@@ -104,6 +104,9 @@ jobs:
       FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       FLY_APP: ${{ vars.FLY_APP || 'openthrottle-supervisor' }}
       SNAPSHOT_NAME: ${{ needs.snapshot.outputs.name }}
+      OT_STATUS_TOKEN: ${{ secrets.OT_STATUS_TOKEN }}
+      OT_DEPLOY_TOKEN: ${{ secrets.OT_DEPLOY_TOKEN }}
+      EPOCH_RELEASE_ID: openthrottle-execution-kernel/v1
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # master
@@ -126,11 +129,399 @@ jobs:
       - name: Stage the exact snapshot reference
         if: needs.snapshot.result == 'success'
         run: flyctl secrets set --stage --app "$FLY_APP" DAYTONA_SNAPSHOT="$SNAPSHOT_NAME"
-      - name: Deploy the supervisor directly
-        run: >-
-          flyctl deploy --ha=false --remote-only --app "$FLY_APP"
-          --config supervisor/fly.toml
-          --dockerfile supervisor/Dockerfile
+      - name: Build and push the exact candidate image
+        id: candidate_image
+        run: |
+          set -euo pipefail
+          flyctl auth docker
+          candidate_tag="registry.fly.io/$FLY_APP:deploy-${GITHUB_SHA}-${GITHUB_RUN_ATTEMPT}"
+          docker build --file supervisor/Dockerfile --tag "$candidate_tag" .
+          push_output="$(docker push "$candidate_tag" 2>&1 | tee /dev/stderr)"
+          candidate_digest="$(
+            sed -n 's/^.*digest: \(sha256:[a-f0-9]\{64\}\).*$/\1/p' <<<"$push_output" |
+              sort -u
+          )"
+          if [[ ! "$candidate_digest" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "Candidate push did not produce exactly one image digest" >&2
+            exit 1
+          fi
+          echo "image=registry.fly.io/$FLY_APP@$candidate_digest" >>"$GITHUB_OUTPUT"
+      - name: Authenticate the candidate release identity
+        id: candidate
+        env:
+          CANDIDATE_IMAGE: ${{ steps.candidate_image.outputs.image }}
+        run: |
+          set -euo pipefail
+          candidate="$(
+            docker run --rm \
+              --env "OT_EPOCH_RELEASE_ID=$EPOCH_RELEASE_ID" \
+              "$CANDIDATE_IMAGE" \
+              node /app/scripts/accept-release.mjs --candidate-identity
+          )"
+          jq -e --arg release "$EPOCH_RELEASE_ID" '
+            def sha256: type == "string" and test("^[a-f0-9]{64}$");
+            .schema == "openthrottle.accept-release-candidate/v1" and
+            .release_id == $release and
+            (.runtime_capability_digest | sha256) and
+            (.schema_checksum | sha256) and
+            (.schema_version | type == "number")
+          ' <<<"$candidate" >/dev/null
+          echo "release_id=$(jq -er .release_id <<<"$candidate")" >>"$GITHUB_OUTPUT"
+          echo "runtime_capability_digest=$(jq -er .runtime_capability_digest <<<"$candidate")" >>"$GITHUB_OUTPUT"
+          echo "schema_version=$(jq -er .schema_version <<<"$candidate")" >>"$GITHUB_OUTPUT"
+          echo "schema_checksum=$(jq -er .schema_checksum <<<"$candidate")" >>"$GITHUB_OUTPUT"
+      - name: Observe the live release and maintenance fence
+        id: live
+        env:
+          CANDIDATE_RUNTIME_CAPABILITY_DIGEST: ${{ steps.candidate.outputs.runtime_capability_digest }}
+        run: |
+          set -euo pipefail
+          machines="$(flyctl machines list --app "$FLY_APP" --json)"
+          machine_count="$(jq -er 'if type == "array" then length else error("invalid Machine inventory") end' <<<"$machines")"
+          if [ "$machine_count" -eq 0 ]; then
+            echo "first_deploy=true" >>"$GITHUB_OUTPUT"
+            echo "needs_acceptance=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$machine_count" -ne 1 ]; then
+            echo "Expected zero Machines for first deploy or one live SQLite writer" >&2
+            jq . <<<"$machines" >&2
+            exit 1
+          fi
+          if [ -z "$OT_STATUS_TOKEN" ] || [ -z "$OT_DEPLOY_TOKEN" ]; then
+            echo "Configure OT_STATUS_TOKEN and OT_DEPLOY_TOKEN as GitHub Actions secrets before deploying a live epoch" >&2
+            exit 1
+          fi
+          capabilities="$(
+            curl -fsS -H "Authorization: Bearer $OT_STATUS_TOKEN" \
+              "https://$FLY_APP.fly.dev/capabilities"
+          )"
+          maintenance="$(
+            curl -fsS -H "Authorization: Bearer $OT_DEPLOY_TOKEN" \
+              "https://$FLY_APP.fly.dev/maintenance"
+          )"
+          current_release="$(jq -er '.release | select(type == "string")' <<<"$capabilities")"
+          current_runtime="$(
+            jq -er '.capabilityDigest | select(type == "string" and test("^[a-f0-9]{64}$"))' \
+              <<<"$capabilities"
+          )"
+          initially_closed="$(jq -er '.maintenance.closed | select(type == "boolean")' <<<"$maintenance")"
+          maintenance_version="$(jq -er '.maintenance.version | select(type == "number")' <<<"$maintenance")"
+          if [ "$current_release" != "$EPOCH_RELEASE_ID" ]; then
+            echo "Live release ID does not match the candidate runtime configuration" >&2
+            exit 1
+          fi
+          echo "first_deploy=false" >>"$GITHUB_OUTPUT"
+          echo "current_release=$current_release" >>"$GITHUB_OUTPUT"
+          echo "current_runtime_capability_digest=$current_runtime" >>"$GITHUB_OUTPUT"
+          echo "initially_closed=$initially_closed" >>"$GITHUB_OUTPUT"
+          echo "maintenance_version=$maintenance_version" >>"$GITHUB_OUTPUT"
+          if [ "$current_runtime" = "$CANDIDATE_RUNTIME_CAPABILITY_DIGEST" ]; then
+            echo "needs_acceptance=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "needs_acceptance=true" >>"$GITHUB_OUTPUT"
+          fi
+      - name: Verify a detached epoch already matches the candidate
+        if: steps.live.outputs.first_deploy == 'true'
+        id: detached_epoch
+        env:
+          CANDIDATE_IMAGE: ${{ steps.candidate_image.outputs.image }}
+          CANDIDATE_RUNTIME: ${{ steps.candidate.outputs.runtime_capability_digest }}
+          CANDIDATE_SCHEMA_VERSION: ${{ steps.candidate.outputs.schema_version }}
+          CANDIDATE_SCHEMA_CHECKSUM: ${{ steps.candidate.outputs.schema_checksum }}
+        run: |
+          set -euo pipefail
+          volumes="$(flyctl volumes list --app "$FLY_APP" --json)"
+          volume_id="$(jq -er '
+            [.[] | select(
+              (.name // .Name // "") == "openthrottle_data" and
+              (.attached_machine_id // .attachedMachineId // "") == ""
+            ) | (.id // .ID // empty)]
+            | if length == 1 then .[0] else error("expected one detached data volume") end
+          ' <<<"$volumes")"
+          machine_name="ot-verify-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          flyctl machine run "$CANDIDATE_IMAGE" \
+            --app "$FLY_APP" \
+            --name "$machine_name" \
+            --restart no \
+            --detach \
+            --volume "$volume_id:/data" \
+            --env OT_BLOB_STORE_ID=openthrottle-execution-kernel-v1 \
+            --env "OT_EPOCH_RELEASE_ID=$EPOCH_RELEASE_ID" \
+            node /app/scripts/accept-release.mjs --verify-current
+          machine_id="$(
+            flyctl machines list --app "$FLY_APP" --json | jq -er --arg name "$machine_name" '
+              [.[] | select((.name // .Name // "") == $name) | (.id // .ID // empty)]
+              | if length == 1 then .[0] else error("expected exactly one verification Machine") end
+            '
+          )"
+          flyctl machine wait --app "$FLY_APP" "$machine_id" --state stopped --wait-timeout 5m
+          logs="$(mktemp)"
+          candidates="$(mktemp)"
+          for attempt in $(seq 1 15); do
+            flyctl logs --app "$FLY_APP" --machine "$machine_id" --no-tail --json >"$logs"
+            jq -s '
+              [.[] | (.message // .Message // empty) | fromjson?
+                | select(.schema == "openthrottle.accept-release-current/v1")]
+            ' "$logs" >"$candidates"
+            [ "$(jq 'length' "$candidates")" -eq 1 ] && break
+            sleep 2
+          done
+          jq -e \
+            --arg release "$EPOCH_RELEASE_ID" \
+            --arg runtime "$CANDIDATE_RUNTIME" \
+            --argjson schema_version "$CANDIDATE_SCHEMA_VERSION" \
+            --arg schema_checksum "$CANDIDATE_SCHEMA_CHECKSUM" '
+            def sha256: type == "string" and test("^[a-f0-9]{64}$");
+            if length != 1 then error("expected exactly one current-identity proof") else .[0] end
+            | .schema == "openthrottle.accept-release-current/v1" and
+              .identity.release_id == $release and
+              .identity.runtime_capability_digest == $runtime and
+              (.identity.blob_marker_checksum | sha256) and
+              (.identity.bootstrap_checksum | sha256) and
+              .schema_version == $schema_version and
+              .schema_checksum == $schema_checksum and
+              .integrity == "ok"
+          ' "$candidates" >/dev/null
+          flyctl machine destroy --app "$FLY_APP" --force "$machine_id"
+          rm -f "$logs" "$candidates"
+          echo "verified=true" >>"$GITHUB_OUTPUT"
+      - name: Close maintenance with compare-and-set
+        if: steps.live.outputs.first_deploy == 'false'
+        id: close
+        env:
+          INITIALLY_CLOSED: ${{ steps.live.outputs.initially_closed }}
+          OBSERVED_VERSION: ${{ steps.live.outputs.maintenance_version }}
+        run: |
+          set -euo pipefail
+          if [ "$INITIALLY_CLOSED" = "true" ]; then
+            closed_version="$OBSERVED_VERSION"
+          else
+            closed="$(
+              jq -n --argjson expected_version "$OBSERVED_VERSION" \
+                '{expected_version:$expected_version}' |
+                curl -fsS -X POST \
+                  -H "Authorization: Bearer $OT_DEPLOY_TOKEN" \
+                  -H "Content-Type: application/json" \
+                  --data-binary @- \
+                  "https://$FLY_APP.fly.dev/maintenance/close"
+            )"
+            closed_version="$(
+              jq -er '.maintenance | select(.closed == true) | .version' <<<"$closed"
+            )"
+          fi
+          echo "closed_version=$closed_version" >>"$GITHUB_OUTPUT"
+      - name: Wait for complete active-work clearance
+        if: steps.live.outputs.first_deploy == 'false'
+        run: |
+          set -euo pipefail
+          last_active_work='{}'
+          for attempt in $(seq 1 60); do
+            if active_work="$(
+              curl -fsS -H "Authorization: Bearer $OT_DEPLOY_TOKEN" \
+                "https://$FLY_APP.fly.dev/maintenance/active-work?limit=2000"
+            )"; then
+              last_active_work="$active_work"
+              if jq -e '.clear == true and .truncated == false and (.items | length) == 0' \
+                <<<"$active_work" >/dev/null; then
+                exit 0
+              fi
+            fi
+            if (( attempt < 60 )); then sleep 5; fi
+          done
+          echo "Epoch did not quiesce; ingress remains closed and release acceptance was not attempted" >&2
+          jq . <<<"$last_active_work" >&2 || true
+          exit 1
+      - name: Stop the sole writer and detach its volume
+        if: steps.live.outputs.first_deploy == 'false'
+        id: stopped_writer
+        run: |
+          set -euo pipefail
+          machines="$(flyctl machines list --app "$FLY_APP" --json)"
+          machine_id="$(
+            jq -er 'if type == "array" and length == 1 then (.[0].id // .[0].ID) else error("expected one writer") end' \
+              <<<"$machines"
+          )"
+          volumes="$(flyctl volumes list --app "$FLY_APP" --json)"
+          volume_id="$(jq -er --arg machine_id "$machine_id" '
+            [.[] | select(
+              (.name // .Name // "") == "openthrottle_data" and
+              (.attached_machine_id // .attachedMachineId // "") == $machine_id
+            ) | (.id // .ID // empty)]
+            | if length == 1 then .[0] else error("writer does not exclusively own the data volume") end
+          ' <<<"$volumes")"
+          flyctl machine stop --app "$FLY_APP" "$machine_id"
+          flyctl machine wait --app "$FLY_APP" "$machine_id" --state stopped --wait-timeout 5m
+          flyctl machine destroy --app "$FLY_APP" --force "$machine_id"
+          detached="$(flyctl volumes list --app "$FLY_APP" --json)"
+          jq -e --arg volume_id "$volume_id" '
+            [.[] | select(
+              (.id // .ID // "") == $volume_id and
+              (.name // .Name // "") == "openthrottle_data" and
+              (.attached_machine_id // .attachedMachineId // "") == ""
+            )] | length == 1
+          ' <<<"$detached" >/dev/null
+          echo "volume_id=$volume_id" >>"$GITHUB_OUTPUT"
+      - name: Accept the candidate release on the offline epoch
+        if: steps.live.outputs.needs_acceptance == 'true'
+        id: acceptance
+        env:
+          CANDIDATE_IMAGE: ${{ steps.candidate_image.outputs.image }}
+          VOLUME_ID: ${{ steps.stopped_writer.outputs.volume_id }}
+          EXPECTED_RELEASE: ${{ steps.live.outputs.current_release }}
+          EXPECTED_RUNTIME: ${{ steps.live.outputs.current_runtime_capability_digest }}
+          CLOSED_VERSION: ${{ steps.close.outputs.closed_version }}
+          CANDIDATE_RUNTIME: ${{ steps.candidate.outputs.runtime_capability_digest }}
+          CANDIDATE_SCHEMA_VERSION: ${{ steps.candidate.outputs.schema_version }}
+          CANDIDATE_SCHEMA_CHECKSUM: ${{ steps.candidate.outputs.schema_checksum }}
+        run: |
+          set -euo pipefail
+          transition_id="deploy-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          machine_name="ot-accept-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          flyctl machine run "$CANDIDATE_IMAGE" \
+            --app "$FLY_APP" \
+            --name "$machine_name" \
+            --restart no \
+            --detach \
+            --volume "$VOLUME_ID:/data" \
+            --env OT_BLOB_STORE_ID=openthrottle-execution-kernel-v1 \
+            --env "OT_EPOCH_RELEASE_ID=$EPOCH_RELEASE_ID" \
+            --env "OT_ACCEPT_RELEASE_EXPECTED_RELEASE_ID=$EXPECTED_RELEASE" \
+            --env "OT_ACCEPT_RELEASE_EXPECTED_RUNTIME_CAPABILITY_DIGEST=$EXPECTED_RUNTIME" \
+            --env "OT_ACCEPT_RELEASE_MAINTENANCE_VERSION=$CLOSED_VERSION" \
+            --env "OT_ACCEPT_RELEASE_TRANSITION_ID=$transition_id" \
+            node /app/scripts/accept-release.mjs
+          machine_id="$(
+            flyctl machines list --app "$FLY_APP" --json | jq -er --arg name "$machine_name" '
+              [.[] | select((.name // .Name // "") == $name) | (.id // .ID // empty)]
+              | if length == 1 then .[0] else error("expected exactly one accept-release Machine") end
+            '
+          )"
+          flyctl machine wait --app "$FLY_APP" "$machine_id" --state stopped --wait-timeout 5m
+          logs="$(mktemp)"
+          candidates="$(mktemp)"
+          for attempt in $(seq 1 15); do
+            flyctl logs --app "$FLY_APP" --machine "$machine_id" --no-tail --json >"$logs"
+            jq -s '
+              [.[] | (.message // .Message // empty) | fromjson?
+                | select(.schema == "openthrottle.epoch-release-acceptance/v1")]
+            ' "$logs" >"$candidates"
+            [ "$(jq 'length' "$candidates")" -eq 1 ] && break
+            sleep 2
+          done
+          if [ "$(jq 'length' "$candidates")" -eq 0 ]; then
+            schema_refusal="$(jq -sr '
+              [.[] | (.message // .Message // empty) | strings
+                | select(contains("fresh epoch is required"))]
+              | last // empty
+            ' "$logs")"
+            if [ -n "$schema_refusal" ]; then
+              echo "Candidate schema differs from the live epoch; a fresh epoch is required before deployment. $schema_refusal" >&2
+              exit 1
+            fi
+          fi
+          OT_ACCEPT_RECEIPT_TRANSITION_ID="$transition_id" \
+          OT_ACCEPT_RECEIPT_FROM_RELEASE_ID="$EXPECTED_RELEASE" \
+          OT_ACCEPT_RECEIPT_FROM_RUNTIME_CAPABILITY_DIGEST="$EXPECTED_RUNTIME" \
+          OT_ACCEPT_RECEIPT_TO_RELEASE_ID="$EPOCH_RELEASE_ID" \
+          OT_ACCEPT_RECEIPT_TO_RUNTIME_CAPABILITY_DIGEST="$CANDIDATE_RUNTIME" \
+          OT_ACCEPT_RECEIPT_MAINTENANCE_VERSION="$CLOSED_VERSION" \
+          OT_ACCEPT_RECEIPT_SCHEMA_VERSION="$CANDIDATE_SCHEMA_VERSION" \
+          OT_ACCEPT_RECEIPT_SCHEMA_CHECKSUM="$CANDIDATE_SCHEMA_CHECKSUM" \
+            node supervisor/scripts/validate-accept-release-receipt.mjs \
+              <"$candidates" >"$RUNNER_TEMP/accept-release-receipt.json"
+          flyctl machine destroy --app "$FLY_APP" --force "$machine_id"
+          rm -f "$logs" "$candidates"
+          echo "validated=true" >>"$GITHUB_OUTPUT"
+      - name: Verify the unchanged release on the offline epoch
+        if: >-
+          steps.live.outputs.first_deploy == 'false' &&
+          steps.live.outputs.needs_acceptance == 'false'
+        id: unchanged_epoch
+        env:
+          CANDIDATE_IMAGE: ${{ steps.candidate_image.outputs.image }}
+          VOLUME_ID: ${{ steps.stopped_writer.outputs.volume_id }}
+          CANDIDATE_RUNTIME: ${{ steps.candidate.outputs.runtime_capability_digest }}
+          CANDIDATE_SCHEMA_VERSION: ${{ steps.candidate.outputs.schema_version }}
+          CANDIDATE_SCHEMA_CHECKSUM: ${{ steps.candidate.outputs.schema_checksum }}
+        run: |
+          set -euo pipefail
+          machine_name="ot-verify-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          flyctl machine run "$CANDIDATE_IMAGE" \
+            --app "$FLY_APP" \
+            --name "$machine_name" \
+            --restart no \
+            --detach \
+            --volume "$VOLUME_ID:/data" \
+            --env OT_BLOB_STORE_ID=openthrottle-execution-kernel-v1 \
+            --env "OT_EPOCH_RELEASE_ID=$EPOCH_RELEASE_ID" \
+            node /app/scripts/accept-release.mjs --verify-current
+          machine_id="$(
+            flyctl machines list --app "$FLY_APP" --json | jq -er --arg name "$machine_name" '
+              [.[] | select((.name // .Name // "") == $name) | (.id // .ID // empty)]
+              | if length == 1 then .[0] else error("expected exactly one verification Machine") end
+            '
+          )"
+          flyctl machine wait --app "$FLY_APP" "$machine_id" --state stopped --wait-timeout 5m
+          logs="$(mktemp)"
+          candidates="$(mktemp)"
+          for attempt in $(seq 1 15); do
+            flyctl logs --app "$FLY_APP" --machine "$machine_id" --no-tail --json >"$logs"
+            jq -s '
+              [.[] | (.message // .Message // empty) | fromjson?
+                | select(.schema == "openthrottle.accept-release-current/v1")]
+            ' "$logs" >"$candidates"
+            [ "$(jq 'length' "$candidates")" -eq 1 ] && break
+            sleep 2
+          done
+          if ! jq -e \
+            --arg release "$EPOCH_RELEASE_ID" \
+            --arg runtime "$CANDIDATE_RUNTIME" \
+            --argjson schema_version "$CANDIDATE_SCHEMA_VERSION" \
+            --arg schema_checksum "$CANDIDATE_SCHEMA_CHECKSUM" '
+            def sha256: type == "string" and test("^[a-f0-9]{64}$");
+            if length != 1 then error("expected exactly one current-identity proof") else .[0] end
+            | .schema == "openthrottle.accept-release-current/v1" and
+              .identity.release_id == $release and
+              .identity.runtime_capability_digest == $runtime and
+              (.identity.blob_marker_checksum | sha256) and
+              (.identity.bootstrap_checksum | sha256) and
+              .schema_version == $schema_version and
+              .schema_checksum == $schema_checksum and
+              .integrity == "ok"
+          ' "$candidates" >/dev/null; then
+            echo "Candidate does not match the live epoch schema or sealed identity; a fresh epoch is required before deployment for a schema version/checksum change" >&2
+            jq . "$candidates" >&2 || true
+            exit 1
+          fi
+          flyctl machine destroy --app "$FLY_APP" --force "$machine_id"
+          rm -f "$logs" "$candidates"
+          echo "verified=true" >>"$GITHUB_OUTPUT"
+      - name: Deploy the exact accepted candidate image
+        env:
+          CANDIDATE_IMAGE: ${{ steps.candidate_image.outputs.image }}
+          NEEDS_ACCEPTANCE: ${{ steps.live.outputs.needs_acceptance }}
+          ACCEPTANCE_VALIDATED: ${{ steps.acceptance.outputs.validated }}
+          FIRST_DEPLOY: ${{ steps.live.outputs.first_deploy }}
+          DETACHED_EPOCH_VERIFIED: ${{ steps.detached_epoch.outputs.verified }}
+          OFFLINE_EPOCH_VERIFIED: ${{ steps.unchanged_epoch.outputs.verified }}
+        run: |
+          set -euo pipefail
+          if [ "$NEEDS_ACCEPTANCE" = "true" ] && [ "$ACCEPTANCE_VALIDATED" != "true" ]; then
+            echo "Candidate identity changed but no matching accept-release receipt was validated" >&2
+            exit 1
+          fi
+          if [ "$FIRST_DEPLOY" = "true" ] && [ "$DETACHED_EPOCH_VERIFIED" != "true" ]; then
+            echo "No writer is running and the detached epoch was not verified against this candidate" >&2
+            exit 1
+          fi
+          if [ "$FIRST_DEPLOY" = "false" ] && [ "$NEEDS_ACCEPTANCE" = "false" ] && [ "$OFFLINE_EPOCH_VERIFIED" != "true" ]; then
+            echo "The live epoch was not verified against this candidate schema; refusing deployment" >&2
+            exit 1
+          fi
+          flyctl deploy --ha=false --app "$FLY_APP" \
+            --config supervisor/fly.toml \
+            --image "$CANDIDATE_IMAGE"
       - name: Converge to one SQLite writer Machine
         run: flyctl scale count 1 --app "$FLY_APP" --yes
       - name: Verify the single-writer Machine topology
@@ -186,3 +577,29 @@ jobs:
           echo "Fly health checks did not all reach passing state" >&2
           jq . <<<"$last_checks" >&2 || printf '%s\n' "$last_checks" >&2
           exit 1
+      - name: Restore the prior open maintenance intent
+        if: >-
+          steps.live.outputs.first_deploy == 'false' &&
+          steps.live.outputs.initially_closed == 'false'
+        env:
+          CLOSED_VERSION: ${{ steps.close.outputs.closed_version }}
+        run: |
+          set -euo pipefail
+          maintenance="$(
+            curl -fsS -H "Authorization: Bearer $OT_DEPLOY_TOKEN" \
+              "https://$FLY_APP.fly.dev/maintenance"
+          )"
+          current_version="$(
+            jq -er '.maintenance | select(.closed == true) | .version' <<<"$maintenance"
+          )"
+          if [ "$current_version" != "$CLOSED_VERSION" ]; then
+            echo "Maintenance fence changed during deployment; leaving ingress closed" >&2
+            exit 1
+          fi
+          jq -n --argjson expected_version "$current_version" \
+            '{expected_version:$expected_version}' |
+            curl -fsS -X POST \
+              -H "Authorization: Bearer $OT_DEPLOY_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data-binary @- \
+              "https://$FLY_APP.fly.dev/maintenance/open"

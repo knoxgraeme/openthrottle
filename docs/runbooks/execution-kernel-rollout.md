@@ -1,8 +1,9 @@
 # Fresh epoch initialization and first dogfood
 
-Use this runbook once to start the execution kernel from empty storage. Prior
+Use sections 1–5 once to start the execution kernel from empty storage. Prior
 dogfood state is abandoned, not migrated or restored. Downtime is intentional.
-Later releases use the normal serialized deploy workflow.
+Later schema-preserving releases use the serialized accept-release procedure in
+section 6.
 
 The supervisor never initializes storage during normal boot. The packaged
 one-shot initializer starts from exact absent database and blob paths, verifies
@@ -23,9 +24,11 @@ npm test --prefix supervisor -- \
   src/persistence/blob-store.test.ts \
   src/app/kernel-bootstrap.test.ts \
   scripts/initialize-epoch.test.mjs \
+  scripts/accept-release.test.mjs \
   scripts/rollout-runbook.test.mjs \
   scripts/deploy-workflow.test.mjs
 node supervisor/scripts/initialize-epoch.mjs --help
+node supervisor/scripts/accept-release.mjs --help
 ```
 
 Keep the repository variable `FRESH_EPOCH_INITIALIZED` absent or false. This
@@ -229,7 +232,77 @@ exact receipt/storage identity, and repair or redeploy. There is no archive,
 restore hook, replacement report, prescribed canary pair, dual-write path, or
 durable cutover state machine.
 
-## 6. Reject a proven pre-mutation sandbox failure
+## 6. Accept a later schema-preserving release
+
+Contracts and definition changes may change the authenticated compiler
+environment and runtime-capability digest without changing SQLite schema. Do
+not deploy such a candidate directly. The serialized `.github/workflows/deploy.yml`
+workflow performs the required offline transition and is the normal operator
+surface:
+
+Configure the same status/deploy bearer values as the GitHub Actions secrets
+`OT_STATUS_TOKEN` and `OT_DEPLOY_TOKEN`. Keep the bootstrap checksum staged as
+the Fly app secret `OT_EPOCH_BOOTSTRAP_CHECKSUM`; temporary Machines inherit it
+from the app. Missing credentials fail before writer shutdown.
+
+1. It builds and pushes one candidate image, resolves its registry digest, and
+   runs `/app/scripts/accept-release.mjs --candidate-identity` in that image.
+   Caller-authored target digests are never persisted.
+2. It observes `/capabilities` and the exact maintenance version, closes
+   maintenance with compare-and-set, and records whether the fence was already
+   closed. Every live redeploy uses this fence so the durable schema can be
+   authenticated before the candidate is rolled out, including when the
+   runtime digest is unchanged.
+3. It polls `/maintenance/active-work?limit=2000` until `clear:true`,
+   `truncated:false`, and an empty item list. Pending or processing inbox work,
+   leases, live runs/Attempts/Effects, and provider runtime resources all block
+   the transition.
+4. It stops and destroys the sole writer, verifies that the sole
+   `openthrottle_data` volume is detached, then attaches it exclusively to one
+   no-restart accept-release Machine running the digest-pinned candidate image.
+   When the runtime digest is unchanged, `accept-release.mjs --verify-current`
+   authenticates the durable schema version/checksum and sealed identity
+   against the candidate. A mismatch refuses deployment with a fresh-epoch
+   instruction.
+5. When the runtime digest changed, the Machine instead runs accept-release and
+   the workflow requires exactly one bounded receipt whose transition ID,
+   maintenance version, previous identity, candidate identity, schema
+   version/checksum, and unchanged blob/bootstrap identity match the observed
+   values. Only after the applicable proof validates does it destroy the
+   stopped transition Machine and deploy that same image digest.
+6. It converges to one volume-owning writer and waits for all Fly health checks.
+   If maintenance was open before the transition, it reopens through the latest
+   authenticated compare-and-set surface. An already-closed fence stays closed.
+
+If no writer exists (the first deployment or recovery after the prior writer
+was destroyed), the workflow does not infer that deployment is safe. It first
+attaches the detached volume to a no-restart candidate Machine and runs
+`accept-release.mjs --verify-current`. Deployment proceeds only if the offline
+schema, integrity, bootstrap, BlobStore, release, and runtime pins already match
+that exact candidate. This makes a rerun after a failed pre-acceptance command
+fail closed, while allowing recovery after a durably accepted transition.
+
+The workflow deliberately has no fallback deployment. Failure to close or
+drain, transition-command failure, no/duplicate/stale/mismatched receipt, or a
+failed candidate deployment leaves ingress closed. Before receipt validation,
+the stopped transition Machine remains attached for inspection; do not destroy
+it or edit SQLite by hand. The normal supervisor is never started with an
+unaccepted runtime identity.
+
+`accept-release` preserves the twelve-table schema, registrations, definitions,
+immutable Records and Checkpoints, blobs, and settled provenance. It changes
+only the release/runtime-capability pins and adds immutable receipt evidence to
+the existing `settings` table in one transaction. Exact replay returns the same
+receipt. If the candidate schema version or checksum differs, stop: the command
+reports that a fresh epoch is required, and sections 1–5 must be performed
+against distinct empty storage. There are no migrations or compatibility reads.
+
+After an interrupted transition, rerun only the same serialized workflow for
+the same candidate. A durable exact replay is safe. Do not deploy a different
+image, reopen ingress manually, replace storage, or author target digests in
+workflow inputs.
+
+## 7. Reject a proven pre-mutation sandbox failure
 
 Use this exceptional path only for the legacy integration-request defect it
 encodes: the run's confirmed runtime-creation Effect selected snapshot

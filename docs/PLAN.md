@@ -50,8 +50,10 @@ subject, OpenThrottle can:
 - External writes are write-ahead Effects with one idempotency key. The worker
   reconciles before writing and records confirmed or rejected delivery
   evidence.
-- SQLite has one fresh twelve-table epoch. Immutable payloads above the inline
-  bound use verified content-addressed blobs.
+- SQLite has one durable twelve-table epoch. Schema-preserving releases advance
+  only its authenticated release/runtime pins through an offline, quiesced,
+  maintenance-fenced transaction with an immutable receipt. Immutable payloads
+  above the inline bound use verified content-addressed blobs.
 - Provider ingress is durably deduplicated. During maintenance it returns a
   retryable non-acknowledgement and persists nothing.
 - Dogfood starts from an explicitly initialized empty epoch. Old state is
@@ -93,6 +95,11 @@ The release is accepted only when all of the following hold:
 - `FRESH_EPOCH_INITIALIZED` is a mechanical storage prerequisite, not an
   acceptance gate. Once initialized, one Fly Machine owns the volume and
   ingress opens only through the authenticated compare-and-set endpoint.
+- A changed authenticated runtime-capability identity is accepted by the exact
+  digest-pinned candidate image only after maintenance is closed and active work
+  is fully drained. Receipt validation precedes deployment of that same image;
+  schema checksum changes still require a fresh epoch, and failures leave
+  ingress closed.
 - Real ordinary and structured items are diagnostic dogfood. Failures become
   normal bug-fix work; no archive, restore hook, prescribed canary pair, or
   replacement report is required.

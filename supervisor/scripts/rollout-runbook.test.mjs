@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import YAML from "yaml";
 
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 const runbook = readFileSync(
@@ -69,7 +70,7 @@ function validateReceiptCandidates(candidates) {
 
 describe("fresh-epoch rollout runbook", () => {
   it("keeps maintenance closed until exceptional recovery cleanup is clear", () => {
-    const section = runbook.slice(runbook.indexOf("## 6. Reject a proven pre-mutation sandbox failure"));
+    const section = runbook.slice(runbook.indexOf("## 7. Reject a proven pre-mutation sandbox failure"));
     const activeWorkIndex = section.indexOf('ACTIVE_WORK="$(');
     const clearGuardIndex = section.indexOf("jq -e '.clear == true'");
     const openIndex = section.indexOf('"https://$FLY_APP.fly.dev/maintenance/open"');
@@ -84,6 +85,28 @@ describe("fresh-epoch rollout runbook", () => {
       `]);
       expect(guarded.status).toBe(expectedStatus);
     }
+  });
+
+  it("documents the fenced schema-preserving release sequence and fail-closed recovery", () => {
+    const section = runbook.slice(
+      runbook.indexOf("## 6. Accept a later schema-preserving release"),
+      runbook.indexOf("## 7. Reject a proven pre-mutation sandbox failure"),
+    );
+    for (const required of [
+      "--candidate-identity",
+      "/maintenance/active-work?limit=2000",
+      "clear:true",
+      "truncated:false",
+      "`openthrottle_data` volume is detached",
+      "no-restart accept-release Machine",
+      "exactly one bounded receipt",
+      "same image digest",
+      "already-closed fence stays closed",
+      "fresh epoch is required",
+    ]) expect(section).toContain(required);
+    expect(section.indexOf("closes maintenance")).toBeLessThan(section.indexOf("polls `/maintenance/active-work"));
+    expect(section.indexOf("polls `/maintenance/active-work")).toBeLessThan(section.indexOf("stops and destroys the sole writer"));
+    expect(section.indexOf("exactly one bounded receipt")).toBeLessThan(section.indexOf("same image digest"));
   });
 
   it("runs the accepted digest-pinned image without rebuilding a checkout", () => {
@@ -233,5 +256,30 @@ describe("packaged initializer CI proof", () => {
     );
     expect(ci).toContain("packaged initializer returned an invalid receipt");
     expect(ci).toContain("/data/openthrottle-kernel-v1-blobs/.openthrottle-blob-store.json");
+  });
+
+  it("exercises packaged refusal, replay, and accepted open-only startup", () => {
+    const exerciseIndex = ci.indexOf("Exercise packaged release acceptance");
+    const nonquiescentIndex = ci.indexOf("accept-release accepted a non-quiescent epoch", exerciseIndex);
+    const schemaIndex = ci.indexOf("accept-release accepted a changed schema", exerciseIndex);
+    const receiptIndex = ci.indexOf('receipt="$(accept_release)"', exerciseIndex);
+    const replayIndex = ci.indexOf('replay="$(accept_release)"', exerciseIndex);
+    const startupIndex = ci.indexOf('openthrottle-supervisor:test >/dev/null', exerciseIndex);
+    expect(exerciseIndex).toBeGreaterThanOrEqual(0);
+    expect(nonquiescentIndex).toBeGreaterThan(exerciseIndex);
+    expect(schemaIndex).toBeGreaterThan(nonquiescentIndex);
+    expect(receiptIndex).toBeGreaterThan(schemaIndex);
+    expect(replayIndex).toBeGreaterThan(receiptIndex);
+    expect(startupIndex).toBeGreaterThan(replayIndex);
+    expect(ci.slice(exerciseIndex, startupIndex)).toContain("epoch is not quiesced");
+    expect(ci.slice(exerciseIndex, startupIndex)).toContain("schema|table set|fresh epoch");
+    expect(ci.slice(startupIndex)).toContain("fresh kernel listening");
+
+    const parsed = YAML.parse(ci);
+    const proof = parsed.jobs["docker-smoke"].steps.find(
+      ({ name }) => name === "Exercise packaged release acceptance",
+    ).run;
+    const shell = spawnSync("bash", ["-n"], { input: proof, encoding: "utf8" });
+    expect(shell.status, shell.stderr).toBe(0);
   });
 });

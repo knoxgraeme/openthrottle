@@ -3,13 +3,19 @@
 import { lstatSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
-const HELP = `Usage: accept-release.mjs
+const HELP = `Usage: accept-release.mjs [--candidate-identity|--verify-current]
 
 Advances one quiesced execution epoch to this exact packaged release. The
 epoch must be maintenance-closed at OT_ACCEPT_RELEASE_MAINTENANCE_VERSION and
 must contain no live coordination state. Candidate digests are authenticated
 from the packaged release; callers provide only the exact expected-current
 identity and transition fence. One durable JSON receipt is printed.
+
+--candidate-identity authenticates the packaged release without opening the
+epoch and prints its bounded release/runtime/schema identity.
+
+--verify-current opens an offline epoch read-only and proves its current pins,
+schema, bootstrap, and BlobStore identities match the packaged candidate.
 `;
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 const BLOB_STORE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
@@ -66,7 +72,19 @@ function isWithin(parent, candidate) {
   return relation === "" || (!relation.startsWith("..") && !isAbsolute(relation));
 }
 
-function configuration() {
+function candidateConfiguration() {
+  const releaseRoot = absolutePath("OT_RELEASE_ROOT", value("OT_RELEASE_ROOT", process.cwd()));
+  return Object.freeze({
+    candidateReleaseId: identifier("OT_EPOCH_RELEASE_ID", required("OT_EPOCH_RELEASE_ID")),
+    releaseRoot,
+    generatedRoot: absolutePath(
+      "OT_GENERATED_DEFINITION_ROOT",
+      value("OT_GENERATED_DEFINITION_ROOT", join(releaseRoot, "contracts/generated")),
+    ),
+  });
+}
+
+function storageConfiguration(candidate) {
   const databasePath = absolutePath(
     "DATABASE_PATH",
     value("DATABASE_PATH", "/data/openthrottle-kernel-v1.sqlite"),
@@ -84,12 +102,20 @@ function configuration() {
   ) {
     fail("database and blob paths must be on the same volume");
   }
-  const releaseRoot = absolutePath("OT_RELEASE_ROOT", value("OT_RELEASE_ROOT", process.cwd()));
   return Object.freeze({
     databasePath,
     blobStorePath,
     blobStoreId: identifier("OT_BLOB_STORE_ID", required("OT_BLOB_STORE_ID"), BLOB_STORE_ID),
-    candidateReleaseId: identifier("OT_EPOCH_RELEASE_ID", required("OT_EPOCH_RELEASE_ID")),
+    candidateReleaseId: candidate.candidateReleaseId,
+    bootstrapChecksum: digest("OT_EPOCH_BOOTSTRAP_CHECKSUM", required("OT_EPOCH_BOOTSTRAP_CHECKSUM")),
+    releaseRoot: candidate.releaseRoot,
+    generatedRoot: candidate.generatedRoot,
+  });
+}
+
+function configuration(storage) {
+  return Object.freeze({
+    ...storage,
     expectedReleaseId: identifier(
       "OT_ACCEPT_RELEASE_EXPECTED_RELEASE_ID",
       required("OT_ACCEPT_RELEASE_EXPECTED_RELEASE_ID"),
@@ -98,18 +124,34 @@ function configuration() {
       "OT_ACCEPT_RELEASE_EXPECTED_RUNTIME_CAPABILITY_DIGEST",
       required("OT_ACCEPT_RELEASE_EXPECTED_RUNTIME_CAPABILITY_DIGEST"),
     ),
-    bootstrapChecksum: digest("OT_EPOCH_BOOTSTRAP_CHECKSUM", required("OT_EPOCH_BOOTSTRAP_CHECKSUM")),
     maintenanceVersion: nonnegativeInteger(
       "OT_ACCEPT_RELEASE_MAINTENANCE_VERSION",
       required("OT_ACCEPT_RELEASE_MAINTENANCE_VERSION"),
     ),
     transitionId: identifier("OT_ACCEPT_RELEASE_TRANSITION_ID", required("OT_ACCEPT_RELEASE_TRANSITION_ID")),
-    releaseRoot,
-    generatedRoot: absolutePath(
-      "OT_GENERATED_DEFINITION_ROOT",
-      value("OT_GENERATED_DEFINITION_ROOT", join(releaseRoot, "contracts/generated")),
-    ),
   });
+}
+
+async function authenticatedCandidate() {
+  const config = candidateConfiguration();
+  const [releaseModule, schemaModule] = await Promise.all([
+    import("../dist/app/kernel-release.js"),
+    import("../dist/persistence/epoch-schema.js"),
+  ]);
+  const release = releaseModule.loadKernelReleaseDefinitions({
+    release_root: config.releaseRoot,
+    generated_root: config.generatedRoot,
+  });
+  return {
+    config,
+    identity: {
+      schema: "openthrottle.accept-release-candidate/v1",
+      release_id: config.candidateReleaseId,
+      runtime_capability_digest: release.execution_policy.runtime_capability_digest,
+      schema_version: schemaModule.FRESH_EPOCH_VERSION,
+      schema_checksum: schemaModule.FRESH_EPOCH_SCHEMA_CHECKSUM,
+    },
+  };
 }
 
 async function main() {
@@ -117,19 +159,53 @@ async function main() {
     process.stdout.write(HELP);
     return;
   }
+  if (process.argv.length === 3 && process.argv[2] === "--candidate-identity") {
+    const candidate = await authenticatedCandidate();
+    process.stdout.write(`${JSON.stringify(candidate.identity)}\n`);
+    return;
+  }
+  if (process.argv.length === 3 && process.argv[2] === "--verify-current") {
+    const candidate = await authenticatedCandidate();
+    const config = storageConfiguration(candidate.config);
+    const [databaseModule, blobModule] = await Promise.all([
+      import("../dist/persistence/epoch-database.js"),
+      import("../dist/persistence/blob-store.js"),
+    ]);
+    const blobs = blobModule.VolumeBlobStore.open(config.blobStorePath, config.blobStoreId);
+    const expectedIdentity = {
+      release_id: config.candidateReleaseId,
+      runtime_capability_digest: candidate.identity.runtime_capability_digest,
+      blob_store_id: blobs.store_id,
+      blob_marker_checksum: blobs.marker_checksum,
+      bootstrap_checksum: config.bootstrapChecksum,
+    };
+    const db = databaseModule.inspectFreshEpochDatabase({
+      database_path: config.databasePath,
+      blob_store: blobs,
+      expected_identity: expectedIdentity,
+    });
+    try {
+      const verification = databaseModule.verifyFreshEpochDatabase(db, expectedIdentity);
+      process.stdout.write(`${JSON.stringify({
+        schema: "openthrottle.accept-release-current/v1",
+        identity: expectedIdentity,
+        schema_version: verification.schema_version,
+        schema_checksum: verification.schema_checksum,
+        integrity: verification.integrity,
+      })}\n`);
+    } finally {
+      db.close();
+    }
+    return;
+  }
   if (process.argv.length !== 2) fail("usage: accept-release.mjs");
 
-  const config = configuration();
-  const [releaseModule, databaseModule, schemaModule, blobModule] = await Promise.all([
-    import("../dist/app/kernel-release.js"),
+  const candidate = await authenticatedCandidate();
+  const config = configuration(storageConfiguration(candidate.config));
+  const [databaseModule, blobModule] = await Promise.all([
     import("../dist/persistence/epoch-database.js"),
-    import("../dist/persistence/epoch-schema.js"),
     import("../dist/persistence/blob-store.js"),
   ]);
-  const release = releaseModule.loadKernelReleaseDefinitions({
-    release_root: config.releaseRoot,
-    generated_root: config.generatedRoot,
-  });
   const blobs = blobModule.VolumeBlobStore.open(config.blobStorePath, config.blobStoreId);
   const commonIdentity = {
     blob_store_id: blobs.store_id,
@@ -150,11 +226,11 @@ async function main() {
       },
       candidate_identity: {
         release_id: config.candidateReleaseId,
-        runtime_capability_digest: release.execution_policy.runtime_capability_digest,
+        runtime_capability_digest: candidate.identity.runtime_capability_digest,
         ...commonIdentity,
       },
-      candidate_schema_version: schemaModule.FRESH_EPOCH_VERSION,
-      candidate_schema_checksum: schemaModule.FRESH_EPOCH_SCHEMA_CHECKSUM,
+      candidate_schema_version: candidate.identity.schema_version,
+      candidate_schema_checksum: candidate.identity.schema_checksum,
     },
   });
   process.stdout.write(`${JSON.stringify(receipt)}\n`);

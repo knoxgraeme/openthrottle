@@ -665,12 +665,14 @@ definition rows directly.
 - Only deterministic registered primitives may evaluate candidates, integrate
   checkpoints, publish, wait on providers, or mutate runtime resources.
 
-## 12. Fresh epoch initialization and first dogfood
+## 12. Fresh epoch initialization and release acceptance
 
 There is no compatibility runtime, online migration, archive/restore workflow,
-or durable epoch-transition protocol. Because this installation is
-dogfood-only, prior runtime state is explicitly abandoned and the execution
-kernel starts from distinct empty storage.
+or general epoch-transition state machine. Because this installation began as
+dogfood-only, prior pre-kernel state was explicitly abandoned and the execution
+kernel started from distinct empty storage. Later schema-preserving releases
+retain that one durable evidence corpus through the bounded offline release
+acceptance operation below.
 
 Normal supervisor boot remains open-only as defined in §9.1. Storage creation
 is a separate, one-shot command packaged in the exact candidate image:
@@ -716,6 +718,43 @@ verifies that the sole Machine owns the SQLite volume. Startup independently
 reopens and verifies the exact schema, integrity, release, runtime, bootstrap,
 and blob identities before listening or starting work. Missing or mismatched
 storage fails the deployment rather than creating a new epoch.
+
+Before deploying a candidate whose authenticated runtime-capability digest
+differs from the live pin, the serialized deploy workflow must advance the
+epoch with the exact candidate image's packaged `accept-release` command. It:
+
+- observes the current authenticated release identity and maintenance version;
+- closes maintenance through the deploy-token compare-and-set endpoint when it
+  was open, then requires the complete active-work projection to be clear and
+  untruncated;
+- stops the sole writer and gives one no-restart Machine running the exact
+  digest-pinned candidate image exclusive ownership of the existing volume;
+- derives the candidate runtime-capability digest from release-sealed compiler
+  artifacts, not a workflow-authored target digest;
+- takes the exact expected-current release/runtime identity, closed maintenance
+  version, and stable transition ID as the replay/conflict fence;
+- verifies the database still has the sealed twelve-table schema version and
+  checksum and has no live leases, work, runs, Attempts, Effects, inbox events,
+  or other resumable coordination state; and
+- atomically compare-and-sets only the release/runtime pins and inserts one
+  immutable bounded `openthrottle.epoch-release-acceptance/v1` receipt into the
+  existing `settings` table.
+
+An exact transition replay returns the same receipt. A stale, divergent,
+partial, non-quiescent, integrity-invalid, bootstrap/blob-mismatched, or
+schema-changing request changes neither pin and creates no receipt. A schema
+version or checksum change is not a release acceptance: it requires a fresh
+epoch. Settled Records, Checkpoints, definitions, registrations, blobs, and
+their per-row provenance are never rewritten.
+
+The matching supervisor may start only after the workflow validates exactly
+one receipt against the observed current identity, maintenance fence,
+authenticated candidate identity, and candidate schema checksum. The deployed
+image is the same digest-pinned image that produced the accepted identity. Any
+failure after maintenance closure leaves ingress closed and does not deploy the
+mismatched supervisor. After matching startup and health checks succeed, the
+workflow reopens ingress by compare-and-set only when maintenance was open
+before the operation; an already-closed operator fence remains closed.
 
 Repository registration may occur while maintenance is closed. Mutating
 provider ingress opens only through the deploy-token-protected compare-and-set

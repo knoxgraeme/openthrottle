@@ -138,6 +138,140 @@ jobs:
             --entrypoint /bin/sh \
             openthrottle-supervisor:test \
             -ec 'test -f /data/openthrottle-kernel-v1.sqlite && test -f /data/openthrottle-kernel-v1-blobs/.openthrottle-blob-store.json'
+      - name: Exercise packaged release acceptance
+        run: |
+          set -euo pipefail
+          acceptance_volume="openthrottle-ci-accept-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          supervisor_container="openthrottle-ci-accepted-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker volume create "$acceptance_volume" >/dev/null
+          cleanup() {
+            docker rm --force "$supervisor_container" >/dev/null 2>&1 || true
+            docker volume rm --force "$acceptance_volume" >/dev/null
+          }
+          trap cleanup EXIT
+
+          old_runtime="$(printf '0%.0s' {1..64})"
+          bootstrap_checksum="$(
+            docker run --rm -i \
+              --mount "type=volume,src=$acceptance_volume,dst=/data" \
+              openthrottle-supervisor:test node --input-type=module <<'NODE'
+          import { VolumeBlobStore } from "/app/dist/persistence/blob-store.js";
+          import {
+            createFreshEpochBootstrap,
+            initializeFreshEpochDatabase,
+          } from "/app/dist/persistence/epoch-database.js";
+          const blobs = VolumeBlobStore.initialize(
+            "/data/openthrottle-kernel-v1-blobs",
+            "openthrottle-execution-kernel-v1",
+          );
+          const bootstrap = createFreshEpochBootstrap({
+            schema: "openthrottle.fresh-epoch-bootstrap/v1",
+            settings: [],
+            repository_registrations: [],
+          });
+          initializeFreshEpochDatabase({
+            database_path: "/data/openthrottle-kernel-v1.sqlite",
+            blob_store: blobs,
+            release_id: "openthrottle-execution-kernel/v1",
+            runtime_capability_digest: "0".repeat(64),
+            bootstrap,
+          }).close();
+          process.stdout.write(`${bootstrap.checksum}\n`);
+          NODE
+          )"
+          candidate="$(
+            docker run --rm \
+              --env OT_EPOCH_RELEASE_ID=openthrottle-execution-kernel/v1 \
+              openthrottle-supervisor:test \
+              node /app/scripts/accept-release.mjs --candidate-identity
+          )"
+          candidate_runtime="$(jq -er .runtime_capability_digest <<<"$candidate")"
+          transition_id="ci-accept-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          accept_release() {
+            docker run --rm \
+              --mount "type=volume,src=$acceptance_volume,dst=/data" \
+              --env OT_BLOB_STORE_ID=openthrottle-execution-kernel-v1 \
+              --env OT_EPOCH_RELEASE_ID=openthrottle-execution-kernel/v1 \
+              --env "OT_EPOCH_BOOTSTRAP_CHECKSUM=$bootstrap_checksum" \
+              --env OT_ACCEPT_RELEASE_EXPECTED_RELEASE_ID=openthrottle-execution-kernel/v1 \
+              --env "OT_ACCEPT_RELEASE_EXPECTED_RUNTIME_CAPABILITY_DIGEST=$old_runtime" \
+              --env OT_ACCEPT_RELEASE_MAINTENANCE_VERSION=0 \
+              --env "OT_ACCEPT_RELEASE_TRANSITION_ID=$transition_id" \
+              openthrottle-supervisor:test node /app/scripts/accept-release.mjs
+          }
+
+          docker run --rm -i \
+            --mount "type=volume,src=$acceptance_volume,dst=/data" \
+            openthrottle-supervisor:test node --input-type=module <<'NODE'
+          import Database from "/app/node_modules/better-sqlite3/lib/index.js";
+          const db = new Database("/data/openthrottle-kernel-v1.sqlite");
+          db.prepare(`INSERT INTO leases
+            (lease_key, purpose, owner_id, lease_id, expires_at, version, metadata_json, updated_at)
+            VALUES ('ci', 'proof', 'ci', 'ci-lease', '2026-08-25T00:00:00.000Z', 0, '{}', '2026-08-25T00:00:00.000Z')
+          `).run();
+          db.close();
+          NODE
+          if accept_release >"$RUNNER_TEMP/nonquiescent-receipt" 2>"$RUNNER_TEMP/nonquiescent-error"; then
+            echo "accept-release accepted a non-quiescent epoch" >&2
+            exit 1
+          fi
+          grep -q "epoch is not quiesced" "$RUNNER_TEMP/nonquiescent-error"
+          docker run --rm -i \
+            --mount "type=volume,src=$acceptance_volume,dst=/data" \
+            openthrottle-supervisor:test node --input-type=module <<'NODE'
+          import Database from "/app/node_modules/better-sqlite3/lib/index.js";
+          const db = new Database("/data/openthrottle-kernel-v1.sqlite");
+          db.prepare("DELETE FROM leases WHERE lease_key = 'ci'").run();
+          db.exec("CREATE TABLE unexpected_schema_change (id INTEGER PRIMARY KEY) STRICT");
+          db.close();
+          NODE
+          if accept_release >"$RUNNER_TEMP/schema-receipt" 2>"$RUNNER_TEMP/schema-error"; then
+            echo "accept-release accepted a changed schema" >&2
+            exit 1
+          fi
+          grep -Eq "schema|table set|fresh epoch" "$RUNNER_TEMP/schema-error"
+          docker run --rm -i \
+            --mount "type=volume,src=$acceptance_volume,dst=/data" \
+            openthrottle-supervisor:test node --input-type=module <<'NODE'
+          import Database from "/app/node_modules/better-sqlite3/lib/index.js";
+          const db = new Database("/data/openthrottle-kernel-v1.sqlite");
+          db.exec("DROP TABLE unexpected_schema_change");
+          db.close();
+          NODE
+
+          receipt="$(accept_release)"
+          replay="$(accept_release)"
+          if [ "$receipt" != "$replay" ]; then
+            echo "accept-release exact replay did not return the identical receipt" >&2
+            exit 1
+          fi
+          jq -e --arg runtime "$candidate_runtime" '
+            .schema == "openthrottle.epoch-release-acceptance/v1" and
+            .to_identity.runtime_capability_digest == $runtime
+          ' <<<"$receipt" >/dev/null
+
+          docker run --detach --name "$supervisor_container" \
+            --mount "type=volume,src=$acceptance_volume,dst=/data" \
+            --env SUPERVISOR_URL=http://127.0.0.1:8080 \
+            --env OT_STATUS_TOKEN=status-token \
+            --env OT_DEPLOY_TOKEN=deploy-token \
+            --env GITHUB_WEBHOOK_SECRET=webhook-secret \
+            --env GITHUB_TOKEN=github-token \
+            --env GITHUB_READ_TOKEN=github-read-token \
+            --env DAYTONA_API_KEY=daytona-token \
+            --env "OT_EPOCH_BOOTSTRAP_CHECKSUM=$bootstrap_checksum" \
+            openthrottle-supervisor:test >/dev/null
+          for attempt in $(seq 1 20); do
+            if docker logs "$supervisor_container" 2>&1 | grep -q "fresh kernel listening"; then
+              [ "$(docker inspect --format '{{.State.Running}}' "$supervisor_container")" = "true" ]
+              exit 0
+            fi
+            if (( attempt < 20 )); then sleep 1; fi
+          done
+          echo "accepted packaged supervisor did not complete open-only startup" >&2
+          docker logs "$supervisor_container" >&2 || true
+          exit 1
       - name: Build sandbox image
         run: docker build -f sandbox/Dockerfile -t openthrottle:test .
       - name: Exercise sandbox lifecycle with stub agent

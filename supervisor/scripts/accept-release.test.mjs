@@ -85,6 +85,28 @@ describe("accept-release process boundary", () => {
     expect(Buffer.byteLength(result.stdout)).toBeLessThan(1_024);
   });
 
+  it("prints the authenticated packaged candidate identity without database configuration", () => {
+    const result = spawnSync(process.execPath, [cliPath, "--candidate-identity"], {
+      cwd: supervisorRoot,
+      encoding: "utf8",
+      env: {
+        OT_EPOCH_RELEASE_ID: "release-candidate",
+        OT_RELEASE_ROOT: repoRoot,
+        OT_GENERATED_DEFINITION_ROOT: join(repoRoot, "contracts/generated"),
+      },
+      timeout: 20_000,
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout)).toEqual({
+      schema: "openthrottle.accept-release-candidate/v1",
+      release_id: "release-candidate",
+      runtime_capability_digest: expect.stringMatching(/^[a-f0-9]{64}$/),
+      schema_version: expect.any(Number),
+      schema_checksum: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+  });
+
   it("authenticates the packaged candidate, accepts it once, and replays the receipt", () => {
     const value = fixture();
     const first = run(value);
@@ -107,6 +129,16 @@ describe("accept-release process boundary", () => {
     const second = run(value);
     expect(second.status, second.stderr).toBe(0);
     expect(JSON.parse(second.stdout)).toEqual(receipt);
+
+    const verified = run(value, {}, ["--verify-current"]);
+    expect(verified.status, verified.stderr).toBe(0);
+    expect(JSON.parse(verified.stdout)).toMatchObject({
+      schema: "openthrottle.accept-release-current/v1",
+      identity: receipt.to_identity,
+      schema_version: expect.any(Number),
+      schema_checksum: expect.stringMatching(/^[a-f0-9]{64}$/),
+      integrity: "ok",
+    });
 
     const opened = openFreshEpochDatabase({
       database_path: value.databasePath,
