@@ -1,15 +1,18 @@
-import type {
-  DeliveryRecord,
-  ExecutionRecord,
+import {
+  validateGithubPushDelivery,
+  type DeliveryRecord,
+  type ExecutionRecord,
+  type GithubPushDelivery,
 } from "@openthrottle/contracts";
 
-export interface ConfirmedGithubPushDelivery {
+type ConfirmedGithubPushDeliveryEvidence = Extract<
+  GithubPushDelivery,
+  { reason?: never }
+>;
+
+export type ConfirmedGithubPushDelivery = ConfirmedGithubPushDeliveryEvidence & {
   record: DeliveryRecord;
-  repository: string;
-  ref: string;
-  sha: string;
-  ref_mode: "create" | "update";
-}
+};
 
 export function isGithubPushDelivery(record: ExecutionRecord): record is DeliveryRecord & {
   payload: { inline: Record<string, unknown> };
@@ -31,27 +34,25 @@ export function parseConfirmedGithubPushDelivery(input: {
     throw new Error(`${input.label} is not task-ref push evidence`);
   }
   const envelope = record.payload.inline;
-  const result = envelope.result;
   if (
     record.pipeline_run_id !== input.pipeline_run_id || record.status !== "confirmed" ||
-    envelope.provider !== "github" ||
-    !result || typeof result !== "object" || Array.isArray(result)
+    envelope.provider !== "github"
   ) throw new Error(`${input.label} contains invalid task-ref push evidence`);
-  const value = result as Record<string, unknown>;
+  let value: GithubPushDelivery;
+  try {
+    value = validateGithubPushDelivery(envelope.result, {
+      source: `${input.label}.result`,
+    }).value;
+  } catch {
+    throw new Error(`${input.label} contains invalid task-ref push evidence`);
+  }
   if (
-    value.schema !== "openthrottle.github-push-delivery/v1" ||
-    typeof value.repository !== "string" ||
-    typeof value.ref !== "string" || !/^refs\/heads\/ot\//.test(value.ref) ||
-    typeof value.sha !== "string" || !/^[a-f0-9]{40}$/.test(value.sha) ||
-    (value.ref_mode !== "create" && value.ref_mode !== "update") ||
+    "reason" in value ||
     record.external_identity !== `github:${value.repository}:${value.ref}`
   ) throw new Error(`${input.label} contains invalid task-ref push evidence`);
   return {
     record,
-    repository: value.repository,
-    ref: value.ref,
-    sha: value.sha,
-    ref_mode: value.ref_mode,
+    ...value,
   };
 }
 

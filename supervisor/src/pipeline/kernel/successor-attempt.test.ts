@@ -346,6 +346,33 @@ describe("mergeCausalGithubPushContext", () => {
         },
       } },
     })],
+    ["malformed result repository", (record: DeliveryRecord) => ({
+      ...record,
+      payload: { inline: {
+        ...(record.payload as { inline: Record<string, unknown> }).inline,
+        result: {
+          schema: "openthrottle.github-push-delivery/v1",
+          repository: "owner/repo/extra",
+          ref: "refs/heads/ot/run-1",
+          sha: "1".repeat(40),
+          ref_mode: "create",
+        },
+      } },
+    })],
+    ["result with an unknown field", (record: DeliveryRecord) => ({
+      ...record,
+      payload: { inline: {
+        ...(record.payload as { inline: Record<string, unknown> }).inline,
+        result: {
+          schema: "openthrottle.github-push-delivery/v1",
+          repository: "owner/repo",
+          ref: "refs/heads/ot/run-1",
+          sha: "1".repeat(40),
+          ref_mode: "create",
+          unexpected: true,
+        },
+      } },
+    })],
   ] as const)("rejects a push delivery from %s", (_label, mutate) => {
     const record = mutate(githubPushDelivery("delivery-push-d1", "1".repeat(40), "create"));
     expect(() => mergeCausalGithubPushContext({

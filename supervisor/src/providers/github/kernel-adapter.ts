@@ -1,10 +1,14 @@
 import {
+  GITHUB_PUSH_DELIVERY_SCHEMA,
   canonicalJson,
+  jsonValueAt,
   validateBlobPointer,
+  validateGithubPushDelivery,
   validateGithubProviderEvidencePolicy,
   type BlobPointer,
   type EffectIntent,
   type FilesystemConfigContract,
+  type GithubPushDelivery,
   type JsonValue,
 } from "@openthrottle/contracts";
 import type { VolumeBlobStore } from "../../persistence/blob-store.js";
@@ -89,6 +93,11 @@ function exactKeys(value: Record<string, unknown>, keys: readonly string[], labe
   if (Object.keys(value).sort().join("\0") !== [...keys].sort().join("\0")) {
     throw new Error(`${label} has unknown or missing fields`);
   }
+}
+
+function githubPushDeliveryEvidence(value: GithubPushDelivery): JsonValue {
+  const validated = validateGithubPushDelivery(value, { source: "github_push_delivery" }).value;
+  return jsonValueAt(validated, "github_push_delivery");
 }
 
 function pushPayload(intent: Readonly<EffectIntent>): PushPayload {
@@ -508,17 +517,18 @@ export class GithubKernelAdapter {
   async #reconcilePush(intent: Readonly<EffectIntent>): Promise<KernelEffectProviderObservation> {
     const payload = pushPayload(intent);
     const current = await this.#ref(payload.repository, payload.ref);
+    const delivery = {
+      schema: GITHUB_PUSH_DELIVERY_SCHEMA,
+      repository: payload.repository,
+      ref: payload.ref,
+      sha: payload.expected_new_subject,
+      ref_mode: payload.ref_mode,
+    } satisfies GithubPushDelivery;
     if (current === payload.expected_new_subject) {
       return {
         kind: "found",
         status: "confirmed",
-        payload: {
-          schema: "openthrottle.github-push-delivery/v1",
-          repository: payload.repository,
-          ref: payload.ref,
-          sha: current,
-          ref_mode: payload.ref_mode,
-        },
+        payload: githubPushDeliveryEvidence(delivery),
       };
     }
     if (payload.ref_mode === "create" && current === null) {
@@ -530,16 +540,13 @@ export class GithubKernelAdapter {
         return {
           kind: "found",
           status: "rejected",
-          payload: {
-            schema: "openthrottle.github-push-delivery/v1",
-            repository: payload.repository,
-            ref: payload.ref,
-            sha: payload.expected_new_subject,
-            ref_mode: payload.ref_mode,
+          payload: githubPushDeliveryEvidence({
+            ...delivery,
+            ref_mode: "create",
             expected_old_subject: payload.expected_old_subject,
             actual: null,
             reason: "publication_parent_missing",
-          },
+          }),
         };
       }
       if (
@@ -553,18 +560,26 @@ export class GithubKernelAdapter {
     if (payload.ref_mode === "update" && current === payload.expected_old_subject) {
       return { kind: "not_found" };
     }
+    if (current === null) {
+      return {
+        kind: "found", status: "rejected",
+        payload: githubPushDeliveryEvidence({
+          ...delivery,
+          ref_mode: "update",
+          expected_old_subject: payload.expected_old_subject,
+          actual: null,
+          reason: "ref_missing",
+        }),
+      };
+    }
     return {
       kind: "found", status: "rejected",
-      payload: {
-        schema: "openthrottle.github-push-delivery/v1",
-        repository: payload.repository,
-        ref: payload.ref,
-        sha: payload.expected_new_subject,
-        ref_mode: payload.ref_mode,
+      payload: githubPushDeliveryEvidence({
+        ...delivery,
         expected_old_subject: payload.expected_old_subject,
         actual: current,
-        reason: current === null ? "ref_missing" : "ref_conflict",
-      },
+        reason: "ref_conflict",
+      }),
     };
   }
 
