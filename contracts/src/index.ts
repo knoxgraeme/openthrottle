@@ -70,6 +70,17 @@ export {
   type EffectIntent,
 } from "./effects.js";
 export {
+  GITHUB_PUSH_DELIVERY_SCHEMA,
+  GITHUB_PUSH_REF_MODES,
+  GITHUB_PUSH_REJECTION_REASONS,
+  validateGithubPushDelivery,
+  type ConfirmedGithubPushDelivery,
+  type GithubPushDelivery,
+  type GithubPushRefMode,
+  type GithubPushRejectionReason,
+  type RejectedGithubPushDelivery,
+} from "./github-push-delivery.js";
+export {
   DEFINITION_BUNDLE_SCHEMA,
   DEFINITION_ENTRY_MAX_BYTES,
   DEFINITION_KINDS,
