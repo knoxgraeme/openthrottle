@@ -1,10 +1,22 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { canonicalJson, digestCanonicalJson } from "./generated-result-contracts.mjs";
+import { runPreparedAgent as runPreparedAgentRuntime } from "./agent-runtime.mjs";
 import { executeAttempt, validateKernelRequest } from "./execute-attempt.mjs";
+import { extractProviderResultCandidate } from "./result-submission.mjs";
 
 const semanticSchema = {
   schema: "openthrottle.semantic-result-schema/v1",
@@ -26,6 +38,15 @@ const semanticSchema = {
 
 function git(repo, ...args) {
   return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+}
+
+function makeTreeOwnerWritable(path) {
+  const metadata = lstatSync(path);
+  if (metadata.isSymbolicLink()) return;
+  chmodSync(path, metadata.mode | (metadata.isDirectory() ? 0o700 : 0o600));
+  if (metadata.isDirectory()) {
+    for (const entry of readdirSync(path)) makeTreeOwnerWritable(join(path, entry));
+  }
 }
 
 function sourceRepository() {
@@ -415,6 +436,108 @@ describe("kernel attempt executor", () => {
       },
     });
     expect(JSON.parse(readFileSync(resultPath, "utf8"))).toEqual(first);
+  });
+
+  it("seals only each Codex action's final-message channel across sequential sandbox actions", async () => {
+    const source = sourceRepository();
+    const root = mkdtempSync(join(tmpdir(), "ot-attempt-sequential-results-"));
+    const actionRoot = join(root, "actions");
+    const candidates = [
+      {
+        schema: "openthrottle.result-candidate/v1",
+        outcome: "success",
+        payload: { summary: "first action", verification: ["first proof"] },
+      },
+      {
+        schema: "openthrottle.result-candidate/v1",
+        outcome: "success",
+        payload: { summary: "second action", verification: ["second proof"] },
+      },
+    ];
+    const agentMessage = (value) => JSON.stringify({
+      type: "item.completed",
+      item: { type: "agent_message", text: JSON.stringify(value) },
+    });
+    const contaminatedSecondTranscript = [agentMessage(candidates[0]), agentMessage(candidates[1])].join("\n");
+    const codexAction = {
+      ...workRequest(source.subject).action,
+      engine: "codex",
+      execution_limits: { max_turns: null, task_timeout_seconds: 600 },
+    };
+
+    // This is the live failure shape: the JSONL event stream contains two
+    // genuinely different schema-valid messages and is therefore ambiguous.
+    expect(extractProviderResultCandidate(contaminatedSecondTranscript, "codex")).toMatchObject({
+      status: "invalid",
+      diagnostics: [{ detail: "provider emitted conflicting final result candidates" }],
+    });
+
+    const results = [];
+    for (let index = 0; index < candidates.length; index += 1) {
+      const attemptId = `attempt-${index + 1}`;
+      const request = workRequest(source.subject, {
+        attempt_id: attemptId,
+        request_hash: String(index + 1).repeat(64),
+        lease_id: `lease-${index + 1}`,
+        action: codexAction,
+      });
+      const resultDirectory = join(root, "action-results", attemptId, request.lease_id);
+      const transcript = index === 0 ? agentMessage(candidates[0]) : contaminatedSecondTranscript;
+      results.push(await executeAttempt({
+        request,
+        sourceRepoDir: source.repo,
+        actionRoot,
+        resultPath: join(resultDirectory, "result.json"),
+        sessionPath: join(resultDirectory, "session.json"),
+        env: {
+          OT_LEASE_GENERATION_FENCE_FILE: join(root, "lease-generation.json"),
+          OT_LEASE_GENERATION_LOCK_FILE: join(root, "lease-generation.lock"),
+        },
+        runPreparedAgent: async (runtime) => runPreparedAgentRuntime({
+          ...runtime,
+          runStreaming: async ({ onSession }) => {
+            expect(existsSync(runtime.prepared.providerFinalPath)).toBe(false);
+            if (index === 0) {
+              writeFileSync(runtime.prepared.providerFinalPath, canonicalJson(candidates[index]));
+            }
+            await onSession(`session-${index + 1}`);
+            return {
+              status: 0,
+              signal: null,
+              timedOut: false,
+              nativeSessionId: `session-${index + 1}`,
+              stderr: "",
+              stdout: transcript,
+            };
+          },
+        }),
+        now: () => new Date(`2026-08-20T00:00:0${index}.000Z`),
+      }));
+      if (index === 0 && typeof process.getuid === "function" && process.getuid() !== 0) {
+        // Production reclamation runs in the root executor. Let this
+        // unprivileged host test model that capability before action two.
+        makeTreeOwnerWritable(join(actionRoot, attemptId));
+      }
+    }
+
+    expect(results.map((result) => result.outcome)).toEqual([
+      expect.objectContaining({
+        state: "work_complete",
+        result: expect.objectContaining({
+          candidate: expect.objectContaining({
+            candidate: expect.objectContaining({ payload: expect.objectContaining({ summary: "first action" }) }),
+          }),
+        }),
+      }),
+      expect.objectContaining({
+        state: "work_complete",
+        result: expect.objectContaining({
+          candidate: expect.objectContaining({
+            candidate: expect.objectContaining({ payload: expect.objectContaining({ summary: "second action" }) }),
+          }),
+        }),
+      }),
+    ]);
   });
 
   it("reclaims settled sibling scratch before dispatching the next action", async () => {

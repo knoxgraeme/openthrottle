@@ -9,6 +9,7 @@ import {
   prepareResultCorrectionRuntime,
   runStreamingAgent,
 } from "./agent-runtime.mjs";
+import { extractProviderFinalOutput } from "./result-submission.mjs";
 
 const directories = [];
 const LEASE_GENERATION_FENCE = "/var/lib/openthrottle/action-fences/attempt-1/lease-generation.json";
@@ -27,6 +28,43 @@ afterEach(() => {
 });
 
 describe("streaming agent launch", () => {
+  it("keeps truncated stdout within the provider fallback extraction limit", async () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = { end() {} };
+    child.pid = 12_345;
+    const final = canonicalJson({
+      schema: "openthrottle.result-candidate/v1",
+      outcome: "success",
+      payload: { summary: "current action", verification: ["current proof"] },
+    });
+    const event = JSON.stringify({
+      type: "item.completed",
+      item: { type: "agent_message", text: final },
+    });
+    const spawnProcess = () => {
+      queueMicrotask(() => {
+        child.stdout.emit("data", Buffer.from(`${"🙂".repeat(600_000)}\n${event}\n`));
+        child.emit("close", 0, null);
+      });
+      return child;
+    };
+
+    const result = await runStreamingAgent({
+      engine: "codex",
+      args: [],
+      cwd: tmpdir(),
+      prompt: "fixture prompt",
+      environment: {},
+      timeoutMs: 100,
+      spawnProcess,
+    });
+
+    expect(Buffer.byteLength(result.stdout, "utf8")).toBeLessThanOrEqual(2 * 1024 * 1024);
+    expect(extractProviderFinalOutput(result.stdout, "codex")).toBe(final);
+  });
+
   it("marks only child-process transport errors as retryable infrastructure failures", async () => {
     const failure = new Error("spawn transport failed");
     const child = new EventEmitter();
@@ -121,6 +159,7 @@ function channel(root) {
     provider_schema_path: join(root, "provider-schema.json"),
     candidate_path: join(root, "candidate.json"),
     rejection_path: join(root, "rejected.json"),
+    provider_final_path: join(root, "provider-final.json"),
   };
   writeFileSync(value.provider_schema_path, "{}\n");
   return value;
@@ -246,6 +285,7 @@ describe("result correction runtime", () => {
 
     expect(prepared.args).toEqual(expect.arrayContaining([
       "--output-schema", join(actionDirectory, "provider-schema.json"),
+      "--output-last-message", join(actionDirectory, "provider-final.json"),
       "--sandbox", "read-only",
       "--disable", "shell_tool",
       "--disable", "unified_exec",
@@ -298,6 +338,10 @@ describe("inspect change context runtime", () => {
     expect(claude.prepared.args).toEqual(expect.arrayContaining(["--max-turns", "11"]));
     expect(preparedByEngine.get("codex").prepared.args).toEqual(expect.arrayContaining([
       "--ask-for-approval", "never",
+      "--output-last-message", join(
+        preparedByEngine.get("codex").actionDirectory,
+        "provider-final.json",
+      ),
       "--sandbox", "danger-full-access", "--ignore-user-config",
       "--disable", "apps", "--disable", "browser_use",
       "--disable", "in_app_browser", "--disable", "multi_agent",

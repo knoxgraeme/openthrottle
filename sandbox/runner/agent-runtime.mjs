@@ -38,9 +38,14 @@ import {
   repositoryGitEnvironment,
 } from "./repository-authority.mjs";
 import { extractNativeSessionId } from "./native-session-id.mjs";
-import { resultSubmissionEnvironment } from "./result-submission.mjs";
+import {
+  extractProviderFinalOutput,
+  readBoundedResultFileSync,
+  resultSubmissionEnvironment,
+} from "./result-submission.mjs";
 
 const CAPTURE_BYTES = 2 * 1024 * 1024;
+const CAPTURE_OMISSION = Buffer.from("\n...[agent output omitted]...\n", "utf8");
 const DEFAULT_TIMEOUT_MS = 60 * 60 * 1000;
 const STEERING_HOOK = "/opt/openthrottle/hooks/ot-inbox-drain.sh";
 
@@ -142,10 +147,20 @@ export function safeAgentEnvironment(env, extra = {}) {
 
 function appendBounded(current, chunk) {
   const next = `${current}${chunk}`;
-  if (Buffer.byteLength(next, "utf8") <= CAPTURE_BYTES) return next;
-  const head = next.slice(0, Math.floor(CAPTURE_BYTES / 2));
-  const tail = next.slice(-Math.floor(CAPTURE_BYTES / 2));
-  return `${head}\n...[agent output omitted]...\n${tail}`;
+  const bytes = Buffer.from(next, "utf8");
+  if (bytes.length <= CAPTURE_BYTES) return next;
+  const retainedBytes = CAPTURE_BYTES - CAPTURE_OMISSION.length;
+  let headEnd = Math.floor(retainedBytes / 2);
+  let tailStart = bytes.length - (retainedBytes - headEnd);
+  // Buffer.from produced valid UTF-8. Move each cut past a partial code point
+  // so decoding cannot expand replacement characters beyond the byte budget.
+  while (headEnd > 0 && (bytes[headEnd] & 0xc0) === 0x80) headEnd -= 1;
+  while (tailStart < bytes.length && (bytes[tailStart] & 0xc0) === 0x80) tailStart += 1;
+  return Buffer.concat([
+    bytes.subarray(0, headEnd),
+    CAPTURE_OMISSION,
+    bytes.subarray(tailStart),
+  ]).toString("utf8");
 }
 
 function childCommand(engine, environment, args) {
@@ -157,6 +172,32 @@ function childCommand(engine, environment, args) {
     };
   }
   return { command: engine, args, environment };
+}
+
+function prepareProviderFinalOutput(engine, channel) {
+  if (engine !== "codex") return null;
+  if (typeof channel?.provider_final_path !== "string" || !isAbsolute(channel.provider_final_path)) {
+    throw new Error("Codex provider final result path is invalid");
+  }
+  // The work launch gets a new action directory. A correction reuses that
+  // directory, so remove the prior turn's final-message file before Codex
+  // opens its truncate-and-write channel.
+  rmSync(channel.provider_final_path, { force: true });
+  return channel.provider_final_path;
+}
+
+function withProviderFinalOutput(result, providerFinalPath) {
+  if (providerFinalPath === null) return result;
+  return {
+    ...result,
+    // Codex's action-scoped final-message channel is authoritative. Some
+    // successful launches do not materialize it, so reproduce that channel's
+    // last-message semantics from this invocation instead of submitting every
+    // agent message in the JSONL stream as a separate final candidate.
+    providerFinalOutput: existsSync(providerFinalPath)
+      ? readBoundedResultFileSync(providerFinalPath, CAPTURE_BYTES)
+      : extractProviderFinalOutput(result.stdout, "codex"),
+  };
 }
 
 export async function runStreamingAgent({
@@ -279,6 +320,7 @@ function writeSteeringHook(engine, profileRoot) {
 
 export function prepareAgentRuntime({ request, actionDirectory, channel, env = process.env }) {
   const engine = request.action.engine;
+  const providerFinalPath = prepareProviderFinalOutput(engine, channel);
   const home = join(actionDirectory, "home");
   prepareAgentOwnedDirectory(home);
   let profileRoot;
@@ -352,6 +394,7 @@ export function prepareAgentRuntime({ request, actionDirectory, channel, env = p
     args = [
       ...(request.repository_authority === "inspect" ? ["--ask-for-approval", "never"] : []),
       "exec", "--json", "--output-schema", channel.provider_schema_path,
+      "--output-last-message", providerFinalPath,
       ...(request.repository_authority === "inspect"
         ? inspectPolicyArgs("codex", request.repository_path, { ephemeral: false })
         : ["--dangerously-bypass-approvals-and-sandbox"]),
@@ -383,11 +426,28 @@ export function prepareAgentRuntime({ request, actionDirectory, channel, env = p
     args = ["run", "--format", "json", "--model", request.action.model, "--dir", request.repository_path,
       ...(request.repository_authority === "edit" ? ["--auto"] : [])];
   }
-  return { engine, home, profileRoot, profile, seal, childEnv, args, prompt: profile.prompt };
+  return {
+    engine,
+    home,
+    profileRoot,
+    profile,
+    seal,
+    childEnv,
+    args,
+    prompt: profile.prompt,
+    providerFinalPath,
+  };
 }
 
-export async function runPreparedAgent({ prepared, request, channel, onSession, timeoutMs }) {
-  const result = await runStreamingAgent({
+export async function runPreparedAgent({
+  prepared,
+  request,
+  channel,
+  onSession,
+  timeoutMs,
+  runStreaming = runStreamingAgent,
+}) {
+  const result = await runStreaming({
     engine: prepared.engine,
     args: prepared.args,
     cwd: request.repository_path,
@@ -397,7 +457,7 @@ export async function runPreparedAgent({ prepared, request, channel, onSession, 
     onSession,
   });
   assertActionProfileSeal(prepared.profile, prepared.seal);
-  return result;
+  return withProviderFinalOutput(result, prepared.providerFinalPath);
 }
 
 export function removeProgressiveSkills(prepared) {
@@ -428,6 +488,7 @@ export function prepareResultCorrectionRuntime({
   env = process.env,
   timeoutMs,
 }) {
+  const providerFinalPath = prepareProviderFinalOutput(request.engine, channel);
   const hookPath = writeSteeringHook(request.engine, profileRoot);
   const hookSeal = captureSteeringHookSeal(hookPath);
   const childEnv = safeAgentEnvironment(env, {
@@ -467,6 +528,7 @@ export function prepareResultCorrectionRuntime({
     args = [
       "--ask-for-approval", "never",
       "exec", "--json", "--output-schema", channel.provider_schema_path,
+      "--output-last-message", providerFinalPath,
       "--disable", "shell_tool", "--disable", "unified_exec", "--disable", "shell_snapshot",
       ...codexResultCorrectionPolicyArgs(),
       "--skip-git-repo-check", "-C", cwd,
@@ -507,6 +569,7 @@ export function prepareResultCorrectionRuntime({
     timeoutMs,
     hookPath,
     hookSeal,
+    providerFinalPath,
   };
 }
 
@@ -521,5 +584,5 @@ export async function runResultCorrection(options) {
     timeoutMs: prepared.timeoutMs,
   });
   assertSteeringHookSeal(prepared.hookSeal);
-  return result;
+  return withProviderFinalOutput(result, prepared.providerFinalPath);
 }

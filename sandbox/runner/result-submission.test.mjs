@@ -6,6 +6,7 @@ import {
   ResultCandidateConflictError,
   ResultCandidateValidationError,
   candidateDiagnosticEvidence,
+  extractProviderFinalOutput,
   extractProviderResultCandidate,
   inspectResultSubmissionChannel,
   loadSemanticResultSchema,
@@ -154,6 +155,7 @@ describe("result candidate submission", () => {
       `OT_RESULT_CANDIDATE_FILE=${channel.candidate_path}`,
       `OT_RESULT_REJECTION_FILE=${channel.rejection_path}`,
     ]);
+    expect(channel.provider_final_path).toBe(join(directory, "provider-final.json"));
     const authored = candidate(["Implemented the unit.", "Targeted tests pass."]);
     await stageResultCandidate({
       value: authored,
@@ -285,5 +287,16 @@ describe("result candidate submission", () => {
       status: "invalid",
       diagnostics: [{ detail: "provider emitted conflicting final result candidates" }],
     });
+  });
+
+  it("recovers only the final Codex message from one invocation stream", () => {
+    const first = candidate("prior action");
+    const current = candidate("current action");
+    const transcript = [first, current].map((value) => JSON.stringify({
+      type: "item.completed",
+      item: { type: "agent_message", text: JSON.stringify(value) },
+    })).join("\n");
+
+    expect(extractProviderFinalOutput(transcript, "codex")).toBe(JSON.stringify(current));
   });
 });

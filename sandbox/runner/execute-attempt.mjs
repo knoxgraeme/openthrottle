@@ -381,6 +381,15 @@ function agentPreparedRuntimeException(error, env) {
   return agentExecutorException(error, env, retryable ? "launch" : "runtime", retryable);
 }
 
+function providerResultOutput(execution, engine) {
+  if (engine === "codex") {
+    return typeof execution.providerFinalOutput === "string"
+      ? execution.providerFinalOutput
+      : "";
+  }
+  return execution.providerFinalOutput ?? execution.stdout;
+}
+
 function defaultCommandRunner({ commandLine, repositoryPath, timeoutMs }) {
   const safeEnv = {
     ...Object.fromEntries(["PATH", "LANG", "LC_ALL", "TZ"].flatMap((name) =>
@@ -634,6 +643,9 @@ async function executeAgentWork(options, actionDirectory) {
       timedOut: Boolean(execution.timedOut),
       stdout: String(execution.stdout ?? ""),
       stderr: String(execution.stderr ?? ""),
+      ...(typeof execution.providerFinalOutput === "string"
+        ? { providerFinalOutput: execution.providerFinalOutput }
+        : {}),
       nativeSessionId: observedSessions[0],
       home: prepared?.home ?? join(actionDirectory, "home"),
       profileRoot: prepared?.profileRoot ?? join(actionDirectory, "home", `.${request.action.engine}`),
@@ -652,7 +664,7 @@ async function executeAgentWork(options, actionDirectory) {
     semanticSchema: request.action.semantic_result_schema,
   });
   const candidate = submitProviderResultCandidate({
-    raw: execution.stdout,
+    raw: providerResultOutput(execution, request.action.engine),
     engine: request.action.engine,
     channel,
   });
@@ -799,7 +811,7 @@ async function executeCorrection(options, actionDirectory) {
     });
   }
   const candidate = submitProviderResultCandidate({
-    raw: execution.stdout,
+    raw: providerResultOutput(execution, request.engine),
     engine: request.engine,
     channel,
   });
