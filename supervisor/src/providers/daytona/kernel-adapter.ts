@@ -8,7 +8,6 @@ import {
   type EffectIntent,
   type JsonValue,
 } from "@openthrottle/contracts";
-import type { Config } from "../../app/config.js";
 import type {
   KernelRuntimeInventoryPort,
   KernelRuntimeInventoryResource,
@@ -1410,7 +1409,3 @@ export function createDaytonaKernelAdapter(
 ): DaytonaKernelAdapter {
   return new DaytonaKernelAdapter(new Daytona({ apiKey: options.api_key }), options);
 }
-
-export type DaytonaKernelConfig = Pick<Config,
-  "daytonaApiKey" | "daytonaSnapshot" | "githubReadToken" | "taskTimeout"
->;

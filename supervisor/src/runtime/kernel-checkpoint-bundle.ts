@@ -20,7 +20,7 @@ interface SealedBundleDescriptor {
   tree: string;
 }
 
-export interface KernelIntegrationAncestryBundle {
+interface KernelIntegrationAncestryBundle {
   checkpoint_id: string;
   bytes: Uint8Array;
   descriptor: SealedBundleDescriptor;

@@ -1,7 +1,6 @@
 import {
   digestCanonicalJson,
   type JsonValue,
-  type PipelineTerminalOutcome,
 } from "@openthrottle/contracts";
 import type {
   KernelHistoricalAnalysisPort,
@@ -379,5 +378,3 @@ export class KernelHttpService {
     return run;
   }
 }
-
-export type KernelAnalysisTerminalOutcome = PipelineTerminalOutcome;

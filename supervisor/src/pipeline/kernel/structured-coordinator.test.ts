@@ -29,24 +29,21 @@ import {
   type ResultRecord,
   type VirtualDefinitionFile,
 } from "@openthrottle/contracts";
-import type { KernelContextPort, ReductionView } from "./ports.js";
+import type { ReductionView } from "./ports.js";
 import { selectKernelAction } from "./action-request.js";
 import { compileKernelCursor, frontierMemberKey } from "./reducer.js";
 import {
   KERNEL_ATTEMPT_SCHEMA,
   KERNEL_RUN_SCHEMA,
   type KernelAttempt,
-  type KernelRun,
 } from "./types.js";
 import {
-  buildStructuredTerminalTransition,
   buildStructuredProvisionSettlement,
   compileReviewFanoutFrontier,
   compileStructuredLoopFrontier,
   createBlockingReviewRemediationAttempt,
   createStructuredIntegrationAttempt,
   parseStructuredExecutionPlan,
-  resolveStructuredAttemptContext,
   selectedStructuredReviewPersonas,
   type StructuredAcceptedUnitEvidence,
   type StructuredIntegrationEvidence,
@@ -1235,51 +1232,6 @@ describe("structured kernel coordinator", () => {
     expect(remediation.context_record_ids).toContain(push.id);
   });
 
-  it("resolves exactly the context IDs persisted on the attempt and rejects widening", async () => {
-    const { bundle, manifest } = definitions();
-    const source = acceptedUnitEvidence();
-    const attempt = createStructuredIntegrationAttempt({
-      pipeline_run_id: "run-1", parent_attempt_id: "parent", member_id: "unit-a", round: 0,
-      stage_id: "integration", input_subject: CURRENT_SUBJECT, task_prompt: "Integrate.",
-      source, current_ancestry_checkpoints: [], bundle, manifest,
-    });
-    const calls: unknown[] = [];
-    const exact: KernelContextPort = {
-      async resolveExactContext(input) {
-        calls.push(input);
-        return {
-          records: new Map<string, ExecutionRecord>([
-            [source.acceptance.result.id, source.acceptance.result],
-            [source.acceptance.decision.id, source.acceptance.decision],
-          ]),
-          checkpoints: new Map([[source.candidate_checkpoint.id, source.candidate_checkpoint]]),
-        };
-      },
-    };
-    await expect(resolveStructuredAttemptContext({ port: exact, attempt })).resolves.toMatchObject({
-      records: expect.any(Map), checkpoints: expect.any(Map),
-    });
-    expect(calls).toEqual([{
-      pipeline_run_id: "run-1",
-      attempt_id: attempt.id,
-      allowed_record_ids: ["decision-accept-unit-a", "result-accept-unit-a"],
-      allowed_checkpoint_ids: ["checkpoint-unit-a"],
-    }]);
-    const widened: KernelContextPort = {
-      async resolveExactContext() {
-        return {
-          records: new Map<string, ExecutionRecord>([
-            [source.acceptance.result.id, source.acceptance.result],
-            [source.acceptance.decision.id, source.acceptance.decision],
-            ["unrelated", { ...source.acceptance.decision, id: "unrelated" }],
-          ]),
-          checkpoints: new Map([[source.candidate_checkpoint.id, source.candidate_checkpoint]]),
-        };
-      },
-    };
-    await expect(resolveStructuredAttemptContext({ port: widened, attempt })).rejects.toThrow(/widened/);
-  });
-
   it("reconstructs exactly one sealed v2 plan without process-local state", () => {
     const plan = {
       schema: "openthrottle.execution-plan/v2",
@@ -1435,58 +1387,4 @@ describe("structured kernel coordinator", () => {
     }
   });
 
-  it.each(["needs_human", "canceled", "superseded"] as const)(
-    "settles every active sibling on terminal %s while retaining checkpoint identities",
-    (outcome) => {
-      const { bundle, manifest } = definitions();
-      const first = pendingAttempt({ id: "unit-a", index: 0 });
-      const second = pendingAttempt({ id: "unit-b", index: 1 });
-      const run: KernelRun = {
-        schema: KERNEL_RUN_SCHEMA,
-        id: "run-1",
-        pipeline_id: manifest.pipeline_id,
-        definition_bundle_hash: manifest.definition_bundle_hash,
-        current_subject: CURRENT_SUBJECT,
-        status: "running",
-        terminal_outcome: null,
-        cursor: compileKernelCursor({ stage_id: "unit", version: 2, attempts: [first, second] }),
-        version: 4,
-        work_retry_limit: 2,
-        result_correction_limit: 2,
-        active_attempt_versions: { [first.id]: 0, [second.id]: 0 },
-        active_effect_versions: {},
-        checkpoint_ids: { "settled-unit": "checkpoint-settled-unit" },
-      };
-      const view: ReductionView = {
-        manifest,
-        run,
-        current_attempt: first,
-        records: new Map(),
-        checkpoints: new Map(),
-      };
-      const transition = buildStructuredTerminalTransition({
-        view,
-        outcome,
-        reason: `operator selected ${outcome}`,
-        created_at: NOW,
-        bundle,
-        task_prompt: "Stop the structured runtime safely.",
-        runtime_delivery_records: [runtimeCreateDelivery()],
-      });
-      expect(transition.run).toMatchObject({
-        status: "running",
-        terminal_outcome: null,
-        cursor: { stage_id: runtimeStopStageId(outcome) },
-        checkpoint_ids: { "settled-unit": "checkpoint-settled-unit" },
-      });
-      expect(transition.attempt_writes).toHaveLength(2);
-      expect(transition.attempt_writes.every((write) =>
-        write.kind === "replace" ? write.attempt.status === outcome : write.status === outcome)).toBe(true);
-      expect(transition.create_attempts).toHaveLength(1);
-      expect(transition.create_attempts[0]?.scope).toEqual({
-        kind: "stage",
-        stage_id: runtimeStopStageId(outcome),
-      });
-    },
-  );
 });

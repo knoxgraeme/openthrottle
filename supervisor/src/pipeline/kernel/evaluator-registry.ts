@@ -1,5 +1,6 @@
 import {
   EXECUTION_RECORD_SCHEMA,
+  REVIEW_FINDING_SEVERITIES,
   canonicalJson,
   compareCodeUnits,
   digestCanonicalJson,
@@ -27,6 +28,7 @@ export const COMMAND_RESULT_RECORD_PAYLOAD_SCHEMA =
   "openthrottle.command-result-record/v1" as const;
 export const PIPELINE_DECISION_RECORD_PAYLOAD_SCHEMA =
   "openthrottle.pipeline-decision-record/v1" as const;
+const BLOCKING_REVIEW_FINDING_SEVERITIES = new Set(REVIEW_FINDING_SEVERITIES.slice(0, 2));
 
 export interface SemanticResultRecordPayload {
   schema: typeof SEMANTIC_RESULT_RECORD_PAYLOAD_SCHEMA;
@@ -262,7 +264,7 @@ export function createCommandResultRecord(input: {
 }
 
 function hasBlockingReviewFinding(findings: readonly ReviewFindingV1[]): boolean {
-  return findings.some(({ severity }) => severity === "P0" || severity === "P1");
+  return findings.some(({ severity }) => BLOCKING_REVIEW_FINDING_SEVERITIES.has(severity));
 }
 
 function semanticObject(value: JsonValue, label: string): Record<string, JsonValue> {

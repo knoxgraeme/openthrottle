@@ -359,12 +359,3 @@ export interface KernelDefinitionBundlePort {
     definition_bundle_hash: string;
   }): Promise<DefinitionBundle>;
 }
-
-export interface KernelContextPort {
-  resolveExactContext(input: {
-    pipeline_run_id: string;
-    attempt_id: string;
-    allowed_record_ids: readonly string[];
-    allowed_checkpoint_ids: readonly string[];
-  }): Promise<ResolvedKernelContext>;
-}

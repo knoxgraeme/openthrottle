@@ -25,7 +25,6 @@ import type {
   KernelAttemptRecoveryQuarantinePort,
   KernelAttemptRequestPort,
   KernelAttemptRequestInputs,
-  KernelContextPort,
   KernelContinuationCandidate,
   KernelContinuationPageRequest,
   KernelDefinitionBundleBytesPort,
@@ -40,7 +39,6 @@ import type {
   LeasedEffectView,
   ReductionReadRequest,
   ReductionView,
-  ResolvedKernelContext,
   SettledStructuredPlanningAttempt,
   StructuredPlanningReadRequest,
   ExternalScheduleView,
@@ -194,7 +192,6 @@ export class SqliteKernelStore implements
   KernelDefinitionBundleBytesPort,
   KernelEffectPort,
   KernelOperatorEffectRejectionPort,
-  KernelContextPort,
   KernelExternalSchedulePort,
   KernelStructuredPlanningReadPort {
   readonly #db: Database.Database;
@@ -881,24 +878,6 @@ export class SqliteKernelStore implements
         ]),
     ) as KernelContinuationCandidate[];
     return rows;
-  }
-
-  async resolveExactContext(input: {
-    pipeline_run_id: string;
-    attempt_id: string;
-    allowed_record_ids: readonly string[];
-    allowed_checkpoint_ids: readonly string[];
-  }): Promise<ResolvedKernelContext> {
-    this.#attemptById(input.attempt_id, input.pipeline_run_id);
-    const run = this.#runFromRow(this.#runRow(input.pipeline_run_id));
-    return {
-      records: this.#loadExactRecords(input.pipeline_run_id, input.allowed_record_ids, run.status),
-      checkpoints: this.#loadExactCheckpoints(
-        input.pipeline_run_id,
-        input.allowed_checkpoint_ids,
-        run.status,
-      ),
-    };
   }
 
   async loadAttemptRequestInputs(input: {

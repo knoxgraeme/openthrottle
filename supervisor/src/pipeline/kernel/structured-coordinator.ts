@@ -29,31 +29,24 @@ export {
   selectedStructuredReviewPersonas,
 } from "./structured-plan.js";
 import type {
-  KernelContextPort,
   ExternalScheduleView,
   ReductionView,
-  ResolvedKernelContext,
 } from "./ports.js";
 import type { EvaluatedKernelResult } from "./evaluator-registry.js";
 import {
   compileKernelCursor,
   frontierMemberKey,
-  reduceKernelCommand,
 } from "./reducer.js";
 import type {
-  AtomicTransitionBundle,
   KernelAttempt,
-  KernelCommand,
   KernelCursor,
 } from "./types.js";
 import {
-  exactKernelRuntimeCleanupDeliveries,
   exactKernelRuntimeResourceDeliveries,
   resolveKernelRuntimeResourceIdentity,
 } from "./runtime-resource.js";
 import { sortedUnique } from "./reducer-support.js";
 import {
-  deriveKernelTerminalCleanupAttempt,
   mergeCausalGithubPushContext,
 } from "./successor-attempt.js";
 import {
@@ -872,147 +865,5 @@ export function createBlockingReviewRemediationAttempt(input: {
         checkpoints,
       },
     },
-  });
-}
-
-function assertExactResolvedIds(
-  resolved: ResolvedKernelContext,
-  attempt: KernelAttempt,
-): void {
-  const recordIds = [...resolved.records.keys()].sort(compareCodeUnits);
-  const checkpointIds = [...resolved.checkpoints.keys()].sort(compareCodeUnits);
-  if (
-    canonicalJson(recordIds) !== canonicalJson(attempt.context_record_ids) ||
-    canonicalJson(checkpointIds) !== canonicalJson(attempt.context_checkpoint_ids)
-  ) {
-    throw new Error(`context resolver widened or narrowed attempt ${attempt.id}`);
-  }
-  for (const record of resolved.records.values()) {
-    if (record.pipeline_run_id !== attempt.pipeline_run_id) {
-      throw new Error(`context resolver returned another run's record ${record.id}`);
-    }
-  }
-  for (const checkpoint of resolved.checkpoints.values()) {
-    if (checkpoint.pipeline_run_id !== attempt.pipeline_run_id) {
-      throw new Error(`context resolver returned another run's checkpoint ${checkpoint.id}`);
-    }
-  }
-}
-
-export async function resolveStructuredAttemptContext(input: {
-  port: KernelContextPort;
-  attempt: KernelAttempt;
-}): Promise<ResolvedKernelContext> {
-  const resolved = await input.port.resolveExactContext({
-    pipeline_run_id: input.attempt.pipeline_run_id,
-    attempt_id: input.attempt.id,
-    allowed_record_ids: input.attempt.context_record_ids,
-    allowed_checkpoint_ids: input.attempt.context_checkpoint_ids,
-  });
-  assertExactResolvedIds(resolved, input.attempt);
-  return resolved;
-}
-
-export function buildStructuredTerminalTransition(input: {
-  view: ReductionView;
-  outcome: "needs_human" | "canceled" | "superseded";
-  reason: string;
-  created_at: string;
-  bundle: DefinitionBundle;
-  task_prompt: string;
-  runtime_delivery_records: readonly ExecutionRecord[];
-}): AtomicTransitionBundle {
-  const attempt = input.view.current_attempt;
-  if (!attempt) throw new Error("structured terminal transition requires one exact active attempt");
-  const runtimeDeliveries = exactKernelRuntimeCleanupDeliveries(input.runtime_delivery_records);
-  if (runtimeDeliveries === null) {
-    throw new Error("structured terminal transition requires exact runtime cleanup evidence");
-  }
-  const decision = createPipelineDecisionRecord({
-    attempt,
-    result: null,
-    additional_input_records: runtimeDeliveries,
-    evaluated: {
-      evaluator: "core/operational-outcome@1",
-      outcome: input.outcome,
-      reason: input.reason,
-    },
-    created_at: input.created_at,
-  });
-  const commandId = `structured-${input.outcome}-${digestCanonicalJson({
-    pipeline_run_id: input.view.run.id,
-    attempt_id: attempt.id,
-    decision_id: decision.id,
-  }).slice(0, 48)}`;
-  const command: KernelCommand = input.outcome === "needs_human"
-    ? {
-      type: "needs_human",
-      command_id: commandId,
-      attempt_id: attempt.id,
-      decision_record_id: decision.id,
-      reason: input.reason,
-      resource_disposition: {
-        kind: "cleanup",
-        runtime_delivery_record_ids: runtimeDeliveries.map(({ id }) => id),
-        cleanup_attempt: deriveKernelTerminalCleanupAttempt({
-          view: input.view,
-          current: attempt,
-          decision,
-          bundle: input.bundle,
-          outcome: input.outcome,
-          task_prompt: input.task_prompt,
-          runtime_delivery_records: runtimeDeliveries,
-        }),
-      },
-    }
-    : input.outcome === "canceled"
-      ? {
-        type: "stop",
-        command_id: commandId,
-        decision_record_id: decision.id,
-        reason: input.reason,
-        resource_disposition: {
-          kind: "cleanup",
-          runtime_delivery_record_ids: runtimeDeliveries.map(({ id }) => id),
-          cleanup_attempt: deriveKernelTerminalCleanupAttempt({
-            view: input.view,
-            current: attempt,
-            decision,
-            bundle: input.bundle,
-            outcome: input.outcome,
-            task_prompt: input.task_prompt,
-            runtime_delivery_records: runtimeDeliveries,
-          }),
-        },
-      }
-      : {
-        type: "supersede",
-        command_id: commandId,
-        decision_record_id: decision.id,
-        reason: input.reason,
-        resource_disposition: {
-          kind: "cleanup",
-          runtime_delivery_record_ids: runtimeDeliveries.map(({ id }) => id),
-          cleanup_attempt: deriveKernelTerminalCleanupAttempt({
-            view: input.view,
-            current: attempt,
-            decision,
-            bundle: input.bundle,
-            outcome: input.outcome,
-            task_prompt: input.task_prompt,
-            runtime_delivery_records: runtimeDeliveries,
-          }),
-        },
-      };
-  return reduceKernelCommand({
-    manifest: input.view.manifest,
-    run: input.view.run,
-    current_attempt: attempt,
-    records: new Map<string, ExecutionRecord>([
-      ...runtimeDeliveries.map((record) => [record.id, record] as const),
-      [decision.id, decision] as const,
-    ]),
-    checkpoints: new Map(),
-    command,
   });
 }

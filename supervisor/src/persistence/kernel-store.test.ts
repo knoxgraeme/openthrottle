@@ -52,7 +52,6 @@ import {
   initializeFreshEpochDatabase,
 } from "./epoch-database.js";
 import {
-  KernelIntegrityError,
   SqliteKernelStore,
   type KernelStoreFaultPoint,
   type PipelineAdmissionInput,
@@ -1458,82 +1457,6 @@ describe("SqliteKernelStore", () => {
         .toEqual({ status: "pending" });
       expect(context.db.prepare("SELECT status, cursor_stage_id FROM pipeline_runs WHERE id = 'run-1'").get())
         .toEqual({ status: "running", cursor_stage_id: runtimeStopStageId("needs_human") });
-    } finally {
-      context.db.close();
-    }
-  });
-
-  it("commits a blob checkpoint only after verification and blocks active corruption with evidence", async () => {
-    const context = setup();
-    try {
-      context.store.admitPipelineRun(context.admission);
-      const started = await claimAndStart(context);
-      const token = context.blobs.put({
-        bytes: '{"tree":"verified"}',
-        encoding: "utf-8",
-        media_type: "application/json",
-        payload_schema: "checkpoint/v1",
-      });
-      const checkpoint: AttemptCheckpoint = {
-        schema: ATTEMPT_CHECKPOINT_SCHEMA,
-        id: "checkpoint-1",
-        pipeline_run_id: "run-1",
-        attempt_id: "attempt-1",
-        request_hash: started.attempt.request_hash,
-        definition_bundle_hash: started.attempt.definition_bundle_hash,
-        input_subject: started.attempt.input_subject,
-        output_subject: subject("2"),
-        native_session_id: "session-1",
-        payload_schema: "checkpoint/v1",
-        payload: { blob: token.pointer },
-        captured_at: NOW,
-      };
-      const transition = reduceKernelCommand({
-        manifest: context.pipelineManifest,
-        run: started.run,
-        current_attempt: started.attempt,
-        records: new Map(),
-        checkpoints: exactMap(checkpoint),
-        command: {
-          type: "work_complete",
-          command_id: "work-complete-1",
-          attempt_id: "attempt-1",
-          checkpoint_id: "checkpoint-1",
-          verified_output_subject: subject("2"),
-          result_record_id: null,
-        },
-      });
-      await context.store.applyAtomicTransition(transition);
-      expect(context.db.prepare("SELECT blob_digest FROM checkpoints WHERE id = 'checkpoint-1'").get())
-        .toEqual({ blob_digest: token.pointer.digest });
-
-      writeFileSync(context.blobs.objectPath(token.pointer.digest), "corrupt", "utf8");
-      let activeFailure: unknown;
-      try {
-        await context.store.resolveExactContext({
-          pipeline_run_id: "run-1",
-          attempt_id: "attempt-1",
-          allowed_record_ids: [],
-          allowed_checkpoint_ids: ["checkpoint-1"],
-        });
-      } catch (error) {
-        activeFailure = error;
-      }
-      expect(activeFailure).toBeInstanceOf(KernelIntegrityError);
-      expect((activeFailure as KernelIntegrityError).evidence.classification).toBe("active_blocking");
-      expect(context.db.prepare("SELECT status FROM attempts WHERE id = 'attempt-1'").get())
-        .toEqual({ status: "work_complete" });
-
-      context.db.prepare(`
-        UPDATE pipeline_runs SET status = 'failed', terminal_outcome = 'failed', cursor_stage_id = NULL
-        WHERE id = 'run-1'
-      `).run();
-      await expect(context.store.resolveExactContext({
-        pipeline_run_id: "run-1",
-        attempt_id: "attempt-1",
-        allowed_record_ids: [],
-        allowed_checkpoint_ids: ["checkpoint-1"],
-      })).rejects.toMatchObject({ evidence: { classification: "settled_history_incident" } });
     } finally {
       context.db.close();
     }

@@ -412,7 +412,7 @@ export function parseOperatorEffectRejectionEvidence(
   return evidence;
 }
 
-export function operatorEffectRejectionEvidence(
+function operatorEffectRejectionEvidence(
   delivery: DeliveryRecord,
 ): OperatorEffectRejectionEvidence {
   if (
