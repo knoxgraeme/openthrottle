@@ -139,6 +139,6 @@ describe("generated runtime artifacts", () => {
     expect(execFileSync(process.execPath, [
       join(contractsRoot, "scripts/build-runtime-artifacts.mjs"),
       "--check",
-    ], { encoding: "utf8" })).toContain("verified 11 sealed runtime artifacts");
+    ], { encoding: "utf8" })).toContain("verified 12 sealed runtime artifacts");
   });
 });

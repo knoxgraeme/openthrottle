@@ -5,14 +5,17 @@ import { describe, expect, it } from "vitest";
 import {
   RELEASE_COMPILER_ENVIRONMENT_DIGEST,
   RELEASE_PLATFORM_DEFINITION_CATALOG_DIGEST,
+  RESULT_CANDIDATE_SCHEMA,
   compileDefinitionBundle,
   deriveTrustedPlatformDefinitionHashes,
+  validateAndNormalizeResultCandidate,
   verifyCompilerEnvironment,
   verifyPlatformDefinitionSource,
   type CompilerEnvironmentDescriptor,
   type DefinitionBundleEntry,
   type DefinitionCompilation,
   type PlatformDefinitionCatalog,
+  type SemanticResultSchemaContract,
   type TrustedPlatformDefinitionSource,
   type VirtualDefinitionFile,
 } from "./index.js";
@@ -43,6 +46,7 @@ const agentIds = [
   "admission-reviewer",
   "investigator",
   "ordinary-worker",
+  "publication-lead",
   "reviewer",
   "unit-lead",
   "unit-worker",
@@ -56,6 +60,7 @@ const skillIds = [
   "agent-native-contracts",
   "correctness-dataflow",
   "data-migration",
+  "draft-publication",
   "final-repair",
   "implement-plan",
   "implement-unit",
@@ -141,6 +146,14 @@ function agentBindings(result: DefinitionCompilation): Array<[string, string, st
     : []);
 }
 
+function publicationDraftSchema(result: DefinitionCompilation): SemanticResultSchemaContract {
+  const evaluation = result.bundle.value.entries.find((entry) =>
+    entry.definition_kind === "eval" && entry.definition_id === "core/publication-draft"
+  );
+  if (evaluation === undefined) throw new Error("compiled pipeline omitted core/publication-draft");
+  return (evaluation.normalized_payload as { result: SemanticResultSchemaContract }).result;
+}
+
 describe("root .openthrottle definition tree", () => {
   it("contains exactly the canonical filesystem inventory and no retired root config", () => {
     const actual = filesBelow(definitionRoot)
@@ -157,7 +170,7 @@ describe("root .openthrottle definition tree", () => {
   it("matches the release-sealed catalog before interpreting any platform definition", () => {
     const trusted = sealedPlatform();
     const actual = new Set([...trusted.files.keys()].map((path) => path.slice(".openthrottle/".length)));
-    expect(trusted.catalog.files).toHaveLength(49);
+    expect(trusted.catalog.files).toHaveLength(52);
     expect([...actual].filter((path) => path.startsWith("agents/") && path.endsWith("/instructions.md")))
       .toEqual(agentIds.map((id) => `agents/core/${id}/instructions.md`));
     expect([...actual].filter((path) => path.endsWith("/pipeline.yml")))
@@ -168,6 +181,7 @@ describe("root .openthrottle definition tree", () => {
         "evals/core/admission-result/eval.yml",
         "evals/core/admission-review-result/eval.yml",
         "evals/core/persona-selection/eval.yml",
+        "evals/core/publication-draft/eval.yml",
         "evals/core/review-result/eval.yml",
         "evals/core/unit-result/eval.yml",
       ]);
@@ -188,7 +202,7 @@ describe("root .openthrottle definition tree", () => {
       ),
     });
 
-    expect(hashes.size).toBe(39);
+    expect(hashes.size).toBe(42);
     for (const result of pipelineIds.map((id) => compile(id))) {
       for (const definition of result.bundle.value.entries) {
         if (definition.origin.kind !== "platform") continue;
@@ -288,6 +302,7 @@ describe("root .openthrottle definition tree", () => {
         ["core/admission-result", "core/admission-outcome@1"],
         ["core/admission-review-result", "core/admission-review-outcome@1"],
         ["core/persona-selection", "core/action-outcome@1"],
+        ["core/publication-draft", "core/action-outcome@1"],
         ["core/review-result", "core/review-outcome@1"],
         ["core/unit-result", "core/unit-outcome@1"],
       ]);
@@ -307,6 +322,7 @@ describe("root .openthrottle definition tree", () => {
       ["review", "core/reviewer", "inspect"],
       ["simplify", "core/ordinary-worker", "edit"],
       ["post_simplify_review", "core/reviewer", "inspect"],
+      ["draft_publication", "core/publication-lead", "inspect"],
     ]);
     expect(agentBindings(results[1]!)).toEqual([
       ["investigate", "core/investigator", "edit"],
@@ -320,6 +336,7 @@ describe("root .openthrottle definition tree", () => {
       ["persona_review", "core/reviewer", "inspect"],
       ["validate_review_findings", "core/reviewer", "inspect"],
       ["final_repair", "core/ordinary-worker", "edit"],
+      ["draft_publication", "core/publication-lead", "inspect"],
     ]);
     expect(agentBindings(results[3]!)).toEqual([
       ["plan", "core/admission-planner", "inspect"],
@@ -379,6 +396,82 @@ describe("root .openthrottle definition tree", () => {
       ],
       loop: { over: "selection.personas", body: ["persona_review"] },
     });
+  });
+
+  it("places one inspect-only publication lead directly before ordinary and structured publication", () => {
+    const results = pipelineIds.map((id) => compile(id));
+
+    expect(results.map((result) => result.manifest.value.stages
+      .filter((stage) => stage.id === "draft_publication").length)).toEqual([1, 0, 1, 0]);
+
+    for (const result of [results[0]!, results[2]!]) {
+      const stages = result.manifest.value.stages;
+      const draftIndex = stages.findIndex((stage) => stage.id === "draft_publication");
+      const publishIndex = stages.findIndex((stage) =>
+        stage.kind === "effect" && stage.effect === "core/publish@1"
+      );
+      expect(draftIndex).toBeGreaterThanOrEqual(0);
+      expect(publishIndex).toBe(draftIndex + 1);
+      expect(stages[draftIndex]).toEqual({
+        id: "draft_publication",
+        kind: "agent",
+        agent_id: "core/publication-lead",
+        repository_authority: "inspect",
+        skills: ["core/draft-publication"],
+        entry_skill: "core/draft-publication",
+        eval: "core/publication-draft",
+        engine: "codex",
+        on: { success: { to: "publish" } },
+      });
+      expect(stages.filter((stage) => stage.kind === "agent" && Object.values(stage.on)
+        .some((transition) => transition.to === "publish")).map(({ id }) => id))
+        .toEqual(["draft_publication"]);
+
+      const selected = new Set(result.bundle.value.entries.map((entry) =>
+        `${entry.definition_kind}:${entry.definition_id}`
+      ));
+      expect(selected.has("agent:core/publication-lead")).toBe(true);
+      expect(selected.has("skill:core/draft-publication")).toBe(true);
+      expect(selected.has("eval:core/publication-draft")).toBe(true);
+    }
+  });
+
+  it("accepts exact publication-copy limits and rejects every malformed closed shape", () => {
+    const schema = publicationDraftSchema(compile("implement"));
+    const valid = {
+      schema: RESULT_CANDIDATE_SCHEMA,
+      outcome: "success",
+      payload: { title: "T".repeat(72), body: "B".repeat(12_000) },
+    };
+
+    expect(validateAndNormalizeResultCandidate(valid, schema).value).toEqual(valid);
+    const invalidCases: Array<{ payload: Record<string, string>; error: string }> = [
+      { payload: { body: "body" }, error: "result_candidate.payload.title: is required" },
+      { payload: { title: "title" }, error: "result_candidate.payload.body: is required" },
+      {
+        payload: { title: "", body: "body" },
+        error: "result_candidate.payload.title: must be a non-empty string",
+      },
+      {
+        payload: { title: "title", body: "" },
+        error: "result_candidate.payload.body: must be a non-empty string",
+      },
+      {
+        payload: { title: "T".repeat(73), body: "body" },
+        error: "result_candidate.payload.title: must be at most 72 characters",
+      },
+      {
+        payload: { title: "title", body: "B".repeat(12_001) },
+        error: "result_candidate.payload.body: must be at most 12000 characters",
+      },
+      {
+        payload: { title: "title", body: "body", provenance: "agent-authored" },
+        error: "result_candidate.payload.provenance: unknown field",
+      },
+    ];
+    for (const { payload, error } of invalidCases) {
+      expect(() => validateAndNormalizeResultCandidate({ ...valid, payload }, schema)).toThrow(error);
+    }
   });
 
   it("gives ordinary repair the failure-oriented skill without changing its stage contract", () => {

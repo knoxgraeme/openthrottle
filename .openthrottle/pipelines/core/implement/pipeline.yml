@@ -91,10 +91,19 @@ stages:
     kind: command
     command: build
     on:
-      success: {to: publish}
-      no_change: {to: publish}
+      success: {to: draft_publication}
+      no_change: {to: draft_publication}
       retryable_infrastructure_failure: {to: build, max_reentries: 2, on_exhausted: failed}
       failure: {to: repair, max_reentries: 5, on_exhausted: needs_human}
+  - id: draft_publication
+    kind: agent
+    agent_id: core/publication-lead
+    repository_authority: inspect
+    skills: [core/draft-publication]
+    entry_skill: core/draft-publication
+    eval: core/publication-draft
+    on:
+      success: {to: publish}
   - id: publish
     kind: effect
     effect: core/publish@1
