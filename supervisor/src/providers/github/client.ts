@@ -7,7 +7,16 @@ import {
 } from "@openthrottle/contracts";
 import { RepositoryRefConflictError } from "../../app/ports.js";
 import { assertGithubResponseOk, githubApiResponse } from "../../shared/github-request.js";
-import { buildGithubPullRequestBody } from "./pull-request-body.js";
+import {
+  assertGithubPublicationCopy,
+  buildGithubPullRequestBody,
+  isGithubPublicationOwnershipMarker,
+  validateGithubPublicationProvenance,
+  validateGithubPublicationSelection,
+  validateGithubVerifiedGateRecordIds,
+  type GithubPublicationProvenance,
+  type GithubPublicationSelectionEvidence,
+} from "./pull-request-body.js";
 
 const GITHUB_COMMIT_SHA_PATTERN = /^[a-f0-9]{40}$/;
 const GITHUB_DEFINITION_SHA_PATTERN = /^[a-f0-9]{40,64}$/;
@@ -268,16 +277,21 @@ export async function publishRepositoryTaskBranch(
     title: string;
     body: string;
     ownershipMarker: string;
+    pipelineRunId: string;
+    publicationSelection: GithubPublicationSelectionEvidence;
+    publicationProvenance: GithubPublicationProvenance;
+    verifiedGateRecordIds: string[];
   },
 ): Promise<{ sha: string; url: string }> {
   assertTaskRefInput(`refs/heads/${input.branch}`, input.expectedHeadSha);
   assertTaskRefInput(`refs/heads/${input.baseBranch}`, input.expectedHeadSha);
-  if (!/^[a-z0-9:_-]{16,200}$/.test(input.ownershipMarker)) {
+  if (!isGithubPublicationOwnershipMarker(input.ownershipMarker)) {
     throw new Error("GitHub publication ownership marker is invalid");
   }
-  if (input.title.length < 1 || input.title.length > 256 || input.body.length > 32_000) {
-    throw new Error("GitHub publication title or body exceeds its bound");
-  }
+  assertGithubPublicationCopy(input.title, input.body);
+  validateGithubPublicationSelection(input.publicationSelection, input.pipelineRunId);
+  validateGithubPublicationProvenance(input.publicationProvenance);
+  validateGithubVerifiedGateRecordIds(input.verifiedGateRecordIds);
   const remoteHead = await getRepositoryRef(
     client,
     input.repository,

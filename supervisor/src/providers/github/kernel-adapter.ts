@@ -15,7 +15,16 @@ import type {
 import { githubApiResponse } from "../../shared/github-request.js";
 import { pushRepositoryCheckpoint } from "./checkpoint-push.js";
 import { publishRepositoryTaskBranch, type GithubClient } from "./client.js";
-import { buildGithubPullRequestBody } from "./pull-request-body.js";
+import {
+  assertGithubPublicationCopy,
+  buildGithubPullRequestBody,
+  isGithubPublicationOwnershipMarker,
+  validateGithubPublicationProvenance,
+  validateGithubPublicationSelection,
+  validateGithubVerifiedGateRecordIds,
+  type GithubPublicationProvenance,
+  type GithubPublicationSelectionEvidence,
+} from "./pull-request-body.js";
 
 const SUBJECT = /^[a-f0-9]{40}$/;
 const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -42,6 +51,9 @@ interface PullRequestPayload {
   title: string;
   body: string;
   ownership_marker: string;
+  publication_selection: GithubPublicationSelectionEvidence;
+  publication_provenance: GithubPublicationProvenance;
+  verified_gate_record_ids: string[];
 }
 
 interface ProviderWaitPayload {
@@ -121,8 +133,16 @@ function pullRequestPayload(intent: Readonly<EffectIntent>): PullRequestPayload 
   const value = object(intent.payload, `effect ${intent.id} payload`);
   exactKeys(value, [
     "schema", "repository", "branch", "base_branch", "expected_head_subject",
-    "title", "body", "ownership_marker",
+    "title", "body", "ownership_marker", "publication_selection",
+    "publication_provenance", "verified_gate_record_ids",
   ], "GitHub pull request payload");
+  assertGithubPublicationCopy(value.title, value.body);
+  const publicationSelection = validateGithubPublicationSelection(
+    value.publication_selection,
+    intent.pipeline_run_id,
+  );
+  const publicationProvenance = validateGithubPublicationProvenance(value.publication_provenance);
+  const verifiedGateRecordIds = validateGithubVerifiedGateRecordIds(value.verified_gate_record_ids);
   if (
     value.schema !== "openthrottle.github-pull-request/v1" ||
     typeof value.repository !== "string" || !REPOSITORY.test(value.repository) ||
@@ -130,11 +150,14 @@ function pullRequestPayload(intent: Readonly<EffectIntent>): PullRequestPayload 
     typeof value.base_branch !== "string" || value.base_branch.length < 1 || value.base_branch.length > 300 ||
     typeof value.expected_head_subject !== "string" || !SUBJECT.test(value.expected_head_subject) ||
     value.expected_head_subject !== intent.subject ||
-    typeof value.title !== "string" || value.title.length < 1 || value.title.length > 256 ||
-    typeof value.body !== "string" || value.body.length > 32_000 ||
-    typeof value.ownership_marker !== "string" || !/^[a-z0-9:_-]{16,200}$/.test(value.ownership_marker)
+    !isGithubPublicationOwnershipMarker(value.ownership_marker)
   ) throw new Error(`effect ${intent.id} has invalid GitHub pull request authority`);
-  return value as unknown as PullRequestPayload;
+  return {
+    ...(value as unknown as PullRequestPayload),
+    publication_selection: publicationSelection,
+    publication_provenance: publicationProvenance,
+    verified_gate_record_ids: verifiedGateRecordIds,
+  };
 }
 
 function waitPayload(intent: Readonly<EffectIntent>): ProviderWaitPayload {
@@ -198,59 +221,43 @@ async function collectPullRequests(
   };
 }
 
+function hasExactPullRequestCoordinates(
+  candidate: unknown,
+  payload: PullRequestPayload,
+): candidate is Record<string, unknown> {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+  const pull = candidate as Record<string, unknown>;
+  const head = pull.head;
+  const base = pull.base;
+  if (
+    !head || typeof head !== "object" || Array.isArray(head) ||
+    !base || typeof base !== "object" || Array.isArray(base)
+  ) return false;
+  const headValue = head as Record<string, unknown>;
+  const headRepository = headValue.repo;
+  return headValue.sha === payload.expected_head_subject && headValue.ref === payload.branch &&
+    headRepository !== null && typeof headRepository === "object" && !Array.isArray(headRepository) &&
+    typeof (headRepository as Record<string, unknown>).full_name === "string" &&
+    ((headRepository as Record<string, unknown>).full_name as string).toLowerCase() ===
+      payload.repository.toLowerCase() &&
+    (base as Record<string, unknown>).ref === payload.base_branch;
+}
+
 function exactOwnedPullRequests(
   entries: readonly unknown[],
   payload: PullRequestPayload,
 ): Record<string, unknown>[] {
   const canonicalBody = buildGithubPullRequestBody(payload.body, payload.ownership_marker);
-  return entries.filter((candidate): candidate is Record<string, unknown> => {
-    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
-    const pull = candidate as Record<string, unknown>;
-    const head = pull.head;
-    const base = pull.base;
-    if (
-      !head || typeof head !== "object" || Array.isArray(head) ||
-      !base || typeof base !== "object" || Array.isArray(base)
-    ) return false;
-    const headValue = head as Record<string, unknown>;
-    const baseValue = base as Record<string, unknown>;
-    const headRepository = headValue.repo;
-    return (
-      headValue.sha === payload.expected_head_subject &&
-      headValue.ref === payload.branch &&
-      headRepository !== null && typeof headRepository === "object" && !Array.isArray(headRepository) &&
-      typeof (headRepository as Record<string, unknown>).full_name === "string" &&
-      ((headRepository as Record<string, unknown>).full_name as string).toLowerCase() ===
-        payload.repository.toLowerCase() &&
-      baseValue.ref === payload.base_branch &&
-      pull.title === payload.title &&
-      pull.body === canonicalBody
-    );
-  });
+  return entries.filter((candidate): candidate is Record<string, unknown> =>
+    hasExactPullRequestCoordinates(candidate, payload) &&
+    candidate.title === payload.title && candidate.body === canonicalBody);
 }
 
 function exactPullRequestCoordinates(
   entries: readonly unknown[],
   payload: PullRequestPayload,
 ): Record<string, unknown>[] {
-  return entries.filter((candidate): candidate is Record<string, unknown> => {
-    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
-    const pull = candidate as Record<string, unknown>;
-    const head = pull.head;
-    const base = pull.base;
-    if (
-      !head || typeof head !== "object" || Array.isArray(head) ||
-      !base || typeof base !== "object" || Array.isArray(base)
-    ) return false;
-    const headValue = head as Record<string, unknown>;
-    const headRepository = headValue.repo;
-    return headValue.sha === payload.expected_head_subject && headValue.ref === payload.branch &&
-      headRepository !== null && typeof headRepository === "object" && !Array.isArray(headRepository) &&
-      typeof (headRepository as Record<string, unknown>).full_name === "string" &&
-      ((headRepository as Record<string, unknown>).full_name as string).toLowerCase() ===
-        payload.repository.toLowerCase() &&
-      (base as Record<string, unknown>).ref === payload.base_branch;
-  });
+  return entries.filter((candidate) => hasExactPullRequestCoordinates(candidate, payload));
 }
 
 async function githubPage(
@@ -757,6 +764,10 @@ export class GithubKernelAdapter {
       title: payload.title,
       body: payload.body,
       ownershipMarker: payload.ownership_marker,
+      pipelineRunId: intent.pipeline_run_id,
+      publicationSelection: payload.publication_selection,
+      publicationProvenance: payload.publication_provenance,
+      verifiedGateRecordIds: payload.verified_gate_record_ids,
     });
   }
 

@@ -309,6 +309,17 @@ an Attempt and at most one DeliveryRecord owns an Effect. A settled Attempt has
 an explicit DecisionRecord; pointer presence, not historical scanning, proves
 ownership.
 
+Publication prose is nondeterministic semantic evidence, not executor
+authority. Immediately before publication, one inspect-only publication lead
+authors a nonempty title of at most 72 characters and a nonempty body of at
+most 12,000 characters against the exact final accepted subject. Its semantic
+payload contains only `title` and `body`; normal result-only correction may fix
+malformed copy without rerunning implementation, review, or command work. The
+publish stage accepts exactly one executor-accepted publication ResultRecord
+for the same run, DefinitionBundle, and input subject. A subject-changing
+repair therefore requires a fresh drafting Attempt and cannot reuse stale
+prose.
+
 ### 5.6 Atomic reduction
 
 The reducer is a pure function of the compiled manifest, run, current Attempts,
@@ -530,6 +541,18 @@ or moved ref is rejected rather than recreated. Pull-request reconciliation
 matches the exact repository, branch, head, base, title, canonical body, and
 ownership marker. A base that already contains the proposed head resolves
 deterministically instead of remaining an absent, replay-ineligible mutation.
+
+The publication Effect is the deterministic boundary after semantic
+authorship. It copies the accepted title and body bytes without rewriting and
+seals their ResultRecord and acceptance DecisionRecord identities alongside
+executor-authored run, ticket, exact-subject, verified-gate, repository, branch,
+base, expected-head, and ownership evidence. These authority fields remain
+separate from agent-authored prose. Scheduling fixes the complete Effect bytes;
+retry, publish re-entry, crash recovery, and unknown-outcome reconciliation
+reuse that intent and never invoke authorship again. Missing, duplicate,
+foreign, stale, malformed, oversized, or widened publication evidence fails
+before any GitHub Effect is scheduled, while reconciliation continues to fail
+closed on any title, canonical-body, coordinate, head, or marker drift.
 
 Built-in plans cover Daytona provision/stop/cleanup, accepted structured-unit
 integration, exact-subject GitHub publication, and trusted GitHub provider

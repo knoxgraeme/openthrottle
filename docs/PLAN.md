@@ -19,7 +19,8 @@ subject, OpenThrottle can:
    normalization or bounded result-only correction;
 5. review exact accepted edits without making the review checkout writable;
 6. run configured commands, integrate accepted structured units, publish the
-   exact subject, reconcile provider evidence, and clean runtime resources;
+   exact subject with useful lead-authored title and body copy, reconcile
+   provider evidence, and clean runtime resources;
 7. expose status, logs, historical record metadata, stop/supersede control, and
    maintenance fencing through one bounded operator surface.
 
@@ -50,6 +51,12 @@ subject, OpenThrottle can:
 - External writes are write-ahead Effects with one idempotency key. The worker
   reconciles before writing and records confirmed or rejected delivery
   evidence.
+- Publication authorship is one inspect-only semantic Attempt bound to the
+  exact final accepted subject. Its bounded title/body ResultRecord remains
+  separate from executor-authored ticket provenance and verified gate evidence.
+  Publication scheduling seals both into one immutable GitHub Effect; retry,
+  restart, re-entry, and unknown reconciliation replay those exact bytes rather
+  than re-authoring prose.
 - SQLite has one fresh twelve-table epoch. Immutable payloads above the inline
   bound use verified content-addressed blobs.
 - Provider ingress is durably deduplicated. During maintenance it returns a
@@ -80,6 +87,11 @@ The release is accepted only when all of the following hold:
   Attempt or native session.
 - Effect retries reconcile known external state before writing and never replay
   an unknown mutation blindly.
+- Publication rejects missing, duplicate, foreign-run, wrong-subject, stale,
+  malformed, oversized, or widened draft evidence before GitHub scheduling.
+  A subject-changing repair requires a fresh draft, while exact-subject recovery
+  retains the same ResultRecord, title/body bytes, provenance, gate evidence,
+  expected head, and ownership marker.
 - Local image and harness proof covers sandbox authority profiles, result
   normalization, immutable checkpoint/integration transport, kernel
   settlement/restart, and structured frontier progression with stubs. Live

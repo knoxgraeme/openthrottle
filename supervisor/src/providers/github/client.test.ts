@@ -24,6 +24,26 @@ const WEBHOOK_EVENTS = [
   "check_suite",
 ] as const;
 
+function publicationEvidence(inputSubject: string) {
+  return {
+    pipelineRunId: "run-1",
+    publicationSelection: {
+      result_record_id: `result-${"1".repeat(48)}`,
+      acceptance_decision_record_id: `decision-${"2".repeat(48)}`,
+      pipeline_run_id: "run-1",
+      definition_bundle_hash: "f".repeat(64),
+      input_subject: inputSubject,
+    },
+    publicationProvenance: {
+      work_item_id: "work-1",
+      source_provider: "linear" as const,
+      source_id: "issue-1",
+      source_reference: "OPE-201",
+    },
+    verifiedGateRecordIds: [],
+  };
+}
+
 describe("GitHub kernel client", () => {
   it("exports only the production kernel surface", () => {
     expect(Object.keys(githubClientModule).sort()).toEqual([
@@ -262,12 +282,50 @@ describe("GitHub kernel client", () => {
       title: "fix: complete OPE-187",
       body: "Implements the approved task.",
       ownershipMarker: marker,
+      ...publicationEvidence(sha),
     };
 
     await expect(publishRepositoryTaskBranch({ token: "github", fetch: fetchMock }, input))
       .resolves.toEqual({ sha, url: "https://github.com/o/r/pull/7" });
     await expect(publishRepositoryTaskBranch({ token: "github", fetch: fetchMock }, input))
       .resolves.toEqual({ sha, url: "https://github.com/o/r/pull/7" });
+  });
+
+  it.each([
+    ["oversized title", (input: Record<string, unknown>) => { input.title = "t".repeat(73); }],
+    ["empty body", (input: Record<string, unknown>) => { input.body = ""; }],
+    ["foreign publication run", (input: Record<string, unknown>) => {
+      (input.publicationSelection as Record<string, unknown>).pipeline_run_id = "run-foreign";
+    }],
+    ["forged provenance", (input: Record<string, unknown>) => {
+      (input.publicationProvenance as Record<string, unknown>).source_provider = "agent";
+    }],
+    ["non-canonical gates", (input: Record<string, unknown>) => {
+      input.verifiedGateRecordIds = [
+        `result-${"4".repeat(48)}`,
+        `decision-${"3".repeat(48)}`,
+      ];
+    }],
+  ])("rejects %s before provider access", async (_label, mutate) => {
+    const sha = "b".repeat(40);
+    const input: Record<string, unknown> = {
+      repository: "o/r",
+      branch: "ot/issue-1",
+      baseBranch: "main",
+      expectedHeadSha: sha,
+      title: "fix: complete OPE-187",
+      body: "Implements the approved task.",
+      ownershipMarker: "openthrottle:publish:pipeline-1:attempt-1",
+      ...publicationEvidence(sha),
+    };
+    mutate(input);
+    const fetchMock = vi.fn();
+
+    await expect(publishRepositoryTaskBranch(
+      { token: "github", fetch: fetchMock as unknown as typeof fetch },
+      input as never,
+    )).rejects.toThrow(/publication/i);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("fails closed for a missing head or an unowned pull request", async () => {
@@ -280,6 +338,7 @@ describe("GitHub kernel client", () => {
       title: "fix: complete OPE-187",
       body: "Implements the approved task.",
       ownershipMarker: "openthrottle:publish:pipeline-1:attempt-1",
+      ...publicationEvidence(sha),
     };
     const missingFetch = vi.fn(async () => new Response("missing", { status: 404 })) as unknown as typeof fetch;
     await expect(publishRepositoryTaskBranch(
@@ -343,6 +402,7 @@ describe("GitHub kernel client", () => {
         title: "fix: complete OPE-187",
         body: "Implements the approved task.",
         ownershipMarker: marker,
+        ...publicationEvidence(sha),
       },
     )).resolves.toEqual({ sha, url: "https://github.com/o/r/pull/7" });
   });
@@ -381,6 +441,7 @@ describe("GitHub kernel client", () => {
         title: "fix: complete OPE-187",
         body: "Implements the approved task.",
         ownershipMarker: marker,
+        ...publicationEvidence(sha),
       },
     )).rejects.toMatchObject({ name: "RepositoryRefConflictError", retryable: false });
   });

@@ -750,8 +750,41 @@ describe("kernel publication plan binding", () => {
     });
     expect(firstPromoted.prepared.phases[2]!.effects[0]).toMatchObject({
       subject: firstPublication,
-      payload: { expected_head_subject: firstPublication },
+      payload: {
+        expected_head_subject: firstPublication,
+        title: "Lead-authored publication title",
+        body: "Behavioral summary, rationale, risks, and verification.",
+        publication_selection: {
+          result_record_id: draftRecords[0]!.id,
+          acceptance_decision_record_id: draftRecords[1]!.id,
+          pipeline_run_id: "run-1",
+          definition_bundle_hash: "b".repeat(64),
+          input_subject: candidateSubject,
+        },
+        publication_provenance: {
+          work_item_id: "work-1",
+          source_provider: "linear",
+          source_id: "issue-1",
+          source_reference: "OPE-201",
+        },
+        verified_gate_record_ids: [],
+      },
     });
+
+    const changedAuthorship = structuredClone(firstPrepared);
+    (changedAuthorship.checkpoint_payload as Record<string, unknown>).publication_selection = {
+      ...(firstPrepared.checkpoint_payload as Record<string, Record<string, unknown>>)
+        .publication_selection,
+      title: "Re-authored after scheduling",
+    };
+    await expect(publish.promote!({
+      run,
+      attempt,
+      stage: {} as never,
+      context: baseContext,
+      prepared: changedAuthorship,
+      schedules: [{ effects: [{ delivery: firstDelivery }] }] as never,
+    })).rejects.toThrow(/sealed authorship/i);
 
     // Recovery after phase-zero promotion retains the immutable private
     // candidate on the Attempt even though the durable run subject is now P1.

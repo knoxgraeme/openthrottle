@@ -69,6 +69,20 @@ function pullRequest(input: { body?: string; ownershipMarker?: string } = {}): E
       title: PULL_REQUEST_TITLE,
       body: input.body ?? PULL_REQUEST_BODY,
       ownership_marker: input.ownershipMarker ?? OWNERSHIP_MARKER,
+      publication_selection: {
+        result_record_id: `result-${"1".repeat(48)}`,
+        acceptance_decision_record_id: `decision-${"2".repeat(48)}`,
+        pipeline_run_id: "run-1",
+        definition_bundle_hash: "f".repeat(64),
+        input_subject: SUBJECT,
+      },
+      publication_provenance: {
+        work_item_id: "work-1",
+        source_provider: "linear",
+        source_id: "issue-1",
+        source_reference: "OPE-201",
+      },
+      verified_gate_record_ids: [],
     },
   };
 }
@@ -464,6 +478,36 @@ describe("GithubKernelAdapter checkpoint push", () => {
 });
 
 describe("GithubKernelAdapter pull request reconciliation", () => {
+  it.each([
+    ["oversized title", (payload: Record<string, unknown>) => { payload.title = "t".repeat(73); }],
+    ["empty body", (payload: Record<string, unknown>) => { payload.body = ""; }],
+    ["oversized body", (payload: Record<string, unknown>) => { payload.body = "b".repeat(12_001); }],
+    ["extra payload field", (payload: Record<string, unknown>) => { payload.forged = true; }],
+    ["foreign run selection", (payload: Record<string, unknown>) => {
+      (payload.publication_selection as Record<string, unknown>).pipeline_run_id = "run-foreign";
+    }],
+    ["extra selection field", (payload: Record<string, unknown>) => {
+      (payload.publication_selection as Record<string, unknown>).forged = true;
+    }],
+    ["invalid provenance", (payload: Record<string, unknown>) => {
+      (payload.publication_provenance as Record<string, unknown>).source_provider = "agent";
+    }],
+    ["duplicate gate evidence", (payload: Record<string, unknown>) => {
+      payload.verified_gate_record_ids = [
+        `result-${"3".repeat(48)}`,
+        `result-${"3".repeat(48)}`,
+      ];
+    }],
+  ])("rejects %s before GitHub access", async (_label, mutate) => {
+    const intent = structuredClone(pullRequest());
+    mutate(intent.payload as Record<string, unknown>);
+    const fetch = vi.fn();
+
+    await expect(pullRequestReconciliation(fetch as unknown as typeof globalThis.fetch, intent))
+      .rejects.toThrow(/publication|pull request/i);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it.each([
     [
       "trailing whitespace",

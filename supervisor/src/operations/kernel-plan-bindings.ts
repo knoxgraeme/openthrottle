@@ -1,5 +1,6 @@
 import {
   ATTEMPT_CHECKPOINT_SCHEMA,
+  canonicalJson,
   digestCanonicalJson,
   validateFilesystemConfigContract,
   type AttemptCheckpoint,
@@ -520,7 +521,7 @@ export function createKernelExternalPlanBindings(input: {
         ],
       };
     },
-    async promote({ run, attempt, prepared, schedules }) {
+    async promote({ run, attempt, context, prepared, schedules }) {
       const delivery = schedules[0]?.effects[0]?.delivery;
       if (!delivery || delivery.status !== "confirmed") {
         throw new Error("publication promotion lacks confirmed compaction delivery");
@@ -559,6 +560,38 @@ export function createKernelExternalPlanBindings(input: {
         captured_at: delivery.created_at,
       };
       const environment = input.environments.loadExactRunEnvironment(run.id);
+      const exactPublication = selectPublicationDraft({
+        records: context.records.values(),
+        pipeline_run_id: run.id,
+        definition_bundle_hash: run.definition_bundle_hash,
+        input_subject: attempt.input_subject,
+      });
+      const publicationSelection = {
+        result_record_id: exactPublication.result.id,
+        acceptance_decision_record_id: exactPublication.acceptance.id,
+        pipeline_run_id: run.id,
+        definition_bundle_hash: run.definition_bundle_hash,
+        input_subject: attempt.input_subject,
+        title: exactPublication.title,
+        body: exactPublication.body,
+      };
+      const publicationProvenance = {
+        work_item_id: environment.work_item_id,
+        source_provider: environment.source_provider,
+        source_id: environment.source_id,
+        source_reference: environment.source_reference,
+      };
+      const verifiedGateRecordIds = sameSubjectGateEvidence({
+        records: context.records.values(),
+        pipeline_run_id: run.id,
+        definition_bundle_hash: run.definition_bundle_hash,
+        input_subject: attempt.input_subject,
+      }).map(({ id }) => id);
+      if (
+        canonicalJson(planning.publication_selection) !== canonicalJson(publicationSelection) ||
+        canonicalJson(planning.publication_provenance) !== canonicalJson(publicationProvenance) ||
+        canonicalJson(planning.verified_gate_record_ids) !== canonicalJson(verifiedGateRecordIds)
+      ) throw new Error("publication promotion changed its sealed authorship or executor evidence");
       const taskBranch = branch(run.id, environment.source_reference);
       if (taskRef !== `refs/heads/${taskBranch}`) {
         throw new Error("publication compaction changed its deterministic task ref");
@@ -601,9 +634,18 @@ export function createKernelExternalPlanBindings(input: {
               branch: taskBranch,
               base_branch: environment.base_branch,
               expected_head_subject: output,
-              title: environment.title.slice(0, 256),
-              body: `OpenThrottle execution ${run.id} for ${environment.source_reference}.`,
+              title: publicationSelection.title,
+              body: publicationSelection.body,
               ownership_marker: `openthrottle:run:${digestCanonicalJson({ run_id: run.id })}`,
+              publication_selection: {
+                result_record_id: publicationSelection.result_record_id,
+                acceptance_decision_record_id: publicationSelection.acceptance_decision_record_id,
+                pipeline_run_id: publicationSelection.pipeline_run_id,
+                definition_bundle_hash: publicationSelection.definition_bundle_hash,
+                input_subject: publicationSelection.input_subject,
+              },
+              publication_provenance: publicationProvenance,
+              verified_gate_record_ids: verifiedGateRecordIds,
             },
           }],
         }],
