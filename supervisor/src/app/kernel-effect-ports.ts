@@ -1,11 +1,16 @@
 import type { EffectIntent, JsonValue } from "@openthrottle/contracts";
+import type { EffectContinuationState } from "../pipeline/kernel/effect-intent.js";
 
 export type KernelEffectIdempotencyStrategy = "provider_native" | "deterministic_target";
 
 export type KernelEffectProviderObservation =
   | { kind: "found"; status: "confirmed" | "rejected"; payload: JsonValue }
   | { kind: "not_found" }
-  | { kind: "unknown"; detail: string };
+  | {
+    kind: "unknown";
+    detail: string;
+    continuation_state?: EffectContinuationState;
+  };
 
 export interface KernelEffectDispatchFence {
   lease_id: string;
@@ -16,6 +21,7 @@ export interface KernelEffectReconciliationRequest {
   intent: Readonly<EffectIntent>;
   external_identity: string;
   dispatch_fence: KernelEffectDispatchFence | null;
+  continuation_state?: Readonly<EffectContinuationState> | null;
 }
 
 export interface KernelEffectDispatchRequest extends KernelEffectReconciliationRequest {

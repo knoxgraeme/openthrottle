@@ -1,11 +1,16 @@
 import type Database from "better-sqlite3";
 import {
+  canonicalJson,
   validateEffectIntent,
   type BlobPointer,
   type EffectIntent,
   type ExecutionRecord,
 } from "@openthrottle/contracts";
-import type { EffectReconciliation } from "../pipeline/kernel/effect-intent.js";
+import {
+  validateEffectContinuationState,
+  type EffectContinuationState,
+  type EffectReconciliation,
+} from "../pipeline/kernel/effect-intent.js";
 import type {
   AttemptLeaseRequest,
   LeasedAttemptView,
@@ -269,6 +274,7 @@ export class KernelLeaseOperations {
             lease_id: replay.dispatch_lease_id,
             worker_id: replay.dispatch_worker_id!,
           },
+          continuation_state: this.#effectContinuationStateFromRow(replay),
         };
       }
       const row = this.#db.prepare(`
@@ -307,6 +313,7 @@ export class KernelLeaseOperations {
           lease_id: row.dispatch_lease_id,
           worker_id: row.dispatch_worker_id!,
         },
+        continuation_state: this.#effectContinuationStateFromRow(row),
       };
     }).immediate();
   }
@@ -348,6 +355,7 @@ export class KernelLeaseOperations {
           lease_id: row.dispatch_lease_id,
           worker_id: row.dispatch_worker_id!,
         },
+        continuation_state: this.#effectContinuationStateFromRow(row),
       };
     }).immediate();
   }
@@ -381,15 +389,24 @@ export class KernelLeaseOperations {
           new Date(retryAt).toISOString() !== input.reconciliation.retry_at ||
           retryAt <= Date.parse(now)
         ) throw new Error("unknown effect reconciliation retry_at must be a future canonical timestamp");
+        const persistedContinuationState = this.#effectContinuationStateFromRow(row);
+        const continuationState = input.reconciliation.continuation_state == null
+          ? persistedContinuationState
+          : validateEffectContinuationState(input.reconciliation.continuation_state);
+        if (
+          continuationState !== null &&
+          retryAt > Date.parse(continuationState.retry_deadline)
+        ) throw new Error("unknown effect reconciliation retry_at exceeds its continuation deadline");
         const changed = this.#db.prepare(`
           UPDATE effects
           SET status = 'unknown', lease_id = NULL, lease_worker_id = NULL,
               lease_expires_at = NULL, lease_execution_mode = NULL, unknown_detail = ?,
-              available_at = ?, version = version + 1, updated_at = ?
+              available_at = ?, continuation_state_json = ?, version = version + 1, updated_at = ?
           WHERE id = ? AND version = ? AND lease_id = ? AND lease_worker_id = ? AND status = 'processing'
         `).run(
           input.reconciliation.detail,
           input.reconciliation.retry_at,
+          continuationState === null ? null : canonicalJson(continuationState),
           now,
           row.id,
           row.version,
@@ -408,6 +425,7 @@ export class KernelLeaseOperations {
           UPDATE effects
           SET status = ?, lease_id = NULL, lease_worker_id = NULL, lease_expires_at = NULL,
               lease_execution_mode = NULL, delivery_record_id = ?, unknown_detail = NULL,
+              continuation_state_json = NULL,
               version = version + 1, updated_at = ?
           WHERE id = ? AND version = ? AND lease_id = ? AND lease_worker_id = ? AND status = 'processing'
         `).run(
@@ -478,5 +496,13 @@ export class KernelLeaseOperations {
       subject: row.subject,
       payload,
     }).value;
+  }
+
+  #effectContinuationStateFromRow(row: EffectRow): EffectContinuationState | null {
+    if (row.continuation_state_json === null) return null;
+    return validateEffectContinuationState(
+      parseJson(row.continuation_state_json, `effect ${row.id} continuation state`),
+      `effect ${row.id} continuation state`,
+    );
   }
 }

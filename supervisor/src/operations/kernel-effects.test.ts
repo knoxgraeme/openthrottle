@@ -13,6 +13,7 @@ import {
   OPERATOR_EFFECT_REJECTION_RUNTIME_SNAPSHOT,
 } from "../pipeline/kernel/operator-effect-rejection.js";
 import type { EffectReconciliation } from "../pipeline/kernel/effect-intent.js";
+import type { EffectContinuationState } from "../pipeline/kernel/effect-intent.js";
 import {
   createKernelEffectAdapterRegistry,
   createKernelEffectExecutionService,
@@ -106,6 +107,7 @@ function lease(
       lease_id: "dispatch-lease-1",
       worker_id: "worker-1",
     } : null,
+    continuation_state: null,
   };
 }
 
@@ -456,8 +458,90 @@ describe("kernel effect execution", () => {
       external_identity: intent.target,
       detail: "provider timed out with [REDACTED]",
       retry_at: "2026-08-20T12:00:05.000Z",
+      continuation_state: null,
     });
     expect(result).toMatchObject({ retry_at: "2026-08-20T12:00:05.000Z" });
+  });
+
+  it("passes bounded continuation state through a held observation and caps retry_at", async () => {
+    const continuation = {
+      schema: "openthrottle.effect-continuation/v1",
+      retry_deadline: "2026-08-20T12:00:02.000Z",
+      payload: {
+        provider: "github",
+        checks: [{
+          name: "quality",
+          first_failed_at: NOW,
+          failed_observation_count: 1,
+          failed_observation_ids: [17],
+        }],
+      },
+    } satisfies EffectContinuationState;
+    const intent = effect({ kind: "github/provider-wait@1" });
+    const adapter: KernelEffectRuntimeAdapter = {
+      async reconcile(request) {
+        expect(request.continuation_state).toBeNull();
+        return {
+          kind: "unknown",
+          detail: "required check quality failed; awaiting an eligible rerun",
+          continuation_state: continuation,
+        };
+      },
+      async dispatch() {
+        throw new Error("observation effects must not dispatch");
+      },
+    };
+    const port = new FakeEffectPort([lease(intent)]);
+
+    await expect(service({
+      port,
+      binding: binding(adapter, { effect_kind: intent.kind, operation: "observation" }),
+    }).drainOne({
+      worker_id: "worker-1",
+      lease_id: "lease-1",
+      expires_at: "2026-08-20T12:01:00.000Z",
+    })).resolves.toMatchObject({
+      kind: "held_unknown",
+      retry_at: continuation.retry_deadline,
+    });
+    expect(port.completions[0]?.reconciliation).toMatchObject({
+      kind: "hold_unknown",
+      retry_at: continuation.retry_deadline,
+      continuation_state: continuation,
+    });
+  });
+
+  it("reuses persisted continuation state when a later provider lookup is unknown", async () => {
+    const continuation = {
+      schema: "openthrottle.effect-continuation/v1",
+      retry_deadline: "2026-08-20T12:30:00.000Z",
+      payload: { failed_observation_ids: [17, 23] },
+    } satisfies EffectContinuationState;
+    const intent = effect({ kind: "github/provider-wait@1" });
+    const adapter: KernelEffectRuntimeAdapter = {
+      async reconcile(request) {
+        expect(request.continuation_state).toEqual(continuation);
+        return { kind: "unknown", detail: "provider lookup timed out" };
+      },
+      async dispatch() {
+        throw new Error("observation effects must not dispatch");
+      },
+    };
+    const persistedLease = { ...lease(intent, "dispatch_or_reconcile", 2), continuation_state: continuation };
+    const port = new FakeEffectPort([persistedLease]);
+
+    await service({
+      port,
+      binding: binding(adapter, { effect_kind: intent.kind, operation: "observation" }),
+    }).drainOne({
+      worker_id: "worker-1",
+      lease_id: "lease-1",
+      expires_at: "2026-08-20T12:01:00.000Z",
+    });
+    expect(port.completions[0]?.reconciliation).toMatchObject({
+      kind: "hold_unknown",
+      continuation_state: continuation,
+    });
   });
 
   it("does not let a provider adapter mutate the leased immutable intent", async () => {

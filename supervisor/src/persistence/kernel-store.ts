@@ -545,7 +545,8 @@ export class SqliteKernelStore implements
           deliveryRow.id !== row.delivery_record_id ||
           row.lease_id !== null || row.lease_worker_id !== null ||
           row.lease_expires_at !== null || row.lease_execution_mode !== null ||
-          row.dispatch_lease_id === null || row.dispatch_worker_id === null
+          row.dispatch_lease_id === null || row.dispatch_worker_id === null ||
+          row.continuation_state_json !== null
         ) {
           throw new KernelOperatorEffectRejectionConflictError(
             "settled Effect does not contain an exact operator rejection fence",
@@ -642,6 +643,7 @@ export class SqliteKernelStore implements
       const changed = this.#db.prepare(`
         UPDATE effects
         SET status = 'rejected', delivery_record_id = ?, unknown_detail = NULL,
+          continuation_state_json = NULL,
           version = version + 1, updated_at = ?
         WHERE id = ? AND pipeline_run_id = ? AND version = ? AND status = 'unknown'
           AND lease_id IS NULL AND lease_worker_id IS NULL

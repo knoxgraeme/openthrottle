@@ -1,11 +1,64 @@
+import { Buffer } from "node:buffer";
 import {
   assertSameIdempotentEffect,
+  canonicalJson,
   digestCanonicalJson,
+  jsonValueAt,
   validateEffectIntent,
   type DecisionRecord,
   type DeliveryRecord,
   type EffectIntent,
+  type JsonValue,
 } from "@openthrottle/contracts";
+
+export const EFFECT_CONTINUATION_STATE_SCHEMA =
+  "openthrottle.effect-continuation/v1" as const;
+export const EFFECT_CONTINUATION_STATE_MAX_BYTES = 65_536;
+const EFFECT_CONTINUATION_STATE_FIELDS = new Set([
+  "schema",
+  "retry_deadline",
+  "payload",
+]);
+
+export interface EffectContinuationState {
+  schema: typeof EFFECT_CONTINUATION_STATE_SCHEMA;
+  retry_deadline: string;
+  payload: JsonValue;
+}
+
+export function validateEffectContinuationState(
+  value: unknown,
+  path = "effect_continuation_state",
+): EffectContinuationState {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${path}: must be an object`);
+  }
+  const input = value as Record<string, unknown>;
+  const unknown = Object.keys(input)
+    .find((key) => !EFFECT_CONTINUATION_STATE_FIELDS.has(key));
+  if (unknown) throw new Error(`${path}.${unknown}: unknown field`);
+  if (input.schema !== EFFECT_CONTINUATION_STATE_SCHEMA) {
+    throw new Error(`${path}.schema: must be ${EFFECT_CONTINUATION_STATE_SCHEMA}`);
+  }
+  if (typeof input.retry_deadline !== "string") {
+    throw new Error(`${path}.retry_deadline: must be a canonical timestamp`);
+  }
+  const deadlineMs = Date.parse(input.retry_deadline);
+  if (
+    !Number.isFinite(deadlineMs) ||
+    new Date(deadlineMs).toISOString() !== input.retry_deadline
+  ) throw new Error(`${path}.retry_deadline: must be a canonical timestamp`);
+  if (!("payload" in input)) throw new Error(`${path}.payload: is required`);
+  const state: EffectContinuationState = {
+    schema: EFFECT_CONTINUATION_STATE_SCHEMA,
+    retry_deadline: input.retry_deadline,
+    payload: jsonValueAt(input.payload, `${path}.payload`),
+  };
+  if (Buffer.byteLength(canonicalJson(state), "utf8") > EFFECT_CONTINUATION_STATE_MAX_BYTES) {
+    throw new Error(`${path}: exceeds ${EFFECT_CONTINUATION_STATE_MAX_BYTES} canonical JSON bytes`);
+  }
+  return state;
+}
 
 export interface ObservedEffectDelivery {
   kind: "found";
@@ -38,6 +91,7 @@ export type EffectReconciliation =
     external_identity: string;
     detail: string;
     retry_at: string;
+    continuation_state?: EffectContinuationState | null;
   };
 
 export function authorizeEffectIntent(
@@ -77,6 +131,7 @@ export function reconcileEffectIntent(input: {
   intent: Readonly<EffectIntent>;
   observation: EffectObservation;
   retry_at?: string;
+  continuation_state?: EffectContinuationState | null;
 }): EffectReconciliation {
   const intent = validateEffectIntent(input.intent, { source: "effect_reconciliation.intent" }).value;
   if (input.observation.external_identity !== intent.target) {
@@ -92,6 +147,11 @@ export function reconcileEffectIntent(input: {
       external_identity: input.observation.external_identity,
       detail: input.observation.detail,
       retry_at: input.retry_at,
+      ...(input.continuation_state === undefined ? {} : {
+        continuation_state: input.continuation_state === null
+          ? null
+          : validateEffectContinuationState(input.continuation_state),
+      }),
     };
   }
   if (input.observation.kind === "not_found") {

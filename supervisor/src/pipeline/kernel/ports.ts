@@ -11,7 +11,7 @@ import {
   type ResultRecord,
 } from "@openthrottle/contracts";
 import type { EvaluatedKernelResult } from "./evaluator-registry.js";
-import type { EffectReconciliation } from "./effect-intent.js";
+import type { EffectContinuationState, EffectReconciliation } from "./effect-intent.js";
 import type {
   AtomicTransitionBundle,
   AttemptLease,
@@ -140,6 +140,8 @@ export interface LeasedEffectView {
     lease_id: string;
     worker_id: string;
   } | null;
+  /** Supervisor-private state retained only while provider observation remains unsettled. */
+  continuation_state: EffectContinuationState | null;
 }
 
 export interface KernelEffectPort {

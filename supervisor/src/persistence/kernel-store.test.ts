@@ -1653,6 +1653,7 @@ describe("SqliteKernelStore", () => {
       });
       expect(effectLease?.intent).toEqual(effect);
       expect(effectLease?.execution_mode).toBe("dispatch_or_reconcile");
+      expect(effectLease?.continuation_state).toBeNull();
       expect(await context.store.leaseNextEffect({
         worker_id: "effect-worker",
         lease_id: "effect-lease-1",
@@ -1790,6 +1791,19 @@ describe("SqliteKernelStore", () => {
         expires_at: "2026-08-20T12:15:00.000Z",
       });
       expect(reconciliationLease?.execution_mode).toBe("reconcile_only");
+      const continuationState = {
+        schema: "openthrottle.effect-continuation/v1" as const,
+        retry_deadline: "2026-08-20T12:30:00.000Z",
+        payload: {
+          provider: "github",
+          checks: [{
+            name: "quality",
+            first_failed_at: "2026-08-20T12:10:01.000Z",
+            failed_observation_count: 1,
+            failed_observation_ids: [17],
+          }],
+        },
+      };
       await context.store.completeLeasedEffect({
         effect_id: "effect-1",
         lease_id: "effect-lease-3",
@@ -1800,6 +1814,7 @@ describe("SqliteKernelStore", () => {
           external_identity: effect.target,
           detail: "provider timed out",
           retry_at: "2026-08-20T12:10:06.000Z",
+          continuation_state: continuationState,
         },
       });
       expect(context.db.prepare("SELECT available_at FROM effects WHERE id = 'effect-1'").get())
@@ -1816,6 +1831,42 @@ describe("SqliteKernelStore", () => {
         expires_at: "2026-08-20T12:20:00.000Z",
       });
       expect(heldUnknownLease?.execution_mode).toBe("reconcile_only");
+      expect(heldUnknownLease?.continuation_state).toEqual(continuationState);
+      expect(await context.store.leaseNextEffect({
+        worker_id: "effect-worker",
+        lease_id: "effect-lease-4",
+        expires_at: "2026-08-20T12:20:00.000Z",
+      })).toEqual(heldUnknownLease);
+      await context.store.completeLeasedEffect({
+        effect_id: "effect-1",
+        lease_id: "effect-lease-4",
+        worker_id: "effect-worker",
+        reconciliation: {
+          kind: "hold_unknown",
+          effect_id: "effect-1",
+          external_identity: effect.target,
+          detail: "provider lookup timed out without a new observation",
+          retry_at: "2026-08-20T12:10:11.000Z",
+        },
+      });
+      currentTime = "2026-08-20T12:10:11.000Z";
+      const continuedLease = await context.store.leaseNextEffect({
+        worker_id: "effect-worker",
+        lease_id: "effect-lease-continued",
+        expires_at: "2026-08-20T12:20:00.000Z",
+      });
+      expect(continuedLease?.continuation_state).toEqual(continuationState);
+      currentTime = "2026-08-20T12:20:01.000Z";
+      const recoveredContinuationLease = await context.store.leaseNextEffect({
+        worker_id: "recovery-worker",
+        lease_id: "effect-lease-5",
+        expires_at: "2026-08-20T12:25:00.000Z",
+      });
+      expect(recoveredContinuationLease).toMatchObject({
+        execution_mode: "reconcile_only",
+        reconciliation_ordinal: continuedLease!.reconciliation_ordinal + 1,
+        continuation_state: continuationState,
+      });
       const delivery: DeliveryRecord = {
         schema: EXECUTION_RECORD_SCHEMA,
         id: "delivery-1",
@@ -1824,24 +1875,44 @@ describe("SqliteKernelStore", () => {
         effect_id: "effect-1",
         idempotency_key: effect.idempotency_key,
         external_identity: effect.target,
-        status: "confirmed",
+        status: "rejected",
         payload_schema: "delivery/v1",
         payload: { inline: { accepted: true } },
         created_at: NOW,
       };
       await context.store.completeLeasedEffect({
         effect_id: "effect-1",
-        lease_id: "effect-lease-4",
-        worker_id: "effect-worker",
+        lease_id: "effect-lease-5",
+        worker_id: "recovery-worker",
         reconciliation: { kind: "append_delivery", delivery },
       });
-      expect(context.db.prepare("SELECT status, delivery_record_id FROM effects WHERE id = 'effect-1'").get())
-        .toEqual({ status: "acknowledged", delivery_record_id: "delivery-1" });
+      expect(context.db.prepare(`
+        SELECT status, delivery_record_id, continuation_state_json
+        FROM effects WHERE id = 'effect-1'
+      `).get()).toEqual({
+        status: "rejected",
+        delivery_record_id: "delivery-1",
+        continuation_state_json: null,
+      });
       expect((await context.store.findExternalSchedule({
         pipeline_run_id: "run-1",
         attempt_id: "attempt-1",
         phase: "publish",
       }))?.effects).toEqual([{ intent: effect, delivery }]);
+      await expect(context.store.completeLeasedEffect({
+        effect_id: "effect-1",
+        lease_id: "effect-lease-5",
+        worker_id: "recovery-worker",
+        reconciliation: { kind: "append_delivery", delivery },
+      })).rejects.toThrow(/lease fence/);
+      expect(context.db.prepare(`
+        SELECT status, delivery_record_id, continuation_state_json
+        FROM effects WHERE id = 'effect-1'
+      `).get()).toEqual({
+        status: "rejected",
+        delivery_record_id: "delivery-1",
+        continuation_state_json: null,
+      });
       const finalView = await context.store.loadExactReductionView({
         pipeline_run_id: "run-1",
         attempt_id: null,

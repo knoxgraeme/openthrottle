@@ -145,6 +145,7 @@ export interface EffectRow extends PayloadRow {
   dispatch_worker_id: string | null;
   delivery_record_id: string | null;
   unknown_detail: string | null;
+  continuation_state_json: string | null;
 }
 
 export function placeholders(length: number): string {

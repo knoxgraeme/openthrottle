@@ -20,6 +20,7 @@ import {
   assertImmutableEffectReplay,
   authorizeEffectIntent,
   reconcileEffectIntent,
+  validateEffectContinuationState,
 } from "./effect-intent.js";
 import {
   compileKernelCursor,
@@ -2125,5 +2126,22 @@ describe("effect ownership and reconciliation", () => {
       intent,
       observation: { kind: "not_found", external_identity: "github:other" },
     })).toThrow(/deterministic external identity/);
+  });
+
+  it("validates a bounded canonical supervisor-private effect continuation", () => {
+    const state = {
+      schema: "openthrottle.effect-continuation/v1",
+      retry_deadline: "2026-08-20T00:30:00.000Z",
+      payload: { failed_observation_ids: [17, 23] },
+    };
+    expect(validateEffectContinuationState(state)).toEqual(state);
+    expect(() => validateEffectContinuationState({
+      ...state,
+      retry_deadline: "not-a-timestamp",
+    })).toThrow(/canonical timestamp/);
+    expect(() => validateEffectContinuationState({
+      ...state,
+      payload: { evidence: "x".repeat(65_536) },
+    })).toThrow(/exceeds 65536/);
   });
 });

@@ -334,6 +334,10 @@ CREATE TABLE effects (
   delivery_record_id TEXT,
   delivery_record_kind TEXT NOT NULL DEFAULT 'delivery' CHECK (delivery_record_kind = 'delivery'),
   unknown_detail TEXT,
+  continuation_state_json TEXT CHECK (
+    continuation_state_json IS NULL OR
+    (json_valid(continuation_state_json) AND length(CAST(continuation_state_json AS BLOB)) <= 65536)
+  ),
   last_error TEXT,
   created_at TEXT NOT NULL CHECK (length(created_at) >= 20),
   updated_at TEXT NOT NULL CHECK (length(updated_at) >= 20),
@@ -350,6 +354,7 @@ CREATE TABLE effects (
   CHECK (dispatch_lease_id IS NULL OR lease_execution_mode = 'reconcile_only' OR status IN ('unknown', 'acknowledged', 'rejected', 'failed', 'canceled')),
   CHECK ((status IN ('acknowledged', 'rejected')) = (delivery_record_id IS NOT NULL)),
   CHECK ((status = 'unknown') = (unknown_detail IS NOT NULL)),
+  CHECK (status NOT IN ('acknowledged', 'rejected') OR continuation_state_json IS NULL),
   FOREIGN KEY (pipeline_run_id) REFERENCES pipeline_runs(id) ON DELETE RESTRICT,
   FOREIGN KEY (decision_record_id, pipeline_run_id, decision_record_kind) REFERENCES records(id, pipeline_run_id, kind) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (delivery_record_id, pipeline_run_id, delivery_record_kind) REFERENCES records(id, pipeline_run_id, kind) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,

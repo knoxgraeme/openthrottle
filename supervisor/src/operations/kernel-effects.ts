@@ -18,6 +18,8 @@ import type {
 import {
   assertImmutableEffectReplay,
   reconcileEffectIntent,
+  validateEffectContinuationState,
+  type EffectContinuationState,
 } from "../pipeline/kernel/effect-intent.js";
 import {
   OPERATOR_EFFECT_REJECTION_EFFECT_KIND,
@@ -188,6 +190,15 @@ function immutableIntent(input: EffectIntent): Readonly<EffectIntent> {
   return deepFreeze(clone);
 }
 
+function immutableContinuation(
+  input: EffectContinuationState | null,
+): Readonly<EffectContinuationState> | null {
+  if (input === null) return null;
+  const validated = validateEffectContinuationState(input, "leased_effect.continuation_state");
+  const clone = JSON.parse(canonicalJson(validated)) as EffectContinuationState;
+  return deepFreeze(clone);
+}
+
 function abortIfRequested(signal: AbortSignal | undefined): void {
   if (!signal?.aborted) return;
   if (signal.reason instanceof Error) throw signal.reason;
@@ -208,7 +219,16 @@ function normalizeObservation(value: KernelEffectProviderObservation): KernelEff
     if (typeof value.detail !== "string" || value.detail.trim().length === 0) {
       throw new Error("unknown provider reconciliation requires detail");
     }
-    return { kind: "unknown", detail: diagnostic(value.detail) };
+    return {
+      kind: "unknown",
+      detail: diagnostic(value.detail),
+      ...(value.continuation_state === undefined ? {} : {
+        continuation_state: validateEffectContinuationState(
+          value.continuation_state,
+          "effect_observation.continuation_state",
+        ),
+      }),
+    };
   }
   if (value.kind === "found") {
     if (value.status !== "confirmed" && value.status !== "rejected") {
@@ -227,6 +247,7 @@ async function observe(input: {
   binding: KernelEffectAdapterBinding;
   intent: Readonly<EffectIntent>;
   dispatch_fence: LeasedEffectView["dispatch_fence"];
+  continuation_state: LeasedEffectView["continuation_state"];
   signal?: AbortSignal;
 }): Promise<KernelEffectProviderObservation> {
   abortIfRequested(input.signal);
@@ -235,6 +256,7 @@ async function observe(input: {
       intent: input.intent,
       external_identity: input.intent.target,
       dispatch_fence: input.dispatch_fence,
+      continuation_state: immutableContinuation(input.continuation_state),
     });
     abortIfRequested(input.signal);
     return normalizeObservation(result);
@@ -287,7 +309,7 @@ export function createKernelEffectExecutionService(input: {
 }): KernelEffectExecutionService {
   const now = input.now ?? (() => new Date().toISOString());
 
-  function retryAt(ordinal: number): string {
+  function retryAt(ordinal: number, deadline: string | null): string {
     if (!Number.isSafeInteger(ordinal) || ordinal < 1) {
       throw new Error("effect lease has an invalid reconciliation ordinal");
     }
@@ -298,16 +320,26 @@ export function createKernelEffectExecutionService(input: {
     }
     const exponent = Math.min(ordinal - 1, 16);
     const delay = Math.min(UNKNOWN_RETRY_BASE_MS * (2 ** exponent), UNKNOWN_RETRY_MAX_MS);
-    return new Date(nowMs + delay).toISOString();
+    const retryMs = deadline === null
+      ? nowMs + delay
+      : Math.min(nowMs + delay, Date.parse(deadline));
+    if (!Number.isFinite(retryMs) || retryMs <= nowMs) {
+      throw new Error("effect continuation retry deadline is not in the future");
+    }
+    return new Date(retryMs).toISOString();
   }
 
   async function holdUnknown(
     leased: LeasedEffectView,
     workerId: string,
     detailInput: string,
+    continuationState: EffectContinuationState | null = leased.continuation_state,
   ): Promise<Extract<KernelEffectExecutionResult, { kind: "held_unknown" }>> {
     const detail = diagnostic(detailInput);
-    const retry_at = retryAt(leased.reconciliation_ordinal);
+    const retry_at = retryAt(
+      leased.reconciliation_ordinal,
+      continuationState?.retry_deadline ?? null,
+    );
     const reconciliation = reconcileEffectIntent({
       intent: leased.intent,
       observation: {
@@ -316,6 +348,7 @@ export function createKernelEffectExecutionService(input: {
         detail,
       },
       retry_at,
+      continuation_state: continuationState,
     });
     if (reconciliation.kind !== "hold_unknown") {
       throw new Error("unknown effect observation produced an invalid reconciliation");
@@ -405,6 +438,7 @@ export function createKernelEffectExecutionService(input: {
         binding,
         intent,
         dispatch_fence: leased.dispatch_fence,
+        continuation_state: leased.continuation_state,
         signal: request.signal,
       });
       if (initial.kind === "found") {
@@ -418,7 +452,12 @@ export function createKernelEffectExecutionService(input: {
         );
       }
       if (initial.kind === "unknown") {
-        return holdUnknown(leased, request.worker_id, initial.detail);
+        return holdUnknown(
+          leased,
+          request.worker_id,
+          initial.detail,
+          initial.continuation_state ?? leased.continuation_state,
+        );
       }
       if (binding.operation === "observation") {
         return holdUnknown(
@@ -473,6 +512,7 @@ export function createKernelEffectExecutionService(input: {
             target: intent.target,
           },
           dispatch_fence: dispatchLease.dispatch_fence,
+          continuation_state: dispatchLease.continuation_state,
         });
         abortIfRequested(request.signal);
       } catch (error) {
@@ -484,6 +524,7 @@ export function createKernelEffectExecutionService(input: {
         binding,
         intent,
         dispatch_fence: dispatchLease.dispatch_fence,
+        continuation_state: dispatchLease.continuation_state,
         signal: request.signal,
       });
       if (afterDispatch.kind === "found") {
@@ -500,7 +541,8 @@ export function createKernelEffectExecutionService(input: {
         return holdUnknown(leased, request.worker_id, [
           dispatchFailure ? `dispatch returned an error: ${dispatchFailure}` : null,
           afterDispatch.detail,
-        ].filter((entry): entry is string => entry !== null).join("; "));
+        ].filter((entry): entry is string => entry !== null).join("; "),
+        afterDispatch.continuation_state ?? dispatchLease.continuation_state);
       }
       return holdUnknown(leased, request.worker_id, [
         dispatchFailure ? `dispatch returned an error: ${dispatchFailure}` : null,
