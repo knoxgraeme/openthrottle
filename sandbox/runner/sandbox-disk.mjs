@@ -14,8 +14,11 @@ const TEMPORARY_PREFIXES = [
   "ot-kernel-integration-",
 ];
 const DEFAULT_TIMEOUT_MS = 15_000;
+const DEFAULT_INSPECTION_TIMEOUT_MS = 5_000;
+const MAX_DF_OUTPUT_BYTES = 16 * 1024;
 const MAX_FAILURES = 32;
 const MAX_FAILURE_CHARS = 240;
+const DISK_PATHS = ["/var/lib/openthrottle", "/home/agent", "/tmp"];
 
 export const SANDBOX_SCRATCH_ROOTS = Object.freeze({
   actions: "/var/lib/openthrottle/actions",
@@ -78,6 +81,84 @@ function defaultRemove(path, timeoutMs) {
     return { ok: false, timedOut: false, detail };
   }
   return { ok: true, timedOut: false, detail: null };
+}
+
+function defaultDf(paths, timeoutMs) {
+  const execution = spawnSync("/bin/df", ["-Pk", ...paths], {
+    encoding: "utf8",
+    timeout: timeoutMs,
+    killSignal: "SIGKILL",
+    maxBuffer: MAX_DF_OUTPUT_BYTES,
+  });
+  if (execution.error?.code === "ETIMEDOUT") {
+    throw new Error("sandbox disk inspection timed out");
+  }
+  if (execution.error || execution.status !== 0) {
+    const detail = execution.error?.message || execution.stderr?.trim() ||
+      `df exited ${execution.status ?? "without status"}`;
+    throw new Error(`sandbox disk inspection failed: ${detail}`);
+  }
+  return execution.stdout;
+}
+
+/**
+ * Inspects the fixed runtime paths with POSIX df output and reports each
+ * distinct backing filesystem once. The injected runner is solely a test seam;
+ * callers cannot select additional filesystem paths through the CLI.
+ */
+export function inspectSandboxDisk({
+  requiredKiB,
+  paths = DISK_PATHS,
+  timeoutMs = DEFAULT_INSPECTION_TIMEOUT_MS,
+  runDf = defaultDf,
+} = {}) {
+  if (!Number.isSafeInteger(requiredKiB) || requiredKiB < 1) {
+    throw new Error("sandbox disk required KiB is invalid");
+  }
+  if (!Array.isArray(paths) || paths.length < 1 || paths.length > 16 ||
+      paths.some((path) => typeof path !== "string" || !path.startsWith("/") || resolve(path) !== path)) {
+    throw new Error("sandbox disk inspection paths are invalid");
+  }
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) {
+    throw new Error("sandbox disk inspection timeout is invalid");
+  }
+  const raw = runDf(paths, timeoutMs);
+  if (typeof raw !== "string" || Buffer.byteLength(raw) > MAX_DF_OUTPUT_BYTES) {
+    throw new Error("sandbox disk inspection output is invalid or oversized");
+  }
+  const lines = raw.trim().split(/\r?\n/);
+  if (lines.length !== paths.length + 1 || !/^Filesystem\s+1024-blocks\s+Used\s+Available\s+Capacity\s+Mounted on\s*$/.test(lines[0] ?? "")) {
+    throw new Error("sandbox disk inspection output has an invalid POSIX header or row count");
+  }
+  const filesystems = new Map();
+  for (const [index, line] of lines.slice(1).entries()) {
+    const match = /^(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)%\s+(.+)$/.exec(line);
+    if (!match) throw new Error("sandbox disk inspection output has an invalid filesystem row");
+    const availableKiB = Number(match[4]);
+    if (!Number.isSafeInteger(availableKiB)) {
+      throw new Error("sandbox disk inspection available capacity is invalid");
+    }
+    const key = `${match[1]}\0${match[6]}`;
+    const existing = filesystems.get(key);
+    if (existing) {
+      existing.paths.push(paths[index]);
+    } else {
+      filesystems.set(key, {
+        filesystem: match[1],
+        mount: match[6],
+        available_kib: availableKiB,
+        paths: [paths[index]],
+        low: availableKiB < requiredKiB,
+      });
+    }
+  }
+  const observations = [...filesystems.values()];
+  return {
+    schema: "openthrottle.sandbox-disk-inspection/v1",
+    required_kib: requiredKiB,
+    low: observations.some((filesystem) => filesystem.low),
+    filesystems: observations,
+  };
 }
 
 /**
@@ -277,7 +358,11 @@ function parseCli(argv) {
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
 if (isMain) {
   try {
-    process.stdout.write(`${JSON.stringify(reclaimSandboxScratch({ current: parseCli(process.argv.slice(2)) }))}\n`);
+    const argv = process.argv.slice(2);
+    const result = argv[0] === "check" && argv.length === 3 && argv[1] === "--required-kib"
+      ? inspectSandboxDisk({ requiredKiB: Number(argv[2]) })
+      : reclaimSandboxScratch({ current: parseCli(argv) });
+    process.stdout.write(`${JSON.stringify(result)}\n`);
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 64;

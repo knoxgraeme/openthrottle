@@ -46,6 +46,7 @@ export interface Config {
   githubReadToken: string;
   daytonaApiKey: string;
   daytonaSnapshot: string;
+  daytonaSandboxMinFreeMiB: number;
   claudeCodeOauthToken: string | undefined;
   codexAuthJson: string | undefined;
   kimiCodeApiKey: string | undefined;
@@ -79,6 +80,7 @@ export function loadConfig(): Config {
     githubReadToken: required("GITHUB_READ_TOKEN"),
     daytonaApiKey: required("DAYTONA_API_KEY"),
     daytonaSnapshot: optional("DAYTONA_SNAPSHOT", "openthrottle"),
+    daytonaSandboxMinFreeMiB: optionalInt("DAYTONA_SANDBOX_MIN_FREE_MIB", 2_048),
     claudeCodeOauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN,
     codexAuthJson: process.env.CODEX_AUTH_JSON,
     kimiCodeApiKey: process.env.KIMI_CODE_API_KEY,
@@ -131,6 +133,7 @@ export function loadConfig(): Config {
   requireRange("PORT", cfg.port, 1, 65_535);
   requireRange("TASK_TIMEOUT", cfg.taskTimeout, 1, 86_400);
   requireRange("WEBHOOK_MAX_AGE_SECONDS", cfg.webhookMaxAgeSeconds, 1);
+  requireRange("DAYTONA_SANDBOX_MIN_FREE_MIB", cfg.daytonaSandboxMinFreeMiB, 1);
   requireRange("OT_KERNEL_WORKER_INTERVAL_MS", cfg.kernelWorkerIntervalMs, 100, 60_000);
   requireRange("OT_KERNEL_LEASE_SECONDS", cfg.kernelLeaseSeconds, 30, 3_600);
   requireRange("OT_KERNEL_CYCLE_LIMIT", cfg.kernelCycleLimit, 1, 100);

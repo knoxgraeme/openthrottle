@@ -118,6 +118,7 @@ async function main(): Promise<void> {
     snapshot: cfg.daytonaSnapshot,
     github_read_token: cfg.githubReadToken,
     task_timeout_seconds: cfg.taskTimeout,
+    sandbox_min_free_kib: cfg.daytonaSandboxMinFreeMiB * 1_024,
     runtime_capability_digest: release.compiler_environment.descriptor.runtime_capability_digest,
     blob_store: epoch.blobs,
     environments,

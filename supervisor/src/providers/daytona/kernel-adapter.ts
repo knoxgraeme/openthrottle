@@ -116,6 +116,7 @@ interface DaytonaKernelOptions {
   snapshot: string;
   github_read_token: string;
   task_timeout_seconds: number;
+  sandbox_min_free_kib: number;
   runtime_capability_digest: string;
   blob_store: VolumeBlobStore;
   environments: KernelRunEnvironmentPort;
@@ -255,6 +256,67 @@ function sealedActionTimeoutMs(
 
 function notFound(error: unknown): boolean {
   return /not[ -]?found|404/i.test(error instanceof Error ? error.message : String(error));
+}
+
+const SANDBOX_DISK_EXHAUSTED_REASON =
+  "sandbox_disk_exhausted: no space left on device in the retained sandbox";
+
+function isSandboxDiskExhausted(value: unknown, depth = 0, seen = new Set<object>()): boolean {
+  if (depth > 4) return false;
+  if (typeof value === "string") {
+    return /\bENOSPC\b|no space left on device/i.test(value);
+  }
+  if (!value || typeof value !== "object" || seen.has(value)) return false;
+  seen.add(value);
+  const candidate = value as Record<string, unknown>;
+  if (candidate.code === "ENOSPC" || candidate.errno === -28) return true;
+  for (const key of ["message", "cause", "error", "stderr", "stdout", "result", "output"]) {
+    if (isSandboxDiskExhausted(candidate[key], depth + 1, seen)) return true;
+  }
+  return false;
+}
+
+type KernelRuntimeFailure = Extract<KernelRuntimeOutcome, { state: "work_failed" }>;
+
+function sandboxDiskExhaustedOutcome(): KernelRuntimeFailure {
+  return { state: "work_failed", retryable: true, reason: SANDBOX_DISK_EXHAUSTED_REASON };
+}
+
+function throwIfSandboxDiskCommandFailure(command: unknown): void {
+  if (isSandboxDiskExhausted(command)) {
+    throw Object.assign(new Error(SANDBOX_DISK_EXHAUSTED_REASON), { code: "ENOSPC" });
+  }
+}
+
+function normalizeSandboxDiskOutcome(outcome: KernelRuntimeOutcome): KernelRuntimeOutcome {
+  if (
+    (outcome.state === "work_failed" || outcome.state === "needs_human") &&
+    isSandboxDiskExhausted(outcome.reason)
+  ) return sandboxDiskExhaustedOutcome();
+  if (
+    outcome.state === "work_complete" && outcome.result.kind === "command" &&
+    isSandboxDiskExhausted(outcome.result.summary)
+  ) return sandboxDiskExhaustedOutcome();
+  return outcome;
+}
+
+async function normalizeSandboxDiskExecution(
+  execution: Promise<KernelRuntimeOutcome>,
+): Promise<KernelRuntimeOutcome> {
+  try {
+    return normalizeSandboxDiskOutcome(await execution);
+  } catch (error) {
+    if (isSandboxDiskExhausted(error)) return sandboxDiskExhaustedOutcome();
+    throw error;
+  }
+}
+
+async function ignoreNonDiskCreateFailure(operation: Promise<unknown>): Promise<void> {
+  try {
+    await operation;
+  } catch (error) {
+    if (isSandboxDiskExhausted(error)) throw error;
+  }
 }
 
 function inspectCheckpointBundle(
@@ -542,7 +604,7 @@ export class DaytonaKernelAdapter implements
       throw new Error("kernel action has no exact Daytona runtime resource");
     }
     const sandbox = await this.#daytona.get(request.runtime_resource.provider_resource_id);
-    return this.#execute(sandbox, request, callbacks);
+    return normalizeSandboxDiskExecution(this.#execute(sandbox, request, callbacks));
   }
 
   async correctResult(
@@ -555,7 +617,8 @@ export class DaytonaKernelAdapter implements
     });
     const resource = resolveKernelRuntimeResourceIdentity([...inputs.context.records.values()]);
     if (!resource) throw new Error("result correction has no exact Daytona runtime resource");
-    return this.#execute(await this.#daytona.get(resource.provider_resource_id), request, callbacks);
+    const sandbox = await this.#daytona.get(resource.provider_resource_id);
+    return normalizeSandboxDiskExecution(this.#execute(sandbox, request, callbacks));
   }
 
   async deliverSteering(input: {
@@ -735,13 +798,14 @@ export class DaytonaKernelAdapter implements
       });
     };
     if (!await this.#sessionExists(sandbox, sessionId)) {
-      await this.#reclaimScratch(sandbox, {
+      const lowDisk = await this.#guardLaunchCapacity(sandbox, {
         kind: "action",
         attempt: request.attempt_id,
         lease: request.lease_id,
         phase: request.schema === KERNEL_ACTION_REQUEST_SCHEMA ? "work" : "correction",
         generation: callbacks.lease_generation,
       });
+      if (lowDisk !== null) return lowDisk;
     }
     await this.#refreshLeaseGenerationFence(sandbox, request, paths, callbacks.lease_generation);
     await heartbeat();
@@ -805,7 +869,7 @@ export class DaytonaKernelAdapter implements
     // Daytona sessions snapshot sandbox environment at creation. A recovered
     // lease must adopt its original command, while a new work/correction lease
     // must inherit its newly sealed request and result paths.
-    await sandbox.process.createSession(sessionId).catch(() => undefined);
+    await ignoreNonDiskCreateFailure(sandbox.process.createSession(sessionId));
     const launch = await sandbox.process.executeSessionCommand(sessionId, {
       command: `flock --nonblock --conflict-exit-code ${DISPATCH_LOCK_CONTENTION_EXIT_CODE} ` +
         `${shellQuote(paths.lock)} sh -c ` +
@@ -815,6 +879,7 @@ export class DaytonaKernelAdapter implements
     }, actionTimeoutSeconds);
     const launchCommandId = launch?.cmdId;
     if (typeof launchCommandId !== "string" || launchCommandId.length < 1) {
+      throwIfSandboxDiskCommandFailure(launch);
       const completedOutcome = await collect();
       if (completedOutcome !== null) return completedOutcome;
       const termination = await this.#terminateSessionAndCollect(sandbox, sessionId, collect);
@@ -844,6 +909,7 @@ export class DaytonaKernelAdapter implements
         if (!notFound(error)) throw error;
       }
       if (typeof command?.exitCode === "number") {
+        if (isSandboxDiskExhausted(command)) return sandboxDiskExhaustedOutcome();
         if (command.exitCode === DISPATCH_LOCK_CONTENTION_EXIT_CODE) {
           adoptedExistingCommand = true;
           await new Promise((resolve) => setTimeout(resolve, this.#options.poll_interval_ms ?? 500));
@@ -893,10 +959,10 @@ export class DaytonaKernelAdapter implements
     paths: ReturnType<typeof launchPaths>,
     leaseGeneration: number,
   ): Promise<void> {
-    await sandbox.fs.createFolder(OPENTHROTTLE_ROOT, "711").catch(() => undefined);
+    await ignoreNonDiskCreateFailure(sandbox.fs.createFolder(OPENTHROTTLE_ROOT, "711"));
     await sandbox.fs.setFilePermissions(OPENTHROTTLE_ROOT, { owner: "root", group: "root", mode: "711" });
     for (const path of [ACTION_FENCE_DIR, paths.fence_attempt_directory]) {
-      await sandbox.fs.createFolder(path, "711").catch(() => undefined);
+      await ignoreNonDiskCreateFailure(sandbox.fs.createFolder(path, "711"));
       await sandbox.fs.setFilePermissions(path, { owner: "root", group: "root", mode: "711" });
     }
     const initializedLock = await sandbox.process.executeCommand(
@@ -908,6 +974,7 @@ export class DaytonaKernelAdapter implements
       30,
     );
     if (initializedLock.exitCode !== undefined && initializedLock.exitCode !== 0) {
+      throwIfSandboxDiskCommandFailure(initializedLock);
       throw new Error("Daytona could not initialize the lease-generation lock");
     }
     const verifiedLock = await downloadBytes(sandbox, paths.lease_generation_lock);
@@ -945,6 +1012,7 @@ export class DaytonaKernelAdapter implements
       30,
     );
     if (refreshed.exitCode !== undefined && refreshed.exitCode !== 0) {
+      throwIfSandboxDiskCommandFailure(refreshed);
       throw new Error(refreshed.exitCode === 42
         ? "Daytona refused to replace a newer lease-generation fence"
         : "Daytona could not atomically refresh the lease-generation fence");
@@ -986,7 +1054,7 @@ export class DaytonaKernelAdapter implements
     sandbox: Sandbox,
     paths: ReturnType<typeof launchPaths>,
   ): Promise<void> {
-    await sandbox.fs.createFolder(OPENTHROTTLE_ROOT, "711").catch(() => undefined);
+    await ignoreNonDiskCreateFailure(sandbox.fs.createFolder(OPENTHROTTLE_ROOT, "711"));
     await sandbox.fs.setFilePermissions(OPENTHROTTLE_ROOT, { owner: "root", group: "root", mode: "711" });
     for (const path of [
       ACTION_INPUT_DIR,
@@ -996,7 +1064,7 @@ export class DaytonaKernelAdapter implements
       paths.result_attempt_directory,
       paths.result_directory,
     ]) {
-      await sandbox.fs.createFolder(path, "700").catch(() => undefined);
+      await ignoreNonDiskCreateFailure(sandbox.fs.createFolder(path, "700"));
       await sandbox.fs.setFilePermissions(path, { owner: "root", group: "root", mode: "700" });
     }
   }
@@ -1006,7 +1074,7 @@ export class DaytonaKernelAdapter implements
     current:
       | { kind: "action"; attempt: string; lease: string; phase: "work" | "correction"; generation: number }
       | { kind: "integration"; effect: string; lease: string },
-  ): Promise<void> {
+  ): Promise<"completed" | "partial" | "timed_out" | "unreported"> {
     const args = current.kind === "action"
       ? [
           "action",
@@ -1027,8 +1095,68 @@ export class DaytonaKernelAdapter implements
       30,
     );
     if (reclaimed.exitCode !== undefined && reclaimed.exitCode !== 0) {
-      throw new Error("Daytona sandbox scratch reclamation rejected the current launch");
+      throwIfSandboxDiskCommandFailure(reclaimed);
+      throw new Error(
+        `Daytona sandbox scratch reclamation rejected the current launch: ${String(reclaimed.result ?? "")}`,
+      );
     }
+    try {
+      const report = JSON.parse(reclaimed.result) as Record<string, unknown>;
+      if (report.schema !== "openthrottle.sandbox-scratch-reclamation/v1") return "unreported";
+      if (report.timed_out === true) return "timed_out";
+      return Array.isArray(report.failures) && report.failures.length > 0 ? "partial" : "completed";
+    } catch {
+      return "unreported";
+    }
+  }
+
+  async #guardLaunchCapacity(
+    sandbox: Sandbox,
+    current:
+      | { kind: "action"; attempt: string; lease: string; phase: "work" | "correction"; generation: number }
+      | { kind: "integration"; effect: string; lease: string },
+  ): Promise<KernelRuntimeFailure | null> {
+    const cleanup = await this.#reclaimScratch(sandbox, current);
+    const inspected = await sandbox.process.executeCommand(
+      ["node", SANDBOX_DISK_HELPER, "check", "--required-kib", String(this.#options.sandbox_min_free_kib)]
+        .map(shellQuote).join(" "),
+      OPENTHROTTLE_ROOT,
+      {},
+      10,
+    );
+    if (inspected.exitCode !== undefined && inspected.exitCode !== 0) {
+      if (isSandboxDiskExhausted(inspected)) return sandboxDiskExhaustedOutcome();
+      throw new Error(`Daytona sandbox disk preflight failed: ${String(inspected.result ?? "")}`);
+    }
+    let report: Record<string, unknown>;
+    try {
+      report = JSON.parse(inspected.result) as Record<string, unknown>;
+    } catch {
+      throw new Error("Daytona sandbox disk preflight returned invalid JSON");
+    }
+    if (
+      report.schema !== "openthrottle.sandbox-disk-inspection/v1" ||
+      report.required_kib !== this.#options.sandbox_min_free_kib ||
+      typeof report.low !== "boolean" || !Array.isArray(report.filesystems)
+    ) throw new Error("Daytona sandbox disk preflight returned invalid evidence");
+    if (!report.low) return null;
+    const deficient = report.filesystems.find((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+      return (entry as Record<string, unknown>).low === true;
+    }) as Record<string, unknown> | undefined;
+    if (
+      !deficient || typeof deficient.mount !== "string" ||
+      !Number.isSafeInteger(deficient.available_kib) ||
+      !Array.isArray(deficient.paths) || typeof deficient.paths[0] !== "string"
+    ) throw new Error("Daytona sandbox disk preflight returned invalid low-space evidence");
+    return {
+      state: "work_failed",
+      retryable: true,
+      reason: "sandbox_disk_low: " +
+        `path=${deficient.paths[0]} mount=${deficient.mount} ` +
+        `available_kib=${deficient.available_kib} required_kib=${this.#options.sandbox_min_free_kib} ` +
+        `cleanup=${cleanup}`,
+    };
   }
 
   async #sessionExists(sandbox: Sandbox, sessionId: string): Promise<boolean> {
@@ -1118,6 +1246,7 @@ export class DaytonaKernelAdapter implements
       120,
     );
     if (listed.exitCode !== 0) {
+      throwIfSandboxDiskCommandFailure(listed);
       throw new Error("Daytona could not inspect the input checkpoint bundle");
     }
     const heads = listed.result.trim().split("\n").filter(Boolean);
@@ -1134,6 +1263,7 @@ export class DaytonaKernelAdapter implements
       120,
     );
     if (bundleVerified.exitCode !== 0) {
+      throwIfSandboxDiskCommandFailure(bundleVerified);
       throw new Error("Daytona could not verify the bounded input checkpoint bundle");
     }
     const imported = await sandbox.process.executeCommand(
@@ -1143,6 +1273,7 @@ export class DaytonaKernelAdapter implements
       120,
     );
     if (imported.exitCode !== 0) {
+      throwIfSandboxDiskCommandFailure(imported);
       throw new Error("Daytona could not import the exact successor checkpoint");
     }
     const verified = await sandbox.process.executeCommand(
@@ -1152,6 +1283,7 @@ export class DaytonaKernelAdapter implements
       120,
     );
     if (verified.exitCode !== 0) {
+      throwIfSandboxDiskCommandFailure(verified);
       throw new Error("Daytona input checkpoint did not materialize its exact commit");
     }
   }
@@ -1312,11 +1444,12 @@ export class DaytonaKernelAdapter implements
     const paths = integrationPaths(intent.id, dispatchFence.lease_id);
     const sessionId = `kernel-effect-${safeTransportId(intent.id, "kernel effect ID")}`;
     if (!await this.#sessionExists(sandbox, sessionId)) {
-      await this.#reclaimScratch(sandbox, {
+      const lowDisk = await this.#guardLaunchCapacity(sandbox, {
         kind: "integration",
         effect: intent.id,
         lease: dispatchFence.lease_id,
       });
+      if (lowDisk !== null) throw new Error(lowDisk.reason);
     }
     for (const path of [
       OPENTHROTTLE_ROOT,
@@ -1369,7 +1502,7 @@ export class DaytonaKernelAdapter implements
       OT_INTEGRATION_REQUEST_FILE: paths.input,
       OT_INTEGRATION_RESULT_FILE: paths.result,
     }, { unset: [...INTEGRATION_CREDENTIAL_SCRUB, ...ACTION_ENV_FAMILY] });
-    await sandbox.process.createSession(sessionId).catch(() => undefined);
+    await ignoreNonDiskCreateFailure(sandbox.process.createSession(sessionId));
     await sandbox.process.executeSessionCommand(sessionId, {
       command: `flock --nonblock ${shellQuote(paths.lock)} sh -c ` +
         shellQuote(`test -f ${shellQuote(paths.result)} || exec /opt/openthrottle/entrypoint.sh`),

@@ -875,6 +875,59 @@ describe("kernel attempt executor", () => {
     });
   });
 
+  it.each([
+    ["system error code", { status: null, signal: null, timedOut: false, stdout: "", stderr: "", error: Object.assign(new Error("write failed"), { code: "ENOSPC" }) }],
+    ["command stderr", { status: 1, signal: null, timedOut: false, stdout: "", stderr: "build: no space left on device" }],
+  ])("classifies command ENOSPC from %s as sandbox-fatal infrastructure", async (_label, execution) => {
+    const source = sourceRepository();
+    const root = mkdtempSync(join(tmpdir(), "ot-attempt-command-enospc-"));
+    const request = workRequest(source.subject, {
+      action: {
+        kind: "command",
+        command_id: "test",
+        command_line: "npm test",
+        post_bootstrap: [],
+        execution_limits: { max_turns: null, task_timeout_seconds: 120 },
+      },
+    });
+
+    const result = await executeAttempt({
+      request,
+      sourceRepoDir: source.repo,
+      actionRoot: join(root, "actions"),
+      resultPath: join(root, "transport", "result.json"),
+      sessionPath: join(root, "transport", "session.json"),
+      runCommand: async () => execution,
+      now: () => new Date("2026-08-20T00:00:00.000Z"),
+    });
+
+    expect(result.outcome).toEqual({
+      state: "work_failed",
+      retryable: true,
+      reason: "sandbox_disk_exhausted: no space left on device in the retained sandbox",
+    });
+  });
+
+  it("classifies agent stderr ENOSPC as sandbox-fatal infrastructure", async () => {
+    const { result } = await executeAgentResult({
+      execution: {
+        status: 1,
+        signal: null,
+        timedOut: false,
+        nativeSessionId: null,
+        stdout: "",
+        stderr: "engine state write failed: No space left on device",
+      },
+      env: {},
+    });
+
+    expect(result.outcome).toEqual({
+      state: "work_failed",
+      retryable: true,
+      reason: "sandbox_disk_exhausted: no space left on device in the retained sandbox",
+    });
+  });
+
   it("lets a sealed command read Git metadata from only its exact action repository", async () => {
     const source = sourceRepository();
     const root = mkdtempSync(join(tmpdir(), "ot-attempt-command-git-"));

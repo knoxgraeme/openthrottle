@@ -62,6 +62,8 @@ const RESULT_CORRECTION_WINDOW_MS = 15 * 60 * 1000;
 const MAX_TRANSPORT_BYTES = 4 * 1024 * 1024;
 const DEFAULT_COMMAND_TIMEOUT_MS = 60 * 60 * 1_000;
 const MAX_WORK_FAILURE_REASON_CHARS = 1_500;
+const SANDBOX_DISK_EXHAUSTED_REASON =
+  "sandbox_disk_exhausted: no space left on device in the retained sandbox";
 
 function validateExecutionLimits(value, label, engine = null) {
   if (!value || typeof value !== "object" || Array.isArray(value) ||
@@ -294,6 +296,20 @@ function boundedCommandSummary(execution) {
   return (text || `command exited ${execution.status ?? "without status"}`).slice(-4_000);
 }
 
+function isSandboxDiskExhausted(value, depth = 0, seen = new Set()) {
+  if (depth > 4) return false;
+  if (typeof value === "string") return /\bENOSPC\b|no space left on device/i.test(value);
+  if (!value || typeof value !== "object" || seen.has(value)) return false;
+  seen.add(value);
+  if (value.code === "ENOSPC" || value.errno === -28) return true;
+  return ["message", "cause", "error", "stderr", "stdout", "result", "output"]
+    .some((key) => isSandboxDiskExhausted(value[key], depth + 1, seen));
+}
+
+function sandboxDiskExhaustedOutcome() {
+  return { state: "work_failed", retryable: true, reason: SANDBOX_DISK_EXHAUSTED_REASON };
+}
+
 function boundedAgentFailureReason(prefix, { stdout = "", stderr = "", env }) {
   const diagnosticLabel = " Executor diagnostic: ";
   // Give the label-free key=value diagnostic all remaining failure-reason space.
@@ -446,6 +462,9 @@ async function executeCommandWork(options, actionDirectory) {
   };
   for (const [index, commandLine] of request.action.post_bootstrap.entries()) {
     const bootstrap = await run(commandLine, "post_bootstrap", index);
+    if (isSandboxDiskExhausted(bootstrap)) {
+      return runtimeEnvelope(request, sandboxDiskExhaustedOutcome());
+    }
     if (bootstrap.error || bootstrap.timedOut || bootstrap.signal) {
       return runtimeEnvelope(request, {
         state: "work_failed",
@@ -471,6 +490,9 @@ async function executeCommandWork(options, actionDirectory) {
     }
   }
   const execution = await run(request.action.command_line, "command");
+  if (isSandboxDiskExhausted(execution)) {
+    return runtimeEnvelope(request, sandboxDiskExhaustedOutcome());
+  }
   if (execution.error || execution.timedOut || execution.signal) {
     return runtimeEnvelope(request, {
       state: "work_failed",
@@ -605,12 +627,18 @@ async function executeAgentWork(options, actionDirectory) {
           env: options.env,
         });
       } catch (error) {
+        if (isSandboxDiskExhausted(error)) {
+          return runtimeEnvelope(request, sandboxDiskExhaustedOutcome());
+        }
         return runtimeEnvelope(request, agentLaunchException(error, options.env));
       }
     } else {
       try {
         prepared = prepareAgentRuntime({ request: runtimeRequest, actionDirectory, channel, env: options.env });
       } catch (error) {
+        if (isSandboxDiskExhausted(error)) {
+          return runtimeEnvelope(request, sandboxDiskExhaustedOutcome());
+        }
         return runtimeEnvelope(request, agentPreparationException(error, options.env));
       }
       try {
@@ -622,8 +650,14 @@ async function executeAgentWork(options, actionDirectory) {
           timeoutMs: timeoutMilliseconds(request.action.execution_limits),
         });
       } catch (error) {
+        if (isSandboxDiskExhausted(error)) {
+          return runtimeEnvelope(request, sandboxDiskExhaustedOutcome());
+        }
         return runtimeEnvelope(request, agentPreparedRuntimeException(error, options.env));
       }
+    }
+    if (isSandboxDiskExhausted(execution)) {
+      return runtimeEnvelope(request, sandboxDiskExhaustedOutcome());
     }
     if (execution.nativeSessionId && observedSessions.length === 0) await onSession(execution.nativeSessionId);
     if (inspectChangeArtifact !== null) verifyInspectChangeArtifact(inspectChangeArtifact);
@@ -789,6 +823,10 @@ async function executeCorrection(options, actionDirectory) {
       timeoutMs,
     });
   }
+  if (isSandboxDiskExhausted(execution)) {
+    stageCheckpointArtifact(checkpoint, artifactDirectory, resultPath);
+    return runtimeEnvelope(request, sandboxDiskExhaustedOutcome());
+  }
   if (options.now().getTime() >= deadline) {
     stageCheckpointArtifact(checkpoint, artifactDirectory, resultPath);
     return runtimeEnvelope(request, {
@@ -857,7 +895,9 @@ export async function executeAttempt({
           env,
         }, actionDirectory);
   } catch (error) {
-    envelope = runtimeEnvelope(request, request.phase === "result_correction" ? {
+    envelope = runtimeEnvelope(request, isSandboxDiskExhausted(error)
+      ? sandboxDiskExhaustedOutcome()
+      : request.phase === "result_correction" ? {
       state: "needs_human",
       reason: error instanceof Error ? error.message : String(error),
       checkpoint: existsSync(join(actionDirectory, "checkpoint.json"))
@@ -870,6 +910,9 @@ export async function executeAttempt({
       retryable: Boolean(error?.retryableInfrastructureFailure),
       reason: error instanceof Error ? error.message : String(error),
     });
+  }
+  if (isSandboxDiskExhausted(envelope?.outcome)) {
+    envelope = runtimeEnvelope(request, sandboxDiskExhaustedOutcome());
   }
   writeImmutableJson(resultPath, envelope, "kernel runtime result");
   return envelope;

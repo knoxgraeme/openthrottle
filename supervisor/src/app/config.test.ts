@@ -6,7 +6,8 @@ const configKeys = [
   "PORT", "DATABASE_PATH", "SUPERVISOR_URL", "OT_STATUS_TOKEN", "OT_DEPLOY_TOKEN",
   "LINEAR_WEBHOOK_SECRET", "LINEAR_CLIENT_ID", "LINEAR_CLIENT_SECRET",
   "GITHUB_WEBHOOK_SECRET", "GITHUB_TOKEN", "GITHUB_READ_TOKEN",
-  "DAYTONA_API_KEY", "DAYTONA_SNAPSHOT", "CLAUDE_CODE_OAUTH_TOKEN", "CODEX_AUTH_JSON",
+  "DAYTONA_API_KEY", "DAYTONA_SNAPSHOT", "DAYTONA_SANDBOX_MIN_FREE_MIB",
+  "CLAUDE_CODE_OAUTH_TOKEN", "CODEX_AUTH_JSON",
   "KIMI_CODE_API_KEY", "TASK_TIMEOUT", "WEBHOOK_MAX_AGE_SECONDS", "OT_BLOB_STORE_PATH",
   "OT_BLOB_STORE_ID", "OT_EPOCH_RELEASE_ID", "OT_RELEASE_ROOT",
   "OT_EPOCH_BOOTSTRAP_CHECKSUM",
@@ -59,6 +60,7 @@ describe("loadConfig", () => {
       linearClientSecret: "linear-client-secret",
       githubReadToken: "github-read-token",
       daytonaSnapshot: "openthrottle",
+      daytonaSandboxMinFreeMiB: 2_048,
       databasePath: "/data/openthrottle-kernel-v1.sqlite",
       blobStorePath: "/data/openthrottle-kernel-v1-blobs",
       kernelWorkerIntervalMs: 1_000,
@@ -127,6 +129,30 @@ describe("loadConfig", () => {
     process.env.OT_KERNEL_LEASE_SECONDS = "29";
     expect(() => loadConfig()).toThrow("OT_KERNEL_LEASE_SECONDS must be between 30");
   });
+
+  it.each([
+    ["1", 1],
+    ["4096", 4_096],
+  ])("accepts positive DAYTONA_SANDBOX_MIN_FREE_MIB=%s", (raw, expected) => {
+    setRequiredEnv();
+    process.env.DAYTONA_SANDBOX_MIN_FREE_MIB = raw;
+    expect(loadConfig().daytonaSandboxMinFreeMiB).toBe(expected);
+  });
+
+  it("uses the disk reserve default for a blank override", () => {
+    setRequiredEnv();
+    process.env.DAYTONA_SANDBOX_MIN_FREE_MIB = "   ";
+    expect(loadConfig().daytonaSandboxMinFreeMiB).toBe(2_048);
+  });
+
+  it.each(["0", "-1", "1.5", "many"])(
+    "rejects invalid DAYTONA_SANDBOX_MIN_FREE_MIB=%s",
+    (raw) => {
+      setRequiredEnv();
+      process.env.DAYTONA_SANDBOX_MIN_FREE_MIB = raw;
+      expect(() => loadConfig()).toThrow(/DAYTONA_SANDBOX_MIN_FREE_MIB/);
+    },
+  );
 
   it("validates stable kernel identities and the public URL", () => {
     setRequiredEnv();

@@ -9,7 +9,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { reclaimSandboxScratch } from "./sandbox-disk.mjs";
+import { inspectSandboxDisk, reclaimSandboxScratch } from "./sandbox-disk.mjs";
 
 function roots(root) {
   return {
@@ -195,5 +195,63 @@ describe("sandbox scratch reclamation", () => {
     expect(report.failures.length).toBeLessThanOrEqual(32);
     expect(report.failures.join("\n")).toContain("permission denied");
     expect(report.timed_out).toBe(true);
+  });
+});
+
+describe("sandbox disk inspection", () => {
+  it("deduplicates healthy paths sharing one filesystem", () => {
+    const report = inspectSandboxDisk({
+      requiredKiB: 2_097_152,
+      runDf: () => [
+        "Filesystem 1024-blocks Used Available Capacity Mounted on",
+        "/dev/root 10485760 1024 3145728 1% /",
+        "/dev/root 10485760 1024 3145728 1% /",
+        "/dev/root 10485760 1024 3145728 1% /",
+        "",
+      ].join("\n"),
+    });
+
+    expect(report).toEqual({
+      schema: "openthrottle.sandbox-disk-inspection/v1",
+      required_kib: 2_097_152,
+      low: false,
+      filesystems: [{
+        filesystem: "/dev/root",
+        mount: "/",
+        available_kib: 3_145_728,
+        paths: ["/var/lib/openthrottle", "/home/agent", "/tmp"],
+        low: false,
+      }],
+    });
+  });
+
+  it("reports an exact deficient filesystem and rejects malformed or oversized output", () => {
+    const report = inspectSandboxDisk({
+      requiredKiB: 2_097_152,
+      runDf: () => [
+        "Filesystem 1024-blocks Used Available Capacity Mounted on",
+        "/dev/runtime 10485760 1024 3145728 1% /var/lib/openthrottle",
+        "/dev/home 10485760 1024 2097151 80% /home/agent",
+        "/dev/runtime 10485760 1024 3145728 1% /var/lib/openthrottle",
+      ].join("\n"),
+    });
+
+    expect(report.low).toBe(true);
+    expect(report.filesystems[1]).toEqual({
+      filesystem: "/dev/home",
+      mount: "/home/agent",
+      available_kib: 2_097_151,
+      paths: ["/home/agent"],
+      low: true,
+    });
+    expect(() => inspectSandboxDisk({ requiredKiB: 0, runDf: () => "" })).toThrow(/required KiB/);
+    expect(() => inspectSandboxDisk({
+      requiredKiB: 1,
+      runDf: () => "invalid\n",
+    })).toThrow(/header or row count/);
+    expect(() => inspectSandboxDisk({
+      requiredKiB: 1,
+      runDf: () => "x".repeat(16 * 1024 + 1),
+    })).toThrow(/oversized/);
   });
 });

@@ -133,6 +133,20 @@ function sandboxWith(downloadFile: (path: string) => Promise<Buffer>) {
   const daemonEnvironment = new Map<string, string>();
   const sessionEnvironments = new Map<string, Record<string, string>>();
   const defaultExecuteCommand = async (command: string) => {
+    if (command.includes("sandbox-disk.mjs") && command.includes("'check'")) {
+      return { exitCode: 0, result: JSON.stringify({
+        schema: "openthrottle.sandbox-disk-inspection/v1",
+        required_kib: 2_097_152,
+        low: false,
+        filesystems: [{
+          filesystem: "/dev/root",
+          mount: "/",
+          available_kib: 3_145_728,
+          paths: ["/var/lib/openthrottle", "/home/agent", "/tmp"],
+          low: false,
+        }],
+      }) };
+    }
     const lockInitialization = /touch -- '([^']*lease-generation\.lock)'/.exec(command);
     if (lockInitialization) {
       if (!files.has(lockInitialization[1]!)) files.set(lockInitialization[1]!, Buffer.alloc(0));
@@ -246,6 +260,7 @@ function adapterFor(
     snapshot: "snapshot-1",
     github_read_token: "github-token",
     task_timeout_seconds: 1,
+    sandbox_min_free_kib: 2_097_152,
     runtime_capability_digest: "d".repeat(64),
     blob_store: blobStore,
     environments: {
@@ -895,6 +910,9 @@ describe("DaytonaKernelAdapter", () => {
     const fenceCall = sandbox.process.executeCommand.mock.calls.findIndex(
       ([command]) => String(command).includes("touch --") && String(command).includes("lease-generation.lock"),
     );
+    const preflightCall = sandbox.process.executeCommand.mock.calls.findIndex(
+      ([command]) => String(command).includes("sandbox-disk.mjs") && String(command).includes("'check'"),
+    );
     expect(sandbox.process.executeCommand.mock.calls[cleanupCall]).toEqual([
       "'node' '/opt/openthrottle/runner/sandbox-disk.mjs' 'action' '--attempt' 'attempt-1' " +
         "'--lease' 'lease-1' '--phase' 'work' '--generation' '0'",
@@ -903,13 +921,169 @@ describe("DaytonaKernelAdapter", () => {
       30,
     ]);
     expect(cleanupCall).toBeGreaterThanOrEqual(0);
-    expect(fenceCall).toBeGreaterThan(cleanupCall);
+    expect(preflightCall).toBeGreaterThan(cleanupCall);
+    expect(sandbox.process.executeCommand.mock.calls[preflightCall]).toEqual([
+      "'node' '/opt/openthrottle/runner/sandbox-disk.mjs' 'check' '--required-kib' '2097152'",
+      "/var/lib/openthrottle",
+      {},
+      10,
+    ]);
+    expect(fenceCall).toBeGreaterThan(preflightCall);
     expect(sandbox.updateEnv).toHaveBeenCalledWith(expect.objectContaining({
       OT_LEASE_GENERATION_FENCE_FILE:
         "/var/lib/openthrottle/action-fences/attempt-1/lease-generation.json",
       OT_LEASE_GENERATION_LOCK_FILE:
         "/var/lib/openthrottle/action-fences/attempt-1/lease-generation.lock",
     }), expect.any(Object));
+  });
+
+  it("returns exact low-disk evidence before writing transport or launching a session", async () => {
+    const request = workRequest();
+    const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
+    sandbox.process.executeCommand.mockImplementation(async (command: string) => {
+      if (command.includes("sandbox-disk.mjs") && command.includes("'action'")) {
+        return { exitCode: 0, result: JSON.stringify({
+          schema: "openthrottle.sandbox-scratch-reclamation/v1",
+          removed_classes: ["action_materializations"],
+          failures: ["legacy_npm_cache: permission denied"],
+          timed_out: false,
+        }) };
+      }
+      if (command.includes("sandbox-disk.mjs") && command.includes("'check'")) {
+        return { exitCode: 0, result: JSON.stringify({
+          schema: "openthrottle.sandbox-disk-inspection/v1",
+          required_kib: 2_097_152,
+          low: true,
+          filesystems: [{
+            filesystem: "/dev/home",
+            mount: "/home/agent",
+            available_kib: 2_000_000,
+            paths: ["/home/agent"],
+            low: true,
+          }],
+        }) };
+      }
+      return sandbox.defaultExecuteCommand(command);
+    });
+
+    await expect(adapterFor(sandbox).executeWork(request, {
+      lease_generation: 0,
+      heartbeat_interval_ms: 10,
+      on_heartbeat: vi.fn().mockResolvedValue(undefined),
+      on_session: vi.fn(),
+    })).resolves.toEqual({
+      state: "work_failed",
+      retryable: true,
+      reason: "sandbox_disk_low: path=/home/agent mount=/home/agent " +
+        "available_kib=2000000 required_kib=2097152 cleanup=partial",
+    });
+
+    expect(sandbox.process.executeCommand.mock.calls.filter(
+      ([command]) => String(command).includes("sandbox-disk.mjs") && String(command).includes("'action'"),
+    )).toHaveLength(1);
+    expect(sandbox.process.executeCommand.mock.calls.filter(
+      ([command]) => String(command).includes("sandbox-disk.mjs") && String(command).includes("'check'"),
+    )).toHaveLength(1);
+    expect(sandbox.fs.createFolder).not.toHaveBeenCalled();
+    expect(sandbox.fs.uploadFile).not.toHaveBeenCalled();
+    expect(sandbox.updateEnv).not.toHaveBeenCalled();
+    expect(sandbox.process.createSession).not.toHaveBeenCalled();
+  });
+
+  it("preflights result correction before creating its transport", async () => {
+    const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
+    sandbox.process.executeCommand.mockImplementation(async (command: string) => {
+      if (command.includes("sandbox-disk.mjs") && command.includes("'check'")) {
+        return { exitCode: 0, result: JSON.stringify({
+          schema: "openthrottle.sandbox-disk-inspection/v1",
+          required_kib: 2_097_152,
+          low: true,
+          filesystems: [{
+            filesystem: "/dev/root",
+            mount: "/",
+            available_kib: 1_000,
+            paths: ["/var/lib/openthrottle", "/home/agent", "/tmp"],
+            low: true,
+          }],
+        }) };
+      }
+      return sandbox.defaultExecuteCommand(command);
+    });
+    const records = [runtimeDelivery("create"), runtimeDelivery("start")];
+    const adapter = adapterFor(sandbox, {}, {
+      loadAttemptRequestInputs: vi.fn().mockResolvedValue({
+        task_prompt: "execute the sealed task",
+        context: {
+          records: new Map(records.map((record) => [record.id, record])),
+          checkpoints: new Map(),
+        },
+      }),
+    });
+
+    await expect(adapter.correctResult(correctionRequest(), {
+      lease_generation: 0,
+      heartbeat_interval_ms: 10,
+      on_heartbeat: vi.fn().mockResolvedValue(undefined),
+    })).resolves.toMatchObject({
+      state: "work_failed",
+      retryable: true,
+      reason: expect.stringContaining("sandbox_disk_low: path=/var/lib/openthrottle"),
+    });
+    expect(sandbox.fs.createFolder).not.toHaveBeenCalled();
+    expect(sandbox.process.createSession).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["folder creation error code", "folder"],
+    ["fence publication diagnostic", "fence"],
+    ["request transport upload error", "request-upload"],
+    ["result transport read error", "result-read"],
+    ["provider command exit diagnostic", "command"],
+  ])("classifies ENOSPC from %s as retryable sandbox-fatal infrastructure", async (_label, source) => {
+    const request = workRequest();
+    const sandbox = sandboxWith(async (path) => {
+      if (source === "result-read" && path.endsWith("/result.json")) {
+        throw Object.assign(new Error("result transport read failed"), { code: "ENOSPC" });
+      }
+      throw new Error("404 not found");
+    });
+    emulateRepositoryBinding(sandbox);
+    if (source === "folder") {
+      sandbox.fs.createFolder.mockImplementationOnce(async () => {
+        throw Object.assign(new Error("create failed"), { code: "ENOSPC" });
+      });
+    } else if (source === "fence") {
+      sandbox.process.executeCommand.mockImplementation(async (command: string) => {
+        if (command.includes("touch --") && command.includes("lease-generation.lock")) {
+          return { exitCode: 1, result: "touch: no space left on device" };
+        }
+        return sandbox.defaultExecuteCommand(command);
+      });
+    } else if (source === "request-upload") {
+      sandbox.fs.uploadFile.mockImplementation(async (bytes: Buffer, path: string) => {
+        if (path.endsWith("/request.json")) {
+          throw new Error("request upload: no space left on device");
+        }
+        sandbox.files.set(path, Buffer.from(bytes));
+      });
+    } else {
+      sandbox.process.getSessionCommand.mockResolvedValue({
+        cmdId: "command-1",
+        exitCode: 1,
+        result: "entrypoint: write failed: No space left on device",
+      });
+    }
+
+    await expect(adapterFor(sandbox).executeWork(request, {
+      lease_generation: 0,
+      heartbeat_interval_ms: 10,
+      on_heartbeat: vi.fn().mockResolvedValue(undefined),
+      on_session: vi.fn(),
+    })).resolves.toEqual({
+      state: "work_failed",
+      retryable: true,
+      reason: "sandbox_disk_exhausted: no space left on device in the retained sandbox",
+    });
   });
 
   it("does not reclaim scratch while adopting an active action session", async () => {
@@ -1120,6 +1294,7 @@ describe("DaytonaKernelAdapter", () => {
       throw new Error(`unexpected download ${path}`);
     });
     sandbox.process.executeCommand.mockImplementation(async (command: string) => {
+      if (command.includes("sandbox-disk.mjs")) return sandbox.defaultExecuteCommand(command);
       if (command.includes("lease-generation.lock")) return sandbox.defaultExecuteCommand(command);
       return {
         exitCode: 0,
@@ -1182,6 +1357,7 @@ describe("DaytonaKernelAdapter", () => {
       throw new Error("404 not found");
     });
     sandbox.process.executeCommand.mockImplementation(async (command: string) => {
+      if (command.includes("sandbox-disk.mjs")) return sandbox.defaultExecuteCommand(command);
       if (command.includes("lease-generation.lock")) return sandbox.defaultExecuteCommand(command);
       if (command.includes("/var/lib/openthrottle/repository-source")) {
         return { exitCode: 45, result: "" };
