@@ -65,9 +65,6 @@ export function unique(values, path) {
         fail(path, "must not contain duplicates");
     return [...values];
 }
-export function optional(value, parse) {
-    return value === undefined ? undefined : parse(value);
-}
 export function nullable(value, parse) {
     return value === null ? null : parse(value);
 }
