@@ -1462,6 +1462,201 @@ describe("SqliteKernelStore", () => {
     }
   });
 
+  it("loads the repaired divergent persona-review terminal context from durable records", async () => {
+    const context = setup(undefined, () => NOW, true);
+    try {
+      context.store.admitPipelineRun(context.admission);
+      const runtimeDecision = (kind: "create" | "start"): DecisionRecord => ({
+        schema: EXECUTION_RECORD_SCHEMA,
+        id: `decision-runtime-${kind}`,
+        kind: "decision",
+        pipeline_run_id: "run-1",
+        reducer: "core/external-schedule@1",
+        input_record_ids: [],
+        payload_schema: "decision/v1",
+        payload: { inline: { phase: kind, attempt_id: "attempt-runtime" } },
+        created_at: NOW,
+      });
+      const runtimeEffect = (kind: "create" | "start", decision: DecisionRecord): EffectIntent => ({
+        schema: EFFECT_INTENT_SCHEMA,
+        id: `effect-runtime-${kind}`,
+        pipeline_run_id: "run-1",
+        decision_record_id: decision.id,
+        kind: `daytona/${kind}-sandbox@1`,
+        idempotency_key: `run-1:daytona/${kind}-sandbox@1:${RUNTIME_IDENTITY}`,
+        target: `daytona:${RUNTIME_IDENTITY}`,
+        subject: null,
+        payload: { schema: `openthrottle.daytona-${kind}/v1`, identity: RUNTIME_IDENTITY },
+      });
+      const runtimeDelivery = (
+        kind: "create" | "start",
+        effect: EffectIntent,
+      ): DeliveryRecord => ({
+        schema: EXECUTION_RECORD_SCHEMA,
+        id: `delivery-runtime-${kind}`,
+        kind: "delivery",
+        pipeline_run_id: "run-1",
+        effect_id: effect.id,
+        idempotency_key: effect.idempotency_key,
+        external_identity: effect.target,
+        status: "confirmed",
+        payload_schema: "openthrottle.effect-delivery/v1",
+        payload: { inline: {
+          effect_kind: effect.kind,
+          provider: "daytona",
+          observed_via: "post_dispatch_reconciliation",
+          result: {
+            identity: RUNTIME_IDENTITY,
+            sandbox_id: "sandbox-ope-226",
+            resource_state: kind === "create" ? "created" : "started",
+          },
+        } },
+        created_at: NOW,
+      });
+      const createDecision = runtimeDecision("create");
+      const startDecision = runtimeDecision("start");
+      const createEffect = runtimeEffect("create", createDecision);
+      const startEffect = runtimeEffect("start", startDecision);
+      const createDelivery = runtimeDelivery("create", createEffect);
+      const startDelivery = runtimeDelivery("start", startEffect);
+      const priorMemberDecision: DecisionRecord = {
+        schema: EXECUTION_RECORD_SCHEMA,
+        id: "decision-review-correctness-durable",
+        kind: "decision",
+        pipeline_run_id: "run-1",
+        reducer: "core/review-outcome@1",
+        input_record_ids: [],
+        payload_schema: "decision/v1",
+        payload: { inline: { outcome: "success", member_id: "core/correctness-dataflow" } },
+        created_at: NOW,
+      };
+      const aggregateDecision: DecisionRecord = {
+        schema: EXECUTION_RECORD_SCHEMA,
+        id: "decision-review-wave-aggregate-failure",
+        kind: "decision",
+        pipeline_run_id: "run-1",
+        reducer: "core/structured-wave@1",
+        input_record_ids: [],
+        payload_schema: "decision/v1",
+        payload: { inline: { outcome: "failure", aggregate: true } },
+        created_at: NOW,
+      };
+      const durableContext = [
+        createDelivery.id,
+        startDelivery.id,
+        priorMemberDecision.id,
+        aggregateDecision.id,
+      ].sort();
+      const insertDecision = context.db.prepare(`
+        INSERT INTO records (
+          id, pipeline_run_id, sequence, record_hash, kind, payload_schema,
+          inline_payload, reducer, input_record_ids_json, input_record_count, created_at
+        ) VALUES (?, 'run-1', ?, ?, 'decision', ?, ?, ?, ?, ?, ?)
+      `);
+      const insertEffect = context.db.prepare(`
+        INSERT INTO effects (
+          id, pipeline_run_id, decision_record_id, kind, idempotency_key, target,
+          subject, payload_schema, inline_payload, intent_hash, status, version,
+          attempt_count, available_at, delivery_record_id, created_at, updated_at
+        ) VALUES (?, 'run-1', ?, ?, ?, ?, NULL, ?, ?, ?, 'acknowledged', 1,
+          1, ?, ?, ?, ?)
+      `);
+      const insertDelivery = context.db.prepare(`
+        INSERT INTO records (
+          id, pipeline_run_id, sequence, record_hash, kind, payload_schema,
+          inline_payload, effect_id, idempotency_key, external_identity,
+          delivery_status, created_at
+        ) VALUES (?, 'run-1', ?, ?, 'delivery', ?, ?, ?, ?, ?, 'confirmed', ?)
+      `);
+      context.db.transaction(() => {
+        let sequence = 0;
+        for (const [decision, effect, delivery] of [
+          [createDecision, createEffect, createDelivery],
+          [startDecision, startEffect, startDelivery],
+        ] as const) {
+          insertDecision.run(
+            decision.id,
+            sequence += 1,
+            digestCanonicalJson(decision),
+            decision.payload_schema,
+            canonicalJson((decision.payload as { inline: unknown }).inline),
+            decision.reducer,
+            canonicalJson(decision.input_record_ids),
+            decision.input_record_ids.length,
+            decision.created_at,
+          );
+          insertEffect.run(
+            effect.id,
+            effect.decision_record_id,
+            effect.kind,
+            effect.idempotency_key,
+            effect.target,
+            effect.kind,
+            canonicalJson(effect.payload),
+            effectIntentContentHash(effect),
+            NOW,
+            delivery.id,
+            NOW,
+            NOW,
+          );
+          insertDelivery.run(
+            delivery.id,
+            sequence += 1,
+            digestCanonicalJson(delivery),
+            delivery.payload_schema,
+            canonicalJson((delivery.payload as { inline: unknown }).inline),
+            delivery.effect_id,
+            delivery.idempotency_key,
+            delivery.external_identity,
+            delivery.created_at,
+          );
+        }
+        for (const decision of [priorMemberDecision, aggregateDecision]) {
+          insertDecision.run(
+            decision.id,
+            sequence += 1,
+            digestCanonicalJson(decision),
+            decision.payload_schema,
+            canonicalJson((decision.payload as { inline: unknown }).inline),
+            decision.reducer,
+            canonicalJson(decision.input_record_ids),
+            decision.input_record_ids.length,
+            decision.created_at,
+          );
+        }
+        context.db.prepare(`
+          UPDATE attempts SET stage_id = ?, repository_authority = 'inspect',
+            context_record_ids_json = ?, updated_at = ?
+          WHERE id = 'attempt-1' AND pipeline_run_id = 'run-1'
+        `).run(runtimeStopStageId("failed"), canonicalJson(durableContext), NOW);
+        context.db.prepare(`
+          UPDATE pipeline_runs SET status = 'running', cursor_stage_id = ?, updated_at = ?
+          WHERE id = 'run-1'
+        `).run(runtimeStopStageId("failed"), NOW);
+      }).immediate();
+
+      const request = await context.store.loadAttemptRequestInputs({
+        pipeline_run_id: "run-1",
+        attempt_id: "attempt-1",
+      });
+      expect([...request.context.records.keys()]).toEqual(durableContext);
+      expect(request.context.records.get(aggregateDecision.id)).toEqual(aggregateDecision);
+      expect(request.context.records.get(priorMemberDecision.id)).toEqual(priorMemberDecision);
+      expect(request.context.records.get(createDelivery.id)).toEqual(createDelivery);
+      expect(request.context.records.get(startDelivery.id)).toEqual(startDelivery);
+      expect(request.context.records.has("decision-review-security-transient")).toBe(false);
+
+      await expect(context.store.loadExactReductionView({
+        pipeline_run_id: "run-1",
+        attempt_id: "attempt-1",
+        record_ids: [...durableContext, "decision-review-security-transient"],
+        checkpoint_ids: [],
+      })).rejects.toThrow("exact record context is missing an authorized record");
+    } finally {
+      context.db.close();
+    }
+  });
+
   it("persists result/decision/effect primitives and fences effect lease reconciliation", async () => {
     let currentTime = NOW;
     const context = setup(undefined, () => currentTime);

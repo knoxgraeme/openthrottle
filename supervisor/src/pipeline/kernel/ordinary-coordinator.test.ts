@@ -8,16 +8,21 @@ import {
   COMPILED_PIPELINE_MANIFEST_SCHEMA,
   DEFINITION_BUNDLE_SCHEMA,
   EVAL_DEFINITION_SCHEMA,
+  EXECUTION_RECORD_SCHEMA,
   PIPELINE_DEFINITION_SCHEMA,
   RESULT_CANDIDATE_SCHEMA,
   RUNTIME_PROVISION_STAGE_ID,
   SEMANTIC_RESULT_SCHEMA,
   definitionEntryContentHash,
+  expandCompiledRuntimeLifecycle,
+  runtimeStopStageId,
   validateAndNormalizeResultCandidate,
   validateDefinitionBundle,
   type CompiledPipelineManifest,
   type AttemptCheckpoint,
   type DefinitionBundleEntry,
+  type DecisionRecord,
+  type DeliveryRecord,
   type EvalDefinition,
   type ReviewFindingV1,
   type ResultCandidate,
@@ -45,6 +50,7 @@ import type {
 } from "../../runtime/kernel-contracts.js";
 import {
   buildKernelWorkActionRequest,
+  createPendingKernelAttempt,
   exactKernelContext,
   kernelAttemptRequestHash,
 } from "./action-request.js";
@@ -552,6 +558,207 @@ async function execute(coordinator: OrdinaryKernelCoordinator, ordinal: number) 
 }
 
 describe("ordinary kernel activation", () => {
+  it("routes a scoped nonretryable failure through runtime stop without recovery quarantine", async () => {
+    const fixed = fixture();
+    const authoredStage: CompiledPipelineManifest["stages"][number] = {
+      id: "persona_review",
+      kind: "agent",
+      engine: "codex",
+      agent_id: "core/reviewer",
+      repository_authority: "inspect",
+      skills: ["core/review-change"],
+      entry_skill: "core/review-change",
+      eval: "core/review-result",
+      on: { failure: { terminal: "failed" } },
+    };
+    const manifest: CompiledPipelineManifest = {
+      ...fixed.manifest,
+      entry_stage: authoredStage.id,
+      stages: expandCompiledRuntimeLifecycle({
+        entry_stage: authoredStage.id,
+        stages: [authoredStage],
+      }).stages,
+    };
+    const runtimeDelivery = (kind: "create" | "start"): DeliveryRecord => ({
+      schema: EXECUTION_RECORD_SCHEMA,
+      id: `delivery-runtime-${kind}`,
+      kind: "delivery",
+      pipeline_run_id: "run-persona-failure",
+      effect_id: `effect-runtime-${kind}`,
+      idempotency_key: `run-persona-failure:runtime:${kind}`,
+      external_identity: "daytona:sandbox-ope-226",
+      status: "confirmed",
+      payload_schema: "openthrottle.effect-delivery/v1",
+      payload: { inline: {
+        effect_kind: `daytona/${kind}-sandbox@1`,
+        provider: "daytona",
+        observed_via: "post_dispatch_reconciliation",
+        result: { sandbox_id: "sandbox-ope-226" },
+      } },
+      created_at: NOW,
+    });
+    const runtimeRecords = [runtimeDelivery("create"), runtimeDelivery("start")];
+    const aggregateDecision: DecisionRecord = {
+      schema: EXECUTION_RECORD_SCHEMA,
+      id: "decision-persona-wave-aggregate-failure",
+      kind: "decision",
+      pipeline_run_id: "run-persona-failure",
+      reducer: "core/structured-wave@1",
+      input_record_ids: [],
+      payload_schema: "openthrottle.pipeline-decision-record/v1",
+      payload: { inline: {
+        schema: "openthrottle.pipeline-decision-record/v1",
+        evaluator: "core/review-outcome@1",
+        outcome: "failure",
+        reason: "review_execution_failed",
+      } },
+      created_at: NOW,
+    };
+    const records = new Map(
+      [...runtimeRecords, aggregateDecision].map((record) => [record.id, record]),
+    );
+    const acceptedBoundary: AttemptCheckpoint = {
+      schema: ATTEMPT_CHECKPOINT_SCHEMA,
+      id: "checkpoint-persona-review-boundary",
+      pipeline_run_id: "run-persona-failure",
+      attempt_id: "attempt-integrate-unit",
+      request_hash: "9".repeat(64),
+      definition_bundle_hash: manifest.definition_bundle_hash,
+      input_subject: SOURCE,
+      output_subject: SOURCE,
+      native_session_id: "session-integrate-unit",
+      payload_schema: "openthrottle.executor-checkpoint/v1",
+      payload: { inline: { accepted: true } },
+      captured_at: NOW,
+    };
+    const pending = createPendingKernelAttempt({
+      id: "attempt-persona-failure",
+      pipeline_run_id: "run-persona-failure",
+      scope: {
+        kind: "fanout_member",
+        stage_id: authoredStage.id,
+        parent_attempt_id: "attempt-selector",
+        fanout_id: "selection.personas",
+        member_id: "core/review-change",
+        member_index: 1,
+      },
+      input_subject: SOURCE,
+      bundle: fixed.compilation.bundle.value,
+      manifest,
+      action_inputs: {
+        task_prompt: "Review the exact structured candidate.",
+        context: { records: [...records.values()], checkpoints: [acceptedBoundary] },
+      },
+    });
+    let currentAttempt: KernelAttempt = {
+      ...pending,
+      status: "running",
+      version: 1,
+      lease: {
+        id: "lease-persona-failure",
+        generation: 0,
+        worker_id: "worker-persona",
+        purpose: "work",
+        expires_at: "2026-08-20T12:05:00.000Z",
+        started: true,
+      },
+    };
+    let run: KernelRun = {
+      schema: KERNEL_RUN_SCHEMA,
+      id: "run-persona-failure",
+      pipeline_id: manifest.pipeline_id,
+      definition_bundle_hash: manifest.definition_bundle_hash,
+      current_subject: SOURCE,
+      status: "running",
+      terminal_outcome: null,
+      cursor: compileKernelCursor({
+        stage_id: authoredStage.id,
+        version: 1,
+        attempts: [currentAttempt],
+      }),
+      version: 1,
+      work_retry_limit: 2,
+      result_correction_limit: 2,
+      active_attempt_versions: { [currentAttempt.id]: currentAttempt.version },
+      active_effect_versions: {},
+      checkpoint_ids: {},
+    };
+    let quarantineCalled = false;
+    const store = {
+      async loadExactReductionView(input: {
+        attempt_id: string | null;
+        record_ids: readonly string[];
+      }) {
+        return {
+          manifest,
+          run,
+          current_attempt: input.attempt_id === null ? null : currentAttempt,
+          records: new Map(input.record_ids.map((id) => [id, records.get(id)!])),
+          checkpoints: new Map(),
+        };
+      },
+      async loadAttemptRequestInputs() {
+        return {
+          task_prompt: "Review the exact structured candidate.",
+          context: {
+            records,
+            checkpoints: new Map([[acceptedBoundary.id, acceptedBoundary]]),
+          },
+        };
+      },
+      async applyAtomicTransition(transition: AtomicTransitionBundle) {
+        for (const write of transition.attempt_writes) {
+          if (write.kind === "replace" && write.attempt.id === currentAttempt.id) {
+            currentAttempt = write.attempt;
+          }
+        }
+        run = transition.run;
+        return { disposition: "applied" as const, run_version: run.version };
+      },
+      async quarantineExhaustedAttemptRecovery() {
+        quarantineCalled = true;
+        return true;
+      },
+    };
+    const runtime: KernelRuntimePort = {
+      async executeWork() {
+        return { state: "work_failed", retryable: false, reason: "review execution failed" };
+      },
+      async correctResult() {
+        throw new Error("unexpected correction");
+      },
+    };
+    const coordinator = new OrdinaryKernelCoordinator({
+      store: store as never,
+      definition_bundles: {
+        resolveExactDefinitionBundle: async () => fixed.compilation.bundle.value,
+      },
+      runtime,
+      runtime_sessions: {} as never,
+      attempt_lease_duration_ms: 60_000,
+      now: () => NOW,
+    });
+
+    await expect(coordinator.executeLeasedAttempt({
+      run_id: run.id,
+      run_version: run.version,
+      cursor_version: run.cursor.version,
+      attempt: currentAttempt,
+      lease: currentAttempt.lease!,
+    })).resolves.toMatchObject({
+      disposition: "terminal",
+      run_status: "running",
+      next_stage_id: runtimeStopStageId("failed"),
+    });
+    expect(quarantineCalled).toBe(false);
+    expect(run).toMatchObject({
+      status: "running",
+      terminal_outcome: null,
+      cursor: { stage_id: runtimeStopStageId("failed") },
+    });
+    expect(currentAttempt.status).toBe("failed");
+  });
+
   it("quarantines an exhausted recovery lease when terminal preparation is unreadable", async () => {
     const fixed = fixture();
     const manifest: CompiledPipelineManifest = {

@@ -7,6 +7,7 @@ import {
   RUNTIME_PROVISION_STAGE_ID,
   canonicalJson,
   expandCompiledRuntimeLifecycle,
+  runtimeCleanupStageId,
   runtimeStopStageId,
   type AttemptCheckpoint,
   type CompiledPipelineManifest,
@@ -344,7 +345,7 @@ function deliveryRecord(effect: EffectIntent): DeliveryRecord {
   };
 }
 
-function runtimeDelivery(kind: "create" | "start" | "cleanup"): DeliveryRecord {
+function runtimeDelivery(kind: "create" | "start" | "stop" | "cleanup"): DeliveryRecord {
   return {
     schema: EXECUTION_RECORD_SCHEMA,
     id: `delivery-runtime-${kind}`,
@@ -356,7 +357,7 @@ function runtimeDelivery(kind: "create" | "start" | "cleanup"): DeliveryRecord {
     status: "confirmed",
     payload_schema: "openthrottle.effect-delivery/v1",
     payload: { inline: {
-      effect_kind: `daytona/${kind === "cleanup" ? "cleanup" : kind}-sandbox@1`,
+      effect_kind: `daytona/${kind}-sandbox@1`,
       provider: "daytona",
       observed_via: "reconciliation",
       result: { sandbox_id: "sandbox-1" },
@@ -1567,6 +1568,92 @@ describe("pipeline topology on the shared kernel", () => {
       terminal_outcome: null,
       cursor: { stage_id: runtimeStopStageId("needs_human") },
     });
+  });
+
+  it.each([
+    "completed",
+    "failed",
+    "needs_human",
+    "canceled",
+  ] as const)("keeps %s cleanup-owned until the cleanup delivery settles", (outcome) => {
+    const currentManifest = manifestWithRuntimeStages();
+    const stop = attempt({
+      id: `attempt-stop-${outcome}`,
+      scope: stageScope(runtimeStopStageId(outcome)),
+      repository_authority: "inspect",
+      status: "recorded",
+      version: 3,
+      result_record_id: `result-stop-${outcome}`,
+    });
+    const stopResult = resultRecord(stop, stop.result_record_id!);
+    const stopDelivery = runtimeDelivery("stop");
+    const stopDecision = decisionRecord(
+      [stopResult.id, stopDelivery.id].sort(),
+      `decision-stop-${outcome}`,
+    );
+    const cleanup = attempt({
+      id: `attempt-cleanup-${outcome}`,
+      scope: stageScope(runtimeCleanupStageId(outcome)),
+      repository_authority: "inspect",
+      context_record_ids: [
+        stopResult.id,
+        stopDelivery.id,
+        stopDecision.id,
+      ].sort(),
+    });
+    const afterStop = reduce({
+      current: stop,
+      currentRun: run(stop, { status: "running", terminal_outcome: null }),
+      currentManifest,
+      command: {
+        type: "settle",
+        command_id: `settle-stop-${outcome}`,
+        attempt_id: stop.id,
+        decision_record_id: stopDecision.id,
+        outcome: "success",
+        next_attempts: [cleanup],
+      },
+      records: [stopResult, stopDelivery, stopDecision],
+    });
+    expect(afterStop.run).toMatchObject({
+      status: "running",
+      terminal_outcome: null,
+      cursor: { stage_id: runtimeCleanupStageId(outcome) },
+    });
+
+    const recordedCleanup = attempt({
+      ...cleanup,
+      status: "recorded",
+      version: 3,
+      result_record_id: `result-cleanup-${outcome}`,
+    });
+    const cleanupResult = resultRecord(recordedCleanup, recordedCleanup.result_record_id!);
+    const cleanupDelivery = runtimeDelivery("cleanup");
+    const cleanupDecision = decisionRecord(
+      [cleanupResult.id, cleanupDelivery.id].sort(),
+      `decision-cleanup-${outcome}`,
+    );
+    const settled = reduce({
+      current: recordedCleanup,
+      currentRun: {
+        ...afterStop.run,
+        version: afterStop.run.version + 3,
+        active_attempt_versions: { [recordedCleanup.id]: recordedCleanup.version },
+      },
+      currentManifest,
+      command: {
+        type: "settle",
+        command_id: `settle-cleanup-${outcome}`,
+        attempt_id: recordedCleanup.id,
+        decision_record_id: cleanupDecision.id,
+        outcome: "success",
+        next_attempts: [],
+      },
+      records: [cleanupResult, cleanupDelivery, cleanupDecision],
+    });
+    expect(settled.run).toMatchObject({ status: outcome, terminal_outcome: outcome });
+    expect(settled.run.active_attempt_versions).toEqual({});
+    expect(settled.run.active_effect_versions).toEqual({});
   });
 
   it.each([
