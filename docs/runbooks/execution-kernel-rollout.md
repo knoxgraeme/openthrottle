@@ -192,6 +192,24 @@ Run the normal deploy workflow. It uses `--ha=false`, converges to one Machine,
 and verifies that the sole `openthrottle_data` volume is attached to that
 Machine. Confirm health and the authenticated release identity:
 
+Size the data volume for both SQLite and immutable blobs: they share `/data`,
+and checkpoint and DefinitionBundle blobs grow as runs accumulate. Keep enough
+headroom for that retained history rather than sizing only for the initial
+database. `/healthz` fails with `condition: "disk_full"` after SQLite reports
+`SQLITE_FULL`; a worker that reports neither a successful cycle nor active
+runtime lease heartbeats for 120 seconds also fails health.
+
+If the volume fills, extend it online before restarting or redeploying the
+writer (Fly volumes cannot be shrunk):
+
+```bash
+fly volumes extend VOLUME_ID --size 10 --app "$FLY_APP"
+```
+
+Confirm the new size with `fly volumes list`, then require `/healthz` to return
+HTTP `200` and a successful worker-cycle timestamp. Extending storage does not
+repair unrelated SQLite corruption or relax the exact epoch identity checks.
+
 ```bash
 flyctl machines list --app "$FLY_APP" --json
 flyctl volumes list --app "$FLY_APP" --json

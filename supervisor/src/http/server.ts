@@ -23,6 +23,7 @@ import {
 import type { KernelHistoricalRunQuery } from "../persistence/kernel-analysis-store.js";
 import { KERNEL_INBOX_MAX_PAYLOAD_BYTES } from "../persistence/kernel-inbox-store.js";
 import type { KernelLogCursor, KernelLogKind } from "../persistence/kernel-projection-store.js";
+import type { KernelWorkerHealthPort } from "../shared/kernel-worker-health.js";
 import { readStreamUpToByteLimit } from "../shared/bounded-stream.js";
 import { sanitizeText } from "../shared/sanitize.js";
 
@@ -64,6 +65,7 @@ export interface KernelServerDeps {
   capabilities: KernelServerCapabilities;
   service: KernelHttpService;
   repository_setup: KernelRepositorySetupPort;
+  worker_health: KernelWorkerHealthPort;
   linear_session_start?: KernelLinearSessionStartWakePort;
 }
 
@@ -367,7 +369,10 @@ export function createServer(deps: KernelServerDeps): Hono {
   const statusAuthorized = (header: string | undefined) => hasBearer(header, deps.cfg.statusToken);
   const deployAuthorized = (header: string | undefined) => hasBearer(header, deps.cfg.deployToken);
 
-  app.get("/healthz", (context) => context.json({ ok: true }));
+  app.get("/healthz", (context) => {
+    const health = deps.worker_health.snapshot();
+    return health.ok ? context.json(health) : context.json(health, 503);
+  });
 
   app.get("/capabilities", (context) => {
     if (!statusAuthorized(context.req.header("Authorization"))) {
