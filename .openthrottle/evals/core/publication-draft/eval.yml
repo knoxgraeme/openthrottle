@@ -1,0 +1,15 @@
+schema: openthrottle.eval-definition/v1
+id: core/publication-draft
+evaluator: core/action-outcome@1
+result:
+  schema: openthrottle.semantic-result-schema/v1
+  id: core/publication-draft
+  outcomes:
+    - success
+  payload:
+    title:
+      type: string
+      max_length: 72
+    body:
+      type: string
+      max_length: 12000

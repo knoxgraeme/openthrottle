@@ -7,7 +7,7 @@
  * runtime change an explicit reviewed source edit.
  */
 export const RELEASE_PLATFORM_DEFINITION_CATALOG_DIGEST =
-  "9234d9debb240ef661ae870ba53a6cbc514b0b6e9804eda817077aeee1849c46" as const;
+  "37cfd479f2f61957dcf41de5401d8885c35e6580fb61be0f104769413652ebbb" as const;
 
 export const RELEASE_COMPILER_ENVIRONMENT_DIGEST =
-  "ecab562f2a939b33e53936fe8d96bb7b3edf2e0585ef042263344e0bb059bd53" as const;
+  "c93ed63d11d7fbc4db6803f052121e60759f05c6c47edfcecfc53183061b981f" as const;

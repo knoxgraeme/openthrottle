@@ -5,14 +5,17 @@ import { describe, expect, it } from "vitest";
 import {
   RELEASE_COMPILER_ENVIRONMENT_DIGEST,
   RELEASE_PLATFORM_DEFINITION_CATALOG_DIGEST,
+  RESULT_CANDIDATE_SCHEMA,
   compileDefinitionBundle,
   deriveTrustedPlatformDefinitionHashes,
+  validateAndNormalizeResultCandidate,
   verifyCompilerEnvironment,
   verifyPlatformDefinitionSource,
   type CompilerEnvironmentDescriptor,
   type DefinitionBundleEntry,
   type DefinitionCompilation,
   type PlatformDefinitionCatalog,
+  type SemanticResultSchemaContract,
   type TrustedPlatformDefinitionSource,
   type VirtualDefinitionFile,
 } from "./index.js";
@@ -43,6 +46,7 @@ const agentIds = [
   "admission-reviewer",
   "investigator",
   "ordinary-worker",
+  "publication-lead",
   "reviewer",
   "unit-lead",
   "unit-worker",
@@ -56,6 +60,7 @@ const skillIds = [
   "agent-native-contracts",
   "correctness-dataflow",
   "data-migration",
+  "draft-publication",
   "final-repair",
   "implement-plan",
   "implement-unit",
@@ -157,7 +162,7 @@ describe("root .openthrottle definition tree", () => {
   it("matches the release-sealed catalog before interpreting any platform definition", () => {
     const trusted = sealedPlatform();
     const actual = new Set([...trusted.files.keys()].map((path) => path.slice(".openthrottle/".length)));
-    expect(trusted.catalog.files).toHaveLength(49);
+    expect(trusted.catalog.files).toHaveLength(52);
     expect([...actual].filter((path) => path.startsWith("agents/") && path.endsWith("/instructions.md")))
       .toEqual(agentIds.map((id) => `agents/core/${id}/instructions.md`));
     expect([...actual].filter((path) => path.endsWith("/pipeline.yml")))
@@ -168,6 +173,7 @@ describe("root .openthrottle definition tree", () => {
         "evals/core/admission-result/eval.yml",
         "evals/core/admission-review-result/eval.yml",
         "evals/core/persona-selection/eval.yml",
+        "evals/core/publication-draft/eval.yml",
         "evals/core/review-result/eval.yml",
         "evals/core/unit-result/eval.yml",
       ]);
@@ -188,7 +194,7 @@ describe("root .openthrottle definition tree", () => {
       ),
     });
 
-    expect(hashes.size).toBe(39);
+    expect(hashes.size).toBe(42);
     for (const result of pipelineIds.map((id) => compile(id))) {
       for (const definition of result.bundle.value.entries) {
         if (definition.origin.kind !== "platform") continue;
@@ -288,6 +294,7 @@ describe("root .openthrottle definition tree", () => {
         ["core/admission-result", "core/admission-outcome@1"],
         ["core/admission-review-result", "core/admission-review-outcome@1"],
         ["core/persona-selection", "core/action-outcome@1"],
+        ["core/publication-draft", "core/action-outcome@1"],
         ["core/review-result", "core/review-outcome@1"],
         ["core/unit-result", "core/unit-outcome@1"],
       ]);
@@ -307,6 +314,7 @@ describe("root .openthrottle definition tree", () => {
       ["review", "core/reviewer", "inspect"],
       ["simplify", "core/ordinary-worker", "edit"],
       ["post_simplify_review", "core/reviewer", "inspect"],
+      ["draft_publication", "core/publication-lead", "inspect"],
     ]);
     expect(agentBindings(results[1]!)).toEqual([
       ["investigate", "core/investigator", "edit"],
@@ -320,6 +328,7 @@ describe("root .openthrottle definition tree", () => {
       ["persona_review", "core/reviewer", "inspect"],
       ["validate_review_findings", "core/reviewer", "inspect"],
       ["final_repair", "core/ordinary-worker", "edit"],
+      ["draft_publication", "core/publication-lead", "inspect"],
     ]);
     expect(agentBindings(results[3]!)).toEqual([
       ["plan", "core/admission-planner", "inspect"],
@@ -379,6 +388,102 @@ describe("root .openthrottle definition tree", () => {
       ],
       loop: { over: "selection.personas", body: ["persona_review"] },
     });
+  });
+
+  it("binds one inspect-only publication draft immediately before publish in both implementation pipelines", () => {
+    const ordinary = compile("implement").manifest.value.stages;
+    const structured = compile("structured").manifest.value.stages;
+    const incomingStages = (
+      stages: DefinitionCompilation["manifest"]["value"]["stages"],
+      target: string,
+    ) => stages.filter((stage) => stage.id !== target &&
+      Object.values(stage.on).some((transition) => transition.to === target))
+      .map(({ id }) => id);
+
+    for (const stages of [ordinary, structured]) {
+      const draftIndex = stages.findIndex(({ id }) => id === "draft_publication");
+      const publishIndex = stages.findIndex(({ id }) => id === "publish");
+      expect(draftIndex).toBeGreaterThanOrEqual(0);
+      expect(publishIndex).toBe(draftIndex + 1);
+      expect(stages[draftIndex]).toEqual({
+        id: "draft_publication",
+        kind: "agent",
+        agent_id: "core/publication-lead",
+        repository_authority: "inspect",
+        skills: ["core/draft-publication"],
+        entry_skill: "core/draft-publication",
+        eval: "core/publication-draft",
+        engine: "codex",
+        on: { success: { to: "publish" } },
+      });
+      expect(incomingStages(stages, "publish")).toEqual(["draft_publication"]);
+    }
+
+    expect(incomingStages(ordinary, "draft_publication")).toEqual(["build"]);
+    expect(incomingStages(structured, "draft_publication")).toEqual(["validate_review_findings"]);
+
+    expect(ordinary.find(({ id }) => id === "build")?.on).toMatchObject({
+      success: { to: "draft_publication" },
+      no_change: { to: "draft_publication" },
+      failure: { to: "repair" },
+    });
+    expect(structured.find(({ id }) => id === "validate_review_findings")?.on).toMatchObject({
+      success: { to: "draft_publication" },
+      no_change: { to: "draft_publication" },
+      semantic_repair_required: { to: "final_repair" },
+    });
+    expect(structured.find(({ id }) => id === "final_repair")?.on).toMatchObject({
+      success: { to: "final_test" },
+    });
+  });
+
+  it("accepts only exact bounded publication copy and leaves malformed copy to result correction", () => {
+    const evaluation = compile("implement").bundle.value.entries.find((entry) =>
+      entry.definition_kind === "eval" && entry.definition_id === "core/publication-draft");
+    expect(evaluation).toBeDefined();
+    const semanticSchema = (evaluation!.normalized_payload as {
+      result: SemanticResultSchemaContract;
+    }).result;
+    expect(semanticSchema).toEqual({
+      schema: "openthrottle.semantic-result-schema/v1",
+      id: "core/publication-draft",
+      outcomes: ["success"],
+      payload: {
+        title: { type: "string", max_length: 72 },
+        body: { type: "string", max_length: 12_000 },
+      },
+    });
+
+    const candidate = (payload: Record<string, unknown>, outcome = "success") => ({
+      schema: RESULT_CANDIDATE_SCHEMA,
+      outcome,
+      payload,
+    });
+    const maximumTitle = "t".repeat(72);
+    const maximumBody = "b".repeat(12_000);
+    const maximumPayload = { title: maximumTitle, body: maximumBody };
+    expect(validateAndNormalizeResultCandidate(
+      candidate(maximumPayload),
+      semanticSchema,
+    ).value.payload).toEqual(maximumPayload);
+
+    for (const [payload, pattern] of [
+      [{ title: "", body: "body" }, /payload\.title: must be a non-empty string/],
+      [{ title: "title", body: "" }, /payload\.body: must be a non-empty string/],
+      [{ title: `${maximumTitle}t`, body: "body" }, /payload\.title: must be at most 72 characters/],
+      [{ title: "title", body: `${maximumBody}b` }, /payload\.body: must be at most 12000 characters/],
+      [{ body: "body" }, /payload\.title: is required/],
+      [{ title: "title" }, /payload\.body: is required/],
+      [{ title: ["title"], body: "body" }, /payload\.title: must be a non-empty string/],
+      [{ title: "title", body: ["body"] }, /payload\.body: must be a non-empty string/],
+      [{ title: "title", body: "body", summary: "forged" }, /payload\.summary: unknown field/],
+    ] as const) {
+      expect(() => validateAndNormalizeResultCandidate(candidate(payload), semanticSchema)).toThrow(pattern);
+    }
+    expect(() => validateAndNormalizeResultCandidate(
+      candidate({ title: "title", body: "body" }, "failure"),
+      semanticSchema,
+    )).toThrow(/outcome: must be one of: success/);
   });
 
   it("gives ordinary repair the failure-oriented skill without changing its stage contract", () => {

@@ -162,8 +162,8 @@ stages:
     entry_skill: core/validate-review-findings
     eval: core/review-result
     on:
-      success: {to: publish}
-      no_change: {to: publish}
+      success: {to: draft_publication}
+      no_change: {to: draft_publication}
       semantic_repair_required: {to: final_repair, max_reentries: 5, on_exhausted: needs_human}
       needs_human: {terminal: needs_human}
       failure: {terminal: failed}
@@ -179,6 +179,15 @@ stages:
       failure: {to: final_repair, max_reentries: 3, on_exhausted: needs_human}
       needs_human: {terminal: needs_human}
       exited: {terminal: needs_human}
+  - id: draft_publication
+    kind: agent
+    agent_id: core/publication-lead
+    repository_authority: inspect
+    skills: [core/draft-publication]
+    entry_skill: core/draft-publication
+    eval: core/publication-draft
+    on:
+      success: {to: publish}
   - id: publish
     kind: effect
     effect: core/publish@1
