@@ -43,8 +43,10 @@ For Linear control, prepare and delegate a plan:
 ```bash
 npx openthrottle plan prepare docs/plans/my-change.md
 npx openthrottle ship docs/plans/my-change.md
-npx openthrottle status
+npx openthrottle status OPE-123
 ```
+
+Replace `OPE-123` with the run or source reference emitted for your delegated plan.
 
 For GitHub-Issue control, an authorized collaborator starts work by applying
 the exact `openthrottle` label to an open Issue.
