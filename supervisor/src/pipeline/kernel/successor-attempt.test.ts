@@ -9,6 +9,7 @@ import {
   type DefinitionBundle,
   type DeliveryRecord,
   type ExecutionRecord,
+  type RejectedGithubPushDelivery,
   type ResultRecord,
 } from "@openthrottle/contracts";
 import { exactConfirmedGithubPushDelivery } from "./github-push-delivery.js";
@@ -24,7 +25,12 @@ const NOW = "2026-08-20T12:00:00.000Z";
 const SUBJECT = "a".repeat(40);
 const OUTPUT = "b".repeat(40);
 
-function githubPushDelivery(id: string, sha: string, refMode: "create" | "update"): DeliveryRecord {
+function githubPushDelivery(
+  id: string,
+  sha: string,
+  refMode: "create" | "update",
+  rejection?: Pick<RejectedGithubPushDelivery, "expected_old_subject" | "actual" | "reason">,
+): DeliveryRecord {
   const repository = "owner/repo";
   const ref = "refs/heads/ot/run-1";
   return {
@@ -47,6 +53,7 @@ function githubPushDelivery(id: string, sha: string, refMode: "create" | "update
           ref,
           sha,
           ref_mode: refMode,
+          ...rejection,
         },
       },
     },
@@ -279,6 +286,25 @@ describe("mergeCausalGithubPushContext", () => {
 
     expect(() => exactConfirmedGithubPushDelivery({
       records: [rejected],
+      label: "publication anchor",
+      pipeline_run_id: "run-1",
+    })).toThrow(/invalid task-ref push evidence/);
+  });
+
+  it("rejects confirmed-status push evidence with a rejected contract payload", () => {
+    const rejectedPayload = githubPushDelivery(
+      "delivery-push-rejected-payload",
+      OUTPUT,
+      "create",
+      {
+        expected_old_subject: SUBJECT,
+        actual: null,
+        reason: "publication_parent_missing",
+      },
+    );
+
+    expect(() => exactConfirmedGithubPushDelivery({
+      records: [rejectedPayload],
       label: "publication anchor",
       pipeline_run_id: "run-1",
     })).toThrow(/invalid task-ref push evidence/);

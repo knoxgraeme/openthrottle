@@ -1,10 +1,12 @@
 import {
   canonicalJson,
   validateBlobPointer,
+  validateGithubPushDelivery,
   validateGithubProviderEvidencePolicy,
   type BlobPointer,
   type EffectIntent,
   type FilesystemConfigContract,
+  type GithubPushDelivery,
   type JsonValue,
 } from "@openthrottle/contracts";
 import type { VolumeBlobStore } from "../../persistence/blob-store.js";
@@ -456,6 +458,12 @@ function providerObservationPayload(
   };
 }
 
+function githubPushDelivery(value: GithubPushDelivery): JsonValue {
+  return validateGithubPushDelivery(value, {
+    source: "github_push_delivery",
+  }).value as unknown as JsonValue;
+}
+
 export class GithubKernelAdapter {
   readonly #client: GithubClient;
   readonly #blobs: VolumeBlobStore;
@@ -512,13 +520,13 @@ export class GithubKernelAdapter {
       return {
         kind: "found",
         status: "confirmed",
-        payload: {
+        payload: githubPushDelivery({
           schema: "openthrottle.github-push-delivery/v1",
           repository: payload.repository,
           ref: payload.ref,
           sha: current,
           ref_mode: payload.ref_mode,
-        },
+        }),
       };
     }
     if (payload.ref_mode === "create" && current === null) {
@@ -530,7 +538,7 @@ export class GithubKernelAdapter {
         return {
           kind: "found",
           status: "rejected",
-          payload: {
+          payload: githubPushDelivery({
             schema: "openthrottle.github-push-delivery/v1",
             repository: payload.repository,
             ref: payload.ref,
@@ -539,7 +547,7 @@ export class GithubKernelAdapter {
             expected_old_subject: payload.expected_old_subject,
             actual: null,
             reason: "publication_parent_missing",
-          },
+          }),
         };
       }
       if (
@@ -555,7 +563,7 @@ export class GithubKernelAdapter {
     }
     return {
       kind: "found", status: "rejected",
-      payload: {
+      payload: githubPushDelivery({
         schema: "openthrottle.github-push-delivery/v1",
         repository: payload.repository,
         ref: payload.ref,
@@ -564,7 +572,7 @@ export class GithubKernelAdapter {
         expected_old_subject: payload.expected_old_subject,
         actual: current,
         reason: current === null ? "ref_missing" : "ref_conflict",
-      },
+      }),
     };
   }
 
