@@ -124,15 +124,18 @@ class FakeEffectPort implements KernelEffectPort {
   readonly #leases: LeasedEffectView[];
   readonly #throwAfterCompletion: boolean;
   readonly #onDispatchStarted: (() => void) | undefined;
+  readonly #dispatchStartedIntent: EffectIntent | undefined;
   #current: LeasedEffectView | null = null;
 
   constructor(leases: readonly LeasedEffectView[], options: {
     throwAfterCompletion?: boolean;
     onDispatchStarted?: () => void;
+    dispatchStartedIntent?: EffectIntent;
   } = {}) {
     this.#leases = [...leases];
     this.#throwAfterCompletion = options.throwAfterCompletion ?? false;
     this.#onDispatchStarted = options.onDispatchStarted;
+    this.#dispatchStartedIntent = options.dispatchStartedIntent;
   }
 
   async leaseNextEffect(): Promise<LeasedEffectView | null> {
@@ -151,6 +154,7 @@ class FakeEffectPort implements KernelEffectPort {
     this.dispatchStarts.push(input);
     this.#current = {
       ...this.#current,
+      intent: this.#dispatchStartedIntent ?? this.#current.intent,
       execution_mode: "reconcile_only",
       dispatch_fence: { lease_id: input.lease_id, worker_id: input.worker_id },
     };
@@ -669,6 +673,31 @@ describe("kernel effect execution", () => {
 
     expect(replayEvents.filter((event) => event.startsWith("dispatch:"))).toHaveLength(1);
     expect(replayPort.dispatchStarts).toHaveLength(1);
+  });
+
+  it("rejects a conflicting immutable intent returned at the dispatch-start fence", async () => {
+    const events: string[] = [];
+    const adapter = scriptedAdapter({
+      events,
+      observations: [{ kind: "not_found" }],
+    });
+    const intent = effect();
+    const port = new FakeEffectPort([lease(intent)], {
+      dispatchStartedIntent: {
+        ...intent,
+        payload: { repository: "owner/other", ref: "refs/heads/ot/work" },
+      },
+    });
+
+    await expect(service({ port, binding: binding(adapter) }).drainOne({
+      worker_id: "worker-1",
+      lease_id: "lease-1",
+      expires_at: "2026-08-20T12:01:00.000Z",
+    })).rejects.toThrow(/invalid dispatch-start fence/);
+
+    expect(events).toEqual([`reconcile:${intent.target}`]);
+    expect(port.dispatchStarts).toHaveLength(1);
+    expect(port.completions).toHaveLength(0);
   });
 
   it("never sends after a kill at the persisted dispatch-start fence", async () => {

@@ -16,6 +16,10 @@ import type {
   LeasedEffectView,
 } from "../pipeline/kernel/ports.js";
 import {
+  assertImmutableEffectReplay,
+  reconcileEffectIntent,
+} from "../pipeline/kernel/effect-intent.js";
+import {
   OPERATOR_EFFECT_REJECTION_EFFECT_KIND,
   parseOperatorEffectRejectionEvidence,
 } from "../pipeline/kernel/operator-effect-rejection.js";
@@ -304,24 +308,30 @@ export function createKernelEffectExecutionService(input: {
   ): Promise<Extract<KernelEffectExecutionResult, { kind: "held_unknown" }>> {
     const detail = diagnostic(detailInput);
     const retry_at = retryAt(leased.reconciliation_ordinal);
+    const reconciliation = reconcileEffectIntent({
+      intent: leased.intent,
+      observation: {
+        kind: "unknown",
+        external_identity: leased.intent.target,
+        detail,
+      },
+      retry_at,
+    });
+    if (reconciliation.kind !== "hold_unknown") {
+      throw new Error("unknown effect observation produced an invalid reconciliation");
+    }
     await input.effects.completeLeasedEffect({
       effect_id: leased.intent.id,
       lease_id: leased.lease_id,
       worker_id: workerId,
-      reconciliation: {
-        kind: "hold_unknown",
-        effect_id: leased.intent.id,
-        external_identity: leased.intent.target,
-        detail,
-        retry_at,
-      },
+      reconciliation,
     });
     return {
       kind: "held_unknown",
-      effect_id: leased.intent.id,
-      external_identity: leased.intent.target,
-      detail,
-      retry_at,
+      effect_id: reconciliation.effect_id,
+      external_identity: reconciliation.external_identity,
+      detail: reconciliation.detail,
+      retry_at: reconciliation.retry_at,
     };
   }
 
@@ -345,11 +355,22 @@ export function createKernelEffectExecutionService(input: {
     } catch (error) {
       return holdUnknown(leased, workerId, `invalid provider delivery observation: ${diagnostic(error)}`);
     }
+    const reconciliation = reconcileEffectIntent({
+      intent,
+      observation: {
+        kind: "found",
+        external_identity: intent.target,
+        delivery,
+      },
+    });
+    if (reconciliation.kind !== "append_delivery") {
+      throw new Error("found effect observation produced an invalid reconciliation");
+    }
     await input.effects.completeLeasedEffect({
       effect_id: intent.id,
       lease_id: leased.lease_id,
       worker_id: workerId,
-      reconciliation: { kind: "append_delivery", delivery },
+      reconciliation,
     });
     return {
       kind: "delivered",
@@ -414,6 +435,14 @@ export function createKernelEffectExecutionService(input: {
         );
       }
 
+      const reconciliation = reconcileEffectIntent({
+        intent,
+        observation: { kind: "not_found", external_identity: intent.target },
+      });
+      if (reconciliation.kind !== "execute") {
+        throw new Error("absent effect observation produced an invalid reconciliation");
+      }
+
       abortIfRequested(request.signal);
       const dispatchLease = await input.effects.markLeasedEffectDispatchStarted({
         effect_id: intent.id,
@@ -423,9 +452,13 @@ export function createKernelEffectExecutionService(input: {
       if (
         dispatchLease.lease_id !== leased.lease_id ||
         dispatchLease.expires_at !== leased.expires_at ||
-        dispatchLease.execution_mode !== "reconcile_only" ||
-        canonicalJson(validateEffectIntent(dispatchLease.intent).value) !== canonicalJson(intent)
+        dispatchLease.execution_mode !== "reconcile_only"
       ) {
+        throw new Error("effect store returned an invalid dispatch-start fence");
+      }
+      try {
+        assertImmutableEffectReplay(reconciliation.intent, dispatchLease.intent);
+      } catch {
         throw new Error("effect store returned an invalid dispatch-start fence");
       }
       abortIfRequested(request.signal);

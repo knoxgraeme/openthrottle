@@ -434,6 +434,10 @@ export function operatorEffectRejectionEvidence(
   );
 }
 
+// Operator rejection replay is a settled administrative resolution, not a provider
+// observation: it must additionally fence exact run/effect versions, the dispatch
+// lease, and captured runtime evidence, so ordinary Effect reconciliation cannot
+// represent or verify it.
 export function assertExactOperatorEffectRejectionReplay(input: {
   request: KernelOperatorEffectRejectionRequest;
   intent: EffectIntent;
