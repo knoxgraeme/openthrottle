@@ -5,11 +5,17 @@ import {
 import { describe, expect, it } from "vitest";
 import {
   structuredSuccessorCheckpoints,
+  structuredWaveSuccessorContextRecords,
   type StructuredWaveEvidence,
 } from "./kernel-structured-wave.js";
 
 const A = "a".repeat(40);
 const B = "b".repeat(40);
+const RUN_ID = "run-1";
+
+type SettlementDecision = Parameters<
+  typeof structuredWaveSuccessorContextRecords
+>[0]["settlement_decision"];
 
 function checkpoint(id: string, input: string, output: string): AttemptCheckpoint {
   return {
@@ -28,6 +34,22 @@ function checkpoint(id: string, input: string, output: string): AttemptCheckpoin
   };
 }
 
+function waveEvidence(input: {
+  attempt_id: string;
+  result_id: string;
+  decision_id: string;
+}): StructuredWaveEvidence {
+  return {
+    attempt: { id: input.attempt_id, pipeline_run_id: RUN_ID },
+    result: { id: input.result_id, pipeline_run_id: RUN_ID },
+    decision: { id: input.decision_id, pipeline_run_id: RUN_ID },
+  } as unknown as StructuredWaveEvidence;
+}
+
+function settlementDecision(id: string, pipelineRunId = RUN_ID): SettlementDecision {
+  return { id, pipeline_run_id: pipelineRunId } as unknown as SettlementDecision;
+}
+
 describe("structured successor checkpoints", () => {
   it("preserves the cumulative boundary after a content-no-op edit", () => {
     const inherited = checkpoint("checkpoint-inherited", A, B);
@@ -42,5 +64,57 @@ describe("structured successor checkpoints", () => {
     } as unknown as StructuredWaveEvidence;
 
     expect(structuredSuccessorCheckpoints(evidence)).toEqual([inherited]);
+  });
+});
+
+describe("structured wave successor records", () => {
+  it("replaces a transient current-member decision with the aggregate settlement decision", () => {
+    const prior = waveEvidence({
+      attempt_id: "attempt-prior",
+      result_id: "result-prior",
+      decision_id: "decision-prior",
+    });
+    const current = waveEvidence({
+      attempt_id: "attempt-current",
+      result_id: "result-current",
+      decision_id: "decision-current-transient",
+    });
+    const aggregate = settlementDecision("decision-aggregate");
+
+    expect(structuredWaveSuccessorContextRecords({
+      evidence: [prior, current],
+      current_attempt_id: current.attempt.id,
+      settlement_decision: aggregate,
+    }).map(({ id }) => id)).toEqual([
+      aggregate.id,
+      prior.decision.id,
+      prior.result.id,
+      current.result.id,
+    ].sort());
+  });
+
+  it("fails closed when the current member or record run is not exact", () => {
+    const evidence = [waveEvidence({
+      attempt_id: "attempt-prior",
+      result_id: "result-prior",
+      decision_id: "decision-prior",
+    })];
+    const aggregate = settlementDecision("decision-aggregate");
+
+    expect(() => structuredWaveSuccessorContextRecords({
+      evidence,
+      current_attempt_id: "attempt-missing",
+      settlement_decision: aggregate,
+    })).toThrow("structured wave successor has no exact current member");
+    expect(() => structuredWaveSuccessorContextRecords({
+      evidence,
+      current_attempt_id: "attempt-prior",
+      settlement_decision: settlementDecision(aggregate.id, "run-foreign"),
+    })).toThrow("structured wave successor contains another run's record");
+    expect(() => structuredWaveSuccessorContextRecords({
+      evidence,
+      current_attempt_id: "attempt-prior",
+      settlement_decision: { ...aggregate, id: evidence[0]!.result.id },
+    })).toThrow("structured wave successor contains duplicate record IDs");
   });
 });

@@ -55,6 +55,7 @@ import {
   structuredNextStageId,
   structuredStageFor,
   structuredSuccessorCheckpoints,
+  structuredWaveSuccessorContextRecords,
   type StructuredLoopStage,
 } from "./kernel-structured-wave.js";
 
@@ -346,7 +347,11 @@ export class KernelStructuredSettlementPlanner implements
         target_scope: { kind: "stage", stage_id: target.id },
         request_inputs: currentRequest,
         checkpoint_override: [],
-        additional_context_records: evidence.flatMap((source) => [source.result, source.decision]),
+        additional_context_records: structuredWaveSuccessorContextRecords({
+          evidence,
+          current_attempt_id: input.attempt.id,
+          settlement_decision: settlement.decision,
+        }),
       })],
     };
   }
@@ -699,7 +704,11 @@ export class KernelStructuredSettlementPlanner implements
           target_scope: { kind: "stage", stage_id: target.id },
           request_inputs: currentRequest,
           checkpoint_override: [],
-          additional_context_records: evidence.flatMap((source) => [source.result, source.decision]),
+          additional_context_records: structuredWaveSuccessorContextRecords({
+            evidence,
+            current_attempt_id: input.attempt.id,
+            settlement_decision: settlement.decision,
+          }),
         })],
       };
     }

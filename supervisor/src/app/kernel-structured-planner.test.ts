@@ -242,6 +242,23 @@ function githubPushDelivery(id: string, sha: string, refMode: "create" | "update
   };
 }
 
+function reviewBoundary(id: string): AttemptCheckpoint {
+  return {
+    schema: ATTEMPT_CHECKPOINT_SCHEMA,
+    id,
+    pipeline_run_id: "run-1",
+    attempt_id: "attempt-integrate-all",
+    request_hash: "d".repeat(64),
+    definition_bundle_hash: DEFINITIONS.manifest.definition_bundle_hash,
+    input_subject: SOURCE,
+    output_subject: INTEGRATED,
+    native_session_id: null,
+    payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+    payload: { inline: { exact: true } },
+    captured_at: NOW,
+  };
+}
+
 function requestInputs(input: {
   task_prompt?: string;
   records?: readonly ExecutionRecord[];
@@ -1108,6 +1125,172 @@ describe("KernelStructuredSettlementPlanner", () => {
       attempt.context_checkpoint_ids.includes(boundary.id))).toBe(true);
     expect(settlement.next_attempts.every((attempt) =>
       attempt.context_record_ids.includes(push.id))).toBe(true);
+  });
+
+  it("anchors a divergent terminal review wave only to durable and atomically appended records", async () => {
+    const store = new PlanningStore();
+    const runtime = [runtimeDelivery("create"), runtimeDelivery("start")];
+    const boundary = reviewBoundary("checkpoint-divergent-terminal-boundary");
+    const firstRequest = requestInputs({ records: runtime, checkpoints: [boundary] });
+    const secondRequest = requestInputs({ records: runtime, checkpoints: [boundary] });
+    const firstPending = pendingAttempt({
+      id: "attempt-review-correctness-terminal",
+      stage_id: "persona_review",
+      scope: {
+        kind: "fanout_member", stage_id: "persona_review", parent_attempt_id: "attempt-selector",
+        fanout_id: "selection.personas", member_id: "core/correctness-dataflow", member_index: 0,
+      },
+      input_subject: INTEGRATED,
+      request: firstRequest,
+    });
+    const secondPending = pendingAttempt({
+      id: "attempt-review-security-terminal",
+      stage_id: "persona_review",
+      scope: {
+        kind: "fanout_member", stage_id: "persona_review", parent_attempt_id: "attempt-selector",
+        fanout_id: "selection.personas", member_id: "core/security", member_index: 1,
+      },
+      input_subject: INTEGRATED,
+      request: secondRequest,
+    });
+    const first = completedAttempt({
+      pending: firstPending,
+      output_subject: null,
+      request: firstRequest,
+      settled: true,
+      evaluated: {
+        evaluator: "core/review-outcome@1",
+        outcome: "success",
+        reason: "validated_semantic_result",
+      },
+    });
+    const second = completedAttempt({
+      pending: secondPending,
+      output_subject: null,
+      request: secondRequest,
+      evaluated: {
+        evaluator: "core/review-outcome@1",
+        outcome: "failure",
+        reason: "review_execution_failed",
+      },
+    });
+    store.requests.set(secondPending.id, secondRequest);
+    store.settled = [first.evidence];
+    const planner = new KernelStructuredSettlementPlanner({ store, now: () => NOW });
+
+    const settlement = await planner.plan(ordinaryInput({
+      attempt: second.attempt,
+      checkpoint: second.checkpoint,
+      result: second.result,
+      view: view({
+        attempts: [first.attempt, second.attempt],
+        current: second.attempt,
+        completed: [frontierMemberKey(first.attempt)],
+        current_subject: INTEGRATED,
+      }),
+      outcome: "failure",
+      evaluator: "core/review-outcome@1",
+      reason: "review_execution_failed",
+    }));
+
+    expect(settlement.outcome).toBe("failure");
+    expect(settlement.decision.id).not.toBe(second.decision.id);
+    expect(settlement.next_attempts).toHaveLength(1);
+    expect(settlement.next_attempts[0]!.scope).toEqual({
+      kind: "stage",
+      stage_id: "ot_runtime_stop_failed",
+    });
+    expect(settlement.next_attempts[0]!.context_record_ids).toEqual([
+      ...runtime.map(({ id }) => id),
+      first.result.id,
+      first.decision.id,
+      second.result.id,
+      settlement.decision.id,
+    ].sort());
+    expect(settlement.next_attempts[0]!.context_record_ids).not.toContain(second.decision.id);
+    const authorizedAtSettlement = new Map([
+      ...runtime,
+      first.decision,
+      ...settlement.input_records,
+      settlement.decision,
+    ].map((record) => [record.id, record]));
+    expect(settlement.next_attempts[0]!.context_record_ids.map((id) =>
+      authorizedAtSettlement.get(id)?.id)).toEqual(settlement.next_attempts[0]!.context_record_ids);
+  });
+
+  it("preserves both durable review decisions for uniform terminal routing", async () => {
+    const store = new PlanningStore();
+    const runtime = [runtimeDelivery("create"), runtimeDelivery("start")];
+    const boundary = reviewBoundary("checkpoint-uniform-terminal-boundary");
+    const firstRequest = requestInputs({ records: runtime, checkpoints: [boundary] });
+    const secondRequest = requestInputs({ records: runtime, checkpoints: [boundary] });
+    const firstPending = pendingAttempt({
+      id: "attempt-review-correctness-uniform-terminal",
+      stage_id: "persona_review",
+      scope: {
+        kind: "fanout_member", stage_id: "persona_review", parent_attempt_id: "attempt-selector",
+        fanout_id: "selection.personas", member_id: "core/correctness-dataflow", member_index: 0,
+      },
+      input_subject: INTEGRATED,
+      request: firstRequest,
+    });
+    const secondPending = pendingAttempt({
+      id: "attempt-review-security-uniform-terminal",
+      stage_id: "persona_review",
+      scope: {
+        kind: "fanout_member", stage_id: "persona_review", parent_attempt_id: "attempt-selector",
+        fanout_id: "selection.personas", member_id: "core/security", member_index: 1,
+      },
+      input_subject: INTEGRATED,
+      request: secondRequest,
+    });
+    const failedEvaluation = {
+      evaluator: "core/review-outcome@1",
+      outcome: "failure",
+      reason: "review_execution_failed",
+    };
+    const first = completedAttempt({
+      pending: firstPending,
+      output_subject: null,
+      request: firstRequest,
+      settled: true,
+      evaluated: failedEvaluation,
+    });
+    const second = completedAttempt({
+      pending: secondPending,
+      output_subject: null,
+      request: secondRequest,
+      evaluated: failedEvaluation,
+    });
+    store.requests.set(secondPending.id, secondRequest);
+    store.settled = [first.evidence];
+    const planner = new KernelStructuredSettlementPlanner({ store, now: () => NOW });
+
+    const settlement = await planner.plan(ordinaryInput({
+      attempt: second.attempt,
+      checkpoint: second.checkpoint,
+      result: second.result,
+      view: view({
+        attempts: [first.attempt, second.attempt],
+        current: second.attempt,
+        completed: [frontierMemberKey(first.attempt)],
+        current_subject: INTEGRATED,
+      }),
+      ...failedEvaluation,
+    }));
+
+    expect(settlement.decision.id).toBe(second.decision.id);
+    expect(settlement.next_attempts[0]!.scope).toEqual({
+      kind: "stage",
+      stage_id: "ot_runtime_stop_failed",
+    });
+    expect(settlement.next_attempts[0]!.context_record_ids).toEqual([
+      ...runtime.map(({ id }) => id),
+      first.result.id,
+      first.decision.id,
+      second.result.id,
+      second.decision.id,
+    ].sort());
   });
 
   it("fans review evidence into validation and preserves runtime identity for edit remediation", async () => {

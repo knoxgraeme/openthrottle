@@ -3,6 +3,7 @@ import {
   type AttemptCheckpoint,
   type CompiledPipelineStage,
   type DecisionRecord,
+  type ExecutionRecord,
   type ResultRecord,
 } from "@openthrottle/contracts";
 import type { OrdinaryKernelSettlementPlanner } from "../pipeline/kernel/ordinary-coordinator.js";
@@ -215,6 +216,39 @@ export function settleStructuredWaveDecision(input: {
     input_records: inputRecords,
     aggregate: true,
   };
+}
+
+/**
+ * Selects only records authorized for a successor created by the wave's
+ * settlement transaction. Prior member decisions are already durable, while
+ * the current member's projected decision is transient unless it is also the
+ * settlement decision appended by that transaction.
+ */
+export function structuredWaveSuccessorContextRecords(input: {
+  evidence: readonly StructuredWaveEvidence[];
+  current_attempt_id: string;
+  settlement_decision: DecisionRecord;
+}): ExecutionRecord[] {
+  const current = input.evidence.filter(({ attempt }) => attempt.id === input.current_attempt_id);
+  if (current.length !== 1) {
+    throw new Error("structured wave successor has no exact current member");
+  }
+  const runId = current[0]!.attempt.pipeline_run_id;
+  const candidates: ExecutionRecord[] = [
+    input.settlement_decision,
+    ...input.evidence.flatMap((source) => [
+      source.result,
+      ...(source.attempt.id === input.current_attempt_id ? [] : [source.decision]),
+    ]),
+  ];
+  if (candidates.some((record) => record.pipeline_run_id !== runId)) {
+    throw new Error("structured wave successor contains another run's record");
+  }
+  const unique = new Map(candidates.map((record) => [record.id, record]));
+  if (unique.size !== candidates.length) {
+    throw new Error("structured wave successor contains duplicate record IDs");
+  }
+  return [...unique.values()].sort((left, right) => compareCodeUnits(left.id, right.id));
 }
 
 export function structuredSuccessorCheckpoints(
