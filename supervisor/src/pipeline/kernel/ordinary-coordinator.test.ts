@@ -18,10 +18,14 @@ import {
   runtimeStopStageId,
   validateAndNormalizeResultCandidate,
   validateDefinitionBundle,
+  canonicalJson,
+  type BlobPointer,
   type CompiledPipelineManifest,
   type AttemptCheckpoint,
   type DefinitionBundleEntry,
+  type DecisionRecord,
   type EvalDefinition,
+  type ExecutionRecord,
   type ReviewFindingV1,
   type ResultCandidate,
   type SemanticResultSchemaContract,
@@ -309,8 +313,17 @@ class RuntimeFixture implements KernelRuntimePort {
   pendingOnce = false;
   blockingReview = false;
   readonly identityOutputStages = new Set<string>();
-  workOutcome: (() => Promise<KernelRuntimeOutcome>) | null = null;
-  correctionOutcome: (() => Promise<KernelRuntimeOutcome>) | null = null;
+  workOutcome: ((request: KernelWorkActionRequest) => Promise<KernelRuntimeOutcome>) | null = null;
+  correctionOutcome: ((request: KernelResultCorrectionRequest) => Promise<KernelRuntimeOutcome>) | null = null;
+  invalidResultEvidence: BlobPointer = {
+    algorithm: "sha256",
+    digest: "e".repeat(64),
+    bytes: 1,
+    encoding: "utf-8",
+    media_type: "application/json",
+    payload_schema: "openthrottle.invalid-result-evidence/v1",
+  };
+  lastCheckpoint: AttemptCheckpoint | null = null;
 
   async executeWork(
     request: KernelWorkActionRequest,
@@ -347,7 +360,8 @@ class RuntimeFixture implements KernelRuntimePort {
       },
       captured_at: NOW,
     };
-    if (this.workOutcome) return this.workOutcome();
+    this.lastCheckpoint = checkpoint;
+    if (this.workOutcome) return this.workOutcome(request);
     if (this.pendingOnce && request.stage_id === "implement") {
       this.pendingOnce = false;
       return {
@@ -356,6 +370,7 @@ class RuntimeFixture implements KernelRuntimePort {
         candidate_hash: "d".repeat(64),
         diagnostics: [{ path: "/payload/summary", detail: "must be a string" }],
         correction_deadline: "2026-08-20T13:00:00.000Z",
+        invalid_result_evidence: this.invalidResultEvidence,
       };
     }
     if (request.action.kind === "command") {
@@ -395,7 +410,7 @@ class RuntimeFixture implements KernelRuntimePort {
   ): Promise<KernelRuntimeOutcome> {
     this.correctionRequests.push(request);
     await callbacks.on_heartbeat();
-    if (this.correctionOutcome) return this.correctionOutcome();
+    if (this.correctionOutcome) return this.correctionOutcome(request);
     return {
       state: "work_complete",
       checkpoint: {
@@ -425,6 +440,7 @@ class RuntimeFixture implements KernelRuntimePort {
 
 interface ActiveKernelFixture {
   db: Database.Database;
+  blobs: VolumeBlobStore;
   store: SqliteKernelStore;
   coordinator: OrdinaryKernelCoordinator;
   runtime: RuntimeFixture;
@@ -517,6 +533,7 @@ async function setup(runtime = new RuntimeFixture()): Promise<ActiveKernelFixtur
       });
     return {
       db: database,
+      blobs,
       store: activeStore,
       coordinator: new OrdinaryKernelCoordinator({
         store: activeStore,
@@ -555,8 +572,25 @@ async function execute(coordinator: OrdinaryKernelCoordinator, ordinal: number) 
   });
 }
 
+function putJsonEvidence(
+  blobs: VolumeBlobStore,
+  payload_schema: string,
+  value: unknown,
+): BlobPointer {
+  return blobs.put({
+    bytes: `${canonicalJson(value)}\n`,
+    encoding: "utf-8",
+    media_type: "application/json",
+    payload_schema,
+  }).pointer;
+}
+
 describe("ordinary kernel activation", () => {
-  async function sandboxFailureTransition(error: Error | null, structuredSibling = false) {
+  async function sandboxFailureTransition(
+    error: Error | null,
+    structuredSibling = false,
+    repeatedForensicsSignature: string | null = null,
+  ) {
     const fixed = fixture();
     const expanded = expandCompiledRuntimeLifecycle({
       entry_stage: "test",
@@ -670,7 +704,9 @@ describe("ordinary kernel activation", () => {
       checkpoint_ids: {},
     };
     const attempts = new Map(frontierAttempts.map((candidate) => [candidate.id, candidate]));
-    const records = new Map(deliveries.map((record) => [record.id, record]));
+    const records = new Map<string, ExecutionRecord>(
+      deliveries.map((record) => [record.id, record]),
+    );
     let applied: AtomicTransitionBundle | null = null;
     const store = {
       async loadExactReductionView(request: {
@@ -689,10 +725,36 @@ describe("ordinary kernel activation", () => {
       async loadAttemptRequestInputs() {
         return {
           task_prompt: inputs.task_prompt,
-          context: { records, checkpoints: new Map() },
+          context: {
+            records: new Map(deliveries.map((record) => [record.id, record])),
+            checkpoints: new Map(),
+          },
         };
       },
       async renewAttemptLease() { return currentAttempt.lease!; },
+      async loadAttemptForensics() {
+        if (repeatedForensicsSignature === null) return null;
+        const record = [...records.values()].find((candidate) =>
+          candidate.kind === "decision" && candidate.reducer === "core/attempt-forensics@1");
+        return record === undefined ? null : {
+          record,
+          payload: {
+            schema: "openthrottle.attempt-forensics/v1",
+            pipeline_run_id: run.id,
+            attempt_id: currentAttempt.id,
+            request_hash: currentAttempt.request_hash,
+            definition_bundle_hash: currentAttempt.definition_bundle_hash,
+            lease_id: "lease-command",
+            operational_signature: repeatedForensicsSignature,
+            exit_code: 1,
+            runner_stdout_tail: "",
+            runner_stderr_tail: "silent exit",
+            result_path_state: { state: "missing" },
+            session_event_state: { state: "missing" },
+            workspace_git_status: { state: "present", summary: "", detail: "" },
+          },
+        };
+      },
       async applyAtomicTransition(transition: AtomicTransitionBundle) {
         applied = transition;
         run = transition.run;
@@ -726,6 +788,24 @@ describe("ordinary kernel activation", () => {
     };
     const runtime: KernelRuntimePort = {
       async executeWork() {
+        if (repeatedForensicsSignature !== null) {
+          return {
+            state: "work_failed",
+            retryable: true,
+            reason: "action exited without a sealed result",
+            forensics: {
+              blob: {
+                algorithm: "sha256",
+                digest: "f".repeat(64),
+                bytes: 100,
+                encoding: "utf-8",
+                media_type: "application/json",
+                payload_schema: "openthrottle.attempt-forensics/v1",
+              },
+              operational_signature: repeatedForensicsSignature,
+            },
+          };
+        }
         return error === null
           ? { state: "work_failed", retryable: true, reason: "provider timeout" }
           : {
@@ -754,6 +834,28 @@ describe("ordinary kernel activation", () => {
       await coordinator.terminalizeExhaustedRecovery(leased, error);
     } else {
       await coordinator.executeLeasedAttempt(leased);
+    }
+    if (repeatedForensicsSignature !== null) {
+      currentAttempt = {
+        ...currentAttempt,
+        status: "running",
+        lease: {
+          id: "lease-command-2",
+          generation: 0,
+          worker_id: "worker-command",
+          purpose: "work",
+          expires_at: "2026-08-20T12:11:00.000Z",
+          started: true,
+        },
+      };
+      attempts.set(currentAttempt.id, currentAttempt);
+      await coordinator.executeLeasedAttempt({
+        run_id: run.id,
+        run_version: run.version,
+        cursor_version: run.cursor.version,
+        attempt: currentAttempt,
+        lease: currentAttempt.lease!,
+      });
     }
     return { transition: applied!, records };
   }
@@ -1387,6 +1489,88 @@ describe("ordinary kernel activation", () => {
       expect(test.db.prepare(`
         SELECT COUNT(*) AS count FROM attempts WHERE stage_id = 'implement'
       `).get()).toEqual({ count: 1 });
+    } finally {
+      test.db.close();
+    }
+  });
+
+  it("persists silent-exit forensics and aborts an identical consecutive retry signature", async () => {
+    const signature = "9".repeat(64);
+    const { records } = await sandboxFailureTransition(
+      null,
+      false,
+      signature,
+    );
+    const forensicRecords = [...records.values()].filter((record) =>
+      record.kind === "decision" && record.reducer === "core/attempt-forensics@1");
+    expect(forensicRecords).toHaveLength(2);
+    expect(forensicRecords.every((record) =>
+      record.payload_schema === "openthrottle.attempt-forensics/v1" && "blob" in record.payload
+    )).toBe(true);
+    const terminal = [...records.values()].find((record): record is DecisionRecord =>
+      record.kind === "decision" && record.reducer === "core/operational-outcome@1");
+    expect(terminal).toBeDefined();
+    expect(terminal?.input_record_ids).toEqual(expect.arrayContaining(
+      forensicRecords.map(({ id }) => id),
+    ));
+    expect(terminal?.payload).toMatchObject({
+      inline: {
+        reason: expect.stringContaining("consecutive_identical_operational_failure"),
+      },
+    });
+  });
+
+  it("retains the latest correction evidence pointer in the pending JSON envelope", async () => {
+    const runtime = new RuntimeFixture();
+    runtime.pendingOnce = true;
+    const test = await setup(runtime);
+    const initialAttempt = (await test.store.loadExactReductionView({
+      pipeline_run_id: test.run_id,
+      attempt_id: "attempt-initial",
+      record_ids: [],
+      checkpoint_ids: [],
+    })).current_attempt!;
+    const invalidEvidence = (phase: "work" | "result_correction", marker: string) => putJsonEvidence(
+      test.blobs,
+      "openthrottle.invalid-result-evidence/v1",
+      {
+        schema: "openthrottle.invalid-result-evidence/v1",
+        pipeline_run_id: test.run_id,
+        attempt_id: initialAttempt.id,
+        request_hash: initialAttempt.request_hash,
+        definition_bundle_hash: initialAttempt.definition_bundle_hash,
+        phase,
+        candidate_hash: marker.repeat(64),
+        rejected_candidate: {
+          raw: JSON.stringify({ schema: "openthrottle.result-candidate/v1", outcome: "bad" }),
+        },
+        diagnostics: [{ path: "result_candidate.outcome", detail: "is not admitted" }],
+        runner_stdout_tail: "invalid candidate",
+        runner_stderr_tail: "",
+        observed_at: NOW,
+      },
+    );
+    runtime.invalidResultEvidence = invalidEvidence("work", "d");
+    const correctionEvidence = invalidEvidence("result_correction", "e");
+    runtime.correctionOutcome = async (request) => ({
+      state: "result_pending",
+      checkpoint: runtime.lastCheckpoint!,
+      candidate_hash: "e".repeat(64),
+      diagnostics: [{ path: "result_candidate.outcome", detail: "is not admitted" }],
+      correction_deadline: request.correction_deadline,
+      invalid_result_evidence: correctionEvidence,
+    });
+    try {
+      expect((await execute(test.coordinator, 1)).disposition).toBe("result_pending");
+      expect((await execute(test.coordinator, 2)).disposition).toBe("result_pending");
+      const persisted = test.db.prepare(`
+        SELECT pending_diagnostics_json FROM attempts WHERE id = 'attempt-initial'
+      `).get() as { pending_diagnostics_json: string };
+      expect(JSON.parse(persisted.pending_diagnostics_json)).toEqual({
+        schema: "openthrottle.pending-result-diagnostics/v1",
+        diagnostics: [{ path: "result_candidate.outcome", detail: "is not admitted" }],
+        invalid_result_evidence: correctionEvidence,
+      });
     } finally {
       test.db.close();
     }

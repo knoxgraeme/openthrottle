@@ -386,6 +386,7 @@ describe("KernelRuntimeSessionService", () => {
       pending_result: {
         candidate_hash: "f".repeat(64),
         diagnostics: [{ path: "/payload/summary", detail: "expected string" }],
+        invalid_result_evidence: null,
       },
       lease: {
         id: "correction-lease",

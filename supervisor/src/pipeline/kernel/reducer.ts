@@ -604,21 +604,31 @@ function terminalCommand(
     throw new Error("runtime cleanup cannot begin while an external outcome is unresolved");
   }
   const evidenceIds = sortedUnique(disposition.runtime_delivery_record_ids);
+  const declaredDiagnosticIds = disposition.diagnostic_record_ids ?? [];
+  const declaredNewDiagnosticIds = disposition.new_diagnostic_record_ids ?? [];
+  const diagnosticIds = sortedUnique(declaredDiagnosticIds);
+  const newDiagnosticIds = sortedUnique(declaredNewDiagnosticIds);
   const frontierRecordIds = recoveryFrontier.map(({ record }) => record.id).sort(compareCodeUnits);
   const recoveryTrigger = sandboxRecovery
     ? exactSandboxFatalAbsenceDelivery(authorization.exact_records)
     : null;
-  const decisionRuntimeEvidenceIds = authorization.decision.input_record_ids
+  const decisionEvidenceIds = authorization.decision.input_record_ids
     .filter((id) => !frontierRecordIds.includes(id) && id !== recoveryTrigger?.id)
     .sort(compareCodeUnits);
   if (
     evidenceIds.length !== disposition.runtime_delivery_record_ids.length ||
-    canonicalJsonValue(evidenceIds) !== canonicalJsonValue(decisionRuntimeEvidenceIds)
-  ) throw new Error("runtime cleanup decision must cite exactly its declared DeliveryRecords");
-  const evidence = authorization.exact_records.filter(
-    (record) => record.id !== authorization.decision.id,
-  );
-  const cleanupDeliveries = exactKernelRuntimeCleanupDeliveries(evidence);
+    diagnosticIds.length !== declaredDiagnosticIds.length ||
+    newDiagnosticIds.length !== declaredNewDiagnosticIds.length ||
+    newDiagnosticIds.some((id) => !diagnosticIds.includes(id)) ||
+    canonicalJsonValue([...evidenceIds, ...diagnosticIds].sort(compareCodeUnits)) !==
+      canonicalJsonValue(decisionEvidenceIds)
+  ) throw new Error("runtime cleanup decision must cite exactly its declared evidence records");
+  const exactById = new Map(authorization.exact_records.map((record) => [record.id, record]));
+  const cleanupDeliveries = exactKernelRuntimeCleanupDeliveries(evidenceIds.map((id) => {
+    const record = exactById.get(id);
+    if (!record) throw new Error(`runtime cleanup is missing DeliveryRecord ${id}`);
+    return record;
+  }));
   if (
     cleanupDeliveries === null ||
     canonicalJsonValue(cleanupDeliveries.map(({ id }) => id).sort()) !== canonicalJsonValue(evidenceIds)
@@ -665,7 +675,15 @@ function terminalCommand(
     run: nextRun,
     attemptWrites: terminalAttemptWrites(input.run, current, outcome),
     createAttempts: [disposition.cleanup_attempt],
-    appendRecords: [authorization.decision, ...recoveryFrontier.map(({ record }) => record)],
+    appendRecords: [
+      authorization.decision,
+      ...recoveryFrontier.map(({ record }) => record),
+      ...newDiagnosticIds.map((id) => {
+        const record = exactById.get(id);
+        if (!record) throw new Error(`runtime cleanup is missing new diagnostic record ${id}`);
+        return record;
+      }),
+    ],
   }));
 }
 
@@ -1060,6 +1078,7 @@ function resultPending(input: ReducerInput): AtomicTransitionBundle {
     pending_result: {
       candidate_hash: command.candidate_hash,
       diagnostics: normalizedDiagnostics(command.diagnostics),
+      invalid_result_evidence: command.invalid_result_evidence,
     },
   };
   return bundle(baseContent({
@@ -1386,7 +1405,12 @@ function settle(input: ReducerInput): AtomicTransitionBundle {
 function retry(input: ReducerInput): AtomicTransitionBundle {
   const command = input.command;
   if (command.type !== "retry") throw new Error("unreachable retry command");
-  assertAttemptCommandMapsEmpty(input);
+  assertExactMap(
+    input.records,
+    command.forensics_record_id == null ? [] : [command.forensics_record_id],
+    "record map",
+  );
+  assertExactMap(input.checkpoints, [], "checkpoint map");
   const attempt = currentAttempt(input, command.attempt_id);
   if (attempt.status !== "pending" && attempt.status !== "running") {
     throw new Error(`attempt ${attempt.id} cannot consume a work retry from ${attempt.status}`);
@@ -1402,11 +1426,21 @@ function retry(input: ReducerInput): AtomicTransitionBundle {
     native_session_id: null,
     lease: null,
   };
+  const forensics = command.forensics_record_id == null
+    ? null
+    : input.records.get(command.forensics_record_id);
+  if (forensics !== null && (
+    !forensics || forensics.kind !== "decision" || forensics.reducer !== "core/attempt-forensics@1" ||
+    forensics.pipeline_run_id !== attempt.pipeline_run_id ||
+    forensics.payload_schema !== "openthrottle.attempt-forensics/v1" ||
+    forensics.input_record_ids.length !== 0
+  )) throw new Error("retry forensics record is invalid");
   return bundle(baseContent({
     command,
     expected: expectedFor(input.run, { [attempt.id]: attempt.version }),
     run: replaceAttempt(input.run, retriedAttempt),
     attemptWrites: [{ kind: "replace", attempt: retriedAttempt }],
+    appendRecords: forensics === null ? [] : [forensics],
   }));
 }
 

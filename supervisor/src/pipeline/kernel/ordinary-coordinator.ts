@@ -70,6 +70,11 @@ import {
   sandboxRecoveryFrontierReason,
   sandboxRecoveryEvaluator,
 } from "./sandbox-recovery.js";
+import {
+  createAttemptForensicsRecord,
+  createInvalidResultEvidenceRecord,
+  type AttemptForensicsPayload,
+} from "./attempt-evidence.js";
 import { stageFor } from "./reducer-support.js";
 
 export interface OrdinaryKernelStore extends
@@ -77,7 +82,13 @@ export interface OrdinaryKernelStore extends
   KernelAttemptLeasePort,
   KernelAttemptRecoveryQuarantinePort,
   KernelAttemptRequestPort,
-  KernelOrdinaryContinuationPort {}
+  KernelOrdinaryContinuationPort {
+  loadAttemptForensics(input: {
+    pipeline_run_id: string;
+    attempt_id: string;
+    work_retry_ordinal: number;
+  }): Promise<{ record: DecisionRecord; payload: AttemptForensicsPayload } | null>;
+}
 
 const ORDINARY_CONTINUATION_SCAN_LIMIT = 100;
 
@@ -574,21 +585,53 @@ export class OrdinaryKernelCoordinator {
       if (input.outcome.sandbox_fatal || isSandboxFatalEnospc(input.outcome.reason)) {
         return this.#recoverSandboxFatal(input.view, input.outcome.reason, input.claim);
       }
+      const forensicsEvidence = input.outcome.forensics ?? null;
+      const forensics = forensicsEvidence === null
+        ? null
+        : createAttemptForensicsRecord({
+          attempt,
+          evidence: forensicsEvidence,
+          created_at: this.#now(),
+        });
+      const priorForensics = forensics === null || attempt.work_retry_ordinal === 0
+        ? null
+        : await this.#store.loadAttemptForensics({
+          pipeline_run_id: attempt.pipeline_run_id,
+          attempt_id: attempt.id,
+          work_retry_ordinal: attempt.work_retry_ordinal - 1,
+        });
+      const repeatedOperationalFailure = forensicsEvidence !== null && priorForensics !== null &&
+        priorForensics.payload.operational_signature === forensicsEvidence.operational_signature;
       if (
         input.outcome.retryable &&
-        attempt.work_retry_ordinal < input.view.run.work_retry_limit
+        attempt.work_retry_ordinal < input.view.run.work_retry_limit &&
+        !repeatedOperationalFailure
       ) {
-        await this.#apply(input.view, {
+        await this.#apply({
+          ...input.view,
+          records: forensics === null ? input.view.records : mapWith(input.view.records, forensics),
+        }, {
           type: "retry",
           command_id: transitionId("retry", {
             attempt: attempt.id,
             ordinal: attempt.work_retry_ordinal + 1,
           }),
           attempt_id: attempt.id,
+          forensics_record_id: forensics?.id ?? null,
         }, input.claim);
         return this.#step("retried", await this.#load(input.view.run.id, attempt.id));
       }
-      return this.#terminal(input.view, "failed", input.outcome.reason, input.claim);
+      const reason = repeatedOperationalFailure
+        ? `consecutive_identical_operational_failure: ${input.outcome.reason}`.slice(0, 1_500)
+        : input.outcome.reason;
+      const diagnosticRecords = [
+        ...(priorForensics === null ? [] : [priorForensics.record]),
+        ...(forensics === null ? [] : [forensics]),
+      ];
+      return this.#terminal(input.view, "failed", reason, input.claim, {
+        records: diagnosticRecords,
+        new_record_ids: forensics === null ? [] : [forensics.id],
+      });
     }
 
     let completedResult: {
@@ -650,6 +693,7 @@ export class OrdinaryKernelCoordinator {
           candidate_hash: input.outcome.candidate_hash,
           diagnostics: input.outcome.diagnostics,
           correction_deadline: input.outcome.correction_deadline,
+          invalid_result_evidence: input.outcome.invalid_result_evidence,
         },
       );
       completed = await this.#load(completed.run.id, attempt.id);
@@ -749,6 +793,8 @@ export class OrdinaryKernelCoordinator {
       resource_disposition: {
         kind: "cleanup",
         runtime_delivery_record_ids: runtimeDeliveries.map(({ id }) => id).sort(),
+        diagnostic_record_ids: [],
+        new_diagnostic_record_ids: [],
         cleanup_attempt: cleanupAttempt,
       },
     }, claim);
@@ -791,11 +837,17 @@ export class OrdinaryKernelCoordinator {
         throw new Error("result correction changed the locked work checkpoint");
       }
       if (attempt.result_correction_count >= input.view.run.result_correction_limit) {
+        const evidence = createInvalidResultEvidenceRecord({
+          attempt,
+          pointer: input.outcome.invalid_result_evidence,
+          created_at: this.#now(),
+        });
         return this.#terminal(
           input.view,
           "needs_human",
           "result_correction_budget_exhausted",
           input.claim,
+          { records: [evidence], new_record_ids: [evidence.id] },
         );
       }
       await this.#apply(
@@ -811,6 +863,7 @@ export class OrdinaryKernelCoordinator {
           candidate_hash: input.outcome.candidate_hash,
           diagnostics: input.outcome.diagnostics,
           correction_deadline: input.outcome.correction_deadline,
+          invalid_result_evidence: input.outcome.invalid_result_evidence,
         },
         input.claim,
       );
@@ -821,7 +874,17 @@ export class OrdinaryKernelCoordinator {
       : input.outcome.state === "work_failed"
         ? input.outcome.reason
         : "result_correction_did_not_produce_a_semantic_candidate";
-    return this.#terminal(input.view, "needs_human", reason, input.claim);
+    const pendingEvidence = attempt.pending_result?.invalid_result_evidence;
+    const evidence = pendingEvidence === null || pendingEvidence === undefined
+      ? null
+      : createInvalidResultEvidenceRecord({
+        attempt,
+        pointer: pendingEvidence,
+        created_at: this.#now(),
+      });
+    return this.#terminal(input.view, "needs_human", reason, input.claim, evidence === null
+      ? undefined
+      : { records: [evidence], new_record_ids: [evidence.id] });
   }
 
   async #completeWork(
@@ -1176,13 +1239,31 @@ export class OrdinaryKernelCoordinator {
     outcome: "needs_human" | "failed",
     reason: string,
     claim?: AttemptLeaseClaim,
+    diagnostics?: { records: readonly DecisionRecord[]; new_record_ids: readonly string[] },
   ): Promise<OrdinaryKernelStep> {
     const attempt = view.current_attempt;
     if (!attempt) throw new Error("attempt terminal transition requires its exact aggregate");
-    const prepared = await this.#prepareTerminalTransition({ view, outcome, reason });
+    let terminalDiagnostics = diagnostics;
+    if (
+      terminalDiagnostics === undefined && outcome === "needs_human" &&
+      attempt.pending_result?.invalid_result_evidence
+    ) {
+      const evidence = createInvalidResultEvidenceRecord({
+        attempt,
+        pointer: attempt.pending_result.invalid_result_evidence,
+        created_at: this.#now(),
+      });
+      terminalDiagnostics = { records: [evidence], new_record_ids: [evidence.id] };
+    }
+    const prepared = await this.#prepareTerminalTransition({
+      view,
+      outcome,
+      reason,
+      diagnostics: terminalDiagnostics,
+    });
     await this.#apply({
       ...prepared.exact,
-      records: mapWith(prepared.exact.records, prepared.decision),
+      records: mapWith(prepared.exact.records, ...prepared.new_diagnostics, prepared.decision),
       checkpoints: new Map(),
     }, {
       type: outcome === "needs_human" ? "needs_human" : "fail",
@@ -1199,9 +1280,11 @@ export class OrdinaryKernelCoordinator {
     view: ReductionView;
     outcome: PipelineTerminalOutcome;
     reason: string;
+    diagnostics?: { records: readonly DecisionRecord[]; new_record_ids: readonly string[] };
   }): Promise<{
     exact: ReductionView;
     decision: DecisionRecord;
+    new_diagnostics: readonly DecisionRecord[];
     resource_disposition: Extract<KernelCommand, {
       type: "needs_human" | "fail" | "stop" | "supersede";
     }>["resource_disposition"];
@@ -1216,10 +1299,19 @@ export class OrdinaryKernelCoordinator {
     const resourceDeliveries = exactKernelRuntimeCleanupDeliveries(
       [...workInputs.context.records.values()],
     );
+    const diagnosticRecords = input.diagnostics?.records ?? [];
+    const diagnosticIds = diagnosticRecords.map(({ id }) => id).sort(compareCodeUnits);
+    const newDiagnosticIds = [...(input.diagnostics?.new_record_ids ?? [])].sort(compareCodeUnits);
+    const newDiagnosticIdSet = new Set(newDiagnosticIds);
+    if (
+      new Set(diagnosticIds).size !== diagnosticIds.length ||
+      newDiagnosticIdSet.size !== newDiagnosticIds.length ||
+      newDiagnosticIds.some((id) => !diagnosticIds.includes(id))
+    ) throw new Error("terminal diagnostic record identities are invalid");
     const decision = createPipelineDecisionRecord({
       attempt,
       result: null,
-      additional_input_records: resourceDeliveries ?? [],
+      additional_input_records: [...(resourceDeliveries ?? []), ...diagnosticRecords],
       evaluated: {
         evaluator: "core/operational-outcome@1",
         outcome: input.outcome,
@@ -1251,19 +1343,30 @@ export class OrdinaryKernelCoordinator {
         outcome: input.outcome,
         task_prompt: workInputs.task_prompt,
         runtime_delivery_records: resourceDeliveries,
+        diagnostic_records: diagnosticRecords,
       });
       exact = await this.#load(
         view.run.id,
         attempt.id,
-        resourceDeliveries.map(({ id }) => id),
+        [
+          ...resourceDeliveries.map(({ id }) => id),
+          ...diagnosticRecords.filter(({ id }) => !newDiagnosticIdSet.has(id)).map(({ id }) => id),
+        ],
       );
       resourceDisposition = {
         kind: "cleanup",
         runtime_delivery_record_ids: resourceDeliveries.map(({ id }) => id).sort(),
+        diagnostic_record_ids: diagnosticIds,
+        new_diagnostic_record_ids: newDiagnosticIds,
         cleanup_attempt: cleanupAttempt,
       };
     }
-    return { exact, decision, resource_disposition: resourceDisposition };
+    return {
+      exact,
+      decision,
+      resource_disposition: resourceDisposition,
+      new_diagnostics: diagnosticRecords.filter(({ id }) => newDiagnosticIdSet.has(id)),
+    };
   }
 
   async #load(

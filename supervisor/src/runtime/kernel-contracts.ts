@@ -1,5 +1,6 @@
 import type {
   AttemptCheckpoint,
+  BlobPointer,
   CompiledPipelineStage,
   DefinitionBundleEntry,
   ExecutionRecord,
@@ -16,6 +17,10 @@ export const KERNEL_RESULT_CORRECTION_REQUEST_SCHEMA =
   "openthrottle.kernel-result-correction-request/v2" as const;
 export const STAGED_SEMANTIC_CANDIDATE_SCHEMA =
   "openthrottle.staged-result-candidate/v1" as const;
+export const ATTEMPT_FORENSICS_PAYLOAD_SCHEMA =
+  "openthrottle.attempt-forensics/v1" as const;
+export const INVALID_RESULT_EVIDENCE_PAYLOAD_SCHEMA =
+  "openthrottle.invalid-result-evidence/v1" as const;
 
 export interface KernelActionContext {
   records: readonly ExecutionRecord[];
@@ -148,6 +153,11 @@ export type KernelVerifiedActionResult =
   | { kind: "semantic"; candidate: StagedSemanticCandidate }
   | KernelCommandResult;
 
+export interface KernelAttemptForensicsEvidence {
+  blob: BlobPointer;
+  operational_signature: string;
+}
+
 export type KernelRuntimeOutcome =
   | {
     state: "work_complete";
@@ -160,6 +170,7 @@ export type KernelRuntimeOutcome =
     candidate_hash: string | null;
     diagnostics: readonly { path: string; detail: string }[];
     correction_deadline: string;
+    invalid_result_evidence: BlobPointer;
   }
   | {
     state: "work_failed";
@@ -167,6 +178,7 @@ export type KernelRuntimeOutcome =
     /** The owning sandbox is poisoned and must not execute this Attempt again. */
     sandbox_fatal?: boolean;
     reason: string;
+    forensics?: KernelAttemptForensicsEvidence;
   }
   | {
     state: "needs_human";

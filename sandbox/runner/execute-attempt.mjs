@@ -34,6 +34,11 @@ import {
   runResultCorrection,
 } from "./agent-runtime.mjs";
 import { createAttemptCheckpoint } from "./checkpoint-bundle.mjs";
+import {
+  INVALID_RESULT_EVIDENCE_SCHEMA,
+  stageEvidenceArtifactForTransport,
+  stageJsonEvidenceArtifact,
+} from "./evidence-artifact.mjs";
 import { prepareAgentOwnedDirectory } from "./filesystem-isolation.mjs";
 import {
   classifyLaunchFailure,
@@ -273,7 +278,7 @@ function correctionDeadline(now) {
   return new Date(now.getTime() + RESULT_CORRECTION_WINDOW_MS).toISOString();
 }
 
-function semanticOutcome({ candidate, checkpoint, deadline }) {
+function semanticOutcome({ candidate, checkpoint, deadline, invalidResultEvidence }) {
   if (candidate.status === "valid") {
     return {
       state: "work_complete",
@@ -287,7 +292,33 @@ function semanticOutcome({ candidate, checkpoint, deadline }) {
     candidate_hash: candidate.original_hash ?? null,
     diagnostics: candidate.diagnostics,
     correction_deadline: deadline,
+    invalid_result_evidence: invalidResultEvidence,
   };
+}
+
+function stageInvalidResultEvidence({ request, candidate, execution, artifactDirectory, resultPath, observedAt }) {
+  if (candidate.status === "valid") return null;
+  const descriptor = stageJsonEvidenceArtifact({
+    directory: artifactDirectory,
+    value: {
+      schema: INVALID_RESULT_EVIDENCE_SCHEMA,
+      pipeline_run_id: request.pipeline_run_id,
+      attempt_id: request.attempt_id,
+      request_hash: request.request_hash,
+      definition_bundle_hash: request.definition_bundle_hash,
+      phase: request.phase,
+      candidate_hash: candidate.original_hash ?? null,
+      rejected_candidate: candidate.rejected ?? (
+        candidate.raw === undefined ? null : { raw: candidate.raw }
+      ),
+      diagnostics: candidate.diagnostics,
+      runner_stdout_tail: String(execution?.stdout ?? "").slice(-16_384),
+      runner_stderr_tail: String(execution?.stderr ?? "").slice(-16_384),
+      observed_at: observedAt,
+    },
+  });
+  stageEvidenceArtifactForTransport(descriptor, artifactDirectory, resultPath);
+  return descriptor;
 }
 
 function boundedCommandSummary(execution) {
@@ -677,10 +708,19 @@ async function executeAgentWork(options, actionDirectory) {
   }
   if (prepared) removeProgressiveSkills(prepared);
   stageCheckpointArtifact(checkpoint, artifactDirectory, resultPath);
+  const invalidResultEvidence = stageInvalidResultEvidence({
+    request,
+    candidate,
+    execution,
+    artifactDirectory,
+    resultPath,
+    observedAt: options.now().toISOString(),
+  });
   return runtimeEnvelope(request, semanticOutcome({
     candidate,
     checkpoint,
     deadline: correctionDeadline(options.now()),
+    invalidResultEvidence,
   }));
 }
 
@@ -804,10 +844,19 @@ async function executeCorrection(options, actionDirectory) {
     channel,
   });
   stageCheckpointArtifact(checkpoint, artifactDirectory, resultPath);
+  const invalidResultEvidence = stageInvalidResultEvidence({
+    request,
+    candidate,
+    execution,
+    artifactDirectory,
+    resultPath,
+    observedAt: options.now().toISOString(),
+  });
   return runtimeEnvelope(request, semanticOutcome({
     candidate,
     checkpoint,
     deadline: request.correction_deadline,
+    invalidResultEvidence,
   }));
 }
 

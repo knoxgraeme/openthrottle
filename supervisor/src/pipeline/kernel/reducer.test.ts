@@ -48,6 +48,14 @@ import {
 
 const sha = (character: string): string => character.repeat(64);
 const subject = (character: string): string => character.repeat(40);
+const invalidResultEvidence = {
+  algorithm: "sha256" as const,
+  digest: sha("e"),
+  bytes: 1,
+  encoding: "utf-8" as const,
+  media_type: "application/json",
+  payload_schema: "openthrottle.invalid-result-evidence/v1",
+};
 
 function manifest(options: {
   authority?: "inspect" | "edit";
@@ -611,6 +619,7 @@ describe("shared execution kernel lifecycle", () => {
         candidate_hash: sha("f"),
         diagnostics: [{ path: "/payload/summary", detail: "must be a string" }],
         correction_deadline: "2026-08-20T00:15:00.000Z",
+        invalid_result_evidence: invalidResultEvidence,
       },
       checkpoints: [completedCheckpoint],
     });
@@ -789,6 +798,7 @@ describe("shared execution kernel lifecycle", () => {
             type: "result_pending", command_id: "bad-pending", attempt_id: running.id,
             candidate_hash: null, diagnostics: [{ path: "/", detail: "missing" }],
             correction_deadline: "2026-08-20T00:15:00.000Z",
+            invalid_result_evidence: invalidResultEvidence,
           },
         }),
         message: /before work completion/,
@@ -1084,6 +1094,7 @@ describe("shared execution kernel lifecycle", () => {
       pending_result: {
         candidate_hash: sha("f"),
         diagnostics: [{ path: "/outcome", detail: "unknown" }],
+        invalid_result_evidence: invalidResultEvidence,
       },
     });
     const completedCheckpoint = checkpoint(current, subject("2"));
@@ -1101,6 +1112,7 @@ describe("shared execution kernel lifecycle", () => {
         candidate_hash: sha("9"),
         diagnostics: [{ path: "/payload", detail: "still invalid" }],
         correction_deadline: "2026-08-20T00:15:00.000Z",
+        invalid_result_evidence: invalidResultEvidence,
       },
       checkpoints: [completedCheckpoint],
     });
@@ -1136,6 +1148,7 @@ describe("shared execution kernel lifecycle", () => {
       pending_result: {
         candidate_hash: sha("f"),
         diagnostics: [{ path: "/payload", detail: "still invalid" }],
+        invalid_result_evidence: invalidResultEvidence,
       },
       context_record_ids: runtime.map(({ id }) => id),
     });

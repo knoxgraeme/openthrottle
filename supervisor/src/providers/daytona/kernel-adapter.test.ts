@@ -656,6 +656,7 @@ function checkpointRuntimeResult(
   checkpoint: ReturnType<typeof checkpointWire>,
   state: "command" | "inspect",
 ): Buffer {
+  const evidence = invalidResultEvidenceArtifact(request);
   return Buffer.from(JSON.stringify({
     schema: "openthrottle.kernel-runtime-result/v1",
     pipeline_run_id: request.pipeline_run_id,
@@ -680,8 +681,81 @@ function checkpointRuntimeResult(
       candidate_hash: null,
       diagnostics: [{ path: "/payload", detail: "result needs correction" }],
       correction_deadline: "2099-08-20T12:15:00.000Z",
+      invalid_result_evidence: evidence.descriptor,
     },
   }));
+}
+
+function invalidResultEvidenceArtifact(request: KernelWorkActionRequest) {
+  const bytes = Buffer.from(`${canonicalJson({
+    schema: "openthrottle.invalid-result-evidence/v1",
+    pipeline_run_id: request.pipeline_run_id,
+    attempt_id: request.attempt_id,
+    request_hash: request.request_hash,
+    definition_bundle_hash: request.definition_bundle_hash,
+    phase: request.phase,
+    candidate_hash: null,
+    rejected_candidate: null,
+    diagnostics: [{ path: "/payload", detail: "result needs correction" }],
+    runner_stdout_tail: "",
+    runner_stderr_tail: "",
+    observed_at: "2026-08-20T12:00:00.000Z",
+  })}\n`);
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  return {
+    bytes,
+    descriptor: {
+      schema: "openthrottle.evidence-artifact-descriptor/v1",
+      file: `evidence-${sha256}.json`,
+      sha256,
+      bytes: bytes.byteLength,
+      media_type: "application/json",
+      payload_schema: "openthrottle.invalid-result-evidence/v1",
+    },
+  } as const;
+}
+
+function attemptForensicsArtifact(request: KernelWorkActionRequest) {
+  const operationalSignature = "9".repeat(64);
+  const bytes = Buffer.from(`${canonicalJson({
+    schema: "openthrottle.attempt-forensics/v1",
+    pipeline_run_id: request.pipeline_run_id,
+    attempt_id: request.attempt_id,
+    request_hash: request.request_hash,
+    definition_bundle_hash: request.definition_bundle_hash,
+    lease_id: request.lease_id,
+    operational_signature: operationalSignature,
+    exit_code: 1,
+    runner_stdout_tail: "runner output",
+    runner_stderr_tail: "runner failure",
+    result_path_state: { state: "missing" },
+    session_event_state: { state: "present", bytes: 100, sha256: "8".repeat(64) },
+    workspace_git_status: { state: "present", summary: " M src/work.ts", detail: "" },
+  })}\n`);
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  return {
+    operationalSignature,
+    bytes,
+    descriptor: {
+      schema: "openthrottle.evidence-artifact-descriptor/v1",
+      file: `evidence-${sha256}.json`,
+      sha256,
+      bytes: bytes.byteLength,
+      media_type: "application/json",
+      payload_schema: "openthrottle.attempt-forensics/v1",
+    },
+  } as const;
+}
+
+function attemptForensicsPointer(forensics: ReturnType<typeof attemptForensicsArtifact>) {
+  return {
+    algorithm: "sha256" as const,
+    digest: forensics.descriptor.sha256,
+    bytes: forensics.descriptor.bytes,
+    encoding: "utf-8" as const,
+    media_type: "application/json",
+    payload_schema: "openthrottle.attempt-forensics/v1",
+  } as const;
 }
 
 function sessionEvent(request: KernelWorkActionRequest): Buffer {
@@ -833,10 +907,14 @@ describe("DaytonaKernelAdapter", () => {
       const resultPath = "/var/lib/openthrottle/action-results/attempt-1/work-lease-1/result.json";
       const sessionPath = "/var/lib/openthrottle/action-results/attempt-1/work-lease-1/session.json";
       const artifactPath = `/var/lib/openthrottle/action-results/attempt-1/work-lease-1/${artifact.descriptor.file}`;
+      const invalidEvidence = invalidResultEvidenceArtifact(request);
+      const invalidEvidencePath =
+        `/var/lib/openthrottle/action-results/attempt-1/work-lease-1/${invalidEvidence.descriptor.file}`;
       const sandbox = sandboxWith(async (path) => {
         if (path === resultPath) return checkpointRuntimeResult(request, checkpoint, kind);
         if (path === sessionPath && kind === "inspect") return sessionEvent(request);
         if (path === artifactPath) return artifact.bytes;
+        if (path === invalidEvidencePath) return invalidEvidence.bytes;
         throw new Error("404 not found");
       });
       const pointer = {
@@ -847,7 +925,18 @@ describe("DaytonaKernelAdapter", () => {
         media_type: "application/x-git-bundle",
         payload_schema: "openthrottle.git-checkpoint-bundle/v1",
       } as const;
-      const put = vi.fn().mockReturnValue({ pointer });
+      const put = vi.fn().mockImplementation((input) => ({
+        pointer: input.payload_schema === "openthrottle.invalid-result-evidence/v1"
+          ? {
+            algorithm: "sha256",
+            digest: invalidEvidence.descriptor.sha256,
+            bytes: invalidEvidence.descriptor.bytes,
+            encoding: "utf-8",
+            media_type: "application/json",
+            payload_schema: "openthrottle.invalid-result-evidence/v1",
+          }
+          : pointer,
+      }));
 
       await expect(adapterFor(sandbox, { put }).executeWork(request, {
         lease_generation: 0,
@@ -858,7 +947,7 @@ describe("DaytonaKernelAdapter", () => {
         state: kind === "command" ? "work_complete" : "result_pending",
         checkpoint: { input_subject: request.input_subject, output_subject: null },
       });
-      expect(put).toHaveBeenCalledOnce();
+      expect(put).toHaveBeenCalledTimes(kind === "inspect" ? 2 : 1);
     },
   );
 
@@ -2019,9 +2108,31 @@ describe("DaytonaKernelAdapter", () => {
     vi.useFakeTimers();
     try {
       const request = workRequest();
-      const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
-      sandbox.process.getSessionCommand.mockResolvedValue({ cmdId: "command-1", exitCode: 1 });
-      const execution = adapterFor(sandbox, {}, {}, { task_timeout_seconds: 60 }).executeWork(request, {
+      const forensics = attemptForensicsArtifact(request);
+      const resultDirectory = "/var/lib/openthrottle/action-results/attempt-1/work-lease-1";
+      let commandObserved = false;
+      const sandbox = sandboxWith(async (path) => {
+        if (path === `${resultDirectory}/result.json`) return Buffer.from('{"schema":');
+        if (commandObserved && path === `${resultDirectory}/forensics.json`) {
+          return Buffer.from(`${canonicalJson(forensics.descriptor)}\n`);
+        }
+        if (commandObserved && path === `${resultDirectory}/${forensics.descriptor.file}`) {
+          return forensics.bytes;
+        }
+        throw new Error("404 not found");
+      });
+      sandbox.process.getSessionCommand.mockImplementation(async () => {
+        commandObserved = true;
+        return { cmdId: "command-1", exitCode: 1 };
+      });
+      const pointer = attemptForensicsPointer(forensics);
+      const put = vi.fn().mockReturnValue({ pointer });
+      const execution = adapterFor(
+        sandbox,
+        { put },
+        {},
+        { task_timeout_seconds: 60 },
+      ).executeWork(request, {
         lease_generation: 0,
         heartbeat_interval_ms: 10_000,
         on_heartbeat: vi.fn().mockResolvedValue(undefined),
@@ -2038,6 +2149,10 @@ describe("DaytonaKernelAdapter", () => {
         state: "work_failed",
         retryable: true,
         reason: "Daytona action command exited with code 1 without producing a sealed result; session termination was verified",
+        forensics: {
+          blob: pointer,
+          operational_signature: forensics.operationalSignature,
+        },
       });
       expect(settledPromptly).toBe(true);
       const sessionId = createdSessionId(sandbox);
@@ -2047,6 +2162,7 @@ describe("DaytonaKernelAdapter", () => {
       );
       expect(sandbox.process.deleteSession).toHaveBeenCalledWith(sessionId);
       expect(sandbox.process.getSession).toHaveBeenCalledWith(sessionId);
+      expect(put).toHaveBeenCalledOnce();
     } finally {
       vi.useRealTimers();
     }
@@ -2125,10 +2241,25 @@ describe("DaytonaKernelAdapter", () => {
 
   it("terminates an asynchronously launched session when Daytona omits its launch response", async () => {
     const request = workRequest();
-    const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
+    const forensics = attemptForensicsArtifact(request);
+    const resultDirectory = "/var/lib/openthrottle/action-results/attempt-1/work-lease-1";
+    let terminated = false;
+    const sandbox = sandboxWith(async (path) => {
+      if (terminated && path === `${resultDirectory}/forensics.json`) {
+        return Buffer.from(`${canonicalJson(forensics.descriptor)}\n`);
+      }
+      if (terminated && path === `${resultDirectory}/${forensics.descriptor.file}`) {
+        return forensics.bytes;
+      }
+      throw new Error("404 not found");
+    });
     sandbox.process.executeSessionCommand.mockResolvedValue(undefined);
+    sandbox.process.deleteSession.mockImplementation(async () => { terminated = true; });
+    const pointer = attemptForensicsPointer(forensics);
 
-    await expect(adapterFor(sandbox).executeWork(request, {
+    await expect(adapterFor(sandbox, {
+      put: vi.fn().mockReturnValue({ pointer }),
+    }).executeWork(request, {
       lease_generation: 0,
       heartbeat_interval_ms: 10,
       on_heartbeat: vi.fn().mockResolvedValue(undefined),
@@ -2137,6 +2268,7 @@ describe("DaytonaKernelAdapter", () => {
       state: "work_failed",
       retryable: true,
       reason: "Daytona action launch omitted its command identity; session termination was verified",
+      forensics: { blob: pointer, operational_signature: forensics.operationalSignature },
     });
     const sessionId = createdSessionId(sandbox);
     expect(sandbox.process.deleteSession).toHaveBeenCalledWith(sessionId);
@@ -2200,8 +2332,26 @@ describe("DaytonaKernelAdapter", () => {
           execution_limits: { max_turns: null, task_timeout_seconds: 1 },
         },
       });
-      const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
-      const adapter = adapterFor(sandbox, {}, {}, { task_timeout_seconds: 60 });
+      const forensics = attemptForensicsArtifact(request);
+      const resultDirectory = "/var/lib/openthrottle/action-results/attempt-1/work-lease-1";
+      let terminated = false;
+      const sandbox = sandboxWith(async (path) => {
+        if (terminated && path === `${resultDirectory}/forensics.json`) {
+          return Buffer.from(`${canonicalJson(forensics.descriptor)}\n`);
+        }
+        if (terminated && path === `${resultDirectory}/${forensics.descriptor.file}`) {
+          return forensics.bytes;
+        }
+        throw new Error("404 not found");
+      });
+      sandbox.process.deleteSession.mockImplementation(async () => { terminated = true; });
+      const pointer = attemptForensicsPointer(forensics);
+      const adapter = adapterFor(
+        sandbox,
+        { put: vi.fn().mockReturnValue({ pointer }) },
+        {},
+        { task_timeout_seconds: 60 },
+      );
       const execution = adapter.executeWork(request, {
         lease_generation: 0,
         heartbeat_interval_ms: 10_000,
@@ -2214,6 +2364,7 @@ describe("DaytonaKernelAdapter", () => {
         state: "work_failed",
         retryable: true,
         reason: expect.stringMatching(/termination was verified/),
+        forensics: { blob: pointer, operational_signature: forensics.operationalSignature },
       });
       const sessionId = createdSessionId(sandbox);
       expect(sandbox.process.deleteSession).toHaveBeenCalledWith(sessionId);

@@ -69,6 +69,9 @@ const payloadSchemas: ExecutionRecordPayloadRegistry = new Map<string, Execution
   ["decision/v1", { kind: "decision", parseInline: (value: unknown): unknown => value }],
   ["delivery/v1", { kind: "delivery", parseInline: (value: unknown): unknown => value }],
   ["openthrottle.effect-delivery/v1", { kind: "delivery", parseInline: (value: unknown): unknown => value }],
+  ["openthrottle.invalid-result-evidence/v1", {
+    kind: "decision", parseInline: (value: unknown): unknown => value,
+  }],
 ]);
 
 function temporaryDirectory(): string {
@@ -1937,6 +1940,16 @@ describe("SqliteKernelStore", () => {
         payload: { inline: deliveryPayload },
         created_at: NOW,
       };
+      const invalidEvidence = context.blobs.put({
+        bytes: canonicalJson({
+          schema: "openthrottle.invalid-result-evidence/v1",
+          rejected_candidate: { raw: "{\"outcome\":\"invalid\"}" },
+          diagnostics: [{ path: "/payload", detail: "invalid" }],
+        }),
+        encoding: "utf-8",
+        media_type: "application/json",
+        payload_schema: "openthrottle.invalid-result-evidence/v1",
+      }).pointer;
       context.db.transaction(() => {
         context.db.prepare(`
           INSERT INTO checkpoints (
@@ -1952,7 +1965,11 @@ describe("SqliteKernelStore", () => {
             result_correction_count = 2, result_correction_deadline = ?,
             pending_candidate_hash = ?, pending_diagnostics_json = ?
           WHERE id = 'attempt-1'
-        `).run(subject("2"), "2026-08-20T12:15:00.000Z", sha("5"), JSON.stringify([{ path: "/payload", detail: "invalid" }]));
+        `).run(subject("2"), "2026-08-20T12:15:00.000Z", sha("5"), canonicalJson({
+          schema: "openthrottle.pending-result-diagnostics/v1",
+          diagnostics: [{ path: "/payload", detail: "invalid" }],
+          invalid_result_evidence: invalidEvidence,
+        }));
         context.db.prepare("UPDATE pipeline_runs SET status = 'running' WHERE id = 'run-1'").run();
         context.db.prepare(`
           INSERT INTO records (
@@ -1994,13 +2011,26 @@ describe("SqliteKernelStore", () => {
         record_ids: [delivery.id],
         checkpoint_ids: [],
       });
+      expect(pending.current_attempt?.pending_result?.invalid_result_evidence)
+        .toEqual(invalidEvidence);
+      const evidenceRecord: DecisionRecord = {
+        schema: EXECUTION_RECORD_SCHEMA,
+        id: "decision-invalid-result-evidence",
+        kind: "decision",
+        pipeline_run_id: "run-1",
+        reducer: "core/invalid-result-evidence@1",
+        input_record_ids: [],
+        payload_schema: "openthrottle.invalid-result-evidence/v1",
+        payload: { blob: invalidEvidence },
+        created_at: NOW,
+      };
       const decision: DecisionRecord = {
         schema: EXECUTION_RECORD_SCHEMA,
         id: "decision-result-correction-exhausted",
         kind: "decision",
         pipeline_run_id: "run-1",
         reducer: "core/result-correction-terminal@1",
-        input_record_ids: [delivery.id],
+        input_record_ids: [delivery.id, evidenceRecord.id].sort(),
         payload_schema: "decision/v1",
         payload: { inline: { outcome: "needs_human" } },
         created_at: NOW,
@@ -2012,13 +2042,14 @@ describe("SqliteKernelStore", () => {
         request_hash: sha("8"),
         definition_bundle_hash: pending.run.definition_bundle_hash,
         input_subject: pending.run.current_subject,
-        context_record_ids: [decision.id, delivery.id].sort(),
+        context_record_ids: [decision.id, delivery.id, evidenceRecord.id].sort(),
       });
       const transition = reduceKernelCommand({
         ...pending,
         records: new Map<string, DecisionRecord | DeliveryRecord>([
           [decision.id, decision],
           [delivery.id, delivery],
+          [evidenceRecord.id, evidenceRecord],
         ]),
         command: {
           type: "needs_human",
@@ -2029,6 +2060,8 @@ describe("SqliteKernelStore", () => {
           resource_disposition: {
             kind: "cleanup",
             runtime_delivery_record_ids: [delivery.id],
+            diagnostic_record_ids: [evidenceRecord.id],
+            new_diagnostic_record_ids: [evidenceRecord.id],
             cleanup_attempt: cleanupAttempt,
           },
         },
@@ -2059,6 +2092,13 @@ describe("SqliteKernelStore", () => {
       });
       expect(context.db.prepare("SELECT status FROM attempts WHERE id = ?").get(cleanupAttempt.id))
         .toEqual({ status: "pending" });
+      expect(context.db.prepare(`
+        SELECT reducer, payload_schema, blob_digest FROM records WHERE id = ?
+      `).get(evidenceRecord.id)).toEqual({
+        reducer: "core/invalid-result-evidence@1",
+        payload_schema: "openthrottle.invalid-result-evidence/v1",
+        blob_digest: invalidEvidence.digest,
+      });
       expect(context.db.prepare("SELECT status, cursor_stage_id FROM pipeline_runs WHERE id = 'run-1'").get())
         .toEqual({ status: "running", cursor_stage_id: runtimeStopStageId("needs_human") });
     } finally {

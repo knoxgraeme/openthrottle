@@ -12,6 +12,7 @@ import {
 import {
   KERNEL_ACTION_REQUEST_SCHEMA,
   KERNEL_RESULT_CORRECTION_REQUEST_SCHEMA,
+  INVALID_RESULT_EVIDENCE_PAYLOAD_SCHEMA,
   STAGED_SEMANTIC_CANDIDATE_SCHEMA,
   type KernelResultCorrectionRequest,
   type KernelRuntimeOutcome,
@@ -22,6 +23,9 @@ export const KERNEL_RUNTIME_RESULT_SCHEMA = "openthrottle.kernel-runtime-result/
 export const KERNEL_SESSION_EVENT_SCHEMA = "openthrottle.kernel-session-event/v1" as const;
 export const ATTEMPT_CHECKPOINT_WIRE_SCHEMA = "openthrottle.attempt-checkpoint-wire/v1" as const;
 export const KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES = 64 * 1024 * 1024;
+export const KERNEL_EVIDENCE_ARTIFACT_MAX_BYTES = 1024 * 1024;
+export const EVIDENCE_ARTIFACT_DESCRIPTOR_SCHEMA =
+  "openthrottle.evidence-artifact-descriptor/v1" as const;
 
 type KernelRequest = KernelWorkActionRequest | KernelResultCorrectionRequest;
 
@@ -49,7 +53,18 @@ export interface KernelCheckpointArtifactDescriptor {
 }
 
 export interface KernelCheckpointArtifactPort {
-  materialize(input: KernelCheckpointArtifactDescriptor): Promise<BlobPointer>;
+  materialize(
+    input: KernelCheckpointArtifactDescriptor | KernelEvidenceArtifactDescriptor,
+  ): Promise<BlobPointer>;
+}
+
+export interface KernelEvidenceArtifactDescriptor {
+  schema: typeof EVIDENCE_ARTIFACT_DESCRIPTOR_SCHEMA;
+  file: string;
+  sha256: string;
+  bytes: number;
+  media_type: "application/json";
+  payload_schema: string;
 }
 
 const DIGEST = /^[a-f0-9]{64}$/;
@@ -212,6 +227,48 @@ function artifactDescriptor(value: unknown, payloadSchema: string): KernelCheckp
   };
 }
 
+export function parseKernelEvidenceArtifactDescriptor(
+  value: unknown,
+  payloadSchema: string,
+): KernelEvidenceArtifactDescriptor {
+  const input = object(value, "evidence artifact");
+  exactKeys(input, [
+    "schema", "file", "sha256", "bytes", "media_type", "payload_schema",
+  ], "evidence artifact");
+  if (
+    input.schema !== EVIDENCE_ARTIFACT_DESCRIPTOR_SCHEMA ||
+    typeof input.file !== "string" || !ARTIFACT_FILE.test(input.file) ||
+    input.file.includes("..") || input.file.includes("/") ||
+    typeof input.sha256 !== "string" || !DIGEST.test(input.sha256) ||
+    typeof input.bytes !== "number" || !Number.isSafeInteger(input.bytes) ||
+    input.bytes < 1 || input.bytes > KERNEL_EVIDENCE_ARTIFACT_MAX_BYTES ||
+    input.media_type !== "application/json" || input.payload_schema !== payloadSchema
+  ) throw new Error("evidence artifact descriptor is invalid");
+  return {
+    schema: EVIDENCE_ARTIFACT_DESCRIPTOR_SCHEMA,
+    file: input.file,
+    sha256: input.sha256,
+    bytes: input.bytes,
+    media_type: "application/json",
+    payload_schema: input.payload_schema as string,
+  };
+}
+
+async function evidencePointer(
+  value: unknown,
+  payloadSchema: string,
+  artifacts: KernelCheckpointArtifactPort,
+): Promise<BlobPointer> {
+  const descriptor = parseKernelEvidenceArtifactDescriptor(value, payloadSchema);
+  const pointer = await artifacts.materialize(descriptor);
+  if (
+    pointer.digest !== descriptor.sha256 || pointer.bytes !== descriptor.bytes ||
+    pointer.encoding !== "utf-8" || pointer.media_type !== descriptor.media_type ||
+    pointer.payload_schema !== descriptor.payload_schema
+  ) throw new Error("materialized evidence artifact changed its sealed descriptor");
+  return pointer;
+}
+
 async function checkpoint(
   value: unknown,
   request: KernelRequest,
@@ -338,6 +395,7 @@ export async function parseKernelRuntimeResult(input: {
   if (outcome.state === "result_pending") {
     exactKeys(outcome, [
       "state", "checkpoint", "candidate_hash", "diagnostics", "correction_deadline",
+      "invalid_result_evidence",
     ], "kernel runtime outcome");
     if (outcome.candidate_hash !== null && (
       typeof outcome.candidate_hash !== "string" || !DIGEST.test(outcome.candidate_hash)
@@ -348,6 +406,11 @@ export async function parseKernelRuntimeResult(input: {
       candidate_hash: outcome.candidate_hash as string | null,
       diagnostics: diagnostics(outcome.diagnostics),
       correction_deadline: timestamp(outcome.correction_deadline, "correction deadline"),
+      invalid_result_evidence: await evidencePointer(
+        outcome.invalid_result_evidence,
+        INVALID_RESULT_EVIDENCE_PAYLOAD_SCHEMA,
+        input.artifacts,
+      ),
     };
   }
   if (outcome.state === "work_failed") {

@@ -23,6 +23,8 @@ import type {
 } from "../../app/kernel-effect-ports.js";
 import {
   KERNEL_ACTION_REQUEST_SCHEMA,
+  ATTEMPT_FORENSICS_PAYLOAD_SCHEMA,
+  INVALID_RESULT_EVIDENCE_PAYLOAD_SCHEMA,
   type KernelResultCorrectionRequest,
   type KernelRuntimeCompatibilityPort,
   type KernelRuntimeLeaseCallbacks,
@@ -41,10 +43,17 @@ import type {
 } from "../../pipeline/kernel/steering.js";
 import {
   KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES,
+  KERNEL_EVIDENCE_ARTIFACT_MAX_BYTES,
   parseKernelRuntimeResult,
+  parseKernelEvidenceArtifactDescriptor,
   parseKernelSessionEvent,
   type KernelCheckpointArtifactDescriptor,
+  type KernelEvidenceArtifactDescriptor,
 } from "../../runtime/kernel-wire.js";
+import {
+  parseAttemptForensicsPayload,
+  parseInvalidResultEvidencePayload,
+} from "../../pipeline/kernel/attempt-evidence.js";
 import {
   inspectKernelCheckpointBundle,
   inspectKernelIntegrationBundle,
@@ -106,6 +115,9 @@ const ACTION_ENV_FAMILY = [
   "OT_ACTION_REQUEST_FILE",
   "OT_ACTION_RESULT_FILE",
   "OT_ACTION_SESSION_FILE",
+  "OT_ACTION_FORENSICS_FILE",
+  "OT_ACTION_RUNNER_STDOUT_FILE",
+  "OT_ACTION_RUNNER_STDERR_FILE",
   "OT_LEASE_GENERATION_FENCE_FILE",
   "OT_LEASE_GENERATION_LOCK_FILE",
 ] as const;
@@ -259,6 +271,9 @@ function launchPaths(
     result_directory: `${ACTION_RESULT_DIR}/${attempt}/${launch}`,
     result: `${ACTION_RESULT_DIR}/${attempt}/${launch}/result.json`,
     session: `${ACTION_RESULT_DIR}/${attempt}/${launch}/session.json`,
+    forensics: `${ACTION_RESULT_DIR}/${attempt}/${launch}/forensics.json`,
+    runner_stdout: `${ACTION_RESULT_DIR}/${attempt}/${launch}/runner.stdout.log`,
+    runner_stderr: `${ACTION_RESULT_DIR}/${attempt}/${launch}/runner.stderr.log`,
     lock: `${ACTION_RESULT_DIR}/${attempt}/dispatch.lock`,
     fence_attempt_directory: `${ACTION_FENCE_DIR}/${attempt}`,
     lease_generation_fence: `${ACTION_FENCE_DIR}/${attempt}/lease-generation.json`,
@@ -787,6 +802,15 @@ export class DaytonaKernelAdapter implements
         downloadUtf8(sandbox, resultPath),
       ]);
       if (raw === null) return null;
+      try {
+        JSON.parse(raw);
+      } catch (error) {
+        // writeImmutableJson creates the result path before its write and
+        // fsync complete. A killed or ENOSPC runner can therefore expose
+        // truncated JSON until the exit trap stages its forensic descriptor.
+        if (error instanceof SyntaxError) return null;
+        throw error;
+      }
       if (
         callbacks !== null && request.schema === KERNEL_ACTION_REQUEST_SCHEMA &&
         request.action.kind === "agent" && !sessionBound
@@ -803,6 +827,28 @@ export class DaytonaKernelAdapter implements
           ),
         },
       });
+    };
+    const collectForensics = async () => {
+      const raw = await downloadUtf8(sandbox, paths.forensics);
+      if (raw === null) return null;
+      const descriptor = parseKernelEvidenceArtifactDescriptor(
+        JSON.parse(raw),
+        ATTEMPT_FORENSICS_PAYLOAD_SCHEMA,
+      );
+      const materialized = await this.#materializeArtifact(
+        sandbox,
+        request,
+        paths.result_directory,
+        descriptor,
+      );
+      if (!("operational_signature" in materialized)) {
+        throw new Error("attempt forensics materialization omitted its operational signature");
+      }
+      const { operational_signature: operationalSignature, ...blob } = materialized;
+      return {
+        blob,
+        operational_signature: operationalSignature,
+      };
     };
     await this.#refreshLeaseGenerationFence(sandbox, request, paths, callbacks.lease_generation);
     await heartbeat();
@@ -851,6 +897,9 @@ export class DaytonaKernelAdapter implements
       OT_ACTION_REQUEST_FILE: requestPath,
       OT_ACTION_RESULT_FILE: resultPath,
       OT_ACTION_SESSION_FILE: sessionPath,
+      OT_ACTION_FORENSICS_FILE: paths.forensics,
+      OT_ACTION_RUNNER_STDOUT_FILE: paths.runner_stdout,
+      OT_ACTION_RUNNER_STDERR_FILE: paths.runner_stderr,
       OT_LEASE_GENERATION_FENCE_FILE: paths.lease_generation_fence,
       OT_LEASE_GENERATION_LOCK_FILE: paths.lease_generation_lock,
     }, { unset });
@@ -871,7 +920,11 @@ export class DaytonaKernelAdapter implements
     const launch = await sandbox.process.executeSessionCommand(sessionId, {
       command: `flock --nonblock --conflict-exit-code ${DISPATCH_LOCK_CONTENTION_EXIT_CODE} ` +
         `${shellQuote(paths.lock)} sh -c ` +
-        shellQuote(`test -f ${shellQuote(resultPath)} || exec /opt/openthrottle/entrypoint.sh`),
+        shellQuote(
+          `test -f ${shellQuote(resultPath)} || test -f ${shellQuote(paths.forensics)} || ` +
+          `exec /opt/openthrottle/entrypoint.sh >${shellQuote(paths.runner_stdout)} ` +
+          `2>${shellQuote(paths.runner_stderr)}`,
+        ),
       runAsync: true,
       suppressInputEcho: true,
     }, actionTimeoutSeconds);
@@ -881,12 +934,14 @@ export class DaytonaKernelAdapter implements
       if (completedOutcome !== null) return completedOutcome;
       const termination = await this.#terminateSessionAndCollect(sandbox, sessionId, collect);
       if (termination.outcome !== null) return termination.outcome;
+      const forensics = termination.verified ? await collectForensics() : null;
       return {
         state: "work_failed",
         retryable: termination.verified,
         reason: termination.verified
           ? "Daytona action launch omitted its command identity; session termination was verified"
           : "Daytona action launch omitted its command identity and session termination could not be verified",
+        ...(forensics === null ? {} : { forensics }),
       };
     }
 
@@ -922,10 +977,12 @@ export class DaytonaKernelAdapter implements
           };
         }
         if (termination.outcome !== null) return termination.outcome;
+        const forensics = await collectForensics();
         return {
           state: "work_failed",
           retryable: true,
           reason: `Daytona action command exited with code ${command.exitCode} without producing a sealed result; session termination was verified`,
+          ...(forensics === null ? {} : { forensics }),
         };
       }
       await new Promise((resolve) => setTimeout(resolve, this.#options.poll_interval_ms ?? 500));
@@ -942,10 +999,12 @@ export class DaytonaKernelAdapter implements
       };
     }
     if (termination.outcome !== null) return termination.outcome;
+    const forensics = await collectForensics();
     return {
       state: "work_failed",
       retryable: true,
       reason: `Daytona action did not produce a sealed result within ${actionTimeoutSeconds}s; session termination was verified`,
+      ...(forensics === null ? {} : { forensics }),
     };
   }
 
@@ -1182,14 +1241,52 @@ export class DaytonaKernelAdapter implements
     sandbox: Sandbox,
     request: KernelWorkActionRequest | KernelResultCorrectionRequest,
     resultDirectory: string,
-    descriptor: KernelCheckpointArtifactDescriptor,
+    descriptor: KernelCheckpointArtifactDescriptor | KernelEvidenceArtifactDescriptor,
   ) {
     const bytes = await sandbox.fs.downloadFile(`${resultDirectory}/${descriptor.file}`);
     if (
       bytes.byteLength !== descriptor.bytes ||
-      bytes.byteLength > KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES ||
+      bytes.byteLength > ("schema" in descriptor
+        ? KERNEL_EVIDENCE_ARTIFACT_MAX_BYTES
+        : KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES) ||
       createHash("sha256").update(bytes).digest("hex") !== descriptor.sha256
-    ) throw new Error(`checkpoint artifact for ${request.attempt_id} failed its sealed descriptor`);
+    ) throw new Error(`artifact for ${request.attempt_id} failed its sealed descriptor`);
+    if ("schema" in descriptor) {
+      const value = JSON.parse(bytes.toString("utf8"));
+      if (descriptor.payload_schema === ATTEMPT_FORENSICS_PAYLOAD_SCHEMA) {
+        const payload = parseAttemptForensicsPayload(value);
+        if (
+          payload.pipeline_run_id !== request.pipeline_run_id ||
+          payload.attempt_id !== request.attempt_id || payload.request_hash !== request.request_hash ||
+          payload.definition_bundle_hash !== request.definition_bundle_hash ||
+          payload.lease_id !== request.lease_id
+        ) throw new Error("attempt forensics changed its sealed request identity");
+        const pointer = this.#options.blob_store.put({
+          bytes,
+          encoding: "utf-8",
+          media_type: descriptor.media_type,
+          payload_schema: descriptor.payload_schema,
+          expected_digest: descriptor.sha256,
+        }).pointer;
+        return { ...pointer, operational_signature: payload.operational_signature };
+      }
+      if (descriptor.payload_schema !== INVALID_RESULT_EVIDENCE_PAYLOAD_SCHEMA) {
+        throw new Error("runtime evidence artifact schema is unsupported");
+      }
+      const payload = parseInvalidResultEvidencePayload(value);
+      if (
+        payload.pipeline_run_id !== request.pipeline_run_id || payload.attempt_id !== request.attempt_id ||
+        payload.request_hash !== request.request_hash ||
+        payload.definition_bundle_hash !== request.definition_bundle_hash || payload.phase !== request.phase
+      ) throw new Error("invalid result evidence changed its sealed request identity");
+      return this.#options.blob_store.put({
+        bytes,
+        encoding: "utf-8",
+        media_type: descriptor.media_type,
+        payload_schema: descriptor.payload_schema,
+        expected_digest: descriptor.sha256,
+      }).pointer;
+    }
     const completedWorkAuthority = request.schema === KERNEL_ACTION_REQUEST_SCHEMA
       ? request.repository_authority
       : request.completed_work_authority;

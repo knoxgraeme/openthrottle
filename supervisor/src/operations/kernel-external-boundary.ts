@@ -986,6 +986,8 @@ export class KernelExternalBoundaryCoordinator {
       resource_disposition: {
         kind: "cleanup",
         runtime_delivery_record_ids: runtimeDeliveries.map(({ id }) => id).sort(),
+        diagnostic_record_ids: [],
+        new_diagnostic_record_ids: [],
         cleanup_attempt: cleanupAttempt,
       },
     }, input.claim);

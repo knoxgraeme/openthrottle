@@ -66,6 +66,12 @@ import {
 } from "../pipeline/kernel/types.js";
 import { reduceKernelRecoveryQuarantine } from "../pipeline/kernel/reducer.js";
 import {
+  ATTEMPT_FORENSICS_REDUCER,
+  attemptForensicsRecordId,
+  parseAttemptForensicsPayload,
+  type AttemptForensicsPayload,
+} from "../pipeline/kernel/attempt-evidence.js";
+import {
   transitionApplicationDisposition,
   type AtomicTransitionApplyResult,
 } from "../pipeline/kernel/store.js";
@@ -81,6 +87,7 @@ import {
   payloadPointer,
   placeholders,
   recordFromRow,
+  serializePendingResultDiagnostics,
   scopeColumns,
   semanticKey,
   sortedRecord,
@@ -696,6 +703,40 @@ export class SqliteKernelStore implements
         run_version: run.version,
       };
     }).immediate();
+  }
+
+  async loadAttemptForensics(input: {
+    pipeline_run_id: string;
+    attempt_id: string;
+    work_retry_ordinal: number;
+  }): Promise<{ record: DecisionRecord; payload: AttemptForensicsPayload } | null> {
+    if (!Number.isSafeInteger(input.work_retry_ordinal) || input.work_retry_ordinal < 0) {
+      throw new Error("attempt forensics ordinal is invalid");
+    }
+    const id = attemptForensicsRecordId(input.attempt_id, input.work_retry_ordinal);
+    const row = this.#db.prepare(`
+      SELECT * FROM records
+      WHERE id = ? AND pipeline_run_id = ? AND kind = 'decision'
+    `).get(id, input.pipeline_run_id) as RecordRow | undefined;
+    if (!row) return null;
+    const record = recordFromRow(row, this.#payloadSchemas);
+    if (
+      record.kind !== "decision" || record.reducer !== ATTEMPT_FORENSICS_REDUCER ||
+      !("blob" in record.payload)
+    ) throw new Error(`record ${id} is not exact Attempt forensics`);
+    const bytes = this.#readBlob(
+      input.pipeline_run_id,
+      "record",
+      record.id,
+      record.payload.blob,
+    );
+    const payload = parseAttemptForensicsPayload(
+      parseJson(bytes.toString("utf8"), `record ${id} blob`),
+    );
+    if (
+      payload.pipeline_run_id !== input.pipeline_run_id || payload.attempt_id !== input.attempt_id
+    ) throw new Error(`record ${id} changed its Attempt forensics identity`);
+    return { record, payload };
   }
 
   async findExternalSchedule(input: {
@@ -1378,7 +1419,7 @@ export class SqliteKernelStore implements
       attempt.result_record_id,
       attempt.decision_record_id,
       attempt.pending_result?.candidate_hash ?? null,
-      attempt.pending_result === null ? null : canonicalJson(attempt.pending_result.diagnostics),
+      attempt.pending_result === null ? null : serializePendingResultDiagnostics(attempt.pending_result),
       now,
       now,
     );
@@ -1451,7 +1492,7 @@ export class SqliteKernelStore implements
       attempt.result_record_id,
       attempt.decision_record_id,
       attempt.pending_result?.candidate_hash ?? null,
-      attempt.pending_result === null ? null : canonicalJson(attempt.pending_result.diagnostics),
+      attempt.pending_result === null ? null : serializePendingResultDiagnostics(attempt.pending_result),
       this.#now(),
       attempt.id,
       runId,

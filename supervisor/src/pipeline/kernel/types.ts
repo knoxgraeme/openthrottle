@@ -1,5 +1,6 @@
 import {
   compareCodeUnits,
+  type BlobPointer,
   type AttemptCheckpoint,
   type AttemptState,
   type CompiledPipelineManifest,
@@ -104,6 +105,8 @@ export interface AttemptLease {
 export interface ResultPendingState {
   candidate_hash: string | null;
   diagnostics: readonly ResultDiagnostic[];
+  /** Null only when reading the legacy bare-array persisted form. */
+  invalid_result_evidence: BlobPointer | null;
 }
 
 export interface ResultDiagnostic {
@@ -205,6 +208,7 @@ export interface ResultPendingCommand extends KernelCommandBase {
   candidate_hash: string | null;
   diagnostics: readonly ResultDiagnostic[];
   correction_deadline: string;
+  invalid_result_evidence: BlobPointer;
 }
 
 export interface RecordResultCommand extends KernelCommandBase {
@@ -255,6 +259,7 @@ export interface SettleAttemptCommand extends KernelCommandBase {
 export interface RetryAttemptCommand extends KernelCommandBase {
   type: "retry";
   attempt_id: string;
+  forensics_record_id?: string | null;
 }
 
 /**
@@ -289,6 +294,8 @@ export type KernelTerminalResourceDisposition =
     /** Exact confirmed Daytona create evidence authorizes stop + cleanup. */
     kind: "cleanup";
     runtime_delivery_record_ids: readonly string[];
+    diagnostic_record_ids?: readonly string[];
+    new_diagnostic_record_ids?: readonly string[];
     cleanup_attempt: KernelAttempt;
   };
 

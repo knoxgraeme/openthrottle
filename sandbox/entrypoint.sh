@@ -84,7 +84,11 @@ seal_repository_source() {
 }
 
 handle_exit() {
+  local status="$?"
   terminate_agent_processes || true
+  if [[ -n "${OT_ACTION_RESULT_FILE:-}" && -n "${OT_ACTION_FORENSICS_FILE:-}" ]]; then
+    node "${RUNNER_DIR}/stage-attempt-forensics.mjs" "$status" || true
+  fi
 }
 trap handle_exit EXIT INT TERM
 
