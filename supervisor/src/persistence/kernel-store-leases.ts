@@ -473,7 +473,9 @@ export class KernelLeaseOperations {
     `).all(now, EXPIRED_EFFECT_RECOVERY_BATCH_SIZE) as EffectRow[];
     for (const row of expired) {
       const reconcileOnly = row.dispatch_lease_id !== null;
-      const retainedPrior = row.kind === "github/provider-wait@1" ? row.last_error : null;
+      const retainedPrior = row.kind === "github/provider-wait@1" || reconcileOnly
+        ? row.last_error
+        : null;
       const recoveredUnknown = retainedPrior !== null || reconcileOnly;
       const changed = this.#db.prepare(`
         UPDATE effects

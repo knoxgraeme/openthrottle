@@ -461,6 +461,32 @@ describe("kernel effect execution", () => {
     expect(result).toMatchObject({ retry_at: "2026-08-20T12:00:05.000Z" });
   });
 
+  it("persists a non-Error provider failure as canonical diagnostic text", async () => {
+    const intent = effect();
+    const adapter: KernelEffectRuntimeAdapter = {
+      async reconcile() {
+        throw { code: "temporarily_unavailable", retryable: true };
+      },
+      async dispatch() {
+        throw new Error("dispatch must not run");
+      },
+    };
+    const port = new FakeEffectPort([lease(intent)]);
+
+    await expect(service({ port, binding: binding(adapter) }).drainOne({
+      worker_id: "worker-1",
+      lease_id: "lease-1",
+      expires_at: "2026-08-20T12:01:00.000Z",
+    })).resolves.toMatchObject({
+      kind: "held_unknown",
+      detail: '{"code":"temporarily_unavailable","retryable":true}',
+    });
+    expect(port.completions[0]?.reconciliation).toMatchObject({
+      kind: "hold_unknown",
+      detail: '{"code":"temporarily_unavailable","retryable":true}',
+    });
+  });
+
   it("round-trips a provider retry continuation through durable unknown detail", async () => {
     const priorContinuation = { schema: "provider-state/v1", failures: [17] };
     const nextContinuation = { schema: "provider-state/v1", failures: [17, 18] };

@@ -2397,7 +2397,7 @@ describe("SqliteKernelStore", () => {
       });
       expect(reconciliationLease).toMatchObject({
         execution_mode: "reconcile_only",
-        prior_unknown_detail: "provider dispatch may have started before the effect lease expired",
+        prior_unknown_detail: "provider lookup failed before dispatch",
       });
       await context.store.completeLeasedEffect({
         effect_id: "effect-1",
@@ -2478,6 +2478,49 @@ describe("SqliteKernelStore", () => {
         attempt_id: "attempt-1",
         phase: "publish",
       })).rejects.toThrow(/invalid delivery record/);
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("retains an integration retry continuation across expired reconciliation lease recovery", async () => {
+    let currentTime = NOW;
+    const context = setup(undefined, () => currentTime);
+    try {
+      const effect = seedDispatchFencedUnknownIntegration(context);
+      const continuationDetail = canonicalJson({
+        schema: "openthrottle.effect-retry-continuation/v1",
+        detail: "integration runtime sandbox is absent; confirming authoritative absence",
+        continuation: {
+          schema: "openthrottle.daytona-integration-absence-continuation/v1",
+          consecutive_absences: 1,
+        },
+      });
+      context.db.prepare("UPDATE effects SET unknown_detail = ? WHERE id = ?")
+        .run(continuationDetail, effect.id);
+
+      const interrupted = await context.store.leaseNextEffect({
+        worker_id: "integration-worker-1",
+        lease_id: "integration-reconciliation-1",
+        expires_at: "2026-08-20T12:00:01.000Z",
+      });
+      expect(interrupted).toMatchObject({
+        intent: { id: effect.id, kind: "daytona/integrate-checkpoint@1" },
+        execution_mode: "reconcile_only",
+        prior_unknown_detail: continuationDetail,
+      });
+
+      currentTime = "2026-08-20T12:00:02.000Z";
+      const recovered = await context.store.leaseNextEffect({
+        worker_id: "integration-worker-2",
+        lease_id: "integration-reconciliation-2",
+        expires_at: "2026-08-20T12:01:00.000Z",
+      });
+      expect(recovered).toMatchObject({
+        intent: { id: effect.id, kind: "daytona/integrate-checkpoint@1" },
+        execution_mode: "reconcile_only",
+        prior_unknown_detail: continuationDetail,
+      });
     } finally {
       context.db.close();
     }
