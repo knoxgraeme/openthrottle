@@ -2,6 +2,10 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  KERNEL_CHECKPOINT_ANCESTRY_MAX_ENTRIES,
+  validateKernelCheckpointAncestryChain,
+} from "../pipeline/kernel/checkpoint-ancestry.js";
 
 export interface KernelGitBundleDescriptor {
   ref: string;
@@ -15,8 +19,6 @@ interface SealedBundleDescriptor {
   commit: string;
   tree: string;
 }
-
-export const KERNEL_INTEGRATION_ANCESTRY_MAX_ENTRIES = 64;
 
 export interface KernelIntegrationAncestryBundle {
   checkpoint_id: string;
@@ -292,7 +294,7 @@ export function inspectKernelIntegrationBundle(input: {
   ) throw new Error("integration bundle changed its sealed candidate or ref identity");
   if (
     !Array.isArray(input.current_ancestry) ||
-    input.current_ancestry.length > KERNEL_INTEGRATION_ANCESTRY_MAX_ENTRIES
+    input.current_ancestry.length > KERNEL_CHECKPOINT_ANCESTRY_MAX_ENTRIES
   ) throw new Error("integration current ancestry proof exceeds its bounded entry limit");
 
   const scratch = mkdtempSync(join(tmpdir(), "openthrottle-kernel-integration-bundle-"));
@@ -328,11 +330,9 @@ export function inspectKernelIntegrationBundle(input: {
       input.candidate_input_subject,
     )) throw new Error("integration candidate does not descend from its sealed checkpoint base");
 
-    let ancestrySubject = input.candidate_input_subject;
-    const ancestryCheckpointIds = new Set<string>();
     const ancestryRefs = new Set<string>();
     const ancestryCommits = new Set<string>();
-    for (const [index, edge] of input.current_ancestry.entries()) {
+    for (const edge of input.current_ancestry) {
       if (
         typeof edge.checkpoint_id !== "string" ||
         !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/.test(edge.checkpoint_id)
@@ -344,19 +344,25 @@ export function inspectKernelIntegrationBundle(input: {
         [edge.output_subject, "current ancestry output"],
       ] as const) subject(value, label);
       if (
-        edge.input_subject !== ancestrySubject ||
-        edge.output_subject === edge.input_subject ||
         edge.descriptor.commit !== edge.output_subject ||
         !INTEGRATION_REF.test(edge.descriptor.ref)
       ) throw new Error("integration current ancestry proof contains a gap or invalid edge identity");
       if (
-        ancestryCheckpointIds.has(edge.checkpoint_id) ||
         ancestryRefs.has(edge.descriptor.ref) ||
         ancestryCommits.has(edge.descriptor.commit)
       ) throw new Error("integration current ancestry proof contains duplicate edge evidence");
-      ancestryCheckpointIds.add(edge.checkpoint_id);
       ancestryRefs.add(edge.descriptor.ref);
       ancestryCommits.add(edge.descriptor.commit);
+    }
+    const currentAncestry = input.current_ancestry.length === 0
+      ? []
+      : validateKernelCheckpointAncestryChain({
+        entries: input.current_ancestry,
+        start_subject: input.candidate_input_subject,
+        end_subject: input.current_subject,
+        label: "integration current ancestry proof",
+      });
+    for (const [index, edge] of currentAncestry.entries()) {
       const ancestryBundle = join(scratch, `current-ancestry-${index}.bundle`);
       writeFileSync(ancestryBundle, edge.bytes, { mode: 0o400 });
       const inspected = inspectBundleInRepository({
@@ -370,10 +376,6 @@ export function inspectKernelIntegrationBundle(input: {
       if (inspected.ref !== edge.descriptor.ref) {
         throw new Error("integration current ancestry bundle changed its exact sealed ref");
       }
-      ancestrySubject = edge.output_subject;
-    }
-    if (input.current_ancestry.length > 0 && ancestrySubject !== input.current_subject) {
-      throw new Error("integration current ancestry proof does not end at the sealed current subject");
     }
     const currentExists = hasCommit(repository, input.current_subject);
     const currentIsDirect =
@@ -385,10 +387,10 @@ export function inspectKernelIntegrationBundle(input: {
       input.candidate_input_subject,
     );
     const currentIsDirectOrCandidateAncestor = currentIsDirect || currentIsCandidateAncestor;
-    if (currentIsDirectOrCandidateAncestor && input.current_ancestry.length > 0) {
+    if (currentIsDirectOrCandidateAncestor && currentAncestry.length > 0) {
       throw new Error("integration current ancestry proof contains unnecessary extra edges");
     }
-    if (!currentIsDirectOrCandidateAncestor && input.current_ancestry.length === 0) {
+    if (!currentIsDirectOrCandidateAncestor && currentAncestry.length === 0) {
       throw new Error("integration stale current ancestry proof is missing");
     }
     if (!currentExists) {

@@ -42,10 +42,13 @@ import {
   type KernelCheckpointArtifactDescriptor,
 } from "../../runtime/kernel-wire.js";
 import {
-  KERNEL_INTEGRATION_ANCESTRY_MAX_ENTRIES,
   inspectKernelCheckpointBundle,
   inspectKernelIntegrationBundle,
 } from "../../runtime/kernel-checkpoint-bundle.js";
+import {
+  KERNEL_CHECKPOINT_ANCESTRY_MAX_ENTRIES,
+  validateKernelCheckpointAncestryChain,
+} from "../../pipeline/kernel/checkpoint-ancestry.js";
 import {
   assertDaytonaRepositorySourceFence,
   DAYTONA_REPOSITORY_ROOT,
@@ -301,14 +304,12 @@ function integrationPayload(intent: Readonly<EffectIntent>): DaytonaIntegrationP
   ) throw new Error(`effect ${intent.id} has invalid Daytona integration authority`);
   if (
     !Array.isArray(value.current_ancestry) ||
-    value.current_ancestry.length > KERNEL_INTEGRATION_ANCESTRY_MAX_ENTRIES
+    value.current_ancestry.length > KERNEL_CHECKPOINT_ANCESTRY_MAX_ENTRIES
   ) throw new Error(`effect ${intent.id} has invalid bounded current ancestry authority`);
   const currentAncestry: DaytonaIntegrationAncestryEntry[] = [];
-  const checkpointIds = new Set<string>();
   const refs = new Set<string>();
   const commits = new Set<string>();
   let aggregateBundleBytes = pointer.bytes;
-  let ancestrySubject = value.candidate_input_subject as string;
   for (const [index, candidate] of value.current_ancestry.entries()) {
     const edge = object(candidate, `integration current_ancestry[${index}]`);
     const edgeKeys = [
@@ -330,7 +331,6 @@ function integrationPayload(intent: Readonly<EffectIntent>): DaytonaIntegrationP
       typeof edge.checkpoint_id !== "string" || !KERNEL_ID.test(edge.checkpoint_id) ||
       typeof edge.input_subject !== "string" || !/^[a-f0-9]{40,64}$/.test(edge.input_subject) ||
       typeof edge.output_subject !== "string" || !/^[a-f0-9]{40,64}$/.test(edge.output_subject) ||
-      edge.input_subject !== ancestrySubject || edge.output_subject === edge.input_subject ||
       edgeArtifact.media_type !== "application/x-git-bundle" ||
       edgeArtifact.payload_schema !== "openthrottle.git-checkpoint-bundle/v1" ||
       edgeArtifact.sha256 !== edgePointer.digest || edgeArtifact.bytes !== edgePointer.bytes ||
@@ -343,16 +343,14 @@ function integrationPayload(intent: Readonly<EffectIntent>): DaytonaIntegrationP
       edgePointer.encoding !== "binary" ||
       edgePointer.media_type !== "application/x-git-bundle" ||
       edgePointer.payload_schema !== "openthrottle.git-checkpoint-bundle/v1" ||
-      checkpointIds.has(edge.checkpoint_id) || refs.has(edgeArtifact.ref) || commits.has(edgeArtifact.commit)
+      refs.has(edgeArtifact.ref) || commits.has(edgeArtifact.commit)
     ) throw new Error(`effect ${intent.id} has invalid exact current ancestry entry`);
     if (aggregateBundleBytes > KERNEL_INTEGRATION_SEALED_BUNDLES_MAX_BYTES - edgePointer.bytes) {
       throw new Error(`effect ${intent.id} exceeds the aggregate sealed bundle byte ceiling`);
     }
     aggregateBundleBytes += edgePointer.bytes;
-    checkpointIds.add(edge.checkpoint_id);
     refs.add(edgeArtifact.ref);
     commits.add(edgeArtifact.commit as string);
-    ancestrySubject = edge.output_subject;
     currentAncestry.push({
       checkpoint_id: edge.checkpoint_id,
       input_subject: edge.input_subject,
@@ -361,14 +359,19 @@ function integrationPayload(intent: Readonly<EffectIntent>): DaytonaIntegrationP
       checkpoint_artifact: edgeArtifact as unknown as KernelCheckpointArtifactDescriptor,
     });
   }
-  if (currentAncestry.length > 0 && ancestrySubject !== value.current_subject) {
-    throw new Error(`effect ${intent.id} current ancestry does not end at its sealed current subject`);
-  }
+  const orderedCurrentAncestry = currentAncestry.length === 0
+    ? []
+    : validateKernelCheckpointAncestryChain({
+      entries: currentAncestry,
+      start_subject: value.candidate_input_subject as string,
+      end_subject: value.current_subject as string,
+      label: `effect ${intent.id} current ancestry`,
+    });
   return {
     ...(value as unknown as DaytonaIntegrationPayload),
     candidate_blob: pointer,
     candidate_artifact: artifact as unknown as KernelCheckpointArtifactDescriptor,
-    current_ancestry: currentAncestry,
+    current_ancestry: orderedCurrentAncestry,
   };
 }
 
