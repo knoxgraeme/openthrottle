@@ -60,10 +60,11 @@ function insertEffect(
   fixture.db.prepare(`
     INSERT INTO effects (
       id, pipeline_run_id, decision_record_id, decision_record_kind, kind,
+      run_classification,
       idempotency_key, target, subject, payload_schema, inline_payload,
       intent_hash, status, version, attempt_count, available_at, created_at, updated_at
     ) VALUES (
-      ?, 'run-1', ?, 'decision', ?,
+      ?, 'run-1', ?, 'decision', ?, 'blocking',
       ?, ?, ?, ?, '{}',
       ?, 'pending', 0, 0, ?, ?, ?
     )

@@ -442,10 +442,11 @@ function seedDispatchFencedUnknownIntegration(
     );
     context.db.prepare(`
       INSERT INTO effects (
-        id, pipeline_run_id, decision_record_id, kind, idempotency_key, target,
+        id, pipeline_run_id, decision_record_id, kind, run_classification,
+        idempotency_key, target,
         subject, payload_schema, inline_payload, intent_hash, status, version,
         attempt_count, available_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 'pending', 0, 1, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, 'blocking', ?, ?, NULL, ?, ?, ?, 'pending', 0, 1, ?, ?, ?)
     `).run(
       runtimeEffect.id,
       runtimeEffect.pipeline_run_id,
@@ -499,11 +500,12 @@ function seedDispatchFencedUnknownIntegration(
     );
     context.db.prepare(`
       INSERT INTO effects (
-        id, pipeline_run_id, decision_record_id, kind, idempotency_key, target,
+        id, pipeline_run_id, decision_record_id, kind, run_classification,
+        idempotency_key, target,
         subject, payload_schema, inline_payload, intent_hash, status, version,
         attempt_count, available_at, dispatch_lease_id, dispatch_worker_id,
         unknown_detail, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', 7, 4, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, 'blocking', ?, ?, ?, ?, ?, ?, 'unknown', 7, 4, ?, ?, ?, ?, ?, ?)
     `).run(
       effect.id,
       effect.pipeline_run_id,
@@ -1359,11 +1361,12 @@ describe("SqliteKernelStore", () => {
         `).run(sha("6"), NOW);
         context.db.prepare(`
           INSERT INTO effects (
-            id, pipeline_run_id, decision_record_id, kind, idempotency_key, target,
+            id, pipeline_run_id, decision_record_id, kind, run_classification,
+            idempotency_key, target,
             payload_schema, inline_payload, intent_hash, status, version, attempt_count,
             available_at, delivery_record_id, created_at, updated_at
           ) VALUES ('effect-runtime-create', 'run-1', 'decision-runtime-create',
-            'daytona/create-sandbox@1', ?, ?, 'daytona/create-sandbox@1', '{}', ?,
+            'daytona/create-sandbox@1', 'blocking', ?, ?, 'daytona/create-sandbox@1', '{}', ?,
             'acknowledged', 1, 1, ?, ?, ?, ?)
         `).run(delivery.idempotency_key, delivery.external_identity, sha("7"), NOW, delivery.id, NOW, NOW);
         context.db.prepare(`
@@ -1567,6 +1570,17 @@ describe("SqliteKernelStore", () => {
         subject: recorded.run.current_subject,
         payload: { branch: "ot/work" },
       };
+      const feedback: EffectIntent = {
+        schema: EFFECT_INTENT_SCHEMA,
+        id: "feedback-effect-1",
+        pipeline_run_id: "run-1",
+        decision_record_id: "decision-1",
+        kind: "linear/post-activity@1",
+        idempotency_key: "attempt-1:linear-activity",
+        target: "linear:session:session-1:activity:attempt-1",
+        subject: recorded.run.current_subject,
+        payload: { line: "work: success: completed" },
+      };
       const next = attempt({
         id: "attempt-2",
         scope: {
@@ -1591,9 +1605,23 @@ describe("SqliteKernelStore", () => {
           decision_record_id: "decision-1",
           outcome: "success",
           next_attempts: [next],
-          effect_intents: [effect],
+          effect_intents: [feedback, effect],
         },
       }));
+      expect(context.db.prepare(`
+        SELECT id, run_classification FROM effects ORDER BY id
+      `).all()).toEqual([
+        { id: effect.id, run_classification: "blocking" },
+        { id: feedback.id, run_classification: "non_blocking_feedback" },
+      ]);
+      expect((await context.store.loadExactReductionView({
+        pipeline_run_id: "run-1",
+        attempt_id: null,
+        record_ids: [],
+        checkpoint_ids: [],
+      })).run.active_effect_versions).toEqual({ [effect.id]: 0 });
+      context.db.prepare("UPDATE effects SET available_at = ? WHERE id = ?")
+        .run("2026-08-21T00:00:00.000Z", feedback.id);
       expect(await context.store.findExternalSchedule({
         pipeline_run_id: "run-1",
         attempt_id: "attempt-1",
@@ -1601,7 +1629,10 @@ describe("SqliteKernelStore", () => {
       })).toEqual({
         semantic_key: "external-schedule:attempt-1:publish",
         decision,
-        effects: [{ intent: effect, delivery: null }],
+        effects: [
+          { intent: effect, delivery: null },
+          { intent: feedback, delivery: null },
+        ],
       });
       const planningRequest = {
         pipeline_run_id: "run-1",
@@ -1841,7 +1872,10 @@ describe("SqliteKernelStore", () => {
         pipeline_run_id: "run-1",
         attempt_id: "attempt-1",
         phase: "publish",
-      }))?.effects).toEqual([{ intent: effect, delivery }]);
+      }))?.effects).toEqual([
+        { intent: effect, delivery },
+        { intent: feedback, delivery: null },
+      ]);
       const finalView = await context.store.loadExactReductionView({
         pipeline_run_id: "run-1",
         attempt_id: null,
@@ -1849,6 +1883,89 @@ describe("SqliteKernelStore", () => {
         checkpoint_ids: [],
       });
       expect(finalView.run.active_effect_versions).toEqual({});
+
+      expect(() => context.db.prepare(`
+        UPDATE effects SET run_classification = 'blocking' WHERE id = ?
+      `).run(feedback.id)).toThrow(/check constraint/i);
+      context.db.prepare("UPDATE effects SET available_at = ? WHERE id = ?")
+        .run(currentTime, feedback.id);
+      const feedbackLease = await context.store.leaseNextEffect({
+        worker_id: "feedback-worker",
+        lease_id: "feedback-lease-1",
+        expires_at: "2026-08-20T12:20:00.000Z",
+      });
+      expect(feedbackLease).toMatchObject({
+        intent: feedback,
+        execution_mode: "dispatch_or_reconcile",
+      });
+      await context.store.markLeasedEffectDispatchStarted({
+        effect_id: feedback.id,
+        lease_id: "feedback-lease-1",
+        worker_id: "feedback-worker",
+      });
+      await context.store.completeLeasedEffect({
+        effect_id: feedback.id,
+        lease_id: "feedback-lease-1",
+        worker_id: "feedback-worker",
+        reconciliation: {
+          kind: "hold_unknown",
+          effect_id: feedback.id,
+          external_identity: feedback.target,
+          detail: "Linear activity is not observable yet",
+          retry_at: "2026-08-20T12:10:07.000Z",
+        },
+      });
+      context.db.transaction(() => {
+        context.db.prepare(`
+          UPDATE attempts SET status = 'failed', version = version + 1, updated_at = ?
+          WHERE id = 'attempt-2' AND pipeline_run_id = 'run-1'
+        `).run(currentTime);
+        context.db.prepare(`
+          UPDATE pipeline_runs SET status = 'failed', terminal_outcome = 'failed',
+            cursor_stage_id = NULL, cursor_version = cursor_version + 1,
+            cursor_frontier_json = '[]', cursor_barrier_json = NULL,
+            version = version + 1, updated_at = ? WHERE id = 'run-1'
+        `).run(currentTime);
+      }).immediate();
+      currentTime = "2026-08-20T12:10:07.000Z";
+      const settledFeedbackLease = await context.store.leaseNextEffect({
+        worker_id: "feedback-worker",
+        lease_id: "feedback-lease-2",
+        expires_at: "2026-08-20T12:20:00.000Z",
+      });
+      expect(settledFeedbackLease).toMatchObject({
+        intent: feedback,
+        execution_mode: "reconcile_only",
+      });
+      const feedbackDelivery: DeliveryRecord = {
+        schema: EXECUTION_RECORD_SCHEMA,
+        id: "delivery-feedback-1",
+        kind: "delivery",
+        pipeline_run_id: "run-1",
+        effect_id: feedback.id,
+        idempotency_key: feedback.idempotency_key,
+        external_identity: feedback.target,
+        status: "confirmed",
+        payload_schema: "delivery/v1",
+        payload: { inline: { accepted: true } },
+        created_at: currentTime,
+      };
+      await context.store.completeLeasedEffect({
+        effect_id: feedback.id,
+        lease_id: "feedback-lease-2",
+        worker_id: "feedback-worker",
+        reconciliation: { kind: "append_delivery", delivery: feedbackDelivery },
+      });
+      expect(context.db.prepare(`
+        SELECT r.status AS run_status, e.status AS effect_status,
+          e.delivery_record_id
+        FROM pipeline_runs r JOIN effects e ON e.pipeline_run_id = r.id
+        WHERE r.id = 'run-1' AND e.id = ?
+      `).get(feedback.id)).toEqual({
+        run_status: "failed",
+        effect_status: "acknowledged",
+        delivery_record_id: feedbackDelivery.id,
+      });
 
       // Reads still fail closed if an externally copied or corrupted database
       // violates the foreign keys that normal writes enforce.

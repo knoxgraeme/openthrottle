@@ -56,6 +56,7 @@ import {
   EXTERNAL_SCHEDULE_PAYLOAD_SCHEMA,
   EXTERNAL_SCHEDULE_REDUCER,
   MAX_EXTERNAL_EFFECTS_PER_PHASE,
+  classifyEffectForRun,
   canonicalAttemptContextIds,
 } from "./types.js";
 
@@ -118,6 +119,17 @@ function attemptWriteOrder(left: AttemptWrite, right: AttemptWrite): number {
 function attemptOrder(left: KernelAttempt, right: KernelAttempt): number {
   return compareCodeUnits(attemptScopeKey(left.scope), attemptScopeKey(right.scope)) ||
     compareCodeUnits(left.id, right.id);
+}
+
+function withBlockingEffectVersions(
+  current: Readonly<Record<string, number>>,
+  effects: readonly EffectIntent[],
+): Record<string, number> {
+  const next = { ...current };
+  for (const effect of effects) {
+    if (classifyEffectForRun(effect.kind) === "blocking") next[effect.id] = 0;
+  }
+  return sortedRecord(next);
 }
 
 function replaceAttempt(run: KernelRun, attempt: KernelAttempt): KernelRun {
@@ -813,12 +825,10 @@ function scheduleExternal(input: ReducerInput): AtomicTransitionBundle {
     native_session_id: null,
     checkpoint_id: checkpoint.id,
   };
-  const activeEffects: Record<string, number> = { ...input.run.active_effect_versions };
-  for (const effect of effects) activeEffects[effect.id] = 0;
   const nextRun = replaceAttempt(input.run, next);
   const withExternalBoundary: KernelRun = {
     ...nextRun,
-    active_effect_versions: sortedRecord(activeEffects),
+    active_effect_versions: withBlockingEffectVersions(input.run.active_effect_versions, effects),
     checkpoint_ids: sortedRecord({
       ...input.run.checkpoint_ids,
       [attempt.id]: checkpoint.id,
@@ -1164,7 +1174,9 @@ function settle(input: ReducerInput): AtomicTransitionBundle {
   if (transition.terminal !== undefined) {
     assertExactMap(input.checkpoints, [], "checkpoint map");
     if (command.next_attempts.length > 0) throw new Error("terminal transition cannot schedule attempts");
-    if ((command.effect_intents?.length ?? 0) > 0) {
+    if ((command.effect_intents ?? []).some((effect) =>
+      classifyEffectForRun(effect.kind) === "blocking"
+    )) {
       throw new Error("terminal transition cannot leave unobserved effects");
     }
     if (Object.keys(command.next_dependencies ?? {}).length > 0) {
@@ -1250,8 +1262,6 @@ function settle(input: ReducerInput): AtomicTransitionBundle {
   for (const nextAttempt of [...command.next_attempts].sort(attemptOrder)) {
     activeAttempts[nextAttempt.id] = nextAttempt.version;
   }
-  const activeEffects: Record<string, number> = { ...input.run.active_effect_versions };
-  for (const effect of effects) activeEffects[effect.id] = 0;
   const nextRun: KernelRun = transition.terminal !== undefined
     ? terminalRun({
       ...runAtAcceptedSubject,
@@ -1273,7 +1283,7 @@ function settle(input: ReducerInput): AtomicTransitionBundle {
         completed_scope_keys: completedScopeKeys,
       }),
       active_attempt_versions: sortedRecord(activeAttempts),
-      active_effect_versions: sortedRecord(activeEffects),
+      active_effect_versions: withBlockingEffectVersions(input.run.active_effect_versions, effects),
     };
   return bundle(baseContent({
     command,

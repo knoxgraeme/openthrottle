@@ -196,10 +196,10 @@ describe("fresh epoch schema ownership", () => {
       `).run(OTHER_HASH, NOW);
       db.prepare(`
         INSERT INTO effects (
-          id, pipeline_run_id, decision_record_id, kind, idempotency_key,
+          id, pipeline_run_id, decision_record_id, kind, run_classification, idempotency_key,
           target, payload_schema, inline_payload, intent_hash,
           status, version, available_at, created_at, updated_at
-        ) VALUES ('effect-1', 'run', 'decision-1', 'github.publish@1', 'idem-1',
+        ) VALUES ('effect-1', 'run', 'decision-1', 'github.publish@1', 'blocking', 'idem-1',
           'owner/repo#1', 'effect/v1', '{}', ?, 'pending', 0, ?, ?, ?)
       `).run(HASH, NOW, NOW, NOW);
       db.prepare(`
@@ -283,10 +283,10 @@ describe("fresh epoch schema ownership", () => {
       `).run(HASH, OTHER_HASH, HASH, SHA, NOW);
       db.prepare(`
         INSERT INTO effects (
-          id, pipeline_run_id, decision_record_id, kind, idempotency_key,
+          id, pipeline_run_id, decision_record_id, kind, run_classification, idempotency_key,
           target, payload_schema, inline_payload, intent_hash,
           status, version, available_at, created_at, updated_at
-        ) VALUES ('effect-1', 'run', 'decision-1', 'github.publish@1', 'idem-1',
+        ) VALUES ('effect-1', 'run', 'decision-1', 'github.publish@1', 'blocking', 'idem-1',
           'owner/repo#1', 'effect/v1', '{}', ?, 'pending', 0, ?, ?, ?)
       `).run(HASH, NOW, NOW, NOW);
 

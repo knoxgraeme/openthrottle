@@ -57,6 +57,7 @@ import {
 } from "../pipeline/kernel/operator-effect-rejection.js";
 import {
   KERNEL_RUN_SCHEMA,
+  classifyEffectForRun,
   canonicalAttemptContextIds,
   type AtomicTransitionBundle,
   type KernelAttempt,
@@ -805,6 +806,7 @@ export class SqliteKernelStore implements
               1,
               length('external-schedule:' || a.id || ':')
             ) = 'external-schedule:' || a.id || ':'
+            AND e.run_classification = 'blocking'
             AND e.status IN ('pending', 'processing', 'unknown')
         )
         ${after === undefined ? "" : `AND (
@@ -1282,6 +1284,7 @@ export class SqliteKernelStore implements
     `).all(row.id, ...ACTIVE_ATTEMPT_STATUSES) as Array<{ id: string; version: number }>;
     const effectRows = this.#db.prepare(`
       SELECT id, version FROM effects WHERE pipeline_run_id = ?
+        AND run_classification = 'blocking'
         AND status IN (${placeholders(ACTIVE_EFFECT_STATUSES.length)})
       ORDER BY id
     `).all(row.id, ...ACTIVE_EFFECT_STATUSES) as Array<{ id: string; version: number }>;
@@ -1626,16 +1629,18 @@ export class SqliteKernelStore implements
     this.#db.prepare(`
       INSERT INTO effects (
         id, pipeline_run_id, decision_record_id, decision_record_kind, kind,
+        run_classification,
         idempotency_key, target, subject, payload_schema,
         inline_payload, blob_algorithm, blob_digest, blob_bytes, blob_encoding,
         blob_media_type, blob_payload_schema, intent_hash, status, version,
         attempt_count, available_at, created_at, updated_at
-      ) VALUES (?, ?, ?, 'decision', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?, ?)
+      ) VALUES (?, ?, ?, 'decision', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?, ?)
     `).run(
       effect.id,
       effect.pipeline_run_id,
       effect.decision_record_id,
       effect.kind,
+      classifyEffectForRun(effect.kind),
       effect.idempotency_key,
       effect.target,
       effect.subject,
@@ -1816,6 +1821,7 @@ export class SqliteKernelStore implements
     `).all(expected.id, ...ACTIVE_ATTEMPT_STATUSES) as Array<{ id: string; version: number }>;
     const effects = this.#db.prepare(`
       SELECT id, version FROM effects WHERE pipeline_run_id = ?
+        AND run_classification = 'blocking'
         AND status IN (${placeholders(ACTIVE_EFFECT_STATUSES.length)}) ORDER BY id
     `).all(expected.id, ...ACTIVE_EFFECT_STATUSES) as Array<{ id: string; version: number }>;
     const checkpoints = this.#db.prepare(`

@@ -7,6 +7,7 @@ import {
   RUNTIME_PROVISION_STAGE_ID,
   canonicalJson,
   expandCompiledRuntimeLifecycle,
+  runtimeCleanupStageId,
   runtimeStopStageId,
   type AttemptCheckpoint,
   type CompiledPipelineManifest,
@@ -2042,9 +2043,9 @@ describe("effect ownership and reconciliation", () => {
     const secondIntent: EffectIntent = {
       ...intent,
       id: "effect-2",
-      kind: "linear/publish-activity@1",
-      idempotency_key: "run-1:activity",
-      target: "linear:issue:OPE-1:activity:complete",
+      kind: "linear/acknowledge-session@1",
+      idempotency_key: "linear-session:session-1:acknowledge",
+      target: "linear:session:session-1:acknowledgement",
     };
     const next = attempt({
       id: "verify-1",
@@ -2063,7 +2064,7 @@ describe("effect ownership and reconciliation", () => {
       records: [decision, state.result],
     });
     expect(transition.put_effects).toEqual([intent, secondIntent]);
-    expect(transition.run.active_effect_versions).toEqual({ "effect-1": 0, "effect-2": 0 });
+    expect(transition.run.active_effect_versions).toEqual({ "effect-1": 0 });
 
     expect(() => authorizeEffectIntent(effectIntent("other-decision"), decision, "run-1"))
       .toThrow(/not owned/);
@@ -2087,6 +2088,43 @@ describe("effect ownership and reconciliation", () => {
       },
       records: [decision, state.result],
     })).toThrow(/terminal transition cannot leave unobserved effects/);
+  });
+
+  it("persists non-blocking feedback without stranding a terminal run", () => {
+    const state = recordedAttempt(stageScope(runtimeCleanupStageId("completed")));
+    const current: KernelAttempt = { ...state.current, repository_authority: "inspect" };
+    const cleanup = runtimeDelivery("cleanup");
+    const decision = decisionRecord([cleanup.id, state.result.id].sort());
+    const feedback: EffectIntent = {
+      ...effectIntent(decision.id),
+      id: "effect-terminal-activity",
+      kind: "linear/post-activity@1",
+      idempotency_key: `attempt:${current.id}:terminal-activity`,
+      target: "linear:session:session-1:activity:terminal",
+      subject: current.output_subject,
+    };
+    const transition = reduce({
+      current,
+      currentRun: state.currentRun,
+      currentManifest: manifestWithRuntimeStages({ firstTerminal: true }),
+      command: {
+        type: "settle",
+        command_id: "terminal-with-feedback",
+        attempt_id: current.id,
+        decision_record_id: decision.id,
+        outcome: "success",
+        next_attempts: [],
+        effect_intents: [feedback],
+      },
+      records: [decision, cleanup, state.result],
+    });
+
+    expect(transition.put_effects).toEqual([feedback]);
+    expect(transition.run).toMatchObject({
+      status: "completed",
+      terminal_outcome: "completed",
+      active_effect_versions: {},
+    });
   });
 
   it("returns append_delivery, execute, or hold_unknown without blind replay", () => {

@@ -274,7 +274,8 @@ export class KernelLeaseOperations {
       const row = this.#db.prepare(`
         SELECT e.* FROM effects e
         JOIN pipeline_runs r ON r.id = e.pipeline_run_id
-        WHERE r.status IN ('pending', 'running')
+        WHERE (e.run_classification = 'non_blocking_feedback'
+            OR r.status IN ('pending', 'running'))
           AND e.status IN ('pending', 'unknown')
           AND e.lease_id IS NULL AND e.available_at <= ?
         ORDER BY e.available_at, e.id

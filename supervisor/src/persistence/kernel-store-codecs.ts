@@ -130,6 +130,7 @@ export interface EffectRow extends PayloadRow {
   pipeline_run_id: string;
   decision_record_id: string;
   kind: string;
+  run_classification: "blocking" | "non_blocking_feedback";
   idempotency_key: string;
   target: string;
   subject: string | null;

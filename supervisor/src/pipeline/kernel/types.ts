@@ -18,6 +18,22 @@ export const EXTERNAL_SCHEDULE_PAYLOAD_SCHEMA =
   "openthrottle.external-schedule/v1" as const;
 export const MAX_EXTERNAL_EFFECTS_PER_PHASE = 16;
 
+export const NON_BLOCKING_FEEDBACK_EFFECT_KINDS = [
+  "linear/acknowledge-session@1",
+  "linear/post-activity@1",
+] as const;
+
+export type EffectRunClassification = "blocking" | "non_blocking_feedback";
+
+const NON_BLOCKING_FEEDBACK_EFFECT_KIND_SET: ReadonlySet<string> =
+  new Set(NON_BLOCKING_FEEDBACK_EFFECT_KINDS);
+
+export function classifyEffectForRun(kind: string): EffectRunClassification {
+  return NON_BLOCKING_FEEDBACK_EFFECT_KIND_SET.has(kind)
+    ? "non_blocking_feedback"
+    : "blocking";
+}
+
 export type KernelRunStatus =
   | "pending"
   | "running"

@@ -309,6 +309,7 @@ CREATE TABLE effects (
   decision_record_id TEXT NOT NULL,
   decision_record_kind TEXT NOT NULL DEFAULT 'decision' CHECK (decision_record_kind = 'decision'),
   kind TEXT NOT NULL CHECK (length(kind) BETWEEN 3 AND 200),
+  run_classification TEXT NOT NULL CHECK (run_classification IN ('blocking', 'non_blocking_feedback')),
   idempotency_key TEXT NOT NULL UNIQUE CHECK (length(idempotency_key) BETWEEN 1 AND 500),
   target TEXT NOT NULL CHECK (length(target) BETWEEN 1 AND 1000),
   subject TEXT,
@@ -350,6 +351,10 @@ CREATE TABLE effects (
   CHECK (dispatch_lease_id IS NULL OR lease_execution_mode = 'reconcile_only' OR status IN ('unknown', 'acknowledged', 'rejected', 'failed', 'canceled')),
   CHECK ((status IN ('acknowledged', 'rejected')) = (delivery_record_id IS NOT NULL)),
   CHECK ((status = 'unknown') = (unknown_detail IS NOT NULL)),
+  CHECK (
+    (kind IN ('linear/acknowledge-session@1', 'linear/post-activity@1') AND run_classification = 'non_blocking_feedback') OR
+    (kind NOT IN ('linear/acknowledge-session@1', 'linear/post-activity@1') AND run_classification = 'blocking')
+  ),
   FOREIGN KEY (pipeline_run_id) REFERENCES pipeline_runs(id) ON DELETE RESTRICT,
   FOREIGN KEY (decision_record_id, pipeline_run_id, decision_record_kind) REFERENCES records(id, pipeline_run_id, kind) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
   FOREIGN KEY (delivery_record_id, pipeline_run_id, delivery_record_kind) REFERENCES records(id, pipeline_run_id, kind) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
@@ -462,7 +467,7 @@ CREATE INDEX records_effect_idx ON records(effect_id, kind, id);
 CREATE UNIQUE INDEX records_result_owner_idx ON records(attempt_id) WHERE kind = 'result';
 CREATE UNIQUE INDEX records_delivery_owner_idx ON records(effect_id) WHERE kind = 'delivery';
 CREATE UNIQUE INDEX records_decision_semantic_key_idx ON records(pipeline_run_id, semantic_key) WHERE kind = 'decision' AND semantic_key IS NOT NULL;
-CREATE INDEX effects_schedule_idx ON effects(status, lease_expires_at, pipeline_run_id, id);
+CREATE INDEX effects_schedule_idx ON effects(status, run_classification, lease_expires_at, pipeline_run_id, id);
 CREATE INDEX effects_run_idx ON effects(pipeline_run_id, status, id);
 CREATE INDEX effects_decision_idx ON effects(decision_record_id, pipeline_run_id);
 CREATE UNIQUE INDEX effects_active_lease_idx ON effects(lease_id) WHERE lease_id IS NOT NULL;
