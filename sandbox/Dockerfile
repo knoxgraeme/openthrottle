@@ -76,12 +76,9 @@ RUN mkdir -p /opt/openthrottle
 COPY sandbox/entrypoint.sh /opt/openthrottle/entrypoint.sh
 COPY sandbox/runner /opt/openthrottle/runner
 COPY sandbox/hooks /opt/openthrottle/hooks
-COPY sandbox/bin/ot-activity.mjs /usr/local/bin/ot-activity
 COPY sandbox/bin/ot-result.mjs /opt/openthrottle/bin/ot-result.mjs
 COPY skills/codex/AGENTS-fragment.md /opt/openthrottle/skills/codex/AGENTS-fragment.md
 COPY contracts/generated/runtime /opt/openthrottle/generated/runtime
-COPY contracts/generated/provider-schemas /opt/openthrottle/generated/provider-schemas
-COPY contracts/generated/artifact-set.json /opt/openthrottle/generated/artifact-set.json
 
 RUN set -eux; \
     baseline="/opt/openthrottle/action-home-baseline"; \
@@ -100,7 +97,6 @@ RUN chown -R root:root /opt/openthrottle/generated \
 
 RUN chmod 0755 /opt/openthrottle/entrypoint.sh \
     && chmod 0755 /opt/openthrottle/runner/*.mjs \
-    && chmod 0755 /usr/local/bin/ot-activity \
     && chmod 0755 /opt/openthrottle/bin/ot-result.mjs \
     && ln -s /opt/openthrottle/bin/ot-result.mjs /usr/local/bin/ot-result \
     && chmod 0755 /opt/openthrottle/hooks/ot-inbox-drain.sh
