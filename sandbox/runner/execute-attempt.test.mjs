@@ -536,9 +536,11 @@ describe("kernel attempt executor", () => {
     const resultPath = join(root, "transport", "work.json");
     const sessionPath = join(root, "transport", "session.json");
     let launches = 0;
+    let launchedPrompt;
     const request = workRequest(source.subject);
-    const runAgent = async ({ repositoryPath, onSession, timeoutMs }) => {
+    const runAgent = async ({ repositoryPath, onSession, timeoutMs, promptBytes }) => {
       launches += 1;
+      launchedPrompt = promptBytes;
       expect(timeoutMs).toBe(600_000);
       writeFileSync(join(repositoryPath, "work.txt"), "implemented\n");
       await onSession("session-1");
@@ -591,6 +593,15 @@ describe("kernel attempt executor", () => {
       },
     });
     expect(JSON.parse(readFileSync(resultPath, "utf8"))).toEqual(first);
+    const sessionEvidence = first.outcome.result.evidence;
+    const promptArtifact = readFileSync(join(root, "transport", sessionEvidence.prompt_context.file));
+    const transcriptArtifact = readFileSync(join(root, "transport", sessionEvidence.transcript.file));
+    expect(promptArtifact.equals(launchedPrompt)).toBe(true);
+    expect(createHash("sha256").update(promptArtifact).digest("hex"))
+      .toBe(sessionEvidence.prompt_context.sha256);
+    expect(createHash("sha256").update(transcriptArtifact).digest("hex"))
+      .toBe(sessionEvidence.transcript.sha256);
+    expect(JSON.parse(transcriptArtifact.toString("utf8")).resourceSpans).toHaveLength(1);
   });
 
   it("seals only each Codex action's final-message channel across sequential sandbox actions", async () => {

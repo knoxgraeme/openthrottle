@@ -33,6 +33,7 @@ import {
   assertExactInvalidResultEvidenceRecord,
   attemptForensicsRecordId,
 } from "./attempt-evidence.js";
+import { assertExactSessionEvidenceRecord } from "./session-evidence.js";
 import {
   assertAttemptCommandMapsEmpty,
   assertBaseInput,
@@ -753,7 +754,10 @@ function workComplete(input: ReducerInput): AtomicTransitionBundle {
   const command = input.command;
   if (command.type !== "work_complete") throw new Error("unreachable work_complete command");
   const resultRecordId = command.result_record_id;
-  assertExactMap(input.records, resultRecordId === null ? [] : [resultRecordId], "record map");
+  const sessionEvidenceRecordId = command.session_evidence_record_id ?? null;
+  assertExactMap(input.records, [resultRecordId, sessionEvidenceRecordId].filter(
+    (id): id is string => id !== null,
+  ), "record map");
   const attempt = currentAttempt(input, command.attempt_id);
   if (attempt.status !== "running" || attempt.lease?.purpose !== "work" || !attempt.lease.started) {
     throw new Error(`attempt ${attempt.id} has not completed a started work lease`);
@@ -786,7 +790,18 @@ function workComplete(input: ReducerInput): AtomicTransitionBundle {
     checkpoint_id: checkpoint.id,
     result_record_id: resultRecordId,
   };
-  const result = resultRecordId === null ? null : recordForAttempt(input, next, resultRecordId);
+  const result = resultRecordId === null ? null : resultForAttempt(input, next, resultRecordId);
+  const sessionEvidence = sessionEvidenceRecordId === null
+    ? null
+    : input.records.get(sessionEvidenceRecordId) ?? null;
+  if (result?.payload_schema === "openthrottle.semantic-result-record/v1") {
+    if (sessionEvidence === null) {
+      throw new Error("semantic work completion requires session evidence");
+    }
+    assertExactSessionEvidenceRecord({ attempt: next, record: sessionEvidence });
+  } else if (sessionEvidence !== null) {
+    throw new Error("non-semantic work completion cannot attach session evidence");
+  }
   const nextRun = replaceAttempt(input.run, next);
   const withCheckpoint: KernelRun = {
     ...nextRun,
@@ -800,7 +815,9 @@ function workComplete(input: ReducerInput): AtomicTransitionBundle {
     expected: expectedFor(input.run, { [attempt.id]: attempt.version }),
     run: withCheckpoint,
     attemptWrites: [{ kind: "replace", attempt: next }],
-    appendRecords: result === null ? [] : [result],
+    appendRecords: [result, sessionEvidence].filter(
+      (record): record is ExecutionRecord => record !== null,
+    ),
     appendCheckpoints: [checkpoint],
   }));
 }
@@ -1474,12 +1491,20 @@ function correctAndSettle(input: ReducerInput): AtomicTransitionBundle {
     throw new Error(`attempt ${attempt.id} has no pending invalid-result evidence`);
   }
   const decision = input.records.get(command.decision_record_id);
+  const sessionEvidenceRecordId = command.session_evidence_record_id ?? null;
+  const productionSemanticResult = input.records.get(command.result_record_id)?.payload_schema ===
+    "openthrottle.semantic-result-record/v1";
   if (
     !decision || decision.kind !== "decision" ||
     !decision.input_record_ids.includes(command.result_record_id) ||
     !decision.input_record_ids.includes(command.invalid_result_evidence_record_id)
   ) {
     throw new Error("corrected-result settlement must cite its result and invalid evidence");
+  }
+  if (productionSemanticResult && (
+    sessionEvidenceRecordId === null || !decision.input_record_ids.includes(sessionEvidenceRecordId)
+  )) {
+    throw new Error("corrected-result settlement must cite its result, invalid evidence, and session evidence");
   }
   const authorization = exactDecision(input, command.decision_record_id);
   const result = resultForAttempt(input, attempt, command.result_record_id);
@@ -1489,13 +1514,18 @@ function correctAndSettle(input: ReducerInput): AtomicTransitionBundle {
     throw new Error("corrected-result invalid evidence does not match the pending pointer");
   }
   assertExactInvalidResultEvidenceRecord({ attempt, pointer, record: evidence });
+  const sessionEvidence = sessionEvidenceRecordId === null ? null : input.records.get(sessionEvidenceRecordId);
+  if (productionSemanticResult) {
+    if (!sessionEvidence) throw new Error("corrected-result settlement omitted session evidence");
+    assertExactSessionEvidenceRecord({ attempt, record: sessionEvidence });
+  }
   return settleAuthorized(
     input,
     command,
     attempt,
     result.id,
     authorization,
-    [result, authorization.decision],
+    [result, ...(sessionEvidence ? [sessionEvidence] : []), authorization.decision],
   );
 }
 

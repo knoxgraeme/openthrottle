@@ -34,6 +34,13 @@ export const KERNEL_SESSION_EVENT_SCHEMA = "openthrottle.kernel-session-event/v1
 export const ATTEMPT_CHECKPOINT_WIRE_SCHEMA = "openthrottle.attempt-checkpoint-wire/v1" as const;
 export const KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES = 64 * 1024 * 1024;
 export const KERNEL_INTEGRATION_EVIDENCE_MAX_BYTES = KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES;
+export const SESSION_ARTIFACT_DESCRIPTOR_SCHEMA =
+  "openthrottle.session-artifact-descriptor/v1" as const;
+export const OTEL_SESSION_TRANSCRIPT_PAYLOAD_SCHEMA =
+  "openthrottle.otel-session-transcript/v1" as const;
+export const COMPOSED_PROMPT_PAYLOAD_SCHEMA =
+  "openthrottle.composed-prompt/v1" as const;
+export const KERNEL_SESSION_ARTIFACT_MAX_BYTES = 64 * 1024 * 1024;
 
 export function addKernelIntegrationEvidenceBytes(
   aggregateBytes: number,
@@ -71,8 +78,20 @@ export interface KernelCheckpointArtifactDescriptor {
 
 export interface KernelCheckpointArtifactPort {
   materialize(
-    input: KernelCheckpointArtifactDescriptor | EvidenceArtifactDescriptor,
+    input: KernelCheckpointArtifactDescriptor | EvidenceArtifactDescriptor | KernelSessionArtifactDescriptor,
   ): Promise<KernelMaterializedArtifact>;
+}
+
+export interface KernelSessionArtifactDescriptor {
+  schema: typeof SESSION_ARTIFACT_DESCRIPTOR_SCHEMA;
+  file: string;
+  sha256: string;
+  bytes: number;
+  encoding: "utf-8";
+  media_type: "application/json" | "text/plain";
+  payload_schema:
+    | typeof OTEL_SESSION_TRANSCRIPT_PAYLOAD_SCHEMA
+    | typeof COMPOSED_PROMPT_PAYLOAD_SCHEMA;
 }
 
 const DIGEST = /^[a-f0-9]{64}$/;
@@ -151,9 +170,79 @@ export function parseKernelSessionEvent(raw: string, request: KernelRequest): Ke
   };
 }
 
-function semanticResult(value: unknown, schema: SemanticResultSchemaContract) {
+function sessionArtifactDescriptor(
+  value: unknown,
+  kind: "transcript" | "prompt",
+): KernelSessionArtifactDescriptor {
+  const input = object(value, `${kind} artifact`);
+  exactKeys(input, [
+    "schema", "file", "sha256", "bytes", "encoding", "media_type", "payload_schema",
+  ], `${kind} artifact`);
+  const digest = string(input.sha256, `${kind} artifact sha256`, 64);
+  const expected = kind === "transcript"
+    ? {
+      prefix: "transcript",
+      extension: "json",
+      media_type: "application/json" as const,
+      payload_schema: OTEL_SESSION_TRANSCRIPT_PAYLOAD_SCHEMA,
+    }
+    : {
+      prefix: "prompt",
+      extension: "txt",
+      media_type: "text/plain" as const,
+      payload_schema: COMPOSED_PROMPT_PAYLOAD_SCHEMA,
+    };
+  if (
+    input.schema !== SESSION_ARTIFACT_DESCRIPTOR_SCHEMA || !DIGEST.test(digest) ||
+    input.file !== `${expected.prefix}-${digest}.${expected.extension}` ||
+    !Number.isSafeInteger(input.bytes) || (input.bytes as number) < 1 ||
+    (input.bytes as number) > KERNEL_SESSION_ARTIFACT_MAX_BYTES ||
+    input.encoding !== "utf-8" || input.media_type !== expected.media_type ||
+    input.payload_schema !== expected.payload_schema
+  ) throw new Error(`${kind} artifact descriptor is invalid`);
+  return {
+    schema: SESSION_ARTIFACT_DESCRIPTOR_SCHEMA,
+    file: input.file as string,
+    sha256: digest,
+    bytes: input.bytes as number,
+    encoding: "utf-8",
+    media_type: expected.media_type,
+    payload_schema: expected.payload_schema,
+  };
+}
+
+async function sessionEvidence(value: unknown, artifacts: KernelCheckpointArtifactPort) {
+  const input = object(value, "semantic result evidence");
+  exactKeys(input, ["transcript", "prompt_context"], "semantic result evidence");
+  const transcriptDescriptor = sessionArtifactDescriptor(input.transcript, "transcript");
+  const promptDescriptor = sessionArtifactDescriptor(input.prompt_context, "prompt");
+  const [transcript, promptContext] = await Promise.all([
+    artifacts.materialize(transcriptDescriptor),
+    artifacts.materialize(promptDescriptor),
+  ]);
+  if ("blob" in transcript || "blob" in promptContext) {
+    throw new Error("session evidence materialization returned attempt-evidence metadata");
+  }
+  for (const [label, pointer, descriptor] of [
+    ["transcript", transcript, transcriptDescriptor],
+    ["prompt", promptContext, promptDescriptor],
+  ] as const) {
+    if (
+      pointer.digest !== descriptor.sha256 || pointer.bytes !== descriptor.bytes ||
+      pointer.encoding !== descriptor.encoding || pointer.media_type !== descriptor.media_type ||
+      pointer.payload_schema !== descriptor.payload_schema
+    ) throw new Error(`${label} materialization changed its sealed descriptor`);
+  }
+  return { transcript, prompt_context: promptContext };
+}
+
+async function semanticResult(
+  value: unknown,
+  schema: SemanticResultSchemaContract,
+  artifacts: KernelCheckpointArtifactPort,
+) {
   const input = object(value, "semantic result");
-  exactKeys(input, ["kind", "candidate"], "semantic result");
+  exactKeys(input, ["kind", "candidate", "evidence"], "semantic result");
   if (input.kind !== "semantic") throw new Error("semantic result kind is invalid");
   const staged = object(input.candidate, "staged result candidate");
   exactKeys(staged, [
@@ -184,6 +273,7 @@ function semanticResult(value: unknown, schema: SemanticResultSchemaContract) {
       normalized_hash: normalized.normalized_hash,
       transformations: normalized.transformations,
     },
+    evidence: await sessionEvidence(input.evidence, artifacts),
   };
 }
 
@@ -385,12 +475,17 @@ export async function parseKernelRuntimeResult(input: {
   if (outcome.state === "work_complete") {
     exactKeys(outcome, ["state", "checkpoint", "result"], "kernel runtime outcome");
     const result = object(outcome.result, "kernel verified result");
+    const verifiedCheckpoint = await checkpoint(outcome.checkpoint, input.request, input.artifacts);
+    const verifiedResult = result.kind === "semantic"
+      ? await semanticResult(result, semanticSchema(input.request), input.artifacts)
+      : commandResult(result);
+    if (verifiedResult.kind === "semantic" && verifiedCheckpoint.native_session_id === null) {
+      throw new Error("semantic result evidence requires a native session checkpoint");
+    }
     return {
       state: "work_complete",
-      checkpoint: await checkpoint(outcome.checkpoint, input.request, input.artifacts),
-      result: result.kind === "semantic"
-        ? semanticResult(result, semanticSchema(input.request))
-        : commandResult(result),
+      checkpoint: verifiedCheckpoint,
+      result: verifiedResult,
     };
   }
   if (outcome.state === "result_pending") {

@@ -45,6 +45,7 @@ import {
   readBoundedResultFileSync,
   resultSubmissionEnvironment,
 } from "./result-submission.mjs";
+import { SESSION_NATIVE_LOG_MAX_BYTES } from "./session-evidence.mjs";
 
 const CAPTURE_BYTES = 2 * 1024 * 1024;
 const CAPTURE_OMISSION = Buffer.from("\n...[agent output omitted]...\n", "utf8");
@@ -327,6 +328,9 @@ export async function runStreamingAgent({
     let sessionId = null;
     let timedOut = false;
     let callbackFailure = null;
+    const nativeLogChunks = [];
+    let nativeLogBytes = 0;
+    let nativeLogOverflow = false;
     const providerFinalCapture = codexFinalOutputCapture(engine);
     const observeSession = (chunk) => {
       if (sessionId) return;
@@ -339,6 +343,16 @@ export async function runStreamingAgent({
       });
     };
     child.stdout.on("data", (chunk) => {
+      if (!nativeLogOverflow) {
+        const bytes = Buffer.from(chunk);
+        if (nativeLogBytes + bytes.byteLength > SESSION_NATIVE_LOG_MAX_BYTES) {
+          nativeLogOverflow = true;
+          try { process.kill(-child.pid, "SIGKILL"); } catch {}
+        } else {
+          nativeLogChunks.push(bytes);
+          nativeLogBytes += bytes.byteLength;
+        }
+      }
       providerFinalCapture?.write(chunk);
       const text = chunk.toString("utf8");
       stdout = appendBounded(stdout, text);
@@ -371,6 +385,10 @@ export async function runStreamingAgent({
         stdout,
         stderr,
         nativeSessionId: sessionId,
+        rawNativeLog: Buffer.concat(nativeLogChunks, nativeLogBytes),
+        ...(nativeLogOverflow
+          ? { error: new Error(`native session log exceeded ${SESSION_NATIVE_LOG_MAX_BYTES} bytes`) }
+          : {}),
         ...(providerFinalCapture === null
           ? {}
           : { providerFinalOutputFallback: providerFinalCapture.end() }),

@@ -3,6 +3,7 @@ import {
   EVIDENCE_ARTIFACT_DESCRIPTOR_SCHEMA,
   INVALID_RESULT_EVIDENCE_PAYLOAD_SCHEMA,
   canonicalJson,
+  digestCanonicalJson,
   type EvidenceArtifactDescriptor,
 } from "@openthrottle/contracts";
 import {
@@ -12,7 +13,10 @@ import {
 } from "./kernel-contracts.js";
 import {
   ATTEMPT_CHECKPOINT_WIRE_SCHEMA,
+  COMPOSED_PROMPT_PAYLOAD_SCHEMA,
   KERNEL_RUNTIME_RESULT_SCHEMA,
+  OTEL_SESSION_TRANSCRIPT_PAYLOAD_SCHEMA,
+  SESSION_ARTIFACT_DESCRIPTOR_SCHEMA,
   parseKernelRuntimeResult,
   type KernelCheckpointArtifactDescriptor,
 } from "./kernel-wire.js";
@@ -54,7 +58,7 @@ function correctionRequest(
       schema: "openthrottle.semantic-result-schema/v1",
       id: "result-schema",
       outcomes: ["success"],
-      payload: {},
+      payload: { summary: { type: "string", max_length: 100 } },
     },
     execution_limits: { max_turns: null, task_timeout_seconds: 900 },
     repository_authority: "inspect",
@@ -137,6 +141,89 @@ function artifacts() {
   };
 }
 
+function semanticRuntimeResult(request: KernelResultCorrectionRequest, includeEvidence = true): string {
+  const original = {
+    schema: "openthrottle.result-candidate/v1",
+    outcome: "success",
+    payload: { summary: "done" },
+  };
+  const descriptor = (
+    kind: "transcript" | "prompt",
+    digest: string,
+  ) => ({
+    schema: SESSION_ARTIFACT_DESCRIPTOR_SCHEMA,
+    file: `${kind}-${digest}.${kind === "transcript" ? "json" : "txt"}`,
+    sha256: digest,
+    bytes: 1,
+    encoding: "utf-8",
+    media_type: kind === "transcript" ? "application/json" : "text/plain",
+    payload_schema: kind === "transcript"
+      ? OTEL_SESSION_TRANSCRIPT_PAYLOAD_SCHEMA
+      : COMPOSED_PROMPT_PAYLOAD_SCHEMA,
+  });
+  const result: Record<string, unknown> = {
+    kind: "semantic",
+    candidate: {
+      schema: "openthrottle.staged-result-candidate/v1",
+      semantic_schema_id: request.semantic_result_schema.id,
+      original,
+      original_hash: digestCanonicalJson(original),
+      candidate: original,
+      normalized_hash: digestCanonicalJson(original),
+      transformations: [],
+    },
+  };
+  if (includeEvidence) {
+    result.evidence = {
+      transcript: descriptor("transcript", "1".repeat(64)),
+      prompt_context: descriptor("prompt", "2".repeat(64)),
+    };
+  }
+  return JSON.stringify({
+    schema: KERNEL_RUNTIME_RESULT_SCHEMA,
+    pipeline_run_id: request.pipeline_run_id,
+    attempt_id: request.attempt_id,
+    request_hash: request.request_hash,
+    definition_bundle_hash: request.definition_bundle_hash,
+    lease_id: request.lease_id,
+    worker_id: request.worker_id,
+    outcome: {
+      state: "work_complete",
+      checkpoint: correctionCheckpoint(request, null),
+      result,
+    },
+  });
+}
+
+function semanticArtifacts() {
+  return {
+    materialize: vi.fn(async (descriptor: KernelCheckpointArtifactDescriptor | {
+      schema: typeof SESSION_ARTIFACT_DESCRIPTOR_SCHEMA;
+      sha256: string;
+      bytes: number;
+      encoding: "utf-8";
+      media_type: "application/json" | "text/plain";
+      payload_schema: string;
+    }) => "schema" in descriptor
+      ? {
+        algorithm: "sha256" as const,
+        digest: descriptor.sha256,
+        bytes: descriptor.bytes,
+        encoding: descriptor.encoding,
+        media_type: descriptor.media_type,
+        payload_schema: descriptor.payload_schema,
+      }
+      : {
+        algorithm: "sha256" as const,
+        digest: ARTIFACT_DIGEST,
+        bytes: 1,
+        encoding: "binary" as const,
+        media_type: "application/x-git-bundle",
+        payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+      }),
+  };
+}
+
 const PENDING_CANDIDATE_HASH = "e".repeat(64);
 const PENDING_DIAGNOSTICS = [
   { path: "/payload/zeta", detail: "must be a string" },
@@ -214,6 +301,35 @@ function pendingResultFixture(input: {
 }
 
 describe("kernel correction checkpoint wire fencing", () => {
+  it("rejects a semantic result without transcript and exact-prompt evidence", async () => {
+    const request = correctionRequest("inspect");
+    await expect(parseKernelRuntimeResult({
+      raw: semanticRuntimeResult(request, false),
+      request,
+      artifacts: semanticArtifacts() as never,
+    })).rejects.toThrow(/unknown or missing fields/);
+  });
+
+  it("materializes both sealed session artifacts for a semantic result", async () => {
+    const request = correctionRequest("inspect");
+    const artifactPort = semanticArtifacts();
+    await expect(parseKernelRuntimeResult({
+      raw: semanticRuntimeResult(request),
+      request,
+      artifacts: artifactPort as never,
+    })).resolves.toMatchObject({
+      state: "work_complete",
+      result: {
+        kind: "semantic",
+        evidence: {
+          transcript: { digest: "1".repeat(64) },
+          prompt_context: { digest: "2".repeat(64) },
+        },
+      },
+    });
+    expect(artifactPort.materialize).toHaveBeenCalledTimes(3);
+  });
+
   it("uses the versioned executor protocol that requires sealed limits and bootstrap commands", () => {
     expect(KERNEL_ACTION_REQUEST_SCHEMA).toBe("openthrottle.kernel-action-request/v2");
     expect(KERNEL_RESULT_CORRECTION_REQUEST_SCHEMA)

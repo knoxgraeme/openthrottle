@@ -50,9 +50,12 @@ import type {
 import {
   addKernelIntegrationEvidenceBytes,
   KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES,
+  KERNEL_SESSION_ARTIFACT_MAX_BYTES,
+  SESSION_ARTIFACT_DESCRIPTOR_SCHEMA,
   parseKernelRuntimeResult,
   parseKernelSessionEvent,
   type KernelCheckpointArtifactDescriptor,
+  type KernelSessionArtifactDescriptor,
 } from "../../runtime/kernel-wire.js";
 import {
   inspectKernelCheckpointBundle,
@@ -1446,18 +1449,38 @@ export class DaytonaKernelAdapter implements
     sandbox: Sandbox,
     request: KernelWorkActionRequest | KernelResultCorrectionRequest,
     resultDirectory: string,
-    descriptor: KernelCheckpointArtifactDescriptor | EvidenceArtifactDescriptor,
+    descriptor: KernelCheckpointArtifactDescriptor | EvidenceArtifactDescriptor | KernelSessionArtifactDescriptor,
     launch: Pick<KernelRuntimeLeaseCallbacks, "lease_generation" | "work_retry_ordinal">,
   ) {
     const bytes = await sandbox.fs.downloadFile(`${resultDirectory}/${descriptor.file}`);
     if (
       bytes.byteLength !== descriptor.bytes ||
       bytes.byteLength > ("schema" in descriptor
-        ? EVIDENCE_ARTIFACT_MAX_BYTES
+        ? descriptor.schema === SESSION_ARTIFACT_DESCRIPTOR_SCHEMA
+          ? KERNEL_SESSION_ARTIFACT_MAX_BYTES
+          : EVIDENCE_ARTIFACT_MAX_BYTES
         : KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES) ||
       createHash("sha256").update(bytes).digest("hex") !== descriptor.sha256
     ) throw new Error(`artifact for ${request.attempt_id} failed its sealed descriptor`);
     if ("schema" in descriptor) {
+      if (descriptor.schema === SESSION_ARTIFACT_DESCRIPTOR_SCHEMA) {
+        if (!Buffer.from(bytes.toString("utf8"), "utf8").equals(bytes)) {
+          throw new Error("session artifact is not exact UTF-8 bytes");
+        }
+        if (descriptor.media_type === "application/json") {
+          const trace = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>;
+          if (!Array.isArray(trace.resourceSpans) || trace.resourceSpans.length !== 1) {
+            throw new Error("session transcript is not one OTLP trace resource");
+          }
+        }
+        return this.#options.blob_store.put({
+          bytes,
+          encoding: descriptor.encoding,
+          media_type: descriptor.media_type,
+          payload_schema: descriptor.payload_schema,
+          expected_digest: descriptor.sha256,
+        }).pointer;
+      }
       const value = JSON.parse(bytes.toString("utf8"));
       if (descriptor.payload_schema === ATTEMPT_FORENSICS_PAYLOAD_SCHEMA) {
         const payload = validateAttemptForensicsPayload(value, {

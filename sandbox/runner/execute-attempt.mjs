@@ -55,6 +55,11 @@ import {
   submitProviderResultCandidate,
 } from "./result-submission.mjs";
 import { reclaimSettledAttemptScratch } from "./scratch-reclamation.mjs";
+import {
+  captureComposedPrompt,
+  captureNativeSessionLog,
+  stageSessionEvidence,
+} from "./session-evidence.mjs";
 
 export const KERNEL_RUNTIME_RESULT_SCHEMA = "openthrottle.kernel-runtime-result/v1";
 export const KERNEL_SESSION_EVENT_SCHEMA = "openthrottle.kernel-session-event/v1";
@@ -278,12 +283,15 @@ function correctionDeadline(now) {
   return new Date(now.getTime() + RESULT_CORRECTION_WINDOW_MS).toISOString();
 }
 
-function semanticOutcome({ candidate, checkpoint, deadline, invalidResultEvidence }) {
+function semanticOutcome({ candidate, checkpoint, deadline, invalidResultEvidence, sessionEvidence }) {
   if (candidate.status === "valid") {
+    if (sessionEvidence === null) {
+      throw new Error("semantic result is missing transcript and prompt evidence");
+    }
     return {
       state: "work_complete",
       checkpoint,
-      result: { kind: "semantic", candidate: candidate.staged },
+      result: { kind: "semantic", candidate: candidate.staged, evidence: sessionEvidence },
     };
   }
   return {
@@ -656,6 +664,25 @@ async function executeAgentWork(options, actionDirectory) {
         0o444,
       );
     };
+    try {
+      prepared = prepareAgentRuntime({
+        request: runtimeRequest,
+        actionDirectory,
+        channel,
+        env: options.runAgent
+          ? {
+            ...options.env,
+            OT_LEASE_GENERATION_FENCE_FILE: options.env?.OT_LEASE_GENERATION_FENCE_FILE ??
+              join(actionDirectory, "test-lease-generation.json"),
+            OT_LEASE_GENERATION_LOCK_FILE: options.env?.OT_LEASE_GENERATION_LOCK_FILE ??
+              join(actionDirectory, "test-lease-generation.lock"),
+          }
+          : options.env,
+      });
+      captureComposedPrompt(actionDirectory, Buffer.from(prepared.prompt, "utf8"));
+    } catch (error) {
+      return runtimeEnvelope(request, agentPreparationException(error, options.env));
+    }
     if (options.runAgent) {
       try {
         execution = await options.runAgent({
@@ -666,16 +693,12 @@ async function executeAgentWork(options, actionDirectory) {
           onSession,
           timeoutMs: timeoutMilliseconds(request.action.execution_limits),
           env: options.env,
+          promptBytes: Buffer.from(prepared.prompt, "utf8"),
         });
       } catch (error) {
         return runtimeEnvelope(request, agentLaunchException(error, options.env));
       }
     } else {
-      try {
-        prepared = prepareAgentRuntime({ request: runtimeRequest, actionDirectory, channel, env: options.env });
-      } catch (error) {
-        return runtimeEnvelope(request, agentPreparationException(error, options.env));
-      }
       try {
         execution = await options.runPreparedAgent({
           prepared,
@@ -687,6 +710,10 @@ async function executeAgentWork(options, actionDirectory) {
       } catch (error) {
         return runtimeEnvelope(request, agentPreparedRuntimeException(error, options.env));
       }
+    }
+    const nativeLog = execution.rawNativeLog ?? Buffer.from(String(execution.stdout ?? ""), "utf8");
+    if (nativeLog.byteLength > 0) {
+      captureNativeSessionLog(actionDirectory, "work", request.lease_id, nativeLog);
     }
     if (execution.nativeSessionId && observedSessions.length === 0) await onSession(execution.nativeSessionId);
     if (inspectChangeArtifact !== null) verifyInspectChangeArtifact(inspectChangeArtifact);
@@ -762,11 +789,22 @@ async function executeAgentWork(options, actionDirectory) {
     resultPath,
     observedAt: options.now().toISOString(),
   });
+  const sessionEvidence = candidate.status === "valid"
+    ? stageSessionEvidence({
+      request,
+      nativeSessionId: execution.nativeSessionId,
+      actionDirectory,
+      artifactDirectory,
+      resultPath,
+      capturedAt: options.now().toISOString(),
+    })
+    : null;
   return runtimeEnvelope(request, semanticOutcome({
     candidate,
     checkpoint,
     deadline: correctionDeadline(options.now()),
     invalidResultEvidence,
+    sessionEvidence,
   }));
 }
 
@@ -864,6 +902,10 @@ async function executeCorrection(options, actionDirectory) {
       timeoutMs,
     });
   }
+  const nativeLog = execution.rawNativeLog ?? Buffer.from(String(execution.stdout ?? ""), "utf8");
+  if (nativeLog.byteLength > 0) {
+    captureNativeSessionLog(actionDirectory, "result_correction", request.lease_id, nativeLog);
+  }
   if (options.now().getTime() >= deadline) {
     stageCheckpointArtifact(checkpoint, artifactDirectory, resultPath);
     return runtimeEnvelope(request, {
@@ -898,11 +940,22 @@ async function executeCorrection(options, actionDirectory) {
     resultPath,
     observedAt: options.now().toISOString(),
   });
+  const sessionEvidence = candidate.status === "valid"
+    ? stageSessionEvidence({
+      request,
+      nativeSessionId: request.native_session_id,
+      actionDirectory,
+      artifactDirectory,
+      resultPath,
+      capturedAt: options.now().toISOString(),
+    })
+    : null;
   return runtimeEnvelope(request, semanticOutcome({
     candidate,
     checkpoint,
     deadline: request.correction_deadline,
     invalidResultEvidence,
+    sessionEvidence,
   }));
 }
 

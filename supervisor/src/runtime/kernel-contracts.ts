@@ -147,8 +147,17 @@ export interface KernelCommandResult {
 }
 
 export type KernelVerifiedActionResult =
-  | { kind: "semantic"; candidate: StagedSemanticCandidate }
+  | {
+    kind: "semantic";
+    candidate: StagedSemanticCandidate;
+    evidence: KernelSessionEvidence;
+  }
   | KernelCommandResult;
+
+export interface KernelSessionEvidence {
+  transcript: BlobPointer;
+  prompt_context: BlobPointer;
+}
 
 export interface KernelAttemptForensicsEvidence {
   blob: BlobPointer;

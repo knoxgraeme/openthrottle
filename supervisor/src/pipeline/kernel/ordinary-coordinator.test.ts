@@ -49,6 +49,7 @@ import type {
   KernelRuntimeLeaseCallbacks,
   KernelRuntimeOutcome,
   KernelRuntimePort,
+  KernelSessionEvidence,
   KernelRuntimeWorkCallbacks,
   KernelWorkActionRequest,
   StagedSemanticCandidate,
@@ -77,6 +78,10 @@ import {
   type KernelAttempt,
   type KernelRun,
 } from "./types.js";
+import {
+  COMPOSED_PROMPT_PAYLOAD_SCHEMA,
+  OTEL_SESSION_TRANSCRIPT_PAYLOAD_SCHEMA,
+} from "./session-evidence.js";
 
 const NOW = "2026-08-20T12:00:00.000Z";
 const SOURCE = "1".repeat(40);
@@ -86,6 +91,27 @@ const CAPABILITY = "c".repeat(64);
 const EXECUTION_POLICY = Object.freeze({ max_concurrent_attempts: 1 });
 const EXECUTION_POLICY_TWO = Object.freeze({ max_concurrent_attempts: 2 });
 const temporaryDirectories: string[] = [];
+
+function runtimeSessionEvidence(): KernelSessionEvidence {
+  return {
+    transcript: {
+      algorithm: "sha256",
+      digest: "7".repeat(64),
+      bytes: 1,
+      encoding: "utf-8",
+      media_type: "application/json",
+      payload_schema: OTEL_SESSION_TRANSCRIPT_PAYLOAD_SCHEMA,
+    },
+    prompt_context: {
+      algorithm: "sha256",
+      digest: "8".repeat(64),
+      bytes: 1,
+      encoding: "utf-8",
+      media_type: "text/plain",
+      payload_schema: COMPOSED_PROMPT_PAYLOAD_SCHEMA,
+    },
+  };
+}
 
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
@@ -404,6 +430,7 @@ class RuntimeFixture implements KernelRuntimePort {
       checkpoint,
       result: {
         kind: "semantic",
+        evidence: runtimeSessionEvidence(),
         candidate: request.stage_id.includes("review")
           ? reviewCandidate(this.blockingReview ? [{
             severity: "P1",
@@ -446,7 +473,11 @@ class RuntimeFixture implements KernelRuntimePort {
         },
         captured_at: NOW,
       },
-      result: { kind: "semantic", candidate: actionCandidate("corrected result only") },
+      result: {
+        kind: "semantic",
+        candidate: actionCandidate("corrected result only"),
+        evidence: runtimeSessionEvidence(),
+      },
     };
   }
 }
@@ -1522,7 +1553,7 @@ describe("ordinary kernel activation", () => {
         context_record_ids_json: string;
         context_checkpoint_ids_json: string;
       };
-      expect(JSON.parse(scheduled.context_record_ids_json)).toHaveLength(2);
+      expect(JSON.parse(scheduled.context_record_ids_json)).toHaveLength(3);
       expect(JSON.parse(scheduled.context_checkpoint_ids_json)).toEqual([
         "checkpoint-attempt-initial",
       ]);
@@ -1557,7 +1588,8 @@ describe("ordinary kernel activation", () => {
       expect(persisted.task_prompt).toBe(
         "Implement the approved plan and preserve its verified behavior.",
       );
-      expect(context.records.map(({ kind }) => kind).sort()).toEqual(["decision", "result"]);
+      expect(context.records.map(({ kind }) => kind).sort())
+        .toEqual(["decision", "decision", "result"]);
       expect(context.checkpoints.map(({ id }) => id)).toEqual(["checkpoint-attempt-initial"]);
       expect(kernelAttemptRequestHash({
         pipeline_run_id: active.run_id,
@@ -2070,10 +2102,14 @@ describe("ordinary kernel activation", () => {
         record.kind === "decision" && record.reducer === "core/invalid-result-evidence@1")!;
       const correctedResult = settlement!.append_records.find((record) => record.kind === "result")!;
       const decision = settlement!.append_records.find((record): record is DecisionRecord =>
-        record.kind === "decision")!;
+        record.kind === "decision" && record.reducer !== "core/session-evidence@1")!;
       expect(pending!.append_records).toEqual([invalidEvidence]);
-      expect(settlement!.append_records).toHaveLength(2);
+      expect(settlement!.append_records).toHaveLength(3);
       expect(settlement!.append_records).not.toContainEqual(invalidEvidence);
+      expect(settlement!.append_records).toContainEqual(expect.objectContaining({
+        kind: "decision",
+        reducer: "core/session-evidence@1",
+      }));
       expect(decision.input_record_ids).toEqual(expect.arrayContaining([
         invalidEvidence.id,
         correctedResult.id,
@@ -2421,10 +2457,11 @@ describe("ordinary kernel activation", () => {
         context_checkpoint_ids_json: '["checkpoint-attempt-initial"]',
       });
       expect(repair.id).not.toBe(reviewAttempt.id);
-      expect(JSON.parse(repair.context_record_ids_json)).toEqual([
+      expect(JSON.parse(repair.context_record_ids_json)).toEqual(expect.arrayContaining([
         reviewAttempt.decision_record_id,
         reviewAttempt.result_record_id,
-      ].sort());
+      ]));
+      expect(JSON.parse(repair.context_record_ids_json)).toHaveLength(4);
       const review = test.runtime.workRequests[1]!;
       expect(review.repository_authority).toBe("inspect");
       expect(review.change_boundary?.output_subject).toBe(IMPLEMENTED);
@@ -2445,10 +2482,11 @@ describe("ordinary kernel activation", () => {
         expect(repairRequest.action.definition_entries.map(({ definition_id }) => definition_id))
           .toEqual(["core/ordinary-worker", "core/repair-unit", "core/action-result"]);
       }
-      expect(repairRequest.context.records.map(({ id }) => id)).toEqual([
+      expect(repairRequest.context.records.map(({ id }) => id)).toEqual(expect.arrayContaining([
         reviewAttempt.decision_record_id,
         reviewAttempt.result_record_id,
-      ].sort());
+      ]));
+      expect(repairRequest.context.records).toHaveLength(4);
       expect(repairRequest.context.checkpoints.map(({ id }) => id))
         .toEqual(["checkpoint-attempt-initial"]);
       const boundRepair = test.db.prepare(`

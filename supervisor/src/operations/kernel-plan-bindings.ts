@@ -41,6 +41,10 @@ import {
   kernelRuntimePoolSize,
   resolveKernelRuntimeResourceSlot,
 } from "../pipeline/kernel/runtime-resource.js";
+import {
+  parseSessionEvidenceRecordPayload,
+  sessionEvidenceRecords,
+} from "../pipeline/kernel/session-evidence.js";
 
 const GIT_BUNDLE_SCHEMA = "openthrottle.git-checkpoint-bundle/v1" as const;
 
@@ -102,6 +106,37 @@ function runtimePoolMembers(input: {
 function branch(runId: string, sourceReference: string): string {
   const slug = sourceReference.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 80) || "task";
   return `ot/${slug}-${digestCanonicalJson({ run_id: runId }).slice(0, 12)}`;
+}
+
+export function sessionTranscriptIndex(
+  records: Iterable<ExecutionRecord>,
+  blobs: Pick<VolumeBlobStore, "read">,
+): string {
+  const entries = sessionEvidenceRecords(records).map((record) => {
+    if (!("inline" in record.payload)) {
+      throw new Error("session evidence index requires materialized inline records");
+    }
+    const payload = parseSessionEvidenceRecordPayload(
+      record.payload.inline,
+      `record:${record.id}.payload.inline`,
+    );
+    blobs.read(payload.transcript);
+    blobs.read(payload.prompt_context);
+    return payload;
+  }).sort((left, right) =>
+    compareCodeUnits(left.attempt_id, right.attempt_id));
+  if (new Set(entries.map(({ attempt_id }) => attempt_id)).size !== entries.length) {
+    throw new Error("session transcript index contains duplicate Attempt evidence");
+  }
+  if (entries.length === 0) {
+    throw new Error("publication requires at least one verified session transcript");
+  }
+  return [
+    "## Session transcripts",
+    "",
+    ...entries.map((entry) =>
+      `- stage=${entry.stage_id} session=${entry.native_session_id} transcript=sha256:${entry.transcript.digest}`),
+  ].join("\n");
 }
 
 interface PublicationAnchor {
@@ -567,7 +602,7 @@ export function createKernelExternalPlanBindings(input: {
         ],
       };
     },
-    async promote({ run, attempt, prepared, schedules }) {
+    async promote({ run, attempt, context, prepared, schedules }) {
       const delivery = schedules[0]?.effects[0]?.delivery;
       if (!delivery || delivery.status !== "confirmed") {
         throw new Error("publication promotion lacks confirmed compaction delivery");
@@ -613,6 +648,7 @@ export function createKernelExternalPlanBindings(input: {
       const artifact = descriptor(input.blob_store, checkpoint, publicationParent, {
         expected_parent: publicationParent,
       });
+      const transcriptIndex = sessionTranscriptIndex(context.records.values(), input.blob_store);
       const promoted: KernelPreparedExternalPlan = {
         ...prepared,
         verified_output_subject: output,
@@ -649,7 +685,10 @@ export function createKernelExternalPlanBindings(input: {
               base_branch: environment.base_branch,
               expected_head_subject: output,
               title: environment.title.slice(0, 256),
-              body: `OpenThrottle execution ${run.id} for ${environment.source_reference}.`,
+              body: [
+                `OpenThrottle execution ${run.id} for ${environment.source_reference}.`,
+                transcriptIndex,
+              ].join("\n\n"),
               ownership_marker: `openthrottle:run:${digestCanonicalJson({ run_id: run.id })}`,
             },
           }],

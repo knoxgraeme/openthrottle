@@ -28,6 +28,7 @@ import {
   exactConfirmedGithubPushDelivery,
   isGithubPushDelivery,
 } from "./github-push-delivery.js";
+import { sessionEvidenceRecords } from "./session-evidence.js";
 
 export function mergeCausalGithubPushContext(input: {
   pipeline_run_id: string;
@@ -58,6 +59,7 @@ export function mergeCausalGithubPushContext(input: {
   const selected = override ?? inherited;
   return [...new Map([
     ...input.base_records.filter((record) => !isGithubPushDelivery(record)),
+    ...sessionEvidenceRecords(input.inherited_records),
     ...additional.filter((record) => !isGithubPushDelivery(record)),
     ...(selected === null ? [] : [selected.record]),
   ].map((record) => [record.id, record])).values()]

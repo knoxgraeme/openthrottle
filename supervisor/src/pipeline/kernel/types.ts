@@ -200,6 +200,8 @@ export interface WorkCompleteCommand extends KernelCommandBase {
   verified_output_subject: string | null;
   /** Verified runtime evidence persisted in the same transition as successful work. */
   result_record_id: string | null;
+  /** Required whenever result_record_id identifies a semantic agent result. */
+  session_evidence_record_id?: string | null;
 }
 
 export interface ResultPendingCommand extends KernelCommandBase {
@@ -268,6 +270,7 @@ export interface CorrectAndSettleAttemptCommand extends KernelCommandBase, Settl
   type: "correct_and_settle";
   result_record_id: string;
   invalid_result_evidence_record_id: string;
+  session_evidence_record_id?: string;
 }
 
 export interface RetryAttemptCommand extends KernelCommandBase {

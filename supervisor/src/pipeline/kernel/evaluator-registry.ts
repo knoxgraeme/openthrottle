@@ -25,6 +25,10 @@ import type {
   StagedSemanticCandidate,
 } from "../../runtime/kernel-contracts.js";
 import type { KernelAttempt } from "./types.js";
+import {
+  SESSION_EVIDENCE_RECORD_PAYLOAD_CONTRACT,
+  SESSION_EVIDENCE_RECORD_PAYLOAD_SCHEMA,
+} from "./session-evidence.js";
 
 export const SEMANTIC_RESULT_RECORD_PAYLOAD_SCHEMA =
   "openthrottle.semantic-result-record/v1" as const;
@@ -148,6 +152,7 @@ const payloadContracts: readonly [string, ExecutionRecordPayloadContract][] = [
   }],
   [ATTEMPT_FORENSICS_PAYLOAD_SCHEMA, ATTEMPT_FORENSICS_PAYLOAD_CONTRACT],
   [INVALID_RESULT_EVIDENCE_PAYLOAD_SCHEMA, INVALID_RESULT_EVIDENCE_PAYLOAD_CONTRACT],
+  [SESSION_EVIDENCE_RECORD_PAYLOAD_SCHEMA, SESSION_EVIDENCE_RECORD_PAYLOAD_CONTRACT],
 ];
 
 export function ordinaryKernelPayloadSchemas(): ExecutionRecordPayloadRegistry {

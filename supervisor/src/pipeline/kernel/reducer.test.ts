@@ -1059,6 +1059,29 @@ describe("shared execution kernel lifecycle", () => {
     })).toThrow(/bind its native session before checkpointing/);
 
     const bound = { ...unbound, native_session_id: "session-1" };
+    const semanticResult = {
+      ...resultRecord({ ...bound, output_subject: subject("2") }),
+      payload_schema: "openthrottle.semantic-result-record/v1",
+      payload: { inline: {
+        schema: "openthrottle.semantic-result-record/v1",
+        outcome: "success",
+        payload: { summary: "done" },
+      } },
+    } as ResultRecord;
+    expect(() => reduce({
+      current: bound,
+      command: {
+        type: "work_complete",
+        command_id: "semantic-without-session-evidence",
+        attempt_id: bound.id,
+        checkpoint_id: "checkpoint-1",
+        verified_output_subject: subject("2"),
+        result_record_id: semanticResult.id,
+      },
+      checkpoints: [checkpoint(bound, subject("2"))],
+      records: [semanticResult],
+    })).toThrow(/semantic work completion requires session evidence/);
+
     expect(() => reduce({
       current: bound,
       command: {

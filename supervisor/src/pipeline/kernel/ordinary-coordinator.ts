@@ -80,6 +80,11 @@ import {
   createInvalidResultEvidenceRecord,
   invalidResultEvidenceRecordId,
 } from "./attempt-evidence.js";
+import {
+  assertExactSessionEvidenceRecord,
+  createSessionEvidenceRecord,
+  sessionEvidenceRecordId,
+} from "./session-evidence.js";
 import { stageFor } from "./reducer-support.js";
 
 export interface OrdinaryKernelStore extends
@@ -265,15 +270,24 @@ export class OrdinaryKernelCoordinator {
       !attempt || (attempt.status !== "work_complete" && attempt.status !== "recorded") ||
       attempt.checkpoint_id === null || attempt.result_record_id === null
     ) throw new Error("ordinary continuation candidate is incomplete");
+    const continuationStage = stageFor(view.manifest, attempt.scope.stage_id);
+    const sessionEvidenceId = continuationStage.kind === "agent"
+      ? sessionEvidenceRecordId(attempt)
+      : null;
     view = await this.#load(
       view.run.id,
       attempt.id,
-      [attempt.result_record_id],
+      [attempt.result_record_id, ...(sessionEvidenceId === null ? [] : [sessionEvidenceId])],
       [attempt.checkpoint_id],
     );
     const result = view.records.get(attempt.result_record_id);
     if (!result || result.kind !== "result") {
       throw new Error(`ordinary continuation ${attempt.id} has no exact ResultRecord`);
+    }
+    const sessionEvidence = sessionEvidenceId === null ? null : view.records.get(sessionEvidenceId);
+    if (sessionEvidenceId !== null) {
+      if (!sessionEvidence) throw new Error(`ordinary continuation ${attempt.id} has no session evidence`);
+      assertExactSessionEvidenceRecord({ attempt, record: sessionEvidence });
     }
     const bundle = await this.#bundles.resolveExactDefinitionBundle({
       pipeline_run_id: view.run.id,
@@ -281,7 +295,7 @@ export class OrdinaryKernelCoordinator {
     });
     const { stage, evaluated } = this.#evaluateResultRecord({ view, bundle, record: result });
     if (attempt.status === "work_complete") {
-      await this.#apply(view, {
+      await this.#apply({ ...view, records: new Map([[result.id, result]]) }, {
         type: "record",
         command_id: transitionId("record", { attempt: attempt.id, record: result.id }),
         attempt_id: attempt.id,
@@ -290,11 +304,18 @@ export class OrdinaryKernelCoordinator {
       view = await this.#load(
         view.run.id,
         attempt.id,
-        [result.id],
+        [result.id, ...(sessionEvidenceId === null ? [] : [sessionEvidenceId])],
         [attempt.checkpoint_id],
       );
     }
-    return this.#settleRecorded({ view, bundle, record: result, stage, evaluated });
+    return this.#settleRecorded({
+      view,
+      bundle,
+      record: result,
+      stage,
+      evaluated,
+      sessionEvidence: sessionEvidence?.kind === "decision" ? sessionEvidence : null,
+    });
   }
 
   async terminalizeExhaustedRecovery(
@@ -658,6 +679,7 @@ export class OrdinaryKernelCoordinator {
 
     let completedResult: {
       record: ResultRecord;
+      sessionEvidence: DecisionRecord | null;
       stage: Exclude<CompiledPipelineStage, { kind: "effect" | "wait" }>;
       evaluated: EvaluatedKernelResult;
     } | null = null;
@@ -681,6 +703,7 @@ export class OrdinaryKernelCoordinator {
         input.outcome.checkpoint,
         input.claim,
         completedResult.record,
+        completedResult.sessionEvidence,
       );
     } else if (input.outcome.checkpoint !== null) {
       await this.#completeWork(input.view, input.outcome.checkpoint, input.claim);
@@ -946,12 +969,18 @@ export class OrdinaryKernelCoordinator {
         });
       }
       const evidence = await this.#loadInvalidResultEvidenceRecord(attempt, pendingEvidence);
+      if (completed.sessionEvidence === null) {
+        throw new Error("corrected semantic result omitted session evidence");
+      }
       return this.#correctAndSettle({
         view: input.view,
         bundle: input.bundle,
         checkpoint: input.checkpoint,
         evidence,
-        ...completed,
+        record: completed.record,
+        stage: completed.stage,
+        evaluated: completed.evaluated,
+        sessionEvidence: completed.sessionEvidence,
         claim: input.claim,
       });
     }
@@ -1088,11 +1117,14 @@ export class OrdinaryKernelCoordinator {
     checkpoint: AttemptCheckpoint,
     claim: AttemptLeaseClaim,
     record?: ResultRecord,
+    sessionEvidence?: DecisionRecord | null,
   ): Promise<void> {
     const attempt = view.current_attempt!;
     const checkpointView: ReductionView = {
       ...view,
-      records: record === undefined ? view.records : mapWith(view.records, record),
+      records: record === undefined
+        ? view.records
+        : mapWith(view.records, record, ...(sessionEvidence ? [sessionEvidence] : [])),
       checkpoints: mapWith(view.checkpoints, checkpoint),
     };
     await this.#apply(checkpointView, {
@@ -1105,6 +1137,7 @@ export class OrdinaryKernelCoordinator {
       checkpoint_id: checkpoint.id,
       verified_output_subject: checkpoint.output_subject,
       result_record_id: record?.id ?? null,
+      session_evidence_record_id: sessionEvidence?.id ?? null,
     }, claim);
   }
 
@@ -1114,6 +1147,7 @@ export class OrdinaryKernelCoordinator {
     result: KernelVerifiedActionResult;
   }): {
     record: ResultRecord;
+    sessionEvidence: DecisionRecord | null;
     stage: Exclude<CompiledPipelineStage, { kind: "effect" | "wait" }>;
     evaluated: EvaluatedKernelResult;
   } {
@@ -1126,6 +1160,7 @@ export class OrdinaryKernelCoordinator {
       attempt,
     });
     let record: ResultRecord;
+    let sessionEvidence: DecisionRecord | null = null;
     let evaluated: EvaluatedKernelResult;
     if (stage.kind === "agent") {
       if (input.result.kind !== "semantic" || selected.action.kind !== "agent") {
@@ -1144,6 +1179,11 @@ export class OrdinaryKernelCoordinator {
         evaluation,
         created_at: this.#now(),
       });
+      sessionEvidence = createSessionEvidenceRecord({
+        attempt,
+        evidence: input.result.evidence,
+        created_at: this.#now(),
+      });
       evaluated = this.#evaluators.evaluateSemantic({ stage, evaluation, result: record });
     } else if (stage.kind === "command") {
       if (input.result.kind !== "command") {
@@ -1159,7 +1199,7 @@ export class OrdinaryKernelCoordinator {
     } else {
       throw new Error(`stage ${stage.id} is not an ordinary executable action`);
     }
-    return { record, stage, evaluated };
+    return { record, sessionEvidence, stage, evaluated };
   }
 
   #evaluateResultRecord(input: {
@@ -1202,6 +1242,7 @@ export class OrdinaryKernelCoordinator {
     record: ResultRecord;
     stage: Exclude<CompiledPipelineStage, { kind: "effect" | "wait" }>;
     evaluated: EvaluatedKernelResult;
+    sessionEvidence: DecisionRecord | null;
     claim?: AttemptLeaseClaim;
   }): Promise<OrdinaryKernelStep> {
     const attempt = input.view.current_attempt!;
@@ -1226,7 +1267,12 @@ export class OrdinaryKernelCoordinator {
     }, input.claim);
 
     const checkpoint = recordView.checkpoints.get(checkpointId)!;
-    const recorded = await this.#load(input.view.run.id, attempt.id, [input.record.id], [checkpointId]);
+    const recorded = await this.#load(
+      input.view.run.id,
+      attempt.id,
+      [input.record.id, ...(input.sessionEvidence === null ? [] : [input.sessionEvidence.id])],
+      [checkpointId],
+    );
     return this.#settleRecorded({
       view: recorded,
       bundle: input.bundle,
@@ -1234,6 +1280,7 @@ export class OrdinaryKernelCoordinator {
       stage: input.stage,
       evaluated: input.evaluated,
       checkpoint,
+      sessionEvidence: input.sessionEvidence ?? null,
     });
   }
 
@@ -1244,6 +1291,7 @@ export class OrdinaryKernelCoordinator {
     stage: Exclude<CompiledPipelineStage, { kind: "effect" | "wait" }>;
     evaluated: EvaluatedKernelResult;
     checkpoint?: AttemptCheckpoint;
+    sessionEvidence: DecisionRecord | null;
   }): Promise<OrdinaryKernelStep> {
     let recorded = input.view;
     while (true) {
@@ -1261,7 +1309,7 @@ export class OrdinaryKernelCoordinator {
         stage: input.stage,
         evaluated: input.evaluated,
         checkpoint,
-        additional_input_records: [],
+        additional_input_records: input.sessionEvidence === null ? [] : [input.sessionEvidence],
       });
       try {
         return await this.#applyPlannedSettlement(recorded, recordedAttempt, input.stage.id, settlement, {
@@ -1283,7 +1331,7 @@ export class OrdinaryKernelCoordinator {
         const refreshed = await this.#load(
           recorded.run.id,
           recordedAttempt.id,
-          [input.record.id],
+          [input.record.id, ...(input.sessionEvidence === null ? [] : [input.sessionEvidence.id])],
           [recordedAttempt.checkpoint_id!],
         );
         assertStaleRunProgress(recorded, refreshed, error);
@@ -1297,6 +1345,7 @@ export class OrdinaryKernelCoordinator {
     bundle: Awaited<ReturnType<KernelDefinitionBundlePort["resolveExactDefinitionBundle"]>>;
     checkpoint: AttemptCheckpoint;
     evidence: DecisionRecord;
+    sessionEvidence: DecisionRecord;
     record: ResultRecord;
     stage: Exclude<CompiledPipelineStage, { kind: "effect" | "wait" }>;
     evaluated: EvaluatedKernelResult;
@@ -1308,7 +1357,7 @@ export class OrdinaryKernelCoordinator {
       assertAttemptLeaseClaim(current, input.claim);
       const planningView = {
         ...current,
-        records: mapWith(current.records, input.record, input.evidence),
+        records: mapWith(current.records, input.record, input.evidence, input.sessionEvidence),
       };
       const settlement = await this.#planSettlement({
         view: planningView,
@@ -1318,7 +1367,7 @@ export class OrdinaryKernelCoordinator {
         stage: input.stage,
         evaluated: input.evaluated,
         checkpoint: input.checkpoint,
-        additional_input_records: [input.evidence],
+        additional_input_records: [input.evidence, input.sessionEvidence],
       });
       try {
         return await this.#applyPlannedSettlement(current, attempt, input.stage.id, settlement, {
@@ -1327,11 +1376,13 @@ export class OrdinaryKernelCoordinator {
             attempt: attempt.id,
             result: input.record.id,
             evidence: input.evidence.id,
+            session_evidence: input.sessionEvidence.id,
             decision: settlement.decision.id,
           }),
           attempt_id: attempt.id,
           result_record_id: input.record.id,
           invalid_result_evidence_record_id: input.evidence.id,
+          session_evidence_record_id: input.sessionEvidence.id,
           decision_record_id: settlement.decision.id,
           outcome: settlement.outcome,
           next_attempts: settlement.next_attempts,

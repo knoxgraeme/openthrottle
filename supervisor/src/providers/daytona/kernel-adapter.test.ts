@@ -41,7 +41,12 @@ import {
   type KernelResultCorrectionRequest,
   type KernelWorkActionRequest,
 } from "../../runtime/kernel-contracts.js";
-import { KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES } from "../../runtime/kernel-wire.js";
+import {
+  COMPOSED_PROMPT_PAYLOAD_SCHEMA,
+  KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES,
+  OTEL_SESSION_TRANSCRIPT_PAYLOAD_SCHEMA,
+  SESSION_ARTIFACT_DESCRIPTOR_SCHEMA,
+} from "../../runtime/kernel-wire.js";
 import {
   authorizeKernelSteeringDelivery,
   createKernelSteeringEnvelope,
@@ -968,6 +973,83 @@ function checkpointRuntimeResult(
   }));
 }
 
+function semanticSessionRuntimeResult(
+  request: KernelWorkActionRequest,
+  checkpoint: ReturnType<typeof checkpointWire>,
+) {
+  const original = {
+    schema: "openthrottle.result-candidate/v1",
+    outcome: "success",
+    payload: { summary: "done" },
+  };
+  const promptBytes = Buffer.from("exact composed prompt\n", "utf8");
+  const transcriptBytes = Buffer.from(`${canonicalJson({
+    resourceSpans: [{ resource: { attributes: [] }, scopeSpans: [] }],
+  })}\n`, "utf8");
+  const descriptor = (
+    prefix: "transcript" | "prompt",
+    bytes: Buffer,
+    mediaType: "application/json" | "text/plain",
+    payloadSchema: string,
+  ) => {
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    return {
+      schema: SESSION_ARTIFACT_DESCRIPTOR_SCHEMA,
+      file: `${prefix}-${sha256}.${prefix === "transcript" ? "json" : "txt"}`,
+      sha256,
+      bytes: bytes.byteLength,
+      encoding: "utf-8",
+      media_type: mediaType,
+      payload_schema: payloadSchema,
+    };
+  };
+  const transcript = descriptor(
+    "transcript",
+    transcriptBytes,
+    "application/json",
+    OTEL_SESSION_TRANSCRIPT_PAYLOAD_SCHEMA,
+  );
+  const prompt = descriptor(
+    "prompt",
+    promptBytes,
+    "text/plain",
+    COMPOSED_PROMPT_PAYLOAD_SCHEMA,
+  );
+  const candidateHash = createHash("sha256").update(canonicalJson(original)).digest("hex");
+  return {
+    runtime: Buffer.from(JSON.stringify({
+      schema: "openthrottle.kernel-runtime-result/v1",
+      pipeline_run_id: request.pipeline_run_id,
+      attempt_id: request.attempt_id,
+      request_hash: request.request_hash,
+      definition_bundle_hash: request.definition_bundle_hash,
+      lease_id: request.lease_id,
+      worker_id: request.worker_id,
+      outcome: {
+        state: "work_complete",
+        checkpoint,
+        result: {
+          kind: "semantic",
+          candidate: {
+            schema: "openthrottle.staged-result-candidate/v1",
+            semantic_schema_id: request.action.kind === "agent"
+              ? request.action.semantic_result_schema.id
+              : "invalid",
+            original,
+            original_hash: candidateHash,
+            candidate: original,
+            normalized_hash: candidateHash,
+            transformations: [],
+          },
+          evidence: { transcript, prompt_context: prompt },
+        },
+      },
+    })),
+    transcript: { descriptor: transcript, bytes: transcriptBytes },
+    prompt: { descriptor: prompt, bytes: promptBytes },
+  };
+}
+
 function invalidResultEvidenceArtifact(
   request: KernelWorkActionRequest,
   observedAt = REPLAYED_EVIDENCE_OBSERVED_AT,
@@ -1354,6 +1436,84 @@ describe("DaytonaKernelAdapter", () => {
       expect(put).toHaveBeenCalledTimes(kind === "inspect" ? 2 : 1);
     },
   );
+
+  it("uploads verified transcript and exact-prompt bytes as content-addressed blobs", async () => {
+    const request = workRequest({
+      action: {
+        kind: "agent",
+        engine: "codex",
+        model: null,
+        reasoning_effort: null,
+        agent_id: "agent-1",
+        skill_ids: [],
+        entry_skill: null,
+        eval_id: "eval-1",
+        semantic_result_schema: {
+          schema: "openthrottle.semantic-result-schema/v1",
+          id: "result-schema",
+          outcomes: ["success"],
+          payload: { summary: { type: "string", max_length: 100 } },
+        },
+        execution_limits: { max_turns: null, task_timeout_seconds: 60 },
+        definition_entries: [],
+      },
+    });
+    const artifact = selfContainedCheckpointBundle(request.request_hash);
+    const checkpoint = checkpointWire(request, artifact.descriptor, "native-session-1");
+    const session = semanticSessionRuntimeResult(request, checkpoint);
+    const resultDirectory = "/var/lib/openthrottle/action-results/attempt-1/work-lease-1";
+    const byPath = new Map([
+      [`${resultDirectory}/result.json`, session.runtime],
+      [`${resultDirectory}/session.json`, sessionEvent(request)],
+      [`${resultDirectory}/${artifact.descriptor.file}`, artifact.bytes],
+      [`${resultDirectory}/${session.transcript.descriptor.file}`, session.transcript.bytes],
+      [`${resultDirectory}/${session.prompt.descriptor.file}`, session.prompt.bytes],
+    ]);
+    const sandbox = sandboxWith(async (path) => {
+      const bytes = byPath.get(path);
+      if (bytes) return bytes;
+      throw new Error("404 not found");
+    });
+    const put = vi.fn((input: {
+      bytes: Buffer;
+      encoding: "binary" | "utf-8";
+      media_type: string;
+      payload_schema: string;
+      expected_digest: string;
+    }) => ({ pointer: {
+      algorithm: "sha256",
+      digest: input.expected_digest,
+      bytes: input.bytes.byteLength,
+      encoding: input.encoding,
+      media_type: input.media_type,
+      payload_schema: input.payload_schema,
+    } }));
+
+    await expect(adapterFor(sandbox, { put }).executeWork(request, {
+      lease_generation: 0,
+      work_retry_ordinal: 0,
+      heartbeat_interval_ms: 10,
+      on_heartbeat: vi.fn().mockResolvedValue(undefined),
+      on_session: vi.fn().mockResolvedValue(undefined),
+    })).resolves.toMatchObject({
+      state: "work_complete",
+      result: {
+        evidence: {
+          transcript: { digest: session.transcript.descriptor.sha256 },
+          prompt_context: { digest: session.prompt.descriptor.sha256 },
+        },
+      },
+    });
+    expect(put).toHaveBeenCalledTimes(3);
+    expect(put).toHaveBeenCalledWith(expect.objectContaining({
+      payload_schema: OTEL_SESSION_TRANSCRIPT_PAYLOAD_SCHEMA,
+      expected_digest: session.transcript.descriptor.sha256,
+    }));
+    expect(put).toHaveBeenCalledWith(expect.objectContaining({
+      payload_schema: COMPOSED_PROMPT_PAYLOAD_SCHEMA,
+      expected_digest: session.prompt.descriptor.sha256,
+    }));
+  });
 
   it("materializes and verifies the exact initial Git subject before launching work", async () => {
     const request = workRequest();

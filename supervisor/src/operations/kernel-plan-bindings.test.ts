@@ -77,6 +77,54 @@ function runtimeDeliveryEntries(): [string, ExecutionRecord][] {
     .map((record) => [record.id, record]);
 }
 
+function sessionEvidenceFixture(): {
+  record: ExecutionRecord;
+  blobs: readonly [string, Buffer][];
+} {
+  const transcriptBytes = Buffer.from('{"resourceSpans":[{"scopeSpans":[]}]}' + "\n", "utf8");
+  const promptBytes = Buffer.from("exact composed prompt\n", "utf8");
+  const transcript = {
+    algorithm: "sha256" as const,
+    digest: createHash("sha256").update(transcriptBytes).digest("hex"),
+    bytes: transcriptBytes.byteLength,
+    encoding: "utf-8" as const,
+    media_type: "application/json",
+    payload_schema: "openthrottle.otel-session-transcript/v1",
+  };
+  const promptContext = {
+    algorithm: "sha256" as const,
+    digest: createHash("sha256").update(promptBytes).digest("hex"),
+    bytes: promptBytes.byteLength,
+    encoding: "utf-8" as const,
+    media_type: "text/plain",
+    payload_schema: "openthrottle.composed-prompt/v1",
+  };
+  return {
+    record: {
+      schema: "openthrottle.record/v1",
+      id: "decision-session-evidence",
+      kind: "decision",
+      pipeline_run_id: "run-1",
+      reducer: "core/session-evidence@1",
+      input_record_ids: [],
+      payload_schema: "openthrottle.session-evidence/v1",
+      payload: { inline: {
+        schema: "openthrottle.session-evidence/v1",
+        attempt_id: "attempt-implement",
+        stage_id: "implement",
+        native_session_id: "session-implement",
+        transcript,
+        prompt_context: promptContext,
+      } },
+      created_at: NOW,
+    },
+    blobs: [
+      [transcript.digest, transcriptBytes],
+      [promptContext.digest, promptBytes],
+    ],
+  };
+}
+
 function lifecycleManifest(poolSize: number): CompiledPipelineManifest {
   return {
     schema: "openthrottle.compiled-pipeline-manifest/v1",
@@ -785,10 +833,12 @@ describe("kernel publication plan binding", () => {
       boundary: firstPublication,
       name: "second-publication.bundle",
     });
+    const sessionEvidence = sessionEvidenceFixture();
     const blobs = new Map([
       [candidateBundle.pointer.digest, candidateBundle.bytes],
       [firstBundle.pointer.digest, firstBundle.bytes],
       [secondBundle.pointer.digest, secondBundle.bytes],
+      ...sessionEvidence.blobs,
     ]);
     const bindings = createKernelExternalPlanBindings({
       environments: {
@@ -815,7 +865,10 @@ describe("kernel publication plan binding", () => {
       definition_bundle_hash: "b".repeat(64),
     } as never;
     const baseContext = {
-      records: new Map(runtimeDeliveryEntries()),
+      records: new Map([
+        ...runtimeDeliveryEntries(),
+        [sessionEvidence.record.id, sessionEvidence.record] as [string, ExecutionRecord],
+      ]),
       checkpoints: new Map([[candidate.id, candidate]]),
     };
 
@@ -895,7 +948,15 @@ describe("kernel publication plan binding", () => {
     });
     expect(firstPromoted.prepared.phases[2]!.effects[0]).toMatchObject({
       subject: firstPublication,
-      payload: { expected_head_subject: firstPublication },
+      payload: {
+        expected_head_subject: firstPublication,
+        body: expect.stringContaining(
+          `- stage=implement session=session-implement transcript=sha256:${
+            (sessionEvidence.record.payload as { inline: { transcript: { digest: string } } })
+              .inline.transcript.digest
+          }`,
+        ),
+      },
     });
 
     // Recovery after phase-zero promotion retains the immutable private
@@ -918,7 +979,7 @@ describe("kernel publication plan binding", () => {
     const priorPush = pushDelivery("delivery-push-p1", firstPublication, "create");
     const updateContext = {
       records: new Map([
-        ...runtimeDeliveryEntries(),
+        ...baseContext.records,
         [priorPush.id, priorPush],
       ]),
       checkpoints: baseContext.checkpoints,
