@@ -15,6 +15,7 @@ import type {
 import { githubApiResponse } from "../../shared/github-request.js";
 import { pushRepositoryCheckpoint } from "./checkpoint-push.js";
 import { publishRepositoryTaskBranch, type GithubClient } from "./client.js";
+import { buildGithubPullRequestBody } from "./pull-request-body.js";
 
 const SUBJECT = /^[a-f0-9]{40}$/;
 const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -201,7 +202,7 @@ function exactOwnedPullRequests(
   entries: readonly unknown[],
   payload: PullRequestPayload,
 ): Record<string, unknown>[] {
-  const canonicalBody = `${payload.body.trimEnd()}\n\n<!-- ${payload.ownership_marker} -->\n`;
+  const canonicalBody = buildGithubPullRequestBody(payload.body, payload.ownership_marker);
   return entries.filter((candidate): candidate is Record<string, unknown> => {
     if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
     const pull = candidate as Record<string, unknown>;

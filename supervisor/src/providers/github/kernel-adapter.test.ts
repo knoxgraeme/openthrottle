@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { EffectIntent } from "@openthrottle/contracts";
 import { GithubKernelAdapter } from "./kernel-adapter.js";
 import { pushRepositoryCheckpoint } from "./checkpoint-push.js";
+import { buildGithubPullRequestBody } from "./pull-request-body.js";
 
 vi.mock("./checkpoint-push.js", () => ({
   pushRepositoryCheckpoint: vi.fn(async () => ({ sha: "a".repeat(40) })),
@@ -16,7 +17,10 @@ const TASK_BRANCH = "ot/ope-201-deadbeef";
 const OWNERSHIP_MARKER = "openthrottle:run:0123456789abcdef";
 const PULL_REQUEST_TITLE = "Dogfood repair";
 const PULL_REQUEST_BODY = "Publish the accepted repair.";
-const CANONICAL_PULL_REQUEST_BODY = `${PULL_REQUEST_BODY}\n\n<!-- ${OWNERSHIP_MARKER} -->\n`;
+const CANONICAL_PULL_REQUEST_BODY = buildGithubPullRequestBody(
+  PULL_REQUEST_BODY,
+  OWNERSHIP_MARKER,
+);
 
 type RequiredObservation =
   | { kind: "check_run"; name: string; app_slug: string }
@@ -46,7 +50,7 @@ function providerWait(required = REQUIRED_CHECKS): EffectIntent {
   };
 }
 
-function pullRequest(): EffectIntent {
+function pullRequest(input: { body?: string; ownershipMarker?: string } = {}): EffectIntent {
   return {
     schema: "openthrottle.effect-intent/v1",
     id: "effect-pull-request",
@@ -63,8 +67,8 @@ function pullRequest(): EffectIntent {
       base_branch: "main",
       expected_head_subject: SUBJECT,
       title: PULL_REQUEST_TITLE,
-      body: PULL_REQUEST_BODY,
-      ownership_marker: OWNERSHIP_MARKER,
+      body: input.body ?? PULL_REQUEST_BODY,
+      ownership_marker: input.ownershipMarker ?? OWNERSHIP_MARKER,
     },
   };
 }
@@ -142,8 +146,10 @@ function reconciliation(fetch: typeof globalThis.fetch, intent = providerWait())
   });
 }
 
-function pullRequestReconciliation(fetch: typeof globalThis.fetch) {
-  const intent = pullRequest();
+function pullRequestReconciliation(
+  fetch: typeof globalThis.fetch,
+  intent = pullRequest(),
+) {
   const adapter = new GithubKernelAdapter({ token: "token", blob_store: {} as never, fetch });
   const binding = adapter.effectBindings().find(
     ({ effect_kind }) => effect_kind === "github/upsert-pull-request@1",
@@ -158,6 +164,12 @@ function pullRequestReconciliation(fetch: typeof globalThis.fetch) {
 function pushBinding(adapter: GithubKernelAdapter) {
   return adapter.effectBindings().find(
     ({ effect_kind }) => effect_kind === "github/push-checkpoint@1",
+  )!;
+}
+
+function pullRequestBinding(adapter: GithubKernelAdapter) {
+  return adapter.effectBindings().find(
+    ({ effect_kind }) => effect_kind === "github/upsert-pull-request@1",
   )!;
 }
 
@@ -452,6 +464,77 @@ describe("GithubKernelAdapter checkpoint push", () => {
 });
 
 describe("GithubKernelAdapter pull request reconciliation", () => {
+  it.each([
+    [
+      "trailing whitespace",
+      `${PULL_REQUEST_BODY} \t\n\n `,
+      CANONICAL_PULL_REQUEST_BODY,
+    ],
+    [
+      "pre-existing marker placement",
+      `${PULL_REQUEST_BODY}\n\n<!-- ${OWNERSHIP_MARKER} -->\n`,
+      `${PULL_REQUEST_BODY}\n\n<!-- ${OWNERSHIP_MARKER} -->\n\n<!-- ${OWNERSHIP_MARKER} -->\n`,
+    ],
+  ])("dispatches and reconciles byte-identical fenced bodies with %s", async (
+    _label,
+    body,
+    expectedBody,
+  ) => {
+    const intent = pullRequest({ body });
+    let dispatchedBody: string | undefined;
+    const dispatchFetch = vi.fn(async (
+      request: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      const url = new URL(String(request));
+      const path = decodeURIComponent(url.pathname);
+      if (path.endsWith(`/git/ref/heads/${TASK_BRANCH}`)) {
+        return Response.json({ object: { sha: SUBJECT } });
+      }
+      if (path.endsWith("/pulls") && init?.method === undefined) {
+        return Response.json([]);
+      }
+      if (path.endsWith("/pulls") && init?.method === "POST") {
+        const posted = JSON.parse(String(init.body)) as Record<string, string>;
+        dispatchedBody = posted.body;
+        return Response.json({
+          html_url: "https://github.com/owner/repo/pull/1",
+          title: posted.title,
+          body: posted.body,
+          head: { sha: SUBJECT, ref: TASK_BRANCH, repo: { full_name: "owner/repo" } },
+          base: { ref: "main" },
+        }, { status: 201 });
+      }
+      throw new Error(`unexpected GitHub request ${url}`);
+    }) as unknown as typeof globalThis.fetch;
+    const adapter = new GithubKernelAdapter({
+      token: "token",
+      blob_store: {} as never,
+      fetch: dispatchFetch,
+    });
+
+    await pullRequestBinding(adapter).adapter.dispatch({
+      intent,
+      external_identity: intent.target,
+      dispatch_fence: null,
+      deduplication: {
+        strategy: "deterministic_target",
+        key: intent.idempotency_key,
+        target: intent.target,
+      },
+    });
+
+    expect(Buffer.from(dispatchedBody!)).toEqual(Buffer.from(expectedBody));
+    const reconcileFetch = publicationFetch({
+      pulls: [ownedPull({ body: dispatchedBody })],
+    });
+    await expect(pullRequestReconciliation(reconcileFetch, intent)).resolves.toEqual({
+      kind: "found",
+      status: "confirmed",
+      payload: { url: "https://github.com/owner/repo/pull/1" },
+    });
+  });
+
   it("queries bounded all-state history first and confirms one exact owned open pull request", async () => {
     const fetch = publicationFetch({ pulls: [ownedPull()] });
 
