@@ -31,6 +31,17 @@ export interface ValidKernelLeaseManifestScheduling {
   readonly pipeline_id: string;
   readonly pool_size: number;
   readonly parallel_inspect_stage_widths: ReadonlyMap<string, number>;
+  readonly parallel_unit_stage_scheduling: ReadonlyMap<
+    string,
+    KernelLeaseUnitStageScheduling
+  >;
+}
+
+export interface KernelLeaseUnitStageScheduling {
+  readonly root_stage_id: string;
+  readonly loop_id: string;
+  readonly max_parallel: number;
+  readonly repository_authority: "inspect" | "edit";
 }
 
 export interface InvalidKernelLeaseManifestScheduling {
@@ -60,6 +71,12 @@ interface SchedulingAttemptRow extends AttemptRow {
   created_at: string;
   run_pipeline_id: string;
   run_definition_bundle_hash: string;
+}
+
+interface ParallelAttemptClaim {
+  readonly kind: "inspect" | "unit_cycle";
+  readonly cohort_id: string;
+  readonly width: number;
 }
 
 export class KernelLeaseOperations {
@@ -277,14 +294,38 @@ export class KernelLeaseOperations {
     return scheduling;
   }
 
-  #isParallelInspect(
+  #parallelClaim(
     row: AttemptRow,
     scheduling: ValidKernelLeaseManifestScheduling,
-  ): boolean {
-    return row.repository_authority === "inspect" &&
+  ): ParallelAttemptClaim | null {
+    const inspectWidth = scheduling.parallel_inspect_stage_widths.get(row.stage_id);
+    if (
+      row.repository_authority === "inspect" &&
       (row.scope_kind === "loop_item" || row.scope_kind === "fanout_member") &&
-      (scheduling.parallel_inspect_stage_widths.get(row.stage_id) ?? 1) > 1 &&
-      row.scope_item_index !== null;
+      inspectWidth !== undefined && inspectWidth > 1 &&
+      row.scope_item_index !== null
+    ) {
+      return {
+        kind: "inspect",
+        cohort_id: row.stage_id,
+        width: inspectWidth,
+      };
+    }
+    const unit = scheduling.parallel_unit_stage_scheduling.get(row.stage_id);
+    if (
+      unit !== undefined && unit.max_parallel > 1 &&
+      row.repository_authority === unit.repository_authority &&
+      row.scope_kind === "loop_item" &&
+      row.scope_group_id === unit.loop_id &&
+      row.scope_item_id !== null && row.scope_item_index !== null
+    ) {
+      return {
+        kind: "unit_cycle",
+        cohort_id: unit.root_stage_id,
+        width: unit.max_parallel,
+      };
+    }
+    return null;
   }
 
   #slotIndex(row: AttemptRow, scheduling: ValidKernelLeaseManifestScheduling): number {
@@ -312,13 +353,29 @@ export class KernelLeaseOperations {
     );
   }
 
-  #sameParallelCohort(left: AttemptRow, right: AttemptRow): boolean {
-    return left.scope_kind === right.scope_kind &&
-      left.stage_id === right.stage_id &&
-      left.parent_attempt_id === right.parent_attempt_id &&
-      left.scope_group_id === right.scope_group_id &&
-      left.definition_bundle_hash === right.definition_bundle_hash &&
-      left.input_subject === right.input_subject;
+  #sameParallelCohort(
+    left: AttemptRow,
+    leftClaim: ParallelAttemptClaim,
+    right: AttemptRow,
+    rightClaim: ParallelAttemptClaim,
+  ): boolean {
+    if (
+      leftClaim.kind !== rightClaim.kind ||
+      leftClaim.cohort_id !== rightClaim.cohort_id ||
+      leftClaim.width !== rightClaim.width ||
+      left.scope_kind !== right.scope_kind ||
+      left.parent_attempt_id !== right.parent_attempt_id ||
+      left.scope_group_id !== right.scope_group_id ||
+      left.definition_bundle_hash !== right.definition_bundle_hash
+    ) return false;
+    return leftClaim.kind === "unit_cycle" || (
+      left.stage_id === right.stage_id && left.input_subject === right.input_subject
+    );
+  }
+
+  #sameParallelMember(left: AttemptRow, right: AttemptRow): boolean {
+    return left.scope_item_id === right.scope_item_id ||
+      left.scope_item_index === right.scope_item_index;
   }
 
   #claimRows(runId: string): AttemptRow[] {
@@ -340,21 +397,25 @@ export class KernelLeaseOperations {
     const scheduling = this.#attemptScheduling(first, snapshot);
     if (claims.length === 1) return true;
     if (scheduling === null) return false;
-    if (!this.#isParallelInspect(first, scheduling)) return false;
-    if (claims.length > (scheduling.parallel_inspect_stage_widths.get(first.stage_id) ?? 1)) {
-      return false;
-    }
+    const firstClaim = this.#parallelClaim(first, scheduling);
+    if (firstClaim === null || claims.length > firstClaim.width) return false;
     const slots = new Set<number>();
+    const members: AttemptRow[] = [];
     for (const claim of claims) {
       const claimScheduling = this.#attemptScheduling(claim, snapshot);
+      const parallelClaim = claimScheduling === null
+        ? null
+        : this.#parallelClaim(claim, claimScheduling);
       if (
         claimScheduling === null || claimScheduling !== scheduling ||
-        !this.#isParallelInspect(claim, claimScheduling) ||
-        !this.#sameParallelCohort(first, claim)
+        parallelClaim === null ||
+        !this.#sameParallelCohort(first, firstClaim, claim, parallelClaim) ||
+        members.some((member) => this.#sameParallelMember(member, claim))
       ) return false;
       const slot = this.#slotIndex(claim, claimScheduling);
       if (slots.has(slot)) return false;
       slots.add(slot);
+      members.push(claim);
     }
     return true;
   }
@@ -368,17 +429,18 @@ export class KernelLeaseOperations {
     const otherClaims = claims.filter((claim) => claim.id !== candidate.id);
     if (otherClaims.length === 0) return true;
     const scheduling = this.#attemptScheduling(candidate, snapshot);
-    if (scheduling === null || !this.#isParallelInspect(candidate, scheduling)) return false;
-    if (
-      otherClaims.length + 1 >
-      (scheduling.parallel_inspect_stage_widths.get(candidate.stage_id) ?? 1)
-    ) return false;
+    if (scheduling === null) return false;
+    const candidateClaim = this.#parallelClaim(candidate, scheduling);
+    if (candidateClaim === null || otherClaims.length + 1 > candidateClaim.width) return false;
     const candidateSlot = this.#slotIndex(candidate, scheduling);
     return otherClaims.every((claim) => {
       const claimScheduling = this.#attemptScheduling(claim, snapshot);
-      return claimScheduling === scheduling &&
-        this.#isParallelInspect(claim, claimScheduling) &&
-        this.#sameParallelCohort(candidate, claim) &&
+      const parallelClaim = claimScheduling === null
+        ? null
+        : this.#parallelClaim(claim, claimScheduling);
+      return claimScheduling === scheduling && parallelClaim !== null &&
+        this.#sameParallelCohort(candidate, candidateClaim, claim, parallelClaim) &&
+        !this.#sameParallelMember(candidate, claim) &&
         this.#slotIndex(claim, claimScheduling) !== candidateSlot;
     });
   }

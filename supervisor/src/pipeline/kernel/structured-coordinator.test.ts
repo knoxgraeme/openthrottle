@@ -908,6 +908,56 @@ describe("structured kernel coordinator", () => {
     expect(first.dependencies[thirdKey]).toEqual([frontierMemberKey(first.attempts[0]!)]);
   });
 
+  it("recomputes a three-unit DAG frontier from integrated dependency state", () => {
+    const input = frontierInput();
+    const members = [
+      { id: "unit-a", depends_on: [], action_inputs: actionInputs("unit A") },
+      { id: "unit-b", depends_on: [], action_inputs: actionInputs("unit B") },
+      { id: "unit-c", depends_on: ["unit-a", "unit-b"], action_inputs: actionInputs("unit C") },
+    ];
+    const frontier = compileStructuredLoopFrontier({
+      ...input,
+      members,
+      completed_integrations: new Map(),
+    })!;
+    const replay = compileStructuredLoopFrontier({
+      ...input,
+      members: [...members].reverse(),
+      completed_integrations: new Map(),
+    })!;
+
+    expect(replay).toEqual(frontier);
+    expect(frontier.attempts.map((attempt) =>
+      attempt.scope.kind === "loop_item" ? attempt.scope.item_id : "unexpected"))
+      .toEqual(["unit-a", "unit-b"]);
+    expect(frontier.attempts.map((attempt) =>
+      frontier.dependencies[frontierMemberKey(attempt)]))
+      .toEqual([[], []]);
+  });
+
+  it("preserves the canonical serial frontier identity at authored width one", () => {
+    const input = { ...frontierInput(), max_parallel: 1 };
+    const members = ["unit-b", "unit-a"].map((id) => ({
+      id,
+      depends_on: [],
+      action_inputs: actionInputs(id),
+    }));
+    const frontier = compileStructuredLoopFrontier({
+      ...input,
+      members,
+      completed_integrations: new Map(),
+    })!;
+    const keys = frontier.attempts.map(frontierMemberKey);
+
+    expect(frontier.attempts.map((attempt) =>
+      attempt.scope.kind === "loop_item" ? attempt.scope.item_id : "unexpected"))
+      .toEqual(["unit-a", "unit-b"]);
+    expect(frontier.dependencies).toEqual({
+      [keys[0]!]: [],
+      [keys[1]!]: [keys[0]!],
+    });
+  });
+
   it("compiles review personas as bounded inspect-only fanout attempts", () => {
     const { bundle, manifest } = definitions();
     const fanout = compileReviewFanoutFrontier({

@@ -113,10 +113,47 @@ import {
 } from "./kernel-active-statuses.js";
 import {
   KernelLeaseOperations,
+  type KernelLeaseUnitStageScheduling,
   type KernelLeaseManifestScheduling,
   type KernelLeaseSchedulingSnapshot,
 } from "./kernel-store-leases.js";
 import { KERNEL_INGRESS_MAINTENANCE_SETTING } from "./epoch-schema.js";
+
+function parallelUnitStageScheduling(
+  manifest: CompiledPipelineManifest,
+): ReadonlyMap<string, KernelLeaseUnitStageScheduling> {
+  const byId = new Map(manifest.stages.map((stage) => [stage.id, stage]));
+  const scheduling = new Map<string, KernelLeaseUnitStageScheduling>();
+  for (const root of manifest.stages) {
+    if (
+      root.kind !== "agent" || root.repository_authority !== "edit" ||
+      root.loop === undefined || root.loop.max_parallel <= 1 || root.loop.body === undefined
+    ) continue;
+    const integrationStageIds = root.loop.body.filter((stageId) => {
+      const stage = byId.get(stageId);
+      return stage?.kind === "effect" && stage.effect === "core/integrate-unit@1";
+    });
+    if (integrationStageIds.length === 0) continue;
+    if (integrationStageIds.length !== 1 || !root.loop.body.includes(root.id)) {
+      throw new Error(`parallel unit loop ${root.id} has an invalid integration boundary`);
+    }
+    for (const stageId of root.loop.body) {
+      const stage = byId.get(stageId);
+      if (stage === undefined) throw new Error(`parallel unit loop ${root.id} contains an unknown stage`);
+      if (stage.kind !== "agent" && stage.kind !== "command") continue;
+      if (scheduling.has(stageId)) {
+        throw new Error(`parallel unit stage ${stageId} belongs to multiple unit cycles`);
+      }
+      scheduling.set(stageId, {
+        root_stage_id: root.id,
+        loop_id: root.loop.over,
+        max_parallel: root.loop.max_parallel,
+        repository_authority: stage.kind === "agent" ? stage.repository_authority : "inspect",
+      });
+    }
+  }
+  return scheduling;
+}
 
 const STRUCTURED_PLANNING_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 
@@ -1332,6 +1369,7 @@ export class SqliteKernelStore implements
                   stage.loop !== undefined && stage.loop.max_parallel > 1
                   ? [[stage.id, stage.loop.max_parallel] as const]
                   : [])),
+              parallel_unit_stage_scheduling: parallelUnitStageScheduling(manifest),
             };
           } catch (error) {
             return {

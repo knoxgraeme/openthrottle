@@ -134,6 +134,40 @@ function manifest(bundleHash: string): CompiledPipelineManifest {
   };
 }
 
+function parallelUnitCycleManifest(
+  candidate: CompiledPipelineManifest,
+  maxParallel = 2,
+): CompiledPipelineManifest {
+  return {
+    ...candidate,
+    stages: [
+      ...candidate.stages.map((stage) => stage.id === "work"
+        ? {
+          ...stage,
+          loop: {
+            over: "execution_plan.units",
+            max_parallel: maxParallel,
+            max_rounds: 8,
+            body: ["work", "unit-command", "verify", "integration"],
+          },
+        }
+        : stage),
+      {
+        id: "unit-command",
+        kind: "command",
+        command: "test",
+        on: { success: { to: "verify" }, failure: { terminal: "failed" } },
+      },
+      {
+        id: "integration",
+        kind: "effect",
+        effect: "core/integrate-unit@1",
+        on: { success: { terminal: "completed" }, failure: { terminal: "failed" } },
+      },
+    ],
+  };
+}
+
 function attempt(input: Partial<KernelAttempt> = {}): KernelAttempt {
   return {
     schema: KERNEL_ATTEMPT_SCHEMA,
@@ -1715,7 +1749,7 @@ describe("SqliteKernelStore", () => {
     }
   });
 
-  it("skips a deterministically invalid manifest while leasing an unrelated run", async () => {
+  it("skips a deterministically malformed unit-cycle manifest while leasing an unrelated run", async () => {
     const context = setup();
     try {
       const goodHash = context.admission.run.definition_bundle_hash;
@@ -1769,7 +1803,16 @@ describe("SqliteKernelStore", () => {
         manifest_resolver: {
           resolve: (input) => {
             if (input.definition_bundle_hash === invalidHash) {
-              throw new Error("invalid exact compiled manifest");
+              const malformed = parallelUnitCycleManifest({
+                ...context.pipelineManifest,
+                definition_bundle_hash: invalidHash,
+              });
+              return {
+                ...malformed,
+                stages: malformed.stages.map((stage) => stage.id === "work" && stage.loop
+                  ? { ...stage, loop: { ...stage.loop, body: ["verify", "integration"] } }
+                  : stage),
+              };
             }
             return context.pipelineManifest;
           },
@@ -2031,6 +2074,194 @@ describe("SqliteKernelStore", () => {
       expect(context.db.prepare(
         "SELECT lease_id FROM attempts WHERE id = 'attempt-2'",
       ).get()).toEqual({ lease_id: null });
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it.each([
+    ["edit", "work", "edit"],
+    ["command", "unit-command", "inspect"],
+    ["acceptance", "verify", "inspect"],
+  ] as const)("co-leases dependency-ready %s unit-cycle members on distinct slots", async (
+    _label,
+    stageId,
+    repositoryAuthority,
+  ) => {
+    const context = setup(
+      undefined,
+      () => NOW,
+      false,
+      2,
+      (candidate) => parallelUnitCycleManifest(candidate),
+      EXECUTION_POLICY_TWO,
+    );
+    try {
+      const bundleHash = context.admission.run.definition_bundle_hash;
+      const candidates = [0, 1].map((itemIndex) => attempt({
+        id: `attempt-unit-${itemIndex}`,
+        pipeline_run_id: "run-1",
+        definition_bundle_hash: bundleHash,
+        repository_authority: repositoryAuthority,
+        input_subject: subject(itemIndex === 0 ? "1" : "2"),
+        scope: {
+          kind: "loop_item",
+          stage_id: stageId,
+          parent_attempt_id: "attempt-unit-0",
+          loop_id: "execution_plan.units",
+          item_id: `unit-${itemIndex}`,
+          item_index: itemIndex,
+        },
+      }));
+      context.store.admitPipelineRun({
+        ...context.admission,
+        run: run(candidates, bundleHash, stageId),
+        initial_attempts: candidates,
+      });
+
+      for (const itemIndex of [0, 1]) {
+        await expect(context.store.leaseNextEligibleAttempt({
+          worker_id: "worker-unit",
+          lease_id: `lease-unit-${itemIndex}`,
+          expires_at: "2026-08-20T12:05:00.000Z",
+        })).resolves.toMatchObject({ attempt: { id: `attempt-unit-${itemIndex}` } });
+      }
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("rejects duplicate unit ownership and keeps integration behind the same-run gate", async () => {
+    const context = setup(
+      undefined,
+      () => NOW,
+      false,
+      2,
+      (candidate) => parallelUnitCycleManifest(candidate),
+      EXECUTION_POLICY_TWO,
+    );
+    try {
+      const bundleHash = context.admission.run.definition_bundle_hash;
+      const candidates = [0, 1].map((itemIndex) => attempt({
+        id: `attempt-duplicate-unit-${itemIndex}`,
+        pipeline_run_id: "run-1",
+        definition_bundle_hash: bundleHash,
+        repository_authority: "edit",
+        scope: {
+          kind: "loop_item",
+          stage_id: "work",
+          parent_attempt_id: "attempt-duplicate-unit-0",
+          loop_id: "execution_plan.units",
+          item_id: "unit-a",
+          item_index: itemIndex,
+        },
+      }));
+      context.store.admitPipelineRun({
+        ...context.admission,
+        run: run(candidates, bundleHash, "work"),
+        initial_attempts: candidates,
+      });
+
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-unit",
+        lease_id: "lease-duplicate-unit-0",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toMatchObject({ attempt: { id: "attempt-duplicate-unit-0" } });
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-unit",
+        lease_id: "lease-duplicate-unit-1",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toBeNull();
+    } finally {
+      context.db.close();
+    }
+
+    const integrationContext = setup(
+      undefined,
+      () => NOW,
+      false,
+      2,
+      (candidate) => parallelUnitCycleManifest(candidate),
+      EXECUTION_POLICY_TWO,
+    );
+    try {
+      const bundleHash = integrationContext.admission.run.definition_bundle_hash;
+      const integrations = [0, 1].map((itemIndex) => attempt({
+        id: `attempt-integration-${itemIndex}`,
+        pipeline_run_id: "run-1",
+        definition_bundle_hash: bundleHash,
+        repository_authority: "inspect",
+        scope: {
+          kind: "loop_item",
+          stage_id: "integration",
+          parent_attempt_id: "attempt-integration-0",
+          loop_id: "execution_plan.units",
+          item_id: `unit-${itemIndex}`,
+          item_index: itemIndex,
+        },
+      }));
+      integrationContext.store.admitPipelineRun({
+        ...integrationContext.admission,
+        run: run(integrations, bundleHash, "integration"),
+        initial_attempts: integrations,
+      });
+
+      await expect(integrationContext.store.leaseNextEligibleAttempt({
+        worker_id: "worker-integration",
+        lease_id: "lease-integration-0",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toMatchObject({ attempt: { id: "attempt-integration-0" } });
+      await expect(integrationContext.store.leaseNextEligibleAttempt({
+        worker_id: "worker-integration",
+        lease_id: "lease-integration-1",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toBeNull();
+    } finally {
+      integrationContext.db.close();
+    }
+  });
+
+  it("preserves serial unit leasing when the authored unit width is one", async () => {
+    const context = setup(
+      undefined,
+      () => NOW,
+      false,
+      2,
+      (candidate) => parallelUnitCycleManifest(candidate, 1),
+      EXECUTION_POLICY_TWO,
+    );
+    try {
+      const bundleHash = context.admission.run.definition_bundle_hash;
+      const candidates = [0, 1].map((itemIndex) => attempt({
+        id: `attempt-serial-unit-${itemIndex}`,
+        pipeline_run_id: "run-1",
+        definition_bundle_hash: bundleHash,
+        repository_authority: "edit",
+        scope: {
+          kind: "loop_item",
+          stage_id: "work",
+          parent_attempt_id: "attempt-serial-unit-0",
+          loop_id: "execution_plan.units",
+          item_id: `unit-${itemIndex}`,
+          item_index: itemIndex,
+        },
+      }));
+      context.store.admitPipelineRun({
+        ...context.admission,
+        run: run(candidates, bundleHash, "work"),
+        initial_attempts: candidates,
+      });
+
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-unit",
+        lease_id: "lease-serial-unit-0",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toMatchObject({ attempt: { id: "attempt-serial-unit-0" } });
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-unit",
+        lease_id: "lease-serial-unit-1",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toBeNull();
     } finally {
       context.db.close();
     }

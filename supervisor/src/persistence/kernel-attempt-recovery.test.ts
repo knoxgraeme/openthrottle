@@ -51,6 +51,48 @@ function recoveryManifest(maxParallel = 1): CompiledPipelineManifest {
   };
 }
 
+function unitRecoveryManifest(): CompiledPipelineManifest {
+  return {
+    ...recoveryManifest(),
+    stages: [
+      {
+        id: "implement",
+        kind: "agent",
+        engine: "codex",
+        agent_id: "worker",
+        repository_authority: "edit",
+        skills: ["work"],
+        entry_skill: "work",
+        eval: "result",
+        loop: {
+          over: "execution_plan.units",
+          max_parallel: 2,
+          max_rounds: 8,
+          body: ["implement", "accept", "integration"],
+        },
+        on: { success: { to: "accept" }, failure: { terminal: "failed" } },
+      },
+      {
+        id: "accept",
+        kind: "agent",
+        engine: "codex",
+        agent_id: "lead",
+        repository_authority: "inspect",
+        skills: ["work"],
+        entry_skill: "work",
+        eval: "result",
+        on: { success: { to: "integration" }, failure: { terminal: "failed" } },
+      },
+      {
+        id: "integration",
+        kind: "effect",
+        effect: "core/integrate-unit@1",
+        on: { success: { terminal: "completed" }, failure: { terminal: "failed" } },
+      },
+    ],
+  };
+}
+
 function setFanoutScope(input: {
   db: FreshKernelFixture["db"];
   attempt_id: string;
@@ -65,6 +107,26 @@ function setFanoutScope(input: {
     input.parent_attempt_id,
     `item-${input.member_index}`,
     input.member_index,
+    input.attempt_id,
+  );
+}
+
+function setUnitScope(input: {
+  db: FreshKernelFixture["db"];
+  attempt_id: string;
+  parent_attempt_id: string;
+  unit_id: string;
+  unit_index: number;
+}): void {
+  input.db.prepare(`
+    UPDATE attempts SET scope_kind = 'loop_item', stage_id = 'implement',
+      repository_authority = 'edit', parent_attempt_id = ?,
+      scope_group_id = 'execution_plan.units', scope_item_id = ?,
+      scope_item_index = ? WHERE id = ?
+  `).run(
+    input.parent_attempt_id,
+    input.unit_id,
+    input.unit_index,
     input.attempt_id,
   );
 }
@@ -310,6 +372,116 @@ describe("expired kernel Attempt lease recovery", () => {
     })).resolves.toMatchObject([
       { run_id: "run-pool", lease: { id: "lease-0", generation: 1 } },
       { run_id: "run-pool", lease: { id: "lease-1", generation: 1 } },
+    ]);
+  });
+
+  it("recovers distinct same-run unit slots with their exact unit ownership", async () => {
+    fixture = freshKernelFixture();
+    seedKernelRun({ db: fixture.db, run_id: "run-units" });
+    for (const unitIndex of [0, 1]) {
+      seedKernelAttempt({
+        db: fixture.db,
+        run_id: "run-units",
+        id: `attempt-unit-${unitIndex}`,
+        status: "pending",
+        lease: {
+          id: `lease-unit-${unitIndex}`,
+          worker_id: "worker-units",
+          purpose: "work",
+          expires_at: EXPIRED,
+          started: false,
+        },
+      });
+      setUnitScope({
+        db: fixture.db,
+        attempt_id: `attempt-unit-${unitIndex}`,
+        parent_attempt_id: "attempt-unit-0",
+        unit_id: `unit-${unitIndex}`,
+        unit_index: unitIndex,
+      });
+    }
+    const store = new SqliteKernelStore({
+      db: fixture.db,
+      blob_store: fixture.blobs,
+      manifest_resolver: { resolve: () => unitRecoveryManifest() },
+      payload_schemas: new Map() as ExecutionRecordPayloadRegistry,
+      execution_policy: EXECUTION_POLICY_TWO,
+      execution_width: 1,
+      now: () => OBSERVED,
+    });
+
+    await expect(store.recoverExpiredAttemptLeases({
+      observed_at: OBSERVED,
+      expires_at: RENEWED,
+      limit: 2,
+    })).resolves.toMatchObject([
+      { run_id: "run-units", attempt: { scope: { item_id: "unit-0" } }, lease: { generation: 1 } },
+      { run_id: "run-units", attempt: { scope: { item_id: "unit-1" } }, lease: { generation: 1 } },
+    ]);
+  });
+
+  it("does not recover duplicate unit ownership while an unrelated run progresses", async () => {
+    fixture = freshKernelFixture();
+    seedKernelRun({ db: fixture.db, run_id: "run-duplicate-unit" });
+    for (const unitIndex of [0, 1]) {
+      seedKernelAttempt({
+        db: fixture.db,
+        run_id: "run-duplicate-unit",
+        id: `attempt-duplicate-unit-${unitIndex}`,
+        status: "pending",
+        lease: {
+          id: `lease-duplicate-unit-${unitIndex}`,
+          worker_id: "worker-duplicate-unit",
+          purpose: "work",
+          expires_at: EXPIRED,
+          started: false,
+        },
+      });
+      setUnitScope({
+        db: fixture.db,
+        attempt_id: `attempt-duplicate-unit-${unitIndex}`,
+        parent_attempt_id: "attempt-duplicate-unit-0",
+        unit_id: "unit-a",
+        unit_index: unitIndex,
+      });
+    }
+    seedKernelRun({ db: fixture.db, run_id: "run-unrelated" });
+    seedKernelAttempt({
+      db: fixture.db,
+      run_id: "run-unrelated",
+      id: "attempt-unrelated",
+      status: "pending",
+      lease: {
+        id: "lease-unrelated",
+        worker_id: "worker-unrelated",
+        purpose: "work",
+        expires_at: EXPIRED,
+        started: false,
+      },
+    });
+    const store = new SqliteKernelStore({
+      db: fixture.db,
+      blob_store: fixture.blobs,
+      manifest_resolver: { resolve: () => unitRecoveryManifest() },
+      payload_schemas: new Map() as ExecutionRecordPayloadRegistry,
+      execution_policy: EXECUTION_POLICY_TWO,
+      execution_width: 3,
+      now: () => OBSERVED,
+    });
+
+    await expect(store.recoverExpiredAttemptLeases({
+      observed_at: OBSERVED,
+      expires_at: RENEWED,
+      limit: 3,
+    })).resolves.toMatchObject([
+      { run_id: "run-unrelated", attempt: { id: "attempt-unrelated" } },
+    ]);
+    expect(fixture.db.prepare(`
+      SELECT id, lease_generation FROM attempts
+      WHERE pipeline_run_id = 'run-duplicate-unit' ORDER BY id
+    `).all()).toEqual([
+      { id: "attempt-duplicate-unit-0", lease_generation: 0 },
+      { id: "attempt-duplicate-unit-1", lease_generation: 0 },
     ]);
   });
 
