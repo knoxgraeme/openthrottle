@@ -16,7 +16,6 @@ import type {
 } from "./kernel-external-plans.js";
 import { CORE_EXTERNAL_PLAN_SHAPES } from "./kernel-external-plans.js";
 import {
-  KERNEL_INTEGRATION_ANCESTRY_MAX_ENTRIES,
   inspectKernelCheckpointBundle,
   inspectKernelCheckpointBundleAdvertisement,
 } from "../runtime/kernel-checkpoint-bundle.js";
@@ -29,6 +28,10 @@ import {
   exactConfirmedGithubPushDelivery,
   isGithubPushDelivery,
 } from "../pipeline/kernel/github-push-delivery.js";
+import {
+  KERNEL_CHECKPOINT_ANCESTRY_MAX_ENTRIES,
+  validateKernelCheckpointAncestryChain,
+} from "../pipeline/kernel/checkpoint-ancestry.js";
 
 const GIT_BUNDLE_SCHEMA = "openthrottle.git-checkpoint-bundle/v1" as const;
 
@@ -190,7 +193,7 @@ function exactIntegrationCheckpointContext(input: {
   const checkpoints = [...input.checkpoints.values()];
   if (
     checkpoints.length < 1 ||
-    checkpoints.length > KERNEL_INTEGRATION_ANCESTRY_MAX_ENTRIES + 1
+    checkpoints.length > KERNEL_CHECKPOINT_ANCESTRY_MAX_ENTRIES + 1
   ) throw new Error("unit integration checkpoint context exceeds its exact bounded shape");
   const sealedCheckpoints = checkpoints.map((checkpoint) => {
     if (
@@ -259,9 +262,6 @@ function exactIntegrationCheckpointContext(input: {
     if (!checkpointArtifact.ref.startsWith("refs/openthrottle/integrations/")) {
       throw new Error("unit integration ancestry is not an integration checkpoint ref");
     }
-    if (checkpoint.output_subject === checkpoint.input_subject) {
-      throw new Error("unit integration ancestry contains a non-advancing edge");
-    }
     return {
       checkpoint_id: checkpoint.id,
       input_subject: checkpoint.input_subject,
@@ -270,34 +270,14 @@ function exactIntegrationCheckpointContext(input: {
       checkpoint_artifact: checkpointArtifact,
     };
   });
-  const byInput = new Map<string, PreparedIntegrationAncestryEntry[]>();
-  for (const edge of proof) {
-    const matches = byInput.get(edge.input_subject) ?? [];
-    matches.push(edge);
-    byInput.set(edge.input_subject, matches);
-  }
-  const ordered: PreparedIntegrationAncestryEntry[] = [];
-  const consumed = new Set<string>();
-  let cursor = candidate.input_subject;
-  while (cursor !== input.current_subject && proof.length > 0) {
-    const matches = (byInput.get(cursor) ?? []).filter((edge) => !consumed.has(edge.checkpoint_id));
-    if (matches.length === 0) throw new Error("unit integration current ancestry contains a gap");
-    if (matches.length > 1) throw new Error("unit integration current ancestry contains a fork");
-    const edge = matches[0]!;
-    if (consumed.has(edge.checkpoint_id) || ordered.some(({ output_subject }) =>
-      output_subject === edge.output_subject)) {
-      throw new Error("unit integration current ancestry contains a cycle or duplicate edge");
-    }
-    consumed.add(edge.checkpoint_id);
-    ordered.push(edge);
-    cursor = edge.output_subject;
-  }
-  if (proof.length > 0 && cursor !== input.current_subject) {
-    throw new Error("unit integration current ancestry does not end at the current subject");
-  }
-  if (consumed.size !== proof.length) {
-    throw new Error("unit integration current ancestry contains disconnected extra checkpoints");
-  }
+  const ordered = proof.length === 0
+    ? []
+    : validateKernelCheckpointAncestryChain({
+      entries: proof,
+      start_subject: candidate.input_subject,
+      end_subject: input.current_subject,
+      label: "unit integration current ancestry",
+    });
   return { candidate, candidate_artifact: candidateArtifact, current_ancestry: ordered };
 }
 
