@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   inspectKernelCheckpointBundle,
@@ -165,7 +165,7 @@ function unprovenCurrentFixture(kind: "divergent" | "orphan") {
 }
 
 describe("kernel checkpoint bundle inspection", () => {
-  it("verifies the exact advertised commit, tree, and sole parent", () => {
+  it("verifies the bundle with isolated no-background Git configuration", () => {
     const work = repository();
     const parent = commit(work, "base\n", "base");
     const output = commit(work, "changed\n", "changed");
@@ -177,8 +177,21 @@ describe("kernel checkpoint bundle inspection", () => {
     execFileSync("git", ["update-ref", ref, output], { cwd: work });
     const bytes = bundle(work, ref, parent);
 
-    const keys = ["GIT_DIR", "GIT_OBJECT_DIRECTORY", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"];
+    const root = dirname(work);
+    const capture = join(root, "git-environment.log");
+    const wrapper = join(root, "git");
+    const realGit = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+    writeFileSync(wrapper, `#!/bin/sh
+printf '%s\\n' "$GIT_CONFIG_COUNT|$GIT_CONFIG_KEY_0=$GIT_CONFIG_VALUE_0|$GIT_CONFIG_KEY_1=$GIT_CONFIG_VALUE_1|$GIT_CONFIG_KEY_2=$GIT_CONFIG_VALUE_2|$GIT_CONFIG_KEY_3=$GIT_CONFIG_VALUE_3" >> ${JSON.stringify(capture)}
+exec ${JSON.stringify(realGit)} "$@"
+`);
+    chmodSync(wrapper, 0o700);
+    const keys = [
+      "PATH", "GIT_DIR", "GIT_OBJECT_DIRECTORY", "GIT_CONFIG_COUNT",
+      "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0",
+    ];
     const original = new Map(keys.map((key) => [key, process.env[key]]));
+    process.env.PATH = `${root}:${process.env.PATH ?? ""}`;
     process.env.GIT_DIR = join(work, ".git", "ambient-redirection");
     process.env.GIT_OBJECT_DIRECTORY = join(work, ".git", "ambient-objects");
     process.env.GIT_CONFIG_COUNT = "1";
@@ -191,6 +204,8 @@ describe("kernel checkpoint bundle inspection", () => {
         expected_tree: tree,
         shallow_boundary: parent,
         expected_parent: parent,
+        required_ancestor: parent,
+        required_descendant: output,
         allowed_ref: /^refs\/openthrottle\/checkpoints\/[a-f0-9]{64}$/,
       })).toEqual({ ref, commit: output, tree, parents: [parent] });
     } finally {
@@ -199,6 +214,10 @@ describe("kernel checkpoint bundle inspection", () => {
         else process.env[key] = value;
       }
     }
+    const expected = "4|maintenance.auto=false|gc.auto=0|gc.autodetach=false|core.fsmonitor=false";
+    const invocations = readFileSync(capture, "utf8").trim().split("\n");
+    expect(invocations).toEqual(expect.arrayContaining([expected]));
+    expect(invocations.every((line) => line === expected)).toBe(true);
   });
 
   it("rejects a bundle whose advertised commit has the wrong parent", () => {
