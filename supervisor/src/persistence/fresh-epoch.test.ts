@@ -12,7 +12,9 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { VolumeBlobStore } from "./blob-store.js";
 import {
+  acceptFreshEpochRelease,
   createFreshEpochBootstrap,
+  EPOCH_RELEASE_ACCEPTANCE_EVIDENCE_SETTING,
   FreshEpochRefusalError,
   initializeFreshEpochDatabase,
   openFreshEpochDatabase,
@@ -21,7 +23,12 @@ import {
   type FreshEpochBootstrap,
   type FreshEpochIdentity,
 } from "./epoch-database.js";
-import { FRESH_EPOCH_TABLES } from "./epoch-schema.js";
+import { FRESH_EPOCH_SCHEMA_CHECKSUM, FRESH_EPOCH_TABLES } from "./epoch-schema.js";
+import {
+  freshKernelFixture,
+  seedKernelAttempt,
+  seedKernelRun,
+} from "./__fixtures__/kernel-epoch.js";
 import { SqliteKernelInboxStore } from "./kernel-inbox-store.js";
 
 const temporaryDirectories: string[] = [];
@@ -403,5 +410,249 @@ describe("fresh epoch database", () => {
       bootstrap: bootstrap(),
     })).toThrow(/sidecar/);
     expect(() => readFileSync(path)).toThrow();
+  });
+});
+
+describe("fresh epoch release acceptance", () => {
+  const acceptedIdentity = {
+    release_id: "release-b",
+    runtime_capability_digest: "d".repeat(64),
+  };
+  const acceptedAt = "2026-08-21T13:30:00.000Z";
+
+  function accept(epoch: ReturnType<typeof initialized>) {
+    if (epoch.db.open) epoch.db.close();
+    return acceptFreshEpochRelease({
+      database_path: epoch.database_path,
+      blob_store: epoch.blob_store,
+      ...acceptedIdentity,
+      schema_checksum: FRESH_EPOCH_SCHEMA_CHECKSUM,
+      now: () => acceptedAt,
+    });
+  }
+
+  it("atomically advances a quiesced closed epoch, persists its receipt, and keeps boot strict", () => {
+    const epoch = initialized();
+    const receipt = accept(epoch);
+
+    expect(receipt).toEqual({
+      schema: "openthrottle.epoch-release-acceptance/v1",
+      previous_identity: {
+        release_id: "release-a",
+        runtime_capability_digest: RUNTIME_CAPABILITY,
+      },
+      accepted_identity: acceptedIdentity,
+      accepted_at: acceptedAt,
+      schema_version: 1,
+      schema_checksum: FRESH_EPOCH_SCHEMA_CHECKSUM,
+      maintenance_ingress_closed: true,
+    });
+    const read = new Database(epoch.database_path, { readonly: true, fileMustExist: true });
+    try {
+      const settings = read.prepare(`
+        SELECT key, value_json, mutable, version FROM settings
+        WHERE key IN ('epoch.release_id', 'epoch.runtime_capability_digest', ?)
+        ORDER BY key
+      `).all(EPOCH_RELEASE_ACCEPTANCE_EVIDENCE_SETTING) as Array<{
+        key: string;
+        value_json: string;
+        mutable: number;
+        version: number;
+      }>;
+      expect(JSON.parse(settings[0]!.value_json)).toEqual(receipt);
+      expect(settings).toEqual([
+        {
+          key: EPOCH_RELEASE_ACCEPTANCE_EVIDENCE_SETTING,
+          value_json: expect.any(String),
+          mutable: 0,
+          version: 0,
+        },
+        {
+          key: "epoch.release_id",
+          value_json: JSON.stringify(acceptedIdentity.release_id),
+          mutable: 0,
+          version: 1,
+        },
+        {
+          key: "epoch.runtime_capability_digest",
+          value_json: JSON.stringify(acceptedIdentity.runtime_capability_digest),
+          mutable: 0,
+          version: 1,
+        },
+      ]);
+    } finally {
+      read.close();
+    }
+
+    expect(() => openFreshEpochDatabase({
+      database_path: epoch.database_path,
+      blob_store: epoch.blob_store,
+      expected_identity: epoch.expected_identity,
+    })).toThrow(/identity mismatch/);
+    const opened = openFreshEpochDatabase({
+      database_path: epoch.database_path,
+      blob_store: epoch.blob_store,
+      expected_identity: { ...epoch.expected_identity, ...acceptedIdentity },
+    });
+    expect(() => opened.prepare(`
+      UPDATE settings SET value_json = '"tampered"' WHERE key = 'epoch.release_id'
+    `).run()).toThrow(/immutable setting/);
+    opened.close();
+  });
+
+  it("refuses open ingress without changing either identity pin", () => {
+    const epoch = initialized();
+    epoch.db.prepare(`
+      UPDATE settings SET value_json = 'false', version = version + 1, updated_at = ?
+      WHERE key = 'epoch.maintenance_ingress_closed'
+    `).run(NOW);
+    epoch.db.close();
+
+    expect(() => accept(epoch)).toThrow(/maintenance ingress to be closed/);
+    const read = new Database(epoch.database_path, { readonly: true });
+    expect(read.prepare("SELECT value_json FROM settings WHERE key = 'epoch.release_id'").get())
+      .toEqual({ value_json: '"release-a"' });
+    expect(read.prepare("SELECT value_json FROM settings WHERE key = ?")
+      .get(EPOCH_RELEASE_ACCEPTANCE_EVIDENCE_SETTING)).toBeUndefined();
+    read.close();
+  });
+
+  it("refuses a live lease without changing either identity pin", () => {
+    const epoch = initialized();
+    epoch.db.prepare(`
+      INSERT INTO leases (
+        lease_key, purpose, owner_id, lease_id, expires_at, version, metadata_json, updated_at
+      ) VALUES ('release-test', 'operator', 'owner', 'lease-live', ?, 0, '{}', ?)
+    `).run("2026-08-21T14:00:00.000Z", NOW);
+    epoch.db.close();
+
+    expect(() => accept(epoch)).toThrow(/zero live leases/);
+    const read = new Database(epoch.database_path, { readonly: true });
+    expect(read.prepare("SELECT value_json FROM settings WHERE key = 'epoch.release_id'").get())
+      .toEqual({ value_json: '"release-a"' });
+    read.close();
+  });
+
+  it("refuses queued inbox work without changing either identity pin", () => {
+    const fixture = freshKernelFixture();
+    try {
+      const inbox = new SqliteKernelInboxStore({
+        db: fixture.db,
+        blob_store: fixture.blobs,
+        now: () => NOW,
+      });
+      expect(inbox.ingest({
+        source_provider: "github",
+        delivery_id: "release-acceptance-pending",
+        kind: "github/issues/opened@1",
+        generation: 0,
+        event_group_key: "github:issue:release-acceptance",
+        delivery_attempt: 1,
+        payload_schema: "github.issue/v1",
+        payload: { action: "opened" },
+      })).toMatchObject({
+        disposition: "inserted",
+        event: { status: "pending", lease_id: null },
+      });
+      inbox.setMaintenanceFence({ closed: true, expected_version: 1 });
+      fixture.db.close();
+
+      expect(() => acceptFreshEpochRelease({
+        database_path: join(fixture.directory, "epoch.sqlite"),
+        blob_store: fixture.blobs,
+        ...acceptedIdentity,
+        schema_checksum: FRESH_EPOCH_SCHEMA_CHECKSUM,
+        now: () => acceptedAt,
+      })).toThrow(/zero pending or processing inbox events/);
+      const read = new Database(join(fixture.directory, "epoch.sqlite"), { readonly: true });
+      expect(read.prepare("SELECT value_json FROM settings WHERE key = 'epoch.release_id'").get())
+        .toEqual({ value_json: '"kernel-u11-release"' });
+      expect(read.prepare("SELECT value_json FROM settings WHERE key = ?")
+        .get(EPOCH_RELEASE_ACCEPTANCE_EVIDENCE_SETTING)).toBeUndefined();
+      read.close();
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("refuses a non-terminal attempt without changing either identity pin", () => {
+    const fixture = freshKernelFixture();
+    try {
+      fixture.db.prepare(`
+        UPDATE settings SET value_json = 'true', version = version + 1, updated_at = ?
+        WHERE key = 'epoch.maintenance_ingress_closed'
+      `).run(NOW);
+      const { run_id } = seedKernelRun({ db: fixture.db });
+      seedKernelAttempt({ db: fixture.db, run_id, id: "attempt-live", status: "pending" });
+      fixture.db.close();
+
+      expect(() => acceptFreshEpochRelease({
+        database_path: join(fixture.directory, "epoch.sqlite"),
+        blob_store: fixture.blobs,
+        ...acceptedIdentity,
+        schema_checksum: FRESH_EPOCH_SCHEMA_CHECKSUM,
+        now: () => acceptedAt,
+      })).toThrow(/zero non-terminal attempts/);
+      const read = new Database(join(fixture.directory, "epoch.sqlite"), { readonly: true });
+      expect(read.prepare("SELECT value_json FROM settings WHERE key = 'epoch.release_id'").get())
+        .toEqual({ value_json: '"kernel-u11-release"' });
+      read.close();
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("refuses a changed schema checksum or an identity already pinned", () => {
+    const changedSchema = initialized();
+    changedSchema.db.close();
+    expect(() => acceptFreshEpochRelease({
+      database_path: changedSchema.database_path,
+      blob_store: changedSchema.blob_store,
+      ...acceptedIdentity,
+      schema_checksum: "e".repeat(64),
+      now: () => acceptedAt,
+    })).toThrow(/schema checksum differs/);
+
+    const identical = initialized();
+    identical.db.close();
+    expect(() => acceptFreshEpochRelease({
+      database_path: identical.database_path,
+      blob_store: identical.blob_store,
+      release_id: identical.expected_identity.release_id,
+      runtime_capability_digest: identical.expected_identity.runtime_capability_digest,
+      schema_checksum: FRESH_EPOCH_SCHEMA_CHECKSUM,
+      now: () => acceptedAt,
+    })).toThrow(/already pinned/);
+  });
+
+  it("rolls back both pins and restores their guard when receipt persistence refuses", () => {
+    const epoch = initialized();
+    epoch.db.prepare(`
+      INSERT INTO settings (key, value_json, value_type, mutable, version, updated_at)
+      VALUES (?, '"malformed"', 'string', 1, 0, ?)
+    `).run(EPOCH_RELEASE_ACCEPTANCE_EVIDENCE_SETTING, NOW);
+    epoch.db.close();
+
+    expect(() => accept(epoch)).toThrow(/evidence setting has an invalid shape/);
+    const db = new Database(epoch.database_path, { fileMustExist: true });
+    try {
+      expect(db.prepare(`
+        SELECT key, value_json, version FROM settings
+        WHERE key IN ('epoch.release_id', 'epoch.runtime_capability_digest')
+        ORDER BY key
+      `).all()).toEqual([
+        { key: "epoch.release_id", value_json: '"release-a"', version: 0 },
+        {
+          key: "epoch.runtime_capability_digest",
+          value_json: JSON.stringify(RUNTIME_CAPABILITY),
+          version: 0,
+        },
+      ]);
+      expect(() => db.prepare(`
+        UPDATE settings SET value_json = '"tampered"' WHERE key = 'epoch.release_id'
+      `).run()).toThrow(/immutable setting/);
+    } finally {
+      db.close();
+    }
   });
 });
