@@ -28,6 +28,7 @@ import {
   exactConfirmedGithubPushDelivery,
   isGithubPushDelivery,
 } from "../pipeline/kernel/github-push-delivery.js";
+import { exactSandboxRecoveryRecord } from "../pipeline/kernel/sandbox-recovery.js";
 import {
   KERNEL_CHECKPOINT_ANCESTRY_MAX_ENTRIES,
   validateKernelCheckpointAncestryChain,
@@ -57,6 +58,7 @@ function runtimeIdentity(input: {
   repository: string;
   base_commit: string;
   snapshot: string;
+  recovery_record_id?: string;
 }): string {
   return digestCanonicalJson({ schema: "openthrottle.daytona-runtime-identity/v1", ...input });
 }
@@ -343,12 +345,14 @@ function lifecycleBinding(input: {
     phases: shape.phases,
     async prepare({ run, context }) {
       const environment = input.environments.loadExactRunEnvironment(run.id);
+      const recoveryRecord = exactSandboxRecoveryRecord([...context.records.values()]);
       const identity = input.external_kind === "core/daytona-provision@1"
         ? runtimeIdentity({
           pipeline_run_id: run.id,
           repository: environment.repository,
           base_commit: run.current_subject,
           snapshot: environment.runtime_snapshot,
+          ...(recoveryRecord === null ? {} : { recovery_record_id: recoveryRecord.id }),
         })
         : persistedRuntimeIdentity(context.records);
       return {

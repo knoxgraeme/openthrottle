@@ -245,6 +245,11 @@ export interface SettleAttemptCommand extends KernelCommandBase {
   next_attempts: readonly KernelAttempt[];
   next_dependencies?: Readonly<Record<string, readonly string[]>>;
   effect_intents?: readonly EffectIntent[];
+  sandbox_recovery?: {
+    recovery_record_id: string;
+    target_stage_id: string;
+    input_subjects: Readonly<Record<string, string>>;
+  };
 }
 
 export interface RetryAttemptCommand extends KernelCommandBase {

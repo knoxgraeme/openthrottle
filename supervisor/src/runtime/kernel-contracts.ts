@@ -164,6 +164,8 @@ export type KernelRuntimeOutcome =
   | {
     state: "work_failed";
     retryable: boolean;
+    /** The owning sandbox is poisoned and must not execute this Attempt again. */
+    sandbox_fatal?: boolean;
     reason: string;
   }
   | {

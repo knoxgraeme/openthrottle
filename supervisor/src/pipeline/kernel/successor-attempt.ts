@@ -19,6 +19,7 @@ import {
   exactKernelRuntimeCleanupDeliveries,
   exactKernelRuntimeResourceDeliveries,
 } from "./runtime-resource.js";
+import { exactSandboxRecoveryRecord } from "./sandbox-recovery.js";
 import {
   runtimeCleanupOutcome,
   runtimeExhaustionDestination,
@@ -106,9 +107,17 @@ export function deriveKernelSuccessorAttempt(input: {
   const runtimeResourceRecords = exactKernelRuntimeResourceDeliveries(
     [...input.request_inputs.context.records.values()],
   ) ?? [];
+  const recoveryRecord = exactSandboxRecoveryRecord(
+    [...input.request_inputs.context.records.values()],
+  );
   const uniqueRecords = mergeCausalGithubPushContext({
     pipeline_run_id: input.view.run.id,
-    base_records: [input.result, input.decision, ...runtimeResourceRecords],
+    base_records: [
+      input.result,
+      input.decision,
+      ...runtimeResourceRecords,
+      ...(recoveryRecord === null ? [] : [recoveryRecord]),
+    ],
     inherited_records: [...input.request_inputs.context.records.values()],
     additional_records: input.additional_context_records,
   });
@@ -138,6 +147,7 @@ export function deriveKernelTerminalCleanupAttempt(input: {
   outcome: PipelineTerminalOutcome;
   task_prompt: string;
   runtime_delivery_records: readonly ExecutionRecord[];
+  recovery_frontier_records?: readonly ExecutionRecord[];
 }): KernelAttempt {
   const deliveries = exactKernelRuntimeCleanupDeliveries(input.runtime_delivery_records);
   if (deliveries === null) {
@@ -148,7 +158,11 @@ export function deriveKernelTerminalCleanupAttempt(input: {
   if (!target || target.kind !== "effect" || target.effect !== "core/daytona-stop@1") {
     throw new Error(`compiled manifest has no exact runtime stop stage for ${input.outcome}`);
   }
-  const records: ExecutionRecord[] = [input.decision, ...deliveries]
+  const records: ExecutionRecord[] = [
+    input.decision,
+    ...(input.recovery_frontier_records ?? []),
+    ...deliveries,
+  ]
     .sort((left, right) => compareCodeUnits(left.id, right.id));
   return createPendingKernelAttempt({
     id: `attempt-${digestCanonicalJson({

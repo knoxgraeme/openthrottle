@@ -24,6 +24,10 @@ import {
   runtimeExhaustionDestination,
 } from "./runtime-lifecycle.js";
 import {
+  exactSandboxRecoveryFrontier,
+  sandboxRecoveryAttemptId,
+} from "./sandbox-recovery.js";
+import {
   assertAttemptCommandMapsEmpty,
   assertBaseInput,
   assertExactMap,
@@ -83,6 +87,26 @@ function bundle(content: AtomicTransitionBundleContent): AtomicTransitionBundle 
   return { ...content, content_hash: digestCanonicalJson(content) };
 }
 
+function appendRecordOrder(records: readonly ExecutionRecord[]): ExecutionRecord[] {
+  const pending = [...records].sort((left, right) => compareCodeUnits(left.id, right.id));
+  const appendedIds = new Set<string>();
+  const batchIds = new Set(pending.map(({ id }) => id));
+  const ordered: ExecutionRecord[] = [];
+  while (pending.length > 0) {
+    const nextIndex = pending.findIndex((record) =>
+      record.kind !== "decision" || record.input_record_ids.every((inputId) =>
+        !batchIds.has(inputId) || appendedIds.has(inputId)
+      ));
+    if (nextIndex < 0) {
+      throw new Error("appended DecisionRecords contain cyclic input references");
+    }
+    const [next] = pending.splice(nextIndex, 1);
+    ordered.push(next!);
+    appendedIds.add(next!.id);
+  }
+  return ordered;
+}
+
 function baseContent(input: {
   command: KernelCommand;
   expected: AtomicTransitionBundleContent["expected"];
@@ -101,7 +125,9 @@ function baseContent(input: {
     run: input.run,
     attempt_writes: [...(input.attemptWrites ?? [])].sort(attemptWriteOrder),
     create_attempts: [...(input.createAttempts ?? [])].sort(attemptOrder),
-    append_records: [...(input.appendRecords ?? [])].sort((left, right) => compareCodeUnits(left.id, right.id)),
+    // SQLite validates DecisionRecord inputs as each row is inserted, so newly
+    // appended inputs must precede the decisions that cite them.
+    append_records: appendRecordOrder(input.appendRecords ?? []),
     append_checkpoints: [...(input.appendCheckpoints ?? [])]
       .sort((left, right) => compareCodeUnits(left.id, right.id)),
     put_effects: [...(input.putEffects ?? [])].sort((left, right) => compareCodeUnits(left.id, right.id)),
@@ -521,7 +547,32 @@ function terminalCommand(
       throw new Error("terminal command does not match its exact current attempt");
     }
   }
-  if (outcome === "failed" && current && current.status !== "pending" && current.status !== "running") {
+  const sandboxRecovery = current === null
+    ? false
+    : sandboxRecoveryAttemptId(authorization.decision) === current.id;
+  const recoveryFrontier = exactSandboxRecoveryFrontier(authorization.exact_records);
+  if (sandboxRecovery) {
+    const expectedMembers = input.run.cursor.frontier
+      .filter(({ attempt_id }) => input.run.active_attempt_versions[attempt_id] !== undefined)
+      .map(({ attempt_id, depends_on }) => ({ attempt_id, depends_on }))
+      .sort((left, right) => compareCodeUnits(left.attempt_id, right.attempt_id));
+    const actualMembers = recoveryFrontier.map(({ attempt_id, depends_on }) => ({
+      attempt_id,
+      depends_on,
+    }));
+    if (canonicalJsonValue(actualMembers) !== canonicalJsonValue(expectedMembers)) {
+      throw new Error("sandbox recovery evidence does not preserve the exact active frontier");
+    }
+    if (recoveryFrontier.some(({ record, stage_id }) =>
+      record.pipeline_run_id !== input.run.id || stage_id !== input.run.cursor.stage_id
+    )) throw new Error("sandbox recovery frontier evidence belongs to another run or stage");
+  } else if (recoveryFrontier.length > 0) {
+    throw new Error("ordinary terminalization cannot carry sandbox recovery frontier evidence");
+  }
+  if (
+    outcome === "failed" && current && current.status !== "pending" && current.status !== "running" &&
+    !sandboxRecovery
+  ) {
     throw new Error("completed work cannot be discarded as a generic failure");
   }
   const disposition = input.command.type === "needs_human" || input.command.type === "fail" ||
@@ -552,10 +603,13 @@ function terminalCommand(
     throw new Error("runtime cleanup cannot begin while an external outcome is unresolved");
   }
   const evidenceIds = sortedUnique(disposition.runtime_delivery_record_ids);
+  const frontierRecordIds = recoveryFrontier.map(({ record }) => record.id).sort(compareCodeUnits);
+  const decisionRuntimeEvidenceIds = authorization.decision.input_record_ids
+    .filter((id) => !frontierRecordIds.includes(id))
+    .sort(compareCodeUnits);
   if (
     evidenceIds.length !== disposition.runtime_delivery_record_ids.length ||
-    canonicalJsonValue(evidenceIds) !==
-      canonicalJsonValue([...authorization.decision.input_record_ids].sort())
+    canonicalJsonValue(evidenceIds) !== canonicalJsonValue(decisionRuntimeEvidenceIds)
   ) throw new Error("runtime cleanup decision must cite exactly its declared DeliveryRecords");
   const evidence = authorization.exact_records.filter(
     (record) => record.id !== authorization.decision.id,
@@ -577,7 +631,10 @@ function terminalCommand(
     expectedStageId: cleanupStageId,
     expectedInputSubject: input.run.current_subject,
   });
-  const expectedContextIds = sortedUnique([authorization.decision.id, ...evidenceIds]);
+  const expectedContextIds = sortedUnique([
+    authorization.decision.id,
+    ...authorization.decision.input_record_ids,
+  ]);
   if (
     canonicalJsonValue(disposition.cleanup_attempt.context_record_ids) !==
     canonicalJsonValue(expectedContextIds) ||
@@ -604,7 +661,7 @@ function terminalCommand(
     run: nextRun,
     attemptWrites: terminalAttemptWrites(input.run, current, outcome),
     createAttempts: [disposition.cleanup_attempt],
-    appendRecords: [authorization.decision],
+    appendRecords: [authorization.decision, ...recoveryFrontier.map(({ record }) => record)],
   }));
 }
 
@@ -1160,7 +1217,34 @@ function settle(input: ReducerInput): AtomicTransitionBundle {
       : input.run.current_subject;
   if (acceptedSubject === null) throw new Error("accepted edit settlement has no verified output subject");
   const runAtAcceptedSubject: KernelRun = { ...input.run, current_subject: acceptedSubject };
-  const transition = effectiveTransition({ run: runAtAcceptedSubject, stage, outcome: command.outcome });
+  let transition = effectiveTransition({ run: runAtAcceptedSubject, stage, outcome: command.outcome });
+  if (command.sandbox_recovery !== undefined) {
+    const recoveryRecord = authorization.exact_records.find(
+      ({ id }) => id === command.sandbox_recovery!.recovery_record_id,
+    );
+    const failedAttemptId = recoveryRecord === undefined
+      ? null
+      : sandboxRecoveryAttemptId(recoveryRecord);
+    if (failedAttemptId === null) {
+      throw new Error("sandbox recovery settlement lacks its exact recovery DecisionRecord");
+    }
+    const cleanupOutcome = runtimeCleanupOutcome(stage);
+    const isCleanupReprovision = cleanupOutcome !== null &&
+      command.sandbox_recovery.target_stage_id === RUNTIME_PROVISION_STAGE_ID &&
+      (command.outcome === "success" || command.outcome === "no_change");
+    const isProvisionResume = stage.id === RUNTIME_PROVISION_STAGE_ID &&
+      stage.kind === "effect" && stage.effect === "core/daytona-provision@1" &&
+      command.sandbox_recovery.target_stage_id !== RUNTIME_PROVISION_STAGE_ID &&
+      (command.outcome === "success" || command.outcome === "no_change");
+    if (!isCleanupReprovision && !isProvisionResume) {
+      throw new Error("sandbox recovery settlement uses an invalid lifecycle edge");
+    }
+    stageFor(input.manifest, command.sandbox_recovery.target_stage_id);
+    transition = {
+      to: command.sandbox_recovery.target_stage_id,
+      reentries: input.run.cursor.reentries,
+    };
+  }
   if (transition.terminal !== undefined) {
     assertExactMap(input.checkpoints, [], "checkpoint map");
     if (command.next_attempts.length > 0) throw new Error("terminal transition cannot schedule attempts");
@@ -1217,6 +1301,14 @@ function settle(input: ReducerInput): AtomicTransitionBundle {
       acceptedSubject,
       nextAttempts: command.next_attempts,
     });
+    if (command.sandbox_recovery !== undefined) {
+      const expectedAttemptIds = command.next_attempts.map(({ id }) => id).sort(compareCodeUnits);
+      const subjectAttemptIds = Object.keys(command.sandbox_recovery.input_subjects)
+        .sort(compareCodeUnits);
+      if (canonicalJsonValue(subjectAttemptIds) !== canonicalJsonValue(expectedAttemptIds)) {
+        throw new Error("sandbox recovery input subjects do not match its restored frontier");
+      }
+    }
     assertExactMap(input.checkpoints, structuredSubjects.checkpointIds, "checkpoint map");
     assertUniqueNewAttempts(command.next_attempts, input.run);
     for (const nextAttempt of command.next_attempts) {
@@ -1224,7 +1316,8 @@ function settle(input: ReducerInput): AtomicTransitionBundle {
         manifest: input.manifest,
         run: runAtAcceptedSubject,
         expectedStageId: transition.to,
-        expectedInputSubject: structuredSubjects.subjects.get(nextAttempt.id)!,
+        expectedInputSubject: command.sandbox_recovery?.input_subjects[nextAttempt.id] ??
+          structuredSubjects.subjects.get(nextAttempt.id)!,
       });
     }
   }

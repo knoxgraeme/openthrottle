@@ -63,6 +63,13 @@ import {
   kernelSuccessorStageId,
 } from "./successor-attempt.js";
 import { exactKernelRuntimeCleanupDeliveries } from "./runtime-resource.js";
+import {
+  isSandboxFatalEnospc,
+  sandboxFailureReason,
+  sandboxRecoveryFrontierEvaluator,
+  sandboxRecoveryFrontierReason,
+  sandboxRecoveryEvaluator,
+} from "./sandbox-recovery.js";
 import { stageFor } from "./reducer-support.js";
 
 export interface OrdinaryKernelStore extends
@@ -123,10 +130,14 @@ function transitionId(kind: string, identity: unknown): string {
 
 function mapWith<T extends { id: string }>(
   existing: ReadonlyMap<string, T>,
-  addition: T,
+  ...additions: readonly T[]
 ): ReadonlyMap<string, T> {
-  if (existing.has(addition.id)) throw new Error(`aggregate already contains ${addition.id}`);
-  return new Map([...existing, [addition.id, addition]]);
+  const next = new Map(existing);
+  for (const addition of additions) {
+    if (next.has(addition.id)) throw new Error(`aggregate already contains ${addition.id}`);
+    next.set(addition.id, addition);
+  }
+  return next;
 }
 
 function sameCheckpoint(left: AttemptCheckpoint, right: AttemptCheckpoint): boolean {
@@ -275,6 +286,9 @@ export class OrdinaryKernelCoordinator {
     try {
       const view = await this.#load(leased.run_id, leased.attempt.id);
       assertAttemptLeaseClaim(view, claim);
+      if (isSandboxFatalEnospc(error)) {
+        return await this.#recoverSandboxFatal(view, sandboxFailureReason(error), claim);
+      }
       if (leased.lease.generation < view.run.work_retry_limit) return null;
       try {
         return await this.#terminal(view, "needs_human", reason, claim);
@@ -557,6 +571,9 @@ export class OrdinaryKernelCoordinator {
     assertAttemptLeaseClaim(input.view, input.claim);
     const attempt = input.view.current_attempt!;
     if (input.outcome.state === "work_failed") {
+      if (input.outcome.sandbox_fatal || isSandboxFatalEnospc(input.outcome.reason)) {
+        return this.#recoverSandboxFatal(input.view, input.outcome.reason, input.claim);
+      }
       if (
         input.outcome.retryable &&
         attempt.work_retry_ordinal < input.view.run.work_retry_limit
@@ -646,6 +663,103 @@ export class OrdinaryKernelCoordinator {
     });
   }
 
+  async #recoverSandboxFatal(
+    view: ReductionView,
+    failureReason: string,
+    claim: AttemptLeaseClaim,
+  ): Promise<OrdinaryKernelStep> {
+    assertAttemptLeaseClaim(view, claim);
+    const attempt = view.current_attempt!;
+    const reason = `sandbox_fatal_enospc: ${failureReason}`.slice(0, 1_500);
+    if (attempt.work_retry_ordinal >= view.run.work_retry_limit) {
+      return this.#terminal(view, "failed", reason, claim);
+    }
+    const requestInputs = await this.#store.loadAttemptRequestInputs({
+      pipeline_run_id: view.run.id,
+      attempt_id: attempt.id,
+    });
+    const runtimeDeliveries = exactKernelRuntimeCleanupDeliveries(
+      [...requestInputs.context.records.values()],
+    );
+    if (runtimeDeliveries === null) return this.#terminal(view, "failed", reason, claim);
+    const recoveryFrontier = await Promise.all(view.run.cursor.frontier
+      .filter(({ attempt_id }) => view.run.active_attempt_versions[attempt_id] !== undefined)
+      .map(async (member) => {
+        const memberAttempt = member.attempt_id === attempt.id
+          ? attempt
+          : (await this.#load(view.run.id, member.attempt_id)).current_attempt;
+        if (
+          !memberAttempt ||
+          view.run.active_attempt_versions[memberAttempt.id] !== memberAttempt.version
+        ) throw new Error(`sandbox recovery lost active frontier Attempt ${member.attempt_id}`);
+        return createPipelineDecisionRecord({
+          attempt: memberAttempt,
+          result: null,
+          evaluated: {
+            evaluator: sandboxRecoveryFrontierEvaluator(memberAttempt.id),
+            outcome: "retryable_infrastructure_failure",
+            reason: sandboxRecoveryFrontierReason(member.depends_on),
+          },
+          created_at: this.#now(),
+        });
+      }));
+    const decision = createPipelineDecisionRecord({
+      attempt,
+      result: null,
+      additional_input_records: [...runtimeDeliveries, ...recoveryFrontier],
+      evaluated: {
+        evaluator: sandboxRecoveryEvaluator(attempt.id),
+        outcome: "retryable_infrastructure_failure",
+        reason,
+      },
+      created_at: this.#now(),
+    });
+    const bundle = await this.#bundles.resolveExactDefinitionBundle({
+      pipeline_run_id: view.run.id,
+      definition_bundle_hash: view.run.definition_bundle_hash,
+    });
+    const cleanupAttempt = deriveKernelTerminalCleanupAttempt({
+      view,
+      current: attempt,
+      decision,
+      bundle,
+      outcome: "failed",
+      task_prompt: requestInputs.task_prompt,
+      runtime_delivery_records: runtimeDeliveries,
+      recovery_frontier_records: recoveryFrontier,
+    });
+    const exact = await this.#load(
+      view.run.id,
+      attempt.id,
+      runtimeDeliveries.map(({ id }) => id),
+    );
+    await this.#apply({
+      ...exact,
+      records: mapWith(exact.records, ...recoveryFrontier, decision),
+      checkpoints: new Map(),
+    }, {
+      type: "fail",
+      command_id: transitionId("sandbox-fatal-recovery", {
+        attempt: attempt.id,
+        decision: decision.id,
+      }),
+      attempt_id: attempt.id,
+      decision_record_id: decision.id,
+      reason,
+      resource_disposition: {
+        kind: "cleanup",
+        runtime_delivery_record_ids: runtimeDeliveries.map(({ id }) => id).sort(),
+        cleanup_attempt: cleanupAttempt,
+      },
+    }, claim);
+    return this.#step(
+      "retried",
+      await this.#load(view.run.id, null),
+      attempt.id,
+      attempt.scope.stage_id,
+    );
+  }
+
   async #handleCorrectionOutcome(input: {
     view: ReductionView;
     bundle: Awaited<ReturnType<KernelDefinitionBundlePort["resolveExactDefinitionBundle"]>>;
@@ -655,6 +769,12 @@ export class OrdinaryKernelCoordinator {
   }): Promise<OrdinaryKernelStep> {
     assertAttemptLeaseClaim(input.view, input.claim);
     const attempt = input.view.current_attempt!;
+    if (
+      input.outcome.state === "work_failed" &&
+      (input.outcome.sandbox_fatal || isSandboxFatalEnospc(input.outcome.reason))
+    ) {
+      return this.#recoverSandboxFatal(input.view, input.outcome.reason, input.claim);
+    }
     if (input.outcome.state === "work_complete") {
       if (!sameCheckpoint(input.checkpoint, input.outcome.checkpoint)) {
         throw new Error("result correction changed the locked work checkpoint");

@@ -204,6 +204,11 @@ export interface KernelExternalSettlementPlan {
   outcome: string;
   next_attempts: readonly KernelAttempt[];
   next_dependencies?: Readonly<Record<string, readonly string[]>>;
+  sandbox_recovery?: {
+    recovery_record_id: string;
+    target_stage_id: string;
+    input_subjects: Readonly<Record<string, string>>;
+  };
 }
 
 export interface KernelExternalSettlementPlanner {
