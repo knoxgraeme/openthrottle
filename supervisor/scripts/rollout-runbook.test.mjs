@@ -9,6 +9,7 @@ const runbook = readFileSync(
   resolve(repoRoot, "docs/runbooks/execution-kernel-rollout.md"),
   "utf8",
 );
+const readme = readFileSync(resolve(repoRoot, "README.md"), "utf8");
 const ci = readFileSync(resolve(repoRoot, ".github/workflows/ci.yml"), "utf8");
 
 function extractDelimited(source, prefix, suffix) {
@@ -68,6 +69,23 @@ function validateReceiptCandidates(candidates) {
 }
 
 describe("fresh-epoch rollout runbook", () => {
+  it("requires merge-facing identity for harness pull requests", () => {
+    const section = runbook.slice(
+      runbook.indexOf("## 5. Register, open ingress, and dogfood"),
+      runbook.indexOf("## 6. Accept a later release identity"),
+    );
+
+    for (const guide of [readme, section]) {
+      expect(guide).toContain("squash");
+      expect(guide).toContain("Default commit message");
+      expect(guide).toContain("Pull request title");
+      expect(guide).toContain("ot/*");
+      expect(guide).toContain("source reference");
+    }
+    expect(section).toContain("git log -1 --oneline origin/main");
+    expect(section).toContain("OpenThrottle integrated checkpoint");
+  });
+
   it("keeps maintenance closed until exceptional recovery cleanup is clear", () => {
     const section = runbook.slice(runbook.indexOf("## 7. Reject a proven pre-mutation sandbox failure"));
     const activeWorkIndex = section.indexOf('ACTIVE_WORK="$(');

@@ -895,7 +895,10 @@ describe("kernel publication plan binding", () => {
     });
     expect(firstPromoted.prepared.phases[2]!.effects[0]).toMatchObject({
       subject: firstPublication,
-      payload: { expected_head_subject: firstPublication },
+      payload: {
+        expected_head_subject: firstPublication,
+        title: "Dogfood repair (OPE-201)",
+      },
     });
 
     // Recovery after phase-zero promotion retains the immutable private
