@@ -2352,6 +2352,7 @@ describe("SqliteKernelStore", () => {
       });
       expect(redispatchLease).toMatchObject({
         execution_mode: "dispatch_or_reconcile",
+        prior_unknown_detail: "provider lookup failed before dispatch",
         dispatch_fence: null,
       });
       await expect(context.store.markLeasedEffectDispatchStarted({
@@ -2365,6 +2366,7 @@ describe("SqliteKernelStore", () => {
         worker_id: "effect-worker",
       });
       expect(dispatchStarted.execution_mode).toBe("reconcile_only");
+      expect(dispatchStarted.prior_unknown_detail).toBe("provider lookup failed before dispatch");
       expect(await context.store.markLeasedEffectDispatchStarted({
         effect_id: "effect-1",
         lease_id: "effect-lease-redispatch",
@@ -2393,7 +2395,10 @@ describe("SqliteKernelStore", () => {
         lease_id: "effect-lease-3",
         expires_at: "2026-08-20T12:15:00.000Z",
       });
-      expect(reconciliationLease?.execution_mode).toBe("reconcile_only");
+      expect(reconciliationLease).toMatchObject({
+        execution_mode: "reconcile_only",
+        prior_unknown_detail: "provider dispatch may have started before the effect lease expired",
+      });
       await context.store.completeLeasedEffect({
         effect_id: "effect-1",
         lease_id: "effect-lease-3",
@@ -2419,7 +2424,10 @@ describe("SqliteKernelStore", () => {
         lease_id: "effect-lease-4",
         expires_at: "2026-08-20T12:20:00.000Z",
       });
-      expect(heldUnknownLease?.execution_mode).toBe("reconcile_only");
+      expect(heldUnknownLease).toMatchObject({
+        execution_mode: "reconcile_only",
+        prior_unknown_detail: "provider timed out",
+      });
       const delivery: DeliveryRecord = {
         schema: EXECUTION_RECORD_SCHEMA,
         id: "delivery-1",

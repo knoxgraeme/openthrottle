@@ -1660,7 +1660,7 @@ export class SqliteKernelStore implements
     const changed = this.#db.prepare(`
       UPDATE effects SET status = 'canceled', version = version + 1,
         lease_id = NULL, lease_worker_id = NULL, lease_expires_at = NULL,
-        lease_execution_mode = NULL, unknown_detail = NULL, updated_at = ?
+        lease_execution_mode = NULL, unknown_detail = NULL, last_error = NULL, updated_at = ?
       WHERE id = ? AND pipeline_run_id = ? AND status IN ('pending', 'processing', 'unknown')
     `).run(this.#now(), effectId, runId);
     if (changed.changes !== 1) throw new Error(`effect ${effectId} cannot be canceled from its current fence`);
