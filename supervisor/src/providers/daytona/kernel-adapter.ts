@@ -190,18 +190,31 @@ const DAYTONA_INTEGRATION_ABSENCE_CONTINUATION_SCHEMA =
   "openthrottle.daytona-integration-absence-continuation/v1" as const;
 const DAYTONA_INTEGRATION_FATAL_ABSENCE_THRESHOLD = 2;
 
+function canonicalProviderErrorDetail(error: unknown, fallback: string): string {
+  try {
+    return canonicalJson(jsonValueAt(error, "daytona_provider_error"));
+  } catch {
+    return fallback;
+  }
+}
+
 function providerErrorDetail(error: unknown, fallback: string): string {
   let detail: string;
   if (error instanceof Error) {
-    detail = error.message;
+    const message = error.message.trim();
+    if (message !== "[object Object]") {
+      detail = message;
+    } else {
+      const evidence: Record<string, unknown> = { ...error };
+      if (error.cause !== undefined) evidence.cause = error.cause;
+      detail = Object.keys(evidence).length > 0
+        ? canonicalProviderErrorDetail(evidence, fallback)
+        : fallback;
+    }
   } else if (typeof error === "string") {
     detail = error;
   } else {
-    try {
-      detail = canonicalJson(jsonValueAt(error, "daytona_provider_error"));
-    } catch {
-      detail = fallback;
-    }
+    detail = canonicalProviderErrorDetail(error, fallback);
   }
   return detail.trim().length > 0 ? detail : fallback;
 }
@@ -1231,6 +1244,26 @@ export class DaytonaKernelAdapter implements
     return matches[0] ?? null;
   }
 
+  async #activateForReconciliation(
+    sandbox: Sandbox,
+    purpose: string,
+  ): Promise<{ kind: "ready"; sandbox: Sandbox } | { kind: "retry"; detail: string }> {
+    const state = String(sandbox.state);
+    if (state !== "stopped" && state !== "archived") return { kind: "ready", sandbox };
+    try {
+      await sandbox.start(60);
+      return { kind: "ready", sandbox: await this.#daytona.get(sandbox.id) };
+    } catch (error) {
+      return {
+        kind: "retry",
+        detail: `${purpose} sandbox ${sandbox.id} is ${state}; recovery start failed: ${providerErrorDetail(
+          error,
+          "provider did not return a sandbox start failure detail",
+        )}`,
+      };
+    }
+  }
+
   async #reconcileIntegration(
     intent: Readonly<EffectIntent>,
     dispatchFence: { lease_id: string; worker_id: string } | null,
@@ -1277,6 +1310,15 @@ export class DaytonaKernelAdapter implements
         },
       };
     }
+    const activation = await this.#activateForReconciliation(sandbox, "integration runtime");
+    if (activation.kind === "retry") {
+      return {
+        kind: "retry",
+        detail: activation.detail,
+        continuation: integrationAbsenceContinuation(0),
+      };
+    }
+    sandbox = activation.sandbox;
     try {
       const paths = integrationPaths(intent.id, dispatchFence.lease_id);
       const raw = await downloadUtf8(sandbox, paths.result);
@@ -1456,7 +1498,7 @@ export class DaytonaKernelAdapter implements
     const authority = payload(intent, schema);
     const matches = await this.#matchingSandboxes(authority.identity);
     if (matches.length > 1) return { kind: "unknown", detail: "multiple sandboxes match one runtime identity" };
-    const sandbox = matches[0];
+    let sandbox = matches[0];
     if (effectKind === "daytona/cleanup-sandbox@1") {
       return sandbox
         ? { kind: "not_found" }
@@ -1470,6 +1512,13 @@ export class DaytonaKernelAdapter implements
           sandbox_id: null, resource_state: "absent", identity: authority.identity,
         } }
         : { kind: "not_found" };
+    }
+    if (effectKind === "daytona/start-sandbox@1") {
+      const activation = await this.#activateForReconciliation(sandbox, "runtime lifecycle");
+      if (activation.kind === "retry") {
+        return { kind: "retry", detail: activation.detail, continuation: null };
+      }
+      sandbox = activation.sandbox;
     }
     const state = String(sandbox.state);
     if (effectKind === "daytona/start-sandbox@1" && state !== "started") return { kind: "not_found" };

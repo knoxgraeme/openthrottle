@@ -198,7 +198,20 @@ function abortIfRequested(signal: AbortSignal | undefined): void {
 function diagnostic(error: unknown): string {
   let text: string;
   if (error instanceof Error) {
-    text = error.message;
+    const message = error.message.trim();
+    if (message !== "[object Object]") {
+      text = message;
+    } else {
+      const evidence: Record<string, unknown> = { ...error };
+      if (error.cause !== undefined) evidence.cause = error.cause;
+      try {
+        text = Object.keys(evidence).length > 0
+          ? canonicalJson(jsonValueAt(evidence, "provider_diagnostic"))
+          : "provider returned an unrepresentable diagnostic";
+      } catch {
+        text = "provider returned an unrepresentable diagnostic";
+      }
+    }
   } else if (typeof error === "string") {
     text = error;
   } else {
