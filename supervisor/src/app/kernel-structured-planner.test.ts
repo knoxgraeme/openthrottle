@@ -1254,4 +1254,168 @@ describe("KernelStructuredSettlementPlanner", () => {
       remediation.decision.id,
     ].sort());
   });
+
+  it("anchors a divergent persona-review failure stop to records persisted by its settlement", async () => {
+    const store = new PlanningStore();
+    const runtime = [runtimeDelivery("create"), runtimeDelivery("start")];
+    const boundary: AttemptCheckpoint = {
+      schema: ATTEMPT_CHECKPOINT_SCHEMA,
+      id: "checkpoint-integrated-boundary-terminal",
+      pipeline_run_id: "run-1",
+      attempt_id: "attempt-integrate-all",
+      request_hash: "d".repeat(64),
+      definition_bundle_hash: DEFINITIONS.manifest.definition_bundle_hash,
+      input_subject: SOURCE,
+      output_subject: INTEGRATED,
+      native_session_id: null,
+      payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+      payload: { inline: { exact: true } },
+      captured_at: NOW,
+    };
+    const request = requestInputs({ records: runtime, checkpoints: [boundary] });
+    const pending = (id: string, memberId: string, memberIndex: number) => pendingAttempt({
+      id,
+      stage_id: "persona_review",
+      scope: {
+        kind: "fanout_member",
+        stage_id: "persona_review",
+        parent_attempt_id: "attempt-selector",
+        fanout_id: "selection.personas",
+        member_id: memberId,
+        member_index: memberIndex,
+      },
+      input_subject: INTEGRATED,
+      request,
+    });
+    const first = completedAttempt({
+      pending: pending("attempt-review-correctness", "core/correctness-dataflow", 0),
+      output_subject: null,
+      request,
+      settled: true,
+      evaluated: {
+        evaluator: "core/review-outcome@1",
+        outcome: "success",
+        reason: "validated_semantic_result",
+      },
+    });
+    const second = completedAttempt({
+      pending: pending("attempt-review-security", "core/security", 1),
+      output_subject: null,
+      request,
+      evaluated: {
+        evaluator: "core/review-outcome@1",
+        outcome: "failure",
+        reason: "blocking_review_failure",
+      },
+    });
+    store.requests.set(second.attempt.id, request);
+    store.settled = [first.evidence];
+    const planner = new KernelStructuredSettlementPlanner({ store, now: () => NOW });
+
+    const settlement = await planner.plan(ordinaryInput({
+      attempt: second.attempt,
+      checkpoint: second.checkpoint,
+      result: second.result,
+      view: view({
+        attempts: [first.attempt, second.attempt],
+        current: second.attempt,
+        completed: [frontierMemberKey(first.attempt)],
+        current_subject: INTEGRATED,
+      }),
+      outcome: "failure",
+      evaluator: "core/review-outcome@1",
+      reason: "blocking_review_failure",
+    }));
+
+    expect(settlement.next_attempts).toHaveLength(1);
+    expect(settlement.next_attempts[0]!.scope).toEqual({
+      kind: "stage",
+      stage_id: "ot_runtime_stop_failed",
+    });
+    expect(stage("ot_runtime_stop_failed")).toMatchObject({
+      kind: "effect",
+      effect: "core/daytona-stop@1",
+      on: { success: { to: "ot_runtime_cleanup_failed" } },
+    });
+    expect(stage("ot_runtime_cleanup_failed")).toMatchObject({
+      kind: "effect",
+      effect: "core/daytona-cleanup@1",
+      on: { success: { terminal: "failed" } },
+    });
+    expect(settlement.decision.id).not.toBe(second.decision.id);
+    expect(settlement.next_attempts[0]!.context_record_ids).toEqual([
+      ...runtime.slice(0, 2).map(({ id }) => id),
+      first.result.id,
+      first.decision.id,
+      second.result.id,
+      settlement.decision.id,
+    ].sort());
+  });
+
+  it("anchors a divergent loop-item failure stop to records persisted by its settlement", async () => {
+    const store = new PlanningStore();
+    const runtime = [runtimeDelivery("create"), runtimeDelivery("start"), promotionDecision()];
+    const request = requestInputs({ records: runtime });
+    const pending = (id: string, itemId: string, itemIndex: number) => pendingAttempt({
+      id,
+      stage_id: "accept_unit",
+      scope: {
+        kind: "loop_item",
+        stage_id: "accept_unit",
+        parent_attempt_id: "attempt-provision",
+        loop_id: "execution_plan.units",
+        item_id: itemId,
+        item_index: itemIndex,
+      },
+      input_subject: itemIndex === 0 ? UNIT_A : UNIT_B,
+      request,
+    });
+    const first = completedAttempt({
+      pending: pending("attempt-accept-a", "unit-a", 0),
+      output_subject: null,
+      request,
+      settled: true,
+    });
+    const second = completedAttempt({
+      pending: pending("attempt-accept-b", "unit-b", 1),
+      output_subject: null,
+      request,
+      evaluated: {
+        evaluator: "core/unit-outcome@1",
+        outcome: "failure",
+        reason: "unit_acceptance_failed",
+      },
+    });
+    store.requests.set(second.attempt.id, request);
+    store.settled = [first.evidence];
+    const planner = new KernelStructuredSettlementPlanner({ store, now: () => NOW });
+
+    const settlement = await planner.plan(ordinaryInput({
+      attempt: second.attempt,
+      checkpoint: second.checkpoint,
+      result: second.result,
+      view: view({
+        attempts: [first.attempt, second.attempt],
+        current: second.attempt,
+        completed: [frontierMemberKey(first.attempt)],
+      }),
+      outcome: "failure",
+      evaluator: "core/unit-outcome@1",
+      reason: "unit_acceptance_failed",
+    }));
+
+    expect(settlement.next_attempts).toHaveLength(1);
+    expect(settlement.next_attempts[0]!.scope).toEqual({
+      kind: "stage",
+      stage_id: "ot_runtime_stop_failed",
+    });
+    expect(settlement.decision.id).not.toBe(second.decision.id);
+    expect(settlement.next_attempts[0]!.context_record_ids).toEqual([
+      ...runtime.slice(0, 2).map(({ id }) => id),
+      first.result.id,
+      first.decision.id,
+      second.result.id,
+      settlement.decision.id,
+    ].sort());
+  });
 });
