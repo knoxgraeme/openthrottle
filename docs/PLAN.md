@@ -43,10 +43,11 @@ subject, OpenThrottle can:
 - Ordinary and structured coordinators use the same kernel reducer and durable
   store. Structured work adds bounded frontier, dependency, acceptance, serial
   integration, and reviewer-persona planning over those primitives.
-- This release admits one live Attempt at a time. Unit and reviewer frontiers
-  remain complete and dependency-aware but execute serially. The reviewer eval
-  may still select all five allowed personas; width one does not truncate the
-  roster.
+- The kernel admits up to a configured number of live Attempts across distinct
+  runs (default one), with at most one live Attempt per run in this release.
+  Unit and reviewer frontiers remain complete and dependency-aware. The
+  reviewer eval may still select all five allowed personas; execution width
+  does not truncate the roster.
 - External writes are write-ahead Effects with one idempotency key. The worker
   reconciles before writing and records confirmed or rejected delivery
   evidence.

@@ -11,7 +11,7 @@ const configKeys = [
   "OT_BLOB_STORE_ID", "OT_EPOCH_RELEASE_ID", "OT_RELEASE_ROOT",
   "OT_EPOCH_BOOTSTRAP_CHECKSUM",
   "OT_GENERATED_DEFINITION_ROOT", "OT_KERNEL_WORKER_ID", "OT_KERNEL_WORKER_INTERVAL_MS",
-  "OT_KERNEL_LEASE_SECONDS", "OT_KERNEL_CYCLE_LIMIT",
+  "OT_KERNEL_LEASE_SECONDS", "OT_KERNEL_CYCLE_LIMIT", "OT_EXECUTION_WIDTH",
   // Retired variables are cleared so they cannot influence a clean-epoch test.
   "OT_INSTALL_SECRET", "DEFAULT_AGENT",
   "REVIEW_FANOUT_CONCURRENCY", "PIPELINE_CATALOG_PATH", "SANDBOX_RUNTIME_RELEASE",
@@ -64,6 +64,7 @@ describe("loadConfig", () => {
       kernelWorkerIntervalMs: 1_000,
       kernelLeaseSeconds: 120,
       kernelCycleLimit: 16,
+      executionWidth: 1,
       epochBootstrapChecksum: "b".repeat(64),
     });
     for (const retired of [
@@ -126,6 +127,17 @@ describe("loadConfig", () => {
     process.env.TASK_TIMEOUT = "7200";
     process.env.OT_KERNEL_LEASE_SECONDS = "29";
     expect(() => loadConfig()).toThrow("OT_KERNEL_LEASE_SECONDS must be between 30");
+
+    process.env.OT_KERNEL_LEASE_SECONDS = "120";
+    process.env.OT_EXECUTION_WIDTH = "0";
+    expect(() => loadConfig()).toThrow("OT_EXECUTION_WIDTH must be between 1");
+  });
+
+  it("loads a configured cross-run execution width", () => {
+    setRequiredEnv();
+    process.env.OT_EXECUTION_WIDTH = "2";
+
+    expect(loadConfig()).toMatchObject({ executionWidth: 2 });
   });
 
   it("validates stable kernel identities and the public URL", () => {

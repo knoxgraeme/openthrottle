@@ -208,6 +208,7 @@ export class SqliteKernelStore implements
     manifest_resolver: KernelManifestResolver;
     payload_schemas: ExecutionRecordPayloadRegistry;
     execution_policy: { readonly max_concurrent_attempts: 1 };
+    execution_width?: number;
     now?: () => string;
     fault_injector?: (point: KernelStoreFaultPoint) => void;
   }) {
@@ -225,6 +226,7 @@ export class SqliteKernelStore implements
       insert_record: (record) => this.#insertRecord(record),
       read_effect_blob: (runId, ownerId, pointer) => this.#readBlob(runId, "effect", ownerId, pointer),
       execution_policy: input.execution_policy,
+      execution_width: input.execution_width ?? 1,
     });
   }
 

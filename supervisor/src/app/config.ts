@@ -61,6 +61,7 @@ export interface Config {
   kernelWorkerIntervalMs: number;
   kernelLeaseSeconds: number;
   kernelCycleLimit: number;
+  executionWidth: number;
 }
 
 export function loadConfig(): Config {
@@ -97,6 +98,7 @@ export function loadConfig(): Config {
     kernelWorkerIntervalMs: optionalInt("OT_KERNEL_WORKER_INTERVAL_MS", 1_000),
     kernelLeaseSeconds: optionalInt("OT_KERNEL_LEASE_SECONDS", 120),
     kernelCycleLimit: optionalInt("OT_KERNEL_CYCLE_LIMIT", 16),
+    executionWidth: optionalInt("OT_EXECUTION_WIDTH", 1),
   };
 
   for (const [credential, engine] of [
@@ -134,6 +136,7 @@ export function loadConfig(): Config {
   requireRange("OT_KERNEL_WORKER_INTERVAL_MS", cfg.kernelWorkerIntervalMs, 100, 60_000);
   requireRange("OT_KERNEL_LEASE_SECONDS", cfg.kernelLeaseSeconds, 30, 3_600);
   requireRange("OT_KERNEL_CYCLE_LIMIT", cfg.kernelCycleLimit, 1, 100);
+  requireRange("OT_EXECUTION_WIDTH", cfg.executionWidth, 1);
   for (const [name, value] of [
     ["OT_BLOB_STORE_ID", cfg.blobStoreId],
     ["OT_EPOCH_RELEASE_ID", cfg.epochReleaseId],

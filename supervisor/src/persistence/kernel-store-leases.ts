@@ -29,7 +29,7 @@ export class KernelLeaseOperations {
   readonly #advanceRunFence: (runId: string, transitionId: string, content: unknown) => KernelRun;
   readonly #insertRecord: (record: ExecutionRecord) => void;
   readonly #readEffectBlob: (runId: string, ownerId: string, pointer: BlobPointer) => Buffer;
-  readonly #maxConcurrentAttempts: 1;
+  readonly #executionWidth: number;
 
   constructor(input: {
     db: Database.Database;
@@ -39,6 +39,7 @@ export class KernelLeaseOperations {
     insert_record: (record: ExecutionRecord) => void;
     read_effect_blob: (runId: string, ownerId: string, pointer: BlobPointer) => Buffer;
     execution_policy: { readonly max_concurrent_attempts: 1 };
+    execution_width: number;
   }) {
     this.#db = input.db;
     this.#now = input.now;
@@ -50,7 +51,10 @@ export class KernelLeaseOperations {
     if (!Object.isFrozen(input.execution_policy) || maxConcurrentAttempts !== 1) {
       throw new Error("Attempt lease policy must be frozen at the supported release limit 1");
     }
-    this.#maxConcurrentAttempts = maxConcurrentAttempts;
+    if (!Number.isSafeInteger(input.execution_width) || input.execution_width < 1) {
+      throw new Error("Attempt execution width must be a positive integer");
+    }
+    this.#executionWidth = input.execution_width;
   }
 
   async leaseNextEligibleAttempt(request: AttemptLeaseRequest): Promise<LeasedAttemptView | null> {
@@ -78,20 +82,46 @@ export class KernelLeaseOperations {
           lease: attempt.lease!,
         };
       }
-      const leased = this.#db.prepare(`
-        SELECT COUNT(*) AS count FROM attempts WHERE lease_id IS NOT NULL
-      `).get() as { count: number };
-      if (leased.count >= this.#maxConcurrentAttempts) return null;
       const row = this.#db.prepare(`
+        WITH live_attempts AS (
+          SELECT pipeline_run_id FROM attempts WHERE lease_id IS NOT NULL
+        ), sandbox_reservations AS (
+          SELECT DISTINCT runtime_create.pipeline_run_id
+          FROM effects runtime_create
+          WHERE runtime_create.kind = 'daytona/create-sandbox@1'
+            AND runtime_create.status IN ('pending', 'processing', 'unknown', 'acknowledged')
+            AND NOT EXISTS (
+              SELECT 1 FROM effects runtime_cleanup
+              WHERE runtime_cleanup.pipeline_run_id = runtime_create.pipeline_run_id
+                AND runtime_cleanup.kind = 'daytona/cleanup-sandbox@1'
+                AND runtime_cleanup.status = 'acknowledged'
+            )
+        ), sandbox_slots AS (
+          SELECT pipeline_run_id FROM live_attempts
+          UNION
+          SELECT pipeline_run_id FROM sandbox_reservations
+        )
         SELECT a.* FROM attempts a
         JOIN pipeline_runs r ON r.id = a.pipeline_run_id
         WHERE r.status IN ('pending', 'running')
           AND a.status IN ('pending', 'result_pending')
           AND a.unmet_dependency_count = 0
           AND a.lease_id IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM live_attempts live
+            WHERE live.pipeline_run_id = a.pipeline_run_id
+          )
+          AND (SELECT COUNT(*) FROM live_attempts) < ?
+          AND (
+            EXISTS (
+              SELECT 1 FROM sandbox_reservations reserved
+              WHERE reserved.pipeline_run_id = a.pipeline_run_id
+            )
+            OR (SELECT COUNT(*) FROM sandbox_slots) < ?
+          )
         ORDER BY a.created_at, a.id
         LIMIT 1
-      `).get() as AttemptRow | undefined;
+      `).get(this.#executionWidth, this.#executionWidth) as AttemptRow | undefined;
       if (!row) return null;
       const purpose = row.status === "result_pending" ? "result_correction" : "work";
       const changed = this.#db.prepare(`
@@ -181,13 +211,16 @@ export class KernelLeaseOperations {
       throw new Error("attempt lease recovery limit must be between 1 and 100");
     }
     return this.#db.transaction(() => {
-      const leased = this.#db.prepare(`
-        SELECT COUNT(*) AS count FROM attempts WHERE lease_id IS NOT NULL
-      `).get() as { count: number };
-      if (leased.count > this.#maxConcurrentAttempts) {
+      const duplicateRun = this.#db.prepare(`
+        SELECT pipeline_run_id, COUNT(*) AS count FROM attempts
+        WHERE lease_id IS NOT NULL
+        GROUP BY pipeline_run_id HAVING COUNT(*) > 1
+        ORDER BY pipeline_run_id LIMIT 1
+      `).get() as { pipeline_run_id: string; count: number } | undefined;
+      if (duplicateRun) {
         throw new Error(
-          `Attempt lease recovery found ${leased.count} leases above the release limit ` +
-          `${this.#maxConcurrentAttempts}`,
+          `Attempt lease recovery found ${duplicateRun.count} live leases for run ` +
+          duplicateRun.pipeline_run_id,
         );
       }
       const rows = this.#db.prepare(`

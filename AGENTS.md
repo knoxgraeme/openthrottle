@@ -158,10 +158,11 @@ or lead rejection schedules a distinct edit successor with
 `native_session_id: null`, exact prior Record/Checkpoint context, and a fresh
 native session bound only when that remediation Attempt starts.
 
-This release admits at most one live Attempt. Unit work and selected reviewer
-personas retain their complete dependency/frontier rosters, but execute
-serially. The selector may still choose up to its eval-bound five personas;
-execution width one must not truncate that roster.
+The kernel admits up to a configured number of live Attempts across distinct
+runs (default one), with at most one live Attempt per run in this release. Unit
+work and selected reviewer personas retain their complete dependency/frontier
+rosters. The selector may still choose up to its eval-bound five personas;
+execution width must not truncate that roster.
 
 Ordinary and structured pipelines share four primitives:
 
