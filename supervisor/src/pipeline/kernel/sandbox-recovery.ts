@@ -1,4 +1,9 @@
-import { compareCodeUnits, type DecisionRecord, type ExecutionRecord } from "@openthrottle/contracts";
+import {
+  compareCodeUnits,
+  type DecisionRecord,
+  type DeliveryRecord,
+  type ExecutionRecord,
+} from "@openthrottle/contracts";
 
 export const SANDBOX_FATAL_RECOVERY_EVALUATOR = "core/sandbox-fatal-recovery@1" as const;
 export const SANDBOX_FATAL_FRONTIER_EVALUATOR = "core/sandbox-fatal-frontier@1" as const;
@@ -71,6 +76,38 @@ export function exactSandboxRecoveryRecord(records: readonly ExecutionRecord[]):
   const matches = records.filter((record) => sandboxRecoveryAttemptId(record) !== null);
   if (matches.length > 1) throw new Error("Attempt context contains multiple sandbox-fatal recoveries");
   return (matches[0] as DecisionRecord | undefined) ?? null;
+}
+
+export function exactSandboxFatalAbsenceDelivery(
+  records: readonly ExecutionRecord[],
+): DeliveryRecord | null {
+  const matches = records.filter((record): record is DeliveryRecord => {
+    if (
+      record.kind !== "delivery" || record.status !== "rejected" ||
+      record.payload_schema !== "openthrottle.effect-delivery/v1" ||
+      !("inline" in record.payload) || !record.payload.inline ||
+      typeof record.payload.inline !== "object" || Array.isArray(record.payload.inline)
+    ) return false;
+    const envelope = record.payload.inline as Record<string, unknown>;
+    const result = envelope.result;
+    if (!result || typeof result !== "object" || Array.isArray(result)) return false;
+    const evidence = result as Record<string, unknown>;
+    return envelope.effect_kind === "daytona/integrate-checkpoint@1" &&
+      envelope.provider === "daytona" &&
+      (envelope.observed_via === "reconciliation" ||
+        envelope.observed_via === "post_dispatch_reconciliation") &&
+      evidence.schema === "openthrottle.daytona-integration-delivery/v1" &&
+      evidence.state === "retryable_failure" &&
+      evidence.pipeline_run_id === record.pipeline_run_id &&
+      evidence.effect_id === record.effect_id &&
+      evidence.idempotency_key === record.idempotency_key &&
+      typeof evidence.reason === "string" &&
+      evidence.reason.startsWith("sandbox_fatal_absent:");
+  });
+  if (matches.length > 1) {
+    throw new Error("Attempt contains multiple sandbox-fatal absence deliveries");
+  }
+  return matches[0] ?? null;
 }
 
 function sandboxRecoveryFrontierMember(record: ExecutionRecord): SandboxRecoveryFrontierMember | null {

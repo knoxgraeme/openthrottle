@@ -148,6 +148,7 @@ export function deriveKernelTerminalCleanupAttempt(input: {
   task_prompt: string;
   runtime_delivery_records: readonly ExecutionRecord[];
   recovery_frontier_records?: readonly ExecutionRecord[];
+  recovery_trigger_records?: readonly ExecutionRecord[];
 }): KernelAttempt {
   const deliveries = exactKernelRuntimeCleanupDeliveries(input.runtime_delivery_records);
   if (deliveries === null) {
@@ -161,6 +162,7 @@ export function deriveKernelTerminalCleanupAttempt(input: {
   const records: ExecutionRecord[] = [
     input.decision,
     ...(input.recovery_frontier_records ?? []),
+    ...(input.recovery_trigger_records ?? []),
     ...deliveries,
   ]
     .sort((left, right) => compareCodeUnits(left.id, right.id));

@@ -185,6 +185,30 @@ interface DaytonaIntegrationResult {
   reason: string | null;
 }
 
+const DAYTONA_INTEGRATION_ABSENCE_CONTINUATION_SCHEMA =
+  "openthrottle.daytona-integration-absence-continuation/v1" as const;
+const DAYTONA_INTEGRATION_FATAL_ABSENCE_THRESHOLD = 2;
+
+function integrationAbsenceCount(value: JsonValue | null | undefined): number {
+  if (value === null || value === undefined) return 0;
+  const continuation = object(value, "Daytona integration absence continuation");
+  if (
+    Object.keys(continuation).sort().join("\0") !== ["consecutive_absences", "schema"].sort().join("\0") ||
+    continuation.schema !== DAYTONA_INTEGRATION_ABSENCE_CONTINUATION_SCHEMA ||
+    !Number.isSafeInteger(continuation.consecutive_absences) ||
+    (continuation.consecutive_absences as number) < 0 ||
+    (continuation.consecutive_absences as number) >= DAYTONA_INTEGRATION_FATAL_ABSENCE_THRESHOLD
+  ) throw new Error("Daytona integration absence continuation is invalid");
+  return continuation.consecutive_absences as number;
+}
+
+function integrationAbsenceContinuation(consecutiveAbsences: number): JsonValue {
+  return {
+    schema: DAYTONA_INTEGRATION_ABSENCE_CONTINUATION_SCHEMA,
+    consecutive_absences: consecutiveAbsences,
+  };
+}
+
 function object(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`${label} must be an object`);
@@ -530,7 +554,8 @@ export class DaytonaKernelAdapter implements
         operation: "mutation",
         idempotency_strategy: "deterministic_target",
         adapter: {
-          reconcile: ({ intent, dispatch_fence }) => this.#reconcileIntegration(intent, dispatch_fence),
+          reconcile: ({ intent, dispatch_fence, continuation }) =>
+            this.#reconcileIntegration(intent, dispatch_fence, continuation),
           dispatch: ({ intent, dispatch_fence }) => this.#dispatchIntegration(intent, dispatch_fence),
         },
       },
@@ -1192,22 +1217,37 @@ export class DaytonaKernelAdapter implements
   async #reconcileIntegration(
     intent: Readonly<EffectIntent>,
     dispatchFence: { lease_id: string; worker_id: string } | null,
+    continuation: JsonValue | null | undefined,
   ): Promise<KernelEffectProviderObservation> {
     const authority = integrationPayload(intent);
     if (dispatchFence === null) return { kind: "not_found" };
-    const sandbox = await this.#integrationSandbox(authority);
-    if (!sandbox) return { kind: "unknown", detail: "integration runtime sandbox is absent" };
-    const paths = integrationPaths(intent.id, dispatchFence.lease_id);
-    const raw = await downloadUtf8(sandbox, paths.result);
-    if (raw === null) return { kind: "not_found" };
-    const result = parseIntegrationResult({ raw, intent, authority, dispatch_fence: dispatchFence });
-    if (result.state !== "integrated") {
+    const priorAbsences = integrationAbsenceCount(continuation);
+    let sandbox: Sandbox | null;
+    try {
+      sandbox = await this.#integrationSandbox(authority);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      return {
+        kind: "retry",
+        detail: detail || "integration runtime sandbox lookup failed",
+        continuation: integrationAbsenceContinuation(0),
+      };
+    }
+    if (!sandbox) {
+      const consecutiveAbsences = priorAbsences + 1;
+      if (consecutiveAbsences < DAYTONA_INTEGRATION_FATAL_ABSENCE_THRESHOLD) {
+        return {
+          kind: "retry",
+          detail: "integration runtime sandbox is absent; confirming authoritative absence",
+          continuation: integrationAbsenceContinuation(consecutiveAbsences),
+        };
+      }
       return {
         kind: "found",
         status: "rejected",
         payload: {
           schema: "openthrottle.daytona-integration-delivery/v1",
-          state: result.state,
+          state: "retryable_failure",
           pipeline_run_id: intent.pipeline_run_id,
           attempt_id: authority.attempt_id,
           effect_id: intent.id,
@@ -1217,67 +1257,101 @@ export class DaytonaKernelAdapter implements
           checkpoint_id: null,
           checkpoint_payload_schema: null,
           checkpoint_blob: null,
-          reason: result.reason,
+          reason: "sandbox_fatal_absent: integration runtime sandbox was absent on 2 consecutive reconciliations",
         },
       };
     }
-    const descriptor = result.payload_artifact!;
-    const bytes = await sandbox.fs.downloadFile(`${paths.result_directory}/${descriptor.file}`);
-    if (
-      bytes.byteLength !== descriptor.bytes ||
-      createHash("sha256").update(bytes).digest("hex") !== descriptor.sha256
-    ) throw new Error("integrated checkpoint artifact failed its exact sealed descriptor");
-    const candidateBytes = this.#options.blob_store.read(authority.candidate_blob);
-    const currentAncestry = authority.current_ancestry.map((edge) => ({
-      checkpoint_id: edge.checkpoint_id,
-      bytes: this.#options.blob_store.read(edge.checkpoint_blob),
-      descriptor: edge.checkpoint_artifact,
-      input_subject: edge.input_subject,
-      output_subject: edge.output_subject,
-    }));
-    inspectKernelIntegrationBundle({
-      bytes,
-      descriptor,
-      checkpoint_base_subject: authority.checkpoint_base_subject,
-      current_subject: authority.current_subject,
-      candidate_bytes: candidateBytes,
-      candidate_descriptor: authority.candidate_artifact,
-      candidate_input_subject: authority.candidate_input_subject,
-      candidate_output_subject: authority.candidate_output_subject,
-      current_ancestry: currentAncestry,
-    });
-    const checkpointBlob = this.#options.blob_store.put({
-      bytes,
-      encoding: "binary",
-      media_type: descriptor.media_type,
-      payload_schema: descriptor.payload_schema,
-      expected_digest: descriptor.sha256,
-    }).pointer;
-    const checkpointId = `checkpoint-${digestCanonicalJson({
-      schema: "openthrottle.integration-checkpoint-identity/v1",
-      attempt_id: authority.attempt_id,
-      effect_id: intent.id,
-      output_subject: result.output_subject,
-      checkpoint_blob: checkpointBlob,
-    }).slice(0, 48)}`;
-    return {
-      kind: "found",
-      status: "confirmed",
-      payload: {
-        schema: "openthrottle.daytona-integration-delivery/v1",
-        state: "integrated",
-        pipeline_run_id: intent.pipeline_run_id,
+    try {
+      const paths = integrationPaths(intent.id, dispatchFence.lease_id);
+      const raw = await downloadUtf8(sandbox, paths.result);
+      if (raw === null) return { kind: "not_found" };
+      const result = parseIntegrationResult({ raw, intent, authority, dispatch_fence: dispatchFence });
+      if (result.state !== "integrated") {
+        return {
+          kind: "found",
+          status: "rejected",
+          payload: {
+            schema: "openthrottle.daytona-integration-delivery/v1",
+            state: result.state,
+            pipeline_run_id: intent.pipeline_run_id,
+            attempt_id: authority.attempt_id,
+            effect_id: intent.id,
+            idempotency_key: intent.idempotency_key,
+            input_subject: authority.current_subject,
+            output_subject: null,
+            checkpoint_id: null,
+            checkpoint_payload_schema: null,
+            checkpoint_blob: null,
+            reason: result.reason,
+          },
+        };
+      }
+      const descriptor = result.payload_artifact!;
+      const bytes = await sandbox.fs.downloadFile(`${paths.result_directory}/${descriptor.file}`);
+      if (
+        bytes.byteLength !== descriptor.bytes ||
+        createHash("sha256").update(bytes).digest("hex") !== descriptor.sha256
+      ) throw new Error("integrated checkpoint artifact failed its exact sealed descriptor");
+      const candidateBytes = this.#options.blob_store.read(authority.candidate_blob);
+      const currentAncestry = authority.current_ancestry.map((edge) => ({
+        checkpoint_id: edge.checkpoint_id,
+        bytes: this.#options.blob_store.read(edge.checkpoint_blob),
+        descriptor: edge.checkpoint_artifact,
+        input_subject: edge.input_subject,
+        output_subject: edge.output_subject,
+      }));
+      inspectKernelIntegrationBundle({
+        bytes,
+        descriptor,
+        checkpoint_base_subject: authority.checkpoint_base_subject,
+        current_subject: authority.current_subject,
+        candidate_bytes: candidateBytes,
+        candidate_descriptor: authority.candidate_artifact,
+        candidate_input_subject: authority.candidate_input_subject,
+        candidate_output_subject: authority.candidate_output_subject,
+        current_ancestry: currentAncestry,
+      });
+      const checkpointBlob = this.#options.blob_store.put({
+        bytes,
+        encoding: "binary",
+        media_type: descriptor.media_type,
+        payload_schema: descriptor.payload_schema,
+        expected_digest: descriptor.sha256,
+      }).pointer;
+      const checkpointId = `checkpoint-${digestCanonicalJson({
+        schema: "openthrottle.integration-checkpoint-identity/v1",
         attempt_id: authority.attempt_id,
         effect_id: intent.id,
-        idempotency_key: intent.idempotency_key,
-        input_subject: authority.current_subject,
         output_subject: result.output_subject,
-        checkpoint_id: checkpointId,
-        checkpoint_payload_schema: "openthrottle.git-checkpoint-bundle/v1",
-        checkpoint_blob: checkpointBlob as unknown as JsonValue,
-        reason: null,
-      },
-    };
+        checkpoint_blob: checkpointBlob,
+      }).slice(0, 48)}`;
+      return {
+        kind: "found",
+        status: "confirmed",
+        payload: {
+          schema: "openthrottle.daytona-integration-delivery/v1",
+          state: "integrated",
+          pipeline_run_id: intent.pipeline_run_id,
+          attempt_id: authority.attempt_id,
+          effect_id: intent.id,
+          idempotency_key: intent.idempotency_key,
+          input_subject: authority.current_subject,
+          output_subject: result.output_subject,
+          checkpoint_id: checkpointId,
+          checkpoint_payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+          checkpoint_blob: checkpointBlob as unknown as JsonValue,
+          reason: null,
+        },
+      };
+    } catch (error) {
+      if (priorAbsences === 0) throw error;
+      const detail = error instanceof Error ? error.message : String(error);
+      return {
+        kind: "retry",
+        detail: detail || "integration runtime sandbox reconciliation failed",
+        continuation: integrationAbsenceContinuation(0),
+      };
+    }
   }
 
   async #dispatchIntegration(

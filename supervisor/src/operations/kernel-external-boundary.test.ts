@@ -6,6 +6,7 @@ import {
   digestCanonicalJson,
   expandCompiledRuntimeLifecycle,
   runtimeCleanupStageId,
+  runtimeStopStageId,
   type AttemptCheckpoint,
   type CompiledPipelineManifest,
   type DefinitionBundle,
@@ -179,7 +180,15 @@ function manifest(input: {
         effect: input.external_kind ?? "core/publish@1",
         on: input.terminal === false
           ? { success: { to: "next" } }
-          : { success: { terminal: "completed" }, failure: { terminal: "failed" } },
+          : {
+            success: { terminal: "completed" },
+            retryable_infrastructure_failure: {
+              to: "external",
+              max_reentries: 2,
+              on_exhausted: "failed",
+            },
+            failure: { terminal: "failed" },
+          },
       }
       : {
         id: "external",
@@ -1543,5 +1552,109 @@ describe("kernel external boundary bridge", () => {
           result: expect.objectContaining({ sandbox_id: "sandbox-fresh" }),
         }) } }),
       ]));
+  });
+
+  it("enters fresh-sandbox recovery when integration settles a sandbox-fatal absence", async () => {
+    const definitionBundle = bundle();
+    const currentManifest = manifest({
+      bundle_hash: digestCanonicalJson(definitionBundle),
+      external_kind: "core/publish@1",
+    });
+    const store = new MemoryExternalStore(currentManifest, PRIVATE_CANDIDATE);
+    const runtimeDelivery = (
+      id: string,
+      effectKind: "daytona/create-sandbox@1" | "daytona/start-sandbox@1",
+    ): DeliveryRecord => ({
+      schema: EXECUTION_RECORD_SCHEMA,
+      id,
+      kind: "delivery",
+      pipeline_run_id: store.run.id,
+      effect_id: `effect-${id}`,
+      idempotency_key: `key-${id}`,
+      external_identity: `daytona:${RUNTIME_IDENTITY}`,
+      status: "confirmed",
+      payload_schema: "openthrottle.effect-delivery/v1",
+      payload: { inline: {
+        effect_kind: effectKind,
+        provider: "daytona",
+        observed_via: "reconciliation",
+        result: {
+          identity: RUNTIME_IDENTITY,
+          sandbox_id: "sandbox-deleted",
+          resource_state: "started",
+        },
+      } },
+      created_at: NOW,
+    });
+    const create = runtimeDelivery("delivery-runtime-create", "daytona/create-sandbox@1");
+    const start = runtimeDelivery("delivery-runtime-start", "daytona/start-sandbox@1");
+    store.records.set(create.id, create);
+    store.records.set(start.id, start);
+    store.attempts.set("attempt-1", {
+      ...store.attempts.get("attempt-1")!,
+      context_record_ids: [create.id, start.id].sort(),
+    });
+    const plan: KernelExternalStagePlanBinding = {
+      ...binding("core/publish@1"),
+      evaluate: ({ schedules }) => schedules.some((schedule) =>
+        schedule.effects.some(({ delivery }) => delivery?.status === "rejected"))
+        ? {
+          outcome: "retryable_infrastructure_failure",
+          summary: "publication integration lost its sandbox",
+        }
+        : { outcome: "success", summary: "published" },
+    };
+    const bridge = coordinator({ store, definition_bundle: definitionBundle, plans: [plan] });
+
+    await bridge.executeLeasedAttempt(store.leased());
+    store.acknowledgePhase("integrate-checkpoint", "rejected");
+    const schedule = store.schedules.get("external-schedule:attempt-1:integrate-checkpoint")!;
+    const { intent, delivery } = schedule.effects[0]!;
+    const fatalDelivery: DeliveryRecord = {
+      ...delivery!,
+      payload: { inline: {
+        effect_kind: intent.kind,
+        provider: "daytona",
+        observed_via: "reconciliation",
+        result: {
+          schema: "openthrottle.daytona-integration-delivery/v1",
+          state: "retryable_failure",
+          pipeline_run_id: intent.pipeline_run_id,
+          attempt_id: "attempt-1",
+          effect_id: intent.id,
+          idempotency_key: intent.idempotency_key,
+          input_subject: PRIVATE_CANDIDATE,
+          output_subject: null,
+          checkpoint_id: null,
+          checkpoint_payload_schema: null,
+          checkpoint_blob: null,
+          reason: "sandbox_fatal_absent: integration runtime sandbox was absent twice",
+        },
+      } },
+    };
+    store.records.set(fatalDelivery.id, fatalDelivery);
+    store.schedules.set(schedule.semantic_key, {
+      ...schedule,
+      effects: [{ intent, delivery: fatalDelivery }],
+    });
+
+    await expect(bridge.resumeAttempt({
+      pipeline_run_id: store.run.id,
+      attempt_id: "attempt-1",
+    })).resolves.toMatchObject({
+      disposition: "settled",
+      outcome: "retryable_infrastructure_failure",
+      next_stage_id: runtimeStopStageId("failed"),
+    });
+    expect(store.attempts.get("attempt-1")).toMatchObject({ status: "failed" });
+    const stop = [...store.attempts.values()].find(
+      ({ scope, status }) => scope.stage_id === runtimeStopStageId("failed") && status === "pending",
+    );
+    expect(stop).toBeDefined();
+    const recovery = [...store.records.values()].find((record) =>
+      record.kind === "decision" && record.reducer === sandboxRecoveryEvaluator("attempt-1"));
+    expect(recovery).toMatchObject({
+      input_record_ids: expect.arrayContaining([fatalDelivery.id, create.id, start.id]),
+    });
   });
 });

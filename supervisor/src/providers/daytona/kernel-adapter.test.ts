@@ -238,10 +238,12 @@ function adapterFor(
   blobStore: object = {},
   attemptInputs: object = {},
   optionOverrides: object = {},
+  daytonaOverrides: object = {},
 ) {
   return new DaytonaKernelAdapter({
     get: vi.fn().mockResolvedValue(sandbox),
     list: vi.fn(() => (async function* () { yield sandbox; })()),
+    ...daytonaOverrides,
   } as never, {
     snapshot: "snapshot-1",
     github_read_token: "github-token",
@@ -1236,6 +1238,136 @@ describe("DaytonaKernelAdapter", () => {
       dispatch_fence: null,
     })).resolves.toEqual({ kind: "not_found" });
     expect(read).not.toHaveBeenCalled();
+  });
+
+  it("classifies two consecutive authoritative integration sandbox absences as sandbox-fatal", async () => {
+    const candidate = selfContainedCheckpointBundle("7".repeat(64));
+    const intent = integrationIntentFor(candidate, "effect-absent-integration");
+    const sandbox = sandboxWith(async () => { throw new Error("provider access is not expected"); });
+    const adapter = adapterFor(sandbox, {}, {}, {}, {
+      list: vi.fn(() => (async function* () {})()),
+    });
+    const binding = adapter.effectBindings().find(
+      ({ effect_kind }) => effect_kind === "daytona/integrate-checkpoint@1",
+    )!;
+    const dispatchFence = { lease_id: "lease-absent", worker_id: "worker-absent" };
+
+    const first = await binding.adapter.reconcile({
+      intent,
+      external_identity: intent.target,
+      dispatch_fence: dispatchFence,
+      continuation: null,
+    });
+    expect(first).toMatchObject({
+      kind: "retry",
+      continuation: { consecutive_absences: 1 },
+    });
+    if (first.kind !== "retry") throw new Error("first absence was not retryable");
+
+    await expect(binding.adapter.reconcile({
+      intent,
+      external_identity: intent.target,
+      dispatch_fence: dispatchFence,
+      continuation: first.continuation,
+    })).resolves.toMatchObject({
+      kind: "found",
+      status: "rejected",
+      payload: {
+        state: "retryable_failure",
+        reason: expect.stringMatching(/^sandbox_fatal_absent:/),
+      },
+    });
+  });
+
+  it("resets consecutive absence evidence across a transient Daytona lookup error", async () => {
+    const candidate = selfContainedCheckpointBundle("8".repeat(64));
+    const intent = integrationIntentFor(candidate, "effect-transient-integration");
+    const sandbox = sandboxWith(async () => { throw new Error("provider access is not expected"); });
+    const observations: Array<"absent" | "error"> = ["absent", "error", "absent"];
+    const list = vi.fn(() => (async function* () {
+      const observation = observations.shift();
+      if (observation === "error") throw new Error("Daytona API temporarily unavailable");
+    })());
+    const adapter = adapterFor(sandbox, {}, {}, {}, { list });
+    const binding = adapter.effectBindings().find(
+      ({ effect_kind }) => effect_kind === "daytona/integrate-checkpoint@1",
+    )!;
+    const dispatchFence = { lease_id: "lease-transient", worker_id: "worker-transient" };
+
+    const first = await binding.adapter.reconcile({
+      intent,
+      external_identity: intent.target,
+      dispatch_fence: dispatchFence,
+      continuation: null,
+    });
+    if (first.kind !== "retry") throw new Error("first absence was not retryable");
+    const transient = await binding.adapter.reconcile({
+      intent,
+      external_identity: intent.target,
+      dispatch_fence: dispatchFence,
+      continuation: first.continuation,
+    });
+    expect(transient).toMatchObject({
+      kind: "retry",
+      detail: expect.stringMatching(/temporarily unavailable/i),
+      continuation: { consecutive_absences: 0 },
+    });
+    if (transient.kind !== "retry") throw new Error("transient lookup was not held");
+    await expect(binding.adapter.reconcile({
+      intent,
+      external_identity: intent.target,
+      dispatch_fence: dispatchFence,
+      continuation: transient.continuation,
+    })).resolves.toMatchObject({
+      kind: "retry",
+      continuation: { consecutive_absences: 1 },
+    });
+  });
+
+  it("resets consecutive absence evidence when a found sandbox has a transient read error", async () => {
+    const candidate = selfContainedCheckpointBundle("9".repeat(64));
+    const intent = integrationIntentFor(candidate, "effect-transient-read-integration");
+    const sandbox = sandboxWith(async () => {
+      throw new Error("Daytona filesystem temporarily unavailable");
+    });
+    const observations: Array<"absent" | "found"> = ["absent", "found", "absent"];
+    const list = vi.fn(() => (async function* () {
+      if (observations.shift() === "found") yield sandbox;
+    })());
+    const adapter = adapterFor(sandbox, {}, {}, {}, { list });
+    const binding = adapter.effectBindings().find(
+      ({ effect_kind }) => effect_kind === "daytona/integrate-checkpoint@1",
+    )!;
+    const dispatchFence = { lease_id: "lease-transient-read", worker_id: "worker-transient-read" };
+
+    const first = await binding.adapter.reconcile({
+      intent,
+      external_identity: intent.target,
+      dispatch_fence: dispatchFence,
+      continuation: null,
+    });
+    if (first.kind !== "retry") throw new Error("first absence was not retryable");
+    const transient = await binding.adapter.reconcile({
+      intent,
+      external_identity: intent.target,
+      dispatch_fence: dispatchFence,
+      continuation: first.continuation,
+    });
+    expect(transient).toMatchObject({
+      kind: "retry",
+      detail: expect.stringMatching(/filesystem temporarily unavailable/i),
+      continuation: { consecutive_absences: 0 },
+    });
+    if (transient.kind !== "retry") throw new Error("transient read was not held");
+    await expect(binding.adapter.reconcile({
+      intent,
+      external_identity: intent.target,
+      dispatch_fence: dispatchFence,
+      continuation: transient.continuation,
+    })).resolves.toMatchObject({
+      kind: "retry",
+      continuation: { consecutive_absences: 1 },
+    });
   });
 
   it("keeps current ancestry supervisor-only and rejects a forged integration before BlobStore put", async () => {
