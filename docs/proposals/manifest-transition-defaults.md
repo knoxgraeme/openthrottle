@@ -1,13 +1,18 @@
 # Proposal: manifest transition defaults
 
-**Status:** implemented — `defaults.transitions` and `defaults.retry` are part of the `openthrottle.pipeline/v1` manifest contract (see docs/SPEC.md, "Manifest and catalog contract"; `same_as` was dropped in review and is reserved/rejected)
-**Scope:** authoring ergonomics for `openthrottle.pipeline/v1` manifests
-**Risk:** low — no coordinator, store, or sandbox changes
+**Status:** superseded by the execution-kernel rewrite
+**Scope:** historical authoring ergonomics for the deleted `openthrottle.pipeline/v1` contract
+**Risk:** historical — no longer applicable to the current architecture
+
+> This proposal is retained as design history. The kernel rewrite removed the
+> `openthrottle.pipeline/v1` contract, the `ce-implement-v3.yaml` manifest, and
+> the former SPEC section it discussed. The text below does not describe the
+> current authoring or runtime contracts.
 
 ## Problem
 
 `ce-implement-v3.yaml` is 148 lines declaring 64 transitions across 8 stages.
-Most of them are not decisions. Measured on the current file:
+Most of them are not decisions. Measured on the former file:
 
 | Outcome | Count | Observation |
 |---|---:|---|
