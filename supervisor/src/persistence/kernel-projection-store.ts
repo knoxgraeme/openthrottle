@@ -102,10 +102,12 @@ export interface KernelLogPage {
 }
 
 export type KernelActiveWorkKind =
+  | "work_item"
   | "run"
   | "attempt"
   | "correction"
   | "effect"
+  | "inbox"
   | "lease"
   | "runtime_resource";
 
@@ -391,6 +393,11 @@ export class SqliteKernelProjectionStore implements
       .map(() => "?").join(", ");
     const rows = this.#db.prepare(`
       SELECT * FROM (
+        SELECT 'work_item' AS kind, id, NULL AS pipeline_run_id, state AS status,
+          'provider=' || source_provider || ' reference=' || source_reference AS detail,
+          updated_at AS observed_at
+        FROM work_items WHERE state IN ('admitted', 'active')
+        UNION ALL
         SELECT 'run' AS kind, id, id AS pipeline_run_id, status,
           'pipeline=' || pipeline_id || ' stage=' || COALESCE(cursor_stage_id, 'none') AS detail,
           updated_at AS observed_at
@@ -411,6 +418,12 @@ export class SqliteKernelProjectionStore implements
           'kind=' || kind || ' target=' || target,
           updated_at
         FROM effects WHERE status IN (${effectPlaceholders})
+        UNION ALL
+        SELECT 'inbox', id, pipeline_run_id, status,
+          'provider=' || source_provider || ' kind=' || kind ||
+            ' available_at=' || available_at,
+          created_at
+        FROM inbox_events WHERE status IN ('pending', 'processing') OR lease_id IS NOT NULL
         UNION ALL
         SELECT 'lease', lease_id, pipeline_run_id, status,
           'owner=attempt:' || id || ' purpose=' || lease_purpose ||

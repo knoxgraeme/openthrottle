@@ -205,19 +205,71 @@ describe("SqliteKernelProjectionStore", () => {
       ) VALUES ('maintenance-test', 'operator', 'owner-1', 'global-lease',
         '2026-08-20T12:05:00.000Z', 0, '{}', ?)
     `).run(KERNEL_FIXTURE_NOW);
+    const inbox = new SqliteKernelInboxStore({
+      db: fixture.db,
+      blob_store: fixture.blobs,
+      now: () => KERNEL_FIXTURE_NOW,
+    });
+    inbox.ingest({
+      source_provider: "runtime",
+      delivery_id: "active-work-inbox",
+      kind: "runtime/observation@1",
+      pipeline_run_id: "run-1",
+      attempt_id: "attempt-running",
+      generation: 0,
+      event_group_key: "runtime:active-work-inbox",
+      delivery_attempt: 1,
+      subject: KERNEL_FIXTURE_SUBJECT,
+      payload_schema: "runtime.observation/v1",
+      payload: { state: "running", private: "must-not-project" },
+    });
 
     const snapshot = projection.collectActiveWork();
     expect(snapshot.truncated).toBe(false);
+    const inboxKey = snapshot.items.find(({ kind }) => kind === "inbox")?.key;
+    expect(inboxKey).toMatch(/^inbox:/);
     expect(new Set(snapshot.items.map(({ key }) => key))).toEqual(new Set([
+      "work_item:work-run-1",
       "run:run-1",
       "attempt:attempt-running",
       "attempt:attempt-correction",
       "correction:attempt-correction",
       "effect:effect-1",
+      inboxKey!,
       "lease:attempt-lease",
       "lease:global-lease",
       "runtime_resource:effect-1",
     ]));
+    expect(JSON.stringify(snapshot)).not.toContain("must-not-project");
+  });
+
+  it("clears inbox active-work only after an event is durably drained", () => {
+    const { fixture, projection } = setup();
+    const inbox = new SqliteKernelInboxStore({
+      db: fixture.db,
+      blob_store: fixture.blobs,
+      now: () => KERNEL_FIXTURE_NOW,
+    });
+    const ingested = inbox.ingest({
+      source_provider: "github",
+      delivery_id: "release-transition-inbox",
+      kind: "github/issues/opened@1",
+      generation: 0,
+      event_group_key: "github:release-transition-inbox",
+      delivery_attempt: 1,
+      payload_schema: "github.issue/v1",
+      payload: { action: "opened" },
+    });
+    expect(ingested).toMatchObject({ disposition: "inserted" });
+    if (ingested.disposition !== "inserted") throw new Error("fixture inbox event was not inserted");
+    const inboxItem = projection.collectActiveWork().items.find(({ kind }) => kind === "inbox");
+    expect(inboxItem).toMatchObject({ status: "pending", pipeline_run_id: null });
+
+    fixture.db.prepare(`
+      UPDATE inbox_events SET status = 'consumed', consumed_at = ? WHERE id = ?
+    `).run(KERNEL_FIXTURE_NOW, ingested.event.id);
+
+    expect(projection.collectActiveWork().items.some(({ kind }) => kind === "inbox")).toBe(false);
   });
 
   it("projects only exact Daytona lifecycle effects as runtime resources", () => {

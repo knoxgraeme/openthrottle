@@ -31,14 +31,26 @@ import {
   FRESH_EPOCH_VERSION,
   KERNEL_INGRESS_MAINTENANCE_SETTING,
 } from "./epoch-schema.js";
+import {
+  ACTIVE_ATTEMPT_STATUSES,
+  ACTIVE_EFFECT_STATUSES,
+  ACTIVE_RUN_STATUSES,
+} from "./kernel-active-statuses.js";
+import { placeholders } from "./kernel-store-codecs.js";
 
 export const FRESH_EPOCH_BOOTSTRAP_SCHEMA = "openthrottle.fresh-epoch-bootstrap/v1" as const;
+export const FRESH_EPOCH_RELEASE_ACCEPTANCE_REQUEST_SCHEMA =
+  "openthrottle.epoch-release-acceptance-request/v1" as const;
+export const FRESH_EPOCH_RELEASE_ACCEPTANCE_SCHEMA =
+  "openthrottle.epoch-release-acceptance/v1" as const;
 const RESERVED_SETTING_PREFIX = "epoch.";
+const RELEASE_ACCEPTANCE_SETTING_PREFIX = "epoch.release_acceptance.";
 const MAX_BOOTSTRAP_SETTINGS = 128;
 const MAX_BOOTSTRAP_REGISTRATIONS = 256;
 const MAX_BOOTSTRAP_BYTES = 1024 * 1024;
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,299}$/;
 const LOWERCASE_SHA256 = /^[a-f0-9]{64}$/;
+const BLOB_STORE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 const DATABASE_SIDECAR_SUFFIXES = ["-journal", "-wal", "-shm"] as const;
 
 export type SettingValueType = "string" | "number" | "boolean" | "json";
@@ -87,6 +99,31 @@ export interface FreshEpochVerification extends FreshEpochIdentity {
   integrity: "ok";
 }
 
+export interface FreshEpochReleaseAcceptanceRequest {
+  schema: typeof FRESH_EPOCH_RELEASE_ACCEPTANCE_REQUEST_SCHEMA;
+  transition_id: string;
+  expected_maintenance_version: number;
+  expected_current_identity: FreshEpochIdentity;
+  candidate_identity: FreshEpochIdentity;
+  candidate_schema_version: number;
+  candidate_schema_checksum: string;
+}
+
+export interface FreshEpochReleaseAcceptance {
+  schema: typeof FRESH_EPOCH_RELEASE_ACCEPTANCE_SCHEMA;
+  transition_id: string;
+  request_hash: string;
+  sequence: number;
+  accepted_at: string;
+  maintenance_version: number;
+  schema_version: number;
+  schema_checksum: string;
+  from_identity: FreshEpochIdentity;
+  to_identity: FreshEpochIdentity;
+}
+
+export type FreshEpochReleaseAcceptanceStep = "pins_advanced" | "evidence_inserted";
+
 export class FreshEpochRefusalError extends Error {
   readonly code = "FRESH_EPOCH_REFUSED";
 
@@ -120,6 +157,113 @@ function lowercaseSha256(value: unknown, path: string): string {
     refuse(`${path} must be a lowercase SHA-256 digest`);
   }
   return value;
+}
+
+function nonnegativeInteger(value: unknown, path: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    refuse(`${path} must be a nonnegative safe integer`);
+  }
+  return value as number;
+}
+
+function normalizeIdentity(value: FreshEpochIdentity, path: string): FreshEpochIdentity {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    refuse(`${path} must be an object`);
+  }
+  exactKeys(value as unknown as Record<string, unknown>, [
+    "release_id", "runtime_capability_digest", "blob_store_id",
+    "blob_marker_checksum", "bootstrap_checksum",
+  ], path);
+  const blobStoreId = boundedString(value.blob_store_id, `${path}.blob_store_id`, 200);
+  if (!BLOB_STORE_ID.test(blobStoreId)) refuse(`${path}.blob_store_id is invalid`);
+  return {
+    release_id: boundedString(value.release_id, `${path}.release_id`, 200),
+    runtime_capability_digest: lowercaseSha256(
+      value.runtime_capability_digest,
+      `${path}.runtime_capability_digest`,
+    ),
+    blob_store_id: blobStoreId,
+    blob_marker_checksum: lowercaseSha256(
+      value.blob_marker_checksum,
+      `${path}.blob_marker_checksum`,
+    ),
+    bootstrap_checksum: lowercaseSha256(
+      value.bootstrap_checksum,
+      `${path}.bootstrap_checksum`,
+    ),
+  };
+}
+
+function identitiesMatch(left: FreshEpochIdentity, right: FreshEpochIdentity): boolean {
+  return left.release_id === right.release_id &&
+    left.runtime_capability_digest === right.runtime_capability_digest &&
+    left.blob_store_id === right.blob_store_id &&
+    left.blob_marker_checksum === right.blob_marker_checksum &&
+    left.bootstrap_checksum === right.bootstrap_checksum;
+}
+
+function normalizedReleaseAcceptanceRequest(
+  value: FreshEpochReleaseAcceptanceRequest,
+): FreshEpochReleaseAcceptanceRequest {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    refuse("release acceptance request must be an object");
+  }
+  exactKeys(value as unknown as Record<string, unknown>, [
+    "schema", "transition_id", "expected_maintenance_version",
+    "expected_current_identity", "candidate_identity",
+    "candidate_schema_version", "candidate_schema_checksum",
+  ], "release acceptance request");
+  if (value.schema !== FRESH_EPOCH_RELEASE_ACCEPTANCE_REQUEST_SCHEMA) {
+    refuse("release acceptance request schema is unsupported");
+  }
+  const transitionId = boundedString(value.transition_id, "transition_id", 160);
+  if (!ID.test(transitionId) || `${RELEASE_ACCEPTANCE_SETTING_PREFIX}${transitionId}`.length > 200) {
+    refuse("transition_id is invalid or too long");
+  }
+  const expectedCurrentIdentity = normalizeIdentity(
+    value.expected_current_identity,
+    "expected_current_identity",
+  );
+  const candidateIdentity = normalizeIdentity(value.candidate_identity, "candidate_identity");
+  if (
+    expectedCurrentIdentity.blob_store_id !== candidateIdentity.blob_store_id ||
+    expectedCurrentIdentity.blob_marker_checksum !== candidateIdentity.blob_marker_checksum ||
+    expectedCurrentIdentity.bootstrap_checksum !== candidateIdentity.bootstrap_checksum
+  ) {
+    refuse("release acceptance may change only release and runtime-capability identity");
+  }
+  if (
+    expectedCurrentIdentity.release_id === candidateIdentity.release_id &&
+    expectedCurrentIdentity.runtime_capability_digest === candidateIdentity.runtime_capability_digest
+  ) {
+    refuse("release acceptance candidate identity is unchanged");
+  }
+  const candidateSchemaVersion = nonnegativeInteger(
+    value.candidate_schema_version,
+    "candidate_schema_version",
+  );
+  const candidateSchemaChecksum = lowercaseSha256(
+    value.candidate_schema_checksum,
+    "candidate_schema_checksum",
+  );
+  if (
+    candidateSchemaVersion !== FRESH_EPOCH_VERSION ||
+    candidateSchemaChecksum !== FRESH_EPOCH_SCHEMA_CHECKSUM
+  ) {
+    refuse("candidate schema identity changed; a fresh epoch is required");
+  }
+  return {
+    schema: FRESH_EPOCH_RELEASE_ACCEPTANCE_REQUEST_SCHEMA,
+    transition_id: transitionId,
+    expected_maintenance_version: nonnegativeInteger(
+      value.expected_maintenance_version,
+      "expected_maintenance_version",
+    ),
+    expected_current_identity: expectedCurrentIdentity,
+    candidate_identity: candidateIdentity,
+    candidate_schema_version: candidateSchemaVersion,
+    candidate_schema_checksum: candidateSchemaChecksum,
+  };
 }
 
 function normalizedSetting(
@@ -295,23 +439,16 @@ function baselineSchemaObjects(): readonly SchemaObjectRow[] {
   }
 }
 
-function readIdentitySetting(db: Database.Database, key: string): string {
-  const row = db.prepare("SELECT value_json, value_type, mutable FROM settings WHERE key = ?")
-    .get(key) as { value_json: string; value_type: string; mutable: number } | undefined;
+function readIdentitySetting(db: Database.Database, key: string): { value: string; version: number } {
+  const row = db.prepare("SELECT value_json, value_type, mutable, version FROM settings WHERE key = ?")
+    .get(key) as { value_json: string; value_type: string; mutable: number; version: number } | undefined;
   if (!row || row.value_type !== "string" || row.mutable !== 0) refuse(`missing immutable ${key} setting`);
   const value: unknown = JSON.parse(row.value_json);
   if (typeof value !== "string") refuse(`${key} setting is not a string`);
-  return value;
+  return { value, version: nonnegativeInteger(row.version, `${key}.version`) };
 }
 
-export function verifyFreshEpochDatabase(
-  db: Database.Database,
-  expected: FreshEpochIdentity,
-): FreshEpochVerification {
-  const expectedRuntimeCapabilityDigest = lowercaseSha256(
-    expected.runtime_capability_digest,
-    "expected runtime_capability_digest",
-  );
+function verifyFreshEpochStructure(db: Database.Database): void {
   if (db.pragma("foreign_keys", { simple: true }) !== 1) refuse("foreign keys are disabled");
   if (db.pragma("application_id", { simple: true }) !== FRESH_EPOCH_APPLICATION_ID) {
     refuse("database application identity is unknown");
@@ -340,21 +477,144 @@ export function verifyFreshEpochDatabase(
   if (foreignKeyFailures.length > 0) refuse("database foreign-key integrity check failed");
   const integrity = db.pragma("integrity_check", { simple: true });
   if (integrity !== "ok") refuse(`database integrity check failed: ${String(integrity)}`);
+}
 
-  const actual: FreshEpochIdentity = {
-    release_id: readIdentitySetting(db, "epoch.release_id"),
-    runtime_capability_digest: lowercaseSha256(
-      readIdentitySetting(db, "epoch.runtime_capability_digest"),
-      "epoch.runtime_capability_digest",
-    ),
-    blob_store_id: readIdentitySetting(db, "epoch.blob_store_id"),
-    blob_marker_checksum: readIdentitySetting(db, "epoch.blob_marker_checksum"),
-    bootstrap_checksum: readIdentitySetting(db, "epoch.bootstrap_checksum"),
+interface FreshEpochIdentityState {
+  identity: FreshEpochIdentity;
+  sequence: number;
+}
+
+function readFreshEpochIdentityState(db: Database.Database): FreshEpochIdentityState {
+  const release = readIdentitySetting(db, "epoch.release_id");
+  const runtime = readIdentitySetting(db, "epoch.runtime_capability_digest");
+  if (release.version !== runtime.version) {
+    refuse("release identity pin versions are inconsistent");
+  }
+  return {
+    identity: {
+      release_id: release.value,
+      runtime_capability_digest: lowercaseSha256(
+        runtime.value,
+        "epoch.runtime_capability_digest",
+      ),
+      blob_store_id: readIdentitySetting(db, "epoch.blob_store_id").value,
+      blob_marker_checksum: lowercaseSha256(
+        readIdentitySetting(db, "epoch.blob_marker_checksum").value,
+        "epoch.blob_marker_checksum",
+      ),
+      bootstrap_checksum: lowercaseSha256(
+        readIdentitySetting(db, "epoch.bootstrap_checksum").value,
+        "epoch.bootstrap_checksum",
+      ),
+    },
+    sequence: release.version,
   };
-  if (canonicalJson(actual) !== canonicalJson({
-    ...expected,
-    runtime_capability_digest: expectedRuntimeCapabilityDigest,
-  })) refuse("release, runtime capability, bootstrap, or blob-root identity mismatch");
+}
+
+function acceptedReleaseRequest(acceptance: FreshEpochReleaseAcceptance): FreshEpochReleaseAcceptanceRequest {
+  return {
+    schema: FRESH_EPOCH_RELEASE_ACCEPTANCE_REQUEST_SCHEMA,
+    transition_id: acceptance.transition_id,
+    expected_maintenance_version: acceptance.maintenance_version,
+    expected_current_identity: acceptance.from_identity,
+    candidate_identity: acceptance.to_identity,
+    candidate_schema_version: acceptance.schema_version,
+    candidate_schema_checksum: acceptance.schema_checksum,
+  };
+}
+
+function parseReleaseAcceptance(value: unknown, path: string): FreshEpochReleaseAcceptance {
+  if (!value || typeof value !== "object" || Array.isArray(value)) refuse(`${path} must be an object`);
+  const input = value as FreshEpochReleaseAcceptance;
+  exactKeys(input as unknown as Record<string, unknown>, [
+    "schema", "transition_id", "request_hash", "sequence", "accepted_at",
+    "maintenance_version", "schema_version", "schema_checksum", "from_identity", "to_identity",
+  ], path);
+  if (input.schema !== FRESH_EPOCH_RELEASE_ACCEPTANCE_SCHEMA) refuse(`${path}.schema is unsupported`);
+  const acceptance: FreshEpochReleaseAcceptance = {
+    schema: FRESH_EPOCH_RELEASE_ACCEPTANCE_SCHEMA,
+    transition_id: boundedString(input.transition_id, `${path}.transition_id`, 160),
+    request_hash: lowercaseSha256(input.request_hash, `${path}.request_hash`),
+    sequence: nonnegativeInteger(input.sequence, `${path}.sequence`),
+    accepted_at: boundedString(input.accepted_at, `${path}.accepted_at`, 100),
+    maintenance_version: nonnegativeInteger(input.maintenance_version, `${path}.maintenance_version`),
+    schema_version: nonnegativeInteger(input.schema_version, `${path}.schema_version`),
+    schema_checksum: lowercaseSha256(input.schema_checksum, `${path}.schema_checksum`),
+    from_identity: normalizeIdentity(input.from_identity, `${path}.from_identity`),
+    to_identity: normalizeIdentity(input.to_identity, `${path}.to_identity`),
+  };
+  const normalizedRequest = normalizedReleaseAcceptanceRequest(acceptedReleaseRequest(acceptance));
+  if (acceptance.request_hash !== digestCanonicalJson(normalizedRequest)) {
+    refuse(`${path}.request_hash does not authenticate the acceptance evidence`);
+  }
+  return acceptance;
+}
+
+function releaseAcceptances(db: Database.Database): FreshEpochReleaseAcceptance[] {
+  const rows = db.prepare(`
+    SELECT key, value_json, value_type, mutable, version
+    FROM settings WHERE key GLOB ? ORDER BY key
+  `).all(`${RELEASE_ACCEPTANCE_SETTING_PREFIX}*`) as Array<{
+    key: string;
+    value_json: string;
+    value_type: string;
+    mutable: number;
+    version: number;
+  }>;
+  return rows.map((row, index) => {
+    if (row.value_type !== "json" || row.mutable !== 0 || row.version !== 0) {
+      refuse(`release acceptance evidence ${row.key} is not immutable JSON`);
+    }
+    let value: unknown;
+    try {
+      value = JSON.parse(row.value_json);
+    } catch {
+      refuse(`release acceptance evidence ${row.key} is invalid JSON`);
+    }
+    const acceptance = parseReleaseAcceptance(value, `release acceptance evidence[${index}]`);
+    if (row.key !== `${RELEASE_ACCEPTANCE_SETTING_PREFIX}${acceptance.transition_id}`) {
+      refuse(`release acceptance evidence ${row.key} has inconsistent identity`);
+    }
+    return acceptance;
+  });
+}
+
+function verifyReleaseAcceptanceChain(
+  db: Database.Database,
+  state: FreshEpochIdentityState,
+): FreshEpochReleaseAcceptance[] {
+  const acceptances = releaseAcceptances(db).sort((left, right) => left.sequence - right.sequence);
+  if (acceptances.length !== state.sequence) {
+    refuse("release acceptance chain does not match the current pin version");
+  }
+  for (const [index, acceptance] of acceptances.entries()) {
+    if (acceptance.sequence !== index + 1) refuse("release acceptance sequence is not contiguous");
+    if (
+      index > 0 &&
+      !identitiesMatch(acceptances[index - 1]!.to_identity, acceptance.from_identity)
+    ) {
+      refuse("release acceptance identity chain is divergent");
+    }
+  }
+  const latest = acceptances.at(-1);
+  if (latest && !identitiesMatch(latest.to_identity, state.identity)) {
+    refuse("latest release acceptance evidence does not match the current pins");
+  }
+  return acceptances;
+}
+
+export function verifyFreshEpochDatabase(
+  db: Database.Database,
+  expected: FreshEpochIdentity,
+): FreshEpochVerification {
+  const expectedIdentity = normalizeIdentity(expected, "expected identity");
+  verifyFreshEpochStructure(db);
+  const state = readFreshEpochIdentityState(db);
+  verifyReleaseAcceptanceChain(db, state);
+  const actual = state.identity;
+  if (!identitiesMatch(actual, expectedIdentity)) {
+    refuse("release, runtime capability, bootstrap, or blob-root identity mismatch");
+  }
   return {
     ...actual,
     schema_version: FRESH_EPOCH_VERSION,
@@ -483,6 +743,204 @@ export function verifyFreshEpochBootstrapOnly(db: Database.Database, input: Fres
   ]) {
     const row = db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number };
     if (row.count !== 0) refuse(`fresh epoch bootstrap unexpectedly populated ${table}`);
+  }
+}
+
+function assertNoRows(
+  db: Database.Database,
+  sql: string,
+  parameters: readonly unknown[],
+  detail: string,
+): void {
+  const row = db.prepare(sql).get(...parameters) as { count: number };
+  if (row.count !== 0) refuse(`epoch is not quiesced: ${detail} (${row.count})`);
+}
+
+function assertReleaseAcceptanceQuiescence(
+  db: Database.Database,
+  expectedMaintenanceVersion: number,
+): void {
+  const maintenance = db.prepare(`
+    SELECT value_json, value_type, mutable, version
+    FROM settings WHERE key = ?
+  `).get(KERNEL_INGRESS_MAINTENANCE_SETTING) as {
+    value_json: string;
+    value_type: string;
+    mutable: number;
+    version: number;
+  } | undefined;
+  if (
+    !maintenance || maintenance.value_json !== "true" || maintenance.value_type !== "boolean" ||
+    maintenance.mutable !== 1
+  ) {
+    refuse("release acceptance requires maintenance ingress to be closed");
+  }
+  if (maintenance.version !== expectedMaintenanceVersion) {
+    refuse("release acceptance maintenance version is stale");
+  }
+  assertNoRows(db, "SELECT COUNT(*) AS count FROM leases", [], "global leases remain");
+  assertNoRows(
+    db,
+    `SELECT COUNT(*) AS count FROM work_items WHERE state IN ('admitted', 'active')`,
+    [],
+    "active work items remain",
+  );
+  assertNoRows(
+    db,
+    `SELECT COUNT(*) AS count FROM pipeline_runs WHERE status IN (${placeholders(ACTIVE_RUN_STATUSES.length)})`,
+    ACTIVE_RUN_STATUSES,
+    "active pipeline runs remain",
+  );
+  assertNoRows(
+    db,
+    `SELECT COUNT(*) AS count FROM attempts WHERE status IN (${placeholders(ACTIVE_ATTEMPT_STATUSES.length)})`,
+    ACTIVE_ATTEMPT_STATUSES,
+    "nonterminal Attempts remain",
+  );
+  assertNoRows(
+    db,
+    `SELECT COUNT(*) AS count FROM attempts WHERE lease_id IS NOT NULL`,
+    [],
+    "Attempt leases remain",
+  );
+  assertNoRows(
+    db,
+    `SELECT COUNT(*) AS count FROM effects WHERE status IN (${placeholders(ACTIVE_EFFECT_STATUSES.length)})`,
+    ACTIVE_EFFECT_STATUSES,
+    "nonterminal Effects remain",
+  );
+  assertNoRows(
+    db,
+    `SELECT COUNT(*) AS count FROM effects WHERE lease_id IS NOT NULL`,
+    [],
+    "Effect leases remain",
+  );
+  assertNoRows(
+    db,
+    `SELECT COUNT(*) AS count FROM inbox_events
+     WHERE status IN ('pending', 'processing') OR lease_id IS NOT NULL`,
+    [],
+    "pending or processing inbox events remain",
+  );
+}
+
+/**
+ * Advances only the release/runtime-capability pins of one offline epoch.
+ * The caller must derive candidate_identity from authenticated candidate
+ * artifacts; this boundary reauthenticates every durable database fence under
+ * one exclusive transaction before changing either pin.
+ */
+export function acceptFreshEpochRelease(input: {
+  database_path: string;
+  blob_store: VolumeBlobStore;
+  request: FreshEpochReleaseAcceptanceRequest;
+  now?: () => string;
+  fault_injector?: (step: FreshEpochReleaseAcceptanceStep) => void;
+}): FreshEpochReleaseAcceptance {
+  const request = normalizedReleaseAcceptanceRequest(input.request);
+  const requestHash = digestCanonicalJson(request);
+  const target = resolve(input.database_path);
+  const stats = lstatSync(target);
+  if (!stats.isFile() || stats.isSymbolicLink()) refuse("target database is not a regular file");
+  input.blob_store.assertSameVolume(target);
+  const db = new Database(target, { fileMustExist: true });
+  try {
+    db.pragma("foreign_keys = ON");
+    db.pragma("synchronous = FULL");
+    db.pragma("busy_timeout = 5000");
+    return db.transaction(() => {
+      verifyFreshEpochStructure(db);
+      const state = readFreshEpochIdentityState(db);
+      const acceptances = verifyReleaseAcceptanceChain(db, state);
+      const replay = acceptances.find((acceptance) => acceptance.transition_id === request.transition_id);
+      if (replay) {
+        if (replay.request_hash !== requestHash) {
+          refuse("release acceptance transition_id conflicts with its durable evidence");
+        }
+        return replay;
+      }
+      if (!identitiesMatch(state.identity, request.expected_current_identity)) {
+        refuse("release acceptance expected-current identity is stale or divergent");
+      }
+      if (
+        input.blob_store.store_id !== state.identity.blob_store_id ||
+        input.blob_store.marker_checksum !== state.identity.blob_marker_checksum
+      ) {
+        refuse("release acceptance BlobStore identity is stale or divergent");
+      }
+      assertReleaseAcceptanceQuiescence(db, request.expected_maintenance_version);
+
+      const acceptedAt = boundedString(
+        (input.now ?? (() => new Date().toISOString()))(),
+        "accepted_at",
+        100,
+      );
+      const acceptance: FreshEpochReleaseAcceptance = {
+        schema: FRESH_EPOCH_RELEASE_ACCEPTANCE_SCHEMA,
+        transition_id: request.transition_id,
+        request_hash: requestHash,
+        sequence: state.sequence + 1,
+        accepted_at: acceptedAt,
+        maintenance_version: request.expected_maintenance_version,
+        schema_version: request.candidate_schema_version,
+        schema_checksum: request.candidate_schema_checksum,
+        from_identity: request.expected_current_identity,
+        to_identity: request.candidate_identity,
+      };
+      if (Buffer.byteLength(canonicalJson(acceptance), "utf8") > 16 * 1024) {
+        refuse("release acceptance evidence exceeds 16384 bytes");
+      }
+
+      const trigger = db.prepare(`
+        SELECT sql FROM sqlite_master
+        WHERE type = 'trigger' AND name = 'settings_immutable_update'
+      `).get() as { sql: string | null } | undefined;
+      if (!trigger?.sql) refuse("immutable settings update trigger is missing");
+      db.exec("DROP TRIGGER settings_immutable_update");
+      const update = db.prepare(`
+        UPDATE settings
+        SET value_json = ?, version = version + 1, updated_at = ?
+        WHERE key = ? AND value_json = ? AND version = ? AND mutable = 0
+      `);
+      for (const [key, previous, candidate] of [
+        ["epoch.release_id", state.identity.release_id, request.candidate_identity.release_id],
+        [
+          "epoch.runtime_capability_digest",
+          state.identity.runtime_capability_digest,
+          request.candidate_identity.runtime_capability_digest,
+        ],
+      ] as const) {
+        const result = update.run(
+          canonicalJson(candidate),
+          acceptedAt,
+          key,
+          canonicalJson(previous),
+          state.sequence,
+        );
+        if (result.changes !== 1) refuse(`release acceptance lost the ${key} compare-and-set`);
+      }
+      input.fault_injector?.("pins_advanced");
+      db.prepare(`
+        INSERT INTO settings (key, value_json, value_type, mutable, version, updated_at)
+        VALUES (?, ?, 'json', 0, 0, ?)
+      `).run(
+        `${RELEASE_ACCEPTANCE_SETTING_PREFIX}${request.transition_id}`,
+        canonicalJson(acceptance),
+        acceptedAt,
+      );
+      input.fault_injector?.("evidence_inserted");
+      db.exec(trigger.sql);
+
+      verifyFreshEpochStructure(db);
+      const acceptedState = readFreshEpochIdentityState(db);
+      verifyReleaseAcceptanceChain(db, acceptedState);
+      if (!identitiesMatch(acceptedState.identity, request.candidate_identity)) {
+        refuse("release acceptance did not install the candidate identity");
+      }
+      return acceptance;
+    }).exclusive();
+  } finally {
+    db.close();
   }
 }
 
