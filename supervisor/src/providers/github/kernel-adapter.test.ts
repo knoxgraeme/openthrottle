@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { EffectIntent } from "@openthrottle/contracts";
+import type { EffectContinuationState } from "../../pipeline/kernel/effect-intent.js";
 import { GithubKernelAdapter } from "./kernel-adapter.js";
 import { pushRepositoryCheckpoint } from "./checkpoint-push.js";
 import { buildGithubPullRequestBody } from "./pull-request-body.js";
@@ -108,12 +109,14 @@ function check(input: {
   id: number;
   name: string;
   app_slug: string;
+  head_sha?: string;
   status?: string;
   conclusion?: string | null;
 }) {
   return {
     id: input.id,
     name: input.name,
+    head_sha: input.head_sha ?? SUBJECT,
     app: { slug: input.app_slug },
     status: input.status ?? "completed",
     conclusion: input.conclusion === undefined ? "success" : input.conclusion,
@@ -134,8 +137,17 @@ function status(input: {
   };
 }
 
-function reconciliation(fetch: typeof globalThis.fetch, intent = providerWait()) {
-  const adapter = new GithubKernelAdapter({ token: "token", blob_store: {} as never, fetch });
+function reconciliation(
+  fetch: typeof globalThis.fetch,
+  intent = providerWait(),
+  options: { continuation_state?: EffectContinuationState | null; now?: string } = {},
+) {
+  const adapter = new GithubKernelAdapter({
+    token: "token",
+    blob_store: {} as never,
+    fetch,
+    ...(options.now ? { now: () => options.now! } : {}),
+  });
   const binding = adapter.effectBindings().find(
     ({ effect_kind }) => effect_kind === "github/provider-wait@1",
   )!;
@@ -143,6 +155,7 @@ function reconciliation(fetch: typeof globalThis.fetch, intent = providerWait())
     intent,
     external_identity: intent.target,
     dispatch_fence: null,
+    continuation_state: options.continuation_state ?? null,
   });
 }
 
@@ -781,12 +794,245 @@ describe("GithubKernelAdapter provider wait", () => {
     await expect(reconciliation(fetch)).resolves.toEqual({ kind: "not_found" });
   });
 
-  it("rejects a failed required observation even when another requirement is missing", async () => {
+  it("holds a first failed required check_run even when another requirement is missing", async () => {
     const fetch = endpointFetch({ checks: { check_runs: [
       check({ id: 7, name: "quality", app_slug: "github-actions", conclusion: "failure" }),
     ] } });
 
-    await expect(reconciliation(fetch)).resolves.toEqual({
+    await expect(reconciliation(fetch, providerWait(), {
+      now: "2026-08-24T12:00:00.000Z",
+    })).resolves.toMatchObject({
+      kind: "unknown",
+      detail: expect.stringMatching(/quality.*eligible re-run.*30-minute/i),
+      continuation_state: {
+        retry_deadline: "2026-08-24T12:30:00.000Z",
+        payload: {
+          checks: [{
+            name: "quality",
+            first_failed_at: "2026-08-24T12:00:00.000Z",
+            failed_observation_count: 1,
+            failed_observation_ids: [7],
+          }],
+        },
+      },
+    });
+  });
+
+  it("confirms a same-name, same-app, same-head re-run success within 30 minutes", async () => {
+    const required = [{ kind: "check_run", name: "quality", app_slug: "github-actions" }] as const;
+    const failed = await reconciliation(endpointFetch({ checks: { check_runs: [
+      check({ id: 7, name: "quality", app_slug: "github-actions", conclusion: "failure" }),
+    ] } }), providerWait([...required]), {
+      now: "2026-08-24T12:00:00.000Z",
+    });
+    expect(failed).toMatchObject({ kind: "unknown" });
+    const continuation = (failed as { continuation_state: EffectContinuationState }).continuation_state;
+
+    await expect(reconciliation(endpointFetch({ checks: { check_runs: [
+      check({ id: 7, name: "quality", app_slug: "github-actions", conclusion: "failure" }),
+      check({ id: 8, name: "quality", app_slug: "github-actions", conclusion: "success" }),
+    ] } }), providerWait([...required]), {
+      now: "2026-08-24T12:10:00.000Z",
+      continuation_state: continuation,
+    })).resolves.toEqual({
+      kind: "found",
+      status: "confirmed",
+      payload: {
+        schema: "openthrottle.github-provider-observation/v1",
+        subject: SUBJECT,
+        reason: "all_required_observations_succeeded",
+        matched_observations: [
+          {
+            kind: "check_run", id: 7, name: "quality", app_slug: "github-actions",
+            status: "completed", conclusion: "failure",
+          },
+          {
+            kind: "check_run", id: 8, name: "quality", app_slug: "github-actions",
+            status: "completed", conclusion: "success",
+          },
+        ],
+      },
+    });
+  });
+
+  it("does not satisfy a failed check by replaying an older success", async () => {
+    const required = [{ kind: "check_run", name: "quality", app_slug: "github-actions" }] as const;
+    const mixedHistory = endpointFetch({ checks: { check_runs: [
+      check({ id: 6, name: "quality", app_slug: "github-actions", conclusion: "success" }),
+      check({ id: 7, name: "quality", app_slug: "github-actions", conclusion: "failure" }),
+    ] } });
+    const first = await reconciliation(mixedHistory, providerWait([...required]), {
+      now: "2026-08-24T12:00:00.000Z",
+    });
+    const firstContinuation = (first as { continuation_state: EffectContinuationState }).continuation_state;
+
+    const replay = await reconciliation(mixedHistory, providerWait([...required]), {
+      now: "2026-08-24T12:01:00.000Z",
+      continuation_state: firstContinuation,
+    });
+    expect(replay).toMatchObject({
+      kind: "unknown",
+      continuation_state: {
+        payload: {
+          checks: [{ failed_observation_ids: [7], successful_observation_id: null }],
+          observations: [expect.objectContaining({ id: 7, conclusion: "failure" })],
+        },
+      },
+    });
+    const replayContinuation = (replay as { continuation_state: EffectContinuationState }).continuation_state;
+
+    await expect(reconciliation(endpointFetch({ checks: { check_runs: [
+      check({ id: 8, name: "quality", app_slug: "github-actions", conclusion: "success" }),
+    ] } }), providerWait([...required]), {
+      now: "2026-08-24T12:02:00.000Z",
+      continuation_state: replayContinuation,
+    })).resolves.toMatchObject({
+      kind: "found",
+      status: "confirmed",
+      payload: {
+        matched_observations: [
+          expect.objectContaining({ id: 7, conclusion: "failure" }),
+          expect.objectContaining({ id: 8, conclusion: "success" }),
+        ],
+      },
+    });
+  });
+
+  it("retains every consumed check_run success while an unsettled failed check is re-observed", async () => {
+    const first = await reconciliation(endpointFetch({ checks: { check_runs: [
+      check({ id: 7, name: "quality", app_slug: "github-actions", conclusion: "failure" }),
+      check({ id: 20, name: "docker-smoke", app_slug: "github-actions", conclusion: "success" }),
+    ] } }), providerWait(), { now: "2026-08-24T12:00:00.000Z" });
+    const continuation = (first as { continuation_state: EffectContinuationState }).continuation_state;
+    expect(continuation).toMatchObject({
+      payload: {
+        observations: expect.arrayContaining([
+          expect.objectContaining({ id: 7, conclusion: "failure" }),
+          expect.objectContaining({ id: 20, conclusion: "success" }),
+        ]),
+      },
+    });
+
+    await expect(reconciliation(endpointFetch({ checks: { check_runs: [
+      check({ id: 8, name: "quality", app_slug: "github-actions", conclusion: "success" }),
+    ] } }), providerWait(), {
+      now: "2026-08-24T12:10:00.000Z",
+      continuation_state: continuation,
+    })).resolves.toMatchObject({
+      kind: "found",
+      status: "confirmed",
+      payload: {
+        matched_observations: expect.arrayContaining([
+          expect.objectContaining({ id: 7, conclusion: "failure" }),
+          expect.objectContaining({ id: 20, conclusion: "success" }),
+          expect.objectContaining({ id: 8, conclusion: "success" }),
+        ]),
+      },
+    });
+  });
+
+  it("rejects the third distinct failure and does not double-count replayed observations", async () => {
+    const required = [{ kind: "check_run", name: "quality", app_slug: "github-actions" }] as const;
+    const observeFailure = async (
+      id: number,
+      continuation_state: EffectContinuationState | null,
+      now: string,
+    ) => reconciliation(endpointFetch({ checks: { check_runs: [
+      check({ id, name: "quality", app_slug: "github-actions", conclusion: "failure" }),
+    ] } }), providerWait([...required]), { now, continuation_state });
+
+    const first = await observeFailure(1, null, "2026-08-24T12:00:00.000Z");
+    const firstContinuation = (first as { continuation_state: EffectContinuationState }).continuation_state;
+    const replay = await observeFailure(1, firstContinuation, "2026-08-24T12:01:00.000Z");
+    expect(replay).toMatchObject({
+      kind: "unknown",
+      continuation_state: { payload: { checks: [{ failed_observation_count: 1 }] } },
+    });
+    const second = await observeFailure(
+      2,
+      (replay as { continuation_state: EffectContinuationState }).continuation_state,
+      "2026-08-24T12:02:00.000Z",
+    );
+    expect(second).toMatchObject({
+      kind: "unknown",
+      continuation_state: { payload: { checks: [{ failed_observation_count: 2 }] } },
+    });
+    const third = await observeFailure(
+      3,
+      (second as { continuation_state: EffectContinuationState }).continuation_state,
+      "2026-08-24T12:03:00.000Z",
+    );
+    expect(third).toMatchObject({
+      kind: "found",
+      status: "rejected",
+      payload: {
+        reason: expect.stringMatching(/quality.*3 observations.*30-minute/i),
+        matched_observations: expect.arrayContaining([
+          expect.objectContaining({ id: 1, conclusion: "failure" }),
+          expect.objectContaining({ id: 2, conclusion: "failure" }),
+          expect.objectContaining({ id: 3, conclusion: "failure" }),
+        ]),
+      },
+    });
+  });
+
+  it("rejects at the 30-minute boundary without an eligible success", async () => {
+    const required = [{ kind: "check_run", name: "quality", app_slug: "github-actions" }] as const;
+    const first = await reconciliation(endpointFetch({ checks: { check_runs: [
+      check({ id: 1, name: "quality", app_slug: "github-actions", conclusion: "failure" }),
+    ] } }), providerWait([...required]), { now: "2026-08-24T12:00:00.000Z" });
+    const continuation = (first as { continuation_state: EffectContinuationState }).continuation_state;
+    const fetch = endpointFetch({ checks: { check_runs: [] } });
+
+    await expect(reconciliation(fetch, providerWait([...required]), {
+      now: "2026-08-24T12:30:00.000Z",
+      continuation_state: continuation,
+    })).resolves.toMatchObject({
+      kind: "found",
+      status: "rejected",
+      payload: { reason: expect.stringMatching(/quality.*1 observation.*30-minute/i) },
+    });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("never satisfies a failed check with a success from another head SHA", async () => {
+    const required = [{ kind: "check_run", name: "quality", app_slug: "github-actions" }] as const;
+    const first = await reconciliation(endpointFetch({ checks: { check_runs: [
+      check({ id: 1, name: "quality", app_slug: "github-actions", conclusion: "failure" }),
+    ] } }), providerWait([...required]), { now: "2026-08-24T12:00:00.000Z" });
+    const continuation = (first as { continuation_state: EffectContinuationState }).continuation_state;
+
+    await expect(reconciliation(endpointFetch({ checks: { check_runs: [
+      check({
+        id: 2,
+        name: "quality",
+        app_slug: "github-actions",
+        head_sha: "f".repeat(40),
+        conclusion: "success",
+      }),
+    ] } }), providerWait([...required]), {
+      now: "2026-08-24T12:05:00.000Z",
+      continuation_state: continuation,
+    })).resolves.toMatchObject({
+      kind: "unknown",
+      continuation_state: {
+        payload: {
+          checks: [{ failed_observation_count: 1, successful_observation_id: null }],
+          observations: [expect.objectContaining({ id: 1 })],
+        },
+      },
+    });
+  });
+
+  it("rejects a failed required commit_status immediately", async () => {
+    const required: RequiredObservation[] = [
+      { kind: "commit_status", context: "coverage", creator_login: "coverage-bot" },
+    ];
+    const fetch = endpointFetch({ statuses: { statuses: [
+      status({ id: 21, context: "coverage", creator_login: "coverage-bot", state: "failure" }),
+    ] } });
+
+    await expect(reconciliation(fetch, providerWait(required))).resolves.toEqual({
       kind: "found",
       status: "rejected",
       payload: {
@@ -794,12 +1040,11 @@ describe("GithubKernelAdapter provider wait", () => {
         subject: SUBJECT,
         reason: "required_observation_failed",
         matched_observations: [{
-          kind: "check_run",
-          id: 7,
-          name: "quality",
-          app_slug: "github-actions",
-          status: "completed",
-          conclusion: "failure",
+          kind: "commit_status",
+          id: 21,
+          context: "coverage",
+          creator_login: "coverage-bot",
+          state: "failure",
         }],
       },
     });
@@ -853,19 +1098,20 @@ describe("GithubKernelAdapter provider wait", () => {
     expect(fetch).toHaveBeenCalledTimes(4);
   });
 
-  it("fails closed on duplicate exact observations or malformed identity", async () => {
+  it("fails closed on duplicate provider identities or malformed identity", async () => {
     const required = [{ kind: "check_run", name: "quality", app_slug: "github-actions" }] as const;
     const duplicate = endpointFetch({ checks: { check_runs: [
       check({ id: 1, name: "quality", app_slug: "github-actions" }),
-      check({ id: 2, name: "quality", app_slug: "github-actions", status: "in_progress", conclusion: null }),
+      check({ id: 1, name: "quality", app_slug: "github-actions", status: "in_progress", conclusion: null }),
     ] } });
     await expect(reconciliation(duplicate, providerWait([...required]))).resolves.toMatchObject({
       kind: "unknown",
-      detail: expect.stringMatching(/multiple exact matches/i),
+      detail: expect.stringMatching(/duplicate provider id/i),
     });
 
     const malformed = endpointFetch({ checks: { check_runs: [{
-      name: "quality", app: { slug: "github-actions" }, status: "completed", conclusion: "success",
+      name: "quality", head_sha: SUBJECT, app: { slug: "github-actions" },
+      status: "completed", conclusion: "success",
     }] } });
     await expect(reconciliation(malformed, providerWait([...required]))).resolves.toMatchObject({
       kind: "unknown",
