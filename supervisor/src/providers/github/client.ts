@@ -7,6 +7,7 @@ import {
 } from "@openthrottle/contracts";
 import { RepositoryRefConflictError } from "../../app/ports.js";
 import { assertGithubResponseOk, githubApiResponse } from "../../shared/github-request.js";
+import { buildGithubPullRequestBody } from "./pull-request-body.js";
 
 const GITHUB_COMMIT_SHA_PATTERN = /^[a-f0-9]{40}$/;
 const GITHUB_DEFINITION_SHA_PATTERN = /^[a-f0-9]{40,64}$/;
@@ -289,7 +290,7 @@ export async function publishRepositoryTaskBranch(
   }
   const [owner] = input.repository.split("/");
   if (!owner) throw new Error("GitHub publication repository is invalid");
-  const canonicalBody = `${input.body.trimEnd()}\n\n<!-- ${input.ownershipMarker} -->\n`;
+  const canonicalBody = buildGithubPullRequestBody(input.body, input.ownershipMarker);
   const query = new URLSearchParams({
     state: "open",
     head: `${owner}:${input.branch}`,
