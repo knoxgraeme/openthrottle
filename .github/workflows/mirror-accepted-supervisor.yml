@@ -1,0 +1,51 @@
+name: Mirror accepted supervisor image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    env:
+      SOURCE_IMAGE: ghcr.io/knoxgraeme/openthrottle-supervisor@sha256:2f6d8beebb597d33872d5f020b99e712836a5a4175f8afa79af904bdaa6cd3a1
+      TARGET_TAG: registry.fly.io/openthrottle-staging-knoxgraeme:accepted-44e010c97e53
+      EXPECTED_DIGEST: sha256:2f6d8beebb597d33872d5f020b99e712836a5a4175f8afa79af904bdaa6cd3a1
+    steps:
+      - name: Authenticate to the accepted-image registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Authenticate to the Fly registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: registry.fly.io
+          username: x
+          password: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Install verified crane
+        run: |
+          set -euo pipefail
+          curl -fsSLo "$RUNNER_TEMP/crane.tgz" \
+            https://github.com/google/go-containerregistry/releases/download/v0.21.9/go-containerregistry_Linux_x86_64.tar.gz
+          echo "5c16d8ddb971cb1d5e6ed8b1e743da8224414eeba2c2762d8f1a61b2f095699e  $RUNNER_TEMP/crane.tgz" \
+            | sha256sum -c -
+          mkdir "$RUNNER_TEMP/crane"
+          tar -xzf "$RUNNER_TEMP/crane.tgz" -C "$RUNNER_TEMP/crane" crane
+          echo "$RUNNER_TEMP/crane" >> "$GITHUB_PATH"
+
+      - name: Copy and prove exact manifest identity
+        run: |
+          set -euo pipefail
+          source_digest="$(crane digest "$SOURCE_IMAGE")"
+          test "$source_digest" = "$EXPECTED_DIGEST"
+          crane copy "$SOURCE_IMAGE" "$TARGET_TAG"
+          target_digest="$(crane digest "$TARGET_TAG")"
+          test "$target_digest" = "$EXPECTED_DIGEST"
+          echo "Mirrored image: ${TARGET_TAG%:*}@$target_digest" >> "$GITHUB_STEP_SUMMARY"

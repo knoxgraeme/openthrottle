@@ -1,0 +1,15 @@
+{
+  "name": "@openthrottle/sandbox-tests",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "vitest run runner/*.test.mjs bin/*.test.mjs tests/*.test.mjs"
+  },
+  "devDependencies": {
+    "vitest": "^3.2.4"
+  }
+}

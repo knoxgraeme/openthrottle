@@ -1,0 +1,188 @@
+name: Deploy
+
+# Normal startup is open-only. The one-shot initializer must have created the
+# exact fresh storage pair before FRESH_EPOCH_INITIALIZED is set. This workflow
+# owns only serialized, single-writer releases after that storage boundary.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      build_snapshot:
+        description: "Force a Daytona snapshot rebuild"
+        type: boolean
+        default: false
+      deploy_supervisor:
+        description: "Force a direct Fly supervisor deploy"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# A SQLite volume has one writer authority. Never cancel a deploy in flight.
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      snapshot: >-
+        ${{ steps.filter.outputs.snapshot_sandbox == 'true' ||
+            steps.filter.outputs.snapshot_definitions == 'true' ||
+            steps.filter.outputs.snapshot_contracts == 'true' ||
+            steps.filter.outputs.snapshot_skills == 'true' }}
+      supervisor: >-
+        ${{ steps.filter.outputs.supervisor_source == 'true' ||
+            steps.filter.outputs.supervisor_contracts == 'true' ||
+            steps.filter.outputs.supervisor_definitions == 'true' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dorny/paths-filter@15192bc058cc28a13dbf6cde61f19e18988b7af6 # v3
+        id: filter
+        with:
+          predicate-quantifier: every
+          filters: |
+            snapshot_sandbox:
+              - 'sandbox/**'
+              - '!sandbox/tests/**'
+              - '!sandbox/**/*.test.mjs'
+            snapshot_definitions:
+              - '.openthrottle/**'
+            snapshot_contracts:
+              - 'contracts/**'
+            snapshot_skills:
+              - 'skills/codex/**'
+            supervisor_source:
+              - 'supervisor/**'
+            supervisor_contracts:
+              - 'contracts/**'
+            supervisor_definitions:
+              - '.openthrottle/**'
+
+  snapshot:
+    needs: changes
+    if: needs.changes.outputs.snapshot == 'true' || inputs.build_snapshot
+    runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.build.outputs.name }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: supervisor/package-lock.json
+      - name: Install snapshot builder dependencies
+        run: npm ci --prefix supervisor
+      - name: Build and register the Daytona snapshot
+        id: build
+        env:
+          DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
+          DAYTONA_SANDBOX_CPU: ${{ vars.DAYTONA_SANDBOX_CPU }}
+          DAYTONA_SANDBOX_MEMORY: ${{ vars.DAYTONA_SANDBOX_MEMORY }}
+          DAYTONA_SANDBOX_DISK: ${{ vars.DAYTONA_SANDBOX_DISK }}
+        run: |
+          set -euo pipefail
+          name="openthrottle-$(git rev-parse --short=12 HEAD)"
+          node supervisor/scripts/build-snapshot.mjs "$name"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: [changes, snapshot]
+    if: >-
+      vars.FRESH_EPOCH_INITIALIZED == 'true' &&
+      always() && !cancelled() && needs.snapshot.result != 'failure' &&
+      (needs.changes.outputs.supervisor == 'true' ||
+       needs.snapshot.result == 'success' ||
+       inputs.deploy_supervisor)
+    runs-on: ubuntu-latest
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      FLY_APP: ${{ vars.FLY_APP || 'openthrottle-supervisor' }}
+      SNAPSHOT_NAME: ${{ needs.snapshot.outputs.name }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # master
+      - name: Assert the initialized Fly app and data volume exist
+        run: |
+          set -euo pipefail
+          if ! flyctl status --app "$FLY_APP" >/dev/null 2>&1; then
+            echo "Initialized Fly app $FLY_APP is missing; refusing to create storage after the epoch gate" >&2
+            exit 1
+          fi
+          volumes="$(flyctl volumes list --app "$FLY_APP" --json)"
+          if ! jq -e '
+            type == "array" and
+            ([.[] | select((.name // .Name // "") == "openthrottle_data")] | length == 1)
+          ' <<<"$volumes" >/dev/null; then
+            echo "Expected exactly one initialized openthrottle_data volume; refusing to create replacement storage" >&2
+            jq . <<<"$volumes" >&2 || true
+            exit 1
+          fi
+      - name: Stage the exact snapshot reference
+        if: needs.snapshot.result == 'success'
+        run: flyctl secrets set --stage --app "$FLY_APP" DAYTONA_SNAPSHOT="$SNAPSHOT_NAME"
+      - name: Deploy the supervisor directly
+        run: >-
+          flyctl deploy --ha=false --remote-only --app "$FLY_APP"
+          --config supervisor/fly.toml
+          --dockerfile supervisor/Dockerfile
+      - name: Converge to one SQLite writer Machine
+        run: flyctl scale count 1 --app "$FLY_APP" --yes
+      - name: Verify the single-writer Machine topology
+        run: |
+          set -euo pipefail
+          machines="$(flyctl machines list --app "$FLY_APP" --json)"
+          volumes="$(flyctl volumes list --app "$FLY_APP" --json)"
+          machine_id="$(jq -er '
+            if type == "array" and length == 1
+            then (.[0].id // .[0].ID // empty)
+            else empty
+            end
+          ' <<<"$machines")"
+          jq -e --arg machine_id "$machine_id" '
+            [ .[] |
+              select(
+                (.name // .Name // "") == "openthrottle_data" and
+                (.attached_machine_id // .attachedMachineId // "") == $machine_id
+              )
+            ] | length == 1
+          ' <<<"$volumes" >/dev/null
+          jq . <<<"$machines"
+          jq . <<<"$volumes"
+      - name: Verify the deployed health check
+        run: |
+          set -euo pipefail
+          last_checks='[]'
+          for attempt in $(seq 1 30); do
+            if checks="$(flyctl checks list --app "$FLY_APP" --json)"; then
+              last_checks="$checks"
+              if jq -e '
+                def normalized_checks:
+                  if type == "array" then .
+                  elif type == "object" and all(.[]; type == "array") then
+                    [.[] | .[]]
+                  else
+                    []
+                  end;
+                normalized_checks as $checks |
+                ($checks | length) > 0 and
+                all($checks[];
+                  type == "object" and
+                  ((.status // .Status // null) |
+                    type == "string" and ascii_downcase == "passing")
+                )
+              ' <<<"$checks" >/dev/null; then
+                jq . <<<"$checks"
+                exit 0
+              fi
+            fi
+            if (( attempt < 30 )); then sleep 5; fi
+          done
+          echo "Fly health checks did not all reach passing state" >&2
+          jq . <<<"$last_checks" >&2 || printf '%s\n' "$last_checks" >&2
+          exit 1

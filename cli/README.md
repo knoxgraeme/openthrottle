@@ -1,0 +1,121 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/knoxgraeme/openthrottle/main/docs/assets/banner.jpg" alt="OpenThrottle" width="100%">
+</p>
+
+# `openthrottle`
+
+The Node.js 22 CLI for OpenThrottle, a self-hosted pipeline that turns approved
+plans into reviewed GitHub pull requests with Claude Code, Codex, or OpenCode.
+
+> OpenThrottle is pre-production software. Use it for controlled pilots and
+> register only repositories you trust to execute inside the sandbox.
+
+## Start here
+
+Install the Fly and Daytona CLIs, authenticate them, then run guided setup:
+
+```bash
+npx openthrottle setup
+```
+
+For an empty Fly volume, the first run prepares the hosting resources but does
+not deploy. Initialize the volume once with the pinned supervisor image, set
+the emitted `OT_EPOCH_BOOTSTRAP_CHECKSUM`, then re-run `setup`. The
+[fresh-epoch runbook](../docs/runbooks/execution-kernel-rollout.md) has the
+exact sequence.
+
+Initialize a target repository:
+
+```bash
+cd your-repository
+npx openthrottle init
+```
+
+`init` installs user-global authoring/operator skills for detected local agents,
+writes `.openthrottle/config.yml`, creates empty starter definition directories,
+registers a Linear-team or GitHub-Issue control route, creates the GitHub webhook,
+and verifies the Daytona snapshot. The config selects one pipeline and one local
+engine. Commit the definition tree before validating or shipping: OpenThrottle
+compiles exact Git bytes and rejects dirty definition paths.
+
+For Linear control, prepare and delegate a plan:
+
+```bash
+npx openthrottle plan prepare docs/plans/my-change.md
+npx openthrottle ship docs/plans/my-change.md
+npx openthrottle status
+```
+
+For GitHub-Issue control, an authorized collaborator starts work by applying
+the exact `openthrottle` label to an open Issue.
+
+## Commands
+
+```text
+openthrottle setup [--profile <name>] [--check] [--yes]
+openthrottle init [--profile <name>] [--dry-run]
+openthrottle plan validate <file.md> [--pipeline <id>] [--json]
+openthrottle plan prepare <file.md> [--pipeline <id>] [--json]
+openthrottle validate <file.md> [--pipeline <id>] [--json]
+openthrottle ship <file.md> [--pipeline <id>]
+openthrottle status <run-or-source-reference> [--json]
+openthrottle stop <run-or-source-reference>
+openthrottle logs <run-or-source-reference>
+openthrottle analysis [--run <reference>] [--pipeline <id>] [--outcome <outcome>]
+                      [--record-kind <kind>] [--from <iso>] [--to <iso>] [--limit <n>]
+openthrottle operator-skill <install|status|refresh|remove> [--json]
+openthrottle planning-skill <install|status|refresh|remove> [--json]
+```
+
+Key workflows:
+
+- `setup` provisions and verifies the pinned supervisor and sandbox release.
+  It refuses the first deploy until the one-shot epoch checksum is present;
+  `--check` is read-only and `--profile` keeps multiple environments separate.
+- `init` writes the small v2 config and starter directories; it does not copy
+  platform agents, pipelines, or skills into the repository. Add repository
+  definitions directly under `.openthrottle/` when needed. `--dry-run` validates
+  the proposed config without writing or registering. A partial
+  `OT_SUPERVISOR_URL`/`OT_STATUS_TOKEN` pair fails closed.
+- `plan prepare` and `plan validate` compile the committed definition bundle.
+  A pipeline whose manifest loops over `execution_plan.units` requires a v2
+  execution-plan block with a matching `pipeline_id`; other pipelines require
+  reviewed prose without that block. `--pipeline` is an assertion against the
+  committed config, never a runtime override.
+- `ship` performs the same committed bundle and plan validation before any
+  Linear credential access or mutation. It does not append selection metadata.
+- `status`, `stop`, `logs`, and `analysis` call authenticated supervisor
+  endpoints.
+- `status`, `logs`, and `analysis --run` expose bounded projections from the
+  shared Attempt/Record/Effect/Checkpoint kernel. Semantic agent output remains
+  untrusted until it is normalized and wrapped in an executor-authored record.
+
+Run `npx openthrottle --help` for full flag descriptions.
+
+## Credentials and local state
+
+Setup profiles live under `~/.openthrottle/profiles/`. Generated supervisor
+secrets and repository setup access are stored separately with owner-only
+permissions. Operator-owned GitHub, Daytona, Linear, and model credentials are
+not persisted by the CLI; configure them as Fly secrets.
+
+Common environment variables:
+
+- `OT_SUPERVISOR_URL` and `OT_STATUS_TOKEN` for explicit supervisor access;
+- `DAYTONA_API_KEY` for setup;
+- `LINEAR_API_KEY`, `LINEAR_TEAM_ID`, and `OT_AGENT_APP_ID` for Linear
+  delegation; and
+- `OT_FLY_APP`, `OT_FLY_ORG`, and `OT_FLY_REGION` for resource overrides.
+
+Do not commit local skills, provider credentials, user-global agent
+configuration, or `.env` files.
+
+## Learn more
+
+Read the [project README](https://github.com/knoxgraeme/openthrottle#readme),
+[security policy](https://github.com/knoxgraeme/openthrottle/blob/main/SECURITY.md),
+and [normative specification](https://github.com/knoxgraeme/openthrottle/blob/main/docs/SPEC.md).
+
+## License
+
+MIT

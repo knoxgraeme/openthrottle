@@ -1,0 +1,19 @@
+schema: openthrottle.eval-definition/v1
+id: core/review-result
+evaluator: core/review-outcome@1
+result:
+  schema: openthrottle.semantic-result-schema/v1
+  id: core/review-result
+  outcomes:
+    - success
+    - no_change
+    - needs_human
+    - failure
+  payload:
+    summary:
+      type: string
+      max_length: 4000
+      normalize: string-array-to-newlines/v1
+    findings:
+      type: review_finding_list_v1
+      max_items: 64

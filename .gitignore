@@ -1,0 +1,13 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.DS_Store
+# Generated per release by cli/scripts/generate-release-manifest.mjs
+cli/release-manifest.json

@@ -1,0 +1,144 @@
+#!/usr/bin/env node
+// =============================================================================
+// openthrottle CLI entrypoint — a plain argv router, no CLI framework.
+//
+// Usage: openthrottle <setup|init|plan|validate|ship|status|stop|logs|operator-skill|planning-skill> [args]
+// =============================================================================
+
+const USAGE = `openthrottle — plan-first autonomous coding pipeline CLI
+
+Usage:
+  openthrottle setup [--profile <name>] [--check] [--yes]
+                                    Guided one-time platform onboarding from
+                                    the CLI's pinned release manifest: verify
+                                    credentials, approve mutations, provision
+                                    the runtime snapshot and supervisor, and
+                                    persist readiness evidence. --check is a
+                                    read-only readiness report; --yes
+                                    pre-approves mutations.
+  openthrottle init [--profile <name>] [--dry-run]
+                                    Register the current GitHub repository and
+                                    control route, install local authoring/operator
+                                    skills, verify readiness, and write
+                                    .openthrottle/config.yml. Empty definition
+                                    directories are created for repository-owned
+                                    pipelines, agents, skills, and evals.
+                                    --profile selects saved onboarding state;
+                                    --dry-run validates the proposed config
+                                    without writing or registering anything.
+  openthrottle plan validate <file.md> [--pipeline <id>] [--json]
+                                    Compile committed definitions and validate
+                                    the plan required by the configured pipeline.
+  openthrottle plan prepare <file.md> [--pipeline <id>] [--json]
+                                    Prepare the execution plan using the committed
+                                    pipeline, configured engine, and planning skill.
+  openthrottle validate <file.md>   Alias for plan validate.
+  openthrottle ship <file.md> [--pipeline <id>]
+                                    Validate committed definitions, create a Linear
+                                    issue, and delegate it to the agent. --pipeline
+                                    asserts config; it never overrides it.
+  openthrottle status <run-or-source-reference> [--json]
+                                    Show the shared-kernel run, Attempt, Effect,
+                                    checkpoint, and result-correction status.
+  openthrottle stop <ticket>       Stop a ticket's active run and workspace.
+  openthrottle logs <ticket>       Print sanitized sandbox logs.
+  openthrottle analysis [flags]    Read-only settled-run and Record metadata:
+                                    --run, --pipeline, --outcome, --record-kind,
+                                    --from, --to, --limit.
+  openthrottle operator-skill <install|status|refresh|remove> [--json]
+                                    Manage the explicit local OpenThrottle
+                                    operator skill through pinned Skillfish.
+  openthrottle planning-skill <install|status|refresh|remove> [--json]
+                                    Manage the local ot-plan authoring skill
+                                    through pinned Skillfish.
+
+  openthrottle --help              Show this message.
+  openthrottle --version           Print the CLI version.
+`;
+
+async function main(): Promise<void> {
+  const [, , command, ...rest] = process.argv;
+
+  switch (command) {
+    case 'setup': {
+      const { default: setup } = await import('./setup.js');
+      await setup(rest);
+      break;
+    }
+    case 'init': {
+      const { default: init } = await import('./init.js');
+      await init(rest);
+      break;
+    }
+    case 'ship': {
+      const { default: ship } = await import('./ship.js');
+      await ship(rest);
+      break;
+    }
+    case 'plan': {
+      const { plan } = await import('./plan.js');
+      await plan(rest);
+      break;
+    }
+    case 'validate': {
+      const { validate } = await import('./plan.js');
+      await validate(rest);
+      break;
+    }
+    case 'status': {
+      const { default: status } = await import('./status.js');
+      await status(rest);
+      break;
+    }
+    case 'stop': {
+      const { default: stop } = await import('./stop.js');
+      await stop(rest[0]);
+      break;
+    }
+    case 'logs': {
+      const { default: logs } = await import('./logs.js');
+      await logs(rest[0]);
+      break;
+    }
+    case 'analysis': {
+      const { default: analysis } = await import('./analysis.js');
+      await analysis(rest);
+      break;
+    }
+    case 'operator-skill': {
+      const { default: operatorSkill } = await import('./operator-skill.js');
+      await operatorSkill(rest);
+      break;
+    }
+    case 'planning-skill': {
+      const { planningSkill } = await import('./operator-skill.js');
+      await planningSkill(rest);
+      break;
+    }
+    case '--version':
+    case '-v': {
+      const { readFileSync } = await import('node:fs');
+      const { fileURLToPath } = await import('node:url');
+      const pkgPath = fileURLToPath(new URL('../package.json', import.meta.url));
+      const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as { version: string };
+      console.log(pkg.version);
+      break;
+    }
+    case '--help':
+    case '-h':
+    case undefined: {
+      console.log(USAGE);
+      break;
+    }
+    default: {
+      console.error(`Unknown command: ${command}\n`);
+      console.log(USAGE);
+      process.exit(1);
+    }
+  }
+}
+
+main().catch((err: unknown) => {
+  console.error(err instanceof Error ? err.stack ?? err.message : err);
+  process.exit(1);
+});

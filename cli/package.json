@@ -1,0 +1,63 @@
+{
+  "name": "openthrottle",
+  "version": "1.1.2",
+  "description": "CLI for OpenThrottle — plan-first autonomous coding pipeline (Linear -> Daytona sandbox -> GitHub PR).",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/knoxgraeme/openthrottle"
+  },
+  "homepage": "https://github.com/knoxgraeme/openthrottle#readme",
+  "bugs": {
+    "url": "https://github.com/knoxgraeme/openthrottle/issues"
+  },
+  "keywords": [
+    "ai-agents",
+    "coding-agent",
+    "codex",
+    "developer-tools",
+    "github",
+    "linear"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "openthrottle": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json && node scripts/copy-planning-skills.mjs",
+    "dev": "tsc --watch",
+    "prepack": "npm run build",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "@clack/prompts": "^0.10.0",
+    "@daytona/sdk": "^0.199.0",
+    "@openthrottle/contracts": "file:../contracts",
+    "skillfish": "1.0.39",
+    "yaml": "^2.6.1"
+  },
+  "overrides": {
+    "@opentelemetry/propagator-jaeger": "2.9.0"
+  },
+  "bundleDependencies": [
+    "@openthrottle/contracts"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@vitest/coverage-v8": "^3.2.4",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}

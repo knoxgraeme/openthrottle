@@ -1,0 +1,21 @@
+{
+  "schema": "openthrottle.runtime-capability-source/v1",
+  "release": "openthrottle-execution-kernel/v1",
+  "protocol": "attempt-executor@2",
+  "engines": ["claude", "codex", "opencode"],
+  "repository_authorities": ["edit", "inspect"],
+  "stage_kinds": ["agent", "command", "effect", "wait"],
+  "record_kinds": ["decision", "delivery", "result"],
+  "result_candidate_schema": "openthrottle.result-candidate/v1",
+  "checkpoint_protocol": "git-bundle@1",
+  "max_concurrent_attempts": 1,
+  "executor_primitives": [
+    "core/daytona-cleanup@1",
+    "core/daytona-provision@1",
+    "core/daytona-stop@1",
+    "core/integrate-unit@1",
+    "core/provider-wait@1",
+    "core/publish@1",
+    "kernel/promote-admission@1"
+  ]
+}

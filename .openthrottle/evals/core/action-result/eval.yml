@@ -1,0 +1,34 @@
+schema: openthrottle.eval-definition/v1
+id: core/action-result
+evaluator: core/action-outcome@1
+result:
+  schema: openthrottle.semantic-result-schema/v1
+  id: core/action-result
+  outcomes:
+    - success
+    - no_change
+    - semantic_repair_required
+    - needs_human
+    - retryable_infrastructure_failure
+    - failure
+  payload:
+    summary:
+      type: string
+      max_length: 1000
+      normalize: string-array-to-newlines/v1
+    evidence:
+      type: string_list
+      max_length: 1000
+      max_items: 50
+    findings:
+      type: string_list
+      max_length: 2000
+      max_items: 50
+    actions:
+      type: string_list
+      max_length: 300
+      max_items: 50
+    uncertainty:
+      type: string_list
+      max_length: 300
+      max_items: 20

@@ -1,0 +1,65 @@
+{
+  "schema": "openthrottle.execution-plan/v2",
+  "pipeline_id": "core/structured",
+  "plan_id": "stage-c-contracts",
+  "units": [
+    {
+      "id": "contracts",
+      "title": "Freeze contracts",
+      "depends_on": [],
+      "objective": "Freeze the closed public execution-plan schemas so downstream packages compile against a stable contract.",
+      "requirements": [
+        "Add a versioned successor schema whose units carry every applicable value directly, with no ID-indirection into a separate map.",
+        "Reject unknown fields on every object in the contract."
+      ],
+      "files": [
+        "contracts/src/execution-plan-v2.ts",
+        "contracts/src/index.ts"
+      ],
+      "approach": [
+        "Define ExecutionPlanUnitV2 and ExecutionPlanContractV2 alongside the existing v1 types without modifying v1.",
+        "Export parse and validate entry points from the package barrel."
+      ],
+      "tests": [
+        "A valid fixture parses and normalizes to a stable digest.",
+        "An invalid fixture with a missing required field is rejected and names the unit and field."
+      ],
+      "acceptance": [
+        "The contracts package exports parseExecutionPlanContractV2 and validateExecutionPlanContractV2.",
+        "Every behavior-bearing unit carries objective, requirements, files, approach, tests, acceptance, and verification directly."
+      ],
+      "verification": [
+        "Run the contracts package test suite and confirm the new fixtures pass."
+      ]
+    },
+    {
+      "id": "corpora",
+      "title": "Add corpora",
+      "depends_on": ["contracts"],
+      "objective": "Add valid and invalid fixture corpora that exercise the v2 contract's structural validation deterministically.",
+      "requirements": [
+        "Cover duplicate unit IDs, dependency cycles, unresolved dependency references, invalid command names, unknown fields, and a missing required unit field."
+      ],
+      "files": [
+        "contracts/fixtures/valid/execution-plan-v2.json",
+        "contracts/fixtures/invalid/execution-plan-v2-missing-field.json"
+      ],
+      "approach": [
+        "Mirror the existing v1 fixture corpus shape with v2-specific field content."
+      ],
+      "tests": [
+        "Each invalid fixture rejects with a stable diagnostic path routed through the shared contracts fixture test."
+      ],
+      "acceptance": [
+        "Invalid corpora reject with stable diagnostic paths naming the offending field."
+      ],
+      "verification": [
+        "Run the contracts package test suite and confirm every fixture in the corpus is exercised."
+      ]
+    }
+  ],
+  "commands": [
+    { "name": "docs-check", "unit": null },
+    { "name": "build", "unit": "contracts" }
+  ]
+}

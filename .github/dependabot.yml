@@ -1,0 +1,48 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /contracts
+    schedule:
+      interval: weekly
+    groups:
+      contracts-dependencies:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /supervisor
+    schedule:
+      interval: weekly
+    groups:
+      supervisor-dependencies:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /cli
+    schedule:
+      interval: weekly
+    groups:
+      cli-dependencies:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /sandbox
+    schedule:
+      interval: weekly
+    groups:
+      sandbox-dependencies:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /supervisor
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker
+    directory: /sandbox
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

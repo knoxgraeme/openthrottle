@@ -1,0 +1,35 @@
+{
+  "name": "@openthrottle/contracts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "generated"
+  ],
+  "scripts": {
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json && npm run generate:runtime",
+    "generate:runtime": "node scripts/build-runtime-artifacts.mjs",
+    "check:runtime": "node scripts/build-runtime-artifacts.mjs --check",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4",
+    "yaml": "^2.9.0"
+  }
+}

@@ -1,0 +1,37 @@
+# fly.toml for the OpenThrottle supervisor.
+# See README.md for `fly launch` / volume / secrets setup steps.
+#
+# app name is intentionally left as a placeholder — `fly launch` will either
+# fill this in interactively or you should set it before first deploy:
+app = "openthrottle-supervisor"
+primary_region = "sjc"
+
+[build]
+
+[env]
+  PORT = "8080"
+  DATABASE_PATH = "/data/openthrottle-kernel-v1.sqlite"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    timeout = "5s"
+    path = "/healthz"
+
+[mounts]
+  source = "openthrottle_data"
+  destination = "/data"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512
