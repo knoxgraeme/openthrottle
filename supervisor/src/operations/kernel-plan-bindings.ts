@@ -408,7 +408,18 @@ export function createKernelExternalPlanBindings(input: {
         // after phase zero, so recovery must not reinterpret P as the candidate.
         output_subject: attempt.input_subject,
       });
-      const artifact = descriptor(input.blob_store, candidate, bundle.source_commit);
+      const candidateBlob = (candidate.payload as { blob: BlobPointer }).blob;
+      const candidateBytes = input.blob_store.read(candidateBlob);
+      const advertised = inspectKernelCheckpointBundleAdvertisement({
+        bytes: candidateBytes,
+        expected_commit: candidate.output_subject!,
+      });
+      const checkpointBaseSubject = advertised.ref.startsWith("refs/openthrottle/integrations/")
+        ? candidate.input_subject
+        : bundle.source_commit;
+      const artifact = descriptor(input.blob_store, candidate, checkpointBaseSubject, {
+        sealed_bytes: candidateBytes,
+      });
       const taskBranch = branch(run.id, environment.source_reference);
       const taskRef = `refs/heads/${taskBranch}`;
       const anchor = latestConfirmedTaskRefPush({
@@ -423,7 +434,7 @@ export function createKernelExternalPlanBindings(input: {
         verified_output_subject: null,
         checkpoint_payload: {
           candidate_checkpoint_id: candidate.id,
-          checkpoint_base_subject: bundle.source_commit,
+          checkpoint_base_subject: checkpointBaseSubject,
           publication_parent_subject: anchor.subject,
           publication_ref_mode: anchor.ref_mode,
           publication_parent_delivery_record_id: anchor.delivery_record_id,
@@ -441,12 +452,12 @@ export function createKernelExternalPlanBindings(input: {
               pipeline_run_id: run.id,
               attempt_id: attempt.id,
               definition_bundle_hash: run.definition_bundle_hash,
-              checkpoint_base_subject: bundle.source_commit,
+              checkpoint_base_subject: checkpointBaseSubject,
               current_subject: anchor.subject,
               candidate_checkpoint_id: candidate.id,
               candidate_input_subject: candidate.input_subject,
               candidate_output_subject: candidate.output_subject!,
-              candidate_blob: (candidate.payload as { blob: BlobPointer }).blob as unknown as JsonValue,
+              candidate_blob: candidateBlob as unknown as JsonValue,
               candidate_artifact: artifact,
               current_ancestry: [],
             },

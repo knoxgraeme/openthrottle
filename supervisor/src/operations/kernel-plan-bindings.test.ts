@@ -419,6 +419,96 @@ describe("kernel publication plan binding", () => {
     });
   }, 15_000);
 
+  it("verifies a multi-checkpoint structured publish candidate at its authored boundary", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ot-kernel-structured-publication-"));
+    directories.push(root);
+    const work = join(root, "work");
+    execFileSync("git", ["init", "-q", "-b", "main", work]);
+    git(work, ["config", "user.name", "Test"]);
+    git(work, ["config", "user.email", "test@example.com"]);
+    writeFileSync(join(work, "file.txt"), "accepted tree\n");
+    git(work, ["add", "."]);
+    git(work, ["commit", "-qm", "base"]);
+    const source = git(work, ["rev-parse", "HEAD"]);
+    const tree = git(work, ["rev-parse", "HEAD^{tree}"]);
+    const firstIntegration = git(work, [
+      "commit-tree", tree, "-p", source, "-m", "OpenThrottle integrated unit 1",
+    ]);
+    const secondIntegration = git(work, [
+      "commit-tree", tree, "-p", firstIntegration, "-m", "OpenThrottle integrated unit 2",
+    ]);
+    const candidateRef = `refs/openthrottle/integrations/${"2".repeat(64)}`;
+    const candidateBundle = writeBundle({
+      repository: work,
+      root,
+      ref: candidateRef,
+      commit: secondIntegration,
+      boundary: firstIntegration,
+      name: "second-integration.bundle",
+    });
+    const candidate: AttemptCheckpoint = {
+      schema: "openthrottle.attempt-checkpoint/v1",
+      id: "checkpoint-second-integration",
+      pipeline_run_id: "run-1",
+      attempt_id: "attempt-second-integration",
+      request_hash: "3".repeat(64),
+      definition_bundle_hash: "b".repeat(64),
+      input_subject: firstIntegration,
+      output_subject: secondIntegration,
+      native_session_id: null,
+      payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+      payload: { blob: candidateBundle.pointer },
+      captured_at: NOW,
+    };
+    const bindings = createKernelExternalPlanBindings({
+      environments: {
+        loadExactRunEnvironment: () => ({
+          repository: "owner/repo",
+          base_branch: "main",
+          source_reference: "OPE-201",
+          runtime_snapshot: "snapshot-1",
+          title: "Structured publication",
+        }),
+      } as never,
+      blob_store: { read: () => candidateBundle.bytes } as never,
+    });
+    const publish = bindings.find(({ external_kind }) => external_kind === "core/publish@1")!;
+
+    const prepared = await publish.prepare({
+      run: {
+        id: "run-1",
+        current_subject: secondIntegration,
+        definition_bundle_hash: "b".repeat(64),
+      } as never,
+      attempt: {
+        id: "attempt-publish",
+        input_subject: secondIntegration,
+        request_hash: "4".repeat(64),
+        definition_bundle_hash: "b".repeat(64),
+      } as never,
+      stage: {} as never,
+      context: {
+        records: new Map([["delivery-runtime", runtimeDelivery()]]),
+        checkpoints: new Map([[candidate.id, candidate]]),
+      },
+      bundle: { source_commit: source } as never,
+    });
+
+    expect(prepared.checkpoint_payload).toMatchObject({
+      candidate_checkpoint_id: candidate.id,
+      checkpoint_base_subject: firstIntegration,
+    });
+    expect(prepared.phases[0]!.effects[0]!.payload).toMatchObject({
+      checkpoint_base_subject: firstIntegration,
+      candidate_input_subject: firstIntegration,
+      candidate_output_subject: secondIntegration,
+      candidate_artifact: {
+        ref: candidateRef,
+        commit: secondIntegration,
+      },
+    });
+  }, 15_000);
+
   it("compacts first and later publications onto the exact durable task-ref anchor", async () => {
     const root = mkdtempSync(join(tmpdir(), "ot-kernel-publication-compaction-"));
     directories.push(root);
