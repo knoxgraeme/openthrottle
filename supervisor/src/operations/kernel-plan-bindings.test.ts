@@ -5,12 +5,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  EXECUTION_RECORD_SCHEMA,
+  RESULT_CANDIDATE_SCHEMA,
   digestCanonicalJson,
   type AttemptCheckpoint,
+  type DecisionRecord,
   type DeliveryRecord,
   type ExecutionRecord,
+  type ResultRecord,
 } from "@openthrottle/contracts";
 import { KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES } from "../runtime/kernel-wire.js";
+import {
+  PIPELINE_DECISION_RECORD_PAYLOAD_SCHEMA,
+  SEMANTIC_RESULT_RECORD_PAYLOAD_SCHEMA,
+} from "../pipeline/kernel/evaluator-registry.js";
 import { createKernelExternalPlanBindings } from "./kernel-plan-bindings.js";
 
 const directories: string[] = [];
@@ -69,6 +77,67 @@ function runtimeDelivery(): ExecutionRecord {
     } },
     created_at: NOW,
   };
+}
+
+function publicationRecords(
+  subject: string,
+  definitionBundleHash = "b".repeat(64),
+  title = "Lead-authored publication title",
+  body = "Behavioral summary, rationale, risks, and verification.",
+): [ResultRecord, DecisionRecord] {
+  const attemptId = "attempt-draft-publication";
+  const requestHash = "a".repeat(64);
+  const candidate = { schema: RESULT_CANDIDATE_SCHEMA, outcome: "success", payload: { title, body } };
+  const hash = digestCanonicalJson(candidate);
+  const result: ResultRecord = {
+    schema: EXECUTION_RECORD_SCHEMA,
+    id: `result-${digestCanonicalJson({
+      attempt_id: attemptId,
+      request_hash: requestHash,
+      normalized_candidate_hash: hash,
+    }).slice(0, 48)}`,
+    kind: "result",
+    pipeline_run_id: "run-1",
+    attempt_id: attemptId,
+    request_hash: requestHash,
+    definition_bundle_hash: definitionBundleHash,
+    input_subject: subject,
+    output_subject: null,
+    original_candidate_hash: hash,
+    normalized_candidate_hash: hash,
+    payload_schema: SEMANTIC_RESULT_RECORD_PAYLOAD_SCHEMA,
+    payload: { inline: {
+      schema: SEMANTIC_RESULT_RECORD_PAYLOAD_SCHEMA,
+      semantic_schema_id: "core/publication-draft",
+      outcome: "success",
+      payload: { title, body },
+      transformations: [],
+    } },
+    created_at: NOW,
+  };
+  const decisionPayload = {
+    schema: PIPELINE_DECISION_RECORD_PAYLOAD_SCHEMA,
+    stage_id: "draft_publication",
+    evaluator: "core/action-outcome@1",
+    outcome: "success",
+    reason: "validated_semantic_result",
+  };
+  const decision: DecisionRecord = {
+    schema: EXECUTION_RECORD_SCHEMA,
+    id: `decision-${digestCanonicalJson({
+      attempt_id: attemptId,
+      input_record_ids: [result.id],
+      payload: decisionPayload,
+    }).slice(0, 48)}`,
+    kind: "decision",
+    pipeline_run_id: "run-1",
+    reducer: "core/action-outcome@1",
+    input_record_ids: [result.id],
+    payload_schema: PIPELINE_DECISION_RECORD_PAYLOAD_SCHEMA,
+    payload: { inline: decisionPayload },
+    created_at: NOW,
+  };
+  return [result, decision];
 }
 
 function pushDelivery(
@@ -335,6 +404,73 @@ describe("kernel publication plan binding", () => {
     });
   });
 
+  it("rejects invalid publication evidence before executor reads or effect preparation", async () => {
+    let environmentReads = 0;
+    let blobReads = 0;
+    const bindings = createKernelExternalPlanBindings({
+      environments: {
+        loadExactRunEnvironment() {
+          environmentReads += 1;
+          throw new Error("environment must not be read");
+        },
+      },
+      blob_store: {
+        read() {
+          blobReads += 1;
+          throw new Error("blob must not be read");
+        },
+      } as never,
+    });
+    const publish = bindings.find(({ external_kind }) => external_kind === "core/publish@1")!;
+    const exact = publicationRecords("c".repeat(40));
+    const duplicate = publicationRecords(
+      "c".repeat(40),
+      "b".repeat(64),
+      "Another accepted title",
+      "Another accepted body",
+    );
+    const foreign = exact.map((record) => ({ ...record, pipeline_run_id: "run-foreign" }));
+    const stale = publicationRecords("d".repeat(40));
+    const oversized = publicationRecords(
+      "c".repeat(40),
+      "b".repeat(64),
+      "t".repeat(73),
+      "body",
+    );
+    const extra = publicationRecords("c".repeat(40));
+    const semantic = (extra[0].payload as { inline: Record<string, unknown> }).inline;
+    semantic.payload = { title: "title", body: "body", provenance: "forged" };
+
+    for (const records of [
+      [],
+      [...exact, ...duplicate],
+      foreign,
+      stale,
+      oversized,
+      extra,
+    ]) {
+      await expect(publish.prepare({
+        run: {
+          id: "run-1",
+          current_subject: "c".repeat(40),
+          definition_bundle_hash: "b".repeat(64),
+        } as never,
+        attempt: {
+          input_subject: "c".repeat(40),
+          definition_bundle_hash: "b".repeat(64),
+        } as never,
+        stage: {} as never,
+        context: {
+          records: new Map(records.map((record) => [record.id, record as ExecutionRecord])),
+          checkpoints: new Map(),
+        },
+        bundle: { source_commit: "a".repeat(40) } as never,
+      })).rejects.toThrow(/publication/i);
+    }
+    expect(environmentReads).toBe(0);
+    expect(blobReads).toBe(0);
+  });
+
   it("keeps needs-human and non-integration rejections permanent", async () => {
     const needsHuman = rejectedDelivery({
       id: "delivery-needs-human-integration",
@@ -488,11 +624,18 @@ describe("kernel publication plan binding", () => {
     const bindings = createKernelExternalPlanBindings({
       environments: {
         loadExactRunEnvironment: () => ({
+          pipeline_run_id: "run-1",
+          work_item_id: "work-1",
+          repository_registration_id: "registration-1",
           repository: "owner/repo",
           base_branch: "main",
-          source_reference: "OPE-201",
           runtime_snapshot: "snapshot-1",
+          control_provider: "linear",
+          source_provider: "linear",
+          source_id: "issue-1",
+          source_reference: "OPE-201",
           title: "Dogfood repair",
+          current_subject: candidateSubject,
         }),
       } as never,
       blob_store: { read: (value: { digest: string }) => blobs.get(value.digest)! } as never,
@@ -509,8 +652,12 @@ describe("kernel publication plan binding", () => {
       current_subject: candidateSubject,
       definition_bundle_hash: "b".repeat(64),
     } as never;
+    const draftRecords = publicationRecords(candidateSubject);
     const baseContext = {
-      records: new Map([["delivery-runtime", runtimeDelivery()]]),
+      records: new Map([
+        ["delivery-runtime", runtimeDelivery()],
+        ...draftRecords.map((record) => [record.id, record] as const),
+      ]),
       checkpoints: new Map([[candidate.id, candidate]]),
     };
 
@@ -527,6 +674,21 @@ describe("kernel publication plan binding", () => {
       publication_ref_mode: "create",
       publication_parent_delivery_record_id: null,
       ref: taskRef(),
+      publication_selection: {
+        result_record_id: draftRecords[0]!.id,
+        acceptance_decision_record_id: draftRecords[1]!.id,
+        pipeline_run_id: "run-1",
+        definition_bundle_hash: "b".repeat(64),
+        input_subject: candidateSubject,
+        title: "Lead-authored publication title",
+        body: "Behavioral summary, rationale, risks, and verification.",
+      },
+      publication_provenance: {
+        work_item_id: "work-1",
+        source_provider: "linear",
+        source_id: "issue-1",
+        source_reference: "OPE-201",
+      },
     });
     expect(firstPrepared.phases[0]!.effects[0]!.payload).toMatchObject({
       checkpoint_base_subject: source,
@@ -548,6 +710,7 @@ describe("kernel publication plan binding", () => {
       context: {
         records: new Map([
           ["delivery-runtime", runtimeDelivery()],
+          ...draftRecords.map((record) => [record.id, record] as const),
           [wrongTargetPush.id, wrongTargetPush],
         ]),
         checkpoints: baseContext.checkpoints,
@@ -610,6 +773,7 @@ describe("kernel publication plan binding", () => {
     const updateContext = {
       records: new Map([
         ["delivery-runtime", runtimeDelivery()],
+        ...draftRecords.map((record) => [record.id, record] as const),
         [priorPush.id, priorPush],
       ]),
       checkpoints: baseContext.checkpoints,
@@ -810,6 +974,7 @@ describe("kernel publication plan binding", () => {
       context: {
         records: new Map([
           ["delivery-runtime", runtimeDelivery()],
+          ...draftRecords.map((record) => [record.id, record] as const),
           [priorPush.id, priorPush],
           [secondPriorPush.id, secondPriorPush],
         ]),
@@ -984,10 +1149,20 @@ describe("kernel publication plan binding", () => {
     const publish = bindings.find(({ external_kind }) => external_kind === "core/publish@1")!;
 
     await expect(publish.prepare({
-      run: { id: "run-1", current_subject: outputSubject } as never,
-      attempt: { input_subject: outputSubject } as never,
+      run: {
+        id: "run-1",
+        current_subject: outputSubject,
+        definition_bundle_hash: "b".repeat(64),
+      } as never,
+      attempt: {
+        input_subject: outputSubject,
+        definition_bundle_hash: "b".repeat(64),
+      } as never,
       stage: {} as never,
-      context: { records: new Map(), checkpoints: new Map([[checkpoint.id, checkpoint]]) },
+      context: {
+        records: new Map(publicationRecords(outputSubject).map((record) => [record.id, record])),
+        checkpoints: new Map([[checkpoint.id, checkpoint]]),
+      },
       bundle: { source_commit: inputSubject } as never,
     })).rejects.toThrow(/exact sole parent/i);
   });

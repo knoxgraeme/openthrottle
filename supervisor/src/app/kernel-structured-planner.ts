@@ -32,6 +32,7 @@ import {
   deriveKernelSuccessorAttempt,
   mergeCausalGithubPushContext,
 } from "../pipeline/kernel/successor-attempt.js";
+import { sameSubjectGateEvidence } from "../pipeline/kernel/publication-draft.js";
 import type { KernelAttempt } from "../pipeline/kernel/types.js";
 import {
   assertStructuredRequestContextExact,
@@ -614,6 +615,12 @@ export class KernelStructuredSettlementPlanner implements
       pipeline_run_id: input.view.run.id,
       base_records: [input.result, decision, ...exactStructuredRuntimeRecords(request)],
       inherited_records: [...request.context.records.values()],
+      additional_records: sameSubjectGateEvidence({
+        records: request.context.records.values(),
+        pipeline_run_id: input.view.run.id,
+        definition_bundle_hash: input.view.run.definition_bundle_hash,
+        input_subject: input.attempt.input_subject,
+      }),
     });
     const frontier = compileReviewFanoutFrontier({
       pipeline_run_id: input.view.run.id,

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   EXECUTION_RECORD_SCHEMA,
+  RESULT_CANDIDATE_SCHEMA,
   digestCanonicalJson,
   expandCompiledRuntimeLifecycle,
   runtimeStopStageId,
@@ -11,6 +12,10 @@ import {
   type ExecutionRecord,
   type ResultRecord,
 } from "@openthrottle/contracts";
+import {
+  PIPELINE_DECISION_RECORD_PAYLOAD_SCHEMA,
+  SEMANTIC_RESULT_RECORD_PAYLOAD_SCHEMA,
+} from "./evaluator-registry.js";
 import { exactConfirmedGithubPushDelivery } from "./github-push-delivery.js";
 import type { ReductionView } from "./ports.js";
 import {
@@ -87,6 +92,74 @@ function runtimeDelivery(kind: "create" | "start"): DeliveryRecord {
     } },
     created_at: NOW,
   };
+}
+
+function publicationEvidence(subject = SUBJECT): [ResultRecord, DecisionRecord] {
+  const attemptId = `attempt-draft-${subject.slice(0, 8)}`;
+  const requestHash = digestCanonicalJson({ publication_subject: subject });
+  const candidate = {
+    schema: RESULT_CANDIDATE_SCHEMA,
+    outcome: "success",
+    payload: { title: "Useful authored title", body: "Useful rationale and verification." },
+  };
+  const hash = digestCanonicalJson(candidate);
+  const result: ResultRecord = {
+    schema: EXECUTION_RECORD_SCHEMA,
+    id: `result-${digestCanonicalJson({
+      attempt_id: attemptId,
+      request_hash: requestHash,
+      normalized_candidate_hash: hash,
+    }).slice(0, 48)}`,
+    kind: "result",
+    pipeline_run_id: "run-1",
+    attempt_id: attemptId,
+    request_hash: requestHash,
+    definition_bundle_hash: digestCanonicalJson({
+      schema: "openthrottle.definition-bundle/v1",
+      compiler_version: "definition-compiler/v1",
+      runtime_capability_digest: "c".repeat(64),
+      source_commit: SUBJECT,
+      pipeline_id: "core/test",
+      pipeline_selection: "config",
+      entries: [],
+    }),
+    input_subject: subject,
+    output_subject: null,
+    original_candidate_hash: hash,
+    normalized_candidate_hash: hash,
+    payload_schema: SEMANTIC_RESULT_RECORD_PAYLOAD_SCHEMA,
+    payload: { inline: {
+      schema: SEMANTIC_RESULT_RECORD_PAYLOAD_SCHEMA,
+      semantic_schema_id: "core/publication-draft",
+      outcome: "success",
+      payload: candidate.payload,
+      transformations: [],
+    } },
+    created_at: NOW,
+  };
+  const payload = {
+    schema: PIPELINE_DECISION_RECORD_PAYLOAD_SCHEMA,
+    stage_id: "draft_publication",
+    evaluator: "core/action-outcome@1",
+    outcome: "success",
+    reason: "validated_semantic_result",
+  };
+  const decision: DecisionRecord = {
+    schema: EXECUTION_RECORD_SCHEMA,
+    id: `decision-${digestCanonicalJson({
+      attempt_id: attemptId,
+      input_record_ids: [result.id],
+      payload,
+    }).slice(0, 48)}`,
+    kind: "decision",
+    pipeline_run_id: "run-1",
+    reducer: "core/action-outcome@1",
+    input_record_ids: [result.id],
+    payload_schema: PIPELINE_DECISION_RECORD_PAYLOAD_SCHEMA,
+    payload: { inline: payload },
+    created_at: NOW,
+  };
+  return [result, decision];
 }
 
 function failureSuccessorFixture(): {
@@ -325,6 +398,95 @@ describe("mergeCausalGithubPushContext", () => {
       fixture.result.id,
     ].sort());
     expect(successor.context_record_ids).not.toContain(rejected.id);
+  });
+
+  it("retains the exact accepted publication record across same-subject publish re-entry", () => {
+    const fixture = failureSuccessorFixture();
+    const publication = publicationEvidence(OUTPUT);
+    const runtimeRecords = [runtimeDelivery("create"), runtimeDelivery("start")];
+    const successor = deriveKernelSuccessorAttempt({
+      view: fixture.view,
+      current: fixture.current,
+      result: fixture.result,
+      decision: fixture.decision,
+      bundle: fixture.bundle,
+      target_scope: { kind: "stage", stage_id: "publish" },
+      request_inputs: {
+        task_prompt: "Retry immutable publication.",
+        context: {
+          records: new Map([...publication, ...runtimeRecords].map((record) => [record.id, record])),
+          checkpoints: new Map(),
+        },
+      },
+    });
+
+    expect(successor.input_subject).toBe(OUTPUT);
+    expect(successor.context_record_ids).toEqual([
+      fixture.result.id,
+      fixture.decision.id,
+      ...publication.map(({ id }) => id),
+      ...runtimeRecords.map(({ id }) => id),
+    ].sort());
+  });
+
+  it("rejects stale publication evidence after a subject-changing repair", () => {
+    const fixture = failureSuccessorFixture();
+    const stale = publicationEvidence(SUBJECT);
+    expect(() => deriveKernelSuccessorAttempt({
+      view: fixture.view,
+      current: fixture.current,
+      result: fixture.result,
+      decision: fixture.decision,
+      bundle: fixture.bundle,
+      target_scope: { kind: "stage", stage_id: "publish" },
+      request_inputs: {
+        task_prompt: "A repaired subject cannot reuse stale prose.",
+        context: { records: new Map(stale.map((record) => [record.id, record])), checkpoints: new Map() },
+      },
+    })).toThrow(/foreign or stale attempt identity/);
+  });
+
+  it("uses a fresh draft after repair without carrying the prior subject's prose", () => {
+    const fixture = failureSuccessorFixture();
+    const stale = publicationEvidence(SUBJECT);
+    const fresh = publicationEvidence(OUTPUT);
+    const draftStage = {
+      id: "draft_publication",
+      kind: "agent" as const,
+      agent_id: "core/publication-lead",
+      repository_authority: "inspect" as const,
+      skills: ["core/draft-publication"],
+      entry_skill: "core/draft-publication",
+      eval: "core/publication-draft",
+      engine: "codex" as const,
+      on: { success: { to: "publish" } },
+    };
+    const manifest = { ...fixture.manifest, stages: [...fixture.manifest.stages, draftStage] };
+    const current = {
+      ...fixture.current,
+      id: fresh[0].attempt_id,
+      scope: { kind: "stage" as const, stage_id: "draft_publication" },
+      input_subject: OUTPUT,
+      output_subject: null,
+    };
+    const view = { ...fixture.view, manifest, current_attempt: current };
+    const successor = deriveKernelSuccessorAttempt({
+      view,
+      current,
+      result: fresh[0],
+      decision: fresh[1],
+      bundle: fixture.bundle,
+      target_scope: { kind: "stage", stage_id: "publish" },
+      request_inputs: {
+        task_prompt: "Draft again for repaired bytes.",
+        context: { records: new Map(stale.map((record) => [record.id, record])), checkpoints: new Map() },
+      },
+    });
+
+    expect(successor.context_record_ids).toContain(fresh[0].id);
+    expect(successor.context_record_ids).toContain(fresh[1].id);
+    expect(successor.context_record_ids).not.toContain(stale[0].id);
+    expect(successor.context_record_ids).not.toContain(stale[1].id);
   });
 
   it.each([

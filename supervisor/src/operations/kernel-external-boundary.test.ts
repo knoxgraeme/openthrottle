@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   EXECUTION_RECORD_SCHEMA,
+  canonicalJson,
   definitionEntryContentHash,
   digestCanonicalJson,
   expandCompiledRuntimeLifecycle,
@@ -475,7 +476,18 @@ function prepared(
     checkpoint_payload: {
       external_kind: externalKind,
       ...(externalKind === "core/publish@1"
-        ? { publication_parent_subject: SUBJECT }
+        ? {
+          publication_parent_subject: SUBJECT,
+          publication_selection: {
+            result_record_id: "result-publication-draft",
+            acceptance_decision_record_id: "decision-publication-draft",
+            pipeline_run_id: "run-1",
+            definition_bundle_hash: "c".repeat(64),
+            input_subject: PRIVATE_CANDIDATE,
+            title: "Exact authored title",
+            body: "Exact authored body with rationale and verification.",
+          },
+        }
         : {}),
     },
     phases: shape.phases.map((phase) => ({
@@ -1183,10 +1195,21 @@ describe("kernel external boundary bridge", () => {
       external_kind: "core/publish@1",
     });
     const store = new MemoryExternalStore(currentManifest, PRIVATE_CANDIDATE);
+    const publish = binding("core/publish@1");
+    const recoveredSelections: JsonValue[] = [];
+    const tracked: KernelExternalStagePlanBinding = {
+      ...publish,
+      async prepare(request) {
+        const next = await publish.prepare(request);
+        recoveredSelections.push((next.checkpoint_payload as Record<string, JsonValue>)
+          .publication_selection!);
+        return next;
+      },
+    };
     const bridge = coordinator({
       store,
       definition_bundle: definitionBundle,
-      plans: [binding("core/publish@1")],
+      plans: [tracked],
     });
     await bridge.executeLeasedAttempt(store.leased());
     store.acknowledgePhase("integrate-checkpoint");
@@ -1214,6 +1237,8 @@ describe("kernel external boundary bridge", () => {
       disposition: "scheduled",
       phase: "push-checkpoint",
     });
+    expect(recoveredSelections.length).toBeGreaterThanOrEqual(3);
+    expect(new Set(recoveredSelections.map((selection) => canonicalJson(selection))).size).toBe(1);
     expect(store.run.current_subject).toBe(OUTPUT);
     expect(store.schedules.get("external-schedule:attempt-1:push-checkpoint")?.effects[0]?.intent)
       .toMatchObject({ subject: OUTPUT });

@@ -29,6 +29,10 @@ import {
   exactConfirmedGithubPushDelivery,
   isGithubPushDelivery,
 } from "../pipeline/kernel/github-push-delivery.js";
+import {
+  sameSubjectGateEvidence,
+  selectPublicationDraft,
+} from "../pipeline/kernel/publication-draft.js";
 
 const GIT_BUNDLE_SCHEMA = "openthrottle.git-checkpoint-bundle/v1" as const;
 
@@ -420,6 +424,18 @@ export function createKernelExternalPlanBindings(input: {
     subject_policy: "advance",
     phases: publishShape.phases,
     async prepare({ run, attempt, context, bundle }) {
+      const publication = selectPublicationDraft({
+        records: context.records.values(),
+        pipeline_run_id: run.id,
+        definition_bundle_hash: run.definition_bundle_hash,
+        input_subject: attempt.input_subject,
+      });
+      const verifiedGateRecordIds = sameSubjectGateEvidence({
+        records: context.records.values(),
+        pipeline_run_id: run.id,
+        definition_bundle_hash: run.definition_bundle_hash,
+        input_subject: attempt.input_subject,
+      }).map(({ id }) => id);
       const environment = input.environments.loadExactRunEnvironment(run.id);
       const candidate = exactGitCheckpoint({
         checkpoints: context.checkpoints,
@@ -448,6 +464,22 @@ export function createKernelExternalPlanBindings(input: {
           publication_ref_mode: anchor.ref_mode,
           publication_parent_delivery_record_id: anchor.delivery_record_id,
           ref: taskRef,
+          publication_selection: {
+            result_record_id: publication.result.id,
+            acceptance_decision_record_id: publication.acceptance.id,
+            pipeline_run_id: run.id,
+            definition_bundle_hash: run.definition_bundle_hash,
+            input_subject: attempt.input_subject,
+            title: publication.title,
+            body: publication.body,
+          },
+          publication_provenance: {
+            work_item_id: environment.work_item_id,
+            source_provider: environment.source_provider,
+            source_id: environment.source_id,
+            source_reference: environment.source_reference,
+          },
+          verified_gate_record_ids: verifiedGateRecordIds,
         },
         phases: [
           { id: "integrate-checkpoint", effects: [{

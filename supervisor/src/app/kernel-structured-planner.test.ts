@@ -25,7 +25,11 @@ import {
   type VirtualDefinitionFile,
 } from "@openthrottle/contracts";
 import { createPendingKernelAttempt } from "../pipeline/kernel/action-request.js";
-import { createPipelineDecisionRecord } from "../pipeline/kernel/evaluator-registry.js";
+import {
+  COMMAND_RESULT_RECORD_PAYLOAD_SCHEMA,
+  PIPELINE_DECISION_RECORD_PAYLOAD_SCHEMA,
+  createPipelineDecisionRecord,
+} from "../pipeline/kernel/evaluator-registry.js";
 import type {
   ExternalScheduleView,
   KernelExternalSettlementPlanner,
@@ -448,6 +452,62 @@ function externalSchedules(deliveries: readonly DeliveryRecord[]): ExternalSched
     },
     effects: [{ intent: {} as never, delivery }],
   }));
+}
+
+function commandGate(stageId: string): [ResultRecord, DecisionRecord] {
+  const attemptId = `attempt-${stageId}`;
+  const requestHash = digestCanonicalJson({ stage_id: stageId, subject: INTEGRATED });
+  const resultPayload = {
+    schema: COMMAND_RESULT_RECORD_PAYLOAD_SCHEMA,
+    command_id: stageId,
+    outcome: "success",
+    exit_code: 0,
+    summary: `${stageId} passed`,
+  };
+  const hash = digestCanonicalJson(resultPayload);
+  const result: ResultRecord = {
+    schema: EXECUTION_RECORD_SCHEMA,
+    id: `result-${digestCanonicalJson({
+      attempt_id: attemptId,
+      request_hash: requestHash,
+      normalized_candidate_hash: hash,
+    }).slice(0, 48)}`,
+    kind: "result",
+    pipeline_run_id: "run-1",
+    attempt_id: attemptId,
+    request_hash: requestHash,
+    definition_bundle_hash: DEFINITIONS.manifest.definition_bundle_hash,
+    input_subject: INTEGRATED,
+    output_subject: null,
+    original_candidate_hash: hash,
+    normalized_candidate_hash: hash,
+    payload_schema: COMMAND_RESULT_RECORD_PAYLOAD_SCHEMA,
+    payload: { inline: resultPayload },
+    created_at: NOW,
+  };
+  const decisionPayload = {
+    schema: PIPELINE_DECISION_RECORD_PAYLOAD_SCHEMA,
+    stage_id: stageId,
+    evaluator: "core/command-outcome@1",
+    outcome: "success",
+    reason: "executor_command_result",
+  };
+  const decision: DecisionRecord = {
+    schema: EXECUTION_RECORD_SCHEMA,
+    id: `decision-${digestCanonicalJson({
+      attempt_id: attemptId,
+      input_record_ids: [result.id],
+      payload: decisionPayload,
+    }).slice(0, 48)}`,
+    kind: "decision",
+    pipeline_run_id: "run-1",
+    reducer: "core/command-outcome@1",
+    input_record_ids: [result.id],
+    payload_schema: PIPELINE_DECISION_RECORD_PAYLOAD_SCHEMA,
+    payload: { inline: decisionPayload },
+    created_at: NOW,
+  };
+  return [result, decision];
 }
 
 function ordinaryInput(input: {
@@ -1053,8 +1113,9 @@ describe("KernelStructuredSettlementPlanner", () => {
       payload: { inline: { exact: true } },
       captured_at: NOW,
     };
+    const gates = ["final_test", "final_lint", "final_build"].flatMap(commandGate);
     const request = requestInputs({
-      records: [runtimeDelivery("create"), runtimeDelivery("start"), push],
+      records: [runtimeDelivery("create"), runtimeDelivery("start"), push, ...gates],
       checkpoints: [boundary],
     });
     const pending = pendingAttempt({
@@ -1108,6 +1169,8 @@ describe("KernelStructuredSettlementPlanner", () => {
       attempt.context_checkpoint_ids.includes(boundary.id))).toBe(true);
     expect(settlement.next_attempts.every((attempt) =>
       attempt.context_record_ids.includes(push.id))).toBe(true);
+    expect(settlement.next_attempts.every((attempt) => gates.every((record) =>
+      attempt.context_record_ids.includes(record.id)))).toBe(true);
   });
 
   it("fans review evidence into validation and preserves runtime identity for edit remediation", async () => {

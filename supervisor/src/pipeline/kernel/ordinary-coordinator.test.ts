@@ -147,6 +147,16 @@ const reviewSchema: SemanticResultSchemaContract = {
   },
 };
 
+const publicationSchema: SemanticResultSchemaContract = {
+  schema: SEMANTIC_RESULT_SCHEMA,
+  id: "core/publication-draft",
+  outcomes: ["success"],
+  payload: {
+    title: { type: "string", max_length: 72 },
+    body: { type: "string", max_length: 12_000 },
+  },
+};
+
 function evaluation(
   id: string,
   evaluator: string,
@@ -200,7 +210,13 @@ function fixture(): {
     },
     { id: "test", kind: "command", command: "test", on: { success: { to: "lint" }, failure: { to: "repair" } } },
     { id: "lint", kind: "command", command: "lint", on: { success: { to: "build" }, failure: { to: "repair" } } },
-    { id: "build", kind: "command", command: "build", on: { success: { to: "publish" }, failure: { to: "repair" } } },
+    { id: "build", kind: "command", command: "build", on: { success: { to: "draft_publication" }, failure: { to: "repair" } } },
+    {
+      id: "draft_publication", kind: "agent", engine: "codex", agent_id: "core/publication-lead",
+      repository_authority: "inspect", skills: ["core/draft-publication"],
+      entry_skill: "core/draft-publication", eval: "core/publication-draft",
+      on: { success: { to: "publish" } },
+    },
     { id: "publish", kind: "effect", effect: "core/publish@1", on: { success: { terminal: "completed" }, failure: { terminal: "failed" } } },
   ];
   const authoredStages = stages.map((stage) => stage.kind === "agent"
@@ -222,15 +238,20 @@ function fixture(): {
     }),
     entry("agent", "core/ordinary-worker", "Implement or simplify only the sealed task."),
     entry("agent", "core/reviewer", "Inspect the sealed change boundary and report findings."),
+    entry("agent", "core/publication-lead", "Author bounded publication copy for the exact subject."),
     entry("skill", "core/implement-plan", skill("core/implement-plan")),
     entry("skill", "core/repair-unit", skill("core/repair-unit")),
     entry("skill", "core/review-change", skill("core/review-change")),
     entry("skill", "core/simplify-change", skill("core/simplify-change")),
+    entry("skill", "core/draft-publication", skill("core/draft-publication")),
     entry("eval", "core/action-result", evaluation(
       "core/action-result", "core/action-outcome@1", actionSchema,
     )),
     entry("eval", "core/review-result", evaluation(
       "core/review-result", "core/review-outcome@1", reviewSchema,
+    )),
+    entry("eval", "core/publication-draft", evaluation(
+      "core/publication-draft", "core/action-outcome@1", publicationSchema,
     )),
   ];
   const trusted = new Map(entries
@@ -296,6 +317,17 @@ function reviewCandidate(findings: readonly ReviewFindingV1[] = []): StagedSeman
     schema: RESULT_CANDIDATE_SCHEMA,
     outcome: "success",
     payload: { summary: "reviewed", findings },
+  });
+}
+
+function publicationCandidate(): StagedSemanticCandidate {
+  return candidateFor(publicationSchema, {
+    schema: RESULT_CANDIDATE_SCHEMA,
+    outcome: "success",
+    payload: {
+      title: "Restore lead-authored pull request descriptions",
+      body: "Restores useful behavioral context because placeholder prose hid design and verification details.",
+    },
   });
 }
 
@@ -380,6 +412,8 @@ class RuntimeFixture implements KernelRuntimePort {
             title: "Authorization can be bypassed",
             evidence: "The sealed review subject reaches the mutation without an authorization check.",
           }] : [])
+          : request.stage_id === "draft_publication"
+            ? publicationCandidate()
           : actionCandidate(request.stage_id === "implement" ? ["implemented", "tested"] : "simplified"),
       },
     };
@@ -1028,7 +1062,7 @@ describe("ordinary kernel activation", () => {
   it("traverses core/implement to the publication boundary using only shared kernel primitives", async () => {
     const test = await setup();
     try {
-      for (let ordinal = 1; ordinal <= 7; ordinal += 1) {
+      for (let ordinal = 1; ordinal <= 8; ordinal += 1) {
         expect((await execute(test.coordinator, ordinal)).disposition).toBe("settled");
       }
       const aggregate = await test.store.loadExactReductionView({
@@ -1054,7 +1088,33 @@ describe("ordinary kernel activation", () => {
         ["test", "inspect"],
         ["lint", "inspect"],
         ["build", "inspect"],
+        ["draft_publication", "inspect"],
       ]);
+
+      const publishAttemptId = Object.keys(aggregate.run.active_attempt_versions)[0]!;
+      const publishInputs = await test.store.loadAttemptRequestInputs({
+        pipeline_run_id: test.run_id,
+        attempt_id: publishAttemptId,
+      });
+      const semanticRecords = [...publishInputs.context.records.values()].filter((record) =>
+        record.kind === "result" && "inline" in record.payload &&
+        record.payload.inline && typeof record.payload.inline === "object" &&
+        !Array.isArray(record.payload.inline) &&
+        record.payload.inline.semantic_schema_id === "core/publication-draft");
+      expect(semanticRecords).toHaveLength(1);
+      expect(semanticRecords[0]).toMatchObject({
+        pipeline_run_id: test.run_id,
+        input_subject: SIMPLIFIED,
+        output_subject: null,
+      });
+      const commandIds = [...publishInputs.context.records.values()].flatMap((record) =>
+        record.kind === "result" && "inline" in record.payload &&
+          record.payload.inline && typeof record.payload.inline === "object" &&
+          !Array.isArray(record.payload.inline) &&
+          typeof record.payload.inline.command_id === "string"
+          ? [record.payload.inline.command_id]
+          : []);
+      expect(commandIds.sort()).toEqual(["build", "lint", "test"]);
 
       const firstReview = test.runtime.workRequests.find(({ stage_id }) => stage_id === "review")!;
       expect(firstReview.change_boundary).toEqual({
@@ -1082,7 +1142,7 @@ describe("ordinary kernel activation", () => {
         outcome: "success",
         payload: { summary: "implemented\ntested" },
       });
-      expect(test.db.prepare("SELECT COUNT(*) AS count FROM attempts").get()).toEqual({ count: 8 });
+      expect(test.db.prepare("SELECT COUNT(*) AS count FROM attempts").get()).toEqual({ count: 9 });
       expect(test.db.prepare("SELECT COUNT(*) AS count FROM effects").get()).toEqual({ count: 0 });
     } finally {
       test.db.close();

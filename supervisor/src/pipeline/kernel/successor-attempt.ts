@@ -27,6 +27,10 @@ import {
   exactConfirmedGithubPushDelivery,
   isGithubPushDelivery,
 } from "./github-push-delivery.js";
+import {
+  sameSubjectGateEvidence,
+  selectPublicationDraft,
+} from "./publication-draft.js";
 
 export function mergeCausalGithubPushContext(input: {
   pipeline_run_id: string;
@@ -106,11 +110,54 @@ export function deriveKernelSuccessorAttempt(input: {
   const runtimeResourceRecords = exactKernelRuntimeResourceDeliveries(
     [...input.request_inputs.context.records.values()],
   ) ?? [];
+  const successorSubject = input.current.output_subject ?? input.current.input_subject;
+  const target = input.view.manifest.stages.find(({ id }) => id === input.target_scope.stage_id);
+  if (!target) throw new Error(`compiled manifest has no successor stage ${input.target_scope.stage_id}`);
+  const inheritedRecords = [...input.request_inputs.context.records.values()];
+  let gateRecords = sameSubjectGateEvidence({
+    records: inheritedRecords,
+    pipeline_run_id: input.view.run.id,
+    definition_bundle_hash: input.view.run.definition_bundle_hash,
+    input_subject: successorSubject,
+  });
+  let publicationRecords: ExecutionRecord[] = [];
+  const currentStage = input.view.manifest.stages.find(({ id }) => id === input.current.scope.stage_id);
+  if (currentStage?.kind === "command") {
+    const supersededResultIds = new Set(gateRecords.flatMap((record) => {
+      if (
+        record.kind !== "result" || !("inline" in record.payload) ||
+        !record.payload.inline || typeof record.payload.inline !== "object" ||
+        Array.isArray(record.payload.inline) ||
+        record.payload.inline.command_id !== currentStage.command
+      ) return [];
+      return [record.id];
+    }));
+    gateRecords = gateRecords.filter((record) =>
+      !supersededResultIds.has(record.id) &&
+      (record.kind !== "decision" ||
+        !record.input_record_ids.some((id) => supersededResultIds.has(id))));
+  }
+  if (
+    target.kind === "effect" && target.effect === "core/publish@1" &&
+    currentStage?.kind === "effect" && currentStage.effect === "core/publish@1"
+  ) {
+    const selected = selectPublicationDraft({
+      records: inheritedRecords,
+      pipeline_run_id: input.view.run.id,
+      definition_bundle_hash: input.view.run.definition_bundle_hash,
+      input_subject: successorSubject,
+    });
+    publicationRecords = [selected.result, selected.acceptance];
+  }
   const uniqueRecords = mergeCausalGithubPushContext({
     pipeline_run_id: input.view.run.id,
     base_records: [input.result, input.decision, ...runtimeResourceRecords],
-    inherited_records: [...input.request_inputs.context.records.values()],
-    additional_records: input.additional_context_records,
+    inherited_records: inheritedRecords,
+    additional_records: [
+      ...gateRecords,
+      ...publicationRecords,
+      ...(input.additional_context_records ?? []),
+    ],
   });
   const checkpoints = [
     ...(input.checkpoint_override ?? input.request_inputs.context.checkpoints.values()),
@@ -120,7 +167,7 @@ export function deriveKernelSuccessorAttempt(input: {
     id,
     pipeline_run_id: input.view.run.id,
     scope: input.target_scope,
-    input_subject: input.current.output_subject ?? input.current.input_subject,
+    input_subject: successorSubject,
     bundle: input.bundle,
     manifest: input.view.manifest,
     action_inputs: {
