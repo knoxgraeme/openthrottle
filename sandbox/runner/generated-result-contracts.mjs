@@ -15,7 +15,6 @@ const [candidateRuntime, canonicalRuntime, validationRuntime] = await Promise.al
 ]);
 
 export const {
-  CORE_SEMANTIC_RESULT_SCHEMAS,
   RESULT_CANDIDATE_MAX_BYTES,
   RESULT_CANDIDATE_SCHEMA,
   providerJsonSchemaForResultCandidate,
