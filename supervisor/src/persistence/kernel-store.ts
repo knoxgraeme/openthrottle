@@ -1324,6 +1324,7 @@ export class SqliteKernelStore implements
   }
 
   #insertAttempt(attempt: KernelAttempt, now: string, workerId: string | null): void {
+    if (attempt.pending_result?.evidence !== undefined) this.#blobs.verify(attempt.pending_result.evidence);
     const [parent, group, item, index] = scopeColumns(attempt.scope);
     const contextRecordIds = canonicalAttemptContextIds(
       attempt.context_record_ids,
@@ -1339,13 +1340,13 @@ export class SqliteKernelStore implements
         scope_item_id, scope_item_index, repository_authority, request_hash,
         definition_bundle_hash, input_subject, context_record_ids_json,
         context_checkpoint_ids_json, output_subject, native_session_id,
-        status, version, work_retry_ordinal, result_correction_count,
+        status, version, work_retry_ordinal, last_operational_signature, result_correction_count,
         result_correction_deadline, unmet_dependency_count,
         lease_id, lease_generation, lease_worker_id, lease_purpose, lease_expires_at, lease_started,
         checkpoint_id, result_record_id, decision_record_id,
         pending_candidate_hash, pending_diagnostics_json,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       attempt.id,
       attempt.pipeline_run_id,
@@ -1366,6 +1367,7 @@ export class SqliteKernelStore implements
       attempt.status,
       attempt.version,
       attempt.work_retry_ordinal,
+      attempt.last_operational_signature ?? null,
       attempt.result_correction_count,
       attempt.result_correction_deadline,
       attempt.lease?.id ?? null,
@@ -1378,13 +1380,17 @@ export class SqliteKernelStore implements
       attempt.result_record_id,
       attempt.decision_record_id,
       attempt.pending_result?.candidate_hash ?? null,
-      attempt.pending_result === null ? null : canonicalJson(attempt.pending_result.diagnostics),
+      attempt.pending_result === null ? null : canonicalJson({
+        diagnostics: attempt.pending_result.diagnostics,
+        evidence: attempt.pending_result.evidence,
+      }),
       now,
       now,
     );
   }
 
   #replaceAttempt(attempt: KernelAttempt, expectedVersion: number, runId: string): void {
+    if (attempt.pending_result?.evidence !== undefined) this.#blobs.verify(attempt.pending_result.evidence);
     if (attempt.pipeline_run_id !== runId) throw new Error(`attempt ${attempt.id} belongs to another run`);
     const existing = this.#db.prepare("SELECT * FROM attempts WHERE id = ? AND pipeline_run_id = ?")
       .get(attempt.id, runId) as AttemptRow | undefined;
@@ -1416,7 +1422,7 @@ export class SqliteKernelStore implements
         scope_kind = ?, stage_id = ?, parent_attempt_id = ?, scope_group_id = ?,
         scope_item_id = ?, scope_item_index = ?, repository_authority = ?, request_hash = ?,
         definition_bundle_hash = ?, input_subject = ?, output_subject = ?, native_session_id = ?,
-        status = ?, version = ?, work_retry_ordinal = ?, result_correction_count = ?,
+        status = ?, version = ?, work_retry_ordinal = ?, last_operational_signature = ?, result_correction_count = ?,
         result_correction_deadline = ?, lease_id = ?, lease_generation = ?,
         lease_worker_id = ?, lease_purpose = ?,
         lease_expires_at = ?, lease_started = ?, checkpoint_id = ?, result_record_id = ?,
@@ -1439,6 +1445,7 @@ export class SqliteKernelStore implements
       attempt.status,
       attempt.version,
       attempt.work_retry_ordinal,
+      attempt.last_operational_signature ?? null,
       attempt.result_correction_count,
       attempt.result_correction_deadline,
       attempt.lease?.id ?? null,
@@ -1451,7 +1458,10 @@ export class SqliteKernelStore implements
       attempt.result_record_id,
       attempt.decision_record_id,
       attempt.pending_result?.candidate_hash ?? null,
-      attempt.pending_result === null ? null : canonicalJson(attempt.pending_result.diagnostics),
+      attempt.pending_result === null ? null : canonicalJson({
+        diagnostics: attempt.pending_result.diagnostics,
+        evidence: attempt.pending_result.evidence,
+      }),
       this.#now(),
       attempt.id,
       runId,

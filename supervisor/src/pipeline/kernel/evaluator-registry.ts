@@ -7,6 +7,7 @@ import {
   jsonValueAt,
   validateAndNormalizeResultCandidate,
   type CompiledPipelineStage,
+  type BlobPointer,
   type DecisionRecord,
   type EvalDefinition,
   type ExecutionRecord,
@@ -28,6 +29,10 @@ export const COMMAND_RESULT_RECORD_PAYLOAD_SCHEMA =
   "openthrottle.command-result-record/v1" as const;
 export const PIPELINE_DECISION_RECORD_PAYLOAD_SCHEMA =
   "openthrottle.pipeline-decision-record/v1" as const;
+export const ATTEMPT_FORENSICS_PAYLOAD_SCHEMAS = [
+  "openthrottle.attempt-forensics/v1",
+  "openthrottle.invalid-result-evidence/v1",
+] as const;
 const BLOCKING_REVIEW_FINDING_SEVERITIES = new Set(REVIEW_FINDING_SEVERITIES.slice(0, 2));
 
 export interface SemanticResultRecordPayload {
@@ -129,7 +134,7 @@ function decisionPayload(value: unknown): PipelineDecisionRecordPayload {
   return input as unknown as PipelineDecisionRecordPayload;
 }
 
-const payloadContracts: readonly [string, ExecutionRecordPayloadContract][] = [
+const payloadContracts: ReadonlyArray<readonly [string, ExecutionRecordPayloadContract]> = [
   [SEMANTIC_RESULT_RECORD_PAYLOAD_SCHEMA, {
     kind: "result",
     parseInline: semanticPayload,
@@ -142,6 +147,12 @@ const payloadContracts: readonly [string, ExecutionRecordPayloadContract][] = [
     kind: "decision",
     parseInline: decisionPayload,
   }],
+  ...ATTEMPT_FORENSICS_PAYLOAD_SCHEMAS.map((schema) => [schema, {
+    kind: "decision" as const,
+    parseInline: () => {
+      throw new Error(`${schema} must be persisted as content-addressed blob evidence`);
+    },
+  }] as const),
 ];
 
 export function ordinaryKernelPayloadSchemas(): ExecutionRecordPayloadRegistry {
@@ -420,6 +431,32 @@ export function createPipelineDecisionRecord(input: {
     input_record_ids: inputRecordIds,
     payload_schema: PIPELINE_DECISION_RECORD_PAYLOAD_SCHEMA,
     payload: { inline: payload as unknown as JsonValue },
+    created_at: input.created_at,
+  };
+}
+
+export function createAttemptForensicsRecord(input: {
+  attempt: KernelAttempt;
+  blob: BlobPointer;
+  created_at: string;
+}): DecisionRecord {
+  if (!(ATTEMPT_FORENSICS_PAYLOAD_SCHEMAS as readonly string[]).includes(input.blob.payload_schema)) {
+    throw new Error("attempt forensics blob uses an unsupported payload schema");
+  }
+  return {
+    schema: EXECUTION_RECORD_SCHEMA,
+    id: recordId("decision", {
+      attempt_id: input.attempt.id,
+      request_hash: input.attempt.request_hash,
+      evidence_digest: input.blob.digest,
+      payload_schema: input.blob.payload_schema,
+    }),
+    kind: "decision",
+    pipeline_run_id: input.attempt.pipeline_run_id,
+    reducer: "core/attempt-forensics@1",
+    input_record_ids: [],
+    payload_schema: input.blob.payload_schema,
+    payload: { blob: input.blob },
     created_at: input.created_at,
   };
 }

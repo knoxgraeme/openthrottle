@@ -35,6 +35,7 @@ import {
 } from "../pipeline/kernel/operator-effect-rejection.js";
 import { effectIntentContentHash } from "../pipeline/kernel/effect-intent.js";
 import {
+  createAttemptForensicsRecord,
   createPipelineDecisionRecord,
   ordinaryKernelPayloadSchemas,
 } from "../pipeline/kernel/evaluator-registry.js";
@@ -1918,6 +1919,17 @@ describe("SqliteKernelStore", () => {
     const context = setup(undefined, () => NOW, true);
     try {
       context.store.admitPipelineRun(context.admission);
+      const invalidCandidate = context.blobs.put({
+        bytes: canonicalJson({
+          schema: "openthrottle.invalid-result-evidence/v1",
+          candidate_hash: sha("5"),
+          rejected_candidate: { raw: "{malformed}" },
+          diagnostics: [{ path: "/payload", detail: "invalid" }],
+        }),
+        encoding: "utf-8",
+        media_type: "application/json",
+        payload_schema: "openthrottle.invalid-result-evidence/v1",
+      }).pointer;
       const deliveryPayload = {
         effect_kind: "daytona/create-sandbox@1",
         provider: "daytona",
@@ -1952,7 +1964,10 @@ describe("SqliteKernelStore", () => {
             result_correction_count = 2, result_correction_deadline = ?,
             pending_candidate_hash = ?, pending_diagnostics_json = ?
           WHERE id = 'attempt-1'
-        `).run(subject("2"), "2026-08-20T12:15:00.000Z", sha("5"), JSON.stringify([{ path: "/payload", detail: "invalid" }]));
+        `).run(subject("2"), "2026-08-20T12:15:00.000Z", sha("5"), canonicalJson({
+          diagnostics: [{ path: "/payload", detail: "invalid" }],
+          evidence: invalidCandidate,
+        }));
         context.db.prepare("UPDATE pipeline_runs SET status = 'running' WHERE id = 'run-1'").run();
         context.db.prepare(`
           INSERT INTO records (
@@ -1994,13 +2009,18 @@ describe("SqliteKernelStore", () => {
         record_ids: [delivery.id],
         checkpoint_ids: [],
       });
+      const invalidEvidence = createAttemptForensicsRecord({
+        attempt: pending.current_attempt!,
+        blob: invalidCandidate,
+        created_at: NOW,
+      });
       const decision: DecisionRecord = {
         schema: EXECUTION_RECORD_SCHEMA,
         id: "decision-result-correction-exhausted",
         kind: "decision",
         pipeline_run_id: "run-1",
         reducer: "core/result-correction-terminal@1",
-        input_record_ids: [delivery.id],
+        input_record_ids: [delivery.id, invalidEvidence.id].sort(),
         payload_schema: "decision/v1",
         payload: { inline: { outcome: "needs_human" } },
         created_at: NOW,
@@ -2012,13 +2032,14 @@ describe("SqliteKernelStore", () => {
         request_hash: sha("8"),
         definition_bundle_hash: pending.run.definition_bundle_hash,
         input_subject: pending.run.current_subject,
-        context_record_ids: [decision.id, delivery.id].sort(),
+        context_record_ids: [decision.id, delivery.id, invalidEvidence.id].sort(),
       });
       const transition = reduceKernelCommand({
         ...pending,
         records: new Map<string, DecisionRecord | DeliveryRecord>([
           [decision.id, decision],
           [delivery.id, delivery],
+          [invalidEvidence.id, invalidEvidence],
         ]),
         command: {
           type: "needs_human",
@@ -2031,6 +2052,7 @@ describe("SqliteKernelStore", () => {
             runtime_delivery_record_ids: [delivery.id],
             cleanup_attempt: cleanupAttempt,
           },
+          evidence_record_id: invalidEvidence.id,
         },
       });
 
@@ -2059,6 +2081,20 @@ describe("SqliteKernelStore", () => {
       });
       expect(context.db.prepare("SELECT status FROM attempts WHERE id = ?").get(cleanupAttempt.id))
         .toEqual({ status: "pending" });
+      expect(context.db.prepare(`
+        SELECT kind, reducer, payload_schema, blob_digest, blob_bytes
+        FROM records WHERE id = ?
+      `).get(invalidEvidence.id)).toEqual({
+        kind: "decision",
+        reducer: "core/attempt-forensics@1",
+        payload_schema: "openthrottle.invalid-result-evidence/v1",
+        blob_digest: invalidCandidate.digest,
+        blob_bytes: invalidCandidate.bytes,
+      });
+      expect(JSON.parse(context.blobs.read(invalidCandidate).toString("utf8"))).toMatchObject({
+        rejected_candidate: { raw: "{malformed}" },
+        diagnostics: [{ path: "/payload", detail: "invalid" }],
+      });
       expect(context.db.prepare("SELECT status, cursor_stage_id FROM pipeline_runs WHERE id = 'run-1'").get())
         .toEqual({ status: "running", cursor_stage_id: runtimeStopStageId("needs_human") });
     } finally {

@@ -445,6 +445,7 @@ export function createPendingKernelAttempt(input: {
     result_record_id: null,
     decision_record_id: null,
     pending_result: null,
+    last_operational_signature: null,
   };
 }
 

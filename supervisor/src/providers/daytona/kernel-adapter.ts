@@ -43,6 +43,7 @@ import {
   parseKernelRuntimeResult,
   parseKernelSessionEvent,
   type KernelCheckpointArtifactDescriptor,
+  type KernelEvidenceArtifactDescriptor,
 } from "../../runtime/kernel-wire.js";
 import {
   inspectKernelCheckpointBundle,
@@ -66,6 +67,7 @@ const INTEGRATION_INPUT_DIR = "/var/lib/openthrottle/integration-input";
 const INTEGRATION_RESULT_DIR = "/var/lib/openthrottle/integration-results";
 const OPENTHROTTLE_ROOT = "/var/lib/openthrottle";
 const AGENT_STATE_ROOT = "/home/agent/.ot";
+const ACTION_WORK_ROOT = "/var/lib/openthrottle/actions";
 const STEERING_INBOX_DIR = `${AGENT_STATE_ROOT}/inbox`;
 const KERNEL_STEERING_DELIVERY_SCHEMA = "openthrottle.kernel-steering/v1" as const;
 const KERNEL_STEERING_DELIVERY_MAX_BYTES = 64 * 1024;
@@ -784,6 +786,12 @@ export class DaytonaKernelAdapter implements
             paths.result_directory,
             descriptor,
           ),
+          materializeEvidence: (descriptor) => this.#materializeEvidenceArtifact(
+            sandbox,
+            request,
+            paths.result_directory,
+            descriptor,
+          ),
         },
       });
     };
@@ -905,10 +913,19 @@ export class DaytonaKernelAdapter implements
           };
         }
         if (termination.outcome !== null) return termination.outcome;
+        const forensic = await this.#captureSilentExitEvidence({
+          sandbox,
+          request,
+          paths,
+          command: { ...command, exitCode: command.exitCode },
+          modelCredentials,
+        });
         return {
           state: "work_failed",
           retryable: true,
           reason: `Daytona action command exited with code ${command.exitCode} without producing a sealed result; session termination was verified`,
+          evidence: { blob: forensic.blob },
+          operational_signature: forensic.signature,
         };
       }
       await new Promise((resolve) => setTimeout(resolve, this.#options.poll_interval_ms ?? 500));
@@ -1193,6 +1210,116 @@ export class DaytonaKernelAdapter implements
       payload_schema: descriptor.payload_schema,
       expected_digest: descriptor.sha256,
     }).pointer;
+  }
+
+  async #materializeEvidenceArtifact(
+    sandbox: Sandbox,
+    request: KernelWorkActionRequest | KernelResultCorrectionRequest,
+    resultDirectory: string,
+    descriptor: KernelEvidenceArtifactDescriptor,
+  ) {
+    const bytes = await sandbox.fs.downloadFile(`${resultDirectory}/${descriptor.file}`);
+    if (
+      bytes.byteLength !== descriptor.bytes || bytes.byteLength > 256 * 1024 ||
+      createHash("sha256").update(bytes).digest("hex") !== descriptor.sha256
+    ) throw new Error(`result evidence for ${request.attempt_id} failed its sealed descriptor`);
+    return this.#options.blob_store.put({
+      bytes,
+      encoding: "utf-8",
+      media_type: descriptor.media_type,
+      payload_schema: descriptor.payload_schema,
+      expected_digest: descriptor.sha256,
+    }).pointer;
+  }
+
+  async #captureSilentExitEvidence(input: {
+    sandbox: Sandbox;
+    request: KernelWorkActionRequest | KernelResultCorrectionRequest;
+    paths: ReturnType<typeof launchPaths>;
+    command: { exitCode: number; stdout?: string; stderr?: string; result?: string };
+    modelCredentials: Record<string, string>;
+  }): Promise<{ blob: BlobPointer; signature: string }> {
+    const boundedFileState = async (path: string) => {
+      const bytes = await downloadBytes(input.sandbox, path);
+      return bytes === null ? { state: "absent" as const } : {
+        state: "present" as const,
+        bytes: bytes.byteLength,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+      };
+    };
+    const secrets = new Set<string>();
+    const collectSecrets = (value: unknown): void => {
+      if (typeof value === "string") {
+        if (value.length >= 8) secrets.add(value);
+        return;
+      }
+      if (Array.isArray(value)) {
+        for (const item of value) collectSecrets(item);
+        return;
+      }
+      if (value && typeof value === "object") {
+        for (const item of Object.values(value)) collectSecrets(item);
+      }
+    };
+    collectSecrets(input.modelCredentials);
+    collectSecrets(this.#options.github_read_token);
+    for (const credential of Object.values(input.modelCredentials)) {
+      try {
+        collectSecrets(JSON.parse(credential));
+      } catch {
+        // Opaque credentials are already collected as whole strings.
+      }
+    }
+    const orderedSecrets = [...secrets].sort((left, right) => right.length - left.length);
+    const redact = (value: unknown): string => {
+      let text = typeof value === "string" ? value : "";
+      for (const secret of orderedSecrets) text = text.replaceAll(secret, "[credential-redacted]");
+      return text.slice(-8_000);
+    };
+    const workspace = `${ACTION_WORK_ROOT}/${safeAttemptId(input.request.attempt_id).replaceAll(":", "-")}/repository`;
+    const status = await input.sandbox.process.executeCommand(
+      `${DAYTONA_EXECUTOR_GIT} status --short --untracked-files=all`,
+      workspace,
+      { GIT_TERMINAL_PROMPT: "0" },
+      30,
+    ).catch((error: unknown) => ({
+      exitCode: -1,
+      result: error instanceof Error ? error.message : String(error),
+    }));
+    const signature = digestCanonicalJson({
+      schema: "openthrottle.operational-signature/v1",
+      provider: "daytona",
+      kind: "silent_action_exit",
+      exit_code: input.command.exitCode,
+      session_termination_verified: true,
+    });
+    const payload = canonicalJson({
+      schema: "openthrottle.attempt-forensics/v1",
+      pipeline_run_id: input.request.pipeline_run_id,
+      attempt_id: input.request.attempt_id,
+      request_hash: input.request.request_hash,
+      lease_id: input.request.lease_id,
+      phase: input.request.phase,
+      operational_signature: signature,
+      command: {
+        exit_code: input.command.exitCode,
+        stdout_tail: redact(input.command.stdout ?? input.command.result),
+        stderr_tail: redact(input.command.stderr),
+      },
+      result_file: await boundedFileState(input.paths.result),
+      session_event_file: await boundedFileState(input.paths.session),
+      workspace_git_status: {
+        exit_code: status.exitCode,
+        summary_tail: redact(status.result),
+      },
+    });
+    const blob = this.#options.blob_store.put({
+      bytes: payload,
+      encoding: "utf-8",
+      media_type: "application/json",
+      payload_schema: "openthrottle.attempt-forensics/v1",
+    }).pointer;
+    return { blob, signature };
   }
 
   #binding(effectKind: string, schema: string): KernelEffectAdapterBinding {

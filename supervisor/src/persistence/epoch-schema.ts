@@ -213,6 +213,7 @@ CREATE TABLE attempts (
   status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'work_complete', 'result_pending', 'recorded', 'settled', 'needs_human', 'failed', 'canceled', 'superseded')),
   version INTEGER NOT NULL CHECK (version >= 0),
   work_retry_ordinal INTEGER NOT NULL CHECK (work_retry_ordinal >= 0),
+  last_operational_signature TEXT CHECK (last_operational_signature IS NULL OR (length(last_operational_signature) = 64 AND last_operational_signature NOT GLOB '*[^0-9a-f]*')),
   result_correction_count INTEGER NOT NULL CHECK (result_correction_count >= 0),
   result_correction_deadline TEXT,
   unmet_dependency_count INTEGER NOT NULL DEFAULT 0 CHECK (unmet_dependency_count >= 0),

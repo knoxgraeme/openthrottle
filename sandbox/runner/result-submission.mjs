@@ -442,6 +442,7 @@ export function inspectResultSubmissionChannel(channel) {
       status: "invalid",
       original_hash: rejected.original_hash,
       diagnostics: rejected.diagnostics,
+      rejected_candidate: rejected,
     };
   }
   return {

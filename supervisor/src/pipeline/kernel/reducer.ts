@@ -4,6 +4,7 @@ import {
   compareCodeUnits,
   digestCanonicalJson,
   runtimeStopStageId,
+  validateBlobPointer,
   type AttemptCheckpoint,
   type CompiledPipelineManifest,
   type CompiledPipelineStage,
@@ -14,7 +15,10 @@ import {
   type ResultRecord,
 } from "@openthrottle/contracts";
 import { authorizeEffectIntent } from "./effect-intent.js";
-import { PIPELINE_DECISION_RECORD_PAYLOAD_SCHEMA } from "./evaluator-registry.js";
+import {
+  ATTEMPT_FORENSICS_PAYLOAD_SCHEMAS,
+  PIPELINE_DECISION_RECORD_PAYLOAD_SCHEMA,
+} from "./evaluator-registry.js";
 import {
   exactKernelRuntimeAbsenceDelivery,
   exactKernelRuntimeCleanupDeliveries,
@@ -410,6 +414,19 @@ function recordForAttempt(input: ReducerInput, attempt: KernelAttempt, recordId:
   return candidate;
 }
 
+function attemptForensicsRecord(input: ReducerInput, recordId: string | null | undefined): DecisionRecord | null {
+  if (recordId === null || recordId === undefined) return null;
+  const record = input.records.get(recordId);
+  if (
+    !record || record.kind !== "decision" || record.pipeline_run_id !== input.run.id ||
+    record.reducer !== "core/attempt-forensics@1" || record.input_record_ids.length !== 0 ||
+    !(ATTEMPT_FORENSICS_PAYLOAD_SCHEMAS as readonly string[]).includes(record.payload_schema) ||
+    !("blob" in record.payload) || record.payload.blob.payload_schema !== record.payload_schema
+  ) throw new Error("attempt forensics evidence record is invalid");
+  validateBlobPointer(record.payload.blob);
+  return record;
+}
+
 function terminalAttemptWrites(
   run: KernelRun,
   current: KernelAttempt | null,
@@ -542,6 +559,23 @@ function terminalCommand(
 ): AtomicTransitionBundle {
   assertExactMap(input.checkpoints, [], "checkpoint map");
   const authorization = exactDecision(input, decisionRecordId);
+  const evidenceRecordId = input.command.type === "needs_human" || input.command.type === "fail" ||
+      input.command.type === "stop" || input.command.type === "supersede"
+    ? input.command.evidence_record_id
+    : undefined;
+  const primaryForensics = attemptForensicsRecord(input, evidenceRecordId);
+  const forensics = authorization.exact_records.flatMap((record) =>
+    record.kind === "decision" && record.reducer === "core/attempt-forensics@1"
+      ? [attemptForensicsRecord(input, record.id)!]
+      : []);
+  if (
+    (primaryForensics === null && forensics.length > 0) ||
+    (primaryForensics !== null && !forensics.some(({ id }) => id === primaryForensics.id))
+  ) {
+    throw new Error("terminal command does not identify its cited attempt forensics evidence");
+  }
+  const forensicsIds = forensics.map(({ id }) => id).sort(compareCodeUnits);
+  const forensicsIdSet = new Set(forensicsIds);
   const current = input.current_attempt;
   if (commandAttemptId !== undefined) {
     if ((current?.id ?? null) !== commandAttemptId) {
@@ -588,7 +622,8 @@ function terminalCommand(
       current === null || stage?.id !== RUNTIME_PROVISION_STAGE_ID || stage.kind !== "effect" ||
       stage.effect !== "core/daytona-provision@1" || current.checkpoint_id !== null ||
       current.output_subject !== null || Object.keys(input.run.active_effect_versions).length !== 0 ||
-      authorization.decision.input_record_ids.length !== 0
+      canonicalJsonValue(authorization.decision.input_record_ids) !==
+        canonicalJsonValue(forensicsIds)
     ) {
       throw new Error("pre-provision terminalization requires exact proof that no create schedule committed");
     }
@@ -597,7 +632,7 @@ function terminalCommand(
       expected: expectedFor(input.run, expectedAttempts),
       run: terminalRun(input.run, outcome),
       attemptWrites: terminalAttemptWrites(input.run, current, outcome),
-      appendRecords: [authorization.decision],
+      appendRecords: [authorization.decision, ...forensics],
     }));
   }
   if (Object.keys(input.run.active_effect_versions).length !== 0) {
@@ -609,14 +644,15 @@ function terminalCommand(
     ? exactSandboxFatalAbsenceDelivery(authorization.exact_records)
     : null;
   const decisionRuntimeEvidenceIds = authorization.decision.input_record_ids
-    .filter((id) => !frontierRecordIds.includes(id) && id !== recoveryTrigger?.id)
+    .filter((id) =>
+      !frontierRecordIds.includes(id) && id !== recoveryTrigger?.id && !forensicsIdSet.has(id))
     .sort(compareCodeUnits);
   if (
     evidenceIds.length !== disposition.runtime_delivery_record_ids.length ||
     canonicalJsonValue(evidenceIds) !== canonicalJsonValue(decisionRuntimeEvidenceIds)
   ) throw new Error("runtime cleanup decision must cite exactly its declared DeliveryRecords");
   const evidence = authorization.exact_records.filter(
-    (record) => record.id !== authorization.decision.id,
+    (record) => record.id !== authorization.decision.id && !forensicsIdSet.has(record.id),
   );
   const cleanupDeliveries = exactKernelRuntimeCleanupDeliveries(evidence);
   if (
@@ -665,7 +701,11 @@ function terminalCommand(
     run: nextRun,
     attemptWrites: terminalAttemptWrites(input.run, current, outcome),
     createAttempts: [disposition.cleanup_attempt],
-    appendRecords: [authorization.decision, ...recoveryFrontier.map(({ record }) => record)],
+    appendRecords: [
+      authorization.decision,
+      ...forensics,
+      ...recoveryFrontier.map(({ record }) => record),
+    ],
   }));
 }
 
@@ -1060,6 +1100,7 @@ function resultPending(input: ReducerInput): AtomicTransitionBundle {
     pending_result: {
       candidate_hash: command.candidate_hash,
       diagnostics: normalizedDiagnostics(command.diagnostics),
+      ...(command.evidence === undefined ? {} : { evidence: validateBlobPointer(command.evidence).value }),
     },
   };
   return bundle(baseContent({
@@ -1386,13 +1427,20 @@ function settle(input: ReducerInput): AtomicTransitionBundle {
 function retry(input: ReducerInput): AtomicTransitionBundle {
   const command = input.command;
   if (command.type !== "retry") throw new Error("unreachable retry command");
-  assertAttemptCommandMapsEmpty(input);
+  assertExactMap(input.checkpoints, [], "checkpoint map");
+  const evidenceRecordId = command.evidence_record_id ?? null;
+  const operationalSignature = command.operational_signature ?? null;
+  assertExactMap(input.records, evidenceRecordId === null ? [] : [evidenceRecordId], "record map");
   const attempt = currentAttempt(input, command.attempt_id);
+  const evidence = attemptForensicsRecord(input, evidenceRecordId);
   if (attempt.status !== "pending" && attempt.status !== "running") {
     throw new Error(`attempt ${attempt.id} cannot consume a work retry from ${attempt.status}`);
   }
   if (attempt.work_retry_ordinal >= input.run.work_retry_limit) {
     throw new Error(`attempt ${attempt.id} exhausted work retries`);
+  }
+  if (operationalSignature !== null && !/^[a-f0-9]{64}$/.test(operationalSignature)) {
+    throw new Error("work retry operational signature is invalid");
   }
   const retriedAttempt: KernelAttempt = {
     ...attempt,
@@ -1401,12 +1449,14 @@ function retry(input: ReducerInput): AtomicTransitionBundle {
     work_retry_ordinal: attempt.work_retry_ordinal + 1,
     native_session_id: null,
     lease: null,
+    last_operational_signature: operationalSignature,
   };
   return bundle(baseContent({
     command,
     expected: expectedFor(input.run, { [attempt.id]: attempt.version }),
     run: replaceAttempt(input.run, retriedAttempt),
     attemptWrites: [{ kind: "replace", attempt: retriedAttempt }],
+    appendRecords: evidence === null ? [] : [evidence],
   }));
 }
 

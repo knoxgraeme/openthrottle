@@ -827,6 +827,26 @@ describe("kernel attempt executor", () => {
       now: () => new Date("2026-08-20T00:00:00.000Z"),
     });
     expect(pending.outcome.state).toBe("result_pending");
+    expect(pending.outcome.evidence_artifact).toMatchObject({
+      file: "invalid-result-evidence.json",
+      media_type: "application/json",
+      payload_schema: "openthrottle.invalid-result-evidence/v1",
+    });
+    const invalidEvidence = JSON.parse(readFileSync(
+      join(root, "transport", pending.outcome.evidence_artifact.file),
+      "utf8",
+    ));
+    expect(invalidEvidence).toMatchObject({
+      schema: "openthrottle.invalid-result-evidence/v1",
+      candidate_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      rejected_candidate: {
+        schema: "openthrottle.rejected-result-candidate/v1",
+        original_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        raw_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      },
+    });
+    expect(invalidEvidence.rejected_candidate.raw).toContain('"summary":["valid",7]');
+    expect(invalidEvidence.diagnostics).toEqual(pending.outcome.diagnostics);
     expect(workLaunches).toBe(1);
     const checkpoint = pending.outcome.checkpoint;
     const correction = {

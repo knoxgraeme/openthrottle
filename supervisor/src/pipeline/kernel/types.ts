@@ -2,6 +2,7 @@ import {
   compareCodeUnits,
   type AttemptCheckpoint,
   type AttemptState,
+  type BlobPointer,
   type CompiledPipelineManifest,
   type DecisionRecord,
   type EffectIntent,
@@ -104,6 +105,7 @@ export interface AttemptLease {
 export interface ResultPendingState {
   candidate_hash: string | null;
   diagnostics: readonly ResultDiagnostic[];
+  evidence?: BlobPointer;
 }
 
 export interface ResultDiagnostic {
@@ -134,6 +136,7 @@ export interface KernelAttempt {
   result_record_id: string | null;
   decision_record_id: string | null;
   pending_result: ResultPendingState | null;
+  last_operational_signature?: string | null;
 }
 
 const CONTEXT_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
@@ -204,6 +207,7 @@ export interface ResultPendingCommand extends KernelCommandBase {
   attempt_id: string;
   candidate_hash: string | null;
   diagnostics: readonly ResultDiagnostic[];
+  evidence?: BlobPointer;
   correction_deadline: string;
 }
 
@@ -255,6 +259,8 @@ export interface SettleAttemptCommand extends KernelCommandBase {
 export interface RetryAttemptCommand extends KernelCommandBase {
   type: "retry";
   attempt_id: string;
+  evidence_record_id?: string | null;
+  operational_signature?: string | null;
 }
 
 /**
@@ -278,6 +284,7 @@ interface TerminalCommandBase extends KernelCommandBase {
   decision_record_id: string;
   reason: string;
   resource_disposition: KernelTerminalResourceDisposition;
+  evidence_record_id?: string;
 }
 
 export type KernelTerminalResourceDisposition =

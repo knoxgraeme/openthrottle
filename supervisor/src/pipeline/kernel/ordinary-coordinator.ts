@@ -8,6 +8,7 @@ import {
   runtimeStopStageId,
   validateEvalDefinition,
   type AttemptCheckpoint,
+  type BlobPointer,
   type CompiledPipelineStage,
   type DecisionRecord,
   type DefinitionBundle,
@@ -29,6 +30,7 @@ import {
 } from "./action-request.js";
 import {
   KernelEvaluatorRegistry,
+  createAttemptForensicsRecord,
   createCommandResultRecord,
   createPipelineDecisionRecord,
   createSemanticResultRecord,
@@ -448,11 +450,13 @@ export class OrdinaryKernelCoordinator {
       attempt.result_correction_deadline === null ||
       attempt.result_correction_deadline <= this.#now()
     )) {
+      const evidence = this.#attemptForensicsRecord(attempt, attempt.pending_result?.evidence);
       return this.#terminal(
         view,
         "needs_human",
         "result_correction_unavailable_or_exhausted",
         claim,
+        evidence,
       );
     }
     const bundle = await this.#bundles.resolveExactDefinitionBundle({
@@ -574,21 +578,34 @@ export class OrdinaryKernelCoordinator {
       if (input.outcome.sandbox_fatal || isSandboxFatalEnospc(input.outcome.reason)) {
         return this.#recoverSandboxFatal(input.view, input.outcome.reason, input.claim);
       }
+      const evidence = this.#attemptForensicsRecord(attempt, input.outcome.evidence?.blob);
+      const repeatedOperationalFailure = input.outcome.operational_signature !== undefined &&
+        attempt.last_operational_signature === input.outcome.operational_signature;
       if (
         input.outcome.retryable &&
-        attempt.work_retry_ordinal < input.view.run.work_retry_limit
+        attempt.work_retry_ordinal < input.view.run.work_retry_limit &&
+        !repeatedOperationalFailure
       ) {
-        await this.#apply(input.view, {
+        await this.#apply({
+          ...input.view,
+          records: evidence === null ? new Map() : mapWith(new Map(), evidence),
+          checkpoints: new Map(),
+        }, {
           type: "retry",
           command_id: transitionId("retry", {
             attempt: attempt.id,
             ordinal: attempt.work_retry_ordinal + 1,
           }),
           attempt_id: attempt.id,
+          evidence_record_id: evidence?.id ?? null,
+          operational_signature: input.outcome.operational_signature ?? null,
         }, input.claim);
         return this.#step("retried", await this.#load(input.view.run.id, attempt.id));
       }
-      return this.#terminal(input.view, "failed", input.outcome.reason, input.claim);
+      const reason = repeatedOperationalFailure
+        ? `consecutive_identical_operational_failure: ${input.outcome.reason}`.slice(0, 1_500)
+        : input.outcome.reason;
+      return this.#terminal(input.view, "failed", reason, input.claim, evidence);
     }
 
     let completedResult: {
@@ -649,6 +666,7 @@ export class OrdinaryKernelCoordinator {
           attempt_id: attempt.id,
           candidate_hash: input.outcome.candidate_hash,
           diagnostics: input.outcome.diagnostics,
+          ...(input.outcome.evidence === undefined ? {} : { evidence: input.outcome.evidence.blob }),
           correction_deadline: input.outcome.correction_deadline,
         },
       );
@@ -790,14 +808,6 @@ export class OrdinaryKernelCoordinator {
       if (!sameCheckpoint(input.checkpoint, input.outcome.checkpoint)) {
         throw new Error("result correction changed the locked work checkpoint");
       }
-      if (attempt.result_correction_count >= input.view.run.result_correction_limit) {
-        return this.#terminal(
-          input.view,
-          "needs_human",
-          "result_correction_budget_exhausted",
-          input.claim,
-        );
-      }
       await this.#apply(
         await this.#load(input.view.run.id, attempt.id, [], [input.checkpoint.id]),
         {
@@ -810,18 +820,41 @@ export class OrdinaryKernelCoordinator {
           attempt_id: attempt.id,
           candidate_hash: input.outcome.candidate_hash,
           diagnostics: input.outcome.diagnostics,
+          ...(input.outcome.evidence === undefined ? {} : { evidence: input.outcome.evidence.blob }),
           correction_deadline: input.outcome.correction_deadline,
         },
         input.claim,
       );
-      return this.#step("result_pending", await this.#load(input.view.run.id, attempt.id));
+      const pending = await this.#load(input.view.run.id, attempt.id);
+      if (attempt.result_correction_count >= input.view.run.result_correction_limit) {
+        const pendingAttempt = pending.current_attempt!;
+        const evidence = this.#attemptForensicsRecord(
+          pendingAttempt,
+          pendingAttempt.pending_result?.evidence,
+        );
+        return this.#terminal(
+          pending,
+          "needs_human",
+          "result_correction_budget_exhausted",
+          undefined,
+          evidence,
+        );
+      }
+      return this.#step("result_pending", pending);
     }
+    const evidence = [...new Map([
+      input.outcome.evidence?.blob,
+      attempt.pending_result?.evidence,
+    ].flatMap((blob) => {
+      const record = this.#attemptForensicsRecord(attempt, blob);
+      return record === null ? [] : [record];
+    }).map((record) => [record.id, record])).values()];
     const reason = input.outcome.state === "needs_human"
       ? input.outcome.reason
       : input.outcome.state === "work_failed"
         ? input.outcome.reason
         : "result_correction_did_not_produce_a_semantic_candidate";
-    return this.#terminal(input.view, "needs_human", reason, input.claim);
+    return this.#terminal(input.view, "needs_human", reason, input.claim, evidence);
   }
 
   async #completeWork(
@@ -1171,18 +1204,38 @@ export class OrdinaryKernelCoordinator {
     });
   }
 
+  #attemptForensicsRecord(
+    attempt: KernelAttempt,
+    blob: BlobPointer | undefined,
+  ): DecisionRecord | null {
+    return blob === undefined
+      ? null
+      : createAttemptForensicsRecord({ attempt, blob, created_at: this.#now() });
+  }
+
   async #terminal(
     view: ReductionView,
     outcome: "needs_human" | "failed",
     reason: string,
     claim?: AttemptLeaseClaim,
+    evidence: DecisionRecord | readonly DecisionRecord[] | null = null,
   ): Promise<OrdinaryKernelStep> {
     const attempt = view.current_attempt;
     if (!attempt) throw new Error("attempt terminal transition requires its exact aggregate");
-    const prepared = await this.#prepareTerminalTransition({ view, outcome, reason });
+    const evidenceRecords = evidence === null
+      ? []
+      : "id" in evidence
+        ? [evidence]
+        : [...evidence];
+    const prepared = await this.#prepareTerminalTransition({
+      view,
+      outcome,
+      reason,
+      evidence: evidenceRecords,
+    });
     await this.#apply({
       ...prepared.exact,
-      records: mapWith(prepared.exact.records, prepared.decision),
+      records: mapWith(prepared.exact.records, ...evidenceRecords, prepared.decision),
       checkpoints: new Map(),
     }, {
       type: outcome === "needs_human" ? "needs_human" : "fail",
@@ -1191,6 +1244,7 @@ export class OrdinaryKernelCoordinator {
       decision_record_id: prepared.decision.id,
       reason,
       resource_disposition: prepared.resource_disposition,
+      ...(evidenceRecords[0] === undefined ? {} : { evidence_record_id: evidenceRecords[0].id }),
     }, claim);
     return this.#step("terminal", await this.#load(view.run.id, null), attempt.id, attempt.scope.stage_id);
   }
@@ -1199,6 +1253,7 @@ export class OrdinaryKernelCoordinator {
     view: ReductionView;
     outcome: PipelineTerminalOutcome;
     reason: string;
+    evidence?: readonly DecisionRecord[];
   }): Promise<{
     exact: ReductionView;
     decision: DecisionRecord;
@@ -1216,10 +1271,11 @@ export class OrdinaryKernelCoordinator {
     const resourceDeliveries = exactKernelRuntimeCleanupDeliveries(
       [...workInputs.context.records.values()],
     );
+    const evidence = input.evidence ?? [];
     const decision = createPipelineDecisionRecord({
       attempt,
       result: null,
-      additional_input_records: resourceDeliveries ?? [],
+      additional_input_records: [...(resourceDeliveries ?? []), ...evidence],
       evaluated: {
         evaluator: "core/operational-outcome@1",
         outcome: input.outcome,
@@ -1251,6 +1307,7 @@ export class OrdinaryKernelCoordinator {
         outcome: input.outcome,
         task_prompt: workInputs.task_prompt,
         runtime_delivery_records: resourceDeliveries,
+        additional_evidence_records: evidence,
       });
       exact = await this.#load(
         view.run.id,

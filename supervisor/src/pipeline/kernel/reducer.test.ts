@@ -311,6 +311,27 @@ function decisionRecord(
   };
 }
 
+function attemptForensicsRecord(id = "forensics-1"): DecisionRecord {
+  return {
+    schema: EXECUTION_RECORD_SCHEMA,
+    id,
+    kind: "decision",
+    pipeline_run_id: "run-1",
+    reducer: "core/attempt-forensics@1",
+    input_record_ids: [],
+    payload_schema: "openthrottle.attempt-forensics/v1",
+    payload: { blob: {
+      algorithm: "sha256",
+      digest: sha("e"),
+      bytes: 123,
+      encoding: "utf-8",
+      media_type: "application/json",
+      payload_schema: "openthrottle.attempt-forensics/v1",
+    } },
+    created_at: "2026-08-20T00:00:02.000Z",
+  };
+}
+
 function externalScheduleDecision(input: {
   attempt_id: string;
   phase: string;
@@ -1062,6 +1083,46 @@ describe("shared execution kernel lifecycle", () => {
         type: "retry", command_id: "exhausted", attempt_id: "attempt-1",
       },
     })).toThrow(/exhausted work retries/);
+  });
+
+  it("records retry evidence and operational signatures independently", () => {
+    const current = attempt({
+      status: "running",
+      lease: {
+        id: "lease",
+        generation: 0,
+        worker_id: "worker-1",
+        purpose: "work",
+        expires_at: "later",
+        started: true,
+      },
+    });
+    const evidence = attemptForensicsRecord();
+    const evidenceOnly = reduce({
+      current,
+      command: {
+        type: "retry",
+        command_id: "retry-with-evidence",
+        attempt_id: current.id,
+        evidence_record_id: evidence.id,
+      },
+      records: [evidence],
+    });
+    expect(evidenceOnly.append_records).toEqual([evidence]);
+    expect(replacedAttempt(evidenceOnly, current.id).last_operational_signature).toBeNull();
+
+    const signature = sha("f");
+    const signatureOnly = reduce({
+      current,
+      command: {
+        type: "retry",
+        command_id: "retry-with-signature",
+        attempt_id: current.id,
+        operational_signature: signature,
+      },
+    });
+    expect(signatureOnly.append_records).toEqual([]);
+    expect(replacedAttempt(signatureOnly, current.id).last_operational_signature).toBe(signature);
   });
 
   it("allows repeated result correction without consuming a work retry", () => {

@@ -20,6 +20,7 @@ import {
   validateDefinitionBundle,
   type CompiledPipelineManifest,
   type AttemptCheckpoint,
+  type BlobPointer,
   type DefinitionBundleEntry,
   type EvalDefinition,
   type ReviewFindingV1,
@@ -556,10 +557,16 @@ async function execute(coordinator: OrdinaryKernelCoordinator, ordinal: number) 
 }
 
 describe("ordinary kernel activation", () => {
-  async function sandboxFailureTransition(error: Error | null, structuredSibling = false) {
+  async function sandboxFailureTransition(
+    error: Error | null,
+    structuredSibling = false,
+    operationalFailure?: { signature: string; repeated: boolean },
+    correction?: { outcome: KernelRuntimeOutcome; pending_evidence?: BlobPointer },
+  ) {
     const fixed = fixture();
+    const stageId = correction === undefined ? "test" : "implement";
     const expanded = expandCompiledRuntimeLifecycle({
-      entry_stage: "test",
+      entry_stage: stageId,
       stages: fixed.manifest.stages,
     });
     const manifest: CompiledPipelineManifest = {
@@ -596,36 +603,65 @@ describe("ordinary kernel activation", () => {
       context: { records: deliveries, checkpoints: [] },
     };
     let currentAttempt = createPendingKernelAttempt({
-      id: "attempt-command",
+      id: correction === undefined ? "attempt-command" : "attempt-correction",
       pipeline_run_id: "run-sandbox-failure",
       scope: structuredSibling
         ? {
           kind: "loop_item",
-          stage_id: "test",
+          stage_id: stageId,
           parent_attempt_id: "attempt-wave",
           loop_id: "units",
           item_id: "unit-a",
           item_index: 0,
         }
-        : { kind: "stage", stage_id: "test" },
+        : { kind: "stage", stage_id: stageId },
       input_subject: SOURCE,
       bundle: fixed.compilation.bundle.value,
       manifest,
       action_inputs: inputs,
     });
-    currentAttempt = {
-      ...currentAttempt,
-      status: "running",
-      version: 2,
-      lease: {
-        id: "lease-command",
-        generation: 2,
-        worker_id: "worker-command",
-        purpose: "work",
-        expires_at: "2026-08-20T12:10:00.000Z",
-        started: true,
-      },
-    };
+    currentAttempt = correction === undefined
+      ? {
+        ...currentAttempt,
+        status: "running",
+        version: 2,
+        lease: {
+          id: "lease-command",
+          generation: 2,
+          worker_id: "worker-command",
+          purpose: "work",
+          expires_at: "2026-08-20T12:10:00.000Z",
+          started: true,
+        },
+        last_operational_signature: operationalFailure?.repeated
+          ? operationalFailure.signature
+          : null,
+      }
+      : {
+        ...currentAttempt,
+        status: "result_pending",
+        version: 2,
+        output_subject: IMPLEMENTED,
+        native_session_id: "session-correction",
+        checkpoint_id: "checkpoint-correction",
+        result_correction_count: 1,
+        result_correction_deadline: "2026-08-20T13:00:00.000Z",
+        lease: {
+          id: "lease-correction",
+          generation: 2,
+          worker_id: "worker-command",
+          purpose: "result_correction",
+          expires_at: "2026-08-20T12:10:00.000Z",
+          started: true,
+        },
+        pending_result: {
+          candidate_hash: "d".repeat(64),
+          diagnostics: [{ path: "/outcome", detail: "unknown outcome" }],
+          ...(correction.pending_evidence === undefined
+            ? {}
+            : { evidence: correction.pending_evidence }),
+        },
+      };
     const siblingAttempt = structuredSibling
       ? createPendingKernelAttempt({
         id: "attempt-command-sibling",
@@ -657,7 +693,7 @@ describe("ordinary kernel activation", () => {
       status: "running",
       terminal_outcome: null,
       cursor: compileKernelCursor({
-        stage_id: "test",
+        stage_id: stageId,
         version: 2,
         attempts: frontierAttempts,
         dependencies,
@@ -667,10 +703,31 @@ describe("ordinary kernel activation", () => {
       result_correction_limit: 2,
       active_attempt_versions: Object.fromEntries(frontierAttempts.map(({ id, version }) => [id, version])),
       active_effect_versions: {},
-      checkpoint_ids: {},
+      checkpoint_ids: correction === undefined
+        ? {}
+        : { [currentAttempt.id]: currentAttempt.checkpoint_id! },
     };
+    const correctionCheckpoint: AttemptCheckpoint | null = correction === undefined
+      ? null
+      : {
+        schema: ATTEMPT_CHECKPOINT_SCHEMA,
+        id: currentAttempt.checkpoint_id!,
+        pipeline_run_id: currentAttempt.pipeline_run_id,
+        attempt_id: currentAttempt.id,
+        request_hash: currentAttempt.request_hash,
+        definition_bundle_hash: currentAttempt.definition_bundle_hash,
+        input_subject: currentAttempt.input_subject,
+        output_subject: currentAttempt.output_subject,
+        native_session_id: currentAttempt.native_session_id,
+        payload_schema: "openthrottle.executor-checkpoint/v1",
+        payload: { inline: { evidence: ["locked correction checkpoint"] } },
+        captured_at: NOW,
+      };
     const attempts = new Map(frontierAttempts.map((candidate) => [candidate.id, candidate]));
     const records = new Map(deliveries.map((record) => [record.id, record]));
+    const checkpoints = new Map(correctionCheckpoint === null
+      ? []
+      : [[correctionCheckpoint.id, correctionCheckpoint]]);
     let applied: AtomicTransitionBundle | null = null;
     const store = {
       async loadExactReductionView(request: {
@@ -683,7 +740,7 @@ describe("ordinary kernel activation", () => {
           run,
           current_attempt: request.attempt_id === null ? null : attempts.get(request.attempt_id)!,
           records: new Map(request.record_ids.map((id) => [id, records.get(id)!])),
-          checkpoints: new Map(),
+          checkpoints: new Map(request.checkpoint_ids.map((id) => [id, checkpoints.get(id)!])),
         };
       },
       async loadAttemptRequestInputs() {
@@ -726,14 +783,33 @@ describe("ordinary kernel activation", () => {
     };
     const runtime: KernelRuntimePort = {
       async executeWork() {
+        if (correction !== undefined) throw new Error("correction fixture executed work");
         return error === null
-          ? { state: "work_failed", retryable: true, reason: "provider timeout" }
+          ? {
+            state: "work_failed",
+            retryable: true,
+            reason: operationalFailure === undefined ? "provider timeout" : "silent action exit",
+            ...(operationalFailure === undefined ? {} : {
+              operational_signature: operationalFailure.signature,
+              evidence: { blob: {
+                algorithm: "sha256" as const,
+                digest: "e".repeat(64),
+                bytes: 123,
+                encoding: "utf-8" as const,
+                media_type: "application/json",
+                payload_schema: "openthrottle.attempt-forensics/v1",
+              } },
+            }),
+          }
           : {
             state: "work_failed", retryable: true, sandbox_fatal: true,
             reason: error.message,
           };
       },
-      async correctResult() { throw new Error("not used"); },
+      async correctResult() {
+        if (correction === undefined) throw new Error("not used");
+        return correction.outcome;
+      },
     };
     const coordinator = new OrdinaryKernelCoordinator({
       store: store as never,
@@ -804,6 +880,39 @@ describe("ordinary kernel activation", () => {
         attempt: expect.objectContaining({ work_retry_ordinal: 1, status: "pending" }),
       }),
     ]);
+  });
+
+  it("records silent-exit forensics and aborts a consecutive identical operational retry", async () => {
+    const signature = "f".repeat(64);
+    const first = await sandboxFailureTransition(null, false, { signature, repeated: false });
+    expect(first.transition.transition_id).toMatch(/^retry-/);
+    expect(first.transition.append_records).toEqual([
+      expect.objectContaining({
+        kind: "decision",
+        reducer: "core/attempt-forensics@1",
+        payload_schema: "openthrottle.attempt-forensics/v1",
+        payload: { blob: expect.objectContaining({ digest: "e".repeat(64) }) },
+      }),
+    ]);
+    expect(first.transition.attempt_writes).toEqual([
+      expect.objectContaining({
+        kind: "replace",
+        attempt: expect.objectContaining({ last_operational_signature: signature }),
+      }),
+    ]);
+
+    const repeated = await sandboxFailureTransition(null, false, { signature, repeated: true });
+    expect(repeated.transition.transition_id).toMatch(/^failed-/);
+    expect(repeated.transition.run.cursor.stage_id).toBe(runtimeStopStageId("failed"));
+    expect(repeated.transition.append_records).toEqual(expect.arrayContaining([
+      expect.objectContaining({ reducer: "core/attempt-forensics@1" }),
+      expect.objectContaining({
+        reducer: "core/operational-outcome@1",
+        payload: { inline: expect.objectContaining({
+          reason: expect.stringContaining("consecutive_identical_operational_failure"),
+        }) },
+      }),
+    ]));
   });
 
   it("routes recovery-exhaustion fence ENOSPC through runtime stop instead of quarantine", async () => {
@@ -1390,6 +1499,99 @@ describe("ordinary kernel activation", () => {
     } finally {
       test.db.close();
     }
+  });
+
+  it("retains correction failure evidence after terminal settlement", async () => {
+    const correctionEvidence: BlobPointer = {
+      algorithm: "sha256",
+      digest: "4".repeat(64),
+      bytes: 234,
+      encoding: "utf-8",
+      media_type: "application/json",
+      payload_schema: "openthrottle.attempt-forensics/v1",
+    };
+    const { transition, records } = await sandboxFailureTransition(null, false, undefined, {
+      outcome: {
+        state: "work_failed",
+        retryable: false,
+        reason: "result correction exited without a sealed result",
+        evidence: { blob: correctionEvidence },
+      },
+    });
+    expect(transition.run.cursor.stage_id).toBe(runtimeStopStageId("needs_human"));
+    expect([...records.values()]).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        reducer: "core/attempt-forensics@1",
+        payload: { blob: correctionEvidence },
+      }),
+    ]));
+  });
+
+  it("retains pending invalid-candidate evidence when correction terminates without new evidence", async () => {
+    const pendingEvidence: BlobPointer = {
+      algorithm: "sha256",
+      digest: "5".repeat(64),
+      bytes: 345,
+      encoding: "utf-8",
+      media_type: "application/json",
+      payload_schema: "openthrottle.invalid-result-evidence/v1",
+    };
+    const { transition, records } = await sandboxFailureTransition(null, false, undefined, {
+      pending_evidence: pendingEvidence,
+      outcome: {
+        state: "needs_human",
+        reason: "result correction unavailable",
+        checkpoint: null,
+        candidate_hash: null,
+        diagnostics: [],
+      },
+    });
+    expect(transition.run.cursor.stage_id).toBe(runtimeStopStageId("needs_human"));
+    expect([...records.values()]).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        reducer: "core/attempt-forensics@1",
+        payload: { blob: pendingEvidence },
+      }),
+    ]));
+  });
+
+  it("retains both invalid-candidate and failure evidence when correction terminates", async () => {
+    const pendingEvidence: BlobPointer = {
+      algorithm: "sha256",
+      digest: "6".repeat(64),
+      bytes: 345,
+      encoding: "utf-8",
+      media_type: "application/json",
+      payload_schema: "openthrottle.invalid-result-evidence/v1",
+    };
+    const correctionEvidence: BlobPointer = {
+      algorithm: "sha256",
+      digest: "7".repeat(64),
+      bytes: 234,
+      encoding: "utf-8",
+      media_type: "application/json",
+      payload_schema: "openthrottle.attempt-forensics/v1",
+    };
+    const { transition, records } = await sandboxFailureTransition(null, false, undefined, {
+      pending_evidence: pendingEvidence,
+      outcome: {
+        state: "work_failed",
+        retryable: false,
+        reason: "result correction exited without a sealed result",
+        evidence: { blob: correctionEvidence },
+      },
+    });
+    expect(transition.run.cursor.stage_id).toBe(runtimeStopStageId("needs_human"));
+    expect([...records.values()]).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        reducer: "core/attempt-forensics@1",
+        payload: { blob: pendingEvidence },
+      }),
+      expect.objectContaining({
+        reducer: "core/attempt-forensics@1",
+        payload: { blob: correctionEvidence },
+      }),
+    ]));
   });
 
   it("rejects a stale work timeout after recovery and reconciles the same sealed request", async () => {

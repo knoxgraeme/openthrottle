@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -53,6 +54,7 @@ import { reclaimSettledAttemptScratch } from "./scratch-reclamation.mjs";
 
 export const KERNEL_RUNTIME_RESULT_SCHEMA = "openthrottle.kernel-runtime-result/v1";
 export const KERNEL_SESSION_EVENT_SCHEMA = "openthrottle.kernel-session-event/v1";
+export const INVALID_RESULT_EVIDENCE_SCHEMA = "openthrottle.invalid-result-evidence/v1";
 
 const SHA256 = /^[a-f0-9]{64}$/;
 const SUBJECT = /^[a-f0-9]{40,64}$/;
@@ -273,7 +275,27 @@ function correctionDeadline(now) {
   return new Date(now.getTime() + RESULT_CORRECTION_WINDOW_MS).toISOString();
 }
 
-function semanticOutcome({ candidate, checkpoint, deadline }) {
+function stageInvalidResultEvidence(candidate, resultPath) {
+  const evidence = {
+    schema: INVALID_RESULT_EVIDENCE_SCHEMA,
+    candidate_hash: candidate.original_hash ?? null,
+    rejected_candidate: candidate.rejected_candidate ?? null,
+    diagnostics: candidate.diagnostics,
+  };
+  const file = "invalid-result-evidence.json";
+  const path = join(dirname(resultPath), file);
+  writeImmutableJson(path, evidence, "invalid result evidence");
+  const bytes = readFileSync(path);
+  return {
+    file,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+    bytes: bytes.byteLength,
+    media_type: "application/json",
+    payload_schema: INVALID_RESULT_EVIDENCE_SCHEMA,
+  };
+}
+
+function semanticOutcome({ candidate, checkpoint, deadline, resultPath }) {
   if (candidate.status === "valid") {
     return {
       state: "work_complete",
@@ -286,6 +308,7 @@ function semanticOutcome({ candidate, checkpoint, deadline }) {
     checkpoint,
     candidate_hash: candidate.original_hash ?? null,
     diagnostics: candidate.diagnostics,
+    evidence_artifact: stageInvalidResultEvidence(candidate, resultPath),
     correction_deadline: deadline,
   };
 }
@@ -681,6 +704,7 @@ async function executeAgentWork(options, actionDirectory) {
     candidate,
     checkpoint,
     deadline: correctionDeadline(options.now()),
+    resultPath,
   }));
 }
 
@@ -808,6 +832,7 @@ async function executeCorrection(options, actionDirectory) {
     candidate,
     checkpoint,
     deadline: request.correction_deadline,
+    resultPath,
   }));
 }
 

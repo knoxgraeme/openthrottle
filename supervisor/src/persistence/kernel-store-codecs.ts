@@ -1,6 +1,7 @@
 import {
   compareCodeUnits,
   validateAttemptCheckpoint,
+  validateBlobPointer,
   validateExecutionRecord,
   type AttemptCheckpoint,
   type BlobPointer,
@@ -76,6 +77,7 @@ export interface AttemptRow {
   status: KernelAttempt["status"];
   version: number;
   work_retry_ordinal: number;
+  last_operational_signature: string | null;
   result_correction_count: number;
   result_correction_deadline: string | null;
   unmet_dependency_count: number;
@@ -262,6 +264,7 @@ export function attemptFromRow(row: AttemptRow): KernelAttempt {
     status: row.status,
     version: row.version,
     work_retry_ordinal: row.work_retry_ordinal,
+    last_operational_signature: row.last_operational_signature,
     result_correction_count: row.result_correction_count,
     result_correction_deadline: row.result_correction_deadline,
     lease,
@@ -269,10 +272,24 @@ export function attemptFromRow(row: AttemptRow): KernelAttempt {
     result_record_id: row.result_record_id,
     decision_record_id: row.decision_record_id,
     pending_result: row.status === "result_pending"
-      ? {
-        candidate_hash: row.pending_candidate_hash,
-        diagnostics: parseJson(row.pending_diagnostics_json!, "result diagnostics"),
-      }
+      ? (() => {
+        const parsed = parseJson(row.pending_diagnostics_json!, "pending result evidence") as unknown;
+        const pending = Array.isArray(parsed) ? { diagnostics: parsed, evidence: undefined } : parsed as {
+          diagnostics: KernelAttempt["pending_result"] extends infer _ ? unknown : never;
+          evidence: unknown;
+        };
+        if (!pending || typeof pending !== "object" || Array.isArray(pending) ||
+            !Array.isArray(pending.diagnostics)) {
+          throw new Error("pending result evidence is invalid");
+        }
+        return {
+          candidate_hash: row.pending_candidate_hash,
+          diagnostics: pending.diagnostics as NonNullable<KernelAttempt["pending_result"]>["diagnostics"],
+          ...(pending.evidence === undefined ? {} : {
+            evidence: validateBlobPointer(pending.evidence).value,
+          }),
+        };
+      })()
       : null,
   };
 }

@@ -292,11 +292,13 @@ export class SqliteKernelProjectionStore implements
         pending_diagnostic_count: row.pending_diagnostics_json === null
           ? 0
           : (() => {
-            const diagnostics: unknown = JSON.parse(row.pending_diagnostics_json);
-            if (!Array.isArray(diagnostics)) {
+            const parsed: unknown = JSON.parse(row.pending_diagnostics_json);
+            const pending = Array.isArray(parsed) ? { diagnostics: parsed } : parsed;
+            if (!pending || typeof pending !== "object" || Array.isArray(pending) ||
+                !Array.isArray((pending as { diagnostics?: unknown }).diagnostics)) {
               throw new Error(`attempt ${row.id} pending diagnostics are not an array`);
             }
-            return diagnostics.length;
+            return (pending as { diagnostics: unknown[] }).diagnostics.length;
           })(),
         lease_purpose: row.lease_purpose,
         lease_expires_at: row.lease_expires_at,

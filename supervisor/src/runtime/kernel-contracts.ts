@@ -1,5 +1,6 @@
 import type {
   AttemptCheckpoint,
+  BlobPointer,
   CompiledPipelineStage,
   DefinitionBundleEntry,
   ExecutionRecord,
@@ -136,6 +137,10 @@ export interface StagedSemanticCandidate {
   transformations: readonly ResultNormalizationDiagnostic[];
 }
 
+export interface KernelAttemptEvidence {
+  blob: BlobPointer;
+}
+
 export interface KernelCommandResult {
   kind: "command";
   outcome: "success" | "no_change" | "retryable_infrastructure_failure" | "failure";
@@ -159,6 +164,7 @@ export type KernelRuntimeOutcome =
     checkpoint: AttemptCheckpoint;
     candidate_hash: string | null;
     diagnostics: readonly { path: string; detail: string }[];
+    evidence?: KernelAttemptEvidence;
     correction_deadline: string;
   }
   | {
@@ -167,6 +173,10 @@ export type KernelRuntimeOutcome =
     /** The owning sandbox is poisoned and must not execute this Attempt again. */
     sandbox_fatal?: boolean;
     reason: string;
+    /** Bounded, content-addressed executor evidence for this operational failure. */
+    evidence?: KernelAttemptEvidence;
+    /** Present only for operational failures whose consecutive recurrence is deterministic. */
+    operational_signature?: string;
   }
   | {
     state: "needs_human";
@@ -174,6 +184,7 @@ export type KernelRuntimeOutcome =
     checkpoint: AttemptCheckpoint | null;
     candidate_hash: string | null;
     diagnostics: readonly { path: string; detail: string }[];
+    evidence?: KernelAttemptEvidence;
   };
 
 export interface KernelRuntimeLeaseCallbacks {

@@ -235,11 +235,36 @@ function emulateRepositoryBinding(sandbox: ReturnType<typeof sandboxWith>) {
 
 function adapterFor(
   sandbox: ReturnType<typeof sandboxWith>,
-  blobStore: object = {},
+  blobStore: object = {
+    put: vi.fn((input: { bytes: string | Buffer; encoding: "utf-8" | "binary"; media_type: string; payload_schema: string }) => {
+      const bytes = Buffer.from(input.bytes);
+      return { pointer: {
+        algorithm: "sha256",
+        digest: createHash("sha256").update(bytes).digest("hex"),
+        bytes: bytes.byteLength,
+        encoding: input.encoding,
+        media_type: input.media_type,
+        payload_schema: input.payload_schema,
+      } };
+    }),
+  },
   attemptInputs: object = {},
   optionOverrides: object = {},
   daytonaOverrides: object = {},
 ) {
+  const defaultBlobStore = {
+    put: vi.fn((input: { bytes: string | Buffer; encoding: "utf-8" | "binary"; media_type: string; payload_schema: string }) => {
+      const bytes = Buffer.from(input.bytes);
+      return { pointer: {
+        algorithm: "sha256",
+        digest: createHash("sha256").update(bytes).digest("hex"),
+        bytes: bytes.byteLength,
+        encoding: input.encoding,
+        media_type: input.media_type,
+        payload_schema: input.payload_schema,
+      } };
+    }),
+  };
   return new DaytonaKernelAdapter({
     get: vi.fn().mockResolvedValue(sandbox),
     list: vi.fn(() => (async function* () { yield sandbox; })()),
@@ -249,7 +274,7 @@ function adapterFor(
     github_read_token: "github-token",
     task_timeout_seconds: 1,
     runtime_capability_digest: "d".repeat(64),
-    blob_store: blobStore,
+    blob_store: { ...defaultBlobStore, ...blobStore },
     environments: {
       loadExactRunEnvironment: vi.fn().mockReturnValue({
         repository: "owner/repository",
@@ -591,6 +616,13 @@ function checkpointRuntimeResult(
       checkpoint,
       candidate_hash: null,
       diagnostics: [{ path: "/payload", detail: "result needs correction" }],
+      evidence_artifact: {
+        file: "invalid-result-evidence.json",
+        sha256: createHash("sha256").update("{}\n").digest("hex"),
+        bytes: 3,
+        media_type: "application/json",
+        payload_schema: "openthrottle.invalid-result-evidence/v1",
+      },
       correction_deadline: "2099-08-20T12:15:00.000Z",
     },
   }));
@@ -745,21 +777,22 @@ describe("DaytonaKernelAdapter", () => {
       const resultPath = "/var/lib/openthrottle/action-results/attempt-1/work-lease-1/result.json";
       const sessionPath = "/var/lib/openthrottle/action-results/attempt-1/work-lease-1/session.json";
       const artifactPath = `/var/lib/openthrottle/action-results/attempt-1/work-lease-1/${artifact.descriptor.file}`;
+      const evidencePath = "/var/lib/openthrottle/action-results/attempt-1/work-lease-1/invalid-result-evidence.json";
       const sandbox = sandboxWith(async (path) => {
         if (path === resultPath) return checkpointRuntimeResult(request, checkpoint, kind);
         if (path === sessionPath && kind === "inspect") return sessionEvent(request);
         if (path === artifactPath) return artifact.bytes;
+        if (path === evidencePath) return Buffer.from("{}\n");
         throw new Error("404 not found");
       });
-      const pointer = {
+      const put = vi.fn((input: { bytes: Buffer; encoding: "utf-8" | "binary"; media_type: string; payload_schema: string }) => ({ pointer: {
         algorithm: "sha256",
-        digest: artifact.descriptor.sha256,
-        bytes: artifact.descriptor.bytes,
-        encoding: "binary",
-        media_type: "application/x-git-bundle",
-        payload_schema: "openthrottle.git-checkpoint-bundle/v1",
-      } as const;
-      const put = vi.fn().mockReturnValue({ pointer });
+        digest: createHash("sha256").update(input.bytes).digest("hex"),
+        bytes: input.bytes.byteLength,
+        encoding: input.encoding,
+        media_type: input.media_type,
+        payload_schema: input.payload_schema,
+      } }));
 
       await expect(adapterFor(sandbox, { put }).executeWork(request, {
         lease_generation: 0,
@@ -770,7 +803,7 @@ describe("DaytonaKernelAdapter", () => {
         state: kind === "command" ? "work_complete" : "result_pending",
         checkpoint: { input_subject: request.input_subject, output_subject: null },
       });
-      expect(put).toHaveBeenCalledOnce();
+      expect(put).toHaveBeenCalledTimes(kind === "command" ? 1 : 2);
     },
   );
 
@@ -1772,10 +1805,51 @@ describe("DaytonaKernelAdapter", () => {
   it("settles promptly when the asynchronous entrypoint exits without a sealed result", async () => {
     vi.useFakeTimers();
     try {
-      const request = workRequest();
+      const request = workRequest({
+        action: {
+          kind: "agent",
+          engine: "codex",
+          model: null,
+          reasoning_effort: null,
+          agent_id: "agent-1",
+          skill_ids: [],
+          entry_skill: null,
+          eval_id: "eval-1",
+          semantic_result_schema: { id: "result-schema", schema: {} },
+          execution_limits: { max_turns: null, task_timeout_seconds: 60 },
+          definition_entries: [],
+        },
+      });
       const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
-      sandbox.process.getSessionCommand.mockResolvedValue({ cmdId: "command-1", exitCode: 1 });
-      const execution = adapterFor(sandbox, {}, {}, { task_timeout_seconds: 60 }).executeWork(request, {
+      sandbox.process.getSessionCommand.mockResolvedValue({
+        cmdId: "command-1",
+        exitCode: 1,
+        result: "runner tail nested-secret github-token",
+      });
+      const forensicBlobs: Buffer[] = [];
+      const put = vi.fn((input: {
+        bytes: string | Buffer;
+        encoding: "utf-8" | "binary";
+        media_type: string;
+        payload_schema: string;
+      }) => {
+        const bytes = Buffer.from(input.bytes);
+        if (input.payload_schema === "openthrottle.attempt-forensics/v1") forensicBlobs.push(bytes);
+        return { pointer: {
+          algorithm: "sha256",
+          digest: createHash("sha256").update(bytes).digest("hex"),
+          bytes: bytes.byteLength,
+          encoding: input.encoding,
+          media_type: input.media_type,
+          payload_schema: input.payload_schema,
+        } };
+      });
+      const execution = adapterFor(sandbox, { put }, {}, {
+        task_timeout_seconds: 60,
+        materialize_model_credentials: vi.fn().mockResolvedValue({
+          CODEX_AUTH_JSON: JSON.stringify({ access_token: "nested-secret" }),
+        }),
+      }).executeWork(request, {
         lease_generation: 0,
         heartbeat_interval_ms: 10_000,
         on_heartbeat: vi.fn().mockResolvedValue(undefined),
@@ -1788,10 +1862,15 @@ describe("DaytonaKernelAdapter", () => {
       const settledPromptly = settled;
       await vi.advanceTimersByTimeAsync(60_100);
 
-      await expect(execution).resolves.toEqual({
+      await expect(execution).resolves.toMatchObject({
         state: "work_failed",
         retryable: true,
         reason: "Daytona action command exited with code 1 without producing a sealed result; session termination was verified",
+        operational_signature: expect.stringMatching(/^[a-f0-9]{64}$/),
+        evidence: { blob: {
+          payload_schema: "openthrottle.attempt-forensics/v1",
+          media_type: "application/json",
+        } },
       });
       expect(settledPromptly).toBe(true);
       const sessionId = createdSessionId(sandbox);
@@ -1801,6 +1880,23 @@ describe("DaytonaKernelAdapter", () => {
       );
       expect(sandbox.process.deleteSession).toHaveBeenCalledWith(sessionId);
       expect(sandbox.process.getSession).toHaveBeenCalledWith(sessionId);
+      expect(forensicBlobs).toHaveLength(1);
+      const forensic = JSON.parse(forensicBlobs[0]!.toString("utf8"));
+      expect(forensic).toMatchObject({
+        schema: "openthrottle.attempt-forensics/v1",
+        command: {
+          exit_code: 1,
+          stdout_tail: "runner tail [credential-redacted] [credential-redacted]",
+        },
+        result_file: { state: "absent" },
+        session_event_file: { state: "absent" },
+        workspace_git_status: {
+          exit_code: expect.any(Number),
+          summary_tail: expect.any(String),
+        },
+      });
+      expect(forensicBlobs[0]!.includes(Buffer.from("nested-secret"))).toBe(false);
+      expect(forensicBlobs[0]!.includes(Buffer.from("github-token"))).toBe(false);
     } finally {
       vi.useRealTimers();
     }

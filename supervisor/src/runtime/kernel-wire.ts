@@ -48,8 +48,17 @@ export interface KernelCheckpointArtifactDescriptor {
   tree: string;
 }
 
+export interface KernelEvidenceArtifactDescriptor {
+  file: string;
+  sha256: string;
+  bytes: number;
+  media_type: "application/json";
+  payload_schema: "openthrottle.invalid-result-evidence/v1";
+}
+
 export interface KernelCheckpointArtifactPort {
   materialize(input: KernelCheckpointArtifactDescriptor): Promise<BlobPointer>;
+  materializeEvidence?(input: KernelEvidenceArtifactDescriptor): Promise<BlobPointer>;
 }
 
 const DIGEST = /^[a-f0-9]{64}$/;
@@ -212,6 +221,22 @@ function artifactDescriptor(value: unknown, payloadSchema: string): KernelCheckp
   };
 }
 
+function evidenceArtifactDescriptor(value: unknown): KernelEvidenceArtifactDescriptor {
+  const input = object(value, "invalid result evidence artifact");
+  exactKeys(input, ["file", "sha256", "bytes", "media_type", "payload_schema"],
+    "invalid result evidence artifact");
+  if (
+    typeof input.file !== "string" || !ARTIFACT_FILE.test(input.file) ||
+    input.file.includes("..") || input.file.includes("/") ||
+    typeof input.sha256 !== "string" || !DIGEST.test(input.sha256) ||
+    typeof input.bytes !== "number" || !Number.isSafeInteger(input.bytes) ||
+    input.bytes < 1 || input.bytes > 256 * 1024 ||
+    input.media_type !== "application/json" ||
+    input.payload_schema !== "openthrottle.invalid-result-evidence/v1"
+  ) throw new Error("invalid result evidence artifact descriptor is invalid");
+  return input as unknown as KernelEvidenceArtifactDescriptor;
+}
+
 async function checkpoint(
   value: unknown,
   request: KernelRequest,
@@ -337,7 +362,8 @@ export async function parseKernelRuntimeResult(input: {
   }
   if (outcome.state === "result_pending") {
     exactKeys(outcome, [
-      "state", "checkpoint", "candidate_hash", "diagnostics", "correction_deadline",
+      "state", "checkpoint", "candidate_hash", "diagnostics", "evidence_artifact",
+      "correction_deadline",
     ], "kernel runtime outcome");
     if (outcome.candidate_hash !== null && (
       typeof outcome.candidate_hash !== "string" || !DIGEST.test(outcome.candidate_hash)
@@ -347,6 +373,16 @@ export async function parseKernelRuntimeResult(input: {
       checkpoint: await checkpoint(outcome.checkpoint, input.request, input.artifacts),
       candidate_hash: outcome.candidate_hash as string | null,
       diagnostics: diagnostics(outcome.diagnostics),
+      evidence: {
+        blob: await (() => {
+          if (!input.artifacts.materializeEvidence) {
+            throw new Error("runtime artifact port cannot materialize invalid result evidence");
+          }
+          return input.artifacts.materializeEvidence(
+          evidenceArtifactDescriptor(outcome.evidence_artifact),
+          );
+        })(),
+      },
       correction_deadline: timestamp(outcome.correction_deadline, "correction deadline"),
     };
   }
