@@ -61,6 +61,7 @@ const ACTION_FENCE_DIR = "/var/lib/openthrottle/action-fences";
 const INTEGRATION_INPUT_DIR = "/var/lib/openthrottle/integration-input";
 const INTEGRATION_RESULT_DIR = "/var/lib/openthrottle/integration-results";
 const OPENTHROTTLE_ROOT = "/var/lib/openthrottle";
+const SANDBOX_DISK_HELPER = "/opt/openthrottle/runner/sandbox-disk.mjs";
 const AGENT_STATE_ROOT = "/home/agent/.ot";
 const STEERING_INBOX_DIR = `${AGENT_STATE_ROOT}/inbox`;
 const KERNEL_STEERING_DELIVERY_SCHEMA = "openthrottle.kernel-steering/v1" as const;
@@ -694,6 +695,7 @@ export class DaytonaKernelAdapter implements
     const requestPath = paths.input;
     const resultPath = paths.result;
     const sessionPath = paths.session;
+    const sessionId = actionSessionId(request);
     let sessionBound = false;
     let nextHeartbeatAt = 0;
     const heartbeat = async (): Promise<void> => {
@@ -732,6 +734,15 @@ export class DaytonaKernelAdapter implements
         },
       });
     };
+    if (!await this.#sessionExists(sandbox, sessionId)) {
+      await this.#reclaimScratch(sandbox, {
+        kind: "action",
+        attempt: request.attempt_id,
+        lease: request.lease_id,
+        phase: request.schema === KERNEL_ACTION_REQUEST_SCHEMA ? "work" : "correction",
+        generation: callbacks.lease_generation,
+      });
+    }
     await this.#refreshLeaseGenerationFence(sandbox, request, paths, callbacks.lease_generation);
     await heartbeat();
     const replay = await collect();
@@ -794,7 +805,6 @@ export class DaytonaKernelAdapter implements
     // Daytona sessions snapshot sandbox environment at creation. A recovered
     // lease must adopt its original command, while a new work/correction lease
     // must inherit its newly sealed request and result paths.
-    const sessionId = actionSessionId(request);
     await sandbox.process.createSession(sessionId).catch(() => undefined);
     const launch = await sandbox.process.executeSessionCommand(sessionId, {
       command: `flock --nonblock --conflict-exit-code ${DISPATCH_LOCK_CONTENTION_EXIT_CODE} ` +
@@ -988,6 +998,46 @@ export class DaytonaKernelAdapter implements
     ]) {
       await sandbox.fs.createFolder(path, "700").catch(() => undefined);
       await sandbox.fs.setFilePermissions(path, { owner: "root", group: "root", mode: "700" });
+    }
+  }
+
+  async #reclaimScratch(
+    sandbox: Sandbox,
+    current:
+      | { kind: "action"; attempt: string; lease: string; phase: "work" | "correction"; generation: number }
+      | { kind: "integration"; effect: string; lease: string },
+  ): Promise<void> {
+    const args = current.kind === "action"
+      ? [
+          "action",
+          "--attempt", safeAttemptId(current.attempt),
+          "--lease", safeTransportId(current.lease, "kernel lease ID"),
+          "--phase", current.phase,
+          "--generation", String(current.generation),
+        ]
+      : [
+          "integration",
+          "--effect", safeTransportId(current.effect, "kernel effect ID"),
+          "--lease", safeTransportId(current.lease, "kernel dispatch lease ID"),
+        ];
+    const reclaimed = await sandbox.process.executeCommand(
+      ["node", SANDBOX_DISK_HELPER, ...args].map(shellQuote).join(" "),
+      OPENTHROTTLE_ROOT,
+      {},
+      30,
+    );
+    if (reclaimed.exitCode !== undefined && reclaimed.exitCode !== 0) {
+      throw new Error("Daytona sandbox scratch reclamation rejected the current launch");
+    }
+  }
+
+  async #sessionExists(sandbox: Sandbox, sessionId: string): Promise<boolean> {
+    try {
+      await sandbox.process.getSession(sessionId);
+      return true;
+    } catch (error) {
+      if (notFound(error)) return false;
+      throw error;
     }
   }
 
@@ -1260,6 +1310,14 @@ export class DaytonaKernelAdapter implements
     if (!sandbox) throw new Error("integration runtime sandbox is absent");
     await ensureActive(sandbox);
     const paths = integrationPaths(intent.id, dispatchFence.lease_id);
+    const sessionId = `kernel-effect-${safeTransportId(intent.id, "kernel effect ID")}`;
+    if (!await this.#sessionExists(sandbox, sessionId)) {
+      await this.#reclaimScratch(sandbox, {
+        kind: "integration",
+        effect: intent.id,
+        lease: dispatchFence.lease_id,
+      });
+    }
     for (const path of [
       OPENTHROTTLE_ROOT,
       INTEGRATION_INPUT_DIR,
@@ -1311,7 +1369,6 @@ export class DaytonaKernelAdapter implements
       OT_INTEGRATION_REQUEST_FILE: paths.input,
       OT_INTEGRATION_RESULT_FILE: paths.result,
     }, { unset: [...INTEGRATION_CREDENTIAL_SCRUB, ...ACTION_ENV_FAMILY] });
-    const sessionId = `kernel-effect-${safeTransportId(intent.id, "kernel effect ID")}`;
     await sandbox.process.createSession(sessionId).catch(() => undefined);
     await sandbox.process.executeSessionCommand(sessionId, {
       command: `flock --nonblock ${shellQuote(paths.lock)} sh -c ` +

@@ -861,6 +861,14 @@ describe("kernel attempt executor", () => {
       { commandLine: "npm test", phase: "command", postBootstrapIndex: null },
     ]);
     expect(calls.every(({ timeoutMs }) => timeoutMs === 120_000)).toBe(true);
+    expect(calls.every(({ env }) => (
+      env.HOME === join(root, "actions", "attempt-1", "command-home") &&
+      env.XDG_CACHE_HOME === join(root, "actions", "attempt-1", "command-home", ".cache") &&
+      env.npm_config_cache === join(root, "actions", "attempt-1", "command-home", ".npm") &&
+      env.TMPDIR === join(root, "actions", "attempt-1", "command-tmp")
+    ))).toBe(true);
+    expect(existsSync(calls[0].env.HOME)).toBe(true);
+    expect(existsSync(calls[0].env.TMPDIR)).toBe(true);
     expect(result.outcome).toMatchObject({
       state: "work_complete",
       result: { kind: "command", outcome: "success", command_id: "test" },
@@ -882,6 +890,10 @@ describe("kernel attempt executor", () => {
           'test "$GIT_CONFIG_GLOBAL" = /dev/null',
           'test "$GIT_OPTIONAL_LOCKS" = 0',
           'test "$GIT_TERMINAL_PROMPT" = 0',
+          `test "$HOME" = '${join(root, "actions", "attempt-1", "command-home")}'`,
+          `test "$XDG_CACHE_HOME" = '${join(root, "actions", "attempt-1", "command-home", ".cache")}'`,
+          `test "$npm_config_cache" = '${join(root, "actions", "attempt-1", "command-home", ".npm")}'`,
+          `test "$TMPDIR" = '${join(root, "actions", "attempt-1", "command-tmp")}'`,
           'test "$(git config --get-all safe.directory)" = "$GIT_CONFIG_VALUE_0"',
           'git rev-parse --verify HEAD >/dev/null',
         ].join(" && "),

@@ -889,12 +889,47 @@ describe("DaytonaKernelAdapter", () => {
       on_heartbeat: vi.fn().mockResolvedValue(undefined),
       on_session: vi.fn(),
     })).resolves.toMatchObject({ state: "work_failed" });
+    const cleanupCall = sandbox.process.executeCommand.mock.calls.findIndex(
+      ([command]) => String(command).includes("sandbox-disk.mjs"),
+    );
+    const fenceCall = sandbox.process.executeCommand.mock.calls.findIndex(
+      ([command]) => String(command).includes("touch --") && String(command).includes("lease-generation.lock"),
+    );
+    expect(sandbox.process.executeCommand.mock.calls[cleanupCall]).toEqual([
+      "'node' '/opt/openthrottle/runner/sandbox-disk.mjs' 'action' '--attempt' 'attempt-1' " +
+        "'--lease' 'lease-1' '--phase' 'work' '--generation' '0'",
+      "/var/lib/openthrottle",
+      {},
+      30,
+    ]);
+    expect(cleanupCall).toBeGreaterThanOrEqual(0);
+    expect(fenceCall).toBeGreaterThan(cleanupCall);
     expect(sandbox.updateEnv).toHaveBeenCalledWith(expect.objectContaining({
       OT_LEASE_GENERATION_FENCE_FILE:
         "/var/lib/openthrottle/action-fences/attempt-1/lease-generation.json",
       OT_LEASE_GENERATION_LOCK_FILE:
         "/var/lib/openthrottle/action-fences/attempt-1/lease-generation.lock",
     }), expect.any(Object));
+  });
+
+  it("does not reclaim scratch while adopting an active action session", async () => {
+    const request = workRequest();
+    const resultPath = "/var/lib/openthrottle/action-results/attempt-1/work-lease-1/result.json";
+    const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
+    sandbox.files.set(resultPath, runtimeResult(request));
+    sandbox.process.getSession.mockResolvedValue({ sessionId: "active-action" });
+
+    await expect(adapterFor(sandbox).executeWork(request, {
+      lease_generation: 0,
+      heartbeat_interval_ms: 10,
+      on_heartbeat: vi.fn().mockResolvedValue(undefined),
+      on_session: vi.fn(),
+    })).resolves.toMatchObject({ state: "work_failed" });
+
+    expect(sandbox.process.executeCommand.mock.calls.some(
+      ([command]) => String(command).includes("sandbox-disk.mjs"),
+    )).toBe(false);
+    expect(sandbox.process.executeSessionCommand).not.toHaveBeenCalled();
   });
 
   it("clears the opposite request family before Daytona sessions snapshot daemon env", async () => {
@@ -1338,6 +1373,16 @@ describe("DaytonaKernelAdapter", () => {
         target: intent.target,
       },
     });
+    const integrationCleanup = sandbox.process.executeCommand.mock.calls.find(
+      ([command]) => String(command).includes("sandbox-disk.mjs"),
+    );
+    expect(integrationCleanup).toEqual([
+      "'node' '/opt/openthrottle/runner/sandbox-disk.mjs' 'integration' '--effect' " +
+        "'effect-integration' '--lease' 'lease-integration'",
+      "/var/lib/openthrottle",
+      {},
+      30,
+    ]);
     const requestPath = `/var/lib/openthrottle/integration-input/${effectId}/lease-integration/request.json`;
     const sandboxRequest = JSON.parse(sandbox.files.get(requestPath)!.toString("utf8"));
     expect(sandboxRequest).not.toHaveProperty("current_ancestry");

@@ -380,10 +380,11 @@ function agentPreparedRuntimeException(error, env) {
   return agentExecutorException(error, env, retryable ? "launch" : "runtime", retryable);
 }
 
-function defaultCommandRunner({ commandLine, repositoryPath, timeoutMs }) {
+function defaultCommandRunner({ commandLine, repositoryPath, timeoutMs, env }) {
   const safeEnv = {
     ...Object.fromEntries(["PATH", "LANG", "LC_ALL", "TZ"].flatMap((name) =>
       process.env[name] ? [[name, process.env[name]]] : [])),
+    ...env,
     ...repositoryGitEnvironment(repositoryPath),
   };
   if (typeof process.getuid === "function" && process.getuid() === 0 && existsSync("/usr/local/bin/gosu")) {
@@ -404,6 +405,16 @@ async function executeCommandWork(options, actionDirectory) {
   rmSync(actionDirectory, { recursive: true, force: true });
   mkdirSync(actionDirectory, { recursive: true, mode: 0o711 });
   chmodSync(actionDirectory, 0o711);
+  const commandHome = join(actionDirectory, "command-home");
+  const commandTemporary = join(actionDirectory, "command-tmp");
+  prepareAgentOwnedDirectory(commandHome);
+  prepareAgentOwnedDirectory(commandTemporary);
+  const commandEnvironment = {
+    HOME: commandHome,
+    XDG_CACHE_HOME: join(commandHome, ".cache"),
+    npm_config_cache: join(commandHome, ".npm"),
+    TMPDIR: commandTemporary,
+  };
   const repository = materializeActionRepository({
     sourceRepoDir,
     inputSubject: request.input_subject,
@@ -430,6 +441,7 @@ async function executeCommandWork(options, actionDirectory) {
       phase,
       postBootstrapIndex: index,
       timeoutMs: remaining,
+      env: commandEnvironment,
     });
   };
   for (const [index, commandLine] of request.action.post_bootstrap.entries()) {
