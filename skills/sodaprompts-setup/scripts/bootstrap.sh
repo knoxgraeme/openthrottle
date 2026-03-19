@@ -67,6 +67,11 @@ log "Checking Node.js and pnpm..."
 if ! command -v node &>/dev/null; then
   fail "Node.js not found. Sprites should have it pre-installed — check: which node"
 fi
+# Ensure npm global bin is in PATH (sprite node installs may not add it)
+NPM_GLOBAL_BIN="$(npm prefix -g)/bin"
+if [[ ":$PATH:" != *":$NPM_GLOBAL_BIN:"* ]]; then
+  export PATH="$NPM_GLOBAL_BIN:$PATH"
+fi
 if ! command -v pnpm &>/dev/null; then
   log "Installing pnpm..."
   npm install -g pnpm
@@ -87,18 +92,20 @@ install_github_cli
 # 3. Soda Prompts plugin
 # ---------------------------------------------------------------------------
 log "Installing sodaprompts plugin..."
-claude plugin install knoxgraeme/sodaprompts || {
-  warn "Plugin install via CLI failed — falling back to manual install"
+if command -v claude &>/dev/null && claude plugin install knoxgraeme/sodaprompts 2>/dev/null; then
+  log "Plugin installed via CLI"
+else
+  log "Installing sodaprompts plugin from git..."
   git clone https://github.com/knoxgraeme/sodaprompts.git /tmp/sodaprompts-plugin 2>/dev/null || true
   if [[ -d /tmp/sodaprompts-plugin/skills ]]; then
     mkdir -p "${HOME}/.claude/skills"
     cp -r /tmp/sodaprompts-plugin/skills/* "${HOME}/.claude/skills/"
-    log "Plugin installed manually from git"
+    log "Plugin installed from git"
   else
     warn "Could not install sodaprompts plugin"
   fi
-}
-log "sodaprompts plugin installed"
+fi
+log "sodaprompts plugin ready"
 
 # ---------------------------------------------------------------------------
 # 4. Compound Engineering plugin
@@ -121,7 +128,9 @@ fi
 log "Installing agent-browser..."
 npm install -g agent-browser
 agent-browser install --with-deps
-npx skills add vercel-labs/agent-browser
+CI=1 npx -y skills add vercel-labs/agent-browser || {
+  warn "Interactive skill install failed — install agent-browser skill manually if needed"
+}
 log "agent-browser installed"
 
 log "Installing Playwright..."
@@ -281,6 +290,14 @@ fi
 
 mkdir -p "${SPRITE_HOME}"/{prd-inbox,logs}
 clone_or_update_repo "$PULL_BRANCH"
+
+# Copy .env files from staging (pushed in Step 6b before clone)
+if [[ -d /tmp/env-staging ]]; then
+  log "Copying .env files from staging..."
+  cp -r /tmp/env-staging/. "${SPRITE_HOME}/repo/"
+  rm -rf /tmp/env-staging
+  log ".env files copied to repo"
+fi
 
 # ---------------------------------------------------------------------------
 # 7b. Disable project-level hooks — sprite uses its own from ~/.claude/

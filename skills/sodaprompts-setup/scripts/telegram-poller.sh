@@ -265,6 +265,12 @@ INITIAL=$(curl -s "${API}/getUpdates?limit=1&offset=-1" 2>/dev/null || echo '{}'
 LAST_UPDATE_ID=$(echo "$INITIAL" | jq -r '.result[-1].update_id // 0' 2>/dev/null || echo 0)
 
 while true; do
+  # Exit when the runner process is gone — lets the sprite suspend
+  if ! pgrep -f "run-builder.sh\|run-reviewer.sh" > /dev/null 2>&1; then
+    echo "[telegram-poller] No runner process found — exiting so sprite can suspend"
+    exit 0
+  fi
+
   RESPONSE=$(curl -s "${API}/getUpdates?offset=$((LAST_UPDATE_ID + 1))&timeout=10" 2>/dev/null || echo '{}')
 
   UPDATES=$(echo "$RESPONSE" | jq -r '.result // [] | length' 2>/dev/null || echo 0)
