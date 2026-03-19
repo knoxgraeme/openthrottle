@@ -25,7 +25,8 @@ TASK_TIMEOUT="${TASK_TIMEOUT:-1800}"  # 30 min per task
 AGENT_RUNTIME="${AGENT_RUNTIME:-claude}"  # "claude" or "codex"
 AGENT_MODEL="${AGENT_MODEL:-}"  # optional model override
 
-mkdir -p "$LOG_DIR"
+SESSIONS_DIR="${SPRITE_HOME}/sessions"
+mkdir -p "$LOG_DIR" "$SESSIONS_DIR"
 
 # Source secrets
 if [[ -f "${REPO}/.env" ]]; then
@@ -74,15 +75,51 @@ cleanup_repo() {
 
 # ---------------------------------------------------------------------------
 # Invoke the agent — runtime-specific command, both load skills
+#
+# Usage: invoke_agent PROMPT TIMEOUT SESSION_LOG [TASK_KEY]
+#   TASK_KEY — unique key for session resume (e.g. "review-42").
+#              If a session file exists for this key, the agent resumes it.
+#              If omitted, starts a fresh session with no resume support.
 # ---------------------------------------------------------------------------
 invoke_agent() {
   local PROMPT="$1"
   local AGENT_TIMEOUT="$2"
   local SESSION_LOG="$3"
+  local TASK_KEY="${4:-}"
+
+  # Resolve session flags for Claude (--session-id or --resume)
+  local -a SESSION_FLAGS=()
+  if [[ -n "$TASK_KEY" ]]; then
+    local SESSION_FILE="${SESSIONS_DIR}/${TASK_KEY}.id"
+    if [[ -f "$SESSION_FILE" ]]; then
+      local EXISTING_ID
+      EXISTING_ID=$(<"$SESSION_FILE")
+      if [[ -n "$EXISTING_ID" ]]; then
+        touch "$SESSION_FILE"  # refresh mtime to prevent pruning
+        SESSION_FLAGS=(--resume "$EXISTING_ID")
+        log "Resuming session for ${TASK_KEY}"
+      else
+        log "WARNING: empty session file for ${TASK_KEY}, starting fresh"
+        rm -f "$SESSION_FILE"
+        local SESSION_ID
+        SESSION_ID=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)
+        echo "$SESSION_ID" > "$SESSION_FILE"
+        SESSION_FLAGS=(--session-id "$SESSION_ID")
+        log "New session for ${TASK_KEY}: ${SESSION_ID}"
+      fi
+    else
+      local SESSION_ID
+      SESSION_ID=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)
+      echo "$SESSION_ID" > "$SESSION_FILE"
+      SESSION_FLAGS=(--session-id "$SESSION_ID")
+      log "New session for ${TASK_KEY}: ${SESSION_ID}"
+    fi
+  fi
 
   case "$AGENT_RUNTIME" in
     claude)
       timeout "${AGENT_TIMEOUT}" claude \
+        "${SESSION_FLAGS[@]}" \
         --dangerously-skip-permissions \
         -p "$PROMPT" \
         2>&1 | tee -a "$SESSION_LOG"
@@ -124,7 +161,7 @@ gather_review_context() {
 
   # Extract linked issue number from PR body (Fixes #N, Closes #N)
   local LINKED_ISSUE=""
-  LINKED_ISSUE=$(echo "$PR_BODY" | grep -oE '(Fixes|Closes|Resolves) #[0-9]+' \
+  LINKED_ISSUE=$(echo "$PR_BODY" | grep -oiE '(fix(es)?|close[sd]?|resolve[sd]?) #[0-9]+' \
     | grep -oE '[0-9]+' | head -1 || echo "")
 
   # Fetch the original task (PRD or bug report)
@@ -219,7 +256,7 @@ BUILDER_REVIEW:
 ${BUILDER_REVIEW:-No builder review comments found.}
 ${RE_REVIEW_NOTE}"
 
-  invoke_agent "$PROMPT" "$TASK_TIMEOUT" "$SESSION_LOG" || {
+  invoke_agent "$PROMPT" "$TASK_TIMEOUT" "$SESSION_LOG" "review-${PR_NUMBER}" || {
     local EXIT_CODE=$?
     if [[ $EXIT_CODE -eq 124 ]]; then
       log "Review timed out for PR #${PR_NUMBER}"
@@ -267,7 +304,7 @@ investigate_bug() {
 
   local PROMPT="Investigate issue #${ISSUE_NUMBER} in ${GITHUB_REPO}. Use the sodaprompts-investigator skill."
 
-  invoke_agent "$PROMPT" "$TASK_TIMEOUT" "$SESSION_LOG" || {
+  invoke_agent "$PROMPT" "$TASK_TIMEOUT" "$SESSION_LOG" "investigate-${ISSUE_NUMBER}" || {
     local EXIT_CODE=$?
     if [[ $EXIT_CODE -eq 124 ]]; then
       log "Investigation timed out for issue #${ISSUE_NUMBER}"
@@ -293,6 +330,9 @@ notify "Thinker sprite online. Runtime: ${AGENT_RUNTIME}. Polling for reviews & 
 
 # Clean repo state on startup
 cleanup_repo
+
+# Prune session files older than 7 days
+find "$SESSIONS_DIR" -name '*.id' -mtime +7 -delete 2>/dev/null || true
 
 LAST_WORK_EPOCH=$(date +%s)
 
