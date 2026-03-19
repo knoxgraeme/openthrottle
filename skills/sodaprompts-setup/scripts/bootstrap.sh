@@ -342,6 +342,29 @@ add_autostart "telegram-poller.sh" "${SPRITE_HOME}/telegram-poller.sh" "${SPRITE
 log "Telegram poller running (PID: ${POLLER_PID})"
 
 # ---------------------------------------------------------------------------
+# 9b. Install and start run-builder.sh
+# ---------------------------------------------------------------------------
+log "Installing builder skill..."
+cd "${SPRITE_HOME}/repo"
+bash /tmp/pipeline/install-skill.sh sodaprompts-builder
+cd "${SPRITE_HOME}"
+
+log "Installing run-builder.sh..."
+cp /tmp/pipeline-builder/run-builder.sh "${SPRITE_HOME}/run-builder.sh"
+chmod +x "${SPRITE_HOME}/run-builder.sh"
+log "run-builder.sh installed"
+
+# Auto-start on boot
+add_autostart "run-builder.sh" "${SPRITE_HOME}/run-builder.sh" "${SPRITE_HOME}/logs/builder.log"
+
+# Start the builder loop now
+log "Starting builder loop..."
+nohup bash "${SPRITE_HOME}/run-builder.sh" >> "${SPRITE_HOME}/logs/builder.log" 2>&1 &
+BUILDER_PID=$!
+echo "$BUILDER_PID" > "${SPRITE_HOME}/builder.pid"
+log "Builder running (PID: ${BUILDER_PID})"
+
+# ---------------------------------------------------------------------------
 # 10. Run project-specific post-bootstrap commands
 # ---------------------------------------------------------------------------
 if [[ -f /tmp/pipeline/sodaprompts.yml ]]; then
