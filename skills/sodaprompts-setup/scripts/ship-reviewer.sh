@@ -78,23 +78,28 @@ print('yes' if config.get('reviewer') else 'no')
 }
 
 step_locate_plugin() {
-  PLUGIN_DIR=$(locate_plugin_dir) || {
-    fail_step "find ~/.claude -path '*/sodaprompts-setup'" \
+  # Resolve from known relative path — scripts live in sodaprompts-setup/scripts/
+  PLUGIN_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+  REVIEWER_DIR="$(cd "${SCRIPT_DIR}/../../sodaprompts-reviewer" 2>/dev/null && pwd)" || true
+  INVESTIGATOR_DIR="$(cd "${SCRIPT_DIR}/../../sodaprompts-investigator" 2>/dev/null && pwd)" || true
+
+  if [[ ! -d "${PLUGIN_DIR}/scripts" ]]; then
+    fail_step "test -d ${SCRIPT_DIR}/../scripts" \
       "sodaprompts plugin not found. Install: claude plugin install knoxgraeme/sodaprompts"
     return 1
-  }
+  fi
 
-  REVIEWER_DIR=$(locate_skill_dir "sodaprompts-reviewer") || {
-    fail_step "find ~/.claude -path '*/sodaprompts-reviewer'" \
+  if [[ -z "$REVIEWER_DIR" || ! -d "$REVIEWER_DIR" ]]; then
+    fail_step "test -d sodaprompts-reviewer" \
       "sodaprompts-reviewer skill not found. Reinstall: claude plugin install knoxgraeme/sodaprompts"
     return 1
-  }
+  fi
 
-  INVESTIGATOR_DIR=$(locate_skill_dir "sodaprompts-investigator") || {
-    fail_step "find ~/.claude -path '*/sodaprompts-investigator'" \
+  if [[ -z "$INVESTIGATOR_DIR" || ! -d "$INVESTIGATOR_DIR" ]]; then
+    fail_step "test -d sodaprompts-investigator" \
       "sodaprompts-investigator skill not found. Reinstall: claude plugin install knoxgraeme/sodaprompts"
     return 1
-  }
+  fi
 
   # Verify critical files
   local missing=()
@@ -247,16 +252,11 @@ step_checkpoint() {
 step_verify() {
   local failures=0
 
-  local agent_cmd="claude"
-  [[ "$AGENT_RUNTIME" == "codex" ]] && agent_cmd="codex"
-
-  # 1. Agent works
-  local agent_check
-  agent_check=$(sprite exec -s "$REVIEWER_SPRITE" -- $agent_cmd -p "reply with only OK" --output-format text 2>&1 || true)
-  if echo "$agent_check" | grep -qi "OK"; then
-    log "  ${agent_cmd} auth: PASS"
+  # 1. Agent config exists (auth was verified in step 4 before bootstrap)
+  if sprite exec -s "$REVIEWER_SPRITE" -- test -d /home/sprite/.claude &>/dev/null; then
+    log "  Agent config: PASS"
   else
-    err "  ${agent_cmd} auth: FAIL"
+    err "  Agent config: FAIL"
     failures=$((failures + 1))
   fi
 

@@ -37,7 +37,7 @@ fix instructions if anything fails. **Stop if it fails.**
 Locate the script relative to this skill's directory:
 
 ```bash
-PREFLIGHT="$(find ~/.claude -path '*/sodaprompts-setup/scripts/preflight.sh' -type f | head -1)"
+PREFLIGHT="$(find ~/.claude/plugins -path '*/sodaprompts-setup/scripts/preflight.sh' -type f | head -1)"
 if [[ -z "$PREFLIGHT" ]]; then
   echo "ERROR: preflight.sh not found. Is the sodaprompts plugin installed?"
   echo "  Fix: claude plugin install knoxgraeme/sodaprompts"
@@ -209,7 +209,7 @@ and wake workflow installation.
 Locate and run the script:
 
 ```bash
-SHIP_DOER="$(find ~/.claude -path '*/sodaprompts-setup/scripts/ship-doer.sh' -type f | head -1)"
+SHIP_DOER="$(find ~/.claude/plugins -path '*/sodaprompts-setup/scripts/ship-doer.sh' -type f | head -1)"
 if [[ -z "$SHIP_DOER" ]]; then
   echo "ERROR: ship-doer.sh not found. Is the sodaprompts plugin installed?"
   exit 1
@@ -279,7 +279,7 @@ reviewer:
 Then run the reviewer ship script:
 
 ```bash
-SHIP_REVIEWER="$(find ~/.claude -path '*/sodaprompts-setup/scripts/ship-reviewer.sh' -type f | head -1)"
+SHIP_REVIEWER="$(find ~/.claude/plugins -path '*/sodaprompts-setup/scripts/ship-reviewer.sh' -type f | head -1)"
 if [[ -z "$SHIP_REVIEWER" ]]; then
   echo "ERROR: ship-reviewer.sh not found. Is the sodaprompts plugin installed?"
   exit 1

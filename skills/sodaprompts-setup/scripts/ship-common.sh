@@ -253,21 +253,22 @@ check_yaml_parser() {
 # ── Plugin discovery ─────────────────────────────────────────────────────
 
 locate_plugin_dir() {
-  PLUGIN_DIR="$(find ~/.claude -path '*/sodaprompts/skills/sodaprompts-setup' -type d 2>/dev/null | head -1)"
-  if [[ -z "$PLUGIN_DIR" ]]; then
-    PLUGIN_DIR="$(find ~/.claude -path '*/sodaprompts-setup' -type d 2>/dev/null | head -1)"
+  local dir
+  dir="$(find ~/.claude/plugins -path '*/sodaprompts/skills/sodaprompts-setup' -type d 2>/dev/null | head -1)"
+  if [[ -z "$dir" ]]; then
+    dir="$(find ~/.claude/plugins -path '*/sodaprompts-setup' -type d 2>/dev/null | head -1)"
   fi
-  if [[ -z "$PLUGIN_DIR" ]]; then
+  if [[ -z "$dir" ]]; then
     return 1
   fi
-  debug "Plugin dir: $PLUGIN_DIR"
-  echo "$PLUGIN_DIR"
+  debug "Plugin dir: $dir"
+  echo "$dir"
 }
 
 locate_skill_dir() {
   local skill_name="$1"
   local dir
-  dir="$(find ~/.claude -path "*/${skill_name}" -type d 2>/dev/null | head -1)"
+  dir="$(find ~/.claude/plugins -path "*/${skill_name}" -type d 2>/dev/null | head -1)"
   if [[ -z "$dir" ]]; then
     return 1
   fi

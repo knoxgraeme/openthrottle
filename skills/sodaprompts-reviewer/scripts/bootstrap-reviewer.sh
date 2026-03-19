@@ -92,6 +92,7 @@ log "run-reviewer.sh installed"
 # ---------------------------------------------------------------------------
 # 7. Auto-start on boot
 # ---------------------------------------------------------------------------
+init_autostart
 add_autostart "run-reviewer.sh" "${SPRITE_HOME}/run-reviewer.sh" "${SPRITE_HOME}/logs/reviewer.log"
 
 # ---------------------------------------------------------------------------
