@@ -319,8 +319,48 @@ Why GHCR:
 
 Build pipeline: GitHub Action on tag push builds + publishes snapshots via multi-stage Dockerfile.
 
+## Confirmed: Daytona Snapshot API
+
+Snapshots are first-class in Daytona with full SDK support (Python, TypeScript, Ruby, Go):
+
+```python
+# Create snapshot from custom GHCR image
+daytona.snapshot.create(
+    CreateSnapshotParams(name='golden-base', image='ghcr.io/sodaprompts/doer-claude:node-1.0.0'),
+    on_logs=lambda chunk: print(chunk, end=""),
+)
+
+# Create sandbox from snapshot
+sandbox = daytona.create(
+    CreateSandboxFromSnapshotParams(snapshot='golden-base', env_vars={...})
+)
+```
+
+Golden-base pattern maps directly: create sandbox → install deps → login → snapshot → restore for future runs.
+
+Notes:
+- Snapshots can be activated/deactivated; inactive ones must be re-activated before use
+- Fork/snapshot of running sandbox state (filesystem + memory) is listed as "coming soon" — not needed for our use case but enables future concurrent builds
+- Auto-stop/archive/delete intervals configurable per sandbox
+
+## Confirmed: GHCR + Daytona Compatibility
+
+Daytona docs explicitly list GHCR as a supported container registry. Public images referenced directly:
+
+```
+ghcr.io/sodaprompts/doer-claude:node-1.0.0
+```
+
+For private images, register GHCR in Daytona dashboard with GitHub username + PAT (`read:packages` scope).
+
+**Constraint:** `latest`, `lts`, `stable` tags are not allowed — must use explicit version tags. Fine for us; we'd version snapshots anyway (e.g., `node-1.0.0`, `node-1.1.0`).
+
+Image tags in `.sodaprompts.yml` will need to reference specific versions:
+
+```yaml
+snapshot: ghcr.io/sodaprompts/doer-claude:node-1.0.0
+```
+
 ## Open Questions
 
 1. **Cost model** — how does Daytona bill for long-lived sandboxes with sleep/wake? Affects guidance on when to snapshot vs keep running.
-2. **Daytona snapshot API** — can we programmatically create/restore snapshots (like `sprite checkpoint`)? Needed for `push-env` and golden-base automation.
-3. **GHCR + Daytona compatibility** — confirm Daytona can pull from `ghcr.io` directly as a snapshot source.
