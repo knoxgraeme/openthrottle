@@ -1,0 +1,70 @@
+# Wake sprites when work arrives on GitHub.
+#
+# Triggers:
+#   - Issue labeled with a *-queued label → wakes the Doer sprite
+#   - PR labeled "needs-review"           → wakes the Thinker sprite
+#
+# The sprites poll while awake and auto-suspend after IDLE_TIMEOUT (default 15m).
+# Restoring an already-running sprite is a no-op (idempotent).
+#
+# Network egress policy is applied once during setup (Step 7), before the
+# golden-base checkpoint. Policies are sprite-level config (not filesystem),
+# so they persist through checkpoint restore — no need to re-apply here.
+#
+# Required repository secrets:
+#   SPRITES_TOKEN  — API token from sprites.dev
+#
+# Required repository variables:
+#   BUILDER_SPRITE  — name of the Doer sprite (e.g. "soda-base")
+#   REVIEWER_SPRITE — name of the Thinker sprite (e.g. "soda-reviewer")
+#                     Leave unset to skip reviewer wake.
+
+name: Wake Sprite
+
+on:
+  issues:
+    types: [labeled]
+  pull_request:
+    types: [labeled]
+
+jobs:
+  wake-builder:
+    if: >
+      github.event_name == 'issues' &&
+      contains(fromJSON('["prd-queued", "bug-queued"]'), github.event.label.name)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake Doer Sprite
+        run: |
+          echo "Waking builder sprite: ${BUILDER_SPRITE}"
+          curl -sf -X POST \
+            "https://api.sprites.dev/v1/sprites/${BUILDER_SPRITE}/restore" \
+            -H "Authorization: Bearer ${SPRITES_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{"checkpoint": "golden-base"}' \
+          && echo "Sprite woken" \
+          || echo "Sprite already running or wake failed (non-fatal)"
+        env:
+          BUILDER_SPRITE: ${{ vars.BUILDER_SPRITE }}
+          SPRITES_TOKEN: ${{ secrets.SPRITES_TOKEN }}
+
+  wake-reviewer:
+    if: >
+      github.event_name == 'pull_request' &&
+      github.event.label.name == 'needs-review' &&
+      vars.REVIEWER_SPRITE != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake Thinker Sprite
+        run: |
+          echo "Waking reviewer sprite: ${REVIEWER_SPRITE}"
+          curl -sf -X POST \
+            "https://api.sprites.dev/v1/sprites/${REVIEWER_SPRITE}/restore" \
+            -H "Authorization: Bearer ${SPRITES_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{"checkpoint": "golden-base"}' \
+          && echo "Sprite woken" \
+          || echo "Sprite already running or wake failed (non-fatal)"
+        env:
+          REVIEWER_SPRITE: ${{ vars.REVIEWER_SPRITE }}
+          SPRITES_TOKEN: ${{ secrets.SPRITES_TOKEN }}
