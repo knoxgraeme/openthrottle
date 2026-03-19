@@ -272,17 +272,38 @@ If using subscription auth (not API key), the action references the user's perso
 
 ## Decisions
 
-### Golden Snapshot (carries over from Sprites)
+### Golden Sandbox (adapted from Sprites)
 
-Sandboxes are **not** ephemeral. Same `golden-base` pattern as Sprites:
+**Key constraint:** Daytona does not yet support snapshotting a *running* sandbox ([#2519](https://github.com/daytonaio/daytona/issues/2519), filed Sep 2025, in development). You can only create snapshots from Docker images/Dockerfiles, not from live sandbox state. However, sandboxes have a **stop/start lifecycle** that preserves filesystem state, and an **archive/restore** flow for cold storage.
 
-1. First run: create sandbox from generic published snapshot
-2. Clone repo, run `post_bootstrap`, login to agent CLI
-3. Snapshot as `golden-base` — project deps + auth baked in
-4. All future runs restore from `golden-base` (fast boot, no re-install, no re-login)
-5. `push-env` command = update env vars + re-snapshot
+This means the golden-base pattern adapts to two layers:
 
-This means auth refresh is a non-issue — the session token lives in the snapshot. API key users still just pass env vars, but the golden snapshot pattern works for them too (avoids re-running `pnpm install` etc. every time).
+**Layer 1: Published snapshot (baked deps, shared by all users)**
+
+Built from a Dockerfile that pre-installs everything slow:
+
+```dockerfile
+FROM node:22-slim
+RUN apt-get update && apt-get install -y git gh jq curl chromium xvfb ...
+RUN npm install -g @anthropic-ai/claude-code
+COPY run-builder.sh run-reviewer.sh entrypoint.sh /opt/sodaprompts/
+```
+
+Published as `ghcr.io/sodaprompts/doer-claude:node-1.0.0`. Every user starts from this.
+
+**Layer 2: Long-lived sandbox (per-project state, per user)**
+
+1. First run: create sandbox from published snapshot
+2. Entrypoint clones repo, runs `post_bootstrap` (e.g. `pnpm install`), user logs in to agent CLI
+3. **Stop** the sandbox (not destroy) — filesystem persists including auth tokens, node_modules, etc.
+4. All future runs: **start** the stopped sandbox (fast — no re-install, no re-login)
+5. `push-env` command = update env vars + restart sandbox
+
+The sandbox is long-lived and stopped between tasks (zero cost when stopped). When [#2519](https://github.com/daytonaio/daytona/issues/2519) lands, we can snapshot the sandbox state into a true golden image — but stop/start is sufficient for now.
+
+**Archive for cold storage:** sandboxes inactive for extended periods can be archived (moved to object storage), then restored on next wake. This is analogous to Sprites checkpoint restore.
+
+**API key users:** skip login step — `ANTHROPIC_API_KEY` passed as env var at sandbox creation. Stop/start still saves deps.
 
 ### Single Sandbox, Two Skills (not two sandboxes)
 
@@ -319,29 +340,38 @@ Why GHCR:
 
 Build pipeline: GitHub Action on tag push builds + publishes snapshots via multi-stage Dockerfile.
 
-## Confirmed: Daytona Snapshot API
+## Confirmed: Daytona Snapshot + Sandbox Lifecycle API
 
-Snapshots are first-class in Daytona with full SDK support (Python, TypeScript, Ruby, Go):
+Full SDK support (Python, TypeScript, Ruby, Go) for both snapshots and sandbox lifecycle:
 
 ```python
-# Create snapshot from custom GHCR image
+# Create snapshot from custom GHCR image (template — not from running sandbox)
 daytona.snapshot.create(
-    CreateSnapshotParams(name='golden-base', image='ghcr.io/sodaprompts/doer-claude:node-1.0.0'),
+    CreateSnapshotParams(name='doer-claude-node', image='ghcr.io/sodaprompts/doer-claude:node-1.0.0'),
     on_logs=lambda chunk: print(chunk, end=""),
 )
 
 # Create sandbox from snapshot
 sandbox = daytona.create(
-    CreateSandboxFromSnapshotParams(snapshot='golden-base', env_vars={...})
+    CreateSandboxFromSnapshotParams(snapshot='doer-claude-node', env_vars={...})
 )
+
+# Stop/start lifecycle (filesystem persists — this is our golden-base mechanism)
+sandbox.stop()     # preserves filesystem, clears memory, zero cost
+sandbox.start()    # fast resume with all state intact
 ```
 
-Golden-base pattern maps directly: create sandbox → install deps → login → snapshot → restore for future runs.
+| Capability | Status |
+|---|---|
+| Create snapshot from Docker image/Dockerfile | Available |
+| Create sandbox from snapshot | Available |
+| Stop/start sandbox (filesystem persisted) | Available |
+| Archive/restore sandbox (cold storage) | Available |
+| Snapshot a *running* sandbox's state | Not yet ([#2519](https://github.com/daytonaio/daytona/issues/2519)) |
+| Point-in-time checkpoint/rollback | Not yet ([#2528](https://github.com/daytonaio/daytona/issues/2528)) |
+| Fork filesystem + memory state | Coming soon |
 
-Notes:
-- Snapshots can be activated/deactivated; inactive ones must be re-activated before use
-- Fork/snapshot of running sandbox state (filesystem + memory) is listed as "coming soon" — not needed for our use case but enables future concurrent builds
-- Auto-stop/archive/delete intervals configurable per sandbox
+When [#2519](https://github.com/daytonaio/daytona/issues/2519) lands, we can create true golden snapshots from configured sandboxes. Until then, stop/start gives us the same UX.
 
 ## Confirmed: GHCR + Daytona Compatibility
 
