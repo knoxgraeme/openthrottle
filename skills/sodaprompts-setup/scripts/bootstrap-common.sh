@@ -15,13 +15,18 @@ fail() { echo -e "${RED}[error]${NC} $1"; exit 1; }
 
 SPRITE_HOME="${SPRITE_HOME:-/home/sprite}"
 
+# Use sudo when not running as root
+SUDO=""
+if [[ $(id -u) -ne 0 ]]; then SUDO="sudo"; fi
+
 # ---------------------------------------------------------------------------
 # Install system packages (apt-get)
 # ---------------------------------------------------------------------------
 install_system_packages() {
   log "Installing system packages..."
-  apt-get update -q
-  apt-get install -y -q curl wget git jq "$@"
+  $SUDO apt-get update -q
+  $SUDO apt-get install -y -q curl wget git jq "$@"
+  $SUDO apt-get clean; $SUDO rm -rf /var/lib/apt/lists/* || true
 }
 
 # ---------------------------------------------------------------------------
@@ -30,14 +35,16 @@ install_system_packages() {
 install_github_cli() {
   log "Installing GitHub CLI..."
   if ! command -v gh &>/dev/null; then
-    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-      | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] \
-      https://cli.github.com/packages stable main" \
-      > /etc/apt/sources.list.d/github-cli.list
-    apt-get update -q && apt-get install -y -q gh
+    GH_VERSION=$(curl -fsSL https://api.github.com/repos/cli/cli/releases/latest | jq -r '.tag_name' | tr -d 'v')
+    curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
+      | $SUDO tar xz --strip-components=1 -C /usr/local
   fi
-  echo "${GITHUB_TOKEN}" | gh auth login --with-token
+  if gh auth status &>/dev/null; then
+    log "GitHub CLI already authenticated"
+  else
+    # GITHUB_TOKEN in env blocks gh auth login; temporarily unset for this command
+    GITHUB_TOKEN= gh auth login --with-token <<< "${GITHUB_TOKEN}"
+  fi
   # Use credential helper instead of embedding token in clone URL
   gh auth setup-git
   log "GitHub CLI authenticated"

@@ -21,13 +21,13 @@ while IFS= read -r envfile; do
   sprite exec -s "$SPRITE" -- bash -c "mkdir -p /home/sprite/repo/$(dirname "$RELPATH")"
   cat "$envfile" | sprite exec -s "$SPRITE" -- bash -c "cat > /home/sprite/repo/${RELPATH}"
   PUSHED=$((PUSHED + 1))
-done < <(find . -name '.env' -o -name '.env.local' -o -name '.env.*' | grep -v node_modules | grep -v .git)
+done < <(find . \( -name '.env' -o -name '.env.local' -o -name '.env.*' \) -print | grep -v node_modules | grep -v .git)
 
 echo ""
 echo "  Pushed ${PUSHED} .env file(s)"
 echo ""
 echo "  Re-checkpointing as golden-base..."
-sprite checkpoint -s "$SPRITE" --name golden-base --overwrite
+sprite checkpoint create -s "$SPRITE" --comment "golden-base"
 
 echo ""
 echo "  Done. Future sessions will use the updated env."

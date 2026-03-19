@@ -97,18 +97,19 @@ sprite exec -s "$SPRITE" -- bash -c "cat > /tmp/pipeline/sodaprompts.yml" \
 
 ### 6b. Push .env files from local machine
 
-Push all local `.env` files so the sprite has the same runtime environment.
-Pipeline secrets (GITHUB_TOKEN, TELEGRAM_*) should already be in the root `.env`.
+Push all local `.env` files to a staging directory on the sprite. Bootstrap.sh
+copies them into the repo after cloning — this avoids a directory collision
+where the repo clone fails because `/home/sprite/repo/` already exists.
 
 ```bash
-# Push all .env files
-find . -name '.env' -o -name '.env.local' -o -name '.env.*' \
+# Push all .env files to staging (bootstrap.sh copies them after clone)
+find . \( -name '.env' -o -name '.env.local' -o -name '.env.*' \) -print \
   | grep -v node_modules | grep -v .git \
   | while read -r envfile; do
       RELPATH="${envfile#./}"
       echo "  Pushing $RELPATH"
-      sprite exec -s "$SPRITE" -- bash -c "mkdir -p /home/sprite/repo/$(dirname "$RELPATH")"
-      cat "$envfile" | sprite exec -s "$SPRITE" -- bash -c "cat > /home/sprite/repo/${RELPATH}"
+      sprite exec -s "$SPRITE" -- bash -c "mkdir -p /tmp/env-staging/$(dirname "$RELPATH")"
+      cat "$envfile" | sprite exec -s "$SPRITE" -- bash -c "cat > /tmp/env-staging/${RELPATH}"
     done
 ```
 
@@ -118,7 +119,7 @@ find . -name '.env' -o -name '.env.local' -o -name '.env.*' \
 sprite exec -s "$SPRITE" -- bash -c "
   cd /tmp/pipeline &&
   chmod +x bootstrap.sh &&
-  set -a && source /home/sprite/repo/.env && set +a &&
+  set -a && source /tmp/env-staging/.env && set +a &&
   bash bootstrap.sh
 "
 ```
@@ -181,7 +182,9 @@ print(json.dumps({'rules': rules}))
 
     # Uses sprite CLI auth (from sprite login) — no SPRITES_TOKEN needed
     echo "$RULES_JSON" | sprite api -s "$SPRITE" \
-      -X POST /sprites/${SPRITE}/policy/network \
+      /v1/sprites/${SPRITE}/policy/network \
+      -X POST \
+      -H "Content-Type: application/json" \
       -d @- \
     && echo "Network policy applied" \
     || echo "WARNING: Failed to apply network policy — sprite has unrestricted egress"
@@ -196,7 +199,7 @@ fi
 ## Step 8 — Checkpoint
 
 ```bash
-sprite checkpoint create "golden-base" -s "$SPRITE"
+sprite checkpoint create -s "$SPRITE" --comment "golden-base"
 ```
 
 ---
@@ -280,7 +283,7 @@ Soda Prompts setup complete!
 
   Refresh Claude auth (every few weeks):
     sprite console -s <sprite> → claude login
-    sprite checkpoint create golden-base -s <sprite>
+    sprite checkpoint create -s <sprite> --comment golden-base
 ```
 
 Remind the user to commit `.sodaprompts.yml` and `.github/workflows/wake-sprite.yml`.
@@ -385,13 +388,13 @@ sprite exec -s "$REVIEWER_SPRITE" -- bash -c "cat > /tmp/pipeline-investigator/S
 sprite exec -s "$REVIEWER_SPRITE" -- bash -c "cat > /tmp/pipeline/bootstrap-reviewer.sh" \
   < "${REVIEWER_DIR}/bootstrap-reviewer.sh"
 
-# Push .env files (reviewer needs GITHUB_TOKEN, optionally TELEGRAM_*)
-find . -name '.env' -o -name '.env.local' -o -name '.env.*' \
+# Push .env files to staging (bootstrap copies them after clone)
+find . \( -name '.env' -o -name '.env.local' -o -name '.env.*' \) -print \
   | grep -v node_modules | grep -v .git \
   | while read -r envfile; do
       RELPATH="${envfile#./}"
-      sprite exec -s "$REVIEWER_SPRITE" -- bash -c "mkdir -p /home/sprite/repo/$(dirname "$RELPATH")"
-      cat "$envfile" | sprite exec -s "$REVIEWER_SPRITE" -- bash -c "cat > /home/sprite/repo/${RELPATH}"
+      sprite exec -s "$REVIEWER_SPRITE" -- bash -c "mkdir -p /tmp/env-staging/$(dirname "$RELPATH")"
+      cat "$envfile" | sprite exec -s "$REVIEWER_SPRITE" -- bash -c "cat > /tmp/env-staging/${RELPATH}"
     done
 
 # Run bootstrap
@@ -399,7 +402,7 @@ AGENT_RUNTIME=$(grep -A5 '^reviewer:' .sodaprompts.yml | grep 'agent_runtime:' |
 sprite exec -s "$REVIEWER_SPRITE" -- bash -c "
   cd /tmp/pipeline &&
   chmod +x bootstrap-reviewer.sh &&
-  set -a && source /home/sprite/repo/.env && set +a &&
+  set -a && source /tmp/env-staging/.env && set +a &&
   AGENT_RUNTIME=${AGENT_RUNTIME:-claude} bash bootstrap-reviewer.sh
 "
 ```
@@ -441,7 +444,9 @@ print(json.dumps({'rules': rules}))
 
   if [[ -n "$RULES_JSON" ]]; then
     echo "$RULES_JSON" | sprite api -s "$REVIEWER_SPRITE" \
-      -X POST /sprites/${REVIEWER_SPRITE}/policy/network \
+      /v1/sprites/${REVIEWER_SPRITE}/policy/network \
+      -X POST \
+      -H "Content-Type: application/json" \
       -d @- \
     && echo "Network policy applied to reviewer" \
     || echo "WARNING: Failed to apply network policy to reviewer sprite"
@@ -452,7 +457,7 @@ fi
 ### 12f. Checkpoint reviewer sprite
 
 ```bash
-sprite checkpoint create "golden-base" -s "$REVIEWER_SPRITE"
+sprite checkpoint create -s "$REVIEWER_SPRITE" --comment "golden-base"
 ```
 
 ### 12g. Verify reviewer

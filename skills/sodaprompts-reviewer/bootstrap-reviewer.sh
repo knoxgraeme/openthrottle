@@ -67,6 +67,14 @@ install_agent_runtime
 # ---------------------------------------------------------------------------
 clone_or_update_repo
 
+# Copy .env files from staging (pushed before clone to avoid directory collision)
+if [[ -d /tmp/env-staging ]]; then
+  log "Copying .env files from staging..."
+  cp -r /tmp/env-staging/. "${SPRITE_HOME}/repo/"
+  rm -rf /tmp/env-staging
+  log ".env files copied to repo"
+fi
+
 # ---------------------------------------------------------------------------
 # 6. Install skill + run-reviewer.sh
 # ---------------------------------------------------------------------------
@@ -112,5 +120,5 @@ echo ""
 echo "  Logs:    tail -f ${SPRITE_HOME}/logs/reviewer.log"
 echo ""
 echo "  Next: checkpoint this sprite as golden-base:"
-echo "    sprite checkpoint create golden-base -s <sprite-name>"
+echo "    sprite checkpoint create -s <sprite-name> --comment golden-base"
 echo ""

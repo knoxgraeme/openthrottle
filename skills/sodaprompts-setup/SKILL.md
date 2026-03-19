@@ -197,6 +197,10 @@ set -a && source .env && set +a
 | `TELEGRAM_BOT_TOKEN` | Telegram `@BotFather` → `/newbot` |
 | `TELEGRAM_CHAT_ID` | `https://api.telegram.org/bot<TOKEN>/getUpdates` |
 
+> **Security note:** Do not paste your Telegram bot token into this chat for
+> verification. To confirm your chat ID, open the getUpdates URL in your
+> browser privately: `https://api.telegram.org/bot<TOKEN>/getUpdates`
+
 **Note:** `SPRITES_TOKEN` is NOT stored in `.env`. It's only needed as a GitHub
 Actions secret (for the wake workflow) and on your machine for setup (Step 7,
 network policy). The sprite CLI authenticates via `sprite login`.
@@ -213,7 +217,7 @@ the same runtime environment you do.
 Discover what's available:
 
 ```bash
-find . -name '.env' -o -name '.env.local' -o -name '.env.*' | grep -v node_modules | grep -v .git | sort
+find . \( -name '.env' -o -name '.env.local' -o -name '.env.*' \) -print | grep -v node_modules | grep -v .git | sort
 ```
 
 Show the user what was found and confirm before pushing. The actual push
