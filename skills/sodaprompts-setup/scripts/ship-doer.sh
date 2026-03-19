@@ -63,17 +63,21 @@ step_read_config() {
 }
 
 step_locate_plugin() {
-  PLUGIN_DIR=$(locate_plugin_dir) || {
-    fail_step "find ~/.claude -path '*/sodaprompts-setup'" \
+  # Resolve from known relative path — scripts live in sodaprompts-setup/scripts/
+  PLUGIN_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+  BUILDER_DIR="$(cd "${SCRIPT_DIR}/../../sodaprompts-builder" 2>/dev/null && pwd)" || true
+
+  if [[ ! -d "${PLUGIN_DIR}/scripts" ]]; then
+    fail_step "test -d ${SCRIPT_DIR}/../scripts" \
       "sodaprompts plugin not found. Install: claude plugin install knoxgraeme/sodaprompts"
     return 1
-  }
+  fi
 
-  BUILDER_DIR=$(locate_skill_dir "sodaprompts-builder") || {
-    fail_step "find ~/.claude -path '*/sodaprompts-builder'" \
+  if [[ -z "$BUILDER_DIR" || ! -d "$BUILDER_DIR" ]]; then
+    fail_step "test -d sodaprompts-builder" \
       "sodaprompts-builder skill not found. Reinstall: claude plugin install knoxgraeme/sodaprompts"
     return 1
-  }
+  fi
 
   # Verify critical files exist
   local missing=()
@@ -162,6 +166,7 @@ step_upload_files() {
   sprite_upload "$SPRITE" "${PLUGIN_DIR}/scripts/bootstrap-common.sh" "/tmp/pipeline/bootstrap-common.sh" || upload_failed=true
   sprite_upload "$SPRITE" "${PLUGIN_DIR}/scripts/install-skill.sh"    "/tmp/pipeline/install-skill.sh"    || upload_failed=true
   sprite_upload "$SPRITE" "${PLUGIN_DIR}/scripts/telegram-poller.sh"  "/tmp/pipeline/telegram-poller.sh"  || upload_failed=true
+  sprite_upload "$SPRITE" "${PLUGIN_DIR}/scripts/ship-common.sh"      "/tmp/pipeline/ship-common.sh"      || upload_failed=true
 
   log "Uploading hooks..."
   for hook in block-push-to-main.sh log-commands.sh auto-format.sh; do
@@ -245,13 +250,11 @@ step_checkpoint() {
 step_verify() {
   local failures=0 warnings=0
 
-  # 1. Claude auth
-  local claude_check
-  claude_check=$(sprite exec -s "$SPRITE" -- claude -p "reply with only OK" --output-format text 2>&1 || true)
-  if echo "$claude_check" | grep -qi "OK"; then
-    log "  Claude auth: PASS"
+  # 1. Claude config exists (auth was verified in step 4 before bootstrap)
+  if sprite exec -s "$SPRITE" -- test -d /home/sprite/.claude &>/dev/null; then
+    log "  Claude config: PASS"
   else
-    err "  Claude auth: FAIL"
+    err "  Claude config: FAIL"
     failures=$((failures + 1))
   fi
 
@@ -263,13 +266,11 @@ step_verify() {
     failures=$((failures + 1))
   fi
 
-  # 3. Plugin installed (non-critical)
-  local skills_check
-  skills_check=$(sprite exec -s "$SPRITE" -- claude -p "list your available skills" --output-format text 2>/dev/null || true)
-  if echo "$skills_check" | grep -qi "sodaprompts"; then
-    log "  Plugin installed: PASS"
+  # 3. Builder skill installed (file check, not LLM call)
+  if sprite exec -s "$SPRITE" -- test -f /home/sprite/repo/.claude/skills/sodaprompts-builder/SKILL.md &>/dev/null; then
+    log "  Builder skill: PASS"
   else
-    warn "  Plugin installed: WARN (not detected, non-critical)"
+    warn "  Builder skill: WARN (not detected, non-critical)"
     warnings=$((warnings + 1))
   fi
 
