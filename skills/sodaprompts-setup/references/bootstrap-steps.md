@@ -90,6 +90,14 @@ sprite exec -s "$SPRITE" -- bash -c "cat > /tmp/pipeline/install-skill.sh" \
 sprite exec -s "$SPRITE" -- bash -c "cat > /tmp/pipeline/telegram-poller.sh" \
   < "${PLUGIN_DIR}/scripts/telegram-poller.sh"
 
+# Upload builder skill + runner
+BUILDER_DIR="$(find ~/.claude -path '*/sodaprompts-builder' -type d | head -1)"
+sprite exec -s "$SPRITE" -- bash -c "mkdir -p /tmp/pipeline-builder"
+sprite exec -s "$SPRITE" -- bash -c "cat > /tmp/pipeline-builder/SKILL.md" \
+  < "${BUILDER_DIR}/SKILL.md"
+sprite exec -s "$SPRITE" -- bash -c "cat > /tmp/pipeline-builder/run-builder.sh" \
+  < "${BUILDER_DIR}/run-builder.sh"
+
 # Upload project config
 sprite exec -s "$SPRITE" -- bash -c "cat > /tmp/pipeline/sodaprompts.yml" \
   < .sodaprompts.yml
