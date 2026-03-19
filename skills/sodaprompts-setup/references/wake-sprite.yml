@@ -7,7 +7,7 @@
 # The sprites poll while awake and auto-suspend after IDLE_TIMEOUT (default 15m).
 # Restoring an already-running sprite is a no-op (idempotent).
 #
-# Network egress policy is applied once during setup (Step 7), before the
+# Network egress policy is applied once during setup (ship-doer.sh step 8), before the
 # golden-base checkpoint. Policies are sprite-level config (not filesystem),
 # so they persist through checkpoint restore — no need to re-apply here.
 #
