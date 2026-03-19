@@ -44,7 +44,8 @@ fi
 ENV_RESET_SIGNAL="${SPRITE_HOME}/env-reset-request.json"
 
 COMPLETIONS_DIR="${SPRITE_HOME}/completions"
-mkdir -p "$COMPLETIONS_DIR"
+SESSIONS_DIR="${SPRITE_HOME}/sessions"
+mkdir -p "$COMPLETIONS_DIR" "$SESSIONS_DIR"
 
 log() { echo "[builder $(date +%H:%M:%S)] $1" | tee -a "${LOG_DIR}/builder.log"; }
 notify() {
@@ -276,16 +277,52 @@ Repairing environment and continuing..."
 
 # ---------------------------------------------------------------------------
 # Invoke the agent — runtime-specific command, same prompt
+#
+# Usage: invoke_agent PROMPT TIMEOUT SESSION_LOG [TASK_KEY]
+#   TASK_KEY — unique key for session resume (e.g. "pr-42", "prd-17", "bug-5").
+#              If a session file exists for this key, the agent resumes it.
+#              If omitted, starts a fresh session with no resume support.
 # ---------------------------------------------------------------------------
 invoke_agent() {
   local PROMPT="$1"
   local AGENT_TIMEOUT="$2"
   local SESSION_LOG="$3"
+  local TASK_KEY="${4:-}"
+
+  # Resolve session flags for Claude (--session-id or --resume)
+  local -a SESSION_FLAGS=()
+  if [[ -n "$TASK_KEY" ]]; then
+    local SESSION_FILE="${SESSIONS_DIR}/${TASK_KEY}.id"
+    if [[ -f "$SESSION_FILE" ]]; then
+      local EXISTING_ID
+      EXISTING_ID=$(<"$SESSION_FILE")
+      if [[ -n "$EXISTING_ID" ]]; then
+        touch "$SESSION_FILE"  # refresh mtime to prevent pruning
+        SESSION_FLAGS=(--resume "$EXISTING_ID")
+        log "Resuming session for ${TASK_KEY}"
+      else
+        log "WARNING: empty session file for ${TASK_KEY}, starting fresh"
+        rm -f "$SESSION_FILE"
+        local SESSION_ID
+        SESSION_ID=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)
+        echo "$SESSION_ID" > "$SESSION_FILE"
+        SESSION_FLAGS=(--session-id "$SESSION_ID")
+        log "New session for ${TASK_KEY}: ${SESSION_ID}"
+      fi
+    else
+      local SESSION_ID
+      SESSION_ID=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)
+      echo "$SESSION_ID" > "$SESSION_FILE"
+      SESSION_FLAGS=(--session-id "$SESSION_ID")
+      log "New session for ${TASK_KEY}: ${SESSION_ID}"
+    fi
+  fi
 
   case "$AGENT_RUNTIME" in
     claude)
       # Claude Code loads skills from .claude/skills/ automatically
       timeout "${AGENT_TIMEOUT}" claude \
+        "${SESSION_FLAGS[@]}" \
         --dangerously-skip-permissions \
         -p "$PROMPT" \
         2>&1 | tee -a "$SESSION_LOG"
@@ -330,6 +367,25 @@ handle_fixes() {
   REVIEW=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPO" --json reviews \
     --jq '[.reviews[] | select(.state == "CHANGES_REQUESTED")] | last | .body')
 
+  # Resolve task key — find linked issue to resume the original build session
+  local TASK_KEY="pr-${PR_NUMBER}"
+  local PR_BODY
+  PR_BODY=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPO" --json body --jq '.body' 2>/dev/null || echo "")
+  local LINKED_ISSUE
+  LINKED_ISSUE=$(echo "$PR_BODY" | grep -oiE '(fix(es)?|close[sd]?|resolve[sd]?) #[0-9]+' | grep -oE '[0-9]+' | head -1 || echo "")
+  if [[ -n "$LINKED_ISSUE" ]]; then
+    # Check for original prd or bug session to resume
+    if [[ -f "${SESSIONS_DIR}/prd-${LINKED_ISSUE}.id" ]]; then
+      TASK_KEY="prd-${LINKED_ISSUE}"
+    elif [[ -f "${SESSIONS_DIR}/bug-${LINKED_ISSUE}.id" ]]; then
+      TASK_KEY="bug-${LINKED_ISSUE}"
+    else
+      log "No original session found for issue #${LINKED_ISSUE}, starting fresh"
+    fi
+  else
+    log "No linked issue in PR #${PR_NUMBER} body, starting fresh session"
+  fi
+
   # Checkout the branch
   cd "$REPO"
   git fetch origin "$BRANCH"
@@ -349,7 +405,7 @@ Do NOT create a new PR — push to the existing branch: ${BRANCH}
 
 After fixing, run the project's test and lint commands to verify."
 
-  invoke_agent "$PROMPT" "${FIX_TIMEOUT}" "$SESSION_LOG" || {
+  invoke_agent "$PROMPT" "${FIX_TIMEOUT}" "$SESSION_LOG" "$TASK_KEY" || {
     local EXIT_CODE=$?
     if [[ $EXIT_CODE -eq 124 ]]; then
       log "Fix session timed out after ${FIX_TIMEOUT}s"
@@ -438,7 +494,7 @@ commit with conventional commits (fix: ...), push, and create a PR.
 Reference the issue: Fixes #${ISSUE_NUMBER}
 Run the project's test and lint commands to verify before creating the PR."
 
-  invoke_agent "$PROMPT" "${BUG_TIMEOUT}" "$SESSION_LOG" || {
+  invoke_agent "$PROMPT" "${BUG_TIMEOUT}" "$SESSION_LOG" "bug-${ISSUE_NUMBER}" || {
     local EXIT_CODE=$?
     if [[ $EXIT_CODE -eq 124 ]]; then
       log "Bug fix ${BUG_ID} timed out after ${BUG_TIMEOUT}s"
@@ -535,7 +591,7 @@ CTXEOF
 
   local PROMPT="New task. Context file: /tmp/task-context-${PRD_ID}.json — use the sodaprompts-builder skill for the full workflow."
 
-  invoke_agent "$PROMPT" "${TIMEOUT}" "$SESSION_LOG" || {
+  invoke_agent "$PROMPT" "${TIMEOUT}" "$SESSION_LOG" "prd-${ISSUE_NUMBER}" || {
     local EXIT_CODE=$?
     if [[ $EXIT_CODE -eq 124 ]]; then
       log "PRD ${PRD_ID} timed out after ${TIMEOUT}s"
@@ -605,6 +661,9 @@ notify "Builder sprite online. Runtime: ${AGENT_RUNTIME}. Polling GitHub for wor
 
 # Clean repo state on startup (in case previous session left debris)
 cleanup_repo
+
+# Prune session files older than 7 days
+find "$SESSIONS_DIR" -name '*.id' -mtime +7 -delete 2>/dev/null || true
 
 # Check if a previous session requested env reset
 if handle_env_reset; then
