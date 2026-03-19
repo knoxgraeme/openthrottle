@@ -52,20 +52,21 @@ One snapshot per agent runtime. Pre-installed:
 - Default MCP servers: Telegram, Context7
 - Entrypoint script
 
-Published as:
+Published on GHCR as:
 
 ```
-sodaprompts/doer-claude:node       ← Claude Code + Node.js
-sodaprompts/doer-codex:node        ← Codex + Node.js
-sodaprompts/reviewer-claude:node   ← lighter image for review sprite
+ghcr.io/sodaprompts/doer-claude:node       ← Claude Code + Node.js
+ghcr.io/sodaprompts/doer-codex:node        ← Codex + Node.js
 ```
+
+No separate reviewer image — builder and reviewer are skills within the same sandbox.
 
 Future variants for language coverage:
 
 ```
-sodaprompts/doer-claude:python
-sodaprompts/doer-claude:rust
-sodaprompts/doer-claude:full       ← fat image, all runtimes
+ghcr.io/sodaprompts/doer-claude:python
+ghcr.io/sodaprompts/doer-claude:rust
+ghcr.io/sodaprompts/doer-claude:full       ← fat image, all runtimes
 ```
 
 ### Layer 2: Project Init (happens at sandbox boot)
@@ -205,12 +206,9 @@ network_policy:
 # New fields
 agent: claude                    # claude | codex | aider
 runtime: node                    # node | python | rust | full (determines snapshot variant)
-
-# Reviewer config (unchanged, already optional)
-reviewer:
-  sprite: soda-reviewer
-  agent_runtime: claude
-  max_rounds: 3
+review:
+  enabled: true                  # enable reviewer skill (default true)
+  max_rounds: 3                  # max review iterations before auto-approve
 ```
 
 ---
@@ -272,10 +270,57 @@ If using subscription auth (not API key), the action references the user's perso
 
 ---
 
+## Decisions
+
+### Golden Snapshot (carries over from Sprites)
+
+Sandboxes are **not** ephemeral. Same `golden-base` pattern as Sprites:
+
+1. First run: create sandbox from generic published snapshot
+2. Clone repo, run `post_bootstrap`, login to agent CLI
+3. Snapshot as `golden-base` — project deps + auth baked in
+4. All future runs restore from `golden-base` (fast boot, no re-install, no re-login)
+5. `push-env` command = update env vars + re-snapshot
+
+This means auth refresh is a non-issue — the session token lives in the snapshot. API key users still just pass env vars, but the golden snapshot pattern works for them too (avoids re-running `pnpm install` etc. every time).
+
+### Single Sandbox, Two Skills (not two sandboxes)
+
+The Doer and Thinker become **skills within the same sandbox**, not separate sandboxes. The runner entrypoint picks which skill to invoke based on the work item:
+
+- Issue labeled `prd-queued` / `bug-queued` / PR with `changes_requested` → builder skill
+- PR labeled `needs-review` / issue labeled `needs-investigation` → reviewer skill
+
+Benefits:
+- Half the infrastructure (one sandbox, one snapshot, one wake action)
+- Shared project context (deps already installed, repo already cloned)
+- Simpler config (no separate `reviewer.sprite` field in `.sodaprompts.yml`)
+- Review happens in the same sandbox that built the code — no cold start for reviewer
+
+Trade-off: builder and reviewer can't run concurrently in a single sandbox. This is fine — the current Sprites model already serializes within each sprite, and the reviewer only wakes after the builder finishes.
+
+### OCI Registry: GitHub Container Registry (ghcr.io)
+
+Standard for open-source projects. Published as:
+
+```
+ghcr.io/sodaprompts/doer-claude:node
+ghcr.io/sodaprompts/doer-codex:node
+ghcr.io/sodaprompts/doer-claude:python
+ghcr.io/sodaprompts/doer-claude:full
+```
+
+Why GHCR:
+- Free for public images
+- Native GitHub Actions integration (`docker/login-action` + `docker/build-push-action`)
+- Same auth model as the rest of the project (GitHub PAT)
+- No separate account/billing (Docker Hub requires one)
+- Org-scoped: `ghcr.io/sodaprompts/*` keeps everything under one namespace
+
+Build pipeline: GitHub Action on tag push builds + publishes snapshots via multi-stage Dockerfile.
+
 ## Open Questions
 
-1. **Daytona snapshot persistence** — do sandboxes survive between tasks (like Sprites checkpoints), or are they ephemeral per GitHub Action run? This affects auth caching and cost.
-2. **Snapshot registry** — where do we publish OCI images? Daytona's registry, Docker Hub, GitHub Container Registry?
-3. **Auth refresh** — if sandboxes are ephemeral, how do subscription users avoid re-login per task? Possible: store session token as GitHub secret, inject at boot.
-4. **Reviewer sprite** — same sandbox or separate? Currently two sprites; with Daytona, could be two sandboxes or one sandbox with two processes.
-5. **Cost model** — Sprites charge per-sprite with sleep/wake. How does Daytona bill? Affects whether we keep long-lived sandboxes vs ephemeral per task.
+1. **Cost model** — how does Daytona bill for long-lived sandboxes with sleep/wake? Affects guidance on when to snapshot vs keep running.
+2. **Daytona snapshot API** — can we programmatically create/restore snapshots (like `sprite checkpoint`)? Needed for `push-env` and golden-base automation.
+3. **GHCR + Daytona compatibility** — confirm Daytona can pull from `ghcr.io` directly as a snapshot source.
