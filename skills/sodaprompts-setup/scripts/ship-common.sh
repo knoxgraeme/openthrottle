@@ -149,13 +149,14 @@ run_step() {
   echo ""
   log "Step ${step_num}: ${description}"
 
-  # Run the function, stream output to terminal and capture it.
-  # Capture PIPESTATUS immediately after the pipeline — before any conditional.
+  # Run the function in the current shell (not a subshell) so global variable
+  # assignments survive. Process substitution streams output through tee.
   local output_file
   output_file=$(mktemp)
 
-  $func 2>&1 | tee "$output_file"
-  local func_exit="${PIPESTATUS[0]}"
+  $func > >(tee "$output_file") 2>&1
+  local func_exit=$?
+  wait
 
   if [[ "$func_exit" -eq 0 ]]; then
     emit_step_ok "$step_num" "$step_name" "$description"
