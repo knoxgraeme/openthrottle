@@ -62,6 +62,57 @@ Issue labeled prd-queued
 
 This is how Daytona is designed to be used — sub-90ms sandbox creation from snapshots, fully stateless, spin up and throw away.
 
+### Persistent Volume (session continuity + logs)
+
+Each project gets a **Daytona Volume** mounted to every sandbox. The volume persists across sandbox lifetimes (free, no storage quota impact). It stores:
+
+- **Claude session data** (`~/.claude/projects/`) — enables `--resume` across ephemeral sandboxes
+- **Command logs** (`~/.claude/logs/`) — sanitized bash command history from `log-commands.sh` hook
+
+```python
+sandbox = daytona.create(CreateSandboxFromSnapshotParams(
+    snapshot='sodaprompts-doer',
+    ephemeral=True,
+    volumes=[VolumeMount(
+        volume_id='sodaprompts-myproject',
+        mount_path='/home/daytona/.claude'
+    )],
+    env_vars={...}
+))
+```
+
+#### `--resume` for review fix cycles
+
+When the doer picks up a `changes_requested` review, it resumes the original build session instead of starting cold:
+
+```
+Build sandbox:
+  → volume mounted at ~/.claude
+  → builder runs, session ID = abc123
+  → opens PR, saves session ID to GitHub (PR comment metadata)
+  → sandbox destroyed — session data persists on volume
+
+Review fix sandbox:
+  → same volume mounted at ~/.claude
+  → claude --resume abc123
+  → full conversation context: knows the codebase, decisions, what it built
+  → reads review comments, applies fixes with full understanding
+  → sandbox destroyed
+```
+
+This is **better than Sprites** — with checkpoint/restore the filesystem persisted but Claude's conversation context was lost. With volumes + `--resume`, the agent picks up exactly where it left off.
+
+#### Command logs on volume
+
+The `log-commands.sh` hook writes to the volume at `~/.claude/logs/bash-commands.log`. This serves:
+
+1. **Session reports** — posted as PR comment (sanitized command log, last 50 lines, collapsible)
+2. **Debugging** — logs persist after sandbox destruction for post-mortem analysis
+3. **Audit trail** — full record of what the agent executed, with secrets redacted
+4. **Usage tracking** — parseable for build duration, command count, failure rate
+
+The hook itself is unchanged from Sprites — only the log path moves to the volume. One addition: `CLAUDE_CODE_OAUTH_TOKEN` added to the sanitization list alongside existing redactions (GITHUB_TOKEN, ANTHROPIC_API_KEY, etc.).
+
 ### Published Snapshot (shared by all users)
 
 One Docker image per agent runtime, published on GHCR. Pre-installed:
@@ -153,11 +204,16 @@ sandbox = daytona.create(CreateSandboxFromSnapshotParams(
     snapshot='sodaprompts-doer',
     ephemeral=True,               # auto-delete when sandbox stops
     auto_stop_interval=30,        # stop after 30min idle (safety net)
+    volumes=[VolumeMount(
+        volume_id='sodaprompts-myproject',
+        mount_path='/home/daytona/.claude'  # sessions + logs persist
+    )],
     env_vars={
         'CLAUDE_CODE_OAUTH_TOKEN': '...',  # or ANTHROPIC_API_KEY
         'GITHUB_TOKEN': '...',
         'TELEGRAM_BOT_TOKEN': '...',
         'TELEGRAM_CHAT_ID': '...',
+        'RESUME_SESSION': '...',   # session ID from previous build (if review fix)
     }
 ))
 ```
@@ -312,21 +368,34 @@ jobs:
           # Read snapshot from .sodaprompts.yml
           SNAPSHOT=$(yq '.snapshot' .sodaprompts.yml)
 
-          # Create ephemeral sandbox with all secrets
-          # --ephemeral auto-deletes sandbox when it stops (Daytona best practice)
+          # For review fixes: extract session ID from PR comments
+          RESUME_SESSION=""
+          if [[ "${{ github.event.review.state }}" == "changes_requested" ]]; then
+            PR_NUM="${{ github.event.pull_request.number }}"
+            RESUME_SESSION=$(gh pr view "$PR_NUM" --json comments \
+              --jq '.comments[] | select(.body | contains("session-id:")) | .body' \
+              | grep -oP 'session-id: \K\S+' | tail -1)
+          fi
+
+          # Create ephemeral sandbox with volume for session continuity
+          # --ephemeral auto-deletes sandbox when it stops
           daytona sandbox create \
             --snapshot "$SNAPSHOT" \
             --ephemeral \
+            --volume sodaprompts-${{ github.repository_id }}:/home/daytona/.claude \
             --env GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }} \
             --env GITHUB_REPO=${{ github.repository }} \
             --env ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }} \
             --env CLAUDE_CODE_OAUTH_TOKEN=${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }} \
             --env TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }} \
             --env TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }} \
-            --env WORK_ITEM=${{ github.event.issue.number || github.event.pull_request.number }}
+            --env WORK_ITEM=${{ github.event.issue.number || github.event.pull_request.number }} \
+            --env RESUME_SESSION="$RESUME_SESSION"
 ```
 
 Each issue/PR event gets its own sandbox — inherently parallel. No queue management needed.
+
+When `RESUME_SESSION` is set, the entrypoint runs `claude --resume $RESUME_SESSION` instead of starting a fresh session. The agent picks up with full context from the original build.
 
 ---
 
@@ -343,6 +412,7 @@ Each issue/PR event gets its own sandbox — inherently parallel. No queue manag
 3. Generates `.sodaprompts.yml`
 4. Copies `.github/workflows/wake-sandbox.yml` into the repo
 5. Creates Daytona snapshot in user's account (via SDK, needs `DAYTONA_API_KEY`)
+6. Creates Daytona volume for session data + logs (`sodaprompts-<project-name>`)
 6. Prints next steps (set GitHub secrets, commit, push)
 
 ### Implementation
@@ -447,7 +517,11 @@ Steps that disappear: locate plugin, upload files, push env, run bootstrap, chec
 
 ### Hooks
 
-**Keep the scripts, change the wiring.** `block-push-to-main.sh`, `log-commands.sh`, `auto-format.sh` are agent-agnostic bash. Baked into the snapshot. The entrypoint registers them in Claude's `settings.json` (or equivalent for other agents).
+**Keep the scripts, two small changes.** `block-push-to-main.sh`, `log-commands.sh`, `auto-format.sh` are agent-agnostic bash. Baked into the snapshot. The entrypoint registers them in Claude's `settings.json` (or equivalent for other agents).
+
+Changes to `log-commands.sh`:
+- Log path moves from `/home/sprite/logs/` to volume-backed `~/.claude/logs/` (persists across ephemeral sandboxes)
+- Add `CLAUDE_CODE_OAUTH_TOKEN` to secret sanitization list
 
 ### `/sodaprompts-setup` Skill
 
