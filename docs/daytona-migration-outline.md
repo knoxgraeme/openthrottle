@@ -51,11 +51,11 @@ Every task gets a fresh sandbox. No stop/start, no cleanup scripts, no stale sta
 ```
 Issue labeled prd-queued
   → GitHub Action fires
-  → Daytona SDK: create sandbox from snapshot (with env vars)
+  → Daytona SDK: create sandbox from snapshot (ephemeral: true, env_vars: {...})
   → Entrypoint: clone repo, pnpm install, wire up config from .sodaprompts.yml
   → Builder implements, opens PR
   → Reviewer reviews (same sandbox, different skill)
-  → Sandbox destroyed
+  → Sandbox auto-deleted on stop (ephemeral)
 
 3 issues queued? → 3 sandboxes in parallel. No queue needed.
 ```
@@ -144,6 +144,8 @@ Daytona is the runtime, not the secrets store. Secrets live in GitHub, get injec
 ```python
 sandbox = daytona.create(CreateSandboxFromSnapshotParams(
     snapshot='sodaprompts-doer',
+    ephemeral=True,               # auto-delete when sandbox stops
+    auto_stop_interval=30,        # stop after 30min idle (safety net)
     env_vars={
         'CLAUDE_CODE_OAUTH_TOKEN': '...',  # or ANTHROPIC_API_KEY
         'GITHUB_TOKEN': '...',
@@ -301,8 +303,10 @@ jobs:
           SNAPSHOT=$(yq '.snapshot' .sodaprompts.yml)
 
           # Create ephemeral sandbox with all secrets
+          # --ephemeral auto-deletes sandbox when it stops (Daytona best practice)
           daytona sandbox create \
             --snapshot "$SNAPSHOT" \
+            --ephemeral \
             --env GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }} \
             --env GITHUB_REPO=${{ github.repository }} \
             --env ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }} \
@@ -413,7 +417,9 @@ gh issue create --title "Search" --body-file search.md --label prd-queued
 
 ### Runner Scripts (run-builder.sh, run-reviewer.sh)
 
-**Keep as-is.** Already agent-agnostic via `AGENT_RUNTIME` env var. Move from being uploaded per-sprite to being baked into the snapshot at `/opt/sodaprompts/`.
+**Keep logic, update artifact storage.** Already agent-agnostic via `AGENT_RUNTIME` env var. Move from being uploaded per-sprite to being baked into the snapshot at `/opt/sodaprompts/`.
+
+One change: `completion.json` currently written to local filesystem (`/home/sprite/completions/`). In ephemeral model, write completion status to GitHub (issue comment or check run) so the runner and wake workflow can detect results after sandbox destruction.
 
 ### bootstrap.sh → entrypoint.sh
 
@@ -439,7 +445,37 @@ Steps that disappear: locate plugin, upload files, push env, run bootstrap, chec
 
 ### `/sodaprompts-ship` Skill
 
-**Keep as-is.** It just creates GitHub Issues — already agent-agnostic.
+**Mostly keep.** Core `ship` command (creates GitHub Issues) is agent-agnostic. Subcommands change:
+
+| Subcommand | Current (Sprites) | Daytona |
+|---|---|---|
+| `ship <file>` | `gh issue create` | Same — no change |
+| `ship status` | `gh issue list` + `gh pr list` | Same — no change |
+| `ship logs` | `sprite exec` tail log | Daytona SDK: stream sandbox stdout |
+| `ship kill` | `sprite exec` kill session | Daytona SDK: `sandbox.stop()` (ephemeral auto-deletes) |
+| `ship push-env` | Push `.env` + re-checkpoint | **Removed** — env vars passed at sandbox creation |
+
+### Completion Artifacts
+
+**Change storage.** Currently `completion.json` is written to `/home/sprite/completions/` — destroyed with ephemeral sandbox. Move to GitHub:
+
+- Decision log → PR comment (already done)
+- Session report → PR comment (already done)
+- Completion status → GitHub issue comment or check run (new)
+- Runner result detection reads from GitHub instead of local filesystem
+
+### Env-Reset Signal
+
+**Remove.** The current builder has an env-reset mechanism for Sprites checkpoint/restore cycles. Irrelevant in ephemeral model — every sandbox starts clean by definition.
+
+### Telegram Commands
+
+**Adapt.** `/status`, `/logs`, `/queue`, `/kill` currently talk to Sprites. Need to:
+
+- `/status` → read from GitHub (issues, PRs) — already works this way
+- `/logs` → Daytona SDK stream sandbox stdout, or read from GitHub Actions logs
+- `/queue` → `gh issue list --label prd-queued` — no change
+- `/kill` → Daytona SDK `sandbox.stop()` (auto-deletes if ephemeral)
 
 ---
 
@@ -491,6 +527,19 @@ Steps that disappear: locate plugin, upload files, push env, run bootstrap, chec
 
 We don't need #2519 or #2528 — the ephemeral model with `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` as env vars avoids the need for persistent sandbox state entirely.
 
+## Deprecated (removed in migration)
+
+These Sprites-specific features have no equivalent and are intentionally dropped:
+
+- **Checkpoint/restore** — replaced by ephemeral sandboxes (no state to checkpoint)
+- **`push-env` command** — env vars passed at sandbox creation, not pushed to a running environment
+- **Env-reset signal** — every sandbox starts clean; no reset needed
+- **`/home/sprite/completions/` filesystem artifacts** — completion status moves to GitHub
+- **Sprite-level network policy API** — replaced by per-sandbox config from `.sodaprompts.yml`
+- **Long-lived sprite lifecycle** — no stop/start/wake; create/run/destroy per task
+
 ## Open Questions
 
 1. **Cost model** — how does Daytona bill? Per sandbox-minute? Per creation? Affects whether parallel sandboxes are practical at scale.
+2. **Network policy in Daytona** — Sprites had L3 DNS-based egress filtering via a REST API. Does Daytona support equivalent network restrictions per sandbox? If not, what's the isolation model?
+3. **Sandbox stdout streaming** — for `ship logs` and Telegram `/logs`, can we stream sandbox output in real-time via the Daytona SDK? The Python SDK has `on_data` callbacks — confirm this works for our runner script output.
