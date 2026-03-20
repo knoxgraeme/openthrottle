@@ -230,7 +230,7 @@ The published snapshot is generic — it has tools but no project knowledge. Eve
 | **Post-bootstrap** | `post_bootstrap` | Runs `pnpm install`, DB migrations, etc. after clone |
 | **MCP servers** | `mcp_servers` | Merged into `~/.claude/settings.json`; `"from-env"` placeholders resolved from env vars |
 | **Supabase safety** | Auto-detected from `mcp_servers.supabase` | Applies tool **allowlist** — only branch management and read-only operations permitted. All other tools (execute_sql, apply_migration, deploy_edge_function, merge_branch) blocked. |
-| **Network policy** | `network_policy.allow` | Domain allowlist + auto-appended deny-all. Always includes github, anthropic, npm, telegram |
+| **Network policy** | Default (no custom policy) | Daytona's essential services cover our needs (npm, GitHub, Anthropic, Supabase). See Security Considerations. |
 | **Hooks** | Baked into snapshot, configured at boot | `block-push-to-main`, `log-commands` (secret sanitization), `auto-format` |
 | **Base branch** | `base_branch` | Which branch to fork from and PR into |
 | **Review config** | `review.enabled`, `review.max_rounds` | Whether reviewer skill runs, convergence limit |
@@ -265,13 +265,6 @@ mcp_servers:
     args: ["-y", "@supabase/mcp-server"]
     env:
       SUPABASE_ACCESS_TOKEN: from-env
-
-# Security
-network_policy:
-  allow:
-    - github.com
-    - "*.anthropic.com"
-    - "*.supabase.co"
 
 # Review
 review:
@@ -315,7 +308,7 @@ The entrypoint replaces the 400-line `bootstrap.sh`. Most of that was installing
 | Run post_bootstrap | Entrypoint (runtime) |
 | Configure MCP servers from config | Entrypoint (runtime) |
 | Configure hooks + permissions | Entrypoint (runtime) |
-| Apply network policy | Sandbox creation params (`network_block_all`, `network_allow_list`) |
+| Apply network policy | Daytona default (essential services always allowed; see Security Considerations) |
 | Start Computer Use (display) | Entrypoint calls Daytona Computer Use API |
 | Start runner | Entrypoint (runtime) |
 
@@ -770,17 +763,30 @@ OUTPUT=$(daytona sandbox create ... 2>&1) || {
 }
 ```
 
-### Network Policy — Domain to CIDR
+### Network Policy
 
-`.sodaprompts.yml` uses domain names (`github.com`, `*.anthropic.com`), but Daytona's `network_allow_list` takes CIDRs. The entrypoint resolves domains at sandbox boot:
+Daytona provides two network controls: `networkBlockAll` (blocks everything) and `networkAllowList` (up to 10 IPv4 CIDRs, no domains). Regardless of either setting, Daytona always allows "essential services":
 
-```bash
-for DOMAIN in $(yq '.network_policy.allow[]' .sodaprompts.yml); do
-  dig +short "$DOMAIN" | grep -E '^[0-9]' | sed 's|$|/32|'
-done
-```
+- **Package managers:** npm, PyPI, Maven, apt
+- **Git hosting:** GitHub, GitLab, Bitbucket
+- **AI services:** Anthropic, OpenAI
+- **Dev tools:** Supabase, Vercel, Sentry, Linear
+- **Container registries:** Docker Hub, GHCR
 
-Wildcard domains (e.g., `*.supabase.co`) require CIDR ranges from the provider's documentation rather than DNS lookups.
+This covers everything sodaprompts needs for core operations. We use **Daytona's default network policy** (no `networkBlockAll`, no custom `networkAllowList`) because:
+
+1. `networkBlockAll` would break MCP servers that call external APIs (Context7 → `mcp.context7.com`, Telegram → `api.telegram.org`)
+2. `networkAllowList` is limited to 10 IPv4 CIDRs — too few and too fragile (IPs change) for MCP endpoints
+3. The essential services list already covers the high-value targets (npm, GitHub, Anthropic, Supabase)
+4. The agent needs open web access for research (reading docs, Stack Overflow, API references). Claude Code's `WebFetch` and `WebSearch` tools are read-only — they can't POST data or exfiltrate secrets via HTTP.
+
+**Remaining exfiltration risk:** The agent could use `curl` via Bash to POST secrets to an arbitrary URL. Mitigations:
+- Fine-grained PAT limits what a leaked token can do (single repo, no admin)
+- `log-commands.sh` redacts secrets from the command string before logging
+- Ephemeral sandbox limits the window of exposure
+- `block-push-to-main` hook blocks `curl` patterns that include known env var names (future enhancement if needed)
+
+**If stricter network isolation is needed later:** Use `networkBlockAll: true` and run MCPs in stdio mode (local process, no external API calls). Context7 supports stdio via `npx @upstash/context7-mcp`. This trades convenience for isolation.
 
 ### Volume Data Hygiene
 
@@ -802,5 +808,5 @@ Persistent volumes store Claude session data across ephemeral sandboxes. Risk: s
 ## Open Questions
 
 1. **Cost model** — how does Daytona bill? Per sandbox-minute? Per creation? Affects whether parallel sandboxes are practical at scale.
-2. ~~**Network policy in Daytona**~~ **Resolved:** Daytona supports `network_block_all` (bool) and `network_allow_list` (comma-separated CIDRs) per sandbox at creation time. Replaces Sprites' DNS-based egress filtering. The entrypoint can read `network_policy.allow` from `.sodaprompts.yml` and pass it as `network_allow_list`.
+2. ~~**Network policy in Daytona**~~ **Resolved:** Daytona's essential services list (npm, GitHub, Anthropic, Supabase, etc.) covers our needs. We use default network policy — no `networkBlockAll` or custom `networkAllowList`. MCP servers need open web access, and the agent needs it for research. Exfiltration risk is mitigated by fine-grained PATs, secret sanitization, and ephemeral sandboxes.
 3. **Sandbox stdout streaming** — for `ship logs` and Telegram `/logs`, can we stream sandbox output in real-time via the Daytona SDK? The Python SDK has `on_data` callbacks — confirm this works for our runner script output.
