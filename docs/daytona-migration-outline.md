@@ -646,6 +646,86 @@ These Sprites-specific features have no equivalent and are intentionally dropped
 - **Sprite-level network policy API** — replaced by per-sandbox config from `.sodaprompts.yml`
 - **Long-lived sprite lifecycle** — no stop/start/wake; create/run/destroy per task
 
+## Security Considerations
+
+### Secret Sanitization
+
+All text posted to GitHub (PR comments, session reports, logs) passes through `sanitize_secrets()` in `run-builder.sh` and the `log-commands.sh` hook. Both redact:
+
+- `GITHUB_TOKEN`
+- `TELEGRAM_BOT_TOKEN`
+- `ANTHROPIC_API_KEY`
+- `CLAUDE_CODE_OAUTH_TOKEN`
+- `SUPABASE_ACCESS_TOKEN` (log-commands.sh only)
+- Pattern-based: `ghp_*`, `ghs_*`, `sk-*`, `Bearer *`
+
+**Limitation:** Command output (stdout/stderr) is not sanitized by `log-commands.sh` — it only redacts the command string. If the agent runs `echo $GITHUB_TOKEN`, the output appears in the session log unredacted. Mitigation: the session report only posts the last 50 lines of the *command log*, not raw stdout.
+
+### GitHub Token Scoping
+
+Recommend **fine-grained PATs** instead of classic tokens with broad `repo` scope. Minimum permissions needed:
+
+- `contents:read+write` (clone, push branches)
+- `pull_requests:read+write` (create/edit PRs, post reviews)
+- `issues:read+write` (create/edit issues, post comments)
+
+Scope to the specific repository only. Classic `repo` scope grants access to all repos the user can see — too broad for a sandbox running autonomous code.
+
+### Sandbox Creation Error Handling
+
+When the Daytona SDK call fails (quota, bad config, network), error responses may echo back env var values. The wake workflow must capture errors and redact all `env_vars` before logging:
+
+```bash
+# In wake-sandbox.yml — redact secrets from any error output
+OUTPUT=$(daytona sandbox create ... 2>&1) || {
+  SAFE_OUTPUT=$(echo "$OUTPUT" | sed \
+    -e "s/${ANTHROPIC_API_KEY:-___}/[REDACTED]/g" \
+    -e "s/${CLAUDE_CODE_OAUTH_TOKEN:-___}/[REDACTED]/g" \
+    -e "s/${GITHUB_TOKEN:-___}/[REDACTED]/g")
+  echo "::error::Sandbox creation failed: $SAFE_OUTPUT"
+  exit 1
+}
+```
+
+### Network Policy — Domain to CIDR
+
+`.sodaprompts.yml` uses domain names (`github.com`, `*.anthropic.com`), but Daytona's `network_allow_list` takes CIDRs. The entrypoint must resolve domains at sandbox boot:
+
+```bash
+# Resolve domains to CIDRs for Daytona network policy
+for DOMAIN in $(yq '.network_policy.allow[]' .sodaprompts.yml); do
+  dig +short "$DOMAIN" | grep -E '^[0-9]' | sed 's|$|/32|'
+done
+```
+
+Wildcard domains (e.g., `*.supabase.co`) require CIDR ranges from the provider's documentation rather than DNS lookups.
+
+### Prompt Injection via Issue Content
+
+Runner scripts paste raw issue/PR body into the agent prompt. Malicious issue content could attempt prompt injection. Mitigations:
+
+1. Agent runs with `--dangerously-skip-permissions` — already has full sandbox access, so injection can't escalate privileges beyond what the agent already has
+2. Network policy limits exfiltration targets
+3. `block-push-to-main` hook prevents direct main branch pushes
+4. **Recommendation:** GitHub branch protection rules on main/master are the real safety net (required reviews, no force push). The hook is best-effort; branch protection is server-side
+
+### Volume Data Hygiene
+
+Persistent volumes store Claude session data across ephemeral sandboxes. Risk: stale sessions could contain API responses with secrets from previous builds.
+
+- Session files (`.id`) are pruned after 7 days
+- **Recommendation:** Add volume-level cleanup to entrypoint — delete session data older than 30 days
+- Users can manually purge: `daytona volume delete sodaprompts-<project>`
+
+### OAuth Token Lifetime
+
+`CLAUDE_CODE_OAUTH_TOKEN` is valid for 1 year (Anthropic limitation). Recommend:
+
+- Document annual rotation in onboarding
+- `/sodaprompts-ship status` should warn if token was set >6 months ago (check GitHub secret last-updated timestamp via `gh api`)
+
+---
+
 ## Open Questions
 
 1. **Cost model** — how does Daytona bill? Per sandbox-minute? Per creation? Affects whether parallel sandboxes are practical at scale.

@@ -52,8 +52,6 @@ if [[ -f "${REPO}/.sodaprompts.yml" ]]; then
   BASE_BRANCH=$(grep '^base_branch:' "${REPO}/.sodaprompts.yml" | awk '{print $2}' 2>/dev/null || echo "main")
 fi
 
-ENV_RESET_SIGNAL="${SPRITE_HOME}/env-reset-request.json"
-
 COMPLETIONS_DIR="${SPRITE_HOME}/completions"
 SESSIONS_DIR="${SPRITE_HOME}/sessions"
 mkdir -p "$COMPLETIONS_DIR" "$SESSIONS_DIR"
@@ -81,6 +79,9 @@ sanitize_secrets() {
   fi
   if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
     TEXT="${TEXT//$ANTHROPIC_API_KEY/[REDACTED]}"
+  fi
+  if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+    TEXT="${TEXT//$CLAUDE_CODE_OAUTH_TOKEN/[REDACTED]}"
   fi
   TEXT=$(echo "$TEXT" | sed \
     -e 's/ghp_[A-Za-z0-9_]\{36,\}/[REDACTED]/g' \
@@ -169,116 +170,6 @@ cleanup_repo() {
   done
 
   log "Repo clean"
-}
-
-# ---------------------------------------------------------------------------
-# Repair environment — fix common issues without full checkpoint restore
-# ---------------------------------------------------------------------------
-repair_env() {
-  log "Repairing environment..."
-
-  cd "$REPO"
-
-  # Reinstall dependencies (most common fix)
-  if [[ -f "pnpm-lock.yaml" ]]; then
-    rm -rf node_modules 2>/dev/null || true
-    # Also clear workspace node_modules
-    find . -name "node_modules" -maxdepth 3 -type d -exec rm -rf {} + 2>/dev/null || true
-    pnpm install 2>&1 | tail -5 | tee -a "${LOG_DIR}/builder.log"
-  fi
-
-  # Clear build caches
-  rm -rf .next .turbo dist 2>/dev/null || true
-  find . -name ".next" -maxdepth 3 -type d -exec rm -rf {} + 2>/dev/null || true
-  find . -name ".turbo" -maxdepth 3 -type d -exec rm -rf {} + 2>/dev/null || true
-
-  log "Environment repair complete"
-}
-
-# ---------------------------------------------------------------------------
-# Handle env reset signal — create continuation issue, repair, continue
-# ---------------------------------------------------------------------------
-handle_env_reset() {
-  if [[ ! -f "$ENV_RESET_SIGNAL" ]]; then
-    return 1
-  fi
-
-  log "Environment reset signal detected"
-
-  # Read the signal file
-  local ORIGINAL_ISSUE ORIGINAL_TYPE ORIGINAL_TITLE BRANCH ISSUE_BASE REASON REMAINING CONTEXT
-  ORIGINAL_ISSUE=$(jq -r '.original_issue // ""' "$ENV_RESET_SIGNAL")
-  ORIGINAL_TYPE=$(jq -r '.original_type // "prd"' "$ENV_RESET_SIGNAL")
-  ORIGINAL_TITLE=$(jq -r '.title // "unknown"' "$ENV_RESET_SIGNAL")
-  BRANCH=$(jq -r '.branch // ""' "$ENV_RESET_SIGNAL")
-  ISSUE_BASE=$(jq -r '.base_branch // "main"' "$ENV_RESET_SIGNAL")
-  REASON=$(jq -r '.reason // "environment issue detected"' "$ENV_RESET_SIGNAL")
-  REMAINING=$(jq -r '.remaining_work // "see original issue"' "$ENV_RESET_SIGNAL")
-  CONTEXT=$(jq -r '.context // ""' "$ENV_RESET_SIGNAL")
-
-  # Pause the original issue (not failed — it's resumable)
-  if [[ -n "$ORIGINAL_ISSUE" ]]; then
-    task_transition "$ORIGINAL_ISSUE" "${ORIGINAL_TYPE}-running" "${ORIGINAL_TYPE}-paused"
-    task_comment "$ORIGINAL_ISSUE" "Environment reset needed: ${REASON}. Creating continuation issue."
-  fi
-
-  # Create continuation issue
-  local CONT_TITLE="Continue #${ORIGINAL_ISSUE} — ${ORIGINAL_TITLE} (env reset)"
-  local CONT_LABELS="prd-queued"
-  [[ "$ISSUE_BASE" != "main" ]] && CONT_LABELS="${CONT_LABELS},base:${ISSUE_BASE}"
-
-  local CONT_BODY
-  CONT_BODY=$(cat <<EOF
-## Environment Reset — Continue #${ORIGINAL_ISSUE}
-
-**Original task:** #${ORIGINAL_ISSUE} — ${ORIGINAL_TITLE}
-**Branch:** \`${BRANCH}\` (work pushed before reset)
-**Reset reason:** ${REASON}
-
-### Remaining Work
-${REMAINING}
-
-### Context
-${CONTEXT}
-
----
-
-Pull the existing branch \`${BRANCH}\`, verify it builds and tests pass after
-env repair, then complete the remaining work. When creating the PR, reference
-both issues:
-
-\`\`\`
-Closes #${ORIGINAL_ISSUE}
-\`\`\`
-
-The continuation PR should close both this issue and the original.
-EOF
-)
-
-  local CONT_URL
-  CONT_URL=$(task_create "$CONT_TITLE" "$CONT_BODY" "prd-queued" \
-    "$( [[ "$ISSUE_BASE" != "main" ]] && echo "base:${ISSUE_BASE}" || echo "" )" \
-    2>/dev/null || echo "")
-
-  if [[ -n "$CONT_URL" ]]; then
-    log "Continuation issue created: ${CONT_URL}"
-    notify "Env reset — paused #${ORIGINAL_ISSUE}, continuation: ${CONT_URL}
-Reason: ${REASON}
-Repairing environment and continuing..."
-  else
-    log "Failed to create continuation issue"
-    notify "Env reset signal detected but failed to create continuation issue. Check logs."
-  fi
-
-  # Remove signal file
-  rm -f "$ENV_RESET_SIGNAL"
-
-  # Repair environment
-  cleanup_repo "$BASE_BRANCH"
-  repair_env
-
-  log "Environment reset complete — resuming poll loop"
-  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -420,9 +311,6 @@ After fixing, run the project's test and lint commands to verify."
     fi
   }
 
-  # Check for env reset signal before continuing
-  handle_env_reset && return 0
-
   # Re-request review by adding needs-review label
   gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPO" --add-label "needs-review" 2>/dev/null || true
 
@@ -505,9 +393,6 @@ Run the project's test and lint commands to verify before creating the PR."
       notify "Bug fix #${ISSUE_NUMBER} timed out. Check logs."
     fi
   }
-
-  # Check for env reset signal before continuing
-  handle_env_reset && return 0
 
   # Check if a PR was created (look for it by branch name)
   local PR_URL=""
@@ -600,9 +485,6 @@ CTXEOF
     fi
   }
 
-  # Check for env reset signal before continuing
-  handle_env_reset && return 0
-
   # Read structured completion artifact if the agent wrote one
   local COMPLETION_FILE="${COMPLETIONS_DIR}/${PRD_ID}.json"
   local PR_URL=""
@@ -663,11 +545,6 @@ cleanup_repo
 
 # Prune session files older than 7 days
 find "$SESSIONS_DIR" -name '*.id' -mtime +7 -delete 2>/dev/null || true
-
-# Check if a previous session requested env reset
-if handle_env_reset; then
-  log "Processed env reset from previous session"
-fi
 
 LAST_WORK_EPOCH=$(date +%s)
 

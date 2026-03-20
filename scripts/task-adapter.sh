@@ -25,8 +25,8 @@ TASK_PROVIDER="${TASK_PROVIDER:-github}"
 
 # All valid state labels used by the system
 _ALL_TASK_LABELS=(
-  prd-queued prd-running prd-complete prd-failed prd-paused
-  bug-queued bug-running bug-complete bug-failed bug-paused
+  prd-queued prd-running prd-complete prd-failed
+  bug-queued bug-running bug-complete bug-failed
   needs-review reviewing
   needs-investigation investigating
 )
