@@ -320,6 +320,22 @@ if [[ -f "$REPO_SETTINGS" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 7c. Seal settings.json — prevent agent from modifying hooks or permissions
+# ---------------------------------------------------------------------------
+# With --dangerously-skip-permissions the agent has full bash access and could
+# rewrite ~/.claude/settings.json to remove hooks or the Supabase allowlist.
+# Making the file immutable (chattr +i) prevents this. Only root can undo it,
+# and the agent runs as a regular user.
+if [[ -f "$SETTINGS" ]]; then
+  log "Sealing settings.json (immutable)..."
+  chattr +i "$SETTINGS" 2>/dev/null || {
+    # Fallback for systems without chattr (e.g., some container runtimes)
+    chmod 444 "$SETTINGS"
+    log "chattr not available — using chmod 444 (weaker: agent could chmod back)"
+  }
+fi
+
+# ---------------------------------------------------------------------------
 # 8. Verify .env exists
 # ---------------------------------------------------------------------------
 ENV_FILE="${SPRITE_HOME}/repo/.env"
