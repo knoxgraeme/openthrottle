@@ -541,5 +541,5 @@ These Sprites-specific features have no equivalent and are intentionally dropped
 ## Open Questions
 
 1. **Cost model** — how does Daytona bill? Per sandbox-minute? Per creation? Affects whether parallel sandboxes are practical at scale.
-2. **Network policy in Daytona** — Sprites had L3 DNS-based egress filtering via a REST API. Does Daytona support equivalent network restrictions per sandbox? If not, what's the isolation model?
+2. ~~**Network policy in Daytona**~~ **Resolved:** Daytona supports `network_block_all` (bool) and `network_allow_list` (comma-separated CIDRs) per sandbox at creation time. Replaces Sprites' DNS-based egress filtering. The entrypoint can read `network_policy.allow` from `.sodaprompts.yml` and pass it as `network_allow_list`.
 3. **Sandbox stdout streaming** — for `ship logs` and Telegram `/logs`, can we stream sandbox output in real-time via the Daytona SDK? The Python SDK has `on_data` callbacks — confirm this works for our runner script output.
