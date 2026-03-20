@@ -51,7 +51,7 @@ Every task gets a fresh sandbox. No stop/start, no cleanup scripts, no stale sta
 ```
 Issue labeled prd-queued
   → GitHub Action fires
-  → Daytona SDK: create sandbox from snapshot (ephemeral: true, env_vars: {...})
+  → Daytona SDK: create sandbox from image (ephemeral: true, envVars: {...})
   → Entrypoint: clone repo, pnpm install, wire up config from .sodaprompts.yml
   → Builder implements, opens PR
   → Reviewer reviews (same sandbox, different skill)
@@ -62,12 +62,12 @@ Issue labeled prd-queued
 
 This is how Daytona is designed to be used — sub-90ms sandbox creation from snapshots, fully stateless, spin up and throw away.
 
-**Lifecycle parameters:**
+**Lifecycle parameters** (TS SDK — `@daytonaio/sdk`):
 
-- `auto_stop_interval=60` — Daytona's auto-stop fires based on SDK interaction, **not** internal process activity. A long Claude Code session (LLM inference + file writes) won't keep the sandbox alive unless the GitHub Action's SDK client maintains a heartbeat. 60 minutes provides enough headroom for complex builds without risking orphaned sandboxes.
-- `auto_delete_interval=60` — fallback cleanup if `ephemeral=True` misses (e.g., sandbox stuck in stopped state). Sandbox is deleted 60 minutes after stopping.
-- `resources=Resources(cpu=2, memory=4, disk=10)` — defaults (1 vCPU, 1GB RAM, 3GB disk) are too small for Claude Code + Node.js + pnpm install. 2 vCPU / 4GB RAM / 10GB disk handles typical builds. Max per Daytona org: 4 vCPU, 8GB RAM, 10GB disk.
-- `labels` — key-value metadata for auditing, orphan cleanup (`daytona sandbox list --label project=myrepo`), and cost attribution.
+- `autoStopInterval: 60` — Daytona's auto-stop fires based on SDK interaction, **not** internal process activity. A long Claude Code session (LLM inference + file writes) won't keep the sandbox alive unless the GitHub Action's SDK client maintains a heartbeat. 60 minutes provides enough headroom for complex builds without risking orphaned sandboxes.
+- `autoDeleteInterval: 60` — fallback cleanup if `ephemeral: true` misses (e.g., sandbox stuck in stopped state). Sandbox is deleted 60 minutes after stopping.
+- `resources: { cpu: 2, memory: 4, disk: 10 }` — defaults (1 vCPU, 1GB RAM, 3GB disk) are too small for Claude Code + Node.js + pnpm install. 2 vCPU / 4GB RAM / 10GB disk handles typical builds. Max per Daytona org: 4 vCPU, 8GB RAM, 10GB disk. **Note:** `resources` is only available on `CreateSandboxFromImageParams`, not `CreateSandboxFromSnapshotParams`.
+- `labels` — key-value `Record<string, string>` for auditing, orphan cleanup, and cost attribution.
 
 ### Persistent Volume (session continuity + logs)
 
@@ -76,25 +76,25 @@ Each project gets a **Daytona Volume** mounted to every sandbox. The volume pers
 - **Claude session data** (`~/.claude/projects/`) — enables `--resume` across ephemeral sandboxes
 - **Command logs** (`~/.claude/logs/`) — sanitized bash command history from `log-commands.sh` hook
 
-```python
-sandbox = daytona.create(CreateSandboxFromSnapshotParams(
-    snapshot='sodaprompts-doer',
-    ephemeral=True,
-    auto_stop_interval=60,          # stop after 60min idle (safety net)
-    auto_delete_interval=60,        # delete 60min after stop (fallback if ephemeral misses)
-    resources=Resources(cpu=2, memory=4, disk=10),  # 2 vCPU, 4GB RAM, 10GB disk
-    volumes=[VolumeMount(
-        volume_id='sodaprompts-myproject',
-        mount_path='/home/daytona/.claude'
-    )],
-    labels={
-        'project': repo_name,
-        'task_type': task_type,       # prd | bug | review-fix
-        'issue': str(issue_number),
-    },
-    env_vars={...}
-))
+```typescript
+const sandbox = await daytona.create({
+  image: 'ghcr.io/sodaprompts/doer-claude:node-1.0.0',
+  user: 'daytona',               // run agent as non-root (entrypoint sets chattr +i as root first)
+  ephemeral: true,
+  autoStopInterval: 60,          // stop after 60min idle (safety net)
+  autoDeleteInterval: 60,        // delete 60min after stop (fallback if ephemeral misses)
+  resources: { cpu: 2, memory: 4, disk: 10 },  // 2 vCPU, 4GB RAM, 10GB disk
+  volumes: [{ volumeId: 'sodaprompts-myproject', mountPath: '/home/daytona/.claude' }],
+  labels: {
+    project: repoName,
+    taskType: taskType,           // prd | bug | review-fix
+    issue: String(issueNumber),
+  },
+  envVars: { ... },
+} satisfies CreateSandboxFromImageParams)
 ```
+
+> **Why `image` instead of `snapshot`?** The TS SDK's `CreateSandboxFromSnapshotParams` does not support the `resources` field — only `CreateSandboxFromImageParams` does. Since we need to control CPU/RAM/disk, we reference the GHCR image directly. Daytona caches pulled images, so subsequent creates are still fast.
 
 #### `--resume` for review fix cycles
 
@@ -139,7 +139,7 @@ One Docker image per agent runtime, published on GHCR. Pre-installed:
 - Default MCP servers: Telegram, Context7
 
 **Not in the image** (provided by Daytona platform):
-- Chromium, xvfb, display server → Daytona Computer Use API (`sandbox.computer_use.start()`)
+- Chromium, xvfb, display server → Daytona Computer Use API (`sandbox.computerUse.start()`)
 - agent-browser → replaced by Daytona's native mouse/keyboard/screenshot APIs
 - Playwright → optional, installed via `post_bootstrap` if project needs browser tests
 
@@ -158,7 +158,7 @@ Published as:
 ghcr.io/sodaprompts/doer-claude:node-1.0.0
 ```
 
-Users create a Daytona snapshot in their account pointing to this image. The scaffolder does this automatically via the Daytona SDK.
+The wake workflow references this image directly via `CreateSandboxFromImageParams`. No pre-created Daytona snapshot needed — Daytona pulls and caches the image on first use.
 
 **Constraint:** Daytona does not allow `latest`/`lts`/`stable` tags — must use explicit versions (e.g., `node-1.0.0`).
 
@@ -207,37 +207,38 @@ Claude Code picks up credentials in this order:
 ```
 GitHub Secrets (storage)
   → GitHub Action (reads them)
-    → Daytona SDK call (passes as env_vars at sandbox creation)
+    → Daytona SDK call (passes as envVars at sandbox creation)
       → Sandbox (born with them in environment)
         → Claude Code picks up auth token automatically
 ```
 
-Daytona is the runtime, not the secrets store. Secrets live in GitHub, get injected at sandbox creation time via `env_vars` parameter:
+Daytona is the runtime, not the secrets store. Secrets live in GitHub, get injected at sandbox creation time via `envVars` parameter:
 
-```python
-sandbox = daytona.create(CreateSandboxFromSnapshotParams(
-    snapshot='sodaprompts-doer',
-    ephemeral=True,               # auto-delete when sandbox stops
-    auto_stop_interval=60,        # stop after 60min idle (safety net)
-    auto_delete_interval=60,      # delete 60min after stop (fallback cleanup)
-    resources=Resources(cpu=2, memory=4, disk=10),  # 2 vCPU, 4GB RAM, 10GB disk
-    volumes=[VolumeMount(
-        volume_id='sodaprompts-myproject',
-        mount_path='/home/daytona/.claude'  # sessions + logs persist
-    )],
-    labels={
-        'project': repo_name,       # for auditing and orphan cleanup
-        'task_type': task_type,     # prd | bug | review-fix
-        'issue': str(issue_number),
-    },
-    env_vars={
-        'CLAUDE_CODE_OAUTH_TOKEN': '...',  # or ANTHROPIC_API_KEY
-        'GITHUB_TOKEN': '...',
-        'TELEGRAM_BOT_TOKEN': '...',
-        'TELEGRAM_CHAT_ID': '...',
-        'RESUME_SESSION': '...',   # session ID from previous build (if review fix)
-    }
-))
+```typescript
+const sandbox = await daytona.create({
+  image: 'ghcr.io/sodaprompts/doer-claude:node-1.0.0',
+  user: 'daytona',                // run agent as non-root
+  ephemeral: true,                // auto-delete when sandbox stops
+  autoStopInterval: 60,           // stop after 60min idle (safety net)
+  autoDeleteInterval: 60,         // delete 60min after stop (fallback cleanup)
+  resources: { cpu: 2, memory: 4, disk: 10 },  // 2 vCPU, 4GB RAM, 10GB disk
+  volumes: [{
+    volumeId: 'sodaprompts-myproject',
+    mountPath: '/home/daytona/.claude',  // sessions + logs persist
+  }],
+  labels: {
+    project: repoName,              // for auditing and orphan cleanup
+    taskType: taskType,             // prd | bug | review-fix
+    issue: String(issueNumber),
+  },
+  envVars: {
+    CLAUDE_CODE_OAUTH_TOKEN: '...', // or ANTHROPIC_API_KEY
+    GITHUB_TOKEN: '...',
+    TELEGRAM_BOT_TOKEN: '...',
+    TELEGRAM_CHAT_ID: '...',
+    RESUME_SESSION: '...',          // session ID from previous build (if review fix)
+  },
+} satisfies CreateSandboxFromImageParams)
 ```
 
 ---
@@ -275,7 +276,7 @@ post_bootstrap:
 
 # Agent & runtime
 agent: claude                    # claude | codex | aider
-snapshot: ghcr.io/sodaprompts/doer-claude:node-1.0.0
+image: ghcr.io/sodaprompts/doer-claude:node-1.0.0
 
 # Notifications
 notifications: telegram
@@ -301,7 +302,7 @@ review:
 The entrypoint replaces the 400-line `bootstrap.sh`. Most of that was installing packages — now baked into the snapshot. What remains (~50 lines):
 
 ```
-1. Start Daytona Computer Use (sandbox.computer_use.start() — Xvfb, xfce4, display)
+1. Start Daytona Computer Use (sandbox.computerUse.start() — Xvfb, xfce4, display)
 2. gh repo clone $GITHUB_REPO
 3. Read .sodaprompts.yml
 4. Run post_bootstrap (pnpm install, playwright install if needed, etc.)
@@ -324,7 +325,6 @@ The entrypoint replaces the 400-line `bootstrap.sh`. Most of that was installing
 | Install GitHub CLI | Baked into snapshot |
 | Install Claude Code | Baked into snapshot |
 | Install sodaprompts plugin | Baked into snapshot |
-| Install agent-browser + Playwright | Baked into snapshot |
 | Install Telegram MCP | Baked into snapshot |
 | Clone repo | Entrypoint (runtime) |
 | Run post_bootstrap | Entrypoint (runtime) |
@@ -380,8 +380,8 @@ jobs:
         env:
           DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
         run: |
-          # Read snapshot from .sodaprompts.yml
-          SNAPSHOT=$(yq '.snapshot' .sodaprompts.yml)
+          # Read image from .sodaprompts.yml
+          IMAGE=$(yq '.image' .sodaprompts.yml)
 
           # For review fixes: extract session ID from PR comments
           RESUME_SESSION=""
@@ -404,7 +404,7 @@ jobs:
           # Create ephemeral sandbox with volume for session continuity
           # --ephemeral auto-deletes sandbox when it stops
           daytona sandbox create \
-            --snapshot "$SNAPSHOT" \
+            --image "$IMAGE" \
             --ephemeral \
             --auto-stop-interval 60 \
             --auto-delete-interval 60 \
@@ -441,8 +441,7 @@ When `RESUME_SESSION` is set, the entrypoint runs `claude --resume $RESUME_SESSI
    - Notification provider (telegram / none)
 3. Generates `.sodaprompts.yml`
 4. Copies `.github/workflows/wake-sandbox.yml` into the repo
-5. Creates Daytona snapshot in user's account (via SDK, needs `DAYTONA_API_KEY`)
-6. Creates Daytona volume for session data + logs (`sodaprompts-<project-name>`)
+5. Creates Daytona volume for session data + logs (`sodaprompts-<project-name>`)
 6. Prints next steps (set GitHub secrets, commit, push)
 
 ### Implementation
@@ -451,7 +450,7 @@ When `RESUME_SESSION` is set, the entrypoint runs `claude --resume $RESUME_SESSI
 - Published as `@sodaprompts/create-sodaprompts` on npm
 - Uses `prompts` (or similar) for interactive questions
 - Zero dependencies on any agent CLI
-- Requires `DAYTONA_API_KEY` env var for snapshot creation
+- Requires `DAYTONA_API_KEY` env var for volume creation
 
 ### Three Onboarding Tiers
 
@@ -472,7 +471,7 @@ When `RESUME_SESSION` is set, the entrypoint runs `claude --resume $RESUME_SESSI
    → detects package.json, prompts for commands
    → generates .sodaprompts.yml
    → copies .github/workflows/wake-sandbox.yml
-   → creates Daytona snapshot via SDK (needs DAYTONA_API_KEY)
+   → creates Daytona volume via SDK (needs DAYTONA_API_KEY)
 
 2. Auth (choose one):
    a) API key:      get ANTHROPIC_API_KEY from console.anthropic.com
@@ -499,7 +498,7 @@ When `RESUME_SESSION` is set, the entrypoint runs `claude --resume $RESUME_SESSI
    (or from Claude: /sodaprompts-ship docs/prds/search.md)
 
 6. GitHub Action fires:
-   → creates ephemeral Daytona sandbox from snapshot
+   → creates ephemeral Daytona sandbox from image
    → entrypoint: clone, pnpm install, wire .sodaprompts.yml config
    → builder implements, opens PR
    → reviewer reviews (same sandbox)
@@ -564,7 +563,7 @@ Two changes:
 **Simplify.** Current 12-step flow becomes ~3 steps:
 
 1. Read `.sodaprompts.yml`
-2. Create Daytona sandbox from snapshot (with env vars)
+2. Create Daytona sandbox from image (with env vars)
 3. Print summary
 
 Steps that disappear: locate plugin, upload files, push env, run bootstrap, checkpoint.
@@ -622,7 +621,7 @@ Changes to `log-commands.sh`:
 ### Phase 1: Scaffolder
 
 - Build and publish `npx create-sodaprompts` (TS-only)
-- Update `.sodaprompts.yml` schema with new fields (`agent`, `snapshot`, `review`)
+- Update `.sodaprompts.yml` schema with new fields (`agent`, `image`, `review`)
 - Keep Sprites as the runtime — scaffolder just generates config
 - Claude plugin still works, now optional for onboarding
 
@@ -653,8 +652,8 @@ Changes to `log-commands.sh`:
 
 | Capability | Status |
 |---|---|
-| Create snapshot from Docker image/Dockerfile | Available |
-| Create sandbox from snapshot | Available |
+| Create sandbox from OCI image (`CreateSandboxFromImageParams`) | Available |
+| Create sandbox from snapshot (`CreateSandboxFromSnapshotParams`) | Available (no `resources` field — use image-based creation instead) |
 | Pass env vars at sandbox creation | Available |
 | Stop/start sandbox (filesystem persisted) | Available |
 | Archive/restore sandbox (cold storage) | Available |
@@ -726,10 +725,10 @@ The system runs with `--dangerously-skip-permissions` — the agent has unrestri
 | Layer | What it prevents | Enforced by | Can agent bypass? |
 |---|---|---|---|
 | **GitHub branch protection** | Push to main, force push, merge without review | GitHub server | No — server-side, outside sandbox |
-| **Sealed settings.json** | Removing hooks or MCP allowlists | `chattr +i` (immutable flag) | No — requires root, agent runs as regular user |
+| **Sealed settings.json** | Removing hooks or MCP allowlists | `chattr +i` (immutable flag) | No — entrypoint sets immutable as root, then drops to `daytona` user before starting agent |
 | **Supabase MCP allowlist** | SQL execution, migrations, deploys, branch merging | Claude Code permissions system | No — tools not invocable |
 | **Fine-grained PAT** | Repo deletion, org access, secret modification | GitHub token scope | No — token doesn't have the permissions |
-| **Network policy** | Data exfiltration to arbitrary domains | Daytona/Sprites platform | No — network-level enforcement |
+| **Network policy** | Data exfiltration to arbitrary domains | Daytona platform (Tier 3+ required) | No — network-level enforcement |
 | **Ephemeral sandbox** | Persistent damage to infrastructure | Daytona auto-delete | N/A — cleanup, not prevention |
 | **PreToolUse hooks** | Push to main, force push, settings tampering | Claude Code hook system | Difficult — settings sealed, hook checks multiple evasion patterns |
 | **Secret sanitization** | Token leakage in logs/comments | `sanitize_secrets()` + `log-commands.sh` | Partial — covers command strings, not all stdout |
@@ -766,6 +765,7 @@ Bootstrap makes `~/.claude/settings.json` immutable after configuring hooks and 
 
 ```bash
 chattr +i ~/.claude/settings.json   # Linux immutable flag — only root can undo
+# Entrypoint then drops to `daytona` user via `su` or `gosu` before starting agent
 ```
 
 This prevents the agent from:
@@ -876,4 +876,4 @@ Persistent volumes store Claude session data across ephemeral sandboxes. Risk: s
 
 1. **Cost model** — how does Daytona bill? Per sandbox-minute? Per creation? Affects whether parallel sandboxes are practical at scale.
 2. ~~**Network policy in Daytona**~~ **Resolved:** Daytona's essential services list (npm, GitHub, Anthropic, Supabase, etc.) covers our needs. We use default network policy — no `networkBlockAll` or custom `networkAllowList`. MCP servers need open web access, and the agent needs it for research. Exfiltration risk is mitigated by fine-grained PATs, secret sanitization, and ephemeral sandboxes.
-3. **Sandbox stdout streaming** — for `ship logs` and Telegram `/logs`, can we stream sandbox output in real-time via the Daytona SDK? The Python SDK has `on_data` callbacks — confirm this works for our runner script output.
+3. **Sandbox stdout streaming** — for `ship logs` and Telegram `/logs`, can we stream sandbox output in real-time via the Daytona SDK? The TS SDK's `process.exec()` supports streaming — confirm this works for our runner script output.
