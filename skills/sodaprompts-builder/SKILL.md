@@ -126,9 +126,9 @@ need to tell the user during your session.
 If a Supabase MCP is available, you can use database branches for isolated
 DB work. Branches are separate Postgres instances — they cannot affect production.
 
-**Only create a branch when you need to test against a real database** (running
-migrations, verifying RLS policies, testing queries against schema). Most PRs
-don't need one. Branches are billed per hour — keep them short-lived.
+**Only create a branch when you need to test against a real database** (verifying
+RLS policies, testing queries against schema, running integration tests). Most
+PRs don't need one. Branches are billed per hour — keep them short-lived.
 
 ### Lifecycle
 
@@ -138,11 +138,18 @@ don't need one. Branches are billed per hour — keep them short-lived.
    the session. Write your migration files and code first. When you need to test
    against a real DB:
    - Create a branch named `sodaprompts-${PRD_ID}`
-   - Run `supabase db push` to apply migrations to the branch
    - Use the branch connection string as `DATABASE_URL` for tests
+   - The branch mirrors production schema — do NOT run migrations on it
 3. **Eager cleanup (immediately after testing):** Delete the branch as soon as
    tests pass. Do not leave it running while you continue coding. If you need
    the DB again later, create a new branch — creation is fast.
+
+### Migrations
+
+**You do not run migrations.** Write migration files (SQL, Drizzle, Prisma, etc.)
+and include them in the PR. The project owner runs `supabase db push` or their
+own migration command after merging. The branch exists only to test against the
+current production schema — not to apply changes to it.
 
 ### Safety
 
@@ -153,8 +160,7 @@ Supabase MCP tools use an **allowlist** — only these tools are permitted:
 - `get_project_url`, `search_docs`, `get_logs` — reference and debugging
 
 All other Supabase MCP tools (including `execute_sql`, `apply_migration`,
-`deploy_edge_function`, `merge_branch`) are blocked. Use the project's own
-CLI/ORM for migrations and SQL — never Supabase MCP tools directly.
+`deploy_edge_function`, `merge_branch`) are blocked.
 
 ---
 

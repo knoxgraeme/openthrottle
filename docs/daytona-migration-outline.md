@@ -641,17 +641,18 @@ Supabase is **not set up for every project** — only when the user configures `
 
 ### How It Works
 
-Supabase branches are separate Postgres instances. The agent uses them for **testing only** — not as a persistent dev environment. Branches are billed per hour, so the lifecycle is designed to minimize uptime:
+Supabase branches are separate Postgres instances. The agent uses them for **testing against the current production schema** — not to run migrations or modify schema. Branches are billed per hour, so the lifecycle is designed to minimize uptime:
 
 ```
 1. Agent writes migration files and code (no branch yet)
 2. Agent needs to test → create_branch("sodaprompts-prd-42")
-3. Agent runs: supabase db push (applies migrations to branch)
-4. Agent runs tests against branch connection string
-5. Tests pass → delete_branch("sodaprompts-prd-42") immediately
-6. Agent continues coding (branch is gone)
-7. If needed again later → create a new branch (fast, <30s)
+3. Agent runs tests against branch connection string (mirrors prod schema)
+4. Tests pass → delete_branch("sodaprompts-prd-42") immediately
+5. Agent continues coding (branch is gone)
+6. If needed again later → create a new branch (fast, <30s)
 ```
+
+The agent **never runs migrations**. It writes migration files and includes them in the PR. The project owner runs `supabase db push` (or their own migration command) after merging.
 
 ### Tool Allowlist
 
@@ -668,14 +669,6 @@ Only these Supabase MCP tools are permitted (allowlist, not denylist):
 | `get_project_url`, `search_docs`, `get_logs` | Reference |
 
 Blocked: `execute_sql`, `apply_migration`, `deploy_edge_function`, `merge_branch`, and any future tools added to the Supabase MCP.
-
-### Migrations
-
-Use the project's own migration tooling, not Supabase MCP:
-
-- `supabase db push` — applies migrations to the branch
-- Project commands (`pnpm db:migrate`, etc.) — ORM-specific migrations
-- Never `apply_migration` via MCP — that bypasses version control
 
 ### Orphan Cleanup
 

@@ -151,7 +151,7 @@ mcp_servers:
       SUPABASE_ACCESS_TOKEN: from-env
 ```
 
-**Supabase safety:** When a Supabase MCP is detected, bootstrap applies a tool **allowlist** — only safe operations are permitted (branch management, read-only introspection, docs). Tools like `execute_sql`, `apply_migration`, `deploy_edge_function`, and `merge_branch` are blocked. The agent creates short-lived Supabase branches on demand for testing, runs `supabase db push` for migrations, and destroys branches immediately after. Production is untouchable.
+**Supabase safety:** When a Supabase MCP is detected, bootstrap applies a tool **allowlist** — only safe operations are permitted (branch management, read-only introspection, docs). Tools like `execute_sql`, `apply_migration`, `deploy_edge_function`, and `merge_branch` are blocked. The agent creates short-lived Supabase branches on demand to test against the current production schema, then destroys them immediately. It never runs migrations — it writes migration files and includes them in the PR for the owner to apply.
 
 ## What the Sprites get
 
