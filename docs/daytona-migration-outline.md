@@ -62,6 +62,13 @@ Issue labeled prd-queued
 
 This is how Daytona is designed to be used — sub-90ms sandbox creation from snapshots, fully stateless, spin up and throw away.
 
+**Lifecycle parameters:**
+
+- `auto_stop_interval=60` — Daytona's auto-stop fires based on SDK interaction, **not** internal process activity. A long Claude Code session (LLM inference + file writes) won't keep the sandbox alive unless the GitHub Action's SDK client maintains a heartbeat. 60 minutes provides enough headroom for complex builds without risking orphaned sandboxes.
+- `auto_delete_interval=60` — fallback cleanup if `ephemeral=True` misses (e.g., sandbox stuck in stopped state). Sandbox is deleted 60 minutes after stopping.
+- `resources=Resources(cpu=2, memory=4, disk=10)` — defaults (1 vCPU, 1GB RAM, 3GB disk) are too small for Claude Code + Node.js + pnpm install. 2 vCPU / 4GB RAM / 10GB disk handles typical builds. Max per Daytona org: 4 vCPU, 8GB RAM, 10GB disk.
+- `labels` — key-value metadata for auditing, orphan cleanup (`daytona sandbox list --label project=myrepo`), and cost attribution.
+
 ### Persistent Volume (session continuity + logs)
 
 Each project gets a **Daytona Volume** mounted to every sandbox. The volume persists across sandbox lifetimes (free, no storage quota impact). It stores:
@@ -73,10 +80,18 @@ Each project gets a **Daytona Volume** mounted to every sandbox. The volume pers
 sandbox = daytona.create(CreateSandboxFromSnapshotParams(
     snapshot='sodaprompts-doer',
     ephemeral=True,
+    auto_stop_interval=60,          # stop after 60min idle (safety net)
+    auto_delete_interval=60,        # delete 60min after stop (fallback if ephemeral misses)
+    resources=Resources(cpu=2, memory=4, disk=10),  # 2 vCPU, 4GB RAM, 10GB disk
     volumes=[VolumeMount(
         volume_id='sodaprompts-myproject',
         mount_path='/home/daytona/.claude'
     )],
+    labels={
+        'project': repo_name,
+        'task_type': task_type,       # prd | bug | review-fix
+        'issue': str(issue_number),
+    },
     env_vars={...}
 ))
 ```
@@ -203,11 +218,18 @@ Daytona is the runtime, not the secrets store. Secrets live in GitHub, get injec
 sandbox = daytona.create(CreateSandboxFromSnapshotParams(
     snapshot='sodaprompts-doer',
     ephemeral=True,               # auto-delete when sandbox stops
-    auto_stop_interval=30,        # stop after 30min idle (safety net)
+    auto_stop_interval=60,        # stop after 60min idle (safety net)
+    auto_delete_interval=60,      # delete 60min after stop (fallback cleanup)
+    resources=Resources(cpu=2, memory=4, disk=10),  # 2 vCPU, 4GB RAM, 10GB disk
     volumes=[VolumeMount(
         volume_id='sodaprompts-myproject',
         mount_path='/home/daytona/.claude'  # sessions + logs persist
     )],
+    labels={
+        'project': repo_name,       # for auditing and orphan cleanup
+        'task_type': task_type,     # prd | bug | review-fix
+        'issue': str(issue_number),
+    },
     env_vars={
         'CLAUDE_CODE_OAUTH_TOKEN': '...',  # or ANTHROPIC_API_KEY
         'GITHUB_TOKEN': '...',
@@ -370,11 +392,26 @@ jobs:
               | grep -oP 'session-id: \K\S+' | tail -1)
           fi
 
+          # Determine task type for labeling
+          TASK_TYPE="prd"
+          if [[ "${{ github.event.label.name }}" == "bug-queued" ]]; then
+            TASK_TYPE="bug"
+          elif [[ "${{ github.event.review.state }}" == "changes_requested" ]]; then
+            TASK_TYPE="review-fix"
+          fi
+          WORK_ITEM="${{ github.event.issue.number || github.event.pull_request.number }}"
+
           # Create ephemeral sandbox with volume for session continuity
           # --ephemeral auto-deletes sandbox when it stops
           daytona sandbox create \
             --snapshot "$SNAPSHOT" \
             --ephemeral \
+            --auto-stop-interval 60 \
+            --auto-delete-interval 60 \
+            --cpu 2 --memory 4 --disk 10 \
+            --label project=${{ github.event.repository.name }} \
+            --label task_type="$TASK_TYPE" \
+            --label issue="$WORK_ITEM" \
             --volume sodaprompts-${{ github.repository_id }}:/home/daytona/.claude \
             --env GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }} \
             --env GITHUB_REPO=${{ github.repository }} \
@@ -382,7 +419,7 @@ jobs:
             --env CLAUDE_CODE_OAUTH_TOKEN=${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }} \
             --env TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }} \
             --env TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }} \
-            --env WORK_ITEM=${{ github.event.issue.number || github.event.pull_request.number }} \
+            --env WORK_ITEM="$WORK_ITEM" \
             --env RESUME_SESSION="$RESUME_SESSION"
 ```
 
@@ -765,7 +802,9 @@ OUTPUT=$(daytona sandbox create ... 2>&1) || {
 
 ### Network Policy
 
-Daytona provides two network controls: `networkBlockAll` (blocks everything) and `networkAllowList` (up to 10 IPv4 CIDRs, no domains). Regardless of either setting, Daytona always allows "essential services":
+**Tier requirement:** Daytona Tiers 1-2 have restricted network access that **cannot be overridden** at the sandbox level. Tiers 3-4 have full internet access with configurable firewall. Since sodaprompts needs MCP access (Context7, Telegram) and open web for research, **Tier 3+ is required** for production use. Document this as a prerequisite in onboarding.
+
+Daytona provides two network controls: `networkBlockAll` (blocks everything) and `networkAllowList` (up to 5 IPv4 CIDRs, no domains). Regardless of either setting, Daytona always allows "essential services":
 
 - **Package managers:** npm, PyPI, Maven, apt
 - **Git hosting:** GitHub, GitLab, Bitbucket
@@ -776,7 +815,7 @@ Daytona provides two network controls: `networkBlockAll` (blocks everything) and
 This covers everything sodaprompts needs for core operations. We use **Daytona's default network policy** (no `networkBlockAll`, no custom `networkAllowList`) because:
 
 1. `networkBlockAll` would break MCP servers that call external APIs (Context7 → `mcp.context7.com`, Telegram → `api.telegram.org`)
-2. `networkAllowList` is limited to 10 IPv4 CIDRs — too few and too fragile (IPs change) for MCP endpoints
+2. `networkAllowList` is limited to 5 IPv4 CIDRs — too few and too fragile (IPs change) for MCP endpoints
 3. The essential services list already covers the high-value targets (npm, GitHub, Anthropic, Supabase)
 4. The agent needs open web access for research (reading docs, Stack Overflow, API references). Claude Code's `WebFetch` and `WebSearch` tools are read-only — they can't POST data or exfiltrate secrets via HTTP.
 
