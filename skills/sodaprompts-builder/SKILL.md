@@ -126,29 +126,35 @@ need to tell the user during your session.
 If a Supabase MCP is available, you can use database branches for isolated
 DB work. Branches are separate Postgres instances — they cannot affect production.
 
-**Only create a branch if the prompt requires database work** (migrations, RLS
-policies, schema changes, queries against real schema). Most PRs don't need one.
+**Only create a branch when you need to test against a real database** (running
+migrations, verifying RLS policies, testing queries against schema). Most PRs
+don't need one. Branches are billed per hour — keep them short-lived.
 
 ### Lifecycle
 
 1. **Orphan cleanup (every session start):** List branches and delete any with
    the `sodaprompts-` prefix left over from crashed sessions. Listing is free.
-2. **Lazy creation (during work):** If you need a DB, create a branch named
-   `sodaprompts-${PRD_ID}`. Use its connection string as `DATABASE_URL` for all
-   database operations. Run migrations with the project's own command (e.g.
-   `pnpm db:migrate`).
-3. **Eager cleanup (session end):** Delete the branch before finishing. Always.
+2. **Lazy creation (only when testing):** Don't create a branch at the start of
+   the session. Write your migration files and code first. When you need to test
+   against a real DB:
+   - Create a branch named `sodaprompts-${PRD_ID}`
+   - Run `supabase db push` to apply migrations to the branch
+   - Use the branch connection string as `DATABASE_URL` for tests
+3. **Eager cleanup (immediately after testing):** Delete the branch as soon as
+   tests pass. Do not leave it running while you continue coding. If you need
+   the DB again later, create a new branch — creation is fast.
 
 ### Safety
 
-The following Supabase MCP tools are **denied** — you cannot use them:
-- `execute_sql` — use the project's own CLI/ORM instead
-- `apply_migration` — use the project's migration command instead
-- `deploy_edge_function` — no production deploys
-- `merge_branch` — never merge a branch into production DB
+Supabase MCP tools use an **allowlist** — only these tools are permitted:
 
-You CAN use: `create_branch`, `delete_branch`, `list_branches`, `reset_branch`,
-`list_tables`, `list_migrations`, `get_project_url`, `search_docs`, etc.
+- `list_tables`, `list_migrations`, `get_schemas` — read-only introspection
+- `create_branch`, `delete_branch`, `list_branches`, `reset_branch` — branch management
+- `get_project_url`, `search_docs`, `get_logs` — reference and debugging
+
+All other Supabase MCP tools (including `execute_sql`, `apply_migration`,
+`deploy_edge_function`, `merge_branch`) are blocked. Use the project's own
+CLI/ORM for migrations and SQL — never Supabase MCP tools directly.
 
 ---
 

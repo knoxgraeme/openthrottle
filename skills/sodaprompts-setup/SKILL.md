@@ -106,7 +106,7 @@ Show the user which MCPs were found and ask which ones the sprite should have.
 
 | MCP | Why the sprite might need it |
 |---|---|
-| Supabase | If the agent needs to work with the database. **Auto-scoped for safety:** bootstrap denies `execute_sql`, `apply_migration`, `deploy_edge_function`, and `merge_branch`. The agent uses Supabase branches for isolated DB work and runs migrations via the project's own commands. |
+| Supabase | If the agent needs to work with the database. **Auto-scoped for safety:** bootstrap applies a tool allowlist — only branch management and read-only operations are permitted. The agent creates short-lived Supabase branches on demand for testing, runs `supabase db push` for migrations, and destroys branches immediately after. |
 | PostHog | If the agent needs analytics context |
 
 **Always included (no config needed):** Telegram (notifications), Context7

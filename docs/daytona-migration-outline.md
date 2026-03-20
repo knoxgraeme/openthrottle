@@ -229,7 +229,7 @@ The published snapshot is generic — it has tools but no project knowledge. Eve
 | **Build commands** | `test`, `build`, `lint`, `format`, `dev` | Wired into Claude's Stop hooks (lint + test before session exit), auto-format hook |
 | **Post-bootstrap** | `post_bootstrap` | Runs `pnpm install`, DB migrations, etc. after clone |
 | **MCP servers** | `mcp_servers` | Merged into `~/.claude/settings.json`; `"from-env"` placeholders resolved from env vars |
-| **Supabase safety** | Auto-detected from `mcp_servers.supabase` | Denies `execute_sql`, `apply_migration`, `deploy_edge_function`, `merge_branch` in permissions |
+| **Supabase safety** | Auto-detected from `mcp_servers.supabase` | Applies tool **allowlist** — only branch management and read-only operations permitted. All other tools (execute_sql, apply_migration, deploy_edge_function, merge_branch) blocked. |
 | **Network policy** | `network_policy.allow` | Domain allowlist + auto-appended deny-all. Always includes github, anthropic, npm, telegram |
 | **Hooks** | Baked into snapshot, configured at boot | `block-push-to-main`, `log-commands` (secret sanitization), `auto-format` |
 | **Base branch** | `base_branch` | Which branch to fork from and PR into |
@@ -295,7 +295,7 @@ The entrypoint replaces the 400-line `bootstrap.sh`. Most of that was installing
    - Resolve "from-env" placeholders in MCP config
    - Register hooks (block-push-to-main, log-commands, auto-format)
    - Wire lint + test into Stop hooks
-   - If supabase MCP detected: add permission denials
+   - If supabase MCP detected: apply tool allowlist
 6. Nullify repo-level .claude/settings.json (sandbox-only hooks apply)
 7. Detect work item type from GitHub (issue label / PR state)
 8. Run builder or reviewer skill accordingly
@@ -634,6 +634,54 @@ Changes to `log-commands.sh`:
 | Fork filesystem + memory state | Coming soon |
 
 We don't need #2519 or #2528 — the ephemeral model with `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` as env vars avoids the need for persistent sandbox state entirely.
+
+## Database Strategy — Supabase Branching
+
+Supabase is **not set up for every project** — only when the user configures `mcp_servers.supabase` in `.sodaprompts.yml`. Auto-detected at boot and scoped via tool allowlist.
+
+### How It Works
+
+Supabase branches are separate Postgres instances. The agent uses them for **testing only** — not as a persistent dev environment. Branches are billed per hour, so the lifecycle is designed to minimize uptime:
+
+```
+1. Agent writes migration files and code (no branch yet)
+2. Agent needs to test → create_branch("sodaprompts-prd-42")
+3. Agent runs: supabase db push (applies migrations to branch)
+4. Agent runs tests against branch connection string
+5. Tests pass → delete_branch("sodaprompts-prd-42") immediately
+6. Agent continues coding (branch is gone)
+7. If needed again later → create a new branch (fast, <30s)
+```
+
+### Tool Allowlist
+
+Only these Supabase MCP tools are permitted (allowlist, not denylist):
+
+| Tool | Purpose |
+|---|---|
+| `create_branch` | Spin up isolated DB for testing |
+| `delete_branch` | Tear down after testing |
+| `list_branches` | Orphan cleanup on session start |
+| `reset_branch` | Reset branch to clean state |
+| `list_tables`, `get_schemas` | Read-only introspection |
+| `list_migrations` | Check migration state |
+| `get_project_url`, `search_docs`, `get_logs` | Reference |
+
+Blocked: `execute_sql`, `apply_migration`, `deploy_edge_function`, `merge_branch`, and any future tools added to the Supabase MCP.
+
+### Migrations
+
+Use the project's own migration tooling, not Supabase MCP:
+
+- `supabase db push` — applies migrations to the branch
+- Project commands (`pnpm db:migrate`, etc.) — ORM-specific migrations
+- Never `apply_migration` via MCP — that bypasses version control
+
+### Orphan Cleanup
+
+On session start, the builder skill lists branches with `sodaprompts-` prefix and deletes any left over from crashed sessions. Listing is free. This prevents cost accumulation from abandoned branches.
+
+---
 
 ## Deprecated (removed in migration)
 
