@@ -134,7 +134,7 @@ This removes ~700MB from the image compared to the Sprites bootstrap.
 FROM node:22-slim
 RUN apt-get update && apt-get install -y git gh jq curl
 RUN npm install -g @anthropic-ai/claude-code
-COPY run-builder.sh run-reviewer.sh entrypoint.sh /opt/sodaprompts/
+COPY run-builder.sh run-reviewer.sh entrypoint.sh task-adapter.sh /opt/sodaprompts/
 ```
 
 Published as:
@@ -499,7 +499,31 @@ gh issue create --title "Search" --body-file search.md --label prd-queued
 
 **Keep logic, update artifact storage.** Already agent-agnostic via `AGENT_RUNTIME` env var. Move from being uploaded per-sprite to being baked into the snapshot at `/opt/sodaprompts/`.
 
-One change: `completion.json` currently written to local filesystem (`/home/sprite/completions/`). In ephemeral model, write completion status to GitHub (issue comment or check run) so the runner and wake workflow can detect results after sandbox destruction.
+Two changes:
+1. `completion.json` currently written to local filesystem (`/home/sprite/completions/`). In ephemeral model, write completion status to GitHub (issue comment or check run) so the runner and wake workflow can detect results after sandbox destruction.
+2. **Task adapter** — all `gh issue` calls in the runners now go through `task-adapter.sh` (see below). This abstracts issue creation, state transitions, comments, and polling behind provider-agnostic functions. Currently GitHub-only; designed for future Linear/other backends.
+
+### Task Adapter (`scripts/task-adapter.sh`)
+
+**New.** Thin shell library sourced by both runner scripts. Abstracts task management operations so the runners don't call `gh issue ...` directly:
+
+| Function | What it does | GitHub impl |
+|---|---|---|
+| `task_create` | Create a task/issue | `gh issue create` |
+| `task_transition` | Move task between states | `gh issue edit --remove-label OLD --add-label NEW` |
+| `task_close` | Close a task | `gh issue close` |
+| `task_comment` | Post a comment | `gh issue comment` |
+| `task_view` | Read task details | `gh issue view` |
+| `task_first_by_status` | Poll for oldest task in a state | `gh issue list --label --sort created` |
+| `task_read_comments` | Read/filter comments | `gh issue view --json comments` |
+| `task_ensure_labels` | Create all state labels (idempotent) | `gh label create --force` |
+
+**Not abstracted** (stays as direct `gh` calls):
+- PR operations (`gh pr create`, `gh pr edit`, `gh pr review`) — code hosting is always GitHub
+- PR comments (session reports, decision logs) — attached to code, not task
+- PR review state detection (`gh pr view --json reviews`) — GitHub-native concept
+
+**Future:** Add `TASK_PROVIDER=linear` case branches to swap in Linear API calls. The adapter uses a `case "$TASK_PROVIDER"` pattern so adding a new backend is additive (no changes to runner logic). Add a `task_provider` field to `.sodaprompts.yml` to configure per-project.
 
 ### bootstrap.sh → entrypoint.sh
 

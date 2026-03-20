@@ -35,6 +35,17 @@ fi
 : "${GITHUB_REPO:?GITHUB_REPO is not set}"
 : "${GITHUB_TOKEN:?GITHUB_TOKEN is not set}"
 
+# Source task management adapter (abstracts GitHub issue operations)
+# Looks in snapshot location first, then falls back to repo-relative path
+if [[ -f "/opt/sodaprompts/task-adapter.sh" ]]; then
+  source "/opt/sodaprompts/task-adapter.sh"
+elif [[ -f "${REPO}/scripts/task-adapter.sh" ]]; then
+  source "${REPO}/scripts/task-adapter.sh"
+else
+  echo "FATAL: task-adapter.sh not found" >&2
+  exit 1
+fi
+
 # Read config
 BASE_BRANCH="main"
 if [[ -f "${REPO}/.sodaprompts.yml" ]]; then
@@ -207,12 +218,8 @@ handle_env_reset() {
 
   # Pause the original issue (not failed — it's resumable)
   if [[ -n "$ORIGINAL_ISSUE" ]]; then
-    gh issue edit "$ORIGINAL_ISSUE" --repo "$GITHUB_REPO" \
-      --remove-label "${ORIGINAL_TYPE}-running" \
-      --add-label "${ORIGINAL_TYPE}-paused" 2>/dev/null || true
-    gh issue comment "$ORIGINAL_ISSUE" --repo "$GITHUB_REPO" \
-      --body "Environment reset needed: ${REASON}. Creating continuation issue." \
-      2>/dev/null || true
+    task_transition "$ORIGINAL_ISSUE" "${ORIGINAL_TYPE}-running" "${ORIGINAL_TYPE}-paused"
+    task_comment "$ORIGINAL_ISSUE" "Environment reset needed: ${REASON}. Creating continuation issue."
   fi
 
   # Create continuation issue
@@ -249,10 +256,9 @@ EOF
 )
 
   local CONT_URL
-  CONT_URL=$(gh issue create --repo "$GITHUB_REPO" \
-    --title "$CONT_TITLE" \
-    --body "$CONT_BODY" \
-    --label "$CONT_LABELS" 2>/dev/null || echo "")
+  CONT_URL=$(task_create "$CONT_TITLE" "$CONT_BODY" "prd-queued" \
+    "$( [[ "$ISSUE_BASE" != "main" ]] && echo "base:${ISSUE_BASE}" || echo "" )" \
+    2>/dev/null || echo "")
 
   if [[ -n "$CONT_URL" ]]; then
     log "Continuation issue created: ${CONT_URL}"
@@ -443,7 +449,7 @@ handle_bug() {
 
   # Read issue details
   local ISSUE_JSON
-  ISSUE_JSON=$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPO" --json title,body,labels)
+  ISSUE_JSON=$(task_view "$ISSUE_NUMBER" --json title,body,labels)
   local TITLE
   TITLE=$(echo "$ISSUE_JSON" | jq -r '.title')
   local BODY
@@ -458,13 +464,11 @@ handle_bug() {
   notify "Bug fix started: #${ISSUE_NUMBER} — ${TITLE}"
 
   # Claim the issue
-  gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPO" \
-    --remove-label "bug-queued" --add-label "bug-running" 2>/dev/null || true
+  task_transition "$ISSUE_NUMBER" "bug-queued" "bug-running"
 
   # Check if the thinker sprite left an investigation report
   local INVESTIGATION=""
-  INVESTIGATION=$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPO" --json comments \
-    --jq '[.comments[] | select(.body | contains("## Investigation Report"))] | last | .body' 2>/dev/null || echo "")
+  INVESTIGATION=$(task_read_comments "$ISSUE_NUMBER" "## Investigation Report")
 
   # Prepare repo
   cd "$REPO"
@@ -511,16 +515,14 @@ Run the project's test and lint commands to verify before creating the PR."
     --json url --jq '.[0].url' 2>/dev/null || echo "")
 
   if [[ -n "$PR_URL" ]] && [[ "$PR_URL" != "null" ]]; then
-    gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPO" \
-      --remove-label "bug-running" --add-label "bug-complete" 2>/dev/null || true
+    task_transition "$ISSUE_NUMBER" "bug-running" "bug-complete"
 
     # Label the PR for review by the thinker sprite
     local PR_NUM
     PR_NUM=$(echo "$PR_URL" | grep -oE '[0-9]+$')
     gh pr edit "$PR_NUM" --repo "$GITHUB_REPO" --add-label "needs-review" 2>/dev/null || true
   else
-    gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPO" \
-      --remove-label "bug-running" --add-label "bug-failed" 2>/dev/null || true
+    task_transition "$ISSUE_NUMBER" "bug-running" "bug-failed"
     notify "Bug fix #${ISSUE_NUMBER} finished without creating a PR. Check logs."
   fi
 
@@ -547,7 +549,7 @@ handle_prd() {
 
   # Read issue details
   local ISSUE_JSON
-  ISSUE_JSON=$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPO" --json title,body,labels)
+  ISSUE_JSON=$(task_view "$ISSUE_NUMBER" --json title,body,labels)
   local TITLE
   TITLE=$(echo "$ISSUE_JSON" | jq -r '.title')
   local BODY
@@ -562,8 +564,7 @@ handle_prd() {
   notify "PRD started: #${ISSUE_NUMBER} — ${TITLE} (base: ${ISSUE_BASE})"
 
   # Claim the issue
-  gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPO" \
-    --remove-label "prd-queued" --add-label "prd-running" 2>/dev/null || true
+  task_transition "$ISSUE_NUMBER" "prd-queued" "prd-running"
 
   # Write prompt to local file for the skill
   mkdir -p "${SPRITE_HOME}/prd-inbox"
@@ -627,10 +628,9 @@ CTXEOF
 
   # Update the issue and post session report
   if [[ -n "$PR_URL" ]] && [[ "$PR_URL" != "null" ]]; then
-    gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPO" --body "PR created: ${PR_URL}" 2>/dev/null || true
-    gh issue close "$ISSUE_NUMBER" --repo "$GITHUB_REPO" 2>/dev/null || true
-    gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPO" \
-      --remove-label "prd-running" --add-label "prd-complete" 2>/dev/null || true
+    task_comment "$ISSUE_NUMBER" "PR created: ${PR_URL}"
+    task_close "$ISSUE_NUMBER"
+    task_transition "$ISSUE_NUMBER" "prd-running" "prd-complete"
 
     # Label the PR for review
     local PR_NUM
@@ -640,8 +640,7 @@ CTXEOF
     # Post session report to the PR
     post_session_report "$PR_NUM" "$PRD_ID" "$DURATION" "$SESSION_LOG"
   else
-    gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPO" \
-      --remove-label "prd-running" --add-label "prd-failed" 2>/dev/null || true
+    task_transition "$ISSUE_NUMBER" "prd-running" "prd-failed"
     notify "PRD #${ISSUE_NUMBER} finished without creating a PR. Check logs."
   fi
 
@@ -692,9 +691,7 @@ while true; do
 
   # Priority 2: Check for queued bugs
   if [[ "$FOUND_WORK" == false ]]; then
-    BUG_NUMBER=$(gh issue list --repo "$GITHUB_REPO" \
-      --label "bug-queued" --sort created --state open \
-      --json number --jq '.[0].number' 2>/dev/null || echo "")
+    BUG_NUMBER=$(task_first_by_status "bug-queued")
 
     if [[ -n "$BUG_NUMBER" ]] && [[ "$BUG_NUMBER" != "null" ]]; then
       handle_bug "$BUG_NUMBER" || true
@@ -704,9 +701,7 @@ while true; do
 
   # Priority 3: Check for queued PRDs (new features)
   if [[ "$FOUND_WORK" == false ]]; then
-    ISSUE_NUMBER=$(gh issue list --repo "$GITHUB_REPO" \
-      --label "prd-queued" --sort created --state open \
-      --json number --jq '.[0].number' 2>/dev/null || echo "")
+    ISSUE_NUMBER=$(task_first_by_status "prd-queued")
 
     if [[ -n "$ISSUE_NUMBER" ]] && [[ "$ISSUE_NUMBER" != "null" ]]; then
       handle_prd "$ISSUE_NUMBER" || true

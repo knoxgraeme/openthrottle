@@ -18,6 +18,10 @@ All ship and status operations use the `gh` CLI directly — no sprite exec need
 This means shipping works from any environment with `gh` installed (Claude Code,
 Claude Desktop, terminal, CI, etc.).
 
+Note: The runner scripts (run-builder.sh, run-reviewer.sh) use `task-adapter.sh`
+to abstract task management operations. This skill runs on the user's machine
+and uses `gh` directly since it only targets GitHub.
+
 Logs, kill, and push-env still require sprite exec (scripts in `scripts/` subdir).
 
 ---
