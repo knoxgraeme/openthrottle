@@ -1,0 +1,33 @@
+{
+  "name": "@sodaprompts/create-sodaprompts",
+  "version": "1.0.0",
+  "description": "Set up sodaprompts in any Node.js project — agent-agnostic, config-driven.",
+  "type": "module",
+  "bin": {
+    "create-sodaprompts": "./index.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "templates/"
+  ],
+  "dependencies": {
+    "@daytonaio/sdk": "^0.54.0",
+    "prompts": "^2.4.2",
+    "yaml": "^2.4.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sodaprompts/sodaprompts"
+  },
+  "keywords": [
+    "sodaprompts",
+    "daytona",
+    "agent",
+    "scaffolder",
+    "create"
+  ]
+}

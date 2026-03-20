@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# pre-push — Universal git hook that works for ANY agent runtime.
+# Blocks push to main/master and force push.
+# Installed by entrypoint.sh via git config core.hooksPath.
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  # Block push to main/master
+  if [[ "$remote_ref" =~ refs/heads/(main|master)$ ]]; then
+    echo "BLOCKED: Direct push to main/master is not allowed." >&2
+    echo "Use: git push origin HEAD  (pushes the current feature branch)" >&2
+    exit 1
+  fi
+done
+
+exit 0

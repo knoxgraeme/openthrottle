@@ -572,7 +572,7 @@ Changes:
 
 ### `ship-doer.sh`
 
-**Simplify.** Current 393-line, 12-step flow → ~50-line, 3-step flow: read config, create sandbox via SDK, print summary. Steps that disappear: locate plugin, upload files, push env, run bootstrap, apply network policy, checkpoint as golden-base, verify setup. The structured output protocol (`===SHIP_ERROR_BEGIN/END===`, `===SHIP_COMPLETE===`) stays for `/sodaprompts-setup` integration.
+**Deprecated.** Sandbox creation is now handled by the `wake-sandbox.yml` GitHub Action (triggered by labels). Onboarding (snapshot + volume creation) moves to `npx create-sodaprompts` (Phase 1 scaffolder). `ship-doer.sh` has no role in the Daytona model.
 
 ### Hooks
 
@@ -626,7 +626,8 @@ User-facing commands (`/status`, `/queue`) continue to work from the local `/sod
 - **`bootstrap.sh`** (431 lines) → replaced by `entrypoint.sh` (~50 lines)
 - **`bootstrap-reviewer.sh`** (124 lines) → removed (single sandbox, two skills)
 - **`ship-reviewer.sh`** (341 lines) → removed (no separate reviewer sprite)
-- **`ship-common.sh`** (380 lines) → most logic disappears with simplified `ship-doer.sh`
+- **`ship-doer.sh`** (393 lines) → deprecated (sandbox creation by GitHub Action; onboarding by scaffolder)
+- **`ship-common.sh`** (380 lines) → removed (shared ship utilities no longer needed)
 - **`install-skill.sh`** (40 lines) → skills baked into snapshot at build time
 - **`preflight.sh`** → sprite-specific pre-flight checks no longer needed
 - **`telegram-poller.sh`** (312 lines) → replaced by on-demand notifications (no background daemon)
@@ -809,7 +810,7 @@ We don't need #2519 or #2528 — the ephemeral model avoids the need for persist
 - Write `wake-sandbox.yml` workflow template
 - Refactor `run-builder.sh` — remove idle-to-suspend, update paths, single-task execution, env-var-driven task type
 - Refactor `run-reviewer.sh` — same changes as builder
-- Simplify `ship-doer.sh` for Daytona
+- Deprecate `ship-doer.sh` — sandbox creation handled by `wake-sandbox.yml`; onboarding moves to `npx create-sodaprompts`
 - Update `log-commands.sh` — new log path, add `CLAUDE_CODE_OAUTH_TOKEN` to sanitization
 - Test with existing users
 
