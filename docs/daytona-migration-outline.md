@@ -66,15 +66,22 @@ This is how Daytona is designed to be used — sub-90ms sandbox creation from sn
 
 One Docker image per agent runtime, published on GHCR. Pre-installed:
 
-- System packages: git, gh, jq, curl, chromium, xvfb
+- System packages: git, gh, jq, curl (lightweight — no chromium/xvfb)
 - Language runtime: Node.js + pnpm (TS-only for v1)
 - Agent binary: Claude Code (v1), Codex/Aider (future)
 - Sodaprompts orchestration: run-builder.sh, run-reviewer.sh, entrypoint.sh
 - Default MCP servers: Telegram, Context7
 
+**Not in the image** (provided by Daytona platform):
+- Chromium, xvfb, display server → Daytona Computer Use API (`sandbox.computer_use.start()`)
+- agent-browser → replaced by Daytona's native mouse/keyboard/screenshot APIs
+- Playwright → optional, installed via `post_bootstrap` if project needs browser tests
+
+This removes ~700MB from the image compared to the Sprites bootstrap.
+
 ```dockerfile
 FROM node:22-slim
-RUN apt-get update && apt-get install -y git gh jq curl chromium xvfb ...
+RUN apt-get update && apt-get install -y git gh jq curl
 RUN npm install -g @anthropic-ai/claude-code
 COPY run-builder.sh run-reviewer.sh entrypoint.sh /opt/sodaprompts/
 ```
@@ -223,17 +230,17 @@ review:
 The entrypoint replaces the 400-line `bootstrap.sh`. Most of that was installing packages — now baked into the snapshot. What remains (~50 lines):
 
 ```
-1. gh repo clone $GITHUB_REPO
-2. Read .sodaprompts.yml
-3. Run post_bootstrap (pnpm install, etc.)
-4. Write ~/.claude/settings.json:
+1. Start Daytona Computer Use (sandbox.computer_use.start() — Xvfb, xfce4, display)
+2. gh repo clone $GITHUB_REPO
+3. Read .sodaprompts.yml
+4. Run post_bootstrap (pnpm install, playwright install if needed, etc.)
+5. Write ~/.claude/settings.json:
    - Merge MCP servers (defaults + project-specific)
    - Resolve "from-env" placeholders in MCP config
    - Register hooks (block-push-to-main, log-commands, auto-format)
    - Wire lint + test into Stop hooks
    - If supabase MCP detected: add permission denials
-5. Nullify repo-level .claude/settings.json (sprite-only hooks apply)
-6. Apply network policy
+6. Nullify repo-level .claude/settings.json (sandbox-only hooks apply)
 7. Detect work item type from GitHub (issue label / PR state)
 8. Run builder or reviewer skill accordingly
 ```
@@ -241,6 +248,8 @@ The entrypoint replaces the 400-line `bootstrap.sh`. Most of that was installing
 | Current bootstrap step | In Daytona |
 |---|---|
 | Install system packages | Baked into snapshot |
+| Install Chromium + xvfb | Daytona Computer Use API (platform-provided) |
+| Install agent-browser + Playwright | Daytona Computer Use replaces agent-browser; Playwright optional via post_bootstrap |
 | Install GitHub CLI | Baked into snapshot |
 | Install Claude Code | Baked into snapshot |
 | Install sodaprompts plugin | Baked into snapshot |
@@ -250,7 +259,8 @@ The entrypoint replaces the 400-line `bootstrap.sh`. Most of that was installing
 | Run post_bootstrap | Entrypoint (runtime) |
 | Configure MCP servers from config | Entrypoint (runtime) |
 | Configure hooks + permissions | Entrypoint (runtime) |
-| Apply network policy | Entrypoint (runtime) |
+| Apply network policy | Sandbox creation params (`network_block_all`, `network_allow_list`) |
+| Start Computer Use (display) | Entrypoint calls Daytona Computer Use API |
 | Start runner | Entrypoint (runtime) |
 
 ---
