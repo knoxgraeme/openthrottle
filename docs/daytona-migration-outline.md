@@ -7,7 +7,8 @@
 1. **Agent-agnostic** — users choose Claude, Codex, Aider, or any future agent
 2. **No plugin install required** — `npx create-sodaprompts` replaces `/sodaprompts-setup` as the primary onboarding path
 3. **Generic snapshot** — one published OCI image per agent runtime; project config is read at boot from `.sodaprompts.yml`
-4. **Keep subscription auth** — Claude `login` device flow stays; auth is baked into the snapshot after first login
+4. **Ephemeral sandboxes** — one sandbox per task, parallel by default, no long-lived state to manage
+5. **Subscription + API key auth** — both supported via env vars (`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`)
 
 ---
 
@@ -24,124 +25,219 @@ claude plugin install knoxgraeme/sodaprompts
 - Tightly coupled to Claude Code skill/hook system
 - Codex support exists in runner scripts but onboarding is Claude-only
 - Users must have Claude Code installed to set up
+- Long-lived sprites with checkpoint/restore
 
 ### Target (Daytona + Scaffolder)
 
 ```
 npx create-sodaprompts      ← agent-agnostic scaffolder generates config
 git push                     ← .sodaprompts.yml + wake workflow committed
-GitHub Action                ← wakes Daytona sandbox on issue label
+GitHub Action                ← creates ephemeral Daytona sandbox per task
 ```
 
 - Any agent runtime supported via snapshot variants
 - Claude plugin becomes optional enhancement, not requirement
 - Config-driven: all project specifics live in `.sodaprompts.yml`
+- Ephemeral sandboxes: create per task, destroy after, parallel by default
 
 ---
 
-## Snapshot Architecture
+## Sandbox Architecture
 
-### Layer 1: Generic Base Snapshot (published, same for everyone)
+### Ephemeral Model
 
-One snapshot per agent runtime. Pre-installed:
+Every task gets a fresh sandbox. No stop/start, no cleanup scripts, no stale state.
+
+```
+Issue labeled prd-queued
+  → GitHub Action fires
+  → Daytona SDK: create sandbox from snapshot (with env vars)
+  → Entrypoint: clone repo, pnpm install, wire up config from .sodaprompts.yml
+  → Builder implements, opens PR
+  → Reviewer reviews (same sandbox, different skill)
+  → Sandbox destroyed
+
+3 issues queued? → 3 sandboxes in parallel. No queue needed.
+```
+
+This is how Daytona is designed to be used — sub-90ms sandbox creation from snapshots, fully stateless, spin up and throw away.
+
+### Published Snapshot (shared by all users)
+
+One Docker image per agent runtime, published on GHCR. Pre-installed:
 
 - System packages: git, gh, jq, curl, chromium, xvfb
-- Language runtimes: Node.js + pnpm (start here; Python/Go/Rust variants later)
-- Agent binary: Claude Code, Codex, or Aider (one per snapshot variant)
-- Sodaprompts orchestration: run-builder.sh, run-reviewer.sh, bootstrap-common.sh
+- Language runtime: Node.js + pnpm (TS-only for v1)
+- Agent binary: Claude Code (v1), Codex/Aider (future)
+- Sodaprompts orchestration: run-builder.sh, run-reviewer.sh, entrypoint.sh
 - Default MCP servers: Telegram, Context7
-- Entrypoint script
 
-Published on GHCR as:
-
-```
-ghcr.io/sodaprompts/doer-claude:node       ← Claude Code + Node.js
-ghcr.io/sodaprompts/doer-codex:node        ← Codex + Node.js
-```
-
-No separate reviewer image — builder and reviewer are skills within the same sandbox.
-
-Future variants for language coverage:
-
-```
-ghcr.io/sodaprompts/doer-claude:python
-ghcr.io/sodaprompts/doer-claude:rust
-ghcr.io/sodaprompts/doer-claude:full       ← fat image, all runtimes
+```dockerfile
+FROM node:22-slim
+RUN apt-get update && apt-get install -y git gh jq curl chromium xvfb ...
+RUN npm install -g @anthropic-ai/claude-code
+COPY run-builder.sh run-reviewer.sh entrypoint.sh /opt/sodaprompts/
 ```
 
-### Layer 2: Project Init (happens at sandbox boot)
-
-The entrypoint script runs at sandbox creation. Everything project-specific comes from env vars + `.sodaprompts.yml` in the repo:
-
-1. `gh repo clone $GITHUB_REPO`
-2. Read `.sodaprompts.yml` for test/build/lint commands, post_bootstrap, MCP servers
-3. Run `post_bootstrap` commands (e.g. `pnpm install`)
-4. Configure agent: merge project MCP servers, set up hooks
-5. Apply network policy from config
-6. Start runner loop (`run-builder.sh` or `run-reviewer.sh`)
-
-### Auth Flow
-
-Interactive login is preserved for subscription users:
+Published as:
 
 ```
-1. daytona sandbox create --snapshot sodaprompts/doer-claude:node
-2. daytona ssh <sandbox>
-3. claude login                    ← one-time browser device flow
-4. daytona snapshot <sandbox>      ← auth baked into personal snapshot
-5. All future sandboxes boot from the authed snapshot
+ghcr.io/sodaprompts/doer-claude:node-1.0.0
 ```
 
-API key users skip steps 2-4 — just pass `ANTHROPIC_API_KEY` as an env var at sandbox creation.
+Users create a Daytona snapshot in their account pointing to this image. The scaffolder does this automatically via the Daytona SDK.
+
+**Constraint:** Daytona does not allow `latest`/`lts`/`stable` tags — must use explicit versions (e.g., `node-1.0.0`).
+
+Future variants (not v1):
+
+```
+ghcr.io/sodaprompts/doer-codex:node-1.0.0
+ghcr.io/sodaprompts/doer-claude:python-1.0.0
+ghcr.io/sodaprompts/doer-claude:full-1.0.0
+```
+
+### Why GHCR
+
+- Free for public images
+- Native GitHub Actions integration (`docker/login-action` + `docker/build-push-action`)
+- Same auth model as the rest of the project (GitHub PAT)
+- No separate account/billing (Docker Hub requires one)
+- Org-scoped: `ghcr.io/sodaprompts/*` keeps everything under one namespace
+- Explicitly supported by Daytona as a container registry source
 
 ---
 
-## Onboarding: `npx create-sodaprompts`
+## Authentication
 
-Replaces the interactive `/sodaprompts-setup` Claude skill as the primary onboarding path.
+### Two Auth Paths
 
-### What It Does
+| Method | Env var | Source | For whom |
+|---|---|---|---|
+| API key | `ANTHROPIC_API_KEY` | [console.anthropic.com](https://console.anthropic.com) | Pay-per-use API users |
+| Subscription | `CLAUDE_CODE_OAUTH_TOKEN` | `claude setup-token` (1-year token) | Max / Pro / Team / Enterprise subscribers |
 
-1. Detects project: reads `package.json`, `pyproject.toml`, `Cargo.toml`, etc.
-2. Prompts for config values (with smart defaults):
-   - Base branch
-   - Test / build / lint / format commands
-   - Agent runtime (claude / codex / aider)
-   - Notification provider (telegram / none)
-   - Sprite name
-3. Generates `.sodaprompts.yml`
-4. Copies `.github/workflows/wake-sprite.yml` into the repo
-5. Prints next steps (set GitHub secrets, create sandbox, login)
+Both are just env vars — the sandbox is born authenticated, does work, dies. No browser login flow, no persistent state to manage.
 
-### Implementation
+### Auth priority in Claude Code
 
-- ~150 lines of JS
-- Published as `@sodaprompts/create-sodaprompts` on npm
-- Uses `prompts` (or similar) for interactive questions
-- Zero dependencies on any agent CLI
+Claude Code picks up credentials in this order:
 
-### Three Onboarding Tiers
+1. Cloud provider creds (`CLAUDE_CODE_USE_BEDROCK` etc.)
+2. `ANTHROPIC_AUTH_TOKEN` (bearer token for proxies)
+3. `ANTHROPIC_API_KEY` (direct API key)
+4. `CLAUDE_CODE_OAUTH_TOKEN` (subscription OAuth token)
+5. OAuth login (interactive — not used in sandboxes)
 
-| User | Path | Agent-locked? |
-|------|------|--------------|
-| Claude Code user | `/sodaprompts-setup` (existing skill) | Yes — premium UX, does scaffolding + shipping in one flow |
-| Any developer | `npx create-sodaprompts` | No — generates config, user ships manually |
-| Power user | Copy template, edit YAML by hand | No |
+### Secrets Flow
+
+```
+GitHub Secrets (storage)
+  → GitHub Action (reads them)
+    → Daytona SDK call (passes as env_vars at sandbox creation)
+      → Sandbox (born with them in environment)
+        → Claude Code picks up auth token automatically
+```
+
+Daytona is the runtime, not the secrets store. Secrets live in GitHub, get injected at sandbox creation time via `env_vars` parameter:
+
+```python
+sandbox = daytona.create(CreateSandboxFromSnapshotParams(
+    snapshot='sodaprompts-doer',
+    env_vars={
+        'CLAUDE_CODE_OAUTH_TOKEN': '...',  # or ANTHROPIC_API_KEY
+        'GITHUB_TOKEN': '...',
+        'TELEGRAM_BOT_TOKEN': '...',
+        'TELEGRAM_CHAT_ID': '...',
+    }
+))
+```
 
 ---
 
-## What Changes in Existing Code
+## What `.sodaprompts.yml` Does
 
-### Runner Scripts (run-builder.sh, run-reviewer.sh)
+The published snapshot is generic — it has tools but no project knowledge. Everything project-specific gets wired up at boot by the entrypoint reading `.sodaprompts.yml`:
 
-**Keep as-is.** Already agent-agnostic via `AGENT_RUNTIME` env var. Move from being uploaded per-sprite to being baked into the base snapshot at `/opt/sodaprompts/`.
+| Category | Config fields | What the entrypoint does |
+|---|---|---|
+| **Build commands** | `test`, `build`, `lint`, `format`, `dev` | Wired into Claude's Stop hooks (lint + test before session exit), auto-format hook |
+| **Post-bootstrap** | `post_bootstrap` | Runs `pnpm install`, DB migrations, etc. after clone |
+| **MCP servers** | `mcp_servers` | Merged into `~/.claude/settings.json`; `"from-env"` placeholders resolved from env vars |
+| **Supabase safety** | Auto-detected from `mcp_servers.supabase` | Denies `execute_sql`, `apply_migration`, `deploy_edge_function`, `merge_branch` in permissions |
+| **Network policy** | `network_policy.allow` | Domain allowlist + auto-appended deny-all. Always includes github, anthropic, npm, telegram |
+| **Hooks** | Baked into snapshot, configured at boot | `block-push-to-main`, `log-commands` (secret sanitization), `auto-format` |
+| **Base branch** | `base_branch` | Which branch to fork from and PR into |
+| **Review config** | `review.enabled`, `review.max_rounds` | Whether reviewer skill runs, convergence limit |
+| **Agent** | `agent` | Which agent runtime to use (determines snapshot variant) |
 
-### bootstrap.sh → entrypoint.sh
+### Schema
 
-**Simplify.** Half the current bootstrap steps disappear because they're pre-baked into the snapshot:
+```yaml
+# Project commands
+base_branch: main
+test: pnpm test
+build: pnpm build
+lint: pnpm lint
+format: pnpm prettier --write
+dev: pnpm dev --port 8080 --hostname 0.0.0.0
+
+# Bootstrap
+post_bootstrap:
+  - pnpm install
+
+# Agent & runtime
+agent: claude                    # claude | codex | aider
+snapshot: ghcr.io/sodaprompts/doer-claude:node-1.0.0
+
+# Notifications
+notifications: telegram
+
+# MCP servers (project-specific, merged with defaults)
+mcp_servers:
+  supabase:
+    command: npx
+    args: ["-y", "@supabase/mcp-server"]
+    env:
+      SUPABASE_ACCESS_TOKEN: from-env
+
+# Security
+network_policy:
+  allow:
+    - github.com
+    - "*.anthropic.com"
+    - "*.supabase.co"
+
+# Review
+review:
+  enabled: true
+  max_rounds: 3
+```
+
+---
+
+## Entrypoint: What Happens at Boot
+
+The entrypoint replaces the 400-line `bootstrap.sh`. Most of that was installing packages — now baked into the snapshot. What remains (~50 lines):
+
+```
+1. gh repo clone $GITHUB_REPO
+2. Read .sodaprompts.yml
+3. Run post_bootstrap (pnpm install, etc.)
+4. Write ~/.claude/settings.json:
+   - Merge MCP servers (defaults + project-specific)
+   - Resolve "from-env" placeholders in MCP config
+   - Register hooks (block-push-to-main, log-commands, auto-format)
+   - Wire lint + test into Stop hooks
+   - If supabase MCP detected: add permission denials
+5. Nullify repo-level .claude/settings.json (sprite-only hooks apply)
+6. Apply network policy
+7. Detect work item type from GitHub (issue label / PR state)
+8. Run builder or reviewer skill accordingly
+```
 
 | Current bootstrap step | In Daytona |
-|----------------------|-----------|
+|---|---|
 | Install system packages | Baked into snapshot |
 | Install GitHub CLI | Baked into snapshot |
 | Install Claude Code | Baked into snapshot |
@@ -151,246 +247,250 @@ Replaces the interactive `/sodaprompts-setup` Claude skill as the primary onboar
 | Clone repo | Entrypoint (runtime) |
 | Run post_bootstrap | Entrypoint (runtime) |
 | Configure MCP servers from config | Entrypoint (runtime) |
+| Configure hooks + permissions | Entrypoint (runtime) |
 | Apply network policy | Entrypoint (runtime) |
-| Start runner loop | Entrypoint (runtime) |
+| Start runner | Entrypoint (runtime) |
 
-The new `entrypoint.sh` is ~50 lines instead of ~400.
+---
+
+## Single Sandbox, Two Skills
+
+The Doer and Thinker become **skills within the same sandbox**. The entrypoint detects the work item and invokes the right skill:
+
+- Issue labeled `prd-queued` / `bug-queued` / PR with `changes_requested` → builder skill
+- PR labeled `needs-review` / issue labeled `needs-investigation` → reviewer skill
+
+Benefits:
+- Half the infrastructure (one snapshot, one workflow)
+- Shared project context (deps installed, repo cloned)
+- Simpler config (no separate reviewer section)
+- Review happens in the same sandbox that built the code
+
+Trade-off: builder and reviewer run sequentially in a single sandbox. Fine — the builder finishes before the reviewer starts, and with ephemeral sandboxes a separate reviewer sandbox could be spun up in parallel if needed later.
+
+---
+
+## GitHub Action
+
+The `wake-sprite.yml` workflow becomes `wake-sandbox.yml`:
+
+```yaml
+name: Wake Sandbox
+on:
+  issues:
+    types: [labeled]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  run-task:
+    if: |
+      contains(github.event.label.name, 'prd-queued') ||
+      contains(github.event.label.name, 'bug-queued') ||
+      contains(github.event.label.name, 'needs-review') ||
+      (github.event.review.state == 'changes_requested')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create and run sandbox
+        env:
+          DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
+        run: |
+          # Read snapshot from .sodaprompts.yml
+          SNAPSHOT=$(yq '.snapshot' .sodaprompts.yml)
+
+          # Create ephemeral sandbox with all secrets
+          daytona sandbox create \
+            --snapshot "$SNAPSHOT" \
+            --env GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }} \
+            --env GITHUB_REPO=${{ github.repository }} \
+            --env ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }} \
+            --env CLAUDE_CODE_OAUTH_TOKEN=${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }} \
+            --env TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }} \
+            --env TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }} \
+            --env WORK_ITEM=${{ github.event.issue.number || github.event.pull_request.number }}
+```
+
+Each issue/PR event gets its own sandbox — inherently parallel. No queue management needed.
+
+---
+
+## Onboarding: `npx create-sodaprompts`
+
+### What It Does
+
+1. Detects project: reads `package.json` (TS-only for v1)
+2. Prompts for config values (with smart defaults):
+   - Base branch
+   - Test / build / lint / format commands
+   - Auth method (API key or subscription)
+   - Notification provider (telegram / none)
+3. Generates `.sodaprompts.yml`
+4. Copies `.github/workflows/wake-sandbox.yml` into the repo
+5. Creates Daytona snapshot in user's account (via SDK, needs `DAYTONA_API_KEY`)
+6. Prints next steps (set GitHub secrets, commit, push)
+
+### Implementation
+
+- ~200 lines of JS
+- Published as `@sodaprompts/create-sodaprompts` on npm
+- Uses `prompts` (or similar) for interactive questions
+- Zero dependencies on any agent CLI
+- Requires `DAYTONA_API_KEY` env var for snapshot creation
+
+### Three Onboarding Tiers
+
+| User | Path | Agent-locked? |
+|------|------|--------------|
+| Claude Code user | `/sodaprompts-setup` (existing skill) | Yes — premium UX, does scaffolding + shipping in one flow |
+| Any developer | `npx create-sodaprompts` | No — generates config, user commits manually |
+| Power user | Copy template, edit YAML by hand | No |
+
+---
+
+## Full User Workflow
+
+### One-time setup (~2 minutes)
+
+```
+1. npx create-sodaprompts
+   → detects package.json, prompts for commands
+   → generates .sodaprompts.yml
+   → copies .github/workflows/wake-sandbox.yml
+   → creates Daytona snapshot via SDK (needs DAYTONA_API_KEY)
+
+2. Auth (choose one):
+   a) API key:      get ANTHROPIC_API_KEY from console.anthropic.com
+   b) Subscription: run `claude setup-token` → get CLAUDE_CODE_OAUTH_TOKEN (valid 1 year)
+
+3. Set GitHub repo secrets:
+   DAYTONA_API_KEY              ← talks to Daytona
+   ANTHROPIC_API_KEY            ← (option a) OR
+   CLAUDE_CODE_OAUTH_TOKEN      ← (option b)
+   TELEGRAM_BOT_TOKEN           ← optional
+   TELEGRAM_CHAT_ID             ← optional
+
+4. git add .sodaprompts.yml .github/workflows/wake-sandbox.yml
+   git commit && git push
+```
+
+### Shipping a task
+
+```
+5. gh issue create --title "Add search feature" \
+     --body-file docs/prds/search.md \
+     --label prd-queued
+
+   (or from Claude: /sodaprompts-ship docs/prds/search.md)
+
+6. GitHub Action fires:
+   → creates ephemeral Daytona sandbox from snapshot
+   → entrypoint: clone, pnpm install, wire .sodaprompts.yml config
+   → builder implements, opens PR
+   → reviewer reviews (same sandbox)
+   → Telegram notification: "PR ready"
+   → sandbox destroyed
+
+7. User reviews PR, merges or requests changes
+   → if changes_requested, Action creates new sandbox
+   → builder applies fixes, re-requests review
+   → cycle repeats until approved
+```
+
+Ship multiple prompts — they run in parallel (one sandbox each):
+
+```
+gh issue create --title "Auth" --body-file auth.md --label prd-queued
+gh issue create --title "Billing" --body-file billing.md --label prd-queued
+gh issue create --title "Search" --body-file search.md --label prd-queued
+# → 3 sandboxes spin up simultaneously
+```
+
+---
+
+## What Changes in Existing Code
+
+### Runner Scripts (run-builder.sh, run-reviewer.sh)
+
+**Keep as-is.** Already agent-agnostic via `AGENT_RUNTIME` env var. Move from being uploaded per-sprite to being baked into the snapshot at `/opt/sodaprompts/`.
+
+### bootstrap.sh → entrypoint.sh
+
+**Rewrite.** ~50 lines instead of ~400. See "Entrypoint" section above.
 
 ### ship-doer.sh
 
-**Simplify.** Current 12-step flow becomes ~5 steps:
+**Simplify.** Current 12-step flow becomes ~3 steps:
 
 1. Read `.sodaprompts.yml`
 2. Create Daytona sandbox from snapshot (with env vars)
-3. Wait for health check
-4. Install wake workflow (if not already in repo)
-5. Print summary
+3. Print summary
 
-Steps that disappear: locate plugin, upload files, push env (env vars passed at creation), run bootstrap (entrypoint handles it), checkpoint (snapshot model).
+Steps that disappear: locate plugin, upload files, push env, run bootstrap, checkpoint.
 
 ### Hooks
 
-**Keep the logic, change the wiring.** The hook scripts (`block-push-to-main.sh`, `log-commands.sh`, `auto-format.sh`) are agent-agnostic bash. Only the registration in `settings.json` is Claude-specific. For other agents, the entrypoint configures the equivalent hook system.
+**Keep the scripts, change the wiring.** `block-push-to-main.sh`, `log-commands.sh`, `auto-format.sh` are agent-agnostic bash. Baked into the snapshot. The entrypoint registers them in Claude's `settings.json` (or equivalent for other agents).
 
 ### `/sodaprompts-setup` Skill
 
-**Keep as optional.** Still works for Claude users. Internally, it could call `create-sodaprompts` for config generation, then handle the Daytona-specific shipping.
+**Keep as optional.** Still works for Claude users. Internally calls `create-sodaprompts` logic for config generation.
 
 ### `/sodaprompts-ship` Skill
 
-**Keep as-is.** It just creates GitHub Issues — already agent-agnostic in function, just invoked from Claude. Other agents can use `gh issue create` directly, or we add the same commands to the scaffolder CLI later.
-
----
-
-## `.sodaprompts.yml` Schema Changes
-
-New fields for agent-agnostic support:
-
-```yaml
-# Existing fields (unchanged)
-base_branch: main
-test: pnpm test
-build: pnpm build
-lint: pnpm lint
-format: pnpm prettier --write
-notifications: telegram
-sprite: soda-base
-post_bootstrap:
-  - pnpm install
-mcp_servers: {}
-network_policy:
-  allow:
-    - github.com
-    - "*.anthropic.com"
-
-# New fields
-agent: claude                    # claude | codex | aider
-runtime: node                    # node | python | rust | full (determines snapshot variant)
-review:
-  enabled: true                  # enable reviewer skill (default true)
-  max_rounds: 3                  # max review iterations before auto-approve
-```
-
----
-
-## GitHub Action Changes
-
-The `wake-sprite.yml` workflow changes from `sprite` CLI calls to Daytona SDK/CLI:
-
-```yaml
-# Current
-- run: |
-    sprite start ${{ vars.BUILDER_SPRITE }}
-    sprite exec -s ${{ vars.BUILDER_SPRITE }} -- bash /home/sprite/run-builder.sh
-
-# Target
-- uses: daytonaio/create-sandbox@v1
-  with:
-    snapshot: sodaprompts/doer-${{ env.AGENT }}:${{ env.RUNTIME }}
-    env: |
-      GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
-      GITHUB_REPO=${{ github.repository }}
-      TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
-```
-
-If using subscription auth (not API key), the action references the user's personal authed snapshot instead of the generic public one.
+**Keep as-is.** It just creates GitHub Issues — already agent-agnostic.
 
 ---
 
 ## Migration Path
 
-### Phase 1: Scaffolder (no Daytona changes yet)
+### Phase 1: Scaffolder
 
-- Build and publish `npx create-sodaprompts`
-- Add `agent` and `runtime` fields to `.sodaprompts.yml` schema
+- Build and publish `npx create-sodaprompts` (TS-only)
+- Update `.sodaprompts.yml` schema with new fields (`agent`, `snapshot`, `review`)
 - Keep Sprites as the runtime — scaffolder just generates config
 - Claude plugin still works, now optional for onboarding
 
 ### Phase 2: Daytona Runtime
 
-- Build generic base snapshots (start with `doer-claude:node`)
+- Build Docker image, publish to GHCR as `doer-claude:node-1.0.0`
 - Write `entrypoint.sh` replacing `bootstrap.sh`
+- Write `wake-sandbox.yml` workflow template
 - Simplify `ship-doer.sh` for Daytona
-- Update `wake-sprite.yml` template for Daytona action
 - Test with existing users
 
 ### Phase 3: Multi-Agent
 
 - Build Codex and Aider snapshot variants
 - Update `entrypoint.sh` to configure hooks per agent runtime
-- Update scaffolder to handle agent-specific config generation
+- Update scaffolder to handle agent-specific config
 - Publish snapshot variants
 
 ### Phase 4: Polish
 
 - Web onboarding UI (optional, generates `.sodaprompts.yml` via browser)
-- Language-specific slim snapshots (python, rust)
+- Language-specific snapshots (python, rust)
 - `sodaprompts` CLI for status/logs/kill without agent dependency
 
 ---
 
-## Decisions
-
-### Golden Sandbox (adapted from Sprites)
-
-**Key constraint:** Daytona does not yet support snapshotting a *running* sandbox ([#2519](https://github.com/daytonaio/daytona/issues/2519), filed Sep 2025, in development). You can only create snapshots from Docker images/Dockerfiles, not from live sandbox state. However, sandboxes have a **stop/start lifecycle** that preserves filesystem state, and an **archive/restore** flow for cold storage.
-
-This means the golden-base pattern adapts to two layers:
-
-**Layer 1: Published snapshot (baked deps, shared by all users)**
-
-Built from a Dockerfile that pre-installs everything slow:
-
-```dockerfile
-FROM node:22-slim
-RUN apt-get update && apt-get install -y git gh jq curl chromium xvfb ...
-RUN npm install -g @anthropic-ai/claude-code
-COPY run-builder.sh run-reviewer.sh entrypoint.sh /opt/sodaprompts/
-```
-
-Published as `ghcr.io/sodaprompts/doer-claude:node-1.0.0`. Every user starts from this.
-
-**Layer 2: Long-lived sandbox (per-project state, per user)**
-
-1. First run: create sandbox from published snapshot
-2. Entrypoint clones repo, runs `post_bootstrap` (e.g. `pnpm install`), user logs in to agent CLI
-3. **Stop** the sandbox (not destroy) — filesystem persists including auth tokens, node_modules, etc.
-4. All future runs: **start** the stopped sandbox (fast — no re-install, no re-login)
-5. `push-env` command = update env vars + restart sandbox
-
-The sandbox is long-lived and stopped between tasks (zero cost when stopped). When [#2519](https://github.com/daytonaio/daytona/issues/2519) lands, we can snapshot the sandbox state into a true golden image — but stop/start is sufficient for now.
-
-**Archive for cold storage:** sandboxes inactive for extended periods can be archived (moved to object storage), then restored on next wake. This is analogous to Sprites checkpoint restore.
-
-**API key users:** skip login step — `ANTHROPIC_API_KEY` passed as env var at sandbox creation. Stop/start still saves deps.
-
-### Single Sandbox, Two Skills (not two sandboxes)
-
-The Doer and Thinker become **skills within the same sandbox**, not separate sandboxes. The runner entrypoint picks which skill to invoke based on the work item:
-
-- Issue labeled `prd-queued` / `bug-queued` / PR with `changes_requested` → builder skill
-- PR labeled `needs-review` / issue labeled `needs-investigation` → reviewer skill
-
-Benefits:
-- Half the infrastructure (one sandbox, one snapshot, one wake action)
-- Shared project context (deps already installed, repo already cloned)
-- Simpler config (no separate `reviewer.sprite` field in `.sodaprompts.yml`)
-- Review happens in the same sandbox that built the code — no cold start for reviewer
-
-Trade-off: builder and reviewer can't run concurrently in a single sandbox. This is fine — the current Sprites model already serializes within each sprite, and the reviewer only wakes after the builder finishes.
-
-### OCI Registry: GitHub Container Registry (ghcr.io)
-
-Standard for open-source projects. Published as:
-
-```
-ghcr.io/sodaprompts/doer-claude:node
-ghcr.io/sodaprompts/doer-codex:node
-ghcr.io/sodaprompts/doer-claude:python
-ghcr.io/sodaprompts/doer-claude:full
-```
-
-Why GHCR:
-- Free for public images
-- Native GitHub Actions integration (`docker/login-action` + `docker/build-push-action`)
-- Same auth model as the rest of the project (GitHub PAT)
-- No separate account/billing (Docker Hub requires one)
-- Org-scoped: `ghcr.io/sodaprompts/*` keeps everything under one namespace
-
-Build pipeline: GitHub Action on tag push builds + publishes snapshots via multi-stage Dockerfile.
-
-## Confirmed: Daytona Snapshot + Sandbox Lifecycle API
-
-Full SDK support (Python, TypeScript, Ruby, Go) for both snapshots and sandbox lifecycle:
-
-```python
-# Create snapshot from custom GHCR image (template — not from running sandbox)
-daytona.snapshot.create(
-    CreateSnapshotParams(name='doer-claude-node', image='ghcr.io/sodaprompts/doer-claude:node-1.0.0'),
-    on_logs=lambda chunk: print(chunk, end=""),
-)
-
-# Create sandbox from snapshot
-sandbox = daytona.create(
-    CreateSandboxFromSnapshotParams(snapshot='doer-claude-node', env_vars={...})
-)
-
-# Stop/start lifecycle (filesystem persists — this is our golden-base mechanism)
-sandbox.stop()     # preserves filesystem, clears memory, zero cost
-sandbox.start()    # fast resume with all state intact
-```
+## Daytona API Capabilities
 
 | Capability | Status |
 |---|---|
 | Create snapshot from Docker image/Dockerfile | Available |
 | Create sandbox from snapshot | Available |
+| Pass env vars at sandbox creation | Available |
 | Stop/start sandbox (filesystem persisted) | Available |
 | Archive/restore sandbox (cold storage) | Available |
+| GHCR as container registry source | Explicitly supported |
 | Snapshot a *running* sandbox's state | Not yet ([#2519](https://github.com/daytonaio/daytona/issues/2519)) |
 | Point-in-time checkpoint/rollback | Not yet ([#2528](https://github.com/daytonaio/daytona/issues/2528)) |
 | Fork filesystem + memory state | Coming soon |
 
-When [#2519](https://github.com/daytonaio/daytona/issues/2519) lands, we can create true golden snapshots from configured sandboxes. Until then, stop/start gives us the same UX.
-
-## Confirmed: GHCR + Daytona Compatibility
-
-Daytona docs explicitly list GHCR as a supported container registry. Public images referenced directly:
-
-```
-ghcr.io/sodaprompts/doer-claude:node-1.0.0
-```
-
-For private images, register GHCR in Daytona dashboard with GitHub username + PAT (`read:packages` scope).
-
-**Constraint:** `latest`, `lts`, `stable` tags are not allowed — must use explicit version tags. Fine for us; we'd version snapshots anyway (e.g., `node-1.0.0`, `node-1.1.0`).
-
-Image tags in `.sodaprompts.yml` will need to reference specific versions:
-
-```yaml
-snapshot: ghcr.io/sodaprompts/doer-claude:node-1.0.0
-```
+We don't need #2519 or #2528 — the ephemeral model with `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` as env vars avoids the need for persistent sandbox state entirely.
 
 ## Open Questions
 
-1. **Cost model** — how does Daytona bill for long-lived sandboxes with sleep/wake? Affects guidance on when to snapshot vs keep running.
+1. **Cost model** — how does Daytona bill? Per sandbox-minute? Per creation? Affects whether parallel sandboxes are practical at scale.
