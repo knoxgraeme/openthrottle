@@ -74,9 +74,10 @@ Every task gets a fresh sandbox. No stop/start, no cleanup scripts, no stale sta
 
 | Parameter | Value | Rationale |
 |---|---|---|
-| `autoStopInterval` | `60` | 60-min idle timeout. Daytona auto-stop fires based on SDK interaction, **not** internal process activity. A long Claude Code session won't keep the sandbox alive unless the Action's SDK client maintains a heartbeat. 60 min provides headroom for complex builds. |
-| `autoDeleteInterval` / `ephemeral` | `0` / `true` | Delete immediately on stop. No `--ephemeral` CLI flag; use `--auto-delete 0`. SDK `ephemeral: true` is equivalent. |
-| `resources` | `cpu: 2, memory: 4, disk: 10` | Defaults (1 vCPU / 1GB / 3GB) too small for Claude Code + Node + pnpm. Max per org: 4 vCPU / 8GB / 10GB. |
+| `autoStopInterval` | `60` | 60-min idle timeout (default: 15 min). Daytona auto-stop resets on preview access, SSH connections, and Toolbox SDK API calls — **not** on internal process activity (background scripts, agent sessions). The entrypoint runs a background heartbeat (see below) to keep long sessions alive. |
+| `autoDeleteInterval` / `ephemeral` | `0` / `true` | Delete immediately on stop. CLI: `--auto-delete 0`. SDK: `ephemeral: true` (equivalent). Value `-1` disables auto-delete entirely. |
+| `autoArchiveInterval` | N/A | Default: 7 days. Irrelevant for ephemeral sandboxes — they're deleted on stop, never reaching the archive threshold. |
+| `resources` | `cpu: 2, memory: 4, disk: 10` | Defaults (1 vCPU / 1 GiB / 3 GiB) too small for Claude Code + Node + pnpm. Max per org: 4 vCPU / 8 GiB / 10 GiB. SDK `memory` unit is GiB; CLI `--memory` unit is MB (so `--memory 4096`). |
 | `labels` | `project`, `taskType`, `issue` | For auditing and cost attribution. Note: `daytona list` doesn't support label filtering — use `daytona info` or SDK for orphan cleanup. |
 
 **Why `image` instead of `snapshot`?** The TS SDK's `CreateSandboxFromSnapshotParams` does not support the `resources` field — only `CreateSandboxFromImageParams` does. Since we need to control CPU/RAM/disk, we reference the GHCR image directly. Daytona caches pulled images, so subsequent creates are still fast.
@@ -158,32 +159,58 @@ Trade-off: builder and reviewer run sequentially in a single sandbox. Fine — t
 
 ## Snapshot Image
 
-One Docker image per agent runtime, published on GHCR. Pre-installed:
+Based on the **default Daytona sandbox image** (`daytonaio/sandbox`), which already includes Chromium, Xvfb/xfce4/x11vnc/novnc, Node.js, Claude Code, git, curl, and Python. We add our tooling on top and snapshot once — after that, sandbox creation is sub-90ms regardless of image size.
 
-- **System:** git, gh, jq, curl
-- **Runtime:** Node.js + pnpm (TS-only for v1)
-- **Agent:** Claude Code
+**Already in the base image** (from `daytonaio/sandbox`):
+
+- **System:** git, curl, Chromium, Xvfb, xfce4, x11vnc, novnc, ffmpeg, ripgrep
+- **Runtime:** Node.js, Python 3
+- **Agent:** Claude Code (`@anthropic-ai/claude-code`)
+
+**Added by our layer:**
+
+- **System:** gh, jq, gosu, pnpm
+- **Browser automation:** agent-browser (uses system Chromium — no separate download)
 - **Orchestration:** `run-builder.sh`, `run-reviewer.sh`, `entrypoint.sh`, `task-adapter.sh`
+- **Hooks:** `block-push-to-main.sh`, `log-commands.sh`, `auto-format.sh`
 - **MCP defaults:** Telegram, Context7
 
-**Not in the image** (platform-provided):
+### Browser Testing
 
-- Chromium, xvfb, display server → Daytona Computer Use API
-- agent-browser → replaced by Daytona's native mouse/keyboard/screenshot APIs
-- Playwright → optional, installed via `post_bootstrap` if needed
+**agent-browser** is the primary browser testing tool. It's a native Rust CLI that provides token-efficient browser automation via accessibility tree snapshots with reference-based element targeting (`@e1`, `@e2`). More token-efficient than Playwright MCP because:
 
-This removes ~700MB compared to the Sprites bootstrap.
+- **Batch mode** — multiple commands in one tool call (`agent-browser batch --json`)
+- **Compact refs** — `@e1` instead of verbose MCP tool schemas
+- **No schema overhead** — CLI output, not MCP tool definitions loaded into context
+- **Stateful daemon** — browser stays open between commands, no re-initialization
+
+The agent calls it via Bash tool: `agent-browser open http://localhost:3000`, `agent-browser snapshot`, `agent-browser click @e3`.
+
+**Playwright MCP** (`@playwright/mcp`) available as an opt-in alternative via `mcp_servers` in `.sodaprompts.yml`. Better for projects needing device emulation, vision mode, or isolated browser profiles. Not a default because of higher token cost per interaction.
+
+**Daytona Computer Use** is infrastructure, not a testing tool:
+- Xvfb/xfce4/x11vnc/novnc already in the base image — Computer Use API just starts/stops them
+- External screenshot/recording API useful for observability (GitHub Action can capture for debugging)
+- Started by GitHub Action after sandbox creation if needed, not by the entrypoint
 
 ```dockerfile
-FROM node:22-slim
-RUN apt-get update && apt-get install -y git gh jq curl
-RUN npm install -g @anthropic-ai/claude-code
+FROM daytonaio/sandbox:0.54.0
+# Base image includes: Chromium, Xvfb, xfce4, Node.js, Claude Code, Python, git, curl
+RUN apt-get update && apt-get install -y gh jq gosu && npm install -g pnpm agent-browser
 COPY run-builder.sh run-reviewer.sh entrypoint.sh task-adapter.sh /opt/sodaprompts/
+COPY hooks/ /opt/sodaprompts/hooks/
+ENTRYPOINT ["/opt/sodaprompts/entrypoint.sh"]
 ```
 
 Published as: `ghcr.io/sodaprompts/doer-claude:node-1.0.0`
 
-**Why GHCR:**
+**Why base on `daytonaio/sandbox`:**
+- Chromium, Xvfb, Claude Code, Node.js already included — less to install and maintain
+- Inherits Daytona's updates to Chromium/Claude Code versions
+- Computer Use works out of the box (VNC packages pre-installed)
+- Extra packages we don't use (Python ML libs) are harmless once snapshotted
+
+**Why publish to GHCR:**
 - Free for public images
 - Native GitHub Actions integration (`docker/login-action` + `docker/build-push-action`)
 - Same auth model as the rest of the project (GitHub PAT)
@@ -200,6 +227,8 @@ daytona snapshot create sodaprompts-doer-claude-node \
 ```
 
 **Constraint:** Snapshot images must use explicit version tags — no `latest`/`lts`/`stable`.
+
+**Snapshot auto-deactivation:** Daytona automatically deactivates snapshots after 2 weeks of non-use. If a project goes idle, the next `daytona create --snapshot` will fail. The wake workflow should handle this gracefully — either by calling `daytona snapshot activate` before creation, or by using `CreateSandboxFromImageParams` (SDK) which bypasses snapshots entirely. The scaffolder should document this in onboarding.
 
 **Future variants** (not v1): `doer-codex:node-1.0.0`, `doer-claude:python-1.0.0`, `doer-claude:full-1.0.0`
 
@@ -241,9 +270,9 @@ review:
 |---|---|---|
 | Build commands | `test`, `build`, `lint`, `format`, `dev` | Wired into Claude Stop hooks (lint + test before exit), auto-format hook |
 | Post-bootstrap | `post_bootstrap` | Runs after clone (pnpm install, DB migrations, etc.) |
-| MCP servers | `mcp_servers` | Merged into `~/.claude/settings.json`; `"from-env"` resolved from env vars |
+| MCP servers | `mcp_servers` | Merged into `~/.claude/settings.json`; `"from-env"` resolved from env vars. Defaults (Telegram, Context7) always included; project-specific servers (e.g. Playwright MCP, Supabase) added on top. |
 | Supabase safety | Auto-detected from `mcp_servers.supabase` | Applies tool allowlist — only branch management + read-only ops |
-| Network policy | Default | Daytona essential services cover our needs |
+| Network policy | Default | Daytona essential services cover our needs. `network_policy` field from Sprites schema is deprecated — remove from `sodaprompts-schema.yml`. |
 | Hooks | Baked into snapshot | `block-push-to-main`, `log-commands`, `auto-format` |
 
 ---
@@ -253,35 +282,40 @@ review:
 Replaces the 400-line `bootstrap.sh` with ~50 lines:
 
 ```
-1. Start Daytona Computer Use (sandbox.computerUse.start())
-2. gh repo clone $GITHUB_REPO
-3. Read .sodaprompts.yml
-4. Run post_bootstrap commands
-5. Write ~/.claude/settings.json:
+1. gh repo clone $GITHUB_REPO
+2. Read .sodaprompts.yml
+3. Run post_bootstrap commands
+4. Write ~/.claude/settings.json (as root):
    - Merge MCP servers (defaults + project-specific)
    - Resolve "from-env" placeholders
    - Register hooks (block-push-to-main, log-commands, auto-format)
    - Wire lint + test into Stop hooks
    - If supabase MCP detected: apply tool allowlist
+5. chattr +i ~/.claude/settings.json (seal as root)
 6. Nullify repo-level .claude/settings.json
-7. Detect work item type (issue label / PR state)
-8. Run builder or reviewer skill
+7. Drop to `daytona` user via exec gosu daytona
+8. Detect work item type from $TASK_TYPE env var
+9. Run builder or reviewer skill
 ```
+
+**Heartbeat.** The entrypoint starts a background loop that calls a Toolbox SDK API endpoint (e.g. `sandbox.fs.list('/')`) every 5 minutes. This resets the `autoStopInterval` timer and prevents long-running agent sessions from being killed. The heartbeat exits when the runner finishes.
+
+**Computer Use is started externally.** The Daytona Computer Use API (`sandbox.computerUse.start()`) launches Xvfb, xfce4, x11vnc, and novnc inside the sandbox — but it must be called from **outside** via the SDK or REST API (`POST /toolbox/{sandboxId}/computeruse/start`). The entrypoint runs inside the sandbox and cannot call it. The GitHub Action starts Computer Use after sandbox creation (see GitHub Action section).
 
 | Current bootstrap step | Daytona |
 |---|---|
 | Install system packages | Baked into snapshot |
-| Install Chromium + xvfb | Computer Use API |
-| Install agent-browser + Playwright | Computer Use replaces agent-browser; Playwright optional via `post_bootstrap` |
+| Install Chromium + xvfb | Already in base image (`daytonaio/sandbox`) |
+| Install agent-browser + Playwright | agent-browser baked into snapshot; uses system Chromium |
 | Install GitHub CLI | Baked into snapshot |
 | Install Claude Code | Baked into snapshot |
 | Install sodaprompts plugin | Baked into snapshot |
 | Install Telegram MCP | Baked into snapshot |
 | Clone repo | Entrypoint (runtime) |
 | Run post_bootstrap | Entrypoint (runtime) |
-| Configure MCP + hooks | Entrypoint (runtime) |
-| Start Computer Use | Entrypoint calls Computer Use API |
-| Start runner | Entrypoint (runtime) |
+| Configure MCP + hooks | Entrypoint (runtime, as root before dropping privileges) |
+| Start Computer Use | Optional — GitHub Action calls `computerUse.start()` via SDK/API if project needs headed browser mode |
+| Start runner | Entrypoint (runtime, as `daytona` user) |
 
 ---
 
@@ -299,7 +333,7 @@ on:
 
 jobs:
   run-task:
-    if: |
+    if: >-
       contains(github.event.label.name, 'prd-queued') ||
       contains(github.event.label.name, 'bug-queued') ||
       contains(github.event.label.name, 'needs-review') ||
@@ -308,39 +342,53 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Resolve work item
+        id: work
+        run: |
+          # GitHub Actions expressions don't support || for coalescing.
+          # Use shell fallback instead.
+          WORK_ITEM="${{ github.event.issue.number }}"
+          if [[ -z "$WORK_ITEM" ]]; then
+            WORK_ITEM="${{ github.event.pull_request.number }}"
+          fi
+          echo "item=$WORK_ITEM" >> "$GITHUB_OUTPUT"
+
+          # Determine task type
+          TASK_TYPE="prd"
+          if [[ "${{ github.event.label.name }}" == "bug-queued" ]]; then
+            TASK_TYPE="bug"
+          elif [[ "${{ github.event.label.name }}" == "needs-review" ]]; then
+            TASK_TYPE="review"
+          elif [[ "${{ github.event.review.state }}" == "changes_requested" ]]; then
+            TASK_TYPE="review-fix"
+          fi
+          echo "task_type=$TASK_TYPE" >> "$GITHUB_OUTPUT"
+
+          # Extract session ID for review fixes (portable — no grep -oP)
+          RESUME_SESSION=""
+          if [[ "$TASK_TYPE" == "review-fix" ]]; then
+            PR_NUM="${{ github.event.pull_request.number }}"
+            RESUME_SESSION=$(gh pr view "$PR_NUM" --json comments \
+              --jq '.comments[] | select(.body | contains("session-id:")) | .body' \
+              | sed -n 's/.*session-id: \([^ ]*\).*/\1/p' | tail -1)
+          fi
+          echo "resume_session=$RESUME_SESSION" >> "$GITHUB_OUTPUT"
+
       - name: Create and run sandbox
         env:
           DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
         run: |
           SNAPSHOT=$(yq '.snapshot' .sodaprompts.yml)
 
-          # Extract session ID for review fixes
-          RESUME_SESSION=""
-          if [[ "${{ github.event.review.state }}" == "changes_requested" ]]; then
-            PR_NUM="${{ github.event.pull_request.number }}"
-            RESUME_SESSION=$(gh pr view "$PR_NUM" --json comments \
-              --jq '.comments[] | select(.body | contains("session-id:")) | .body' \
-              | grep -oP 'session-id: \K\S+' | tail -1)
-          fi
-
-          # Determine task type
-          TASK_TYPE="prd"
-          if [[ "${{ github.event.label.name }}" == "bug-queued" ]]; then
-            TASK_TYPE="bug"
-          elif [[ "${{ github.event.review.state }}" == "changes_requested" ]]; then
-            TASK_TYPE="review-fix"
-          fi
-          WORK_ITEM="${{ github.event.issue.number || github.event.pull_request.number }}"
-
           # Create ephemeral sandbox
-          daytona create \
+          SANDBOX_ID=$(daytona create \
             --snapshot "$SNAPSHOT" \
             --auto-delete 0 \
             --auto-stop 60 \
             --cpu 2 --memory 4096 --disk 10 \
             --label project=${{ github.event.repository.name }} \
-            --label task_type="$TASK_TYPE" \
-            --label issue="$WORK_ITEM" \
+            --label task_type="${{ steps.work.outputs.task_type }}" \
+            --label issue="${{ steps.work.outputs.item }}" \
             --volume sodaprompts-${{ github.repository_id }}:/home/daytona/.claude \
             --env GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }} \
             --env GITHUB_REPO=${{ github.repository }} \
@@ -348,8 +396,15 @@ jobs:
             --env CLAUDE_CODE_OAUTH_TOKEN=${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }} \
             --env TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }} \
             --env TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }} \
-            --env WORK_ITEM="$WORK_ITEM" \
-            --env RESUME_SESSION="$RESUME_SESSION"
+            --env WORK_ITEM="${{ steps.work.outputs.item }}" \
+            --env TASK_TYPE="${{ steps.work.outputs.task_type }}" \
+            --env RESUME_SESSION="${{ steps.work.outputs.resume_session }}")
+
+          # Optional: Start Computer Use (Xvfb + xfce4 + x11vnc + novnc) for headed browser mode.
+          # Not needed for headless agent-browser (default) or headless Playwright MCP.
+          # curl -sf -X POST \
+          #   "https://proxy.app.daytona.io/toolbox/${SANDBOX_ID}/computeruse/start" \
+          #   -H "Authorization: Bearer $DAYTONA_API_KEY"
 ```
 
 ---
@@ -477,20 +532,24 @@ gh issue create --title "Search" --body-file search.md --label prd-queued
 
 ### Runner Scripts (`run-builder.sh`, `run-reviewer.sh`)
 
-**Keep logic, update artifact storage.** Already agent-agnostic via `AGENT_RUNTIME` env var. Move from being uploaded per-sprite to being baked into the snapshot at `/opt/sodaprompts/`.
+**Significant refactor.** Already agent-agnostic via `AGENT_RUNTIME` env var. Move from being uploaded per-sprite to being baked into the snapshot at `/opt/sodaprompts/`. The core build/review logic stays, but the Sprite-specific scaffolding needs updating.
 
-Two changes:
+Changes:
 
 1. **Completion artifacts** — `completion.json` currently written to `/home/sprite/completions/`, destroyed with ephemeral sandbox. Move to GitHub:
    - Decision log → PR comment (already done)
    - Session report → PR comment (already done)
    - Completion status → GitHub issue comment or check run (new)
    - Runner result detection reads from GitHub instead of local filesystem
-2. **Task adapter** — route all `gh issue` calls through `task-adapter.sh` for provider abstraction
+2. **Remove idle-to-suspend pattern** — both runners currently exit after 5 min idle to trigger Sprite suspension at zero cost. Ephemeral sandboxes don't need this — the runner runs once, finishes, and the sandbox auto-stops. Remove the polling loop and idle timeout logic.
+3. **Update paths** — `/home/sprite/` references → `/home/daytona/`; completion paths, log paths, session file paths all change.
+4. **Remove checkpoint/restore references** — no more `sprite checkpoint` calls or golden-base logic.
+5. **Task type from env var** — the entrypoint no longer needs to poll GitHub for work items. `TASK_TYPE` and `WORK_ITEM` are passed as env vars from the GitHub Action. The runner executes a single task and exits.
+6. **Task adapter** — route all `gh issue` calls through `task-adapter.sh` for provider abstraction.
 
 ### Task Adapter (`scripts/task-adapter.sh`)
 
-**New.** Thin shell library sourced by runners, abstracts task operations:
+**Already exists** (253 lines). Thin shell library sourced by runners, abstracts task operations:
 
 | Function | GitHub implementation |
 |---|---|
@@ -513,7 +572,7 @@ Two changes:
 
 ### `ship-doer.sh`
 
-**Simplify.** 12-step flow → 3 steps: read config, create sandbox, print summary. Steps that disappear: locate plugin, upload files, push env, run bootstrap, checkpoint.
+**Simplify.** Current 393-line, 12-step flow → ~50-line, 3-step flow: read config, create sandbox via SDK, print summary. Steps that disappear: locate plugin, upload files, push env, run bootstrap, apply network policy, checkpoint as golden-base, verify setup. The structured output protocol (`===SHIP_ERROR_BEGIN/END===`, `===SHIP_COMPLETE===`) stays for `/sodaprompts-setup` integration.
 
 ### Hooks
 
@@ -534,27 +593,44 @@ Changes to `log-commands.sh`:
 | `ship kill` | `sprite exec` kill session | `sandbox.stop()` (auto-deletes) |
 | `ship push-env` | Push `.env` + re-checkpoint | **Removed** — env vars at creation |
 
-### Telegram Commands
+### Telegram Notifications
 
-**Adapt.** `/status`, `/logs`, `/queue`, `/kill` currently talk to Sprites. Changes:
+**Simplify.** The current `telegram-poller.sh` (312 lines) runs as a background daemon on the Sprite, continuously polling for commands. With ephemeral sandboxes there's no long-lived process to host a daemon.
 
-| Command | Change |
-|---|---|
-| `/status` | No change (reads from GitHub) |
-| `/logs` | Daytona SDK stream or GitHub Actions logs |
-| `/queue` | No change (`gh issue list --label prd-queued`) |
-| `/kill` | `sandbox.stop()` (auto-deletes) |
+Replace with **on-demand polling** — the runner sends Telegram notifications at key moments (task started, PR opened, review complete, error) and only polls for a reply when it needs human input (phone-a-friend pattern). No background daemon, no `/status`/`/logs`/`/queue`/`/kill` commands inside the sandbox.
+
+| Notification | When | Direction |
+|---|---|---|
+| Task started | Entrypoint begins | Sandbox → Telegram |
+| PR opened | Builder creates PR | Sandbox → Telegram |
+| Review complete | Reviewer finishes | Sandbox → Telegram |
+| Error / blocked | Runner hits an error or needs input | Sandbox → Telegram, then poll for reply |
+
+User-facing commands (`/status`, `/queue`) continue to work from the local `/sodaprompts-ship` skill — they read from GitHub, not from the sandbox.
 
 ---
 
 ## Deprecated (Removed in Migration)
 
+### Concepts
+- **Separate Chromium/xvfb install** → included in base Daytona image
 - **Checkpoint/restore** → ephemeral sandboxes
 - **`push-env`** → env vars at sandbox creation
 - **Env-reset signal** → every sandbox starts clean
 - **`/home/sprite/completions/`** → completion status moves to GitHub
-- **Sprite-level network policy API** → replaced by per-sandbox config from `.sodaprompts.yml` + Daytona platform defaults
+- **Sprite-level network policy API** → replaced by Daytona platform defaults
 - **Long-lived sprite lifecycle** → create/run/destroy per task
+- **Idle-to-suspend polling loop** → runner executes a single task and exits; sandbox auto-stops
+
+### Scripts
+- **`bootstrap.sh`** (431 lines) → replaced by `entrypoint.sh` (~50 lines)
+- **`bootstrap-reviewer.sh`** (124 lines) → removed (single sandbox, two skills)
+- **`ship-reviewer.sh`** (341 lines) → removed (no separate reviewer sprite)
+- **`ship-common.sh`** (380 lines) → most logic disappears with simplified `ship-doer.sh`
+- **`install-skill.sh`** (40 lines) → skills baked into snapshot at build time
+- **`preflight.sh`** → sprite-specific pre-flight checks no longer needed
+- **`telegram-poller.sh`** (312 lines) → replaced by on-demand notifications (no background daemon)
+- **`bootstrap-common.sh`** (137 lines) → shared bootstrap utilities no longer needed
 
 ---
 
@@ -629,7 +705,7 @@ We use **Daytona's default network policy** (no `networkBlockAll`, no custom `ne
 Three independent layers:
 
 1. **Boundary markers** — all user-submitted content (issue bodies, review comments, PR bodies) wrapped in explicit boundary markers with warnings in every prompt. Applied in: `run-builder.sh` (PRD file, bug prompt, review-fix prompt), `run-reviewer.sh` (original task, builder review).
-2. **PreToolUse sandbox guard** (`sandbox-guard.sh`) — blocks bash commands that reference secret env vars (`$GITHUB_TOKEN`, `$ANTHROPIC_API_KEY`, `$CLAUDE_CODE_OAUTH_TOKEN`, `$SUPABASE_ACCESS_TOKEN`, `$TELEGRAM_BOT_TOKEN`) in outbound network calls (`curl`, `wget`, `nc`, `netcat`, `python http`, `node http`, `fetch`). Also blocks `env`/`printenv`/`set` and `cat .env` piped to outbound commands. Fires before every Bash tool invocation.
+2. **PreToolUse sandbox guard** (`block-push-to-main.sh`) — blocks bash commands that reference secret env vars (`$GITHUB_TOKEN`, `$ANTHROPIC_API_KEY`, `$CLAUDE_CODE_OAUTH_TOKEN`, `$SUPABASE_ACCESS_TOKEN`, `$TELEGRAM_BOT_TOKEN`) in outbound network calls (`curl`, `wget`, `nc`, `netcat`, `python http`, `node http`, `fetch`). Also blocks `env`/`printenv`/`set` and `cat .env` piped to outbound commands. Fires before every Bash tool invocation.
 3. **Sealed settings** — agent cannot remove the guard hook or modify permissions (settings.json is immutable).
 
 **Limitation:** The sandbox guard uses regex pattern matching. Sophisticated obfuscation (base64 encoding, writing to a temp file then curling it, using Python's `requests` library with an env var read) could theoretically bypass it. The guard catches common/obvious attack patterns. GitHub branch protection remains the hard stop for the most critical action (pushing to main).
@@ -697,15 +773,22 @@ OUTPUT=$(daytona sandbox create ... 2>&1) || {
 | Create sandbox from snapshot (CLI: `daytona create --snapshot`, SDK: `CreateSandboxFromSnapshotParams`) | Available |
 | Create sandbox from OCI image (SDK only: `CreateSandboxFromImageParams`) | Available (supports `resources` field; no CLI equivalent — CLI requires snapshot) |
 | Create snapshot from image (CLI: `daytona snapshot create --image`) | Available |
-| Pass env vars at sandbox creation | Available |
+| Create snapshot from Dockerfile (CLI: `daytona snapshot create --dockerfile`) | Available |
+| Pass env vars at sandbox creation (CLI: `--env`, SDK: `envVars`) | Available |
+| Mount volumes (CLI: `--volume name:/path`, SDK: `volumes: [{ volumeId, mountPath }]`) | Available (FUSE-based, free, no quota impact, max 100 per org) |
+| Computer Use API (start/stop Xvfb + xfce4 + x11vnc + novnc) | Available (called externally via SDK/REST, launches processes inside sandbox) |
+| Computer Use mouse/keyboard/screenshot/recording | Available |
 | Stop/start sandbox (filesystem persisted) | Available |
 | Archive/restore sandbox (cold storage) | Available |
-| GHCR as container registry source | Explicitly supported |
+| GHCR as container registry source | Explicitly supported (register at daytona.io/dashboard/registries) |
+| Snapshot auto-deactivation | Automatic after 2 weeks of non-use; reactivate via SDK/API/dashboard |
 | Snapshot a *running* sandbox's state | Not yet ([#2519](https://github.com/daytonaio/daytona/issues/2519)) |
 | Point-in-time checkpoint/rollback | Not yet ([#2528](https://github.com/daytonaio/daytona/issues/2528)) |
 | Fork filesystem + memory state | Coming soon |
 
 We don't need #2519 or #2528 — the ephemeral model avoids the need for persistent sandbox state entirely.
+
+**Volume limitations:** Volumes are FUSE-based mounts — slower than local sandbox filesystem, cannot be used for applications requiring block storage access (database tables). Fine for session data and logs.
 
 ---
 
@@ -720,10 +803,14 @@ We don't need #2519 or #2528 — the ephemeral model avoids the need for persist
 
 ### Phase 2: Daytona Runtime
 
-- Build Docker image, publish to GHCR as `doer-claude:node-1.0.0`
+- Build Docker image (based on `daytonaio/sandbox`), publish to GHCR as `doer-claude:node-1.0.0`
+- Create Daytona snapshot from GHCR image
 - Write `entrypoint.sh` replacing `bootstrap.sh`
 - Write `wake-sandbox.yml` workflow template
+- Refactor `run-builder.sh` — remove idle-to-suspend, update paths, single-task execution, env-var-driven task type
+- Refactor `run-reviewer.sh` — same changes as builder
 - Simplify `ship-doer.sh` for Daytona
+- Update `log-commands.sh` — new log path, add `CLAUDE_CODE_OAUTH_TOKEN` to sanitization
 - Test with existing users
 
 ### Phase 3: Multi-Agent
@@ -744,4 +831,7 @@ We don't need #2519 or #2528 — the ephemeral model avoids the need for persist
 ## Open Questions
 
 1. **Cost model** — Daytona billing (per sandbox-minute? per creation?) affects parallel sandbox viability at scale.
-2. **Stdout streaming** — for `ship logs` and Telegram `/logs`, confirm Daytona SDK `process.exec()` streaming works for runner script output.
+2. **Stdout streaming** — for `ship logs` and Telegram `/logs`, confirm Daytona SDK `process.executeCommand()` streaming works for runner script output.
+3. **Snapshot activation in CI** — if a project goes idle >2 weeks, the snapshot auto-deactivates. The wake workflow needs a pre-creation activation step or fallback to `CreateSandboxFromImageParams` (slower first run, fast after image cache).
+4. **GHCR registry setup** — Daytona requires private registries to be registered at `daytona.io/dashboard/registries` with a GitHub PAT scoped to `write:packages`, `read:packages`, `delete:packages`. The scaffolder should automate or document this step.
+5. **Heartbeat implementation** — the entrypoint needs a background heartbeat to keep long sessions alive. Determine the lightest Toolbox API call that resets `autoStopInterval` (e.g. `GET /toolbox/{sandboxId}/filesystem/list?path=/`). The heartbeat script needs the sandbox ID — verify it's available inside the sandbox as an env var or via metadata endpoint.
