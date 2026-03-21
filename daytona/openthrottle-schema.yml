@@ -19,7 +19,7 @@ notifications: telegram
 agent: claude
 
 # Daytona snapshot name (created during onboarding)
-snapshot: openthrottle-doer-claude-node
+snapshot: openthrottle
 
 # Commands to run after clone (install deps, seed data, etc.)
 post_bootstrap:

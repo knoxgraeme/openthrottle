@@ -1,9 +1,11 @@
-FROM daytonaio/sandbox:0.54.0
+FROM daytonaio/sandbox:0.6.0
 
 # Base image includes: Chromium, Xvfb, xfce4, Node.js, Claude Code, Python, git, curl
-# Build with: docker build --build-arg AGENT=claude|codex|aider
+# Build remotely: daytona snapshot create openthrottle --dockerfile ./Dockerfile --context .
 
 ARG AGENT=claude
+
+USER root
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       gh jq gosu \

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# entrypoint.sh — Daytona sandbox entrypoint for sodaprompts
+# entrypoint.sh — Daytona sandbox entrypoint for openthrottle
 #
 # Replaces the 400-line bootstrap.sh with a simple config-driven flow.
 # Runs as root, configures the environment, then drops to the daytona user.
@@ -37,11 +37,11 @@ gh repo clone "$GITHUB_REPO" "$REPO" -- --depth=50
 cd "$REPO"
 
 # ---------------------------------------------------------------------------
-# 2. Read .sodaprompts.yml
+# 2. Read .openthrottle.yml
 # ---------------------------------------------------------------------------
-CONFIG="${REPO}/.sodaprompts.yml"
+CONFIG="${REPO}/.openthrottle.yml"
 if [[ ! -f "$CONFIG" ]]; then
-  log "FATAL: .sodaprompts.yml not found in repo"
+  log "FATAL: .openthrottle.yml not found in repo"
   exit 1
 fi
 
@@ -63,7 +63,7 @@ AGENT=$(read_config '.agent' 'claude')
 # 3. Run post_bootstrap commands (as daytona user, not root)
 # ---------------------------------------------------------------------------
 POST_BOOTSTRAP=$(yq -r '.post_bootstrap // [] | .[]' "$CONFIG") || {
-  log "FATAL: Failed to parse post_bootstrap from .sodaprompts.yml — check YAML syntax"
+  log "FATAL: Failed to parse post_bootstrap from .openthrottle.yml — check YAML syntax"
   exit 1
 }
 if [[ -n "$POST_BOOTSTRAP" ]]; then
@@ -83,7 +83,7 @@ fi
 log "Configuring agent settings (${AGENT})"
 
 # 4a. Install universal git hooks and seal git config (works for ALL agent runtimes)
-git -C "$REPO" config core.hooksPath /opt/sodaprompts/git-hooks
+git -C "$REPO" config core.hooksPath /opt/openthrottle/git-hooks
 log "Installed git hooks (pre-push)"
 # Seal .git/config to prevent agents from changing core.hooksPath
 seal_file "${REPO}/.git/config" 2>/dev/null || true
@@ -110,11 +110,11 @@ case "$AGENT" in
         "permissions": {"allow": [], "deny": []},
         "hooks": {
           "PreToolUse": [
-            {"matcher": "Bash", "hooks": ["/opt/sodaprompts/hooks/block-push-to-main.sh"]}
+            {"matcher": "Bash", "hooks": ["/opt/openthrottle/hooks/block-push-to-main.sh"]}
           ],
           "PostToolUse": [
-            {"matcher": "Bash", "hooks": ["/opt/sodaprompts/hooks/log-commands.sh"]},
-            {"matcher": "Write|Edit", "hooks": ["/opt/sodaprompts/hooks/auto-format.sh"]}
+            {"matcher": "Bash", "hooks": ["/opt/openthrottle/hooks/log-commands.sh"]},
+            {"matcher": "Write|Edit", "hooks": ["/opt/openthrottle/hooks/auto-format.sh"]}
           ],
           "Stop": $stop_hooks
         }
@@ -273,10 +273,10 @@ export AGENT_RUNTIME="$AGENT"
 
 case "$TASK_TYPE" in
   prd|bug|review-fix)
-    exec gosu daytona /opt/sodaprompts/run-builder.sh
+    exec gosu daytona /opt/openthrottle/run-builder.sh
     ;;
   review|investigation)
-    exec gosu daytona /opt/sodaprompts/run-reviewer.sh
+    exec gosu daytona /opt/openthrottle/run-reviewer.sh
     ;;
   *)
     log "Unknown TASK_TYPE: ${TASK_TYPE}"

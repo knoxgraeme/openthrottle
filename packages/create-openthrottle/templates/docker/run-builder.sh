@@ -26,8 +26,8 @@ RUNNER_NAME="builder"
 mkdir -p "$LOG_DIR" "$SESSIONS_DIR"
 
 # Source shared libraries
-source /opt/sodaprompts/agent-lib.sh
-source /opt/sodaprompts/task-adapter.sh
+source /opt/openthrottle/agent-lib.sh
+source /opt/openthrottle/task-adapter.sh
 
 # Read config
 BASE_BRANCH="${BASE_BRANCH:-main}"
@@ -328,7 +328,7 @@ find "$SESSIONS_DIR" -name '*.id' -mtime +7 -delete 2>/dev/null || true
 # Only runs if the Supabase MCP is configured (SUPABASE_ACCESS_TOKEN set).
 if [[ -n "${SUPABASE_ACCESS_TOKEN:-}" ]] && command -v npx &>/dev/null; then
   ORPHAN_BRANCHES=$(npx -y @supabase/mcp-server list_branches 2>/dev/null \
-    | jq -r '.[] | select(.name | startswith("sodaprompts-")) | .name' 2>/dev/null || true)
+    | jq -r '.[] | select(.name | startswith("openthrottle-")) | .name' 2>/dev/null || true)
   if [[ -n "$ORPHAN_BRANCHES" ]]; then
     log "Cleaning up orphaned Supabase branches"
     while IFS= read -r branch; do

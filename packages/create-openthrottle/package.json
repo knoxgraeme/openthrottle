@@ -1,10 +1,10 @@
 {
-  "name": "@sodaprompts/create-sodaprompts",
+  "name": "create-openthrottle",
   "version": "1.0.0",
-  "description": "Set up sodaprompts in any Node.js project — agent-agnostic, config-driven.",
+  "description": "Set up openthrottle in any Node.js project — agent-agnostic, config-driven.",
   "type": "module",
   "bin": {
-    "create-sodaprompts": "./index.mjs"
+    "create-openthrottle": "./index.mjs"
   },
   "files": [
     "index.mjs",
@@ -21,10 +21,10 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/sodaprompts/sodaprompts"
+    "url": "https://github.com/knoxgraeme/sodaprompts"
   },
   "keywords": [
-    "sodaprompts",
+    "openthrottle",
     "daytona",
     "agent",
     "scaffolder",
