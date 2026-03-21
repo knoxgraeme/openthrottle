@@ -5,16 +5,15 @@
 // Usage: npx create-openthrottle
 //
 // Detects the project, prompts for config, generates .openthrottle.yml +
-// wake-sandbox.yml, creates a Daytona snapshot + volume, prints next steps.
+// wake-sandbox.yml, creates a Daytona snapshot from GHCR, and prints next steps.
 // =============================================================================
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import prompts from 'prompts';
 import { stringify } from 'yaml';
-import { Daytona } from '@daytonaio/sdk';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cwd = process.cwd();
@@ -108,14 +107,7 @@ async function promptConfig(detected) {
       type: (prev) => prev ? 'number' : null,
       name: 'maxRounds', message: 'Max review rounds', initial: 3, min: 1, max: 10,
     },
-    {
-      type: 'select', name: 'snapshotMode', message: 'Snapshot source',
-      choices: [
-        { title: 'Pre-built image (faster, recommended)', value: 'image' },
-        { title: 'Build from Dockerfile (customizable)', value: 'dockerfile' },
-      ],
-      initial: 0,
-    },
+    { type: 'text', name: 'snapshotName', message: 'Daytona snapshot name', initial: 'openthrottle' },
   ], { onCancel: () => { console.log('\nCancelled.'); process.exit(0); } });
 
   return { ...detected, ...response };
@@ -135,7 +127,7 @@ function generateConfig(config) {
     build: config.build || undefined,
     notifications: config.notifications === 'none' ? undefined : config.notifications,
     agent: config.agent,
-    snapshot: `openthrottle`,
+    snapshot: config.snapshotName || 'openthrottle',
     post_bootstrap: [config.postBootstrap],
     mcp_servers: {},
     review: {
@@ -173,76 +165,40 @@ function copyWorkflow() {
 }
 
 // ---------------------------------------------------------------------------
-// 5 & 6. Create Daytona snapshot + volume
+// 5. Create Daytona snapshot from pre-built GHCR image
 // ---------------------------------------------------------------------------
 
-async function setupDaytona(config) {
-  const apiKey = process.env.DAYTONA_API_KEY;
-  if (!apiKey) {
-    console.error('\n  Missing DAYTONA_API_KEY env var. Get one at https://daytona.io/dashboard\n');
-    process.exit(1);
-  }
+function setupDaytona(config) {
+  const snapshotName = config.snapshotName || 'openthrottle';
+  const image = 'ghcr.io/knoxgraeme/openthrottle:latest';
 
-  const daytona = new Daytona();
-  const snapshotName = `openthrottle`;
-  const volumeName = `openthrottle-${config.name}`;
-
-  // Create snapshot — from pre-built image or from Dockerfile
-  if (config.snapshotMode === 'dockerfile') {
-    // Copy Dockerfile + runtime scripts into user's project for customization
-    const dockerDir = join(cwd, '.openthrottle', 'docker');
-    mkdirSync(dockerDir, { recursive: true });
-
-    const templateDir = join(__dirname, 'templates', 'docker');
-    if (existsSync(templateDir)) {
-      for (const file of readdirSync(templateDir, { recursive: true })) {
-        const src = join(templateDir, file);
-        const dest = join(dockerDir, file);
-        const stat = statSync(src);
-        if (stat.isDirectory()) {
-          mkdirSync(dest, { recursive: true });
-        } else {
-          mkdirSync(dirname(dest), { recursive: true });
-          copyFileSync(src, dest);
-        }
-      }
-    }
-    console.log('  ✓ Copied Dockerfile + runtime to .openthrottle/docker/');
-    console.log('    Customize the Dockerfile, then create snapshot:');
-    console.log(`    daytona snapshot create ${snapshotName} --dockerfile .openthrottle/docker/Dockerfile --build-arg AGENT=${config.agent}`);
-  } else {
-    const image = `ghcr.io/openthrottle/doer-${config.agent}:node-1.0.0`;
-    try {
-      await daytona.snapshot.create({
-        name: snapshotName,
-        image,
-        resources: { cpu: 2, memory: 4, disk: 10 },
-      });
-      console.log(`  ✓ Created Daytona snapshot: ${snapshotName}`);
-    } catch (err) {
-      if (err.status === 409 || err.message?.includes('already exists')) {
-        console.log(`  ✓ Snapshot already exists: ${snapshotName}`);
-      } else {
-        console.error(`  ✗ Failed to create snapshot: ${err.message}`);
-        process.exit(1);
-      }
-    }
-  }
-
-  // Create volume (idempotent)
+  // Check daytona CLI is available
   try {
-    await daytona.volume.create({ name: volumeName });
-    console.log(`  ✓ Created Daytona volume: ${volumeName}`);
+    execFileSync('daytona', ['--version'], { stdio: 'pipe' });
+  } catch {
+    console.log(`\n  daytona CLI not found. Install it, then run:`);
+    console.log(`    daytona snapshot create ${snapshotName} --image ${image} --cpu 2 --memory 4 --disk 10\n`);
+    return { snapshotName, skipped: true };
+  }
+
+  // Create snapshot from pre-built image
+  try {
+    execFileSync('daytona', [
+      'snapshot', 'create', snapshotName,
+      '--image', image,
+      '--cpu', '2', '--memory', '4', '--disk', '10',
+    ], { stdio: 'inherit' });
+    console.log(`  ✓ Created Daytona snapshot: ${snapshotName}`);
   } catch (err) {
-    if (err.status === 409 || err.message?.includes('already exists')) {
-      console.log(`  ✓ Volume already exists: ${volumeName}`);
+    if (err.stderr?.toString().includes('already exists')) {
+      console.log(`  ✓ Snapshot already exists: ${snapshotName}`);
     } else {
-      console.error(`  ✗ Failed to create volume: ${err.message}`);
-      process.exit(1);
+      console.log(`  ✗ Snapshot creation failed. You can create it manually:`);
+      console.log(`    daytona snapshot create ${snapshotName} --image ${image} --cpu 2 --memory 4 --disk 10`);
     }
   }
 
-  return { snapshotName, volumeName };
+  return { snapshotName };
 }
 
 // ---------------------------------------------------------------------------
@@ -322,10 +278,10 @@ async function main() {
     console.log('  ✓ Copied .github/workflows/wake-sandbox.yml');
   }
 
-  // Steps 5 & 6: Daytona setup
-  await setupDaytona(config);
+  // Step 5: Create Daytona snapshot
+  setupDaytona(config);
 
-  // Step 7: Next steps
+  // Step 6: Next steps
   printNextSteps(config);
 }
 
