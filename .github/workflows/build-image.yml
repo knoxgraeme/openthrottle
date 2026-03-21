@@ -1,7 +1,7 @@
 # Build and push the openthrottle Docker image to GHCR.
 #
 # Triggers on pushes to main that touch the daytona/ directory,
-# and on manual dispatch. Tags with :latest and the short SHA.
+# and on manual dispatch. Tags with :v1 (stable) and the commit SHA.
 
 name: Build Image
 
@@ -48,5 +48,5 @@ jobs:
           context: daytona
           push: true
           tags: |
-            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:v1
             ${{ env.IMAGE }}:${{ github.sha }}
