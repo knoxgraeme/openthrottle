@@ -1,0 +1,12 @@
+{
+  "name": "sodaprompts",
+  "owner": {
+    "name": "Graeme Knox"
+  },
+  "plugins": [
+    {
+      "name": "sodaprompts",
+      "source": "./"
+    }
+  ]
+}

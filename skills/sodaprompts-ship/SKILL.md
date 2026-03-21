@@ -131,7 +131,7 @@ Requires sprite exec. Find this skill's `scripts/` directory (sibling to this
 SKILL.md) and run:
 
 ```bash
-SCRIPTS_DIR="$(dirname "$(find ~/.claude -path '*/sodaprompts-ship/scripts/logs.sh' -type f | head -1)")"
+SCRIPTS_DIR="$(dirname "$(find ~/.claude/plugins -path '*/sodaprompts-ship/scripts/logs.sh' -type f | head -1)")"
 bash "$SCRIPTS_DIR/logs.sh" [prd-id]
 ```
 
@@ -146,7 +146,7 @@ Requires sprite exec. **Always confirm with the user before killing** — this
 stops the prompt mid-run and any uncommitted work is lost.
 
 ```bash
-SCRIPTS_DIR="$(dirname "$(find ~/.claude -path '*/sodaprompts-ship/scripts/kill.sh' -type f | head -1)")"
+SCRIPTS_DIR="$(dirname "$(find ~/.claude/plugins -path '*/sodaprompts-ship/scripts/kill.sh' -type f | head -1)")"
 bash "$SCRIPTS_DIR/kill.sh"
 ```
 
@@ -157,7 +157,7 @@ bash "$SCRIPTS_DIR/kill.sh"
 When the user updates their `.env` (rotated keys, new secrets, etc.):
 
 ```bash
-SCRIPTS_DIR="$(dirname "$(find ~/.claude -path '*/sodaprompts-ship/scripts/push-env.sh' -type f | head -1)")"
+SCRIPTS_DIR="$(dirname "$(find ~/.claude/plugins -path '*/sodaprompts-ship/scripts/push-env.sh' -type f | head -1)")"
 bash "$SCRIPTS_DIR/push-env.sh"
 ```
 
