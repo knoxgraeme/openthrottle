@@ -170,7 +170,7 @@ function copyWorkflow() {
 
 function setupDaytona(config) {
   const snapshotName = config.snapshotName || 'openthrottle';
-  const image = 'ghcr.io/knoxgraeme/openthrottle:v1';
+  const image = 'knoxgraeme/openthrottle:v1';
 
   // Check daytona CLI is available
   try {

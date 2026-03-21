@@ -169,7 +169,7 @@ Each sandbox is ephemeral — created per task, destroyed after. Session data pe
 
 During `npx create-openthrottle`, you choose how the sandbox image is created:
 
-**Pre-built image (default):** Uses `ghcr.io/knoxgraeme/openthrottle-doer-claude:node-1.0.0` — fast, no customization needed. The scaffolder creates the Daytona snapshot automatically.
+**Pre-built image (default):** Uses `knoxgraeme/openthrottle:v1` from Docker Hub — fast, no customization needed. The scaffolder creates the Daytona snapshot automatically.
 
 **Build from Dockerfile:** Copies the Dockerfile + runtime scripts into `.openthrottle/docker/` in your project. You can customize the image (add system packages, tools, different Node version), then create the snapshot yourself:
 
@@ -190,7 +190,7 @@ agent: codex   # claude | codex | aider
 The Dockerfile uses a build arg to install the right agent CLI:
 
 ```bash
-docker build --build-arg AGENT=codex -t ghcr.io/knoxgraeme/openthrottle-doer-codex:node-1.0.0 daytona/
+docker build --build-arg AGENT=codex -t knoxgraeme/openthrottle:v1 daytona/
 ```
 
 ## Security
