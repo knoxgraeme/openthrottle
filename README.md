@@ -1,124 +1,88 @@
 # Soda Prompts
 
-Ship prompts to autonomous Claude Code agents running on [Sprites](https://sprites.dev). Write a prompt, ship it, get a PR back.
+Ship prompts to autonomous coding agents running on [Daytona](https://daytona.io) sandboxes. Write a prompt, ship it, get a PR back.
 
 ## How it works
 
 1. You write a prompt describing a feature, bug fix, or task
-2. `/sodaprompts-ship` creates a GitHub Issue labeled `prd-queued`
-3. A GitHub Action wakes the Doer Sprite (zero cost when idle)
-4. The Doer claims the issue, implements the work, and opens a PR
-5. The Thinker Sprite wakes, reviews the PR against the original task, and posts findings
+2. You label a GitHub Issue `prd-queued` (or use `/sodaprompts-ship`)
+3. A GitHub Action creates an ephemeral Daytona sandbox
+4. The builder implements the work and opens a PR
+5. The reviewer reviews the PR against the original task
 6. You get a Telegram notification when the PR is ready
+7. Sandbox auto-deletes — zero cost when idle
 
-The agents use [Compound Engineering](https://github.com/every-env/compound-engineering) for structured planning, implementation, and review.
-
-## Architecture — Doer & Thinker Sprites
-
-Two sprites work together. All state lives on GitHub (labels, reviews, comments) —
-checkpoint restore loses nothing.
-
-**Doer Sprite** (builder) polls for:
-1. PRs with `changes_requested` reviews — applies fixes, re-requests review
-2. Issues labeled `bug-queued` — reads investigation report (if available), creates branch, fixes, PRs
-3. Issues labeled `prd-queued` — claims issue, full prompt-to-PR workflow
-
-**Thinker Sprite** (reviewer) polls for:
-1. PRs labeled `needs-review` — checks out the branch, gathers the linked issue for task context, runs a task-aware review (alignment, best practices, security, triage of builder's deferred items), can commit trivial fixes directly
-2. Issues labeled `needs-investigation` — analyzes codebase, posts investigation report
-
-State machine labels:
-- PRDs: `prd-queued` → `prd-running` → `prd-complete` / `prd-failed` / `prd-paused`
-- Bugs: `needs-investigation` → `investigating` → `bug-queued` → `bug-running` → `bug-complete` / `bug-failed` / `bug-paused`
-- Reviews: `needs-review` → `reviewing` → approved / changes_requested
-- Paused states (`prd-paused` / `bug-paused`) occur during environment resets — a continuation issue is created automatically
-
-## Install
+Ship multiple prompts — they run **in parallel** (one sandbox each):
 
 ```bash
-claude plugin install knoxgraeme/sodaprompts
+gh issue create --title "Auth" --body-file auth.md --label prd-queued
+gh issue create --title "Billing" --body-file billing.md --label prd-queued
+gh issue create --title "Search" --body-file search.md --label prd-queued
+# → 3 sandboxes spin up simultaneously
 ```
-
-## Prerequisites
-
-- [Sprites CLI](https://sprites.dev) — `curl -fsSL https://sprites.dev/install.sh | sh`
-- [GitHub CLI](https://cli.github.com) — `brew install gh`
-- [Claude Code](https://claude.ai/code) with a Max subscription
-- A [Telegram bot](https://core.telegram.org/bots#botfather) for notifications
 
 ## Quick start
 
-### 1. Add secrets to your `.env`
-
-Add these to the root `.env` in your project (create one if it doesn't exist):
+### 1. Set up your project (~2 minutes)
 
 ```bash
-GITHUB_TOKEN=ghp_your-github-pat        # GitHub PAT with repo scope
-GITHUB_REPO=owner/repo                  # auto-detected during setup
-TELEGRAM_BOT_TOKEN=123:ABC-xyz          # from @BotFather
-TELEGRAM_CHAT_ID=123456789              # from getUpdates API
-```
-
-Your existing project secrets (database URLs, API keys, etc.) stay in `.env` too — they all get pushed to the Sprite.
-
-> **Note:** `SPRITES_TOKEN` is not needed in `.env`. The sprite CLI authenticates
-> via `sprite login`. `SPRITES_TOKEN` is only needed as a GitHub Actions secret
-> (for the wake workflow).
-
-### 2. Set up your project
-
-```bash
-claude
-> /sodaprompts-setup
+npx create-sodaprompts
 ```
 
 This will:
-- Detect your project (test commands, package manager, monorepo structure)
-- Generate `.sodaprompts.yml` (commit this to your repo)
-- Create a Sprite and bootstrap it with tools, hooks, and skills
-- Install `.github/workflows/wake-sprite.yml` (wakes sprites on new work)
-- Checkpoint as `golden-base`
-- Optionally set up a Thinker Sprite for automated PR review
+- Detect your project (package manager, commands, base branch)
+- Generate `.sodaprompts.yml`
+- Copy `.github/workflows/wake-sandbox.yml`
+- Create a Daytona snapshot and volume
 
-### 3. Ship a prompt
+Requires `DAYTONA_API_KEY` — get one at [daytona.io/dashboard](https://daytona.io/dashboard).
 
-```bash
-> /sodaprompts-ship docs/prds/add-search.md
-```
+### 2. Set GitHub repo secrets
 
-That's it. You'll get a Telegram message when the PR is ready.
+Pick one auth method:
 
-## Commands
+| Secret | Required | Source |
+|---|---|---|
+| `DAYTONA_API_KEY` | Yes | [daytona.io/dashboard](https://daytona.io/dashboard) |
+| `ANTHROPIC_API_KEY` | Option A | [console.anthropic.com](https://console.anthropic.com) |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Option B | `claude setup-token` (valid 1 year) |
+| `OPENAI_API_KEY` | For Codex/Aider | [platform.openai.com](https://platform.openai.com) |
+| `TELEGRAM_BOT_TOKEN` | Optional | [@BotFather](https://t.me/botfather) |
+| `TELEGRAM_CHAT_ID` | Optional | Telegram getUpdates API |
+| `SUPABASE_ACCESS_TOKEN` | Optional | [supabase.com/dashboard](https://supabase.com/dashboard) |
 
-| Command | What it does |
-|---|---|
-| `/sodaprompts-ship <file.md>` | Ship a prompt via GitHub Issues |
-| `/sodaprompts-ship status` | Check status from GitHub (issues, PRs, reviews) |
-| `/sodaprompts-ship logs` | Tail the active session's log (sprite exec) |
-| `/sodaprompts-ship kill` | Stop the running session (sprite exec) |
-| `/sodaprompts-ship push-env` | Push updated `.env` files + re-checkpoint |
-
-Status reads from GitHub, not the sprite filesystem — it works even after a checkpoint restore.
-
-Ship multiple prompts — they queue as GitHub Issues automatically:
+### 3. Commit and push
 
 ```bash
-> /sodaprompts-ship docs/prds/auth.md
-> /sodaprompts-ship docs/prds/billing.md
-> /sodaprompts-ship docs/prds/search.md
+git add .sodaprompts.yml .github/workflows/wake-sandbox.yml
+git commit -m "feat: add sodaprompts config"
+git push
 ```
 
-## Telegram commands
+### 4. Ship a prompt
 
-Control the Sprite from your phone:
+```bash
+gh issue create --title "Add search feature" \
+  --body-file docs/prds/search.md \
+  --label prd-queued
+```
 
-| Command | What it does |
+Or from Claude Code: `/sodaprompts-ship docs/prds/search.md`
+
+## How tasks flow
+
+| Trigger | What happens |
 |---|---|
-| `/status` | What's running, queue, completions |
-| `/logs` | Last 20 lines of the active log |
-| `/queue` | Show queued prompts |
-| `/kill` | Stop the running session |
-| `/help` | List commands |
+| Issue labeled `prd-queued` | Builder implements feature, opens PR |
+| Issue labeled `bug-queued` | Builder fixes bug, opens PR |
+| PR labeled `needs-review` | Reviewer runs task-aware review |
+| Issue labeled `needs-investigation` | Reviewer investigates, posts findings |
+| PR gets `changes_requested` review | Builder applies fixes, re-requests review |
+
+State machine labels:
+- PRDs: `prd-queued` → `prd-running` → `prd-complete` / `prd-failed`
+- Bugs: `bug-queued` → `bug-running` → `bug-complete` / `bug-failed`
+- Reviews: `needs-review` → `reviewing` → approved / changes_requested
 
 ## Config
 
@@ -127,20 +91,28 @@ Control the Sprite from your phone:
 ```yaml
 base_branch: main
 test: pnpm test
-dev: pnpm dev --port 8080 --hostname 0.0.0.0
-format: pnpm prettier --write
-lint: pnpm lint
 build: pnpm build
+lint: pnpm lint
+format: pnpm prettier --write
+dev: pnpm dev --port 8080 --hostname 0.0.0.0
+
+agent: claude                              # claude | codex | aider
+snapshot: sodaprompts-doer-claude-node
 notifications: telegram
-sprite: soda-base
+
 post_bootstrap:
   - pnpm install
+
 mcp_servers: {}
+
+review:
+  enabled: true
+  max_rounds: 3
 ```
 
 ### MCP servers
 
-Add project-specific MCPs to `.sodaprompts.yml`. Telegram and Context7 are always included automatically.
+Add project-specific MCPs. Telegram and Context7 are always included automatically.
 
 ```yaml
 mcp_servers:
@@ -151,106 +123,110 @@ mcp_servers:
       SUPABASE_ACCESS_TOKEN: from-env
 ```
 
-**Supabase safety:** When a Supabase MCP is detected, bootstrap automatically denies `execute_sql`, `apply_migration`, `deploy_edge_function`, and `merge_branch`. The agent uses Supabase branches for isolated DB work and runs migrations via your project's own commands. Production is untouchable.
+`from-env` values are resolved from sandbox environment variables at boot.
 
-## What the Sprites get
-
-During bootstrap, each sprite is set up with the tools it needs.
-
-**Doer Sprite** (full build environment):
-
-| Tool | Purpose |
-|---|---|
-| Chromium + xvfb | Headless browser runtime |
-| agent-browser | AI-native web interaction |
-| Playwright | Browser test execution |
-| Telegram MCP | Notifications + phone-a-friend |
-| Context7 MCP | Framework documentation lookup |
-| Compound Engineering | Structured plan/implement/review |
-| GitHub CLI | PR creation |
-
-Plus hooks for:
-- Blocking pushes to main/master
-- Logging every bash command (with secret sanitization)
-- Auto-formatting files on write
-- Running lint + tests before session exit
-
-**Thinker Sprite** (lighter setup):
-
-| Tool | Purpose |
-|---|---|
-| GitHub CLI | Reading diffs, posting reviews, committing trivial fixes |
-| Agent runtime | Claude Code or Codex |
-| Skills | Reviewer (task-aware), investigator, phone-a-friend |
-
-## PR artifacts
-
-The Doer Sprite posts structured artifacts to each PR:
-
-**Decision Log** — posted as a PR comment after implementation:
-- Approach chosen and reasoning
-- Key decisions with justification
-- Deferred items (P2/P3) and why they're safe to defer
-- Review notes for human attention
-
-**Session Report** — posted as a PR comment after the session:
-- Duration, commits, and files changed
-- Bash commands (total / failed)
-- Sanitized command log (last 50 lines, collapsible)
-
-**Completion Artifact** — structured JSON written to the sprite filesystem:
-- Status (success / failed / blocked)
-- PR URL, branch, commit count
-- Deferred items and notes
-- Used by the runner script for reliable result detection
-
-## Review process
-
-The Thinker Sprite performs a task-aware final review — not a generic code quality pass (the Doer already ran ce:review for that). The review focuses on:
-
-1. **Task alignment** — does the PR deliver what the original issue asked for, without scope drift?
-2. **Best practices** — did the builder take shortcuts (hardcoded values, copy-paste, swallowed errors)?
-3. **Security** — fresh eyes on auth, input handling, secrets, injection risks
-4. **Builder triage** — are any deferred P2/P3 items actually blocking?
-5. **Integration sanity** — duplicated logic, pattern violations, broken callers
-
-Trivial fixes (typos, formatting) are committed directly instead of requesting changes. The review uses structured output with blocking/non-blocking categories.
-
-**Convergence:** On re-reviews (round 2+), the reviewer focuses narrowly on whether previous blocking items were addressed. New P2/P3 findings are noted but don't block approval — this prevents infinite review loops.
+**Supabase safety:** When detected, a tool allowlist is applied — only branch management and read-only operations are permitted. `execute_sql`, `apply_migration`, `deploy_edge_function`, and `merge_branch` are blocked.
 
 ## Architecture
 
 ```
-Any client (Claude Code, Desktop, CLI)
-┌─────────────┐
-│ /ship        │── gh issue create ──┐
-│ /status      │── gh issue list     │
-└─────────────┘                      │
-                                     ▼
-                              GitHub Issues
-                              + Actions webhook
-                                     │
-                    ┌────────────────┼────────────────┐
-                    ▼                                  ▼
-             Doer Sprite                        Thinker Sprite
-            ┌──────────────┐                   ┌──────────────┐
-            │  run-builder  │                   │  run-reviewer │
-            │               │── PR + label ───>│               │
-            │  Wakes on:    │                   │  Wakes on:    │
-            │  prd-queued   │<── review ───────│  needs-review │
-            │  bug-queued   │                   │  needs-invest │
-            │  changes_req  │                   │               │
-            │               │   Artifacts:      │  Checks out   │
-            │  Posts:        │   decision log    │  PR branch    │
-            │  decision log │   session report   │  reads linked │
-            │  session rpt  │   completion.json  │  issue for    │
-            │  completion   │                   │  task context  │
-            │               │                   │               │
-            │  Sleeps after │                   │  Sleeps after │
-            │  5m idle      │                   │  5m idle      │
-            └──────────────┘                   └──────────────┘
-                    │                                  │
-                    └──────── Telegram ◄───────────────┘
+npx create-sodaprompts          ← one-time setup
+git push                        ← .sodaprompts.yml + wake workflow committed
+                                      │
+                                      ▼
+Issue labeled prd-queued        GitHub Action fires
+                                      │
+                                      ▼
+                               Daytona Sandbox
+                              ┌──────────────────┐
+                              │  entrypoint.sh    │
+                              │  ├─ clone repo    │
+                              │  ├─ read config   │
+                              │  ├─ install deps  │
+                              │  ├─ wire hooks    │
+                              │  └─ dispatch:     │
+                              │     prd/bug/fix   │ → run-builder.sh
+                              │     review/invest │ → run-reviewer.sh
+                              │                   │
+                              │  Safety layers:   │
+                              │  ├─ git pre-push  │ (universal)
+                              │  ├─ PreToolUse    │ (Claude)
+                              │  ├─ sealed config │ (chattr +i)
+                              │  └─ sanitization  │ (secrets in logs)
+                              │                   │
+                              │  Artifacts:       │
+                              │  ├─ PR + commits  │
+                              │  ├─ session report│
+                              │  └─ Telegram msg  │
+                              └──────────────────┘
+                                      │
+                              auto-deleted on stop
+```
+
+Each sandbox is ephemeral — created per task, destroyed after. Session data persists on a Daytona volume for `--resume` across sandboxes.
+
+## Snapshot modes
+
+During `npx create-sodaprompts`, you choose how the sandbox image is created:
+
+**Pre-built image (default):** Uses `ghcr.io/sodaprompts/doer-claude:node-1.0.0` — fast, no customization needed. The scaffolder creates the Daytona snapshot automatically.
+
+**Build from Dockerfile:** Copies the Dockerfile + runtime scripts into `.sodaprompts/docker/` in your project. You can customize the image (add system packages, tools, different Node version), then create the snapshot yourself:
+
+```bash
+daytona snapshot create sodaprompts-doer-claude-node \
+  --dockerfile .sodaprompts/docker/Dockerfile \
+  --build-arg AGENT=claude
+```
+
+## Multi-agent support
+
+The runtime supports Claude Code, Codex, and Aider. Set `agent` in `.sodaprompts.yml`:
+
+```yaml
+agent: codex   # claude | codex | aider
+```
+
+The Dockerfile uses a build arg to install the right agent CLI:
+
+```bash
+docker build --build-arg AGENT=codex -t ghcr.io/sodaprompts/doer-codex:node-1.0.0 daytona/
+```
+
+## Security
+
+The agent runs with `--dangerously-skip-permissions`. Safety comes from defense in depth:
+
+| Layer | Prevents | Bypassable? |
+|---|---|---|
+| GitHub branch protection | Push to main, force push | No |
+| Sealed settings.json | Removing hooks or allowlists | No (chattr +i) |
+| Supabase MCP allowlist | SQL execution, migrations | No |
+| Fine-grained PAT | Repo deletion, org access | No |
+| Git pre-push hook | Push to main (all agents) | No (config sealed) |
+| PreToolUse hooks | Secret exfiltration, config tampering | Difficult (Claude only) |
+| Secret sanitization | Token leakage in logs/comments | Partial |
+| Ephemeral sandbox | Persistent damage | N/A |
+
+**Requirements:**
+- GitHub branch protection enabled (require PR reviews, no direct push)
+- Fine-grained PAT: `contents:rw`, `pull_requests:rw`, `issues:rw` — deny admin/actions/secrets
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `/sodaprompts-ship <file.md>` | Ship a prompt via GitHub Issues |
+| `/sodaprompts-ship status` | Check status from GitHub |
+| `/sodaprompts-ship logs` | Stream sandbox logs |
+| `/sodaprompts-ship kill` | Stop the running sandbox |
+
+## Claude Code plugin (optional)
+
+The Claude Code plugin adds `/sodaprompts-ship` and `/sodaprompts-setup` skills for a richer onboarding experience. It's optional — `npx create-sodaprompts` works without it.
+
+```bash
+claude plugin install knoxgraeme/sodaprompts
 ```
 
 ## License

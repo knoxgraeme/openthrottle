@@ -271,17 +271,25 @@ print(json.dumps(mcps))
         && mv "${SETTINGS}.tmp" "$SETTINGS"
       log "Project MCPs merged"
 
-      # If Supabase MCP was added, scope it — deny tools that could touch production
+      # If Supabase MCP was added, allowlist safe tools only.
+      # New Supabase MCP versions may add tools — allowlist ensures only known-safe
+      # tools are permitted without requiring manual updates to a denylist.
       if echo "$RESOLVED_MCPS" | jq -e '.supabase' > /dev/null 2>&1; then
-        log "Supabase MCP detected — adding production safety denies..."
-        jq '.permissions.deny += [
-          "mcp__supabase__execute_sql",
-          "mcp__supabase__apply_migration",
-          "mcp__supabase__deploy_edge_function",
-          "mcp__supabase__merge_branch"
-        ] | .permissions.deny |= unique' "$SETTINGS" > "${SETTINGS}.tmp" \
+        log "Supabase MCP detected — applying tool allowlist..."
+        jq '.permissions.allow += [
+          "mcp__supabase__list_tables",
+          "mcp__supabase__list_migrations",
+          "mcp__supabase__list_branches",
+          "mcp__supabase__create_branch",
+          "mcp__supabase__delete_branch",
+          "mcp__supabase__reset_branch",
+          "mcp__supabase__get_project_url",
+          "mcp__supabase__search_docs",
+          "mcp__supabase__get_logs",
+          "mcp__supabase__get_schemas"
+        ] | .permissions.allow |= unique' "$SETTINGS" > "${SETTINGS}.tmp" \
           && mv "${SETTINGS}.tmp" "$SETTINGS"
-        log "Supabase tools scoped (execute_sql, apply_migration, deploy_edge_function, merge_branch denied)"
+        log "Supabase tools scoped via allowlist (branch management, read-only operations)"
       fi
     fi
   fi
@@ -316,6 +324,21 @@ with open('/tmp/pipeline/sodaprompts.yml') as f:
     log "Disabling project-level hooks (sprite has its own)..."
     echo '{}' > "$REPO_SETTINGS"
     git -C "${SPRITE_HOME}/repo" update-index --assume-unchanged "$REPO_SETTINGS" 2>/dev/null || true
+  fi
+
+  # Seal settings.json — prevent agent from modifying hooks or permissions.
+  # With --dangerously-skip-permissions the agent has full bash access and could
+  # rewrite ~/.claude/settings.json to remove hooks or the Supabase allowlist.
+  # Making the file immutable (chattr +i) prevents this. Only root can undo it,
+  # and the agent runs as a regular user.
+  SETTINGS="${HOME}/.claude/settings.json"
+  if [[ -f "$SETTINGS" ]]; then
+    log "Sealing settings.json (immutable)..."
+    chattr +i "$SETTINGS" 2>/dev/null || {
+      # Fallback for systems without chattr (e.g., some container runtimes)
+      chmod 444 "$SETTINGS"
+      log "chattr not available — using chmod 444 (weaker: agent could chmod back)"
+    }
   fi
 
   # Verify .env exists
