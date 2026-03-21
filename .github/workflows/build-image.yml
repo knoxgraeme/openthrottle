@@ -1,0 +1,41 @@
+# Build and push the openthrottle Docker image to GHCR.
+#
+# Triggers on pushes to main that touch the daytona/ directory,
+# and on manual dispatch. Tags with :latest and the short SHA.
+
+name: Build Image
+
+on:
+  push:
+    branches: [main]
+    paths: [daytona/**]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/openthrottle
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: daytona
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}

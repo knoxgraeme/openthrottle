@@ -1,0 +1,179 @@
+---
+title: "feat: Multi-agent snapshot variants (Phase 3)"
+type: feat
+status: completed
+date: 2026-03-19
+origin: docs/daytona-migration-plan.md
+---
+
+# feat: Multi-agent snapshot variants
+
+## Overview
+
+Make the Daytona runtime truly multi-agent by adding Codex and Aider support. Currently the Dockerfile installs Claude Code (via base image), the entrypoint writes Claude-specific `~/.claude/settings.json`, and safety hooks use Claude's PreToolUse/PostToolUse system. Phase 3 adds agent-specific Dockerfile variants, universal safety hooks (git hooks as fallback), and per-agent config generation in the entrypoint.
+
+Phase 3 of the Daytona migration (see origin: `docs/daytona-migration-plan.md` lines 816-821).
+
+## Problem Statement
+
+The runtime is Claude-locked despite the `AGENT_RUNTIME` dispatch in `agent-lib.sh`:
+- `settings.json` is Claude Code format — Codex ignores it
+- PreToolUse/PostToolUse hooks are Claude Code concepts — Codex and Aider have no equivalent
+- Safety guardrails (block-push-to-main, log-commands) only fire for Claude
+- The Dockerfile only has Claude Code installed (from base image)
+
+## Proposed Solution
+
+### 1. Universal safety via git hooks
+
+Instead of relying solely on Claude's PreToolUse hooks, install **git hooks** (`pre-push`, `post-commit`) that work for any agent. The Claude-specific hooks remain as a second layer for Claude.
+
+```
+pre-push hook → blocks push to main/master, blocks force push
+post-commit hook → logs commit to bash-commands.log
+```
+
+Git hooks fire for any tool that uses git, regardless of agent runtime.
+
+### 2. Per-agent Dockerfiles
+
+Three Dockerfile variants sharing a common base:
+
+```
+daytona/Dockerfile            → doer-claude:node-1.0.0 (existing, base image has Claude)
+daytona/Dockerfile.codex      → doer-codex:node-1.0.0  (installs Codex CLI)
+daytona/Dockerfile.aider      → doer-aider:node-1.0.0  (installs Aider via pip)
+```
+
+All share the same entrypoint, runners, hooks, and task-adapter.
+
+### 3. Per-agent entrypoint config
+
+The entrypoint detects `AGENT` from `.sodaprompts.yml` and writes agent-specific config:
+- **Claude:** `~/.claude/settings.json` with hooks + MCP (existing behavior)
+- **Codex:** `~/.codex/config.json` with equivalent settings (if Codex supports config files)
+- **Aider:** `~/.aider.conf.yml` with Aider config (model, auto-commits off, etc.)
+
+For all agents: install git hooks as universal safety layer.
+
+## Technical Approach
+
+### Git hooks (universal safety)
+
+Create `daytona/git-hooks/pre-push` — blocks push to main/master and force push:
+
+```bash
+#!/usr/bin/env bash
+# Blocks push to main/master and force push for ANY agent runtime.
+while read local_ref local_sha remote_ref remote_sha; do
+  if [[ "$remote_ref" =~ refs/heads/(main|master)$ ]]; then
+    echo "BLOCKED: Push to main/master not allowed." >&2
+    exit 1
+  fi
+done
+```
+
+The entrypoint installs this with `git config core.hooksPath /opt/sodaprompts/git-hooks`.
+
+### Dockerfile variants
+
+**Dockerfile.codex:**
+```dockerfile
+FROM daytonaio/sandbox:0.54.0
+RUN apt-get update && apt-get install -y --no-install-recommends gh jq gosu \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g pnpm agent-browser codex \
+    && curl -sL "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64" \
+       -o /usr/local/bin/yq && chmod +x /usr/local/bin/yq
+# Same scripts, hooks, entrypoint
+COPY entrypoint.sh run-builder.sh run-reviewer.sh task-adapter.sh agent-lib.sh /opt/sodaprompts/
+COPY hooks/ /opt/sodaprompts/hooks/
+COPY git-hooks/ /opt/sodaprompts/git-hooks/
+RUN chmod +x /opt/sodaprompts/*.sh /opt/sodaprompts/hooks/*.sh /opt/sodaprompts/git-hooks/*
+ENTRYPOINT ["/opt/sodaprompts/entrypoint.sh"]
+```
+
+**Dockerfile.aider:**
+```dockerfile
+FROM daytonaio/sandbox:0.54.0
+RUN apt-get update && apt-get install -y --no-install-recommends gh jq gosu \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g pnpm agent-browser \
+    && pip install aider-chat \
+    && curl -sL "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64" \
+       -o /usr/local/bin/yq && chmod +x /usr/local/bin/yq
+COPY entrypoint.sh run-builder.sh run-reviewer.sh task-adapter.sh agent-lib.sh /opt/sodaprompts/
+COPY hooks/ /opt/sodaprompts/hooks/
+COPY git-hooks/ /opt/sodaprompts/git-hooks/
+RUN chmod +x /opt/sodaprompts/*.sh /opt/sodaprompts/hooks/*.sh /opt/sodaprompts/git-hooks/*
+ENTRYPOINT ["/opt/sodaprompts/entrypoint.sh"]
+```
+
+### Entrypoint changes
+
+Add per-agent config after step 4 (settings.json generation):
+
+```bash
+case "$AGENT" in
+  claude)
+    # Existing: write ~/.claude/settings.json with hooks + MCP (already done)
+    ;;
+  codex)
+    # Write Codex config if supported, otherwise rely on CLI flags
+    mkdir -p "${SANDBOX_HOME}/.codex"
+    # Codex reads AGENTS.md for instructions — write one
+    cat > "${REPO}/AGENTS.md" <<'AGENTEOF'
+    # Agent instructions generated by sodaprompts entrypoint
+    AGENTEOF
+    ;;
+  aider)
+    # Write Aider config
+    cat > "${SANDBOX_HOME}/.aider.conf.yml" <<AIDEREOF
+auto-commits: false
+model: ${AGENT_MODEL:-claude-sonnet-4-20250514}
+AIDEREOF
+    ;;
+esac
+
+# Universal: install git hooks for all agents
+git -C "$REPO" config core.hooksPath /opt/sodaprompts/git-hooks
+```
+
+### agent-lib.sh changes
+
+Add `aider` case to `invoke_agent`:
+
+```bash
+aider)
+  local -a MODEL_FLAGS=()
+  [[ -n "${AGENT_MODEL:-}" ]] && MODEL_FLAGS=(--model "$AGENT_MODEL")
+  timeout "${AGENT_TIMEOUT}" aider \
+    "${MODEL_FLAGS[@]}" \
+    --yes \
+    --no-auto-commits \
+    --message "$PROMPT" \
+    2>&1 | tee -a "$SESSION_LOG"
+  ;;
+```
+
+### Scaffolder changes
+
+Already prompts for agent type and derives snapshot name (`sodaprompts-doer-{agent}-node`). No changes needed — the scaffolder maps to the right image automatically.
+
+## Acceptance Criteria
+
+- [ ] `daytona/Dockerfile` updated to include git-hooks COPY
+- [ ] `daytona/Dockerfile.codex` created and builds successfully
+- [ ] `daytona/Dockerfile.aider` created and builds successfully
+- [ ] `daytona/git-hooks/pre-push` blocks push to main/master for any agent
+- [ ] `daytona/entrypoint.sh` writes per-agent config (claude/codex/aider)
+- [ ] `daytona/entrypoint.sh` installs git hooks for all agents
+- [ ] `daytona/agent-lib.sh` has aider case in invoke_agent
+- [ ] All three agents can execute a task end-to-end in a sandbox
+
+## Sources
+
+- **Origin:** [docs/daytona-migration-plan.md](docs/daytona-migration-plan.md) — Phase 3 (lines 816-821), snapshot naming (line 233)
+- **Existing Dockerfile:** [daytona/Dockerfile](daytona/Dockerfile)
+- **Existing entrypoint:** [daytona/entrypoint.sh](daytona/entrypoint.sh) — Claude-specific settings generation
+- **Existing agent-lib:** [daytona/agent-lib.sh](daytona/agent-lib.sh) — invoke_agent with claude/codex cases
