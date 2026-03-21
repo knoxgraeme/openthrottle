@@ -22,6 +22,17 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/share/boost /usr/local/graalvm /usr/local/share/chromium \
+            /usr/local/lib/node_modules /usr/share/swift /opt/hostedtoolcache
+          sudo apt-get remove -y '^aspnetcore-.*' '^dotnet-.*' '^llvm-.*' 'php.*' azure-cli \
+            google-cloud-cli microsoft-edge-stable google-chrome-stable firefox mono-devel 2>/dev/null || true
+          sudo apt-get autoremove -y
+          sudo docker image prune -af
+          df -h /
+
       - uses: actions/checkout@v4
 
       - name: Log in to GHCR
