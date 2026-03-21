@@ -14,10 +14,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl -sL "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64" \
        -o /usr/local/bin/yq && chmod +x /usr/local/bin/yq
 
-COPY entrypoint.sh run-builder.sh run-reviewer.sh task-adapter.sh agent-lib.sh /opt/sodaprompts/
-COPY hooks/ /opt/sodaprompts/hooks/
-COPY git-hooks/ /opt/sodaprompts/git-hooks/
+COPY entrypoint.sh run-builder.sh run-reviewer.sh task-adapter.sh agent-lib.sh /opt/openthrottle/
+COPY hooks/ /opt/openthrottle/hooks/
+COPY git-hooks/ /opt/openthrottle/git-hooks/
 
-RUN chmod +x /opt/sodaprompts/*.sh /opt/sodaprompts/hooks/*.sh /opt/sodaprompts/git-hooks/*
+RUN chmod +x /opt/openthrottle/*.sh /opt/openthrottle/hooks/*.sh /opt/openthrottle/git-hooks/*
 
-ENTRYPOINT ["/opt/sodaprompts/entrypoint.sh"]
+ENTRYPOINT ["/opt/openthrottle/entrypoint.sh"]

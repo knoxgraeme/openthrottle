@@ -27,13 +27,13 @@ RUNNER_NAME="reviewer"
 mkdir -p "$LOG_DIR" "$SESSIONS_DIR"
 
 # Source shared libraries
-source /opt/sodaprompts/agent-lib.sh
-source /opt/sodaprompts/task-adapter.sh
+source /opt/openthrottle/agent-lib.sh
+source /opt/openthrottle/task-adapter.sh
 
 # Read config
 BASE_BRANCH="${BASE_BRANCH:-main}"
-if [[ -f "${REPO}/.sodaprompts.yml" ]]; then
-  MAX_REVIEW_ROUNDS=$(grep '^  max_rounds:' "${REPO}/.sodaprompts.yml" | awk '{print $2}' 2>/dev/null || echo "$MAX_REVIEW_ROUNDS")
+if [[ -f "${REPO}/.openthrottle.yml" ]]; then
+  MAX_REVIEW_ROUNDS=$(grep '^  max_rounds:' "${REPO}/.openthrottle.yml" | awk '{print $2}' 2>/dev/null || echo "$MAX_REVIEW_ROUNDS")
 fi
 
 # ---------------------------------------------------------------------------
@@ -165,7 +165,7 @@ review_pr() {
 RE_REVIEW: This is re-review round ${REVIEW_ROUND}. Focus on whether your previous requested changes were addressed."
   fi
 
-  local PROMPT="Review PR #${PR_NUMBER} in ${GITHUB_REPO}. Use the sodaprompts-reviewer skill.
+  local PROMPT="Review PR #${PR_NUMBER} in ${GITHUB_REPO}. Use the openthrottle-reviewer skill.
 
 The PR branch is checked out locally — you can read source files, run commands,
 and commit trivial fixes directly. Push to the branch when done.
@@ -220,7 +220,7 @@ investigate_bug() {
     log "WARNING: Could not pull latest ${BASE_BRANCH} — investigating local version"
   }
 
-  local PROMPT="Investigate issue #${ISSUE_NUMBER} in ${GITHUB_REPO}. Use the sodaprompts-investigator skill."
+  local PROMPT="Investigate issue #${ISSUE_NUMBER} in ${GITHUB_REPO}. Use the openthrottle-investigator skill."
 
   invoke_agent "$PROMPT" "$TASK_TIMEOUT" "$SESSION_LOG" "investigate-${ISSUE_NUMBER}" || true
   handle_agent_result $? "Investigation #${ISSUE_NUMBER}" "$TASK_TIMEOUT" || true

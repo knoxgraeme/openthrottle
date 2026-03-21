@@ -27,7 +27,7 @@ on:
     types: [submitted]
 
 concurrency:
-  group: sodaprompts-${{ github.event.issue.number || github.event.pull_request.number }}
+  group: openthrottle-${{ github.event.issue.number || github.event.pull_request.number }}
   cancel-in-progress: false
 
 permissions:
@@ -88,9 +88,9 @@ jobs:
 
       - name: Validate config
         run: |
-          SNAPSHOT=$(yq '.snapshot // ""' .sodaprompts.yml)
+          SNAPSHOT=$(yq '.snapshot // ""' .openthrottle.yml)
           if [[ -z "$SNAPSHOT" || "$SNAPSHOT" == "null" ]]; then
-            echo "::error::Missing 'snapshot' key in .sodaprompts.yml — cannot create sandbox"
+            echo "::error::Missing 'snapshot' key in .openthrottle.yml — cannot create sandbox"
             exit 1
           fi
           echo "snapshot=$SNAPSHOT" >> "$GITHUB_OUTPUT"
@@ -120,7 +120,7 @@ jobs:
             --label project=${{ github.event.repository.name }} \
             --label task_type="${{ steps.work.outputs.task_type }}" \
             --label issue="${{ steps.work.outputs.item }}" \
-            --volume sodaprompts-${{ github.repository_id }}:/home/daytona/.claude \
+            --volume openthrottle-${{ github.repository_id }}:/home/daytona/.claude \
             --env GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }} \
             --env GITHUB_REPO=${{ github.repository }} \
             --env ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY} \
