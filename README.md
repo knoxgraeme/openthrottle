@@ -1,11 +1,11 @@
-# Soda Prompts
+# Open Throttle
 
 Ship prompts to autonomous coding agents running on [Daytona](https://daytona.io) sandboxes. Write a prompt, ship it, get a PR back.
 
 ## How it works
 
 1. You write a prompt describing a feature, bug fix, or task
-2. You label a GitHub Issue `prd-queued` (or use `/sodaprompts-ship`)
+2. You label a GitHub Issue `prd-queued` (or use `/openthrottle-ship`)
 3. A GitHub Action creates an ephemeral Daytona sandbox
 4. The builder implements the work and opens a PR
 5. The reviewer reviews the PR against the original task
@@ -26,12 +26,12 @@ gh issue create --title "Search" --body-file search.md --label prd-queued
 ### 1. Set up your project (~2 minutes)
 
 ```bash
-npx create-sodaprompts
+npx create-openthrottle
 ```
 
 This will:
 - Detect your project (package manager, commands, base branch)
-- Generate `.sodaprompts.yml`
+- Generate `.openthrottle.yml`
 - Copy `.github/workflows/wake-sandbox.yml`
 - Create a Daytona snapshot and volume
 
@@ -54,8 +54,8 @@ Pick one auth method:
 ### 3. Commit and push
 
 ```bash
-git add .sodaprompts.yml .github/workflows/wake-sandbox.yml
-git commit -m "feat: add sodaprompts config"
+git add .openthrottle.yml .github/workflows/wake-sandbox.yml
+git commit -m "feat: add openthrottle config"
 git push
 ```
 
@@ -67,7 +67,7 @@ gh issue create --title "Add search feature" \
   --label prd-queued
 ```
 
-Or from Claude Code: `/sodaprompts-ship docs/prds/search.md`
+Or from Claude Code: `/openthrottle-ship docs/prds/search.md`
 
 ## How tasks flow
 
@@ -86,7 +86,7 @@ State machine labels:
 
 ## Config
 
-`.sodaprompts.yml` is generated during setup and committed to your repo:
+`.openthrottle.yml` is generated during setup and committed to your repo:
 
 ```yaml
 base_branch: main
@@ -97,7 +97,7 @@ format: pnpm prettier --write
 dev: pnpm dev --port 8080 --hostname 0.0.0.0
 
 agent: claude                              # claude | codex | aider
-snapshot: sodaprompts-doer-claude-node
+snapshot: openthrottle-doer-claude-node
 notifications: telegram
 
 post_bootstrap:
@@ -130,8 +130,8 @@ mcp_servers:
 ## Architecture
 
 ```
-npx create-sodaprompts          ← one-time setup
-git push                        ← .sodaprompts.yml + wake workflow committed
+npx create-openthrottle        ← one-time setup
+git push                       ← .openthrottle.yml + wake workflow committed
                                       │
                                       ▼
 Issue labeled prd-queued        GitHub Action fires
@@ -167,21 +167,21 @@ Each sandbox is ephemeral — created per task, destroyed after. Session data pe
 
 ## Snapshot modes
 
-During `npx create-sodaprompts`, you choose how the sandbox image is created:
+During `npx create-openthrottle`, you choose how the sandbox image is created:
 
-**Pre-built image (default):** Uses `ghcr.io/sodaprompts/doer-claude:node-1.0.0` — fast, no customization needed. The scaffolder creates the Daytona snapshot automatically.
+**Pre-built image (default):** Uses `ghcr.io/knoxgraeme/openthrottle-doer-claude:node-1.0.0` — fast, no customization needed. The scaffolder creates the Daytona snapshot automatically.
 
-**Build from Dockerfile:** Copies the Dockerfile + runtime scripts into `.sodaprompts/docker/` in your project. You can customize the image (add system packages, tools, different Node version), then create the snapshot yourself:
+**Build from Dockerfile:** Copies the Dockerfile + runtime scripts into `.openthrottle/docker/` in your project. You can customize the image (add system packages, tools, different Node version), then create the snapshot yourself:
 
 ```bash
-daytona snapshot create sodaprompts-doer-claude-node \
-  --dockerfile .sodaprompts/docker/Dockerfile \
+daytona snapshot create openthrottle-doer-claude-node \
+  --dockerfile .openthrottle/docker/Dockerfile \
   --build-arg AGENT=claude
 ```
 
 ## Multi-agent support
 
-The runtime supports Claude Code, Codex, and Aider. Set `agent` in `.sodaprompts.yml`:
+The runtime supports Claude Code, Codex, and Aider. Set `agent` in `.openthrottle.yml`:
 
 ```yaml
 agent: codex   # claude | codex | aider
@@ -190,7 +190,7 @@ agent: codex   # claude | codex | aider
 The Dockerfile uses a build arg to install the right agent CLI:
 
 ```bash
-docker build --build-arg AGENT=codex -t ghcr.io/sodaprompts/doer-codex:node-1.0.0 daytona/
+docker build --build-arg AGENT=codex -t ghcr.io/knoxgraeme/openthrottle-doer-codex:node-1.0.0 daytona/
 ```
 
 ## Security
@@ -216,17 +216,17 @@ The agent runs with `--dangerously-skip-permissions`. Safety comes from defense 
 
 | Command | What it does |
 |---|---|
-| `/sodaprompts-ship <file.md>` | Ship a prompt via GitHub Issues |
-| `/sodaprompts-ship status` | Check status from GitHub |
-| `/sodaprompts-ship logs` | Stream sandbox logs |
-| `/sodaprompts-ship kill` | Stop the running sandbox |
+| `/openthrottle-ship <file.md>` | Ship a prompt via GitHub Issues |
+| `/openthrottle-ship status` | Check status from GitHub |
+| `/openthrottle-ship logs` | Stream sandbox logs |
+| `/openthrottle-ship kill` | Stop the running sandbox |
 
 ## Claude Code plugin (optional)
 
-The Claude Code plugin adds `/sodaprompts-ship` and `/sodaprompts-setup` skills for a richer onboarding experience. It's optional — `npx create-sodaprompts` works without it.
+The Claude Code plugin adds `/openthrottle-ship` and `/openthrottle-setup` skills for a richer onboarding experience. It's optional — `npx create-openthrottle` works without it.
 
 ```bash
-claude plugin install knoxgraeme/sodaprompts
+claude plugin install knoxgraeme/openthrottle
 ```
 
 ## License

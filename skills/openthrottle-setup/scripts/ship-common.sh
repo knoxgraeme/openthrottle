@@ -13,7 +13,7 @@ GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; CYAN='\033[0;36m'; NC
 
 # Globals set by parse_args
 FROM_STEP=1
-CONFIG_FILE=".sodaprompts.yml"
+CONFIG_FILE=".openthrottle.yml"
 VERBOSE=false
 
 # Tracking
@@ -254,9 +254,9 @@ check_yaml_parser() {
 
 locate_plugin_dir() {
   local dir
-  dir="$(find ~/.claude/plugins -path '*/sodaprompts/skills/sodaprompts-setup' -type d 2>/dev/null | head -1)"
+  dir="$(find ~/.claude/plugins -path '*/openthrottle/skills/openthrottle-setup' -type d 2>/dev/null | head -1)"
   if [[ -z "$dir" ]]; then
-    dir="$(find ~/.claude/plugins -path '*/sodaprompts-setup' -type d 2>/dev/null | head -1)"
+    dir="$(find ~/.claude/plugins -path '*/openthrottle-setup' -type d 2>/dev/null | head -1)"
   fi
   if [[ -z "$dir" ]]; then
     return 1
@@ -278,7 +278,7 @@ locate_skill_dir() {
 
 # ── Network policy ───────────────────────────────────────────────────────
 
-# Build the network policy JSON from .sodaprompts.yml.
+# Build the network policy JSON from .openthrottle.yml.
 # Returns empty string if no policy configured. Returns non-zero on parse error.
 build_network_policy_json() {
   local config_file="$1"

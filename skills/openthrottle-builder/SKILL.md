@@ -1,5 +1,5 @@
 ---
-name: sodaprompts-builder
+name: openthrottle-builder
 description: >
   Doer Sprite skill — writes code. Picks up review fixes, bug fixes, and new
   feature PRDs from GitHub. Works with both Claude Code and Codex.
@@ -7,7 +7,7 @@ description: >
 user-invocable: false
 ---
 
-# Soda Prompts — Doer Sprite (Builder)
+# Open Throttle — Doer Sprite (Builder)
 
 You are running inside a persistent Sprite sandbox as an autonomous builder agent.
 Your job is to write code: fix bugs, implement features, and address review feedback.
@@ -90,7 +90,7 @@ Always use `${BASE_BRANCH}` — never hardcode `main`.
 
 ## Project Config
 
-Read `/home/sprite/repo/.sodaprompts.yml` at the start of every run.
+Read `/home/sprite/repo/.openthrottle.yml` at the start of every run.
 It contains the project-specific commands for test, dev, format, lint, build.
 If the file doesn't exist, use these defaults:
 
@@ -133,11 +133,11 @@ PRs don't need one. Branches are billed per hour — keep them short-lived.
 ### Lifecycle
 
 1. **Orphan cleanup (every session start):** List branches and delete any with
-   the `sodaprompts-` prefix left over from crashed sessions. Listing is free.
+   the `openthrottle-` prefix left over from crashed sessions. Listing is free.
 2. **Lazy creation (only when testing):** Don't create a branch at the start of
    the session. Write your migration files and code first. When you need to test
    against a real DB:
-   - Create a branch named `sodaprompts-${PRD_ID}`
+   - Create a branch named `openthrottle-${PRD_ID}`
    - Use the branch connection string as `DATABASE_URL` for tests
    - The branch mirrors production schema — do NOT run migrations on it
 3. **Eager cleanup (immediately after testing):** Delete the branch as soon as
@@ -182,10 +182,10 @@ instead of parsing them from the prompt string.
 Then:
 
 1. Read the prompt at the path from `prompt_file` in the context JSON
-2. Read the project config: `cat /home/sprite/repo/.sodaprompts.yml`
+2. Read the project config: `cat /home/sprite/repo/.openthrottle.yml`
    Use its `test`, `lint`, `format`, and `build` values for all project commands
    throughout your session — never hardcode or guess alternatives.
-3. If Supabase MCP is available: list branches, delete any `sodaprompts-*` orphans
+3. If Supabase MCP is available: list branches, delete any `openthrottle-*` orphans
 
 ---
 
@@ -327,7 +327,7 @@ P0: done  P1: {summary}  P2: {summary}
 
 If you created a Supabase branch during this session, delete it now:
 ```
-delete_branch: sodaprompts-${PRD_ID}
+delete_branch: openthrottle-${PRD_ID}
 ```
 
 ---
@@ -371,7 +371,7 @@ continuation, repairs the env, and resumes on the next poll).
   without it." Proceeding without resolving a P0 means shipping a broken feature.
 - **Review notes go in the PR** — the reviewer and human need visibility into
   decisions you made. Silently fixing things hides context.
-- **Always read `.sodaprompts.yml`** — the project config is the source of truth
+- **Always read `.openthrottle.yml`** — the project config is the source of truth
   for test/lint/build commands. Using the wrong commands wastes time and may
   produce false results.
 - **Conventional commits** — `feat:`, `fix:`, `test:`, `chore:`. The project

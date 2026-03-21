@@ -37,8 +37,8 @@ fi
 
 # Source task management adapter (abstracts GitHub issue operations)
 # Looks in snapshot location first, then falls back to repo-relative path
-if [[ -f "/opt/sodaprompts/task-adapter.sh" ]]; then
-  source "/opt/sodaprompts/task-adapter.sh"
+if [[ -f "/opt/openthrottle/task-adapter.sh" ]]; then
+  source "/opt/openthrottle/task-adapter.sh"
 elif [[ -f "${REPO}/scripts/task-adapter.sh" ]]; then
   source "${REPO}/scripts/task-adapter.sh"
 else
@@ -48,8 +48,8 @@ fi
 
 # Read config
 BASE_BRANCH="main"
-if [[ -f "${REPO}/.sodaprompts.yml" ]]; then
-  BASE_BRANCH=$(grep '^base_branch:' "${REPO}/.sodaprompts.yml" | awk '{print $2}' 2>/dev/null || echo "main")
+if [[ -f "${REPO}/.openthrottle.yml" ]]; then
+  BASE_BRANCH=$(grep '^base_branch:' "${REPO}/.openthrottle.yml" | awk '{print $2}' 2>/dev/null || echo "main")
 fi
 
 COMPLETIONS_DIR="${SPRITE_HOME}/completions"
@@ -495,7 +495,7 @@ PRDEOF
 }
 CTXEOF
 
-  local PROMPT="New task. Context file: /tmp/task-context-${PRD_ID}.json — use the sodaprompts-builder skill for the full workflow."
+  local PROMPT="New task. Context file: /tmp/task-context-${PRD_ID}.json — use the openthrottle-builder skill for the full workflow."
 
   invoke_agent "$PROMPT" "${TIMEOUT}" "$SESSION_LOG" "prd-${ISSUE_NUMBER}" || {
     local EXIT_CODE=$?

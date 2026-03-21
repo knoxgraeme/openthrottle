@@ -15,7 +15,7 @@ AGENT_RUNTIME="${AGENT_RUNTIME:-claude}"
 
 # Find the SKILL.md for the requested skill
 # During bootstrap, skills are uploaded to /tmp/pipeline-<skill-suffix>/
-SKILL_SOURCE="/tmp/pipeline-${SKILL_NAME#sodaprompts-}/SKILL.md"
+SKILL_SOURCE="/tmp/pipeline-${SKILL_NAME#openthrottle-}/SKILL.md"
 
 if [[ ! -f "$SKILL_SOURCE" ]]; then
   # Fallback: look relative to this script
@@ -25,7 +25,7 @@ fi
 
 if [[ ! -f "$SKILL_SOURCE" ]]; then
   echo "Error: SKILL.md not found for ${SKILL_NAME}"
-  echo "Looked in: /tmp/pipeline-${SKILL_NAME#sodaprompts-}/SKILL.md"
+  echo "Looked in: /tmp/pipeline-${SKILL_NAME#openthrottle-}/SKILL.md"
   exit 1
 fi
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# bootstrap.sh — run ONCE inside the Sprite via /sodaprompts-setup
+# bootstrap.sh — run ONCE inside the Sprite via /openthrottle-setup
 #
 # Before running:
 #   1. sprite console -s <sprite>
@@ -102,21 +102,21 @@ step_github_cli() {
 }
 
 step_plugins() {
-  log "Installing sodaprompts plugin..."
-  if command -v claude &>/dev/null && claude plugin install knoxgraeme/sodaprompts 2>/dev/null; then
+  log "Installing openthrottle plugin..."
+  if command -v claude &>/dev/null && claude plugin install knoxgraeme/openthrottle 2>/dev/null; then
     log "Plugin installed via CLI"
   else
-    log "Installing sodaprompts plugin from git..."
-    git clone https://github.com/knoxgraeme/sodaprompts.git /tmp/sodaprompts-plugin 2>/dev/null || true
-    if [[ -d /tmp/sodaprompts-plugin/skills ]]; then
+    log "Installing openthrottle plugin from git..."
+    git clone https://github.com/knoxgraeme/openthrottle.git /tmp/openthrottle-plugin 2>/dev/null || true
+    if [[ -d /tmp/openthrottle-plugin/skills ]]; then
       mkdir -p "${HOME}/.claude/skills"
-      cp -r /tmp/sodaprompts-plugin/skills/* "${HOME}/.claude/skills/"
+      cp -r /tmp/openthrottle-plugin/skills/* "${HOME}/.claude/skills/"
       log "Plugin installed from git"
     else
-      warn "Could not install sodaprompts plugin"
+      warn "Could not install openthrottle plugin"
     fi
   fi
-  log "sodaprompts plugin ready"
+  log "openthrottle plugin ready"
 
   log "Installing compound-engineering plugin..."
   npx @every-env/compound-plugin install compound-engineering || {
@@ -176,15 +176,15 @@ TGEOF
   # Read lint/test commands from config (fallback to generic defaults)
   LINT_CMD="npm run lint"
   TEST_CMD="npm test"
-  if [[ -f /tmp/pipeline/sodaprompts.yml ]]; then
+  if [[ -f /tmp/pipeline/openthrottle.yml ]]; then
     LINT_CMD=$(python3 -c "
 import yaml
-with open('/tmp/pipeline/sodaprompts.yml') as f:
+with open('/tmp/pipeline/openthrottle.yml') as f:
     print(yaml.safe_load(f).get('lint', 'npm run lint'))
 " 2>/dev/null || echo "npm run lint")
     TEST_CMD=$(python3 -c "
 import yaml
-with open('/tmp/pipeline/sodaprompts.yml') as f:
+with open('/tmp/pipeline/openthrottle.yml') as f:
     print(yaml.safe_load(f).get('test', 'npm test'))
 " 2>/dev/null || echo "npm test")
   fi
@@ -241,10 +241,10 @@ SETTEOF
   log "settings.json written"
 
   # Merge project MCP servers from config if defined
-  if [[ -f /tmp/pipeline/sodaprompts.yml ]]; then
+  if [[ -f /tmp/pipeline/openthrottle.yml ]]; then
     PROJECT_MCPS=$(python3 -c "
 import yaml, json, sys
-with open('/tmp/pipeline/sodaprompts.yml') as f:
+with open('/tmp/pipeline/openthrottle.yml') as f:
     config = yaml.safe_load(f) or {}
 mcps = config.get('mcp_servers', {})
 if mcps:
@@ -299,10 +299,10 @@ print(json.dumps(mcps))
 
 step_clone_repo() {
   PULL_BRANCH="main"
-  if [[ -f /tmp/pipeline/sodaprompts.yml ]]; then
+  if [[ -f /tmp/pipeline/openthrottle.yml ]]; then
     PULL_BRANCH=$(python3 -c "
 import yaml
-with open('/tmp/pipeline/sodaprompts.yml') as f:
+with open('/tmp/pipeline/openthrottle.yml') as f:
     print(yaml.safe_load(f).get('base_branch', 'main'))
 " 2>/dev/null || echo "main")
   fi
@@ -348,7 +348,7 @@ with open('/tmp/pipeline/sodaprompts.yml') as f:
   else
     warn ".env not found at ${ENV_FILE}"
     warn "Pipeline secrets (GITHUB_TOKEN, TELEGRAM_*) may not be available"
-    warn "Re-run /sodaprompts-setup to push .env files"
+    warn "Re-run /openthrottle-setup to push .env files"
   fi
 
   return 0
@@ -374,7 +374,7 @@ step_services() {
   # Builder skill
   log "Installing builder skill..."
   cd "${SPRITE_HOME}/repo"
-  bash /tmp/pipeline/install-skill.sh sodaprompts-builder
+  bash /tmp/pipeline/install-skill.sh openthrottle-builder
   cd "${SPRITE_HOME}"
 
   log "Installing run-builder.sh..."
@@ -394,13 +394,13 @@ step_services() {
 }
 
 step_post_bootstrap() {
-  if [[ -f /tmp/pipeline/sodaprompts.yml ]]; then
-    cp /tmp/pipeline/sodaprompts.yml "${SPRITE_HOME}/repo/.sodaprompts.yml"
+  if [[ -f /tmp/pipeline/openthrottle.yml ]]; then
+    cp /tmp/pipeline/openthrottle.yml "${SPRITE_HOME}/repo/.openthrottle.yml"
 
     # Run post_bootstrap commands if defined
     POST_BOOTSTRAP=$(python3 -c "
 import yaml, sys
-with open('/tmp/pipeline/sodaprompts.yml') as f:
+with open('/tmp/pipeline/openthrottle.yml') as f:
     config = yaml.safe_load(f)
 for cmd in config.get('post_bootstrap', []):
     print(cmd)
@@ -442,7 +442,7 @@ step_summary() {
 # ═════════════════════════════════════════════════════════════════════════
 
 echo ""
-echo "Soda Prompts — Bootstrap"
+echo "Open Throttle — Bootstrap"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━"
 [[ "$FROM_STEP" -gt 1 ]] && echo "Resuming from step ${FROM_STEP}"
 

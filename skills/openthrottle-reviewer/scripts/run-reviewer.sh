@@ -37,8 +37,8 @@ fi
 : "${GITHUB_TOKEN:?GITHUB_TOKEN is not set}"
 
 # Source task management adapter (abstracts GitHub issue operations)
-if [[ -f "/opt/sodaprompts/task-adapter.sh" ]]; then
-  source "/opt/sodaprompts/task-adapter.sh"
+if [[ -f "/opt/openthrottle/task-adapter.sh" ]]; then
+  source "/opt/openthrottle/task-adapter.sh"
 elif [[ -f "${REPO}/scripts/task-adapter.sh" ]]; then
   source "${REPO}/scripts/task-adapter.sh"
 else
@@ -48,8 +48,8 @@ fi
 
 # Read config
 BASE_BRANCH="main"
-if [[ -f "${REPO}/.sodaprompts.yml" ]]; then
-  BASE_BRANCH=$(grep '^base_branch:' "${REPO}/.sodaprompts.yml" | awk '{print $2}' 2>/dev/null || echo "main")
+if [[ -f "${REPO}/.openthrottle.yml" ]]; then
+  BASE_BRANCH=$(grep '^base_branch:' "${REPO}/.openthrottle.yml" | awk '{print $2}' 2>/dev/null || echo "main")
 fi
 
 log() { echo "[thinker $(date +%H:%M:%S)] $1" | tee -a "${LOG_DIR}/thinker.log"; }
@@ -254,7 +254,7 @@ review_pr() {
 RE_REVIEW: This is re-review round ${REVIEW_ROUND}. Focus on whether your previous requested changes were addressed."
   fi
 
-  local PROMPT="Review PR #${PR_NUMBER} in ${GITHUB_REPO}. Use the sodaprompts-reviewer skill.
+  local PROMPT="Review PR #${PR_NUMBER} in ${GITHUB_REPO}. Use the openthrottle-reviewer skill.
 
 The PR branch is checked out locally — you can read source files, run commands,
 and commit trivial fixes directly. Push to the branch when done.
@@ -319,7 +319,7 @@ investigate_bug() {
   cd "$REPO"
   git pull origin "$BASE_BRANCH" 2>/dev/null || true
 
-  local PROMPT="Investigate issue #${ISSUE_NUMBER} in ${GITHUB_REPO}. Use the sodaprompts-investigator skill."
+  local PROMPT="Investigate issue #${ISSUE_NUMBER} in ${GITHUB_REPO}. Use the openthrottle-investigator skill."
 
   invoke_agent "$PROMPT" "$TASK_TIMEOUT" "$SESSION_LOG" "investigate-${ISSUE_NUMBER}" || {
     local EXIT_CODE=$?

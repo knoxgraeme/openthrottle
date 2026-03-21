@@ -10,7 +10,7 @@
 # always GitHub regardless of task provider.
 #
 # Usage:
-#   source /opt/sodaprompts/task-adapter.sh   # (in snapshot)
+#   source /opt/openthrottle/task-adapter.sh   # (in snapshot)
 #   source ./scripts/task-adapter.sh          # (local dev)
 #
 # Requires:

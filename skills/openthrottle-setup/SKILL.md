@@ -1,25 +1,25 @@
 ---
-name: sodaprompts-setup
+name: openthrottle-setup
 description: >
-  One-time setup of Soda Prompts for a project. Creates or connects to a
-  Sprite, detects the project stack, generates .sodaprompts.yml, bootstraps
+  One-time setup of Open Throttle for a project. Creates or connects to a
+  Sprite, detects the project stack, generates .openthrottle.yml, bootstraps
   the Sprite with tools/hooks/skills, and checkpoints as golden-base.
-  Use when: "set up soda prompts", "bootstrap the sprite", "configure sodaprompts",
+  Use when: "set up open throttle", "bootstrap the sprite", "configure openthrottle",
   or first-time onboarding for any project. Also related:
-  /sodaprompts-ship for shipping prompts after setup is complete.
+  /openthrottle-ship for shipping prompts after setup is complete.
 disable-model-invocation: true
 argument-hint: [--sprite sprite-name]
 ---
 
-# Soda Prompts Setup
+# Open Throttle Setup
 
-Onboard a project to Soda Prompts. Idempotent — safe to re-run.
+Onboard a project to Open Throttle. Idempotent — safe to re-run.
 
 ## Workflow Overview
 
 1. **Preflight** — deterministic script checks tools, env vars, project files
 2. **Detect project** — read package.json, infer test/dev/format commands
-3. **Generate config** — write `.sodaprompts.yml`, confirm with user
+3. **Generate config** — write `.openthrottle.yml`, confirm with user
 4. **Discover .env files** — find all .env files to push to the sprite
 5. **Ship Doer** — deterministic script: create sprite, bootstrap, verify, checkpoint
 6. **Reviewer** — (optional) ask user, then deterministic script for reviewer sprite
@@ -37,10 +37,10 @@ fix instructions if anything fails. **Stop if it fails.**
 Locate the script relative to this skill's directory:
 
 ```bash
-PREFLIGHT="$(find ~/.claude/plugins -path '*/sodaprompts-setup/scripts/preflight.sh' -type f | head -1)"
+PREFLIGHT="$(find ~/.claude/plugins -path '*/openthrottle-setup/scripts/preflight.sh' -type f | head -1)"
 if [[ -z "$PREFLIGHT" ]]; then
-  echo "ERROR: preflight.sh not found. Is the sodaprompts plugin installed?"
-  echo "  Fix: claude plugin install knoxgraeme/sodaprompts"
+  echo "ERROR: preflight.sh not found. Is the openthrottle plugin installed?"
+  echo "  Fix: claude plugin install knoxgraeme/openthrottle"
   exit 1
 fi
 bash "$PREFLIGHT"
@@ -55,7 +55,7 @@ cat package.json | jq '{scripts: .scripts, packageManager: .packageManager}'
 ls pnpm-workspace.yaml turbo.json lerna.json nx.json 2>/dev/null
 ls tsconfig.json 2>/dev/null
 head -50 CLAUDE.md 2>/dev/null || echo "No CLAUDE.md"
-cat .sodaprompts.yml 2>/dev/null || echo "No existing config"
+cat .openthrottle.yml 2>/dev/null || echo "No existing config"
 ```
 
 | Field | Detection |
@@ -73,8 +73,8 @@ For pnpm/turbo monorepos, prefix commands with `pnpm`.
 
 ## Step 3 — Generate Config
 
-Write `.sodaprompts.yml` using the detected values from Step 2.
-The reference at `references/sodaprompts-schema.yml` shows the structure — but you
+Write `.openthrottle.yml` using the detected values from Step 2.
+The reference at `references/openthrottle-schema.yml` shows the structure — but you
 should populate every field with actual detected values, not copy defaults.
 
 **Every field should be filled in.** No commented-out sections. The config
@@ -175,7 +175,7 @@ their request schemas are documented. See https://sprites.dev/api/sprites/polici
 ### Confirm with user
 
 Show the generated config and ask the user to confirm or edit before writing.
-Then write to `.sodaprompts.yml` at the repo root.
+Then write to `.openthrottle.yml` at the repo root.
 
 ---
 
@@ -209,9 +209,9 @@ and wake workflow installation.
 Locate and run the script:
 
 ```bash
-SHIP_DOER="$(find ~/.claude/plugins -path '*/sodaprompts-setup/scripts/ship-doer.sh' -type f | head -1)"
+SHIP_DOER="$(find ~/.claude/plugins -path '*/openthrottle-setup/scripts/ship-doer.sh' -type f | head -1)"
 if [[ -z "$SHIP_DOER" ]]; then
-  echo "ERROR: ship-doer.sh not found. Is the sodaprompts plugin installed?"
+  echo "ERROR: ship-doer.sh not found. Is the openthrottle plugin installed?"
   exit 1
 fi
 bash "$SHIP_DOER"
@@ -266,7 +266,7 @@ If **yes** → ask for configuration:
 | Max review rounds | `3` | "Max review rounds before auto-approve?" |
 | Poll interval | `60` | "Poll interval in seconds?" |
 
-Add the `reviewer` section to `.sodaprompts.yml`:
+Add the `reviewer` section to `.openthrottle.yml`:
 
 ```yaml
 reviewer:
@@ -279,9 +279,9 @@ reviewer:
 Then run the reviewer ship script:
 
 ```bash
-SHIP_REVIEWER="$(find ~/.claude/plugins -path '*/sodaprompts-setup/scripts/ship-reviewer.sh' -type f | head -1)"
+SHIP_REVIEWER="$(find ~/.claude/plugins -path '*/openthrottle-setup/scripts/ship-reviewer.sh' -type f | head -1)"
 if [[ -z "$SHIP_REVIEWER" ]]; then
-  echo "ERROR: ship-reviewer.sh not found. Is the sodaprompts plugin installed?"
+  echo "ERROR: ship-reviewer.sh not found. Is the openthrottle plugin installed?"
   exit 1
 fi
 bash "$SHIP_REVIEWER"
@@ -295,4 +295,4 @@ Tell the user to also set `REVIEWER_SPRITE` variable in GitHub Actions.
 
 ## Finish
 
-Remind the user to commit `.sodaprompts.yml` and `.github/workflows/wake-sprite.yml`.
+Remind the user to commit `.openthrottle.yml` and `.github/workflows/wake-sprite.yml`.

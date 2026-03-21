@@ -1,11 +1,11 @@
 {
-  "name": "sodaprompts",
+  "name": "openthrottle",
   "owner": {
     "name": "Graeme Knox"
   },
   "plugins": [
     {
-      "name": "sodaprompts",
+      "name": "openthrottle",
       "source": "./"
     }
   ]

@@ -1,12 +1,12 @@
 {
-  "name": "sodaprompts",
+  "name": "openthrottle",
   "version": "0.1.0",
   "description": "Ship prompts to autonomous Claude Code agents running on Sprites. Write a prompt, ship it, get a PR back.",
   "author": {
     "name": "Graeme Knox",
     "url": "https://github.com/knoxgraeme"
   },
-  "repository": "https://github.com/knoxgraeme/sodaprompts",
+  "repository": "https://github.com/knoxgraeme/openthrottle",
   "license": "MIT",
   "keywords": ["sprites", "autonomous", "agent", "pipeline", "prompts"]
 }

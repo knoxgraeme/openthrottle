@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# lib.sh — shared helpers for sodaprompts local scripts
+# lib.sh — shared helpers for openthrottle local scripts
 # Source this at the top of every script: source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 set -euo pipefail
@@ -9,7 +9,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 load_config() {
   REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-  CONFIG="${REPO_ROOT}/.sodaprompts.yml"
+  CONFIG="${REPO_ROOT}/.openthrottle.yml"
   ENV_FILE="${REPO_ROOT}/.env"
 
   if [[ -f "$ENV_FILE" ]]; then

@@ -27,9 +27,9 @@ reasonably assume. Prefer doing over asking.
 ## Setup
 
 Requires the Telegram MCP server configured in `~/.claude/settings.json`
-(installed automatically during `/sodaprompts-setup`).
+(installed automatically during `/openthrottle-setup`).
 
-If the MCP tools aren't available, tell the user to run `/sodaprompts-setup`
+If the MCP tools aren't available, tell the user to run `/openthrottle-setup`
 or configure the Telegram MCP manually.
 
 ## Send a Message (no reply needed)

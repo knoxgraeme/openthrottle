@@ -6,9 +6,9 @@
 # files, runs bootstrap, applies network policy, checkpoints, and verifies.
 #
 # Usage:
-#   bash ship-reviewer.sh [--from-step N] [--config .sodaprompts.yml] [--verbose]
+#   bash ship-reviewer.sh [--from-step N] [--config .openthrottle.yml] [--verbose]
 #
-# Requires: reviewer section in .sodaprompts.yml (added during /sodaprompts-setup)
+# Requires: reviewer section in .openthrottle.yml (added during /openthrottle-setup)
 # =============================================================================
 
 SHIP_SCRIPT_NAME="ship-reviewer.sh"
@@ -33,7 +33,7 @@ INVESTIGATOR_DIR=""
 step_read_config() {
   if [[ ! -f "$CONFIG_FILE" ]]; then
     fail_step "test -f $CONFIG_FILE" \
-      ".sodaprompts.yml not found. Run /sodaprompts-setup first."
+      ".openthrottle.yml not found. Run /openthrottle-setup first."
     return 1
   fi
 
@@ -51,22 +51,22 @@ with open(os.environ['CONFIG']) as f:
 print('yes' if config.get('reviewer') else 'no')
 " 2>&1) || {
     fail_step "parse ${CONFIG_FILE}" \
-      "Failed to parse .sodaprompts.yml. Check for YAML syntax errors."
+      "Failed to parse .openthrottle.yml. Check for YAML syntax errors."
     return 1
   }
 
   if [[ "$has_reviewer" != "yes" ]]; then
     fail_step "check reviewer config" \
-      "No 'reviewer' section in .sodaprompts.yml. Add it first (sprite name, agent_runtime, max_rounds, poll_interval)."
+      "No 'reviewer' section in .openthrottle.yml. Add it first (sprite name, agent_runtime, max_rounds, poll_interval)."
     return 1
   fi
 
   REVIEWER_SPRITE=$(read_yaml_nested "$CONFIG_FILE" "reviewer.sprite" "soda-reviewer") || {
-    fail_step "read reviewer.sprite from ${CONFIG_FILE}" "Check .sodaprompts.yml for YAML syntax errors."
+    fail_step "read reviewer.sprite from ${CONFIG_FILE}" "Check .openthrottle.yml for YAML syntax errors."
     return 1
   }
   AGENT_RUNTIME=$(read_yaml_nested "$CONFIG_FILE" "reviewer.agent_runtime" "claude") || {
-    fail_step "read reviewer.agent_runtime from ${CONFIG_FILE}" "Check .sodaprompts.yml for YAML syntax errors."
+    fail_step "read reviewer.agent_runtime from ${CONFIG_FILE}" "Check .openthrottle.yml for YAML syntax errors."
     return 1
   }
 
@@ -78,26 +78,26 @@ print('yes' if config.get('reviewer') else 'no')
 }
 
 step_locate_plugin() {
-  # Resolve from known relative path — scripts live in sodaprompts-setup/scripts/
+  # Resolve from known relative path — scripts live in openthrottle-setup/scripts/
   PLUGIN_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-  REVIEWER_DIR="$(cd "${SCRIPT_DIR}/../../sodaprompts-reviewer" 2>/dev/null && pwd)" || true
-  INVESTIGATOR_DIR="$(cd "${SCRIPT_DIR}/../../sodaprompts-investigator" 2>/dev/null && pwd)" || true
+  REVIEWER_DIR="$(cd "${SCRIPT_DIR}/../../openthrottle-reviewer" 2>/dev/null && pwd)" || true
+  INVESTIGATOR_DIR="$(cd "${SCRIPT_DIR}/../../openthrottle-investigator" 2>/dev/null && pwd)" || true
 
   if [[ ! -d "${PLUGIN_DIR}/scripts" ]]; then
     fail_step "test -d ${SCRIPT_DIR}/../scripts" \
-      "sodaprompts plugin not found. Install: claude plugin install knoxgraeme/sodaprompts"
+      "openthrottle plugin not found. Install: claude plugin install knoxgraeme/openthrottle"
     return 1
   fi
 
   if [[ -z "$REVIEWER_DIR" || ! -d "$REVIEWER_DIR" ]]; then
-    fail_step "test -d sodaprompts-reviewer" \
-      "sodaprompts-reviewer skill not found. Reinstall: claude plugin install knoxgraeme/sodaprompts"
+    fail_step "test -d openthrottle-reviewer" \
+      "openthrottle-reviewer skill not found. Reinstall: claude plugin install knoxgraeme/openthrottle"
     return 1
   fi
 
   if [[ -z "$INVESTIGATOR_DIR" || ! -d "$INVESTIGATOR_DIR" ]]; then
-    fail_step "test -d sodaprompts-investigator" \
-      "sodaprompts-investigator skill not found. Reinstall: claude plugin install knoxgraeme/sodaprompts"
+    fail_step "test -d openthrottle-investigator" \
+      "openthrottle-investigator skill not found. Reinstall: claude plugin install knoxgraeme/openthrottle"
     return 1
   fi
 
@@ -112,7 +112,7 @@ step_locate_plugin() {
 
   if [[ ${#missing[@]} -gt 0 ]]; then
     fail_step "file existence check" \
-      "Missing files in plugin: ${missing[*]}. Reinstall: claude plugin install knoxgraeme/sodaprompts"
+      "Missing files in plugin: ${missing[*]}. Reinstall: claude plugin install knoxgraeme/openthrottle"
     return 1
   fi
 
@@ -269,7 +269,7 @@ step_verify() {
   fi
 
   # 3. Reviewer skill installed
-  if sprite exec -s "$REVIEWER_SPRITE" -- test -f .claude/skills/sodaprompts-reviewer/SKILL.md &>/dev/null; then
+  if sprite exec -s "$REVIEWER_SPRITE" -- test -f .claude/skills/openthrottle-reviewer/SKILL.md &>/dev/null; then
     log "  Reviewer skill: PASS"
   else
     err "  Reviewer skill: FAIL"
@@ -277,7 +277,7 @@ step_verify() {
   fi
 
   # 4. Investigator skill installed
-  if sprite exec -s "$REVIEWER_SPRITE" -- test -f .claude/skills/sodaprompts-investigator/SKILL.md &>/dev/null; then
+  if sprite exec -s "$REVIEWER_SPRITE" -- test -f .claude/skills/openthrottle-investigator/SKILL.md &>/dev/null; then
     log "  Investigator skill: PASS"
   else
     err "  Investigator skill: FAIL"
@@ -324,7 +324,7 @@ step_summary() {
 # ═════════════════════════════════════════════════════════════════════════
 
 echo ""
-echo "Soda Prompts — Ship Reviewer"
+echo "Open Throttle — Ship Reviewer"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 [[ "$FROM_STEP" -gt 1 ]] && echo "Resuming from step ${FROM_STEP}"
 

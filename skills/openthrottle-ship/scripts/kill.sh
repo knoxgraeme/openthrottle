@@ -32,12 +32,12 @@ else
 fi
 
 # Clean up orphaned Supabase branches (best-effort)
-# The builder skill creates branches named sodaprompts-* for isolated DB work.
+# The builder skill creates branches named openthrottle-* for isolated DB work.
 # If a session was killed mid-run, the branch may not have been deleted.
 echo ""
 echo "Checking for orphaned Supabase branches..."
 ORPHANS=$(sprite exec -s "$SPRITE" -- \
-  claude -p "List Supabase branches. Delete any with the sodaprompts- prefix. Reply with what you deleted or 'none found'." \
+  claude -p "List Supabase branches. Delete any with the openthrottle- prefix. Reply with what you deleted or 'none found'." \
   --dangerously-skip-permissions --output-format text 2>/dev/null || echo "skip")
 
 if [[ "$ORPHANS" == "skip" ]]; then

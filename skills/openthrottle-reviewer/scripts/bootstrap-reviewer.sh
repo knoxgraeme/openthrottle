@@ -80,8 +80,8 @@ fi
 # ---------------------------------------------------------------------------
 log "Installing thinker skills for ${AGENT_RUNTIME}..."
 cd "${SPRITE_HOME}/repo"
-bash /tmp/pipeline/install-skill.sh sodaprompts-reviewer
-bash /tmp/pipeline/install-skill.sh sodaprompts-investigator
+bash /tmp/pipeline/install-skill.sh openthrottle-reviewer
+bash /tmp/pipeline/install-skill.sh openthrottle-investigator
 cd "${SPRITE_HOME}"
 
 log "Installing run-reviewer.sh..."

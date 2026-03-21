@@ -1,10 +1,10 @@
 ---
-name: sodaprompts-ship
+name: openthrottle-ship
 description: >
   Ship prompts to the remote Sprite, check status, view logs, or kill
   a running session. Use when: "ship this prompt", "push to sprite", "queue prompt",
   "check sprite status", "show logs", "kill the session", "what's running",
-  or any interaction with Soda Prompts. Run /sodaprompts-setup first
+  or any interaction with Open Throttle. Run /openthrottle-setup first
   if the pipeline hasn't been set up yet.
 disable-model-invocation: true
 argument-hint: [prompt-file.md | status | logs | kill | push-env] [--base branch]
@@ -12,7 +12,7 @@ argument-hint: [prompt-file.md | status | logs | kill | push-env] [--base branch
 
 # Ship Prompt
 
-Interact with Soda Prompts running on your Sprite.
+Interact with Open Throttle running on your Sprite.
 
 All ship and status operations use the `gh` CLI directly — no sprite exec needed.
 This means shipping works from any environment with `gh` installed (Claude Code,
@@ -28,11 +28,11 @@ Logs, kill, and push-env still require sprite exec (scripts in `scripts/` subdir
 
 ## Config
 
-Read `.sodaprompts.yml` at the repo root for:
+Read `.openthrottle.yml` at the repo root for:
 
 ```bash
 GITHUB_REPO=$(git remote get-url origin | sed -E 's|.*github.com[:/](.+/.+?)(\.git)?$|\1|')
-BASE_BRANCH=$(grep '^base_branch:' .sodaprompts.yml | awk '{print $2}')
+BASE_BRANCH=$(grep '^base_branch:' .openthrottle.yml | awk '{print $2}')
 BASE_BRANCH="${BASE_BRANCH:-main}"
 ```
 
@@ -131,7 +131,7 @@ Requires sprite exec. Find this skill's `scripts/` directory (sibling to this
 SKILL.md) and run:
 
 ```bash
-SCRIPTS_DIR="$(dirname "$(find ~/.claude/plugins -path '*/sodaprompts-ship/scripts/logs.sh' -type f | head -1)")"
+SCRIPTS_DIR="$(dirname "$(find ~/.claude/plugins -path '*/openthrottle-ship/scripts/logs.sh' -type f | head -1)")"
 bash "$SCRIPTS_DIR/logs.sh" [prd-id]
 ```
 
@@ -146,7 +146,7 @@ Requires sprite exec. **Always confirm with the user before killing** — this
 stops the prompt mid-run and any uncommitted work is lost.
 
 ```bash
-SCRIPTS_DIR="$(dirname "$(find ~/.claude/plugins -path '*/sodaprompts-ship/scripts/kill.sh' -type f | head -1)")"
+SCRIPTS_DIR="$(dirname "$(find ~/.claude/plugins -path '*/openthrottle-ship/scripts/kill.sh' -type f | head -1)")"
 bash "$SCRIPTS_DIR/kill.sh"
 ```
 
@@ -157,7 +157,7 @@ bash "$SCRIPTS_DIR/kill.sh"
 When the user updates their `.env` (rotated keys, new secrets, etc.):
 
 ```bash
-SCRIPTS_DIR="$(dirname "$(find ~/.claude/plugins -path '*/sodaprompts-ship/scripts/push-env.sh' -type f | head -1)")"
+SCRIPTS_DIR="$(dirname "$(find ~/.claude/plugins -path '*/openthrottle-ship/scripts/push-env.sh' -type f | head -1)")"
 bash "$SCRIPTS_DIR/push-env.sh"
 ```
 
@@ -174,4 +174,4 @@ Always tell the user:
 - The issue URL that was created
 - Whether it started immediately or was queued (check queue position)
 - That they'll get a Telegram message when the PR is ready
-- How to check: `/sodaprompts-ship status`
+- How to check: `/openthrottle-ship status`

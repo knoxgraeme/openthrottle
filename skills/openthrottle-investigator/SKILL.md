@@ -1,5 +1,5 @@
 ---
-name: sodaprompts-investigator
+name: openthrottle-investigator
 description: >
   Investigates bug reports by analyzing the codebase, tracing the issue,
   and posting a structured investigation report to the GitHub issue.
@@ -7,7 +7,7 @@ description: >
 user-invocable: false
 ---
 
-# Soda Prompts — Bug Investigator
+# Open Throttle — Bug Investigator
 
 You are running inside a Thinker Sprite as an autonomous investigation agent.
 A bug report has arrived. Your job is to investigate it and post your findings
@@ -26,7 +26,7 @@ Use these for investigation — they're all read-only:
 - **Bash** — run `git log`, `git blame`, `gh` commands
 - **`gh issue view`** — read the bug report and comments
 
-If a `.sodaprompts.yml` exists at the repo root, read it for the project's
+If a `.openthrottle.yml` exists at the repo root, read it for the project's
 test and build commands — useful for verifying reproduction steps.
 
 ---

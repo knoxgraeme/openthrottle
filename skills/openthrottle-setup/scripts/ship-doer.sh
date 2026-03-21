@@ -6,7 +6,7 @@
 # runs bootstrap, applies network policy, checkpoints, and verifies.
 #
 # Usage:
-#   bash ship-doer.sh [--from-step N] [--config .sodaprompts.yml] [--verbose]
+#   bash ship-doer.sh [--from-step N] [--config .openthrottle.yml] [--verbose]
 #
 # On failure: outputs structured JSON between ===SHIP_ERROR_BEGIN/END===
 # On success: outputs ===SHIP_COMPLETE=== with full status
@@ -33,7 +33,7 @@ BUILDER_DIR=""
 step_read_config() {
   if [[ ! -f "$CONFIG_FILE" ]]; then
     fail_step "test -f $CONFIG_FILE" \
-      ".sodaprompts.yml not found at '${CONFIG_FILE}'. Run /sodaprompts-setup Steps 2-3 first to generate it."
+      ".openthrottle.yml not found at '${CONFIG_FILE}'. Run /openthrottle-setup Steps 2-3 first to generate it."
     return 1
   fi
 
@@ -43,11 +43,11 @@ step_read_config() {
   fi
 
   SPRITE=$(read_yaml_field "$CONFIG_FILE" "sprite" "soda-base") || {
-    fail_step "read sprite from ${CONFIG_FILE}" "Check .sodaprompts.yml for YAML syntax errors."
+    fail_step "read sprite from ${CONFIG_FILE}" "Check .openthrottle.yml for YAML syntax errors."
     return 1
   }
   BASE_BRANCH=$(read_yaml_field "$CONFIG_FILE" "base_branch" "main") || {
-    fail_step "read base_branch from ${CONFIG_FILE}" "Check .sodaprompts.yml for YAML syntax errors."
+    fail_step "read base_branch from ${CONFIG_FILE}" "Check .openthrottle.yml for YAML syntax errors."
     return 1
   }
 
@@ -63,19 +63,19 @@ step_read_config() {
 }
 
 step_locate_plugin() {
-  # Resolve from known relative path — scripts live in sodaprompts-setup/scripts/
+  # Resolve from known relative path — scripts live in openthrottle-setup/scripts/
   PLUGIN_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-  BUILDER_DIR="$(cd "${SCRIPT_DIR}/../../sodaprompts-builder" 2>/dev/null && pwd)" || true
+  BUILDER_DIR="$(cd "${SCRIPT_DIR}/../../openthrottle-builder" 2>/dev/null && pwd)" || true
 
   if [[ ! -d "${PLUGIN_DIR}/scripts" ]]; then
     fail_step "test -d ${SCRIPT_DIR}/../scripts" \
-      "sodaprompts plugin not found. Install: claude plugin install knoxgraeme/sodaprompts"
+      "openthrottle plugin not found. Install: claude plugin install knoxgraeme/openthrottle"
     return 1
   fi
 
   if [[ -z "$BUILDER_DIR" || ! -d "$BUILDER_DIR" ]]; then
-    fail_step "test -d sodaprompts-builder" \
-      "sodaprompts-builder skill not found. Reinstall: claude plugin install knoxgraeme/sodaprompts"
+    fail_step "test -d openthrottle-builder" \
+      "openthrottle-builder skill not found. Reinstall: claude plugin install knoxgraeme/openthrottle"
     return 1
   fi
 
@@ -90,7 +90,7 @@ step_locate_plugin() {
 
   if [[ ${#missing[@]} -gt 0 ]]; then
     fail_step "file existence check" \
-      "Missing files in plugin: ${missing[*]}. Reinstall: claude plugin install knoxgraeme/sodaprompts"
+      "Missing files in plugin: ${missing[*]}. Reinstall: claude plugin install knoxgraeme/openthrottle"
     return 1
   fi
 
@@ -109,7 +109,7 @@ step_create_sprite() {
   log "Creating sprite '${SPRITE}'..."
   if ! sprite create "$SPRITE"; then
     fail_step "sprite create ${SPRITE}" \
-      "Failed to create sprite. Run 'sprite list' to check existing sprites. Destroy unused ones with 'sprite destroy <name>', or use an existing sprite by setting 'sprite: <name>' in .sodaprompts.yml"
+      "Failed to create sprite. Run 'sprite list' to check existing sprites. Destroy unused ones with 'sprite destroy <name>', or use an existing sprite by setting 'sprite: <name>' in .openthrottle.yml"
     return 1
   fi
   log "Sprite '${SPRITE}' created"
@@ -182,7 +182,7 @@ step_upload_files() {
   sprite_upload "$SPRITE" "${BUILDER_DIR}/scripts/run-builder.sh"  "/tmp/pipeline-builder/run-builder.sh" || upload_failed=true
 
   log "Uploading project config..."
-  sprite_upload "$SPRITE" "$CONFIG_FILE" "/tmp/pipeline/sodaprompts.yml" || upload_failed=true
+  sprite_upload "$SPRITE" "$CONFIG_FILE" "/tmp/pipeline/openthrottle.yml" || upload_failed=true
 
   if [[ "$upload_failed" == true ]]; then
     fail_step "sprite_upload" \
@@ -267,7 +267,7 @@ step_verify() {
   fi
 
   # 3. Builder skill installed (file check, not LLM call)
-  if sprite exec -s "$SPRITE" -- test -f /home/sprite/repo/.claude/skills/sodaprompts-builder/SKILL.md &>/dev/null; then
+  if sprite exec -s "$SPRITE" -- test -f /home/sprite/repo/.claude/skills/openthrottle-builder/SKILL.md &>/dev/null; then
     log "  Builder skill: PASS"
   else
     warn "  Builder skill: WARN (not detected, non-critical)"
@@ -312,7 +312,7 @@ step_install_wake_workflow() {
 
   if [[ -z "$workflow_src" || ! -f "$workflow_src" ]]; then
     fail_step "locate wake-sprite.yml" \
-      "wake-sprite.yml not found in plugin. Reinstall: claude plugin install knoxgraeme/sodaprompts"
+      "wake-sprite.yml not found in plugin. Reinstall: claude plugin install knoxgraeme/openthrottle"
     return 1
   fi
 
@@ -345,7 +345,7 @@ step_summary() {
 
   echo ""
   echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-  echo -e "${GREEN}  Soda Prompts setup complete!${NC}"
+  echo -e "${GREEN}  Open Throttle setup complete!${NC}"
   echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
   echo ""
   echo "  Sprite:      ${SPRITE}"
@@ -355,7 +355,7 @@ step_summary() {
   echo "  Egress:      ${policy_status}"
   echo ""
   echo "  How it works:"
-  echo "    1. Ship a prompt:  /sodaprompts-ship path/to/feature.md"
+  echo "    1. Ship a prompt:  /openthrottle-ship path/to/feature.md"
   echo "    2. GitHub Action wakes the sprite automatically"
   echo "    3. Sprite works, opens a PR, goes back to sleep"
   echo "    4. Telegram notification when PR is ready"
@@ -364,7 +364,7 @@ step_summary() {
   echo "    sprite console -s ${SPRITE} → claude login"
   echo "    sprite checkpoint create -s ${SPRITE} --comment golden-base"
   echo ""
-  echo "  Commit: .sodaprompts.yml and .github/workflows/wake-sprite.yml"
+  echo "  Commit: .openthrottle.yml and .github/workflows/wake-sprite.yml"
   echo ""
 
   emit_complete "{\"status\":\"success\",\"sprite\":\"${SPRITE}\",\"checkpoint\":\"golden-base\"}"
@@ -376,11 +376,11 @@ step_summary() {
 # ═════════════════════════════════════════════════════════════════════════
 
 echo ""
-echo "Soda Prompts — Ship Doer"
+echo "Open Throttle — Ship Doer"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━"
 [[ "$FROM_STEP" -gt 1 ]] && echo "Resuming from step ${FROM_STEP}"
 
-run_step  1  "read-config"             "Parse .sodaprompts.yml"              step_read_config       --required
+run_step  1  "read-config"             "Parse .openthrottle.yml"              step_read_config       --required
 run_step  2  "locate-plugin"           "Locate plugin files"                 step_locate_plugin     --required
 run_step  3  "create-sprite"           "Create or connect sprite"            step_create_sprite
 run_step  4  "check-auth"              "Verify Claude auth on sprite"        step_check_auth

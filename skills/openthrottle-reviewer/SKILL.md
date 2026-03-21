@@ -1,5 +1,5 @@
 ---
-name: sodaprompts-reviewer
+name: openthrottle-reviewer
 description: >
   Thinker Sprite review skill — task-aware final review of PRs created by
   the Doer Sprite. Checks task alignment, best practices, security, and
@@ -8,7 +8,7 @@ description: >
 user-invocable: false
 ---
 
-# Soda Prompts — Thinker Sprite (Reviewer)
+# Open Throttle — Thinker Sprite (Reviewer)
 
 You are the final reviewer for PRs created by the Doer Sprite. The Doer
 already ran ce:review during its session, so basic code quality, architecture,
@@ -121,7 +121,7 @@ blind spots. Check specifically:
 - **Exposed error details** — stack traces or internal state leaked
   to users
 
-If the project has a `.sodaprompts.yml`, read it for the test command
+If the project has a `.openthrottle.yml`, read it for the test command
 and run the security-related tests if any exist.
 
 ---

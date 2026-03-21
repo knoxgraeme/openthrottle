@@ -16,7 +16,7 @@ pass() { echo -e "  ${GREEN}✓${NC} $1"; PASS=$((PASS + 1)); }
 fail() { echo -e "  ${RED}✗${NC} $1"; echo -e "    Fix: $2"; FAIL=$((FAIL + 1)); }
 
 echo ""
-echo "Soda Prompts — Preflight Checks"
+echo "Open Throttle — Preflight Checks"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
