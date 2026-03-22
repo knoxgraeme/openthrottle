@@ -25,6 +25,10 @@ ${INVESTIGATION_BLOCK}
 
 ---
 
+Execute every step below IN ORDER. Do NOT skip steps or jump ahead to
+coding. The plan phase MUST be completed and verified BEFORE any
+implementation begins.
+
 ## Step 1 — Plan
 
 Use the Skill tool to invoke `compound-engineering:ce-plan` with the bug
