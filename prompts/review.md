@@ -62,7 +62,15 @@ Read the actual source files, not just the diff.
 - SQL/injection risks from raw string interpolation
 - Exposed error details or stack traces
 
-## Phase 4 — Triage Builder's Review Items
+## Phase 4 — Silent Failure Analysis
+
+Run `/pr-review-toolkit:silent-failure-hunter` on the PR diff.
+
+This catches swallowed errors, inadequate fallbacks, and `|| true` patterns
+that the best practices check above may miss. Include any findings in your
+review alongside your own.
+
+## Phase 5 — Triage Builder's Review Items
 
 Read the builder's review notes. For each deferred item assess:
 
@@ -70,13 +78,13 @@ Read the builder's review notes. For each deferred item assess:
 - **Correctly deferred** — fine to merge. Note it.
 - **Already resolved** — builder fixed it. Acknowledge it.
 
-## Phase 5 — Integration Sanity
+## Phase 6 — Integration Sanity
 
 - **Duplicated logic** — does new code reinvent something that exists?
 - **Pattern violations** — does it follow codebase conventions?
 - **API contract changes** — if shared interfaces changed, are callers updated?
 
-## Phase 6 — Act on Findings
+## Phase 7 — Act on Findings
 
 ### Trivial fixes (commit directly)
 

@@ -77,4 +77,10 @@ Bug Fix Ready — ${TITLE}
 Base: ${BASE_BRANCH}
 ```
 
+## Compound
+
+Run `/ce:compound` to capture learnings in CLAUDE.md on the fix branch.
+Bug fixes often reveal fragile areas, missing tests, or common failure
+patterns worth documenting.
+
 ${SUPABASE_BLOCK}
