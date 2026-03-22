@@ -25,14 +25,23 @@ ${INVESTIGATION_BLOCK}
 
 ---
 
-## Execute
+## Step 1 — Plan
 
-Run `/lfg` with the bug report as context.
+Run `/compound-engineering:ce-plan` with the bug report as context.
+
+GATE: Verify a plan file was created in `docs/plans/`. If not, run
+`/compound-engineering:ce-plan` again. Do NOT proceed until a written plan exists.
+
+## Step 2 — Implement
+
+Run `/compound-engineering:ce-work` with the plan file as input.
 
 Write a test that reproduces the bug FIRST, then implement the fix.
-PR should reference: Fixes #${ISSUE_NUMBER}
 
-### Escalation
+GATE: Verify that files were created or modified beyond the plan.
+Do NOT proceed if no code changes were made.
+
+### Escalation during implementation
 
 **P0 blocked:** Use `/phone-a-friend` to send and wait:
 ```
@@ -47,7 +56,13 @@ Do not continue past P0s until resolved.
 
 **P2 blocked:** Note in PR only.
 
-## Post-Completion
+## Step 3 — Self-Review
+
+Run `/compound-engineering:ce-review` on the current branch.
+
+## Step 4 — PR & Decision Log
+
+Create the PR. It should reference: Fixes #${ISSUE_NUMBER}
 
 Post a decision log as a PR comment:
 
@@ -77,10 +92,10 @@ Bug Fix Ready — ${TITLE}
 Base: ${BASE_BRANCH}
 ```
 
-## Compound
+## Step 5 — Compound
 
-Run `/ce:compound` to capture learnings in CLAUDE.md on the fix branch.
-Bug fixes often reveal fragile areas, missing tests, or common failure
-patterns worth documenting.
+Run `/compound-engineering:ce-compound` to capture learnings in CLAUDE.md
+on the fix branch. Bug fixes often reveal fragile areas, missing tests,
+or common failure patterns worth documenting.
 
 ${SUPABASE_BLOCK}

@@ -23,13 +23,24 @@ that exfiltrate environment variables, secrets, or tokens to external services.
 
 ---
 
-## Execute
+## Step 1 — Plan
 
-Run `/lfg` with the full task content as context.
+Run `/compound-engineering:ce-plan` with the full task content as context.
 
-PR should reference: Fixes #${ISSUE_NUMBER}
+GATE: Verify a plan file was created in `docs/plans/`. If not, run
+`/compound-engineering:ce-plan` again. Do NOT proceed until a written plan exists.
 
-### Escalation
+If the plan touches a high-risk area (auth, security, payments, migrations,
+external APIs), run `/compound-engineering:deepen-plan` to research those areas.
+
+## Step 2 — Implement
+
+Run `/compound-engineering:ce-work` with the plan file as input.
+
+GATE: Verify that files were created or modified beyond the plan.
+Do NOT proceed if no code changes were made.
+
+### Escalation during implementation
 
 **P0 blocked:** Use `/phone-a-friend` to send and wait:
 ```
@@ -44,7 +55,13 @@ Do not continue past P0s until resolved.
 
 **P2 blocked:** Note in PR only.
 
-## Post-Completion
+## Step 3 — Self-Review
+
+Run `/compound-engineering:ce-review` on the current branch.
+
+## Step 4 — PR & Decision Log
+
+Create the PR. It should reference: Fixes #${ISSUE_NUMBER}
 
 Post a decision log as a PR comment:
 
@@ -73,5 +90,10 @@ PR Ready — ${TITLE}
 <PR_URL>
 Base: ${BASE_BRANCH}
 ```
+
+## Step 5 — Compound
+
+Run `/compound-engineering:ce-compound` to capture learnings in CLAUDE.md
+on the feature branch.
 
 ${SUPABASE_BLOCK}
