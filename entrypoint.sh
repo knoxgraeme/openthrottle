@@ -293,12 +293,64 @@ if [[ -d "${REPO}/skills" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 8. Fix ownership (skip sealed files — chattr prevents chown on them)
+# 8. Install Claude Code plugins (compound-engineering, pr-review-toolkit)
+#    Baked into the Docker image at build time. Rebuild image to update.
+# ---------------------------------------------------------------------------
+if [[ "$AGENT" == "claude" ]] && [[ -d "/opt/openthrottle/plugins" ]]; then
+  PLUGINS_DIR="${SANDBOX_HOME}/.claude/plugins"
+  CACHE_DIR="${PLUGINS_DIR}/cache"
+  mkdir -p "$CACHE_DIR"
+
+  # Read version from each plugin's plugin.json
+  CE_VERSION=$(jq -r '.version' /opt/openthrottle/plugins/compound-engineering/.claude-plugin/plugin.json 2>/dev/null || echo "0.0.0")
+  PRT_VERSION=$(jq -r '.version' /opt/openthrottle/plugins/pr-review-toolkit/.claude-plugin/plugin.json 2>/dev/null || echo "0.0.0")
+
+  # Copy plugins into Claude Code's cache directory structure
+  CE_PATH="${CACHE_DIR}/every-marketplace/compound-engineering/${CE_VERSION}"
+  PRT_PATH="${CACHE_DIR}/claude-code-plugins/pr-review-toolkit/${PRT_VERSION}"
+
+  mkdir -p "$CE_PATH" "$PRT_PATH"
+  cp -r /opt/openthrottle/plugins/compound-engineering/* "$CE_PATH/"
+  cp -r /opt/openthrottle/plugins/pr-review-toolkit/* "$PRT_PATH/"
+
+  # Write installed_plugins.json so Claude Code discovers them
+  NOW=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
+  jq -n \
+    --arg ce_path "$CE_PATH" \
+    --arg ce_ver "$CE_VERSION" \
+    --arg prt_path "$PRT_PATH" \
+    --arg prt_ver "$PRT_VERSION" \
+    --arg now "$NOW" \
+    '{
+      "version": 2,
+      "plugins": {
+        "compound-engineering@every-marketplace": [{
+          "scope": "user",
+          "installPath": $ce_path,
+          "version": $ce_ver,
+          "installedAt": $now,
+          "lastUpdated": $now
+        }],
+        "pr-review-toolkit@claude-code-plugins": [{
+          "scope": "user",
+          "installPath": $prt_path,
+          "version": $prt_ver,
+          "installedAt": $now,
+          "lastUpdated": $now
+        }]
+      }
+    }' > "${PLUGINS_DIR}/installed_plugins.json"
+
+  log "Installed plugins: compound-engineering@${CE_VERSION}, pr-review-toolkit@${PRT_VERSION}"
+fi
+
+# ---------------------------------------------------------------------------
+# 9. Fix ownership (skip sealed files — chattr prevents chown on them)
 # ---------------------------------------------------------------------------
 chown -R daytona:daytona "$SANDBOX_HOME" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# 9. Start heartbeat (resets autoStopInterval every 5 min)
+# 10. Start heartbeat (resets autoStopInterval every 5 min)
 #
 # Daytona auto-stop only resets on Toolbox SDK API calls, NOT on internal
 # process activity. The Toolbox agent runs inside the sandbox on port 63650.
@@ -324,7 +376,7 @@ chown -R daytona:daytona "$SANDBOX_HOME" 2>/dev/null || true
 HEARTBEAT_PID=$!
 
 # ---------------------------------------------------------------------------
-# 10. Drop to daytona user and run the appropriate runner
+# 11. Drop to daytona user and run the appropriate runner
 # ---------------------------------------------------------------------------
 log "Task: ${TASK_TYPE} #${WORK_ITEM} (agent: ${AGENT})"
 
