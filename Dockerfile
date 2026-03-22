@@ -20,6 +20,7 @@ COPY entrypoint.sh run-builder.sh run-reviewer.sh task-adapter.sh agent-lib.sh /
 COPY hooks/ /opt/openthrottle/hooks/
 COPY git-hooks/ /opt/openthrottle/git-hooks/
 COPY skills/ /opt/openthrottle/skills/
+COPY prompts/ /opt/openthrottle/prompts/
 
 RUN chmod +x /opt/openthrottle/*.sh /opt/openthrottle/hooks/*.sh /opt/openthrottle/git-hooks/*
 
