@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY entrypoint.sh run-builder.sh run-reviewer.sh task-adapter.sh agent-lib.sh /opt/openthrottle/
 COPY hooks/ /opt/openthrottle/hooks/
 COPY git-hooks/ /opt/openthrottle/git-hooks/
+COPY skills/ /opt/openthrottle/skills/
 
 RUN chmod +x /opt/openthrottle/*.sh /opt/openthrottle/hooks/*.sh /opt/openthrottle/git-hooks/*
 

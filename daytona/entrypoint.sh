@@ -233,17 +233,33 @@ elif [[ "$AGENT" == "aider" ]] && [[ -f "${SANDBOX_HOME}/.aider.conf.yml" ]]; th
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Install skills from repo into Claude's skill directory
+# 6. Install skills into Claude's skill directory
+#    Baked-in skills from the image are installed first, then any repo-level
+#    skills override them (allows user customization).
 # ---------------------------------------------------------------------------
-if [[ -d "${REPO}/skills" ]]; then
-  SKILLS_TARGET="${SANDBOX_HOME}/.claude/skills"
-  mkdir -p "$SKILLS_TARGET"
-  for SKILL_DIR in "${REPO}/skills"/*/; do
+SKILLS_TARGET="${SANDBOX_HOME}/.claude/skills"
+mkdir -p "$SKILLS_TARGET"
+
+# Install baked-in skills from the Docker image
+if [[ -d "/opt/openthrottle/skills" ]]; then
+  for SKILL_DIR in /opt/openthrottle/skills/*/; do
     SKILL_NAME=$(basename "$SKILL_DIR")
     if [[ -f "${SKILL_DIR}/SKILL.md" ]]; then
       mkdir -p "${SKILLS_TARGET}/${SKILL_NAME}"
       cp "${SKILL_DIR}/SKILL.md" "${SKILLS_TARGET}/${SKILL_NAME}/SKILL.md"
       log "Installed skill: ${SKILL_NAME}"
+    fi
+  done
+fi
+
+# Override with repo-level skills if present (user customization)
+if [[ -d "${REPO}/skills" ]]; then
+  for SKILL_DIR in "${REPO}/skills"/*/; do
+    SKILL_NAME=$(basename "$SKILL_DIR")
+    if [[ -f "${SKILL_DIR}/SKILL.md" ]]; then
+      mkdir -p "${SKILLS_TARGET}/${SKILL_NAME}"
+      cp "${SKILL_DIR}/SKILL.md" "${SKILLS_TARGET}/${SKILL_NAME}/SKILL.md"
+      log "Installed skill (repo override): ${SKILL_NAME}"
     fi
   done
 fi
