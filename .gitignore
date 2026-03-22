@@ -1,1 +1,19 @@
-*.DS_Store
+# OS
+.DS_Store
+
+# Internal docs and todos (not shipped)
+docs/
+todos/
+
+# Local Claude Code settings
+.claude/settings.local.json
+
+# Secrets and keys
+.env
+.env.*
+*.pem
+*.key
+*.p12
+
+# Dependencies
+node_modules/
