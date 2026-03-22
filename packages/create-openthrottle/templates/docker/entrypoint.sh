@@ -233,6 +233,22 @@ elif [[ "$AGENT" == "aider" ]] && [[ -f "${SANDBOX_HOME}/.aider.conf.yml" ]]; th
 fi
 
 # ---------------------------------------------------------------------------
+# 6. Install skills from repo into Claude's skill directory
+# ---------------------------------------------------------------------------
+if [[ -d "${REPO}/skills" ]]; then
+  SKILLS_TARGET="${SANDBOX_HOME}/.claude/skills"
+  mkdir -p "$SKILLS_TARGET"
+  for SKILL_DIR in "${REPO}/skills"/*/; do
+    SKILL_NAME=$(basename "$SKILL_DIR")
+    if [[ -f "${SKILL_DIR}/SKILL.md" ]]; then
+      mkdir -p "${SKILLS_TARGET}/${SKILL_NAME}"
+      cp "${SKILL_DIR}/SKILL.md" "${SKILLS_TARGET}/${SKILL_NAME}/SKILL.md"
+      log "Installed skill: ${SKILL_NAME}"
+    fi
+  done
+fi
+
+# ---------------------------------------------------------------------------
 # 7. Fix ownership (skip sealed files — chattr prevents chown on them)
 # ---------------------------------------------------------------------------
 chown -R daytona:daytona "$SANDBOX_HOME" 2>/dev/null || true

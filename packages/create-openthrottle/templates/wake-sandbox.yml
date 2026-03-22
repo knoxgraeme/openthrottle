@@ -108,6 +108,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
         run: |
           # Create ephemeral sandbox (capture both stdout and stderr for error reporting)
@@ -124,6 +125,7 @@ jobs:
             --env GITHUB_REPO=${{ github.repository }} \
             --env ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY} \
             --env CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN} \
+            --env OPENAI_API_KEY=${OPENAI_API_KEY} \
             --env SUPABASE_ACCESS_TOKEN=${SUPABASE_ACCESS_TOKEN} \
             --env TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }} \
             --env TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }} \
@@ -135,6 +137,7 @@ jobs:
               SAFE_OUTPUT=$(echo "$OUTPUT" | sed \
                 -e "s/${ANTHROPIC_API_KEY:-___}/[REDACTED]/g" \
                 -e "s/${CLAUDE_CODE_OAUTH_TOKEN:-___}/[REDACTED]/g" \
+                -e "s/${OPENAI_API_KEY:-___}/[REDACTED]/g" \
                 -e "s/${SUPABASE_ACCESS_TOKEN:-___}/[REDACTED]/g" \
                 -e "s/${GH_TOKEN:-___}/[REDACTED]/g")
               echo "::error::Sandbox creation failed: $SAFE_OUTPUT"
