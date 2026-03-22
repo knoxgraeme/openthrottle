@@ -77,12 +77,11 @@ jobs:
           fi
           echo "task_type=$TASK_TYPE" >> "$GITHUB_OUTPUT"
 
-          # Extract session ID for review fixes (portable — no grep -oP)
+          # Extract session ID for review fixes
           RESUME_SESSION=""
           if [[ "$TASK_TYPE" == "review-fix" ]]; then
             RESUME_SESSION=$(gh pr view "$EVENT_PR_NUM" --json comments \
-              --jq '.comments[] | select(.body | contains("session-id:")) | .body' \
-              | sed -n 's/.*session-id: \([^ ]*\).*/\1/p' | tail -1) || true
+              --jq '[.comments[].body | capture("session-id: (?<id>[^ ]+)") | .id] | last // empty') || true
           fi
           echo "resume_session=$RESUME_SESSION" >> "$GITHUB_OUTPUT"
 
