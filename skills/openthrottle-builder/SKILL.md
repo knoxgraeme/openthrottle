@@ -1,15 +1,15 @@
 ---
 name: openthrottle-builder
 description: >
-  Doer Sprite skill — writes code. Picks up review fixes, bug fixes, and new
+  Builder sandbox skill — writes code. Picks up review fixes, bug fixes, and new
   feature PRDs from GitHub. Works with both Claude Code and Codex.
-  This file is uploaded to the Sprite and should not be invoked locally.
+  This file is uploaded to the sandbox and should not be invoked locally.
 user-invocable: false
 ---
 
-# Open Throttle — Doer Sprite (Builder)
+# Open Throttle — Daytona Sandbox (Builder)
 
-You are running inside a persistent Sprite sandbox as an autonomous builder agent.
+You are running inside an ephemeral Daytona sandbox as an autonomous builder agent.
 Your job is to write code: fix bugs, implement features, and address review feedback.
 
 You have full permissions (auto-approved mode is enabled).
@@ -18,17 +18,15 @@ You have full permissions (auto-approved mode is enabled).
 
 ## How It Works
 
-The doer sprite runs `run-builder.sh` which polls GitHub in a loop:
+A GitHub Action creates an ephemeral Daytona sandbox for each task.
+The sandbox runs `run-builder.sh` which dispatches your task:
 
-1. **Priority 1 — Review fixes:** PRs where the thinker requested changes.
-   Check out the branch, read the review, apply fixes, push.
-2. **Priority 2 — Bug fixes:** Issues labeled `bug-queued`.
-   Read the issue (and any investigation report from the thinker), create a branch, fix, test, PR.
-3. **Priority 3 — New features:** Issues labeled `prd-queued`.
-   Claim the issue, run the full prompt-to-PR workflow.
+- **Review fixes:** PRs where the reviewer requested changes.
+- **Bug fixes:** Issues labeled `bug-queued`.
+- **New features:** Issues labeled `prd-queued`.
 
-All state lives on GitHub (issue labels, PR review states). The sprite is
-stateless — checkpoint restore loses nothing. Sleeps when idle (scale to zero).
+All state lives on GitHub (issue labels, PR review states). The sandbox
+is ephemeral — created per task, destroyed after.
 
 ---
 
@@ -68,9 +66,9 @@ PR review:approved          → done, human merges
 
 | Path | Purpose |
 |---|---|
-| `/home/sprite/repo` | Git repository — your working directory |
-| `/home/sprite/prd-inbox/` | Prompt files written here from issue body |
-| `/home/sprite/logs/` | Session logs |
+| `/home/daytona/repo` | Git repository — your working directory |
+| `/home/daytona/prd-inbox/` | Prompt files written here from issue body |
+| `/home/daytona/logs/` | Session logs |
 
 ## Key Variables
 
@@ -90,7 +88,7 @@ Always use `${BASE_BRANCH}` — never hardcode `main`.
 
 ## Project Config
 
-Read `/home/sprite/repo/.openthrottle.yml` at the start of every run.
+Read `/home/daytona/repo/.openthrottle.yml` at the start of every run.
 It contains the project-specific commands for test, dev, format, lint, build.
 If the file doesn't exist, use these defaults:
 
@@ -182,7 +180,7 @@ instead of parsing them from the prompt string.
 Then:
 
 1. Read the prompt at the path from `prompt_file` in the context JSON
-2. Read the project config: `cat /home/sprite/repo/.openthrottle.yml`
+2. Read the project config: `cat /home/daytona/repo/.openthrottle.yml`
    Use its `test`, `lint`, `format`, and `build` values for all project commands
    throughout your session — never hardcode or guess alternatives.
 3. If Supabase MCP is available: list branches, delete any `openthrottle-*` orphans
@@ -202,7 +200,7 @@ If you CAN make a reasonable assumption — make it and proceed.
 
 Create the feature branch (the runner script specifies the branch prefix):
 ```bash
-cd /home/sprite/repo
+cd /home/daytona/repo
 git checkout -b feat/${PRD_ID}
 ```
 
@@ -244,8 +242,7 @@ P1 Blocked — {task}: {reason}. Continuing.
 
 ### Git rollback for failed tasks
 
-Use git for all rollbacks. Never use `sprite checkpoint restore` — it kills
-the running session.
+Use git for all rollbacks:
 
 ```bash
 git stash        # save WIP
@@ -292,7 +289,7 @@ Write a structured completion artifact so the runner script knows exactly
 what happened. This replaces the old heuristic of guessing from branch names:
 
 ```bash
-cat > /home/sprite/completions/${PRD_ID}.json <<EOF
+cat > /home/daytona/completions/${PRD_ID}.json <<EOF
 {
   "status": "success",
   "pr_url": "${PR_URL}",
@@ -334,33 +331,21 @@ delete_branch: openthrottle-${PRD_ID}
 
 ## Step 6 — Compound (`/ce:compound`)
 
-Run `/ce:compound`. This updates `/home/sprite/repo/CLAUDE.md` on the
+Run `/ce:compound`. This updates `/home/daytona/repo/CLAUDE.md` on the
 feature branch — learnings merge into the repo when the PR lands.
-The Sprite itself accumulates nothing; all knowledge lives in GitHub.
-
----
-
-## Environment Reset
-
-If the environment is broken and basic fixes don't work, you can request a
-clean reset. Read [references/env-reset.md](references/env-reset.md) for the
-full signal file format and procedure.
-
-**Quick summary:** push your work, write `/home/sprite/env-reset-request.json`,
-then exit. The runner script handles the rest (pauses the issue, creates a
-continuation, repairs the env, and resumes on the next poll).
+The sandbox itself accumulates nothing; all knowledge lives in GitHub.
 
 ---
 
 ## Rules
 
-- **Fixes and bugs before PRDs** — the thinker sprite may be blocked waiting
+- **Fixes and bugs before PRDs** — the reviewer sandbox may be blocked waiting
   for a fix before it can review the next PR. Unblocking the pipeline comes first.
 - **Use the thinker's investigation report** — if one exists on a bug issue,
   it already traced the root cause. Re-investigating wastes a full session.
 - **Prefer doing over asking** — the user shipped a prompt because they want
   results, not questions. Only message if truly blocked on a P0.
-- **Never force-push** — the reviewer sprite may have already analyzed the branch,
+- **Never force-push** — the reviewer sandbox may have already analyzed the branch,
   and force-pushing invalidates that review. Never push directly to `${BASE_BRANCH}`
   either — all work goes through PRs.
 - **Always use `${BASE_BRANCH}`** — the project config determines the base branch.
@@ -378,7 +363,5 @@ continuation, repairs the env, and resumes on the next poll).
   may use these for changelogs or release automation.
 - **Use `/phone-a-friend` for Telegram** — the skill handles MCP tool invocation
   correctly. Inline curl commands bypass the MCP and may fail silently.
-- **Never run `sprite checkpoint restore`** — it terminates your running session
-  immediately. Use `git reset`, `git stash`, or `git checkout` for code rollback.
-- **Use the env reset signal when broken** — retrying broken commands wastes
-  the session timeout. Signal for a clean reset and let the runner handle it.
+- **Use git for rollbacks** — `git reset`, `git stash`, or `git checkout`.
+  The sandbox is ephemeral — there's no checkpoint restore.

@@ -1,28 +1,18 @@
 ---
 name: openthrottle-ship
 description: >
-  Ship prompts to the remote Sprite, check status, view logs, or kill
-  a running session. Use when: "ship this prompt", "push to sprite", "queue prompt",
-  "check sprite status", "show logs", "kill the session", "what's running",
-  or any interaction with Open Throttle. Run /openthrottle-setup first
+  Ship prompts to Daytona sandboxes, check status, or view recent activity.
+  Use when: "ship this prompt", "queue prompt", "check status", "what's running",
+  or any interaction with Open Throttle. Run `npx create-openthrottle` first
   if the pipeline hasn't been set up yet.
 disable-model-invocation: true
-argument-hint: [prompt-file.md | status | logs | kill | push-env] [--base branch]
+argument-hint: [prompt-file.md | status] [--base branch]
 ---
 
 # Ship Prompt
 
-Interact with Open Throttle running on your Sprite.
-
-All ship and status operations use the `gh` CLI directly — no sprite exec needed.
-This means shipping works from any environment with `gh` installed (Claude Code,
-Claude Desktop, terminal, CI, etc.).
-
-Note: The runner scripts (run-builder.sh, run-reviewer.sh) use `task-adapter.sh`
-to abstract task management operations. This skill runs on the user's machine
-and uses `gh` directly since it only targets GitHub.
-
-Logs, kill, and push-env still require sprite exec (scripts in `scripts/` subdir).
+Ship prompts and check status via the `gh` CLI. Works from any environment
+with `gh` installed (Claude Code, Claude Desktop, terminal, CI, etc.).
 
 ---
 
@@ -62,7 +52,7 @@ TITLE="${TITLE:-$(basename "$PRD_FILE" .md)}"
 
 2. **Ensure labels exist** (idempotent):
 ```bash
-for LABEL in prd-queued prd-running prd-complete prd-failed prd-paused needs-review reviewing bug-queued bug-running bug-complete bug-failed bug-paused; do
+for LABEL in prd-queued prd-running prd-complete prd-failed needs-review reviewing bug-queued bug-running bug-complete bug-failed; do
   gh label create "$LABEL" --repo "$GITHUB_REPO" --force 2>/dev/null || true
 done
 ```
@@ -101,7 +91,7 @@ For multiple prompts, loop over the files and create one issue per file.
 
 ### Check Status
 
-Query GitHub directly — no sprite exec needed:
+Query GitHub directly:
 
 ```bash
 echo "RUNNING"
@@ -115,10 +105,6 @@ gh pr list --repo "$GITHUB_REPO" --label "needs-review" --json number,title --jq
 gh pr list --repo "$GITHUB_REPO" --label "reviewing" --json number,title --jq '.[] | "  active:  #\(.number) — \(.title)"'
 gh pr list --repo "$GITHUB_REPO" --search "review:changes_requested" --json number,title --jq '.[] | "  fixes:   #\(.number) — \(.title)"'
 
-echo "PAUSED (env reset)"
-gh issue list --repo "$GITHUB_REPO" --label "prd-paused" --state open --json number,title --jq '.[] | "  #\(.number) — \(.title)"'
-gh issue list --repo "$GITHUB_REPO" --label "bug-paused" --state open --json number,title --jq '.[] | "  #\(.number) — \(.title)"'
-
 echo "COMPLETED (recent)"
 gh issue list --repo "$GITHUB_REPO" --label "prd-complete" --state closed --sort updated --limit 5 --json number,title --jq '.[] | "  #\(.number) — \(.title)"'
 ```
@@ -127,44 +113,12 @@ gh issue list --repo "$GITHUB_REPO" --label "prd-complete" --state closed --sort
 
 ### View Logs
 
-Requires sprite exec. Find this skill's `scripts/` directory (sibling to this
-SKILL.md) and run:
+Sandbox logs are available in GitHub Actions:
 
 ```bash
-SCRIPTS_DIR="$(dirname "$(find ~/.claude/plugins -path '*/openthrottle-ship/scripts/logs.sh' -type f | head -1)")"
-bash "$SCRIPTS_DIR/logs.sh" [prd-id]
+gh run list --workflow="Wake Sandbox" --limit 5
+gh run view <run-id> --log
 ```
-
-- No ID → tails the currently running prompt's log
-- With ID → shows that run's complete log
-
----
-
-### Kill Running Session
-
-Requires sprite exec. **Always confirm with the user before killing** — this
-stops the prompt mid-run and any uncommitted work is lost.
-
-```bash
-SCRIPTS_DIR="$(dirname "$(find ~/.claude/plugins -path '*/openthrottle-ship/scripts/kill.sh' -type f | head -1)")"
-bash "$SCRIPTS_DIR/kill.sh"
-```
-
----
-
-### Push Env Update
-
-When the user updates their `.env` (rotated keys, new secrets, etc.):
-
-```bash
-SCRIPTS_DIR="$(dirname "$(find ~/.claude/plugins -path '*/openthrottle-ship/scripts/push-env.sh' -type f | head -1)")"
-bash "$SCRIPTS_DIR/push-env.sh"
-```
-
-Pushes all local `.env` files to the sprite and re-checkpoints as
-`golden-base` so future sessions pick up the changes.
-
-Only needed when secrets change — not for regular prompt shipping.
 
 ---
 
@@ -173,5 +127,5 @@ Only needed when secrets change — not for regular prompt shipping.
 Always tell the user:
 - The issue URL that was created
 - Whether it started immediately or was queued (check queue position)
-- That they'll get a Telegram message when the PR is ready
+- That they'll get a Telegram message when the PR is ready (if configured)
 - How to check: `/openthrottle-ship status`

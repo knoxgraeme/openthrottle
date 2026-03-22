@@ -4,7 +4,7 @@ user-invocable: true
 description: >
   Send a message to the user via Telegram and optionally wait for a reply.
   Use when you're blocked, need a decision, have a question, or want to
-  notify the user of something important. Designed for headless Sprite
+  notify the user of something important. Designed for headless sandbox
   sessions. Use for: "ask the user", "notify", "I'm stuck",
   "need a decision", "phone a friend", or any situation where you need
   human input.

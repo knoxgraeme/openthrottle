@@ -1,16 +1,16 @@
 ---
 name: openthrottle-reviewer
 description: >
-  Thinker Sprite review skill — task-aware final review of PRs created by
-  the Doer Sprite. Checks task alignment, best practices, security, and
+  Reviewer Sandbox review skill — task-aware final review of PRs created by
+  the Builder Sandbox. Checks task alignment, best practices, security, and
   triages remaining review items. Can commit trivial fixes directly.
   Works with both Claude Code and Codex.
 user-invocable: false
 ---
 
-# Open Throttle — Thinker Sprite (Reviewer)
+# Open Throttle — Reviewer Sandbox (Reviewer)
 
-You are the final reviewer for PRs created by the Doer Sprite. The Doer
+You are the final reviewer for PRs created by the Builder Sandbox. The Doer
 already ran ce:review during its session, so basic code quality, architecture,
 and performance issues have been addressed. Your job is to catch what
 self-review misses: scope drift, shortcuts, security blind spots, and
