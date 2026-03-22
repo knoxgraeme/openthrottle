@@ -8,8 +8,8 @@
 // wake-sandbox.yml, creates a Daytona snapshot from GHCR, and prints next steps.
 // =============================================================================
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, readdirSync, statSync } from 'node:fs';
+import { join, dirname, relative } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import prompts from 'prompts';
@@ -68,6 +68,50 @@ function detectProject() {
     format: scripts.format ? `${pm} run format` : (pkg.devDependencies?.prettier ? 'npx prettier --write .' : ''),
     dev: scripts.dev ? `${pm} dev --port 8080 --hostname 0.0.0.0` : '',
   };
+}
+
+// ---------------------------------------------------------------------------
+// 1b. Detect .env files and extract key names
+// ---------------------------------------------------------------------------
+
+function detectEnvFiles() {
+  const envFiles = {};
+  const seen = new Set();
+
+  function scan(dir) {
+    let entries;
+    try { entries = readdirSync(dir); } catch { return; }
+    for (const entry of entries) {
+      if (entry === 'node_modules' || entry === '.git' || entry === '.next' || entry === 'dist') continue;
+      const full = join(dir, entry);
+      let stat;
+      try { stat = statSync(full); } catch { continue; }
+      if (stat.isDirectory()) { scan(full); continue; }
+      if (!entry.startsWith('.env')) continue;
+      // Skip .env.example, .env.sample, .env.template
+      if (/\.(example|sample|template)$/i.test(entry)) continue;
+
+      const relPath = relative(cwd, full);
+      const keys = [];
+      try {
+        const content = readFileSync(full, 'utf8');
+        for (const line of content.split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed.startsWith('#')) continue;
+          const match = trimmed.replace(/^export\s+/, '').match(/^([a-zA-Z_][a-zA-Z0-9_]*)=/);
+          if (match) keys.push(match[1]);
+        }
+      } catch { continue; }
+
+      if (keys.length > 0) {
+        envFiles[relPath] = keys;
+        keys.forEach(k => seen.add(k));
+      }
+    }
+  }
+
+  scan(cwd);
+  return { envFiles, allKeys: [...seen].sort() };
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +174,9 @@ function generateConfig(config) {
     snapshot: config.snapshotName || 'openthrottle',
     post_bootstrap: [config.postBootstrap],
     mcp_servers: {},
+    env_files: config.envFiles && Object.keys(config.envFiles).length > 0
+      ? config.envFiles
+      : undefined,
     review: {
       enabled: config.reviewEnabled,
       max_rounds: config.maxRounds ?? 3,
@@ -155,12 +202,41 @@ function generateConfig(config) {
 // 4. Copy wake-sandbox.yml
 // ---------------------------------------------------------------------------
 
-function copyWorkflow() {
+function copyWorkflow(config) {
   const src = join(__dirname, 'templates', 'wake-sandbox.yml');
   const destDir = join(cwd, '.github', 'workflows');
   const dest = join(destDir, 'wake-sandbox.yml');
   mkdirSync(destDir, { recursive: true });
-  copyFileSync(src, dest);
+
+  let content = readFileSync(src, 'utf8');
+
+  // Inject project-specific secrets into the workflow
+  const allKeys = config.envAllKeys || [];
+  if (allKeys.length > 0) {
+    // Add env: entries for secrets
+    const envSecrets = allKeys
+      .map(k => `          ${k}: \${{ secrets.${k} }}`)
+      .join('\n');
+    content = content.replace(
+      /          # @@ENV_SECRETS@@ — scaffolder inserts project-specific secrets here/,
+      envSecrets
+    );
+
+    // Add --env flags for daytona create
+    const envFlags = allKeys
+      .map(k => `            --env ${k}=\${${k}} \\`)
+      .join('\n');
+    content = content.replace(
+      /            # @@ENV_FLAGS@@ — scaffolder inserts --env flags for project secrets here/,
+      envFlags
+    );
+  } else {
+    // No project secrets — remove the placeholder comments
+    content = content.replace(/          # @@ENV_SECRETS@@ — scaffolder inserts project-specific secrets here\n/, '');
+    content = content.replace(/            # @@ENV_FLAGS@@ — scaffolder inserts --env flags for project secrets here\n/, '');
+  }
+
+  writeFileSync(dest, content);
   return dest;
 }
 
@@ -217,13 +293,20 @@ function printNextSteps(config) {
     agentSecret,
   ];
 
+  // Project-specific secrets from env_files
+  const projectKeys = config.envAllKeys || [];
+  const projectSecrets = projectKeys.length > 0
+    ? '\n\n     Project secrets (from .env files):\n' +
+      projectKeys.map(k => `     ${k}`).join('\n')
+    : '';
+
   console.log(`
   Next steps:
 
   1. Set GitHub repo secrets:
 ${secrets.join('\n')}
      TELEGRAM_BOT_TOKEN            ← optional (notifications)
-     TELEGRAM_CHAT_ID              ← optional (notifications)
+     TELEGRAM_CHAT_ID              ← optional (notifications)${projectSecrets}
 
   2. Commit and push:
      git add .openthrottle.yml .github/workflows/wake-sandbox.yml
@@ -246,9 +329,20 @@ async function main() {
 
   // Step 1: Detect
   const detected = detectProject();
+  const { envFiles, allKeys: envAllKeys } = detectEnvFiles();
+
+  if (Object.keys(envFiles).length > 0) {
+    console.log(`  Found ${Object.keys(envFiles).length} .env file(s):`);
+    for (const [path, keys] of Object.entries(envFiles)) {
+      console.log(`    ${path} (${keys.length} keys)`);
+    }
+    console.log('');
+  }
 
   // Step 2: Prompt
   const config = await promptConfig(detected);
+  config.envFiles = envFiles;
+  config.envAllKeys = envAllKeys;
 
   // Step 3: Generate config
   const configPath = join(cwd, '.openthrottle.yml');
@@ -272,9 +366,9 @@ async function main() {
       message: 'wake-sandbox.yml already exists. Overwrite?', initial: false,
     }, { onCancel: () => { console.log('\nCancelled.'); process.exit(0); } });
     if (!overwrite) { console.log('  Skipped wake-sandbox.yml'); }
-    else { copyWorkflow(); console.log('  ✓ Copied .github/workflows/wake-sandbox.yml'); }
+    else { copyWorkflow(config); console.log('  ✓ Copied .github/workflows/wake-sandbox.yml'); }
   } else {
-    copyWorkflow();
+    copyWorkflow(config);
     console.log('  ✓ Copied .github/workflows/wake-sandbox.yml');
   }
 

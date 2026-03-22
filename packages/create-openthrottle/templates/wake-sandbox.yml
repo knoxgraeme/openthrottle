@@ -87,6 +87,7 @@ jobs:
           echo "resume_session=$RESUME_SESSION" >> "$GITHUB_OUTPUT"
 
       - name: Validate config
+        id: config
         run: |
           SNAPSHOT=$(yq '.snapshot // ""' .openthrottle.yml)
           if [[ -z "$SNAPSHOT" || "$SNAPSHOT" == "null" ]]; then
@@ -94,7 +95,6 @@ jobs:
             exit 1
           fi
           echo "snapshot=$SNAPSHOT" >> "$GITHUB_OUTPUT"
-        id: config
 
       - name: Activate snapshot (reactivates if idle >2 weeks)
         env:
@@ -110,8 +110,9 @@ jobs:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          # @@ENV_SECRETS@@ — scaffolder inserts project-specific secrets here
         run: |
-          # Create ephemeral sandbox (capture both stdout and stderr for error reporting)
+          # Create ephemeral sandbox
           OUTPUT=$(daytona create \
             --snapshot "${{ steps.config.outputs.snapshot }}" \
             --auto-delete 0 \
@@ -132,6 +133,7 @@ jobs:
             --env WORK_ITEM="${{ steps.work.outputs.item }}" \
             --env TASK_TYPE="${{ steps.work.outputs.task_type }}" \
             --env RESUME_SESSION="${{ steps.work.outputs.resume_session }}" \
+            # @@ENV_FLAGS@@ — scaffolder inserts --env flags for project secrets here
             2>&1) || {
               # Redact secrets from error output
               SAFE_OUTPUT=$(echo "$OUTPUT" | sed \

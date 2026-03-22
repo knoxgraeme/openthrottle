@@ -60,7 +60,32 @@ LINT_CMD=$(read_config '.lint' '')
 AGENT=$(read_config '.agent' 'claude')
 
 # ---------------------------------------------------------------------------
-# 3. Run post_bootstrap commands (as daytona user, not root)
+# 3. Write .env files from env_files config
+#    Maps sandbox env vars to .env files at project-specific paths.
+#    Keys are defined in .openthrottle.yml; values come from --env flags
+#    passed by the GitHub Action (sourced from GitHub repo secrets).
+# ---------------------------------------------------------------------------
+ENV_FILES_COUNT=$(yq -r '.env_files // {} | keys | length' "$CONFIG" 2>/dev/null || echo "0")
+if [[ "$ENV_FILES_COUNT" -gt 0 ]]; then
+  log "Writing ${ENV_FILES_COUNT} .env file(s)"
+  yq -r '.env_files // {} | to_entries[] | .key' "$CONFIG" | while IFS= read -r filepath; do
+    target="${REPO}/${filepath}"
+    mkdir -p "$(dirname "$target")"
+    # Write each key=value pair
+    yq -r ".env_files[\"${filepath}\"][]" "$CONFIG" | while IFS= read -r key; do
+      value="${!key:-}"
+      if [[ -n "$value" ]]; then
+        echo "${key}=${value}" >> "$target"
+      else
+        log "  WARNING: ${key} not set in environment — skipping for ${filepath}"
+      fi
+    done
+    log "  Wrote ${filepath}"
+  done
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Run post_bootstrap commands (as daytona user, not root)
 # ---------------------------------------------------------------------------
 POST_BOOTSTRAP=$(yq -r '.post_bootstrap // [] | .[]' "$CONFIG") || {
   log "FATAL: Failed to parse post_bootstrap from .openthrottle.yml — check YAML syntax"
@@ -78,17 +103,17 @@ if [[ -n "$POST_BOOTSTRAP" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Configure agent settings (per-agent)
+# 5. Configure agent settings (per-agent)
 # ---------------------------------------------------------------------------
 log "Configuring agent settings (${AGENT})"
 
-# 4a. Install universal git hooks and seal git config (works for ALL agent runtimes)
+# 5a. Install universal git hooks and seal git config (works for ALL agent runtimes)
 git -C "$REPO" config core.hooksPath /opt/openthrottle/git-hooks
 log "Installed git hooks (pre-push)"
 # Seal .git/config to prevent agents from changing core.hooksPath
 seal_file "${REPO}/.git/config" 2>/dev/null || true
 
-# 4b. Per-agent configuration
+# 5b. Per-agent configuration
 case "$AGENT" in
   claude)
     SETTINGS_DIR="${SANDBOX_HOME}/.claude"
@@ -214,7 +239,7 @@ AIDEREOF
 esac
 
 # ---------------------------------------------------------------------------
-# 5. Seal settings (immutable — only root can undo)
+# 6. Seal settings (immutable — only root can undo)
 # ---------------------------------------------------------------------------
 
 # Seal agent-specific settings
@@ -233,7 +258,7 @@ elif [[ "$AGENT" == "aider" ]] && [[ -f "${SANDBOX_HOME}/.aider.conf.yml" ]]; th
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Install skills into Claude's skill directory
+# 7. Install skills into Claude's skill directory
 #    Baked-in skills from the image are installed first, then any repo-level
 #    skills override them (allows user customization).
 # ---------------------------------------------------------------------------
@@ -265,12 +290,12 @@ if [[ -d "${REPO}/skills" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Fix ownership (skip sealed files — chattr prevents chown on them)
+# 8. Fix ownership (skip sealed files — chattr prevents chown on them)
 # ---------------------------------------------------------------------------
 chown -R daytona:daytona "$SANDBOX_HOME" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# 8. Start heartbeat (resets autoStopInterval every 5 min)
+# 9. Start heartbeat (resets autoStopInterval every 5 min)
 #
 # Daytona auto-stop only resets on Toolbox SDK API calls, NOT on internal
 # process activity. The Toolbox agent runs inside the sandbox on port 63650.
@@ -296,7 +321,7 @@ chown -R daytona:daytona "$SANDBOX_HOME" 2>/dev/null || true
 HEARTBEAT_PID=$!
 
 # ---------------------------------------------------------------------------
-# 9. Drop to daytona user and run the appropriate runner
+# 10. Drop to daytona user and run the appropriate runner
 # ---------------------------------------------------------------------------
 log "Task: ${TASK_TYPE} #${WORK_ITEM} (agent: ${AGENT})"
 
