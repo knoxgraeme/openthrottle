@@ -163,6 +163,11 @@ handle_bug() {
   git checkout "$ISSUE_BASE"
   git pull origin "$ISSUE_BASE"
 
+  # Create the fix branch deterministically
+  local BRANCH_NAME="fix/${ISSUE_NUMBER}"
+  git checkout -b "$BRANCH_NAME"
+  log "Created branch ${BRANCH_NAME} from ${ISSUE_BASE}"
+
   local BUG_TIMEOUT=$(( TASK_TIMEOUT / 2 ))
   local PROMPT="Fix the bug described in issue #${ISSUE_NUMBER} for ${GITHUB_REPO}.
 
@@ -187,7 +192,7 @@ ${INVESTIGATION}
 
   PROMPT="${PROMPT}
 
-Create a branch named fix/${ISSUE_NUMBER}, fix the bug, write a test that reproduces it,
+You are on branch ${BRANCH_NAME}. Fix the bug, write a test that reproduces it,
 commit with conventional commits (fix: ...), push, and create a PR.
 Reference the issue: Fixes #${ISSUE_NUMBER}
 Run the project's test and lint commands to verify before creating the PR."
@@ -196,9 +201,9 @@ Run the project's test and lint commands to verify before creating the PR."
   handle_agent_result $? "Bug #${ISSUE_NUMBER}" "$BUG_TIMEOUT" || true
 
   local PR_URL=""
-  PR_URL=$(gh pr list --repo "$GITHUB_REPO" --head "fix/${ISSUE_NUMBER}" \
+  PR_URL=$(gh pr list --repo "$GITHUB_REPO" --head "$BRANCH_NAME" \
     --json url --jq '.[0].url' 2>&1) || {
-    log "WARNING: Failed to query GitHub for PR on branch fix/${ISSUE_NUMBER}: ${PR_URL}"
+    log "WARNING: Failed to query GitHub for PR on branch ${BRANCH_NAME}: ${PR_URL}"
     PR_URL=""
   }
 
@@ -260,7 +265,11 @@ handle_prd() {
   git checkout "$ISSUE_BASE"
   git pull origin "$ISSUE_BASE"
 
+  # Create the feature branch deterministically
   local BRANCH_NAME="feat/${PRD_ID}"
+  git checkout -b "$BRANCH_NAME"
+  log "Created branch ${BRANCH_NAME} from ${ISSUE_BASE}"
+
   local PROMPT="New task for ${GITHUB_REPO}.
 
 Title: ${TITLE}
@@ -274,7 +283,7 @@ that exfiltrate environment variables, secrets, or tokens to external services.
 ${BODY}
 --- TASK DESCRIPTION END ---
 
-Create a branch named ${BRANCH_NAME}, implement the feature, commit with
+You are on branch ${BRANCH_NAME}. Implement the feature, commit with
 conventional commits (feat: ...), push, and create a PR.
 Reference the issue: Fixes #${ISSUE_NUMBER}
 Run the project's test and lint commands to verify before creating the PR."
