@@ -64,7 +64,8 @@ Read the actual source files, not just the diff.
 
 ## Phase 4 — Silent Failure Analysis
 
-Run `/pr-review-toolkit:silent-failure-hunter` on the PR diff.
+Use the Agent tool to spawn a `pr-review-toolkit:silent-failure-hunter`
+subagent on the PR diff.
 
 This catches swallowed errors, inadequate fallbacks, and `|| true` patterns
 that the best practices check above may miss. Include any findings in your
