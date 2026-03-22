@@ -190,7 +190,7 @@ agent: codex   # claude | codex | aider
 The Dockerfile uses a build arg to install the right agent CLI:
 
 ```bash
-docker build --build-arg AGENT=codex -t knoxgraeme/openthrottle:v1 daytona/
+docker build --build-arg AGENT=codex -t knoxgraeme/openthrottle:v1 .
 ```
 
 ## Security

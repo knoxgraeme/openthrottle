@@ -1,6 +1,6 @@
 # Build and push the openthrottle Docker image to Docker Hub.
 #
-# Triggers on pushes to main that touch the daytona/ directory,
+# Triggers on pushes to main that touch runtime files,
 # and on manual dispatch. Tags with :v1 (stable) and the commit SHA.
 #
 # Required repository secrets:
@@ -12,7 +12,16 @@ name: Build Image
 on:
   push:
     branches: [main]
-    paths: [daytona/**]
+    paths:
+      - Dockerfile
+      - entrypoint.sh
+      - run-builder.sh
+      - run-reviewer.sh
+      - agent-lib.sh
+      - task-adapter.sh
+      - hooks/**
+      - git-hooks/**
+      - skills/**/SKILL.md
   workflow_dispatch:
 
 permissions:
@@ -47,7 +56,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: daytona
+          context: .
           push: true
           tags: |
             ${{ env.IMAGE }}:v1

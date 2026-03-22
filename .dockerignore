@@ -1,0 +1,11 @@
+# Only include files needed for the Docker image build
+*
+!Dockerfile
+!entrypoint.sh
+!run-builder.sh
+!run-reviewer.sh
+!task-adapter.sh
+!agent-lib.sh
+!hooks/
+!git-hooks/
+!skills/*/SKILL.md
