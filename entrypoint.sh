@@ -58,6 +58,9 @@ BASE_BRANCH=$(read_config '.base_branch' 'main')
 TEST_CMD=$(read_config '.test' '')
 LINT_CMD=$(read_config '.lint' '')
 AGENT=$(read_config '.agent' 'claude')
+MAX_TURNS=$(read_config '.limits.max_turns' '')
+MAX_BUDGET_USD=$(read_config '.limits.max_budget_usd' '')
+TASK_TIMEOUT=$(read_config '.limits.task_timeout' '')
 
 # ---------------------------------------------------------------------------
 # 3. Write .env files from env_files config
@@ -325,7 +328,7 @@ HEARTBEAT_PID=$!
 # ---------------------------------------------------------------------------
 log "Task: ${TASK_TYPE} #${WORK_ITEM} (agent: ${AGENT})"
 
-export SANDBOX_HOME REPO BASE_BRANCH AGENT
+export SANDBOX_HOME REPO BASE_BRANCH AGENT MAX_TURNS MAX_BUDGET_USD TASK_TIMEOUT
 export AGENT_RUNTIME="$AGENT"
 
 case "$TASK_TYPE" in

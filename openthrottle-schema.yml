@@ -36,6 +36,13 @@ mcp_servers: {}
   #   env:
   #     SUPABASE_ACCESS_TOKEN: from-env
 
+# --- Agent limits (optional) ---
+# Safety caps to prevent runaway agents.
+limits:
+  max_turns: 200          # Max agentic turns per invocation (works with all auth methods)
+  max_budget_usd: 5.00    # Max USD spend per invocation (API only — ignored with OAuth)
+  task_timeout: 7200      # Wall-clock timeout in seconds (builder default: 7200, reviewer: 1800)
+
 # --- Review config (optional) ---
 # Controls automated PR review behavior.
 review:

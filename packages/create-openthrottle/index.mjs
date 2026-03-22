@@ -146,6 +146,8 @@ async function promptConfig(detected) {
       ],
       initial: 0,
     },
+    { type: 'number', name: 'maxTurns', message: 'Max turns per agent run', initial: 200, min: 1 },
+    { type: 'number', name: 'maxBudgetUsd', message: 'Max budget per run in USD (API only)', initial: 5, min: 0 },
     { type: 'confirm', name: 'reviewEnabled', message: 'Enable automated PR review?', initial: true },
     {
       type: (prev) => prev ? 'number' : null,
@@ -177,6 +179,10 @@ function generateConfig(config) {
     env_files: config.envFiles && Object.keys(config.envFiles).length > 0
       ? config.envFiles
       : undefined,
+    limits: {
+      max_turns: config.maxTurns ?? 200,
+      max_budget_usd: config.maxBudgetUsd ?? 5,
+    },
     review: {
       enabled: config.reviewEnabled,
       max_rounds: config.maxRounds ?? 3,

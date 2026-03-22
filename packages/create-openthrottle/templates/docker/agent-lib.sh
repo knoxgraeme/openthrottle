@@ -106,11 +106,28 @@ invoke_agent() {
 
   case "$AGENT_RUNTIME" in
     claude)
-      timeout "${AGENT_TIMEOUT}" claude \
+      local -a LIMIT_FLAGS=()
+      [[ -n "${MAX_TURNS:-}" ]] && LIMIT_FLAGS+=(--max-turns "$MAX_TURNS")
+      [[ -n "${MAX_BUDGET_USD:-}" ]] && LIMIT_FLAGS+=(--max-budget-usd "$MAX_BUDGET_USD")
+
+      local RAW_OUTPUT
+      RAW_OUTPUT=$(timeout "${AGENT_TIMEOUT}" claude \
         "${SESSION_FLAGS[@]}" \
+        "${LIMIT_FLAGS[@]}" \
         --dangerously-skip-permissions \
-        -p "$PROMPT" \
-        2>&1 | tee -a "$SESSION_LOG"
+        --output-format json \
+        -p "$PROMPT" 2>&1)
+      local AGENT_EXIT=$?
+
+      # Write raw JSON to session log (structured metadata for post_session_report)
+      echo "$RAW_OUTPUT" >> "$SESSION_LOG"
+
+      # Extract text result for human-readable companion log
+      local RESULT_TEXT
+      RESULT_TEXT=$(echo "$RAW_OUTPUT" | jq -r '.result // empty' 2>/dev/null || echo "$RAW_OUTPUT")
+      echo "$RESULT_TEXT" >> "${SESSION_LOG%.log}.txt"
+
+      return $AGENT_EXIT
       ;;
     codex)
       local -a MODEL_FLAGS=()
@@ -187,8 +204,25 @@ post_session_report() {
   CMD_FAILED=$(grep "\[${TASK_ID}\]" "${LOG_DIR}/bash-commands.log" 2>/dev/null \
     | grep -cv '\[exit:0\]' || echo "0")
 
-  local LOG_TAIL
-  LOG_TAIL=$(tail -50 "$SESSION_LOG" 2>/dev/null || echo "(no log)")
+  # Extract structured metadata from JSON output (Claude runtime)
+  local COST_USD NUM_TURNS INPUT_TOKENS OUTPUT_TOKENS API_DURATION_MS LOG_TAIL
+  if jq -e '.type == "result"' "$SESSION_LOG" > /dev/null 2>&1; then
+    COST_USD=$(jq -r '.total_cost_usd // "n/a"' "$SESSION_LOG")
+    NUM_TURNS=$(jq -r '.num_turns // "n/a"' "$SESSION_LOG")
+    INPUT_TOKENS=$(jq -r '.usage.input_tokens // "n/a"' "$SESSION_LOG")
+    OUTPUT_TOKENS=$(jq -r '.usage.output_tokens // "n/a"' "$SESSION_LOG")
+    API_DURATION_MS=$(jq -r '.duration_api_ms // "n/a"' "$SESSION_LOG")
+    # Use human-readable text for the log tail
+    LOG_TAIL=$(tail -50 "${SESSION_LOG%.log}.txt" 2>/dev/null || echo "(no log)")
+  else
+    # Fallback for codex/aider — plain text log, no structured metadata
+    COST_USD="n/a"
+    NUM_TURNS="n/a"
+    INPUT_TOKENS="n/a"
+    OUTPUT_TOKENS="n/a"
+    API_DURATION_MS="n/a"
+    LOG_TAIL=$(tail -50 "$SESSION_LOG" 2>/dev/null || echo "(no log)")
+  fi
   LOG_TAIL=$(sanitize_secrets "$LOG_TAIL")
 
   # Include session-id for review-fix resume
@@ -206,12 +240,16 @@ ${SESSION_MARKER}
 | Metric | Value |
 |---|---|
 | Duration | ${DURATION}m |
+| API duration | ${API_DURATION_MS}ms |
+| Cost | \$${COST_USD} |
+| Tokens | ${INPUT_TOKENS} in / ${OUTPUT_TOKENS} out |
+| Turns | ${NUM_TURNS} |
 | Commits | ${COMMIT_COUNT} |
 | Files changed | ${FILES_CHANGED} |
 | Bash commands | ${CMD_TOTAL} total, ${CMD_FAILED} failed |
 
 <details>
-<summary>Command log (last 50 lines)</summary>
+<summary>Agent output (last 50 lines)</summary>
 
 \`\`\`
 ${LOG_TAIL}
