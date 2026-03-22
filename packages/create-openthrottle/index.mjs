@@ -284,6 +284,94 @@ function setupDaytona(config) {
 }
 
 // ---------------------------------------------------------------------------
+// 6. Push .env secrets to GitHub repo secrets
+// ---------------------------------------------------------------------------
+
+async function pushSecrets(config) {
+  const envFiles = config.envFiles || {};
+  const paths = Object.keys(envFiles);
+  if (paths.length === 0) return;
+
+  // Check gh is available and authenticated
+  try {
+    execFileSync('gh', ['auth', 'status'], { stdio: 'pipe' });
+  } catch {
+    console.log('\n  gh CLI not authenticated — skipping secret push.');
+    console.log('  Run "gh auth login" then set secrets manually.\n');
+    return;
+  }
+
+  // Detect repo
+  let repo;
+  try {
+    repo = execFileSync('gh', ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'], {
+      encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+  } catch {
+    console.log('\n  Could not detect GitHub repo — skipping secret push.\n');
+    return;
+  }
+
+  // Show what we'd push
+  console.log(`\n  Push .env secrets to GitHub repo secrets? (${repo})`);
+  console.log('  Values are encrypted at rest — not readable after upload.\n');
+  for (const [path, keys] of Object.entries(envFiles)) {
+    console.log(`    ${path} (${keys.length} keys): ${keys.join(', ')}`);
+  }
+  console.log('');
+
+  const { confirm } = await prompts({
+    type: 'confirm', name: 'confirm',
+    message: `Push ${config.envAllKeys.length} secret(s) to ${repo}?`, initial: false,
+  }, { onCancel: () => {} });
+
+  if (!confirm) {
+    console.log('  Skipped secret push.');
+    return;
+  }
+
+  let pushed = 0;
+  let failed = 0;
+  for (const [path, keys] of Object.entries(envFiles)) {
+    const fullPath = join(cwd, path);
+    let content;
+    try {
+      content = readFileSync(fullPath, 'utf8');
+    } catch {
+      console.log(`  ✗ Could not read ${path} — skipping`);
+      failed += keys.length;
+      continue;
+    }
+
+    // Parse key=value pairs
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const cleaned = trimmed.replace(/^export\s+/, '');
+      const eqIdx = cleaned.indexOf('=');
+      if (eqIdx === -1) continue;
+      const key = cleaned.slice(0, eqIdx);
+      let value = cleaned.slice(eqIdx + 1);
+      // Strip surrounding quotes
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
+      if (!keys.includes(key)) continue;
+
+      try {
+        execFileSync('gh', ['secret', 'set', key, '--repo', repo, '--body', value], { stdio: 'pipe' });
+        pushed++;
+      } catch {
+        console.log(`  ✗ Failed to set ${key}`);
+        failed++;
+      }
+    }
+  }
+
+  console.log(`  ✓ Pushed ${pushed} secret(s) to ${repo}${failed > 0 ? ` (${failed} failed)` : ''}`);
+}
+
+// ---------------------------------------------------------------------------
 // 7. Print next steps
 // ---------------------------------------------------------------------------
 
@@ -381,7 +469,10 @@ async function main() {
   // Step 5: Create Daytona snapshot
   setupDaytona(config);
 
-  // Step 6: Next steps
+  // Step 6: Push secrets
+  await pushSecrets(config);
+
+  // Step 7: Next steps
   printNextSteps(config);
 }
 

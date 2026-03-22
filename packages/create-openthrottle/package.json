@@ -1,6 +1,6 @@
 {
   "name": "create-openthrottle",
-  "version": "1.3.4",
+  "version": "1.3.5",
   "description": "Set up openthrottle in any Node.js project — agent-agnostic, config-driven.",
   "type": "module",
   "bin": {
