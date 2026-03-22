@@ -28,26 +28,7 @@ ${RE_REVIEW_BLOCK}
 
 ---
 
-## Phase 1 — Preflight
-
-Verify the PR is still reviewable:
-
-```bash
-PR_STATE=$(gh pr view ${PR_NUMBER} --repo ${GITHUB_REPO} --json state --jq '.state')
-if [[ "$PR_STATE" != "OPEN" ]]; then
-  gh pr edit ${PR_NUMBER} --repo ${GITHUB_REPO} --remove-label reviewing 2>/dev/null || true
-  # Exit — PR was merged or closed
-fi
-```
-
-Then get oriented:
-
-```bash
-gh pr diff ${PR_NUMBER} --repo ${GITHUB_REPO}
-gh pr view ${PR_NUMBER} --repo ${GITHUB_REPO}
-```
-
-## Phase 2 — Task Alignment
+## Phase 1 — Task Alignment
 
 *Did the PR deliver what was asked, without drifting or bloating?*
 
@@ -60,7 +41,7 @@ Compare the original task against what the PR actually does. Look for:
 
 If the task is a bug fix, verify the fix addresses the root cause, not just symptoms.
 
-## Phase 3 — Best Practices
+## Phase 2 — Best Practices
 
 *Did the builder take shortcuts?*
 
@@ -73,7 +54,7 @@ If the task is a bug fix, verify the fix addresses the root cause, not just symp
 
 Read the actual source files, not just the diff.
 
-## Phase 4 — Security Check
+## Phase 3 — Security Check
 
 - Auth/authz gaps on new endpoints
 - Input validation/sanitization
@@ -81,7 +62,7 @@ Read the actual source files, not just the diff.
 - SQL/injection risks from raw string interpolation
 - Exposed error details or stack traces
 
-## Phase 5 — Triage Builder's Review Items
+## Phase 4 — Triage Builder's Review Items
 
 Read the builder's review notes. For each deferred item assess:
 
@@ -89,13 +70,13 @@ Read the builder's review notes. For each deferred item assess:
 - **Correctly deferred** — fine to merge. Note it.
 - **Already resolved** — builder fixed it. Acknowledge it.
 
-## Phase 6 — Integration Sanity
+## Phase 5 — Integration Sanity
 
 - **Duplicated logic** — does new code reinvent something that exists?
 - **Pattern violations** — does it follow codebase conventions?
 - **API contract changes** — if shared interfaces changed, are callers updated?
 
-## Phase 7 — Act on Findings
+## Phase 6 — Act on Findings
 
 ### Trivial fixes (commit directly)
 
