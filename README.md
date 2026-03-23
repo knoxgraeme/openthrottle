@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.jpg" alt="Open Throttle" width="100%" />
+  <img src="https://raw.githubusercontent.com/knoxgraeme/openthrottle/main/assets/banner.jpg" alt="Open Throttle" width="100%" />
 </p>
 
 Ship prompts to autonomous coding agents running on [Daytona](https://daytona.io) sandboxes. Write a prompt, ship it, get a PR back.

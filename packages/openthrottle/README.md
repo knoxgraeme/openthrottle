@@ -1,4 +1,6 @@
-# openthrottle
+<p align="center">
+  <img src="https://raw.githubusercontent.com/knoxgraeme/openthrottle/main/assets/banner.jpg" alt="Open Throttle" width="100%" />
+</p>
 
 CLI for [Open Throttle](https://github.com/knoxgraeme/openthrottle) — ship prompts to autonomous coding agents running on Daytona sandboxes.
 
