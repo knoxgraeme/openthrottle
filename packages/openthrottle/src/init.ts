@@ -6,29 +6,68 @@
 // =============================================================================
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync } from 'node:fs';
-import { join, dirname, relative } from 'node:path';
+import { join, relative } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 import prompts from 'prompts';
 import { stringify } from 'yaml';
+import { ExecError, getErrorMessage } from './types.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
 const cwd = process.cwd();
+
+// ---------------------------------------------------------------------------
+// Interfaces
+// ---------------------------------------------------------------------------
+
+interface PackageJson {
+  name?: string;
+  scripts?: Record<string, string>;
+  packageManager?: string;
+  devDependencies?: Record<string, string>;
+}
+
+interface ProjectInfo {
+  name: string;
+  pm: string;
+  baseBranch: string;
+  test: string;
+  build: string;
+  lint: string;
+  format: string;
+  dev: string;
+}
+
+interface EnvDetection {
+  envFiles: Record<string, string[]>;
+  allKeys: string[];
+}
+
+interface PromptConfig extends ProjectInfo {
+  agent: string;
+  notifications: string;
+  maxTurns: number;
+  maxBudgetUsd: number;
+  reviewEnabled: boolean;
+  maxRounds: number;
+  snapshotName: string;
+  postBootstrap: string;
+  envFiles: Record<string, string[]>;
+  envAllKeys: string[];
+}
 
 // ---------------------------------------------------------------------------
 // 1. Detect project
 // ---------------------------------------------------------------------------
 
-function detectProject() {
+function detectProject(): ProjectInfo {
   const pkgPath = join(cwd, 'package.json');
   if (!existsSync(pkgPath)) {
     console.error('No package.json found. openthrottle init currently supports Node.js projects only.');
     process.exit(1);
   }
 
-  let pkg;
+  let pkg: PackageJson;
   try {
-    pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
+    pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as PackageJson;
   } catch {
     console.error('Could not parse package.json. Is it valid JSON?');
     process.exit(1);
@@ -50,7 +89,7 @@ function detectProject() {
   try {
     const head = execFileSync('git', ['remote', 'show', 'origin'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
     const match = head.match(/HEAD branch:\s*(\S+)/);
-    if (match) baseBranch = match[1];
+    if (match?.[1]) baseBranch = match[1];
   } catch {
     // Not a git repo or no remote — default to main
   }
@@ -71,12 +110,12 @@ function detectProject() {
 // 1b. Detect .env files and extract key names
 // ---------------------------------------------------------------------------
 
-function detectEnvFiles() {
-  const envFiles = {};
-  const seen = new Set();
+function detectEnvFiles(): EnvDetection {
+  const envFiles: Record<string, string[]> = {};
+  const seen = new Set<string>();
 
-  function scan(dir) {
-    let entries;
+  function scan(dir: string): void {
+    let entries: string[];
     try { entries = readdirSync(dir); } catch { return; }
     for (const entry of entries) {
       if (entry === 'node_modules' || entry === '.git' || entry === '.next' || entry === 'dist') continue;
@@ -89,17 +128,17 @@ function detectEnvFiles() {
       if (/\.(example|sample|template)$/i.test(entry)) continue;
 
       const relPath = relative(cwd, full);
-      const keys = [];
+      const keys: string[] = [];
       try {
         const content = readFileSync(full, 'utf8');
         for (const line of content.split('\n')) {
           const trimmed = line.trim();
           if (!trimmed || trimmed.startsWith('#')) continue;
           const match = trimmed.replace(/^export\s+/, '').match(/^([a-zA-Z_][a-zA-Z0-9_]*)=/);
-          if (match) keys.push(match[1]);
+          if (match?.[1]) keys.push(match[1]);
         }
-      } catch (err) {
-        console.error(`warning: could not read ${relPath}: ${err.message}`);
+      } catch (err: unknown) {
+        console.error(`warning: could not read ${relPath}: ${getErrorMessage(err)}`);
         continue;
       }
 
@@ -118,7 +157,7 @@ function detectEnvFiles() {
 // 2. Prompt for config
 // ---------------------------------------------------------------------------
 
-async function promptConfig(detected) {
+async function promptConfig(detected: ProjectInfo): Promise<PromptConfig> {
   console.log(`\n  Detected: package.json (${detected.pm})\n`);
 
   const response = await prompts([
@@ -150,21 +189,40 @@ async function promptConfig(detected) {
     { type: 'number', name: 'maxBudgetUsd', message: 'Max budget per run in USD (API only)', initial: 5, min: 0 },
     { type: 'confirm', name: 'reviewEnabled', message: 'Enable automated PR review?', initial: true },
     {
-      type: (prev) => prev ? 'number' : null,
+      type: (prev: boolean) => prev ? 'number' as const : null,
       name: 'maxRounds', message: 'Max review rounds', initial: 3, min: 1, max: 10,
     },
     { type: 'text', name: 'snapshotName', message: 'Daytona snapshot name', initial: 'openthrottle' },
   ], { onCancel: () => { console.log('\nCancelled.'); process.exit(0); } });
 
-  return { ...detected, ...response };
+  const { baseBranch, test, build, lint, format, dev, postBootstrap, agent, notifications, maxTurns, maxBudgetUsd, reviewEnabled, maxRounds, snapshotName } = response;
+  return {
+    ...detected,
+    baseBranch: (baseBranch as string) || detected.baseBranch,
+    test: (test as string) ?? detected.test,
+    build: (build as string) ?? detected.build,
+    lint: (lint as string) ?? detected.lint,
+    format: (format as string) ?? detected.format,
+    dev: (dev as string) ?? detected.dev,
+    postBootstrap: postBootstrap as string,
+    agent: agent as string,
+    notifications: notifications as string,
+    maxTurns: maxTurns as number,
+    maxBudgetUsd: maxBudgetUsd as number,
+    reviewEnabled: reviewEnabled as boolean,
+    maxRounds: maxRounds as number,
+    snapshotName: snapshotName as string,
+    envFiles: {} as Record<string, string[]>,
+    envAllKeys: [] as string[],
+  };
 }
 
 // ---------------------------------------------------------------------------
 // 3. Generate .openthrottle.yml
 // ---------------------------------------------------------------------------
 
-function generateConfig(config) {
-  const doc = {
+function generateConfig(config: PromptConfig): string {
+  const doc: Record<string, unknown> = {
     base_branch: config.baseBranch,
     test: config.test || undefined,
     dev: config.dev || undefined,
@@ -208,8 +266,8 @@ function generateConfig(config) {
 // 4. Copy wake-sandbox.yml
 // ---------------------------------------------------------------------------
 
-function copyWorkflow(config) {
-  const src = join(__dirname, 'templates', 'wake-sandbox.yml');
+function copyWorkflow(config: PromptConfig): string {
+  const src = new URL('../templates/wake-sandbox.yml', import.meta.url);
   const destDir = join(cwd, '.github', 'workflows');
   const dest = join(destDir, 'wake-sandbox.yml');
   mkdirSync(destDir, { recursive: true });
@@ -250,7 +308,7 @@ function copyWorkflow(config) {
 // 5. Create Daytona snapshot from pre-built image
 // ---------------------------------------------------------------------------
 
-function setupDaytona(config) {
+function setupDaytona(config: PromptConfig): void {
   const snapshotName = config.snapshotName || 'openthrottle';
   const image = 'knoxgraeme/openthrottle:v1';
 
@@ -260,7 +318,7 @@ function setupDaytona(config) {
   } catch {
     console.log(`\n  daytona CLI not found. Install it, then run:`);
     console.log(`    daytona snapshot create ${snapshotName} --image ${image} --cpu 2 --memory 4 --disk 10\n`);
-    return { snapshotName, skipped: true };
+    return;
   }
 
   // Create snapshot from pre-built image
@@ -271,23 +329,22 @@ function setupDaytona(config) {
       '--cpu', '2', '--memory', '4', '--disk', '10',
     ], { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf8' });
     console.log(`  Created Daytona snapshot: ${snapshotName}`);
-  } catch (err) {
-    if (err.stderr?.toString().includes('already exists')) {
+  } catch (err: unknown) {
+    const execErr = err as ExecError;
+    if (execErr.stderr?.toString().includes('already exists')) {
       console.log(`  Snapshot already exists: ${snapshotName}`);
     } else {
       console.log(`  Snapshot creation failed. You can create it manually:`);
       console.log(`    daytona snapshot create ${snapshotName} --image ${image} --cpu 2 --memory 4 --disk 10`);
     }
   }
-
-  return { snapshotName };
 }
 
 // ---------------------------------------------------------------------------
 // 6. Push .env secrets to GitHub repo secrets
 // ---------------------------------------------------------------------------
 
-async function pushSecrets(config) {
+async function pushSecrets(config: PromptConfig): Promise<void> {
   const envFiles = config.envFiles || {};
   const paths = Object.keys(envFiles);
   if (paths.length === 0) return;
@@ -302,7 +359,7 @@ async function pushSecrets(config) {
   }
 
   // Detect repo
-  let repo;
+  let repo: string;
   try {
     repo = execFileSync('gh', ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'], {
       encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
@@ -334,7 +391,7 @@ async function pushSecrets(config) {
   let failed = 0;
   for (const [path, keys] of Object.entries(envFiles)) {
     const fullPath = join(cwd, path);
-    let content;
+    let content: string;
     try {
       content = readFileSync(fullPath, 'utf8');
     } catch {
@@ -364,9 +421,8 @@ async function pushSecrets(config) {
           stdio: ['pipe', 'pipe', 'pipe'],
         });
         pushed++;
-      } catch (err) {
-        const stderr = err.stderr?.toString().trim() || err.message;
-        console.log(`  Failed to set ${key}: ${stderr}`);
+      } catch (err: unknown) {
+        console.log(`  Failed to set ${key}: ${getErrorMessage(err)}`);
         failed++;
       }
     }
@@ -379,7 +435,7 @@ async function pushSecrets(config) {
 // 7. Print next steps
 // ---------------------------------------------------------------------------
 
-function printNextSteps(config) {
+function printNextSteps(config: PromptConfig): void {
   const agentSecret =
     config.agent === 'claude'
       ? '     ANTHROPIC_API_KEY            <- option a: pay-per-use API key\n     CLAUDE_CODE_OAUTH_TOKEN      <- option b: subscription token (claude setup-token)'
@@ -417,10 +473,10 @@ ${secrets.join('\n')}
 }
 
 // ---------------------------------------------------------------------------
-// Main (exported for use by index.mjs)
+// Main (exported for use by index.ts)
 // ---------------------------------------------------------------------------
 
-export default async function init() {
+export default async function init(): Promise<void> {
   console.log('\n  openthrottle init\n');
 
   // Step 1: Detect

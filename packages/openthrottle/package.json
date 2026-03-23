@@ -4,13 +4,16 @@
   "description": "CLI for Open Throttle — ship prompts to Daytona sandboxes.",
   "type": "module",
   "bin": {
-    "openthrottle": "./index.mjs"
+    "openthrottle": "./dist/index.js"
   },
   "files": [
-    "index.mjs",
-    "init.mjs",
+    "dist/",
     "templates/"
   ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
   "dependencies": {
     "prompts": "^2.4.2",
     "yaml": "^2.4.0"
@@ -28,5 +31,10 @@
     "daytona",
     "agent",
     "cli"
-  ]
+  ],
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "@types/prompts": "^2.4.9",
+    "typescript": "^5.9.3"
+  }
 }
