@@ -1,6 +1,6 @@
 {
   "name": "openthrottle",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "CLI for Open Throttle — ship prompts to Daytona sandboxes.",
   "type": "module",
   "bin": {

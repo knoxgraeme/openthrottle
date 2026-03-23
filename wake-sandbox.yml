@@ -77,13 +77,13 @@ jobs:
           fi
           echo "task_type=$TASK_TYPE" >> "$GITHUB_OUTPUT"
 
-          # Extract session ID for review fixes
-          RESUME_SESSION=""
+          # For review-fix tasks, pass the PR number so the sandbox can
+          # use `claude --from-pr` to resume conversation context
+          FROM_PR=""
           if [[ "$TASK_TYPE" == "review-fix" ]]; then
-            RESUME_SESSION=$(gh pr view "$EVENT_PR_NUM" --json comments \
-              --jq '[.comments[].body | capture("session-id: (?<id>[^ ]+)") | .id] | last // empty') || true
+            FROM_PR="${EVENT_PR_NUM}"
           fi
-          echo "resume_session=$RESUME_SESSION" >> "$GITHUB_OUTPUT"
+          echo "from_pr=$FROM_PR" >> "$GITHUB_OUTPUT"
 
       - name: Validate config
         id: config
@@ -131,7 +131,7 @@ jobs:
             --env TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }} \
             --env WORK_ITEM="${{ steps.work.outputs.item }}" \
             --env TASK_TYPE="${{ steps.work.outputs.task_type }}" \
-            --env RESUME_SESSION="${{ steps.work.outputs.resume_session }}" \
+            --env FROM_PR="${{ steps.work.outputs.from_pr }}" \
             # @@ENV_FLAGS@@ — scaffolder inserts --env flags for project secrets here
             2>&1) || {
               # Redact secrets from error output

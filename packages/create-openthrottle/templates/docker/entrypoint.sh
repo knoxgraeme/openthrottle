@@ -34,6 +34,7 @@ seal_file() {
 # ---------------------------------------------------------------------------
 log "Cloning ${GITHUB_REPO}"
 gh repo clone "$GITHUB_REPO" "$REPO" -- --depth=50
+chown -R daytona:daytona "$REPO"
 cd "$REPO"
 
 # ---------------------------------------------------------------------------

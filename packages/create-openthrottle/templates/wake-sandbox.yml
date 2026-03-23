@@ -37,12 +37,10 @@ permissions:
 
 jobs:
   run-task:
-    if: >-
-      contains(fromJSON('["prd-queued", "bug-queued", "needs-review", "needs-investigation"]'), github.event.label.name) ||
-      (github.event.review.state == 'changes_requested')
+    if: ${{ contains(fromJSON('["prd-queued","bug-queued","needs-review","needs-investigation"]'), github.event.label.name) || (github.event.review.state == 'changes_requested') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Resolve work item
         id: work
@@ -64,7 +62,7 @@ jobs:
           fi
           echo "item=$WORK_ITEM" >> "$GITHUB_OUTPUT"
 
-          # Determine task type (using env vars, not inline ${{ }} expressions)
+          # Determine task type (using env vars, not inline expressions)
           TASK_TYPE="prd"
           if [[ "$EVENT_LABEL" == "bug-queued" ]]; then
             TASK_TYPE="bug"
@@ -77,13 +75,19 @@ jobs:
           fi
           echo "task_type=$TASK_TYPE" >> "$GITHUB_OUTPUT"
 
-          # Extract session ID for review fixes
-          RESUME_SESSION=""
+          # For review-fix tasks, pass the PR number so the sandbox can
+          # use `claude --from-pr` to resume conversation context
+          FROM_PR=""
           if [[ "$TASK_TYPE" == "review-fix" ]]; then
-            RESUME_SESSION=$(gh pr view "$EVENT_PR_NUM" --json comments \
-              --jq '[.comments[].body | capture("session-id: (?<id>[^ ]+)") | .id] | last // empty') || true
+            FROM_PR="${EVENT_PR_NUM}"
           fi
-          echo "resume_session=$RESUME_SESSION" >> "$GITHUB_OUTPUT"
+          echo "from_pr=$FROM_PR" >> "$GITHUB_OUTPUT"
+
+      - name: Install Daytona CLI
+        run: curl -Lo daytona "https://download.daytona.io/cli/latest/daytona-linux-amd64" && sudo chmod +x daytona && sudo mv daytona /usr/local/bin/
+
+      - name: Install yq
+        run: sudo snap install yq
 
       - name: Validate config
         id: config
@@ -95,11 +99,25 @@ jobs:
           fi
           echo "snapshot=$SNAPSHOT" >> "$GITHUB_OUTPUT"
 
-      - name: Activate snapshot (reactivates if idle >2 weeks)
+      - name: Authenticate Daytona CLI
+        run: daytona login --api-key "$DAYTONA_API_KEY"
         env:
           DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
+
+      - name: Verify snapshot exists
+        env:
+          DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
+          SNAPSHOT: ${{ steps.config.outputs.snapshot }}
         run: |
-          daytona snapshot activate "${{ steps.config.outputs.snapshot }}" 2>/dev/null || true
+          # Reactivate if idle >2 weeks, then verify it exists
+          daytona snapshot activate "$SNAPSHOT" 2>/dev/null || true
+          if ! daytona snapshot list 2>/dev/null | grep -q "$SNAPSHOT"; then
+            echo "::error::Snapshot '$SNAPSHOT' not found. Create it first: daytona snapshot create $SNAPSHOT --image <your-image:tag>"
+            echo "Available snapshots:"
+            daytona snapshot list 2>/dev/null || echo "  (could not list snapshots)"
+            exit 1
+          fi
+          echo "Snapshot verified: $SNAPSHOT"
 
       - name: Create and run sandbox
         env:
@@ -109,42 +127,37 @@ jobs:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SNAPSHOT: ${{ steps.config.outputs.snapshot }}
+          WORK_ITEM: ${{ steps.work.outputs.item }}
+          TASK_TYPE: ${{ steps.work.outputs.task_type }}
+          FROM_PR: ${{ steps.work.outputs.from_pr }}
           # @@ENV_SECRETS@@ — scaffolder inserts project-specific secrets here
         run: |
-          # Create ephemeral sandbox
-          OUTPUT=$(daytona create \
-            --snapshot "${{ steps.config.outputs.snapshot }}" \
-            --auto-delete 0 \
-            --auto-stop 60 \
-            --cpu 2 --memory 4096 --disk 10 \
-            --label project=${{ github.event.repository.name }} \
-            --label task_type="${{ steps.work.outputs.task_type }}" \
-            --label issue="${{ steps.work.outputs.item }}" \
-            --volume openthrottle-${{ github.repository_id }}:/home/daytona/.claude \
-            --env GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }} \
-            --env GITHUB_REPO=${{ github.repository }} \
-            --env ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY} \
-            --env CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN} \
-            --env OPENAI_API_KEY=${OPENAI_API_KEY} \
-            --env SUPABASE_ACCESS_TOKEN=${SUPABASE_ACCESS_TOKEN} \
-            --env TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }} \
-            --env TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }} \
-            --env WORK_ITEM="${{ steps.work.outputs.item }}" \
-            --env TASK_TYPE="${{ steps.work.outputs.task_type }}" \
-            --env RESUME_SESSION="${{ steps.work.outputs.resume_session }}" \
-            # @@ENV_FLAGS@@ — scaffolder inserts --env flags for project secrets here
-            2>&1) || {
-              # Redact secrets from error output
-              SAFE_OUTPUT=$(echo "$OUTPUT" | sed \
-                -e "s/${ANTHROPIC_API_KEY:-___}/[REDACTED]/g" \
-                -e "s/${CLAUDE_CODE_OAUTH_TOKEN:-___}/[REDACTED]/g" \
-                -e "s/${OPENAI_API_KEY:-___}/[REDACTED]/g" \
-                -e "s/${SUPABASE_ACCESS_TOKEN:-___}/[REDACTED]/g" \
-                -e "s/${GH_TOKEN:-___}/[REDACTED]/g")
-              echo "::error::Sandbox creation failed: $SAFE_OUTPUT"
-              exit 1
-            }
-          SANDBOX_ID="$OUTPUT"
+          SANDBOX_NAME="ot-${TASK_TYPE}-${WORK_ITEM}-${GITHUB_RUN_ID}"
 
-          echo "Sandbox created: $SANDBOX_ID"
-          echo "Task: ${{ steps.work.outputs.task_type }} #${{ steps.work.outputs.item }}"
+          # Create ephemeral sandbox
+          daytona create \
+            --snapshot "$SNAPSHOT" \
+            --name "$SANDBOX_NAME" \
+            --auto-stop 60 \
+            --label "project=${{ github.event.repository.name }}" \
+            --label "task_type=${TASK_TYPE}" \
+            --label "issue=${WORK_ITEM}" \
+            --env "GITHUB_TOKEN=${{ secrets.GH_PAT }}" \
+            --env "GITHUB_REPO=${{ github.repository }}" \
+            --env "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" \
+            --env "CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}" \
+            --env "OPENAI_API_KEY=${OPENAI_API_KEY}" \
+            --env "SUPABASE_ACCESS_TOKEN=${SUPABASE_ACCESS_TOKEN}" \
+            --env "TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}" \
+            --env "TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --env "WORK_ITEM=${WORK_ITEM}" \
+            --env "TASK_TYPE=${TASK_TYPE}" \
+            --env "FROM_PR=${FROM_PR}" \
+            # @@ENV_FLAGS@@ — scaffolder inserts --env flags for project secrets here
+
+          echo "Sandbox created: $SANDBOX_NAME"
+          echo "Task: ${TASK_TYPE} #${WORK_ITEM}"
+          if [[ -n "$FROM_PR" ]]; then
+            echo "Review-fix mode: sandbox will use 'claude --from-pr $FROM_PR' to resume PR context"
+          fi

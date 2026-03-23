@@ -56,7 +56,7 @@ sanitize_secrets() {
 # Usage: invoke_agent PROMPT TIMEOUT SESSION_LOG [TASK_KEY]
 #   TASK_KEY — unique key for session persistence (e.g. "prd-42", "review-7").
 #              Session files are stored on the volume at SESSIONS_DIR.
-#              If RESUME_SESSION env var is set, it takes precedence (review-fix flow).
+#              If FROM_PR env var is set, uses `claude --from-pr` to resume PR context.
 # ---------------------------------------------------------------------------
 invoke_agent() {
   local PROMPT="$1"
@@ -67,11 +67,11 @@ invoke_agent() {
   local -a SESSION_FLAGS=()
   local ACTIVE_SESSION_ID=""
 
-  # Priority 1: RESUME_SESSION env var (set by GitHub Action for review-fix flow)
-  if [[ -n "${RESUME_SESSION:-}" ]]; then
-    SESSION_FLAGS=(--resume "$RESUME_SESSION")
-    ACTIVE_SESSION_ID="$RESUME_SESSION"
-    log "Resuming session from workflow: ${RESUME_SESSION}"
+  # Priority 1: FROM_PR env var (review-fix flow — resume conversation context)
+  if [[ -n "${FROM_PR:-}" ]]; then
+    SESSION_FLAGS=(--from-pr "$FROM_PR")
+    ACTIVE_SESSION_ID="from-pr-${FROM_PR}"
+    log "Resuming PR context with --from-pr ${FROM_PR}"
 
   # Priority 2: Session file on volume (cross-sandbox resume)
   elif [[ -n "$TASK_KEY" ]]; then

@@ -288,7 +288,7 @@ function copyWorkflow(config: PromptConfig): string {
 
     // Add --env flags for daytona create
     const envFlags = allKeys
-      .map(k => `            --env ${k}=\${${k}} \\`)
+      .map(k => `            --env "${k}=\${${k}}" \\`)
       .join('\n');
     content = content.replace(
       /            # @@ENV_FLAGS@@ — scaffolder inserts --env flags for project secrets here/,
