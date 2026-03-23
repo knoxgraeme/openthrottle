@@ -8,6 +8,10 @@
 
 set -euo pipefail
 
+# Log all output to file for debugging
+LOGFILE="/tmp/entrypoint.log"
+exec > >(tee -a "$LOGFILE") 2>&1
+
 : "${GITHUB_REPO:?GITHUB_REPO is required}"
 : "${GITHUB_TOKEN:?GITHUB_TOKEN is required}"
 : "${TASK_TYPE:?TASK_TYPE is required}"
