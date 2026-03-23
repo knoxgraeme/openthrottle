@@ -4,11 +4,15 @@
   "description": "Alias for `npx openthrottle init`.",
   "type": "module",
   "bin": {
-    "create-openthrottle": "./index.mjs"
+    "create-openthrottle": "./dist/index.js"
   },
   "files": [
-    "index.mjs"
+    "dist/"
   ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
   "engines": {
     "node": ">=18"
   },
@@ -20,5 +24,9 @@
   "keywords": [
     "openthrottle",
     "create"
-  ]
+  ],
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "typescript": "^5.9.3"
+  }
 }

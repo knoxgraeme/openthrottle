@@ -13,7 +13,16 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { ExecError, getErrorMessage } from './types.js';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+interface OpenThrottleConfig {
+  baseBranch: string;
+  snapshot: string;
+}
 
 // ---------------------------------------------------------------------------
 // 1. Constants + helpers
@@ -23,34 +32,35 @@ const EXIT_OK = 0;
 const EXIT_USER_ERROR = 1;
 const EXIT_MISSING_DEP = 2;
 
-function die(message, code = EXIT_USER_ERROR) {
+function die(message: string, code: number = EXIT_USER_ERROR): never {
   console.error(`error: ${message}`);
   process.exit(code);
 }
 
-function gh(args, { quiet = false } = {}) {
+function gh(args: string[], { quiet = false }: { quiet?: boolean } = {}): string {
   try {
     return execFileSync('gh', args, {
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe'],
     }).trim();
   } catch (err) {
-    const stderr = err.stderr?.toString().trim() || '';
+    const execErr = err as ExecError;
+    const stderr = execErr.stderr?.toString().trim() || '';
     if (stderr.includes('auth login')) {
       die('gh auth expired -- run: gh auth login', EXIT_MISSING_DEP);
     }
     if (quiet) {
       // Exit code 1 with no stderr = no matching results (expected)
-      if (err.status === 1 && !stderr) return '';
+      if (execErr.status === 1 && !stderr) return '';
       // Real failure — warn but don't crash
-      console.error(`warning: gh ${args.slice(0, 2).join(' ')} failed: ${stderr || err.message}`);
+      console.error(`warning: gh ${args.slice(0, 2).join(' ')} failed: ${stderr || execErr.message}`);
       return '';
     }
     throw err;
   }
 }
 
-function preflight() {
+function preflight(): void {
   try {
     execFileSync('gh', ['auth', 'status'], { stdio: 'pipe' });
   } catch {
@@ -61,32 +71,33 @@ function preflight() {
   }
 }
 
-function detectRepo() {
+function detectRepo(): string {
   try {
     const url = execFileSync('git', ['remote', 'get-url', 'origin'], {
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe'],
     }).trim();
     const match = url.match(/github\.com[:/](.+?\/.+?)(?:\.git)?$/);
-    if (match) return match[1];
+    if (match?.[1]) return match[1];
   } catch {}
   die('Could not detect GitHub repo. Run from a git repo with a github.com remote.');
 }
 
-function readConfig() {
+function readConfig(): OpenThrottleConfig {
   const configPath = join(process.cwd(), '.openthrottle.yml');
   if (!existsSync(configPath)) {
     return { baseBranch: 'main', snapshot: 'openthrottle' };
   }
-  let content;
+  let content: string;
   try {
     content = readFileSync(configPath, 'utf8');
   } catch (err) {
-    die(`Could not read .openthrottle.yml: ${err.message}`);
+    const e = err as Error;
+    die(`Could not read .openthrottle.yml: ${e.message}`);
   }
-  const get = (key) => {
+  const get = (key: string): string | undefined => {
     const match = content.match(new RegExp(`^${key}:\\s*(.+)`, 'm'));
-    if (!match) return undefined;
+    if (!match?.[1]) return undefined;
     return match[1].replace(/#.*$/, '').trim().replace(/^["']|["']$/g, '');
   };
   return {
@@ -99,9 +110,9 @@ function readConfig() {
 // 2. Command: ship
 // ---------------------------------------------------------------------------
 
-function cmdShip(args) {
-  let file = null;
-  let baseBranch = null;
+function cmdShip(args: string[]): void {
+  let file: string | null = null;
+  let baseBranch: string | null = null;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--base' && args[i + 1]) {
@@ -124,7 +135,7 @@ function cmdShip(args) {
   // Extract title from first markdown heading
   const content = readFileSync(file, 'utf8');
   const headingMatch = content.match(/^#{1,6}\s+(.+)/m);
-  let title = headingMatch ? headingMatch[1].trim() : file.replace(/\.md$/, '');
+  let title = headingMatch?.[1]?.trim() ?? file.replace(/\.md$/, '');
   if (!title.startsWith('PRD:')) title = `PRD: ${title}`;
 
   // Ensure labels exist (idempotent)
@@ -137,8 +148,7 @@ function cmdShip(args) {
     try {
       gh(['label', 'create', label, '--repo', repo, '--force']);
     } catch (err) {
-      const stderr = err.stderr?.toString().trim() || err.message;
-      console.error(`warning: failed to create label "${label}": ${stderr}`);
+      console.error(`warning: failed to create label "${label}": ${getErrorMessage(err)}`);
     }
   }
 
@@ -147,7 +157,7 @@ function cmdShip(args) {
   if (base !== 'main') issueLabels += `,base:${base}`;
 
   // Create the issue
-  let issueUrl;
+  let issueUrl: string;
   try {
     issueUrl = gh([
       'issue', 'create',
@@ -157,8 +167,7 @@ function cmdShip(args) {
       '--label', issueLabels,
     ]);
   } catch (err) {
-    const msg = err.stderr?.toString().trim() || err.message;
-    die(`Failed to create issue: ${msg}`);
+    die(`Failed to create issue: ${getErrorMessage(err)}`);
   }
 
   // Show queue position
@@ -197,7 +206,7 @@ function cmdShip(args) {
 // 3. Command: status
 // ---------------------------------------------------------------------------
 
-function cmdStatus() {
+function cmdStatus(): void {
   const repo = detectRepo();
 
   console.log('RUNNING');
@@ -255,10 +264,10 @@ function cmdStatus() {
 // 4. Command: logs
 // ---------------------------------------------------------------------------
 
-function cmdLogs() {
+function cmdLogs(): void {
   const repo = detectRepo();
 
-  let output;
+  let output: string;
   try {
     output = gh([
       'run', 'list',
@@ -274,7 +283,7 @@ function cmdLogs() {
         '--limit', '10',
       ]);
     } catch (err) {
-      die(`Failed to list workflow runs: ${err.stderr?.toString().trim() || err.message}`);
+      die(`Failed to list workflow runs: ${getErrorMessage(err)}`);
     }
   }
 
@@ -302,7 +311,7 @@ Options:
   --help, -h                         Show this help message
   --version, -v                      Show version`;
 
-async function main() {
+async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const command = args[0];
 
@@ -312,13 +321,13 @@ async function main() {
   }
 
   if (command === '--version' || command === '-v') {
-    const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
+    const pkg: { version: string } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
     console.log(pkg.version);
     process.exit(EXIT_OK);
   }
 
   if (command === 'init') {
-    const { default: init } = await import('./init.mjs');
+    const { default: init }: { default: () => Promise<void> } = await import('./init.js');
     await init();
     return;
   }
@@ -340,7 +349,7 @@ async function main() {
   }
 }
 
-main().catch((err) => {
+main().catch((err: Error) => {
   console.error(`error: ${err.message}`);
   process.exit(1);
 });
