@@ -334,7 +334,9 @@ function setupDaytona(config: PromptConfig): void {
     if (execErr.stderr?.toString().includes('already exists')) {
       console.log(`  Snapshot already exists: ${snapshotName}`);
     } else {
-      console.log(`  Snapshot creation failed. You can create it manually:`);
+      const detail = getErrorMessage(err);
+      console.log(`  Snapshot creation failed: ${detail}`);
+      console.log(`  You can create it manually:`);
       console.log(`    daytona snapshot create ${snapshotName} --image ${image} --cpu 2 --memory 4 --disk 10`);
     }
   }
@@ -352,9 +354,10 @@ async function pushSecrets(config: PromptConfig): Promise<void> {
   // Check gh is available and authenticated
   try {
     execFileSync('gh', ['auth', 'status'], { stdio: 'pipe' });
-  } catch {
-    console.log('\n  gh CLI not authenticated — skipping secret push.');
-    console.log('  Run "gh auth login" then set secrets manually.\n');
+  } catch (err: unknown) {
+    const detail = getErrorMessage(err);
+    console.log(`\n  gh CLI check failed: ${detail}`);
+    console.log('  Skipping secret push. Run "gh auth login" then set secrets manually.\n');
     return;
   }
 
@@ -364,8 +367,9 @@ async function pushSecrets(config: PromptConfig): Promise<void> {
     repo = execFileSync('gh', ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'], {
       encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
     }).trim();
-  } catch {
-    console.log('\n  Could not detect GitHub repo — skipping secret push.\n');
+  } catch (err: unknown) {
+    console.log(`\n  Could not detect GitHub repo: ${getErrorMessage(err)}`);
+    console.log('  Skipping secret push.\n');
     return;
   }
 
