@@ -33,20 +33,18 @@ This will:
 - Detect your project (package manager, commands, base branch)
 - Generate `.openthrottle.yml`
 - Copy `.github/workflows/wake-sandbox.yml`
-- Create a Daytona snapshot and volume
+- Create a Daytona snapshot
 
 Requires `DAYTONA_API_KEY` — get one at [daytona.io/dashboard](https://daytona.io/dashboard).
 
 ### 2. Set GitHub repo secrets
 
-Pick one auth method:
-
 | Secret | Required | Source |
 |---|---|---|
 | `DAYTONA_API_KEY` | Yes | [daytona.io/dashboard](https://daytona.io/dashboard) |
-| `ANTHROPIC_API_KEY` | Option A | [console.anthropic.com](https://console.anthropic.com) |
-| `CLAUDE_CODE_OAUTH_TOKEN` | Option B | `claude setup-token` (valid 1 year) |
-| `OPENAI_API_KEY` | For Codex/Aider | [platform.openai.com](https://platform.openai.com) |
+| `ANTHROPIC_API_KEY` | Claude (option A) | [console.anthropic.com](https://console.anthropic.com) |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Claude (option B) | `claude setup-token` (valid 1 year) |
+| `OPENAI_API_KEY` | Codex / Aider | [platform.openai.com](https://platform.openai.com) |
 | `TELEGRAM_BOT_TOKEN` | Optional | [@BotFather](https://t.me/botfather) |
 | `TELEGRAM_CHAT_ID` | Optional | Telegram getUpdates API |
 | `SUPABASE_ACCESS_TOKEN` | Optional | [supabase.com/dashboard](https://supabase.com/dashboard) |
@@ -69,21 +67,6 @@ gh issue create --title "Add search feature" \
 
 Or from Claude Code: `/openthrottle-ship docs/prds/search.md`
 
-## How tasks flow
-
-| Trigger | What happens |
-|---|---|
-| Issue labeled `prd-queued` | Builder implements feature, opens PR |
-| Issue labeled `bug-queued` | Builder fixes bug, opens PR |
-| PR labeled `needs-review` | Reviewer runs task-aware review |
-| Issue labeled `needs-investigation` | Reviewer investigates, posts findings |
-| PR gets `changes_requested` review | Builder applies fixes, re-requests review |
-
-State machine labels:
-- PRDs: `prd-queued` → `prd-running` → `prd-complete` / `prd-failed`
-- Bugs: `bug-queued` → `bug-running` → `bug-complete` / `bug-failed`
-- Reviews: `needs-review` → `reviewing` → approved / changes_requested
-
 ## Config
 
 `.openthrottle.yml` is generated during setup and committed to your repo:
@@ -97,13 +80,18 @@ format: pnpm prettier --write
 dev: pnpm dev --port 8080 --hostname 0.0.0.0
 
 agent: claude                              # claude | codex | aider
-snapshot: openthrottle-doer-claude-node
+snapshot: openthrottle
 notifications: telegram
 
 post_bootstrap:
   - pnpm install
 
 mcp_servers: {}
+
+limits:
+  max_turns: 200                           # max agentic turns per run
+  max_budget_usd: 5.00                     # max USD per run (API keys only)
+  task_timeout: 7200                       # wall-clock timeout in seconds
 
 review:
   enabled: true
@@ -126,6 +114,24 @@ mcp_servers:
 `from-env` values are resolved from sandbox environment variables at boot.
 
 **Supabase safety:** When detected, a tool allowlist is applied — only branch management and read-only operations are permitted. `execute_sql`, `apply_migration`, `deploy_edge_function`, and `merge_branch` are blocked.
+
+## Task lifecycle
+
+| Trigger | What happens |
+|---|---|
+| Issue labeled `prd-queued` | Builder implements feature, opens PR |
+| Issue labeled `bug-queued` | Builder fixes bug, opens PR |
+| PR labeled `needs-review` | Reviewer runs task-aware review |
+| Issue labeled `needs-investigation` | Reviewer investigates, posts findings |
+| PR gets `changes_requested` review | Builder applies fixes, re-requests review |
+
+Labels track state through each workflow:
+
+```
+PRDs:     prd-queued → prd-running → prd-complete / prd-failed
+Bugs:     bug-queued → bug-running → bug-complete / bug-failed
+Reviews:  needs-review → reviewing → approved / changes_requested
+```
 
 ## Architecture
 
@@ -165,34 +171,6 @@ Issue labeled prd-queued        GitHub Action fires
 
 Each sandbox is ephemeral — created per task, destroyed after. Session data persists on a Daytona volume for `--resume` across sandboxes.
 
-## Snapshot modes
-
-During `npx create-openthrottle`, you choose how the sandbox image is created:
-
-**Pre-built image (default):** Uses `knoxgraeme/openthrottle:v1` from Docker Hub — fast, no customization needed. The scaffolder creates the Daytona snapshot automatically.
-
-**Build from Dockerfile:** Copies the Dockerfile + runtime scripts into `.openthrottle/docker/` in your project. You can customize the image (add system packages, tools, different Node version), then create the snapshot yourself:
-
-```bash
-daytona snapshot create openthrottle-doer-claude-node \
-  --dockerfile .openthrottle/docker/Dockerfile \
-  --build-arg AGENT=claude
-```
-
-## Multi-agent support
-
-The runtime supports Claude Code, Codex, and Aider. Set `agent` in `.openthrottle.yml`:
-
-```yaml
-agent: codex   # claude | codex | aider
-```
-
-The Dockerfile uses a build arg to install the right agent CLI:
-
-```bash
-docker build --build-arg AGENT=codex -t knoxgraeme/openthrottle:v1 .
-```
-
 ## Security
 
 The agent runs with `--dangerously-skip-permissions`. Safety comes from defense in depth:
@@ -212,22 +190,19 @@ The agent runs with `--dangerously-skip-permissions`. Safety comes from defense 
 - GitHub branch protection enabled (require PR reviews, no direct push)
 - Fine-grained PAT: `contents:rw`, `pull_requests:rw`, `issues:rw` — deny admin/actions/secrets
 
-## Commands
-
-| Command | What it does |
-|---|---|
-| `/openthrottle-ship <file.md>` | Ship a prompt via GitHub Issues |
-| `/openthrottle-ship status` | Check status from GitHub |
-| `/openthrottle-ship logs` | Stream sandbox logs |
-| `/openthrottle-ship kill` | Stop the running sandbox |
-
 ## Claude Code plugin (optional)
 
-The Claude Code plugin adds `/openthrottle-ship` and `/openthrottle-setup` skills for a richer onboarding experience. It's optional — `npx create-openthrottle` works without it.
+The plugin adds `/openthrottle-ship` for shipping prompts and checking status directly from Claude Code. It's optional — `npx create-openthrottle` and `gh issue create` work without it.
 
 ```bash
 claude plugin install knoxgraeme/openthrottle
 ```
+
+| Command | What it does |
+|---|---|
+| `/openthrottle-ship <file.md>` | Ship a prompt via GitHub Issues |
+| `/openthrottle-ship status` | Check running, queued, and completed tasks |
+| `/openthrottle-ship logs` | View GitHub Actions run logs |
 
 ## License
 
