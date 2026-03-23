@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/knoxgraeme/openthrottle/main/assets/banner.jpg" alt="Open Throttle" width="100%" />
 </p>
 
-Ship prompts to autonomous coding agents running on [Daytona](https://daytona.io) sandboxes. Write a prompt, ship it, get a PR back.
+Ship prompts to autonomous coding agents running on [Daytona](https://daytona.io) sandboxes, powered by the [compound-engineering](https://github.com/EveryInc/compound-engineering-plugin) workflow. Write a prompt, ship it, get a PR back.
 
 ## How it works
 
@@ -170,6 +170,10 @@ Issue labeled prd-queued        GitHub Action fires
 ```
 
 Each sandbox is ephemeral — created per task, destroyed after. Session data persists on a Daytona volume for `--resume` across sandboxes.
+
+### Compound Engineering
+
+The builder uses the [compound-engineering](https://github.com/EveryInc/compound-engineering-plugin) Claude Code plugin to drive the implementation workflow inside each sandbox. The plugin provides structured skills for planning (`ce-plan`), research (`deepen-plan`), implementation (`ce-work`), and self-review (`ce-review`) — giving the agent a repeatable, multi-phase workflow rather than a single monolithic prompt.
 
 ## Security
 
