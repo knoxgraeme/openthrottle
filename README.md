@@ -1,4 +1,6 @@
-# Open Throttle
+<p align="center">
+  <img src="assets/banner.jpg" alt="Open Throttle" width="100%" />
+</p>
 
 Ship prompts to autonomous coding agents running on [Daytona](https://daytona.io) sandboxes. Write a prompt, ship it, get a PR back.
 
@@ -15,9 +17,9 @@ Ship prompts to autonomous coding agents running on [Daytona](https://daytona.io
 Ship multiple prompts — they run **in parallel** (one sandbox each):
 
 ```bash
-gh issue create --title "Auth" --body-file auth.md --label prd-queued
-gh issue create --title "Billing" --body-file billing.md --label prd-queued
-gh issue create --title "Search" --body-file search.md --label prd-queued
+npx openthrottle ship auth.md
+npx openthrottle ship billing.md
+npx openthrottle ship search.md
 # → 3 sandboxes spin up simultaneously
 ```
 
@@ -26,7 +28,7 @@ gh issue create --title "Search" --body-file search.md --label prd-queued
 ### 1. Set up your project (~2 minutes)
 
 ```bash
-npx create-openthrottle
+npx openthrottle init
 ```
 
 This will:
@@ -60,12 +62,10 @@ git push
 ### 4. Ship a prompt
 
 ```bash
-gh issue create --title "Add search feature" \
-  --body-file docs/prds/search.md \
-  --label prd-queued
+npx openthrottle ship docs/prds/search.md
 ```
 
-Or from Claude Code: `/openthrottle-ship docs/prds/search.md`
+Or via Claude Code: `/openthrottle-ship docs/prds/search.md`
 
 ## Config
 
@@ -136,7 +136,7 @@ Reviews:  needs-review → reviewing → approved / changes_requested
 ## Architecture
 
 ```
-npx create-openthrottle        ← one-time setup
+npx openthrottle init          ← one-time setup
 git push                       ← .openthrottle.yml + wake workflow committed
                                       │
                                       ▼
@@ -190,19 +190,25 @@ The agent runs with `--dangerously-skip-permissions`. Safety comes from defense 
 - GitHub branch protection enabled (require PR reviews, no direct push)
 - Fine-grained PAT: `contents:rw`, `pull_requests:rw`, `issues:rw` — deny admin/actions/secrets
 
-## Claude Code plugin (optional)
+## CLI
 
-The plugin adds `/openthrottle-ship` for shipping prompts and checking status directly from Claude Code. It's optional — `npx create-openthrottle` and `gh issue create` work without it.
+Requires [gh CLI](https://cli.github.com) installed and authenticated.
+
+| Command | What it does |
+|---|---|
+| `npx openthrottle init` | Set up Open Throttle in your project |
+| `npx openthrottle ship <file.md>` | Create a GitHub issue to trigger a sandbox |
+| `npx openthrottle ship <file.md> --base dev` | Target a non-default branch |
+| `npx openthrottle status` | Show running, queued, and completed tasks |
+| `npx openthrottle logs` | Show recent GitHub Actions workflow runs |
+
+### Claude Code plugin (optional)
+
+The plugin adds `/openthrottle-ship` as a skill in Claude Code, delegating to the CLI above. It's optional — the CLI works standalone.
 
 ```bash
 claude plugin install knoxgraeme/openthrottle
 ```
-
-| Command | What it does |
-|---|---|
-| `/openthrottle-ship <file.md>` | Ship a prompt via GitHub Issues |
-| `/openthrottle-ship status` | Check running, queued, and completed tasks |
-| `/openthrottle-ship logs` | View GitHub Actions run logs |
 
 ## License
 

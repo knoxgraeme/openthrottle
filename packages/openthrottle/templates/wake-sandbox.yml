@@ -1,0 +1,150 @@
+# Wake Daytona sandbox when work arrives on GitHub.
+#
+# Triggers:
+#   - Issue labeled prd-queued or bug-queued → builder sandbox
+#   - PR labeled needs-review               → reviewer sandbox
+#   - PR review with changes_requested      → review-fix sandbox
+#
+# Each trigger creates a fresh ephemeral sandbox — no polling, no long-lived state.
+# Multiple triggers fire in parallel (one sandbox per task).
+#
+# Required repository secrets:
+#   DAYTONA_API_KEY          — API key from daytona.io
+#   ANTHROPIC_API_KEY        — (option a) or
+#   CLAUDE_CODE_OAUTH_TOKEN  — (option b) for Claude Code auth
+#   TELEGRAM_BOT_TOKEN       — optional, for notifications
+#   TELEGRAM_CHAT_ID         — optional, for notifications
+#   SUPABASE_ACCESS_TOKEN    — optional, for Supabase MCP
+
+name: Wake Sandbox
+
+on:
+  issues:
+    types: [labeled]
+  pull_request:
+    types: [labeled]
+  pull_request_review:
+    types: [submitted]
+
+concurrency:
+  group: openthrottle-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  run-task:
+    if: >-
+      contains(fromJSON('["prd-queued", "bug-queued", "needs-review", "needs-investigation"]'), github.event.label.name) ||
+      (github.event.review.state == 'changes_requested')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve work item
+        id: work
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_LABEL: ${{ github.event.label.name }}
+          EVENT_REVIEW_STATE: ${{ github.event.review.state }}
+          EVENT_ISSUE_NUM: ${{ github.event.issue.number }}
+          EVENT_PR_NUM: ${{ github.event.pull_request.number }}
+        run: |
+          # Determine work item number
+          WORK_ITEM="${EVENT_ISSUE_NUM}"
+          if [[ -z "$WORK_ITEM" ]]; then
+            WORK_ITEM="${EVENT_PR_NUM}"
+          fi
+          if [[ -z "$WORK_ITEM" ]]; then
+            echo "::error::Could not determine work item number from event payload"
+            exit 1
+          fi
+          echo "item=$WORK_ITEM" >> "$GITHUB_OUTPUT"
+
+          # Determine task type (using env vars, not inline ${{ }} expressions)
+          TASK_TYPE="prd"
+          if [[ "$EVENT_LABEL" == "bug-queued" ]]; then
+            TASK_TYPE="bug"
+          elif [[ "$EVENT_LABEL" == "needs-review" ]]; then
+            TASK_TYPE="review"
+          elif [[ "$EVENT_LABEL" == "needs-investigation" ]]; then
+            TASK_TYPE="investigation"
+          elif [[ "$EVENT_REVIEW_STATE" == "changes_requested" ]]; then
+            TASK_TYPE="review-fix"
+          fi
+          echo "task_type=$TASK_TYPE" >> "$GITHUB_OUTPUT"
+
+          # Extract session ID for review fixes
+          RESUME_SESSION=""
+          if [[ "$TASK_TYPE" == "review-fix" ]]; then
+            RESUME_SESSION=$(gh pr view "$EVENT_PR_NUM" --json comments \
+              --jq '[.comments[].body | capture("session-id: (?<id>[^ ]+)") | .id] | last // empty') || true
+          fi
+          echo "resume_session=$RESUME_SESSION" >> "$GITHUB_OUTPUT"
+
+      - name: Validate config
+        id: config
+        run: |
+          SNAPSHOT=$(yq '.snapshot // ""' .openthrottle.yml)
+          if [[ -z "$SNAPSHOT" || "$SNAPSHOT" == "null" ]]; then
+            echo "::error::Missing 'snapshot' key in .openthrottle.yml — cannot create sandbox"
+            exit 1
+          fi
+          echo "snapshot=$SNAPSHOT" >> "$GITHUB_OUTPUT"
+
+      - name: Activate snapshot (reactivates if idle >2 weeks)
+        env:
+          DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
+        run: |
+          daytona snapshot activate "${{ steps.config.outputs.snapshot }}" 2>/dev/null || true
+
+      - name: Create and run sandbox
+        env:
+          DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          # @@ENV_SECRETS@@ — scaffolder inserts project-specific secrets here
+        run: |
+          # Create ephemeral sandbox
+          OUTPUT=$(daytona create \
+            --snapshot "${{ steps.config.outputs.snapshot }}" \
+            --auto-delete 0 \
+            --auto-stop 60 \
+            --cpu 2 --memory 4096 --disk 10 \
+            --label project=${{ github.event.repository.name }} \
+            --label task_type="${{ steps.work.outputs.task_type }}" \
+            --label issue="${{ steps.work.outputs.item }}" \
+            --volume openthrottle-${{ github.repository_id }}:/home/daytona/.claude \
+            --env GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }} \
+            --env GITHUB_REPO=${{ github.repository }} \
+            --env ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY} \
+            --env CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN} \
+            --env OPENAI_API_KEY=${OPENAI_API_KEY} \
+            --env SUPABASE_ACCESS_TOKEN=${SUPABASE_ACCESS_TOKEN} \
+            --env TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }} \
+            --env TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }} \
+            --env WORK_ITEM="${{ steps.work.outputs.item }}" \
+            --env TASK_TYPE="${{ steps.work.outputs.task_type }}" \
+            --env RESUME_SESSION="${{ steps.work.outputs.resume_session }}" \
+            # @@ENV_FLAGS@@ — scaffolder inserts --env flags for project secrets here
+            2>&1) || {
+              # Redact secrets from error output
+              SAFE_OUTPUT=$(echo "$OUTPUT" | sed \
+                -e "s/${ANTHROPIC_API_KEY:-___}/[REDACTED]/g" \
+                -e "s/${CLAUDE_CODE_OAUTH_TOKEN:-___}/[REDACTED]/g" \
+                -e "s/${OPENAI_API_KEY:-___}/[REDACTED]/g" \
+                -e "s/${SUPABASE_ACCESS_TOKEN:-___}/[REDACTED]/g" \
+                -e "s/${GH_TOKEN:-___}/[REDACTED]/g")
+              echo "::error::Sandbox creation failed: $SAFE_OUTPUT"
+              exit 1
+            }
+          SANDBOX_ID="$OUTPUT"
+
+          echo "Sandbox created: $SANDBOX_ID"
+          echo "Task: ${{ steps.work.outputs.task_type }} #${{ steps.work.outputs.item }}"
