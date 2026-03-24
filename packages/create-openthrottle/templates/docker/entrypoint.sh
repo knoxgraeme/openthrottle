@@ -116,7 +116,7 @@ fi
 log "Configuring agent settings (${AGENT})"
 
 # 5a. Install universal git hooks and seal git config (works for ALL agent runtimes)
-git -C "$REPO" config core.hooksPath /opt/openthrottle/git-hooks
+cd "$REPO" && git config core.hooksPath /opt/openthrottle/git-hooks
 log "Installed git hooks (pre-push)"
 # Seal .git/config to prevent agents from changing core.hooksPath
 seal_file "${REPO}/.git/config" 2>/dev/null || true
