@@ -12,6 +12,10 @@ set -euo pipefail
 LOGFILE="/tmp/entrypoint.log"
 exec > >(tee -a "$LOGFILE") 2>&1
 
+# Debug: log every command before execution
+trap 'echo "[DEBUG] Line $LINENO: $BASH_COMMAND" >> /tmp/entrypoint-debug.log' DEBUG
+trap 'echo "[TRAP] EXIT at line $LINENO (exit code $?)" >> /tmp/entrypoint-debug.log' EXIT
+
 : "${GITHUB_REPO:?GITHUB_REPO is required}"
 : "${GITHUB_TOKEN:?GITHUB_TOKEN is required}"
 : "${TASK_TYPE:?TASK_TYPE is required}"
