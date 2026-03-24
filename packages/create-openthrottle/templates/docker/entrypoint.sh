@@ -44,9 +44,15 @@ log "Cloning ${GITHUB_REPO}"
 gh repo clone "$GITHUB_REPO" "$REPO" -- --depth=50
 chown -R daytona:daytona "$REPO"
 git config --global --add safe.directory "$REPO"
-# Configure git to use the PAT for push/fetch (gh clone doesn't persist credentials)
-git config --global credential.helper store
-printf "protocol=https\nhost=github.com\nusername=x-access-token\npassword=${GITHUB_TOKEN}\n" | git credential approve
+# Configure git credentials for both root and daytona user
+# Root needs it for entrypoint git ops, daytona needs it for builder push/fetch
+for GHOME in /root /home/daytona; do
+  git config --file "${GHOME}/.gitconfig" credential.helper store
+  git config --file "${GHOME}/.gitconfig" --add safe.directory "$REPO"
+  printf "https://x-access-token:${GITHUB_TOKEN}@github.com\n" > "${GHOME}/.git-credentials"
+  chmod 600 "${GHOME}/.git-credentials"
+done
+chown daytona:daytona /home/daytona/.gitconfig /home/daytona/.git-credentials
 cd "$REPO"
 
 # ---------------------------------------------------------------------------
