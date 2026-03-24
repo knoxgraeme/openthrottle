@@ -329,8 +329,9 @@ if [[ "$AGENT" == "claude" ]] && [[ -d "/opt/openthrottle/plugins" ]]; then
   PRT_PATH="${CACHE_DIR}/claude-code-plugins/pr-review-toolkit/${PRT_VERSION}"
 
   mkdir -p "$CE_PATH" "$PRT_PATH"
-  cp -r /opt/openthrottle/plugins/compound-engineering/* "$CE_PATH/"
-  cp -r /opt/openthrottle/plugins/pr-review-toolkit/* "$PRT_PATH/"
+  # Use rsync to include dotfiles (.claude-plugin/) which cp -r * misses
+  rsync -a /opt/openthrottle/plugins/compound-engineering/ "$CE_PATH/"
+  rsync -a /opt/openthrottle/plugins/pr-review-toolkit/ "$PRT_PATH/"
 
   # Write installed_plugins.json so Claude Code discovers them
   NOW=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
