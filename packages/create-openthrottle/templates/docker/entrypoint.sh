@@ -40,6 +40,9 @@ log "Cloning ${GITHUB_REPO}"
 gh repo clone "$GITHUB_REPO" "$REPO" -- --depth=50
 chown -R daytona:daytona "$REPO"
 git config --global --add safe.directory "$REPO"
+# Configure git to use the PAT for push/fetch (gh clone doesn't persist credentials)
+git config --global credential.helper store
+printf "protocol=https\nhost=github.com\nusername=x-access-token\npassword=${GITHUB_TOKEN}\n" | git credential approve
 cd "$REPO"
 
 # ---------------------------------------------------------------------------
