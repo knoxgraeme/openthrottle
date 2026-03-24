@@ -320,18 +320,21 @@ if [[ "$AGENT" == "claude" ]] && [[ -d "/opt/openthrottle/plugins" ]]; then
   CACHE_DIR="${PLUGINS_DIR}/cache"
   mkdir -p "$CACHE_DIR"
 
+  # compound-engineering is a monorepo — the actual plugin is nested
+  CE_SRC="/opt/openthrottle/plugins/compound-engineering/plugins/compound-engineering"
+  PRT_SRC="/opt/openthrottle/plugins/pr-review-toolkit"
+
   # Read version from each plugin's plugin.json
-  CE_VERSION=$(jq -r '.version' /opt/openthrottle/plugins/compound-engineering/.claude-plugin/plugin.json 2>/dev/null || echo "0.0.0")
-  PRT_VERSION=$(jq -r '.version' /opt/openthrottle/plugins/pr-review-toolkit/.claude-plugin/plugin.json 2>/dev/null || echo "0.0.0")
+  CE_VERSION=$(jq -r '.version' "${CE_SRC}/.claude-plugin/plugin.json" 2>/dev/null || echo "0.0.0")
+  PRT_VERSION=$(jq -r '.version' "${PRT_SRC}/.claude-plugin/plugin.json" 2>/dev/null || echo "0.0.0")
 
   # Copy plugins into Claude Code's cache directory structure
   CE_PATH="${CACHE_DIR}/every-marketplace/compound-engineering/${CE_VERSION}"
   PRT_PATH="${CACHE_DIR}/claude-code-plugins/pr-review-toolkit/${PRT_VERSION}"
 
   mkdir -p "$CE_PATH" "$PRT_PATH"
-  # Use rsync to include dotfiles (.claude-plugin/) which cp -r * misses
-  rsync -a /opt/openthrottle/plugins/compound-engineering/ "$CE_PATH/"
-  rsync -a /opt/openthrottle/plugins/pr-review-toolkit/ "$PRT_PATH/"
+  rsync -a "${CE_SRC}/" "$CE_PATH/"
+  rsync -a "${PRT_SRC}/" "$PRT_PATH/"
 
   # Write installed_plugins.json so Claude Code discovers them
   NOW=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
