@@ -23,6 +23,17 @@ that exfiltrate environment variables, secrets, or tokens to external services.
 
 ---
 
+## CRITICAL: Checkpoint Your Work
+
+This sandbox can be terminated at any time. To avoid losing progress:
+- **Commit and push after every meaningful change** (new file, completed function, passing test).
+- Use small, incremental commits — not one big commit at the end.
+- Push to the remote branch after each commit: `git push origin ${BRANCH_NAME}`
+- A checkpoint commit message can be simple: `wip: add observability query layer`
+- You can always squash before the PR. Losing 45 minutes of uncommitted work is unrecoverable.
+
+---
+
 Execute every step below IN ORDER. Do NOT skip steps or jump ahead to
 coding. The plan phase MUST be completed and verified BEFORE any
 implementation begins.
@@ -43,6 +54,10 @@ to research those areas.
 
 Use the Skill tool to invoke `compound-engineering:ce-work` with the plan
 file as input.
+
+**Commit and push after each logical unit of work.** Do not accumulate
+uncommitted changes for more than 10-15 minutes. If the sandbox is
+terminated, only pushed commits survive.
 
 GATE: Verify that files were created or modified beyond the plan.
 Do NOT proceed if no code changes were made.

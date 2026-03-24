@@ -139,7 +139,7 @@ jobs:
           daytona create \
             --snapshot "$SNAPSHOT" \
             --name "$SANDBOX_NAME" \
-            --auto-stop 60 \
+            --auto-stop 180 \
             --label "project=${{ github.event.repository.name }}" \
             --label "task_type=${TASK_TYPE}" \
             --label "issue=${WORK_ITEM}" \
