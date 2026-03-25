@@ -129,7 +129,7 @@ fi
 # ---------------------------------------------------------------------------
 if [[ "$AGENT" == "claude" ]]; then
   log "Updating Claude Code to latest..."
-  npm update -g @anthropic-ai/claude-code 2>&1 | tail -3
+  npm update -g @anthropic-ai/claude-code 2>&1 | tail -3 || log "WARNING: Claude Code update failed, using existing version"
   log "Claude Code version: $(claude --version 2>/dev/null || echo 'unknown')"
 fi
 
