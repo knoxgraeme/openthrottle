@@ -125,6 +125,15 @@ if [[ -n "$POST_BOOTSTRAP" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 4b. Update Claude Code to latest (base image may be outdated)
+# ---------------------------------------------------------------------------
+if [[ "$AGENT" == "claude" ]]; then
+  log "Updating Claude Code to latest..."
+  npm update -g @anthropic-ai/claude-code 2>&1 | tail -3
+  log "Claude Code version: $(claude --version 2>/dev/null || echo 'unknown')"
+fi
+
+# ---------------------------------------------------------------------------
 # 5. Configure agent settings (per-agent)
 # ---------------------------------------------------------------------------
 log "Configuring agent settings (${AGENT})"
