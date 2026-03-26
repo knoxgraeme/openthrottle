@@ -34,7 +34,7 @@ COPY prompts/ /opt/openthrottle/prompts/
 
 # Agent SDK orchestrator (TypeScript) — replaces claude -p for claude runtime
 COPY orchestrator/ /opt/openthrottle/orchestrator/
-RUN cd /opt/openthrottle/orchestrator && npm install --production && npm run build
+RUN cd /opt/openthrottle/orchestrator && npm install && npm run build && npm prune --production
 
 RUN chmod +x /opt/openthrottle/*.sh /opt/openthrottle/hooks/*.sh /opt/openthrottle/git-hooks/*
 
