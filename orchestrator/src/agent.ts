@@ -156,7 +156,7 @@ export async function invokeAgent(opts: InvokeOptions): Promise<AgentResult> {
         (message as any).type === "system" &&
         (message as any).subtype === "init"
       ) {
-        const initSessionId = (message as any).session_id ?? (message as any).data?.session_id;
+        const initSessionId = (message as any).session_id;
         if (initSessionId) {
           result.sessionId = initSessionId;
           // Persist for cross-sandbox resume
@@ -172,15 +172,18 @@ export async function invokeAgent(opts: InvokeOptions): Promise<AgentResult> {
       // Capture final result
       if ("result" in message) {
         const r = message as any;
+        const isError = r.is_error ?? false;
         result = {
           sessionId: result.sessionId,
-          costUsd: r.total_cost_usd ?? r.cost_usd ?? null,
+          costUsd: r.total_cost_usd ?? null,
           numTurns: r.num_turns ?? null,
           inputTokens: r.usage?.input_tokens ?? null,
           outputTokens: r.usage?.output_tokens ?? null,
           durationApiMs: r.duration_api_ms ?? null,
-          resultText: r.result ?? "",
-          isError: r.is_error ?? false,
+          resultText: isError
+            ? (r.errors?.join("\n") ?? "Agent error (no details)")
+            : (r.result ?? ""),
+          isError,
         };
       }
     }
