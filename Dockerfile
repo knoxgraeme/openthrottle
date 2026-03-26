@@ -32,6 +32,10 @@ COPY git-hooks/ /opt/openthrottle/git-hooks/
 COPY skills/ /opt/openthrottle/skills/
 COPY prompts/ /opt/openthrottle/prompts/
 
+# Agent SDK orchestrator (TypeScript) — replaces claude -p for claude runtime
+COPY orchestrator/ /opt/openthrottle/orchestrator/
+RUN cd /opt/openthrottle/orchestrator && npm install --production && npm run build
+
 RUN chmod +x /opt/openthrottle/*.sh /opt/openthrottle/hooks/*.sh /opt/openthrottle/git-hooks/*
 
 ENTRYPOINT ["/opt/openthrottle/entrypoint.sh"]

@@ -159,38 +159,63 @@ case "$AGENT" in
       STOP_HOOKS=$(echo "$STOP_CMDS" | jq '[{"hooks": .}]')
     fi
 
-    # Build base settings with hooks
-    jq -n \
-      --argjson stop_hooks "$STOP_HOOKS" \
-      '{
-        "permissions": {"allow": [], "deny": []},
-        "hooks": {
-          "PreToolUse": [
-            {"matcher": "Bash", "hooks": ["/opt/openthrottle/hooks/block-push-to-main.sh"]}
-          ],
-          "PostToolUse": [
-            {"matcher": "Bash", "hooks": ["/opt/openthrottle/hooks/log-commands.sh"]},
-            {"matcher": "Write|Edit", "hooks": ["/opt/openthrottle/hooks/auto-format.sh"]}
-          ],
-          "Stop": $stop_hooks
-        }
+    # Build base settings.
+    # When using the Agent SDK orchestrator, hooks run in-process via the SDK
+    # and are NOT needed in settings.json. For direct claude -p usage (fallback),
+    # the bash hook scripts are still wired here.
+    if [[ -f /opt/openthrottle/orchestrator/dist/index.js ]]; then
+      # Agent SDK path: minimal settings — hooks handled in-process by orchestrator
+      jq -n '{
+        "permissions": {"allow": [], "deny": []}
       }' > "${SETTINGS_DIR}/settings.json"
+    else
+      # Legacy claude -p path: hooks via bash scripts
+      jq -n \
+        --argjson stop_hooks "$STOP_HOOKS" \
+        '{
+          "permissions": {"allow": [], "deny": []},
+          "hooks": {
+            "PreToolUse": [
+              {"matcher": "Bash", "hooks": ["/opt/openthrottle/hooks/block-push-to-main.sh"]}
+            ],
+            "PostToolUse": [
+              {"matcher": "Bash", "hooks": ["/opt/openthrottle/hooks/log-commands.sh"]},
+              {"matcher": "Write|Edit", "hooks": ["/opt/openthrottle/hooks/auto-format.sh"]}
+            ],
+            "Stop": $stop_hooks
+          }
+        }' > "${SETTINGS_DIR}/settings.json"
+    fi
 
-    # Merge default MCP servers (Telegram, Context7)
-    DEFAULT_MCPS=$(jq -n '{
-      "telegram": {
-        "command": "npx",
-        "args": ["-y", "@punkpeye/telegram-mcp"],
-        "env": {
-          "TELEGRAM_BOT_TOKEN": env.TELEGRAM_BOT_TOKEN,
-          "TELEGRAM_CHAT_ID": env.TELEGRAM_CHAT_ID
+    # Merge default MCP servers.
+    # When using the Agent SDK orchestrator, Telegram is handled by the custom
+    # ask_human tool in-process — no MCP server needed. Context7 and project
+    # MCPs are passed programmatically via the SDK.
+    if [[ -f /opt/openthrottle/orchestrator/dist/index.js ]]; then
+      # Agent SDK path: only context7 (orchestrator adds telegram + project MCPs)
+      DEFAULT_MCPS=$(jq -n '{
+        "context7": {
+          "command": "npx",
+          "args": ["-y", "@upstash/context7-mcp"]
         }
-      },
-      "context7": {
-        "command": "npx",
-        "args": ["-y", "@upstash/context7-mcp"]
-      }
-    }')
+      }')
+    else
+      # Legacy path: all MCP servers in settings.json
+      DEFAULT_MCPS=$(jq -n '{
+        "telegram": {
+          "command": "npx",
+          "args": ["-y", "@punkpeye/telegram-mcp"],
+          "env": {
+            "TELEGRAM_BOT_TOKEN": env.TELEGRAM_BOT_TOKEN,
+            "TELEGRAM_CHAT_ID": env.TELEGRAM_CHAT_ID
+          }
+        },
+        "context7": {
+          "command": "npx",
+          "args": ["-y", "@upstash/context7-mcp"]
+        }
+      }')
+    fi
 
     # Merge project-specific MCP servers, resolving "from-env" placeholders
     PROJECT_MCPS=$(yq -o=json '.mcp_servers // {}' "$CONFIG") || {

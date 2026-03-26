@@ -383,6 +383,12 @@ if [[ -n "${SUPABASE_ACCESS_TOKEN:-}" ]] && command -v npx &>/dev/null; then
   fi
 fi
 
+# If using Claude via Agent SDK, delegate to TypeScript orchestrator
+if [[ "$AGENT_RUNTIME" == "claude" ]] && [[ -f /opt/openthrottle/orchestrator/dist/index.js ]]; then
+  log "Delegating to Agent SDK orchestrator"
+  exec node /opt/openthrottle/orchestrator/dist/index.js
+fi
+
 case "$TASK_TYPE" in
   prd)        handle_prd "$WORK_ITEM" ;;
   bug)        handle_bug "$WORK_ITEM" ;;
