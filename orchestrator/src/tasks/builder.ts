@@ -249,26 +249,16 @@ export async function handleFixes(ctx: TaskContext): Promise<void> {
 
   let branchName: string;
   try {
-    branchName = JSON.parse(
-      execFileSync(
-        "gh",
-        ["pr", "view", prNumber, "--repo", ctx.githubRepo, "--json", "headRefName", "--jq", ".headRefName"],
-        { encoding: "utf-8", timeout: 30_000 },
-      ).trim(),
-    );
+    // gh --jq returns a plain string, not JSON-quoted
+    branchName = execFileSync(
+      "gh",
+      ["pr", "view", prNumber, "--repo", ctx.githubRepo, "--json", "headRefName", "--jq", ".headRefName"],
+      { encoding: "utf-8", timeout: 30_000 },
+    ).trim();
   } catch {
-    // Try without JSON.parse (gh --jq returns plain string)
-    try {
-      branchName = execFileSync(
-        "gh",
-        ["pr", "view", prNumber, "--repo", ctx.githubRepo, "--json", "headRefName", "--jq", ".headRefName"],
-        { encoding: "utf-8", timeout: 30_000 },
-      ).trim();
-    } catch {
-      log(`FATAL: Could not fetch PR #${prNumber} metadata`);
-      await notify(`Fix failed — could not fetch PR #${prNumber}`);
-      return;
-    }
+    log(`FATAL: Could not fetch PR #${prNumber} metadata`);
+    await notify(`Fix failed — could not fetch PR #${prNumber}`);
+    return;
   }
 
   log(`Fixing PR #${prNumber} on branch ${branchName}`);

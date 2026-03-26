@@ -101,15 +101,22 @@ async function main(): Promise<void> {
     log(`FATAL: Unhandled error — ${err?.message ?? err}`);
     await notify(`Orchestrator failed: ${taskType} #${workItem} — ${err?.message ?? err}`);
 
-    // Attempt to transition back to failed state
+    // Attempt to transition back to failed/queued state
     try {
       const { taskTransition } = await import("./lib/github.js");
+      const { prEdit } = await import("./lib/github.js");
       switch (taskType) {
         case "prd":
           taskTransition(workItem, "prd-running", "prd-failed");
           break;
         case "bug":
           taskTransition(workItem, "bug-running", "bug-failed");
+          break;
+        case "review":
+          prEdit(workItem, { removeLabel: "reviewing", addLabel: "needs-review" });
+          break;
+        case "investigation":
+          taskTransition(workItem, "investigating", "needs-investigation");
           break;
       }
     } catch {

@@ -1,4 +1,5 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
+import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import type { TaskContext, AgentResult, McpServerConfig } from "./types.js";
 import {
   guardHook,
@@ -48,18 +49,20 @@ export async function invokeAgent(opts: InvokeOptions): Promise<AgentResult> {
   const autoFormatHook = createAutoFormatHook(ctx.repo);
 
   // Build stop hooks from lint/test commands.
-  // Stop hooks run shell commands — wrap them as HookCallbacks that exec the command.
-  const stopHookCallbacks: Array<(input: any, toolUseId: string | undefined, options: any) => Promise<any>> = [];
+  // Stop hooks fire when the agent wants to stop. If lint/test fails, we
+  // return stopReason to prevent stopping (so the agent can fix the issue).
+  const stopHookCallbacks: HookCallback[] = [];
   for (const cmd of [ctx.config.lint, ctx.config.test].filter(Boolean)) {
-    stopHookCallbacks.push(async () => {
+    const hookFn: HookCallback = async (_input, _toolUseId, _options) => {
       const { execSync } = await import("node:child_process");
       try {
         execSync(cmd, { cwd: ctx.repo, timeout: 120_000, stdio: "pipe" });
       } catch (err: any) {
-        return { decision: "block", reason: `Stop hook failed: ${cmd}\n${err?.stderr?.toString() ?? err?.message}` };
+        return { stopReason: `Stop hook failed: ${cmd}\n${err?.stderr?.toString().slice(0, 500) ?? err?.message}` };
       }
       return {};
-    });
+    };
+    stopHookCallbacks.push(hookFn);
   }
 
   // Determine allowed tools
@@ -145,6 +148,7 @@ export async function invokeAgent(opts: InvokeOptions): Promise<AgentResult> {
         },
         ...(session.isResume ? { resume: session.sessionId } : {}),
         settingSources: ["project"],
+        abortController: controller,
       },
     })) {
       // Capture session ID from init message

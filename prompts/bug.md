@@ -64,7 +64,7 @@ Do NOT proceed if no code changes were made.
 
 ### Escalation during implementation
 
-**P0 blocked:** Use the Skill tool to invoke `phone-a-friend` to send and wait:
+**P0 blocked:** Use the `ask_human` tool to send a message and wait for a reply:
 ```
 P0 Blocked — ${TASK_ID}
 Task: {description}
@@ -73,8 +73,8 @@ Reply with: fix hint / "skip" / "abort"
 ```
 Do not continue past P0s until resolved.
 
-**P1 blocked:** Use the Skill tool to invoke `phone-a-friend` to notify
-(no wait). Continue working.
+**P1 blocked:** Use the `ask_human` tool to notify (set `wait_for_reply` to false).
+Continue working.
 
 **P2 blocked:** Note in PR only.
 
@@ -108,7 +108,7 @@ DECLOG
 )"
 ```
 
-Use the Skill tool to invoke `phone-a-friend` to notify (no wait):
+Use the `ask_human` tool to notify (set `wait_for_reply` to false):
 ```
 Bug Fix Ready — ${TITLE}
 <PR_URL>

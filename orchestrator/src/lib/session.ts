@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, utimesSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, utimesSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { SessionInfo } from "../types.js";
@@ -26,6 +26,9 @@ export function resolveSession(
       log(`Resuming session from volume: ${existingId}`);
       return { sessionId: existingId, isResume: true };
     }
+    // Empty session file — delete it and start fresh
+    log(`WARNING: Empty session file for ${taskKey} — starting fresh`);
+    try { unlinkSync(sessionFile); } catch { /* ignore */ }
   }
 
   // Create new session
