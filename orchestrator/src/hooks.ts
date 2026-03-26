@@ -13,7 +13,7 @@ const SECRET_VARS_PATTERN =
 const OUTBOUND_TOOLS_PATTERN =
   /\b(curl|wget|nc|ncat|netcat|python.*http|node.*http|fetch|gh\s+api)\b/;
 
-export const guardHook: HookCallback = async (input) => {
+export const guardHook: HookCallback = async (input, _toolUseId, _options) => {
   const command = (input as any).tool_input?.command ?? "";
   if (!command) return {};
 
@@ -124,7 +124,7 @@ export function createLogCommandsHook(
   mkdirSync(logDir, { recursive: true });
   const logPath = join(logDir, "bash-commands.log");
 
-  return async (input) => {
+  return async (input, _toolUseId, _options) => {
     const command = (input as any).tool_input?.command ?? "";
     const exitCode =
       (input as any).tool_response?.exit_code ?? "?";
@@ -143,7 +143,7 @@ export function createLogCommandsHook(
 // ---------------------------------------------------------------------------
 
 export function createAutoFormatHook(repoDir: string): HookCallback {
-  return async (input) => {
+  return async (input, _toolUseId, _options) => {
     const filePath: string =
       (input as any).tool_input?.file_path ?? "";
     if (!filePath) return {};

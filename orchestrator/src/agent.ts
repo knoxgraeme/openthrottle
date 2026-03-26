@@ -1,6 +1,6 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
-import type { TaskContext, AgentResult, McpServerConfig } from "./types.js";
+import type { TaskContext, AgentResult, ProjectMcpServerConfig } from "./types.js";
 import {
   guardHook,
   createLogCommandsHook,
@@ -18,7 +18,7 @@ export interface InvokeOptions {
   timeoutMs: number;
   maxTurns?: number;
   maxBudgetUsd?: number;
-  extraMcpServers?: Record<string, McpServerConfig>;
+  extraMcpServers?: Record<string, ProjectMcpServerConfig>;
 }
 
 export async function invokeAgent(opts: InvokeOptions): Promise<AgentResult> {

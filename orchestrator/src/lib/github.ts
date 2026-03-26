@@ -63,7 +63,7 @@ export function taskReadComments(id: string, filter?: string): string {
         "--json",
         "comments",
         "--jq",
-        `[.comments[] | select(.body | contains("${filter}"))] | last | .body`,
+        `[.comments[] | select(.body | contains(${JSON.stringify(filter)}))] | last | .body`,
       ]);
     }
     return gh([

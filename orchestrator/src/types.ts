@@ -9,7 +9,7 @@ export interface OpenThrottleConfig {
   snapshot: string;
   notifications: string;
   post_bootstrap: string[];
-  mcp_servers: Record<string, McpServerConfig>;
+  mcp_servers: Record<string, ProjectMcpServerConfig>;
   limits: {
     max_turns: number;
     max_budget_usd: number;
@@ -22,7 +22,7 @@ export interface OpenThrottleConfig {
   env_files?: Record<string, string[]>;
 }
 
-export interface McpServerConfig {
+export interface ProjectMcpServerConfig {
   command: string;
   args: string[];
   env?: Record<string, string>;

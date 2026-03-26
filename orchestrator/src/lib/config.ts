@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { parse } from "yaml";
 import type { OpenThrottleConfig } from "../types.js";
 
@@ -19,6 +19,10 @@ const DEFAULTS: OpenThrottleConfig = {
 };
 
 export function loadConfig(configPath: string): OpenThrottleConfig {
+  if (!existsSync(configPath)) {
+    console.error(`FATAL: ${configPath} not found — using defaults`);
+    return { ...DEFAULTS };
+  }
   const raw = readFileSync(configPath, "utf-8");
   const parsed = parse(raw) as Partial<OpenThrottleConfig>;
   return {
