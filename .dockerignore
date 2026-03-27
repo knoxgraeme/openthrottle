@@ -10,3 +10,6 @@
 !git-hooks/
 !skills/*/SKILL.md
 !prompts/
+!orchestrator/
+orchestrator/node_modules/
+orchestrator/dist/
