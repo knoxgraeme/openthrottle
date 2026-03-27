@@ -249,6 +249,12 @@ notify "Reviewer online: ${TASK_TYPE} #${WORK_ITEM} (${AGENT_RUNTIME})"
 # Prune session files older than 7 days
 find "$SESSIONS_DIR" -name '*.id' -mtime +7 -delete 2>/dev/null || true
 
+# If using Claude via Agent SDK, delegate to TypeScript orchestrator
+if [[ "$AGENT_RUNTIME" == "claude" ]] && [[ -f /opt/openthrottle/orchestrator/dist/index.js ]]; then
+  log "Delegating to Agent SDK orchestrator"
+  exec node /opt/openthrottle/orchestrator/dist/index.js
+fi
+
 case "$TASK_TYPE" in
   review)        review_pr "$WORK_ITEM" ;;
   investigation) investigate_bug "$WORK_ITEM" ;;

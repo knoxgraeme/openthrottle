@@ -23,6 +23,7 @@ on:
       - git-hooks/**
       - skills/**/SKILL.md
       - prompts/**
+      - orchestrator/**
   workflow_dispatch:
 
 permissions:

@@ -116,7 +116,7 @@ jobs:
             --snapshot "${{ steps.config.outputs.snapshot }}" \
             --auto-delete 0 \
             --auto-stop 60 \
-            --cpu 2 --memory 4096 --disk 10 \
+            --cpu 3 --memory 8192 --disk 10 \
             --label project=${{ github.event.repository.name }} \
             --label task_type="${{ steps.work.outputs.task_type }}" \
             --label issue="${{ steps.work.outputs.item }}" \
