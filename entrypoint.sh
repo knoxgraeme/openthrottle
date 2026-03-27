@@ -440,6 +440,11 @@ log "Task: ${TASK_TYPE} #${WORK_ITEM} (agent: ${AGENT})"
 export SANDBOX_HOME REPO BASE_BRANCH AGENT MAX_TURNS MAX_BUDGET_USD TASK_TIMEOUT
 export AGENT_RUNTIME="$AGENT"
 
+# Strip newlines from auth tokens — GitHub secrets or Daytona --env can
+# introduce line breaks that cause "invalid header value" errors.
+export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY//$'\n'/}"
+export CLAUDE_CODE_OAUTH_TOKEN="${CLAUDE_CODE_OAUTH_TOKEN//$'\n'/}"
+
 case "$TASK_TYPE" in
   prd|bug|review-fix)
     exec gosu daytona /opt/openthrottle/run-builder.sh
