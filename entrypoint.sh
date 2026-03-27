@@ -188,17 +188,12 @@ case "$AGENT" in
     fi
 
     # Merge default MCP servers.
-    # When using the Agent SDK orchestrator, Telegram is handled by the custom
-    # ask_human tool in-process — no MCP server needed. Context7 and project
-    # MCPs are passed programmatically via the SDK.
+    # When using the Agent SDK orchestrator, ALL MCP servers are passed
+    # programmatically via the SDK — nothing goes in settings.json to
+    # avoid duplicate processes.
     if [[ -f /opt/openthrottle/orchestrator/dist/index.js ]]; then
-      # Agent SDK path: only context7 (orchestrator adds telegram + project MCPs)
-      DEFAULT_MCPS=$(jq -n '{
-        "context7": {
-          "command": "npx",
-          "args": ["-y", "@upstash/context7-mcp"]
-        }
-      }')
+      # Agent SDK path: no default MCPs (orchestrator manages them all)
+      DEFAULT_MCPS=$(jq -n '{}')
     else
       # Legacy path: all MCP servers in settings.json
       DEFAULT_MCPS=$(jq -n '{
