@@ -683,19 +683,20 @@ async function handleCreated(
     return;
   }
 
+  const ticket = store.getByIssueId(issue.id)!;
+  const env = baseSandboxEnv(cfg, {
+    ticket,
+    linearAccessToken: linear.accessToken,
+    taskType,
+    run,
+  });
+  let sandbox;
   try {
-    const ticket = store.getByIssueId(issue.id)!;
-    const sandbox = await createForTicket(daytona, cfg, {
+    sandbox = await createForTicket(daytona, cfg, {
       issueIdentifier: issue.identifier,
-      env: baseSandboxEnv(cfg, {
-        ticket,
-        linearAccessToken: linear.accessToken,
-        taskType,
-        run,
-      }),
+      env,
     });
     store.setSandboxId(issue.id, sandbox.id);
-    await reportCreatedWorkspace(cfg, store, linear, ticket, sandbox.id);
   } catch (error) {
     const partiallyCreated = await findSandboxForTicket(daytona, issue.identifier).catch(
       () => undefined
@@ -719,6 +720,35 @@ async function handleCreated(
       ticketState: "error",
     });
     throw error;
+  }
+
+  try {
+    await startTask(sandbox, {
+      env,
+      taskTimeoutSeconds: cfg.taskTimeout,
+    });
+  } catch (error) {
+    const message = sanitizeText(`Failed to start ${taskType}: ${String(error)}`);
+    store.finishRun({
+      runId: run.id,
+      status: "failed",
+      failureTail: message,
+      ticketState: "error",
+    });
+    await tryPostError(linear, sessionId, message);
+    return;
+  }
+
+  await reportCreatedWorkspace(cfg, store, linear, ticket, sandbox.id);
+  try {
+    await agentActivityCreate(linear, {
+      sessionId,
+      type: "action",
+      action: "Started",
+      parameter: `${taskType} run on ${ticket.branch}`,
+    });
+  } catch (error) {
+    console.error(`[linear] ${taskType} started but its activity could not be posted:`, error);
   }
 }
 

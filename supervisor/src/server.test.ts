@@ -83,9 +83,15 @@ describe("createServer lifecycle", () => {
     const linear: LinearClient = { accessToken: "oauth", fetch: linearFetch };
 
     let createParams: { envVars?: Record<string, string> } | undefined;
+    const executeSessionCommand = vi.fn(async () => undefined);
     const sandbox = {
       id: "sandbox-1",
       state: "started",
+      updateEnv: vi.fn(async () => undefined),
+      process: {
+        createSession: vi.fn(async () => undefined),
+        executeSessionCommand,
+      },
       stop: vi.fn(async () => undefined),
       delete: vi.fn(async () => undefined),
     };
@@ -140,6 +146,7 @@ describe("createServer lifecycle", () => {
     expect(createdResponse.status).toBe(200);
     await Promise.all(background.splice(0));
     expect(daytona.create).toHaveBeenCalledTimes(1);
+    expect(executeSessionCommand).toHaveBeenCalledOnce();
     expect(store.getByIssueId("issue-1")).toMatchObject({
       agent: "codex",
       sandbox_id: "sandbox-1",
