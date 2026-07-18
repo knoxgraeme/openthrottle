@@ -485,25 +485,29 @@ export function createServer(deps: ServerDeps): Hono {
 
     const linear = await getLinearClient();
     if (linear) {
-      const costLine = costUsd === undefined ? "" : ` Cost: $${costUsd.toFixed(4)}.`;
-      if (exitCode === 0) {
-        await agentActivityCreate(linear, {
-          sessionId: ticket.linear_session_id,
-          type: "response",
-          body: `OpenThrottle ${run.task_type} run finished successfully.${prUrl ? ` PR: ${prUrl}` : ""}${costLine}`,
-        });
-      } else {
-        await agentActivityCreate(linear, {
-          sessionId: ticket.linear_session_id,
-          type: "error",
-          body: `OpenThrottle ${run.task_type} run failed (exit ${exitCode}).${costLine}${failureTail ? `\n\nLast output:\n\`\`\`\n${failureTail}\n\`\`\`` : ""}`,
-        });
-      }
-      if (prUrl) {
-        await agentSessionUpdate(linear, {
-          sessionId: ticket.linear_session_id,
-          addedExternalUrls: [{ label: "Pull Request", url: prUrl }],
-        });
+      try {
+        const costLine = costUsd === undefined ? "" : ` Cost: $${costUsd.toFixed(4)}.`;
+        if (exitCode === 0) {
+          await agentActivityCreate(linear, {
+            sessionId: ticket.linear_session_id,
+            type: "response",
+            body: `OpenThrottle ${run.task_type} run finished successfully.${prUrl ? ` PR: ${prUrl}` : ""}${costLine}`,
+          });
+        } else {
+          await agentActivityCreate(linear, {
+            sessionId: ticket.linear_session_id,
+            type: "error",
+            body: `OpenThrottle ${run.task_type} run failed (exit ${exitCode}).${costLine}${failureTail ? `\n\nLast output:\n\`\`\`\n${failureTail}\n\`\`\`` : ""}`,
+          });
+        }
+        if (prUrl) {
+          await agentSessionUpdate(linear, {
+            sessionId: ticket.linear_session_id,
+            addedExternalUrls: [{ label: "Pull Request", url: prUrl }],
+          });
+        }
+      } catch (error) {
+        console.error(`[linear] ${run.task_type} completed but its notification could not be posted:`, error);
       }
     }
 

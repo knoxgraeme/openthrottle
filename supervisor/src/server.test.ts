@@ -803,7 +803,7 @@ describe("createServer lifecycle", () => {
     expect(linearRequests.some((request) => request.includes("Merged"))).toBe(true);
   });
 
-  it("starts a fresh review after a successful review-fix callback", async () => {
+  it("starts a fresh review after a successful review-fix callback despite a Linear notification outage", async () => {
     db = openDb(":memory:");
     const store = createTicketStore(db);
     store.upsert({
@@ -841,8 +841,12 @@ describe("createServer lifecycle", () => {
       "fetch",
       vi.fn(async () => Response.json([{ state: "CHANGES_REQUESTED" }]))
     );
+    let activityAttempts = 0;
     const linearFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       const query = String(JSON.parse(String(init?.body)).query);
+      if (query.includes("AgentActivityCreate") && activityAttempts++ === 0) {
+        return Response.json({ errors: [{ message: "Linear unavailable" }] });
+      }
       return Response.json({
         data: query.includes("AgentSessionUpdate")
           ? { agentSessionUpdate: { success: true } }
@@ -872,6 +876,7 @@ describe("createServer lifecycle", () => {
     await Promise.all(background.splice(0));
 
     expect(response.status).toBe(200);
+    expect(activityAttempts).toBeGreaterThan(1);
     expect(envUpdates.at(-1)).toMatchObject({ TASK_TYPE: "review", PR_NUMBER: "15" });
     const ticket = store.getByIssueId("issue-rereview")!;
     expect(ticket.run_id).not.toBe("run-rereview");

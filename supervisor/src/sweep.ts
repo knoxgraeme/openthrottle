@@ -91,7 +91,9 @@ async function deleteOrphanSandboxes(
 
   for (const sandbox of sandboxes) {
     const ticket = store.getBySandboxId(sandbox.id);
-    if (ticket && ticket.state === "active") continue; // known, still in use
+    if (ticket && ticket.state !== "closed" && ticket.state !== "expired") {
+      continue; // active, stopped, and error workspaces remain reusable
+    }
 
     // A sandbox can become visible to list() before handleCreated persists its
     // ID. Never sweep inside that provisioning window. Missing timestamps are

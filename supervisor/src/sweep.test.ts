@@ -31,6 +31,12 @@ describe("runSweep", () => {
       });
     addTicket("stale", "sandbox-stale");
     addTicket("timed", null);
+    addTicket("stopped", "known-stopped");
+    addTicket("errored", "known-errored");
+    addTicket("closed", "known-closed");
+    store.setState("stopped", "stopped");
+    store.setState("errored", "error");
+    store.setState("closed", "closed");
     db.prepare("UPDATE tickets SET created_at = ? WHERE linear_issue_id = ?").run(
       "2020-01-01T00:00:00.000Z",
       "stale"
@@ -56,6 +62,21 @@ describe("runSweep", () => {
       createdAt: new Date().toISOString(),
       labels: { ticket: "NEW-1" },
     } as unknown as Sandbox;
+    const knownStopped = {
+      id: "known-stopped",
+      createdAt: "2020-01-01T00:00:00.000Z",
+      labels: { ticket: "STOPPED" },
+    } as unknown as Sandbox;
+    const knownErrored = {
+      id: "known-errored",
+      createdAt: "2020-01-01T00:00:00.000Z",
+      labels: { ticket: "ERRORED" },
+    } as unknown as Sandbox;
+    const knownClosed = {
+      id: "known-closed",
+      createdAt: "2020-01-01T00:00:00.000Z",
+      labels: { ticket: "CLOSED" },
+    } as unknown as Sandbox;
     const deleteOrphan = vi.fn(async () => undefined);
     const daytona = {
       get: vi.fn(async () => staleSandbox),
@@ -63,6 +84,9 @@ describe("runSweep", () => {
       list: async function* () {
         yield oldOrphan;
         yield newOrphan;
+        yield knownStopped;
+        yield knownErrored;
+        yield knownClosed;
       },
     } as unknown as Daytona;
     const linearFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
@@ -79,8 +103,11 @@ describe("runSweep", () => {
     expect(store.getByIssueId("timed")?.state).toBe("error");
     expect(store.getByIssueId("stale")?.state).toBe("expired");
     expect(staleSandbox.delete).toHaveBeenCalledOnce();
-    expect(deleteOrphan).toHaveBeenCalledOnce();
+    expect(deleteOrphan).toHaveBeenCalledTimes(2);
     expect(deleteOrphan).toHaveBeenCalledWith(oldOrphan, 60, false);
+    expect(deleteOrphan).toHaveBeenCalledWith(knownClosed, 60, false);
+    expect(deleteOrphan).not.toHaveBeenCalledWith(knownStopped, 60, false);
+    expect(deleteOrphan).not.toHaveBeenCalledWith(knownErrored, 60, false);
     expect(
       db.prepare("SELECT count(*) AS count FROM webhook_deliveries").get()
     ).toMatchObject({ count: 0 });
