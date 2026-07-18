@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# safety/pre-push — installed via `git config core.hooksPath` by entrypoint.sh
+# (phase 3). Two independent checks, adapted from openthrottle v1
+# (git-hooks/pre-push):
+#
+#   1. Block any push whose remote ref is refs/heads/main or refs/heads/master.
+#   2. Refuse force / non-fast-forward pushes on any branch (history must
+#      only move forward on agent branches — the pushed branch is the human
+#      escape hatch, so it must never silently lose commits).
+#
+# This is defense-in-depth: the primary control is GitHub branch protection
+# on the target repo (documented in sandbox/README.md), which this hook
+# cannot see or enforce on its own. core.hooksPath points at this directory,
+# and .git/config is sealed immutable right after this is installed, so the
+# agent cannot `git config --unset core.hooksPath` to bypass it.
+
+set -euo pipefail
+
+zero="0000000000000000000000000000000000000000"
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  if [[ "$remote_ref" =~ ^refs/heads/(main|master)$ ]]; then
+    echo "BLOCKED: direct push to '${remote_ref#refs/heads/}' is not allowed." >&2
+    echo "Push your feature branch (git push origin HEAD) and open a PR instead." >&2
+    exit 1
+  fi
+
+  # Ref deletion (local_sha is all zeros) — nothing more to validate; a
+  # delete of main/master would already have been caught above.
+  if [[ "$local_sha" == "$zero" ]]; then
+    continue
+  fi
+
+  # New remote ref (remote_sha is all zeros) — first push of this branch,
+  # can't be a force-push.
+  if [[ "$remote_sha" == "$zero" ]]; then
+    continue
+  fi
+
+  # Existing remote ref: only allow if it's a fast-forward, i.e. the current
+  # remote tip is an ancestor of what we're about to push.
+  if ! git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
+    echo "BLOCKED: force-push (non-fast-forward) to '${remote_ref}' is not allowed." >&2
+    echo "Commit forward instead of rewriting history on agent branches." >&2
+    exit 1
+  fi
+done
+
+exit 0

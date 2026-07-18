@@ -1,0 +1,543 @@
+#!/usr/bin/env bash
+# entrypoint.sh — OpenThrottle sandbox entrypoint. Runs as root inside the
+# Daytona sandbox; all repo/agent work happens as the unprivileged `agent`
+# user via gosu. See docs/SPEC.md "Sandbox contract" for the 8-phase
+# contract this implements, and "Sandbox env contract" for every env var
+# referenced below.
+#
+# Invoked twice per ticket:
+#   - TASK_TYPE=implement : first run, right after the sandbox is created.
+#   - TASK_TYPE=resume    : supervisor re-execs this same script inside the
+#     already-running (or just-restarted) sandbox via the Daytona process
+#     exec API, with RESUME_MESSAGE set. Every phase below is written to be
+#     safe to re-run (idempotent) so the same script serves both cases.
+#
+# Never exits without posting a final Linear activity — see
+# post_final_activity() / the EXIT trap near the bottom of the "functions"
+# section.
+
+set -euo pipefail
+
+AGENT_USER="agent"
+AGENT_HOME="/home/agent"
+REPO_DIR="${AGENT_HOME}/repo"
+OT_DIR="${AGENT_HOME}/.ot"
+OPT_DIR="/opt/openthrottle"
+
+# =============================================================================
+# Functions (defined up front — the EXIT trap can fire at any point once
+# installed, and must be able to call post_final_activity() no matter how
+# early we abort).
+# =============================================================================
+
+log() {
+  printf '[entrypoint %s] %s\n' "$(date -u +%H:%M:%S)" "$1" >&2
+}
+
+# Strip a trailing newline/CR from a single-line secret value. Daytona env
+# plumbing / GitHub Actions secrets sometimes introduce a trailing newline
+# that breaks "Authorization: Bearer <token>" headers.
+strip_nl() {
+  local v="$1"
+  v="${v%$'\r'}"
+  v="${v%$'\n'}"
+  v="${v%$'\r'}"
+  printf '%s' "$v"
+}
+
+# Run a command as the `agent` user with a correct HOME/USER. gosu does not
+# reset the environment (unlike su -l), so HOME/USER are set explicitly.
+as_agent() {
+  gosu "$AGENT_USER" env HOME="$AGENT_HOME" USER="$AGENT_USER" bash -c "$1"
+}
+
+# Best-effort local sanitizer for the log tail posted to Linear on failure.
+# Mirrors runner/normalize.mjs's sanitizer (SPEC: redact env vars whose name
+# matches (TOKEN|KEY|SECRET|PASSWORD), plus a fixed set of token regexes).
+# Kept independent (not shelling out to node) so a failure that happens
+# before Node/the repo are even set up can still be sanitized and reported.
+sanitize_log() {
+  local text="$1"
+  local name value
+  while IFS='=' read -r name value; do
+    [[ "$name" =~ (TOKEN|KEY|SECRET|PASSWORD) ]] || continue
+    [[ -z "$value" ]] && continue
+    text="${text//$value/[REDACTED]}"
+  done < <(env)
+
+  text="$(printf '%s' "$text" | sed -E \
+    -e 's/ghp_[A-Za-z0-9_]+/[REDACTED]/g' \
+    -e 's/github_pat_[A-Za-z0-9_]+/[REDACTED]/g' \
+    -e 's/sk-[A-Za-z0-9_-]+/[REDACTED]/g' \
+    -e 's/lin_api_[A-Za-z0-9_]+/[REDACTED]/g' \
+    -e 's/Bearer [^ ]+/Bearer [REDACTED]/g')"
+  printf '%s' "$text"
+}
+
+# POST a single agentActivityCreate mutation to the Linear GraphQL API.
+# TODO(verify-linear-api): the Agent API is Developer Preview. Confirm the
+# mutation name, the AgentActivityCreateInput shape (agentSessionId vs
+# sessionId; content.type vs a top-level type; content.body vs body) against
+# current Linear docs before the first real run.
+post_linear_activity() {
+  local content_type="$1"
+  local body="$2"
+
+  if [[ -z "${LINEAR_ACCESS_TOKEN:-}" || -z "${LINEAR_SESSION_ID:-}" ]]; then
+    log "WARNING: missing LINEAR_ACCESS_TOKEN or LINEAR_SESSION_ID — cannot post final Linear activity"
+    return 0
+  fi
+
+  local payload http_code
+  payload="$(jq -n \
+    --arg sessionId "$LINEAR_SESSION_ID" \
+    --arg type "$content_type" \
+    --arg body "$body" \
+    '{
+      query: "mutation AgentActivityCreate($input: AgentActivityCreateInput!) { agentActivityCreate(input: $input) { success } }",
+      variables: { input: { agentSessionId: $sessionId, content: { type: $type, body: $body } } }
+    }' 2>/dev/null)" || {
+    log "WARNING: failed to build Linear activity payload"
+    return 0
+  }
+
+  http_code="$(curl -sS --max-time 15 \
+    -X POST "https://api.linear.app/graphql" \
+    -H "Authorization: Bearer ${LINEAR_ACCESS_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "$payload" \
+    -o /tmp/ot-linear-activity-response.json \
+    -w '%{http_code}' 2>/dev/null)" || http_code="curl_failed"
+
+  log "posted Linear activity (type=${content_type}, http=${http_code})"
+}
+
+FINAL_ACTIVITY_POSTED=0
+
+# Always runs on script exit (success or failure) — installed via `trap ...
+# EXIT` right after the minimum env vars it needs are validated. Guarantees
+# phase 8 of the SPEC contract ("Never exit without posting something").
+post_final_activity() {
+  local exit_code="${1:-0}"
+
+  if [[ "$FINAL_ACTIVITY_POSTED" == "1" ]]; then
+    return 0
+  fi
+  FINAL_ACTIVITY_POSTED=1
+
+  if [[ "$exit_code" -eq 0 ]]; then
+    local body="OpenThrottle sandbox task (${TASK_TYPE:-unknown}) finished successfully."
+    if [[ -n "${PR_URL:-}" ]]; then
+      body="${body} PR: ${PR_URL}"
+    fi
+    post_linear_activity "response" "$body"
+  else
+    local tail_raw tail_sanitized body
+    tail_raw="$(tail -c 4000 "${TASK_LOG:-/dev/null}" 2>/dev/null || true)"
+    tail_sanitized="$(sanitize_log "$tail_raw")"
+    body="$(printf 'OpenThrottle sandbox task (%s) failed (exit %s).\n\nLast log output:\n```\n%s\n```' \
+      "${TASK_TYPE:-unknown}" "$exit_code" "$tail_sanitized")"
+    post_linear_activity "error" "$body"
+  fi
+}
+
+# =============================================================================
+# Validate the bare minimum needed to report failures, then install the
+# EXIT trap before doing anything else that could fail.
+# =============================================================================
+
+: "${TASK_TYPE:?TASK_TYPE is required (implement|resume)}"
+: "${LINEAR_SESSION_ID:?LINEAR_SESSION_ID is required}"
+: "${LINEAR_ACCESS_TOKEN:?LINEAR_ACCESS_TOKEN is required}"
+
+case "$TASK_TYPE" in
+  implement|resume) ;;
+  *) log "FATAL: TASK_TYPE must be 'implement' or 'resume', got '${TASK_TYPE}'"; exit 1 ;;
+esac
+
+trap 'post_final_activity "$?"' EXIT
+
+# =============================================================================
+# Validate the rest of the required env (SPEC "Sandbox env contract").
+# =============================================================================
+
+: "${GITHUB_REPO:?GITHUB_REPO is required}"
+: "${GITHUB_TOKEN:?GITHUB_TOKEN is required}"
+: "${BASE_BRANCH:?BASE_BRANCH is required}"
+: "${BRANCH_NAME:?BRANCH_NAME is required}"
+
+if [[ "$TASK_TYPE" == "resume" ]]; then
+  : "${RESUME_MESSAGE:?RESUME_MESSAGE is required when TASK_TYPE=resume}"
+fi
+
+MAX_TURNS="${MAX_TURNS:-200}"
+TASK_TIMEOUT="${TASK_TIMEOUT:-7200}"
+DEV_PORT="${DEV_PORT:-3000}"
+
+# Strip trailing newlines from token-shaped secrets (SPEC phase 1).
+GITHUB_TOKEN="$(strip_nl "$GITHUB_TOKEN")"
+LINEAR_ACCESS_TOKEN="$(strip_nl "$LINEAR_ACCESS_TOKEN")"
+LINEAR_MCP_API_KEY="$(strip_nl "${LINEAR_MCP_API_KEY:-}")"
+CLAUDE_CODE_OAUTH_TOKEN="$(strip_nl "${CLAUDE_CODE_OAUTH_TOKEN:-}")"
+ANTHROPIC_API_KEY="$(strip_nl "${ANTHROPIC_API_KEY:-}")"
+CODEX_API_KEY="$(strip_nl "${CODEX_API_KEY:-}")"
+export GITHUB_TOKEN LINEAR_ACCESS_TOKEN LINEAR_MCP_API_KEY
+export CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY CODEX_API_KEY
+
+mkdir -p "$OT_DIR"
+chown -R "${AGENT_USER}:${AGENT_USER}" "$AGENT_HOME"
+TASK_LOG="${OT_DIR}/task.log"
+: > "$TASK_LOG" || true
+chown "${AGENT_USER}:${AGENT_USER}" "$TASK_LOG" || true
+
+# Everything from here on (our own log() calls, and anything the agent
+# writes to stdout/stderr through runner/normalize.mjs) is tee'd into
+# task.log so post_final_activity() has something to summarize on failure.
+exec > >(tee -a "$TASK_LOG") 2>&1
+
+log "TASK_TYPE=${TASK_TYPE} AGENT_env=${AGENT:-<unset>} repo=${GITHUB_REPO} branch=${BRANCH_NAME}"
+
+# =============================================================================
+# Phase 1 — auth files
+# =============================================================================
+log "phase 1: auth files"
+
+if [[ -n "${CODEX_AUTH_JSON:-}" ]]; then
+  mkdir -p "${AGENT_HOME}/.codex"
+  # Only strip a *trailing* newline here — this is a JSON blob, not a bare
+  # token, so we must not touch whitespace inside it.
+  printf '%s' "${CODEX_AUTH_JSON%$'\n'}" > "${AGENT_HOME}/.codex/auth.json"
+  chmod 0600 "${AGENT_HOME}/.codex/auth.json"
+  chown -R "${AGENT_USER}:${AGENT_USER}" "${AGENT_HOME}/.codex"
+  log "wrote ~/.codex/auth.json"
+fi
+
+# Claude auth is env-var only (CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY) —
+# the CLI reads it directly from the environment, no file needed.
+
+# =============================================================================
+# Phase 2 — clone / checkout / push branch (idempotent for resume)
+# =============================================================================
+log "phase 2: repo checkout"
+
+GIT_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git"
+
+if [[ ! -d "${REPO_DIR}/.git" ]]; then
+  log "cloning ${GITHUB_REPO} -> ${REPO_DIR}"
+  as_agent "git clone --quiet '$GIT_URL' '$REPO_DIR'"
+  as_agent "git -C '$REPO_DIR' config user.email 'agent@openthrottle.dev'"
+  as_agent "git -C '$REPO_DIR' config user.name 'OpenThrottle Agent'"
+  as_agent "git config --global --add safe.directory '$REPO_DIR'"
+else
+  log "repo already present (resume) — fetching"
+  as_agent "git -C '$REPO_DIR' remote set-url origin '$GIT_URL'"
+  as_agent "git -C '$REPO_DIR' fetch --quiet origin"
+fi
+
+if as_agent "git -C '$REPO_DIR' show-ref --verify --quiet 'refs/heads/${BRANCH_NAME}'"; then
+  as_agent "git -C '$REPO_DIR' checkout --quiet '$BRANCH_NAME'"
+elif as_agent "git -C '$REPO_DIR' ls-remote --exit-code --heads origin '$BRANCH_NAME'" >/dev/null 2>&1; then
+  log "branch exists on origin only — checking out"
+  as_agent "git -C '$REPO_DIR' fetch --quiet origin '$BRANCH_NAME'"
+  as_agent "git -C '$REPO_DIR' checkout --quiet -b '$BRANCH_NAME' 'origin/${BRANCH_NAME}'"
+else
+  log "branch does not exist yet — creating from ${BASE_BRANCH}"
+  as_agent "git -C '$REPO_DIR' fetch --quiet origin '$BASE_BRANCH'"
+  as_agent "git -C '$REPO_DIR' checkout --quiet -b '$BRANCH_NAME' 'origin/${BASE_BRANCH}'"
+fi
+
+if [[ "$TASK_TYPE" == "resume" ]]; then
+  log "resume: pulling latest ${BRANCH_NAME}"
+  as_agent "git -C '$REPO_DIR' pull --quiet --ff-only origin '$BRANCH_NAME'" \
+    || log "WARNING: fast-forward pull failed — continuing with local branch state"
+fi
+
+# Push immediately so the branch exists on origin as the human escape hatch,
+# even before the agent makes its first commit. No-op ("Everything
+# up-to-date") on a resume where nothing changed locally.
+as_agent "git -C '$REPO_DIR' push --quiet -u origin '$BRANCH_NAME'"
+
+# =============================================================================
+# Phase 3 — safety: pre-push hook + sealed .git/config + neutralized
+# .claude/settings.json
+# =============================================================================
+log "phase 3: safety"
+
+HOOKS_PATH="${OPT_DIR}/safety"
+CURRENT_HOOKS_PATH="$(as_agent "git -C '$REPO_DIR' config --get core.hooksPath" 2>/dev/null || true)"
+if [[ "$CURRENT_HOOKS_PATH" != "$HOOKS_PATH" ]]; then
+  as_agent "git -C '$REPO_DIR' config core.hooksPath '$HOOKS_PATH'"
+  log "installed pre-push hook (core.hooksPath=${HOOKS_PATH})"
+else
+  log "pre-push hook already installed"
+fi
+
+# Seal .git/config as root so the agent (and the agent process itself,
+# should it get compromised via prompt injection) cannot unset
+# core.hooksPath or repoint origin. Idempotent — seal.sh no-ops if already
+# sealed.
+"${OPT_DIR}/safety/seal.sh" "${REPO_DIR}/.git/config"
+
+SETTINGS_FILE="${REPO_DIR}/.claude/settings.json"
+if [[ -f "$SETTINGS_FILE" && ! -f "${SETTINGS_FILE}.bak" ]]; then
+  cp "$SETTINGS_FILE" "${SETTINGS_FILE}.bak"
+  printf '{}\n' > "$SETTINGS_FILE"
+  chown "${AGENT_USER}:${AGENT_USER}" "$SETTINGS_FILE" "${SETTINGS_FILE}.bak"
+  log "neutralized ${SETTINGS_FILE} (backup at ${SETTINGS_FILE}.bak)"
+fi
+
+# =============================================================================
+# Phase 4 — read .openthrottle.yml (yq), with defaults
+# =============================================================================
+log "phase 4: reading .openthrottle.yml"
+
+CONFIG_FILE="${REPO_DIR}/.openthrottle.yml"
+
+# $1 = yq filter (applied with a `// "<default>"` fallback), $2 = default.
+yq_get() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    yq -r "$1 // \"$2\"" "$CONFIG_FILE"
+  else
+    printf '%s' "$2"
+  fi
+}
+
+CFG_AGENT="$(yq_get '.agent' 'claude')"
+CFG_DEV="$(yq_get '.dev' '')"
+CFG_TEST="$(yq_get '.test' '')"
+CFG_LINT="$(yq_get '.lint' '')"
+CFG_BUILD="$(yq_get '.build' '')"
+CFG_FORMAT="$(yq_get '.format' '')"
+MAX_TURNS="$(yq_get '.limits.max_turns' "$MAX_TURNS")"
+TASK_TIMEOUT="$(yq_get '.limits.task_timeout' "$TASK_TIMEOUT")"
+
+if [[ -f "$CONFIG_FILE" ]]; then
+  MCP_SERVERS_JSON="$(yq -o=json -r '.mcp_servers // {}' "$CONFIG_FILE" 2>/dev/null || echo '{}')"
+else
+  MCP_SERVERS_JSON='{}'
+fi
+[[ -z "$MCP_SERVERS_JSON" || "$MCP_SERVERS_JSON" == "null" ]] && MCP_SERVERS_JSON='{}'
+
+POST_BOOTSTRAP_CMDS=()
+if [[ -f "$CONFIG_FILE" ]]; then
+  while IFS= read -r cmd_line; do
+    [[ -n "$cmd_line" ]] && POST_BOOTSTRAP_CMDS+=("$cmd_line")
+  done < <(yq -r '.post_bootstrap // [] | .[]' "$CONFIG_FILE" 2>/dev/null || true)
+fi
+
+# Surface test/lint/build/format/dev to the agent process as env vars — SPEC
+# phase 4 has entrypoint read them but doesn't otherwise say how the agent
+# (specifically the implement-plan skill, which must "run configured
+# test/lint/build before opening the PR") is meant to learn them. Exporting
+# them here (inherited by the gosu'd agent process in as_agent/run below) is
+# the simplest option that doesn't make every skill re-parse yq itself.
+export OT_TEST_CMD="$CFG_TEST"
+export OT_LINT_CMD="$CFG_LINT"
+export OT_BUILD_CMD="$CFG_BUILD"
+export OT_FORMAT_CMD="$CFG_FORMAT"
+export OT_DEV_CMD="$CFG_DEV"
+export OT_DEV_PORT="$DEV_PORT"
+
+# Agent resolution precedence:
+#   1. AGENT=codex from the sandbox env — this represents an explicit
+#      per-ticket `agent:codex` Linear label, which the supervisor already
+#      resolved (SPEC "Repo/agent routing") and which the .openthrottle.yml
+#      comment itself documents as an override ("label agent:codex on a
+#      ticket overrides"). Always wins.
+#   2. .openthrottle.yml's `agent:` field, the repo-wide default.
+#   3. "claude", the hardcoded fallback if neither is set (e.g. local
+#      testing of this script without the supervisor).
+if [[ "${AGENT:-}" == "codex" ]]; then
+  : # explicit per-ticket override wins, keep AGENT=codex
+elif [[ -n "$CFG_AGENT" ]]; then
+  AGENT="$CFG_AGENT"
+fi
+AGENT="${AGENT:-claude}"
+export AGENT
+
+case "$AGENT" in
+  claude|codex) ;;
+  *) log "FATAL: resolved AGENT='${AGENT}' is invalid (expected claude|codex)"; exit 1 ;;
+esac
+
+log "config: agent=${AGENT} dev='${CFG_DEV}' max_turns=${MAX_TURNS} task_timeout=${TASK_TIMEOUT}"
+
+# =============================================================================
+# Phase 5 — post_bootstrap
+# =============================================================================
+log "phase 5: post_bootstrap"
+
+if [[ "${#POST_BOOTSTRAP_CMDS[@]}" -gt 0 ]]; then
+  for cmd in "${POST_BOOTSTRAP_CMDS[@]}"; do
+    log "  > ${cmd}"
+    as_agent "cd '$REPO_DIR' && ${cmd}"
+  done
+else
+  log "no post_bootstrap commands configured"
+fi
+
+# =============================================================================
+# Phase 6 — dev server (background)
+# =============================================================================
+log "phase 6: dev server"
+
+DEV_LOG="${OT_DIR}/dev.log"
+DEV_PID_FILE="${OT_DIR}/dev.pid"
+
+if [[ -n "$CFG_DEV" ]]; then
+  if [[ -f "$DEV_PID_FILE" ]]; then
+    OLD_PID="$(cat "$DEV_PID_FILE" 2>/dev/null || true)"
+    if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
+      log "restarting dev server (stopping previous pid ${OLD_PID})"
+      kill "$OLD_PID" 2>/dev/null || true
+      sleep 1
+      kill -9 "$OLD_PID" 2>/dev/null || true
+    fi
+  fi
+  log "starting dev server: ${CFG_DEV} (0.0.0.0:${DEV_PORT})"
+  as_agent "cd '$REPO_DIR' && DEV_PORT='$DEV_PORT' PORT='$DEV_PORT' HOST=0.0.0.0 HOSTNAME=0.0.0.0 nohup ${CFG_DEV} >> '$DEV_LOG' 2>&1 < /dev/null & echo \$! > '$DEV_PID_FILE'"
+else
+  log "no dev command configured, skipping"
+fi
+
+# =============================================================================
+# Phase 7 — run the agent under `timeout $TASK_TIMEOUT`, piped through
+# runner/normalize.mjs. Skills are installed first.
+# =============================================================================
+log "phase 7: agent run"
+
+# Claude skills: copy skills/claude/* into the repo's own .claude/skills/ so
+# `claude -p` picks them up as project skills. Untracked — excluded via
+# .git/info/exclude rather than committed, so they never show up in the
+# agent's own `git status`/diff during self-review.
+mkdir -p "${REPO_DIR}/.claude/skills"
+if [[ -d "${OPT_DIR}/skills/claude" ]]; then
+  cp -r "${OPT_DIR}/skills/claude/." "${REPO_DIR}/.claude/skills/"
+fi
+if ! grep -qxF '.claude/skills/' "${REPO_DIR}/.git/info/exclude" 2>/dev/null; then
+  echo '.claude/skills/' >> "${REPO_DIR}/.git/info/exclude"
+fi
+chown -R "${AGENT_USER}:${AGENT_USER}" "${REPO_DIR}/.claude"
+
+# Codex project instructions: append the AGENTS-fragment to the repo's
+# AGENTS.md (create if missing). Also untracked via .git/info/exclude — NOTE
+# this only fully hides the addition from `git status` if AGENTS.md did not
+# already exist as a tracked file in the target repo; if it did, the
+# appended fragment will show as a local modification (exclude only affects
+# untracked paths). See sandbox/README.md "Design notes".
+if [[ "$AGENT" == "codex" ]]; then
+  AGENTS_FRAGMENT="${OPT_DIR}/skills/codex/AGENTS-fragment.md"
+  if [[ -f "$AGENTS_FRAGMENT" ]]; then
+    touch "${REPO_DIR}/AGENTS.md"
+    {
+      echo ""
+      echo "<!-- openthrottle: appended at runtime by entrypoint.sh, not committed -->"
+      cat "$AGENTS_FRAGMENT"
+    } >> "${REPO_DIR}/AGENTS.md"
+    if ! grep -qxF 'AGENTS.md' "${REPO_DIR}/.git/info/exclude" 2>/dev/null; then
+      echo 'AGENTS.md' >> "${REPO_DIR}/.git/info/exclude"
+    fi
+    chown "${AGENT_USER}:${AGENT_USER}" "${REPO_DIR}/AGENTS.md"
+  else
+    log "WARNING: ${AGENTS_FRAGMENT} not found, skipping AGENTS.md fragment"
+  fi
+fi
+
+# MCP config for claude (--mcp-config <file>): always Linear MCP, plus
+# whatever the repo's .openthrottle.yml declares under mcp_servers.
+# TODO(verify-mcp-config): confirm the exact --mcp-config JSON shape
+# (mcpServers.<name>.{type,url,headers} for a remote HTTP MCP server)
+# against the installed @anthropic-ai/claude-code version's docs.
+MCP_CONFIG_FILE="$(mktemp /tmp/ot-mcp-XXXXXX.json)"
+LINEAR_MCP_JSON=$(cat <<JSON
+{"mcpServers":{"linear":{"type":"http","url":"https://mcp.linear.app/mcp","headers":{"Authorization":"Bearer ${LINEAR_MCP_API_KEY}"}}}}
+JSON
+)
+if [[ "$MCP_SERVERS_JSON" != "{}" ]]; then
+  echo "$LINEAR_MCP_JSON" | jq --argjson extra "$MCP_SERVERS_JSON" '.mcpServers += $extra' > "$MCP_CONFIG_FILE"
+else
+  echo "$LINEAR_MCP_JSON" > "$MCP_CONFIG_FILE"
+fi
+chmod 600 "$MCP_CONFIG_FILE"
+chown "${AGENT_USER}:${AGENT_USER}" "$MCP_CONFIG_FILE"
+
+# Build the exact agent command line per SPEC "Agent invocation" (verbatim
+# flags), then run it under `timeout`, piped through normalize.mjs — all as
+# the `agent` user in one gosu'd subshell so normalize.mjs's
+# ~/.ot/agent-session-id write lands with the right owner/HOME.
+AGENT_EXIT=0
+CODEX_STDIN_FILE=""
+
+case "${AGENT}:${TASK_TYPE}" in
+  claude:implement)
+    AGENT_CMD=(claude -p "/implement-plan" --output-format stream-json --verbose \
+      --max-turns "$MAX_TURNS" --dangerously-skip-permissions \
+      --mcp-config "$MCP_CONFIG_FILE")
+    ;;
+  claude:resume)
+    SAVED_SESSION_ID="$(as_agent "cat '${OT_DIR}/agent-session-id' 2>/dev/null" || true)"
+    if [[ -z "$SAVED_SESSION_ID" ]]; then
+      log "FATAL: resume requested but ${OT_DIR}/agent-session-id is missing/empty"
+      exit 1
+    fi
+    AGENT_CMD=(claude -p --resume "$SAVED_SESSION_ID" "$RESUME_MESSAGE" \
+      --output-format stream-json --verbose --max-turns "$MAX_TURNS" \
+      --dangerously-skip-permissions --mcp-config "$MCP_CONFIG_FILE")
+    ;;
+  codex:implement)
+    CODEX_STDIN_FILE="${OT_DIR}/codex-implement-stdin.md"
+    {
+      cat "${OPT_DIR}/skills/codex/implement-plan.md"
+      printf '\n\n## Ticket context\n- Issue: %s (%s)\n- Branch: %s\n- Base branch: %s\n' \
+        "${LINEAR_ISSUE_IDENTIFIER:-unknown}" "${LINEAR_ISSUE_ID:-unknown}" "$BRANCH_NAME" "$BASE_BRANCH"
+    } > "$CODEX_STDIN_FILE"
+    chown "${AGENT_USER}:${AGENT_USER}" "$CODEX_STDIN_FILE"
+    AGENT_CMD=(codex exec --json --dangerously-bypass-approvals-and-sandbox \
+      --skip-git-repo-check -C "$REPO_DIR")
+    ;;
+  codex:resume)
+    SAVED_SESSION_ID="$(as_agent "cat '${OT_DIR}/agent-session-id' 2>/dev/null" || true)"
+    if [[ -z "$SAVED_SESSION_ID" ]]; then
+      log "FATAL: resume requested but ${OT_DIR}/agent-session-id is missing/empty"
+      exit 1
+    fi
+    AGENT_CMD=(codex exec resume "$SAVED_SESSION_ID" --json \
+      --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check \
+      -C "$REPO_DIR" "$RESUME_MESSAGE")
+    ;;
+  *)
+    log "FATAL: unsupported AGENT='${AGENT}' TASK_TYPE='${TASK_TYPE}' combination"
+    exit 1
+    ;;
+esac
+
+# Safely re-quote the array for the gosu'd bash -c string (handles
+# RESUME_MESSAGE / plan text containing spaces, quotes, newlines, etc).
+QUOTED_CMD="$(printf '%q ' "${AGENT_CMD[@]}")"
+
+log "running: ${AGENT}:${TASK_TYPE} (max_turns=${MAX_TURNS}, timeout=${TASK_TIMEOUT}s)"
+
+set +e
+if [[ -n "$CODEX_STDIN_FILE" ]]; then
+  as_agent "set -o pipefail; cd '$REPO_DIR' && timeout '$TASK_TIMEOUT' $QUOTED_CMD - < '$CODEX_STDIN_FILE' 2>&1 | node '${OPT_DIR}/runner/normalize.mjs'"
+else
+  as_agent "set -o pipefail; cd '$REPO_DIR' && timeout '$TASK_TIMEOUT' $QUOTED_CMD 2>&1 | node '${OPT_DIR}/runner/normalize.mjs'"
+fi
+AGENT_EXIT=$?
+set -e
+
+log "agent exited with code ${AGENT_EXIT}"
+
+# Best-effort: pick up the PR URL for the success activity body, if the
+# implement-plan/review skill already opened one via `gh pr create`.
+if [[ "$AGENT_EXIT" -eq 0 ]]; then
+  PR_URL="$(as_agent "cd '$REPO_DIR' && gh pr view '$BRANCH_NAME' --json url -q .url 2>/dev/null" || true)"
+fi
+
+rm -f "$MCP_CONFIG_FILE"
+
+# =============================================================================
+# Phase 8 — final Linear activity. Handled by the EXIT trap
+# (post_final_activity), triggered by this exit.
+# =============================================================================
+exit "$AGENT_EXIT"

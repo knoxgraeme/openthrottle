@@ -1,0 +1,30 @@
+{
+  "name": "openthrottle",
+  "version": "2.0.0-alpha.0",
+  "description": "CLI for OpenThrottle — plan-first autonomous coding pipeline (Linear -> Daytona sandbox -> GitHub PR).",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "openthrottle": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@clack/prompts": "^0.10.0",
+    "@daytonaio/sdk": "^0.199.0",
+    "yaml": "^2.6.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.9.3"
+  }
+}
