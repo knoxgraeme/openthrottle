@@ -146,7 +146,7 @@ CLAUDE_HOME="$SMOKE_DIR/result/claude-home"
 run_sandbox "$CLAUDE_HOME" claude implement ot/smoke-claude claude-implement OT-CLAUDE
 test "$(cat "$CLAUDE_HOME/.ot/agent-session-id")" = "smoke-claude-session"
 run_sandbox "$CLAUDE_HOME" claude resume ot/smoke-claude claude-resume OT-CLAUDE "continue"
-rg -q -- '--resume smoke-claude-session' "$CLAUDE_HOME/.ot/claude-args.log"
+grep -q -- '--resume smoke-claude-session' "$CLAUDE_HOME/.ot/claude-args.log"
 jq -e '.exit_code == 0 and .cost_usd == 0.125' \
   "$SMOKE_DIR/result/callback/claude-implement.json" >/dev/null
 jq -e '.exit_code == 0 and .cost_usd == 0.25' \
@@ -156,7 +156,7 @@ CODEX_HOME="$SMOKE_DIR/result/codex-home"
 run_sandbox "$CODEX_HOME" codex implement ot/smoke-codex codex-implement OT-CODEX
 test "$(cat "$CODEX_HOME/.ot/agent-session-id")" = "smoke-codex-thread"
 run_sandbox "$CODEX_HOME" codex resume ot/smoke-codex codex-resume OT-CODEX "continue"
-rg -q -- 'exec .* resume smoke-codex-thread continue' "$CODEX_HOME/.ot/codex-args.log"
+grep -q -- 'exec .* resume smoke-codex-thread continue' "$CODEX_HOME/.ot/codex-args.log"
 jq -e '.exit_code == 0 and (has("cost_usd") | not)' \
   "$SMOKE_DIR/result/callback/codex-implement.json" >/dev/null
 jq -e '.exit_code == 0 and (has("cost_usd") | not)' \
@@ -164,7 +164,7 @@ jq -e '.exit_code == 0 and (has("cost_usd") | not)' \
 
 git --git-dir "$SMOKE_DIR/repo.git" show-ref --verify --quiet refs/heads/ot/smoke-claude
 git --git-dir "$SMOKE_DIR/repo.git" show-ref --verify --quiet refs/heads/ot/smoke-codex
-if rg -n \
+if grep -R -n -E -- \
   'github-smoke-token|linear-oauth-token|linear-mcp-key|claude-oauth-token|codex-api-key|token-(claude|codex)' \
   "$SMOKE_DIR/result"; then
   echo "smoke artifacts leaked a secret" >&2
