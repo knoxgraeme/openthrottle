@@ -14,17 +14,23 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
     "dev": "tsc --watch",
-    "start": "node dist/index.js"
+    "prepack": "npm run build",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
     "@clack/prompts": "^0.10.0",
-    "@daytonaio/sdk": "^0.199.0",
+    "@daytona/sdk": "^0.199.0",
     "yaml": "^2.6.1"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
-    "typescript": "^5.9.3"
+    "@vitest/coverage-v8": "^3.2.4",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
   }
 }

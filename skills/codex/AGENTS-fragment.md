@@ -1,9 +1,9 @@
 # OpenThrottle sandbox — project instructions
 
-This fragment is appended to this repo's `AGENTS.md` by the sandbox
-entrypoint for the duration of this task. It is **not** committed (the
-entrypoint adds it to `.git/info/exclude`) — it exists only so Codex has
-the same standing context Claude gets from `.claude/skills/`.
+The sandbox entrypoint installs this file as global Codex instructions at
+`~/.codex/AGENTS.md` for the duration of the workspace. It lives outside the
+target checkout and is never committed. This gives Codex the same standing
+context Claude gets from its user-level skills without changing project files.
 
 ## Environment available to you
 
@@ -11,12 +11,12 @@ You're running as the `agent` user in a Daytona sandbox, inside the
 already-cloned repo at `/home/agent/repo`. Useful env vars, all set by
 the entrypoint:
 
-- `TASK_TYPE` — `implement` or `resume`.
+- `TASK_TYPE` — `implement`, `resume`, `review`, `review-fix`, or
+  `investigate`.
 - `GITHUB_REPO` — `owner/name`.
 - `BASE_BRANCH` — the repo's default branch (e.g. `main`).
 - `BRANCH_NAME` — `ot/<ticket-id>`, already checked out and already
   pushed once. Never create or switch to a different branch.
-- `LINEAR_SESSION_ID` — the agent session to post updates to.
 - `LINEAR_ISSUE_ID` / `LINEAR_ISSUE_IDENTIFIER` — the ticket driving this
   run.
 - `RESUME_MESSAGE` — set only when `TASK_TYPE=resume`; the human's
@@ -24,8 +24,9 @@ the entrypoint:
 - `DEV_PORT` — if `.openthrottle.yml` configures a `dev` command, it's
   already running in the background, bound to `0.0.0.0:$DEV_PORT`; check
   `~/.ot/dev.log` if you need to confirm it's healthy.
-- `gh` is authenticated against `GITHUB_REPO`. Linear MCP tools are
-  available via the MCP config already passed to you.
+- `gh` is authenticated against `GITHUB_REPO`.
+- `~/.ot/linear-context.md` contains the signed Linear delegation context.
+- `ot-activity` writes structured updates for Fly to publish as OpenThrottle.
 
 You do **not** have a Daytona API key, a Fly key, or any webhook secret —
 you were never given them. Don't go looking for them.
@@ -64,13 +65,12 @@ instead.
   — don't paste raw secrets into commit messages, PR bodies, or Linear
   activities either.
 
-## How to post to Linear
+## How to communicate progress
 
-Use the Linear MCP tools available to you, addressed at `LINEAR_ISSUE_ID`
-/ `LINEAR_SESSION_ID`. There's no fixed tool name to assume — inspect
-what's available in your MCP config and use whatever create/update
-comment or activity tool exists. When you post, pick a tone appropriate
-to the moment even if the tool itself has no formal "type" field:
+Use `ot-activity <type> "<message>"`. It writes a local, run-scoped event;
+Fly validates it and publishes it through the OpenThrottle Linear app. Never
+call Linear directly or create a normal issue comment. Choose the type that
+matches the moment:
 
 - **thought/action** — short, in-progress narration ("Implemented the
   auth middleware, running tests now"). Post these at real milestones,
@@ -84,9 +84,8 @@ to the moment even if the tool itself has no formal "type" field:
 - **error** — something failed and you couldn't recover. Say what broke,
   sanitized of any secret values.
 
-If no Linear MCP tool is reachable for some reason, fall back to leaving
-context in the PR/issue on GitHub via `gh` and note in your final output
-that Linear posting failed — don't silently skip communicating status.
+If `ot-activity` fails, leave durable context in the PR or GitHub issue via
+`gh` and note the failure in your final output.
 
 ## Which skill you're running
 

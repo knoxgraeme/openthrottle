@@ -6,7 +6,7 @@
 // (returns the `tickets` DB rows).
 // =============================================================================
 
-import { getErrorMessage, printTable, requireEnv } from './util.js';
+import { getErrorMessage, printTable, supervisorRequest } from './util.js';
 
 interface TicketRow {
   linear_issue_identifier: string;
@@ -22,19 +22,16 @@ interface StatusResponse {
 }
 
 export default async function status(): Promise<void> {
-  const supervisorUrl = requireEnv('OT_SUPERVISOR_URL', 'the base URL of your deployed supervisor, e.g. https://openthrottle.fly.dev');
-  const url = `${supervisorUrl.replace(/\/+$/, '')}/status`;
-
   let res: Response;
   try {
-    res = await fetch(url);
+    res = await supervisorRequest('/status');
   } catch (err: unknown) {
-    console.error(`Could not reach ${url}: ${getErrorMessage(err)}`);
+    console.error(`Could not reach the supervisor: ${getErrorMessage(err)}`);
     process.exit(1);
   }
 
   if (!res.ok) {
-    console.error(`GET ${url} → HTTP ${res.status}`);
+    console.error(`GET /status → HTTP ${res.status}`);
     try {
       console.error(await res.text());
     } catch {

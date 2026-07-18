@@ -51,8 +51,13 @@ RUN set -eux; \
 # pnpm + yarn via corepack (bundled with Node 22)
 RUN corepack enable
 
-# Coding agent CLIs
-RUN npm install -g @anthropic-ai/claude-code @openai/codex \
+# Coding agent CLIs. Pin the versions whose flags/JSONL contracts are covered
+# by the smoke and normalizer tests; upgrade deliberately with those tests.
+ARG CLAUDE_CODE_VERSION=2.1.201
+ARG CODEX_VERSION=0.143.0
+RUN npm install -g \
+      "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+      "@openai/codex@${CODEX_VERSION}" \
     && npm cache clean --force
 
 # ---------------------------------------------------------------------------
@@ -72,11 +77,20 @@ RUN useradd --create-home --home-dir /home/agent --shell /bin/bash --user-group 
 RUN mkdir -p /opt/openthrottle
 COPY sandbox/entrypoint.sh /opt/openthrottle/entrypoint.sh
 COPY sandbox/runner /opt/openthrottle/runner
+COPY sandbox/lib /opt/openthrottle/lib
 COPY sandbox/safety /opt/openthrottle/safety
+COPY sandbox/bin/ot-activity.mjs /usr/local/bin/ot-activity
 COPY skills /opt/openthrottle/skills
 
 RUN chmod 0755 /opt/openthrottle/entrypoint.sh \
-    && chmod 0755 /opt/openthrottle/safety/pre-push /opt/openthrottle/safety/seal.sh
+    && chmod 0755 /opt/openthrottle/lib/runtime.sh \
+    && chmod 0755 /usr/local/bin/ot-activity \
+    && chmod 0755 /opt/openthrottle/safety/pre-push \
+      /opt/openthrottle/safety/seal.sh
 
 WORKDIR /home/agent
-ENTRYPOINT ["/opt/openthrottle/entrypoint.sh"]
+
+# Daytona executes the image entrypoint as soon as a sandbox is provisioned.
+# Keep that automatic session inert: the Fly supervisor must upload the latest
+# Linear context and run credentials before it explicitly starts entrypoint.sh.
+ENTRYPOINT ["/bin/true"]

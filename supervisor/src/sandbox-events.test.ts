@@ -1,0 +1,232 @@
+import type { Daytona, Sandbox } from "@daytona/sdk";
+import type Database from "better-sqlite3";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
+import { createTicketStore, openDb } from "./db.js";
+import { parseSandboxEvent, pollSandboxEvents } from "./sandbox-events.js";
+
+let db: Database.Database | undefined;
+afterEach(() => db?.close());
+
+function seedRunningTicket() {
+  db = openDb(":memory:");
+  const store = createTicketStore(db);
+  store.upsert({
+    linear_issue_id: "issue-1",
+    linear_issue_identifier: "OT-1",
+    linear_session_id: "session-1",
+    sandbox_id: "sandbox-1",
+    branch: "ot/ot-1",
+    agent: "codex",
+    repo: "owner/repo",
+    pr_url: null,
+    state: "active",
+  });
+  store.beginRun({
+    issueId: "issue-1",
+    runId: "run-1",
+    taskType: "implement",
+    tokenHash: createHash("sha256").update("callback-token-123").digest("hex"),
+    expiresAt: "2099-01-01T00:00:00.000Z",
+  });
+  return store;
+}
+
+describe("sandbox event contracts", () => {
+  it("accepts bounded activity and completion records and rejects unsafe input", () => {
+    const parsed = parseSandboxEvent(JSON.stringify({
+        version: 1,
+        kind: "activity",
+        event_id: "11111111-1111-4111-8111-111111111111",
+        run_id: "run-1",
+        created_at: "2026-07-18T00:00:00.000Z",
+        type: "elicitation",
+        body: "Please add a plan",
+        unexpected_secret: "raw-secret",
+      }));
+    expect(parsed).toMatchObject({ type: "elicitation", body: "Please add a plan" });
+    expect(parsed).not.toHaveProperty("unexpected_secret");
+
+    expect(() => parseSandboxEvent("{}" )).toThrow();
+    expect(() =>
+      parseSandboxEvent(JSON.stringify({
+        version: 1,
+        kind: "activity",
+        event_id: "../bad",
+        run_id: "run-1",
+        created_at: "now",
+        type: "response",
+        body: "ok",
+      }))
+    ).toThrow();
+  });
+
+  it("posts activities once, finalizes completion once, and removes processed files", async () => {
+    const store = seedRunningTicket();
+    const activity = JSON.stringify({
+      version: 1,
+      kind: "activity",
+      event_id: "11111111-1111-4111-8111-111111111111",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:00.000Z",
+      type: "elicitation",
+      body: "Please add a plan",
+    });
+    const completion = JSON.stringify({
+      version: 1,
+      kind: "completion",
+      event_id: "22222222-2222-4222-8222-222222222222",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:01.000Z",
+      token: "callback-token-123",
+      exit_code: 0,
+      pr_url: "https://github.com/owner/repo/pull/1",
+    });
+    const files = new Map([
+      ["/home/agent/.ot/outbox/001.json", Buffer.from(activity)],
+      ["/home/agent/.ot/outbox/002.json", Buffer.from(completion)],
+    ]);
+    let failDeleteOnce = true;
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      fs: {
+        listFiles: vi.fn(async () =>
+          [...files.entries()].map(([path, value]) => ({
+            name: path.split("/").at(-1), path, size: value.length, isDir: false,
+          }))
+        ),
+        downloadFile: vi.fn(async (path: string) => files.get(path)!),
+        deleteFile: vi.fn(async (path: string) => {
+          if (path.endsWith("001.json") && failDeleteOnce) {
+            failDeleteOnce = false;
+            throw new Error("temporary delete failure");
+          }
+          files.delete(path);
+        }),
+      },
+    } as unknown as Sandbox;
+    const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
+    const postActivity = vi.fn(async () => undefined);
+    const finishCompletion = vi.fn(async () => ({ status: 200 }));
+
+    await pollSandboxEvents({ daytona, store, postActivity, finishCompletion });
+    await pollSandboxEvents({ daytona, store, postActivity, finishCompletion });
+
+    expect(postActivity).toHaveBeenCalledOnce();
+    expect(postActivity).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: "session-1", type: "elicitation", body: "Please add a plan" })
+    );
+    expect(finishCompletion).toHaveBeenCalledOnce();
+    expect(finishCompletion).toHaveBeenCalledWith(
+      expect.objectContaining({ runId: "run-1", token: "callback-token-123", exitCode: 0 })
+    );
+    expect(files.size).toBe(0);
+    expect(store.getSandboxEvent("11111111-1111-4111-8111-111111111111")?.status)
+      .toBe("processed");
+  });
+
+  it("retries a failed activity before processing the completion behind it", async () => {
+    const store = seedRunningTicket();
+    const activityId = "55555555-5555-4555-8555-555555555555";
+    const activity = Buffer.from(JSON.stringify({
+      version: 1,
+      kind: "activity",
+      event_id: activityId,
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:00.000Z",
+      type: "response",
+      body: "Implementation is ready",
+    }));
+    const completion = Buffer.from(JSON.stringify({
+      version: 1,
+      kind: "completion",
+      event_id: "66666666-6666-4666-8666-666666666666",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:01.000Z",
+      token: "callback-token-123",
+      exit_code: 0,
+    }));
+    const files = new Map([
+      ["/home/agent/.ot/outbox/001.json", activity],
+      ["/home/agent/.ot/outbox/002.json", completion],
+    ]);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      fs: {
+        listFiles: vi.fn(async () =>
+          [...files.entries()].map(([path, value]) => ({
+            name: path.split("/").at(-1), path, size: value.length, isDir: false,
+          }))
+        ),
+        downloadFile: vi.fn(async (path: string) => files.get(path)!),
+        deleteFile: vi.fn(async (path: string) => files.delete(path)),
+      },
+    } as unknown as Sandbox;
+    const postActivity = vi
+      .fn<() => Promise<void>>()
+      .mockRejectedValueOnce(new Error("Linear unavailable"))
+      .mockResolvedValue(undefined);
+    const finishCompletion = vi.fn(async () => ({ status: 200 }));
+    const params = {
+      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      store,
+      postActivity,
+      finishCompletion,
+    };
+
+    await pollSandboxEvents(params);
+
+    expect(postActivity).toHaveBeenCalledOnce();
+    expect(finishCompletion).not.toHaveBeenCalled();
+    expect(store.getSandboxEvent(activityId)).toMatchObject({
+      status: "failed",
+      payload: expect.not.stringContaining("callback-token-123"),
+    });
+
+    db!.prepare("UPDATE sandbox_events SET next_attempt_at = ? WHERE event_id = ?")
+      .run("2000-01-01T00:00:00.000Z", activityId);
+    await pollSandboxEvents(params);
+
+    expect(postActivity).toHaveBeenCalledTimes(2);
+    expect(finishCompletion).toHaveBeenCalledOnce();
+    expect(store.getSandboxEvent(activityId)?.status).toBe("processed");
+  });
+
+  it("discards a stale event without posting it into the current run", async () => {
+    const store = seedRunningTicket();
+    const stale = Buffer.from(JSON.stringify({
+      version: 1,
+      kind: "activity",
+      event_id: "33333333-3333-4333-8333-333333333333",
+      run_id: "old-run",
+      created_at: "2026-07-18T00:00:00.000Z",
+      type: "response",
+      body: "stale",
+    }));
+    const deleteFile = vi.fn(async () => undefined);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      fs: {
+        listFiles: vi.fn(async () => [{
+          name: "stale.json", path: "/home/agent/.ot/outbox/stale.json", size: stale.length, isDir: false,
+        }]),
+        downloadFile: vi.fn(async () => stale),
+        deleteFile,
+      },
+    } as unknown as Sandbox;
+    const postActivity = vi.fn();
+
+    await pollSandboxEvents({
+      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      store,
+      postActivity,
+      finishCompletion: vi.fn(),
+    });
+
+    expect(postActivity).not.toHaveBeenCalled();
+    expect(deleteFile).toHaveBeenCalledOnce();
+  });
+});

@@ -3,71 +3,121 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 const LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql";
 const LINEAR_OAUTH_AUTHORIZE_URL = "https://linear.app/oauth/authorize";
 const LINEAR_OAUTH_TOKEN_URL = "https://api.linear.app/oauth/token";
+const HTTP_TIMEOUT_MS = 15_000;
 
-/**
- * Verify the `Linear-Signature` header against the raw (unparsed) request
- * body using HMAC-SHA256, per SPEC "Supervisor contract".
- * https://linear.app/developers/webhooks — TODO(verify-linear-api): confirm
- * header name casing and hex vs base64 digest encoding against current docs.
- */
 export function verifyLinearSignature(
   rawBody: string,
   signatureHeader: string | undefined,
   webhookSecret: string
 ): boolean {
-  if (!signatureHeader) return false;
-  const expected = createHmac("sha256", webhookSecret).update(rawBody).digest("hex");
-  const expectedBuf = Buffer.from(expected, "utf8");
-  const actualBuf = Buffer.from(signatureHeader, "utf8");
-  if (expectedBuf.length !== actualBuf.length) return false;
-  return timingSafeEqual(expectedBuf, actualBuf);
+  if (!signatureHeader || !/^[a-f\d]{64}$/i.test(signatureHeader)) return false;
+  const expected = createHmac("sha256", webhookSecret).update(rawBody).digest();
+  const actual = Buffer.from(signatureHeader, "hex");
+  return actual.length === expected.length && timingSafeEqual(expected, actual);
 }
 
-// ---------------------------------------------------------------------------
-// Webhook payload shapes (Linear Agent API — Developer Preview).
-// TODO(verify-linear-api): every field name below must be checked against
-// live Linear docs/schema before first deploy; Developer Preview APIs are
-// known to change field names without notice.
-// ---------------------------------------------------------------------------
+export function isRecentLinearWebhook(
+  webhookTimestamp: number,
+  maxAgeSeconds: number,
+  nowMs = Date.now()
+): boolean {
+  return (
+    Number.isFinite(webhookTimestamp) &&
+    Math.abs(nowMs - webhookTimestamp) <= maxAgeSeconds * 1000
+  );
+}
+
+export interface LinearIssueWebhookPayload {
+  id: string;
+  identifier: string;
+  team?: { id?: string; key?: string; name?: string };
+  labels?: Array<{ id?: string; name: string }> | { nodes?: Array<{ name: string }> };
+}
 
 export interface LinearAgentSessionEventPayload {
-  action: "created" | "prompted"; // TODO(verify-linear-api): confirm exact action enum values
-  type?: string; // e.g. "AgentSessionEvent" — TODO(verify-linear-api)
+  action: "created" | "prompted";
+  type: "AgentSessionEvent";
+  webhookId: string;
+  webhookTimestamp: number;
+  organizationId: string;
+  oauthClientId?: string;
+  appUserId?: string;
+  promptContext?: string;
   agentSession: {
-    id: string; // TODO(verify-linear-api): agent session id field name
-    issue?: {
-      id: string;
-      identifier: string;
-      labels?: { nodes?: { name: string }[] }; // TODO(verify-linear-api): label shape on issue
-    };
+    id: string;
+    issueId?: string;
+    issue?: LinearIssueWebhookPayload;
   };
   agentActivity?: {
-    id?: string;
-    body?: string; // human message content for "prompted" events — TODO(verify-linear-api)
-    content?: { body?: string };
+    id: string;
+    content?: { type?: string; body?: string };
+    body?: string;
   };
-  webhookTimestamp?: number;
-  organizationId?: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 export function parseLinearWebhook(raw: string): LinearAgentSessionEventPayload {
-  return JSON.parse(raw) as LinearAgentSessionEventPayload;
+  const payload: unknown = JSON.parse(raw);
+  if (!isRecord(payload)) throw new Error("Linear webhook body must be an object");
+  if (payload.type !== "AgentSessionEvent") {
+    throw new Error(`Unexpected Linear webhook type: ${String(payload.type)}`);
+  }
+  if (payload.action !== "created" && payload.action !== "prompted") {
+    throw new Error(`Unexpected Linear agent action: ${String(payload.action)}`);
+  }
+  if (!isRecord(payload.agentSession) || typeof payload.agentSession.id !== "string") {
+    throw new Error("Linear webhook is missing agentSession.id");
+  }
+  if (payload.agentSession.issue !== undefined) {
+    if (!isRecord(payload.agentSession.issue)) {
+      throw new Error("Linear webhook has invalid agentSession.issue");
+    }
+    const issue = payload.agentSession.issue;
+    if (typeof issue.id !== "string" || issue.id === "") {
+      throw new Error("Linear webhook is missing agentSession.issue.id");
+    }
+    if (
+      typeof issue.identifier !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(issue.identifier)
+    ) {
+      throw new Error("Linear webhook has an unsafe agentSession.issue.identifier");
+    }
+  }
+  if (typeof payload.webhookId !== "string" || typeof payload.webhookTimestamp !== "number") {
+    throw new Error("Linear webhook is missing webhookId/webhookTimestamp");
+  }
+  if (typeof payload.organizationId !== "string") {
+    throw new Error("Linear webhook is missing organizationId");
+  }
+  if (payload.promptContext !== undefined && typeof payload.promptContext !== "string") {
+    throw new Error("Linear webhook has invalid promptContext");
+  }
+  if (payload.action === "prompted") {
+    if (!isRecord(payload.agentActivity) || typeof payload.agentActivity.id !== "string") {
+      throw new Error("Prompted webhook is missing agentActivity.id");
+    }
+    const body = isRecord(payload.agentActivity.content)
+      ? payload.agentActivity.content.body
+      : payload.agentActivity.body;
+    if (typeof body !== "string" || body.trim() === "") {
+      throw new Error("Prompted webhook is missing agentActivity.body");
+    }
+  }
+  return payload as unknown as LinearAgentSessionEventPayload;
 }
 
-/** Extract label names from the webhook payload, used for agent routing (agent:codex). */
-export function extractLabelNames(
-  payload: LinearAgentSessionEventPayload
-): string[] {
-  // TODO(verify-linear-api): confirm issue.labels shape in the AgentSessionEvent payload.
-  return payload.agentSession.issue?.labels?.nodes?.map((n) => n.name) ?? [];
+export function extractLabelNames(payload: LinearAgentSessionEventPayload): string[] {
+  const labels = payload.agentSession.issue?.labels;
+  if (Array.isArray(labels)) return labels.map((label) => label.name);
+  return labels?.nodes?.map((label) => label.name) ?? [];
 }
-
-// ---------------------------------------------------------------------------
-// GraphQL client
-// ---------------------------------------------------------------------------
 
 export interface LinearClient {
   accessToken: string;
+  fetch?: typeof fetch;
 }
 
 async function linearGraphQL<T>(
@@ -75,145 +125,122 @@ async function linearGraphQL<T>(
   query: string,
   variables: Record<string, unknown>
 ): Promise<T> {
-  const res = await fetch(LINEAR_GRAPHQL_URL, {
+  const fetchImpl = client.fetch ?? fetch;
+  const response = await fetchImpl(LINEAR_GRAPHQL_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      // TODO(verify-linear-api): OAuth app tokens are typically sent as a
-      // bare token (no "Bearer " prefix) per Linear's older docs, but this
-      // must be reconfirmed for actor=app tokens specifically.
-      Authorization: client.accessToken,
+      Authorization: `Bearer ${client.accessToken}`,
     },
     body: JSON.stringify({ query, variables }),
+    signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
   });
-
-  const json = (await res.json()) as { data?: T; errors?: unknown[] };
-  if (!res.ok || json.errors) {
+  const json = (await response.json()) as { data?: T; errors?: unknown[] };
+  if (!response.ok || json.errors?.length) {
     throw new Error(
-      `Linear GraphQL error (${res.status}): ${JSON.stringify(json.errors ?? json)}`
+      `Linear GraphQL error (${response.status}): ${JSON.stringify(json.errors ?? json)}`
     );
   }
-  if (!json.data) {
-    throw new Error("Linear GraphQL response missing data");
-  }
+  if (!json.data) throw new Error("Linear GraphQL response missing data");
   return json.data;
 }
 
-export type AgentActivityType =
-  | "thought"
-  | "action"
-  | "elicitation"
-  | "response"
-  | "error";
+export type AgentActivityInput =
+  | {
+      sessionId: string;
+      type: "thought" | "elicitation" | "response" | "error";
+      body: string;
+      ephemeral?: boolean;
+    }
+  | {
+      sessionId: string;
+      type: "action";
+      action: string;
+      parameter: string;
+      result?: string;
+      ephemeral?: boolean;
+    };
 
-/**
- * Post an activity into an agent session.
- * Mutation name and input shape per SPEC: `agentActivityCreate` with types
- * thought/action/elicitation/response/error.
- * TODO(verify-linear-api): confirm `AgentActivityCreateInput` field names
- * (agentSessionId vs sessionId, content union shape, whether "action" type
- * takes an extra `action`/`parameter`/`result` sub-fields) against the
- * Linear Agent API (Developer Preview) schema before first deploy.
- */
 export async function agentActivityCreate(
   client: LinearClient,
-  params: { sessionId: string; type: AgentActivityType; body: string }
-): Promise<{ success: boolean }> {
-  const mutation = `
-    mutation AgentActivityCreate($input: AgentActivityCreateInput!) {
+  params: AgentActivityInput
+): Promise<{ success: boolean; agentActivity?: { id: string } }> {
+  const content =
+    params.type === "action"
+      ? {
+          type: params.type,
+          action: params.action,
+          parameter: params.parameter,
+          ...(params.result === undefined ? {} : { result: params.result }),
+        }
+      : { type: params.type, body: params.body };
+  const data = await linearGraphQL<{
+    agentActivityCreate: { success: boolean; agentActivity?: { id: string } };
+  }>(
+    client,
+    `mutation AgentActivityCreate($input: AgentActivityCreateInput!) {
       agentActivityCreate(input: $input) {
         success
-        agentActivity {
-          id
-        }
+        agentActivity { id }
       }
-    }
-  `;
-  // TODO(verify-linear-api): confirm whether `content` is a discriminated
-  // union `{ type: "thought", body: "..." }` (used here) or nested fields
-  // like `{ thought: { body: "..." } }`.
-  const variables = {
-    input: {
-      agentSessionId: params.sessionId,
-      content: {
-        type: params.type,
-        body: params.body,
+    }`,
+    {
+      input: {
+        agentSessionId: params.sessionId,
+        content,
+        ephemeral: params.ephemeral ?? false,
       },
-    },
-  };
-  try {
-    const data = await linearGraphQL<{
-      agentActivityCreate: { success: boolean };
-    }>(client, mutation, variables);
-    return data.agentActivityCreate;
-  } catch (err) {
-    // Never throw out of activity posting into caller's critical path if
-    // avoidable — callers still decide what to do, but log defensively here.
-    console.error("[linear] agentActivityCreate failed:", err);
-    throw err;
+    }
+  );
+  if (!data.agentActivityCreate.success) {
+    throw new Error("Linear agentActivityCreate returned success: false");
   }
+  return data.agentActivityCreate;
 }
 
-/**
- * Attach a PR / external link and optionally update state on an agent
- * session. TODO(verify-linear-api): confirm `agentSessionUpdate` mutation
- * exists with this shape — SPEC says "attach PR/external links" but the
- * exact input fields (externalUrl vs url, label) are unverified.
- */
 export async function agentSessionUpdate(
   client: LinearClient,
-  params: { sessionId: string; externalUrl?: string; externalUrlLabel?: string }
+  params: {
+    sessionId: string;
+    externalUrls?: Array<{ label: string; url: string }>;
+    addedExternalUrls?: Array<{ label: string; url: string }>;
+  }
 ): Promise<{ success: boolean }> {
-  const mutation = `
-    mutation AgentSessionUpdate($input: AgentSessionUpdateInput!) {
-      agentSessionUpdate(input: $input) {
-        success
-      }
-    }
-  `;
-  const variables = {
-    input: {
-      agentSessionId: params.sessionId,
-      // TODO(verify-linear-api): confirm field name(s) for attaching a link
-      externalUrl: params.externalUrl,
-      externalUrlLabel: params.externalUrlLabel,
-    },
-  };
   const data = await linearGraphQL<{ agentSessionUpdate: { success: boolean } }>(
     client,
-    mutation,
-    variables
+    `mutation AgentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
+      agentSessionUpdate(id: $id, input: $input) { success }
+    }`,
+    {
+      id: params.sessionId,
+      input: {
+        ...(params.externalUrls ? { externalUrls: params.externalUrls } : {}),
+        ...(params.addedExternalUrls ? { addedExternalUrls: params.addedExternalUrls } : {}),
+      },
+    }
   );
+  if (!data.agentSessionUpdate.success) {
+    throw new Error("Linear agentSessionUpdate returned success: false");
+  }
   return data.agentSessionUpdate;
 }
 
-/** Post a plain comment on an issue (used by sweep for expiry notices). */
 export async function commentCreate(
   client: LinearClient,
   params: { issueId: string; body: string }
 ): Promise<{ success: boolean }> {
-  const mutation = `
-    mutation CommentCreate($input: CommentCreateInput!) {
-      commentCreate(input: $input) {
-        success
-      }
-    }
-  `;
-  const variables = { input: { issueId: params.issueId, body: params.body } };
   const data = await linearGraphQL<{ commentCreate: { success: boolean } }>(
     client,
-    mutation,
-    variables
+    `mutation CommentCreate($input: CommentCreateInput!) {
+      commentCreate(input: $input) { success }
+    }`,
+    { input: { issueId: params.issueId, body: params.body } }
   );
+  if (!data.commentCreate.success) {
+    throw new Error("Linear commentCreate returned success: false");
+  }
   return data.commentCreate;
 }
-
-// ---------------------------------------------------------------------------
-// OAuth (actor=app flow)
-// https://linear.app/developers/agents — TODO(verify-linear-api): confirm
-// scope list and that `actor=app` is a query param on the authorize URL
-// (vs a form field on the token exchange).
-// ---------------------------------------------------------------------------
 
 export function buildLinearInstallUrl(params: {
   clientId: string;
@@ -224,8 +251,7 @@ export function buildLinearInstallUrl(params: {
   url.searchParams.set("client_id", params.clientId);
   url.searchParams.set("redirect_uri", params.redirectUri);
   url.searchParams.set("response_type", "code");
-  // TODO(verify-linear-api): confirm required scopes for agent apps
-  url.searchParams.set("scope", "app:mentionable,read,write");
+  url.searchParams.set("scope", "read,write,app:assignable,app:mentionable");
   url.searchParams.set("actor", "app");
   url.searchParams.set("state", params.state);
   return url.toString();
@@ -234,31 +260,52 @@ export function buildLinearInstallUrl(params: {
 export interface LinearOAuthTokenResponse {
   access_token: string;
   token_type: string;
-  scope?: string;
-  expires_in?: number; // TODO(verify-linear-api): confirm app-actor tokens are long-lived / non-expiring
+  scope?: string | string[];
+  expires_in?: number;
+  refresh_token?: string;
 }
 
-export async function exchangeLinearOAuthCode(params: {
+async function exchangeToken(body: URLSearchParams): Promise<LinearOAuthTokenResponse> {
+  const response = await fetch(LINEAR_OAUTH_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: body.toString(),
+    signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    throw new Error(`Linear OAuth token exchange failed (${response.status}): ${await response.text()}`);
+  }
+  return (await response.json()) as LinearOAuthTokenResponse;
+}
+
+export function exchangeLinearOAuthCode(params: {
   clientId: string;
   clientSecret: string;
   redirectUri: string;
   code: string;
 }): Promise<LinearOAuthTokenResponse> {
-  const body = new URLSearchParams({
-    client_id: params.clientId,
-    client_secret: params.clientSecret,
-    redirect_uri: params.redirectUri,
-    code: params.code,
-    grant_type: "authorization_code",
-  });
-  const res = await fetch(LINEAR_OAUTH_TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: body.toString(),
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Linear OAuth token exchange failed (${res.status}): ${text}`);
-  }
-  return (await res.json()) as LinearOAuthTokenResponse;
+  return exchangeToken(
+    new URLSearchParams({
+      client_id: params.clientId,
+      client_secret: params.clientSecret,
+      redirect_uri: params.redirectUri,
+      code: params.code,
+      grant_type: "authorization_code",
+    })
+  );
+}
+
+export function refreshLinearOAuthToken(params: {
+  clientId: string;
+  clientSecret: string;
+  refreshToken: string;
+}): Promise<LinearOAuthTokenResponse> {
+  return exchangeToken(
+    new URLSearchParams({
+      client_id: params.clientId,
+      client_secret: params.clientSecret,
+      refresh_token: params.refreshToken,
+      grant_type: "refresh_token",
+    })
+  );
 }

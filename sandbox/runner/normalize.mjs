@@ -27,27 +27,49 @@ import { createInterface } from "node:readline";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 // ---------------------------------------------------------------------------
 // Sanitization — SPEC: redact values of all env vars whose names match
 // (TOKEN|KEY|SECRET|PASSWORD), plus a fixed set of token-shape regexes.
 // ---------------------------------------------------------------------------
 
-const ENV_NAME_PATTERN = /(TOKEN|KEY|SECRET|PASSWORD)/i;
+const ENV_NAME_PATTERN = /(TOKEN|KEY|SECRET|PASSWORD|AUTH_JSON)/i;
 
 const SECRET_REGEXES = [
-  /ghp_\w+/g,
+  /gh[opsu]_\w+/g,
   /github_pat_\w+/g,
   /sk-[\w-]+/g,
-  /lin_api_\w+/g,
+  /lin_(?:api|oauth)_\w+/g,
   /Bearer \S+/g,
 ];
 
-function collectEnvSecretValues() {
+function collectNestedSecretValues(value) {
+  try {
+    const parsed = JSON.parse(value);
+    const nested = [];
+    const visit = (item) => {
+      if (typeof item === "string") {
+        if (item.length >= 8) nested.push(item);
+      } else if (Array.isArray(item)) {
+        for (const child of item) visit(child);
+      } else if (item && typeof item === "object") {
+        for (const child of Object.values(item)) visit(child);
+      }
+    };
+    visit(parsed);
+    return nested;
+  } catch {
+    return [];
+  }
+}
+
+export function collectEnvSecretValues(env = process.env) {
   const values = [];
-  for (const [name, value] of Object.entries(process.env)) {
+  for (const [name, value] of Object.entries(env)) {
     if (value && ENV_NAME_PATTERN.test(name)) {
       values.push(value);
+      values.push(...collectNestedSecretValues(value));
     }
   }
   // Longest first so a value that happens to be a prefix/substring of
@@ -57,9 +79,9 @@ function collectEnvSecretValues() {
 
 const ENV_SECRET_VALUES = collectEnvSecretValues();
 
-function sanitize(text) {
+export function sanitize(text, secretValues = ENV_SECRET_VALUES) {
   let out = text;
-  for (const value of ENV_SECRET_VALUES) {
+  for (const value of secretValues) {
     if (!value) continue;
     out = out.split(value).join("[REDACTED]");
   }
@@ -98,7 +120,7 @@ function writeSessionId(id) {
 
 const TRUNCATE_LEN = 2000;
 
-function truncate(str, len = TRUNCATE_LEN) {
+export function truncate(str, len = TRUNCATE_LEN) {
   const s = String(str);
   if (s.length <= len) return s;
   return `${s.slice(0, len)}… [truncated ${s.length - len} chars]`;
@@ -168,6 +190,9 @@ function handleClaudeLine(obj) {
       return true;
     }
     case "result": {
+      if (typeof obj.total_cost_usd === "number" && Number.isFinite(obj.total_cost_usd)) {
+        runResult.cost_usd = obj.total_cost_usd;
+      }
       emit(
         `[claude] result: ${obj.subtype ?? "?"} is_error=${obj.is_error ?? false} turns=${obj.num_turns ?? "?"} cost_usd=${obj.total_cost_usd ?? "?"}`,
       );
@@ -182,13 +207,8 @@ function handleClaudeLine(obj) {
 // ---------------------------------------------------------------------------
 // codex exec --json line handling
 //
-// TODO(verify-codex-json-schema): the event/type names and field paths below
-// (thread.started -> thread_id, item.completed -> item.type/text/command/
-// status, turn.* -> usage) are best-effort reconstructions of the
-// `codex exec --json` JSONL protocol and may drift between @openai/codex
-// versions. Verify against the installed codex CLI's own docs/`--help`
-// output before first production run, and adjust summarizeCodexItem /
-// handleCodexLine accordingly.
+// Event names and paths below match the current `codex exec --json` JSONL
+// protocol: thread.started.thread_id, turn.*, and item.completed.item.
 // ---------------------------------------------------------------------------
 
 function handleCodexLine(obj) {
@@ -235,7 +255,7 @@ function handleCodexLine(obj) {
   }
 }
 
-function summarizeCodexItem(item) {
+export function summarizeCodexItem(item) {
   switch (item.type) {
     case "agent_message":
       return `agent_message: ${truncate(String(item.text ?? ""), 500)}`;
@@ -256,9 +276,9 @@ function summarizeCodexItem(item) {
 // Main loop
 // ---------------------------------------------------------------------------
 
-const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+const runResult = {};
 
-rl.on("line", (raw) => {
+export function processLine(raw) {
   const line = raw.trim();
   if (!line) return;
 
@@ -282,8 +302,22 @@ rl.on("line", (raw) => {
 
   // Recognized JSON but an unknown shape — pass through, truncated.
   emit(truncate(JSON.stringify(obj)));
-});
+}
 
-rl.on("close", () => {
-  // Nothing to flush; each line was written as it arrived.
-});
+export function writeRunResult() {
+  try {
+    mkdirSync(OT_DIR, { recursive: true });
+    writeFileSync(join(OT_DIR, "run-result.json"), JSON.stringify(runResult) + "\n", {
+      mode: 0o600,
+    });
+  } catch (err) {
+    process.stderr.write(`[normalize] failed to write run result: ${err.message}\n`);
+  }
+}
+
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMain) {
+  const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+  rl.on("line", processLine);
+  rl.on("close", writeRunResult);
+}

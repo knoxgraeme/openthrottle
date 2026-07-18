@@ -1,8 +1,9 @@
-import type { Daytona } from "@daytonaio/sdk";
+import type { Daytona } from "@daytona/sdk";
 import type { Config } from "./config.js";
 import type { TicketStore } from "./db.js";
 import { deleteSandbox, listLabeledSandboxes } from "./daytona.js";
 import { commentCreate, type LinearClient } from "./linear.js";
+import { expireRun } from "./server.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -19,8 +20,14 @@ export async function runSweep(
   linear: LinearClient | undefined,
   cfg: Config
 ): Promise<void> {
+  for (const run of store.listExpiredRuns(new Date().toISOString())) {
+    await expireRun(store, linear, run);
+  }
   await expireStaleTickets(daytona, store, linear, cfg);
-  await deleteOrphanSandboxes(daytona, store);
+  await deleteOrphanSandboxes(daytona, store, cfg);
+  const retentionCutoff = new Date(Date.now() - 7 * DAY_MS).toISOString();
+  store.pruneDeliveries(retentionCutoff);
+  store.pruneSandboxEvents(retentionCutoff);
 }
 
 async function expireStaleTickets(
@@ -73,7 +80,8 @@ async function expireStaleTickets(
 
 async function deleteOrphanSandboxes(
   daytona: Daytona,
-  store: TicketStore
+  store: TicketStore,
+  cfg: Config
 ): Promise<void> {
   let sandboxes;
   try {
@@ -85,7 +93,20 @@ async function deleteOrphanSandboxes(
 
   for (const sandbox of sandboxes) {
     const ticket = store.getBySandboxId(sandbox.id);
-    if (ticket && ticket.state === "active") continue; // known, still in use
+    if (ticket && ticket.state !== "closed" && ticket.state !== "expired") {
+      continue; // active, stopped, and error workspaces remain reusable
+    }
+
+    // A sandbox can become visible to list() before handleCreated persists its
+    // ID. Never sweep inside that provisioning window. Missing timestamps are
+    // treated conservatively and retried on a later sweep.
+    const createdAt = sandbox.createdAt ? Date.parse(sandbox.createdAt) : Number.NaN;
+    if (
+      Number.isNaN(createdAt) ||
+      Date.now() - createdAt < cfg.orphanGraceMinutes * 60 * 1000
+    ) {
+      continue;
+    }
 
     console.log(`[sweep] deleting orphan sandbox ${sandbox.id} (label ticket=${sandbox.labels?.ticket ?? "?"})`);
     try {
