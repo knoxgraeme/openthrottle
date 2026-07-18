@@ -20,12 +20,12 @@ Export the values from `.env.example`; the process does not implicitly load
 
 ## Deploy to Fly
 
-`fly.toml` uses the `sea` region, a persistent `/data` mount, and one always-on
+`fly.toml` uses the `sjc` region, a persistent `/data` mount, and one always-on
 shared machine so webhook acknowledgement and the in-process sweep remain
 reliable.
 
 ```bash
-fly volumes create openthrottle_data --region sea --size 1
+fly volumes create openthrottle_data --region sjc --size 1
 fly secrets set SUPERVISOR_URL=https://<app>.fly.dev \
   OT_STATUS_TOKEN=<random> OT_INSTALL_SECRET=<random> \
   LINEAR_WEBHOOK_SECRET=... LINEAR_CLIENT_ID=... LINEAR_CLIENT_SECRET=... \

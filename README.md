@@ -43,7 +43,7 @@ daytona snapshot create openthrottle --dockerfile sandbox/Dockerfile --context .
 
 # deploy the always-on supervisor
 cd supervisor
-fly volumes create openthrottle_data --region sea --size 1
+fly volumes create openthrottle_data --region sjc --size 1
 fly secrets set SUPERVISOR_URL=... OT_STATUS_TOKEN=... OT_INSTALL_SECRET=... # plus .env.example
 fly deploy
 ```

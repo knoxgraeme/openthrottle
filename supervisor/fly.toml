@@ -4,7 +4,7 @@
 # app name is intentionally left as a placeholder — `fly launch` will either
 # fill this in interactively or you should set it before first deploy:
 app = "openthrottle-supervisor"
-primary_region = "sea"
+primary_region = "sjc"
 
 [build]
 
