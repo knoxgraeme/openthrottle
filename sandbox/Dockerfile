@@ -89,4 +89,8 @@ RUN chmod 0755 /opt/openthrottle/entrypoint.sh \
       /opt/openthrottle/safety/seal.sh
 
 WORKDIR /home/agent
-ENTRYPOINT ["/opt/openthrottle/entrypoint.sh"]
+
+# Daytona executes the image entrypoint as soon as a sandbox is provisioned.
+# Keep that automatic session inert: the Fly supervisor must upload the latest
+# Linear context and run credentials before it explicitly starts entrypoint.sh.
+ENTRYPOINT ["/bin/true"]

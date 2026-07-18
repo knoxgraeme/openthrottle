@@ -41,8 +41,9 @@ Linear AgentSessionEvent ──HMAC──> Fly supervisor ──@daytona/sdk─�
 3. It posts an ephemeral `thought`, resolves repo and agent labels, persists
    `promptContext`, inserts the ticket, and atomically claims a run.
 4. It creates a private Daytona sandbox from `DAYTONA_SNAPSHOT`, labeled
-   `openthrottle=true` and `ticket=<identifier>`. The image entrypoint starts
-   the requested task.
+   `openthrottle=true` and `ticket=<identifier>`. The image entrypoint is an
+   inert no-op; Fly uploads the latest Linear context and run credentials,
+   then explicitly starts the requested task in a Daytona process session.
 
 ### Follow-up
 

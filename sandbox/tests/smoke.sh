@@ -29,6 +29,8 @@ git -C "$SMOKE_DIR/work" remote add origin "file://$SMOKE_DIR/repo.git"
 git -C "$SMOKE_DIR/work" push -u origin main >/dev/null
 git --git-dir "$SMOKE_DIR/repo.git" symbolic-ref HEAD refs/heads/main
 
+test "$(docker image inspect --format '{{json .Config.Entrypoint}}' "$IMAGE")" = '["/bin/true"]'
+
 docker run --rm --entrypoint bash "$IMAGE" -lc '
   claude --version | rg -q "^2\.1\.201" &&
   claude --help | rg -q -- "--setting-sources" &&
@@ -83,6 +85,7 @@ run_sandbox() {
     > "$home_dir/.ot/linear-context.md"
   local docker_args=(
     run --rm
+    --entrypoint /opt/openthrottle/entrypoint.sh
     --network "$NETWORK"
     -e OT_SMOKE_TEST=1
     -e OT_GIT_URL_OVERRIDE=file:///fixture/repo.git

@@ -9,8 +9,10 @@ daytona snapshot create openthrottle --dockerfile sandbox/Dockerfile --context .
 ```
 
 It contains Node 22, git/curl/jq/yq/ripgrep/GitHub CLI, Claude Code, Codex,
-and an unprivileged `agent` user. The root entrypoint owns checkout and safety
-setup, then drops privileges for all repo and agent commands.
+and an unprivileged `agent` user. Its automatic image entrypoint is an inert
+no-op so Daytona provisioning cannot race the supervisor. Fly uploads the run
+context and explicitly launches the root task script, which owns checkout and
+safety setup before dropping privileges for repo and agent commands.
 
 ## Lifecycle
 
