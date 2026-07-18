@@ -1,11 +1,13 @@
 import { serve } from "@hono/node-server";
-import { Daytona } from "@daytonaio/sdk";
+import { Daytona } from "@daytona/sdk";
 import { loadConfig } from "./config.js";
 import { openDb, createTicketStore } from "./db.js";
-import { createServer } from "./server.js";
+import { createServer, createServerWebhookDeliveryProcessor } from "./server.js";
 import { runSweep } from "./sweep.js";
+import { createLinearClientProvider } from "./linear-auth.js";
 
 const SWEEP_INTERVAL_MS = 15 * 60 * 1000; // run every 15 min while awake; SPEC only requires "on every boot" + periodic while awake
+const DELIVERY_DRAIN_INTERVAL_MS = 30 * 1000;
 
 async function main() {
   const cfg = loadConfig();
@@ -14,28 +16,34 @@ async function main() {
   const store = createTicketStore(db);
 
   const daytona = new Daytona({ apiKey: cfg.daytonaApiKey });
+  const getLinearClient = createLinearClientProvider(cfg, store);
+  const deliveryProcessor = createServerWebhookDeliveryProcessor({
+    cfg,
+    store,
+    daytona,
+    getLinearClient,
+  });
 
-  const app = createServer({ cfg, store, daytona });
+  const app = createServer({ cfg, store, daytona, getLinearClient, deliveryProcessor });
 
   serve({ fetch: app.fetch, port: cfg.port }, (info) => {
     console.log(`[supervisor] listening on :${info.port}`);
   });
 
-  const linear = store.getSetting("linear_access_token")
-    ? { accessToken: store.getSetting("linear_access_token")! }
-    : undefined;
-
   // Run once on boot, then on an interval while the process stays awake.
-  runSweep(daytona, store, linear, cfg).catch((err) =>
-    console.error("[sweep] boot sweep failed:", err)
-  );
+  deliveryProcessor.drain().catch((err) => console.error("[webhooks] boot drain failed:", err));
+  getLinearClient()
+    .then((linear) => runSweep(daytona, store, linear, cfg))
+    .catch((err) => console.error("[sweep] boot sweep failed:", err));
   setInterval(() => {
-    const currentLinear = store.getSetting("linear_access_token")
-      ? { accessToken: store.getSetting("linear_access_token")! }
-      : undefined;
-    runSweep(daytona, store, currentLinear, cfg).catch((err) =>
-      console.error("[sweep] interval sweep failed:", err)
-    );
+    deliveryProcessor
+      .drain()
+      .catch((err) => console.error("[webhooks] interval drain failed:", err));
+  }, DELIVERY_DRAIN_INTERVAL_MS).unref();
+  setInterval(() => {
+    getLinearClient()
+      .then((linear) => runSweep(daytona, store, linear, cfg))
+      .catch((err) => console.error("[sweep] interval sweep failed:", err));
   }, SWEEP_INTERVAL_MS).unref();
 
   for (const sig of ["SIGINT", "SIGTERM"] as const) {

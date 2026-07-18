@@ -3,7 +3,7 @@ name: review
 description: >
   Reviews an open PR against its originating Linear ticket for task
   alignment, best practices, security, silent failures, and prior-review
-  triage; commits trivial fixes and posts a gh pr review plus a Linear
+  triage; commits trivial fixes and posts a PR comment plus a Linear
   update. Use when asked to review a PR, or for a re-review after
   review-fix pushes changes.
 ---
@@ -118,10 +118,10 @@ git push origin ${BRANCH_NAME}
 
 Note what you fixed in the review comment.
 
-### Real issues (request changes)
+### Real issues (blocking verdict comment)
 
 ```bash
-gh pr review ${PR_NUMBER} --repo ${GITHUB_REPO} --request-changes --body "$(cat <<'EOF'
+gh pr comment ${PR_NUMBER} --repo ${GITHUB_REPO} --body "$(cat <<'EOF'
 ## Review
 
 ### Blocking
@@ -146,10 +146,10 @@ EOF
 )"
 ```
 
-### Clean (approve)
+### Clean (merge-ready verdict comment)
 
 ```bash
-gh pr review ${PR_NUMBER} --repo ${GITHUB_REPO} --approve --body "$(cat <<'EOF'
+gh pr comment ${PR_NUMBER} --repo ${GITHUB_REPO} --body "$(cat <<'EOF'
 ## Review
 
 ### Task Alignment
@@ -163,9 +163,9 @@ EOF
 
 ### Post to Linear
 
-After posting the `gh pr review`, add a short `action` activity to the
-Linear session (`LINEAR_SESSION_ID`) that mirrors the verdict — approved,
-or N blocking items requested — with a link to the PR review. Keep it to
+After posting the PR comment, add a short `action` activity to the
+Linear session (`LINEAR_SESSION_ID`) that mirrors the verdict — merge-ready,
+or N blocking items found — with a link to the PR comment. Keep it to
 a sentence or two; the full detail lives on the PR, not duplicated in
 Linear.
 
@@ -182,3 +182,6 @@ Linear.
 - **Conventional commits** for fixes: `fix: <what> (reviewer)`.
 - **Never modify tests to force a pass** — a red test is signal, not an
   obstacle.
+- **Never approve or request changes through GitHub review state.** The same
+  bot identity authors and reviews these PRs, so verdicts are comments and a
+  human owns the merge decision.

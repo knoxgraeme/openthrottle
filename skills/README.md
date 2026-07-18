@@ -8,7 +8,7 @@ skill exists in **two forms that share one canonical body**:
 skills/
   claude/<name>/SKILL.md   # Claude Code skill format (YAML frontmatter: name, description)
   codex/<name>.md          # plain prompt piped to `codex exec` on stdin
-  codex/AGENTS-fragment.md # project-instruction fragment appended to the target repo's AGENTS.md
+  codex/AGENTS-fragment.md # global runtime instructions installed outside the checkout
 ```
 
 Skills in v1: `implement-plan`, `review`, `review-fix`, `investigate`.
@@ -39,9 +39,9 @@ re-examined, not a green light to drift silently.
 
 ## How to keep them in sync
 
-There's no automated check for this yet (v1 scaffold has none of the
-usual doc-generation tooling, deliberately — see SPEC's "Conventions").
-Until there is, follow this by hand:
+The CI contract exercises both engines' runtime selection and the locked
+review-verdict convention. For substantive prose changes, also follow this
+manual synchronization pass:
 
 1. Decide the behavior change first, independent of which file you're
    about to edit.
@@ -88,9 +88,9 @@ Until there is, follow this by hand:
 ## `AGENTS-fragment.md`
 
 This one has no Claude-form counterpart — Claude Code gets its standing
-context from `.claude/skills/` automatically; Codex has no equivalent, so
-the entrypoint appends this fragment to the target repo's `AGENTS.md` for
-the duration of the task (never committed — added to
-`.git/info/exclude`). It covers: what env/context is available, the
-push-early rule, the never-push-to-base rule, the sanitization/injection
-guard, and how to post to Linear without assuming fixed tool names.
+context from `.claude/skills/` automatically; Codex has no equivalent, so the
+entrypoint installs this fragment globally at `~/.codex/AGENTS.md`. It lives
+outside the checkout, leaving any project `AGENTS.md` untouched and editable.
+It covers what env/context is available, the push-early rule, the
+never-push-to-base rule, the sanitization/injection guard, and how to post to
+Linear without assuming fixed tool names.

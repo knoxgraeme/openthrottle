@@ -1,6 +1,8 @@
 // Small shared helpers used by the init/ship/status subcommands.
 // Kept dependency-free (no framework) per SPEC "CLI contract".
 
+const HTTP_TIMEOUT_MS = 15_000;
+
 export function getErrorMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
   if (typeof err === 'string') return err;
@@ -24,6 +26,24 @@ export function requireEnv(name: string, hint?: string): string {
     process.exit(1);
   }
   return v;
+}
+
+export function supervisorRequest(path: string, init?: RequestInit): Promise<Response> {
+  const supervisorUrl = requireEnv(
+    'OT_SUPERVISOR_URL',
+    'the base URL of your deployed supervisor, e.g. https://openthrottle.fly.dev'
+  );
+  const statusToken = requireEnv(
+    'OT_STATUS_TOKEN',
+    'the operator bearer token configured on the supervisor'
+  );
+  const headers = new Headers(init?.headers);
+  headers.set('Authorization', `Bearer ${statusToken}`);
+  return fetch(`${supervisorUrl.replace(/\/+$/, '')}${path}`, {
+    ...init,
+    headers,
+    signal: init?.signal ?? AbortSignal.timeout(HTTP_TIMEOUT_MS),
+  });
 }
 
 /**
@@ -69,6 +89,7 @@ export async function linearGraphQL<T = unknown>(
       Authorization: apiKey,
     },
     body: JSON.stringify({ query, variables }),
+    signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
   });
 
   const json = (await res.json()) as { data?: T; errors?: Array<{ message: string }> };

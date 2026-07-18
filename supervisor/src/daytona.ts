@@ -1,13 +1,9 @@
-import { Daytona, Sandbox } from "@daytonaio/sdk";
+import type { Daytona, Sandbox } from "@daytona/sdk";
 import type { Config } from "./config.js";
-import type { Agent } from "./db.js";
-
-export function createDaytonaClient(cfg: Config): Daytona {
-  return new Daytona({ apiKey: cfg.daytonaApiKey });
-}
+import type { Agent, TaskType } from "./db.js";
 
 export interface SandboxEnvContract {
-  TASK_TYPE: "implement" | "resume";
+  TASK_TYPE: TaskType;
   AGENT: Agent;
   GITHUB_REPO: string;
   GITHUB_TOKEN: string;
@@ -18,7 +14,12 @@ export interface SandboxEnvContract {
   LINEAR_ISSUE_IDENTIFIER: string;
   LINEAR_ACCESS_TOKEN: string;
   LINEAR_MCP_API_KEY: string;
+  SUPERVISOR_URL: string;
+  RUN_ID: string;
+  RUN_CALLBACK_TOKEN: string;
   RESUME_MESSAGE?: string;
+  PR_NUMBER?: string;
+  REVIEW_ROUND?: string;
   CLAUDE_CODE_OAUTH_TOKEN?: string;
   ANTHROPIC_API_KEY?: string;
   CODEX_API_KEY?: string;
@@ -28,119 +29,101 @@ export interface SandboxEnvContract {
   DEV_PORT: string;
 }
 
-function toEnvVars(env: SandboxEnvContract): Record<string, string> {
-  // Daytona envVars is Record<string,string> — strip undefined optionals.
-  const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(env)) {
-    if (v !== undefined) out[k] = v;
-  }
-  return out;
+export function toEnvVars(env: SandboxEnvContract): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined)
+  );
 }
 
-/**
- * Create a fresh sandbox for a new ticket ("implement" flow).
- * Params per SPEC "Daytona" contract:
- *   { snapshot, envVars, labels: { openthrottle: "true", ticket }, autoStopInterval: 60, autoDeleteInterval: -1 }
- * Verified against installed @daytonaio/sdk (0.199.x) Daytona.create():
- *   CreateSandboxFromSnapshotParams = { snapshot?, envVars?, labels?, autoStopInterval?, autoDeleteInterval?, ... }
- */
 export async function createForTicket(
   daytona: Daytona,
   cfg: Config,
-  params: {
-    issueIdentifier: string;
-    env: Omit<SandboxEnvContract, "TASK_TYPE" | "RESUME_MESSAGE">;
-  }
+  params: { issueIdentifier: string; env: SandboxEnvContract }
 ): Promise<Sandbox> {
-  const envVars = toEnvVars({ ...params.env, TASK_TYPE: "implement" });
   return daytona.create({
     snapshot: cfg.daytonaSnapshot,
-    envVars,
+    envVars: toEnvVars(params.env),
     labels: {
       openthrottle: "true",
       ticket: params.issueIdentifier,
     },
-    autoStopInterval: 60, // minutes idle before auto-stop
-    autoDeleteInterval: -1, // never auto-delete; deletion is explicit (PR close / sweep)
+    public: false,
+    autoStopInterval: 60,
+    autoDeleteInterval: -1,
   });
 }
 
-/**
- * Resume flow: start the sandbox if stopped, then re-run the entrypoint in
- * resume mode via the process exec API (do NOT recreate the sandbox).
- * SPEC: "re-run the entrypoint task in resume mode by executing the sandbox
- * command /opt/openthrottle/entrypoint.sh with TASK_TYPE=resume and
- * RESUME_MESSAGE set (use Daytona process exec API)".
- *
- * TODO(verify-sdk): executeCommand's `env` param — confirmed to exist on
- * Process.executeCommand(command, cwd?, env?, timeout?) — but verify it is
- * merged with (not replacing) the sandbox's base env, and that long-running
- * commands (the full agent run, up to TASK_TIMEOUT seconds) are supported
- * synchronously vs requiring a background session (createSession +
- * executeSessionCommand with runAsync). Using a session here to avoid
- * blocking on a webhook-handler-scoped HTTP call for up to TASK_TIMEOUT.
- */
-export async function startAndResume(
+export async function findSandboxForTicket(
   daytona: Daytona,
+  issueIdentifier: string
+): Promise<Sandbox | undefined> {
+  for await (const sandbox of daytona.list({
+    labels: { openthrottle: "true", ticket: issueIdentifier },
+  })) {
+    return sandbox;
+  }
+  return undefined;
+}
+
+export async function startTask(
   sandbox: Sandbox,
   params: {
-    resumeMessage: string;
-    env: Omit<SandboxEnvContract, "TASK_TYPE" | "RESUME_MESSAGE">;
+    env: SandboxEnvContract;
     taskTimeoutSeconds: number;
   }
 ): Promise<void> {
-  if (sandbox.state !== "started") {
-    await daytona.start(sandbox, 60);
-  }
-
-  const envVars = toEnvVars({
-    ...params.env,
-    TASK_TYPE: "resume",
-    RESUME_MESSAGE: params.resumeMessage,
+  if (sandbox.state !== "started") await sandbox.start(60);
+  const envVars = toEnvVars(params.env);
+  const optionalNames = ["RESUME_MESSAGE", "PR_NUMBER", "REVIEW_ROUND"] as const;
+  await sandbox.updateEnv(envVars, {
+    unset: optionalNames.filter((name) => params.env[name] === undefined),
   });
 
-  // Run detached in a background session so this call returns quickly; the
-  // sandbox entrypoint itself posts the final Linear activity on completion.
-  const sessionId = `resume-${Date.now()}`;
+  const sessionId = `${params.env.TASK_TYPE}-${params.env.RUN_ID}`;
   await sandbox.process.createSession(sessionId);
   await sandbox.process.executeSessionCommand(
     sessionId,
     {
       command: "/opt/openthrottle/entrypoint.sh",
-      runAsync: true, // TODO(verify-sdk): confirm SessionExecuteRequest field name for fire-and-forget execution
-      env: envVars, // TODO(verify-sdk): confirm SessionExecuteRequest accepts an `env` map
-    } as never, // TODO(verify-sdk): SessionExecuteRequest shape imported from @daytona/toolbox-api-client not fully inspected; cast pending verification
+      runAsync: true,
+      suppressInputEcho: true,
+    },
     params.taskTimeoutSeconds
   );
 }
 
+export async function stopSandbox(daytona: Daytona, sandboxId: string): Promise<void> {
+  const sandbox = await daytona.get(sandboxId);
+  await sandbox.stop(60, true);
+}
+
 export async function deleteSandbox(daytona: Daytona, sandboxId: string): Promise<void> {
   const sandbox = await daytona.get(sandboxId);
-  await daytona.delete(sandbox, 60, false);
+  await sandbox.delete(60, false);
 }
 
-/**
- * List sandboxes labeled openthrottle=true in Daytona that have no
- * corresponding DB row (or whose DB row is closed/expired) — used by the
- * sweep to clean up orphans. Caller cross-references against the DB.
- */
+export async function getSignedPreviewUrl(
+  daytona: Daytona,
+  sandboxId: string,
+  port: number
+): Promise<string> {
+  const sandbox = await daytona.get(sandboxId);
+  if (sandbox.state !== "started") await sandbox.start(60);
+  const preview = await sandbox.getSignedPreviewUrl(port, 5 * 60);
+  return preview.url;
+}
+
+export async function getSandboxLogs(daytona: Daytona, sandboxId: string): Promise<string> {
+  const sandbox = await daytona.get(sandboxId);
+  if (sandbox.state !== "started") await sandbox.start(60);
+  const logs = await sandbox.process.getEntrypointLogs();
+  return logs.output ?? [logs.stdout, logs.stderr].filter(Boolean).join("\n");
+}
+
 export async function listLabeledSandboxes(daytona: Daytona): Promise<Sandbox[]> {
-  const out: Sandbox[] = [];
+  const sandboxes: Sandbox[] = [];
   for await (const sandbox of daytona.list({ labels: { openthrottle: "true" } })) {
-    out.push(sandbox);
+    sandboxes.push(sandbox);
   }
-  return out;
-}
-
-/**
- * Deterministic preview URL for a sandbox port, without an extra API round
- * trip (SPEC: "preview URL (deterministic from sandboxId)").
- * TODO(verify-sdk): confirm the exact Daytona preview URL domain/pattern
- * for the target Daytona deployment (self-hosted vs app.daytona.io) — the
- * SDK's authoritative equivalent is the async `sandbox.getPreviewLink(port)`
- * call (returns { url, token }), which should be preferred wherever an
- * extra API call is acceptable (e.g. after resume) instead of this guess.
- */
-export function computePreviewUrl(sandboxId: string, port: number): string {
-  return `https://${port}-${sandboxId}.proxy.daytona.works`;
+  return sandboxes;
 }

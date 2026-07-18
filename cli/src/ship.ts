@@ -2,16 +2,8 @@
 // openthrottle ship <file.md>
 //
 // Creates a Linear issue from a markdown file (title = first `#` heading,
-// body = the rest) via raw GraphQL using LINEAR_API_KEY, then attempts to
-// delegate it to the OpenThrottle agent app so the supervisor picks it up.
-//
-// SPEC-DEVIATION: the Linear Agent API (Developer Preview) does not document
-// a dedicated "delegate this issue to an app" mutation as of this writing.
-// The delegate step here assumes delegation == assigning the issue to the
-// agent app's actor user (`issueUpdate(input: { assigneeId })`), which is
-// the mechanism described informally for triggering an AgentSessionEvent.
-// This is UNVERIFIED — see TODO(verify-linear-api) below. If it's wrong,
-// `ship` still creates the issue and prints manual delegate instructions.
+// body = the rest) via raw GraphQL using LINEAR_API_KEY, then delegates it
+// to the OpenThrottle app with IssueUpdateInput.delegateId.
 // =============================================================================
 
 import { readFileSync, existsSync } from 'node:fs';
@@ -99,22 +91,21 @@ async function createIssue(apiKey: string, teamId: string, title: string, descri
   return data.issueCreate.issue;
 }
 
-// TODO(verify-linear-api): confirm the delegate mechanism. Candidates seen in
-// Linear's (Developer Preview) Agent API docs/community examples:
-//   1. issueUpdate(input: { assigneeId: <app actor id> }) — assign to the app.
-//   2. A dedicated agentSessionCreate/delegate mutation that isn't stable yet.
-// This implementation tries (1) and treats any GraphQL error as "delegation
-// isn't wired up" rather than a hard failure — `ship` always succeeds at
-// creating the issue even if delegation fails.
-async function attemptDelegate(apiKey: string, issueId: string, agentAppId: string): Promise<boolean> {
-  await linearGraphQL(
+export async function delegateIssue(
+  apiKey: string,
+  issueId: string,
+  agentAppId: string
+): Promise<void> {
+  const data = await linearGraphQL<{ issueUpdate: { success: boolean } }>(
     apiKey,
     `mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
       issueUpdate(id: $id, input: $input) { success }
     }`,
-    { id: issueId, input: { assigneeId: agentAppId } }
+    { id: issueId, input: { delegateId: agentAppId } }
   );
-  return true;
+  if (!data.issueUpdate.success) {
+    throw new Error('issueUpdate returned success: false');
+  }
 }
 
 export default async function ship(file: string | undefined): Promise<void> {
@@ -170,12 +161,12 @@ export default async function ship(file: string | undefined): Promise<void> {
   if (agentAppId) {
     s.start('Delegating to the OpenThrottle agent');
     try {
-      await attemptDelegate(apiKey, issue.id, agentAppId);
+      await delegateIssue(apiKey, issue.id, agentAppId);
       s.stop('Delegated. The supervisor should pick this up shortly.');
     } catch (err: unknown) {
       s.stop('Automatic delegation failed.');
       p.log.warn(
-        `SPEC-DEVIATION: could not delegate ${issue.identifier} automatically (${getErrorMessage(err)}).\n` +
+        `Could not delegate ${issue.identifier} automatically (${getErrorMessage(err)}).\n` +
           `  Open the issue and delegate it to the OpenThrottle agent manually:\n` +
           `  ${issue.url}`
       );
@@ -183,7 +174,7 @@ export default async function ship(file: string | undefined): Promise<void> {
   } else {
     p.log.info(
       'OT_AGENT_APP_ID is not set — skipping automatic delegation.\n' +
-        `  Delegate it in Linear (assign the issue to the OpenThrottle agent, or @-mention it):\n` +
+        `  Delegate it to the OpenThrottle agent in Linear, or @-mention the agent:\n` +
         `  ${issue.url}`
     );
   }

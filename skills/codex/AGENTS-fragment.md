@@ -1,9 +1,9 @@
 # OpenThrottle sandbox — project instructions
 
-This fragment is appended to this repo's `AGENTS.md` by the sandbox
-entrypoint for the duration of this task. It is **not** committed (the
-entrypoint adds it to `.git/info/exclude`) — it exists only so Codex has
-the same standing context Claude gets from `.claude/skills/`.
+The sandbox entrypoint installs this file as global Codex instructions at
+`~/.codex/AGENTS.md` for the duration of the workspace. It lives outside the
+target checkout and is never committed. This gives Codex the same standing
+context Claude gets from its user-level skills without changing project files.
 
 ## Environment available to you
 
@@ -11,7 +11,8 @@ You're running as the `agent` user in a Daytona sandbox, inside the
 already-cloned repo at `/home/agent/repo`. Useful env vars, all set by
 the entrypoint:
 
-- `TASK_TYPE` — `implement` or `resume`.
+- `TASK_TYPE` — `implement`, `resume`, `review`, `review-fix`, or
+  `investigate`.
 - `GITHUB_REPO` — `owner/name`.
 - `BASE_BRANCH` — the repo's default branch (e.g. `main`).
 - `BRANCH_NAME` — `ot/<ticket-id>`, already checked out and already

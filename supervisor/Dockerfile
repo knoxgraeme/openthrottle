@@ -11,8 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 make g++ \
     && rm -rf /var/lib/apt/lists/*
 COPY package.json package-lock.json* ./
-RUN npm install
-COPY tsconfig.json ./
+RUN npm ci
+COPY tsconfig.json tsconfig.build.json ./
 COPY src ./src
 RUN npm run build
 # Strip devDependencies (typescript, tsx, @types/*) from node_modules,
