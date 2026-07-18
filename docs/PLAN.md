@@ -105,6 +105,13 @@ goes.
 - Budget: verify `--max-turns` and `timeout` actually bound a runaway prompt;
   add a per-run cost line to the final Linear activity (claude result JSON has
   `total_cost_usd`).
+- Per-ticket run serialization: two quick replies to the same thread must not
+  exec two overlapping entrypoints in the same sandbox. Add an "is a run
+  already active" guard in the supervisor before `startAndResume` (a
+  `running_since` column on the ticket row, cleared by the entrypoint's final
+  activity or a timeout; queue or politely reject the second prompt with a
+  `thought` activity). Cross-ticket parallelism stays unbounded — one ticket =
+  one sandbox = one agent session at a time is the only rule.
 - Re-audit sanitization against real logs from Phases 1–2.
 
 Acceptance: each scenario above run deliberately at least once with the
