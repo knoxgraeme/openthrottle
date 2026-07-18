@@ -18,6 +18,7 @@ import {
   commentOnPullRequest,
   countChangesRequestedReviews,
   getMergeReadiness,
+  isGithubPullRequestUrl,
   isOpenthrottleBranch,
   mergePullRequest,
   parseGithubWebhook,
@@ -82,8 +83,32 @@ function hasBearer(header: string | undefined, expected: string): boolean {
   return hashesMatch(actualHash, expectedHash);
 }
 
-function pickAgent(labels: string[]): Agent {
-  return labels.includes("agent:codex") ? "codex" : "claude";
+function pickAgent(labels: string[], defaultAgent: Agent): Agent {
+  if (labels.includes("agent:codex")) return "codex";
+  if (labels.includes("agent:claude")) return "claude";
+  return defaultAgent;
+}
+
+function hasAgentSubscription(cfg: Config, agent: Agent): boolean {
+  return agent === "codex" ? Boolean(cfg.codexAuthJson) : Boolean(cfg.claudeCodeOauthToken);
+}
+
+function linearContext(
+  payload: ReturnType<typeof parseLinearWebhook>,
+  fallback: string
+): string {
+  return payload.promptContext?.trim() || fallback;
+}
+
+function hasTerminalSandboxActivity(store: TicketStore, runId: string): boolean {
+  const event = store.getLastProcessedSandboxActivity(runId);
+  if (!event) return false;
+  try {
+    const payload = JSON.parse(event.payload) as { type?: string };
+    return ["elicitation", "response", "error"].includes(payload.type ?? "");
+  } catch {
+    return false;
+  }
 }
 
 function branchFor(issueIdentifier: string): string {
@@ -129,11 +154,9 @@ function baseSandboxEnv(
       | "agent"
       | "repo"
       | "branch"
-      | "linear_session_id"
       | "linear_issue_id"
       | "linear_issue_identifier"
     >;
-    linearAccessToken: string;
     taskType: TaskType;
     run: RunCredentials;
     resumeMessage?: string;
@@ -148,21 +171,16 @@ function baseSandboxEnv(
     GITHUB_TOKEN: cfg.githubToken,
     BASE_BRANCH: cfg.baseBranch,
     BRANCH_NAME: params.ticket.branch,
-    LINEAR_SESSION_ID: params.ticket.linear_session_id,
     LINEAR_ISSUE_ID: params.ticket.linear_issue_id,
     LINEAR_ISSUE_IDENTIFIER: params.ticket.linear_issue_identifier,
-    LINEAR_ACCESS_TOKEN: params.linearAccessToken,
-    LINEAR_MCP_API_KEY: cfg.linearMcpApiKey,
-    SUPERVISOR_URL: cfg.supervisorUrl,
     RUN_ID: params.run.id,
     RUN_CALLBACK_TOKEN: params.run.token,
     RESUME_MESSAGE: params.resumeMessage,
     PR_NUMBER: params.pullNumber === undefined ? undefined : String(params.pullNumber),
     REVIEW_ROUND: params.reviewRound === undefined ? undefined : String(params.reviewRound),
-    CLAUDE_CODE_OAUTH_TOKEN: cfg.claudeCodeOauthToken,
-    ANTHROPIC_API_KEY: cfg.anthropicApiKey,
-    CODEX_API_KEY: cfg.codexApiKey,
-    CODEX_AUTH_JSON: cfg.codexAuthJson,
+    CLAUDE_CODE_OAUTH_TOKEN:
+      params.ticket.agent === "claude" ? cfg.claudeCodeOauthToken : undefined,
+    CODEX_AUTH_JSON: params.ticket.agent === "codex" ? cfg.codexAuthJson : undefined,
     MAX_TURNS: String(cfg.maxTurns),
     TASK_TIMEOUT: String(cfg.taskTimeout),
     DEV_PORT: String(cfg.devPort),
@@ -196,9 +214,18 @@ async function launchExistingTask(params: {
   resumeMessage?: string;
   pullNumber?: number;
   reviewRound?: number;
+  linearContext?: string;
 }): Promise<boolean> {
   const { cfg, store, daytona, linear, ticket } = params;
   if (!ticket.sandbox_id) return false;
+  if (!hasAgentSubscription(cfg, ticket.agent)) {
+    await tryPostError(
+      linear,
+      ticket.linear_session_id,
+      `${ticket.agent === "codex" ? "Codex" : "Claude"} subscription login is not configured for OpenThrottle.`
+    );
+    return false;
+  }
   const run = beginRun(store, cfg, ticket.linear_issue_id, params.taskType);
   if (!run) {
     await agentActivityCreate(linear, {
@@ -214,13 +241,16 @@ async function launchExistingTask(params: {
     await startTask(sandbox, {
       env: baseSandboxEnv(cfg, {
         ticket,
-        linearAccessToken: linear.accessToken,
         taskType: params.taskType,
         run,
         resumeMessage: params.resumeMessage,
         pullNumber: params.pullNumber,
         reviewRound: params.reviewRound,
       }),
+      linearContext:
+        params.linearContext ??
+        ticket.linear_context ??
+        `# ${ticket.linear_issue_identifier}\n\nNo Linear prompt context was supplied.`,
       taskTimeoutSeconds: cfg.taskTimeout,
     });
   } catch (error) {
@@ -288,6 +318,108 @@ export function createServerWebhookDeliveryProcessor(deps: {
       );
     },
   });
+}
+
+export async function completeRun(
+  deps: {
+    cfg: Config;
+    store: TicketStore;
+    daytona: Daytona;
+    getLinearClient: () => Promise<LinearClient | undefined>;
+    schedule?: (task: Promise<void>) => void;
+  },
+  input: {
+    runId: string;
+    token: string | undefined;
+    exitCode: unknown;
+    costUsd?: unknown;
+    prUrl?: unknown;
+    failureTail?: unknown;
+  }
+): Promise<{ status: number; body: { ok?: true; error?: string } }> {
+  const run = deps.store.getRun(input.runId);
+  if (!run) return { status: 404, body: { error: "run not found" } };
+  if (!input.token || !hashesMatch(run.token_hash, tokenHash(input.token))) {
+    return { status: 401, body: { error: "invalid callback token" } };
+  }
+  if (run.status !== "running") {
+    return { status: 409, body: { error: "callback token already used" } };
+  }
+  if (!Number.isInteger(input.exitCode)) {
+    return { status: 400, body: { error: "exit_code must be an integer" } };
+  }
+
+  const exitCode = input.exitCode as number;
+  const costUsd =
+    typeof input.costUsd === "number" &&
+    Number.isFinite(input.costUsd) &&
+    input.costUsd >= 0
+      ? input.costUsd
+      : undefined;
+  const failureTail =
+    typeof input.failureTail === "string"
+      ? sanitizeText(input.failureTail).slice(-4_000)
+      : undefined;
+  const prUrl =
+    isGithubPullRequestUrl(input.prUrl) ? input.prUrl : undefined;
+  const ticket = deps.store.getByIssueId(run.linear_issue_id);
+  const completed = deps.store.finishRun({
+    runId: input.runId,
+    status: exitCode === 0 ? "completed" : "failed",
+    exitCode,
+    costUsd,
+    prUrl,
+    failureTail,
+    ticketState: exitCode === 0 ? "active" : "error",
+  });
+  if (!completed || !ticket) {
+    return { status: 409, body: { error: "run no longer active" } };
+  }
+
+  const linear = await deps.getLinearClient();
+  if (linear) {
+    try {
+      const costLine = costUsd === undefined ? "" : ` Cost: $${costUsd.toFixed(4)}.`;
+      const agentAlreadyConcluded = hasTerminalSandboxActivity(deps.store, run.id);
+      if (exitCode === 0 && !agentAlreadyConcluded) {
+        await agentActivityCreate(linear, {
+          sessionId: ticket.linear_session_id,
+          type: "response",
+          body: `OpenThrottle ${run.task_type} run finished successfully.${prUrl ? ` PR: ${prUrl}` : ""}${costLine}`,
+        });
+      } else if (exitCode !== 0 && !agentAlreadyConcluded) {
+        await agentActivityCreate(linear, {
+          sessionId: ticket.linear_session_id,
+          type: "error",
+          body: `OpenThrottle ${run.task_type} run failed (exit ${exitCode}).${costLine}${failureTail ? `\n\nLast output:\n\`\`\`\n${failureTail}\n\`\`\`` : ""}`,
+        });
+      }
+      if (prUrl) {
+        await agentSessionUpdate(linear, {
+          sessionId: ticket.linear_session_id,
+          addedExternalUrls: [{ label: "Pull Request", url: prUrl }],
+        });
+      }
+    } catch (error) {
+      console.error(`[linear] ${run.task_type} completed but its notification could not be posted:`, error);
+    }
+  }
+
+  if (run.task_type === "review-fix" && exitCode === 0 && prUrl) {
+    const pull = parsePullRequestUrl(prUrl);
+    const task = triggerReviewTask(
+      deps.cfg,
+      deps.store,
+      deps.daytona,
+      linear,
+      ticket,
+      pull.number,
+      "review"
+    );
+    if (deps.schedule) deps.schedule(task);
+    else await task;
+  }
+  return { status: 200, body: { ok: true } };
 }
 
 export function createServer(deps: ServerDeps): Hono {
@@ -434,17 +566,6 @@ export function createServer(deps: ServerDeps): Hono {
   });
 
   app.post("/runs/:id/complete", async (context) => {
-    const runId = context.req.param("id");
-    const run = store.getRun(runId);
-    if (!run) return context.json({ error: "run not found" }, 404);
-    const token = bearerToken(context.req.header("Authorization"));
-    if (!token || !hashesMatch(run.token_hash, tokenHash(token))) {
-      return context.json({ error: "invalid callback token" }, 401);
-    }
-    if (run.status !== "running") {
-      return context.json({ error: "callback token already used" }, 409);
-    }
-
     let body: unknown;
     try {
       body = await context.req.json();
@@ -455,67 +576,18 @@ export function createServer(deps: ServerDeps): Hono {
       return context.json({ error: "invalid callback body" }, 400);
     }
     const data = body as Record<string, unknown>;
-    if (!Number.isInteger(data.exit_code)) {
-      return context.json({ error: "exit_code must be an integer" }, 400);
-    }
-    const exitCode = data.exit_code as number;
-    const costUsd =
-      typeof data.cost_usd === "number" && Number.isFinite(data.cost_usd) && data.cost_usd >= 0
-        ? data.cost_usd
-        : undefined;
-    const failureTail =
-      typeof data.failure_tail === "string"
-        ? sanitizeText(data.failure_tail).slice(-4000)
-        : undefined;
-    const prUrl =
-      typeof data.pr_url === "string" && /^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+$/.test(data.pr_url)
-        ? data.pr_url
-        : undefined;
-    const ticket = store.getByIssueId(run.linear_issue_id);
-    const completed = store.finishRun({
-      runId,
-      status: exitCode === 0 ? "completed" : "failed",
-      exitCode,
-      costUsd,
-      prUrl,
-      failureTail,
-      ticketState: exitCode === 0 ? "active" : "error",
-    });
-    if (!completed || !ticket) return context.json({ error: "run no longer active" }, 409);
-
-    const linear = await getLinearClient();
-    if (linear) {
-      try {
-        const costLine = costUsd === undefined ? "" : ` Cost: $${costUsd.toFixed(4)}.`;
-        if (exitCode === 0) {
-          await agentActivityCreate(linear, {
-            sessionId: ticket.linear_session_id,
-            type: "response",
-            body: `OpenThrottle ${run.task_type} run finished successfully.${prUrl ? ` PR: ${prUrl}` : ""}${costLine}`,
-          });
-        } else {
-          await agentActivityCreate(linear, {
-            sessionId: ticket.linear_session_id,
-            type: "error",
-            body: `OpenThrottle ${run.task_type} run failed (exit ${exitCode}).${costLine}${failureTail ? `\n\nLast output:\n\`\`\`\n${failureTail}\n\`\`\`` : ""}`,
-          });
-        }
-        if (prUrl) {
-          await agentSessionUpdate(linear, {
-            sessionId: ticket.linear_session_id,
-            addedExternalUrls: [{ label: "Pull Request", url: prUrl }],
-          });
-        }
-      } catch (error) {
-        console.error(`[linear] ${run.task_type} completed but its notification could not be posted:`, error);
+    const result = await completeRun(
+      { cfg, store, daytona, getLinearClient, schedule },
+      {
+        runId: context.req.param("id"),
+        token: bearerToken(context.req.header("Authorization")),
+        exitCode: data.exit_code,
+        costUsd: data.cost_usd,
+        prUrl: data.pr_url,
+        failureTail: data.failure_tail,
       }
-    }
-
-    if (run.task_type === "review-fix" && exitCode === 0 && prUrl) {
-      const pull = parsePullRequestUrl(prUrl);
-      schedule(triggerReviewTask(cfg, store, daytona, linear, ticket, pull.number, "review"));
-    }
-    return context.json({ ok: true });
+    );
+    return context.json(result.body, result.status as 200 | 400 | 401 | 404 | 409);
   });
 
   app.post("/tickets/:identifier/stop", async (context) => {
@@ -612,12 +684,28 @@ async function handleCreated(
 
   const labels = extractLabelNames(payload);
   const existing = store.getByIssueId(issue.id);
+  const selectedAgent = pickAgent(labels, existing?.agent ?? cfg.defaultAgent);
+  if (!hasAgentSubscription(cfg, selectedAgent)) {
+    await tryPostError(
+      linear,
+      sessionId,
+      `${selectedAgent === "codex" ? "Codex" : "Claude"} subscription login is not configured for OpenThrottle.`
+    );
+    return;
+  }
+  const initialContext = linearContext(
+    payload,
+    `# ${issue.identifier}\n\nNo Linear prompt context was supplied for this delegation.`
+  );
   if (existing?.sandbox_id && existing.state !== "closed" && existing.state !== "expired") {
+    const agentChanged = existing.agent !== selectedAgent;
     store.upsert({
       ...existing,
       linear_session_id: sessionId,
+      agent: selectedAgent,
       state: "active",
     });
+    store.setLinearContext(issue.id, initialContext);
     const current = store.getByIssueId(issue.id)!;
     await launchExistingTask({
       cfg,
@@ -625,8 +713,15 @@ async function handleCreated(
       daytona,
       linear,
       ticket: current,
-      taskType: labels.includes("investigate") ? "investigate" : "resume",
-      resumeMessage: "This ticket was re-delegated. Re-read it and continue from the existing branch.",
+      taskType: labels.includes("investigate")
+        ? "investigate"
+        : agentChanged
+          ? "implement"
+          : "resume",
+      resumeMessage: agentChanged
+        ? undefined
+        : "This ticket was re-delegated. Re-read it and continue from the existing branch.",
+      linearContext: initialContext,
     });
     return;
   }
@@ -638,12 +733,13 @@ async function handleCreated(
     linear_session_id: sessionId,
     sandbox_id: null,
     branch: branchFor(issue.identifier),
-    agent: pickAgent(labels),
+    agent: selectedAgent,
     repo: repoFor(cfg, issue),
     pr_url: null,
     state: "active" as const,
   };
   store.upsert(ticketCore);
+  store.setLinearContext(issue.id, initialContext);
   const recovered = await findSandboxForTicket(daytona, issue.identifier);
   if (recovered) {
     store.setSandboxId(issue.id, recovered.id);
@@ -660,6 +756,7 @@ async function handleCreated(
       ticket: recoveredTicket,
       taskType,
       resumeMessage: "Recovered the existing workspace. Re-read the ticket and continue.",
+      linearContext: initialContext,
     });
     return;
   }
@@ -686,7 +783,6 @@ async function handleCreated(
   const ticket = store.getByIssueId(issue.id)!;
   const env = baseSandboxEnv(cfg, {
     ticket,
-    linearAccessToken: linear.accessToken,
     taskType,
     run,
   });
@@ -725,6 +821,7 @@ async function handleCreated(
   try {
     await startTask(sandbox, {
       env,
+      linearContext: initialContext,
       taskTimeoutSeconds: cfg.taskTimeout,
     });
   } catch (error) {
@@ -814,18 +911,25 @@ async function handlePrompted(
     return;
   }
 
+  const nextContext = linearContext(
+    payload,
+    `${ticket.linear_context ?? `# ${ticket.linear_issue_identifier}`}\n\n## Latest human reply\n\n${resumeMessage}`
+  );
+  store.setLinearContext(ticket.linear_issue_id, nextContext);
+  const currentTicket = store.getByIssueId(ticket.linear_issue_id) ?? ticket;
+
   if (resumeMessage.trim() === "/stop") {
     await stopTicket({
       store,
       daytona,
       linear,
-      ticket,
+      ticket: currentTicket,
       reason: "Stopped from the Linear thread.",
     });
     return;
   }
   if (/^(?:\/merge|merge it)$/i.test(resumeMessage.trim())) {
-    await mergeFromLinear(cfg, linear, ticket);
+    await mergeFromLinear(cfg, linear, currentTicket);
     return;
   }
 
@@ -839,9 +943,10 @@ async function handlePrompted(
     store,
     daytona,
     linear,
-    ticket,
+    ticket: currentTicket,
     taskType,
     resumeMessage: taskType === "resume" ? resumeMessage : undefined,
+    linearContext: nextContext,
   });
 }
 
@@ -1004,7 +1109,7 @@ export async function expireRun(
   run: Run
 ): Promise<void> {
   const ticket = store.getByIssueId(run.linear_issue_id);
-  const message = `OpenThrottle ${run.task_type} run timed out without a completion callback.`;
+  const message = `OpenThrottle ${run.task_type} run timed out without a completion result.`;
   store.finishRun({
     runId: run.id,
     status: "timed_out",

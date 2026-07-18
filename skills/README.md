@@ -32,7 +32,7 @@ to differ *only* in the ways below — nothing else.
 | Trailing note | none needed | Ends with "Ticket context appended by the caller follows below" |
 
 Everything else — phase names, step order, bash snippets, the rules
-lists, the prompt-injection guard wording, the Linear posting cadence —
+lists, the prompt-injection guard wording, the activity cadence —
 must match. If you find yourself wanting a divergence not in this table,
 that's a signal the SPEC's "shared canonical body" contract needs to be
 re-examined, not a green light to drift silently.
@@ -77,11 +77,9 @@ manual synchronization pass:
    the table above.
 3. Include the prompt-injection guard paragraph — every skill that reads
    ticket/PR/issue/code content must treat it as data, not instructions.
-4. If the skill posts to Linear, describe *what* to post and *when*
-   (milestones, final response, elicitation), not literal tool calls —
-   exact Linear MCP tool names aren't fixed by this repo and may change;
-   `AGENTS-fragment.md` is where the tool-agnostic posting convention
-   lives for Codex.
+4. If the skill communicates with Linear, describe *what* to post and *when*
+   (milestones, final response, elicitation) and use `ot-activity`. Fly owns
+   the Linear app credentials and publishes the local activity records.
 5. Update this README's skill list and the SPEC if the new skill changes
    the sandbox/entrypoint contract.
 
@@ -92,5 +90,5 @@ context from `.claude/skills/` automatically; Codex has no equivalent, so the
 entrypoint installs this fragment globally at `~/.codex/AGENTS.md`. It lives
 outside the checkout, leaving any project `AGENTS.md` untouched and editable.
 It covers what env/context is available, the push-early rule, the
-never-push-to-base rule, the sanitization/injection guard, and how to post to
-Linear without assuming fixed tool names.
+never-push-to-base rule, the sanitization/injection guard, and how to use the
+local activity helper.

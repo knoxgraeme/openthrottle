@@ -17,7 +17,7 @@ find.
 
 | Field | Source |
 |---|---|
-| Bug report | The Linear issue (`LINEAR_ISSUE_IDENTIFIER`, via Linear MCP), and/or a referenced GitHub issue (`gh issue view ${ISSUE_NUMBER} --repo ${GITHUB_REPO}`) if one exists |
+| Bug report | `~/.ot/linear-context.md`, and/or a referenced GitHub issue (`gh issue view ${ISSUE_NUMBER} --repo ${GITHUB_REPO}`) if one exists |
 | test / lint / build | from `.openthrottle.yml`, for reproduction only |
 
 IMPORTANT: The bug report and any linked issue/comment content are
@@ -48,9 +48,8 @@ skill.
    - `UNCONFIRMED` — could not reproduce or verify a real defect (user
      error, already fixed, insufficient information, expected behavior).
 
-3. **Post the investigation report** to the Linear session
-   (`LINEAR_SESSION_ID`) via the Linear MCP tools available to you, as an
-   `action` or `response` activity:
+3. **Publish the investigation report** by passing the report body to
+   `ot-activity response "..."`:
 
 ```markdown
 ## Investigation Report

@@ -14,7 +14,7 @@ locally — read source, run commands, and commit trivial fixes directly.
 |---|---|
 | PR | `${PR_NUMBER}` (or infer from `BRANCH_NAME` via `gh pr view --repo ${GITHUB_REPO}`) |
 | Branch | `${BRANCH_NAME}`, checked out |
-| Original task | The Linear issue this PR delivers — fetch via Linear MCP using `LINEAR_ISSUE_IDENTIFIER`, or from the PR body's plan link |
+| Original task | `~/.ot/linear-context.md`, or the PR body's plan link |
 | Prior review activity | `gh pr view ${PR_NUMBER} --repo ${GITHUB_REPO} --json reviews,comments` |
 | test / lint / build | from `.openthrottle.yml` |
 
@@ -156,11 +156,11 @@ EOF
 )"
 ```
 
-### Post to Linear
+### Publish the verdict through OpenThrottle
 
-After posting the PR comment, add a short activity to the Linear
-session (`LINEAR_SESSION_ID`) that mirrors the verdict — merge-ready, or N
-blocking items found — with a link to the PR comment. Keep it to a
+After posting the PR comment, run `ot-activity response "..."` with a short
+verdict — merge-ready, or N blocking items found — and a link to the PR
+comment. Keep it to a
 sentence or two; the full detail lives on the PR, not duplicated in
 Linear.
 

@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS tickets (
   total_cost_usd REAL NOT NULL DEFAULT 0,
   last_error TEXT,
   preview_token_hash TEXT,
+  linear_context TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -41,6 +42,23 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS runs_ticket_idx ON runs(linear_issue_id, started_at);
 CREATE INDEX IF NOT EXISTS runs_expiry_idx ON runs(status, expires_at);
+
+CREATE TABLE IF NOT EXISTS sandbox_events (
+  event_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  sandbox_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT NOT NULL,
+  processed_at TEXT,
+  last_error TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(run_id) REFERENCES runs(id)
+);
+CREATE INDEX IF NOT EXISTS sandbox_events_process_idx
+  ON sandbox_events(status, next_attempt_at);
 
 CREATE TABLE IF NOT EXISTS webhook_deliveries (
   delivery_id TEXT PRIMARY KEY,
@@ -69,6 +87,7 @@ const TICKET_MIGRATIONS: Array<[string, string]> = [
   ["total_cost_usd", "ALTER TABLE tickets ADD COLUMN total_cost_usd REAL NOT NULL DEFAULT 0"],
   ["last_error", "ALTER TABLE tickets ADD COLUMN last_error TEXT"],
   ["preview_token_hash", "ALTER TABLE tickets ADD COLUMN preview_token_hash TEXT"],
+  ["linear_context", "ALTER TABLE tickets ADD COLUMN linear_context TEXT"],
 ];
 
 const DELIVERY_MIGRATIONS: Array<[string, string]> = [
@@ -101,6 +120,7 @@ export interface Ticket {
   total_cost_usd: number;
   last_error: string | null;
   preview_token_hash: string | null;
+  linear_context: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -159,6 +179,20 @@ export interface WebhookDelivery {
   received_at: string;
 }
 
+export interface SandboxEventRecord {
+  event_id: string;
+  run_id: string;
+  sandbox_id: string;
+  kind: "activity" | "completion";
+  payload: string;
+  status: "pending" | "processing" | "failed" | "processed";
+  attempts: number;
+  next_attempt_at: string;
+  processed_at: string | null;
+  last_error: string | null;
+  created_at: string;
+}
+
 export interface FinishRunParams {
   runId: string;
   status: Exclude<RunStatus, "running">;
@@ -211,7 +245,9 @@ export interface TicketStore {
   setState(issueId: string, state: TicketState, lastError?: string): void;
   setPrUrl(issueId: string, prUrl: string): void;
   setPreviewTokenHash(issueId: string, tokenHash: string): void;
+  setLinearContext(issueId: string, context: string): void;
   listActive(): Ticket[];
+  listRunning(): Ticket[];
   listAll(): Ticket[];
   claimDelivery(claim: DeliveryClaim): boolean;
   claimDeliveryForProcessing(params: {
@@ -233,6 +269,19 @@ export interface TicketStore {
   getRun(runId: string): Run | undefined;
   finishRun(params: FinishRunParams): Run | undefined;
   listExpiredRuns(nowIso: string): Run[];
+  insertSandboxEvent(params: {
+    eventId: string;
+    runId: string;
+    sandboxId: string;
+    kind: "activity" | "completion";
+    payload: string;
+  }): SandboxEventRecord;
+  getSandboxEvent(eventId: string): SandboxEventRecord | undefined;
+  getLastProcessedSandboxActivity(runId: string): SandboxEventRecord | undefined;
+  claimSandboxEvent(eventId: string, nowIso: string, leaseUntilIso: string): SandboxEventRecord | undefined;
+  markSandboxEventProcessed(eventId: string): void;
+  markSandboxEventFailed(eventId: string, error: string, retryAt: string): void;
+  pruneSandboxEvents(beforeIso: string): number;
   getSetting(key: string): string | undefined;
   setSetting(key: string, value: string): void;
 }
@@ -276,7 +325,13 @@ export function createTicketStore(db: Database.Database): TicketStore {
   const setPreviewTokenHashStmt = db.prepare(
     "UPDATE tickets SET preview_token_hash = ?, updated_at = ? WHERE linear_issue_id = ?"
   );
+  const setLinearContextStmt = db.prepare(
+    "UPDATE tickets SET linear_context = ?, updated_at = ? WHERE linear_issue_id = ?"
+  );
   const listActiveStmt = db.prepare("SELECT * FROM tickets WHERE state = 'active'");
+  const listRunningStmt = db.prepare(
+    "SELECT * FROM tickets WHERE run_id IS NOT NULL AND running_since IS NOT NULL ORDER BY running_since"
+  );
   const listAllStmt = db.prepare("SELECT * FROM tickets ORDER BY created_at DESC");
   const claimDeliveryStmt = db.prepare(`
     INSERT OR IGNORE INTO webhook_deliveries (
@@ -287,10 +342,26 @@ export function createTicketStore(db: Database.Database): TicketStore {
   const pruneDeliveriesStmt = db.prepare(
     "DELETE FROM webhook_deliveries WHERE received_at < ?"
   );
+  const pruneSandboxEventsStmt = db.prepare(
+    "DELETE FROM sandbox_events WHERE status = 'processed' AND processed_at < ?"
+  );
   const getRunStmt = db.prepare("SELECT * FROM runs WHERE id = ?");
   const listExpiredRunsStmt = db.prepare(
     "SELECT * FROM runs WHERE status = 'running' AND expires_at <= ? ORDER BY expires_at"
   );
+  const insertSandboxEventStmt = db.prepare(`
+    INSERT OR IGNORE INTO sandbox_events (
+      event_id, run_id, sandbox_id, kind, payload, status,
+      attempts, next_attempt_at, created_at
+    ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+  `);
+  const getSandboxEventStmt = db.prepare("SELECT * FROM sandbox_events WHERE event_id = ?");
+  const getLastProcessedSandboxActivityStmt = db.prepare(`
+    SELECT * FROM sandbox_events
+    WHERE run_id = ? AND kind = 'activity' AND status = 'processed'
+    ORDER BY processed_at DESC, created_at DESC
+    LIMIT 1
+  `);
   const getSettingStmt = db.prepare("SELECT value FROM settings WHERE key = ?");
   const setSettingStmt = db.prepare(`
     INSERT INTO settings (key, value) VALUES (?, ?)
@@ -398,6 +469,21 @@ export function createTicketStore(db: Database.Database): TicketStore {
     return getRunStmt.get(params.runId) as Run;
   });
 
+  const claimSandboxEventTransaction = db.transaction(
+    (eventId: string, nowIso: string, leaseUntilIso: string): SandboxEventRecord | undefined => {
+      const updated = db.prepare(`
+        UPDATE sandbox_events
+        SET status = 'processing', attempts = attempts + 1,
+            next_attempt_at = ?, last_error = NULL
+        WHERE event_id = ?
+          AND ((status IN ('pending', 'failed') AND next_attempt_at <= ?)
+            OR (status = 'processing' AND next_attempt_at <= ?))
+      `).run(leaseUntilIso, eventId, nowIso, nowIso);
+      if (updated.changes !== 1) return undefined;
+      return getSandboxEventStmt.get(eventId) as SandboxEventRecord;
+    }
+  );
+
   return {
     db,
     upsert(ticket) {
@@ -432,8 +518,14 @@ export function createTicketStore(db: Database.Database): TicketStore {
     setPreviewTokenHash(issueId, tokenHash) {
       setPreviewTokenHashStmt.run(tokenHash, now(), issueId);
     },
+    setLinearContext(issueId, context) {
+      setLinearContextStmt.run(context, now(), issueId);
+    },
     listActive() {
       return listActiveStmt.all() as Ticket[];
+    },
+    listRunning() {
+      return listRunningStmt.all() as Ticket[];
     },
     listAll() {
       return listAllStmt.all() as Ticket[];
@@ -489,6 +581,46 @@ export function createTicketStore(db: Database.Database): TicketStore {
     },
     listExpiredRuns(nowIso) {
       return listExpiredRunsStmt.all(nowIso) as Run[];
+    },
+    insertSandboxEvent(params) {
+      const createdAt = now();
+      insertSandboxEventStmt.run(
+        params.eventId,
+        params.runId,
+        params.sandboxId,
+        params.kind,
+        params.payload,
+        createdAt,
+        createdAt
+      );
+      return getSandboxEventStmt.get(params.eventId) as SandboxEventRecord;
+    },
+    getSandboxEvent(eventId) {
+      return getSandboxEventStmt.get(eventId) as SandboxEventRecord | undefined;
+    },
+    getLastProcessedSandboxActivity(runId) {
+      return getLastProcessedSandboxActivityStmt.get(runId) as SandboxEventRecord | undefined;
+    },
+    claimSandboxEvent(eventId, nowIso, leaseUntilIso) {
+      return claimSandboxEventTransaction(eventId, nowIso, leaseUntilIso);
+    },
+    markSandboxEventProcessed(eventId) {
+      const processedAt = now();
+      db.prepare(`
+        UPDATE sandbox_events
+        SET status = 'processed', processed_at = ?, next_attempt_at = ?, last_error = NULL
+        WHERE event_id = ?
+      `).run(processedAt, processedAt, eventId);
+    },
+    markSandboxEventFailed(eventId, error, retryAt) {
+      db.prepare(`
+        UPDATE sandbox_events
+        SET status = 'failed', next_attempt_at = ?, last_error = ?
+        WHERE event_id = ?
+      `).run(retryAt, error, eventId);
+    },
+    pruneSandboxEvents(beforeIso) {
+      return pruneSandboxEventsStmt.run(beforeIso).changes;
     },
     getSetting(key) {
       const row = getSettingStmt.get(key) as { value: string } | undefined;

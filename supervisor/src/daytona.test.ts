@@ -10,12 +10,8 @@ const baseEnv: SandboxEnvContract = {
   GITHUB_TOKEN: "github",
   BASE_BRANCH: "main",
   BRANCH_NAME: "ot/test",
-  LINEAR_SESSION_ID: "session",
   LINEAR_ISSUE_ID: "issue",
   LINEAR_ISSUE_IDENTIFIER: "OT-1",
-  LINEAR_ACCESS_TOKEN: "oauth",
-  LINEAR_MCP_API_KEY: "mcp",
-  SUPERVISOR_URL: "https://ot.test",
   RUN_ID: "run",
   RUN_CALLBACK_TOKEN: "callback",
   MAX_TURNS: "200",
@@ -29,21 +25,46 @@ describe("Daytona task execution", () => {
       "RESUME_MESSAGE"
     );
     const updateEnv = vi.fn(async () => undefined);
+    const uploadFile = vi.fn(async () => undefined);
+    const setFilePermissions = vi.fn(async () => undefined);
     const execute = vi.fn(async () => undefined);
     const sandbox = {
       state: "started",
       updateEnv,
+      fs: { uploadFile, setFilePermissions },
       process: {
         createSession: vi.fn(async () => undefined),
         executeSessionCommand: execute,
       },
     } as unknown as Sandbox;
 
-    await startTask(sandbox, { env: baseEnv, taskTimeoutSeconds: 60 });
+    await startTask(sandbox, {
+      env: baseEnv,
+      linearContext: "# OT-1\n\nApproved plan",
+      taskTimeoutSeconds: 60,
+    });
 
     expect(updateEnv).toHaveBeenCalledWith(expect.any(Object), {
-      unset: ["RESUME_MESSAGE", "PR_NUMBER", "REVIEW_ROUND"],
+      unset: [
+        "RESUME_MESSAGE",
+        "PR_NUMBER",
+        "REVIEW_ROUND",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CODEX_AUTH_JSON",
+        "LINEAR_ACCESS_TOKEN",
+        "LINEAR_MCP_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "CODEX_API_KEY",
+      ],
     });
+    expect(uploadFile).toHaveBeenCalledWith(
+      Buffer.from("# OT-1\n\nApproved plan"),
+      "/home/agent/.ot/linear-context.md"
+    );
+    expect(setFilePermissions).toHaveBeenCalledWith(
+      "/home/agent/.ot/linear-context.md",
+      { owner: "agent", group: "agent", mode: "600" }
+    );
     expect(execute).toHaveBeenCalledWith(
       "resume-run",
       {

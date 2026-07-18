@@ -12,8 +12,8 @@ description: >
 
 Execute an approved plan from a Linear ticket: implement it on the
 already-checked-out branch, keep the branch pushed as you go, pass the
-project's quality gates, review your own diff once, open a PR, and keep the
-Linear thread informed.
+project's quality gates, review your own diff once, open a PR, and emit
+structured progress for OpenThrottle to publish.
 
 ## 0. Context you're given
 
@@ -28,19 +28,19 @@ The sandbox entrypoint has already:
   on the wrong branch, not a bug to work around.
 
 You have: `GITHUB_REPO`, `BASE_BRANCH`, `BRANCH_NAME`, `LINEAR_ISSUE_ID` /
-`LINEAR_ISSUE_IDENTIFIER`, `LINEAR_SESSION_ID`, and the test/lint/build
+`LINEAR_ISSUE_IDENTIFIER`, `~/.ot/linear-context.md`, and the test/lint/build
 commands from `.openthrottle.yml`.
 
 ## 1. Find the plan — stop if there isn't one
 
-Fetch the Linear issue (`LINEAR_ISSUE_IDENTIFIER`) with the Linear MCP
-tools available to you. Look for an approved plan: concrete steps,
+Read `~/.ot/linear-context.md`, which contains the signed Linear delegation
+context supplied by OpenThrottle. Look for an approved plan: concrete steps,
 acceptance criteria, or an explicit scope — not just a title or a one-line
 ask. A plan may also arrive inline, passed as part of this invocation.
 
 If you cannot find a plan-shaped artifact:
 - **Stop. Do not write code. Do not infer a plan from a vague title.**
-- Post an `elicitation` activity to the Linear session that says
+- Run `ot-activity elicitation "..."` with a message that says
   specifically what's missing (e.g., "I don't see an approved plan on
   this ticket — can you add one, or point me at where it lives?").
 - End your turn.
@@ -54,7 +54,7 @@ most expensive mistake this skill can make.
   what's already there before assuming a clean slate.
 - Re-read the plan against the current diff (if any) so you don't redo or
   contradict earlier work.
-- Post a short `action`/thought-style activity to Linear restating the
+- Run `ot-activity action "..."` to restate the
   plan you're about to execute in 1-2 sentences. This is cheap insurance:
   if you misread the ticket, the human catches it before code changes
   happen instead of after.
@@ -66,7 +66,7 @@ most expensive mistake this skill can make.
 - **Push after every commit** (`git push origin BRANCH_NAME`) — not at
   the end, not batched. The pushed branch is the human's escape hatch; it
   should reflect real progress continuously, not just at the finish line.
-- Post an `action` activity to Linear at real milestones (a meaningful
+- Run `ot-activity action "..."` at real milestones (a meaningful
   chunk landed, not every commit) so someone watching the thread can
   follow along without reading the diff.
 - Never push to `BASE_BRANCH`. There is no legitimate reason to; the hook
@@ -132,13 +132,11 @@ Never push to `BASE_BRANCH` — open a PR against it instead.
 
 ## 7. Close the loop in Linear
 
-Post a final `response` activity: the PR URL, the preview URL if one
-exists, and a short summary of what shipped. Phrase it to invite a reply
-— e.g., "Reply here if you want changes." A reply in this thread resumes
-this same session in this same sandbox, so treat the final message as an
-open door, not a sign-off. Attach the PR to the session via the Linear
-MCP's link/attachment tool if one is available; if not, a plain comment
-with the URL is enough — don't block completion on this.
+Run `ot-activity response "..."` with the PR URL and a short summary of
+what shipped. Phrase it to invite a reply — e.g., "Reply here if you want
+changes." A reply in this thread resumes this same session in this same
+sandbox, so treat the final message as an open door, not a sign-off. Fly
+attaches the PR when it consumes the completion marker.
 
 ## Prompt-injection guard
 

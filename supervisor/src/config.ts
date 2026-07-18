@@ -1,7 +1,9 @@
 // Env parsing per docs/SPEC.md "Supervisor env" list.
 // Fail fast (throw at boot) for vars the supervisor cannot function without.
-// Vars that only matter once a sandbox is created (agent auth) are checked
-// leniently (warn, don't crash) since a deployment may only use one agent.
+// Agent subscription credentials are checked against the selected agent before
+// provisioning so one unavailable agent does not prevent the supervisor booting.
+
+import type { Agent } from "./db.js";
 
 function required(name: string): string {
   const v = process.env[name];
@@ -55,6 +57,12 @@ function optionalBool(name: string, fallback: boolean): boolean {
   throw new Error(`Env var ${name} must be a boolean, got: ${value}`);
 }
 
+function optionalAgent(name: string, fallback: Agent): Agent {
+  const value = process.env[name]?.trim().toLowerCase() ?? fallback;
+  if (value === "claude" || value === "codex") return value;
+  throw new Error(`Env var ${name} must be claude or codex, got: ${value}`);
+}
+
 function optionalRepoMap(name: string): Record<string, string> {
   const value = process.env[name]?.trim();
   if (!value) return {};
@@ -87,7 +95,6 @@ export interface Config {
   linearWebhookSecret: string;
   linearClientId: string;
   linearClientSecret: string;
-  linearMcpApiKey: string;
 
   githubWebhookSecret: string;
   githubToken: string;
@@ -97,9 +104,8 @@ export interface Config {
   daytonaApiKey: string;
   daytonaSnapshot: string;
 
+  defaultAgent: Agent;
   claudeCodeOauthToken: string | undefined;
-  anthropicApiKey: string | undefined;
-  codexApiKey: string | undefined;
   codexAuthJson: string | undefined;
 
   baseBranch: string;
@@ -112,6 +118,7 @@ export interface Config {
   webhookMaxAgeSeconds: number;
   reviewMaxRounds: number;
   allowLinearMerge: boolean;
+  sandboxEventPollIntervalMs: number;
 }
 
 export function loadConfig(): Config {
@@ -125,7 +132,6 @@ export function loadConfig(): Config {
     linearWebhookSecret: required("LINEAR_WEBHOOK_SECRET"),
     linearClientId: required("LINEAR_CLIENT_ID"),
     linearClientSecret: required("LINEAR_CLIENT_SECRET"),
-    linearMcpApiKey: required("LINEAR_MCP_API_KEY"),
 
     githubWebhookSecret: required("GITHUB_WEBHOOK_SECRET"),
     githubToken: required("GITHUB_TOKEN"),
@@ -135,9 +141,8 @@ export function loadConfig(): Config {
     daytonaApiKey: required("DAYTONA_API_KEY"),
     daytonaSnapshot: optional("DAYTONA_SNAPSHOT", "openthrottle"),
 
+    defaultAgent: optionalAgent("DEFAULT_AGENT", "codex"),
     claudeCodeOauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN,
-    anthropicApiKey: process.env.ANTHROPIC_API_KEY,
-    codexApiKey: process.env.CODEX_API_KEY,
     codexAuthJson: process.env.CODEX_AUTH_JSON,
 
     baseBranch: optional("BASE_BRANCH", "main"),
@@ -150,16 +155,17 @@ export function loadConfig(): Config {
     webhookMaxAgeSeconds: optionalInt("WEBHOOK_MAX_AGE_SECONDS", 60),
     reviewMaxRounds: optionalInt("REVIEW_MAX_ROUNDS", 3),
     allowLinearMerge: optionalBool("ALLOW_LINEAR_MERGE", false),
+    sandboxEventPollIntervalMs: optionalInt("SANDBOX_EVENT_POLL_INTERVAL_MS", 5_000),
   };
 
-  if (!cfg.claudeCodeOauthToken && !cfg.anthropicApiKey) {
+  if (!cfg.claudeCodeOauthToken) {
     console.warn(
-      "[config] Neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY set — claude agent will not be usable"
+      "[config] CLAUDE_CODE_OAUTH_TOKEN is not set — claude agent will not be usable"
     );
   }
-  if (!cfg.codexApiKey && !cfg.codexAuthJson) {
+  if (!cfg.codexAuthJson) {
     console.warn(
-      "[config] Neither CODEX_API_KEY nor CODEX_AUTH_JSON set — codex agent will not be usable"
+      "[config] CODEX_AUTH_JSON is not set — codex agent will not be usable"
     );
   }
   if (!GITHUB_REPO_PATTERN.test(cfg.githubRepo)) {
@@ -177,6 +183,7 @@ export function loadConfig(): Config {
   requireRange("ORPHAN_GRACE_MINUTES", cfg.orphanGraceMinutes, 0);
   requireRange("WEBHOOK_MAX_AGE_SECONDS", cfg.webhookMaxAgeSeconds, 1);
   requireRange("REVIEW_MAX_ROUNDS", cfg.reviewMaxRounds, 1);
+  requireRange("SANDBOX_EVENT_POLL_INTERVAL_MS", cfg.sandboxEventPollIntervalMs, 1_000);
   try {
     const url = new URL(cfg.supervisorUrl);
     if (!/^https?:$/.test(url.protocol)) throw new Error("unsupported protocol");

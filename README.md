@@ -11,8 +11,8 @@ and Daytona snapshot are all named `openthrottle`.
 
 ```text
 Linear ticket ──> Fly supervisor ──> Daytona sandbox ──> ot/* branch + PR
-     ▲                 │                    │                    │
-     └── activities ───┴── run callback ────┴── GitHub events ──┘
+     ▲                 │     ▲              │                    │
+     └── activities ───┘     └── outbox ────┴── GitHub events ──┘
 ```
 
 The supervisor authenticates webhooks, durably stores and retries deliveries,

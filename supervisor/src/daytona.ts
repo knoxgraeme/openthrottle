@@ -9,20 +9,14 @@ export interface SandboxEnvContract {
   GITHUB_TOKEN: string;
   BASE_BRANCH: string;
   BRANCH_NAME: string;
-  LINEAR_SESSION_ID: string;
   LINEAR_ISSUE_ID: string;
   LINEAR_ISSUE_IDENTIFIER: string;
-  LINEAR_ACCESS_TOKEN: string;
-  LINEAR_MCP_API_KEY: string;
-  SUPERVISOR_URL: string;
   RUN_ID: string;
   RUN_CALLBACK_TOKEN: string;
   RESUME_MESSAGE?: string;
   PR_NUMBER?: string;
   REVIEW_ROUND?: string;
   CLAUDE_CODE_OAUTH_TOKEN?: string;
-  ANTHROPIC_API_KEY?: string;
-  CODEX_API_KEY?: string;
   CODEX_AUTH_JSON?: string;
   MAX_TURNS: string;
   TASK_TIMEOUT: string;
@@ -69,14 +63,39 @@ export async function startTask(
   sandbox: Sandbox,
   params: {
     env: SandboxEnvContract;
+    linearContext: string;
     taskTimeoutSeconds: number;
   }
 ): Promise<void> {
   if (sandbox.state !== "started") await sandbox.start(60);
   const envVars = toEnvVars(params.env);
-  const optionalNames = ["RESUME_MESSAGE", "PR_NUMBER", "REVIEW_ROUND"] as const;
+  const optionalNames = [
+    "RESUME_MESSAGE",
+    "PR_NUMBER",
+    "REVIEW_ROUND",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CODEX_AUTH_JSON",
+  ] as const;
+  const retiredSecretNames = [
+    "LINEAR_ACCESS_TOKEN",
+    "LINEAR_MCP_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "CODEX_API_KEY",
+  ] as const;
   await sandbox.updateEnv(envVars, {
-    unset: optionalNames.filter((name) => params.env[name] === undefined),
+    unset: [
+      ...optionalNames.filter((name) => params.env[name] === undefined),
+      ...retiredSecretNames,
+    ],
+  });
+  await sandbox.fs.uploadFile(
+    Buffer.from(params.linearContext),
+    "/home/agent/.ot/linear-context.md"
+  );
+  await sandbox.fs.setFilePermissions("/home/agent/.ot/linear-context.md", {
+    owner: "agent",
+    group: "agent",
+    mode: "600",
   });
 
   const sessionId = `${params.env.TASK_TYPE}-${params.env.RUN_ID}`;

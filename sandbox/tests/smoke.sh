@@ -4,10 +4,8 @@ set -euo pipefail
 IMAGE="${1:-openthrottle:test}"
 SMOKE_DIR="$(mktemp -d)"
 NETWORK="ot-smoke-$RANDOM-$$"
-CALLBACK_CONTAINER="ot-callback-$RANDOM-$$"
 
 cleanup() {
-  docker rm -f "$CALLBACK_CONTAINER" >/dev/null 2>&1 || true
   docker network rm "$NETWORK" >/dev/null 2>&1 || true
   rm -rf "$SMOKE_DIR"
 }
@@ -16,7 +14,6 @@ trap cleanup EXIT
 mkdir -p \
   "$SMOKE_DIR/work" \
   "$SMOKE_DIR/bin" \
-  "$SMOKE_DIR/result/callback" \
   "$SMOKE_DIR/result/claude-home" \
   "$SMOKE_DIR/result/codex-home"
 git init --bare "$SMOKE_DIR/repo.git" >/dev/null
@@ -44,6 +41,7 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
 
 cat > "$SMOKE_DIR/bin/claude" <<'STUB'
 #!/usr/bin/env sh
+ot-activity action "smoke Claude agent started"
 printf '%s\n' "$*" >> "$HOME/.ot/claude-args.log"
 case " $* " in
   *" --resume "*) cost=0.250 ;;
@@ -57,6 +55,7 @@ STUB
 
 cat > "$SMOKE_DIR/bin/codex" <<'STUB'
 #!/usr/bin/env sh
+ot-activity action "smoke Codex agent started"
 if [ "${1:-}" = "mcp" ]; then
   exit 0
 fi
@@ -69,37 +68,7 @@ printf '%s\n' \
 STUB
 chmod 0755 "$SMOKE_DIR/bin/claude" "$SMOKE_DIR/bin/codex"
 
-cat > "$SMOKE_DIR/callback.mjs" <<'SERVER'
-import { createServer } from "node:http";
-import { writeFileSync } from "node:fs";
-
-createServer((request, response) => {
-  const match = request.url?.match(/^\/runs\/([^/]+)\/complete$/);
-  const runId = match?.[1];
-  const chunks = [];
-  request.on("data", (chunk) => chunks.push(chunk));
-  request.on("end", () => {
-    if (
-      request.method !== "POST" ||
-      !runId ||
-      request.headers.authorization !== `Bearer token-${runId}`
-    ) {
-      response.writeHead(401).end("invalid");
-      return;
-    }
-    writeFileSync(`/result/${runId}.json`, Buffer.concat(chunks));
-    response.writeHead(200, { "Content-Type": "application/json" }).end('{"ok":true}');
-  });
-}).listen(8080, "0.0.0.0");
-SERVER
-
 docker network create "$NETWORK" >/dev/null
-docker run -d --rm \
-  --name "$CALLBACK_CONTAINER" \
-  --network "$NETWORK" \
-  -v "$SMOKE_DIR/callback.mjs:/callback.mjs:ro" \
-  -v "$SMOKE_DIR/result/callback:/result" \
-  node:22-bookworm node /callback.mjs >/dev/null
 
 run_sandbox() {
   local home_dir="$1"
@@ -109,6 +78,9 @@ run_sandbox() {
   local run_id="$5"
   local issue_identifier="$6"
   local resume_message="${7:-}"
+  mkdir -p "$home_dir/.ot"
+  printf '# %s\n\nApproved smoke-test plan.\n' "$issue_identifier" \
+    > "$home_dir/.ot/linear-context.md"
   local docker_args=(
     run --rm
     --network "$NETWORK"
@@ -120,14 +92,8 @@ run_sandbox() {
     -e GITHUB_TOKEN=github-smoke-token
     -e BASE_BRANCH=main
     -e "BRANCH_NAME=$branch"
-    -e "LINEAR_SESSION_ID=session-$issue_identifier"
     -e "LINEAR_ISSUE_ID=issue-$issue_identifier"
     -e "LINEAR_ISSUE_IDENTIFIER=$issue_identifier"
-    -e LINEAR_ACCESS_TOKEN=linear-oauth-token
-    -e LINEAR_MCP_API_KEY=linear-mcp-key
-    -e CLAUDE_CODE_OAUTH_TOKEN=claude-oauth-token
-    -e CODEX_API_KEY=codex-api-key
-    -e SUPERVISOR_URL="http://$CALLBACK_CONTAINER:8080"
     -e "RUN_ID=$run_id"
     -e "RUN_CALLBACK_TOKEN=token-$run_id"
     -e TASK_TIMEOUT=30
@@ -139,6 +105,11 @@ run_sandbox() {
   if [[ -n "$resume_message" ]]; then
     docker_args+=(-e "RESUME_MESSAGE=$resume_message")
   fi
+  if [[ "$agent" == "claude" ]]; then
+    docker_args+=(-e CLAUDE_CODE_OAUTH_TOKEN=claude-oauth-token)
+  else
+    docker_args+=(-e 'CODEX_AUTH_JSON={}')
+  fi
   docker "${docker_args[@]}" "$IMAGE"
 }
 
@@ -148,9 +119,11 @@ test "$(cat "$CLAUDE_HOME/.ot/agent-session-id")" = "smoke-claude-session"
 run_sandbox "$CLAUDE_HOME" claude resume ot/smoke-claude claude-resume OT-CLAUDE "continue"
 grep -q -- '--resume smoke-claude-session' "$CLAUDE_HOME/.ot/claude-args.log"
 jq -e '.exit_code == 0 and .cost_usd == 0.125' \
-  "$SMOKE_DIR/result/callback/claude-implement.json" >/dev/null
+  "$(find "$CLAUDE_HOME/.ot/outbox" -name '*completion-claude-implement.json' -print -quit)" >/dev/null
 jq -e '.exit_code == 0 and .cost_usd == 0.25' \
-  "$SMOKE_DIR/result/callback/claude-resume.json" >/dev/null
+  "$(find "$CLAUDE_HOME/.ot/outbox" -name '*completion-claude-resume.json' -print -quit)" >/dev/null
+jq -e '.kind == "activity" and .type == "action"' \
+  "$(find "$CLAUDE_HOME/.ot/outbox" -name '*-activity-*.json' -print -quit)" >/dev/null
 
 CODEX_HOME="$SMOKE_DIR/result/codex-home"
 run_sandbox "$CODEX_HOME" codex implement ot/smoke-codex codex-implement OT-CODEX
@@ -158,14 +131,16 @@ test "$(cat "$CODEX_HOME/.ot/agent-session-id")" = "smoke-codex-thread"
 run_sandbox "$CODEX_HOME" codex resume ot/smoke-codex codex-resume OT-CODEX "continue"
 grep -q -- 'exec .* resume smoke-codex-thread continue' "$CODEX_HOME/.ot/codex-args.log"
 jq -e '.exit_code == 0 and (has("cost_usd") | not)' \
-  "$SMOKE_DIR/result/callback/codex-implement.json" >/dev/null
+  "$(find "$CODEX_HOME/.ot/outbox" -name '*completion-codex-implement.json' -print -quit)" >/dev/null
 jq -e '.exit_code == 0 and (has("cost_usd") | not)' \
-  "$SMOKE_DIR/result/callback/codex-resume.json" >/dev/null
+  "$(find "$CODEX_HOME/.ot/outbox" -name '*completion-codex-resume.json' -print -quit)" >/dev/null
+jq -e '.kind == "activity" and .type == "action"' \
+  "$(find "$CODEX_HOME/.ot/outbox" -name '*-activity-*.json' -print -quit)" >/dev/null
 
 git --git-dir "$SMOKE_DIR/repo.git" show-ref --verify --quiet refs/heads/ot/smoke-claude
 git --git-dir "$SMOKE_DIR/repo.git" show-ref --verify --quiet refs/heads/ot/smoke-codex
-if grep -R -n -E -- \
-  'github-smoke-token|linear-oauth-token|linear-mcp-key|claude-oauth-token|codex-api-key|token-(claude|codex)' \
+if grep -R --exclude-dir=outbox -n -E -- \
+  'github-smoke-token|claude-oauth-token|token-(claude|codex)' \
   "$SMOKE_DIR/result"; then
   echo "smoke artifacts leaked a secret" >&2
   exit 1

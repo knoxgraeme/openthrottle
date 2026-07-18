@@ -14,9 +14,8 @@ function setRequiredEnv(): void {
     "DATABASE_PATH",
     "GITHUB_REPO_MAPPINGS",
     "DAYTONA_SNAPSHOT",
+    "DEFAULT_AGENT",
     "CLAUDE_CODE_OAUTH_TOKEN",
-    "ANTHROPIC_API_KEY",
-    "CODEX_API_KEY",
     "CODEX_AUTH_JSON",
     "BASE_BRANCH",
     "MAX_TURNS",
@@ -28,6 +27,7 @@ function setRequiredEnv(): void {
     "WEBHOOK_MAX_AGE_SECONDS",
     "REVIEW_MAX_ROUNDS",
     "ALLOW_LINEAR_MERGE",
+    "SANDBOX_EVENT_POLL_INTERVAL_MS",
   ]) {
     delete process.env[name];
   }
@@ -38,13 +38,12 @@ function setRequiredEnv(): void {
     LINEAR_WEBHOOK_SECRET: "linear-webhook",
     LINEAR_CLIENT_ID: "linear-client",
     LINEAR_CLIENT_SECRET: "linear-client-secret",
-    LINEAR_MCP_API_KEY: "linear-mcp",
     GITHUB_WEBHOOK_SECRET: "github-webhook",
     GITHUB_TOKEN: "github-token",
     GITHUB_REPO: "owner/repo",
     DAYTONA_API_KEY: "daytona",
     CLAUDE_CODE_OAUTH_TOKEN: "claude",
-    CODEX_API_KEY: "codex",
+    CODEX_AUTH_JSON: "{}",
   });
 }
 
@@ -62,6 +61,8 @@ describe("loadConfig", () => {
       port: 8080,
       taskTimeout: 7200,
       allowLinearMerge: true,
+      defaultAgent: "codex",
+      sandboxEventPollIntervalMs: 5_000,
     });
   });
 
@@ -83,5 +84,11 @@ describe("loadConfig", () => {
     setRequiredEnv();
     process.env.TASK_TIMEOUT = "0";
     expect(() => loadConfig()).toThrow("TASK_TIMEOUT must be between 1");
+  });
+
+  it("rejects an invalid default agent", () => {
+    setRequiredEnv();
+    process.env.DEFAULT_AGENT = "other";
+    expect(() => loadConfig()).toThrow("DEFAULT_AGENT must be claude or codex");
   });
 });

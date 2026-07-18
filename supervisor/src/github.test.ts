@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   countChangesRequestedReviews,
   getMergeReadiness,
+  isGithubPullRequestUrl,
   isOpenthrottleBranch,
   parseGithubWebhook,
   parsePullRequestUrl,
@@ -45,6 +46,9 @@ describe("GitHub contracts", () => {
       repo: "owner/repo",
       number: 42,
     });
+    expect(isGithubPullRequestUrl("https://github.com/owner/repo/pull/42")).toBe(true);
+    expect(isGithubPullRequestUrl("https://example.com/owner/repo/pull/42")).toBe(false);
+    expect(isGithubPullRequestUrl("https://github.com/owner/repo/pull/42/")).toBe(false);
     expect(() => parsePullRequestUrl("https://example.com/not-a-pr")).toThrow(/Invalid/);
   });
 

@@ -92,6 +92,9 @@ export function parseLinearWebhook(raw: string): LinearAgentSessionEventPayload 
   if (typeof payload.organizationId !== "string") {
     throw new Error("Linear webhook is missing organizationId");
   }
+  if (payload.promptContext !== undefined && typeof payload.promptContext !== "string") {
+    throw new Error("Linear webhook has invalid promptContext");
+  }
   if (payload.action === "prompted") {
     if (!isRecord(payload.agentActivity) || typeof payload.agentActivity.id !== "string") {
       throw new Error("Prompted webhook is missing agentActivity.id");

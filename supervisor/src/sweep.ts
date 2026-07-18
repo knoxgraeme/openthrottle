@@ -25,7 +25,9 @@ export async function runSweep(
   }
   await expireStaleTickets(daytona, store, linear, cfg);
   await deleteOrphanSandboxes(daytona, store, cfg);
-  store.pruneDeliveries(new Date(Date.now() - 7 * DAY_MS).toISOString());
+  const retentionCutoff = new Date(Date.now() - 7 * DAY_MS).toISOString();
+  store.pruneDeliveries(retentionCutoff);
+  store.pruneSandboxEvents(retentionCutoff);
 }
 
 async function expireStaleTickets(

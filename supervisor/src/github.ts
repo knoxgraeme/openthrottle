@@ -1,6 +1,12 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 const HTTP_TIMEOUT_MS = 15_000;
+const GITHUB_PULL_REQUEST_URL_PATTERN =
+  /^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+$/;
+
+export function isGithubPullRequestUrl(value: unknown): value is string {
+  return typeof value === "string" && GITHUB_PULL_REQUEST_URL_PATTERN.test(value);
+}
 
 export function verifyGithubSignature(
   rawBody: string,

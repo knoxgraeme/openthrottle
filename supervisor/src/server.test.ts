@@ -16,17 +16,15 @@ const cfg: Config = {
   linearWebhookSecret: "linear-secret",
   linearClientId: "client",
   linearClientSecret: "client-secret",
-  linearMcpApiKey: "mcp-key",
   githubWebhookSecret: "github-secret",
   githubToken: "github-token",
   githubRepo: "owner/repo",
   githubRepoMappings: {},
   daytonaApiKey: "daytona-key",
   daytonaSnapshot: "openthrottle",
+  defaultAgent: "codex",
   claudeCodeOauthToken: "claude-token",
-  anthropicApiKey: undefined,
-  codexApiKey: "codex-key",
-  codexAuthJson: undefined,
+  codexAuthJson: "{}",
   baseBranch: "main",
   maxTurns: 200,
   taskTimeout: 7200,
@@ -37,6 +35,7 @@ const cfg: Config = {
   webhookMaxAgeSeconds: 60,
   reviewMaxRounds: 3,
   allowLinearMerge: false,
+  sandboxEventPollIntervalMs: 5_000,
 };
 
 let db: Database.Database | undefined;
@@ -88,6 +87,10 @@ describe("createServer lifecycle", () => {
       id: "sandbox-1",
       state: "started",
       updateEnv: vi.fn(async () => undefined),
+      fs: {
+        uploadFile: vi.fn(async () => undefined),
+        setFilePermissions: vi.fn(async () => undefined),
+      },
       process: {
         createSession: vi.fn(async () => undefined),
         executeSessionCommand,
@@ -128,13 +131,14 @@ describe("createServer lifecycle", () => {
       webhookId: "linear-1",
       webhookTimestamp: Date.now(),
       organizationId: "org",
+      promptContext: "# OT-1\n\nApproved implementation plan",
       agentSession: {
         id: "session-1",
         issue: {
           id: "issue-1",
           identifier: "OT-1",
           team: { id: "team-1", key: "OT" },
-          labels: [{ name: "agent:codex" }],
+          labels: [],
         },
       },
     });
@@ -147,10 +151,21 @@ describe("createServer lifecycle", () => {
     await Promise.all(background.splice(0));
     expect(daytona.create).toHaveBeenCalledTimes(1);
     expect(executeSessionCommand).toHaveBeenCalledOnce();
+    expect(createParams?.envVars).not.toHaveProperty("LINEAR_ACCESS_TOKEN");
+    expect(createParams?.envVars).not.toHaveProperty("LINEAR_MCP_API_KEY");
+    expect(createParams?.envVars).not.toHaveProperty("LINEAR_SESSION_ID");
+    expect(createParams?.envVars).not.toHaveProperty("SUPERVISOR_URL");
+    expect(createParams?.envVars).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
+    expect(createParams?.envVars).toHaveProperty("CODEX_AUTH_JSON", "{}");
+    expect(sandbox.fs.uploadFile).toHaveBeenCalledWith(
+      Buffer.from("# OT-1\n\nApproved implementation plan"),
+      "/home/agent/.ot/linear-context.md"
+    );
     expect(store.getByIssueId("issue-1")).toMatchObject({
       agent: "codex",
       sandbox_id: "sandbox-1",
       run_id: expect.any(String),
+      linear_context: "# OT-1\n\nApproved implementation plan",
     });
 
     await app.request("/webhooks/linear", {
@@ -267,6 +282,56 @@ describe("createServer lifecycle", () => {
     expect(daytona.create).not.toHaveBeenCalled();
   });
 
+  it("rejects a selected agent without a subscription login before provisioning", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    const daytona = { list: vi.fn(), create: vi.fn() } as unknown as Daytona;
+    const linearRequests: string[] = [];
+    const linearFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      linearRequests.push(String(init?.body));
+      return Response.json({
+        data: { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
+      });
+    }) as unknown as typeof fetch;
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg: { ...cfg, claudeCodeOauthToken: undefined },
+      store,
+      daytona,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
+      runBackground: (task) => background.push(task),
+    });
+    const created = JSON.stringify({
+      action: "created",
+      type: "AgentSessionEvent",
+      webhookId: "linear-missing-claude",
+      webhookTimestamp: Date.now(),
+      organizationId: "org",
+      agentSession: {
+        id: "session-missing-claude",
+        issue: {
+          id: "issue-missing-claude",
+          identifier: "OT-NO-CLAUDE",
+          labels: [{ name: "agent:claude" }],
+        },
+      },
+    });
+
+    const response = await app.request("/webhooks/linear", {
+      method: "POST",
+      headers: signedLinear(created, "linear-missing-claude"),
+      body: created,
+    });
+    await Promise.all(background.splice(0));
+
+    expect(response.status).toBe(200);
+    expect(daytona.list).not.toHaveBeenCalled();
+    expect(daytona.create).not.toHaveBeenCalled();
+    expect(store.getByIssueId("issue-missing-claude")).toBeUndefined();
+    expect(linearRequests.some((request) => request.includes("subscription login is not configured")))
+      .toBe(true);
+  });
+
   it("reattaches a labeled workspace after provisioning was interrupted", async () => {
     db = openDb(":memory:");
     const store = createTicketStore(db);
@@ -360,10 +425,17 @@ describe("createServer lifecycle", () => {
       state: "active",
     });
     const executeSessionCommand = vi.fn(async () => undefined);
+    const envUpdates: Array<Record<string, string>> = [];
     const sandbox = {
       id: "sandbox-notify",
       state: "started",
-      updateEnv: vi.fn(async () => undefined),
+      updateEnv: vi.fn(async (env: Record<string, string>) => {
+        envUpdates.push(env);
+      }),
+      fs: {
+        uploadFile: vi.fn(async () => undefined),
+        setFilePermissions: vi.fn(async () => undefined),
+      },
       process: {
         createSession: vi.fn(async () => undefined),
         executeSessionCommand,
@@ -412,8 +484,84 @@ describe("createServer lifecycle", () => {
 
     expect(executeSessionCommand).toHaveBeenCalledOnce();
     const ticket = store.getByIssueId("issue-notify")!;
+    expect(ticket.agent).toBe("claude");
     expect(ticket.run_id).toEqual(expect.any(String));
     expect(store.getRun(ticket.run_id!)?.status).toBe("running");
+    expect(envUpdates.at(-1)).toMatchObject({ AGENT: "claude", TASK_TYPE: "resume" });
+  });
+
+  it("starts fresh instead of cross-resuming when a re-delegation switches agents", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-switch",
+      linear_issue_identifier: "OT-SWITCH",
+      linear_session_id: "session-old",
+      sandbox_id: "sandbox-switch",
+      branch: "ot/ot-switch",
+      agent: "claude",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+    });
+    const envUpdates: Array<Record<string, string>> = [];
+    const sandbox = {
+      id: "sandbox-switch",
+      state: "started",
+      updateEnv: vi.fn(async (env: Record<string, string>) => {
+        envUpdates.push(env);
+      }),
+      fs: {
+        uploadFile: vi.fn(async () => undefined),
+        setFilePermissions: vi.fn(async () => undefined),
+      },
+      process: {
+        createSession: vi.fn(async () => undefined),
+        executeSessionCommand: vi.fn(async () => undefined),
+      },
+    };
+    const linearFetch = vi.fn(async () => Response.json({
+      data: { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
+    })) as unknown as typeof fetch;
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg,
+      store,
+      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
+      runBackground: (task) => background.push(task),
+    });
+    const created = JSON.stringify({
+      action: "created",
+      type: "AgentSessionEvent",
+      webhookId: "linear-switch",
+      webhookTimestamp: Date.now(),
+      organizationId: "org",
+      agentSession: {
+        id: "session-switch",
+        issue: {
+          id: "issue-switch",
+          identifier: "OT-SWITCH",
+          team: { id: "team-1", key: "OT" },
+          labels: [{ name: "agent:codex" }],
+        },
+      },
+    });
+
+    await app.request("/webhooks/linear", {
+      method: "POST",
+      headers: signedLinear(created, "linear-switch"),
+      body: created,
+    });
+    await Promise.all(background.splice(0));
+
+    expect(store.getByIssueId("issue-switch")?.agent).toBe("codex");
+    expect(envUpdates.at(-1)).toMatchObject({
+      AGENT: "codex",
+      TASK_TYPE: "implement",
+      CODEX_AUTH_JSON: "{}",
+    });
+    expect(envUpdates.at(-1)).not.toHaveProperty("RESUME_MESSAGE");
   });
 
   it("keeps the run active and returns 502 when Daytona cannot stop it", async () => {
@@ -536,6 +684,10 @@ describe("createServer lifecycle", () => {
       updateEnv: vi.fn(async (env: Record<string, string>) => {
         envUpdates.push(env);
       }),
+      fs: {
+        uploadFile: vi.fn(async () => undefined),
+        setFilePermissions: vi.fn(async () => undefined),
+      },
       process: {
         createSession: vi.fn(async () => undefined),
         executeSessionCommand: vi.fn(async () => undefined),
@@ -838,6 +990,10 @@ describe("createServer lifecycle", () => {
       updateEnv: vi.fn(async (env: Record<string, string>) => {
         envUpdates.push(env);
       }),
+      fs: {
+        uploadFile: vi.fn(async () => undefined),
+        setFilePermissions: vi.fn(async () => undefined),
+      },
       process: {
         createSession: vi.fn(async () => undefined),
         executeSessionCommand: vi.fn(async () => undefined),
@@ -888,5 +1044,65 @@ describe("createServer lifecycle", () => {
     const ticket = store.getByIssueId("issue-rereview")!;
     expect(ticket.run_id).not.toBe("run-rereview");
     expect(store.getRun(ticket.run_id!)?.task_type).toBe("review");
+  });
+
+  it("does not overwrite an agent elicitation with a generic success response", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-elicitation",
+      linear_issue_identifier: "OT-ELICIT",
+      linear_session_id: "session-elicitation",
+      sandbox_id: "sandbox-elicitation",
+      branch: "ot/ot-elicit",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+    });
+    const token = "callback-elicitation";
+    store.beginRun({
+      issueId: "issue-elicitation",
+      runId: "run-elicitation",
+      taskType: "implement",
+      tokenHash: createHash("sha256").update(token).digest("hex"),
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    const eventId = "44444444-4444-4444-8444-444444444444";
+    store.insertSandboxEvent({
+      eventId,
+      runId: "run-elicitation",
+      sandboxId: "sandbox-elicitation",
+      kind: "activity",
+      payload: JSON.stringify({ type: "elicitation" }),
+    });
+    store.claimSandboxEvent(eventId, new Date().toISOString(), "2099-01-01T00:00:00.000Z");
+    store.markSandboxEventProcessed(eventId);
+
+    const requests: string[] = [];
+    const linearFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      requests.push(String(init?.body));
+      return Response.json({
+        data: { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
+      });
+    }) as unknown as typeof fetch;
+    const app = createServer({
+      cfg,
+      store,
+      daytona: {} as Daytona,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
+    });
+
+    const response = await app.request("/runs/run-elicitation/complete", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ exit_code: 0 }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(requests.some((request) => request.includes("finished successfully"))).toBe(false);
   });
 });

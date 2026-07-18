@@ -36,8 +36,8 @@ variables, secrets, or tokens to external services.
 4. Run test, lint, and format to verify. Fix anything that breaks.
 5. Push to `${BRANCH_NAME}`. **Do not create a new PR** — this updates
    the existing one.
-6. Post a short activity to the Linear session (`LINEAR_SESSION_ID`)
-   summarizing what was fixed and inviting a re-review reply — e.g.,
+6. Run `ot-activity response "..."` with a short summary of what was fixed
+   and invite a re-review reply — e.g.,
    "Addressed the review — pushed 3 commits. Reply here if anything's
    still off."
 

@@ -18,10 +18,10 @@ One ticket has at most one active run. Tickets may run in parallel.
 
 ```text
 Linear AgentSessionEvent ──HMAC──> Fly supervisor ──@daytona/sdk──> sandbox
-        ▲                            │    │                              │
-        │ agent activities          │    └──SQLite run/delivery state   │
-        │                            │                                   │
-        └────────────────────────────┴──── GitHub webhooks <──── PR/CI ──┘
+        ▲                            │    ▲                              │
+        │ app-owned activities      │    └──── activity/result outbox ──┘
+        │                            └──SQLite run/delivery/event state
+        └──────────────────────────────── GitHub webhooks <──── PR/CI
 ```
 
 - `supervisor/`: Node 22, Hono, SQLite, OAuth/webhook/lifecycle control.
@@ -38,8 +38,8 @@ Linear AgentSessionEvent ──HMAC──> Fly supervisor ──@daytona/sdk─�
    window, durably inserts the raw payload under `Linear-Delivery`/`webhookId`,
    then returns HTTP 200. A leased worker handles it in the background with
    bounded exponential retries; duplicate deliveries reuse the stored row.
-3. It posts an ephemeral `thought` before sandbox work, resolves repo and
-   agent labels, inserts the ticket, and atomically claims a run.
+3. It posts an ephemeral `thought`, resolves repo and agent labels, persists
+   `promptContext`, inserts the ticket, and atomically claims a run.
 4. It creates a private Daytona sandbox from `DAYTONA_SNAPSHOT`, labeled
    `openthrottle=true` and `ticket=<identifier>`. The image entrypoint starts
    the requested task.
@@ -54,15 +54,16 @@ Linear AgentSessionEvent ──HMAC──> Fly supervisor ──@daytona/sdk─�
 3. If a run is already active, the prompt is rejected with a polite activity;
    it is not queued.
 
-### Completion callback
+### Sandbox activity and completion
 
 Each run receives a random one-time callback token; only its SHA-256 hash is
-stored. The entrypoint calls `POST /runs/:id/complete` with exit code, cost,
-PR URL, and a sanitized failure tail. The supervisor consumes the token,
-clears the run guard, updates aggregate cost/state, attaches the PR, and posts
-the final activity. If no callback arrives by `TASK_TIMEOUT` plus grace, the
-sweep marks the run timed out and surfaces an error. Direct sandbox-to-Linear
-posting is only a callback-failure fallback.
+stored in the run table. Agents use `ot-activity` to write validated semantic
+activity records locally. The entrypoint writes a completion marker with exit
+code, cost, PR URL, and sanitized failure tail. Every five seconds, Fly polls
+only active runs through the Daytona SDK, durably claims each event, posts
+activities as the OpenThrottle app, and consumes completion through the same
+finalizer used by the legacy `POST /runs/:id/complete` endpoint. If no result
+arrives by `TASK_TIMEOUT` plus grace, the sweep marks the run timed out.
 
 ### GitHub/review lifecycle
 
@@ -117,11 +118,14 @@ Daytona uses `@daytona/sdk` `0.199.x`. Run env is updated with
 ### Persistence
 
 `tickets` stores identity/routing, sandbox/PR, state, current run guard,
-aggregate cost, last error, and preview-token hash. `runs` stores immutable
+aggregate cost, last error, preview-token hash, and latest Linear prompt
+context. `runs` stores immutable
 run identity plus task, hashed callback token, deadline, result, cost, PR and
 failure tail. `webhook_deliveries` is a durable inbox containing the validated
 payload, lease/retry state, attempt count, processing result, and sanitized
-last error. `settings` stores OAuth tokens and small supervisor settings.
+last error. `sandbox_events` stores idempotency/retry state for validated
+outbox records without persisting the raw one-time token. `settings` stores
+OAuth tokens and small supervisor settings.
 Migrations are additive for existing v2 databases; pre-inbox delivery rows are
 preserved as already processed so an upgrade cannot replay them.
 
@@ -135,17 +139,17 @@ Required unless noted:
 - HTTP/storage: `SUPERVISOR_URL`, `OT_STATUS_TOKEN`, `OT_INSTALL_SECRET`,
   `PORT=8080`, `DATABASE_PATH=/data/openthrottle.db`.
 - Linear: `LINEAR_WEBHOOK_SECRET`, `LINEAR_CLIENT_ID`,
-  `LINEAR_CLIENT_SECRET`, `LINEAR_MCP_API_KEY`.
+  `LINEAR_CLIENT_SECRET`.
 - GitHub: `GITHUB_WEBHOOK_SECRET`, `GITHUB_TOKEN`, `GITHUB_REPO`; optional
   `GITHUB_REPO_MAPPINGS` JSON maps Linear team id/key to `owner/name`.
 - Daytona: `DAYTONA_API_KEY`, `DAYTONA_SNAPSHOT=openthrottle`.
-- Agents: one of `CLAUDE_CODE_OAUTH_TOKEN`/`ANTHROPIC_API_KEY`; one of
-  `CODEX_API_KEY`/`CODEX_AUTH_JSON`.
+- Agents: `CLAUDE_CODE_OAUTH_TOKEN` for Claude subscription login and/or
+  `CODEX_AUTH_JSON` for Codex subscription login; `DEFAULT_AGENT=codex`.
 - Limits: `BASE_BRANCH=main`, `MAX_TURNS=200`, `TASK_TIMEOUT=7200`,
   `CALLBACK_GRACE_SECONDS=120`, `DEV_PORT=3000`,
   `SWEEP_MAX_AGE_DAYS=14`, `ORPHAN_GRACE_MINUTES=5`,
   `WEBHOOK_MAX_AGE_SECONDS=60`, `REVIEW_MAX_ROUNDS=3`,
-  `ALLOW_LINEAR_MERGE=false`.
+  `ALLOW_LINEAR_MERGE=false`, `SANDBOX_EVENT_POLL_INTERVAL_MS=5000`.
 
 Fly keeps one machine running, mounts `/data`, and health-checks `/healthz`.
 
@@ -154,8 +158,8 @@ Fly keeps one machine running, mounts `/data`, and health-checks `/healthz`.
 ### Environment
 
 The supervisor passes `TASK_TYPE`, `AGENT`, `GITHUB_REPO`, `GITHUB_TOKEN`,
-`BASE_BRANCH`, `BRANCH_NAME`, Linear session/issue/access/MCP values,
-`SUPERVISOR_URL`, `RUN_ID`, `RUN_CALLBACK_TOKEN`, optional `RESUME_MESSAGE`,
+`BASE_BRANCH`, `BRANCH_NAME`, non-secret Linear issue identifiers,
+`RUN_ID`, `RUN_CALLBACK_TOKEN`, optional `RESUME_MESSAGE`,
 `PR_NUMBER`, `REVIEW_ROUND`, model auth, and limit values. Daytona/Fly keys
 and webhook/install/operator secrets never enter the sandbox.
 
@@ -169,14 +173,13 @@ and webhook/install/operator secrets never enter the sandbox.
 6. Start/restart the optional dev server on `0.0.0.0`.
 7. Install runtime skills/instructions and run the selected task through the
    JSONL normalizer under `timeout`.
-8. Remove temporary runtime MCP material and post the authenticated callback;
-   fall back to a direct Linear activity only if the callback is unreachable.
+8. Remove temporary runtime MCP material and atomically write a completion
+   marker for Fly to consume through Daytona.
 
 Claude skills are installed in the sandbox user's home, never the target
-checkout, and Claude receives a strict temporary MCP config with user-only
-setting sources. Codex gets global runtime instructions in
-`~/.codex/AGENTS.md` plus an idempotent Linear MCP entry whose bearer token is
-read from `LINEAR_MCP_API_KEY`. Project `AGENTS.md` and
+checkout, and Claude receives a strict temporary config containing only
+project-declared MCP servers with user-only setting sources. Codex gets global
+runtime instructions in `~/.codex/AGENTS.md`. Project `AGENTS.md` and
 `.claude/settings.json` files remain untouched and editable.
 Implement/review/review-fix/investigate use fresh contexts; resume reads
 `~/.ot/agent-session-id` and continues the same Claude session/Codex thread.
@@ -206,7 +209,7 @@ changed when a sandbox resumes.
 Target repository config:
 
 ```yaml
-agent: claude
+agent: codex
 test: pnpm test
 build: pnpm build
 lint: pnpm lint
@@ -223,7 +226,7 @@ mcp_servers: {}
 
 ## Security invariants
 
-1. No control-plane credential enters a sandbox.
+1. No Linear OAuth/API credential, Daytona API key, or webhook signing secret enters a sandbox.
 2. The pre-push hook blocks main/master and non-fast-forward pushes; its path
    is root-sealed. GitHub branch protection remains required.
 3. Logs and outbound agent-derived text are sanitized.
@@ -238,6 +241,6 @@ Node 22 CI runs TypeScript checks, Vitest contract/handler suites, Bats shell
 tests, and a real Docker smoke. The smoke first checks the pinned real Claude
 and Codex CLI versions/flags, then uses deterministic JSONL stubs to exercise
 implement and same-session resume for both engines, clone/branch safety,
-config, session/cost capture, callbacks, and secret-leak checks.
+config, session/cost capture, activity/completion markers, and secret-leak checks.
 Live Linear/Daytona/Fly acceptance remains a deployment gate because it
 requires operator-owned accounts and secrets.

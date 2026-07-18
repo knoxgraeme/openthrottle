@@ -15,19 +15,19 @@ setup, then drops privileges for all repo and agent commands.
 ## Lifecycle
 
 The eight phases are auth, checkout/push, sealed safety config, project config,
-post-bootstrap, dev server, agent task, and completion callback. Supported
+post-bootstrap, dev server, agent task, and completion marker. Supported
 tasks are `implement`, `resume`, `review`, `review-fix`, and `investigate`.
 Fresh tasks use their corresponding skill; resume continues the saved Claude
 session or Codex thread.
 
-`~/.ot` holds task/dev logs, the agent session ID, and normalized run result.
-The callback posts exit code, Claude cost, PR URL, and sanitized failure tail
-to the supervisor using a one-time token. Direct Linear GraphQL is only the
-fallback when the callback cannot be reached.
+`~/.ot` holds ticket context, task/dev logs, the agent session ID, normalized
+run result, and a structured outbox. `ot-activity` writes progress into that
+outbox. The exit trap writes exit code, Claude cost, PR URL, and sanitized
+failure tail as a completion marker. Fly reads both through the Daytona SDK.
 
-Claude receives only the strict runtime MCP config and user-level setting
-sources. Codex receives global instructions in `~/.codex/AGENTS.md` and a
-Linear MCP entry backed by the token environment variable. The target repo's
+Claude receives only project-declared MCP servers through a strict runtime
+config and user-level setting sources. Codex receives global instructions in
+`~/.codex/AGENTS.md`. Neither engine receives Linear credentials. The target repo's
 `AGENTS.md` and Claude settings remain untouched and editable. Git uses the
 `gh` credential helper against a clean origin URL, so the token never enters
 `.git/config` and the sealed config remains safe across resume runs.
@@ -52,10 +52,10 @@ sandbox/tests/smoke.sh openthrottle:test
 ```
 
 The smoke checks the pinned real Claude and Codex CLI versions and required
-flags, then uses a local bare repository, deterministic agent JSONL stubs, and
-a fake callback receiver. It verifies implement and same-session resume for
+flags, then uses a local bare repository and deterministic agent JSONL stubs.
+It verifies implement and same-session resume for
 both engines, checkout/branch creation, safety/config phases, session/cost
-capture, callback delivery, and absence of secrets in all persisted artifacts.
+capture, completion markers, and absence of secrets in human-visible artifacts.
 
 For live monitoring, use Daytona’s normal controls:
 

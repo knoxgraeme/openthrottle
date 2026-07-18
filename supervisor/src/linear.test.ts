@@ -40,6 +40,9 @@ describe("Linear contracts", () => {
   it("validates created and prompted payloads and both label encodings", () => {
     const parsed = parseLinearWebhook(JSON.stringify(createdPayload));
     expect(extractLabelNames(parsed)).toEqual(["agent:codex", "investigate"]);
+    expect(() =>
+      parseLinearWebhook(JSON.stringify({ ...createdPayload, promptContext: { unsafe: true } }))
+    ).toThrow("invalid promptContext");
 
     const prompted = parseLinearWebhook(
       JSON.stringify({

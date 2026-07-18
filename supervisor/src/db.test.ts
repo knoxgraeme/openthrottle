@@ -90,6 +90,45 @@ describe("TicketStore", () => {
     expect(store.listExpiredRuns("2021-01-01T00:00:00.000Z")).toHaveLength(1);
   });
 
+  it("persists Linear context and prunes only processed sandbox events", () => {
+    const store = makeStore();
+    store.setLinearContext("issue-1", "# OT-1\n\nApproved plan");
+    store.beginRun({
+      issueId: "issue-1",
+      runId: "run-events",
+      taskType: "implement",
+      tokenHash: "hash",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    for (const eventId of [
+      "11111111-1111-4111-8111-111111111111",
+      "22222222-2222-4222-8222-222222222222",
+    ]) {
+      store.insertSandboxEvent({
+        eventId,
+        runId: "run-events",
+        sandboxId: "sandbox-1",
+        kind: "activity",
+        payload: JSON.stringify({ type: "thought" }),
+      });
+    }
+    store.claimSandboxEvent(
+      "11111111-1111-4111-8111-111111111111",
+      new Date().toISOString(),
+      "2099-01-01T00:00:00.000Z"
+    );
+    store.markSandboxEventProcessed("11111111-1111-4111-8111-111111111111");
+    db!.prepare("UPDATE sandbox_events SET processed_at = ?, created_at = ?").run(
+      "2020-01-01T00:00:00.000Z",
+      "2020-01-01T00:00:00.000Z"
+    );
+
+    expect(store.getByIssueId("issue-1")?.linear_context).toBe("# OT-1\n\nApproved plan");
+    expect(store.pruneSandboxEvents("2021-01-01T00:00:00.000Z")).toBe(1);
+    expect(store.getSandboxEvent("11111111-1111-4111-8111-111111111111")).toBeUndefined();
+    expect(store.getSandboxEvent("22222222-2222-4222-8222-222222222222")).toBeDefined();
+  });
+
   it("migrates legacy delivery rows without replaying already acknowledged events", () => {
     const dir = mkdtempSync(join(tmpdir(), "openthrottle-db-"));
     tempDirs.push(dir);
