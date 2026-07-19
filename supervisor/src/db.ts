@@ -135,7 +135,7 @@ function applyColumnMigrations(
   }
 }
 
-export type Agent = "claude" | "codex";
+export type Agent = "claude" | "codex" | "opencode";
 export type TicketState = "active" | "closed" | "expired" | "error" | "stopped";
 export type TaskType = "implement" | "resume" | "review" | "review-fix" | "investigate";
 export type RunStatus = "running" | "completed" | "failed" | "timed_out" | "stopped";

@@ -8,7 +8,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 function adapter(engine, task) {
   const path = engine === "claude"
     ? `skills/claude/${task}/SKILL.md`
-    : `skills/codex/${task}.md`;
+    : `skills/${engine}/${task}.md`;
   return readFileSync(resolve(repoRoot, path), "utf8");
 }
 
@@ -20,7 +20,7 @@ describe("OpenThrottle Compound Engineering adapters", () => {
     investigate: ["ce-debug", "ce-commit-push-pr", "ce-babysit-pr"],
   };
 
-  for (const engine of ["claude", "codex"]) {
+  for (const engine of ["claude", "codex", "opencode"]) {
     for (const [task, skills] of Object.entries(expected)) {
       it(`${engine} ${task} composes the declared native skills`, () => {
         const body = adapter(engine, task);
@@ -33,12 +33,15 @@ describe("OpenThrottle Compound Engineering adapters", () => {
   it("keeps the plan gate and makes investigation action-capable", () => {
     expect(adapter("claude", "implement-plan")).toContain("stop without changing code");
     expect(adapter("codex", "implement-plan")).toContain("stop without changing code");
+    expect(adapter("opencode", "implement-plan")).toContain("stop without changing code");
     expect(adapter("claude", "investigate")).toContain("action-capable");
     expect(adapter("codex", "investigate")).toContain("may fix");
+    expect(adapter("opencode", "investigate")).toContain("may fix");
     expect(adapter("claude", "investigate")).toContain("actual bug");
     expect(adapter("codex", "investigate")).toContain("actual bug");
     expect(adapter("claude", "investigate")).not.toContain("mode:pipeline ~/.ot/linear-context.md");
     expect(adapter("codex", "investigate")).not.toContain("mode:pipeline ~/.ot/linear-context.md");
+    expect(adapter("opencode", "investigate")).not.toContain("mode:pipeline ~/.ot/linear-context.md");
   });
 
   it("passes the runtime PR number to Codex review", () => {
@@ -47,7 +50,7 @@ describe("OpenThrottle Compound Engineering adapters", () => {
   });
 
   it("runs configured gates before either engine creates a PR", () => {
-    for (const engine of ["claude", "codex"]) {
+    for (const engine of ["claude", "codex", "opencode"]) {
       const body = adapter(engine, "implement-plan");
       const testGate = body.indexOf("$OT_TEST_CMD");
       const lintGate = body.indexOf("$OT_LINT_CMD");

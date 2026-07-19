@@ -2,7 +2,7 @@
 // runner/normalize.mjs
 //
 // Line-buffered stdin JSONL processor sitting between the coding agent
-// (claude or codex) and the sandbox task log. See docs/SPEC.md
+// (claude, codex, or opencode) and the sandbox task log. See docs/SPEC.md
 // "runner/normalize.mjs" for the contract. Pure Node, zero dependencies —
 // only node: builtins, so it needs no npm install step in the image.
 //
@@ -273,6 +273,89 @@ export function summarizeCodexItem(item) {
 }
 
 // ---------------------------------------------------------------------------
+// opencode run --format json line handling
+// ---------------------------------------------------------------------------
+
+let openCodeCostUsd = 0;
+
+function looksLikeOpenCode(obj) {
+  if (typeof obj.sessionID === "string") return true;
+  if (typeof obj.type !== "string") return false;
+  if (obj.type.startsWith("step_")) return true;
+  if (obj.type === "message" && obj.part) return true;
+  if (obj.type === "error" && typeof obj.sessionID === "string") return true;
+  return false;
+}
+
+function openCodePart(obj) {
+  return obj.part ?? obj.message?.part ?? obj;
+}
+
+export function summarizeOpenCodeEvent(obj) {
+  const type = obj.type ?? "event";
+  const part = openCodePart(obj);
+  switch (type) {
+    case "message":
+    case "part": {
+      if (part?.type === "text" && part.text) return truncate(part.text);
+      if (part?.type === "tool" || part?.tool) {
+        return `tool: ${part.tool ?? part.name ?? "unknown"}${part.state ? ` (${part.state})` : ""}`;
+      }
+      if (part?.type === "error" || part?.error) {
+        return `error: ${truncate(JSON.stringify(part.error ?? part), 500)}`;
+      }
+      if (part?.type === "reasoning") return "";
+      return truncate(JSON.stringify(obj), 300);
+    }
+    case "step_start":
+      return "step started";
+    case "step_finish": {
+      const cost = part?.cost ?? obj.cost;
+      return `step finished${typeof cost === "number" ? ` (cost_usd=${cost})` : ""}`;
+    }
+    case "error":
+      return `error: ${truncate(JSON.stringify(obj.error ?? obj), 500)}`;
+    default:
+      return `${type}: ${truncate(JSON.stringify(obj), 300)}`;
+  }
+}
+
+function handleOpenCodeLine(obj) {
+  if (!looksLikeOpenCode(obj)) return false;
+
+  if (typeof obj.sessionID === "string") writeSessionId(obj.sessionID);
+
+  const type = obj.type ?? "event";
+  const part = openCodePart(obj);
+  switch (type) {
+    case "message":
+    case "part": {
+      const summary = summarizeOpenCodeEvent(obj);
+      if (summary) emit(`[opencode] ${summary}`);
+      return true;
+    }
+    case "step_start":
+      emit(`[opencode] ${summarizeOpenCodeEvent(obj)}`);
+      return true;
+    case "step_finish": {
+      const cost = part?.cost ?? obj.cost;
+      if (typeof cost === "number" && Number.isFinite(cost) && cost >= 0) {
+        openCodeCostUsd += cost;
+        runResult.cost_usd = openCodeCostUsd;
+      }
+      emit(`[opencode] ${summarizeOpenCodeEvent(obj)}`);
+      return true;
+    }
+    case "error":
+      emit(`[opencode] ${summarizeOpenCodeEvent(obj)}`);
+      return true;
+    default:
+      emit(`[opencode] ${summarizeOpenCodeEvent(obj)}`);
+      return true;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main loop
 // ---------------------------------------------------------------------------
 
@@ -298,6 +381,7 @@ export function processLine(raw) {
   }
 
   if (handleClaudeLine(obj)) return;
+  if (handleOpenCodeLine(obj)) return;
   if (handleCodexLine(obj)) return;
 
   // Recognized JSON but an unknown shape — pass through, truncated.

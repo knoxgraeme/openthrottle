@@ -59,8 +59,8 @@ function optionalBool(name: string, fallback: boolean): boolean {
 
 function optionalAgent(name: string, fallback: Agent): Agent {
   const value = process.env[name]?.trim().toLowerCase() ?? fallback;
-  if (value === "claude" || value === "codex") return value;
-  throw new Error(`Env var ${name} must be claude or codex, got: ${value}`);
+  if (value === "claude" || value === "codex" || value === "opencode") return value;
+  throw new Error(`Env var ${name} must be claude, codex, or opencode, got: ${value}`);
 }
 
 function optionalRepoMap(name: string): Record<string, string> {
@@ -107,6 +107,7 @@ export interface Config {
   defaultAgent: Agent;
   claudeCodeOauthToken: string | undefined;
   codexAuthJson: string | undefined;
+  kimiCodeApiKey: string | undefined;
 
   baseBranch: string;
   maxTurns: number;
@@ -144,6 +145,7 @@ export function loadConfig(): Config {
     defaultAgent: optionalAgent("DEFAULT_AGENT", "codex"),
     claudeCodeOauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN,
     codexAuthJson: process.env.CODEX_AUTH_JSON,
+    kimiCodeApiKey: process.env.KIMI_CODE_API_KEY,
 
     baseBranch: optional("BASE_BRANCH", "main"),
     maxTurns: optionalInt("MAX_TURNS", 200),
@@ -166,6 +168,11 @@ export function loadConfig(): Config {
   if (!cfg.codexAuthJson) {
     console.warn(
       "[config] CODEX_AUTH_JSON is not set — codex agent will not be usable"
+    );
+  }
+  if (!cfg.kimiCodeApiKey) {
+    console.warn(
+      "[config] KIMI_CODE_API_KEY is not set — opencode agent will not be usable"
     );
   }
   if (!GITHUB_REPO_PATTERN.test(cfg.githubRepo)) {

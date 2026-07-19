@@ -17,6 +17,7 @@ function setRequiredEnv(): void {
     "DEFAULT_AGENT",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CODEX_AUTH_JSON",
+    "KIMI_CODE_API_KEY",
     "BASE_BRANCH",
     "MAX_TURNS",
     "TASK_TIMEOUT",
@@ -44,6 +45,7 @@ function setRequiredEnv(): void {
     DAYTONA_API_KEY: "daytona",
     CLAUDE_CODE_OAUTH_TOKEN: "claude",
     CODEX_AUTH_JSON: "{}",
+    KIMI_CODE_API_KEY: "kimi",
   });
 }
 
@@ -62,6 +64,7 @@ describe("loadConfig", () => {
       taskTimeout: 7200,
       allowLinearMerge: true,
       defaultAgent: "codex",
+      kimiCodeApiKey: "kimi",
       sandboxEventPollIntervalMs: 5_000,
     });
   });
@@ -89,6 +92,12 @@ describe("loadConfig", () => {
   it("rejects an invalid default agent", () => {
     setRequiredEnv();
     process.env.DEFAULT_AGENT = "other";
-    expect(() => loadConfig()).toThrow("DEFAULT_AGENT must be claude or codex");
+    expect(() => loadConfig()).toThrow("DEFAULT_AGENT must be claude, codex, or opencode");
+  });
+
+  it("accepts opencode as the default agent", () => {
+    setRequiredEnv();
+    process.env.DEFAULT_AGENT = "opencode";
+    expect(loadConfig().defaultAgent).toBe("opencode");
   });
 });

@@ -1,7 +1,8 @@
 # OpenThrottle
 
 OpenThrottle is a plan-first coding pipeline: delegate an approved Linear
-ticket, get an isolated Daytona workspace running Claude Code or Codex, review
+ticket, get an isolated Daytona workspace running Claude Code, Codex, or
+OpenCode, review
 the resulting GitHub PR, and reply in Linear to continue the same session.
 
 The GitHub repository is `openthrottle-v2`; the product, CLI, npm package,
@@ -76,7 +77,7 @@ instead of falling back to the wrong repository.
 - `supervisor/` — Hono/SQLite control plane deployed on Fly.
 - `sandbox/` — Daytona image, safety boundary, entrypoint, tests.
 - `skills/` — OpenThrottle task adapters layered over the native Compound
-  Engineering toolkit installed for both Claude Code and Codex.
+  Engineering toolkit installed for Claude Code, Codex, and OpenCode.
 - `cli/` — the `openthrottle` command-line package.
 - `docs/` — architecture and execution plan.
 
@@ -93,3 +94,10 @@ are still required as the outer enforcement layer.
 The deterministic contract suite and Docker smoke are green locally. Live
 Linear/Daytona/Fly acceptance is intentionally a separate deployment gate
 because it consumes operator-owned credentials and account state.
+
+OpenCode is an opt-in third engine. The first supported provider profile is
+`model: kimi-code/kimi-for-coding` using `KIMI_CODE_API_KEY` from the Kimi Code
+Console subscription endpoint (`https://api.kimi.com/coding/v1`), not a Kimi
+Open Platform pay-as-you-go key or `kimi-k3` model ID. Production enablement
+requires a live operator-owned check that this stable alias is currently backed
+by K3 and authorized for OpenCode.

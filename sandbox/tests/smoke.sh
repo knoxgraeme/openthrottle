@@ -15,13 +15,14 @@ mkdir -p \
   "$SMOKE_DIR/work" \
   "$SMOKE_DIR/bin" \
   "$SMOKE_DIR/result/claude-home" \
-  "$SMOKE_DIR/result/codex-home"
+  "$SMOKE_DIR/result/codex-home" \
+  "$SMOKE_DIR/result/opencode-home"
 git init --bare "$SMOKE_DIR/repo.git" >/dev/null
 git init -b main "$SMOKE_DIR/work" >/dev/null
 git -C "$SMOKE_DIR/work" config user.email smoke@openthrottle.dev
 git -C "$SMOKE_DIR/work" config user.name "OpenThrottle Smoke"
 printf '{"name":"smoke","private":true}\n' > "$SMOKE_DIR/work/package.json"
-printf 'agent: claude\npost_bootstrap: []\nlimits:\n  max_turns: 2\n  task_timeout: 30\n' \
+printf 'agent: claude\nmodel: kimi-code/kimi-for-coding\npost_bootstrap: []\nlimits:\n  max_turns: 2\n  task_timeout: 30\n' \
   > "$SMOKE_DIR/work/.openthrottle.yml"
 git -C "$SMOKE_DIR/work" add package.json .openthrottle.yml
 git -C "$SMOKE_DIR/work" commit -m "test: seed smoke fixture" >/dev/null
@@ -45,7 +46,14 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
   codex exec --help | rg -q -- "--dangerously-bypass-approvals-and-sandbox" &&
   codex exec resume --help | rg -q -- "--skip-git-repo-check" &&
   gosu agent env HOME=/home/agent CODEX_HOME=/home/agent/.codex codex plugin list --json | jq -e '\''.installed[] | select(.pluginId == "compound-engineering@compound-engineering-plugin" and .version == "3.19.0" and .enabled == true)'\'' >/dev/null &&
-  test -f /home/agent/.codex/plugins/cache/compound-engineering-plugin/compound-engineering/3.19.0/skills/ce-work/SKILL.md
+  test -f /home/agent/.codex/plugins/cache/compound-engineering-plugin/compound-engineering/3.19.0/skills/ce-work/SKILL.md &&
+  opencode --version | rg -q "1\.18\.3" &&
+  opencode run --help | rg -q -- "--format" &&
+  opencode run --help | rg -q -- "--session" &&
+  opencode run --help | rg -q -- "--model" &&
+  opencode run --help | rg -q -- "--dir" &&
+  opencode run --help | rg -q -- "--auto" &&
+  test ! -e /opt/openthrottle/skills/opencode/ce-work/SKILL.md
 '
 
 cat > "$SMOKE_DIR/bin/claude" <<'STUB'
@@ -82,7 +90,29 @@ printf '%s\n' \
   '{"type":"item.completed","item":{"type":"agent_message","text":"smoke complete"}}' \
   '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}'
 STUB
-chmod 0755 "$SMOKE_DIR/bin/claude" "$SMOKE_DIR/bin/codex"
+
+cat > "$SMOKE_DIR/bin/opencode" <<'STUB'
+#!/usr/bin/env sh
+ot-activity action "smoke OpenCode agent started"
+test "${OPENCODE_DISABLE_PROJECT_CONFIG:-}" = "1"
+test "${OPENCODE_DISABLE_EXTERNAL_SKILLS:-}" = "1"
+test "${OPENCODE_DISABLE_CLAUDE_CODE:-}" = "1"
+test -f "$OPENCODE_CONFIG_DIR/opencode.json"
+test -r "$OPENCODE_CONFIG_DIR/opencode.json"
+grep -Fq '/opt/openthrottle/compound-engineering-marketplace' "$OPENCODE_CONFIG_DIR/opencode.json"
+grep -Fq '{env:KIMI_CODE_API_KEY}' "$OPENCODE_CONFIG_DIR/opencode.json"
+if grep -Fq "$KIMI_CODE_API_KEY" "$OPENCODE_CONFIG_DIR/opencode.json"; then
+  exit 12
+fi
+printf '%s\n' "$*" >> "$HOME/.ot/opencode-args.log"
+last=""
+for arg in "$@"; do last="$arg"; done
+printf '%s\n' "$last" >> "$HOME/.ot/opencode-prompt.log"
+printf '%s\n' \
+  '{"type":"message","sessionID":"smoke-opencode-session","part":{"type":"text","text":"smoke complete"}}' \
+  '{"type":"step_finish","sessionID":"smoke-opencode-session","part":{"cost":0.375}}'
+STUB
+chmod 0755 "$SMOKE_DIR/bin/claude" "$SMOKE_DIR/bin/codex" "$SMOKE_DIR/bin/opencode"
 
 docker network create "$NETWORK" >/dev/null
 
@@ -131,6 +161,7 @@ run_sandbox() {
     -v "$SMOKE_DIR:/fixture"
     -v "$SMOKE_DIR/bin/claude:/usr/local/bin/claude:ro"
     -v "$SMOKE_DIR/bin/codex:/usr/local/bin/codex:ro"
+    -v "$SMOKE_DIR/bin/opencode:/usr/local/bin/opencode:ro"
     -v "$home_dir:/home/agent"
   )
   if [[ -n "$resume_message" ]]; then
@@ -138,8 +169,10 @@ run_sandbox() {
   fi
   if [[ "$agent" == "claude" ]]; then
     docker_args+=(-e CLAUDE_CODE_OAUTH_TOKEN=claude-oauth-token)
-  else
+  elif [[ "$agent" == "codex" ]]; then
     docker_args+=(-e 'CODEX_AUTH_JSON={}')
+  else
+    docker_args+=(-e KIMI_CODE_API_KEY=kimi-smoke-secret)
   fi
   docker "${docker_args[@]}" "$IMAGE"
 }
@@ -173,13 +206,30 @@ jq -e '.exit_code == 0 and (has("cost_usd") | not)' \
 jq -e '.kind == "activity" and .type == "action"' \
   "$(find "$CODEX_HOME/.ot/outbox" -name '*-activity-*.json' -print -quit)" >/dev/null
 
+OPENCODE_HOME="$SMOKE_DIR/result/opencode-home"
+seed_agent_home "$OPENCODE_HOME"
+run_sandbox "$OPENCODE_HOME" opencode implement ot/smoke-opencode opencode-implement OT-OPENCODE
+test "$(cat "$OPENCODE_HOME/.ot/agent-session-id")" = "smoke-opencode-session"
+test "$(cat "$OPENCODE_HOME/.ot/agent-model")" = "kimi-code/kimi-for-coding"
+grep -Fq '$ce-work' "$OPENCODE_HOME/.ot/opencode-prompt.log"
+grep -q -- 'run .*--model kimi-code/kimi-for-coding .*--dir /home/agent/repo .*--auto' \
+  "$OPENCODE_HOME/.ot/opencode-args.log"
+run_sandbox "$OPENCODE_HOME" opencode resume ot/smoke-opencode opencode-resume OT-OPENCODE "continue"
+grep -q -- 'run .*--session smoke-opencode-session' "$OPENCODE_HOME/.ot/opencode-args.log"
+jq -e '.exit_code == 0 and .cost_usd == 0.375' \
+  "$(find "$OPENCODE_HOME/.ot/outbox" -name '*completion-opencode-implement.json' -print -quit)" >/dev/null
+jq -e '.exit_code == 0 and .cost_usd == 0.375' \
+  "$(find "$OPENCODE_HOME/.ot/outbox" -name '*completion-opencode-resume.json' -print -quit)" >/dev/null
+
 git --git-dir "$SMOKE_DIR/repo.git" show-ref --verify --quiet refs/heads/ot/smoke-claude
 git --git-dir "$SMOKE_DIR/repo.git" show-ref --verify --quiet refs/heads/ot/smoke-codex
 if grep -R --exclude-dir=outbox -n -E -- \
-  'github-smoke-token|claude-oauth-token|token-(claude|codex)' \
+  'github-smoke-token|claude-oauth-token|kimi-smoke-secret|token-(claude|codex|opencode)' \
   "$SMOKE_DIR/result"; then
   echo "smoke artifacts leaked a secret" >&2
   exit 1
 fi
 
-echo "sandbox Claude + Codex implement/resume smoke passed"
+git --git-dir "$SMOKE_DIR/repo.git" show-ref --verify --quiet refs/heads/ot/smoke-opencode
+
+echo "sandbox Claude + Codex + OpenCode implement/resume smoke passed"

@@ -19,7 +19,8 @@ interface Detected {
 }
 
 export interface ProjectConfig {
-  agent: "claude" | "codex";
+  agent: "claude" | "codex" | "opencode";
+  model?: string;
   test: string;
   build: string;
   lint: string;
@@ -144,6 +145,7 @@ async function promptConfig(detected: Detected, target: RepositoryTarget): Promi
           options: [
             { value: "codex", label: "Codex CLI" },
             { value: "claude", label: "Claude Code" },
+            { value: "opencode", label: "OpenCode (Kimi Code)" },
           ],
           initialValue: "codex",
         }),
@@ -168,7 +170,8 @@ async function promptConfig(detected: Detected, target: RepositoryTarget): Promi
   );
   return {
     project: {
-      agent: result.agent as "claude" | "codex",
+      agent: result.agent as "claude" | "codex" | "opencode",
+      model: result.agent === "opencode" ? "kimi-code/kimi-for-coding" : undefined,
       test: result.test,
       build: result.build,
       lint: result.lint,

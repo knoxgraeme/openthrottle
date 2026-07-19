@@ -86,13 +86,32 @@ function hasBearer(header: string | undefined, expected: string): boolean {
 }
 
 function pickAgent(labels: string[], defaultAgent: Agent): Agent {
+  if (labels.includes("agent:opencode")) return "opencode";
   if (labels.includes("agent:codex")) return "codex";
   if (labels.includes("agent:claude")) return "claude";
   return defaultAgent;
 }
 
 function hasAgentSubscription(cfg: Config, agent: Agent): boolean {
-  return agent === "codex" ? Boolean(cfg.codexAuthJson) : Boolean(cfg.claudeCodeOauthToken);
+  switch (agent) {
+    case "codex":
+      return Boolean(cfg.codexAuthJson);
+    case "claude":
+      return Boolean(cfg.claudeCodeOauthToken);
+    case "opencode":
+      return Boolean(cfg.kimiCodeApiKey);
+  }
+}
+
+function agentDisplayName(agent: Agent): string {
+  switch (agent) {
+    case "codex":
+      return "Codex";
+    case "claude":
+      return "Claude";
+    case "opencode":
+      return "OpenCode";
+  }
 }
 
 function linearContext(
@@ -256,6 +275,7 @@ function baseSandboxEnv(
     CLAUDE_CODE_OAUTH_TOKEN:
       params.ticket.agent === "claude" ? cfg.claudeCodeOauthToken : undefined,
     CODEX_AUTH_JSON: params.ticket.agent === "codex" ? cfg.codexAuthJson : undefined,
+    KIMI_CODE_API_KEY: params.ticket.agent === "opencode" ? cfg.kimiCodeApiKey : undefined,
     MAX_TURNS: String(cfg.maxTurns),
     TASK_TIMEOUT: String(cfg.taskTimeout),
     DEV_PORT: String(cfg.devPort),
@@ -297,7 +317,7 @@ async function launchExistingTask(params: {
     await tryPostError(
       linear,
       ticket.linear_session_id,
-      `${ticket.agent === "codex" ? "Codex" : "Claude"} subscription login is not configured for OpenThrottle.`
+      `${agentDisplayName(ticket.agent)} subscription login is not configured for OpenThrottle.`
     );
     return false;
   }
@@ -835,7 +855,7 @@ async function handleCreated(
     await tryPostError(
       linear,
       sessionId,
-      `${selectedAgent === "codex" ? "Codex" : "Claude"} subscription login is not configured for OpenThrottle.`
+      `${agentDisplayName(selectedAgent)} subscription login is not configured for OpenThrottle.`
     );
     return;
   }

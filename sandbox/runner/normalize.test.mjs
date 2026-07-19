@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   collectEnvSecretValues,
   sanitize,
+  summarizeOpenCodeEvent,
   summarizeCodexItem,
   truncate,
 } from "./normalize.mjs";
@@ -31,5 +32,33 @@ describe("normalize", () => {
 
   it("truncates oversized output", () => {
     expect(truncate("abcdef", 3)).toBe("abc… [truncated 3 chars]");
+  });
+
+  it("summarizes OpenCode JSON events", () => {
+    expect(
+      summarizeOpenCodeEvent({
+        type: "message",
+        sessionID: "session-1",
+        part: { type: "text", text: "done" },
+      })
+    ).toBe("done");
+    expect(
+      summarizeOpenCodeEvent({
+        type: "message",
+        part: { type: "tool", tool: "bash", state: "completed" },
+      })
+    ).toBe("tool: bash (completed)");
+    expect(summarizeOpenCodeEvent({ type: "step_finish", part: { cost: 0.125 } })).toBe(
+      "step finished (cost_usd=0.125)"
+    );
+  });
+
+  it("does not classify Codex errors as OpenCode without a sessionID", () => {
+    expect(summarizeCodexItem({ type: "agent_message", text: "still codex" })).toBe(
+      "agent_message: still codex"
+    );
+    expect(summarizeOpenCodeEvent({ type: "error", sessionID: "oc", error: "failed" })).toBe(
+      "error: \"failed\""
+    );
   });
 });

@@ -42,6 +42,10 @@ SQLite database; they are not Fly secrets.
 
 Development:
 
+For OpenCode projects, choose `agent: opencode`; `init` writes
+`model: kimi-code/kimi-for-coding`. The `model` setting is ignored by Claude
+and Codex runs, and OpenCode resumes keep the model saved from the first run.
+
 ```bash
 npm ci
 npm run typecheck
