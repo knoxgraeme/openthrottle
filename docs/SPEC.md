@@ -280,8 +280,12 @@ changed when a sandbox resumes.
 
 - `openthrottle setup`: verify the canonical Daytona snapshot when local
   credentials are available and print the one-time platform/Fly checklist.
-  Snapshot creation is a one-time operator command from this repository:
-  `daytona snapshot create openthrottle --dockerfile sandbox/Dockerfile --context .`.
+  Snapshot creation is an operator command from this repository
+  (`daytona snapshot create <name> --dockerfile sandbox/Dockerfile --context .`)
+  and is automated on `main` by `.github/workflows/deploy.yml`, which builds
+  commit-pinned `openthrottle-v2-ce-<short-sha>` snapshots through
+  `supervisor/scripts/build-snapshot.mjs` and stages the `DAYTONA_SNAPSHOT`
+  secret before the Fly deploy releases it.
 - `openthrottle init`: run from a target GitHub checkout; detect its origin,
   base branch, package commands (or accept manual non-Node commands), write
   `.openthrottle.yml`, and call the authenticated supervisor registration
