@@ -2033,4 +2033,166 @@ describe("createServer lifecycle", () => {
     expect(response.status).toBe(200);
     expect(requests.some((request) => request.includes("finished successfully"))).toBe(false);
   });
+
+  it("defers the fresh re-review while a review-fix run ends paused on a decision elicitation", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-paused",
+      linear_issue_identifier: "OT-PAUSED",
+      linear_session_id: "session-paused",
+      sandbox_id: "sandbox-paused",
+      branch: "ot/ot-paused",
+      agent: "claude",
+      repo: "owner/repo",
+      pr_url: "https://github.com/owner/repo/pull/21",
+      state: "active",
+    });
+    const callbackToken = "callback-paused";
+    store.beginRun({
+      issueId: "issue-paused",
+      runId: "run-paused",
+      taskType: "review-fix",
+      tokenHash: createHash("sha256").update(callbackToken).digest("hex"),
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    const eventId = "55555555-5555-4555-8555-555555555555";
+    store.insertSandboxEvent({
+      eventId,
+      runId: "run-paused",
+      sandboxId: "sandbox-paused",
+      kind: "activity",
+      payload: JSON.stringify({ type: "elicitation", body: "Decision needed on the schema change." }),
+    });
+    store.claimSandboxEvent(eventId, new Date().toISOString(), "2099-01-01T00:00:00.000Z");
+    store.markSandboxEventProcessed(eventId);
+    const envUpdates: Array<Record<string, string>> = [];
+    const sandbox = {
+      state: "started",
+      setAutostopInterval: vi.fn(async () => undefined),
+      updateEnv: vi.fn(async (env: Record<string, string>) => {
+        envUpdates.push(env);
+      }),
+      fs: {
+        uploadFile: vi.fn(async () => undefined),
+        setFilePermissions: vi.fn(async () => undefined),
+      },
+      process: {
+        createSession: vi.fn(async () => undefined),
+        executeSessionCommand: vi.fn(async () => undefined),
+      },
+    };
+    const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
+    const linearFetch = vi.fn(async () =>
+      Response.json({
+        data: { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
+      })
+    ) as unknown as typeof fetch;
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg,
+      store,
+      daytona,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
+      runBackground: (task) => background.push(task),
+    });
+
+    const response = await app.request("/runs/run-paused/complete", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${callbackToken}`,
+      },
+      body: JSON.stringify({
+        exit_code: 0,
+        pr_url: "https://github.com/owner/repo/pull/21",
+      }),
+    });
+    await Promise.all(background.splice(0));
+
+    expect(response.status).toBe(200);
+    expect(envUpdates).toEqual([]);
+    const ticket = store.getByIssueId("issue-paused")!;
+    expect(ticket.run_id).toBeNull();
+    expect(ticket.pending_re_review).toBe(1);
+  });
+
+  it("starts the deferred re-review after the resumed session answers the decisions", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-deferred",
+      linear_issue_identifier: "OT-DEFERRED",
+      linear_session_id: "session-deferred",
+      sandbox_id: "sandbox-deferred",
+      branch: "ot/ot-deferred",
+      agent: "claude",
+      repo: "owner/repo",
+      pr_url: "https://github.com/owner/repo/pull/22",
+      state: "active",
+    });
+    store.setPendingReReview("issue-deferred", true);
+    const callbackToken = "callback-deferred";
+    store.beginRun({
+      issueId: "issue-deferred",
+      runId: "run-deferred",
+      taskType: "resume",
+      tokenHash: createHash("sha256").update(callbackToken).digest("hex"),
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    const envUpdates: Array<Record<string, string>> = [];
+    const sandbox = {
+      state: "started",
+      setAutostopInterval: vi.fn(async () => undefined),
+      updateEnv: vi.fn(async (env: Record<string, string>) => {
+        envUpdates.push(env);
+      }),
+      fs: {
+        uploadFile: vi.fn(async () => undefined),
+        setFilePermissions: vi.fn(async () => undefined),
+      },
+      process: {
+        createSession: vi.fn(async () => undefined),
+        executeSessionCommand: vi.fn(async () => undefined),
+      },
+    };
+    const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Response.json([{ state: "CHANGES_REQUESTED" }]))
+    );
+    const linearFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const query = String(JSON.parse(String(init?.body)).query);
+      return Response.json({
+        data: query.includes("AgentSessionUpdate")
+          ? { agentSessionUpdate: { success: true } }
+          : { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
+      });
+    }) as unknown as typeof fetch;
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg,
+      store,
+      daytona,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
+      runBackground: (task) => background.push(task),
+    });
+
+    const response = await app.request("/runs/run-deferred/complete", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${callbackToken}`,
+      },
+      body: JSON.stringify({ exit_code: 0 }),
+    });
+    await Promise.all(background.splice(0));
+
+    expect(response.status).toBe(200);
+    expect(envUpdates.at(-1)).toMatchObject({ TASK_TYPE: "review", PR_NUMBER: "22" });
+    const ticket = store.getByIssueId("issue-deferred")!;
+    expect(ticket.pending_re_review).toBe(0);
+    expect(ticket.run_id).not.toBe("run-deferred");
+    expect(store.getRun(ticket.run_id!)?.task_type).toBe("review");
+  });
 });

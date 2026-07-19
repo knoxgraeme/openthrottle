@@ -88,7 +88,10 @@ that ticket, bounding durable log storage to the latest captured run.
   and closes the ticket row.
 - `needs-review` labels or `review_requested` start a fresh `review` task.
 - A human `CHANGES_REQUESTED` review starts `review-fix`; a successful fix
-  starts a fresh re-review.
+  starts a fresh re-review. A review-fix that ends paused on a decision
+  elicitation (or whose re-review was outranked by queued human work) instead
+  marks the ticket's pending re-review flag; the re-review starts after a
+  later successful non-paused run on that ticket.
 - Implement and review-fix runs invoke bounded `ce-babysit-pr mode:pipeline`
   so actionable CI/review feedback can be repaired before Fly's next event.
 - Review verdicts are PR comments, never GitHub approval/rejection state.
@@ -143,7 +146,8 @@ Daytona uses `@daytona/sdk` `0.199.x`. Run env is updated with
 
 `tickets` stores identity/routing (including the resolved base branch),
 sandbox/PR, state, current run guard, aggregate cost, last error,
-preview-token hash, and latest Linear prompt context. `agent_sessions` stores
+preview-token hash, latest Linear prompt context, and the pending re-review
+flag set when a review-fix pauses on a decision elicitation. `agent_sessions` stores
 each immutable Linear AgentSession generation and marks the one current
 generation per issue. `session_work` stores deduplicated human/automatic work
 by source id and priority. `runs` stores immutable run identity plus the
@@ -236,6 +240,15 @@ report-only `ce-code-review`; review-fix uses `ce-resolve-pr-feedback` and
 bounded `ce-babysit-pr`; investigate uses action-capable `ce-debug
 mode:pipeline` and ships convergent fixes. Fly remains responsible for run
 serialization, event publication, and fresh re-review scheduling.
+Adapters enforce a decision gate: critical, foundational, or risky changes
+(schema/data migrations, auth/security behavior, public API or contract
+changes, architecture rework, dependency changes, destructive operations, or
+multiple defensible interpretations) are never implemented without a human
+answer. Clear fixes ship first; remaining items go out as one batched
+`elicitation` decision list whose Linear reply resumes the same session. No
+item is backlogged — each ends fixed, answered on its thread, or escalated —
+and every response and PR description ends with an "Assumptions & decisions"
+section for human audit.
 Implement/review/review-fix/investigate use fresh contexts; resume reads
 `~/.ot/agent-session-id` and continues the same Claude session/Codex thread.
 

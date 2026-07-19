@@ -19,8 +19,14 @@ convergent bug, but must defer divergent product or architecture decisions.
 3. If CE pushed a fix, resolve an existing PR for `BRANCH_NAME`; if none
    exists, invoke `/ce-commit-push-pr mode:pipeline branding:on babysit:off`.
    Then invoke `/ce-babysit-pr mode:pipeline <PR URL>`. Never merge the PR.
-4. Run `ot-activity response` with the root cause and one of: fixed PR,
-   diagnosed-no-fix, flaky-infra, or needs-human. Include any PR URL and invite
-   a reply.
+4. If the fix is blocked on a divergent product or architecture decision that
+   a specific answer would unblock, run `ot-activity elicitation` with the
+   diagnosis and one numbered decision list (context, options, and your
+   recommended option), then stop; the reply resumes this session. Otherwise
+   run `ot-activity response` with the root cause and one of: fixed PR,
+   diagnosed-no-fix, flaky-infra, or needs-human, ending in an
+   "Assumptions & decisions" section listing every judgment call made
+   without asking.
+   Include any PR URL and invite a reply.
 
 The required native sequence is also available as `$OT_CE_PIPELINE`.

@@ -37,12 +37,25 @@ use the same version.
 The adapters remain necessary for contracts that CE does not own:
 
 - The hard approved-plan gate before implementation.
+- The decision gate: critical, foundational, or risky changes are never
+  implemented without a human answer. Clear fixes ship first; the remaining
+  items go out as one batched `ot-activity elicitation` decision list
+  (context, options, recommendation per item), and the Linear reply resumes
+  the same session to action the answers.
+- The no-backlog rule: every review item ends a run fixed and pushed,
+  answered on its thread with reasoning, or escalated as a numbered decision
+  — never silently deferred or dropped.
+- The assumptions ledger: responses and PR descriptions end with an
+  "Assumptions & decisions" section so a human can audit every judgment call
+  the agent made without asking.
 - The existing checked-out branch and sealed never-push-to-base boundary.
 - `ot-activity` semantic events; Fly alone holds Linear app credentials and
   publishes as OpenThrottle.
 - Comment-only review verdicts because the app identity cannot approve its own
   PR and a human owns merge.
-- Fly's deterministic fresh re-review after a successful review-fix.
+- Fly's deterministic fresh re-review after a review-fix that completes with
+  no pending decisions. A review-fix that pauses on a decision elicitation
+  defers the re-review until the resumed session lands the answers.
 - Prompt-injection treatment for ticket, repository, and review content.
 
 `investigate` is deliberately action-capable. Native `ce-debug mode:pipeline`

@@ -30,10 +30,12 @@ The corresponding OpenThrottle skill is a thin product adapter over native CE:
 - `implement` → `ce-work` → `ce-code-review` → `ce-commit-push-pr` → bounded
   `ce-babysit-pr`.
 - `review` → report-only `ce-code-review` and one PR verdict comment.
-- `review-fix` → `ce-resolve-pr-feedback` → bounded `ce-babysit-pr`; Fly then
-  schedules a fresh review.
+- `review-fix` → `ce-resolve-pr-feedback` → bounded `ce-babysit-pr`; remaining
+  decision-required items go out as one batched elicitation whose reply
+  resumes the session. Fly schedules the fresh review once no decisions are
+  pending.
 - `investigate` → action-capable `ce-debug mode:pipeline`, with convergent fixes
-  shipped and divergent decisions returned as needs-human residuals.
+  shipped and divergent decisions escalated as elicitation questions.
 
 Fly owns run serialization, webhook retries, follow-up scheduling, and Linear
 publication. Sandbox events are session-bound by the supervisor run record

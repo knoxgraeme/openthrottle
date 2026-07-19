@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS tickets (
   preview_token_hash TEXT,
   linear_context TEXT,
   base_branch TEXT NOT NULL DEFAULT 'main',
+  pending_re_review INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -168,6 +169,7 @@ const TICKET_MIGRATIONS: Array<[string, string]> = [
   ["preview_token_hash", "ALTER TABLE tickets ADD COLUMN preview_token_hash TEXT"],
   ["linear_context", "ALTER TABLE tickets ADD COLUMN linear_context TEXT"],
   ["base_branch", "ALTER TABLE tickets ADD COLUMN base_branch TEXT NOT NULL DEFAULT 'main'"],
+  ["pending_re_review", "ALTER TABLE tickets ADD COLUMN pending_re_review INTEGER NOT NULL DEFAULT 0"],
 ];
 
 const RUN_MIGRATIONS: Array<[string, string]> = [
@@ -246,6 +248,7 @@ export interface Ticket {
   preview_token_hash: string | null;
   linear_context: string | null;
   base_branch: string;
+  pending_re_review: number;
   created_at: string;
   updated_at: string;
 }
@@ -425,6 +428,7 @@ export interface TicketStore {
   setSandboxId(issueId: string, sandboxId: string | null): void;
   setState(issueId: string, state: TicketState, lastError?: string): void;
   setPrUrl(issueId: string, prUrl: string): void;
+  setPendingReReview(issueId: string, pending: boolean): void;
   setPreviewTokenHash(issueId: string, tokenHash: string): void;
   setLinearContext(issueId: string, context: string): void;
   listActive(): Ticket[];
@@ -539,6 +543,9 @@ export function createTicketStore(db: Database.Database): TicketStore {
   );
   const setPrUrlStmt = db.prepare(
     "UPDATE tickets SET pr_url = ?, updated_at = ? WHERE linear_issue_id = ?"
+  );
+  const setPendingReReviewStmt = db.prepare(
+    "UPDATE tickets SET pending_re_review = ?, updated_at = ? WHERE linear_issue_id = ?"
   );
   const setPreviewTokenHashStmt = db.prepare(
     "UPDATE tickets SET preview_token_hash = ?, updated_at = ? WHERE linear_issue_id = ?"
@@ -918,6 +925,9 @@ export function createTicketStore(db: Database.Database): TicketStore {
     },
     setPrUrl(issueId, prUrl) {
       setPrUrlStmt.run(prUrl, now(), issueId);
+    },
+    setPendingReReview(issueId, pending) {
+      setPendingReReviewStmt.run(pending ? 1 : 0, now(), issueId);
     },
     setPreviewTokenHash(issueId, tokenHash) {
       setPreviewTokenHashStmt.run(tokenHash, now(), issueId);

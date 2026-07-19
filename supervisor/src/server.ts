@@ -163,14 +163,22 @@ function linearContext(
   return payload.promptContext?.trim() || fallback;
 }
 
-function hasTerminalSandboxActivity(store: TicketStore, runId: string): boolean {
+type TerminalActivityType = "elicitation" | "response" | "error";
+
+function lastTerminalSandboxActivity(
+  store: TicketStore,
+  runId: string
+): TerminalActivityType | undefined {
   const event = store.getLastProcessedSandboxActivity(runId);
-  if (!event) return false;
+  if (!event) return undefined;
   try {
     const payload = JSON.parse(event.payload) as { type?: string };
-    return ["elicitation", "response", "error"].includes(payload.type ?? "");
+    const type = payload.type ?? "";
+    return ["elicitation", "response", "error"].includes(type)
+      ? (type as TerminalActivityType)
+      : undefined;
   } catch {
-    return false;
+    return undefined;
   }
 }
 
@@ -643,10 +651,12 @@ export async function completeRun(
     },
     deps.schedule
   );
+  const terminalActivity = lastTerminalSandboxActivity(deps.store, run.id);
+  const pausedOnDecisions = exitCode === 0 && terminalActivity === "elicitation";
   try {
     const sessionId = run.linear_session_id ?? ticket.linear_session_id;
     const costLine = costUsd === undefined ? "" : ` Cost: $${costUsd.toFixed(4)}.`;
-    const agentAlreadyConcluded = hasTerminalSandboxActivity(deps.store, run.id);
+    const agentAlreadyConcluded = terminalActivity !== undefined;
     if (exitCode === 0 && !agentAlreadyConcluded) {
       await enqueueActivity(deps.store, outbox, {
         sessionId,
@@ -671,7 +681,7 @@ export async function completeRun(
     console.error(`[linear] ${run.task_type} completed but its notification could not be enqueued:`, error);
   }
 
-  if (run.task_type === "review-fix" && exitCode === 0 && prUrl) {
+  if (run.task_type === "review-fix" && exitCode === 0 && prUrl && !pausedOnDecisions) {
     const linear = await deps.getLinearClient();
     if (linear && ticket && await drainNextSessionWork({
       cfg: deps.cfg,
@@ -681,8 +691,10 @@ export async function completeRun(
       linearOutbox: outbox,
       ticket,
     })) {
+      deps.store.setPendingReReview(ticket.linear_issue_id, true);
       return { status: 200, body: { ok: true } };
     }
+    deps.store.setPendingReReview(ticket.linear_issue_id, false);
     const pull = parsePullRequestUrl(prUrl);
     const task = triggerReviewTask(
       deps.cfg,
@@ -697,6 +709,9 @@ export async function completeRun(
     if (deps.schedule) deps.schedule(task);
     else await task;
   } else if (exitCode === 0) {
+    if (run.task_type === "review-fix" && pausedOnDecisions) {
+      deps.store.setPendingReReview(ticket.linear_issue_id, true);
+    }
     const linear = await deps.getLinearClient();
     if (linear && ticket) {
       const task = drainNextSessionWork({
@@ -706,8 +721,28 @@ export async function completeRun(
         linear,
         linearOutbox: outbox,
         ticket,
+      }).then(async (drained) => {
+        if (drained || pausedOnDecisions || run.task_type === "review") return;
+        const current = deps.store.getByIssueId(ticket.linear_issue_id);
+        const pendingPrUrl = prUrl ?? current?.pr_url ?? undefined;
+        if (
+          !current?.pending_re_review ||
+          current.state !== "active" ||
+          !isGithubPullRequestUrl(pendingPrUrl)
+        ) return;
+        deps.store.setPendingReReview(current.linear_issue_id, false);
+        await triggerReviewTask(
+          deps.cfg,
+          deps.store,
+          deps.daytona,
+          linear,
+          outbox,
+          current,
+          parsePullRequestUrl(pendingPrUrl).number,
+          "review"
+        );
       });
-      if (deps.schedule) deps.schedule(task.then(() => undefined));
+      if (deps.schedule) deps.schedule(task);
       else await task;
     }
   }
