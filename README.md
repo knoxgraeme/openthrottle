@@ -73,10 +73,20 @@ the first durable route exists, delegations from unmatched teams fail closed
 instead of falling back to the wrong repository.
 
 The team route also fixes the base branch each run is cut from. To target a
-different base for a single ticket, add a `Base › <branch>` label (also
-`Base >`, `Base:`, or `Base/`) — the supervisor verifies the branch exists on
-the resolved repository, cuts the `ot/*` branch from it, and opens the PR
-against it. An unmatched or malformed branch fails closed with a Linear error.
+different base for a single ticket, label the issue with a `branch` label before
+delegating. Two equivalent forms are supported:
+
+- **A Linear label group named `branch`** (recommended) whose child label is the
+  branch name — e.g. a `branch` group containing `feature/x`. This keeps branch
+  labels tidy under one group. Linear's webhook only carries the child's leaf
+  name, so the supervisor resolves the parent group through a GraphQL lookup.
+- **A flat `branch › <name>` label** (also `branch >`, `branch:`, or `branch/`),
+  matched directly from the webhook with no extra call.
+
+The supervisor verifies the branch exists on the resolved repository, cuts the
+`ot/*` branch from it, and opens the PR against it. An unmatched or malformed
+branch fails closed with a Linear error. The base is read when the run is
+delegated (the `created` agent event), so apply the label before assigning.
 
 ## Repository layout
 

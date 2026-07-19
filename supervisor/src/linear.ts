@@ -147,6 +147,54 @@ export function extractLabelNames(payload: LinearAgentSessionEventPayload): stri
   return labels?.nodes?.map((label) => label.name) ?? [];
 }
 
+export interface ResolvedLabel {
+  name: string;
+  parentName?: string;
+}
+
+// The webhook payload carries only each label's leaf name, so a Linear label
+// *group* (e.g. a "branch" group containing a "feature/x" child) arrives as the
+// bare leaf with no way to know its group. This reads the issue's labels with
+// their parent group from Linear, letting grouped labels drive routing.
+export async function fetchIssueLabels(
+  client: LinearClient,
+  issueId: string
+): Promise<ResolvedLabel[]> {
+  const data = await linearGraphQL<{
+    issue?: { labels?: { nodes?: Array<{ name?: string; parent?: { name?: string } | null }> } };
+  }>(
+    client,
+    `query IssueLabels($id: String!) {
+      issue(id: $id) {
+        labels { nodes { name parent { name } } }
+      }
+    }`,
+    { id: issueId }
+  );
+  const nodes = data.issue?.labels?.nodes ?? [];
+  const resolved: ResolvedLabel[] = [];
+  for (const node of nodes) {
+    if (typeof node?.name !== "string") continue;
+    resolved.push({
+      name: node.name,
+      parentName: typeof node.parent?.name === "string" ? node.parent.name : undefined,
+    });
+  }
+  return resolved;
+}
+
+// Expand resolved labels into the flat strings the label parsers match: each
+// leaf name, plus a "<group> › <leaf>" form for grouped labels so a Linear
+// label group resolves exactly like a flat "<group> › <leaf>" label.
+export function labelMatchNames(labels: ResolvedLabel[]): string[] {
+  const names: string[] = [];
+  for (const label of labels) {
+    names.push(label.name);
+    if (label.parentName) names.push(`${label.parentName} › ${label.name}`);
+  }
+  return names;
+}
+
 export interface LinearClient {
   accessToken: string;
   fetch?: typeof fetch;

@@ -7,7 +7,9 @@ import {
   buildLinearInstallUrl,
   exchangeLinearOAuthCode,
   extractLabelNames,
+  fetchIssueLabels,
   isRecentLinearWebhook,
+  labelMatchNames,
   parseLinearWebhook,
   verifyLinearSignature,
   type AgentActivityInput,
@@ -225,12 +227,12 @@ function repoLabelKeys(label: string): string[] {
   return [...new Set([trimmed, withoutPrefix].filter(Boolean))];
 }
 
-// A `Base › <branch>` label (also `Base >`, `Base:`, `Base/`) targets a
+// A `branch › <name>` label (also `branch >`, `branch:`, `branch/`) targets a
 // per-task base branch, overriding the route's default. The branch itself may
 // contain slashes, so everything after the first separator is the branch name.
 function baseBranchFromLabels(labels: string[]): string | undefined {
   for (const label of labels) {
-    const match = label.trim().match(/^Base\s*(?:›|>|:|\/)\s*(.+)$/i);
+    const match = label.trim().match(/^branch\s*(?:›|>|:|\/)\s*(.+)$/i);
     const branch = match?.[1]?.trim();
     if (branch) return branch;
   }
@@ -1152,8 +1154,42 @@ async function handleCreated(
 
   const labels = extractLabelNames(payload);
   const existing = store.getByIssueId(issue.id);
-  const selectedAgent = pickAgent(labels, existing?.agent ?? cfg.defaultAgent);
-  const selectedRepository = repositoryFor(cfg, store, issue, labels);
+  // A `branch` label targets a per-task base branch for this ticket, overriding
+  // the route's default. It is a flat `branch › <name>` label (matched straight
+  // from the webhook, no extra call) or a Linear label group named `branch` whose
+  // child is the branch name — the webhook carries only the child's leaf name, so
+  // grouped labels are resolved with their parent group via GraphQL. A `branch`
+  // label is a base-branch directive, not a routing label, so grouped `branch`
+  // children (which arrive as bare leaves) are dropped from the label set that
+  // drives repo/agent/task routing below; otherwise a child leaf could collide
+  // with a `GITHUB_REPO_LABEL_MAPPINGS` key or an agent/investigate label and
+  // misroute the ticket. The branch itself is verified further down, once the
+  // repository is resolved.
+  let routingLabels = labels;
+  let requestedBase = baseBranchFromLabels(labels);
+  if (!requestedBase && labels.length > 0) {
+    try {
+      const resolved = await fetchIssueLabels(linear, issue.id);
+      requestedBase = baseBranchFromLabels(labelMatchNames(resolved));
+      const baseChildren = new Set(
+        resolved
+          .filter(
+            (label) =>
+              label.parentName && baseBranchFromLabels([`${label.parentName} › ${label.name}`])
+          )
+          .map((label) => label.name)
+      );
+      if (baseChildren.size > 0) {
+        routingLabels = labels.filter((name) => !baseChildren.has(name));
+      }
+    } catch (error) {
+      console.warn(
+        `[base-label] grouped-label lookup failed for ${issue.identifier}: ${String(error)}`
+      );
+    }
+  }
+  const selectedAgent = pickAgent(routingLabels, existing?.agent ?? cfg.defaultAgent);
+  const selectedRepository = repositoryFor(cfg, store, issue, routingLabels);
   if (!hasAgentSubscription(cfg, selectedAgent)) {
     await tryPostError(
       store,
@@ -1178,10 +1214,8 @@ async function handleCreated(
     );
     return;
   }
-  // A `Base › <branch>` label targets a per-task base branch for this ticket,
-  // overriding the route's default. Verify it up front so a typo surfaces as a
-  // clean Linear message instead of a clone/checkout failure inside the sandbox.
-  const requestedBase = baseBranchFromLabels(labels);
+  // Verify the resolved base branch now that the repository is known, so a typo
+  // surfaces as a clean Linear message instead of a clone failure in the sandbox.
   if (requestedBase) {
     if (!isSafeBranchName(requestedBase)) {
       await tryPostError(
@@ -1189,7 +1223,7 @@ async function handleCreated(
         linearOutbox,
         sessionId,
         issue.id,
-        `The base branch label \`${requestedBase}\` is not a valid Git branch name.`
+        `The \`branch\` label value \`${requestedBase}\` is not a valid Git branch name.`
       );
       return;
     }
@@ -1262,7 +1296,7 @@ async function handleCreated(
         linear,
         linearOutbox,
         ticket: current,
-        taskType: labels.includes("investigate")
+        taskType: routingLabels.includes("investigate")
           ? "investigate"
           : agentChanged
             ? "implement"
@@ -1276,7 +1310,7 @@ async function handleCreated(
     }
   }
 
-  const taskType: TaskType = labels.includes("investigate") ? "investigate" : "implement";
+  const taskType: TaskType = routingLabels.includes("investigate") ? "investigate" : "implement";
   const ticketCore = {
     linear_issue_id: issue.id,
     linear_issue_identifier: issue.identifier,

@@ -3,11 +3,19 @@ name: Deploy
 # Rebuilds the Daytona sandbox snapshot and/or deploys the Fly supervisor when
 # the paths that feed them change on main. Manual dispatch can force either.
 #
+# The deploy job first ensures the Fly app and its /data volume exist, so a
+# fresh account bootstraps itself instead of failing with "Could not find App".
+# The operator still sets the runtime secrets once (see supervisor/README.md);
+# until then the deploy releases but the health check fails.
+#
 # Required repository secrets:
 #   DAYTONA_API_KEY — builds/registers snapshots (same key the supervisor uses)
-#   FLY_API_TOKEN   — deploy token for the supervisor app
-# Optional repository variable:
-#   FLY_APP — Fly app name; defaults to openthrottle-supervisor
+#   FLY_API_TOKEN   — deploy token for the supervisor app (org-scoped, so it can
+#                     create the app on first run)
+# Optional repository variables:
+#   FLY_APP    — Fly app name; defaults to openthrottle-supervisor
+#   FLY_ORG    — Fly org for first-time app creation; defaults to personal
+#   FLY_REGION — region for the app's data volume; defaults to sjc
 
 on:
   push:
@@ -87,9 +95,33 @@ jobs:
     env:
       FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       FLY_APP: ${{ vars.FLY_APP || 'openthrottle-supervisor' }}
+      FLY_ORG: ${{ vars.FLY_ORG || 'personal' }}
+      FLY_REGION: ${{ vars.FLY_REGION || 'sjc' }}
     steps:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Ensure the Fly app and data volume exist
+        run: |
+          set -euo pipefail
+          # Create the app if it is missing. Tolerate only the already-exists
+          # error so real failures (bad token, unknown org) still surface.
+          if ! flyctl apps create "$FLY_APP" --org "$FLY_ORG" 2>create.log; then
+            if grep -qiE "taken|already exists|already been" create.log; then
+              echo "Fly app $FLY_APP already exists."
+            else
+              cat create.log >&2
+              exit 1
+            fi
+          fi
+          # fly.toml mounts /data from openthrottle_data; create it once so the
+          # first deploy on a fresh app does not fail on a missing volume.
+          if flyctl volumes list --app "$FLY_APP" 2>/dev/null | grep -q "openthrottle_data"; then
+            echo "openthrottle_data volume already exists."
+          else
+            echo "Creating openthrottle_data volume in $FLY_REGION."
+            flyctl volumes create openthrottle_data \
+              --app "$FLY_APP" --region "$FLY_REGION" --size 1 --yes
+          fi
       - name: Stage the new snapshot name
         if: needs.snapshot.result == 'success'
         run: flyctl secrets set --stage --app "$FLY_APP" DAYTONA_SNAPSHOT="${{ needs.snapshot.outputs.name }}"

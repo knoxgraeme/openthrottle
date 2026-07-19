@@ -51,15 +51,26 @@ Linear credentials remain in Fly and are never passed into Daytona.
   named `openthrottle-v2-ce-<short-sha>` via
   `supervisor/scripts/build-snapshot.mjs` (the pinned `@daytona/sdk`, no CLI
   install), then stage `DAYTONA_SNAPSHOT` on the Fly app.
+- The deploy job first ensures the Fly app and its `openthrottle_data` volume
+  exist (idempotent — created only when missing), so a fresh account bootstraps
+  itself instead of failing with `Could not find App`.
 - Changes under `supervisor/` (or a freshly built snapshot, whose staged
   secret applies on release) run `flyctl deploy --remote-only`.
 - `workflow_dispatch` inputs force either half manually.
 
-It needs the repository secrets `DAYTONA_API_KEY` and `FLY_API_TOKEN`, plus an
-optional `FLY_APP` repository variable when the app name is not
-`openthrottle-supervisor` (both `flyctl` steps pass `--app` explicitly, so the
-committed `fly.toml` app value never has to match). Re-registering target
-repositories is still a manual step when webhook event subscriptions change.
+It needs the repository secrets `DAYTONA_API_KEY` and `FLY_API_TOKEN` (org-scoped
+so it can create the app on first run), plus optional repository variables
+`FLY_APP` (app name, default `openthrottle-supervisor`), `FLY_ORG` (org for
+first-time creation, default `personal`), and `FLY_REGION` (volume region,
+default `sjc`). Both `flyctl` deploy steps pass `--app` explicitly, so the
+committed `fly.toml` app value never has to match.
+
+The workflow does **not** set the runtime secrets — those are operator-owned and
+still set once with `fly secrets set ...` (see [Deploy to Fly](#deploy-to-fly)).
+Until they are set, the app and volume are created and the deploy releases, but
+the `/healthz` check fails because the supervisor cannot start without its
+configuration. Re-registering target repositories is still a manual step when
+webhook event subscriptions change.
 
 `DEFAULT_AGENT=opencode` and Linear label `agent:opencode` require
 `KIMI_CODE_API_KEY`. That key must be a Kimi Code Console subscription key for
