@@ -10,6 +10,7 @@ import {
   detectRepository,
   parseGithubRemote,
   registerTargetRepository,
+  registrationSummary,
   writeProjectConfig,
 } from "./init.js";
 
@@ -108,6 +109,18 @@ describe("init project detection", () => {
       cwd: directory,
     });
     expect(detectRepository(directory)).toEqual({ repo: "acme/widget", baseBranch: "develop" });
+  });
+
+  it("summarizes the auto-detected registration for the confirmation prompt", () => {
+    expect(
+      registrationSummary({ repo: "acme/widget", baseBranch: "develop", linearTeamKey: "ENG" })
+    ).toBe("Linear team ENG → acme/widget (base branch develop)");
+    expect(registrationSummary({ repo: "acme/widget", linearTeamKey: "ENG" })).toBe(
+      "Linear team ENG → acme/widget (GitHub default branch)"
+    );
+    expect(
+      registrationSummary({ repo: "acme/widget", linearTeamKey: "ENG" }, "https://ot.test")
+    ).toBe("Linear team ENG → acme/widget (GitHub default branch) on https://ot.test");
   });
 
   it("registers a repository through the authenticated supervisor request helper", async () => {

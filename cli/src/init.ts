@@ -120,6 +120,17 @@ export function detectRepository(directory = process.cwd()): RepositoryTarget {
   return { repo: parseGithubRemote(remote), baseBranch };
 }
 
+export function registrationSummary(
+  registration: RepositoryRegistrationInput,
+  supervisorUrl?: string
+): string {
+  const branch = registration.baseBranch
+    ? `base branch ${registration.baseBranch}`
+    : "GitHub default branch";
+  const target = supervisorUrl ? ` on ${supervisorUrl}` : "";
+  return `Linear team ${registration.linearTeamKey} → ${registration.repo} (${branch})${target}`;
+}
+
 async function promptConfig(detected: Detected, target: RepositoryTarget): Promise<InitSelection> {
   const result = await p.group(
     {
@@ -240,6 +251,20 @@ export default async function init(): Promise<void> {
   p.log.info(`Target repository: ${target.repo} (${target.baseBranch ?? "GitHub default branch"})`);
   p.log.info(detected.pm ? `Detected package manager: ${detected.pm}` : "No Node package detected; enter project commands manually.");
   const selection = await promptConfig(detected, target);
+
+  p.log.warn(
+    "The target repository was auto-detected from this directory's git origin. " +
+      "If it is wrong, cancel and re-run `openthrottle init` from the correct repository checkout."
+  );
+  const proceed = await p.confirm({
+    message: `Register ${registrationSummary(selection.registration, readEnv("OT_SUPERVISOR_URL"))}?`,
+    initialValue: false,
+  });
+  if (p.isCancel(proceed) || !proceed) {
+    p.cancel("Cancelled. No repository was registered and no files were changed.");
+    return;
+  }
+
   const configPath = join(process.cwd(), ".openthrottle.yml");
   if (existsSync(configPath)) {
     const overwrite = await p.confirm({
