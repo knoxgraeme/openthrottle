@@ -81,6 +81,7 @@ describe("sandbox event contracts", () => {
       token: "callback-token-123",
       exit_code: 0,
       pr_url: "https://github.com/owner/repo/pull/1",
+      final_response: "Finished the implementation.",
     });
     const files = new Map([
       ["/home/agent/.ot/outbox/001.json", Buffer.from(activity)],
@@ -126,7 +127,8 @@ describe("sandbox event contracts", () => {
 
     expect(postActivity).toHaveBeenCalledOnce();
     expect(postActivity).toHaveBeenCalledWith(
-      expect.objectContaining({ sessionId: "session-1", type: "elicitation", body: "Please add a plan" })
+      expect.objectContaining({ sessionId: "session-1", type: "elicitation", body: "Please add a plan" }),
+      expect.objectContaining({ issueId: "issue-1", event_id: "11111111-1111-4111-8111-111111111111" })
     );
     expect(finishCompletion).toHaveBeenCalledOnce();
     expect(finishCompletion).toHaveBeenCalledWith(
@@ -134,6 +136,7 @@ describe("sandbox event contracts", () => {
         runId: "run-1",
         token: "callback-token-123",
         exitCode: 0,
+        finalResponse: "Finished the implementation.",
         logTail: "safe [REDACTED] [REDACTED]",
       })
     );
@@ -290,6 +293,52 @@ describe("sandbox event contracts", () => {
     });
 
     expect(postActivity).not.toHaveBeenCalled();
+    expect(deleteFile).toHaveBeenCalledOnce();
+  });
+
+  it("does not publish late activity from a superseded session into the new session", async () => {
+    const store = seedRunningTicket();
+    store.upsert({
+      ...store.getByIssueId("issue-1")!,
+      linear_session_id: "session-2",
+      sandbox_id: "sandbox-1",
+      state: "active",
+    });
+    const late = Buffer.from(JSON.stringify({
+      version: 1,
+      kind: "activity",
+      event_id: "77777777-7777-4777-8777-777777777777",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:00.000Z",
+      type: "response",
+      body: "late old-session response",
+    }));
+    const deleteFile = vi.fn(async () => undefined);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      setAutostopInterval: vi.fn(async () => undefined),
+      fs: {
+        listFiles: vi.fn(async () => [{
+          name: "late.json", path: "/home/agent/.ot/outbox/late.json", size: late.length, isDir: false,
+        }]),
+        downloadFile: vi.fn(async () => late),
+        deleteFile,
+      },
+    } as unknown as Sandbox;
+    const postActivity = vi.fn();
+
+    await pollSandboxEvents({
+      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      store,
+      postActivity,
+      finishCompletion: vi.fn(),
+    });
+
+    expect(postActivity).not.toHaveBeenCalled();
+    expect(store.getSandboxEvent("77777777-7777-4777-8777-777777777777")?.status)
+      .toBe("processed");
     expect(deleteFile).toHaveBeenCalledOnce();
   });
 });

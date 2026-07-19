@@ -44,6 +44,7 @@ export interface SandboxCompletionEvent {
   cost_usd?: number;
   pr_url?: string;
   failure_tail?: string;
+  final_response?: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -107,6 +108,12 @@ export function parseSandboxEvent(raw: string): SandboxEvent {
     ) {
       throw new Error("sandbox completion has an invalid failure_tail");
     }
+    if (
+      value.final_response !== undefined &&
+      (typeof value.final_response !== "string" || value.final_response.length > MAX_BODY_LENGTH)
+    ) {
+      throw new Error("sandbox completion has an invalid final_response");
+    }
     return {
       version: 1,
       kind: "completion",
@@ -119,6 +126,9 @@ export function parseSandboxEvent(raw: string): SandboxEvent {
       ...(isGithubPullRequestUrl(value.pr_url) ? { pr_url: value.pr_url } : {}),
       ...(typeof value.failure_tail === "string"
         ? { failure_tail: value.failure_tail }
+        : {}),
+      ...(typeof value.final_response === "string"
+        ? { final_response: sanitizeText(value.final_response).slice(0, MAX_BODY_LENGTH) }
         : {}),
     };
   }
@@ -155,7 +165,10 @@ async function readTaskLogTail(sandbox: Sandbox, callbackToken: string): Promise
 interface SandboxEventPollerParams {
   daytona: Daytona;
   store: TicketStore;
-  postActivity: (activity: AgentActivityInput) => Promise<unknown>;
+  postActivity: (
+    activity: AgentActivityInput,
+    event: SandboxActivityEvent & { issueId: string }
+  ) => Promise<unknown>;
   finishCompletion: (completion: {
     runId: string;
     token: string;
@@ -163,6 +176,7 @@ interface SandboxEventPollerParams {
     costUsd?: number;
     prUrl?: string;
     failureTail?: string;
+    finalResponse?: string;
     logTail?: string;
   }) => Promise<{ status: number }>;
 }
@@ -258,7 +272,20 @@ async function pollTicketEvents(
 
     try {
       if (event.kind === "activity") {
-        await params.postActivity(toLinearActivity(event, ticket.linear_session_id));
+        const run = params.store.getRun(event.run_id);
+        const sessionId = run?.linear_session_id ?? ticket.linear_session_id;
+        if (run?.linear_session_id && run.linear_session_id !== ticket.linear_session_id) {
+          const session = params.store.getSession(run.linear_session_id);
+          if (session?.state === "superseded") {
+            await sandbox.fs.deleteFile(remotePath).catch(() => undefined);
+            params.store.markSandboxEventProcessed(event.event_id);
+            continue;
+          }
+        }
+        await params.postActivity(toLinearActivity(event, sessionId), {
+          ...event,
+          issueId: run?.linear_issue_id ?? ticket.linear_issue_id,
+        });
       } else {
         const logTail = await readTaskLogTail(sandbox, event.token);
         const result = await params.finishCompletion({
@@ -268,6 +295,7 @@ async function pollTicketEvents(
           costUsd: event.cost_usd,
           prUrl: event.pr_url,
           failureTail: event.failure_tail,
+          finalResponse: event.final_response,
           logTail,
         });
         if (result.status !== 200 && result.status !== 409) {

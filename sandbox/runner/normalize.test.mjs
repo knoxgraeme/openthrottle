@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 import {
   collectEnvSecretValues,
+  processLine,
   sanitize,
   summarizeOpenCodeEvent,
   summarizeCodexItem,
   truncate,
+  writeRunResult,
 } from "./normalize.mjs";
 
 describe("normalize", () => {
@@ -60,5 +63,13 @@ describe("normalize", () => {
     expect(summarizeOpenCodeEvent({ type: "error", sessionID: "oc", error: "failed" })).toBe(
       "error: \"failed\""
     );
+  });
+
+  it("captures sanitized final responses from Claude and latest Codex agent messages", () => {
+    processLine(JSON.stringify({ type: "result", result: "Claude result ghp_abcdefghijklmnop" }));
+    processLine(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "Codex final ghp_abcdefghijklmnop" } }));
+    writeRunResult();
+    const result = JSON.parse(readFileSync(`${process.env.HOME}/.ot/run-result.json`, "utf8"));
+    expect(result.final_response).toBe("Codex final [REDACTED]");
   });
 });

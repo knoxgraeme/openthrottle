@@ -4,14 +4,13 @@ import type { Daytona } from "@daytona/sdk";
 import type { Config } from "./config.js";
 import type { Agent, Run, TaskType, Ticket, TicketStore, WebhookDelivery } from "./db.js";
 import {
-  agentActivityCreate,
-  agentSessionUpdate,
   buildLinearInstallUrl,
   exchangeLinearOAuthCode,
   extractLabelNames,
   isRecentLinearWebhook,
   parseLinearWebhook,
   verifyLinearSignature,
+  type AgentActivityInput,
   type LinearClient,
 } from "./linear.js";
 import {
@@ -51,6 +50,12 @@ import {
   createWebhookDeliveryProcessor,
   type WebhookDeliveryProcessor,
 } from "./webhook-delivery.js";
+import {
+  activityPayload,
+  createLinearOutboxProcessor,
+  sessionUpdatePayload,
+  type LinearOutboxProcessor,
+} from "./linear-outbox.js";
 
 export interface ServerDeps {
   cfg: Config;
@@ -59,6 +64,7 @@ export interface ServerDeps {
   runBackground?: (task: Promise<void>) => void;
   getLinearClient?: () => Promise<LinearClient | undefined>;
   deliveryProcessor?: WebhookDeliveryProcessor;
+  linearOutboxProcessor?: LinearOutboxProcessor;
 }
 
 interface RunCredentials {
@@ -334,20 +340,66 @@ function baseSandboxEnv(
 }
 
 async function tryPostError(
-  linear: LinearClient | undefined,
+  store: TicketStore,
+  outbox: LinearOutboxProcessor,
   sessionId: string | undefined,
+  issueId: string | undefined,
   message: string
 ): Promise<void> {
-  if (!linear || !sessionId) return;
+  if (!sessionId) return;
   try {
-    await agentActivityCreate(linear, {
-      sessionId,
-      type: "error",
-      body: sanitizeText(message),
+    const row = store.enqueueLinearOutbox({
+      linearSessionId: sessionId,
+      issueId,
+      kind: "activity",
+      payload: activityPayload({
+        sessionId,
+        type: "error",
+        body: sanitizeText(message),
+      }),
     });
+    await outbox.process(row.id);
   } catch (error) {
-    console.error("[linear] failed to post error activity:", error);
+    console.error("[linear] failed to enqueue error activity:", error);
   }
+}
+
+async function enqueueActivity(
+  store: TicketStore,
+  outbox: LinearOutboxProcessor,
+  activity: AgentActivityInput,
+  issueId?: string,
+  runId?: string
+): Promise<void> {
+  const row = store.enqueueLinearOutbox({
+    linearSessionId: activity.sessionId,
+    issueId,
+    runId,
+    kind: "activity",
+    payload: activityPayload(activity),
+  });
+  await outbox.process(row.id);
+}
+
+async function enqueueSessionUpdate(
+  store: TicketStore,
+  outbox: LinearOutboxProcessor,
+  params: {
+    sessionId: string;
+    issueId?: string;
+    addedExternalUrls?: Array<{ label: string; url: string }>;
+  }
+): Promise<void> {
+  const row = store.enqueueLinearOutbox({
+    linearSessionId: params.sessionId,
+    issueId: params.issueId,
+    kind: "session_update",
+    payload: sessionUpdatePayload({
+      sessionId: params.sessionId,
+      addedExternalUrls: params.addedExternalUrls,
+    }),
+  });
+  await outbox.process(row.id);
 }
 
 async function launchExistingTask(params: {
@@ -355,6 +407,7 @@ async function launchExistingTask(params: {
   store: TicketStore;
   daytona: Daytona;
   linear: LinearClient;
+  linearOutbox: LinearOutboxProcessor;
   ticket: Ticket;
   taskType: TaskType;
   resumeMessage?: string;
@@ -362,23 +415,25 @@ async function launchExistingTask(params: {
   reviewRound?: number;
   linearContext?: string;
 }): Promise<boolean> {
-  const { cfg, store, daytona, linear, ticket } = params;
+  const { cfg, store, daytona, ticket } = params;
   if (!ticket.sandbox_id) return false;
   if (!hasAgentSubscription(cfg, ticket.agent)) {
     await tryPostError(
-      linear,
+      store,
+      params.linearOutbox,
       ticket.linear_session_id,
+      ticket.linear_issue_id,
       `${agentDisplayName(ticket.agent)} subscription login is not configured for OpenThrottle.`
     );
     return false;
   }
   const run = beginRun(store, cfg, ticket.linear_issue_id, params.taskType);
   if (!run) {
-    await agentActivityCreate(linear, {
+    await enqueueActivity(store, params.linearOutbox, {
       sessionId: ticket.linear_session_id,
       type: "thought",
       body: "Still working on the last message — reply again when this run finishes.",
-    });
+    }, ticket.linear_issue_id);
     return false;
   }
 
@@ -408,21 +463,55 @@ async function launchExistingTask(params: {
       ticketState: "error",
     });
     scheduleSandboxSettlement({ daytona, store, ticket, taskType: params.taskType });
-    await tryPostError(linear, ticket.linear_session_id, message);
+    await tryPostError(store, params.linearOutbox, ticket.linear_session_id, ticket.linear_issue_id, message);
     return false;
   }
 
   try {
-    await agentActivityCreate(linear, {
+    await enqueueActivity(store, params.linearOutbox, {
       sessionId: ticket.linear_session_id,
       type: "action",
       action: "Started",
       parameter: `${params.taskType} run on ${ticket.branch}`,
-    });
+    }, ticket.linear_issue_id, run.id);
   } catch (error) {
     console.error(`[linear] ${params.taskType} started but its activity could not be posted:`, error);
   }
   return true;
+}
+
+async function drainNextSessionWork(params: {
+  cfg: Config;
+  store: TicketStore;
+  daytona: Daytona;
+  linear: LinearClient;
+  linearOutbox: LinearOutboxProcessor;
+  ticket: Ticket;
+}): Promise<boolean> {
+  const work = params.store.claimNextSessionWork(
+    params.ticket.linear_session_id,
+    new Date().toISOString()
+  );
+  if (!work) return false;
+  const current = params.store.getByIssueId(params.ticket.linear_issue_id) ?? params.ticket;
+  const launched = await launchExistingTask({
+    cfg: params.cfg,
+    store: params.store,
+    daytona: params.daytona,
+    linear: params.linear,
+    linearOutbox: params.linearOutbox,
+    ticket: current,
+    taskType: "resume",
+    resumeMessage: work.body,
+    linearContext: `${current.linear_context ?? `# ${current.linear_issue_identifier}`}\n\n## Latest human reply\n\n${work.body}`,
+  });
+  const runId = params.store.getByIssueId(params.ticket.linear_issue_id)?.run_id;
+  if (launched && runId) {
+    params.store.markSessionWorkConsumed(work.id, runId);
+    return true;
+  }
+  params.store.releaseSessionWork(work.id);
+  return false;
 }
 
 export function createServerWebhookDeliveryProcessor(deps: {
@@ -430,17 +519,22 @@ export function createServerWebhookDeliveryProcessor(deps: {
   store: TicketStore;
   daytona: Daytona;
   getLinearClient: () => Promise<LinearClient | undefined>;
+  linearOutbox?: LinearOutboxProcessor;
 }): WebhookDeliveryProcessor {
+  const linearOutbox =
+    deps.linearOutbox ??
+    createLinearOutboxProcessor({ store: deps.store, getLinearClient: deps.getLinearClient });
   return createWebhookDeliveryProcessor({
     store: deps.store,
     maxAttempts: 8,
     baseDelayMs: 30_000,
     onDead: async (delivery, error) => {
       if (delivery.source !== "linear" || !delivery.session_id) return;
-      const linear = await deps.getLinearClient();
       await tryPostError(
-        linear,
+        deps.store,
+        linearOutbox,
         delivery.session_id,
+        undefined,
         `OpenThrottle could not process this event after ${delivery.attempts} attempts: ${String(error)}`
       );
     },
@@ -452,6 +546,7 @@ export function createServerWebhookDeliveryProcessor(deps: {
           deps.store,
           deps.daytona,
           deps.getLinearClient,
+          linearOutbox,
           parseLinearWebhook(delivery.payload)
         );
         return;
@@ -461,6 +556,7 @@ export function createServerWebhookDeliveryProcessor(deps: {
         deps.store,
         deps.daytona,
         deps.getLinearClient,
+        linearOutbox,
         parseGithubWebhook(delivery.event_name ?? undefined, delivery.payload)
       );
     },
@@ -473,6 +569,7 @@ export async function completeRun(
     store: TicketStore;
     daytona: Daytona;
     getLinearClient: () => Promise<LinearClient | undefined>;
+    linearOutbox?: LinearOutboxProcessor;
     schedule?: (task: Promise<void>) => void;
   },
   input: {
@@ -482,6 +579,7 @@ export async function completeRun(
     costUsd?: unknown;
     prUrl?: unknown;
     failureTail?: unknown;
+    finalResponse?: unknown;
     logTail?: unknown;
   }
 ): Promise<{ status: number; body: { ok?: true; error?: string } }> {
@@ -514,7 +612,14 @@ export async function completeRun(
       : undefined;
   const prUrl =
     isGithubPullRequestUrl(input.prUrl) ? input.prUrl : undefined;
+  const finalResponse =
+    typeof input.finalResponse === "string" && input.finalResponse.trim()
+      ? sanitizeText(input.finalResponse).slice(0, 8_000)
+      : undefined;
   const ticket = deps.store.getByIssueId(run.linear_issue_id);
+  const outbox =
+    deps.linearOutbox ??
+    createLinearOutboxProcessor({ store: deps.store, getLinearClient: deps.getLinearClient });
   const completed = deps.store.finishRun({
     runId: input.runId,
     status: exitCode === 0 ? "completed" : "failed",
@@ -538,48 +643,73 @@ export async function completeRun(
     },
     deps.schedule
   );
-  const linear = await deps.getLinearClient();
-  if (linear) {
-    try {
-      const costLine = costUsd === undefined ? "" : ` Cost: $${costUsd.toFixed(4)}.`;
-      const agentAlreadyConcluded = hasTerminalSandboxActivity(deps.store, run.id);
-      if (exitCode === 0 && !agentAlreadyConcluded) {
-        await agentActivityCreate(linear, {
-          sessionId: ticket.linear_session_id,
-          type: "response",
-          body: `OpenThrottle ${run.task_type} run finished successfully.${prUrl ? ` PR: ${prUrl}` : ""}${costLine}`,
-        });
-      } else if (exitCode !== 0 && !agentAlreadyConcluded) {
-        await agentActivityCreate(linear, {
-          sessionId: ticket.linear_session_id,
-          type: "error",
-          body: `OpenThrottle ${run.task_type} run failed (exit ${exitCode}).${costLine}${failureTail ? `\n\nLast output:\n\`\`\`\n${failureTail}\n\`\`\`` : ""}`,
-        });
-      }
-      if (prUrl) {
-        await agentSessionUpdate(linear, {
-          sessionId: ticket.linear_session_id,
-          addedExternalUrls: [{ label: "Pull Request", url: prUrl }],
-        });
-      }
-    } catch (error) {
-      console.error(`[linear] ${run.task_type} completed but its notification could not be posted:`, error);
+  try {
+    const sessionId = run.linear_session_id ?? ticket.linear_session_id;
+    const costLine = costUsd === undefined ? "" : ` Cost: $${costUsd.toFixed(4)}.`;
+    const agentAlreadyConcluded = hasTerminalSandboxActivity(deps.store, run.id);
+    if (exitCode === 0 && !agentAlreadyConcluded) {
+      await enqueueActivity(deps.store, outbox, {
+        sessionId,
+        type: "response",
+        body: finalResponse ?? `OpenThrottle ${run.task_type} run finished successfully.${prUrl ? ` PR: ${prUrl}` : ""}${costLine}`,
+      }, ticket.linear_issue_id, run.id);
+    } else if (exitCode !== 0 && !agentAlreadyConcluded) {
+      await enqueueActivity(deps.store, outbox, {
+        sessionId,
+        type: "error",
+        body: `OpenThrottle ${run.task_type} run failed (exit ${exitCode}).${costLine}${failureTail ? `\n\nLast output:\n\`\`\`\n${failureTail}\n\`\`\`` : ""}`,
+      }, ticket.linear_issue_id, run.id);
     }
+    if (prUrl) {
+      await enqueueSessionUpdate(deps.store, outbox, {
+        sessionId,
+        issueId: ticket.linear_issue_id,
+        addedExternalUrls: [{ label: "Pull Request", url: prUrl }],
+      });
+    }
+  } catch (error) {
+    console.error(`[linear] ${run.task_type} completed but its notification could not be enqueued:`, error);
   }
 
   if (run.task_type === "review-fix" && exitCode === 0 && prUrl) {
+    const linear = await deps.getLinearClient();
+    if (linear && ticket && await drainNextSessionWork({
+      cfg: deps.cfg,
+      store: deps.store,
+      daytona: deps.daytona,
+      linear,
+      linearOutbox: outbox,
+      ticket,
+    })) {
+      return { status: 200, body: { ok: true } };
+    }
     const pull = parsePullRequestUrl(prUrl);
     const task = triggerReviewTask(
       deps.cfg,
       deps.store,
       deps.daytona,
       linear,
+      outbox,
       ticket,
       pull.number,
       "review"
     );
     if (deps.schedule) deps.schedule(task);
     else await task;
+  } else if (exitCode === 0) {
+    const linear = await deps.getLinearClient();
+    if (linear && ticket) {
+      const task = drainNextSessionWork({
+        cfg: deps.cfg,
+        store: deps.store,
+        daytona: deps.daytona,
+        linear,
+        linearOutbox: outbox,
+        ticket,
+      });
+      if (deps.schedule) deps.schedule(task.then(() => undefined));
+      else await task;
+    }
   }
   return { status: 200, body: { ok: true } };
 }
@@ -587,9 +717,18 @@ export async function completeRun(
 export function createServer(deps: ServerDeps): Hono {
   const { cfg, store, daytona } = deps;
   const getLinearClient = deps.getLinearClient ?? createLinearClientProvider(cfg, store);
+  const linearOutboxProcessor =
+    deps.linearOutboxProcessor ??
+    createLinearOutboxProcessor({ store, getLinearClient });
   const deliveryProcessor =
     deps.deliveryProcessor ??
-    createServerWebhookDeliveryProcessor({ cfg, store, daytona, getLinearClient });
+    createServerWebhookDeliveryProcessor({
+      cfg,
+      store,
+      daytona,
+      getLinearClient,
+      linearOutbox: linearOutboxProcessor,
+    });
   const oauthStates = createLinearOAuthStateStore(() => randomBytes(16).toString("hex"));
   const schedule =
     deps.runBackground ??
@@ -797,7 +936,7 @@ export function createServer(deps: ServerDeps): Hono {
     }
     const data = body as Record<string, unknown>;
     const result = await completeRun(
-      { cfg, store, daytona, getLinearClient, schedule },
+      { cfg, store, daytona, getLinearClient, linearOutbox: linearOutboxProcessor, schedule },
       {
         runId: context.req.param("id"),
         token: bearerToken(context.req.header("Authorization")),
@@ -805,6 +944,7 @@ export function createServer(deps: ServerDeps): Hono {
         costUsd: data.cost_usd,
         prUrl: data.pr_url,
         failureTail: data.failure_tail,
+        finalResponse: data.final_response,
       }
     );
     return context.json(result.body, result.status as 200 | 400 | 401 | 404 | 409);
@@ -818,11 +958,24 @@ export function createServer(deps: ServerDeps): Hono {
     if (!ticket) return context.json({ error: "ticket not found" }, 404);
     const linear = await getLinearClient();
     try {
-      await stopTicket({ store, daytona, linear, ticket, reason: "Stopped by operator." });
+      await stopTicket({
+        store,
+        daytona,
+        linear,
+        linearOutbox: linearOutboxProcessor,
+        ticket,
+        reason: "Stopped by operator.",
+      });
       return context.json({ ok: true });
     } catch (error) {
       const message = sanitizeText(`Failed to stop workspace: ${String(error)}`);
-      await tryPostError(linear, ticket.linear_session_id, message);
+      await tryPostError(
+        store,
+        linearOutboxProcessor,
+        ticket.linear_session_id,
+        ticket.linear_issue_id,
+        message
+      );
       return context.json({ error: message }, 502);
     }
   });
@@ -876,6 +1029,7 @@ async function handleLinearEvent(
   store: TicketStore,
   daytona: Daytona,
   getLinearClient: () => Promise<LinearClient | undefined>,
+  linearOutbox: LinearOutboxProcessor,
   payload: ReturnType<typeof parseLinearWebhook>
 ): Promise<void> {
   const linear = await getLinearClient();
@@ -883,9 +1037,9 @@ async function handleLinearEvent(
     throw new Error("No valid Linear OAuth token is stored");
   }
   if (payload.action === "created") {
-    await handleCreated(cfg, store, daytona, linear, payload);
+    await handleCreated(cfg, store, daytona, linear, linearOutbox, payload);
   } else {
-    await handlePrompted(cfg, store, daytona, linear, payload);
+    await handlePrompted(cfg, store, daytona, linear, linearOutbox, payload);
   }
 }
 
@@ -894,15 +1048,16 @@ async function handleCreated(
   store: TicketStore,
   daytona: Daytona,
   linear: LinearClient,
+  linearOutbox: LinearOutboxProcessor,
   payload: ReturnType<typeof parseLinearWebhook>
 ): Promise<void> {
   const issue = payload.agentSession.issue;
   const sessionId = payload.agentSession.id;
   if (!issue) {
-    await tryPostError(linear, sessionId, "OpenThrottle could not find an issue on this agent session.");
+    await tryPostError(store, linearOutbox, sessionId, undefined, "OpenThrottle could not find an issue on this agent session.");
     return;
   }
-  await agentActivityCreate(linear, {
+  await enqueueActivity(store, linearOutbox, {
     sessionId,
     type: "thought",
     body: "Spinning up a workspace…",
@@ -915,8 +1070,10 @@ async function handleCreated(
   const selectedRepository = repositoryFor(cfg, store, issue, labels);
   if (!hasAgentSubscription(cfg, selectedAgent)) {
     await tryPostError(
-      linear,
+      store,
+      linearOutbox,
       sessionId,
+      issue.id,
       `${agentDisplayName(selectedAgent)} subscription login is not configured for OpenThrottle.`
     );
     return;
@@ -927,8 +1084,10 @@ async function handleCreated(
   );
   if (!selectedRepository) {
     await tryPostError(
-      linear,
+      store,
+      linearOutbox,
       sessionId,
+      issue.id,
       `No repository is registered for Linear team ${issue.team?.key ?? issue.team?.id ?? "unknown"}. Run \`openthrottle init\` in the target repository first.`
     );
     return;
@@ -954,7 +1113,7 @@ async function handleCreated(
         const message = sanitizeText(
           `OpenThrottle resolved this ticket to ${selectedRepository.repo}, but could not delete the existing ${existing.repo} workspace: ${String(error)}`
         );
-        await tryPostError(linear, sessionId, message);
+        await tryPostError(store, linearOutbox, sessionId, issue.id, message);
         return;
       }
     } else {
@@ -971,6 +1130,7 @@ async function handleCreated(
         store,
         daytona,
         linear,
+        linearOutbox,
         ticket: current,
         taskType: labels.includes("investigate")
           ? "investigate"
@@ -1006,7 +1166,7 @@ async function handleCreated(
     store.setSandboxId(issue.id, recovered.id);
     const recoveredTicket = store.getByIssueId(issue.id)!;
     if (recoveredTicket.run_id) {
-      await reportCreatedWorkspace(cfg, store, linear, recoveredTicket, recovered.id);
+      await reportCreatedWorkspace(cfg, store, linearOutbox, recoveredTicket, recovered.id);
       return;
     }
     await launchExistingTask({
@@ -1014,6 +1174,7 @@ async function handleCreated(
       store,
       daytona,
       linear,
+      linearOutbox,
       ticket: recoveredTicket,
       taskType,
       resumeMessage: "Recovered the existing workspace. Re-read the ticket and continue.",
@@ -1033,11 +1194,11 @@ async function handleCreated(
   }
   const run = beginRun(store, cfg, issue.id, taskType);
   if (!run) {
-    await agentActivityCreate(linear, {
+    await enqueueActivity(store, linearOutbox, {
       sessionId,
       type: "thought",
       body: "Still working on this ticket — no second workspace was created.",
-    });
+    }, issue.id);
     return;
   }
 
@@ -1063,7 +1224,7 @@ async function handleCreated(
       await reportCreatedWorkspace(
         cfg,
         store,
-        linear,
+        linearOutbox,
         store.getByIssueId(issue.id)!,
         partiallyCreated.id
       );
@@ -1094,19 +1255,19 @@ async function handleCreated(
       failureTail: message,
       ticketState: "error",
     });
+    await tryPostError(store, linearOutbox, sessionId, issue.id, message);
     scheduleSandboxSettlement({ daytona, store, ticket: provisionedTicket, taskType });
-    await tryPostError(linear, sessionId, message);
     return;
   }
 
-  await reportCreatedWorkspace(cfg, store, linear, provisionedTicket, sandbox.id);
+  await reportCreatedWorkspace(cfg, store, linearOutbox, provisionedTicket, sandbox.id);
   try {
-    await agentActivityCreate(linear, {
+    await enqueueActivity(store, linearOutbox, {
       sessionId,
       type: "action",
       action: "Started",
       parameter: `${taskType} run on ${provisionedTicket.branch}`,
-    });
+    }, issue.id, run.id);
   } catch (error) {
     console.error(`[linear] ${taskType} started but its activity could not be posted:`, error);
   }
@@ -1115,7 +1276,7 @@ async function handleCreated(
 async function reportCreatedWorkspace(
   cfg: Config,
   store: TicketStore,
-  linear: LinearClient,
+  linearOutbox: LinearOutboxProcessor,
   ticket: Ticket,
   sandboxId: string
 ): Promise<void> {
@@ -1125,23 +1286,24 @@ async function reportCreatedWorkspace(
     ticket.linear_issue_identifier
   )}?token=${encodeURIComponent(previewToken)}`;
   try {
-    await agentActivityCreate(linear, {
+    await enqueueActivity(store, linearOutbox, {
       sessionId: ticket.linear_session_id,
       type: "action",
       action: "Created workspace",
       parameter: `${sandboxId} on ${ticket.repo}:${ticket.branch}`,
       result: `Wake-on-click preview: ${previewUrl}`,
-    });
+    }, ticket.linear_issue_id);
   } catch (error) {
-    console.error("[linear] failed to post workspace activity:", error);
+    console.error("[linear] failed to enqueue workspace activity:", error);
   }
   try {
-    await agentSessionUpdate(linear, {
+    await enqueueSessionUpdate(store, linearOutbox, {
       sessionId: ticket.linear_session_id,
+      issueId: ticket.linear_issue_id,
       addedExternalUrls: [{ label: "Workspace Preview", url: previewUrl }],
     });
   } catch (error) {
-    console.error("[linear] failed to attach workspace preview:", error);
+    console.error("[linear] failed to enqueue workspace preview:", error);
   }
 }
 
@@ -1150,29 +1312,59 @@ async function handlePrompted(
   store: TicketStore,
   daytona: Daytona,
   linear: LinearClient,
+  linearOutbox: LinearOutboxProcessor,
   payload: ReturnType<typeof parseLinearWebhook>
 ): Promise<void> {
   const sessionId = payload.agentSession.id;
   const issue = payload.agentSession.issue;
   const resumeMessage =
     payload.agentActivity?.content?.body ?? payload.agentActivity?.body ?? "";
-  await agentActivityCreate(linear, {
-    sessionId,
-    type: "thought",
-    body: "Picking this back up…",
-    ephemeral: true,
-  });
   const ticket = issue
     ? store.getByIssueId(issue.id)
     : store.listAll().find((candidate) => candidate.linear_session_id === sessionId);
   if (!ticket || !ticket.sandbox_id) {
     await tryPostError(
-      linear,
+      store,
+      linearOutbox,
       sessionId,
+      issue?.id,
       "OpenThrottle couldn't find an existing workspace. Delegate the issue again to start one."
     );
     return;
   }
+
+  const isStop =
+    payload.agentActivity?.signal?.toLowerCase() === "stop" || resumeMessage.trim() === "/stop";
+  if (isStop) {
+    await stopTicket({
+      store,
+      daytona,
+      linear,
+      linearOutbox,
+      ticket,
+      reason: "Stopped from the Linear thread.",
+    });
+    return;
+  }
+
+  const workId = payload.agentActivity?.id;
+  if (workId) {
+    const inserted = store.enqueueSessionWork({
+      id: workId,
+      linearSessionId: sessionId,
+      issueId: ticket.linear_issue_id,
+      source: "human",
+      body: sanitizeText(resumeMessage),
+    });
+    if (!inserted) return;
+  }
+
+  await enqueueActivity(store, linearOutbox, {
+    sessionId,
+    type: "thought",
+    body: "Picking this back up…",
+    ephemeral: true,
+  }, ticket.linear_issue_id);
 
   const nextContext = linearContext(
     payload,
@@ -1181,18 +1373,8 @@ async function handlePrompted(
   store.setLinearContext(ticket.linear_issue_id, nextContext);
   const currentTicket = store.getByIssueId(ticket.linear_issue_id) ?? ticket;
 
-  if (resumeMessage.trim() === "/stop") {
-    await stopTicket({
-      store,
-      daytona,
-      linear,
-      ticket: currentTicket,
-      reason: "Stopped from the Linear thread.",
-    });
-    return;
-  }
   if (/^(?:\/merge|merge it)$/i.test(resumeMessage.trim())) {
-    await mergeFromLinear(cfg, linear, currentTicket);
+    await mergeFromLinear(cfg, store, linearOutbox, currentTicket);
     return;
   }
 
@@ -1201,52 +1383,58 @@ async function handlePrompted(
     labels.includes("investigate") && /\b(fix it|implement|go ahead)\b/i.test(resumeMessage)
       ? "implement"
       : "resume";
-  await launchExistingTask({
+  const launched = await launchExistingTask({
     cfg,
     store,
     daytona,
     linear,
+    linearOutbox,
     ticket: currentTicket,
     taskType,
     resumeMessage: taskType === "resume" ? resumeMessage : undefined,
     linearContext: nextContext,
   });
+  const runId = store.getByIssueId(ticket.linear_issue_id)?.run_id;
+  if (launched && workId && runId) {
+    store.markSessionWorkConsumed(workId, runId);
+  }
 }
 
 async function mergeFromLinear(
   cfg: Config,
-  linear: LinearClient,
+  store: TicketStore,
+  linearOutbox: LinearOutboxProcessor,
   ticket: Ticket
 ): Promise<void> {
   if (!cfg.allowLinearMerge) {
-    await agentActivityCreate(linear, {
+    await enqueueActivity(store, linearOutbox, {
       sessionId: ticket.linear_session_id,
       type: "error",
       body: "Linear merge is disabled. Merge from GitHub, or set ALLOW_LINEAR_MERGE=true.",
-    });
+    }, ticket.linear_issue_id);
     return;
   }
   if (!ticket.pr_url) {
-    await tryPostError(linear, ticket.linear_session_id, "This ticket has no pull request to merge.");
+    await tryPostError(store, linearOutbox, ticket.linear_session_id, ticket.linear_issue_id, "This ticket has no pull request to merge.");
     return;
   }
   const pull = parsePullRequestUrl(ticket.pr_url);
   const github: GithubClient = { token: cfg.githubToken };
   const readiness = await getMergeReadiness(github, pull.repo, pull.number);
   if (readiness.draft || !readiness.mergeable || !readiness.checksPresent || !readiness.checksGreen) {
-    await agentActivityCreate(linear, {
+    await enqueueActivity(store, linearOutbox, {
       sessionId: ticket.linear_session_id,
       type: "error",
       body: "The PR is not merge-ready: it must be non-draft, mergeable, and have terminal green checks.",
-    });
+    }, ticket.linear_issue_id);
     return;
   }
   const result = await mergePullRequest(github, pull.repo, pull.number, readiness.headSha);
-  await agentActivityCreate(linear, {
+  await enqueueActivity(store, linearOutbox, {
     sessionId: ticket.linear_session_id,
     type: result.merged ? "response" : "error",
     body: result.merged ? `Merged ${ticket.pr_url}.` : `GitHub did not merge the PR: ${result.message}`,
-  });
+  }, ticket.linear_issue_id);
 }
 
 async function handleGithubEvent(
@@ -1254,6 +1442,7 @@ async function handleGithubEvent(
   store: TicketStore,
   daytona: Daytona,
   getLinearClient: () => Promise<LinearClient | undefined>,
+  linearOutbox: LinearOutboxProcessor,
   event: GithubWebhookEvent
 ): Promise<void> {
   const linear = await getLinearClient();
@@ -1267,6 +1456,7 @@ async function handleGithubEvent(
           store,
           daytona,
           linear,
+          linearOutbox,
           ticket,
           prUrl: event.pull_request.html_url,
           merged: event.pull_request.merged,
@@ -1280,6 +1470,7 @@ async function handleGithubEvent(
           store,
           daytona,
           linear,
+          linearOutbox,
           ticket,
           event.pull_request.number,
           "review"
@@ -1291,19 +1482,20 @@ async function handleGithubEvent(
   if (event.kind === "pull_request_review") {
       const ticket = store.getByBranch(event.repository.full_name, event.pull_request.head.ref);
       if (!ticket || !linear || event.action !== "submitted") return;
-      await agentActivityCreate(linear, {
+      await enqueueActivity(store, linearOutbox, {
         sessionId: ticket.linear_session_id,
         type: "action",
         action: "PR review submitted",
         parameter: `${event.review.user?.login ?? "reviewer"}: ${event.review.state}`,
         result: event.review.html_url,
-      });
+      }, ticket.linear_issue_id);
       if (event.review.state.toLowerCase() === "changes_requested") {
         await triggerReviewTask(
           cfg,
           store,
           daytona,
           linear,
+          linearOutbox,
           ticket,
           event.pull_request.number,
           "review-fix"
@@ -1320,13 +1512,13 @@ async function handleGithubEvent(
   const conclusion =
     event.kind === "workflow_run" ? event.workflow_run.conclusion : event.check_suite.conclusion;
   const url = event.kind === "workflow_run" ? event.workflow_run.html_url : event.check_suite.url;
-  await agentActivityCreate(linear, {
+  await enqueueActivity(store, linearOutbox, {
     sessionId: ticket.linear_session_id,
     type: "action",
     action: "CI completed",
     parameter: conclusion ?? "unknown",
     result: url,
-  });
+  }, ticket.linear_issue_id);
 }
 
 async function triggerReviewTask(
@@ -1334,6 +1526,7 @@ async function triggerReviewTask(
   store: TicketStore,
   daytona: Daytona,
   linear: LinearClient | undefined,
+  linearOutbox: LinearOutboxProcessor,
   ticket: Ticket,
   pullNumber: number,
   taskType: "review" | "review-fix"
@@ -1346,11 +1539,11 @@ async function triggerReviewTask(
   );
   if (round >= cfg.reviewMaxRounds) {
     const message = `Review rounds exhausted (${round}/${cfg.reviewMaxRounds}) — needs a human decision.`;
-    await agentActivityCreate(linear, {
+    await enqueueActivity(store, linearOutbox, {
       sessionId: ticket.linear_session_id,
       type: "error",
       body: message,
-    });
+    }, ticket.linear_issue_id);
     await commentOnPullRequest({ token: cfg.githubToken }, ticket.repo, pullNumber, message);
     return;
   }
@@ -1359,6 +1552,7 @@ async function triggerReviewTask(
     store,
     daytona,
     linear,
+    linearOutbox,
     ticket: store.getByIssueId(ticket.linear_issue_id) ?? ticket,
     taskType,
     pullNumber,
@@ -1369,7 +1563,7 @@ async function triggerReviewTask(
 export async function expireRun(
   daytona: Daytona,
   store: TicketStore,
-  linear: LinearClient | undefined,
+  linearOutbox: LinearOutboxProcessor,
   run: Run
 ): Promise<void> {
   const ticket = store.getByIssueId(run.linear_issue_id);
@@ -1382,6 +1576,12 @@ export async function expireRun(
   });
   if (ticket) {
     scheduleSandboxSettlement({ daytona, store, ticket, taskType: run.task_type });
+    await tryPostError(
+      store,
+      linearOutbox,
+      run.linear_session_id ?? ticket.linear_session_id,
+      ticket.linear_issue_id,
+      message
+    );
   }
-  if (ticket) await tryPostError(linear, ticket.linear_session_id, message);
 }

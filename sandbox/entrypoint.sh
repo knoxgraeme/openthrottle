@@ -76,8 +76,9 @@ write_run_completion() {
   [[ -n "${RUN_ID:-}" && -n "${RUN_CALLBACK_TOKEN:-}" ]] || return 1
 
   local result_file="${OT_DIR}/run-result.json"
-  local cost_usd=""
+  local cost_usd="" final_response=""
   [[ -f "$result_file" ]] && cost_usd="$(jq -r '.cost_usd // empty' "$result_file" 2>/dev/null || true)"
+  [[ -f "$result_file" ]] && final_response="$(jq -r '.final_response // empty' "$result_file" 2>/dev/null || true)"
 
   local tail_raw="" failure_tail="" pr_url="${PR_URL:-}" payload
   if [[ "$exit_code" -ne 0 ]]; then
@@ -91,6 +92,7 @@ write_run_completion() {
     --arg token "$RUN_CALLBACK_TOKEN" \
     --argjson exitCode "$exit_code" \
     --arg cost "$cost_usd" \
+    --arg finalResponse "$final_response" \
     --arg prUrl "$pr_url" \
     --arg failureTail "$failure_tail" \
     '{
@@ -103,6 +105,7 @@ write_run_completion() {
        exit_code: $exitCode
      }
      + (if $cost == "" then {} else {cost_usd: ($cost | tonumber)} end)
+     + (if $finalResponse == "" then {} else {final_response: $finalResponse} end)
      + (if $prUrl == "" then {} else {pr_url: $prUrl} end)
      + (if $failureTail == "" then {} else {failure_tail: $failureTail} end)')" || return 1
 

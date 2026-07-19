@@ -92,6 +92,7 @@ describe("Linear contracts", () => {
     const client = { accessToken: "oauth", fetch: fetchMock };
 
     await agentActivityCreate(client, {
+      id: "11111111-1111-4111-8111-111111111111",
       sessionId: "session-1",
       type: "action",
       action: "Created workspace",
@@ -106,6 +107,7 @@ describe("Linear contracts", () => {
     expect(requests[0]).toMatchObject({
       variables: {
         input: {
+          id: "11111111-1111-4111-8111-111111111111",
           agentSessionId: "session-1",
           content: {
             type: "action",

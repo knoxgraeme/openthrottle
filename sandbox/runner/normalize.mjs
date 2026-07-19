@@ -119,6 +119,7 @@ function writeSessionId(id) {
 // ---------------------------------------------------------------------------
 
 const TRUNCATE_LEN = 2000;
+const FINAL_RESPONSE_LEN = 8000;
 
 export function truncate(str, len = TRUNCATE_LEN) {
   const s = String(str);
@@ -128,6 +129,13 @@ export function truncate(str, len = TRUNCATE_LEN) {
 
 function emit(line) {
   process.stdout.write(sanitize(line) + "\n");
+}
+
+function captureFinalResponse(text) {
+  const body = sanitize(String(text ?? "")).trim();
+  if (!body) return;
+  runResult.final_response =
+    body.length <= FINAL_RESPONSE_LEN ? body : body.slice(0, FINAL_RESPONSE_LEN);
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +204,10 @@ function handleClaudeLine(obj) {
       emit(
         `[claude] result: ${obj.subtype ?? "?"} is_error=${obj.is_error ?? false} turns=${obj.num_turns ?? "?"} cost_usd=${obj.total_cost_usd ?? "?"}`,
       );
-      if (obj.result) emit(`[claude] ${truncate(String(obj.result))}`);
+      if (obj.result) {
+        captureFinalResponse(obj.result);
+        emit(`[claude] ${truncate(String(obj.result))}`);
+      }
       return true;
     }
     default:
@@ -258,6 +269,7 @@ function handleCodexLine(obj) {
 export function summarizeCodexItem(item) {
   switch (item.type) {
     case "agent_message":
+      if (item.text) captureFinalResponse(item.text);
       return `agent_message: ${truncate(String(item.text ?? ""), 500)}`;
     case "reasoning":
       return `reasoning: ${truncate(String(item.text ?? ""), 300)}`;

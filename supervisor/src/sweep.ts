@@ -3,6 +3,7 @@ import type { Config } from "./config.js";
 import type { TicketStore } from "./db.js";
 import { deleteSandbox, listLabeledSandboxes } from "./daytona.js";
 import { commentCreate, type LinearClient } from "./linear.js";
+import { createLinearOutboxProcessor } from "./linear-outbox.js";
 import { expireRun } from "./server.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -20,8 +21,12 @@ export async function runSweep(
   linear: LinearClient | undefined,
   cfg: Config
 ): Promise<void> {
+  const linearOutbox = createLinearOutboxProcessor({
+    store,
+    getLinearClient: async () => linear,
+  });
   for (const run of store.listExpiredRuns(new Date().toISOString())) {
-    await expireRun(daytona, store, linear, run);
+    await expireRun(daytona, store, linearOutbox, run);
   }
   await expireStaleTickets(daytona, store, linear, cfg);
   await deleteOrphanSandboxes(daytona, store, cfg);
