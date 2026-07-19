@@ -1403,6 +1403,116 @@ describe("createServer lifecycle", () => {
     });
   });
 
+  it("keeps a grouped Base child out of repo-label routing", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.registerRepository({
+      linearTeamKey: "OT",
+      linearTeamId: "team-1",
+      githubRepo: "owner/team-default",
+      baseBranch: "develop",
+      webhookId: 42,
+      snapshot: "openthrottle",
+    });
+    // A repo-label mapping whose key collides with the Base-group child leaf.
+    const routedCfg: Config = {
+      ...cfg,
+      githubRepoLabelMappings: { "web-app": "owner/web-app" },
+    };
+    let createParams: { envVars?: Record<string, string> } | undefined;
+    const sandbox = {
+      id: "sandbox-collision",
+      state: "started",
+      autoStopInterval: 60,
+      setAutostopInterval: vi.fn(async () => undefined),
+      updateEnv: vi.fn(async () => undefined),
+      fs: {
+        uploadFile: vi.fn(async () => undefined),
+        setFilePermissions: vi.fn(async () => undefined),
+      },
+      process: {
+        createSession: vi.fn(async () => undefined),
+        executeSessionCommand: vi.fn(async () => undefined),
+      },
+    };
+    const create = vi.fn(async (params: { envVars?: Record<string, string> }) => {
+      createParams = params;
+      return sandbox;
+    });
+    const linearFetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const query = String((JSON.parse(String(init?.body)) as { query?: string }).query);
+      if (query.includes("IssueLabels")) {
+        return Response.json({
+          data: {
+            issue: { labels: { nodes: [{ name: "web-app", parent: { name: "Base" } }] } },
+          },
+        });
+      }
+      return Response.json({
+        data: {
+          agentActivityCreate: { success: true, agentActivity: { id: "activity" } },
+          agentSessionUpdate: { success: true },
+        },
+      });
+    }) as unknown as typeof fetch;
+    const githubFetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/repos/owner/team-default/branches/web-app")) {
+        return Response.json({ name: "web-app" });
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    });
+    vi.stubGlobal("fetch", githubFetch);
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg: routedCfg,
+      store,
+      daytona: {
+        get: vi.fn(async () => sandbox),
+        list: vi.fn(() => (async function* () {})()),
+        create,
+      } as unknown as Daytona,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
+      runBackground: (task) => background.push(task),
+    });
+    const created = JSON.stringify({
+      action: "created",
+      type: "AgentSessionEvent",
+      webhookId: "linear-collision",
+      webhookTimestamp: Date.now(),
+      organizationId: "org",
+      agentSession: {
+        id: "session-collision",
+        issue: {
+          id: "issue-collision",
+          identifier: "OT-COLLIDE",
+          team: { id: "team-1", key: "OT" },
+          labels: [{ name: "web-app" }],
+        },
+      },
+    });
+    await app.request("/webhooks/linear", {
+      method: "POST",
+      headers: signedLinear(created, "linear-collision"),
+      body: created,
+    });
+    await Promise.all(background.splice(0));
+
+    // The `web-app` leaf is a Base-group child, so it must not route to the
+    // mapped `owner/web-app`; the team repo wins with only the base overridden,
+    // and the branch is verified on that team repo (not the mapped one).
+    expect(githubFetch).toHaveBeenCalledOnce();
+    expect(createParams?.envVars).toMatchObject({
+      GITHUB_REPO: "owner/team-default",
+      BASE_BRANCH: "web-app",
+    });
+    expect(store.getByIssueId("issue-collision")).toMatchObject({
+      repo: "owner/team-default",
+      base_branch: "web-app",
+      state: "active",
+    });
+  });
+
   it("starts a fresh workspace when re-delegation changes the routed repo", async () => {
     db = openDb(":memory:");
     const store = createTicketStore(db);

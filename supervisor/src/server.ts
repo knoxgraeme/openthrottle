@@ -1154,8 +1154,42 @@ async function handleCreated(
 
   const labels = extractLabelNames(payload);
   const existing = store.getByIssueId(issue.id);
-  const selectedAgent = pickAgent(labels, existing?.agent ?? cfg.defaultAgent);
-  const selectedRepository = repositoryFor(cfg, store, issue, labels);
+  // A `Base` label targets a per-task base branch for this ticket, overriding
+  // the route's default. It is a flat `Base › <branch>` label (matched straight
+  // from the webhook, no extra call) or a Linear label group named `Base` whose
+  // child is the branch — the webhook carries only the child's leaf name, so
+  // grouped labels are resolved with their parent group via GraphQL. A `Base`
+  // label is a base-branch directive, not a routing label, so grouped `Base`
+  // children (which arrive as bare leaves) are dropped from the label set that
+  // drives repo/agent/task routing below; otherwise a child leaf could collide
+  // with a `GITHUB_REPO_LABEL_MAPPINGS` key or an agent/investigate label and
+  // misroute the ticket. The branch itself is verified further down, once the
+  // repository is resolved.
+  let routingLabels = labels;
+  let requestedBase = baseBranchFromLabels(labels);
+  if (!requestedBase && labels.length > 0) {
+    try {
+      const resolved = await fetchIssueLabels(linear, issue.id);
+      requestedBase = baseBranchFromLabels(labelMatchNames(resolved));
+      const baseChildren = new Set(
+        resolved
+          .filter(
+            (label) =>
+              label.parentName && baseBranchFromLabels([`${label.parentName} › ${label.name}`])
+          )
+          .map((label) => label.name)
+      );
+      if (baseChildren.size > 0) {
+        routingLabels = labels.filter((name) => !baseChildren.has(name));
+      }
+    } catch (error) {
+      console.warn(
+        `[base-label] grouped-label lookup failed for ${issue.identifier}: ${String(error)}`
+      );
+    }
+  }
+  const selectedAgent = pickAgent(routingLabels, existing?.agent ?? cfg.defaultAgent);
+  const selectedRepository = repositoryFor(cfg, store, issue, routingLabels);
   if (!hasAgentSubscription(cfg, selectedAgent)) {
     await tryPostError(
       store,
@@ -1180,25 +1214,8 @@ async function handleCreated(
     );
     return;
   }
-  // A `Base` label targets a per-task base branch for this ticket, overriding
-  // the route's default. It can be a flat `Base › <branch>` label (matched from
-  // the webhook payload, no extra call) or a Linear label group named `Base`
-  // with the branch as its child — the webhook only carries the child's leaf
-  // name, so grouped labels are resolved with their parent group via GraphQL.
-  // Verify the branch up front so a typo surfaces as a clean Linear message
-  // instead of a clone/checkout failure inside the sandbox.
-  let requestedBase = baseBranchFromLabels(labels);
-  if (!requestedBase && labels.length > 0) {
-    try {
-      requestedBase = baseBranchFromLabels(
-        labelMatchNames(await fetchIssueLabels(linear, issue.id))
-      );
-    } catch (error) {
-      console.warn(
-        `[base-label] grouped-label lookup failed for ${issue.identifier}: ${String(error)}`
-      );
-    }
-  }
+  // Verify the resolved base branch now that the repository is known, so a typo
+  // surfaces as a clean Linear message instead of a clone failure in the sandbox.
   if (requestedBase) {
     if (!isSafeBranchName(requestedBase)) {
       await tryPostError(
@@ -1279,7 +1296,7 @@ async function handleCreated(
         linear,
         linearOutbox,
         ticket: current,
-        taskType: labels.includes("investigate")
+        taskType: routingLabels.includes("investigate")
           ? "investigate"
           : agentChanged
             ? "implement"
@@ -1293,7 +1310,7 @@ async function handleCreated(
     }
   }
 
-  const taskType: TaskType = labels.includes("investigate") ? "investigate" : "implement";
+  const taskType: TaskType = routingLabels.includes("investigate") ? "investigate" : "implement";
   const ticketCore = {
     linear_issue_id: issue.id,
     linear_issue_identifier: issue.identifier,
