@@ -37,9 +37,13 @@ fly secrets set SUPERVISOR_URL=https://<app>.fly.dev \
 fly deploy
 ```
 
-Add `CLAUDE_CODE_OAUTH_TOKEN` and/or `CODEX_AUTH_JSON` from subscription
-logins. `DEFAULT_AGENT=codex` applies when the ticket has no agent label.
+Add `CLAUDE_CODE_OAUTH_TOKEN`, `CODEX_AUTH_JSON`, and/or `KIMI_CODE_API_KEY`
+from subscription logins. `DEFAULT_AGENT=codex` applies when the ticket has no agent label.
 Linear credentials remain in Fly and are never passed into Daytona.
+
+`DEFAULT_AGENT=opencode` and Linear label `agent:opencode` require
+`KIMI_CODE_API_KEY`. That key must be a Kimi Code Console subscription key for
+the OpenAI-compatible coding endpoint, not a Kimi Open Platform key.
 
 ## Linear app
 

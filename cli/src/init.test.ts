@@ -64,6 +64,28 @@ describe("init project detection", () => {
     expect(contents).not.toContain("build:");
   });
 
+  it("writes the supported OpenCode model only for OpenCode projects", () => {
+    const directory = temporaryProject();
+    writeProjectConfig(
+      {
+        agent: "opencode",
+        test: "",
+        build: "",
+        lint: "",
+        dev: "",
+        post_bootstrap: [],
+        limits: { max_turns: 20, task_timeout: 60 },
+        mcp_servers: {},
+        model: "kimi-code/kimi-for-coding",
+      },
+      directory
+    );
+    expect(parse(readFileSync(join(directory, ".openthrottle.yml"), "utf8"))).toMatchObject({
+      agent: "opencode",
+      model: "kimi-code/kimi-for-coding",
+    });
+  });
+
   it("supports non-Node repositories with blank detected commands", () => {
     expect(detectProject(temporaryProject())).toEqual({
       pm: null,

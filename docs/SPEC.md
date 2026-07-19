@@ -8,7 +8,7 @@ This is the cross-component source of truth. The GitHub repository remains
 
 An approved plan in Linear is delegated to the OpenThrottle app. The
 always-on supervisor acknowledges it, creates one private Daytona sandbox for
-the ticket, and starts Claude Code or Codex. The agent pushes an `ot/*` branch,
+the ticket, and starts Claude Code, Codex, or OpenCode. The agent pushes an `ot/*` branch,
 opens a GitHub PR, and can resume in the same sandbox/session when a human
 replies in Linear. Closing the PR deletes the sandbox.
 
@@ -26,7 +26,7 @@ Linear AgentSessionEvent ──HMAC──> Fly supervisor ──@daytona/sdk─�
 
 - `supervisor/`: Node 22, Hono, SQLite, OAuth/webhook/lifecycle control.
 - `sandbox/`: Node 22 image, safety boundary, agent entrypoint and normalizer.
-- `skills/`: Claude skills and Codex prompt mirrors.
+- `skills/`: Claude skills plus Codex/OpenCode prompt mirrors.
 - `cli/`: npm package `openthrottle` (`setup`, `init`, `ship`, `status`, `stop`, `logs`).
 
 ## Event flows
@@ -280,7 +280,7 @@ ticket so later runs remain stable if the route changes.
 Node 22 CI runs TypeScript checks, Vitest contract/handler suites, Bats shell
 tests, and a real Docker smoke. The smoke first checks the pinned real Claude
 and Codex CLI versions/flags, then uses deterministic JSONL stubs to exercise
-implement and same-session resume for both engines, clone/branch safety,
+implement and same-session resume for all engines, clone/branch safety,
 config, session/cost capture, activity/completion markers, and secret-leak checks.
 Live Linear/Daytona/Fly acceptance remains a deployment gate because it
 requires operator-owned accounts and secrets.

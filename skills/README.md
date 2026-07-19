@@ -10,11 +10,12 @@ skills/
   claude/<name>/SKILL.md   # user-level Claude adapter
   codex/<name>.md          # prompt piped to codex exec
   codex/AGENTS-fragment.md # standing Codex runtime instructions
+  opencode/<name>.md       # prompt passed to opencode run
 ```
 
 The four adapters are `implement-plan`, `review`, `review-fix`, and
 `investigate`. Resume does not start an adapter; it resumes the saved native
-Claude session or Codex thread.
+Claude session, Codex thread, or OpenCode session.
 
 ## Native CE composition
 
@@ -26,7 +27,7 @@ Claude session or Codex thread.
 | `investigate` | `ce-debug mode:pipeline`; if fixed, create/find the PR and run `ce-babysit-pr mode:pipeline` |
 
 The snapshot installs the official `compound-engineering` plugin natively for
-both Claude Code and Codex from one commit-pinned marketplace checkout. Do not
+Claude Code, Codex, and OpenCode from one commit-pinned marketplace checkout. Do not
 copy CE source into this directory or into target repositories: native install
 preserves its skill-local reviewer/research assets and makes every target repo
 use the same version.
@@ -48,12 +49,12 @@ The adapters remain necessary for contracts that CE does not own:
 may diagnose, test, fix, commit, and push a convergent bug. Product/design
 decisions and other divergent fixes remain needs-human residuals.
 
-## Keeping Claude and Codex aligned
+## Keeping Agent Adapters Aligned
 
-Both forms must preserve the same task ordering and product boundaries. The
+All forms must preserve the same task ordering and product boundaries. The
 only intentional differences are native invocation syntax (`/ce-*` for Claude,
-`$ce-*` for Codex), Claude YAML frontmatter, and Codex's appended runtime
-context. When changing a task, update and review both forms together.
+`$ce-*` for Codex/OpenCode prompts), Claude YAML frontmatter, and appended
+runtime context. When changing a task, update and review all forms together.
 
 Codex receives `AGENTS-fragment.md` globally at `~/.codex/AGENTS.md`, outside
 the checkout. It provides standing environment, safety, sanitization, and

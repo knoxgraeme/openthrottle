@@ -9,7 +9,7 @@ daytona snapshot create openthrottle --dockerfile sandbox/Dockerfile --context .
 ```
 
 It contains Node 22, git/curl/jq/yq/ripgrep/GitHub CLI, Claude Code, Codex,
-a pinned native Compound Engineering installation for both agent CLIs, and an
+OpenCode, a pinned native Compound Engineering installation for all agent CLIs, and an
 unprivileged `agent` user. Its automatic image entrypoint is an inert no-op so
 Daytona provisioning cannot race the supervisor. Fly uploads the run context
 and explicitly launches the root task script, which owns checkout and safety
@@ -21,7 +21,9 @@ The eight phases are auth, checkout/push, sealed safety config, project config,
 post-bootstrap, dev server, agent task, and completion marker. Supported
 tasks are `implement`, `resume`, `review`, `review-fix`, and `investigate`.
 Fresh tasks use their corresponding skill; resume continues the saved Claude
-session or Codex thread.
+session, Codex thread, or OpenCode session. OpenCode also saves the initial
+model in `~/.ot/agent-model` so a resumed session cannot switch models after a
+project config change.
 
 The corresponding OpenThrottle skill is a thin product adapter over native CE:
 
@@ -55,6 +57,13 @@ Claude settings remain untouched and editable. Git uses the `gh` credential
 helper against a clean origin URL, so the token never enters `.git/config` and
 the sealed config remains safe across resume runs.
 
+OpenCode receives a root-owned runtime config outside the repository through
+`OPENCODE_CONFIG_DIR`. Repository `opencode.json[c]`, `.opencode` content,
+Claude compatibility loading, and external skills are disabled; only validated
+`.openthrottle.yml` MCP declarations and the allowlisted
+`kimi-code/kimi-for-coding` profile enter the config. The Kimi key remains an
+environment value referenced by name and is not written to JSON.
+
 ## Safety and sanitization
 
 The pre-push hook blocks main/master and non-fast-forward pushes, with
@@ -74,10 +83,10 @@ docker build -f sandbox/Dockerfile -t openthrottle:test .
 sandbox/tests/smoke.sh openthrottle:test
 ```
 
-The smoke checks the pinned real Claude and Codex CLI versions, required flags,
-and native Compound Engineering installation and skill discovery. It then uses
+The smoke checks the pinned real Claude, Codex, and OpenCode CLI versions,
+required flags, and native Compound Engineering installation and skill discovery. It then uses
 a local bare repository and deterministic agent JSONL stubs. It verifies
-implement and same-session resume for both engines, checkout/branch creation,
+implement and same-session resume for all engines, checkout/branch creation,
 safety/config phases, session/cost capture, completion markers, and absence of
 secrets in human-visible artifacts.
 

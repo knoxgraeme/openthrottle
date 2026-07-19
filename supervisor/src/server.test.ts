@@ -25,6 +25,7 @@ const cfg: Config = {
   defaultAgent: "codex",
   claudeCodeOauthToken: "claude-token",
   codexAuthJson: "{}",
+  kimiCodeApiKey: "kimi-token",
   baseBranch: "main",
   maxTurns: 200,
   taskTimeout: 7200,
@@ -707,7 +708,11 @@ describe("createServer lifecycle", () => {
     const app = createServer({
       cfg,
       store,
-      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      daytona: {
+        get: vi.fn(async () => sandbox),
+        list: vi.fn(() => (async function* () {})()),
+        create: vi.fn(async () => sandbox),
+      } as unknown as Daytona,
       getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
       runBackground: (task) => background.push(task),
     });
@@ -742,6 +747,35 @@ describe("createServer lifecycle", () => {
       CODEX_AUTH_JSON: "{}",
     });
     expect(envUpdates.at(-1)).not.toHaveProperty("RESUME_MESSAGE");
+
+    const opencode = JSON.stringify({
+      ...JSON.parse(created),
+      webhookId: "linear-switch-opencode",
+      agentSession: {
+        id: "session-switch-opencode",
+        issue: {
+          id: "issue-switch-opencode",
+          identifier: "OT-SWITCH-OPENCODE",
+          team: { id: "team-1", key: "OT" },
+          labels: [{ name: "agent:opencode" }],
+        },
+      },
+    });
+    await app.request("/webhooks/linear", {
+      method: "POST",
+      headers: signedLinear(opencode, "linear-switch-opencode"),
+      body: opencode,
+    });
+    await Promise.all(background.splice(0));
+
+    expect(store.getByIssueId("issue-switch-opencode")?.agent).toBe("opencode");
+    expect(envUpdates.at(-1)).toMatchObject({
+      AGENT: "opencode",
+      TASK_TYPE: "implement",
+      KIMI_CODE_API_KEY: "kimi-token",
+    });
+    expect(envUpdates.at(-1)).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
+    expect(envUpdates.at(-1)).not.toHaveProperty("CODEX_AUTH_JSON");
   });
 
   it("keeps the run active and returns 502 when Daytona cannot stop it", async () => {
