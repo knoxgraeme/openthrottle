@@ -62,7 +62,8 @@ npx openthrottle status
 
 - `supervisor/` — Hono/SQLite control plane deployed on Fly.
 - `sandbox/` — Daytona image, safety boundary, entrypoint, tests.
-- `skills/` — implement, review, review-fix, and investigate instructions.
+- `skills/` — OpenThrottle task adapters layered over the native Compound
+  Engineering toolkit installed for both Claude Code and Codex.
 - `cli/` — the `openthrottle` command-line package.
 - `docs/` — architecture and execution plan.
 
