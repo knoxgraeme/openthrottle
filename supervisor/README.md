@@ -37,9 +37,13 @@ fly secrets set SUPERVISOR_URL=https://<app>.fly.dev \
 fly deploy
 ```
 
-Add `CLAUDE_CODE_OAUTH_TOKEN` and/or `CODEX_AUTH_JSON` from subscription
-logins. `DEFAULT_AGENT=codex` applies when the ticket has no agent label.
+Add `CLAUDE_CODE_OAUTH_TOKEN`, `CODEX_AUTH_JSON`, and/or `KIMI_CODE_API_KEY`
+from subscription logins. `DEFAULT_AGENT=codex` applies when the ticket has no agent label.
 Linear credentials remain in Fly and are never passed into Daytona.
+
+`DEFAULT_AGENT=opencode` and Linear label `agent:opencode` require
+`KIMI_CODE_API_KEY`. That key must be a Kimi Code Console subscription key for
+the OpenAI-compatible coding endpoint, not a Kimi Open Platform key.
 
 ## Linear app
 
@@ -59,17 +63,26 @@ curl -i -H "Authorization: Bearer $OT_INSTALL_SECRET" \
 Open the returned `Location` in a browser. Access tokens and refresh tokens
 are stored in SQLite; access tokens are refreshed before expiry.
 
-## GitHub webhook
+## Target repository onboarding
 
-Point a JSON webhook at `https://<app>.fly.dev/webhooks/github`, using
-`GITHUB_WEBHOOK_SECRET`. Subscribe to pull requests, pull request reviews,
-workflow runs, and check suites. The PAT needs repository contents and pull
-requests read/write plus checks/actions read for status mirroring/guarded
-merge. Keep branch protection enabled.
+Run `openthrottle init` in each target checkout with `OT_SUPERVISOR_URL` and
+`OT_STATUS_TOKEN`. The authenticated registration endpoint verifies the PAT's
+access and requested base branch, creates or refreshes a JSON webhook at
+`https://<app>.fly.dev/webhooks/github`, verifies that `DAYTONA_SNAPSHOT` is
+active, and stores the Linear-team route in SQLite.
+
+The PAT needs repository administration/webhooks read-write, contents and
+pull requests read-write, and checks/actions read on every registered target.
+The same `GITHUB_WEBHOOK_SECRET` signs each managed repository webhook. Keep
+branch protection enabled. `GITHUB_REPO`/`BASE_BRANCH` remain fallback values
+until the first durable registration exists; `GITHUB_REPO_MAPPINGS` remains a
+legacy static fallback. After durable onboarding is active, an unmatched team
+is rejected instead of being sent to the global fallback repository.
 
 ## Operator endpoints
 
-`/status`, `/tickets/:id/stop`, and `/tickets/:id/logs` require
+`/status`, `/repositories`, `/repositories/register`, `/tickets/:id/stop`, and
+`/tickets/:id/logs` require
 `Authorization: Bearer $OT_STATUS_TOKEN`. `/oauth/install` uses the separate
 install token. Preview links and legacy callbacks carry scoped random credentials.
 The logs endpoint prefers live Daytona output and falls back to the latest

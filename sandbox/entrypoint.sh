@@ -99,6 +99,9 @@ handle_exit() {
   if [[ -n "${MCP_CONFIG_FILE:-}" ]]; then
     rm -f "$MCP_CONFIG_FILE"
   fi
+  if [[ -n "${OPENCODE_CONFIG_DIR:-}" ]]; then
+    rm -rf "$OPENCODE_CONFIG_DIR"
+  fi
   [[ "$COMPLETION_WRITTEN" == "1" ]] && return 0
   COMPLETION_WRITTEN=1
   write_run_completion "$exit_code" || log "ERROR: failed to write completion marker"
@@ -141,7 +144,8 @@ DEV_PORT="${DEV_PORT:-3000}"
 # Strip trailing newlines from token-shaped secrets (SPEC phase 1).
 GITHUB_TOKEN="$(strip_nl "$GITHUB_TOKEN")"
 CLAUDE_CODE_OAUTH_TOKEN="$(strip_nl "${CLAUDE_CODE_OAUTH_TOKEN:-}")"
-export GITHUB_TOKEN CLAUDE_CODE_OAUTH_TOKEN
+KIMI_CODE_API_KEY="$(strip_nl "${KIMI_CODE_API_KEY:-}")"
+export GITHUB_TOKEN CLAUDE_CODE_OAUTH_TOKEN KIMI_CODE_API_KEY
 export GH_TOKEN="$GITHUB_TOKEN"
 
 mkdir -p "$OT_DIR" "${OT_DIR}/outbox"
@@ -261,6 +265,7 @@ CONFIG_FILE="${REPO_DIR}/.openthrottle.yml"
 yq_get() { yq_value_or_default "$CONFIG_FILE" "$1" "$2"; }
 
 CFG_AGENT="$(yq_get '.agent' 'codex')"
+CFG_MODEL="$(yq_get '.model' '')"
 CFG_DEV="$(yq_get '.dev' '')"
 CFG_TEST="$(yq_get '.test' '')"
 CFG_LINT="$(yq_get '.lint' '')"
@@ -311,11 +316,43 @@ AGENT="${AGENT:-codex}"
 export AGENT
 
 case "$AGENT" in
-  claude|codex) ;;
-  *) log "FATAL: resolved AGENT='${AGENT}' is invalid (expected claude|codex)"; exit 1 ;;
+  claude|codex|opencode) ;;
+  *) log "FATAL: resolved AGENT='${AGENT}' is invalid (expected claude|codex|opencode)"; exit 1 ;;
 esac
 
-log "config: agent=${AGENT} ce_pipeline=${OT_CE_PIPELINE} dev='${CFG_DEV}' max_turns=${MAX_TURNS} task_timeout=${TASK_TIMEOUT}"
+OPENCODE_MODEL_FILE="${OT_DIR}/agent-model"
+OPENCODE_MODEL=""
+if [[ "$AGENT" == "opencode" ]]; then
+  if [[ -z "$KIMI_CODE_API_KEY" ]]; then
+    log "FATAL: KIMI_CODE_API_KEY is required for AGENT=opencode"
+    exit 1
+  fi
+  if [[ "$TASK_TYPE" == "resume" ]]; then
+    OPENCODE_MODEL="$(as_agent "cat '${OPENCODE_MODEL_FILE}' 2>/dev/null" || true)"
+    if [[ -z "$OPENCODE_MODEL" ]]; then
+      log "FATAL: resume requested for OpenCode but ${OPENCODE_MODEL_FILE} is missing/empty"
+      exit 1
+    fi
+  else
+    OPENCODE_MODEL="$CFG_MODEL"
+    if [[ -z "$OPENCODE_MODEL" ]]; then
+      log "FATAL: AGENT=opencode requires model: kimi-code/kimi-for-coding in .openthrottle.yml"
+      exit 1
+    fi
+    OPENCODE_VALIDATION_DIR="$(mktemp -d /tmp/ot-opencode-validate-XXXXXX)"
+    if ! node "${OPT_DIR}/runner/build-opencode-config.mjs" \
+      --model "$OPENCODE_MODEL" --mcp-json '{}' --config-dir "$OPENCODE_VALIDATION_DIR" >/dev/null; then
+      rm -rf "$OPENCODE_VALIDATION_DIR"
+      exit 1
+    fi
+    rm -rf "$OPENCODE_VALIDATION_DIR"
+    printf '%s\n' "$OPENCODE_MODEL" > "$OPENCODE_MODEL_FILE"
+    chmod 0600 "$OPENCODE_MODEL_FILE"
+    chown "${AGENT_USER}:${AGENT_USER}" "$OPENCODE_MODEL_FILE"
+  fi
+fi
+
+log "config: agent=${AGENT}${OPENCODE_MODEL:+ model=${OPENCODE_MODEL}} ce_pipeline=${OT_CE_PIPELINE} dev='${CFG_DEV}' max_turns=${MAX_TURNS} task_timeout=${TASK_TIMEOUT}"
 
 # =============================================================================
 # Phase 5 — post_bootstrap
@@ -394,12 +431,30 @@ if [[ "$AGENT" == "claude" ]]; then
   chown "${AGENT_USER}:${AGENT_USER}" "$MCP_CONFIG_FILE"
 fi
 
+if [[ "$AGENT" == "opencode" ]]; then
+  OPENCODE_CONFIG_DIR="$(mktemp -d /tmp/ot-opencode-XXXXXX)"
+  node "${OPT_DIR}/runner/build-opencode-config.mjs" \
+    --model "$OPENCODE_MODEL" \
+    --mcp-json "$MCP_SERVERS_JSON" \
+    --config-dir "$OPENCODE_CONFIG_DIR" >/dev/null
+  chmod 0755 "$OPENCODE_CONFIG_DIR"
+  chmod 0644 "$OPENCODE_CONFIG_DIR/opencode.json"
+  chown -R root:root "$OPENCODE_CONFIG_DIR"
+  export OPENCODE_CONFIG_DIR
+  export OPENCODE_DISABLE_PROJECT_CONFIG=1
+  export OPENCODE_DISABLE_EXTERNAL_SKILLS=1
+  export OPENCODE_DISABLE_CLAUDE_CODE=1
+  export OPENCODE_DISABLE_AUTOUPDATE=1
+  export OPENCODE_DISABLE_SHARE=1
+fi
+
 # Build the exact agent command line per SPEC "Agent invocation" (verbatim
 # flags), then run it under `timeout`, piped through normalize.mjs — all as
 # the `agent` user in one gosu'd subshell so normalize.mjs's
 # ~/.ot/agent-session-id write lands with the right owner/HOME.
 AGENT_EXIT=0
 CODEX_STDIN_FILE=""
+OPENCODE_PROMPT_FILE=""
 
 case "${AGENT}:${TASK_TYPE}" in
   claude:implement|claude:review|claude:review-fix|claude:investigate)
@@ -445,6 +500,32 @@ case "${AGENT}:${TASK_TYPE}" in
       --skip-git-repo-check -C "$REPO_DIR" resume "$SAVED_SESSION_ID" \
       "$RESUME_MESSAGE")
     ;;
+  opencode:implement|opencode:review|opencode:review-fix|opencode:investigate)
+    SKILL_NAME="$(task_skill_name "$TASK_TYPE")"
+    OPENCODE_PROMPT_FILE="${OT_DIR}/opencode-${TASK_TYPE}-prompt.md"
+    {
+      cat "${OPT_DIR}/skills/opencode/${SKILL_NAME}.md"
+      printf '\n\n## Runtime context\n- Task type: %s\n- CE pipeline: %s\n- Issue: %s (%s)\n- Repository: %s\n- Branch: %s\n- Base branch: %s\n- PR number: %s\n- Review round: %s\n' \
+        "$TASK_TYPE" "$OT_CE_PIPELINE" "${LINEAR_ISSUE_IDENTIFIER:-unknown}" "${LINEAR_ISSUE_ID:-unknown}" \
+        "$GITHUB_REPO" "$BRANCH_NAME" "$BASE_BRANCH" "${PR_NUMBER:-none}" "${REVIEW_ROUND:-none}"
+      printf '\n\n## Linear ticket context\n'
+      cat "${OT_DIR}/linear-context.md"
+    } > "$OPENCODE_PROMPT_FILE"
+    chown "${AGENT_USER}:${AGENT_USER}" "$OPENCODE_PROMPT_FILE"
+    AGENT_CMD=(opencode run --format json --model "$OPENCODE_MODEL" --dir "$REPO_DIR" --auto)
+    ;;
+  opencode:resume)
+    SAVED_SESSION_ID="$(as_agent "cat '${OT_DIR}/agent-session-id' 2>/dev/null" || true)"
+    if [[ -z "$SAVED_SESSION_ID" ]]; then
+      log "FATAL: resume requested but ${OT_DIR}/agent-session-id is missing/empty"
+      exit 1
+    fi
+    OPENCODE_PROMPT_FILE="${OT_DIR}/opencode-resume-prompt.md"
+    printf '%s\n' "$RESUME_MESSAGE" > "$OPENCODE_PROMPT_FILE"
+    chown "${AGENT_USER}:${AGENT_USER}" "$OPENCODE_PROMPT_FILE"
+    AGENT_CMD=(opencode run --format json --model "$OPENCODE_MODEL" --dir "$REPO_DIR" --auto \
+      --session "$SAVED_SESSION_ID")
+    ;;
   *)
     log "FATAL: unsupported AGENT='${AGENT}' TASK_TYPE='${TASK_TYPE}' combination"
     exit 1
@@ -460,6 +541,8 @@ log "running: ${AGENT}:${TASK_TYPE} (max_turns=${MAX_TURNS}, timeout=${TASK_TIME
 set +e
 if [[ -n "$CODEX_STDIN_FILE" ]]; then
   as_agent "set -o pipefail; cd '$REPO_DIR' && timeout '$TASK_TIMEOUT' $QUOTED_CMD - < '$CODEX_STDIN_FILE' 2>&1 | node '${OPT_DIR}/runner/normalize.mjs'"
+elif [[ -n "$OPENCODE_PROMPT_FILE" ]]; then
+  as_agent "set -o pipefail; cd '$REPO_DIR' && OT_PROMPT=\$(cat '$OPENCODE_PROMPT_FILE') && timeout '$TASK_TIMEOUT' $QUOTED_CMD \"\$OT_PROMPT\" 2>&1 | node '${OPT_DIR}/runner/normalize.mjs'"
 else
   as_agent "set -o pipefail; cd '$REPO_DIR' && timeout '$TASK_TIMEOUT' $QUOTED_CMD 2>&1 | node '${OPT_DIR}/runner/normalize.mjs'"
 fi

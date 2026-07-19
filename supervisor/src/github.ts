@@ -216,6 +216,77 @@ async function githubRequest<T>(
   return (await response.json()) as T;
 }
 
+export interface RepositoryReadiness {
+  repo: string;
+  baseBranch: string;
+  webhookId: number;
+  webhookAction: "created" | "updated";
+}
+
+const OPENTHROTTLE_WEBHOOK_EVENTS = [
+  "pull_request",
+  "pull_request_review",
+  "workflow_run",
+  "check_suite",
+];
+
+export async function prepareRepository(
+  client: GithubClient,
+  input: {
+    repo: string;
+    requestedBaseBranch?: string;
+    webhookUrl: string;
+    webhookSecret: string;
+  }
+): Promise<RepositoryReadiness> {
+  const repository = await githubRequest<{
+    full_name: string;
+    default_branch: string;
+  }>(client, `/repos/${input.repo}`);
+  const baseBranch = input.requestedBaseBranch || repository.default_branch;
+  await githubRequest(client, `/repos/${repository.full_name}/branches/${encodeURIComponent(baseBranch)}`);
+
+  const hooks = await githubRequest<Array<{
+    id: number;
+    active: boolean;
+    events: string[];
+    config?: { url?: string };
+  }>>(client, `/repos/${repository.full_name}/hooks?per_page=100`);
+  const existing = hooks.find((hook) => hook.config?.url === input.webhookUrl);
+  const hookConfiguration = {
+    active: true,
+    events: OPENTHROTTLE_WEBHOOK_EVENTS,
+    config: {
+      url: input.webhookUrl,
+      content_type: "json",
+      secret: input.webhookSecret,
+      insecure_ssl: "0",
+    },
+  };
+  const hook = existing
+    ? await githubRequest<{ id: number }>(
+        client,
+        `/repos/${repository.full_name}/hooks/${existing.id}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(hookConfiguration),
+        }
+      )
+    : await githubRequest<{ id: number }>(client, `/repos/${repository.full_name}/hooks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "web", ...hookConfiguration }),
+      });
+
+  return {
+    repo: repository.full_name,
+    baseBranch,
+    webhookId: hook.id,
+    webhookAction: existing ? "updated" : "created",
+  };
+}
+
 export async function countChangesRequestedReviews(
   client: GithubClient,
   repo: string,

@@ -18,6 +18,7 @@ export interface SandboxEnvContract {
   REVIEW_ROUND?: string;
   CLAUDE_CODE_OAUTH_TOKEN?: string;
   CODEX_AUTH_JSON?: string;
+  KIMI_CODE_API_KEY?: string;
   MAX_TURNS: string;
   TASK_TIMEOUT: string;
   DEV_PORT: string;
@@ -75,6 +76,7 @@ export async function startTask(
     "REVIEW_ROUND",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CODEX_AUTH_JSON",
+    "KIMI_CODE_API_KEY",
   ] as const;
   const retiredSecretNames = [
     "LINEAR_ACCESS_TOKEN",

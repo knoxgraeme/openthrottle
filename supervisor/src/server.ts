@@ -23,6 +23,7 @@ import {
   mergePullRequest,
   parseGithubWebhook,
   parsePullRequestUrl,
+  prepareRepository,
   verifyGithubSignature,
   type GithubClient,
   type GithubWebhookEvent,
@@ -87,13 +88,32 @@ function hasBearer(header: string | undefined, expected: string): boolean {
 }
 
 function pickAgent(labels: string[], defaultAgent: Agent): Agent {
+  if (labels.includes("agent:opencode")) return "opencode";
   if (labels.includes("agent:codex")) return "codex";
   if (labels.includes("agent:claude")) return "claude";
   return defaultAgent;
 }
 
 function hasAgentSubscription(cfg: Config, agent: Agent): boolean {
-  return agent === "codex" ? Boolean(cfg.codexAuthJson) : Boolean(cfg.claudeCodeOauthToken);
+  switch (agent) {
+    case "codex":
+      return Boolean(cfg.codexAuthJson);
+    case "claude":
+      return Boolean(cfg.claudeCodeOauthToken);
+    case "opencode":
+      return Boolean(cfg.kimiCodeApiKey);
+  }
+}
+
+function agentDisplayName(agent: Agent): string {
+  switch (agent) {
+    case "codex":
+      return "Codex";
+    case "claude":
+      return "Claude";
+    case "opencode":
+      return "OpenCode";
+  }
 }
 
 function linearContext(
@@ -124,20 +144,89 @@ function repoLabelKeys(label: string): string[] {
   return [...new Set([trimmed, withoutPrefix].filter(Boolean))];
 }
 
-function repoFor(
+function repositoryFor(
   cfg: Config,
+  store: TicketStore,
   issue: { team?: { id?: string; key?: string } },
   labels: string[] = []
-): string {
+): { repo: string; baseBranch: string } | undefined {
   for (const label of labels) {
     for (const key of repoLabelKeys(label)) {
       const byLabel = cfg.githubRepoLabelMappings[key];
-      if (byLabel) return byLabel;
+      if (byLabel) return { repo: byLabel, baseBranch: cfg.baseBranch };
     }
+  }
+  const registered = store.getRepositoryRegistration(issue.team?.id, issue.team?.key);
+  if (registered) {
+    return { repo: registered.github_repo, baseBranch: registered.base_branch };
   }
   const byId = issue.team?.id ? cfg.githubRepoMappings[issue.team.id] : undefined;
   const byKey = issue.team?.key ? cfg.githubRepoMappings[issue.team.key] : undefined;
-  return byId ?? byKey ?? cfg.githubRepo;
+  const legacyMapped = byId ?? byKey;
+  if (legacyMapped) return { repo: legacyMapped, baseBranch: cfg.baseBranch };
+  if (store.hasRepositoryRegistrations()) return undefined;
+  return { repo: cfg.githubRepo, baseBranch: cfg.baseBranch };
+}
+
+const LINEAR_TEAM_KEY_PATTERN = /^[A-Za-z0-9_-]+$/;
+
+function isGithubRepository(value: string): boolean {
+  const parts = value.split("/");
+  return (
+    parts.length === 2 &&
+    parts.every(
+      (part) =>
+        part !== "." &&
+        part !== ".." &&
+        /^[A-Za-z0-9_.-]+$/.test(part)
+    )
+  );
+}
+
+function isSafeBranchName(value: string): boolean {
+  if (!value || value.length > 255 || value === "@") return false;
+  if (/^[./-]|[/.]$/.test(value)) return false;
+  if (/\.\.|@\{|\/\/|[~^:?*\[\\\s]/.test(value)) return false;
+  return value.split("/").every((part) => part && !part.startsWith(".") && !part.endsWith(".lock"));
+}
+
+function repositoryRegistrationInput(value: unknown): {
+  repo: string;
+  linearTeamKey: string;
+  linearTeamId?: string;
+  baseBranch?: string;
+} {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("request body must be an object");
+  }
+  const input = value as Record<string, unknown>;
+  if (typeof input.repo !== "string" || !isGithubRepository(input.repo)) {
+    throw new Error("repo must be owner/name");
+  }
+  if (
+    typeof input.linearTeamKey !== "string" ||
+    !LINEAR_TEAM_KEY_PATTERN.test(input.linearTeamKey)
+  ) {
+    throw new Error("linearTeamKey is required");
+  }
+  if (
+    input.linearTeamId !== undefined &&
+    (typeof input.linearTeamId !== "string" || !input.linearTeamId.trim())
+  ) {
+    throw new Error("linearTeamId must be a non-empty string");
+  }
+  if (
+    input.baseBranch !== undefined &&
+    (typeof input.baseBranch !== "string" || !isSafeBranchName(input.baseBranch))
+  ) {
+    throw new Error("baseBranch is not a safe Git branch name");
+  }
+  return {
+    repo: input.repo,
+    linearTeamKey: input.linearTeamKey.toUpperCase(),
+    linearTeamId: typeof input.linearTeamId === "string" ? input.linearTeamId.trim() : undefined,
+    baseBranch: input.baseBranch || undefined,
+  };
 }
 
 function findTicket(store: TicketStore, identifier: string): Ticket | undefined {
@@ -175,6 +264,7 @@ function baseSandboxEnv(
       | "branch"
       | "linear_issue_id"
       | "linear_issue_identifier"
+      | "base_branch"
     >;
     taskType: TaskType;
     run: RunCredentials;
@@ -188,7 +278,7 @@ function baseSandboxEnv(
     AGENT: params.ticket.agent,
     GITHUB_REPO: params.ticket.repo,
     GITHUB_TOKEN: cfg.githubToken,
-    BASE_BRANCH: cfg.baseBranch,
+    BASE_BRANCH: params.ticket.base_branch,
     BRANCH_NAME: params.ticket.branch,
     LINEAR_ISSUE_ID: params.ticket.linear_issue_id,
     LINEAR_ISSUE_IDENTIFIER: params.ticket.linear_issue_identifier,
@@ -200,6 +290,7 @@ function baseSandboxEnv(
     CLAUDE_CODE_OAUTH_TOKEN:
       params.ticket.agent === "claude" ? cfg.claudeCodeOauthToken : undefined,
     CODEX_AUTH_JSON: params.ticket.agent === "codex" ? cfg.codexAuthJson : undefined,
+    KIMI_CODE_API_KEY: params.ticket.agent === "opencode" ? cfg.kimiCodeApiKey : undefined,
     MAX_TURNS: String(cfg.maxTurns),
     TASK_TIMEOUT: String(cfg.taskTimeout),
     DEV_PORT: String(cfg.devPort),
@@ -241,7 +332,7 @@ async function launchExistingTask(params: {
     await tryPostError(
       linear,
       ticket.linear_session_id,
-      `${ticket.agent === "codex" ? "Codex" : "Claude"} subscription login is not configured for OpenThrottle.`
+      `${agentDisplayName(ticket.agent)} subscription login is not configured for OpenThrottle.`
     );
     return false;
   }
@@ -475,6 +566,7 @@ export function createServer(deps: ServerDeps): Hono {
         linear_issue_identifier: ticket.linear_issue_identifier,
         branch: ticket.branch,
         repo: ticket.repo,
+        base_branch: ticket.base_branch,
         agent: ticket.agent,
         state: ticket.state,
         pr_url: ticket.pr_url,
@@ -486,6 +578,63 @@ export function createServer(deps: ServerDeps): Hono {
         updated_at: ticket.updated_at,
       })),
     });
+  });
+
+  app.get("/repositories", (context) => {
+    if (!requireStatusAuth(context.req.header("Authorization"))) {
+      return context.json({ error: "unauthorized" }, 401);
+    }
+    return context.json({ repositories: store.listRepositoryRegistrations() });
+  });
+
+  app.post("/repositories/register", async (context) => {
+    if (!requireStatusAuth(context.req.header("Authorization"))) {
+      return context.json({ error: "unauthorized" }, 401);
+    }
+    let input: ReturnType<typeof repositoryRegistrationInput>;
+    try {
+      input = repositoryRegistrationInput(await context.req.json());
+    } catch (error) {
+      return context.json({ error: sanitizeText(String(error)) }, 400);
+    }
+    try {
+      const snapshot = await daytona.snapshot.get(cfg.daytonaSnapshot);
+      if (String(snapshot.state).toLowerCase() !== "active") {
+        throw new Error(
+          `Daytona snapshot ${cfg.daytonaSnapshot} is not active (${String(snapshot.state)})`
+        );
+      }
+      const github = await prepareRepository(
+        { token: cfg.githubToken },
+        {
+          repo: input.repo,
+          requestedBaseBranch: input.baseBranch,
+          webhookUrl: `${cfg.supervisorUrl}/webhooks/github`,
+          webhookSecret: cfg.githubWebhookSecret,
+        }
+      );
+      const registration = store.registerRepository({
+        linearTeamKey: input.linearTeamKey,
+        linearTeamId: input.linearTeamId,
+        githubRepo: github.repo,
+        baseBranch: github.baseBranch,
+        webhookId: github.webhookId,
+        snapshot: cfg.daytonaSnapshot,
+      });
+      return context.json({
+        registration,
+        readiness: {
+          github: "ready",
+          webhook: github.webhookAction,
+          snapshot: { name: snapshot.name, state: snapshot.state },
+        },
+      });
+    } catch (error) {
+      return context.json(
+        { error: sanitizeText(`Repository setup failed: ${String(error)}`) },
+        502
+      );
+    }
   });
 
   app.get("/oauth/install", (context) => {
@@ -717,12 +866,12 @@ async function handleCreated(
   const labels = extractLabelNames(payload);
   const existing = store.getByIssueId(issue.id);
   const selectedAgent = pickAgent(labels, existing?.agent ?? cfg.defaultAgent);
-  const selectedRepo = repoFor(cfg, issue, labels);
+  const selectedRepository = repositoryFor(cfg, store, issue, labels);
   if (!hasAgentSubscription(cfg, selectedAgent)) {
     await tryPostError(
       linear,
       sessionId,
-      `${selectedAgent === "codex" ? "Codex" : "Claude"} subscription login is not configured for OpenThrottle.`
+      `${agentDisplayName(selectedAgent)} subscription login is not configured for OpenThrottle.`
     );
     return;
   }
@@ -730,15 +879,25 @@ async function handleCreated(
     payload,
     `# ${issue.identifier}\n\nNo Linear prompt context was supplied for this delegation.`
   );
+  if (!selectedRepository) {
+    await tryPostError(
+      linear,
+      sessionId,
+      `No repository is registered for Linear team ${issue.team?.key ?? issue.team?.id ?? "unknown"}. Run \`openthrottle init\` in the target repository first.`
+    );
+    return;
+  }
   if (existing?.sandbox_id && existing.state !== "closed" && existing.state !== "expired") {
     const agentChanged = existing.agent !== selectedAgent;
-    const repoChanged = existing.repo !== selectedRepo;
+    const repoChanged =
+      existing.repo !== selectedRepository.repo ||
+      existing.base_branch !== selectedRepository.baseBranch;
     if (repoChanged) {
       if (existing.run_id) {
         store.finishRun({
           runId: existing.run_id,
           status: "stopped",
-          failureTail: `Repository route changed from ${existing.repo} to ${selectedRepo}; starting a fresh workspace.`,
+          failureTail: `Repository route changed from ${existing.repo} to ${selectedRepository.repo}; starting a fresh workspace.`,
           ticketState: "active",
         });
       }
@@ -747,7 +906,7 @@ async function handleCreated(
         await deleteSandbox(daytona, existing.sandbox_id);
       } catch (error) {
         const message = sanitizeText(
-          `OpenThrottle resolved this ticket to ${selectedRepo}, but could not delete the existing ${existing.repo} workspace: ${String(error)}`
+          `OpenThrottle resolved this ticket to ${selectedRepository.repo}, but could not delete the existing ${existing.repo} workspace: ${String(error)}`
         );
         await tryPostError(linear, sessionId, message);
         return;
@@ -789,7 +948,8 @@ async function handleCreated(
     sandbox_id: null,
     branch: branchFor(issue.identifier),
     agent: selectedAgent,
-    repo: selectedRepo,
+    repo: selectedRepository.repo,
+    base_branch: selectedRepository.baseBranch,
     pr_url: null,
     state: "active" as const,
   };
@@ -921,7 +1081,7 @@ async function reportCreatedWorkspace(
       sessionId: ticket.linear_session_id,
       type: "action",
       action: "Created workspace",
-      parameter: `${sandboxId} on ${ticket.branch}`,
+      parameter: `${sandboxId} on ${ticket.repo}:${ticket.branch}`,
       result: `Wake-on-click preview: ${previewUrl}`,
     });
   } catch (error) {

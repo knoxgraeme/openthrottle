@@ -1,8 +1,9 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import * as p from "@clack/prompts";
 import { stringify } from "yaml";
-import { getErrorMessage, readEnv } from "./util.js";
+import { getErrorMessage, readEnv, supervisorRequest } from "./util.js";
 
 interface PackageJson {
   scripts?: Record<string, string>;
@@ -10,15 +11,16 @@ interface PackageJson {
 }
 
 interface Detected {
-  pm: "npm" | "pnpm" | "yarn";
+  pm: "npm" | "pnpm" | "yarn" | null;
   test: string;
   build: string;
   lint: string;
   dev: string;
 }
 
-interface ProjectConfig {
-  agent: "claude" | "codex";
+export interface ProjectConfig {
+  agent: "claude" | "codex" | "opencode";
+  model?: string;
   test: string;
   build: string;
   lint: string;
@@ -26,6 +28,21 @@ interface ProjectConfig {
   post_bootstrap: string[];
   limits: { max_turns: number; task_timeout: number };
   mcp_servers: Record<string, unknown>;
+}
+
+export interface RepositoryTarget {
+  repo: string;
+  baseBranch?: string;
+}
+
+export interface RepositoryRegistrationInput extends RepositoryTarget {
+  linearTeamKey: string;
+  linearTeamId?: string;
+}
+
+interface InitSelection {
+  project: ProjectConfig;
+  registration: RepositoryRegistrationInput;
 }
 
 export function detectPackageManager(
@@ -42,7 +59,7 @@ export function detectPackageManager(
 export function detectProject(directory = process.cwd()): Detected {
   const packagePath = join(directory, "package.json");
   if (!existsSync(packagePath)) {
-    throw new Error("No package.json found. Run openthrottle init from a Node.js project root.");
+    return { pm: null, test: "", build: "", lint: "", dev: "" };
   }
   const pkg = JSON.parse(readFileSync(packagePath, "utf8")) as PackageJson;
   const scripts = pkg.scripts ?? {};
@@ -57,15 +74,78 @@ export function detectProject(directory = process.cwd()): Detected {
   };
 }
 
-async function promptConfig(detected: Detected): Promise<ProjectConfig> {
+export function parseGithubRemote(remote: string): string {
+  const value = remote.trim().replace(/\.git$/, "");
+  const match =
+    value.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)$/i) ??
+    value.match(/^git@github\.com:([^/]+)\/([^/]+)$/i) ??
+    value.match(/^ssh:\/\/git@github\.com\/([^/]+)\/([^/]+)$/i);
+  if (!match?.[1] || !match[2]) {
+    throw new Error("origin must point to a GitHub repository");
+  }
+  return `${match[1]}/${match[2]}`;
+}
+
+function git(directory: string, args: string[]): string {
+  return execFileSync("git", args, {
+    cwd: directory,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  }).trim();
+}
+
+export function detectRepository(directory = process.cwd()): RepositoryTarget {
+  let remote: string;
+  try {
+    remote = git(directory, ["remote", "get-url", "origin"]);
+  } catch {
+    throw new Error("No git origin found. Add the target GitHub repository as origin first.");
+  }
+  let baseBranch: string | undefined;
+  try {
+    const symbolic = git(directory, ["symbolic-ref", "refs/remotes/origin/HEAD"]);
+    baseBranch = symbolic.replace(/^refs\/remotes\/origin\//, "") || undefined;
+  } catch {
+    try {
+      git(directory, ["rev-parse", "--verify", "HEAD"]);
+    } catch {
+      // For an unborn repository, HEAD still names the explicitly initialized base branch.
+      try {
+        baseBranch = git(directory, ["branch", "--show-current"]) || undefined;
+      } catch {
+        // The supervisor will use GitHub's canonical default branch.
+      }
+    }
+  }
+  return { repo: parseGithubRemote(remote), baseBranch };
+}
+
+async function promptConfig(detected: Detected, target: RepositoryTarget): Promise<InitSelection> {
   const result = await p.group(
     {
+      linearTeamKey: () =>
+        p.text({
+          message: "Linear team key routed to this repository",
+          initialValue: readEnv("LINEAR_TEAM_KEY") ?? "",
+          validate: (value) => (/^[A-Za-z0-9_-]+$/.test(value) ? undefined : "Enter a team key"),
+        }),
+      linearTeamId: () =>
+        p.text({
+          message: "Linear team ID (optional, but recommended)",
+          initialValue: readEnv("LINEAR_TEAM_ID") ?? "",
+        }),
+      baseBranch: () =>
+        p.text({
+          message: "Base branch (blank uses GitHub default)",
+          initialValue: target.baseBranch ?? "",
+        }),
       agent: () =>
         p.select({
           message: "Default agent",
           options: [
             { value: "codex", label: "Codex CLI" },
             { value: "claude", label: "Claude Code" },
+            { value: "opencode", label: "OpenCode (Kimi Code)" },
           ],
           initialValue: "codex",
         }),
@@ -74,7 +154,10 @@ async function promptConfig(detected: Detected): Promise<ProjectConfig> {
       lint: () => p.text({ message: "Lint command (blank to skip)", initialValue: detected.lint }),
       dev: () => p.text({ message: "Dev command (blank to skip)", initialValue: detected.dev }),
       post_bootstrap: () =>
-        p.text({ message: "Post-bootstrap command", initialValue: `${detected.pm} install` }),
+        p.text({
+          message: "Post-bootstrap command (blank to skip)",
+          initialValue: detected.pm ? `${detected.pm} install` : "",
+        }),
       max_turns: () => p.text({ message: "Max turns per agent run", initialValue: "200" }),
       task_timeout: () => p.text({ message: "Task timeout (seconds)", initialValue: "7200" }),
     },
@@ -86,24 +169,30 @@ async function promptConfig(detected: Detected): Promise<ProjectConfig> {
     }
   );
   return {
-    agent: result.agent as "claude" | "codex",
-    test: result.test,
-    build: result.build,
-    lint: result.lint,
-    dev: result.dev,
-    post_bootstrap: result.post_bootstrap ? [result.post_bootstrap] : [],
-    limits: {
-      max_turns: Number(result.max_turns) || 200,
-      task_timeout: Number(result.task_timeout) || 7200,
+    project: {
+      agent: result.agent as "claude" | "codex" | "opencode",
+      model: result.agent === "opencode" ? "kimi-code/kimi-for-coding" : undefined,
+      test: result.test,
+      build: result.build,
+      lint: result.lint,
+      dev: result.dev,
+      post_bootstrap: result.post_bootstrap ? [result.post_bootstrap] : [],
+      limits: {
+        max_turns: Number(result.max_turns) || 200,
+        task_timeout: Number(result.task_timeout) || 7200,
+      },
+      mcp_servers: {},
     },
-    mcp_servers: {},
+    registration: {
+      repo: target.repo,
+      baseBranch: result.baseBranch || undefined,
+      linearTeamKey: result.linearTeamKey.toUpperCase(),
+      linearTeamId: result.linearTeamId || undefined,
+    },
   };
 }
 
-export function writeProjectConfig(
-  config: ProjectConfig,
-  directory = process.cwd()
-): void {
+export function writeProjectConfig(config: ProjectConfig, directory = process.cwd()): void {
   const document: Record<string, unknown> = { ...config };
   for (const key of ["test", "build", "lint", "dev"] as const) {
     if (!config[key]) delete document[key];
@@ -116,96 +205,74 @@ export function writeProjectConfig(
   writeFileSync(join(directory, ".openthrottle.yml"), header + stringify(document));
 }
 
-async function verifySnapshot(snapshotName: string): Promise<void> {
-  const apiKey = readEnv("DAYTONA_API_KEY");
-  if (!apiKey) {
-    p.log.warn(
-      `DAYTONA_API_KEY is not set, so snapshot "${snapshotName}" could not be verified.\n` +
-        `Create it from the OpenThrottle repo with:\n` +
-        `  daytona snapshot create ${snapshotName} --dockerfile sandbox/Dockerfile --context .`
-    );
-    return;
-  }
-  const { Daytona } = await import("@daytona/sdk");
-  const daytona = new Daytona({ apiKey });
-  const spinner = p.spinner();
-  spinner.start(`Verifying Daytona snapshot "${snapshotName}"`);
-  try {
-    const snapshot = await daytona.snapshot.get(snapshotName);
-    spinner.stop(`Snapshot "${snapshot.name}" found (${snapshot.state}).`);
-  } catch (error) {
-    spinner.stop(`Snapshot "${snapshotName}" was not found.`);
-    p.log.error(getErrorMessage(error));
-    p.log.info(
-      `Build it once from the OpenThrottle repository:\n` +
-        `  daytona snapshot create ${snapshotName} --dockerfile sandbox/Dockerfile --context .`
-    );
-  }
-}
-
-const SUPERVISOR_ENV_VARS: Array<{ name: string; hint: string }> = [
-  { name: "SUPERVISOR_URL", hint: "public HTTPS base URL" },
-  { name: "OT_STATUS_TOKEN", hint: "random bearer token for CLI/status/stop/logs" },
-  { name: "OT_INSTALL_SECRET", hint: "random bearer token for /oauth/install" },
-  { name: "DATABASE_PATH", hint: "default: /data/openthrottle.db" },
-  { name: "LINEAR_WEBHOOK_SECRET", hint: "Linear webhook signing secret" },
-  { name: "LINEAR_CLIENT_ID", hint: "Linear OAuth agent app" },
-  { name: "LINEAR_CLIENT_SECRET", hint: "Linear OAuth agent app" },
-  { name: "GITHUB_WEBHOOK_SECRET", hint: "GitHub webhook signing secret" },
-  { name: "GITHUB_TOKEN", hint: "fine-grained PAT: contents/PRs/checks" },
-  { name: "GITHUB_REPO", hint: "default owner/name" },
-  { name: "GITHUB_REPO_MAPPINGS", hint: "optional JSON map of Linear team id/key to repo" },
-  { name: "DAYTONA_API_KEY", hint: "Daytona API key" },
-  { name: "DAYTONA_SNAPSHOT", hint: "default: openthrottle" },
-  { name: "DEFAULT_AGENT", hint: "codex or claude; default: codex" },
-  { name: "CLAUDE_CODE_OAUTH_TOKEN", hint: "Claude subscription setup token" },
-  { name: "CODEX_AUTH_JSON", hint: "raw ~/.codex/auth.json for Codex subscription login" },
-  { name: "BASE_BRANCH", hint: "default: main" },
-  { name: "MAX_TURNS", hint: "default: 200" },
-  { name: "TASK_TIMEOUT", hint: "seconds, default: 7200" },
-  { name: "CALLBACK_GRACE_SECONDS", hint: "default: 120" },
-  { name: "SANDBOX_EVENT_POLL_INTERVAL_MS", hint: "default: 5000" },
-  { name: "DEV_PORT", hint: "default: 3000" },
-  { name: "SWEEP_MAX_AGE_DAYS", hint: "default: 14" },
-  { name: "ORPHAN_GRACE_MINUTES", hint: "default: 5" },
-  { name: "REVIEW_MAX_ROUNDS", hint: "default: 3" },
-  { name: "ALLOW_LINEAR_MERGE", hint: "default: false" },
-];
-
-function printSecretsChecklist(): void {
-  console.log("\nSupervisor secrets checklist:\n");
-  for (const { name, hint } of SUPERVISOR_ENV_VARS) {
-    console.log(`  fly secrets set ${name}="<value>"   # ${hint}`);
-  }
+export async function registerTargetRepository(
+  input: RepositoryRegistrationInput,
+  request: typeof supervisorRequest = supervisorRequest
+): Promise<{
+  registration: { github_repo: string; base_branch: string };
+  readiness: { webhook: string; snapshot: { name: string; state: string } };
+}> {
+  const response = await request("/repositories/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  const body = (await response.json()) as {
+    error?: string;
+    registration: { github_repo: string; base_branch: string };
+    readiness: { webhook: string; snapshot: { name: string; state: string } };
+  };
+  if (!response.ok) throw new Error(body.error ?? `Supervisor returned HTTP ${response.status}`);
+  return body;
 }
 
 export default async function init(): Promise<void> {
   p.intro("openthrottle init");
   let detected: Detected;
+  let target: RepositoryTarget;
   try {
+    target = detectRepository();
     detected = detectProject();
   } catch (error) {
     p.log.error(getErrorMessage(error));
     process.exit(1);
   }
-  p.log.info(`Detected package manager: ${detected.pm}`);
-  const config = await promptConfig(detected);
+  p.log.info(`Target repository: ${target.repo} (${target.baseBranch ?? "GitHub default branch"})`);
+  p.log.info(detected.pm ? `Detected package manager: ${detected.pm}` : "No Node package detected; enter project commands manually.");
+  const selection = await promptConfig(detected, target);
   const configPath = join(process.cwd(), ".openthrottle.yml");
   if (existsSync(configPath)) {
     const overwrite = await p.confirm({
       message: ".openthrottle.yml already exists. Overwrite?",
       initialValue: false,
     });
-    if (p.isCancel(overwrite) || !overwrite) p.log.warn("Skipped .openthrottle.yml");
+    if (p.isCancel(overwrite)) {
+      p.cancel("Cancelled.");
+      return;
+    }
+    if (!overwrite) p.log.warn("Kept existing .openthrottle.yml");
     else {
-      writeProjectConfig(config);
+      writeProjectConfig(selection.project);
       p.log.success("Wrote .openthrottle.yml");
     }
   } else {
-    writeProjectConfig(config);
+    writeProjectConfig(selection.project);
     p.log.success("Wrote .openthrottle.yml");
   }
-  await verifySnapshot(readEnv("DAYTONA_SNAPSHOT") ?? "openthrottle");
-  printSecretsChecklist();
-  p.outro("Next: deploy supervisor/, install its Linear app, then ship a plan.");
+
+  const spinner = p.spinner();
+  spinner.start("Registering repository and checking readiness");
+  try {
+    const result = await registerTargetRepository(selection.registration);
+    spinner.stop(`Registered ${result.registration.github_repo} on ${result.registration.base_branch}`);
+    p.log.success(
+      `GitHub webhook ${result.readiness.webhook}; Daytona snapshot ${result.readiness.snapshot.name} is ${result.readiness.snapshot.state}.`
+    );
+  } catch (error) {
+    spinner.stop("Repository registration failed");
+    p.log.error(getErrorMessage(error));
+    p.log.warn("The local .openthrottle.yml is ready; rerun init after fixing supervisor access.");
+    process.exit(1);
+  }
+  p.outro("Commit .openthrottle.yml, then delegate an issue from the configured Linear team.");
 }

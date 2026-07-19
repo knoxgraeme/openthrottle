@@ -55,9 +55,11 @@ RUN corepack enable
 # by the smoke and normalizer tests; upgrade deliberately with those tests.
 ARG CLAUDE_CODE_VERSION=2.1.201
 ARG CODEX_VERSION=0.143.0
+ARG OPENCODE_VERSION=1.18.3
 RUN npm install -g \
       "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
       "@openai/codex@${CODEX_VERSION}" \
+      "opencode-ai@${OPENCODE_VERSION}" \
     && npm cache clean --force
 
 # ---------------------------------------------------------------------------

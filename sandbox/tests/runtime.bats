@@ -13,9 +13,10 @@ setup() {
 @test "sanitize_log redacts direct and nested credentials" {
   export GITHUB_TOKEN="direct-secret-value"
   export CODEX_AUTH_JSON='{"tokens":{"access_token":"nested-secret-value"}}'
-  run sanitize_log "direct-secret-value nested-secret-value ghp_abcdefghijklmnop visible"
+  export KIMI_CODE_API_KEY="kimi-secret-value"
+  run sanitize_log "direct-secret-value nested-secret-value kimi-secret-value ghp_abcdefghijklmnop visible"
   [ "$status" -eq 0 ]
-  [ "$output" = "[REDACTED] [REDACTED] [REDACTED] visible" ]
+  [ "$output" = "[REDACTED] [REDACTED] [REDACTED] [REDACTED] visible" ]
 }
 
 @test "task types map to the correct skill" {

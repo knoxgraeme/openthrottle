@@ -26,6 +26,7 @@ const cfg: Config = {
   defaultAgent: "codex",
   claudeCodeOauthToken: "claude-token",
   codexAuthJson: "{}",
+  kimiCodeApiKey: "kimi-token",
   baseBranch: "main",
   maxTurns: 200,
   taskTimeout: 7200,
@@ -70,6 +71,14 @@ describe("createServer lifecycle", () => {
   it("acks, deduplicates, serializes, completes once, and cleans up on PR close", async () => {
     db = openDb(":memory:");
     const store = createTicketStore(db);
+    store.registerRepository({
+      linearTeamKey: "OT",
+      linearTeamId: "team-1",
+      githubRepo: "owner/target",
+      baseBranch: "develop",
+      webhookId: 42,
+      snapshot: "openthrottle",
+    });
     const linearRequests: Array<Record<string, unknown>> = [];
     const linearFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       const request = JSON.parse(String(init?.body)) as Record<string, unknown>;
@@ -158,12 +167,18 @@ describe("createServer lifecycle", () => {
     expect(createParams?.envVars).not.toHaveProperty("SUPERVISOR_URL");
     expect(createParams?.envVars).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
     expect(createParams?.envVars).toHaveProperty("CODEX_AUTH_JSON", "{}");
+    expect(createParams?.envVars).toMatchObject({
+      GITHUB_REPO: "owner/target",
+      BASE_BRANCH: "develop",
+    });
     expect(sandbox.fs.uploadFile).toHaveBeenCalledWith(
       Buffer.from("# OT-1\n\nApproved implementation plan"),
       "/home/agent/.ot/linear-context.md"
     );
     expect(store.getByIssueId("issue-1")).toMatchObject({
       agent: "codex",
+      repo: "owner/target",
+      base_branch: "develop",
       sandbox_id: "sandbox-1",
       run_id: expect.any(String),
       linear_context: "# OT-1\n\nApproved implementation plan",
@@ -206,14 +221,14 @@ describe("createServer lifecycle", () => {
       body: JSON.stringify({
         exit_code: 0,
         cost_usd: 0.75,
-        pr_url: "https://github.com/owner/repo/pull/7",
+        pr_url: "https://github.com/owner/target/pull/7",
       }),
     });
     expect(callback.status).toBe(200);
     expect(store.getByIssueId("issue-1")).toMatchObject({
       run_id: null,
       total_cost_usd: 0.75,
-      pr_url: "https://github.com/owner/repo/pull/7",
+      pr_url: "https://github.com/owner/target/pull/7",
     });
     expect(
       (
@@ -230,13 +245,13 @@ describe("createServer lifecycle", () => {
 
     const closed = JSON.stringify({
       action: "closed",
-      repository: { full_name: "owner/repo" },
+      repository: { full_name: "owner/target" },
       pull_request: {
         number: 7,
-        html_url: "https://github.com/owner/repo/pull/7",
+        html_url: "https://github.com/owner/target/pull/7",
         merged: true,
         head: { ref: "ot/ot-1", sha: "abc" },
-        base: { ref: "main" },
+        base: { ref: "develop" },
       },
     });
     await app.request("/webhooks/github", {
@@ -247,6 +262,172 @@ describe("createServer lifecycle", () => {
     await Promise.all(background.splice(0));
     expect(sandbox.delete).toHaveBeenCalledOnce();
     expect(store.getByIssueId("issue-1")?.state).toBe("closed");
+  });
+
+  it("authenticates repository registration and verifies GitHub plus Daytona readiness", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    const githubFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/repos/acme/widget")) {
+        return Response.json({ full_name: "acme/widget", default_branch: "main" });
+      }
+      if (url.endsWith("/branches/develop")) return Response.json({ name: "develop" });
+      if (url.endsWith("/hooks?per_page=100")) return Response.json([]);
+      if (url.endsWith("/hooks") && init?.method === "POST") return Response.json({ id: 99 });
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    });
+    vi.stubGlobal("fetch", githubFetch);
+    const daytona = {
+      snapshot: { get: vi.fn(async () => ({ name: "openthrottle", state: "active" })) },
+    } as unknown as Daytona;
+    const app = createServer({ cfg, store, daytona, getLinearClient: async () => undefined });
+
+    expect((await app.request("/repositories")).status).toBe(401);
+    expect(
+      (
+        await app.request("/repositories/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            repo: "acme/widget",
+            baseBranch: "develop",
+            linearTeamKey: "eng",
+            linearTeamId: "team-eng",
+          }),
+        })
+      ).status
+    ).toBe(401);
+    expect(
+      (
+        await app.request("/repositories/register", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${cfg.statusToken}`,
+          },
+          body: JSON.stringify({
+            repo: "acme/widget",
+            baseBranch: "../main",
+            linearTeamKey: "ENG",
+          }),
+        })
+      ).status
+    ).toBe(400);
+
+    const response = await app.request("/repositories/register", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${cfg.statusToken}`,
+      },
+      body: JSON.stringify({
+        repo: "acme/widget",
+        baseBranch: "develop",
+        linearTeamKey: "eng",
+        linearTeamId: "team-eng",
+      }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      registration: {
+        linear_team_key: "ENG",
+        linear_team_id: "team-eng",
+        github_repo: "acme/widget",
+        base_branch: "develop",
+        webhook_id: 99,
+      },
+      readiness: {
+        github: "ready",
+        webhook: "created",
+        snapshot: { name: "openthrottle", state: "active" },
+      },
+    });
+    const list = await app.request("/repositories", {
+      headers: { Authorization: `Bearer ${cfg.statusToken}` },
+    });
+    expect(await list.json()).toMatchObject({
+      repositories: [expect.objectContaining({ github_repo: "acme/widget" })],
+    });
+
+    githubFetch.mockClear();
+    const inactiveApp = createServer({
+      cfg,
+      store,
+      daytona: {
+        snapshot: { get: vi.fn(async () => ({ name: "openthrottle", state: "error" })) },
+      } as unknown as Daytona,
+      getLinearClient: async () => undefined,
+    });
+    const inactiveResponse = await inactiveApp.request("/repositories/register", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${cfg.statusToken}`,
+      },
+      body: JSON.stringify({ repo: "acme/other", linearTeamKey: "OTHER" }),
+    });
+    expect(inactiveResponse.status).toBe(502);
+    expect(githubFetch).not.toHaveBeenCalled();
+    expect(store.getRepositoryRegistration(undefined, "OTHER")).toBeUndefined();
+  });
+
+  it("fails closed for an unregistered Linear team once durable routing is enabled", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.registerRepository({
+      linearTeamKey: "ENG",
+      linearTeamId: "team-eng",
+      githubRepo: "acme/widget",
+      baseBranch: "main",
+      webhookId: 9,
+      snapshot: "openthrottle",
+    });
+    const linearRequests: string[] = [];
+    const linearFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      linearRequests.push(String(init?.body));
+      return Response.json({
+        data: { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
+      });
+    }) as unknown as typeof fetch;
+    const daytona = {
+      list: vi.fn(() => (async function* () {})()),
+      create: vi.fn(),
+    } as unknown as Daytona;
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg,
+      store,
+      daytona,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
+      runBackground: (task) => background.push(task),
+    });
+    const created = JSON.stringify({
+      action: "created",
+      type: "AgentSessionEvent",
+      webhookId: "linear-unregistered",
+      webhookTimestamp: Date.now(),
+      organizationId: "org",
+      agentSession: {
+        id: "session-unregistered",
+        issue: {
+          id: "issue-unregistered",
+          identifier: "OPS-1",
+          team: { id: "team-ops", key: "OPS" },
+          labels: [],
+        },
+      },
+    });
+    await app.request("/webhooks/linear", {
+      method: "POST",
+      headers: signedLinear(created, "linear-unregistered"),
+      body: created,
+    });
+    await Promise.all(background);
+
+    expect(daytona.create).not.toHaveBeenCalled();
+    expect(store.getByIssueId("issue-unregistered")).toBeUndefined();
+    expect(linearRequests.some((request) => request.includes("No repository is registered"))).toBe(true);
   });
 
   it("rejects invalid, stale, and unsupported webhook input before side effects", async () => {
@@ -528,7 +709,11 @@ describe("createServer lifecycle", () => {
     const app = createServer({
       cfg,
       store,
-      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      daytona: {
+        get: vi.fn(async () => sandbox),
+        list: vi.fn(() => (async function* () {})()),
+        create: vi.fn(async () => sandbox),
+      } as unknown as Daytona,
       getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
       runBackground: (task) => background.push(task),
     });
@@ -563,6 +748,35 @@ describe("createServer lifecycle", () => {
       CODEX_AUTH_JSON: "{}",
     });
     expect(envUpdates.at(-1)).not.toHaveProperty("RESUME_MESSAGE");
+
+    const opencode = JSON.stringify({
+      ...JSON.parse(created),
+      webhookId: "linear-switch-opencode",
+      agentSession: {
+        id: "session-switch-opencode",
+        issue: {
+          id: "issue-switch-opencode",
+          identifier: "OT-SWITCH-OPENCODE",
+          team: { id: "team-1", key: "OT" },
+          labels: [{ name: "agent:opencode" }],
+        },
+      },
+    });
+    await app.request("/webhooks/linear", {
+      method: "POST",
+      headers: signedLinear(opencode, "linear-switch-opencode"),
+      body: opencode,
+    });
+    await Promise.all(background.splice(0));
+
+    expect(store.getByIssueId("issue-switch-opencode")?.agent).toBe("opencode");
+    expect(envUpdates.at(-1)).toMatchObject({
+      AGENT: "opencode",
+      TASK_TYPE: "implement",
+      KIMI_CODE_API_KEY: "kimi-token",
+    });
+    expect(envUpdates.at(-1)).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
+    expect(envUpdates.at(-1)).not.toHaveProperty("CODEX_AUTH_JSON");
   });
 
   it("routes new delegations from repo labels before team mappings", async () => {
