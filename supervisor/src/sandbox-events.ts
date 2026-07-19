@@ -23,7 +23,7 @@ const ACTIVITY_TYPES: ReadonlyArray<SandboxActivityEvent["type"]> = [
 
 export type SandboxEvent = SandboxActivityEvent | SandboxCompletionEvent;
 
-export interface SandboxActivityEvent {
+interface SandboxActivityEvent {
   version: 1;
   kind: "activity";
   event_id: string;
@@ -33,7 +33,7 @@ export interface SandboxActivityEvent {
   body: string;
 }
 
-export interface SandboxCompletionEvent {
+interface SandboxCompletionEvent {
   version: 1;
   kind: "completion";
   event_id: string;
