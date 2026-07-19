@@ -424,6 +424,7 @@ export interface TicketStore {
   getByIssueId(issueId: string): Ticket | undefined;
   getByIdentifier(identifier: string): Ticket | undefined;
   getByBranch(repo: string, branch: string): Ticket | undefined;
+  getByPrUrl(repo: string, prUrl: string): Ticket | undefined;
   getBySandboxId(sandboxId: string): Ticket | undefined;
   setSandboxId(issueId: string, sandboxId: string | null): void;
   setState(issueId: string, state: TicketState, lastError?: string): void;
@@ -487,6 +488,7 @@ export interface TicketStore {
   getRun(runId: string): Run | undefined;
   getLatestRun(issueId: string): Run | undefined;
   getLatestRunWithLog(issueId: string): Run | undefined;
+  countRunsByType(issueId: string, taskType: TaskType): number;
   finishRun(params: FinishRunParams): Run | undefined;
   listExpiredRuns(nowIso: string): Run[];
   insertSandboxEvent(params: {
@@ -534,6 +536,12 @@ export function createTicketStore(db: Database.Database): TicketStore {
     "SELECT * FROM tickets WHERE lower(linear_issue_identifier) = lower(?)"
   );
   const getByBranchStmt = db.prepare("SELECT * FROM tickets WHERE repo = ? AND branch = ?");
+  const getByPrUrlStmt = db.prepare(
+    "SELECT * FROM tickets WHERE lower(repo) = lower(?) AND lower(pr_url) = lower(?)"
+  );
+  const countRunsByTypeStmt = db.prepare(
+    "SELECT COUNT(*) AS count FROM runs WHERE linear_issue_id = ? AND task_type = ?"
+  );
   const getBySandboxIdStmt = db.prepare("SELECT * FROM tickets WHERE sandbox_id = ?");
   const setSandboxIdStmt = db.prepare(
     "UPDATE tickets SET sandbox_id = ?, updated_at = ? WHERE linear_issue_id = ?"
@@ -914,6 +922,9 @@ export function createTicketStore(db: Database.Database): TicketStore {
     getByBranch(repo, branch) {
       return getByBranchStmt.get(repo, branch) as Ticket | undefined;
     },
+    getByPrUrl(repo, prUrl) {
+      return getByPrUrlStmt.get(repo, prUrl) as Ticket | undefined;
+    },
     getBySandboxId(sandboxId) {
       return getBySandboxIdStmt.get(sandboxId) as Ticket | undefined;
     },
@@ -1122,6 +1133,9 @@ export function createTicketStore(db: Database.Database): TicketStore {
     },
     getLatestRunWithLog(issueId) {
       return getLatestRunWithLogStmt.get(issueId) as Run | undefined;
+    },
+    countRunsByType(issueId, taskType) {
+      return (countRunsByTypeStmt.get(issueId, taskType) as { count: number }).count;
     },
     finishRun(params) {
       return finishRunTransaction(params);

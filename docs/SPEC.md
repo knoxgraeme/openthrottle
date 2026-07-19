@@ -92,6 +92,20 @@ that ticket, bounding durable log storage to the latest captured run.
   elicitation (or whose re-review was outranked by queued human work) instead
   marks the ticket's pending re-review flag; the re-review starts after a
   later successful non-paused run on that ticket.
+- A submitted `commented` review (covering all inline review threads, since
+  GitHub wraps every inline comment in a review) or a new PR conversation
+  comment also starts `review-fix`, so bot reviews and drive-by comments are
+  actioned or answered instead of sitting unaddressed. Feedback authored by
+  the `GITHUB_TOKEN` account itself is ignored (the account login is resolved
+  once and cached; comment-grade feedback fails closed if it cannot be
+  resolved). When a run is already active, the feedback is queued as
+  automatic session work — below human replies — and handled when the run
+  finishes. Comment-triggered fixes count toward `REVIEW_MAX_ROUNDS` through
+  the ticket's review-fix run history.
+- Webhook subscriptions cover `pull_request`, `pull_request_review`,
+  `issue_comment`, `workflow_run`, and `check_suite`; repositories registered
+  before `issue_comment` was added pick it up on the next
+  `/repositories/register` (or `openthrottle init`) refresh.
 - Implement and review-fix runs invoke bounded `ce-babysit-pr mode:pipeline`
   so actionable CI/review feedback can be repaired before Fly's next event.
 - Review verdicts are PR comments, never GitHub approval/rejection state.

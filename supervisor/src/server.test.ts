@@ -2195,4 +2195,160 @@ describe("createServer lifecycle", () => {
     expect(ticket.run_id).not.toBe("run-deferred");
     expect(store.getRun(ticket.run_id!)?.task_type).toBe("review");
   });
+
+  it("actions a commented review from another account by starting review-fix", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-commented",
+      linear_issue_identifier: "OT-COMMENTED",
+      linear_session_id: "session-commented",
+      sandbox_id: "sandbox-commented",
+      branch: "ot/ot-commented",
+      agent: "claude",
+      repo: "owner/repo",
+      pr_url: "https://github.com/owner/repo/pull/31",
+      state: "active",
+    });
+    const envUpdates: Array<Record<string, string>> = [];
+    const sandbox = {
+      state: "started",
+      setAutostopInterval: vi.fn(async () => undefined),
+      updateEnv: vi.fn(async (env: Record<string, string>) => {
+        envUpdates.push(env);
+      }),
+      fs: {
+        uploadFile: vi.fn(async () => undefined),
+        setFilePermissions: vi.fn(async () => undefined),
+      },
+      process: {
+        createSession: vi.fn(async () => undefined),
+        executeSessionCommand: vi.fn(async () => undefined),
+      },
+    };
+    const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
+    const githubFetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/user")) return Response.json({ login: "openthrottle-bot" });
+      if (url.includes("/reviews")) return Response.json([]);
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    });
+    vi.stubGlobal("fetch", githubFetch);
+    const linearFetch = vi.fn(async () =>
+      Response.json({
+        data: { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
+      })
+    ) as unknown as typeof fetch;
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg,
+      store,
+      daytona,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
+      runBackground: (task) => background.push(task),
+    });
+    const commented = JSON.stringify({
+      action: "submitted",
+      repository: { full_name: "owner/repo" },
+      pull_request: {
+        number: 31,
+        html_url: "https://github.com/owner/repo/pull/31",
+        merged: false,
+        head: { ref: "ot/ot-commented", sha: "abc" },
+        base: { ref: "main" },
+      },
+      review: {
+        id: 77,
+        state: "commented",
+        body: "The retry loop swallows the original error.",
+        html_url: "https://github.com/owner/repo/pull/31#pullrequestreview-77",
+        user: { login: "codex-review-bot" },
+      },
+    });
+
+    await app.request("/webhooks/github", {
+      method: "POST",
+      headers: signedGithub(commented, "github-commented-review", "pull_request_review"),
+      body: commented,
+    });
+    await Promise.all(background.splice(0));
+
+    expect(envUpdates.at(-1)).toMatchObject({ TASK_TYPE: "review-fix", PR_NUMBER: "31" });
+    const ticket = store.getByIssueId("issue-commented")!;
+    expect(store.getRun(ticket.run_id!)?.task_type).toBe("review-fix");
+  });
+
+  it("queues PR comment feedback while a run is active and ignores the agent's own comments", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-comment",
+      linear_issue_identifier: "OT-COMMENT",
+      linear_session_id: "session-comment",
+      sandbox_id: "sandbox-comment",
+      branch: "ot/ot-comment",
+      agent: "claude",
+      repo: "owner/repo",
+      pr_url: "https://github.com/owner/repo/pull/32",
+      state: "active",
+    });
+    store.beginRun({
+      issueId: "issue-comment",
+      runId: "run-busy",
+      taskType: "implement",
+      tokenHash: "hash",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    const githubFetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/user")) return Response.json({ login: "openthrottle-bot" });
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    });
+    vi.stubGlobal("fetch", githubFetch);
+    const linearFetch = vi.fn(async () =>
+      Response.json({
+        data: { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
+      })
+    ) as unknown as typeof fetch;
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg,
+      store,
+      daytona: {} as Daytona,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
+      runBackground: (task) => background.push(task),
+    });
+    const commentEvent = (id: number, login: string, body: string) =>
+      JSON.stringify({
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 32, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/32" } },
+        comment: {
+          id,
+          body,
+          html_url: `https://github.com/owner/repo/pull/32#issuecomment-${id}`,
+          user: { login },
+        },
+      });
+
+    const human = commentEvent(901, "human-dev", "Can we also cover the empty-cart case?");
+    await app.request("/webhooks/github", {
+      method: "POST",
+      headers: signedGithub(human, "github-pr-comment", "issue_comment"),
+      body: human,
+    });
+    const own = commentEvent(902, "openthrottle-bot", "Review verdict: merge-ready.");
+    await app.request("/webhooks/github", {
+      method: "POST",
+      headers: signedGithub(own, "github-own-comment", "issue_comment"),
+      body: own,
+    });
+    await Promise.all(background.splice(0));
+
+    const queued = store.claimNextSessionWork("session-comment", new Date().toISOString());
+    expect(queued).toMatchObject({ id: "gh-comment-901", source: "automatic" });
+    expect(queued?.body).toContain("empty-cart");
+    expect(queued?.body).toContain("https://github.com/owner/repo/pull/32#issuecomment-901");
+    expect(store.claimNextSessionWork("session-comment", new Date().toISOString())).toBeUndefined();
+  });
 });

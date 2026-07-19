@@ -80,9 +80,25 @@ export interface GithubCheckSuiteEvent extends GithubEventBase {
   };
 }
 
+export interface GithubIssueCommentEvent extends GithubEventBase {
+  kind: "issue_comment";
+  action: string;
+  issue: {
+    number: number;
+    pull_request?: { url?: string };
+  };
+  comment: {
+    id: number;
+    body?: string;
+    html_url: string;
+    user?: { login: string };
+  };
+}
+
 export type GithubWebhookEvent =
   | GithubPullRequestEvent
   | GithubReviewEvent
+  | GithubIssueCommentEvent
   | GithubWorkflowRunEvent
   | GithubCheckSuiteEvent;
 
@@ -132,7 +148,11 @@ function validatePullRequest(payload: Record<string, unknown>): void {
 export function parseGithubWebhook(eventName: string | undefined, raw: string): GithubWebhookEvent {
   const payload = parseObject(raw);
   if (!eventName) throw new Error("Missing X-GitHub-Event header");
-  if (!["pull_request", "pull_request_review", "workflow_run", "check_suite"].includes(eventName)) {
+  if (
+    !["pull_request", "pull_request_review", "issue_comment", "workflow_run", "check_suite"].includes(
+      eventName
+    )
+  ) {
     throw new Error(`Unsupported GitHub event: ${eventName}`);
   }
   if (typeof payload.action !== "string") throw new Error("GitHub webhook is missing action");
@@ -145,6 +165,11 @@ export function parseGithubWebhook(eventName: string | undefined, raw: string): 
     numberField(review, "id");
     stringField(review, "state");
     stringField(review, "html_url");
+  } else if (eventName === "issue_comment") {
+    numberField(recordField(payload, "issue"), "number");
+    const comment = recordField(payload, "comment");
+    numberField(comment, "id");
+    stringField(comment, "html_url");
   } else if (eventName === "workflow_run") {
     const run = recordField(payload, "workflow_run");
     numberField(run, "id");
@@ -226,9 +251,15 @@ export interface RepositoryReadiness {
 const OPENTHROTTLE_WEBHOOK_EVENTS = [
   "pull_request",
   "pull_request_review",
+  "issue_comment",
   "workflow_run",
   "check_suite",
 ];
+
+export async function getAuthenticatedLogin(client: GithubClient): Promise<string> {
+  const user = await githubRequest<{ login: string }>(client, "/user");
+  return user.login;
+}
 
 export async function prepareRepository(
   client: GithubClient,
