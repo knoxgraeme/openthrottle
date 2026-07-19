@@ -161,6 +161,8 @@ Required unless noted:
 - Linear: `LINEAR_WEBHOOK_SECRET`, `LINEAR_CLIENT_ID`,
   `LINEAR_CLIENT_SECRET`.
 - GitHub: `GITHUB_WEBHOOK_SECRET`, `GITHUB_TOKEN`, `GITHUB_REPO`; optional
+  `GITHUB_REPO_LABEL_MAPPINGS` JSON maps Linear repo label names or suffixes
+  to `owner/name`, and takes precedence when a matching repo label is present.
   `GITHUB_REPO_MAPPINGS` JSON maps Linear team id/key to `owner/name` as a
   legacy fallback. The token also needs webhook-administration permission for
   per-repository onboarding.

@@ -30,10 +30,12 @@ import {
 } from "./github.js";
 import {
   createForTicket,
+  deleteSandbox,
   findSandboxForTicket,
   getSandboxLogs,
   getSignedPreviewUrl,
   startTask,
+  stopSandbox,
   type SandboxEnvContract,
 } from "./daytona.js";
 import { reconcileSandboxAutostop } from "./sandbox-lifecycle.js";
@@ -170,11 +172,24 @@ function branchFor(issueIdentifier: string): string {
   return `ot/${issueIdentifier.toLowerCase()}`;
 }
 
+function repoLabelKeys(label: string): string[] {
+  const trimmed = label.trim();
+  const withoutPrefix = trimmed.replace(/^Repo\s*(?:›|>|:|\/)\s*/i, "").trim();
+  return [...new Set([trimmed, withoutPrefix].filter(Boolean))];
+}
+
 function repositoryFor(
   cfg: Config,
   store: TicketStore,
-  issue: { team?: { id?: string; key?: string } }
+  issue: { team?: { id?: string; key?: string } },
+  labels: string[] = []
 ): { repo: string; baseBranch: string } | undefined {
+  for (const label of labels) {
+    for (const key of repoLabelKeys(label)) {
+      const byLabel = cfg.githubRepoLabelMappings[key];
+      if (byLabel) return { repo: byLabel, baseBranch: cfg.baseBranch };
+    }
+  }
   const registered = store.getRepositoryRegistration(issue.team?.id, issue.team?.key);
   if (registered) {
     return { repo: registered.github_repo, baseBranch: registered.base_branch };
@@ -895,6 +910,7 @@ async function handleCreated(
   const labels = extractLabelNames(payload);
   const existing = store.getByIssueId(issue.id);
   const selectedAgent = pickAgent(labels, existing?.agent ?? cfg.defaultAgent);
+  const selectedRepository = repositoryFor(cfg, store, issue, labels);
   if (!hasAgentSubscription(cfg, selectedAgent)) {
     await tryPostError(
       linear,
@@ -907,38 +923,7 @@ async function handleCreated(
     payload,
     `# ${issue.identifier}\n\nNo Linear prompt context was supplied for this delegation.`
   );
-  if (existing?.sandbox_id && existing.state !== "closed" && existing.state !== "expired") {
-    const agentChanged = existing.agent !== selectedAgent;
-    store.upsert({
-      ...existing,
-      linear_session_id: sessionId,
-      agent: selectedAgent,
-      state: "active",
-    });
-    store.setLinearContext(issue.id, initialContext);
-    const current = store.getByIssueId(issue.id)!;
-    await launchExistingTask({
-      cfg,
-      store,
-      daytona,
-      linear,
-      ticket: current,
-      taskType: labels.includes("investigate")
-        ? "investigate"
-        : agentChanged
-          ? "implement"
-          : "resume",
-      resumeMessage: agentChanged
-        ? undefined
-        : "This ticket was re-delegated. Re-read it and continue from the existing branch.",
-      linearContext: initialContext,
-    });
-    return;
-  }
-
-  const taskType: TaskType = labels.includes("investigate") ? "investigate" : "implement";
-  const repository = repositoryFor(cfg, store, issue);
-  if (!repository) {
+  if (!selectedRepository) {
     await tryPostError(
       linear,
       sessionId,
@@ -946,6 +931,60 @@ async function handleCreated(
     );
     return;
   }
+  if (existing?.sandbox_id && existing.state !== "closed" && existing.state !== "expired") {
+    const agentChanged = existing.agent !== selectedAgent;
+    const repoChanged =
+      existing.repo !== selectedRepository.repo ||
+      existing.base_branch !== selectedRepository.baseBranch;
+    if (repoChanged) {
+      if (existing.run_id) {
+        store.finishRun({
+          runId: existing.run_id,
+          status: "stopped",
+          failureTail: `Repository route changed from ${existing.repo} to ${selectedRepository.repo}; starting a fresh workspace.`,
+          ticketState: "active",
+        });
+      }
+      try {
+        await stopSandbox(daytona, existing.sandbox_id);
+        await deleteSandbox(daytona, existing.sandbox_id);
+      } catch (error) {
+        const message = sanitizeText(
+          `OpenThrottle resolved this ticket to ${selectedRepository.repo}, but could not delete the existing ${existing.repo} workspace: ${String(error)}`
+        );
+        await tryPostError(linear, sessionId, message);
+        return;
+      }
+    } else {
+      store.upsert({
+        ...existing,
+        linear_session_id: sessionId,
+        agent: selectedAgent,
+        state: "active",
+      });
+      store.setLinearContext(issue.id, initialContext);
+      const current = store.getByIssueId(issue.id)!;
+      await launchExistingTask({
+        cfg,
+        store,
+        daytona,
+        linear,
+        ticket: current,
+        taskType: labels.includes("investigate")
+          ? "investigate"
+          : agentChanged
+            ? "implement"
+            : "resume",
+        resumeMessage: agentChanged
+          ? undefined
+          : "This ticket was re-delegated. Re-read it and continue from the existing branch.",
+        linearContext: initialContext,
+      });
+      return;
+    }
+  }
+
+  const taskType: TaskType = labels.includes("investigate") ? "investigate" : "implement";
   const ticketCore = {
     linear_issue_id: issue.id,
     linear_issue_identifier: issue.identifier,
@@ -953,8 +992,8 @@ async function handleCreated(
     sandbox_id: null,
     branch: branchFor(issue.identifier),
     agent: selectedAgent,
-    repo: repository.repo,
-    base_branch: repository.baseBranch,
+    repo: selectedRepository.repo,
+    base_branch: selectedRepository.baseBranch,
     pr_url: null,
     state: "active" as const,
   };
