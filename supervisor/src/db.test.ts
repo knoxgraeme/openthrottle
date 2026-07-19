@@ -133,6 +133,52 @@ describe("TicketStore", () => {
     expect(store.getSetting("key")).toBe("value");
   });
 
+  it("tracks session generations and enforces immutable ordered outbox rows", () => {
+    const store = makeStore();
+    const firstSession = store.getCurrentSession("issue-1");
+    expect(firstSession).toMatchObject({
+      id: "session-1",
+      generation: 1,
+      state: "current",
+    });
+
+    store.upsert({
+      ...store.getByIssueId("issue-1")!,
+      linear_session_id: "session-2",
+    });
+    expect(store.getSession("session-1")?.state).toBe("superseded");
+    expect(store.getCurrentSession("issue-1")).toMatchObject({
+      id: "session-2",
+      generation: 2,
+      state: "current",
+    });
+
+    const first = store.enqueueLinearOutbox({
+      id: "11111111-1111-4111-8111-111111111111",
+      linearSessionId: "session-2",
+      issueId: "issue-1",
+      kind: "activity",
+      payload: JSON.stringify({ type: "activity", activity: { sessionId: "session-2", type: "response", body: "done" } }),
+    });
+    const second = store.enqueueLinearOutbox({
+      linearSessionId: "session-2",
+      issueId: "issue-1",
+      kind: "session_update",
+      payload: JSON.stringify({ type: "session_update", sessionId: "session-2" }),
+    });
+    expect(first.sequence).toBe(1);
+    expect(second.sequence).toBe(2);
+    expect(() =>
+      store.enqueueLinearOutbox({
+        id: "11111111-1111-4111-8111-111111111111",
+        linearSessionId: "session-2",
+        issueId: "issue-1",
+        kind: "activity",
+        payload: JSON.stringify({ type: "activity", activity: { sessionId: "session-2", type: "response", body: "changed" } }),
+      })
+    ).toThrow(/different intent/);
+  });
+
   it("finds expired running work", () => {
     const store = makeStore();
     store.beginRun({

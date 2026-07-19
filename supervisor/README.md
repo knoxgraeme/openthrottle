@@ -4,8 +4,10 @@ The Node 22 control plane receives authenticated Linear/GitHub events, stores
 them in a durable leased/retrying SQLite inbox, controls Daytona ticket
 sandboxes, mirrors review/CI activity, and sweeps stale resources. Linear
 OAuth refresh is shared across webhook and sweep paths, and outbound
-Linear/GitHub calls have 15-second deadlines. A short-interval worker reads
-agent activities and completion markers from active Daytona sandboxes.
+Linear/GitHub calls have 15-second deadlines. Linear activities and session
+updates are persisted to a SQLite outbox before delivery, with per-session
+ordering and retry. A short-interval worker reads agent activities and
+completion markers from active Daytona sandboxes.
 Completion polling also persists a bounded sanitized task-log tail so operator
 debugging survives sandbox deletion without posting raw logs to Linear or PRs.
 
@@ -87,7 +89,8 @@ is rejected instead of being sent to the global fallback repository.
 install token. Preview links and legacy callbacks carry scoped random credentials.
 The logs endpoint prefers live Daytona output and falls back to the latest
 private run tail stored in SQLite.
-Stopping a ticket returns an error and preserves its active state if Daytona
-cannot confirm the stop; PR-close cleanup is best-effort and still closes the
-terminal ticket while recording cleanup failures.
+Stopping a ticket records the run/session as stopped and enqueues the terminal
+Linear response before Daytona cleanup; cleanup failure is logged for retry and
+does not resurrect the run. PR-close cleanup is best-effort and still closes
+the terminal ticket while recording cleanup failures.
 Full endpoint and database contracts are in [docs/SPEC.md](../docs/SPEC.md).

@@ -36,12 +36,16 @@ The corresponding OpenThrottle skill is a thin product adapter over native CE:
   shipped and divergent decisions returned as needs-human residuals.
 
 Fly owns run serialization, webhook retries, follow-up scheduling, and Linear
-publication. CE owns agent reasoning and code/PR work within the run.
+publication. Sandbox events are session-bound by the supervisor run record
+before they enter the Linear outbox, so a late event from an older delegated
+session cannot be redirected into a newer Linear conversation. CE owns agent
+reasoning and code/PR work within the run.
 
 `~/.ot` holds ticket context, task/dev logs, the agent session ID, normalized
 run result, and a structured outbox. `ot-activity` writes progress into that
 outbox. The exit trap writes exit code, Claude cost, PR URL, and sanitized
-failure tail as a completion marker. Fly reads both through the Daytona SDK.
+final assistant output/failure tail as a completion marker. Fly reads both
+through the Daytona SDK.
 At completion Fly also reads, sanitizes, and persists only the last 100,000
 characters of `task.log` in its private SQLite database. Live logs are served
 while the workspace exists and this durable tail is the fallback after cleanup;

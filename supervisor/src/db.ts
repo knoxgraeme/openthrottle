@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
@@ -29,6 +30,8 @@ CREATE INDEX IF NOT EXISTS tickets_sandbox_idx ON tickets(sandbox_id);
 CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY,
   linear_issue_id TEXT NOT NULL,
+  linear_session_id TEXT,
+  session_generation INTEGER,
   task_type TEXT NOT NULL,
   token_hash TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'running',
@@ -44,6 +47,67 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS runs_ticket_idx ON runs(linear_issue_id, started_at);
 CREATE INDEX IF NOT EXISTS runs_expiry_idx ON runs(status, expires_at);
+
+CREATE TABLE IF NOT EXISTS agent_sessions (
+  id TEXT PRIMARY KEY,
+  linear_issue_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  state TEXT NOT NULL DEFAULT 'current',
+  provider_conversation_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  superseded_at TEXT,
+  UNIQUE(linear_issue_id, generation),
+  FOREIGN KEY(linear_issue_id) REFERENCES tickets(linear_issue_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS agent_sessions_current_issue_idx
+  ON agent_sessions(linear_issue_id)
+  WHERE state = 'current';
+CREATE INDEX IF NOT EXISTS agent_sessions_issue_generation_idx
+  ON agent_sessions(linear_issue_id, generation);
+
+CREATE TABLE IF NOT EXISTS session_work (
+  id TEXT PRIMARY KEY,
+  linear_session_id TEXT NOT NULL,
+  linear_issue_id TEXT NOT NULL,
+  source TEXT NOT NULL,
+  priority INTEGER NOT NULL,
+  body TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  claimed_run_id TEXT,
+  available_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  consumed_at TEXT,
+  canceled_at TEXT,
+  UNIQUE(linear_session_id, source, id),
+  FOREIGN KEY(linear_session_id) REFERENCES agent_sessions(id),
+  FOREIGN KEY(linear_issue_id) REFERENCES tickets(linear_issue_id)
+);
+CREATE INDEX IF NOT EXISTS session_work_claim_idx
+  ON session_work(linear_session_id, status, priority, created_at);
+
+CREATE TABLE IF NOT EXISTS linear_outbox (
+  id TEXT PRIMARY KEY,
+  linear_session_id TEXT,
+  linear_issue_id TEXT,
+  run_id TEXT,
+  sequence INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT NOT NULL,
+  processed_at TEXT,
+  last_error TEXT,
+  created_at TEXT NOT NULL,
+  UNIQUE(linear_session_id, sequence),
+  FOREIGN KEY(run_id) REFERENCES runs(id)
+);
+CREATE INDEX IF NOT EXISTS linear_outbox_process_idx
+  ON linear_outbox(status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS linear_outbox_session_order_idx
+  ON linear_outbox(linear_session_id, sequence);
 
 CREATE TABLE IF NOT EXISTS sandbox_events (
   event_id TEXT PRIMARY KEY,
@@ -107,6 +171,8 @@ const TICKET_MIGRATIONS: Array<[string, string]> = [
 ];
 
 const RUN_MIGRATIONS: Array<[string, string]> = [
+  ["linear_session_id", "ALTER TABLE runs ADD COLUMN linear_session_id TEXT"],
+  ["session_generation", "ALTER TABLE runs ADD COLUMN session_generation INTEGER"],
   ["log_tail", "ALTER TABLE runs ADD COLUMN log_tail TEXT"],
 ];
 
@@ -164,6 +230,8 @@ export interface Ticket {
 export interface Run {
   id: string;
   linear_issue_id: string;
+  linear_session_id: string | null;
+  session_generation: number | null;
   task_type: TaskType;
   token_hash: string;
   status: RunStatus;
@@ -250,6 +318,49 @@ export interface SandboxEventRecord {
   created_at: string;
 }
 
+export interface AgentSession {
+  id: string;
+  linear_issue_id: string;
+  generation: number;
+  state: "current" | "stopping" | "stopped" | "superseded";
+  provider_conversation_id: string | null;
+  created_at: string;
+  updated_at: string;
+  superseded_at: string | null;
+}
+
+export interface LinearOutboxRecord {
+  id: string;
+  linear_session_id: string | null;
+  linear_issue_id: string | null;
+  run_id: string | null;
+  sequence: number;
+  kind: "activity" | "session_update";
+  payload: string;
+  payload_hash: string;
+  status: "pending" | "processing" | "failed" | "processed" | "dead";
+  attempts: number;
+  next_attempt_at: string;
+  processed_at: string | null;
+  last_error: string | null;
+  created_at: string;
+}
+
+export interface SessionWork {
+  id: string;
+  linear_session_id: string;
+  linear_issue_id: string;
+  source: "human" | "automatic";
+  priority: number;
+  body: string;
+  status: "pending" | "claimed" | "consumed" | "canceled";
+  claimed_run_id: string | null;
+  available_at: string;
+  created_at: string;
+  consumed_at: string | null;
+  canceled_at: string | null;
+}
+
 export interface FinishRunParams {
   runId: string;
   status: Exclude<RunStatus, "running">;
@@ -274,6 +385,7 @@ export function openDb(path: string): Database.Database {
   db.exec(
     "CREATE INDEX IF NOT EXISTS tickets_repo_branch_idx ON tickets(repo, branch);" +
       "CREATE INDEX IF NOT EXISTS tickets_sandbox_idx ON tickets(sandbox_id);" +
+      "CREATE INDEX IF NOT EXISTS runs_session_idx ON runs(linear_session_id, session_generation);" +
       "CREATE INDEX IF NOT EXISTS webhook_deliveries_process_idx ON webhook_deliveries(status, next_attempt_at);"
   );
   return db;
@@ -294,6 +406,35 @@ export interface TicketStore {
   listActive(): Ticket[];
   listRunning(): Ticket[];
   listAll(): Ticket[];
+  getCurrentSession(issueId: string): AgentSession | undefined;
+  getSession(sessionId: string): AgentSession | undefined;
+  supersedeCurrentSession(issueId: string, newSessionId: string): AgentSession;
+  markSessionState(sessionId: string, state: AgentSession["state"]): void;
+  enqueueSessionWork(params: {
+    id: string;
+    linearSessionId: string;
+    issueId: string;
+    source: "human" | "automatic";
+    body: string;
+    priority?: number;
+  }): boolean;
+  claimNextSessionWork(linearSessionId: string, nowIso: string): SessionWork | undefined;
+  markSessionWorkConsumed(workId: string, runId: string): void;
+  releaseSessionWork(workId: string): void;
+  cancelPendingSessionWork(linearSessionId: string): number;
+  enqueueLinearOutbox(params: {
+    id?: string;
+    linearSessionId?: string | null;
+    issueId?: string | null;
+    runId?: string | null;
+    kind: LinearOutboxRecord["kind"];
+    payload: string;
+  }): LinearOutboxRecord;
+  claimLinearOutbox(nowIso: string, leaseUntilIso: string, limit: number): LinearOutboxRecord[];
+  markLinearOutboxProcessed(id: string): void;
+  markLinearOutboxFailed(id: string, error: string, retryAt: string | null): void;
+  getLinearOutbox(id: string): LinearOutboxRecord | undefined;
+  listLinearOutbox(): LinearOutboxRecord[];
   registerRepository(input: RepositoryRegistrationInput): RepositoryRegistration;
   getRepositoryRegistration(teamId?: string, teamKey?: string): RepositoryRegistration | undefined;
   hasRepositoryRegistrations(): boolean;
@@ -339,6 +480,7 @@ export interface TicketStore {
 
 export function createTicketStore(db: Database.Database): TicketStore {
   const now = () => new Date().toISOString();
+  const hashPayload = (payload: string) => createHash("sha256").update(payload).digest("hex");
   const upsertStmt = db.prepare(`
     INSERT INTO tickets (
       linear_issue_id, linear_issue_identifier, linear_session_id,
@@ -410,6 +552,55 @@ export function createTicketStore(db: Database.Database): TicketStore {
       snapshot = excluded.snapshot,
       updated_at = excluded.updated_at
   `);
+  const getCurrentSessionStmt = db.prepare(
+    "SELECT * FROM agent_sessions WHERE linear_issue_id = ? AND state = 'current'"
+  );
+  const getSessionStmt = db.prepare("SELECT * FROM agent_sessions WHERE id = ?");
+  const maxSessionGenerationStmt = db.prepare(
+    "SELECT COALESCE(MAX(generation), 0) AS generation FROM agent_sessions WHERE linear_issue_id = ?"
+  );
+  const insertSessionStmt = db.prepare(`
+    INSERT OR IGNORE INTO agent_sessions (
+      id, linear_issue_id, generation, state, created_at, updated_at
+    ) VALUES (?, ?, ?, 'current', ?, ?)
+  `);
+  const supersedeSessionStmt = db.prepare(`
+    UPDATE agent_sessions
+    SET state = 'superseded', superseded_at = ?, updated_at = ?
+    WHERE linear_issue_id = ? AND state = 'current' AND id <> ?
+  `);
+  const markSessionStateStmt = db.prepare(
+    "UPDATE agent_sessions SET state = ?, updated_at = ? WHERE id = ?"
+  );
+  const insertSessionWorkStmt = db.prepare(`
+    INSERT OR IGNORE INTO session_work (
+      id, linear_session_id, linear_issue_id, source, priority, body,
+      status, available_at, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+  `);
+  const cancelPendingSessionWorkStmt = db.prepare(`
+    UPDATE session_work
+    SET status = 'canceled', canceled_at = ?
+    WHERE linear_session_id = ? AND status = 'pending'
+  `);
+  const getSessionWorkStmt = db.prepare("SELECT * FROM session_work WHERE id = ?");
+  const nextSessionWorkStmt = db.prepare(`
+    SELECT * FROM session_work
+    WHERE linear_session_id = ? AND status = 'pending' AND available_at <= ?
+    ORDER BY priority ASC, created_at ASC, id ASC
+    LIMIT 1
+  `);
+  const nextOutboxSequenceStmt = db.prepare(
+    "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM linear_outbox WHERE linear_session_id IS ?"
+  );
+  const insertLinearOutboxStmt = db.prepare(`
+    INSERT INTO linear_outbox (
+      id, linear_session_id, linear_issue_id, run_id, sequence, kind,
+      payload, payload_hash, status, attempts, next_attempt_at, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+  `);
+  const getLinearOutboxStmt = db.prepare("SELECT * FROM linear_outbox WHERE id = ?");
+  const listLinearOutboxStmt = db.prepare("SELECT * FROM linear_outbox ORDER BY created_at, sequence");
   const claimDeliveryStmt = db.prepare(`
     INSERT OR IGNORE INTO webhook_deliveries (
       delivery_id, source, session_id, action, activity_id, event_name,
@@ -517,6 +708,8 @@ export function createTicketStore(db: Database.Database): TicketStore {
       expiresAt: string;
     }): boolean => {
       const startedAt = now();
+      const ticket = getByIssueIdStmt.get(params.issueId) as Ticket | undefined;
+      const currentSession = getCurrentSessionStmt.get(params.issueId) as AgentSession | undefined;
       const update = db
         .prepare(`
           UPDATE tickets
@@ -527,11 +720,14 @@ export function createTicketStore(db: Database.Database): TicketStore {
       if (update.changes !== 1) return false;
       db.prepare(`
         INSERT INTO runs (
-          id, linear_issue_id, task_type, token_hash, status, started_at, expires_at
-        ) VALUES (?, ?, ?, ?, 'running', ?, ?)
+          id, linear_issue_id, linear_session_id, session_generation,
+          task_type, token_hash, status, started_at, expires_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?)
       `).run(
         params.runId,
         params.issueId,
+        currentSession?.id ?? ticket?.linear_session_id ?? null,
+        currentSession?.generation ?? null,
         params.taskType,
         params.tokenHash,
         startedAt,
@@ -587,6 +783,68 @@ export function createTicketStore(db: Database.Database): TicketStore {
     return getRunStmt.get(params.runId) as Run;
   });
 
+  const supersedeCurrentSessionTransaction = db.transaction(
+    (issueId: string, newSessionId: string): AgentSession => {
+      const timestamp = now();
+      const existing = getSessionStmt.get(newSessionId) as AgentSession | undefined;
+      if (existing) {
+        supersedeSessionStmt.run(timestamp, timestamp, issueId, newSessionId);
+        markSessionStateStmt.run("current", timestamp, newSessionId);
+        return getSessionStmt.get(newSessionId) as AgentSession;
+      }
+      const generation =
+        ((maxSessionGenerationStmt.get(issueId) as { generation: number } | undefined)
+          ?.generation ?? 0) + 1;
+      supersedeSessionStmt.run(timestamp, timestamp, issueId, newSessionId);
+      insertSessionStmt.run(newSessionId, issueId, generation, timestamp, timestamp);
+      return getSessionStmt.get(newSessionId) as AgentSession;
+    }
+  );
+
+  const enqueueLinearOutboxTransaction = db.transaction(
+    (params: {
+      id?: string;
+      linearSessionId?: string | null;
+      issueId?: string | null;
+      runId?: string | null;
+      kind: LinearOutboxRecord["kind"];
+      payload: string;
+    }): LinearOutboxRecord => {
+      const timestamp = now();
+      const id = params.id ?? randomUUID();
+      const existing = getLinearOutboxStmt.get(id) as LinearOutboxRecord | undefined;
+      const payloadHash = hashPayload(params.payload);
+      if (existing) {
+        if (
+          existing.linear_session_id !== (params.linearSessionId ?? null) ||
+          existing.linear_issue_id !== (params.issueId ?? null) ||
+          existing.run_id !== (params.runId ?? null) ||
+          existing.kind !== params.kind ||
+          existing.payload_hash !== payloadHash
+        ) {
+          throw new Error(`linear outbox id ${id} already exists with different intent`);
+        }
+        return existing;
+      }
+      const sequence = (nextOutboxSequenceStmt.get(params.linearSessionId ?? null) as {
+        sequence: number;
+      }).sequence;
+      insertLinearOutboxStmt.run(
+        id,
+        params.linearSessionId ?? null,
+        params.issueId ?? null,
+        params.runId ?? null,
+        sequence,
+        params.kind,
+        params.payload,
+        payloadHash,
+        timestamp,
+        timestamp
+      );
+      return getLinearOutboxStmt.get(id) as LinearOutboxRecord;
+    }
+  );
+
   const claimSandboxEventTransaction = db.transaction(
     (eventId: string, nowIso: string, leaseUntilIso: string): SandboxEventRecord | undefined => {
       const updated = db.prepare(`
@@ -606,12 +864,15 @@ export function createTicketStore(db: Database.Database): TicketStore {
     db,
     upsert(ticket) {
       const existing = getByIssueIdStmt.get(ticket.linear_issue_id) as Ticket | undefined;
-      upsertStmt.run({
+      db.transaction(() => {
+        upsertStmt.run({
         ...ticket,
         base_branch: ticket.base_branch ?? existing?.base_branch ?? "main",
         created_at: existing?.created_at ?? now(),
         updated_at: now(),
-      });
+        });
+        supersedeCurrentSessionTransaction(ticket.linear_issue_id, ticket.linear_session_id);
+      })();
     },
     getByIssueId(issueId) {
       return getByIssueIdStmt.get(issueId) as Ticket | undefined;
@@ -648,6 +909,115 @@ export function createTicketStore(db: Database.Database): TicketStore {
     },
     listAll() {
       return listAllStmt.all() as Ticket[];
+    },
+    getCurrentSession(issueId) {
+      return getCurrentSessionStmt.get(issueId) as AgentSession | undefined;
+    },
+    getSession(sessionId) {
+      return getSessionStmt.get(sessionId) as AgentSession | undefined;
+    },
+    supersedeCurrentSession(issueId, newSessionId) {
+      return supersedeCurrentSessionTransaction(issueId, newSessionId);
+    },
+    markSessionState(sessionId, state) {
+      markSessionStateStmt.run(state, now(), sessionId);
+    },
+    enqueueSessionWork(params) {
+      const timestamp = now();
+      return (
+        insertSessionWorkStmt.run(
+          params.id,
+          params.linearSessionId,
+          params.issueId,
+          params.source,
+          params.priority ?? (params.source === "human" ? 0 : 10),
+          params.body,
+          timestamp,
+          timestamp
+        ).changes === 1
+      );
+    },
+    claimNextSessionWork(linearSessionId, nowIso) {
+      const candidate = nextSessionWorkStmt.get(linearSessionId, nowIso) as SessionWork | undefined;
+      if (!candidate) return undefined;
+      const update = db.prepare(`
+        UPDATE session_work
+        SET status = 'claimed'
+        WHERE id = ? AND status = 'pending'
+      `).run(candidate.id);
+      return update.changes === 1
+        ? (getSessionWorkStmt.get(candidate.id) as SessionWork)
+        : undefined;
+    },
+    markSessionWorkConsumed(workId, runId) {
+      const timestamp = now();
+      db.prepare(`
+        UPDATE session_work
+        SET status = 'consumed', claimed_run_id = ?, consumed_at = ?
+        WHERE id = ? AND status = 'claimed'
+      `).run(runId, timestamp, workId);
+    },
+    releaseSessionWork(workId) {
+      db.prepare(`
+        UPDATE session_work
+        SET status = 'pending'
+        WHERE id = ? AND status = 'claimed'
+      `).run(workId);
+    },
+    cancelPendingSessionWork(linearSessionId) {
+      return cancelPendingSessionWorkStmt.run(now(), linearSessionId).changes;
+    },
+    enqueueLinearOutbox(params) {
+      return enqueueLinearOutboxTransaction(params);
+    },
+    claimLinearOutbox(nowIso, leaseUntilIso, limit) {
+      const rows = db.prepare(`
+        SELECT * FROM linear_outbox candidate
+        WHERE ((candidate.status IN ('pending', 'failed') AND candidate.next_attempt_at <= ?)
+          OR (candidate.status = 'processing' AND candidate.next_attempt_at <= ?))
+          AND NOT EXISTS (
+            SELECT 1 FROM linear_outbox earlier
+            WHERE earlier.linear_session_id IS candidate.linear_session_id
+              AND earlier.sequence < candidate.sequence
+              AND earlier.status IN ('pending', 'processing', 'failed')
+          )
+        ORDER BY candidate.created_at, candidate.sequence
+        LIMIT ?
+      `).all(nowIso, nowIso, limit) as LinearOutboxRecord[];
+      const claimed: LinearOutboxRecord[] = [];
+      for (const row of rows) {
+        const update = db.prepare(`
+          UPDATE linear_outbox
+          SET status = 'processing', attempts = attempts + 1,
+              next_attempt_at = ?, last_error = NULL
+          WHERE id = ?
+            AND ((status IN ('pending', 'failed') AND next_attempt_at <= ?)
+              OR (status = 'processing' AND next_attempt_at <= ?))
+        `).run(leaseUntilIso, row.id, nowIso, nowIso);
+        if (update.changes === 1) claimed.push(getLinearOutboxStmt.get(row.id) as LinearOutboxRecord);
+      }
+      return claimed;
+    },
+    markLinearOutboxProcessed(id) {
+      const processedAt = now();
+      db.prepare(`
+        UPDATE linear_outbox
+        SET status = 'processed', processed_at = ?, next_attempt_at = ?, last_error = NULL
+        WHERE id = ?
+      `).run(processedAt, processedAt, id);
+    },
+    markLinearOutboxFailed(id, error, retryAt) {
+      db.prepare(`
+        UPDATE linear_outbox
+        SET status = ?, next_attempt_at = ?, last_error = ?
+        WHERE id = ?
+      `).run(retryAt ? "failed" : "dead", retryAt ?? now(), error, id);
+    },
+    getLinearOutbox(id) {
+      return getLinearOutboxStmt.get(id) as LinearOutboxRecord | undefined;
+    },
+    listLinearOutbox() {
+      return listLinearOutboxStmt.all() as LinearOutboxRecord[];
     },
     registerRepository(input) {
       return registerRepositoryTransaction(input);

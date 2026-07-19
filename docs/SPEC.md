@@ -19,8 +19,8 @@ One ticket has at most one active run. Tickets may run in parallel.
 ```text
 Linear AgentSessionEvent ──HMAC──> Fly supervisor ──@daytona/sdk──> sandbox
         ▲                            │    ▲                              │
-        │ app-owned activities      │    └──── activity/result outbox ──┘
-        │                            └──SQLite run/delivery/event state
+        │ app-owned activities      │    └──── sandbox activity/result spool ──┘
+        │                            └──SQLite inbox/session/run/outbox state
         └──────────────────────────────── GitHub webhooks <──── PR/CI
 ```
 
@@ -38,9 +38,11 @@ Linear AgentSessionEvent ──HMAC──> Fly supervisor ──@daytona/sdk─�
    window, durably inserts the raw payload under `Linear-Delivery`/`webhookId`,
    then returns HTTP 200. A leased worker handles it in the background with
    bounded exponential retries; duplicate deliveries reuse the stored row.
-3. It posts an ephemeral `thought`, resolves the Linear team through durable
-   repository registrations (then legacy env fallbacks), resolves agent labels, persists
-   `promptContext`, inserts the ticket, and atomically claims a run.
+3. It durably enqueues an ephemeral `thought`, resolves the Linear team through
+   durable repository registrations (then legacy env fallbacks), resolves agent
+   labels, persists `promptContext`, inserts the ticket and current
+   `agent_sessions` generation, and atomically claims a run bound to that
+   session.
 4. It creates a private Daytona sandbox from `DAYTONA_SNAPSHOT`, labeled
    `openthrottle=true` and `ticket=<identifier>`. The image entrypoint is an
    inert no-op; Fly uploads the latest Linear context and run credentials,
@@ -50,22 +52,30 @@ Linear AgentSessionEvent ──HMAC──> Fly supervisor ──@daytona/sdk─�
 
 1. A signed `action=prompted` event carries the reply in
    `agentActivity.content.body` (legacy `agentActivity.body` is tolerated).
-2. `/stop` stops the current run. Exact `/merge` uses the guarded merge path
-   when enabled. Other replies claim a run and re-execute the entrypoint in
-   the existing sandbox with `TASK_TYPE=resume`.
-3. If a run is already active, the prompt is rejected with a polite activity;
-   it is not queued.
+2. Native `signal=stop` and exact `/stop` bypass acknowledgement and prompt
+   context mutation. Stop first records the run/session as stopped, cancels
+   pending work, and enqueues one terminal response; Daytona cleanup is retried
+   independently if it fails.
+3. Exact `/merge` uses the guarded merge path when enabled. Other replies are
+   deduplicated by Linear activity ID in `session_work`, acknowledged, and then
+   claim a run in the existing sandbox when the session is idle. A busy session
+   keeps the durable work row instead of requiring the user to resend it.
 
 ### Sandbox activity and completion
 
 Each run receives a random one-time callback token; only its SHA-256 hash is
 stored in the run table. Agents use `ot-activity` to write validated semantic
 activity records locally. The entrypoint writes a completion marker with exit
-code, cost, PR URL, and sanitized failure tail. Every five seconds, Fly polls
-only active runs through the Daytona SDK, durably claims each event, posts
-activities as the OpenThrottle app, and consumes completion through the same
-finalizer used by the legacy `POST /runs/:id/complete` endpoint. If no result
-arrives by `TASK_TIMEOUT` plus grace, the sweep marks the run timed out.
+code, cost, PR URL, sanitized final assistant response, and sanitized failure
+tail. Every five seconds, Fly polls only active runs through the Daytona SDK, durably claims each event, and
+projects activities into `linear_outbox` using the run's immutable Linear
+session binding. A late event from a superseded session is consumed without
+publishing into the newer conversation. Completion uses the same finalizer as
+the legacy `POST /runs/:id/complete` endpoint and enqueues the first explicit
+terminal activity when present, otherwise the captured final assistant response,
+otherwise a generic terminal activity plus PR links through the Linear outbox.
+If no result arrives by `TASK_TIMEOUT` plus grace, the sweep marks the run
+timed out and enqueues the timeout error.
 Before finalizing an outbox completion, Fly reads a fixed-size tail of
 `~/.ot/task.log`, sanitizes it (including the one-time callback token), and
 stores at most 100,000 characters on the run row. This private operator log is
@@ -89,12 +99,14 @@ that ticket, bounding durable log storage to the latest captured run.
 ### Sweep
 
 On boot and every 30 seconds, the supervisor drains new, failed, and
-lease-expired webhook deliveries. A separate boot and 15-minute lifecycle
-sweep expires callback-less runs, expires old no-PR tickets, deletes old
-orphaned sandboxes (with a provisioning grace window), and prunes old delivery
-records. A delivery is retried at most eight times; terminal failures remain
-visible in SQLite/logs and Linear receives one final error activity when its
-session is known.
+lease-expired webhook deliveries plus pending Linear outbox rows. A separate
+boot and 15-minute lifecycle sweep expires callback-less runs, expires old
+no-PR tickets, deletes old orphaned sandboxes (with a provisioning grace
+window), and prunes old delivery records. A webhook delivery is retried at most
+eight times; terminal failures remain visible in SQLite/logs and enqueue one
+final error activity when its session is known. Linear outbox rows preserve
+per-session sequence order and keep later rows pending behind a failed earlier
+row until retry/redrive.
 
 ## Supervisor contract
 
@@ -117,7 +129,8 @@ session is known.
 
 Linear OAuth uses `actor=app`, scopes
 `read,write,app:assignable,app:mentionable`, Bearer GraphQL auth, 24-hour
-access tokens, and persisted refresh tokens. `agentActivityCreate` uses
+access tokens, and persisted refresh tokens. `agentActivityCreate` uses an
+outbox-supplied UUID when available and
 `content: {type, body}` or exact action fields `{type,action,parameter,result}`.
 `agentSessionUpdate` passes the session as the mutation `id` and link arrays
 inside `input`.
@@ -128,14 +141,20 @@ Daytona uses `@daytona/sdk` `0.199.x`. Run env is updated with
 
 ### Persistence
 
-`tickets` stores identity/routing (including the resolved base branch), sandbox/PR, state, current run guard,
-aggregate cost, last error, preview-token hash, and latest Linear prompt
-context. `runs` stores immutable
-run identity plus task, hashed callback token, deadline, result, cost, PR and
-failure tail. `webhook_deliveries` is a durable inbox containing the validated
-payload, lease/retry state, attempt count, processing result, and sanitized
-last error. `sandbox_events` stores idempotency/retry state for validated
-outbox records without persisting the raw one-time token. `settings` stores
+`tickets` stores identity/routing (including the resolved base branch),
+sandbox/PR, state, current run guard, aggregate cost, last error,
+preview-token hash, and latest Linear prompt context. `agent_sessions` stores
+each immutable Linear AgentSession generation and marks the one current
+generation per issue. `session_work` stores deduplicated human/automatic work
+by source id and priority. `runs` stores immutable run identity plus the
+originating Linear session/generation, task, hashed callback token, deadline,
+result, cost, PR and failure tail. `webhook_deliveries` is a durable inbox
+containing the validated payload, lease/retry state, attempt count, processing
+result, and sanitized last error. `sandbox_events` stores idempotency/retry
+state for validated sandbox records without persisting the raw one-time token.
+`linear_outbox` stores all Linear activity/session-update mutations before
+delivery, including UUID id, immutable payload hash, target session,
+per-session sequence, retry state, and sanitized last error. `settings` stores
 OAuth tokens and small supervisor settings.
 `repository_registrations` durably maps one Linear team key (and optional
 stable team ID) to a canonical GitHub `owner/name`, verified base branch,

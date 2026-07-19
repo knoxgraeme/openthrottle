@@ -50,6 +50,7 @@ export interface LinearAgentSessionEventPayload {
   };
   agentActivity?: {
     id: string;
+    signal?: string;
     content?: { type?: string; body?: string };
     body?: string;
   };
@@ -99,10 +100,17 @@ export function parseLinearWebhook(raw: string): LinearAgentSessionEventPayload 
     if (!isRecord(payload.agentActivity) || typeof payload.agentActivity.id !== "string") {
       throw new Error("Prompted webhook is missing agentActivity.id");
     }
+    const signal = payload.agentActivity.signal;
+    if (signal !== undefined && typeof signal !== "string") {
+      throw new Error("Prompted webhook has invalid agentActivity.signal");
+    }
     const body = isRecord(payload.agentActivity.content)
       ? payload.agentActivity.content.body
       : payload.agentActivity.body;
-    if (typeof body !== "string" || body.trim() === "") {
+    if (
+      signal?.toLowerCase() !== "stop" &&
+      (typeof body !== "string" || body.trim() === "")
+    ) {
       throw new Error("Prompted webhook is missing agentActivity.body");
     }
   }
@@ -147,12 +155,14 @@ async function linearGraphQL<T>(
 
 export type AgentActivityInput =
   | {
+      id?: string;
       sessionId: string;
       type: "thought" | "elicitation" | "response" | "error";
       body: string;
       ephemeral?: boolean;
     }
   | {
+      id?: string;
       sessionId: string;
       type: "action";
       action: string;
@@ -186,6 +196,7 @@ export async function agentActivityCreate(
     }`,
     {
       input: {
+        ...(params.id ? { id: params.id } : {}),
         agentSessionId: params.sessionId,
         content,
         ephemeral: params.ephemeral ?? false,
