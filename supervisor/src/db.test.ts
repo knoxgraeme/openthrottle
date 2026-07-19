@@ -31,6 +31,36 @@ function makeStore() {
 }
 
 describe("TicketStore", () => {
+  it("durably registers repositories and resolves Linear team IDs before keys", () => {
+    const store = makeStore();
+    store.registerRepository({
+      linearTeamKey: "ENG",
+      linearTeamId: "team-1",
+      githubRepo: "acme/widget",
+      baseBranch: "develop",
+      webhookId: 42,
+      snapshot: "openthrottle",
+    });
+    expect(store.getRepositoryRegistration(undefined, "eng")).toMatchObject({
+      github_repo: "acme/widget",
+      base_branch: "develop",
+    });
+    expect(store.getRepositoryRegistration("team-1", "OTHER")?.linear_team_key).toBe("ENG");
+    expect(store.listRepositoryRegistrations()).toHaveLength(1);
+    expect(store.hasRepositoryRegistrations()).toBe(true);
+
+    store.registerRepository({
+      linearTeamKey: "PLATFORM",
+      linearTeamId: "team-1",
+      githubRepo: "acme/platform",
+      baseBranch: "main",
+      webhookId: 43,
+      snapshot: "openthrottle-v2",
+    });
+    expect(store.getRepositoryRegistration(undefined, "ENG")).toBeUndefined();
+    expect(store.getRepositoryRegistration("team-1")?.github_repo).toBe("acme/platform");
+  });
+
   it("serializes runs atomically and records completion/cost", () => {
     const store = makeStore();
     const first = store.beginRun({
@@ -232,5 +262,34 @@ describe("TicketStore", () => {
     db = openDb(path);
     const columns = db.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>;
     expect(columns.map((column) => column.name)).toContain("log_tail");
+  });
+
+  it("adds the per-ticket base branch to an existing tickets table", () => {
+    const dir = mkdtempSync(join(tmpdir(), "openthrottle-tickets-db-"));
+    tempDirs.push(dir);
+    const path = join(dir, "legacy-tickets.db");
+    const legacy = new Database(path);
+    legacy.exec(`
+      CREATE TABLE tickets (
+        linear_issue_id TEXT PRIMARY KEY,
+        linear_issue_identifier TEXT NOT NULL,
+        linear_session_id TEXT NOT NULL,
+        sandbox_id TEXT,
+        branch TEXT NOT NULL,
+        agent TEXT NOT NULL DEFAULT 'claude',
+        repo TEXT NOT NULL,
+        pr_url TEXT,
+        state TEXT NOT NULL DEFAULT 'active',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO tickets VALUES (
+        'issue-legacy', 'OT-LEGACY', 'session', NULL, 'ot/legacy', 'codex',
+        'owner/repo', NULL, 'active', '2026-01-01', '2026-01-01'
+      );
+    `);
+    legacy.close();
+    db = openDb(path);
+    expect(createTicketStore(db).getByIssueId("issue-legacy")?.base_branch).toBe("main");
   });
 });

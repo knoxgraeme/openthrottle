@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS tickets (
   last_error TEXT,
   preview_token_hash TEXT,
   linear_context TEXT,
+  base_branch TEXT NOT NULL DEFAULT 'main',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -79,6 +80,19 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
 CREATE INDEX IF NOT EXISTS webhook_deliveries_received_idx
   ON webhook_deliveries(received_at);
 
+CREATE TABLE IF NOT EXISTS repository_registrations (
+  linear_team_key TEXT PRIMARY KEY COLLATE NOCASE,
+  linear_team_id TEXT UNIQUE,
+  github_repo TEXT NOT NULL COLLATE NOCASE,
+  base_branch TEXT NOT NULL,
+  webhook_id INTEGER NOT NULL,
+  snapshot TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS repository_registrations_repo_idx
+  ON repository_registrations(github_repo);
+
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 `;
 
@@ -89,6 +103,7 @@ const TICKET_MIGRATIONS: Array<[string, string]> = [
   ["last_error", "ALTER TABLE tickets ADD COLUMN last_error TEXT"],
   ["preview_token_hash", "ALTER TABLE tickets ADD COLUMN preview_token_hash TEXT"],
   ["linear_context", "ALTER TABLE tickets ADD COLUMN linear_context TEXT"],
+  ["base_branch", "ALTER TABLE tickets ADD COLUMN base_branch TEXT NOT NULL DEFAULT 'main'"],
 ];
 
 const RUN_MIGRATIONS: Array<[string, string]> = [
@@ -141,6 +156,7 @@ export interface Ticket {
   last_error: string | null;
   preview_token_hash: string | null;
   linear_context: string | null;
+  base_branch: string;
   created_at: string;
   updated_at: string;
 }
@@ -172,7 +188,27 @@ export type TicketUpsert = Pick<
   | "repo"
   | "pr_url"
   | "state"
->;
+> & { base_branch?: string };
+
+export interface RepositoryRegistration {
+  linear_team_key: string;
+  linear_team_id: string | null;
+  github_repo: string;
+  base_branch: string;
+  webhook_id: number;
+  snapshot: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RepositoryRegistrationInput {
+  linearTeamKey: string;
+  linearTeamId?: string;
+  githubRepo: string;
+  baseBranch: string;
+  webhookId: number;
+  snapshot: string;
+}
 
 export interface DeliveryClaim {
   deliveryId: string;
@@ -258,6 +294,10 @@ export interface TicketStore {
   listActive(): Ticket[];
   listRunning(): Ticket[];
   listAll(): Ticket[];
+  registerRepository(input: RepositoryRegistrationInput): RepositoryRegistration;
+  getRepositoryRegistration(teamId?: string, teamKey?: string): RepositoryRegistration | undefined;
+  hasRepositoryRegistrations(): boolean;
+  listRepositoryRegistrations(): RepositoryRegistration[];
   claimDelivery(claim: DeliveryClaim): boolean;
   claimDeliveryForProcessing(params: {
     deliveryId: string;
@@ -302,10 +342,10 @@ export function createTicketStore(db: Database.Database): TicketStore {
   const upsertStmt = db.prepare(`
     INSERT INTO tickets (
       linear_issue_id, linear_issue_identifier, linear_session_id,
-      sandbox_id, branch, agent, repo, pr_url, state, created_at, updated_at
+      sandbox_id, branch, agent, repo, pr_url, state, base_branch, created_at, updated_at
     ) VALUES (
       @linear_issue_id, @linear_issue_identifier, @linear_session_id,
-      @sandbox_id, @branch, @agent, @repo, @pr_url, @state, @created_at, @updated_at
+      @sandbox_id, @branch, @agent, @repo, @pr_url, @state, @base_branch, @created_at, @updated_at
     )
     ON CONFLICT(linear_issue_id) DO UPDATE SET
       linear_issue_identifier = excluded.linear_issue_identifier,
@@ -316,6 +356,7 @@ export function createTicketStore(db: Database.Database): TicketStore {
       repo = excluded.repo,
       pr_url = excluded.pr_url,
       state = excluded.state,
+      base_branch = excluded.base_branch,
       updated_at = excluded.updated_at
   `);
   const getByIssueIdStmt = db.prepare("SELECT * FROM tickets WHERE linear_issue_id = ?");
@@ -344,6 +385,31 @@ export function createTicketStore(db: Database.Database): TicketStore {
     "SELECT * FROM tickets WHERE run_id IS NOT NULL AND running_since IS NOT NULL ORDER BY running_since"
   );
   const listAllStmt = db.prepare("SELECT * FROM tickets ORDER BY created_at DESC");
+  const getRepositoryByTeamIdStmt = db.prepare(
+    "SELECT * FROM repository_registrations WHERE linear_team_id = ?"
+  );
+  const getRepositoryByTeamKeyStmt = db.prepare(
+    "SELECT * FROM repository_registrations WHERE lower(linear_team_key) = lower(?)"
+  );
+  const listRepositoryRegistrationsStmt = db.prepare(
+    "SELECT * FROM repository_registrations ORDER BY linear_team_key"
+  );
+  const hasRepositoryRegistrationsStmt = db.prepare(
+    "SELECT 1 AS found FROM repository_registrations LIMIT 1"
+  );
+  const upsertRepositoryRegistrationStmt = db.prepare(`
+    INSERT INTO repository_registrations (
+      linear_team_key, linear_team_id, github_repo, base_branch,
+      webhook_id, snapshot, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(linear_team_key) DO UPDATE SET
+      linear_team_id = excluded.linear_team_id,
+      github_repo = excluded.github_repo,
+      base_branch = excluded.base_branch,
+      webhook_id = excluded.webhook_id,
+      snapshot = excluded.snapshot,
+      updated_at = excluded.updated_at
+  `);
   const claimDeliveryStmt = db.prepare(`
     INSERT OR IGNORE INTO webhook_deliveries (
       delivery_id, source, session_id, action, activity_id, event_name,
@@ -413,6 +479,32 @@ export function createTicketStore(db: Database.Database): TicketStore {
       `).run(params.leaseUntilIso, params.deliveryId, params.nowIso, params.nowIso);
       if (update.changes !== 1) return undefined;
       return getDeliveryStmt.get(params.deliveryId) as WebhookDelivery;
+    }
+  );
+
+  const registerRepositoryTransaction = db.transaction(
+    (input: RepositoryRegistrationInput): RepositoryRegistration => {
+      const timestamp = now();
+      const existing = getRepositoryByTeamKeyStmt.get(input.linearTeamKey) as
+        | RepositoryRegistration
+        | undefined;
+      if (input.linearTeamId) {
+        db.prepare(
+          `DELETE FROM repository_registrations
+           WHERE linear_team_id = ? AND lower(linear_team_key) <> lower(?)`
+        ).run(input.linearTeamId, input.linearTeamKey);
+      }
+      upsertRepositoryRegistrationStmt.run(
+        input.linearTeamKey,
+        input.linearTeamId ?? null,
+        input.githubRepo,
+        input.baseBranch,
+        input.webhookId,
+        input.snapshot,
+        existing?.created_at ?? timestamp,
+        timestamp
+      );
+      return getRepositoryByTeamKeyStmt.get(input.linearTeamKey) as RepositoryRegistration;
     }
   );
 
@@ -516,6 +608,7 @@ export function createTicketStore(db: Database.Database): TicketStore {
       const existing = getByIssueIdStmt.get(ticket.linear_issue_id) as Ticket | undefined;
       upsertStmt.run({
         ...ticket,
+        base_branch: ticket.base_branch ?? existing?.base_branch ?? "main",
         created_at: existing?.created_at ?? now(),
         updated_at: now(),
       });
@@ -555,6 +648,24 @@ export function createTicketStore(db: Database.Database): TicketStore {
     },
     listAll() {
       return listAllStmt.all() as Ticket[];
+    },
+    registerRepository(input) {
+      return registerRepositoryTransaction(input);
+    },
+    getRepositoryRegistration(teamId, teamKey) {
+      if (teamId) {
+        const byId = getRepositoryByTeamIdStmt.get(teamId) as RepositoryRegistration | undefined;
+        if (byId) return byId;
+      }
+      return teamKey
+        ? (getRepositoryByTeamKeyStmt.get(teamKey) as RepositoryRegistration | undefined)
+        : undefined;
+    },
+    hasRepositoryRegistrations() {
+      return Boolean(hasRepositoryRegistrationsStmt.get());
+    },
+    listRepositoryRegistrations() {
+      return listRepositoryRegistrationsStmt.all() as RepositoryRegistration[];
     },
     claimDelivery(claim) {
       const receivedAt = now();

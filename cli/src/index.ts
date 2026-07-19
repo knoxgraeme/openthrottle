@@ -2,15 +2,17 @@
 // =============================================================================
 // openthrottle CLI entrypoint — a plain argv router, no CLI framework.
 //
-// Usage: openthrottle <init|ship|status|stop|logs> [args]
+// Usage: openthrottle <setup|init|ship|status|stop|logs> [args]
 // =============================================================================
 
 const USAGE = `openthrottle — plan-first autonomous coding pipeline CLI
 
 Usage:
-  openthrottle init                Detect project, write .openthrottle.yml,
-                                    verify the canonical Daytona snapshot, and
-                                    print the supervisor secrets checklist.
+  openthrottle setup               Check one-time platform prerequisites and
+                                    print the Fly supervisor secrets checklist.
+  openthrottle init                Register the current GitHub repository and
+                                    Linear team, verify readiness, and write
+                                    .openthrottle.yml.
   openthrottle ship <file.md>      Create a Linear issue from a markdown
                                     file and delegate it to the agent.
   openthrottle status              Show ticket status from the supervisor.
@@ -25,6 +27,11 @@ async function main(): Promise<void> {
   const [, , command, ...rest] = process.argv;
 
   switch (command) {
+    case 'setup': {
+      const { default: setup } = await import('./setup.js');
+      await setup();
+      break;
+    }
     case 'init': {
       const { default: init } = await import('./init.js');
       await init();

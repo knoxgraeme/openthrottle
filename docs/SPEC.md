@@ -27,7 +27,7 @@ Linear AgentSessionEvent ──HMAC──> Fly supervisor ──@daytona/sdk─�
 - `supervisor/`: Node 22, Hono, SQLite, OAuth/webhook/lifecycle control.
 - `sandbox/`: Node 22 image, safety boundary, agent entrypoint and normalizer.
 - `skills/`: Claude skills and Codex prompt mirrors.
-- `cli/`: npm package `openthrottle` (`init`, `ship`, `status`, `stop`, `logs`).
+- `cli/`: npm package `openthrottle` (`setup`, `init`, `ship`, `status`, `stop`, `logs`).
 
 ## Event flows
 
@@ -38,7 +38,8 @@ Linear AgentSessionEvent ──HMAC──> Fly supervisor ──@daytona/sdk─�
    window, durably inserts the raw payload under `Linear-Delivery`/`webhookId`,
    then returns HTTP 200. A leased worker handles it in the background with
    bounded exponential retries; duplicate deliveries reuse the stored row.
-3. It posts an ephemeral `thought`, resolves repo and agent labels, persists
+3. It posts an ephemeral `thought`, resolves the Linear team through durable
+   repository registrations (then legacy env fallbacks), resolves agent labels, persists
    `promptContext`, inserts the ticket, and atomically claims a run.
 4. It creates a private Daytona sandbox from `DAYTONA_SNAPSHOT`, labeled
    `openthrottle=true` and `ticket=<identifier>`. The image entrypoint is an
@@ -107,6 +108,8 @@ session is known.
 | `GET` | `/oauth/install` | `OT_INSTALL_SECRET` bearer | start Linear OAuth |
 | `GET` | `/oauth/callback` | one-time OAuth state | exchange/store token |
 | `GET` | `/status` | `OT_STATUS_TOKEN` bearer | ticket list |
+| `GET` | `/repositories` | `OT_STATUS_TOKEN` bearer | registered target list |
+| `POST` | `/repositories/register` | `OT_STATUS_TOKEN` bearer | verify and upsert a target route/webhook |
 | `POST` | `/tickets/:id/stop` | `OT_STATUS_TOKEN` bearer | stop a ticket |
 | `GET` | `/tickets/:id/logs` | `OT_STATUS_TOKEN` bearer | sanitized live logs, falling back to the latest durable private run tail |
 | `GET` | `/preview/:id?token=` | per-ticket token | wake and signed redirect |
@@ -125,7 +128,7 @@ Daytona uses `@daytona/sdk` `0.199.x`. Run env is updated with
 
 ### Persistence
 
-`tickets` stores identity/routing, sandbox/PR, state, current run guard,
+`tickets` stores identity/routing (including the resolved base branch), sandbox/PR, state, current run guard,
 aggregate cost, last error, preview-token hash, and latest Linear prompt
 context. `runs` stores immutable
 run identity plus task, hashed callback token, deadline, result, cost, PR and
@@ -134,6 +137,13 @@ payload, lease/retry state, attempt count, processing result, and sanitized
 last error. `sandbox_events` stores idempotency/retry state for validated
 outbox records without persisting the raw one-time token. `settings` stores
 OAuth tokens and small supervisor settings.
+`repository_registrations` durably maps one Linear team key (and optional
+stable team ID) to a canonical GitHub `owner/name`, verified base branch,
+managed webhook ID, and verified snapshot name. Team ID lookup wins over key;
+re-registering the same team updates the route atomically.
+The global repository fallback is allowed only while no durable registrations
+exist. Once onboarding is active, an unmatched team fails closed; explicit
+legacy `GITHUB_REPO_MAPPINGS` entries remain valid during migration.
 The `runs` table also stores a bounded sanitized `log_tail` for authenticated
 operator debugging after a sandbox is deleted.
 Migrations are additive for existing v2 databases; pre-inbox delivery rows are
@@ -151,7 +161,9 @@ Required unless noted:
 - Linear: `LINEAR_WEBHOOK_SECRET`, `LINEAR_CLIENT_ID`,
   `LINEAR_CLIENT_SECRET`.
 - GitHub: `GITHUB_WEBHOOK_SECRET`, `GITHUB_TOKEN`, `GITHUB_REPO`; optional
-  `GITHUB_REPO_MAPPINGS` JSON maps Linear team id/key to `owner/name`.
+  `GITHUB_REPO_MAPPINGS` JSON maps Linear team id/key to `owner/name` as a
+  legacy fallback. The token also needs webhook-administration permission for
+  per-repository onboarding.
 - Daytona: `DAYTONA_API_KEY`, `DAYTONA_SNAPSHOT=openthrottle`.
 - Agents: `CLAUDE_CODE_OAUTH_TOKEN` for Claude subscription login and/or
   `CODEX_AUTH_JSON` for Codex subscription login; `DEFAULT_AGENT=codex`.
@@ -215,10 +227,16 @@ changed when a sandbox resumes.
 
 ## CLI contract
 
-- `openthrottle init`: detect a Node project, write `.openthrottle.yml`,
-  verify the canonical Daytona snapshot, and print the deployment checklist.
+- `openthrottle setup`: verify the canonical Daytona snapshot when local
+  credentials are available and print the one-time platform/Fly checklist.
   Snapshot creation is a one-time operator command from this repository:
   `daytona snapshot create openthrottle --dockerfile sandbox/Dockerfile --context .`.
+- `openthrottle init`: run from a target GitHub checkout; detect its origin,
+  base branch, package commands (or accept manual non-Node commands), write
+  `.openthrottle.yml`, and call the authenticated supervisor registration
+  endpoint. The supervisor verifies repository/branch access, creates or
+  refreshes its GitHub webhook, verifies the configured Daytona snapshot is
+  active, and persists the Linear-team route without a Fly restart.
 - `openthrottle ship <file.md>`: create a Linear issue and, when
   `OT_AGENT_APP_ID` is set, delegate it with `IssueUpdateInput.delegateId`.
 - `openthrottle status`: authenticated ticket table.
@@ -242,7 +260,9 @@ limits:
 mcp_servers: {}
 ```
 
-`BASE_BRANCH` is supervisor-owned and is deliberately absent.
+`BASE_BRANCH` is supervisor-owned and is deliberately absent. The effective
+base branch is captured in the durable registration and copied onto each
+ticket so later runs remain stable if the route changes.
 
 ## Security invariants
 
