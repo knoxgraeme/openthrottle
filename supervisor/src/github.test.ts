@@ -7,6 +7,7 @@ import {
   isOpenthrottleBranch,
   parseGithubWebhook,
   parsePullRequestUrl,
+  prepareRepository,
   verifyGithubSignature,
 } from "./github.js";
 
@@ -81,5 +82,76 @@ describe("GitHub contracts", () => {
     });
     expect(signals).toHaveLength(3);
     expect(signals.every((signal) => signal instanceof AbortSignal)).toBe(true);
+  });
+
+  it("verifies a repository and creates its OpenThrottle webhook", async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/repos/acme/widget")) {
+        return Response.json({ full_name: "Acme/Widget", default_branch: "trunk" });
+      }
+      if (url.endsWith("/branches/develop")) return Response.json({ name: "develop" });
+      if (url.endsWith("/hooks?per_page=100")) return Response.json([]);
+      if (url.endsWith("/hooks") && init?.method === "POST") {
+        expect(JSON.parse(String(init.body))).toEqual({
+          name: "web",
+          active: true,
+          events: ["pull_request", "pull_request_review", "workflow_run", "check_suite"],
+          config: {
+            url: "https://ot.test/webhooks/github",
+            content_type: "json",
+            secret: "webhook-secret",
+            insecure_ssl: "0",
+          },
+        });
+        return Response.json({ id: 42 });
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    }) as unknown as typeof fetch;
+
+    await expect(
+      prepareRepository(
+        { token: "github", fetch: fetchMock },
+        {
+          repo: "acme/widget",
+          requestedBaseBranch: "develop",
+          webhookUrl: "https://ot.test/webhooks/github",
+          webhookSecret: "webhook-secret",
+        }
+      )
+    ).resolves.toEqual({
+      repo: "Acme/Widget",
+      baseBranch: "develop",
+      webhookId: 42,
+      webhookAction: "created",
+    });
+  });
+
+  it("updates an existing OpenThrottle webhook", async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/repos/acme/widget")) {
+        return Response.json({ full_name: "acme/widget", default_branch: "main" });
+      }
+      if (url.endsWith("/branches/main")) return Response.json({ name: "main" });
+      if (url.endsWith("/hooks?per_page=100")) {
+        return Response.json([{ id: 7, config: { url: "https://ot.test/webhooks/github" } }]);
+      }
+      if (url.endsWith("/hooks/7") && init?.method === "PATCH") {
+        expect(JSON.parse(String(init.body))).not.toHaveProperty("name");
+        return Response.json({ id: 7 });
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    }) as unknown as typeof fetch;
+
+    const result = await prepareRepository(
+      { token: "github", fetch: fetchMock },
+      {
+        repo: "acme/widget",
+        webhookUrl: "https://ot.test/webhooks/github",
+        webhookSecret: "webhook-secret",
+      }
+    );
+    expect(result).toMatchObject({ webhookId: 7, webhookAction: "updated" });
   });
 });

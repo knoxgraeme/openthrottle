@@ -38,10 +38,10 @@ includes green CI.
 10. **One canonical snapshot build.** `daytona snapshot create openthrottle
     --dockerfile sandbox/Dockerfile` from this repo (Daytona builds it; if
     pushing a locally-built image instead, it must be `--platform
-    linux/amd64`). `openthrottle init` no longer builds snapshots — it
-    verifies the snapshot exists, writes `.openthrottle.yml`, and prints the
-    supervisor secrets to set. Drop the declarative-builder path in
-    `cli/src/init.ts`.
+    linux/amd64`). `openthrottle setup` verifies the one-time snapshot and
+    prints the platform checklist. Per-target `openthrottle init` writes
+    `.openthrottle.yml`, registers the Linear-team/repository route, creates
+    or refreshes its webhook, and asks Fly to verify snapshot readiness.
 
 ## Learnings this plan is built on (July 2026 research)
 
@@ -154,7 +154,7 @@ Goal: one trivial, real ticket flows Linear → sandbox → PR → thread-reply
 resume → merge → cleanup, with a human watching logs throughout.
 
 Steps: pick a low-stakes target repo; `openthrottle init` in it (branch
-protection ON, fine-grained PAT scoped to contents+PRs); write a genuinely
+protection ON, fine-grained PAT scoped to webhooks+contents+PRs+checks/actions); write a genuinely
 approved plan into a ticket (e.g. "add a /healthz route"); delegate; watch.
 Then reply in the thread with a small change request and verify resume uses
 the same session (check `~/.ot/agent-session-id` continuity); merge the PR

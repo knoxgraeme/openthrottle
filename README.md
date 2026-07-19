@@ -43,6 +43,9 @@ sandbox/tests/smoke.sh openthrottle:test
 # create the canonical Daytona snapshot once (requires `daytona login`)
 daytona snapshot create openthrottle --dockerfile sandbox/Dockerfile --context .
 
+# inspect the one-time platform checklist
+npx openthrottle setup
+
 # deploy the always-on supervisor
 cd supervisor
 fly volumes create openthrottle_data --region sjc --size 1
@@ -50,15 +53,23 @@ fly secrets set SUPERVISOR_URL=... OT_STATUS_TOKEN=... OT_INSTALL_SECRET=... # p
 fly deploy
 ```
 
-Then install the Linear OAuth app through authenticated `/oauth/install`, add
-the Linear and GitHub webhooks described in [supervisor/README.md](supervisor/README.md),
-and initialize a target repository:
+Then install the Linear OAuth app through authenticated `/oauth/install`.
+Run `init` from each target repository; it detects the GitHub origin, writes
+the repo-local execution config, registers the Linear-team route in Fly's
+SQLite database, creates or refreshes that repository's GitHub webhook, and
+verifies the canonical Daytona snapshot:
 
 ```bash
 npx openthrottle init
 npx openthrottle ship docs/plans/my-change.md
 npx openthrottle status
 ```
+
+`init` requires `OT_SUPERVISOR_URL` and `OT_STATUS_TOKEN`. One Linear team
+currently routes to one GitHub repository; re-running `init` updates that
+registration without restarting Fly or creating a new Daytona snapshot. Once
+the first durable route exists, delegations from unmatched teams fail closed
+instead of falling back to the wrong repository.
 
 ## Repository layout
 
