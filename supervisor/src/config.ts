@@ -101,6 +101,8 @@ export interface Config {
   githubRepo: string;
   githubRepoMappings: Record<string, string>;
   githubRepoLabelMappings: Record<string, string>;
+  gitAuthorName?: string;
+  gitAuthorEmail?: string;
 
   daytonaApiKey: string;
   daytonaSnapshot: string;
@@ -140,6 +142,8 @@ export function loadConfig(): Config {
     githubRepo: required("GITHUB_REPO"),
     githubRepoMappings: optionalRepoMap("GITHUB_REPO_MAPPINGS"),
     githubRepoLabelMappings: optionalRepoMap("GITHUB_REPO_LABEL_MAPPINGS"),
+    gitAuthorName: process.env.OT_GIT_AUTHOR_NAME,
+    gitAuthorEmail: process.env.OT_GIT_AUTHOR_EMAIL,
 
     daytonaApiKey: required("DAYTONA_API_KEY"),
     daytonaSnapshot: optional("DAYTONA_SNAPSHOT", "openthrottle"),

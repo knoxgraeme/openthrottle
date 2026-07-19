@@ -46,6 +46,25 @@ setup() {
   [ "$output" = "resume" ]
 }
 
+@test "resolve_git_identity prefers override, then GitHub noreply, then placeholder" {
+  # Explicit override email wins and keeps an explicit name.
+  run resolve_git_identity "Ada" "ada@example.com" "octocat" "583231"
+  [ "$output" = $'Ada\tada@example.com' ]
+
+  # No override: derive the account's GitHub noreply identity.
+  run resolve_git_identity "" "" "knoxgraeme" "42"
+  [ "$output" = $'knoxgraeme\t42+knoxgraeme@users.noreply.github.com' ]
+
+  # Override email with no name derives the name from the address local part
+  # (git refuses to commit with an empty author name).
+  run resolve_git_identity "" "custom@example.com" "" ""
+  [ "$output" = $'custom\tcustom@example.com' ]
+
+  # Account lookup failed and no override: placeholder of last resort.
+  run resolve_git_identity "" "" "" ""
+  [ "$output" = $'OpenThrottle Agent\tagent@openthrottle.dev' ]
+}
+
 @test "yq default does not require a config file" {
   run yq_value_or_default "/not/present" ".test" "npm test"
   [ "$status" -eq 0 ]

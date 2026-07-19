@@ -325,6 +325,8 @@ function baseSandboxEnv(
       params.ticket.agent === "claude" ? cfg.claudeCodeOauthToken : undefined,
     CODEX_AUTH_JSON: params.ticket.agent === "codex" ? cfg.codexAuthJson : undefined,
     KIMI_CODE_API_KEY: params.ticket.agent === "opencode" ? cfg.kimiCodeApiKey : undefined,
+    OT_GIT_AUTHOR_NAME: cfg.gitAuthorName,
+    OT_GIT_AUTHOR_EMAIL: cfg.gitAuthorEmail,
     MAX_TURNS: String(cfg.maxTurns),
     TASK_TIMEOUT: String(cfg.taskTimeout),
     DEV_PORT: String(cfg.devPort),

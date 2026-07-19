@@ -12,6 +12,28 @@ strip_nl() {
   printf '%s' "$value"
 }
 
+# resolve_git_identity OVERRIDE_NAME OVERRIDE_EMAIL GH_LOGIN GH_UID
+#
+# Chooses the git commit author identity, preferring an explicit override
+# email, then the GitHub account's noreply identity (so GitHub attributes
+# commits to a real account and author-gated integrations such as Vercel
+# accept the deployment), then a placeholder. Emits "<name>\t<email>".
+resolve_git_identity() {
+  local name="$1" email="$2" login="$3" uid="$4"
+  if [[ -z "$email" && -n "$login" && -n "$uid" ]]; then
+    name="${name:-$login}"
+    email="${uid}+${login}@users.noreply.github.com"
+  fi
+  if [[ -z "$email" ]]; then
+    name="${name:-OpenThrottle Agent}"
+    email="agent@openthrottle.dev"
+  fi
+  # Never emit an empty author name: git refuses to commit without one, so an
+  # override email supplied without a name derives the name from its local part.
+  name="${name:-${email%%@*}}"
+  printf '%s\t%s\n' "$name" "$email"
+}
+
 sanitize_log() {
   local text="$1"
   local name value nested

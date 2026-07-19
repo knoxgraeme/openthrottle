@@ -165,7 +165,10 @@ Required unless noted:
   to `owner/name`, and takes precedence when a matching repo label is present.
   `GITHUB_REPO_MAPPINGS` JSON maps Linear team id/key to `owner/name` as a
   legacy fallback. The token also needs webhook-administration permission for
-  per-repository onboarding.
+  per-repository onboarding. Optional `OT_GIT_AUTHOR_NAME`/`OT_GIT_AUTHOR_EMAIL`
+  override the sandbox commit author; unset, the sandbox authors commits as the
+  `GITHUB_TOKEN` account's GitHub noreply identity so downstream author-gated
+  integrations (e.g. Vercel) accept the deployment.
 - Daytona: `DAYTONA_API_KEY`, `DAYTONA_SNAPSHOT=openthrottle`.
 - Agents: `CLAUDE_CODE_OAUTH_TOKEN` for Claude subscription login and/or
   `CODEX_AUTH_JSON` for Codex subscription login; `DEFAULT_AGENT=codex`.
