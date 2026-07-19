@@ -98,8 +98,8 @@ acceptance runs instead.
 - **Priority order:** (1) sanitizers in `normalize.mjs` + `entrypoint.sh` —
   these are the wall between a prompt-injected agent and leaked tokens;
   (2) webhook signature verification (Linear HMAC, GitHub sha256) with signed
-  fixtures; (3) payload parsers (`parseLinearWebhook`,
-  `parseGithubPullRequestEvent`, `extractLabelNames`, `parseMarkdown`);
+  fixtures; (3) payload parsers (`parseLinearWebhook`, `parseGithubWebhook`,
+  `extractLabelNames`, `parseMarkdown`);
   (4) handler flows — `createServer` already takes injected deps
   (`ServerDeps`), so exercise created/prompted/pr-closed/sweep against fake
   Daytona + Linear clients, including the races Phase 2 hardens.

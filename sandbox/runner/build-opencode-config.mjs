@@ -3,7 +3,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export const OPENCODE_MODEL_PROFILES = Object.freeze({
+const OPENCODE_MODEL_PROFILES = Object.freeze({
   "kimi-code/kimi-for-coding": Object.freeze({
     providerId: "kimi-code",
     modelId: "kimi-for-coding",
