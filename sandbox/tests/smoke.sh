@@ -35,14 +35,21 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
   claude --version | rg -q "^2\.1\.201" &&
   claude --help | rg -q -- "--setting-sources" &&
   claude --help | rg -q -- "--strict-mcp-config" &&
+  test "$(git -C /opt/openthrottle/compound-engineering-marketplace rev-parse HEAD)" = "8163a96e86656a89797869ac61905fe4641f81be" &&
+  gosu agent env HOME=/home/agent claude plugin list --json | jq -e '\''.[] | select(.id == "compound-engineering@compound-engineering-plugin" and .version == "3.19.0" and .enabled == true)'\'' >/dev/null &&
+  gosu agent env HOME=/home/agent claude plugin details compound-engineering@compound-engineering-plugin | rg -q "ce-work" &&
+  test -f /home/agent/.claude/plugins/cache/compound-engineering-plugin/compound-engineering/3.19.0/skills/ce-work/SKILL.md &&
   codex --version | rg -q "0\.143\.0" &&
   codex exec --help | rg -q -- "--json" &&
   codex exec --help | rg -q -- "--dangerously-bypass-approvals-and-sandbox" &&
-  codex exec resume --help | rg -q -- "--skip-git-repo-check"
+  codex exec resume --help | rg -q -- "--skip-git-repo-check" &&
+  gosu agent env HOME=/home/agent CODEX_HOME=/home/agent/.codex codex plugin list --json | jq -e '\''.installed[] | select(.pluginId == "compound-engineering@compound-engineering-plugin" and .version == "3.19.0" and .enabled == true)'\'' >/dev/null &&
+  test -f /home/agent/.codex/plugins/cache/compound-engineering-plugin/compound-engineering/3.19.0/skills/ce-work/SKILL.md
 '
 
 cat > "$SMOKE_DIR/bin/claude" <<'STUB'
 #!/usr/bin/env sh
+test -f "$HOME/.claude/plugins/cache/compound-engineering-plugin/compound-engineering/3.19.0/skills/ce-work/SKILL.md"
 ot-activity action "smoke Claude agent started"
 printf '%s\n' "$*" >> "$HOME/.ot/claude-args.log"
 case " $* " in
@@ -57,6 +64,7 @@ STUB
 
 cat > "$SMOKE_DIR/bin/codex" <<'STUB'
 #!/usr/bin/env sh
+test -f "$HOME/.codex/plugins/cache/compound-engineering-plugin/compound-engineering/3.19.0/skills/ce-work/SKILL.md"
 ot-activity action "smoke Codex agent started"
 if [ "${1:-}" = "mcp" ]; then
   exit 0
@@ -71,6 +79,20 @@ STUB
 chmod 0755 "$SMOKE_DIR/bin/claude" "$SMOKE_DIR/bin/codex"
 
 docker network create "$NETWORK" >/dev/null
+
+seed_agent_home() {
+  local home_dir="$1"
+  chmod 0777 "$home_dir"
+  docker run --rm --entrypoint bash \
+    -v "$home_dir:/seed" \
+    "$IMAGE" -lc '
+      gosu agent cp -a /home/agent/.claude /home/agent/.codex /seed/
+      # Docker Desktop bind mounts reject the entrypoint ownership refresh
+      # for copied git packfiles. Plugin discovery does not use cache VCS data.
+      find /seed/.claude /seed/.codex -type d -name .git -prune \
+        -exec rm -rf -- {} +
+    '
+}
 
 run_sandbox() {
   local home_dir="$1"
@@ -117,6 +139,7 @@ run_sandbox() {
 }
 
 CLAUDE_HOME="$SMOKE_DIR/result/claude-home"
+seed_agent_home "$CLAUDE_HOME"
 run_sandbox "$CLAUDE_HOME" claude implement ot/smoke-claude claude-implement OT-CLAUDE
 test "$(cat "$CLAUDE_HOME/.ot/agent-session-id")" = "smoke-claude-session"
 run_sandbox "$CLAUDE_HOME" claude resume ot/smoke-claude claude-resume OT-CLAUDE "continue"
@@ -129,6 +152,7 @@ jq -e '.kind == "activity" and .type == "action"' \
   "$(find "$CLAUDE_HOME/.ot/outbox" -name '*-activity-*.json' -print -quit)" >/dev/null
 
 CODEX_HOME="$SMOKE_DIR/result/codex-home"
+seed_agent_home "$CODEX_HOME"
 run_sandbox "$CODEX_HOME" codex implement ot/smoke-codex codex-implement OT-CODEX
 test "$(cat "$CODEX_HOME/.ot/agent-session-id")" = "smoke-codex-thread"
 run_sandbox "$CODEX_HOME" codex resume ot/smoke-codex codex-resume OT-CODEX "continue"

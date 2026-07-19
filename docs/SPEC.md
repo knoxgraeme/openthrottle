@@ -172,16 +172,19 @@ and webhook/install/operator secrets never enter the sandbox.
 4. Read `.openthrottle.yml` with supervisor-owned base branch unchanged.
 5. Run `post_bootstrap` commands.
 6. Start/restart the optional dev server on `0.0.0.0`.
-7. Install runtime skills/instructions and run the selected task through the
-   JSONL normalizer under `timeout`.
+7. Install OpenThrottle runtime adapters/instructions and run the selected
+   task through the JSONL normalizer under `timeout`.
 8. Remove temporary runtime MCP material and atomically write a completion
    marker for Fly to consume through Daytona.
 
-Claude skills are installed in the sandbox user's home, never the target
-checkout, and Claude receives a strict temporary config containing only
-project-declared MCP servers with user-only setting sources. Codex gets global
-runtime instructions in `~/.codex/AGENTS.md`. Project `AGENTS.md` and
-`.claude/settings.json` files remain untouched and editable.
+The snapshot contains one pinned Compound Engineering marketplace checkout and
+installs that same release natively into the sandbox user's Claude and Codex
+profiles. OpenThrottle's task adapters remain outside the target checkout:
+Claude adapters are installed in the sandbox user's home, while Codex gets
+global runtime instructions in `~/.codex/AGENTS.md`. Claude receives a strict
+temporary config containing only project-declared MCP servers with user-only
+setting sources. Project `AGENTS.md` and `.claude/settings.json` files remain
+untouched and editable.
 Implement/review/review-fix/investigate use fresh contexts; resume reads
 `~/.ot/agent-session-id` and continues the same Claude session/Codex thread.
 

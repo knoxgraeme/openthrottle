@@ -1,8 +1,10 @@
 # Skills
 
-This is the product's real IP: the instructions given to the coding
-agent inside each sandbox. Per `docs/SPEC.md` ("Skills contract"), every
-skill exists in **two forms that share one canonical body**:
+These are OpenThrottle's task adapters: the instructions that connect the
+supervisor's task types, safety boundary, activity outbox, and PR publication
+contract to the coding agent inside each sandbox. Per `docs/SPEC.md` ("Skills
+contract"), every adapter exists in **two forms that share one canonical
+body**:
 
 ```
 skills/
@@ -12,6 +14,20 @@ skills/
 ```
 
 Skills in v1: `implement-plan`, `review`, `review-fix`, `investigate`.
+
+## Compound Engineering foundation
+
+The sandbox image installs the official `compound-engineering` plugin natively
+for both Claude Code and Codex from one commit-pinned marketplace checkout. The
+plugin is baked into the Daytona snapshot, not copied into target repositories,
+so every ticket gets the same CE version and full skill-local prompt assets.
+
+The adapters in this directory remain because OpenThrottle has additional
+runtime contracts that are not one-to-one with CE skills: `ot-activity`
+publication, never-push-to-base enforcement, a hard approved-plan gate,
+comment-based review verdicts, and read-only `investigate` behavior. Keep that
+boundary explicit when adopting more CE workflow behavior; do not fork or copy
+CE's skill source into this directory.
 
 ## The canonical-body rule
 

@@ -9,10 +9,11 @@ daytona snapshot create openthrottle --dockerfile sandbox/Dockerfile --context .
 ```
 
 It contains Node 22, git/curl/jq/yq/ripgrep/GitHub CLI, Claude Code, Codex,
-and an unprivileged `agent` user. Its automatic image entrypoint is an inert
-no-op so Daytona provisioning cannot race the supervisor. Fly uploads the run
-context and explicitly launches the root task script, which owns checkout and
-safety setup before dropping privileges for repo and agent commands.
+a pinned native Compound Engineering installation for both agent CLIs, and an
+unprivileged `agent` user. Its automatic image entrypoint is an inert no-op so
+Daytona provisioning cannot race the supervisor. Fly uploads the run context
+and explicitly launches the root task script, which owns checkout and safety
+setup before dropping privileges for repo and agent commands.
 
 ## Lifecycle
 
@@ -28,11 +29,13 @@ outbox. The exit trap writes exit code, Claude cost, PR URL, and sanitized
 failure tail as a completion marker. Fly reads both through the Daytona SDK.
 
 Claude receives only project-declared MCP servers through a strict runtime
-config and user-level setting sources. Codex receives global instructions in
-`~/.codex/AGENTS.md`. Neither engine receives Linear credentials. The target repo's
-`AGENTS.md` and Claude settings remain untouched and editable. Git uses the
-`gh` credential helper against a clean origin URL, so the token never enters
-`.git/config` and the sealed config remains safe across resume runs.
+config and user-level setting sources. Claude and Codex receive the same native
+Compound Engineering release through their normal user plugin installations;
+Codex also receives OpenThrottle global instructions in `~/.codex/AGENTS.md`.
+Neither engine receives Linear credentials. The target repo's `AGENTS.md` and
+Claude settings remain untouched and editable. Git uses the `gh` credential
+helper against a clean origin URL, so the token never enters `.git/config` and
+the sealed config remains safe across resume runs.
 
 ## Safety and sanitization
 
@@ -53,11 +56,12 @@ docker build -f sandbox/Dockerfile -t openthrottle:test .
 sandbox/tests/smoke.sh openthrottle:test
 ```
 
-The smoke checks the pinned real Claude and Codex CLI versions and required
-flags, then uses a local bare repository and deterministic agent JSONL stubs.
-It verifies implement and same-session resume for
-both engines, checkout/branch creation, safety/config phases, session/cost
-capture, completion markers, and absence of secrets in human-visible artifacts.
+The smoke checks the pinned real Claude and Codex CLI versions, required flags,
+and native Compound Engineering installation and skill discovery. It then uses
+a local bare repository and deterministic agent JSONL stubs. It verifies
+implement and same-session resume for both engines, checkout/branch creation,
+safety/config phases, session/cost capture, completion markers, and absence of
+secrets in human-visible artifacts.
 
 For live monitoring, use Daytona’s normal controls:
 

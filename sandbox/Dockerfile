@@ -66,8 +66,38 @@ RUN npm install -g \
 # .git/config etc.
 # ---------------------------------------------------------------------------
 RUN useradd --create-home --home-dir /home/agent --shell /bin/bash --user-group agent \
-    && mkdir -p /home/agent/.ot \
+    && mkdir -p /home/agent/.ot /home/agent/.codex \
     && chown -R agent:agent /home/agent
+
+# Native Compound Engineering plugin installation for both agent CLIs. Keep a
+# single, exact marketplace checkout in the image and install it into both of
+# the sandbox user's normal agent profiles. Updating CE is therefore one
+# deliberate ref/version bump, and every target repository sees the same
+# skill set from its first agent invocation.
+ARG COMPOUND_ENGINEERING_REF=8163a96e86656a89797869ac61905fe4641f81be
+ARG COMPOUND_ENGINEERING_VERSION=3.19.0
+RUN set -eux; \
+    ce_marketplace="/opt/openthrottle/compound-engineering-marketplace"; \
+    install -d -m 0755 "$ce_marketplace"; \
+    git -C "$ce_marketplace" init -q; \
+    git -C "$ce_marketplace" remote add origin https://github.com/EveryInc/compound-engineering-plugin.git; \
+    git -C "$ce_marketplace" fetch -q --depth=1 origin "$COMPOUND_ENGINEERING_REF"; \
+    git -C "$ce_marketplace" checkout -q --detach FETCH_HEAD; \
+    test "$(git -C "$ce_marketplace" rev-parse HEAD)" = "$COMPOUND_ENGINEERING_REF"; \
+    gosu agent env HOME=/home/agent \
+      claude plugin marketplace add "$ce_marketplace" --scope user; \
+    gosu agent env HOME=/home/agent \
+      claude plugin install compound-engineering@compound-engineering-plugin --scope user; \
+    test "$(gosu agent env HOME=/home/agent claude plugin list --json \
+      | jq -r '.[] | select(.id == "compound-engineering@compound-engineering-plugin" and .enabled == true) | .version')" \
+      = "$COMPOUND_ENGINEERING_VERSION"; \
+    gosu agent env HOME=/home/agent CODEX_HOME=/home/agent/.codex \
+      codex plugin marketplace add "$ce_marketplace" --json; \
+    gosu agent env HOME=/home/agent CODEX_HOME=/home/agent/.codex \
+      codex plugin add compound-engineering@compound-engineering-plugin --json; \
+    test "$(gosu agent env HOME=/home/agent CODEX_HOME=/home/agent/.codex \
+      codex plugin list --json | jq -r '.installed[] | select(.pluginId == "compound-engineering@compound-engineering-plugin") | .version')" \
+      = "$COMPOUND_ENGINEERING_VERSION"
 
 # ---------------------------------------------------------------------------
 # OpenThrottle payload. Build context is the repo root:
