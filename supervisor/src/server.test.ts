@@ -271,6 +271,87 @@ describe("createServer lifecycle", () => {
     expect(store.getByIssueId("issue-1")?.state).toBe("closed");
   });
 
+  it("settles a newly created sandbox when its first task fails to start", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.registerRepository({
+      linearTeamKey: "OT",
+      linearTeamId: "team-1",
+      githubRepo: "owner/repo",
+      baseBranch: "main",
+      webhookId: 42,
+      snapshot: "openthrottle",
+    });
+    const setAutostopInterval = vi.fn(async () => undefined);
+    const sandbox = {
+      id: "sandbox-start-failure",
+      state: "started",
+      autoStopInterval: 60,
+      setAutostopInterval,
+      updateEnv: vi.fn(async () => undefined),
+      fs: {
+        uploadFile: vi.fn(async () => undefined),
+        setFilePermissions: vi.fn(async () => undefined),
+      },
+      process: {
+        createSession: vi.fn(async () => undefined),
+        executeSessionCommand: vi.fn(async () => {
+          throw new Error("entrypoint unavailable");
+        }),
+      },
+    };
+    const daytona = {
+      list: vi.fn(() => (async function* () {})()),
+      create: vi.fn(async () => sandbox),
+      get: vi.fn(async () => sandbox),
+    } as unknown as Daytona;
+    const linearFetch = vi.fn(async () =>
+      Response.json({
+        data: { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
+      })
+    ) as unknown as typeof fetch;
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg,
+      store,
+      daytona,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
+      runBackground: (task) => background.push(task),
+    });
+    const created = JSON.stringify({
+      action: "created",
+      type: "AgentSessionEvent",
+      webhookId: "linear-start-failure",
+      webhookTimestamp: Date.now(),
+      organizationId: "org",
+      agentSession: {
+        id: "session-start-failure",
+        issue: {
+          id: "issue-start-failure",
+          identifier: "OT-START-FAILURE",
+          team: { id: "team-1", key: "OT" },
+          labels: [],
+        },
+      },
+    });
+
+    const response = await app.request("/webhooks/linear", {
+      method: "POST",
+      headers: signedLinear(created, "linear-start-failure"),
+      body: created,
+    });
+    await Promise.all(background.splice(0));
+
+    expect(response.status).toBe(200);
+    expect(store.getByIssueId("issue-start-failure")).toMatchObject({
+      sandbox_id: "sandbox-start-failure",
+      run_id: null,
+      state: "error",
+    });
+    expect(daytona.get).toHaveBeenCalledWith("sandbox-start-failure");
+    expect(setAutostopInterval).toHaveBeenCalledWith(5);
+  });
+
   it("authenticates repository registration and verifies GitHub plus Daytona readiness", async () => {
     db = openDb(":memory:");
     const store = createTicketStore(db);

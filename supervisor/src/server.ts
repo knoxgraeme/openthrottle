@@ -1037,6 +1037,7 @@ async function handleCreated(
     });
     throw error;
   }
+  const provisionedTicket = store.getByIssueId(issue.id)!;
 
   try {
     await startTask(sandbox, {
@@ -1052,18 +1053,18 @@ async function handleCreated(
       failureTail: message,
       ticketState: "error",
     });
-    scheduleSandboxSettlement({ daytona, store, ticket, taskType });
+    scheduleSandboxSettlement({ daytona, store, ticket: provisionedTicket, taskType });
     await tryPostError(linear, sessionId, message);
     return;
   }
 
-  await reportCreatedWorkspace(cfg, store, linear, ticket, sandbox.id);
+  await reportCreatedWorkspace(cfg, store, linear, provisionedTicket, sandbox.id);
   try {
     await agentActivityCreate(linear, {
       sessionId,
       type: "action",
       action: "Started",
-      parameter: `${taskType} run on ${ticket.branch}`,
+      parameter: `${taskType} run on ${provisionedTicket.branch}`,
     });
   } catch (error) {
     console.error(`[linear] ${taskType} started but its activity could not be posted:`, error);
