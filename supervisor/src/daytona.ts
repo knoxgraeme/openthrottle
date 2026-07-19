@@ -92,6 +92,8 @@ export async function startTask(
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CODEX_AUTH_JSON",
     "KIMI_CODE_API_KEY",
+    "OT_GIT_AUTHOR_NAME",
+    "OT_GIT_AUTHOR_EMAIL",
   ] as const;
   const retiredSecretNames = [
     "LINEAR_ACCESS_TOKEN",

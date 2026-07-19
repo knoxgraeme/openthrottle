@@ -60,8 +60,12 @@ configure_git_identity() {
   identity="$(resolve_git_identity "${OT_GIT_AUTHOR_NAME:-}" "${OT_GIT_AUTHOR_EMAIL:-}" "$login" "$uid")"
   name="${identity%%$'\t'*}"
   email="${identity#*$'\t'}"
-  as_agent "git -C '$REPO_DIR' config user.name '$name'"
-  as_agent "git -C '$REPO_DIR' config user.email '$email'"
+  # Write to the agent's global config (like safe.directory above), never the
+  # repository's .git/config: Phase 3 seals .git/config immutable, so a
+  # repo-local write would fail on resume and abort the entrypoint. The clone
+  # never sets a repo-local user.*, so this global identity always applies.
+  as_agent "git config --global user.name '$name'"
+  as_agent "git config --global user.email '$email'"
   log "commit identity: ${name} <${email}>"
 }
 
@@ -230,8 +234,9 @@ else
   as_agent "git -C '$REPO_DIR' fetch --quiet origin"
 fi
 
-# Set (or refresh, on resume) the commit identity every run so rotated tokens
-# and sandboxes cloned before this fix converge on the correct GitHub account.
+# Set (or refresh, on resume) the commit identity every run. It writes only the
+# agent's global git config, which is unaffected by the Phase 3 .git/config
+# seal, so this is safe on resume as well as on fresh clones.
 configure_git_identity
 
 if as_agent "git -C '$REPO_DIR' show-ref --verify --quiet 'refs/heads/${BRANCH_NAME}'"; then
