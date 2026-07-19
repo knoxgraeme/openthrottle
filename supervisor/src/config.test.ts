@@ -13,6 +13,7 @@ function setRequiredEnv(): void {
     "PORT",
     "DATABASE_PATH",
     "GITHUB_REPO_MAPPINGS",
+    "GITHUB_REPO_LABEL_MAPPINGS",
     "DAYTONA_SNAPSHOT",
     "DEFAULT_AGENT",
     "CLAUDE_CODE_OAUTH_TOKEN",
@@ -51,12 +52,14 @@ describe("loadConfig", () => {
   it("loads safe defaults and repo mappings", () => {
     setRequiredEnv();
     process.env.GITHUB_REPO_MAPPINGS = JSON.stringify({ OT: "other/project" });
+    process.env.GITHUB_REPO_LABEL_MAPPINGS = JSON.stringify({ "Repo/web-app": "owner/web-app" });
     process.env.ALLOW_LINEAR_MERGE = "true";
 
     expect(loadConfig()).toMatchObject({
       supervisorUrl: "https://openthrottle.test",
       githubRepo: "owner/repo",
       githubRepoMappings: { OT: "other/project" },
+      githubRepoLabelMappings: { "Repo/web-app": "owner/web-app" },
       baseBranch: "main",
       port: 8080,
       taskTimeout: 7200,
@@ -76,6 +79,10 @@ describe("loadConfig", () => {
     expect(() => loadConfig()).toThrow('GITHUB_REPO must be "owner/name"');
 
     process.env.GITHUB_REPO = "owner/repo";
+    process.env.GITHUB_REPO_LABEL_MAPPINGS = JSON.stringify({ "Repo/web-app": "owner/repo'" });
+    expect(() => loadConfig()).toThrow('GITHUB_REPO_LABEL_MAPPINGS.Repo/web-app must be an "owner/name"');
+
+    process.env.GITHUB_REPO_LABEL_MAPPINGS = "";
     process.env.BASE_BRANCH = "main; unsafe";
     expect(() => loadConfig()).toThrow("BASE_BRANCH must be a safe Git branch name");
   });

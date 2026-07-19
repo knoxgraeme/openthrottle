@@ -20,6 +20,7 @@ const cfg: Config = {
   githubToken: "github-token",
   githubRepo: "owner/repo",
   githubRepoMappings: {},
+  githubRepoLabelMappings: {},
   daytonaApiKey: "daytona-key",
   daytonaSnapshot: "openthrottle",
   defaultAgent: "codex",
@@ -562,6 +563,185 @@ describe("createServer lifecycle", () => {
       CODEX_AUTH_JSON: "{}",
     });
     expect(envUpdates.at(-1)).not.toHaveProperty("RESUME_MESSAGE");
+  });
+
+  it("routes new delegations from repo labels before team mappings", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    const routedCfg: Config = {
+      ...cfg,
+      githubRepoMappings: { OT: "owner/team-default" },
+      githubRepoLabelMappings: { "Repo/web-app": "owner/web-app" },
+    };
+    let createParams: { envVars?: Record<string, string> } | undefined;
+    const sandbox = {
+      id: "sandbox-repo-label",
+      state: "started",
+      fs: {
+        uploadFile: vi.fn(async () => undefined),
+        setFilePermissions: vi.fn(async () => undefined),
+      },
+      process: {
+        createSession: vi.fn(async () => undefined),
+        executeSessionCommand: vi.fn(async () => undefined),
+      },
+    };
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg: routedCfg,
+      store,
+      daytona: {
+        list: vi.fn(() => (async function* () {})()),
+        create: vi.fn(async (params: { envVars?: Record<string, string> }) => {
+          createParams = params;
+          return sandbox;
+        }),
+      } as unknown as Daytona,
+      getLinearClient: async () => ({
+        accessToken: "oauth",
+        fetch: vi.fn(async () =>
+          Response.json({
+            data: {
+              agentActivityCreate: { success: true, agentActivity: { id: "activity" } },
+              agentSessionUpdate: { success: true },
+            },
+          })
+        ) as unknown as typeof fetch,
+      }),
+      runBackground: (task) => background.push(task),
+    });
+    const created = JSON.stringify({
+      action: "created",
+      type: "AgentSessionEvent",
+      webhookId: "linear-repo-label",
+      webhookTimestamp: Date.now(),
+      organizationId: "org",
+      agentSession: {
+        id: "session-repo-label",
+        issue: {
+          id: "issue-repo-label",
+          identifier: "OT-REPO",
+          team: { id: "team-1", key: "OT" },
+          labels: [{ name: "Repo › Repo/web-app" }],
+        },
+      },
+    });
+
+    await app.request("/webhooks/linear", {
+      method: "POST",
+      headers: signedLinear(created, "linear-repo-label"),
+      body: created,
+    });
+    await Promise.all(background.splice(0));
+
+    expect(createParams?.envVars).toHaveProperty("GITHUB_REPO", "owner/web-app");
+    expect(store.getByIssueId("issue-repo-label")).toMatchObject({
+      repo: "owner/web-app",
+      sandbox_id: "sandbox-repo-label",
+    });
+  });
+
+  it("starts a fresh workspace when re-delegation changes the routed repo", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-repo-switch",
+      linear_issue_identifier: "OT-REPO-SWITCH",
+      linear_session_id: "session-old",
+      sandbox_id: "sandbox-old-repo",
+      branch: "ot/ot-repo-switch",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+    });
+    store.beginRun({
+      issueId: "issue-repo-switch",
+      runId: "run-old-repo",
+      taskType: "implement",
+      tokenHash: "hash",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    const routedCfg: Config = {
+      ...cfg,
+      githubRepoLabelMappings: { "Repo/web-app": "owner/web-app" },
+    };
+    let createParams: { envVars?: Record<string, string> } | undefined;
+    const oldSandbox = {
+      stop: vi.fn(async () => undefined),
+      delete: vi.fn(async () => undefined),
+    };
+    const newSandbox = {
+      id: "sandbox-new-repo",
+      state: "started",
+      updateEnv: vi.fn(async () => undefined),
+      fs: {
+        uploadFile: vi.fn(async () => undefined),
+        setFilePermissions: vi.fn(async () => undefined),
+      },
+      process: {
+        createSession: vi.fn(async () => undefined),
+        executeSessionCommand: vi.fn(async () => undefined),
+      },
+    };
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg: routedCfg,
+      store,
+      daytona: {
+        get: vi.fn(async () => oldSandbox),
+        list: vi.fn(() => (async function* () {})()),
+        create: vi.fn(async (params: { envVars?: Record<string, string> }) => {
+          createParams = params;
+          return newSandbox;
+        }),
+      } as unknown as Daytona,
+      getLinearClient: async () => ({
+        accessToken: "oauth",
+        fetch: vi.fn(async () =>
+          Response.json({
+            data: {
+              agentActivityCreate: { success: true, agentActivity: { id: "activity" } },
+              agentSessionUpdate: { success: true },
+            },
+          })
+        ) as unknown as typeof fetch,
+      }),
+      runBackground: (task) => background.push(task),
+    });
+    const created = JSON.stringify({
+      action: "created",
+      type: "AgentSessionEvent",
+      webhookId: "linear-repo-switch",
+      webhookTimestamp: Date.now(),
+      organizationId: "org",
+      agentSession: {
+        id: "session-repo-switch",
+        issue: {
+          id: "issue-repo-switch",
+          identifier: "OT-REPO-SWITCH",
+          team: { id: "team-1", key: "OT" },
+          labels: [{ name: "Repo › Repo/web-app" }],
+        },
+      },
+    });
+
+    await app.request("/webhooks/linear", {
+      method: "POST",
+      headers: signedLinear(created, "linear-repo-switch"),
+      body: created,
+    });
+    await Promise.all(background.splice(0));
+
+    expect(oldSandbox.stop).toHaveBeenCalledWith(60, true);
+    expect(oldSandbox.delete).toHaveBeenCalledWith(60, false);
+    expect(store.getRun("run-old-repo")?.status).toBe("stopped");
+    expect(createParams?.envVars).toHaveProperty("GITHUB_REPO", "owner/web-app");
+    expect(store.getByIssueId("issue-repo-switch")).toMatchObject({
+      repo: "owner/web-app",
+      sandbox_id: "sandbox-new-repo",
+      state: "active",
+    });
   });
 
   it("keeps the run active and returns 502 when Daytona cannot stop it", async () => {

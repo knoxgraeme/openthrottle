@@ -29,10 +29,12 @@ import {
 } from "./github.js";
 import {
   createForTicket,
+  deleteSandbox,
   findSandboxForTicket,
   getSandboxLogs,
   getSignedPreviewUrl,
   startTask,
+  stopSandbox,
   type SandboxEnvContract,
 } from "./daytona.js";
 import { MAX_PRIVATE_LOG_TAIL_CHARS } from "./logs.js";
@@ -116,7 +118,23 @@ function branchFor(issueIdentifier: string): string {
   return `ot/${issueIdentifier.toLowerCase()}`;
 }
 
-function repoFor(cfg: Config, issue: { team?: { id?: string; key?: string } }): string {
+function repoLabelKeys(label: string): string[] {
+  const trimmed = label.trim();
+  const withoutPrefix = trimmed.replace(/^Repo\s*(?:›|>|:|\/)\s*/i, "").trim();
+  return [...new Set([trimmed, withoutPrefix].filter(Boolean))];
+}
+
+function repoFor(
+  cfg: Config,
+  issue: { team?: { id?: string; key?: string } },
+  labels: string[] = []
+): string {
+  for (const label of labels) {
+    for (const key of repoLabelKeys(label)) {
+      const byLabel = cfg.githubRepoLabelMappings[key];
+      if (byLabel) return byLabel;
+    }
+  }
   const byId = issue.team?.id ? cfg.githubRepoMappings[issue.team.id] : undefined;
   const byKey = issue.team?.key ? cfg.githubRepoMappings[issue.team.key] : undefined;
   return byId ?? byKey ?? cfg.githubRepo;
@@ -699,6 +717,7 @@ async function handleCreated(
   const labels = extractLabelNames(payload);
   const existing = store.getByIssueId(issue.id);
   const selectedAgent = pickAgent(labels, existing?.agent ?? cfg.defaultAgent);
+  const selectedRepo = repoFor(cfg, issue, labels);
   if (!hasAgentSubscription(cfg, selectedAgent)) {
     await tryPostError(
       linear,
@@ -713,31 +732,53 @@ async function handleCreated(
   );
   if (existing?.sandbox_id && existing.state !== "closed" && existing.state !== "expired") {
     const agentChanged = existing.agent !== selectedAgent;
-    store.upsert({
-      ...existing,
-      linear_session_id: sessionId,
-      agent: selectedAgent,
-      state: "active",
-    });
-    store.setLinearContext(issue.id, initialContext);
-    const current = store.getByIssueId(issue.id)!;
-    await launchExistingTask({
-      cfg,
-      store,
-      daytona,
-      linear,
-      ticket: current,
-      taskType: labels.includes("investigate")
-        ? "investigate"
-        : agentChanged
-          ? "implement"
-          : "resume",
-      resumeMessage: agentChanged
-        ? undefined
-        : "This ticket was re-delegated. Re-read it and continue from the existing branch.",
-      linearContext: initialContext,
-    });
-    return;
+    const repoChanged = existing.repo !== selectedRepo;
+    if (repoChanged) {
+      if (existing.run_id) {
+        store.finishRun({
+          runId: existing.run_id,
+          status: "stopped",
+          failureTail: `Repository route changed from ${existing.repo} to ${selectedRepo}; starting a fresh workspace.`,
+          ticketState: "active",
+        });
+      }
+      try {
+        await stopSandbox(daytona, existing.sandbox_id);
+        await deleteSandbox(daytona, existing.sandbox_id);
+      } catch (error) {
+        const message = sanitizeText(
+          `OpenThrottle resolved this ticket to ${selectedRepo}, but could not delete the existing ${existing.repo} workspace: ${String(error)}`
+        );
+        await tryPostError(linear, sessionId, message);
+        return;
+      }
+    } else {
+      store.upsert({
+        ...existing,
+        linear_session_id: sessionId,
+        agent: selectedAgent,
+        state: "active",
+      });
+      store.setLinearContext(issue.id, initialContext);
+      const current = store.getByIssueId(issue.id)!;
+      await launchExistingTask({
+        cfg,
+        store,
+        daytona,
+        linear,
+        ticket: current,
+        taskType: labels.includes("investigate")
+          ? "investigate"
+          : agentChanged
+            ? "implement"
+            : "resume",
+        resumeMessage: agentChanged
+          ? undefined
+          : "This ticket was re-delegated. Re-read it and continue from the existing branch.",
+        linearContext: initialContext,
+      });
+      return;
+    }
   }
 
   const taskType: TaskType = labels.includes("investigate") ? "investigate" : "implement";
@@ -748,7 +789,7 @@ async function handleCreated(
     sandbox_id: null,
     branch: branchFor(issue.identifier),
     agent: selectedAgent,
-    repo: repoFor(cfg, issue),
+    repo: selectedRepo,
     pr_url: null,
     state: "active" as const,
   };

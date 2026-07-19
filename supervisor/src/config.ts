@@ -100,6 +100,7 @@ export interface Config {
   githubToken: string;
   githubRepo: string;
   githubRepoMappings: Record<string, string>;
+  githubRepoLabelMappings: Record<string, string>;
 
   daytonaApiKey: string;
   daytonaSnapshot: string;
@@ -137,6 +138,7 @@ export function loadConfig(): Config {
     githubToken: required("GITHUB_TOKEN"),
     githubRepo: required("GITHUB_REPO"),
     githubRepoMappings: optionalRepoMap("GITHUB_REPO_MAPPINGS"),
+    githubRepoLabelMappings: optionalRepoMap("GITHUB_REPO_LABEL_MAPPINGS"),
 
     daytonaApiKey: required("DAYTONA_API_KEY"),
     daytonaSnapshot: optional("DAYTONA_SNAPSHOT", "openthrottle"),

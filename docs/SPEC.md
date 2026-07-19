@@ -151,7 +151,9 @@ Required unless noted:
 - Linear: `LINEAR_WEBHOOK_SECRET`, `LINEAR_CLIENT_ID`,
   `LINEAR_CLIENT_SECRET`.
 - GitHub: `GITHUB_WEBHOOK_SECRET`, `GITHUB_TOKEN`, `GITHUB_REPO`; optional
-  `GITHUB_REPO_MAPPINGS` JSON maps Linear team id/key to `owner/name`.
+  `GITHUB_REPO_MAPPINGS` JSON maps Linear team id/key to `owner/name`, and
+  `GITHUB_REPO_LABEL_MAPPINGS` JSON maps Linear repo label names or suffixes
+  to `owner/name`. Repo labels take precedence over team mappings.
 - Daytona: `DAYTONA_API_KEY`, `DAYTONA_SNAPSHOT=openthrottle`.
 - Agents: `CLAUDE_CODE_OAUTH_TOKEN` for Claude subscription login and/or
   `CODEX_AUTH_JSON` for Codex subscription login; `DEFAULT_AGENT=codex`.
