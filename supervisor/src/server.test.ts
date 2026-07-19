@@ -1212,14 +1212,14 @@ describe("createServer lifecycle", () => {
             id: issueId,
             identifier: "OT-BASE",
             team: { id: "team-1", key: "OT" },
-            labels: [{ name: `Base › ${base}` }],
+            labels: [{ name: `branch › ${base}` }],
           },
         },
       });
     return { store, create, background, app, createdEvent, getCreateParams: () => createParams };
   }
 
-  it("overrides the route base branch from a Base label when the branch exists", async () => {
+  it("overrides the route base branch from a branch label when the branch exists", async () => {
     const { store, create, background, app, createdEvent, getCreateParams } = baseLabelHarness();
     const githubFetch = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
@@ -1251,7 +1251,7 @@ describe("createServer lifecycle", () => {
     });
   });
 
-  it("fails closed when the Base label branch does not exist", async () => {
+  it("fails closed when the branch label value does not exist", async () => {
     const { store, create, background, app, createdEvent } = baseLabelHarness();
     const githubFetch = vi.fn(async () => new Response("Not Found", { status: 404 }));
     vi.stubGlobal("fetch", githubFetch);
@@ -1276,7 +1276,7 @@ describe("createServer lifecycle", () => {
     ).toBe(true);
   });
 
-  it("fails closed on an unsafe Base label without calling GitHub", async () => {
+  it("fails closed on an unsafe branch label without calling GitHub", async () => {
     const { store, create, background, app, createdEvent } = baseLabelHarness();
     const githubFetch = vi.fn(async () => new Response("{}", { status: 200 }));
     vi.stubGlobal("fetch", githubFetch);
@@ -1325,9 +1325,9 @@ describe("createServer lifecycle", () => {
       createParams = params;
       return sandbox;
     });
-    // The webhook carries only the leaf label name, so no flat `Base ›` match
+    // The webhook carries only the leaf label name, so no flat `branch ›` match
     // exists; the supervisor must resolve the parent group via the IssueLabels
-    // GraphQL query to discover this is a `Base` group label.
+    // GraphQL query to discover this is a `branch` group label.
     let issueLabelsQueried = false;
     const linearFetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       const query = String((JSON.parse(String(init?.body)) as { query?: string }).query);
@@ -1335,7 +1335,7 @@ describe("createServer lifecycle", () => {
         issueLabelsQueried = true;
         return Response.json({
           data: {
-            issue: { labels: { nodes: [{ name: "release/2.0", parent: { name: "Base" } }] } },
+            issue: { labels: { nodes: [{ name: "release/2.0", parent: { name: "branch" } }] } },
           },
         });
       }
@@ -1403,7 +1403,7 @@ describe("createServer lifecycle", () => {
     });
   });
 
-  it("keeps a grouped Base child out of repo-label routing", async () => {
+  it("keeps a grouped branch child out of repo-label routing", async () => {
     db = openDb(":memory:");
     const store = createTicketStore(db);
     store.registerRepository({
@@ -1414,7 +1414,7 @@ describe("createServer lifecycle", () => {
       webhookId: 42,
       snapshot: "openthrottle",
     });
-    // A repo-label mapping whose key collides with the Base-group child leaf.
+    // A repo-label mapping whose key collides with the branch-group child leaf.
     const routedCfg: Config = {
       ...cfg,
       githubRepoLabelMappings: { "web-app": "owner/web-app" },
@@ -1444,7 +1444,7 @@ describe("createServer lifecycle", () => {
       if (query.includes("IssueLabels")) {
         return Response.json({
           data: {
-            issue: { labels: { nodes: [{ name: "web-app", parent: { name: "Base" } }] } },
+            issue: { labels: { nodes: [{ name: "web-app", parent: { name: "branch" } }] } },
           },
         });
       }
@@ -1498,7 +1498,7 @@ describe("createServer lifecycle", () => {
     });
     await Promise.all(background.splice(0));
 
-    // The `web-app` leaf is a Base-group child, so it must not route to the
+    // The `web-app` leaf is a branch-group child, so it must not route to the
     // mapped `owner/web-app`; the team repo wins with only the base overridden,
     // and the branch is verified on that team repo (not the mapped one).
     expect(githubFetch).toHaveBeenCalledOnce();

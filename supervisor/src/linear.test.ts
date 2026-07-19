@@ -161,7 +161,7 @@ describe("Linear contracts", () => {
           issue: {
             labels: {
               nodes: [
-                { name: "feature/x", parent: { name: "Base" } },
+                { name: "feature/x", parent: { name: "branch" } },
                 { name: "investigate", parent: null },
                 { name: "bad" },
               ],
@@ -173,7 +173,7 @@ describe("Linear contracts", () => {
 
     const resolved = await fetchIssueLabels({ accessToken: "oauth", fetch: fetchMock }, "issue-1");
     expect(resolved).toEqual([
-      { name: "feature/x", parentName: "Base" },
+      { name: "feature/x", parentName: "branch" },
       { name: "investigate", parentName: undefined },
       { name: "bad", parentName: undefined },
     ]);
@@ -181,7 +181,7 @@ describe("Linear contracts", () => {
 
     expect(labelMatchNames(resolved)).toEqual([
       "feature/x",
-      "Base › feature/x",
+      "branch › feature/x",
       "investigate",
       "bad",
     ]);

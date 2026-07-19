@@ -42,18 +42,18 @@ Linear AgentSessionEvent ──HMAC──> Fly supervisor ──@daytona/sdk─�
    durable repository registrations (then legacy env fallbacks), resolves agent
    labels, persists `promptContext`, inserts the ticket and current
    `agent_sessions` generation, and atomically claims a run bound to that
-   session. A `Base` label overrides the route's base branch for that one
-   ticket. It resolves from either a Linear label **group** named `Base` whose
-   child is the branch (the recommended, tidy form — the webhook carries only
-   the child's leaf name, so grouped labels are resolved with their parent group
-   through the `IssueLabels` GraphQL query), or a flat `Base › <branch>` label
-   (also `Base >`, `Base:`, `Base/`, matched directly from the webhook with no
-   extra call). The branch name is validated and verified to exist on the
-   resolved repository before the ticket captures it, so a missing or unsafe
-   branch fails closed with a Linear error instead of a clone failure inside the
-   sandbox; a failed group lookup degrades to the flat-label behavior. The
-   `ot/<identifier>` working branch is always cut from the resolved base, and the
-   PR is opened against it.
+   session. A `branch` label overrides the route's base branch for that one
+   ticket. It resolves from either a Linear label **group** named `branch` whose
+   child is the branch name (the recommended, tidy form — the webhook carries
+   only the child's leaf name, so grouped labels are resolved with their parent
+   group through the `IssueLabels` GraphQL query), or a flat `branch › <name>`
+   label (also `branch >`, `branch:`, `branch/`, matched directly from the
+   webhook with no extra call). The branch name is validated and verified to
+   exist on the resolved repository before the ticket captures it, so a missing
+   or unsafe branch fails closed with a Linear error instead of a clone failure
+   inside the sandbox; a failed group lookup degrades to the flat-label behavior.
+   The `ot/<identifier>` working branch is always cut from the resolved base, and
+   the PR is opened against it.
 4. It creates a private Daytona sandbox from `DAYTONA_SNAPSHOT`, labeled
    `openthrottle=true` and `ticket=<identifier>`. The image entrypoint is an
    inert no-op; Fly uploads the latest Linear context and run credentials,
@@ -170,7 +170,7 @@ Daytona uses `@daytona/sdk` `0.199.x`. Run env is updated with
 ### Persistence
 
 `tickets` stores identity/routing (including the resolved base branch, which
-may be a per-ticket `Base › <branch>` override of the route default),
+may be a per-ticket `branch › <name>` override of the route default),
 sandbox/PR, state, current run guard, aggregate cost, last error,
 preview-token hash, latest Linear prompt context, and the pending re-review
 flag set when a review-fix pauses on a decision elicitation. `agent_sessions` stores

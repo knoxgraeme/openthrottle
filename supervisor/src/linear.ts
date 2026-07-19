@@ -153,7 +153,7 @@ export interface ResolvedLabel {
 }
 
 // The webhook payload carries only each label's leaf name, so a Linear label
-// *group* (e.g. a "Base" group containing a "feature/x" child) arrives as the
+// *group* (e.g. a "branch" group containing a "feature/x" child) arrives as the
 // bare leaf with no way to know its group. This reads the issue's labels with
 // their parent group from Linear, letting grouped labels drive routing.
 export async function fetchIssueLabels(

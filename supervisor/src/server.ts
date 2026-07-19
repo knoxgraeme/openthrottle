@@ -227,12 +227,12 @@ function repoLabelKeys(label: string): string[] {
   return [...new Set([trimmed, withoutPrefix].filter(Boolean))];
 }
 
-// A `Base › <branch>` label (also `Base >`, `Base:`, `Base/`) targets a
+// A `branch › <name>` label (also `branch >`, `branch:`, `branch/`) targets a
 // per-task base branch, overriding the route's default. The branch itself may
 // contain slashes, so everything after the first separator is the branch name.
 function baseBranchFromLabels(labels: string[]): string | undefined {
   for (const label of labels) {
-    const match = label.trim().match(/^Base\s*(?:›|>|:|\/)\s*(.+)$/i);
+    const match = label.trim().match(/^branch\s*(?:›|>|:|\/)\s*(.+)$/i);
     const branch = match?.[1]?.trim();
     if (branch) return branch;
   }
@@ -1154,12 +1154,12 @@ async function handleCreated(
 
   const labels = extractLabelNames(payload);
   const existing = store.getByIssueId(issue.id);
-  // A `Base` label targets a per-task base branch for this ticket, overriding
-  // the route's default. It is a flat `Base › <branch>` label (matched straight
-  // from the webhook, no extra call) or a Linear label group named `Base` whose
-  // child is the branch — the webhook carries only the child's leaf name, so
-  // grouped labels are resolved with their parent group via GraphQL. A `Base`
-  // label is a base-branch directive, not a routing label, so grouped `Base`
+  // A `branch` label targets a per-task base branch for this ticket, overriding
+  // the route's default. It is a flat `branch › <name>` label (matched straight
+  // from the webhook, no extra call) or a Linear label group named `branch` whose
+  // child is the branch name — the webhook carries only the child's leaf name, so
+  // grouped labels are resolved with their parent group via GraphQL. A `branch`
+  // label is a base-branch directive, not a routing label, so grouped `branch`
   // children (which arrive as bare leaves) are dropped from the label set that
   // drives repo/agent/task routing below; otherwise a child leaf could collide
   // with a `GITHUB_REPO_LABEL_MAPPINGS` key or an agent/investigate label and
@@ -1223,7 +1223,7 @@ async function handleCreated(
         linearOutbox,
         sessionId,
         issue.id,
-        `The base branch label \`${requestedBase}\` is not a valid Git branch name.`
+        `The \`branch\` label value \`${requestedBase}\` is not a valid Git branch name.`
       );
       return;
     }

@@ -15,7 +15,7 @@ the entrypoint:
   `investigate`.
 - `GITHUB_REPO` — `owner/name`.
 - `BASE_BRANCH` — the branch this task is based on: the repo default (e.g.
-  `main`) unless the ticket targeted another with a `Base` label. The PR opens
+  `main`) unless the ticket targeted another with a `branch` label. The PR opens
   against it.
 - `BRANCH_NAME` — `ot/<ticket-id>`, already checked out and already
   pushed once. Never create or switch to a different branch.
