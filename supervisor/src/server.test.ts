@@ -20,6 +20,7 @@ const cfg: Config = {
   githubToken: "github-token",
   githubRepo: "owner/repo",
   githubRepoMappings: {},
+  githubRepoLabelMappings: {},
   daytonaApiKey: "daytona-key",
   daytonaSnapshot: "openthrottle",
   defaultAgent: "codex",
@@ -90,11 +91,16 @@ describe("createServer lifecycle", () => {
     }) as unknown as typeof fetch;
     const linear: LinearClient = { accessToken: "oauth", fetch: linearFetch };
 
-    let createParams: { envVars?: Record<string, string> } | undefined;
+    let createParams:
+      | { envVars?: Record<string, string>; autoStopInterval?: number }
+      | undefined;
     const executeSessionCommand = vi.fn(async () => undefined);
+    const setAutostopInterval = vi.fn(async (_minutes: number) => undefined);
     const sandbox = {
       id: "sandbox-1",
       state: "started",
+      autoStopInterval: 60,
+      setAutostopInterval,
       updateEnv: vi.fn(async () => undefined),
       fs: {
         uploadFile: vi.fn(async () => undefined),
@@ -160,6 +166,7 @@ describe("createServer lifecycle", () => {
     await Promise.all(background.splice(0));
     expect(daytona.create).toHaveBeenCalledTimes(1);
     expect(executeSessionCommand).toHaveBeenCalledOnce();
+    expect(createParams?.autoStopInterval).toBe(60);
     expect(createParams?.envVars).not.toHaveProperty("LINEAR_ACCESS_TOKEN");
     expect(createParams?.envVars).not.toHaveProperty("LINEAR_MCP_API_KEY");
     expect(createParams?.envVars).not.toHaveProperty("LINEAR_SESSION_ID");
@@ -223,9 +230,11 @@ describe("createServer lifecycle", () => {
         pr_url: "https://github.com/owner/target/pull/7",
       }),
     });
+    await Promise.all(background.splice(0));
     expect(callback.status).toBe(200);
     await Promise.all(background.splice(0));
     const resumedRunId = store.getByIssueId("issue-1")?.run_id;
+    expect(setAutostopInterval.mock.calls.map(([minutes]) => minutes)).toEqual([5]);
     expect(store.getByIssueId("issue-1")).toMatchObject({
       run_id: expect.any(String),
       total_cost_usd: 0.75,
@@ -269,6 +278,171 @@ describe("createServer lifecycle", () => {
     await Promise.all(background.splice(0));
     expect(sandbox.delete).toHaveBeenCalledOnce();
     expect(store.getByIssueId("issue-1")?.state).toBe("closed");
+  });
+
+  it("consumes an idle prompted activity when it launches immediately", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-idle",
+      linear_issue_identifier: "OT-IDLE",
+      linear_session_id: "session-idle",
+      sandbox_id: "sandbox-idle",
+      branch: "ot/ot-idle",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+    });
+    const executeSessionCommand = vi.fn(async () => undefined);
+    const sandbox = {
+      state: "started",
+      autoStopInterval: 60,
+      setAutostopInterval: vi.fn(async () => undefined),
+      updateEnv: vi.fn(async () => undefined),
+      fs: {
+        uploadFile: vi.fn(async () => undefined),
+        setFilePermissions: vi.fn(async () => undefined),
+      },
+      process: {
+        createSession: vi.fn(async () => undefined),
+        executeSessionCommand,
+      },
+    };
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg,
+      store,
+      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      getLinearClient: async () => ({
+        accessToken: "oauth",
+        fetch: vi.fn(async () =>
+          Response.json({
+            data: { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
+          })
+        ) as unknown as typeof fetch,
+      }),
+      runBackground: (task) => background.push(task),
+    });
+    const prompted = JSON.stringify({
+      action: "prompted",
+      type: "AgentSessionEvent",
+      webhookId: "linear-idle-1",
+      webhookTimestamp: Date.now(),
+      organizationId: "org",
+      agentSession: { id: "session-idle" },
+      agentActivity: { id: "prompt-idle", content: { type: "prompt", body: "continue" } },
+    });
+
+    expect(
+      (
+        await app.request("/webhooks/linear", {
+          method: "POST",
+          headers: signedLinear(prompted, "linear-idle-1"),
+          body: prompted,
+        })
+      ).status
+    ).toBe(200);
+    await Promise.all(background.splice(0));
+    const runId = store.getByIssueId("issue-idle")?.run_id;
+    expect(runId).toBeTruthy();
+    expect(
+      db.prepare("SELECT status, claimed_run_id FROM session_work WHERE id = ?")
+        .get("prompt-idle")
+    ).toEqual({ status: "consumed", claimed_run_id: runId });
+
+    expect(
+      (
+        await app.request("/webhooks/linear", {
+          method: "POST",
+          headers: signedLinear(prompted, "linear-idle-2"),
+          body: prompted,
+        })
+      ).status
+    ).toBe(200);
+    await Promise.all(background.splice(0));
+    expect(executeSessionCommand).toHaveBeenCalledOnce();
+  });
+
+  it("settles a newly created sandbox when its first task fails to start", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.registerRepository({
+      linearTeamKey: "OT",
+      linearTeamId: "team-1",
+      githubRepo: "owner/repo",
+      baseBranch: "main",
+      webhookId: 42,
+      snapshot: "openthrottle",
+    });
+    const setAutostopInterval = vi.fn(async () => undefined);
+    const sandbox = {
+      id: "sandbox-start-failure",
+      state: "started",
+      autoStopInterval: 60,
+      setAutostopInterval,
+      updateEnv: vi.fn(async () => undefined),
+      fs: {
+        uploadFile: vi.fn(async () => undefined),
+        setFilePermissions: vi.fn(async () => undefined),
+      },
+      process: {
+        createSession: vi.fn(async () => undefined),
+        executeSessionCommand: vi.fn(async () => {
+          throw new Error("entrypoint unavailable");
+        }),
+      },
+    };
+    const daytona = {
+      list: vi.fn(() => (async function* () {})()),
+      create: vi.fn(async () => sandbox),
+      get: vi.fn(async () => sandbox),
+    } as unknown as Daytona;
+    const linearFetch = vi.fn(async () =>
+      Response.json({
+        data: { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
+      })
+    ) as unknown as typeof fetch;
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg,
+      store,
+      daytona,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
+      runBackground: (task) => background.push(task),
+    });
+    const created = JSON.stringify({
+      action: "created",
+      type: "AgentSessionEvent",
+      webhookId: "linear-start-failure",
+      webhookTimestamp: Date.now(),
+      organizationId: "org",
+      agentSession: {
+        id: "session-start-failure",
+        issue: {
+          id: "issue-start-failure",
+          identifier: "OT-START-FAILURE",
+          team: { id: "team-1", key: "OT" },
+          labels: [],
+        },
+      },
+    });
+
+    const response = await app.request("/webhooks/linear", {
+      method: "POST",
+      headers: signedLinear(created, "linear-start-failure"),
+      body: created,
+    });
+    await Promise.all(background.splice(0));
+
+    expect(response.status).toBe(200);
+    expect(store.getByIssueId("issue-start-failure")).toMatchObject({
+      sandbox_id: "sandbox-start-failure",
+      run_id: null,
+      state: "error",
+    });
+    expect(daytona.get).toHaveBeenCalledWith("sandbox-start-failure");
+    expect(setAutostopInterval).toHaveBeenCalledWith(5);
   });
 
   it("authenticates repository registration and verifies GitHub plus Daytona readiness", async () => {
@@ -636,6 +810,7 @@ describe("createServer lifecycle", () => {
     const sandbox = {
       id: "sandbox-notify",
       state: "started",
+      setAutostopInterval: vi.fn(async () => undefined),
       updateEnv: vi.fn(async (env: Record<string, string>) => {
         envUpdates.push(env);
       }),
@@ -715,6 +890,7 @@ describe("createServer lifecycle", () => {
     const sandbox = {
       id: "sandbox-switch",
       state: "started",
+      setAutostopInterval: vi.fn(async () => undefined),
       updateEnv: vi.fn(async (env: Record<string, string>) => {
         envUpdates.push(env);
       }),
@@ -805,6 +981,276 @@ describe("createServer lifecycle", () => {
   });
 
   it("persists stopped state even when Daytona cannot stop immediately", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-stop",
+      linear_issue_identifier: "OT-STOP",
+      linear_session_id: "session-stop",
+      sandbox_id: "sandbox-stop",
+      branch: "ot/ot-stop",
+      agent: "claude",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+    });
+    store.beginRun({
+      issueId: "issue-stop",
+      runId: "run-stop",
+      taskType: "implement",
+      tokenHash: "hash",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    const calls: string[] = [];
+    const sandbox = { stop: vi.fn(async () => {
+      calls.push("stop");
+      return Promise.reject(new Error("Daytona unavailable"));
+    }) };
+    const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
+    const app = createServer({
+      cfg,
+      store,
+      daytona,
+      getLinearClient: async () => ({
+        accessToken: "oauth",
+        fetch: vi.fn(async () =>
+          Response.json({
+            data: { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
+          })
+        ) as unknown as typeof fetch,
+      }),
+      linearOutboxProcessor: {
+        process: vi.fn(async () => undefined),
+        drain: vi.fn(async () => {
+          calls.push("drain");
+        }),
+      },
+    });
+    const prompted = JSON.stringify({
+      action: "prompted",
+      type: "AgentSessionEvent",
+      webhookId: "linear-stop",
+      webhookTimestamp: Date.now(),
+      organizationId: "org",
+      agentSession: { id: "session-stop" },
+      agentActivity: { id: "activity-stop", content: { type: "prompt", body: "/stop" } },
+    });
+
+    const response = await app.request("/webhooks/linear", {
+      method: "POST",
+      headers: signedLinear(prompted, "linear-stop"),
+      body: prompted,
+    });
+
+    expect(response.status).toBe(200);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(store.getByIssueId("issue-stop")).toMatchObject({
+      run_id: null,
+      state: "stopped",
+    });
+    expect(store.getRun("run-stop")?.status).toBe("stopped");
+    expect(store.listLinearOutbox()).toEqual([
+      expect.objectContaining({ kind: "activity", status: "pending" }),
+    ]);
+    expect(calls).toEqual(["stop", "drain"]);
+  });
+
+  it("routes new delegations from repo labels before registered team routes", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.registerRepository({
+      linearTeamKey: "OT",
+      linearTeamId: "team-1",
+      githubRepo: "owner/team-default",
+      baseBranch: "develop",
+      webhookId: 42,
+      snapshot: "openthrottle",
+    });
+    const routedCfg: Config = {
+      ...cfg,
+      githubRepoLabelMappings: { "Repo/web-app": "owner/web-app" },
+    };
+    let createParams: { envVars?: Record<string, string> } | undefined;
+    const sandbox = {
+      id: "sandbox-repo-label",
+      state: "started",
+      autoStopInterval: 60,
+      setAutostopInterval: vi.fn(async () => undefined),
+      updateEnv: vi.fn(async () => undefined),
+      fs: {
+        uploadFile: vi.fn(async () => undefined),
+        setFilePermissions: vi.fn(async () => undefined),
+      },
+      process: {
+        createSession: vi.fn(async () => undefined),
+        executeSessionCommand: vi.fn(async () => undefined),
+      },
+    };
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg: routedCfg,
+      store,
+      daytona: {
+        list: vi.fn(() => (async function* () {})()),
+        create: vi.fn(async (params: { envVars?: Record<string, string> }) => {
+          createParams = params;
+          return sandbox;
+        }),
+      } as unknown as Daytona,
+      getLinearClient: async () => ({
+        accessToken: "oauth",
+        fetch: vi.fn(async () =>
+          Response.json({
+            data: {
+              agentActivityCreate: { success: true, agentActivity: { id: "activity" } },
+              agentSessionUpdate: { success: true },
+            },
+          })
+        ) as unknown as typeof fetch,
+      }),
+      runBackground: (task) => background.push(task),
+    });
+    const created = JSON.stringify({
+      action: "created",
+      type: "AgentSessionEvent",
+      webhookId: "linear-repo-label",
+      webhookTimestamp: Date.now(),
+      organizationId: "org",
+      agentSession: {
+        id: "session-repo-label",
+        issue: {
+          id: "issue-repo-label",
+          identifier: "OT-REPO",
+          team: { id: "team-1", key: "OT" },
+          labels: [{ name: "Repo › Repo/web-app" }],
+        },
+      },
+    });
+
+    await app.request("/webhooks/linear", {
+      method: "POST",
+      headers: signedLinear(created, "linear-repo-label"),
+      body: created,
+    });
+    await Promise.all(background.splice(0));
+
+    expect(createParams?.envVars).toHaveProperty("GITHUB_REPO", "owner/web-app");
+    expect(createParams?.envVars).toHaveProperty("BASE_BRANCH", "main");
+    expect(store.getByIssueId("issue-repo-label")).toMatchObject({
+      repo: "owner/web-app",
+      base_branch: "main",
+      sandbox_id: "sandbox-repo-label",
+      state: "active",
+      run_id: expect.any(String),
+    });
+  });
+
+  it("starts a fresh workspace when re-delegation changes the routed repo", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-repo-switch",
+      linear_issue_identifier: "OT-REPO-SWITCH",
+      linear_session_id: "session-old",
+      sandbox_id: "sandbox-old-repo",
+      branch: "ot/ot-repo-switch",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+    });
+    store.beginRun({
+      issueId: "issue-repo-switch",
+      runId: "run-old-repo",
+      taskType: "implement",
+      tokenHash: "hash",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    const routedCfg: Config = {
+      ...cfg,
+      githubRepoLabelMappings: { "Repo/web-app": "owner/web-app" },
+    };
+    let createParams: { envVars?: Record<string, string> } | undefined;
+    const oldSandbox = {
+      stop: vi.fn(async () => undefined),
+      delete: vi.fn(async () => undefined),
+    };
+    const newSandbox = {
+      id: "sandbox-new-repo",
+      state: "started",
+      autoStopInterval: 60,
+      setAutostopInterval: vi.fn(async () => undefined),
+      updateEnv: vi.fn(async () => undefined),
+      fs: {
+        uploadFile: vi.fn(async () => undefined),
+        setFilePermissions: vi.fn(async () => undefined),
+      },
+      process: {
+        createSession: vi.fn(async () => undefined),
+        executeSessionCommand: vi.fn(async () => undefined),
+      },
+    };
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg: routedCfg,
+      store,
+      daytona: {
+        get: vi.fn(async () => oldSandbox),
+        list: vi.fn(() => (async function* () {})()),
+        create: vi.fn(async (params: { envVars?: Record<string, string> }) => {
+          createParams = params;
+          return newSandbox;
+        }),
+      } as unknown as Daytona,
+      getLinearClient: async () => ({
+        accessToken: "oauth",
+        fetch: vi.fn(async () =>
+          Response.json({
+            data: {
+              agentActivityCreate: { success: true, agentActivity: { id: "activity" } },
+              agentSessionUpdate: { success: true },
+            },
+          })
+        ) as unknown as typeof fetch,
+      }),
+      runBackground: (task) => background.push(task),
+    });
+    const created = JSON.stringify({
+      action: "created",
+      type: "AgentSessionEvent",
+      webhookId: "linear-repo-switch",
+      webhookTimestamp: Date.now(),
+      organizationId: "org",
+      agentSession: {
+        id: "session-repo-switch",
+        issue: {
+          id: "issue-repo-switch",
+          identifier: "OT-REPO-SWITCH",
+          team: { id: "team-1", key: "OT" },
+          labels: [{ name: "Repo › Repo/web-app" }],
+        },
+      },
+    });
+
+    await app.request("/webhooks/linear", {
+      method: "POST",
+      headers: signedLinear(created, "linear-repo-switch"),
+      body: created,
+    });
+    await Promise.all(background.splice(0));
+
+    expect(oldSandbox.stop).toHaveBeenCalledWith(60, true);
+    expect(oldSandbox.delete).toHaveBeenCalledWith(60, false);
+    expect(store.getRun("run-old-repo")?.status).toBe("stopped");
+    expect(createParams?.envVars).toHaveProperty("GITHUB_REPO", "owner/web-app");
+    expect(store.getByIssueId("issue-repo-switch")).toMatchObject({
+      repo: "owner/web-app",
+      sandbox_id: "sandbox-new-repo",
+      state: "active",
+    });
+  });
+
+  it("persists operator stop state even when Daytona cannot stop immediately", async () => {
     db = openDb(":memory:");
     const store = createTicketStore(db);
     store.upsert({
@@ -944,6 +1390,7 @@ describe("createServer lifecycle", () => {
     const sandbox = {
       id: "sandbox-review",
       state: "started",
+      setAutostopInterval: vi.fn(async () => undefined),
       updateEnv: vi.fn(async (env: Record<string, string>) => {
         envUpdates.push(env);
       }),
@@ -1245,6 +1692,138 @@ describe("createServer lifecycle", () => {
     expect(linearRequests.some((request) => request.includes("Merged"))).toBe(true);
   });
 
+  it("restores active mode when a new run starts during the prior run's idle transition", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-idle-race",
+      linear_issue_identifier: "OT-IDLE-RACE",
+      linear_session_id: "session-idle-race",
+      sandbox_id: "sandbox-idle-race",
+      branch: "ot/ot-idle-race",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+    });
+    const callbackToken = "callback-idle-race";
+    store.beginRun({
+      issueId: "issue-idle-race",
+      runId: "run-idle-race",
+      taskType: "implement",
+      tokenHash: createHash("sha256").update(callbackToken).digest("hex"),
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+
+    let releaseIdle!: () => void;
+    const idleReleased = new Promise<void>((resolve) => {
+      releaseIdle = resolve;
+    });
+    let markIdleStarted!: () => void;
+    const idleStarted = new Promise<void>((resolve) => {
+      markIdleStarted = resolve;
+    });
+    const autostopIntervals: number[] = [];
+    const sandbox = {
+      autoStopInterval: 60,
+      setAutostopInterval: vi.fn(async (minutes: number) => {
+        autostopIntervals.push(minutes);
+        if (minutes === 5) {
+          markIdleStarted();
+          await idleReleased;
+        }
+        sandbox.autoStopInterval = minutes;
+      }),
+    };
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg,
+      store,
+      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      getLinearClient: async () => undefined,
+      runBackground: (task) => background.push(task),
+    });
+
+    const completion = app.request("/runs/run-idle-race/complete", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${callbackToken}`,
+      },
+      body: JSON.stringify({ exit_code: 0 }),
+    });
+    await idleStarted;
+    store.beginRun({
+      issueId: "issue-idle-race",
+      runId: "run-after-idle-race",
+      taskType: "resume",
+      tokenHash: createHash("sha256").update("next-token").digest("hex"),
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    releaseIdle();
+
+    expect((await completion).status).toBe(200);
+    await Promise.all(background.splice(0));
+    expect(autostopIntervals).toEqual([5, 60]);
+    expect(sandbox.autoStopInterval).toBe(60);
+  });
+
+  it("preserves a failed run completion when Daytona cannot mark its sandbox idle", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-idle-failure",
+      linear_issue_identifier: "OT-IDLE-FAILURE",
+      linear_session_id: "session-idle-failure",
+      sandbox_id: "sandbox-idle-failure",
+      branch: "ot/ot-idle-failure",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+    });
+    const callbackToken = "callback-idle-failure";
+    store.beginRun({
+      issueId: "issue-idle-failure",
+      runId: "run-idle-failure",
+      taskType: "implement",
+      tokenHash: createHash("sha256").update(callbackToken).digest("hex"),
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    const setAutostopInterval = vi.fn(async () => {
+      throw new Error("Daytona unavailable");
+    });
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg,
+      store,
+      daytona: {
+        get: vi.fn(async () => ({ autoStopInterval: 60, setAutostopInterval })),
+      } as unknown as Daytona,
+      getLinearClient: async () => undefined,
+      runBackground: (task) => background.push(task),
+    });
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const response = await app.request("/runs/run-idle-failure/complete", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${callbackToken}`,
+      },
+      body: JSON.stringify({ exit_code: 1 }),
+    });
+    await Promise.all(background.splice(0));
+
+    expect(response.status).toBe(200);
+    expect(setAutostopInterval).toHaveBeenCalledWith(5);
+    expect(store.getRun("run-idle-failure")?.status).toBe("failed");
+    expect(store.getByIssueId("issue-idle-failure")).toMatchObject({
+      run_id: null,
+      state: "error",
+    });
+  });
+
   it("starts a fresh review after a successful review-fix callback despite a Linear notification outage", async () => {
     db = openDb(":memory:");
     const store = createTicketStore(db);
@@ -1268,8 +1847,10 @@ describe("createServer lifecycle", () => {
       expiresAt: "2099-01-01T00:00:00.000Z",
     });
     const envUpdates: Array<Record<string, string>> = [];
+    const setAutostopInterval = vi.fn(async (_minutes: number) => undefined);
     const sandbox = {
       state: "started",
+      setAutostopInterval,
       updateEnv: vi.fn(async (env: Record<string, string>) => {
         envUpdates.push(env);
       }),
@@ -1329,6 +1910,7 @@ describe("createServer lifecycle", () => {
         expect.objectContaining({ status: "pending", kind: "session_update" }),
       ])
     );
+    expect(setAutostopInterval.mock.calls.map(([minutes]) => minutes)).toEqual([5, 60]);
     expect(envUpdates.at(-1)).toMatchObject({ TASK_TYPE: "review", PR_NUMBER: "15" });
     const ticket = store.getByIssueId("issue-rereview")!;
     expect(ticket.run_id).not.toBe("run-rereview");
@@ -1428,7 +2010,11 @@ describe("createServer lifecycle", () => {
     const app = createServer({
       cfg,
       store,
-      daytona: {} as Daytona,
+      daytona: {
+        get: vi.fn(async () => ({
+          setAutostopInterval: vi.fn(async () => undefined),
+        })),
+      } as unknown as Daytona,
       getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
     });
 

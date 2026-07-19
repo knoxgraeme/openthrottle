@@ -201,6 +201,29 @@ function applyColumnMigrations(
   }
 }
 
+function backfillAgentSessions(db: Database.Database): void {
+  const timestamp = new Date().toISOString();
+  db.prepare(`
+    INSERT OR IGNORE INTO agent_sessions (
+      id, linear_issue_id, generation, state, created_at, updated_at
+    )
+    SELECT
+      tickets.linear_session_id,
+      tickets.linear_issue_id,
+      1,
+      CASE tickets.state WHEN 'stopped' THEN 'stopped' ELSE 'current' END,
+      COALESCE(tickets.created_at, ?),
+      COALESCE(tickets.updated_at, ?)
+    FROM tickets
+    WHERE tickets.linear_session_id IS NOT NULL
+      AND tickets.linear_session_id <> ''
+      AND NOT EXISTS (
+        SELECT 1 FROM agent_sessions
+        WHERE agent_sessions.linear_issue_id = tickets.linear_issue_id
+      )
+  `).run(timestamp, timestamp);
+}
+
 export type Agent = "claude" | "codex" | "opencode";
 export type TicketState = "active" | "closed" | "expired" | "error" | "stopped";
 export type TaskType = "implement" | "resume" | "review" | "review-fix" | "investigate";
@@ -382,6 +405,7 @@ export function openDb(path: string): Database.Database {
   applyColumnMigrations(db, "tickets", TICKET_MIGRATIONS);
   applyColumnMigrations(db, "webhook_deliveries", DELIVERY_MIGRATIONS);
   applyColumnMigrations(db, "runs", RUN_MIGRATIONS);
+  backfillAgentSessions(db);
   db.exec(
     "CREATE INDEX IF NOT EXISTS tickets_repo_branch_idx ON tickets(repo, branch);" +
       "CREATE INDEX IF NOT EXISTS tickets_sandbox_idx ON tickets(sandbox_id);" +
@@ -954,7 +978,7 @@ export function createTicketStore(db: Database.Database): TicketStore {
       db.prepare(`
         UPDATE session_work
         SET status = 'consumed', claimed_run_id = ?, consumed_at = ?
-        WHERE id = ? AND status = 'claimed'
+        WHERE id = ? AND status IN ('pending', 'claimed')
       `).run(runId, timestamp, workId);
     },
     releaseSessionWork(workId) {

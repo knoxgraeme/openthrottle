@@ -29,12 +29,15 @@ import {
 } from "./github.js";
 import {
   createForTicket,
+  deleteSandbox,
   findSandboxForTicket,
   getSandboxLogs,
   getSignedPreviewUrl,
   startTask,
+  stopSandbox,
   type SandboxEnvContract,
 } from "./daytona.js";
+import { reconcileSandboxAutostop } from "./sandbox-lifecycle.js";
 import { MAX_PRIVATE_LOG_TAIL_CHARS } from "./logs.js";
 import { sanitizeText } from "./sanitize.js";
 import {
@@ -91,6 +94,39 @@ function hasBearer(header: string | undefined, expected: string): boolean {
   return hashesMatch(actualHash, expectedHash);
 }
 
+async function settleSandboxAfterRun(params: {
+  daytona: Daytona;
+  store: TicketStore;
+  ticket: Ticket;
+  taskType: TaskType;
+}): Promise<void> {
+  const { daytona, store, ticket, taskType } = params;
+  if (!ticket.sandbox_id) return;
+
+  try {
+    await reconcileSandboxAutostop({
+      daytona,
+      store,
+      issueId: ticket.linear_issue_id,
+      sandboxId: ticket.sandbox_id,
+    });
+  } catch (error) {
+    console.error(
+      `[daytona] ${taskType} completed but sandbox ${ticket.sandbox_id} could not be reconciled:`,
+      error
+    );
+  }
+}
+
+function scheduleSandboxSettlement(
+  params: Parameters<typeof settleSandboxAfterRun>[0],
+  schedule?: (task: Promise<void>) => void
+): void {
+  const task = settleSandboxAfterRun(params);
+  if (schedule) schedule(task);
+  else void task.catch((error) => console.error("[daytona] sandbox settlement failed:", error));
+}
+
 function pickAgent(labels: string[], defaultAgent: Agent): Agent {
   if (labels.includes("agent:opencode")) return "opencode";
   if (labels.includes("agent:codex")) return "codex";
@@ -142,11 +178,24 @@ function branchFor(issueIdentifier: string): string {
   return `ot/${issueIdentifier.toLowerCase()}`;
 }
 
+function repoLabelKeys(label: string): string[] {
+  const trimmed = label.trim();
+  const withoutPrefix = trimmed.replace(/^Repo\s*(?:›|>|:|\/)\s*/i, "").trim();
+  return [...new Set([trimmed, withoutPrefix].filter(Boolean))];
+}
+
 function repositoryFor(
   cfg: Config,
   store: TicketStore,
-  issue: { team?: { id?: string; key?: string } }
+  issue: { team?: { id?: string; key?: string } },
+  labels: string[] = []
 ): { repo: string; baseBranch: string } | undefined {
+  for (const label of labels) {
+    for (const key of repoLabelKeys(label)) {
+      const byLabel = cfg.githubRepoLabelMappings[key];
+      if (byLabel) return { repo: byLabel, baseBranch: cfg.baseBranch };
+    }
+  }
   const registered = store.getRepositoryRegistration(issue.team?.id, issue.team?.key);
   if (registered) {
     return { repo: registered.github_repo, baseBranch: registered.base_branch };
@@ -411,6 +460,7 @@ async function launchExistingTask(params: {
       failureTail: message,
       ticketState: "error",
     });
+    scheduleSandboxSettlement({ daytona, store, ticket, taskType: params.taskType });
     await tryPostError(store, params.linearOutbox, ticket.linear_session_id, ticket.linear_issue_id, message);
     return false;
   }
@@ -582,6 +632,15 @@ export async function completeRun(
     return { status: 409, body: { error: "run no longer active" } };
   }
 
+  scheduleSandboxSettlement(
+    {
+      daytona: deps.daytona,
+      store: deps.store,
+      ticket,
+      taskType: run.task_type,
+    },
+    deps.schedule
+  );
   try {
     const sessionId = run.linear_session_id ?? ticket.linear_session_id;
     const costLine = costUsd === undefined ? "" : ` Cost: $${costUsd.toFixed(4)}.`;
@@ -1006,6 +1065,7 @@ async function handleCreated(
   const labels = extractLabelNames(payload);
   const existing = store.getByIssueId(issue.id);
   const selectedAgent = pickAgent(labels, existing?.agent ?? cfg.defaultAgent);
+  const selectedRepository = repositoryFor(cfg, store, issue, labels);
   if (!hasAgentSubscription(cfg, selectedAgent)) {
     await tryPostError(
       store,
@@ -1020,39 +1080,7 @@ async function handleCreated(
     payload,
     `# ${issue.identifier}\n\nNo Linear prompt context was supplied for this delegation.`
   );
-  if (existing?.sandbox_id && existing.state !== "closed" && existing.state !== "expired") {
-    const agentChanged = existing.agent !== selectedAgent;
-    store.upsert({
-      ...existing,
-      linear_session_id: sessionId,
-      agent: selectedAgent,
-      state: "active",
-    });
-    store.setLinearContext(issue.id, initialContext);
-    const current = store.getByIssueId(issue.id)!;
-    await launchExistingTask({
-      cfg,
-      store,
-      daytona,
-      linear,
-      linearOutbox,
-      ticket: current,
-      taskType: labels.includes("investigate")
-        ? "investigate"
-        : agentChanged
-          ? "implement"
-          : "resume",
-      resumeMessage: agentChanged
-        ? undefined
-        : "This ticket was re-delegated. Re-read it and continue from the existing branch.",
-      linearContext: initialContext,
-    });
-    return;
-  }
-
-  const taskType: TaskType = labels.includes("investigate") ? "investigate" : "implement";
-  const repository = repositoryFor(cfg, store, issue);
-  if (!repository) {
+  if (!selectedRepository) {
     await tryPostError(
       store,
       linearOutbox,
@@ -1062,6 +1090,61 @@ async function handleCreated(
     );
     return;
   }
+  if (existing?.sandbox_id && existing.state !== "closed" && existing.state !== "expired") {
+    const agentChanged = existing.agent !== selectedAgent;
+    const repoChanged =
+      existing.repo !== selectedRepository.repo ||
+      existing.base_branch !== selectedRepository.baseBranch;
+    if (repoChanged) {
+      if (existing.run_id) {
+        store.finishRun({
+          runId: existing.run_id,
+          status: "stopped",
+          failureTail: `Repository route changed from ${existing.repo} to ${selectedRepository.repo}; starting a fresh workspace.`,
+          ticketState: "active",
+        });
+      }
+      try {
+        await stopSandbox(daytona, existing.sandbox_id);
+        await deleteSandbox(daytona, existing.sandbox_id);
+      } catch (error) {
+        const message = sanitizeText(
+          `OpenThrottle resolved this ticket to ${selectedRepository.repo}, but could not delete the existing ${existing.repo} workspace: ${String(error)}`
+        );
+        await tryPostError(store, linearOutbox, sessionId, issue.id, message);
+        return;
+      }
+    } else {
+      store.upsert({
+        ...existing,
+        linear_session_id: sessionId,
+        agent: selectedAgent,
+        state: "active",
+      });
+      store.setLinearContext(issue.id, initialContext);
+      const current = store.getByIssueId(issue.id)!;
+      await launchExistingTask({
+        cfg,
+        store,
+        daytona,
+        linear,
+        linearOutbox,
+        ticket: current,
+        taskType: labels.includes("investigate")
+          ? "investigate"
+          : agentChanged
+            ? "implement"
+            : "resume",
+        resumeMessage: agentChanged
+          ? undefined
+          : "This ticket was re-delegated. Re-read it and continue from the existing branch.",
+        linearContext: initialContext,
+      });
+      return;
+    }
+  }
+
+  const taskType: TaskType = labels.includes("investigate") ? "investigate" : "implement";
   const ticketCore = {
     linear_issue_id: issue.id,
     linear_issue_identifier: issue.identifier,
@@ -1069,8 +1152,8 @@ async function handleCreated(
     sandbox_id: null,
     branch: branchFor(issue.identifier),
     agent: selectedAgent,
-    repo: repository.repo,
-    base_branch: repository.baseBranch,
+    repo: selectedRepository.repo,
+    base_branch: selectedRepository.baseBranch,
     pr_url: null,
     state: "active" as const,
   };
@@ -1154,6 +1237,7 @@ async function handleCreated(
     });
     throw error;
   }
+  const provisionedTicket = store.getByIssueId(issue.id)!;
 
   try {
     await startTask(sandbox, {
@@ -1170,16 +1254,17 @@ async function handleCreated(
       ticketState: "error",
     });
     await tryPostError(store, linearOutbox, sessionId, issue.id, message);
+    scheduleSandboxSettlement({ daytona, store, ticket: provisionedTicket, taskType });
     return;
   }
 
-  await reportCreatedWorkspace(cfg, store, linearOutbox, ticket, sandbox.id);
+  await reportCreatedWorkspace(cfg, store, linearOutbox, provisionedTicket, sandbox.id);
   try {
     await enqueueActivity(store, linearOutbox, {
       sessionId,
       type: "action",
       action: "Started",
-      parameter: `${taskType} run on ${ticket.branch}`,
+      parameter: `${taskType} run on ${provisionedTicket.branch}`,
     }, issue.id, run.id);
   } catch (error) {
     console.error(`[linear] ${taskType} started but its activity could not be posted:`, error);
@@ -1260,14 +1345,16 @@ async function handlePrompted(
     return;
   }
 
-  if (payload.agentActivity?.id) {
-    store.enqueueSessionWork({
-      id: payload.agentActivity.id,
+  const workId = payload.agentActivity?.id;
+  if (workId) {
+    const inserted = store.enqueueSessionWork({
+      id: workId,
       linearSessionId: sessionId,
       issueId: ticket.linear_issue_id,
       source: "human",
       body: sanitizeText(resumeMessage),
     });
+    if (!inserted) return;
   }
 
   await enqueueActivity(store, linearOutbox, {
@@ -1294,7 +1381,7 @@ async function handlePrompted(
     labels.includes("investigate") && /\b(fix it|implement|go ahead)\b/i.test(resumeMessage)
       ? "implement"
       : "resume";
-  await launchExistingTask({
+  const launched = await launchExistingTask({
     cfg,
     store,
     daytona,
@@ -1305,6 +1392,10 @@ async function handlePrompted(
     resumeMessage: taskType === "resume" ? resumeMessage : undefined,
     linearContext: nextContext,
   });
+  const runId = store.getByIssueId(ticket.linear_issue_id)?.run_id;
+  if (launched && workId && runId) {
+    store.markSessionWorkConsumed(workId, runId);
+  }
 }
 
 async function mergeFromLinear(
@@ -1468,6 +1559,7 @@ async function triggerReviewTask(
 }
 
 export async function expireRun(
+  daytona: Daytona,
   store: TicketStore,
   linearOutbox: LinearOutboxProcessor,
   run: Run
@@ -1481,6 +1573,7 @@ export async function expireRun(
     ticketState: "error",
   });
   if (ticket) {
+    scheduleSandboxSettlement({ daytona, store, ticket, taskType: run.task_type });
     await tryPostError(
       store,
       linearOutbox,

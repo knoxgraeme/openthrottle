@@ -88,9 +88,14 @@ describe("sandbox event contracts", () => {
       ["/home/agent/.ot/outbox/002.json", Buffer.from(completion)],
     ]);
     let failDeleteOnce = true;
+    const setAutostopInterval = vi.fn(async (minutes: number) => {
+      sandbox.autoStopInterval = minutes;
+    });
     const sandbox = {
       id: "sandbox-1",
       state: "started",
+      autoStopInterval: 5,
+      setAutostopInterval,
       process: {
         executeCommand: vi.fn(async () => ({
           exitCode: 0,
@@ -135,6 +140,8 @@ describe("sandbox event contracts", () => {
         logTail: "safe [REDACTED] [REDACTED]",
       })
     );
+    expect(setAutostopInterval).toHaveBeenCalledOnce();
+    expect(setAutostopInterval).toHaveBeenCalledWith(60);
     expect(files.size).toBe(0);
     expect(store.getSandboxEvent("11111111-1111-4111-8111-111111111111")?.status)
       .toBe("processed");
@@ -168,6 +175,7 @@ describe("sandbox event contracts", () => {
     const sandbox = {
       id: "sandbox-1",
       state: "started",
+      autoStopInterval: 60,
       fs: {
         listFiles: vi.fn(async () =>
           [...files.entries()].map(([path, value]) => ({
@@ -208,6 +216,49 @@ describe("sandbox event contracts", () => {
     expect(store.getSandboxEvent(activityId)?.status).toBe("processed");
   });
 
+  it("returns a sandbox to idle when a stale poll reactivates it after completion", async () => {
+    const store = seedRunningTicket();
+    let releaseActive!: () => void;
+    const activeReleased = new Promise<void>((resolve) => {
+      releaseActive = resolve;
+    });
+    let markActiveStarted!: () => void;
+    const activeStarted = new Promise<void>((resolve) => {
+      markActiveStarted = resolve;
+    });
+    const autostopIntervals: number[] = [];
+    const listFiles = vi.fn(async () => []);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 5,
+      setAutostopInterval: vi.fn(async (minutes: number) => {
+        autostopIntervals.push(minutes);
+        if (minutes === 60) {
+          markActiveStarted();
+          await activeReleased;
+        }
+        sandbox.autoStopInterval = minutes;
+      }),
+      fs: { listFiles },
+    } as unknown as Sandbox;
+    const polling = pollSandboxEvents({
+      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      store,
+      postActivity: vi.fn(),
+      finishCompletion: vi.fn(),
+    });
+
+    await activeStarted;
+    store.finishRun({ runId: "run-1", status: "completed", ticketState: "active" });
+    releaseActive();
+    await polling;
+
+    expect(autostopIntervals).toEqual([60, 5]);
+    expect(sandbox.autoStopInterval).toBe(5);
+    expect(listFiles).not.toHaveBeenCalled();
+  });
+
   it("discards a stale event without posting it into the current run", async () => {
     const store = seedRunningTicket();
     const stale = Buffer.from(JSON.stringify({
@@ -223,6 +274,7 @@ describe("sandbox event contracts", () => {
     const sandbox = {
       id: "sandbox-1",
       state: "started",
+      autoStopInterval: 60,
       fs: {
         listFiles: vi.fn(async () => [{
           name: "stale.json", path: "/home/agent/.ot/outbox/stale.json", size: stale.length, isDir: false,
@@ -265,6 +317,8 @@ describe("sandbox event contracts", () => {
     const sandbox = {
       id: "sandbox-1",
       state: "started",
+      autoStopInterval: 60,
+      setAutostopInterval: vi.fn(async () => undefined),
       fs: {
         listFiles: vi.fn(async () => [{
           name: "late.json", path: "/home/agent/.ot/outbox/late.json", size: late.length, isDir: false,

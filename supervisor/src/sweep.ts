@@ -26,7 +26,7 @@ export async function runSweep(
     getLinearClient: async () => linear,
   });
   for (const run of store.listExpiredRuns(new Date().toISOString())) {
-    await expireRun(store, linearOutbox, run);
+    await expireRun(daytona, store, linearOutbox, run);
   }
   await expireStaleTickets(daytona, store, linear, cfg);
   await deleteOrphanSandboxes(daytona, store, cfg);
