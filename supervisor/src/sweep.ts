@@ -21,7 +21,7 @@ export async function runSweep(
   cfg: Config
 ): Promise<void> {
   for (const run of store.listExpiredRuns(new Date().toISOString())) {
-    await expireRun(store, linear, run);
+    await expireRun(daytona, store, linear, run);
   }
   await expireStaleTickets(daytona, store, linear, cfg);
   await deleteOrphanSandboxes(daytona, store, cfg);

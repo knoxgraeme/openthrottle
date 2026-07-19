@@ -36,6 +36,7 @@ import {
   startTask,
   type SandboxEnvContract,
 } from "./daytona.js";
+import { reconcileSandboxAutostop } from "./sandbox-lifecycle.js";
 import { MAX_PRIVATE_LOG_TAIL_CHARS } from "./logs.js";
 import { sanitizeText } from "./sanitize.js";
 import {
@@ -83,6 +84,39 @@ function hasBearer(header: string | undefined, expected: string): boolean {
   const actualHash = tokenHash(actual);
   const expectedHash = tokenHash(expected);
   return hashesMatch(actualHash, expectedHash);
+}
+
+async function settleSandboxAfterRun(params: {
+  daytona: Daytona;
+  store: TicketStore;
+  ticket: Ticket;
+  taskType: TaskType;
+}): Promise<void> {
+  const { daytona, store, ticket, taskType } = params;
+  if (!ticket.sandbox_id) return;
+
+  try {
+    await reconcileSandboxAutostop({
+      daytona,
+      store,
+      issueId: ticket.linear_issue_id,
+      sandboxId: ticket.sandbox_id,
+    });
+  } catch (error) {
+    console.error(
+      `[daytona] ${taskType} completed but sandbox ${ticket.sandbox_id} could not be reconciled:`,
+      error
+    );
+  }
+}
+
+function scheduleSandboxSettlement(
+  params: Parameters<typeof settleSandboxAfterRun>[0],
+  schedule?: (task: Promise<void>) => void
+): void {
+  const task = settleSandboxAfterRun(params);
+  if (schedule) schedule(task);
+  else void task.catch((error) => console.error("[daytona] sandbox settlement failed:", error));
 }
 
 function pickAgent(labels: string[], defaultAgent: Agent): Agent {
@@ -356,6 +390,7 @@ async function launchExistingTask(params: {
       failureTail: message,
       ticketState: "error",
     });
+    scheduleSandboxSettlement({ daytona, store, ticket, taskType: params.taskType });
     await tryPostError(linear, ticket.linear_session_id, message);
     return false;
   }
@@ -477,6 +512,15 @@ export async function completeRun(
     return { status: 409, body: { error: "run no longer active" } };
   }
 
+  scheduleSandboxSettlement(
+    {
+      daytona: deps.daytona,
+      store: deps.store,
+      ticket,
+      taskType: run.task_type,
+    },
+    deps.schedule
+  );
   const linear = await deps.getLinearClient();
   if (linear) {
     try {
@@ -993,6 +1037,7 @@ async function handleCreated(
     });
     throw error;
   }
+  const provisionedTicket = store.getByIssueId(issue.id)!;
 
   try {
     await startTask(sandbox, {
@@ -1008,17 +1053,18 @@ async function handleCreated(
       failureTail: message,
       ticketState: "error",
     });
+    scheduleSandboxSettlement({ daytona, store, ticket: provisionedTicket, taskType });
     await tryPostError(linear, sessionId, message);
     return;
   }
 
-  await reportCreatedWorkspace(cfg, store, linear, ticket, sandbox.id);
+  await reportCreatedWorkspace(cfg, store, linear, provisionedTicket, sandbox.id);
   try {
     await agentActivityCreate(linear, {
       sessionId,
       type: "action",
       action: "Started",
-      parameter: `${taskType} run on ${ticket.branch}`,
+      parameter: `${taskType} run on ${provisionedTicket.branch}`,
     });
   } catch (error) {
     console.error(`[linear] ${taskType} started but its activity could not be posted:`, error);
@@ -1280,6 +1326,7 @@ async function triggerReviewTask(
 }
 
 export async function expireRun(
+  daytona: Daytona,
   store: TicketStore,
   linear: LinearClient | undefined,
   run: Run
@@ -1292,5 +1339,8 @@ export async function expireRun(
     failureTail: message,
     ticketState: "error",
   });
+  if (ticket) {
+    scheduleSandboxSettlement({ daytona, store, ticket, taskType: run.task_type });
+  }
   if (ticket) await tryPostError(linear, ticket.linear_session_id, message);
 }
