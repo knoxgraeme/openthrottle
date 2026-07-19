@@ -336,7 +336,13 @@ describe("TicketStore", () => {
     `);
     legacy.close();
     db = openDb(path);
-    expect(createTicketStore(db).getByIssueId("issue-legacy")?.base_branch).toBe("main");
+    const store = createTicketStore(db);
+    expect(store.getByIssueId("issue-legacy")?.base_branch).toBe("main");
+    expect(store.getByIssueId("issue-legacy")?.pending_re_review).toBe(0);
+    store.setPendingReReview("issue-legacy", true);
+    expect(store.getByIssueId("issue-legacy")?.pending_re_review).toBe(1);
+    store.setPendingReReview("issue-legacy", false);
+    expect(store.getByIssueId("issue-legacy")?.pending_re_review).toBe(0);
   });
 
   it("backfills current agent sessions for legacy tickets", () => {

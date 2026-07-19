@@ -16,6 +16,7 @@ import {
 import {
   commentOnPullRequest,
   countChangesRequestedReviews,
+  getAuthenticatedLogin,
   getMergeReadiness,
   isGithubPullRequestUrl,
   isOpenthrottleBranch,
@@ -163,14 +164,53 @@ function linearContext(
   return payload.promptContext?.trim() || fallback;
 }
 
-function hasTerminalSandboxActivity(store: TicketStore, runId: string): boolean {
+const githubLoginCache = new Map<string, string>();
+
+async function selfGithubLogin(cfg: Config): Promise<string | undefined> {
+  const cached = githubLoginCache.get(cfg.githubToken);
+  if (cached) return cached;
+  try {
+    const login = await getAuthenticatedLogin({ token: cfg.githubToken });
+    githubLoginCache.set(cfg.githubToken, login);
+    return login;
+  } catch (error) {
+    console.error("[github] could not resolve the token account for self-feedback filtering:", error);
+    return undefined;
+  }
+}
+
+function prFeedbackMessage(
+  author: string | undefined,
+  pullNumber: number,
+  url: string,
+  body: string | undefined
+): string {
+  const excerpt = body?.trim() ? `\n\n${sanitizeText(body).slice(0, 2_000)}` : "";
+  return (
+    `New PR feedback from ${author ?? "a reviewer"} on PR #${pullNumber}: ${url}${excerpt}\n\n` +
+    "Triage this feedback the review-fix way: apply the clear fixes, reply on the " +
+    "thread with your reasoning where no change is needed, and batch " +
+    "decision-required items into one elicitation. Leave nothing unaddressed, and " +
+    "end with your assumptions and decisions."
+  );
+}
+
+type TerminalActivityType = "elicitation" | "response" | "error";
+
+function lastTerminalSandboxActivity(
+  store: TicketStore,
+  runId: string
+): TerminalActivityType | undefined {
   const event = store.getLastProcessedSandboxActivity(runId);
-  if (!event) return false;
+  if (!event) return undefined;
   try {
     const payload = JSON.parse(event.payload) as { type?: string };
-    return ["elicitation", "response", "error"].includes(payload.type ?? "");
+    const type = payload.type ?? "";
+    return ["elicitation", "response", "error"].includes(type)
+      ? (type as TerminalActivityType)
+      : undefined;
   } catch {
-    return false;
+    return undefined;
   }
 }
 
@@ -643,10 +683,12 @@ export async function completeRun(
     },
     deps.schedule
   );
+  const terminalActivity = lastTerminalSandboxActivity(deps.store, run.id);
+  const pausedOnDecisions = exitCode === 0 && terminalActivity === "elicitation";
   try {
     const sessionId = run.linear_session_id ?? ticket.linear_session_id;
     const costLine = costUsd === undefined ? "" : ` Cost: $${costUsd.toFixed(4)}.`;
-    const agentAlreadyConcluded = hasTerminalSandboxActivity(deps.store, run.id);
+    const agentAlreadyConcluded = terminalActivity !== undefined;
     if (exitCode === 0 && !agentAlreadyConcluded) {
       await enqueueActivity(deps.store, outbox, {
         sessionId,
@@ -671,7 +713,7 @@ export async function completeRun(
     console.error(`[linear] ${run.task_type} completed but its notification could not be enqueued:`, error);
   }
 
-  if (run.task_type === "review-fix" && exitCode === 0 && prUrl) {
+  if (run.task_type === "review-fix" && exitCode === 0 && prUrl && !pausedOnDecisions) {
     const linear = await deps.getLinearClient();
     if (linear && ticket && await drainNextSessionWork({
       cfg: deps.cfg,
@@ -681,8 +723,10 @@ export async function completeRun(
       linearOutbox: outbox,
       ticket,
     })) {
+      deps.store.setPendingReReview(ticket.linear_issue_id, true);
       return { status: 200, body: { ok: true } };
     }
+    deps.store.setPendingReReview(ticket.linear_issue_id, false);
     const pull = parsePullRequestUrl(prUrl);
     const task = triggerReviewTask(
       deps.cfg,
@@ -697,6 +741,15 @@ export async function completeRun(
     if (deps.schedule) deps.schedule(task);
     else await task;
   } else if (exitCode === 0) {
+    if (run.task_type === "review-fix" && pausedOnDecisions) {
+      deps.store.setPendingReReview(ticket.linear_issue_id, true);
+    }
+    if (pausedOnDecisions) {
+      // The agent is waiting on a human decision. Leave queued session work
+      // pending so nothing resumes the session before the answer arrives; the
+      // answer launches directly and the queue drains after that run.
+      return { status: 200, body: { ok: true } };
+    }
     const linear = await deps.getLinearClient();
     if (linear && ticket) {
       const task = drainNextSessionWork({
@@ -706,8 +759,28 @@ export async function completeRun(
         linear,
         linearOutbox: outbox,
         ticket,
+      }).then(async (drained) => {
+        if (drained || run.task_type === "review") return;
+        const current = deps.store.getByIssueId(ticket.linear_issue_id);
+        const pendingPrUrl = prUrl ?? current?.pr_url ?? undefined;
+        if (
+          !current?.pending_re_review ||
+          current.state !== "active" ||
+          !isGithubPullRequestUrl(pendingPrUrl)
+        ) return;
+        deps.store.setPendingReReview(current.linear_issue_id, false);
+        await triggerReviewTask(
+          deps.cfg,
+          deps.store,
+          deps.daytona,
+          linear,
+          outbox,
+          current,
+          parsePullRequestUrl(pendingPrUrl).number,
+          "review"
+        );
       });
-      if (deps.schedule) deps.schedule(task.then(() => undefined));
+      if (deps.schedule) deps.schedule(task);
       else await task;
     }
   }
@@ -1489,18 +1562,86 @@ async function handleGithubEvent(
         parameter: `${event.review.user?.login ?? "reviewer"}: ${event.review.state}`,
         result: event.review.html_url,
       }, ticket.linear_issue_id);
-      if (event.review.state.toLowerCase() === "changes_requested") {
-        await triggerReviewTask(
-          cfg,
-          store,
-          daytona,
-          linear,
-          linearOutbox,
-          ticket,
-          event.pull_request.number,
-          "review-fix"
-        );
+      const reviewState = event.review.state.toLowerCase();
+      if (reviewState !== "changes_requested" && reviewState !== "commented") return;
+      if (ticket.state !== "active") return;
+      const author = event.review.user?.login;
+      if (reviewState === "commented") {
+        // Comment-grade feedback (e.g. a bot review) is actionable only when it
+        // is provably not the agent's own account; fail closed otherwise.
+        const self = await selfGithubLogin(cfg);
+        if (!author || !self || author === self) return;
       }
+      if (ticket.run_id) {
+        store.enqueueSessionWork({
+          id: `gh-review-${event.review.id}`,
+          linearSessionId: ticket.linear_session_id,
+          issueId: ticket.linear_issue_id,
+          source: "automatic",
+          body: prFeedbackMessage(
+            author,
+            event.pull_request.number,
+            event.review.html_url,
+            event.review.body
+          ),
+        });
+        return;
+      }
+      await triggerReviewTask(
+        cfg,
+        store,
+        daytona,
+        linear,
+        linearOutbox,
+        ticket,
+        event.pull_request.number,
+        "review-fix"
+      );
+      return;
+  }
+
+  if (event.kind === "issue_comment") {
+      if (event.action !== "created" || !event.issue.pull_request) return;
+      const ticket = store.getByPrUrl(
+        event.repository.full_name,
+        `https://github.com/${event.repository.full_name}/pull/${event.issue.number}`
+      );
+      if (!ticket || !linear || ticket.state !== "active") return;
+      const author = event.comment.user?.login;
+      const self = await selfGithubLogin(cfg);
+      if (!author || !self || author === self) return;
+      await enqueueActivity(store, linearOutbox, {
+        sessionId: ticket.linear_session_id,
+        type: "action",
+        action: "PR comment",
+        parameter: author,
+        result: event.comment.html_url,
+      }, ticket.linear_issue_id);
+      if (ticket.run_id) {
+        store.enqueueSessionWork({
+          id: `gh-comment-${event.comment.id}`,
+          linearSessionId: ticket.linear_session_id,
+          issueId: ticket.linear_issue_id,
+          source: "automatic",
+          body: prFeedbackMessage(
+            author,
+            event.issue.number,
+            event.comment.html_url,
+            event.comment.body
+          ),
+        });
+        return;
+      }
+      await triggerReviewTask(
+        cfg,
+        store,
+        daytona,
+        linear,
+        linearOutbox,
+        ticket,
+        event.issue.number,
+        "review-fix"
+      );
       return;
   }
 
@@ -1532,11 +1673,17 @@ async function triggerReviewTask(
   taskType: "review" | "review-fix"
 ): Promise<void> {
   if (!linear) return;
-  const round = await countChangesRequestedReviews(
+  const changesRequested = await countChangesRequestedReviews(
     { token: cfg.githubToken },
     ticket.repo,
     pullNumber
   );
+  // Comment-triggered fixes never raise the CHANGES_REQUESTED count, so bound
+  // them by the ticket's own review-fix run history as well.
+  const round =
+    taskType === "review-fix"
+      ? Math.max(changesRequested, store.countRunsByType(ticket.linear_issue_id, "review-fix"))
+      : changesRequested;
   if (round >= cfg.reviewMaxRounds) {
     const message = `Review rounds exhausted (${round}/${cfg.reviewMaxRounds}) — needs a human decision.`;
     await enqueueActivity(store, linearOutbox, {

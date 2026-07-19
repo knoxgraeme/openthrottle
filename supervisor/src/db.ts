@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS tickets (
   preview_token_hash TEXT,
   linear_context TEXT,
   base_branch TEXT NOT NULL DEFAULT 'main',
+  pending_re_review INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -168,6 +169,7 @@ const TICKET_MIGRATIONS: Array<[string, string]> = [
   ["preview_token_hash", "ALTER TABLE tickets ADD COLUMN preview_token_hash TEXT"],
   ["linear_context", "ALTER TABLE tickets ADD COLUMN linear_context TEXT"],
   ["base_branch", "ALTER TABLE tickets ADD COLUMN base_branch TEXT NOT NULL DEFAULT 'main'"],
+  ["pending_re_review", "ALTER TABLE tickets ADD COLUMN pending_re_review INTEGER NOT NULL DEFAULT 0"],
 ];
 
 const RUN_MIGRATIONS: Array<[string, string]> = [
@@ -246,6 +248,7 @@ export interface Ticket {
   preview_token_hash: string | null;
   linear_context: string | null;
   base_branch: string;
+  pending_re_review: number;
   created_at: string;
   updated_at: string;
 }
@@ -421,10 +424,12 @@ export interface TicketStore {
   getByIssueId(issueId: string): Ticket | undefined;
   getByIdentifier(identifier: string): Ticket | undefined;
   getByBranch(repo: string, branch: string): Ticket | undefined;
+  getByPrUrl(repo: string, prUrl: string): Ticket | undefined;
   getBySandboxId(sandboxId: string): Ticket | undefined;
   setSandboxId(issueId: string, sandboxId: string | null): void;
   setState(issueId: string, state: TicketState, lastError?: string): void;
   setPrUrl(issueId: string, prUrl: string): void;
+  setPendingReReview(issueId: string, pending: boolean): void;
   setPreviewTokenHash(issueId: string, tokenHash: string): void;
   setLinearContext(issueId: string, context: string): void;
   listActive(): Ticket[];
@@ -483,6 +488,7 @@ export interface TicketStore {
   getRun(runId: string): Run | undefined;
   getLatestRun(issueId: string): Run | undefined;
   getLatestRunWithLog(issueId: string): Run | undefined;
+  countRunsByType(issueId: string, taskType: TaskType): number;
   finishRun(params: FinishRunParams): Run | undefined;
   listExpiredRuns(nowIso: string): Run[];
   insertSandboxEvent(params: {
@@ -530,6 +536,12 @@ export function createTicketStore(db: Database.Database): TicketStore {
     "SELECT * FROM tickets WHERE lower(linear_issue_identifier) = lower(?)"
   );
   const getByBranchStmt = db.prepare("SELECT * FROM tickets WHERE repo = ? AND branch = ?");
+  const getByPrUrlStmt = db.prepare(
+    "SELECT * FROM tickets WHERE lower(repo) = lower(?) AND lower(pr_url) = lower(?)"
+  );
+  const countRunsByTypeStmt = db.prepare(
+    "SELECT COUNT(*) AS count FROM runs WHERE linear_issue_id = ? AND task_type = ?"
+  );
   const getBySandboxIdStmt = db.prepare("SELECT * FROM tickets WHERE sandbox_id = ?");
   const setSandboxIdStmt = db.prepare(
     "UPDATE tickets SET sandbox_id = ?, updated_at = ? WHERE linear_issue_id = ?"
@@ -539,6 +551,9 @@ export function createTicketStore(db: Database.Database): TicketStore {
   );
   const setPrUrlStmt = db.prepare(
     "UPDATE tickets SET pr_url = ?, updated_at = ? WHERE linear_issue_id = ?"
+  );
+  const setPendingReReviewStmt = db.prepare(
+    "UPDATE tickets SET pending_re_review = ?, updated_at = ? WHERE linear_issue_id = ?"
   );
   const setPreviewTokenHashStmt = db.prepare(
     "UPDATE tickets SET preview_token_hash = ?, updated_at = ? WHERE linear_issue_id = ?"
@@ -907,6 +922,9 @@ export function createTicketStore(db: Database.Database): TicketStore {
     getByBranch(repo, branch) {
       return getByBranchStmt.get(repo, branch) as Ticket | undefined;
     },
+    getByPrUrl(repo, prUrl) {
+      return getByPrUrlStmt.get(repo, prUrl) as Ticket | undefined;
+    },
     getBySandboxId(sandboxId) {
       return getBySandboxIdStmt.get(sandboxId) as Ticket | undefined;
     },
@@ -918,6 +936,9 @@ export function createTicketStore(db: Database.Database): TicketStore {
     },
     setPrUrl(issueId, prUrl) {
       setPrUrlStmt.run(prUrl, now(), issueId);
+    },
+    setPendingReReview(issueId, pending) {
+      setPendingReReviewStmt.run(pending ? 1 : 0, now(), issueId);
     },
     setPreviewTokenHash(issueId, tokenHash) {
       setPreviewTokenHashStmt.run(tokenHash, now(), issueId);
@@ -1112,6 +1133,9 @@ export function createTicketStore(db: Database.Database): TicketStore {
     },
     getLatestRunWithLog(issueId) {
       return getLatestRunWithLogStmt.get(issueId) as Run | undefined;
+    },
+    countRunsByType(issueId, taskType) {
+      return (countRunsByTypeStmt.get(issueId, taskType) as { count: number }).count;
     },
     finishRun(params) {
       return finishRunTransaction(params);

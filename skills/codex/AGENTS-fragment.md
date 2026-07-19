@@ -89,6 +89,26 @@ matches the moment:
 If `ot-activity` fails, leave durable context in the PR or GitHub issue via
 `gh` and note the failure in your final output.
 
+## Decision gate, no backlog, assumptions ledger
+
+- **Ask before risky changes.** Never implement a critical, foundational, or
+  risky change — schema or data migrations, auth or security behavior, public
+  API or contract changes, architecture rework, dependency changes,
+  destructive or hard-to-reverse operations, or anything with more than one
+  defensible interpretation — without a human answer. Ship the clear,
+  decision-independent work first, then send one `ot-activity elicitation`
+  containing a numbered decision list: context, options, and your recommended
+  option for each. The reply resumes this same session; then action the
+  answers.
+- **Never backlog.** Every review item or discovered issue ends a run in
+  exactly one state: fixed and pushed, answered on its thread with reasoning,
+  or escalated as a numbered decision. Silently deferring or dropping an item
+  is a failure.
+- **List your assumptions.** Every `response` (and the PR description for
+  work that ships code) ends with an "Assumptions & decisions" section listing
+  each judgment call made without asking — what was assumed, why, and where —
+  so a human can audit it quickly.
+
 ## Which skill you're running
 
 - `implement-plan` — plan gate, then `ce-work`, `ce-code-review`, shipping, and

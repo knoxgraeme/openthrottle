@@ -44,6 +44,20 @@ describe("OpenThrottle Compound Engineering adapters", () => {
     expect(adapter("opencode", "investigate")).not.toContain("mode:pipeline ~/.ot/linear-context.md");
   });
 
+  it("keeps the decision gate, no-backlog rule, and assumptions ledger in every form", () => {
+    for (const engine of ["claude", "codex", "opencode"]) {
+      for (const task of ["implement-plan", "review-fix", "investigate"]) {
+        const body = adapter(engine, task);
+        expect(body).toContain("elicitation");
+        expect(body).toContain("Assumptions & decisions");
+      }
+      const reviewFix = adapter(engine, "review-fix");
+      expect(reviewFix).toContain("decision-required");
+      expect(reviewFix).toContain("Never defer, backlog,");
+      expect(adapter(engine, "review")).toContain("decision-required");
+    }
+  });
+
   it("passes the runtime PR number to Codex review", () => {
     expect(adapter("codex", "review")).toContain("mode:agent $PR_NUMBER");
     expect(adapter("codex", "review")).not.toContain("mode:agent PR_NUMBER");

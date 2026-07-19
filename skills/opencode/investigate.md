@@ -15,8 +15,14 @@ divergent product or architecture decisions.
    invoke `$ce-commit-push-pr` with
    `mode:pipeline branding:on babysit:off`. Then invoke `$ce-babysit-pr` with
    `mode:pipeline <PR URL>`. Never merge the PR.
-4. Run `ot-activity response` with root cause and one of: fixed PR,
-   diagnosed-no-fix, flaky-infra, or needs-human. Include the PR URL and invite
-   a reply when applicable.
+4. If the fix is blocked on a divergent product or architecture decision that
+   a specific answer would unblock, run `ot-activity elicitation` with the
+   diagnosis and one numbered decision list (context, options, and your
+   recommended option), then stop; the reply resumes this session. Otherwise
+   run `ot-activity response` with root cause and one of: fixed PR,
+   diagnosed-no-fix, flaky-infra, or needs-human, ending in an
+   "Assumptions & decisions" section listing every judgment call made
+   without asking.
+   Include the PR URL and invite a reply when applicable.
 
 The expected native sequence is in `OT_CE_PIPELINE` and runtime context below.

@@ -32,6 +32,24 @@ describe("GitHub contracts", () => {
       },
     });
     expect(parseGithubWebhook("pull_request", raw).kind).toBe("pull_request");
+    const comment = JSON.stringify({
+      action: "created",
+      repository: { full_name: "o/r" },
+      issue: { number: 1, pull_request: { url: "https://api.github.com/repos/o/r/pulls/1" } },
+      comment: {
+        id: 7,
+        body: "Please double-check the retry logic.",
+        html_url: "https://github.com/o/r/pull/1#issuecomment-7",
+        user: { login: "reviewer" },
+      },
+    });
+    expect(parseGithubWebhook("issue_comment", comment).kind).toBe("issue_comment");
+    expect(() =>
+      parseGithubWebhook(
+        "issue_comment",
+        JSON.stringify({ action: "created", repository: { full_name: "o/r" }, issue: { number: 1 } })
+      )
+    ).toThrow(/comment/);
     expect(() => parseGithubWebhook("issues", raw)).toThrow(/Unsupported/);
     expect(() => parseGithubWebhook("pull_request", "[]")).toThrow(/object/);
     expect(() =>
@@ -96,7 +114,13 @@ describe("GitHub contracts", () => {
         expect(JSON.parse(String(init.body))).toEqual({
           name: "web",
           active: true,
-          events: ["pull_request", "pull_request_review", "workflow_run", "check_suite"],
+          events: [
+            "pull_request",
+            "pull_request_review",
+            "issue_comment",
+            "workflow_run",
+            "check_suite",
+          ],
           config: {
             url: "https://ot.test/webhooks/github",
             content_type: "json",
