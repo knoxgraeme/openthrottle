@@ -2,6 +2,9 @@ import type { Daytona, Sandbox } from "@daytona/sdk";
 import type { Config } from "./config.js";
 import type { Agent, TaskType } from "./db.js";
 
+const ACTIVE_SANDBOX_AUTOSTOP_MINUTES = 60;
+const IDLE_SANDBOX_AUTOSTOP_MINUTES = 5;
+
 export interface SandboxEnvContract {
   TASK_TYPE: TaskType;
   AGENT: Agent;
@@ -30,6 +33,16 @@ export function toEnvVars(env: SandboxEnvContract): Record<string, string> {
   );
 }
 
+function ensureSandboxAutostop(sandbox: Sandbox, minutes: number): Promise<void> {
+  return sandbox.autoStopInterval === minutes
+    ? Promise.resolve()
+    : sandbox.setAutostopInterval(minutes);
+}
+
+export function ensureSandboxActive(sandbox: Sandbox): Promise<void> {
+  return ensureSandboxAutostop(sandbox, ACTIVE_SANDBOX_AUTOSTOP_MINUTES);
+}
+
 export async function createForTicket(
   daytona: Daytona,
   cfg: Config,
@@ -43,7 +56,7 @@ export async function createForTicket(
       ticket: params.issueIdentifier,
     },
     public: false,
-    autoStopInterval: 60,
+    autoStopInterval: ACTIVE_SANDBOX_AUTOSTOP_MINUTES,
     autoDeleteInterval: -1,
   });
 }
@@ -84,12 +97,18 @@ export async function startTask(
     "ANTHROPIC_API_KEY",
     "CODEX_API_KEY",
   ] as const;
-  await sandbox.updateEnv(envVars, {
-    unset: [
-      ...optionalNames.filter((name) => params.env[name] === undefined),
-      ...retiredSecretNames,
-    ],
-  });
+  const activateSandbox = ensureSandboxActive(sandbox);
+  const [activationResult, envResult] = await Promise.allSettled([
+    activateSandbox,
+    sandbox.updateEnv(envVars, {
+      unset: [
+        ...optionalNames.filter((name) => params.env[name] === undefined),
+        ...retiredSecretNames,
+      ],
+    }),
+  ]);
+  if (activationResult.status === "rejected") throw activationResult.reason;
+  if (envResult.status === "rejected") throw envResult.reason;
   await sandbox.fs.uploadFile(
     Buffer.from(params.linearContext),
     "/home/agent/.ot/linear-context.md"
@@ -111,6 +130,16 @@ export async function startTask(
     },
     params.taskTimeoutSeconds
   );
+}
+
+export async function setSandboxActive(daytona: Daytona, sandboxId: string): Promise<void> {
+  const sandbox = await daytona.get(sandboxId);
+  await ensureSandboxActive(sandbox);
+}
+
+export async function setSandboxIdle(daytona: Daytona, sandboxId: string): Promise<void> {
+  const sandbox = await daytona.get(sandboxId);
+  await ensureSandboxAutostop(sandbox, IDLE_SANDBOX_AUTOSTOP_MINUTES);
 }
 
 export async function stopSandbox(daytona: Daytona, sandboxId: string): Promise<void> {

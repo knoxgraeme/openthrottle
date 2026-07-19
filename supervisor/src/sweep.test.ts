@@ -30,7 +30,7 @@ describe("runSweep", () => {
         state: "active",
       });
     addTicket("stale", "sandbox-stale");
-    addTicket("timed", null);
+    addTicket("timed", "sandbox-timed");
     addTicket("stopped", "known-stopped");
     addTicket("errored", "known-errored");
     addTicket("closed", "known-closed");
@@ -52,6 +52,13 @@ describe("runSweep", () => {
     db.prepare("UPDATE webhook_deliveries SET received_at = ?").run("2020-01-01T00:00:00.000Z");
 
     const staleSandbox = { id: "sandbox-stale", delete: vi.fn(async () => undefined) };
+    const timedSandbox = {
+      id: "sandbox-timed",
+      autoStopInterval: 60,
+      setAutostopInterval: vi.fn(async (minutes: number) => {
+        timedSandbox.autoStopInterval = minutes;
+      }),
+    };
     const oldOrphan = {
       id: "old-orphan",
       createdAt: "2020-01-01T00:00:00.000Z",
@@ -79,7 +86,9 @@ describe("runSweep", () => {
     } as unknown as Sandbox;
     const deleteOrphan = vi.fn(async () => undefined);
     const daytona = {
-      get: vi.fn(async () => staleSandbox),
+      get: vi.fn(async (sandboxId: string) =>
+        sandboxId === timedSandbox.id ? timedSandbox : staleSandbox
+      ),
       delete: deleteOrphan,
       list: async function* () {
         yield oldOrphan;
@@ -101,6 +110,7 @@ describe("runSweep", () => {
 
     expect(store.getRun("run-timed")?.status).toBe("timed_out");
     expect(store.getByIssueId("timed")?.state).toBe("error");
+    expect(timedSandbox.setAutostopInterval).toHaveBeenCalledWith(5);
     expect(store.getByIssueId("stale")?.state).toBe("expired");
     expect(staleSandbox.delete).toHaveBeenCalledOnce();
     expect(deleteOrphan).toHaveBeenCalledTimes(2);

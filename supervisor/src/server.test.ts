@@ -90,11 +90,16 @@ describe("createServer lifecycle", () => {
     }) as unknown as typeof fetch;
     const linear: LinearClient = { accessToken: "oauth", fetch: linearFetch };
 
-    let createParams: { envVars?: Record<string, string> } | undefined;
+    let createParams:
+      | { envVars?: Record<string, string>; autoStopInterval?: number }
+      | undefined;
     const executeSessionCommand = vi.fn(async () => undefined);
+    const setAutostopInterval = vi.fn(async (_minutes: number) => undefined);
     const sandbox = {
       id: "sandbox-1",
       state: "started",
+      autoStopInterval: 60,
+      setAutostopInterval,
       updateEnv: vi.fn(async () => undefined),
       fs: {
         uploadFile: vi.fn(async () => undefined),
@@ -160,6 +165,7 @@ describe("createServer lifecycle", () => {
     await Promise.all(background.splice(0));
     expect(daytona.create).toHaveBeenCalledTimes(1);
     expect(executeSessionCommand).toHaveBeenCalledOnce();
+    expect(createParams?.autoStopInterval).toBe(60);
     expect(createParams?.envVars).not.toHaveProperty("LINEAR_ACCESS_TOKEN");
     expect(createParams?.envVars).not.toHaveProperty("LINEAR_MCP_API_KEY");
     expect(createParams?.envVars).not.toHaveProperty("LINEAR_SESSION_ID");
@@ -223,7 +229,9 @@ describe("createServer lifecycle", () => {
         pr_url: "https://github.com/owner/target/pull/7",
       }),
     });
+    await Promise.all(background.splice(0));
     expect(callback.status).toBe(200);
+    expect(setAutostopInterval.mock.calls.map(([minutes]) => minutes)).toEqual([5]);
     expect(store.getByIssueId("issue-1")).toMatchObject({
       run_id: null,
       total_cost_usd: 0.75,
@@ -610,6 +618,7 @@ describe("createServer lifecycle", () => {
     const sandbox = {
       id: "sandbox-notify",
       state: "started",
+      setAutostopInterval: vi.fn(async () => undefined),
       updateEnv: vi.fn(async (env: Record<string, string>) => {
         envUpdates.push(env);
       }),
@@ -689,6 +698,7 @@ describe("createServer lifecycle", () => {
     const sandbox = {
       id: "sandbox-switch",
       state: "started",
+      setAutostopInterval: vi.fn(async () => undefined),
       updateEnv: vi.fn(async (env: Record<string, string>) => {
         envUpdates.push(env);
       }),
@@ -895,6 +905,7 @@ describe("createServer lifecycle", () => {
     const sandbox = {
       id: "sandbox-review",
       state: "started",
+      setAutostopInterval: vi.fn(async () => undefined),
       updateEnv: vi.fn(async (env: Record<string, string>) => {
         envUpdates.push(env);
       }),
@@ -1196,6 +1207,138 @@ describe("createServer lifecycle", () => {
     expect(linearRequests.some((request) => request.includes("Merged"))).toBe(true);
   });
 
+  it("restores active mode when a new run starts during the prior run's idle transition", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-idle-race",
+      linear_issue_identifier: "OT-IDLE-RACE",
+      linear_session_id: "session-idle-race",
+      sandbox_id: "sandbox-idle-race",
+      branch: "ot/ot-idle-race",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+    });
+    const callbackToken = "callback-idle-race";
+    store.beginRun({
+      issueId: "issue-idle-race",
+      runId: "run-idle-race",
+      taskType: "implement",
+      tokenHash: createHash("sha256").update(callbackToken).digest("hex"),
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+
+    let releaseIdle!: () => void;
+    const idleReleased = new Promise<void>((resolve) => {
+      releaseIdle = resolve;
+    });
+    let markIdleStarted!: () => void;
+    const idleStarted = new Promise<void>((resolve) => {
+      markIdleStarted = resolve;
+    });
+    const autostopIntervals: number[] = [];
+    const sandbox = {
+      autoStopInterval: 60,
+      setAutostopInterval: vi.fn(async (minutes: number) => {
+        autostopIntervals.push(minutes);
+        if (minutes === 5) {
+          markIdleStarted();
+          await idleReleased;
+        }
+        sandbox.autoStopInterval = minutes;
+      }),
+    };
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg,
+      store,
+      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      getLinearClient: async () => undefined,
+      runBackground: (task) => background.push(task),
+    });
+
+    const completion = app.request("/runs/run-idle-race/complete", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${callbackToken}`,
+      },
+      body: JSON.stringify({ exit_code: 0 }),
+    });
+    await idleStarted;
+    store.beginRun({
+      issueId: "issue-idle-race",
+      runId: "run-after-idle-race",
+      taskType: "resume",
+      tokenHash: createHash("sha256").update("next-token").digest("hex"),
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    releaseIdle();
+
+    expect((await completion).status).toBe(200);
+    await Promise.all(background.splice(0));
+    expect(autostopIntervals).toEqual([5, 60]);
+    expect(sandbox.autoStopInterval).toBe(60);
+  });
+
+  it("preserves a failed run completion when Daytona cannot mark its sandbox idle", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-idle-failure",
+      linear_issue_identifier: "OT-IDLE-FAILURE",
+      linear_session_id: "session-idle-failure",
+      sandbox_id: "sandbox-idle-failure",
+      branch: "ot/ot-idle-failure",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+    });
+    const callbackToken = "callback-idle-failure";
+    store.beginRun({
+      issueId: "issue-idle-failure",
+      runId: "run-idle-failure",
+      taskType: "implement",
+      tokenHash: createHash("sha256").update(callbackToken).digest("hex"),
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    const setAutostopInterval = vi.fn(async () => {
+      throw new Error("Daytona unavailable");
+    });
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg,
+      store,
+      daytona: {
+        get: vi.fn(async () => ({ autoStopInterval: 60, setAutostopInterval })),
+      } as unknown as Daytona,
+      getLinearClient: async () => undefined,
+      runBackground: (task) => background.push(task),
+    });
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const response = await app.request("/runs/run-idle-failure/complete", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${callbackToken}`,
+      },
+      body: JSON.stringify({ exit_code: 1 }),
+    });
+    await Promise.all(background.splice(0));
+
+    expect(response.status).toBe(200);
+    expect(setAutostopInterval).toHaveBeenCalledWith(5);
+    expect(store.getRun("run-idle-failure")?.status).toBe("failed");
+    expect(store.getByIssueId("issue-idle-failure")).toMatchObject({
+      run_id: null,
+      state: "error",
+    });
+  });
+
   it("starts a fresh review after a successful review-fix callback despite a Linear notification outage", async () => {
     db = openDb(":memory:");
     const store = createTicketStore(db);
@@ -1219,8 +1362,10 @@ describe("createServer lifecycle", () => {
       expiresAt: "2099-01-01T00:00:00.000Z",
     });
     const envUpdates: Array<Record<string, string>> = [];
+    const setAutostopInterval = vi.fn(async (_minutes: number) => undefined);
     const sandbox = {
       state: "started",
+      setAutostopInterval,
       updateEnv: vi.fn(async (env: Record<string, string>) => {
         envUpdates.push(env);
       }),
@@ -1274,6 +1419,7 @@ describe("createServer lifecycle", () => {
 
     expect(response.status).toBe(200);
     expect(activityAttempts).toBeGreaterThan(1);
+    expect(setAutostopInterval.mock.calls.map(([minutes]) => minutes)).toEqual([5, 60]);
     expect(envUpdates.at(-1)).toMatchObject({ TASK_TYPE: "review", PR_NUMBER: "15" });
     const ticket = store.getByIssueId("issue-rereview")!;
     expect(ticket.run_id).not.toBe("run-rereview");
@@ -1323,7 +1469,11 @@ describe("createServer lifecycle", () => {
     const app = createServer({
       cfg,
       store,
-      daytona: {} as Daytona,
+      daytona: {
+        get: vi.fn(async () => ({
+          setAutostopInterval: vi.fn(async () => undefined),
+        })),
+      } as unknown as Daytona,
       getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
     });
 

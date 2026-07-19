@@ -1,6 +1,8 @@
 import type { Daytona, Sandbox } from "@daytona/sdk";
 import type { AgentActivityInput } from "./linear.js";
 import type { Ticket, TicketStore } from "./db.js";
+import { ensureSandboxActive } from "./daytona.js";
+import { reconcileSandboxAutostop } from "./sandbox-lifecycle.js";
 import { isGithubPullRequestUrl } from "./github.js";
 import { MAX_PRIVATE_LOG_TAIL_BYTES, MAX_PRIVATE_LOG_TAIL_CHARS } from "./logs.js";
 import { sanitizeText } from "./sanitize.js";
@@ -175,6 +177,16 @@ async function pollTicketEvents(
   try {
     sandbox = await params.daytona.get(ticket.sandbox_id);
     if (sandbox.state !== "started") await sandbox.start(60);
+    await ensureSandboxActive(sandbox);
+    if (params.store.getByIssueId(ticket.linear_issue_id)?.run_id !== ticket.run_id) {
+      await reconcileSandboxAutostop({
+        daytona: params.daytona,
+        store: params.store,
+        issueId: ticket.linear_issue_id,
+        sandboxId: ticket.sandbox_id,
+      });
+      return;
+    }
     files = await listEventFiles(sandbox);
   } catch (error) {
     console.error(`[sandbox-events] could not inspect ${ticket.linear_issue_identifier}:`, error);
