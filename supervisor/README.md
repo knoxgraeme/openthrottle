@@ -43,6 +43,24 @@ Add `CLAUDE_CODE_OAUTH_TOKEN`, `CODEX_AUTH_JSON`, and/or `KIMI_CODE_API_KEY`
 from subscription logins. `DEFAULT_AGENT=codex` applies when the ticket has no agent label.
 Linear credentials remain in Fly and are never passed into Daytona.
 
+## Automated deploys
+
+`.github/workflows/deploy.yml` runs on every push to `main`:
+
+- Changes under `sandbox/` or `skills/` build a commit-pinned Daytona snapshot
+  named `openthrottle-v2-ce-<short-sha>` via
+  `supervisor/scripts/build-snapshot.mjs` (the pinned `@daytona/sdk`, no CLI
+  install), then stage `DAYTONA_SNAPSHOT` on the Fly app.
+- Changes under `supervisor/` (or a freshly built snapshot, whose staged
+  secret applies on release) run `flyctl deploy --remote-only`.
+- `workflow_dispatch` inputs force either half manually.
+
+It needs the repository secrets `DAYTONA_API_KEY` and `FLY_API_TOKEN`, plus an
+optional `FLY_APP` repository variable when the app name is not
+`openthrottle-supervisor` (both `flyctl` steps pass `--app` explicitly, so the
+committed `fly.toml` app value never has to match). Re-registering target
+repositories is still a manual step when webhook event subscriptions change.
+
 `DEFAULT_AGENT=opencode` and Linear label `agent:opencode` require
 `KIMI_CODE_API_KEY`. That key must be a Kimi Code Console subscription key for
 the OpenAI-compatible coding endpoint, not a Kimi Open Platform key.

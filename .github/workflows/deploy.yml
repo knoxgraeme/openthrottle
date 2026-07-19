@@ -1,0 +1,98 @@
+name: Deploy
+
+# Rebuilds the Daytona sandbox snapshot and/or deploys the Fly supervisor when
+# the paths that feed them change on main. Manual dispatch can force either.
+#
+# Required repository secrets:
+#   DAYTONA_API_KEY — builds/registers snapshots (same key the supervisor uses)
+#   FLY_API_TOKEN   — deploy token for the supervisor app
+# Optional repository variable:
+#   FLY_APP — Fly app name; defaults to openthrottle-supervisor
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      build_snapshot:
+        description: "Force a Daytona snapshot rebuild"
+        type: boolean
+        default: false
+      deploy_supervisor:
+        description: "Force a Fly supervisor deploy"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Serialize deploys; never cancel one mid-flight.
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      sandbox: ${{ steps.filter.outputs.sandbox }}
+      supervisor: ${{ steps.filter.outputs.supervisor }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            sandbox:
+              - 'sandbox/**'
+              - 'skills/**'
+            supervisor:
+              - 'supervisor/**'
+
+  snapshot:
+    needs: changes
+    if: needs.changes.outputs.sandbox == 'true' || inputs.build_snapshot
+    runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.build.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: supervisor/package-lock.json
+      - name: Install supervisor dependencies (for @daytona/sdk)
+        run: npm ci --prefix supervisor
+      - name: Build and register the Daytona snapshot
+        id: build
+        env:
+          DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
+        run: |
+          name="openthrottle-v2-ce-$(git rev-parse --short=7 HEAD)"
+          node supervisor/scripts/build-snapshot.mjs "$name"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: [changes, snapshot]
+    # Run when supervisor code changed, when a new snapshot must be released to
+    # the app (the staged secret applies on deploy), or when forced. Never run
+    # if the snapshot build failed — the secret would point at a broken build.
+    if: >-
+      !cancelled() && needs.snapshot.result != 'failure' &&
+      (needs.changes.outputs.supervisor == 'true' ||
+       needs.snapshot.result == 'success' ||
+       inputs.deploy_supervisor)
+    runs-on: ubuntu-latest
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      FLY_APP: ${{ vars.FLY_APP || 'openthrottle-supervisor' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Stage the new snapshot name
+        if: needs.snapshot.result == 'success'
+        run: flyctl secrets set --stage --app "$FLY_APP" DAYTONA_SNAPSHOT="${{ needs.snapshot.outputs.name }}"
+      - name: Deploy the supervisor
+        working-directory: supervisor
+        run: flyctl deploy --remote-only --app "$FLY_APP"
