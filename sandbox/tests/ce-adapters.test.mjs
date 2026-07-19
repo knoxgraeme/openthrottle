@@ -40,4 +40,24 @@ describe("OpenThrottle Compound Engineering adapters", () => {
     expect(adapter("claude", "investigate")).not.toContain("mode:pipeline ~/.ot/linear-context.md");
     expect(adapter("codex", "investigate")).not.toContain("mode:pipeline ~/.ot/linear-context.md");
   });
+
+  it("passes the runtime PR number to Codex review", () => {
+    expect(adapter("codex", "review")).toContain("mode:agent $PR_NUMBER");
+    expect(adapter("codex", "review")).not.toContain("mode:agent PR_NUMBER");
+  });
+
+  it("runs configured gates before either engine creates a PR", () => {
+    for (const engine of ["claude", "codex"]) {
+      const body = adapter(engine, "implement-plan");
+      const testGate = body.indexOf("$OT_TEST_CMD");
+      const lintGate = body.indexOf("$OT_LINT_CMD");
+      const buildGate = body.indexOf("$OT_BUILD_CMD");
+      const createPr = body.indexOf("ce-commit-push-pr");
+
+      expect(testGate).toBeGreaterThan(-1);
+      expect(lintGate).toBeGreaterThan(testGate);
+      expect(buildGate).toBeGreaterThan(lintGate);
+      expect(createPr).toBeGreaterThan(buildGate);
+    }
+  });
 });
