@@ -60,6 +60,27 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+// Linear delivers agent-activity control signals (currently `stop`, plus the
+// agent->human `auth`/`select` signals) on `agentActivity.signal`. The docs
+// describe a string enum, but the wire payload can arrive as an object, so
+// accept either shape and reduce it to a lowercase signal name. Unknown shapes
+// reduce to `undefined` (handled as an ordinary prompt) rather than rejecting
+// the whole webhook — a reject would drop the user's interrupt and make Linear
+// retry, then disable, the endpoint.
+function normalizeSignal(raw: unknown): string | undefined {
+  if (typeof raw === "string") {
+    const value = raw.trim().toLowerCase();
+    return value === "" ? undefined : value;
+  }
+  if (isRecord(raw)) {
+    const candidate = raw.type ?? raw.name ?? raw.signal ?? raw.value;
+    if (typeof candidate === "string" && candidate.trim() !== "") {
+      return candidate.trim().toLowerCase();
+    }
+  }
+  return undefined;
+}
+
 export function parseLinearWebhook(raw: string): LinearAgentSessionEventPayload {
   const payload: unknown = JSON.parse(raw);
   if (!isRecord(payload)) throw new Error("Linear webhook body must be an object");
@@ -100,17 +121,20 @@ export function parseLinearWebhook(raw: string): LinearAgentSessionEventPayload 
     if (!isRecord(payload.agentActivity) || typeof payload.agentActivity.id !== "string") {
       throw new Error("Prompted webhook is missing agentActivity.id");
     }
-    const signal = payload.agentActivity.signal;
-    if (signal !== undefined && typeof signal !== "string") {
-      throw new Error("Prompted webhook has invalid agentActivity.signal");
+    const rawSignal = payload.agentActivity.signal;
+    if (rawSignal !== undefined && typeof rawSignal !== "string") {
+      // Parsing happens before durable storage, so a rejected payload is never
+      // saved — log the exact shape once so Linear's wire format can be
+      // confirmed from the supervisor logs.
+      console.warn("[linear] non-string agentActivity.signal:", JSON.stringify(rawSignal));
     }
+    const signal = normalizeSignal(rawSignal);
+    // Normalize in place so downstream handlers see a plain lowercase string.
+    payload.agentActivity.signal = signal;
     const body = isRecord(payload.agentActivity.content)
       ? payload.agentActivity.content.body
       : payload.agentActivity.body;
-    if (
-      signal?.toLowerCase() !== "stop" &&
-      (typeof body !== "string" || body.trim() === "")
-    ) {
+    if (signal !== "stop" && (typeof body !== "string" || body.trim() === "")) {
       throw new Error("Prompted webhook is missing agentActivity.body");
     }
   }
