@@ -779,18 +779,26 @@ describe("createServer lifecycle", () => {
     expect(envUpdates.at(-1)).not.toHaveProperty("CODEX_AUTH_JSON");
   });
 
-  it("routes new delegations from repo labels before team mappings", async () => {
+  it("routes new delegations from repo labels before registered team routes", async () => {
     db = openDb(":memory:");
     const store = createTicketStore(db);
+    store.registerRepository({
+      linearTeamKey: "OT",
+      linearTeamId: "team-1",
+      githubRepo: "owner/team-default",
+      baseBranch: "develop",
+      webhookId: 42,
+      snapshot: "openthrottle",
+    });
     const routedCfg: Config = {
       ...cfg,
-      githubRepoMappings: { OT: "owner/team-default" },
       githubRepoLabelMappings: { "Repo/web-app": "owner/web-app" },
     };
     let createParams: { envVars?: Record<string, string> } | undefined;
     const sandbox = {
       id: "sandbox-repo-label",
       state: "started",
+      updateEnv: vi.fn(async () => undefined),
       fs: {
         uploadFile: vi.fn(async () => undefined),
         setFilePermissions: vi.fn(async () => undefined),
@@ -849,9 +857,13 @@ describe("createServer lifecycle", () => {
     await Promise.all(background.splice(0));
 
     expect(createParams?.envVars).toHaveProperty("GITHUB_REPO", "owner/web-app");
+    expect(createParams?.envVars).toHaveProperty("BASE_BRANCH", "main");
     expect(store.getByIssueId("issue-repo-label")).toMatchObject({
       repo: "owner/web-app",
+      base_branch: "main",
       sandbox_id: "sandbox-repo-label",
+      state: "active",
+      run_id: expect.any(String),
     });
   });
 
