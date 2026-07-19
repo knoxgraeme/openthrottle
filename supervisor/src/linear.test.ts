@@ -52,6 +52,27 @@ describe("Linear contracts", () => {
       })
     );
     expect(prompted.action).toBe("prompted");
+
+    // A "stop" interrupt (Linear's composer stop / force-send button) can
+    // arrive with no body and with the signal delivered as an object rather
+    // than a bare string. It must parse (never 4xx) and normalize to "stop"
+    // so handlePrompted routes it to stopTicket.
+    const stopObject = parseLinearWebhook(
+      JSON.stringify({
+        ...createdPayload,
+        action: "prompted",
+        agentActivity: { id: "activity-2", signal: { type: "STOP" } },
+      })
+    );
+    expect(stopObject.agentActivity?.signal).toBe("stop");
+    const stopString = parseLinearWebhook(
+      JSON.stringify({
+        ...createdPayload,
+        action: "prompted",
+        agentActivity: { id: "activity-3", signal: "stop" },
+      })
+    );
+    expect(stopString.agentActivity?.signal).toBe("stop");
     expect(() =>
       parseLinearWebhook(JSON.stringify({ ...createdPayload, action: "prompted" }))
     ).toThrow(/agentActivity/);
