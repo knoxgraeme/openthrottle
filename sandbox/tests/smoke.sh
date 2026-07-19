@@ -47,12 +47,12 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
   codex exec resume --help | rg -q -- "--skip-git-repo-check" &&
   gosu agent env HOME=/home/agent CODEX_HOME=/home/agent/.codex codex plugin list --json | jq -e '\''.installed[] | select(.pluginId == "compound-engineering@compound-engineering-plugin" and .version == "3.19.0" and .enabled == true)'\'' >/dev/null &&
   test -f /home/agent/.codex/plugins/cache/compound-engineering-plugin/compound-engineering/3.19.0/skills/ce-work/SKILL.md &&
-  opencode --version | rg -q "1\.18\.3" &&
-  opencode run --help | rg -q -- "--format" &&
-  opencode run --help | rg -q -- "--session" &&
-  opencode run --help | rg -q -- "--model" &&
-  opencode run --help | rg -q -- "--dir" &&
-  opencode run --help | rg -q -- "--auto" &&
+  opencode --version 2>&1 | rg -q "1\.18\.3" &&
+  opencode run --help 2>&1 | rg -q -- "--format" &&
+  opencode run --help 2>&1 | rg -q -- "--session" &&
+  opencode run --help 2>&1 | rg -q -- "--model" &&
+  opencode run --help 2>&1 | rg -q -- "--dir" &&
+  opencode run --help 2>&1 | rg -q -- "--auto" &&
   test ! -e /opt/openthrottle/skills/opencode/ce-work/SKILL.md
 '
 
