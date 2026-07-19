@@ -318,6 +318,30 @@ export async function prepareRepository(
   };
 }
 
+export async function branchExists(
+  client: GithubClient,
+  repo: string,
+  branch: string
+): Promise<boolean> {
+  const fetchImpl = client.fetch ?? fetch;
+  const response = await fetchImpl(
+    `${client.apiBaseUrl ?? "https://api.github.com"}/repos/${repo}/branches/${encodeURIComponent(branch)}`,
+    {
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${client.token}`,
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+    }
+  );
+  if (response.status === 404) return false;
+  if (!response.ok) {
+    throw new Error(`GitHub API error (${response.status}): ${await response.text()}`);
+  }
+  return true;
+}
+
 export async function countChangesRequestedReviews(
   client: GithubClient,
   repo: string,

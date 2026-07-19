@@ -72,6 +72,12 @@ registration without restarting Fly or creating a new Daytona snapshot. Once
 the first durable route exists, delegations from unmatched teams fail closed
 instead of falling back to the wrong repository.
 
+The team route also fixes the base branch each run is cut from. To target a
+different base for a single ticket, add a `Base › <branch>` label (also
+`Base >`, `Base:`, or `Base/`) — the supervisor verifies the branch exists on
+the resolved repository, cuts the `ot/*` branch from it, and opens the PR
+against it. An unmatched or malformed branch fails closed with a Linear error.
+
 ## Repository layout
 
 - `supervisor/` — Hono/SQLite control plane deployed on Fly.

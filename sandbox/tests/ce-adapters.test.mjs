@@ -58,6 +58,15 @@ describe("OpenThrottle Compound Engineering adapters", () => {
     }
   });
 
+  it("retargets the PR to the task base branch in every PR-creating adapter", () => {
+    for (const engine of ["claude", "codex", "opencode"]) {
+      for (const task of ["implement-plan", "investigate"]) {
+        const body = adapter(engine, task);
+        expect(body).toContain('--base "$BASE_BRANCH"');
+      }
+    }
+  });
+
   it("passes the runtime PR number to Codex review", () => {
     expect(adapter("codex", "review")).toContain("mode:agent $PR_NUMBER");
     expect(adapter("codex", "review")).not.toContain("mode:agent PR_NUMBER");

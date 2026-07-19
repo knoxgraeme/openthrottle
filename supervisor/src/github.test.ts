@@ -1,6 +1,7 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import {
+  branchExists,
   countChangesRequestedReviews,
   getMergeReadiness,
   isGithubPullRequestUrl,
@@ -100,6 +101,19 @@ describe("GitHub contracts", () => {
     });
     expect(signals).toHaveLength(3);
     expect(signals.every((signal) => signal instanceof AbortSignal)).toBe(true);
+  });
+
+  it("resolves branch existence and distinguishes 404 from other errors", async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/branches/feature%2Fx")) return Response.json({ name: "feature/x" });
+      if (url.endsWith("/branches/missing")) return new Response("Not Found", { status: 404 });
+      return new Response("boom", { status: 500 });
+    }) as unknown as typeof fetch;
+    const client = { token: "github", fetch: fetchMock };
+    expect(await branchExists(client, "o/r", "feature/x")).toBe(true);
+    expect(await branchExists(client, "o/r", "missing")).toBe(false);
+    await expect(branchExists(client, "o/r", "boom")).rejects.toThrow(/GitHub API error \(500\)/);
   });
 
   it("verifies a repository and creates its OpenThrottle webhook", async () => {

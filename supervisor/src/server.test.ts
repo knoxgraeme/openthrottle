@@ -1146,6 +1146,154 @@ describe("createServer lifecycle", () => {
     });
   });
 
+  function baseLabelHarness() {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.registerRepository({
+      linearTeamKey: "OT",
+      linearTeamId: "team-1",
+      githubRepo: "owner/team-default",
+      baseBranch: "develop",
+      webhookId: 42,
+      snapshot: "openthrottle",
+    });
+    let createParams: { envVars?: Record<string, string> } | undefined;
+    const sandbox = {
+      id: "sandbox-base-label",
+      state: "started",
+      autoStopInterval: 60,
+      setAutostopInterval: vi.fn(async () => undefined),
+      updateEnv: vi.fn(async () => undefined),
+      fs: {
+        uploadFile: vi.fn(async () => undefined),
+        setFilePermissions: vi.fn(async () => undefined),
+      },
+      process: {
+        createSession: vi.fn(async () => undefined),
+        executeSessionCommand: vi.fn(async () => undefined),
+      },
+    };
+    const create = vi.fn(async (params: { envVars?: Record<string, string> }) => {
+      createParams = params;
+      return sandbox;
+    });
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg,
+      store,
+      daytona: {
+        get: vi.fn(async () => sandbox),
+        list: vi.fn(() => (async function* () {})()),
+        create,
+      } as unknown as Daytona,
+      getLinearClient: async () => ({
+        accessToken: "oauth",
+        fetch: vi.fn(async () =>
+          Response.json({
+            data: {
+              agentActivityCreate: { success: true, agentActivity: { id: "activity" } },
+              agentSessionUpdate: { success: true },
+            },
+          })
+        ) as unknown as typeof fetch,
+      }),
+      runBackground: (task) => background.push(task),
+    });
+    const createdEvent = (issueId: string, base: string) =>
+      JSON.stringify({
+        action: "created",
+        type: "AgentSessionEvent",
+        webhookId: `linear-${issueId}`,
+        webhookTimestamp: Date.now(),
+        organizationId: "org",
+        agentSession: {
+          id: `session-${issueId}`,
+          issue: {
+            id: issueId,
+            identifier: "OT-BASE",
+            team: { id: "team-1", key: "OT" },
+            labels: [{ name: `Base › ${base}` }],
+          },
+        },
+      });
+    return { store, create, background, app, createdEvent, getCreateParams: () => createParams };
+  }
+
+  it("overrides the route base branch from a Base label when the branch exists", async () => {
+    const { store, create, background, app, createdEvent, getCreateParams } = baseLabelHarness();
+    const githubFetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/repos/owner/team-default/branches/feature%2Fx")) {
+        return Response.json({ name: "feature/x" });
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    });
+    vi.stubGlobal("fetch", githubFetch);
+
+    const created = createdEvent("issue-base-label", "feature/x");
+    await app.request("/webhooks/linear", {
+      method: "POST",
+      headers: signedLinear(created, "linear-issue-base-label"),
+      body: created,
+    });
+    await Promise.all(background.splice(0));
+
+    expect(githubFetch).toHaveBeenCalledOnce();
+    expect(create).toHaveBeenCalledOnce();
+    expect(getCreateParams()?.envVars).toMatchObject({
+      GITHUB_REPO: "owner/team-default",
+      BASE_BRANCH: "feature/x",
+    });
+    expect(store.getByIssueId("issue-base-label")).toMatchObject({
+      repo: "owner/team-default",
+      base_branch: "feature/x",
+      state: "active",
+    });
+  });
+
+  it("fails closed when the Base label branch does not exist", async () => {
+    const { store, create, background, app, createdEvent } = baseLabelHarness();
+    const githubFetch = vi.fn(async () => new Response("Not Found", { status: 404 }));
+    vi.stubGlobal("fetch", githubFetch);
+
+    const created = createdEvent("issue-base-missing", "ghost");
+    await app.request("/webhooks/linear", {
+      method: "POST",
+      headers: signedLinear(created, "linear-issue-base-missing"),
+      body: created,
+    });
+    await Promise.all(background.splice(0));
+
+    expect(githubFetch).toHaveBeenCalledOnce();
+    expect(create).not.toHaveBeenCalled();
+    expect(store.getByIssueId("issue-base-missing")).toBeUndefined();
+    expect(
+      store
+        .listLinearOutbox()
+        .some(
+          (row) => typeof row.payload === "string" && row.payload.includes("does not exist")
+        )
+    ).toBe(true);
+  });
+
+  it("fails closed on an unsafe Base label without calling GitHub", async () => {
+    const { store, create, background, app, createdEvent } = baseLabelHarness();
+    const githubFetch = vi.fn(async () => new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", githubFetch);
+
+    const created = createdEvent("issue-base-unsafe", "../evil");
+    await app.request("/webhooks/linear", {
+      method: "POST",
+      headers: signedLinear(created, "linear-issue-base-unsafe"),
+      body: created,
+    });
+    await Promise.all(background.splice(0));
+
+    expect(githubFetch).not.toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
+    expect(store.getByIssueId("issue-base-unsafe")).toBeUndefined();
+  });
+
   it("starts a fresh workspace when re-delegation changes the routed repo", async () => {
     db = openDb(":memory:");
     const store = createTicketStore(db);

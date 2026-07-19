@@ -14,6 +14,7 @@ import {
   type LinearClient,
 } from "./linear.js";
 import {
+  branchExists,
   commentOnPullRequest,
   countChangesRequestedReviews,
   getAuthenticatedLogin,
@@ -222,6 +223,18 @@ function repoLabelKeys(label: string): string[] {
   const trimmed = label.trim();
   const withoutPrefix = trimmed.replace(/^Repo\s*(?:›|>|:|\/)\s*/i, "").trim();
   return [...new Set([trimmed, withoutPrefix].filter(Boolean))];
+}
+
+// A `Base › <branch>` label (also `Base >`, `Base:`, `Base/`) targets a
+// per-task base branch, overriding the route's default. The branch itself may
+// contain slashes, so everything after the first separator is the branch name.
+function baseBranchFromLabels(labels: string[]): string | undefined {
+  for (const label of labels) {
+    const match = label.trim().match(/^Base\s*(?:›|>|:|\/)\s*(.+)$/i);
+    const branch = match?.[1]?.trim();
+    if (branch) return branch;
+  }
+  return undefined;
 }
 
 function repositoryFor(
@@ -1164,6 +1177,50 @@ async function handleCreated(
       `No repository is registered for Linear team ${issue.team?.key ?? issue.team?.id ?? "unknown"}. Run \`openthrottle init\` in the target repository first.`
     );
     return;
+  }
+  // A `Base › <branch>` label targets a per-task base branch for this ticket,
+  // overriding the route's default. Verify it up front so a typo surfaces as a
+  // clean Linear message instead of a clone/checkout failure inside the sandbox.
+  const requestedBase = baseBranchFromLabels(labels);
+  if (requestedBase) {
+    if (!isSafeBranchName(requestedBase)) {
+      await tryPostError(
+        store,
+        linearOutbox,
+        sessionId,
+        issue.id,
+        `The base branch label \`${requestedBase}\` is not a valid Git branch name.`
+      );
+      return;
+    }
+    let baseExists: boolean;
+    try {
+      baseExists = await branchExists(
+        { token: cfg.githubToken },
+        selectedRepository.repo,
+        requestedBase
+      );
+    } catch (error) {
+      await tryPostError(
+        store,
+        linearOutbox,
+        sessionId,
+        issue.id,
+        `OpenThrottle could not verify base branch \`${requestedBase}\` on ${selectedRepository.repo}: ${String(error)}`
+      );
+      return;
+    }
+    if (!baseExists) {
+      await tryPostError(
+        store,
+        linearOutbox,
+        sessionId,
+        issue.id,
+        `Base branch \`${requestedBase}\` does not exist on ${selectedRepository.repo}.`
+      );
+      return;
+    }
+    selectedRepository.baseBranch = requestedBase;
   }
   if (existing?.sandbox_id && existing.state !== "closed" && existing.state !== "expired") {
     const agentChanged = existing.agent !== selectedAgent;
