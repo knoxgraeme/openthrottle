@@ -2066,6 +2066,13 @@ describe("createServer lifecycle", () => {
     });
     store.claimSandboxEvent(eventId, new Date().toISOString(), "2099-01-01T00:00:00.000Z");
     store.markSandboxEventProcessed(eventId);
+    store.enqueueSessionWork({
+      id: "gh-comment-777",
+      linearSessionId: "session-paused",
+      issueId: "issue-paused",
+      source: "automatic",
+      body: "New PR feedback queued while the review-fix was running.",
+    });
     const envUpdates: Array<Record<string, string>> = [];
     const sandbox = {
       state: "started",
@@ -2115,6 +2122,9 @@ describe("createServer lifecycle", () => {
     const ticket = store.getByIssueId("issue-paused")!;
     expect(ticket.run_id).toBeNull();
     expect(ticket.pending_re_review).toBe(1);
+    expect(
+      store.claimNextSessionWork("session-paused", new Date().toISOString())
+    ).toMatchObject({ id: "gh-comment-777", status: "claimed" });
   });
 
   it("starts the deferred re-review after the resumed session answers the decisions", async () => {

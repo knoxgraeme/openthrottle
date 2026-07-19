@@ -744,6 +744,12 @@ export async function completeRun(
     if (run.task_type === "review-fix" && pausedOnDecisions) {
       deps.store.setPendingReReview(ticket.linear_issue_id, true);
     }
+    if (pausedOnDecisions) {
+      // The agent is waiting on a human decision. Leave queued session work
+      // pending so nothing resumes the session before the answer arrives; the
+      // answer launches directly and the queue drains after that run.
+      return { status: 200, body: { ok: true } };
+    }
     const linear = await deps.getLinearClient();
     if (linear && ticket) {
       const task = drainNextSessionWork({
@@ -754,7 +760,7 @@ export async function completeRun(
         linearOutbox: outbox,
         ticket,
       }).then(async (drained) => {
-        if (drained || pausedOnDecisions || run.task_type === "review") return;
+        if (drained || run.task_type === "review") return;
         const current = deps.store.getByIssueId(ticket.linear_issue_id);
         const pendingPrUrl = prUrl ?? current?.pr_url ?? undefined;
         if (
