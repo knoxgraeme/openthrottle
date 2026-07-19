@@ -1294,6 +1294,115 @@ describe("createServer lifecycle", () => {
     expect(store.getByIssueId("issue-base-unsafe")).toBeUndefined();
   });
 
+  it("overrides the base branch from a Linear label group resolved via GraphQL", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.registerRepository({
+      linearTeamKey: "OT",
+      linearTeamId: "team-1",
+      githubRepo: "owner/team-default",
+      baseBranch: "develop",
+      webhookId: 42,
+      snapshot: "openthrottle",
+    });
+    let createParams: { envVars?: Record<string, string> } | undefined;
+    const sandbox = {
+      id: "sandbox-group-label",
+      state: "started",
+      autoStopInterval: 60,
+      setAutostopInterval: vi.fn(async () => undefined),
+      updateEnv: vi.fn(async () => undefined),
+      fs: {
+        uploadFile: vi.fn(async () => undefined),
+        setFilePermissions: vi.fn(async () => undefined),
+      },
+      process: {
+        createSession: vi.fn(async () => undefined),
+        executeSessionCommand: vi.fn(async () => undefined),
+      },
+    };
+    const create = vi.fn(async (params: { envVars?: Record<string, string> }) => {
+      createParams = params;
+      return sandbox;
+    });
+    // The webhook carries only the leaf label name, so no flat `Base ›` match
+    // exists; the supervisor must resolve the parent group via the IssueLabels
+    // GraphQL query to discover this is a `Base` group label.
+    let issueLabelsQueried = false;
+    const linearFetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const query = String((JSON.parse(String(init?.body)) as { query?: string }).query);
+      if (query.includes("IssueLabels")) {
+        issueLabelsQueried = true;
+        return Response.json({
+          data: {
+            issue: { labels: { nodes: [{ name: "release/2.0", parent: { name: "Base" } }] } },
+          },
+        });
+      }
+      return Response.json({
+        data: {
+          agentActivityCreate: { success: true, agentActivity: { id: "activity" } },
+          agentSessionUpdate: { success: true },
+        },
+      });
+    }) as unknown as typeof fetch;
+    const githubFetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/repos/owner/team-default/branches/release%2F2.0")) {
+        return Response.json({ name: "release/2.0" });
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    });
+    vi.stubGlobal("fetch", githubFetch);
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg,
+      store,
+      daytona: {
+        get: vi.fn(async () => sandbox),
+        list: vi.fn(() => (async function* () {})()),
+        create,
+      } as unknown as Daytona,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
+      runBackground: (task) => background.push(task),
+    });
+    const created = JSON.stringify({
+      action: "created",
+      type: "AgentSessionEvent",
+      webhookId: "linear-group-label",
+      webhookTimestamp: Date.now(),
+      organizationId: "org",
+      agentSession: {
+        id: "session-group-label",
+        issue: {
+          id: "issue-group-label",
+          identifier: "OT-GROUP",
+          team: { id: "team-1", key: "OT" },
+          labels: [{ name: "release/2.0" }],
+        },
+      },
+    });
+    await app.request("/webhooks/linear", {
+      method: "POST",
+      headers: signedLinear(created, "linear-group-label"),
+      body: created,
+    });
+    await Promise.all(background.splice(0));
+
+    expect(issueLabelsQueried).toBe(true);
+    expect(githubFetch).toHaveBeenCalledOnce();
+    expect(create).toHaveBeenCalledOnce();
+    expect(createParams?.envVars).toMatchObject({
+      GITHUB_REPO: "owner/team-default",
+      BASE_BRANCH: "release/2.0",
+    });
+    expect(store.getByIssueId("issue-group-label")).toMatchObject({
+      repo: "owner/team-default",
+      base_branch: "release/2.0",
+      state: "active",
+    });
+  });
+
   it("starts a fresh workspace when re-delegation changes the routed repo", async () => {
     db = openDb(":memory:");
     const store = createTicketStore(db);

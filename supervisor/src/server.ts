@@ -7,7 +7,9 @@ import {
   buildLinearInstallUrl,
   exchangeLinearOAuthCode,
   extractLabelNames,
+  fetchIssueLabels,
   isRecentLinearWebhook,
+  labelMatchNames,
   parseLinearWebhook,
   verifyLinearSignature,
   type AgentActivityInput,
@@ -1178,10 +1180,25 @@ async function handleCreated(
     );
     return;
   }
-  // A `Base › <branch>` label targets a per-task base branch for this ticket,
-  // overriding the route's default. Verify it up front so a typo surfaces as a
-  // clean Linear message instead of a clone/checkout failure inside the sandbox.
-  const requestedBase = baseBranchFromLabels(labels);
+  // A `Base` label targets a per-task base branch for this ticket, overriding
+  // the route's default. It can be a flat `Base › <branch>` label (matched from
+  // the webhook payload, no extra call) or a Linear label group named `Base`
+  // with the branch as its child — the webhook only carries the child's leaf
+  // name, so grouped labels are resolved with their parent group via GraphQL.
+  // Verify the branch up front so a typo surfaces as a clean Linear message
+  // instead of a clone/checkout failure inside the sandbox.
+  let requestedBase = baseBranchFromLabels(labels);
+  if (!requestedBase && labels.length > 0) {
+    try {
+      requestedBase = baseBranchFromLabels(
+        labelMatchNames(await fetchIssueLabels(linear, issue.id))
+      );
+    } catch (error) {
+      console.warn(
+        `[base-label] grouped-label lookup failed for ${issue.identifier}: ${String(error)}`
+      );
+    }
+  }
   if (requestedBase) {
     if (!isSafeBranchName(requestedBase)) {
       await tryPostError(

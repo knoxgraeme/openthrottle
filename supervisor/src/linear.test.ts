@@ -5,7 +5,9 @@ import {
   agentSessionUpdate,
   buildLinearInstallUrl,
   extractLabelNames,
+  fetchIssueLabels,
   isRecentLinearWebhook,
+  labelMatchNames,
   parseLinearWebhook,
   verifyLinearSignature,
 } from "./linear.js";
@@ -148,6 +150,48 @@ describe("Linear contracts", () => {
     });
     expect(signals).toHaveLength(2);
     expect(signals.every((signal) => signal instanceof AbortSignal)).toBe(true);
+  });
+
+  it("fetches issue labels with their parent group and expands grouped names", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return Response.json({
+        data: {
+          issue: {
+            labels: {
+              nodes: [
+                { name: "feature/x", parent: { name: "Base" } },
+                { name: "investigate", parent: null },
+                { name: "bad" },
+              ],
+            },
+          },
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    const resolved = await fetchIssueLabels({ accessToken: "oauth", fetch: fetchMock }, "issue-1");
+    expect(resolved).toEqual([
+      { name: "feature/x", parentName: "Base" },
+      { name: "investigate", parentName: undefined },
+      { name: "bad", parentName: undefined },
+    ]);
+    expect(requests[0]).toMatchObject({ variables: { id: "issue-1" } });
+
+    expect(labelMatchNames(resolved)).toEqual([
+      "feature/x",
+      "Base › feature/x",
+      "investigate",
+      "bad",
+    ]);
+  });
+
+  it("tolerates an issue with no labels", async () => {
+    const fetchMock = vi.fn(async () =>
+      Response.json({ data: { issue: { labels: { nodes: [] } } } })
+    ) as unknown as typeof fetch;
+    expect(await fetchIssueLabels({ accessToken: "oauth", fetch: fetchMock }, "issue-2")).toEqual([]);
   });
 
   it("builds app-actor OAuth URLs with agent scopes", () => {
