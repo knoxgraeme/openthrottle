@@ -42,6 +42,33 @@ as_agent() {
   gosu "$AGENT_USER" env HOME="$AGENT_HOME" USER="$AGENT_USER" bash -c "$1"
 }
 
+# Author agent commits as the GitHub account that owns GH_TOKEN so GitHub can
+# attribute them to a real account and integrations that gate on commit-author
+# identity (e.g. Vercel) accept the deployment. An explicit OT_GIT_AUTHOR_EMAIL
+# (with optional OT_GIT_AUTHOR_NAME) override wins; otherwise the account's
+# GitHub noreply identity is derived from `gh api user`. The placeholder is a
+# last resort used only when the account lookup fails.
+configure_git_identity() {
+  local login="" uid="" identity name email
+  if [[ -z "${OT_GIT_AUTHOR_EMAIL:-}" ]]; then
+    login="$(as_agent "gh api user --jq .login" 2>/dev/null || true)"
+    uid="$(as_agent "gh api user --jq .id" 2>/dev/null || true)"
+    if [[ -z "$login" || -z "$uid" ]]; then
+      log "WARNING: could not resolve a GitHub commit identity; author-gated integrations (e.g. Vercel) may reject commits"
+    fi
+  fi
+  identity="$(resolve_git_identity "${OT_GIT_AUTHOR_NAME:-}" "${OT_GIT_AUTHOR_EMAIL:-}" "$login" "$uid")"
+  name="${identity%%$'\t'*}"
+  email="${identity#*$'\t'}"
+  # Write to the agent's global config (like safe.directory above), never the
+  # repository's .git/config: Phase 3 seals .git/config immutable, so a
+  # repo-local write would fail on resume and abort the entrypoint. The clone
+  # never sets a repo-local user.*, so this global identity always applies.
+  as_agent "git config --global user.name '$name'"
+  as_agent "git config --global user.email '$email'"
+  log "commit identity: ${name} <${email}>"
+}
+
 COMPLETION_WRITTEN=0
 
 write_run_completion() {
@@ -201,13 +228,16 @@ as_agent "gh auth setup-git >/dev/null"
 if [[ ! -d "${REPO_DIR}/.git" ]]; then
   log "cloning ${GITHUB_REPO} -> ${REPO_DIR}"
   as_agent "git clone --quiet '$GIT_URL' '$REPO_DIR'"
-  as_agent "git -C '$REPO_DIR' config user.email 'agent@openthrottle.dev'"
-  as_agent "git -C '$REPO_DIR' config user.name 'OpenThrottle Agent'"
   as_agent "git config --global --add safe.directory '$REPO_DIR'"
 else
   log "repo already present (resume) — fetching"
   as_agent "git -C '$REPO_DIR' fetch --quiet origin"
 fi
+
+# Set (or refresh, on resume) the commit identity every run. It writes only the
+# agent's global git config, which is unaffected by the Phase 3 .git/config
+# seal, so this is safe on resume as well as on fresh clones.
+configure_git_identity
 
 if as_agent "git -C '$REPO_DIR' show-ref --verify --quiet 'refs/heads/${BRANCH_NAME}'"; then
   as_agent "git -C '$REPO_DIR' checkout --quiet '$BRANCH_NAME'"

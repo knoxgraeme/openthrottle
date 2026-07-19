@@ -55,6 +55,8 @@ describe("Daytona task execution", () => {
         "CLAUDE_CODE_OAUTH_TOKEN",
         "CODEX_AUTH_JSON",
         "KIMI_CODE_API_KEY",
+        "OT_GIT_AUTHOR_NAME",
+        "OT_GIT_AUTHOR_EMAIL",
         "LINEAR_ACCESS_TOKEN",
         "LINEAR_MCP_API_KEY",
         "ANTHROPIC_API_KEY",

@@ -22,6 +22,8 @@ export interface SandboxEnvContract {
   CLAUDE_CODE_OAUTH_TOKEN?: string;
   CODEX_AUTH_JSON?: string;
   KIMI_CODE_API_KEY?: string;
+  OT_GIT_AUTHOR_NAME?: string;
+  OT_GIT_AUTHOR_EMAIL?: string;
   MAX_TURNS: string;
   TASK_TIMEOUT: string;
   DEV_PORT: string;
@@ -90,6 +92,8 @@ export async function startTask(
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CODEX_AUTH_JSON",
     "KIMI_CODE_API_KEY",
+    "OT_GIT_AUTHOR_NAME",
+    "OT_GIT_AUTHOR_EMAIL",
   ] as const;
   const retiredSecretNames = [
     "LINEAR_ACCESS_TOKEN",
