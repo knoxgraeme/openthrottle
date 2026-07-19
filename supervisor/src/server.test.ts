@@ -889,6 +889,8 @@ describe("createServer lifecycle", () => {
     const sandbox = {
       id: "sandbox-repo-label",
       state: "started",
+      autoStopInterval: 60,
+      setAutostopInterval: vi.fn(async () => undefined),
       updateEnv: vi.fn(async () => undefined),
       fs: {
         uploadFile: vi.fn(async () => undefined),
@@ -904,6 +906,7 @@ describe("createServer lifecycle", () => {
       cfg: routedCfg,
       store,
       daytona: {
+        get: vi.fn(async () => sandbox),
         list: vi.fn(() => (async function* () {})()),
         create: vi.fn(async (params: { envVars?: Record<string, string> }) => {
           createParams = params;
@@ -985,12 +988,16 @@ describe("createServer lifecycle", () => {
     };
     let createParams: { envVars?: Record<string, string> } | undefined;
     const oldSandbox = {
+      autoStopInterval: 60,
+      setAutostopInterval: vi.fn(async () => undefined),
       stop: vi.fn(async () => undefined),
       delete: vi.fn(async () => undefined),
     };
     const newSandbox = {
       id: "sandbox-new-repo",
       state: "started",
+      autoStopInterval: 60,
+      setAutostopInterval: vi.fn(async () => undefined),
       updateEnv: vi.fn(async () => undefined),
       fs: {
         uploadFile: vi.fn(async () => undefined),
