@@ -882,6 +882,26 @@ describe("createServer lifecycle", () => {
     const previewResponse = await app.request(`/preview/OT-OPERATOR?token=${previewToken}`);
     expect(previewResponse.status).toBe(302);
     expect(previewResponse.headers.get("location")).toBe("https://preview.test/signed");
+
+    store.beginRun({
+      issueId: "issue-operator",
+      runId: "run-operator",
+      taskType: "implement",
+      tokenHash: "unused",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    store.finishRun({
+      runId: "run-operator",
+      status: "completed",
+      logTail: "durable ghp_abcdefghijklmnop",
+    });
+    store.setSandboxId("issue-operator", null);
+
+    const durableLogsResponse = await app.request("/tickets/OT-OPERATOR/logs", {
+      headers: { Authorization: `Bearer ${cfg.statusToken}` },
+    });
+    expect(durableLogsResponse.status).toBe(200);
+    expect(await durableLogsResponse.text()).toBe("durable [REDACTED]");
   });
 
   it("merges from Linear only after GitHub reports terminal green checks", async () => {

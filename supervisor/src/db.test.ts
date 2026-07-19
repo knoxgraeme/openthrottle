@@ -56,6 +56,7 @@ describe("TicketStore", () => {
       exitCode: 0,
       costUsd: 1.25,
       prUrl: "https://github.com/owner/repo/pull/1",
+      logTail: "private durable log",
       ticketState: "active",
     });
     expect(store.getByIssueId("issue-1")).toMatchObject({
@@ -66,7 +67,31 @@ describe("TicketStore", () => {
     });
     expect(store.getRun("run-1")).toMatchObject({ status: "completed", exit_code: 0 });
     expect(completed?.status).toBe("completed");
+    expect(completed?.log_tail).toBe("private durable log");
+    expect(store.getLatestRun("issue-1")?.id).toBe("run-1");
     expect(store.finishRun({ runId: "run-1", status: "completed" })).toBeUndefined();
+
+    expect(store.beginRun({
+      issueId: "issue-1",
+      runId: "run-2",
+      taskType: "resume",
+      tokenHash: "hash-2",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    })).toBe(true);
+    store.finishRun({ runId: "run-2", status: "completed", logTail: "new durable log" });
+    expect(store.getRun("run-1")?.log_tail).toBeNull();
+    expect(store.getLatestRun("issue-1")?.log_tail).toBe("new durable log");
+
+    expect(store.beginRun({
+      issueId: "issue-1",
+      runId: "run-3",
+      taskType: "resume",
+      tokenHash: "hash-3",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    })).toBe(true);
+    store.finishRun({ runId: "run-3", status: "failed" });
+    expect(store.getLatestRun("issue-1")?.id).toBe("run-3");
+    expect(store.getLatestRunWithLog("issue-1")?.id).toBe("run-2");
   });
 
   it("deduplicates webhook deliveries and persists settings", () => {
@@ -179,5 +204,33 @@ describe("TicketStore", () => {
     expect(store.listProcessableDeliveries("2099-01-01T00:00:00.000Z", 10)).toEqual([
       expect.objectContaining({ id: "new-delivery", status: "pending", attempts: 0 }),
     ]);
+  });
+
+  it("adds durable log storage to an existing runs table", () => {
+    const dir = mkdtempSync(join(tmpdir(), "openthrottle-runs-db-"));
+    tempDirs.push(dir);
+    const path = join(dir, "legacy-runs.db");
+    const legacy = new Database(path);
+    legacy.exec(`
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY,
+        linear_issue_id TEXT NOT NULL,
+        task_type TEXT NOT NULL,
+        token_hash TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'running',
+        started_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        completed_at TEXT,
+        exit_code INTEGER,
+        cost_usd REAL,
+        pr_url TEXT,
+        failure_tail TEXT
+      );
+    `);
+    legacy.close();
+
+    db = openDb(path);
+    const columns = db.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>;
+    expect(columns.map((column) => column.name)).toContain("log_tail");
   });
 });

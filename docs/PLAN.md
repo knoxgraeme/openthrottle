@@ -251,8 +251,9 @@ v1 prompts (decision #8):
   at `max_rounds` (default 3) stop and post "review rounds exhausted — needs
   a human decision" instead of an auto-approve GitHub would reject anyway.
 - `investigate`: triggered by delegating a bug ticket with label
-  `investigate` — read-only run, posts the verdict report; a human thread
-  reply ("fix it") triggers implement with the report as the plan.
+  `investigate` — runs `ce-debug mode:pipeline`, applies and ships convergent
+  fixes, and leaves divergent product/design decisions as needs-human
+  residuals.
 
 Acceptance: a PR goes through review → changes_requested → fix → re-review
 with verdicts and CI status visible in the Linear thread, rounds bounded, no
@@ -273,8 +274,8 @@ human orchestration except the merge click.
   sandbox, then redirects); until then Vercel PR previews carry it.
 - **Attach/monitor** — optional: herdr in the sandbox image + docs for
   `daytona ssh` / attach-takeover when watching a live run matters.
-- **`openthrottle logs`** — CLI command streaming a ticket's sandbox log via
-  the supervisor.
+- **`openthrottle logs`** — CLI command streaming a ticket's sanitized sandbox
+  log via the supervisor, with a bounded durable private tail after cleanup.
 
 ## Non-goals (v2)
 

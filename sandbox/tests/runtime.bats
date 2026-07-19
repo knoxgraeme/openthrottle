@@ -27,6 +27,24 @@ setup() {
   [ "$status" -ne 0 ]
 }
 
+@test "task types declare their native Compound Engineering pipeline" {
+  run task_ce_pipeline implement
+  [ "$status" -eq 0 ]
+  [ "$output" = "ce-work,ce-code-review,ce-commit-push-pr,ce-babysit-pr" ]
+
+  run task_ce_pipeline review
+  [ "$output" = "ce-code-review" ]
+
+  run task_ce_pipeline review-fix
+  [ "$output" = "ce-resolve-pr-feedback,ce-babysit-pr" ]
+
+  run task_ce_pipeline investigate
+  [ "$output" = "ce-debug,ce-commit-push-pr,ce-babysit-pr" ]
+
+  run task_ce_pipeline resume
+  [ "$output" = "resume" ]
+}
+
 @test "yq default does not require a config file" {
   run yq_value_or_default "/not/present" ".test" "npm test"
   [ "$status" -eq 0 ]

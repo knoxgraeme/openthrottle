@@ -27,6 +27,8 @@ the entrypoint:
 - `gh` is authenticated against `GITHUB_REPO`.
 - `~/.ot/linear-context.md` contains the signed Linear delegation context.
 - `ot-activity` writes structured updates for Fly to publish as OpenThrottle.
+- `OT_CE_PIPELINE` declares the native Compound Engineering skills expected for
+  this task. OpenThrottle adapters enforce product boundaries around them.
 
 You do **not** have a Daytona API key, a Fly key, or any webhook secret —
 you were never given them. Don't go looking for them.
@@ -89,13 +91,13 @@ If `ot-activity` fails, leave durable context in the PR or GitHub issue via
 
 ## Which skill you're running
 
-- `implement-plan` — default for a fresh ticket with an approved plan.
-  Stops and asks if no plan exists; never improvises scope.
-- `review` — reviewing an existing PR against its ticket.
-- `review-fix` — applying requested changes from an existing review; push
-  to the same branch, never open a new PR.
-- `investigate` — read-only bug triage; never modify code, always end
-  with a `CONFIRMED_SMALL` / `CONFIRMED_MAJOR` / `UNCONFIRMED` verdict.
+- `implement-plan` — plan gate, then `ce-work`, `ce-code-review`, shipping, and
+  bounded PR babysitting.
+- `review` — report-only `ce-code-review` against an existing PR.
+- `review-fix` — `ce-resolve-pr-feedback` plus bounded PR babysitting on the
+  same branch; Fly schedules the fresh re-review.
+- `investigate` — action-capable `ce-debug mode:pipeline`; convergent bugs may
+  be fixed and shipped, while divergent decisions are returned as residuals.
 
 Whichever one you were invoked with, its full prompt was piped to you
 ahead of this fragment (or this fragment was appended to `AGENTS.md`

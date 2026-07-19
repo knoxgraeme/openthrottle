@@ -39,6 +39,7 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
   gosu agent env HOME=/home/agent claude plugin list --json | jq -e '\''.[] | select(.id == "compound-engineering@compound-engineering-plugin" and .version == "3.19.0" and .enabled == true)'\'' >/dev/null &&
   gosu agent env HOME=/home/agent claude plugin details compound-engineering@compound-engineering-plugin | rg -q "ce-work" &&
   test -f /home/agent/.claude/plugins/cache/compound-engineering-plugin/compound-engineering/3.19.0/skills/ce-work/SKILL.md &&
+  rg -q "/ce-work" /opt/openthrottle/skills/claude/implement-plan/SKILL.md &&
   codex --version | rg -q "0\.143\.0" &&
   codex exec --help | rg -q -- "--json" &&
   codex exec --help | rg -q -- "--dangerously-bypass-approvals-and-sandbox" &&
@@ -70,6 +71,11 @@ if [ "${1:-}" = "mcp" ]; then
   exit 0
 fi
 printf '%s\n' "$*" >> "$HOME/.ot/codex-args.log"
+last=""
+for arg in "$@"; do last="$arg"; done
+if [ "$last" = "-" ]; then
+  cat > "$HOME/.ot/codex-stdin.log"
+fi
 printf '%s\n' \
   '{"type":"thread.started","thread_id":"smoke-codex-thread"}' \
   '{"type":"turn.started"}' \
@@ -155,6 +161,9 @@ CODEX_HOME="$SMOKE_DIR/result/codex-home"
 seed_agent_home "$CODEX_HOME"
 run_sandbox "$CODEX_HOME" codex implement ot/smoke-codex codex-implement OT-CODEX
 test "$(cat "$CODEX_HOME/.ot/agent-session-id")" = "smoke-codex-thread"
+grep -Fq '$ce-work' "$CODEX_HOME/.ot/codex-stdin.log"
+grep -Fq 'CE pipeline: ce-work,ce-code-review,ce-commit-push-pr,ce-babysit-pr' \
+  "$CODEX_HOME/.ot/codex-stdin.log"
 run_sandbox "$CODEX_HOME" codex resume ot/smoke-codex codex-resume OT-CODEX "continue"
 grep -q -- 'exec .* resume smoke-codex-thread continue' "$CODEX_HOME/.ot/codex-args.log"
 jq -e '.exit_code == 0 and (has("cost_usd") | not)' \

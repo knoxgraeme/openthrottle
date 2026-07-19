@@ -7,7 +7,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "vitest run runner/*.test.mjs bin/*.test.mjs"
+    "test": "vitest run runner/*.test.mjs bin/*.test.mjs tests/*.test.mjs"
   },
   "devDependencies": {
     "vitest": "^3.2.4"

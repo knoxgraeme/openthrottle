@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS runs (
   cost_usd REAL,
   pr_url TEXT,
   failure_tail TEXT,
+  log_tail TEXT,
   FOREIGN KEY(linear_issue_id) REFERENCES tickets(linear_issue_id)
 );
 CREATE INDEX IF NOT EXISTS runs_ticket_idx ON runs(linear_issue_id, started_at);
@@ -90,6 +91,10 @@ const TICKET_MIGRATIONS: Array<[string, string]> = [
   ["linear_context", "ALTER TABLE tickets ADD COLUMN linear_context TEXT"],
 ];
 
+const RUN_MIGRATIONS: Array<[string, string]> = [
+  ["log_tail", "ALTER TABLE runs ADD COLUMN log_tail TEXT"],
+];
+
 const DELIVERY_MIGRATIONS: Array<[string, string]> = [
   ["event_name", "ALTER TABLE webhook_deliveries ADD COLUMN event_name TEXT"],
   ["payload", "ALTER TABLE webhook_deliveries ADD COLUMN payload TEXT"],
@@ -99,6 +104,21 @@ const DELIVERY_MIGRATIONS: Array<[string, string]> = [
   ["processed_at", "ALTER TABLE webhook_deliveries ADD COLUMN processed_at TEXT"],
   ["last_error", "ALTER TABLE webhook_deliveries ADD COLUMN last_error TEXT"],
 ];
+
+function applyColumnMigrations(
+  db: Database.Database,
+  table: "tickets" | "webhook_deliveries" | "runs",
+  migrations: Array<[string, string]>
+): void {
+  const columns = new Set(
+    (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(
+      (column) => column.name
+    )
+  );
+  for (const [column, sql] of migrations) {
+    if (!columns.has(column)) db.exec(sql);
+  }
+}
 
 export type Agent = "claude" | "codex";
 export type TicketState = "active" | "closed" | "expired" | "error" | "stopped";
@@ -138,6 +158,7 @@ export interface Run {
   cost_usd: number | null;
   pr_url: string | null;
   failure_tail: string | null;
+  log_tail: string | null;
 }
 
 export type TicketUpsert = Pick<
@@ -200,6 +221,7 @@ export interface FinishRunParams {
   costUsd?: number;
   prUrl?: string;
   failureTail?: string;
+  logTail?: string;
   ticketState?: TicketState;
 }
 
@@ -210,22 +232,9 @@ export function openDb(path: string): Database.Database {
   db.pragma("foreign_keys = ON");
   db.exec(SCHEMA);
 
-  const columns = new Set(
-    (db.prepare("PRAGMA table_info(tickets)").all() as Array<{ name: string }>).map(
-      (column) => column.name
-    )
-  );
-  for (const [column, sql] of TICKET_MIGRATIONS) {
-    if (!columns.has(column)) db.exec(sql);
-  }
-  const deliveryColumns = new Set(
-    (db.prepare("PRAGMA table_info(webhook_deliveries)").all() as Array<{ name: string }>).map(
-      (column) => column.name
-    )
-  );
-  for (const [column, sql] of DELIVERY_MIGRATIONS) {
-    if (!deliveryColumns.has(column)) db.exec(sql);
-  }
+  applyColumnMigrations(db, "tickets", TICKET_MIGRATIONS);
+  applyColumnMigrations(db, "webhook_deliveries", DELIVERY_MIGRATIONS);
+  applyColumnMigrations(db, "runs", RUN_MIGRATIONS);
   db.exec(
     "CREATE INDEX IF NOT EXISTS tickets_repo_branch_idx ON tickets(repo, branch);" +
       "CREATE INDEX IF NOT EXISTS tickets_sandbox_idx ON tickets(sandbox_id);" +
@@ -267,6 +276,8 @@ export interface TicketStore {
     expiresAt: string;
   }): boolean;
   getRun(runId: string): Run | undefined;
+  getLatestRun(issueId: string): Run | undefined;
+  getLatestRunWithLog(issueId: string): Run | undefined;
   finishRun(params: FinishRunParams): Run | undefined;
   listExpiredRuns(nowIso: string): Run[];
   insertSandboxEvent(params: {
@@ -346,6 +357,14 @@ export function createTicketStore(db: Database.Database): TicketStore {
     "DELETE FROM sandbox_events WHERE status = 'processed' AND processed_at < ?"
   );
   const getRunStmt = db.prepare("SELECT * FROM runs WHERE id = ?");
+  const getLatestRunStmt = db.prepare(
+    "SELECT * FROM runs WHERE linear_issue_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1"
+  );
+  const getLatestRunWithLogStmt = db.prepare(
+    `SELECT * FROM runs
+     WHERE linear_issue_id = ? AND log_tail IS NOT NULL
+     ORDER BY started_at DESC, rowid DESC LIMIT 1`
+  );
   const listExpiredRunsStmt = db.prepare(
     "SELECT * FROM runs WHERE status = 'running' AND expires_at <= ? ORDER BY expires_at"
   );
@@ -436,7 +455,7 @@ export function createTicketStore(db: Database.Database): TicketStore {
     const completedAt = now();
     db.prepare(`
       UPDATE runs SET
-        status = ?, completed_at = ?, exit_code = ?, cost_usd = ?, pr_url = ?, failure_tail = ?
+        status = ?, completed_at = ?, exit_code = ?, cost_usd = ?, pr_url = ?, failure_tail = ?, log_tail = ?
       WHERE id = ? AND status = 'running'
     `).run(
       params.status,
@@ -445,8 +464,15 @@ export function createTicketStore(db: Database.Database): TicketStore {
       params.costUsd ?? null,
       params.prUrl ?? null,
       params.failureTail ?? null,
+      params.logTail ?? null,
       params.runId
     );
+    if (params.logTail !== undefined) {
+      db.prepare(`
+        UPDATE runs SET log_tail = NULL
+        WHERE linear_issue_id = ? AND id <> ? AND log_tail IS NOT NULL
+      `).run(existing.linear_issue_id, params.runId);
+    }
     db.prepare(`
       UPDATE tickets SET
         running_since = NULL,
@@ -575,6 +601,12 @@ export function createTicketStore(db: Database.Database): TicketStore {
     },
     getRun(runId) {
       return getRunStmt.get(runId) as Run | undefined;
+    },
+    getLatestRun(issueId) {
+      return getLatestRunStmt.get(issueId) as Run | undefined;
+    },
+    getLatestRunWithLog(issueId) {
+      return getLatestRunWithLogStmt.get(issueId) as Run | undefined;
     },
     finishRun(params) {
       return finishRunTransaction(params);

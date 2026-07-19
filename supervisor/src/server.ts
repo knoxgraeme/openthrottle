@@ -35,6 +35,7 @@ import {
   startTask,
   type SandboxEnvContract,
 } from "./daytona.js";
+import { MAX_PRIVATE_LOG_TAIL_CHARS } from "./logs.js";
 import { sanitizeText } from "./sanitize.js";
 import {
   createLinearClientProvider,
@@ -335,6 +336,7 @@ export async function completeRun(
     costUsd?: unknown;
     prUrl?: unknown;
     failureTail?: unknown;
+    logTail?: unknown;
   }
 ): Promise<{ status: number; body: { ok?: true; error?: string } }> {
   const run = deps.store.getRun(input.runId);
@@ -360,6 +362,10 @@ export async function completeRun(
     typeof input.failureTail === "string"
       ? sanitizeText(input.failureTail).slice(-4_000)
       : undefined;
+  const logTail =
+    typeof input.logTail === "string"
+      ? sanitizeText(input.logTail).slice(-MAX_PRIVATE_LOG_TAIL_CHARS)
+      : undefined;
   const prUrl =
     isGithubPullRequestUrl(input.prUrl) ? input.prUrl : undefined;
   const ticket = deps.store.getByIssueId(run.linear_issue_id);
@@ -370,6 +376,7 @@ export async function completeRun(
     costUsd,
     prUrl,
     failureTail,
+    logTail,
     ticketState: exitCode === 0 ? "active" : "error",
   });
   if (!completed || !ticket) {
@@ -612,13 +619,20 @@ export function createServer(deps: ServerDeps): Hono {
       return context.json({ error: "unauthorized" }, 401);
     }
     const ticket = findTicket(store, context.req.param("identifier"));
-    if (!ticket?.sandbox_id) return context.json({ error: "workspace not found" }, 404);
-    try {
-      const logs = await getSandboxLogs(daytona, ticket.sandbox_id);
-      return context.text(sanitizeText(logs).slice(-100_000));
-    } catch (error) {
-      return context.json({ error: sanitizeText(String(error)) }, 502);
+    if (!ticket) return context.json({ error: "ticket not found" }, 404);
+    if (ticket.sandbox_id) {
+      try {
+        const logs = await getSandboxLogs(daytona, ticket.sandbox_id);
+        return context.text(sanitizeText(logs).slice(-MAX_PRIVATE_LOG_TAIL_CHARS));
+      } catch (error) {
+        console.warn(`[logs] live workspace unavailable for ${ticket.linear_issue_identifier}:`, error);
+      }
     }
+    const durableLogTail = store.getLatestRunWithLog(ticket.linear_issue_id)?.log_tail;
+    if (durableLogTail) {
+      return context.text(sanitizeText(durableLogTail).slice(-MAX_PRIVATE_LOG_TAIL_CHARS));
+    }
+    return context.json({ error: "logs not found" }, 404);
   });
 
   app.get("/preview/:identifier", async (context) => {

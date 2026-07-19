@@ -90,6 +90,12 @@ describe("sandbox event contracts", () => {
     const sandbox = {
       id: "sandbox-1",
       state: "started",
+      process: {
+        executeCommand: vi.fn(async () => ({
+          exitCode: 0,
+          result: "safe ghp_abcdefghijklmnop callback-token-123",
+        })),
+      },
       fs: {
         listFiles: vi.fn(async () =>
           [...files.entries()].map(([path, value]) => ({
@@ -119,7 +125,12 @@ describe("sandbox event contracts", () => {
     );
     expect(finishCompletion).toHaveBeenCalledOnce();
     expect(finishCompletion).toHaveBeenCalledWith(
-      expect.objectContaining({ runId: "run-1", token: "callback-token-123", exitCode: 0 })
+      expect.objectContaining({
+        runId: "run-1",
+        token: "callback-token-123",
+        exitCode: 0,
+        logTail: "safe [REDACTED] [REDACTED]",
+      })
     );
     expect(files.size).toBe(0);
     expect(store.getSandboxEvent("11111111-1111-4111-8111-111111111111")?.status)
