@@ -61,3 +61,17 @@ task_skill_name() {
     *) return 1 ;;
   esac
 }
+
+# The OpenThrottle adapters are intentionally thin. This declaration makes
+# their native Compound Engineering composition explicit to the entrypoint,
+# tests, logs, and the agent itself while Fly remains the outer scheduler.
+task_ce_pipeline() {
+  case "$1" in
+    implement) printf '%s' 'ce-work,ce-code-review,ce-commit-push-pr,ce-babysit-pr' ;;
+    review) printf '%s' 'ce-code-review' ;;
+    review-fix) printf '%s' 'ce-resolve-pr-feedback,ce-babysit-pr' ;;
+    investigate) printf '%s' 'ce-debug,ce-commit-push-pr,ce-babysit-pr' ;;
+    resume) printf '%s' 'resume' ;;
+    *) return 1 ;;
+  esac
+}

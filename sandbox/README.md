@@ -23,10 +23,28 @@ tasks are `implement`, `resume`, `review`, `review-fix`, and `investigate`.
 Fresh tasks use their corresponding skill; resume continues the saved Claude
 session or Codex thread.
 
+The corresponding OpenThrottle skill is a thin product adapter over native CE:
+
+- `implement` → `ce-work` → `ce-code-review` → `ce-commit-push-pr` → bounded
+  `ce-babysit-pr`.
+- `review` → report-only `ce-code-review` and one PR verdict comment.
+- `review-fix` → `ce-resolve-pr-feedback` → bounded `ce-babysit-pr`; Fly then
+  schedules a fresh review.
+- `investigate` → action-capable `ce-debug mode:pipeline`, with convergent fixes
+  shipped and divergent decisions returned as needs-human residuals.
+
+Fly owns run serialization, webhook retries, follow-up scheduling, and Linear
+publication. CE owns agent reasoning and code/PR work within the run.
+
 `~/.ot` holds ticket context, task/dev logs, the agent session ID, normalized
 run result, and a structured outbox. `ot-activity` writes progress into that
 outbox. The exit trap writes exit code, Claude cost, PR URL, and sanitized
 failure tail as a completion marker. Fly reads both through the Daytona SDK.
+At completion Fly also reads, sanitizes, and persists only the last 100,000
+characters of `task.log` in its private SQLite database. Live logs are served
+while the workspace exists and this durable tail is the fallback after cleanup;
+only the newest captured tail per ticket is retained, and neither form is
+automatically attached to Linear or the PR.
 
 Claude receives only project-declared MCP servers through a strict runtime
 config and user-level setting sources. Claude and Codex receive the same native
@@ -70,5 +88,6 @@ daytona list
 daytona ssh <sandbox-id>
 ```
 
-Or use `openthrottle logs <ticket>` for sanitized remote output and the
-wake-on-click preview link attached to the Linear session.
+Or use `openthrottle logs <ticket>` for authenticated, sanitized live output or
+the latest durable private tail after workspace deletion. The wake-on-click
+preview link remains attached to the Linear session.

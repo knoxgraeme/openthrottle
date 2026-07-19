@@ -2,9 +2,11 @@ import type { Daytona, Sandbox } from "@daytona/sdk";
 import type { AgentActivityInput } from "./linear.js";
 import type { Ticket, TicketStore } from "./db.js";
 import { isGithubPullRequestUrl } from "./github.js";
+import { MAX_PRIVATE_LOG_TAIL_BYTES, MAX_PRIVATE_LOG_TAIL_CHARS } from "./logs.js";
 import { sanitizeText } from "./sanitize.js";
 
 const OUTBOX_DIR = "/home/agent/.ot/outbox";
+const TASK_LOG_TAIL_COMMAND = `tail -c ${MAX_PRIVATE_LOG_TAIL_BYTES} /home/agent/.ot/task.log`;
 const MAX_EVENT_BYTES = 32 * 1024;
 const MAX_BODY_LENGTH = 8_000;
 const EVENT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -136,6 +138,18 @@ async function listEventFiles(sandbox: Sandbox) {
     .sort((left, right) => left.name.localeCompare(right.name));
 }
 
+async function readTaskLogTail(sandbox: Sandbox, callbackToken: string): Promise<string | undefined> {
+  if (!sandbox.process?.executeCommand) return undefined;
+  try {
+    const result = await sandbox.process.executeCommand(TASK_LOG_TAIL_COMMAND, undefined, undefined, 10);
+    if (result.exitCode !== 0 || !result.result) return undefined;
+    return sanitizeText(result.result, process.env, [callbackToken]).slice(-MAX_PRIVATE_LOG_TAIL_CHARS);
+  } catch (error) {
+    console.warn("[sandbox-events] could not preserve the private task log tail:", error);
+    return undefined;
+  }
+}
+
 interface SandboxEventPollerParams {
   daytona: Daytona;
   store: TicketStore;
@@ -147,6 +161,7 @@ interface SandboxEventPollerParams {
     costUsd?: number;
     prUrl?: string;
     failureTail?: string;
+    logTail?: string;
   }) => Promise<{ status: number }>;
 }
 
@@ -233,6 +248,7 @@ async function pollTicketEvents(
       if (event.kind === "activity") {
         await params.postActivity(toLinearActivity(event, ticket.linear_session_id));
       } else {
+        const logTail = await readTaskLogTail(sandbox, event.token);
         const result = await params.finishCompletion({
           runId: event.run_id,
           token: event.token,
@@ -240,6 +256,7 @@ async function pollTicketEvents(
           costUsd: event.cost_usd,
           prUrl: event.pr_url,
           failureTail: event.failure_tail,
+          logTail,
         });
         if (result.status !== 200 && result.status !== 409) {
           throw new Error(`completion rejected with status ${result.status}`);

@@ -17,7 +17,9 @@ Linear ticket ──> Fly supervisor ──> Daytona sandbox ──> ot/* branch
 
 The supervisor authenticates webhooks, durably stores and retries deliveries,
 owns one-time run state in SQLite, and keeps one sandbox per ticket. Agents
-push early, cannot push main/master, and run through a sanitizer. PR
+push early, cannot push main/master, and run through a sanitizer. Fly is the
+deterministic outer state machine; native Compound Engineering skills are the
+agentic implementation/review/debug loop inside each authorized run. PR
 close/merge deletes the workspace. Review and CI events are mirrored back to
 the Linear session.
 
@@ -72,8 +74,10 @@ npx openthrottle status
 Only repo, Linear, and model credentials enter a sandbox—never Daytona, Fly,
 webhook, install, or operator tokens. Webhooks are signature-verified, run and
 preview tokens are stored hashed, and logs redact named/nested credentials and
-known token shapes. GitHub branch protection and a fine-grained PAT are still
-required as the outer enforcement layer.
+known token shapes. A bounded private task-log tail is stored in Fly's SQLite
+database so operator debugging survives workspace deletion; raw logs are not
+attached to Linear or GitHub. GitHub branch protection and a fine-grained PAT
+are still required as the outer enforcement layer.
 
 The deterministic contract suite and Docker smoke are green locally. Live
 Linear/Daytona/Fly acceptance is intentionally a separate deployment gate

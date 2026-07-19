@@ -65,6 +65,11 @@ only active runs through the Daytona SDK, durably claims each event, posts
 activities as the OpenThrottle app, and consumes completion through the same
 finalizer used by the legacy `POST /runs/:id/complete` endpoint. If no result
 arrives by `TASK_TIMEOUT` plus grace, the sweep marks the run timed out.
+Before finalizing an outbox completion, Fly reads a fixed-size tail of
+`~/.ot/task.log`, sanitizes it (including the one-time callback token), and
+stores at most 100,000 characters on the run row. This private operator log is
+not published to Linear or GitHub. Persisting a new tail clears older tails for
+that ticket, bounding durable log storage to the latest captured run.
 
 ### GitHub/review lifecycle
 
@@ -73,6 +78,8 @@ arrives by `TASK_TIMEOUT` plus grace, the sweep marks the run timed out.
 - `needs-review` labels or `review_requested` start a fresh `review` task.
 - A human `CHANGES_REQUESTED` review starts `review-fix`; a successful fix
   starts a fresh re-review.
+- Implement and review-fix runs invoke bounded `ce-babysit-pr mode:pipeline`
+  so actionable CI/review feedback can be repaired before Fly's next event.
 - Review verdicts are PR comments, never GitHub approval/rejection state.
 - Completed workflow/check-suite and submitted-review events are mirrored to
   Linear.
@@ -101,7 +108,7 @@ session is known.
 | `GET` | `/oauth/callback` | one-time OAuth state | exchange/store token |
 | `GET` | `/status` | `OT_STATUS_TOKEN` bearer | ticket list |
 | `POST` | `/tickets/:id/stop` | `OT_STATUS_TOKEN` bearer | stop a ticket |
-| `GET` | `/tickets/:id/logs` | `OT_STATUS_TOKEN` bearer | sanitized logs |
+| `GET` | `/tickets/:id/logs` | `OT_STATUS_TOKEN` bearer | sanitized live logs, falling back to the latest durable private run tail |
 | `GET` | `/preview/:id?token=` | per-ticket token | wake and signed redirect |
 | `POST` | `/runs/:id/complete` | one-time run bearer | consume run result |
 
@@ -127,6 +134,8 @@ payload, lease/retry state, attempt count, processing result, and sanitized
 last error. `sandbox_events` stores idempotency/retry state for validated
 outbox records without persisting the raw one-time token. `settings` stores
 OAuth tokens and small supervisor settings.
+The `runs` table also stores a bounded sanitized `log_tail` for authenticated
+operator debugging after a sandbox is deleted.
 Migrations are additive for existing v2 databases; pre-inbox delivery rows are
 preserved as already processed so an upgrade cannot replay them.
 
@@ -185,6 +194,12 @@ global runtime instructions in `~/.codex/AGENTS.md`. Claude receives a strict
 temporary config containing only project-declared MCP servers with user-only
 setting sources. Project `AGENTS.md` and `.claude/settings.json` files remain
 untouched and editable.
+The adapters compose native CE as follows: implement uses `ce-work`, local
+`ce-code-review`, `ce-commit-push-pr`, and bounded `ce-babysit-pr`; review uses
+report-only `ce-code-review`; review-fix uses `ce-resolve-pr-feedback` and
+bounded `ce-babysit-pr`; investigate uses action-capable `ce-debug
+mode:pipeline` and ships convergent fixes. Fly remains responsible for run
+serialization, event publication, and fresh re-review scheduling.
 Implement/review/review-fix/investigate use fresh contexts; resume reads
 `~/.ot/agent-session-id` and continues the same Claude session/Codex thread.
 
@@ -208,7 +223,8 @@ changed when a sandbox resumes.
   `OT_AGENT_APP_ID` is set, delegate it with `IssueUpdateInput.delegateId`.
 - `openthrottle status`: authenticated ticket table.
 - `openthrottle stop <ticket>`: authenticated stop control.
-- `openthrottle logs <ticket>`: authenticated sanitized log output.
+- `openthrottle logs <ticket>`: authenticated sanitized live output, with the
+  latest durable private run tail after workspace cleanup.
 
 Target repository config:
 

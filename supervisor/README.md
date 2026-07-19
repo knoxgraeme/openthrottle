@@ -6,6 +6,8 @@ sandboxes, mirrors review/CI activity, and sweeps stale resources. Linear
 OAuth refresh is shared across webhook and sweep paths, and outbound
 Linear/GitHub calls have 15-second deadlines. A short-interval worker reads
 agent activities and completion markers from active Daytona sandboxes.
+Completion polling also persists a bounded sanitized task-log tail so operator
+debugging survives sandbox deletion without posting raw logs to Linear or PRs.
 
 ## Develop and test
 
@@ -70,6 +72,8 @@ merge. Keep branch protection enabled.
 `/status`, `/tickets/:id/stop`, and `/tickets/:id/logs` require
 `Authorization: Bearer $OT_STATUS_TOKEN`. `/oauth/install` uses the separate
 install token. Preview links and legacy callbacks carry scoped random credentials.
+The logs endpoint prefers live Daytona output and falls back to the latest
+private run tail stored in SQLite.
 Stopping a ticket returns an error and preserves its active state if Daytona
 cannot confirm the stop; PR-close cleanup is best-effort and still closes the
 terminal ticket while recording cleanup failures.

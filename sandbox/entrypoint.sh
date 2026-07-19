@@ -295,6 +295,8 @@ export OT_BUILD_CMD="$CFG_BUILD"
 export OT_FORMAT_CMD="$CFG_FORMAT"
 export OT_DEV_CMD="$CFG_DEV"
 export OT_DEV_PORT="$DEV_PORT"
+OT_CE_PIPELINE="$(task_ce_pipeline "$TASK_TYPE")"
+export OT_CE_PIPELINE
 
 # Agent resolution precedence:
 #   1. AGENT from the supervisor (Linear label or DEFAULT_AGENT).
@@ -313,7 +315,7 @@ case "$AGENT" in
   *) log "FATAL: resolved AGENT='${AGENT}' is invalid (expected claude|codex)"; exit 1 ;;
 esac
 
-log "config: agent=${AGENT} dev='${CFG_DEV}' max_turns=${MAX_TURNS} task_timeout=${TASK_TIMEOUT}"
+log "config: agent=${AGENT} ce_pipeline=${OT_CE_PIPELINE} dev='${CFG_DEV}' max_turns=${MAX_TURNS} task_timeout=${TASK_TIMEOUT}"
 
 # =============================================================================
 # Phase 5 — post_bootstrap
@@ -423,8 +425,8 @@ case "${AGENT}:${TASK_TYPE}" in
     CODEX_STDIN_FILE="${OT_DIR}/codex-${TASK_TYPE}-stdin.md"
     {
       cat "${OPT_DIR}/skills/codex/${SKILL_NAME}.md"
-      printf '\n\n## Runtime context\n- Task type: %s\n- Issue: %s (%s)\n- Repository: %s\n- Branch: %s\n- Base branch: %s\n- PR number: %s\n- Review round: %s\n' \
-        "$TASK_TYPE" "${LINEAR_ISSUE_IDENTIFIER:-unknown}" "${LINEAR_ISSUE_ID:-unknown}" \
+      printf '\n\n## Runtime context\n- Task type: %s\n- CE pipeline: %s\n- Issue: %s (%s)\n- Repository: %s\n- Branch: %s\n- Base branch: %s\n- PR number: %s\n- Review round: %s\n' \
+        "$TASK_TYPE" "$OT_CE_PIPELINE" "${LINEAR_ISSUE_IDENTIFIER:-unknown}" "${LINEAR_ISSUE_ID:-unknown}" \
         "$GITHUB_REPO" "$BRANCH_NAME" "$BASE_BRANCH" "${PR_NUMBER:-none}" "${REVIEW_ROUND:-none}"
       printf '\n\n## Linear ticket context\n'
       cat "${OT_DIR}/linear-context.md"
