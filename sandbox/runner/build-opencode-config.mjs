@@ -9,6 +9,7 @@ export const OPENCODE_MODEL_PROFILES = Object.freeze({
     modelId: "kimi-for-coding",
     baseURL: "https://api.kimi.com/coding/v1",
     contextLimit: 262_144,
+    outputLimit: 65_536,
     apiKeyEnv: "KIMI_CODE_API_KEY",
   }),
 });
@@ -80,7 +81,7 @@ export function buildOpenCodeConfig({ model, mcpServers = {} }) {
         models: {
           [profile.modelId]: {
             name: "kimi-for-coding",
-            limit: { context: profile.contextLimit },
+            limit: { context: profile.contextLimit, output: profile.outputLimit },
           },
         },
       },

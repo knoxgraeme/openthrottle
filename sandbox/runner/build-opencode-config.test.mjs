@@ -31,7 +31,7 @@ describe("OpenCode config builder", () => {
       },
       models: {
         "kimi-for-coding": {
-          limit: { context: 262_144 },
+          limit: { context: 262_144, output: 65_536 },
         },
       },
     });
