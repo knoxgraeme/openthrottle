@@ -13,8 +13,10 @@ divergent product or architecture decisions.
    structured status and residuals.
 3. If CE pushed a fix, resolve an existing PR for `BRANCH_NAME`; if none exists,
    invoke `$ce-commit-push-pr` with
-   `mode:pipeline branding:on babysit:off`. Then invoke `$ce-babysit-pr` with
-   `mode:pipeline <PR URL>`. Never merge the PR.
+   `mode:pipeline branding:on babysit:off`. Ensure the PR targets `$BASE_BRANCH`;
+   if it was opened against a different base, retarget it with
+   `gh pr edit --repo "$GITHUB_REPO" <number> --base "$BASE_BRANCH"`. Then invoke
+   `$ce-babysit-pr` with `mode:pipeline <PR URL>`. Never merge the PR.
 4. If the fix is blocked on a divergent product or architecture decision that
    a specific answer would unblock, run `ot-activity elicitation` with the
    diagnosis and one numbered decision list (context, options, and your

@@ -41,9 +41,13 @@ session. Record every smaller judgment call you do make for the final
    known gap.
 6. Invoke `/ce-commit-push-pr mode:pipeline branding:on babysit:off`. It owns
    the final commits, push, and PR creation or update.
-7. Resolve the PR URL with `gh pr view --repo "$GITHUB_REPO" --json url -q .url`.
-   Invoke `/ce-babysit-pr mode:pipeline <PR URL>` so CI and actionable review
-   feedback receive a bounded autonomous repair pass. Never merge the PR.
+7. Resolve the PR URL and base with
+   `gh pr view --repo "$GITHUB_REPO" --json url,baseRefName`. The PR must target
+   `$BASE_BRANCH`; if it was opened against a different base, retarget it with
+   `gh pr edit --repo "$GITHUB_REPO" <number> --base "$BASE_BRANCH"` before
+   continuing. Invoke `/ce-babysit-pr mode:pipeline <PR URL>` so CI and
+   actionable review feedback receive a bounded autonomous repair pass. Never
+   merge the PR.
 8. If CE returned needs-human residuals that a specific answer would unblock,
    do not park them in a response: run `ot-activity elicitation` with the PR
    URL and one numbered decision list, then stop; the reply resumes this
