@@ -75,9 +75,11 @@ async function exec(name, script, { timeoutMs = 300_000 } = {}) {
   return { exitCode, output: b.subarray(0, end).toString("utf8"), rawTail: b.subarray(-16).toString("hex") };
 }
 
-async function fsWrite(name, path, content) {
+// Confirmed shape (SDK filesystem.ts): mode is a 4-digit octal string,
+// mkdirParents creates the tree.
+async function fsWrite(name, path, content, mode = "0644") {
   const res = await api("PUT", `/v1/sprites/${name}/fs/write`, {
-    query: [["path", path], ["workingDir", "/"]],
+    query: [["path", path], ["workingDir", "/"], ["mkdirParents", "true"], ["mode", mode]],
     raw: Buffer.from(content),
   });
   if (res.status >= 300) throw new Error(`fs/write ${path} HTTP ${res.status}: ${res.text().slice(0, 300)}`);
@@ -144,9 +146,16 @@ async function checkExec() {
 }
 
 async function checkFs() {
-  await fsWrite(MAIN, "/tmp/spike-fs.txt", "hello-from-fs-write\n");
-  const r = await exec(MAIN, "cat /tmp/spike-fs.txt && stat -c '%a %U' /tmp/spike-fs.txt");
-  record("fs", r.output.includes("hello-from-fs-write") ? "PASS" : "FAIL", r.output.trim().replace(/\n/g, " | "));
+  await fsWrite(MAIN, "/tmp/spike-dir/spike-fs.txt", "hello-from-fs-write\n", "0600");
+  const r = await exec(MAIN, "cat /tmp/spike-dir/spike-fs.txt && stat -c '%a %U' /tmp/spike-dir/spike-fs.txt");
+  const read = await api("GET", `/v1/sprites/${MAIN}/fs/read`, {
+    query: [["path", "/tmp/spike-dir/spike-fs.txt"], ["workingDir", "/"]],
+  });
+  record(
+    "fs",
+    r.output.includes("hello-from-fs-write") && read.text().includes("hello-from-fs-write") ? "PASS" : "FAIL",
+    `${r.output.trim().replace(/\n/g, " | ")}; fs/read=${read.status} (expect mode 600, mkdirParents worked)`
+  );
 }
 
 // §8 Q4 (read-only part) — who are we, can we sudo, can a non-sudo user exist.
@@ -219,64 +228,74 @@ async function checkServiceTask() {
   );
 }
 
-// §8 Q2 — checkpoint create/restore timing. Endpoint shape is a probe.
+// §8 Q2 — checkpoint create/restore timing.
+// Confirmed shape (SDK sprite.ts): POST .../checkpoint (singular) with an
+// NDJSON progress stream; list is GET .../checkpoints (plural); restore is
+// POST .../checkpoints/{id}/restore (also NDJSON).
 async function checkCheckpoint() {
   await exec(MAIN, "echo pre-checkpoint > /tmp/spike-ckpt.txt");
-  const candidates = [`/v1/sprites/${MAIN}/checkpoints`, `/v1/sprites/${MAIN}/checkpoint`];
-  let created, path;
-  for (const p of candidates) {
-    const t0 = Date.now();
-    const res = await api("POST", p, { body: { comment: "spike" } });
-    if (res.status < 300) {
-      created = { ms: Date.now() - t0, body: res.text().slice(0, 200) };
-      path = p;
-      break;
-    }
-    if (res.status !== 404 && res.status !== 405) {
-      record("checkpoint", "INFO", `POST ${p} => HTTP ${res.status}: ${res.text().slice(0, 150)}`);
-    }
-  }
-  if (!created) {
-    record("checkpoint", "FAIL", `no candidate endpoint accepted (tried ${candidates.join(", ")}) — create via in-sprite sprite-env instead`);
-    const t0 = Date.now();
-    const r = await exec(MAIN, "sprite-env checkpoints create --comment spike 2>&1 | tail -1");
-    record("checkpoint-insprite", "INFO", `in-sprite create: ${Date.now() - t0}ms — ${r.output.trim()}`);
+  const t0 = Date.now();
+  const res = await api("POST", `/v1/sprites/${MAIN}/checkpoint`, { body: { comment: "spike" } });
+  if (res.status >= 300) {
+    record("checkpoint", "FAIL", `POST /checkpoint HTTP ${res.status}: ${res.text().slice(0, 200)}`);
     return;
   }
-  record("checkpoint", "PASS", `POST ${path} created in ${created.ms}ms: ${created.body}`);
+  const createMs = Date.now() - t0; // fetch buffers the full NDJSON stream, so this is time-to-stream-end
+  const list = await api("GET", `/v1/sprites/${MAIN}/checkpoints`);
+  const checkpoints = list.status === 200 ? list.json() : [];
+  const latest = Array.isArray(checkpoints) ? checkpoints[checkpoints.length - 1] : undefined;
+  record(
+    "checkpoint",
+    "PASS",
+    `create stream completed in ${createMs}ms (docs claim ms-CoW vs 10-30s — this settles it); ${
+      Array.isArray(checkpoints) ? checkpoints.length : "?"
+    } checkpoints, latest=${latest?.id}`
+  );
+  if (!latest?.id) return;
   await exec(MAIN, "echo post-checkpoint > /tmp/spike-ckpt.txt");
-  const list = await exec(MAIN, "sprite-env checkpoints list 2>&1 | tail -3");
-  record("checkpoint-list", "INFO", list.output.trim().replace(/\n/g, " | "));
+  const t1 = Date.now();
+  const restore = await api("POST", `/v1/sprites/${MAIN}/checkpoints/${latest.id}/restore`);
+  const restoreMs = Date.now() - t1;
+  // Restore is async and restarts the environment; exec retries while it comes back.
+  let after = { output: "" };
+  for (let i = 0; i < 10; i++) {
+    await sleep(3_000);
+    try {
+      after = await exec(MAIN, "cat /tmp/spike-ckpt.txt");
+      break;
+    } catch {}
+  }
+  record(
+    "checkpoint-restore",
+    after.output.includes("pre-checkpoint") ? "PASS" : "FAIL",
+    `restore HTTP ${restore.status}, stream ${restoreMs}ms; file after restore=${JSON.stringify(after.output.trim())} (want pre-checkpoint)`
+  );
 }
 
-// D6 — egress policy endpoint probe + enforcement.
+// D6 — egress policy enforcement.
+// Confirmed shape (SDK policy.ts): GET/POST /v1/sprites/{name}/policy/network,
+// 204 on success.
 async function checkPolicy() {
+  const path = `/v1/sprites/${MAIN}/policy/network`;
   const policy = { rules: [{ include: "defaults" }, { domain: "example.com", action: "deny" }] };
-  const candidates = [
-    ["PUT", `/v1/sprites/${MAIN}/policy/network`],
-    ["PUT", `/v1/sprites/${MAIN}/network-policy`],
-    ["PUT", `/v1/sprites/${MAIN}/policies/network`],
-  ];
-  let applied;
-  for (const [method, p] of candidates) {
-    const res = await api(method, p, { body: policy });
-    if (res.status < 300) {
-      applied = p;
-      break;
-    }
-  }
-  if (!applied) {
-    record("policy", "FAIL", `no candidate endpoint accepted (${candidates.map(([, p]) => p).join(", ")})`);
+  const res = await api("POST", path, { body: policy });
+  if (res.status >= 300) {
+    record("policy", "FAIL", `POST ${path} HTTP ${res.status}: ${res.text().slice(0, 200)}`);
     return;
   }
   await sleep(3_000);
+  const readBack = await api("GET", path);
   const r = await exec(
     MAIN,
     "cat /.sprite/policy/network.json 2>/dev/null | head -c 200; echo; dig +short github.com | head -1; dig example.com 2>&1 | grep -o REFUSED | head -1"
   );
-  record("policy", "PASS", `applied via ${applied}; in-sprite view+resolution: ${r.output.trim().replace(/\n/g, " | ")}`);
+  record(
+    "policy",
+    "PASS",
+    `applied (HTTP ${res.status}); GET=${readBack.status}; in-sprite view+resolution: ${r.output.trim().replace(/\n/g, " | ")}`
+  );
   // reset to unrestricted for the remaining checks
-  await api("PUT", applied, { body: { rules: [] } });
+  await api("POST", path, { body: { rules: [] } });
 }
 
 // §8 Q7 / D7 — URL auth behavior and wake-on-request.
@@ -310,33 +329,49 @@ async function checkWake() {
   record("wake", "INFO", `status after 50s idle=${before}; exec-after-idle latency=${Date.now() - t0}ms`);
 }
 
-// §8 Q1 — concurrency cap semantics (active vs merely existing).
+// §8 Q1 — concurrency cap. Research indicates SEPARATE active and warm caps
+// (equal per tier; Adventurer=20), paused=warm counts against the warm cap,
+// cold counts against neither, and the create call returns a structured
+// `concurrent_sprite_limit_exceeded` error. This probes the create-time cap
+// and surfaces the structured fields. Raise --cap-probe above the plan tier to
+// actually trip it (default 25 clears Adventurer's 20).
 async function checkCap() {
+  const max = Number(argValue("--cap-probe") ?? 25);
   const created = [];
   let capHit = null;
-  for (let i = 1; i <= 12; i++) {
+  for (let i = 1; i <= max; i++) {
     const name = `${PREFIX}-cap-${i}`;
     const res = await api("POST", "/v1/sprites", { body: { name, wait_for_capacity: false } });
     if (res.status >= 300 && res.status !== 409) {
-      capHit = `sprite #${i}: HTTP ${res.status}: ${res.text().slice(0, 160)}`;
+      let extra = res.text().slice(0, 160);
+      try {
+        const j = res.json();
+        extra = `error=${j.error} limit=${j.limit} current=${j.current_count} upgrade=${j.upgrade_available}`;
+      } catch {}
+      capHit = `capped at create #${i}: HTTP ${res.status} ${extra}`;
       break;
     }
     created.push(name);
-    await exec(name, "true").catch((e) => (capHit ??= `exec on #${i}: ${e.message.slice(0, 160)}`));
-    if (capHit) break;
   }
-  record("cap", "INFO", capHit ?? `created+ran ${created.length} concurrently without hitting a cap`);
+  record(
+    "cap",
+    "INFO",
+    (capHit ?? `created ${created.length} sprites without a create-time cap (raise --cap-probe)`) +
+      " — research: distinct active vs warm caps; confirm whether these ot-spike sprites (now warm) block a fresh create"
+  );
   for (const name of created) await deleteSprite(name);
 }
 
-// §8 Q3 — memory shape and behavior under pressure.
+// §8 Q3 — memory. Research says design bursts to 16 GB but the practical
+// ceiling is reported ~8 GB. Allocate past 8 GB in 1 MB chunks and see where it
+// dies (or whether it reaches ~16 GB), plus what `free` reports.
 async function checkMem() {
   const r = await exec(
     MAIN,
-    "free -m | head -2; node -e 'const a=[];try{for(let i=0;i<7000;i++){a.push(Buffer.alloc(1<<20,1));if(i%1000===0)console.log(i,\"MB\")}}catch(e){console.log(\"died:\",e.message)}' 2>&1 | tail -3",
-    { timeoutMs: 240_000 }
+    "free -m | head -2; node -e 'const a=[];try{for(let i=0;i<17000;i++){a.push(Buffer.alloc(1<<20,1));if(i%1000===0)console.log(i,\"MB\")}}catch(e){console.log(\"died:\",e.message)}' 2>&1 | tail -3",
+    { timeoutMs: 300_000 }
   );
-  record("mem", "INFO", r.output.trim().replace(/\n/g, " | "));
+  record("mem", "INFO", `${r.output.trim().replace(/\n/g, " | ")} — expect death ~8GB (advertised 16GB)`);
 }
 
 async function cleanup() {

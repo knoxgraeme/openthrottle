@@ -9,7 +9,11 @@ Grounded in the official docs at `superfly/sprites-docs` (docs.sprites.dev),
 especially the *Claude Managed Agents* integration guide, which is Fly's own
 reference implementation of OpenThrottle's exact shape: an always-on worker
 that claims queued work and runs each session in a named, persistent,
-per-session Sprite.
+per-session Sprite. The wire protocol is pinned from the `superfly/sprites-js`
+SDK source in [../spike/PROTOCOL.md](../spike/PROTOCOL.md); operational facts
+(caps, memory, maturity) are in [../spike/RESEARCH.md](../spike/RESEARCH.md);
+[../spike/sprites-spike.mjs](../spike/sprites-spike.mjs) confirms both against a
+live org (Phase 0).
 
 ## 1. Platform facts the design relies on
 
@@ -26,8 +30,8 @@ per-session Sprite.
 | Files are written from outside via `PUT /v1/sprites/{name}/fs/write?path=…`; commands run via `POST …/exec` (framed output, exit code after a `0x03` frame) or SDK exec/spawn with per-call `env`/`cwd` | Managed-agents guide, JS SDK |
 | Sprite URL `https://<name>-<org-id>.sprites.app` is **org-private by default** (`url_settings.auth: "sprite"`), switchable to `public` per sprite; routes to the `http_port` service and wakes on request | Networking, API |
 | **Egress network policy**: DNS-based allowlist applied from outside via API, read-only inside the sprite; raw-IP and private-IP dialing blocked under policy | Networking |
-| Fixed shape: 8 vCPU, ~4 GB RAM (platform-managed, may autoscale), 100 GB disk. Billing per second, compute+hot-storage only while active; object storage accrues 24/7, including for paused sprites | Lifecycle, Billing |
-| Concurrency is plan-capped: pay-as-you-go 3 concurrent sprites; Level 10 $20/mo = 10 concurrent + 450 CPU-hrs / 1,800 GB-hrs / 50 GB included; overage at usage rates (~$0.07/CPU-hr, ~$0.04375/GB-hr) | Billing |
+| 8 vCPU; memory **elastic** (design bursts to 16 GB, but ~8 GB practical ceiling reported — OOM risk on heavy builds); 100 GB disk. Billing per second, compute+hot-storage only while active; object storage accrues 24/7 including while paused | Lifecycle, Billing, RESEARCH Q3 |
+| Concurrency is plan-capped by **two** caps — *active* and *warm* (equal per tier). Paused=warm counts against the warm cap; **cold (long-idle) counts against neither**. Adventurer $20/mo = 20/20; up to Mythic $2,000/mo = 2,000. Structured `concurrent_sprite_limit_exceeded` error. Rates ~$0.07/CPU-hr, ~$0.04375/GB-hr; storage cold $0.02 / hot $0.50 GB-mo, 20 GB cold free | Billing, RESEARCH Q1/Q5 |
 | Auth: one org-scoped `SPRITE_TOKEN` against `https://api.sprites.dev`. JS SDK (`@fly/sprites`) requires **Node 24+** | Configuration, JS SDK |
 | Hosted MCP server (`https://sprites.dev/mcp`, OAuth, name-prefix + count-capped tokens) exposes create/exec/checkpoint/policy/services as MCP tools | Remote MCP |
 
@@ -150,12 +154,17 @@ npm, PyPI, model APIs — plus the supervisor callback host). Raw-IP and
 private-IP egress are platform-blocked under policy, and the policy is
 read-only from inside the sprite.
 
-One regression to manage: the base `sprite` user has passwordless sudo, so
-root-sealing is weaker than under Daytona. Provision runs agent work as the
-non-sudo `agent` user (as today, via `sudo -u agent` instead of gosu) and
-removes `sprite` from sudoers at the end of provisioning as evaluated in the
-spike (§8). GitHub branch protection + fine-grained PAT remain the outer
-enforcement layer regardless (already a stated invariant).
+On sudo (revised per RESEARCH Q4): the base `sprite` user has passwordless
+sudo. **Do not edit sudoers** — the serious hardening projects deliberately
+don't (it risks breaking base-image auto-upgrades and the runtime), and Fly's
+security model is per-sprite **Firecracker VM isolation**, not in-guest
+hardening. Because every ticket already runs in its own hardware-isolated
+microVM, base-user sudo is far less dangerous than under Daytona's shared
+kernel. The boundary is: VM isolation (real) + agent work as the non-privileged
+`agent` user via `sudo -u agent` (hook-sealing hygiene, as today) + GitHub
+branch protection & fine-grained PAT (outer enforcement, already an invariant).
+Sudoers removal drops from the plan; in-guest hardening is a separate advanced
+track if ever needed.
 
 ### D7. Preview: org-auth'd Sprite URL replaces signed preview URLs (deferred polish)
 
@@ -237,8 +246,9 @@ this doc; go/no-go.
 - `deploy.yml`: delete the snapshot build/stage job; deploy is just the Fly
   app.
 - Smoke: replace the Docker-image smoke with a harness that runs
-  `provision.sh` + entrypoint stubs inside `ubuntu:25.04` (approximating the
-  base image); Bats and Vitest contract suites updated to the REST client.
+  `provision.sh` + entrypoint stubs inside the current base OS (`ubuntu:26.04`,
+  approximating the Sprites base image); Bats and Vitest contract suites updated
+  to the REST client.
 - Rewrite SPEC.md sandbox/supervisor contract sections; README bootstrap.
 
 ### Phase 4 — Cutover (one-time)
@@ -259,24 +269,27 @@ either direction — the freeze/drain makes that set empty.
 
 ## 5. Cost & capacity
 
-Per active-ticket-hour ≈ 8 CPU × $0.07 + 4 GB × $0.04375 ≈ **$0.74/hr while
-the agent actually runs**, $0 compute while paused; storage ~$0.5/GB-month for
-what's written. The binding constraint is the **plan's concurrent-sprite cap**
-(= max simultaneously *active* tickets, assuming paused sprites don't count —
-spike question). Level 10 ($20/mo, 10 concurrent) fits current usage; the
-sweep's expiry of stale tickets now also directly bounds storage spend.
+Per active-ticket-hour ≈ 8 CPU × $0.07 + ~4 GB × $0.04375 ≈ **~$0.74/hr while
+the agent actually runs**, $0 compute while paused; storage: hot $0.50/GB-mo
+(only while active) + cold $0.02/GB-mo (24/7, first 20 GB free). The binding
+constraint is the **warm cap**, not the active cap (RESEARCH Q1): tickets whose
+sprites were touched within ~a day count; a ticket idling days for review goes
+**cold and stops counting**. So capacity ≈ *recently-active* tickets, not all
+open ones — more forgiving than first estimated. Adventurer ($20/mo, 20 active /
+20 warm) covers current usage with headroom; the lifecycle sweep's ticket
+expiry also bounds cold-storage spend.
 
 ## 6. Risks
 
 | Risk | Mitigation |
 |---|---|
-| Base image drifts under us (it auto-upgrades) | Pin agent CLIs + CE checkout in the overlay at provision; smoke against `ubuntu:25.04` in CI; `/.sprite/version.txt` logged per run |
+| **Platform maturity — the biggest risk (RESEARCH Q6).** Pre-1.0 (`rc4x`); documented H1-2026 control-plane outages, one report of ~1-in-5 create success under load, checkpoint/unresponsive bugs, and a possible dev slowdown (SDK untouched ~4 months, docs quiet since ~March). | **Gate the whole port on a go/no-go** after the live spike confirms current stability. Build create/exec **retry + idempotency** into the client. Keep the Daytona rollback path valid through cutover (Phase 4). Reassess if the platform looks stalled. |
+| Base image drifts under us (auto-upgrades; shipped EOL Ubuntu 25.04 for ~2 months once) | Pin agent CLIs + CE checkout in the overlay at provision; CI smoke against the current base (Ubuntu 26.04 LTS); log `/.sprite/version.txt` per run |
 | No custom images → per-ticket provision latency | Accepted (1–3 min, once per ticket); checkpoint v0 covers intra-ticket resets; revisit if Fly ships fork-from-checkpoint |
-| `sudo` on the base user weakens hook sealing | D6: non-sudo `agent` user + sudoers removal (spike-validated); branch protection is the enforced outer layer |
+| `sudo` on the base user | Reframed (D6/RESEARCH Q4): per-sprite Firecracker VM isolation is the boundary; non-privileged `agent` user for hygiene; **don't** edit sudoers (unsupported); branch protection is the enforced outer layer |
 | Push events depend on sprite egress | Local spool + sweep exec-reconcile fallback (D3); callback host pinned in egress policy |
-| 4 GB RAM ceiling for heavy builds | Spike measures a real repo build; platform claims memory autoscaling — verify |
-| Sprites is young; API is `dev-latest` | Thin client isolates the surface; contract tests mock at HTTP level |
-| Concurrency cap semantics (active vs existing) | Spike question §8; plan sizing before cutover |
+| ~8 GB practical RAM ceiling for heavy builds (advertised 16 GB not always available) | Spike measures a real repo build at the ceiling; if a target repo OOMs, that repo is a poor Sprites fit — surface early |
+| Checkpoint reliability (unresponsive-after-checkpoint / restore→404 bugs reported) | Keep checkpointing strictly off the critical path (v0 is an optional reset, never a dependency) |
 
 ## 7. Later (explicitly out of scope for the port)
 
@@ -292,17 +305,31 @@ sweep's expiry of stale tickets now also directly bounds storage spend.
 
 ## 8. Open questions for the spike
 
-1. Do **paused** sprites count against the plan's concurrent cap, or only
-   active ones?
-2. Checkpoint creation: milliseconds-CoW or 10–30s with process stop? (Docs
-   disagree.) Determines where in the entrypoint v0 is taken.
-3. Is memory genuinely autoscaled above ~4 GB under pressure?
-4. Does removing `sprite` from sudoers break the runtime (services, exec,
-   base-image upgrades)?
-5. Exact sprite-name constraints (charset/length) for `ot-<identifier>`
-   mapping.
+The wire protocol is now settled from the SDK source (`spike/PROTOCOL.md`) and
+the operational questions have **research-indicated answers** (`spike/RESEARCH.md`,
+medium confidence, snippet-derived). `spike/sprites-spike.mjs` confirms each
+against a live org — it needs a `SPRITE_TOKEN` and open egress, so it runs from
+a laptop, not from a hosted OpenThrottle session (egress-blocked). Remaining to
+confirm live:
+
+1. **Concurrency (research: two caps, cold uncounted).** Confirm the *warm* cap
+   is what bites for idle open tickets, and that a long-idle ticket sprite goes
+   cold and frees the slot. → `--only cap`, plus observe status decay.
+2. **Checkpoint timing/reliability (research: ~300ms create / ~1s restore, but
+   real breakage reports).** Confirm timing and that restore doesn't 404 the
+   sprite. → `--only checkpoint`.
+3. **Memory (research: ~8 GB practical vs 16 GB advertised).** Confirm the
+   ceiling and behavior under a real repo build. → `--only mem`.
+4. ~~Sudoers removal~~ **dropped** (RESEARCH Q4): don't edit sudoers; rely on VM
+   isolation + non-privileged `agent` user. Spike still records the read-only
+   `sudo` fact for the record. → `--only sudo`.
+5. Exact sprite-name constraints (charset/length) for `ot-<identifier>` — SDK
+   does no client-side validation, so server rules are unknown. → `--only names`.
 6. Egress-policy interaction with `gh`/git credential helper and model APIs —
-   confirm `defaults` covers all agent traffic, enumerate what doesn't.
-7. Service restart semantics after a cold wake mid-run: confirm re-entry
-   behavior matches the entrypoint's idempotency assumptions (or mark the run
-   service `stop`ped on first exit so it never auto-re-runs).
+   confirm `defaults` covers all agent traffic, enumerate what doesn't. →
+   `--only policy`.
+7. Service restart semantics after a cold wake mid-run: confirm re-entry matches
+   the entrypoint's idempotency assumptions (or mark the run service `stop`ped
+   on first exit so it never auto-re-runs). → `--only service-task`.
+8. URL auth (research: org member gets a Fly login prompt; external senders
+   can't). Confirm anonymous vs org-token responses. → `--only url`.
