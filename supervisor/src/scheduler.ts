@@ -66,8 +66,11 @@ export function feedbackMessage(input: FeedbackInput): string {
   );
 }
 
+// Only a review creates a GraphQL reviewThread; a plain PR conversation
+// comment never does, so checking it against thread-resolution state would
+// measure something unrelated and could cancel a fresh comment.
 export function isResolvableFeedbackWorkId(workId: string): boolean {
-  return workId.startsWith("gh-review-") || workId.startsWith("gh-comment-");
+  return workId.startsWith("gh-review-");
 }
 
 // Rounds bound (Phase 1 item 3): a single counter — automatic session-work
@@ -195,6 +198,7 @@ export async function drainNextSessionWork(params: DrainParams): Promise<boolean
     }
 
     const current = params.store.getByIssueId(params.ticket.linear_issue_id) ?? params.ticket;
+    const heading = work.source === "human" ? "Latest human reply" : "New PR feedback";
     const launched = await params.launch({
       cfg: params.cfg,
       store: params.store,
@@ -204,7 +208,7 @@ export async function drainNextSessionWork(params: DrainParams): Promise<boolean
       ticket: current,
       taskType: "resume",
       resumeMessage: work.body,
-      linearContext: `${current.linear_context ?? `# ${current.linear_issue_identifier}`}\n\n## Latest human reply\n\n${work.body}`,
+      linearContext: `${current.linear_context ?? `# ${current.linear_issue_identifier}`}\n\n## ${heading}\n\n${work.body}`,
     });
     const runId = params.store.getByIssueId(params.ticket.linear_issue_id)?.run_id;
     if (launched && runId) {

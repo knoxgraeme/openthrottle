@@ -25,9 +25,9 @@ describe("isAutomaticWorkBounded", () => {
 });
 
 describe("isResolvableFeedbackWorkId", () => {
-  it("flags only gh-review- and gh-comment- ids for the resolved-thread check", () => {
+  it("flags only gh-review- ids for the resolved-thread check — a plain PR comment never creates a review thread to resolve", () => {
     expect(isResolvableFeedbackWorkId("gh-review-42")).toBe(true);
-    expect(isResolvableFeedbackWorkId("gh-comment-7")).toBe(true);
+    expect(isResolvableFeedbackWorkId("gh-comment-7")).toBe(false);
     expect(isResolvableFeedbackWorkId("gh-ci-99")).toBe(false);
     expect(isResolvableFeedbackWorkId("human-reply-1")).toBe(false);
   });

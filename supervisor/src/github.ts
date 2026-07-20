@@ -64,6 +64,7 @@ export interface GithubWorkflowRunEvent extends GithubEventBase {
     status: string;
     conclusion: string | null;
     head_branch: string;
+    head_sha: string;
     html_url: string;
   };
 }
@@ -76,6 +77,7 @@ export interface GithubCheckSuiteEvent extends GithubEventBase {
     status: string;
     conclusion: string | null;
     head_branch: string | null;
+    head_sha: string;
     url: string;
   };
 }
@@ -176,11 +178,13 @@ export function parseGithubWebhook(eventName: string | undefined, raw: string): 
     stringField(run, "name");
     stringField(run, "status");
     stringField(run, "head_branch");
+    stringField(run, "head_sha");
     stringField(run, "html_url");
   } else if (eventName === "check_suite") {
     const suite = recordField(payload, "check_suite");
     numberField(suite, "id");
     stringField(suite, "status");
+    stringField(suite, "head_sha");
     stringField(suite, "url");
     if (suite.head_branch !== null && typeof suite.head_branch !== "string") {
       throw new Error("GitHub webhook has invalid check_suite.head_branch");

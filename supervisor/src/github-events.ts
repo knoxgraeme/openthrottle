@@ -74,13 +74,20 @@ export async function handleGithubEvent(
     const reviewState = event.review.state.toLowerCase();
     if (reviewState !== "changes_requested" && reviewState !== "commented") return;
     if (ticket.state !== "active") return;
-    // Both a human CHANGES_REQUESTED and a bot's commented review are
-    // actionable only when provably not the agent's own account; fail closed
-    // otherwise. A CHANGES_REQUESTED from the token account is equally
-    // self-feedback as a commented one.
     const author = event.review.user?.login;
     const self = await selfGithubLogin(cfg);
-    if (!author || !self || author === self) return;
+    if (reviewState === "commented") {
+      // A bot's commented review is only actionable when provably not the
+      // agent's own account; fail closed (skip) when either side of that
+      // comparison is unknown, since we can't otherwise rule out self-feedback.
+      if (!author || !self || author === self) return;
+    } else if (author && self && author === self) {
+      // changes_requested: skip ONLY when the author is positively known to
+      // be the token account. A transient self-lookup failure (or missing
+      // author) must not silently drop a genuine human CHANGES_REQUESTED —
+      // that would fail closed on exactly the review that matters most.
+      return;
+    }
     await enqueueFeedbackWork({
       cfg,
       store,
@@ -149,6 +156,8 @@ export async function handleGithubEvent(
   const conclusion =
     event.kind === "workflow_run" ? event.workflow_run.conclusion : event.check_suite.conclusion;
   const url = event.kind === "workflow_run" ? event.workflow_run.html_url : event.check_suite.url;
+  const headSha =
+    event.kind === "workflow_run" ? event.workflow_run.head_sha : event.check_suite.head_sha;
   await enqueueActivity(store, linearOutbox, {
     sessionId: ticket.linear_session_id,
     type: "action",
@@ -165,7 +174,12 @@ export async function handleGithubEvent(
     return;
   }
   const name = event.kind === "workflow_run" ? event.workflow_run.name : "CI check suite";
-  const workId = `gh-ci-${event.kind === "workflow_run" ? event.workflow_run.id : event.check_suite.id}`;
+  // Keyed by head_sha (not the workflow_run/check_suite id) so a single
+  // failing push — which GitHub reports as both a workflow_run and a
+  // check_suite completion — dedups to one work item instead of two review
+  // rounds. The event that arrives second is dropped by enqueueSessionWork's
+  // id dedup; whichever arrived first keeps its feedback message.
+  const workId = `gh-ci-${headSha}`;
   await enqueueFeedbackWork({
     cfg,
     store,
