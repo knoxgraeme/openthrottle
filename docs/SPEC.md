@@ -29,7 +29,7 @@ Linear AgentSessionEvent ──HMAC──> Fly supervisor ──Sprites REST─�
 - `sandbox/`: safety boundary, agent entrypoint, `provision.sh`, and
   normalizer; packaged into the supervisor's own Fly image and installed onto
   each Fly Sprite at provision time.
-- `skills/`: Claude skills plus Codex/OpenCode prompt mirrors.
+- `skills/`: canonical `implement`/`investigate` task adapters (`skills/tasks/<name>/SKILL.md`), delivered natively to Claude, Codex, and OpenCode.
 - `cli/`: npm package `openthrottle` (`setup`, `init`, `ship`, `status`, `stop`, `logs`).
 
 ## Event flows
@@ -74,10 +74,15 @@ Linear AgentSessionEvent ──HMAC──> Fly supervisor ──Sprites REST─�
    context mutation. Stop first records the run/session as stopped, cancels
    pending work, and enqueues one terminal response; sandbox cleanup is retried
    independently if it fails.
-3. Exact `/merge` uses the guarded merge path when enabled. Other replies are
-   deduplicated by Linear activity ID in `session_work`, acknowledged, and then
-   claim a run in the existing sandbox when the session is idle. A busy session
-   keeps the durable work row instead of requiring the user to resend it.
+3. Exact `/merge` (or `merge it`) uses the guarded merge path when enabled.
+   Exact `/implement` promotes the next run to `implement`; the legacy
+   free-text heuristic (`fix it`/`implement`/`go ahead` anywhere in the reply,
+   only recognized on an `investigate`-labeled ticket) remains a deprecated
+   alias that logs a warning when it fires instead of the command. Other
+   replies are deduplicated by Linear activity ID in `session_work`,
+   acknowledged, and then claim a `resume` run in the existing sandbox when
+   the session is idle. A busy session keeps the durable work row instead of
+   requiring the user to resend it.
 
 ### Sandbox activity and completion
 
@@ -110,32 +115,52 @@ that ticket, bounding durable log storage to the latest captured run.
 
 - Closing or merging an `ot/*` PR stops an active run, deletes its sandbox,
   and closes the ticket row.
-- `needs-review` labels or `review_requested` start a fresh `review` task.
-- A human `CHANGES_REQUESTED` review starts `review-fix`; a successful fix
-  starts a fresh re-review. A review-fix that ends paused on a decision
-  elicitation (or whose re-review was outranked by queued human work) instead
-  marks the ticket's pending re-review flag; the re-review starts after a
-  later successful non-paused run on that ticket.
-- A submitted `commented` review (covering all inline review threads, since
-  GitHub wraps every inline comment in a review) or a new PR conversation
-  comment also starts `review-fix`, so bot reviews and drive-by comments are
-  actioned or answered instead of sitting unaddressed. Feedback authored by
-  the `GITHUB_TOKEN` account itself is ignored (the account login is resolved
-  once and cached; comment-grade feedback fails closed if it cannot be
-  resolved). When a run is already active, the feedback is queued as
-  automatic session work — below human replies — and handled when the run
-  finishes. Comment-triggered fixes count toward `REVIEW_MAX_ROUNDS` through
-  the ticket's review-fix run history.
+- All GitHub feedback on an active, PR-backed ticket becomes deduplicated
+  `automatic` session work, each item carrying a triage message (act on clear
+  fixes, answer non-actionable threads with reasoning, batch decision-required
+  items into one elicitation, end with "Assumptions & decisions"): a human
+  `CHANGES_REQUESTED` review, a non-self `commented` review (GitHub wraps
+  every inline review comment in a `commented` review, so this also covers
+  bot inline reviews), a new PR conversation comment, and a failed or
+  timed-out `workflow_run`/`check_suite` conclusion. Dedup keys
+  (`gh-review-<id>`, `gh-comment-<id>`, `gh-ci-<id>`) make repeated deliveries
+  a no-op. Feedback authored by the `GITHUB_TOKEN` account itself is ignored
+  (the account login is resolved once and cached; review/comment feedback
+  fails closed if it cannot be resolved).
+- An idle ticket (no active run) drains and launches the next item
+  immediately; an active run picks it up on completion. Every launch is a
+  **`resume` of the original session** — there is no separate task type or
+  fresh context for feedback. The former two-tier `review`/`review-fix`
+  choreography and the ticket's pending-re-review flag are gone.
+- **Rounds bound.** One counter — `automatic`-source session-work items
+  consumed per ticket — is bounded by `REVIEW_MAX_ROUNDS`; human-source
+  replies are never bounded. Exhausting the bound cancels the queued item
+  without launching and posts a "needs a human decision" message to both the
+  Linear activity stream and the PR (best-effort).
+- **Resolved-thread skip.** Before launching a review/comment-sourced
+  automatic item, the supervisor checks its PR's review threads via `gh`; if
+  every thread is already resolved (a prior resume may have addressed several
+  queued items at once), the item is dropped instead of launched. A check
+  failure launches anyway rather than dropping work.
+- **External-reviewer nudge.** After a feedback-triggered resume completes
+  cleanly (exit 0, no pending elicitation) with a PR, the supervisor
+  optionally posts `REVIEW_NUDGE_COMMENT` on the PR to prompt the external
+  reviewer bot/human to look again (e.g. `@codex review`). Never posted for
+  human-triggered resumes, and never when the comment is unset (default:
+  rely on the bot's own review-on-push behavior).
+- **Missing-session resume.** A `resume` requires the saved native session
+  (`~/.ot/agent-session-id`), which can be lost if the sandbox was recreated.
+  When a resume fails for that reason, the supervisor posts a Linear error
+  ("workspace was recreated — re-delegate to continue") instead of silently
+  falling back to a fresh context.
 - Webhook subscriptions cover `pull_request`, `pull_request_review`,
   `issue_comment`, `workflow_run`, and `check_suite`; repositories registered
   before `issue_comment` was added pick it up on the next
   `/repositories/register` (or `openthrottle init`) refresh.
-- Implement and review-fix runs invoke bounded `ce-babysit-pr mode:pipeline`
-  so actionable CI/review feedback can be repaired before Fly's next event.
 - Review verdicts are PR comments, never GitHub approval/rejection state.
-- Completed workflow/check-suite and submitted-review events are mirrored to
-  Linear.
-- Review rounds stop at `REVIEW_MAX_ROUNDS` and require human judgment.
+- Every completed `workflow_run`/`check_suite` and every submitted review is
+  mirrored to Linear as an activity, regardless of whether it also becomes
+  queued feedback work.
 
 ### Sweep
 
@@ -188,15 +213,20 @@ before running.
 
 `tickets` stores identity/routing (including the resolved base branch, which
 may be a per-ticket `branch › <name>` override of the route default),
-sandbox/PR (the `sandbox_id` column holds the Fly Sprite name), state,
-current run guard, aggregate cost, last error, preview-token hash, latest
-Linear prompt context, and the pending re-review flag set when a review-fix
-pauses on a decision elicitation. `agent_sessions` stores
-each immutable Linear AgentSession generation and marks the one current
-generation per issue. `session_work` stores deduplicated human/automatic work
-by source id and priority. `runs` stores immutable run identity plus the
-originating Linear session/generation, task, hashed callback token, deadline,
-result, cost, PR and failure tail. `webhook_deliveries` is a durable inbox
+sandbox/PR (the `sandbox_id` column holds the Fly Sprite name), state, current
+run guard, aggregate cost, last error, preview-token hash, and latest Linear
+prompt context. A `pending_re_review` column remains in the schema for existing
+rows — no code reads or writes it anymore. `agent_sessions` stores each immutable
+Linear AgentSession generation and marks the one current generation per issue.
+`session_work` stores deduplicated human/automatic work by source id and
+priority: a `source` column distinguishes human replies (`human`) from
+GitHub-feedback items (`automatic`), and status moves `pending → claimed →
+consumed`, or `canceled` when superseded by a stop, dropped as already
+thread-resolved, or cut off by the rounds bound. Only consumed `automatic` rows
+count toward `REVIEW_MAX_ROUNDS`; `human`-source work is never bounded. `runs`
+stores immutable run identity plus the originating Linear session/generation,
+task, hashed callback token, deadline, result, cost, PR and failure tail.
+`webhook_deliveries` is a durable inbox
 containing the validated payload, lease/retry state, attempt count, processing
 result, and sanitized last error. `sandbox_events` stores idempotency/retry
 state for validated sandbox records without persisting the raw one-time token.
@@ -219,7 +249,9 @@ Migrations are additive for existing v2 databases; pre-inbox delivery rows are
 preserved as already processed so an upgrade cannot replay them.
 
 Ticket states: `active | closed | expired | error | stopped`.
-Task types: `implement | resume | review | review-fix | investigate`.
+Task types: `implement | resume | investigate`. `implement` and `investigate`
+are the two loops; `resume` is the single continuation mechanism for either,
+fed by a human reply or queued GitHub feedback.
 
 ### Environment
 
@@ -249,6 +281,11 @@ Required unless noted:
   `SWEEP_MAX_AGE_DAYS=14`, `ORPHAN_GRACE_MINUTES=5`,
   `WEBHOOK_MAX_AGE_SECONDS=60`, `REVIEW_MAX_ROUNDS=3`,
   `ALLOW_LINEAR_MERGE=false`.
+  `REVIEW_MAX_ROUNDS` bounds `automatic` (GitHub-feedback) session-work items
+  consumed per ticket. Optional `REVIEW_NUDGE_COMMENT` (default empty) is
+  posted on the PR after a feedback-triggered resume completes cleanly, to
+  prompt an external reviewer bot/human to look again; empty relies on the
+  bot's own review-on-push behavior.
 
 Fly keeps one machine running, mounts `/data`, and health-checks `/healthz`.
 
@@ -257,11 +294,14 @@ Fly keeps one machine running, mounts `/data`, and health-checks `/healthz`.
 ### Environment
 
 The supervisor passes `TASK_TYPE`, `AGENT`, `GITHUB_REPO`, `GITHUB_TOKEN`,
-`BASE_BRANCH`, `BRANCH_NAME`, non-secret Linear issue identifiers,
-`RUN_ID`, `RUN_CALLBACK_TOKEN`, `SUPERVISOR_URL` (a public URL, not a secret —
-it lets the sandbox POST activity/completion callbacks), optional
-`RESUME_MESSAGE`, `PR_NUMBER`, `REVIEW_ROUND`, model auth, and limit values.
-`SPRITE_TOKEN` and webhook/install/operator secrets never enter the sandbox.
+`BASE_BRANCH`, `BRANCH_NAME`, non-secret Linear issue identifiers, `RUN_ID`,
+`RUN_CALLBACK_TOKEN`, `SUPERVISOR_URL` (a public URL, not a secret — it lets the
+sandbox POST activity/completion callbacks), optional `RESUME_MESSAGE`, optional
+`OT_GIT_AUTHOR_NAME`/`OT_GIT_AUTHOR_EMAIL`, model auth, and limit values
+(`MAX_TURNS`, `TASK_TIMEOUT`, `DEV_PORT`). There is no per-run `PR_NUMBER` or
+`REVIEW_ROUND` — feedback arrives as a `resume` and the agent re-derives PR
+state itself (e.g. `gh pr view`). `SPRITE_TOKEN` and webhook/install/operator
+secrets never enter the sandbox.
 
 ### Entrypoint phases
 
@@ -272,8 +312,20 @@ it lets the sandbox POST activity/completion callbacks), optional
 5. Run `post_bootstrap` commands.
 6. Register (or restart) the optional dev server as a Sprites service on
    `0.0.0.0`, so it survives sprite pause/wake.
-7. Install OpenThrottle runtime adapters/instructions and run the selected
-   task through the JSONL normalizer under `timeout`.
+7. Install OpenThrottle runtime adapters/instructions per agent, then run the
+   selected task through the JSONL normalizer under `timeout`. Claude gets a
+   fresh copy of the canonical `skills/tasks/*` directories under the sandbox
+   user's `~/.claude/skills` (user scope) every run and is invoked with
+   `-p "/<skill-name>"`. Codex discovers the same canonical skills natively
+   from the provisioned admin-scope `/etc/codex/skills/<name>/` (each with an
+   `agents/openai.yaml` setting `allow_implicit_invocation: false`, so a skill
+   only runs when explicitly named) and is invoked with piped stdin naming the
+   skill (`$<skill-name>`) followed by runtime-context and Linear-context
+   blocks. OpenCode cannot yet load agent-standard skills from a sandbox-owned
+   directory, so its prompt is rendered at run time by stripping the
+   canonical file's YAML frontmatter and appending the same context blocks.
+   `resume` bypasses all of this and continues the saved native
+   session/thread directly with the follow-up message.
 8. Remove temporary runtime MCP material, POST the completion payload to
    `POST /runs/:id/complete`, and fall back to an on-disk outbox completion
    marker (drained by the sweep) when the push fails.
@@ -287,12 +339,30 @@ global runtime instructions in `~/.codex/AGENTS.md`. Claude receives a strict
 temporary config containing only project-declared MCP servers with user-only
 setting sources. Project `AGENTS.md` and `.claude/settings.json` files remain
 untouched and editable.
-The adapters compose native CE as follows: implement uses `ce-work`, local
-`ce-code-review`, `ce-commit-push-pr`, and bounded `ce-babysit-pr`; review uses
-report-only `ce-code-review`; review-fix uses `ce-resolve-pr-feedback` and
-bounded `ce-babysit-pr`; investigate uses action-capable `ce-debug
-mode:pipeline` and ships convergent fixes. Fly remains responsible for run
-serialization, event publication, and fresh re-review scheduling.
+The adapters compose native CE as follows: `implement` uses `ce-work`, local
+`ce-code-review`, a conditional `ce-simplify` pass (invoked only when the
+branch diff is large or structurally complex; behavior-preserving, with skips
+recorded in the assumptions ledger), and `ce-commit-push-pr`; `investigate` uses action-capable
+`ce-debug mode:pipeline` and, when it converges on a fix, the same
+`ce-commit-push-pr` tail to ship it — divergent findings return as residuals
+instead. Neither loop babysits its own PR (`ce-babysit-pr` and the internal
+`review`/`review-fix` tasks are removed); once a PR exists, external
+GitHub-native reviewers own review, and their feedback arrives back at the
+same session as a `resume`, never a separate task or fresh context. Fly
+remains responsible for run serialization and event publication.
+
+The supervisor treats a loop purely as an interface — an entry task name, its
+sandbox env contract, the `ot-activity` outbox events it may emit, and its
+completion marker — never the loop's internal skill/CE composition; adding a
+loop means registering a task name against a skill and CE pipeline
+declaration, with no handler changes. Registered repositories are
+code-execution-trusted (`post_bootstrap` runs arbitrary repository-configured
+commands before the agent starts, and Codex's repo-scope `.agents/skills`
+discovery stays enabled beside the admin-scope bake, since a checked-in skill
+adds no capability beyond what `post_bootstrap` already grants); only ticket
+text, PR comments, and review bodies remain untrusted data regardless of
+where they are read from.
+
 Adapters enforce a decision gate: critical, foundational, or risky changes
 (schema/data migrations, auth/security behavior, public API or contract
 changes, architecture rework, dependency changes, destructive operations, or
@@ -302,8 +372,9 @@ answer. Clear fixes ship first; remaining items go out as one batched
 item is backlogged — each ends fixed, answered on its thread, or escalated —
 and every response and PR description ends with an "Assumptions & decisions"
 section for human audit.
-Implement/review/review-fix/investigate use fresh contexts; resume reads
-`~/.ot/agent-session-id` and continues the same Claude session/Codex thread.
+`implement`/`investigate` use fresh contexts; `resume` reads
+`~/.ot/agent-session-id` and continues the same Claude session/Codex
+thread/OpenCode session.
 
 The normalizer captures session IDs and Claude `total_cost_usd`, writes
 `~/.ot/run-result.json`, and sanitizes all output. Sanitizers redact named

@@ -17,23 +17,24 @@ checkout and safety setup before dropping privileges for repo and agent commands
 
 The eight phases are auth, checkout/push, sealed safety config, project config,
 post-bootstrap, dev server, agent task, and completion marker. Supported
-tasks are `implement`, `resume`, `review`, `review-fix`, and `investigate`.
-Fresh tasks use their corresponding skill; resume continues the saved Claude
-session, Codex thread, or OpenCode session. OpenCode also saves the initial
-model in `~/.ot/agent-model` so a resumed session cannot switch models after a
-project config change.
+tasks are `implement`, `resume`, and `investigate`. Fresh tasks use their
+corresponding canonical skill from `skills/tasks/`; resume continues the saved
+Claude session, Codex thread, or OpenCode session — including PR feedback
+(reviews, comments, CI failures) queued while the sandbox was idle, which is
+delivered as a resume message in the same session rather than a new task.
+OpenCode also saves the initial model in `~/.ot/agent-model` so a resumed
+session cannot switch models after a project config change.
 
 The corresponding OpenThrottle skill is a thin product adapter over native CE:
 
-- `implement` → `ce-work` → `ce-code-review` → `ce-commit-push-pr` → bounded
-  `ce-babysit-pr`.
-- `review` → report-only `ce-code-review` and one PR verdict comment.
-- `review-fix` → `ce-resolve-pr-feedback` → bounded `ce-babysit-pr`; remaining
-  decision-required items go out as one batched elicitation whose reply
-  resumes the session. Fly schedules the fresh review once no decisions are
-  pending.
+- `implement` → `ce-work` → `ce-code-review` → configured gates →
+  `ce-commit-push-pr` → resolve/retarget the PR.
 - `investigate` → action-capable `ce-debug mode:pipeline`, with convergent fixes
   shipped and divergent decisions escalated as elicitation questions.
+
+Neither task babysits its own PR after opening it. GitHub-native reviewers
+(bot or human) own review from there, and their feedback re-enters as a
+`resume` of the same session — see `skills/README.md` for the full loop.
 
 Fly owns run serialization, webhook retries, follow-up scheduling, and Linear
 publication. Sandbox events are session-bound by the supervisor run record

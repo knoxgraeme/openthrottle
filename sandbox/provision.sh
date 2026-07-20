@@ -216,4 +216,15 @@ chmod 0755 /opt/openthrottle/lib/runtime.sh
 chmod 0755 /usr/local/bin/ot-activity
 chmod 0755 /opt/openthrottle/safety/pre-push /opt/openthrottle/safety/seal.sh
 
+# ---------------------------------------------------------------------------
+# Canonical task skills → Codex admin scope. Claude copies skills/tasks/* into
+# the sandbox user's ~/.claude/skills at runtime (entrypoint.sh); Codex instead
+# discovers them natively from /etc/codex/skills, so bake them in here. Each
+# skill's agents/openai.yaml sets allow_implicit_invocation: false, so a skill
+# only runs when the entrypoint's prompt names it. Overwrite-copy = idempotent.
+# ---------------------------------------------------------------------------
+log "codex admin-scope skills"
+mkdir -p /etc/codex/skills
+cp -r /opt/openthrottle/skills/tasks/. /etc/codex/skills/
+
 log "provisioning complete"

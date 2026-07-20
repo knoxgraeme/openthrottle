@@ -3,6 +3,74 @@ import { agentActivityCreate, agentSessionUpdate } from "./linear.js";
 import type { LinearOutboxRecord, TicketStore } from "./db.js";
 import { sanitizeText } from "./sanitize.js";
 
+// Shared helpers for enqueueing a single Linear outbox row and processing it
+// immediately, used across the run lifecycle, the Linear/GitHub event
+// handlers, and the scheduler. They live here (rather than being duplicated
+// per caller) since they are pure wrappers over this module's own processor.
+
+export async function tryPostError(
+  store: TicketStore,
+  outbox: LinearOutboxProcessor,
+  sessionId: string | undefined,
+  issueId: string | undefined,
+  message: string
+): Promise<void> {
+  if (!sessionId) return;
+  try {
+    const row = store.enqueueLinearOutbox({
+      linearSessionId: sessionId,
+      issueId,
+      kind: "activity",
+      payload: activityPayload({
+        sessionId,
+        type: "error",
+        body: sanitizeText(message),
+      }),
+    });
+    await outbox.process(row.id);
+  } catch (error) {
+    console.error("[linear] failed to enqueue error activity:", error);
+  }
+}
+
+export async function enqueueActivity(
+  store: TicketStore,
+  outbox: LinearOutboxProcessor,
+  activity: AgentActivityInput,
+  issueId?: string,
+  runId?: string
+): Promise<void> {
+  const row = store.enqueueLinearOutbox({
+    linearSessionId: activity.sessionId,
+    issueId,
+    runId,
+    kind: "activity",
+    payload: activityPayload(activity),
+  });
+  await outbox.process(row.id);
+}
+
+export async function enqueueSessionUpdate(
+  store: TicketStore,
+  outbox: LinearOutboxProcessor,
+  params: {
+    sessionId: string;
+    issueId?: string;
+    addedExternalUrls?: Array<{ label: string; url: string }>;
+  }
+): Promise<void> {
+  const row = store.enqueueLinearOutbox({
+    linearSessionId: params.sessionId,
+    issueId: params.issueId,
+    kind: "session_update",
+    payload: sessionUpdatePayload({
+      sessionId: params.sessionId,
+      addedExternalUrls: params.addedExternalUrls,
+    }),
+  });
+  await outbox.process(row.id);
+}
+
 export interface LinearOutboxProcessor {
   process(id: string): Promise<void>;
   drain(limit?: number): Promise<void>;

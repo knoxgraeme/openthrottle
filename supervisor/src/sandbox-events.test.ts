@@ -38,6 +38,7 @@ const cfg: Config = {
   orphanGraceMinutes: 5,
   webhookMaxAgeSeconds: 60,
   reviewMaxRounds: 3,
+  reviewNudgeComment: "",
   allowLinearMerge: false,
 };
 

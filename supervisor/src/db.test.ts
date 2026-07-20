@@ -179,6 +179,59 @@ describe("TicketStore", () => {
     ).toThrow(/different intent/);
   });
 
+  it("keeps the pending_re_review column in the schema without exposing store methods for it", () => {
+    const store = makeStore();
+    const columns = (db!.prepare("PRAGMA table_info(tickets)").all() as Array<{ name: string }>).map(
+      (column) => column.name
+    );
+    expect(columns).toContain("pending_re_review");
+    expect((store as unknown as Record<string, unknown>).setPendingReReview).toBeUndefined();
+  });
+
+  it("counts consumed automatic session work, marks a single item cancelled, and finds a run's consumed item", () => {
+    const store = makeStore();
+    store.beginRun({
+      issueId: "issue-1",
+      runId: "run-a",
+      taskType: "resume",
+      tokenHash: "hash",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    expect(
+      store.enqueueSessionWork({
+        id: "gh-review-1",
+        linearSessionId: "session-1",
+        issueId: "issue-1",
+        source: "automatic",
+        body: "feedback one",
+      })
+    ).toBe(true);
+    expect(store.countConsumedAutomaticSessionWork("issue-1")).toBe(0);
+
+    const claimed = store.claimNextSessionWork("session-1", new Date().toISOString());
+    expect(claimed?.id).toBe("gh-review-1");
+    store.markSessionWorkConsumed("gh-review-1", "run-a");
+    expect(store.countConsumedAutomaticSessionWork("issue-1")).toBe(1);
+    expect(store.getConsumedSessionWorkForRun("run-a")).toMatchObject({
+      id: "gh-review-1",
+      source: "automatic",
+      status: "consumed",
+    });
+    expect(store.getConsumedSessionWorkForRun("run-missing")).toBeUndefined();
+
+    expect(
+      store.enqueueSessionWork({
+        id: "gh-review-2",
+        linearSessionId: "session-1",
+        issueId: "issue-1",
+        source: "automatic",
+        body: "feedback two",
+      })
+    ).toBe(true);
+    store.cancelSessionWork("gh-review-2");
+    expect(store.claimNextSessionWork("session-1", new Date().toISOString())).toBeUndefined();
+  });
+
   it("finds expired running work", () => {
     const store = makeStore();
     store.beginRun({
@@ -338,11 +391,6 @@ describe("TicketStore", () => {
     db = openDb(path);
     const store = createTicketStore(db);
     expect(store.getByIssueId("issue-legacy")?.base_branch).toBe("main");
-    expect(store.getByIssueId("issue-legacy")?.pending_re_review).toBe(0);
-    store.setPendingReReview("issue-legacy", true);
-    expect(store.getByIssueId("issue-legacy")?.pending_re_review).toBe(1);
-    store.setPendingReReview("issue-legacy", false);
-    expect(store.getByIssueId("issue-legacy")?.pending_re_review).toBe(0);
   });
 
   it("backfills current agent sessions for legacy tickets", () => {

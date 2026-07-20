@@ -122,6 +122,7 @@ export interface Config {
   orphanGraceMinutes: number;
   webhookMaxAgeSeconds: number;
   reviewMaxRounds: number;
+  reviewNudgeComment: string;
   allowLinearMerge: boolean;
 }
 
@@ -163,6 +164,7 @@ export function loadConfig(): Config {
     orphanGraceMinutes: optionalInt("ORPHAN_GRACE_MINUTES", 5),
     webhookMaxAgeSeconds: optionalInt("WEBHOOK_MAX_AGE_SECONDS", 60),
     reviewMaxRounds: optionalInt("REVIEW_MAX_ROUNDS", 3),
+    reviewNudgeComment: optional("REVIEW_NUDGE_COMMENT", ""),
     allowLinearMerge: optionalBool("ALLOW_LINEAR_MERGE", false),
   };
 

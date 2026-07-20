@@ -71,6 +71,7 @@ describe("loadConfig", () => {
       spriteToken: "sprite-token",
       spritesApiUrl: "https://api.sprites.dev",
       payloadTarPath: "/app/payload.tar.gz",
+      reviewNudgeComment: "",
     });
   });
 
@@ -78,6 +79,12 @@ describe("loadConfig", () => {
     setRequiredEnv();
     delete process.env.SPRITE_TOKEN;
     expect(() => loadConfig()).toThrow("Missing required env var: SPRITE_TOKEN");
+  });
+
+  it("loads a configured review nudge comment", () => {
+    setRequiredEnv();
+    process.env.REVIEW_NUDGE_COMMENT = "@codex review";
+    expect(loadConfig().reviewNudgeComment).toBe("@codex review");
   });
 
   it("rejects malformed integers, unsafe repos, and unsafe branch names", () => {
