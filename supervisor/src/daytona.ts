@@ -17,8 +17,6 @@ export interface SandboxEnvContract {
   RUN_ID: string;
   RUN_CALLBACK_TOKEN: string;
   RESUME_MESSAGE?: string;
-  PR_NUMBER?: string;
-  REVIEW_ROUND?: string;
   CLAUDE_CODE_OAUTH_TOKEN?: string;
   CODEX_AUTH_JSON?: string;
   KIMI_CODE_API_KEY?: string;
@@ -87,8 +85,6 @@ export async function startTask(
   const envVars = toEnvVars(params.env);
   const optionalNames = [
     "RESUME_MESSAGE",
-    "PR_NUMBER",
-    "REVIEW_ROUND",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CODEX_AUTH_JSON",
     "KIMI_CODE_API_KEY",

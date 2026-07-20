@@ -69,7 +69,14 @@ describe("loadConfig", () => {
       defaultAgent: "codex",
       kimiCodeApiKey: "kimi",
       sandboxEventPollIntervalMs: 5_000,
+      reviewNudgeComment: "",
     });
+  });
+
+  it("loads a configured review nudge comment", () => {
+    setRequiredEnv();
+    process.env.REVIEW_NUDGE_COMMENT = "@codex review";
+    expect(loadConfig().reviewNudgeComment).toBe("@codex review");
   });
 
   it("rejects malformed integers, unsafe repos, and unsafe branch names", () => {

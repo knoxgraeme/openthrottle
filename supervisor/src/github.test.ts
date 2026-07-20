@@ -1,8 +1,8 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import {
+  areAllReviewThreadsResolved,
   branchExists,
-  countChangesRequestedReviews,
   getMergeReadiness,
   isGithubPullRequestUrl,
   isOpenthrottleBranch,
@@ -72,14 +72,11 @@ describe("GitHub contracts", () => {
     expect(() => parsePullRequestUrl("https://example.com/not-a-pr")).toThrow(/Invalid/);
   });
 
-  it("counts blocking reviews and requires terminal green checks", async () => {
+  it("requires terminal green checks for merge readiness", async () => {
     const signals: Array<AbortSignal | null | undefined> = [];
     const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       signals.push(init?.signal);
       const url = String(input);
-      if (url.includes("/reviews")) {
-        return Response.json([{ state: "CHANGES_REQUESTED" }, { state: "APPROVED" }]);
-      }
       if (url.includes("/check-runs")) {
         return Response.json({
           check_runs: [
@@ -91,7 +88,6 @@ describe("GitHub contracts", () => {
       return Response.json({ mergeable: true, draft: false, head: { sha: "abc123" } });
     }) as unknown as typeof fetch;
     const client = { token: "github", fetch: fetchMock };
-    expect(await countChangesRequestedReviews(client, "o/r", 1)).toBe(1);
     expect(await getMergeReadiness(client, "o/r", 1)).toEqual({
       mergeable: true,
       draft: false,
@@ -99,8 +95,30 @@ describe("GitHub contracts", () => {
       checksGreen: true,
       headSha: "abc123",
     });
-    expect(signals).toHaveLength(3);
+    expect(signals).toHaveLength(2);
     expect(signals.every((signal) => signal instanceof AbortSignal)).toBe(true);
+  });
+
+  it("resolves whether every PR review thread is resolved via GraphQL", async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      expect(String(input)).toBe("https://api.github.com/graphql");
+      const body = JSON.parse(String(init?.body)) as { variables: { number: number } };
+      const nodes =
+        body.variables.number === 1
+          ? [{ isResolved: true }, { isResolved: true }]
+          : body.variables.number === 2
+            ? [{ isResolved: true }, { isResolved: false }]
+            : [];
+      return Response.json({
+        data: { repository: { pullRequest: { reviewThreads: { nodes } } } },
+      });
+    }) as unknown as typeof fetch;
+    const client = { token: "github", fetch: fetchMock };
+    expect(await areAllReviewThreadsResolved(client, "o/r", 1)).toBe(true);
+    expect(await areAllReviewThreadsResolved(client, "o/r", 2)).toBe(false);
+    // No review threads at all (e.g. a plain PR comment) must not be treated
+    // as vacuously "all resolved" — there is nothing to skip launching for.
+    expect(await areAllReviewThreadsResolved(client, "o/r", 3)).toBe(false);
   });
 
   it("resolves branch existence and distinguishes 404 from other errors", async () => {

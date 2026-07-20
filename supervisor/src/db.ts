@@ -228,7 +228,15 @@ function backfillAgentSessions(db: Database.Database): void {
 
 export type Agent = "claude" | "codex" | "opencode";
 type TicketState = "active" | "closed" | "expired" | "error" | "stopped";
-export type TaskType = "implement" | "resume" | "review" | "review-fix" | "investigate";
+// Task taxonomy: implement (feature/bug plan) and investigate (debugging) are the
+// two loops; resume is the single continuation mechanism for either loop, fed by
+// a human reply or queued GitHub feedback. `review`/`review-fix` were removed —
+// see docs/SIMPLIFICATION-PLAN.md Phase 1. This is an additive migration: any
+// historical `runs` rows already written with the old task types are left as
+// free-form text (there is no CHECK constraint to violate), and the ticket's
+// `pending_re_review` column stays in the schema — no code reads or writes it
+// anymore.
+export type TaskType = "implement" | "resume" | "investigate";
 type RunStatus = "running" | "completed" | "failed" | "timed_out" | "stopped";
 
 export interface Ticket {
@@ -248,7 +256,6 @@ export interface Ticket {
   preview_token_hash: string | null;
   linear_context: string | null;
   base_branch: string;
-  pending_re_review: number;
   created_at: string;
   updated_at: string;
 }
@@ -429,7 +436,6 @@ export interface TicketStore {
   setSandboxId(issueId: string, sandboxId: string | null): void;
   setState(issueId: string, state: TicketState, lastError?: string): void;
   setPrUrl(issueId: string, prUrl: string): void;
-  setPendingReReview(issueId: string, pending: boolean): void;
   setPreviewTokenHash(issueId: string, tokenHash: string): void;
   setLinearContext(issueId: string, context: string): void;
   listActive(): Ticket[];
@@ -451,6 +457,9 @@ export interface TicketStore {
   markSessionWorkConsumed(workId: string, runId: string): void;
   releaseSessionWork(workId: string): void;
   cancelPendingSessionWork(linearSessionId: string): number;
+  cancelSessionWork(workId: string): void;
+  countConsumedAutomaticSessionWork(issueId: string): number;
+  getConsumedSessionWorkForRun(runId: string): SessionWork | undefined;
   enqueueLinearOutbox(params: {
     id?: string;
     linearSessionId?: string | null;
@@ -552,9 +561,6 @@ export function createTicketStore(db: Database.Database): TicketStore {
   const setPrUrlStmt = db.prepare(
     "UPDATE tickets SET pr_url = ?, updated_at = ? WHERE linear_issue_id = ?"
   );
-  const setPendingReReviewStmt = db.prepare(
-    "UPDATE tickets SET pending_re_review = ?, updated_at = ? WHERE linear_issue_id = ?"
-  );
   const setPreviewTokenHashStmt = db.prepare(
     "UPDATE tickets SET preview_token_hash = ?, updated_at = ? WHERE linear_issue_id = ?"
   );
@@ -621,6 +627,18 @@ export function createTicketStore(db: Database.Database): TicketStore {
     UPDATE session_work
     SET status = 'canceled', canceled_at = ?
     WHERE linear_session_id = ? AND status = 'pending'
+  `);
+  const cancelSessionWorkStmt = db.prepare(`
+    UPDATE session_work
+    SET status = 'canceled', canceled_at = ?
+    WHERE id = ? AND status IN ('pending', 'claimed')
+  `);
+  const countConsumedAutomaticSessionWorkStmt = db.prepare(`
+    SELECT COUNT(*) AS count FROM session_work
+    WHERE linear_issue_id = ? AND source = 'automatic' AND status = 'consumed'
+  `);
+  const getConsumedSessionWorkForRunStmt = db.prepare(`
+    SELECT * FROM session_work WHERE claimed_run_id = ? AND status = 'consumed' LIMIT 1
   `);
   const getSessionWorkStmt = db.prepare("SELECT * FROM session_work WHERE id = ?");
   const nextSessionWorkStmt = db.prepare(`
@@ -937,9 +955,6 @@ export function createTicketStore(db: Database.Database): TicketStore {
     setPrUrl(issueId, prUrl) {
       setPrUrlStmt.run(prUrl, now(), issueId);
     },
-    setPendingReReview(issueId, pending) {
-      setPendingReReviewStmt.run(pending ? 1 : 0, now(), issueId);
-    },
     setPreviewTokenHash(issueId, tokenHash) {
       setPreviewTokenHashStmt.run(tokenHash, now(), issueId);
     },
@@ -1011,6 +1026,15 @@ export function createTicketStore(db: Database.Database): TicketStore {
     },
     cancelPendingSessionWork(linearSessionId) {
       return cancelPendingSessionWorkStmt.run(now(), linearSessionId).changes;
+    },
+    cancelSessionWork(workId) {
+      cancelSessionWorkStmt.run(now(), workId);
+    },
+    countConsumedAutomaticSessionWork(issueId) {
+      return (countConsumedAutomaticSessionWorkStmt.get(issueId) as { count: number }).count;
+    },
+    getConsumedSessionWorkForRun(runId) {
+      return getConsumedSessionWorkForRunStmt.get(runId) as SessionWork | undefined;
     },
     enqueueLinearOutbox(params) {
       return enqueueLinearOutboxTransaction(params);

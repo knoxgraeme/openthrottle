@@ -11,8 +11,7 @@ You're running as the `agent` user in a Daytona sandbox, inside the
 already-cloned repo at `/home/agent/repo`. Useful env vars, all set by
 the entrypoint:
 
-- `TASK_TYPE` — `implement`, `resume`, `review`, `review-fix`, or
-  `investigate`.
+- `TASK_TYPE` — `implement`, `resume`, or `investigate`.
 - `GITHUB_REPO` — `owner/name`.
 - `BASE_BRANCH` — the branch this task is based on: the repo default (e.g.
   `main`) unless the ticket targeted another with a `branch` label. The PR opens
@@ -113,15 +112,27 @@ If `ot-activity` fails, leave durable context in the PR or GitHub issue via
 
 ## Which skill you're running
 
-- `implement-plan` — plan gate, then `ce-work`, `ce-code-review`, shipping, and
-  bounded PR babysitting.
-- `review` — report-only `ce-code-review` against an existing PR.
-- `review-fix` — `ce-resolve-pr-feedback` plus bounded PR babysitting on the
-  same branch; Fly schedules the fresh re-review.
+- `implement-plan` — plan gate, then `ce-work`, `ce-code-review`, configured
+  gates, and shipping.
 - `investigate` — action-capable `ce-debug mode:pipeline`; convergent bugs may
   be fixed and shipped, while divergent decisions are returned as residuals.
+- `resume` is not a skill — it continues this same session with a follow-up
+  message (see below).
 
-Whichever one you were invoked with, its full prompt was piped to you
-ahead of this fragment (or this fragment was appended to `AGENTS.md`
-before that prompt ran) — follow that prompt's specific workflow; this
-fragment is standing context, not a replacement for it.
+Whichever skill you were invoked with, it was named via `$<skill-name>` at
+the top of your prompt and its full body is loaded automatically from your
+installed skills — follow that skill's specific workflow; this fragment is
+standing context alongside it, not a replacement for it.
+
+## PR feedback arrives as a resume, not a new task
+
+Once `implement-plan` or `investigate` ships a PR, this session's job for that
+PR is not over — it is just paused. Bot and human reviews, PR conversation
+comments, and CI failures all get queued and delivered later as a `resume` of
+this exact session (`RESUME_MESSAGE` carries the feedback to triage), never as
+a fresh `implement`/`investigate` run and never as a separate review task.
+Apply the decision gate / no-backlog / assumptions-ledger rules above to that
+triage pass exactly as you would to the original run: action clear fixes and
+push, answer threads you're not changing with your reasoning, and batch any
+decision-required items into one further elicitation. There is no separate
+babysitting step — this is the mechanism that replaces it.
