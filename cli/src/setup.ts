@@ -29,6 +29,7 @@ const SUPERVISOR_ENV_VARS: Array<{ name: string; hint: string }> = [
   { name: "ORPHAN_GRACE_MINUTES", hint: "default: 5" },
   { name: "WEBHOOK_MAX_AGE_SECONDS", hint: "default: 60" },
   { name: "REVIEW_MAX_ROUNDS", hint: "default: 3" },
+  { name: "REVIEW_NUDGE_COMMENT", hint: "optional PR comment posted after a feedback fix, e.g. @codex review; empty relies on review-on-push" },
   { name: "ALLOW_LINEAR_MERGE", hint: "default: false" },
 ];
 
