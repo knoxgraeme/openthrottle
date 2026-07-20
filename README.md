@@ -46,7 +46,7 @@ npm ci --prefix supervisor && npm test --prefix supervisor
 npm ci --prefix cli && npm test --prefix cli
 npm ci --prefix sandbox && npm test --prefix sandbox
 bats sandbox/tests/runtime.bats
-docker build -f sandbox/Dockerfile -t openthrottle:test .
+docker build -f sandbox/tests/Dockerfile -t openthrottle:test .
 sandbox/tests/smoke.sh openthrottle:test
 
 # inspect the one-time platform checklist (verifies SPRITE_TOKEN)

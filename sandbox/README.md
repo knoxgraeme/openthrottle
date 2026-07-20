@@ -84,7 +84,7 @@ from `CODEX_AUTH_JSON`, and known GitHub/OpenAI/Linear/bearer token shapes.
 npm ci --prefix sandbox
 npm test --prefix sandbox
 bats sandbox/tests/runtime.bats
-docker build -f sandbox/Dockerfile -t openthrottle:test .
+docker build -f sandbox/tests/Dockerfile -t openthrottle:test .
 sandbox/tests/smoke.sh openthrottle:test
 ```
 

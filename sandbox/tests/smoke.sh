@@ -30,7 +30,10 @@ git -C "$SMOKE_DIR/work" remote add origin "file://$SMOKE_DIR/repo.git"
 git -C "$SMOKE_DIR/work" push -u origin main >/dev/null
 git --git-dir "$SMOKE_DIR/repo.git" symbolic-ref HEAD refs/heads/main
 
-test "$(docker image inspect --format '{{json .Config.Entrypoint}}' "$IMAGE")" = '["/bin/true"]'
+# The image is a provisioned-sprite simulation (sandbox/tests/Dockerfile runs
+# provision.sh). Unlike the old Daytona image there is no inert /bin/true
+# entrypoint to assert — the supervisor launches the entrypoint explicitly via
+# the run service, which is what run_sandbox exercises below.
 
 docker run --rm --entrypoint bash "$IMAGE" -lc '
   claude --version | rg -q "^2\.1\.201" &&

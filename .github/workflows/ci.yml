@@ -51,7 +51,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build sandbox image
-        run: docker build -f sandbox/Dockerfile -t openthrottle:test .
+      - name: Build provisioned-sprite simulation image
+        run: docker build -f sandbox/tests/Dockerfile -t openthrottle:test .
       - name: Exercise sandbox lifecycle with stub agent
         run: sandbox/tests/smoke.sh openthrottle:test
