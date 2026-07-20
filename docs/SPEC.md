@@ -216,7 +216,22 @@ state for validated sandbox records without persisting the raw one-time token.
 `linear_outbox` stores all Linear activity/session-update mutations before
 delivery, including UUID id, immutable payload hash, target session,
 per-session sequence, retry state, and sanitized last error. `settings` stores
-OAuth tokens and small supervisor settings.
+OAuth tokens and small supervisor settings, including the durable Codex
+`auth.json` (`codex_auth_json`). Codex's OAuth refresh token rotates on every
+refresh, so `CODEX_AUTH_JSON` is only a bootstrap seed: the supervisor seeds
+each fresh sandbox from the stored blob, reads back the token Codex rotated in
+the sandbox on run completion, and reseeds later runs from it. Replaying the
+frozen env snapshot would present an already-spent refresh token ("refresh
+token was already used"). A resumed sandbox keeps its own rotated `auth.json`
+rather than being overwritten by the seed. Before seeding, a near-expiry token
+is refreshed centrally behind a single in-flight promise, so concurrent runs
+off the one shared subscription account coalesce onto one refresh instead of
+racing to spend the same token, and each run is handed the freshest token.
+(This narrows but cannot fully close concurrency: two runs that both outlive the
+access token still refresh independently inside their sandboxes. An OpenAI API
+key, which does not rotate, is the fully-concurrent alternative to subscription
+login.) Claude's `CLAUDE_CODE_OAUTH_TOKEN` is long-lived and non-rotating, so it
+stays env-only with no durable state.
 `repository_registrations` durably maps one Linear team key (and optional
 stable team ID) to a canonical GitHub `owner/name`, verified base branch,
 managed webhook ID, and verified snapshot name. Team ID lookup wins over key;

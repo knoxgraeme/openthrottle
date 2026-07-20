@@ -179,6 +179,9 @@ interface SandboxEventPollerParams {
     finalResponse?: string;
     logTail?: string;
   }) => Promise<{ status: number }>;
+  // Best-effort read-back of a rotating agent credential (Codex refresh token)
+  // from the sandbox after a run completes. Must not throw.
+  captureAgentAuth?: (sandbox: Sandbox, ticket: Ticket) => Promise<void>;
 }
 
 async function pollTicketEvents(
@@ -301,6 +304,9 @@ async function pollTicketEvents(
         if (result.status !== 200 && result.status !== 409) {
           throw new Error(`completion rejected with status ${result.status}`);
         }
+        // The run rotated its credentials in the sandbox; capture them before
+        // the workspace is torn down so the next run seeds the live token.
+        await params.captureAgentAuth?.(sandbox, ticket);
       }
       params.store.markSandboxEventProcessed(event.event_id);
     } catch (error) {

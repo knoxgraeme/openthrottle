@@ -196,12 +196,21 @@ log "phase 1: auth files"
 
 if [[ -n "${CODEX_AUTH_JSON:-}" ]]; then
   mkdir -p "${AGENT_HOME}/.codex"
-  # Only strip a *trailing* newline here — this is a JSON blob, not a bare
-  # token, so we must not touch whitespace inside it.
-  printf '%s' "${CODEX_AUTH_JSON%$'\n'}" > "${AGENT_HOME}/.codex/auth.json"
-  chmod 0600 "${AGENT_HOME}/.codex/auth.json"
+  if [[ -s "${AGENT_HOME}/.codex/auth.json" ]]; then
+    # Resume reuses this sandbox, and Codex may have already rotated its refresh
+    # token into auth.json. OpenAI invalidates the previous refresh token on
+    # every rotation, so overwriting the file with the (older) seed would replay
+    # a spent token — the "refresh token was already used" failure. Keep the
+    # sandbox's rotated copy; the supervisor reads it back to reseed later runs.
+    log "~/.codex/auth.json already present — keeping the sandbox's rotated token"
+  else
+    # Only strip a *trailing* newline here — this is a JSON blob, not a bare
+    # token, so we must not touch whitespace inside it.
+    printf '%s' "${CODEX_AUTH_JSON%$'\n'}" > "${AGENT_HOME}/.codex/auth.json"
+    chmod 0600 "${AGENT_HOME}/.codex/auth.json"
+    log "wrote ~/.codex/auth.json"
+  fi
   chown -R "${AGENT_USER}:${AGENT_USER}" "${AGENT_HOME}/.codex"
-  log "wrote ~/.codex/auth.json"
 else
   rm -f "${AGENT_HOME}/.codex/auth.json"
 fi

@@ -5,6 +5,7 @@ import { openDb, createTicketStore } from "./db.js";
 import { completeRun, createServer, createServerWebhookDeliveryProcessor } from "./server.js";
 import { runSweep } from "./sweep.js";
 import { createLinearClientProvider } from "./linear-auth.js";
+import { captureCodexAuthJson } from "./codex-auth.js";
 import { pollSandboxEvents } from "./sandbox-events.js";
 import { activityPayload, createLinearOutboxProcessor } from "./linear-outbox.js";
 
@@ -70,6 +71,21 @@ async function main() {
             },
             completion
           ),
+        captureAgentAuth: async (sandbox, ticket) => {
+          // Codex rotates its OAuth refresh token inside the sandbox; persist
+          // it so the next run seeds the live token instead of a spent one.
+          if (ticket.agent !== "codex") return;
+          try {
+            const raw = (
+              await sandbox.fs.downloadFile("/home/agent/.codex/auth.json")
+            ).toString("utf8");
+            if (captureCodexAuthJson(store, raw)) {
+              console.log("[codex-auth] captured a rotated refresh token from the sandbox");
+            }
+          } catch (error) {
+            console.warn("[codex-auth] could not read back ~/.codex/auth.json:", error);
+          }
+        },
       });
     } finally {
       sandboxPollRunning = false;

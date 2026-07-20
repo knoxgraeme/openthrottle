@@ -43,6 +43,7 @@ import {
   tryPostError,
   type LinearOutboxProcessor,
 } from "./linear-outbox.js";
+import { getCodexAuthForSeed } from "./codex-auth.js";
 import { sanitizeText } from "./sanitize.js";
 import { parseCommand } from "./commands.js";
 import { stopTicket } from "./ticket-control.js";
@@ -379,6 +380,7 @@ async function handleCreated(
     ticket,
     taskType,
     run,
+    codexAuthJson: await getCodexAuthForSeed(cfg, store),
   });
   let sandbox;
   try {
