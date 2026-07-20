@@ -1,31 +1,34 @@
 # OpenThrottle v2 — Architecture & Contracts
 
 This is the cross-component source of truth. The GitHub repository remains
-`knoxgraeme/openthrottle-v2`; the product, CLI, snapshot, and package are named
+`knoxgraeme/openthrottle-v2`; the product, CLI, and package are named
 `openthrottle`.
 
 ## Concept
 
 An approved plan in Linear is delegated to the OpenThrottle app. The
-always-on supervisor acknowledges it, creates one private Daytona sandbox for
-the ticket, and starts Claude Code, Codex, or OpenCode. The agent pushes an `ot/*` branch,
-opens a GitHub PR, and can resume in the same sandbox/session when a human
-replies in Linear. Closing the PR deletes the sandbox.
+always-on supervisor acknowledges it, creates one persistent Fly Sprite (a
+named microVM) for the ticket, and starts Claude Code, Codex, or OpenCode. The
+agent pushes an `ot/*` branch, opens a GitHub PR, and can resume in the same
+sandbox/session when a human replies in Linear. Closing the PR deletes the
+sandbox.
 
 One ticket has at most one active run. Tickets may run in parallel.
 
 ## Components
 
 ```text
-Linear AgentSessionEvent ──HMAC──> Fly supervisor ──@daytona/sdk──> sandbox
+Linear AgentSessionEvent ──HMAC──> Fly supervisor ──Sprites REST──> sandbox
         ▲                            │    ▲                              │
-        │ app-owned activities      │    └──── sandbox activity/result spool ──┘
+        │ app-owned activities      │    └──── POST /runs/:id/{events,complete} ──┘
         │                            └──SQLite inbox/session/run/outbox state
         └──────────────────────────────── GitHub webhooks <──── PR/CI
 ```
 
 - `supervisor/`: Node 22, Hono, SQLite, OAuth/webhook/lifecycle control.
-- `sandbox/`: Node 22 image, safety boundary, agent entrypoint and normalizer.
+- `sandbox/`: safety boundary, agent entrypoint, `provision.sh`, and
+  normalizer; packaged into the supervisor's own Fly image and installed onto
+  each Fly Sprite at provision time.
 - `skills/`: Claude skills plus Codex/OpenCode prompt mirrors.
 - `cli/`: npm package `openthrottle` (`setup`, `init`, `ship`, `status`, `stop`, `logs`).
 
@@ -54,10 +57,14 @@ Linear AgentSessionEvent ──HMAC──> Fly supervisor ──@daytona/sdk─�
    inside the sandbox; a failed group lookup degrades to the flat-label behavior.
    The `ot/<identifier>` working branch is always cut from the resolved base, and
    the PR is opened against it.
-4. It creates a private Daytona sandbox from `DAYTONA_SNAPSHOT`, labeled
-   `openthrottle=true` and `ticket=<identifier>`. The image entrypoint is an
-   inert no-op; Fly uploads the latest Linear context and run credentials,
-   then explicitly starts the requested task in a Daytona process session.
+4. It creates (idempotently, by name) a private Fly Sprite `ot-<identifier>`
+   (lowercased); the `tickets.sandbox_id` column stores that sprite name.
+   There is no prebuilt image: on first create the supervisor uploads the
+   sandbox payload tarball and runs `sandbox/provision.sh` (idempotent)
+   against the live Ubuntu overlay, and applies a DNS egress allowlist scoped
+   to the sprite. It then uploads the latest Linear context and per-run
+   credentials and starts the requested task as a self-stopping Sprites
+   service running `/opt/openthrottle/entrypoint.sh`.
 
 ### Follow-up
 
@@ -65,7 +72,7 @@ Linear AgentSessionEvent ──HMAC──> Fly supervisor ──@daytona/sdk─�
    `agentActivity.content.body` (legacy `agentActivity.body` is tolerated).
 2. Native `signal=stop` and exact `/stop` bypass acknowledgement and prompt
    context mutation. Stop first records the run/session as stopped, cancels
-   pending work, and enqueues one terminal response; Daytona cleanup is retried
+   pending work, and enqueues one terminal response; sandbox cleanup is retried
    independently if it fails.
 3. Exact `/merge` uses the guarded merge path when enabled. Other replies are
    deduplicated by Linear activity ID in `session_work`, acknowledged, and then
@@ -76,21 +83,27 @@ Linear AgentSessionEvent ──HMAC──> Fly supervisor ──@daytona/sdk─�
 
 Each run receives a random one-time callback token; only its SHA-256 hash is
 stored in the run table. Agents use `ot-activity` to write validated semantic
-activity records locally. The entrypoint writes a completion marker with exit
-code, cost, PR URL, sanitized final assistant response, and sanitized failure
-tail. Every five seconds, Fly polls only active runs through the Daytona SDK, durably claims each event, and
-projects activities into `linear_outbox` using the run's immutable Linear
-session binding. A late event from a superseded session is consumed without
-publishing into the newer conversation. Completion uses the same finalizer as
-the legacy `POST /runs/:id/complete` endpoint and enqueues the first explicit
-terminal activity when present, otherwise the captured final assistant response,
+activity records and POST them to `POST /runs/:id/events` (bearer-authed with
+the run callback token); the supervisor durably claims each one by `event_id`
+in `sandbox_events` before projecting it into `linear_outbox`, using the run's
+immutable Linear session binding. A late event from a superseded session is
+consumed without publishing into the newer conversation. The entrypoint's
+completion trap POSTs the same shape of payload (exit code, cost, PR URL,
+sanitized final assistant response, and sanitized failure tail) to
+`POST /runs/:id/complete`, gated by the same one-time callback token (once a
+run is no longer `running`, its token no longer works). If a push fails, or
+`SUPERVISOR_URL` is unreachable, the sandbox instead writes the event to an
+on-disk outbox spool; the sweep drains any spooled events for an overdue run —
+reusing the exact dedupe and projection the push endpoints use — before
+declaring it timed out. Completion enqueues the first explicit terminal
+activity when present, otherwise the captured final assistant response,
 otherwise a generic terminal activity plus PR links through the Linear outbox.
 If no result arrives by `TASK_TIMEOUT` plus grace, the sweep marks the run
 timed out and enqueues the timeout error.
-Before finalizing an outbox completion, Fly reads a fixed-size tail of
-`~/.ot/task.log`, sanitizes it (including the one-time callback token), and
-stores at most 100,000 characters on the run row. This private operator log is
-not published to Linear or GitHub. Persisting a new tail clears older tails for
+The run row also stores a bounded sanitized tail of the sandbox's
+`~/.ot/task.log` (at most 100,000 characters) for authenticated operator
+debugging after a sandbox is deleted. This private operator log is not
+published to Linear or GitHub. Persisting a new tail clears older tails for
 that ticket, bounding durable log storage to the latest captured run.
 
 ### GitHub/review lifecycle
@@ -152,7 +165,8 @@ row until retry/redrive.
 | `POST` | `/repositories/register` | `OT_STATUS_TOKEN` bearer | verify and upsert a target route/webhook |
 | `POST` | `/tickets/:id/stop` | `OT_STATUS_TOKEN` bearer | stop a ticket |
 | `GET` | `/tickets/:id/logs` | `OT_STATUS_TOKEN` bearer | sanitized live logs, falling back to the latest durable private run tail |
-| `GET` | `/preview/:id?token=` | per-ticket token | wake and signed redirect |
+| `GET` | `/preview/:id?token=` | per-ticket token | wake and redirect to the org-private sprite URL |
+| `POST` | `/runs/:id/events` | one-time run bearer | push sandbox activity |
 | `POST` | `/runs/:id/complete` | one-time run bearer | consume run result |
 
 Linear OAuth uses `actor=app`, scopes
@@ -163,17 +177,21 @@ outbox-supplied UUID when available and
 `agentSessionUpdate` passes the session as the mutation `id` and link arrays
 inside `input`.
 
-Daytona uses `@daytona/sdk` `0.199.x`. Run env is updated with
-`sandbox.updateEnv`, then `/opt/openthrottle/entrypoint.sh` is launched with
-`executeSessionCommand(..., {runAsync:true})`.
+Fly Sprites uses `supervisor/src/sprites.ts`, a thin in-repo REST client (no
+`@daytona/sdk` or `@fly/sprites` dependency). Per-run credentials are written
+to a 0600 env file via `fs/write`, then `/opt/openthrottle/entrypoint.sh` is
+launched as a self-stopping Sprites service
+(`PUT /v1/sprites/:name/services/run`) that sources and deletes the env file
+before running.
 
 ### Persistence
 
 `tickets` stores identity/routing (including the resolved base branch, which
 may be a per-ticket `branch › <name>` override of the route default),
-sandbox/PR, state, current run guard, aggregate cost, last error,
-preview-token hash, latest Linear prompt context, and the pending re-review
-flag set when a review-fix pauses on a decision elicitation. `agent_sessions` stores
+sandbox/PR (the `sandbox_id` column holds the Fly Sprite name), state,
+current run guard, aggregate cost, last error, preview-token hash, latest
+Linear prompt context, and the pending re-review flag set when a review-fix
+pauses on a decision elicitation. `agent_sessions` stores
 each immutable Linear AgentSession generation and marks the one current
 generation per issue. `session_work` stores deduplicated human/automatic work
 by source id and priority. `runs` stores immutable run identity plus the
@@ -188,8 +206,10 @@ per-session sequence, retry state, and sanitized last error. `settings` stores
 OAuth tokens and small supervisor settings.
 `repository_registrations` durably maps one Linear team key (and optional
 stable team ID) to a canonical GitHub `owner/name`, verified base branch,
-managed webhook ID, and verified snapshot name. Team ID lookup wins over key;
-re-registering the same team updates the route atomically.
+managed webhook ID, and a retained `snapshot` placeholder column (Fly Sprites
+has no image to verify, so registration instead runs a Sprites API
+liveness/authorization probe before touching GitHub). Team ID lookup wins over
+key; re-registering the same team updates the route atomically.
 The global repository fallback is allowed only while no durable registrations
 exist. Once onboarding is active, an unmatched team fails closed; explicit
 legacy `GITHUB_REPO_MAPPINGS` entries remain valid during migration.
@@ -218,14 +238,17 @@ Required unless noted:
   override the sandbox commit author; unset, the sandbox authors commits as the
   `GITHUB_TOKEN` account's GitHub noreply identity so downstream author-gated
   integrations (e.g. Vercel) accept the deployment.
-- Daytona: `DAYTONA_API_KEY`, `DAYTONA_SNAPSHOT=openthrottle`.
+- Fly Sprites: `SPRITE_TOKEN` (org-scoped Sprites API token); optional
+  `SPRITES_API_URL` (default `https://api.sprites.dev`) and
+  `OT_PAYLOAD_TAR_PATH` (default `/app/payload.tar.gz`, the sandbox payload
+  tarball baked into the supervisor's own Fly image).
 - Agents: `CLAUDE_CODE_OAUTH_TOKEN` for Claude subscription login and/or
   `CODEX_AUTH_JSON` for Codex subscription login; `DEFAULT_AGENT=codex`.
 - Limits: `BASE_BRANCH=main`, `MAX_TURNS=200`, `TASK_TIMEOUT=7200`,
   `CALLBACK_GRACE_SECONDS=120`, `DEV_PORT=3000`,
   `SWEEP_MAX_AGE_DAYS=14`, `ORPHAN_GRACE_MINUTES=5`,
   `WEBHOOK_MAX_AGE_SECONDS=60`, `REVIEW_MAX_ROUNDS=3`,
-  `ALLOW_LINEAR_MERGE=false`, `SANDBOX_EVENT_POLL_INTERVAL_MS=5000`.
+  `ALLOW_LINEAR_MERGE=false`.
 
 Fly keeps one machine running, mounts `/data`, and health-checks `/healthz`.
 
@@ -235,9 +258,10 @@ Fly keeps one machine running, mounts `/data`, and health-checks `/healthz`.
 
 The supervisor passes `TASK_TYPE`, `AGENT`, `GITHUB_REPO`, `GITHUB_TOKEN`,
 `BASE_BRANCH`, `BRANCH_NAME`, non-secret Linear issue identifiers,
-`RUN_ID`, `RUN_CALLBACK_TOKEN`, optional `RESUME_MESSAGE`,
-`PR_NUMBER`, `REVIEW_ROUND`, model auth, and limit values. Daytona/Fly keys
-and webhook/install/operator secrets never enter the sandbox.
+`RUN_ID`, `RUN_CALLBACK_TOKEN`, `SUPERVISOR_URL` (a public URL, not a secret —
+it lets the sandbox POST activity/completion callbacks), optional
+`RESUME_MESSAGE`, `PR_NUMBER`, `REVIEW_ROUND`, model auth, and limit values.
+`SPRITE_TOKEN` and webhook/install/operator secrets never enter the sandbox.
 
 ### Entrypoint phases
 
@@ -246,15 +270,18 @@ and webhook/install/operator secrets never enter the sandbox.
 3. Install and seal the pre-push boundary and configure token-safe Git auth.
 4. Read `.openthrottle.yml` with supervisor-owned base branch unchanged.
 5. Run `post_bootstrap` commands.
-6. Start/restart the optional dev server on `0.0.0.0`.
+6. Register (or restart) the optional dev server as a Sprites service on
+   `0.0.0.0`, so it survives sprite pause/wake.
 7. Install OpenThrottle runtime adapters/instructions and run the selected
    task through the JSONL normalizer under `timeout`.
-8. Remove temporary runtime MCP material and atomically write a completion
-   marker for Fly to consume through Daytona.
+8. Remove temporary runtime MCP material, POST the completion payload to
+   `POST /runs/:id/complete`, and fall back to an on-disk outbox completion
+   marker (drained by the sweep) when the push fails.
 
-The snapshot contains one pinned Compound Engineering marketplace checkout and
-installs that same release natively into the sandbox user's Claude and Codex
-profiles. OpenThrottle's task adapters remain outside the target checkout:
+Provisioning (`sandbox/provision.sh`, run idempotently the first time a
+sprite is used) installs one pinned Compound Engineering marketplace checkout
+and installs that same release natively into the sandbox user's Claude and
+Codex profiles. OpenThrottle's task adapters remain outside the target checkout:
 Claude adapters are installed in the sandbox user's home, while Codex gets
 global runtime instructions in `~/.codex/AGENTS.md`. Claude receives a strict
 temporary config containing only project-declared MCP servers with user-only
@@ -290,20 +317,20 @@ changed when a sandbox resumes.
 
 ## CLI contract
 
-- `openthrottle setup`: verify the canonical Daytona snapshot when local
-  credentials are available and print the one-time platform/Fly checklist.
-  Snapshot creation is an operator command from this repository
-  (`daytona snapshot create <name> --dockerfile sandbox/Dockerfile --context .`)
-  and is automated on `main` by `.github/workflows/deploy.yml`, which builds
-  commit-pinned `openthrottle-v2-ce-<short-sha>` snapshots through
-  `supervisor/scripts/build-snapshot.mjs` and stages the `DAYTONA_SNAPSHOT`
-  secret before the Fly deploy releases it.
+- `openthrottle setup`: verify `SPRITE_TOKEN` with a live GET against the Fly
+  Sprites API when local credentials are available, and print the one-time
+  Fly secrets checklist. There is no snapshot to build or verify: the sandbox
+  payload (entrypoint, `provision.sh`, runner, skills) is baked into the
+  supervisor's own Fly image at deploy time and installed onto each sprite by
+  `sandbox/provision.sh` on first use, so `.github/workflows/deploy.yml` has a
+  single deploy job with no separate snapshot build/stage step.
 - `openthrottle init`: run from a target GitHub checkout; detect its origin,
   base branch, package commands (or accept manual non-Node commands), write
   `.openthrottle.yml`, and call the authenticated supervisor registration
-  endpoint. The supervisor verifies repository/branch access, creates or
-  refreshes its GitHub webhook, verifies the configured Daytona snapshot is
-  active, and persists the Linear-team route without a Fly restart.
+  endpoint. The supervisor pings the Fly Sprites API as a liveness/
+  authorization probe, verifies repository/branch access, creates or
+  refreshes its GitHub webhook, and persists the Linear-team route without a
+  Fly restart. `init` no longer verifies or persists a snapshot.
 - `openthrottle ship <file.md>`: create a Linear issue and, when
   `OT_AGENT_APP_ID` is set, delegate it with `IssueUpdateInput.delegateId`.
 - `openthrottle status`: authenticated ticket table.
@@ -333,7 +360,7 @@ ticket so later runs remain stable if the route changes.
 
 ## Security invariants
 
-1. No Linear OAuth/API credential, Daytona API key, or webhook signing secret enters a sandbox.
+1. No Linear OAuth/API credential, `SPRITE_TOKEN`, or webhook signing secret enters a sandbox.
 2. The pre-push hook blocks main/master and non-fast-forward pushes; its path
    is root-sealed. GitHub branch protection remains required.
 3. Logs and outbound agent-derived text are sanitized.
@@ -341,6 +368,10 @@ ticket so later runs remain stable if the route changes.
    require bearer auth and OAuth uses one-time state.
 5. Run and preview credentials are random, stored hashed, scoped, and
    one-time or short-lived.
+6. Each ticket sandbox runs in its own per-sprite Firecracker microVM; a DNS
+   egress allowlist (`include: defaults` plus the supervisor callback host) is
+   applied to every ticket sprite, and per-run credentials arrive via a 0600
+   env file that the entrypoint sources then deletes.
 
 ## Verification contract
 
@@ -349,5 +380,5 @@ tests, and a real Docker smoke. The smoke first checks the pinned real Claude
 and Codex CLI versions/flags, then uses deterministic JSONL stubs to exercise
 implement and same-session resume for all engines, clone/branch safety,
 config, session/cost capture, activity/completion markers, and secret-leak checks.
-Live Linear/Daytona/Fly acceptance remains a deployment gate because it
+Live Linear/Sprites/Fly acceptance remains a deployment gate because it
 requires operator-owned accounts and secrets.

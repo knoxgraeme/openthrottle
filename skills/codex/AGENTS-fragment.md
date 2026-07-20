@@ -7,7 +7,7 @@ context Claude gets from its user-level skills without changing project files.
 
 ## Environment available to you
 
-You're running as the `agent` user in a Daytona sandbox, inside the
+You're running as the `agent` user in a Fly Sprite sandbox, inside the
 already-cloned repo at `/home/agent/repo`. Useful env vars, all set by
 the entrypoint:
 
@@ -32,7 +32,7 @@ the entrypoint:
 - `OT_CE_PIPELINE` declares the native Compound Engineering skills expected for
   this task. OpenThrottle adapters enforce product boundaries around them.
 
-You do **not** have a Daytona API key, a Fly key, or any webhook secret —
+You do **not** have a Sprites token, a Fly key, or any webhook secret —
 you were never given them. Don't go looking for them.
 
 ## Push early, push often

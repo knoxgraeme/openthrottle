@@ -8,7 +8,7 @@ includes green CI.
 ## Decisions locked in the 2026-07-18 review
 
 1. **Keep the GitHub repository named `openthrottle-v2`.** The product,
-   package, CLI, and snapshot are named `openthrottle`; this repository stays
+   package, and CLI are named `openthrottle`; this repository stays
    `knoxgraeme/openthrottle-v2`. The older `knoxgraeme/openthrottle` remains
    reference material and is not modified by this plan.
 2. **Review verdicts are comments, never GitHub approvals.** GitHub rejects a
@@ -21,9 +21,11 @@ includes green CI.
    cost and unblocks the serialization guard, error states, and cost
    reporting in one move. Secured with a per-run one-time token — no standing
    supervisor secrets enter the sandbox (invariant #1 holds).
-4. **Daytona previews are nice-to-have.** Target repos have Vercel previews on
-   PRs; that is the preview story. Mid-run Daytona preview + wake-on-click is
-   Phase 5.
+4. **Vercel previews are the primary preview story.** Target repos have
+   Vercel previews on PRs. Fly Sprites also give every ticket an org-private,
+   always-on preview URL for the sandbox's dev server (wakes on request,
+   reachable by org members via Fly login) at no extra supervisor cost;
+   further preview hardening (e.g. tokened external sharing) is deferred.
 5. **Codex stays Phase 3.** We actively use Codex; parity lands before the
    review loop.
 6. **Hard budget caps deferred until API-key auth.** Per-run cost reporting
@@ -35,13 +37,16 @@ includes green CI.
 9. **Fly runs `min_machines_running = 1`.** Scale-to-zero made the in-process
    sweep unreliable and put machine cold-start inside the 10-second ack
    budget. ~$3/mo buys both problems gone.
-10. **One canonical snapshot build.** `daytona snapshot create openthrottle
-    --dockerfile sandbox/Dockerfile` from this repo (Daytona builds it; if
-    pushing a locally-built image instead, it must be `--platform
-    linux/amd64`). `openthrottle setup` verifies the one-time snapshot and
-    prints the platform checklist. Per-target `openthrottle init` writes
+10. **No sandbox image to build.** The sandbox payload (entrypoint,
+    `provision.sh`, runner, skills) is baked into the supervisor's own Fly
+    image and installed onto each Fly Sprite by `sandbox/provision.sh`
+    (idempotent) on first use, so supervisor and sandbox assets are always in
+    lockstep — nothing to build, stage, or verify separately.
+    `openthrottle setup` verifies `SPRITE_TOKEN` against the Fly Sprites API
+    and prints the platform checklist. Per-target `openthrottle init` writes
     `.openthrottle.yml`, registers the Linear-team/repository route, creates
-    or refreshes its webhook, and asks Fly to verify snapshot readiness.
+    or refreshes its webhook, and asks the supervisor to verify Sprites
+    reachability.
 
 ## Learnings this plan is built on (July 2026 research)
 
@@ -61,12 +66,12 @@ includes green CI.
 3. **The 10-second ack rule shapes the architecture.** The supervisor must
    post a `thought` activity before any sandbox work; sandbox creation happens
    after. Never reorder this.
-4. **Sandbox lifetime == ticket lifetime is the core simplification.** Stopped
-   Daytona sandboxes bill no compute (filesystem persists on the runner), so
-   we keep one sandbox per ticket from delegation to PR-close. This is what
-   makes `--resume` trivially correct (same cwd, same session files) and
-   deletes the volume/session-sync machinery v1 half-built. Auto-archive after
-   7 days stopped means old tickets restart slower — acceptable.
+4. **Sandbox lifetime == ticket lifetime is the core simplification.** Fly
+   Sprites idle-pause and wake on request natively — no compute bills while
+   paused, and no reconciliation loop is needed to keep them stopped — so we
+   keep one sprite per ticket from delegation to PR-close. This is what makes
+   `--resume` trivially correct (same cwd, same session files) and avoids the
+   volume/session-sync machinery v1 half-built.
 5. **Fresh-context phases beat long-running orchestrators.** The ecosystem
    converged on state-in-files/git with fresh agent context per run (the Ralph
    insight; v1's phased orchestrator learned it independently). → v2 has no
@@ -78,12 +83,14 @@ includes green CI.
    deprecated (~v0.128) for profiles. → Codex is the linear-task engine;
    multi-subagent skills are Claude-only.
 7. **Don't build on dying hosts.** Vibe Kanban (sunsetting), Omnara (archived),
-   Gitpod (gone → Ona). Depend only on: Daytona (AGPL, active, self-host
-   escape), Linear API, GitHub, the two agent CLIs, Fly (replaceable in an
-   afternoon — the supervisor is a plain Node app).
-8. **Previews: Vercel at PR time is the story; Daytona mid-run is a bonus.**
-   Human takeover = push-early branch + optionally `claude --resume` against
-   the sandbox's session files; herdr/tmux attach is a nice-to-have, not core.
+   Gitpod (gone → Ona). Depend only on: Fly Sprites (the sandbox provider, a
+   Fly product) and Fly (the supervisor host, replaceable in an afternoon —
+   the supervisor is a plain Node app), Linear API, GitHub, and the two agent
+   CLIs.
+8. **Previews: Vercel at PR time is the story; the sprite's org-private URL
+   mid-run is a bonus.** Human takeover = push-early branch + optionally
+   `claude --resume` against the sandbox's session files; herdr/tmux attach is
+   a nice-to-have, not core.
 
 ## Cross-cutting workstream: tests + CI
 
@@ -102,7 +109,7 @@ acceptance runs instead.
   `extractLabelNames`, `parseMarkdown`);
   (4) handler flows — `createServer` already takes injected deps
   (`ServerDeps`), so exercise created/prompted/pr-closed/sweep against fake
-  Daytona + Linear clients, including the races Phase 2 hardens.
+  Sprites + Linear clients, including the races Phase 2 hardens.
 - **Sandbox smoke test:** `docker run` the sandbox image with a stub `claude`
   / `codex` on PATH emitting canned JSONL — verifies all eight entrypoint
   phases (clone → safety → config → agent → callback → final activity)
@@ -114,17 +121,19 @@ acceptance runs instead.
 
 ## Phase 0 — Verified deploy (the "resolve every TODO" stretch)
 
-Goal: supervisor live on Fly, snapshot in Daytona, all `TODO(verify-*)`
-markers resolved against live APIs, test scaffold running in CI.
+Goal: supervisor live on Fly, sandbox payload provisioning verified against
+Fly Sprites, all `TODO(verify-*)` markers resolved against live APIs, test
+scaffold running in CI.
 
 Steps:
 1. Keep this repository at `knoxgraeme/openthrottle-v2`; use `openthrottle`
-   consistently for the contents/product/package/snapshot.
+   consistently for the contents/product/package.
 2. Wire the test workstream: vitest + bats + docker smoke + GitHub Actions;
    land the sanitizer, signature, and parser tests (they need no live
    accounts and lock in behavior before the TODO-resolution churn).
-3. Build the snapshot: `daytona snapshot create openthrottle --dockerfile
-   sandbox/Dockerfile` (decision #10). Simplify `cli/src/init.ts` accordingly.
+3. Bake the sandbox payload into the supervisor's Fly image and confirm
+   `sandbox/provision.sh` runs cleanly on a fresh sprite (decision #10).
+   Simplify `cli/src/init.ts` accordingly.
 4. `fly launch` supervisor with `min_machines_running = 1`, create `/data`
    volume, `fly secrets set` from `.env.example`.
 5. Lock the supervisor surface: bearer token on `GET /status` (the CLI sends
@@ -136,7 +145,7 @@ Steps:
 7. Add GitHub repo webhook (`pull_request` events) → `/webhooks/github`.
 8. Work through `grep -rn "TODO(verify" supervisor/src sandbox cli/src`:
    Linear mutation shapes (test each with a curl against the live GraphQL
-   API), Daytona session-exec `env`/`runAsync` fields, `--mcp-config` JSON
+   API), Fly Sprites service `cmd`/`env` fields, `--mcp-config` JSON
    shape, Codex JSONL event names. Also confirm the full AgentSessionEvent
    action catalog (anything beyond created/prompted we should handle or log).
 9. Reconcile SPEC drift found in review: drop `base_branch` from the
@@ -144,8 +153,8 @@ Steps:
    supervisor-owned) or wire it — pick one and update SPEC.md.
 
 Acceptance: delegating a test issue produces an ack activity in Linear within
-10s (measure it) and a sandbox appears in Daytona with the right env and
-labels. No unresolved `TODO(verify-*)` remains (delete markers as confirmed).
+10s (measure it) and a sprite appears in Fly Sprites with the right env and
+name. No unresolved `TODO(verify-*)` remains (delete markers as confirmed).
 CI green.
 
 ## Phase 1 — First end-to-end ticket (supervised)
@@ -180,7 +189,7 @@ one deliberate live run.
   records cost. Fallback: no callback by `TASK_TIMEOUT` + grace → mark the
   run dead, clear the guard, post an `error` activity.
 - **Per-ticket run serialization.** `running_since`/`run_id` on the ticket
-  row, set before the Daytona task starts, cleared by the callback. A prompt while a
+  row, set before the sandbox task starts, cleared by the callback. A prompt while a
   run is active gets a polite `thought` ("still working on the last message —
   reply again when this run finishes") and is rejected, not queued. Queueing
   is a later upgrade. Cross-ticket parallelism stays unbounded — one ticket =
@@ -269,11 +278,13 @@ human orchestration except the merge click.
   as Linear tickets (which then flow through the pipeline).
 - **Multi-repo** — replace `GITHUB_REPO` env with per-Linear-team or
   per-project mapping in `settings`.
-- **Daytona mid-run previews** — verify `getPreviewLink` (URL + token) and add
-  a wake-on-click supervisor redirect (`GET /preview/:ticket` starts the
-  sandbox, then redirects); until then Vercel PR previews carry it.
-- **Attach/monitor** — optional: herdr in the sandbox image + docs for
-  `daytona ssh` / attach-takeover when watching a live run matters.
+- **Preview hardening** — the sprite's org-private URL already covers
+  mid-run preview (wakes on request, reachable by org members via Fly login);
+  tokened external sharing (flip to `public` behind a supervisor-signed gate,
+  or a supervisor proxy) is deferred polish.
+- **Attach/monitor** — optional: herdr in the sandbox image + docs for the
+  Sprites exec/attach API (tmux-backed detachable sessions) when watching a
+  live run matters.
 - **`openthrottle logs`** — CLI command streaming a ticket's sanitized sandbox
   log via the supervisor, with a bounded durable private tail after cleanup.
 
@@ -292,8 +303,8 @@ one agent session at a time); Windows.
   decision #6) become load-bearing and get built immediately.
 - **Linear AIS churn** (learning #2): pin nothing; keep `linear.ts` small and
   diffable against Cyrus.
-- **Daytona pricing/limits**: sandbox-per-ticket holds disk per open PR; the
-  sweep and PR-close cleanup are the cost controls. Self-host (AGPL compose)
-  is the exit if cloud economics change.
+- **Fly Sprites pricing/limits**: sprite-per-ticket holds disk/compute per
+  open PR; the sweep and PR-close cleanup are the cost controls, and idle
+  sprites pause automatically between runs.
 - **Codex `exec` subagent constraints** (learning #6): revisit when OpenAI
   stabilizes subagents; until then don't give Codex multi-agent skills.

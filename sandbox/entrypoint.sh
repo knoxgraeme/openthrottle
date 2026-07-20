@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # entrypoint.sh — OpenThrottle sandbox entrypoint. Runs as root inside the
-# Daytona sandbox; all repo/agent work happens as the unprivileged `agent`
-# user via gosu. See docs/SPEC.md "Sandbox contract" for the 8-phase
-# contract this implements, and "Sandbox env contract" for every env var
-# referenced below.
+# Fly Sprite (a persistent microVM); all repo/agent work happens as the
+# unprivileged `agent` user via gosu. See docs/SPEC.md "Sandbox contract" for
+# the 8-phase contract this implements, and "Sandbox env contract" for every
+# env var referenced below.
 #
 # Invoked twice per ticket:
-#   - TASK_TYPE=implement : first run, right after the sandbox is created.
+#   - TASK_TYPE=implement : first run, right after the sprite is provisioned.
 #   - TASK_TYPE=resume    : supervisor re-execs this same script inside the
-#     already-running (or just-restarted) sandbox via the Daytona process
-#     exec API, with RESUME_MESSAGE set. Every phase below is written to be
-#     safe to re-run (idempotent) so the same script serves both cases.
+#     persistent sprite via the Sprites `run` service, with RESUME_MESSAGE set.
+#     Every phase below is written to be safe to re-run (idempotent) so the
+#     same script serves both cases.
 #
-# Never exits without writing a completion marker for the Fly supervisor —
-# see write_run_completion() / the EXIT trap below.
+# Never exits without reporting completion to the Fly supervisor (a POST with a
+# spooled marker-file fallback) — see write_run_completion() / the EXIT trap.
 
 set -euo pipefail
 
@@ -143,8 +143,8 @@ write_run_completion() {
   log "wrote completion marker (run=${RUN_ID})"
 }
 
-# Always runs on script exit (success or failure). Fly polls this marker through
-# the Daytona SDK, so completion does not depend on sandbox outbound internet.
+# Always runs on script exit (success or failure). write_run_completion POSTs the
+# result to the supervisor; if that fails it spools a marker file the sweep drains.
 handle_exit() {
   local exit_code="${1:-0}"
   if [[ -n "${MCP_CONFIG_FILE:-}" ]]; then
