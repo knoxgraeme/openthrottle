@@ -2993,9 +2993,11 @@ describe("createServer lifecycle", () => {
     // Regression pin: the commented review still becomes actionable feedback
     // work, now uniformly as queued `automatic` session work rather than a
     // direct `review-fix` launch — the idle ticket drains it immediately as a
-    // resume of the original session.
+    // resume of the original session. The review carries a summary body, so
+    // it takes the `gh-rvbody-` prefix that exempts it from the
+    // resolved-thread skip (its feedback lives outside any inline thread).
     expect(
-      db!.prepare("SELECT status, source FROM session_work WHERE id = ?").get("gh-review-77")
+      db!.prepare("SELECT status, source FROM session_work WHERE id = ?").get("gh-rvbody-77")
     ).toEqual({ status: "consumed", source: "automatic" });
     expect(envUpdates.at(-1)).toMatchObject({ TASK_TYPE: "resume" });
     expect(envUpdates.at(-1)).not.toHaveProperty("PR_NUMBER");
@@ -3418,6 +3420,189 @@ describe("createServer lifecycle", () => {
     ).toEqual({ status: "consumed" });
     expect(graphqlCalls).toHaveLength(0);
     expect(envUpdates.at(-1)).toMatchObject({ TASK_TYPE: "resume" });
+  });
+
+  it("never skips a gh-rvbody- item (body-only review), even when every review thread is resolved", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-rvbody",
+      linear_issue_identifier: "OT-RVBODY",
+      linear_session_id: "session-rvbody",
+      sandbox_id: "sandbox-rvbody",
+      branch: "ot/ot-rvbody",
+      agent: "claude",
+      repo: "owner/repo",
+      pr_url: "https://github.com/owner/repo/pull/36",
+      state: "active",
+    });
+    // A body-only review creates no inline threads: its feedback lives in the
+    // summary body captured here, so thread-resolution state is unrelated and
+    // must never cancel it.
+    store.enqueueSessionWork({
+      id: "gh-rvbody-902",
+      linearSessionId: "session-rvbody",
+      issueId: "issue-rvbody",
+      source: "automatic",
+      body: "Review summary: the retry loop swallows the original error.",
+    });
+    const envUpdates: Array<Record<string, string>> = [];
+    const sandbox = {
+      state: "started",
+      setAutostopInterval: vi.fn(async () => undefined),
+      updateEnv: vi.fn(async (env: Record<string, string>) => {
+        envUpdates.push(env);
+      }),
+      fs: {
+        uploadFile: vi.fn(async () => undefined),
+        setFilePermissions: vi.fn(async () => undefined),
+      },
+      process: {
+        createSession: vi.fn(async () => undefined),
+        executeSessionCommand: vi.fn(async () => undefined),
+      },
+    };
+    const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
+    const graphqlCalls: unknown[] = [];
+    const githubFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/graphql")) {
+        graphqlCalls.push(JSON.parse(String(init?.body)));
+        return Response.json({
+          data: {
+            repository: { pullRequest: { reviewThreads: { nodes: [{ isResolved: true }] } } },
+          },
+        });
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    });
+    vi.stubGlobal("fetch", githubFetch);
+    const linearFetch = vi.fn(async () =>
+      Response.json({
+        data: { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
+      })
+    ) as unknown as typeof fetch;
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg,
+      store,
+      daytona,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
+      runBackground: (task) => background.push(task),
+    });
+    const failedRun = JSON.stringify({
+      action: "completed",
+      repository: { full_name: "owner/repo" },
+      workflow_run: {
+        id: 14,
+        name: "CI",
+        status: "completed",
+        conclusion: "failure",
+        head_branch: "ot/ot-rvbody",
+        head_sha: "sha-rvbody",
+        html_url: "https://github.com/owner/repo/actions/runs/14",
+      },
+    });
+    await app.request("/webhooks/github", {
+      method: "POST",
+      headers: signedGithub(failedRun, "github-rvbody-drain", "workflow_run"),
+      body: failedRun,
+    });
+    await Promise.all(background.splice(0));
+
+    // The body-only review item launches despite every thread reading as
+    // resolved; the resolved-thread check is never even consulted for it.
+    expect(
+      db!.prepare("SELECT status FROM session_work WHERE id = ?").get("gh-rvbody-902")
+    ).toEqual({ status: "consumed" });
+    expect(graphqlCalls).toHaveLength(0);
+    expect(envUpdates.at(-1)).toMatchObject({ TASK_TYPE: "resume" });
+  });
+
+  it("keeps a queued /implement command as an implement run when drained", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-queued-implement",
+      linear_issue_identifier: "OT-QUEUED-IMPLEMENT",
+      linear_session_id: "session-queued-implement",
+      sandbox_id: "sandbox-queued-implement",
+      branch: "ot/ot-queued-implement",
+      agent: "claude",
+      repo: "owner/repo",
+      pr_url: "https://github.com/owner/repo/pull/37",
+      state: "active",
+    });
+    // A human sent `/implement` while a run was active, so it was stored as
+    // pending human work instead of launching. Draining it must preserve the
+    // command's meaning, not downgrade it to a resume.
+    store.enqueueSessionWork({
+      id: "linear-implement-cmd",
+      linearSessionId: "session-queued-implement",
+      issueId: "issue-queued-implement",
+      source: "human",
+      body: "/implement",
+    });
+    const envUpdates: Array<Record<string, string>> = [];
+    const sandbox = {
+      state: "started",
+      setAutostopInterval: vi.fn(async () => undefined),
+      updateEnv: vi.fn(async (env: Record<string, string>) => {
+        envUpdates.push(env);
+      }),
+      fs: {
+        uploadFile: vi.fn(async () => undefined),
+        setFilePermissions: vi.fn(async () => undefined),
+      },
+      process: {
+        createSession: vi.fn(async () => undefined),
+        executeSessionCommand: vi.fn(async () => undefined),
+      },
+    };
+    const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
+    const linearFetch = vi.fn(async () =>
+      Response.json({
+        data: { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
+      })
+    ) as unknown as typeof fetch;
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg,
+      store,
+      daytona,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
+      runBackground: (task) => background.push(task),
+    });
+    // Any drain trigger works; a CI failure enqueues behind the human item,
+    // and the human item is claimed first (human work outranks automatic).
+    const failedRun = JSON.stringify({
+      action: "completed",
+      repository: { full_name: "owner/repo" },
+      workflow_run: {
+        id: 15,
+        name: "CI",
+        status: "completed",
+        conclusion: "failure",
+        head_branch: "ot/ot-queued-implement",
+        head_sha: "sha-queued-implement",
+        html_url: "https://github.com/owner/repo/actions/runs/15",
+      },
+    });
+    await app.request("/webhooks/github", {
+      method: "POST",
+      headers: signedGithub(failedRun, "github-queued-implement", "workflow_run"),
+      body: failedRun,
+    });
+    await Promise.all(background.splice(0));
+
+    expect(
+      db!.prepare("SELECT status FROM session_work WHERE id = ?").get("linear-implement-cmd")
+    ).toEqual({ status: "consumed" });
+    const launchEnv = envUpdates.at(-1)!;
+    expect(launchEnv).toMatchObject({ TASK_TYPE: "implement" });
+    expect(launchEnv).not.toHaveProperty("RESUME_MESSAGE");
+    const ticket = store.getByIssueId("issue-queued-implement")!;
+    expect(store.getRun(ticket.run_id!)?.task_type).toBe("implement");
   });
 
   it("posts a re-delegate error when a resume fails because the saved agent session is gone", async () => {

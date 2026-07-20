@@ -95,7 +95,13 @@ export async function handleGithubEvent(
       linear,
       linearOutbox,
       ticket,
-      workId: `gh-review-${event.review.id}`,
+      // A review with only a summary body creates no inline review threads,
+      // so the resolved-thread skip would measure unrelated (older) threads
+      // and could cancel it. `gh-rvbody-` marks it exempt from that skip;
+      // only reviews whose feedback lives in inline threads are `gh-review-`.
+      workId: event.review.body?.trim()
+        ? `gh-rvbody-${event.review.id}`
+        : `gh-review-${event.review.id}`,
       body: feedbackMessage({
         kind: "review",
         author,

@@ -81,8 +81,11 @@ describe("feedbackMessage", () => {
       conclusion: "failure",
       url: "https://github.com/o/r/actions/runs/9",
     });
-    expect(message).toContain('CI check "CI" completed with conclusion failure');
+    expect(message).toContain('Check "CI" concluded failure');
     expect(message).toContain("https://github.com/o/r/actions/runs/9");
+    // Feedback is deduplicated per head SHA, so the message must send the
+    // agent to the full check list — other workflows may have failed too.
+    expect(message).toContain("run `gh pr checks` and triage every failing check");
     expect(message).toContain("Triage this feedback");
   });
 });

@@ -12,6 +12,7 @@ import type { Daytona } from "@daytona/sdk";
 import type { Config } from "./config.js";
 import type { Ticket, TicketStore } from "./db.js";
 import type { LinearClient } from "./linear.js";
+import { parseCommand } from "./commands.js";
 import { enqueueActivity, type LinearOutboxProcessor } from "./linear-outbox.js";
 import { areAllReviewThreadsResolved, commentOnPullRequest, parsePullRequestUrl } from "./github.js";
 import { sanitizeText } from "./sanitize.js";
@@ -54,8 +55,13 @@ export type FeedbackInput =
 // work on the original session.
 export function feedbackMessage(input: FeedbackInput): string {
   if (input.kind === "ci") {
+    // Feedback work is deduplicated per head SHA, so one item may stand in for
+    // several distinct failing workflows on the same push — the message sends
+    // the agent to the full check list rather than only the triggering check.
     return (
-      `CI check "${input.name}" completed with conclusion ${input.conclusion}: ${input.url}\n\n` +
+      `CI failed on this PR. Check "${input.name}" concluded ${input.conclusion}: ${input.url}\n\n` +
+      "Other checks may have failed on the same commit — run `gh pr checks` and " +
+      "triage every failing check, not just the one named above.\n\n" +
       TRIAGE_INSTRUCTIONS
     );
   }
@@ -68,7 +74,10 @@ export function feedbackMessage(input: FeedbackInput): string {
 
 // Only a review creates a GraphQL reviewThread; a plain PR conversation
 // comment never does, so checking it against thread-resolution state would
-// measure something unrelated and could cancel a fresh comment.
+// measure something unrelated and could cancel a fresh comment. The same
+// holds for a body-only review (summary text, no inline comments): its
+// feedback lives outside any thread, so the enqueue path gives it the
+// `gh-rvbody-` prefix and it is never skipped on thread resolution.
 export function isResolvableFeedbackWorkId(workId: string): boolean {
   return workId.startsWith("gh-review-");
 }
@@ -111,7 +120,7 @@ export type LaunchExistingTask = (params: {
   linear: LinearClient;
   linearOutbox: LinearOutboxProcessor;
   ticket: Ticket;
-  taskType: "resume";
+  taskType: "resume" | "implement";
   resumeMessage?: string;
   linearContext?: string;
 }) => Promise<boolean>;
@@ -199,6 +208,16 @@ export async function drainNextSessionWork(params: DrainParams): Promise<boolean
 
     const current = params.store.getByIssueId(params.ticket.linear_issue_id) ?? params.ticket;
     const heading = work.source === "human" ? "Latest human reply" : "New PR feedback";
+    // A human `/implement` queued while a run was active must keep its
+    // command meaning when drained — launching it as a resume would silently
+    // downgrade the explicit promotion. The legacy regex promotion is not
+    // re-parsed here (it needs the investigate label, which the drain does
+    // not have); only the explicit command survives queueing.
+    const queuedCommand =
+      work.source === "human"
+        ? parseCommand(work.body, { investigateLabel: false })
+        : undefined;
+    const taskType = queuedCommand?.kind === "implement" ? ("implement" as const) : ("resume" as const);
     const launched = await params.launch({
       cfg: params.cfg,
       store: params.store,
@@ -206,8 +225,8 @@ export async function drainNextSessionWork(params: DrainParams): Promise<boolean
       linear: params.linear,
       linearOutbox: params.linearOutbox,
       ticket: current,
-      taskType: "resume",
-      resumeMessage: work.body,
+      taskType,
+      resumeMessage: taskType === "resume" ? work.body : undefined,
       linearContext: `${current.linear_context ?? `# ${current.linear_issue_identifier}`}\n\n## ${heading}\n\n${work.body}`,
     });
     const runId = params.store.getByIssueId(params.ticket.linear_issue_id)?.run_id;
