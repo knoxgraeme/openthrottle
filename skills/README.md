@@ -34,7 +34,9 @@ whatever mechanism that CLI natively supports, decided once in
 
 ## Two loops
 
-- **implement** — plan gate → `ce-work` → local `ce-code-review` → configured
+- **implement** — plan gate → `ce-work` → local `ce-code-review` →
+  conditional `ce-simplify` (only when the diff is large or structurally
+  complex; behavior-preserving, skips noted in the ledger) → configured
   gates (`$OT_TEST_CMD`/`$OT_LINT_CMD`/`$OT_BUILD_CMD`) → `ce-commit-push-pr`
   → resolve the PR URL and retarget it to `$BASE_BRANCH` if needed →
   elicitation-or-response ending in "Assumptions & decisions".
@@ -56,7 +58,7 @@ elicitation.
 
 | OpenThrottle task | Native CE pipeline |
 |---|---|
-| `implement` | `ce-work mode:return-to-caller` → `ce-code-review apply:local` → `ce-commit-push-pr mode:pipeline` |
+| `implement` | `ce-work mode:return-to-caller` → `ce-code-review apply:local` → conditional `ce-simplify` (large/complex diffs only) → `ce-commit-push-pr mode:pipeline` |
 | `investigate` | `ce-debug mode:pipeline`; if it shipped a fix, resolve/create the PR |
 | `resume` | continues the saved native session with the human's or GitHub's follow-up message |
 

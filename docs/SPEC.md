@@ -314,7 +314,9 @@ temporary config containing only project-declared MCP servers with user-only
 setting sources. Project `AGENTS.md` and `.claude/settings.json` files remain
 untouched and editable.
 The adapters compose native CE as follows: `implement` uses `ce-work`, local
-`ce-code-review`, and `ce-commit-push-pr`; `investigate` uses action-capable
+`ce-code-review`, a conditional `ce-simplify` pass (invoked only when the
+branch diff is large or structurally complex; behavior-preserving, with skips
+recorded in the assumptions ledger), and `ce-commit-push-pr`; `investigate` uses action-capable
 `ce-debug mode:pipeline` and, when it converges on a fix, the same
 `ce-commit-push-pr` tail to ship it — divergent findings return as residuals
 instead. Neither loop babysits its own PR (`ce-babysit-pr` and the internal
