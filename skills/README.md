@@ -38,7 +38,9 @@ whatever mechanism that CLI natively supports, decided once in
   conditional `ce-simplify` (only when the diff is large or structurally
   complex; behavior-preserving, skips noted in the ledger) → configured
   gates (`$OT_TEST_CMD`/`$OT_LINT_CMD`/`$OT_BUILD_CMD`) → `ce-commit-push-pr`
-  → resolve the PR URL and retarget it to `$BASE_BRANCH` if needed →
+  → resolve the PR URL and retarget it to `$BASE_BRANCH` if needed → wait for
+  CI to settle (`gh pr checks --watch`, fixing in-scope reds in the same run)
+  → refresh the `## OpenThrottle gates` checklist in the PR description →
   elicitation-or-response ending in "Assumptions & decisions".
 - **investigate** — the debugging analogue: `ce-debug mode:pipeline` (action-
   capable — it may diagnose, fix, verify, commit, and push a convergent bug),
@@ -49,10 +51,13 @@ Neither loop babysits its own PR. Once a PR exists, GitHub-native reviewers
 (bot or human) take over review, and their feedback — reviews, PR comments, CI
 failures — is queued by the supervisor and delivered later as a `resume`
 message in the **same session**, not as a new task and not as a fresh
-context. That resume message is where the triage happens: action clear
-fixes and push, answer non-actionable threads on their own thread with
-reasoning, and batch any decision-required items into one further
-elicitation.
+context. That resume message is where the triage happens: gather the whole
+picture first (`gh pr checks` plus every open review thread and comment), reply
+visibly on **every** item — a change gets a reply naming what was done and the
+commit that addresses it, with the thread resolved; a no-change gets a reply
+with reasoning — wait for CI to go green (fixing in-scope reds in the same run)
+before finalizing, refresh the `## OpenThrottle gates` checklist, and batch any
+decision-required items into one further elicitation.
 
 ## Native CE composition
 
@@ -78,10 +83,20 @@ The adapters remain necessary for contracts that CE does not own:
   items go out as one batched `ot-activity elicitation` decision list
   (context, options, recommendation per item), and the Linear reply resumes
   the same session to action the answers.
-- The no-backlog rule: every review item ends a run fixed and pushed,
-  answered on its thread with reasoning, or escalated as a numbered decision
-  — never silently deferred or dropped. This rule applies identically to the
-  feedback-triage resume that follows a PR, not just the original run.
+- The no-backlog rule: every review item ends a run fixed and pushed with a
+  reply naming the commit that addresses it, answered on its thread with
+  reasoning, or escalated as a numbered decision — never silently deferred or
+  dropped. This rule applies identically to the feedback-triage resume that
+  follows a PR, not just the original run.
+- The CI gate: a run does not finalize while CI is red or still running. After
+  any push, the adapter waits for `gh pr checks` to conclude and fixes in-scope
+  failures in the same run; only genuinely pre-existing/out-of-scope reds are
+  left, and then only as a recorded known gap.
+- The gate checklist: each run writes or refreshes an `## OpenThrottle gates`
+  checklist in the PR description (tests, lint, build, internal review,
+  simplification, CI, review threads) so a human can see which gates completed.
+  A gate that could not run — e.g. one the sandbox OOM-killed (exit 137) — is
+  marked a known gap, never reported as passed.
 - The assumptions ledger: responses and PR descriptions end with an
   "Assumptions & decisions" section so a human can audit every judgment call
   the agent made without asking.

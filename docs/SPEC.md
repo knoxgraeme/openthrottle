@@ -103,9 +103,12 @@ that ticket, bounding durable log storage to the latest captured run.
 - Closing or merging an `ot/*` PR stops an active run, deletes its sandbox,
   and closes the ticket row.
 - All GitHub feedback on an active, PR-backed ticket becomes deduplicated
-  `automatic` session work, each item carrying a triage message (act on clear
-  fixes, answer non-actionable threads with reasoning, batch decision-required
-  items into one elicitation, end with "Assumptions & decisions"): a human
+  `automatic` session work, each item carrying a triage message (gather the
+  full review first via `gh pr checks` and all open threads; reply visibly on
+  every item — actioned items name the fixing commit and resolve the thread,
+  no-change items give reasoning; wait for CI to go green before finalizing;
+  refresh the PR's `## OpenThrottle gates` checklist; batch decision-required
+  items into one elicitation; end with "Assumptions & decisions"): a human
   `CHANGES_REQUESTED` review, a non-self `commented` review (GitHub wraps
   every inline review comment in a `commented` review, so this also covers
   bot inline reviews), a new PR conversation comment, and a failed or
@@ -266,7 +269,12 @@ Required unless noted:
   override the sandbox commit author; unset, the sandbox authors commits as the
   `GITHUB_TOKEN` account's GitHub noreply identity so downstream author-gated
   integrations (e.g. Vercel) accept the deployment.
-- Daytona: `DAYTONA_API_KEY`, `DAYTONA_SNAPSHOT=openthrottle`.
+- Daytona: `DAYTONA_API_KEY`, `DAYTONA_SNAPSHOT=openthrottle`. Snapshot sizing
+  is set when the snapshot is built (`supervisor/scripts/build-snapshot.mjs`)
+  from optional `DAYTONA_SANDBOX_CPU=4` (cores), `DAYTONA_SANDBOX_MEMORY=8`
+  (GiB), and `DAYTONA_SANDBOX_DISK=40` (GiB); the defaults clear Daytona's
+  small default tier, which OOM-kills real pnpm/Turbo monorepo build and
+  type-check gates (SIGKILL / exit 137). Right-size these per fleet.
 - Agents: `CLAUDE_CODE_OAUTH_TOKEN` for Claude subscription login and/or
   `CODEX_AUTH_JSON` for Codex subscription login; `DEFAULT_AGENT=codex`.
 - Limits: `BASE_BRANCH=main`, `MAX_TURNS=200`, `TASK_TIMEOUT=7200`,
@@ -300,7 +308,10 @@ secrets never enter the sandbox.
 1. Materialize model auth files and strip trailing CR/LF from tokens.
 2. Clone/fetch, create or resume `BRANCH_NAME`, and push it immediately.
 3. Install and seal the pre-push boundary and configure token-safe Git auth.
-4. Read `.openthrottle.yml` with supervisor-owned base branch unchanged.
+4. Read `.openthrottle.yml` with supervisor-owned base branch unchanged, and
+   export a default `TURBO_CONCURRENCY=50%` (only when unset) so heavy
+   Turbo-driven build/lint/test gates stay within the sandbox memory cgroup;
+   a repo can override it in `post_bootstrap`.
 5. Run `post_bootstrap` commands.
 6. Start/restart the optional dev server on `0.0.0.0`.
 7. Install OpenThrottle runtime adapters/instructions per agent, then run the
@@ -358,9 +369,16 @@ changes, architecture rework, dependency changes, destructive operations, or
 multiple defensible interpretations) are never implemented without a human
 answer. Clear fixes ship first; remaining items go out as one batched
 `elicitation` decision list whose Linear reply resumes the same session. No
-item is backlogged — each ends fixed, answered on its thread, or escalated —
-and every response and PR description ends with an "Assumptions & decisions"
-section for human audit.
+item is backlogged — each ends fixed and pushed with a reply naming the fixing
+commit, answered on its thread, or escalated — and a run never finalizes while
+CI is red or still running: after any push the adapter waits for `gh pr
+checks` to conclude and fixes in-scope failures in the same run. Every run also
+writes or refreshes an `## OpenThrottle gates` checklist in the PR description
+(tests, lint, build, internal review, simplification, CI, review threads) so a
+human can see which gates completed; a gate that could not run — e.g. one the
+sandbox OOM-killed (exit 137) — is recorded as a known gap, never reported as
+passed. Every response and PR description ends with an "Assumptions &
+decisions" section for human audit.
 `implement`/`investigate` use fresh contexts; `resume` reads
 `~/.ot/agent-session-id` and continues the same Claude session/Codex
 thread/OpenCode session.

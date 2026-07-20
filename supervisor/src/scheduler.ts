@@ -41,10 +41,19 @@ export const LOOP_REGISTRY: Record<"implement" | "investigate", LoopRegistryEntr
 };
 
 const TRIAGE_INSTRUCTIONS =
-  "Triage this feedback the review-fix way: apply the clear fixes, reply on the " +
-  "thread with your reasoning where no change is needed, and batch " +
-  "decision-required items into one elicitation. Leave nothing unaddressed, and " +
-  "end with your assumptions and decisions.";
+  "Triage this feedback the review-fix way. Gather the whole picture before you " +
+  "act: run `gh pr checks` and read every open review thread and comment so you " +
+  "answer the complete review, not one comment at a time. Then reply visibly on " +
+  "EVERY item on its own thread — when you make a change, reply with what you did " +
+  "and the commit that addresses it and resolve the thread; when no change is " +
+  "needed, reply with your reasoning. Batch decision-required items into one " +
+  "elicitation. After pushing any fix, wait for CI to finish with `gh pr checks " +
+  "--watch` and fix in-scope failures in this same run before finalizing — never " +
+  "end while checks are still red or running. Refresh the `## OpenThrottle gates` " +
+  "checklist in the PR description to reflect the true state of every gate (tests, " +
+  "lint, build, CI, review threads), marking anything you could not run — e.g. a " +
+  "gate the sandbox OOM-killed — as a known gap, never as done. Leave nothing " +
+  "unaddressed, and end with your assumptions and decisions.";
 
 export type FeedbackInput =
   | { kind: "review" | "comment"; author: string | undefined; pullNumber: number; url: string; body?: string }

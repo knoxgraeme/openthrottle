@@ -76,6 +76,12 @@ jobs:
         id: build
         env:
           DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
+          # Optional sandbox sizing overrides. Empty repo variables fall through
+          # to the script defaults (4 vCPU / 8 GiB / 40 GiB), which clear the
+          # small default tier that OOM-kills monorepo build gates.
+          DAYTONA_SANDBOX_CPU: ${{ vars.DAYTONA_SANDBOX_CPU }}
+          DAYTONA_SANDBOX_MEMORY: ${{ vars.DAYTONA_SANDBOX_MEMORY }}
+          DAYTONA_SANDBOX_DISK: ${{ vars.DAYTONA_SANDBOX_DISK }}
         run: |
           name="openthrottle-v2-ce-$(git rev-parse --short=7 HEAD)"
           node supervisor/scripts/build-snapshot.mjs "$name"
