@@ -431,6 +431,11 @@ log "phase 6: dev server"
 
 if [[ -n "$CFG_DEV" ]]; then
   log "registering dev server service: ${CFG_DEV} (0.0.0.0:${DEV_PORT})"
+  # Delete any stale definition first so a changed dev command / DEV_PORT (from
+  # an edited .openthrottle.yml on a persistent sprite) actually takes effect —
+  # `services create` fails if one exists, and `restart` only replays the old
+  # stored definition.
+  sprite-env services delete dev >/dev/null 2>&1 || true
   sprite-env services create dev --cmd bash --args "-lc,cd '$REPO_DIR' && exec ${CFG_DEV}" --env "PORT=${DEV_PORT},HOST=0.0.0.0,HOSTNAME=0.0.0.0" --http-port "${DEV_PORT}" --no-stream >/dev/null 2>&1 || sprite-env services restart dev >/dev/null 2>&1 || true
 else
   log "no dev command configured, skipping"

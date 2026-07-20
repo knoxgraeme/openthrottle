@@ -512,8 +512,10 @@ export async function drainSpooledEventsForRun(
     getLinearClient: () => Promise<LinearClient | undefined>;
     linearOutbox: LinearOutboxProcessor;
   },
-  run: Run
+  run: Run,
+  opts: { includeCompletions?: boolean } = {}
 ): Promise<void> {
+  const includeCompletions = opts.includeCompletions ?? true;
   const ticket = deps.store.getByIssueId(run.linear_issue_id);
   if (!ticket?.sandbox_id) return;
   let raws: string[];
@@ -521,39 +523,49 @@ export async function drainSpooledEventsForRun(
     raws = await readSpooledEvents(deps.sprites, ticket.sandbox_id);
   } catch (error) {
     console.warn(
-      `[sweep] could not drain spooled events for ${ticket.linear_issue_identifier}:`,
+      `[drain] could not read spooled events for ${ticket.linear_issue_identifier}:`,
       error
     );
     return;
   }
+  const events: SandboxEvent[] = [];
   for (const raw of raws) {
-    let event: SandboxEvent;
     try {
-      event = parseSandboxEvent(raw);
+      const event = parseSandboxEvent(raw);
+      if (event.run_id === run.id) events.push(event);
     } catch {
-      continue; // ignore anything that is not a well-formed event
+      // ignore anything that is not a well-formed event
     }
-    if (event.run_id !== run.id) continue;
+  }
+  // Activities first, then completions: a spooled elicitation must be recorded
+  // before any spooled completion finalizes the run's terminal decision.
+  for (const event of events) {
+    if (event.kind !== "activity") continue;
     try {
-      if (event.kind === "completion") {
-        await completeRun(deps, {
-          runId: event.run_id,
-          token: event.token,
-          exitCode: event.exit_code,
-          costUsd: event.cost_usd,
-          prUrl: event.pr_url,
-          failureTail: event.failure_tail,
-          finalResponse: event.final_response,
-        });
-      } else {
-        const current = deps.store.getRun(run.id);
-        const currentTicket = deps.store.getByIssueId(run.linear_issue_id);
-        if (current && currentTicket) {
-          await recordSandboxActivity(deps.store, deps.linearOutbox, current, currentTicket, event);
-        }
+      const current = deps.store.getRun(run.id);
+      const currentTicket = deps.store.getByIssueId(run.linear_issue_id);
+      if (current && currentTicket) {
+        await recordSandboxActivity(deps.store, deps.linearOutbox, current, currentTicket, event);
       }
     } catch (error) {
-      console.warn(`[sweep] failed to apply spooled event ${event.event_id}:`, error);
+      console.warn(`[drain] failed to apply spooled activity ${event.event_id}:`, error);
+    }
+  }
+  if (!includeCompletions) return;
+  for (const event of events) {
+    if (event.kind !== "completion") continue;
+    try {
+      await completeRun(deps, {
+        runId: event.run_id,
+        token: event.token,
+        exitCode: event.exit_code,
+        costUsd: event.cost_usd,
+        prUrl: event.pr_url,
+        failureTail: event.failure_tail,
+        finalResponse: event.final_response,
+      });
+    } catch (error) {
+      console.warn(`[drain] failed to apply spooled completion ${event.event_id}:`, error);
     }
   }
 }
@@ -1113,11 +1125,25 @@ export function createServer(deps: ServerDeps): Hono {
       return context.json({ error: "invalid callback body" }, 400);
     }
     const data = body as Record<string, unknown>;
+    const runId = context.req.param("id");
+    const token = bearerToken(context.req.header("Authorization"));
+    // Before finalizing, record any activities the sandbox spooled to disk when
+    // a push failed (e.g. a decision elicitation): completeRun's terminal
+    // decision reads the last processed activity, so a lost elicitation would
+    // otherwise become a generic success or trigger a premature re-review.
+    const pending = store.getRun(runId);
+    if (pending && pending.status === "running" && token && hashesMatch(pending.token_hash, tokenHash(token))) {
+      await drainSpooledEventsForRun(
+        { cfg, store, sprites, getLinearClient, linearOutbox: linearOutboxProcessor },
+        pending,
+        { includeCompletions: false }
+      ).catch((error) => console.warn("[complete] spooled-activity drain failed:", error));
+    }
     const result = await completeRun(
       { cfg, store, sprites, getLinearClient, linearOutbox: linearOutboxProcessor, schedule },
       {
-        runId: context.req.param("id"),
-        token: bearerToken(context.req.header("Authorization")),
+        runId,
+        token,
         exitCode: data.exit_code,
         costUsd: data.cost_usd,
         prUrl: data.pr_url,
