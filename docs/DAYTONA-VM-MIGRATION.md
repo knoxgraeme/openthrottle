@@ -118,6 +118,13 @@ Fork is optional to *ship* — the baseline VM switch (Phases 1–3) is valuable
 its own for isolation — but it's the capability that makes VM worth it over Kata,
 so it's planned, not merely deferred.
 
+**Caveat: fork is currently experimental.** The SDK exposes it as
+`_experimental_fork({ name? }, timeout?): Promise<Sandbox>` — the `_experimental_`
+prefix means the API is not GA and may change or be unstable. The Phase-0 spike
+must exercise it directly before Phase 4 commits to it; the baseline VM switch
+(Phases 1–3, the isolation win) does **not** depend on fork, so it's safe to ship
+first and adopt fork only once its stability is confirmed.
+
 ## Cutover
 
 Same-provider tier change → a normal deploy, and the two tiers can coexist by
@@ -145,5 +152,6 @@ migration.
 | **VM snapshot build path unknown** | The one real unknown; Phase 0 Q1. Pivots Phase 1 between trivial and moderate. |
 | VM boot ~2s + higher cost | Negligible latency for our minutes-long runs; confirm the price delta in Phase 0. |
 | Feature parity on VM tier | Expected identical (SDK abstracts sandbox type); Phase 0 Q4 verifies before any code. |
+| **Fork is experimental** (`_experimental_fork`) | Not GA; may change/be unstable. Baseline VM switch (Phases 1–3) doesn't depend on it — ship isolation first, adopt fork only after the spike confirms stability. |
 | Fork golden staleness | Cache keyed on lockfile/base-commit, cold-install fallback (Phase 4), not a frozen snapshot. |
 | Daytona closed-source (Jun 2026) | Transparency downgrade, not a reliability issue; noted for vendor risk. |
