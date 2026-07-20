@@ -2226,6 +2226,9 @@ describe("createServer lifecycle", () => {
       state: "started",
       process: {
         getEntrypointLogs: vi.fn(async () => ({ output: "safe ghp_abcdefghijklmnop" })),
+        // The preview probes the dev server first; a real HTTP status means it
+        // is serving, so the endpoint redirects to the signed preview.
+        executeCommand: vi.fn(async () => ({ exitCode: 0, result: "OT_DEV_STATUS:200\n<html>ok</html>" })),
       },
       getSignedPreviewUrl: vi.fn(async () => ({ url: "https://preview.test/signed" })),
     };
@@ -2261,6 +2264,51 @@ describe("createServer lifecycle", () => {
     });
     expect(durableLogsResponse.status).toBe(200);
     expect(await durableLogsResponse.text()).toBe("durable [REDACTED]");
+  });
+
+  it("shows the sanitized dev-server log on the preview when nothing is listening", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-preview",
+      linear_issue_identifier: "OT-PREVIEW",
+      linear_session_id: "session-preview",
+      sandbox_id: "sandbox-preview",
+      branch: "ot/ot-preview",
+      agent: "claude",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+    });
+    const previewToken = "preview-token";
+    store.setPreviewTokenHash(
+      "issue-preview",
+      createHash("sha256").update(previewToken).digest("hex")
+    );
+    const sandbox = {
+      state: "started",
+      process: {
+        // 000 = curl could not connect: the dev server is not listening.
+        executeCommand: vi.fn(async () => ({
+          exitCode: 0,
+          result: "OT_DEV_STATUS:000\nError: dev server crashed ghp_abcdefghijklmnop",
+        })),
+      },
+      getSignedPreviewUrl: vi.fn(async () => ({ url: "https://preview.test/signed" })),
+    };
+    const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
+    const app = createServer({ cfg, store, daytona, getLinearClient: async () => undefined });
+
+    const response = await app.request(`/preview/OT-PREVIEW?token=${previewToken}`);
+    expect(response.status).toBe(200);
+    const html = await response.text();
+    expect(html).toContain("Dev server not responding");
+    expect(html).toContain("Error: dev server crashed");
+    // The dev log is sanitized before it is rendered.
+    expect(html).toContain("[REDACTED]");
+    expect(html).not.toContain("ghp_abcdefghijklmnop");
+    // No redirect to a dead signed preview URL.
+    expect(sandbox.getSignedPreviewUrl).not.toHaveBeenCalled();
   });
 
   it("merges from Linear only after GitHub reports terminal green checks", async () => {

@@ -163,6 +163,37 @@ export async function getSignedPreviewUrl(
   return preview.url;
 }
 
+export interface DevServerProbe {
+  // A dev server responded on the port (any HTTP status, including its own 5xx
+  // error page) — the preview should redirect so that page is shown as-is.
+  listening: boolean;
+  // The latest dev-server log tail, shown when nothing is listening so the
+  // startup/crash error is still visible instead of a blank connection refusal.
+  log: string;
+}
+
+// Wakes the sandbox and checks whether the dev server is actually serving on
+// `port`, capturing the dev log either way. Used by the wake-on-click preview
+// so a stale or crashed dev server surfaces its error rather than a dead link.
+export async function probeDevServer(
+  daytona: Daytona,
+  sandboxId: string,
+  port: number
+): Promise<DevServerProbe> {
+  const sandbox = await daytona.get(sandboxId);
+  if (sandbox.state !== "started") await sandbox.start(60);
+  if (!sandbox.process?.executeCommand) return { listening: false, log: "" };
+  const command =
+    `code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:${port}/ 2>/dev/null || echo 000); ` +
+    `printf 'OT_DEV_STATUS:%s\\n' "$code"; ` +
+    `tail -c 16000 /home/agent/.ot/dev.log 2>/dev/null || true`;
+  const result = await sandbox.process.executeCommand(command, undefined, undefined, 10);
+  const output = result.result ?? "";
+  const code = output.match(/OT_DEV_STATUS:(\d{3})/)?.[1] ?? "000";
+  const log = output.replace(/OT_DEV_STATUS:\d{3}\r?\n?/, "");
+  return { listening: code !== "000", log };
+}
+
 export async function getSandboxLogs(daytona: Daytona, sandboxId: string): Promise<string> {
   const sandbox = await daytona.get(sandboxId);
   if (sandbox.state !== "started") await sandbox.start(60);

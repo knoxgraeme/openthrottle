@@ -111,6 +111,11 @@ replace of the wake-on-click workspace preview (fresh per-ticket token) plus the
 Pull Request link when one exists — so both stay visible and valid in whatever
 run the user is viewing, not only the run that created the workspace. The
 preview URL is also echoed into that run's "Started"/"Created workspace" action.
+Opening the preview wakes the sandbox and probes the dev server: if it responds
+(any HTTP status, including its own error page) the request redirects to the
+signed preview; if nothing is listening — crashed, never configured, or idle —
+the endpoint serves the sanitized dev-server log instead, so the error is
+visible rather than a dead connection-refused link.
 
 Before finalizing an outbox completion, Fly reads a fixed-size tail of
 `~/.ot/task.log`, sanitizes it (including the one-time callback token), and
@@ -200,7 +205,7 @@ row until retry/redrive.
 | `POST` | `/repositories/register` | `OT_STATUS_TOKEN` bearer | verify and upsert a target route/webhook |
 | `POST` | `/tickets/:id/stop` | `OT_STATUS_TOKEN` bearer | stop a ticket |
 | `GET` | `/tickets/:id/logs` | `OT_STATUS_TOKEN` bearer | sanitized live logs, falling back to the latest durable private run tail |
-| `GET` | `/preview/:id?token=` | per-ticket token | wake and signed redirect |
+| `GET` | `/preview/:id?token=` | per-ticket token | wake, then redirect to the dev server or show its error log |
 | `POST` | `/runs/:id/complete` | one-time run bearer | consume run result |
 
 Linear OAuth uses `actor=app`, scopes

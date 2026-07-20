@@ -17,7 +17,7 @@ import {
   verifyGithubSignature,
   type GithubWebhookEvent,
 } from "./github.js";
-import { getSandboxLogs, getSignedPreviewUrl } from "./daytona.js";
+import { getSandboxLogs, getSignedPreviewUrl, probeDevServer } from "./daytona.js";
 import { MAX_PRIVATE_LOG_TAIL_CHARS } from "./logs.js";
 import { sanitizeText } from "./sanitize.js";
 import {
@@ -474,9 +474,32 @@ export function createServer(deps: ServerDeps): Hono {
       return context.text("unauthorized", 401);
     }
     try {
-      return context.redirect(
-        await getSignedPreviewUrl(daytona, ticket.sandbox_id, cfg.devPort),
-        302
+      // Probe the dev server first. If it responds at all (even its own error
+      // page), redirect so that page shows as-is. If nothing is listening —
+      // the dev server crashed, was never configured, or the workspace went
+      // idle — keep the preview useful by serving the dev log so the error is
+      // visible instead of a dead connection-refused link. A probe failure
+      // falls back to the plain redirect (previous behavior).
+      let probe: { listening: boolean; log: string };
+      try {
+        probe = await probeDevServer(daytona, ticket.sandbox_id, cfg.devPort);
+      } catch (error) {
+        console.warn("[preview] dev-server probe failed, redirecting anyway:", error);
+        probe = { listening: true, log: "" };
+      }
+      if (probe.listening) {
+        return context.redirect(
+          await getSignedPreviewUrl(daytona, ticket.sandbox_id, cfg.devPort),
+          302
+        );
+      }
+      return context.html(
+        renderDevPreviewErrorPage(
+          ticket.linear_issue_identifier,
+          cfg.devPort,
+          sanitizeText(probe.log).slice(-MAX_PRIVATE_LOG_TAIL_CHARS)
+        ),
+        200
       );
     } catch (error) {
       console.error("[preview] failed:", error);
@@ -485,4 +508,30 @@ export function createServer(deps: ServerDeps): Hono {
   });
 
   return app;
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+// Rendered when the wake-on-click preview finds no dev server listening, so the
+// operator sees the actual startup/crash log (or a clear "no dev server" note)
+// rather than a blank connection refusal.
+function renderDevPreviewErrorPage(identifier: string, port: number, log: string): string {
+  const body = log.trim()
+    ? `<pre>${escapeHtml(log)}</pre>`
+    : `<p>No dev-server output was captured. This repository may not configure a <code>dev</code> command, or the workspace has been idle and the dev server is no longer running.</p>`;
+  return (
+    `<!doctype html><html lang="en"><head><meta charset="utf-8">` +
+    `<meta name="viewport" content="width=device-width, initial-scale=1">` +
+    `<title>Preview unavailable — ${escapeHtml(identifier)}</title>` +
+    `<style>body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;margin:2rem;max-width:64rem;line-height:1.5}` +
+    `h1{font-size:1.25rem}pre{white-space:pre-wrap;word-break:break-word;background:#111;color:#eee;padding:1rem;border-radius:8px;overflow:auto;max-height:70vh}</style>` +
+    `</head><body><h1>Dev server not responding for ${escapeHtml(identifier)}</h1>` +
+    `<p>Nothing is serving on port ${port}. Here is the latest dev-server log so the error is visible:</p>` +
+    `${body}</body></html>`
+  );
 }
