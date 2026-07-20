@@ -29,6 +29,13 @@ Two core loops, one continuation mechanism, Linear as the control plane:
   either source: a human reply in Linear, or GitHub feedback (reviews,
   comments, CI failures) queued as session work.
 
+Decision recorded: always-resume means session context grows across feedback
+rounds instead of each fix starting clean. Accepted — the external reviewers
+provide the fresh eyes, actioning benefits from the implementation context,
+the loop is bounded by `REVIEW_MAX_ROUNDS`, and the agent can delegate
+subtasks to its native subagents to keep the main session lean. Re-delegation
+is the pressure valve if a long-lived session degrades.
+
 Role contract:
 
 - **Linear is the control plane.** All human intent enters through it
@@ -138,6 +145,11 @@ The "what runs next" policy is currently spread across `completeRun`,
    `pending_re_review` logic.) `completeRun` and the webhook handlers reduce
    to event normalization plus scheduler calls. Pure-function core so
    transitions are table-testable without Daytona/Linear fakes.
+   Structure the table as a **loop registry**: each entry maps a task name to
+   its entry skill, CE pipeline declaration, and the events that may trigger
+   it. The scheduler consults the registry rather than hard-coding task
+   names, so a future pipeline is added by registering an entry plus a
+   canonical skill (Phase 3) — no handler changes.
 2. **`commands.ts`.** Centralize `/stop`, `/merge`, and the
    `investigate` + `fix it|implement|go ahead` promotion heuristic. Add an
    explicit `/implement` command; keep the regex as a deprecated alias for
@@ -222,6 +234,18 @@ servers). This deliberately amends security invariant 1.
    SPEC invariant 1 to enumerate excluded keys instead of a blanket claim.
 
 ## Future work (recorded, not scheduled)
+
+**Swappable skill pipelines.** The end state Phases 2–3 build toward: adding
+a new loop (e.g. a docs pipeline, a migration pipeline, a different vendor's
+skill suite) means writing one canonical skill, declaring its CE/native
+pipeline, and adding a loop-registry entry — the supervisor, sandbox
+entrypoint, outbox contract, and Linear publication are untouched because
+they only ever see the loop interface (task name, env contract, `ot-activity`
+events, completion marker). The registry entry also declares which triggers
+may start the loop, so new pipelines cannot be started by events they don't
+opt into. `sandbox/lib/runtime.sh`'s `task_skill_name`/`task_ce_pipeline`
+maps should derive from the same registry data (baked into the snapshot at
+build time) so the loop definition lives in exactly one place.
 
 **Investigate → ticket → implement.** An investigate loop that plans a fix
 should be able to queue that work as a new Linear ticket that re-enters the
