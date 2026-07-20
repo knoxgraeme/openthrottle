@@ -227,7 +227,8 @@ export async function launchExistingTask(params: {
         taskType: params.taskType,
         run,
         resumeMessage: params.resumeMessage,
-        codexAuthJson: await getCodexAuthForSeed(cfg, store),
+        codexAuthJson:
+          ticket.agent === "codex" ? await getCodexAuthForSeed(cfg, store) : undefined,
       }),
       linearContext:
         params.linearContext ??

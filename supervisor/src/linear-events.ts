@@ -380,7 +380,8 @@ async function handleCreated(
     ticket,
     taskType,
     run,
-    codexAuthJson: await getCodexAuthForSeed(cfg, store),
+    codexAuthJson:
+      ticket.agent === "codex" ? await getCodexAuthForSeed(cfg, store) : undefined,
   });
   let sandbox;
   try {

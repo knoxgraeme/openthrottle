@@ -147,6 +147,55 @@ describe("sandbox event contracts", () => {
       .toBe("processed");
   });
 
+  it("captures rotated agent auth before finishing the run", async () => {
+    const store = seedRunningTicket();
+    const completion = Buffer.from(JSON.stringify({
+      version: 1,
+      kind: "completion",
+      event_id: "44444444-4444-4444-8444-444444444444",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:01.000Z",
+      token: "callback-token-123",
+      exit_code: 0,
+    }));
+    const files = new Map([["/home/agent/.ot/outbox/001.json", completion]]);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      process: { executeCommand: vi.fn(async () => ({ exitCode: 0, result: "" })) },
+      fs: {
+        listFiles: vi.fn(async () =>
+          [...files.entries()].map(([path, value]) => ({
+            name: path.split("/").at(-1), path, size: value.length, isDir: false,
+          }))
+        ),
+        downloadFile: vi.fn(async (path: string) => files.get(path)!),
+        deleteFile: vi.fn(async (path: string) => files.delete(path)),
+      },
+    } as unknown as Sandbox;
+    const order: string[] = [];
+    const captureAgentAuth = vi.fn(async () => {
+      order.push("capture");
+    });
+    const finishCompletion = vi.fn(async () => {
+      order.push("finish");
+      return { status: 200 };
+    });
+
+    await pollSandboxEvents({
+      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      store,
+      postActivity: vi.fn(async () => undefined),
+      finishCompletion,
+      captureAgentAuth,
+    });
+
+    expect(captureAgentAuth).toHaveBeenCalledOnce();
+    expect(captureAgentAuth).toHaveBeenCalledWith(sandbox, expect.objectContaining({ agent: "codex" }));
+    expect(order).toEqual(["capture", "finish"]);
+  });
+
   it("retries a failed activity before processing the completion behind it", async () => {
     const store = seedRunningTicket();
     const activityId = "55555555-5555-4555-8555-555555555555";
