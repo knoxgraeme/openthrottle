@@ -1,12 +1,11 @@
 import { serve } from "@hono/node-server";
-import { Daytona } from "@daytona/sdk";
+import { SpritesClient } from "./sprites.js";
 import { loadConfig } from "./config.js";
 import { openDb, createTicketStore } from "./db.js";
-import { completeRun, createServer, createServerWebhookDeliveryProcessor } from "./server.js";
+import { createServer, createServerWebhookDeliveryProcessor } from "./server.js";
 import { runSweep } from "./sweep.js";
 import { createLinearClientProvider } from "./linear-auth.js";
-import { pollSandboxEvents } from "./sandbox-events.js";
-import { activityPayload, createLinearOutboxProcessor } from "./linear-outbox.js";
+import { createLinearOutboxProcessor } from "./linear-outbox.js";
 
 const SWEEP_INTERVAL_MS = 15 * 60 * 1000; // run every 15 min while awake; SPEC only requires "on every boot" + periodic while awake
 const DELIVERY_DRAIN_INTERVAL_MS = 30 * 1000;
@@ -17,13 +16,13 @@ async function main() {
   const db = openDb(cfg.databasePath);
   const store = createTicketStore(db);
 
-  const daytona = new Daytona({ apiKey: cfg.daytonaApiKey });
+  const sprites = new SpritesClient(cfg.spriteToken, { baseURL: cfg.spritesApiUrl });
   const getLinearClient = createLinearClientProvider(cfg, store);
   const linearOutboxProcessor = createLinearOutboxProcessor({ store, getLinearClient });
   const deliveryProcessor = createServerWebhookDeliveryProcessor({
     cfg,
     store,
-    daytona,
+    sprites,
     getLinearClient,
     linearOutbox: linearOutboxProcessor,
   });
@@ -31,61 +30,22 @@ async function main() {
   const app = createServer({
     cfg,
     store,
-    daytona,
+    sprites,
     getLinearClient,
     deliveryProcessor,
     linearOutboxProcessor,
   });
 
-  let sandboxPollRunning = false;
-  const pollActiveSandboxes = async () => {
-    if (sandboxPollRunning) return;
-    sandboxPollRunning = true;
-    try {
-      await pollSandboxEvents({
-        daytona,
-        store,
-        postActivity: async (activity, event) => {
-          const row = store.enqueueLinearOutbox({
-            id: event.event_id,
-            linearSessionId: activity.sessionId,
-            issueId: event.issueId,
-            runId: event.run_id,
-            kind: "activity",
-            payload: activityPayload(activity),
-          });
-          await linearOutboxProcessor.process(row.id);
-        },
-        finishCompletion: (completion) =>
-          completeRun(
-            {
-              cfg,
-              store,
-              daytona,
-              getLinearClient,
-              linearOutbox: linearOutboxProcessor,
-              schedule: (task) => void task.catch((error) =>
-                console.error("[sandbox-events] follow-up task failed:", error)
-              ),
-            },
-            completion
-          ),
-      });
-    } finally {
-      sandboxPollRunning = false;
-    }
-  };
-
   serve({ fetch: app.fetch, port: cfg.port }, (info) => {
     console.log(`[supervisor] listening on :${info.port}`);
   });
 
-  // Run once on boot, then on an interval while the process stays awake.
+  // Sandbox events arrive by push (POST /runs/:id/events + /runs/:id/complete),
+  // so there is no sandbox poll loop; the sweep is the only sandbox-touching timer.
   deliveryProcessor.drain().catch((err) => console.error("[webhooks] boot drain failed:", err));
   linearOutboxProcessor.drain().catch((err) => console.error("[linear-outbox] boot drain failed:", err));
-  pollActiveSandboxes().catch((err) => console.error("[sandbox-events] boot poll failed:", err));
   getLinearClient()
-    .then((linear) => runSweep(daytona, store, linear, cfg))
+    .then((linear) => runSweep(sprites, store, linear, cfg))
     .catch((err) => console.error("[sweep] boot sweep failed:", err));
   setInterval(() => {
     deliveryProcessor
@@ -96,13 +56,8 @@ async function main() {
       .catch((err) => console.error("[linear-outbox] interval drain failed:", err));
   }, DELIVERY_DRAIN_INTERVAL_MS).unref();
   setInterval(() => {
-    pollActiveSandboxes().catch((err) =>
-      console.error("[sandbox-events] interval poll failed:", err)
-    );
-  }, cfg.sandboxEventPollIntervalMs).unref();
-  setInterval(() => {
     getLinearClient()
-      .then((linear) => runSweep(daytona, store, linear, cfg))
+      .then((linear) => runSweep(sprites, store, linear, cfg))
       .catch((err) => console.error("[sweep] interval sweep failed:", err));
   }, SWEEP_INTERVAL_MS).unref();
 

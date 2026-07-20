@@ -5,7 +5,7 @@
 // index.ts/sweep.ts.
 
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import type { Daytona } from "@daytona/sdk";
+import type { SpritesClient } from "./sprites.js";
 import type { Config } from "./config.js";
 import type { Agent, Run, TaskType, Ticket, TicketStore } from "./db.js";
 import type { LinearClient } from "./linear.js";
@@ -14,8 +14,7 @@ import {
   isGithubPullRequestUrl,
   parsePullRequestUrl,
 } from "./github.js";
-import { startTask, type SandboxEnvContract } from "./daytona.js";
-import { reconcileSandboxAutostop } from "./sandbox-lifecycle.js";
+import { startTask, type SandboxEnvContract } from "./sprites.js";
 import { MAX_PRIVATE_LOG_TAIL_CHARS } from "./logs.js";
 import { sanitizeText } from "./sanitize.js";
 import {
@@ -39,39 +38,6 @@ export function tokenHash(token: string): string {
 export function hashesMatch(left: string, right: string): boolean {
   if (!/^[a-f\d]{64}$/i.test(left) || !/^[a-f\d]{64}$/i.test(right)) return false;
   return timingSafeEqual(Buffer.from(left, "hex"), Buffer.from(right, "hex"));
-}
-
-export async function settleSandboxAfterRun(params: {
-  daytona: Daytona;
-  store: TicketStore;
-  ticket: Ticket;
-  taskType: TaskType;
-}): Promise<void> {
-  const { daytona, store, ticket, taskType } = params;
-  if (!ticket.sandbox_id) return;
-
-  try {
-    await reconcileSandboxAutostop({
-      daytona,
-      store,
-      issueId: ticket.linear_issue_id,
-      sandboxId: ticket.sandbox_id,
-    });
-  } catch (error) {
-    console.error(
-      `[daytona] ${taskType} completed but sandbox ${ticket.sandbox_id} could not be reconciled:`,
-      error
-    );
-  }
-}
-
-export function scheduleSandboxSettlement(
-  params: Parameters<typeof settleSandboxAfterRun>[0],
-  schedule?: (task: Promise<void>) => void
-): void {
-  const task = settleSandboxAfterRun(params);
-  if (schedule) schedule(task);
-  else void task.catch((error) => console.error("[daytona] sandbox settlement failed:", error));
 }
 
 export function pickAgent(labels: string[], defaultAgent: Agent): Agent {
@@ -171,6 +137,7 @@ export function baseSandboxEnv(
     LINEAR_ISSUE_IDENTIFIER: params.ticket.linear_issue_identifier,
     RUN_ID: params.run.id,
     RUN_CALLBACK_TOKEN: params.run.token,
+    SUPERVISOR_URL: cfg.supervisorUrl,
     RESUME_MESSAGE: params.resumeMessage,
     CLAUDE_CODE_OAUTH_TOKEN:
       params.ticket.agent === "claude" ? cfg.claudeCodeOauthToken : undefined,
@@ -187,7 +154,7 @@ export function baseSandboxEnv(
 export async function launchExistingTask(params: {
   cfg: Config;
   store: TicketStore;
-  daytona: Daytona;
+  sprites: SpritesClient;
   linear: LinearClient;
   linearOutbox: LinearOutboxProcessor;
   ticket: Ticket;
@@ -195,7 +162,7 @@ export async function launchExistingTask(params: {
   resumeMessage?: string;
   linearContext?: string;
 }): Promise<boolean> {
-  const { cfg, store, daytona, ticket } = params;
+  const { cfg, store, sprites, ticket } = params;
   if (!ticket.sandbox_id) return false;
   if (!hasAgentSubscription(cfg, ticket.agent)) {
     await tryPostError(
@@ -218,8 +185,7 @@ export async function launchExistingTask(params: {
   }
 
   try {
-    const sandbox = await daytona.get(ticket.sandbox_id);
-    await startTask(sandbox, {
+    await startTask(sprites, ticket.sandbox_id, {
       env: baseSandboxEnv(cfg, {
         ticket,
         taskType: params.taskType,
@@ -240,7 +206,6 @@ export async function launchExistingTask(params: {
       failureTail: message,
       ticketState: "error",
     });
-    scheduleSandboxSettlement({ daytona, store, ticket, taskType: params.taskType });
     await tryPostError(store, params.linearOutbox, ticket.linear_session_id, ticket.linear_issue_id, message);
     return false;
   }
@@ -264,7 +229,7 @@ export async function completeRun(
   deps: {
     cfg: Config;
     store: TicketStore;
-    daytona: Daytona;
+    sprites: SpritesClient;
     getLinearClient: () => Promise<LinearClient | undefined>;
     linearOutbox?: LinearOutboxProcessor;
     schedule?: (task: Promise<void>) => void;
@@ -332,15 +297,8 @@ export async function completeRun(
     return { status: 409, body: { error: "run no longer active" } };
   }
 
-  scheduleSandboxSettlement(
-    {
-      daytona: deps.daytona,
-      store: deps.store,
-      ticket,
-      taskType: run.task_type,
-    },
-    deps.schedule
-  );
+  // Sprites idle-pause the microVM natively once the run service self-stops, so
+  // there is no autostop/settlement to schedule here.
   const terminalActivity = lastTerminalSandboxActivity(deps.store, run.id);
   const pausedOnDecisions = exitCode === 0 && terminalActivity === "elicitation";
   const sessionId = run.linear_session_id ?? ticket.linear_session_id;
@@ -412,7 +370,7 @@ export async function completeRun(
       const task = drainNextSessionWork({
         cfg: deps.cfg,
         store: deps.store,
-        daytona: deps.daytona,
+        sprites: deps.sprites,
         linear,
         linearOutbox: outbox,
         ticket,
@@ -436,7 +394,6 @@ async function postReviewNudge(cfg: Config, ticket: Ticket, prUrl: string | unde
 }
 
 export async function expireRun(
-  daytona: Daytona,
   store: TicketStore,
   linearOutbox: LinearOutboxProcessor,
   run: Run
@@ -450,7 +407,7 @@ export async function expireRun(
     ticketState: "error",
   });
   if (ticket) {
-    scheduleSandboxSettlement({ daytona, store, ticket, taskType: run.task_type });
+    // Sprites idle-pause natively; no settlement needed on timeout.
     await tryPostError(
       store,
       linearOutbox,

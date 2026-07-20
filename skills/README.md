@@ -3,7 +3,7 @@
 These are thin OpenThrottle task adapters. They connect Fly's deterministic
 task state machine, branch boundary, activity outbox, and Linear/GitHub
 publication contract to native Compound Engineering skills installed in the
-Daytona image.
+sandbox by `sandbox/provision.sh`.
 
 ```text
 skills/
@@ -62,7 +62,7 @@ elicitation.
 | `investigate` | `ce-debug mode:pipeline`; if it shipped a fix, resolve/create the PR |
 | `resume` | continues the saved native session with the human's or GitHub's follow-up message |
 
-The snapshot installs the official `compound-engineering` plugin natively for
+`provision.sh` installs the official `compound-engineering` plugin natively for
 Claude Code, Codex, and OpenCode from one commit-pinned marketplace checkout. Do not
 copy CE source into this directory or into target repositories: native install
 preserves its skill-local reviewer/research assets and makes every target repo

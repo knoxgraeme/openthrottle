@@ -3,7 +3,7 @@
 // `automatic` session work that resumes the original session; there is no
 // more separate `review`/`review-fix` choreography. Split out of server.ts.
 
-import type { Daytona } from "@daytona/sdk";
+import type { SpritesClient } from "./sprites.js";
 import type { Config } from "./config.js";
 import type { TicketStore } from "./db.js";
 import { type LinearClient } from "./linear.js";
@@ -35,7 +35,7 @@ async function selfGithubLogin(cfg: Config): Promise<string | undefined> {
 export async function handleGithubEvent(
   cfg: Config,
   store: TicketStore,
-  daytona: Daytona,
+  sprites: SpritesClient,
   getLinearClient: () => Promise<LinearClient | undefined>,
   linearOutbox: LinearOutboxProcessor,
   event: GithubWebhookEvent
@@ -50,7 +50,7 @@ export async function handleGithubEvent(
     if (event.action === "closed") {
       await closeTicketForPullRequest({
         store,
-        daytona,
+        sprites,
         linear,
         linearOutbox,
         ticket,
@@ -91,7 +91,7 @@ export async function handleGithubEvent(
     await enqueueFeedbackWork({
       cfg,
       store,
-      daytona,
+      sprites,
       linear,
       linearOutbox,
       ticket,
@@ -134,7 +134,7 @@ export async function handleGithubEvent(
     await enqueueFeedbackWork({
       cfg,
       store,
-      daytona,
+      sprites,
       linear,
       linearOutbox,
       ticket,
@@ -189,7 +189,7 @@ export async function handleGithubEvent(
   await enqueueFeedbackWork({
     cfg,
     store,
-    daytona,
+    sprites,
     linear,
     linearOutbox,
     ticket,

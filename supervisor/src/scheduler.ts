@@ -8,7 +8,7 @@
 // depend on the scheduler for draining after a completed run without the
 // scheduler depending back on run-lifecycle.ts for launching a task.
 
-import type { Daytona } from "@daytona/sdk";
+import type { SpritesClient } from "./sprites.js";
 import type { Config } from "./config.js";
 import type { Ticket, TicketStore } from "./db.js";
 import type { LinearClient } from "./linear.js";
@@ -116,7 +116,7 @@ export function shouldNudgeAfterRun(params: {
 export type LaunchExistingTask = (params: {
   cfg: Config;
   store: TicketStore;
-  daytona: Daytona;
+  sprites: SpritesClient;
   linear: LinearClient;
   linearOutbox: LinearOutboxProcessor;
   ticket: Ticket;
@@ -154,7 +154,7 @@ async function postRoundsExhausted(params: {
 export interface DrainParams {
   cfg: Config;
   store: TicketStore;
-  daytona: Daytona;
+  sprites: SpritesClient;
   linear: LinearClient;
   linearOutbox: LinearOutboxProcessor;
   ticket: Ticket;
@@ -221,7 +221,7 @@ export async function drainNextSessionWork(params: DrainParams): Promise<boolean
     const launched = await params.launch({
       cfg: params.cfg,
       store: params.store,
-      daytona: params.daytona,
+      sprites: params.sprites,
       linear: params.linear,
       linearOutbox: params.linearOutbox,
       ticket: current,
@@ -245,7 +245,7 @@ export async function drainNextSessionWork(params: DrainParams): Promise<boolean
 export async function enqueueFeedbackWork(params: {
   cfg: Config;
   store: TicketStore;
-  daytona: Daytona;
+  sprites: SpritesClient;
   linear: LinearClient;
   linearOutbox: LinearOutboxProcessor;
   ticket: Ticket;

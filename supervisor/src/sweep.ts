@@ -1,22 +1,23 @@
-import type { Daytona } from "@daytona/sdk";
 import type { Config } from "./config.js";
 import type { TicketStore } from "./db.js";
-import { deleteSandbox, listLabeledSandboxes } from "./daytona.js";
+import type { SpritesClient } from "./sprites.js";
+import { deleteSandbox, listLabeledSandboxes } from "./sprites.js";
 import { commentCreate, type LinearClient } from "./linear.js";
 import { createLinearOutboxProcessor } from "./linear-outbox.js";
-import { expireRun } from "./server.js";
+import { drainSpooledEventsForRun, expireRun } from "./server.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Cron sweep, per SPEC "Event flows > 4. Sweep":
+ *  - overdue runs → best-effort drain of any events the sandbox spooled to disk
+ *    (push-failure fallback), then time out whatever is still running.
  *  - active rows older than SWEEP_MAX_AGE_DAYS with no PR → notify + delete
  *    sandbox + mark `expired`.
- *  - Daytona sandboxes labeled openthrottle=true with no matching DB row →
- *    delete (orphans).
+ *  - Sprites labeled `ot-*` with no matching DB row → delete (orphans).
  */
 export async function runSweep(
-  daytona: Daytona,
+  sprites: SpritesClient,
   store: TicketStore,
   linear: LinearClient | undefined,
   cfg: Config
@@ -25,18 +26,26 @@ export async function runSweep(
     store,
     getLinearClient: async () => linear,
   });
+  const getLinearClient = async () => linear;
   for (const run of store.listExpiredRuns(new Date().toISOString())) {
-    await expireRun(daytona, store, linearOutbox, run);
+    await drainSpooledEventsForRun(
+      { cfg, store, sprites, getLinearClient, linearOutbox },
+      run
+    );
+    const current = store.getRun(run.id);
+    if (current?.status === "running") {
+      await expireRun(store, linearOutbox, current);
+    }
   }
-  await expireStaleTickets(daytona, store, linear, cfg);
-  await deleteOrphanSandboxes(daytona, store, cfg);
+  await expireStaleTickets(sprites, store, linear, cfg);
+  await deleteOrphanSandboxes(sprites, store, cfg);
   const retentionCutoff = new Date(Date.now() - 7 * DAY_MS).toISOString();
   store.pruneDeliveries(retentionCutoff);
   store.pruneSandboxEvents(retentionCutoff);
 }
 
 async function expireStaleTickets(
-  daytona: Daytona,
+  sprites: SpritesClient,
   store: TicketStore,
   linear: LinearClient | undefined,
   cfg: Config
@@ -70,7 +79,7 @@ async function expireStaleTickets(
 
     if (ticket.sandbox_id) {
       try {
-        await deleteSandbox(daytona, ticket.sandbox_id);
+        await deleteSandbox(sprites, ticket.sandbox_id);
       } catch (err) {
         console.error(
           `[sweep] failed to delete sandbox ${ticket.sandbox_id} for ${ticket.linear_issue_identifier}:`,
@@ -84,40 +93,43 @@ async function expireStaleTickets(
 }
 
 async function deleteOrphanSandboxes(
-  daytona: Daytona,
+  sprites: SpritesClient,
   store: TicketStore,
   cfg: Config
 ): Promise<void> {
   let sandboxes;
   try {
-    sandboxes = await listLabeledSandboxes(daytona);
+    sandboxes = await listLabeledSandboxes(sprites);
   } catch (err) {
-    console.error("[sweep] failed to list Daytona sandboxes:", err);
+    console.error("[sweep] failed to list sprites:", err);
     return;
   }
 
   for (const sandbox of sandboxes) {
-    const ticket = store.getBySandboxId(sandbox.id);
+    const ticket = store.getBySandboxId(sandbox.name);
     if (ticket && ticket.state !== "closed" && ticket.state !== "expired") {
       continue; // active, stopped, and error workspaces remain reusable
     }
 
-    // A sandbox can become visible to list() before handleCreated persists its
-    // ID. Never sweep inside that provisioning window. Missing timestamps are
-    // treated conservatively and retried on a later sweep.
-    const createdAt = sandbox.createdAt ? Date.parse(sandbox.createdAt) : Number.NaN;
-    if (
-      Number.isNaN(createdAt) ||
-      Date.now() - createdAt < cfg.orphanGraceMinutes * 60 * 1000
-    ) {
-      continue;
+    // A sprite can become visible to list() before handleCreated persists its
+    // name. Never sweep inside that provisioning window: sprite handles expose
+    // `updatedAt`, so a recently-touched orphan is left for a later sweep.
+    // Missing/unparseable timestamps are treated conservatively and retried.
+    if (!ticket) {
+      const updatedAt = sandbox.updatedAt ? Date.parse(sandbox.updatedAt) : Number.NaN;
+      if (
+        Number.isNaN(updatedAt) ||
+        Date.now() - updatedAt < cfg.orphanGraceMinutes * 60 * 1000
+      ) {
+        continue;
+      }
     }
 
-    console.log(`[sweep] deleting orphan sandbox ${sandbox.id} (label ticket=${sandbox.labels?.ticket ?? "?"})`);
+    console.log(`[sweep] deleting orphan sprite ${sandbox.name}`);
     try {
-      await daytona.delete(sandbox, 60, false);
+      await deleteSandbox(sprites, sandbox.name);
     } catch (err) {
-      console.error(`[sweep] failed to delete orphan sandbox ${sandbox.id}:`, err);
+      console.error(`[sweep] failed to delete orphan sprite ${sandbox.name}:`, err);
     }
   }
 }

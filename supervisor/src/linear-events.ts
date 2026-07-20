@@ -3,7 +3,7 @@
 // of server.ts.
 
 import { randomBytes } from "node:crypto";
-import type { Daytona } from "@daytona/sdk";
+import type { SpritesClient } from "./sprites.js";
 import type { Config } from "./config.js";
 import type { TaskType, Ticket, TicketStore } from "./db.js";
 import {
@@ -26,7 +26,7 @@ import {
   findSandboxForTicket,
   startTask,
   stopSandbox,
-} from "./daytona.js";
+} from "./sprites.js";
 import {
   agentDisplayName,
   baseSandboxEnv,
@@ -34,7 +34,6 @@ import {
   hasAgentSubscription,
   launchExistingTask,
   pickAgent,
-  scheduleSandboxSettlement,
   tokenHash,
 } from "./run-lifecycle.js";
 import {
@@ -110,7 +109,7 @@ function repositoryFor(
 export async function handleLinearEvent(
   cfg: Config,
   store: TicketStore,
-  daytona: Daytona,
+  sprites: SpritesClient,
   getLinearClient: () => Promise<LinearClient | undefined>,
   linearOutbox: LinearOutboxProcessor,
   payload: ReturnType<typeof parseLinearWebhook>
@@ -120,16 +119,16 @@ export async function handleLinearEvent(
     throw new Error("No valid Linear OAuth token is stored");
   }
   if (payload.action === "created") {
-    await handleCreated(cfg, store, daytona, linear, linearOutbox, payload);
+    await handleCreated(cfg, store, sprites, linear, linearOutbox, payload);
   } else {
-    await handlePrompted(cfg, store, daytona, linear, linearOutbox, payload);
+    await handlePrompted(cfg, store, sprites, linear, linearOutbox, payload);
   }
 }
 
 async function handleCreated(
   cfg: Config,
   store: TicketStore,
-  daytona: Daytona,
+  sprites: SpritesClient,
   linear: LinearClient,
   linearOutbox: LinearOutboxProcessor,
   payload: ReturnType<typeof parseLinearWebhook>
@@ -279,8 +278,8 @@ async function handleCreated(
         });
       }
       try {
-        await stopSandbox(daytona, existing.sandbox_id);
-        await deleteSandbox(daytona, existing.sandbox_id);
+        await stopSandbox(sprites, existing.sandbox_id);
+        await deleteSandbox(sprites, existing.sandbox_id);
       } catch (error) {
         const message = sanitizeText(
           `OpenThrottle resolved this ticket to ${selectedRepository.repo}, but could not delete the existing ${existing.repo} workspace: ${String(error)}`
@@ -300,7 +299,7 @@ async function handleCreated(
       await launchExistingTask({
         cfg,
         store,
-        daytona,
+        sprites,
         linear,
         linearOutbox,
         ticket: current,
@@ -333,18 +332,18 @@ async function handleCreated(
   };
   store.upsert(ticketCore);
   store.setLinearContext(issue.id, initialContext);
-  const recovered = await findSandboxForTicket(daytona, issue.identifier);
+  const recovered = await findSandboxForTicket(sprites, issue.identifier);
   if (recovered) {
-    store.setSandboxId(issue.id, recovered.id);
+    store.setSandboxId(issue.id, recovered.name);
     const recoveredTicket = store.getByIssueId(issue.id)!;
     if (recoveredTicket.run_id) {
-      await reportCreatedWorkspace(cfg, store, linearOutbox, recoveredTicket, recovered.id);
+      await reportCreatedWorkspace(cfg, store, linearOutbox, recoveredTicket, recovered.name);
       return;
     }
     await launchExistingTask({
       cfg,
       store,
-      daytona,
+      sprites,
       linear,
       linearOutbox,
       ticket: recoveredTicket,
@@ -382,23 +381,23 @@ async function handleCreated(
   });
   let sandbox;
   try {
-    sandbox = await createForTicket(daytona, cfg, {
+    sandbox = await createForTicket(sprites, cfg, {
       issueIdentifier: issue.identifier,
       env,
     });
-    store.setSandboxId(issue.id, sandbox.id);
+    store.setSandboxId(issue.id, sandbox.name);
   } catch (error) {
-    const partiallyCreated = await findSandboxForTicket(daytona, issue.identifier).catch(
+    const partiallyCreated = await findSandboxForTicket(sprites, issue.identifier).catch(
       () => undefined
     );
     if (partiallyCreated) {
-      store.setSandboxId(issue.id, partiallyCreated.id);
+      store.setSandboxId(issue.id, partiallyCreated.name);
       await reportCreatedWorkspace(
         cfg,
         store,
         linearOutbox,
         store.getByIssueId(issue.id)!,
-        partiallyCreated.id
+        partiallyCreated.name
       );
       return;
     }
@@ -414,7 +413,7 @@ async function handleCreated(
   const provisionedTicket = store.getByIssueId(issue.id)!;
 
   try {
-    await startTask(sandbox, {
+    await startTask(sprites, sandbox.name, {
       env,
       linearContext: initialContext,
       taskTimeoutSeconds: cfg.taskTimeout,
@@ -428,11 +427,10 @@ async function handleCreated(
       ticketState: "error",
     });
     await tryPostError(store, linearOutbox, sessionId, issue.id, message);
-    scheduleSandboxSettlement({ daytona, store, ticket: provisionedTicket, taskType });
     return;
   }
 
-  await reportCreatedWorkspace(cfg, store, linearOutbox, provisionedTicket, sandbox.id);
+  await reportCreatedWorkspace(cfg, store, linearOutbox, provisionedTicket, sandbox.name);
   try {
     await enqueueActivity(store, linearOutbox, {
       sessionId,
@@ -482,7 +480,7 @@ async function reportCreatedWorkspace(
 async function handlePrompted(
   cfg: Config,
   store: TicketStore,
-  daytona: Daytona,
+  sprites: SpritesClient,
   linear: LinearClient,
   linearOutbox: LinearOutboxProcessor,
   payload: ReturnType<typeof parseLinearWebhook>
@@ -514,7 +512,7 @@ async function handlePrompted(
   if (isStop) {
     await stopTicket({
       store,
-      daytona,
+      sprites,
       linear,
       linearOutbox,
       ticket,
@@ -563,7 +561,7 @@ async function handlePrompted(
   const launched = await launchExistingTask({
     cfg,
     store,
-    daytona,
+    sprites,
     linear,
     linearOutbox,
     ticket: currentTicket,

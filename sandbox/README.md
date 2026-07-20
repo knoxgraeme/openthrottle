@@ -1,19 +1,17 @@
 # OpenThrottle sandbox
 
-The Daytona snapshot is built from the repository root because it embeds the
-shared `skills/` directory:
+Each ticket runs in a Fly Sprite (a persistent microVM). There is no prebuilt
+image: the sandbox payload — this directory plus the shared `skills/` tree — is
+baked into the supervisor's Fly image as `payload.tar.gz`, and on first create
+the supervisor uploads it to the sprite and runs `sandbox/provision.sh` on the
+live Ubuntu overlay.
 
-```bash
-docker build -f sandbox/Dockerfile -t openthrottle .
-daytona snapshot create openthrottle --dockerfile sandbox/Dockerfile --context .
-```
-
-It contains Node 22, git/curl/jq/yq/ripgrep/GitHub CLI, Claude Code, Codex,
-OpenCode, a pinned native Compound Engineering installation for all agent CLIs, and an
-unprivileged `agent` user. Its automatic image entrypoint is an inert no-op so
-Daytona provisioning cannot race the supervisor. Fly uploads the run context
-and explicitly launches the root task script, which owns checkout and safety
-setup before dropping privileges for repo and agent commands.
+`provision.sh` installs (idempotently, so it is safe to re-run) Node 22 tooling,
+git/curl/jq/yq/ripgrep/GitHub CLI, `gosu`, the pinned Claude Code / Codex /
+OpenCode CLIs, a pinned native Compound Engineering installation for all agent
+CLIs, and an unprivileged `agent` user. The supervisor then launches each run
+through the Sprites `run` service, which invokes this root task script; it owns
+checkout and safety setup before dropping privileges for repo and agent commands.
 
 ## Lifecycle
 
@@ -45,10 +43,11 @@ session cannot be redirected into a newer Linear conversation. CE owns agent
 reasoning and code/PR work within the run.
 
 `~/.ot` holds ticket context, task/dev logs, the agent session ID, normalized
-run result, and a structured outbox. `ot-activity` writes progress into that
-outbox. The exit trap writes exit code, Claude cost, PR URL, and sanitized
-final assistant output/failure tail as a completion marker. Fly reads both
-through the Daytona SDK.
+run result, and a structured outbox. `ot-activity` posts progress to the
+supervisor (`POST /runs/:id/events`) and the exit trap posts the completion
+(`POST /runs/:id/complete`) with exit code, Claude cost, PR URL, and sanitized
+final assistant output/failure tail. Both fall back to spooling a file in the
+outbox that the supervisor's sweep drains if the POST fails.
 At completion Fly also reads, sanitizes, and persists only the last 100,000
 characters of `task.log` in its private SQLite database. Live logs are served
 while the workspace exists and this durable tail is the fallback after cleanup;
@@ -86,7 +85,7 @@ from `CODEX_AUTH_JSON`, and known GitHub/OpenAI/Linear/bearer token shapes.
 npm ci --prefix sandbox
 npm test --prefix sandbox
 bats sandbox/tests/runtime.bats
-docker build -f sandbox/Dockerfile -t openthrottle:test .
+docker build -f sandbox/tests/Dockerfile -t openthrottle:test .
 sandbox/tests/smoke.sh openthrottle:test
 ```
 
@@ -97,13 +96,8 @@ implement and same-session resume for all engines, checkout/branch creation,
 safety/config phases, session/cost capture, completion markers, and absence of
 secrets in human-visible artifacts.
 
-For live monitoring, use Daytona’s normal controls:
-
-```bash
-daytona list
-daytona ssh <sandbox-id>
-```
-
-Or use `openthrottle logs <ticket>` for authenticated, sanitized live output or
-the latest durable private tail after workspace deletion. The wake-on-click
-preview link remains attached to the Linear session.
+For live monitoring, use the Sprites CLI/API (`sprite list --prefix ot-`, then
+`sprite exec`/`sprite console` against a named sprite), or `openthrottle logs
+<ticket>` for authenticated, sanitized live output or the latest durable private
+tail after workspace deletion. The org-private sprite URL wakes the sandbox on
+request.

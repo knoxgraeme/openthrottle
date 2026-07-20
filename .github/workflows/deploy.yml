@@ -1,7 +1,12 @@
 name: Deploy
 
-# Rebuilds the Daytona sandbox snapshot and/or deploys the Fly supervisor when
-# the paths that feed them change on main. Manual dispatch can force either.
+# Builds and deploys the Fly supervisor app when the paths that feed it
+# change on main. Manual dispatch can force a deploy.
+#
+# The sandbox payload (entrypoint/provision/runner/lib/safety/skills) is
+# baked into the supervisor's own Fly image as payload.tar.gz — there is no
+# separate snapshot build/publish step. Sandbox and skills changes therefore
+# trigger the same supervisor deploy as supervisor code changes.
 #
 # The deploy job first ensures the Fly app and its /data volume exist, so a
 # fresh account bootstraps itself instead of failing with "Could not find App".
@@ -9,7 +14,6 @@ name: Deploy
 # until then the deploy releases but the health check fails.
 #
 # Required repository secrets:
-#   DAYTONA_API_KEY — builds/registers snapshots (same key the supervisor uses)
 #   FLY_API_TOKEN   — deploy token for the supervisor app (org-scoped, so it can
 #                     create the app on first run)
 # Optional repository variables:
@@ -22,10 +26,6 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
-      build_snapshot:
-        description: "Force a Daytona snapshot rebuild"
-        type: boolean
-        default: false
       deploy_supervisor:
         description: "Force a Fly supervisor deploy"
         type: boolean
@@ -43,54 +43,21 @@ jobs:
   changes:
     runs-on: ubuntu-latest
     outputs:
-      sandbox: ${{ steps.filter.outputs.sandbox }}
-      supervisor: ${{ steps.filter.outputs.supervisor }}
+      deploy: ${{ steps.filter.outputs.deploy }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
         id: filter
         with:
           filters: |
-            sandbox:
+            deploy:
               - 'sandbox/**'
               - 'skills/**'
-            supervisor:
               - 'supervisor/**'
 
-  snapshot:
-    needs: changes
-    if: needs.changes.outputs.sandbox == 'true' || inputs.build_snapshot
-    runs-on: ubuntu-latest
-    outputs:
-      name: ${{ steps.build.outputs.name }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: supervisor/package-lock.json
-      - name: Install supervisor dependencies (for @daytona/sdk)
-        run: npm ci --prefix supervisor
-      - name: Build and register the Daytona snapshot
-        id: build
-        env:
-          DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
-        run: |
-          name="openthrottle-v2-ce-$(git rev-parse --short=7 HEAD)"
-          node supervisor/scripts/build-snapshot.mjs "$name"
-          echo "name=$name" >> "$GITHUB_OUTPUT"
-
   deploy:
-    needs: [changes, snapshot]
-    # Run when supervisor code changed, when a new snapshot must be released to
-    # the app (the staged secret applies on deploy), or when forced. Never run
-    # if the snapshot build failed — the secret would point at a broken build.
-    if: >-
-      !cancelled() && needs.snapshot.result != 'failure' &&
-      (needs.changes.outputs.supervisor == 'true' ||
-       needs.snapshot.result == 'success' ||
-       inputs.deploy_supervisor)
+    needs: changes
+    if: needs.changes.outputs.deploy == 'true' || inputs.deploy_supervisor
     runs-on: ubuntu-latest
     env:
       FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
@@ -122,9 +89,13 @@ jobs:
             flyctl volumes create openthrottle_data \
               --app "$FLY_APP" --region "$FLY_REGION" --size 1 --yes
           fi
-      - name: Stage the new snapshot name
-        if: needs.snapshot.result == 'success'
-        run: flyctl secrets set --stage --app "$FLY_APP" DAYTONA_SNAPSHOT="${{ needs.snapshot.outputs.name }}"
       - name: Deploy the supervisor
-        working-directory: supervisor
-        run: flyctl deploy --remote-only --app "$FLY_APP"
+        # Build context must be the repo root: supervisor/Dockerfile stages
+        # the sandbox payload from the sibling sandbox/ and skills/ directories.
+        # Passing the config/dockerfile paths (resolved relative to this
+        # working directory) instead of `cd supervisor` keeps the context at
+        # the root while still using supervisor/fly.toml and supervisor/Dockerfile.
+        run: |
+          flyctl deploy --remote-only --app "$FLY_APP" \
+            --config supervisor/fly.toml \
+            --dockerfile supervisor/Dockerfile

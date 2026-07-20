@@ -1,12 +1,56 @@
-import type { Daytona, Sandbox } from "@daytona/sdk";
 import type Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
+import type { Config } from "./config.js";
+import type { LinearClient } from "./linear.js";
+import type { SpritesClient } from "./sprites.js";
 import { createTicketStore, openDb } from "./db.js";
-import { parseSandboxEvent, pollSandboxEvents } from "./sandbox-events.js";
+import { createServer } from "./server.js";
+import { parseSandboxEvent } from "./sandbox-events.js";
+
+const cfg: Config = {
+  port: 8080,
+  databasePath: ":memory:",
+  supervisorUrl: "https://ot.test",
+  statusToken: "status-secret",
+  installSecret: "install-secret",
+  linearWebhookSecret: "linear-secret",
+  linearClientId: "client",
+  linearClientSecret: "client-secret",
+  githubWebhookSecret: "github-secret",
+  githubToken: "github-token",
+  githubRepo: "owner/repo",
+  githubRepoMappings: {},
+  githubRepoLabelMappings: {},
+  spriteToken: "sprite-token",
+  spritesApiUrl: "https://api.sprites.dev",
+  payloadTarPath: "/app/payload.tar.gz",
+  defaultAgent: "codex",
+  claudeCodeOauthToken: "claude-token",
+  codexAuthJson: "{}",
+  kimiCodeApiKey: "kimi-token",
+  baseBranch: "main",
+  maxTurns: 200,
+  taskTimeout: 7200,
+  callbackGraceSeconds: 120,
+  devPort: 3000,
+  sweepMaxAgeDays: 14,
+  orphanGraceMinutes: 5,
+  webhookMaxAgeSeconds: 60,
+  reviewMaxRounds: 3,
+  reviewNudgeComment: "",
+  allowLinearMerge: false,
+};
+
+const CALLBACK_TOKEN = "callback-token-1234567890";
+const ACTIVITY_EVENT_ID = "11111111-1111-4111-8111-111111111111";
 
 let db: Database.Database | undefined;
-afterEach(() => db?.close());
+afterEach(() => {
+  vi.restoreAllMocks();
+  db?.close();
+  db = undefined;
+});
 
 function seedRunningTicket() {
   db = openDb(":memory:");
@@ -15,7 +59,7 @@ function seedRunningTicket() {
     linear_issue_id: "issue-1",
     linear_issue_identifier: "OT-1",
     linear_session_id: "session-1",
-    sandbox_id: "sandbox-1",
+    sandbox_id: "ot-ot-1",
     branch: "ot/ot-1",
     agent: "codex",
     repo: "owner/repo",
@@ -26,28 +70,41 @@ function seedRunningTicket() {
     issueId: "issue-1",
     runId: "run-1",
     taskType: "implement",
-    tokenHash: createHash("sha256").update("callback-token-123").digest("hex"),
+    tokenHash: createHash("sha256").update(CALLBACK_TOKEN).digest("hex"),
     expiresAt: "2099-01-01T00:00:00.000Z",
   });
   return store;
 }
 
+function activityBody(overrides: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    version: 1,
+    kind: "activity",
+    event_id: ACTIVITY_EVENT_ID,
+    run_id: "run-1",
+    created_at: "2026-07-18T00:00:00.000Z",
+    type: "response",
+    body: "Implementation is ready",
+    ...overrides,
+  });
+}
+
 describe("sandbox event contracts", () => {
   it("accepts bounded activity and completion records and rejects unsafe input", () => {
     const parsed = parseSandboxEvent(JSON.stringify({
-        version: 1,
-        kind: "activity",
-        event_id: "11111111-1111-4111-8111-111111111111",
-        run_id: "run-1",
-        created_at: "2026-07-18T00:00:00.000Z",
-        type: "elicitation",
-        body: "Please add a plan",
-        unexpected_secret: "raw-secret",
-      }));
+      version: 1,
+      kind: "activity",
+      event_id: ACTIVITY_EVENT_ID,
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:00.000Z",
+      type: "elicitation",
+      body: "Please add a plan",
+      unexpected_secret: "raw-secret",
+    }));
     expect(parsed).toMatchObject({ type: "elicitation", body: "Please add a plan" });
     expect(parsed).not.toHaveProperty("unexpected_secret");
 
-    expect(() => parseSandboxEvent("{}" )).toThrow();
+    expect(() => parseSandboxEvent("{}")).toThrow();
     expect(() =>
       parseSandboxEvent(JSON.stringify({
         version: 1,
@@ -60,285 +117,103 @@ describe("sandbox event contracts", () => {
       }))
     ).toThrow();
   });
+});
 
-  it("posts activities once, finalizes completion once, and removes processed files", async () => {
-    const store = seedRunningTicket();
-    const activity = JSON.stringify({
-      version: 1,
-      kind: "activity",
-      event_id: "11111111-1111-4111-8111-111111111111",
-      run_id: "run-1",
-      created_at: "2026-07-18T00:00:00.000Z",
-      type: "elicitation",
-      body: "Please add a plan",
+describe("POST /runs/:id/events", () => {
+  function makeApp(store: ReturnType<typeof createTicketStore>) {
+    const linearRequests: string[] = [];
+    const linearFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      linearRequests.push(String(init?.body));
+      return Response.json({
+        data: { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
+      });
+    }) as unknown as typeof fetch;
+    const linear: LinearClient = { accessToken: "oauth", fetch: linearFetch };
+    const app = createServer({
+      cfg,
+      store,
+      sprites: {} as unknown as SpritesClient,
+      getLinearClient: async () => linear,
     });
+    return { app, linearRequests, linearFetch };
+  }
+
+  function post(app: ReturnType<typeof createServer>, body: string, token = CALLBACK_TOKEN) {
+    return app.request("/runs/run-1/events", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body,
+    });
+  }
+
+  it("rejects a bad callback token with 401 and does not store the event", async () => {
+    const store = seedRunningTicket();
+    const { app, linearFetch } = makeApp(store);
+
+    const response = await post(app, activityBody(), "wrong-token");
+
+    expect(response.status).toBe(401);
+    expect(linearFetch).not.toHaveBeenCalled();
+    expect(store.getSandboxEvent(ACTIVITY_EVENT_ID)).toBeUndefined();
+  });
+
+  it("returns 404 for an unknown run", async () => {
+    const store = seedRunningTicket();
+    const { app } = makeApp(store);
+    const response = await app.request("/runs/does-not-exist/events", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${CALLBACK_TOKEN}` },
+      body: activityBody(),
+    });
+    expect(response.status).toBe(404);
+  });
+
+  it("projects a valid activity into Linear exactly once and dedupes by event_id", async () => {
+    const store = seedRunningTicket();
+    const { app, linearRequests } = makeApp(store);
+
+    const first = await post(app, activityBody());
+    expect(first.status).toBe(200);
+
+    // Replaying the same event_id must not project a second time.
+    const second = await post(app, activityBody());
+    expect(second.status).toBe(200);
+
+    const activityPosts = linearRequests.filter((body) => body.includes("AgentActivityCreate"));
+    expect(activityPosts).toHaveLength(1);
+    expect(activityPosts[0]).toContain("Implementation is ready");
+    expect(store.getSandboxEvent(ACTIVITY_EVENT_ID)?.status).toBe("processed");
+  });
+
+  it("rejects a completion event (completions go to /complete) with 400", async () => {
+    const store = seedRunningTicket();
+    const { app } = makeApp(store);
     const completion = JSON.stringify({
       version: 1,
       kind: "completion",
       event_id: "22222222-2222-4222-8222-222222222222",
       run_id: "run-1",
       created_at: "2026-07-18T00:00:01.000Z",
-      token: "callback-token-123",
+      token: CALLBACK_TOKEN,
       exit_code: 0,
-      pr_url: "https://github.com/owner/repo/pull/1",
-      final_response: "Finished the implementation.",
     });
-    const files = new Map([
-      ["/home/agent/.ot/outbox/001.json", Buffer.from(activity)],
-      ["/home/agent/.ot/outbox/002.json", Buffer.from(completion)],
-    ]);
-    let failDeleteOnce = true;
-    const setAutostopInterval = vi.fn(async (minutes: number) => {
-      sandbox.autoStopInterval = minutes;
-    });
-    const sandbox = {
-      id: "sandbox-1",
-      state: "started",
-      autoStopInterval: 5,
-      setAutostopInterval,
-      process: {
-        executeCommand: vi.fn(async () => ({
-          exitCode: 0,
-          result: "safe ghp_abcdefghijklmnop callback-token-123",
-        })),
-      },
-      fs: {
-        listFiles: vi.fn(async () =>
-          [...files.entries()].map(([path, value]) => ({
-            name: path.split("/").at(-1), path, size: value.length, isDir: false,
-          }))
-        ),
-        downloadFile: vi.fn(async (path: string) => files.get(path)!),
-        deleteFile: vi.fn(async (path: string) => {
-          if (path.endsWith("001.json") && failDeleteOnce) {
-            failDeleteOnce = false;
-            throw new Error("temporary delete failure");
-          }
-          files.delete(path);
-        }),
-      },
-    } as unknown as Sandbox;
-    const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
-    const postActivity = vi.fn(async () => undefined);
-    const finishCompletion = vi.fn(async () => ({ status: 200 }));
-
-    await pollSandboxEvents({ daytona, store, postActivity, finishCompletion });
-    await pollSandboxEvents({ daytona, store, postActivity, finishCompletion });
-
-    expect(postActivity).toHaveBeenCalledOnce();
-    expect(postActivity).toHaveBeenCalledWith(
-      expect.objectContaining({ sessionId: "session-1", type: "elicitation", body: "Please add a plan" }),
-      expect.objectContaining({ issueId: "issue-1", event_id: "11111111-1111-4111-8111-111111111111" })
-    );
-    expect(finishCompletion).toHaveBeenCalledOnce();
-    expect(finishCompletion).toHaveBeenCalledWith(
-      expect.objectContaining({
-        runId: "run-1",
-        token: "callback-token-123",
-        exitCode: 0,
-        finalResponse: "Finished the implementation.",
-        logTail: "safe [REDACTED] [REDACTED]",
-      })
-    );
-    expect(setAutostopInterval).toHaveBeenCalledOnce();
-    expect(setAutostopInterval).toHaveBeenCalledWith(60);
-    expect(files.size).toBe(0);
-    expect(store.getSandboxEvent("11111111-1111-4111-8111-111111111111")?.status)
-      .toBe("processed");
+    const response = await post(app, completion);
+    expect(response.status).toBe(400);
   });
 
-  it("retries a failed activity before processing the completion behind it", async () => {
+  it("rejects an event whose run_id does not match the run with 400", async () => {
     const store = seedRunningTicket();
-    const activityId = "55555555-5555-4555-8555-555555555555";
-    const activity = Buffer.from(JSON.stringify({
-      version: 1,
-      kind: "activity",
-      event_id: activityId,
-      run_id: "run-1",
-      created_at: "2026-07-18T00:00:00.000Z",
-      type: "response",
-      body: "Implementation is ready",
-    }));
-    const completion = Buffer.from(JSON.stringify({
-      version: 1,
-      kind: "completion",
-      event_id: "66666666-6666-4666-8666-666666666666",
-      run_id: "run-1",
-      created_at: "2026-07-18T00:00:01.000Z",
-      token: "callback-token-123",
-      exit_code: 0,
-    }));
-    const files = new Map([
-      ["/home/agent/.ot/outbox/001.json", activity],
-      ["/home/agent/.ot/outbox/002.json", completion],
-    ]);
-    const sandbox = {
-      id: "sandbox-1",
-      state: "started",
-      autoStopInterval: 60,
-      fs: {
-        listFiles: vi.fn(async () =>
-          [...files.entries()].map(([path, value]) => ({
-            name: path.split("/").at(-1), path, size: value.length, isDir: false,
-          }))
-        ),
-        downloadFile: vi.fn(async (path: string) => files.get(path)!),
-        deleteFile: vi.fn(async (path: string) => files.delete(path)),
-      },
-    } as unknown as Sandbox;
-    const postActivity = vi
-      .fn<() => Promise<void>>()
-      .mockRejectedValueOnce(new Error("Linear unavailable"))
-      .mockResolvedValue(undefined);
-    const finishCompletion = vi.fn(async () => ({ status: 200 }));
-    const params = {
-      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
-      store,
-      postActivity,
-      finishCompletion,
-    };
-
-    await pollSandboxEvents(params);
-
-    expect(postActivity).toHaveBeenCalledOnce();
-    expect(finishCompletion).not.toHaveBeenCalled();
-    expect(store.getSandboxEvent(activityId)).toMatchObject({
-      status: "failed",
-      payload: expect.not.stringContaining("callback-token-123"),
-    });
-
-    db!.prepare("UPDATE sandbox_events SET next_attempt_at = ? WHERE event_id = ?")
-      .run("2000-01-01T00:00:00.000Z", activityId);
-    await pollSandboxEvents(params);
-
-    expect(postActivity).toHaveBeenCalledTimes(2);
-    expect(finishCompletion).toHaveBeenCalledOnce();
-    expect(store.getSandboxEvent(activityId)?.status).toBe("processed");
+    const { app } = makeApp(store);
+    const response = await post(app, activityBody({ run_id: "other-run" }));
+    expect(response.status).toBe(400);
   });
 
-  it("returns a sandbox to idle when a stale poll reactivates it after completion", async () => {
+  it("refuses activity once the run is no longer running with 409", async () => {
     const store = seedRunningTicket();
-    let releaseActive!: () => void;
-    const activeReleased = new Promise<void>((resolve) => {
-      releaseActive = resolve;
-    });
-    let markActiveStarted!: () => void;
-    const activeStarted = new Promise<void>((resolve) => {
-      markActiveStarted = resolve;
-    });
-    const autostopIntervals: number[] = [];
-    const listFiles = vi.fn(async () => []);
-    const sandbox = {
-      id: "sandbox-1",
-      state: "started",
-      autoStopInterval: 5,
-      setAutostopInterval: vi.fn(async (minutes: number) => {
-        autostopIntervals.push(minutes);
-        if (minutes === 60) {
-          markActiveStarted();
-          await activeReleased;
-        }
-        sandbox.autoStopInterval = minutes;
-      }),
-      fs: { listFiles },
-    } as unknown as Sandbox;
-    const polling = pollSandboxEvents({
-      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
-      store,
-      postActivity: vi.fn(),
-      finishCompletion: vi.fn(),
-    });
-
-    await activeStarted;
     store.finishRun({ runId: "run-1", status: "completed", ticketState: "active" });
-    releaseActive();
-    await polling;
-
-    expect(autostopIntervals).toEqual([60, 5]);
-    expect(sandbox.autoStopInterval).toBe(5);
-    expect(listFiles).not.toHaveBeenCalled();
-  });
-
-  it("discards a stale event without posting it into the current run", async () => {
-    const store = seedRunningTicket();
-    const stale = Buffer.from(JSON.stringify({
-      version: 1,
-      kind: "activity",
-      event_id: "33333333-3333-4333-8333-333333333333",
-      run_id: "old-run",
-      created_at: "2026-07-18T00:00:00.000Z",
-      type: "response",
-      body: "stale",
-    }));
-    const deleteFile = vi.fn(async () => undefined);
-    const sandbox = {
-      id: "sandbox-1",
-      state: "started",
-      autoStopInterval: 60,
-      fs: {
-        listFiles: vi.fn(async () => [{
-          name: "stale.json", path: "/home/agent/.ot/outbox/stale.json", size: stale.length, isDir: false,
-        }]),
-        downloadFile: vi.fn(async () => stale),
-        deleteFile,
-      },
-    } as unknown as Sandbox;
-    const postActivity = vi.fn();
-
-    await pollSandboxEvents({
-      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
-      store,
-      postActivity,
-      finishCompletion: vi.fn(),
-    });
-
-    expect(postActivity).not.toHaveBeenCalled();
-    expect(deleteFile).toHaveBeenCalledOnce();
-  });
-
-  it("does not publish late activity from a superseded session into the new session", async () => {
-    const store = seedRunningTicket();
-    store.upsert({
-      ...store.getByIssueId("issue-1")!,
-      linear_session_id: "session-2",
-      sandbox_id: "sandbox-1",
-      state: "active",
-    });
-    const late = Buffer.from(JSON.stringify({
-      version: 1,
-      kind: "activity",
-      event_id: "77777777-7777-4777-8777-777777777777",
-      run_id: "run-1",
-      created_at: "2026-07-18T00:00:00.000Z",
-      type: "response",
-      body: "late old-session response",
-    }));
-    const deleteFile = vi.fn(async () => undefined);
-    const sandbox = {
-      id: "sandbox-1",
-      state: "started",
-      autoStopInterval: 60,
-      setAutostopInterval: vi.fn(async () => undefined),
-      fs: {
-        listFiles: vi.fn(async () => [{
-          name: "late.json", path: "/home/agent/.ot/outbox/late.json", size: late.length, isDir: false,
-        }]),
-        downloadFile: vi.fn(async () => late),
-        deleteFile,
-      },
-    } as unknown as Sandbox;
-    const postActivity = vi.fn();
-
-    await pollSandboxEvents({
-      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
-      store,
-      postActivity,
-      finishCompletion: vi.fn(),
-    });
-
-    expect(postActivity).not.toHaveBeenCalled();
-    expect(store.getSandboxEvent("77777777-7777-4777-8777-777777777777")?.status)
-      .toBe("processed");
-    expect(deleteFile).toHaveBeenCalledOnce();
+    const { app, linearFetch } = makeApp(store);
+    const response = await post(app, activityBody());
+    expect(response.status).toBe(409);
+    expect(linearFetch).not.toHaveBeenCalled();
   });
 });

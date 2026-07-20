@@ -1,8 +1,7 @@
 import { Hono } from "hono";
 import { createHash, randomBytes } from "node:crypto";
-import type { Daytona } from "@daytona/sdk";
 import type { Config } from "./config.js";
-import type { Ticket, TicketStore, WebhookDelivery } from "./db.js";
+import type { Run, Ticket, TicketStore, WebhookDelivery } from "./db.js";
 import {
   buildLinearInstallUrl,
   exchangeLinearOAuthCode,
@@ -17,7 +16,14 @@ import {
   verifyGithubSignature,
   type GithubWebhookEvent,
 } from "./github.js";
-import { getSandboxLogs, getSignedPreviewUrl } from "./daytona.js";
+import type { SpritesClient } from "./sprites.js";
+import { getSandboxLogs, getSignedPreviewUrl, readSpooledEvents } from "./sprites.js";
+import {
+  parseSandboxEvent,
+  toLinearActivity,
+  type SandboxActivityEvent,
+  type SandboxEvent,
+} from "./sandbox-events.js";
 import { MAX_PRIVATE_LOG_TAIL_CHARS } from "./logs.js";
 import { sanitizeText } from "./sanitize.js";
 import {
@@ -30,7 +36,12 @@ import {
   createWebhookDeliveryProcessor,
   type WebhookDeliveryProcessor,
 } from "./webhook-delivery.js";
-import { createLinearOutboxProcessor, tryPostError, type LinearOutboxProcessor } from "./linear-outbox.js";
+import {
+  createLinearOutboxProcessor,
+  enqueueActivity,
+  tryPostError,
+  type LinearOutboxProcessor,
+} from "./linear-outbox.js";
 import { hashesMatch, tokenHash, completeRun } from "./run-lifecycle.js";
 import { handleLinearEvent } from "./linear-events.js";
 import { handleGithubEvent } from "./github-events.js";
@@ -43,7 +54,7 @@ export { completeRun, expireRun } from "./run-lifecycle.js";
 export interface ServerDeps {
   cfg: Config;
   store: TicketStore;
-  daytona: Daytona;
+  sprites: SpritesClient;
   runBackground?: (task: Promise<void>) => void;
   getLinearClient?: () => Promise<LinearClient | undefined>;
   deliveryProcessor?: WebhookDeliveryProcessor;
@@ -128,10 +139,150 @@ function repositoryRegistrationInput(value: unknown): {
   };
 }
 
+/**
+ * Record a single sandbox activity: dedupes by event_id, resolves the run's own
+ * session, drops late activity from a superseded session, and enqueues to the
+ * Linear outbox (which owns delivery retries). Shared by the `/runs/:id/events`
+ * push endpoint and the sweep/complete spool-drain fallback.
+ */
+async function recordSandboxActivity(
+  store: TicketStore,
+  outbox: LinearOutboxProcessor,
+  run: Run,
+  ticket: Ticket,
+  event: SandboxActivityEvent
+): Promise<void> {
+  if (!ticket.sandbox_id) return;
+  const payload = JSON.stringify({ ...event, body: sanitizeText(event.body) });
+  const existing = store.insertSandboxEvent({
+    eventId: event.event_id,
+    runId: run.id,
+    sandboxId: ticket.sandbox_id,
+    kind: "activity",
+    payload,
+  });
+  if (
+    existing.run_id !== run.id ||
+    existing.sandbox_id !== ticket.sandbox_id ||
+    existing.kind !== "activity"
+  ) {
+    // A different event already claimed this id — ignore the conflicting push.
+    return;
+  }
+  if (existing.status === "processed") return;
+
+  const now = new Date();
+  const claimed = store.claimSandboxEvent(
+    event.event_id,
+    now.toISOString(),
+    new Date(now.getTime() + 30_000).toISOString()
+  );
+  if (!claimed) return; // a concurrent push is already handling it
+
+  try {
+    const sessionId = run.linear_session_id ?? ticket.linear_session_id;
+    if (run.linear_session_id && run.linear_session_id !== ticket.linear_session_id) {
+      const session = store.getSession(run.linear_session_id);
+      if (session?.state === "superseded") {
+        store.markSandboxEventProcessed(event.event_id);
+        return;
+      }
+    }
+    await enqueueActivity(
+      store,
+      outbox,
+      toLinearActivity(event, sessionId),
+      run.linear_issue_id ?? ticket.linear_issue_id,
+      run.id
+    );
+    store.markSandboxEventProcessed(event.event_id);
+  } catch (error) {
+    store.markSandboxEventFailed(
+      event.event_id,
+      sanitizeText(String(error)).slice(-2_000),
+      new Date(Date.now() + 5_000).toISOString()
+    );
+    throw error;
+  }
+}
+
+/**
+ * Best-effort drain of any events a sandbox spooled to disk when a push failed.
+ * Read by the sweep for overdue runs before it times them out, and by
+ * `/runs/:id/complete` (activities only) so a spooled elicitation is recorded
+ * before the completion finalizes the run — reusing the exact dedupe +
+ * projection the push endpoints use.
+ */
+export async function drainSpooledEventsForRun(
+  deps: {
+    cfg: Config;
+    store: TicketStore;
+    sprites: SpritesClient;
+    getLinearClient: () => Promise<LinearClient | undefined>;
+    linearOutbox: LinearOutboxProcessor;
+  },
+  run: Run,
+  opts: { includeCompletions?: boolean } = {}
+): Promise<void> {
+  const includeCompletions = opts.includeCompletions ?? true;
+  const ticket = deps.store.getByIssueId(run.linear_issue_id);
+  if (!ticket?.sandbox_id) return;
+  let raws: string[];
+  try {
+    raws = await readSpooledEvents(deps.sprites, ticket.sandbox_id);
+  } catch (error) {
+    console.warn(
+      `[drain] could not read spooled events for ${ticket.linear_issue_identifier}:`,
+      error
+    );
+    return;
+  }
+  const events: SandboxEvent[] = [];
+  for (const raw of raws) {
+    try {
+      const event = parseSandboxEvent(raw);
+      if (event.run_id === run.id) events.push(event);
+    } catch {
+      // ignore anything that is not a well-formed event
+    }
+  }
+  // Activities first, then completions: a spooled elicitation must be recorded
+  // before any spooled completion finalizes the run's terminal decision.
+  for (const event of events) {
+    if (event.kind !== "activity") continue;
+    try {
+      const current = deps.store.getRun(run.id);
+      const currentTicket = deps.store.getByIssueId(run.linear_issue_id);
+      if (current && currentTicket) {
+        await recordSandboxActivity(deps.store, deps.linearOutbox, current, currentTicket, event);
+      }
+    } catch (error) {
+      console.warn(`[drain] failed to apply spooled activity ${event.event_id}:`, error);
+    }
+  }
+  if (!includeCompletions) return;
+  for (const event of events) {
+    if (event.kind !== "completion") continue;
+    try {
+      await completeRun(deps, {
+        runId: event.run_id,
+        token: event.token,
+        exitCode: event.exit_code,
+        costUsd: event.cost_usd,
+        prUrl: event.pr_url,
+        failureTail: event.failure_tail,
+        finalResponse: event.final_response,
+      });
+    } catch (error) {
+      console.warn(`[drain] failed to apply spooled completion ${event.event_id}:`, error);
+    }
+  }
+}
+
 export function createServerWebhookDeliveryProcessor(deps: {
   cfg: Config;
   store: TicketStore;
-  daytona: Daytona;
+  sprites: SpritesClient;
   getLinearClient: () => Promise<LinearClient | undefined>;
   linearOutbox?: LinearOutboxProcessor;
 }): WebhookDeliveryProcessor {
@@ -158,7 +309,7 @@ export function createServerWebhookDeliveryProcessor(deps: {
         await handleLinearEvent(
           deps.cfg,
           deps.store,
-          deps.daytona,
+          deps.sprites,
           deps.getLinearClient,
           linearOutbox,
           parseLinearWebhook(delivery.payload)
@@ -168,7 +319,7 @@ export function createServerWebhookDeliveryProcessor(deps: {
       await handleGithubEvent(
         deps.cfg,
         deps.store,
-        deps.daytona,
+        deps.sprites,
         deps.getLinearClient,
         linearOutbox,
         parseGithubWebhook(delivery.event_name ?? undefined, delivery.payload)
@@ -178,7 +329,7 @@ export function createServerWebhookDeliveryProcessor(deps: {
 }
 
 export function createServer(deps: ServerDeps): Hono {
-  const { cfg, store, daytona } = deps;
+  const { cfg, store, sprites } = deps;
   const getLinearClient = deps.getLinearClient ?? createLinearClientProvider(cfg, store);
   const linearOutboxProcessor =
     deps.linearOutboxProcessor ??
@@ -188,7 +339,7 @@ export function createServer(deps: ServerDeps): Hono {
     createServerWebhookDeliveryProcessor({
       cfg,
       store,
-      daytona,
+      sprites,
       getLinearClient,
       linearOutbox: linearOutboxProcessor,
     });
@@ -246,12 +397,10 @@ export function createServer(deps: ServerDeps): Hono {
       return context.json({ error: sanitizeText(String(error)) }, 400);
     }
     try {
-      const snapshot = await daytona.snapshot.get(cfg.daytonaSnapshot);
-      if (String(snapshot.state).toLowerCase() !== "active") {
-        throw new Error(
-          `Daytona snapshot ${cfg.daytonaSnapshot} is not active (${String(snapshot.state)})`
-        );
-      }
+      // Liveness/authorization probe: throws if the Sprites token or org is bad.
+      // Runs before any GitHub setup so a bad Sprites config fails fast and does
+      // not create webhooks.
+      await sprites.ping();
       const github = await prepareRepository(
         { token: cfg.githubToken },
         {
@@ -267,14 +416,16 @@ export function createServer(deps: ServerDeps): Hono {
         githubRepo: github.repo,
         baseBranch: github.baseBranch,
         webhookId: github.webhookId,
-        snapshot: cfg.daytonaSnapshot,
+        // The snapshot column is retained (additive schema) but is meaningless
+        // for Sprites, which provisions from the payload tarball, not a snapshot.
+        snapshot: "sprites",
       });
       return context.json({
         registration,
         readiness: {
           github: "ready",
           webhook: github.webhookAction,
-          snapshot: { name: snapshot.name, state: snapshot.state },
+          sprites: "ready",
         },
       });
     } catch (error) {
@@ -398,11 +549,25 @@ export function createServer(deps: ServerDeps): Hono {
       return context.json({ error: "invalid callback body" }, 400);
     }
     const data = body as Record<string, unknown>;
+    const runId = context.req.param("id");
+    const token = bearerToken(context.req.header("Authorization"));
+    // Before finalizing, record any activities the sandbox spooled to disk when
+    // a push failed (e.g. a decision elicitation): completeRun's terminal
+    // decision reads the last processed activity, so a lost elicitation would
+    // otherwise become a generic success or trigger a premature re-review.
+    const pending = store.getRun(runId);
+    if (pending && pending.status === "running" && token && hashesMatch(pending.token_hash, tokenHash(token))) {
+      await drainSpooledEventsForRun(
+        { cfg, store, sprites, getLinearClient, linearOutbox: linearOutboxProcessor },
+        pending,
+        { includeCompletions: false }
+      ).catch((error) => console.warn("[complete] spooled-activity drain failed:", error));
+    }
     const result = await completeRun(
-      { cfg, store, daytona, getLinearClient, linearOutbox: linearOutboxProcessor, schedule },
+      { cfg, store, sprites, getLinearClient, linearOutbox: linearOutboxProcessor, schedule },
       {
-        runId: context.req.param("id"),
-        token: bearerToken(context.req.header("Authorization")),
+        runId,
+        token,
         exitCode: data.exit_code,
         costUsd: data.cost_usd,
         prUrl: data.pr_url,
@@ -411,6 +576,45 @@ export function createServer(deps: ServerDeps): Hono {
       }
     );
     return context.json(result.body, result.status as 200 | 400 | 401 | 404 | 409);
+  });
+
+  // Sandbox activities arrive by push (the poll loop is gone). Auth mirrors
+  // /runs/:id/complete: the per-run callback token gates the run, and only a
+  // running run accepts activity. The body is a single validated activity event;
+  // completions still go to /complete.
+  app.post("/runs/:id/events", async (context) => {
+    const runId = context.req.param("id");
+    const token = bearerToken(context.req.header("Authorization"));
+    const run = store.getRun(runId);
+    if (!run) return context.json({ error: "run not found" }, 404);
+    if (!token || !hashesMatch(run.token_hash, tokenHash(token))) {
+      return context.json({ error: "invalid callback token" }, 401);
+    }
+    if (run.status !== "running") {
+      return context.json({ error: "run is not active" }, 409);
+    }
+    let event: SandboxEvent;
+    try {
+      event = parseSandboxEvent(await context.req.text());
+    } catch (error) {
+      return context.json({ error: sanitizeText(String(error)) }, 400);
+    }
+    if (event.kind !== "activity") {
+      return context.json({ error: "only activity events are accepted here" }, 400);
+    }
+    if (event.run_id !== run.id) {
+      return context.json({ error: "event run_id does not match the run" }, 400);
+    }
+    const ticket = store.getByIssueId(run.linear_issue_id);
+    if (!ticket?.sandbox_id) {
+      return context.json({ error: "run no longer active" }, 409);
+    }
+    try {
+      await recordSandboxActivity(store, linearOutboxProcessor, run, ticket, event);
+    } catch (error) {
+      return context.json({ error: sanitizeText(String(error)) }, 502);
+    }
+    return context.json({ ok: true });
   });
 
   app.post("/tickets/:identifier/stop", async (context) => {
@@ -423,7 +627,7 @@ export function createServer(deps: ServerDeps): Hono {
     try {
       await stopTicket({
         store,
-        daytona,
+        sprites,
         linear,
         linearOutbox: linearOutboxProcessor,
         ticket,
@@ -451,7 +655,7 @@ export function createServer(deps: ServerDeps): Hono {
     if (!ticket) return context.json({ error: "ticket not found" }, 404);
     if (ticket.sandbox_id) {
       try {
-        const logs = await getSandboxLogs(daytona, ticket.sandbox_id);
+        const logs = await getSandboxLogs(sprites, ticket.sandbox_id);
         return context.text(sanitizeText(logs).slice(-MAX_PRIVATE_LOG_TAIL_CHARS));
       } catch (error) {
         console.warn(`[logs] live workspace unavailable for ${ticket.linear_issue_identifier}:`, error);
@@ -475,7 +679,7 @@ export function createServer(deps: ServerDeps): Hono {
     }
     try {
       return context.redirect(
-        await getSignedPreviewUrl(daytona, ticket.sandbox_id, cfg.devPort),
+        await getSignedPreviewUrl(sprites, ticket.sandbox_id, cfg.devPort),
         302
       );
     } catch (error) {

@@ -221,7 +221,7 @@ export async function registerTargetRepository(
   request: typeof supervisorRequest = supervisorRequest
 ): Promise<{
   registration: { github_repo: string; base_branch: string };
-  readiness: { webhook: string; snapshot: { name: string; state: string } };
+  readiness: { webhook: string };
 }> {
   const response = await request("/repositories/register", {
     method: "POST",
@@ -231,7 +231,7 @@ export async function registerTargetRepository(
   const body = (await response.json()) as {
     error?: string;
     registration: { github_repo: string; base_branch: string };
-    readiness: { webhook: string; snapshot: { name: string; state: string } };
+    readiness: { webhook: string };
   };
   if (!response.ok) throw new Error(body.error ?? `Supervisor returned HTTP ${response.status}`);
   return body;
@@ -290,9 +290,7 @@ export default async function init(): Promise<void> {
   try {
     const result = await registerTargetRepository(selection.registration);
     spinner.stop(`Registered ${result.registration.github_repo} on ${result.registration.base_branch}`);
-    p.log.success(
-      `GitHub webhook ${result.readiness.webhook}; Daytona snapshot ${result.readiness.snapshot.name} is ${result.readiness.snapshot.state}.`
-    );
+    p.log.success(`GitHub webhook ${result.readiness.webhook}.`);
   } catch (error) {
     spinner.stop("Repository registration failed");
     p.log.error(getErrorMessage(error));

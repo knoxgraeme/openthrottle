@@ -1,6 +1,6 @@
-import type { Daytona } from "@daytona/sdk";
 import type { Ticket, TicketStore } from "./db.js";
-import { deleteSandbox, stopSandbox } from "./daytona.js";
+import type { SpritesClient } from "./sprites.js";
+import { deleteSandbox, stopSandbox } from "./sprites.js";
 import { type LinearClient } from "./linear.js";
 import {
   activityPayload,
@@ -10,13 +10,13 @@ import {
 
 export async function stopTicket(params: {
   store: TicketStore;
-  daytona: Daytona;
+  sprites: SpritesClient;
   linear: LinearClient | undefined;
   linearOutbox: LinearOutboxProcessor;
   ticket: Ticket;
   reason: string;
 }): Promise<void> {
-  const { store, daytona, linearOutbox, ticket, reason } = params;
+  const { store, sprites, linearOutbox, ticket, reason } = params;
   if (ticket.run_id) {
     store.finishRun({
       runId: ticket.run_id,
@@ -46,7 +46,7 @@ export async function stopTicket(params: {
   }
   if (ticket.sandbox_id) {
     try {
-      await stopSandbox(daytona, ticket.sandbox_id);
+      await stopSandbox(sprites, ticket.sandbox_id);
     } catch (error) {
       console.error(`[stop] cleanup pending for ${ticket.linear_issue_identifier}:`, error);
     }
@@ -58,20 +58,20 @@ export async function stopTicket(params: {
 
 export async function closeTicketForPullRequest(params: {
   store: TicketStore;
-  daytona: Daytona;
+  sprites: SpritesClient;
   linear: LinearClient | undefined;
   linearOutbox: LinearOutboxProcessor;
   ticket: Ticket;
   prUrl: string;
   merged: boolean;
 }): Promise<void> {
-  const { store, daytona, linearOutbox, ticket, prUrl, merged } = params;
+  const { store, sprites, linearOutbox, ticket, prUrl, merged } = params;
   let stopFailed = false;
   let deleteFailed = false;
 
   if (ticket.run_id) {
     try {
-      if (ticket.sandbox_id) await stopSandbox(daytona, ticket.sandbox_id);
+      if (ticket.sandbox_id) await stopSandbox(sprites, ticket.sandbox_id);
     } catch (error) {
       stopFailed = true;
       console.error(`[webhooks/github] failed to stop sandbox ${ticket.sandbox_id}:`, error);
@@ -87,7 +87,7 @@ export async function closeTicketForPullRequest(params: {
   }
   if (ticket.sandbox_id) {
     try {
-      await deleteSandbox(daytona, ticket.sandbox_id);
+      await deleteSandbox(sprites, ticket.sandbox_id);
     } catch (error) {
       deleteFailed = true;
       console.error(`[webhooks/github] failed to delete sandbox ${ticket.sandbox_id}:`, error);
