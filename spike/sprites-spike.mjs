@@ -232,8 +232,19 @@ async function checkServiceTask() {
 // Confirmed shape (SDK sprite.ts): POST .../checkpoint (singular) with an
 // NDJSON progress stream; list is GET .../checkpoints (plural); restore is
 // POST .../checkpoints/{id}/restore (also NDJSON).
+//
+// NOTE: the test file lives under /home/sprite (persisted overlay), NOT /tmp.
+// /tmp is scratch/tmpfs and is explicitly not part of the checkpointed overlay,
+// so a /tmp file is a false negative for restore. We also read the file back
+// via fs/read (raw bytes) instead of exec, to avoid exec's stream-ID framing
+// bytes leaking into the compared output.
 async function checkCheckpoint() {
-  await exec(MAIN, "echo pre-checkpoint > /tmp/spike-ckpt.txt");
+  const P = "/home/sprite/spike-ckpt.txt";
+  const readFile = async () => {
+    const rd = await api("GET", `/v1/sprites/${MAIN}/fs/read`, { query: [["path", P], ["workingDir", "/"]] });
+    return { status: rd.status, body: rd.status === 200 ? rd.text() : "" };
+  };
+  await fsWrite(MAIN, P, "pre-checkpoint\n");
   const t0 = Date.now();
   const res = await api("POST", `/v1/sprites/${MAIN}/checkpoint`, { body: { comment: "spike" } });
   if (res.status >= 300) {
@@ -252,23 +263,23 @@ async function checkCheckpoint() {
     } checkpoints, latest=${latest?.id}`
   );
   if (!latest?.id) return;
-  await exec(MAIN, "echo post-checkpoint > /tmp/spike-ckpt.txt");
+  await fsWrite(MAIN, P, "post-checkpoint\n");
   const t1 = Date.now();
   const restore = await api("POST", `/v1/sprites/${MAIN}/checkpoints/${latest.id}/restore`);
   const restoreMs = Date.now() - t1;
-  // Restore is async and restarts the environment; exec retries while it comes back.
-  let after = { output: "" };
-  for (let i = 0; i < 10; i++) {
+  // Restore is async and restarts the environment; fs/read retries while it comes back.
+  let after = { status: 0, body: "" };
+  for (let i = 0; i < 12; i++) {
     await sleep(3_000);
-    try {
-      after = await exec(MAIN, "cat /tmp/spike-ckpt.txt");
-      break;
-    } catch {}
+    after = await readFile().catch(() => ({ status: 0, body: "" }));
+    if (after.status === 200) break;
   }
   record(
     "checkpoint-restore",
-    after.output.includes("pre-checkpoint") ? "PASS" : "FAIL",
-    `restore HTTP ${restore.status}, stream ${restoreMs}ms; file after restore=${JSON.stringify(after.output.trim())} (want pre-checkpoint)`
+    after.body.includes("pre-checkpoint") ? "PASS" : "FAIL",
+    `restore HTTP ${restore.status}, stream ${restoreMs}ms; fs/read after restore=${after.status} body=${JSON.stringify(
+      after.body.trim()
+    )} (want pre-checkpoint on the persisted /home/sprite path)`
   );
 }
 
