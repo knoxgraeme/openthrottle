@@ -12,9 +12,42 @@ green (Vitest suites, Bats, Docker smoke) plus the listed additions.
 
 ---
 
+## Target model
+
+Two core loops, one continuation mechanism, Linear as the control plane:
+
+- **implement** — CE pipeline (`ce-work` → local `ce-code-review` →
+  `ce-commit-push-pr`) → PR → external GitHub-native reviewers (Codex/Claude
+  bots, humans) review and comment → the **original session** resumes,
+  triages the feedback (action / answer on thread / escalate a decision),
+  pushes, and comments. An implement ticket may be a feature or a bug plan.
+- **investigate** — the debugging analogue (`ce-debug`); convergent fixes
+  merge into the implement tail (PR + feedback loop), divergent findings are
+  returned as residuals. Future: findings can become new Linear tickets that
+  re-enter as fresh implement loops (see "Future work").
+- **resume** — the single continuation mechanism for a running loop, fed by
+  either source: a human reply in Linear, or GitHub feedback (reviews,
+  comments, CI failures) queued as session work.
+
+Role contract:
+
+- **Linear is the control plane.** All human intent enters through it
+  (delegate, reply, decide elicitations, stop) and all status/decisions are
+  published back to it. Queuing future work = creating a ticket.
+- **GitHub is the work surface.** Code, PRs, reviews, CI — it emits events;
+  it is not where the pipeline is steered.
+- **The supervisor is pure coordination.** Triggers, one-run-per-ticket,
+  durable queues, sandbox lifecycle, publication. It knows a loop only by
+  its interface — (entry task name, sandbox env contract, `ot-activity`
+  outbox events, completion marker) — never by its internals. That interface
+  is what makes loops swappable: a loop is a skill plus a CE pipeline
+  declaration behind a task name.
+
+---
+
 ## Phase 1 — One owner for PR feedback and CI repair; external reviewers own review
 
-Two consolidations, driven by how the pipeline is actually used now.
+Three consolidations, driven by how the pipeline is actually used now.
 
 First, `ce-babysit-pr` (inside implement/review-fix/investigate runs) and the
 supervisor's webhook handlers both react to PR feedback, which double-handles
@@ -30,44 +63,66 @@ and the non-self commented-review and issue-comment handlers launch
 `ce-resolve-pr-feedback` — so the internal review choreography on top of
 that can be deleted.
 
-1. **Supervisor reacts to CI failure.** In `handleGithubEvent`
-   (`supervisor/src/server.ts`), extend the `workflow_run`/`check_suite`
-   `completed` branch: when the conclusion is `failure`/`timed_out`, the
-   ticket is `active`, and an open `ot/*` PR exists, launch `review-fix`
-   through `triggerReviewTask` (or enqueue as `automatic` session work with a
-   `gh-ci-<id>` dedup key when a run is active). Keep the existing
-   mirror-to-Linear activity. The existing rounds bound applies unchanged.
-2. **Remove babysit from the pipelines.** Delete `ce-babysit-pr` from the
-   implement/review-fix/investigate adapters (all agent forms),
-   `task_ce_pipeline` in `sandbox/lib/runtime.sh`, the composition table in
-   `skills/README.md`, and the corresponding SPEC lines.
-3. **Delete the internal reviewer.** Remove the `review` task type: its three
-   adapter files, the `needs-review` label / `review_requested` triggers, the
-   auto-fresh-re-review scheduled by `completeRun` after a successful
-   review-fix, and the `pending_re_review` flag plus its drain logic
-   (additive migration: column stays, code stops reading it). `review-fix`
-   becomes the only feedback-driven task; its triggers are human
-   `CHANGES_REQUESTED`, non-self commented reviews (covers bot inline
-   reviews), PR conversation comments, and (new) CI failures. The rounds
-   bound keeps counting per-ticket review-fix runs via `countRunsByType`.
-4. **Close the loop externally.** After a review-fix completes with no
-   pending elicitation, the supervisor optionally nudges the external
-   reviewer to re-review (post the bot's mention command, e.g.
-   `@codex review`, or re-request review) instead of running an internal
-   review. Config: `REVIEW_NUDGE_COMMENT` (empty = rely on the bot's
-   review-on-push behavior). Repos without a reviewer bot fall back to
-   human review; nothing in the pipeline blocks on a review existing.
-5. **Skip already-resolved queued feedback.** When the scheduler is about to
-   launch an `automatic` session-work item, check its review thread/comment
-   via `gh`; drop the item if the thread is already resolved. With babysit
-   gone this is belt-and-braces (mid-run feedback is no longer handled
-   in-run), but it protects against `ce-resolve-pr-feedback` having already
-   addressed a queued comment.
-6. **Tests.** New `server.test.ts` cases: CI failure → review-fix launch; CI
-   failure during active run → queued automatic work; rounds exhaustion via
-   CI-triggered fixes; resolved-thread skip; review-fix completion posts the
-   nudge and schedules no internal review; bot commented review with inline
-   comments → review-fix (regression-pin the existing behavior).
+There is also an inconsistency worth removing while we are here: the same
+feedback event is handled two different ways depending on timing. Feedback
+arriving during an active run is queued as session work and later launched
+as a **resume of the original session**; feedback arriving while idle
+launches `review-fix` in a **fresh context**. The fresh context made sense
+when a separate reviewer agent did the fixing; in the target model the
+original session (which has the implementation context) always triages its
+own feedback.
+
+1. **All GitHub feedback becomes session work.** Human `CHANGES_REQUESTED`,
+   non-self commented reviews (covers bot inline reviews), PR conversation
+   comments, and (new) failed `workflow_run`/`check_suite` conclusions on an
+   open `ot/*` PR are enqueued as `automatic` session work with dedup keys
+   (`gh-review-<id>`, `gh-comment-<id>`, `gh-ci-<id>`). An idle ticket
+   launches the next item immediately; an active run picks it up on
+   completion. Every launch is a `resume` of the original session carrying
+   the feedback-triage message (the current `prFeedbackMessage` contract:
+   action clear fixes, answer threads with reasoning, batch decisions into
+   one elicitation). Keep the existing mirror-to-Linear activities.
+2. **Delete both review task types.** Remove `review` (its three adapter
+   files, the `needs-review` label / `review_requested` triggers) and
+   `review-fix` (its three adapter files, `triggerReviewTask`'s launch path,
+   the auto-fresh-re-review in `completeRun`, and the `pending_re_review`
+   flag plus drain logic — additive migration: columns stay, code stops
+   reading them). Task types collapse to `implement | investigate | resume`.
+   The `ce-resolve-pr-feedback` triage rules move into the feedback resume
+   message and the standing rules (AGENTS fragment / skill text), not a
+   separate task.
+3. **Bound the loop.** Replace the `CHANGES_REQUESTED`-count/round logic
+   with one counter: feedback-triggered resumes per ticket (a `source`
+   column on session work already distinguishes `automatic` from `human`),
+   bounded by `REVIEW_MAX_ROUNDS` with the existing "needs a human
+   decision" escalation to Linear and the PR.
+4. **Missing-session fallback.** A `resume` requires the saved native
+   session (`~/.ot/agent-session-id`); it can be lost when a sandbox is
+   recreated. On that failure, surface an error activity to Linear
+   ("workspace was recreated — re-delegate to continue") rather than
+   silently starting a fresh context. Decision recorded: no fresh-context
+   fallback task; re-delegation is the recovery path.
+5. **Remove babysit from the pipelines.** Delete `ce-babysit-pr` from the
+   implement/investigate adapters (all agent forms), `task_ce_pipeline` in
+   `sandbox/lib/runtime.sh`, the composition table in `skills/README.md`,
+   and the corresponding SPEC lines.
+6. **Close the loop externally.** After a feedback-triggered resume
+   completes with no pending elicitation, the supervisor optionally nudges
+   the external reviewer to re-review (post the bot's mention command, e.g.
+   `@codex review`, or re-request review). Config: `REVIEW_NUDGE_COMMENT`
+   (empty = rely on the bot's review-on-push behavior). Repos without a
+   reviewer bot fall back to human review; nothing blocks on a review
+   existing.
+7. **Skip already-resolved queued feedback.** Before launching an
+   `automatic` session-work item, check its review thread/comment via `gh`;
+   drop the item if the thread is already resolved (a prior resume may have
+   addressed several queued items at once).
+8. **Tests.** New `server.test.ts` cases: each feedback kind → queued work →
+   resume launch; CI failure during active run → queued; rounds exhaustion
+   via feedback-triggered resumes; resolved-thread skip; completion posts
+   the nudge and schedules nothing internal; missing-session resume →
+   Linear error; bot commented review with inline comments → queued work
+   (regression-pin the existing trigger).
 
 ## Phase 2 — Extract the scheduler; make chat commands explicit
 
@@ -94,14 +149,14 @@ The "what runs next" policy is currently spread across `completeRun`,
 
 ## Phase 3 — Single-source the task adapters
 
-After Phase 1 removes the `review` adapter, the remaining 3 tasks × 3 agents
-= 9 hand-synchronized prompt files become three canonical skills. Codex now
-supports the open agent skills standard (same `SKILL.md` format), which
-removes most of the per-agent delta.
+After Phase 1 removes the `review` and `review-fix` adapters, the remaining
+2 tasks × 3 agents = 6 hand-synchronized prompt files become two canonical
+skills. Codex now supports the open agent skills standard (same `SKILL.md`
+format), which removes most of the per-agent delta.
 
 1. **Canonical source.** Restructure to
    `skills/tasks/<task>/SKILL.md` as the single source of truth for
-   implement-plan / review-fix / investigate. Per-agent output is
+   implement-plan / investigate. Per-agent output is
    generated at snapshot build time (`supervisor/scripts/build-snapshot.mjs`
    or Dockerfile step), never hand-maintained.
 2. **Claude:** unchanged delivery (user-level skills dir), sourced from the
@@ -165,6 +220,18 @@ servers). This deliberately amends security invariant 1.
    sanitizers (`supervisor/src/sanitize.ts`, `sandbox/lib/runtime.sh`);
    rewrite the AGENTS-fragment paragraph promising no Fly key exists; amend
    SPEC invariant 1 to enumerate excluded keys instead of a blanket claim.
+
+## Future work (recorded, not scheduled)
+
+**Investigate → ticket → implement.** An investigate loop that plans a fix
+should be able to queue that work as a new Linear ticket that re-enters the
+pipeline as a fresh implement loop. Since Linear is the control plane and
+the sandbox holds no Linear credentials, this is a supervisor capability:
+add a new semantic outbox event kind (`ticket-proposal`, carrying title /
+body / suggested labels) that the sandbox emits like any `ot-activity`
+event; the supervisor validates it and creates (optionally delegates) the
+Linear issue. The new ticket then flows through the normal delegation front
+door — no special coupling between the two loops.
 
 ## Explicitly not changing
 
