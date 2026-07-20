@@ -15,7 +15,7 @@ import {
   parsePullRequestUrl,
 } from "./github.js";
 import { startTask, type SandboxEnvContract } from "./daytona.js";
-import { resolveCodexAuthJson } from "./codex-auth.js";
+import { getCodexAuthForSeed } from "./codex-auth.js";
 import { reconcileSandboxAutostop } from "./sandbox-lifecycle.js";
 import { MAX_PRIVATE_LOG_TAIL_CHARS } from "./logs.js";
 import { sanitizeText } from "./sanitize.js";
@@ -227,7 +227,7 @@ export async function launchExistingTask(params: {
         taskType: params.taskType,
         run,
         resumeMessage: params.resumeMessage,
-        codexAuthJson: resolveCodexAuthJson(cfg, store),
+        codexAuthJson: await getCodexAuthForSeed(cfg, store),
       }),
       linearContext:
         params.linearContext ??

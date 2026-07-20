@@ -16,11 +16,32 @@ import type { TicketStore } from "./db.js";
  * env var is a one-time bootstrap seed; the supervisor reads the rotated token
  * back out of each sandbox (see `captureCodexAuthJson`) so the next run seeds
  * the live token.
+ *
+ * `getCodexAuthForSeed` additionally refreshes a near-expiry token centrally,
+ * behind a single in-flight promise, before seeding a sandbox. Concurrent runs
+ * share one shared subscription account, so serializing the supervisor's own
+ * refresh keeps two runs from racing to spend the same refresh token, and hands
+ * each run the freshest possible token so it need not refresh mid-run. (Two
+ * long runs that both outlive the access token can still race inside their
+ * sandboxes — one shared account plus rotation cannot be made fully concurrent
+ * without per-run credentials, e.g. an API key.)
  */
 export const SETTINGS_CODEX_AUTH_JSON = "codex_auth_json";
 
+// Public OAuth parameters of the Codex CLI's ChatGPT login. These are fixed,
+// non-secret values baked into the open-source Codex client; the client is a
+// public PKCE client with no secret.
+const CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token";
+const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+const CODEX_OAUTH_SCOPE = "openid profile email";
+
+// Refresh preflight when the seeded access token would expire within this
+// window, so a fresh sandbox never starts on an already-spent token (which
+// would force an immediate — and, across concurrent runs, racing — refresh).
+const REFRESH_LEEWAY_MS = 15 * 60 * 1000;
+
 interface CodexAuthShape {
-  tokens?: { refresh_token?: unknown };
+  tokens?: { refresh_token?: unknown; access_token?: unknown };
   last_refresh?: unknown;
 }
 
@@ -57,7 +78,7 @@ function codexLastRefreshMs(blob: string | undefined): number | undefined {
  * operator re-logs-in and supplies a strictly newer `last_refresh` (recovering
  * a lineage that has been fully spent).
  */
-export function resolveCodexAuthJson(cfg: Config, store: TicketStore): string | undefined {
+export function resolveStoredCodexAuthJson(cfg: Config, store: TicketStore): string | undefined {
   const stored = store.getSetting(SETTINGS_CODEX_AUTH_JSON);
   const seed = cfg.codexAuthJson;
   if (!stored) {
@@ -95,4 +116,113 @@ export function captureCodexAuthJson(store: TicketStore, blob: string): boolean 
   }
   store.setSetting(SETTINGS_CODEX_AUTH_JSON, blob);
   return true;
+}
+
+/** Decode a JWT's `exp` claim (epoch ms) without verifying the signature. */
+function jwtExpiryMs(token: unknown): number | undefined {
+  if (typeof token !== "string") return undefined;
+  const payload = token.split(".")[1];
+  if (!payload) return undefined;
+  try {
+    const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as {
+      exp?: unknown;
+    };
+    return typeof claims.exp === "number" ? claims.exp * 1000 : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Whether the blob's access token is expired or within the refresh leeway. When
+ * the expiry cannot be read we treat the token as fresh so we never refresh
+ * blindly on every run.
+ */
+function codexAccessTokenNearExpiry(blob: string, nowMs: number): boolean {
+  const expMs = jwtExpiryMs(parseCodexAuth(blob)?.tokens?.access_token);
+  return expMs !== undefined && expMs - nowMs < REFRESH_LEEWAY_MS;
+}
+
+interface CodexRefreshResponse {
+  access_token?: string;
+  id_token?: string;
+  refresh_token?: string;
+}
+
+/**
+ * Exchange the blob's refresh token for a fresh access/id token (and, with
+ * rotation, a new refresh token) and merge the result back into the blob.
+ * Throws on a network or non-2xx error so the caller can fall back to seeding
+ * the stored token. Returns undefined when the blob has no refresh token.
+ */
+export async function refreshCodexAuthJson(
+  currentBlob: string,
+  nowIso: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<string | undefined> {
+  const refreshToken = codexRefreshToken(currentBlob);
+  if (!refreshToken) return undefined;
+  const response = await fetchImpl(CODEX_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      client_id: CODEX_OAUTH_CLIENT_ID,
+      grant_type: "refresh_token",
+      refresh_token: refreshToken,
+      scope: CODEX_OAUTH_SCOPE,
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`Codex token refresh failed with status ${response.status}`);
+  }
+  const refreshed = (await response.json()) as CodexRefreshResponse;
+  if (!refreshed.access_token && !refreshed.refresh_token) {
+    throw new Error("Codex token refresh returned no tokens");
+  }
+
+  const base = (parseCodexAuth(currentBlob) ?? {}) as Record<string, unknown>;
+  const tokens = {
+    ...((base.tokens as Record<string, unknown> | undefined) ?? {}),
+    ...(refreshed.access_token ? { access_token: refreshed.access_token } : {}),
+    ...(refreshed.id_token ? { id_token: refreshed.id_token } : {}),
+    ...(refreshed.refresh_token ? { refresh_token: refreshed.refresh_token } : {}),
+  };
+  return JSON.stringify({ ...base, tokens, last_refresh: nowIso });
+}
+
+// One in-flight refresh per store (i.e. per supervisor process, one shared
+// account): concurrent seed requests coalesce onto the same promise so they
+// never spend the same refresh token twice.
+const refreshInFlight = new WeakMap<TicketStore, Promise<string | undefined>>();
+
+/**
+ * Resolve the Codex auth blob to seed into a sandbox, refreshing a near-expiry
+ * token centrally first. Best-effort: any refresh failure falls back to seeding
+ * the stored token unchanged, so seeding never blocks on OpenAI availability.
+ */
+export async function getCodexAuthForSeed(
+  cfg: Config,
+  store: TicketStore
+): Promise<string | undefined> {
+  const current = resolveStoredCodexAuthJson(cfg, store);
+  if (!current || !codexAccessTokenNearExpiry(current, Date.now())) return current;
+
+  const pending = refreshInFlight.get(store);
+  if (pending) return pending;
+
+  const inflight = (async () => {
+    try {
+      const refreshed = await refreshCodexAuthJson(current, new Date().toISOString());
+      if (!refreshed) return current;
+      store.setSetting(SETTINGS_CODEX_AUTH_JSON, refreshed);
+      return refreshed;
+    } catch (error) {
+      console.warn("[codex-auth] preflight refresh failed; seeding the stored token:", error);
+      return current;
+    } finally {
+      refreshInFlight.delete(store);
+    }
+  })();
+  refreshInFlight.set(store, inflight);
+  return inflight;
 }

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type Database from "better-sqlite3";
 import type { Config } from "./config.js";
 import { createTicketStore, openDb, type TicketStore } from "./db.js";
@@ -6,19 +6,32 @@ import {
   SETTINGS_CODEX_AUTH_JSON,
   captureCodexAuthJson,
   codexRefreshToken,
-  resolveCodexAuthJson,
+  getCodexAuthForSeed,
+  refreshCodexAuthJson,
+  resolveStoredCodexAuthJson,
 } from "./codex-auth.js";
 
 function cfgWith(codexAuthJson: string | undefined): Config {
   return { codexAuthJson } as unknown as Config;
 }
 
-function authBlob(refresh: string, lastRefresh?: string): string {
+/** A JWT whose `exp` is `secondsFromNow` from now (unsigned; only exp matters). */
+function jwtExpiringIn(secondsFromNow: number): string {
+  const exp = Math.floor(Date.now() / 1000) + secondsFromNow;
+  const payload = Buffer.from(JSON.stringify({ exp })).toString("base64url");
+  return `header.${payload}.sig`;
+}
+
+function authBlob(
+  refresh: string,
+  lastRefresh?: string,
+  accessToken = "access"
+): string {
   return JSON.stringify({
     OPENAI_API_KEY: null,
     tokens: {
       id_token: "id",
-      access_token: "access",
+      access_token: accessToken,
       refresh_token: refresh,
       account_id: "acct",
     },
@@ -37,6 +50,8 @@ describe("Codex durable auth", () => {
 
   afterEach(() => {
     db.close();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
   describe("codexRefreshToken", () => {
@@ -52,10 +67,10 @@ describe("Codex durable auth", () => {
     });
   });
 
-  describe("resolveCodexAuthJson", () => {
+  describe("resolveStoredCodexAuthJson", () => {
     it("bootstraps the settings store from the env seed on first use", () => {
       const seed = authBlob("rt-0", "2026-07-01T00:00:00Z");
-      expect(resolveCodexAuthJson(cfgWith(seed), store)).toBe(seed);
+      expect(resolveStoredCodexAuthJson(cfgWith(seed), store)).toBe(seed);
       expect(store.getSetting(SETTINGS_CODEX_AUTH_JSON)).toBe(seed);
     });
 
@@ -64,7 +79,7 @@ describe("Codex durable auth", () => {
       store.setSetting(SETTINGS_CODEX_AUTH_JSON, rotated);
       const staleSeed = authBlob("rt-0", "2026-07-01T00:00:00Z");
 
-      expect(resolveCodexAuthJson(cfgWith(staleSeed), store)).toBe(rotated);
+      expect(resolveStoredCodexAuthJson(cfgWith(staleSeed), store)).toBe(rotated);
       expect(store.getSetting(SETTINGS_CODEX_AUTH_JSON)).toBe(rotated);
     });
 
@@ -72,12 +87,12 @@ describe("Codex durable auth", () => {
       store.setSetting(SETTINGS_CODEX_AUTH_JSON, authBlob("rt-0", "2026-07-01T00:00:00Z"));
       const relogin = authBlob("rt-9", "2026-07-05T00:00:00Z");
 
-      expect(resolveCodexAuthJson(cfgWith(relogin), store)).toBe(relogin);
+      expect(resolveStoredCodexAuthJson(cfgWith(relogin), store)).toBe(relogin);
       expect(store.getSetting(SETTINGS_CODEX_AUTH_JSON)).toBe(relogin);
     });
 
     it("returns undefined when neither env nor store has a token", () => {
-      expect(resolveCodexAuthJson(cfgWith(undefined), store)).toBeUndefined();
+      expect(resolveStoredCodexAuthJson(cfgWith(undefined), store)).toBeUndefined();
       expect(store.getSetting(SETTINGS_CODEX_AUTH_JSON)).toBeUndefined();
     });
   });
@@ -120,6 +135,98 @@ describe("Codex durable auth", () => {
       const rotated = authBlob("rt-1", "2026-07-02T00:00:00Z");
       expect(captureCodexAuthJson(store, rotated)).toBe(true);
       expect(store.getSetting(SETTINGS_CODEX_AUTH_JSON)).toBe(rotated);
+    });
+  });
+
+  describe("refreshCodexAuthJson", () => {
+    it("merges the rotated tokens back into the blob and stamps last_refresh", async () => {
+      const fetchMock = vi.fn(async () => ({
+        ok: true,
+        json: async () => ({
+          access_token: "access-2",
+          id_token: "id-2",
+          refresh_token: "rt-1",
+        }),
+      })) as unknown as typeof fetch;
+
+      const result = await refreshCodexAuthJson(
+        authBlob("rt-0", "2026-07-01T00:00:00Z"),
+        "2026-07-02T12:00:00Z",
+        fetchMock
+      );
+      const parsed = JSON.parse(result!);
+      expect(parsed.tokens.access_token).toBe("access-2");
+      expect(parsed.tokens.refresh_token).toBe("rt-1");
+      expect(parsed.tokens.account_id).toBe("acct"); // preserved
+      expect(parsed.last_refresh).toBe("2026-07-02T12:00:00Z");
+
+      const body = JSON.parse((fetchMock as unknown as ReturnType<typeof vi.fn>).mock.calls[0][1].body);
+      expect(body).toMatchObject({ grant_type: "refresh_token", refresh_token: "rt-0" });
+    });
+
+    it("throws on a non-2xx response so the caller can fall back", async () => {
+      const fetchMock = vi.fn(async () => ({ ok: false, status: 400 })) as unknown as typeof fetch;
+      await expect(
+        refreshCodexAuthJson(authBlob("rt-0"), "2026-07-02T00:00:00Z", fetchMock)
+      ).rejects.toThrow(/status 400/);
+    });
+  });
+
+  describe("getCodexAuthForSeed", () => {
+    it("seeds the stored token unchanged when it is not near expiry", async () => {
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+      const fresh = authBlob("rt-0", "2026-07-01T00:00:00Z", jwtExpiringIn(3600));
+      store.setSetting(SETTINGS_CODEX_AUTH_JSON, fresh);
+
+      expect(await getCodexAuthForSeed(cfgWith(undefined), store)).toBe(fresh);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("refreshes a near-expiry token centrally and persists the rotation", async () => {
+      const fetchMock = vi.fn(async () => ({
+        ok: true,
+        json: async () => ({ access_token: jwtExpiringIn(3600), refresh_token: "rt-1" }),
+      }));
+      vi.stubGlobal("fetch", fetchMock);
+      store.setSetting(
+        SETTINGS_CODEX_AUTH_JSON,
+        authBlob("rt-0", "2026-07-01T00:00:00Z", jwtExpiringIn(60))
+      );
+
+      const seeded = await getCodexAuthForSeed(cfgWith(undefined), store);
+      expect(codexRefreshToken(seeded)).toBe("rt-1");
+      expect(codexRefreshToken(store.getSetting(SETTINGS_CODEX_AUTH_JSON))).toBe("rt-1");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("coalesces concurrent seeds onto a single refresh", async () => {
+      const fetchMock = vi.fn(async () => ({
+        ok: true,
+        json: async () => ({ access_token: jwtExpiringIn(3600), refresh_token: "rt-1" }),
+      }));
+      vi.stubGlobal("fetch", fetchMock);
+      store.setSetting(
+        SETTINGS_CODEX_AUTH_JSON,
+        authBlob("rt-0", "2026-07-01T00:00:00Z", jwtExpiringIn(60))
+      );
+
+      const [a, b] = await Promise.all([
+        getCodexAuthForSeed(cfgWith(undefined), store),
+        getCodexAuthForSeed(cfgWith(undefined), store),
+      ]);
+      expect(a).toBe(b);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("falls back to the stored token when the refresh fails", async () => {
+      const fetchMock = vi.fn(async () => ({ ok: false, status: 401 }));
+      vi.stubGlobal("fetch", fetchMock);
+      const stale = authBlob("rt-0", "2026-07-01T00:00:00Z", jwtExpiringIn(60));
+      store.setSetting(SETTINGS_CODEX_AUTH_JSON, stale);
+
+      expect(await getCodexAuthForSeed(cfgWith(undefined), store)).toBe(stale);
+      expect(store.getSetting(SETTINGS_CODEX_AUTH_JSON)).toBe(stale);
     });
   });
 });
