@@ -7,6 +7,19 @@ import { pathToFileURL } from "node:url";
 
 const ACTIVITY_TYPES = new Set(["thought", "action", "elicitation", "response", "error"]);
 const MAX_BODY_LENGTH = 8_000;
+const MAX_PLAN_ITEMS = 50;
+const MAX_PLAN_CONTENT = 500;
+
+// Friendly aliases → Linear's four canonical plan statuses, so an agent can
+// write `done`/`running`/`skip` and still produce a valid plan.
+const PLAN_STATUS_ALIASES = {
+  pending: "pending", todo: "pending", queued: "pending", waiting: "pending", blocked: "pending",
+  inprogress: "inProgress", "in-progress": "inProgress", active: "inProgress",
+  running: "inProgress", doing: "inProgress", wip: "inProgress",
+  completed: "completed", complete: "completed", done: "completed", passed: "completed", ok: "completed",
+  canceled: "canceled", cancelled: "canceled", skip: "canceled", skipped: "canceled",
+  gap: "canceled", na: "canceled", "n/a": "canceled",
+};
 
 export function buildActivityEvent({ runId, type, message }) {
   if (!runId || !/^[A-Za-z0-9_-]{1,128}$/.test(runId)) {
@@ -31,10 +44,54 @@ export function buildActivityEvent({ runId, type, message }) {
   };
 }
 
+export function normalizePlanStatus(raw) {
+  const key = String(raw ?? "").trim().toLowerCase();
+  const mapped = PLAN_STATUS_ALIASES[key];
+  if (!mapped) {
+    throw new Error(`Unsupported plan status: ${raw} (use pending|inProgress|completed|canceled)`);
+  }
+  return mapped;
+}
+
+// Parse one `Content=status` CLI token into a plan item. Splits on the LAST
+// `=` so plan content may itself contain `=`.
+export function parsePlanItem(arg) {
+  const text = String(arg);
+  const idx = text.lastIndexOf("=");
+  if (idx < 0) {
+    throw new Error(`Plan item must be "content=status": ${arg}`);
+  }
+  const content = text.slice(0, idx).trim();
+  if (!content) throw new Error(`Plan item is missing content: ${arg}`);
+  if (content.length > MAX_PLAN_CONTENT) {
+    throw new Error(`Plan item content must be at most ${MAX_PLAN_CONTENT} characters`);
+  }
+  return { content, status: normalizePlanStatus(text.slice(idx + 1)) };
+}
+
+export function buildPlanEvent({ runId, items }) {
+  if (!runId || !/^[A-Za-z0-9_-]{1,128}$/.test(runId)) {
+    throw new Error("RUN_ID is missing or unsafe");
+  }
+  if (!Array.isArray(items) || items.length === 0 || items.length > MAX_PLAN_ITEMS) {
+    throw new Error(`Plan must have between 1 and ${MAX_PLAN_ITEMS} items`);
+  }
+  return {
+    version: 1,
+    kind: "plan",
+    event_id: randomUUID(),
+    run_id: runId,
+    created_at: new Date().toISOString(),
+    plan: items,
+  };
+}
+
+// Writes any outbox event (activity or plan). The filename carries the kind so
+// the supervisor can tell them apart; ordering is by the timestamp prefix.
 export async function writeActivityEvent(event, outboxDir) {
   await mkdir(outboxDir, { recursive: true, mode: 0o700 });
   const prefix = String(Date.parse(event.created_at)).padStart(13, "0");
-  const finalPath = join(outboxDir, `${prefix}-activity-${event.event_id}.json`);
+  const finalPath = join(outboxDir, `${prefix}-${event.kind}-${event.event_id}.json`);
   const temporaryPath = `${finalPath}.tmp`;
   await writeFile(temporaryPath, `${JSON.stringify(event)}\n`, { mode: 0o600 });
   await rename(temporaryPath, finalPath);
@@ -42,16 +99,28 @@ export async function writeActivityEvent(event, outboxDir) {
 }
 
 async function main() {
-  const [type, ...messageParts] = process.argv.slice(2);
-  if (!type || messageParts.length === 0) {
-    throw new Error("Usage: ot-activity <thought|action|elicitation|response|error> <message>");
+  const [type, ...rest] = process.argv.slice(2);
+  const outboxDir = resolve(process.env.OT_OUTBOX_DIR ?? "/home/agent/.ot/outbox");
+
+  if (type === "plan") {
+    if (rest.length === 0) {
+      throw new Error('Usage: ot-activity plan "<content>=<status>" ["<content>=<status>" ...]');
+    }
+    const event = buildPlanEvent({ runId: process.env.RUN_ID, items: rest.map(parsePlanItem) });
+    await writeActivityEvent(event, outboxDir);
+    return;
+  }
+
+  if (!type || rest.length === 0) {
+    throw new Error(
+      "Usage: ot-activity <thought|action|elicitation|response|error> <message> | ot-activity plan <items...>"
+    );
   }
   const event = buildActivityEvent({
     runId: process.env.RUN_ID,
     type,
-    message: messageParts.join(" "),
+    message: rest.join(" "),
   });
-  const outboxDir = resolve(process.env.OT_OUTBOX_DIR ?? "/home/agent/.ot/outbox");
   await writeActivityEvent(event, outboxDir);
 }
 

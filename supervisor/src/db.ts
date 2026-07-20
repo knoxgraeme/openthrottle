@@ -341,7 +341,7 @@ interface SandboxEventRecord {
   event_id: string;
   run_id: string;
   sandbox_id: string;
-  kind: "activity" | "completion";
+  kind: "activity" | "completion" | "plan";
   payload: string;
   status: "pending" | "processing" | "failed" | "processed";
   attempts: number;
@@ -504,7 +504,7 @@ export interface TicketStore {
     eventId: string;
     runId: string;
     sandboxId: string;
-    kind: "activity" | "completion";
+    kind: "activity" | "completion" | "plan";
     payload: string;
   }): SandboxEventRecord;
   getSandboxEvent(eventId: string): SandboxEventRecord | undefined;

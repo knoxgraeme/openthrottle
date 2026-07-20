@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import {
+  buildHeartbeatEvent,
   collectEnvSecretValues,
   processLine,
   sanitize,
+  shouldEmitHeartbeat,
   summarizeOpenCodeEvent,
   summarizeCodexItem,
+  summarizeToolUse,
   truncate,
   writeRunResult,
 } from "./normalize.mjs";
@@ -71,5 +74,30 @@ describe("normalize", () => {
     writeRunResult();
     const result = JSON.parse(readFileSync(`${process.env.HOME}/.ot/run-result.json`, "utf8"));
     expect(result.final_response).toBe("Codex final [REDACTED]");
+  });
+});
+
+describe("progress heartbeat", () => {
+  it("throttles by the configured interval", () => {
+    expect(shouldEmitHeartbeat(0, 15_000, 15_000)).toBe(true);
+    expect(shouldEmitHeartbeat(1_000, 10_000, 15_000)).toBe(false);
+    expect(shouldEmitHeartbeat(1_000, 16_000, 15_000)).toBe(true);
+  });
+
+  it("summarizes tool_use into a short 'currently doing X' line", () => {
+    expect(summarizeToolUse("Bash", { command: "pnpm test" })).toBe("running: pnpm test");
+    expect(summarizeToolUse("Edit", { file_path: "/repo/src/app.ts" })).toBe("Edit app.ts");
+    expect(summarizeToolUse("WebSearch", {})).toBe("running WebSearch");
+  });
+
+  it("builds an ephemeral thought event, sanitized and bounded", () => {
+    const event = buildHeartbeatEvent({
+      runId: "run-1",
+      summary: "running: deploy --token ghp_abcdefghijklmnop",
+      nowIso: "2026-07-18T00:00:00.000Z",
+    });
+    expect(event).toMatchObject({ kind: "activity", type: "thought", ephemeral: true, run_id: "run-1" });
+    expect(event.body).toContain("[REDACTED]");
+    expect(event.body).not.toContain("ghp_abcdefghijklmnop");
   });
 });

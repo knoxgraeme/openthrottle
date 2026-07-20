@@ -1,4 +1,4 @@
-import type { AgentActivityInput, LinearClient } from "./linear.js";
+import type { AgentActivityInput, AgentPlanItem, LinearClient } from "./linear.js";
 import { agentActivityCreate, agentSessionUpdate } from "./linear.js";
 import type { LinearOutboxRecord, TicketStore } from "./db.js";
 import { sanitizeText } from "./sanitize.js";
@@ -54,18 +54,22 @@ export async function enqueueSessionUpdate(
   store: TicketStore,
   outbox: LinearOutboxProcessor,
   params: {
+    id?: string;
     sessionId: string;
     issueId?: string;
     addedExternalUrls?: Array<{ label: string; url: string }>;
+    plan?: AgentPlanItem[];
   }
 ): Promise<void> {
   const row = store.enqueueLinearOutbox({
+    id: params.id,
     linearSessionId: params.sessionId,
     issueId: params.issueId,
     kind: "session_update",
     payload: sessionUpdatePayload({
       sessionId: params.sessionId,
       addedExternalUrls: params.addedExternalUrls,
+      plan: params.plan,
     }),
   });
   await outbox.process(row.id);
@@ -82,6 +86,7 @@ type LinearOutboxPayload =
       type: "session_update";
       sessionId: string;
       addedExternalUrls?: Array<{ label: string; url: string }>;
+      plan?: AgentPlanItem[];
     };
 
 function retryDelayMs(attempts: number): number {
@@ -113,6 +118,7 @@ async function deliver(linear: LinearClient, row: LinearOutboxRecord): Promise<v
   await agentSessionUpdate(linear, {
     sessionId: payload.sessionId,
     addedExternalUrls: payload.addedExternalUrls,
+    plan: payload.plan,
   });
 }
 
@@ -186,6 +192,7 @@ export function activityPayload(activity: AgentActivityInput): string {
 export function sessionUpdatePayload(params: {
   sessionId: string;
   addedExternalUrls?: Array<{ label: string; url: string }>;
+  plan?: AgentPlanItem[];
 }): string {
   return JSON.stringify({ type: "session_update", ...params });
 }

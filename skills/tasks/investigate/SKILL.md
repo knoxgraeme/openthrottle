@@ -11,7 +11,10 @@ confirmed, convergent bug, but must defer divergent product or architecture
 decisions.
 
 1. Read the bug report and run `ot-activity action` with the symptom being
-   investigated.
+   investigated, then seed the Linear session plan so progress is visible:
+   `ot-activity plan "Diagnose=inProgress" "Fix + regression test=pending"
+   "Open PR=pending" "CI green=pending"`. Replace the whole plan as phases
+   progress; a live per-step heartbeat is emitted automatically by the runtime.
 2. Invoke the native Compound Engineering skill `ce-debug` (`/ce-debug` in
    Claude Code; `$ce-debug` in Codex/OpenCode) as `mode:pipeline <bug
    description>`, passing the actual bug report and relevant acceptance
@@ -29,7 +32,8 @@ decisions.
    `## OpenThrottle gates` checklist in the PR description (update in place,
    never overwrite the body) covering the regression test, the fix,
    verification, and CI — marking anything you could not run (e.g. a gate the
-   sandbox OOM-killed with exit 137) as a known gap rather than done.
+   sandbox OOM-killed with exit 137) as a known gap rather than done. Mirror the
+   same states into the Linear session plan with `ot-activity plan`.
 4. If the fix is blocked on a divergent product or architecture decision that
    a specific answer would unblock, run `ot-activity elicitation` with the
    diagnosis and one numbered decision list (context, options, and your

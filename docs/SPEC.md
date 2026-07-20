@@ -81,11 +81,21 @@ Linear AgentSessionEvent ──HMAC──> Fly supervisor ──@daytona/sdk─�
 
 Each run receives a random one-time callback token; only its SHA-256 hash is
 stored in the run table. Agents use `ot-activity` to write validated semantic
-activity records locally. The entrypoint writes a completion marker with exit
-code, cost, PR URL, sanitized final assistant response, and sanitized failure
-tail. Every five seconds, Fly polls only active runs through the Daytona SDK, durably claims each event, and
+activity records locally: the five activity types (`thought`, `action`,
+`elicitation`, `response`, `error`), plus `ot-activity plan "<content>=<status>"
+…` which writes a `plan` event carrying a session-level checklist (Linear plan
+statuses `pending`/`inProgress`/`completed`/`canceled`, replaced in full each
+update). Independently, `runner/normalize.mjs` mirrors a throttled, ephemeral
+`thought` for each meaningful agent step (a tool call, shell command, or file
+edit) into the same outbox — a live "currently doing X" heartbeat that
+self-replaces in the session and answers "stuck or working?" without cluttering
+the permanent timeline (interval `OT_HEARTBEAT_INTERVAL_MS`, default 15s). The
+entrypoint writes a completion marker with exit code, cost, PR URL, sanitized
+final assistant response, and sanitized failure tail. Every five seconds, Fly
+polls only active runs through the Daytona SDK, durably claims each event, and
 projects activities into `linear_outbox` using the run's immutable Linear
-session binding. A late event from a superseded session is consumed without
+session binding; a `plan` event becomes an `agentSessionUpdate` carrying the
+plan, and only `thought`/`action` activities may be marked `ephemeral`. A late event from a superseded session is consumed without
 publishing into the newer conversation. Completion uses the same finalizer as
 the legacy `POST /runs/:id/complete` endpoint and enqueues the first explicit
 terminal activity when present, otherwise the captured final assistant response,
@@ -384,9 +394,11 @@ decisions" section for human audit.
 thread/OpenCode session.
 
 The normalizer captures session IDs and Claude `total_cost_usd`, writes
-`~/.ot/run-result.json`, and sanitizes all output. Sanitizers redact named
-secret env values, inner strings in `CODEX_AUTH_JSON`, GitHub/OpenAI/Linear
-token shapes, and bearer credentials.
+`~/.ot/run-result.json`, emits the throttled ephemeral progress heartbeat
+described under "Sandbox activity and completion", and sanitizes all output
+(the heartbeat body included). Sanitizers redact named secret env values, inner
+strings in `CODEX_AUTH_JSON`, GitHub/OpenAI/Linear token shapes, and bearer
+credentials.
 
 The checkout remote is a clean `https://github.com/owner/repo` URL. `gh auth
 setup-git` supplies the current token through Git's credential helper, so no

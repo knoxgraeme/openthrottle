@@ -97,6 +97,14 @@ The adapters remain necessary for contracts that CE does not own:
   simplification, CI, review threads) so a human can see which gates completed.
   A gate that could not run — e.g. one the sandbox OOM-killed (exit 137) — is
   marked a known gap, never reported as passed.
+- Progress visibility: each adapter seeds and refreshes a Linear **session
+  plan** (`ot-activity plan "<content>=<status>"`, statuses
+  `pending`/`inProgress`/`completed`/`canceled`, replaced whole each update) so
+  users see which phase/gate is done, in progress, or a gap — the same states
+  the PR gate checklist carries. A live per-step "currently doing X" heartbeat
+  (throttled, ephemeral `thought`s) is emitted automatically by
+  `runner/normalize.mjs`, so adapters never need to narrate individual tool
+  calls to show the run is alive.
 - The assumptions ledger: responses and PR descriptions end with an
   "Assumptions & decisions" section so a human can audit every judgment call
   the agent made without asking.
