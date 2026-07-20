@@ -689,9 +689,16 @@ export function createTicketStore(db: Database.Database): TicketStore {
     ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)
   `);
   const getSandboxEventStmt = db.prepare("SELECT * FROM sandbox_events WHERE event_id = ?");
+  // Ephemeral activities (the live progress heartbeat) must never count as the
+  // run's last terminal activity: an agent's terminal `ot-activity
+  // elicitation/response` can be followed by a heartbeat with a newer timestamp
+  // (e.g. Codex reports the command_execution after the file is written), which
+  // would otherwise mask the terminal event and make completion post a generic
+  // response or drain queued work instead of pausing.
   const getLastProcessedSandboxActivityStmt = db.prepare(`
     SELECT * FROM sandbox_events
     WHERE run_id = ? AND kind = 'activity' AND status = 'processed'
+      AND (json_extract(payload, '$.ephemeral') IS NOT 1)
     ORDER BY processed_at DESC, created_at DESC
     LIMIT 1
   `);

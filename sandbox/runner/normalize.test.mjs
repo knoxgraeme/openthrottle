@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import {
   buildHeartbeatEvent,
   collectEnvSecretValues,
+  isOtActivityCommand,
   processLine,
   sanitize,
   shouldEmitHeartbeat,
@@ -88,6 +89,13 @@ describe("progress heartbeat", () => {
     expect(summarizeToolUse("Bash", { command: "pnpm test" })).toBe("running: pnpm test");
     expect(summarizeToolUse("Edit", { file_path: "/repo/src/app.ts" })).toBe("Edit app.ts");
     expect(summarizeToolUse("WebSearch", {})).toBe("running WebSearch");
+  });
+
+  it("detects ot-activity commands so they are not heartbeated", () => {
+    expect(isOtActivityCommand("ot-activity elicitation 'need input'")).toBe(true);
+    expect(isOtActivityCommand("cd repo && ot-activity response 'done'")).toBe(true);
+    expect(isOtActivityCommand("pnpm test")).toBe(false);
+    expect(isOtActivityCommand(undefined)).toBe(false);
   });
 
   it("builds an ephemeral thought event, sanitized and bounded", () => {

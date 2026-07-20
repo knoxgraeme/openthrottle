@@ -198,8 +198,14 @@ jq -e '.exit_code == 0 and .cost_usd == 0.125' \
   "$(find "$CLAUDE_HOME/.ot/outbox" -name '*completion-claude-implement.json' -print -quit)" >/dev/null
 jq -e '.exit_code == 0 and .cost_usd == 0.25' \
   "$(find "$CLAUDE_HOME/.ot/outbox" -name '*completion-claude-resume.json' -print -quit)" >/dev/null
-jq -e '.kind == "activity" and .type == "action"' \
-  "$(find "$CLAUDE_HOME/.ot/outbox" -name '*-activity-*.json' -print -quit)" >/dev/null
+# The agent's `ot-activity action` and the normalizer's ephemeral progress
+# heartbeat both land as activity files, so assert across all of them rather
+# than assuming a single one: an action activity exists, and the live heartbeat
+# emitted an ephemeral thought.
+find "$CLAUDE_HOME/.ot/outbox" -name '*-activity-*.json' -exec cat {} + \
+  | jq -s -e 'any(.[]; .kind == "activity" and .type == "action")' >/dev/null
+find "$CLAUDE_HOME/.ot/outbox" -name '*-activity-*.json' -exec cat {} + \
+  | jq -s -e 'any(.[]; .type == "thought" and .ephemeral == true)' >/dev/null
 
 CODEX_HOME="$SMOKE_DIR/result/codex-home"
 seed_agent_home "$CODEX_HOME"
@@ -218,8 +224,8 @@ jq -e '.exit_code == 0 and (has("cost_usd") | not)' \
   "$(find "$CODEX_HOME/.ot/outbox" -name '*completion-codex-implement.json' -print -quit)" >/dev/null
 jq -e '.exit_code == 0 and (has("cost_usd") | not)' \
   "$(find "$CODEX_HOME/.ot/outbox" -name '*completion-codex-resume.json' -print -quit)" >/dev/null
-jq -e '.kind == "activity" and .type == "action"' \
-  "$(find "$CODEX_HOME/.ot/outbox" -name '*-activity-*.json' -print -quit)" >/dev/null
+find "$CODEX_HOME/.ot/outbox" -name '*-activity-*.json' -exec cat {} + \
+  | jq -s -e 'any(.[]; .kind == "activity" and .type == "action")' >/dev/null
 
 OPENCODE_HOME="$SMOKE_DIR/result/opencode-home"
 seed_agent_home "$OPENCODE_HOME"

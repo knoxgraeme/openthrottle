@@ -198,6 +198,14 @@ function firstLine(text) {
   return String(text ?? "").trim().split("\n")[0];
 }
 
+// `ot-activity` invocations already write their own semantic activity; a
+// heartbeat for them is pure noise, and heartbeating a *terminal* ot-activity
+// (elicitation/response/error) command would emit an ephemeral thought after
+// the terminal event. Skip them.
+export function isOtActivityCommand(command) {
+  return /\bot-activity\b/.test(String(command ?? ""));
+}
+
 // ---------------------------------------------------------------------------
 // Output helpers
 // ---------------------------------------------------------------------------
@@ -265,7 +273,9 @@ function handleClaudeLine(obj) {
           emit(
             `[claude] tool_use: ${block.name}(${truncate(JSON.stringify(block.input ?? {}), 300)})`,
           );
-          maybeHeartbeat(summarizeToolUse(block.name, block.input));
+          if (!(block.name === "Bash" && isOtActivityCommand(block.input?.command))) {
+            maybeHeartbeat(summarizeToolUse(block.name, block.input));
+          }
         }
       }
       return true;
@@ -341,7 +351,7 @@ function handleCodexLine(obj) {
     case "item.completed": {
       const item = obj.item ?? {};
       emit(`[codex] ${summarizeCodexItem(item)}`);
-      if (item.type === "command_execution" && item.command) {
+      if (item.type === "command_execution" && item.command && !isOtActivityCommand(item.command)) {
         maybeHeartbeat(`running: ${item.command}`);
       } else if (item.type === "file_change") {
         maybeHeartbeat(`editing: ${truncate(JSON.stringify(item.changes ?? item), 160)}`);
