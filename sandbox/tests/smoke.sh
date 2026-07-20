@@ -40,20 +40,31 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
   gosu agent env HOME=/home/agent claude plugin list --json | jq -e '\''.[] | select(.id == "compound-engineering@compound-engineering-plugin" and .version == "3.19.0" and .enabled == true)'\'' >/dev/null &&
   gosu agent env HOME=/home/agent claude plugin details compound-engineering@compound-engineering-plugin | rg -q "ce-work" &&
   test -f /home/agent/.claude/plugins/cache/compound-engineering-plugin/compound-engineering/3.19.0/skills/ce-work/SKILL.md &&
-  rg -q "/ce-work" /opt/openthrottle/skills/claude/implement-plan/SKILL.md &&
+  rg -q "ce-work" /opt/openthrottle/skills/tasks/implement-plan/SKILL.md &&
+  test -f /opt/openthrottle/skills/tasks/investigate/SKILL.md &&
+  test ! -e /opt/openthrottle/skills/claude &&
+  test ! -e /opt/openthrottle/skills/opencode &&
+  test ! -e /opt/openthrottle/skills/codex/implement-plan.md &&
+  test ! -e /opt/openthrottle/skills/codex/review.md &&
+  test ! -e /opt/openthrottle/skills/codex/review-fix.md &&
+  test ! -e /opt/openthrottle/skills/codex/investigate.md &&
+  test -f /opt/openthrottle/skills/codex/AGENTS-fragment.md &&
   codex --version | rg -q "0\.143\.0" &&
   codex exec --help | rg -q -- "--json" &&
   codex exec --help | rg -q -- "--dangerously-bypass-approvals-and-sandbox" &&
   codex exec resume --help | rg -q -- "--skip-git-repo-check" &&
   gosu agent env HOME=/home/agent CODEX_HOME=/home/agent/.codex codex plugin list --json | jq -e '\''.installed[] | select(.pluginId == "compound-engineering@compound-engineering-plugin" and .version == "3.19.0" and .enabled == true)'\'' >/dev/null &&
   test -f /home/agent/.codex/plugins/cache/compound-engineering-plugin/compound-engineering/3.19.0/skills/ce-work/SKILL.md &&
+  test -f /etc/codex/skills/implement-plan/SKILL.md &&
+  test -f /etc/codex/skills/investigate/SKILL.md &&
+  rg -q "allow_implicit_invocation: false" /etc/codex/skills/implement-plan/agents/openai.yaml &&
+  rg -q "allow_implicit_invocation: false" /etc/codex/skills/investigate/agents/openai.yaml &&
   opencode --version 2>&1 | rg -q "1\.18\.3" &&
   opencode run --help 2>&1 | rg -q -- "--format" &&
   opencode run --help 2>&1 | rg -q -- "--session" &&
   opencode run --help 2>&1 | rg -q -- "--model" &&
   opencode run --help 2>&1 | rg -q -- "--dir" &&
-  opencode run --help 2>&1 | rg -q -- "--auto" &&
-  test ! -e /opt/openthrottle/skills/opencode/ce-work/SKILL.md
+  opencode run --help 2>&1 | rg -q -- "--auto"
 '
 
 cat > "$SMOKE_DIR/bin/claude" <<'STUB'
@@ -194,9 +205,13 @@ CODEX_HOME="$SMOKE_DIR/result/codex-home"
 seed_agent_home "$CODEX_HOME"
 run_sandbox "$CODEX_HOME" codex implement ot/smoke-codex codex-implement OT-CODEX
 test "$(cat "$CODEX_HOME/.ot/agent-session-id")" = "smoke-codex-thread"
-grep -Fq '$ce-work' "$CODEX_HOME/.ot/codex-stdin.log"
-grep -Fq 'CE pipeline: ce-work,ce-code-review,ce-commit-push-pr,ce-babysit-pr' \
+head -n1 "$CODEX_HOME/.ot/codex-stdin.log" | grep -Fxq '$implement-plan'
+grep -Fq 'CE pipeline: ce-work,ce-code-review,ce-commit-push-pr' \
   "$CODEX_HOME/.ot/codex-stdin.log"
+if grep -Eq 'PR number|Review round' "$CODEX_HOME/.ot/codex-stdin.log"; then
+  echo "codex stdin still contains the retired PR number/Review round fields" >&2
+  exit 1
+fi
 run_sandbox "$CODEX_HOME" codex resume ot/smoke-codex codex-resume OT-CODEX "continue"
 grep -q -- 'exec .* resume smoke-codex-thread continue' "$CODEX_HOME/.ot/codex-args.log"
 jq -e '.exit_code == 0 and (has("cost_usd") | not)' \
@@ -212,6 +227,16 @@ run_sandbox "$OPENCODE_HOME" opencode implement ot/smoke-opencode opencode-imple
 test "$(cat "$OPENCODE_HOME/.ot/agent-session-id")" = "smoke-opencode-session"
 test "$(cat "$OPENCODE_HOME/.ot/agent-model")" = "kimi-code/kimi-for-coding"
 grep -Fq '$ce-work' "$OPENCODE_HOME/.ot/opencode-prompt.log"
+grep -Fq 'CE pipeline: ce-work,ce-code-review,ce-commit-push-pr' \
+  "$OPENCODE_HOME/.ot/opencode-prompt.log"
+if grep -Eq 'PR number|Review round' "$OPENCODE_HOME/.ot/opencode-prompt.log"; then
+  echo "opencode prompt still contains the retired PR number/Review round fields" >&2
+  exit 1
+fi
+if grep -Fxq -- '---' "$OPENCODE_HOME/.ot/opencode-prompt.log"; then
+  echo "opencode prompt still carries the SKILL.md YAML frontmatter" >&2
+  exit 1
+fi
 grep -q -- 'run .*--model kimi-code/kimi-for-coding .*--dir /home/agent/repo .*--auto' \
   "$OPENCODE_HOME/.ot/opencode-args.log"
 run_sandbox "$OPENCODE_HOME" opencode resume ot/smoke-opencode opencode-resume OT-OPENCODE "continue"

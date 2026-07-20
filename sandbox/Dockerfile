@@ -114,6 +114,17 @@ COPY sandbox/safety /opt/openthrottle/safety
 COPY sandbox/bin/ot-activity.mjs /usr/local/bin/ot-activity
 COPY skills /opt/openthrottle/skills
 
+# The canonical task skills (skills/tasks/<name>/SKILL.md, agents/openai.yaml)
+# are the single source of truth. Claude picks them up at runtime from
+# /opt/openthrottle/skills/tasks (entrypoint.sh copies them into the sandbox
+# user's ~/.claude/skills). Codex instead gets them baked in here at
+# admin scope (/etc/codex/skills), which Codex discovers natively without any
+# per-run copy; each skill's agents/openai.yaml sets
+# policy.allow_implicit_invocation: false so a skill only runs when the
+# entrypoint's prompt names it explicitly via `$<skill-name>`.
+RUN mkdir -p /etc/codex/skills \
+    && cp -r /opt/openthrottle/skills/tasks/. /etc/codex/skills/
+
 RUN chmod 0755 /opt/openthrottle/entrypoint.sh \
     && chmod 0755 /opt/openthrottle/lib/runtime.sh \
     && chmod 0755 /usr/local/bin/ot-activity \

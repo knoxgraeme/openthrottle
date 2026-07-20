@@ -22,28 +22,50 @@ setup() {
 @test "task types map to the correct skill" {
   run task_skill_name implement
   [ "$output" = "implement-plan" ]
-  run task_skill_name review-fix
-  [ "$output" = "review-fix" ]
+  run task_skill_name investigate
+  [ "$output" = "investigate" ]
+  run task_skill_name resume
+  [ "$status" -ne 0 ]
   run is_supported_task_type unknown
+  [ "$status" -ne 0 ]
+}
+
+@test "task types collapse to implement, resume, investigate" {
+  run is_supported_task_type implement
+  [ "$status" -eq 0 ]
+  run is_supported_task_type resume
+  [ "$status" -eq 0 ]
+  run is_supported_task_type investigate
+  [ "$status" -eq 0 ]
+  run is_supported_task_type review
+  [ "$status" -ne 0 ]
+  run is_supported_task_type review-fix
   [ "$status" -ne 0 ]
 }
 
 @test "task types declare their native Compound Engineering pipeline" {
   run task_ce_pipeline implement
   [ "$status" -eq 0 ]
-  [ "$output" = "ce-work,ce-code-review,ce-commit-push-pr,ce-babysit-pr" ]
-
-  run task_ce_pipeline review
-  [ "$output" = "ce-code-review" ]
-
-  run task_ce_pipeline review-fix
-  [ "$output" = "ce-resolve-pr-feedback,ce-babysit-pr" ]
+  [ "$output" = "ce-work,ce-code-review,ce-commit-push-pr" ]
 
   run task_ce_pipeline investigate
-  [ "$output" = "ce-debug,ce-commit-push-pr,ce-babysit-pr" ]
+  [ "$output" = "ce-debug,ce-commit-push-pr" ]
 
   run task_ce_pipeline resume
   [ "$output" = "resume" ]
+
+  run task_ce_pipeline review
+  [ "$status" -ne 0 ]
+
+  run task_ce_pipeline review-fix
+  [ "$status" -ne 0 ]
+}
+
+@test "no pipeline mentions ce-babysit-pr" {
+  for task in implement investigate resume; do
+    run task_ce_pipeline "$task"
+    [[ "$output" != *ce-babysit-pr* ]]
+  done
 }
 
 @test "resolve_git_identity prefers override, then GitHub noreply, then placeholder" {

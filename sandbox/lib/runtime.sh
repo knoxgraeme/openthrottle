@@ -71,7 +71,7 @@ yq_value_or_default() {
 
 is_supported_task_type() {
   case "$1" in
-    implement|resume|review|review-fix|investigate) return 0 ;;
+    implement|resume|investigate) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -79,7 +79,7 @@ is_supported_task_type() {
 task_skill_name() {
   case "$1" in
     implement) printf '%s' 'implement-plan' ;;
-    review|review-fix|investigate) printf '%s' "$1" ;;
+    investigate) printf '%s' 'investigate' ;;
     *) return 1 ;;
   esac
 }
@@ -89,10 +89,8 @@ task_skill_name() {
 # tests, logs, and the agent itself while Fly remains the outer scheduler.
 task_ce_pipeline() {
   case "$1" in
-    implement) printf '%s' 'ce-work,ce-code-review,ce-commit-push-pr,ce-babysit-pr' ;;
-    review) printf '%s' 'ce-code-review' ;;
-    review-fix) printf '%s' 'ce-resolve-pr-feedback,ce-babysit-pr' ;;
-    investigate) printf '%s' 'ce-debug,ce-commit-push-pr,ce-babysit-pr' ;;
+    implement) printf '%s' 'ce-work,ce-code-review,ce-commit-push-pr' ;;
+    investigate) printf '%s' 'ce-debug,ce-commit-push-pr' ;;
     resume) printf '%s' 'resume' ;;
     *) return 1 ;;
   esac

@@ -163,9 +163,6 @@ is_supported_task_type "$TASK_TYPE" \
 if [[ "$TASK_TYPE" == "resume" ]]; then
   : "${RESUME_MESSAGE:?RESUME_MESSAGE is required when TASK_TYPE=resume}"
 fi
-if [[ "$TASK_TYPE" == "review" || "$TASK_TYPE" == "review-fix" ]]; then
-  : "${PR_NUMBER:?PR_NUMBER is required for review tasks}"
-fi
 
 MAX_TURNS="${MAX_TURNS:-200}"
 TASK_TIMEOUT="${TASK_TIMEOUT:-7200}"
@@ -433,10 +430,13 @@ log "phase 7: agent run"
 
 # Claude skills live in the sandbox user's skill directory, never inside the
 # target checkout. This avoids overwriting or dirtying a repository that
-# already tracks its own .claude/skills content.
+# already tracks its own .claude/skills content. Codex and OpenCode do not use
+# this copy: Codex discovers the same canonical skills baked into
+# /etc/codex/skills at image build time (admin scope), and OpenCode's prompt
+# is rendered from the canonical file at runtime below.
 mkdir -p "${AGENT_HOME}/.claude/skills"
-if [[ -d "${OPT_DIR}/skills/claude" ]]; then
-  cp -r "${OPT_DIR}/skills/claude/." "${AGENT_HOME}/.claude/skills/"
+if [[ -d "${OPT_DIR}/skills/tasks" ]]; then
+  cp -r "${OPT_DIR}/skills/tasks/." "${AGENT_HOME}/.claude/skills/"
 fi
 chown -R "${AGENT_USER}:${AGENT_USER}" "${AGENT_HOME}/.claude"
 
@@ -490,7 +490,7 @@ CODEX_STDIN_FILE=""
 OPENCODE_PROMPT_FILE=""
 
 case "${AGENT}:${TASK_TYPE}" in
-  claude:implement|claude:review|claude:review-fix|claude:investigate)
+  claude:implement|claude:investigate)
     SKILL_NAME="$(task_skill_name "$TASK_TYPE")"
     AGENT_CMD=(claude -p "/${SKILL_NAME}" --output-format stream-json --verbose \
       --max-turns "$MAX_TURNS" --dangerously-skip-permissions \
@@ -508,14 +508,17 @@ case "${AGENT}:${TASK_TYPE}" in
       --dangerously-skip-permissions --mcp-config "$MCP_CONFIG_FILE" \
       --strict-mcp-config --setting-sources user)
     ;;
-  codex:implement|codex:review|codex:review-fix|codex:investigate)
+  codex:implement|codex:investigate)
+    # Codex discovers the skill body itself natively from the admin-scope
+    # /etc/codex/skills baked in at image build time (see Dockerfile) — the
+    # stdin file only needs to name it, not carry its full text.
     SKILL_NAME="$(task_skill_name "$TASK_TYPE")"
     CODEX_STDIN_FILE="${OT_DIR}/codex-${TASK_TYPE}-stdin.md"
     {
-      cat "${OPT_DIR}/skills/codex/${SKILL_NAME}.md"
-      printf '\n\n## Runtime context\n- Task type: %s\n- CE pipeline: %s\n- Issue: %s (%s)\n- Repository: %s\n- Branch: %s\n- Base branch: %s\n- PR number: %s\n- Review round: %s\n' \
+      printf '$%s\n' "$SKILL_NAME"
+      printf '\n## Runtime context\n- Task type: %s\n- CE pipeline: %s\n- Issue: %s (%s)\n- Repository: %s\n- Branch: %s\n- Base branch: %s\n' \
         "$TASK_TYPE" "$OT_CE_PIPELINE" "${LINEAR_ISSUE_IDENTIFIER:-unknown}" "${LINEAR_ISSUE_ID:-unknown}" \
-        "$GITHUB_REPO" "$BRANCH_NAME" "$BASE_BRANCH" "${PR_NUMBER:-none}" "${REVIEW_ROUND:-none}"
+        "$GITHUB_REPO" "$BRANCH_NAME" "$BASE_BRANCH"
       printf '\n\n## Linear ticket context\n'
       cat "${OT_DIR}/linear-context.md"
     } > "$CODEX_STDIN_FILE"
@@ -533,14 +536,20 @@ case "${AGENT}:${TASK_TYPE}" in
       --skip-git-repo-check -C "$REPO_DIR" resume "$SAVED_SESSION_ID" \
       "$RESUME_MESSAGE")
     ;;
-  opencode:implement|opencode:review|opencode:review-fix|opencode:investigate)
+  opencode:implement|opencode:investigate)
+    # OpenCode cannot yet discover skills from a sandbox-owned admin
+    # directory the way Codex does, so the canonical SKILL.md is rendered
+    # into the prompt at runtime: strip its YAML frontmatter (the first
+    # `---`...`---` block) and append the same runtime-context/Linear-context
+    # blocks Codex gets.
     SKILL_NAME="$(task_skill_name "$TASK_TYPE")"
     OPENCODE_PROMPT_FILE="${OT_DIR}/opencode-${TASK_TYPE}-prompt.md"
     {
-      cat "${OPT_DIR}/skills/opencode/${SKILL_NAME}.md"
-      printf '\n\n## Runtime context\n- Task type: %s\n- CE pipeline: %s\n- Issue: %s (%s)\n- Repository: %s\n- Branch: %s\n- Base branch: %s\n- PR number: %s\n- Review round: %s\n' \
+      awk 'NR==1 && $0=="---" { fm=1; next } fm && $0=="---" { fm=0; next } fm { next } { print }' \
+        "${OPT_DIR}/skills/tasks/${SKILL_NAME}/SKILL.md"
+      printf '\n\n## Runtime context\n- Task type: %s\n- CE pipeline: %s\n- Issue: %s (%s)\n- Repository: %s\n- Branch: %s\n- Base branch: %s\n' \
         "$TASK_TYPE" "$OT_CE_PIPELINE" "${LINEAR_ISSUE_IDENTIFIER:-unknown}" "${LINEAR_ISSUE_ID:-unknown}" \
-        "$GITHUB_REPO" "$BRANCH_NAME" "$BASE_BRANCH" "${PR_NUMBER:-none}" "${REVIEW_ROUND:-none}"
+        "$GITHUB_REPO" "$BRANCH_NAME" "$BASE_BRANCH"
       printf '\n\n## Linear ticket context\n'
       cat "${OT_DIR}/linear-context.md"
     } > "$OPENCODE_PROMPT_FILE"
@@ -585,7 +594,7 @@ set -e
 log "agent exited with code ${AGENT_EXIT}"
 
 # Best-effort: pick up the PR URL for the success activity body, if the
-# implement-plan/review skill already opened one via `gh pr create`.
+# implement-plan/investigate skill already opened one via `gh pr create`.
 if [[ "$AGENT_EXIT" -eq 0 ]]; then
   PR_URL="$(as_agent "cd '$REPO_DIR' && gh pr view '$BRANCH_NAME' --json url -q .url 2>/dev/null" || true)"
 fi
