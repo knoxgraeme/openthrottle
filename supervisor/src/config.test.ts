@@ -14,7 +14,8 @@ function setRequiredEnv(): void {
     "DATABASE_PATH",
     "GITHUB_REPO_MAPPINGS",
     "GITHUB_REPO_LABEL_MAPPINGS",
-    "DAYTONA_SNAPSHOT",
+    "SPRITES_API_URL",
+    "OT_PAYLOAD_TAR_PATH",
     "DEFAULT_AGENT",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CODEX_AUTH_JSON",
@@ -29,7 +30,6 @@ function setRequiredEnv(): void {
     "WEBHOOK_MAX_AGE_SECONDS",
     "REVIEW_MAX_ROUNDS",
     "ALLOW_LINEAR_MERGE",
-    "SANDBOX_EVENT_POLL_INTERVAL_MS",
   ]) {
     delete process.env[name];
   }
@@ -43,7 +43,7 @@ function setRequiredEnv(): void {
     GITHUB_WEBHOOK_SECRET: "github-webhook",
     GITHUB_TOKEN: "github-token",
     GITHUB_REPO: "owner/repo",
-    DAYTONA_API_KEY: "daytona",
+    SPRITE_TOKEN: "sprite-token",
     CLAUDE_CODE_OAUTH_TOKEN: "claude",
     CODEX_AUTH_JSON: "{}",
     KIMI_CODE_API_KEY: "kimi",
@@ -68,8 +68,16 @@ describe("loadConfig", () => {
       allowLinearMerge: true,
       defaultAgent: "codex",
       kimiCodeApiKey: "kimi",
-      sandboxEventPollIntervalMs: 5_000,
+      spriteToken: "sprite-token",
+      spritesApiUrl: "https://api.sprites.dev",
+      payloadTarPath: "/app/payload.tar.gz",
     });
+  });
+
+  it("requires SPRITE_TOKEN", () => {
+    setRequiredEnv();
+    delete process.env.SPRITE_TOKEN;
+    expect(() => loadConfig()).toThrow("Missing required env var: SPRITE_TOKEN");
   });
 
   it("rejects malformed integers, unsafe repos, and unsafe branch names", () => {

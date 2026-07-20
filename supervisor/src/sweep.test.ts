@@ -1,7 +1,7 @@
-import type { Daytona, Sandbox } from "@daytona/sdk";
 import type Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "./config.js";
+import type { SpriteInfo, SpritesClient } from "./sprites.js";
 import { createTicketStore, openDb } from "./db.js";
 import { runSweep } from "./sweep.js";
 
@@ -51,53 +51,23 @@ describe("runSweep", () => {
     store.claimDelivery({ deliveryId: "old-delivery", source: "linear", action: "created" });
     db.prepare("UPDATE webhook_deliveries SET received_at = ?").run("2020-01-01T00:00:00.000Z");
 
-    const staleSandbox = { id: "sandbox-stale", delete: vi.fn(async () => undefined) };
-    const timedSandbox = {
-      id: "sandbox-timed",
-      autoStopInterval: 60,
-      setAutostopInterval: vi.fn(async (minutes: number) => {
-        timedSandbox.autoStopInterval = minutes;
-      }),
-    };
-    const oldOrphan = {
-      id: "old-orphan",
-      createdAt: "2020-01-01T00:00:00.000Z",
-      labels: { ticket: "OLD-1" },
-    } as unknown as Sandbox;
-    const newOrphan = {
-      id: "new-orphan",
-      createdAt: new Date().toISOString(),
-      labels: { ticket: "NEW-1" },
-    } as unknown as Sandbox;
-    const knownStopped = {
-      id: "known-stopped",
-      createdAt: "2020-01-01T00:00:00.000Z",
-      labels: { ticket: "STOPPED" },
-    } as unknown as Sandbox;
-    const knownErrored = {
-      id: "known-errored",
-      createdAt: "2020-01-01T00:00:00.000Z",
-      labels: { ticket: "ERRORED" },
-    } as unknown as Sandbox;
-    const knownClosed = {
-      id: "known-closed",
-      createdAt: "2020-01-01T00:00:00.000Z",
-      labels: { ticket: "CLOSED" },
-    } as unknown as Sandbox;
-    const deleteOrphan = vi.fn(async () => undefined);
-    const daytona = {
-      get: vi.fn(async (sandboxId: string) =>
-        sandboxId === timedSandbox.id ? timedSandbox : staleSandbox
-      ),
-      delete: deleteOrphan,
-      list: async function* () {
-        yield oldOrphan;
-        yield newOrphan;
-        yield knownStopped;
-        yield knownErrored;
-        yield knownClosed;
-      },
-    } as unknown as Daytona;
+    // Sprites are name-addressed; list() returns handles labeled `ot-*` plus the
+    // reused workspaces still owned by stopped/errored/closed tickets.
+    const labeled: SpriteInfo[] = [
+      { name: "ot-old-1", updated_at: "2020-01-01T00:00:00.000Z" },
+      { name: "ot-new-1", updated_at: new Date().toISOString() },
+      { name: "known-stopped", updated_at: "2020-01-01T00:00:00.000Z" },
+      { name: "known-errored", updated_at: "2020-01-01T00:00:00.000Z" },
+      { name: "known-closed", updated_at: "2020-01-01T00:00:00.000Z" },
+    ];
+    const deleteSprite = vi.fn(async () => undefined);
+    const sprites = {
+      // readSpooledEvents drains the timed-out sandbox before it is expired.
+      exec: vi.fn(async () => ({ exitCode: 0, output: "" })),
+      listSprites: vi.fn(async () => labeled),
+      deleteSprite,
+    } as unknown as SpritesClient;
+
     const linearFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as { query: string };
       const data = body.query.includes("CommentCreate")
@@ -106,18 +76,20 @@ describe("runSweep", () => {
       return Response.json({ data });
     }) as unknown as typeof fetch;
 
-    await runSweep(daytona, store, { accessToken: "oauth", fetch: linearFetch }, cfg);
+    await runSweep(sprites, store, { accessToken: "oauth", fetch: linearFetch }, cfg);
 
     expect(store.getRun("run-timed")?.status).toBe("timed_out");
     expect(store.getByIssueId("timed")?.state).toBe("error");
-    expect(timedSandbox.setAutostopInterval).toHaveBeenCalledWith(5);
     expect(store.getByIssueId("stale")?.state).toBe("expired");
-    expect(staleSandbox.delete).toHaveBeenCalledOnce();
-    expect(deleteOrphan).toHaveBeenCalledTimes(2);
-    expect(deleteOrphan).toHaveBeenCalledWith(oldOrphan, 60, false);
-    expect(deleteOrphan).toHaveBeenCalledWith(knownClosed, 60, false);
-    expect(deleteOrphan).not.toHaveBeenCalledWith(knownStopped, 60, false);
-    expect(deleteOrphan).not.toHaveBeenCalledWith(knownErrored, 60, false);
+
+    const deleted = deleteSprite.mock.calls.map(([name]) => name);
+    expect(deleted).toContain("sandbox-stale"); // stale ticket cleanup
+    expect(deleted).toContain("ot-old-1"); // aged orphan with no DB row
+    expect(deleted).toContain("known-closed"); // closed ticket's workspace
+    expect(deleted).not.toContain("ot-new-1"); // inside provisioning grace window
+    expect(deleted).not.toContain("known-stopped"); // reusable
+    expect(deleted).not.toContain("known-errored"); // reusable
+
     expect(
       db.prepare("SELECT count(*) AS count FROM webhook_deliveries").get()
     ).toMatchObject({ count: 0 });
