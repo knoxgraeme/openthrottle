@@ -9,6 +9,7 @@
 import { copyFileSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import { Daytona, Image } from "@daytona/sdk";
+import { resolveSandboxResources } from "./snapshot-resources.mjs";
 
 const name = process.argv[2];
 if (!name) {
@@ -49,9 +50,17 @@ if (existing) {
 // both agree, and clean it up afterwards.
 const stagedDockerfile = resolve(repoRoot, ".snapshot-build.Dockerfile");
 copyFileSync(resolve(repoRoot, "sandbox/Dockerfile"), stagedDockerfile);
+
+// Size the sandbox to run real monorepo builds. Without this, Daytona's small
+// default tier OOM-kills pnpm/Turbo build and type-check gates (exit 137).
+// Overridable per operator via DAYTONA_SANDBOX_CPU/MEMORY/DISK.
+const resources = resolveSandboxResources();
+console.log(
+  `Sizing sandbox: ${resources.cpu} vCPU / ${resources.memory} GiB RAM / ${resources.disk} GiB disk`
+);
 try {
   const snapshot = await daytona.snapshot.create(
-    { name, image: Image.fromDockerfile(stagedDockerfile) },
+    { name, image: Image.fromDockerfile(stagedDockerfile), resources },
     { onLogs: (chunk) => process.stdout.write(chunk) }
   );
   const state = String(snapshot.state).toLowerCase();

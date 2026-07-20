@@ -163,6 +163,43 @@ export async function getSignedPreviewUrl(
   return preview.url;
 }
 
+// listening — the dev server is serving (redirect to it); starting — it was
+// down and has been (re)started (show a "starting" page that auto-refreshes);
+// no-dev — down with no `dev:` command configured; unknown — could not probe
+// (fall back to the plain redirect).
+export type DevServerState = "listening" | "starting" | "no-dev" | "unknown";
+export interface DevServerRevival {
+  state: DevServerState;
+  // The latest dev-server log tail, shown alongside the starting/no-dev pages
+  // so the startup/crash error is visible instead of a blank connection refusal.
+  log: string;
+}
+
+// Wakes the sandbox and runs restart-dev.sh, which probes the dev server on
+// `port` and (re)starts it from the repo's `dev:` command if it is down — so a
+// preview opened after the workspace idled brings the app back rather than
+// dead-ending. Captures the dev log either way.
+export async function reviveDevServer(
+  daytona: Daytona,
+  sandboxId: string,
+  port: number
+): Promise<DevServerRevival> {
+  const sandbox = await daytona.get(sandboxId);
+  if (sandbox.state !== "started") await sandbox.start(60);
+  if (!sandbox.process?.executeCommand) return { state: "unknown", log: "" };
+  const result = await sandbox.process.executeCommand(
+    `bash /opt/openthrottle/runner/restart-dev.sh ${port}`,
+    undefined,
+    undefined,
+    20
+  );
+  const output = result.result ?? "";
+  const state = (output.match(/OT_DEV_STATUS:(listening|starting|no-dev)/)?.[1] ??
+    "unknown") as DevServerState;
+  const log = output.replace(/OT_DEV_STATUS:(?:listening|starting|no-dev)\r?\n?/, "");
+  return { state, log };
+}
+
 export async function getSandboxLogs(daytona: Daytona, sandboxId: string): Promise<string> {
   const sandbox = await daytona.get(sandboxId);
   if (sandbox.state !== "started") await sandbox.start(60);

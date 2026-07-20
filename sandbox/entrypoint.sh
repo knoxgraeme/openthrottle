@@ -339,6 +339,14 @@ export OT_BUILD_CMD="$CFG_BUILD"
 export OT_FORMAT_CMD="$CFG_FORMAT"
 export OT_DEV_CMD="$CFG_DEV"
 export OT_DEV_PORT="$DEV_PORT"
+
+# Cap build-tool fan-out so heavy monorepo builds (Turbo/tsc/Jest launched
+# through Turborepo) don't spike past the sandbox memory cgroup and get
+# OOM-killed (SIGKILL / exit 137) before diagnostics print. Turbo defaults to
+# one task per core (100%); halving that roughly halves peak build memory while
+# keeping some parallelism. Only set when unset, so a repo whose build needs
+# more (or less) can override it in .openthrottle.yml's post_bootstrap.
+export TURBO_CONCURRENCY="${TURBO_CONCURRENCY:-50%}"
 OT_CE_PIPELINE="$(task_ce_pipeline "$TASK_TYPE")"
 export OT_CE_PIPELINE
 

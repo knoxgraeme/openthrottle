@@ -186,6 +186,39 @@ export function baseSandboxEnv(
   };
 }
 
+// Re-assert the agent-owned session external URLs (workspace preview + PR) so
+// they stay visible and valid in whatever run the user is looking at — not
+// only the one that first created the workspace. A full `externalUrls` replace
+// keeps exactly one of each (no duplicates piling up) and mints a fresh preview
+// token so the link never points at a rotated/expired one. Returns the preview
+// URL so the caller can echo it into the run's "Started" activity. Never
+// throws — a link refresh must not fail a run launch.
+export async function syncSessionExternalUrls(params: {
+  cfg: Config;
+  store: TicketStore;
+  outbox: LinearOutboxProcessor;
+  ticket: Ticket;
+}): Promise<string> {
+  const { cfg, store, outbox, ticket } = params;
+  const previewToken = randomBytes(24).toString("base64url");
+  store.setPreviewTokenHash(ticket.linear_issue_id, tokenHash(previewToken));
+  const previewUrl = `${cfg.supervisorUrl}/preview/${encodeURIComponent(
+    ticket.linear_issue_identifier
+  )}?token=${encodeURIComponent(previewToken)}`;
+  const externalUrls = [{ label: "Workspace Preview", url: previewUrl }];
+  if (ticket.pr_url) externalUrls.push({ label: "Pull Request", url: ticket.pr_url });
+  try {
+    await enqueueSessionUpdate(store, outbox, {
+      sessionId: ticket.linear_session_id,
+      issueId: ticket.linear_issue_id,
+      externalUrls,
+    });
+  } catch (error) {
+    console.error("[linear] failed to sync session external URLs:", error);
+  }
+  return previewUrl;
+}
+
 export async function launchExistingTask(params: {
   cfg: Config;
   store: TicketStore;
@@ -249,12 +282,22 @@ export async function launchExistingTask(params: {
     return false;
   }
 
+  // Refresh the workspace-preview and PR links on the session, and echo the
+  // preview into the "Started" activity, so the preview is surfaced on every
+  // run (including resumes) rather than only when the workspace was created.
+  const previewUrl = await syncSessionExternalUrls({
+    cfg,
+    store,
+    outbox: params.linearOutbox,
+    ticket,
+  });
   try {
     await enqueueActivity(store, params.linearOutbox, {
       sessionId: ticket.linear_session_id,
       type: "action",
       action: "Started",
       parameter: `${params.taskType} run on ${ticket.branch}`,
+      result: `Wake-on-click preview: ${previewUrl}`,
     }, ticket.linear_issue_id, run.id);
   } catch (error) {
     console.error(`[linear] ${params.taskType} started but its activity could not be posted:`, error);

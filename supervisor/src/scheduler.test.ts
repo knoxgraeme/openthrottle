@@ -66,6 +66,12 @@ describe("feedbackMessage", () => {
     expect(message).toContain("https://github.com/o/r/pull/12#pullrequestreview-1");
     expect(message).toContain("The retry loop swallows the original error.");
     expect(message).toContain("Triage this feedback");
+    // The triage contract: wait for CI, reply on every thread, refresh the
+    // gate checklist. Lock those so the delivered message can't quietly drop
+    // back to fire-and-forget triage.
+    expect(message).toContain("gh pr checks --watch");
+    expect(message).toContain("reply visibly on EVERY item");
+    expect(message).toContain("## OpenThrottle gates");
   });
 
   it("falls back to 'a reviewer' when no author is known", () => {

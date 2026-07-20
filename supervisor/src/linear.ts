@@ -281,12 +281,22 @@ export async function agentActivityCreate(
   return data.agentActivityCreate;
 }
 
+// A session-level plan is an ordered checklist Linear renders in the agent
+// session UI; agents replace it in full on each update (Linear has no
+// per-item patch). Used to surface "which gate is done / in progress" live.
+export type AgentPlanStatus = "pending" | "inProgress" | "completed" | "canceled";
+export interface AgentPlanItem {
+  content: string;
+  status: AgentPlanStatus;
+}
+
 export async function agentSessionUpdate(
   client: LinearClient,
   params: {
     sessionId: string;
     externalUrls?: Array<{ label: string; url: string }>;
     addedExternalUrls?: Array<{ label: string; url: string }>;
+    plan?: AgentPlanItem[];
   }
 ): Promise<{ success: boolean }> {
   const data = await linearGraphQL<{ agentSessionUpdate: { success: boolean } }>(
@@ -299,6 +309,7 @@ export async function agentSessionUpdate(
       input: {
         ...(params.externalUrls ? { externalUrls: params.externalUrls } : {}),
         ...(params.addedExternalUrls ? { addedExternalUrls: params.addedExternalUrls } : {}),
+        ...(params.plan ? { plan: params.plan } : {}),
       },
     }
   );

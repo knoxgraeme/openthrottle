@@ -61,6 +61,177 @@ describe("sandbox event contracts", () => {
     ).toThrow();
   });
 
+  it("parses ephemeral activities and plan events, and rejects malformed plans", () => {
+    const ephemeral = parseSandboxEvent(
+      JSON.stringify({
+        version: 1,
+        kind: "activity",
+        event_id: "33333333-3333-4333-8333-333333333333",
+        run_id: "run-1",
+        created_at: "2026-07-18T00:00:00.000Z",
+        type: "thought",
+        body: "running: pnpm test",
+        ephemeral: true,
+      })
+    );
+    expect(ephemeral).toMatchObject({ type: "thought", ephemeral: true });
+
+    const plan = parseSandboxEvent(
+      JSON.stringify({
+        version: 1,
+        kind: "plan",
+        event_id: "44444444-4444-4444-8444-444444444444",
+        run_id: "run-1",
+        created_at: "2026-07-18T00:00:00.000Z",
+        plan: [
+          { content: "Tests", status: "completed" },
+          { content: "Build", status: "inProgress" },
+        ],
+      })
+    );
+    expect(plan).toMatchObject({
+      kind: "plan",
+      plan: [
+        { content: "Tests", status: "completed" },
+        { content: "Build", status: "inProgress" },
+      ],
+    });
+
+    // Unknown status, empty plan, and a non-boolean ephemeral are all rejected.
+    for (const bad of [
+      { kind: "plan", plan: [{ content: "x", status: "bogus" }] },
+      { kind: "plan", plan: [] },
+      { kind: "activity", type: "thought", body: "x", ephemeral: "yes" },
+    ]) {
+      expect(() =>
+        parseSandboxEvent(
+          JSON.stringify({
+            version: 1,
+            event_id: "55555555-5555-4555-8555-555555555555",
+            run_id: "run-1",
+            created_at: "2026-07-18T00:00:00.000Z",
+            ...bad,
+          })
+        )
+      ).toThrow();
+    }
+  });
+
+  it("forwards structured action verb/parameter/result to Linear", async () => {
+    const store = seedRunningTicket();
+    const action = JSON.stringify({
+      version: 1,
+      kind: "activity",
+      event_id: "99999999-9999-4999-8999-999999999999",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:03.000Z",
+      type: "action",
+      action: "Ran",
+      parameter: "pnpm test",
+      result: "583 passed",
+      body: "Ran: pnpm test → 583 passed",
+    });
+    const files = new Map([["/home/agent/.ot/outbox/004.json", Buffer.from(action)]]);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      setAutostopInterval: vi.fn(async () => undefined),
+      fs: {
+        listFiles: vi.fn(async () =>
+          [...files.entries()].map(([path, value]) => ({
+            name: path.split("/").at(-1),
+            path,
+            size: value.length,
+            isDir: false,
+          }))
+        ),
+        downloadFile: vi.fn(async (path: string) => files.get(path)!),
+        deleteFile: vi.fn(async (path: string) => {
+          files.delete(path);
+        }),
+      },
+    } as unknown as Sandbox;
+    const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
+    const postActivity = vi.fn(async () => undefined);
+
+    await pollSandboxEvents({
+      daytona,
+      store,
+      postActivity,
+      finishCompletion: vi.fn(async () => ({ status: 200 })),
+    });
+
+    expect(postActivity).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "action",
+        action: "Ran",
+        parameter: "pnpm test",
+        result: "583 passed",
+      }),
+      expect.anything()
+    );
+  });
+
+  it("forwards a plan event to the session-update handler", async () => {
+    const store = seedRunningTicket();
+    const planEvent = JSON.stringify({
+      version: 1,
+      kind: "plan",
+      event_id: "88888888-8888-4888-8888-888888888888",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:02.000Z",
+      plan: [
+        { content: "Run tests", status: "completed" },
+        { content: "Build", status: "inProgress" },
+      ],
+    });
+    const files = new Map([["/home/agent/.ot/outbox/003.json", Buffer.from(planEvent)]]);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      setAutostopInterval: vi.fn(async () => undefined),
+      fs: {
+        listFiles: vi.fn(async () =>
+          [...files.entries()].map(([path, value]) => ({
+            name: path.split("/").at(-1),
+            path,
+            size: value.length,
+            isDir: false,
+          }))
+        ),
+        downloadFile: vi.fn(async (path: string) => files.get(path)!),
+        deleteFile: vi.fn(async (path: string) => {
+          files.delete(path);
+        }),
+      },
+    } as unknown as Sandbox;
+    const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
+    const postSessionUpdate = vi.fn(async () => undefined);
+
+    await pollSandboxEvents({
+      daytona,
+      store,
+      postActivity: vi.fn(async () => undefined),
+      finishCompletion: vi.fn(async () => ({ status: 200 })),
+      postSessionUpdate,
+    });
+
+    expect(postSessionUpdate).toHaveBeenCalledOnce();
+    expect(postSessionUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: "session-1",
+        issueId: "issue-1",
+        plan: [
+          { content: "Run tests", status: "completed" },
+          { content: "Build", status: "inProgress" },
+        ],
+      })
+    );
+    expect(files.size).toBe(0);
+  });
+
   it("posts activities once, finalizes completion once, and removes processed files", async () => {
     const store = seedRunningTicket();
     const activity = JSON.stringify({

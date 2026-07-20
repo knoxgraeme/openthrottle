@@ -283,6 +283,42 @@ describe("TicketStore", () => {
     expect(store.getSandboxEvent("22222222-2222-4222-8222-222222222222")).toBeDefined();
   });
 
+  it("getLastProcessedSandboxActivity ignores a newer ephemeral heartbeat", () => {
+    const store = makeStore();
+    store.beginRun({
+      issueId: "issue-1",
+      runId: "run-term",
+      taskType: "implement",
+      tokenHash: "hash",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    const process = (eventId: string, payload: Record<string, unknown>) => {
+      store.insertSandboxEvent({
+        eventId,
+        runId: "run-term",
+        sandboxId: "sandbox-1",
+        kind: "activity",
+        payload: JSON.stringify(payload),
+      });
+      store.claimSandboxEvent(eventId, new Date().toISOString(), "2099-01-01T00:00:00.000Z");
+      store.markSandboxEventProcessed(eventId);
+    };
+    // The terminal elicitation, then a heartbeat with a strictly newer time.
+    process("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", { type: "elicitation", body: "need input" });
+    process("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", {
+      type: "thought",
+      body: "running: pnpm test",
+      ephemeral: true,
+    });
+    db!
+      .prepare("UPDATE sandbox_events SET processed_at = ?, created_at = ? WHERE event_id = ?")
+      .run("2030-01-01T00:00:00.000Z", "2030-01-01T00:00:00.000Z", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+
+    const last = store.getLastProcessedSandboxActivity("run-term");
+    expect(last).toBeDefined();
+    expect(JSON.parse(last!.payload).type).toBe("elicitation");
+  });
+
   it("migrates legacy delivery rows without replaying already acknowledged events", () => {
     const dir = mkdtempSync(join(tmpdir(), "openthrottle-db-"));
     tempDirs.push(dir);

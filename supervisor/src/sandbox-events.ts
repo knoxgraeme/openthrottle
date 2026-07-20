@@ -1,5 +1,5 @@
 import type { Daytona, Sandbox } from "@daytona/sdk";
-import type { AgentActivityInput } from "./linear.js";
+import type { AgentActivityInput, AgentPlanItem, AgentPlanStatus } from "./linear.js";
 import type { Ticket, TicketStore } from "./db.js";
 import { ensureSandboxActive } from "./daytona.js";
 import { reconcileSandboxAutostop } from "./sandbox-lifecycle.js";
@@ -20,8 +20,16 @@ const ACTIVITY_TYPES: ReadonlyArray<SandboxActivityEvent["type"]> = [
   "response",
   "error",
 ];
+const PLAN_STATUSES: ReadonlyArray<AgentPlanStatus> = [
+  "pending",
+  "inProgress",
+  "completed",
+  "canceled",
+];
+const MAX_PLAN_ITEMS = 50;
+const MAX_PLAN_CONTENT = 500;
 
-export type SandboxEvent = SandboxActivityEvent | SandboxCompletionEvent;
+export type SandboxEvent = SandboxActivityEvent | SandboxPlanEvent | SandboxCompletionEvent;
 
 interface SandboxActivityEvent {
   version: 1;
@@ -31,6 +39,24 @@ interface SandboxActivityEvent {
   created_at: string;
   type: "thought" | "action" | "elicitation" | "response" | "error";
   body: string;
+  // Ephemeral thoughts/actions self-replace in Linear — used for the live
+  // progress heartbeat emitted by runner/normalize.mjs.
+  ephemeral?: boolean;
+  // Structured fields for `action` events: verb + parameter, plus an optional
+  // result once the step completes. When present they render as a proper
+  // Linear action instead of the flat "Progress: <body>" fallback.
+  action?: string;
+  parameter?: string;
+  result?: string;
+}
+
+interface SandboxPlanEvent {
+  version: 1;
+  kind: "plan";
+  event_id: string;
+  run_id: string;
+  created_at: string;
+  plan: AgentPlanItem[];
 }
 
 interface SandboxCompletionEvent {
@@ -55,6 +81,24 @@ function isActivityType(value: unknown): value is SandboxActivityEvent["type"] {
   return typeof value === "string" && ACTIVITY_TYPES.includes(value as SandboxActivityEvent["type"]);
 }
 
+function parsePlanItems(value: unknown): AgentPlanItem[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_PLAN_ITEMS) {
+    throw new Error("sandbox plan has an invalid item list");
+  }
+  return value.map((item) => {
+    if (
+      !isRecord(item) ||
+      typeof item.content !== "string" ||
+      !item.content.trim() ||
+      item.content.length > MAX_PLAN_CONTENT ||
+      !PLAN_STATUSES.includes(item.status as AgentPlanStatus)
+    ) {
+      throw new Error("sandbox plan has an invalid item");
+    }
+    return { content: item.content, status: item.status as AgentPlanStatus };
+  });
+}
+
 export function parseSandboxEvent(raw: string): SandboxEvent {
   if (Buffer.byteLength(raw) > MAX_EVENT_BYTES) throw new Error("sandbox event is too large");
   const value: unknown = JSON.parse(raw);
@@ -76,6 +120,20 @@ export function parseSandboxEvent(raw: string): SandboxEvent {
     if (typeof value.body !== "string" || !value.body.trim() || value.body.length > MAX_BODY_LENGTH) {
       throw new Error("sandbox activity has an invalid body");
     }
+    if (value.ephemeral !== undefined && typeof value.ephemeral !== "boolean") {
+      throw new Error("sandbox activity has an invalid ephemeral flag");
+    }
+    const actionFields: Pick<SandboxActivityEvent, "action" | "parameter" | "result"> = {};
+    if (value.type === "action") {
+      for (const key of ["action", "parameter", "result"] as const) {
+        const field = value[key];
+        if (field === undefined) continue;
+        if (typeof field !== "string" || field.length > MAX_BODY_LENGTH) {
+          throw new Error(`sandbox activity has an invalid ${key}`);
+        }
+        actionFields[key] = field;
+      }
+    }
     return {
       version: 1,
       kind: "activity",
@@ -84,6 +142,18 @@ export function parseSandboxEvent(raw: string): SandboxEvent {
       created_at: value.created_at,
       type: value.type,
       body: value.body,
+      ...(value.ephemeral === true ? { ephemeral: true } : {}),
+      ...actionFields,
+    };
+  }
+  if (value.kind === "plan") {
+    return {
+      version: 1,
+      kind: "plan",
+      event_id: value.event_id,
+      run_id: value.run_id,
+      created_at: value.created_at,
+      plan: parsePlanItems(value.plan),
     };
   }
   if (value.kind === "completion") {
@@ -137,10 +207,37 @@ export function parseSandboxEvent(raw: string): SandboxEvent {
 
 function toLinearActivity(event: SandboxActivityEvent, sessionId: string): AgentActivityInput {
   const body = sanitizeText(event.body);
+  // Linear only honors `ephemeral` on thought/action activities; it is ignored
+  // (and omitted) for the others.
   if (event.type === "action") {
-    return { sessionId, type: "action", action: "Progress", parameter: body };
+    // Prefer the structured verb/parameter/result; fall back to the flat
+    // "Progress: <body>" shape for legacy single-string actions.
+    if (event.action && event.parameter) {
+      return {
+        sessionId,
+        type: "action",
+        action: sanitizeText(event.action),
+        parameter: sanitizeText(event.parameter),
+        ...(event.result ? { result: sanitizeText(event.result) } : {}),
+        ...(event.ephemeral ? { ephemeral: true } : {}),
+      };
+    }
+    return {
+      sessionId,
+      type: "action",
+      action: "Progress",
+      parameter: body,
+      ...(event.ephemeral ? { ephemeral: true } : {}),
+    };
+  }
+  if (event.type === "thought") {
+    return { sessionId, type: "thought", body, ...(event.ephemeral ? { ephemeral: true } : {}) };
   }
   return { sessionId, type: event.type, body };
+}
+
+function sanitizePlan(plan: AgentPlanItem[]): AgentPlanItem[] {
+  return plan.map((item) => ({ content: sanitizeText(item.content), status: item.status }));
 }
 
 async function listEventFiles(sandbox: Sandbox) {
@@ -169,6 +266,15 @@ interface SandboxEventPollerParams {
     activity: AgentActivityInput,
     event: SandboxActivityEvent & { issueId: string }
   ) => Promise<unknown>;
+  // Forwards a session-level plan (live gate/phase checklist) to Linear.
+  // Optional so tests and older callers that never emit plans compile
+  // unchanged; a plan event with no handler is dropped, not retried forever.
+  postSessionUpdate?: (params: {
+    sessionId: string;
+    issueId: string;
+    plan: AgentPlanItem[];
+    eventId: string;
+  }) => Promise<unknown>;
   finishCompletion: (completion: {
     runId: string;
     token: string;
@@ -241,14 +347,22 @@ async function pollTicketEvents(
       kind: event.kind,
       payload: JSON.stringify(
         event.kind === "activity"
-          ? { ...event, body: sanitizeText(event.body) }
-          : {
+          ? {
               ...event,
-              token: "[redacted]",
-              ...(event.failure_tail
-                ? { failure_tail: sanitizeText(event.failure_tail) }
-                : {}),
+              body: sanitizeText(event.body),
+              ...(event.action ? { action: sanitizeText(event.action) } : {}),
+              ...(event.parameter ? { parameter: sanitizeText(event.parameter) } : {}),
+              ...(event.result ? { result: sanitizeText(event.result) } : {}),
             }
+          : event.kind === "plan"
+            ? { ...event, plan: sanitizePlan(event.plan) }
+            : {
+                ...event,
+                token: "[redacted]",
+                ...(event.failure_tail
+                  ? { failure_tail: sanitizeText(event.failure_tail) }
+                  : {}),
+              }
       ),
     });
     if (
@@ -289,6 +403,27 @@ async function pollTicketEvents(
           ...event,
           issueId: run?.linear_issue_id ?? ticket.linear_issue_id,
         });
+      } else if (event.kind === "plan") {
+        const run = params.store.getRun(event.run_id);
+        const sessionId = run?.linear_session_id ?? ticket.linear_session_id;
+        if (run?.linear_session_id && run.linear_session_id !== ticket.linear_session_id) {
+          const session = params.store.getSession(run.linear_session_id);
+          if (session?.state === "superseded") {
+            await sandbox.fs.deleteFile(remotePath).catch(() => undefined);
+            params.store.markSandboxEventProcessed(event.event_id);
+            continue;
+          }
+        }
+        // A plan event with no wired handler is simply dropped below (marked
+        // processed), never retried forever.
+        if (params.postSessionUpdate) {
+          await params.postSessionUpdate({
+            sessionId,
+            issueId: run?.linear_issue_id ?? ticket.linear_issue_id,
+            plan: sanitizePlan(event.plan),
+            eventId: event.event_id,
+          });
+        }
       } else {
         const logTail = await readTaskLogTail(sandbox, event.token);
         // Capture the token the run rotated in the sandbox BEFORE finishing:

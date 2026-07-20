@@ -81,17 +81,46 @@ Linear AgentSessionEvent ──HMAC──> Fly supervisor ──@daytona/sdk─�
 
 Each run receives a random one-time callback token; only its SHA-256 hash is
 stored in the run table. Agents use `ot-activity` to write validated semantic
-activity records locally. The entrypoint writes a completion marker with exit
-code, cost, PR URL, sanitized final assistant response, and sanitized failure
-tail. Every five seconds, Fly polls only active runs through the Daytona SDK, durably claims each event, and
+activity records locally: the five activity types (`thought`, `action`,
+`elicitation`, `response`, `error`), plus `ot-activity plan "<content>=<status>"
+…` which writes a `plan` event carrying a session-level checklist (Linear plan
+statuses `pending`/`inProgress`/`completed`/`canceled`, replaced in full each
+update). An `action` may carry a structured verb, parameter, and optional
+result (`ot-activity action Ran "pnpm test" "583 passed"`), rendering as a real
+Linear action rather than a flat "Progress" line; a single-argument action
+stays a plain progress note. Independently, `runner/normalize.mjs` mirrors a throttled, ephemeral
+`thought` for each meaningful agent step (a tool call, shell command, or file
+edit) into the same outbox — a live "currently doing X" heartbeat that
+self-replaces in the session and answers "stuck or working?" without cluttering
+the permanent timeline (interval `OT_HEARTBEAT_INTERVAL_MS`, default 15s). The
+entrypoint writes a completion marker with exit code, cost, PR URL, sanitized
+final assistant response, and sanitized failure tail. Every five seconds, Fly
+polls only active runs through the Daytona SDK, durably claims each event, and
 projects activities into `linear_outbox` using the run's immutable Linear
-session binding. A late event from a superseded session is consumed without
+session binding; a `plan` event becomes an `agentSessionUpdate` carrying the
+plan, and only `thought`/`action` activities may be marked `ephemeral`. A late event from a superseded session is consumed without
 publishing into the newer conversation. Completion uses the same finalizer as
 the legacy `POST /runs/:id/complete` endpoint and enqueues the first explicit
 terminal activity when present, otherwise the captured final assistant response,
 otherwise a generic terminal activity plus PR links through the Linear outbox.
 If no result arrives by `TASK_TIMEOUT` plus grace, the sweep marks the run
 timed out and enqueues the timeout error.
+Every run start (workspace creation and every resume) re-asserts the session's
+agent-owned external URLs via `agentSessionUpdate` — a full `externalUrls`
+replace of the wake-on-click workspace preview (fresh per-ticket token) plus the
+Pull Request link when one exists — so both stay visible and valid in whatever
+run the user is viewing, not only the run that created the workspace. The
+preview URL is also echoed into that run's "Started"/"Created workspace" action.
+Opening the preview wakes the sandbox and runs `restart-dev.sh`, which probes
+the dev server and, if it is down, (re)starts it from the repository's `dev:`
+command (the workspace idling stops the server the run started). If it is
+serving, the request redirects to the signed preview; if it was just restarted,
+the endpoint returns an auto-refreshing "starting" page that opens the app once
+it is ready; if the repository configures no `dev:` command, a clear note is
+shown. The sanitized dev-server log accompanies both pages so any startup/crash
+error is visible rather than a dead connection-refused link. A probe/restart
+failure falls back to the plain redirect.
+
 Before finalizing an outbox completion, Fly reads a fixed-size tail of
 `~/.ot/task.log`, sanitizes it (including the one-time callback token), and
 stores at most 100,000 characters on the run row. This private operator log is
@@ -103,9 +132,12 @@ that ticket, bounding durable log storage to the latest captured run.
 - Closing or merging an `ot/*` PR stops an active run, deletes its sandbox,
   and closes the ticket row.
 - All GitHub feedback on an active, PR-backed ticket becomes deduplicated
-  `automatic` session work, each item carrying a triage message (act on clear
-  fixes, answer non-actionable threads with reasoning, batch decision-required
-  items into one elicitation, end with "Assumptions & decisions"): a human
+  `automatic` session work, each item carrying a triage message (gather the
+  full review first via `gh pr checks` and all open threads; reply visibly on
+  every item — actioned items name the fixing commit and resolve the thread,
+  no-change items give reasoning; wait for CI to go green before finalizing;
+  refresh the PR's `## OpenThrottle gates` checklist; batch decision-required
+  items into one elicitation; end with "Assumptions & decisions"): a human
   `CHANGES_REQUESTED` review, a non-self `commented` review (GitHub wraps
   every inline review comment in a `commented` review, so this also covers
   bot inline reviews), a new PR conversation comment, and a failed or
@@ -177,7 +209,7 @@ row until retry/redrive.
 | `POST` | `/repositories/register` | `OT_STATUS_TOKEN` bearer | verify and upsert a target route/webhook |
 | `POST` | `/tickets/:id/stop` | `OT_STATUS_TOKEN` bearer | stop a ticket |
 | `GET` | `/tickets/:id/logs` | `OT_STATUS_TOKEN` bearer | sanitized live logs, falling back to the latest durable private run tail |
-| `GET` | `/preview/:id?token=` | per-ticket token | wake and signed redirect |
+| `GET` | `/preview/:id?token=` | per-ticket token | wake, restart the dev server if down, then redirect or show a status page |
 | `POST` | `/runs/:id/complete` | one-time run bearer | consume run result |
 
 Linear OAuth uses `actor=app`, scopes
@@ -266,7 +298,14 @@ Required unless noted:
   override the sandbox commit author; unset, the sandbox authors commits as the
   `GITHUB_TOKEN` account's GitHub noreply identity so downstream author-gated
   integrations (e.g. Vercel) accept the deployment.
-- Daytona: `DAYTONA_API_KEY`, `DAYTONA_SNAPSHOT=openthrottle`.
+- Daytona: `DAYTONA_API_KEY`, `DAYTONA_SNAPSHOT=openthrottle`. Snapshot sizing
+  is set when the snapshot is built (`supervisor/scripts/build-snapshot.mjs`)
+  from optional `DAYTONA_SANDBOX_CPU=4` (cores), `DAYTONA_SANDBOX_MEMORY=8`
+  (GiB), and `DAYTONA_SANDBOX_DISK=10` (GiB); the defaults clear Daytona's
+  small default tier, which OOM-kills real pnpm/Turbo monorepo build and
+  type-check gates (SIGKILL / exit 137). Disk stays within Daytona's
+  standard-tier 10 GiB maximum so the default build works for ordinary orgs;
+  raise it only on a plan with a larger quota. Right-size these per fleet.
 - Agents: `CLAUDE_CODE_OAUTH_TOKEN` for Claude subscription login and/or
   `CODEX_AUTH_JSON` for Codex subscription login; `DEFAULT_AGENT=codex`.
 - Limits: `BASE_BRANCH=main`, `MAX_TURNS=200`, `TASK_TIMEOUT=7200`,
@@ -300,7 +339,10 @@ secrets never enter the sandbox.
 1. Materialize model auth files and strip trailing CR/LF from tokens.
 2. Clone/fetch, create or resume `BRANCH_NAME`, and push it immediately.
 3. Install and seal the pre-push boundary and configure token-safe Git auth.
-4. Read `.openthrottle.yml` with supervisor-owned base branch unchanged.
+4. Read `.openthrottle.yml` with supervisor-owned base branch unchanged, and
+   export a default `TURBO_CONCURRENCY=50%` (only when unset) so heavy
+   Turbo-driven build/lint/test gates stay within the sandbox memory cgroup;
+   a repo can override it in `post_bootstrap`.
 5. Run `post_bootstrap` commands.
 6. Start/restart the optional dev server on `0.0.0.0`.
 7. Install OpenThrottle runtime adapters/instructions per agent, then run the
@@ -358,17 +400,26 @@ changes, architecture rework, dependency changes, destructive operations, or
 multiple defensible interpretations) are never implemented without a human
 answer. Clear fixes ship first; remaining items go out as one batched
 `elicitation` decision list whose Linear reply resumes the same session. No
-item is backlogged — each ends fixed, answered on its thread, or escalated —
-and every response and PR description ends with an "Assumptions & decisions"
-section for human audit.
+item is backlogged — each ends fixed and pushed with a reply naming the fixing
+commit, answered on its thread, or escalated — and a run never finalizes while
+CI is red or still running: after any push the adapter waits for `gh pr
+checks` to conclude and fixes in-scope failures in the same run. Every run also
+writes or refreshes an `## OpenThrottle gates` checklist in the PR description
+(tests, lint, build, internal review, simplification, CI, review threads) so a
+human can see which gates completed; a gate that could not run — e.g. one the
+sandbox OOM-killed (exit 137) — is recorded as a known gap, never reported as
+passed. Every response and PR description ends with an "Assumptions &
+decisions" section for human audit.
 `implement`/`investigate` use fresh contexts; `resume` reads
 `~/.ot/agent-session-id` and continues the same Claude session/Codex
 thread/OpenCode session.
 
 The normalizer captures session IDs and Claude `total_cost_usd`, writes
-`~/.ot/run-result.json`, and sanitizes all output. Sanitizers redact named
-secret env values, inner strings in `CODEX_AUTH_JSON`, GitHub/OpenAI/Linear
-token shapes, and bearer credentials.
+`~/.ot/run-result.json`, emits the throttled ephemeral progress heartbeat
+described under "Sandbox activity and completion", and sanitizes all output
+(the heartbeat body included). Sanitizers redact named secret env values, inner
+strings in `CODEX_AUTH_JSON`, GitHub/OpenAI/Linear token shapes, and bearer
+credentials.
 
 The checkout remote is a clean `https://github.com/owner/repo` URL. `gh auth
 setup-git` supplies the current token through Git's credential helper, so no

@@ -115,6 +115,20 @@ describe("OpenThrottle canonical task skills", () => {
     }
   });
 
+  it("both skills wait for CI, reply on every feedback item, and keep a PR gate checklist", () => {
+    for (const task of tasks) {
+      const body = skillBody(task);
+      // Wait for CI to settle before finalizing (never end on red/running).
+      expect(body).toContain("gh pr checks");
+      expect(body).toContain("--watch");
+      // A visible, auditable gate checklist lives in the PR description.
+      expect(body).toContain("## OpenThrottle gates");
+      // Every feedback item gets a visible reply — not just non-actionable
+      // ones — so it is always clear what was actioned.
+      expect(body).toContain("EVERY item");
+    }
+  });
+
   it("each skill declares an openai.yaml with implicit invocation disabled", () => {
     for (const task of tasks) {
       const yaml = agentsYaml(task);

@@ -7,7 +7,7 @@ import { runSweep } from "./sweep.js";
 import { createLinearClientProvider } from "./linear-auth.js";
 import { captureCodexAuthJson } from "./codex-auth.js";
 import { pollSandboxEvents } from "./sandbox-events.js";
-import { activityPayload, createLinearOutboxProcessor } from "./linear-outbox.js";
+import { activityPayload, createLinearOutboxProcessor, enqueueSessionUpdate } from "./linear-outbox.js";
 
 const SWEEP_INTERVAL_MS = 15 * 60 * 1000; // run every 15 min while awake; SPEC only requires "on every boot" + periodic while awake
 const DELIVERY_DRAIN_INTERVAL_MS = 30 * 1000;
@@ -57,6 +57,13 @@ async function main() {
           });
           await linearOutboxProcessor.process(row.id);
         },
+        postSessionUpdate: (params) =>
+          enqueueSessionUpdate(store, linearOutboxProcessor, {
+            id: params.eventId,
+            sessionId: params.sessionId,
+            issueId: params.issueId,
+            plan: params.plan,
+          }),
         finishCompletion: (completion) =>
           completeRun(
             {
