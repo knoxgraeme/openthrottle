@@ -22,11 +22,13 @@ change is *what kind of snapshot/sandbox we create*.
 ## What changes vs what stays
 
 **Changes (VM):**
-- The snapshot becomes a **VM snapshot** (today `build-snapshot.mjs` builds a
-  container image snapshot from `sandbox/Dockerfile`).
-- `createForTicket` creates a **VM sandbox** from that snapshot (VM sandboxes
-  "can currently only be created from existing VM snapshots").
-- Start/resume timeouts tuned for VM boot (~2s vs container sub-90ms).
+- The snapshot is tagged **`sandboxClass: "linux-vm"`** — the one build-time
+  change (today `build-snapshot.mjs` builds a `container`-class snapshot from
+  `sandbox/Dockerfile`; same Dockerfile, class tag added).
+- `createForTicket` is **unchanged**: it still `create({ snapshot })`s, and the
+  sandbox inherits `linux-vm` from the snapshot (VM sandboxes "can currently only
+  be created from existing VM snapshots" — satisfied by the class on the snapshot).
+- Start/resume timeouts tuned for VM boot where Phase 0 shows it's needed.
 
 **Stays (unchanged):**
 - `daytona.ts` surface (`fs`, `process`, `exec`, `getSignedPreviewUrl`,
@@ -34,60 +36,95 @@ change is *what kind of snapshot/sandbox we create*.
   git/gh, the 5s **poll** event model, `/preview/:id` signed URL, the #21
   pipeline, and the whole supervisor control plane.
 
-## The one real unknown (the spike pivot)
+## The build path (confirmed from the SDK, v0.199.0)
 
-**How Daytona builds a VM snapshot.** Container snapshots build from a
-Dockerfile (`Image.fromDockerfile`, what we do now). VM snapshots are a distinct
-artifact — the docs say they "can only be created from existing VM snapshots,"
-but don't spell out the *build* path. The three candidates the spike must settle:
-1. Build a VM snapshot directly from our `sandbox/Dockerfile` (best case — a
-   near drop-in change to `build-snapshot.mjs`).
-2. Start from a Daytona **base VM snapshot**, run our provisioning into it, then
-   snapshot that (a provision-then-snapshot flow — moderate; we'd adapt the
-   Dockerfile steps into a provisioning script run against a base VM).
-3. Snapshot a running/prepared VM sandbox into a reusable VM snapshot.
+**Resolved — it's a one-field change.** Reading the published SDK's own type
+definitions (`@daytona/sdk@0.199.0` → `@daytona/api-client@0.199.0`) settles what
+the docs left implicit:
 
-This determines whether Phase 1 is "trivial" or "moderate." Everything else is
-low-risk.
+- The VM tier is **not a `create()` parameter**. `create()` takes only
+  `CreateSandboxFromImageParams` / `CreateSandboxFromSnapshotParams`; neither has
+  a `class`/VM field.
+- The tier is a property of the **snapshot**. `CreateSnapshotParams` (and the
+  wire model `CreateSnapshot`) carry `sandboxClass?: SandboxClass`, documented as
+  "Determines which runners can host sandboxes created from this snapshot."
+- `SandboxClass` is an enum: **`LINUX_VM = "linux-vm"`**, `CONTAINER =
+  "container"`, `ANDROID`, `WINDOWS`. The VM tier is literally
+  `sandboxClass: "linux-vm"`.
 
-## Phase 0 — Spike (gates the effort; ~half a day, live Daytona)
+So the "VM snapshot build path" is the best case (old candidate 1): we keep
+building the snapshot from our existing `sandbox/Dockerfile`
+(`Image.fromDockerfile`, exactly as today) and just add `sandboxClass:
+"linux-vm"` to the `snapshot.create()` call. A sandbox created from that snapshot
+(`daytona.create({ snapshot })`, unchanged) inherits the VM class. "VM sandboxes
+can only be created from existing VM snapshots" is satisfied by the snapshot
+carrying the class — there is no separate VM-image artifact to produce.
 
-On a real Daytona account, confirm:
-1. **VM snapshot build path** — which of the three above; whether our
-   `sandbox/Dockerfile` is reusable, or we need a base-VM + provision step.
-2. **Create-VM API** — the exact `daytona.create({...})` shape for a VM sandbox
-   (the v0.21+ image-vs-snapshot param split; any `class`/VM flag).
-3. **`fork` API** — `sandbox.fork()` / the CoW-clone call, independence, fork-tree
-   behavior (needed for Phase 4).
-4. **Feature parity** — `fs.uploadFile/setFilePermissions`,
-   `process.createSession/executeSessionCommand/getEntrypointLogs`,
-   `getSignedPreviewUrl`, `setAutostopInterval`, label `list` all behave
-   identically on VM sandboxes (this is the entire adapter surface).
-5. **Latency + cost** — VM create/resume time (to tune `start(60)` timeouts) and
-   the VM price delta vs container.
+The remaining live-only questions are small tuning details, not blockers:
+whether `linux-vm` supports pausing (`autoPauseInterval` / pay-when-paused) and
+the VM boot latency + price delta. Phase 0 shrinks to confirming those.
 
-Output: the VM-snapshot build recipe, the create-VM + fork API shapes, and a go.
+### Also confirmed from the SDK — relevant to OpenThrottle
 
-## Phase 1 — VM snapshot build
+- **Native network policy at create()**: `networkBlockAll`, `networkAllowList`
+  (CIDRs), `domainAllowList` (domains) — egress lockdown as create params, no
+  separate call.
+- **Org Secrets**: `secrets?: Record<envName, orgSecretName>` mounts a Secret as
+  an opaque placeholder, substituted transparently on outbound calls to the
+  Secret's allowed hosts. A cleaner path than injecting raw model/GitHub tokens
+  as `envVars` — worth evaluating for credential handling.
+- **`linkedSandbox` + `ephemeral`**: co-schedule an ephemeral sandbox on the same
+  runner with a private local network — the primitive for the future
+  agent-orchestrator / sub-sandbox scratch-compute idea.
 
-- Rework `supervisor/scripts/build-snapshot.mjs` to produce a **VM snapshot** per
-  the Phase-0 recipe. If path (1): swap the snapshot-create call to the VM
-  variant, keep `sandbox/Dockerfile`. If path (2/3): add a base-VM + provision
-  step (the Dockerfile install steps become a provisioning script run into a
-  base VM, then snapshot). This is the primary work + the only real unknown.
+None of these are required for the VM switch; they're captured because the
+confirmation surfaced them and two map onto earlier design questions.
+
+## Phase 0 — Spike (small now that the API is confirmed; live Daytona)
+
+The build recipe and the create/fork API shapes are settled from the SDK
+(above), so the spike only has to confirm runtime behavior on a real account:
+1. **Pause economics** — does `linux-vm` support pausing? Set `autoPauseInterval`
+   and confirm the sandbox pauses (billed while active, cheap while paused) and
+   resumes on `start()`. If `linux-vm` does *not* pause, fall back to
+   `autoStopInterval` (stop/start) and note the cold-start cost.
+2. **Latency + cost** — VM create/resume time (to tune the `create()`/`start()`
+   timeouts, default 60s) and the `linux-vm` price delta vs `container`.
+3. **`_experimental_fork`** — exercise `daytona._experimental_fork(sandbox,
+   { name })` directly: independence of the fork, fork-tree behavior, and that
+   it's stable enough to build Phase 4 on (it's an `_experimental_` API).
+4. **Feature parity spot-check** — `fs`, `process`, `getPreviewLink`,
+   `setAutostopInterval`, and label `list` on a `linux-vm` sandbox (expected
+   identical; the SDK abstracts the class, so this is a confidence check, not a
+   discovery).
+
+Output: pause-vs-stop decision, tuned timeouts, the fork go/no-go, and a green
+single-run drive on `linux-vm`.
+
+## Phase 1 — VM snapshot build (one field)
+
+- In `supervisor/scripts/build-snapshot.mjs`, add `sandboxClass: "linux-vm"`
+  (`SandboxClass.LINUX_VM`) to the existing
+  `daytona.snapshot.create({ name, image: Image.fromDockerfile(...) })` call.
+  Keep `sandbox/Dockerfile` and the whole build exactly as-is — the only change
+  is the class tag on the snapshot.
 - Keep the snapshot **commit-pinned** (`openthrottle-v2-ce-<sha>`) and the CI
-  `snapshot` job that stages `DAYTONA_SNAPSHOT`.
+  `snapshot` job that stages `DAYTONA_SNAPSHOT`. No new artifact type, no
+  base-VM/provision detour.
 
 ## Phase 2 — Adapter + config + deploy (small)
 
-- **`supervisor/src/daytona.ts` `createForTicket`** — create a VM sandbox from
-  `cfg.daytonaSnapshot` (VM snapshot), adding whatever VM `class`/param Phase 0
-  found. A few lines; everything else in the adapter is untouched.
-- **`config.ts`** — reuse `DAYTONA_SNAPSHOT` (now a VM snapshot name); add
-  `DAYTONA_SANDBOX_CLASS`/VM flag only if the API requires it.
-- **Timeouts** — bump `start()`/resume waits for VM boot (~2s) where needed.
-- **`deploy.yml`** — the snapshot job builds the VM snapshot (Phase 1); otherwise
-  unchanged.
+- **`supervisor/src/daytona.ts` `createForTicket`** — **unchanged.** It already
+  calls `daytona.create({ snapshot: cfg.daytonaSnapshot, ... })`; the sandbox
+  inherits `linux-vm` from the snapshot, and `create()` has no class param to
+  add. (Optional: set `autoPauseInterval` here if Phase 0 confirms pausing.)
+- **`config.ts`** — reuse `DAYTONA_SNAPSHOT` (now points at the `linux-vm`
+  snapshot). No new class env var — the class rides on the snapshot, not the
+  sandbox-create call.
+- **Timeouts** — bump `create()`/`start()` waits for VM boot where Phase 0 shows
+  it's needed.
+- **`deploy.yml`** — the snapshot job builds the `linux-vm` snapshot (Phase 1);
+  otherwise unchanged.
 
 ## Phase 3 — Verify
 
@@ -118,12 +155,15 @@ Fork is optional to *ship* — the baseline VM switch (Phases 1–3) is valuable
 its own for isolation — but it's the capability that makes VM worth it over Kata,
 so it's planned, not merely deferred.
 
-**Caveat: fork is currently experimental.** The SDK exposes it as
-`_experimental_fork({ name? }, timeout?): Promise<Sandbox>` — the `_experimental_`
-prefix means the API is not GA and may change or be unstable. The Phase-0 spike
-must exercise it directly before Phase 4 commits to it; the baseline VM switch
-(Phases 1–3, the isolation win) does **not** depend on fork, so it's safe to ship
-first and adopt fork only once its stability is confirmed.
+**Caveat: fork is currently experimental.** The SDK exposes it on the client as
+`daytona._experimental_fork(sandbox, { name? }, timeout?): Promise<Sandbox>` — a
+top-level `Daytona` method that takes the source `Sandbox` (not a
+`sandbox.fork()`), documented as "creating a new Sandbox with an identical
+filesystem." The `_experimental_` prefix means the API is not GA and may change
+or be unstable. The Phase-0 spike must exercise it directly before Phase 4
+commits to it; the baseline VM switch (Phases 1–3, the isolation win) does
+**not** depend on fork, so it's safe to ship first and adopt fork only once its
+stability is confirmed.
 
 ## Cutover
 
@@ -149,9 +189,10 @@ migration.
 
 | Risk | Note |
 |---|---|
-| **VM snapshot build path unknown** | The one real unknown; Phase 0 Q1. Pivots Phase 1 between trivial and moderate. |
-| VM boot ~2s + higher cost | Negligible latency for our minutes-long runs; confirm the price delta in Phase 0. |
-| Feature parity on VM tier | Expected identical (SDK abstracts sandbox type); Phase 0 Q4 verifies before any code. |
-| **Fork is experimental** (`_experimental_fork`) | Not GA; may change/be unstable. Baseline VM switch (Phases 1–3) doesn't depend on it — ship isolation first, adopt fork only after the spike confirms stability. |
+| ~~VM snapshot build path unknown~~ **Resolved** | Confirmed from the SDK: `snapshot.create({ …, sandboxClass: "linux-vm" })`, `create()` unchanged. Phase 1 is a one-field change. |
+| Pause support on `linux-vm` | `autoPauseInterval` is class-dependent; Phase 0 Q1 confirms whether `linux-vm` pauses (pay-when-paused) or only stops. Tuning, not a blocker. |
+| VM boot + higher cost | Negligible latency for our minutes-long runs; confirm the `linux-vm` price delta in Phase 0. |
+| Feature parity on VM tier | Expected identical (SDK abstracts sandbox class); Phase 0 Q4 spot-checks before code. |
+| **Fork is experimental** (`_experimental_fork`) | Not GA; `daytona._experimental_fork(sandbox, { name })`. Baseline VM switch (Phases 1–3) doesn't depend on it — ship isolation first, adopt fork only after the spike confirms stability. |
 | Fork golden staleness | Cache keyed on lockfile/base-commit, cold-install fallback (Phase 4), not a frozen snapshot. |
 | Daytona closed-source (Jun 2026) | Transparency downgrade, not a reliability issue; noted for vendor risk. |
