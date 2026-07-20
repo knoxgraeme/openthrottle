@@ -1404,6 +1404,113 @@ describe("createServer lifecycle", () => {
     });
   });
 
+  it("resolves a grouped branch label even when the webhook carries no labels", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.registerRepository({
+      linearTeamKey: "OT",
+      linearTeamId: "team-1",
+      githubRepo: "owner/team-default",
+      baseBranch: "develop",
+      webhookId: 42,
+      snapshot: "openthrottle",
+    });
+    let createParams: { envVars?: Record<string, string> } | undefined;
+    const sandbox = {
+      id: "sandbox-no-webhook-labels",
+      state: "started",
+      autoStopInterval: 60,
+      setAutostopInterval: vi.fn(async () => undefined),
+      updateEnv: vi.fn(async () => undefined),
+      fs: {
+        uploadFile: vi.fn(async () => undefined),
+        setFilePermissions: vi.fn(async () => undefined),
+      },
+      process: {
+        createSession: vi.fn(async () => undefined),
+        executeSessionCommand: vi.fn(async () => undefined),
+      },
+    };
+    const create = vi.fn(async (params: { envVars?: Record<string, string> }) => {
+      createParams = params;
+      return sandbox;
+    });
+    // The AgentSessionEvent carries an empty labels array; the branch group must
+    // still be discovered via the IssueLabels GraphQL query (no webhook gate).
+    let issueLabelsQueried = false;
+    const linearFetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const query = String((JSON.parse(String(init?.body)) as { query?: string }).query);
+      if (query.includes("IssueLabels")) {
+        issueLabelsQueried = true;
+        return Response.json({
+          data: {
+            issue: { labels: { nodes: [{ name: "env/staging", parent: { name: "branch" } }] } },
+          },
+        });
+      }
+      return Response.json({
+        data: {
+          agentActivityCreate: { success: true, agentActivity: { id: "activity" } },
+          agentSessionUpdate: { success: true },
+        },
+      });
+    }) as unknown as typeof fetch;
+    const githubFetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/repos/owner/team-default/branches/env%2Fstaging")) {
+        return Response.json({ name: "env/staging" });
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    });
+    vi.stubGlobal("fetch", githubFetch);
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg,
+      store,
+      daytona: {
+        get: vi.fn(async () => sandbox),
+        list: vi.fn(() => (async function* () {})()),
+        create,
+      } as unknown as Daytona,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
+      runBackground: (task) => background.push(task),
+    });
+    const created = JSON.stringify({
+      action: "created",
+      type: "AgentSessionEvent",
+      webhookId: "linear-no-labels",
+      webhookTimestamp: Date.now(),
+      organizationId: "org",
+      agentSession: {
+        id: "session-no-labels",
+        issue: {
+          id: "issue-no-labels",
+          identifier: "OT-NOLABELS",
+          team: { id: "team-1", key: "OT" },
+          labels: [],
+        },
+      },
+    });
+    await app.request("/webhooks/linear", {
+      method: "POST",
+      headers: signedLinear(created, "linear-no-labels"),
+      body: created,
+    });
+    await Promise.all(background.splice(0));
+
+    expect(issueLabelsQueried).toBe(true);
+    expect(githubFetch).toHaveBeenCalledOnce();
+    expect(createParams?.envVars).toMatchObject({
+      GITHUB_REPO: "owner/team-default",
+      BASE_BRANCH: "env/staging",
+    });
+    expect(store.getByIssueId("issue-no-labels")).toMatchObject({
+      repo: "owner/team-default",
+      base_branch: "env/staging",
+      state: "active",
+    });
+  });
+
   it("keeps a grouped branch child out of repo-label routing", async () => {
     db = openDb(":memory:");
     const store = createTicketStore(db);

@@ -27,7 +27,7 @@ export function isRecentLinearWebhook(
   );
 }
 
-export interface LinearIssueWebhookPayload {
+interface LinearIssueWebhookPayload {
   id: string;
   identifier: string;
   team?: { id?: string; key?: string; name?: string };

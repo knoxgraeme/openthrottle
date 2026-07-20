@@ -162,7 +162,13 @@ async function handleCreated(
   // repository is resolved.
   let routingLabels = labels;
   let requestedBase = baseBranchFromLabels(labels);
-  if (!requestedBase && labels.length > 0) {
+  // The AgentSessionEvent webhook does not reliably embed the issue's labels
+  // (grouped labels in particular), so whenever no flat `branch ›` label matched
+  // we resolve the issue's labels from Linear rather than gating on the
+  // webhook-provided list. Gating on `labels.length` silently missed a grouped
+  // `branch` label whenever the webhook carried no labels, falling back to the
+  // route default.
+  if (!requestedBase) {
     try {
       const resolved = await fetchIssueLabels(linear, issue.id);
       requestedBase = baseBranchFromLabels(labelMatchNames(resolved));
@@ -177,6 +183,13 @@ async function handleCreated(
       if (baseChildren.size > 0) {
         routingLabels = labels.filter((name) => !baseChildren.has(name));
       }
+      // Diagnostic: record what Linear returned and the chosen base so a
+      // mislabeled group (or an empty result) is visible in the supervisor logs.
+      console.log(
+        `[base-label] ${issue.identifier}: resolved=${JSON.stringify(
+          labelMatchNames(resolved)
+        )} base=${requestedBase ?? "(route default)"}`
+      );
     } catch (error) {
       console.warn(
         `[base-label] grouped-label lookup failed for ${issue.identifier}: ${String(error)}`

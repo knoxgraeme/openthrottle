@@ -33,7 +33,7 @@ const SUPERVISOR_ENV_VARS: Array<{ name: string; hint: string }> = [
   { name: "ALLOW_LINEAR_MERGE", hint: "default: false" },
 ];
 
-export async function verifySnapshot(snapshotName: string): Promise<boolean> {
+async function verifySnapshot(snapshotName: string): Promise<boolean> {
   const apiKey = readEnv("DAYTONA_API_KEY");
   if (!apiKey) {
     p.log.warn(`DAYTONA_API_KEY is not set, so snapshot "${snapshotName}" could not be verified.`);

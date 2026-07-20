@@ -227,7 +227,7 @@ function backfillAgentSessions(db: Database.Database): void {
 }
 
 export type Agent = "claude" | "codex" | "opencode";
-export type TicketState = "active" | "closed" | "expired" | "error" | "stopped";
+type TicketState = "active" | "closed" | "expired" | "error" | "stopped";
 // Task taxonomy: implement (feature/bug plan) and investigate (debugging) are the
 // two loops; resume is the single continuation mechanism for either loop, fed by
 // a human reply or queued GitHub feedback. `review`/`review-fix` were removed —
@@ -237,7 +237,7 @@ export type TicketState = "active" | "closed" | "expired" | "error" | "stopped";
 // `pending_re_review` column stays in the schema — no code reads or writes it
 // anymore.
 export type TaskType = "implement" | "resume" | "investigate";
-export type RunStatus = "running" | "completed" | "failed" | "timed_out" | "stopped";
+type RunStatus = "running" | "completed" | "failed" | "timed_out" | "stopped";
 
 export interface Ticket {
   linear_issue_id: string;
@@ -278,7 +278,7 @@ export interface Run {
   log_tail: string | null;
 }
 
-export type TicketUpsert = Pick<
+type TicketUpsert = Pick<
   Ticket,
   | "linear_issue_id"
   | "linear_issue_identifier"
@@ -291,7 +291,7 @@ export type TicketUpsert = Pick<
   | "state"
 > & { base_branch?: string };
 
-export interface RepositoryRegistration {
+interface RepositoryRegistration {
   linear_team_key: string;
   linear_team_id: string | null;
   github_repo: string;
@@ -302,7 +302,7 @@ export interface RepositoryRegistration {
   updated_at: string;
 }
 
-export interface RepositoryRegistrationInput {
+interface RepositoryRegistrationInput {
   linearTeamKey: string;
   linearTeamId?: string;
   githubRepo: string;
@@ -311,7 +311,7 @@ export interface RepositoryRegistrationInput {
   snapshot: string;
 }
 
-export interface DeliveryClaim {
+interface DeliveryClaim {
   deliveryId: string;
   source: "linear" | "github";
   sessionId?: string;
@@ -337,7 +337,7 @@ export interface WebhookDelivery {
   received_at: string;
 }
 
-export interface SandboxEventRecord {
+interface SandboxEventRecord {
   event_id: string;
   run_id: string;
   sandbox_id: string;
@@ -351,7 +351,7 @@ export interface SandboxEventRecord {
   created_at: string;
 }
 
-export interface AgentSession {
+interface AgentSession {
   id: string;
   linear_issue_id: string;
   generation: number;
@@ -379,7 +379,7 @@ export interface LinearOutboxRecord {
   created_at: string;
 }
 
-export interface SessionWork {
+interface SessionWork {
   id: string;
   linear_session_id: string;
   linear_issue_id: string;
@@ -394,7 +394,7 @@ export interface SessionWork {
   canceled_at: string | null;
 }
 
-export interface FinishRunParams {
+interface FinishRunParams {
   runId: string;
   status: Exclude<RunStatus, "running">;
   exitCode?: number;

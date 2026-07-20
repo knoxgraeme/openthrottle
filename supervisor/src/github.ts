@@ -22,7 +22,7 @@ export function verifyGithubSignature(
   return actual.length === expected.length && timingSafeEqual(expected, actual);
 }
 
-export interface GithubPullRequest {
+interface GithubPullRequest {
   number: number;
   html_url: string;
   merged: boolean;
@@ -35,14 +35,14 @@ interface GithubEventBase {
   repository: { full_name: string };
 }
 
-export interface GithubPullRequestEvent extends GithubEventBase {
+interface GithubPullRequestEvent extends GithubEventBase {
   kind: "pull_request";
   action: string;
   pull_request: GithubPullRequest;
   label?: { name: string };
 }
 
-export interface GithubReviewEvent extends GithubEventBase {
+interface GithubReviewEvent extends GithubEventBase {
   kind: "pull_request_review";
   action: string;
   pull_request: GithubPullRequest;
@@ -55,7 +55,7 @@ export interface GithubReviewEvent extends GithubEventBase {
   };
 }
 
-export interface GithubWorkflowRunEvent extends GithubEventBase {
+interface GithubWorkflowRunEvent extends GithubEventBase {
   kind: "workflow_run";
   action: string;
   workflow_run: {
@@ -69,7 +69,7 @@ export interface GithubWorkflowRunEvent extends GithubEventBase {
   };
 }
 
-export interface GithubCheckSuiteEvent extends GithubEventBase {
+interface GithubCheckSuiteEvent extends GithubEventBase {
   kind: "check_suite";
   action: string;
   check_suite: {
@@ -191,10 +191,6 @@ export function parseGithubWebhook(eventName: string | undefined, raw: string): 
     }
   }
   return { ...payload, kind: eventName } as unknown as GithubWebhookEvent;
-}
-
-export function parseGithubPullRequestEvent(raw: string): GithubPullRequestEvent {
-  return parseGithubWebhook("pull_request", raw) as GithubPullRequestEvent;
 }
 
 export function isOpenthrottleBranch(ref: string | null | undefined): ref is string {
