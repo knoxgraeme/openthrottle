@@ -291,6 +291,12 @@ async function pollTicketEvents(
         });
       } else {
         const logTail = await readTaskLogTail(sandbox, event.token);
+        // Capture the token the run rotated in the sandbox BEFORE finishing:
+        // completeRun schedules follow-up work (a queued resume) before it
+        // returns, and that resume reseeds Codex auth from the settings store.
+        // Persisting the rotation first keeps the resume from replaying the
+        // spent token. Best-effort — the hook must not throw.
+        await params.captureAgentAuth?.(sandbox, ticket);
         const result = await params.finishCompletion({
           runId: event.run_id,
           token: event.token,
@@ -304,9 +310,6 @@ async function pollTicketEvents(
         if (result.status !== 200 && result.status !== 409) {
           throw new Error(`completion rejected with status ${result.status}`);
         }
-        // The run rotated its credentials in the sandbox; capture them before
-        // the workspace is torn down so the next run seeds the live token.
-        await params.captureAgentAuth?.(sandbox, ticket);
       }
       params.store.markSandboxEventProcessed(event.event_id);
     } catch (error) {
