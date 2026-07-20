@@ -56,6 +56,8 @@ export async function handleGithubEvent(
         ticket,
         prUrl: event.pull_request.html_url,
         merged: event.pull_request.merged,
+        doneOnMerge: cfg.doneOnMerge,
+        doneStateName: cfg.linearDoneStateName,
       });
     }
     return;

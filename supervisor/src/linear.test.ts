@@ -8,7 +8,9 @@ import {
   fetchIssueLabels,
   isRecentLinearWebhook,
   labelMatchNames,
+  moveIssueToCompletedState,
   parseLinearWebhook,
+  selectCompletedStateId,
   verifyLinearSignature,
 } from "./linear.js";
 
@@ -214,5 +216,71 @@ describe("Linear contracts", () => {
         { sessionId: "session-1", type: "thought", body: "working" }
       )
     ).rejects.toThrow("success: false");
+  });
+
+  it("selects the completed state, preferring an explicit name, then Done, then position", () => {
+    const states = [
+      { id: "s-progress", name: "In Progress", type: "started", position: 1 },
+      { id: "s-done", name: "Done", type: "completed", position: 3 },
+      { id: "s-released", name: "Released", type: "completed", position: 4 },
+      { id: "s-canceled", name: "Canceled", type: "canceled", position: 5 },
+    ];
+    expect(selectCompletedStateId(states)).toBe("s-done");
+    expect(selectCompletedStateId(states, { preferredName: "released" })).toBe("s-released");
+    // A preferred name that is not a completed state falls back to Done.
+    expect(selectCompletedStateId(states, { preferredName: "In Progress" })).toBe("s-done");
+    // No state literally named Done → lowest-position completed state.
+    expect(
+      selectCompletedStateId([
+        { id: "s-ship", name: "Shipped", type: "completed", position: 7 },
+        { id: "s-rel", name: "Released", type: "completed", position: 2 },
+      ])
+    ).toBe("s-rel");
+    // No completed states at all → nothing to move to.
+    expect(selectCompletedStateId([{ id: "s", name: "Todo", type: "unstarted", position: 0 }])).toBeUndefined();
+  });
+
+  it("moves an unfinished issue to its team's Done state", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { query: string; variables: Record<string, unknown> };
+      bodies.push(body);
+      if (body.query.includes("IssueWorkflow")) {
+        return Response.json({
+          data: {
+            issue: {
+              state: { type: "started" },
+              team: {
+                states: {
+                  nodes: [
+                    { id: "s-todo", name: "Todo", type: "unstarted", position: 0 },
+                    { id: "s-done", name: "Done", type: "completed", position: 3 },
+                  ],
+                },
+              },
+            },
+          },
+        });
+      }
+      return Response.json({
+        data: { issueUpdate: { success: true, issue: { state: { name: "Done" } } } },
+      });
+    }) as unknown as typeof fetch;
+
+    const result = await moveIssueToCompletedState({ accessToken: "oauth", fetch: fetchMock }, "issue-1");
+    expect(result).toEqual({ moved: true, stateName: "Done" });
+    const mutation = bodies.find((body) => String(body.query).includes("IssueUpdate"));
+    expect(mutation?.variables).toMatchObject({ id: "issue-1", stateId: "s-done" });
+  });
+
+  it("does not update an issue that is already completed", async () => {
+    const fetchMock = vi.fn(async () =>
+      Response.json({ data: { issue: { state: { type: "completed" }, team: { states: { nodes: [] } } } } })
+    ) as unknown as typeof fetch;
+
+    const result = await moveIssueToCompletedState({ accessToken: "oauth", fetch: fetchMock }, "issue-1");
+    expect(result).toEqual({ moved: false });
+    // Only the query ran; no issueUpdate mutation.
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 });

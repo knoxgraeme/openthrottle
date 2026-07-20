@@ -319,6 +319,88 @@ export async function agentSessionUpdate(
   return data.agentSessionUpdate;
 }
 
+export interface WorkflowState {
+  id: string;
+  name: string;
+  // Linear workflow-state category: triage | backlog | unstarted | started |
+  // completed | canceled.
+  type: string;
+  position: number;
+}
+
+// Pick the workflow state a merged issue should move to. Only completed-type
+// states are eligible (so "done on merge" always lands in a done column):
+// prefer an explicit name, then one literally named "Done", then the
+// lowest-position completed state (Linear's leftmost done column). Pure and
+// exported so the selection is table-testable without a network call.
+export function selectCompletedStateId(
+  states: WorkflowState[],
+  opts?: { preferredName?: string }
+): string | undefined {
+  const completed = states.filter((state) => state.type === "completed");
+  if (completed.length === 0) return undefined;
+  const byName = (name: string) =>
+    completed.find((state) => state.name.trim().toLowerCase() === name.trim().toLowerCase());
+  const preferred = opts?.preferredName?.trim() ? byName(opts.preferredName) : undefined;
+  const chosen = preferred ?? byName("Done") ?? [...completed].sort((a, b) => a.position - b.position)[0];
+  return chosen.id;
+}
+
+// Moves an issue into its team's completed state, unless it is already there.
+// Returns whether it moved and the state name, so the caller can report it. The
+// caller treats this as best-effort — a failure must not block PR-close cleanup.
+export async function moveIssueToCompletedState(
+  client: LinearClient,
+  issueId: string,
+  opts?: { preferredName?: string }
+): Promise<{ moved: boolean; stateName?: string }> {
+  const data = await linearGraphQL<{
+    issue?: {
+      state?: { type?: string } | null;
+      team?: { states?: { nodes?: Array<{ id?: string; name?: string; type?: string; position?: number }> } };
+    };
+  }>(
+    client,
+    `query IssueWorkflow($id: String!) {
+      issue(id: $id) {
+        state { type }
+        team { states { nodes { id name type position } } }
+      }
+    }`,
+    { id: issueId }
+  );
+  if (data.issue?.state?.type === "completed") return { moved: false };
+  const states: WorkflowState[] = (data.issue?.team?.states?.nodes ?? [])
+    .filter(
+      (node): node is { id: string; name: string; type: string; position?: number } =>
+        typeof node?.id === "string" && typeof node?.name === "string" && typeof node?.type === "string"
+    )
+    .map((node) => ({
+      id: node.id,
+      name: node.name,
+      type: node.type,
+      position: typeof node.position === "number" ? node.position : 0,
+    }));
+  const stateId = selectCompletedStateId(states, opts);
+  if (!stateId) return { moved: false };
+  const result = await linearGraphQL<{
+    issueUpdate: { success: boolean; issue?: { state?: { name?: string } } };
+  }>(
+    client,
+    `mutation IssueUpdate($id: String!, $stateId: String!) {
+      issueUpdate(id: $id, input: { stateId: $stateId }) {
+        success
+        issue { state { name } }
+      }
+    }`,
+    { id: issueId, stateId }
+  );
+  if (!result.issueUpdate.success) {
+    throw new Error("Linear issueUpdate returned success: false");
+  }
+  return { moved: true, stateName: result.issueUpdate.issue?.state?.name };
+}
+
 export async function commentCreate(
   client: LinearClient,
   params: { issueId: string; body: string }

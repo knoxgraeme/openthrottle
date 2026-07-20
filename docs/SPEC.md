@@ -130,7 +130,11 @@ that ticket, bounding durable log storage to the latest captured run.
 ### GitHub/review lifecycle
 
 - Closing or merging an `ot/*` PR stops an active run, deletes its sandbox,
-  and closes the ticket row.
+  and closes the ticket row. On **merge** (default on, `LINEAR_DONE_ON_MERGE`),
+  the Linear issue is also moved to its team's completed workflow state — the
+  one named by `LINEAR_DONE_STATE_NAME`, else `Done`, else the lowest-position
+  completed state; already-completed issues and non-merge closes are left as-is.
+  Best-effort: a failed transition is logged and never blocks cleanup.
 - All GitHub feedback on an active, PR-backed ticket becomes deduplicated
   `automatic` session work, each item carrying a triage message (gather the
   full review first via `gh pr checks` and all open threads; reply visibly on
@@ -312,7 +316,9 @@ Required unless noted:
   `CALLBACK_GRACE_SECONDS=120`, `DEV_PORT=3000`,
   `SWEEP_MAX_AGE_DAYS=14`, `ORPHAN_GRACE_MINUTES=5`,
   `WEBHOOK_MAX_AGE_SECONDS=60`, `REVIEW_MAX_ROUNDS=3`,
-  `ALLOW_LINEAR_MERGE=false`, `SANDBOX_EVENT_POLL_INTERVAL_MS=5000`.
+  `ALLOW_LINEAR_MERGE=false`, `LINEAR_DONE_ON_MERGE=true`,
+  `LINEAR_DONE_STATE_NAME=` (empty → auto-detect the completed state),
+  `SANDBOX_EVENT_POLL_INTERVAL_MS=5000`.
   `REVIEW_MAX_ROUNDS` bounds `automatic` (GitHub-feedback) session-work items
   consumed per ticket. Optional `REVIEW_NUDGE_COMMENT` (default empty) is
   posted on the PR after a feedback-triggered resume completes cleanly, to

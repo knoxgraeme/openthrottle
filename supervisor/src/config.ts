@@ -123,6 +123,8 @@ export interface Config {
   reviewMaxRounds: number;
   reviewNudgeComment: string;
   allowLinearMerge: boolean;
+  doneOnMerge: boolean;
+  linearDoneStateName: string;
   sandboxEventPollIntervalMs: number;
 }
 
@@ -165,6 +167,8 @@ export function loadConfig(): Config {
     reviewMaxRounds: optionalInt("REVIEW_MAX_ROUNDS", 3),
     reviewNudgeComment: optional("REVIEW_NUDGE_COMMENT", ""),
     allowLinearMerge: optionalBool("ALLOW_LINEAR_MERGE", false),
+    doneOnMerge: optionalBool("LINEAR_DONE_ON_MERGE", true),
+    linearDoneStateName: optional("LINEAR_DONE_STATE_NAME", ""),
     sandboxEventPollIntervalMs: optionalInt("SANDBOX_EVENT_POLL_INTERVAL_MS", 5_000),
   };
 

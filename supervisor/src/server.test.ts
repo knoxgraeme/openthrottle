@@ -38,6 +38,8 @@ const cfg: Config = {
   reviewMaxRounds: 3,
   reviewNudgeComment: "",
   allowLinearMerge: false,
+  doneOnMerge: true,
+  linearDoneStateName: "",
   sandboxEventPollIntervalMs: 5_000,
 };
 

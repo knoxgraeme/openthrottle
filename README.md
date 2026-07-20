@@ -25,8 +25,9 @@ two loops inside each authorized run — `implement` (feature/bug plan) and
 GitHub-native reviewers (bots or humans) own review; their feedback — reviews,
 PR comments, failed CI — is deduplicated and delivered back as a `resume` of
 the same agent session, bounded by a rounds counter with a Linear/PR
-escalation. PR close/merge deletes the workspace. Review and CI events are
-mirrored back to the Linear session.
+escalation. PR close/merge deletes the workspace, and a merge also moves the
+Linear issue to its team's Done state. Review and CI events are mirrored back to
+the Linear session.
 
 See [docs/SPEC.md](docs/SPEC.md) for the normative contracts and
 [docs/PLAN.md](docs/PLAN.md) for the delivery/acceptance plan.

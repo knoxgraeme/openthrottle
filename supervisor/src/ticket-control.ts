@@ -1,7 +1,7 @@
 import type { Daytona } from "@daytona/sdk";
 import type { Ticket, TicketStore } from "./db.js";
 import { deleteSandbox, stopSandbox } from "./daytona.js";
-import { type LinearClient } from "./linear.js";
+import { moveIssueToCompletedState, type LinearClient } from "./linear.js";
 import {
   activityPayload,
   sessionUpdatePayload,
@@ -64,6 +64,10 @@ export async function closeTicketForPullRequest(params: {
   ticket: Ticket;
   prUrl: string;
   merged: boolean;
+  // Move the Linear issue to its team's completed state when its PR merges
+  // (default on). doneStateName optionally names which completed state to use.
+  doneOnMerge?: boolean;
+  doneStateName?: string;
 }): Promise<void> {
   const { store, daytona, linearOutbox, ticket, prUrl, merged } = params;
   let stopFailed = false;
@@ -97,6 +101,21 @@ export async function closeTicketForPullRequest(params: {
   store.setState(ticket.linear_issue_id, "closed");
 
   if (params.linear) {
+    // Move the issue to Done on merge (best-effort — never block cleanup).
+    let doneNote = "";
+    if (merged && params.doneOnMerge !== false) {
+      try {
+        const moved = await moveIssueToCompletedState(params.linear, ticket.linear_issue_id, {
+          preferredName: params.doneStateName,
+        });
+        if (moved.moved) doneNote = ` Moved ${ticket.linear_issue_identifier} to ${moved.stateName ?? "Done"}.`;
+      } catch (error) {
+        console.error(
+          `[webhooks/github] failed to move ${ticket.linear_issue_identifier} to its completed state:`,
+          error
+        );
+      }
+    }
     const cleanup =
       stopFailed || deleteFailed
         ? " Workspace cleanup is pending and will be retried by the orphan sweep."
@@ -110,7 +129,7 @@ export async function closeTicketForPullRequest(params: {
         type: stopFailed || deleteFailed ? "error" : "response",
         body: `PR ${merged ? "merged" : "closed"}.${cleanup}${
           ticket.running_since ? " The active run was stopped." : ""
-        }`,
+        }${doneNote}`,
       }),
     });
     await linearOutbox.process(activity.id);
