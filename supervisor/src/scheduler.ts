@@ -28,13 +28,13 @@ export interface LoopRegistryEntry {
 
 export const LOOP_REGISTRY: Record<"implement" | "investigate", LoopRegistryEntry> = {
   implement: {
-    entrySkill: "task-implement",
+    entrySkill: "implement-plan",
     cePipeline: ["ce-work", "ce-code-review", "ce-commit-push-pr"],
     triggers: ["linear.created", "linear.prompted.reDelegated", "linear.prompted.command"],
   },
   investigate: {
-    entrySkill: "task-investigate",
-    cePipeline: ["ce-debug"],
+    entrySkill: "investigate",
+    cePipeline: ["ce-debug", "ce-commit-push-pr"],
     triggers: ["linear.created.investigateLabel"],
   },
 };

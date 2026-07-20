@@ -19,10 +19,14 @@ Linear ticket ──> Fly supervisor ──> Daytona sandbox ──> ot/* branch
 The supervisor authenticates webhooks, durably stores and retries deliveries,
 owns one-time run state in SQLite, and keeps one sandbox per ticket. Agents
 push early, cannot push main/master, and run through a sanitizer. Fly is the
-deterministic outer state machine; native Compound Engineering skills are the
-agentic implementation/review/debug loop inside each authorized run. PR
-close/merge deletes the workspace. Review and CI events are mirrored back to
-the Linear session.
+deterministic outer state machine; native Compound Engineering skills drive
+two loops inside each authorized run — `implement` (feature/bug plan) and
+`investigate` (debugging), both ending in a PR. Once a PR exists, external
+GitHub-native reviewers (bots or humans) own review; their feedback — reviews,
+PR comments, failed CI — is deduplicated and delivered back as a `resume` of
+the same agent session, bounded by a rounds counter with a Linear/PR
+escalation. PR close/merge deletes the workspace. Review and CI events are
+mirrored back to the Linear session.
 
 See [docs/SPEC.md](docs/SPEC.md) for the normative contracts and
 [docs/PLAN.md](docs/PLAN.md) for the delivery/acceptance plan.
