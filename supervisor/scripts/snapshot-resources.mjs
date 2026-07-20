@@ -10,10 +10,13 @@
 // Units follow the Daytona SDK `Resources` contract: cpu in cores, memory and
 // disk in GiB.
 
+// Disk stays within Daytona's documented standard-tier maximum (10 GiB) so the
+// default snapshot build works for ordinary orgs; raise DAYTONA_SANDBOX_DISK on
+// plans with a larger quota. The OOM fix is the memory bump, not disk.
 export const SANDBOX_RESOURCE_DEFAULTS = Object.freeze({
   cpu: 4,
   memory: 8,
-  disk: 40,
+  disk: 10,
 });
 
 function positiveIntFromEnv(env, name, fallback) {

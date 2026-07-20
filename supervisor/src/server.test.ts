@@ -2226,9 +2226,9 @@ describe("createServer lifecycle", () => {
       state: "started",
       process: {
         getEntrypointLogs: vi.fn(async () => ({ output: "safe ghp_abcdefghijklmnop" })),
-        // The preview probes the dev server first; a real HTTP status means it
-        // is serving, so the endpoint redirects to the signed preview.
-        executeCommand: vi.fn(async () => ({ exitCode: 0, result: "OT_DEV_STATUS:200\n<html>ok</html>" })),
+        // The preview probes/restarts the dev server first; `listening` means
+        // it is serving, so the endpoint redirects to the signed preview.
+        executeCommand: vi.fn(async () => ({ exitCode: 0, result: "OT_DEV_STATUS:listening\n<html>ok</html>" })),
       },
       getSignedPreviewUrl: vi.fn(async () => ({ url: "https://preview.test/signed" })),
     };
@@ -2266,7 +2266,7 @@ describe("createServer lifecycle", () => {
     expect(await durableLogsResponse.text()).toBe("durable [REDACTED]");
   });
 
-  it("shows the sanitized dev-server log on the preview when nothing is listening", async () => {
+  it("restarts the dev server and shows an auto-refreshing page when it was down", async () => {
     db = openDb(":memory:");
     const store = createTicketStore(db);
     store.upsert({
@@ -2288,10 +2288,10 @@ describe("createServer lifecycle", () => {
     const sandbox = {
       state: "started",
       process: {
-        // 000 = curl could not connect: the dev server is not listening.
+        // The dev server was down and restart-dev.sh (re)started it.
         executeCommand: vi.fn(async () => ({
           exitCode: 0,
-          result: "OT_DEV_STATUS:000\nError: dev server crashed ghp_abcdefghijklmnop",
+          result: "OT_DEV_STATUS:starting\nStarting dev server ghp_abcdefghijklmnop",
         })),
       },
       getSignedPreviewUrl: vi.fn(async () => ({ url: "https://preview.test/signed" })),
@@ -2302,12 +2302,51 @@ describe("createServer lifecycle", () => {
     const response = await app.request(`/preview/OT-PREVIEW?token=${previewToken}`);
     expect(response.status).toBe(200);
     const html = await response.text();
-    expect(html).toContain("Dev server not responding");
-    expect(html).toContain("Error: dev server crashed");
-    // The dev log is sanitized before it is rendered.
+    expect(html).toContain("Starting the dev server");
+    // Auto-refreshes so it opens the app once ready.
+    expect(html).toContain('http-equiv="refresh"');
+    // The dev log is shown, sanitized.
+    expect(html).toContain("Starting dev server");
     expect(html).toContain("[REDACTED]");
     expect(html).not.toContain("ghp_abcdefghijklmnop");
-    // No redirect to a dead signed preview URL.
+    // No redirect to a still-booting server.
+    expect(sandbox.getSignedPreviewUrl).not.toHaveBeenCalled();
+  });
+
+  it("shows a no-dev-server page when the repository configures no dev command", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-nodev",
+      linear_issue_identifier: "OT-NODEV",
+      linear_session_id: "session-nodev",
+      sandbox_id: "sandbox-nodev",
+      branch: "ot/ot-nodev",
+      agent: "claude",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+    });
+    const previewToken = "preview-token";
+    store.setPreviewTokenHash(
+      "issue-nodev",
+      createHash("sha256").update(previewToken).digest("hex")
+    );
+    const sandbox = {
+      state: "started",
+      process: {
+        executeCommand: vi.fn(async () => ({ exitCode: 0, result: "OT_DEV_STATUS:no-dev\n" })),
+      },
+      getSignedPreviewUrl: vi.fn(async () => ({ url: "https://preview.test/signed" })),
+    };
+    const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
+    const app = createServer({ cfg, store, daytona, getLinearClient: async () => undefined });
+
+    const response = await app.request(`/preview/OT-NODEV?token=${previewToken}`);
+    expect(response.status).toBe(200);
+    const html = await response.text();
+    expect(html).toContain("No dev server");
+    expect(html).not.toContain('http-equiv="refresh"');
     expect(sandbox.getSignedPreviewUrl).not.toHaveBeenCalled();
   });
 

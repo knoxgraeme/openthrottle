@@ -77,8 +77,10 @@ jobs:
         env:
           DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
           # Optional sandbox sizing overrides. Empty repo variables fall through
-          # to the script defaults (4 vCPU / 8 GiB / 40 GiB), which clear the
-          # small default tier that OOM-kills monorepo build gates.
+          # to the script defaults (4 vCPU / 8 GiB / 10 GiB), which clear the
+          # small default tier that OOM-kills monorepo build gates. Disk stays
+          # within Daytona's standard-tier cap; raise it via the repo variable
+          # only on a larger-quota plan.
           DAYTONA_SANDBOX_CPU: ${{ vars.DAYTONA_SANDBOX_CPU }}
           DAYTONA_SANDBOX_MEMORY: ${{ vars.DAYTONA_SANDBOX_MEMORY }}
           DAYTONA_SANDBOX_DISK: ${{ vars.DAYTONA_SANDBOX_DISK }}

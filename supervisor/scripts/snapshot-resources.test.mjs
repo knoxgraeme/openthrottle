@@ -8,6 +8,9 @@ describe("resolveSandboxResources", () => {
     // monorepo builds, so guard the floor explicitly.
     expect(SANDBOX_RESOURCE_DEFAULTS.memory).toBeGreaterThanOrEqual(8);
     expect(SANDBOX_RESOURCE_DEFAULTS.cpu).toBeGreaterThanOrEqual(2);
+    // Disk stays within Daytona's standard-tier maximum so the default
+    // snapshot build does not fail for ordinary orgs.
+    expect(SANDBOX_RESOURCE_DEFAULTS.disk).toBeLessThanOrEqual(10);
   });
 
   it("reads operator overrides for every dimension", () => {

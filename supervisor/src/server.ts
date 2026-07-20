@@ -17,7 +17,7 @@ import {
   verifyGithubSignature,
   type GithubWebhookEvent,
 } from "./github.js";
-import { getSandboxLogs, getSignedPreviewUrl, probeDevServer } from "./daytona.js";
+import { getSandboxLogs, getSignedPreviewUrl, reviveDevServer, type DevServerRevival } from "./daytona.js";
 import { MAX_PRIVATE_LOG_TAIL_CHARS } from "./logs.js";
 import { sanitizeText } from "./sanitize.js";
 import {
@@ -474,30 +474,31 @@ export function createServer(deps: ServerDeps): Hono {
       return context.text("unauthorized", 401);
     }
     try {
-      // Probe the dev server first. If it responds at all (even its own error
-      // page), redirect so that page shows as-is. If nothing is listening —
-      // the dev server crashed, was never configured, or the workspace went
-      // idle — keep the preview useful by serving the dev log so the error is
-      // visible instead of a dead connection-refused link. A probe failure
-      // falls back to the plain redirect (previous behavior).
-      let probe: { listening: boolean; log: string };
+      // Probe and, if the dev server is down, restart it. `listening` → the app
+      // is up, redirect to it. `starting` → it was down and has been
+      // (re)started, show a page that auto-refreshes until it is ready.
+      // `no-dev` → show the log with a clear "no dev server" note. A probe
+      // failure (`unknown`) falls back to the plain redirect (previous
+      // behavior), so a broken restart never worsens the outcome.
+      let revival: DevServerRevival;
       try {
-        probe = await probeDevServer(daytona, ticket.sandbox_id, cfg.devPort);
+        revival = await reviveDevServer(daytona, ticket.sandbox_id, cfg.devPort);
       } catch (error) {
-        console.warn("[preview] dev-server probe failed, redirecting anyway:", error);
-        probe = { listening: true, log: "" };
+        console.warn("[preview] dev-server probe/restart failed, redirecting anyway:", error);
+        revival = { state: "unknown", log: "" };
       }
-      if (probe.listening) {
+      if (revival.state === "listening" || revival.state === "unknown") {
         return context.redirect(
           await getSignedPreviewUrl(daytona, ticket.sandbox_id, cfg.devPort),
           302
         );
       }
       return context.html(
-        renderDevPreviewErrorPage(
+        renderDevPreviewPage(
           ticket.linear_issue_identifier,
           cfg.devPort,
-          sanitizeText(probe.log).slice(-MAX_PRIVATE_LOG_TAIL_CHARS)
+          revival.state,
+          sanitizeText(revival.log).slice(-MAX_PRIVATE_LOG_TAIL_CHARS)
         ),
         200
       );
@@ -517,21 +518,31 @@ function escapeHtml(text: string): string {
     .replace(/>/g, "&gt;");
 }
 
-// Rendered when the wake-on-click preview finds no dev server listening, so the
-// operator sees the actual startup/crash log (or a clear "no dev server" note)
-// rather than a blank connection refusal.
-function renderDevPreviewErrorPage(identifier: string, port: number, log: string): string {
-  const body = log.trim()
-    ? `<pre>${escapeHtml(log)}</pre>`
-    : `<p>No dev-server output was captured. This repository may not configure a <code>dev</code> command, or the workspace has been idle and the dev server is no longer running.</p>`;
+// Rendered when the wake-on-click preview restarted the dev server (`starting`,
+// with an auto-refresh so the page becomes the app once it is up) or found no
+// dev command (`no-dev`). Either way the latest dev log is shown so any
+// startup/crash error is visible instead of a blank connection refusal.
+function renderDevPreviewPage(
+  identifier: string,
+  port: number,
+  state: "starting" | "no-dev",
+  log: string
+): string {
+  const starting = state === "starting";
+  const refresh = starting ? `<meta http-equiv="refresh" content="5">` : "";
+  const heading = starting
+    ? `Starting the dev server for ${escapeHtml(identifier)}`
+    : `No dev server for ${escapeHtml(identifier)}`;
+  const intro = starting
+    ? `The dev server was not running (the workspace idled), so it is being restarted on port ${port}. This page refreshes automatically and will open the app once it is ready.`
+    : `This repository does not configure a <code>dev</code> command in <code>.openthrottle.yml</code>, so nothing serves on port ${port}.`;
+  const body = log.trim() ? `<pre>${escapeHtml(log)}</pre>` : "";
   return (
     `<!doctype html><html lang="en"><head><meta charset="utf-8">` +
-    `<meta name="viewport" content="width=device-width, initial-scale=1">` +
-    `<title>Preview unavailable — ${escapeHtml(identifier)}</title>` +
+    `<meta name="viewport" content="width=device-width, initial-scale=1">${refresh}` +
+    `<title>Preview — ${escapeHtml(identifier)}</title>` +
     `<style>body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;margin:2rem;max-width:64rem;line-height:1.5}` +
     `h1{font-size:1.25rem}pre{white-space:pre-wrap;word-break:break-word;background:#111;color:#eee;padding:1rem;border-radius:8px;overflow:auto;max-height:70vh}</style>` +
-    `</head><body><h1>Dev server not responding for ${escapeHtml(identifier)}</h1>` +
-    `<p>Nothing is serving on port ${port}. Here is the latest dev-server log so the error is visible:</p>` +
-    `${body}</body></html>`
+    `</head><body><h1>${heading}</h1><p>${intro}</p>${body}</body></html>`
   );
 }

@@ -49,9 +49,10 @@ sandbox/tests/smoke.sh openthrottle:test
 # Size it for real monorepo builds — the default tier OOM-kills pnpm/Turbo
 # build and type-check gates (exit 137). CI builds via
 # supervisor/scripts/build-snapshot.mjs read DAYTONA_SANDBOX_CPU/MEMORY/DISK
-# (default 4 vCPU / 8 GiB / 40 GiB).
+# (default 4 vCPU / 8 GiB / 10 GiB; disk stays within Daytona's standard-tier
+# 10 GiB cap — raise it only on a larger-quota plan).
 daytona snapshot create openthrottle --dockerfile sandbox/Dockerfile --context . \
-  --cpu 4 --memory 8 --disk 40
+  --cpu 4 --memory 8 --disk 10
 
 # inspect the one-time platform checklist
 npx openthrottle setup

@@ -111,11 +111,15 @@ replace of the wake-on-click workspace preview (fresh per-ticket token) plus the
 Pull Request link when one exists — so both stay visible and valid in whatever
 run the user is viewing, not only the run that created the workspace. The
 preview URL is also echoed into that run's "Started"/"Created workspace" action.
-Opening the preview wakes the sandbox and probes the dev server: if it responds
-(any HTTP status, including its own error page) the request redirects to the
-signed preview; if nothing is listening — crashed, never configured, or idle —
-the endpoint serves the sanitized dev-server log instead, so the error is
-visible rather than a dead connection-refused link.
+Opening the preview wakes the sandbox and runs `restart-dev.sh`, which probes
+the dev server and, if it is down, (re)starts it from the repository's `dev:`
+command (the workspace idling stops the server the run started). If it is
+serving, the request redirects to the signed preview; if it was just restarted,
+the endpoint returns an auto-refreshing "starting" page that opens the app once
+it is ready; if the repository configures no `dev:` command, a clear note is
+shown. The sanitized dev-server log accompanies both pages so any startup/crash
+error is visible rather than a dead connection-refused link. A probe/restart
+failure falls back to the plain redirect.
 
 Before finalizing an outbox completion, Fly reads a fixed-size tail of
 `~/.ot/task.log`, sanitizes it (including the one-time callback token), and
@@ -205,7 +209,7 @@ row until retry/redrive.
 | `POST` | `/repositories/register` | `OT_STATUS_TOKEN` bearer | verify and upsert a target route/webhook |
 | `POST` | `/tickets/:id/stop` | `OT_STATUS_TOKEN` bearer | stop a ticket |
 | `GET` | `/tickets/:id/logs` | `OT_STATUS_TOKEN` bearer | sanitized live logs, falling back to the latest durable private run tail |
-| `GET` | `/preview/:id?token=` | per-ticket token | wake, then redirect to the dev server or show its error log |
+| `GET` | `/preview/:id?token=` | per-ticket token | wake, restart the dev server if down, then redirect or show a status page |
 | `POST` | `/runs/:id/complete` | one-time run bearer | consume run result |
 
 Linear OAuth uses `actor=app`, scopes
@@ -297,9 +301,11 @@ Required unless noted:
 - Daytona: `DAYTONA_API_KEY`, `DAYTONA_SNAPSHOT=openthrottle`. Snapshot sizing
   is set when the snapshot is built (`supervisor/scripts/build-snapshot.mjs`)
   from optional `DAYTONA_SANDBOX_CPU=4` (cores), `DAYTONA_SANDBOX_MEMORY=8`
-  (GiB), and `DAYTONA_SANDBOX_DISK=40` (GiB); the defaults clear Daytona's
+  (GiB), and `DAYTONA_SANDBOX_DISK=10` (GiB); the defaults clear Daytona's
   small default tier, which OOM-kills real pnpm/Turbo monorepo build and
-  type-check gates (SIGKILL / exit 137). Right-size these per fleet.
+  type-check gates (SIGKILL / exit 137). Disk stays within Daytona's
+  standard-tier 10 GiB maximum so the default build works for ordinary orgs;
+  raise it only on a plan with a larger quota. Right-size these per fleet.
 - Agents: `CLAUDE_CODE_OAUTH_TOKEN` for Claude subscription login and/or
   `CODEX_AUTH_JSON` for Codex subscription login; `DEFAULT_AGENT=codex`.
 - Limits: `BASE_BRANCH=main`, `MAX_TURNS=200`, `TASK_TIMEOUT=7200`,
