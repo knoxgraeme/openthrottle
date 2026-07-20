@@ -15,6 +15,7 @@ import {
   parsePullRequestUrl,
 } from "./github.js";
 import { startTask, type SandboxEnvContract } from "./daytona.js";
+import { resolveCodexAuthJson } from "./codex-auth.js";
 import { reconcileSandboxAutostop } from "./sandbox-lifecycle.js";
 import { MAX_PRIVATE_LOG_TAIL_CHARS } from "./logs.js";
 import { sanitizeText } from "./sanitize.js";
@@ -158,6 +159,7 @@ export function baseSandboxEnv(
     taskType: TaskType;
     run: RunCredentials;
     resumeMessage?: string;
+    codexAuthJson?: string;
   }
 ): SandboxEnvContract {
   return {
@@ -174,7 +176,7 @@ export function baseSandboxEnv(
     RESUME_MESSAGE: params.resumeMessage,
     CLAUDE_CODE_OAUTH_TOKEN:
       params.ticket.agent === "claude" ? cfg.claudeCodeOauthToken : undefined,
-    CODEX_AUTH_JSON: params.ticket.agent === "codex" ? cfg.codexAuthJson : undefined,
+    CODEX_AUTH_JSON: params.ticket.agent === "codex" ? params.codexAuthJson : undefined,
     KIMI_CODE_API_KEY: params.ticket.agent === "opencode" ? cfg.kimiCodeApiKey : undefined,
     OT_GIT_AUTHOR_NAME: cfg.gitAuthorName,
     OT_GIT_AUTHOR_EMAIL: cfg.gitAuthorEmail,
@@ -225,6 +227,7 @@ export async function launchExistingTask(params: {
         taskType: params.taskType,
         run,
         resumeMessage: params.resumeMessage,
+        codexAuthJson: resolveCodexAuthJson(cfg, store),
       }),
       linearContext:
         params.linearContext ??
