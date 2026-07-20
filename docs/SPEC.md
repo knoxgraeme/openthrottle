@@ -222,6 +222,8 @@ Required unless noted:
 - Agents: `CLAUDE_CODE_OAUTH_TOKEN` for Claude subscription login and/or
   `CODEX_AUTH_JSON` for Codex subscription login; `DEFAULT_AGENT=codex`.
 - Limits: `BASE_BRANCH=main`, `MAX_TURNS=200`, `TASK_TIMEOUT=7200`,
+  optional `MAX_BUDGET_USD`/`CLAUDE_FALLBACK_MODEL` (Claude engine only; unset by
+  default, overridable per-repo via `.openthrottle.yml`),
   `CALLBACK_GRACE_SECONDS=120`, `DEV_PORT=3000`,
   `SWEEP_MAX_AGE_DAYS=14`, `ORPHAN_GRACE_MINUTES=5`,
   `WEBHOOK_MAX_AGE_SECONDS=60`, `REVIEW_MAX_ROUNDS=3`,
@@ -259,7 +261,10 @@ Claude adapters are installed in the sandbox user's home, while Codex gets
 global runtime instructions in `~/.codex/AGENTS.md`. Claude receives a strict
 temporary config containing only project-declared MCP servers with user-only
 setting sources. Project `AGENTS.md` and `.claude/settings.json` files remain
-untouched and editable.
+untouched and editable. When configured, a per-run spend ceiling
+(`--max-budget-usd`) and an overflow `--fallback-model` are appended to the
+Claude invocation; both are omitted when unset so the default command is
+unchanged.
 The adapters compose native CE as follows: implement uses `ce-work`, local
 `ce-code-review`, `ce-commit-push-pr`, and bounded `ce-babysit-pr`; review uses
 report-only `ce-code-review`; review-fix uses `ce-resolve-pr-feedback` and
@@ -324,6 +329,9 @@ post_bootstrap:
 limits:
   max_turns: 200
   task_timeout: 7200
+  # Claude engine only, unset by default (Codex/OpenCode ignore them):
+  # max_budget_usd: 5.00   # hard per-run spend ceiling (--max-budget-usd)
+  # fallback_model: sonnet # used when the primary model is overloaded (--fallback-model)
 mcp_servers: {}
 ```
 

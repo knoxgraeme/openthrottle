@@ -22,7 +22,7 @@ git init -b main "$SMOKE_DIR/work" >/dev/null
 git -C "$SMOKE_DIR/work" config user.email smoke@openthrottle.dev
 git -C "$SMOKE_DIR/work" config user.name "OpenThrottle Smoke"
 printf '{"name":"smoke","private":true}\n' > "$SMOKE_DIR/work/package.json"
-printf 'agent: claude\nmodel: kimi-code/kimi-for-coding\npost_bootstrap: []\nlimits:\n  max_turns: 2\n  task_timeout: 30\n' \
+printf 'agent: claude\nmodel: kimi-code/kimi-for-coding\npost_bootstrap: []\nlimits:\n  max_turns: 2\n  task_timeout: 30\n  max_budget_usd: 5\n  fallback_model: sonnet\n' \
   > "$SMOKE_DIR/work/.openthrottle.yml"
 git -C "$SMOKE_DIR/work" add package.json .openthrottle.yml
 git -C "$SMOKE_DIR/work" commit -m "test: seed smoke fixture" >/dev/null
@@ -33,9 +33,11 @@ git --git-dir "$SMOKE_DIR/repo.git" symbolic-ref HEAD refs/heads/main
 test "$(docker image inspect --format '{{json .Config.Entrypoint}}' "$IMAGE")" = '["/bin/true"]'
 
 docker run --rm --entrypoint bash "$IMAGE" -lc '
-  claude --version | rg -q "^2\.1\.201" &&
+  claude --version | rg -q "^2\.1\.215" &&
   claude --help | rg -q -- "--setting-sources" &&
   claude --help | rg -q -- "--strict-mcp-config" &&
+  claude --help | rg -q -- "--max-budget-usd" &&
+  claude --help | rg -q -- "--fallback-model" &&
   test "$(git -C /opt/openthrottle/compound-engineering-marketplace rev-parse HEAD)" = "8163a96e86656a89797869ac61905fe4641f81be" &&
   gosu agent env HOME=/home/agent claude plugin list --json | jq -e '\''.[] | select(.id == "compound-engineering@compound-engineering-plugin" and .version == "3.19.0" and .enabled == true)'\'' >/dev/null &&
   gosu agent env HOME=/home/agent claude plugin details compound-engineering@compound-engineering-plugin | rg -q "ce-work" &&
@@ -183,6 +185,10 @@ run_sandbox "$CLAUDE_HOME" claude implement ot/smoke-claude claude-implement OT-
 test "$(cat "$CLAUDE_HOME/.ot/agent-session-id")" = "smoke-claude-session"
 run_sandbox "$CLAUDE_HOME" claude resume ot/smoke-claude claude-resume OT-CLAUDE "continue"
 grep -q -- '--resume smoke-claude-session' "$CLAUDE_HOME/.ot/claude-args.log"
+# Optional per-run limits from .openthrottle.yml reach the Claude CLI on every
+# invocation (implement and resume both append to claude-args.log).
+grep -q -- '--max-budget-usd 5' "$CLAUDE_HOME/.ot/claude-args.log"
+grep -q -- '--fallback-model sonnet' "$CLAUDE_HOME/.ot/claude-args.log"
 jq -e '.exit_code == 0 and .cost_usd == 0.125' \
   "$(find "$CLAUDE_HOME/.ot/outbox" -name '*completion-claude-implement.json' -print -quit)" >/dev/null
 jq -e '.exit_code == 0 and .cost_usd == 0.25' \

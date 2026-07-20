@@ -11,4 +11,10 @@ post_bootstrap:
 limits:
   max_turns: 200
   task_timeout: 7200
+  # Claude engine only. max_budget_usd is a hard per-run spend ceiling
+  # (Claude's --max-budget-usd); fallback_model keeps an unattended run alive
+  # when the primary model is overloaded (Claude's --fallback-model). Both are
+  # unset by default; Codex/OpenCode ignore them.
+  # max_budget_usd: 5.00
+  # fallback_model: sonnet
 mcp_servers: {}

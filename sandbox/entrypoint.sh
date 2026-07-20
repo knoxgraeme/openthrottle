@@ -171,6 +171,12 @@ MAX_TURNS="${MAX_TURNS:-200}"
 TASK_TIMEOUT="${TASK_TIMEOUT:-7200}"
 DEV_PORT="${DEV_PORT:-3000}"
 
+# Optional Claude-only run limits. Empty means "unset" (the flag is omitted, so
+# behavior is unchanged). Either can be overridden per-repository from
+# .openthrottle.yml (`limits.max_budget_usd` / `limits.fallback_model`) in Phase 4.
+MAX_BUDGET_USD="${MAX_BUDGET_USD:-}"
+CLAUDE_FALLBACK_MODEL="${CLAUDE_FALLBACK_MODEL:-}"
+
 # Strip trailing newlines from token-shaped secrets (SPEC phase 1).
 GITHUB_TOKEN="$(strip_nl "$GITHUB_TOKEN")"
 CLAUDE_CODE_OAUTH_TOKEN="$(strip_nl "${CLAUDE_CODE_OAUTH_TOKEN:-}")"
@@ -306,6 +312,16 @@ CFG_BUILD="$(yq_get '.build' '')"
 CFG_FORMAT="$(yq_get '.format' '')"
 MAX_TURNS="$(yq_get '.limits.max_turns' "$MAX_TURNS")"
 TASK_TIMEOUT="$(yq_get '.limits.task_timeout' "$TASK_TIMEOUT")"
+MAX_BUDGET_USD="$(yq_get '.limits.max_budget_usd' "$MAX_BUDGET_USD")"
+CLAUDE_FALLBACK_MODEL="$(yq_get '.limits.fallback_model' "$CLAUDE_FALLBACK_MODEL")"
+
+# max_budget_usd, when set, becomes Claude's --max-budget-usd hard per-run spend
+# ceiling. Reject a non-numeric value here rather than letting the CLI abort the
+# run mid-flight with a less obvious error.
+if [[ -n "$MAX_BUDGET_USD" && ! "$MAX_BUDGET_USD" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+  log "FATAL: limits.max_budget_usd='${MAX_BUDGET_USD}' is not a positive number"
+  exit 1
+fi
 
 if [[ -f "$CONFIG_FILE" ]]; then
   MCP_SERVERS_JSON="$(yq -o=json -r '.mcp_servers // {}' "$CONFIG_FILE" 2>/dev/null || echo '{}')"
@@ -385,7 +401,7 @@ if [[ "$AGENT" == "opencode" ]]; then
   fi
 fi
 
-log "config: agent=${AGENT}${OPENCODE_MODEL:+ model=${OPENCODE_MODEL}} ce_pipeline=${OT_CE_PIPELINE} dev='${CFG_DEV}' max_turns=${MAX_TURNS} task_timeout=${TASK_TIMEOUT}"
+log "config: agent=${AGENT}${OPENCODE_MODEL:+ model=${OPENCODE_MODEL}} ce_pipeline=${OT_CE_PIPELINE} dev='${CFG_DEV}' max_turns=${MAX_TURNS} task_timeout=${TASK_TIMEOUT}${MAX_BUDGET_USD:+ max_budget_usd=${MAX_BUDGET_USD}}${CLAUDE_FALLBACK_MODEL:+ fallback_model=${CLAUDE_FALLBACK_MODEL}}"
 
 # =============================================================================
 # Phase 5 — post_bootstrap
@@ -489,13 +505,23 @@ AGENT_EXIT=0
 CODEX_STDIN_FILE=""
 OPENCODE_PROMPT_FILE=""
 
+# Optional Claude-only flags, spliced into both claude branches below when set.
+# --max-budget-usd caps per-run spend; --fallback-model keeps an unattended run
+# alive when the primary model is overloaded or unavailable. Empty array expands
+# to nothing, so the default invocation is byte-for-byte unchanged when unset.
+CLAUDE_EXTRA_FLAGS=()
+if [[ "$AGENT" == "claude" ]]; then
+  [[ -n "$MAX_BUDGET_USD" ]] && CLAUDE_EXTRA_FLAGS+=(--max-budget-usd "$MAX_BUDGET_USD")
+  [[ -n "$CLAUDE_FALLBACK_MODEL" ]] && CLAUDE_EXTRA_FLAGS+=(--fallback-model "$CLAUDE_FALLBACK_MODEL")
+fi
+
 case "${AGENT}:${TASK_TYPE}" in
   claude:implement|claude:review|claude:review-fix|claude:investigate)
     SKILL_NAME="$(task_skill_name "$TASK_TYPE")"
     AGENT_CMD=(claude -p "/${SKILL_NAME}" --output-format stream-json --verbose \
       --max-turns "$MAX_TURNS" --dangerously-skip-permissions \
       --mcp-config "$MCP_CONFIG_FILE" --strict-mcp-config \
-      --setting-sources user)
+      --setting-sources user "${CLAUDE_EXTRA_FLAGS[@]}")
     ;;
   claude:resume)
     SAVED_SESSION_ID="$(as_agent "cat '${OT_DIR}/agent-session-id' 2>/dev/null" || true)"
@@ -506,7 +532,7 @@ case "${AGENT}:${TASK_TYPE}" in
     AGENT_CMD=(claude -p --resume "$SAVED_SESSION_ID" "$RESUME_MESSAGE" \
       --output-format stream-json --verbose --max-turns "$MAX_TURNS" \
       --dangerously-skip-permissions --mcp-config "$MCP_CONFIG_FILE" \
-      --strict-mcp-config --setting-sources user)
+      --strict-mcp-config --setting-sources user "${CLAUDE_EXTRA_FLAGS[@]}")
     ;;
   codex:implement|codex:review|codex:review-fix|codex:investigate)
     SKILL_NAME="$(task_skill_name "$TASK_TYPE")"
