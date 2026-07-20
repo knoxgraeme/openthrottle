@@ -42,6 +42,12 @@ interface SandboxActivityEvent {
   // Ephemeral thoughts/actions self-replace in Linear — used for the live
   // progress heartbeat emitted by runner/normalize.mjs.
   ephemeral?: boolean;
+  // Structured fields for `action` events: verb + parameter, plus an optional
+  // result once the step completes. When present they render as a proper
+  // Linear action instead of the flat "Progress: <body>" fallback.
+  action?: string;
+  parameter?: string;
+  result?: string;
 }
 
 interface SandboxPlanEvent {
@@ -117,6 +123,17 @@ export function parseSandboxEvent(raw: string): SandboxEvent {
     if (value.ephemeral !== undefined && typeof value.ephemeral !== "boolean") {
       throw new Error("sandbox activity has an invalid ephemeral flag");
     }
+    const actionFields: Pick<SandboxActivityEvent, "action" | "parameter" | "result"> = {};
+    if (value.type === "action") {
+      for (const key of ["action", "parameter", "result"] as const) {
+        const field = value[key];
+        if (field === undefined) continue;
+        if (typeof field !== "string" || field.length > MAX_BODY_LENGTH) {
+          throw new Error(`sandbox activity has an invalid ${key}`);
+        }
+        actionFields[key] = field;
+      }
+    }
     return {
       version: 1,
       kind: "activity",
@@ -126,6 +143,7 @@ export function parseSandboxEvent(raw: string): SandboxEvent {
       type: value.type,
       body: value.body,
       ...(value.ephemeral === true ? { ephemeral: true } : {}),
+      ...actionFields,
     };
   }
   if (value.kind === "plan") {
@@ -192,6 +210,18 @@ function toLinearActivity(event: SandboxActivityEvent, sessionId: string): Agent
   // Linear only honors `ephemeral` on thought/action activities; it is ignored
   // (and omitted) for the others.
   if (event.type === "action") {
+    // Prefer the structured verb/parameter/result; fall back to the flat
+    // "Progress: <body>" shape for legacy single-string actions.
+    if (event.action && event.parameter) {
+      return {
+        sessionId,
+        type: "action",
+        action: sanitizeText(event.action),
+        parameter: sanitizeText(event.parameter),
+        ...(event.result ? { result: sanitizeText(event.result) } : {}),
+        ...(event.ephemeral ? { ephemeral: true } : {}),
+      };
+    }
     return {
       sessionId,
       type: "action",
@@ -317,7 +347,13 @@ async function pollTicketEvents(
       kind: event.kind,
       payload: JSON.stringify(
         event.kind === "activity"
-          ? { ...event, body: sanitizeText(event.body) }
+          ? {
+              ...event,
+              body: sanitizeText(event.body),
+              ...(event.action ? { action: sanitizeText(event.action) } : {}),
+              ...(event.parameter ? { parameter: sanitizeText(event.parameter) } : {}),
+              ...(event.result ? { result: sanitizeText(event.result) } : {}),
+            }
           : event.kind === "plan"
             ? { ...event, plan: sanitizePlan(event.plan) }
             : {

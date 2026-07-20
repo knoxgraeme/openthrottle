@@ -57,6 +57,7 @@ export async function enqueueSessionUpdate(
     id?: string;
     sessionId: string;
     issueId?: string;
+    externalUrls?: Array<{ label: string; url: string }>;
     addedExternalUrls?: Array<{ label: string; url: string }>;
     plan?: AgentPlanItem[];
   }
@@ -68,6 +69,7 @@ export async function enqueueSessionUpdate(
     kind: "session_update",
     payload: sessionUpdatePayload({
       sessionId: params.sessionId,
+      externalUrls: params.externalUrls,
       addedExternalUrls: params.addedExternalUrls,
       plan: params.plan,
     }),
@@ -85,6 +87,7 @@ type LinearOutboxPayload =
   | {
       type: "session_update";
       sessionId: string;
+      externalUrls?: Array<{ label: string; url: string }>;
       addedExternalUrls?: Array<{ label: string; url: string }>;
       plan?: AgentPlanItem[];
     };
@@ -117,6 +120,7 @@ async function deliver(linear: LinearClient, row: LinearOutboxRecord): Promise<v
   }
   await agentSessionUpdate(linear, {
     sessionId: payload.sessionId,
+    externalUrls: payload.externalUrls,
     addedExternalUrls: payload.addedExternalUrls,
     plan: payload.plan,
   });
@@ -191,6 +195,7 @@ export function activityPayload(activity: AgentActivityInput): string {
 
 export function sessionUpdatePayload(params: {
   sessionId: string;
+  externalUrls?: Array<{ label: string; url: string }>;
   addedExternalUrls?: Array<{ label: string; url: string }>;
   plan?: AgentPlanItem[];
 }): string {

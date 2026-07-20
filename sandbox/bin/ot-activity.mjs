@@ -21,13 +21,42 @@ const PLAN_STATUS_ALIASES = {
   gap: "canceled", na: "canceled", "n/a": "canceled",
 };
 
-export function buildActivityEvent({ runId, type, message }) {
+export function buildActivityEvent({ runId, type, message, action, parameter, result }) {
   if (!runId || !/^[A-Za-z0-9_-]{1,128}$/.test(runId)) {
     throw new Error("RUN_ID is missing or unsafe");
   }
   if (!ACTIVITY_TYPES.has(type)) {
     throw new Error(`Unsupported activity type: ${type}`);
   }
+
+  // An `action` renders in Linear as verb + parameter, optionally with a
+  // result once the step completes ("Ran · pnpm test · 583 passed") — much
+  // more legible than the flat "Progress: <text>" every action used to carry.
+  // A bare 1-arg action stays backward-compatible as a Progress note.
+  if (type === "action") {
+    const verb = String(action ?? "Progress").trim();
+    const param = String(parameter ?? message ?? "").trim();
+    if (!param) throw new Error("Action activity requires a parameter");
+    if (verb.length > 200) throw new Error("Action verb must be at most 200 characters");
+    const res = result === undefined || result === null ? undefined : String(result).trim();
+    if (verb.length + param.length + (res?.length ?? 0) > MAX_BODY_LENGTH) {
+      throw new Error(`Action fields must be at most ${MAX_BODY_LENGTH.toLocaleString()} characters`);
+    }
+    return {
+      version: 1,
+      kind: "activity",
+      event_id: randomUUID(),
+      run_id: runId,
+      created_at: new Date().toISOString(),
+      type: "action",
+      action: verb,
+      parameter: param,
+      ...(res ? { result: res } : {}),
+      // A human summary for the private log and the DB dedup payload.
+      body: res ? `${verb}: ${param} → ${res}` : `${verb}: ${param}`,
+    };
+  }
+
   const body = String(message ?? "").trim();
   if (!body) throw new Error("Activity message must not be empty");
   if (body.length > MAX_BODY_LENGTH) {
@@ -113,14 +142,31 @@ async function main() {
 
   if (!type || rest.length === 0) {
     throw new Error(
-      "Usage: ot-activity <thought|action|elicitation|response|error> <message> | ot-activity plan <items...>"
+      "Usage: ot-activity <thought|elicitation|response|error> <message>\n" +
+        '       ot-activity action <verb> <parameter> [<result>]   (or a single progress note)\n' +
+        '       ot-activity plan "<content>=<status>" ...'
     );
   }
-  const event = buildActivityEvent({
-    runId: process.env.RUN_ID,
-    type,
-    message: rest.join(" "),
-  });
+
+  let event;
+  if (type === "action" && rest.length >= 2) {
+    // action <verb> <parameter> [<result...>]
+    const [actionVerb, parameter, ...resultParts] = rest;
+    event = buildActivityEvent({
+      runId: process.env.RUN_ID,
+      type: "action",
+      action: actionVerb,
+      parameter,
+      result: resultParts.length ? resultParts.join(" ") : undefined,
+    });
+  } else {
+    // Any single-argument form (incl. a bare `action <note>`) is a plain message.
+    event = buildActivityEvent({
+      runId: process.env.RUN_ID,
+      type,
+      message: rest.join(" "),
+    });
+  }
   await writeActivityEvent(event, outboxDir);
 }
 

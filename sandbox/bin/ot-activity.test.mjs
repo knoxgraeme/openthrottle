@@ -47,6 +47,42 @@ describe("ot-activity", () => {
     expect(JSON.parse(await readFile(join(outboxDir, files[0]), "utf8"))).toEqual(event);
   });
 
+  it("builds structured action events with verb/parameter/result", () => {
+    const started = buildActivityEvent({
+      runId: "run-1",
+      type: "action",
+      action: "Running",
+      parameter: "pnpm test",
+    });
+    expect(started).toMatchObject({
+      type: "action",
+      action: "Running",
+      parameter: "pnpm test",
+      body: "Running: pnpm test",
+    });
+    expect(started).not.toHaveProperty("result");
+
+    const finished = buildActivityEvent({
+      runId: "run-1",
+      type: "action",
+      action: "Ran",
+      parameter: "pnpm test",
+      result: "583 passed",
+    });
+    expect(finished).toMatchObject({
+      action: "Ran",
+      parameter: "pnpm test",
+      result: "583 passed",
+      body: "Ran: pnpm test → 583 passed",
+    });
+
+    // A bare single-string action stays backward-compatible as a Progress note.
+    expect(buildActivityEvent({ runId: "run-1", type: "action", message: "Tests passed" }))
+      .toMatchObject({ action: "Progress", parameter: "Tests passed" });
+    expect(() => buildActivityEvent({ runId: "run-1", type: "action", action: "Ran" }))
+      .toThrow("requires a parameter");
+  });
+
   it("normalizes friendly plan statuses and rejects unknown ones", () => {
     expect(normalizePlanStatus("done")).toBe("completed");
     expect(normalizePlanStatus("Running")).toBe("inProgress");

@@ -117,6 +117,62 @@ describe("sandbox event contracts", () => {
     }
   });
 
+  it("forwards structured action verb/parameter/result to Linear", async () => {
+    const store = seedRunningTicket();
+    const action = JSON.stringify({
+      version: 1,
+      kind: "activity",
+      event_id: "99999999-9999-4999-8999-999999999999",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:03.000Z",
+      type: "action",
+      action: "Ran",
+      parameter: "pnpm test",
+      result: "583 passed",
+      body: "Ran: pnpm test → 583 passed",
+    });
+    const files = new Map([["/home/agent/.ot/outbox/004.json", Buffer.from(action)]]);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      setAutostopInterval: vi.fn(async () => undefined),
+      fs: {
+        listFiles: vi.fn(async () =>
+          [...files.entries()].map(([path, value]) => ({
+            name: path.split("/").at(-1),
+            path,
+            size: value.length,
+            isDir: false,
+          }))
+        ),
+        downloadFile: vi.fn(async (path: string) => files.get(path)!),
+        deleteFile: vi.fn(async (path: string) => {
+          files.delete(path);
+        }),
+      },
+    } as unknown as Sandbox;
+    const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
+    const postActivity = vi.fn(async () => undefined);
+
+    await pollSandboxEvents({
+      daytona,
+      store,
+      postActivity,
+      finishCompletion: vi.fn(async () => ({ status: 200 })),
+    });
+
+    expect(postActivity).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "action",
+        action: "Ran",
+        parameter: "pnpm test",
+        result: "583 passed",
+      }),
+      expect.anything()
+    );
+  });
+
   it("forwards a plan event to the session-update handler", async () => {
     const store = seedRunningTicket();
     const planEvent = JSON.stringify({

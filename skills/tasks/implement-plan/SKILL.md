@@ -58,7 +58,10 @@ session. Record every smaller judgment call you do make for the final
    could-not-run (for example a gate the sandbox OOM-killed with exit 137).
    Never report a gate you could not actually run as passed; if a failure is
    genuinely pre-existing, carry the exact failing gate into the PR
-   description as a known gap.
+   description as a known gap. Report each gate outcome as a structured action
+   so the timeline reads as real work, not flat progress — verb, parameter,
+   result: e.g. `ot-activity action Ran "tests" "583 files passed"`,
+   `ot-activity action Ran "build" "could not run — sandbox OOM"`.
 7. Invoke `ce-commit-push-pr mode:pipeline branding:on`. It owns the final
    commits, push, and PR creation or update.
 8. Resolve the PR URL and base with

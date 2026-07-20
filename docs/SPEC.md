@@ -85,7 +85,10 @@ activity records locally: the five activity types (`thought`, `action`,
 `elicitation`, `response`, `error`), plus `ot-activity plan "<content>=<status>"
 …` which writes a `plan` event carrying a session-level checklist (Linear plan
 statuses `pending`/`inProgress`/`completed`/`canceled`, replaced in full each
-update). Independently, `runner/normalize.mjs` mirrors a throttled, ephemeral
+update). An `action` may carry a structured verb, parameter, and optional
+result (`ot-activity action Ran "pnpm test" "583 passed"`), rendering as a real
+Linear action rather than a flat "Progress" line; a single-argument action
+stays a plain progress note. Independently, `runner/normalize.mjs` mirrors a throttled, ephemeral
 `thought` for each meaningful agent step (a tool call, shell command, or file
 edit) into the same outbox — a live "currently doing X" heartbeat that
 self-replaces in the session and answers "stuck or working?" without cluttering
@@ -102,6 +105,13 @@ terminal activity when present, otherwise the captured final assistant response,
 otherwise a generic terminal activity plus PR links through the Linear outbox.
 If no result arrives by `TASK_TIMEOUT` plus grace, the sweep marks the run
 timed out and enqueues the timeout error.
+Every run start (workspace creation and every resume) re-asserts the session's
+agent-owned external URLs via `agentSessionUpdate` — a full `externalUrls`
+replace of the wake-on-click workspace preview (fresh per-ticket token) plus the
+Pull Request link when one exists — so both stay visible and valid in whatever
+run the user is viewing, not only the run that created the workspace. The
+preview URL is also echoed into that run's "Started"/"Created workspace" action.
+
 Before finalizing an outbox completion, Fly reads a fixed-size tail of
 `~/.ot/task.log`, sanitizes it (including the one-time callback token), and
 stores at most 100,000 characters on the run row. This private operator log is
