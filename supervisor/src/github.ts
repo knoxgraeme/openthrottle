@@ -342,16 +342,57 @@ export async function branchExists(
   return true;
 }
 
-export async function countChangesRequestedReviews(
+async function githubGraphQL<T>(
+  client: GithubClient,
+  query: string,
+  variables: Record<string, unknown>
+): Promise<T> {
+  const fetchImpl = client.fetch ?? fetch;
+  const response = await fetchImpl(`${client.apiBaseUrl ?? "https://api.github.com"}/graphql`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${client.token}`,
+    },
+    body: JSON.stringify({ query, variables }),
+    signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+  });
+  const json = (await response.json()) as { data?: T; errors?: unknown[] };
+  if (!response.ok || json.errors?.length) {
+    throw new Error(`GitHub GraphQL error (${response.status}): ${JSON.stringify(json.errors ?? json)}`);
+  }
+  if (!json.data) throw new Error("GitHub GraphQL response missing data");
+  return json.data;
+}
+
+// Best-effort skip for already-resolved queued feedback (Phase 1 item 7): a
+// prior resume may have addressed several queued review comments/threads at
+// once, so re-litigating a resolved thread wastes a round. Returns false (do
+// not skip) when the PR has no review threads at all — that covers plain PR
+// conversation comments, which never create a review thread to resolve.
+export async function areAllReviewThreadsResolved(
   client: GithubClient,
   repo: string,
   pullNumber: number
-): Promise<number> {
-  const reviews = await githubRequest<Array<{ state: string }>>(
+): Promise<boolean> {
+  const [owner, name] = repo.split("/");
+  const data = await githubGraphQL<{
+    repository?: {
+      pullRequest?: { reviewThreads?: { nodes?: Array<{ isResolved: boolean }> } };
+    };
+  }>(
     client,
-    `/repos/${repo}/pulls/${pullNumber}/reviews?per_page=100`
+    `query PullRequestReviewThreads($owner: String!, $name: String!, $number: Int!) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+          reviewThreads(first: 100) { nodes { isResolved } }
+        }
+      }
+    }`,
+    { owner, name, number: pullNumber }
   );
-  return reviews.filter((review) => review.state.toUpperCase() === "CHANGES_REQUESTED").length;
+  const nodes = data.repository?.pullRequest?.reviewThreads?.nodes ?? [];
+  return nodes.length > 0 && nodes.every((node) => node.isResolved);
 }
 
 export function commentOnPullRequest(

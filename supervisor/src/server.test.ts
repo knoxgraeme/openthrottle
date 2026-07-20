@@ -36,6 +36,7 @@ const cfg: Config = {
   orphanGraceMinutes: 5,
   webhookMaxAgeSeconds: 60,
   reviewMaxRounds: 3,
+  reviewNudgeComment: "",
   allowLinearMerge: false,
   sandboxEventPollIntervalMs: 5_000,
 };
@@ -1742,15 +1743,15 @@ describe("createServer lifecycle", () => {
     expect(sandbox.delete).toHaveBeenCalledOnce();
   });
 
-  it("starts review and review-fix tasks and mirrors completed CI", async () => {
+  it("mirrors every CI completion to Linear and turns a failure into automatic feedback work launched immediately when idle", async () => {
     db = openDb(":memory:");
     const store = createTicketStore(db);
     store.upsert({
-      linear_issue_id: "issue-review",
-      linear_issue_identifier: "OT-REVIEW",
-      linear_session_id: "session-review",
-      sandbox_id: "sandbox-review",
-      branch: "ot/ot-review",
+      linear_issue_id: "issue-ci",
+      linear_issue_identifier: "OT-CI",
+      linear_session_id: "session-ci",
+      sandbox_id: "sandbox-ci",
+      branch: "ot/ot-ci",
       agent: "claude",
       repo: "owner/repo",
       pr_url: "https://github.com/owner/repo/pull/12",
@@ -1758,7 +1759,7 @@ describe("createServer lifecycle", () => {
     });
     const envUpdates: Array<Record<string, string>> = [];
     const sandbox = {
-      id: "sandbox-review",
+      id: "sandbox-ci",
       state: "started",
       setAutostopInterval: vi.fn(async () => undefined),
       updateEnv: vi.fn(async (env: Record<string, string>) => {
@@ -1774,13 +1775,6 @@ describe("createServer lifecycle", () => {
       },
     };
     const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
-    const githubFetch = vi.fn(async (input: string | URL | Request) => {
-      if (String(input).includes("/reviews")) {
-        return Response.json([{ state: "CHANGES_REQUESTED" }]);
-      }
-      throw new Error(`Unexpected GitHub request: ${String(input)}`);
-    });
-    vi.stubGlobal("fetch", githubFetch);
     const linearRequests: Array<string> = [];
     const linearFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       const request = JSON.parse(String(init?.body)) as { query: string; variables: unknown };
@@ -1797,50 +1791,8 @@ describe("createServer lifecycle", () => {
       getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
       runBackground: (task) => background.push(task),
     });
-    const pullRequest = {
-      number: 12,
-      html_url: "https://github.com/owner/repo/pull/12",
-      merged: false,
-      head: { ref: "ot/ot-review", sha: "abc" },
-      base: { ref: "main" },
-    };
-    const labeled = JSON.stringify({
-      action: "labeled",
-      label: { name: "needs-review" },
-      repository: { full_name: "owner/repo" },
-      pull_request: pullRequest,
-    });
 
-    await app.request("/webhooks/github", {
-      method: "POST",
-      headers: signedGithub(labeled, "github-review", "pull_request"),
-      body: labeled,
-    });
-    await Promise.all(background.splice(0));
-    expect(envUpdates.at(-1)).toMatchObject({ TASK_TYPE: "review", PR_NUMBER: "12" });
-
-    const reviewRunId = store.getByIssueId("issue-review")!.run_id!;
-    store.finishRun({ runId: reviewRunId, status: "completed", ticketState: "active" });
-    const changesRequested = JSON.stringify({
-      action: "submitted",
-      repository: { full_name: "owner/repo" },
-      pull_request: pullRequest,
-      review: {
-        id: 42,
-        state: "CHANGES_REQUESTED",
-        html_url: "https://github.com/owner/repo/pull/12#pullrequestreview-42",
-        user: { login: "reviewer" },
-      },
-    });
-    await app.request("/webhooks/github", {
-      method: "POST",
-      headers: signedGithub(changesRequested, "github-review-fix", "pull_request_review"),
-      body: changesRequested,
-    });
-    await Promise.all(background.splice(0));
-    expect(envUpdates.at(-1)).toMatchObject({ TASK_TYPE: "review-fix", PR_NUMBER: "12" });
-
-    const workflowRun = JSON.stringify({
+    const successfulRun = JSON.stringify({
       action: "completed",
       repository: { full_name: "owner/repo" },
       workflow_run: {
@@ -1848,43 +1800,69 @@ describe("createServer lifecycle", () => {
         name: "CI",
         status: "completed",
         conclusion: "success",
-        head_branch: "ot/ot-review",
+        head_branch: "ot/ot-ci",
         html_url: "https://github.com/owner/repo/actions/runs/9",
       },
     });
     await app.request("/webhooks/github", {
       method: "POST",
-      headers: signedGithub(workflowRun, "github-ci", "workflow_run"),
-      body: workflowRun,
+      headers: signedGithub(successfulRun, "github-ci-success", "workflow_run"),
+      body: successfulRun,
     });
     await Promise.all(background.splice(0));
     expect(linearRequests.some((request) => request.includes("CI completed"))).toBe(true);
+    // A successful CI run only mirrors the activity — it is not feedback.
+    expect(store.getByIssueId("issue-ci")?.run_id).toBeNull();
+
+    const failedRun = JSON.stringify({
+      action: "completed",
+      repository: { full_name: "owner/repo" },
+      workflow_run: {
+        id: 10,
+        name: "CI",
+        status: "completed",
+        conclusion: "failure",
+        head_branch: "ot/ot-ci",
+        html_url: "https://github.com/owner/repo/actions/runs/10",
+      },
+    });
+    await app.request("/webhooks/github", {
+      method: "POST",
+      headers: signedGithub(failedRun, "github-ci-failure", "workflow_run"),
+      body: failedRun,
+    });
+    await Promise.all(background.splice(0));
+
+    expect(
+      db!.prepare("SELECT status, source FROM session_work WHERE id = ?").get("gh-ci-10")
+    ).toEqual({ status: "consumed", source: "automatic" });
+    // The idle ticket drains and launches a resume immediately (Phase 1 item 1).
+    expect(envUpdates.at(-1)).toMatchObject({ TASK_TYPE: "resume" });
+    expect(envUpdates.at(-1)).not.toHaveProperty("PR_NUMBER");
+    expect(store.getByIssueId("issue-ci")?.run_id).toEqual(expect.any(String));
   });
 
-  it("stops automated review work at the configured round cap", async () => {
+  it("queues a failed CI run while a run is active without launching until it completes", async () => {
     db = openDb(":memory:");
     const store = createTicketStore(db);
     store.upsert({
-      linear_issue_id: "issue-cap",
-      linear_issue_identifier: "OT-CAP",
-      linear_session_id: "session-cap",
-      sandbox_id: "sandbox-cap",
-      branch: "ot/ot-cap",
+      linear_issue_id: "issue-ci-busy",
+      linear_issue_identifier: "OT-CI-BUSY",
+      linear_session_id: "session-ci-busy",
+      sandbox_id: "sandbox-ci-busy",
+      branch: "ot/ot-ci-busy",
       agent: "claude",
       repo: "owner/repo",
-      pr_url: "https://github.com/owner/repo/pull/13",
+      pr_url: "https://github.com/owner/repo/pull/44",
       state: "active",
     });
-    const githubFetch = vi.fn(async (input: string | URL | Request) => {
-      if (String(input).includes("/reviews")) {
-        return Response.json(Array.from({ length: 3 }, () => ({ state: "CHANGES_REQUESTED" })));
-      }
-      if (String(input).includes("/issues/13/comments")) {
-        return Response.json({ html_url: "https://github.com/owner/repo/pull/13#comment" });
-      }
-      throw new Error(`Unexpected GitHub request: ${String(input)}`);
+    store.beginRun({
+      issueId: "issue-ci-busy",
+      runId: "run-ci-busy",
+      taskType: "implement",
+      tokenHash: "hash",
+      expiresAt: "2099-01-01T00:00:00.000Z",
     });
-    vi.stubGlobal("fetch", githubFetch);
     const linearFetch = vi.fn(async () =>
       Response.json({
         data: { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
@@ -1899,29 +1877,120 @@ describe("createServer lifecycle", () => {
       getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
       runBackground: (task) => background.push(task),
     });
-    const labeled = JSON.stringify({
-      action: "labeled",
-      label: { name: "needs-review" },
+    const failedRun = JSON.stringify({
+      action: "completed",
       repository: { full_name: "owner/repo" },
-      pull_request: {
-        number: 13,
-        html_url: "https://github.com/owner/repo/pull/13",
-        merged: false,
-        head: { ref: "ot/ot-cap", sha: "abc" },
-        base: { ref: "main" },
+      workflow_run: {
+        id: 11,
+        name: "CI",
+        status: "completed",
+        conclusion: "timed_out",
+        head_branch: "ot/ot-ci-busy",
+        html_url: "https://github.com/owner/repo/actions/runs/11",
       },
     });
 
     await app.request("/webhooks/github", {
       method: "POST",
-      headers: signedGithub(labeled, "github-cap", "pull_request"),
-      body: labeled,
+      headers: signedGithub(failedRun, "github-ci-busy", "workflow_run"),
+      body: failedRun,
+    });
+    await Promise.all(background.splice(0));
+
+    expect(daytona.get).not.toHaveBeenCalled();
+    expect(
+      db!.prepare("SELECT status, source FROM session_work WHERE id = ?").get("gh-ci-11")
+    ).toEqual({ status: "pending", source: "automatic" });
+    expect(store.getByIssueId("issue-ci-busy")?.run_id).toBe("run-ci-busy");
+  });
+
+  it("exhausts review rounds via consumed automatic session work, posts an error and PR comment, and discards without launching", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-cap",
+      linear_issue_identifier: "OT-CAP",
+      linear_session_id: "session-cap",
+      sandbox_id: "sandbox-cap",
+      branch: "ot/ot-cap",
+      agent: "claude",
+      repo: "owner/repo",
+      pr_url: "https://github.com/owner/repo/pull/13",
+      state: "active",
+    });
+    // Simulate REVIEW_MAX_ROUNDS (3) already-consumed automatic session-work
+    // items so the next one trips the bound.
+    for (let i = 0; i < cfg.reviewMaxRounds; i += 1) {
+      store.beginRun({
+        issueId: "issue-cap",
+        runId: `run-cap-${i}`,
+        taskType: "resume",
+        tokenHash: `hash-${i}`,
+        expiresAt: "2099-01-01T00:00:00.000Z",
+      });
+      store.enqueueSessionWork({
+        id: `gh-comment-cap-${i}`,
+        linearSessionId: "session-cap",
+        issueId: "issue-cap",
+        source: "automatic",
+        body: "prior feedback",
+      });
+      store.markSessionWorkConsumed(`gh-comment-cap-${i}`, `run-cap-${i}`);
+      store.finishRun({ runId: `run-cap-${i}`, status: "completed", ticketState: "active" });
+    }
+    const commentUrls: string[] = [];
+    const githubFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/user")) return Response.json({ login: "openthrottle-bot" });
+      if (url.includes("/issues/13/comments") && init?.method === "POST") {
+        commentUrls.push(String(init.body));
+        return Response.json({ html_url: "https://github.com/owner/repo/pull/13#comment" });
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    });
+    vi.stubGlobal("fetch", githubFetch);
+    const linearRequests: string[] = [];
+    const linearFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      linearRequests.push(String(init?.body));
+      return Response.json({
+        data: { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
+      });
+    }) as unknown as typeof fetch;
+    const background: Array<Promise<void>> = [];
+    const daytona = { get: vi.fn() } as unknown as Daytona;
+    const app = createServer({
+      cfg,
+      store,
+      daytona,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
+      runBackground: (task) => background.push(task),
+    });
+    const comment = JSON.stringify({
+      action: "created",
+      repository: { full_name: "owner/repo" },
+      issue: { number: 13, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/13" } },
+      comment: {
+        id: 555,
+        body: "one more round please",
+        html_url: "https://github.com/owner/repo/pull/13#issuecomment-555",
+        user: { login: "human-dev" },
+      },
+    });
+
+    await app.request("/webhooks/github", {
+      method: "POST",
+      headers: signedGithub(comment, "github-cap", "issue_comment"),
+      body: comment,
     });
     await Promise.all(background.splice(0));
 
     expect(daytona.get).not.toHaveBeenCalled();
     expect(store.getByIssueId("issue-cap")?.run_id).toBeNull();
-    expect(githubFetch.mock.calls.some(([input]) => String(input).includes("/comments"))).toBe(true);
+    expect(
+      db!.prepare("SELECT status FROM session_work WHERE id = ?").get("gh-comment-555")
+    ).toEqual({ status: "canceled" });
+    expect(linearRequests.some((request) => request.includes("Review rounds exhausted (3/3)"))).toBe(true);
+    expect(commentUrls.some((body) => body.includes("Review rounds exhausted (3/3)"))).toBe(true);
   });
 
   it("serves sanitized logs and a signed workspace preview to authorized operators", async () => {
@@ -2194,97 +2263,138 @@ describe("createServer lifecycle", () => {
     });
   });
 
-  it("starts a fresh review after a successful review-fix callback despite a Linear notification outage", async () => {
+  it("posts the configured review nudge after a successful automatic-consuming resume, scheduling no internal review", async () => {
     db = openDb(":memory:");
     const store = createTicketStore(db);
     store.upsert({
-      linear_issue_id: "issue-rereview",
-      linear_issue_identifier: "OT-REREVIEW",
-      linear_session_id: "session-rereview",
-      sandbox_id: "sandbox-rereview",
-      branch: "ot/ot-rereview",
+      linear_issue_id: "issue-nudge",
+      linear_issue_identifier: "OT-NUDGE",
+      linear_session_id: "session-nudge",
+      sandbox_id: "sandbox-nudge",
+      branch: "ot/ot-nudge",
       agent: "claude",
       repo: "owner/repo",
       pr_url: "https://github.com/owner/repo/pull/15",
       state: "active",
     });
-    const callbackToken = "callback-rereview";
+    const callbackToken = "callback-nudge";
     store.beginRun({
-      issueId: "issue-rereview",
-      runId: "run-rereview",
-      taskType: "review-fix",
+      issueId: "issue-nudge",
+      runId: "run-nudge",
+      taskType: "resume",
       tokenHash: createHash("sha256").update(callbackToken).digest("hex"),
       expiresAt: "2099-01-01T00:00:00.000Z",
     });
-    const envUpdates: Array<Record<string, string>> = [];
-    const setAutostopInterval = vi.fn(async (_minutes: number) => undefined);
-    const sandbox = {
-      state: "started",
-      setAutostopInterval,
-      updateEnv: vi.fn(async (env: Record<string, string>) => {
-        envUpdates.push(env);
-      }),
-      fs: {
-        uploadFile: vi.fn(async () => undefined),
-        setFilePermissions: vi.fn(async () => undefined),
-      },
-      process: {
-        createSession: vi.fn(async () => undefined),
-        executeSessionCommand: vi.fn(async () => undefined),
-      },
-    };
-    const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
+    store.enqueueSessionWork({
+      id: "gh-review-901",
+      linearSessionId: "session-nudge",
+      issueId: "issue-nudge",
+      source: "automatic",
+      body: "feedback",
+    });
+    store.markSessionWorkConsumed("gh-review-901", "run-nudge");
+    const daytona = { get: vi.fn() } as unknown as Daytona;
+    const githubRequests: Array<{ url: string; body?: string }> = [];
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () => Response.json([{ state: "CHANGES_REQUESTED" }]))
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        githubRequests.push({ url: String(input), body: init?.body ? String(init.body) : undefined });
+        return Response.json({ html_url: "https://github.com/owner/repo/pull/15#comment" });
+      })
     );
-    let activityAttempts = 0;
-    const linearFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
-      const query = String(JSON.parse(String(init?.body)).query);
-      if (query.includes("AgentActivityCreate") && activityAttempts++ === 0) {
-        return Response.json({ errors: [{ message: "Linear unavailable" }] });
-      }
-      return Response.json({
-        data: query.includes("AgentSessionUpdate")
-          ? { agentSessionUpdate: { success: true } }
-          : { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
-      });
-    }) as unknown as typeof fetch;
+    const linearFetch = vi.fn(async () =>
+      Response.json({
+        data: { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
+      })
+    ) as unknown as typeof fetch;
     const background: Array<Promise<void>> = [];
     const app = createServer({
-      cfg,
+      cfg: { ...cfg, reviewNudgeComment: "@codex review" },
       store,
       daytona,
       getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
       runBackground: (task) => background.push(task),
     });
 
-    const response = await app.request("/runs/run-rereview/complete", {
+    const response = await app.request("/runs/run-nudge/complete", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${callbackToken}`,
       },
-      body: JSON.stringify({
-        exit_code: 0,
-        pr_url: "https://github.com/owner/repo/pull/15",
-      }),
+      body: JSON.stringify({ exit_code: 0 }),
     });
     await Promise.all(background.splice(0));
 
     expect(response.status).toBe(200);
-    expect(activityAttempts).toBe(1);
-    expect(store.listLinearOutbox()).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ status: "failed", kind: "activity" }),
-        expect.objectContaining({ status: "pending", kind: "session_update" }),
-      ])
-    );
-    expect(setAutostopInterval.mock.calls.map(([minutes]) => minutes)).toEqual([5, 60]);
-    expect(envUpdates.at(-1)).toMatchObject({ TASK_TYPE: "review", PR_NUMBER: "15" });
-    const ticket = store.getByIssueId("issue-rereview")!;
-    expect(ticket.run_id).not.toBe("run-rereview");
-    expect(store.getRun(ticket.run_id!)?.task_type).toBe("review");
+    expect(
+      githubRequests.some(
+        (request) => request.url.includes("/issues/15/comments") && request.body?.includes("@codex review")
+      )
+    ).toBe(true);
+    // No internal review/review-fix task is scheduled — the drain found no
+    // more queued work, so no new run was launched.
+    expect(store.getByIssueId("issue-nudge")?.run_id).toBeNull();
+  });
+
+  it("does not post a nudge after a successful human-triggered resume", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-no-nudge",
+      linear_issue_identifier: "OT-NO-NUDGE",
+      linear_session_id: "session-no-nudge",
+      sandbox_id: "sandbox-no-nudge",
+      branch: "ot/ot-no-nudge",
+      agent: "claude",
+      repo: "owner/repo",
+      pr_url: "https://github.com/owner/repo/pull/16",
+      state: "active",
+    });
+    const callbackToken = "callback-no-nudge";
+    store.beginRun({
+      issueId: "issue-no-nudge",
+      runId: "run-no-nudge",
+      taskType: "resume",
+      tokenHash: createHash("sha256").update(callbackToken).digest("hex"),
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    store.enqueueSessionWork({
+      id: "human-reply-901",
+      linearSessionId: "session-no-nudge",
+      issueId: "issue-no-nudge",
+      source: "human",
+      body: "one more thing",
+    });
+    store.markSessionWorkConsumed("human-reply-901", "run-no-nudge");
+    const daytona = { get: vi.fn() } as unknown as Daytona;
+    const githubFetch = vi.fn(async () => Response.json({}));
+    vi.stubGlobal("fetch", githubFetch);
+    const linearFetch = vi.fn(async () =>
+      Response.json({
+        data: { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
+      })
+    ) as unknown as typeof fetch;
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg: { ...cfg, reviewNudgeComment: "@codex review" },
+      store,
+      daytona,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
+      runBackground: (task) => background.push(task),
+    });
+
+    await app.request("/runs/run-no-nudge/complete", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${callbackToken}`,
+      },
+      body: JSON.stringify({ exit_code: 0 }),
+    });
+    await Promise.all(background.splice(0));
+
+    expect(githubFetch).not.toHaveBeenCalled();
   });
 
   it("publishes captured final assistant output instead of a generic success response", async () => {
@@ -2401,7 +2511,7 @@ describe("createServer lifecycle", () => {
     expect(requests.some((request) => request.includes("finished successfully"))).toBe(false);
   });
 
-  it("defers the fresh re-review while a review-fix run ends paused on a decision elicitation", async () => {
+  it("freezes queued session work while a resume run ends paused on a decision elicitation", async () => {
     db = openDb(":memory:");
     const store = createTicketStore(db);
     store.upsert({
@@ -2419,7 +2529,7 @@ describe("createServer lifecycle", () => {
     store.beginRun({
       issueId: "issue-paused",
       runId: "run-paused",
-      taskType: "review-fix",
+      taskType: "resume",
       tokenHash: createHash("sha256").update(callbackToken).digest("hex"),
       expiresAt: "2099-01-01T00:00:00.000Z",
     });
@@ -2438,25 +2548,9 @@ describe("createServer lifecycle", () => {
       linearSessionId: "session-paused",
       issueId: "issue-paused",
       source: "automatic",
-      body: "New PR feedback queued while the review-fix was running.",
+      body: "New PR feedback queued while the resume was running.",
     });
-    const envUpdates: Array<Record<string, string>> = [];
-    const sandbox = {
-      state: "started",
-      setAutostopInterval: vi.fn(async () => undefined),
-      updateEnv: vi.fn(async (env: Record<string, string>) => {
-        envUpdates.push(env);
-      }),
-      fs: {
-        uploadFile: vi.fn(async () => undefined),
-        setFilePermissions: vi.fn(async () => undefined),
-      },
-      process: {
-        createSession: vi.fn(async () => undefined),
-        executeSessionCommand: vi.fn(async () => undefined),
-      },
-    };
-    const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
+    const daytona = { get: vi.fn() } as unknown as Daytona;
     const linearFetch = vi.fn(async () =>
       Response.json({
         data: { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
@@ -2485,95 +2579,16 @@ describe("createServer lifecycle", () => {
     await Promise.all(background.splice(0));
 
     expect(response.status).toBe(200);
-    expect(envUpdates).toEqual([]);
+    // Paused-on-elicitation completions never drain — nothing was launched,
+    // so the queued item is still there (claimed, not consumed).
     const ticket = store.getByIssueId("issue-paused")!;
     expect(ticket.run_id).toBeNull();
-    expect(ticket.pending_re_review).toBe(1);
     expect(
       store.claimNextSessionWork("session-paused", new Date().toISOString())
     ).toMatchObject({ id: "gh-comment-777", status: "claimed" });
   });
 
-  it("starts the deferred re-review after the resumed session answers the decisions", async () => {
-    db = openDb(":memory:");
-    const store = createTicketStore(db);
-    store.upsert({
-      linear_issue_id: "issue-deferred",
-      linear_issue_identifier: "OT-DEFERRED",
-      linear_session_id: "session-deferred",
-      sandbox_id: "sandbox-deferred",
-      branch: "ot/ot-deferred",
-      agent: "claude",
-      repo: "owner/repo",
-      pr_url: "https://github.com/owner/repo/pull/22",
-      state: "active",
-    });
-    store.setPendingReReview("issue-deferred", true);
-    const callbackToken = "callback-deferred";
-    store.beginRun({
-      issueId: "issue-deferred",
-      runId: "run-deferred",
-      taskType: "resume",
-      tokenHash: createHash("sha256").update(callbackToken).digest("hex"),
-      expiresAt: "2099-01-01T00:00:00.000Z",
-    });
-    const envUpdates: Array<Record<string, string>> = [];
-    const sandbox = {
-      state: "started",
-      setAutostopInterval: vi.fn(async () => undefined),
-      updateEnv: vi.fn(async (env: Record<string, string>) => {
-        envUpdates.push(env);
-      }),
-      fs: {
-        uploadFile: vi.fn(async () => undefined),
-        setFilePermissions: vi.fn(async () => undefined),
-      },
-      process: {
-        createSession: vi.fn(async () => undefined),
-        executeSessionCommand: vi.fn(async () => undefined),
-      },
-    };
-    const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => Response.json([{ state: "CHANGES_REQUESTED" }]))
-    );
-    const linearFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
-      const query = String(JSON.parse(String(init?.body)).query);
-      return Response.json({
-        data: query.includes("AgentSessionUpdate")
-          ? { agentSessionUpdate: { success: true } }
-          : { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
-      });
-    }) as unknown as typeof fetch;
-    const background: Array<Promise<void>> = [];
-    const app = createServer({
-      cfg,
-      store,
-      daytona,
-      getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
-      runBackground: (task) => background.push(task),
-    });
-
-    const response = await app.request("/runs/run-deferred/complete", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${callbackToken}`,
-      },
-      body: JSON.stringify({ exit_code: 0 }),
-    });
-    await Promise.all(background.splice(0));
-
-    expect(response.status).toBe(200);
-    expect(envUpdates.at(-1)).toMatchObject({ TASK_TYPE: "review", PR_NUMBER: "22" });
-    const ticket = store.getByIssueId("issue-deferred")!;
-    expect(ticket.pending_re_review).toBe(0);
-    expect(ticket.run_id).not.toBe("run-deferred");
-    expect(store.getRun(ticket.run_id!)?.task_type).toBe("review");
-  });
-
-  it("actions a commented review from another account by starting review-fix", async () => {
+  it("queues a bot's commented review (inline comments) as automatic work and launches an idle resume immediately", async () => {
     db = openDb(":memory:");
     const store = createTicketStore(db);
     store.upsert({
@@ -2607,7 +2622,6 @@ describe("createServer lifecycle", () => {
     const githubFetch = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
       if (url.endsWith("/user")) return Response.json({ login: "openthrottle-bot" });
-      if (url.includes("/reviews")) return Response.json([]);
       throw new Error(`Unexpected GitHub request: ${url}`);
     });
     vi.stubGlobal("fetch", githubFetch);
@@ -2650,9 +2664,237 @@ describe("createServer lifecycle", () => {
     });
     await Promise.all(background.splice(0));
 
-    expect(envUpdates.at(-1)).toMatchObject({ TASK_TYPE: "review-fix", PR_NUMBER: "31" });
+    // Regression pin: the commented review still becomes actionable feedback
+    // work, now uniformly as queued `automatic` session work rather than a
+    // direct `review-fix` launch — the idle ticket drains it immediately as a
+    // resume of the original session.
+    expect(
+      db!.prepare("SELECT status, source FROM session_work WHERE id = ?").get("gh-review-77")
+    ).toEqual({ status: "consumed", source: "automatic" });
+    expect(envUpdates.at(-1)).toMatchObject({ TASK_TYPE: "resume" });
+    expect(envUpdates.at(-1)).not.toHaveProperty("PR_NUMBER");
     const ticket = store.getByIssueId("issue-commented")!;
-    expect(store.getRun(ticket.run_id!)?.task_type).toBe("review-fix");
+    expect(store.getRun(ticket.run_id!)?.task_type).toBe("resume");
+  });
+
+  it("treats a CHANGES_REQUESTED review from the token account as self-feedback and does not queue it", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-self",
+      linear_issue_identifier: "OT-SELF",
+      linear_session_id: "session-self",
+      sandbox_id: "sandbox-self",
+      branch: "ot/ot-self",
+      agent: "claude",
+      repo: "owner/repo",
+      pr_url: "https://github.com/owner/repo/pull/32",
+      state: "active",
+    });
+    const githubFetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/user")) return Response.json({ login: "openthrottle-bot" });
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    });
+    vi.stubGlobal("fetch", githubFetch);
+    const linearFetch = vi.fn(async () =>
+      Response.json({
+        data: { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
+      })
+    ) as unknown as typeof fetch;
+    const background: Array<Promise<void>> = [];
+    const daytona = { get: vi.fn() } as unknown as Daytona;
+    const app = createServer({
+      cfg,
+      store,
+      daytona,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
+      runBackground: (task) => background.push(task),
+    });
+    const changesRequested = JSON.stringify({
+      action: "submitted",
+      repository: { full_name: "owner/repo" },
+      pull_request: {
+        number: 32,
+        html_url: "https://github.com/owner/repo/pull/32",
+        merged: false,
+        head: { ref: "ot/ot-self", sha: "abc" },
+        base: { ref: "main" },
+      },
+      review: {
+        id: 88,
+        state: "CHANGES_REQUESTED",
+        html_url: "https://github.com/owner/repo/pull/32#pullrequestreview-88",
+        user: { login: "openthrottle-bot" },
+      },
+    });
+
+    await app.request("/webhooks/github", {
+      method: "POST",
+      headers: signedGithub(changesRequested, "github-self-review", "pull_request_review"),
+      body: changesRequested,
+    });
+    await Promise.all(background.splice(0));
+
+    expect(daytona.get).not.toHaveBeenCalled();
+    expect(store.getByIssueId("issue-self")?.run_id).toBeNull();
+    expect(
+      db!.prepare("SELECT 1 FROM session_work WHERE id = ?").get("gh-review-88")
+    ).toBeUndefined();
+  });
+
+  it("skips a resolved-thread review item, then still launches a gh-ci- item (which is never subject to the check)", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-resolved",
+      linear_issue_identifier: "OT-RESOLVED",
+      linear_session_id: "session-resolved",
+      sandbox_id: "sandbox-resolved",
+      branch: "ot/ot-resolved",
+      agent: "claude",
+      repo: "owner/repo",
+      pr_url: "https://github.com/owner/repo/pull/33",
+      state: "active",
+    });
+    // Queued earlier (e.g. from a prior resume that already addressed it).
+    store.enqueueSessionWork({
+      id: "gh-review-901",
+      linearSessionId: "session-resolved",
+      issueId: "issue-resolved",
+      source: "automatic",
+      body: "already-addressed feedback",
+    });
+    const envUpdates: Array<Record<string, string>> = [];
+    const sandbox = {
+      state: "started",
+      setAutostopInterval: vi.fn(async () => undefined),
+      updateEnv: vi.fn(async (env: Record<string, string>) => {
+        envUpdates.push(env);
+      }),
+      fs: {
+        uploadFile: vi.fn(async () => undefined),
+        setFilePermissions: vi.fn(async () => undefined),
+      },
+      process: {
+        createSession: vi.fn(async () => undefined),
+        executeSessionCommand: vi.fn(async () => undefined),
+      },
+    };
+    const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
+    const graphqlCalls: unknown[] = [];
+    const githubFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/graphql")) {
+        const body = JSON.parse(String(init?.body)) as { variables: unknown };
+        graphqlCalls.push(body.variables);
+        return Response.json({
+          data: {
+            repository: { pullRequest: { reviewThreads: { nodes: [{ isResolved: true }] } } },
+          },
+        });
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    });
+    vi.stubGlobal("fetch", githubFetch);
+    const linearFetch = vi.fn(async () =>
+      Response.json({
+        data: { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
+      })
+    ) as unknown as typeof fetch;
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg,
+      store,
+      daytona,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
+      runBackground: (task) => background.push(task),
+    });
+    const failedRun = JSON.stringify({
+      action: "completed",
+      repository: { full_name: "owner/repo" },
+      workflow_run: {
+        id: 12,
+        name: "CI",
+        status: "completed",
+        conclusion: "failure",
+        head_branch: "ot/ot-resolved",
+        html_url: "https://github.com/owner/repo/actions/runs/12",
+      },
+    });
+    // Delivering the CI failure enqueues gh-ci-12 and drains the idle queue:
+    // the older gh-review-901 is claimed first, found resolved, and
+    // discarded; the drain continues to gh-ci-12 and launches it, since CI
+    // items are never subject to the resolved-thread check.
+    await app.request("/webhooks/github", {
+      method: "POST",
+      headers: signedGithub(failedRun, "github-resolved-skip", "workflow_run"),
+      body: failedRun,
+    });
+    await Promise.all(background.splice(0));
+
+    expect(graphqlCalls.length).toBeGreaterThan(0);
+    expect(
+      db!.prepare("SELECT status FROM session_work WHERE id = ?").get("gh-review-901")
+    ).toEqual({ status: "canceled" });
+    expect(
+      db!.prepare("SELECT status FROM session_work WHERE id = ?").get("gh-ci-12")
+    ).toEqual({ status: "consumed" });
+    expect(envUpdates.at(-1)).toMatchObject({ TASK_TYPE: "resume" });
+  });
+
+  it("posts a re-delegate error when a resume fails because the saved agent session is gone", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-missing-session",
+      linear_issue_identifier: "OT-MISSING-SESSION",
+      linear_session_id: "session-missing-session",
+      sandbox_id: "sandbox-missing-session",
+      branch: "ot/ot-missing-session",
+      agent: "claude",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+    });
+    const token = "callback-missing-session";
+    store.beginRun({
+      issueId: "issue-missing-session",
+      runId: "run-missing-session",
+      taskType: "resume",
+      tokenHash: createHash("sha256").update(token).digest("hex"),
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    const requests: string[] = [];
+    const linearFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      requests.push(String(init?.body));
+      return Response.json({
+        data: { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
+      });
+    }) as unknown as typeof fetch;
+    const app = createServer({
+      cfg,
+      store,
+      daytona: {} as Daytona,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
+    });
+
+    const response = await app.request("/runs/run-missing-session/complete", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        exit_code: 1,
+        failure_tail: "fatal: agent-session-id is missing from ~/.ot/agent-session-id",
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(
+      requests.some((request) => request.includes("re-delegate the issue to continue"))
+    ).toBe(true);
   });
 
   it("queues PR comment feedback while a run is active and ignores the agent's own comments", async () => {

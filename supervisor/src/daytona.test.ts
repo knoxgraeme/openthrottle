@@ -50,8 +50,6 @@ describe("Daytona task execution", () => {
     expect(updateEnv).toHaveBeenCalledWith(expect.any(Object), {
       unset: [
         "RESUME_MESSAGE",
-        "PR_NUMBER",
-        "REVIEW_ROUND",
         "CLAUDE_CODE_OAUTH_TOKEN",
         "CODEX_AUTH_JSON",
         "KIMI_CODE_API_KEY",
