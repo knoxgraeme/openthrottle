@@ -12,13 +12,23 @@ green (Vitest suites, Bats, Docker smoke) plus the listed additions.
 
 ---
 
-## Phase 1 — One owner for PR feedback and CI repair
+## Phase 1 — One owner for PR feedback and CI repair; external reviewers own review
 
-Today `ce-babysit-pr` (inside implement/review-fix/investigate runs) and the
+Two consolidations, driven by how the pipeline is actually used now.
+
+First, `ce-babysit-pr` (inside implement/review-fix/investigate runs) and the
 supervisor's webhook handlers both react to PR feedback, which double-handles
 events, burns `REVIEW_MAX_ROUNDS`, and keeps sandboxes on the 60-minute
-active autostop tier waiting on CI a webhook would report for free. The
-supervisor becomes the sole owner; runs end at "pushed + PR updated".
+active autostop tier waiting on CI a webhook would report for free.
+
+Second, the internal `review` task is legacy of the original two-agent design
+(reviewer agent reviews → original agent fixes → reviewer agent re-reviews).
+In practice the reviewer role is now owned by GitHub-native reviewers
+(Codex/Claude review bots, humans). Their inline comments already trigger
+`review-fix` today — GitHub wraps inline comments in a `commented` review,
+and the non-self commented-review and issue-comment handlers launch
+`ce-resolve-pr-feedback` — so the internal review choreography on top of
+that can be deleted.
 
 1. **Supervisor reacts to CI failure.** In `handleGithubEvent`
    (`supervisor/src/server.ts`), extend the `workflow_run`/`check_suite`
@@ -31,15 +41,33 @@ supervisor becomes the sole owner; runs end at "pushed + PR updated".
    implement/review-fix/investigate adapters (all agent forms),
    `task_ce_pipeline` in `sandbox/lib/runtime.sh`, the composition table in
    `skills/README.md`, and the corresponding SPEC lines.
-3. **Skip already-resolved queued feedback.** When the scheduler is about to
+3. **Delete the internal reviewer.** Remove the `review` task type: its three
+   adapter files, the `needs-review` label / `review_requested` triggers, the
+   auto-fresh-re-review scheduled by `completeRun` after a successful
+   review-fix, and the `pending_re_review` flag plus its drain logic
+   (additive migration: column stays, code stops reading it). `review-fix`
+   becomes the only feedback-driven task; its triggers are human
+   `CHANGES_REQUESTED`, non-self commented reviews (covers bot inline
+   reviews), PR conversation comments, and (new) CI failures. The rounds
+   bound keeps counting per-ticket review-fix runs via `countRunsByType`.
+4. **Close the loop externally.** After a review-fix completes with no
+   pending elicitation, the supervisor optionally nudges the external
+   reviewer to re-review (post the bot's mention command, e.g.
+   `@codex review`, or re-request review) instead of running an internal
+   review. Config: `REVIEW_NUDGE_COMMENT` (empty = rely on the bot's
+   review-on-push behavior). Repos without a reviewer bot fall back to
+   human review; nothing in the pipeline blocks on a review existing.
+5. **Skip already-resolved queued feedback.** When the scheduler is about to
    launch an `automatic` session-work item, check its review thread/comment
    via `gh`; drop the item if the thread is already resolved. With babysit
    gone this is belt-and-braces (mid-run feedback is no longer handled
    in-run), but it protects against `ce-resolve-pr-feedback` having already
    addressed a queued comment.
-4. **Tests.** New `server.test.ts` cases: CI failure → review-fix launch; CI
+6. **Tests.** New `server.test.ts` cases: CI failure → review-fix launch; CI
    failure during active run → queued automatic work; rounds exhaustion via
-   CI-triggered fixes; resolved-thread skip.
+   CI-triggered fixes; resolved-thread skip; review-fix completion posts the
+   nudge and schedules no internal review; bot commented review with inline
+   comments → review-fix (regression-pin the existing behavior).
 
 ## Phase 2 — Extract the scheduler; make chat commands explicit
 
@@ -49,11 +77,12 @@ The "what runs next" policy is currently spread across `completeRun`,
 
 1. **`scheduler.ts`.** One module owning the transition table:
    `(event, ticket, run history) → launch task X | queue | ignore`. Move into
-   it: post-review-fix fresh-review scheduling, the `pending_re_review` flag
-   logic, session-work draining/priority, review-round bounding, and Phase
-   1's CI rule. `completeRun` and the webhook handlers reduce to event
-   normalization plus scheduler calls. Pure-function core so transitions are
-   table-testable without Daytona/Linear fakes.
+   it: session-work draining/priority, review-round bounding, the external
+   re-review nudge, and Phase 1's CI rule. (Phase 1 already deleted the
+   biggest former residents: fresh-re-review scheduling and the
+   `pending_re_review` logic.) `completeRun` and the webhook handlers reduce
+   to event normalization plus scheduler calls. Pure-function core so
+   transitions are table-testable without Daytona/Linear fakes.
 2. **`commands.ts`.** Centralize `/stop`, `/merge`, and the
    `investigate` + `fix it|implement|go ahead` promotion heuristic. Add an
    explicit `/implement` command; keep the regex as a deprecated alias for
@@ -65,13 +94,14 @@ The "what runs next" policy is currently spread across `completeRun`,
 
 ## Phase 3 — Single-source the task adapters
 
-The 4 tasks × 3 agents = 12 hand-synchronized prompt files become four
-canonical skills. Codex now supports the open agent skills standard
-(same `SKILL.md` format), which removes most of the per-agent delta.
+After Phase 1 removes the `review` adapter, the remaining 3 tasks × 3 agents
+= 9 hand-synchronized prompt files become three canonical skills. Codex now
+supports the open agent skills standard (same `SKILL.md` format), which
+removes most of the per-agent delta.
 
 1. **Canonical source.** Restructure to
    `skills/tasks/<task>/SKILL.md` as the single source of truth for
-   implement-plan / review / review-fix / investigate. Per-agent output is
+   implement-plan / review-fix / investigate. Per-agent output is
    generated at snapshot build time (`supervisor/scripts/build-snapshot.mjs`
    or Dockerfile step), never hand-maintained.
 2. **Claude:** unchanged delivery (user-level skills dir), sourced from the
