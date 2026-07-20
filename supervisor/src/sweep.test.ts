@@ -60,7 +60,7 @@ describe("runSweep", () => {
       { name: "known-errored", updated_at: "2020-01-01T00:00:00.000Z" },
       { name: "known-closed", updated_at: "2020-01-01T00:00:00.000Z" },
     ];
-    const deleteSprite = vi.fn(async () => undefined);
+    const deleteSprite = vi.fn(async (_name: string) => undefined);
     const sprites = {
       // readSpooledEvents drains the timed-out sandbox before it is expired.
       exec: vi.fn(async () => ({ exitCode: 0, output: "" })),
