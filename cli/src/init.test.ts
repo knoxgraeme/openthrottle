@@ -135,10 +135,7 @@ describe("init project detection", () => {
       });
       return Response.json({
         registration: { github_repo: "acme/widget", base_branch: "develop" },
-        readiness: {
-          webhook: "created",
-          snapshot: { name: "openthrottle", state: "active" },
-        },
+        readiness: { webhook: "created" },
       });
     };
     await expect(
@@ -151,6 +148,9 @@ describe("init project detection", () => {
         },
         request
       )
-    ).resolves.toMatchObject({ registration: { github_repo: "acme/widget" } });
+    ).resolves.toMatchObject({
+      registration: { github_repo: "acme/widget" },
+      readiness: { webhook: "created" },
+    });
   });
 });

@@ -1,6 +1,8 @@
 import * as p from "@clack/prompts";
 import { getErrorMessage, readEnv } from "./util.js";
 
+const DEFAULT_SPRITES_API_URL = "https://api.sprites.dev";
+
 const SUPERVISOR_ENV_VARS: Array<{ name: string; hint: string }> = [
   { name: "SUPERVISOR_URL", hint: "public HTTPS base URL" },
   { name: "OT_STATUS_TOKEN", hint: "random operator bearer token" },
@@ -13,8 +15,8 @@ const SUPERVISOR_ENV_VARS: Array<{ name: string; hint: string }> = [
   { name: "GITHUB_TOKEN", hint: "fine-grained PAT with target-repository access" },
   { name: "GITHUB_REPO", hint: "fallback owner/name for legacy unmapped teams" },
   { name: "GITHUB_REPO_MAPPINGS", hint: "optional legacy team-to-repo JSON fallback" },
-  { name: "DAYTONA_API_KEY", hint: "Daytona API key" },
-  { name: "DAYTONA_SNAPSHOT", hint: "default: openthrottle" },
+  { name: "SPRITE_TOKEN", hint: "org-scoped Fly Sprites API token" },
+  { name: "SPRITES_API_URL", hint: "default: https://api.sprites.dev" },
   { name: "DEFAULT_AGENT", hint: "codex, claude, or opencode; default: codex" },
   { name: "CLAUDE_CODE_OAUTH_TOKEN", hint: "Claude subscription setup token" },
   { name: "CODEX_AUTH_JSON", hint: "raw ~/.codex/auth.json for Codex subscription login" },
@@ -23,7 +25,6 @@ const SUPERVISOR_ENV_VARS: Array<{ name: string; hint: string }> = [
   { name: "MAX_TURNS", hint: "default: 200" },
   { name: "TASK_TIMEOUT", hint: "seconds; default: 7200" },
   { name: "CALLBACK_GRACE_SECONDS", hint: "default: 120" },
-  { name: "SANDBOX_EVENT_POLL_INTERVAL_MS", hint: "default: 5000" },
   { name: "DEV_PORT", hint: "default: 3000" },
   { name: "SWEEP_MAX_AGE_DAYS", hint: "default: 14" },
   { name: "ORPHAN_GRACE_MINUTES", hint: "default: 5" },
@@ -32,29 +33,38 @@ const SUPERVISOR_ENV_VARS: Array<{ name: string; hint: string }> = [
   { name: "ALLOW_LINEAR_MERGE", hint: "default: false" },
 ];
 
-async function verifySnapshot(snapshotName: string): Promise<boolean> {
-  const apiKey = readEnv("DAYTONA_API_KEY");
-  if (!apiKey) {
-    p.log.warn(`DAYTONA_API_KEY is not set, so snapshot "${snapshotName}" could not be verified.`);
+/** Confirms SPRITE_TOKEN authenticates against the Fly Sprites API. No sandbox payload
+ * check is needed here — the payload is baked into the supervisor's own Fly image, so it
+ * cannot drift out of band the way a separately published Daytona snapshot could. */
+async function verifySpriteToken(): Promise<boolean> {
+  const token = readEnv("SPRITE_TOKEN");
+  if (!token) {
+    p.log.warn("SPRITE_TOKEN is not set, so Fly Sprites access could not be verified.");
     return false;
   }
-  const { Daytona } = await import("@daytona/sdk");
-  const snapshot = await new Daytona({ apiKey }).snapshot.get(snapshotName);
-  p.log.success(`Snapshot "${snapshot.name}" found (${snapshot.state}).`);
-  return String(snapshot.state).toLowerCase() === "active";
+  const baseUrl = (readEnv("SPRITES_API_URL") ?? DEFAULT_SPRITES_API_URL).replace(/\/+$/, "");
+  const response = await fetch(`${baseUrl}/v1/sprites?max_results=1`, {
+    headers: { authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!response.ok) {
+    p.log.warn(`Fly Sprites API rejected SPRITE_TOKEN (HTTP ${response.status}) at ${baseUrl}.`);
+    return false;
+  }
+  p.log.success(`SPRITE_TOKEN verified against ${baseUrl}.`);
+  return true;
 }
 
 export default async function setup(): Promise<void> {
   p.intro("openthrottle setup");
-  const snapshotName = readEnv("DAYTONA_SNAPSHOT") ?? "openthrottle";
   try {
-    if (!(await verifySnapshot(snapshotName))) {
+    if (!(await verifySpriteToken())) {
       p.log.warn(
-        `Create or activate it from the OpenThrottle repository:\n  daytona snapshot create ${snapshotName} --dockerfile sandbox/Dockerfile --context .`
+        "Create an org-scoped Fly Sprites API token (https://sprites.dev) and set it as SPRITE_TOKEN before deploying the supervisor."
       );
     }
   } catch (error) {
-    p.log.error(`Snapshot verification failed: ${getErrorMessage(error)}`);
+    p.log.error(`SPRITE_TOKEN verification failed: ${getErrorMessage(error)}`);
   }
   console.log("\nOne-time Fly supervisor secrets:\n");
   for (const { name, hint } of SUPERVISOR_ENV_VARS) {

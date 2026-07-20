@@ -104,8 +104,9 @@ export interface Config {
   gitAuthorName?: string;
   gitAuthorEmail?: string;
 
-  daytonaApiKey: string;
-  daytonaSnapshot: string;
+  spriteToken: string;
+  spritesApiUrl: string;
+  payloadTarPath: string;
 
   defaultAgent: Agent;
   claudeCodeOauthToken: string | undefined;
@@ -122,7 +123,6 @@ export interface Config {
   webhookMaxAgeSeconds: number;
   reviewMaxRounds: number;
   allowLinearMerge: boolean;
-  sandboxEventPollIntervalMs: number;
 }
 
 export function loadConfig(): Config {
@@ -145,8 +145,9 @@ export function loadConfig(): Config {
     gitAuthorName: process.env.OT_GIT_AUTHOR_NAME,
     gitAuthorEmail: process.env.OT_GIT_AUTHOR_EMAIL,
 
-    daytonaApiKey: required("DAYTONA_API_KEY"),
-    daytonaSnapshot: optional("DAYTONA_SNAPSHOT", "openthrottle"),
+    spriteToken: required("SPRITE_TOKEN"),
+    spritesApiUrl: optional("SPRITES_API_URL", "https://api.sprites.dev"),
+    payloadTarPath: optional("OT_PAYLOAD_TAR_PATH", "/app/payload.tar.gz"),
 
     defaultAgent: optionalAgent("DEFAULT_AGENT", "codex"),
     claudeCodeOauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN,
@@ -163,7 +164,6 @@ export function loadConfig(): Config {
     webhookMaxAgeSeconds: optionalInt("WEBHOOK_MAX_AGE_SECONDS", 60),
     reviewMaxRounds: optionalInt("REVIEW_MAX_ROUNDS", 3),
     allowLinearMerge: optionalBool("ALLOW_LINEAR_MERGE", false),
-    sandboxEventPollIntervalMs: optionalInt("SANDBOX_EVENT_POLL_INTERVAL_MS", 5_000),
   };
 
   if (!cfg.claudeCodeOauthToken) {
@@ -196,7 +196,6 @@ export function loadConfig(): Config {
   requireRange("ORPHAN_GRACE_MINUTES", cfg.orphanGraceMinutes, 0);
   requireRange("WEBHOOK_MAX_AGE_SECONDS", cfg.webhookMaxAgeSeconds, 1);
   requireRange("REVIEW_MAX_ROUNDS", cfg.reviewMaxRounds, 1);
-  requireRange("SANDBOX_EVENT_POLL_INTERVAL_MS", cfg.sandboxEventPollIntervalMs, 1_000);
   try {
     const url = new URL(cfg.supervisorUrl);
     if (!/^https?:$/.test(url.protocol)) throw new Error("unsupported protocol");

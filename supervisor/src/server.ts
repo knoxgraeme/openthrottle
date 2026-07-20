@@ -1,6 +1,5 @@
 import { Hono } from "hono";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import type { Daytona } from "@daytona/sdk";
 import type { Config } from "./config.js";
 import type { Agent, Run, TaskType, Ticket, TicketStore, WebhookDelivery } from "./db.js";
 import {
@@ -31,17 +30,24 @@ import {
   type GithubClient,
   type GithubWebhookEvent,
 } from "./github.js";
+import type { SpritesClient } from "./sprites.js";
 import {
   createForTicket,
   deleteSandbox,
   findSandboxForTicket,
   getSandboxLogs,
   getSignedPreviewUrl,
+  readSpooledEvents,
   startTask,
   stopSandbox,
   type SandboxEnvContract,
-} from "./daytona.js";
-import { reconcileSandboxAutostop } from "./sandbox-lifecycle.js";
+} from "./sprites.js";
+import {
+  parseSandboxEvent,
+  toLinearActivity,
+  type SandboxActivityEvent,
+  type SandboxEvent,
+} from "./sandbox-events.js";
 import { MAX_PRIVATE_LOG_TAIL_CHARS } from "./logs.js";
 import { sanitizeText } from "./sanitize.js";
 import {
@@ -64,7 +70,7 @@ import {
 export interface ServerDeps {
   cfg: Config;
   store: TicketStore;
-  daytona: Daytona;
+  sprites: SpritesClient;
   runBackground?: (task: Promise<void>) => void;
   getLinearClient?: () => Promise<LinearClient | undefined>;
   deliveryProcessor?: WebhookDeliveryProcessor;
@@ -96,39 +102,6 @@ function hasBearer(header: string | undefined, expected: string): boolean {
   const actualHash = tokenHash(actual);
   const expectedHash = tokenHash(expected);
   return hashesMatch(actualHash, expectedHash);
-}
-
-async function settleSandboxAfterRun(params: {
-  daytona: Daytona;
-  store: TicketStore;
-  ticket: Ticket;
-  taskType: TaskType;
-}): Promise<void> {
-  const { daytona, store, ticket, taskType } = params;
-  if (!ticket.sandbox_id) return;
-
-  try {
-    await reconcileSandboxAutostop({
-      daytona,
-      store,
-      issueId: ticket.linear_issue_id,
-      sandboxId: ticket.sandbox_id,
-    });
-  } catch (error) {
-    console.error(
-      `[daytona] ${taskType} completed but sandbox ${ticket.sandbox_id} could not be reconciled:`,
-      error
-    );
-  }
-}
-
-function scheduleSandboxSettlement(
-  params: Parameters<typeof settleSandboxAfterRun>[0],
-  schedule?: (task: Promise<void>) => void
-): void {
-  const task = settleSandboxAfterRun(params);
-  if (schedule) schedule(task);
-  else void task.catch((error) => console.error("[daytona] sandbox settlement failed:", error));
 }
 
 function pickAgent(labels: string[], defaultAgent: Agent): Agent {
@@ -457,10 +430,137 @@ async function enqueueSessionUpdate(
   await outbox.process(row.id);
 }
 
+/**
+ * Durably record a pushed sandbox activity and project it into Linear. Dedupes
+ * by event_id, resolves the run's own session, drops late activity from a
+ * superseded session, and enqueues to the Linear outbox (which owns delivery
+ * retries). Shared by the push endpoint and the sweep spool-drain fallback.
+ */
+async function recordSandboxActivity(
+  store: TicketStore,
+  outbox: LinearOutboxProcessor,
+  run: Run,
+  ticket: Ticket,
+  event: SandboxActivityEvent
+): Promise<void> {
+  if (!ticket.sandbox_id) return;
+  const payload = JSON.stringify({ ...event, body: sanitizeText(event.body) });
+  const existing = store.insertSandboxEvent({
+    eventId: event.event_id,
+    runId: run.id,
+    sandboxId: ticket.sandbox_id,
+    kind: "activity",
+    payload,
+  });
+  if (
+    existing.run_id !== run.id ||
+    existing.sandbox_id !== ticket.sandbox_id ||
+    existing.kind !== "activity"
+  ) {
+    // A different event already claimed this id — ignore the conflicting push.
+    return;
+  }
+  if (existing.status === "processed") return;
+
+  const now = new Date();
+  const claimed = store.claimSandboxEvent(
+    event.event_id,
+    now.toISOString(),
+    new Date(now.getTime() + 30_000).toISOString()
+  );
+  if (!claimed) return; // a concurrent push is already handling it
+
+  try {
+    const sessionId = run.linear_session_id ?? ticket.linear_session_id;
+    if (run.linear_session_id && run.linear_session_id !== ticket.linear_session_id) {
+      const session = store.getSession(run.linear_session_id);
+      if (session?.state === "superseded") {
+        store.markSandboxEventProcessed(event.event_id);
+        return;
+      }
+    }
+    await enqueueActivity(
+      store,
+      outbox,
+      toLinearActivity(event, sessionId),
+      run.linear_issue_id ?? ticket.linear_issue_id,
+      run.id
+    );
+    store.markSandboxEventProcessed(event.event_id);
+  } catch (error) {
+    store.markSandboxEventFailed(
+      event.event_id,
+      sanitizeText(String(error)).slice(-2_000),
+      new Date(Date.now() + 5_000).toISOString()
+    );
+    throw error;
+  }
+}
+
+/**
+ * Best-effort drain of any events a sandbox spooled to disk when a push failed.
+ * Read by the sweep for overdue runs before it times them out: a spooled
+ * completion finishes the run, spooled activities are projected — reusing the
+ * exact dedupe + projection the push endpoints use.
+ */
+export async function drainSpooledEventsForRun(
+  deps: {
+    cfg: Config;
+    store: TicketStore;
+    sprites: SpritesClient;
+    getLinearClient: () => Promise<LinearClient | undefined>;
+    linearOutbox: LinearOutboxProcessor;
+  },
+  run: Run
+): Promise<void> {
+  const ticket = deps.store.getByIssueId(run.linear_issue_id);
+  if (!ticket?.sandbox_id) return;
+  let raws: string[];
+  try {
+    raws = await readSpooledEvents(deps.sprites, ticket.sandbox_id);
+  } catch (error) {
+    console.warn(
+      `[sweep] could not drain spooled events for ${ticket.linear_issue_identifier}:`,
+      error
+    );
+    return;
+  }
+  for (const raw of raws) {
+    let event: SandboxEvent;
+    try {
+      event = parseSandboxEvent(raw);
+    } catch {
+      continue; // ignore anything that is not a well-formed event
+    }
+    if (event.run_id !== run.id) continue;
+    try {
+      if (event.kind === "completion") {
+        await completeRun(deps, {
+          runId: event.run_id,
+          token: event.token,
+          exitCode: event.exit_code,
+          costUsd: event.cost_usd,
+          prUrl: event.pr_url,
+          failureTail: event.failure_tail,
+          finalResponse: event.final_response,
+        });
+      } else {
+        const current = deps.store.getRun(run.id);
+        const currentTicket = deps.store.getByIssueId(run.linear_issue_id);
+        if (current && currentTicket) {
+          await recordSandboxActivity(deps.store, deps.linearOutbox, current, currentTicket, event);
+        }
+      }
+    } catch (error) {
+      console.warn(`[sweep] failed to apply spooled event ${event.event_id}:`, error);
+    }
+  }
+}
+
 async function launchExistingTask(params: {
   cfg: Config;
   store: TicketStore;
-  daytona: Daytona;
+  sprites: SpritesClient;
   linear: LinearClient;
   linearOutbox: LinearOutboxProcessor;
   ticket: Ticket;
@@ -470,7 +570,7 @@ async function launchExistingTask(params: {
   reviewRound?: number;
   linearContext?: string;
 }): Promise<boolean> {
-  const { cfg, store, daytona, ticket } = params;
+  const { cfg, store, sprites, ticket } = params;
   if (!ticket.sandbox_id) return false;
   if (!hasAgentSubscription(cfg, ticket.agent)) {
     await tryPostError(
@@ -493,8 +593,7 @@ async function launchExistingTask(params: {
   }
 
   try {
-    const sandbox = await daytona.get(ticket.sandbox_id);
-    await startTask(sandbox, {
+    await startTask(sprites, ticket.sandbox_id, {
       env: baseSandboxEnv(cfg, {
         ticket,
         taskType: params.taskType,
@@ -517,7 +616,6 @@ async function launchExistingTask(params: {
       failureTail: message,
       ticketState: "error",
     });
-    scheduleSandboxSettlement({ daytona, store, ticket, taskType: params.taskType });
     await tryPostError(store, params.linearOutbox, ticket.linear_session_id, ticket.linear_issue_id, message);
     return false;
   }
@@ -538,7 +636,7 @@ async function launchExistingTask(params: {
 async function drainNextSessionWork(params: {
   cfg: Config;
   store: TicketStore;
-  daytona: Daytona;
+  sprites: SpritesClient;
   linear: LinearClient;
   linearOutbox: LinearOutboxProcessor;
   ticket: Ticket;
@@ -552,7 +650,7 @@ async function drainNextSessionWork(params: {
   const launched = await launchExistingTask({
     cfg: params.cfg,
     store: params.store,
-    daytona: params.daytona,
+    sprites: params.sprites,
     linear: params.linear,
     linearOutbox: params.linearOutbox,
     ticket: current,
@@ -572,7 +670,7 @@ async function drainNextSessionWork(params: {
 export function createServerWebhookDeliveryProcessor(deps: {
   cfg: Config;
   store: TicketStore;
-  daytona: Daytona;
+  sprites: SpritesClient;
   getLinearClient: () => Promise<LinearClient | undefined>;
   linearOutbox?: LinearOutboxProcessor;
 }): WebhookDeliveryProcessor {
@@ -599,7 +697,7 @@ export function createServerWebhookDeliveryProcessor(deps: {
         await handleLinearEvent(
           deps.cfg,
           deps.store,
-          deps.daytona,
+          deps.sprites,
           deps.getLinearClient,
           linearOutbox,
           parseLinearWebhook(delivery.payload)
@@ -609,7 +707,7 @@ export function createServerWebhookDeliveryProcessor(deps: {
       await handleGithubEvent(
         deps.cfg,
         deps.store,
-        deps.daytona,
+        deps.sprites,
         deps.getLinearClient,
         linearOutbox,
         parseGithubWebhook(delivery.event_name ?? undefined, delivery.payload)
@@ -622,7 +720,7 @@ export async function completeRun(
   deps: {
     cfg: Config;
     store: TicketStore;
-    daytona: Daytona;
+    sprites: SpritesClient;
     getLinearClient: () => Promise<LinearClient | undefined>;
     linearOutbox?: LinearOutboxProcessor;
     schedule?: (task: Promise<void>) => void;
@@ -689,15 +787,6 @@ export async function completeRun(
     return { status: 409, body: { error: "run no longer active" } };
   }
 
-  scheduleSandboxSettlement(
-    {
-      daytona: deps.daytona,
-      store: deps.store,
-      ticket,
-      taskType: run.task_type,
-    },
-    deps.schedule
-  );
   const terminalActivity = lastTerminalSandboxActivity(deps.store, run.id);
   const pausedOnDecisions = exitCode === 0 && terminalActivity === "elicitation";
   try {
@@ -733,7 +822,7 @@ export async function completeRun(
     if (linear && ticket && await drainNextSessionWork({
       cfg: deps.cfg,
       store: deps.store,
-      daytona: deps.daytona,
+      sprites: deps.sprites,
       linear,
       linearOutbox: outbox,
       ticket,
@@ -746,7 +835,7 @@ export async function completeRun(
     const task = triggerReviewTask(
       deps.cfg,
       deps.store,
-      deps.daytona,
+      deps.sprites,
       linear,
       outbox,
       ticket,
@@ -770,7 +859,7 @@ export async function completeRun(
       const task = drainNextSessionWork({
         cfg: deps.cfg,
         store: deps.store,
-        daytona: deps.daytona,
+        sprites: deps.sprites,
         linear,
         linearOutbox: outbox,
         ticket,
@@ -787,7 +876,7 @@ export async function completeRun(
         await triggerReviewTask(
           deps.cfg,
           deps.store,
-          deps.daytona,
+          deps.sprites,
           linear,
           outbox,
           current,
@@ -803,7 +892,7 @@ export async function completeRun(
 }
 
 export function createServer(deps: ServerDeps): Hono {
-  const { cfg, store, daytona } = deps;
+  const { cfg, store, sprites } = deps;
   const getLinearClient = deps.getLinearClient ?? createLinearClientProvider(cfg, store);
   const linearOutboxProcessor =
     deps.linearOutboxProcessor ??
@@ -813,7 +902,7 @@ export function createServer(deps: ServerDeps): Hono {
     createServerWebhookDeliveryProcessor({
       cfg,
       store,
-      daytona,
+      sprites,
       getLinearClient,
       linearOutbox: linearOutboxProcessor,
     });
@@ -871,12 +960,10 @@ export function createServer(deps: ServerDeps): Hono {
       return context.json({ error: sanitizeText(String(error)) }, 400);
     }
     try {
-      const snapshot = await daytona.snapshot.get(cfg.daytonaSnapshot);
-      if (String(snapshot.state).toLowerCase() !== "active") {
-        throw new Error(
-          `Daytona snapshot ${cfg.daytonaSnapshot} is not active (${String(snapshot.state)})`
-        );
-      }
+      // Liveness/authorization probe: throws if the Sprites token or org is bad.
+      // Runs before any GitHub setup so a bad Sprites config fails fast and does
+      // not create webhooks.
+      await sprites.ping();
       const github = await prepareRepository(
         { token: cfg.githubToken },
         {
@@ -892,14 +979,16 @@ export function createServer(deps: ServerDeps): Hono {
         githubRepo: github.repo,
         baseBranch: github.baseBranch,
         webhookId: github.webhookId,
-        snapshot: cfg.daytonaSnapshot,
+        // The snapshot column is retained (additive schema) but is meaningless
+        // for Sprites, which provisions from the payload tarball, not a snapshot.
+        snapshot: "sprites",
       });
       return context.json({
         registration,
         readiness: {
           github: "ready",
           webhook: github.webhookAction,
-          snapshot: { name: snapshot.name, state: snapshot.state },
+          sprites: "ready",
         },
       });
     } catch (error) {
@@ -1024,7 +1113,7 @@ export function createServer(deps: ServerDeps): Hono {
     }
     const data = body as Record<string, unknown>;
     const result = await completeRun(
-      { cfg, store, daytona, getLinearClient, linearOutbox: linearOutboxProcessor, schedule },
+      { cfg, store, sprites, getLinearClient, linearOutbox: linearOutboxProcessor, schedule },
       {
         runId: context.req.param("id"),
         token: bearerToken(context.req.header("Authorization")),
@@ -1038,6 +1127,45 @@ export function createServer(deps: ServerDeps): Hono {
     return context.json(result.body, result.status as 200 | 400 | 401 | 404 | 409);
   });
 
+  // Sandbox activities arrive by push (the poll loop is gone). Auth mirrors
+  // /runs/:id/complete: the per-run callback token gates the run, and only a
+  // running run accepts activity. The body is a single validated activity event;
+  // completions still go to /complete.
+  app.post("/runs/:id/events", async (context) => {
+    const runId = context.req.param("id");
+    const token = bearerToken(context.req.header("Authorization"));
+    const run = store.getRun(runId);
+    if (!run) return context.json({ error: "run not found" }, 404);
+    if (!token || !hashesMatch(run.token_hash, tokenHash(token))) {
+      return context.json({ error: "invalid callback token" }, 401);
+    }
+    if (run.status !== "running") {
+      return context.json({ error: "run is not active" }, 409);
+    }
+    let event: SandboxEvent;
+    try {
+      event = parseSandboxEvent(await context.req.text());
+    } catch (error) {
+      return context.json({ error: sanitizeText(String(error)) }, 400);
+    }
+    if (event.kind !== "activity") {
+      return context.json({ error: "only activity events are accepted here" }, 400);
+    }
+    if (event.run_id !== run.id) {
+      return context.json({ error: "event run_id does not match the run" }, 400);
+    }
+    const ticket = store.getByIssueId(run.linear_issue_id);
+    if (!ticket?.sandbox_id) {
+      return context.json({ error: "run no longer active" }, 409);
+    }
+    try {
+      await recordSandboxActivity(store, linearOutboxProcessor, run, ticket, event);
+    } catch (error) {
+      return context.json({ error: sanitizeText(String(error)) }, 502);
+    }
+    return context.json({ ok: true });
+  });
+
   app.post("/tickets/:identifier/stop", async (context) => {
     if (!requireStatusAuth(context.req.header("Authorization"))) {
       return context.json({ error: "unauthorized" }, 401);
@@ -1048,7 +1176,7 @@ export function createServer(deps: ServerDeps): Hono {
     try {
       await stopTicket({
         store,
-        daytona,
+        sprites,
         linear,
         linearOutbox: linearOutboxProcessor,
         ticket,
@@ -1076,7 +1204,7 @@ export function createServer(deps: ServerDeps): Hono {
     if (!ticket) return context.json({ error: "ticket not found" }, 404);
     if (ticket.sandbox_id) {
       try {
-        const logs = await getSandboxLogs(daytona, ticket.sandbox_id);
+        const logs = await getSandboxLogs(sprites, ticket.sandbox_id);
         return context.text(sanitizeText(logs).slice(-MAX_PRIVATE_LOG_TAIL_CHARS));
       } catch (error) {
         console.warn(`[logs] live workspace unavailable for ${ticket.linear_issue_identifier}:`, error);

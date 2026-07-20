@@ -26,6 +26,18 @@ OPT_DIR="/opt/openthrottle"
 # shellcheck source=lib/runtime.sh
 source "${OPT_DIR}/lib/runtime.sh"
 
+# Per-run credentials (RUN_ID, RUN_CALLBACK_TOKEN, SUPERVISOR_URL, GITHUB_*,
+# etc.) arrive via a sourced-then-deleted env file rather than process args,
+# so they never persist on disk or show up in `ps`/service config beyond
+# startup. Source it before anything below (including the RUN_ID validation
+# just past this block) depends on those vars being set.
+if [ -f /home/agent/.ot/run.env ]; then
+  set -a
+  . /home/agent/.ot/run.env
+  set +a
+  rm -f /home/agent/.ot/run.env
+fi
+
 # =============================================================================
 # Functions (defined up front — the EXIT trap can fire at any point once
 # installed, and must be able to call handle_exit() no matter how
@@ -108,6 +120,15 @@ write_run_completion() {
      + (if $finalResponse == "" then {} else {final_response: $finalResponse} end)
      + (if $prUrl == "" then {} else {pr_url: $prUrl} end)
      + (if $failureTail == "" then {} else {failure_tail: $failureTail} end)')" || return 1
+
+  if [[ -n "${SUPERVISOR_URL:-}" ]] && curl -fsS -X POST \
+    "${SUPERVISOR_URL}/runs/${RUN_ID}/complete" \
+    -H "Authorization: Bearer ${RUN_CALLBACK_TOKEN}" \
+    -H "Content-Type: application/json" \
+    --data "$payload" >/dev/null; then
+    log "posted completion to supervisor (run=${RUN_ID})"
+    return 0
+  fi
 
   local outbox_dir="${OT_DIR}/outbox"
   local stamp final_path temporary_path
@@ -402,25 +423,15 @@ else
 fi
 
 # =============================================================================
-# Phase 6 — dev server (background)
+# Phase 6 — dev server (registered as a runtime service so it survives sprite
+# pause and wakes on URL request, instead of a nohup'd background process
+# that would die when the sprite pauses).
 # =============================================================================
 log "phase 6: dev server"
 
-DEV_LOG="${OT_DIR}/dev.log"
-DEV_PID_FILE="${OT_DIR}/dev.pid"
-
 if [[ -n "$CFG_DEV" ]]; then
-  if [[ -f "$DEV_PID_FILE" ]]; then
-    OLD_PID="$(cat "$DEV_PID_FILE" 2>/dev/null || true)"
-    if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
-      log "restarting dev server (stopping previous pid ${OLD_PID})"
-      kill "$OLD_PID" 2>/dev/null || true
-      sleep 1
-      kill -9 "$OLD_PID" 2>/dev/null || true
-    fi
-  fi
-  log "starting dev server: ${CFG_DEV} (0.0.0.0:${DEV_PORT})"
-  as_agent "cd '$REPO_DIR' && DEV_PORT='$DEV_PORT' PORT='$DEV_PORT' HOST=0.0.0.0 HOSTNAME=0.0.0.0 nohup ${CFG_DEV} >> '$DEV_LOG' 2>&1 < /dev/null & echo \$! > '$DEV_PID_FILE'"
+  log "registering dev server service: ${CFG_DEV} (0.0.0.0:${DEV_PORT})"
+  sprite-env services create dev --cmd bash --args "-lc,cd '$REPO_DIR' && exec ${CFG_DEV}" --env "PORT=${DEV_PORT},HOST=0.0.0.0,HOSTNAME=0.0.0.0" --http-port "${DEV_PORT}" --no-stream >/dev/null 2>&1 || sprite-env services restart dev >/dev/null 2>&1 || true
 else
   log "no dev command configured, skipping"
 fi

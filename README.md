@@ -1,17 +1,17 @@
 # OpenThrottle
 
 OpenThrottle is a plan-first coding pipeline: delegate an approved Linear
-ticket, get an isolated Daytona workspace running Claude Code, Codex, or
+ticket, get an isolated Fly Sprites workspace running Claude Code, Codex, or
 OpenCode, review
 the resulting GitHub PR, and reply in Linear to continue the same session.
 
-The GitHub repository is `openthrottle-v2`; the product, CLI, npm package,
-and Daytona snapshot are all named `openthrottle`.
+The GitHub repository is `openthrottle-v2`; the product, CLI, and npm package
+are all named `openthrottle`.
 
 ## How it works
 
 ```text
-Linear ticket ──> Fly supervisor ──> Daytona sandbox ──> ot/* branch + PR
+Linear ticket ──> Fly supervisor ──> Fly Sprite ──> ot/* branch + PR
      ▲                 │     ▲              │                    │
      └── activities ───┘     └── outbox ────┴── GitHub events ──┘
 ```
@@ -29,8 +29,16 @@ See [docs/SPEC.md](docs/SPEC.md) for the normative contracts and
 
 ## Bootstrap
 
-Requires Node 22, Docker, Fly CLI, Daytona CLI, and the service credentials in
+Requires Node 22, Docker, Fly CLI, an org-scoped Fly Sprites API token
+(`SPRITE_TOKEN`, from https://sprites.dev), and the service credentials in
 `supervisor/.env.example`.
+
+There is no separate sandbox image to build or publish: the sandbox payload
+(entrypoint, provisioning script, runner, skills) is assembled into
+`payload.tar.gz` and baked into the supervisor's own Fly image at deploy
+time, then written into each ticket's Sprite at provision time. Supervisor
+and sandbox assets are therefore always in lockstep — one artifact, one
+deploy.
 
 ```bash
 # test all non-live contracts
@@ -41,24 +49,21 @@ bats sandbox/tests/runtime.bats
 docker build -f sandbox/Dockerfile -t openthrottle:test .
 sandbox/tests/smoke.sh openthrottle:test
 
-# create the canonical Daytona snapshot once (requires `daytona login`)
-daytona snapshot create openthrottle --dockerfile sandbox/Dockerfile --context .
-
-# inspect the one-time platform checklist
+# inspect the one-time platform checklist (verifies SPRITE_TOKEN)
 npx openthrottle setup
 
-# deploy the always-on supervisor
-cd supervisor
-fly volumes create openthrottle_data --region sjc --size 1
-fly secrets set SUPERVISOR_URL=... OT_STATUS_TOKEN=... OT_INSTALL_SECRET=... # plus .env.example
-fly deploy
+# deploy the always-on supervisor — run from the repo root: the image build
+# context must include the sibling sandbox/ and skills/ directories
+fly volumes create openthrottle_data --region sjc --size 1 --config supervisor/fly.toml
+fly secrets set --config supervisor/fly.toml \
+  SUPERVISOR_URL=... OT_STATUS_TOKEN=... OT_INSTALL_SECRET=... SPRITE_TOKEN=... # plus .env.example
+fly deploy --config supervisor/fly.toml --dockerfile supervisor/Dockerfile
 ```
 
 Then install the Linear OAuth app through authenticated `/oauth/install`.
 Run `init` from each target repository; it detects the GitHub origin, writes
 the repo-local execution config, registers the Linear-team route in Fly's
-SQLite database, creates or refreshes that repository's GitHub webhook, and
-verifies the canonical Daytona snapshot:
+SQLite database, and creates or refreshes that repository's GitHub webhook:
 
 ```bash
 npx openthrottle init
@@ -68,9 +73,9 @@ npx openthrottle status
 
 `init` requires `OT_SUPERVISOR_URL` and `OT_STATUS_TOKEN`. One Linear team
 currently routes to one GitHub repository; re-running `init` updates that
-registration without restarting Fly or creating a new Daytona snapshot. Once
-the first durable route exists, delegations from unmatched teams fail closed
-instead of falling back to the wrong repository.
+registration without restarting Fly. Once the first durable route exists,
+delegations from unmatched teams fail closed instead of falling back to the
+wrong repository.
 
 The team route also fixes the base branch each run is cut from. To target a
 different base for a single ticket, label the issue with a `branch` label before
@@ -91,7 +96,7 @@ delegated (the `created` agent event), so apply the label before assigning.
 ## Repository layout
 
 - `supervisor/` — Hono/SQLite control plane deployed on Fly.
-- `sandbox/` — Daytona image, safety boundary, entrypoint, tests.
+- `sandbox/` — sandbox payload (provisioning, entrypoint), safety boundary, tests.
 - `skills/` — OpenThrottle task adapters layered over the native Compound
   Engineering toolkit installed for Claude Code, Codex, and OpenCode.
 - `cli/` — the `openthrottle` command-line package.
@@ -99,7 +104,7 @@ delegated (the `created` agent event), so apply the label before assigning.
 
 ## Security boundary
 
-Only repo, Linear, and model credentials enter a sandbox—never Daytona, Fly,
+Only repo, Linear, and model credentials enter a sandbox—never `SPRITE_TOKEN`,
 webhook, install, or operator tokens. Webhooks are signature-verified, run and
 preview tokens are stored hashed, and logs redact named/nested credentials and
 known token shapes. A bounded private task-log tail is stored in Fly's SQLite
@@ -108,7 +113,7 @@ attached to Linear or GitHub. GitHub branch protection and a fine-grained PAT
 are still required as the outer enforcement layer.
 
 The deterministic contract suite and Docker smoke are green locally. Live
-Linear/Daytona/Fly acceptance is intentionally a separate deployment gate
+Linear/Sprites/Fly acceptance is intentionally a separate deployment gate
 because it consumes operator-owned credentials and account state.
 
 OpenCode is an opt-in third engine. The first supported provider profile is

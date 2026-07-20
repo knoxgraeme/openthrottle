@@ -41,6 +41,23 @@ export async function writeActivityEvent(event, outboxDir) {
   return finalPath;
 }
 
+// Push the activity straight to the supervisor. Throws on any network error
+// or non-2xx response so the caller can fall back to the on-disk outbox.
+// Uses the global `fetch` (Node 22+) rather than a dependency.
+export async function postActivityEvent(event, supervisorUrl, token) {
+  const response = await fetch(`${supervisorUrl}/runs/${event.run_id}/events`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(event),
+  });
+  if (!response.ok) {
+    throw new Error(`supervisor responded ${response.status}`);
+  }
+}
+
 async function main() {
   const [type, ...messageParts] = process.argv.slice(2);
   if (!type || messageParts.length === 0) {
@@ -51,6 +68,21 @@ async function main() {
     type,
     message: messageParts.join(" "),
   });
+
+  // Prefer a direct push to the supervisor; only fall back to the atomic
+  // outbox-file write if that fails (no SUPERVISOR_URL/token configured,
+  // network error, or a non-2xx response).
+  const supervisorUrl = process.env.SUPERVISOR_URL;
+  const token = process.env.RUN_CALLBACK_TOKEN;
+  if (supervisorUrl && token) {
+    try {
+      await postActivityEvent(event, supervisorUrl, token);
+      return;
+    } catch {
+      // fall through to the outbox fallback below
+    }
+  }
+
   const outboxDir = resolve(process.env.OT_OUTBOX_DIR ?? "/home/agent/.ot/outbox");
   await writeActivityEvent(event, outboxDir);
 }
