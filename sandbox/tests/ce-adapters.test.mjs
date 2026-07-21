@@ -115,12 +115,15 @@ describe("OpenThrottle canonical task skills", () => {
     }
   });
 
-  it("both skills wait for CI, reply on every feedback item, and keep a PR gate checklist", () => {
+  it("both skills hand remote CI to the supervisor, reply on every feedback item, and keep a PR gate checklist", () => {
     for (const task of tasks) {
       const body = skillBody(task);
-      // Wait for CI to settle before finalizing (never end on red/running).
+      // Remote CI is the supervisor's to watch: the run pushes and ends, and a
+      // CI failure returns as a follow-up resume. The adapter takes a
+      // non-blocking `gh pr checks` snapshot but never blocks in `--watch`.
       expect(body).toContain("gh pr checks");
-      expect(body).toContain("--watch");
+      expect(body).not.toContain("--watch");
+      expect(body).toContain("resume");
       // A visible, auditable gate checklist lives in the PR description.
       expect(body).toContain("## OpenThrottle gates");
       // Every feedback item gets a visible reply — not just non-actionable

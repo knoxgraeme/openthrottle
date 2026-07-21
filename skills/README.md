@@ -38,8 +38,9 @@ whatever mechanism that CLI natively supports, decided once in
   conditional `ce-simplify` (only when the diff is large or structurally
   complex; behavior-preserving, skips noted in the ledger) → configured
   gates (`$OT_TEST_CMD`/`$OT_LINT_CMD`/`$OT_BUILD_CMD`) → `ce-commit-push-pr`
-  → resolve the PR URL and retarget it to `$BASE_BRANCH` if needed → wait for
-  CI to settle (`gh pr checks --watch`, fixing in-scope reds in the same run)
+  → resolve the PR URL and retarget it to `$BASE_BRANCH` if needed → push and
+  end the run; the supervisor watches CI and re-delivers any failure as a
+  follow-up `resume` (the run never blocks in `gh pr checks --watch`)
   → refresh the `## OpenThrottle gates` checklist in the PR description →
   elicitation-or-response ending in "Assumptions & decisions".
 - **investigate** — the debugging analogue: `ce-debug mode:pipeline` (action-
@@ -55,9 +56,10 @@ context. That resume message is where the triage happens: gather the whole
 picture first (`gh pr checks` plus every open review thread and comment), reply
 visibly on **every** item — a change gets a reply naming what was done and the
 commit that addresses it, with the thread resolved; a no-change gets a reply
-with reasoning — wait for CI to go green (fixing in-scope reds in the same run)
-before finalizing, refresh the `## OpenThrottle gates` checklist, and batch any
-decision-required items into one further elicitation.
+with reasoning — run the local gates on the fix, push, and end the run; the
+supervisor re-delivers any remaining CI failure as another `resume`, so the run
+never blocks on remote CI. Refresh the `## OpenThrottle gates` checklist, and
+batch any decision-required items into one further elicitation.
 
 ## Native CE composition
 
@@ -88,10 +90,12 @@ The adapters remain necessary for contracts that CE does not own:
   reasoning, or escalated as a numbered decision — never silently deferred or
   dropped. This rule applies identically to the feedback-triage resume that
   follows a PR, not just the original run.
-- The CI gate: a run does not finalize while CI is red or still running. After
-  any push, the adapter waits for `gh pr checks` to conclude and fixes in-scope
-  failures in the same run; only genuinely pre-existing/out-of-scope reds are
-  left, and then only as a recorded known gap.
+- The CI gate: remote CI is the supervisor's to watch, not the run's to block
+  on. After the local gates pass and the push lands, the run ends; the
+  supervisor watches the checks and re-delivers any failure to the same session
+  as a follow-up `resume`, bounded by the review-round limit. The adapter never
+  sits in `gh pr checks --watch`. The local test/lint/build gates remain the
+  in-run correctness bar; CI is the automated backstop the supervisor owns.
 - The gate checklist: each run writes or refreshes an `## OpenThrottle gates`
   checklist in the PR description (tests, lint, build, internal review,
   simplification, CI, review threads) so a human can see which gates completed.

@@ -26,7 +26,7 @@ import {
   tryPostError,
   type LinearOutboxProcessor,
 } from "./linear-outbox.js";
-import { drainNextSessionWork, shouldNudgeAfterRun } from "./scheduler.js";
+import { drainNextSessionWork, shouldNudgeAfterRun, type LaunchExistingTask } from "./scheduler.js";
 
 export interface RunCredentials {
   id: string;
@@ -106,7 +106,7 @@ export function agentDisplayName(agent: Agent): string {
 
 type TerminalActivityType = "elicitation" | "response" | "error";
 
-function lastTerminalSandboxActivity(
+export function lastTerminalSandboxActivity(
   store: TicketStore,
   runId: string
 ): TerminalActivityType | undefined {
@@ -479,6 +479,48 @@ async function postReviewNudge(cfg: Config, ticket: Ticket, prUrl: string | unde
     await commentOnPullRequest({ token: cfg.githubToken }, ticket.repo, pull.number, cfg.reviewNudgeComment);
   } catch (error) {
     console.error(`[run-lifecycle] failed to post the review nudge for ${ticket.linear_issue_identifier}:`, error);
+  }
+}
+
+// Recovery net for the drain-after-run path. `completeRun` is normally the ONLY
+// thing that drains queued feedback work for a ticket, and it can skip that
+// drain — deliberately (the run paused on an elicitation) or accidentally (the
+// Linear client was momentarily unavailable, or the launch failed and released
+// the item). Nothing else re-triggers a drain until the next webhook, so a
+// single missed drain can strand PR feedback indefinitely. The lifecycle sweep
+// calls this to re-drain any idle, active ticket that still has claimable
+// pending work — except tickets whose last run parked on an unanswered human
+// decision, which must keep waiting for the human reply exactly as
+// `completeRun` intends. `claimNextSessionWork` and `beginRun` are both atomic
+// compare-and-sets, so racing a concurrent completeRun drain cannot double-launch.
+export async function redrainStalledSessionWork(deps: {
+  cfg: Config;
+  store: TicketStore;
+  daytona: Daytona;
+  linear: LinearClient | undefined;
+  linearOutbox: LinearOutboxProcessor;
+  launch?: LaunchExistingTask;
+}): Promise<void> {
+  const { cfg, store, daytona, linear, linearOutbox } = deps;
+  if (!linear) return; // no Linear client this cycle — retry on the next sweep
+  const launch = deps.launch ?? launchExistingTask;
+  const nowIso = new Date().toISOString();
+  for (const ticket of store.listTicketsWithPendingSessionWork(nowIso)) {
+    // Mirror completeRun's `pausedOnDecisions`: a run that ended on an
+    // elicitation is waiting for a human answer, so its queued work must stay
+    // pending until that answer arrives — never re-drained here.
+    const latestRun = store.getLatestRun(ticket.linear_issue_id);
+    if (latestRun && lastTerminalSandboxActivity(store, latestRun.id) === "elicitation") {
+      continue;
+    }
+    try {
+      await drainNextSessionWork({ cfg, store, daytona, linear, linearOutbox, ticket, launch });
+    } catch (error) {
+      console.error(
+        `[sweep] failed to re-drain stalled session work for ${ticket.linear_issue_identifier}:`,
+        error
+      );
+    }
   }
 }
 

@@ -441,6 +441,7 @@ export interface TicketStore {
   listActive(): Ticket[];
   listRunning(): Ticket[];
   listAll(): Ticket[];
+  listTicketsWithPendingSessionWork(nowIso: string): Ticket[];
   getCurrentSession(issueId: string): AgentSession | undefined;
   getSession(sessionId: string): AgentSession | undefined;
   supersedeCurrentSession(issueId: string, newSessionId: string): AgentSession;
@@ -646,6 +647,25 @@ export function createTicketStore(db: Database.Database): TicketStore {
     WHERE linear_session_id = ? AND status = 'pending' AND available_at <= ?
     ORDER BY priority ASC, created_at ASC, id ASC
     LIMIT 1
+  `);
+  // Recovery net for the drain path: idle (no active run), still-active tickets
+  // whose *current* session has claimable pending work. completeRun is normally
+  // the only thing that drains queued feedback after a run, so a single missed
+  // drain would otherwise strand the work forever; the lifecycle sweep re-drains
+  // these. Matching on the ticket's current linear_session_id avoids reviving
+  // work left over from a superseded session.
+  const listTicketsWithPendingSessionWorkStmt = db.prepare(`
+    SELECT t.* FROM tickets t
+    WHERE t.run_id IS NULL
+      AND t.state = 'active'
+      AND EXISTS (
+        SELECT 1 FROM session_work sw
+        WHERE sw.linear_issue_id = t.linear_issue_id
+          AND sw.linear_session_id = t.linear_session_id
+          AND sw.status = 'pending'
+          AND sw.available_at <= ?
+      )
+    ORDER BY t.updated_at ASC
   `);
   const nextOutboxSequenceStmt = db.prepare(
     "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM linear_outbox WHERE linear_session_id IS ?"
@@ -976,6 +996,9 @@ export function createTicketStore(db: Database.Database): TicketStore {
     },
     listAll() {
       return listAllStmt.all() as Ticket[];
+    },
+    listTicketsWithPendingSessionWork(nowIso) {
+      return listTicketsWithPendingSessionWorkStmt.all(nowIso) as Ticket[];
     },
     getCurrentSession(issueId) {
       return getCurrentSessionStmt.get(issueId) as AgentSession | undefined;
