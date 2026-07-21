@@ -175,7 +175,7 @@ KIMI_CODE_API_KEY="$(strip_nl "${KIMI_CODE_API_KEY:-}")"
 export GITHUB_TOKEN CLAUDE_CODE_OAUTH_TOKEN KIMI_CODE_API_KEY
 export GH_TOKEN="$GITHUB_TOKEN"
 
-mkdir -p "$OT_DIR" "${OT_DIR}/outbox"
+mkdir -p "$OT_DIR" "${OT_DIR}/outbox" "${OT_DIR}/inbox"
 chown -R "${AGENT_USER}:${AGENT_USER}" "$AGENT_HOME"
 TASK_LOG="${OT_DIR}/task.log"
 rm -f "${OT_DIR}/run-result.json"
@@ -456,6 +456,55 @@ if [[ -d "${OPT_DIR}/skills/tasks" ]]; then
   cp -r "${OPT_DIR}/skills/tasks/." "${AGENT_HOME}/.claude/skills/"
 fi
 chown -R "${AGENT_USER}:${AGENT_USER}" "${AGENT_HOME}/.claude"
+
+# Mid-run steering "inbox": register the baked drain hook in the sandbox user's
+# ~/.claude/settings.json (user scope, so it applies under `--setting-sources
+# user`). The supervisor's inbox poller drops steering files into ~/.ot/inbox;
+# on each PostToolUse the hook injects them as additionalContext, and on Stop it
+# blocks so a run cannot end with unread steering. Merge into any existing
+# settings so plugin-managed keys survive; fall back to a fresh file if the
+# existing one is unparseable. Idempotent on resume.
+if [[ "$AGENT" == "claude" ]]; then
+  CLAUDE_SETTINGS="${AGENT_HOME}/.claude/settings.json"
+  DRAIN_HOOK="${OPT_DIR}/hooks/ot-inbox-drain.sh"
+  CLAUDE_SETTINGS_BASE='{}'
+  [[ -s "$CLAUDE_SETTINGS" ]] && CLAUDE_SETTINGS_BASE="$(cat "$CLAUDE_SETTINGS")"
+  if ! printf '%s' "$CLAUDE_SETTINGS_BASE" | jq \
+      --arg cmd "$DRAIN_HOOK" '
+        .hooks = (.hooks // {})
+        | .hooks.Stop = [ { hooks: [ { type: "command", command: $cmd } ] } ]
+        | .hooks.PostToolUse = [ { matcher: "*", hooks: [ { type: "command", command: $cmd } ] } ]
+      ' > "${CLAUDE_SETTINGS}.tmp" 2>/dev/null; then
+    jq -n --arg cmd "$DRAIN_HOOK" '
+      { hooks: {
+          Stop: [ { hooks: [ { type: "command", command: $cmd } ] } ],
+          PostToolUse: [ { matcher: "*", hooks: [ { type: "command", command: $cmd } ] } ]
+      } }' > "${CLAUDE_SETTINGS}.tmp"
+  fi
+  mv "${CLAUDE_SETTINGS}.tmp" "$CLAUDE_SETTINGS"
+  chmod 0644 "$CLAUDE_SETTINGS"
+  chown "${AGENT_USER}:${AGENT_USER}" "$CLAUDE_SETTINGS"
+  log "registered Claude inbox drain hook (${DRAIN_HOOK})"
+fi
+
+# TODO(codex hooks): wire the same ${OPT_DIR}/hooks/ot-inbox-drain.sh as a Codex
+# PreToolUse/PostToolUse hook so mid-run steering also reaches Codex runs. The
+# pinned Codex (CODEX_VERSION in sandbox/Dockerfile, currently 0.143.0) is >= the
+# ~0.117.0 minimum that introduced hooks, so the VERSION requirement is met.
+# It is intentionally left unwired here because (a) Codex's ~/.codex/config.toml
+# hook schema (the exact table/keys and `[features] codex_hooks = true` gating)
+# and (b) its injection contract (exit 2 + stderr reason fed back as context, vs
+# Claude's stdout `additionalContext` JSON) could not be verified in this
+# environment. Half-wiring risks an unparseable config.toml that would break ALL
+# Codex runs, so a Codex branch must be added to the drain script (detect the
+# event source, emit exit-2+stderr instead of Claude JSON) and validated against
+# the pinned Codex before enabling. Until then Codex runs simply receive no
+# mid-run steering (no regression).
+#
+# TODO(opencode steering): OpenCode has no settings.json-style hook system; its
+# equivalent is a plugin. Delivering mid-run steering to OpenCode requires a
+# small baked OpenCode plugin that polls ~/.ot/inbox and injects — a documented
+# follow-up, deliberately not attempted here.
 
 # Codex global instructions live outside the target checkout so AGENTS.md
 # remains ordinary project data that a ticket can create or edit.

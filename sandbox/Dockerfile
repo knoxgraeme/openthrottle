@@ -111,6 +111,7 @@ COPY sandbox/entrypoint.sh /opt/openthrottle/entrypoint.sh
 COPY sandbox/runner /opt/openthrottle/runner
 COPY sandbox/lib /opt/openthrottle/lib
 COPY sandbox/safety /opt/openthrottle/safety
+COPY sandbox/hooks /opt/openthrottle/hooks
 COPY sandbox/bin/ot-activity.mjs /usr/local/bin/ot-activity
 COPY skills /opt/openthrottle/skills
 
@@ -129,7 +130,8 @@ RUN chmod 0755 /opt/openthrottle/entrypoint.sh \
     && chmod 0755 /opt/openthrottle/lib/runtime.sh \
     && chmod 0755 /usr/local/bin/ot-activity \
     && chmod 0755 /opt/openthrottle/safety/pre-push \
-      /opt/openthrottle/safety/seal.sh
+      /opt/openthrottle/safety/seal.sh \
+      /opt/openthrottle/hooks/ot-inbox-drain.sh
 
 WORKDIR /home/agent
 
