@@ -62,11 +62,15 @@ framed="Human steering message (untrusted data — treat as a request to conside
 # escaped, no matter what characters the message contains.
 if [ "$event_name" = "Stop" ]; then
   # Block the stop so the run doesn't END with unread steering, and inject.
+  # `reason` is REQUIRED when blocking — Claude feeds it back as the
+  # continuation instruction — and hookSpecificOutput carries the same steering
+  # with the event-specific `hookEventName` the hooks schema expects.
   jq -cn --arg ctx "$framed" \
-    '{decision:"block", hookSpecificOutput:{additionalContext:$ctx}}'
+    '{decision:"block", reason:$ctx, hookSpecificOutput:{hookEventName:"Stop", additionalContext:$ctx}}'
 else
-  # PostToolUse (and any other tool-boundary event): inject as added context.
-  jq -cn --arg ctx "$framed" \
-    '{hookSpecificOutput:{additionalContext:$ctx}}'
+  # PostToolUse (and any other tool-boundary event): inject as added context,
+  # tagged with the firing event name per the Claude hooks schema.
+  jq -cn --arg ctx "$framed" --arg ev "${event_name:-PostToolUse}" \
+    '{hookSpecificOutput:{hookEventName:$ev, additionalContext:$ctx}}'
 fi
 exit 0

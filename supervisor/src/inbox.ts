@@ -19,6 +19,11 @@ export async function deliverPendingInbox(params: {
 }): Promise<void> {
   for (const ticket of params.store.listRunning()) {
     if (!ticket.sandbox_id) continue;
+    // Only Claude currently has the drain hook wired (entrypoint.sh phase 7).
+    // Uploading to a Codex/OpenCode sandbox and marking the row delivered would
+    // silently lose the steer, since no hook ever reads ~/.ot/inbox — leave
+    // those messages pending until an engine hook is wired.
+    if (ticket.agent !== "claude") continue;
     const pending = params.store.listPendingInbox(ticket.linear_issue_id);
     if (pending.length === 0) continue;
     try {

@@ -531,10 +531,13 @@ export interface TicketStore {
   countRunsByType(issueId: string, taskType: TaskType): number;
   finishRun(params: FinishRunParams): Run | undefined;
   listExpiredRuns(nowIso: string): Run[];
-  // Feature 1 (heartbeat-silence reaper): running runs whose most recent
-  // sandbox event (any kind, including ephemeral heartbeats) — or start time,
-  // if none yet — is at or before `cutoffIso`. Distinct from listExpiredRuns,
-  // which is the hard wall-clock cap; this is the liveness cap.
+  // Feature 1 (heartbeat-silence reaper): running runs that have emitted at
+  // least one sandbox event (any kind, including ephemeral heartbeats) whose
+  // most recent one is at or before `cutoffIso`. Runs that have not emitted any
+  // event yet — still in sandbox bootstrap before normalize.mjs starts — are
+  // exempt, so a slow bootstrap is never mistaken for a stall; the hard
+  // wall-clock cap (listExpiredRuns) covers a run that never produces output.
+  // This is the liveness cap.
   listStalledRuns(cutoffIso: string): Run[];
   // Feature 5 (mid-run steering inbox): the inbound counterpart of the Linear
   // outbox. Messages are enqueued pending, delivered into the running sandbox's
@@ -733,13 +736,16 @@ export function createTicketStore(db: Database.Database): TicketStore {
   const listExpiredRunsStmt = db.prepare(
     "SELECT * FROM runs WHERE status = 'running' AND expires_at <= ? ORDER BY expires_at"
   );
+  // Only runs that have ALREADY emitted at least one sandbox event and then
+  // gone silent are stall candidates: MAX over no rows is NULL and `NULL <= ?`
+  // is never true, so a run still in sandbox bootstrap (checkout/post_bootstrap/
+  // dev server, before normalize.mjs emits its first event) is never reaped —
+  // a slow bootstrap must not look like a stall. The hard-timeout expiry
+  // (listExpiredRuns) still covers a run that never produces any output.
   const listStalledRunsStmt = db.prepare(`
     SELECT r.* FROM runs r
     WHERE r.status = 'running'
-      AND COALESCE(
-        (SELECT MAX(e.created_at) FROM sandbox_events e WHERE e.run_id = r.id),
-        r.started_at
-      ) <= ?
+      AND (SELECT MAX(e.created_at) FROM sandbox_events e WHERE e.run_id = r.id) <= ?
     ORDER BY r.started_at
   `);
   const insertInboxStmt = db.prepare(`

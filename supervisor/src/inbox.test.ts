@@ -11,7 +11,7 @@ afterEach(() => {
   db = undefined;
 });
 
-function seedRunningTicket() {
+function seedRunningTicket(agent: "claude" | "codex" | "opencode" = "claude") {
   db = openDb(":memory:");
   const store = createTicketStore(db);
   store.upsert({
@@ -20,7 +20,7 @@ function seedRunningTicket() {
     linear_session_id: "session-1",
     sandbox_id: "sandbox-1",
     branch: "ot/ot-1",
-    agent: "codex",
+    agent,
     repo: "owner/repo",
     pr_url: null,
     state: "active",
@@ -94,6 +94,23 @@ describe("deliverPendingInbox", () => {
     expect(store.listPendingInbox("issue-1")).toHaveLength(0);
     expect(store.getInbox(first.id)?.status).toBe("delivered");
     expect(store.getInbox(second.id)?.status).toBe("delivered");
+  });
+
+  it("skips tickets whose agent has no drain hook, leaving steering pending", async () => {
+    const store = seedRunningTicket("codex");
+    const record = store.enqueueInbox({
+      issueId: "issue-1",
+      sessionId: "session-1",
+      runId: "run-1",
+      source: "operator",
+      body: "codex has no drain hook yet",
+    });
+    const get = vi.fn(async () => makeSandbox());
+    await deliverPendingInbox({ daytona: { get } as unknown as Daytona, store });
+    // Never touched the sandbox, and the row stays pending — not silently lost.
+    expect(get).not.toHaveBeenCalled();
+    expect(store.getInbox(record.id)?.status).toBe("pending");
+    expect(store.listPendingInbox("issue-1")).toHaveLength(1);
   });
 
   it("skips running tickets with no pending messages", async () => {

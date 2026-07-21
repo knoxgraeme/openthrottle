@@ -29,6 +29,7 @@ setup() {
   run bash -c "printf '%s' '{\"hook_event_name\":\"PostToolUse\"}' | '$DRAIN'"
   [ "$status" -eq 0 ]
   [[ "$output" == *'"hookSpecificOutput"'* ]]
+  [[ "$output" == *'"hookEventName":"PostToolUse"'* ]]
   [[ "$output" == *'additionalContext'* ]]
   [[ "$output" == *'Human steering message'* ]]
   [[ "$output" == *'untrusted data'* ]]
@@ -45,6 +46,8 @@ setup() {
   run bash -c "printf '%s' '{\"hook_event_name\":\"Stop\"}' | '$DRAIN'"
   [ "$status" -eq 0 ]
   [[ "$output" == *'"decision":"block"'* ]]
+  [[ "$output" == *'"reason"'* ]]
+  [[ "$output" == *'"hookEventName":"Stop"'* ]]
   [[ "$output" == *'do not forget the migration'* ]]
   [ ! -f "$OT_INBOX_DIR/bbbb.md" ]
 }

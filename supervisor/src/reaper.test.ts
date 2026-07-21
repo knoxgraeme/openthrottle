@@ -74,10 +74,18 @@ describe("reapStalledRuns", () => {
       tokenHash: "hash",
       expiresAt: "2999-01-01T00:00:00.000Z",
     });
-    // No events for the stalled run → started_at governs; drag it before the cutoff.
-    db.prepare("UPDATE runs SET started_at = ? WHERE id = ?").run(
+    // The stalled run emitted a heartbeat once, then went silent — age its only
+    // event before the cutoff so MAX(event) governs and it is reaped.
+    store.insertSandboxEvent({
+      eventId: "evt-stalled",
+      runId: "run-stalled",
+      sandboxId: "sandbox-1",
+      kind: "activity",
+      payload: JSON.stringify({ type: "thought", ephemeral: true }),
+    });
+    db.prepare("UPDATE sandbox_events SET created_at = ? WHERE event_id = ?").run(
       "2020-01-01T00:00:00.000Z",
-      "run-stalled"
+      "evt-stalled"
     );
 
     await reapStalledRuns({ daytona, store, linearOutbox, cfg });
@@ -139,6 +147,35 @@ describe("reapStalledRuns", () => {
 
     expect(store.getRun("run-beating")?.status).toBe("running");
     expect(store.getByIssueId("beating")?.run_id).toBe("run-beating");
+    expect(store.listLinearOutbox()).toHaveLength(0);
+  });
+
+  it("does not reap a bootstrapping run that has not emitted any event yet", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    const { daytona } = makeDaytona();
+    const linearOutbox = makeOutbox(store);
+
+    addTicket(store, "booting", "sandbox-1");
+    store.beginRun({
+      issueId: "booting",
+      runId: "run-booting",
+      taskType: "implement",
+      tokenHash: "hash",
+      expiresAt: "2999-01-01T00:00:00.000Z",
+    });
+    // A slow bootstrap (e.g. a long post_bootstrap `npm ci`): started well
+    // before the cutoff, but normalize.mjs has not emitted its first event yet.
+    // The hard TASK_TIMEOUT expiry — not the stall reaper — governs this case.
+    db.prepare("UPDATE runs SET started_at = ? WHERE id = ?").run(
+      "2020-01-01T00:00:00.000Z",
+      "run-booting"
+    );
+
+    await reapStalledRuns({ daytona, store, linearOutbox, cfg });
+
+    expect(store.getRun("run-booting")?.status).toBe("running");
+    expect(store.getByIssueId("booting")?.run_id).toBe("run-booting");
     expect(store.listLinearOutbox()).toHaveLength(0);
   });
 
