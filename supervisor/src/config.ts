@@ -124,6 +124,7 @@ export interface Config {
   reviewNudgeComment: string;
   allowLinearMerge: boolean;
   sandboxEventPollIntervalMs: number;
+  stallTimeoutSeconds: number;
 }
 
 export function loadConfig(): Config {
@@ -166,6 +167,7 @@ export function loadConfig(): Config {
     reviewNudgeComment: optional("REVIEW_NUDGE_COMMENT", ""),
     allowLinearMerge: optionalBool("ALLOW_LINEAR_MERGE", false),
     sandboxEventPollIntervalMs: optionalInt("SANDBOX_EVENT_POLL_INTERVAL_MS", 5_000),
+    stallTimeoutSeconds: optionalInt("STALL_TIMEOUT_SECONDS", 900),
   };
 
   if (!cfg.claudeCodeOauthToken) {
@@ -199,6 +201,7 @@ export function loadConfig(): Config {
   requireRange("WEBHOOK_MAX_AGE_SECONDS", cfg.webhookMaxAgeSeconds, 1);
   requireRange("REVIEW_MAX_ROUNDS", cfg.reviewMaxRounds, 1);
   requireRange("SANDBOX_EVENT_POLL_INTERVAL_MS", cfg.sandboxEventPollIntervalMs, 1_000);
+  requireRange("STALL_TIMEOUT_SECONDS", cfg.stallTimeoutSeconds, 60);
   try {
     const url = new URL(cfg.supervisorUrl);
     if (!/^https?:$/.test(url.protocol)) throw new Error("unsupported protocol");

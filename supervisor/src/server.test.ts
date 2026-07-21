@@ -39,6 +39,7 @@ const cfg: Config = {
   reviewNudgeComment: "",
   allowLinearMerge: false,
   sandboxEventPollIntervalMs: 5_000,
+  stallTimeoutSeconds: 900,
 };
 
 let db: Database.Database | undefined;
