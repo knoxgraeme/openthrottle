@@ -412,7 +412,13 @@ async function handleCreated(
       failureTail: message,
       ticketState: "error",
     });
-    throw error;
+    // Surface the failure in the Linear session and return, matching every other
+    // provisioning-failure branch above. Re-throwing here left the session stuck
+    // on the ephemeral "Spinning up a workspace…" thought while the webhook layer
+    // retried silently — e.g. a Daytona "Total disk limit exceeded" quota error
+    // was invisible in Linear and only showed up in the supervisor logs.
+    await tryPostError(store, linearOutbox, sessionId, issue.id, message);
+    return;
   }
   const provisionedTicket = store.getByIssueId(issue.id)!;
 

@@ -10,13 +10,19 @@
 // Units follow the Daytona SDK `Resources` contract: cpu in cores, memory and
 // disk in GiB.
 
-// Disk stays within Daytona's documented standard-tier maximum (10 GiB) so the
-// default snapshot build works for ordinary orgs; raise DAYTONA_SANDBOX_DISK on
+// Disk is deliberately small because Daytona enforces a *total* disk quota per
+// org (30 GiB on the standard tier), not a per-sandbox cap, and OpenThrottle
+// retains a stopped sandbox per non-closed ticket for wake-on-click reuse
+// (see sweep.ts). So the ceiling on concurrent tickets is roughly
+// floor(orgDiskQuota / disk): at 10 GiB that was only ~3 tickets and a handful
+// of leftover stopped sandboxes exhausted the quota, making every new
+// `daytona.create` fail with "Total disk limit exceeded". 5 GiB leaves room for
+// ~6 concurrent workspaces under a 30 GiB quota; raise DAYTONA_SANDBOX_DISK on
 // plans with a larger quota. The OOM fix is the memory bump, not disk.
 export const SANDBOX_RESOURCE_DEFAULTS = Object.freeze({
   cpu: 4,
   memory: 8,
-  disk: 10,
+  disk: 5,
 });
 
 function positiveIntFromEnv(env, name, fallback) {
