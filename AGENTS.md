@@ -33,8 +33,8 @@ have their own. Always target one with `--prefix`:
 npm ci --prefix supervisor && npm ci --prefix cli && npm ci --prefix sandbox
 
 # typecheck / build (supervisor + cli only; sandbox is JS)
-npm run typecheck --prefix supervisor
-npm run build --prefix supervisor        # tsc -> dist/
+npm run typecheck --prefix supervisor && npm run typecheck --prefix cli
+npm run build --prefix supervisor && npm run build --prefix cli   # tsc -> dist/
 
 # test
 npm test --prefix supervisor             # vitest run
@@ -58,9 +58,12 @@ so **relative imports carry a `.js` extension even when the source is `.ts`**
 ### Full contract suite (what CI runs)
 
 ```bash
-npm ci --prefix supervisor && npm test --prefix supervisor
-npm ci --prefix cli && npm test --prefix cli
-npm ci --prefix sandbox && npm test --prefix sandbox
+npm ci --prefix supervisor && npm ci --prefix cli && npm ci --prefix sandbox
+npm run typecheck --prefix supervisor && npm run typecheck --prefix cli
+npm run build --prefix supervisor && npm run build --prefix cli
+npm test --prefix supervisor
+npm test --prefix cli
+npm test --prefix sandbox
 bats sandbox/tests/runtime.bats
 docker build -f sandbox/Dockerfile -t openthrottle:test .   # context is repo root
 sandbox/tests/smoke.sh openthrottle:test                     # full lifecycle with stub agents
