@@ -25,15 +25,19 @@ decisions.
    exists, invoke `ce-commit-push-pr mode:pipeline branding:on`. Ensure the PR
    targets `$BASE_BRANCH`; if it was opened against a different base, retarget
    it with `gh pr edit --repo "$GITHUB_REPO" <number> --base "$BASE_BRANCH"`.
-   Then wait for CI to settle: run
-   `gh pr checks --repo "$GITHUB_REPO" <number> --watch` until every check has
-   concluded, fix any in-scope failure and re-push in this same run, and do not
-   finalize while checks are red or running. Write or refresh an
+   Do not sit and watch remote CI: your correctness gate is the verification
+   `ce-debug` already ran, so once the fix is pushed this run's job is done.
+   OpenThrottle owns CI from here — the supervisor watches the checks and
+   delivers any failure back to this same session as a follow-up `resume`,
+   bounded by the review-round limit. A single non-blocking
+   `gh pr checks --repo "$GITHUB_REPO" <number>` snapshot is fine to record
+   state, but never poll or wait on remote CI in a loop. Write or refresh an
    `## OpenThrottle gates` checklist in the PR description (update in place,
    never overwrite the body) covering the regression test, the fix,
-   verification, and CI — marking anything you could not run (e.g. a gate the
-   sandbox OOM-killed with exit 137) as a known gap rather than done. Mirror the
-   same states into the Linear session plan with `ot-activity plan`.
+   verification, and CI — marking CI as awaiting the automated check on this
+   first run, and anything you could not run (e.g. a gate the sandbox OOM-killed
+   with exit 137) as a known gap rather than done. Mirror the same states into
+   the Linear session plan with `ot-activity plan`.
 4. If the fix is blocked on a divergent product or architecture decision that
    a specific answer would unblock, run `ot-activity elicitation` with the
    diagnosis and one numbered decision list (context, options, and your
@@ -50,8 +54,9 @@ message in this same session. Triage it then: gather the whole picture first
 on EVERY item — a change gets a reply naming what you did and the commit that
 addresses it and the thread resolved; no-change gets a reply with your
 reasoning — and batch any decision-required items into one further
-elicitation. After pushing fixes, wait for CI with `gh pr checks --watch`, fix
-in-scope failures in the same run before finalizing, and refresh the
+elicitation. After pushing fixes, end the run — OpenThrottle re-delivers any
+remaining CI failure as another follow-up on this same session, so never block
+waiting on remote CI — then refresh the
 `## OpenThrottle gates` checklist. If nothing shipped (diagnosed-no-fix,
 flaky-infra, or needs-human), this run simply ends after the response above.
 

@@ -69,20 +69,24 @@ session. Record every smaller judgment call you do make for the final
    target `$BASE_BRANCH`; if it was opened against a different base, retarget
    it with `gh pr edit --repo "$GITHUB_REPO" <number> --base "$BASE_BRANCH"`
    before continuing.
-9. Wait for CI to settle before you finalize. Run
-   `gh pr checks --repo "$GITHUB_REPO" <number> --watch` until every check has
-   concluded, then read the results. If a check failed and the cause is in
-   scope, fix it, let `ce-commit-push-pr` push again, and watch once more —
-   stay in this run until the checks are green or the only failures left are
-   genuinely pre-existing or out-of-scope (record those as known gaps). Never
-   end the run while checks are still red or in progress.
+9. Do not sit and watch remote CI. Your correctness gate is the local
+   test/lint/build run in step 6; once those pass and `ce-commit-push-pr` has
+   pushed, this run's job is done. OpenThrottle owns CI from here: the
+   supervisor watches the checks and, if any fail, delivers the failure back to
+   this same session as a follow-up `resume` for you to fix then, bounded by the
+   review-round limit. Take a single non-blocking
+   `gh pr checks --repo "$GITHUB_REPO" <number>` snapshot to record the current
+   state for the checklist if you want, but never poll or wait on remote CI in a
+   loop — ending the run is how CI ownership passes to the supervisor.
 10. Write or refresh an `## OpenThrottle gates` checklist in the PR description
     so a human can see at a glance which gates completed. Update that section
     in place; never overwrite the rest of the body. Include one line each for
     tests, lint, build, the internal `ce-code-review`, simplification (or its
     skip), CI, and review threads — each marked done (`- [x]`), a known gap
     (`- [ ]` with why, e.g. "build: could not run, sandbox OOM"), or skipped,
-    with a one-line note. This checklist is the gate audit surface, distinct
+    with a one-line note. On the first run, CI has not concluded yet: mark it
+    `- [ ]` awaiting the automated check (the supervisor re-delivers any failure
+    as a follow-up), never as done. This checklist is the gate audit surface, distinct
     from the "Assumptions & decisions" ledger. Mirror the same gate states into
     the Linear session plan with `ot-activity plan` so the session and the PR
     agree.
@@ -103,10 +107,10 @@ and comment so you answer the complete review, not one comment at a time —
 then reply visibly on EVERY item: when you make a change, reply with what you
 did and the commit that addresses it and resolve the thread; when no change is
 needed, reply with your reasoning; batch any decision-required items into one
-further elicitation. After pushing fixes, wait for CI with `gh pr checks
---watch` and fix in-scope failures in the same run before finalizing, then
+further elicitation. After running the local gates on your fix and pushing, end
+the run — OpenThrottle re-delivers any remaining CI failure as another follow-up
+on this same session, so never block waiting on remote CI. Then
 refresh the `## OpenThrottle gates` checklist. Never leave an item
-unaddressed, and never finalize while checks are still red or running, across
-a resume.
+unaddressed.
 
 The required native sequence is also available as `$OT_CE_PIPELINE`.

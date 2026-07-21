@@ -232,6 +232,77 @@ describe("TicketStore", () => {
     expect(store.claimNextSessionWork("session-1", new Date().toISOString())).toBeUndefined();
   });
 
+  it("lists idle active tickets with claimable pending work — skipping active runs, non-active tickets, and future-dated work", () => {
+    const store = makeStore(); // issue-1 / session-1, active, no run
+    const addTicket = (id: string, state: "active" | "error") => {
+      store.upsert({
+        linear_issue_id: id,
+        linear_issue_identifier: id.toUpperCase(),
+        linear_session_id: `session-${id}`,
+        sandbox_id: null,
+        branch: `ot/${id}`,
+        agent: "claude",
+        repo: "owner/repo",
+        pr_url: null,
+        state: "active",
+      });
+      if (state !== "active") store.setState(id, state);
+    };
+
+    // issue-1: idle + pending automatic work → listed.
+    store.enqueueSessionWork({
+      id: "gh-ci-1",
+      linearSessionId: "session-1",
+      issueId: "issue-1",
+      source: "automatic",
+      body: "ci failed",
+    });
+
+    // busy: pending work but an active run → excluded (run_id set).
+    addTicket("busy", "active");
+    store.enqueueSessionWork({
+      id: "gh-ci-busy",
+      linearSessionId: "session-busy",
+      issueId: "busy",
+      source: "automatic",
+      body: "ci failed",
+    });
+    store.beginRun({
+      issueId: "busy",
+      runId: "run-busy",
+      taskType: "resume",
+      tokenHash: "hash",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+
+    // errored: pending work but ticket is not active → excluded.
+    addTicket("errored", "error");
+    store.enqueueSessionWork({
+      id: "gh-ci-err",
+      linearSessionId: "session-errored",
+      issueId: "errored",
+      source: "automatic",
+      body: "ci failed",
+    });
+
+    // idle-empty: active + idle but no pending work → excluded.
+    addTicket("empty", "active");
+
+    const now = new Date().toISOString();
+    expect(
+      store.listTicketsWithPendingSessionWork(now).map((t) => t.linear_issue_id)
+    ).toEqual(["issue-1"]);
+
+    // The available_at filter: work enqueued now is not yet claimable "in the past".
+    expect(
+      store.listTicketsWithPendingSessionWork("2000-01-01T00:00:00.000Z")
+    ).toEqual([]);
+
+    // Once the only pending item is claimed, the ticket drops out.
+    store.claimNextSessionWork("session-1", now);
+    expect(store.listTicketsWithPendingSessionWork(now)).toEqual([]);
+  });
+
   it("finds expired running work", () => {
     const store = makeStore();
     store.beginRun({

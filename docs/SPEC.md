@@ -133,11 +133,14 @@ that ticket, bounding durable log storage to the latest captured run.
   and closes the ticket row.
 - All GitHub feedback on an active, PR-backed ticket becomes deduplicated
   `automatic` session work, each item carrying a triage message (gather the
-  full review first via `gh pr checks` and all open threads; reply visibly on
-  every item — actioned items name the fixing commit and resolve the thread,
-  no-change items give reasoning; wait for CI to go green before finalizing;
-  refresh the PR's `## OpenThrottle gates` checklist; batch decision-required
-  items into one elicitation; end with "Assumptions & decisions"): a human
+  full review first via a `gh pr checks` snapshot and all open threads; reply
+  visibly on every item — actioned items name the fixing commit and resolve the
+  thread, no-change items give reasoning; run the local test/lint/build gates on
+  the fix, push, and end the run — the run does not block on remote CI, because
+  the supervisor watches the checks and re-delivers any failure as another
+  `automatic` follow-up on the same session; refresh the PR's
+  `## OpenThrottle gates` checklist; batch decision-required items into one
+  elicitation; end with "Assumptions & decisions"): a human
   `CHANGES_REQUESTED` review, a non-self `commented` review (GitHub wraps
   every inline review comment in a `commented` review, so this also covers
   bot inline reviews), a new PR conversation comment, and a failed or
@@ -151,6 +154,14 @@ that ticket, bounding durable log storage to the latest captured run.
   **`resume` of the original session** — there is no separate task type or
   fresh context for feedback. The former two-tier `review`/`review-fix`
   choreography and the ticket's pending-re-review flag are gone.
+- **Drain recovery.** Completion is normally the only point that drains queued
+  work for an active run, and it can skip that drain — deliberately (the run
+  paused on an elicitation) or on a fault (no Linear client that moment, or a
+  launch that released the item). The lifecycle sweep re-drains any idle,
+  active ticket that still holds claimable pending work for its current
+  session, so a single missed drain self-heals instead of stranding the
+  feedback. Tickets whose last run parked on an unanswered elicitation are left
+  pending — the sweep never resumes a session that is waiting on a human.
 - **Rounds bound.** One counter — `automatic`-source session-work items
   consumed per ticket — is bounded by `REVIEW_MAX_ROUNDS`; human-source
   replies are never bounded. Exhausting the bound cancels the queued item
@@ -187,7 +198,9 @@ On boot and every 30 seconds, the supervisor drains new, failed, and
 lease-expired webhook deliveries plus pending Linear outbox rows. A separate
 boot and 15-minute lifecycle sweep expires callback-less runs, expires old
 no-PR tickets, deletes old orphaned sandboxes (with a provisioning grace
-window), and prunes old delivery records. A webhook delivery is retried at most
+window), re-drains stalled session work (idle active tickets with claimable
+pending feedback whose last run did not park on an elicitation), and prunes old
+delivery records. A webhook delivery is retried at most
 eight times; terminal failures remain visible in SQLite/logs and enqueue one
 final error activity when its session is known. Linear outbox rows preserve
 per-session sequence order and keep later rows pending behind a failed earlier
@@ -401,9 +414,11 @@ multiple defensible interpretations) are never implemented without a human
 answer. Clear fixes ship first; remaining items go out as one batched
 `elicitation` decision list whose Linear reply resumes the same session. No
 item is backlogged — each ends fixed and pushed with a reply naming the fixing
-commit, answered on its thread, or escalated — and a run never finalizes while
-CI is red or still running: after any push the adapter waits for `gh pr
-checks` to conclude and fixes in-scope failures in the same run. Every run also
+commit, answered on its thread, or escalated. Remote CI is the supervisor's to
+watch, not the run's to block on: after the local test/lint/build gates pass and
+the push lands, the run ends, and the supervisor re-delivers any failing check
+to the same session as a follow-up `resume` (bounded by `REVIEW_MAX_ROUNDS`) —
+the adapter never sits in `gh pr checks --watch`. Every run also
 writes or refreshes an `## OpenThrottle gates` checklist in the PR description
 (tests, lint, build, internal review, simplification, CI, review threads) so a
 human can see which gates completed; a gate that could not run — e.g. one the

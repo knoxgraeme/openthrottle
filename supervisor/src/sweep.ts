@@ -5,6 +5,7 @@ import { deleteSandbox, listLabeledSandboxes } from "./daytona.js";
 import { commentCreate, type LinearClient } from "./linear.js";
 import { createLinearOutboxProcessor } from "./linear-outbox.js";
 import { expireRun } from "./server.js";
+import { redrainStalledSessionWork } from "./run-lifecycle.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -30,6 +31,10 @@ export async function runSweep(
   }
   await expireStaleTickets(daytona, store, linear, cfg);
   await deleteOrphanSandboxes(daytona, store, cfg);
+  // Recover any feedback work that was enqueued but never drained (a completeRun
+  // drain that was skipped or failed): without this, one missed drain strands a
+  // PR review forever, since nothing else re-triggers a drain.
+  await redrainStalledSessionWork({ cfg, store, daytona, linear, linearOutbox });
   const retentionCutoff = new Date(Date.now() - 7 * DAY_MS).toISOString();
   store.pruneDeliveries(retentionCutoff);
   store.pruneSandboxEvents(retentionCutoff);

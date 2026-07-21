@@ -66,10 +66,13 @@ describe("feedbackMessage", () => {
     expect(message).toContain("https://github.com/o/r/pull/12#pullrequestreview-1");
     expect(message).toContain("The retry loop swallows the original error.");
     expect(message).toContain("Triage this feedback");
-    // The triage contract: wait for CI, reply on every thread, refresh the
-    // gate checklist. Lock those so the delivered message can't quietly drop
-    // back to fire-and-forget triage.
-    expect(message).toContain("gh pr checks --watch");
+    // The triage contract: snapshot CI, reply on every thread, run the local
+    // gates, push, and END — the supervisor re-delivers any CI failure as a
+    // follow-up resume rather than the agent blocking on remote CI. Lock those
+    // so the delivered message can't quietly regress to in-run CI babysitting.
+    expect(message).toContain("gh pr checks");
+    expect(message).not.toContain("--watch");
+    expect(message).toContain("OpenThrottle watches CI");
     expect(message).toContain("reply visibly on EVERY item");
     expect(message).toContain("## OpenThrottle gates");
   });
