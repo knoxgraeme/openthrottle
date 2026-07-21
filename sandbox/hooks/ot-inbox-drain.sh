@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # ot-inbox-drain.sh — mid-run steering "inbox" drain hook. Baked into the image
-# at /opt/openthrottle/hooks/ot-inbox-drain.sh and registered (for Claude) as a
-# Stop + PostToolUse hook in the sandbox user's ~/.claude/settings.json.
+# at /opt/openthrottle/hooks/ot-inbox-drain.sh and registered as a Stop +
+# PostToolUse hook for Claude (~/.claude/settings.json) and Codex
+# (~/.codex/hooks.json). Both engines share the hook contract: `hook_event_name`
+# on stdin; `hookSpecificOutput.additionalContext` injects context, and on Stop
+# `decision:block` + `reason` continues the run (Claude reads additionalContext,
+# Codex uses reason as the continuation prompt), so one script serves both.
 #
 # The Fly supervisor's inbox poller (supervisor/src/inbox.ts) writes per-message
 # steering files into ~/.ot/inbox/<id>.md while the agent runs. On each hook

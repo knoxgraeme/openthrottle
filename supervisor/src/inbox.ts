@@ -19,11 +19,11 @@ export async function deliverPendingInbox(params: {
 }): Promise<void> {
   for (const ticket of params.store.listRunning()) {
     if (!ticket.sandbox_id) continue;
-    // Only Claude currently has the drain hook wired (entrypoint.sh phase 7).
-    // Uploading to a Codex/OpenCode sandbox and marking the row delivered would
-    // silently lose the steer, since no hook ever reads ~/.ot/inbox — leave
-    // those messages pending until an engine hook is wired.
-    if (ticket.agent !== "claude") continue;
+    // Only agents with a wired drain hook can consume steering (entrypoint.sh:
+    // Claude via ~/.claude/settings.json, Codex via ~/.codex/hooks.json).
+    // OpenCode has no hook yet, so delivering + marking delivered would silently
+    // lose the steer — leave those pending until an OpenCode hook is wired.
+    if (ticket.agent !== "claude" && ticket.agent !== "codex") continue;
     const pending = params.store.listPendingInbox(ticket.linear_issue_id);
     if (pending.length === 0) continue;
     try {

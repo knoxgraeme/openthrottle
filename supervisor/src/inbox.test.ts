@@ -96,14 +96,33 @@ describe("deliverPendingInbox", () => {
     expect(store.getInbox(second.id)?.status).toBe("delivered");
   });
 
-  it("skips tickets whose agent has no drain hook, leaving steering pending", async () => {
+  it("delivers to Codex tickets, which have a wired drain hook", async () => {
     const store = seedRunningTicket("codex");
     const record = store.enqueueInbox({
       issueId: "issue-1",
       sessionId: "session-1",
       runId: "run-1",
       source: "operator",
-      body: "codex has no drain hook yet",
+      body: "steer the codex run",
+    });
+    const sandbox = makeSandbox();
+    const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
+    await deliverPendingInbox({ daytona, store });
+    expect(sandbox.fs.uploadFile).toHaveBeenCalledWith(
+      Buffer.from("steer the codex run"),
+      `/home/agent/.ot/inbox/${record.id}.md`
+    );
+    expect(store.getInbox(record.id)?.status).toBe("delivered");
+  });
+
+  it("skips tickets whose agent has no drain hook, leaving steering pending", async () => {
+    const store = seedRunningTicket("opencode");
+    const record = store.enqueueInbox({
+      issueId: "issue-1",
+      sessionId: "session-1",
+      runId: "run-1",
+      source: "operator",
+      body: "opencode has no drain hook yet",
     });
     const get = vi.fn(async () => makeSandbox());
     await deliverPendingInbox({ daytona: { get } as unknown as Daytona, store });

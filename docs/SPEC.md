@@ -368,7 +368,9 @@ secrets never enter the sandbox.
    registers the baked `hooks/ot-inbox-drain.sh` as a `Stop`/`PostToolUse`
    hook that drains `~/.ot/inbox` and injects any queued mid-run steering as
    untrusted-data context, blocking `Stop` so a run cannot end with unread
-   steering (Codex/OpenCode steering delivery are documented follow-ups).
+   steering. Codex registers the same drain hook via `~/.codex/hooks.json`
+   (run with `--dangerously-bypass-hook-trust` when the pinned Codex advertises
+   it); OpenCode steering delivery is a documented follow-up.
    Codex discovers the same canonical skills natively
    from the image-baked admin-scope `/etc/codex/skills/<name>/` (each with an
    `agents/openai.yaml` setting `allow_implicit_invocation: false`, so a skill
