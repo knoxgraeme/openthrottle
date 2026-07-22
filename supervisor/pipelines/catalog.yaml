@@ -3,6 +3,7 @@ manifests:
   - ce-implement-v1.yaml
   - ce-investigate-v1.yaml
   - command-fixture-v1.yaml
+  - command-fixture-v2.yaml
   - agent-fixture-v1.yaml
 aliases:
   implement:
@@ -13,7 +14,7 @@ aliases:
     version: 1
   fixture-command:
     id: fixture/command
-    version: 1
+    version: 2
   fixture-agent:
     id: fixture/agent
     version: 1

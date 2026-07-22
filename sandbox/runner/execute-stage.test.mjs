@@ -1,0 +1,247 @@
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { canonicalJson } from "./capabilities.mjs";
+import { digest } from "./artifacts.mjs";
+import {
+  computeWorkspaceTreeOid,
+  createStageRequestHash,
+  executeStage,
+  extractNativeSessionId,
+  resolveContextInvocation,
+  runtimeCapabilityDigest,
+  validateStageRequest,
+} from "./execute-stage.mjs";
+
+const directories = [];
+afterEach(() => {
+  for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
+});
+
+function repository() {
+  const directory = mkdtempSync(join(tmpdir(), "ot-stage-repo-"));
+  directories.push(directory);
+  execFileSync("git", ["init", "-q", "-b", "main"], { cwd: directory });
+  execFileSync("git", ["config", "user.name", "Test"], { cwd: directory });
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: directory });
+  writeFileSync(join(directory, ".gitignore"), "generated/\n");
+  writeFileSync(join(directory, "file.txt"), "initial\n");
+  mkdirSync(join(directory, "generated"));
+  writeFileSync(join(directory, "generated", "ignored.txt"), "ignored\n");
+  execFileSync("git", ["add", "."], { cwd: directory });
+  execFileSync("git", ["commit", "-qm", "initial"], { cwd: directory });
+  return directory;
+}
+
+function fixture({
+  capability = "agent/semantic@1",
+  contextPolicy = "fresh",
+  nativeSessionId = null,
+  requiredArtifacts = ["stage_result"],
+  credentialScopes = ["model.invoke", "repo.read"],
+  liveSteering = true,
+  commandName,
+  configuredCommand = true,
+} = {}) {
+  const repoDir = repository();
+  const config = commandName && configuredCommand ? { [commandName]: "test-command" } : {};
+  const stage = {
+    id: commandName ? "command" : "review",
+    executor: { kind: commandName ? "command" : "agent", capability },
+    evaluator: { required_artifacts: requiredArtifacts.filter((kind) => kind !== "stage_result") },
+    context: contextPolicy,
+    live_steering: liveSteering,
+    credentials: credentialScopes,
+  };
+  const manifest = { id: "fixture/test", version: 1, stages: [stage] };
+  const configRaw = canonicalJson(config);
+  const manifestRaw = canonicalJson(manifest);
+  const base = {
+    protocol: "stage-executor@1",
+    pipelineInstanceId: "pipeline-1",
+    manifestDigest: digest(manifestRaw),
+    runtimeRelease: "openthrottle-snapshot/v1",
+    capabilityDigest: runtimeCapabilityDigest(),
+    repositoryConfigDigest: digest(configRaw),
+    stageId: stage.id,
+    attemptId: "attempt-1",
+    runId: "run-1",
+    issueId: "issue-1",
+    sessionId: "session-1",
+    generation: 1,
+    repository: "owner/repo",
+    baseCommit: execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim(),
+    branch: "ot/issue-1",
+    agent: "codex",
+    contextRevision: 0,
+    expectedSubject: computeWorkspaceTreeOid(repoDir),
+    contextPolicy,
+    nativeSessionId,
+    capability,
+    requiredArtifacts,
+    credentialScopes,
+    liveSteering,
+    ...(commandName ? { commandName } : {}),
+  };
+  const request = { ...base, ...createStageRequestHash(base) };
+  return { repoDir, configRaw, manifestRaw, request };
+}
+
+function successProposal() {
+  return {
+    schema: "openthrottle.stage-proposal/v1",
+    suggested_outcome: "success",
+    summary: "Stage completed",
+    evidence: ["Inspected the change"],
+    findings: [],
+    actions: [],
+    uncertainty: [],
+  };
+}
+
+function clock() {
+  const values = ["2026-07-22T00:00:00.000Z", "2026-07-22T00:00:01.000Z"];
+  return () => values.shift();
+}
+
+describe("one-stage executor", () => {
+  it("validates the complete immutable request fence", () => {
+    const { request } = fixture();
+    expect(validateStageRequest(request)).toEqual(request);
+    expect(() => validateStageRequest({ ...request, requestHash: "0".repeat(64) })).toThrow(/stale/);
+    expect(() => validateStageRequest({ ...request, capabilityDigest: "0".repeat(64) }))
+      .toThrow(/installed runtime/);
+    expect(() => validateStageRequest({ ...request, authority: "agent" })).toThrow(/unknown field/);
+  });
+
+  it("rejects wrong sealed config/manifest digests before invocation", () => {
+    const input = fixture();
+    const runAgent = vi.fn();
+    expect(() => executeStage({ ...input, configRaw: '{"test":"wrong"}', runAgent })).toThrow(/repository config digest mismatch/);
+    expect(() => executeStage({ ...input, manifestRaw: "{}", runAgent })).toThrow(/pipeline manifest digest mismatch/);
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+
+  it("implements fresh, required-resume, prefer-resume reconstruction, and fresh-review policies", () => {
+    expect(resolveContextInvocation(fixture().request)).toMatchObject({ mode: "fresh", reconstructed: false });
+    expect(() => resolveContextInvocation(fixture({ contextPolicy: "resume_required" }).request))
+      .toThrow(/missing its native session/);
+    expect(resolveContextInvocation(fixture({ contextPolicy: "resume_required", nativeSessionId: "native-1" }).request))
+      .toMatchObject({ mode: "resume", nativeSessionId: "native-1" });
+    expect(resolveContextInvocation(fixture({ contextPolicy: "prefer_resume" }).request))
+      .toMatchObject({ mode: "fresh", reconstructed: true });
+    expect(resolveContextInvocation(fixture({ contextPolicy: "fresh_review", liveSteering: false }).request))
+      .toMatchObject({ mode: "fresh", readOnly: true });
+  });
+
+  it("captures provider-neutral native session identifiers from JSONL", () => {
+    expect(extractNativeSessionId('{"type":"system","session_id":"claude-1"}\n', "claude")).toBe("claude-1");
+    expect(extractNativeSessionId('{"type":"thread.started","thread_id":"codex-1"}\n', "codex")).toBe("codex-1");
+    expect(extractNativeSessionId('{"type":"step_start","sessionID":"opencode-1"}\n', "opencode")).toBe("opencode-1");
+    expect(extractNativeSessionId("not-json\n", "codex")).toBeNull();
+  });
+
+  it("takes engine selection from the sealed request", () => {
+    const input = fixture();
+    const runAgent = vi.fn(() => ({ exitCode: 0, proposal: successProposal(), nativeSessionId: "native-1" }));
+    executeStage({ ...input, agent: "claude", runAgent, now: clock() });
+    expect(runAgent).toHaveBeenCalledWith(expect.objectContaining({ agent: "codex" }));
+  });
+
+  it("records a missing required native session as explicit failed evidence", () => {
+    const input = fixture({ contextPolicy: "resume_required" });
+    const result = executeStage({ ...input, runAgent: vi.fn(), now: clock() });
+    expect(result.outcome).toBe("failure");
+    expect(JSON.parse(result.artifacts[0].payload).summary).toMatch(/missing its native session/);
+  });
+
+  it("invalidates a fresh-review success when the workspace mutates", () => {
+    const input = fixture({ contextPolicy: "fresh_review", liveSteering: false, requiredArtifacts: ["stage_result", "review"] });
+    const result = executeStage({
+      ...input,
+      now: clock(),
+      runAgent: ({ repoDir }) => {
+        writeFileSync(join(repoDir, "file.txt"), "mutated\n");
+        return { exitCode: 0, proposal: successProposal(), nativeSessionId: "review-session" };
+      },
+    });
+    expect(result.outcome).toBe("semantic_repair_required");
+    expect(JSON.parse(result.artifacts[0].payload).findings[0].code).toBe("review-mutated-workspace");
+  });
+
+  it("treats exit zero without a proposal as a non-recoverable failure", () => {
+    const input = fixture();
+    const result = executeStage({
+      ...input,
+      now: clock(),
+      runAgent: () => ({ exitCode: 0, nativeSessionId: "native-1" }),
+    });
+    expect(result.outcome).toBe("failure");
+    expect(JSON.parse(result.artifacts[0].payload).summary).toMatch(/without the required terminal/);
+  });
+
+  it("turns an invalid terminal proposal into typed failure evidence", () => {
+    const input = fixture();
+    const result = executeStage({
+      ...input,
+      now: clock(),
+      runAgent: () => ({
+        exitCode: 0,
+        nativeSessionId: "native-1",
+        proposal: { ...successProposal(), suggested_outcome: "canceled" },
+      }),
+    });
+    expect(result.outcome).toBe("failure");
+    expect(JSON.parse(result.artifacts[0].payload).summary).toMatch(/proposal was rejected/);
+  });
+
+  it("executes only the sealed allowlisted command and records tree mutation", () => {
+    const input = fixture({
+      capability: "command/run@1",
+      contextPolicy: "none",
+      requiredArtifacts: ["stage_result", "command_result"],
+      credentialScopes: ["repo.read"],
+      liveSteering: false,
+      commandName: "test",
+    });
+    const executeCommand = vi.fn(({ command, repoDir }) => {
+      writeFileSync(join(repoDir, "new.txt"), "new\n");
+      return { exitCode: 0, signal: null, timedOut: false, stdout: "ok", stderr: "" };
+    });
+    const result = executeStage({ ...input, executeCommand, now: clock() });
+    expect(executeCommand).toHaveBeenCalledWith(expect.objectContaining({ command: "test-command" }));
+    expect(result.outcome).toBe("success");
+    const payload = JSON.parse(result.artifacts[0].payload);
+    expect(payload.repository.post_subject).not.toBe(payload.repository.pre_subject);
+    expect(payload.details.command_name).toBe("test");
+  });
+
+  it("normalizes an unconfigured command to a valid no-change event outcome", () => {
+    const input = fixture({
+      capability: "command/run@1",
+      contextPolicy: "none",
+      requiredArtifacts: ["stage_result", "command_result"],
+      credentialScopes: ["repo.read"],
+      liveSteering: false,
+      commandName: "test",
+      configuredCommand: false,
+    });
+    const result = executeStage({ ...input, now: clock() });
+    expect(result.outcome).toBe("no_change");
+    expect(JSON.parse(result.artifacts[0].payload).result).toBe("not_configured");
+  });
+
+  it("computes subjects from a private index and excludes ignored generated files", () => {
+    const repoDir = repository();
+    const before = computeWorkspaceTreeOid(repoDir);
+    writeFileSync(join(repoDir, "generated", "ignored.txt"), "changed ignored\n");
+    expect(computeWorkspaceTreeOid(repoDir)).toBe(before);
+    writeFileSync(join(repoDir, "untracked.txt"), "included\n");
+    const after = computeWorkspaceTreeOid(repoDir);
+    expect(after).not.toBe(before);
+    execFileSync("git", ["reset", "--hard", "-q"], { cwd: repoDir });
+    expect(computeWorkspaceTreeOid(repoDir)).toBe(after);
+  });
+});

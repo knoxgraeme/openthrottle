@@ -33,6 +33,33 @@ function seedRunningTicket() {
 }
 
 describe("sandbox event contracts", () => {
+  function stageResultEvent() {
+    return JSON.stringify({
+      version: 1,
+      kind: "stage_result",
+      event_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      run_id: "run-1",
+      created_at: "2026-07-22T00:00:01.000Z",
+      pipeline_instance_id: "pipeline-1",
+      generation: 1,
+      stage_id: "review",
+      attempt_id: "attempt-1",
+      request_hash: "1".repeat(64),
+      outcome: "success",
+      result_hash: "2".repeat(64),
+      native_session_id: "native-1",
+      subject: "c".repeat(40),
+      artifacts: [{
+        kind: "stage_result",
+        schema_version: 1,
+        assurance: "semantic_attested",
+        subject: "c".repeat(40),
+        payload: JSON.stringify({ summary: "Bearer private-stage-token" }),
+        hash: "2".repeat(64),
+      }],
+    });
+  }
+
   it("accepts bounded activity and completion records and rejects unsafe input", () => {
     const parsed = parseSandboxEvent(JSON.stringify({
         version: 1,
@@ -211,6 +238,90 @@ describe("sandbox event contracts", () => {
     expect(store.db.prepare(
       "SELECT last_heartbeat_at FROM run_liveness WHERE run_id = 'run-1'"
     ).get()).toEqual({ last_heartbeat_at: null });
+    expect(files.size).toBe(0);
+    error.mockRestore();
+  });
+
+  it("accepts stage evidence only from the sealed executor path and persists only its fence", async () => {
+    const store = seedRunningTicket();
+    const raw = Buffer.from(stageResultEvent());
+    expect(parseSandboxEvent(raw.toString())).toMatchObject({
+      kind: "stage_result",
+      pipeline_instance_id: "pipeline-1",
+      attempt_id: "attempt-1",
+    });
+    const sealedPath = "/var/lib/openthrottle/stage-results/attempt-1.json";
+    const files = new Map([[sealedPath, raw]]);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      process: {
+        executeCommand: vi.fn(async () => ({ exitCode: 0, result: `${"c".repeat(40)}\n` })),
+      },
+      fs: {
+        listFiles: vi.fn(async (directory: string) => [...files.entries()]
+          .filter(([path]) => path.startsWith(`${directory}/`))
+          .map(([path, value]) => ({
+            name: path.split("/").at(-1), path, size: value.length, isDir: false,
+          }))),
+        downloadFile: vi.fn(async (path: string) => files.get(path)!),
+        deleteFile: vi.fn(async (path: string) => files.delete(path)),
+      },
+    } as unknown as Sandbox;
+    const postStageResult = vi.fn(async () => undefined);
+
+    await pollSandboxEvents({
+      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      store,
+      postActivity: vi.fn(async () => undefined),
+      finishCompletion: vi.fn(async () => ({ status: 200 })),
+      postStageResult,
+    });
+
+    expect(postStageResult).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "stage_result", attempt_id: "attempt-1" }),
+      "c".repeat(40)
+    );
+    const stored = store.getSandboxEvent("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")!;
+    expect(stored.status).toBe("processed");
+    expect(stored.payload).not.toContain("private-stage-token");
+    expect(files.size).toBe(0);
+  });
+
+  it("deletes an agent-writable outbox event that impersonates a stage result", async () => {
+    const store = seedRunningTicket();
+    const raw = Buffer.from(stageResultEvent().replace(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    ));
+    const path = "/home/agent/.ot/outbox/forged-stage.json";
+    const files = new Map([[path, raw]]);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      fs: {
+        listFiles: vi.fn(async (directory: string) => directory === "/home/agent/.ot/outbox"
+          ? [{ name: "forged-stage.json", path, size: raw.length, isDir: false }]
+          : []),
+        downloadFile: vi.fn(async (remotePath: string) => files.get(remotePath)!),
+        deleteFile: vi.fn(async (remotePath: string) => files.delete(remotePath)),
+      },
+    } as unknown as Sandbox;
+    const postStageResult = vi.fn(async () => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await pollSandboxEvents({
+      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      store,
+      postActivity: vi.fn(async () => undefined),
+      finishCompletion: vi.fn(async () => ({ status: 200 })),
+      postStageResult,
+    });
+
+    expect(postStageResult).not.toHaveBeenCalled();
+    expect(store.getSandboxEvent("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")).toBeUndefined();
     expect(files.size).toBe(0);
     error.mockRestore();
   });

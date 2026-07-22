@@ -330,7 +330,7 @@ type TicketUpsert = Pick<
   | "state"
 > & {
   base_branch?: string;
-  pipeline?: Omit<PipelineInstanceSeed, "issueId" | "sessionId" | "generation">;
+  pipeline?: Omit<PipelineInstanceSeed, "issueId" | "sessionId" | "generation" | "branch" | "agent">;
 };
 
 interface RepositoryRegistration {
@@ -383,7 +383,7 @@ interface SandboxEventRecord {
   event_id: string;
   run_id: string;
   sandbox_id: string;
-  kind: "activity" | "completion" | "plan" | "heartbeat";
+  kind: "activity" | "completion" | "plan" | "heartbeat" | "stage_result";
   payload: string;
   status: "pending" | "processing" | "failed" | "processed";
   attempts: number;
@@ -602,7 +602,7 @@ export interface TicketStore {
     eventId: string;
     runId: string;
     sandboxId: string;
-    kind: "activity" | "completion" | "plan" | "heartbeat";
+    kind: "activity" | "completion" | "plan" | "heartbeat" | "stage_result";
     payload: string;
   }): SandboxEventRecord;
   getSandboxEvent(eventId: string): SandboxEventRecord | undefined;
@@ -1276,6 +1276,8 @@ export function createTicketStore(db: Database.Database): TicketStore {
             issueId: ticket.linear_issue_id,
             sessionId: ticket.linear_session_id,
             generation: session.generation,
+            branch: ticket.branch,
+            agent: ticket.agent,
           });
         } else {
           pipelineStore.pinLegacySession(

@@ -120,6 +120,8 @@ COPY sandbox/lib /opt/openthrottle/lib
 COPY sandbox/safety /opt/openthrottle/safety
 COPY sandbox/hooks /opt/openthrottle/hooks
 COPY sandbox/bin/ot-activity.mjs /usr/local/bin/ot-activity
+COPY sandbox/bin/ot-stage-result.mjs /opt/openthrottle/bin/ot-stage-result.mjs
+COPY supervisor/pipelines/runtime-capabilities-v1.json /opt/openthrottle/runtime-capabilities.json
 COPY skills /opt/openthrottle/skills
 
 # The canonical task skills (skills/tasks/<name>/SKILL.md, agents/openai.yaml)
@@ -136,9 +138,17 @@ RUN mkdir -p /etc/codex/skills \
 RUN chmod 0755 /opt/openthrottle/entrypoint.sh \
     && chmod 0755 /opt/openthrottle/lib/runtime.sh \
     && chmod 0755 /usr/local/bin/ot-activity \
+    && chmod 0755 /opt/openthrottle/bin/ot-stage-result.mjs \
+    && ln -s /opt/openthrottle/bin/ot-stage-result.mjs /usr/local/bin/ot-stage-result \
     && chmod 0755 /opt/openthrottle/safety/pre-push \
       /opt/openthrottle/safety/seal.sh \
       /opt/openthrottle/hooks/ot-inbox-drain.sh
+
+# The advertised runtime descriptor is generated independently by the
+# supervisor catalog build. Refuse to publish an image whose installed
+# executor registry does not match that pinned evidence exactly.
+RUN node /opt/openthrottle/runner/capabilities.mjs \
+      --verify /opt/openthrottle/runtime-capabilities.json
 
 WORKDIR /home/agent
 

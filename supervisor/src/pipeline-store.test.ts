@@ -85,7 +85,20 @@ describe("pipeline store", () => {
     expect(instance.pipeline_id).toBe("ce/implement");
     expect(instance.status).toBe("dispatchable");
     expect(instance.attempt_count).toBe(1);
-    expect(pipelines.getActiveAttempt(instance.id)?.stage_id).toBe("implement");
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    expect(attempt.stage_id).toBe("implement");
+    const request = pipelines.getStageRequest(attempt.id);
+    expect(request).toMatchObject({
+      pipelineInstanceId: instance.id,
+      attemptId: attempt.id,
+      runId: attempt.planned_run_id,
+      branch: "ot/issue-pipeline-session",
+      agent: "codex",
+      repositoryConfigDigest: snapshot.digest,
+      nativeSessionId: null,
+    });
+    expect(request.requestHash).toBe(attempt.request_hash);
+    expect(request.idempotencyKey).toBe(attempt.idempotency_key);
     expect(pipelines.listEffects(instance.id).map((effect) => effect.kind)).toEqual(["provision"]);
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(1);
   });
@@ -185,14 +198,14 @@ describe("pipeline store", () => {
     expect(() => pipelines.acceptCatalog(mutatedCatalog)).toThrow(/different digest/);
 
     const v2Value = JSON.parse(v1.normalized) as Record<string, unknown>;
-    v2Value.version = 2;
+    v2Value.version = 3;
     v2Value.description = "A compatible future command fixture.";
     const v2 = validatePipelineManifest(v2Value, { runtime: runtime.descriptor });
     const moved: ValidatedPipelineCatalog = {
-      aliases: { "fixture-command": { id: v2.manifest.id, version: 2 } },
-      manifests: new Map([["fixture/command@1", v1], ["fixture/command@2", v2]]),
+      aliases: { "fixture-command": { id: v2.manifest.id, version: 3 } },
+      manifests: new Map([["fixture/command@1", v1], ["fixture/command@3", v2]]),
       normalized: canonicalJson({
-        aliases: { "fixture-command": { id: v2.manifest.id, version: 2 } },
+        aliases: { "fixture-command": { id: v2.manifest.id, version: 3 } },
         manifests: [v1, v2].map((entry) => ({
           id: entry.manifest.id,
           version: entry.manifest.version,
@@ -200,7 +213,7 @@ describe("pipeline store", () => {
         })),
       }),
       digest: digestNormalized(canonicalJson({
-        aliases: { "fixture-command": { id: v2.manifest.id, version: 2 } },
+        aliases: { "fixture-command": { id: v2.manifest.id, version: 3 } },
         manifests: [v1, v2].map((entry) => ({
           id: entry.manifest.id,
           version: entry.manifest.version,
@@ -224,7 +237,7 @@ describe("pipeline store", () => {
       });
     }
     expect(pipelines.getInstanceForSession("session-v1")?.pipeline_version).toBe(1);
-    expect(pipelines.getInstanceForSession("session-v2")?.pipeline_version).toBe(2);
+    expect(pipelines.getInstanceForSession("session-v2")?.pipeline_version).toBe(3);
   });
 
   it("revalidates pinned hashes and restricts deletion of audit-bearing parents", () => {

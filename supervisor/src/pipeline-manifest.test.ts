@@ -61,10 +61,12 @@ describe("pipeline manifest validation", () => {
       "ce/implement@1",
       "ce/investigate@1",
       "fixture/command@1",
+      "fixture/command@2",
       "fixture/agent@1",
     ]);
     expect(resolvePipelineReference(first, "implement").manifest.id).toBe("ce/implement");
     expect(resolvePipelineReference(first, "fixture/command@1").manifest.id).toBe("fixture/command");
+    expect(resolvePipelineReference(first, "fixture-command").manifest.version).toBe(2);
   });
 
   it("normalizes key order and rejects unknown or duplicate YAML fields", () => {

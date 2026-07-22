@@ -43,6 +43,7 @@ describe("sandbox runtime port", () => {
       manifestDigest: "a".repeat(64),
       runtimeRelease: "snapshot/v1",
       capabilityDigest: "b".repeat(64),
+      repositoryConfigDigest: "d".repeat(64),
       stageId: "command",
       attemptId: "attempt-1",
       runId: "run-1",
@@ -51,12 +52,16 @@ describe("sandbox runtime port", () => {
       generation: 1,
       repository: "owner/repo",
       baseCommit: "c".repeat(40),
+      branch: "ot/issue-1",
+      agent: "codex",
       contextRevision: 0,
       expectedSubject: null,
       contextPolicy: "none" as const,
+      nativeSessionId: null,
       capability: "command/run@1",
       requiredArtifacts: ["command_result" as const],
       credentialScopes: ["repo.read"],
+      liveSteering: false,
     };
     expect(createStageRequestHash(request)).toEqual(createStageRequestHash({ ...request }));
     expect(createStageRequestHash({ ...request, generation: 2 }).requestHash)

@@ -463,6 +463,31 @@ const pipelineCoordinatorMigrationSource = `${pipelineCoordinatorSchema}
 backfill-contract:every-existing-agent-session-is-legacy/v1
 audit-bearing pipeline records use restricted foreign keys and immutable identities`;
 
+const canonicalGateReceiptSchema = `
+ALTER TABLE pipeline_gate_receipts ADD COLUMN payload TEXT;
+ALTER TABLE pipeline_instances ADD COLUMN branch TEXT;
+ALTER TABLE pipeline_instances ADD COLUMN agent TEXT;
+ALTER TABLE pipeline_stage_attempts ADD COLUMN planned_run_id TEXT;
+ALTER TABLE pipeline_stage_attempts ADD COLUMN expected_subject TEXT;
+ALTER TABLE pipeline_stage_attempts ADD COLUMN native_session_id TEXT;
+ALTER TABLE pipeline_stage_attempts ADD COLUMN request_payload TEXT;
+CREATE UNIQUE INDEX pipeline_attempts_planned_run_unique
+  ON pipeline_stage_attempts(planned_run_id) WHERE planned_run_id IS NOT NULL;
+`;
+
+const canonicalGateReceiptMigrationSource = `${canonicalGateReceiptSchema}
+gate receipts persist the canonical evaluator input and decision payload/v1
+backfill-contract:pipeline branch and agent from ticket when the legacy table exists`;
+
+function backfillPipelineExecutionIdentity(db: Database.Database): void {
+  if (!hasColumns(db, "tickets", ["linear_issue_id", "branch", "agent"])) return;
+  db.exec(`
+    UPDATE pipeline_instances
+    SET branch = (SELECT branch FROM tickets WHERE tickets.linear_issue_id = pipeline_instances.linear_issue_id),
+        agent = (SELECT agent FROM tickets WHERE tickets.linear_issue_id = pipeline_instances.linear_issue_id)
+  `);
+}
+
 function backfillLegacySessionExecutions(db: Database.Database): void {
   if (!hasColumns(db, "agent_sessions", ["id", "linear_issue_id", "generation"])) return;
   const timestamp = new Date().toISOString();
@@ -776,6 +801,15 @@ const definitions: DatabaseMigrationDefinition[] = [
     up(db) {
       db.exec(pipelineCoordinatorSchema);
       backfillLegacySessionExecutions(db);
+    },
+  },
+  {
+    version: 5,
+    name: "canonical-gate-receipt-payload",
+    source: canonicalGateReceiptMigrationSource,
+    up(db) {
+      db.exec(canonicalGateReceiptSchema);
+      backfillPipelineExecutionIdentity(db);
     },
   },
 ];

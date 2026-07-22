@@ -187,6 +187,30 @@ describe("pipeline coordinator", () => {
     expect(attemptsExhausted.nextAttempt).toBeUndefined();
   });
 
+  it("persists a complete immutable request for a repair attempt", () => {
+    const { pipelines, instance, attempt } = setup("ce/implement@1");
+    const repaired = coordinatePipelineEvent(
+      pipelines,
+      event(instance, attempt, "semantic_repair_required", "repair-request")
+    );
+    const next = pipelines.getActiveAttempt(repaired.id)!;
+    const request = pipelines.getStageRequest(next.id);
+    expect(request).toMatchObject({
+      pipelineInstanceId: instance.id,
+      stageId: "implement",
+      attemptId: next.id,
+      runId: next.planned_run_id,
+      requestHash: next.request_hash,
+      idempotencyKey: next.idempotency_key,
+      agent: "codex",
+      contextRevision: 1,
+    });
+    expect(pipelines.listEffects(instance.id).at(-1)).toMatchObject({
+      kind: "dispatch_stage",
+      payload: next.request_payload,
+    });
+  });
+
   it("turns a current-head provider snapshot into a bounded typed repair re-entry", () => {
     const { manifest, instance, attempt, stages } = setup("ce/implement@1");
     const providerAttempt = {

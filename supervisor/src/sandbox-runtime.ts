@@ -8,6 +8,7 @@ import {
   canonicalJson,
   digestNormalized,
   type ArtifactKind,
+  type AssuranceClass,
   type ContextPolicy,
   type EvaluatorKind,
   type ExecutorKind,
@@ -36,6 +37,7 @@ export interface StageRequestEnvelope {
   manifestDigest: string;
   runtimeRelease: string;
   capabilityDigest: string;
+  repositoryConfigDigest: string;
   stageId: string;
   attemptId: string;
   requestHash: string;
@@ -46,12 +48,17 @@ export interface StageRequestEnvelope {
   generation: number;
   repository: string;
   baseCommit: string;
+  branch: string;
+  agent: "claude" | "codex" | "opencode";
   contextRevision: number;
   expectedSubject: string | null;
   contextPolicy: ContextPolicy;
+  nativeSessionId: string | null;
   capability: string;
   requiredArtifacts: ArtifactKind[];
   credentialScopes: string[];
+  liveSteering: boolean;
+  commandName?: "test" | "lint" | "build" | "format";
 }
 
 export interface StageExecutionResult {
@@ -60,7 +67,14 @@ export interface StageExecutionResult {
   outcome: StageOutcome;
   nativeSessionId: string | null;
   subject: string | null;
-  artifacts: Array<{ kind: ArtifactKind; schemaVersion: number; payload: string; hash: string }>;
+  artifacts: Array<{
+    kind: ArtifactKind;
+    schemaVersion: number;
+    assurance: AssuranceClass;
+    subject: string | null;
+    payload: string;
+    hash: string;
+  }>;
   completedAt: string;
 }
 
@@ -75,7 +89,12 @@ export interface SandboxRuntime {
     baseCommit: string;
     runtimeRelease: string;
   }): Promise<RuntimeResource>;
-  bootstrap(resource: RuntimeResource, input: { sealedRepositoryConfig: string; configDigest: string }): Promise<void>;
+  bootstrap(resource: RuntimeResource, input: {
+    sealedRepositoryConfig: string;
+    configDigest: string;
+    normalizedManifest: string;
+    manifestDigest: string;
+  }): Promise<void>;
   dispatchStage(resource: RuntimeResource, request: StageRequestEnvelope): Promise<{ providerDispatchId: string }>;
   collectStageResult(resource: RuntimeResource, attemptId: string): Promise<StageExecutionResult | null>;
   renewLiveness(resource: RuntimeResource, attemptId: string): Promise<{ observedAt: string }>;

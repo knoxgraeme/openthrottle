@@ -13,6 +13,7 @@ import { activityPayload, createLinearOutboxProcessor, enqueueSessionUpdate } fr
 import { loadPipelineCatalog } from "./pipeline-manifest.js";
 import { createPipelineStore } from "./pipeline-store.js";
 import { loadRuntimeCapabilityDescriptor } from "./sandbox-runtime.js";
+import { processStageEvidence } from "./gate-evaluators.js";
 
 const SWEEP_INTERVAL_MS = 15 * 60 * 1000; // run every 15 min while awake; SPEC only requires "on every boot" + periodic while awake
 const DELIVERY_DRAIN_INTERVAL_MS = 30 * 1000;
@@ -104,6 +105,23 @@ async function main() {
             },
             completion
           ),
+        postStageResult: async (event, observedSubject) => {
+          processStageEvidence(pipelineStore, {
+            id: event.event_id,
+            kind: "stage_result",
+            instanceId: event.pipeline_instance_id,
+            generation: event.generation,
+            runId: event.run_id,
+            stageId: event.stage_id,
+            attemptId: event.attempt_id,
+            requestHash: event.request_hash,
+            outcome: event.outcome,
+            resultHash: event.result_hash,
+            subject: event.subject,
+            nativeSessionId: event.native_session_id,
+            artifacts: event.artifacts,
+          }, { observedSubject });
+        },
         captureAgentAuth: async (sandbox, ticket) => {
           // Codex rotates its OAuth refresh token inside the sandbox; persist
           // it so the next run seeds the live token instead of a spent one.

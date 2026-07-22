@@ -9,6 +9,7 @@ import {
 } from "./pipeline-manifest.js";
 import type {
   CoordinatorArtifactWrite,
+  CoordinatorGateReceiptWrite,
   CoordinatorTransitionWrite,
   PipelineInstance,
   PipelineInstanceStage,
@@ -16,6 +17,7 @@ import type {
   PipelineStageAttempt,
   PipelineStore,
 } from "./pipeline-store.js";
+import { buildStageRequest } from "./pipeline-store.js";
 
 export interface PipelineEventArtifact {
   id?: string;
@@ -37,11 +39,14 @@ export interface PipelineCoordinatorEvent {
     | "supersede";
   instanceId: string;
   generation: number;
+  runId?: string;
+  stageId?: string;
   attemptId: string;
   requestHash: string;
   outcome: StageOutcome;
   resultHash: string;
   subject?: string | null;
+  nativeSessionId?: string | null;
   artifacts?: PipelineEventArtifact[];
 }
 
@@ -81,7 +86,8 @@ function verifyInput(input: PipelineReductionInput): PipelineStage {
     throw new Error("pipeline event attempt fence mismatch");
   }
   if (!/^[a-f0-9]{64}$/.test(event.resultHash)) throw new Error("pipeline event result hash is invalid");
-  if (event.subject != null && instance.immutable_subject != null && event.subject !== instance.immutable_subject) {
+  if (event.kind !== "stage_result" && event.subject != null &&
+      instance.immutable_subject != null && event.subject !== instance.immutable_subject) {
     throw new Error("pipeline event subject is stale");
   }
   const stage = activeStage(input);
@@ -152,31 +158,40 @@ function nextAttemptFor(input: PipelineReductionInput, stage: PipelineStage, ree
   const id = `attempt-${digestNormalized(canonicalJson([
     input.instance.id, stage.id, attemptOrdinal, reentryOrdinal,
   ])).slice(0, 32)}`;
-  const requestHash = digestNormalized(canonicalJson({
-    pipelineInstanceId: input.instance.id,
+  const plannedRunId = `run-${digestNormalized(canonicalJson([id, "stage-execution"])).slice(0, 32)}`;
+  const request = buildStageRequest({
+    instanceId: input.instance.id,
     manifestDigest: input.instance.manifest_digest,
     runtimeRelease: input.instance.runtime_release,
     capabilityDigest: input.instance.capability_digest,
-    stageId: stage.id,
+    repositoryConfigDigest: input.instance.repository_config_digest,
+    stage,
     attemptId: id,
+    runId: plannedRunId,
     issueId: input.instance.linear_issue_id,
     sessionId: input.instance.linear_session_id,
     generation: input.instance.generation,
     repository: input.instance.repository,
     baseCommit: input.instance.base_commit,
+    branch: input.instance.branch,
+    agent: input.instance.agent,
     contextRevision: input.attempt.context_revision + 1,
-    contextPolicy: stage.context,
-    capability: stage.executor.capability,
-  }));
+    expectedSubject: input.event.subject ?? null,
+    nativeSessionId: input.event.nativeSessionId ?? null,
+  });
   return {
     id,
     stageId: stage.id,
     attemptOrdinal,
     reentryOrdinal,
-    requestHash,
-    idempotencyKey: `stage:${input.instance.id}:${stage.id}:${attemptOrdinal}:${reentryOrdinal}:${requestHash}`,
+    requestHash: request.requestHash,
+    idempotencyKey: request.idempotencyKey,
     contextRevision: input.attempt.context_revision + 1,
     contextPolicy: stage.context,
+    plannedRunId,
+    expectedSubject: input.event.subject ?? null,
+    nativeSessionId: input.event.nativeSessionId ?? null,
+    requestPayload: canonicalJson(request),
   };
 }
 
@@ -294,12 +309,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
       ? {
           kind: "dispatch_stage" as const,
           idempotencyKey: nextAttempt.idempotencyKey,
-          payload: canonicalJson({
-            pipelineInstanceId: input.instance.id,
-            stageId: target.id,
-            attemptId: nextAttempt.id,
-            requestHash: nextAttempt.requestHash,
-          }),
+          payload: nextAttempt.requestPayload,
         }
       : {
           kind: "publish_linear" as const,
@@ -361,7 +371,8 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
 export function coordinatePipelineEvent(
   store: PipelineStore,
   event: PipelineCoordinatorEvent,
-  faultAfterWrite?: (writeCount: number) => void
+  faultAfterWrite?: (writeCount: number) => void,
+  gateReceipt?: CoordinatorGateReceiptWrite
 ): PipelineInstance {
   const queued = store.enqueueInboxEvent({
     id: event.id,
@@ -380,5 +391,6 @@ export function coordinatePipelineEvent(
   const manifest = JSON.parse(instance.normalized_manifest) as PipelineManifest;
   const stages = store.listStages(instance.id);
   const write = reducePipelineEvent({ manifest, instance, attempt, stages, event });
+  write.gateReceipt = gateReceipt;
   return store.applyTransition(write, faultAfterWrite);
 }

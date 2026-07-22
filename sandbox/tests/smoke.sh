@@ -75,8 +75,15 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
 
 cat > "$SMOKE_DIR/bin/claude" <<'STUB'
 #!/usr/bin/env sh
-test -f "$HOME/.claude/plugins/cache/compound-engineering-plugin/compound-engineering/3.19.0/skills/ce-work/SKILL.md"
+test -f "$HOME/.claude/plugins/cache/compound-engineering-plugin/compound-engineering/3.19.0/skills/ce-work/SKILL.md" || {
+  echo "Claude CE skill missing in $HOME" >&2
+  exit 25
+}
 ot-activity action "smoke Claude agent started"
+if [ -n "${OT_STAGE_PROPOSAL_FILE:-}" ]; then
+  ot-stage-result '{"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"Claude stage complete","evidence":["stub engine invoked"],"findings":[],"actions":[],"uncertainty":[]}' --output "$OT_STAGE_PROPOSAL_FILE" || exit 23
+  test -s "$OT_STAGE_PROPOSAL_FILE" || exit 24
+fi
 printf '%s\n' "$*" >> "$HOME/.ot/claude-args.log"
 case " $* " in
   *" --resume "*) cost=0.250 ;;
@@ -90,8 +97,15 @@ STUB
 
 cat > "$SMOKE_DIR/bin/codex" <<'STUB'
 #!/usr/bin/env sh
-test -f "$HOME/.codex/plugins/cache/compound-engineering-plugin/compound-engineering/3.19.0/skills/ce-work/SKILL.md"
+test -f "$HOME/.codex/plugins/cache/compound-engineering-plugin/compound-engineering/3.19.0/skills/ce-work/SKILL.md" || {
+  echo "Codex CE skill missing in $HOME" >&2
+  exit 25
+}
 ot-activity action "smoke Codex agent started"
+if [ -n "${OT_STAGE_PROPOSAL_FILE:-}" ]; then
+  ot-stage-result '{"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"Codex stage complete","evidence":["stub engine invoked"],"findings":[],"actions":[],"uncertainty":[]}' --output "$OT_STAGE_PROPOSAL_FILE" || exit 23
+  test -s "$OT_STAGE_PROPOSAL_FILE" || exit 24
+fi
 if [ "${1:-}" = "mcp" ]; then
   exit 0
 fi
@@ -111,15 +125,20 @@ STUB
 cat > "$SMOKE_DIR/bin/opencode" <<'STUB'
 #!/usr/bin/env sh
 ot-activity action "smoke OpenCode agent started"
-test "${OPENCODE_DISABLE_PROJECT_CONFIG:-}" = "1"
-test "${OPENCODE_DISABLE_EXTERNAL_SKILLS:-}" = "1"
-test "${OPENCODE_DISABLE_CLAUDE_CODE:-}" = "1"
-test -f "$OPENCODE_CONFIG_DIR/opencode.json"
-test -r "$OPENCODE_CONFIG_DIR/opencode.json"
-grep -Fq '/opt/openthrottle/compound-engineering-marketplace' "$OPENCODE_CONFIG_DIR/opencode.json"
-grep -Fq '{env:KIMI_CODE_API_KEY}' "$OPENCODE_CONFIG_DIR/opencode.json"
-if grep -Fq "$KIMI_CODE_API_KEY" "$OPENCODE_CONFIG_DIR/opencode.json"; then
-  exit 12
+if [ -n "${OT_STAGE_PROPOSAL_FILE:-}" ]; then
+  ot-stage-result '{"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"OpenCode stage complete","evidence":["stub engine invoked"],"findings":[],"actions":[],"uncertainty":[]}' --output "$OT_STAGE_PROPOSAL_FILE" || exit 23
+  test -s "$OT_STAGE_PROPOSAL_FILE" || exit 24
+else
+  test "${OPENCODE_DISABLE_PROJECT_CONFIG:-}" = "1"
+  test "${OPENCODE_DISABLE_EXTERNAL_SKILLS:-}" = "1"
+  test "${OPENCODE_DISABLE_CLAUDE_CODE:-}" = "1"
+  test -f "$OPENCODE_CONFIG_DIR/opencode.json"
+  test -r "$OPENCODE_CONFIG_DIR/opencode.json"
+  grep -Fq '/opt/openthrottle/compound-engineering-marketplace' "$OPENCODE_CONFIG_DIR/opencode.json"
+  grep -Fq '{env:KIMI_CODE_API_KEY}' "$OPENCODE_CONFIG_DIR/opencode.json"
+  if grep -Fq "$KIMI_CODE_API_KEY" "$OPENCODE_CONFIG_DIR/opencode.json"; then
+    exit 12
+  fi
 fi
 printf '%s\n' "$*" >> "$HOME/.ot/opencode-args.log"
 last=""
@@ -269,4 +288,145 @@ fi
 
 git --git-dir "$SMOKE_DIR/repo.git" show-ref --verify --quiet refs/heads/ot/smoke-opencode
 
-echo "sandbox Claude + Codex + OpenCode implement/resume smoke passed"
+run_stage_smoke() {
+  local agent="$1"
+  local home_dir="$2"
+  local state_dir="$SMOKE_DIR/result/stage-$agent"
+  local attempt_id="attempt-$agent"
+  local run_id="run-stage-$agent"
+  local branch="ot/stage-$agent"
+  local base_commit tree_oid
+  base_commit="$(git -C "$SMOKE_DIR/work" rev-parse HEAD)"
+  tree_oid="$(git -C "$SMOKE_DIR/work" rev-parse 'HEAD^{tree}')"
+  mkdir -p "$state_dir"
+  chmod 0777 "$state_dir"
+
+  docker run --rm --entrypoint node \
+    -e "STAGE_AGENT=$agent" \
+    -e "STAGE_ATTEMPT=$attempt_id" \
+    -e "STAGE_RUN=$run_id" \
+    -e "STAGE_BRANCH=$branch" \
+    -e "STAGE_BASE=$base_commit" \
+    -e "STAGE_TREE=$tree_oid" \
+    -v "$state_dir:/state" \
+    "$IMAGE" --input-type=module -e '
+      import { mkdirSync, writeFileSync } from "node:fs";
+      import { canonicalJson, RUNTIME_DESCRIPTOR } from "/opt/openthrottle/runner/capabilities.mjs";
+      import { digest } from "/opt/openthrottle/runner/artifacts.mjs";
+      import { createStageRequestHash } from "/opt/openthrottle/runner/execute-stage.mjs";
+      const config = {
+        agent: process.env.STAGE_AGENT,
+        model: "kimi-code/kimi-for-coding",
+        post_bootstrap: [],
+        limits: { max_turns: 2, task_timeout: 30 },
+      };
+      const manifest = {
+        schema: "openthrottle.pipeline/v1",
+        id: "fixture/stage-smoke",
+        version: 1,
+        description: "Provider-neutral stage smoke",
+        entry_stage: "review",
+        max_attempts: 1,
+        requires: { protocol: "stage-executor@1", capabilities: ["agent/semantic@1"] },
+        stages: [{
+          id: "review",
+          executor: { kind: "agent", capability: "agent/semantic@1" },
+          evaluator: { kind: "semantic", assurance: "semantic_attested", required_artifacts: ["review"] },
+          context: "fresh",
+          live_steering: true,
+          credentials: ["model.invoke", "repo.read", "repo.write"],
+          produces: ["review", "stage_result"],
+          transitions: {},
+        }],
+      };
+      const configRaw = canonicalJson(config);
+      const manifestRaw = canonicalJson(manifest);
+      const base = {
+        protocol: "stage-executor@1",
+        pipelineInstanceId: `pipeline-${process.env.STAGE_AGENT}`,
+        manifestDigest: digest(manifestRaw),
+        runtimeRelease: RUNTIME_DESCRIPTOR.release,
+        capabilityDigest: digest(canonicalJson(RUNTIME_DESCRIPTOR)),
+        repositoryConfigDigest: digest(configRaw),
+        stageId: "review",
+        attemptId: process.env.STAGE_ATTEMPT,
+        runId: process.env.STAGE_RUN,
+        issueId: `issue-${process.env.STAGE_AGENT}`,
+        sessionId: `session-${process.env.STAGE_AGENT}`,
+        generation: 1,
+        repository: "owner/smoke",
+        baseCommit: process.env.STAGE_BASE,
+        branch: process.env.STAGE_BRANCH,
+        agent: process.env.STAGE_AGENT,
+        contextRevision: 0,
+        expectedSubject: process.env.STAGE_TREE,
+        contextPolicy: "fresh",
+        nativeSessionId: null,
+        capability: "agent/semantic@1",
+        requiredArtifacts: ["review", "stage_result"],
+        credentialScopes: ["model.invoke", "repo.read", "repo.write"],
+        liveSteering: true,
+      };
+      mkdirSync("/state/stage-input", { recursive: true, mode: 0o700 });
+      writeFileSync("/state/stage-input/repository-config.json", configRaw, { mode: 0o400 });
+      writeFileSync("/state/stage-input/pipeline-manifest.json", manifestRaw, { mode: 0o400 });
+      writeFileSync(`/state/stage-input/${process.env.STAGE_ATTEMPT}.json`, canonicalJson({ ...base, ...createStageRequestHash(base) }), { mode: 0o400 });
+    '
+
+  local docker_args=(
+    run --rm
+    --entrypoint /opt/openthrottle/entrypoint.sh
+    --network "$NETWORK"
+    -e OT_SMOKE_TEST=1
+    -e OT_STAGE_EXECUTION=1
+    -e OT_GIT_URL_OVERRIDE=file:///fixture/repo.git
+    -e "OT_STAGE_REQUEST_FILE=/var/lib/openthrottle/stage-input/$attempt_id.json"
+    -e OT_STAGE_CONFIG_FILE=/var/lib/openthrottle/stage-input/repository-config.json
+    -e OT_STAGE_MANIFEST_FILE=/var/lib/openthrottle/stage-input/pipeline-manifest.json
+    -e TASK_TYPE=resume
+    -e AGENT=env-tampered
+    -e GITHUB_REPO=env/tampered
+    -e GITHUB_TOKEN=github-smoke-token
+    -e "BASE_BRANCH=$base_commit"
+    -e BRANCH_NAME=env/tampered
+    -e "RUN_ID=$run_id"
+    -e TASK_TIMEOUT=30
+    -v "$SMOKE_DIR:/fixture"
+    -v "$SMOKE_DIR/bin/claude:/usr/local/bin/claude:ro"
+    -v "$SMOKE_DIR/bin/codex:/usr/local/bin/codex:ro"
+    -v "$SMOKE_DIR/bin/opencode:/usr/local/bin/opencode:ro"
+    -v "$home_dir:/home/agent"
+    -v "$state_dir:/var/lib/openthrottle"
+  )
+  if [[ "$agent" == "claude" ]]; then
+    docker_args+=(-e CLAUDE_CODE_OAUTH_TOKEN=claude-oauth-token)
+  elif [[ "$agent" == "codex" ]]; then
+    docker_args+=(-e 'CODEX_AUTH_JSON={}')
+  else
+    docker_args+=(-e KIMI_CODE_API_KEY=kimi-smoke-secret)
+  fi
+  docker "${docker_args[@]}" "$IMAGE"
+
+  test "$(git -c "safe.directory=$home_dir/repo" -C "$home_dir/repo" branch --show-current)" = "$branch"
+
+  local result="$state_dir/stage-results/$attempt_id.json"
+  if ! jq -e --arg attempt "$attempt_id" --arg run "$run_id" '
+    .kind == "stage_result" and .attempt_id == $attempt and .run_id == $run and
+    .outcome == "success" and (.artifacts | length == 2) and
+    all(.artifacts[]; .assurance == "semantic_attested" and (.payload | fromjson | .result == "success"))
+  ' "$result" >/dev/null; then
+    echo "invalid normalized stage result for $agent" >&2
+    cat "$result" >&2
+    exit 1
+  fi
+  if find "$home_dir/.ot/outbox" -name "*completion-$run_id.json" -print -quit | rg -q .; then
+    echo "stage execution emitted a legacy completion marker" >&2
+    exit 1
+  fi
+}
+
+run_stage_smoke claude "$CLAUDE_HOME"
+run_stage_smoke codex "$CODEX_HOME"
+run_stage_smoke opencode "$OPENCODE_HOME"
+
+echo "sandbox Claude + Codex + OpenCode implement/resume + fenced stage smoke passed"

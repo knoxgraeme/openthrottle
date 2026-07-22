@@ -5,12 +5,18 @@ import {
   type AssuranceClass,
   type PipelineManifest,
   type PipelineOutcome,
+  type PipelineStage,
   type StageOutcome,
   type ValidatedPipelineCatalog,
   type ValidatedPipelineManifest,
   type ValidatedRepositoryConfig,
 } from "./pipeline-manifest.js";
-import type { ValidatedRuntimeCapabilityDescriptor } from "./sandbox-runtime.js";
+import {
+  STAGE_EXECUTOR_PROTOCOL,
+  createStageRequestHash,
+  type StageRequestEnvelope,
+  type ValidatedRuntimeCapabilityDescriptor,
+} from "./sandbox-runtime.js";
 
 export type PipelineInstanceStatus =
   | "pending"
@@ -43,6 +49,8 @@ export interface PipelineInstance {
   normalized_manifest: string;
   repository: string;
   base_commit: string;
+  branch: string;
+  agent: "claude" | "codex" | "opencode";
   repository_config_snapshot_id: string;
   repository_config_digest: string;
   runtime_release: string;
@@ -68,6 +76,10 @@ export interface PipelineStageAttempt {
   attempt_ordinal: number;
   reentry_ordinal: number;
   run_id: string | null;
+  planned_run_id: string | null;
+  expected_subject: string | null;
+  native_session_id: string | null;
+  request_payload: string | null;
   request_hash: string;
   idempotency_key: string;
   context_revision: number;
@@ -115,6 +127,8 @@ export interface PipelineInstanceSeed {
   generation: number;
   repository: string;
   baseCommit: string;
+  branch: string;
+  agent: "claude" | "codex" | "opencode";
   manifest: ValidatedPipelineManifest;
   repositoryConfig: RepositoryConfigSnapshot;
   runtime: ValidatedRuntimeCapabilityDescriptor;
@@ -138,6 +152,17 @@ export interface CoordinatorEffectWrite {
   payload: string;
 }
 
+export interface CoordinatorGateReceiptWrite {
+  id?: string;
+  evaluatorKind: "result" | "semantic" | "command" | "provider" | "human" | "publish_subject";
+  policyDigest: string;
+  subject?: string | null;
+  result: "passed" | "failed" | "indeterminate" | "skipped" | "not_configured";
+  artifactHashes: string[];
+  payload: string;
+  hash: string;
+}
+
 export interface CoordinatorTransitionWrite {
   instanceId: string;
   eventId: string;
@@ -155,6 +180,7 @@ export interface CoordinatorTransitionWrite {
   immutableSubject?: string | null;
   reentryIncrement?: number;
   artifacts?: CoordinatorArtifactWrite[];
+  gateReceipt?: CoordinatorGateReceiptWrite;
   nextAttempt?: {
     id?: string;
     stageId: string;
@@ -164,6 +190,10 @@ export interface CoordinatorTransitionWrite {
     idempotencyKey: string;
     contextRevision: number;
     contextPolicy: string;
+    plannedRunId: string;
+    expectedSubject: string | null;
+    nativeSessionId: string | null;
+    requestPayload: string;
   };
   effects: CoordinatorEffectWrite[];
 }
@@ -185,6 +215,8 @@ export interface PipelineStore {
   getInstance(id: string): PipelineInstance | undefined;
   getInstanceForSession(sessionId: string): PipelineInstance | undefined;
   getAttempt(id: string): PipelineStageAttempt | undefined;
+  getStageRequest(attemptId: string): StageRequestEnvelope;
+  bindStageRun(attemptId: string, runId: string): void;
   getActiveAttempt(instanceId: string): PipelineStageAttempt | undefined;
   listStages(instanceId: string): PipelineInstanceStage[];
   listEffects(instanceId: string): PipelineEffectIntent[];
@@ -212,6 +244,63 @@ function assertDigest(label: string, normalized: string, digest: string): void {
 
 function deterministicId(prefix: string, input: unknown): string {
   return `${prefix}-${digestNormalized(canonicalJson(input)).slice(0, 32)}`;
+}
+
+function plannedStageRunId(attemptId: string): string {
+  return deterministicId("run", [attemptId, "stage-execution"]);
+}
+
+export function buildStageRequest(input: {
+  instanceId: string;
+  manifestDigest: string;
+  runtimeRelease: string;
+  capabilityDigest: string;
+  repositoryConfigDigest: string;
+  stage: PipelineStage;
+  attemptId: string;
+  runId: string;
+  issueId: string;
+  sessionId: string;
+  generation: number;
+  repository: string;
+  baseCommit: string;
+  branch: string;
+  agent: "claude" | "codex" | "opencode";
+  contextRevision: number;
+  expectedSubject: string | null;
+  nativeSessionId: string | null;
+}): StageRequestEnvelope {
+  const commandNames = new Set(["test", "lint", "build", "format"] as const);
+  const withoutFence: Omit<StageRequestEnvelope, "requestHash" | "idempotencyKey"> = {
+    protocol: STAGE_EXECUTOR_PROTOCOL,
+    pipelineInstanceId: input.instanceId,
+    manifestDigest: input.manifestDigest,
+    runtimeRelease: input.runtimeRelease,
+    capabilityDigest: input.capabilityDigest,
+    repositoryConfigDigest: input.repositoryConfigDigest,
+    stageId: input.stage.id,
+    attemptId: input.attemptId,
+    runId: input.runId,
+    issueId: input.issueId,
+    sessionId: input.sessionId,
+    generation: input.generation,
+    repository: input.repository,
+    baseCommit: input.baseCommit,
+    branch: input.branch,
+    agent: input.agent,
+    contextRevision: input.contextRevision,
+    expectedSubject: input.expectedSubject,
+    contextPolicy: input.stage.context,
+    nativeSessionId: input.nativeSessionId,
+    capability: input.stage.executor.capability,
+    requiredArtifacts: [...new Set(["stage_result" as const, ...input.stage.evaluator.required_artifacts])].sort(),
+    credentialScopes: [...input.stage.credentials].sort(),
+    liveSteering: input.stage.live_steering,
+    ...(input.stage.executor.kind === "command" && commandNames.has(input.stage.id as never)
+      ? { commandName: input.stage.id as "test" | "lint" | "build" | "format" }
+      : {}),
+  };
+  return { ...withoutFence, ...createStageRequestHash(withoutFence) };
 }
 
 function validatePinnedInstance(db: Database.Database, instance: PipelineInstance): PipelineManifest {
@@ -470,7 +559,8 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
         if (
           existing.linear_issue_id !== seed.issueId || existing.linear_session_id !== seed.sessionId ||
           existing.generation !== seed.generation || existing.repository !== seed.repository ||
-          existing.base_commit !== seed.baseCommit || existing.manifest_digest !== seed.manifest.digest ||
+          existing.base_commit !== seed.baseCommit || existing.branch !== seed.branch || existing.agent !== seed.agent ||
+          existing.manifest_digest !== seed.manifest.digest ||
           existing.repository_config_snapshot_id !== seed.repositoryConfig.id ||
           existing.repository_config_digest !== seed.repositoryConfig.digest ||
           existing.runtime_release !== seed.runtime.descriptor.release ||
@@ -481,8 +571,8 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
       }
       throw new Error(`session ${seed.sessionId} execution mode is already pinned`);
     }
-    const session = db.prepare("SELECT linear_issue_id, generation FROM agent_sessions WHERE id = ?").get(seed.sessionId) as
-      | { linear_issue_id: string; generation: number }
+    const session = db.prepare("SELECT linear_issue_id, generation, provider_conversation_id FROM agent_sessions WHERE id = ?").get(seed.sessionId) as
+      | { linear_issue_id: string; generation: number; provider_conversation_id: string | null }
       | undefined;
     if (!session || session.linear_issue_id !== seed.issueId || session.generation !== seed.generation) {
       throw new Error(`session ${seed.sessionId} generation binding mismatch`);
@@ -516,15 +606,15 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
       INSERT INTO pipeline_instances (
         id, linear_issue_id, linear_session_id, generation, pipeline_id,
         pipeline_version, manifest_digest, normalized_manifest, repository,
-        base_commit, repository_config_snapshot_id, repository_config_digest,
+        base_commit, branch, agent, repository_config_snapshot_id, repository_config_digest,
         runtime_release, capability_digest, executor_protocol,
         authorized_capabilities, status, active_stage_id, attempt_count, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatchable', ?, 1, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatchable', ?, 1, ?, ?)
     `).run(
       instanceId, seed.issueId, seed.sessionId, seed.generation,
       seed.manifest.manifest.id, seed.manifest.manifest.version,
       seed.manifest.digest, seed.manifest.normalized, seed.repository,
-      seed.baseCommit, snapshot.id, snapshot.digest, seed.runtime.descriptor.release,
+      seed.baseCommit, seed.branch, seed.agent, snapshot.id, snapshot.digest, seed.runtime.descriptor.release,
       seed.runtime.digest, seed.runtime.descriptor.protocol, canonicalJson(authorized),
       seed.manifest.manifest.entry_stage, timestamp, timestamp
     );
@@ -551,30 +641,39 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
     `).run(seed.sessionId, seed.issueId, seed.generation, instanceId, timestamp);
     const entry = seed.manifest.manifest.stages.find((stage) => stage.id === seed.manifest.manifest.entry_stage)!;
     const attemptId = deterministicId("attempt", [instanceId, entry.id, 1, 0]);
-    const requestHash = digestNormalized(canonicalJson({
+    const plannedRunId = plannedStageRunId(attemptId);
+    const stageRequest = buildStageRequest({
       instanceId,
       manifestDigest: seed.manifest.digest,
       runtimeRelease: seed.runtime.descriptor.release,
       capabilityDigest: seed.runtime.digest,
-      stageId: entry.id,
+      repositoryConfigDigest: snapshot.digest,
+      stage: entry,
       attemptId,
+      runId: plannedRunId,
       issueId: seed.issueId,
       sessionId: seed.sessionId,
       generation: seed.generation,
       repository: seed.repository,
       baseCommit: seed.baseCommit,
+      branch: seed.branch,
+      agent: seed.agent,
       contextRevision: 0,
-      contextPolicy: entry.context,
-      capability: entry.executor.capability,
-    }));
-    const idempotencyKey = `stage:${instanceId}:${entry.id}:1:0:${requestHash}`;
+      expectedSubject: null,
+      nativeSessionId: session.provider_conversation_id,
+    });
+    const requestPayload = canonicalJson(stageRequest);
     db.prepare(`
       INSERT INTO pipeline_stage_attempts (
         id, pipeline_instance_id, stage_id, attempt_ordinal, reentry_ordinal,
         request_hash, idempotency_key, context_revision, native_context_policy,
+        planned_run_id, expected_subject, native_session_id, request_payload,
         status, created_at, updated_at
-      ) VALUES (?, ?, ?, 1, 0, ?, ?, 0, ?, 'pending', ?, ?)
-    `).run(attemptId, instanceId, entry.id, requestHash, idempotencyKey, entry.context, timestamp, timestamp);
+      ) VALUES (?, ?, ?, 1, 0, ?, ?, 0, ?, ?, NULL, ?, ?, 'pending', ?, ?)
+    `).run(
+      attemptId, instanceId, entry.id, stageRequest.requestHash, stageRequest.idempotencyKey,
+      entry.context, plannedRunId, session.provider_conversation_id, requestPayload, timestamp, timestamp
+    );
     const provisionPayload = canonicalJson({
       pipelineInstanceId: instanceId,
       repository: seed.repository,
@@ -612,7 +711,8 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
     const instance = getInstanceStmt.get(input.instanceId) as PipelineInstance | undefined;
     if (!instance) throw new Error(`unknown pipeline instance ${input.instanceId}`);
     const status = input.generation === instance.generation &&
-      (input.subject == null || instance.immutable_subject == null || input.subject === instance.immutable_subject)
+      (input.kind === "stage_result" || input.subject == null ||
+        instance.immutable_subject == null || input.subject === instance.immutable_subject)
       ? "pending"
       : "stale";
     const payloadHash = digestNormalized(input.payload);
@@ -691,6 +791,32 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
       );
       wrote();
     }
+    if (write.gateReceipt) {
+      const receipt = write.gateReceipt;
+      if (digestNormalized(receipt.payload) !== receipt.hash) {
+        throw new Error(`gate receipt ${receipt.id ?? attempt.id} hash mismatch`);
+      }
+      const artifactHashes = canonicalJson([...receipt.artifactHashes].sort());
+      if (artifactHashes !== canonicalJson(receipt.artifactHashes)) {
+        throw new Error(`gate receipt ${receipt.id ?? attempt.id} artifact hashes are not canonical`);
+      }
+      const acceptedHashes = new Set((write.artifacts ?? []).map((artifact) => artifact.hash));
+      if (receipt.artifactHashes.some((hash) => !acceptedHashes.has(hash))) {
+        throw new Error(`gate receipt ${receipt.id ?? attempt.id} references unaccepted evidence`);
+      }
+      db.prepare(`
+        INSERT INTO pipeline_gate_receipts (
+          id, pipeline_instance_id, attempt_id, evaluator_kind, policy_digest,
+          subject, result, artifact_hashes, receipt_hash, payload, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        receipt.id ?? deterministicId("gate", [instance.id, attempt.id, receipt.hash]),
+        instance.id, attempt.id, receipt.evaluatorKind, receipt.policyDigest,
+        receipt.subject ?? null, receipt.result, artifactHashes, receipt.hash,
+        receipt.payload, timestamp
+      );
+      wrote();
+    }
     db.prepare(`
       UPDATE pipeline_instance_stages
       SET status = ?,
@@ -728,8 +854,9 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
         INSERT INTO pipeline_stage_attempts (
           id, pipeline_instance_id, stage_id, attempt_ordinal, reentry_ordinal,
           request_hash, idempotency_key, context_revision, native_context_policy,
+          planned_run_id, expected_subject, native_session_id, request_payload,
           status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
       `).run(
         write.nextAttempt.id ?? deterministicId("attempt", [
           instance.id, write.nextAttempt.stageId, write.nextAttempt.attemptOrdinal, write.nextAttempt.reentryOrdinal,
@@ -737,7 +864,9 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
         instance.id, write.nextAttempt.stageId, write.nextAttempt.attemptOrdinal,
         write.nextAttempt.reentryOrdinal, write.nextAttempt.requestHash,
         write.nextAttempt.idempotencyKey, write.nextAttempt.contextRevision,
-        write.nextAttempt.contextPolicy, timestamp, timestamp
+        write.nextAttempt.contextPolicy, write.nextAttempt.plannedRunId,
+        write.nextAttempt.expectedSubject, write.nextAttempt.nativeSessionId,
+        write.nextAttempt.requestPayload, timestamp, timestamp
       );
       wrote();
     }
@@ -746,13 +875,14 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
       UPDATE pipeline_instances SET
         status = ?, active_stage_id = ?, wait_reason = ?, state_version = ?,
         attempt_count = attempt_count + ?, reentry_count = reentry_count + ?,
-        immutable_subject = COALESCE(?, immutable_subject), terminal_outcome = ?,
+        immutable_subject = CASE WHEN ? IS NULL THEN immutable_subject ELSE ? END,
+        terminal_outcome = ?,
         updated_at = ?
       WHERE id = ? AND state_version = ? AND status = ?
     `).run(
       write.nextStatus, write.nextStageId ?? null, write.waitReason ?? null, nextVersion,
       write.nextAttempt ? 1 : 0, write.reentryIncrement ?? 0,
-      write.immutableSubject ?? null, write.terminalOutcome ?? null,
+      write.immutableSubject ?? null, write.immutableSubject ?? null, write.terminalOutcome ?? null,
       timestamp, instance.id, write.expectedVersion, write.expectedStatus
     );
     if (update.changes !== 1) throw new Error(`pipeline instance ${instance.id} transition compare-and-set failed`);
@@ -778,6 +908,28 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
     if (consumed.changes !== 1) throw new Error(`pipeline inbox event ${write.eventId} is not pending`);
     wrote();
     return getInstanceStmt.get(instance.id) as PipelineInstance;
+  });
+
+  const bindStageRun = db.transaction((attemptId: string, runId: string): void => {
+    const attempt = getAttemptStmt.get(attemptId) as PipelineStageAttempt | undefined;
+    if (!attempt) throw new Error(`unknown pipeline attempt ${attemptId}`);
+    if (!attempt.planned_run_id || attempt.planned_run_id !== runId) {
+      throw new Error(`pipeline attempt ${attemptId} run does not match its immutable request`);
+    }
+    if (attempt.run_id) {
+      if (attempt.run_id !== runId) throw new Error(`pipeline attempt ${attemptId} is already bound to another run`);
+      return;
+    }
+    const timestamp = now();
+    const update = db.prepare(`
+      UPDATE pipeline_stage_attempts SET run_id = ?, updated_at = ?
+      WHERE id = ? AND run_id IS NULL AND status = 'pending'
+    `).run(runId, timestamp, attemptId);
+    if (update.changes !== 1) throw new Error(`pipeline attempt ${attemptId} is not bindable`);
+    db.prepare(`
+      INSERT INTO run_stage_bindings(run_id, attempt_id, bound_at)
+      VALUES (?, ?, ?)
+    `).run(runId, attemptId, timestamp);
   });
 
   const claimEffects = db.transaction((
@@ -873,6 +1025,23 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
     getAttempt(id) {
       return getAttemptStmt.get(id) as PipelineStageAttempt | undefined;
     },
+    getStageRequest(attemptId) {
+      const attempt = getAttemptStmt.get(attemptId) as PipelineStageAttempt | undefined;
+      if (!attempt?.request_payload) throw new Error(`pipeline attempt ${attemptId} has no complete stage request`);
+      const request = JSON.parse(attempt.request_payload) as StageRequestEnvelope;
+      if (canonicalJson(request) !== attempt.request_payload || request.attemptId !== attempt.id ||
+          request.requestHash !== attempt.request_hash || request.idempotencyKey !== attempt.idempotency_key ||
+          request.runId !== attempt.planned_run_id) {
+        throw new Error(`pipeline attempt ${attemptId} stage request binding mismatch`);
+      }
+      const { requestHash, idempotencyKey, ...withoutFence } = request;
+      const expected = createStageRequestHash(withoutFence);
+      if (requestHash !== expected.requestHash || idempotencyKey !== expected.idempotencyKey) {
+        throw new Error(`pipeline attempt ${attemptId} stage request hash mismatch`);
+      }
+      return request;
+    },
+    bindStageRun,
     getActiveAttempt(instanceId) {
       return db.prepare(`
         SELECT psa.* FROM pipeline_stage_attempts psa

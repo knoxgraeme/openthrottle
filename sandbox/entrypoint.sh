@@ -5,15 +5,17 @@
 # contract this implements, and "Sandbox env contract" for every env var
 # referenced below.
 #
-# Invoked twice per ticket:
+# Invoked for each ticket task or fenced pipeline stage:
 #   - TASK_TYPE=implement : first run, right after the sandbox is created.
 #   - TASK_TYPE=resume    : supervisor re-execs this same script inside the
 #     already-running (or just-restarted) sandbox via the Daytona process
 #     exec API, with RESUME_MESSAGE set. Every phase below is written to be
 #     safe to re-run (idempotent) so the same script serves both cases.
+#   - OT_STAGE_EXECUTION=1: executes one root-fenced stage request and emits a
+#     sealed stage result instead of the legacy completion marker.
 #
-# Never exits without writing a completion marker for the Fly supervisor —
-# see write_run_completion() / the EXIT trap below.
+# Legacy tasks never exit without a completion marker for the Fly supervisor;
+# fenced stages instead write their typed result under /var/lib/openthrottle.
 
 set -euo pipefail
 
@@ -71,6 +73,7 @@ configure_git_identity() {
 
 COMPLETION_WRITTEN=0
 HEARTBEAT_PID=""
+STAGE_EXECUTION="${OT_STAGE_EXECUTION:-0}"
 
 write_run_completion() {
   local exit_code="$1"
@@ -137,6 +140,7 @@ handle_exit() {
   if [[ -n "${OPENCODE_CONFIG_DIR:-}" ]]; then
     rm -rf "$OPENCODE_CONFIG_DIR"
   fi
+  [[ "$STAGE_EXECUTION" == "1" ]] && return 0
   [[ "$COMPLETION_WRITTEN" == "1" ]] && return 0
   COMPLETION_WRITTEN=1
   write_run_completion "$exit_code" || log "ERROR: failed to write completion marker"
@@ -147,8 +151,44 @@ handle_exit() {
 # EXIT trap before doing anything else that could fail.
 # =============================================================================
 
+STAGE_EXPECTED_SUBJECT=""
+STAGE_BASE_COMMIT=""
+if [[ "$STAGE_EXECUTION" == "1" ]]; then
+  : "${OT_STAGE_REQUEST_FILE:?OT_STAGE_REQUEST_FILE is required for stage execution}"
+  : "${OT_STAGE_CONFIG_FILE:?OT_STAGE_CONFIG_FILE is required for stage execution}"
+  : "${OT_STAGE_MANIFEST_FILE:?OT_STAGE_MANIFEST_FILE is required for stage execution}"
+  for sealed_input in "$OT_STAGE_REQUEST_FILE" "$OT_STAGE_CONFIG_FILE" "$OT_STAGE_MANIFEST_FILE"; do
+    [[ "$(stat -c '%U' "$sealed_input")" == "root" ]] \
+      || { log "FATAL: sealed stage input is not root-owned: ${sealed_input}"; exit 1; }
+  done
+  # Validate the complete hash/capability fence before any request field is
+  # used for auth, checkout, or process selection. Mutable provider env is
+  # transport only; the root-owned request is the execution authority.
+  node "${OPT_DIR}/runner/execute-stage.mjs" \
+    --validate-inputs \
+    --request "$OT_STAGE_REQUEST_FILE" \
+    --config "$OT_STAGE_CONFIG_FILE" \
+    --manifest "$OT_STAGE_MANIFEST_FILE"
+  RUN_ID="$(jq -er '.runId' "$OT_STAGE_REQUEST_FILE")"
+  GITHUB_REPO="$(jq -er '.repository' "$OT_STAGE_REQUEST_FILE")"
+  BRANCH_NAME="$(jq -er '.branch' "$OT_STAGE_REQUEST_FILE")"
+  STAGE_BASE_COMMIT="$(jq -er '.baseCommit' "$OT_STAGE_REQUEST_FILE")"
+  BASE_BRANCH="$STAGE_BASE_COMMIT"
+  STAGE_EXPECTED_SUBJECT="$(jq -r '.expectedSubject // empty' "$OT_STAGE_REQUEST_FILE")"
+  AGENT="$(jq -er '.agent' "$OT_STAGE_REQUEST_FILE")"
+  LINEAR_ISSUE_ID="$(jq -er '.issueId' "$OT_STAGE_REQUEST_FILE")"
+  LINEAR_ISSUE_IDENTIFIER="$LINEAR_ISSUE_ID"
+  if [[ "$(jq -er '.capability' "$OT_STAGE_REQUEST_FILE")" == "ce/investigate@1" ]]; then
+    TASK_TYPE="investigate"
+  else
+    TASK_TYPE="implement"
+  fi
+fi
+
 : "${RUN_ID:?RUN_ID is required}"
-: "${RUN_CALLBACK_TOKEN:?RUN_CALLBACK_TOKEN is required}"
+if [[ "$STAGE_EXECUTION" != "1" ]]; then
+  : "${RUN_CALLBACK_TOKEN:?RUN_CALLBACK_TOKEN is required}"
+fi
 
 trap 'handle_exit "$?"' EXIT
 
@@ -278,19 +318,29 @@ fi
 # seal, so this is safe on resume as well as on fresh clones.
 configure_git_identity
 
-if as_agent "git -C '$REPO_DIR' show-ref --verify --quiet 'refs/heads/${BRANCH_NAME}'"; then
+if [[ "$STAGE_EXECUTION" == "1" && -z "$STAGE_EXPECTED_SUBJECT" ]]; then
+  log "initializing stage branch from exact sealed base commit ${STAGE_BASE_COMMIT}"
+  as_agent "git -C '$REPO_DIR' cat-file -e '${STAGE_BASE_COMMIT}^{commit}'"
+  as_agent "git -C '$REPO_DIR' checkout --quiet -B '$BRANCH_NAME' '$STAGE_BASE_COMMIT'"
+  as_agent "git -C '$REPO_DIR' reset --hard --quiet '$STAGE_BASE_COMMIT' && git -C '$REPO_DIR' clean -fdq"
+elif as_agent "git -C '$REPO_DIR' show-ref --verify --quiet 'refs/heads/${BRANCH_NAME}'"; then
   as_agent "git -C '$REPO_DIR' checkout --quiet '$BRANCH_NAME'"
 elif as_agent "git -C '$REPO_DIR' ls-remote --exit-code --heads origin '$BRANCH_NAME'" >/dev/null 2>&1; then
   log "branch exists on origin only — checking out"
   as_agent "git -C '$REPO_DIR' fetch --quiet origin '$BRANCH_NAME'"
   as_agent "git -C '$REPO_DIR' checkout --quiet -b '$BRANCH_NAME' 'origin/${BRANCH_NAME}'"
+elif [[ "$STAGE_EXECUTION" == "1" ]]; then
+  log "stage branch is absent — reconstructing from exact sealed base commit ${STAGE_BASE_COMMIT}"
+  as_agent "git -C '$REPO_DIR' cat-file -e '${STAGE_BASE_COMMIT}^{commit}'"
+  as_agent "git -C '$REPO_DIR' checkout --quiet -b '$BRANCH_NAME' '$STAGE_BASE_COMMIT'"
+  as_agent "git -C '$REPO_DIR' reset --hard --quiet '$STAGE_BASE_COMMIT' && git -C '$REPO_DIR' clean -fdq"
 else
   log "branch does not exist yet — creating from ${BASE_BRANCH}"
   as_agent "git -C '$REPO_DIR' fetch --quiet origin '$BASE_BRANCH'"
   as_agent "git -C '$REPO_DIR' checkout --quiet -b '$BRANCH_NAME' 'origin/${BASE_BRANCH}'"
 fi
 
-if [[ "$TASK_TYPE" == "resume" ]]; then
+if [[ "$TASK_TYPE" == "resume" && "$STAGE_EXECUTION" != "1" ]]; then
   log "resume: pulling latest ${BRANCH_NAME}"
   as_agent "git -C '$REPO_DIR' pull --quiet --ff-only origin '$BRANCH_NAME'" \
     || log "WARNING: fast-forward pull failed — continuing with local branch state"
@@ -299,7 +349,9 @@ fi
 # Push immediately so the branch exists on origin as the human escape hatch,
 # even before the agent makes its first commit. No-op ("Everything
 # up-to-date") on a resume where nothing changed locally.
-as_agent "git -C '$REPO_DIR' push --quiet -u origin '$BRANCH_NAME'"
+if [[ "$STAGE_EXECUTION" != "1" ]]; then
+  as_agent "git -C '$REPO_DIR' push --quiet -u origin '$BRANCH_NAME'"
+fi
 
 # =============================================================================
 # Phase 3 — safety: pre-push hook + sealed .git/config. Claude is invoked
@@ -328,7 +380,7 @@ fi
 # =============================================================================
 log "phase 4: reading .openthrottle.yml"
 
-CONFIG_FILE="${REPO_DIR}/.openthrottle.yml"
+CONFIG_FILE="${OT_STAGE_CONFIG_FILE:-${REPO_DIR}/.openthrottle.yml}"
 
 # $1 = yq filter (applied with a `// "<default>"` fallback), $2 = default.
 yq_get() { yq_value_or_default "$CONFIG_FILE" "$1" "$2"; }
@@ -443,6 +495,25 @@ if [[ "${#POST_BOOTSTRAP_CMDS[@]}" -gt 0 ]]; then
   done
 else
   log "no post_bootstrap commands configured"
+fi
+
+if [[ "$STAGE_EXECUTION" == "1" ]]; then
+  log "phase 6-8: fenced one-stage executor"
+  for sealed_input in "$OT_STAGE_REQUEST_FILE" "$OT_STAGE_CONFIG_FILE" "$OT_STAGE_MANIFEST_FILE"; do
+    chmod 0400 "$sealed_input"
+  done
+  install -d -o root -g root -m 0700 /var/lib/openthrottle/stage-results
+  mkdir -p "${OT_DIR}/stage" "${AGENT_HOME}/.claude/skills"
+  if [[ -d "${OPT_DIR}/skills/tasks" ]]; then
+    cp -r "${OPT_DIR}/skills/tasks/." "${AGENT_HOME}/.claude/skills/"
+  fi
+  chown -R "${AGENT_USER}:${AGENT_USER}" "${OT_DIR}/stage" "${AGENT_HOME}/.claude"
+  node "${OPT_DIR}/runner/execute-stage.mjs" \
+    --request "$OT_STAGE_REQUEST_FILE" \
+    --config "$OT_STAGE_CONFIG_FILE" \
+    --manifest "$OT_STAGE_MANIFEST_FILE" \
+    --repo "$REPO_DIR"
+  exit 0
 fi
 
 # =============================================================================

@@ -6,11 +6,16 @@ import { reconcileSandboxAutostop } from "./sandbox-lifecycle.js";
 import { isGithubPullRequestUrl } from "./github.js";
 import { MAX_PRIVATE_LOG_TAIL_BYTES, MAX_PRIVATE_LOG_TAIL_CHARS } from "./logs.js";
 import { sanitizeText } from "./sanitize.js";
+import { STAGE_OUTCOMES } from "./pipeline-manifest.js";
+import type { PipelineCoordinatorEvent, PipelineEventArtifact } from "./pipeline-coordinator.js";
 
 const OUTBOX_DIR = "/home/agent/.ot/outbox";
 const SEALED_HEARTBEAT_FILE = "/var/lib/openthrottle/heartbeat/heartbeat.json";
+const SEALED_STAGE_RESULT_DIR = "/var/lib/openthrottle/stage-results";
+const WORKSPACE_SUBJECT_COMMAND = "node /opt/openthrottle/runner/execute-stage.mjs --print-subject --repo /home/agent/repo";
 const TASK_LOG_TAIL_COMMAND = `tail -c ${MAX_PRIVATE_LOG_TAIL_BYTES} /home/agent/.ot/task.log`;
 const MAX_EVENT_BYTES = 32 * 1024;
+const MAX_STAGE_EVENT_BYTES = 64 * 1024;
 const MAX_BODY_LENGTH = 8_000;
 const EVENT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RUN_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
@@ -30,7 +35,25 @@ const PLAN_STATUSES: ReadonlyArray<AgentPlanStatus> = [
 const MAX_PLAN_ITEMS = 50;
 const MAX_PLAN_CONTENT = 500;
 
-export type SandboxEvent = SandboxActivityEvent | SandboxPlanEvent | SandboxCompletionEvent | SandboxHeartbeatEvent;
+export type SandboxEvent = SandboxActivityEvent | SandboxPlanEvent | SandboxCompletionEvent | SandboxHeartbeatEvent | SandboxStageResultEvent;
+
+export interface SandboxStageResultEvent {
+  version: 1;
+  kind: "stage_result";
+  event_id: string;
+  run_id: string;
+  created_at: string;
+  pipeline_instance_id: string;
+  generation: number;
+  stage_id: string;
+  attempt_id: string;
+  request_hash: string;
+  outcome: PipelineCoordinatorEvent["outcome"];
+  result_hash: string;
+  native_session_id: string | null;
+  subject: string;
+  artifacts: PipelineEventArtifact[];
+}
 
 interface SandboxHeartbeatEvent {
   version: 1;
@@ -109,9 +132,11 @@ function parsePlanItems(value: unknown): AgentPlanItem[] {
 }
 
 export function parseSandboxEvent(raw: string): SandboxEvent {
-  if (Buffer.byteLength(raw) > MAX_EVENT_BYTES) throw new Error("sandbox event is too large");
+  const rawBytes = Buffer.byteLength(raw);
+  if (rawBytes > MAX_STAGE_EVENT_BYTES) throw new Error("sandbox event is too large");
   const value: unknown = JSON.parse(raw);
   if (!isRecord(value) || value.version !== 1) throw new Error("unsupported sandbox event");
+  if (value.kind !== "stage_result" && rawBytes > MAX_EVENT_BYTES) throw new Error("sandbox event is too large");
   if (typeof value.event_id !== "string" || !EVENT_ID_PATTERN.test(value.event_id)) {
     throw new Error("sandbox event has an invalid event_id");
   }
@@ -129,6 +154,65 @@ export function parseSandboxEvent(raw: string): SandboxEvent {
       event_id: value.event_id,
       run_id: value.run_id,
       created_at: value.created_at,
+    };
+  }
+  if (value.kind === "stage_result") {
+    const id = (field: unknown, label: string) => {
+      if (typeof field !== "string" || !RUN_ID_PATTERN.test(field)) throw new Error(`stage result has invalid ${label}`);
+      return field;
+    };
+    const sha = (field: unknown, label: string) => {
+      if (typeof field !== "string" || !/^[a-f0-9]{64}$/.test(field)) throw new Error(`stage result has invalid ${label}`);
+      return field;
+    };
+    if (!Number.isSafeInteger(value.generation) || (value.generation as number) < 1) {
+      throw new Error("stage result has invalid generation");
+    }
+    if (!STAGE_OUTCOMES.includes(value.outcome as never)) throw new Error("stage result has invalid outcome");
+    if (value.native_session_id !== null &&
+        (typeof value.native_session_id !== "string" || !RUN_ID_PATTERN.test(value.native_session_id))) {
+      throw new Error("stage result has invalid native_session_id");
+    }
+    if (typeof value.subject !== "string" || !/^[a-f0-9]{40,64}$/.test(value.subject)) {
+      throw new Error("stage result has invalid subject");
+    }
+    if (!Array.isArray(value.artifacts) || value.artifacts.length < 1 || value.artifacts.length > 8) {
+      throw new Error("stage result has invalid artifacts");
+    }
+    const artifacts = value.artifacts.map((entry, index): PipelineEventArtifact => {
+      if (!isRecord(entry)) throw new Error(`stage result artifact ${index} is invalid`);
+      if (typeof entry.kind !== "string" || entry.kind.length > 80 ||
+          !Number.isSafeInteger(entry.schema_version) || (entry.schema_version as number) < 1 ||
+          typeof entry.assurance !== "string" || entry.assurance.length > 80 ||
+          typeof entry.subject !== "string" || !/^[a-f0-9]{40,64}$/.test(entry.subject) ||
+          typeof entry.payload !== "string" || Buffer.byteLength(entry.payload, "utf8") > 256 * 1024) {
+        throw new Error(`stage result artifact ${index} is invalid`);
+      }
+      return {
+        kind: entry.kind,
+        schemaVersion: entry.schema_version as number,
+        assurance: entry.assurance as PipelineEventArtifact["assurance"],
+        subject: entry.subject,
+        payload: entry.payload,
+        hash: sha(entry.hash, `artifact ${index} hash`),
+      };
+    });
+    return {
+      version: 1,
+      kind: "stage_result",
+      event_id: value.event_id,
+      run_id: value.run_id,
+      created_at: value.created_at,
+      pipeline_instance_id: id(value.pipeline_instance_id, "pipeline_instance_id"),
+      generation: value.generation as number,
+      stage_id: id(value.stage_id, "stage_id"),
+      attempt_id: id(value.attempt_id, "attempt_id"),
+      request_hash: sha(value.request_hash, "request_hash"),
+      outcome: value.outcome as PipelineCoordinatorEvent["outcome"],
+      result_hash: sha(value.result_hash, "result_hash"),
+      native_session_id: value.native_session_id as string | null,
+      subject: value.subject,
+      artifacts,
     };
   }
   if (value.kind === "activity") {
@@ -263,6 +347,7 @@ interface SandboxEventFile {
   remotePath: string;
   size: number;
   sealedHeartbeat: boolean;
+  sealedStageResult: boolean;
   prefetched?: Buffer;
 }
 
@@ -275,6 +360,7 @@ async function listEventFiles(sandbox: Sandbox): Promise<SandboxEventFile[]> {
       remotePath: `${OUTBOX_DIR}/${file.name}`,
       size: file.size,
       sealedHeartbeat: false,
+      sealedStageResult: false,
     }));
   try {
     const heartbeat = await sandbox.fs.downloadFile(SEALED_HEARTBEAT_FILE);
@@ -284,13 +370,39 @@ async function listEventFiles(sandbox: Sandbox): Promise<SandboxEventFile[]> {
         remotePath: SEALED_HEARTBEAT_FILE,
         size: heartbeat.length,
         sealedHeartbeat: true,
+        sealedStageResult: false,
         prefetched: heartbeat,
       });
     }
   } catch {
     // No sealed pulse has landed yet.
   }
+  try {
+    const stageResults = await sandbox.fs.listFiles(SEALED_STAGE_RESULT_DIR);
+    events.push(...stageResults
+      .filter((file) => !file.isDir && /^[A-Za-z0-9._-]+\.json$/.test(file.name) &&
+        (!file.path || file.path.startsWith(`${SEALED_STAGE_RESULT_DIR}/`)))
+      .map((file) => ({
+        name: `100-stage-${file.name}`,
+        remotePath: `${SEALED_STAGE_RESULT_DIR}/${file.name}`,
+        size: file.size,
+        sealedHeartbeat: false,
+        sealedStageResult: true,
+      })));
+  } catch {
+    // No sealed stage result has landed yet.
+  }
   return events.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+async function readWorkspaceSubject(sandbox: Sandbox): Promise<string> {
+  if (!sandbox.process?.executeCommand) throw new Error("sandbox cannot attest the current workspace subject");
+  const result = await sandbox.process.executeCommand(WORKSPACE_SUBJECT_COMMAND, undefined, undefined, 30);
+  const subject = result.result?.trim();
+  if (result.exitCode !== 0 || !subject || !/^[a-f0-9]{40,64}$/.test(subject)) {
+    throw new Error("sandbox current workspace subject attestation failed");
+  }
+  return subject;
 }
 
 async function readTaskLogTail(sandbox: Sandbox, callbackToken: string): Promise<string | undefined> {
@@ -334,6 +446,7 @@ interface SandboxEventPollerParams {
   // Best-effort read-back of a rotating agent credential (Codex refresh token)
   // from the sandbox after a run completes. Must not throw.
   captureAgentAuth?: (sandbox: Sandbox, ticket: Ticket) => Promise<void>;
+  postStageResult?: (event: SandboxStageResultEvent, observedSubject: string) => Promise<unknown>;
 }
 
 async function pollTicketEvents(
@@ -367,7 +480,8 @@ async function pollTicketEvents(
 
   for (const file of files) {
     const remotePath = file.remotePath;
-    if (file.size > MAX_EVENT_BYTES) {
+    const eventLimit = file.sealedStageResult ? MAX_STAGE_EVENT_BYTES : MAX_EVENT_BYTES;
+    if (file.size > eventLimit) {
       console.error(`[sandbox-events] deleting oversized event ${file.name}`);
       await sandbox.fs.deleteFile(remotePath).catch(() => undefined);
       continue;
@@ -385,7 +499,9 @@ async function pollTicketEvents(
 
     if (
       (event.kind === "heartbeat" && !file.sealedHeartbeat) ||
-      (event.kind !== "heartbeat" && file.sealedHeartbeat)
+      (event.kind !== "heartbeat" && file.sealedHeartbeat) ||
+      (event.kind === "stage_result" && !file.sealedStageResult) ||
+      (event.kind !== "stage_result" && file.sealedStageResult)
     ) {
       console.error(`[sandbox-events] deleting event with invalid trust origin ${file.name}`);
       await sandbox.fs.deleteFile(remotePath).catch(() => undefined);
@@ -404,7 +520,18 @@ async function pollTicketEvents(
       sandboxId: ticket.sandbox_id,
       kind: event.kind,
       payload: JSON.stringify(
-        event.kind === "activity"
+        event.kind === "stage_result"
+          ? {
+              version: event.version,
+              kind: event.kind,
+              event_id: event.event_id,
+              run_id: event.run_id,
+              pipeline_instance_id: event.pipeline_instance_id,
+              attempt_id: event.attempt_id,
+              request_hash: event.request_hash,
+              result_hash: event.result_hash,
+            }
+          : event.kind === "activity"
           ? {
               ...event,
               body: sanitizeText(event.body),
@@ -488,6 +615,9 @@ async function pollTicketEvents(
             eventId: event.event_id,
           });
         }
+      } else if (event.kind === "stage_result") {
+        if (!params.postStageResult) throw new Error("sealed stage result handler is not configured");
+        await params.postStageResult(event, await readWorkspaceSubject(sandbox));
       } else {
         const logTail = await readTaskLogTail(sandbox, event.token);
         // Capture the token the run rotated in the sandbox BEFORE finishing:
