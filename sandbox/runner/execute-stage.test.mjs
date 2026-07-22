@@ -128,6 +128,27 @@ describe("one-stage executor", () => {
       .toMatch(/^\$investigate/);
   });
 
+  it("renders the canonical adapter body for OpenCode fenced stages", () => {
+    const skillRoot = mkdtempSync(join(tmpdir(), "ot-stage-skills-"));
+    directories.push(skillRoot);
+    mkdirSync(join(skillRoot, "implement-plan"), { recursive: true });
+    writeFileSync(
+      join(skillRoot, "implement-plan", "SKILL.md"),
+      "---\nname: implement-plan\n---\nUse $ce-work mode:return-to-caller for this fenced stage.\n"
+    );
+    const prompt = stagePrompt(
+      { ...fixture().request, capability: "ce/implement@1" },
+      "/tmp/proposal.json",
+      {
+      agent: "opencode",
+      skillRoot,
+      }
+    );
+    expect(prompt).toContain("$implement-plan");
+    expect(prompt).toContain("Use $ce-work mode:return-to-caller");
+    expect(prompt).not.toContain("name: implement-plan");
+  });
+
   it("rejects wrong sealed config/manifest digests before invocation", () => {
     const input = fixture();
     const runAgent = vi.fn();

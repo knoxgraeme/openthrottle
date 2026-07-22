@@ -251,7 +251,7 @@ function setAuthoritativeGithubHead(store: TicketStore, issueId: string, headSha
   store.setSetting(`github-head-source:${issueId}`, "authoritative");
 }
 
-function considerCiGithubHead(
+export function considerCiGithubHead(
   store: TicketStore,
   issueId: string,
   headSha: string,
@@ -260,22 +260,19 @@ function considerCiGithubHead(
 ): void {
   const headKey = `github-head:${issueId}`;
   const sourceKey = `github-head-source:${issueId}`;
+  const watermarkKey = `github-head-watermark:${issueId}:${source}`;
   const currentHead = store.getSetting(headKey);
   const rawSource = store.getSetting(sourceKey);
-  let currentSource: { source: string; sequence: number } | undefined;
-  try {
-    currentSource = rawSource && rawSource !== "authoritative"
-      ? JSON.parse(rawSource) as { source: string; sequence: number }
-      : undefined;
-  } catch {
-    currentSource = undefined;
-  }
+  const priorSequence = Number(store.getSetting(watermarkKey));
+  if (rawSource === "authoritative" ||
+      (Number.isSafeInteger(priorSequence) && sequence <= priorSequence)) return;
   const canAdvance =
     !currentHead ||
     currentHead.startsWith("unknown:") ||
     currentHead === headSha ||
-    (currentSource?.source === source && sequence > currentSource.sequence);
-  if (!canAdvance || rawSource === "authoritative") return;
+    rawSource !== "authoritative";
+  if (!canAdvance) return;
+  store.setSetting(watermarkKey, String(sequence));
   store.setSetting(headKey, headSha);
   store.setSetting(sourceKey, JSON.stringify({ source, sequence }));
 }

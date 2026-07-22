@@ -42,6 +42,24 @@ function parseRequest(effect: PipelineEffectIntent, store: PipelineStore): Stage
   return sealed;
 }
 
+function parseProvisionRequest(effect: PipelineEffectIntent, store: PipelineStore): StageRequestEnvelope {
+  const control = JSON.parse(effect.payload) as { attemptId?: unknown; requestHash?: unknown };
+  if (typeof control.attemptId !== "string" || typeof control.requestHash !== "string") {
+    throw new Error(`pipeline provision effect ${effect.id} has no sealed attempt fence`);
+  }
+  const attempt = store.getAttempt(control.attemptId);
+  if (!attempt || attempt.pipeline_instance_id !== effect.pipeline_instance_id ||
+      attempt.request_hash !== control.requestHash) {
+    throw new Error(`pipeline provision effect ${effect.id} attempt fence mismatch`);
+  }
+  const request = store.getStageRequest(attempt.id);
+  if (request.pipelineInstanceId !== effect.pipeline_instance_id ||
+      request.requestHash !== control.requestHash) {
+    throw new Error(`pipeline provision effect ${effect.id} sealed request mismatch`);
+  }
+  return request;
+}
+
 export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps): PipelineEffectProcessor {
   const now = deps.now ?? (() => new Date());
   let draining = false;
@@ -134,7 +152,20 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       await bootstrap(instance, resource);
       const request = effect.kind === "dispatch_stage"
         ? parseRequest(effect, deps.store)
-        : deps.store.getStageRequest(deps.store.getActiveAttempt(instance.id)!.id);
+        : parseProvisionRequest(effect, deps.store);
+      const requestedAttempt = deps.store.getAttempt(request.attemptId);
+      if (effect.kind === "provision" && requestedAttempt &&
+          ["completed", "canceled", "superseded", "failed"].includes(requestedAttempt.status)) {
+        deps.store.recordEffectAcknowledgement({
+          effectId: effect.id,
+          eventId,
+          payload: canonicalJson({
+            providerResourceId: resource.providerResourceId,
+            providerDispatchId: `already-transitioned:${request.attemptId}`,
+          }),
+        });
+        return;
+      }
       const dispatched = await dispatch(instance, resource, request);
       deps.store.recordEffectAcknowledgement({
         effectId: effect.id,

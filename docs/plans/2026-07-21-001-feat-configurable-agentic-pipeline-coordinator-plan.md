@@ -11,6 +11,14 @@ execution: code
 
 # Configurable Agentic Pipeline Coordinator
 
+> **POC implementation decision (2026-07-22):** OpenThrottle has no installed
+> consumers or production traffic. The implementation therefore selects the
+> coordinator for every new generation and omits the plan's repository canary,
+> legacy-drain, and production soak machinery. The credentialed live acceptance
+> is explicitly deferred; all local gates and the stubbed Docker lifecycle remain
+> required. Historical migration columns may remain until a separate schema
+> contraction change.
+
 ## Goal Capsule
 
 | Field | Contract |

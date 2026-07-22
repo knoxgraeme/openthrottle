@@ -79,12 +79,40 @@ export function createFeedbackStore(db: Database.Database): FeedbackStore {
       };
     }
 
+    // Conversation comments survive head changes and must never share the
+    // unique commit-scoped snapshot key with reviews/checks. Provider events
+    // retain the actual head SHA; only the snapshot grouping key is namespaced.
+    const snapshotHeadSha = params.kind === "issue_comment"
+      ? `conversation:${params.headSha}`
+      : params.headSha;
     let snapshot = db.prepare(`
       SELECT * FROM feedback_snapshots
       WHERE linear_issue_id = ? AND linear_session_id = ? AND generation = ?
         AND head_sha = ? AND status = 'collecting'
+        AND (
+          (? = 'issue_comment' AND NOT EXISTS (
+            SELECT 1 FROM feedback_snapshot_events fse
+            JOIN provider_events pe
+              ON pe.provider = fse.provider AND pe.provider_event_id = fse.provider_event_id
+            WHERE fse.snapshot_id = feedback_snapshots.id AND pe.kind <> 'issue_comment'
+          ))
+          OR
+          (? <> 'issue_comment' AND NOT EXISTS (
+            SELECT 1 FROM feedback_snapshot_events fse
+            JOIN provider_events pe
+              ON pe.provider = fse.provider AND pe.provider_event_id = fse.provider_event_id
+            WHERE fse.snapshot_id = feedback_snapshots.id AND pe.kind = 'issue_comment'
+          ))
+        )
       ORDER BY created_at, id LIMIT 1
-    `).get(params.issueId, params.sessionId, params.generation, params.headSha) as
+    `).get(
+      params.issueId,
+      params.sessionId,
+      params.generation,
+      snapshotHeadSha,
+      params.kind,
+      params.kind
+    ) as
       | FeedbackSnapshot
       | undefined;
     let snapshotCreated = false;
@@ -106,7 +134,7 @@ export function createFeedbackStore(db: Database.Database): FeedbackStore {
         params.issueId,
         params.sessionId,
         params.generation,
-        params.headSha,
+        snapshotHeadSha,
         `${receivedAt}:${params.provider}:${params.providerEventId}`,
         workItemId,
         receivedAt

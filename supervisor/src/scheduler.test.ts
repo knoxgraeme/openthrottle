@@ -6,7 +6,6 @@ import {
   feedbackMessage,
   isAutomaticWorkBounded,
   isResolvableFeedbackWorkId,
-  legacyDrainReport,
   selectExecutionMode,
   shouldNudgeAfterRun,
   type DrainParams,
@@ -14,32 +13,15 @@ import {
 } from "./scheduler.js";
 
 describe("selectExecutionMode", () => {
-  it("applies admission only to unpinned generations", () => {
-    expect(selectExecutionMode({ pipelineAdmissionEnabled: false })).toBe("legacy");
-    expect(selectExecutionMode({ pipelineAdmissionEnabled: true })).toBe("pipeline");
-    expect(selectExecutionMode({ pinnedMode: "legacy", pipelineAdmissionEnabled: true })).toBe("legacy");
-    expect(selectExecutionMode({ pinnedMode: "pipeline", pipelineAdmissionEnabled: false })).toBe("pipeline");
-    expect(selectExecutionMode({
-      pipelineAdmissionEnabled: true,
-      repository: "owner/canary",
-      admittedRepositories: ["owner/canary"],
-    })).toBe("pipeline");
-    expect(selectExecutionMode({
-      pipelineAdmissionEnabled: true,
-      repository: "owner/production",
-      admittedRepositories: ["owner/canary"],
-    })).toBe("legacy");
-    expect(selectExecutionMode({
-      pinnedMode: "pipeline",
-      pipelineAdmissionEnabled: false,
-      repository: "owner/production",
-      admittedRepositories: ["owner/canary"],
-    })).toBe("pipeline");
+  it("selects the coordinator for every new generation and preserves an existing pin", () => {
+    expect(selectExecutionMode({})).toBe("pipeline");
+    expect(selectExecutionMode({ pinnedMode: "legacy" })).toBe("legacy");
+    expect(selectExecutionMode({ pinnedMode: "pipeline" })).toBe("pipeline");
   });
 });
 
-describe("cutover reporting", () => {
-  it("counts pinned modes and refuses to call legacy drained while any cross-domain obligation remains", () => {
+describe("execution reporting", () => {
+  it("counts pinned modes without a rollout drain gate", () => {
     const store = createTicketStore(openDb(":memory:"));
     store.upsert({
       linear_issue_id: "legacy-issue",
@@ -58,13 +40,6 @@ describe("cutover reporting", () => {
       waiting: 0,
       publication_blocked: 0,
     });
-    expect(legacyDrainReport(store, "2026-07-22T00:00:00.000Z")).toMatchObject({
-      drained: false,
-      obligations: { active_tickets: 1, sandbox_resources: 1 },
-    });
-    store.setSandboxId("legacy-issue", null);
-    store.setState("legacy-issue", "closed");
-    expect(legacyDrainReport(store).drained).toBe(true);
     store.db.close();
   });
 });
@@ -378,6 +353,49 @@ describe("drainNextSessionWork terminal-state guard", () => {
       "SELECT status FROM feedback_snapshots WHERE work_item_id = 'gh-ci-head-old'"
     ).get()).toEqual({ status: "stale" });
     expect(store.claimNextSessionWork("session-1", new Date().toISOString())).toBeUndefined();
+  });
+
+  it("delivers PR conversation comments even when the branch head advances before claim", async () => {
+    const store = makeStore();
+    store.recordProviderFeedback({
+      provider: "github",
+      providerEventId: "comment:old-head",
+      issueId: "issue-1",
+      sessionId: "session-1",
+      generation: 1,
+      repository: "owner/repo",
+      pullNumber: 1,
+      headSha: "head-before-comment",
+      kind: "issue_comment",
+      payload: '{"body":"please also cover the empty case"}',
+      workItemId: "gh-comment-old-head",
+      workBody: "please also cover the empty case",
+    });
+    store.enqueueSessionWork({
+      id: "gh-comment-old-head",
+      linearSessionId: "session-1",
+      issueId: "issue-1",
+      source: "automatic",
+      body: "please also cover the empty case",
+    });
+    store.setSetting("github-head:issue-1", "head-after-comment");
+    const launch: LaunchExistingTask = async (params) => {
+      store.beginRun({
+        issueId: params.ticket.linear_issue_id,
+        runId: "run-comment",
+        taskType: params.taskType,
+        tokenHash: "hash",
+        expiresAt: "2999-01-01T00:00:00.000Z",
+      });
+      return true;
+    };
+
+    expect(await drainNextSessionWork(
+      makeParams(store, store.getByIssueId("issue-1")!, launch)
+    )).toBe(true);
+    expect(store.db.prepare(
+      "SELECT status FROM feedback_snapshots WHERE work_item_id = 'gh-comment-old-head'"
+    ).get()).toEqual({ status: "consumed" });
   });
 
   it("cancels a human reply only after its live steer is acknowledged", async () => {

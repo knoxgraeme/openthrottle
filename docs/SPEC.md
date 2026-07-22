@@ -94,18 +94,15 @@ Linear AgentSessionEvent ──HMAC──> Fly supervisor ──@daytona/sdk─�
    inert no-op; Fly uploads the latest Linear context and run credentials,
    then explicitly starts the requested task in a Daytona process session.
 
-While `PIPELINE_COORDINATOR_ENABLED=false` (the default), this is the legacy
-path above. When admission is explicitly enabled for a new generation, the
-supervisor first resolves the base branch to an exact commit, fetches and
+For every new generation, the supervisor resolves the base branch to an exact
+commit, fetches and
 validates `.openthrottle.yml` at that commit, pins catalog/config/runtime
 digests, and atomically creates the pipeline instance, stage graph, first
-attempt, and provision intent. Existing generations retain their pinned
-`legacy` or `pipeline` mode across restart and flag changes. A durable effect
+attempt, and provision intent. A durable effect
 worker provisions and bootstraps the runtime, materializes only the stage's
 declared credential scopes, acquires the ticket actor, and dispatches the
-sealed stage request. The global admission flag and optional repository cohort
-affect future generations only; disabling the flag never converts an active
-pipeline generation to legacy.
+sealed stage request. Historical execution-mode columns remain migration
+scaffolding only and do not route new POC work.
 
 ### Pipeline stage lifecycle
 
@@ -353,7 +350,7 @@ sandbox-event poll interval.
 | `POST` | `/webhooks/github` | GitHub `sha256=` HMAC | PR/review/CI events |
 | `GET` | `/oauth/install` | `OT_INSTALL_SECRET` bearer | start Linear OAuth |
 | `GET` | `/oauth/callback` | one-time OAuth state | exchange/store token |
-| `GET` | `/status` | `OT_STATUS_TOKEN` bearer | admission policy, execution summary, legacy-drain predicate, and ticket list |
+| `GET` | `/status` | `OT_STATUS_TOKEN` bearer | execution summary, pipeline state, and ticket list |
 | `GET` | `/repositories` | `OT_STATUS_TOKEN` bearer | registered target list |
 | `POST` | `/repositories/register` | `OT_STATUS_TOKEN` bearer | verify and upsert a target route/webhook |
 | `POST` | `/tickets/:id/stop` | `OT_STATUS_TOKEN` bearer | stop a ticket |
@@ -513,15 +510,12 @@ Required unless noted:
   is claimed for reaping; before the first heartbeat, `started_at` is the
   liveness origin. Termination must be confirmed before release, otherwise the
   actor is quarantined, independent of the hard `TASK_TIMEOUT` wall clock.
-- Pipeline admission: `PIPELINE_COORDINATOR_ENABLED=false`, optional
-  comma-separated `PIPELINE_COORDINATOR_REPOSITORIES` canary cohort (an empty
-  cohort means all routed repositories only when the flag is true), optional
-  `PIPELINE_CATALOG_PATH` (defaults to the catalog shipped in the supervisor
+- Pipeline coordinator: optional `PIPELINE_CATALOG_PATH` (defaults to the catalog shipped in the supervisor
   image), `SANDBOX_RUNTIME_RELEASE=openthrottle-snapshot/v1`, and optional
   `SANDBOX_RUNTIME_DESCRIPTOR_PATH` (the independently generated descriptor
   shipped for that runtime release). The supervisor
   validates and durably accepts the full catalog against the independently
-  built runtime capability descriptor at boot even while admission is off;
+  built runtime capability descriptor at boot;
   reusing an accepted pipeline version or runtime release with different
   normalized content fails startup.
 

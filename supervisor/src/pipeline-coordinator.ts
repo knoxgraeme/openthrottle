@@ -309,6 +309,9 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
   if (transition.to) {
     const target = input.manifest.stages.find((candidate) => candidate.id === transition.to);
     if (!target) throw new Error(`transition target ${transition.to} is absent from the pinned manifest`);
+    if (target.executor.kind === "provider_wait" && !input.event.subject) {
+      throw new Error(`stage ${stage.id} cannot enter provider wait without an exact subject`);
+    }
     const isReentry = target.id === stage.id ||
       input.manifest.stages.findIndex((candidate) => candidate.id === target.id) <=
         input.manifest.stages.findIndex((candidate) => candidate.id === stage.id);

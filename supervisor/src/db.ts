@@ -644,10 +644,13 @@ export function createTicketStore(db: Database.Database): TicketStore {
   const pipelineStore = createPipelineStore(db);
   const hashPayload = (payload: string) => createHash("sha256").update(payload).digest("hex");
   const claimFeedbackSnapshot = (snapshot: FeedbackSnapshot, maxRounds: number) => {
+    const events = feedbackStore.listEvents(snapshot.id);
+    const isConversationSnapshot = events.length > 0 &&
+      events.every((event) => event.kind === "issue_comment");
     const currentHead = (db.prepare("SELECT value FROM settings WHERE key = ?").get(
       `github-head:${snapshot.linear_issue_id}`
     ) as { value: string } | undefined)?.value;
-    if (currentHead && currentHead !== snapshot.head_sha) {
+    if (!isConversationSnapshot && currentHead && currentHead !== snapshot.head_sha) {
       db.prepare(`
         UPDATE feedback_snapshots SET status = 'stale'
         WHERE id = ? AND status IN ('collecting', 'claimed')
@@ -656,7 +659,7 @@ export function createTicketStore(db: Database.Database): TicketStore {
     }
     const claim = feedbackStore.claim(snapshot.id, maxRounds);
     return claim.status === "claimed"
-      ? { ...claim, events: feedbackStore.listEvents(snapshot.id) }
+      ? { ...claim, events }
       : claim;
   };
   const upsertStmt = db.prepare(`

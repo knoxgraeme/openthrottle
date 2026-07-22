@@ -459,9 +459,28 @@ export function createGithubPublicationProcessor(params: {
   async function deliver(publication: PipelinePublicationReceipt): Promise<void> {
     const instance = params.store.getInstance(publication.pipeline_instance_id);
     if (!instance) throw new Error(`unknown pipeline instance ${publication.pipeline_instance_id}`);
-    const ticket = params.tickets.getByIssueId(instance.linear_issue_id);
-    if (!ticket?.pr_url) throw new Error("pipeline pull request is not available yet");
-    const pull = parsePullRequestUrl(ticket.pr_url);
+    let bound = publication;
+    if (!bound.target_url) {
+      const ticket = params.tickets.getByIssueId(instance.linear_issue_id);
+      if (!ticket?.pr_url) throw new Error("pipeline pull request is not available yet");
+      if (ticket.linear_session_id !== instance.linear_session_id) {
+        throw new Error("pipeline publication no longer has its original session binding");
+      }
+      const persisted = params.store.bindGithubPublicationTarget(
+        publication.id,
+        publication.payload_hash,
+        ticket.pr_url
+      );
+      if (!persisted) throw new Error("pipeline publication target binding is stale");
+      bound = persisted;
+    }
+    const current = params.store.getPublication(publication.id);
+    if (!current || current.pipeline_instance_id !== publication.pipeline_instance_id ||
+        current.payload_hash !== publication.payload_hash || current.status !== "processing" ||
+        current.target_url !== bound.target_url) {
+      throw new Error("pipeline publication changed before delivery");
+    }
+    const pull = parsePullRequestUrl(bound.target_url!);
     if (pull.host !== "github.com" || pull.repo.toLowerCase() !== instance.repository.toLowerCase()) {
       throw new Error("invalid pipeline pull request binding for the pinned instance");
     }

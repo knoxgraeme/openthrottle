@@ -47,7 +47,6 @@ function config(): Config {
     allowLinearMerge: false,
     sandboxEventPollIntervalMs: 5_000,
     stallTimeoutSeconds: 900,
-    pipelineAdmissionEnabled: true,
     pipelineCatalogPath: catalogPath,
     sandboxRuntimeRelease: "admission-test/v1",
     sandboxRuntimeDescriptorPath: "pipelines/runtime-capabilities-v1.json",
@@ -199,12 +198,12 @@ mcp_servers: {}
     });
   });
 
-  it("keeps an existing session pinned when the admission flag changes", async () => {
+  it("keeps an existing coordinator session pinned on a duplicate delegation", async () => {
     const { pipelines, githubFetch, invoke } = await run("pipelines: { implement: implement }\n");
     const before = pipelines.getInstanceForSession("session-1")!;
     expect(pipelines.getSessionExecutionMode("session-1")).toBe("pipeline");
 
-    await invoke({ pipelineAdmissionEnabled: false });
+    await invoke();
 
     expect(pipelines.getInstanceForSession("session-1")).toEqual(before);
     expect(githubFetch).toHaveBeenCalledTimes(2);

@@ -25,7 +25,6 @@ describe('operator commands', () => {
     const fetchMock = vi.fn(
       async (_input: string | URL | Request, _init?: RequestInit) => Response.json({
         execution_summary: { legacy: 1, pipeline: 1, waiting: 0, publication_blocked: 1 },
-        legacy_drain: { drained: false, total_obligations: 3 },
         tickets: [
           {
             linear_issue_identifier: 'OT-1',
@@ -84,7 +83,6 @@ describe('operator commands', () => {
     expect(output.mock.calls.flat().join('\n')).toContain('implement');
     expect(output.mock.calls.flat().join('\n')).toContain('0123456789ab');
     expect(output.mock.calls.flat().join('\n')).toContain('legacy=1 pipeline=1');
-    expect(output.mock.calls.flat().join('\n')).toContain('Legacy drain: blocked (3 obligations)');
   });
 
   it('stops an encoded ticket with the operator endpoint', async () => {

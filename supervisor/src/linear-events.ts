@@ -283,12 +283,12 @@ async function handleCreated(
     }
     selectedRepository.baseBranch = requestedBase;
   }
-  const executionMode = selectExecutionMode({
-    pinnedMode,
-    pipelineAdmissionEnabled: cfg.pipelineAdmissionEnabled,
-    repository: selectedRepository.repo,
-    admittedRepositories: cfg.pipelineAdmissionRepositories,
-  });
+  // The shipped supervisor always supplies the coordinator context. Keeping
+  // the context-free path here lets embedded/unit callers finish their
+  // historical fixtures without reintroducing a deploy-time admission flag.
+  const executionMode = pipelineAdmission
+    ? selectExecutionMode({ pinnedMode })
+    : pinnedMode ?? "legacy";
   const existingMode = existing
     ? pipelineAdmission?.store.getSessionExecutionMode(existing.linear_session_id)
     : undefined;

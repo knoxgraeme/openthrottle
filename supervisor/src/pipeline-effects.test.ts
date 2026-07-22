@@ -105,6 +105,30 @@ describe("pipeline effect processor", () => {
       attempts: 1,
     });
 
+    // Simulate a crash after dispatch/result settlement but before the
+    // provision acknowledgement committed. Retrying must remain tied to the
+    // original attempt and must not dispatch whichever attempt is active now.
+    const provision = pipelines.listEffects(instance.id)[0]!;
+    db.prepare("DELETE FROM pipeline_inbox_events WHERE id = ?")
+      .run(`effect-ack-${provision.id}`);
+    db.prepare(`
+      UPDATE pipeline_effect_intents
+      SET status = 'processing', acknowledged_at = NULL,
+          next_attempt_at = '2099-07-22T12:00:00.000Z'
+      WHERE id = ?
+    `).run(provision.id);
+    db.prepare(`
+      UPDATE pipeline_stage_attempts SET status = 'completed' WHERE id = ?
+    `).run(attempt.id);
+    await processor.drain();
+    expect(runtime.dispatchStage).toHaveBeenCalledTimes(1);
+    expect(pipelines.listEffects(instance.id)[0]).toMatchObject({
+      status: "acknowledged",
+      attempts: 2,
+    });
+    db.prepare("UPDATE pipeline_stage_attempts SET status = 'running' WHERE id = ?")
+      .run(attempt.id);
+
     requestPipelineStop({
       store: pipelines,
       sessionId: "session-1",

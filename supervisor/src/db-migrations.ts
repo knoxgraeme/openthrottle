@@ -379,7 +379,7 @@ CREATE TABLE pipeline_artifacts (
   )),
   subject TEXT,
   payload TEXT NOT NULL,
-  artifact_hash TEXT NOT NULL UNIQUE,
+  artifact_hash TEXT NOT NULL,
   created_at TEXT NOT NULL,
   FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
   FOREIGN KEY(attempt_id, pipeline_instance_id)
@@ -488,6 +488,7 @@ ALTER TABLE linear_outbox ADD COLUMN attachment_url TEXT;
 const pipelinePublicationStateSchema = `
 ALTER TABLE pipeline_publication_receipts ADD COLUMN payload TEXT;
 ALTER TABLE pipeline_publication_receipts ADD COLUMN external_url TEXT;
+ALTER TABLE pipeline_publication_receipts ADD COLUMN target_url TEXT;
 ALTER TABLE pipeline_publication_receipts ADD COLUMN attachment_url TEXT;
 ALTER TABLE pipeline_publication_receipts ADD COLUMN last_error TEXT;
 ALTER TABLE pipeline_publication_receipts ADD COLUMN next_attempt_at TEXT;

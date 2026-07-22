@@ -89,6 +89,33 @@ describe("provider feedback snapshots", () => {
     })).toThrow(/changed payload/i);
   });
 
+  it("keeps conversation comments separate from commit-scoped feedback on the same head", () => {
+    db = openDb(":memory:");
+    const store = createFeedbackStore(db);
+    const comment = store.record({
+      ...base,
+      providerEventId: "comment:1",
+      kind: "issue_comment",
+      payload: "please cover the empty case",
+      workItemId: "gh-comment-1",
+    });
+    const check = store.record({
+      ...base,
+      providerEventId: "check:2",
+      kind: "check_suite",
+      payload: "failure",
+      workItemId: "gh-check-2",
+    });
+
+    expect(check.snapshot.id).not.toBe(comment.snapshot.id);
+    expect(comment.snapshot.head_sha).toBe("conversation:head-a");
+    expect(check.snapshot.head_sha).toBe("head-a");
+    expect(store.listEvents(comment.snapshot.id).map((event) => event.kind))
+      .toEqual(["issue_comment"]);
+    expect(store.listEvents(check.snapshot.id).map((event) => event.kind))
+      .toEqual(["check_suite"]);
+  });
+
   it("keeps old-head events separate and enforces the round bound atomically", () => {
     db = openDb(":memory:");
     const store = createFeedbackStore(db);

@@ -244,7 +244,7 @@ acceptance reserved for the rollout gate.
 | #17 provider events spend excess rounds | resolved | Legacy and pipeline paths share immutable current-head snapshots: stable provider identities coalesce, arrivals during repair collect for the next snapshot, and one snapshot creates one manifest re-entry. |
 | #18 processed heartbeats grow indefinitely | resolved | Processed ephemeral activity retention is pruned while retryable rows remain durable. |
 | #19 quiet long commands appear dead | resolved | Root-owned executor heartbeats cover in-flight command and agent stages independently of semantic output. |
-| #20 real pinned CLI acceptance is missing | **open — cutover gate** | Stubbed multi-engine Docker coverage exists, but real released-snapshot Claude/Codex/OpenCode runs require operator credentials and must be attached before canary. |
+| #20 real pinned CLI acceptance is missing | **open — deferred POC verification** | Stubbed multi-engine Docker coverage exists, but real released-snapshot Claude/Codex/OpenCode runs require operator credentials. The POC owner explicitly deferred this test. |
 | #21 writable shared credential lineage | **open — orthogonal** | No trust-model decision was inferred. The shared subscription lineage and API-key concurrency alternative remain documented; this finding stays owned outside coordinator cutover. |
 | #22 CI identity dedup loses distinct failures | resolved | Provider event identity is workflow/check specific while current-head snapshots coalesce repair work. |
 | #23 reaper overlap and release-before-stop | resolved | Non-dispatchable reaping and explicit stop confirmation retain exclusivity; uncertain termination quarantines the actor. |
@@ -260,11 +260,12 @@ acceptance reserved for the rollout gate.
 
 ### U8 verdict
 
-> **Verdict:** Canary-ready code; broad cutover remains gated.
+> **Verdict:** Locally complete for the pre-production POC; credentialed acceptance is deferred.
 >
 > The original autonomy-breaking delivery, liveness, fencing, typed-result,
 > and false-authority findings are resolved in repository code. #20 remains an
-> explicit live acceptance gate and #21 remains an orthogonal credential-trust
-> decision. Admission therefore defaults off, compatibility remains in place,
-> and removal/schema contraction cannot begin until the runbook's named-owner,
-> restore, live-service, full-drain, and soak evidence exists.
+> explicit deferred verification item and #21 remains an orthogonal
+> credential-trust decision. Because this is a POC with no installed consumer
+> population, new generations use the coordinator unconditionally and there is
+> no canary cohort, legacy-drain period, or production soak gate. Destructive
+> schema contraction remains separate.

@@ -26,13 +26,6 @@ export interface ExecutionSummary {
   publication_blocked: number;
 }
 
-export interface LegacyDrainReport {
-  drained: boolean;
-  total_obligations: number;
-  obligations: Record<string, number>;
-  checked_at: string;
-}
-
 export function sessionExecutionMode(
   store: TicketStore,
   sessionId: string
@@ -57,87 +50,13 @@ export function executionSummary(store: TicketStore): ExecutionSummary {
   };
 }
 
-export function legacyDrainReport(store: TicketStore, checkedAt = new Date().toISOString()): LegacyDrainReport {
-  const count = (sql: string) => Number(store.db.prepare(sql).pluck().get() ?? 0);
-  const obligations = {
-    active_tickets: count(`
-      SELECT COUNT(*) FROM tickets t
-      JOIN session_executions se ON se.linear_session_id = t.linear_session_id
-      WHERE se.execution_mode = 'legacy' AND t.state NOT IN ('closed', 'stopped', 'expired')
-    `),
-    actors: count(`
-      SELECT COUNT(*) FROM runs r
-      JOIN session_executions se ON se.linear_session_id = r.linear_session_id
-      WHERE se.execution_mode = 'legacy' AND r.status IN ('running', 'reaping', 'quarantined')
-    `),
-    work_items: count(`
-      SELECT COUNT(*) FROM work_items wi
-      JOIN session_executions se ON se.linear_session_id = wi.linear_session_id
-      WHERE se.execution_mode = 'legacy'
-        AND wi.status IN ('pending', 'leased', 'dispatched', 'acknowledged', 'reconciliation')
-    `),
-    work_deliveries: count(`
-      SELECT COUNT(*) FROM work_deliveries wd
-      JOIN work_items wi ON wi.id = wd.work_item_id
-      JOIN session_executions se ON se.linear_session_id = wi.linear_session_id
-      WHERE se.execution_mode = 'legacy'
-        AND wd.status IN ('leased', 'dispatched', 'acknowledged')
-    `),
-    steering_inbox: count(`
-      SELECT COUNT(*) FROM session_inbox si
-      JOIN session_executions se ON se.linear_session_id = si.linear_session_id
-      WHERE se.execution_mode = 'legacy' AND si.status IN ('pending', 'dispatched', 'acknowledged')
-    `),
-    feedback: count(`
-      SELECT COUNT(*) FROM feedback_snapshots fs
-      JOIN session_executions se ON se.linear_session_id = fs.linear_session_id
-      WHERE se.execution_mode = 'legacy' AND fs.status IN ('collecting', 'claimed')
-    `),
-    provider_events: count(`
-      SELECT COUNT(*) FROM provider_events pe
-      JOIN session_executions se ON se.linear_session_id = pe.linear_session_id
-      WHERE se.execution_mode = 'legacy' AND pe.snapshot_id IS NULL
-    `),
-    webhook_deliveries: count(`
-      SELECT COUNT(*) FROM webhook_deliveries wd
-      LEFT JOIN session_executions se ON se.linear_session_id = wd.session_id
-      WHERE (se.execution_mode = 'legacy' OR wd.session_id IS NULL)
-        AND wd.status IN ('pending', 'processing', 'failed')
-    `),
-    linear_outbox: count(`
-      SELECT COUNT(*) FROM linear_outbox lo
-      JOIN session_executions se ON se.linear_session_id = lo.linear_session_id
-      WHERE se.execution_mode = 'legacy' AND lo.status IN ('pending', 'processing', 'failed')
-    `),
-    sandbox_events: count(`
-      SELECT COUNT(*) FROM sandbox_events ev
-      JOIN runs r ON r.id = ev.run_id
-      JOIN session_executions se ON se.linear_session_id = r.linear_session_id
-      WHERE se.execution_mode = 'legacy' AND ev.status IN ('pending', 'processing', 'failed')
-    `),
-    sandbox_resources: count(`
-      SELECT COUNT(*) FROM tickets t
-      JOIN session_executions se ON se.linear_session_id = t.linear_session_id
-      WHERE se.execution_mode = 'legacy' AND t.sandbox_id IS NOT NULL
-    `),
-  };
-  const total = Object.values(obligations).reduce((sum, value) => sum + value, 0);
-  return { drained: total === 0, total_obligations: total, obligations, checked_at: checkedAt };
-}
-
-// Admission is generation-scoped. Once a generation has a mode, a restart or
-// flag change returns that pin instead of reinterpreting the live lifecycle.
+// New work is coordinator-native. The pinned mode is retained only so a local
+// pre-cutover database can finish a session deterministically during upgrade;
+// there is no feature flag or repository cohort for new generations.
 export function selectExecutionMode(params: {
   pinnedMode?: "legacy" | "pipeline";
-  pipelineAdmissionEnabled: boolean;
-  repository?: string;
-  admittedRepositories?: readonly string[];
 }): "legacy" | "pipeline" {
-  if (params.pinnedMode) return params.pinnedMode;
-  if (!params.pipelineAdmissionEnabled) return "legacy";
-  const cohort = params.admittedRepositories ?? [];
-  if (cohort.length === 0) return "pipeline";
-  return params.repository && cohort.includes(params.repository.toLowerCase()) ? "pipeline" : "legacy";
+  return params.pinnedMode ?? "pipeline";
 }
 
 const TRIAGE_INSTRUCTIONS =

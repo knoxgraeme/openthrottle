@@ -120,3 +120,17 @@ setup() {
   run codex_reconcile_auth "$newer" "$other"
   [ "$output" = "incompatible" ]
 }
+
+@test "codex_reconcile_auth orders ISO-8601 offsets and fractional seconds by instant" {
+  before='{"tokens":{"account_id":"acct"},"last_refresh":"2026-07-01T23:59:59.900Z"}'
+  after_offset='{"tokens":{"account_id":"acct"},"last_refresh":"2026-07-02T02:00:00.100+02:00"}'
+  same_instant='{"tokens":{"account_id":"acct"},"last_refresh":"2026-07-02T00:00:00.100Z"}'
+  invalid='{"tokens":{"account_id":"acct"},"last_refresh":"not-a-timestamp"}'
+
+  run codex_reconcile_auth "$after_offset" "$before"
+  [ "$output" = "seed" ]
+  run codex_reconcile_auth "$same_instant" "$after_offset"
+  [ "$output" = "keep" ]
+  run codex_reconcile_auth "$after_offset" "$invalid"
+  [ "$output" = "keep" ]
+}

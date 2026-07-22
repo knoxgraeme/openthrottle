@@ -144,6 +144,7 @@ export interface PipelinePublicationReceipt {
   status: "pending" | "processing" | "acknowledged" | "failed" | "dead";
   external_id: string | null;
   external_url: string | null;
+  target_url: string | null;
   attachment_url: string | null;
   attempts: number;
   next_attempt_at: string;
@@ -313,6 +314,11 @@ export interface PipelineStore {
   listPublications(instanceId: string): PipelinePublicationReceipt[];
   getPublication(id: string): PipelinePublicationReceipt | undefined;
   claimGithubPublications(nowIso: string, leaseUntilIso: string, limit?: number): PipelinePublicationReceipt[];
+  bindGithubPublicationTarget(
+    id: string,
+    expectedPayloadHash: string,
+    targetUrl: string
+  ): PipelinePublicationReceipt | undefined;
   markGithubPublicationProcessed(
     id: string,
     expectedPayloadHash: string,
@@ -558,6 +564,11 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
           resume_status, created_at, updated_at
         ) VALUES (?, ?, ?, 'github_summary', ?, ?, ?, 'pending', 0, ?, NULL, ?, ?)
         ON CONFLICT(idempotency_key) DO UPDATE SET
+          target_url = CASE
+            WHEN pipeline_publication_receipts.pipeline_instance_id = excluded.pipeline_instance_id
+              THEN pipeline_publication_receipts.target_url
+            ELSE NULL
+          END,
           pipeline_instance_id = excluded.pipeline_instance_id,
           attempt_id = excluded.attempt_id,
           payload = excluded.payload,
@@ -967,6 +978,8 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
     );
     const provisionPayload = canonicalJson({
       pipelineInstanceId: instanceId,
+      attemptId,
+      requestHash: stageRequest.requestHash,
       repository: seed.repository,
       baseCommit: seed.baseCommit,
       repositoryConfigDigest: snapshot.digest,
@@ -1364,6 +1377,39 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
     return claimed;
   });
 
+  const bindGithubPublicationTarget = db.transaction((
+    id: string,
+    expectedPayloadHash: string,
+    targetUrl: string
+  ): PipelinePublicationReceipt | undefined => {
+    const publication = db.prepare("SELECT * FROM pipeline_publication_receipts WHERE id = ?")
+      .get(id) as PipelinePublicationReceipt | undefined;
+    if (!publication || publication.kind !== "github_summary" ||
+        publication.status !== "processing" || publication.payload_hash !== expectedPayloadHash) {
+      return undefined;
+    }
+    if (publication.target_url) {
+      return publication.target_url === targetUrl ? publication : undefined;
+    }
+    const update = db.prepare(`
+      UPDATE pipeline_publication_receipts
+      SET target_url = ?, updated_at = ?
+      WHERE id = ? AND kind = 'github_summary' AND status = 'processing'
+        AND payload_hash = ? AND target_url IS NULL
+        AND EXISTS (
+          SELECT 1
+          FROM pipeline_instances pi
+          JOIN tickets t ON t.linear_issue_id = pi.linear_issue_id
+          WHERE pi.id = pipeline_publication_receipts.pipeline_instance_id
+            AND t.linear_session_id = pi.linear_session_id
+            AND t.pr_url = ?
+        )
+    `).run(targetUrl, now(), id, expectedPayloadHash, targetUrl);
+    if (update.changes !== 1) return undefined;
+    return db.prepare("SELECT * FROM pipeline_publication_receipts WHERE id = ?")
+      .get(id) as PipelinePublicationReceipt;
+  });
+
   const markGithubPublicationProcessed = db.transaction((
     id: string,
     expectedPayloadHash: string,
@@ -1484,6 +1530,11 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
       ORDER BY updated_at DESC, created_at DESC, id DESC
     `).all(instance.id) as PipelinePublicationReceipt[];
     const latest = publications[0];
+    const blockedPublication = publications.find((item) => item.status === "dead");
+    const failedPublication = publications.find((item) => item.status === "failed");
+    const pendingPublication = publications.find((item) =>
+      item.status === "pending" || item.status === "processing"
+    );
     const publicationState: PipelineStatusProjection["publication_state"] =
       publications.some((item) => item.status === "dead") || instance.status === "publication_blocked"
         ? "blocked"
@@ -1513,11 +1564,13 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
       policy_digest: gate?.policy_digest ?? null,
       context_policy: attempt?.native_context_policy ?? null,
       publication_state: publicationState,
-      publication_id: latest?.id ?? null,
-      publication_external_id: latest?.external_id ?? null,
-      publication_error: publications.find((item) => item.last_error)?.last_error ?? null,
-      recovery_action: publicationState === "blocked" && latest
-        ? `POST /tickets/:identifier/publications/${latest.id}/retry`
+      publication_id: (blockedPublication ?? failedPublication ?? pendingPublication ?? latest)?.id ?? null,
+      publication_external_id:
+        (blockedPublication ?? failedPublication ?? pendingPublication ?? latest)?.external_id ?? null,
+      publication_error:
+        (blockedPublication ?? failedPublication ?? publications.find((item) => item.last_error))?.last_error ?? null,
+      recovery_action: publicationState === "blocked" && blockedPublication
+        ? `POST /tickets/:identifier/publications/${blockedPublication.id}/retry`
         : null,
     };
   }
@@ -1677,6 +1730,7 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
         .get(id) as PipelinePublicationReceipt | undefined;
     },
     claimGithubPublications,
+    bindGithubPublicationTarget,
     markGithubPublicationProcessed,
     markGithubPublicationFailed,
     retryPublication,

@@ -92,6 +92,17 @@ codex_auth_field() {
   jq -r "$2 // empty" <<<"$1" 2>/dev/null || true
 }
 
+# Convert any valid ISO-8601 instant accepted by the JavaScript runtime to
+# epoch milliseconds. Empty output means the value is absent or invalid. This
+# avoids byte-order comparisons, which are wrong for equivalent timestamps
+# expressed with different offsets or fractional-second precision.
+codex_auth_timestamp_ms() {
+  node -e '
+    const value = Date.parse(process.argv[1] ?? "");
+    if (Number.isFinite(value)) process.stdout.write(String(value));
+  ' "$1" 2>/dev/null || true
+}
+
 # Decide how to reconcile a freshly-seeded Codex auth blob against the blob
 # already present in the sandbox on resume. The supervisor now refreshes the
 # rotating subscription token centrally before seeding (see codex-auth.ts), so
@@ -106,7 +117,7 @@ codex_auth_field() {
 # Args: $1 = seed blob, $2 = existing blob
 codex_reconcile_auth() {
   local seed="$1" existing="$2"
-  local seed_acct existing_acct seed_ts existing_ts
+  local seed_acct existing_acct seed_ts existing_ts seed_ms existing_ms
   seed_acct="$(codex_auth_field "$seed" '.tokens.account_id')"
   existing_acct="$(codex_auth_field "$existing" '.tokens.account_id')"
   if [[ -n "$seed_acct" && -n "$existing_acct" && "$seed_acct" != "$existing_acct" ]]; then
@@ -115,9 +126,12 @@ codex_reconcile_auth() {
   fi
   seed_ts="$(codex_auth_field "$seed" '.last_refresh')"
   existing_ts="$(codex_auth_field "$existing" '.last_refresh')"
-  # ISO-8601 UTC timestamps compare chronologically as byte strings. Only
-  # override the rotated sandbox token when the seed is STRICTLY newer.
-  if [[ -n "$seed_ts" && ( -z "$existing_ts" || "$seed_ts" > "$existing_ts" ) ]]; then
+  seed_ms="$(codex_auth_timestamp_ms "$seed_ts")"
+  existing_ms="$(codex_auth_timestamp_ms "$existing_ts")"
+  # Only override the rotated sandbox token when the seed is provably and
+  # strictly newer. An invalid existing timestamp remains conservative unless
+  # the timestamp is wholly absent.
+  if [[ -n "$seed_ms" && ( -z "$existing_ts" || ( -n "$existing_ms" && "$seed_ms" -gt "$existing_ms" ) ) ]]; then
     printf '%s' 'seed'
     return 0
   fi

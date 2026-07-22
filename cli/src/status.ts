@@ -42,10 +42,6 @@ interface StatusResponse {
     waiting: number;
     publication_blocked: number;
   };
-  legacy_drain?: {
-    drained: boolean;
-    total_obligations: number;
-  };
 }
 
 export default async function status(): Promise<void> {
@@ -81,12 +77,6 @@ export default async function status(): Promise<void> {
     console.log(
       `Execution: legacy=${summary.legacy} pipeline=${summary.pipeline} ` +
       `waiting=${summary.waiting} publication-blocked=${summary.publication_blocked}`
-    );
-  }
-  if (data.legacy_drain) {
-    console.log(
-      `Legacy drain: ${data.legacy_drain.drained ? 'clear' : 'blocked'} ` +
-      `(${data.legacy_drain.total_obligations} obligations)`
     );
   }
   printTable(

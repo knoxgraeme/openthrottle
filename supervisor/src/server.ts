@@ -35,7 +35,7 @@ import { hashesMatch, tokenHash, completeRun } from "./run-lifecycle.js";
 import { handleLinearEvent, type PipelineAdmissionContext } from "./linear-events.js";
 import { handleGithubEvent } from "./github-events.js";
 import { renderPipelineLogHeader } from "./pipeline-publication.js";
-import { executionSummary, legacyDrainReport } from "./scheduler.js";
+import { executionSummary } from "./scheduler.js";
 import { canSteerPipelineRun, requestPipelineStop } from "./pipeline-control.js";
 
 // index.ts and sweep.ts keep importing `completeRun`/`expireRun` from here so
@@ -224,12 +224,7 @@ export function createServer(deps: ServerDeps): Hono {
       return context.json({ error: "unauthorized" }, 401);
     }
     return context.json({
-      admission: {
-        enabled_for_new_generations: cfg.pipelineAdmissionEnabled,
-        repositories: cfg.pipelineAdmissionRepositories ?? [],
-      },
       execution_summary: executionSummary(store),
-      legacy_drain: legacyDrainReport(store),
       tickets: store.listAll().map((ticket) => {
         const pipeline = deps.pipelineAdmission?.store.getStatusForIssue(ticket.linear_issue_id);
         return {

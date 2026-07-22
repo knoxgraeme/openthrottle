@@ -247,10 +247,28 @@ function defaultExecuteCommand({ command, repoDir, timeoutMs }) {
   };
 }
 
-export function stagePrompt(request, proposalPath) {
-  const entry = request.capability.startsWith("ce/")
-    ? request.taskType === "investigate" ? "$investigate" : "$implement-plan"
-    : "Review the requested repository state and produce bounded evidence.";
+function skillBody(raw) {
+  const lines = raw.replace(/\r\n/g, "\n").split("\n");
+  if (lines[0] !== "---") return raw.trim();
+  const end = lines.indexOf("---", 1);
+  return (end === -1 ? raw : lines.slice(end + 1).join("\n")).trim();
+}
+
+export function stagePrompt(
+  request,
+  proposalPath,
+  { agent = request.agent, skillRoot = "/opt/openthrottle/skills/tasks" } = {}
+) {
+  let entry = "Review the requested repository state and produce bounded evidence.";
+  if (request.capability.startsWith("ce/")) {
+    const skillName = request.taskType === "investigate" ? "investigate" : "implement-plan";
+    entry = `$${skillName}`;
+    // OpenCode has no admin-scope skill discovery equivalent. Give it the
+    // canonical adapter body from the same single source used by other engines.
+    if (agent === "opencode") {
+      entry += `\n\n${skillBody(readFileSync(join(skillRoot, skillName, "SKILL.md"), "utf8"))}`;
+    }
+  }
   return `${entry}\n\nThis is one fenced OpenThrottle stage (${request.stageId}/${request.attemptId}) ` +
     `for capability ${request.capability}. ` +
     `Do not claim gate authority. Before exiting, write a proposal with ` +
@@ -282,7 +300,7 @@ export function extractNativeSessionId(output, agent) {
 }
 
 function defaultRunAgent({ request, invocation, repoDir, proposalPath, timeoutMs, model, agent = request.agent }) {
-  const prompt = stagePrompt(request, proposalPath);
+  const prompt = stagePrompt(request, proposalPath, { agent });
   const env = [
     "HOME=/home/agent",
     "USER=agent",

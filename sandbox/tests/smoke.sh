@@ -291,10 +291,11 @@ git --git-dir "$SMOKE_DIR/repo.git" show-ref --verify --quiet refs/heads/ot/smok
 run_stage_smoke() {
   local agent="$1"
   local home_dir="$2"
-  local state_dir="$SMOKE_DIR/result/stage-$agent"
-  local attempt_id="attempt-$agent"
-  local run_id="run-stage-$agent"
-  local branch="ot/stage-$agent"
+  local stage_kind="${3:-agent}"
+  local state_dir="$SMOKE_DIR/result/stage-$agent-$stage_kind"
+  local attempt_id="attempt-$agent-$stage_kind"
+  local run_id="run-stage-$agent-$stage_kind"
+  local branch="ot/stage-$agent-$stage_kind"
   local base_commit tree_oid
   base_commit="$(git -C "$SMOKE_DIR/work" rev-parse HEAD)"
   tree_oid="$(git -C "$SMOKE_DIR/work" rev-parse 'HEAD^{tree}')"
@@ -303,6 +304,7 @@ run_stage_smoke() {
 
   docker run --rm --entrypoint node \
     -e "STAGE_AGENT=$agent" \
+    -e "STAGE_KIND=$stage_kind" \
     -e "STAGE_ATTEMPT=$attempt_id" \
     -e "STAGE_RUN=$run_id" \
     -e "STAGE_BRANCH=$branch" \
@@ -314,12 +316,18 @@ run_stage_smoke() {
       import { canonicalJson, RUNTIME_DESCRIPTOR } from "/opt/openthrottle/runner/capabilities.mjs";
       import { digest } from "/opt/openthrottle/runner/artifacts.mjs";
       import { createStageRequestHash } from "/opt/openthrottle/runner/execute-stage.mjs";
+      const commandStage = process.env.STAGE_KIND === "command";
       const config = {
         agent: process.env.STAGE_AGENT,
-        model: "kimi-code/kimi-for-coding",
+        ...(commandStage ? { test: "true" } : { model: "kimi-code/kimi-for-coding" }),
         post_bootstrap: [],
         limits: { max_turns: 2, task_timeout: 30 },
       };
+      const capability = commandStage ? "command/run@1" : "ce/plan@1";
+      const requiredArtifacts = commandStage
+        ? ["stage_result", "command_result"]
+        : ["stage_result"];
+      const credentialScopes = commandStage ? ["repo.read"] : ["model.invoke", "repo.read"];
       const manifest = {
         schema: "openthrottle.pipeline/v1",
         id: "ce/stage-smoke",
@@ -327,15 +335,17 @@ run_stage_smoke() {
         description: "Provider-neutral stage smoke",
         entry_stage: "planning",
         max_attempts: 1,
-        requires: { protocol: "stage-executor@1", capabilities: ["ce/plan@1"] },
+        requires: { protocol: "stage-executor@1", capabilities: [capability] },
         stages: [{
           id: "planning",
-          executor: { kind: "agent", capability: "ce/plan@1" },
-          evaluator: { kind: "semantic", assurance: "semantic_attested", required_artifacts: ["stage_result"] },
-          context: "fresh",
-          live_steering: true,
-          credentials: ["model.invoke", "repo.read"],
-          produces: ["stage_result"],
+          executor: { kind: commandStage ? "command" : "agent", capability },
+          evaluator: commandStage
+            ? { kind: "command", assurance: "executor_verified", required_artifacts: ["command_result"] }
+            : { kind: "semantic", assurance: "semantic_attested", required_artifacts: ["stage_result"] },
+          context: commandStage ? "none" : "fresh",
+          live_steering: !commandStage,
+          credentials: credentialScopes,
+          produces: requiredArtifacts,
           transitions: {},
         }],
       };
@@ -364,12 +374,13 @@ run_stage_smoke() {
         agent: process.env.STAGE_AGENT,
         contextRevision: 0,
         expectedSubject: process.env.STAGE_TREE,
-        contextPolicy: "fresh",
+        contextPolicy: commandStage ? "none" : "fresh",
         nativeSessionId: null,
-        capability: "ce/plan@1",
-        requiredArtifacts: ["stage_result"],
-        credentialScopes: ["model.invoke", "repo.read"],
-        liveSteering: true,
+        capability,
+        requiredArtifacts,
+        credentialScopes,
+        liveSteering: !commandStage,
+        ...(commandStage ? { commandName: "test" } : {}),
       };
       mkdirSync("/state/stage-input", { recursive: true, mode: 0o700 });
       writeFileSync("/state/stage-input/repository-config.json", configRaw, { mode: 0o400 });
@@ -406,18 +417,29 @@ run_stage_smoke() {
     docker_args+=(-e CLAUDE_CODE_OAUTH_TOKEN=claude-oauth-token)
   elif [[ "$agent" == "codex" ]]; then
     docker_args+=(-e 'CODEX_AUTH_JSON={}')
-  else
+  elif [[ "$stage_kind" != "command" ]]; then
     docker_args+=(-e KIMI_CODE_API_KEY=kimi-smoke-secret)
   fi
   docker "${docker_args[@]}" "$IMAGE"
 
+  # The runtime intentionally creates its spool root-only. Make this bind
+  # mounted smoke fixture readable/removable by the non-root GitHub runner
+  # without weakening the permissions used in real Daytona sandboxes.
+  docker run --rm --entrypoint sh -v "$state_dir:/state" "$IMAGE" \
+    -c 'chown -R "$1:$2" /state && chmod -R u+rwX /state' sh "$(id -u)" "$(id -g)"
+
   test "$(git -c "safe.directory=$home_dir/repo" -C "$home_dir/repo" branch --show-current)" = "$branch"
 
   local result="$state_dir/stage-results/$attempt_id.json"
-  if ! jq -e --arg attempt "$attempt_id" --arg run "$run_id" '
+  if ! jq -e --arg attempt "$attempt_id" --arg run "$run_id" --arg stageKind "$stage_kind" '
     .kind == "stage_result" and .attempt_id == $attempt and .run_id == $run and
-    .outcome == "success" and (.artifacts | length == 1) and
-    all(.artifacts[]; .assurance == "semantic_attested" and (.payload | fromjson | .result == "success"))
+    .outcome == "success" and
+    (if $stageKind == "command" then
+      (.artifacts | length == 2) and all(.artifacts[]; .assurance == "executor_verified")
+    else
+      (.artifacts | length == 1) and
+      all(.artifacts[]; .assurance == "semantic_attested" and (.payload | fromjson | .result == "success"))
+    end)
   ' "$result" >/dev/null; then
     echo "invalid normalized stage result for $agent" >&2
     cat "$result" >&2
@@ -432,5 +454,6 @@ run_stage_smoke() {
 run_stage_smoke claude "$CLAUDE_HOME"
 run_stage_smoke codex "$CODEX_HOME"
 run_stage_smoke opencode "$OPENCODE_HOME"
+run_stage_smoke opencode "$OPENCODE_HOME" command
 
 echo "sandbox Claude + Codex + OpenCode implement/resume + fenced stage smoke passed"

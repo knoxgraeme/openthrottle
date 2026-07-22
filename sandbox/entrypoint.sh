@@ -153,6 +153,7 @@ handle_exit() {
 
 STAGE_EXPECTED_SUBJECT=""
 STAGE_BASE_COMMIT=""
+STAGE_MODEL_REQUIRED=1
 if [[ "$STAGE_EXECUTION" == "1" ]]; then
   : "${OT_STAGE_REQUEST_FILE:?OT_STAGE_REQUEST_FILE is required for stage execution}"
   : "${OT_STAGE_CONFIG_FILE:?OT_STAGE_CONFIG_FILE is required for stage execution}"
@@ -179,6 +180,9 @@ if [[ "$STAGE_EXECUTION" == "1" ]]; then
   LINEAR_ISSUE_ID="$(jq -er '.issueId' "$OT_STAGE_REQUEST_FILE")"
   LINEAR_ISSUE_IDENTIFIER="$LINEAR_ISSUE_ID"
   TASK_TYPE="$(jq -er '.taskType' "$OT_STAGE_REQUEST_FILE")"
+  if ! jq -e '.credentialScopes | index("model.invoke") != null' "$OT_STAGE_REQUEST_FILE" >/dev/null; then
+    STAGE_MODEL_REQUIRED=0
+  fi
 fi
 
 : "${RUN_ID:?RUN_ID is required}"
@@ -451,7 +455,7 @@ esac
 
 OPENCODE_MODEL_FILE="${OT_DIR}/agent-model"
 OPENCODE_MODEL=""
-if [[ "$AGENT" == "opencode" ]]; then
+if [[ "$AGENT" == "opencode" && "$STAGE_MODEL_REQUIRED" == "1" ]]; then
   if [[ -z "$KIMI_CODE_API_KEY" ]]; then
     log "FATAL: KIMI_CODE_API_KEY is required for AGENT=opencode"
     exit 1
@@ -653,7 +657,7 @@ if [[ "$AGENT" == "claude" ]]; then
   chown "${AGENT_USER}:${AGENT_USER}" "$MCP_CONFIG_FILE"
 fi
 
-if [[ "$AGENT" == "opencode" ]]; then
+if [[ "$AGENT" == "opencode" && "$STAGE_MODEL_REQUIRED" == "1" ]]; then
   OPENCODE_CONFIG_DIR="$(mktemp -d /tmp/ot-opencode-XXXXXX)"
   node "${OPT_DIR}/runner/build-opencode-config.mjs" \
     --model "$OPENCODE_MODEL" \

@@ -219,6 +219,51 @@ describe("pipeline coordinator", () => {
     });
   });
 
+  it("cannot enter provider wait until the publishing stage establishes an exact subject", () => {
+    const { manifest, instance, attempt, stages } = setup("ce/implement@1");
+    const publishAttempt = {
+      ...attempt,
+      id: "publish-attempt",
+      stage_id: "publish",
+      request_hash: "f".repeat(64),
+      native_context_policy: "none",
+    };
+    const payload = JSON.stringify({ outcome: "success" });
+    const publishPayload = JSON.stringify({ published: true });
+    expect(() => reducePipelineEvent({
+      manifest,
+      instance: { ...instance, active_stage_id: "publish", status: "running" },
+      attempt: publishAttempt,
+      stages,
+      event: {
+        id: "publish-without-subject",
+        kind: "stage_result",
+        instanceId: instance.id,
+        generation: instance.generation,
+        attemptId: publishAttempt.id,
+        requestHash: publishAttempt.request_hash,
+        outcome: "success",
+        resultHash: digestNormalized(payload),
+        artifacts: [
+          {
+            kind: "stage_result",
+            schemaVersion: 1,
+            assurance: "executor_verified",
+            payload,
+            hash: digestNormalized(payload),
+          },
+          {
+            kind: "publish_subject",
+            schemaVersion: 1,
+            assurance: "executor_verified",
+            payload: publishPayload,
+            hash: digestNormalized(publishPayload),
+          },
+        ],
+      },
+    })).toThrow(/provider wait without an exact subject/);
+  });
+
   it("turns a current-head provider snapshot into a bounded typed repair re-entry", () => {
     const { manifest, instance, attempt, stages } = setup("ce/implement@1");
     const providerAttempt = {

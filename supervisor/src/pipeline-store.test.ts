@@ -339,6 +339,32 @@ describe("pipeline store", () => {
       "f".repeat(64),
       new Date().toISOString()
     )).toThrow(/FOREIGN KEY/);
+
+    const sharedHash = "1".repeat(64);
+    const createdAt = new Date().toISOString();
+    const insertArtifact = db!.prepare(`
+      INSERT INTO pipeline_artifacts (
+        id, pipeline_instance_id, attempt_id, kind, schema_version, assurance,
+        payload, artifact_hash, created_at
+      ) VALUES (?, ?, ?, 'stage_result', 1, 'executor_verified', '{}', ?, ?)
+    `);
+    insertArtifact.run(
+      "shared-artifact-first",
+      instance.id,
+      pipelines.getActiveAttempt(instance.id)!.id,
+      sharedHash,
+      createdAt
+    );
+    insertArtifact.run(
+      "shared-artifact-second",
+      other.id,
+      pipelines.getActiveAttempt(other.id)!.id,
+      sharedHash,
+      createdAt
+    );
+    expect(db!.prepare(
+      "SELECT COUNT(*) AS count FROM pipeline_artifacts WHERE artifact_hash = ?"
+    ).get(sharedHash)).toEqual({ count: 2 });
   });
 
   it("recovers the same pinned state and pending effects from a file-backed restart", () => {

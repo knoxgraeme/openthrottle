@@ -289,18 +289,14 @@ The delivery units in
 now provide the additive schema, immutable catalog/runtime validation, durable
 coordinator and effects, fenced stage executor, deterministic gates, provider
 repair with exact published-commit binding, publication receipts,
-repository-cohort admission, operator status,
-and cross-domain legacy-drain report. CE implement/investigate v2 and generic
-command/agent fixtures use the same coordinator; legacy mappings remain only
-in the explicit compatibility registry.
+operator status, and unconditional coordinator selection for new generations.
+CE implement/investigate v2 and generic command/agent fixtures use the same
+coordinator.
 
-This is a canary-ready code boundary, not authorization for broad activation.
-Admission stays off until the rollout runbook has real pinned Claude/Codex/
-OpenCode snapshot evidence, live Linear/Daytona/GitHub acceptance, named human
-owners/backups, a successful database restore rehearsal, and all stop criteria
-clear. Active generations stay pinned when the future-admission kill switch is
-changed. Legacy removal follows a complete cross-domain drain and 72-hour soak
-in a separate release; destructive schema contraction is later again.
+This repository is a pre-production POC with no installed consumers, so it has
+no canary cohort, legacy-drain period, or production soak gate. The credentialed
+Linear/Daytona/GitHub acceptance remains an explicit optional verification step;
+destructive schema contraction is a separate change.
 
 ## Non-goals (v2)
 

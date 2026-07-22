@@ -30,15 +30,6 @@ on:
         description: "Force a Fly supervisor deploy"
         type: boolean
         default: false
-      pipeline_admission:
-        description: "Admission for future generations only"
-        type: choice
-        options: [preserve, off, canary, all]
-        default: preserve
-      pipeline_repositories:
-        description: "Comma-separated owner/repo canary cohort (required for canary)"
-        type: string
-        default: ""
 
 permissions:
   contents: read
@@ -144,32 +135,6 @@ jobs:
       - name: Stage the new snapshot name
         if: needs.snapshot.result == 'success'
         run: flyctl secrets set --stage --app "$FLY_APP" DAYTONA_SNAPSHOT="${{ needs.snapshot.outputs.name }}"
-      - name: Stage coordinator admission policy
-        if: inputs.pipeline_admission != '' && inputs.pipeline_admission != 'preserve'
-        env:
-          ADMISSION_MODE: ${{ inputs.pipeline_admission }}
-          ADMISSION_REPOSITORIES: ${{ inputs.pipeline_repositories }}
-        run: |
-          set -euo pipefail
-          case "$ADMISSION_MODE" in
-            off)
-              flyctl secrets set --stage --app "$FLY_APP" \
-                PIPELINE_COORDINATOR_ENABLED=false PIPELINE_COORDINATOR_REPOSITORIES=""
-              ;;
-            canary)
-              test -n "$ADMISSION_REPOSITORIES" || {
-                echo "pipeline_repositories is required for canary admission" >&2
-                exit 1
-              }
-              flyctl secrets set --stage --app "$FLY_APP" \
-                PIPELINE_COORDINATOR_ENABLED=true \
-                PIPELINE_COORDINATOR_REPOSITORIES="$ADMISSION_REPOSITORIES"
-              ;;
-            all)
-              flyctl secrets set --stage --app "$FLY_APP" \
-                PIPELINE_COORDINATOR_ENABLED=true PIPELINE_COORDINATOR_REPOSITORIES=""
-              ;;
-          esac
       - name: Deploy the supervisor
         working-directory: supervisor
         run: flyctl deploy --remote-only --app "$FLY_APP"

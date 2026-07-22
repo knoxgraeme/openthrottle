@@ -1,5 +1,7 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
+import { createTicketStore, openDb } from "./db.js";
+import { considerCiGithubHead } from "./github-events.js";
 import {
   areAllReviewThreadsResolved,
   branchExists,
@@ -15,6 +17,26 @@ import {
 } from "./github.js";
 
 describe("GitHub contracts", () => {
+  it("advances CI head watermarks across workflow-run and check-suite sources", () => {
+    const db = openDb(":memory:");
+    try {
+      const store = createTicketStore(db);
+      considerCiGithubHead(store, "issue-1", "head-workflow", "workflow_run", 100);
+      // IDs from different webhook object types are not a shared sequence.
+      considerCiGithubHead(store, "issue-1", "head-check", "check_suite", 1);
+      expect(store.getSetting("github-head:issue-1")).toBe("head-check");
+      expect(store.getSetting("github-head-source:issue-1")).toBe(
+        JSON.stringify({ source: "check_suite", sequence: 1 })
+      );
+
+      // A delayed older event cannot move the watermark backwards.
+      considerCiGithubHead(store, "issue-1", "head-old", "workflow_run", 99);
+      expect(store.getSetting("github-head:issue-1")).toBe("head-check");
+    } finally {
+      db.close();
+    }
+  });
+
   it("verifies sha256 signatures", () => {
     const raw = '{"action":"closed"}';
     const signature = `sha256=${createHmac("sha256", "secret").update(raw).digest("hex")}`;
