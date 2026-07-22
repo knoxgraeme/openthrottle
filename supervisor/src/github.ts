@@ -342,6 +342,56 @@ export async function branchExists(
   return true;
 }
 
+export interface RepositoryConfigAtCommit {
+  repository: string;
+  branch: string;
+  baseCommit: string;
+  blobSha: string;
+  content: string;
+}
+
+// Resolve branch state once, then fetch repository configuration by that exact
+// commit. The returned blob/commit pair is suitable for sealing into a pipeline
+// instance; later branch or working-tree changes cannot reinterpret it.
+export async function getRepositoryConfigAtCommit(
+  client: GithubClient,
+  repository: string,
+  branch: string
+): Promise<RepositoryConfigAtCommit> {
+  const commit = await githubRequest<{ sha: string }>(
+    client,
+    `/repos/${repository}/commits/${encodeURIComponent(branch)}`
+  );
+  if (!/^[a-f0-9]{40}$/i.test(commit.sha)) throw new Error("GitHub returned an invalid base commit SHA");
+  const file = await githubRequest<{
+    type: string;
+    sha: string;
+    encoding: string;
+    content: string;
+    size: number;
+  }>(
+    client,
+    `/repos/${repository}/contents/.openthrottle.yml?ref=${encodeURIComponent(commit.sha)}`
+  );
+  if (file.type !== "file" || file.encoding !== "base64" || !/^[a-f0-9]{40}$/i.test(file.sha)) {
+    throw new Error("GitHub returned an invalid .openthrottle.yml blob");
+  }
+  if (!Number.isSafeInteger(file.size) || file.size < 0 || file.size > 256 * 1024) {
+    throw new Error(".openthrottle.yml exceeds the 256 KiB snapshot limit");
+  }
+  const content = Buffer.from(file.content.replace(/\s/g, ""), "base64").toString("utf8");
+  if (Buffer.byteLength(content, "utf8") !== file.size) {
+    throw new Error(".openthrottle.yml content size does not match GitHub metadata");
+  }
+  return {
+    repository,
+    branch,
+    baseCommit: commit.sha.toLowerCase(),
+    blobSha: file.sha.toLowerCase(),
+    content,
+  };
+}
+
 async function githubGraphQL<T>(
   client: GithubClient,
   query: string,

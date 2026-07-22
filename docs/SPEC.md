@@ -94,6 +94,16 @@ Linear AgentSessionEvent ──HMAC──> Fly supervisor ──@daytona/sdk─�
    inert no-op; Fly uploads the latest Linear context and run credentials,
    then explicitly starts the requested task in a Daytona process session.
 
+While `PIPELINE_COORDINATOR_ENABLED=false` (the default), this is the legacy
+path above. When admission is explicitly enabled for a new generation, the
+supervisor first resolves the base branch to an exact commit, fetches and
+validates `.openthrottle.yml` at that commit, pins catalog/config/runtime
+digests, and atomically creates the pipeline instance, stage graph, first
+attempt, and provision intent. Existing generations retain their pinned
+`legacy` or `pipeline` mode across restart and flag changes. During the dormant
+U5 release, no dispatcher consumes that provision intent; admission therefore
+stays off until the stage-executor release is deployed.
+
 ### Follow-up
 
 1. A signed `action=prompted` event carries the reply in
@@ -341,6 +351,21 @@ state for validated sandbox records without persisting the raw one-time token.
 stable GitHub identities, current-head immutable membership, watermarks, and
 one-round claims. `run_liveness` owns executor heartbeat and settlement/
 quarantine state; `supervisor_leases` prevents overlapping reaper sweeps.
+`pipeline_catalog_entries` makes each accepted `(pipeline_id, version)` digest
+immutable while aliases may move for future instances.
+`runtime_capability_descriptors` stores independently normalized runtime-release
+evidence; manifests cannot add to that inventory.
+`repository_config_snapshots`, `session_executions`, `pipeline_instances`,
+`pipeline_instance_stages`, and `pipeline_stage_attempts` pin a generation's
+exact manifest, base commit, repository blob/config, runtime protocol and
+capabilities, state version, stage/attempt ordinals, wait reason, and bounded
+re-entry counters. `pipeline_inbox_events` and `pipeline_effect_intents` are the
+typed transactional boundary: a reducer compare-and-set and its idempotent
+external intents commit together, and dispatch leases can be reclaimed without
+creating a second semantic intent. Artifact, gate, publication, run, and work
+binding tables use restricted foreign keys so audit-bearing parents cannot be
+silently deleted. Existing generations are backfilled as `legacy`; a pipeline
+generation and its instance are pinned in the same transaction.
 `linear_outbox` stores all Linear activity/session-update mutations before
 delivery, including UUID id, immutable payload hash, target session,
 per-session sequence, retry state, and sanitized last error. `session_inbox` is
@@ -425,6 +450,15 @@ Required unless noted:
   is claimed for reaping; before the first heartbeat, `started_at` is the
   liveness origin. Termination must be confirmed before release, otherwise the
   actor is quarantined, independent of the hard `TASK_TIMEOUT` wall clock.
+- Pipeline admission: `PIPELINE_COORDINATOR_ENABLED=false`, optional
+  `PIPELINE_CATALOG_PATH` (defaults to the catalog shipped in the supervisor
+  image), `SANDBOX_RUNTIME_RELEASE=openthrottle-snapshot/v1`, and optional
+  `SANDBOX_RUNTIME_DESCRIPTOR_PATH` (the independently generated descriptor
+  shipped for that runtime release). The supervisor
+  validates and durably accepts the full catalog against the independently
+  built runtime capability descriptor at boot even while admission is off;
+  reusing an accepted pipeline version or runtime release with different
+  normalized content fails startup.
 
 Fly keeps one machine running, mounts `/data`, and health-checks `/healthz`.
 

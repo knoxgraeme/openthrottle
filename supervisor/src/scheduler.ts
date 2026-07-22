@@ -40,6 +40,15 @@ export const LOOP_REGISTRY: Record<"implement" | "investigate", LoopRegistryEntr
   },
 };
 
+// Admission is generation-scoped. Once a generation has a mode, a restart or
+// flag change returns that pin instead of reinterpreting the live lifecycle.
+export function selectExecutionMode(params: {
+  pinnedMode?: "legacy" | "pipeline";
+  pipelineAdmissionEnabled: boolean;
+}): "legacy" | "pipeline" {
+  return params.pinnedMode ?? (params.pipelineAdmissionEnabled ? "pipeline" : "legacy");
+}
+
 const TRIAGE_INSTRUCTIONS =
   "Triage this feedback the review-fix way. Gather the whole picture before you " +
   "act: run `gh pr checks` for a snapshot of the current check state and read " +

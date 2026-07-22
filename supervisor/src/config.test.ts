@@ -30,6 +30,10 @@ function setRequiredEnv(): void {
     "REVIEW_MAX_ROUNDS",
     "ALLOW_LINEAR_MERGE",
     "SANDBOX_EVENT_POLL_INTERVAL_MS",
+    "PIPELINE_COORDINATOR_ENABLED",
+    "PIPELINE_CATALOG_PATH",
+    "SANDBOX_RUNTIME_RELEASE",
+    "SANDBOX_RUNTIME_DESCRIPTOR_PATH",
   ]) {
     delete process.env[name];
   }
@@ -70,7 +74,25 @@ describe("loadConfig", () => {
       kimiCodeApiKey: "kimi",
       sandboxEventPollIntervalMs: 5_000,
       reviewNudgeComment: "",
+      pipelineAdmissionEnabled: false,
+      sandboxRuntimeRelease: "openthrottle-snapshot/v1",
     });
+  });
+
+  it("keeps pipeline admission off by default and validates explicit runtime settings", () => {
+    setRequiredEnv();
+    process.env.PIPELINE_COORDINATOR_ENABLED = "true";
+    process.env.PIPELINE_CATALOG_PATH = "/opt/catalog.yaml";
+    process.env.SANDBOX_RUNTIME_RELEASE = "snapshot/2026-07-22";
+    process.env.SANDBOX_RUNTIME_DESCRIPTOR_PATH = "/opt/runtime.json";
+    expect(loadConfig()).toMatchObject({
+      pipelineAdmissionEnabled: true,
+      pipelineCatalogPath: "/opt/catalog.yaml",
+      sandboxRuntimeRelease: "snapshot/2026-07-22",
+      sandboxRuntimeDescriptorPath: "/opt/runtime.json",
+    });
+    process.env.SANDBOX_RUNTIME_RELEASE = "unsafe release";
+    expect(() => loadConfig()).toThrow(/SANDBOX_RUNTIME_RELEASE/);
   });
 
   it("loads a configured review nudge comment", () => {

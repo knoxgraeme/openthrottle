@@ -14,7 +14,7 @@ import {
   isGithubPullRequestUrl,
   parsePullRequestUrl,
 } from "./github.js";
-import { startTask, type SandboxEnvContract } from "./daytona.js";
+import { setSandboxActive, setSandboxIdle, startTask, type SandboxEnvContract } from "./daytona.js";
 import { terminateAndSettleActor } from "./actor-settlement.js";
 import { getCodexAuthForSeed } from "./codex-auth.js";
 import { reconcileSandboxAutostop } from "./sandbox-lifecycle.js";
@@ -54,10 +54,13 @@ export async function settleSandboxAfterRun(params: {
 
   try {
     await reconcileSandboxAutostop({
-      daytona,
+      runtime: {
+        setActive: (id) => setSandboxActive(daytona, id),
+        setIdle: (id) => setSandboxIdle(daytona, id),
+      },
       store,
       issueId: ticket.linear_issue_id,
-      sandboxId: ticket.sandbox_id,
+      providerResourceId: ticket.sandbox_id,
     });
   } catch (error) {
     console.error(

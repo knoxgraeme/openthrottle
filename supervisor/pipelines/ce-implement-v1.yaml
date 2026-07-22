@@ -1,0 +1,67 @@
+schema: openthrottle.pipeline/v1
+id: ce/implement
+version: 1
+description: CE-backed implementation followed by exact-subject publication.
+entry_stage: implement
+max_attempts: 8
+requires:
+  protocol: stage-executor@1
+  capabilities: [ce/implement@1, repository/publish@1, provider/wait@1]
+stages:
+  - id: implement
+    executor: { kind: agent, capability: ce/implement@1 }
+    evaluator:
+      kind: semantic
+      assurance: semantic_attested
+      required_artifacts: [stage_result]
+    context: prefer_resume
+    live_steering: true
+    credentials: [model.invoke, repo.read, repo.write, provider.read]
+    produces: [stage_result, review]
+    transitions:
+      success: { to: publish }
+      no_change: { terminal: no_change }
+      semantic_repair_required: { to: implement, max_reentries: 3, on_exhausted: needs_human }
+      retryable_infrastructure_failure: { to: implement, max_reentries: 3, on_exhausted: failed }
+      needs_human: { terminal: needs_human }
+      canceled: { terminal: canceled }
+      superseded: { terminal: superseded }
+      failure: { terminal: failed }
+  - id: publish
+    executor: { kind: publish, capability: repository/publish@1 }
+    evaluator:
+      kind: publish_subject
+      assurance: executor_verified
+      required_artifacts: [publish_subject]
+    context: none
+    live_steering: false
+    credentials: [repo.read, repo.write]
+    produces: [publish_subject, stage_result]
+    transitions:
+      success: { to: provider }
+      no_change: { terminal: no_change }
+      semantic_repair_required: { to: implement, max_reentries: 3, on_exhausted: needs_human }
+      retryable_infrastructure_failure: { to: publish, max_reentries: 2, on_exhausted: failed }
+      needs_human: { terminal: needs_human }
+      canceled: { terminal: canceled }
+      superseded: { terminal: superseded }
+      failure: { terminal: failed }
+  - id: provider
+    executor: { kind: provider_wait, capability: provider/wait@1 }
+    evaluator:
+      kind: provider
+      assurance: provider_verified
+      required_artifacts: [provider_check]
+    context: none
+    live_steering: false
+    credentials: [provider.read]
+    produces: [provider_check, stage_result]
+    transitions:
+      success: { terminal: shipped }
+      no_change: { terminal: no_change }
+      semantic_repair_required: { to: implement, max_reentries: 3, on_exhausted: needs_human }
+      retryable_infrastructure_failure: { to: provider, max_reentries: 2, on_exhausted: failed }
+      needs_human: { terminal: needs_human }
+      canceled: { terminal: canceled }
+      superseded: { terminal: superseded }
+      failure: { terminal: failed }

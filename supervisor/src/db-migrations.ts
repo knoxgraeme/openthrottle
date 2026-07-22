@@ -165,6 +165,285 @@ CREATE INDEX sandbox_events_run_liveness_idx
   ON sandbox_events(run_id, kind, created_at);
 `;
 
+const pipelineCoordinatorSchema = `
+CREATE TABLE pipeline_catalog_entries (
+  pipeline_id TEXT NOT NULL,
+  version INTEGER NOT NULL CHECK(version >= 1),
+  digest TEXT NOT NULL,
+  normalized_manifest TEXT NOT NULL,
+  accepted_at TEXT NOT NULL,
+  PRIMARY KEY(pipeline_id, version),
+  UNIQUE(pipeline_id, version, digest)
+);
+
+CREATE TABLE pipeline_catalog_aliases (
+  alias TEXT PRIMARY KEY,
+  pipeline_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  digest TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(pipeline_id, version, digest)
+    REFERENCES pipeline_catalog_entries(pipeline_id, version, digest) ON DELETE RESTRICT
+);
+
+CREATE TABLE runtime_capability_descriptors (
+  runtime_release TEXT PRIMARY KEY,
+  digest TEXT NOT NULL,
+  protocol TEXT NOT NULL,
+  normalized_descriptor TEXT NOT NULL,
+  accepted_at TEXT NOT NULL,
+  UNIQUE(runtime_release, digest)
+);
+
+CREATE TABLE repository_config_snapshots (
+  id TEXT PRIMARY KEY,
+  repository TEXT NOT NULL,
+  base_commit TEXT NOT NULL,
+  blob_sha TEXT NOT NULL,
+  digest TEXT NOT NULL,
+  normalized_config TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(repository, base_commit, blob_sha, digest),
+  UNIQUE(id, repository, base_commit, digest)
+);
+
+CREATE TABLE pipeline_instances (
+  id TEXT PRIMARY KEY,
+  linear_issue_id TEXT NOT NULL,
+  linear_session_id TEXT NOT NULL,
+  generation INTEGER NOT NULL CHECK(generation >= 1),
+  pipeline_id TEXT NOT NULL,
+  pipeline_version INTEGER NOT NULL,
+  manifest_digest TEXT NOT NULL,
+  normalized_manifest TEXT NOT NULL,
+  repository TEXT NOT NULL,
+  base_commit TEXT NOT NULL,
+  repository_config_snapshot_id TEXT NOT NULL,
+  repository_config_digest TEXT NOT NULL,
+  runtime_release TEXT NOT NULL,
+  capability_digest TEXT NOT NULL,
+  executor_protocol TEXT NOT NULL,
+  authorized_capabilities TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN (
+    'pending', 'dispatchable', 'running', 'waiting_provider', 'waiting_human',
+    'completion_pending_publication', 'shipped', 'no_change', 'needs_human',
+    'canceled', 'superseded', 'failed', 'publication_blocked'
+  )),
+  active_stage_id TEXT,
+  wait_reason TEXT,
+  state_version INTEGER NOT NULL DEFAULT 0 CHECK(state_version >= 0),
+  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+  reentry_count INTEGER NOT NULL DEFAULT 0 CHECK(reentry_count >= 0),
+  immutable_subject TEXT,
+  terminal_outcome TEXT CHECK(terminal_outcome IS NULL OR terminal_outcome IN (
+    'shipped', 'no_change', 'needs_human', 'canceled', 'superseded', 'failed'
+  )),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(linear_issue_id) REFERENCES tickets(linear_issue_id) ON DELETE RESTRICT,
+  FOREIGN KEY(linear_session_id) REFERENCES agent_sessions(id) ON DELETE RESTRICT,
+  FOREIGN KEY(linear_session_id, linear_issue_id, generation)
+    REFERENCES agent_sessions(id, linear_issue_id, generation) ON DELETE RESTRICT,
+  FOREIGN KEY(pipeline_id, pipeline_version, manifest_digest)
+    REFERENCES pipeline_catalog_entries(pipeline_id, version, digest) ON DELETE RESTRICT,
+  FOREIGN KEY(repository_config_snapshot_id, repository, base_commit, repository_config_digest)
+    REFERENCES repository_config_snapshots(id, repository, base_commit, digest) ON DELETE RESTRICT,
+  FOREIGN KEY(runtime_release, capability_digest)
+    REFERENCES runtime_capability_descriptors(runtime_release, digest) ON DELETE RESTRICT,
+  UNIQUE(linear_session_id, generation),
+  UNIQUE(id, generation),
+  UNIQUE(id, linear_session_id, linear_issue_id, generation)
+);
+CREATE INDEX pipeline_instances_status_idx ON pipeline_instances(status, updated_at);
+
+CREATE TABLE session_executions (
+  linear_session_id TEXT PRIMARY KEY,
+  linear_issue_id TEXT NOT NULL,
+  generation INTEGER NOT NULL CHECK(generation >= 1),
+  execution_mode TEXT NOT NULL CHECK(execution_mode IN ('legacy', 'pipeline')),
+  pipeline_instance_id TEXT UNIQUE,
+  pinned_at TEXT NOT NULL,
+  FOREIGN KEY(linear_session_id) REFERENCES agent_sessions(id) ON DELETE RESTRICT,
+  FOREIGN KEY(linear_session_id, linear_issue_id, generation)
+    REFERENCES agent_sessions(id, linear_issue_id, generation) ON DELETE RESTRICT,
+  FOREIGN KEY(linear_issue_id) REFERENCES tickets(linear_issue_id) ON DELETE RESTRICT,
+  FOREIGN KEY(pipeline_instance_id, linear_session_id, linear_issue_id, generation)
+    REFERENCES pipeline_instances(id, linear_session_id, linear_issue_id, generation) ON DELETE RESTRICT,
+  CHECK((execution_mode = 'legacy' AND pipeline_instance_id IS NULL)
+    OR (execution_mode = 'pipeline' AND pipeline_instance_id IS NOT NULL))
+);
+
+CREATE TABLE pipeline_instance_stages (
+  pipeline_instance_id TEXT NOT NULL,
+  stage_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL CHECK(ordinal >= 1),
+  status TEXT NOT NULL CHECK(status IN (
+    'pending', 'dispatchable', 'running', 'passed', 'skipped', 'waiting',
+    'failed', 'canceled', 'superseded'
+  )),
+  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+  reentry_count INTEGER NOT NULL DEFAULT 0 CHECK(reentry_count >= 0),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(pipeline_instance_id, stage_id),
+  UNIQUE(pipeline_instance_id, ordinal),
+  FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE pipeline_stage_attempts (
+  id TEXT PRIMARY KEY,
+  pipeline_instance_id TEXT NOT NULL,
+  stage_id TEXT NOT NULL,
+  attempt_ordinal INTEGER NOT NULL CHECK(attempt_ordinal >= 1),
+  reentry_ordinal INTEGER NOT NULL DEFAULT 0 CHECK(reentry_ordinal >= 0),
+  run_id TEXT UNIQUE,
+  request_hash TEXT NOT NULL UNIQUE,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  context_revision INTEGER NOT NULL CHECK(context_revision >= 0),
+  native_context_policy TEXT NOT NULL CHECK(native_context_policy IN (
+    'none', 'fresh', 'resume_required', 'prefer_resume', 'fresh_review'
+  )),
+  status TEXT NOT NULL CHECK(status IN (
+    'pending', 'leased', 'dispatched', 'acknowledged', 'running',
+    'completed', 'canceled', 'superseded', 'failed'
+  )),
+  outcome TEXT CHECK(outcome IS NULL OR outcome IN (
+    'success', 'no_change', 'semantic_repair_required',
+    'retryable_infrastructure_failure', 'needs_human', 'canceled',
+    'superseded', 'failure'
+  )),
+  result_hash TEXT,
+  started_at TEXT,
+  completed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(pipeline_instance_id, stage_id, attempt_ordinal, reentry_ordinal),
+  UNIQUE(id, pipeline_instance_id),
+  UNIQUE(id, run_id),
+  FOREIGN KEY(pipeline_instance_id, stage_id)
+    REFERENCES pipeline_instance_stages(pipeline_instance_id, stage_id) ON DELETE RESTRICT,
+  FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE RESTRICT
+);
+CREATE INDEX pipeline_attempts_status_idx ON pipeline_stage_attempts(status, updated_at);
+
+CREATE UNIQUE INDEX work_items_pipeline_binding_identity_idx
+  ON work_items(id, pipeline_instance_id);
+
+CREATE TABLE run_stage_bindings (
+  run_id TEXT PRIMARY KEY,
+  attempt_id TEXT NOT NULL UNIQUE,
+  bound_at TEXT NOT NULL,
+  FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE RESTRICT,
+  FOREIGN KEY(attempt_id, run_id)
+    REFERENCES pipeline_stage_attempts(id, run_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE pipeline_work_bindings (
+  work_item_id TEXT PRIMARY KEY,
+  pipeline_instance_id TEXT NOT NULL,
+  bound_at TEXT NOT NULL,
+  FOREIGN KEY(work_item_id, pipeline_instance_id)
+    REFERENCES work_items(id, pipeline_instance_id) ON DELETE RESTRICT,
+  FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE pipeline_inbox_events (
+  id TEXT PRIMARY KEY,
+  pipeline_instance_id TEXT NOT NULL,
+  generation INTEGER NOT NULL CHECK(generation >= 1),
+  kind TEXT NOT NULL CHECK(kind IN (
+    'stage_acknowledged', 'stage_result', 'provider_snapshot', 'human_answer',
+    'stop', 'supersede', 'effect_acknowledged', 'effect_failed'
+  )),
+  payload TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending', 'consumed', 'stale', 'dead')),
+  created_at TEXT NOT NULL,
+  consumed_at TEXT,
+  FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT
+);
+CREATE INDEX pipeline_inbox_pending_idx ON pipeline_inbox_events(pipeline_instance_id, status, created_at);
+
+CREATE TABLE pipeline_artifacts (
+  id TEXT PRIMARY KEY,
+  pipeline_instance_id TEXT NOT NULL,
+  attempt_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN (
+    'stage_result', 'review', 'command_result', 'provider_check',
+    'human_approval', 'publish_subject'
+  )),
+  schema_version INTEGER NOT NULL CHECK(schema_version >= 1),
+  assurance TEXT NOT NULL CHECK(assurance IN (
+    'semantic_attested', 'semantic_corroborated', 'executor_verified',
+    'provider_verified', 'human_approved'
+  )),
+  subject TEXT,
+  payload TEXT NOT NULL,
+  artifact_hash TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
+  FOREIGN KEY(attempt_id, pipeline_instance_id)
+    REFERENCES pipeline_stage_attempts(id, pipeline_instance_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE pipeline_gate_receipts (
+  id TEXT PRIMARY KEY,
+  pipeline_instance_id TEXT NOT NULL,
+  attempt_id TEXT NOT NULL,
+  evaluator_kind TEXT NOT NULL CHECK(evaluator_kind IN (
+    'result', 'semantic', 'command', 'provider', 'human', 'publish_subject'
+  )),
+  policy_digest TEXT NOT NULL,
+  subject TEXT,
+  result TEXT NOT NULL CHECK(result IN ('passed', 'failed', 'indeterminate', 'skipped', 'not_configured')),
+  artifact_hashes TEXT NOT NULL,
+  receipt_hash TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
+  FOREIGN KEY(attempt_id, pipeline_instance_id)
+    REFERENCES pipeline_stage_attempts(id, pipeline_instance_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE pipeline_publication_receipts (
+  id TEXT PRIMARY KEY,
+  pipeline_instance_id TEXT NOT NULL,
+  attempt_id TEXT,
+  kind TEXT NOT NULL CHECK(kind IN ('linear_ledger', 'github_summary', 'pull_request')),
+  idempotency_key TEXT NOT NULL UNIQUE,
+  payload_hash TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending', 'processing', 'acknowledged', 'failed', 'dead')),
+  external_id TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+  created_at TEXT NOT NULL,
+  acknowledged_at TEXT,
+  FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
+  FOREIGN KEY(attempt_id, pipeline_instance_id)
+    REFERENCES pipeline_stage_attempts(id, pipeline_instance_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE pipeline_effect_intents (
+  id TEXT PRIMARY KEY,
+  pipeline_instance_id TEXT NOT NULL,
+  transition_version INTEGER NOT NULL CHECK(transition_version >= 1),
+  kind TEXT NOT NULL CHECK(kind IN (
+    'provision', 'bootstrap', 'dispatch_stage', 'stop', 'quarantine', 'cleanup',
+    'publish_linear', 'publish_github', 'publish_pr'
+  )),
+  idempotency_key TEXT NOT NULL UNIQUE,
+  payload TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending', 'processing', 'acknowledged', 'failed', 'dead')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+  next_attempt_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  acknowledged_at TEXT,
+  last_error TEXT,
+  FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
+  UNIQUE(pipeline_instance_id, transition_version, kind, idempotency_key)
+);
+CREATE INDEX pipeline_effects_pending_idx ON pipeline_effect_intents(status, next_attempt_at);
+`;
+
 // Checksums must be identical in the source (tsx/vitest) and compiled Node
 // runtimes. Function#toString is transpiler-dependent, so each migration owns a
 // stable source manifest alongside its executable implementation. Never edit a
@@ -180,6 +459,22 @@ backfill-contract:active-run-liveness/v1
 running legacy run -> running liveness rooted at started_at`;
 const lifecycleEventIndexMigrationSource = `${lifecycleEventIndex}
 index-contract:create-only-when-sandbox-events-exists/v1`;
+const pipelineCoordinatorMigrationSource = `${pipelineCoordinatorSchema}
+backfill-contract:every-existing-agent-session-is-legacy/v1
+audit-bearing pipeline records use restricted foreign keys and immutable identities`;
+
+function backfillLegacySessionExecutions(db: Database.Database): void {
+  if (!hasColumns(db, "agent_sessions", ["id", "linear_issue_id", "generation"])) return;
+  const timestamp = new Date().toISOString();
+  db.prepare(`
+    INSERT OR IGNORE INTO session_executions (
+      linear_session_id, linear_issue_id, generation, execution_mode,
+      pipeline_instance_id, pinned_at
+    )
+    SELECT id, linear_issue_id, generation, 'legacy', NULL, ?
+    FROM agent_sessions
+  `).run(timestamp);
+}
 
 function hasTable(db: Database.Database, name: string): boolean {
   return Boolean(
@@ -472,6 +767,15 @@ const definitions: DatabaseMigrationDefinition[] = [
     source: lifecycleEventIndexMigrationSource,
     up(db) {
       if (hasTable(db, "sandbox_events")) db.exec(lifecycleEventIndex);
+    },
+  },
+  {
+    version: 4,
+    name: "dormant-pipeline-coordinator",
+    source: pipelineCoordinatorMigrationSource,
+    up(db) {
+      db.exec(pipelineCoordinatorSchema);
+      backfillLegacySessionExecutions(db);
     },
   },
 ];

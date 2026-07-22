@@ -1,0 +1,24 @@
+{
+  "schema": "openthrottle.runtime-capabilities/v1",
+  "release": "openthrottle-snapshot/v1",
+  "generatedBy": "sandbox-runtime-build",
+  "protocol": "stage-executor@1",
+  "capabilities": [
+    "agent/semantic@1",
+    "ce/implement@1",
+    "ce/investigate@1",
+    "command/run@1",
+    "provider/wait@1",
+    "repository/publish@1"
+  ],
+  "executors": ["agent", "command", "provider_wait", "publish"],
+  "evaluators": ["command", "human", "provider", "publish_subject", "result", "semantic"],
+  "artifacts": ["command_result", "human_approval", "provider_check", "publish_subject", "review", "stage_result"],
+  "contextPolicies": ["fresh", "fresh_review", "none", "prefer_resume", "resume_required"],
+  "credentialScopes": ["model.invoke", "provider.read", "repo.read", "repo.write"],
+  "adapters": {
+    "claude": "claude-jsonl@1",
+    "codex": "codex-jsonl@1",
+    "opencode": "opencode-jsonl@1"
+  }
+}

@@ -32,7 +32,7 @@ import {
 } from "./webhook-delivery.js";
 import { createLinearOutboxProcessor, tryPostError, type LinearOutboxProcessor } from "./linear-outbox.js";
 import { hashesMatch, tokenHash, completeRun } from "./run-lifecycle.js";
-import { handleLinearEvent } from "./linear-events.js";
+import { handleLinearEvent, type PipelineAdmissionContext } from "./linear-events.js";
 import { handleGithubEvent } from "./github-events.js";
 
 // index.ts and sweep.ts keep importing `completeRun`/`expireRun` from here so
@@ -48,6 +48,7 @@ export interface ServerDeps {
   getLinearClient?: () => Promise<LinearClient | undefined>;
   deliveryProcessor?: WebhookDeliveryProcessor;
   linearOutboxProcessor?: LinearOutboxProcessor;
+  pipelineAdmission?: PipelineAdmissionContext;
 }
 
 function bearerToken(header: string | undefined): string | undefined {
@@ -139,6 +140,7 @@ export function createServerWebhookDeliveryProcessor(deps: {
   daytona: Daytona;
   getLinearClient: () => Promise<LinearClient | undefined>;
   linearOutbox?: LinearOutboxProcessor;
+  pipelineAdmission?: PipelineAdmissionContext;
 }): WebhookDeliveryProcessor {
   const linearOutbox =
     deps.linearOutbox ??
@@ -166,7 +168,8 @@ export function createServerWebhookDeliveryProcessor(deps: {
           deps.daytona,
           deps.getLinearClient,
           linearOutbox,
-          parseLinearWebhook(delivery.payload)
+          parseLinearWebhook(delivery.payload),
+          deps.pipelineAdmission
         );
         return;
       }
@@ -196,6 +199,7 @@ export function createServer(deps: ServerDeps): Hono {
       daytona,
       getLinearClient,
       linearOutbox: linearOutboxProcessor,
+      pipelineAdmission: deps.pipelineAdmission,
     });
   const oauthStates = createLinearOAuthStateStore(() => randomBytes(16).toString("hex"));
   const schedule =

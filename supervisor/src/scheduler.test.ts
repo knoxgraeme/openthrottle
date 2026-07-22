@@ -5,10 +5,20 @@ import {
   feedbackMessage,
   isAutomaticWorkBounded,
   isResolvableFeedbackWorkId,
+  selectExecutionMode,
   shouldNudgeAfterRun,
   type DrainParams,
   type LaunchExistingTask,
 } from "./scheduler.js";
+
+describe("selectExecutionMode", () => {
+  it("applies admission only to unpinned generations", () => {
+    expect(selectExecutionMode({ pipelineAdmissionEnabled: false })).toBe("legacy");
+    expect(selectExecutionMode({ pipelineAdmissionEnabled: true })).toBe("pipeline");
+    expect(selectExecutionMode({ pinnedMode: "legacy", pipelineAdmissionEnabled: true })).toBe("legacy");
+    expect(selectExecutionMode({ pinnedMode: "pipeline", pipelineAdmissionEnabled: false })).toBe("pipeline");
+  });
+});
 
 describe("isAutomaticWorkBounded", () => {
   it("bounds only automatic work, at or past the configured max rounds", () => {

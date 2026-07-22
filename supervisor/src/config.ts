@@ -4,6 +4,7 @@
 // provisioning so one unavailable agent does not prevent the supervisor booting.
 
 import type { Agent } from "./db.js";
+import { fileURLToPath } from "node:url";
 
 function required(name: string): string {
   const v = process.env[name];
@@ -125,6 +126,10 @@ export interface Config {
   allowLinearMerge: boolean;
   sandboxEventPollIntervalMs: number;
   stallTimeoutSeconds: number;
+  pipelineAdmissionEnabled: boolean;
+  pipelineCatalogPath: string;
+  sandboxRuntimeRelease: string;
+  sandboxRuntimeDescriptorPath: string;
 }
 
 export function loadConfig(): Config {
@@ -168,6 +173,16 @@ export function loadConfig(): Config {
     allowLinearMerge: optionalBool("ALLOW_LINEAR_MERGE", false),
     sandboxEventPollIntervalMs: optionalInt("SANDBOX_EVENT_POLL_INTERVAL_MS", 5_000),
     stallTimeoutSeconds: optionalInt("STALL_TIMEOUT_SECONDS", 900),
+    pipelineAdmissionEnabled: optionalBool("PIPELINE_COORDINATOR_ENABLED", false),
+    pipelineCatalogPath: optional(
+      "PIPELINE_CATALOG_PATH",
+      fileURLToPath(new URL("../pipelines/catalog.yaml", import.meta.url))
+    ),
+    sandboxRuntimeRelease: optional("SANDBOX_RUNTIME_RELEASE", "openthrottle-snapshot/v1"),
+    sandboxRuntimeDescriptorPath: optional(
+      "SANDBOX_RUNTIME_DESCRIPTOR_PATH",
+      fileURLToPath(new URL("../pipelines/runtime-capabilities-v1.json", import.meta.url))
+    ),
   };
 
   if (!cfg.claudeCodeOauthToken) {
@@ -202,6 +217,9 @@ export function loadConfig(): Config {
   requireRange("REVIEW_MAX_ROUNDS", cfg.reviewMaxRounds, 1);
   requireRange("SANDBOX_EVENT_POLL_INTERVAL_MS", cfg.sandboxEventPollIntervalMs, 1_000);
   requireRange("STALL_TIMEOUT_SECONDS", cfg.stallTimeoutSeconds, 60);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}$/.test(cfg.sandboxRuntimeRelease)) {
+    throw new Error(`SANDBOX_RUNTIME_RELEASE has an invalid format: ${cfg.sandboxRuntimeRelease}`);
+  }
   try {
     const url = new URL(cfg.supervisorUrl);
     if (!/^https?:$/.test(url.protocol)) throw new Error("unsupported protocol");

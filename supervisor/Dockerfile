@@ -14,6 +14,7 @@ COPY package.json package-lock.json* ./
 RUN npm ci
 COPY tsconfig.json tsconfig.build.json ./
 COPY src ./src
+COPY pipelines ./pipelines
 RUN npm run build
 # Strip devDependencies (typescript, tsx, @types/*) from node_modules,
 # leaving the built better-sqlite3 native binary intact for the runtime stage.
@@ -25,6 +26,7 @@ ENV NODE_ENV=production
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
+COPY --from=build /app/pipelines ./pipelines
 
 # /data is where the SQLite DB lives (see fly.toml [mounts] and DATABASE_PATH default).
 RUN mkdir -p /data

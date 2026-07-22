@@ -15,11 +15,19 @@ import {
 } from "./linear.js";
 import {
   branchExists,
+  getRepositoryConfigAtCommit,
   getMergeReadiness,
   mergePullRequest,
   parsePullRequestUrl,
   type GithubClient,
 } from "./github.js";
+import {
+  parseRepositoryConfig,
+  resolvePipelineReference,
+  type ValidatedPipelineCatalog,
+} from "./pipeline-manifest.js";
+import type { PipelineStore } from "./pipeline-store.js";
+import type { ValidatedRuntimeCapabilityDescriptor } from "./sandbox-runtime.js";
 import {
   createForTicket,
   deleteSandbox,
@@ -47,6 +55,7 @@ import { getCodexAuthForSeed } from "./codex-auth.js";
 import { sanitizeText } from "./sanitize.js";
 import { parseCommand } from "./commands.js";
 import { stopTicket } from "./ticket-control.js";
+import { selectExecutionMode } from "./scheduler.js";
 
 function linearContext(
   payload: ReturnType<typeof parseLinearWebhook>,
@@ -114,17 +123,24 @@ export async function handleLinearEvent(
   daytona: Daytona,
   getLinearClient: () => Promise<LinearClient | undefined>,
   linearOutbox: LinearOutboxProcessor,
-  payload: ReturnType<typeof parseLinearWebhook>
+  payload: ReturnType<typeof parseLinearWebhook>,
+  pipelineAdmission?: PipelineAdmissionContext
 ): Promise<void> {
   const linear = await getLinearClient();
   if (!linear) {
     throw new Error("No valid Linear OAuth token is stored");
   }
   if (payload.action === "created") {
-    await handleCreated(cfg, store, daytona, linear, linearOutbox, payload);
+    await handleCreated(cfg, store, daytona, linear, linearOutbox, payload, pipelineAdmission);
   } else {
     await handlePrompted(cfg, store, daytona, linear, linearOutbox, payload);
   }
+}
+
+export interface PipelineAdmissionContext {
+  catalog: ValidatedPipelineCatalog;
+  runtime: ValidatedRuntimeCapabilityDescriptor;
+  store: PipelineStore;
 }
 
 async function handleCreated(
@@ -133,7 +149,8 @@ async function handleCreated(
   daytona: Daytona,
   linear: LinearClient,
   linearOutbox: LinearOutboxProcessor,
-  payload: ReturnType<typeof parseLinearWebhook>
+  payload: ReturnType<typeof parseLinearWebhook>,
+  pipelineAdmission?: PipelineAdmissionContext
 ): Promise<void> {
   const issue = payload.agentSession.issue;
   const sessionId = payload.agentSession.id;
@@ -141,6 +158,10 @@ async function handleCreated(
     await tryPostError(store, linearOutbox, sessionId, undefined, "OpenThrottle could not find an issue on this agent session.");
     return;
   }
+  const initialContext = linearContext(
+    payload,
+    `# ${issue.identifier}\n\nNo Linear prompt context was supplied for this delegation.`
+  );
   await enqueueActivity(store, linearOutbox, {
     sessionId,
     type: "thought",
@@ -150,6 +171,15 @@ async function handleCreated(
 
   const labels = extractLabelNames(payload);
   const existing = store.getByIssueId(issue.id);
+  const pinnedMode = pipelineAdmission?.store.getSessionExecutionMode(sessionId);
+  if (pinnedMode === "pipeline") {
+    const pinned = pipelineAdmission?.store.getInstanceForSession(sessionId);
+    if (!pinned || pinned.linear_issue_id !== issue.id) {
+      throw new Error(`pipeline session ${sessionId} has an invalid issue binding`);
+    }
+    store.setLinearContext(issue.id, initialContext);
+    return;
+  }
   // A `branch` label targets a per-task base branch for this ticket, overriding
   // the route's default. It is a flat `branch › <name>` label (matched straight
   // from the webhook, no extra call) or a Linear label group named `branch` whose
@@ -209,10 +239,6 @@ async function handleCreated(
     );
     return;
   }
-  const initialContext = linearContext(
-    payload,
-    `# ${issue.identifier}\n\nNo Linear prompt context was supplied for this delegation.`
-  );
   if (!selectedRepository) {
     await tryPostError(
       store,
@@ -332,6 +358,71 @@ async function handleCreated(
     pr_url: null,
     state: "active" as const,
   };
+  if (selectExecutionMode({
+    pinnedMode,
+    pipelineAdmissionEnabled: cfg.pipelineAdmissionEnabled,
+  }) === "pipeline") {
+    if (!pipelineAdmission) throw new Error("pipeline admission is enabled without a catalog/runtime context");
+    const failSelection = async (error: unknown) => {
+      const message = sanitizeText(`Pipeline selection failed before sandbox provisioning: ${String(error)}`);
+      store.upsert({ ...ticketCore, state: "error" });
+      store.setState(issue.id, "error", message);
+      store.setLinearContext(issue.id, initialContext);
+      await tryPostError(store, linearOutbox, sessionId, issue.id, message);
+    };
+    let pinned: {
+      remote: Awaited<ReturnType<typeof getRepositoryConfigAtCommit>>;
+      manifest: ReturnType<typeof resolvePipelineReference>;
+      snapshot: ReturnType<PipelineStore["saveRepositoryConfigSnapshot"]>;
+    };
+    try {
+      const remote = await getRepositoryConfigAtCommit(
+        { token: cfg.githubToken },
+        selectedRepository.repo,
+        selectedRepository.baseBranch
+      );
+      const repositoryConfig = parseRepositoryConfig(
+        remote.content,
+        `${selectedRepository.repo}@${remote.baseCommit}:.openthrottle.yml`
+      );
+      const intent = taskType === "investigate" ? "investigate" : "implement";
+      const reference = repositoryConfig.config.pipelines?.[intent] ?? intent;
+      const manifest = resolvePipelineReference(pipelineAdmission.catalog, reference);
+      const snapshot = pipelineAdmission.store.saveRepositoryConfigSnapshot({
+        repository: selectedRepository.repo,
+        baseCommit: remote.baseCommit,
+        blobSha: remote.blobSha,
+        config: repositoryConfig,
+      });
+      pinned = { remote, manifest, snapshot };
+    } catch (error) {
+      await failSelection(error);
+      return;
+    }
+    try {
+      store.upsert({
+        ...ticketCore,
+        pipeline: {
+          repository: selectedRepository.repo,
+          baseCommit: pinned.remote.baseCommit,
+          manifest: pinned.manifest,
+          repositoryConfig: pinned.snapshot,
+          runtime: pipelineAdmission.runtime,
+          authorizedCapabilities: pinned.manifest.manifest.requires.capabilities,
+        },
+      });
+    } catch (error) {
+      await failSelection(error);
+      return;
+    }
+    store.setLinearContext(issue.id, initialContext);
+    await enqueueActivity(store, linearOutbox, {
+      sessionId,
+      type: "thought",
+      body: `Pinned pipeline ${pinned.manifest.manifest.id}@${pinned.manifest.manifest.version} (${pinned.manifest.digest.slice(0, 12)}) at base ${pinned.remote.baseCommit.slice(0, 12)}. The durable coordinator will dispatch its first stage.`,
+    }, issue.id);
+    return;
+  }
   store.upsert(ticketCore);
   store.setLinearContext(issue.id, initialContext);
   const recovered = await findSandboxForTicket(daytona, issue.identifier);

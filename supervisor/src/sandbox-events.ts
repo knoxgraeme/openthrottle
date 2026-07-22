@@ -1,7 +1,7 @@
 import type { Daytona, Sandbox } from "@daytona/sdk";
 import type { AgentActivityInput, AgentPlanItem, AgentPlanStatus } from "./linear.js";
 import type { Ticket, TicketStore } from "./db.js";
-import { ensureSandboxActive } from "./daytona.js";
+import { ensureSandboxActive, setSandboxActive, setSandboxIdle } from "./daytona.js";
 import { reconcileSandboxAutostop } from "./sandbox-lifecycle.js";
 import { isGithubPullRequestUrl } from "./github.js";
 import { MAX_PRIVATE_LOG_TAIL_BYTES, MAX_PRIVATE_LOG_TAIL_CHARS } from "./logs.js";
@@ -349,10 +349,13 @@ async function pollTicketEvents(
     await ensureSandboxActive(sandbox);
     if (params.store.getByIssueId(ticket.linear_issue_id)?.run_id !== ticket.run_id) {
       await reconcileSandboxAutostop({
-        daytona: params.daytona,
+        runtime: {
+          setActive: (id) => setSandboxActive(params.daytona, id),
+          setIdle: (id) => setSandboxIdle(params.daytona, id),
+        },
         store: params.store,
         issueId: ticket.linear_issue_id,
-        sandboxId: ticket.sandbox_id,
+        providerResourceId: ticket.sandbox_id,
       });
       return;
     }

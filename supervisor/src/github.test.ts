@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   areAllReviewThreadsResolved,
   branchExists,
+  getRepositoryConfigAtCommit,
   getMergeReadiness,
   isGithubPullRequestUrl,
   isOpenthrottleBranch,
@@ -132,6 +133,41 @@ describe("GitHub contracts", () => {
     expect(await branchExists(client, "o/r", "feature/x")).toBe(true);
     expect(await branchExists(client, "o/r", "missing")).toBe(false);
     await expect(branchExists(client, "o/r", "boom")).rejects.toThrow(/GitHub API error \(500\)/);
+  });
+
+  it("pins repository config to the exact resolved commit and blob", async () => {
+    const content = "pipelines:\n  implement: implement\n";
+    const requested: string[] = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      requested.push(url);
+      if (url.endsWith("/commits/feature%2Fpipeline")) {
+        return Response.json({ sha: "a".repeat(40) });
+      }
+      if (url.endsWith(`/contents/.openthrottle.yml?ref=${"a".repeat(40)}`)) {
+        return Response.json({
+          type: "file",
+          sha: "b".repeat(40),
+          encoding: "base64",
+          content: Buffer.from(content).toString("base64"),
+          size: Buffer.byteLength(content),
+        });
+      }
+      throw new Error(`unexpected request ${url}`);
+    }) as unknown as typeof fetch;
+
+    await expect(getRepositoryConfigAtCommit(
+      { token: "github", fetch: fetchMock },
+      "owner/repo",
+      "feature/pipeline"
+    )).resolves.toEqual({
+      repository: "owner/repo",
+      branch: "feature/pipeline",
+      baseCommit: "a".repeat(40),
+      blobSha: "b".repeat(40),
+      content,
+    });
+    expect(requested[1]).toContain(`ref=${"a".repeat(40)}`);
   });
 
   it("verifies a repository and creates its OpenThrottle webhook", async () => {

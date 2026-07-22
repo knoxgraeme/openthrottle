@@ -40,6 +40,10 @@ const cfg: Config = {
   allowLinearMerge: false,
   sandboxEventPollIntervalMs: 5_000,
   stallTimeoutSeconds: 900,
+  pipelineAdmissionEnabled: false,
+  pipelineCatalogPath: "pipelines/catalog.yaml",
+  sandboxRuntimeRelease: "openthrottle-snapshot/v1",
+  sandboxRuntimeDescriptorPath: "pipelines/runtime-capabilities-v1.json",
 };
 
 let db: Database.Database | undefined;

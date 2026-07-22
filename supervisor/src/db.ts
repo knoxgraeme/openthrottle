@@ -15,6 +15,10 @@ import {
   type FeedbackSnapshot,
   type FeedbackSnapshotEvent,
 } from "./feedback-store.js";
+import {
+  createPipelineStore,
+  type PipelineInstanceSeed,
+} from "./pipeline-store.js";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS tickets (
@@ -79,6 +83,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS agent_sessions_current_issue_idx
   WHERE state = 'current';
 CREATE INDEX IF NOT EXISTS agent_sessions_issue_generation_idx
   ON agent_sessions(linear_issue_id, generation);
+CREATE UNIQUE INDEX IF NOT EXISTS agent_sessions_identity_idx
+  ON agent_sessions(id, linear_issue_id, generation);
 
 CREATE TABLE IF NOT EXISTS session_work (
   id TEXT PRIMARY KEY,
@@ -322,7 +328,10 @@ type TicketUpsert = Pick<
   | "repo"
   | "pr_url"
   | "state"
-> & { base_branch?: string };
+> & {
+  base_branch?: string;
+  pipeline?: Omit<PipelineInstanceSeed, "issueId" | "sessionId" | "generation">;
+};
 
 interface RepositoryRegistration {
   linear_team_key: string;
@@ -613,6 +622,7 @@ export function createTicketStore(db: Database.Database): TicketStore {
   const now = () => new Date().toISOString();
   const workStore = createWorkStore(db);
   const feedbackStore = createFeedbackStore(db);
+  const pipelineStore = createPipelineStore(db);
   const hashPayload = (payload: string) => createHash("sha256").update(payload).digest("hex");
   const upsertStmt = db.prepare(`
     INSERT INTO tickets (
@@ -1245,13 +1255,35 @@ export function createTicketStore(db: Database.Database): TicketStore {
     upsert(ticket) {
       const existing = getByIssueIdStmt.get(ticket.linear_issue_id) as Ticket | undefined;
       db.transaction(() => {
+        const { pipeline, ...ticketRow } = ticket;
         upsertStmt.run({
-        ...ticket,
-        base_branch: ticket.base_branch ?? existing?.base_branch ?? "main",
-        created_at: existing?.created_at ?? now(),
-        updated_at: now(),
+          ...ticketRow,
+          base_branch: ticket.base_branch ?? existing?.base_branch ?? "main",
+          created_at: existing?.created_at ?? now(),
+          updated_at: now(),
         });
-        supersedeCurrentSessionTransaction(ticket.linear_issue_id, ticket.linear_session_id);
+        const session = supersedeCurrentSessionTransaction(
+          ticket.linear_issue_id,
+          ticket.linear_session_id
+        );
+        pipelineStore.supersedeOtherInstances(
+          ticket.linear_issue_id,
+          ticket.linear_session_id
+        );
+        if (pipeline) {
+          pipelineStore.createInstance({
+            ...pipeline,
+            issueId: ticket.linear_issue_id,
+            sessionId: ticket.linear_session_id,
+            generation: session.generation,
+          });
+        } else {
+          pipelineStore.pinLegacySession(
+            ticket.linear_session_id,
+            ticket.linear_issue_id,
+            session.generation
+          );
+        }
       })();
     },
     getByIssueId(issueId) {

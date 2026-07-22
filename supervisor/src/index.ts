@@ -10,6 +10,9 @@ import { pollSandboxEvents } from "./sandbox-events.js";
 import { deliverPendingInbox } from "./inbox.js";
 import { reapStalledRuns } from "./reaper.js";
 import { activityPayload, createLinearOutboxProcessor, enqueueSessionUpdate } from "./linear-outbox.js";
+import { loadPipelineCatalog } from "./pipeline-manifest.js";
+import { createPipelineStore } from "./pipeline-store.js";
+import { loadRuntimeCapabilityDescriptor } from "./sandbox-runtime.js";
 
 const SWEEP_INTERVAL_MS = 15 * 60 * 1000; // run every 15 min while awake; SPEC only requires "on every boot" + periodic while awake
 const DELIVERY_DRAIN_INTERVAL_MS = 30 * 1000;
@@ -22,6 +25,19 @@ async function main() {
 
   const db = openDb(cfg.databasePath);
   const store = createTicketStore(db);
+  const pipelineStore = createPipelineStore(db);
+  const runtimeCapabilities = loadRuntimeCapabilityDescriptor(
+    cfg.sandboxRuntimeDescriptorPath,
+    cfg.sandboxRuntimeRelease
+  );
+  // Catalog wishes and runtime evidence are built independently, then checked
+  // against one another before either is accepted into the durable ledger.
+  const pipelineCatalog = loadPipelineCatalog(
+    cfg.pipelineCatalogPath,
+    runtimeCapabilities.descriptor
+  );
+  pipelineStore.acceptRuntimeDescriptor(runtimeCapabilities);
+  pipelineStore.acceptCatalog(pipelineCatalog);
 
   const daytona = new Daytona({ apiKey: cfg.daytonaApiKey });
   const getLinearClient = createLinearClientProvider(cfg, store);
@@ -32,6 +48,11 @@ async function main() {
     daytona,
     getLinearClient,
     linearOutbox: linearOutboxProcessor,
+    pipelineAdmission: {
+      catalog: pipelineCatalog,
+      runtime: runtimeCapabilities,
+      store: pipelineStore,
+    },
   });
 
   const app = createServer({
