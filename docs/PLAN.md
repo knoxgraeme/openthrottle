@@ -70,8 +70,13 @@ includes green CI.
 5. **Fresh-context phases beat long-running orchestrators.** The ecosystem
    converged on state-in-files/git with fresh agent context per run (the Ralph
    insight; v1's phased orchestrator learned it independently). → v2 has no
-   orchestrator: skills carry the procedure, git/Linear carry the state, the
-   supervisor only does lifecycle.
+   *reasoning* orchestrator: skills carry the procedure, git/Linear carry the
+   state, and the supervisor never performs semantic reasoning. It does own a
+   *deterministic pipeline coordinator* — introduced by the Configurable
+   Agentic Pipeline Coordinator plan — that validates evidence and advances
+   typed state transitions but never reasons about the work itself. "No
+   orchestrator" means no reasoning orchestrator in the supervisor, not the
+   absence of deterministic lifecycle coordination.
 6. **`codex exec` is a near-peer of `claude -p`, with caveats.** JSONL
    streaming, resume, MCP, AGENTS.md all exist; but Codex subagents are
    experimental and approval-constrained under `exec`, and `--full-auto` was

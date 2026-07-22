@@ -3336,6 +3336,10 @@ describe("createServer lifecycle", () => {
       source: "automatic",
       body: "already-addressed feedback",
     });
+    db.prepare("UPDATE session_work SET created_at = ? WHERE id = ?").run(
+      "2000-01-01T00:00:00.000Z",
+      "gh-review-901"
+    );
     const envUpdates: Array<Record<string, string>> = [];
     const sandbox = {
       state: "started",
@@ -3439,6 +3443,10 @@ describe("createServer lifecycle", () => {
       source: "automatic",
       body: "already-addressed-looking feedback",
     });
+    db.prepare("UPDATE session_work SET created_at = ? WHERE id = ?").run(
+      "2000-01-01T00:00:00.000Z",
+      "gh-comment-901"
+    );
     const envUpdates: Array<Record<string, string>> = [];
     const sandbox = {
       state: "started",
@@ -3539,6 +3547,10 @@ describe("createServer lifecycle", () => {
       source: "automatic",
       body: "Review summary: the retry loop swallows the original error.",
     });
+    db.prepare("UPDATE session_work SET created_at = ? WHERE id = ?").run(
+      "2000-01-01T00:00:00.000Z",
+      "gh-rvbody-902"
+    );
     const envUpdates: Array<Record<string, string>> = [];
     const sandbox = {
       state: "started",

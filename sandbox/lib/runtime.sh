@@ -95,3 +95,41 @@ task_ce_pipeline() {
     *) return 1 ;;
   esac
 }
+
+# Extract a string field from a Codex auth.json blob; empty on absent/invalid.
+codex_auth_field() {
+  # $1 = json blob, $2 = jq path (e.g. '.last_refresh')
+  jq -r "$2 // empty" <<<"$1" 2>/dev/null || true
+}
+
+# Decide how to reconcile a freshly-seeded Codex auth blob against the blob
+# already present in the sandbox on resume. The supervisor now refreshes the
+# rotating subscription token centrally before seeding (see codex-auth.ts), so
+# the seed can be *newer* than the sandbox's local copy — but it can also be
+# older if Codex rotated again mid-run. Install whichever is newest and trusted;
+# never cross accounts. Echoes exactly one of:
+#   seed         -> the seed is strictly newer; install it
+#   keep         -> the existing sandbox token is newer-or-equal (or ages are
+#                   unknown); keep it, since overwriting with an older/unknown
+#                   blob would replay a spent refresh token
+#   incompatible -> the two blobs name different accounts; caller must fail closed
+# Args: $1 = seed blob, $2 = existing blob
+codex_reconcile_auth() {
+  local seed="$1" existing="$2"
+  local seed_acct existing_acct seed_ts existing_ts
+  seed_acct="$(codex_auth_field "$seed" '.tokens.account_id')"
+  existing_acct="$(codex_auth_field "$existing" '.tokens.account_id')"
+  if [[ -n "$seed_acct" && -n "$existing_acct" && "$seed_acct" != "$existing_acct" ]]; then
+    printf '%s' 'incompatible'
+    return 0
+  fi
+  seed_ts="$(codex_auth_field "$seed" '.last_refresh')"
+  existing_ts="$(codex_auth_field "$existing" '.last_refresh')"
+  # ISO-8601 UTC timestamps compare chronologically as byte strings. Only
+  # override the rotated sandbox token when the seed is STRICTLY newer.
+  if [[ -n "$seed_ts" && ( -z "$existing_ts" || "$seed_ts" > "$existing_ts" ) ]]; then
+    printf '%s' 'seed'
+    return 0
+  fi
+  printf '%s' 'keep'
+}

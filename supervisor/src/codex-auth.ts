@@ -40,6 +40,12 @@ const CODEX_OAUTH_SCOPE = "openid profile email";
 // would force an immediate — and, across concurrent runs, racing — refresh).
 const REFRESH_LEEWAY_MS = 15 * 60 * 1000;
 
+// Hard bound on the central refresh exchange. A refresh endpoint that accepts
+// the connection but never responds must not hold the shared in-flight refresh
+// promise (and therefore every coalesced seed request) open indefinitely — it
+// is cancelled and the caller falls back to seeding the stored token.
+const REFRESH_TIMEOUT_MS = 10 * 1000;
+
 interface CodexAuthShape {
   tokens?: { refresh_token?: unknown; access_token?: unknown };
   last_refresh?: unknown;
@@ -158,24 +164,72 @@ interface CodexRefreshResponse {
 export async function refreshCodexAuthJson(
   currentBlob: string,
   nowIso: string,
-  fetchImpl: typeof fetch = fetch
+  fetchImpl: typeof fetch = fetch,
+  timeoutMs: number = REFRESH_TIMEOUT_MS
 ): Promise<string | undefined> {
   const refreshToken = codexRefreshToken(currentBlob);
   if (!refreshToken) return undefined;
-  const response = await fetchImpl(CODEX_TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      client_id: CODEX_OAUTH_CLIENT_ID,
-      grant_type: "refresh_token",
-      refresh_token: refreshToken,
-      scope: CODEX_OAUTH_SCOPE,
-    }),
+
+  // Bound the exchange with an AbortController. The `signal` cancels a real
+  // fetch's socket; the abort-driven race additionally rejects even a stub (or
+  // a pathological runtime) that ignores the signal, so the timeout is
+  // observable regardless of the fetch implementation.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const abortRejection = new Promise<never>((_, reject) => {
+    controller.signal.addEventListener(
+      "abort",
+      () => reject(new Error(`Codex token refresh timed out after ${timeoutMs}ms`)),
+      { once: true }
+    );
   });
-  if (!response.ok) {
-    throw new Error(`Codex token refresh failed with status ${response.status}`);
+
+  let response: Response;
+  let refreshed: CodexRefreshResponse;
+  try {
+    try {
+      response = await Promise.race([
+        fetchImpl(CODEX_TOKEN_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            client_id: CODEX_OAUTH_CLIENT_ID,
+            grant_type: "refresh_token",
+            refresh_token: refreshToken,
+            scope: CODEX_OAUTH_SCOPE,
+          }),
+          signal: controller.signal,
+        }),
+        abortRejection,
+      ]);
+    } catch {
+      // Sanitize: never let a transport error carry request body/token content
+      // into logs. The timeout keeps its own explicit message.
+      if (controller.signal.aborted) {
+        throw new Error(`Codex token refresh timed out after ${timeoutMs}ms`);
+      }
+      throw new Error("Codex token refresh request failed");
+    }
+    if (!response.ok) {
+      throw new Error(`Codex token refresh failed with status ${response.status}`);
+    }
+    try {
+      // Keep the same deadline active through response-body consumption. Fetch
+      // resolves when headers arrive, while `json()` may still block on a slow
+      // or truncated body; both phases are one bounded exchange.
+      refreshed = (await Promise.race([
+        response.json(),
+        abortRejection,
+      ])) as CodexRefreshResponse;
+    } catch {
+      if (controller.signal.aborted) {
+        throw new Error(`Codex token refresh timed out after ${timeoutMs}ms`);
+      }
+      throw new Error("Codex token refresh response was invalid");
+    }
+  } finally {
+    clearTimeout(timer);
   }
-  const refreshed = (await response.json()) as CodexRefreshResponse;
   if (!refreshed.access_token && !refreshed.refresh_token) {
     throw new Error("Codex token refresh returned no tokens");
   }
@@ -217,7 +271,10 @@ export async function getCodexAuthForSeed(
       store.setSetting(SETTINGS_CODEX_AUTH_JSON, refreshed);
       return refreshed;
     } catch (error) {
-      console.warn("[codex-auth] preflight refresh failed; seeding the stored token:", error);
+      // Log only the sanitized message (never the error object/stack, which
+      // could carry request context) so no token material reaches logs.
+      const reason = error instanceof Error ? error.message : "unknown error";
+      console.warn(`[codex-auth] preflight refresh failed; seeding the stored token: ${reason}`);
       return current;
     } finally {
       refreshInFlight.delete(store);

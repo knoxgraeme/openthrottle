@@ -123,7 +123,7 @@ Engineering / "CE")**. Keep new logic on the correct side:
   hand-maintained source per task (`implement-plan`, `investigate`); its YAML
   frontmatter is exactly what Claude Code loads as a user skill. The two agent
   loops: **implement** = plan gate → `ce-work` → local `ce-code-review` →
-  conditional `ce-simplify` → configured gates → `ce-commit-push-pr` →
+  conditional `ce-simplify-code` → configured gates → `ce-commit-push-pr` →
   resolve/retarget PR; **investigate** = action-capable `ce-debug
   mode:pipeline`. Read `skills/README.md` before editing anything here.
 

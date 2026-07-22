@@ -52,6 +52,62 @@ describe("OpenThrottle canonical task skills", () => {
     expect(allSkillsText()).not.toContain("ce-babysit-pr");
   });
 
+  it("names the pinned ce-simplify-code skill, never the nonexistent ce-simplify (finding #2)", () => {
+    // The conditional simplification stage must name the CE skill that is
+    // actually installed in the snapshot: `ce-simplify-code`. A bare
+    // `ce-simplify` resolves to nothing, so the stage silently no-ops.
+    expect(allSkillsText()).not.toMatch(/ce-simplify(?!-code)/);
+    expect(skillBody("implement-plan")).toContain("ce-simplify-code");
+  });
+
+  it("keeps the repo-root guidance docs free of the nonexistent ce-simplify (finding #2)", () => {
+    // The CE pipeline composition is also spelled out in the repo-root agent
+    // guidance (AGENTS.md, imported by CLAUDE.md). The skills-tree scan above
+    // does not cover those, so guard them explicitly — a bare `ce-simplify`
+    // there is the same silent-no-op regression, just outside skills/.
+    for (const rel of ["AGENTS.md", "CLAUDE.md"]) {
+      const p = resolve(repoRoot, rel);
+      if (!existsSync(p)) continue;
+      expect(readFileSync(p, "utf8")).not.toMatch(/ce-simplify(?!-code)/);
+    }
+  });
+
+  it("references only compound-engineering skills that the pinned plugin ships (finding #2)", () => {
+    // Every `ce-*` token the adapters compose must resolve to a real skill in
+    // the installed CE plugin. This catches renamed/removed/typo'd skill names
+    // (e.g. the historical `ce-simplify` → `ce-simplify-code` drift) in source
+    // before the snapshot build. Snapshot-level resolution against the built
+    // image remains a separate infra-gated check (audit findings #2, #20).
+    const CE_PLUGIN_SKILLS = new Set([
+      "ce-brainstorm",
+      "ce-code-review",
+      "ce-commit",
+      "ce-commit-push-pr",
+      "ce-compound",
+      "ce-compound-refresh",
+      "ce-debug",
+      "ce-doc-review",
+      "ce-ideate",
+      "ce-optimize",
+      "ce-plan",
+      "ce-proof",
+      "ce-resolve-pr-feedback",
+      "ce-riffrec-feedback-analysis",
+      "ce-simplify-code",
+      "ce-strategy",
+      "ce-test-browser",
+      "ce-work",
+      "ce-worktree",
+    ]);
+    const referenced = new Set(
+      [...allSkillsText().matchAll(/\bce-[a-z][a-z-]*[a-z]\b/g)].map(
+        (m) => m[0],
+      ),
+    );
+    const unknown = [...referenced].filter((s) => !CE_PLUGIN_SKILLS.has(s));
+    expect(unknown).toEqual([]);
+  });
+
   it("implement-plan keeps the plan gate, decision gate, and assumptions ledger", () => {
     const body = skillBody("implement-plan");
     expect(body).toContain("stop without changing code");

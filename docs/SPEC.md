@@ -14,6 +14,41 @@ replies in Linear. Closing the PR deletes the sandbox.
 
 One ticket has at most one active run. Tickets may run in parallel.
 
+### Canonical vocabulary
+
+These terms are used consistently across every component contract below. The
+Configurable Agentic Pipeline Coordinator plan introduces the pipeline/stage/
+gate/attempt layer; the definitions here are the source of truth when a
+component doc and that plan disagree.
+
+- **Autonomous loop** — the durable ticket/event lifecycle from delegation to a
+  terminal outcome. It is *not* a pipeline; it is the outer machine that drives
+  one.
+- **Pipeline** — the configured, versioned execution graph the loop runs. A
+  pipeline is data (a validated manifest), not agent prose.
+- **Stage** — one execution unit within a pipeline (an agent capability or a
+  repository command).
+- **Gate** — a transition condition evaluated over typed evidence. A gate is a
+  deterministic decision the supervisor makes; an agent can produce evidence but
+  never declares its own gate passed.
+- **Attempt** — one immutable execution of a stage. A retry creates a new
+  attempt, never mutates the prior one.
+- **Resume** — a native-session continuation policy that continues the saved
+  agent session/thread with a follow-up message. Resume is a context policy, not
+  a pipeline or a task type.
+
+The supervisor is gaining a **deterministic pipeline coordinator** (introduced
+by the Configurable Agentic Pipeline Coordinator plan; not all of its state and
+evaluators are wired up yet): it validates evidence and advances typed state
+transitions, but performs no semantic reasoning. This is distinct from the
+legacy `## OpenThrottle gates` PR checklist, which is agent-authored progress
+prose — not a pipeline Gate. All agent reasoning stays inside explicitly
+requested sandbox stages.
+Runtime safety invariants (authentication, branch/push protection, one active
+actor per ticket, fail-closed routing, minimal credentials, sanitization,
+generation fencing) are non-configurable and are never expressed as product
+gates.
+
 ## Components
 
 ```text
@@ -284,11 +319,13 @@ refresh, so `CODEX_AUTH_JSON` is only a bootstrap seed: the supervisor seeds
 each fresh sandbox from the stored blob, reads back the token Codex rotated in
 the sandbox on run completion, and reseeds later runs from it. Replaying the
 frozen env snapshot would present an already-spent refresh token ("refresh
-token was already used"). A resumed sandbox keeps its own rotated `auth.json`
-rather than being overwritten by the seed. Before seeding, a near-expiry token
-is refreshed centrally behind a single in-flight promise, so concurrent runs
-off the one shared subscription account coalesce onto one refresh instead of
-racing to spend the same token, and each run is handed the freshest token.
+token was already used"). On resume, the supervisor seed and sandbox
+`auth.json` are reconciled by account lineage and `last_refresh`: a strictly
+newer compatible record wins in either direction, while incompatible accounts
+fail closed before the agent starts. Before seeding, a near-expiry token is
+refreshed centrally behind a single in-flight promise, so concurrent runs off
+the one shared subscription account coalesce onto one refresh instead of racing
+to spend the same token, and each run is handed the freshest token.
 (This narrows but cannot fully close concurrency: two runs that both outlive the
 access token still refresh independently inside their sandboxes. An OpenAI API
 key, which does not rotate, is the fully-concurrent alternative to subscription
@@ -331,11 +368,12 @@ Required unless noted:
 - Daytona: `DAYTONA_API_KEY`, `DAYTONA_SNAPSHOT=openthrottle`. Snapshot sizing
   is set when the snapshot is built (`supervisor/scripts/build-snapshot.mjs`)
   from optional `DAYTONA_SANDBOX_CPU=4` (cores), `DAYTONA_SANDBOX_MEMORY=8`
-  (GiB), and `DAYTONA_SANDBOX_DISK=10` (GiB); the defaults clear Daytona's
+  (GiB), and `DAYTONA_SANDBOX_DISK=5` (GiB); the defaults clear Daytona's
   small default tier, which OOM-kills real pnpm/Turbo monorepo build and
-  type-check gates (SIGKILL / exit 137). Disk stays within Daytona's
-  standard-tier 10 GiB maximum so the default build works for ordinary orgs;
-  raise it only on a plan with a larger quota. Right-size these per fleet.
+  type-check gates (SIGKILL / exit 137). Disk is kept small because Daytona
+  enforces a 30 GiB *total* org disk quota (not a per-sandbox cap) and
+  OpenThrottle retains a stopped sandbox per non-closed ticket; raise it only
+  on a plan with a larger quota. Right-size these per fleet.
 - Agents: `CLAUDE_CODE_OAUTH_TOKEN` for Claude subscription login and/or
   `CODEX_AUTH_JSON` for Codex subscription login; `DEFAULT_AGENT=codex`.
 - Limits: `BASE_BRANCH=main`, `MAX_TURNS=200`, `TASK_TIMEOUT=7200`,
@@ -413,7 +451,7 @@ temporary config containing only project-declared MCP servers with user-only
 setting sources. Project `AGENTS.md` and `.claude/settings.json` files remain
 untouched and editable.
 The adapters compose native CE as follows: `implement` uses `ce-work`, local
-`ce-code-review`, a conditional `ce-simplify` pass (invoked only when the
+`ce-code-review`, a conditional `ce-simplify-code` pass (invoked only when the
 branch diff is large or structurally complex; behavior-preserving, with skips
 recorded in the assumptions ledger), and `ce-commit-push-pr`; `investigate` uses action-capable
 `ce-debug mode:pipeline` and, when it converges on a fix, the same

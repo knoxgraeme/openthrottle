@@ -92,3 +92,30 @@ setup() {
   [ "$status" -eq 0 ]
   [ "$output" = "npm test" ]
 }
+
+@test "codex_reconcile_auth installs the newest trusted seed and fails closed across accounts" {
+  older='{"tokens":{"account_id":"acct","refresh_token":"rt0"},"last_refresh":"2026-07-01T00:00:00.000Z"}'
+  newer='{"tokens":{"account_id":"acct","refresh_token":"rt1"},"last_refresh":"2026-07-02T00:00:00.000Z"}'
+  no_ts='{"tokens":{"account_id":"acct","refresh_token":"rtX"}}'
+  other='{"tokens":{"account_id":"OTHER","refresh_token":"rtZ"},"last_refresh":"2026-07-09T00:00:00.000Z"}'
+
+  # A strictly newer central seed replaces the sandbox's rotated token (#1).
+  run codex_reconcile_auth "$newer" "$older"
+  [ "$output" = "seed" ]
+
+  # An older or equal seed is never replayed over the rotated token.
+  run codex_reconcile_auth "$older" "$newer"
+  [ "$output" = "keep" ]
+  run codex_reconcile_auth "$newer" "$newer"
+  [ "$output" = "keep" ]
+
+  # Unknown ages stay conservative: keep the sandbox's rotated token.
+  run codex_reconcile_auth "$no_ts" "$newer"
+  [ "$output" = "keep" ]
+  run codex_reconcile_auth "$no_ts" "$no_ts"
+  [ "$output" = "keep" ]
+
+  # A seed from a different account is rejected, not silently trusted.
+  run codex_reconcile_auth "$newer" "$other"
+  [ "$output" = "incompatible" ]
+}

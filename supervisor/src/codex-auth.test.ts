@@ -170,6 +170,79 @@ describe("Codex durable auth", () => {
         refreshCodexAuthJson(authBlob("rt-0"), "2026-07-02T00:00:00Z", fetchMock)
       ).rejects.toThrow(/status 400/);
     });
+
+    it("cancels a hung refresh within the bound and leaks no token content (finding #3)", async () => {
+      // A refresh endpoint that accepts the connection but never responds, and
+      // ignores the abort signal — the bound must still fire.
+      const neverResolves = vi.fn(
+        () => new Promise<Response>(() => {})
+      ) as unknown as typeof fetch;
+      const blob = authBlob("rt-secret-0", "2026-07-01T00:00:00Z");
+      const start = Date.now();
+      const err = await refreshCodexAuthJson(
+        blob,
+        "2026-07-02T00:00:00Z",
+        neverResolves,
+        20
+      ).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).toMatch(/timed out after 20ms/);
+      expect((err as Error).message).not.toContain("rt-secret-0");
+      expect(Date.now() - start).toBeLessThan(1000);
+    });
+
+    it("keeps the timeout active while the response body is being read (finding #3)", async () => {
+      const bodyNeverResolves = vi.fn(async () => ({
+        ok: true,
+        json: () => new Promise<never>(() => {}),
+      })) as unknown as typeof fetch;
+      const start = Date.now();
+      const err = await refreshCodexAuthJson(
+        authBlob("rt-secret-body"),
+        "2026-07-02T00:00:00Z",
+        bodyNeverResolves,
+        20
+      ).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).toMatch(/timed out after 20ms/);
+      expect((err as Error).message).not.toContain("rt-secret-body");
+      expect(Date.now() - start).toBeLessThan(1000);
+    });
+
+    it("sanitizes response-body parsing failures (finding #3)", async () => {
+      const fetchMock = vi.fn(async () => ({
+        ok: true,
+        json: async () => {
+          throw new Error("invalid response containing rt-secret-body-error");
+        },
+      })) as unknown as typeof fetch;
+      const err = await refreshCodexAuthJson(
+        authBlob("rt-secret-body-error"),
+        "2026-07-02T00:00:00Z",
+        fetchMock
+      ).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).toBe("Codex token refresh response was invalid");
+      expect((err as Error).message).not.toContain("rt-secret-body-error");
+    });
+
+    it("rethrows a sanitized error carrying no request content on transport failure (finding #3)", async () => {
+      const fetchMock = vi.fn(async () => {
+        throw new Error("ECONNRESET while sending refresh_token=rt-secret-1");
+      }) as unknown as typeof fetch;
+      const err = await refreshCodexAuthJson(
+        authBlob("rt-secret-1"),
+        "2026-07-02T00:00:00Z",
+        fetchMock
+      ).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).toBe("Codex token refresh request failed");
+      expect((err as Error).message).not.toContain("rt-secret-1");
+    });
   });
 
   describe("getCodexAuthForSeed", () => {
@@ -227,6 +300,23 @@ describe("Codex durable auth", () => {
 
       expect(await getCodexAuthForSeed(cfgWith(undefined), store)).toBe(stale);
       expect(store.getSetting(SETTINGS_CODEX_AUTH_JSON)).toBe(stale);
+    });
+
+    it("falls back on a transport failure and logs no token content (finding #3)", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const fetchMock = vi.fn(async () => {
+        throw new Error("boom refresh_token=rt-secret-2");
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const stale = authBlob("rt-secret-2", "2026-07-01T00:00:00Z", jwtExpiringIn(60));
+      store.setSetting(SETTINGS_CODEX_AUTH_JSON, stale);
+
+      expect(await getCodexAuthForSeed(cfgWith(undefined), store)).toBe(stale);
+      expect(store.getSetting(SETTINGS_CODEX_AUTH_JSON)).toBe(stale);
+      // The one warning emitted must carry only the sanitized reason.
+      const logged = warn.mock.calls.map((c) => c.join(" ")).join("\n");
+      expect(logged).not.toContain("rt-secret-2");
+      expect(logged).toContain("Codex token refresh request failed");
     });
   });
 });

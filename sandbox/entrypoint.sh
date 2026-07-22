@@ -196,17 +196,32 @@ log "phase 1: auth files"
 
 if [[ -n "${CODEX_AUTH_JSON:-}" ]]; then
   mkdir -p "${AGENT_HOME}/.codex"
+  # Only strip a *trailing* newline here — this is a JSON blob, not a bare
+  # token, so we must not touch whitespace inside it.
+  SEED_AUTH="${CODEX_AUTH_JSON%$'\n'}"
   if [[ -s "${AGENT_HOME}/.codex/auth.json" ]]; then
-    # Resume reuses this sandbox, and Codex may have already rotated its refresh
-    # token into auth.json. OpenAI invalidates the previous refresh token on
-    # every rotation, so overwriting the file with the (older) seed would replay
-    # a spent token — the "refresh token was already used" failure. Keep the
-    # sandbox's rotated copy; the supervisor reads it back to reseed later runs.
-    log "~/.codex/auth.json already present — keeping the sandbox's rotated token"
+    # Resume reuses this sandbox, and Codex may have rotated its refresh token
+    # into auth.json (OpenAI invalidates the previous refresh token on every
+    # rotation). But the supervisor now refreshes centrally before seeding, so
+    # the seed can be *newer* than the local copy. Install whichever is newest
+    # and from the same account; fail closed if the accounts differ.
+    EXISTING_AUTH="$(cat "${AGENT_HOME}/.codex/auth.json")"
+    case "$(codex_reconcile_auth "$SEED_AUTH" "$EXISTING_AUTH")" in
+      incompatible)
+        log "FATAL: seeded Codex auth account does not match the sandbox's existing token; refusing to cross accounts"
+        exit 1
+        ;;
+      seed)
+        printf '%s' "$SEED_AUTH" > "${AGENT_HOME}/.codex/auth.json"
+        chmod 0600 "${AGENT_HOME}/.codex/auth.json"
+        log "~/.codex/auth.json present but the seeded token is newer — installing the supervisor's refreshed token"
+        ;;
+      *)
+        log "~/.codex/auth.json present and newer-or-equal — keeping the sandbox's rotated token"
+        ;;
+    esac
   else
-    # Only strip a *trailing* newline here — this is a JSON blob, not a bare
-    # token, so we must not touch whitespace inside it.
-    printf '%s' "${CODEX_AUTH_JSON%$'\n'}" > "${AGENT_HOME}/.codex/auth.json"
+    printf '%s' "$SEED_AUTH" > "${AGENT_HOME}/.codex/auth.json"
     chmod 0600 "${AGENT_HOME}/.codex/auth.json"
     log "wrote ~/.codex/auth.json"
   fi

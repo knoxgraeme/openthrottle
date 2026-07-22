@@ -93,6 +93,13 @@ RUN set -eux; \
     test "$(gosu agent env HOME=/home/agent claude plugin list --json \
       | jq -r '.[] | select(.id == "compound-engineering@compound-engineering-plugin" and .enabled == true) | .version')" \
       = "$COMPOUND_ENGINEERING_VERSION"; \
+    codex_marketplace="$ce_marketplace/.agents/plugins/marketplace.json"; \
+    jq --arg sha "$COMPOUND_ENGINEERING_REF" \
+      '(.plugins[] | select(.name == "compound-engineering").source.sha) = $sha' \
+      "$codex_marketplace" > "$codex_marketplace.tmp"; \
+    mv "$codex_marketplace.tmp" "$codex_marketplace"; \
+    test "$(jq -r '.plugins[] | select(.name == "compound-engineering").source.sha' "$codex_marketplace")" \
+      = "$COMPOUND_ENGINEERING_REF"; \
     gosu agent env HOME=/home/agent CODEX_HOME=/home/agent/.codex \
       codex plugin marketplace add "$ce_marketplace" --json; \
     gosu agent env HOME=/home/agent CODEX_HOME=/home/agent/.codex \

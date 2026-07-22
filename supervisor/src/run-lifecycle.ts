@@ -106,6 +106,28 @@ export function agentDisplayName(agent: Agent): string {
 
 type TerminalActivityType = "elicitation" | "response" | "error";
 
+export type ExecutionOutcome = "success" | "infrastructure_failure" | "failure";
+
+// A process killed by a signal exits with 128 + signal number. These codes are
+// runtime/infrastructure terminations (137 = 128+SIGKILL, the OOM/resource kill;
+// 143 = SIGTERM; 139 = SIGSEGV; 134 = SIGABRT; 135 = SIGBUS), never a semantic
+// outcome the agent chose. They must classify as an infrastructure failure and
+// can never be read as a pass or a known-gap success.
+const RESOURCE_TERMINATION_EXIT_CODES = new Set([134, 135, 137, 139, 143]);
+
+// The wrapper/process exit code is the authoritative execution signal (audit
+// E4 + the E3 exit-zero-conflates-success hazard). A nonzero exit is ALWAYS a
+// failure and can never be converted to success by a later completion marker,
+// a prior success-shaped terminal response, or a cleanup path. Exit zero is the
+// only value eligible for success, and only because the completion callback
+// that carries it is required — a callback without a valid integer exit code is
+// rejected before this runs, so "exit zero alone" cannot be manufactured.
+export function classifyExecutionOutcome(exitCode: number): ExecutionOutcome {
+  if (exitCode === 0) return "success";
+  if (RESOURCE_TERMINATION_EXIT_CODES.has(exitCode)) return "infrastructure_failure";
+  return "failure";
+}
+
 export function lastTerminalSandboxActivity(
   store: TicketStore,
   runId: string
@@ -340,6 +362,11 @@ export async function completeRun(
   }
 
   const exitCode = input.exitCode as number;
+  // Precedence is fixed here and reused for every downstream decision so a
+  // nonzero exit cannot later be re-read as success: `succeeded` is true only
+  // for a clean exit-zero completion.
+  const outcome = classifyExecutionOutcome(exitCode);
+  const succeeded = outcome === "success";
   const costUsd =
     typeof input.costUsd === "number" &&
     Number.isFinite(input.costUsd) &&
@@ -367,13 +394,13 @@ export async function completeRun(
   const consumedWork = deps.store.getConsumedSessionWorkForRun(run.id);
   const completed = deps.store.finishRun({
     runId: input.runId,
-    status: exitCode === 0 ? "completed" : "failed",
+    status: succeeded ? "completed" : "failed",
     exitCode,
     costUsd,
     prUrl,
     failureTail,
     logTail,
-    ticketState: exitCode === 0 ? "active" : "error",
+    ticketState: succeeded ? "active" : "error",
   });
   if (!completed || !ticket) {
     return { status: 409, body: { error: "run no longer active" } };
@@ -389,22 +416,36 @@ export async function completeRun(
     deps.schedule
   );
   const terminalActivity = lastTerminalSandboxActivity(deps.store, run.id);
-  const pausedOnDecisions = exitCode === 0 && terminalActivity === "elicitation";
+  const pausedOnDecisions = succeeded && terminalActivity === "elicitation";
   const sessionId = run.linear_session_id ?? ticket.linear_session_id;
   try {
     const costLine = costUsd === undefined ? "" : ` Cost: $${costUsd.toFixed(4)}.`;
-    const agentAlreadyConcluded = terminalActivity !== undefined;
-    if (exitCode === 0 && !agentAlreadyConcluded) {
-      await enqueueActivity(deps.store, outbox, {
-        sessionId,
-        type: "response",
-        body: finalResponse ?? `OpenThrottle ${run.task_type} run finished successfully.${prUrl ? ` PR: ${prUrl}` : ""}${costLine}`,
-      }, ticket.linear_issue_id, run.id);
-    } else if (exitCode !== 0 && !agentAlreadyConcluded) {
+    if (succeeded) {
+      // Synthesize a success response only when the agent has not already
+      // concluded the session itself (any terminal activity), so we do not
+      // double-post over the agent's own response/error/elicitation.
+      if (terminalActivity === undefined) {
+        await enqueueActivity(deps.store, outbox, {
+          sessionId,
+          type: "response",
+          body: finalResponse ?? `OpenThrottle ${run.task_type} run finished successfully.${prUrl ? ` PR: ${prUrl}` : ""}${costLine}`,
+        }, ticket.linear_issue_id, run.id);
+      }
+    } else if (terminalActivity !== "error") {
+      // A nonzero exit is a failure regardless of any success-shaped terminal
+      // response the agent posted (audit E4). Suppress the synthetic failure
+      // notice ONLY when an error activity already represents this same failure
+      // (don't double-report); a prior `response`/`elicitation` must never hide
+      // it. `succeeded` is false for the resource-termination class too, so
+      // exit 137 is reported as an infrastructure failure, never a pass.
+      const infraLine =
+        outcome === "infrastructure_failure"
+          ? " The run was terminated by the infrastructure (resource limit or signal), not by the agent."
+          : "";
       await enqueueActivity(deps.store, outbox, {
         sessionId,
         type: "error",
-        body: `OpenThrottle ${run.task_type} run failed (exit ${exitCode}).${costLine}${failureTail ? `\n\nLast output:\n\`\`\`\n${failureTail}\n\`\`\`` : ""}`,
+        body: `OpenThrottle ${run.task_type} run failed (exit ${exitCode}).${infraLine}${costLine}${failureTail ? `\n\nLast output:\n\`\`\`\n${failureTail}\n\`\`\`` : ""}`,
       }, ticket.linear_issue_id, run.id);
     }
     if (prUrl) {
@@ -422,7 +463,7 @@ export async function completeRun(
   // `resume` requires the saved native session, which can be lost when a
   // sandbox is recreated. Surface a dedicated error rather than silently
   // starting a fresh context — re-delegation is the recovery path.
-  if (exitCode !== 0 && run.task_type === "resume" && failureTail && MISSING_AGENT_SESSION_PATTERN.test(failureTail)) {
+  if (!succeeded && run.task_type === "resume" && failureTail && MISSING_AGENT_SESSION_PATTERN.test(failureTail)) {
     await tryPostError(
       deps.store,
       outbox,
@@ -439,7 +480,7 @@ export async function completeRun(
     return { status: 200, body: { ok: true } };
   }
 
-  if (exitCode === 0) {
+  if (succeeded) {
     if (
       shouldNudgeAfterRun({
         exitCode,

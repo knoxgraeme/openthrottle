@@ -44,7 +44,7 @@ session. Record every smaller judgment call you do make for the final
 5. Judge whether the change earned a simplification pass. If the branch diff
    is large or structurally complex — as a rough gate: more than ~300 changed
    lines or ~8 files, or the implementation introduced new abstractions,
-   layers, or indirection — invoke the native `ce-simplify` skill on the
+   layers, or indirection — invoke the native `ce-simplify-code` skill on the
    branch's changes against `origin/<base-branch>`, then re-run the gates
    affected by anything it changed. For a small or mechanical diff, skip
    this step and note the skip in "Assumptions & decisions". Simplification
