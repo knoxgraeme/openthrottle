@@ -33,7 +33,9 @@ setup() {
   [[ "$output" == *'additionalContext'* ]]
   [[ "$output" == *'Mid-run steering'* ]]
   [[ "$output" == *'does not override'* ]]
-  [[ "$output" == *'via ot-activity'* ]]
+  # Both response paths are offered: acknowledge-and-continue vs stop-and-ask.
+  [[ "$output" == *'ot-activity thought'* ]]
+  [[ "$output" == *'ot-activity elicitation'* ]]
   [[ "$output" == *'focus on the failing test'* ]]
   # Consumed exactly once — file deleted, no pending files remain.
   [ ! -f "$OT_INBOX_DIR/aaaa.md" ]
