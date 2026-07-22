@@ -458,6 +458,39 @@ export function commentOnPullRequest(
   });
 }
 
+export async function upsertPullRequestComment(
+  client: GithubClient,
+  repo: string,
+  pullNumber: number,
+  identity: string,
+  body: string
+): Promise<{ id: number; html_url: string }> {
+  if (!/^[A-Za-z0-9_.:-]{1,200}$/.test(identity)) throw new Error("GitHub comment identity is unsafe");
+  const marker = `<!-- openthrottle:pipeline-summary:${identity} -->`;
+  if (!body.startsWith(marker)) throw new Error("GitHub pipeline summary is missing its stable marker");
+  let existing: { id: number; body?: string; html_url: string } | undefined;
+  for (let page = 1; page <= 10 && !existing; page += 1) {
+    const comments = await githubRequest<Array<{ id: number; body?: string; html_url: string }>>(
+      client,
+      `/repos/${repo}/issues/${pullNumber}/comments?per_page=100${page === 1 ? "" : `&page=${page}`}`
+    );
+    existing = comments.find((comment) => comment.body?.includes(marker));
+    if (comments.length < 100) break;
+  }
+  if (existing) {
+    return githubRequest(client, `/repos/${repo}/issues/comments/${existing.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ body }),
+    });
+  }
+  return githubRequest(client, `/repos/${repo}/issues/${pullNumber}/comments`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ body }),
+  });
+}
+
 export interface MergeReadiness {
   mergeable: boolean;
   draft: boolean;

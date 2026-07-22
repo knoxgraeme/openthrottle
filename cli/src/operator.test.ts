@@ -33,6 +33,29 @@ describe('operator commands', () => {
             pr_url: null,
             updated_at: '2026-07-18T00:00:00.000Z',
           },
+          {
+            linear_issue_identifier: 'OT-PIPE',
+            branch: 'ot/pipe',
+            agent: 'codex',
+            state: 'active',
+            pr_url: 'https://github.com/o/r/pull/1',
+            updated_at: '2026-07-18T00:01:00.000Z',
+            execution_mode: 'pipeline',
+            pipeline: {
+              pipeline_id: 'ce/implement',
+              pipeline_version: 1,
+              status: 'publication_blocked',
+              stage_id: 'review',
+              attempt_ordinal: 3,
+              retry_count: 1,
+              reentry_count: 2,
+              wait_reason: 'permanent publication failure',
+              subject: 'abcdef0123456789',
+              gate_result: 'passed',
+              context_policy: 'fresh_review',
+              publication_state: 'blocked',
+            },
+          },
         ],
       })
     );
@@ -51,6 +74,9 @@ describe('operator commands', () => {
     const headers = fetchMock.mock.calls[0]![1]!.headers as Headers;
     expect(headers.get('Authorization')).toBe('Bearer operator-token');
     expect(output.mock.calls.flat().join('\n')).toContain('OT-1');
+    expect(output.mock.calls.flat().join('\n')).toContain('ce/implement@1');
+    expect(output.mock.calls.flat().join('\n')).toContain('publication_blocked');
+    expect(output.mock.calls.flat().join('\n')).toContain('fresh_review');
   });
 
   it('stops an encoded ticket with the operator endpoint', async () => {

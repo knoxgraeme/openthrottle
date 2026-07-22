@@ -15,6 +15,21 @@ interface TicketRow {
   state: string;
   pr_url: string | null;
   updated_at: string;
+  execution_mode?: 'legacy' | 'pipeline';
+  pipeline?: {
+    pipeline_id: string;
+    pipeline_version: number;
+    status: string;
+    stage_id: string | null;
+    attempt_ordinal: number | null;
+    retry_count: number;
+    reentry_count: number;
+    wait_reason: string | null;
+    subject: string | null;
+    gate_result: string | null;
+    context_policy: string | null;
+    publication_state: string;
+  } | null;
 }
 
 interface StatusResponse {
@@ -54,10 +69,24 @@ export default async function status(): Promise<void> {
       issue: t.linear_issue_identifier,
       branch: t.branch,
       agent: t.agent,
-      state: t.state,
+      mode: t.execution_mode ?? 'legacy',
+      pipeline: t.pipeline ? `${t.pipeline.pipeline_id}@${t.pipeline.pipeline_version}` : null,
+      state: t.pipeline?.status ?? t.state,
+      stage: t.pipeline?.stage_id,
+      attempt: t.pipeline?.attempt_ordinal,
+      retry: t.pipeline?.retry_count,
+      reentry: t.pipeline?.reentry_count,
+      subject: t.pipeline?.subject ? t.pipeline.subject.slice(0, 12) : null,
+      gate: t.pipeline?.gate_result,
+      context: t.pipeline?.context_policy,
+      publication: t.pipeline?.publication_state,
+      wait: t.pipeline?.wait_reason,
       pr: t.pr_url,
       updated: t.updated_at,
     })),
-    ['issue', 'branch', 'agent', 'state', 'pr', 'updated']
+    [
+      'issue', 'branch', 'agent', 'mode', 'pipeline', 'state', 'stage', 'attempt',
+      'retry', 'reentry', 'subject', 'gate', 'context', 'publication', 'wait', 'pr', 'updated',
+    ]
   );
 }

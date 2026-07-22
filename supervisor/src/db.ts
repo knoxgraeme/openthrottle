@@ -120,6 +120,9 @@ CREATE TABLE IF NOT EXISTS linear_outbox (
   next_attempt_at TEXT NOT NULL,
   processed_at TEXT,
   last_error TEXT,
+  external_id TEXT,
+  external_url TEXT,
+  attachment_url TEXT,
   created_at TEXT NOT NULL,
   UNIQUE(linear_session_id, sequence),
   FOREIGN KEY(run_id) REFERENCES runs(id)
@@ -410,7 +413,7 @@ export interface LinearOutboxRecord {
   linear_issue_id: string | null;
   run_id: string | null;
   sequence: number;
-  kind: "activity" | "session_update";
+  kind: "activity" | "session_update" | "pipeline_receipt";
   payload: string;
   payload_hash: string;
   status: "pending" | "processing" | "failed" | "processed" | "dead";
@@ -418,6 +421,9 @@ export interface LinearOutboxRecord {
   next_attempt_at: string;
   processed_at: string | null;
   last_error: string | null;
+  external_id: string | null;
+  external_url: string | null;
+  attachment_url: string | null;
   created_at: string;
 }
 
@@ -541,8 +547,13 @@ export interface TicketStore {
     payload: string;
   }): LinearOutboxRecord;
   claimLinearOutbox(nowIso: string, leaseUntilIso: string, limit: number): LinearOutboxRecord[];
-  markLinearOutboxProcessed(id: string): void;
+  markLinearOutboxProcessed(id: string, receipt?: {
+    externalId?: string | null;
+    externalUrl?: string | null;
+    attachmentUrl?: string | null;
+  }): void;
   markLinearOutboxFailed(id: string, error: string, retryAt: string | null): void;
+  recordLinearOutboxAttachment(id: string, attachmentUrl: string): void;
   getLinearOutbox(id: string): LinearOutboxRecord | undefined;
   listLinearOutbox(): LinearOutboxRecord[];
   registerRepository(input: RepositoryRegistrationInput): RepositoryRegistration;
@@ -1565,20 +1576,109 @@ export function createTicketStore(db: Database.Database): TicketStore {
       }
       return claimed;
     },
-    markLinearOutboxProcessed(id) {
-      const processedAt = now();
-      db.prepare(`
-        UPDATE linear_outbox
-        SET status = 'processed', processed_at = ?, next_attempt_at = ?, last_error = NULL
-        WHERE id = ?
-      `).run(processedAt, processedAt, id);
+    markLinearOutboxProcessed(id, receipt) {
+      db.transaction(() => {
+        const processedAt = now();
+        db.prepare(`
+          UPDATE linear_outbox
+          SET status = 'processed', processed_at = ?, next_attempt_at = ?, last_error = NULL,
+              external_id = COALESCE(?, external_id),
+              external_url = COALESCE(?, external_url),
+              attachment_url = COALESCE(?, attachment_url)
+          WHERE id = ?
+        `).run(
+          processedAt,
+          processedAt,
+          receipt?.externalId ?? null,
+          receipt?.externalUrl ?? null,
+          receipt?.attachmentUrl ?? null,
+          id
+        );
+        const publication = db.prepare(`
+          SELECT * FROM pipeline_publication_receipts WHERE id = ?
+        `).get(id) as {
+          pipeline_instance_id: string;
+          resume_status: string | null;
+          status: string;
+        } | undefined;
+        if (!publication) return;
+        db.prepare(`
+          UPDATE pipeline_publication_receipts
+          SET status = 'acknowledged', external_id = COALESCE(?, external_id),
+              external_url = COALESCE(?, external_url),
+              attachment_url = COALESCE(?, attachment_url), acknowledged_at = ?,
+              last_error = NULL, updated_at = ?
+          WHERE id = ?
+        `).run(
+          receipt?.externalId ?? null,
+          receipt?.externalUrl ?? null,
+          receipt?.attachmentUrl ?? null,
+          processedAt,
+          processedAt,
+          id
+        );
+        if (publication.resume_status) {
+          db.prepare(`
+            UPDATE pipeline_instances
+            SET status = ?, state_version = state_version + 1,
+                wait_reason = CASE WHEN ? = 'waiting_human' THEN wait_reason ELSE NULL END,
+                updated_at = ?
+            WHERE id = ? AND status = 'completion_pending_publication'
+          `).run(
+            publication.resume_status,
+            publication.resume_status,
+            processedAt,
+            publication.pipeline_instance_id
+          );
+        }
+      })();
     },
     markLinearOutboxFailed(id, error, retryAt) {
-      db.prepare(`
-        UPDATE linear_outbox
-        SET status = ?, next_attempt_at = ?, last_error = ?
-        WHERE id = ?
-      `).run(retryAt ? "failed" : "dead", retryAt ?? now(), error, id);
+      db.transaction(() => {
+        const timestamp = now();
+        const status = retryAt ? "failed" : "dead";
+        db.prepare(`
+          UPDATE linear_outbox
+          SET status = ?, next_attempt_at = ?, last_error = ?
+          WHERE id = ?
+        `).run(status, retryAt ?? timestamp, error, id);
+        const publication = db.prepare(`
+          SELECT pipeline_instance_id FROM pipeline_publication_receipts WHERE id = ?
+        `).get(id) as { pipeline_instance_id: string } | undefined;
+        if (!publication) return;
+        const instanceStatus = db.prepare(
+          "SELECT status FROM pipeline_instances WHERE id = ?"
+        ).pluck().get(publication.pipeline_instance_id) as string | undefined;
+        db.prepare(`
+          UPDATE pipeline_publication_receipts
+          SET status = ?, attempts = (
+                SELECT attempts FROM linear_outbox WHERE linear_outbox.id = pipeline_publication_receipts.id
+              ),
+              next_attempt_at = ?, last_error = ?, updated_at = ?,
+              blocked_from_status = CASE WHEN ? = 'dead' THEN COALESCE(
+                blocked_from_status, ?
+              ) ELSE blocked_from_status END
+          WHERE id = ?
+        `).run(status, retryAt ?? timestamp, error, timestamp, status, instanceStatus ?? null, id);
+        if (status === "dead") {
+          db.prepare(`
+            UPDATE pipeline_instances
+            SET status = 'publication_blocked', state_version = state_version + 1,
+                wait_reason = 'permanent publication failure', updated_at = ?
+            WHERE id = ? AND status NOT IN (
+              'shipped', 'no_change', 'needs_human', 'canceled', 'superseded', 'failed',
+              'publication_blocked'
+            )
+          `).run(timestamp, publication.pipeline_instance_id);
+        }
+      })();
+    },
+    recordLinearOutboxAttachment(id, attachmentUrl) {
+      const updated = db.prepare(`
+        UPDATE linear_outbox SET attachment_url = ?
+        WHERE id = ? AND status = 'processing'
+      `).run(attachmentUrl, id);
+      if (updated.changes !== 1) throw new Error(`linear outbox ${id} is not processing`);
     },
     getLinearOutbox(id) {
       return getLinearOutboxStmt.get(id) as LinearOutboxRecord | undefined;

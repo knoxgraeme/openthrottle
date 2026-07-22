@@ -1,5 +1,5 @@
 import type { AgentActivityInput, AgentPlanItem, LinearClient } from "./linear.js";
-import { agentActivityCreate, agentSessionUpdate } from "./linear.js";
+import { agentActivityCreate, agentSessionUpdate, linearFileUpload } from "./linear.js";
 import type { LinearOutboxRecord, TicketStore } from "./db.js";
 import { sanitizeText } from "./sanitize.js";
 
@@ -90,6 +90,14 @@ type LinearOutboxPayload =
       externalUrls?: Array<{ label: string; url: string }>;
       addedExternalUrls?: Array<{ label: string; url: string }>;
       plan?: AgentPlanItem[];
+    }
+  | {
+      type: "pipeline_receipt";
+      publication: {
+        body: string;
+        artifactInline?: string;
+        attachment?: { filename: string; contentType: "application/json"; content: string };
+      };
     };
 
 function retryDelayMs(attempts: number): number {
@@ -112,18 +120,46 @@ function parsePayload(row: LinearOutboxRecord): LinearOutboxPayload {
   return payload;
 }
 
-async function deliver(linear: LinearClient, row: LinearOutboxRecord): Promise<void> {
+async function deliver(
+  linear: LinearClient,
+  row: LinearOutboxRecord,
+  store: TicketStore
+): Promise<{ externalId?: string; attachmentUrl?: string }> {
   const payload = parsePayload(row);
   if (payload.type === "activity") {
-    await agentActivityCreate(linear, { ...payload.activity, id: row.id });
-    return;
+    const result = await agentActivityCreate(linear, { ...payload.activity, id: row.id });
+    return { externalId: result.agentActivity?.id };
   }
-  await agentSessionUpdate(linear, {
-    sessionId: payload.sessionId,
-    externalUrls: payload.externalUrls,
-    addedExternalUrls: payload.addedExternalUrls,
-    plan: payload.plan,
+  if (payload.type === "session_update") {
+    await agentSessionUpdate(linear, {
+      sessionId: payload.sessionId,
+      externalUrls: payload.externalUrls,
+      addedExternalUrls: payload.addedExternalUrls,
+      plan: payload.plan,
+    });
+    return {};
+  }
+  if (!row.linear_session_id) throw new Error(`pipeline receipt ${row.id} has no Linear session`);
+  let attachmentUrl = row.attachment_url ?? undefined;
+  if (payload.publication.attachment && !attachmentUrl) {
+    const upload = await linearFileUpload(linear, payload.publication.attachment);
+    attachmentUrl = upload.assetUrl;
+    store.recordLinearOutboxAttachment(row.id, attachmentUrl);
+  }
+  const body = sanitizeText([
+    payload.publication.body,
+    ...(payload.publication.artifactInline
+      ? ["", "<details><summary>Typed evidence</summary>", "", "```json", payload.publication.artifactInline, "```", "</details>"]
+      : []),
+    ...(attachmentUrl ? ["", `[Private typed evidence attachment](${attachmentUrl})`] : []),
+  ].join("\n")).slice(0, 20_000);
+  const result = await agentActivityCreate(linear, {
+    id: row.id,
+    sessionId: row.linear_session_id,
+    type: "response",
+    body,
   });
+  return { externalId: result.agentActivity?.id, attachmentUrl };
 }
 
 export function createLinearOutboxProcessor(params: {
@@ -136,8 +172,8 @@ export function createLinearOutboxProcessor(params: {
   async function processRow(row: LinearOutboxRecord): Promise<void> {
     const linear = await params.getLinearClient();
     if (!linear) throw new Error("No valid Linear OAuth token is stored");
-    await deliver(linear, row);
-    params.store.markLinearOutboxProcessed(row.id);
+    const receipt = await deliver(linear, row, params.store);
+    params.store.markLinearOutboxProcessed(row.id, receipt);
   }
 
   return {

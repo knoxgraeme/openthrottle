@@ -6,6 +6,7 @@ import type { Config } from "./config.js";
 import { createTicketStore, openDb } from "./db.js";
 import type { LinearClient } from "./linear.js";
 import { createServer } from "./server.js";
+import type { PipelineStore } from "./pipeline-store.js";
 
 const cfg: Config = {
   port: 8080,
@@ -2283,6 +2284,103 @@ describe("createServer lifecycle", () => {
     });
     expect(durableLogsResponse.status).toBe(200);
     expect(await durableLogsResponse.text()).toBe("durable [REDACTED]");
+  });
+
+  it("projects pipeline status into status/logs and exposes an owned publication retry", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-pipeline-status",
+      linear_issue_identifier: "OT-PIPELINE",
+      linear_session_id: "session-pipeline-status",
+      sandbox_id: "sandbox-pipeline-status",
+      branch: "ot/pipeline-status",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+    });
+    const projection = {
+      execution_mode: "pipeline" as const,
+      instance_id: "pipeline-status-1",
+      pipeline_id: "ce/implement",
+      pipeline_version: 1,
+      status: "publication_blocked" as const,
+      stage_id: "review",
+      attempt_ordinal: 3,
+      retry_count: 1,
+      reentry_count: 2,
+      wait_reason: "permanent publication failure",
+      subject: "a".repeat(40),
+      gate_result: "passed",
+      assurance: "semantic_attested",
+      policy_digest: "b".repeat(64),
+      context_policy: "fresh_review",
+      publication_state: "blocked" as const,
+      publication_id: "publication-1",
+      publication_external_id: null,
+      publication_error: "forbidden",
+      recovery_action: "POST /tickets/:identifier/publications/publication-1/retry",
+    };
+    const retried = {
+      id: "publication-1",
+      pipeline_instance_id: "pipeline-status-1",
+      attempt_id: "attempt-1",
+      kind: "linear_ledger" as const,
+      idempotency_key: "linear-gate:1",
+      payload: "{}",
+      payload_hash: "c".repeat(64),
+      status: "pending" as const,
+      external_id: null,
+      external_url: null,
+      attempts: 1,
+      next_attempt_at: "2026-01-01T00:00:00.000Z",
+      resume_status: "shipped" as const,
+      blocked_from_status: "completion_pending_publication" as const,
+      created_at: "2026-01-01T00:00:00.000Z",
+      updated_at: "2026-01-01T00:00:00.000Z",
+      acknowledged_at: null,
+      last_error: null,
+    };
+    const retryPublication = vi.fn(() => retried);
+    const pipelineStore = {
+      getStatusForIssue: vi.fn(() => projection),
+      getPublication: vi.fn(() => retried),
+      getInstance: vi.fn(() => ({ id: "pipeline-status-1", linear_issue_id: "issue-pipeline-status" })),
+      retryPublication,
+    } as unknown as PipelineStore;
+    const process = vi.fn(async () => undefined);
+    const sandbox = {
+      state: "started",
+      process: { getEntrypointLogs: vi.fn(async () => ({ output: "sandbox tail" })) },
+    };
+    const app = createServer({
+      cfg,
+      store,
+      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      getLinearClient: async () => undefined,
+      linearOutboxProcessor: { process, drain: vi.fn(async () => undefined) },
+      runBackground: (task) => void task,
+      pipelineAdmission: { catalog: {} as never, runtime: {} as never, store: pipelineStore },
+    });
+    const authorization = { Authorization: `Bearer ${cfg.statusToken}` };
+    const statusResponse = await app.request("/status", { headers: authorization });
+    const statusBody = await statusResponse.json() as { tickets: Array<{ execution_mode: string; pipeline: unknown }> };
+    expect(statusBody.tickets[0]).toMatchObject({ execution_mode: "pipeline", pipeline: projection });
+
+    const logsResponse = await app.request("/tickets/OT-PIPELINE/logs", { headers: authorization });
+    const logs = await logsResponse.text();
+    expect(logs).toContain("[pipeline] ce/implement@1 state=publication_blocked");
+    expect(logs).toContain("publication=blocked");
+    expect(logs).toContain("sandbox tail");
+
+    const retryResponse = await app.request(
+      "/tickets/OT-PIPELINE/publications/publication-1/retry",
+      { method: "POST", headers: authorization }
+    );
+    expect(retryResponse.status).toBe(200);
+    expect(retryPublication).toHaveBeenCalledWith("publication-1");
+    expect(process).toHaveBeenCalledWith("publication-1");
   });
 
   it("restarts the dev server and shows an auto-refreshing page when it was down", async () => {

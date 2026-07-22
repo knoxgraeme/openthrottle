@@ -479,6 +479,45 @@ const canonicalGateReceiptMigrationSource = `${canonicalGateReceiptSchema}
 gate receipts persist the canonical evaluator input and decision payload/v1
 backfill-contract:pipeline branch and agent from ticket when the legacy table exists`;
 
+const linearOutboxPublicationSchema = `
+ALTER TABLE linear_outbox ADD COLUMN external_id TEXT;
+ALTER TABLE linear_outbox ADD COLUMN external_url TEXT;
+ALTER TABLE linear_outbox ADD COLUMN attachment_url TEXT;
+`;
+
+const pipelinePublicationStateSchema = `
+ALTER TABLE pipeline_publication_receipts ADD COLUMN payload TEXT;
+ALTER TABLE pipeline_publication_receipts ADD COLUMN external_url TEXT;
+ALTER TABLE pipeline_publication_receipts ADD COLUMN attachment_url TEXT;
+ALTER TABLE pipeline_publication_receipts ADD COLUMN last_error TEXT;
+ALTER TABLE pipeline_publication_receipts ADD COLUMN next_attempt_at TEXT;
+ALTER TABLE pipeline_publication_receipts ADD COLUMN resume_status TEXT;
+ALTER TABLE pipeline_publication_receipts ADD COLUMN blocked_from_status TEXT;
+ALTER TABLE pipeline_publication_receipts ADD COLUMN updated_at TEXT;
+CREATE INDEX pipeline_publications_process_idx
+  ON pipeline_publication_receipts(kind, status, next_attempt_at);
+`;
+
+const durablePipelinePublicationSchema = `${linearOutboxPublicationSchema}
+${pipelinePublicationStateSchema}`;
+
+const durablePipelinePublicationMigrationSource = `${durablePipelinePublicationSchema}
+publication-contract:linear receipt id is the ordered outbox id/v1
+publication-contract:github summary is a single mutable projection per pipeline instance/v1
+base-schema-or-migration ensures every Linear outbox receipt column exists
+terminal and human-wait states advance only after their Linear receipt acknowledgement`;
+
+function backfillPipelinePublicationState(db: Database.Database): void {
+  if (!hasTable(db, "pipeline_publication_receipts")) return;
+  const timestamp = new Date().toISOString();
+  db.prepare(`
+    UPDATE pipeline_publication_receipts
+    SET payload = COALESCE(payload, '{}'),
+        next_attempt_at = COALESCE(next_attempt_at, created_at, ?),
+        updated_at = COALESCE(updated_at, created_at, ?)
+  `).run(timestamp, timestamp);
+}
+
 function backfillPipelineExecutionIdentity(db: Database.Database): void {
   if (!hasColumns(db, "tickets", ["linear_issue_id", "branch", "agent"])) return;
   db.exec(`
@@ -810,6 +849,24 @@ const definitions: DatabaseMigrationDefinition[] = [
     up(db) {
       db.exec(canonicalGateReceiptSchema);
       backfillPipelineExecutionIdentity(db);
+    },
+  },
+  {
+    version: 6,
+    name: "durable-pipeline-publication",
+    source: durablePipelinePublicationMigrationSource,
+    up(db) {
+      if (hasTable(db, "linear_outbox")) {
+        for (const [column, sql] of [
+          ["external_id", "ALTER TABLE linear_outbox ADD COLUMN external_id TEXT"],
+          ["external_url", "ALTER TABLE linear_outbox ADD COLUMN external_url TEXT"],
+          ["attachment_url", "ALTER TABLE linear_outbox ADD COLUMN attachment_url TEXT"],
+        ] as const) {
+          if (!hasColumns(db, "linear_outbox", [column])) db.exec(sql);
+        }
+      }
+      db.exec(pipelinePublicationStateSchema);
+      backfillPipelinePublicationState(db);
     },
   },
 ];

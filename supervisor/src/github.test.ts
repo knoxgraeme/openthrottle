@@ -10,6 +10,7 @@ import {
   parseGithubWebhook,
   parsePullRequestUrl,
   prepareRepository,
+  upsertPullRequestComment,
   verifyGithubSignature,
 } from "./github.js";
 
@@ -245,5 +246,39 @@ describe("GitHub contracts", () => {
       }
     );
     expect(result).toMatchObject({ webhookId: 7, webhookAction: "updated" });
+  });
+
+  it("creates then updates one stable neutral PR summary without using the reviews API", async () => {
+    const requests: Array<{ url: string; method: string }> = [];
+    let existing = false;
+    const marker = "<!-- openthrottle:pipeline-summary:pipeline-1 -->";
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      requests.push({ url, method });
+      if (url.endsWith("/issues/7/comments?per_page=100")) {
+        return Response.json(existing ? [{
+          id: 99,
+          body: `${marker}\nold`,
+          html_url: "https://github.com/o/r/pull/7#issuecomment-99",
+        }] : []);
+      }
+      if (url.endsWith("/issues/7/comments") && method === "POST") {
+        existing = true;
+        return Response.json({ id: 99, html_url: "https://github.com/o/r/pull/7#issuecomment-99" });
+      }
+      if (url.endsWith("/issues/comments/99") && method === "PATCH") {
+        return Response.json({ id: 99, html_url: "https://github.com/o/r/pull/7#issuecomment-99" });
+      }
+      throw new Error(`Unexpected GitHub request: ${method} ${url}`);
+    }) as unknown as typeof fetch;
+    const client = { token: "github", fetch: fetchMock };
+    const first = await upsertPullRequestComment(client, "o/r", 7, "pipeline-1", `${marker}\nfirst`);
+    const second = await upsertPullRequestComment(client, "o/r", 7, "pipeline-1", `${marker}\nsecond`);
+    expect(first.id).toBe(99);
+    expect(second.id).toBe(99);
+    expect(requests.filter((request) => request.method === "POST")).toHaveLength(1);
+    expect(requests.filter((request) => request.method === "PATCH")).toHaveLength(1);
+    expect(requests.some((request) => request.url.includes("/reviews"))).toBe(false);
   });
 });

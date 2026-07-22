@@ -34,6 +34,7 @@ import { createLinearOutboxProcessor, tryPostError, type LinearOutboxProcessor }
 import { hashesMatch, tokenHash, completeRun } from "./run-lifecycle.js";
 import { handleLinearEvent, type PipelineAdmissionContext } from "./linear-events.js";
 import { handleGithubEvent } from "./github-events.js";
+import { renderPipelineLogHeader } from "./pipeline-publication.js";
 
 // index.ts and sweep.ts keep importing `completeRun`/`expireRun` from here so
 // their imports need minimal churn; the real implementations live in
@@ -219,21 +220,26 @@ export function createServer(deps: ServerDeps): Hono {
       return context.json({ error: "unauthorized" }, 401);
     }
     return context.json({
-      tickets: store.listAll().map((ticket) => ({
-        linear_issue_identifier: ticket.linear_issue_identifier,
-        branch: ticket.branch,
-        repo: ticket.repo,
-        base_branch: ticket.base_branch,
-        agent: ticket.agent,
-        state: ticket.state,
-        pr_url: ticket.pr_url,
-        sandbox_id: ticket.sandbox_id,
-        running_since: ticket.running_since,
-        total_cost_usd: ticket.total_cost_usd,
-        last_error: ticket.last_error,
-        created_at: ticket.created_at,
-        updated_at: ticket.updated_at,
-      })),
+      tickets: store.listAll().map((ticket) => {
+        const pipeline = deps.pipelineAdmission?.store.getStatusForIssue(ticket.linear_issue_id);
+        return {
+          linear_issue_identifier: ticket.linear_issue_identifier,
+          branch: ticket.branch,
+          repo: ticket.repo,
+          base_branch: ticket.base_branch,
+          agent: ticket.agent,
+          state: ticket.state,
+          pr_url: ticket.pr_url,
+          sandbox_id: ticket.sandbox_id,
+          running_since: ticket.running_since,
+          total_cost_usd: ticket.total_cost_usd,
+          last_error: ticket.last_error,
+          created_at: ticket.created_at,
+          updated_at: ticket.updated_at,
+          execution_mode: pipeline ? "pipeline" : "legacy",
+          pipeline: pipeline ?? null,
+        };
+      }),
     });
   });
 
@@ -491,19 +497,51 @@ export function createServer(deps: ServerDeps): Hono {
     }
     const ticket = findTicket(store, context.req.param("identifier"));
     if (!ticket) return context.json({ error: "ticket not found" }, 404);
+    const pipeline = deps.pipelineAdmission?.store.getStatusForIssue(ticket.linear_issue_id);
+    const prefix = pipeline ? `${renderPipelineLogHeader(pipeline)}\n` : "";
+    const withPipelinePrefix = (logs: string) =>
+      prefix + sanitizeText(logs).slice(-Math.max(0, MAX_PRIVATE_LOG_TAIL_CHARS - prefix.length));
     if (ticket.sandbox_id) {
       try {
         const logs = await getSandboxLogs(daytona, ticket.sandbox_id);
-        return context.text(sanitizeText(logs).slice(-MAX_PRIVATE_LOG_TAIL_CHARS));
+        return context.text(withPipelinePrefix(logs));
       } catch (error) {
         console.warn(`[logs] live workspace unavailable for ${ticket.linear_issue_identifier}:`, error);
       }
     }
     const durableLogTail = store.getLatestRunWithLog(ticket.linear_issue_id)?.log_tail;
     if (durableLogTail) {
-      return context.text(sanitizeText(durableLogTail).slice(-MAX_PRIVATE_LOG_TAIL_CHARS));
+      return context.text(withPipelinePrefix(durableLogTail));
     }
+    if (pipeline) return context.text(prefix);
     return context.json({ error: "logs not found" }, 404);
+  });
+
+  app.post("/tickets/:identifier/publications/:publicationId/retry", (context) => {
+    if (!requireStatusAuth(context.req.header("Authorization"))) {
+      return context.json({ error: "unauthorized" }, 401);
+    }
+    const ticket = findTicket(store, context.req.param("identifier"));
+    if (!ticket) return context.json({ error: "ticket not found" }, 404);
+    const pipelineStore = deps.pipelineAdmission?.store;
+    if (!pipelineStore) return context.json({ error: "pipeline coordinator is unavailable" }, 409);
+    const publication = pipelineStore.getPublication(context.req.param("publicationId"));
+    const instance = publication ? pipelineStore.getInstance(publication.pipeline_instance_id) : undefined;
+    if (!publication || instance?.linear_issue_id !== ticket.linear_issue_id) {
+      return context.json({ error: "publication not found" }, 404);
+    }
+    try {
+      const retried = pipelineStore.retryPublication(publication.id);
+      if (retried.kind === "linear_ledger") {
+        schedule(linearOutboxProcessor.process(retried.id));
+      }
+      return context.json({
+        ok: true,
+        publication: { id: retried.id, kind: retried.kind, status: retried.status },
+      });
+    } catch (error) {
+      return context.json({ error: sanitizeText(String(error)) }, 409);
+    }
   });
 
   app.get("/preview/:identifier", async (context) => {

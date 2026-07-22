@@ -17,6 +17,14 @@ import {
   type StageRequestEnvelope,
   type ValidatedRuntimeCapabilityDescriptor,
 } from "./sandbox-runtime.js";
+import {
+  buildLifecyclePublication,
+  buildSelectionPublication,
+  deterministicPublicationId,
+  parsePipelinePublication,
+  pipelinePublicationOutboxPayload,
+  publicationPayloadHash,
+} from "./pipeline-publication.js";
 
 export type PipelineInstanceStatus =
   | "pending"
@@ -120,6 +128,51 @@ export interface PipelineEffectIntent {
   last_error: string | null;
 }
 
+export interface PipelinePublicationReceipt {
+  id: string;
+  pipeline_instance_id: string;
+  attempt_id: string | null;
+  kind: "linear_ledger" | "github_summary" | "pull_request";
+  idempotency_key: string;
+  payload: string;
+  payload_hash: string;
+  status: "pending" | "processing" | "acknowledged" | "failed" | "dead";
+  external_id: string | null;
+  external_url: string | null;
+  attachment_url: string | null;
+  attempts: number;
+  next_attempt_at: string;
+  resume_status: PipelineInstanceStatus | null;
+  blocked_from_status: PipelineInstanceStatus | null;
+  created_at: string;
+  updated_at: string;
+  acknowledged_at: string | null;
+  last_error: string | null;
+}
+
+export interface PipelineStatusProjection {
+  execution_mode: "pipeline";
+  instance_id: string;
+  pipeline_id: string;
+  pipeline_version: number;
+  status: PipelineInstanceStatus;
+  stage_id: string | null;
+  attempt_ordinal: number | null;
+  retry_count: number;
+  reentry_count: number;
+  wait_reason: string | null;
+  subject: string | null;
+  gate_result: string | null;
+  assurance: string | null;
+  policy_digest: string | null;
+  context_policy: string | null;
+  publication_state: "none" | "pending" | "acknowledged" | "failed" | "blocked";
+  publication_id: string | null;
+  publication_external_id: string | null;
+  publication_error: string | null;
+  recovery_action: string | null;
+}
+
 export interface PipelineInstanceSeed {
   id?: string;
   issueId: string;
@@ -220,6 +273,23 @@ export interface PipelineStore {
   getActiveAttempt(instanceId: string): PipelineStageAttempt | undefined;
   listStages(instanceId: string): PipelineInstanceStage[];
   listEffects(instanceId: string): PipelineEffectIntent[];
+  listPublications(instanceId: string): PipelinePublicationReceipt[];
+  getPublication(id: string): PipelinePublicationReceipt | undefined;
+  claimGithubPublications(nowIso: string, leaseUntilIso: string, limit?: number): PipelinePublicationReceipt[];
+  markGithubPublicationProcessed(
+    id: string,
+    expectedPayloadHash: string,
+    externalId: string,
+    externalUrl: string
+  ): boolean;
+  markGithubPublicationFailed(
+    id: string,
+    expectedPayloadHash: string,
+    error: string,
+    retryAt: string | null
+  ): boolean;
+  retryPublication(id: string): PipelinePublicationReceipt;
+  getStatusForIssue(issueId: string): PipelineStatusProjection | undefined;
   claimEffects(nowIso: string, leaseUntilIso: string, limit?: number): PipelineEffectIntent[];
   recordEffectAcknowledgement(input: {
     effectId: string;
@@ -361,6 +431,140 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
   const getInstanceStmt = db.prepare("SELECT * FROM pipeline_instances WHERE id = ?");
   const getAttemptStmt = db.prepare("SELECT * FROM pipeline_stage_attempts WHERE id = ?");
 
+  const persistPublication = (input: {
+    instance: PipelineInstance;
+    attemptId: string | null;
+    kind: "linear_ledger" | "github_summary";
+    idempotencyKey: string;
+    payload: string;
+    timestamp: string;
+  }): PipelinePublicationReceipt => {
+    const envelope = parsePipelinePublication(input.payload);
+    if (envelope.pipeline.instance_id !== input.instance.id ||
+        envelope.pipeline.linear_issue_id !== input.instance.linear_issue_id ||
+        envelope.pipeline.generation !== input.instance.generation ||
+        envelope.pipeline.manifest_digest !== input.instance.manifest_digest) {
+      throw new Error("pipeline publication instance fence mismatch");
+    }
+    const payloadHash = publicationPayloadHash(envelope);
+    if (input.kind === "linear_ledger") {
+      const id = deterministicPublicationId(input.idempotencyKey);
+      const existing = db.prepare(`
+        SELECT * FROM pipeline_publication_receipts WHERE idempotency_key = ?
+      `).get(input.idempotencyKey) as PipelinePublicationReceipt | undefined;
+      if (existing) {
+        if (existing.id !== id || existing.pipeline_instance_id !== input.instance.id ||
+            existing.attempt_id !== input.attemptId || existing.kind !== input.kind ||
+            existing.payload_hash !== payloadHash || existing.payload !== input.payload) {
+          throw new Error(`pipeline publication ${input.idempotencyKey} already exists with different intent`);
+        }
+        return existing;
+      }
+      db.prepare(`
+        INSERT INTO pipeline_publication_receipts (
+          id, pipeline_instance_id, attempt_id, kind, idempotency_key,
+          payload, payload_hash, status, attempts, next_attempt_at,
+          resume_status, created_at, updated_at
+        ) VALUES (?, ?, ?, 'linear_ledger', ?, ?, ?, 'pending', 0, ?, ?, ?, ?)
+      `).run(
+        id,
+        input.instance.id,
+        input.attemptId,
+        input.idempotencyKey,
+        input.payload,
+        payloadHash,
+        input.timestamp,
+        envelope.resume_status,
+        input.timestamp,
+        input.timestamp
+      );
+      const outboxPayload = pipelinePublicationOutboxPayload(envelope);
+      const sequence = (db.prepare(`
+        SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence
+        FROM linear_outbox WHERE linear_session_id IS ?
+      `).get(input.instance.linear_session_id) as { sequence: number }).sequence;
+      db.prepare(`
+        INSERT INTO linear_outbox (
+          id, linear_session_id, linear_issue_id, run_id, sequence, kind,
+          payload, payload_hash, status, attempts, next_attempt_at, created_at
+        ) VALUES (?, ?, ?, NULL, ?, 'pipeline_receipt', ?, ?, 'pending', 0, ?, ?)
+      `).run(
+        id,
+        input.instance.linear_session_id,
+        input.instance.linear_issue_id,
+        sequence,
+        outboxPayload,
+        digestNormalized(outboxPayload),
+        input.timestamp,
+        input.timestamp
+      );
+    } else {
+      const stableKey = `github-summary:${input.instance.linear_issue_id}`;
+      const stableId = deterministicPublicationId(stableKey);
+      db.prepare(`
+        INSERT INTO pipeline_publication_receipts (
+          id, pipeline_instance_id, attempt_id, kind, idempotency_key,
+          payload, payload_hash, status, attempts, next_attempt_at,
+          resume_status, created_at, updated_at
+        ) VALUES (?, ?, ?, 'github_summary', ?, ?, ?, 'pending', 0, ?, NULL, ?, ?)
+        ON CONFLICT(idempotency_key) DO UPDATE SET
+          pipeline_instance_id = excluded.pipeline_instance_id,
+          attempt_id = excluded.attempt_id,
+          payload = excluded.payload,
+          payload_hash = excluded.payload_hash,
+          status = 'pending',
+          next_attempt_at = excluded.next_attempt_at,
+          last_error = NULL,
+          updated_at = excluded.updated_at
+      `).run(
+        stableId,
+        input.instance.id,
+        input.attemptId,
+        stableKey,
+        input.payload,
+        payloadHash,
+        input.timestamp,
+        input.timestamp,
+        input.timestamp
+      );
+      return db.prepare("SELECT * FROM pipeline_publication_receipts WHERE id = ?")
+        .get(stableId) as PipelinePublicationReceipt;
+    }
+    return db.prepare("SELECT * FROM pipeline_publication_receipts WHERE idempotency_key = ?")
+      .get(input.idempotencyKey) as PipelinePublicationReceipt;
+  };
+
+  db.transaction(() => {
+    const timestamp = now();
+    const instances = db.prepare(`
+      SELECT * FROM pipeline_instances pi
+      WHERE pi.status NOT IN ('shipped', 'no_change', 'needs_human', 'canceled', 'superseded', 'failed')
+        AND NOT EXISTS (
+          SELECT 1 FROM pipeline_publication_receipts ppr
+          WHERE ppr.pipeline_instance_id = pi.id AND ppr.kind = 'linear_ledger'
+        )
+    `).all() as PipelineInstance[];
+    for (const instance of instances) {
+      const selection = canonicalJson(buildSelectionPublication(instance));
+      persistPublication({
+        instance,
+        attemptId: null,
+        kind: "linear_ledger",
+        idempotencyKey: `linear-selection:${instance.id}`,
+        payload: selection,
+        timestamp,
+      });
+      persistPublication({
+        instance,
+        attemptId: null,
+        kind: "github_summary",
+        idempotencyKey: `github-summary:${instance.id}`,
+        payload: selection,
+        timestamp,
+      });
+    }
+  })();
+
   const acceptCatalog = db.transaction((catalog: ValidatedPipelineCatalog) => {
     assertDigest("pipeline catalog", catalog.normalized, catalog.digest);
     const expectedCatalog = canonicalJson({
@@ -485,6 +689,12 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
     const timestamp = now();
     for (const instance of instances) {
       const nextVersion = instance.state_version + 1;
+      const activeAttempt = db.prepare(`
+        SELECT * FROM pipeline_stage_attempts
+        WHERE pipeline_instance_id = ?
+          AND status IN ('pending', 'leased', 'dispatched', 'acknowledged', 'running')
+        ORDER BY attempt_ordinal DESC, reentry_ordinal DESC LIMIT 1
+      `).get(instance.id) as PipelineStageAttempt | undefined;
       db.prepare(`
         UPDATE pipeline_stage_attempts
         SET status = 'superseded', outcome = 'superseded', completed_at = ?, updated_at = ?
@@ -512,6 +722,28 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
             terminal_outcome = 'superseded', state_version = ?, updated_at = ?
         WHERE id = ? AND state_version = ?
       `).run(nextVersion, timestamp, instance.id, instance.state_version);
+      const terminalPublication = canonicalJson(buildLifecyclePublication({
+        instance,
+        attempt: activeAttempt,
+        outcome: "superseded",
+        reason: "A newer delegated Linear session superseded this pipeline generation.",
+      }));
+      persistPublication({
+        instance,
+        attemptId: activeAttempt?.id ?? null,
+        kind: "linear_ledger",
+        idempotencyKey: `linear-terminal:${instance.id}:superseded:${nextVersion}`,
+        payload: terminalPublication,
+        timestamp,
+      });
+      persistPublication({
+        instance,
+        attemptId: activeAttempt?.id ?? null,
+        kind: "github_summary",
+        idempotencyKey: `github-summary-update:${instance.id}:superseded:${nextVersion}`,
+        payload: terminalPublication,
+        timestamp,
+      });
       const payload = canonicalJson({
         pipelineInstanceId: instance.id,
         reason: "newer_delegated_generation",
@@ -697,6 +929,23 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
     );
     const result = getInstanceStmt.get(instanceId) as PipelineInstance;
     validatePinnedInstance(db, result);
+    const selection = canonicalJson(buildSelectionPublication(result));
+    persistPublication({
+      instance: result,
+      attemptId: null,
+      kind: "linear_ledger",
+      idempotencyKey: `linear-selection:${result.id}`,
+      payload: selection,
+      timestamp,
+    });
+    persistPublication({
+      instance: result,
+      attemptId: null,
+      kind: "github_summary",
+      idempotencyKey: `github-summary:${result.id}`,
+      payload: selection,
+      timestamp,
+    });
     return result;
   });
 
@@ -889,15 +1138,32 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
     wrote();
     for (const effect of write.effects) {
       const payloadHash = digestNormalized(effect.payload);
+      const publicationKind = effect.kind === "publish_linear"
+        ? "linear_ledger" as const
+        : effect.kind === "publish_github"
+          ? "github_summary" as const
+          : undefined;
+      if (publicationKind) {
+        persistPublication({
+          instance,
+          attemptId: attempt.id,
+          kind: publicationKind,
+          idempotencyKey: effect.idempotencyKey,
+          payload: effect.payload,
+          timestamp,
+        });
+        wrote();
+      }
       db.prepare(`
         INSERT INTO pipeline_effect_intents (
           id, pipeline_instance_id, transition_version, kind, idempotency_key,
-          payload, payload_hash, status, next_attempt_at, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+          payload, payload_hash, status, next_attempt_at, created_at, acknowledged_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         effect.id ?? deterministicId("effect", [instance.id, nextVersion, effect.kind, effect.idempotencyKey]),
         instance.id, nextVersion, effect.kind, effect.idempotencyKey,
-        effect.payload, payloadHash, timestamp, timestamp
+        effect.payload, payloadHash, publicationKind ? "acknowledged" : "pending",
+        timestamp, timestamp, publicationKind ? timestamp : null
       );
       wrote();
     }
@@ -996,6 +1262,192 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
     `).run(input.eventId, instance.id, instance.generation, eventPayload, payloadHash, timestamp);
   });
 
+  const claimGithubPublications = db.transaction((
+    nowIso: string,
+    leaseUntilIso: string,
+    limit = 50
+  ): PipelinePublicationReceipt[] => {
+    const candidates = db.prepare(`
+      SELECT id FROM pipeline_publication_receipts
+      WHERE kind = 'github_summary'
+        AND ((status IN ('pending', 'failed') AND next_attempt_at <= ?)
+          OR (status = 'processing' AND next_attempt_at <= ?))
+      ORDER BY next_attempt_at, created_at, id LIMIT ?
+    `).all(nowIso, nowIso, limit) as Array<{ id: string }>;
+    const claimed: PipelinePublicationReceipt[] = [];
+    for (const candidate of candidates) {
+      const update = db.prepare(`
+        UPDATE pipeline_publication_receipts
+        SET status = 'processing', attempts = attempts + 1,
+            next_attempt_at = ?, last_error = NULL, updated_at = ?
+        WHERE id = ? AND kind = 'github_summary'
+          AND ((status IN ('pending', 'failed') AND next_attempt_at <= ?)
+            OR (status = 'processing' AND next_attempt_at <= ?))
+      `).run(leaseUntilIso, nowIso, candidate.id, nowIso, nowIso);
+      if (update.changes === 1) {
+        claimed.push(db.prepare("SELECT * FROM pipeline_publication_receipts WHERE id = ?")
+          .get(candidate.id) as PipelinePublicationReceipt);
+      }
+    }
+    return claimed;
+  });
+
+  const markGithubPublicationProcessed = db.transaction((
+    id: string,
+    expectedPayloadHash: string,
+    externalId: string,
+    externalUrl: string
+  ): boolean => {
+    const timestamp = now();
+    const update = db.prepare(`
+      UPDATE pipeline_publication_receipts
+      SET status = 'acknowledged', external_id = ?, external_url = ?,
+          acknowledged_at = ?, last_error = NULL, updated_at = ?
+      WHERE id = ? AND kind = 'github_summary' AND status = 'processing'
+        AND payload_hash = ?
+    `).run(externalId, externalUrl, timestamp, timestamp, id, expectedPayloadHash);
+    return update.changes === 1;
+  });
+
+  const markGithubPublicationFailed = db.transaction((
+    id: string,
+    expectedPayloadHash: string,
+    error: string,
+    retryAt: string | null
+  ): boolean => {
+    const publication = db.prepare("SELECT * FROM pipeline_publication_receipts WHERE id = ?")
+      .get(id) as PipelinePublicationReceipt | undefined;
+    if (!publication || publication.kind !== "github_summary" ||
+        publication.status !== "processing" || publication.payload_hash !== expectedPayloadHash) return false;
+    const timestamp = now();
+    const status = retryAt ? "failed" : "dead";
+    const instance = getInstanceStmt.get(publication.pipeline_instance_id) as PipelineInstance;
+    db.prepare(`
+      UPDATE pipeline_publication_receipts
+      SET status = ?, next_attempt_at = ?, last_error = ?, updated_at = ?,
+          blocked_from_status = CASE WHEN ? = 'dead' THEN COALESCE(blocked_from_status, ?) ELSE blocked_from_status END
+      WHERE id = ?
+    `).run(status, retryAt ?? timestamp, error, timestamp, status, instance.status, id);
+    if (status === "dead" && ![
+      "shipped", "no_change", "needs_human", "canceled", "superseded", "failed", "publication_blocked",
+    ].includes(instance.status)) {
+      db.prepare(`
+        UPDATE pipeline_instances
+        SET status = 'publication_blocked', state_version = state_version + 1,
+            wait_reason = 'permanent publication failure', updated_at = ?
+        WHERE id = ? AND state_version = ?
+      `).run(timestamp, instance.id, instance.state_version);
+    }
+    return true;
+  });
+
+  const retryPublication = db.transaction((id: string): PipelinePublicationReceipt => {
+    const publication = db.prepare("SELECT * FROM pipeline_publication_receipts WHERE id = ?")
+      .get(id) as PipelinePublicationReceipt | undefined;
+    if (!publication) throw new Error(`unknown pipeline publication ${id}`);
+    if (publication.status !== "dead" && publication.status !== "failed") {
+      throw new Error(`pipeline publication ${id} is not recoverable`);
+    }
+    const timestamp = now();
+    db.prepare(`
+      UPDATE pipeline_publication_receipts
+      SET status = 'pending', next_attempt_at = ?, last_error = NULL, updated_at = ?
+      WHERE id = ?
+    `).run(timestamp, timestamp, id);
+    if (publication.kind === "linear_ledger") {
+      const update = db.prepare(`
+        UPDATE linear_outbox
+        SET status = 'pending', next_attempt_at = ?, last_error = NULL, processed_at = NULL
+        WHERE id = ? AND status IN ('dead', 'failed')
+      `).run(timestamp, id);
+      if (update.changes !== 1) throw new Error(`pipeline publication ${id} has no recoverable outbox row`);
+    }
+    const remainingDead = db.prepare(`
+      SELECT COUNT(*) AS count FROM pipeline_publication_receipts
+      WHERE pipeline_instance_id = ? AND status = 'dead'
+    `).get(publication.pipeline_instance_id) as { count: number };
+    if (remainingDead.count === 0) {
+      db.prepare(`
+        UPDATE pipeline_instances
+        SET status = ?, wait_reason = NULL, state_version = state_version + 1, updated_at = ?
+        WHERE id = ? AND status = 'publication_blocked'
+      `).run(publication.blocked_from_status ?? "completion_pending_publication", timestamp, publication.pipeline_instance_id);
+    }
+    return db.prepare("SELECT * FROM pipeline_publication_receipts WHERE id = ?")
+      .get(id) as PipelinePublicationReceipt;
+  });
+
+  function getStatusForIssue(issueId: string): PipelineStatusProjection | undefined {
+    const instance = db.prepare(`
+      SELECT pi.* FROM session_executions se
+      JOIN pipeline_instances pi ON pi.id = se.pipeline_instance_id
+      JOIN tickets t ON t.linear_session_id = se.linear_session_id
+      WHERE t.linear_issue_id = ? AND se.execution_mode = 'pipeline'
+    `).get(issueId) as PipelineInstance | undefined;
+    if (!instance) return undefined;
+    const attempt = db.prepare(`
+      SELECT * FROM pipeline_stage_attempts
+      WHERE pipeline_instance_id = ?
+      ORDER BY attempt_ordinal DESC, reentry_ordinal DESC LIMIT 1
+    `).get(instance.id) as PipelineStageAttempt | undefined;
+    const retries = db.prepare(`
+      SELECT COUNT(*) AS count FROM pipeline_stage_attempts
+      WHERE pipeline_instance_id = ? AND status = 'failed'
+    `).get(instance.id) as { count: number };
+    const gate = db.prepare(`
+      SELECT pgr.*, pa.assurance FROM pipeline_gate_receipts pgr
+      LEFT JOIN pipeline_artifacts pa
+        ON pa.pipeline_instance_id = pgr.pipeline_instance_id
+       AND pa.attempt_id = pgr.attempt_id
+      WHERE pgr.pipeline_instance_id = ?
+      ORDER BY pgr.created_at DESC, pgr.id DESC LIMIT 1
+    `).get(instance.id) as {
+      result: string;
+      policy_digest: string;
+      assurance: string | null;
+    } | undefined;
+    const publications = db.prepare(`
+      SELECT * FROM pipeline_publication_receipts
+      WHERE pipeline_instance_id = ?
+      ORDER BY updated_at DESC, created_at DESC, id DESC
+    `).all(instance.id) as PipelinePublicationReceipt[];
+    const latest = publications[0];
+    const publicationState: PipelineStatusProjection["publication_state"] =
+      publications.some((item) => item.status === "dead") || instance.status === "publication_blocked"
+        ? "blocked"
+        : publications.some((item) => item.status === "failed")
+          ? "failed"
+          : publications.some((item) => item.status === "pending" || item.status === "processing")
+            ? "pending"
+            : publications.some((item) => item.status === "acknowledged")
+              ? "acknowledged"
+              : "none";
+    return {
+      execution_mode: "pipeline",
+      instance_id: instance.id,
+      pipeline_id: instance.pipeline_id,
+      pipeline_version: instance.pipeline_version,
+      status: instance.status,
+      stage_id: instance.active_stage_id ?? attempt?.stage_id ?? null,
+      attempt_ordinal: attempt?.attempt_ordinal ?? null,
+      retry_count: retries.count,
+      reentry_count: instance.reentry_count,
+      wait_reason: instance.wait_reason,
+      subject: instance.immutable_subject,
+      gate_result: gate?.result ?? null,
+      assurance: gate?.assurance ?? null,
+      policy_digest: gate?.policy_digest ?? null,
+      context_policy: attempt?.native_context_policy ?? null,
+      publication_state: publicationState,
+      publication_id: latest?.id ?? null,
+      publication_external_id: latest?.external_id ?? null,
+      publication_error: publications.find((item) => item.last_error)?.last_error ?? null,
+      recovery_action: publicationState === "blocked" && latest
+        ? `POST /tickets/:identifier/publications/${latest.id}/retry`
+        : null,
+    };
+  }
+
   return {
     acceptCatalog,
     acceptRuntimeDescriptor,
@@ -1064,6 +1516,21 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
         WHERE pipeline_instance_id = ? ORDER BY transition_version, created_at, id
       `).all(instanceId) as PipelineEffectIntent[];
     },
+    listPublications(instanceId) {
+      return db.prepare(`
+        SELECT * FROM pipeline_publication_receipts
+        WHERE pipeline_instance_id = ? ORDER BY created_at, id
+      `).all(instanceId) as PipelinePublicationReceipt[];
+    },
+    getPublication(id) {
+      return db.prepare("SELECT * FROM pipeline_publication_receipts WHERE id = ?")
+        .get(id) as PipelinePublicationReceipt | undefined;
+    },
+    claimGithubPublications,
+    markGithubPublicationProcessed,
+    markGithubPublicationFailed,
+    retryPublication,
+    getStatusForIssue,
     claimEffects,
     recordEffectAcknowledgement,
     markEffectFailed(effectId, error, retryAt) {

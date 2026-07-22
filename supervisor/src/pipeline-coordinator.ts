@@ -18,6 +18,7 @@ import type {
   PipelineStore,
 } from "./pipeline-store.js";
 import { buildStageRequest } from "./pipeline-store.js";
+import { buildStagePublication } from "./pipeline-publication.js";
 
 export interface PipelineEventArtifact {
   id?: string;
@@ -58,10 +59,8 @@ export interface PipelineReductionInput {
   event: PipelineCoordinatorEvent;
 }
 
-function terminalStatus(outcome: PipelineOutcome): PipelineInstanceStatus {
-  return outcome === "shipped" || outcome === "no_change"
-    ? "completion_pending_publication"
-    : outcome;
+function terminalStatus(_outcome: PipelineOutcome): PipelineInstanceStatus {
+  return "completion_pending_publication";
 }
 
 function activeStage(input: PipelineReductionInput): PipelineStage {
@@ -89,6 +88,10 @@ function verifyInput(input: PipelineReductionInput): PipelineStage {
   if (event.kind !== "stage_result" && event.subject != null &&
       instance.immutable_subject != null && event.subject !== instance.immutable_subject) {
     throw new Error("pipeline event subject is stale");
+  }
+  if (instance.status === "publication_blocked" &&
+      event.kind !== "stop" && event.kind !== "supersede") {
+    throw new Error("pipeline publication is blocked and must be recovered before progression");
   }
   const stage = activeStage(input);
   if (event.kind === "provider_snapshot" && instance.status !== "waiting_provider") {
@@ -221,7 +224,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
       attemptId: input.attempt.id,
       outcome: input.event.outcome,
       resultHash: input.event.resultHash,
-      nextStatus: terminal,
+      nextStatus: terminalStatus(terminal),
       terminalOutcome: terminal,
       nextStageId: null,
       artifacts: artifactsFor(input.event),
@@ -281,7 +284,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
         attemptId: input.attempt.id,
         outcome: input.event.outcome,
         resultHash: input.event.resultHash,
-        nextStatus: "failed",
+        nextStatus: terminalStatus("failed"),
         terminalOutcome: "failed",
         nextStageId: null,
         waitReason: `pipeline attempt limit ${input.manifest.max_attempts} exhausted`,
@@ -300,12 +303,15 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
     }
     const reentryOrdinal = isReentry ? targetState.reentry_count + 1 : targetState.reentry_count;
     const nextAttempt = nextAttemptFor(input, target, reentryOrdinal);
-    const nextStatus: PipelineInstanceStatus = target.executor.kind === "provider_wait"
+    const resumeStatus: PipelineInstanceStatus = target.executor.kind === "provider_wait"
       ? "waiting_provider"
       : target.evaluator.kind === "human"
         ? "waiting_human"
         : "dispatchable";
-    const nextEffect = nextStatus === "dispatchable"
+    const nextStatus: PipelineInstanceStatus = resumeStatus === "waiting_human"
+      ? "completion_pending_publication"
+      : resumeStatus;
+    const nextEffect = resumeStatus === "dispatchable"
       ? {
           kind: "dispatch_stage" as const,
           idempotencyKey: nextAttempt.idempotencyKey,
@@ -317,7 +323,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
           payload: canonicalJson({
             pipelineInstanceId: input.instance.id,
             stageId: target.id,
-            wait: nextStatus,
+          wait: resumeStatus,
           }),
         };
     return {
@@ -332,6 +338,11 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
       nextStatus,
       nextStageId: target.id,
       nextStageStatus: nextStatus === "dispatchable" ? "dispatchable" : "waiting",
+      waitReason: resumeStatus === "waiting_human"
+        ? `human decision required at ${target.id}`
+        : resumeStatus === "waiting_provider"
+          ? `provider evidence required at ${target.id}`
+          : null,
       immutableSubject: input.event.subject ?? null,
       reentryIncrement: isReentry ? 1 : 0,
       artifacts: artifactsFor(input.event),
@@ -353,6 +364,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
     nextStatus: terminalStatus(terminal),
     terminalOutcome: terminal,
     nextStageId: null,
+    waitReason: terminal === "needs_human" ? "pipeline requires a human decision" : null,
     immutableSubject: input.event.subject ?? null,
     artifacts: artifactsFor(input.event),
     effects: [{
@@ -392,5 +404,33 @@ export function coordinatePipelineEvent(
   const stages = store.listStages(instance.id);
   const write = reducePipelineEvent({ manifest, instance, attempt, stages, event });
   write.gateReceipt = gateReceipt;
+  const target = write.nextStageId
+    ? manifest.stages.find((stage) => stage.id === write.nextStageId)
+    : undefined;
+  const resumeStatus: PipelineInstanceStatus | null = write.terminalOutcome
+    ? write.terminalOutcome
+    : target?.evaluator.kind === "human" && write.nextStatus === "completion_pending_publication"
+      ? "waiting_human"
+      : null;
+  const publication = canonicalJson(buildStagePublication({
+    instance,
+    attempt,
+    event,
+    write,
+    gateReceipt,
+    resumeStatus,
+  }));
+  const linear = write.effects.find((effect) => effect.kind === "publish_linear");
+  if (linear) linear.payload = publication;
+  else write.effects.push({
+    kind: "publish_linear",
+    idempotencyKey: `linear-gate:${instance.id}:${attempt.id}:${gateReceipt?.hash ?? event.resultHash}`,
+    payload: publication,
+  });
+  write.effects.push({
+    kind: "publish_github",
+    idempotencyKey: `github-summary-update:${instance.id}:${attempt.id}:${gateReceipt?.hash ?? event.resultHash}`,
+    payload: publication,
+  });
   return store.applyTransition(write, faultAfterWrite);
 }

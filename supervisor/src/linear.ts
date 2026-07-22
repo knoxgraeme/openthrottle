@@ -281,6 +281,59 @@ export async function agentActivityCreate(
   return data.agentActivityCreate;
 }
 
+export async function linearFileUpload(
+  client: LinearClient,
+  params: { filename: string; contentType: string; content: string }
+): Promise<{ assetUrl: string }> {
+  const size = Buffer.byteLength(params.content, "utf8");
+  if (!/^[A-Za-z0-9_.-]{1,180}$/.test(params.filename)) {
+    throw new Error("Linear upload filename is unsafe");
+  }
+  if (params.contentType !== "application/json" || size < 1 || size > 256 * 1024) {
+    throw new Error("Linear upload content is invalid");
+  }
+  const data = await linearGraphQL<{
+    fileUpload: {
+      success: boolean;
+      uploadFile?: {
+        uploadUrl?: string;
+        assetUrl?: string;
+        headers?: Array<{ key?: string; value?: string }>;
+      };
+    };
+  }>(
+    client,
+    `mutation FileUpload($contentType: String!, $filename: String!, $size: Int!) {
+      fileUpload(contentType: $contentType, filename: $filename, size: $size) {
+        success
+        uploadFile { uploadUrl assetUrl headers { key value } }
+      }
+    }`,
+    { contentType: params.contentType, filename: params.filename, size }
+  );
+  const upload = data.fileUpload.uploadFile;
+  if (!data.fileUpload.success || !upload?.uploadUrl || !upload.assetUrl) {
+    throw new Error("Linear fileUpload returned an incomplete upload target");
+  }
+  const uploadUrl = new URL(upload.uploadUrl);
+  const assetUrl = new URL(upload.assetUrl);
+  if (uploadUrl.protocol !== "https:" || assetUrl.protocol !== "https:") {
+    throw new Error("Linear fileUpload returned an unsafe URL");
+  }
+  const headers = new Headers({ "Content-Type": params.contentType });
+  for (const header of upload.headers ?? []) {
+    if (header.key && header.value) headers.set(header.key, header.value);
+  }
+  const response = await (client.fetch ?? fetch)(uploadUrl, {
+    method: "PUT",
+    headers,
+    body: params.content,
+    signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+  });
+  if (!response.ok) throw new Error(`Linear private upload failed (${response.status})`);
+  return { assetUrl: assetUrl.toString() };
+}
+
 // A session-level plan is an ordered checklist Linear renders in the agent
 // session UI; agents replace it in full on each update (Linear has no
 // per-item patch). Used to surface "which gate is done / in progress" live.

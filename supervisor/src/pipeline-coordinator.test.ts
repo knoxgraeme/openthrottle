@@ -127,17 +127,18 @@ describe("pipeline coordinator", () => {
     expect(pipelines.listEffects(instance.id).map((effect) => effect.kind)).toEqual([
       "provision",
       "publish_linear",
+      "publish_github",
     ]);
 
     const replay = coordinatePipelineEvent(pipelines, input);
     expect(replay.state_version).toBe(1);
-    expect(pipelines.listEffects(instance.id)).toHaveLength(2);
+    expect(pipelines.listEffects(instance.id)).toHaveLength(3);
   });
 
   it("rolls back every transition write boundary and recovers one complete intent set", () => {
     const { pipelines, instance, attempt } = setup();
     const input = event(instance, attempt, "success", "fault-event");
-    for (let failAt = 1; failAt <= 7; failAt += 1) {
+    for (let failAt = 1; failAt <= 10; failAt += 1) {
       expect(() => coordinatePipelineEvent(pipelines, input, (writes) => {
         if (writes === failAt) throw new Error(`fault after write ${writes}`);
       })).toThrow(`fault after write ${failAt}`);
@@ -148,7 +149,7 @@ describe("pipeline coordinator", () => {
 
     const completed = coordinatePipelineEvent(pipelines, input);
     expect(completed.state_version).toBe(1);
-    expect(pipelines.listEffects(instance.id)).toHaveLength(2);
+    expect(pipelines.listEffects(instance.id)).toHaveLength(3);
   });
 
   it("enforces bounded repair and uses explicit on_exhausted policy", () => {
@@ -171,7 +172,7 @@ describe("pipeline coordinator", () => {
       stages: stages.map((stage) => ({ ...stage, reentry_count: stage.stage_id === "implement" ? 3 : stage.reentry_count })),
       event: repair,
     });
-    expect(exhausted.nextStatus).toBe("needs_human");
+    expect(exhausted.nextStatus).toBe("completion_pending_publication");
     expect(exhausted.terminalOutcome).toBe("needs_human");
     expect(exhausted.nextAttempt).toBeUndefined();
 
@@ -182,7 +183,7 @@ describe("pipeline coordinator", () => {
       stages,
       event: event(instance, attempt, "retryable_infrastructure_failure", "attempt-limit"),
     });
-    expect(attemptsExhausted.nextStatus).toBe("failed");
+    expect(attemptsExhausted.nextStatus).toBe("completion_pending_publication");
     expect(attemptsExhausted.waitReason).toMatch(/attempt limit/);
     expect(attemptsExhausted.nextAttempt).toBeUndefined();
   });
@@ -205,7 +206,7 @@ describe("pipeline coordinator", () => {
       agent: "codex",
       contextRevision: 1,
     });
-    expect(pipelines.listEffects(instance.id).at(-1)).toMatchObject({
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.kind === "dispatch_stage")).toMatchObject({
       kind: "dispatch_stage",
       payload: next.request_payload,
     });

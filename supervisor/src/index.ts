@@ -14,6 +14,7 @@ import { loadPipelineCatalog } from "./pipeline-manifest.js";
 import { createPipelineStore } from "./pipeline-store.js";
 import { loadRuntimeCapabilityDescriptor } from "./sandbox-runtime.js";
 import { processStageEvidence } from "./gate-evaluators.js";
+import { createGithubPublicationProcessor } from "./pipeline-publication.js";
 
 const SWEEP_INTERVAL_MS = 15 * 60 * 1000; // run every 15 min while awake; SPEC only requires "on every boot" + periodic while awake
 const DELIVERY_DRAIN_INTERVAL_MS = 30 * 1000;
@@ -43,17 +44,23 @@ async function main() {
   const daytona = new Daytona({ apiKey: cfg.daytonaApiKey });
   const getLinearClient = createLinearClientProvider(cfg, store);
   const linearOutboxProcessor = createLinearOutboxProcessor({ store, getLinearClient });
+  const pipelineAdmission = {
+    catalog: pipelineCatalog,
+    runtime: runtimeCapabilities,
+    store: pipelineStore,
+  };
+  const githubPublicationProcessor = createGithubPublicationProcessor({
+    store: pipelineStore,
+    tickets: store,
+    client: { token: cfg.githubToken },
+  });
   const deliveryProcessor = createServerWebhookDeliveryProcessor({
     cfg,
     store,
     daytona,
     getLinearClient,
     linearOutbox: linearOutboxProcessor,
-    pipelineAdmission: {
-      catalog: pipelineCatalog,
-      runtime: runtimeCapabilities,
-      store: pipelineStore,
-    },
+    pipelineAdmission,
   });
 
   const app = createServer({
@@ -63,6 +70,7 @@ async function main() {
     getLinearClient,
     deliveryProcessor,
     linearOutboxProcessor,
+    pipelineAdmission,
   });
 
   let sandboxPollRunning = false;
@@ -153,6 +161,7 @@ async function main() {
   // Run once on boot, then on an interval while the process stays awake.
   deliveryProcessor.drain().catch((err) => console.error("[webhooks] boot drain failed:", err));
   linearOutboxProcessor.drain().catch((err) => console.error("[linear-outbox] boot drain failed:", err));
+  githubPublicationProcessor.drain().catch((err) => console.error("[github-publication] boot drain failed:", err));
   pollActiveSandboxes().catch((err) => console.error("[sandbox-events] boot poll failed:", err));
   getLinearClient()
     .then((linear) => runSweep(daytona, store, linear, cfg))
@@ -170,6 +179,9 @@ async function main() {
     linearOutboxProcessor
       .drain()
       .catch((err) => console.error("[linear-outbox] interval drain failed:", err));
+    githubPublicationProcessor
+      .drain()
+      .catch((err) => console.error("[github-publication] interval drain failed:", err));
   }, DELIVERY_DRAIN_INTERVAL_MS).unref();
   setInterval(() => {
     pollActiveSandboxes().catch((err) =>
