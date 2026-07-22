@@ -33,9 +33,12 @@ setup() {
   [[ "$output" == *'additionalContext'* ]]
   [[ "$output" == *'Mid-run steering'* ]]
   [[ "$output" == *'does not override'* ]]
-  # Both response paths are offered: acknowledge-and-continue vs stop-and-ask.
+  # Both response paths are offered: acknowledge-and-continue vs stop-and-ask,
+  # with the elicit path gated to genuinely blocking questions (a bare question
+  # is not by itself a reason to stop).
   [[ "$output" == *'ot-activity thought'* ]]
   [[ "$output" == *'ot-activity elicitation'* ]]
+  [[ "$output" == *'not by itself a reason to stop'* ]]
   [[ "$output" == *'focus on the failing test'* ]]
   # Consumed exactly once — file deleted, no pending files remain.
   [ ! -f "$OT_INBOX_DIR/aaaa.md" ]
