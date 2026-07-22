@@ -76,6 +76,21 @@ describe("sandbox event contracts", () => {
     );
     expect(ephemeral).toMatchObject({ type: "thought", ephemeral: true });
 
+    expect(parseSandboxEvent(JSON.stringify({
+      version: 1,
+      kind: "heartbeat",
+      event_id: "22222222-2222-4222-8222-222222222222",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:01.000Z",
+      injected_agent_text: "must be dropped",
+    }))).toEqual({
+      version: 1,
+      kind: "heartbeat",
+      event_id: "22222222-2222-4222-8222-222222222222",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:01.000Z",
+    });
+
     const plan = parseSandboxEvent(
       JSON.stringify({
         version: 1,
@@ -115,6 +130,89 @@ describe("sandbox event contracts", () => {
         )
       ).toThrow();
     }
+  });
+
+  it("renews liveness from a sealed heartbeat without publishing semantic activity", async () => {
+    const store = seedRunningTicket();
+    const heartbeatAt = "2026-07-22T16:00:00.000Z";
+    const heartbeat = Buffer.from(JSON.stringify({
+      version: 1,
+      kind: "heartbeat",
+      event_id: "77777777-7777-4777-8777-777777777777",
+      run_id: "run-1",
+      created_at: heartbeatAt,
+    }));
+    const files = new Map([["/var/lib/openthrottle/heartbeat/heartbeat.json", heartbeat]]);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      fs: {
+        listFiles: vi.fn(async (directory: string) => [...files.entries()]
+          .filter(([path]) => path.startsWith(`${directory}/`))
+          .map(([path, value]) => ({
+            name: path.split("/").at(-1), path, size: value.length, isDir: false,
+          }))),
+        downloadFile: vi.fn(async (path: string) => files.get(path)!),
+        deleteFile: vi.fn(async (path: string) => files.delete(path)),
+      },
+    } as unknown as Sandbox;
+    const postActivity = vi.fn(async () => undefined);
+
+    await pollSandboxEvents({
+      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      store,
+      postActivity,
+      finishCompletion: vi.fn(async () => ({ status: 200 })),
+    });
+
+    expect(postActivity).not.toHaveBeenCalled();
+    expect(store.db.prepare(
+      "SELECT actor_state, last_heartbeat_at FROM run_liveness WHERE run_id = 'run-1'"
+    ).get()).toEqual({ actor_state: "running", last_heartbeat_at: expect.any(String) });
+    expect(store.getSandboxEvent("77777777-7777-4777-8777-777777777777")?.status)
+      .toBe("processed");
+    expect(files.size).toBe(0);
+  });
+
+  it("rejects an agent-writable outbox event that impersonates the executor heartbeat", async () => {
+    const store = seedRunningTicket();
+    const forged = Buffer.from(JSON.stringify({
+      version: 1,
+      kind: "heartbeat",
+      event_id: "66666666-6666-4666-8666-666666666666",
+      run_id: "run-1",
+      created_at: "2999-01-01T00:00:00.000Z",
+    }));
+    const files = new Map([["/home/agent/.ot/outbox/forged.json", forged]]);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      fs: {
+        listFiles: vi.fn(async () => [{
+          name: "forged.json", path: "/home/agent/.ot/outbox/forged.json",
+          size: forged.length, isDir: false,
+        }]),
+        downloadFile: vi.fn(async (path: string) => files.get(path)),
+        deleteFile: vi.fn(async (path: string) => files.delete(path)),
+      },
+    } as unknown as Sandbox;
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await pollSandboxEvents({
+      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      store,
+      postActivity: vi.fn(async () => undefined),
+      finishCompletion: vi.fn(async () => ({ status: 200 })),
+    });
+
+    expect(store.getSandboxEvent("66666666-6666-4666-8666-666666666666")).toBeUndefined();
+    expect(store.db.prepare(
+      "SELECT last_heartbeat_at FROM run_liveness WHERE run_id = 'run-1'"
+    ).get()).toEqual({ last_heartbeat_at: null });
+    expect(files.size).toBe(0);
+    error.mockRestore();
   });
 
   it("forwards structured action verb/parameter/result to Linear", async () => {
@@ -499,7 +597,12 @@ describe("sandbox event contracts", () => {
         listFiles: vi.fn(async () => [{
           name: "stale.json", path: "/home/agent/.ot/outbox/stale.json", size: stale.length, isDir: false,
         }]),
-        downloadFile: vi.fn(async () => stale),
+        downloadFile: vi.fn(async (path: string) => {
+          if (path === "/var/lib/openthrottle/heartbeat/heartbeat.json") {
+            throw new Error("not found");
+          }
+          return stale;
+        }),
         deleteFile,
       },
     } as unknown as Sandbox;
@@ -543,7 +646,12 @@ describe("sandbox event contracts", () => {
         listFiles: vi.fn(async () => [{
           name: "late.json", path: "/home/agent/.ot/outbox/late.json", size: late.length, isDir: false,
         }]),
-        downloadFile: vi.fn(async () => late),
+        downloadFile: vi.fn(async (path: string) => {
+          if (path === "/var/lib/openthrottle/heartbeat/heartbeat.json") {
+            throw new Error("not found");
+          }
+          return late;
+        }),
         deleteFile,
       },
     } as unknown as Sandbox;

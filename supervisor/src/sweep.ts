@@ -38,6 +38,7 @@ export async function runSweep(
   const retentionCutoff = new Date(Date.now() - 7 * DAY_MS).toISOString();
   store.pruneDeliveries(retentionCutoff);
   store.pruneSandboxEvents(retentionCutoff);
+  store.pruneEphemeralLinearOutbox(retentionCutoff);
 }
 
 async function expireStaleTickets(

@@ -275,7 +275,7 @@ describe("TicketStore", () => {
       expiresAt: "2099-01-01T00:00:00.000Z",
     });
 
-    // errored: pending work but ticket is not active → excluded.
+    // errored: valid pending work is explicitly recoverable and redrains.
     addTicket("errored", "error");
     store.enqueueSessionWork({
       id: "gh-ci-err",
@@ -291,7 +291,7 @@ describe("TicketStore", () => {
     const now = new Date().toISOString();
     expect(
       store.listTicketsWithPendingSessionWork(now).map((t) => t.linear_issue_id)
-    ).toEqual(["issue-1"]);
+    ).toEqual(["issue-1", "errored"]);
 
     // The available_at filter: work enqueued now is not yet claimable "in the past".
     expect(
@@ -300,7 +300,32 @@ describe("TicketStore", () => {
 
     // Once the only pending item is claimed, the ticket drops out.
     store.claimNextSessionWork("session-1", now);
-    expect(store.listTicketsWithPendingSessionWork(now)).toEqual([]);
+    expect(store.listTicketsWithPendingSessionWork(now).map((t) => t.linear_issue_id)).toEqual([
+      "errored",
+    ]);
+  });
+
+  it("claims authoritative work even when the legacy projection has drifted", () => {
+    const store = makeStore();
+    store.enqueueSessionWork({
+      id: "authoritative-work",
+      linearSessionId: "session-1",
+      issueId: "issue-1",
+      source: "human",
+      body: "authoritative body",
+    });
+    db!.prepare(
+      "UPDATE session_work SET status = 'canceled', body = 'stale projection' WHERE id = ?"
+    ).run("authoritative-work");
+
+    expect(store.claimNextSessionWork("session-1", new Date().toISOString())).toMatchObject({
+      id: "authoritative-work",
+      body: "authoritative body",
+      status: "claimed",
+    });
+    expect(db!.prepare("SELECT body, status FROM session_work WHERE id = ?").get(
+      "authoritative-work"
+    )).toEqual({ body: "authoritative body", status: "claimed" });
   });
 
   it("finds expired running work", () => {
@@ -325,16 +350,16 @@ describe("TicketStore", () => {
       tokenHash: "hash",
       expiresAt: "2099-01-01T00:00:00.000Z",
     });
-    for (const eventId of [
-      "11111111-1111-4111-8111-111111111111",
-      "22222222-2222-4222-8222-222222222222",
-    ]) {
+    for (const [eventId, ephemeral] of [
+      ["11111111-1111-4111-8111-111111111111", true],
+      ["22222222-2222-4222-8222-222222222222", false],
+    ] as const) {
       store.insertSandboxEvent({
         eventId,
         runId: "run-events",
         sandboxId: "sandbox-1",
         kind: "activity",
-        payload: JSON.stringify({ type: "thought" }),
+        payload: JSON.stringify({ type: "thought", ephemeral }),
       });
     }
     store.claimSandboxEvent(

@@ -8,6 +8,7 @@ import { MAX_PRIVATE_LOG_TAIL_BYTES, MAX_PRIVATE_LOG_TAIL_CHARS } from "./logs.j
 import { sanitizeText } from "./sanitize.js";
 
 const OUTBOX_DIR = "/home/agent/.ot/outbox";
+const SEALED_HEARTBEAT_FILE = "/var/lib/openthrottle/heartbeat/heartbeat.json";
 const TASK_LOG_TAIL_COMMAND = `tail -c ${MAX_PRIVATE_LOG_TAIL_BYTES} /home/agent/.ot/task.log`;
 const MAX_EVENT_BYTES = 32 * 1024;
 const MAX_BODY_LENGTH = 8_000;
@@ -29,7 +30,15 @@ const PLAN_STATUSES: ReadonlyArray<AgentPlanStatus> = [
 const MAX_PLAN_ITEMS = 50;
 const MAX_PLAN_CONTENT = 500;
 
-export type SandboxEvent = SandboxActivityEvent | SandboxPlanEvent | SandboxCompletionEvent;
+export type SandboxEvent = SandboxActivityEvent | SandboxPlanEvent | SandboxCompletionEvent | SandboxHeartbeatEvent;
+
+interface SandboxHeartbeatEvent {
+  version: 1;
+  kind: "heartbeat";
+  event_id: string;
+  run_id: string;
+  created_at: string;
+}
 
 interface SandboxActivityEvent {
   version: 1;
@@ -113,6 +122,15 @@ export function parseSandboxEvent(raw: string): SandboxEvent {
     throw new Error("sandbox event has an invalid created_at");
   }
 
+  if (value.kind === "heartbeat") {
+    return {
+      version: 1,
+      kind: "heartbeat",
+      event_id: value.event_id,
+      run_id: value.run_id,
+      created_at: value.created_at,
+    };
+  }
   if (value.kind === "activity") {
     if (!isActivityType(value.type)) {
       throw new Error("sandbox activity has an invalid type");
@@ -240,11 +258,39 @@ function sanitizePlan(plan: AgentPlanItem[]): AgentPlanItem[] {
   return plan.map((item) => ({ content: sanitizeText(item.content), status: item.status }));
 }
 
-async function listEventFiles(sandbox: Sandbox) {
+interface SandboxEventFile {
+  name: string;
+  remotePath: string;
+  size: number;
+  sealedHeartbeat: boolean;
+  prefetched?: Buffer;
+}
+
+async function listEventFiles(sandbox: Sandbox): Promise<SandboxEventFile[]> {
   const files = await sandbox.fs.listFiles(OUTBOX_DIR);
-  return files
+  const events: SandboxEventFile[] = files
     .filter((file) => !file.isDir && /^[A-Za-z0-9._-]+\.json$/.test(file.name))
-    .sort((left, right) => left.name.localeCompare(right.name));
+    .map((file) => ({
+      name: file.name,
+      remotePath: `${OUTBOX_DIR}/${file.name}`,
+      size: file.size,
+      sealedHeartbeat: false,
+    }));
+  try {
+    const heartbeat = await sandbox.fs.downloadFile(SEALED_HEARTBEAT_FILE);
+    if (Buffer.isBuffer(heartbeat) && heartbeat.length > 0) {
+      events.push({
+        name: "000-sealed-heartbeat.json",
+        remotePath: SEALED_HEARTBEAT_FILE,
+        size: heartbeat.length,
+        sealedHeartbeat: true,
+        prefetched: heartbeat,
+      });
+    }
+  } catch {
+    // No sealed pulse has landed yet.
+  }
+  return events.sort((left, right) => left.name.localeCompare(right.name));
 }
 
 async function readTaskLogTail(sandbox: Sandbox, callbackToken: string): Promise<string | undefined> {
@@ -317,7 +363,7 @@ async function pollTicketEvents(
   }
 
   for (const file of files) {
-    const remotePath = `${OUTBOX_DIR}/${file.name}`;
+    const remotePath = file.remotePath;
     if (file.size > MAX_EVENT_BYTES) {
       console.error(`[sandbox-events] deleting oversized event ${file.name}`);
       await sandbox.fs.deleteFile(remotePath).catch(() => undefined);
@@ -326,10 +372,19 @@ async function pollTicketEvents(
 
     let event: SandboxEvent;
     try {
-      const raw = (await sandbox.fs.downloadFile(remotePath)).toString("utf8");
+      const raw = (file.prefetched ?? await sandbox.fs.downloadFile(remotePath)).toString("utf8");
       event = parseSandboxEvent(raw);
     } catch (error) {
       console.error(`[sandbox-events] deleting invalid event ${file.name}:`, error);
+      await sandbox.fs.deleteFile(remotePath).catch(() => undefined);
+      continue;
+    }
+
+    if (
+      (event.kind === "heartbeat" && !file.sealedHeartbeat) ||
+      (event.kind !== "heartbeat" && file.sealedHeartbeat)
+    ) {
+      console.error(`[sandbox-events] deleting event with invalid trust origin ${file.name}`);
       await sandbox.fs.deleteFile(remotePath).catch(() => undefined);
       continue;
     }
@@ -356,13 +411,13 @@ async function pollTicketEvents(
             }
           : event.kind === "plan"
             ? { ...event, plan: sanitizePlan(event.plan) }
-            : {
+            : event.kind === "completion" ? {
                 ...event,
                 token: "[redacted]",
                 ...(event.failure_tail
                   ? { failure_tail: sanitizeText(event.failure_tail) }
                   : {}),
-              }
+              } : event
       ),
     });
     if (
@@ -388,7 +443,13 @@ async function pollTicketEvents(
     if (!claimed) break;
 
     try {
-      if (event.kind === "activity") {
+      if (event.kind === "heartbeat") {
+        // Supervisor receipt time is authoritative; a skewed sandbox clock
+        // cannot extend a lease into the future.
+        if (!params.store.renewRunLiveness(event.run_id, new Date().toISOString())) {
+          throw new Error(`heartbeat rejected for inactive run ${event.run_id}`);
+        }
+      } else if (event.kind === "activity") {
         const run = params.store.getRun(event.run_id);
         const sessionId = run?.linear_session_id ?? ticket.linear_session_id;
         if (run?.linear_session_id && run.linear_session_id !== ticket.linear_session_id) {

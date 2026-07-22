@@ -99,24 +99,29 @@ Linear AgentSessionEvent ──HMAC──> Fly supervisor ──@daytona/sdk─�
 1. A signed `action=prompted` event carries the reply in
    `agentActivity.content.body` (legacy `agentActivity.body` is tolerated).
 2. Native `signal=stop` and exact `/stop` bypass acknowledgement and prompt
-   context mutation. Stop first records the run/session as stopped, cancels
-   pending work, and enqueues one terminal response; Daytona cleanup is retried
-   independently if it fails.
+   context mutation. Stop first claims the run into non-dispatchable `reaping`,
+   confirms Daytona termination, then records the run/session as stopped,
+   cancels pending work, and enqueues one terminal response. An unconfirmed
+   termination remains quarantined with ticket exclusivity held.
 3. Exact `/merge` (or `merge it`) uses the guarded merge path when enabled.
    Exact `/implement` promotes the next run to `implement`; the legacy
    free-text heuristic (`fix it`/`implement`/`go ahead` anywhere in the reply,
    only recognized on an `investigate`-labeled ticket) remains a deprecated
    alias that logs a warning when it fires instead of the command. Other
-   replies are deduplicated by Linear activity ID in `session_work`,
+   replies are deduplicated by Linear activity ID in authoritative
+   `work_items` (with a same-transaction `session_work` compatibility projection),
    acknowledged, and then claim a `resume` run in the existing sandbox when
    the session is idle. A busy session keeps the durable work row instead of
    requiring the user to resend it. On a busy session whose agent supports
    mid-run steering (Claude/Codex), the reply is additionally pushed to the
-   `session_inbox` under the same activity ID (interrupt-on-send), so it is
-   injected into the running sandbox at the next hook boundary rather than only
-   after the run. When that run completes, a steer already `delivered` cancels
-   the queued `session_work` row (no double-apply); a steer still `pending` —
-   the run ended before delivery — resumes from the durable row as the fallback.
+   `session_inbox` under the same activity ID (interrupt-on-send). The supervisor
+   leases a fenced `work_delivery` and uploads its envelope; upload advances only
+   to `dispatched`. The hook atomically journals the delivery/request hash after
+   injection, and only the observed exact journal advances it to `acknowledged`.
+   Completion consumes acknowledged work against that run and cancels the queued
+   fallback (no double-apply). An unacknowledged delivery retries in the same
+   context while its actor lives; if that actor ends first, one durable fallback
+   owns the work in a continuation (or an operator steer is re-fenced there).
 
 ### Sandbox activity and completion
 
@@ -133,8 +138,13 @@ stays a plain progress note. Independently, `runner/normalize.mjs` mirrors a thr
 `thought` for each meaningful agent step (a tool call, shell command, or file
 edit) into the same outbox — a live "currently doing X" heartbeat that
 self-replaces in the session and answers "stuck or working?" without cluttering
-the permanent timeline (interval `OT_HEARTBEAT_INTERVAL_MS`, default 15s). The
-entrypoint writes a completion marker with exit code, cost, PR URL, sanitized
+the permanent timeline (interval `OT_HEARTBEAT_INTERVAL_MS`, default 15s). This
+is presentation progress, not liveness. A root-launched executor process emits
+separate `heartbeat` records from a root-only directory from bootstrap through
+exit even when the agent or command is quiet. Agent-writable outbox records
+cannot impersonate this pulse; accepted records renew run liveness and are never
+published as semantic activity. The entrypoint writes a completion marker with exit code,
+cost, PR URL, sanitized
 final assistant response, and sanitized failure tail. Every five seconds, Fly
 polls only active runs through the Daytona SDK, durably claims each event, and
 projects activities into `linear_outbox` using the run's immutable Linear
@@ -172,8 +182,12 @@ that ticket, bounding durable log storage to the latest captured run.
 
 - Closing or merging an `ot/*` PR stops an active run, deletes its sandbox,
   and closes the ticket row.
-- All GitHub feedback on an active, PR-backed ticket becomes deduplicated
-  `automatic` session work, each item carrying a triage message (gather the
+- All GitHub feedback on an active, PR-backed ticket is retained under a stable
+  provider identity. Events for the same ticket generation and PR head join one
+  collecting snapshot. Recording the first event atomically creates the
+  uniquely keyed pending `automatic` work item; claiming that immutable
+  snapshot freezes membership and assigns exactly one repair round. The work
+  item carries a triage message (gather the
   full review first via a `gh pr checks` snapshot and all open threads; reply
   visibly on every item — actioned items name the fixing commit and resolve the
   thread, no-change items give reasoning; run the local test/lint/build gates on
@@ -185,9 +199,11 @@ that ticket, bounding durable log storage to the latest captured run.
   `CHANGES_REQUESTED` review, a non-self `commented` review (GitHub wraps
   every inline review comment in a `commented` review, so this also covers
   bot inline reviews), a new PR conversation comment, and a failed or
-  timed-out `workflow_run`/`check_suite` conclusion. Dedup keys
-  (`gh-review-<id>`, `gh-comment-<id>`, `gh-ci-<id>`) make repeated deliveries
-  a no-op. Feedback authored by the `GITHUB_TOKEN` account itself is ignored
+  timed-out `workflow_run`/`check_suite` conclusion. Events arriving after a
+  claim form the next snapshot; old-head events remain auditable but cannot
+  join current-head work. Provider identities make repeated deliveries a no-op
+  without collapsing distinct workflow/check/review records. Feedback authored
+  by the `GITHUB_TOKEN` account itself is ignored
   (the account login is resolved once and cached; review/comment feedback
   fails closed if it cannot be resolved).
 - An idle ticket (no active run) drains and launches the next item
@@ -203,9 +219,10 @@ that ticket, bounding durable log storage to the latest captured run.
   session, so a single missed drain self-heals instead of stranding the
   feedback. Tickets whose last run parked on an unanswered elicitation are left
   pending — the sweep never resumes a session that is waiting on a human.
-- **Rounds bound.** One counter — `automatic`-source session-work items
-  consumed per ticket — is bounded by `REVIEW_MAX_ROUNDS`; human-source
-  replies are never bounded. Exhausting the bound cancels the queued item
+- **Rounds bound.** Claimed feedback snapshots own the repair counter; legacy
+  consumed automatic work contributes to its initial value during migration.
+  It is bounded by `REVIEW_MAX_ROUNDS`; human-source replies are never bounded.
+  Exhausting the bound cancels the queued item
   without launching and posts a "needs a human decision" message to both the
   Linear activity stream and the PR (best-effort).
 - **Resolved-thread skip.** Before launching a review/comment-sourced
@@ -239,15 +256,19 @@ On boot and every 30 seconds, the supervisor drains new, failed, and
 lease-expired webhook deliveries plus pending Linear outbox rows. A separate
 boot and 15-minute lifecycle sweep expires callback-less runs, expires old
 no-PR tickets, deletes old orphaned sandboxes (with a provisioning grace
-window), re-drains stalled session work (idle active tickets with claimable
+window), re-drains stalled work (idle active tickets with claimable
 pending feedback whose last run did not park on an elicitation), and prunes old
 delivery records. A webhook delivery is retried at most
 eight times; terminal failures remain visible in SQLite/logs and enqueue one
 final error activity when its session is known. Linear outbox rows preserve
 per-session sequence order and keep later rows pending behind a failed earlier
-row until retry/redrive. A separate ~60-second liveness reaper fails any run
-that has emitted no sandbox activity for `STALL_TIMEOUT_SECONDS` and idles its
-sandbox — distinct from the hard-timeout run expiry above. Mid-run steering
+row until retry/redrive. A separate ~60-second liveness reaper uses an exclusive
+supervisor lease and the last sealed executor heartbeat, or `started_at` before
+the first heartbeat. Its winner first moves the actor to non-dispatchable
+`reaping`, confirms sandbox termination, and only then releases ticket
+exclusivity and publishes failure. Failed termination remains visibly
+`quarantined`; completion, stop, and reaper CAS losers perform no terminal side
+effects. This is distinct from hard-timeout expiry. Mid-run steering
 messages queued in `session_inbox` are delivered into running sandboxes on the
 sandbox-event poll interval.
 
@@ -266,7 +287,7 @@ sandbox-event poll interval.
 | `GET` | `/repositories` | `OT_STATUS_TOKEN` bearer | registered target list |
 | `POST` | `/repositories/register` | `OT_STATUS_TOKEN` bearer | verify and upsert a target route/webhook |
 | `POST` | `/tickets/:id/stop` | `OT_STATUS_TOKEN` bearer | stop a ticket |
-| `POST` | `/tickets/:id/steer` | `OT_STATUS_TOKEN` bearer | queue a mid-run steering message, delivered into the running sandbox |
+| `POST` | `/tickets/:id/steer` | `OT_STATUS_TOKEN` bearer | queue a fenced mid-run steering delivery for the running sandbox |
 | `GET` | `/tickets/:id/logs` | `OT_STATUS_TOKEN` bearer | sanitized live logs, falling back to the latest durable private run tail |
 | `GET` | `/preview/:id?token=` | per-ticket token | wake, restart the dev server if down, then redirect or show a status page |
 | `POST` | `/runs/:id/complete` | one-time run bearer | consume run result |
@@ -291,28 +312,41 @@ sandbox/PR, state, current run guard, aggregate cost, last error,
 preview-token hash, and latest Linear prompt context. A `pending_re_review`
 column remains in the schema for existing rows — no code reads or writes it
 anymore. `agent_sessions` stores each immutable Linear AgentSession generation
-and marks the one current generation per issue. `session_work` stores
-deduplicated human/automatic work by source id and priority: a `source`
+and marks the one current generation per issue. `schema_migrations` records each
+ordered migration and its SHA-256 checksum; startup uses an exclusive SQLite
+transaction and fails closed on checksum drift or an unknown newer version.
+`work_items` is the authoritative semantic request. `work_deliveries` stores
+immutable leased attempts bound to issue/session/run/native-session, generation,
+context revision, request hash, and idempotency key. Its lifecycle is `leased →
+dispatched → acknowledged → consumed`, with expired/canceled/dead terminals;
+upload never implies acknowledgement. `work_item_sources` retains stable legacy
+provenance, and `migration_reconciliation` records source/mapped/ambiguous counts.
+`session_work` remains a same-transaction compatibility projection during drain:
+a `source`
 column distinguishes human replies (`human`) from GitHub-feedback items
 (`automatic`), and status moves `pending → claimed → consumed`, or
 `canceled` when superseded by a stop, dropped as already thread-resolved,
 cut off by the rounds bound, or skipped because its ticket reached a terminal
 state (`closed`/`expired`/`stopped`) before the queued work could launch — a
 re-fetched terminal ticket never resumes into stale work. Only consumed
-`automatic` rows count toward
-`REVIEW_MAX_ROUNDS`; `human`-source work is never bounded. `runs` stores
+`automatic` rows seed the feedback-snapshot round count during migration;
+`human`-source work is never bounded. `runs` stores
 immutable run identity plus the originating Linear session/generation, task,
 hashed callback token, deadline, result, cost, PR and failure tail.
 `webhook_deliveries` is a durable inbox
 containing the validated payload, lease/retry state, attempt count, processing
 result, and sanitized last error. `sandbox_events` stores idempotency/retry
 state for validated sandbox records without persisting the raw one-time token.
+`provider_events`, `feedback_snapshots`, and `feedback_snapshot_events` retain
+stable GitHub identities, current-head immutable membership, watermarks, and
+one-round claims. `run_liveness` owns executor heartbeat and settlement/
+quarantine state; `supervisor_leases` prevents overlapping reaper sweeps.
 `linear_outbox` stores all Linear activity/session-update mutations before
 delivery, including UUID id, immutable payload hash, target session,
 per-session sequence, retry state, and sanitized last error. `session_inbox` is
-the inbound counterpart of the outbox: durable human/operator mid-run steering
-messages (`pending → delivered`, or `canceled`) written into a running sandbox's
-`~/.ot/inbox` by the delivery poller. `settings` stores
+the compatibility projection for human/operator steering (`pending → dispatched
+→ acknowledged`, or `canceled`); the hook writes processed journals under
+`~/.ot/inbox-processed`. `settings` stores
 OAuth tokens and small supervisor settings, including the durable Codex
 `auth.json` (`codex_auth_json`). Codex's OAuth refresh token rotates on every
 refresh, so `CODEX_AUTH_JSON` is only a bootstrap seed: the supervisor seeds
@@ -382,14 +416,15 @@ Required unless noted:
   `WEBHOOK_MAX_AGE_SECONDS=60`, `REVIEW_MAX_ROUNDS=3`,
   `ALLOW_LINEAR_MERGE=false`, `SANDBOX_EVENT_POLL_INTERVAL_MS=5000`,
   `STALL_TIMEOUT_SECONDS=900`.
-  `REVIEW_MAX_ROUNDS` bounds `automatic` (GitHub-feedback) session-work items
-  consumed per ticket. Optional `REVIEW_NUDGE_COMMENT` (default empty) is
+  `REVIEW_MAX_ROUNDS` bounds claimed GitHub-feedback snapshots per ticket
+  generation, including preserved legacy counts. Optional `REVIEW_NUDGE_COMMENT` (default empty) is
   posted on the PR after a feedback-triggered resume completes cleanly, to
   prompt an external reviewer bot/human to look again; empty relies on the
   bot's own review-on-push behavior. `STALL_TIMEOUT_SECONDS` is the liveness
-  cap: a running run that emits no sandbox activity — not even the
-  `normalize.mjs` heartbeat — for this long is reaped (failed and its sandbox
-  idled), independent of the hard `TASK_TIMEOUT` wall clock.
+  cap: a running actor whose sealed executor heartbeat is silent for this long
+  is claimed for reaping; before the first heartbeat, `started_at` is the
+  liveness origin. Termination must be confirmed before release, otherwise the
+  actor is quarantined, independent of the hard `TASK_TIMEOUT` wall clock.
 
 Fly keeps one machine running, mounts `/data`, and health-checks `/healthz`.
 
@@ -497,7 +532,7 @@ decisions" section for human audit.
 thread/OpenCode session.
 
 The normalizer captures session IDs and Claude `total_cost_usd`, writes
-`~/.ot/run-result.json`, emits the throttled ephemeral progress heartbeat
+`~/.ot/run-result.json`, emits throttled ephemeral progress
 described under "Sandbox activity and completion", and sanitizes all output
 (the heartbeat body included). Sanitizers redact named secret env values, inner
 strings in `CODEX_AUTH_JSON`, GitHub/OpenAI/Linear token shapes, and bearer

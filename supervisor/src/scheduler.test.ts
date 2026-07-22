@@ -239,7 +239,89 @@ describe("drainNextSessionWork terminal-state guard", () => {
     expect(launchCalls).toEqual([{ taskType: "resume", issueId: "issue-1" }]);
   });
 
-  it("cancels a human reply already steered mid-run (inbox delivered)", async () => {
+  it("freezes every coalesced provider event into the claimed repair context", async () => {
+    const store = makeStore();
+    store.setSetting("github-head:issue-1", "head-a");
+    for (const [providerEventId, kind, payload] of [
+      ["review:1", "pull_request_review", '{"body":"fix retry"}'],
+      ["check-suite:2", "check_suite", '{"conclusion":"failure"}'],
+    ] as const) {
+      store.recordProviderFeedback({
+        provider: "github",
+        providerEventId,
+        issueId: "issue-1",
+        sessionId: "session-1",
+        generation: 1,
+        repository: "owner/repo",
+        pullNumber: 1,
+        headSha: "head-a",
+        kind,
+        payload,
+        workItemId: "gh-review-1",
+        workBody: "first event compatibility body",
+      });
+    }
+    expect(store.getWorkItem("gh-review-1")).toMatchObject({
+      source: "automatic",
+      status: "pending",
+      body: "first event compatibility body",
+    });
+    let deliveredContext = "";
+    const launch: LaunchExistingTask = async (params) => {
+      deliveredContext = params.linearContext ?? "";
+      store.beginRun({
+        issueId: params.ticket.linear_issue_id,
+        runId: "run-snapshot",
+        taskType: params.taskType,
+        tokenHash: "hash",
+        expiresAt: "2999-01-01T00:00:00.000Z",
+      });
+      return true;
+    };
+
+    expect(await drainNextSessionWork(makeParams(store, store.getByIssueId("issue-1")!, launch)))
+      .toBe(true);
+    expect(deliveredContext).toContain("review:1");
+    expect(deliveredContext).toContain("fix retry");
+    expect(deliveredContext).toContain("check-suite:2");
+    expect(deliveredContext).toContain("failure");
+  });
+
+  it("retains old-head feedback for audit but never launches it into the current head", async () => {
+    const store = makeStore();
+    store.setSetting("github-head:issue-1", "head-current");
+    store.recordProviderFeedback({
+      provider: "github",
+      providerEventId: "workflow-run:old",
+      issueId: "issue-1",
+      sessionId: "session-1",
+      generation: 1,
+      repository: "owner/repo",
+      pullNumber: 1,
+      headSha: "head-old",
+      kind: "workflow_run",
+      payload: '{"conclusion":"failure"}',
+      workItemId: "gh-ci-head-old",
+    });
+    store.enqueueSessionWork({
+      id: "gh-ci-head-old",
+      linearSessionId: "session-1",
+      issueId: "issue-1",
+      source: "automatic",
+      body: "old failure",
+    });
+    const launch: LaunchExistingTask = async () => true;
+
+    expect(await drainNextSessionWork(
+      makeParams(store, store.getByIssueId("issue-1")!, launch)
+    )).toBe(false);
+    expect(store.db.prepare(
+      "SELECT status FROM feedback_snapshots WHERE work_item_id = 'gh-ci-head-old'"
+    ).get()).toEqual({ status: "stale" });
+    expect(store.claimNextSessionWork("session-1", new Date().toISOString())).toBeUndefined();
+  });
+
+  it("cancels a human reply only after its live steer is acknowledged", async () => {
     const store = makeStore();
     store.enqueueSessionWork({
       id: "human-steered",
@@ -248,9 +330,16 @@ describe("drainNextSessionWork terminal-state guard", () => {
       source: "human",
       body: "also check the retry path",
     });
-    // Same id in the steering inbox, marked delivered — the interrupt-on-send
-    // half already pushed this into the running sandbox.
-    store.enqueueInbox({
+    store.beginRun({
+      issueId: "issue-1",
+      runId: "run-1",
+      taskType: "implement",
+      tokenHash: "hash",
+      expiresAt: "2999-01-01T00:00:00.000Z",
+    });
+    // Same id in the steering inbox, dispatched and acknowledged — the
+    // interrupt-on-send half was processed by the running sandbox.
+    const steered = store.enqueueInbox({
       id: "human-steered",
       issueId: "issue-1",
       sessionId: "session-1",
@@ -258,7 +347,16 @@ describe("drainNextSessionWork terminal-state guard", () => {
       source: "human",
       body: "also check the retry path",
     });
-    store.markInboxDelivered("human-steered");
+    store.markInboxDispatched("human-steered");
+    store.acknowledgeInboxDelivery(steered.delivery_id!, {
+      requestHash: steered.request_hash!,
+      issueId: steered.linear_issue_id,
+      sessionId: steered.linear_session_id,
+      runId: steered.run_id!,
+      nativeSessionId: steered.native_session_id,
+      generation: steered.generation!,
+      contextRevision: steered.context_revision!,
+    });
     const ticket = store.getByIssueId("issue-1")!;
 
     let launched = 0;

@@ -55,6 +55,7 @@ describe("runSweep", () => {
     const timedSandbox = {
       id: "sandbox-timed",
       autoStopInterval: 60,
+      stop: vi.fn(async () => undefined),
       setAutostopInterval: vi.fn(async (minutes: number) => {
         timedSandbox.autoStopInterval = minutes;
       }),
@@ -110,7 +111,8 @@ describe("runSweep", () => {
 
     expect(store.getRun("run-timed")?.status).toBe("timed_out");
     expect(store.getByIssueId("timed")?.state).toBe("error");
-    expect(timedSandbox.setAutostopInterval).toHaveBeenCalledWith(5);
+    expect(timedSandbox.stop).toHaveBeenCalledWith(60, true);
+    expect(timedSandbox.setAutostopInterval).not.toHaveBeenCalled();
     expect(store.getByIssueId("stale")?.state).toBe("expired");
     expect(staleSandbox.delete).toHaveBeenCalledOnce();
     expect(deleteOrphan).toHaveBeenCalledTimes(2);

@@ -70,6 +70,7 @@ configure_git_identity() {
 }
 
 COMPLETION_WRITTEN=0
+HEARTBEAT_PID=""
 
 write_run_completion() {
   local exit_code="$1"
@@ -126,6 +127,10 @@ write_run_completion() {
 # the Daytona SDK, so completion does not depend on sandbox outbound internet.
 handle_exit() {
   local exit_code="${1:-0}"
+  if [[ -n "${HEARTBEAT_PID:-}" ]]; then
+    kill "$HEARTBEAT_PID" 2>/dev/null || true
+    wait "$HEARTBEAT_PID" 2>/dev/null || true
+  fi
   if [[ -n "${MCP_CONFIG_FILE:-}" ]]; then
     rm -f "$MCP_CONFIG_FILE"
   fi
@@ -177,6 +182,9 @@ export GH_TOKEN="$GITHUB_TOKEN"
 
 mkdir -p "$OT_DIR" "${OT_DIR}/outbox" "${OT_DIR}/inbox"
 chown -R "${AGENT_USER}:${AGENT_USER}" "$AGENT_HOME"
+HEARTBEAT_DIR="/var/lib/openthrottle/heartbeat"
+install -d -o root -g root -m 0700 "$HEARTBEAT_DIR"
+rm -f "${HEARTBEAT_DIR}/heartbeat.json" "${HEARTBEAT_DIR}/heartbeat.json.tmp"
 TASK_LOG="${OT_DIR}/task.log"
 rm -f "${OT_DIR}/run-result.json"
 : > "$TASK_LOG" || true
@@ -186,6 +194,13 @@ chown "${AGENT_USER}:${AGENT_USER}" "$TASK_LOG" || true
 # writes to stdout/stderr through runner/normalize.mjs) is tee'd into
 # task.log so handle_exit() has something to summarize on failure.
 exec > >(tee -a "$TASK_LOG") 2>&1
+
+# A root-owned executor pulse covers quiet bootstrap and long commands. It is a
+# liveness signal only; unlike normalize.mjs progress, it is never published as
+# semantic activity.
+RUN_ID="$RUN_ID" OT_HEARTBEAT_FILE="${HEARTBEAT_DIR}/heartbeat.json" \
+  node "${OPT_DIR}/runner/heartbeat.mjs" &
+HEARTBEAT_PID=$!
 
 log "TASK_TYPE=${TASK_TYPE} AGENT_env=${AGENT:-<unset>} repo=${GITHUB_REPO} branch=${BRANCH_NAME}"
 

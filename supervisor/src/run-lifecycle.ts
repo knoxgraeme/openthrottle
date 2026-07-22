@@ -15,6 +15,7 @@ import {
   parsePullRequestUrl,
 } from "./github.js";
 import { startTask, type SandboxEnvContract } from "./daytona.js";
+import { terminateAndSettleActor } from "./actor-settlement.js";
 import { getCodexAuthForSeed } from "./codex-auth.js";
 import { reconcileSandboxAutostop } from "./sandbox-lifecycle.js";
 import { MAX_PRIVATE_LOG_TAIL_CHARS } from "./logs.js";
@@ -573,14 +574,29 @@ export async function expireRun(
 ): Promise<void> {
   const ticket = store.getByIssueId(run.linear_issue_id);
   const message = `OpenThrottle ${run.task_type} run timed out without a completion result.`;
-  store.finishRun({
+  if (!ticket) return;
+  const owner = `hard-timeout-${randomUUID()}`;
+  const settlement = await terminateAndSettleActor({
+    daytona,
+    store,
     runId: run.id,
+    sandboxId: ticket.sandbox_id,
+    owner,
+    reason: message,
     status: "timed_out",
-    failureTail: message,
     ticketState: "error",
   });
-  if (ticket) {
-    scheduleSandboxSettlement({ daytona, store, ticket, taskType: run.task_type });
+  if (settlement.kind === "quarantined") {
+    await tryPostError(
+      store,
+      linearOutbox,
+      run.linear_session_id ?? ticket.linear_session_id,
+      ticket.linear_issue_id,
+      settlement.message
+    );
+    return;
+  }
+  if (settlement.kind === "settled") {
     await tryPostError(
       store,
       linearOutbox,

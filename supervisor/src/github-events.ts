@@ -16,8 +16,86 @@ import { enqueueActivity, type LinearOutboxProcessor } from "./linear-outbox.js"
 import { launchExistingTask } from "./run-lifecycle.js";
 import { enqueueFeedbackWork, feedbackMessage } from "./scheduler.js";
 import { closeTicketForPullRequest } from "./ticket-control.js";
+import { sanitizeText } from "./sanitize.js";
 
 const githubLoginCache = new Map<string, string>();
+
+function setAuthoritativeGithubHead(store: TicketStore, issueId: string, headSha: string): void {
+  store.setSetting(`github-head:${issueId}`, headSha);
+  store.setSetting(`github-head-source:${issueId}`, "authoritative");
+}
+
+function considerCiGithubHead(
+  store: TicketStore,
+  issueId: string,
+  headSha: string,
+  source: "workflow_run" | "check_suite",
+  sequence: number
+): void {
+  const headKey = `github-head:${issueId}`;
+  const sourceKey = `github-head-source:${issueId}`;
+  const currentHead = store.getSetting(headKey);
+  const rawSource = store.getSetting(sourceKey);
+  let currentSource: { source: string; sequence: number } | undefined;
+  try {
+    currentSource = rawSource && rawSource !== "authoritative"
+      ? JSON.parse(rawSource) as { source: string; sequence: number }
+      : undefined;
+  } catch {
+    currentSource = undefined;
+  }
+  const canAdvance =
+    !currentHead ||
+    currentHead.startsWith("unknown:") ||
+    currentHead === headSha ||
+    (currentSource?.source === source && sequence > currentSource.sequence);
+  if (!canAdvance || rawSource === "authoritative") return;
+  store.setSetting(headKey, headSha);
+  store.setSetting(sourceKey, JSON.stringify({ source, sequence }));
+}
+
+async function enqueueProviderFeedback(params: {
+  cfg: Config;
+  store: TicketStore;
+  daytona: Daytona;
+  linear: LinearClient;
+  linearOutbox: LinearOutboxProcessor;
+  ticket: NonNullable<ReturnType<TicketStore["getByIssueId"]>>;
+  providerEventId: string;
+  pullNumber: number;
+  headSha: string;
+  kind: string;
+  payload: unknown;
+  workId: string;
+  body: string;
+}): Promise<void> {
+  const session = params.store.getCurrentSession(params.ticket.linear_issue_id);
+  const recorded = params.store.recordProviderFeedback({
+    provider: "github",
+    providerEventId: params.providerEventId,
+    issueId: params.ticket.linear_issue_id,
+    sessionId: params.ticket.linear_session_id,
+    generation: session?.generation ?? 1,
+    repository: params.ticket.repo,
+    pullNumber: params.pullNumber,
+    headSha: params.headSha,
+    kind: params.kind,
+    payload: sanitizeText(JSON.stringify(params.payload)).slice(0, 16_000),
+    workItemId: params.workId,
+    workBody: params.body,
+  });
+  await enqueueFeedbackWork({
+    cfg: params.cfg,
+    store: params.store,
+    daytona: params.daytona,
+    linear: params.linear,
+    linearOutbox: params.linearOutbox,
+    ticket: params.ticket,
+    workId: recorded.snapshot.work_item_id!,
+    body: params.body,
+    launch: launchExistingTask,
+  });
+}
 
 async function selfGithubLogin(cfg: Config): Promise<string | undefined> {
   const cached = githubLoginCache.get(cfg.githubToken);
@@ -47,6 +125,9 @@ export async function handleGithubEvent(
     if (!isOpenthrottleBranch(branch)) return;
     const ticket = store.getByBranch(event.repository.full_name, branch);
     if (!ticket) return;
+    if (event.pull_request.head.sha) {
+      setAuthoritativeGithubHead(store, ticket.linear_issue_id, event.pull_request.head.sha);
+    }
     if (event.action === "closed") {
       await closeTicketForPullRequest({
         store,
@@ -88,7 +169,15 @@ export async function handleGithubEvent(
       // that would fail closed on exactly the review that matters most.
       return;
     }
-    await enqueueFeedbackWork({
+    const headSha = event.pull_request.head.sha ??
+      store.getSetting(`github-head:${ticket.linear_issue_id}`) ??
+      `unknown:${event.pull_request.head.ref}`;
+    if (event.pull_request.head.sha) {
+      setAuthoritativeGithubHead(store, ticket.linear_issue_id, headSha);
+    } else if (!store.getSetting(`github-head:${ticket.linear_issue_id}`)) {
+      store.setSetting(`github-head:${ticket.linear_issue_id}`, headSha);
+    }
+    await enqueueProviderFeedback({
       cfg,
       store,
       daytona,
@@ -99,6 +188,11 @@ export async function handleGithubEvent(
       // so the resolved-thread skip would measure unrelated (older) threads
       // and could cancel it. `gh-rvbody-` marks it exempt from that skip;
       // only reviews whose feedback lives in inline threads are `gh-review-`.
+      providerEventId: `review:${event.review.id}`,
+      pullNumber: event.pull_request.number,
+      headSha,
+      kind: "pull_request_review",
+      payload: { state: event.review.state, url: event.review.html_url, body: event.review.body },
       workId: event.review.body?.trim()
         ? `gh-rvbody-${event.review.id}`
         : `gh-review-${event.review.id}`,
@@ -109,7 +203,6 @@ export async function handleGithubEvent(
         url: event.review.html_url,
         body: event.review.body,
       }),
-      launch: launchExistingTask,
     });
     return;
   }
@@ -131,13 +224,20 @@ export async function handleGithubEvent(
       parameter: author,
       result: event.comment.html_url,
     }, ticket.linear_issue_id);
-    await enqueueFeedbackWork({
+    const headSha = store.getSetting(`github-head:${ticket.linear_issue_id}`) ??
+      `unknown:${ticket.branch}`;
+    await enqueueProviderFeedback({
       cfg,
       store,
       daytona,
       linear,
       linearOutbox,
       ticket,
+      providerEventId: `comment:${event.comment.id}`,
+      pullNumber: event.issue.number,
+      headSha,
+      kind: "issue_comment",
+      payload: { url: event.comment.html_url, body: event.comment.body },
       workId: `gh-comment-${event.comment.id}`,
       body: feedbackMessage({
         kind: "comment",
@@ -146,7 +246,6 @@ export async function handleGithubEvent(
         url: event.comment.html_url,
         body: event.comment.body,
       }),
-      launch: launchExistingTask,
     });
     return;
   }
@@ -171,6 +270,13 @@ export async function handleGithubEvent(
     parameter: conclusion ?? "unknown",
     result: url,
   }, ticket.linear_issue_id);
+  considerCiGithubHead(
+    store,
+    ticket.linear_issue_id,
+    headSha,
+    event.kind,
+    event.kind === "workflow_run" ? event.workflow_run.id : event.check_suite.id
+  );
 
   if (
     (conclusion !== "failure" && conclusion !== "timed_out") ||
@@ -180,21 +286,24 @@ export async function handleGithubEvent(
     return;
   }
   const name = event.kind === "workflow_run" ? event.workflow_run.name : "CI check suite";
-  // Keyed by head_sha (not the workflow_run/check_suite id) so a single
-  // failing push — which GitHub reports as both a workflow_run and a
-  // check_suite completion — dedups to one work item instead of two review
-  // rounds. The event that arrives second is dropped by enqueueSessionWork's
-  // id dedup; whichever arrived first keeps its feedback message.
+  // Keyed by head_sha so failures from one push coalesce into one collecting
+  // snapshot. Each provider event still retains its stable identity and payload.
   const workId = `gh-ci-${headSha}`;
-  await enqueueFeedbackWork({
+  await enqueueProviderFeedback({
     cfg,
     store,
     daytona,
     linear,
     linearOutbox,
     ticket,
+    providerEventId: event.kind === "workflow_run"
+      ? `workflow-run:${event.workflow_run.id}`
+      : `check-suite:${event.check_suite.id}`,
+    pullNumber: Number(ticket.pr_url.match(/\/pull\/(\d+)$/)?.[1] ?? 0),
+    headSha,
+    kind: event.kind,
+    payload: { name, conclusion, url },
     workId,
     body: feedbackMessage({ kind: "ci", name, conclusion, url }),
-    launch: launchExistingTask,
   });
 }

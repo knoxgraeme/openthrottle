@@ -95,10 +95,9 @@ export function isResolvableFeedbackWorkId(workId: string): boolean {
   return workId.startsWith("gh-review-");
 }
 
-// Rounds bound (Phase 1 item 3): a single counter — automatic session-work
-// items already launched (consumed) for the ticket — bounded by
-// cfg.reviewMaxRounds. Human-source items are never bounded. Exported as a
-// pure predicate so it is table-testable without a store.
+// Legacy rounds-bound predicate retained for migrated automatic session work.
+// New provider feedback uses atomic snapshot repair_round claims; human-source
+// items remain unbounded.
 export function isAutomaticWorkBounded(params: {
   source: "human" | "automatic";
   consumedAutomaticCount: number;
@@ -190,6 +189,7 @@ export async function drainNextSessionWork(params: DrainParams): Promise<boolean
       new Date().toISOString()
     );
     if (!work) return false;
+    let workBody = work.body;
 
     // Terminal-state guard (Symphony invariant: retry re-fetches tracker state;
     // never silently treat a ticket as still-live). The claimed item may have
@@ -210,17 +210,17 @@ export async function drainNextSessionWork(params: DrainParams): Promise<boolean
     }
 
     // Interrupt-on-send dedup: a human reply that arrived during an active run is
-    // delivered into the running sandbox via the steering inbox (same id as this
+    // acknowledged by the running sandbox via the steering inbox (same id as this
     // session_work row) AND queued here as the durable fallback. This drain runs
     // after a run completed cleanly, at which point the Stop hook has already
-    // drained and injected any delivered inbox message — so if this item was
+    // drained and acknowledged any dispatched inbox message — so if this item was
     // steered mid-run, cancel it rather than resuming it a second time. A row
     // whose inbox message is still `pending` (the steer never reached a live
     // sandbox, e.g. the run ended in the delivery race) falls through and resumes
     // as the fallback.
     if (work.source === "human") {
       const steered = params.store.getInbox(work.id);
-      if (steered?.status === "delivered") {
+      if (steered?.status === "acknowledged") {
         console.log(
           `[scheduler] queued reply ${work.id} for ${params.ticket.linear_issue_identifier} was already steered mid-run; cancelling the post-run resume`
         );
@@ -230,8 +230,18 @@ export async function drainNextSessionWork(params: DrainParams): Promise<boolean
     }
 
     if (work.source === "automatic") {
-      const consumed = params.store.countConsumedAutomaticSessionWork(params.ticket.linear_issue_id);
-      if (isAutomaticWorkBounded({ source: work.source, consumedAutomaticCount: consumed, maxRounds: params.cfg.reviewMaxRounds })) {
+      const snapshotClaim = params.store.claimFeedbackWork(work.id, params.cfg.reviewMaxRounds);
+      const consumed = snapshotClaim?.status === "exhausted"
+        ? snapshotClaim.completedRounds
+        : params.store.countConsumedAutomaticSessionWork(params.ticket.linear_issue_id);
+      if (
+        snapshotClaim?.status === "exhausted" ||
+        (!snapshotClaim && isAutomaticWorkBounded({
+          source: work.source,
+          consumedAutomaticCount: consumed,
+          maxRounds: params.cfg.reviewMaxRounds,
+        }))
+      ) {
         await postRoundsExhausted({
           cfg: params.cfg,
           store: params.store,
@@ -242,7 +252,28 @@ export async function drainNextSessionWork(params: DrainParams): Promise<boolean
         params.store.cancelSessionWork(work.id);
         return false;
       }
-      if (isResolvableFeedbackWorkId(work.id) && params.ticket.pr_url) {
+      if (snapshotClaim?.status === "stale") {
+        params.store.cancelSessionWork(work.id);
+        continue;
+      }
+      if (snapshotClaim?.status === "claimed") {
+        workBody = [
+          `Immutable GitHub feedback snapshot for head ${snapshotClaim.snapshot.head_sha} (repair round ${snapshotClaim.snapshot.repair_round}).`,
+          ...snapshotClaim.events.map(
+            (event) => `${event.kind} [${event.provider}:${event.provider_event_id}]\n${event.payload}`
+          ),
+          "Triage every item in this snapshot, make the justified changes, run the configured gates, and push the result. Newer provider events will arrive as a separate snapshot.",
+        ].join("\n\n");
+      }
+      const onlyResolvableReviewThreads =
+        !snapshotClaim ||
+        snapshotClaim.status !== "claimed" ||
+        snapshotClaim.events.every((event) => event.kind === "pull_request_review");
+      if (
+        isResolvableFeedbackWorkId(work.id) &&
+        onlyResolvableReviewThreads &&
+        params.ticket.pr_url
+      ) {
         const pull = parsePullRequestUrl(params.ticket.pr_url);
         const resolved = await areAllReviewThreadsResolved(
           { token: params.cfg.githubToken },
@@ -270,7 +301,7 @@ export async function drainNextSessionWork(params: DrainParams): Promise<boolean
     // not have); only the explicit command survives queueing.
     const queuedCommand =
       work.source === "human"
-        ? parseCommand(work.body, { investigateLabel: false })
+        ? parseCommand(workBody, { investigateLabel: false })
         : undefined;
     const taskType = queuedCommand?.kind === "implement" ? ("implement" as const) : ("resume" as const);
     const launched = await params.launch({
@@ -281,8 +312,8 @@ export async function drainNextSessionWork(params: DrainParams): Promise<boolean
       linearOutbox: params.linearOutbox,
       ticket: current,
       taskType,
-      resumeMessage: taskType === "resume" ? work.body : undefined,
-      linearContext: `${current.linear_context ?? `# ${current.linear_issue_identifier}`}\n\n## ${heading}\n\n${work.body}`,
+      resumeMessage: taskType === "resume" ? workBody : undefined,
+      linearContext: `${current.linear_context ?? `# ${current.linear_issue_identifier}`}\n\n## ${heading}\n\n${workBody}`,
     });
     const runId = params.store.getByIssueId(params.ticket.linear_issue_id)?.run_id;
     if (launched && runId) {
@@ -308,14 +339,16 @@ export async function enqueueFeedbackWork(params: {
   body: string;
   launch: LaunchExistingTask;
 }): Promise<void> {
-  const inserted = params.store.enqueueSessionWork({
+  params.store.enqueueSessionWork({
     id: params.workId,
     linearSessionId: params.ticket.linear_session_id,
     issueId: params.ticket.linear_issue_id,
     source: "automatic",
     body: params.body,
   });
-  if (!inserted) return;
   if (params.ticket.run_id) return;
+  // Drain even when the stable id already existed: a prior handler may have
+  // committed the durable row and crashed before launch. The claim CAS makes
+  // an already-consumed duplicate a no-op.
   await drainNextSessionWork(params);
 }

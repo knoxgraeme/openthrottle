@@ -987,7 +987,7 @@ describe("createServer lifecycle", () => {
     expect(envUpdates.at(-1)).not.toHaveProperty("CODEX_AUTH_JSON");
   });
 
-  it("persists stopped state even when Daytona cannot stop immediately", async () => {
+  it("quarantines a prompted stop when Daytona cannot confirm actor termination", async () => {
     db = openDb(":memory:");
     const store = createTicketStore(db);
     store.upsert({
@@ -1052,14 +1052,14 @@ describe("createServer lifecycle", () => {
     expect(response.status).toBe(200);
     await new Promise((resolve) => setImmediate(resolve));
     expect(store.getByIssueId("issue-stop")).toMatchObject({
-      run_id: null,
-      state: "stopped",
+      run_id: "run-stop",
+      state: "error",
     });
-    expect(store.getRun("run-stop")?.status).toBe("stopped");
+    expect(store.getRun("run-stop")?.status).toBe("quarantined");
     expect(store.listLinearOutbox()).toEqual([
       expect.objectContaining({ kind: "activity", status: "pending" }),
     ]);
-    expect(calls).toEqual(["stop", "drain"]);
+    expect(calls).toEqual(["stop"]);
   });
 
   it("routes new delegations from repo labels before registered team routes", async () => {
@@ -1734,7 +1734,7 @@ describe("createServer lifecycle", () => {
     });
   });
 
-  it("persists operator stop state even when Daytona cannot stop immediately", async () => {
+  it("quarantines an operator stop when Daytona cannot confirm actor termination", async () => {
     db = openDb(":memory:");
     const store = createTicketStore(db);
     store.upsert({
@@ -1780,12 +1780,12 @@ describe("createServer lifecycle", () => {
     });
 
     expect(response.status).toBe(200);
-    expect(store.getRun("run-stop")?.status).toBe("stopped");
+    expect(store.getRun("run-stop")?.status).toBe("quarantined");
     expect(store.getByIssueId("issue-stop")).toMatchObject({
-      state: "stopped",
-      run_id: null,
+      state: "error",
+      run_id: "run-stop",
     });
-    expect(calls).toEqual(["stop", "drain"]);
+    expect(calls).toEqual(["stop"]);
     expect(store.listLinearOutbox()).toEqual([
       expect.objectContaining({
         linear_session_id: "session-stop",
@@ -1795,7 +1795,7 @@ describe("createServer lifecycle", () => {
     ]);
   });
 
-  it("finishes PR-close state even when immediate sandbox cleanup fails", async () => {
+  it("quarantines PR-close settlement when actor termination cannot be confirmed", async () => {
     db = openDb(":memory:");
     const store = createTicketStore(db);
     store.upsert({
@@ -1851,9 +1851,12 @@ describe("createServer lifecycle", () => {
     });
     await Promise.all(background.splice(0));
 
-    expect(store.getRun("run-close")?.status).toBe("stopped");
-    expect(store.getByIssueId("issue-close")?.state).toBe("closed");
-    expect(sandbox.delete).toHaveBeenCalledOnce();
+    expect(store.getRun("run-close")?.status).toBe("quarantined");
+    expect(store.getByIssueId("issue-close")).toMatchObject({
+      state: "error",
+      run_id: "run-close",
+    });
+    expect(sandbox.delete).not.toHaveBeenCalled();
   });
 
   it("mirrors every CI completion to Linear and turns a failure into automatic feedback work launched immediately when idle", async () => {
@@ -2020,7 +2023,7 @@ describe("createServer lifecycle", () => {
     expect(store.getByIssueId("issue-ci-busy")?.run_id).toBe("run-ci-busy");
   });
 
-  it("dedups a workflow_run failure and a check_suite failure for the same head_sha into one automatic work item", async () => {
+  it("forms a next snapshot when same-head CI feedback arrives during an active repair", async () => {
     db = openDb(":memory:");
     const store = createTicketStore(db);
     store.upsert({
@@ -2110,13 +2113,19 @@ describe("createServer lifecycle", () => {
     expect(
       db!.prepare("SELECT status, source FROM session_work WHERE id = ?").get("gh-ci-sha-ci-dedup")
     ).toEqual({ status: "consumed", source: "automatic" });
-    expect(
-      (
-        db!
-          .prepare("SELECT COUNT(*) AS count FROM session_work WHERE linear_issue_id = ?")
-          .get("issue-ci-dedup") as { count: number }
-      ).count
-    ).toBe(1);
+    expect(db!.prepare(`
+      SELECT id, status FROM session_work
+      WHERE linear_issue_id = ? ORDER BY created_at, id
+    `).all("issue-ci-dedup")).toEqual([
+      { id: "gh-ci-sha-ci-dedup", status: "consumed" },
+      { id: expect.stringMatching(/^gh-ci-sha-ci-dedup:snapshot:/), status: "pending" },
+    ]);
+    expect(db!.prepare(
+      "SELECT COUNT(*) AS count FROM provider_events WHERE linear_issue_id = ?"
+    ).get("issue-ci-dedup")).toEqual({ count: 2 });
+    expect(db!.prepare(
+      "SELECT COUNT(*) AS count FROM feedback_snapshots WHERE linear_issue_id = ?"
+    ).get("issue-ci-dedup")).toEqual({ count: 2 });
     expect(envUpdates.at(-1)).toMatchObject({ TASK_TYPE: "resume" });
   });
 
