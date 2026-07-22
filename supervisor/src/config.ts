@@ -86,6 +86,15 @@ function optionalRepoMap(name: string): Record<string, string> {
   return result;
 }
 
+function optionalRepoList(name: string): string[] {
+  const value = process.env[name]?.trim();
+  if (!value) return [];
+  const repositories = value.split(",").map((entry) => entry.trim()).filter(Boolean);
+  const invalid = repositories.find((repository) => !GITHUB_REPO_PATTERN.test(repository));
+  if (invalid) throw new Error(`Env var ${name} contains invalid repository: ${invalid}`);
+  return [...new Set(repositories.map((repository) => repository.toLowerCase()))].sort();
+}
+
 export interface Config {
   port: number;
   databasePath: string;
@@ -127,6 +136,7 @@ export interface Config {
   sandboxEventPollIntervalMs: number;
   stallTimeoutSeconds: number;
   pipelineAdmissionEnabled: boolean;
+  pipelineAdmissionRepositories?: string[];
   pipelineCatalogPath: string;
   sandboxRuntimeRelease: string;
   sandboxRuntimeDescriptorPath: string;
@@ -174,6 +184,7 @@ export function loadConfig(): Config {
     sandboxEventPollIntervalMs: optionalInt("SANDBOX_EVENT_POLL_INTERVAL_MS", 5_000),
     stallTimeoutSeconds: optionalInt("STALL_TIMEOUT_SECONDS", 900),
     pipelineAdmissionEnabled: optionalBool("PIPELINE_COORDINATOR_ENABLED", false),
+    pipelineAdmissionRepositories: optionalRepoList("PIPELINE_COORDINATOR_REPOSITORIES"),
     pipelineCatalogPath: optional(
       "PIPELINE_CATALOG_PATH",
       fileURLToPath(new URL("../pipelines/catalog.yaml", import.meta.url))

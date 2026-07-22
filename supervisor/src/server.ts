@@ -35,6 +35,8 @@ import { hashesMatch, tokenHash, completeRun } from "./run-lifecycle.js";
 import { handleLinearEvent, type PipelineAdmissionContext } from "./linear-events.js";
 import { handleGithubEvent } from "./github-events.js";
 import { renderPipelineLogHeader } from "./pipeline-publication.js";
+import { executionSummary, legacyDrainReport } from "./scheduler.js";
+import { canSteerPipelineRun, requestPipelineStop } from "./pipeline-control.js";
 
 // index.ts and sweep.ts keep importing `completeRun`/`expireRun` from here so
 // their imports need minimal churn; the real implementations live in
@@ -180,8 +182,10 @@ export function createServerWebhookDeliveryProcessor(deps: {
         deps.daytona,
         deps.getLinearClient,
         linearOutbox,
-        parseGithubWebhook(delivery.event_name ?? undefined, delivery.payload)
+        parseGithubWebhook(delivery.event_name ?? undefined, delivery.payload),
+        deps.pipelineAdmission?.store
       );
+      await deps.pipelineAdmission?.drainEffects?.();
     },
   });
 }
@@ -220,6 +224,12 @@ export function createServer(deps: ServerDeps): Hono {
       return context.json({ error: "unauthorized" }, 401);
     }
     return context.json({
+      admission: {
+        enabled_for_new_generations: cfg.pipelineAdmissionEnabled,
+        repositories: cfg.pipelineAdmissionRepositories ?? [],
+      },
+      execution_summary: executionSummary(store),
+      legacy_drain: legacyDrainReport(store),
       tickets: store.listAll().map((ticket) => {
         const pipeline = deps.pipelineAdmission?.store.getStatusForIssue(ticket.linear_issue_id);
         return {
@@ -436,6 +446,17 @@ export function createServer(deps: ServerDeps): Hono {
     if (!ticket) return context.json({ error: "ticket not found" }, 404);
     const linear = await getLinearClient();
     try {
+      const pipeline = deps.pipelineAdmission?.store.getInstanceForSession(ticket.linear_session_id);
+      if (pipeline && deps.pipelineAdmission) {
+        requestPipelineStop({
+          store: deps.pipelineAdmission.store,
+          sessionId: ticket.linear_session_id,
+          eventId: `operator-stop:${pipeline.id}`,
+          reason: "Stopped by operator.",
+        });
+        await deps.pipelineAdmission.drainEffects?.();
+        return context.json({ ok: true });
+      }
       await stopTicket({
         store,
         daytona,
@@ -478,7 +499,17 @@ export function createServer(deps: ServerDeps): Hono {
     ) {
       return context.json({ error: "message is required" }, 400);
     }
-    // Enqueue durably even if the ticket is not currently running — the inbox
+    const pipeline = deps.pipelineAdmission?.store.getInstanceForSession(ticket.linear_session_id);
+    if (pipeline && deps.pipelineAdmission && !canSteerPipelineRun({
+      store: deps.pipelineAdmission.store,
+      sessionId: ticket.linear_session_id,
+      runId: ticket.run_id,
+      agent: ticket.agent,
+    })) {
+      return context.json({ error: "the current pipeline stage does not accept live steering" }, 409);
+    }
+    // Legacy messages remain durable while idle. Pipeline messages reach only
+    // the exact active run accepted by the stage's sealed steering policy.
     // poller delivers it on the next run. The body is untrusted data; it is only
     // stored here and later written as a file, never executed.
     const record = store.enqueueInbox({

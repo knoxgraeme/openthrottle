@@ -282,6 +282,26 @@ human orchestration except the merge click.
 - **`openthrottle logs`** — CLI command streaming a ticket's sanitized sandbox
   log via the supervisor, with a bounded durable private tail after cleanup.
 
+## Configurable coordinator cutover (2026-07-22)
+
+The delivery units in
+`docs/plans/2026-07-21-001-feat-configurable-agentic-pipeline-coordinator-plan.md`
+now provide the additive schema, immutable catalog/runtime validation, durable
+coordinator and effects, fenced stage executor, deterministic gates, provider
+repair with exact published-commit binding, publication receipts,
+repository-cohort admission, operator status,
+and cross-domain legacy-drain report. CE implement/investigate v2 and generic
+command/agent fixtures use the same coordinator; legacy mappings remain only
+in the explicit compatibility registry.
+
+This is a canary-ready code boundary, not authorization for broad activation.
+Admission stays off until the rollout runbook has real pinned Claude/Codex/
+OpenCode snapshot evidence, live Linear/Daytona/GitHub acceptance, named human
+owners/backups, a successful database restore rehearsal, and all stop criteria
+clear. Active generations stay pinned when the future-admission kill switch is
+changed. Legacy removal follows a complete cross-domain drain and 72-hour soak
+in a separate release; destructive schema contraction is later again.
+
 ## Non-goals (v2)
 
 Multi-tenant/team use beyond one workspace; a web UI (Linear is the UI);

@@ -495,6 +495,7 @@ export function openDb(path: string): Database.Database {
 export interface TicketStore {
   db: Database.Database;
   upsert(ticket: TicketUpsert): void;
+  upsertUnpinned(ticket: Omit<TicketUpsert, "pipeline">): void;
   getByIssueId(issueId: string): Ticket | undefined;
   getByIdentifier(identifier: string): Ticket | undefined;
   getByBranch(repo: string, branch: string): Ticket | undefined;
@@ -537,6 +538,12 @@ export interface TicketStore {
     | { status: "exhausted"; completedRounds: number }
     | { status: "stale" }
     | undefined;
+  listPendingFeedbackSnapshots(linearSessionId: string, limit?: number): FeedbackSnapshot[];
+  claimFeedbackSnapshot(snapshotId: string, maxRounds: number):
+    | { status: "claimed"; snapshot: FeedbackSnapshot; events: FeedbackSnapshotEvent[] }
+    | { status: "exhausted"; completedRounds: number }
+    | { status: "stale" };
+  consumeFeedbackSnapshot(snapshotId: string): boolean;
   getConsumedSessionWorkForRun(runId: string): SessionWork | undefined;
   enqueueLinearOutbox(params: {
     id?: string;
@@ -585,6 +592,7 @@ export interface TicketStore {
   claimRunForReaping(runId: string, owner: string, reason: string): Run | undefined;
   finishReapingRun(params: FinishRunParams & { owner: string }): Run | undefined;
   quarantineRun(runId: string, owner: string, reason: string): Run | undefined;
+  settleQuarantinedRun(params: FinishRunParams): Run | undefined;
   renewRunLiveness(runId: string, heartbeatAt: string): boolean;
   listExpiredRuns(nowIso: string): Run[];
   // Running actors whose sealed executor heartbeat is at or before `cutoffIso`.
@@ -635,6 +643,22 @@ export function createTicketStore(db: Database.Database): TicketStore {
   const feedbackStore = createFeedbackStore(db);
   const pipelineStore = createPipelineStore(db);
   const hashPayload = (payload: string) => createHash("sha256").update(payload).digest("hex");
+  const claimFeedbackSnapshot = (snapshot: FeedbackSnapshot, maxRounds: number) => {
+    const currentHead = (db.prepare("SELECT value FROM settings WHERE key = ?").get(
+      `github-head:${snapshot.linear_issue_id}`
+    ) as { value: string } | undefined)?.value;
+    if (currentHead && currentHead !== snapshot.head_sha) {
+      db.prepare(`
+        UPDATE feedback_snapshots SET status = 'stale'
+        WHERE id = ? AND status IN ('collecting', 'claimed')
+      `).run(snapshot.id);
+      return { status: "stale" as const };
+    }
+    const claim = feedbackStore.claim(snapshot.id, maxRounds);
+    return claim.status === "claimed"
+      ? { ...claim, events: feedbackStore.listEvents(snapshot.id) }
+      : claim;
+  };
   const upsertStmt = db.prepare(`
     INSERT INTO tickets (
       linear_issue_id, linear_issue_identifier, linear_session_id,
@@ -1166,6 +1190,39 @@ export function createTicketStore(db: Database.Database): TicketStore {
     }
   );
 
+  const settleQuarantinedRunTransaction = db.transaction((params: FinishRunParams): Run | undefined => {
+    const existing = getRunStmt.get(params.runId) as Run | undefined;
+    if (!existing || existing.status !== "quarantined") return undefined;
+    const completedAt = now();
+    db.prepare(`
+      UPDATE runs SET status = ?, completed_at = ?, failure_tail = ?, pr_url = COALESCE(?, pr_url)
+      WHERE id = ? AND status = 'quarantined'
+    `).run(params.status, completedAt, params.failureTail ?? null, params.prUrl ?? null, params.runId);
+    db.prepare(`
+      UPDATE tickets SET running_since = NULL, run_id = NULL,
+        state = COALESCE(?, state), pr_url = COALESCE(?, pr_url),
+        last_error = ?, updated_at = ?
+      WHERE linear_issue_id = ? AND run_id = ?
+    `).run(
+      params.ticketState ?? null,
+      params.prUrl ?? null,
+      params.failureTail ?? null,
+      completedAt,
+      existing.linear_issue_id,
+      params.runId
+    );
+    db.prepare(`
+      UPDATE run_liveness SET actor_state = 'settled', termination_confirmed_at = ?, updated_at = ?
+      WHERE run_id = ? AND actor_state = 'quarantined'
+    `).run(completedAt, completedAt, params.runId);
+    workStore.consumeAcknowledgedForRun(params.runId, params.runId);
+    workStore.releaseUnacknowledgedForRun(
+      params.runId,
+      `owning run ${params.runId} ended after confirmed quarantine recovery`
+    );
+    return getRunStmt.get(params.runId) as Run;
+  });
+
   const acquireSupervisorLeaseTransaction = db.transaction(
     (name: string, owner: string, nowIso: string, leaseUntilIso: string): boolean => {
       const existing = db.prepare(
@@ -1297,6 +1354,19 @@ export function createTicketStore(db: Database.Database): TicketStore {
             session.generation
           );
         }
+      })();
+    },
+    upsertUnpinned(ticket) {
+      const existing = getByIssueIdStmt.get(ticket.linear_issue_id) as Ticket | undefined;
+      db.transaction(() => {
+        upsertStmt.run({
+          ...ticket,
+          base_branch: ticket.base_branch ?? existing?.base_branch ?? "main",
+          created_at: existing?.created_at ?? now(),
+          updated_at: now(),
+        });
+        supersedeCurrentSessionTransaction(ticket.linear_issue_id, ticket.linear_session_id);
+        pipelineStore.supersedeOtherInstances(ticket.linear_issue_id, ticket.linear_session_id);
       })();
     },
     getByIssueId(issueId) {
@@ -1527,20 +1597,22 @@ export function createTicketStore(db: Database.Database): TicketStore {
         "SELECT * FROM feedback_snapshots WHERE work_item_id = ?"
       ).get(workItemId) as FeedbackSnapshot | undefined;
       if (!snapshot) return undefined;
-      const currentHead = (getSettingStmt.get(
-        `github-head:${snapshot.linear_issue_id}`
-      ) as { value: string } | undefined)?.value;
-      if (currentHead && currentHead !== snapshot.head_sha) {
-        db.prepare(`
-          UPDATE feedback_snapshots SET status = 'stale'
-          WHERE id = ? AND status IN ('collecting', 'claimed')
-        `).run(snapshot.id);
-        return { status: "stale" as const };
-      }
-      const claim = feedbackStore.claim(snapshot.id, maxRounds);
-      return claim.status === "claimed"
-        ? { ...claim, events: feedbackStore.listEvents(snapshot.id) }
-        : claim;
+      return claimFeedbackSnapshot(snapshot, maxRounds);
+    },
+    listPendingFeedbackSnapshots(linearSessionId, limit = 50) {
+      return db.prepare(`
+        SELECT * FROM feedback_snapshots
+        WHERE linear_session_id = ? AND status IN ('collecting', 'claimed')
+        ORDER BY created_at, id LIMIT ?
+      `).all(linearSessionId, limit) as FeedbackSnapshot[];
+    },
+    claimFeedbackSnapshot(snapshotId, maxRounds) {
+      const snapshot = feedbackStore.get(snapshotId);
+      if (!snapshot) return { status: "stale" as const };
+      return claimFeedbackSnapshot(snapshot, maxRounds);
+    },
+    consumeFeedbackSnapshot(snapshotId) {
+      return feedbackStore.consume(snapshotId);
     },
     getConsumedSessionWorkForRun(runId) {
       return getConsumedSessionWorkForRunStmt.get(runId) as SessionWork | undefined;
@@ -1770,6 +1842,9 @@ export function createTicketStore(db: Database.Database): TicketStore {
     },
     quarantineRun(runId, owner, reason) {
       return quarantineRunTransaction.immediate(runId, owner, reason);
+    },
+    settleQuarantinedRun(params) {
+      return settleQuarantinedRunTransaction.immediate(params);
     },
     renewRunLiveness(runId, heartbeatAt) {
       return db.prepare(`

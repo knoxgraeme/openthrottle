@@ -117,6 +117,7 @@ export async function closeTicketForPullRequest(params: {
   if (ticket.sandbox_id) {
     try {
       await deleteSandbox(daytona, ticket.sandbox_id);
+      store.setSandboxId(ticket.linear_issue_id, null);
     } catch (error) {
       deleteFailed = true;
       console.error(`[webhooks/github] failed to delete sandbox ${ticket.sandbox_id}:`, error);

@@ -230,8 +230,12 @@ describe("Daytona task execution", () => {
       issueId: "issue-1",
       sessionId: "session-1",
       generation: 1,
+      taskType: "implement",
+      taskContext: "Run the repository test fixture.",
+      transitionContext: "",
       repository: "owner/repo",
       baseCommit: "a".repeat(40),
+      baseBranch: "release/2.0",
       branch: "ot/issue-1",
       agent: "codex",
       contextRevision: 0,
@@ -251,7 +255,15 @@ describe("Daytona task execution", () => {
     expect(sandbox.updateEnv).toHaveBeenLastCalledWith(expect.objectContaining({
       OT_STAGE_EXECUTION: "1",
       RUN_ID: "run-1",
+      BASE_BRANCH: "release/2.0",
     }), { unset: ["RUN_CALLBACK_TOKEN", "RESUME_MESSAGE"] });
+    expect(sandbox.process.executeSessionCommand).toHaveBeenCalledWith(
+      "stage-attempt-1",
+      expect.objectContaining({
+        command: expect.stringMatching(/flock --nonblock .*attempt-1\.lock.*test -f .*attempt-1\.json/),
+      }),
+      expect.any(Number)
+    );
     expect(JSON.stringify(updateEnv.mock.calls.at(-1))).not.toContain("secret-token");
 
     const artifactPayload = canonicalJson({ result: "success" });

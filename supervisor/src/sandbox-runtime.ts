@@ -46,8 +46,12 @@ export interface StageRequestEnvelope {
   issueId: string;
   sessionId: string;
   generation: number;
+  taskType: "implement" | "investigate";
+  taskContext: string;
+  transitionContext: string;
   repository: string;
   baseCommit: string;
+  baseBranch: string;
   branch: string;
   agent: "claude" | "codex" | "opencode";
   contextRevision: number;
@@ -209,8 +213,12 @@ export function buildInstalledRuntimeDescriptor(
     protocol: STAGE_EXECUTOR_PROTOCOL,
     capabilities: sortedUnique(overrides.capabilities ?? [
       "agent/semantic@1",
+      "ce/plan@1",
       "ce/implement@1",
       "ce/investigate@1",
+      "ce/publish@1",
+      "ce/review@1",
+      "ce/simplify@1",
       "command/run@1",
       "provider/wait@1",
       "repository/publish@1",

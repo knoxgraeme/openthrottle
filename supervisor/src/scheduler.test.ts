@@ -2,9 +2,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createTicketStore, openDb, type Ticket, type TicketStore } from "./db.js";
 import {
   drainNextSessionWork,
+  executionSummary,
   feedbackMessage,
   isAutomaticWorkBounded,
   isResolvableFeedbackWorkId,
+  legacyDrainReport,
   selectExecutionMode,
   shouldNudgeAfterRun,
   type DrainParams,
@@ -17,6 +19,53 @@ describe("selectExecutionMode", () => {
     expect(selectExecutionMode({ pipelineAdmissionEnabled: true })).toBe("pipeline");
     expect(selectExecutionMode({ pinnedMode: "legacy", pipelineAdmissionEnabled: true })).toBe("legacy");
     expect(selectExecutionMode({ pinnedMode: "pipeline", pipelineAdmissionEnabled: false })).toBe("pipeline");
+    expect(selectExecutionMode({
+      pipelineAdmissionEnabled: true,
+      repository: "owner/canary",
+      admittedRepositories: ["owner/canary"],
+    })).toBe("pipeline");
+    expect(selectExecutionMode({
+      pipelineAdmissionEnabled: true,
+      repository: "owner/production",
+      admittedRepositories: ["owner/canary"],
+    })).toBe("legacy");
+    expect(selectExecutionMode({
+      pinnedMode: "pipeline",
+      pipelineAdmissionEnabled: false,
+      repository: "owner/production",
+      admittedRepositories: ["owner/canary"],
+    })).toBe("pipeline");
+  });
+});
+
+describe("cutover reporting", () => {
+  it("counts pinned modes and refuses to call legacy drained while any cross-domain obligation remains", () => {
+    const store = createTicketStore(openDb(":memory:"));
+    store.upsert({
+      linear_issue_id: "legacy-issue",
+      linear_issue_identifier: "OT-LEGACY",
+      linear_session_id: "legacy-session",
+      sandbox_id: "legacy-sandbox",
+      branch: "ot/legacy",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: "https://github.com/owner/repo/pull/1",
+      state: "active",
+    });
+    expect(executionSummary(store)).toEqual({
+      legacy: 1,
+      pipeline: 0,
+      waiting: 0,
+      publication_blocked: 0,
+    });
+    expect(legacyDrainReport(store, "2026-07-22T00:00:00.000Z")).toMatchObject({
+      drained: false,
+      obligations: { active_tickets: 1, sandbox_resources: 1 },
+    });
+    store.setSandboxId("legacy-issue", null);
+    store.setState("legacy-issue", "closed");
+    expect(legacyDrainReport(store).drained).toBe(true);
+    store.db.close();
   });
 });
 

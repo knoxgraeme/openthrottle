@@ -1,0 +1,161 @@
+schema: openthrottle.pipeline/v1
+id: ce/implement
+version: 2
+description: Staged CE implementation with sealed repository gates, exact-tree publication, and bounded provider repair.
+entry_stage: planning
+max_attempts: 20
+requires:
+  protocol: stage-executor@1
+  capabilities:
+    - ce/plan@1
+    - ce/implement@1
+    - ce/review@1
+    - ce/simplify@1
+    - ce/publish@1
+    - command/run@1
+    - provider/wait@1
+stages:
+  - id: planning
+    executor: { kind: agent, capability: ce/plan@1 }
+    evaluator: { kind: semantic, assurance: semantic_attested, required_artifacts: [stage_result] }
+    context: fresh_review
+    live_steering: true
+    credentials: [model.invoke, repo.read]
+    produces: [stage_result]
+    transitions:
+      success: { to: implementation }
+      no_change: { terminal: no_change }
+      semantic_repair_required: { to: planning, max_reentries: 3, on_exhausted: needs_human }
+      retryable_infrastructure_failure: { to: planning, max_reentries: 3, on_exhausted: failed }
+      needs_human: { terminal: needs_human }
+      canceled: { terminal: canceled }
+      superseded: { terminal: superseded }
+      failure: { terminal: failed }
+  - id: implementation
+    executor: { kind: agent, capability: ce/implement@1 }
+    evaluator: { kind: semantic, assurance: semantic_attested, required_artifacts: [stage_result] }
+    context: resume_required
+    live_steering: true
+    credentials: [model.invoke, provider.read, repo.read, repo.write]
+    produces: [stage_result]
+    transitions:
+      success: { to: semantic_review }
+      no_change: { terminal: no_change }
+      semantic_repair_required: { to: implementation, max_reentries: 3, on_exhausted: needs_human }
+      retryable_infrastructure_failure: { to: implementation, max_reentries: 3, on_exhausted: failed }
+      needs_human: { terminal: needs_human }
+      canceled: { terminal: canceled }
+      superseded: { terminal: superseded }
+      failure: { terminal: failed }
+  - id: semantic_review
+    executor: { kind: agent, capability: ce/review@1 }
+    evaluator: { kind: semantic, assurance: semantic_attested, required_artifacts: [stage_result, review] }
+    context: resume_required
+    live_steering: false
+    credentials: [model.invoke, repo.read, repo.write]
+    produces: [stage_result, review]
+    transitions:
+      success: { to: simplification }
+      no_change: { to: simplification }
+      semantic_repair_required: { to: implementation, max_reentries: 3, on_exhausted: needs_human }
+      retryable_infrastructure_failure: { to: semantic_review, max_reentries: 2, on_exhausted: failed }
+      needs_human: { terminal: needs_human }
+      canceled: { terminal: canceled }
+      superseded: { terminal: superseded }
+      failure: { to: implementation, max_reentries: 3, on_exhausted: needs_human }
+  - id: simplification
+    executor: { kind: agent, capability: ce/simplify@1 }
+    evaluator: { kind: semantic, assurance: semantic_attested, required_artifacts: [stage_result] }
+    context: resume_required
+    live_steering: false
+    credentials: [model.invoke, repo.read, repo.write]
+    produces: [stage_result]
+    transitions:
+      success: { to: test }
+      no_change: { to: test }
+      semantic_repair_required: { to: implementation, max_reentries: 3, on_exhausted: needs_human }
+      retryable_infrastructure_failure: { to: simplification, max_reentries: 2, on_exhausted: failed }
+      needs_human: { terminal: needs_human }
+      canceled: { terminal: canceled }
+      superseded: { terminal: superseded }
+      failure: { to: implementation, max_reentries: 3, on_exhausted: needs_human }
+  - id: test
+    executor: { kind: command, capability: command/run@1 }
+    evaluator: { kind: command, assurance: executor_verified, required_artifacts: [command_result] }
+    context: none
+    live_steering: false
+    credentials: [repo.read]
+    produces: [stage_result, command_result]
+    transitions:
+      success: { to: lint }
+      no_change: { to: lint }
+      semantic_repair_required: { to: implementation, max_reentries: 3, on_exhausted: needs_human }
+      retryable_infrastructure_failure: { to: test, max_reentries: 2, on_exhausted: failed }
+      needs_human: { terminal: needs_human }
+      canceled: { terminal: canceled }
+      superseded: { terminal: superseded }
+      failure: { to: implementation, max_reentries: 3, on_exhausted: needs_human }
+  - id: lint
+    executor: { kind: command, capability: command/run@1 }
+    evaluator: { kind: command, assurance: executor_verified, required_artifacts: [command_result] }
+    context: none
+    live_steering: false
+    credentials: [repo.read]
+    produces: [stage_result, command_result]
+    transitions:
+      success: { to: build }
+      no_change: { to: build }
+      semantic_repair_required: { to: implementation, max_reentries: 3, on_exhausted: needs_human }
+      retryable_infrastructure_failure: { to: lint, max_reentries: 2, on_exhausted: failed }
+      needs_human: { terminal: needs_human }
+      canceled: { terminal: canceled }
+      superseded: { terminal: superseded }
+      failure: { to: implementation, max_reentries: 3, on_exhausted: needs_human }
+  - id: build
+    executor: { kind: command, capability: command/run@1 }
+    evaluator: { kind: command, assurance: executor_verified, required_artifacts: [command_result] }
+    context: none
+    live_steering: false
+    credentials: [repo.read]
+    produces: [stage_result, command_result]
+    transitions:
+      success: { to: publish }
+      no_change: { to: publish }
+      semantic_repair_required: { to: implementation, max_reentries: 3, on_exhausted: needs_human }
+      retryable_infrastructure_failure: { to: build, max_reentries: 2, on_exhausted: failed }
+      needs_human: { terminal: needs_human }
+      canceled: { terminal: canceled }
+      superseded: { terminal: superseded }
+      failure: { to: implementation, max_reentries: 3, on_exhausted: needs_human }
+  - id: publish
+    executor: { kind: agent, capability: ce/publish@1 }
+    evaluator: { kind: publish_subject, assurance: semantic_attested, required_artifacts: [publish_subject] }
+    context: resume_required
+    live_steering: false
+    credentials: [model.invoke, repo.read, repo.write, provider.read]
+    produces: [stage_result, publish_subject]
+    transitions:
+      success: { to: provider }
+      no_change: { terminal: no_change }
+      semantic_repair_required: { to: implementation, max_reentries: 3, on_exhausted: needs_human }
+      retryable_infrastructure_failure: { to: publish, max_reentries: 2, on_exhausted: failed }
+      needs_human: { terminal: needs_human }
+      canceled: { terminal: canceled }
+      superseded: { terminal: superseded }
+      failure: { terminal: failed }
+  - id: provider
+    executor: { kind: provider_wait, capability: provider/wait@1 }
+    evaluator: { kind: provider, assurance: provider_verified, required_artifacts: [provider_check] }
+    context: none
+    live_steering: false
+    credentials: [provider.read]
+    produces: [stage_result, provider_check]
+    transitions:
+      success: { terminal: shipped }
+      no_change: { terminal: no_change }
+      semantic_repair_required: { to: implementation, max_reentries: 3, on_exhausted: needs_human }
+      retryable_infrastructure_failure: { to: provider, max_reentries: 2, on_exhausted: failed }
+      needs_human: { terminal: needs_human }
+      canceled: { terminal: canceled }
+      superseded: { terminal: superseded }
+      failure: { terminal: failed }

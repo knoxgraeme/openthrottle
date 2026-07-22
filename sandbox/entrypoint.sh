@@ -173,16 +173,12 @@ if [[ "$STAGE_EXECUTION" == "1" ]]; then
   GITHUB_REPO="$(jq -er '.repository' "$OT_STAGE_REQUEST_FILE")"
   BRANCH_NAME="$(jq -er '.branch' "$OT_STAGE_REQUEST_FILE")"
   STAGE_BASE_COMMIT="$(jq -er '.baseCommit' "$OT_STAGE_REQUEST_FILE")"
-  BASE_BRANCH="$STAGE_BASE_COMMIT"
+  BASE_BRANCH="$(jq -er '.baseBranch' "$OT_STAGE_REQUEST_FILE")"
   STAGE_EXPECTED_SUBJECT="$(jq -r '.expectedSubject // empty' "$OT_STAGE_REQUEST_FILE")"
   AGENT="$(jq -er '.agent' "$OT_STAGE_REQUEST_FILE")"
   LINEAR_ISSUE_ID="$(jq -er '.issueId' "$OT_STAGE_REQUEST_FILE")"
   LINEAR_ISSUE_IDENTIFIER="$LINEAR_ISSUE_ID"
-  if [[ "$(jq -er '.capability' "$OT_STAGE_REQUEST_FILE")" == "ce/investigate@1" ]]; then
-    TASK_TYPE="investigate"
-  else
-    TASK_TYPE="implement"
-  fi
+  TASK_TYPE="$(jq -er '.taskType' "$OT_STAGE_REQUEST_FILE")"
 fi
 
 : "${RUN_ID:?RUN_ID is required}"
@@ -429,7 +425,11 @@ export OT_DEV_PORT="$DEV_PORT"
 # keeping some parallelism. Only set when unset, so a repo whose build needs
 # more (or less) can override it in .openthrottle.yml's post_bootstrap.
 export TURBO_CONCURRENCY="${TURBO_CONCURRENCY:-50%}"
-OT_CE_PIPELINE="$(task_ce_pipeline "$TASK_TYPE")"
+if [[ "$STAGE_EXECUTION" == "1" ]]; then
+  OT_CE_PIPELINE="$(jq -er '.capability' "$OT_STAGE_REQUEST_FILE")"
+else
+  OT_CE_PIPELINE="$(task_adapter_value "$TASK_TYPE" legacyPipeline)"
+fi
 export OT_CE_PIPELINE
 
 # Agent resolution precedence:
@@ -504,9 +504,12 @@ if [[ "$STAGE_EXECUTION" == "1" ]]; then
   done
   install -d -o root -g root -m 0700 /var/lib/openthrottle/stage-results
   mkdir -p "${OT_DIR}/stage" "${AGENT_HOME}/.claude/skills"
+  jq -r '.taskContext' "$OT_STAGE_REQUEST_FILE" > "${OT_DIR}/linear-context.md"
   if [[ -d "${OPT_DIR}/skills/tasks" ]]; then
     cp -r "${OPT_DIR}/skills/tasks/." "${AGENT_HOME}/.claude/skills/"
   fi
+  chown "${AGENT_USER}:${AGENT_USER}" "${OT_DIR}/linear-context.md"
+  chmod 0600 "${OT_DIR}/linear-context.md"
   chown -R "${AGENT_USER}:${AGENT_USER}" "${OT_DIR}/stage" "${AGENT_HOME}/.claude"
   node "${OPT_DIR}/runner/execute-stage.mjs" \
     --request "$OT_STAGE_REQUEST_FILE" \
@@ -677,7 +680,7 @@ OPENCODE_PROMPT_FILE=""
 
 case "${AGENT}:${TASK_TYPE}" in
   claude:implement|claude:investigate)
-    SKILL_NAME="$(task_skill_name "$TASK_TYPE")"
+    SKILL_NAME="$(task_adapter_value "$TASK_TYPE" skill)"
     AGENT_CMD=(claude -p "/${SKILL_NAME}" --output-format stream-json --verbose \
       --max-turns "$MAX_TURNS" --dangerously-skip-permissions \
       --mcp-config "$MCP_CONFIG_FILE" --strict-mcp-config \
@@ -698,7 +701,7 @@ case "${AGENT}:${TASK_TYPE}" in
     # Codex discovers the skill body itself natively from the admin-scope
     # /etc/codex/skills baked in at image build time (see Dockerfile) — the
     # stdin file only needs to name it, not carry its full text.
-    SKILL_NAME="$(task_skill_name "$TASK_TYPE")"
+    SKILL_NAME="$(task_adapter_value "$TASK_TYPE" skill)"
     CODEX_STDIN_FILE="${OT_DIR}/codex-${TASK_TYPE}-stdin.md"
     {
       printf '$%s\n' "$SKILL_NAME"
@@ -728,7 +731,7 @@ case "${AGENT}:${TASK_TYPE}" in
     # into the prompt at runtime: strip its YAML frontmatter (the first
     # `---`...`---` block) and append the same runtime-context/Linear-context
     # blocks Codex gets.
-    SKILL_NAME="$(task_skill_name "$TASK_TYPE")"
+    SKILL_NAME="$(task_adapter_value "$TASK_TYPE" skill)"
     OPENCODE_PROMPT_FILE="${OT_DIR}/opencode-${TASK_TYPE}-prompt.md"
     {
       awk 'NR==1 && $0=="---" { fm=1; next } fm && $0=="---" { fm=0; next } fm { next } { print }' \

@@ -75,6 +75,7 @@ describe("pipeline publication", () => {
         repositoryConfig: snapshot,
         runtime,
         authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
       },
     });
     const instance = pipelines.getInstanceForSession("session-1")!;
@@ -481,6 +482,7 @@ describe("pipeline publication", () => {
         repositoryConfig: snapshot,
         runtime,
         authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
       },
     });
     const replacement = pipelines.getInstanceForSession("session-2")!;
@@ -566,6 +568,7 @@ describe("pipeline publication", () => {
         repository: "owner/repo", baseCommit: "a".repeat(40), manifest,
         repositoryConfig: snapshot, runtime,
         authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
       },
     });
     await acknowledgeSelection(tickets);

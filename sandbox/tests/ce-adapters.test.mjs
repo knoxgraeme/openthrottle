@@ -39,6 +39,37 @@ function allSkillsText() {
 }
 
 describe("OpenThrottle canonical task skills", () => {
+  it("uses one data registry for the legacy compatibility mapping", () => {
+    const registry = JSON.parse(readFileSync(resolve(skillsRoot, "task-adapters-v1.json"), "utf8"));
+    expect(registry).toMatchObject({
+      schema: "openthrottle.task-adapters/v1",
+      tasks: {
+        implement: { skill: "implement-plan" },
+        investigate: { skill: "investigate" },
+        resume: { legacyPipeline: ["resume"] },
+      },
+    });
+    const runtime = readFileSync(resolve(repoRoot, "sandbox/lib/runtime.sh"), "utf8");
+    const entrypoint = readFileSync(resolve(repoRoot, "sandbox/entrypoint.sh"), "utf8");
+    const scheduler = readFileSync(resolve(repoRoot, "supervisor/src/scheduler.ts"), "utf8");
+    expect(`${runtime}\n${entrypoint}`).not.toMatch(/task_skill_name|task_ce_pipeline/);
+    expect(scheduler).not.toContain("LOOP_REGISTRY");
+  });
+
+  it("keeps CE v2 execution policies aligned with installed stage contracts", () => {
+    const implement = readFileSync(resolve(repoRoot, "supervisor/pipelines/ce-implement-v2.yaml"), "utf8");
+    const investigate = readFileSync(resolve(repoRoot, "supervisor/pipelines/ce-investigate-v2.yaml"), "utf8");
+    expect(implement).toMatch(
+      /id: planning[\s\S]*?executor: \{ kind: agent, capability: ce\/plan@1 \}[\s\S]*?context: fresh_review/
+    );
+    expect(implement).toMatch(
+      /id: implementation[\s\S]*?credentials: \[model\.invoke, provider\.read, repo\.read, repo\.write\]/
+    );
+    expect(investigate).toMatch(
+      /id: investigate[\s\S]*?credentials: \[model\.invoke, repo\.read, repo\.write, provider\.read\]/
+    );
+  });
+
   it("both canonical skill files exist with YAML frontmatter", () => {
     for (const task of tasks) {
       const body = skillBody(task);
@@ -128,12 +159,21 @@ describe("OpenThrottle canonical task skills", () => {
     expect(prIdx).toBeGreaterThan(reviewIdx);
   });
 
+  it("documents every CE manifest stage and the sealed command/provider boundaries", () => {
+    const body = skillBody("implement-plan");
+    for (const stage of ["planning", "implementation", "semantic_review", "simplification", "publish"]) {
+      expect(body).toContain(stage);
+    }
+    expect(body).toMatch(/separate sealed command\s+stages/);
+    expect(body).toContain("supervisor-owned stage");
+  });
+
   it("implement-plan runs configured gates before ce-commit-push-pr", () => {
     const body = skillBody("implement-plan");
     const testGate = body.indexOf("$OT_TEST_CMD");
     const lintGate = body.indexOf("$OT_LINT_CMD");
     const buildGate = body.indexOf("$OT_BUILD_CMD");
-    const createPr = body.indexOf("ce-commit-push-pr");
+    const createPr = body.lastIndexOf("ce-commit-push-pr");
 
     expect(testGate).toBeGreaterThan(-1);
     expect(lintGate).toBeGreaterThan(testGate);

@@ -144,7 +144,7 @@ function safeEvidence(raw: string): {
 function githubLinks(instance: PipelineInstance, subject: string | null): Array<{ label: string; url: string }> {
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(instance.repository)) return [];
   return subject && /^[a-f0-9]{40,64}$/.test(subject)
-    ? [{ label: "Gated commit", url: `https://github.com/${instance.repository}/commit/${subject}` }]
+    ? [{ label: "Gated tree", url: `https://github.com/${instance.repository}/tree/${subject}` }]
     : [];
 }
 
@@ -411,20 +411,22 @@ export function renderGithubPipelineSummary(envelope: PipelinePublicationEnvelop
 export function renderPipelineLogHeader(status: {
   pipeline_id: string;
   pipeline_version: number;
+  task_type: string;
   status: string;
   stage_id: string | null;
   attempt_ordinal: number | null;
   reentry_count: number;
   wait_reason: string | null;
   subject: string | null;
+  published_commit: string | null;
   gate_result: string | null;
   context_policy: string | null;
   publication_state: string;
 }): string {
   return boundedSanitized([
-    `[pipeline] ${status.pipeline_id}@${status.pipeline_version} state=${status.status}`,
+    `[pipeline] ${status.pipeline_id}@${status.pipeline_version} task=${status.task_type} state=${status.status}`,
     `[pipeline] stage=${status.stage_id ?? "-"} attempt=${status.attempt_ordinal ?? "-"} reentry=${status.reentry_count}`,
-    `[pipeline] subject=${status.subject ?? "-"} gate=${status.gate_result ?? "-"} context=${status.context_policy ?? "-"}`,
+    `[pipeline] subject=${status.subject ?? "-"} provider=${status.published_commit ?? "-"} gate=${status.gate_result ?? "-"} context=${status.context_policy ?? "-"}`,
     `[pipeline] publication=${status.publication_state} wait=${status.wait_reason ?? "-"}`,
   ].join("\n"), 4_000);
 }

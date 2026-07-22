@@ -1,7 +1,9 @@
-// Phase 2 item 1: the scheduler owns "what runs next" — the loop registry,
-// session-work draining/priority, the review-round bound, the resolved-thread
-// skip, and the external-reviewer nudge decision. completeRun and the GitHub
-// webhook handler reduce to normalization plus calls into this module.
+// Phase 2 item 1: the scheduler owns legacy "what runs next" decisions —
+// generation-scoped execution-mode selection, session-work draining/priority,
+// the review-round bound, the resolved-thread skip, and the external-reviewer
+// nudge decision. Pipeline stage order comes only from the pinned manifest.
+// completeRun and the GitHub webhook handler reduce to normalization plus calls
+// into this module.
 //
 // This module intentionally does not import run-lifecycle.ts. `launch` is
 // passed in by the caller (typed structurally below) so run-lifecycle.ts can
@@ -17,36 +19,125 @@ import { enqueueActivity, type LinearOutboxProcessor } from "./linear-outbox.js"
 import { areAllReviewThreadsResolved, commentOnPullRequest, parsePullRequestUrl } from "./github.js";
 import { sanitizeText } from "./sanitize.js";
 
-// A loop is a skill plus a CE pipeline declaration behind a task name. `resume`
-// is the continuation mechanism shared by both loops, not a registry entry —
-// it has no entry skill or pipeline of its own, only whatever session it
-// resumes.
-export interface LoopRegistryEntry {
-  entrySkill: string;
-  cePipeline: string[];
-  triggers: string[];
+export interface ExecutionSummary {
+  legacy: number;
+  pipeline: number;
+  waiting: number;
+  publication_blocked: number;
 }
 
-export const LOOP_REGISTRY: Record<"implement" | "investigate", LoopRegistryEntry> = {
-  implement: {
-    entrySkill: "implement-plan",
-    cePipeline: ["ce-work", "ce-code-review", "ce-commit-push-pr"],
-    triggers: ["linear.created", "linear.prompted.reDelegated", "linear.prompted.command"],
-  },
-  investigate: {
-    entrySkill: "investigate",
-    cePipeline: ["ce-debug", "ce-commit-push-pr"],
-    triggers: ["linear.created.investigateLabel"],
-  },
-};
+export interface LegacyDrainReport {
+  drained: boolean;
+  total_obligations: number;
+  obligations: Record<string, number>;
+  checked_at: string;
+}
+
+export function sessionExecutionMode(
+  store: TicketStore,
+  sessionId: string
+): "legacy" | "pipeline" | undefined {
+  return store.db.prepare(
+    "SELECT execution_mode FROM session_executions WHERE linear_session_id = ?"
+  ).pluck().get(sessionId) as "legacy" | "pipeline" | undefined;
+}
+
+export function executionSummary(store: TicketStore): ExecutionSummary {
+  const rows = store.db.prepare(`
+    SELECT se.execution_mode, pi.status
+    FROM session_executions se
+    JOIN agent_sessions ag ON ag.id = se.linear_session_id AND ag.state = 'current'
+    LEFT JOIN pipeline_instances pi ON pi.id = se.pipeline_instance_id
+  `).all() as Array<{ execution_mode: "legacy" | "pipeline"; status: string | null }>;
+  return {
+    legacy: rows.filter((row) => row.execution_mode === "legacy").length,
+    pipeline: rows.filter((row) => row.execution_mode === "pipeline").length,
+    waiting: rows.filter((row) => row.status === "waiting_human" || row.status === "waiting_provider").length,
+    publication_blocked: rows.filter((row) => row.status === "publication_blocked").length,
+  };
+}
+
+export function legacyDrainReport(store: TicketStore, checkedAt = new Date().toISOString()): LegacyDrainReport {
+  const count = (sql: string) => Number(store.db.prepare(sql).pluck().get() ?? 0);
+  const obligations = {
+    active_tickets: count(`
+      SELECT COUNT(*) FROM tickets t
+      JOIN session_executions se ON se.linear_session_id = t.linear_session_id
+      WHERE se.execution_mode = 'legacy' AND t.state NOT IN ('closed', 'stopped', 'expired')
+    `),
+    actors: count(`
+      SELECT COUNT(*) FROM runs r
+      JOIN session_executions se ON se.linear_session_id = r.linear_session_id
+      WHERE se.execution_mode = 'legacy' AND r.status IN ('running', 'reaping', 'quarantined')
+    `),
+    work_items: count(`
+      SELECT COUNT(*) FROM work_items wi
+      JOIN session_executions se ON se.linear_session_id = wi.linear_session_id
+      WHERE se.execution_mode = 'legacy'
+        AND wi.status IN ('pending', 'leased', 'dispatched', 'acknowledged', 'reconciliation')
+    `),
+    work_deliveries: count(`
+      SELECT COUNT(*) FROM work_deliveries wd
+      JOIN work_items wi ON wi.id = wd.work_item_id
+      JOIN session_executions se ON se.linear_session_id = wi.linear_session_id
+      WHERE se.execution_mode = 'legacy'
+        AND wd.status IN ('leased', 'dispatched', 'acknowledged')
+    `),
+    steering_inbox: count(`
+      SELECT COUNT(*) FROM session_inbox si
+      JOIN session_executions se ON se.linear_session_id = si.linear_session_id
+      WHERE se.execution_mode = 'legacy' AND si.status IN ('pending', 'dispatched', 'acknowledged')
+    `),
+    feedback: count(`
+      SELECT COUNT(*) FROM feedback_snapshots fs
+      JOIN session_executions se ON se.linear_session_id = fs.linear_session_id
+      WHERE se.execution_mode = 'legacy' AND fs.status IN ('collecting', 'claimed')
+    `),
+    provider_events: count(`
+      SELECT COUNT(*) FROM provider_events pe
+      JOIN session_executions se ON se.linear_session_id = pe.linear_session_id
+      WHERE se.execution_mode = 'legacy' AND pe.snapshot_id IS NULL
+    `),
+    webhook_deliveries: count(`
+      SELECT COUNT(*) FROM webhook_deliveries wd
+      LEFT JOIN session_executions se ON se.linear_session_id = wd.session_id
+      WHERE (se.execution_mode = 'legacy' OR wd.session_id IS NULL)
+        AND wd.status IN ('pending', 'processing', 'failed')
+    `),
+    linear_outbox: count(`
+      SELECT COUNT(*) FROM linear_outbox lo
+      JOIN session_executions se ON se.linear_session_id = lo.linear_session_id
+      WHERE se.execution_mode = 'legacy' AND lo.status IN ('pending', 'processing', 'failed')
+    `),
+    sandbox_events: count(`
+      SELECT COUNT(*) FROM sandbox_events ev
+      JOIN runs r ON r.id = ev.run_id
+      JOIN session_executions se ON se.linear_session_id = r.linear_session_id
+      WHERE se.execution_mode = 'legacy' AND ev.status IN ('pending', 'processing', 'failed')
+    `),
+    sandbox_resources: count(`
+      SELECT COUNT(*) FROM tickets t
+      JOIN session_executions se ON se.linear_session_id = t.linear_session_id
+      WHERE se.execution_mode = 'legacy' AND t.sandbox_id IS NOT NULL
+    `),
+  };
+  const total = Object.values(obligations).reduce((sum, value) => sum + value, 0);
+  return { drained: total === 0, total_obligations: total, obligations, checked_at: checkedAt };
+}
 
 // Admission is generation-scoped. Once a generation has a mode, a restart or
 // flag change returns that pin instead of reinterpreting the live lifecycle.
 export function selectExecutionMode(params: {
   pinnedMode?: "legacy" | "pipeline";
   pipelineAdmissionEnabled: boolean;
+  repository?: string;
+  admittedRepositories?: readonly string[];
 }): "legacy" | "pipeline" {
-  return params.pinnedMode ?? (params.pipelineAdmissionEnabled ? "pipeline" : "legacy");
+  if (params.pinnedMode) return params.pinnedMode;
+  if (!params.pipelineAdmissionEnabled) return "legacy";
+  const cohort = params.admittedRepositories ?? [];
+  if (cohort.length === 0) return "pipeline";
+  return params.repository && cohort.includes(params.repository.toLowerCase()) ? "pipeline" : "legacy";
 }
 
 const TRIAGE_INSTRUCTIONS =
@@ -213,6 +304,13 @@ export async function drainNextSessionWork(params: DrainParams): Promise<boolean
     if (!current || TERMINAL_DISPATCH_STATES.has(current.state)) {
       console.log(
         `[scheduler] skipping queued work ${work.id} for ${params.ticket.linear_issue_identifier} — ticket ${current ? `is ${current.state}` : "no longer exists"}; cancelling instead of resuming`
+      );
+      params.store.cancelSessionWork(work.id);
+      continue;
+    }
+    if (sessionExecutionMode(params.store, current.linear_session_id) === "pipeline") {
+      console.warn(
+        `[scheduler] refusing legacy work ${work.id} for pipeline-pinned session ${current.linear_session_id}`
       );
       params.store.cancelSessionWork(work.id);
       continue;

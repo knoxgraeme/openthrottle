@@ -6,6 +6,7 @@ import { commentCreate, type LinearClient } from "./linear.js";
 import { createLinearOutboxProcessor } from "./linear-outbox.js";
 import { expireRun } from "./server.js";
 import { redrainStalledSessionWork } from "./run-lifecycle.js";
+import type { PipelineStore } from "./pipeline-store.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -20,16 +21,17 @@ export async function runSweep(
   daytona: Daytona,
   store: TicketStore,
   linear: LinearClient | undefined,
-  cfg: Config
+  cfg: Config,
+  pipelines?: PipelineStore
 ): Promise<void> {
   const linearOutbox = createLinearOutboxProcessor({
     store,
     getLinearClient: async () => linear,
   });
   for (const run of store.listExpiredRuns(new Date().toISOString())) {
-    await expireRun(daytona, store, linearOutbox, run);
+    await expireRun(daytona, store, linearOutbox, run, pipelines);
   }
-  await expireStaleTickets(daytona, store, linear, cfg);
+  await expireStaleTickets(daytona, store, linear, cfg, pipelines);
   await deleteOrphanSandboxes(daytona, store, cfg);
   // Recover any feedback work that was enqueued but never drained (a completeRun
   // drain that was skipped or failed): without this, one missed drain strands a
@@ -45,12 +47,14 @@ async function expireStaleTickets(
   daytona: Daytona,
   store: TicketStore,
   linear: LinearClient | undefined,
-  cfg: Config
+  cfg: Config,
+  pipelines?: PipelineStore
 ): Promise<void> {
   const maxAgeMs = cfg.sweepMaxAgeDays * DAY_MS;
   const now = Date.now();
 
   for (const ticket of store.listActive()) {
+    if (pipelines?.getInstanceForSession(ticket.linear_session_id)) continue;
     if (ticket.pr_url) continue; // has PR activity — leave alone
     const createdMs = Date.parse(ticket.created_at);
     if (Number.isNaN(createdMs)) continue;

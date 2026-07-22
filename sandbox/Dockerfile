@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       gnupg \
       jq \
       ripgrep \
+      util-linux \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
        -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \

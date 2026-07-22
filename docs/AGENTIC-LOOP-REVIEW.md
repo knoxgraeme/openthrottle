@@ -219,3 +219,52 @@ be treated as resolved by a replaced code path.
 No finding is dispositioned **verified obsolete**: every original finding maps
 to a prerequisite fix, a unit that will resolve it, or explicit open follow-up
 work.
+
+## U8 cutover re-audit — 2026-07-22
+
+This is the required line-by-line U8 re-audit of the original findings and the
+four pre-existing issues. “Resolved” means the named repository evidence is
+implemented and covered locally; it does not claim the credentialed deployment
+acceptance reserved for the rollout gate.
+
+| Finding | U8 status | Repository evidence |
+|---|---|---|
+| #1 newer Codex seed overwritten on resume | resolved | Central/newer seed selection and resume lineage are covered by Codex auth/runtime regression tests. |
+| #2 nonexistent `ce-simplify` reference | resolved | Canonical adapters use `ce-simplify-code`; catalog/runtime/adapter parity tests reject unknown capability mappings. |
+| #3 unbounded Codex refresh I/O | resolved | Refresh timeout, cancellation, and single-flight behavior are regression-tested. |
+| #4 work claimed without a lease | resolved | Durable work-delivery leases, expiry, reclamation, and file-backed restart cases replace claim-only ownership. |
+| #6 review-round history can reset | resolved | Migration reconciliation preserves consumed automatic work and pipeline repair counters without counting human work. |
+| #7 errored tickets can strand work | resolved | Idle/error recovery and redrain tests retain and relaunch eligible current-generation work. |
+| #8 no-event runs evade stale detection | resolved | Sealed liveness falls back to `started_at`; stale no-event actors are covered by reaper tests. |
+| #9 fallback steering race | resolved | Dispatch/acknowledge/consume fencing cancels the queued fallback only after the exact journal is observed. |
+| #10 work can cross session/run | resolved | Session, generation, run, context revision, request hash, and idempotency fences are stored and tested. |
+| #12 missing native session recovery repeats failure | resolved | Manifest context policies make fresh, reconstruction, and reject transitions explicit and bounded. |
+| #14 reaper loser performs side effects | resolved | Settlement CAS losers return before terminal publication or cleanup; interleaving tests pin the behavior. |
+| #16 inbox upload treated as consumption | resolved | Upload is only `dispatched`; the sealed hook journal is required for `acknowledged` and later consumption. |
+| #17 provider events spend excess rounds | resolved | Legacy and pipeline paths share immutable current-head snapshots: stable provider identities coalesce, arrivals during repair collect for the next snapshot, and one snapshot creates one manifest re-entry. |
+| #18 processed heartbeats grow indefinitely | resolved | Processed ephemeral activity retention is pruned while retryable rows remain durable. |
+| #19 quiet long commands appear dead | resolved | Root-owned executor heartbeats cover in-flight command and agent stages independently of semantic output. |
+| #20 real pinned CLI acceptance is missing | **open — cutover gate** | Stubbed multi-engine Docker coverage exists, but real released-snapshot Claude/Codex/OpenCode runs require operator credentials and must be attached before canary. |
+| #21 writable shared credential lineage | **open — orthogonal** | No trust-model decision was inferred. The shared subscription lineage and API-key concurrency alternative remain documented; this finding stays owned outside coordinator cutover. |
+| #22 CI identity dedup loses distinct failures | resolved | Provider event identity is workflow/check specific while current-head snapshots coalesce repair work. |
+| #23 reaper overlap and release-before-stop | resolved | Non-dispatchable reaping and explicit stop confirmation retain exclusivity; uncertain termination quarantines the actor. |
+| #25 declarative pipeline metadata drifts | resolved | Immutable CE v2 manifests and the independent runtime descriptor are boot-validated; fixtures use the same catalog path. |
+| #26 engine invocation mapping drifts | resolved | Sandbox capability inventory and adapter tests cover Claude, Codex, and OpenCode stage invocation. |
+| #27 disk/default config drift | resolved | Snapshot resource defaults are single-sourced and checked against workflow/documented surfaces. |
+| #28 missing run/event query index | resolved | Additive migration and schema tests pin the liveness-supporting run/event indexes. |
+| #32 unused `LOOP_REGISTRY` is false authority | resolved | `LOOP_REGISTRY`, `task_skill_name`, and `task_ce_pipeline` are absent; immutable manifests drive pipeline execution and one JSON registry remains explicitly legacy-only. |
+| E1 follow-up dispatch not generation-bound | resolved | Work/effect intents carry immutable session and generation fences and reject stale execution. |
+| E2 control command can queue behind work | resolved | Stop/control handling precedes semantic work and cancels nonterminal queued delivery. |
+| E3 exit zero conflates semantic success | resolved | Typed stage artifacts, deterministic gate receipts, publish trees plus executor-verified remote commits, and head-bound provider receipts decide outcomes; process exit alone cannot pass. |
+| E4 wrapper can suppress failure | resolved | Wrapper/result precedence requires a matching typed failure/result rather than any earlier terminal prose. |
+
+### U8 verdict
+
+> **Verdict:** Canary-ready code; broad cutover remains gated.
+>
+> The original autonomy-breaking delivery, liveness, fencing, typed-result,
+> and false-authority findings are resolved in repository code. #20 remains an
+> explicit live acceptance gate and #21 remains an orthogonal credential-trust
+> decision. Admission therefore defaults off, compatibility remains in place,
+> and removal/schema contraction cannot begin until the runbook's named-owner,
+> restore, live-service, full-drain, and soak evidence exists.

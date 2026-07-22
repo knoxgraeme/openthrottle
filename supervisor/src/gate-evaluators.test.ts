@@ -1,8 +1,8 @@
 import Database from "better-sqlite3";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { createTicketStore, openDb } from "./db.js";
-import { evaluateStageGate, processStageEvidence } from "./gate-evaluators.js";
+import { createTicketStore, openDb, type TicketStore } from "./db.js";
+import { drainDeferredProviderEvidence, evaluateStageGate, processStageEvidence, settleStageEvidence } from "./gate-evaluators.js";
 import {
   canonicalJson,
   digestNormalized,
@@ -15,6 +15,8 @@ import {
 import type { PipelineCoordinatorEvent, PipelineEventArtifact } from "./pipeline-coordinator.js";
 import { createPipelineStore, type PipelineInstance, type PipelineStageAttempt, type PipelineStore } from "./pipeline-store.js";
 import { buildInstalledRuntimeDescriptor } from "./sandbox-runtime.js";
+import { processPipelineInfrastructureFailure } from "./pipeline-control.js";
+import { drainPipelineFeedbackSnapshots, routePipelineProviderEvent } from "./github-events.js";
 
 const catalogPath = fileURLToPath(new URL("../pipelines/catalog.yaml", import.meta.url));
 const runtime = buildInstalledRuntimeDescriptor("gate-test/v1");
@@ -22,6 +24,7 @@ const SUBJECT = "c".repeat(40);
 
 interface Fixture {
   db: Database.Database;
+  tickets: TicketStore;
   pipelines: PipelineStore;
   manifest: PipelineManifest;
   stage: PipelineStage;
@@ -65,6 +68,7 @@ describe("deterministic supervisor stage gates", () => {
         repositoryConfig: snapshot,
         runtime,
         authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: manifestKey.startsWith("ce/investigate") ? "investigate" : "implement",
       },
     });
     const instance = pipelines.getInstanceForSession("session-1")!;
@@ -81,6 +85,7 @@ describe("deterministic supervisor stage gates", () => {
     const boundAttempt = pipelines.getAttempt(attempt.id)!;
     return {
       db: database,
+      tickets,
       pipelines,
       manifest: manifest.manifest,
       stage: manifest.manifest.stages.find((candidate) => candidate.id === attempt.stage_id)!,
@@ -276,5 +281,277 @@ describe("deterministic supervisor stage gates", () => {
       "SELECT evaluator_kind, result, payload, receipt_hash FROM pipeline_gate_receipts"
     ).get()).toMatchObject({ evaluator_kind: "semantic", result: "passed" });
     expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM pipeline_artifacts").get()).toEqual({ count: 1 });
+  });
+
+  it("settles the actor and pipeline transition in one replayable transaction", () => {
+    const fixture = setup();
+    const input = event(fixture);
+    expect(() => settleStageEvidence(fixture.pipelines, fixture.tickets, input, {
+      observedSubject: SUBJECT,
+      faultAfterWrite: (count) => {
+        if (count === 3) throw new Error("fault after run settlement");
+      },
+    })).toThrow(/fault after run settlement/);
+    expect(fixture.tickets.getRun(input.runId!)?.status).toBe("running");
+    expect(fixture.tickets.getByIssueId("issue-1")?.run_id).toBe(input.runId);
+    expect(fixture.pipelines.getInstance(fixture.instance.id)?.state_version).toBe(0);
+
+    const completed = settleStageEvidence(
+      fixture.pipelines,
+      fixture.tickets,
+      input,
+      { observedSubject: SUBJECT }
+    );
+    expect(completed.status).toBe("completion_pending_publication");
+    expect(fixture.tickets.getRun(input.runId!)?.status).toBe("completed");
+    expect(fixture.tickets.getByIssueId("issue-1")?.run_id).toBeNull();
+  });
+
+  it("turns an executor lease expiry into a bounded coordinator retry without semantic artifacts", () => {
+    const fixture = setup();
+    const transitioned = processPipelineInfrastructureFailure({
+      store: fixture.pipelines,
+      runId: fixture.attempt.planned_run_id!,
+    });
+
+    expect(transitioned).toMatchObject({ status: "dispatchable", active_stage_id: "investigate" });
+    expect(fixture.pipelines.getAttempt(fixture.attempt.id)).toMatchObject({
+      status: "failed",
+      outcome: "retryable_infrastructure_failure",
+    });
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "investigate",
+      reentry_ordinal: 1,
+    });
+    expect(fixture.db.prepare(
+      "SELECT kind, status FROM pipeline_inbox_events WHERE id = ?"
+    ).get(`pipeline-run-failed:${fixture.attempt.planned_run_id}`)).toEqual({
+      kind: "effect_failed",
+      status: "consumed",
+    });
+
+    expect(processPipelineInfrastructureFailure({
+      store: fixture.pipelines,
+      runId: fixture.attempt.planned_run_id!,
+    })).toMatchObject({ state_version: transitioned!.state_version });
+  });
+
+  it("pins the executor-verified provider commit when the publish gate passes", () => {
+    const fixture = setup("ce/implement@1");
+    const stage = fixture.manifest.stages.find((candidate) => candidate.id === "publish")!;
+    const publishedCommit = "e".repeat(40);
+    fixture.db.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET stage_id = 'publish', native_context_policy = 'none'
+      WHERE id = ?
+    `).run(fixture.attempt.id);
+    fixture.db.prepare(`
+      UPDATE pipeline_instances SET status = 'running', active_stage_id = 'publish' WHERE id = ?
+    `).run(fixture.instance.id);
+    const publishFixture: Fixture = {
+      ...fixture,
+      stage,
+      attempt: fixture.pipelines.getAttempt(fixture.attempt.id)!,
+    };
+    const input = event(publishFixture, "success", {
+      details: {
+        proposal_schema: "openthrottle.stage-proposal/v1",
+        published_commit: publishedCommit,
+      },
+    });
+
+    expect(evaluateStageGate(fixture.pipelines, input).event.providerRevision).toBe(publishedCommit);
+    expect(processStageEvidence(fixture.pipelines, input)).toMatchObject({
+      status: "waiting_provider",
+      published_commit: publishedCommit,
+    });
+
+    const missing = event(publishFixture, "success");
+    expect(() => evaluateStageGate(fixture.pipelines, missing)).toThrow(/provider commit/);
+  });
+
+  it("turns supervisor-owned provider evidence into a fenced terminal receipt", () => {
+    const fixture = setup("ce/implement@1");
+    fixture.db.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET stage_id = 'provider', native_context_policy = 'none', expected_subject = ?, native_session_id = 'native-1'
+      WHERE id = ?
+    `).run(SUBJECT, fixture.attempt.id);
+    fixture.db.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'completion_pending_publication', active_stage_id = 'provider',
+          immutable_subject = ?, published_commit = ?
+      WHERE id = ?
+    `).run(SUBJECT, SUBJECT, fixture.instance.id);
+
+    const providerInput = {
+      id: "provider-success-1",
+      instanceId: fixture.instance.id,
+      outcome: "success" as const,
+      summary: "GitHub reports the pull request merged.",
+      evidence: ["https://github.com/owner/repo/pull/1"],
+      providerPayload: { merged: true, head_sha: "d".repeat(40) },
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    fixture.tickets.setSetting("github-head:issue-1", SUBJECT);
+    expect(routePipelineProviderEvent({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      ticket: fixture.tickets.getByIssueId("issue-1")!,
+      eventId: "provider-synchronize-published-commit",
+      outcome: "needs_human",
+      summary: "The pull-request head synchronized.",
+      evidence: ["https://github.com/owner/repo/pull/1"],
+      payload: { action: "synchronize" },
+      headSha: SUBJECT,
+      pullRequestUrl: "https://github.com/owner/repo/pull/1",
+    })).toBe(true);
+    expect(fixture.pipelines.getInstance(fixture.instance.id)?.status)
+      .toBe("completion_pending_publication");
+    expect(fixture.pipelines.getInboxEvent("provider-synchronize-published-commit")).toBeUndefined();
+    expect(routePipelineProviderEvent({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      ticket: fixture.tickets.getByIssueId("issue-1")!,
+      eventId: providerInput.id,
+      outcome: providerInput.outcome,
+      summary: providerInput.summary,
+      evidence: providerInput.evidence,
+      payload: providerInput.providerPayload,
+      headSha: SUBJECT,
+      pullRequestUrl: "https://github.com/owner/repo/pull/1",
+    })).toBe(true);
+    const deferred = fixture.pipelines.getInstance(fixture.instance.id)!;
+
+    expect(deferred.status).toBe("completion_pending_publication");
+    expect(fixture.pipelines.getInboxEvent(providerInput.id)?.status).toBe("pending");
+    expect(fixture.db.prepare("SELECT COUNT(*) FROM pipeline_gate_receipts").pluck().get()).toBe(0);
+
+    fixture.db.prepare("UPDATE pipeline_instances SET status = 'waiting_provider' WHERE id = ?")
+      .run(fixture.instance.id);
+    expect(drainDeferredProviderEvidence(fixture.pipelines)).toBe(1);
+    const completed = fixture.pipelines.getInstance(fixture.instance.id)!;
+
+    expect(completed).toMatchObject({
+      status: "completion_pending_publication",
+      terminal_outcome: "shipped",
+    });
+    expect(routePipelineProviderEvent({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      ticket: fixture.tickets.getByIssueId("issue-1")!,
+      eventId: providerInput.id,
+      outcome: providerInput.outcome,
+      summary: providerInput.summary,
+      evidence: providerInput.evidence,
+      payload: providerInput.providerPayload,
+      headSha: SUBJECT,
+      pullRequestUrl: "https://github.com/owner/repo/pull/1",
+    })).toBe(true);
+    expect(fixture.pipelines.getInstance(fixture.instance.id))
+      .toMatchObject({ status: "completion_pending_publication", terminal_outcome: "shipped" });
+    expect(fixture.db.prepare(
+      "SELECT evaluator_kind, result FROM pipeline_gate_receipts WHERE attempt_id = ?"
+    ).get(fixture.attempt.id)).toEqual({ evaluator_kind: "provider", result: "passed" });
+  });
+
+  it("fails closed when GitHub's current head differs from the executor-verified commit", () => {
+    const fixture = setup("ce/implement@1");
+    const observedHead = "d".repeat(40);
+    fixture.db.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET stage_id = 'provider', native_context_policy = 'none', expected_subject = ?
+      WHERE id = ?
+    `).run(SUBJECT, fixture.attempt.id);
+    fixture.db.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'waiting_provider', active_stage_id = 'provider',
+          immutable_subject = ?, published_commit = ?
+      WHERE id = ?
+    `).run(SUBJECT, SUBJECT, fixture.instance.id);
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    fixture.tickets.setSetting("github-head:issue-1", observedHead);
+
+    expect(routePipelineProviderEvent({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      ticket: fixture.tickets.getByIssueId("issue-1")!,
+      eventId: "provider-head-drift-1",
+      outcome: "success",
+      summary: "GitHub reports the pull request merged.",
+      evidence: ["https://github.com/owner/repo/pull/1"],
+      payload: { merged: true },
+      headSha: observedHead,
+      pullRequestUrl: "https://github.com/owner/repo/pull/1",
+    })).toBe(true);
+
+    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+      status: "completion_pending_publication",
+      terminal_outcome: "needs_human",
+    });
+    expect(fixture.db.prepare(
+      "SELECT evaluator_kind, result FROM pipeline_gate_receipts WHERE attempt_id = ?"
+    ).get(fixture.attempt.id)).toEqual({ evaluator_kind: "provider", result: "failed" });
+  });
+
+  it("coalesces feedback arriving during repair and replays a claimed snapshot at provider wait", () => {
+    const fixture = setup("ce/implement@1");
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    fixture.tickets.setSetting("github-head:issue-1", SUBJECT);
+    fixture.db.prepare(`
+      UPDATE pipeline_instances SET status = 'running', published_commit = ? WHERE id = ?
+    `).run(SUBJECT, fixture.instance.id);
+    const route = (id: string) => routePipelineProviderEvent({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      ticket: fixture.tickets.getByIssueId("issue-1")!,
+      eventId: id,
+      outcome: "semantic_repair_required",
+      summary: `Feedback ${id}`,
+      evidence: [`https://github.com/owner/repo/pull/1#${id}`],
+      payload: { kind: "review", id },
+      headSha: SUBJECT,
+      pullRequestUrl: "https://github.com/owner/repo/pull/1",
+    });
+
+    expect(route("review-during-repair-1")).toBe(true);
+    expect(route("ci-during-repair-2")).toBe(true);
+    const snapshot = fixture.db.prepare("SELECT * FROM feedback_snapshots").get() as { id: string; work_item_id: string };
+    expect(fixture.db.prepare("SELECT COUNT(*) FROM provider_events").pluck().get()).toBe(2);
+    const claimed = fixture.tickets.claimFeedbackSnapshot(snapshot.id, Number.MAX_SAFE_INTEGER);
+    expect(claimed).toMatchObject({
+      status: "claimed",
+      snapshot: { repair_round: 1 },
+    });
+    expect(claimed.status === "claimed" && claimed.events.map((event) => event.provider_event_id).sort())
+      .toEqual(["ci-during-repair-2", "review-during-repair-1"]);
+
+    fixture.db.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET stage_id = 'provider', native_context_policy = 'none', expected_subject = ?
+      WHERE id = ?
+    `).run(SUBJECT, fixture.attempt.id);
+    fixture.db.prepare(`
+      UPDATE pipeline_instance_stages SET status = 'passed'
+      WHERE pipeline_instance_id = ? AND stage_id = 'implement'
+    `).run(fixture.instance.id);
+    fixture.db.prepare(`
+      UPDATE pipeline_instance_stages SET status = 'waiting'
+      WHERE pipeline_instance_id = ? AND stage_id = 'provider'
+    `).run(fixture.instance.id);
+    fixture.db.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'waiting_provider', active_stage_id = 'provider', immutable_subject = ?
+      WHERE id = ?
+    `).run(SUBJECT, fixture.instance.id);
+
+    expect(drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(1);
+    expect(fixture.db.prepare("SELECT status FROM feedback_snapshots WHERE id = ?").get(snapshot.id))
+      .toEqual({ status: "consumed" });
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "implement",
+      reentry_ordinal: 1,
+    });
+    expect(drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(0);
   });
 });

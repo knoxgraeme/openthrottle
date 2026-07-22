@@ -56,6 +56,8 @@ describe("pipeline coordinator", () => {
         repositoryConfig: snapshot,
         runtime,
         authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
+        taskContext: "Approved ticket plan",
       },
     });
     const instance = pipelines.getInstanceForSession("session-1")!;
@@ -113,7 +115,9 @@ describe("pipeline coordinator", () => {
       });
       expect(write.instanceId).toBe(instance.id);
       expect(write.outcome).toBe(outcome);
-      expect(write.effects).toHaveLength(1);
+      expect(write.effects).toHaveLength(
+        write.terminalOutcome === "shipped" || write.terminalOutcome === "no_change" ? 2 : 1
+      );
     }
   });
 
@@ -127,12 +131,13 @@ describe("pipeline coordinator", () => {
     expect(pipelines.listEffects(instance.id).map((effect) => effect.kind)).toEqual([
       "provision",
       "publish_linear",
+      "cleanup",
       "publish_github",
     ]);
 
     const replay = coordinatePipelineEvent(pipelines, input);
     expect(replay.state_version).toBe(1);
-    expect(pipelines.listEffects(instance.id)).toHaveLength(3);
+    expect(pipelines.listEffects(instance.id)).toHaveLength(4);
   });
 
   it("rolls back every transition write boundary and recovers one complete intent set", () => {
@@ -149,7 +154,7 @@ describe("pipeline coordinator", () => {
 
     const completed = coordinatePipelineEvent(pipelines, input);
     expect(completed.state_version).toBe(1);
-    expect(pipelines.listEffects(instance.id)).toHaveLength(3);
+    expect(pipelines.listEffects(instance.id)).toHaveLength(4);
   });
 
   it("enforces bounded repair and uses explicit on_exhausted policy", () => {
@@ -205,7 +210,9 @@ describe("pipeline coordinator", () => {
       idempotencyKey: next.idempotency_key,
       agent: "codex",
       contextRevision: 1,
+      taskContext: "Approved ticket plan",
     });
+    expect(request.transitionContext).toContain("semantic_repair_required");
     expect(pipelines.listEffects(instance.id).find((effect) => effect.kind === "dispatch_stage")).toMatchObject({
       kind: "dispatch_stage",
       payload: next.request_payload,

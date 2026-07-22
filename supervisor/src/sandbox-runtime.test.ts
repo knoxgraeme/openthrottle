@@ -50,8 +50,12 @@ describe("sandbox runtime port", () => {
       issueId: "issue-1",
       sessionId: "session-1",
       generation: 1,
+      taskType: "implement",
+      taskContext: "Implement the approved plan.",
+      transitionContext: "",
       repository: "owner/repo",
       baseCommit: "c".repeat(40),
+      baseBranch: "release/2.0",
       branch: "ot/issue-1",
       agent: "codex",
       contextRevision: 0,
@@ -65,6 +69,12 @@ describe("sandbox runtime port", () => {
     };
     expect(createStageRequestHash(request)).toEqual(createStageRequestHash({ ...request }));
     expect(createStageRequestHash({ ...request, generation: 2 }).requestHash)
+      .not.toBe(createStageRequestHash(request).requestHash);
+    expect(createStageRequestHash({ ...request, taskType: "investigate" }).requestHash)
+      .not.toBe(createStageRequestHash(request).requestHash);
+    expect(createStageRequestHash({ ...request, baseBranch: "main" }).requestHash)
+      .not.toBe(createStageRequestHash(request).requestHash);
+    expect(createStageRequestHash({ ...request, taskContext: "Different plan" }).requestHash)
       .not.toBe(createStageRequestHash(request).requestHash);
     expect(JSON.stringify(createStageRequestHash(request))).not.toContain("token");
   });

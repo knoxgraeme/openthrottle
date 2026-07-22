@@ -322,20 +322,20 @@ run_stage_smoke() {
       };
       const manifest = {
         schema: "openthrottle.pipeline/v1",
-        id: "fixture/stage-smoke",
+        id: "ce/stage-smoke",
         version: 1,
         description: "Provider-neutral stage smoke",
-        entry_stage: "review",
+        entry_stage: "planning",
         max_attempts: 1,
-        requires: { protocol: "stage-executor@1", capabilities: ["agent/semantic@1"] },
+        requires: { protocol: "stage-executor@1", capabilities: ["ce/plan@1"] },
         stages: [{
-          id: "review",
-          executor: { kind: "agent", capability: "agent/semantic@1" },
-          evaluator: { kind: "semantic", assurance: "semantic_attested", required_artifacts: ["review"] },
+          id: "planning",
+          executor: { kind: "agent", capability: "ce/plan@1" },
+          evaluator: { kind: "semantic", assurance: "semantic_attested", required_artifacts: ["stage_result"] },
           context: "fresh",
           live_steering: true,
-          credentials: ["model.invoke", "repo.read", "repo.write"],
-          produces: ["review", "stage_result"],
+          credentials: ["model.invoke", "repo.read"],
+          produces: ["stage_result"],
           transitions: {},
         }],
       };
@@ -348,23 +348,27 @@ run_stage_smoke() {
         runtimeRelease: RUNTIME_DESCRIPTOR.release,
         capabilityDigest: digest(canonicalJson(RUNTIME_DESCRIPTOR)),
         repositoryConfigDigest: digest(configRaw),
-        stageId: "review",
+        stageId: "planning",
         attemptId: process.env.STAGE_ATTEMPT,
         runId: process.env.STAGE_RUN,
         issueId: `issue-${process.env.STAGE_AGENT}`,
         sessionId: `session-${process.env.STAGE_AGENT}`,
         generation: 1,
+        taskType: "implement",
+        taskContext: "Exercise the fenced planning stage for the smoke fixture.",
+        transitionContext: "",
         repository: "owner/smoke",
         baseCommit: process.env.STAGE_BASE,
+        baseBranch: "main",
         branch: process.env.STAGE_BRANCH,
         agent: process.env.STAGE_AGENT,
         contextRevision: 0,
         expectedSubject: process.env.STAGE_TREE,
         contextPolicy: "fresh",
         nativeSessionId: null,
-        capability: "agent/semantic@1",
-        requiredArtifacts: ["review", "stage_result"],
-        credentialScopes: ["model.invoke", "repo.read", "repo.write"],
+        capability: "ce/plan@1",
+        requiredArtifacts: ["stage_result"],
+        credentialScopes: ["model.invoke", "repo.read"],
         liveSteering: true,
       };
       mkdirSync("/state/stage-input", { recursive: true, mode: 0o700 });
@@ -412,7 +416,7 @@ run_stage_smoke() {
   local result="$state_dir/stage-results/$attempt_id.json"
   if ! jq -e --arg attempt "$attempt_id" --arg run "$run_id" '
     .kind == "stage_result" and .attempt_id == $attempt and .run_id == $run and
-    .outcome == "success" and (.artifacts | length == 2) and
+    .outcome == "success" and (.artifacts | length == 1) and
     all(.artifacts[]; .assurance == "semantic_attested" and (.payload | fromjson | .result == "success"))
   ' "$result" >/dev/null; then
     echo "invalid normalized stage result for $agent" >&2

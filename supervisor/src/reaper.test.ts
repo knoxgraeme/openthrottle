@@ -6,6 +6,7 @@ import type { TicketStore } from "./db.js";
 import { createTicketStore, openDb } from "./db.js";
 import { createLinearOutboxProcessor } from "./linear-outbox.js";
 import { reapStalledRuns } from "./reaper.js";
+import type { PipelineStore } from "./pipeline-store.js";
 
 let db: Database.Database | undefined;
 afterEach(() => db?.close());
@@ -202,6 +203,48 @@ describe("reapStalledRuns", () => {
       expiresAt: "2999-01-01T00:00:00.000Z",
     })).toBe(false);
     expect(store.listLinearOutbox()).toHaveLength(1);
+
+    expect(store.settleQuarantinedRun({
+      runId: "run-wedged",
+      status: "stopped",
+      ticketState: "stopped",
+      failureTail: "termination later confirmed",
+    })).toMatchObject({ status: "stopped" });
+    expect(store.getByIssueId("wedged")).toMatchObject({ state: "stopped", run_id: null });
+  });
+
+  it("quarantines a pipeline resource without advancing to a retry before actor termination", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    const { daytona } = makeDaytona(new Error("provider timeout"));
+    const linearOutbox = makeOutbox(store);
+    addTicket(store, "pipeline-wedged", "sandbox-1");
+    store.beginRun({
+      issueId: "pipeline-wedged",
+      runId: "run-pipeline-wedged",
+      taskType: "implement",
+      tokenHash: "hash",
+      expiresAt: "2999-01-01T00:00:00.000Z",
+    });
+    db.prepare("UPDATE runs SET started_at = ? WHERE id = ?").run(
+      "2020-01-01T00:00:00.000Z",
+      "run-pipeline-wedged"
+    );
+    const setRuntimeResourceStatus = vi.fn();
+    const getActiveAttempt = vi.fn();
+    const pipelines = {
+      getAttemptForRun: vi.fn(() => ({ pipeline_instance_id: "pipeline-1" })),
+      getInstance: vi.fn(() => ({ id: "pipeline-1" })),
+      getRuntimeResource: vi.fn(() => ({ provider_resource_id: "sandbox-1" })),
+      setRuntimeResourceStatus,
+      getActiveAttempt,
+    } as unknown as PipelineStore;
+
+    await reapStalledRuns({ daytona, store, linearOutbox, cfg, pipelines });
+
+    expect(setRuntimeResourceStatus).toHaveBeenCalledWith("pipeline-1", "quarantined");
+    expect(getActiveAttempt).not.toHaveBeenCalled();
+    expect(store.getRun("run-pipeline-wedged")?.status).toBe("quarantined");
   });
 
   it("allows only the settlement owner to finish a reaping run", () => {

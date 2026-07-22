@@ -507,6 +507,40 @@ publication-contract:github summary is a single mutable projection per pipeline 
 base-schema-or-migration ensures every Linear outbox receipt column exists
 terminal and human-wait states advance only after their Linear receipt acknowledgement`;
 
+const pipelineRuntimeResourceSchema = `
+CREATE TABLE pipeline_runtime_resources (
+  pipeline_instance_id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  provider_resource_id TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL CHECK(status IN ('active', 'stopped', 'quarantined', 'cleaned')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT
+);
+CREATE INDEX pipeline_runtime_resources_status_idx
+  ON pipeline_runtime_resources(status, updated_at);
+`;
+
+const pipelineRuntimeResourceMigrationSource = `${pipelineRuntimeResourceSchema}
+runtime-resource-contract:one opaque provider resource per pinned pipeline instance/v1
+activation, legacy cleanup, and schema contraction remain separate releases`;
+
+const pipelineIntentSchema = `
+ALTER TABLE pipeline_instances ADD COLUMN task_type TEXT NOT NULL DEFAULT 'implement'
+  CHECK(task_type IN ('implement', 'investigate'));
+ALTER TABLE pipeline_instances ADD COLUMN base_branch TEXT NOT NULL DEFAULT 'main';
+ALTER TABLE pipeline_instances ADD COLUMN published_commit TEXT;
+UPDATE pipeline_instances SET task_type = 'investigate'
+  WHERE pipeline_id = 'ce/investigate';
+`;
+
+const pipelineIntentMigrationSource = `${pipelineIntentSchema}
+pipeline-intent-contract:execution intent is pinned independently of manifest identity/v1
+existing ce/investigate rows retain their historical investigate classification
+base-branch-contract:review and publication receive the immutable selected branch rather than a commit-shaped substitute/v1
+backfill-contract:existing pipeline instances inherit the selected branch from their bound ticket when available
+provider-revision-contract:executor-verified published commit is pinned separately from the gated tree/v1`;
+
 function backfillPipelinePublicationState(db: Database.Database): void {
   if (!hasTable(db, "pipeline_publication_receipts")) return;
   const timestamp = new Date().toISOString();
@@ -867,6 +901,31 @@ const definitions: DatabaseMigrationDefinition[] = [
       }
       db.exec(pipelinePublicationStateSchema);
       backfillPipelinePublicationState(db);
+    },
+  },
+  {
+    version: 7,
+    name: "pipeline-runtime-resources",
+    source: pipelineRuntimeResourceMigrationSource,
+    up(db) {
+      db.exec(pipelineRuntimeResourceSchema);
+    },
+  },
+  {
+    version: 8,
+    name: "pipeline-execution-intent-and-provider-revision",
+    source: pipelineIntentMigrationSource,
+    up(db) {
+      db.exec(pipelineIntentSchema);
+      if (hasTable(db, "tickets")) {
+        db.exec(`
+          UPDATE pipeline_instances
+          SET base_branch = COALESCE((
+            SELECT tickets.base_branch FROM tickets
+            WHERE tickets.linear_issue_id = pipeline_instances.linear_issue_id
+          ), base_branch)
+        `);
+      }
     },
   },
 ];

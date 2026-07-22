@@ -915,9 +915,6 @@ describe("createServer lifecycle", () => {
         executeSessionCommand: vi.fn(async () => undefined),
       },
     };
-    const linearFetch = vi.fn(async () => Response.json({
-      data: { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
-    })) as unknown as typeof fetch;
     const background: Array<Promise<void>> = [];
     const app = createServer({
       cfg,
@@ -927,7 +924,12 @@ describe("createServer lifecycle", () => {
         list: vi.fn(() => (async function* () {})()),
         create: vi.fn(async () => sandbox),
       } as unknown as Daytona,
-      getLinearClient: async () => ({ accessToken: "oauth", fetch: linearFetch }),
+      getLinearClient: async () => ({
+        accessToken: "oauth",
+        fetch: vi.fn(async () => Response.json({
+          data: { agentActivityCreate: { success: true, agentActivity: { id: "activity" } } },
+        })) as unknown as typeof fetch,
+      }),
       runBackground: (task) => background.push(task),
     });
     const created = JSON.stringify({
@@ -1965,6 +1967,166 @@ describe("createServer lifecycle", () => {
     expect(store.getByIssueId("issue-ci")?.run_id).toEqual(expect.any(String));
   });
 
+  it("closes a terminal pipeline ticket and reconciles its runtime binding when the PR closes", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-pipeline-close",
+      linear_issue_identifier: "OT-PIPELINE-CLOSE",
+      linear_session_id: "session-pipeline-close",
+      sandbox_id: "sandbox-pipeline-close",
+      branch: "ot/pipeline-close",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: "https://github.com/owner/repo/pull/90",
+      state: "active",
+    });
+    const instance = { id: "pipeline-close-1", status: "shipped", immutable_subject: "a".repeat(40) };
+    const setRuntimeResourceStatus = vi.fn();
+    const pipelineStore = {
+      getInstanceForSession: vi.fn(() => instance),
+      getRuntimeResource: vi.fn(() => ({ provider_resource_id: "sandbox-pipeline-close" })),
+      setRuntimeResourceStatus,
+    } as unknown as PipelineStore;
+    const sandbox = { delete: vi.fn(async () => undefined) };
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg,
+      store,
+      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      getLinearClient: async () => undefined,
+      runBackground: (task) => background.push(task),
+      pipelineAdmission: { catalog: {} as never, runtime: {} as never, store: pipelineStore },
+    });
+    const closed = JSON.stringify({
+      action: "closed",
+      repository: { full_name: "owner/repo" },
+      pull_request: {
+        number: 90,
+        html_url: "https://github.com/owner/repo/pull/90",
+        merged: true,
+        head: { ref: "ot/pipeline-close", sha: "a".repeat(40) },
+        base: { ref: "main" },
+      },
+    });
+
+    const staleClosed = JSON.stringify({
+      ...JSON.parse(closed),
+      pull_request: {
+        ...JSON.parse(closed).pull_request,
+        number: 89,
+        html_url: "https://github.com/owner/repo/pull/89",
+        head: { ref: "ot/pipeline-close", sha: "b".repeat(40) },
+      },
+    });
+    await app.request("/webhooks/github", {
+      method: "POST",
+      headers: signedGithub(staleClosed, "github-pipeline-close-stale", "pull_request"),
+      body: staleClosed,
+    });
+    await Promise.all(background.splice(0));
+    expect(sandbox.delete).not.toHaveBeenCalled();
+    expect(store.getByIssueId("issue-pipeline-close")?.state).toBe("active");
+
+    await app.request("/webhooks/github", {
+      method: "POST",
+      headers: signedGithub(closed, "github-pipeline-close", "pull_request"),
+      body: closed,
+    });
+    await Promise.all(background.splice(0));
+
+    expect(sandbox.delete).toHaveBeenCalledOnce();
+    expect(store.getByIssueId("issue-pipeline-close")).toMatchObject({ state: "closed", sandbox_id: null });
+    expect(setRuntimeResourceStatus).toHaveBeenCalledWith("pipeline-close-1", "cleaned");
+  });
+
+  it("keeps a pipeline provider wait open after one green workflow or a stale-head failure", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-pipeline-ci",
+      linear_issue_identifier: "OT-PIPELINE-CI",
+      linear_session_id: "session-pipeline-ci",
+      sandbox_id: "sandbox-pipeline-ci",
+      branch: "ot/pipeline-ci",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: "https://github.com/owner/repo/pull/91",
+      state: "active",
+    });
+    const getInstanceForSession = vi.fn(() => ({
+      id: "pipeline-ci-1",
+      status: "waiting_provider",
+      immutable_subject: "sha-current",
+      active_stage_id: "provider",
+      normalized_manifest: JSON.stringify({
+        stages: [{ id: "provider", executor: { kind: "provider_wait" } }],
+      }),
+    }));
+    const pipelineStore = { getInstanceForSession } as unknown as PipelineStore;
+    store.setSetting("github-head:issue-pipeline-ci", "sha-current");
+    store.setSetting("github-head-source:issue-pipeline-ci", "authoritative");
+    const background: Array<Promise<void>> = [];
+    const app = createServer({
+      cfg,
+      store,
+      daytona: {} as Daytona,
+      getLinearClient: async () => undefined,
+      runBackground: (task) => background.push(task),
+      pipelineAdmission: { catalog: {} as never, runtime: {} as never, store: pipelineStore },
+    });
+    const successfulRun = JSON.stringify({
+      action: "completed",
+      repository: { full_name: "owner/repo" },
+      workflow_run: {
+        id: 91,
+        name: "unit",
+        status: "completed",
+        conclusion: "success",
+        head_branch: "ot/pipeline-ci",
+        head_sha: "sha-pipeline-ci",
+        html_url: "https://github.com/owner/repo/actions/runs/91",
+      },
+    });
+
+    await app.request("/webhooks/github", {
+      method: "POST",
+      headers: signedGithub(successfulRun, "github-pipeline-ci-success", "workflow_run"),
+      body: successfulRun,
+    });
+    await Promise.all(background.splice(0));
+
+    expect(getInstanceForSession).toHaveBeenCalledWith("session-pipeline-ci");
+    expect(db!.prepare(
+      "SELECT status FROM webhook_deliveries WHERE source = 'github' AND delivery_id = ?"
+    ).get("github-pipeline-ci-success")).toEqual({ status: "processed" });
+    expect(db!.prepare("SELECT COUNT(*) AS count FROM session_work").get()).toEqual({ count: 0 });
+
+    const staleFailure = JSON.stringify({
+      action: "completed",
+      repository: { full_name: "owner/repo" },
+      workflow_run: {
+        id: 92,
+        name: "unit",
+        status: "completed",
+        conclusion: "failure",
+        head_branch: "ot/pipeline-ci",
+        head_sha: "sha-stale",
+        html_url: "https://github.com/owner/repo/actions/runs/92",
+      },
+    });
+    await app.request("/webhooks/github", {
+      method: "POST",
+      headers: signedGithub(staleFailure, "github-pipeline-ci-stale", "workflow_run"),
+      body: staleFailure,
+    });
+    await Promise.all(background.splice(0));
+    expect(db!.prepare(
+      "SELECT status FROM webhook_deliveries WHERE source = 'github' AND delivery_id = ?"
+    ).get("github-pipeline-ci-stale")).toEqual({ status: "processed" });
+    expect(db!.prepare("SELECT COUNT(*) AS count FROM session_work").get()).toEqual({ count: 0 });
+  });
+
   it("queues a failed CI run while a run is active without launching until it completes", async () => {
     db = openDb(":memory:");
     const store = createTicketStore(db);
@@ -2305,6 +2467,7 @@ describe("createServer lifecycle", () => {
       instance_id: "pipeline-status-1",
       pipeline_id: "ce/implement",
       pipeline_version: 1,
+      task_type: "implement" as const,
       status: "publication_blocked" as const,
       stage_id: "review",
       attempt_ordinal: 3,
@@ -2312,6 +2475,7 @@ describe("createServer lifecycle", () => {
       reentry_count: 2,
       wait_reason: "permanent publication failure",
       subject: "a".repeat(40),
+      published_commit: "c".repeat(40),
       gate_result: "passed",
       assurance: "semantic_attested",
       policy_digest: "b".repeat(64),
@@ -2370,7 +2534,8 @@ describe("createServer lifecycle", () => {
 
     const logsResponse = await app.request("/tickets/OT-PIPELINE/logs", { headers: authorization });
     const logs = await logsResponse.text();
-    expect(logs).toContain("[pipeline] ce/implement@1 state=publication_blocked");
+    expect(logs).toContain("[pipeline] ce/implement@1 task=implement state=publication_blocked");
+    expect(logs).toContain(`provider=${"c".repeat(40)}`);
     expect(logs).toContain("publication=blocked");
     expect(logs).toContain("sandbox tail");
 

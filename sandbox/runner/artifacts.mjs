@@ -203,7 +203,13 @@ function sealArtifact(payload) {
   };
 }
 
-export function buildSemanticArtifacts({ proposal, fence, requiredArtifacts, env = process.env }) {
+export function buildSemanticArtifacts({
+  proposal,
+  fence,
+  requiredArtifacts,
+  publishedCommit,
+  env = process.env,
+}) {
   const normalized = validateSemanticProposal(proposal, env);
   const assurance = assuranceForCapability(fence.capability);
   const kinds = [...new Set(["stage_result", ...requiredArtifacts])];
@@ -217,7 +223,10 @@ export function buildSemanticArtifacts({ proposal, fence, requiredArtifacts, env
     findings: normalized.findings,
     actions: normalized.actions,
     uncertainty: normalized.uncertainty,
-    details: { proposal_schema: normalized.schema },
+    details: {
+      proposal_schema: normalized.schema,
+      ...(publishedCommit ? { published_commit: publishedCommit } : {}),
+    },
   })));
 }
 

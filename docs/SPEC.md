@@ -37,10 +37,9 @@ component doc and that plan disagree.
   agent session/thread with a follow-up message. Resume is a context policy, not
   a pipeline or a task type.
 
-The supervisor is gaining a **deterministic pipeline coordinator** (introduced
-by the Configurable Agentic Pipeline Coordinator plan; not all of its state and
-evaluators are wired up yet): it validates evidence and advances typed state
-transitions, but performs no semantic reasoning. This is distinct from the
+The supervisor owns a **deterministic pipeline coordinator**: it validates
+evidence and advances typed state transitions, but performs no semantic
+reasoning. This is distinct from the
 legacy `## OpenThrottle gates` PR checklist, which is agent-authored progress
 prose — not a pipeline Gate. All agent reasoning stays inside explicitly
 requested sandbox stages.
@@ -75,9 +74,10 @@ Linear AgentSessionEvent ──HMAC──> Fly supervisor ──@daytona/sdk─�
    bounded exponential retries; duplicate deliveries reuse the stored row.
 3. It durably enqueues an ephemeral `thought`, resolves the Linear team through
    durable repository registrations (then legacy env fallbacks), resolves agent
-   labels, persists `promptContext`, inserts the ticket and current
-   `agent_sessions` generation, and atomically claims a run bound to that
-   session. A `branch` label overrides the route's base branch for that one
+   labels, persists `promptContext`, and inserts the ticket and current
+   `agent_sessions` generation. The legacy path atomically claims a run bound
+   to that session; the pipeline path atomically pins its execution generation
+   and first external effect instead. A `branch` label overrides the route's base branch for that one
    ticket. It resolves from either a Linear label **group** named `branch` whose
    child is the branch name (the recommended, tidy form — the webhook carries
    only the child's leaf name, so grouped labels are resolved with their parent
@@ -89,7 +89,7 @@ Linear AgentSessionEvent ──HMAC──> Fly supervisor ──@daytona/sdk─�
    inside the sandbox; a failed group lookup degrades to the flat-label behavior.
    The `ot/<identifier>` working branch is always cut from the resolved base, and
    the PR is opened against it.
-4. It creates a private Daytona sandbox from `DAYTONA_SNAPSHOT`, labeled
+4. In legacy mode it creates a private Daytona sandbox from `DAYTONA_SNAPSHOT`, labeled
    `openthrottle=true` and `ticket=<identifier>`. The image entrypoint is an
    inert no-op; Fly uploads the latest Linear context and run credentials,
    then explicitly starts the requested task in a Daytona process session.
@@ -100,9 +100,63 @@ supervisor first resolves the base branch to an exact commit, fetches and
 validates `.openthrottle.yml` at that commit, pins catalog/config/runtime
 digests, and atomically creates the pipeline instance, stage graph, first
 attempt, and provision intent. Existing generations retain their pinned
-`legacy` or `pipeline` mode across restart and flag changes. During the dormant
-U5 release, no dispatcher consumes that provision intent; admission therefore
-stays off until the stage-executor release is deployed.
+`legacy` or `pipeline` mode across restart and flag changes. A durable effect
+worker provisions and bootstraps the runtime, materializes only the stage's
+declared credential scopes, acquires the ticket actor, and dispatches the
+sealed stage request. The global admission flag and optional repository cohort
+affect future generations only; disabling the flag never converts an active
+pipeline generation to legacy.
+
+### Pipeline stage lifecycle
+
+The accepted catalog and independently built runtime descriptor must agree on
+protocol and capabilities at supervisor boot. Aliases select immutable
+manifest versions only for new generations. The CE v2 manifests split
+implement into planning, implementation, semantic review, conditional
+simplification, configured test/lint/build commands, exact-tree publication,
+and a provider wait; investigate has a typed investigation and conditional
+publication. Fixture command and agent manifests traverse the same coordinator
+without CE-specific branches.
+
+Each dispatched stage receives an immutable request envelope fenced by
+instance, generation, task intent, stage, attempt, run, base commit and selected base branch,
+manifest/config/capability digests,
+task/transition context, context policy, credential scopes, and request hash. The sandbox independently
+checks those values, writes hashed typed artifacts, and exposes the sealed
+result through the sandbox event spool. The supervisor checks the observed Git
+subject, required artifact set, assurance level, native-session policy, and
+active attempt before committing a gate receipt and the next effect in one
+transaction. Retries and repairs create new attempts and are bounded by the
+manifest; provider feedback can re-enter only the configured repair edge.
+Actionable reviews, comments, and red checks retain stable provider identities
+in the shared feedback ledger. Events on one current head join an immutable
+snapshot; arrivals after that snapshot is claimed collect for the next repair,
+and a snapshot whose head has since changed is marked stale instead of reopening
+the current revision. Pipeline snapshots advance the manifest edge directly and
+never create legacy `session_work`.
+The publish executor additionally proves that the remote branch head is the
+local commit whose tree equals the gated subject, seals that commit separately,
+and the supervisor pins it as the provider revision.
+`fresh_review` always starts a separate native review context and invalidates
+otherwise-successful evidence if that read-only stage changes the tracked tree.
+An effect is acknowledged only after its provider action confirms success;
+unconfirmed stop results remain retryable with their actor/resource ownership
+intact. Successful and no-change terminal transitions enqueue idempotent runtime
+cleanup; a delayed cleanup is fenced to its originating session before it can
+clear the ticket's current sandbox binding.
+
+A single green GitHub workflow is observational evidence, not terminal proof.
+A failed or timed-out current-head check can trigger bounded repair; a merged
+PR is the authoritative provider-success boundary for implement only when its
+head equals the pinned executor-verified published commit. A later
+`synchronize` to another head, or any merge/review evidence for another head,
+fails closed to a human-required outcome rather than claiming the gated tree shipped. Linear and
+GitHub publications use stable external IDs and durable receipts. Technical
+terminal state remains completion-pending while a required publication is
+retryable or permanently blocked.
+Provider evidence that arrives during that publication-acknowledgement window
+is durably deferred against the provider attempt and drained only after the
+instance reaches `waiting_provider`.
 
 ### Follow-up
 
@@ -190,8 +244,14 @@ that ticket, bounding durable log storage to the latest captured run.
 
 ### GitHub/review lifecycle
 
+- Pipeline generations route review comments, requested changes, current-head
+  CI failures, PR synchronization, PR close, and merge through provider evidence and configured
+  graph edges. They never enqueue the legacy automatic-resume choreography.
 - Closing or merging an `ot/*` PR stops an active run, deletes its sandbox,
-  and closes the ticket row.
+  and closes the ticket row. If a pipeline repair is active instead of waiting
+  on the provider, the close is retained in the provider ledger and also
+  creates a durable cancellation whose retries preserve `closed` as the
+  ticket's final state.
 - All GitHub feedback on an active, PR-backed ticket is retained under a stable
   provider identity. Events for the same ticket generation and PR head join one
   collecting snapshot. Recording the first event atomically creates the
@@ -293,7 +353,7 @@ sandbox-event poll interval.
 | `POST` | `/webhooks/github` | GitHub `sha256=` HMAC | PR/review/CI events |
 | `GET` | `/oauth/install` | `OT_INSTALL_SECRET` bearer | start Linear OAuth |
 | `GET` | `/oauth/callback` | one-time OAuth state | exchange/store token |
-| `GET` | `/status` | `OT_STATUS_TOKEN` bearer | ticket list |
+| `GET` | `/status` | `OT_STATUS_TOKEN` bearer | admission policy, execution summary, legacy-drain predicate, and ticket list |
 | `GET` | `/repositories` | `OT_STATUS_TOKEN` bearer | registered target list |
 | `POST` | `/repositories/register` | `OT_STATUS_TOKEN` bearer | verify and upsert a target route/webhook |
 | `POST` | `/tickets/:id/stop` | `OT_STATUS_TOKEN` bearer | stop a ticket |
@@ -358,11 +418,14 @@ evidence; manifests cannot add to that inventory.
 `repository_config_snapshots`, `session_executions`, `pipeline_instances`,
 `pipeline_instance_stages`, and `pipeline_stage_attempts` pin a generation's
 exact manifest, base commit, repository blob/config, runtime protocol and
-capabilities, state version, stage/attempt ordinals, wait reason, and bounded
+capabilities, execution task intent, gated tree, executor-verified published
+commit, state version, stage/attempt ordinals, wait reason, and bounded
 re-entry counters. `pipeline_inbox_events` and `pipeline_effect_intents` are the
 typed transactional boundary: a reducer compare-and-set and its idempotent
 external intents commit together, and dispatch leases can be reclaimed without
-creating a second semantic intent. Artifact, gate, publication, run, and work
+creating a second semantic intent. `pipeline_runtime_resources` durably binds
+opaque provider resource IDs and lifecycle state to their instance. Artifact,
+gate, publication, run, and work
 binding tables use restricted foreign keys so audit-bearing parents cannot be
 silently deleted. Existing generations are backfilled as `legacy`; a pipeline
 generation and its instance are pinned in the same transaction.
@@ -451,6 +514,8 @@ Required unless noted:
   liveness origin. Termination must be confirmed before release, otherwise the
   actor is quarantined, independent of the hard `TASK_TIMEOUT` wall clock.
 - Pipeline admission: `PIPELINE_COORDINATOR_ENABLED=false`, optional
+  comma-separated `PIPELINE_COORDINATOR_REPOSITORIES` canary cohort (an empty
+  cohort means all routed repositories only when the flag is true), optional
   `PIPELINE_CATALOG_PATH` (defaults to the catalog shipped in the supervisor
   image), `SANDBOX_RUNTIME_RELEASE=openthrottle-snapshot/v1`, and optional
   `SANDBOX_RUNTIME_DESCRIPTOR_PATH` (the independently generated descriptor
@@ -466,7 +531,7 @@ Fly keeps one machine running, mounts `/data`, and health-checks `/healthz`.
 
 ### Environment
 
-The supervisor passes `TASK_TYPE`, `AGENT`, `GITHUB_REPO`, `GITHUB_TOKEN`,
+For legacy execution the supervisor passes `TASK_TYPE`, `AGENT`, `GITHUB_REPO`, `GITHUB_TOKEN`,
 `BASE_BRANCH`, `BRANCH_NAME`, non-secret Linear issue identifiers, `RUN_ID`,
 `RUN_CALLBACK_TOKEN`, optional `RESUME_MESSAGE`, optional
 `OT_GIT_AUTHOR_NAME`/`OT_GIT_AUTHOR_EMAIL`, model auth, and limit values
@@ -474,6 +539,11 @@ The supervisor passes `TASK_TYPE`, `AGENT`, `GITHUB_REPO`, `GITHUB_TOKEN`,
 `REVIEW_ROUND` — feedback arrives as a `resume` and the agent re-derives PR
 state itself (e.g. `gh pr view`). Daytona/Fly keys and webhook/install/operator
 secrets never enter the sandbox.
+
+For pipeline execution it instead seals `OT_STAGE_REQUEST_FILE` and the exact
+manifest/config digests, provisions a deterministic process-session identity,
+and materializes only the declared model/repository/provider scopes. Daytona,
+Fly, Linear, webhook, install, and operator credentials remain unavailable.
 
 ### Entrypoint phases
 
@@ -487,7 +557,9 @@ secrets never enter the sandbox.
 5. Run `post_bootstrap` commands.
 6. Start/restart the optional dev server on `0.0.0.0`.
 7. Install OpenThrottle runtime adapters/instructions per agent, then run the
-   selected task through the JSONL normalizer under `timeout`. Claude gets a
+   selected legacy task or one fenced stage through the JSONL normalizer under
+   `timeout`. A fenced stage invokes exactly its advertised capability and
+   emits the typed artifacts required by its evaluator. Claude gets a
    fresh copy of the canonical `skills/tasks/*` directories under the sandbox
    user's `~/.claude/skills` (user scope) every run and is invoked with
    `-p "/<skill-name>"`; its user-scope `~/.claude/settings.json` also
@@ -519,7 +591,7 @@ global runtime instructions in `~/.codex/AGENTS.md`. Claude receives a strict
 temporary config containing only project-declared MCP servers with user-only
 setting sources. Project `AGENTS.md` and `.claude/settings.json` files remain
 untouched and editable.
-The adapters compose native CE as follows: `implement` uses `ce-work`, local
+For legacy generations, the adapters compose native CE as follows: `implement` uses `ce-work`, local
 `ce-code-review`, a conditional `ce-simplify-code` pass (invoked only when the
 branch diff is large or structurally complex; behavior-preserving, with skips
 recorded in the assumptions ledger), and `ce-commit-push-pr`; `investigate` uses action-capable
@@ -529,13 +601,19 @@ instead. Neither loop babysits its own PR (`ce-babysit-pr` and the internal
 `review`/`review-fix` tasks are removed); once a PR exists, external
 GitHub-native reviewers own review, and their feedback arrives back at the
 same session as a `resume`, never a separate task or fresh context. Fly
-remains responsible for run serialization and event publication.
+remains responsible for run serialization and event publication. For pipeline
+generations, the same canonical adapters route each advertised capability to
+the corresponding CE operation; command gates and provider waits stay outside
+the agent boundary.
 
-The supervisor treats a loop purely as an interface — an entry task name, its
-sandbox env contract, the `ot-activity` outbox events it may emit, and its
-completion marker — never the loop's internal skill/CE composition; adding a
-loop means registering a task name against a skill and CE pipeline
-declaration, with no handler changes. Registered repositories are
+The supervisor treats a pipeline as an accepted manifest plus independently
+advertised runtime capabilities, never as hard-coded skill composition. Adding
+a pipeline or fixture means adding catalog data that validates against that
+inventory, with no coordinator handler changes. A single
+`skills/task-adapters-v1.json` registry remains only for legacy-generation
+task-to-adapter compatibility until the cross-domain drain predicate has held;
+the former scheduler `LOOP_REGISTRY` and shell mapping functions are removed.
+Registered repositories are
 code-execution-trusted (`post_bootstrap` runs arbitrary repository-configured
 commands before the agent starts, and Codex's repo-scope `.agents/skills`
 discovery stays enabled beside the admin-scope bake, since a checked-in skill

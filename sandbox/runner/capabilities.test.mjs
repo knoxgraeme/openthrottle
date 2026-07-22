@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 import {
   RUNTIME_DESCRIPTOR,
   authorizeCapability,
@@ -12,6 +13,11 @@ describe("installed stage capabilities", () => {
     expect(RUNTIME_DESCRIPTOR.capabilities).toEqual([...RUNTIME_DESCRIPTOR.capabilities].sort());
     expect(canonicalJson(RUNTIME_DESCRIPTOR)).not.toContain("ce-implement-v1.yaml");
     expect(capabilityContract("command/run@1").kind).toBe("command");
+    const supervisorDescriptor = JSON.parse(readFileSync(
+      new URL("../../supervisor/pipelines/runtime-capabilities-v1.json", import.meta.url),
+      "utf8"
+    ));
+    expect(canonicalJson(supervisorDescriptor)).toBe(canonicalJson(RUNTIME_DESCRIPTOR));
   });
 
   it("enforces minimum and maximum logical credential scopes", () => {
@@ -33,6 +39,18 @@ describe("installed stage capabilities", () => {
       credentialScopes: ["repo.read"],
       requiredArtifacts: ["stage_result", "command_result"],
     }).kind).toBe("command");
+    expect(authorizeCapability({
+      capability: "ce/investigate@1",
+      contextPolicy: "prefer_resume",
+      credentialScopes: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+      requiredArtifacts: ["stage_result", "review"],
+    }).kind).toBe("agent");
+    expect(authorizeCapability({
+      capability: "ce/plan@1",
+      contextPolicy: "fresh_review",
+      credentialScopes: ["model.invoke", "repo.read"],
+      requiredArtifacts: ["stage_result"],
+    }).kind).toBe("agent");
   });
 
   it("rejects unknown capabilities, contexts, and artifacts", () => {

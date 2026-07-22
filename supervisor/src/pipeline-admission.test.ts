@@ -54,7 +54,7 @@ function config(): Config {
   };
 }
 
-function payload() {
+function payload(sessionId = "session-1") {
   return parseLinearWebhook(JSON.stringify({
     action: "created",
     type: "AgentSessionEvent",
@@ -62,7 +62,7 @@ function payload() {
     webhookTimestamp: Date.now(),
     organizationId: "org",
     agentSession: {
-      id: "session-1",
+      id: sessionId,
       issue: {
         id: "issue-1",
         identifier: "OT-1",
@@ -80,7 +80,7 @@ describe("pipeline admission", () => {
     db?.close();
   });
 
-  async function run(repositoryConfig: string) {
+  async function run(repositoryConfig: string, overrides: Partial<Config> = {}) {
     db = openDb(":memory:");
     const tickets = createTicketStore(db);
     const pipelines = createPipelineStore(db);
@@ -88,6 +88,7 @@ describe("pipeline admission", () => {
     const catalog = loadPipelineCatalog(catalogPath, runtime.descriptor);
     pipelines.acceptRuntimeDescriptor(runtime);
     pipelines.acceptCatalog(catalog);
+    let currentRepositoryConfig = repositoryConfig;
     const githubFetch = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
       if (url.endsWith("/repos/owner/repo/commits/main")) {
@@ -98,8 +99,8 @@ describe("pipeline admission", () => {
           type: "file",
           sha: "b".repeat(40),
           encoding: "base64",
-          content: Buffer.from(repositoryConfig).toString("base64"),
-          size: Buffer.byteLength(repositoryConfig),
+          content: Buffer.from(currentRepositoryConfig).toString("base64"),
+          size: Buffer.byteLength(currentRepositoryConfig),
         });
       }
       throw new Error(`unexpected GitHub request: ${url}`);
@@ -115,17 +116,35 @@ describe("pipeline admission", () => {
       process: vi.fn(async () => undefined),
       drain: vi.fn(async () => undefined),
     };
-    const invoke = async (overrides: Partial<Config> = {}) => handleLinearEvent(
+    const sandbox = {
+      stop: vi.fn(async () => undefined),
+      delete: vi.fn(async () => undefined),
+    };
+    const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
+    const invoke = async (
+      overrides: Partial<Config> = {},
+      event = payload()
+    ) => handleLinearEvent(
       { ...config(), ...overrides },
       tickets,
-      {} as Daytona,
+      daytona,
       async () => linear,
       outbox,
-      payload(),
+      event,
       { catalog, runtime, store: pipelines }
     );
-    await invoke();
-    return { tickets, pipelines, githubFetch, invoke };
+    await invoke(overrides);
+    return {
+      tickets,
+      pipelines,
+      githubFetch,
+      invoke,
+      daytona,
+      sandbox,
+      setRepositoryConfig(value: string) {
+        currentRepositoryConfig = value;
+      },
+    };
   }
 
   it("pins a new generation and creates no legacy run or sandbox", async () => {
@@ -140,8 +159,11 @@ mcp_servers: {}
     expect(ticket.sandbox_id).toBeNull();
     expect(ticket.run_id).toBeNull();
     expect(instance.pipeline_id).toBe("ce/implement");
+    expect(instance.task_type).toBe("implement");
     expect(instance.base_commit).toBe("a".repeat(40));
-    expect(pipelines.getActiveAttempt(instance.id)?.stage_id).toBe("implement");
+    expect(instance.base_branch).toBe("main");
+    expect(pipelines.getStageRequest(pipelines.getActiveAttempt(instance.id)!.id).baseBranch).toBe("main");
+    expect(pipelines.getActiveAttempt(instance.id)?.stage_id).toBe("planning");
     expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
     expect(githubFetch).toHaveBeenCalledTimes(2);
   });
@@ -155,8 +177,26 @@ mcp_servers: {}
     });
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_stage_attempts").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM session_executions").pluck().get()).toBe(0);
     const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
     expect(payloads.some((entry) => entry.includes("unknown pipeline selection"))).toBe(true);
+  });
+
+  it("admits a command-only fixture without requiring a model subscription", async () => {
+    const { tickets, pipelines } = await run(
+      "pipelines: { implement: fixture-command }\n",
+      { codexAuthJson: undefined, claudeCodeOauthToken: undefined, kimiCodeApiKey: undefined }
+    );
+
+    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+      state: "active",
+      sandbox_id: null,
+      run_id: null,
+    });
+    expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
+      pipeline_id: "fixture/command",
+      pipeline_version: 2,
+    });
   });
 
   it("keeps an existing session pinned when the admission flag changes", async () => {
@@ -169,5 +209,104 @@ mcp_servers: {}
     expect(pipelines.getInstanceForSession("session-1")).toEqual(before);
     expect(githubFetch).toHaveBeenCalledTimes(2);
     expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
+  });
+
+  it("routes a prompted stop through the pinned pipeline without starting legacy work", async () => {
+    const { tickets, pipelines, invoke } = await run("pipelines: { implement: implement }\n");
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const prompted = parseLinearWebhook(JSON.stringify({
+      action: "prompted",
+      type: "AgentSessionEvent",
+      webhookId: "pipeline-stop",
+      webhookTimestamp: Date.now(),
+      organizationId: "org",
+      agentSession: { id: "session-1" },
+      agentActivity: { id: "activity-stop", content: { type: "prompt", body: "/stop" } },
+    }));
+
+    await invoke({}, prompted);
+
+    expect(pipelines.getInstance(instance.id)).toMatchObject({
+      status: "completion_pending_publication",
+      terminal_outcome: "canceled",
+    });
+    expect(pipelines.listEffects(instance.id)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "provision", status: "dead" }),
+      expect.objectContaining({ kind: "stop", status: "pending" }),
+    ]));
+    expect(db!.prepare("SELECT COUNT(*) FROM session_work").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM session_inbox").pluck().get()).toBe(0);
+    expect(tickets.getByIssueId("issue-1")?.run_id).toBeNull();
+  });
+
+  it("rejects an idle pipeline reply instead of falling back to a legacy resume", async () => {
+    const { pipelines, invoke } = await run("pipelines: { implement: implement }\n");
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const prompted = parseLinearWebhook(JSON.stringify({
+      action: "prompted",
+      type: "AgentSessionEvent",
+      webhookId: "pipeline-reply",
+      webhookTimestamp: Date.now(),
+      organizationId: "org",
+      agentSession: { id: "session-1" },
+      agentActivity: { id: "activity-reply", content: { type: "prompt", body: "keep going" } },
+    }));
+
+    await invoke({}, prompted);
+
+    expect(pipelines.getInstance(instance.id)?.status).toBe("dispatchable");
+    expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM session_work").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM session_inbox").pluck().get()).toBe(0);
+    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(payloads.some((entry) => entry.includes("does not accept live steering"))).toBe(true);
+  });
+
+  it("never reuses an earlier pipeline workspace through the legacy launcher on re-delegation", async () => {
+    const { tickets, pipelines, invoke, sandbox } = await run("pipelines: { implement: implement }\n");
+    const previous = pipelines.getInstanceForSession("session-1")!;
+    tickets.setSandboxId("issue-1", "sandbox-old");
+
+    await invoke({}, payload("session-2"));
+
+    const current = pipelines.getInstanceForSession("session-2")!;
+    expect(current.id).not.toBe(previous.id);
+    expect(pipelines.getSessionExecutionMode("session-2")).toBe("pipeline");
+    expect(pipelines.getInstance(previous.id)).toMatchObject({
+      status: "superseded",
+      terminal_outcome: "superseded",
+    });
+    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+      linear_session_id: "session-2",
+      sandbox_id: null,
+      run_id: null,
+    });
+    expect(sandbox.stop).toHaveBeenCalledOnce();
+    expect(sandbox.delete).toHaveBeenCalledOnce();
+    expect(tickets.db.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
+  });
+
+  it("does not retire the current generation when re-delegation selects an invalid pipeline", async () => {
+    const { tickets, pipelines, invoke, sandbox, setRepositoryConfig } =
+      await run("pipelines: { implement: implement }\n");
+    const previous = pipelines.getInstanceForSession("session-1")!;
+    tickets.setSandboxId("issue-1", "sandbox-old");
+    setRepositoryConfig("pipelines: { implement: unknown/pipeline@9 }\n");
+
+    await invoke({}, payload("session-2"));
+
+    expect(pipelines.getInstance(previous.id)).toMatchObject({
+      status: "dispatchable",
+      terminal_outcome: null,
+    });
+    expect(pipelines.getInstanceForSession("session-2")).toBeUndefined();
+    expect(pipelines.getSessionExecutionMode("session-2")).toBeUndefined();
+    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+      linear_session_id: "session-1",
+      sandbox_id: "sandbox-old",
+      run_id: null,
+    });
+    expect(sandbox.stop).not.toHaveBeenCalled();
+    expect(sandbox.delete).not.toHaveBeenCalled();
   });
 });

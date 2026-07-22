@@ -270,6 +270,7 @@ describe("sandbox event contracts", () => {
       },
     } as unknown as Sandbox;
     const postStageResult = vi.fn(async () => undefined);
+    const captureAgentAuth = vi.fn(async () => undefined);
 
     await pollSandboxEvents({
       daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
@@ -277,11 +278,16 @@ describe("sandbox event contracts", () => {
       postActivity: vi.fn(async () => undefined),
       finishCompletion: vi.fn(async () => ({ status: 200 })),
       postStageResult,
+      captureAgentAuth,
     });
 
     expect(postStageResult).toHaveBeenCalledWith(
       expect.objectContaining({ kind: "stage_result", attempt_id: "attempt-1" }),
       "c".repeat(40)
+    );
+    expect(captureAgentAuth).toHaveBeenCalledWith(
+      sandbox,
+      expect.objectContaining({ linear_issue_id: "issue-1" })
     );
     const stored = store.getSandboxEvent("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")!;
     expect(stored.status).toBe("processed");

@@ -18,12 +18,15 @@ import type { Config } from "./config.js";
 import type { TicketStore } from "./db.js";
 import { terminateAndSettleActor } from "./actor-settlement.js";
 import { tryPostError, type LinearOutboxProcessor } from "./linear-outbox.js";
+import type { PipelineStore } from "./pipeline-store.js";
+import { processPipelineInfrastructureFailure } from "./pipeline-control.js";
 
 export async function reapStalledRuns(params: {
   daytona: Daytona;
   store: TicketStore;
   linearOutbox: LinearOutboxProcessor;
   cfg: Config;
+  pipelines?: PipelineStore;
 }): Promise<void> {
   const { daytona, store, linearOutbox, cfg } = params;
   const now = new Date();
@@ -52,6 +55,10 @@ export async function reapStalledRuns(params: {
         const message = `OpenThrottle ${run.task_type} run reaped — no executor heartbeat for over ${cfg.stallTimeoutSeconds}s (stalled).`;
         const ticket = store.getByIssueId(run.linear_issue_id);
         if (!ticket) continue;
+        const pipelineAttempt = params.pipelines?.getAttemptForRun(run.id);
+        const pipeline = pipelineAttempt
+          ? params.pipelines?.getInstance(pipelineAttempt.pipeline_instance_id)
+          : undefined;
         const settlement = await terminateAndSettleActor({
           daytona,
           store,
@@ -61,8 +68,14 @@ export async function reapStalledRuns(params: {
           reason: message,
           status: "timed_out",
           ticketState: "error",
+          onSettled: params.pipelines && pipeline
+            ? () => processPipelineInfrastructureFailure({ store: params.pipelines!, runId: run.id })
+            : undefined,
         });
         if (settlement.kind === "quarantined") {
+          if (pipeline && params.pipelines?.getRuntimeResource(pipeline.id)) {
+            params.pipelines.setRuntimeResourceStatus(pipeline.id, "quarantined");
+          }
           await tryPostError(
             store,
             linearOutbox,

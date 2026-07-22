@@ -19,6 +19,7 @@ interface TicketRow {
   pipeline?: {
     pipeline_id: string;
     pipeline_version: number;
+    task_type: 'implement' | 'investigate';
     status: string;
     stage_id: string | null;
     attempt_ordinal: number | null;
@@ -26,6 +27,7 @@ interface TicketRow {
     reentry_count: number;
     wait_reason: string | null;
     subject: string | null;
+    published_commit: string | null;
     gate_result: string | null;
     context_policy: string | null;
     publication_state: string;
@@ -34,6 +36,16 @@ interface TicketRow {
 
 interface StatusResponse {
   tickets?: TicketRow[];
+  execution_summary?: {
+    legacy: number;
+    pipeline: number;
+    waiting: number;
+    publication_blocked: number;
+  };
+  legacy_drain?: {
+    drained: boolean;
+    total_obligations: number;
+  };
 }
 
 export default async function status(): Promise<void> {
@@ -64,6 +76,19 @@ export default async function status(): Promise<void> {
   }
 
   const tickets = data.tickets ?? [];
+  if (data.execution_summary) {
+    const summary = data.execution_summary;
+    console.log(
+      `Execution: legacy=${summary.legacy} pipeline=${summary.pipeline} ` +
+      `waiting=${summary.waiting} publication-blocked=${summary.publication_blocked}`
+    );
+  }
+  if (data.legacy_drain) {
+    console.log(
+      `Legacy drain: ${data.legacy_drain.drained ? 'clear' : 'blocked'} ` +
+      `(${data.legacy_drain.total_obligations} obligations)`
+    );
+  }
   printTable(
     tickets.map((t) => ({
       issue: t.linear_issue_identifier,
@@ -71,12 +96,14 @@ export default async function status(): Promise<void> {
       agent: t.agent,
       mode: t.execution_mode ?? 'legacy',
       pipeline: t.pipeline ? `${t.pipeline.pipeline_id}@${t.pipeline.pipeline_version}` : null,
+      task: t.pipeline?.task_type,
       state: t.pipeline?.status ?? t.state,
       stage: t.pipeline?.stage_id,
       attempt: t.pipeline?.attempt_ordinal,
       retry: t.pipeline?.retry_count,
       reentry: t.pipeline?.reentry_count,
       subject: t.pipeline?.subject ? t.pipeline.subject.slice(0, 12) : null,
+      provider: t.pipeline?.published_commit ? t.pipeline.published_commit.slice(0, 12) : null,
       gate: t.pipeline?.gate_result,
       context: t.pipeline?.context_policy,
       publication: t.pipeline?.publication_state,
@@ -85,8 +112,8 @@ export default async function status(): Promise<void> {
       updated: t.updated_at,
     })),
     [
-      'issue', 'branch', 'agent', 'mode', 'pipeline', 'state', 'stage', 'attempt',
-      'retry', 'reentry', 'subject', 'gate', 'context', 'publication', 'wait', 'pr', 'updated',
+      'issue', 'branch', 'agent', 'mode', 'pipeline', 'task', 'state', 'stage', 'attempt',
+      'retry', 'reentry', 'subject', 'provider', 'gate', 'context', 'publication', 'wait', 'pr', 'updated',
     ]
   );
 }

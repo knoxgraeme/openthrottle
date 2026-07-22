@@ -76,24 +76,14 @@ is_supported_task_type() {
   esac
 }
 
-task_skill_name() {
-  case "$1" in
-    implement) printf '%s' 'implement-plan' ;;
-    investigate) printf '%s' 'investigate' ;;
-    *) return 1 ;;
-  esac
-}
-
-# The OpenThrottle adapters are intentionally thin. This declaration makes
-# their native Compound Engineering composition explicit to the entrypoint,
-# tests, logs, and the agent itself while Fly remains the outer scheduler.
-task_ce_pipeline() {
-  case "$1" in
-    implement) printf '%s' 'ce-work,ce-code-review,ce-commit-push-pr' ;;
-    investigate) printf '%s' 'ce-debug,ce-commit-push-pr' ;;
-    resume) printf '%s' 'resume' ;;
-    *) return 1 ;;
-  esac
+task_adapter_value() {
+  local task="$1"
+  local field="$2"
+  local registry="${OT_TASK_ADAPTERS_FILE:-/opt/openthrottle/skills/task-adapters-v1.json}"
+  jq -er --arg task "$task" --arg field "$field" '
+    .tasks[$task][$field]
+    | if type == "array" then join(",") elif type == "string" then . else error("missing adapter field") end
+  ' "$registry"
 }
 
 # Extract a string field from a Codex auth.json blob; empty on absent/invalid.

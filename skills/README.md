@@ -7,6 +7,7 @@ Daytona image.
 
 ```text
 skills/
+  task-adapters-v1.json          # sole legacy task-to-adapter declaration
   tasks/<name>/SKILL.md          # canonical adapter — single source of truth
   tasks/<name>/agents/openai.yaml  # Codex admin-scope skill policy
   codex/AGENTS-fragment.md       # standing Codex runtime instructions
@@ -19,6 +20,11 @@ sync. The two canonical tasks are `implement-plan` and `investigate`. Resume
 does not start an adapter; it resumes the saved native Claude session, Codex
 thread, or OpenCode session with a follow-up message — including PR feedback
 that arrived while the run was idle (see "Two loops" below).
+
+`task-adapters-v1.json` is the sole compatibility declaration for legacy task
+names. The shell entrypoint reads it directly; scheduler code no longer carries
+a second task/skill/CE registry. New coordinator generations select immutable
+catalog manifests and do not consult this compatibility file.
 
 ## Delivery per agent
 

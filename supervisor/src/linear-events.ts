@@ -56,6 +56,7 @@ import { sanitizeText } from "./sanitize.js";
 import { parseCommand } from "./commands.js";
 import { stopTicket } from "./ticket-control.js";
 import { selectExecutionMode } from "./scheduler.js";
+import { canSteerPipelineRun, requestPipelineStop } from "./pipeline-control.js";
 
 function linearContext(
   payload: ReturnType<typeof parseLinearWebhook>,
@@ -133,7 +134,7 @@ export async function handleLinearEvent(
   if (payload.action === "created") {
     await handleCreated(cfg, store, daytona, linear, linearOutbox, payload, pipelineAdmission);
   } else {
-    await handlePrompted(cfg, store, daytona, linear, linearOutbox, payload);
+    await handlePrompted(cfg, store, daytona, linear, linearOutbox, payload, pipelineAdmission);
   }
 }
 
@@ -141,6 +142,7 @@ export interface PipelineAdmissionContext {
   catalog: ValidatedPipelineCatalog;
   runtime: ValidatedRuntimeCapabilityDescriptor;
   store: PipelineStore;
+  drainEffects?: () => Promise<void>;
 }
 
 async function handleCreated(
@@ -229,16 +231,6 @@ async function handleCreated(
   }
   const selectedAgent = pickAgent(routingLabels, existing?.agent ?? cfg.defaultAgent);
   const selectedRepository = repositoryFor(cfg, store, issue, routingLabels);
-  if (!hasAgentSubscription(cfg, selectedAgent)) {
-    await tryPostError(
-      store,
-      linearOutbox,
-      sessionId,
-      issue.id,
-      `${agentDisplayName(selectedAgent)} subscription login is not configured for OpenThrottle.`
-    );
-    return;
-  }
   if (!selectedRepository) {
     await tryPostError(
       store,
@@ -291,7 +283,77 @@ async function handleCreated(
     }
     selectedRepository.baseBranch = requestedBase;
   }
-  if (existing?.sandbox_id && existing.state !== "closed" && existing.state !== "expired") {
+  const executionMode = selectExecutionMode({
+    pinnedMode,
+    pipelineAdmissionEnabled: cfg.pipelineAdmissionEnabled,
+    repository: selectedRepository.repo,
+    admittedRepositories: cfg.pipelineAdmissionRepositories,
+  });
+  const existingMode = existing
+    ? pipelineAdmission?.store.getSessionExecutionMode(existing.linear_session_id)
+    : undefined;
+  if (executionMode === "legacy" && !hasAgentSubscription(cfg, selectedAgent)) {
+    await tryPostError(
+      store,
+      linearOutbox,
+      sessionId,
+      issue.id,
+      `${agentDisplayName(selectedAgent)} subscription login is not configured for OpenThrottle.`
+    );
+    return;
+  }
+  const retireExistingWorkspace = async (): Promise<boolean> => {
+    if (!existing?.sandbox_id || existing.state === "closed" || existing.state === "expired") {
+      return true;
+    }
+    const priorPipeline = pipelineAdmission?.store.getInstanceForSession(existing.linear_session_id);
+    await stopTicket({
+      store,
+      daytona,
+      linear,
+      linearOutbox,
+      ticket: existing,
+      reason: "Stopped because a new execution generation was delegated.",
+    });
+    const stopped = store.getByIssueId(issue.id);
+    if (stopped?.run_id) {
+      await tryPostError(
+        store,
+        linearOutbox,
+        sessionId,
+        issue.id,
+        "The prior workspace could not be stopped safely. It remains quarantined; resolve it before re-delegating."
+      );
+      return false;
+    }
+    try {
+      await deleteSandbox(daytona, existing.sandbox_id);
+      store.setSandboxId(issue.id, null);
+      if (priorPipeline && pipelineAdmission?.store.getRuntimeResource(priorPipeline.id)) {
+        pipelineAdmission.store.setRuntimeResourceStatus(priorPipeline.id, "cleaned");
+      }
+    } catch (error) {
+      await tryPostError(
+        store,
+        linearOutbox,
+        sessionId,
+        issue.id,
+        sanitizeText(`The prior workspace stopped but could not be deleted before new-generation admission: ${String(error)}`)
+      );
+      return false;
+    }
+    return true;
+  };
+  if (executionMode === "legacy" && existingMode === "pipeline") {
+    if (!(await retireExistingWorkspace())) return;
+  }
+  if (
+    executionMode === "legacy" &&
+    existingMode !== "pipeline" &&
+    existing?.sandbox_id &&
+    existing.state !== "closed" &&
+    existing.state !== "expired"
+  ) {
     const agentChanged = existing.agent !== selectedAgent;
     const repoChanged =
       existing.repo !== selectedRepository.repo ||
@@ -358,14 +420,16 @@ async function handleCreated(
     pr_url: null,
     state: "active" as const,
   };
-  if (selectExecutionMode({
-    pinnedMode,
-    pipelineAdmissionEnabled: cfg.pipelineAdmissionEnabled,
-  }) === "pipeline") {
+  if (executionMode === "pipeline") {
     if (!pipelineAdmission) throw new Error("pipeline admission is enabled without a catalog/runtime context");
     const failSelection = async (error: unknown) => {
       const message = sanitizeText(`Pipeline selection failed before sandbox provisioning: ${String(error)}`);
-      store.upsert({ ...ticketCore, state: "error" });
+      // Selection has not earned the right to supersede or detach a prior
+      // generation. Keep that workspace/session binding intact so a corrected
+      // replay can retire it safely after validation succeeds.
+      if (!existing) {
+        store.upsertUnpinned({ ...ticketCore, state: "error" });
+      }
       store.setState(issue.id, "error", message);
       store.setLinearContext(issue.id, initialContext);
       await tryPostError(store, linearOutbox, sessionId, issue.id, message);
@@ -388,6 +452,10 @@ async function handleCreated(
       const intent = taskType === "investigate" ? "investigate" : "implement";
       const reference = repositoryConfig.config.pipelines?.[intent] ?? intent;
       const manifest = resolvePipelineReference(pipelineAdmission.catalog, reference);
+      const needsModel = manifest.manifest.stages.some((stage) => stage.credentials.includes("model.invoke"));
+      if (needsModel && !hasAgentSubscription(cfg, selectedAgent)) {
+        throw new Error(`${agentDisplayName(selectedAgent)} subscription login is not configured for this pipeline`);
+      }
       const snapshot = pipelineAdmission.store.saveRepositoryConfigSnapshot({
         repository: selectedRepository.repo,
         baseCommit: remote.baseCommit,
@@ -399,16 +467,20 @@ async function handleCreated(
       await failSelection(error);
       return;
     }
+    if (!(await retireExistingWorkspace())) return;
     try {
       store.upsert({
         ...ticketCore,
         pipeline: {
           repository: selectedRepository.repo,
           baseCommit: pinned.remote.baseCommit,
+          baseBranch: selectedRepository.baseBranch,
           manifest: pinned.manifest,
           repositoryConfig: pinned.snapshot,
           runtime: pipelineAdmission.runtime,
           authorizedCapabilities: pinned.manifest.manifest.requires.capabilities,
+          taskType,
+          taskContext: sanitizeText(initialContext).slice(0, 64_000),
         },
       });
     } catch (error) {
@@ -421,6 +493,7 @@ async function handleCreated(
       type: "thought",
       body: `Pinned pipeline ${pinned.manifest.manifest.id}@${pinned.manifest.manifest.version} (${pinned.manifest.digest.slice(0, 12)}) at base ${pinned.remote.baseCommit.slice(0, 12)}. The durable coordinator will dispatch its first stage.`,
     }, issue.id);
+    await pipelineAdmission.drainEffects?.();
     return;
   }
   store.upsert(ticketCore);
@@ -585,7 +658,8 @@ async function handlePrompted(
   daytona: Daytona,
   linear: LinearClient,
   linearOutbox: LinearOutboxProcessor,
-  payload: ReturnType<typeof parseLinearWebhook>
+  payload: ReturnType<typeof parseLinearWebhook>,
+  pipelineAdmission?: PipelineAdmissionContext
 ): Promise<void> {
   const sessionId = payload.agentSession.id;
   const issue = payload.agentSession.issue;
@@ -594,7 +668,7 @@ async function handlePrompted(
   const ticket = issue
     ? store.getByIssueId(issue.id)
     : store.listAll().find((candidate) => candidate.linear_session_id === sessionId);
-  if (!ticket || !ticket.sandbox_id) {
+  if (!ticket) {
     await tryPostError(
       store,
       linearOutbox,
@@ -607,11 +681,32 @@ async function handlePrompted(
 
   const labels = extractLabelNames(payload);
   const command = parseCommand(resumeMessage, { investigateLabel: labels.includes("investigate") });
+  const pipelineInstance = pipelineAdmission?.store.getInstanceForSession(sessionId);
   // The native Linear `signal: "stop"` control signal is checked directly
   // here (it's not a chat command); a textual "/stop" is handled by
   // parseCommand alongside /merge and /implement.
   const isStop = payload.agentActivity?.signal?.toLowerCase() === "stop" || command.kind === "stop";
   if (isStop) {
+    if (pipelineInstance && pipelineAdmission) {
+      requestPipelineStop({
+        store: pipelineAdmission.store,
+        sessionId,
+        eventId: `linear-stop:${pipelineInstance.id}:${payload.agentActivity?.id ?? "signal"}`,
+        reason: "Stopped from the Linear thread.",
+      });
+      await pipelineAdmission.drainEffects?.();
+      return;
+    }
+    if (!ticket.sandbox_id) {
+      await tryPostError(
+        store,
+        linearOutbox,
+        sessionId,
+        ticket.linear_issue_id,
+        "OpenThrottle couldn't find an existing workspace. Delegate the issue again to start one."
+      );
+      return;
+    }
     await stopTicket({
       store,
       daytona,
@@ -620,6 +715,62 @@ async function handlePrompted(
       ticket,
       reason: "Stopped from the Linear thread.",
     });
+    return;
+  }
+
+  if (command.kind === "merge") {
+    await mergeFromLinear(cfg, store, linearOutbox, ticket);
+    return;
+  }
+
+  if (pipelineInstance && pipelineAdmission) {
+    const workId = payload.agentActivity?.id;
+    if (
+      command.kind === "reply" &&
+      workId &&
+      canSteerPipelineRun({
+        store: pipelineAdmission.store,
+        sessionId,
+        runId: ticket.run_id,
+        agent: ticket.agent,
+      })
+    ) {
+      store.enqueueInbox({
+        id: workId,
+        issueId: ticket.linear_issue_id,
+        sessionId,
+        runId: ticket.run_id,
+        source: "human",
+        body: sanitizeText(resumeMessage),
+      });
+      await enqueueActivity(store, linearOutbox, {
+        sessionId,
+        type: "thought",
+        body: "Steering the current pipeline stage with your message…",
+        ephemeral: true,
+      }, ticket.linear_issue_id);
+      return;
+    }
+    await tryPostError(
+      store,
+      linearOutbox,
+      sessionId,
+      ticket.linear_issue_id,
+      command.kind === "implement"
+        ? "This session is pinned to the pipeline coordinator and cannot start a legacy implementation run. Re-delegate the issue to create a new generation."
+        : "The current pipeline stage does not accept live steering. Add feedback to the pull request, or re-delegate the issue to create a new generation."
+    );
+    return;
+  }
+
+  if (!ticket.sandbox_id) {
+    await tryPostError(
+      store,
+      linearOutbox,
+      sessionId,
+      ticket.linear_issue_id,
+      "OpenThrottle couldn't find an existing workspace. Delegate the issue again to start one."
+    );
     return;
   }
 
@@ -648,11 +799,6 @@ async function handlePrompted(
   );
   store.setLinearContext(ticket.linear_issue_id, nextContext);
   const currentTicket = store.getByIssueId(ticket.linear_issue_id) ?? ticket;
-
-  if (command.kind === "merge") {
-    await mergeFromLinear(cfg, store, linearOutbox, currentTicket);
-    return;
-  }
 
   if (command.kind === "implement" && command.legacy) {
     console.warn(

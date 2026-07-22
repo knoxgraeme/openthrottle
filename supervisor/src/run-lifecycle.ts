@@ -16,6 +16,8 @@ import {
 } from "./github.js";
 import { setSandboxActive, setSandboxIdle, startTask, type SandboxEnvContract } from "./daytona.js";
 import { terminateAndSettleActor } from "./actor-settlement.js";
+import type { PipelineStore } from "./pipeline-store.js";
+import { processPipelineInfrastructureFailure } from "./pipeline-control.js";
 import { getCodexAuthForSeed } from "./codex-auth.js";
 import { reconcileSandboxAutostop } from "./sandbox-lifecycle.js";
 import { MAX_PRIVATE_LOG_TAIL_CHARS } from "./logs.js";
@@ -27,7 +29,7 @@ import {
   tryPostError,
   type LinearOutboxProcessor,
 } from "./linear-outbox.js";
-import { drainNextSessionWork, shouldNudgeAfterRun, type LaunchExistingTask } from "./scheduler.js";
+import { drainNextSessionWork, sessionExecutionMode, shouldNudgeAfterRun, type LaunchExistingTask } from "./scheduler.js";
 
 export interface RunCredentials {
   id: string;
@@ -257,6 +259,10 @@ export async function launchExistingTask(params: {
   linearContext?: string;
 }): Promise<boolean> {
   const { cfg, store, daytona, ticket } = params;
+  if (sessionExecutionMode(store, ticket.linear_session_id) === "pipeline") {
+    console.warn(`[run-lifecycle] refusing legacy launch for pipeline-pinned session ${ticket.linear_session_id}`);
+    return false;
+  }
   if (!ticket.sandbox_id) return false;
   if (!hasAgentSubscription(cfg, ticket.agent)) {
     await tryPostError(
@@ -573,11 +579,16 @@ export async function expireRun(
   daytona: Daytona,
   store: TicketStore,
   linearOutbox: LinearOutboxProcessor,
-  run: Run
+  run: Run,
+  pipelines?: PipelineStore
 ): Promise<void> {
   const ticket = store.getByIssueId(run.linear_issue_id);
   const message = `OpenThrottle ${run.task_type} run timed out without a completion result.`;
   if (!ticket) return;
+  const pipelineAttempt = pipelines?.getAttemptForRun(run.id);
+  const pipeline = pipelineAttempt
+    ? pipelines?.getInstance(pipelineAttempt.pipeline_instance_id)
+    : undefined;
   const owner = `hard-timeout-${randomUUID()}`;
   const settlement = await terminateAndSettleActor({
     daytona,
@@ -588,8 +599,14 @@ export async function expireRun(
     reason: message,
     status: "timed_out",
     ticketState: "error",
+    onSettled: pipelines && pipeline
+      ? () => processPipelineInfrastructureFailure({ store: pipelines, runId: run.id })
+      : undefined,
   });
   if (settlement.kind === "quarantined") {
+    if (pipeline && pipelines?.getRuntimeResource(pipeline.id)) {
+      pipelines.setRuntimeResourceStatus(pipeline.id, "quarantined");
+    }
     await tryPostError(
       store,
       linearOutbox,

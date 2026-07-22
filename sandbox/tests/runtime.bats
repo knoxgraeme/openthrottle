@@ -1,6 +1,7 @@
 #!/usr/bin/env bats
 
 setup() {
+  export OT_TASK_ADAPTERS_FILE="${BATS_TEST_DIRNAME}/../../skills/task-adapters-v1.json"
   source "${BATS_TEST_DIRNAME}/../lib/runtime.sh"
 }
 
@@ -20,11 +21,11 @@ setup() {
 }
 
 @test "task types map to the correct skill" {
-  run task_skill_name implement
+  run task_adapter_value implement skill
   [ "$output" = "implement-plan" ]
-  run task_skill_name investigate
+  run task_adapter_value investigate skill
   [ "$output" = "investigate" ]
-  run task_skill_name resume
+  run task_adapter_value resume skill
   [ "$status" -ne 0 ]
   run is_supported_task_type unknown
   [ "$status" -ne 0 ]
@@ -44,26 +45,26 @@ setup() {
 }
 
 @test "task types declare their native Compound Engineering pipeline" {
-  run task_ce_pipeline implement
+  run task_adapter_value implement legacyPipeline
   [ "$status" -eq 0 ]
   [ "$output" = "ce-work,ce-code-review,ce-commit-push-pr" ]
 
-  run task_ce_pipeline investigate
+  run task_adapter_value investigate legacyPipeline
   [ "$output" = "ce-debug,ce-commit-push-pr" ]
 
-  run task_ce_pipeline resume
+  run task_adapter_value resume legacyPipeline
   [ "$output" = "resume" ]
 
-  run task_ce_pipeline review
+  run task_adapter_value review legacyPipeline
   [ "$status" -ne 0 ]
 
-  run task_ce_pipeline review-fix
+  run task_adapter_value review-fix legacyPipeline
   [ "$status" -ne 0 ]
 }
 
 @test "no pipeline mentions ce-babysit-pr" {
   for task in implement investigate resume; do
-    run task_ce_pipeline "$task"
+    run task_adapter_value "$task" legacyPipeline
     [[ "$output" != *ce-babysit-pr* ]]
   done
 }

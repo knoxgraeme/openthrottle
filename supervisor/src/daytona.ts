@@ -268,9 +268,9 @@ export function createDaytonaSandboxRuntime(
         OT_STAGE_REQUEST_FILE: requestPath,
         OT_STAGE_CONFIG_FILE: `${STAGE_INPUT_DIR}/repository-config.json`,
         OT_STAGE_MANIFEST_FILE: `${STAGE_INPUT_DIR}/pipeline-manifest.json`,
-        TASK_TYPE: request.capability === "ce/investigate@1" ? "investigate" : "implement",
+        TASK_TYPE: request.taskType,
         GITHUB_REPO: request.repository,
-        BASE_BRANCH: request.baseCommit,
+        BASE_BRANCH: request.baseBranch,
         BRANCH_NAME: request.branch,
         AGENT: request.agent,
         RUN_ID: request.runId,
@@ -280,7 +280,13 @@ export function createDaytonaSandboxRuntime(
       const sessionId = `stage-${request.attemptId}`;
       await sandbox.process.createSession(sessionId).catch(() => undefined);
       const dispatched = await sandbox.process.executeSessionCommand(sessionId, {
-        command: "/opt/openthrottle/entrypoint.sh",
+        // The deterministic provider session name is not sufficient on its
+        // own: a supervisor crash after dispatch but before acknowledgement
+        // can replay the effect. Check the result while holding the root-owned
+        // attempt lock so both concurrent and just-after-completion replays are
+        // no-ops.
+        command: `flock --nonblock ${STAGE_RESULT_DIR}/${request.attemptId}.lock sh -c ` +
+          `'test -f ${STAGE_RESULT_DIR}/${request.attemptId}.json || exec /opt/openthrottle/entrypoint.sh'`,
         runAsync: true,
         suppressInputEcho: true,
       }, options.taskTimeoutSeconds ?? 7_200);
@@ -318,8 +324,12 @@ export function createDaytonaSandboxRuntime(
     },
 
     async cleanup(resource) {
-      const sandbox = await getSandbox(resource);
-      await sandbox.delete(60, false);
+      try {
+        const sandbox = await getSandbox(resource);
+        await sandbox.delete(60, false);
+      } catch (error) {
+        if (!String(error).toLowerCase().includes("not found")) throw error;
+      }
       materializedScopes.delete(resource.providerResourceId);
       bootstrapped.delete(resource.providerResourceId);
     },

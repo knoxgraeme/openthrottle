@@ -617,6 +617,7 @@ async function pollTicketEvents(
         }
       } else if (event.kind === "stage_result") {
         if (!params.postStageResult) throw new Error("sealed stage result handler is not configured");
+        await params.captureAgentAuth?.(sandbox, ticket);
         await params.postStageResult(event, await readWorkspaceSubject(sandbox));
       } else {
         const logTail = await readTaskLogTail(sandbox, event.token);

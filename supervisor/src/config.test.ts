@@ -31,6 +31,7 @@ function setRequiredEnv(): void {
     "ALLOW_LINEAR_MERGE",
     "SANDBOX_EVENT_POLL_INTERVAL_MS",
     "PIPELINE_COORDINATOR_ENABLED",
+    "PIPELINE_COORDINATOR_REPOSITORIES",
     "PIPELINE_CATALOG_PATH",
     "SANDBOX_RUNTIME_RELEASE",
     "SANDBOX_RUNTIME_DESCRIPTOR_PATH",
@@ -82,17 +83,22 @@ describe("loadConfig", () => {
   it("keeps pipeline admission off by default and validates explicit runtime settings", () => {
     setRequiredEnv();
     process.env.PIPELINE_COORDINATOR_ENABLED = "true";
+    process.env.PIPELINE_COORDINATOR_REPOSITORIES = "Owner/Canary,owner/second,owner/canary";
     process.env.PIPELINE_CATALOG_PATH = "/opt/catalog.yaml";
     process.env.SANDBOX_RUNTIME_RELEASE = "snapshot/2026-07-22";
     process.env.SANDBOX_RUNTIME_DESCRIPTOR_PATH = "/opt/runtime.json";
     expect(loadConfig()).toMatchObject({
       pipelineAdmissionEnabled: true,
+      pipelineAdmissionRepositories: ["owner/canary", "owner/second"],
       pipelineCatalogPath: "/opt/catalog.yaml",
       sandboxRuntimeRelease: "snapshot/2026-07-22",
       sandboxRuntimeDescriptorPath: "/opt/runtime.json",
     });
     process.env.SANDBOX_RUNTIME_RELEASE = "unsafe release";
     expect(() => loadConfig()).toThrow(/SANDBOX_RUNTIME_RELEASE/);
+    process.env.SANDBOX_RUNTIME_RELEASE = "snapshot/2026-07-22";
+    process.env.PIPELINE_COORDINATOR_REPOSITORIES = "not-a-repository";
+    expect(() => loadConfig()).toThrow(/PIPELINE_COORDINATOR_REPOSITORIES/);
   });
 
   it("loads a configured review nudge comment", () => {

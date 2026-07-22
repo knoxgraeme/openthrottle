@@ -7,6 +7,10 @@
     "agent/semantic@1",
     "ce/implement@1",
     "ce/investigate@1",
+    "ce/plan@1",
+    "ce/publish@1",
+    "ce/review@1",
+    "ce/simplify@1",
     "command/run@1",
     "provider/wait@1",
     "repository/publish@1"

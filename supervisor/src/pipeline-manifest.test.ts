@@ -59,7 +59,9 @@ describe("pipeline manifest validation", () => {
     expect(first.digest).toBe(second.digest);
     expect([...first.manifests.keys()]).toEqual([
       "ce/implement@1",
+      "ce/implement@2",
       "ce/investigate@1",
+      "ce/investigate@2",
       "fixture/command@1",
       "fixture/command@2",
       "fixture/agent@1",
@@ -67,6 +69,21 @@ describe("pipeline manifest validation", () => {
     expect(resolvePipelineReference(first, "implement").manifest.id).toBe("ce/implement");
     expect(resolvePipelineReference(first, "fixture/command@1").manifest.id).toBe("fixture/command");
     expect(resolvePipelineReference(first, "fixture-command").manifest.version).toBe(2);
+    expect(resolvePipelineReference(first, "implement").manifest.stages.map((stage) => stage.id)).toEqual([
+      "planning",
+      "implementation",
+      "semantic_review",
+      "simplification",
+      "test",
+      "lint",
+      "build",
+      "publish",
+      "provider",
+    ]);
+    expect(resolvePipelineReference(first, "investigate").manifest.stages.map((stage) => stage.id)).toEqual([
+      "investigate",
+      "publish",
+    ]);
   });
 
   it("normalizes key order and rejects unknown or duplicate YAML fields", () => {

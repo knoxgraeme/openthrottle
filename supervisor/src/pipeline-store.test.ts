@@ -76,6 +76,7 @@ describe("pipeline store", () => {
         repositoryConfig: snapshot,
         runtime,
         authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement" as const,
       },
     };
     tickets.upsert(input);
@@ -115,6 +116,7 @@ describe("pipeline store", () => {
         repositoryConfig: snapshot,
         runtime,
         authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
       },
     })).toThrow(/snapshot binding mismatch/);
     expect(tickets.getByIssueId("issue-broken-session")).toBeUndefined();
@@ -132,6 +134,7 @@ describe("pipeline store", () => {
       repositoryConfig: snapshot,
       runtime,
       authorizedCapabilities: manifest.manifest.requires.capabilities,
+      taskType: "implement" as const,
     };
     tickets.upsert({ ...ticket("session-old", "shared-issue"), pipeline });
     const oldInstance = pipelines.getInstanceForSession("session-old")!;
@@ -161,6 +164,7 @@ describe("pipeline store", () => {
       repositoryConfig: snapshot,
       runtime,
       authorizedCapabilities: manifest.manifest.requires.capabilities,
+      taskType: "implement" as const,
     };
     tickets.upsert({ ...ticket("rollback-old", "rollback-issue"), pipeline });
     const oldInstance = pipelines.getInstanceForSession("rollback-old")!;
@@ -233,6 +237,7 @@ describe("pipeline store", () => {
           repositoryConfig: snapshot,
           runtime,
           authorizedCapabilities: manifest.manifest.requires.capabilities,
+          taskType: "implement",
         },
       });
     }
@@ -252,6 +257,7 @@ describe("pipeline store", () => {
         repositoryConfig: snapshot,
         runtime,
         authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
       },
     });
     const instance = pipelines.getInstanceForSession("audit-session")!;
@@ -276,6 +282,7 @@ describe("pipeline store", () => {
         repositoryConfig: snapshot,
         runtime,
         authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
       },
     });
     const instance = pipelines.getInstanceForSession("integrity-session")!;
@@ -317,6 +324,7 @@ describe("pipeline store", () => {
         repositoryConfig: snapshot,
         runtime,
         authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
       },
     });
     const other = pipelines.getInstanceForSession("other-integrity-session")!;
@@ -360,6 +368,7 @@ describe("pipeline store", () => {
         repositoryConfig: snapshot,
         runtime,
         authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
       },
     });
     const before = pipelines.getInstanceForSession("restart-session")!;
@@ -386,6 +395,7 @@ describe("pipeline store", () => {
         repositoryConfig: snapshot,
         runtime,
         authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
       },
     });
     const instance = pipelines.getInstanceForSession("effect-session")!;

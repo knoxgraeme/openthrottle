@@ -12,6 +12,7 @@ import {
   extractNativeSessionId,
   resolveContextInvocation,
   runtimeCapabilityDigest,
+  stagePrompt,
   validateStageRequest,
 } from "./execute-stage.mjs";
 
@@ -71,8 +72,12 @@ function fixture({
     issueId: "issue-1",
     sessionId: "session-1",
     generation: 1,
+    taskType: "implement",
+    taskContext: "Implement the approved fixture change.",
+    transitionContext: "",
     repository: "owner/repo",
     baseCommit: execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim(),
+    baseBranch: "main",
     branch: "ot/issue-1",
     agent: "codex",
     contextRevision: 0,
@@ -114,6 +119,13 @@ describe("one-stage executor", () => {
     expect(() => validateStageRequest({ ...request, capabilityDigest: "0".repeat(64) }))
       .toThrow(/installed runtime/);
     expect(() => validateStageRequest({ ...request, authority: "agent" })).toThrow(/unknown field/);
+    expect(validateStageRequest({ ...request })).toMatchObject({
+      taskContext: "Implement the approved fixture change.",
+      transitionContext: "",
+    });
+    expect(stagePrompt(request, "/tmp/proposal.json")).toContain("Implement the approved fixture change.");
+    expect(stagePrompt({ ...request, taskType: "investigate", capability: "ce/publish@1" }, "/tmp/proposal.json"))
+      .toMatch(/^\$investigate/);
   });
 
   it("rejects wrong sealed config/manifest digests before invocation", () => {
@@ -231,6 +243,34 @@ describe("one-stage executor", () => {
     const result = executeStage({ ...input, now: clock() });
     expect(result.outcome).toBe("no_change");
     expect(JSON.parse(result.artifacts[0].payload).result).toBe("not_configured");
+  });
+
+  it("seals the exact pushed commit after publication reconciles its tree", () => {
+    const input = fixture({
+      capability: "ce/publish@1",
+      contextPolicy: "prefer_resume",
+      requiredArtifacts: ["stage_result", "publish_subject"],
+      credentialScopes: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+      liveSteering: false,
+    });
+    const remote = mkdtempSync(join(tmpdir(), "ot-stage-remote-"));
+    directories.push(remote);
+    execFileSync("git", ["init", "--bare", "-q"], { cwd: remote });
+    execFileSync("git", ["remote", "add", "origin", remote], { cwd: input.repoDir });
+    execFileSync("git", ["push", "-q", "origin", `HEAD:refs/heads/${input.request.branch}`], {
+      cwd: input.repoDir,
+    });
+
+    const result = executeStage({
+      ...input,
+      runAgent: () => ({ exitCode: 0, proposal: successProposal(), nativeSessionId: "publish-session" }),
+      now: clock(),
+    });
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: input.repoDir, encoding: "utf8" }).trim();
+    const publish = result.artifacts.find((artifact) => artifact.kind === "publish_subject");
+
+    expect(result.outcome).toBe("success");
+    expect(JSON.parse(publish.payload).details.published_commit).toBe(head);
   });
 
   it("computes subjects from a private index and excludes ignored generated files", () => {

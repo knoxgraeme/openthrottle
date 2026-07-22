@@ -21,6 +21,7 @@ export async function terminateAndSettleActor(params: {
   status: "timed_out" | "stopped";
   ticketState: Ticket["state"];
   prUrl?: string;
+  onSettled?: (run: Run) => void;
 }): Promise<ActorSettlementResult> {
   const claimed = params.store.claimRunForReaping(params.runId, params.owner, params.reason);
   if (!claimed) return { kind: "lost" };
@@ -37,13 +38,17 @@ export async function terminateAndSettleActor(params: {
       : { kind: "lost" };
   }
 
-  const settled = params.store.finishReapingRun({
-    runId: params.runId,
-    owner: params.owner,
-    status: params.status,
-    failureTail: params.reason,
-    ticketState: params.ticketState,
-    prUrl: params.prUrl,
-  });
+  const settled = params.store.db.transaction(() => {
+    const result = params.store.finishReapingRun({
+      runId: params.runId,
+      owner: params.owner,
+      status: params.status,
+      failureTail: params.reason,
+      ticketState: params.ticketState,
+      prUrl: params.prUrl,
+    });
+    if (result) params.onSettled?.(result);
+    return result;
+  }).immediate();
   return settled ? { kind: "settled", run: settled } : { kind: "lost" };
 }

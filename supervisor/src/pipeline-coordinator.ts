@@ -36,6 +36,7 @@ export interface PipelineCoordinatorEvent {
     | "stage_result"
     | "provider_snapshot"
     | "human_answer"
+    | "effect_failed"
     | "stop"
     | "supersede";
   instanceId: string;
@@ -47,7 +48,9 @@ export interface PipelineCoordinatorEvent {
   outcome: StageOutcome;
   resultHash: string;
   subject?: string | null;
+  providerRevision?: string;
   nativeSessionId?: string | null;
+  controlTicketState?: "stopped" | "closed";
   artifacts?: PipelineEventArtifact[];
 }
 
@@ -61,6 +64,34 @@ export interface PipelineReductionInput {
 
 function terminalStatus(_outcome: PipelineOutcome): PipelineInstanceStatus {
   return "completion_pending_publication";
+}
+
+function transitionContext(event: PipelineCoordinatorEvent, fromStage: string): string {
+  const stageResult = event.artifacts?.find((artifact) => artifact.kind === "stage_result");
+  let summary = "";
+  let evidence: string[] = [];
+  if (stageResult) {
+    try {
+      const payload = JSON.parse(stageResult.payload) as { summary?: unknown; evidence?: unknown };
+      if (typeof payload.summary === "string") summary = payload.summary.slice(0, 2_000);
+      if (Array.isArray(payload.evidence)) {
+        evidence = payload.evidence
+          .filter((item): item is string => typeof item === "string")
+          .slice(0, 20)
+          .map((item) => item.slice(0, 1_000));
+      }
+    } catch {
+      // The gate already validates typed artifact JSON. A control-event test
+      // may omit it; retain only the deterministic transition metadata then.
+    }
+  }
+  return canonicalJson({
+    from_stage: fromStage,
+    event_kind: event.kind,
+    outcome: event.outcome,
+    summary,
+    evidence,
+  });
 }
 
 function activeStage(input: PipelineReductionInput): PipelineStage {
@@ -100,6 +131,9 @@ function verifyInput(input: PipelineReductionInput): PipelineStage {
   if (event.kind === "human_answer" && instance.status !== "waiting_human") {
     throw new Error("a human answer can advance only a human-waiting instance");
   }
+  if (event.kind === "effect_failed" && event.outcome !== "retryable_infrastructure_failure") {
+    throw new Error("effect_failed must use outcome retryable_infrastructure_failure");
+  }
   const controlOutcome = event.kind === "stop"
     ? "canceled"
     : event.kind === "supersede"
@@ -119,6 +153,9 @@ function verifyInput(input: PipelineReductionInput): PipelineStage {
     throw new Error("waiting stages require their typed provider or human event");
   }
   const artifacts = event.artifacts ?? [];
+  if (event.kind === "effect_failed" && artifacts.length > 0) {
+    throw new Error("effect_failed cannot claim stage artifact assurance");
+  }
   if (new Set(artifacts.map((artifact) => artifact.kind)).size !== artifacts.length) {
     throw new Error("pipeline event contains duplicate artifact kinds");
   }
@@ -141,7 +178,7 @@ function verifyInput(input: PipelineReductionInput): PipelineStage {
       throw new Error(`artifact ${artifact.kind} subject does not match the current event subject`);
     }
   }
-  if (event.kind !== "stop" && event.kind !== "supersede") {
+  if (event.kind !== "stop" && event.kind !== "supersede" && event.kind !== "effect_failed") {
     for (const required of ["stage_result", ...stage.evaluator.required_artifacts]) {
       if (!artifacts.some((artifact) => artifact.kind === required)) {
         throw new Error(`stage ${stage.id} result is missing required ${required} artifact`);
@@ -149,9 +186,27 @@ function verifyInput(input: PipelineReductionInput): PipelineStage {
     }
   }
   const stageResult = artifacts.find((artifact) => artifact.kind === "stage_result");
-  if (event.kind !== "stop" && event.kind !== "supersede" &&
+  if (event.kind !== "stop" && event.kind !== "supersede" && event.kind !== "effect_failed" &&
       stageResult?.hash !== event.resultHash) {
     throw new Error("pipeline event result hash does not match stage_result artifact");
+  }
+  if (event.providerRevision !== undefined) {
+    if (event.kind !== "stage_result" || stage.evaluator.kind !== "publish_subject" ||
+        !/^[a-f0-9]{40}$/.test(event.providerRevision)) {
+      throw new Error("pipeline event has an invalid provider revision");
+    }
+    const publish = artifacts.find((artifact) => artifact.kind === "publish_subject");
+    let publishedCommit: unknown;
+    try {
+      publishedCommit = publish
+        ? (JSON.parse(publish.payload) as { details?: { published_commit?: unknown } }).details?.published_commit
+        : undefined;
+    } catch {
+      publishedCommit = undefined;
+    }
+    if (publishedCommit !== event.providerRevision) {
+      throw new Error("pipeline provider revision does not match publish evidence");
+    }
   }
   return stage;
 }
@@ -162,6 +217,9 @@ function nextAttemptFor(input: PipelineReductionInput, stage: PipelineStage, ree
     input.instance.id, stage.id, attemptOrdinal, reentryOrdinal,
   ])).slice(0, 32)}`;
   const plannedRunId = `run-${digestNormalized(canonicalJson([id, "stage-execution"])).slice(0, 32)}`;
+  if (!input.attempt.request_payload) throw new Error(`pipeline attempt ${input.attempt.id} has no sealed request`);
+  const priorRequest = JSON.parse(input.attempt.request_payload) as { taskContext?: unknown };
+  const taskContext = typeof priorRequest.taskContext === "string" ? priorRequest.taskContext : "";
   const request = buildStageRequest({
     instanceId: input.instance.id,
     manifestDigest: input.instance.manifest_digest,
@@ -174,8 +232,12 @@ function nextAttemptFor(input: PipelineReductionInput, stage: PipelineStage, ree
     issueId: input.instance.linear_issue_id,
     sessionId: input.instance.linear_session_id,
     generation: input.instance.generation,
+    taskType: input.instance.task_type,
+    taskContext,
+    transitionContext: transitionContext(input.event, input.attempt.stage_id),
     repository: input.instance.repository,
     baseCommit: input.instance.base_commit,
+    baseBranch: input.instance.base_branch,
     branch: input.instance.branch,
     agent: input.instance.agent,
     contextRevision: input.attempt.context_revision + 1,
@@ -214,6 +276,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
       pipelineInstanceId: input.instance.id,
       reason: input.event.kind,
       generation: input.instance.generation,
+      ticketState: input.event.controlTicketState ?? "stopped",
     });
     return {
       instanceId: input.instance.id,
@@ -323,7 +386,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
           payload: canonicalJson({
             pipelineInstanceId: input.instance.id,
             stageId: target.id,
-          wait: resumeStatus,
+            wait: resumeStatus,
           }),
         };
     return {
@@ -344,6 +407,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
           ? `provider evidence required at ${target.id}`
           : null,
       immutableSubject: input.event.subject ?? null,
+      publishedCommit: input.event.providerRevision ?? null,
       reentryIncrement: isReentry ? 1 : 0,
       artifacts: artifactsFor(input.event),
       nextAttempt,
@@ -352,6 +416,23 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
   }
 
   const terminal = transition.terminal!;
+  const terminalEffects: CoordinatorTransitionWrite["effects"] = [{
+    kind: "publish_linear",
+    idempotencyKey: `linear-terminal:${input.instance.id}:${terminal}`,
+    payload: canonicalJson({
+      pipelineInstanceId: input.instance.id,
+      pipeline: `${input.instance.pipeline_id}@${input.instance.pipeline_version}`,
+      outcome: terminal,
+      subject: input.event.subject ?? input.instance.immutable_subject,
+    }),
+  }];
+  if (terminal === "shipped" || terminal === "no_change") {
+    terminalEffects.push({
+      kind: "cleanup",
+      idempotencyKey: `cleanup:${input.instance.id}:${terminal}`,
+      payload: canonicalJson({ pipelineInstanceId: input.instance.id, outcome: terminal }),
+    });
+  }
   return {
     instanceId: input.instance.id,
     eventId: input.event.id,
@@ -366,17 +447,9 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
     nextStageId: null,
     waitReason: terminal === "needs_human" ? "pipeline requires a human decision" : null,
     immutableSubject: input.event.subject ?? null,
+    publishedCommit: input.event.providerRevision ?? null,
     artifacts: artifactsFor(input.event),
-    effects: [{
-      kind: "publish_linear",
-      idempotencyKey: `linear-terminal:${input.instance.id}:${terminal}`,
-      payload: canonicalJson({
-        pipelineInstanceId: input.instance.id,
-        pipeline: `${input.instance.pipeline_id}@${input.instance.pipeline_version}`,
-        outcome: terminal,
-        subject: input.event.subject ?? input.instance.immutable_subject,
-      }),
-    }],
+    effects: terminalEffects,
   };
 }
 
