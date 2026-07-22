@@ -212,9 +212,14 @@ describe("createServer lifecycle", () => {
       body: prompted,
     });
     await Promise.all(background.splice(0));
+    // Interrupt-on-send: a mid-run reply on a steering-capable agent (codex here)
+    // is pushed to the steering inbox instead of bouncing with "Still working".
+    // The delivery poller isn't run in this test, so the inbox row stays pending
+    // and the durable session_work fallback still resumes after completion below.
     expect(
-      linearRequests.some((request) => JSON.stringify(request).includes("Still working on the last message"))
+      linearRequests.some((request) => JSON.stringify(request).includes("Steering the current run"))
     ).toBe(true);
+    expect(store.getInbox("prompt-1")).toMatchObject({ status: "pending", body: "one more change" });
 
     const runId = createParams?.envVars?.RUN_ID;
     const callbackToken = createParams?.envVars?.RUN_CALLBACK_TOKEN;

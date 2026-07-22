@@ -235,4 +235,80 @@ describe("drainNextSessionWork terminal-state guard", () => {
     expect(result).toBe(true);
     expect(launchCalls).toEqual([{ taskType: "resume", issueId: "issue-1" }]);
   });
+
+  it("cancels a human reply already steered mid-run (inbox delivered)", async () => {
+    const store = makeStore();
+    store.enqueueSessionWork({
+      id: "human-steered",
+      linearSessionId: "session-1",
+      issueId: "issue-1",
+      source: "human",
+      body: "also check the retry path",
+    });
+    // Same id in the steering inbox, marked delivered — the interrupt-on-send
+    // half already pushed this into the running sandbox.
+    store.enqueueInbox({
+      id: "human-steered",
+      issueId: "issue-1",
+      sessionId: "session-1",
+      runId: "run-1",
+      source: "human",
+      body: "also check the retry path",
+    });
+    store.markInboxDelivered("human-steered");
+    const ticket = store.getByIssueId("issue-1")!;
+
+    let launched = 0;
+    const launch: LaunchExistingTask = async () => {
+      launched += 1;
+      return true;
+    };
+
+    const result = await drainNextSessionWork(makeParams(store, ticket, launch));
+
+    expect(result).toBe(false);
+    expect(launched).toBe(0);
+    // Cancelled, not re-resumed and not left pending.
+    expect(store.claimNextSessionWork("session-1", new Date().toISOString())).toBeUndefined();
+  });
+
+  it("resumes a human reply whose steer was never delivered (inbox pending)", async () => {
+    const store = makeStore();
+    store.enqueueSessionWork({
+      id: "human-race",
+      linearSessionId: "session-1",
+      issueId: "issue-1",
+      source: "human",
+      body: "one more thing",
+    });
+    // Inbox row exists but the run ended before delivery — still pending, so the
+    // durable fallback must resume it rather than dedup it away.
+    store.enqueueInbox({
+      id: "human-race",
+      issueId: "issue-1",
+      sessionId: "session-1",
+      runId: "run-1",
+      source: "human",
+      body: "one more thing",
+    });
+    const ticket = store.getByIssueId("issue-1")!;
+
+    const launchCalls: string[] = [];
+    const launch: LaunchExistingTask = async (p) => {
+      launchCalls.push(p.taskType);
+      store.beginRun({
+        issueId: p.ticket.linear_issue_id,
+        runId: "run-2",
+        taskType: p.taskType,
+        tokenHash: "hash",
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      });
+      return true;
+    };
+
+    const result = await drainNextSessionWork(makeParams(store, ticket, launch));
+
+    expect(result).toBe(true);
+    expect(launchCalls).toEqual(["resume"]);
+  });
 });

@@ -205,6 +205,26 @@ export async function drainNextSessionWork(params: DrainParams): Promise<boolean
       continue;
     }
 
+    // Interrupt-on-send dedup: a human reply that arrived during an active run is
+    // delivered into the running sandbox via the steering inbox (same id as this
+    // session_work row) AND queued here as the durable fallback. This drain runs
+    // after a run completed cleanly, at which point the Stop hook has already
+    // drained and injected any delivered inbox message — so if this item was
+    // steered mid-run, cancel it rather than resuming it a second time. A row
+    // whose inbox message is still `pending` (the steer never reached a live
+    // sandbox, e.g. the run ended in the delivery race) falls through and resumes
+    // as the fallback.
+    if (work.source === "human") {
+      const steered = params.store.getInbox(work.id);
+      if (steered?.status === "delivered") {
+        console.log(
+          `[scheduler] queued reply ${work.id} for ${params.ticket.linear_issue_identifier} was already steered mid-run; cancelling the post-run resume`
+        );
+        params.store.cancelSessionWork(work.id);
+        continue;
+      }
+    }
+
     if (work.source === "automatic") {
       const consumed = params.store.countConsumedAutomaticSessionWork(params.ticket.linear_issue_id);
       if (isAutomaticWorkBounded({ source: work.source, consumedAutomaticCount: consumed, maxRounds: params.cfg.reviewMaxRounds })) {

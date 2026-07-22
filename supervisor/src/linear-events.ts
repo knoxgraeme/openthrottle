@@ -569,6 +569,38 @@ async function handlePrompted(
     );
   }
   const taskType: TaskType = command.kind === "implement" ? "implement" : "resume";
+
+  // Interrupt-on-send: a plain reply that arrives while a run is active on a
+  // steering-capable agent (Claude/Codex) is delivered into the running sandbox
+  // now via the steering inbox — using the SAME id as the session_work row above
+  // so completeRun's drain dedups (cancels the after-run resume once the steer
+  // was delivered). The session_work row stays as the durable fallback: if the
+  // steer never reaches a live sandbox before the run ends, it drains as a normal
+  // resume. launchExistingTask would fail here anyway (a run is already active),
+  // so skip it and leave the item pending.
+  if (
+    taskType === "resume" &&
+    workId &&
+    currentTicket.run_id &&
+    (currentTicket.agent === "claude" || currentTicket.agent === "codex")
+  ) {
+    store.enqueueInbox({
+      id: workId,
+      issueId: currentTicket.linear_issue_id,
+      sessionId,
+      runId: currentTicket.run_id,
+      source: "human",
+      body: sanitizeText(resumeMessage),
+    });
+    await enqueueActivity(store, linearOutbox, {
+      sessionId,
+      type: "thought",
+      body: "Steering the current run with your message…",
+      ephemeral: true,
+    }, currentTicket.linear_issue_id);
+    return;
+  }
+
   const launched = await launchExistingTask({
     cfg,
     store,

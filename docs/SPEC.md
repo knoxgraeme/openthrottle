@@ -75,7 +75,13 @@ Linear AgentSessionEvent ──HMAC──> Fly supervisor ──@daytona/sdk─�
    replies are deduplicated by Linear activity ID in `session_work`,
    acknowledged, and then claim a `resume` run in the existing sandbox when
    the session is idle. A busy session keeps the durable work row instead of
-   requiring the user to resend it.
+   requiring the user to resend it. On a busy session whose agent supports
+   mid-run steering (Claude/Codex), the reply is additionally pushed to the
+   `session_inbox` under the same activity ID (interrupt-on-send), so it is
+   injected into the running sandbox at the next hook boundary rather than only
+   after the run. When that run completes, a steer already `delivered` cancels
+   the queued `session_work` row (no double-apply); a steer still `pending` —
+   the run ended before delivery — resumes from the durable row as the fallback.
 
 ### Sandbox activity and completion
 
