@@ -372,9 +372,10 @@ secrets never enter the sandbox.
    user's `~/.claude/skills` (user scope) every run and is invoked with
    `-p "/<skill-name>"`; its user-scope `~/.claude/settings.json` also
    registers the baked `hooks/ot-inbox-drain.sh` as a `Stop`/`PostToolUse`
-   hook that drains `~/.ot/inbox` and injects any queued mid-run steering as
-   untrusted-data context, blocking `Stop` so a run cannot end with unread
-   steering. Codex registers the same drain hook via `~/.codex/hooks.json`
+   hook that drains `~/.ot/inbox` and injects any queued mid-run steering,
+   framed as guidance the agent weighs and acknowledges (never commands that
+   override its task, plan, or safety) and blocking `Stop` so a run cannot end
+   with unread steering. Codex registers the same drain hook via `~/.codex/hooks.json`
    (run with `--dangerously-bypass-hook-trust` when the pinned Codex advertises
    it); OpenCode steering delivery is a documented follow-up.
    Codex discovers the same canonical skills natively

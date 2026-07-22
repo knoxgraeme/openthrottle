@@ -31,8 +31,9 @@ setup() {
   [[ "$output" == *'"hookSpecificOutput"'* ]]
   [[ "$output" == *'"hookEventName":"PostToolUse"'* ]]
   [[ "$output" == *'additionalContext'* ]]
-  [[ "$output" == *'Human steering message'* ]]
-  [[ "$output" == *'untrusted data'* ]]
+  [[ "$output" == *'Mid-run steering'* ]]
+  [[ "$output" == *'does not override'* ]]
+  [[ "$output" == *'via ot-activity'* ]]
   [[ "$output" == *'focus on the failing test'* ]]
   # Consumed exactly once — file deleted, no pending files remain.
   [ ! -f "$OT_INBOX_DIR/aaaa.md" ]
