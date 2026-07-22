@@ -175,7 +175,7 @@ KIMI_CODE_API_KEY="$(strip_nl "${KIMI_CODE_API_KEY:-}")"
 export GITHUB_TOKEN CLAUDE_CODE_OAUTH_TOKEN KIMI_CODE_API_KEY
 export GH_TOKEN="$GITHUB_TOKEN"
 
-mkdir -p "$OT_DIR" "${OT_DIR}/outbox"
+mkdir -p "$OT_DIR" "${OT_DIR}/outbox" "${OT_DIR}/inbox"
 chown -R "${AGENT_USER}:${AGENT_USER}" "$AGENT_HOME"
 TASK_LOG="${OT_DIR}/task.log"
 rm -f "${OT_DIR}/run-result.json"
@@ -457,8 +457,48 @@ if [[ -d "${OPT_DIR}/skills/tasks" ]]; then
 fi
 chown -R "${AGENT_USER}:${AGENT_USER}" "${AGENT_HOME}/.claude"
 
+# Mid-run steering "inbox": register the baked drain hook in the sandbox user's
+# ~/.claude/settings.json (user scope, so it applies under `--setting-sources
+# user`). The supervisor's inbox poller drops steering files into ~/.ot/inbox;
+# on each PostToolUse the hook injects them as additionalContext, and on Stop it
+# blocks so a run cannot end with unread steering. Merge into any existing
+# settings so plugin-managed keys survive; fall back to a fresh file if the
+# existing one is unparseable. Idempotent on resume.
+if [[ "$AGENT" == "claude" ]]; then
+  CLAUDE_SETTINGS="${AGENT_HOME}/.claude/settings.json"
+  DRAIN_HOOK="${OPT_DIR}/hooks/ot-inbox-drain.sh"
+  CLAUDE_SETTINGS_BASE='{}'
+  [[ -s "$CLAUDE_SETTINGS" ]] && CLAUDE_SETTINGS_BASE="$(cat "$CLAUDE_SETTINGS")"
+  if ! printf '%s' "$CLAUDE_SETTINGS_BASE" | jq \
+      --arg cmd "$DRAIN_HOOK" '
+        .hooks = (.hooks // {})
+        | .hooks.Stop = [ { hooks: [ { type: "command", command: $cmd } ] } ]
+        | .hooks.PostToolUse = [ { matcher: "*", hooks: [ { type: "command", command: $cmd } ] } ]
+      ' > "${CLAUDE_SETTINGS}.tmp" 2>/dev/null; then
+    jq -n --arg cmd "$DRAIN_HOOK" '
+      { hooks: {
+          Stop: [ { hooks: [ { type: "command", command: $cmd } ] } ],
+          PostToolUse: [ { matcher: "*", hooks: [ { type: "command", command: $cmd } ] } ]
+      } }' > "${CLAUDE_SETTINGS}.tmp"
+  fi
+  mv "${CLAUDE_SETTINGS}.tmp" "$CLAUDE_SETTINGS"
+  chmod 0644 "$CLAUDE_SETTINGS"
+  chown "${AGENT_USER}:${AGENT_USER}" "$CLAUDE_SETTINGS"
+  log "registered Claude inbox drain hook (${DRAIN_HOOK})"
+fi
+
+# Codex mid-run steering is wired in the Codex config block below: it registers
+# the same baked ot-inbox-drain.sh via ~/.codex/hooks.json. Codex and Claude
+# share the hook stdin/stdout contract, so the drain script serves both unchanged.
+#
+# TODO(opencode steering): OpenCode has no settings.json-style hook system; its
+# equivalent is a plugin. Delivering mid-run steering to OpenCode requires a
+# small baked OpenCode plugin that polls ~/.ot/inbox and injects — a documented
+# follow-up, deliberately not attempted here.
+
 # Codex global instructions live outside the target checkout so AGENTS.md
 # remains ordinary project data that a ticket can create or edit.
+CODEX_HOOK_TRUST_FLAG=()
 if [[ "$AGENT" == "codex" ]]; then
   AGENTS_FRAGMENT="${OPT_DIR}/skills/codex/AGENTS-fragment.md"
   if [[ -f "$AGENTS_FRAGMENT" ]]; then
@@ -467,6 +507,34 @@ if [[ "$AGENT" == "codex" ]]; then
     chown -R "${AGENT_USER}:${AGENT_USER}" "${AGENT_HOME}/.codex"
   else
     log "WARNING: ${AGENTS_FRAGMENT} not found, skipping global Codex instructions"
+  fi
+
+  # Mid-run steering: register the baked drain hook for Codex. Codex hooks are
+  # enabled by default and share Claude's stdin (`hook_event_name`) and output
+  # (`hookSpecificOutput.additionalContext`; Stop uses `decision:block`+`reason`)
+  # contract, so ot-inbox-drain.sh serves both unchanged. hooks.json is a fresh,
+  # isolated file — no config.toml merge risk.
+  DRAIN_HOOK="${OPT_DIR}/hooks/ot-inbox-drain.sh"
+  mkdir -p "${AGENT_HOME}/.codex"
+  jq -n --arg cmd "$DRAIN_HOOK" '{
+    hooks: {
+      PostToolUse: [ { matcher: "", hooks: [ { type: "command", command: $cmd } ] } ],
+      Stop: [ { hooks: [ { type: "command", command: $cmd } ] } ]
+    }
+  }' > "${AGENT_HOME}/.codex/hooks.json"
+  chmod 0644 "${AGENT_HOME}/.codex/hooks.json"
+  chown "${AGENT_USER}:${AGENT_USER}" "${AGENT_HOME}/.codex/hooks.json"
+
+  # A non-managed command hook only runs once trusted, which a non-interactive
+  # `codex exec` cannot do, so bypass trust for this invocation — but ONLY if the
+  # pinned Codex advertises the flag, so an unknown flag can never break Codex
+  # runs (worst case degrades to "no steering", never to a failed run).
+  if { as_agent "codex exec --help 2>/dev/null" || true; as_agent "codex --help 2>/dev/null" || true; } \
+       | grep -q -- "--dangerously-bypass-hook-trust"; then
+    CODEX_HOOK_TRUST_FLAG=(--dangerously-bypass-hook-trust)
+    log "registered Codex inbox drain hook (${DRAIN_HOOK}); hook-trust bypass enabled"
+  else
+    log "WARNING: codex lacks --dangerously-bypass-hook-trust; mid-run steering hook will be skipped by the trust gate"
   fi
 fi
 
@@ -541,7 +609,7 @@ case "${AGENT}:${TASK_TYPE}" in
     } > "$CODEX_STDIN_FILE"
     chown "${AGENT_USER}:${AGENT_USER}" "$CODEX_STDIN_FILE"
     AGENT_CMD=(codex exec --json --dangerously-bypass-approvals-and-sandbox \
-      --skip-git-repo-check -C "$REPO_DIR")
+      "${CODEX_HOOK_TRUST_FLAG[@]}" --skip-git-repo-check -C "$REPO_DIR")
     ;;
   codex:resume)
     SAVED_SESSION_ID="$(as_agent "cat '${OT_DIR}/agent-session-id' 2>/dev/null" || true)"
@@ -550,8 +618,8 @@ case "${AGENT}:${TASK_TYPE}" in
       exit 1
     fi
     AGENT_CMD=(codex exec --json --dangerously-bypass-approvals-and-sandbox \
-      --skip-git-repo-check -C "$REPO_DIR" resume "$SAVED_SESSION_ID" \
-      "$RESUME_MESSAGE")
+      "${CODEX_HOOK_TRUST_FLAG[@]}" --skip-git-repo-check -C "$REPO_DIR" \
+      resume "$SAVED_SESSION_ID" "$RESUME_MESSAGE")
     ;;
   opencode:implement|opencode:investigate)
     # OpenCode cannot yet discover skills from a sandbox-owned admin

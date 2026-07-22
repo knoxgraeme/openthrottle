@@ -69,6 +69,11 @@ function findTicket(store: TicketStore, identifier: string): Ticket | undefined 
 
 const LINEAR_TEAM_KEY_PATTERN = /^[A-Za-z0-9_-]+$/;
 
+// Upper bound on an operator steering message. Keeps a single injected file
+// bounded (it is written verbatim into the sandbox and framed as untrusted data
+// for the agent) and roughly aligns with the sandbox event body cap.
+const MAX_STEER_MESSAGE_CHARS = 8_000;
+
 function isGithubRepository(value: string): boolean {
   const parts = value.split("/");
   return (
@@ -441,6 +446,39 @@ export function createServer(deps: ServerDeps): Hono {
       );
       return context.json({ error: message }, 502);
     }
+  });
+
+  app.post("/tickets/:identifier/steer", async (context) => {
+    if (!requireStatusAuth(context.req.header("Authorization"))) {
+      return context.json({ error: "unauthorized" }, 401);
+    }
+    const ticket = findTicket(store, context.req.param("identifier"));
+    if (!ticket) return context.json({ error: "ticket not found" }, 404);
+    let body: unknown;
+    try {
+      body = await context.req.json();
+    } catch {
+      return context.json({ error: "invalid JSON" }, 400);
+    }
+    const message = (body as Record<string, unknown> | null)?.message;
+    if (
+      typeof message !== "string" ||
+      !message.trim() ||
+      message.length > MAX_STEER_MESSAGE_CHARS
+    ) {
+      return context.json({ error: "message is required" }, 400);
+    }
+    // Enqueue durably even if the ticket is not currently running — the inbox
+    // poller delivers it on the next run. The body is untrusted data; it is only
+    // stored here and later written as a file, never executed.
+    const record = store.enqueueInbox({
+      issueId: ticket.linear_issue_id,
+      sessionId: ticket.linear_session_id,
+      runId: ticket.run_id,
+      source: "operator",
+      body: message,
+    });
+    return context.json({ ok: true, id: record.id });
   });
 
   app.get("/tickets/:identifier/logs", async (context) => {

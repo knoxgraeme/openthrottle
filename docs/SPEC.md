@@ -75,7 +75,13 @@ Linear AgentSessionEvent ──HMAC──> Fly supervisor ──@daytona/sdk─�
    replies are deduplicated by Linear activity ID in `session_work`,
    acknowledged, and then claim a `resume` run in the existing sandbox when
    the session is idle. A busy session keeps the durable work row instead of
-   requiring the user to resend it.
+   requiring the user to resend it. On a busy session whose agent supports
+   mid-run steering (Claude/Codex), the reply is additionally pushed to the
+   `session_inbox` under the same activity ID (interrupt-on-send), so it is
+   injected into the running sandbox at the next hook boundary rather than only
+   after the run. When that run completes, a steer already `delivered` cancels
+   the queued `session_work` row (no double-apply); a steer still `pending` —
+   the run ended before delivery — resumes from the durable row as the fallback.
 
 ### Sandbox activity and completion
 
@@ -204,7 +210,11 @@ delivery records. A webhook delivery is retried at most
 eight times; terminal failures remain visible in SQLite/logs and enqueue one
 final error activity when its session is known. Linear outbox rows preserve
 per-session sequence order and keep later rows pending behind a failed earlier
-row until retry/redrive.
+row until retry/redrive. A separate ~60-second liveness reaper fails any run
+that has emitted no sandbox activity for `STALL_TIMEOUT_SECONDS` and idles its
+sandbox — distinct from the hard-timeout run expiry above. Mid-run steering
+messages queued in `session_inbox` are delivered into running sandboxes on the
+sandbox-event poll interval.
 
 ## Supervisor contract
 
@@ -221,6 +231,7 @@ row until retry/redrive.
 | `GET` | `/repositories` | `OT_STATUS_TOKEN` bearer | registered target list |
 | `POST` | `/repositories/register` | `OT_STATUS_TOKEN` bearer | verify and upsert a target route/webhook |
 | `POST` | `/tickets/:id/stop` | `OT_STATUS_TOKEN` bearer | stop a ticket |
+| `POST` | `/tickets/:id/steer` | `OT_STATUS_TOKEN` bearer | queue a mid-run steering message, delivered into the running sandbox |
 | `GET` | `/tickets/:id/logs` | `OT_STATUS_TOKEN` bearer | sanitized live logs, falling back to the latest durable private run tail |
 | `GET` | `/preview/:id?token=` | per-ticket token | wake, restart the dev server if down, then redirect or show a status page |
 | `POST` | `/runs/:id/complete` | one-time run bearer | consume run result |
@@ -249,8 +260,11 @@ and marks the one current generation per issue. `session_work` stores
 deduplicated human/automatic work by source id and priority: a `source`
 column distinguishes human replies (`human`) from GitHub-feedback items
 (`automatic`), and status moves `pending → claimed → consumed`, or
-`canceled` when superseded by a stop, dropped as already thread-resolved, or
-cut off by the rounds bound. Only consumed `automatic` rows count toward
+`canceled` when superseded by a stop, dropped as already thread-resolved,
+cut off by the rounds bound, or skipped because its ticket reached a terminal
+state (`closed`/`expired`/`stopped`) before the queued work could launch — a
+re-fetched terminal ticket never resumes into stale work. Only consumed
+`automatic` rows count toward
 `REVIEW_MAX_ROUNDS`; `human`-source work is never bounded. `runs` stores
 immutable run identity plus the originating Linear session/generation, task,
 hashed callback token, deadline, result, cost, PR and failure tail.
@@ -260,7 +274,10 @@ result, and sanitized last error. `sandbox_events` stores idempotency/retry
 state for validated sandbox records without persisting the raw one-time token.
 `linear_outbox` stores all Linear activity/session-update mutations before
 delivery, including UUID id, immutable payload hash, target session,
-per-session sequence, retry state, and sanitized last error. `settings` stores
+per-session sequence, retry state, and sanitized last error. `session_inbox` is
+the inbound counterpart of the outbox: durable human/operator mid-run steering
+messages (`pending → delivered`, or `canceled`) written into a running sandbox's
+`~/.ot/inbox` by the delivery poller. `settings` stores
 OAuth tokens and small supervisor settings, including the durable Codex
 `auth.json` (`codex_auth_json`). Codex's OAuth refresh token rotates on every
 refresh, so `CODEX_AUTH_JSON` is only a bootstrap seed: the supervisor seeds
@@ -325,12 +342,16 @@ Required unless noted:
   `CALLBACK_GRACE_SECONDS=120`, `DEV_PORT=3000`,
   `SWEEP_MAX_AGE_DAYS=14`, `ORPHAN_GRACE_MINUTES=5`,
   `WEBHOOK_MAX_AGE_SECONDS=60`, `REVIEW_MAX_ROUNDS=3`,
-  `ALLOW_LINEAR_MERGE=false`, `SANDBOX_EVENT_POLL_INTERVAL_MS=5000`.
+  `ALLOW_LINEAR_MERGE=false`, `SANDBOX_EVENT_POLL_INTERVAL_MS=5000`,
+  `STALL_TIMEOUT_SECONDS=900`.
   `REVIEW_MAX_ROUNDS` bounds `automatic` (GitHub-feedback) session-work items
   consumed per ticket. Optional `REVIEW_NUDGE_COMMENT` (default empty) is
   posted on the PR after a feedback-triggered resume completes cleanly, to
   prompt an external reviewer bot/human to look again; empty relies on the
-  bot's own review-on-push behavior.
+  bot's own review-on-push behavior. `STALL_TIMEOUT_SECONDS` is the liveness
+  cap: a running run that emits no sandbox activity — not even the
+  `normalize.mjs` heartbeat — for this long is reaped (failed and its sandbox
+  idled), independent of the hard `TASK_TIMEOUT` wall clock.
 
 Fly keeps one machine running, mounts `/data`, and health-checks `/healthz`.
 
@@ -362,7 +383,15 @@ secrets never enter the sandbox.
    selected task through the JSONL normalizer under `timeout`. Claude gets a
    fresh copy of the canonical `skills/tasks/*` directories under the sandbox
    user's `~/.claude/skills` (user scope) every run and is invoked with
-   `-p "/<skill-name>"`. Codex discovers the same canonical skills natively
+   `-p "/<skill-name>"`; its user-scope `~/.claude/settings.json` also
+   registers the baked `hooks/ot-inbox-drain.sh` as a `Stop`/`PostToolUse`
+   hook that drains `~/.ot/inbox` and injects any queued mid-run steering,
+   framed as guidance the agent weighs and acknowledges (never commands that
+   override its task, plan, or safety) and blocking `Stop` so a run cannot end
+   with unread steering. Codex registers the same drain hook via `~/.codex/hooks.json`
+   (run with `--dangerously-bypass-hook-trust` when the pinned Codex advertises
+   it); OpenCode steering delivery is a documented follow-up.
+   Codex discovers the same canonical skills natively
    from the image-baked admin-scope `/etc/codex/skills/<name>/` (each with an
    `agents/openai.yaml` setting `allow_implicit_invocation: false`, so a skill
    only runs when explicitly named) and is invoked with piped stdin naming the

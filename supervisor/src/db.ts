@@ -110,6 +110,25 @@ CREATE INDEX IF NOT EXISTS linear_outbox_process_idx
 CREATE INDEX IF NOT EXISTS linear_outbox_session_order_idx
   ON linear_outbox(linear_session_id, sequence);
 
+-- Inbound counterpart of linear_outbox: durable, per-issue steering messages
+-- delivered INTO a running sandbox mid-run (the "inbox"). A message is enqueued
+-- pending, written into ~/.ot/inbox by the delivery poller, then marked
+-- delivered. See docs/SPEC.md "Mid-run steering".
+CREATE TABLE IF NOT EXISTS session_inbox (
+  id TEXT PRIMARY KEY,
+  linear_issue_id TEXT NOT NULL,
+  linear_session_id TEXT NOT NULL,
+  run_id TEXT,
+  source TEXT NOT NULL,
+  body TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at TEXT NOT NULL,
+  delivered_at TEXT,
+  FOREIGN KEY(linear_issue_id) REFERENCES tickets(linear_issue_id)
+);
+CREATE INDEX IF NOT EXISTS session_inbox_delivery_idx
+  ON session_inbox(linear_issue_id, status, created_at);
+
 CREATE TABLE IF NOT EXISTS sandbox_events (
   event_id TEXT PRIMARY KEY,
   run_id TEXT NOT NULL,
@@ -379,6 +398,18 @@ export interface LinearOutboxRecord {
   created_at: string;
 }
 
+export interface SteerInboxRecord {
+  id: string;
+  linear_issue_id: string;
+  linear_session_id: string;
+  run_id: string | null;
+  source: "human" | "operator";
+  body: string;
+  status: "pending" | "delivered" | "canceled";
+  created_at: string;
+  delivered_at: string | null;
+}
+
 interface SessionWork {
   id: string;
   linear_session_id: string;
@@ -501,6 +532,29 @@ export interface TicketStore {
   countRunsByType(issueId: string, taskType: TaskType): number;
   finishRun(params: FinishRunParams): Run | undefined;
   listExpiredRuns(nowIso: string): Run[];
+  // Feature 1 (heartbeat-silence reaper): running runs that have emitted at
+  // least one sandbox event (any kind, including ephemeral heartbeats) whose
+  // most recent one is at or before `cutoffIso`. Runs that have not emitted any
+  // event yet — still in sandbox bootstrap before normalize.mjs starts — are
+  // exempt, so a slow bootstrap is never mistaken for a stall; the hard
+  // wall-clock cap (listExpiredRuns) covers a run that never produces output.
+  // This is the liveness cap.
+  listStalledRuns(cutoffIso: string): Run[];
+  // Feature 5 (mid-run steering inbox): the inbound counterpart of the Linear
+  // outbox. Messages are enqueued pending, delivered into the running sandbox's
+  // ~/.ot/inbox by the delivery poller, then marked delivered.
+  enqueueInbox(params: {
+    id?: string;
+    issueId: string;
+    sessionId: string;
+    runId?: string | null;
+    source: "human" | "operator";
+    body: string;
+  }): SteerInboxRecord;
+  listPendingInbox(issueId: string): SteerInboxRecord[];
+  markInboxDelivered(id: string): void;
+  cancelPendingInbox(issueId: string): number;
+  getInbox(id: string): SteerInboxRecord | undefined;
   insertSandboxEvent(params: {
     eventId: string;
     runId: string;
@@ -702,6 +756,35 @@ export function createTicketStore(db: Database.Database): TicketStore {
   const listExpiredRunsStmt = db.prepare(
     "SELECT * FROM runs WHERE status = 'running' AND expires_at <= ? ORDER BY expires_at"
   );
+  // Only runs that have ALREADY emitted at least one sandbox event and then
+  // gone silent are stall candidates: MAX over no rows is NULL and `NULL <= ?`
+  // is never true, so a run still in sandbox bootstrap (checkout/post_bootstrap/
+  // dev server, before normalize.mjs emits its first event) is never reaped —
+  // a slow bootstrap must not look like a stall. The hard-timeout expiry
+  // (listExpiredRuns) still covers a run that never produces any output.
+  const listStalledRunsStmt = db.prepare(`
+    SELECT r.* FROM runs r
+    WHERE r.status = 'running'
+      AND (SELECT MAX(e.created_at) FROM sandbox_events e WHERE e.run_id = r.id) <= ?
+    ORDER BY r.started_at
+  `);
+  const insertInboxStmt = db.prepare(`
+    INSERT OR IGNORE INTO session_inbox (
+      id, linear_issue_id, linear_session_id, run_id, source, body, status, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+  `);
+  const listPendingInboxStmt = db.prepare(`
+    SELECT * FROM session_inbox
+    WHERE linear_issue_id = ? AND status = 'pending'
+    ORDER BY created_at ASC, id ASC
+  `);
+  const markInboxDeliveredStmt = db.prepare(
+    "UPDATE session_inbox SET status = 'delivered', delivered_at = ? WHERE id = ? AND status = 'pending'"
+  );
+  const cancelPendingInboxStmt = db.prepare(
+    "UPDATE session_inbox SET status = 'canceled' WHERE linear_issue_id = ? AND status = 'pending'"
+  );
+  const getInboxStmt = db.prepare("SELECT * FROM session_inbox WHERE id = ?");
   const insertSandboxEventStmt = db.prepare(`
     INSERT OR IGNORE INTO sandbox_events (
       event_id, run_id, sandbox_id, kind, payload, status,
@@ -1196,6 +1279,34 @@ export function createTicketStore(db: Database.Database): TicketStore {
     },
     listExpiredRuns(nowIso) {
       return listExpiredRunsStmt.all(nowIso) as Run[];
+    },
+    listStalledRuns(cutoffIso) {
+      return listStalledRunsStmt.all(cutoffIso) as Run[];
+    },
+    enqueueInbox(params) {
+      const id = params.id ?? randomUUID();
+      insertInboxStmt.run(
+        id,
+        params.issueId,
+        params.sessionId,
+        params.runId ?? null,
+        params.source,
+        params.body,
+        now()
+      );
+      return getInboxStmt.get(id) as SteerInboxRecord;
+    },
+    listPendingInbox(issueId) {
+      return listPendingInboxStmt.all(issueId) as SteerInboxRecord[];
+    },
+    markInboxDelivered(id) {
+      markInboxDeliveredStmt.run(now(), id);
+    },
+    cancelPendingInbox(issueId) {
+      return cancelPendingInboxStmt.run(issueId).changes;
+    },
+    getInbox(id) {
+      return getInboxStmt.get(id) as SteerInboxRecord | undefined;
     },
     insertSandboxEvent(params) {
       const createdAt = now();

@@ -39,6 +39,7 @@ const cfg: Config = {
   reviewNudgeComment: "",
   allowLinearMerge: false,
   sandboxEventPollIntervalMs: 5_000,
+  stallTimeoutSeconds: 900,
 };
 
 let db: Database.Database | undefined;
@@ -211,9 +212,14 @@ describe("createServer lifecycle", () => {
       body: prompted,
     });
     await Promise.all(background.splice(0));
+    // Interrupt-on-send: a mid-run reply on a steering-capable agent (codex here)
+    // is pushed to the steering inbox instead of bouncing with "Still working".
+    // The delivery poller isn't run in this test, so the inbox row stays pending
+    // and the durable session_work fallback still resumes after completion below.
     expect(
-      linearRequests.some((request) => JSON.stringify(request).includes("Still working on the last message"))
+      linearRequests.some((request) => JSON.stringify(request).includes("Steering the current run"))
     ).toBe(true);
+    expect(store.getInbox("prompt-1")).toMatchObject({ status: "pending", body: "one more change" });
 
     const runId = createParams?.envVars?.RUN_ID;
     const callbackToken = createParams?.envVars?.RUN_CALLBACK_TOKEN;
@@ -3818,5 +3824,88 @@ describe("createServer lifecycle", () => {
     expect(queued?.body).toContain("empty-cart");
     expect(queued?.body).toContain("https://github.com/owner/repo/pull/32#issuecomment-901");
     expect(store.claimNextSessionWork("session-comment", new Date().toISOString())).toBeUndefined();
+  });
+
+  it("enqueues an operator steering message on the inbox and guards auth/lookup/input", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    store.upsert({
+      linear_issue_id: "issue-steer",
+      linear_issue_identifier: "OT-STEER",
+      linear_session_id: "session-steer",
+      sandbox_id: "sandbox-steer",
+      branch: "ot/ot-steer",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+    });
+    const app = createServer({
+      cfg,
+      store,
+      daytona: {} as unknown as Daytona,
+      getLinearClient: async () => undefined,
+    });
+
+    // Rejected without the operator status token.
+    expect(
+      (
+        await app.request("/tickets/OT-STEER/steer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: "focus on the failing test" }),
+        })
+      ).status
+    ).toBe(401);
+
+    // Unknown ticket -> 404.
+    expect(
+      (
+        await app.request("/tickets/OT-UNKNOWN/steer", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${cfg.statusToken}`,
+          },
+          body: JSON.stringify({ message: "hello" }),
+        })
+      ).status
+    ).toBe(404);
+
+    // Empty/whitespace message -> 400.
+    expect(
+      (
+        await app.request("/tickets/OT-STEER/steer", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${cfg.statusToken}`,
+          },
+          body: JSON.stringify({ message: "   " }),
+        })
+      ).status
+    ).toBe(400);
+
+    // Valid -> 200, durably enqueued and retrievable via the store.
+    const response = await app.request("/tickets/OT-STEER/steer", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${cfg.statusToken}`,
+      },
+      body: JSON.stringify({ message: "prefer the smaller refactor" }),
+    });
+    expect(response.status).toBe(200);
+    const payload = (await response.json()) as { ok: boolean; id: string };
+    expect(payload.ok).toBe(true);
+    expect(payload.id).toEqual(expect.any(String));
+    expect(store.getInbox(payload.id)).toMatchObject({
+      linear_issue_id: "issue-steer",
+      linear_session_id: "session-steer",
+      source: "operator",
+      body: "prefer the smaller refactor",
+      status: "pending",
+    });
+    expect(store.listPendingInbox("issue-steer")).toHaveLength(1);
   });
 });

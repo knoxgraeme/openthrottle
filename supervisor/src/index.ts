@@ -7,10 +7,15 @@ import { runSweep } from "./sweep.js";
 import { createLinearClientProvider } from "./linear-auth.js";
 import { captureCodexAuthJson } from "./codex-auth.js";
 import { pollSandboxEvents } from "./sandbox-events.js";
+import { deliverPendingInbox } from "./inbox.js";
+import { reapStalledRuns } from "./reaper.js";
 import { activityPayload, createLinearOutboxProcessor, enqueueSessionUpdate } from "./linear-outbox.js";
 
 const SWEEP_INTERVAL_MS = 15 * 60 * 1000; // run every 15 min while awake; SPEC only requires "on every boot" + periodic while awake
 const DELIVERY_DRAIN_INTERVAL_MS = 30 * 1000;
+// Liveness reap runs far more often than the hard-timeout sweep so a stalled
+// run is caught within ~a minute of crossing STALL_TIMEOUT_SECONDS.
+const REAP_INTERVAL_MS = 60 * 1000;
 
 async function main() {
   const cfg = loadConfig();
@@ -94,6 +99,9 @@ async function main() {
           }
         },
       });
+      // Deliver any queued mid-run steering into running sandboxes on the same
+      // fast cadence, so a steer reaches the agent within one poll interval.
+      await deliverPendingInbox({ daytona, store });
     } finally {
       sandboxPollRunning = false;
     }
@@ -110,6 +118,12 @@ async function main() {
   getLinearClient()
     .then((linear) => runSweep(daytona, store, linear, cfg))
     .catch((err) => console.error("[sweep] boot sweep failed:", err));
+  const reapStalled = () =>
+    reapStalledRuns({ daytona, store, linearOutbox: linearOutboxProcessor, cfg }).catch((err) =>
+      console.error("[reaper] stall reap failed:", err)
+    );
+  reapStalled();
+  setInterval(reapStalled, REAP_INTERVAL_MS).unref();
   setInterval(() => {
     deliveryProcessor
       .drain()

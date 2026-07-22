@@ -174,10 +174,15 @@ export interface DrainParams {
   launch: LaunchExistingTask;
 }
 
+// Terminal-for-dispatch ticket states: a ticket in one of these must never be
+// resumed into queued work. "error" and "active" are deliberately excluded —
+// both are recoverable and must still drain.
+const TERMINAL_DISPATCH_STATES = new Set<Ticket["state"]>(["closed", "expired", "stopped"]);
+
 // Claims and launches the next queued session-work item for the ticket's
-// session as a `resume`, applying the rounds bound and the resolved-thread
-// skip to automatic (GitHub-feedback) items before launching. Returns true
-// only if a run was actually launched.
+// session as a `resume`, applying the terminal-state guard, the rounds bound,
+// and the resolved-thread skip before launching. Returns true only if a run was
+// actually launched.
 export async function drainNextSessionWork(params: DrainParams): Promise<boolean> {
   for (;;) {
     const work = params.store.claimNextSessionWork(
@@ -185,6 +190,44 @@ export async function drainNextSessionWork(params: DrainParams): Promise<boolean
       new Date().toISOString()
     );
     if (!work) return false;
+
+    // Terminal-state guard (Symphony invariant: retry re-fetches tracker state;
+    // never silently treat a ticket as still-live). The claimed item may have
+    // sat queued while the ticket was cancelled/closed/stopped out from under
+    // it, so re-fetch the ticket fresh here — before any rounds/thread checks or
+    // launch — and, if it is gone or terminal-for-dispatch, cancel the item and
+    // move on instead of resuming into stale work. This runs for EVERY claimed
+    // item, human or automatic (a dead ticket must not resume for either), and
+    // cancels rather than releases so a terminal ticket cannot re-claim the same
+    // item forever. "error"/"active" are recoverable and intentionally still drain.
+    const current = params.store.getByIssueId(params.ticket.linear_issue_id);
+    if (!current || TERMINAL_DISPATCH_STATES.has(current.state)) {
+      console.log(
+        `[scheduler] skipping queued work ${work.id} for ${params.ticket.linear_issue_identifier} — ticket ${current ? `is ${current.state}` : "no longer exists"}; cancelling instead of resuming`
+      );
+      params.store.cancelSessionWork(work.id);
+      continue;
+    }
+
+    // Interrupt-on-send dedup: a human reply that arrived during an active run is
+    // delivered into the running sandbox via the steering inbox (same id as this
+    // session_work row) AND queued here as the durable fallback. This drain runs
+    // after a run completed cleanly, at which point the Stop hook has already
+    // drained and injected any delivered inbox message — so if this item was
+    // steered mid-run, cancel it rather than resuming it a second time. A row
+    // whose inbox message is still `pending` (the steer never reached a live
+    // sandbox, e.g. the run ended in the delivery race) falls through and resumes
+    // as the fallback.
+    if (work.source === "human") {
+      const steered = params.store.getInbox(work.id);
+      if (steered?.status === "delivered") {
+        console.log(
+          `[scheduler] queued reply ${work.id} for ${params.ticket.linear_issue_identifier} was already steered mid-run; cancelling the post-run resume`
+        );
+        params.store.cancelSessionWork(work.id);
+        continue;
+      }
+    }
 
     if (work.source === "automatic") {
       const consumed = params.store.countConsumedAutomaticSessionWork(params.ticket.linear_issue_id);
@@ -219,7 +262,6 @@ export async function drainNextSessionWork(params: DrainParams): Promise<boolean
       }
     }
 
-    const current = params.store.getByIssueId(params.ticket.linear_issue_id) ?? params.ticket;
     const heading = work.source === "human" ? "Latest human reply" : "New PR feedback";
     // A human `/implement` queued while a run was active must keep its
     // command meaning when drained — launching it as a resume would silently
