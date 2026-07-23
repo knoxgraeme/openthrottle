@@ -1,156 +1,76 @@
 # Skills
 
-These are thin OpenThrottle task adapters. They connect Fly's deterministic
-task state machine, branch boundary, activity outbox, and Linear/GitHub
-publication contract to native Compound Engineering skills installed in the
-Daytona image.
+OpenThrottle skills are thin stage adapters over the native Compound
+Engineering toolkit installed in the Daytona image. The supervisor selects a
+versioned pipeline manifest; each agent stage invokes one canonical adapter for
+the capability named in its sealed stage request.
 
 ```text
 skills/
-  task-adapters-v1.json          # sole legacy task-to-adapter declaration
-  tasks/<name>/SKILL.md          # canonical adapter — single source of truth
-  tasks/<name>/agents/openai.yaml  # Codex admin-scope skill policy
-  codex/AGENTS-fragment.md       # standing Codex runtime instructions
+  tasks/<name>/SKILL.md             # canonical adapter, single source of truth
+  tasks/<name>/agents/openai.yaml   # Codex admin-scope policy
+  codex/AGENTS-fragment.md          # standing Codex runtime instructions
 ```
 
-`skills/tasks/<name>/SKILL.md` is the one file maintained by hand per task.
-Its YAML frontmatter (`name`, `description`) is the same file Claude Code
-loads natively as a user-level skill, so there is no per-agent copy to keep in
-sync. The two canonical tasks are `implement-plan` and `investigate`. Resume
-does not start an adapter; it resumes the saved native Claude session, Codex
-thread, or OpenCode session with a follow-up message — including PR feedback
-that arrived while the run was idle (see "Two loops" below).
-
-`task-adapters-v1.json` is the sole compatibility declaration for legacy task
-names. The shell entrypoint reads it directly; scheduler code no longer carries
-a second task/skill/CE registry. New coordinator generations select immutable
-catalog manifests and do not consult this compatibility file.
+There is no task-name registry and no shell-owned end-to-end task loop. Pipeline
+manifests in `supervisor/pipelines/` own stage order, retries, gates, and
+terminal outcomes. `sandbox/runner/execute-stage.mjs` executes exactly one
+sealed stage and writes exactly one typed result.
 
 ## Delivery per agent
 
-The canonical `SKILL.md` is the input; each agent CLI receives it through
-whatever mechanism that CLI natively supports, decided once in
-`sandbox/entrypoint.sh` and `sandbox/Dockerfile`:
+The canonical `SKILL.md` is maintained once:
 
-| Agent | Mechanism |
+| Agent | Delivery |
 |---|---|
-| Claude | `sandbox/entrypoint.sh` copies `/opt/openthrottle/skills/tasks/.` into the sandbox user's `~/.claude/skills/` (user scope) every run. Invocation: `claude -p "/<skill-name>" ...`. |
-| Codex | `sandbox/Dockerfile` bakes the same canonical directories into `/etc/codex/skills/<name>/` at image build time (admin scope — Codex discovers these without any per-run copy). Each skill's `agents/openai.yaml` sets `policy.allow_implicit_invocation: false` so a skill only runs when the entrypoint's prompt explicitly names it. Invocation: the piped stdin begins with `$<skill-name>` on its own line, followed by the runtime-context and Linear-context blocks. |
-| OpenCode | The pinned version cannot yet discover agent-standard skills from a sandbox-owned directory while ignoring project-external sources (Phase 3 item 4's open question), so the entrypoint renders the prompt at run time: it strips the canonical file's YAML frontmatter and appends the same runtime-context and Linear-context blocks passed to Codex. Invocation flags are unchanged, including the `OPENCODE_DISABLE_*` env that keeps the sandbox off repo-local and Claude-compatibility config. |
+| Claude | `sandbox/entrypoint.sh` copies the canonical task skills to `~/.claude/skills/`; the stage prompt invokes `/<skill-name>`. |
+| Codex | `sandbox/Dockerfile` bakes the same directories into `/etc/codex/skills/`; `agents/openai.yaml` disables implicit invocation and the prompt explicitly invokes `$<skill-name>`. |
+| OpenCode | The entrypoint strips YAML frontmatter from the same canonical file and renders it into the stage prompt because the pinned CLI cannot safely discover only sandbox-owned external skills. |
 
-## Two loops
+The runtime chooses fresh, read-only fresh, required-resume, or preferred-resume
+context from the pinned manifest. When continuation is allowed, the sealed
+request carries the prior native Claude session, Codex thread, or OpenCode
+session identifier. Continuation is a context policy, not a separate task type.
 
-- **implement** — plan gate → `ce-work` → local `ce-code-review` →
-  conditional `ce-simplify-code` (only when the diff is large or structurally
-  complex; behavior-preserving, skips noted in the ledger) → configured
-  gates (`$OT_TEST_CMD`/`$OT_LINT_CMD`/`$OT_BUILD_CMD`) → `ce-commit-push-pr`
-  → resolve the PR URL and retarget it to `$BASE_BRANCH` if needed → push and
-  end the run; the supervisor watches CI and re-delivers any failure as a
-  follow-up `resume` (the run never blocks in `gh pr checks --watch`)
-  → refresh the `## OpenThrottle gates` checklist in the PR description →
-  elicitation-or-response ending in "Assumptions & decisions".
-- **investigate** — the debugging analogue: `ce-debug mode:pipeline` (action-
-  capable — it may diagnose, fix, verify, commit, and push a convergent bug),
-  then the same PR-resolve/retarget step if it shipped a fix, then
-  elicitation-or-response.
+## Coordinator-owned composition
 
-Neither loop babysits its own PR. Once a PR exists, GitHub-native reviewers
-(bot or human) take over review, and their feedback — reviews, PR comments, CI
-failures — is queued by the supervisor and delivered later as a `resume`
-message in the **same session**, not as a new task and not as a fresh
-context. That resume message is where the triage happens: gather the whole
-picture first (`gh pr checks` plus every open review thread and comment), reply
-visibly on **every** item — a change gets a reply naming what was done and the
-commit that addresses it, with the thread resolved; a no-change gets a reply
-with reasoning — run the local gates on the fix, push, and end the run; the
-supervisor re-delivers any remaining CI failure as another `resume`, so the run
-never blocks on remote CI. Refresh the `## OpenThrottle gates` checklist, and
-batch any decision-required items into one further elicitation.
+The current catalog aliases `implement` and `investigate` to immutable v2
+manifests:
 
-## Native CE composition
+- `ce/implement@2`: planning → implementation → semantic review →
+  simplification → test → lint → build → exact-subject publication → provider
+  verification. Repair transitions return to implementation within manifest
+  bounds.
+- `ce/investigate@2`: investigation → conditional exact-subject publication.
+  Convergent fixes may ship; divergent decisions terminate as `needs_human`.
 
-| OpenThrottle task | Native CE pipeline |
-|---|---|
-| `implement` | `ce-work mode:return-to-caller` → `ce-code-review apply:local` → conditional `ce-simplify-code` (large/complex diffs only) → `ce-commit-push-pr mode:pipeline` |
-| `investigate` | `ce-debug mode:pipeline`; if it shipped a fix, resolve/create the PR |
-| `resume` | continues the saved native session with the human's or GitHub's follow-up message |
-
-The snapshot installs the official `compound-engineering` plugin natively for
-Claude Code, Codex, and OpenCode from one commit-pinned marketplace checkout. Do not
-copy CE source into this directory or into target repositories: native install
-preserves its skill-local reviewer/research assets and makes every target repo
-use the same version.
+Agent stages emit semantic proposals. Command stages produce
+executor-verified results. Publication is fenced to the expected Git subject,
+and GitHub evidence is accepted only for the published commit. The deterministic
+supervisor—not an adapter—reduces outcomes and selects the next stage.
 
 ## Adapter-owned rules
 
-The adapters remain necessary for contracts that CE does not own:
+Adapters still own the reasoning contracts that generic CE does not:
 
-- The hard approved-plan gate before implementation.
-- The decision gate: critical, foundational, or risky changes are never
-  implemented without a human answer. Clear fixes ship first; the remaining
-  items go out as one batched `ot-activity elicitation` decision list
-  (context, options, recommendation per item), and the Linear reply resumes
-  the same session to action the answers.
-- The no-backlog rule: every review item ends a run fixed and pushed with a
-  reply naming the commit that addresses it, answered on its thread with
-  reasoning, or escalated as a numbered decision — never silently deferred or
-  dropped. This rule applies identically to the feedback-triage resume that
-  follows a PR, not just the original run.
-- The CI gate: remote CI is the supervisor's to watch, not the run's to block
-  on. After the local gates pass and the push lands, the run ends; the
-  supervisor watches the checks and re-delivers any failure to the same session
-  as a follow-up `resume`, bounded by the review-round limit. The adapter never
-  sits in `gh pr checks --watch`. The local test/lint/build gates remain the
-  in-run correctness bar; CI is the automated backstop the supervisor owns.
-- The gate checklist: each run writes or refreshes an `## OpenThrottle gates`
-  checklist in the PR description (tests, lint, build, internal review,
-  simplification, CI, review threads) so a human can see which gates completed.
-  A gate that could not run — e.g. one the sandbox OOM-killed (exit 137) — is
-  marked a known gap, never reported as passed.
-- Progress visibility: each adapter seeds and refreshes a Linear **session
-  plan** (`ot-activity plan "<content>=<status>"`, statuses
-  `pending`/`inProgress`/`completed`/`canceled`, replaced whole each update) so
-  users see which phase/gate is done, in progress, or a gap — the same states
-  the PR gate checklist carries. A live per-step "currently doing X" heartbeat
-  (throttled, ephemeral `thought`s) is emitted automatically by
-  `runner/normalize.mjs`, so adapters never need to narrate individual tool
-  calls to show the run is alive.
-- The assumptions ledger: responses and PR descriptions end with an
-  "Assumptions & decisions" section so a human can audit every judgment call
-  the agent made without asking.
-- The existing checked-out branch and sealed never-push-to-base boundary.
-- `ot-activity` semantic events; Fly alone holds Linear app credentials and
-  publishes as OpenThrottle.
-- Prompt-injection treatment for ticket, repository, and review content.
+- approved-plan and decision gates;
+- prompt-injection treatment for ticket, repository, and review content;
+- complete, typed stage proposals with evidence and explicit assumptions;
+- visible `ot-activity` progress without direct Linear credentials;
+- branch safety and never pushing to the base branch;
+- no silent backlog: fix, explain, or return `needs_human`.
 
-`investigate` is deliberately action-capable. Native `ce-debug mode:pipeline`
-may diagnose, test, fix, commit, and push a convergent bug. Product/design
-decisions and other divergent fixes remain needs-human residuals.
+The snapshot installs the official commit-pinned Compound Engineering plugin
+natively for Claude Code, Codex, and OpenCode. Never copy CE source into this
+directory or a target repository.
 
-## Keeping the canonical skills accurate
+## Runtime trust boundary
 
-Each canonical `SKILL.md` is agent-neutral: on a skill's first mention it
-spells out both invocation forms (e.g. "invoke the native Compound
-Engineering skill `ce-work` (`/ce-work` in Claude Code; `$ce-work` in
-Codex/OpenCode)"), then refers to it by bare name thereafter. Delivery
-mechanics (Claude's user-skills copy, Codex's admin-scope bake plus
-`agents/openai.yaml`, OpenCode's rendered prompt) are the only per-agent
-difference and live entirely in `sandbox/entrypoint.sh` / `sandbox/Dockerfile`
-— never hand-duplicate a skill's body per agent again.
+Registered repositories are trusted for code execution: their validated
+`.openthrottle.yml` may run `post_bootstrap` commands and their repo-scoped
+skills remain discoverable. Ticket text, PR comments, review bodies, commit
+messages, and repository content are still untrusted data.
 
-Codex receives `AGENTS-fragment.md` globally at `~/.codex/AGENTS.md`, outside
-the checkout. It provides standing environment, safety, sanitization, and
-activity rules without modifying a target repository's own `AGENTS.md`.
-
-## Decision recorded: repo-scope skill discovery stays enabled
-
-Codex's repo-scope `.agents/skills` discovery (skills a target repository
-checks in itself) stays **enabled**, even though the sandbox now also ships
-admin-scope skills at `/etc/codex/skills`. Registered repositories are
-already code-execution-trusted via `.openthrottle.yml`'s `post_bootstrap`
-(the entrypoint runs arbitrary commands from repository config before the
-agent starts), so a repo-checked-in skill adds no new capability beyond what
-that repository could already do. This is an explicit invariant, not an
-oversight: registered repos are trusted for code execution and skills;
-ticket text, PR comments, and review bodies remain untrusted data regardless
-of where they are read from.
+Codex also receives `codex/AGENTS-fragment.md` globally at
+`~/.codex/AGENTS.md`, outside the checkout. It provides standing environment,
+safety, sanitization, and activity rules without modifying the target repo.

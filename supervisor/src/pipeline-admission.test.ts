@@ -1,4 +1,3 @@
-import type { Daytona } from "@daytona/sdk";
 import type Database from "better-sqlite3";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -25,25 +24,16 @@ function config(): Config {
     linearClientSecret: "secret",
     githubWebhookSecret: "github-webhook",
     githubToken: "github-token",
-    githubRepo: "owner/repo",
-    githubRepoMappings: {},
-    githubRepoLabelMappings: {},
+    githubReadToken: "github-read-token",
     daytonaApiKey: "daytona",
     daytonaSnapshot: "snapshot",
     defaultAgent: "codex",
     claudeCodeOauthToken: undefined,
     codexAuthJson: "{}",
     kimiCodeApiKey: undefined,
-    baseBranch: "main",
-    maxTurns: 20,
     taskTimeout: 300,
-    callbackGraceSeconds: 10,
-    devPort: 3000,
-    sweepMaxAgeDays: 14,
     orphanGraceMinutes: 5,
     webhookMaxAgeSeconds: 60,
-    reviewMaxRounds: 3,
-    reviewNudgeComment: "",
     allowLinearMerge: false,
     sandboxEventPollIntervalMs: 5_000,
     stallTimeoutSeconds: 900,
@@ -82,6 +72,14 @@ describe("pipeline admission", () => {
   async function run(repositoryConfig: string, overrides: Partial<Config> = {}) {
     db = openDb(":memory:");
     const tickets = createTicketStore(db);
+    tickets.registerRepository({
+      linearTeamKey: "OT",
+      linearTeamId: "team-1",
+      githubRepo: "owner/repo",
+      baseBranch: "main",
+      webhookId: 1,
+      snapshot: "snapshot",
+    });
     const pipelines = createPipelineStore(db);
     const runtime = buildInstalledRuntimeDescriptor("admission-test/v1");
     const catalog = loadPipelineCatalog(catalogPath, runtime.descriptor);
@@ -115,18 +113,12 @@ describe("pipeline admission", () => {
       process: vi.fn(async () => undefined),
       drain: vi.fn(async () => undefined),
     };
-    const sandbox = {
-      stop: vi.fn(async () => undefined),
-      delete: vi.fn(async () => undefined),
-    };
-    const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
     const invoke = async (
       overrides: Partial<Config> = {},
       event = payload()
     ) => handleLinearEvent(
       { ...config(), ...overrides },
       tickets,
-      daytona,
       async () => linear,
       outbox,
       event,
@@ -138,15 +130,13 @@ describe("pipeline admission", () => {
       pipelines,
       githubFetch,
       invoke,
-      daytona,
-      sandbox,
       setRepositoryConfig(value: string) {
         currentRepositoryConfig = value;
       },
     };
   }
 
-  it("pins a new generation and creates no legacy run or sandbox", async () => {
+  it("pins a new generation without a direct task run or sandbox", async () => {
     const { tickets, pipelines, githubFetch } = await run(`
 agent: codex
 pipelines: { implement: implement }
@@ -201,7 +191,7 @@ mcp_servers: {}
   it("keeps an existing coordinator session pinned on a duplicate delegation", async () => {
     const { pipelines, githubFetch, invoke } = await run("pipelines: { implement: implement }\n");
     const before = pipelines.getInstanceForSession("session-1")!;
-    expect(pipelines.getSessionExecutionMode("session-1")).toBe("pipeline");
+    expect(pipelines.getInstanceForSession("session-1")).toEqual(before);
 
     await invoke();
 
@@ -210,7 +200,7 @@ mcp_servers: {}
     expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
   });
 
-  it("routes a prompted stop through the pinned pipeline without starting legacy work", async () => {
+  it("routes a prompted stop through the pinned pipeline", async () => {
     const { tickets, pipelines, invoke } = await run("pipelines: { implement: implement }\n");
     const instance = pipelines.getInstanceForSession("session-1")!;
     const prompted = parseLinearWebhook(JSON.stringify({
@@ -233,12 +223,12 @@ mcp_servers: {}
       expect.objectContaining({ kind: "provision", status: "dead" }),
       expect.objectContaining({ kind: "stop", status: "pending" }),
     ]));
-    expect(db!.prepare("SELECT COUNT(*) FROM session_work").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'session_work'").pluck().get()).toBe(0);
     expect(db!.prepare("SELECT COUNT(*) FROM session_inbox").pluck().get()).toBe(0);
     expect(tickets.getByIssueId("issue-1")?.run_id).toBeNull();
   });
 
-  it("rejects an idle pipeline reply instead of falling back to a legacy resume", async () => {
+  it("rejects an idle pipeline reply instead of starting another task", async () => {
     const { pipelines, invoke } = await run("pipelines: { implement: implement }\n");
     const instance = pipelines.getInstanceForSession("session-1")!;
     const prompted = parseLinearWebhook(JSON.stringify({
@@ -255,14 +245,14 @@ mcp_servers: {}
 
     expect(pipelines.getInstance(instance.id)?.status).toBe("dispatchable");
     expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
-    expect(db!.prepare("SELECT COUNT(*) FROM session_work").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'session_work'").pluck().get()).toBe(0);
     expect(db!.prepare("SELECT COUNT(*) FROM session_inbox").pluck().get()).toBe(0);
     const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
     expect(payloads.some((entry) => entry.includes("does not accept live steering"))).toBe(true);
   });
 
-  it("never reuses an earlier pipeline workspace through the legacy launcher on re-delegation", async () => {
-    const { tickets, pipelines, invoke, sandbox } = await run("pipelines: { implement: implement }\n");
+  it("supersedes an earlier pipeline generation on re-delegation", async () => {
+    const { tickets, pipelines, invoke } = await run("pipelines: { implement: implement }\n");
     const previous = pipelines.getInstanceForSession("session-1")!;
     tickets.setSandboxId("issue-1", "sandbox-old");
 
@@ -270,7 +260,6 @@ mcp_servers: {}
 
     const current = pipelines.getInstanceForSession("session-2")!;
     expect(current.id).not.toBe(previous.id);
-    expect(pipelines.getSessionExecutionMode("session-2")).toBe("pipeline");
     expect(pipelines.getInstance(previous.id)).toMatchObject({
       status: "superseded",
       terminal_outcome: "superseded",
@@ -280,13 +269,14 @@ mcp_servers: {}
       sandbox_id: null,
       run_id: null,
     });
-    expect(sandbox.stop).toHaveBeenCalledOnce();
-    expect(sandbox.delete).toHaveBeenCalledOnce();
+    expect(pipelines.listEffects(previous.id)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "stop", status: "pending" }),
+    ]));
     expect(tickets.db.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
   });
 
   it("does not retire the current generation when re-delegation selects an invalid pipeline", async () => {
-    const { tickets, pipelines, invoke, sandbox, setRepositoryConfig } =
+    const { tickets, pipelines, invoke, setRepositoryConfig } =
       await run("pipelines: { implement: implement }\n");
     const previous = pipelines.getInstanceForSession("session-1")!;
     tickets.setSandboxId("issue-1", "sandbox-old");
@@ -299,13 +289,11 @@ mcp_servers: {}
       terminal_outcome: null,
     });
     expect(pipelines.getInstanceForSession("session-2")).toBeUndefined();
-    expect(pipelines.getSessionExecutionMode("session-2")).toBeUndefined();
     expect(tickets.getByIssueId("issue-1")).toMatchObject({
       linear_session_id: "session-1",
       sandbox_id: "sandbox-old",
       run_id: null,
     });
-    expect(sandbox.stop).not.toHaveBeenCalled();
-    expect(sandbox.delete).not.toHaveBeenCalled();
+    expect(pipelines.listEffects(previous.id).some((effect) => effect.kind === "stop")).toBe(false);
   });
 });

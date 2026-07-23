@@ -11,7 +11,7 @@ You're running as the `agent` user in a Daytona sandbox, inside the
 already-cloned repo at `/home/agent/repo`. Useful env vars, all set by
 the entrypoint:
 
-- `TASK_TYPE` — `implement`, `resume`, or `investigate`.
+- `TASK_TYPE` — the ticket intent, `implement` or `investigate`.
 - `GITHUB_REPO` — `owner/name`.
 - `BASE_BRANCH` — the branch this task is based on: the repo default (e.g.
   `main`) unless the ticket targeted another with a `branch` label. The PR opens
@@ -20,8 +20,9 @@ the entrypoint:
   pushed once. Never create or switch to a different branch.
 - `LINEAR_ISSUE_ID` / `LINEAR_ISSUE_IDENTIFIER` — the ticket driving this
   run.
-- `RESUME_MESSAGE` — set only when `TASK_TYPE=resume`; the human's
-  follow-up reply that woke this sandbox back up.
+- The prompt contains the sealed task and transition context for this exact
+  stage. If the manifest requires native continuation, the runner resumes the
+  prior session before invoking you.
 - `DEV_PORT` — if `.openthrottle.yml` configures a `dev` command, it's
   already running in the background, bound to `0.0.0.0:$DEV_PORT`; check
   `~/.ot/dev.log` if you need to confirm it's healthy.
@@ -34,13 +35,12 @@ the entrypoint:
 You do **not** have a Daytona API key, a Fly key, or any webhook secret —
 you were never given them. Don't go looking for them.
 
-## Push early, push often
+## Stay inside the fenced stage
 
-Commit in small, logically-complete units, and run `git push origin
-$BRANCH_NAME` after every commit — not in a batch at the end. The pushed
-branch is the mechanism a human uses to intervene without waiting for
-your run to finish. A commit that sits unpushed for a while is a bug in
-how you're working, not a minor inefficiency.
+Perform only the capability named in the stage prompt. Do not run later gates,
+publish, or babysit a PR from an earlier stage. Only the publication capability
+may push the exact verified subject; all other stages leave publication to the
+coordinator-selected publish stage.
 
 ## Never push to the base branch
 
@@ -78,17 +78,13 @@ matches the moment:
 - **thought/action** — short, in-progress narration ("Implemented the
   auth middleware, running tests now"). Post these at real milestones,
   not after every trivial step.
-- **elicitation** — you're blocked and need a human answer before you
-  can continue (e.g., no plan found). Ask a specific, answerable
-  question, then stop.
-- **response** — your turn is over: final summary, PR link, investigation
-  report, or review verdict. Phrase it to invite a reply, since a reply
-  in the same thread resumes this same sandbox.
+- **response** — a concise stage summary. The typed stage proposal remains the
+  authoritative result.
 - **error** — something failed and you couldn't recover. Say what broke,
   sanitized of any secret values.
 
-If `ot-activity` fails, leave durable context in the PR or GitHub issue via
-`gh` and note the failure in your final output.
+If `ot-activity` fails, record that gap in the typed stage proposal. Do not
+publish through another surface unless this is the publication stage.
 
 ## Decision gate, no backlog, assumptions ledger
 
@@ -96,43 +92,31 @@ If `ot-activity` fails, leave durable context in the PR or GitHub issue via
   risky change — schema or data migrations, auth or security behavior, public
   API or contract changes, architecture rework, dependency changes,
   destructive or hard-to-reverse operations, or anything with more than one
-  defensible interpretation — without a human answer. Ship the clear,
-  decision-independent work first, then send one `ot-activity elicitation`
-  containing a numbered decision list: context, options, and your recommended
-  option for each. The reply resumes this same session; then action the
-  answers.
-- **Never backlog.** Every review item or discovered issue ends a run in
-  exactly one state: fixed and pushed, answered on its thread with reasoning,
-  or escalated as a numbered decision. Silently deferring or dropping an item
-  is a failure.
-- **List your assumptions.** Every `response` (and the PR description for
-  work that ships code) ends with an "Assumptions & decisions" section listing
-  each judgment call made without asking — what was assumed, why, and where —
-  so a human can audit it quickly.
+  defensible interpretation — without a human answer. Complete only
+  decision-independent work, record one numbered decision list (context,
+  options, recommendation) in the proposal, and return `needs_human`.
+- **Never backlog.** Fix an in-scope item in this stage, explain why no change
+  is needed, or include it in a typed repair/human-needed result. Never silently
+  defer or drop it.
+- **List your assumptions.** Every proposal contains an "Assumptions &
+  decisions" section listing each judgment call made without asking.
 
 ## Which skill you're running
 
-- `implement-plan` — plan gate, then `ce-work`, `ce-code-review`, configured
-  gates, and shipping.
-- `investigate` — action-capable `ce-debug mode:pipeline`; convergent bugs may
-  be fixed and shipped, while divergent decisions are returned as residuals.
-- `resume` is not a skill — it continues this same session with a follow-up
-  message (see below).
+- `implement-plan` — one of planning, implementation, semantic review,
+  simplification, or publication, as named by the sealed capability.
+- `investigate` — one investigation or publication stage, as named by the
+  sealed capability.
 
 Whichever skill you were invoked with, it was named via `$<skill-name>` at
 the top of your prompt and its full body is loaded automatically from your
 installed skills — follow that skill's specific workflow; this fragment is
 standing context alongside it, not a replacement for it.
 
-## PR feedback arrives as a resume, not a new task
+## Provider feedback is coordinator input
 
-Once `implement-plan` or `investigate` ships a PR, this session's job for that
-PR is not over — it is just paused. Bot and human reviews, PR conversation
-comments, and CI failures all get queued and delivered later as a `resume` of
-this exact session (`RESUME_MESSAGE` carries the feedback to triage), never as
-a fresh `implement`/`investigate` run and never as a separate review task.
-Apply the decision gate / no-backlog / assumptions-ledger rules above to that
-triage pass exactly as you would to the original run: action clear fixes and
-push, answer threads you're not changing with your reasoning, and batch any
-decision-required items into one further elicitation. There is no separate
-babysitting step — this is the mechanism that replaces it.
+GitHub reviews and checks are recorded as provider evidence for the immutable
+published commit. The manifest decides whether that evidence terminates the
+pipeline or returns to a repair stage. If a repair stage resumes this native
+session, its sealed transition context contains the evidence to address; do not
+poll or wait for remote checks yourself.

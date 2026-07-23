@@ -1,6 +1,6 @@
 // Feature 1: the heartbeat-silence reaper.
 //
-// `expireRun` (run-lifecycle.ts) enforces the *hard* wall-clock cap: a run is
+// `reapExpiredRuns` enforces the *hard* wall-clock cap: a run is
 // killed once `runs.expires_at` passes, regardless of what it is doing. That
 // does nothing for a run that wedges early — an agent that stops emitting
 // anything while still an hour short of the 2h cap keeps a live Daytona sandbox
@@ -68,7 +68,7 @@ export async function reapStalledRuns(params: {
           reason: message,
           status: "timed_out",
           ticketState: "error",
-          onSettled: params.pipelines && pipeline
+          onSettled: pipeline
             ? () => processPipelineInfrastructureFailure({ store: params.pipelines!, runId: run.id })
             : undefined,
         });
@@ -98,5 +98,61 @@ export async function reapStalledRuns(params: {
     }
   } finally {
     store.releaseSupervisorLease("stalled-run-reaper", owner);
+  }
+}
+
+export async function reapExpiredRuns(params: {
+  daytona: Daytona;
+  store: TicketStore;
+  linearOutbox: LinearOutboxProcessor;
+  pipelines: PipelineStore;
+}): Promise<void> {
+  const owner = `expiry-reaper-${randomUUID()}`;
+  for (const run of params.store.listExpiredRuns(new Date().toISOString())) {
+    const ticket = params.store.getByIssueId(run.linear_issue_id);
+    if (!ticket) continue;
+    const attempt = params.pipelines.getAttemptForRun(run.id);
+    if (!attempt) continue;
+    const pipeline = params.pipelines.getInstance(attempt.pipeline_instance_id);
+    if (!pipeline) continue;
+    const message = `OpenThrottle ${run.task_type} stage exceeded its hard execution timeout.`;
+    try {
+      const settlement = await terminateAndSettleActor({
+        daytona: params.daytona,
+        store: params.store,
+        runId: run.id,
+        sandboxId: ticket.sandbox_id,
+        owner,
+        reason: message,
+        status: "timed_out",
+        ticketState: "error",
+        onSettled: () => processPipelineInfrastructureFailure({
+          store: params.pipelines,
+          runId: run.id,
+        }),
+      });
+      if (settlement.kind === "quarantined") {
+        if (params.pipelines.getRuntimeResource(pipeline.id)) {
+          params.pipelines.setRuntimeResourceStatus(pipeline.id, "quarantined");
+        }
+        await tryPostError(
+          params.store,
+          params.linearOutbox,
+          run.linear_session_id ?? ticket.linear_session_id,
+          ticket.linear_issue_id,
+          settlement.message
+        );
+      } else if (settlement.kind === "settled") {
+        await tryPostError(
+          params.store,
+          params.linearOutbox,
+          run.linear_session_id ?? ticket.linear_session_id,
+          ticket.linear_issue_id,
+          message
+        );
+      }
+    } catch (error) {
+      console.error(`[reaper] failed to reap expired run ${run.id}:`, error);
+    }
   }
 }

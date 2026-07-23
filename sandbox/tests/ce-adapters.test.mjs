@@ -39,21 +39,14 @@ function allSkillsText() {
 }
 
 describe("OpenThrottle canonical task skills", () => {
-  it("uses one data registry for the legacy compatibility mapping", () => {
-    const registry = JSON.parse(readFileSync(resolve(skillsRoot, "task-adapters-v1.json"), "utf8"));
-    expect(registry).toMatchObject({
-      schema: "openthrottle.task-adapters/v1",
-      tasks: {
-        implement: { skill: "implement-plan" },
-        investigate: { skill: "investigate" },
-        resume: { legacyPipeline: ["resume"] },
-      },
-    });
+  it("has no task registry or direct task scheduler", () => {
+    expect(existsSync(resolve(skillsRoot, "task-adapters-v1.json"))).toBe(false);
     const runtime = readFileSync(resolve(repoRoot, "sandbox/lib/runtime.sh"), "utf8");
     const entrypoint = readFileSync(resolve(repoRoot, "sandbox/entrypoint.sh"), "utf8");
-    const scheduler = readFileSync(resolve(repoRoot, "supervisor/src/scheduler.ts"), "utf8");
-    expect(`${runtime}\n${entrypoint}`).not.toMatch(/task_skill_name|task_ce_pipeline/);
-    expect(scheduler).not.toContain("LOOP_REGISTRY");
+    expect(`${runtime}\n${entrypoint}`).not.toMatch(
+      /task_adapter_value|task-adapters-v1|RUN_CALLBACK_TOKEN|RESUME_MESSAGE/
+    );
+    expect(existsSync(resolve(repoRoot, "supervisor/src/scheduler.ts"))).toBe(false);
   });
 
   it("keeps CE v2 execution policies aligned with installed stage contracts", () => {
@@ -141,8 +134,8 @@ describe("OpenThrottle canonical task skills", () => {
 
   it("implement-plan keeps the plan gate, decision gate, and assumptions ledger", () => {
     const body = skillBody("implement-plan");
-    expect(body).toContain("stop without changing code");
-    expect(body).toContain("elicitation");
+    expect(body).toContain("Missing or materially ambiguous acceptance criteria");
+    expect(body).toContain("needs_human");
     expect(body).toContain("Assumptions & decisions");
     expect(body).toContain(
       "critical, foundational, or risky",
@@ -168,21 +161,15 @@ describe("OpenThrottle canonical task skills", () => {
     expect(body).toContain("supervisor-owned stage");
   });
 
-  it("implement-plan runs configured gates before ce-commit-push-pr", () => {
+  it("keeps configured commands and provider evidence outside agent stages", () => {
     const body = skillBody("implement-plan");
-    const testGate = body.indexOf("$OT_TEST_CMD");
-    const lintGate = body.indexOf("$OT_LINT_CMD");
-    const buildGate = body.indexOf("$OT_BUILD_CMD");
-    const createPr = body.lastIndexOf("ce-commit-push-pr");
-
-    expect(testGate).toBeGreaterThan(-1);
-    expect(lintGate).toBeGreaterThan(testGate);
-    expect(buildGate).toBeGreaterThan(lintGate);
-    expect(createPr).toBeGreaterThan(buildGate);
+    expect(body).toMatch(/`test`, `lint`, and `build` commands are separate sealed command\s+stages/);
+    expect(body).toContain("Provider evidence is a supervisor-owned stage");
+    expect(body).not.toContain("$OT_TEST_CMD");
   });
 
   it("implement-plan retargets the PR to the task base branch", () => {
-    expect(skillBody("implement-plan")).toContain('--base "$BASE_BRANCH"');
+    expect(skillBody("implement-plan")).toContain("targets `$BASE_BRANCH`");
   });
 
   it("investigate is action-capable and invokes ce-debug", () => {
@@ -195,36 +182,29 @@ describe("OpenThrottle canonical task skills", () => {
 
   it("investigate keeps the decision gate and assumptions ledger", () => {
     const body = skillBody("investigate");
-    expect(body).toContain("elicitation");
+    expect(body).toContain("needs_human");
     expect(body).toContain("Assumptions & decisions");
   });
 
   it("investigate retargets the PR to the task base branch", () => {
-    expect(skillBody("investigate")).toContain('--base "$BASE_BRANCH"');
+    expect(skillBody("investigate")).toContain("targets `$BASE_BRANCH`");
   });
 
-  it("both skills reference ot-activity and the resume-carries-feedback contract", () => {
+  it("both skills reference activity and remain single-stage adapters", () => {
     for (const task of tasks) {
       const body = skillBody(task);
       expect(body).toContain("ot-activity");
-      expect(body).toContain("resume");
+      expect(body).toContain("Execute only");
+      expect(body).not.toContain("follow-up `resume`");
     }
   });
 
-  it("both skills hand remote CI to the supervisor, reply on every feedback item, and keep a PR gate checklist", () => {
+  it("both skills leave remote CI to the provider stage and keep a PR gate checklist", () => {
     for (const task of tasks) {
       const body = skillBody(task);
-      // Remote CI is the supervisor's to watch: the run pushes and ends, and a
-      // CI failure returns as a follow-up resume. The adapter takes a
-      // non-blocking `gh pr checks` snapshot but never blocks in `--watch`.
-      expect(body).toContain("gh pr checks");
+      expect(body).toContain("Do not poll or wait");
       expect(body).not.toContain("--watch");
-      expect(body).toContain("resume");
-      // A visible, auditable gate checklist lives in the PR description.
       expect(body).toContain("## OpenThrottle gates");
-      // Every feedback item gets a visible reply — not just non-actionable
-      // ones — so it is always clear what was actioned.
-      expect(body).toContain("EVERY item");
     }
   });
 

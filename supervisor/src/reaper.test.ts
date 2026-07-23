@@ -198,7 +198,7 @@ describe("reapStalledRuns", () => {
     expect(store.beginRun({
       issueId: "wedged",
       runId: "replacement",
-      taskType: "resume",
+      taskType: "implement",
       tokenHash: "hash",
       expiresAt: "2999-01-01T00:00:00.000Z",
     })).toBe(false);

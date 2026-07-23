@@ -35,7 +35,6 @@ export interface FeedbackRecordParams {
   kind: string;
   payload: string;
   workItemId: string;
-  workBody?: string;
   receivedAt?: string;
 }
 
@@ -188,23 +187,13 @@ export function createFeedbackStore(db: Database.Database): FeedbackStore {
       return { status: "claimed" as const, snapshot };
     }
     const completedRounds = (db.prepare(`
-      SELECT
-        (SELECT COUNT(*) FROM feedback_snapshots fs
-          WHERE fs.linear_issue_id = ? AND fs.linear_session_id = ?
-            AND fs.generation = ? AND fs.repair_round IS NOT NULL)
-        +
-        (SELECT COUNT(*) FROM session_work sw
-          WHERE sw.linear_issue_id = ? AND sw.linear_session_id = ?
-            AND sw.source = 'automatic' AND sw.status = 'consumed'
-            AND NOT EXISTS (
-              SELECT 1 FROM feedback_snapshots linked WHERE linked.work_item_id = sw.id
-            )) AS count
+      SELECT COUNT(*) AS count FROM feedback_snapshots
+      WHERE linear_issue_id = ? AND linear_session_id = ?
+        AND generation = ? AND repair_round IS NOT NULL
     `).get(
       snapshot.linear_issue_id,
       snapshot.linear_session_id,
-      snapshot.generation,
-      snapshot.linear_issue_id,
-      snapshot.linear_session_id
+      snapshot.generation
     ) as {
       count: number;
     }).count;

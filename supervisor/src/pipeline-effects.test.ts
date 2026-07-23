@@ -14,6 +14,64 @@ describe("pipeline effect processor", () => {
   let db: Database.Database | undefined;
   afterEach(() => db?.close());
 
+  function harness(issueId: string, sessionId: string) {
+    db = openDb(":memory:");
+    const tickets = createTicketStore(db);
+    const pipelines = createPipelineStore(db);
+    const runtimeDescriptor = buildInstalledRuntimeDescriptor("effect-exhaustion-test/v1");
+    const catalog = loadPipelineCatalog(catalogPath, runtimeDescriptor.descriptor);
+    pipelines.acceptRuntimeDescriptor(runtimeDescriptor);
+    pipelines.acceptCatalog(catalog);
+    const config = pipelines.saveRepositoryConfigSnapshot({
+      repository: "owner/repo",
+      baseCommit: "a".repeat(40),
+      blobSha: "b".repeat(40),
+      config: parseRepositoryConfig("pipelines: { implement: fixture-command }\ntest: npm test\n"),
+    });
+    const manifest = catalog.manifests.get("fixture/command@2")!;
+    tickets.upsert({
+      linear_issue_id: issueId,
+      linear_issue_identifier: issueId.toUpperCase(),
+      linear_session_id: sessionId,
+      sandbox_id: null,
+      branch: `ot/${issueId}`,
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+      pipeline: {
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        manifest,
+        repositoryConfig: config,
+        runtime: runtimeDescriptor,
+        authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "investigate",
+      },
+    });
+    const runtime = {
+      provision: vi.fn(async () => ({ providerResourceId: `sandbox-${issueId}` })),
+      bootstrap: vi.fn(async () => undefined),
+      materializeCredentials: vi.fn(async () => undefined),
+      dispatchStage: vi.fn(async () => ({ providerDispatchId: `dispatch-${issueId}` })),
+      collectStageResult: vi.fn(async () => null),
+      renewLiveness: vi.fn(async () => ({ observedAt: new Date().toISOString() })),
+      stop: vi.fn(async () => ({ confirmed: true })),
+      quarantine: vi.fn(async () => undefined),
+      cleanup: vi.fn(async () => undefined),
+    } satisfies SandboxRuntime;
+    const processor = createPipelineEffectProcessor({
+      store: pipelines,
+      tickets,
+      runtime,
+      taskTimeoutSeconds: 300,
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+    });
+    const instance = pipelines.getInstanceForSession(sessionId)!;
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    return { tickets, pipelines, runtime, processor, instance, attempt };
+  }
+
   it("provisions, seals, credentials, and dispatches the first stage exactly through the durable intent", async () => {
     db = openDb(":memory:");
     const tickets = createTicketStore(db);
@@ -67,7 +125,6 @@ describe("pipeline effect processor", () => {
       tickets,
       runtime,
       taskTimeoutSeconds: 300,
-      callbackGraceSeconds: 10,
       now: () => new Date("2099-07-22T12:00:00.000Z"),
     });
 
@@ -139,7 +196,9 @@ describe("pipeline effect processor", () => {
     await processor.drain();
 
     expect(pipelines.getRuntimeResource(instance.id)?.status).toBe("active");
-    expect(tickets.getRun(attempt.planned_run_id!)).toMatchObject({ status: "running" });
+    // A failed remote stop retains the actor claim and ticket exclusivity
+    // until the same idempotent effect confirms termination.
+    expect(tickets.getRun(attempt.planned_run_id!)).toMatchObject({ status: "reaping" });
     expect(pipelines.listEffects(instance.id).find((effect) => effect.kind === "stop"))
       .toMatchObject({ status: "failed", attempts: 1 });
 
@@ -155,7 +214,7 @@ describe("pipeline effect processor", () => {
       status: "completion_pending_publication",
       terminal_outcome: "canceled",
     });
-    expect(pipelines.getRuntimeResource(instance.id)?.status).toBe("stopped");
+    expect(pipelines.getRuntimeResource(instance.id)?.status).toBe("cleaned");
     expect(tickets.getRun(attempt.planned_run_id!)).toMatchObject({ status: "stopped" });
     expect(tickets.getByIssueId("issue-1")).toMatchObject({
       state: "stopped",
@@ -247,7 +306,6 @@ describe("pipeline effect processor", () => {
       tickets,
       runtime,
       taskTimeoutSeconds: 300,
-      callbackGraceSeconds: 10,
       now: () => new Date("2099-07-22T12:00:00.000Z"),
     });
 
@@ -269,5 +327,68 @@ describe("pipeline effect processor", () => {
       expect.objectContaining({ kind: "provision", status: "dead" }),
       expect.objectContaining({ kind: "stop", status: "acknowledged" }),
     ]));
+  });
+
+  it("atomically converts exhausted provisioning into a typed failed terminal and stop cleanup", async () => {
+    const { tickets, pipelines, runtime, processor, instance } = harness("issue-3", "session-3");
+    runtime.provision.mockRejectedValue(new Error("provider unavailable"));
+    db!.prepare(`
+      UPDATE pipeline_effect_intents SET attempts = 7
+      WHERE pipeline_instance_id = ? AND kind = 'provision'
+    `).run(instance.id);
+    db!.prepare(`
+      UPDATE pipeline_instance_stages SET reentry_count = 2
+      WHERE pipeline_instance_id = ? AND stage_id = 'test'
+    `).run(instance.id);
+
+    await processor.drain();
+
+    expect(pipelines.getInstance(instance.id)).toMatchObject({
+      status: "completion_pending_publication",
+      terminal_outcome: "failed",
+    });
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.kind === "provision"))
+      .toMatchObject({ status: "dead", attempts: 8, last_error: expect.stringContaining("provider unavailable") });
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.kind === "stop"))
+      .toMatchObject({ status: "pending" });
+
+    await processor.drain();
+
+    expect(tickets.getByIssueId("issue-3")).toMatchObject({ state: "error", run_id: null });
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.kind === "stop"))
+      .toMatchObject({ status: "acknowledged" });
+  });
+
+  it("quarantines the runtime and retains exclusivity when stop attempts exhaust", async () => {
+    const { tickets, pipelines, runtime, processor, instance, attempt } = harness("issue-4", "session-4");
+    await processor.drain();
+    requestPipelineStop({
+      store: pipelines,
+      sessionId: "session-4",
+      eventId: "operator-stop:exhaustion",
+      reason: "Stopped by test.",
+    });
+    db!.prepare(`
+      UPDATE pipeline_effect_intents SET attempts = 7
+      WHERE pipeline_instance_id = ? AND kind = 'stop'
+    `).run(instance.id);
+    runtime.stop.mockResolvedValue({ confirmed: false });
+
+    await processor.drain();
+
+    expect(tickets.getRun(attempt.planned_run_id!)).toMatchObject({ status: "reaping" });
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.kind === "stop"))
+      .toMatchObject({ status: "dead", attempts: 8 });
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.kind === "quarantine"))
+      .toMatchObject({ status: "pending" });
+
+    await processor.drain();
+
+    expect(runtime.quarantine).toHaveBeenCalledOnce();
+    expect(pipelines.getRuntimeResource(instance.id)?.status).toBe("quarantined");
+    expect(tickets.getRun(attempt.planned_run_id!)).toMatchObject({ status: "quarantined" });
+    expect(tickets.getByIssueId("issue-4")).toMatchObject({ state: "error", run_id: attempt.planned_run_id });
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.kind === "quarantine"))
+      .toMatchObject({ status: "acknowledged" });
   });
 });

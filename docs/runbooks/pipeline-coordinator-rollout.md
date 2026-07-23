@@ -2,7 +2,7 @@
 
 OpenThrottle is a pre-production proof of concept with no installed consumer
 population. Every newly delegated generation therefore uses the configurable
-pipeline coordinator. There is no repository cohort, legacy-drain period, or
+pipeline coordinator. There is no repository cohort, consumer-drain period, or
 production soak gate.
 
 ## Required local evidence
@@ -29,7 +29,7 @@ run, use one registered test repository/team and capture:
 - terminal Linear acknowledgement and sandbox cleanup.
 
 Skipping this exercise is a documented verification gap, not a reason to add
-an inactive legacy execution cohort.
+an inactive alternate execution cohort.
 
 ## Failure handling
 
@@ -37,11 +37,15 @@ an inactive legacy execution cohort.
   error.
 - Runtime or subject-fence failure: stop the actor, quarantine the resource if
   termination cannot be confirmed, and retain the durable evidence.
+- An accepted operator stop returns `202 stop_requested` until the durable stop
+  effect confirms termination; only then does it return `200 stopped`.
+- `/status` and ticket log headers expose outstanding/dead effect state and
+  publication error/recovery fields for operator diagnosis.
 - Publication failure: leave the receipt retryable or publication-blocked and
   use the operator retry endpoint after correcting the cause.
 - Schema/runtime incompatibility: do not deploy the incompatible revision;
   restore the POC database snapshot if one exists.
 
-Destructive schema contraction remains a separate change. The current legacy
-columns may remain as historical migration scaffolding, but they do not gate or
+Destructive schema contraction remains a separate change. Historical columns
+may remain as migration scaffolding, but they do not gate or
 route new work.

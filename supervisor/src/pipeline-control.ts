@@ -70,6 +70,10 @@ export function processPipelineInfrastructureFailure(input: {
   if (!attempt) return undefined;
   const instance = input.store.getInstance(attempt.pipeline_instance_id);
   if (!instance) throw new Error(`pipeline run ${input.runId} has no pinned instance`);
+  if (["completed", "canceled", "superseded", "failed"].includes(attempt.status) ||
+      TERMINAL_STATUSES.has(instance.status)) {
+    return instance;
+  }
   const resultPayload = canonicalJson({
     schema: "openthrottle.pipeline-control/v1",
     event: "actor_lease_expired",

@@ -3,7 +3,6 @@ import { describe, expect, it, vi } from "vitest";
 import { createTicketStore, openDb } from "./db.js";
 import { considerCiGithubHead } from "./github-events.js";
 import {
-  areAllReviewThreadsResolved,
   branchExists,
   getRepositoryConfigAtCommit,
   getMergeReadiness,
@@ -121,28 +120,6 @@ describe("GitHub contracts", () => {
     });
     expect(signals).toHaveLength(2);
     expect(signals.every((signal) => signal instanceof AbortSignal)).toBe(true);
-  });
-
-  it("resolves whether every PR review thread is resolved via GraphQL", async () => {
-    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-      expect(String(input)).toBe("https://api.github.com/graphql");
-      const body = JSON.parse(String(init?.body)) as { variables: { number: number } };
-      const nodes =
-        body.variables.number === 1
-          ? [{ isResolved: true }, { isResolved: true }]
-          : body.variables.number === 2
-            ? [{ isResolved: true }, { isResolved: false }]
-            : [];
-      return Response.json({
-        data: { repository: { pullRequest: { reviewThreads: { nodes } } } },
-      });
-    }) as unknown as typeof fetch;
-    const client = { token: "github", fetch: fetchMock };
-    expect(await areAllReviewThreadsResolved(client, "o/r", 1)).toBe(true);
-    expect(await areAllReviewThreadsResolved(client, "o/r", 2)).toBe(false);
-    // No review threads at all (e.g. a plain PR comment) must not be treated
-    // as vacuously "all resolved" — there is nothing to skip launching for.
-    expect(await areAllReviewThreadsResolved(client, "o/r", 3)).toBe(false);
   });
 
   it("resolves branch existence and distinguishes 404 from other errors", async () => {

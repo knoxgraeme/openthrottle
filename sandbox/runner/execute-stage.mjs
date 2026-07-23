@@ -262,7 +262,7 @@ export function stagePrompt(
   let entry = "Review the requested repository state and produce bounded evidence.";
   if (request.capability.startsWith("ce/")) {
     const skillName = request.taskType === "investigate" ? "investigate" : "implement-plan";
-    entry = `$${skillName}`;
+    entry = `${agent === "claude" ? "/" : "$"}${skillName}`;
     // OpenCode has no admin-scope skill discovery equivalent. Give it the
     // canonical adapter body from the same single source used by other engines.
     if (agent === "opencode") {
@@ -310,17 +310,29 @@ function defaultRunAgent({ request, invocation, repoDir, proposalPath, timeoutMs
   let args;
   let stdin;
   if (agent === "claude") {
+    const maxTurns = process.env.MAX_TURNS?.trim();
+    const mcpConfig = process.env.OT_CLAUDE_MCP_CONFIG?.trim();
+    const common = [
+      "--output-format", "stream-json", "--verbose",
+      ...(maxTurns ? ["--max-turns", maxTurns] : []),
+      ...(model ? ["--model", model] : []),
+      "--dangerously-skip-permissions",
+      ...(mcpConfig ? ["--mcp-config", mcpConfig, "--strict-mcp-config"] : []),
+      "--setting-sources", "user",
+    ];
     command = "claude";
     args = invocation.mode === "resume"
-      ? ["-p", "--resume", invocation.nativeSessionId, prompt, "--output-format", "stream-json", "--verbose", ...(model ? ["--model", model] : []), "--dangerously-skip-permissions", "--setting-sources", "user"]
-      : ["-p", prompt, "--output-format", "stream-json", "--verbose", ...(model ? ["--model", model] : []), "--dangerously-skip-permissions", "--setting-sources", "user"];
+      ? ["-p", "--resume", invocation.nativeSessionId, prompt, ...common]
+      : ["-p", prompt, ...common];
   } else if (agent === "opencode") {
     if (!model) throw new Error("OpenCode stage execution requires a sealed model selection");
     command = "opencode";
     args = ["run", "--format", "json", "--model", model, "--dir", repoDir, "--auto", ...(invocation.mode === "resume" ? ["--session", invocation.nativeSessionId] : []), prompt];
   } else if (agent === "codex") {
     command = "codex";
-    args = ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-C", repoDir, ...(model ? ["-m", model] : []),
+    args = ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox",
+      ...(process.env.OT_CODEX_HOOK_TRUST_FLAG === "1" ? ["--dangerously-bypass-hook-trust"] : []),
+      "--skip-git-repo-check", "-C", repoDir, ...(model ? ["-m", model] : []),
       ...(invocation.mode === "resume" ? ["resume", invocation.nativeSessionId, prompt] : ["-"])];
     if (invocation.mode !== "resume") stdin = prompt;
   } else {
@@ -333,6 +345,13 @@ function defaultRunAgent({ request, invocation, repoDir, proposalPath, timeoutMs
     timeout: timeoutMs,
     maxBuffer: 8 * 1024 * 1024,
   });
+  const authRead = agent === "codex"
+    ? spawnSync("gosu", ["agent", "head", "-c", "262144", "/home/agent/.codex/auth.json"], {
+        encoding: "utf8",
+        timeout: 2_000,
+        maxBuffer: 262_144,
+      })
+    : undefined;
   return {
     exitCode: result.status,
     signal: result.signal,
@@ -341,6 +360,7 @@ function defaultRunAgent({ request, invocation, repoDir, proposalPath, timeoutMs
     stderr: result.stderr ?? result.error?.message ?? "",
     nativeSessionId: request.nativeSessionId ?? extractNativeSessionId(result.stdout, agent),
     proposal: existsSync(proposalPath) ? JSON.parse(readFileSync(proposalPath, "utf8")) : undefined,
+    authSnapshot: authRead?.status === 0 ? authRead.stdout : undefined,
   };
 }
 
@@ -397,6 +417,7 @@ export function executeStage({
   } else {
     let invocation;
     let execution;
+    let redactionEnv = process.env;
     try {
       invocation = resolveContextInvocation(request);
       execution = runAgent({
@@ -409,6 +430,9 @@ export function executeStage({
         agent: request.agent,
       });
       nativeSessionId = execution.nativeSessionId ?? nativeSessionId;
+      redactionEnv = execution.authSnapshot
+        ? { ...process.env, OT_RUNTIME_AUTH_JSON: execution.authSnapshot }
+        : process.env;
     } catch (error) {
       invocation = { mode: "none", nativeSessionId: null, reconstructed: false, readOnly: false };
       execution = {
@@ -429,7 +453,7 @@ export function executeStage({
       };
     } else if (!execution.executorFailure && (execution.exitCode !== 0 || !proposal)) {
       const terminated = execution.timedOut || execution.signal || execution.exitCode === 137;
-      const diagnostic = sanitizeArtifactText(execution.stderr ?? "").trim().slice(-1_000);
+      const diagnostic = sanitizeArtifactText(execution.stderr ?? "", redactionEnv).trim().slice(-1_000);
       const termination = [
         `exit=${execution.exitCode ?? "none"}`,
         execution.signal ? `signal=${execution.signal}` : null,
@@ -456,7 +480,7 @@ export function executeStage({
         }
       } catch (error) {
         proposal = {
-          ...failureProposal(`Publication reconciliation failed: ${sanitizeArtifactText(String(error)).slice(-800)}`, "failure"),
+          ...failureProposal(`Publication reconciliation failed: ${sanitizeArtifactText(String(error), redactionEnv).slice(-800)}`, "failure"),
           findings: [{ severity: "P1", code: "publish-reconciliation-failed", summary: "The executor could not verify the pushed branch subject." }],
         };
       }
@@ -477,15 +501,17 @@ export function executeStage({
         fence,
         requiredArtifacts: request.requiredArtifacts,
         publishedCommit,
+        env: redactionEnv,
       });
     } catch (error) {
       artifacts = buildSemanticArtifacts({
         proposal: failureProposal(
-          `Stage proposal was rejected: ${sanitizeArtifactText(String(error)).slice(-800)}`,
+          `Stage proposal was rejected: ${sanitizeArtifactText(String(error), redactionEnv).slice(-800)}`,
           "failure",
         ),
         fence,
         requiredArtifacts: request.requiredArtifacts,
+        env: redactionEnv,
       });
     }
   }

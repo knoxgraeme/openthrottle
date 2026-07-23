@@ -127,7 +127,7 @@ export interface WorkStore {
     nativeSessionId?: string | null;
     generation: number;
     contextRevision: number;
-    source: WorkItem["source"];
+    source: "human" | "operator";
     body: string;
     priority?: number;
     availableAt?: string;

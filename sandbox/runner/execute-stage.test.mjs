@@ -126,6 +126,11 @@ describe("one-stage executor", () => {
     expect(stagePrompt(request, "/tmp/proposal.json")).toContain("Implement the approved fixture change.");
     expect(stagePrompt({ ...request, taskType: "investigate", capability: "ce/publish@1" }, "/tmp/proposal.json"))
       .toMatch(/^\$investigate/);
+    expect(stagePrompt(
+      { ...request, agent: "claude", capability: "ce/implement@1" },
+      "/tmp/proposal.json",
+      { agent: "claude" }
+    )).toMatch(/^\/implement-plan/);
   });
 
   it("renders the canonical adapter body for OpenCode fenced stages", () => {
@@ -228,6 +233,23 @@ describe("one-stage executor", () => {
     });
     expect(result.outcome).toBe("failure");
     expect(JSON.parse(result.artifacts[0].payload).summary).toMatch(/proposal was rejected/);
+  });
+
+  it("redacts a Codex token rotated during execution from semantic artifacts", () => {
+    const input = fixture();
+    const rotated = "rotated-codex-secret-123456789";
+    const result = executeStage({
+      ...input,
+      now: clock(),
+      runAgent: () => ({
+        exitCode: 0,
+        nativeSessionId: "native-1",
+        authSnapshot: JSON.stringify({ tokens: { access_token: rotated } }),
+        proposal: { ...successProposal(), summary: `Stage completed with ${rotated}` },
+      }),
+    });
+    expect(result.artifacts[0].payload).not.toContain(rotated);
+    expect(result.artifacts[0].payload).toContain("[REDACTED]");
   });
 
   it("executes only the sealed allowlisted command and records tree mutation", () => {

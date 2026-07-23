@@ -1,5 +1,10 @@
 ## Code Review Results
 
+> **Historical review record:** file paths and scheduler/direct-run findings
+> below describe the pre-coordinator implementation. They are retained as
+> provenance, not as current operational guidance; see `docs/SPEC.md` and
+> `docs/PLAN.md` for the coordinator-only contract.
+
 **Scope:** `9a51ab02094f51d40dd570893362f1465d01575b..5bf4d53d08c9c0374fdcf4eaa8c2cac86692a3b4` on `knoxgraeme/review-agentic-loop` (73 files; 7,699 additions / 2,355 deletions)
 **Intent:** Review the simplification, durable feedback, live progress, rotating auth, reaper, dispatch guard, and mid-run steering changes as one autonomous-loop modernization.
 **Mode:** markdown report-only

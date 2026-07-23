@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { Daytona } from "@daytona/sdk";
 import type { Config } from "./config.js";
 import type { Ticket, TicketStore, WebhookDelivery } from "./db.js";
@@ -17,7 +17,7 @@ import {
   verifyGithubSignature,
   type GithubWebhookEvent,
 } from "./github.js";
-import { getSandboxLogs, getSignedPreviewUrl, reviveDevServer, type DevServerRevival } from "./daytona.js";
+import { getSandboxLogs } from "./daytona.js";
 import { MAX_PRIVATE_LOG_TAIL_CHARS } from "./logs.js";
 import { sanitizeText } from "./sanitize.js";
 import {
@@ -25,23 +25,15 @@ import {
   createLinearOAuthStateStore,
   persistLinearToken,
 } from "./linear-auth.js";
-import { stopTicket } from "./ticket-control.js";
 import {
   createWebhookDeliveryProcessor,
   type WebhookDeliveryProcessor,
 } from "./webhook-delivery.js";
 import { createLinearOutboxProcessor, tryPostError, type LinearOutboxProcessor } from "./linear-outbox.js";
-import { hashesMatch, tokenHash, completeRun } from "./run-lifecycle.js";
-import { handleLinearEvent, type PipelineAdmissionContext } from "./linear-events.js";
+import { handleLinearEvent, type PipelineCoordinatorContext } from "./linear-events.js";
 import { handleGithubEvent } from "./github-events.js";
 import { renderPipelineLogHeader } from "./pipeline-publication.js";
-import { executionSummary } from "./scheduler.js";
 import { canSteerPipelineRun, requestPipelineStop } from "./pipeline-control.js";
-
-// index.ts and sweep.ts keep importing `completeRun`/`expireRun` from here so
-// their imports need minimal churn; the real implementations live in
-// run-lifecycle.ts.
-export { completeRun, expireRun } from "./run-lifecycle.js";
 
 export interface ServerDeps {
   cfg: Config;
@@ -51,7 +43,7 @@ export interface ServerDeps {
   getLinearClient?: () => Promise<LinearClient | undefined>;
   deliveryProcessor?: WebhookDeliveryProcessor;
   linearOutboxProcessor?: LinearOutboxProcessor;
-  pipelineAdmission?: PipelineAdmissionContext;
+  pipelineCoordinator: PipelineCoordinatorContext;
 }
 
 function bearerToken(header: string | undefined): string | undefined {
@@ -65,6 +57,15 @@ function hasBearer(header: string | undefined, expected: string): boolean {
   const actualHash = tokenHash(actual);
   const expectedHash = tokenHash(expected);
   return hashesMatch(actualHash, expectedHash);
+}
+
+function tokenHash(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+function hashesMatch(left: string, right: string): boolean {
+  if (!/^[a-f\d]{64}$/i.test(left) || !/^[a-f\d]{64}$/i.test(right)) return false;
+  return timingSafeEqual(Buffer.from(left, "hex"), Buffer.from(right, "hex"));
 }
 
 function findTicket(store: TicketStore, identifier: string): Ticket | undefined {
@@ -143,7 +144,7 @@ export function createServerWebhookDeliveryProcessor(deps: {
   daytona: Daytona;
   getLinearClient: () => Promise<LinearClient | undefined>;
   linearOutbox?: LinearOutboxProcessor;
-  pipelineAdmission?: PipelineAdmissionContext;
+  pipelineCoordinator: PipelineCoordinatorContext;
 }): WebhookDeliveryProcessor {
   const linearOutbox =
     deps.linearOutbox ??
@@ -168,24 +169,21 @@ export function createServerWebhookDeliveryProcessor(deps: {
         await handleLinearEvent(
           deps.cfg,
           deps.store,
-          deps.daytona,
           deps.getLinearClient,
           linearOutbox,
           parseLinearWebhook(delivery.payload),
-          deps.pipelineAdmission
+          deps.pipelineCoordinator
         );
         return;
       }
       await handleGithubEvent(
         deps.cfg,
         deps.store,
-        deps.daytona,
-        deps.getLinearClient,
         linearOutbox,
         parseGithubWebhook(delivery.event_name ?? undefined, delivery.payload),
-        deps.pipelineAdmission?.store
+        deps.pipelineCoordinator.store
       );
-      await deps.pipelineAdmission?.drainEffects?.();
+      await deps.pipelineCoordinator.drainEffects?.();
     },
   });
 }
@@ -204,7 +202,7 @@ export function createServer(deps: ServerDeps): Hono {
       daytona,
       getLinearClient,
       linearOutbox: linearOutboxProcessor,
-      pipelineAdmission: deps.pipelineAdmission,
+      pipelineCoordinator: deps.pipelineCoordinator,
     });
   const oauthStates = createLinearOAuthStateStore(() => randomBytes(16).toString("hex"));
   const schedule =
@@ -224,9 +222,8 @@ export function createServer(deps: ServerDeps): Hono {
       return context.json({ error: "unauthorized" }, 401);
     }
     return context.json({
-      execution_summary: executionSummary(store),
       tickets: store.listAll().map((ticket) => {
-        const pipeline = deps.pipelineAdmission?.store.getStatusForIssue(ticket.linear_issue_id);
+        const pipeline = deps.pipelineCoordinator.store.getStatusForIssue(ticket.linear_issue_id);
         return {
           linear_issue_identifier: ticket.linear_issue_identifier,
           branch: ticket.branch,
@@ -241,7 +238,6 @@ export function createServer(deps: ServerDeps): Hono {
           last_error: ticket.last_error,
           created_at: ticket.created_at,
           updated_at: ticket.updated_at,
-          execution_mode: pipeline ? "pipeline" : "legacy",
           pipeline: pipeline ?? null,
         };
       }),
@@ -407,60 +403,32 @@ export function createServer(deps: ServerDeps): Hono {
     return context.text("ok", 200);
   });
 
-  app.post("/runs/:id/complete", async (context) => {
-    let body: unknown;
-    try {
-      body = await context.req.json();
-    } catch {
-      return context.json({ error: "invalid JSON" }, 400);
-    }
-    if (!body || typeof body !== "object" || Array.isArray(body)) {
-      return context.json({ error: "invalid callback body" }, 400);
-    }
-    const data = body as Record<string, unknown>;
-    const result = await completeRun(
-      { cfg, store, daytona, getLinearClient, linearOutbox: linearOutboxProcessor, schedule },
-      {
-        runId: context.req.param("id"),
-        token: bearerToken(context.req.header("Authorization")),
-        exitCode: data.exit_code,
-        costUsd: data.cost_usd,
-        prUrl: data.pr_url,
-        failureTail: data.failure_tail,
-        finalResponse: data.final_response,
-      }
-    );
-    return context.json(result.body, result.status as 200 | 400 | 401 | 404 | 409);
-  });
-
   app.post("/tickets/:identifier/stop", async (context) => {
     if (!requireStatusAuth(context.req.header("Authorization"))) {
       return context.json({ error: "unauthorized" }, 401);
     }
     const ticket = findTicket(store, context.req.param("identifier"));
     if (!ticket) return context.json({ error: "ticket not found" }, 404);
-    const linear = await getLinearClient();
     try {
-      const pipeline = deps.pipelineAdmission?.store.getInstanceForSession(ticket.linear_session_id);
-      if (pipeline && deps.pipelineAdmission) {
-        requestPipelineStop({
-          store: deps.pipelineAdmission.store,
-          sessionId: ticket.linear_session_id,
-          eventId: `operator-stop:${pipeline.id}`,
-          reason: "Stopped by operator.",
-        });
-        await deps.pipelineAdmission.drainEffects?.();
-        return context.json({ ok: true });
-      }
-      await stopTicket({
-        store,
-        daytona,
-        linear,
-        linearOutbox: linearOutboxProcessor,
-        ticket,
+      const pipeline = deps.pipelineCoordinator.store.getInstanceForSession(ticket.linear_session_id);
+      if (!pipeline) return context.json({ error: "pipeline not found" }, 409);
+      requestPipelineStop({
+        store: deps.pipelineCoordinator.store,
+        sessionId: ticket.linear_session_id,
+        eventId: `operator-stop:${pipeline.id}`,
         reason: "Stopped by operator.",
       });
-      return context.json({ ok: true });
+      await deps.pipelineCoordinator.drainEffects?.();
+      const refreshed = findTicket(store, context.req.param("identifier"));
+      const stopEffect = deps.pipelineCoordinator.store.listEffects(pipeline.id)
+        .filter((effect) => effect.kind === "stop")
+        .at(-1);
+      const stopped = refreshed?.run_id == null && stopEffect?.status === "acknowledged";
+      return context.json({
+        ok: true,
+        status: stopped ? "stopped" : "stop_requested",
+        ...(stopEffect ? { effect: { id: stopEffect.id, status: stopEffect.status } } : {}),
+      }, stopped ? 200 : 202);
     } catch (error) {
       const message = sanitizeText(`Failed to stop workspace: ${String(error)}`);
       await tryPostError(
@@ -494,19 +462,18 @@ export function createServer(deps: ServerDeps): Hono {
     ) {
       return context.json({ error: "message is required" }, 400);
     }
-    const pipeline = deps.pipelineAdmission?.store.getInstanceForSession(ticket.linear_session_id);
-    if (pipeline && deps.pipelineAdmission && !canSteerPipelineRun({
-      store: deps.pipelineAdmission.store,
+    const pipeline = deps.pipelineCoordinator.store.getInstanceForSession(ticket.linear_session_id);
+    if (!pipeline) return context.json({ error: "pipeline not found" }, 409);
+    if (!canSteerPipelineRun({
+      store: deps.pipelineCoordinator.store,
       sessionId: ticket.linear_session_id,
       runId: ticket.run_id,
       agent: ticket.agent,
     })) {
       return context.json({ error: "the current pipeline stage does not accept live steering" }, 409);
     }
-    // Legacy messages remain durable while idle. Pipeline messages reach only
-    // the exact active run accepted by the stage's sealed steering policy.
-    // poller delivers it on the next run. The body is untrusted data; it is only
-    // stored here and later written as a file, never executed.
+    // The message reaches only the exact active run accepted by the stage's
+    // sealed steering policy. It is untrusted data and is never executed.
     const record = store.enqueueInbox({
       issueId: ticket.linear_issue_id,
       sessionId: ticket.linear_session_id,
@@ -523,7 +490,7 @@ export function createServer(deps: ServerDeps): Hono {
     }
     const ticket = findTicket(store, context.req.param("identifier"));
     if (!ticket) return context.json({ error: "ticket not found" }, 404);
-    const pipeline = deps.pipelineAdmission?.store.getStatusForIssue(ticket.linear_issue_id);
+    const pipeline = deps.pipelineCoordinator.store.getStatusForIssue(ticket.linear_issue_id);
     const prefix = pipeline ? `${renderPipelineLogHeader(pipeline)}\n` : "";
     const withPipelinePrefix = (logs: string) =>
       prefix + sanitizeText(logs).slice(-Math.max(0, MAX_PRIVATE_LOG_TAIL_CHARS - prefix.length));
@@ -549,8 +516,7 @@ export function createServer(deps: ServerDeps): Hono {
     }
     const ticket = findTicket(store, context.req.param("identifier"));
     if (!ticket) return context.json({ error: "ticket not found" }, 404);
-    const pipelineStore = deps.pipelineAdmission?.store;
-    if (!pipelineStore) return context.json({ error: "pipeline coordinator is unavailable" }, 409);
+    const pipelineStore = deps.pipelineCoordinator.store;
     const publication = pipelineStore.getPublication(context.req.param("publicationId"));
     const instance = publication ? pipelineStore.getInstance(publication.pipeline_instance_id) : undefined;
     if (!publication || instance?.linear_issue_id !== ticket.linear_issue_id) {
@@ -570,85 +536,5 @@ export function createServer(deps: ServerDeps): Hono {
     }
   });
 
-  app.get("/preview/:identifier", async (context) => {
-    const ticket = findTicket(store, context.req.param("identifier"));
-    const token = context.req.query("token");
-    if (!ticket?.sandbox_id || !ticket.preview_token_hash || !token) {
-      return context.text("preview not found", 404);
-    }
-    if (!hashesMatch(ticket.preview_token_hash, tokenHash(token))) {
-      return context.text("unauthorized", 401);
-    }
-    try {
-      // Probe and, if the dev server is down, restart it. `listening` → the app
-      // is up, redirect to it. `starting` → it was down and has been
-      // (re)started, show a page that auto-refreshes until it is ready.
-      // `no-dev` → show the log with a clear "no dev server" note. A probe
-      // failure (`unknown`) falls back to the plain redirect (previous
-      // behavior), so a broken restart never worsens the outcome.
-      let revival: DevServerRevival;
-      try {
-        revival = await reviveDevServer(daytona, ticket.sandbox_id, cfg.devPort);
-      } catch (error) {
-        console.warn("[preview] dev-server probe/restart failed, redirecting anyway:", error);
-        revival = { state: "unknown", log: "" };
-      }
-      if (revival.state === "listening" || revival.state === "unknown") {
-        return context.redirect(
-          await getSignedPreviewUrl(daytona, ticket.sandbox_id, cfg.devPort),
-          302
-        );
-      }
-      return context.html(
-        renderDevPreviewPage(
-          ticket.linear_issue_identifier,
-          cfg.devPort,
-          revival.state,
-          sanitizeText(revival.log).slice(-MAX_PRIVATE_LOG_TAIL_CHARS)
-        ),
-        200
-      );
-    } catch (error) {
-      console.error("[preview] failed:", error);
-      return context.text("preview unavailable", 502);
-    }
-  });
-
   return app;
-}
-
-function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-// Rendered when the wake-on-click preview restarted the dev server (`starting`,
-// with an auto-refresh so the page becomes the app once it is up) or found no
-// dev command (`no-dev`). Either way the latest dev log is shown so any
-// startup/crash error is visible instead of a blank connection refusal.
-function renderDevPreviewPage(
-  identifier: string,
-  port: number,
-  state: "starting" | "no-dev",
-  log: string
-): string {
-  const starting = state === "starting";
-  const refresh = starting ? `<meta http-equiv="refresh" content="5">` : "";
-  const heading = starting
-    ? `Starting the dev server for ${escapeHtml(identifier)}`
-    : `No dev server for ${escapeHtml(identifier)}`;
-  const intro = starting
-    ? `The dev server was not running (the workspace idled), so it is being restarted on port ${port}. This page refreshes automatically and will open the app once it is ready.`
-    : `This repository does not configure a <code>dev</code> command in <code>.openthrottle.yml</code>, so nothing serves on port ${port}.`;
-  const body = log.trim() ? `<pre>${escapeHtml(log)}</pre>` : "";
-  return (
-    `<!doctype html><html lang="en"><head><meta charset="utf-8">` +
-    `<meta name="viewport" content="width=device-width, initial-scale=1">${refresh}` +
-    `<title>Preview — ${escapeHtml(identifier)}</title>` +
-    `<style>body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;margin:2rem;max-width:64rem;line-height:1.5}` +
-    `h1{font-size:1.25rem}pre{white-space:pre-wrap;word-break:break-word;background:#111;color:#eee;padding:1rem;border-radius:8px;overflow:auto;max-height:70vh}</style>` +
-    `</head><body><h1>${heading}</h1><p>${intro}</p>${body}</body></html>`
-  );
 }

@@ -1,9 +1,8 @@
 # OpenThrottle
 
 OpenThrottle is a plan-first coding pipeline: delegate an approved Linear
-ticket, get an isolated Daytona workspace running Claude Code, Codex, or
-OpenCode, review
-the resulting GitHub PR, and reply in Linear to continue the same session.
+ticket, run an immutable configurable pipeline through fenced Daytona stages
+using Claude Code, Codex, or OpenCode, and review the resulting GitHub PR.
 
 The GitHub repository is `openthrottle-v2`; the product, CLI, npm package,
 and Daytona snapshot are all named `openthrottle`.
@@ -16,17 +15,17 @@ Linear ticket ──> Fly supervisor ──> Daytona sandbox ──> ot/* branch
      └── activities ───┘     └── outbox ────┴── GitHub events ──┘
 ```
 
-The supervisor authenticates webhooks, durably stores and retries deliveries,
-owns one-time run state in SQLite, and keeps one sandbox per ticket. Agents
-push early, cannot push main/master, and run through a sanitizer. Fly is the
-deterministic outer state machine; native Compound Engineering skills drive
-two loops inside each authorized run — `implement` (feature/bug plan) and
-`investigate` (debugging), both ending in a PR. Once a PR exists, external
-GitHub-native reviewers (bots or humans) own review; their feedback — reviews,
-PR comments, failed CI — is deduplicated and delivered back as a `resume` of
-the same agent session, bounded by a rounds counter with a Linear/PR
-escalation. PR close/merge deletes the workspace. Review and CI events are
-mirrored back to the Linear session.
+The supervisor authenticates and durably retries webhooks, pins the manifest,
+repository config, runtime descriptor, base commit, and generation, then
+dispatches one sealed stage at a time. Typed artifacts and gates determine the
+next transition; external effects are persisted before execution. Native
+Compound Engineering supplies agent reasoning inside the stage boundary.
+
+The implement pipeline separates planning, implementation, semantic review,
+simplification, command gates, exact-subject publication, and provider
+verification. Investigate uses its own immutable graph. GitHub reviews and CI
+are deduplicated as evidence for the published commit; bounded repair
+transitions may continue the native agent session when the manifest permits.
 
 See [docs/SPEC.md](docs/SPEC.md) for the normative contracts and
 [docs/PLAN.md](docs/PLAN.md) for the delivery/acceptance plan.
@@ -79,9 +78,8 @@ npx openthrottle status
 
 `init` requires `OT_SUPERVISOR_URL` and `OT_STATUS_TOKEN`. One Linear team
 currently routes to one GitHub repository; re-running `init` updates that
-registration without restarting Fly or creating a new Daytona snapshot. Once
-the first durable route exists, delegations from unmatched teams fail closed
-instead of falling back to the wrong repository.
+registration without restarting Fly or creating a new Daytona snapshot.
+Delegations from unmatched teams fail closed.
 
 The team route also fixes the base branch each run is cut from. To target a
 different base for a single ticket, label the issue with a `branch` label before
@@ -103,20 +101,21 @@ delegated (the `created` agent event), so apply the label before assigning.
 
 - `supervisor/` — Hono/SQLite control plane deployed on Fly.
 - `sandbox/` — Daytona image, safety boundary, entrypoint, tests.
-- `skills/` — OpenThrottle task adapters layered over the native Compound
+- `skills/` — OpenThrottle stage adapters layered over the native Compound
   Engineering toolkit installed for Claude Code, Codex, and OpenCode.
 - `cli/` — the `openthrottle` command-line package.
 - `docs/` — architecture and execution plan.
 
 ## Security boundary
 
-Only repo, Linear, and model credentials enter a sandbox—never Daytona, Fly,
-webhook, install, or operator tokens. Webhooks are signature-verified, run and
-preview tokens are stored hashed, and logs redact named/nested credentials and
-known token shapes. A bounded private task-log tail is stored in Fly's SQLite
+Only credentials declared by the selected stage enter a sandbox—never Daytona,
+Fly, Linear app, webhook, install, or operator tokens. Webhooks are
+signature-verified; sealed requests bind the generation, attempt, run, config,
+runtime, and Git subject; and logs redact named/nested credentials and known
+token shapes. A bounded private task-log tail is stored in Fly's SQLite
 database so operator debugging survives workspace deletion; raw logs are not
 attached to Linear or GitHub. GitHub branch protection and a fine-grained PAT
-are still required as the outer enforcement layer.
+remain the outer enforcement layer.
 
 The deterministic contract suite and Docker smoke are green locally. Live
 Linear/Daytona/Fly acceptance is intentionally a separate deployment gate

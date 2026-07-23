@@ -29,7 +29,7 @@ function seedRunningTicket(agent: "claude" | "codex" | "opencode" = "claude") {
     issueId: "issue-1",
     runId: "run-1",
     taskType: "implement",
-    tokenHash: createHash("sha256").update("callback-token-123").digest("hex"),
+    tokenHash: createHash("sha256").update("sealed-request-hash").digest("hex"),
     expiresAt: "2099-01-01T00:00:00.000Z",
   });
   return store;
@@ -171,7 +171,7 @@ describe("deliverPendingInbox", () => {
     store.beginRun({
       issueId: "issue-1",
       runId: "run-2",
-      taskType: "resume",
+      taskType: "implement",
       tokenHash: "hash",
       expiresAt: "2999-01-01T00:00:00.000Z",
     });

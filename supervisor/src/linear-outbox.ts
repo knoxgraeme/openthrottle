@@ -4,8 +4,8 @@ import type { LinearOutboxRecord, TicketStore } from "./db.js";
 import { sanitizeText } from "./sanitize.js";
 
 // Shared helpers for enqueueing a single Linear outbox row and processing it
-// immediately, used across the run lifecycle, the Linear/GitHub event
-// handlers, and the scheduler. They live here (rather than being duplicated
+// immediately, used across pipeline effects and the Linear/GitHub event
+// handlers. They live here (rather than being duplicated
 // per caller) since they are pure wrappers over this module's own processor.
 
 export async function tryPostError(

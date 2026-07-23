@@ -1,6 +1,7 @@
-import { randomBytes } from "node:crypto";
 import type { TicketStore } from "./db.js";
 import { canonicalJson } from "./pipeline-manifest.js";
+import { digestNormalized } from "./pipeline-manifest.js";
+import { coordinatePipelineEvent } from "./pipeline-coordinator.js";
 import type { PipelineEffectIntent, PipelineInstance, PipelineStore } from "./pipeline-store.js";
 import type { RuntimeResource, SandboxRuntime, StageRequestEnvelope } from "./sandbox-runtime.js";
 import { sanitizeText } from "./sanitize.js";
@@ -18,15 +19,7 @@ interface PipelineEffectProcessorDeps {
   tickets: TicketStore;
   runtime: SandboxRuntime;
   taskTimeoutSeconds: number;
-  callbackGraceSeconds: number;
   now?: () => Date;
-}
-
-function unusedCallbackTokenHash(): string {
-  // Pipeline stages settle through the root-owned result spool, not the
-  // legacy callback endpoint. Retain an unguessable, unmaterialized hash so a
-  // run row can never acquire a callback credential derived from public IDs.
-  return randomBytes(32).toString("hex");
 }
 
 function parseRequest(effect: PipelineEffectIntent, store: PipelineStore): StageRequestEnvelope {
@@ -128,9 +121,11 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         issueId: instance.linear_issue_id,
         runId: request.runId,
         taskType: instance.task_type,
-        tokenHash: unusedCallbackTokenHash(),
-        expiresAt: new Date(now().getTime() +
-          (deps.taskTimeoutSeconds + deps.callbackGraceSeconds) * 1_000).toISOString(),
+        // `runs.token_hash` predates the sealed stage protocol. Store the
+        // immutable request hash until the column is contracted in a schema-
+        // only migration; no bearer callback credential exists.
+        tokenHash: request.requestHash,
+        expiresAt: new Date(now().getTime() + deps.taskTimeoutSeconds * 1_000).toISOString(),
       });
       if (!started) throw new Error(`pipeline stage ${request.attemptId} could not acquire the ticket actor`);
     }
@@ -178,8 +173,28 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     const resource = binding ? { providerResourceId: binding.provider_resource_id } : undefined;
     if (effect.kind === "stop") {
       const control = JSON.parse(effect.payload) as { ticketState?: unknown };
-      const ticketState = control.ticketState === "closed" ? "closed" : "stopped";
+      const ticketState = control.ticketState === "closed"
+        ? "closed"
+        : control.ticketState === "error"
+          ? "error"
+          : "stopped";
+      const settlementReason = ticketState === "closed"
+        ? "Pull request closed."
+        : ticketState === "error"
+          ? "Pipeline infrastructure failed."
+          : "Pipeline stopped.";
       const ticket = deps.tickets.getByIssueId(instance.linear_issue_id);
+      const owner = `pipeline-stop:${effect.id}`;
+      const activeRunId = ticket?.linear_session_id === instance.linear_session_id ? ticket.run_id : null;
+      if (activeRunId) {
+        const claimed = deps.tickets.claimRunForReaping(activeRunId, owner, "pipeline stop");
+        if (!claimed) {
+          const refreshed = deps.tickets.getByIssueId(instance.linear_issue_id);
+          if (refreshed?.run_id === activeRunId) {
+            throw new Error(`pipeline actor ${activeRunId} is owned by another settlement worker`);
+          }
+        }
+      }
       if (!resource && ticket?.linear_session_id === instance.linear_session_id && ticket.run_id) {
         throw new Error(`pipeline instance ${instance.id} has an active actor without a runtime resource`);
       }
@@ -191,32 +206,53 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         deps.store.setRuntimeResourceStatus(instance.id, "stopped");
       }
       if (ticket?.linear_session_id === instance.linear_session_id) {
-        if (ticket.run_id) {
-          const settlement = {
-            runId: ticket.run_id,
+        if (activeRunId) {
+          const settled = deps.tickets.finishReapingRun({
+            runId: activeRunId,
+            owner,
             status: "stopped",
             ticketState,
-            failureTail: ticketState === "closed" ? "Pull request closed." : "Pipeline stopped.",
+            failureTail: settlementReason,
             prUrl: ticket.pr_url ?? undefined,
-          } as const;
-          if (!deps.tickets.finishRun(settlement)) {
-            deps.tickets.settleQuarantinedRun(settlement);
+          });
+          const refreshed = deps.tickets.getByIssueId(instance.linear_issue_id);
+          if (!settled && refreshed?.run_id === activeRunId) {
+            throw new Error(`pipeline actor ${activeRunId} lost its stop settlement claim`);
           }
         } else {
           deps.tickets.setState(
             ticket.linear_issue_id,
             ticketState,
-            ticketState === "closed" ? "Pull request closed." : "Pipeline stopped."
+            settlementReason
           );
         }
         deps.tickets.markSessionState(instance.linear_session_id, "stopped");
-        deps.tickets.cancelPendingSessionWork(instance.linear_session_id);
         deps.tickets.cancelPendingInbox(instance.linear_issue_id);
       }
+      if (resource && binding?.status !== "cleaned") {
+        await deps.runtime.cleanup(resource);
+        deps.store.setRuntimeResourceStatus(instance.id, "cleaned");
+      }
+      if (ticket?.linear_session_id === instance.linear_session_id &&
+          (!resource || ticket.sandbox_id === resource.providerResourceId)) {
+        deps.tickets.setSandboxId(instance.linear_issue_id, null);
+      }
     } else if (effect.kind === "quarantine") {
-      if (!resource) throw new Error(`pipeline instance ${instance.id} has no runtime resource`);
-      await deps.runtime.quarantine(resource, "pipeline quarantine");
-      deps.store.setRuntimeResourceStatus(instance.id, "quarantined");
+      const control = JSON.parse(effect.payload) as { runId?: unknown; owner?: unknown; reason?: unknown };
+      const runId = typeof control.runId === "string" ? control.runId : null;
+      const owner = typeof control.owner === "string" ? control.owner : `pipeline-quarantine:${effect.id}`;
+      const reason = typeof control.reason === "string" ? control.reason : "pipeline stop attempts exhausted";
+      if (resource && binding?.status !== "cleaned" && binding?.status !== "stopped") {
+        await deps.runtime.quarantine(resource, reason);
+        deps.store.setRuntimeResourceStatus(instance.id, "quarantined");
+      }
+      if (runId) {
+        const quarantined = deps.tickets.quarantineRun(runId, owner, reason);
+        const refreshed = deps.tickets.getByIssueId(instance.linear_issue_id);
+        if (!quarantined && refreshed?.run_id === runId) {
+          throw new Error(`pipeline actor ${runId} could not be quarantined by ${owner}`);
+        }
+      }
     } else if (effect.kind === "cleanup") {
       if (resource && binding?.status !== "cleaned") {
         await deps.runtime.cleanup(resource);
@@ -242,9 +278,53 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       await handle(effect);
     } catch (error) {
       const message = sanitizeText(String(error)).slice(-2_000);
-      const retryAt = effect.attempts >= MAX_EFFECT_ATTEMPTS
+      const exhausted = effect.attempts >= MAX_EFFECT_ATTEMPTS;
+      const retryAt = exhausted
         ? null
         : new Date(now().getTime() + RETRY_BASE_MS * 2 ** Math.min(effect.attempts - 1, 6)).toISOString();
+      if (exhausted && (effect.kind === "provision" || effect.kind === "dispatch_stage")) {
+        const instance = deps.store.getInstance(effect.pipeline_instance_id);
+        const attempt = instance ? deps.store.getActiveAttempt(instance.id) : undefined;
+        if (instance && attempt) {
+          const payload = canonicalJson({
+            schema: "openthrottle.pipeline-effect-failure/v1",
+            effect_id: effect.id,
+            effect_kind: effect.kind,
+            error: message,
+          });
+          coordinatePipelineEvent(deps.store, {
+            id: `pipeline-effect-exhausted:${effect.id}`,
+            kind: "effect_failed",
+            instanceId: instance.id,
+            generation: instance.generation,
+            ...(attempt.run_id ? { runId: attempt.run_id } : {}),
+            stageId: attempt.stage_id,
+            attemptId: attempt.id,
+            requestHash: attempt.request_hash,
+            outcome: "retryable_infrastructure_failure",
+            resultHash: digestNormalized(payload),
+            subject: attempt.expected_subject ?? instance.immutable_subject,
+            nativeSessionId: attempt.native_session_id,
+            exhaustedEffectId: effect.id,
+            exhaustedEffectError: message,
+          });
+          return;
+        }
+      }
+      if (exhausted && effect.kind === "stop") {
+        const instance = deps.store.getInstance(effect.pipeline_instance_id);
+        const ticket = instance ? deps.tickets.getByIssueId(instance.linear_issue_id) : undefined;
+        const runId = ticket && instance && ticket.linear_session_id === instance.linear_session_id
+          ? ticket.run_id
+          : null;
+        deps.store.markStopEffectExhausted({
+          effectId: effect.id,
+          error: message,
+          runId,
+          owner: `pipeline-stop:${effect.id}`,
+        });
+        return;
+      }
       deps.store.markEffectFailed(effect.id, message, retryAt);
     }
   };
@@ -259,7 +339,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
           current.toISOString(),
           new Date(current.getTime() + EFFECT_LEASE_MS).toISOString()
         );
-        for (const effect of effects) await processClaimed(effect);
+        await Promise.all(effects.map(processClaimed));
       } finally {
         draining = false;
       }

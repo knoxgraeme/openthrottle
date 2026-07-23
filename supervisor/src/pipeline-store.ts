@@ -198,6 +198,11 @@ export interface PipelineStatusProjection {
   publication_external_id: string | null;
   publication_error: string | null;
   recovery_action: string | null;
+  effect_state: "none" | "pending" | "failed" | "blocked";
+  effect_kind: string | null;
+  effect_status: PipelineEffectIntent["status"] | null;
+  effect_attempts: number | null;
+  effect_error: string | null;
 }
 
 export interface PipelineInstanceSeed {
@@ -280,6 +285,8 @@ export interface CoordinatorTransitionWrite {
     requestPayload: string;
   };
   effects: CoordinatorEffectWrite[];
+  exhaustedEffectId?: string;
+  exhaustedEffectError?: string;
 }
 
 export interface PipelineStore {
@@ -292,10 +299,8 @@ export interface PipelineStore {
     blobSha: string;
     config: ValidatedRepositoryConfig;
   }): RepositoryConfigSnapshot;
-  pinLegacySession(sessionId: string, issueId: string, generation: number): void;
   supersedeOtherInstances(issueId: string, currentSessionId: string): void;
   createInstance(seed: PipelineInstanceSeed): PipelineInstance;
-  getSessionExecutionMode(sessionId: string): "legacy" | "pipeline" | undefined;
   getInstance(id: string): PipelineInstance | undefined;
   getInstanceForSession(sessionId: string): PipelineInstance | undefined;
   getAttempt(id: string): PipelineStageAttempt | undefined;
@@ -325,6 +330,7 @@ export interface PipelineStore {
     externalId: string,
     externalUrl: string
   ): boolean;
+  markGithubPublicationSkipped(id: string, expectedPayloadHash: string): boolean;
   markGithubPublicationFailed(
     id: string,
     expectedPayloadHash: string,
@@ -340,6 +346,12 @@ export interface PipelineStore {
     payload: string;
   }): void;
   markEffectFailed(effectId: string, error: string, retryAt: string | null): void;
+  markStopEffectExhausted(input: {
+    effectId: string;
+    error: string;
+    runId: string | null;
+    owner: string;
+  }): void;
   getInboxEvent(id: string): PipelineInboxEventRecord | undefined;
   listPendingInboxEvents(kind: string, limit?: number): PipelineInboxEventRecord[];
   enqueueInboxEvent(input: {
@@ -724,23 +736,6 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
     return db.prepare("SELECT * FROM repository_config_snapshots WHERE id = ?").get(id) as RepositoryConfigSnapshot;
   });
 
-  const pinLegacySession = db.transaction((sessionId: string, issueId: string, generation: number) => {
-    const existing = db.prepare("SELECT * FROM session_executions WHERE linear_session_id = ?").get(sessionId) as
-      | { linear_issue_id: string; generation: number; execution_mode: string; pipeline_instance_id: string | null }
-      | undefined;
-    if (existing) {
-      if (existing.linear_issue_id !== issueId || existing.generation !== generation || existing.execution_mode !== "legacy" || existing.pipeline_instance_id !== null) {
-        throw new Error(`session ${sessionId} execution mode is already pinned differently`);
-      }
-      return;
-    }
-    db.prepare(`
-      INSERT INTO session_executions (
-        linear_session_id, linear_issue_id, generation, execution_mode, pipeline_instance_id, pinned_at
-      ) VALUES (?, ?, ?, 'legacy', NULL, ?)
-    `).run(sessionId, issueId, generation, now());
-  });
-
   const supersedeOtherInstances = db.transaction((issueId: string, currentSessionId: string) => {
     const instances = db.prepare(`
       SELECT * FROM pipeline_instances
@@ -1085,6 +1080,22 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
       event.payload_hash !== write.eventPayloadHash || event.status !== "pending"
     ) throw new Error(`pipeline inbox event ${write.eventId} fence mismatch`);
     const timestamp = now();
+    if (write.exhaustedEffectId) {
+      const exhausted = db.prepare(`
+        UPDATE pipeline_effect_intents
+        SET status = 'dead', next_attempt_at = ?, last_error = ?
+        WHERE id = ? AND pipeline_instance_id = ? AND status = 'processing'
+      `).run(
+        timestamp,
+        write.exhaustedEffectError ?? "pipeline effect attempts exhausted",
+        write.exhaustedEffectId,
+        instance.id
+      );
+      if (exhausted.changes !== 1) {
+        throw new Error(`pipeline effect ${write.exhaustedEffectId} is not processing`);
+      }
+      wrote();
+    }
     const attemptStatus = write.outcome === "canceled"
       ? "canceled"
       : write.outcome === "superseded"
@@ -1286,13 +1297,24 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
   const claimEffects = db.transaction((
     nowIso: string,
     leaseUntilIso: string,
-    limit = 50
+    limit = 4
   ): PipelineEffectIntent[] => {
     const candidates = db.prepare(`
-      SELECT id FROM pipeline_effect_intents
-      WHERE ((status IN ('pending', 'failed') AND next_attempt_at <= ?)
-        OR (status = 'processing' AND next_attempt_at <= ?))
-      ORDER BY next_attempt_at, created_at, id LIMIT ?
+      SELECT current.id FROM pipeline_effect_intents current
+      WHERE ((current.status IN ('pending', 'failed') AND current.next_attempt_at <= ?)
+        OR (current.status = 'processing' AND current.next_attempt_at <= ?))
+        AND NOT EXISTS (
+          SELECT 1 FROM pipeline_effect_intents earlier
+          WHERE earlier.pipeline_instance_id = current.pipeline_instance_id
+            AND earlier.status NOT IN ('acknowledged', 'dead')
+            AND (
+              earlier.transition_version < current.transition_version OR
+              (earlier.transition_version = current.transition_version AND earlier.created_at < current.created_at) OR
+              (earlier.transition_version = current.transition_version AND earlier.created_at = current.created_at
+                AND earlier.id < current.id)
+            )
+        )
+      ORDER BY current.next_attempt_at, current.created_at, current.id LIMIT ?
     `).all(nowIso, nowIso, limit) as Array<{ id: string }>;
     const claimed: PipelineEffectIntent[] = [];
     for (const candidate of candidates) {
@@ -1345,6 +1367,47 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
         id, pipeline_instance_id, generation, kind, payload, payload_hash, status, created_at
       ) VALUES (?, ?, ?, 'effect_acknowledged', ?, ?, 'pending', ?)
     `).run(input.eventId, instance.id, instance.generation, eventPayload, payloadHash, timestamp);
+  });
+
+  const markStopEffectExhausted = db.transaction((input: {
+    effectId: string;
+    error: string;
+    runId: string | null;
+    owner: string;
+  }): void => {
+    const effect = db.prepare("SELECT * FROM pipeline_effect_intents WHERE id = ?")
+      .get(input.effectId) as PipelineEffectIntent | undefined;
+    if (!effect || effect.kind !== "stop" || effect.status !== "processing") {
+      throw new Error(`pipeline stop effect ${input.effectId} is not processing`);
+    }
+    const timestamp = now();
+    const dead = db.prepare(`
+      UPDATE pipeline_effect_intents
+      SET status = 'dead', next_attempt_at = ?, last_error = ?
+      WHERE id = ? AND status = 'processing'
+    `).run(timestamp, input.error, effect.id);
+    if (dead.changes !== 1) throw new Error(`pipeline stop effect ${input.effectId} changed during exhaustion`);
+    const payload = canonicalJson({
+      runId: input.runId,
+      owner: input.owner,
+      reason: input.error,
+    });
+    db.prepare(`
+      INSERT INTO pipeline_effect_intents (
+        id, pipeline_instance_id, transition_version, kind, idempotency_key,
+        payload, payload_hash, status, next_attempt_at, created_at
+      ) VALUES (?, ?, ?, 'quarantine', ?, ?, ?, 'pending', ?, ?)
+      ON CONFLICT(id) DO NOTHING
+    `).run(
+      `quarantine-${effect.id}`,
+      effect.pipeline_instance_id,
+      effect.transition_version,
+      `quarantine:${effect.id}`,
+      payload,
+      digestNormalized(payload),
+      timestamp,
+      timestamp
+    );
   });
 
   const claimGithubPublications = db.transaction((
@@ -1424,6 +1487,21 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
       WHERE id = ? AND kind = 'github_summary' AND status = 'processing'
         AND payload_hash = ?
     `).run(externalId, externalUrl, timestamp, timestamp, id, expectedPayloadHash);
+    return update.changes === 1;
+  });
+
+  const markGithubPublicationSkipped = db.transaction((
+    id: string,
+    expectedPayloadHash: string
+  ): boolean => {
+    const timestamp = now();
+    const update = db.prepare(`
+      UPDATE pipeline_publication_receipts
+      SET status = 'acknowledged', external_id = 'skipped:no-pull-request',
+          external_url = NULL, acknowledged_at = ?, last_error = NULL, updated_at = ?
+      WHERE id = ? AND kind = 'github_summary' AND status = 'processing'
+        AND payload_hash = ? AND target_url IS NULL
+    `).run(timestamp, timestamp, id, expectedPayloadHash);
     return update.changes === 1;
   });
 
@@ -1545,6 +1623,25 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
             : publications.some((item) => item.status === "acknowledged")
               ? "acknowledged"
               : "none";
+    const effects = db.prepare(`
+      SELECT * FROM pipeline_effect_intents
+      WHERE pipeline_instance_id = ?
+        AND NOT (
+          status = 'dead' AND last_error = 'canceled by a terminal pipeline control event'
+        )
+      ORDER BY created_at DESC, id DESC
+    `).all(instance.id) as PipelineEffectIntent[];
+    const blockedEffect = effects.find((item) => item.status === "dead");
+    const failedEffect = effects.find((item) => item.status === "failed");
+    const pendingEffect = effects.find((item) => item.status === "pending" || item.status === "processing");
+    const relevantEffect = blockedEffect ?? failedEffect ?? pendingEffect;
+    const effectState: PipelineStatusProjection["effect_state"] = blockedEffect
+      ? "blocked"
+      : failedEffect
+        ? "failed"
+        : pendingEffect
+          ? "pending"
+          : "none";
     return {
       execution_mode: "pipeline",
       instance_id: instance.id,
@@ -1572,6 +1669,11 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
       recovery_action: publicationState === "blocked" && blockedPublication
         ? `POST /tickets/:identifier/publications/${blockedPublication.id}/retry`
         : null,
+      effect_state: effectState,
+      effect_kind: relevantEffect?.kind ?? null,
+      effect_status: relevantEffect?.status ?? null,
+      effect_attempts: relevantEffect?.attempts ?? null,
+      effect_error: relevantEffect?.last_error ?? null,
     };
   }
 
@@ -1579,14 +1681,8 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
     acceptCatalog,
     acceptRuntimeDescriptor,
     saveRepositoryConfigSnapshot,
-    pinLegacySession,
     supersedeOtherInstances,
     createInstance,
-    getSessionExecutionMode(sessionId) {
-      return db.prepare(
-        "SELECT execution_mode FROM session_executions WHERE linear_session_id = ?"
-      ).pluck().get(sessionId) as "legacy" | "pipeline" | undefined;
-    },
     getInstance(id) {
       const instance = getInstanceStmt.get(id) as PipelineInstance | undefined;
       if (instance) validatePinnedInstance(db, instance);
@@ -1732,11 +1828,13 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
     claimGithubPublications,
     bindGithubPublicationTarget,
     markGithubPublicationProcessed,
+    markGithubPublicationSkipped,
     markGithubPublicationFailed,
     retryPublication,
     getStatusForIssue,
     claimEffects,
     recordEffectAcknowledgement,
+    markStopEffectExhausted,
     markEffectFailed(effectId, error, retryAt) {
       const update = db.prepare(`
         UPDATE pipeline_effect_intents

@@ -35,10 +35,8 @@ CREATE TABLE IF NOT EXISTS tickets (
   run_id TEXT,
   total_cost_usd REAL NOT NULL DEFAULT 0,
   last_error TEXT,
-  preview_token_hash TEXT,
   linear_context TEXT,
   base_branch TEXT NOT NULL DEFAULT 'main',
-  pending_re_review INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -85,26 +83,6 @@ CREATE INDEX IF NOT EXISTS agent_sessions_issue_generation_idx
   ON agent_sessions(linear_issue_id, generation);
 CREATE UNIQUE INDEX IF NOT EXISTS agent_sessions_identity_idx
   ON agent_sessions(id, linear_issue_id, generation);
-
-CREATE TABLE IF NOT EXISTS session_work (
-  id TEXT PRIMARY KEY,
-  linear_session_id TEXT NOT NULL,
-  linear_issue_id TEXT NOT NULL,
-  source TEXT NOT NULL,
-  priority INTEGER NOT NULL,
-  body TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',
-  claimed_run_id TEXT,
-  available_at TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  consumed_at TEXT,
-  canceled_at TEXT,
-  UNIQUE(linear_session_id, source, id),
-  FOREIGN KEY(linear_session_id) REFERENCES agent_sessions(id),
-  FOREIGN KEY(linear_issue_id) REFERENCES tickets(linear_issue_id)
-);
-CREATE INDEX IF NOT EXISTS session_work_claim_idx
-  ON session_work(linear_session_id, status, priority, created_at);
 
 CREATE TABLE IF NOT EXISTS linear_outbox (
   id TEXT PRIMARY KEY,
@@ -207,10 +185,8 @@ const TICKET_MIGRATIONS: Array<[string, string]> = [
   ["run_id", "ALTER TABLE tickets ADD COLUMN run_id TEXT"],
   ["total_cost_usd", "ALTER TABLE tickets ADD COLUMN total_cost_usd REAL NOT NULL DEFAULT 0"],
   ["last_error", "ALTER TABLE tickets ADD COLUMN last_error TEXT"],
-  ["preview_token_hash", "ALTER TABLE tickets ADD COLUMN preview_token_hash TEXT"],
   ["linear_context", "ALTER TABLE tickets ADD COLUMN linear_context TEXT"],
   ["base_branch", "ALTER TABLE tickets ADD COLUMN base_branch TEXT NOT NULL DEFAULT 'main'"],
-  ["pending_re_review", "ALTER TABLE tickets ADD COLUMN pending_re_review INTEGER NOT NULL DEFAULT 0"],
 ];
 
 const RUN_MIGRATIONS: Array<[string, string]> = [
@@ -269,15 +245,9 @@ function backfillAgentSessions(db: Database.Database): void {
 
 export type Agent = "claude" | "codex" | "opencode";
 type TicketState = "active" | "closed" | "expired" | "error" | "stopped";
-// Task taxonomy: implement (feature/bug plan) and investigate (debugging) are the
-// two loops; resume is the single continuation mechanism for either loop, fed by
-// a human reply or queued GitHub feedback. `review`/`review-fix` were removed —
-// see docs/SIMPLIFICATION-PLAN.md Phase 1. This is an additive migration: any
-// historical `runs` rows already written with the old task types are left as
-// free-form text (there is no CHECK constraint to violate), and the ticket's
-// `pending_re_review` column stays in the schema — no code reads or writes it
-// anymore.
-export type TaskType = "implement" | "resume" | "investigate";
+// The pipeline intent is selected at delegation. Continuation happens inside
+// stage attempts through pinned native-session policy, not as a task type.
+export type TaskType = "implement" | "investigate";
 type TerminalRunStatus = "completed" | "failed" | "timed_out" | "stopped";
 type RunStatus = "running" | "reaping" | "quarantined" | TerminalRunStatus;
 
@@ -295,7 +265,6 @@ export interface Ticket {
   run_id: string | null;
   total_cost_usd: number;
   last_error: string | null;
-  preview_token_hash: string | null;
   linear_context: string | null;
   base_branch: string;
   created_at: string;
@@ -386,7 +355,7 @@ interface SandboxEventRecord {
   event_id: string;
   run_id: string;
   sandbox_id: string;
-  kind: "activity" | "completion" | "plan" | "heartbeat" | "stage_result";
+  kind: "activity" | "plan" | "heartbeat" | "stage_result";
   payload: string;
   status: "pending" | "processing" | "failed" | "processed";
   attempts: number;
@@ -445,21 +414,6 @@ export interface SteerInboxRecord {
   lease_until: string | null;
 }
 
-interface SessionWork {
-  id: string;
-  linear_session_id: string;
-  linear_issue_id: string;
-  source: "human" | "automatic";
-  priority: number;
-  body: string;
-  status: "pending" | "claimed" | "consumed" | "canceled";
-  claimed_run_id: string | null;
-  available_at: string;
-  created_at: string;
-  consumed_at: string | null;
-  canceled_at: string | null;
-}
-
 interface FinishRunParams {
   runId: string;
   status: TerminalRunStatus;
@@ -504,47 +458,23 @@ export interface TicketStore {
   setSandboxId(issueId: string, sandboxId: string | null): void;
   setState(issueId: string, state: TicketState, lastError?: string): void;
   setPrUrl(issueId: string, prUrl: string): void;
-  setPreviewTokenHash(issueId: string, tokenHash: string): void;
   setLinearContext(issueId: string, context: string): void;
-  listActive(): Ticket[];
   listRunning(): Ticket[];
   listAll(): Ticket[];
-  listTicketsWithPendingSessionWork(nowIso: string): Ticket[];
   getCurrentSession(issueId: string): AgentSession | undefined;
   getSession(sessionId: string): AgentSession | undefined;
-  supersedeCurrentSession(issueId: string, newSessionId: string): AgentSession;
   markSessionState(sessionId: string, state: AgentSession["state"]): void;
-  enqueueSessionWork(params: {
-    id: string;
-    linearSessionId: string;
-    issueId: string;
-    source: "human" | "automatic";
-    body: string;
-    priority?: number;
-  }): boolean;
-  claimNextSessionWork(linearSessionId: string, nowIso: string): SessionWork | undefined;
-  markSessionWorkConsumed(workId: string, runId: string): void;
-  releaseSessionWork(workId: string): void;
-  cancelPendingSessionWork(linearSessionId: string): number;
-  cancelSessionWork(workId: string): void;
-  countConsumedAutomaticSessionWork(issueId: string): number;
   recordProviderFeedback(params: FeedbackRecordParams): {
     snapshot: FeedbackSnapshot;
     eventInserted: boolean;
     snapshotCreated: boolean;
   };
-  claimFeedbackWork(workItemId: string, maxRounds: number):
-    | { status: "claimed"; snapshot: FeedbackSnapshot; events: FeedbackSnapshotEvent[] }
-    | { status: "exhausted"; completedRounds: number }
-    | { status: "stale" }
-    | undefined;
   listPendingFeedbackSnapshots(linearSessionId: string, limit?: number): FeedbackSnapshot[];
   claimFeedbackSnapshot(snapshotId: string, maxRounds: number):
     | { status: "claimed"; snapshot: FeedbackSnapshot; events: FeedbackSnapshotEvent[] }
     | { status: "exhausted"; completedRounds: number }
     | { status: "stale" };
   consumeFeedbackSnapshot(snapshotId: string): boolean;
-  getConsumedSessionWorkForRun(runId: string): SessionWork | undefined;
   enqueueLinearOutbox(params: {
     id?: string;
     linearSessionId?: string | null;
@@ -565,7 +495,6 @@ export interface TicketStore {
   listLinearOutbox(): LinearOutboxRecord[];
   registerRepository(input: RepositoryRegistrationInput): RepositoryRegistration;
   getRepositoryRegistration(teamId?: string, teamKey?: string): RepositoryRegistration | undefined;
-  hasRepositoryRegistrations(): boolean;
   listRepositoryRegistrations(): RepositoryRegistration[];
   claimDelivery(claim: DeliveryClaim): boolean;
   claimDeliveryForProcessing(params: {
@@ -585,9 +514,7 @@ export interface TicketStore {
     expiresAt: string;
   }): boolean;
   getRun(runId: string): Run | undefined;
-  getLatestRun(issueId: string): Run | undefined;
   getLatestRunWithLog(issueId: string): Run | undefined;
-  countRunsByType(issueId: string, taskType: TaskType): number;
   finishRun(params: FinishRunParams): Run | undefined;
   claimRunForReaping(runId: string, owner: string, reason: string): Run | undefined;
   finishReapingRun(params: FinishRunParams & { owner: string }): Run | undefined;
@@ -621,11 +548,10 @@ export interface TicketStore {
     eventId: string;
     runId: string;
     sandboxId: string;
-    kind: "activity" | "completion" | "plan" | "heartbeat" | "stage_result";
+    kind: "activity" | "plan" | "heartbeat" | "stage_result";
     payload: string;
   }): SandboxEventRecord;
   getSandboxEvent(eventId: string): SandboxEventRecord | undefined;
-  getLastProcessedSandboxActivity(runId: string): SandboxEventRecord | undefined;
   claimSandboxEvent(eventId: string, nowIso: string, leaseUntilIso: string): SandboxEventRecord | undefined;
   markSandboxEventProcessed(eventId: string): void;
   markSandboxEventFailed(eventId: string, error: string, retryAt: string): void;
@@ -690,9 +616,6 @@ export function createTicketStore(db: Database.Database): TicketStore {
   const getByPrUrlStmt = db.prepare(
     "SELECT * FROM tickets WHERE lower(repo) = lower(?) AND lower(pr_url) = lower(?)"
   );
-  const countRunsByTypeStmt = db.prepare(
-    "SELECT COUNT(*) AS count FROM runs WHERE linear_issue_id = ? AND task_type = ?"
-  );
   const getBySandboxIdStmt = db.prepare("SELECT * FROM tickets WHERE sandbox_id = ?");
   const setSandboxIdStmt = db.prepare(
     "UPDATE tickets SET sandbox_id = ?, updated_at = ? WHERE linear_issue_id = ?"
@@ -703,13 +626,9 @@ export function createTicketStore(db: Database.Database): TicketStore {
   const setPrUrlStmt = db.prepare(
     "UPDATE tickets SET pr_url = ?, updated_at = ? WHERE linear_issue_id = ?"
   );
-  const setPreviewTokenHashStmt = db.prepare(
-    "UPDATE tickets SET preview_token_hash = ?, updated_at = ? WHERE linear_issue_id = ?"
-  );
   const setLinearContextStmt = db.prepare(
     "UPDATE tickets SET linear_context = ?, updated_at = ? WHERE linear_issue_id = ?"
   );
-  const listActiveStmt = db.prepare("SELECT * FROM tickets WHERE state = 'active'");
   const listRunningStmt = db.prepare(`
     SELECT t.* FROM tickets t
     JOIN runs r ON r.id = t.run_id
@@ -725,9 +644,6 @@ export function createTicketStore(db: Database.Database): TicketStore {
   );
   const listRepositoryRegistrationsStmt = db.prepare(
     "SELECT * FROM repository_registrations ORDER BY linear_team_key"
-  );
-  const hasRepositoryRegistrationsStmt = db.prepare(
-    "SELECT 1 AS found FROM repository_registrations LIMIT 1"
   );
   const upsertRepositoryRegistrationStmt = db.prepare(`
     INSERT INTO repository_registrations (
@@ -762,66 +678,6 @@ export function createTicketStore(db: Database.Database): TicketStore {
   const markSessionStateStmt = db.prepare(
     "UPDATE agent_sessions SET state = ?, updated_at = ? WHERE id = ?"
   );
-  const insertSessionWorkStmt = db.prepare(`
-    INSERT OR IGNORE INTO session_work (
-      id, linear_session_id, linear_issue_id, source, priority, body,
-      status, available_at, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-  `);
-  const cancelPendingSessionWorkStmt = db.prepare(`
-    UPDATE session_work
-    SET status = 'canceled', canceled_at = ?
-    WHERE linear_session_id = ? AND status = 'pending'
-  `);
-  const cancelSessionWorkStmt = db.prepare(`
-    UPDATE session_work
-    SET status = 'canceled', canceled_at = ?
-    WHERE id = ? AND status IN ('pending', 'claimed')
-  `);
-  const countConsumedAutomaticSessionWorkStmt = db.prepare(`
-    SELECT COUNT(*) AS count FROM work_items
-    WHERE linear_issue_id = ? AND source = 'automatic' AND status = 'consumed'
-  `);
-  const getConsumedSessionWorkForRunStmt = db.prepare(`
-    SELECT
-      id, linear_session_id, linear_issue_id, source, priority, body, status,
-      consumed_by_attempt_id AS claimed_run_id, available_at, created_at,
-      consumed_at, canceled_at
-    FROM work_items
-    WHERE consumed_by_attempt_id = ? AND status = 'consumed'
-      AND source IN ('human', 'automatic')
-    LIMIT 1
-  `);
-  const nextSessionWorkStmt = db.prepare(`
-    SELECT
-      wi.id, wi.linear_session_id, wi.linear_issue_id, wi.source, wi.priority,
-      wi.body, wi.status, NULL AS claimed_run_id, wi.available_at, wi.created_at,
-      wi.consumed_at, wi.canceled_at
-    FROM work_items wi
-    WHERE wi.linear_session_id = ? AND wi.status = 'pending'
-      AND wi.source IN ('human', 'automatic') AND wi.available_at <= ?
-    ORDER BY wi.priority ASC, wi.created_at ASC, wi.id ASC
-    LIMIT 1
-  `);
-  // Recovery net for the drain path: idle (no active run), still-active tickets
-  // whose *current* session has claimable pending work. completeRun is normally
-  // the only thing that drains queued feedback after a run, so a single missed
-  // drain would otherwise strand the work forever; the lifecycle sweep re-drains
-  // these. Matching on the ticket's current linear_session_id avoids reviving
-  // work left over from a superseded session.
-  const listTicketsWithPendingSessionWorkStmt = db.prepare(`
-    SELECT t.* FROM tickets t
-    WHERE t.run_id IS NULL
-      AND t.state IN ('active', 'error')
-      AND EXISTS (
-        SELECT 1 FROM work_items wi
-        WHERE wi.linear_issue_id = t.linear_issue_id
-          AND wi.linear_session_id = t.linear_session_id
-          AND wi.source IN ('human', 'automatic')
-          AND wi.status = 'pending' AND wi.available_at <= ?
-      )
-    ORDER BY t.updated_at ASC
-  `);
   const nextOutboxSequenceStmt = db.prepare(
     "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM linear_outbox WHERE linear_session_id IS ?"
   );
@@ -855,9 +711,6 @@ export function createTicketStore(db: Database.Database): TicketStore {
       AND json_extract(payload, '$.activity.ephemeral') IS 1
   `);
   const getRunStmt = db.prepare("SELECT * FROM runs WHERE id = ?");
-  const getLatestRunStmt = db.prepare(
-    "SELECT * FROM runs WHERE linear_issue_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1"
-  );
   const getLatestRunWithLogStmt = db.prepare(
     `SELECT * FROM runs
      WHERE linear_issue_id = ? AND log_tail IS NOT NULL
@@ -919,19 +772,6 @@ export function createTicketStore(db: Database.Database): TicketStore {
     ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)
   `);
   const getSandboxEventStmt = db.prepare("SELECT * FROM sandbox_events WHERE event_id = ?");
-  // Ephemeral activities (the live progress heartbeat) must never count as the
-  // run's last terminal activity: an agent's terminal `ot-activity
-  // elicitation/response` can be followed by a heartbeat with a newer timestamp
-  // (e.g. Codex reports the command_execution after the file is written), which
-  // would otherwise mask the terminal event and make completion post a generic
-  // response or drain queued work instead of pausing.
-  const getLastProcessedSandboxActivityStmt = db.prepare(`
-    SELECT * FROM sandbox_events
-    WHERE run_id = ? AND kind = 'activity' AND status = 'processed'
-      AND (json_extract(payload, '$.ephemeral') IS NOT 1)
-    ORDER BY processed_at DESC, created_at DESC
-    LIMIT 1
-  `);
   const getSettingStmt = db.prepare("SELECT value FROM settings WHERE key = ?");
   const setSettingStmt = db.prepare(`
     INSERT INTO settings (key, value) VALUES (?, ?)
@@ -1095,6 +935,14 @@ export function createTicketStore(db: Database.Database): TicketStore {
   const claimRunForReapingTransaction = db.transaction(
     (runId: string, owner: string, reason: string): Run | undefined => {
       const timestamp = now();
+      const existing = getRunStmt.get(runId) as Run | undefined;
+      if (existing?.status === "reaping") {
+        const liveness = db.prepare(`
+          SELECT settlement_owner FROM run_liveness
+          WHERE run_id = ? AND actor_state = 'reaping'
+        `).get(runId) as { settlement_owner: string | null } | undefined;
+        return liveness?.settlement_owner === owner ? existing : undefined;
+      }
       const update = db.prepare(
         "UPDATE runs SET status = 'reaping' WHERE id = ? AND status = 'running'"
       ).run(runId);
@@ -1168,6 +1016,14 @@ export function createTicketStore(db: Database.Database): TicketStore {
   const quarantineRunTransaction = db.transaction(
     (runId: string, owner: string, reason: string): Run | undefined => {
       const timestamp = now();
+      const existing = getRunStmt.get(runId) as Run | undefined;
+      if (existing?.status === "quarantined") {
+        const liveness = db.prepare(`
+          SELECT settlement_owner FROM run_liveness
+          WHERE run_id = ? AND actor_state = 'quarantined'
+        `).get(runId) as { settlement_owner: string | null } | undefined;
+        return liveness?.settlement_owner === owner ? existing : undefined;
+      }
       const update = db.prepare(`
         UPDATE runs SET status = 'quarantined', failure_tail = ?
         WHERE id = ? AND status = 'reaping'
@@ -1350,12 +1206,6 @@ export function createTicketStore(db: Database.Database): TicketStore {
             branch: ticket.branch,
             agent: ticket.agent,
           });
-        } else {
-          pipelineStore.pinLegacySession(
-            ticket.linear_session_id,
-            ticket.linear_issue_id,
-            session.generation
-          );
         }
       })();
     },
@@ -1396,14 +1246,8 @@ export function createTicketStore(db: Database.Database): TicketStore {
     setPrUrl(issueId, prUrl) {
       setPrUrlStmt.run(prUrl, now(), issueId);
     },
-    setPreviewTokenHash(issueId, tokenHash) {
-      setPreviewTokenHashStmt.run(tokenHash, now(), issueId);
-    },
     setLinearContext(issueId, context) {
       setLinearContextStmt.run(context, now(), issueId);
-    },
-    listActive() {
-      return listActiveStmt.all() as Ticket[];
     },
     listRunning() {
       return listRunningStmt.all() as Ticket[];
@@ -1411,196 +1255,17 @@ export function createTicketStore(db: Database.Database): TicketStore {
     listAll() {
       return listAllStmt.all() as Ticket[];
     },
-    listTicketsWithPendingSessionWork(nowIso) {
-      return listTicketsWithPendingSessionWorkStmt.all(nowIso) as Ticket[];
-    },
     getCurrentSession(issueId) {
       return getCurrentSessionStmt.get(issueId) as AgentSession | undefined;
     },
     getSession(sessionId) {
       return getSessionStmt.get(sessionId) as AgentSession | undefined;
     },
-    supersedeCurrentSession(issueId, newSessionId) {
-      return supersedeCurrentSessionTransaction(issueId, newSessionId);
-    },
     markSessionState(sessionId, state) {
       markSessionStateStmt.run(state, now(), sessionId);
     },
-    enqueueSessionWork(params) {
-      const timestamp = now();
-      return db.transaction(() => {
-        const inserted = insertSessionWorkStmt.run(
-          params.id,
-          params.linearSessionId,
-          params.issueId,
-          params.source,
-          params.priority ?? (params.source === "human" ? 0 : 10),
-          params.body,
-          timestamp,
-          timestamp
-        ).changes === 1;
-        if (!inserted) return false;
-        const session = getSessionStmt.get(params.linearSessionId) as AgentSession | undefined;
-        workStore.enqueue({
-          id: params.id,
-          issueId: params.issueId,
-          sessionId: params.linearSessionId,
-          generation: session?.generation ?? 1,
-          contextRevision: 0,
-          nativeSessionId: session?.provider_conversation_id ?? null,
-          source: params.source,
-          body: params.body,
-          priority: params.priority,
-          availableAt: timestamp,
-        });
-        db.prepare(
-          "INSERT OR IGNORE INTO work_item_sources(source_table, source_id, work_item_id) VALUES ('session_work', ?, ?)"
-        ).run(params.id, params.id);
-        return true;
-      })();
-    },
-    claimNextSessionWork(linearSessionId, nowIso) {
-      return db.transaction(() => {
-        const candidate = nextSessionWorkStmt.get(linearSessionId, nowIso) as
-          | SessionWork
-          | undefined;
-        if (!candidate) return undefined;
-        const authoritative = db.prepare(`
-          UPDATE work_items SET status = 'leased', updated_at = ?
-          WHERE id = ? AND status = 'pending' AND active_delivery_id IS NULL
-        `).run(now(), candidate.id);
-        if (authoritative.changes !== 1) return undefined;
-        db.prepare(`
-          INSERT INTO session_work (
-            id, linear_session_id, linear_issue_id, source, priority, body,
-            status, claimed_run_id, available_at, created_at, consumed_at, canceled_at
-          ) VALUES (?, ?, ?, ?, ?, ?, 'claimed', NULL, ?, ?, NULL, NULL)
-          ON CONFLICT(id) DO UPDATE SET
-            linear_session_id = excluded.linear_session_id,
-            linear_issue_id = excluded.linear_issue_id,
-            source = excluded.source,
-            priority = excluded.priority,
-            body = excluded.body,
-            status = 'claimed',
-            claimed_run_id = NULL,
-            available_at = excluded.available_at,
-            consumed_at = NULL,
-            canceled_at = NULL
-        `).run(
-          candidate.id,
-          candidate.linear_session_id,
-          candidate.linear_issue_id,
-          candidate.source,
-          candidate.priority,
-          candidate.body,
-          candidate.available_at,
-          candidate.created_at
-        );
-        return { ...candidate, status: "claimed" as const };
-      }).immediate();
-    },
-    markSessionWorkConsumed(workId, runId) {
-      const timestamp = now();
-      db.transaction(() => {
-        db.prepare(`
-          UPDATE session_work
-          SET status = 'consumed', claimed_run_id = ?, consumed_at = ?
-          WHERE id = ? AND status IN ('pending', 'claimed')
-        `).run(runId, timestamp, workId);
-        workStore.consumeFallback(workId, runId);
-        const snapshot = db.prepare(
-          "SELECT id FROM feedback_snapshots WHERE work_item_id = ?"
-        ).get(workId) as { id: string } | undefined;
-        if (snapshot) feedbackStore.consume(snapshot.id);
-        db.prepare(
-          "UPDATE session_inbox SET status = 'canceled' WHERE id = ? AND status IN ('pending', 'dispatched')"
-        ).run(workId);
-      })();
-    },
-    releaseSessionWork(workId) {
-      db.transaction(() => {
-        db.prepare(`
-          UPDATE work_items SET status = 'pending', updated_at = ?
-          WHERE id = ? AND status = 'leased' AND active_delivery_id IS NULL
-        `).run(now(), workId);
-        db.prepare(`
-          UPDATE session_work SET status = 'pending'
-          WHERE id = ? AND status = 'claimed'
-        `).run(workId);
-      }).immediate();
-    },
-    cancelPendingSessionWork(linearSessionId) {
-      return db.transaction(() => {
-        const ids = db.prepare(
-          "SELECT id FROM session_work WHERE linear_session_id = ? AND status = 'pending'"
-        ).all(linearSessionId) as Array<{ id: string }>;
-        const changes = cancelPendingSessionWorkStmt.run(now(), linearSessionId).changes;
-        for (const { id } of ids) {
-          workStore.cancel(id, "session stopped");
-          db.prepare(
-            "UPDATE session_inbox SET status = 'canceled' WHERE id = ? AND status IN ('pending', 'dispatched')"
-          ).run(id);
-        }
-        return changes;
-      })();
-    },
-    cancelSessionWork(workId) {
-      db.transaction(() => {
-        cancelSessionWorkStmt.run(now(), workId);
-        workStore.cancel(workId, "compatibility projection canceled");
-        db.prepare(
-          "UPDATE session_inbox SET status = 'canceled' WHERE id = ? AND status IN ('pending', 'dispatched')"
-        ).run(workId);
-      })();
-    },
-    countConsumedAutomaticSessionWork(issueId) {
-      return (countConsumedAutomaticSessionWorkStmt.get(issueId) as { count: number }).count;
-    },
     recordProviderFeedback(params) {
-      return db.transaction(() => {
-        const recorded = feedbackStore.record(params);
-        if (params.workBody !== undefined) {
-          const timestamp = now();
-          const inserted = insertSessionWorkStmt.run(
-            recorded.snapshot.work_item_id,
-            params.sessionId,
-            params.issueId,
-            "automatic",
-            10,
-            params.workBody,
-            timestamp,
-            timestamp
-          ).changes === 1;
-          if (inserted) {
-            workStore.enqueue({
-              id: recorded.snapshot.work_item_id!,
-              issueId: params.issueId,
-              sessionId: params.sessionId,
-              generation: params.generation,
-              contextRevision: 0,
-              source: "automatic",
-              body: params.workBody,
-              priority: 10,
-              availableAt: timestamp,
-            });
-            db.prepare(
-              "INSERT OR IGNORE INTO work_item_sources(source_table, source_id, work_item_id) VALUES ('session_work', ?, ?)"
-            ).run(recorded.snapshot.work_item_id, recorded.snapshot.work_item_id);
-          } else if (!workStore.get(recorded.snapshot.work_item_id!)) {
-            throw new Error(
-              `feedback work projection ${recorded.snapshot.work_item_id} has no authoritative item`
-            );
-          }
-        }
-        return recorded;
-      }).immediate();
-    },
-    claimFeedbackWork(workItemId, maxRounds) {
-      const snapshot = db.prepare(
-        "SELECT * FROM feedback_snapshots WHERE work_item_id = ?"
-      ).get(workItemId) as FeedbackSnapshot | undefined;
-      if (!snapshot) return undefined;
-      return claimFeedbackSnapshot(snapshot, maxRounds);
+      return feedbackStore.record(params);
     },
     listPendingFeedbackSnapshots(linearSessionId, limit = 50) {
       return db.prepare(`
@@ -1616,9 +1281,6 @@ export function createTicketStore(db: Database.Database): TicketStore {
     },
     consumeFeedbackSnapshot(snapshotId) {
       return feedbackStore.consume(snapshotId);
-    },
-    getConsumedSessionWorkForRun(runId) {
-      return getConsumedSessionWorkForRunStmt.get(runId) as SessionWork | undefined;
     },
     enqueueLinearOutbox(params) {
       return enqueueLinearOutboxTransaction(params);
@@ -1773,9 +1435,6 @@ export function createTicketStore(db: Database.Database): TicketStore {
         ? (getRepositoryByTeamKeyStmt.get(teamKey) as RepositoryRegistration | undefined)
         : undefined;
     },
-    hasRepositoryRegistrations() {
-      return Boolean(hasRepositoryRegistrationsStmt.get());
-    },
     listRepositoryRegistrations() {
       return listRepositoryRegistrationsStmt.all() as RepositoryRegistration[];
     },
@@ -1825,14 +1484,8 @@ export function createTicketStore(db: Database.Database): TicketStore {
     getRun(runId) {
       return getRunStmt.get(runId) as Run | undefined;
     },
-    getLatestRun(issueId) {
-      return getLatestRunStmt.get(issueId) as Run | undefined;
-    },
     getLatestRunWithLog(issueId) {
       return getLatestRunWithLogStmt.get(issueId) as Run | undefined;
-    },
-    countRunsByType(issueId, taskType) {
-      return (countRunsByTypeStmt.get(issueId, taskType) as { count: number }).count;
     },
     finishRun(params) {
       return finishRunTransaction.immediate(params);
@@ -2025,9 +1678,6 @@ export function createTicketStore(db: Database.Database): TicketStore {
     },
     getSandboxEvent(eventId) {
       return getSandboxEventStmt.get(eventId) as SandboxEventRecord | undefined;
-    },
-    getLastProcessedSandboxActivity(runId) {
-      return getLastProcessedSandboxActivityStmt.get(runId) as SandboxEventRecord | undefined;
     },
     claimSandboxEvent(eventId, nowIso, leaseUntilIso) {
       return claimSandboxEventTransaction(eventId, nowIso, leaseUntilIso);

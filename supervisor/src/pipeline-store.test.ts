@@ -61,10 +61,10 @@ describe("pipeline store", () => {
     };
   }
 
-  it("pins legacy mode for ordinary generations and creates a new-mode graph atomically", () => {
+  it("creates only explicitly configured pipeline graphs", () => {
     const { tickets, pipelines, catalog, snapshot } = setup();
-    tickets.upsert(ticket("legacy-session"));
-    expect(db!.prepare("SELECT execution_mode FROM session_executions WHERE linear_session_id = ?").pluck().get("legacy-session")).toBe("legacy");
+    tickets.upsertUnpinned(ticket("unpinned-session"));
+    expect(db!.prepare("SELECT execution_mode FROM session_executions WHERE linear_session_id = ?").pluck().get("unpinned-session")).toBeUndefined();
 
     const manifest = catalog.manifests.get("ce/implement@1")!;
     const input = {
@@ -178,7 +178,7 @@ describe("pipeline store", () => {
     expect(pipelines.getInstance(oldInstance.id)?.status).toBe("dispatchable");
     expect(pipelines.listEffects(oldInstance.id).map((effect) => [effect.kind, effect.status]))
       .toEqual([["provision", "pending"]]);
-    expect(pipelines.getSessionExecutionMode("rollback-new")).toBeUndefined();
+    expect(db!.prepare("SELECT execution_mode FROM session_executions WHERE linear_session_id = ?").pluck().get("rollback-new")).toBeUndefined();
   });
 
   it("rejects mutation of an accepted version while allowing aliases to move for future instances", () => {
@@ -425,6 +425,13 @@ describe("pipeline store", () => {
       },
     });
     const instance = pipelines.getInstanceForSession("effect-session")!;
+    db!.prepare(`
+      INSERT INTO pipeline_effect_intents (
+        id, pipeline_instance_id, transition_version, kind, idempotency_key,
+        payload, payload_hash, status, next_attempt_at, created_at
+      ) VALUES ('later-cleanup', ?, 2, 'cleanup', 'later-cleanup', '{}', ?,
+        'pending', '2099-01-01T00:00:00.000Z', '2099-01-01T00:00:00.000Z')
+    `).run(instance.id, digestNormalized("{}"));
     const first = pipelines.claimEffects(
       "2099-01-01T00:00:00.000Z",
       "2099-01-01T00:01:00.000Z"
@@ -454,9 +461,19 @@ describe("pipeline store", () => {
     expect(pipelines.listEffects(instance.id)[0]?.status).toBe("acknowledged");
     expect(db!.prepare("SELECT kind, status FROM pipeline_inbox_events WHERE id = ?")
       .get("effect-ack-1")).toEqual({ kind: "effect_acknowledged", status: "pending" });
-    expect(pipelines.claimEffects(
+    const later = pipelines.claimEffects(
       "2099-01-01T01:00:00.000Z",
       "2099-01-01T01:01:00.000Z"
+    );
+    expect(later).toEqual([expect.objectContaining({ id: "later-cleanup", attempts: 1 })]);
+    pipelines.recordEffectAcknowledgement({
+      effectId: "later-cleanup",
+      eventId: "effect-ack-2",
+      payload: "{}",
+    });
+    expect(pipelines.claimEffects(
+      "2099-01-01T02:00:00.000Z",
+      "2099-01-01T02:01:00.000Z"
     )).toEqual([]);
   });
 });

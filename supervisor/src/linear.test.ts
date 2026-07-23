@@ -95,10 +95,10 @@ describe("Linear contracts", () => {
         ...parsed,
         agentSession: {
           ...parsed.agentSession,
-          issue: { ...parsed.agentSession.issue!, labels: { nodes: [{ name: "legacy" }] } },
+          issue: { ...parsed.agentSession.issue!, labels: { nodes: [{ name: "backend" }] } },
         },
       })
-    ).toEqual(["legacy"]);
+    ).toEqual(["backend"]);
   });
 
   it("sends exact activity and session-update GraphQL variables", async () => {

@@ -116,7 +116,8 @@ describe("pipeline coordinator", () => {
       expect(write.instanceId).toBe(instance.id);
       expect(write.outcome).toBe(outcome);
       expect(write.effects).toHaveLength(
-        write.terminalOutcome === "shipped" || write.terminalOutcome === "no_change" ? 2 : 1
+        write.terminalOutcome === "shipped" || write.terminalOutcome === "no_change" ||
+          write.terminalOutcome === "failed" ? 2 : 1
       );
     }
   });

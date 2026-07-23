@@ -422,12 +422,20 @@ export function renderPipelineLogHeader(status: {
   gate_result: string | null;
   context_policy: string | null;
   publication_state: string;
+  publication_error: string | null;
+  recovery_action: string | null;
+  effect_state: string;
+  effect_kind: string | null;
+  effect_status: string | null;
+  effect_attempts: number | null;
+  effect_error: string | null;
 }): string {
   return boundedSanitized([
     `[pipeline] ${status.pipeline_id}@${status.pipeline_version} task=${status.task_type} state=${status.status}`,
     `[pipeline] stage=${status.stage_id ?? "-"} attempt=${status.attempt_ordinal ?? "-"} reentry=${status.reentry_count}`,
     `[pipeline] subject=${status.subject ?? "-"} provider=${status.published_commit ?? "-"} gate=${status.gate_result ?? "-"} context=${status.context_policy ?? "-"}`,
-    `[pipeline] publication=${status.publication_state} wait=${status.wait_reason ?? "-"}`,
+    `[pipeline] publication=${status.publication_state} publication_error=${status.publication_error ?? "-"} recovery=${status.recovery_action ?? "-"}`,
+    `[pipeline] effect=${status.effect_kind ?? "-"}:${status.effect_status ?? status.effect_state} attempts=${status.effect_attempts ?? "-"} effect_error=${status.effect_error ?? "-"} wait=${status.wait_reason ?? "-"}`,
   ].join("\n"), 4_000);
 }
 
@@ -462,7 +470,18 @@ export function createGithubPublicationProcessor(params: {
     let bound = publication;
     if (!bound.target_url) {
       const ticket = params.tickets.getByIssueId(instance.linear_issue_id);
-      if (!ticket?.pr_url) throw new Error("pipeline pull request is not available yet");
+      if (!ticket?.pr_url) {
+        const terminal = instance.terminal_outcome != null || [
+          "shipped", "no_change", "needs_human", "canceled", "superseded", "failed",
+        ].includes(instance.status);
+        if (terminal) {
+          if (!params.store.markGithubPublicationSkipped(publication.id, publication.payload_hash)) {
+            throw new Error("terminal pipeline publication changed before it could be skipped");
+          }
+          return;
+        }
+        throw new Error("pipeline pull request is not available yet");
+      }
       if (ticket.linear_session_id !== instance.linear_session_id) {
         throw new Error("pipeline publication no longer has its original session binding");
       }

@@ -51,6 +51,8 @@ export interface PipelineCoordinatorEvent {
   providerRevision?: string;
   nativeSessionId?: string | null;
   controlTicketState?: "stopped" | "closed";
+  exhaustedEffectId?: string;
+  exhaustedEffectError?: string;
   artifacts?: PipelineEventArtifact[];
 }
 
@@ -333,11 +335,18 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
         nextStageId: null,
         waitReason: `re-entry exhausted at ${stage.id}`,
         artifacts: artifactsFor(input.event),
-        effects: [{
-          kind: "publish_linear",
-          idempotencyKey: `linear-exhausted:${input.instance.id}:${stage.id}:${targetState.reentry_count}`,
-          payload: canonicalJson({ pipelineInstanceId: input.instance.id, stageId: stage.id, outcome: exhausted }),
-        }],
+        effects: [
+          {
+            kind: "publish_linear",
+            idempotencyKey: `linear-exhausted:${input.instance.id}:${stage.id}:${targetState.reentry_count}`,
+            payload: canonicalJson({ pipelineInstanceId: input.instance.id, stageId: stage.id, outcome: exhausted }),
+          },
+          ...(exhausted === "failed" ? [{
+            kind: "stop" as const,
+            idempotencyKey: `stop:${input.instance.id}:reentry-exhausted`,
+            payload: canonicalJson({ pipelineInstanceId: input.instance.id, outcome: exhausted, ticketState: "error" }),
+          }] : []),
+        ],
       };
     }
     if (input.instance.attempt_count >= input.manifest.max_attempts) {
@@ -355,16 +364,23 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
         nextStageId: null,
         waitReason: `pipeline attempt limit ${input.manifest.max_attempts} exhausted`,
         artifacts: artifactsFor(input.event),
-        effects: [{
-          kind: "publish_linear",
-          idempotencyKey: `linear-attempts-exhausted:${input.instance.id}:${input.manifest.max_attempts}`,
-          payload: canonicalJson({
-            pipelineInstanceId: input.instance.id,
-            stageId: stage.id,
-            outcome: "failed",
-            reason: "attempts_exhausted",
-          }),
-        }],
+        effects: [
+          {
+            kind: "publish_linear",
+            idempotencyKey: `linear-attempts-exhausted:${input.instance.id}:${input.manifest.max_attempts}`,
+            payload: canonicalJson({
+              pipelineInstanceId: input.instance.id,
+              stageId: stage.id,
+              outcome: "failed",
+              reason: "attempts_exhausted",
+            }),
+          },
+          {
+            kind: "stop",
+            idempotencyKey: `stop:${input.instance.id}:attempts-exhausted`,
+            payload: canonicalJson({ pipelineInstanceId: input.instance.id, outcome: "failed", ticketState: "error" }),
+          },
+        ],
       };
     }
     const reentryOrdinal = isReentry ? targetState.reentry_count + 1 : targetState.reentry_count;
@@ -435,6 +451,16 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
       idempotencyKey: `cleanup:${input.instance.id}:${terminal}`,
       payload: canonicalJson({ pipelineInstanceId: input.instance.id, outcome: terminal }),
     });
+  } else if (terminal === "failed") {
+    terminalEffects.push({
+      kind: "stop",
+      idempotencyKey: `stop:${input.instance.id}:${terminal}`,
+      payload: canonicalJson({
+        pipelineInstanceId: input.instance.id,
+        outcome: terminal,
+        ticketState: "error",
+      }),
+    });
   }
   return {
     instanceId: input.instance.id,
@@ -479,6 +505,8 @@ export function coordinatePipelineEvent(
   const manifest = JSON.parse(instance.normalized_manifest) as PipelineManifest;
   const stages = store.listStages(instance.id);
   const write = reducePipelineEvent({ manifest, instance, attempt, stages, event });
+  write.exhaustedEffectId = event.exhaustedEffectId;
+  write.exhaustedEffectError = event.exhaustedEffectError;
   write.gateReceipt = gateReceipt;
   const target = write.nextStageId
     ? manifest.stages.find((stage) => stage.id === write.nextStageId)

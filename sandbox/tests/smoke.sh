@@ -81,6 +81,14 @@ test -f "$HOME/.claude/plugins/cache/compound-engineering-plugin/compound-engine
 }
 ot-activity action "smoke Claude agent started"
 if [ -n "${OT_STAGE_PROPOSAL_FILE:-}" ]; then
+  case "$*" in
+    *"/implement-plan"*) ;;
+    *) echo "Claude stage did not use slash-command skill syntax" >&2; exit 26 ;;
+  esac
+  case " $* " in *" --max-turns 2 "*) ;; *) exit 27 ;; esac
+  case " $* " in *" --strict-mcp-config "*) ;; *) exit 28 ;; esac
+  test -f "$HOME/.claude/settings.json" || exit 29
+  grep -Fq 'fixture-mcp' "${OT_CLAUDE_MCP_CONFIG:?}" || exit 30
   ot-stage-result '{"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"Claude stage complete","evidence":["stub engine invoked"],"findings":[],"actions":[],"uncertainty":[]}' --output "$OT_STAGE_PROPOSAL_FILE" || exit 23
   test -s "$OT_STAGE_PROPOSAL_FILE" || exit 24
 fi
@@ -97,12 +105,19 @@ STUB
 
 cat > "$SMOKE_DIR/bin/codex" <<'STUB'
 #!/usr/bin/env sh
+if [ "${1:-}" = "exec" ] && [ "${2:-}" = "--help" ]; then
+  echo '--dangerously-bypass-hook-trust'
+  exit 0
+fi
 test -f "$HOME/.codex/plugins/cache/compound-engineering-plugin/compound-engineering/3.19.0/skills/ce-work/SKILL.md" || {
   echo "Codex CE skill missing in $HOME" >&2
   exit 25
 }
 ot-activity action "smoke Codex agent started"
 if [ -n "${OT_STAGE_PROPOSAL_FILE:-}" ]; then
+  test -f "$HOME/.codex/AGENTS.md" || exit 26
+  test -f "$HOME/.codex/hooks.json" || exit 27
+  case " $* " in *" --dangerously-bypass-hook-trust "*) ;; *) exit 28 ;; esac
   ot-stage-result '{"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"Codex stage complete","evidence":["stub engine invoked"],"findings":[],"actions":[],"uncertainty":[]}' --output "$OT_STAGE_PROPOSAL_FILE" || exit 23
   test -s "$OT_STAGE_PROPOSAL_FILE" || exit 24
 fi
@@ -128,7 +143,8 @@ ot-activity action "smoke OpenCode agent started"
 if [ -n "${OT_STAGE_PROPOSAL_FILE:-}" ]; then
   ot-stage-result '{"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"OpenCode stage complete","evidence":["stub engine invoked"],"findings":[],"actions":[],"uncertainty":[]}' --output "$OT_STAGE_PROPOSAL_FILE" || exit 23
   test -s "$OT_STAGE_PROPOSAL_FILE" || exit 24
-else
+fi
+if [ -n "${OPENCODE_CONFIG_DIR:-}" ]; then
   test "${OPENCODE_DISABLE_PROJECT_CONFIG:-}" = "1"
   test "${OPENCODE_DISABLE_EXTERNAL_SKILLS:-}" = "1"
   test "${OPENCODE_DISABLE_CLAUDE_CODE:-}" = "1"
@@ -136,6 +152,7 @@ else
   test -r "$OPENCODE_CONFIG_DIR/opencode.json"
   grep -Fq '/opt/openthrottle/compound-engineering-marketplace' "$OPENCODE_CONFIG_DIR/opencode.json"
   grep -Fq '{env:KIMI_CODE_API_KEY}' "$OPENCODE_CONFIG_DIR/opencode.json"
+  grep -Fq 'fixture-mcp' "$OPENCODE_CONFIG_DIR/opencode.json"
   if grep -Fq "$KIMI_CODE_API_KEY" "$OPENCODE_CONFIG_DIR/opencode.json"; then
     exit 12
   fi
@@ -166,127 +183,14 @@ seed_agent_home() {
     '
 }
 
-run_sandbox() {
-  local home_dir="$1"
-  local agent="$2"
-  local task_type="$3"
-  local branch="$4"
-  local run_id="$5"
-  local issue_identifier="$6"
-  local resume_message="${7:-}"
-  mkdir -p "$home_dir/.ot"
-  printf '# %s\n\nApproved smoke-test plan.\n' "$issue_identifier" \
-    > "$home_dir/.ot/linear-context.md"
-  local docker_args=(
-    run --rm
-    --entrypoint /opt/openthrottle/entrypoint.sh
-    --network "$NETWORK"
-    -e OT_SMOKE_TEST=1
-    -e OT_GIT_URL_OVERRIDE=file:///fixture/repo.git
-    -e "TASK_TYPE=$task_type"
-    -e "AGENT=$agent"
-    -e GITHUB_REPO=owner/smoke
-    -e GITHUB_TOKEN=github-smoke-token
-    -e BASE_BRANCH=main
-    -e "BRANCH_NAME=$branch"
-    -e "LINEAR_ISSUE_ID=issue-$issue_identifier"
-    -e "LINEAR_ISSUE_IDENTIFIER=$issue_identifier"
-    -e "RUN_ID=$run_id"
-    -e "RUN_CALLBACK_TOKEN=token-$run_id"
-    -e TASK_TIMEOUT=30
-    -v "$SMOKE_DIR:/fixture"
-    -v "$SMOKE_DIR/bin/claude:/usr/local/bin/claude:ro"
-    -v "$SMOKE_DIR/bin/codex:/usr/local/bin/codex:ro"
-    -v "$SMOKE_DIR/bin/opencode:/usr/local/bin/opencode:ro"
-    -v "$home_dir:/home/agent"
-  )
-  if [[ -n "$resume_message" ]]; then
-    docker_args+=(-e "RESUME_MESSAGE=$resume_message")
-  fi
-  if [[ "$agent" == "claude" ]]; then
-    docker_args+=(-e CLAUDE_CODE_OAUTH_TOKEN=claude-oauth-token)
-  elif [[ "$agent" == "codex" ]]; then
-    docker_args+=(-e 'CODEX_AUTH_JSON={}')
-  else
-    docker_args+=(-e KIMI_CODE_API_KEY=kimi-smoke-secret)
-  fi
-  docker "${docker_args[@]}" "$IMAGE"
-}
-
 CLAUDE_HOME="$SMOKE_DIR/result/claude-home"
 seed_agent_home "$CLAUDE_HOME"
-run_sandbox "$CLAUDE_HOME" claude implement ot/smoke-claude claude-implement OT-CLAUDE
-test "$(cat "$CLAUDE_HOME/.ot/agent-session-id")" = "smoke-claude-session"
-run_sandbox "$CLAUDE_HOME" claude resume ot/smoke-claude claude-resume OT-CLAUDE "continue"
-grep -q -- '--resume smoke-claude-session' "$CLAUDE_HOME/.ot/claude-args.log"
-jq -e '.exit_code == 0 and .cost_usd == 0.125' \
-  "$(find "$CLAUDE_HOME/.ot/outbox" -name '*completion-claude-implement.json' -print -quit)" >/dev/null
-jq -e '.exit_code == 0 and .cost_usd == 0.25' \
-  "$(find "$CLAUDE_HOME/.ot/outbox" -name '*completion-claude-resume.json' -print -quit)" >/dev/null
-# The agent's `ot-activity action` and the normalizer's ephemeral progress
-# heartbeat both land as activity files, so assert across all of them rather
-# than assuming a single one: an action activity exists, and the live heartbeat
-# emitted an ephemeral thought.
-find "$CLAUDE_HOME/.ot/outbox" -name '*-activity-*.json' -exec cat {} + \
-  | jq -s -e 'any(.[]; .kind == "activity" and .type == "action")' >/dev/null
-find "$CLAUDE_HOME/.ot/outbox" -name '*-activity-*.json' -exec cat {} + \
-  | jq -s -e 'any(.[]; .type == "thought" and .ephemeral == true)' >/dev/null
 
 CODEX_HOME="$SMOKE_DIR/result/codex-home"
 seed_agent_home "$CODEX_HOME"
-run_sandbox "$CODEX_HOME" codex implement ot/smoke-codex codex-implement OT-CODEX
-test "$(cat "$CODEX_HOME/.ot/agent-session-id")" = "smoke-codex-thread"
-head -n1 "$CODEX_HOME/.ot/codex-stdin.log" | grep -Fxq '$implement-plan'
-grep -Fq 'CE pipeline: ce-work,ce-code-review,ce-commit-push-pr' \
-  "$CODEX_HOME/.ot/codex-stdin.log"
-if grep -Eq 'PR number|Review round' "$CODEX_HOME/.ot/codex-stdin.log"; then
-  echo "codex stdin still contains the retired PR number/Review round fields" >&2
-  exit 1
-fi
-run_sandbox "$CODEX_HOME" codex resume ot/smoke-codex codex-resume OT-CODEX "continue"
-grep -q -- 'exec .* resume smoke-codex-thread continue' "$CODEX_HOME/.ot/codex-args.log"
-jq -e '.exit_code == 0 and (has("cost_usd") | not)' \
-  "$(find "$CODEX_HOME/.ot/outbox" -name '*completion-codex-implement.json' -print -quit)" >/dev/null
-jq -e '.exit_code == 0 and (has("cost_usd") | not)' \
-  "$(find "$CODEX_HOME/.ot/outbox" -name '*completion-codex-resume.json' -print -quit)" >/dev/null
-find "$CODEX_HOME/.ot/outbox" -name '*-activity-*.json' -exec cat {} + \
-  | jq -s -e 'any(.[]; .kind == "activity" and .type == "action")' >/dev/null
 
 OPENCODE_HOME="$SMOKE_DIR/result/opencode-home"
 seed_agent_home "$OPENCODE_HOME"
-run_sandbox "$OPENCODE_HOME" opencode implement ot/smoke-opencode opencode-implement OT-OPENCODE
-test "$(cat "$OPENCODE_HOME/.ot/agent-session-id")" = "smoke-opencode-session"
-test "$(cat "$OPENCODE_HOME/.ot/agent-model")" = "kimi-code/kimi-for-coding"
-grep -Fq '$ce-work' "$OPENCODE_HOME/.ot/opencode-prompt.log"
-grep -Fq 'CE pipeline: ce-work,ce-code-review,ce-commit-push-pr' \
-  "$OPENCODE_HOME/.ot/opencode-prompt.log"
-if grep -Eq 'PR number|Review round' "$OPENCODE_HOME/.ot/opencode-prompt.log"; then
-  echo "opencode prompt still contains the retired PR number/Review round fields" >&2
-  exit 1
-fi
-if grep -Fxq -- '---' "$OPENCODE_HOME/.ot/opencode-prompt.log"; then
-  echo "opencode prompt still carries the SKILL.md YAML frontmatter" >&2
-  exit 1
-fi
-grep -q -- 'run .*--model kimi-code/kimi-for-coding .*--dir /home/agent/repo .*--auto' \
-  "$OPENCODE_HOME/.ot/opencode-args.log"
-run_sandbox "$OPENCODE_HOME" opencode resume ot/smoke-opencode opencode-resume OT-OPENCODE "continue"
-grep -q -- 'run .*--session smoke-opencode-session' "$OPENCODE_HOME/.ot/opencode-args.log"
-jq -e '.exit_code == 0 and .cost_usd == 0.375' \
-  "$(find "$OPENCODE_HOME/.ot/outbox" -name '*completion-opencode-implement.json' -print -quit)" >/dev/null
-jq -e '.exit_code == 0 and .cost_usd == 0.375' \
-  "$(find "$OPENCODE_HOME/.ot/outbox" -name '*completion-opencode-resume.json' -print -quit)" >/dev/null
-
-git --git-dir "$SMOKE_DIR/repo.git" show-ref --verify --quiet refs/heads/ot/smoke-claude
-git --git-dir "$SMOKE_DIR/repo.git" show-ref --verify --quiet refs/heads/ot/smoke-codex
-if grep -R --exclude-dir=outbox -n -E -- \
-  'github-smoke-token|claude-oauth-token|kimi-smoke-secret|token-(claude|codex|opencode)' \
-  "$SMOKE_DIR/result"; then
-  echo "smoke artifacts leaked a secret" >&2
-  exit 1
-fi
-
-git --git-dir "$SMOKE_DIR/repo.git" show-ref --verify --quiet refs/heads/ot/smoke-opencode
 
 run_stage_smoke() {
   local agent="$1"
@@ -322,6 +226,7 @@ run_stage_smoke() {
         ...(commandStage ? { test: "true" } : { model: "kimi-code/kimi-for-coding" }),
         post_bootstrap: [],
         limits: { max_turns: 2, task_timeout: 30 },
+        mcp_servers: { "fixture-mcp": { command: "node", args: ["fixture-mcp.mjs"] } },
       };
       const capability = commandStage ? "command/run@1" : "ce/plan@1";
       const requiredArtifacts = commandStage
@@ -393,12 +298,11 @@ run_stage_smoke() {
     --entrypoint /opt/openthrottle/entrypoint.sh
     --network "$NETWORK"
     -e OT_SMOKE_TEST=1
-    -e OT_STAGE_EXECUTION=1
     -e OT_GIT_URL_OVERRIDE=file:///fixture/repo.git
     -e "OT_STAGE_REQUEST_FILE=/var/lib/openthrottle/stage-input/$attempt_id.json"
     -e OT_STAGE_CONFIG_FILE=/var/lib/openthrottle/stage-input/repository-config.json
     -e OT_STAGE_MANIFEST_FILE=/var/lib/openthrottle/stage-input/pipeline-manifest.json
-    -e TASK_TYPE=resume
+    -e TASK_TYPE=env-tampered
     -e AGENT=env-tampered
     -e GITHUB_REPO=env/tampered
     -e GITHUB_TOKEN=github-smoke-token
@@ -420,7 +324,13 @@ run_stage_smoke() {
   elif [[ "$stage_kind" != "command" ]]; then
     docker_args+=(-e KIMI_CODE_API_KEY=kimi-smoke-secret)
   fi
-  docker "${docker_args[@]}" "$IMAGE"
+  if ! docker "${docker_args[@]}" "$IMAGE"; then
+    echo "stage container failed for ${agent}/${stage_kind}" >&2
+    if [[ -f "$home_dir/.ot/task.log" ]]; then
+      tail -n 200 "$home_dir/.ot/task.log" >&2
+    fi
+    return 1
+  fi
 
   # The runtime intentionally creates its spool root-only. Make this bind
   # mounted smoke fixture readable/removable by the non-root GitHub runner
@@ -446,7 +356,7 @@ run_stage_smoke() {
     exit 1
   fi
   if find "$home_dir/.ot/outbox" -name "*completion-$run_id.json" -print -quit | rg -q .; then
-    echo "stage execution emitted a legacy completion marker" >&2
+    echo "stage execution emitted an unexpected completion event" >&2
     exit 1
   fi
 }
@@ -456,4 +366,4 @@ run_stage_smoke codex "$CODEX_HOME"
 run_stage_smoke opencode "$OPENCODE_HOME"
 run_stage_smoke opencode "$OPENCODE_HOME" command
 
-echo "sandbox Claude + Codex + OpenCode implement/resume + fenced stage smoke passed"
+echo "sandbox Claude + Codex + OpenCode fenced stage smoke passed"

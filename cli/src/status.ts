@@ -15,7 +15,6 @@ interface TicketRow {
   state: string;
   pr_url: string | null;
   updated_at: string;
-  execution_mode?: 'legacy' | 'pipeline';
   pipeline?: {
     pipeline_id: string;
     pipeline_version: number;
@@ -31,17 +30,19 @@ interface TicketRow {
     gate_result: string | null;
     context_policy: string | null;
     publication_state: string;
+    publication_id: string | null;
+    publication_error: string | null;
+    recovery_action: string | null;
+    effect_state: string;
+    effect_kind: string | null;
+    effect_status: string | null;
+    effect_attempts: number | null;
+    effect_error: string | null;
   } | null;
 }
 
 interface StatusResponse {
   tickets?: TicketRow[];
-  execution_summary?: {
-    legacy: number;
-    pipeline: number;
-    waiting: number;
-    publication_blocked: number;
-  };
 }
 
 export default async function status(): Promise<void> {
@@ -72,19 +73,11 @@ export default async function status(): Promise<void> {
   }
 
   const tickets = data.tickets ?? [];
-  if (data.execution_summary) {
-    const summary = data.execution_summary;
-    console.log(
-      `Execution: legacy=${summary.legacy} pipeline=${summary.pipeline} ` +
-      `waiting=${summary.waiting} publication-blocked=${summary.publication_blocked}`
-    );
-  }
   printTable(
     tickets.map((t) => ({
       issue: t.linear_issue_identifier,
       branch: t.branch,
       agent: t.agent,
-      mode: t.execution_mode ?? 'legacy',
       pipeline: t.pipeline ? `${t.pipeline.pipeline_id}@${t.pipeline.pipeline_version}` : null,
       task: t.pipeline?.task_type,
       state: t.pipeline?.status ?? t.state,
@@ -97,13 +90,21 @@ export default async function status(): Promise<void> {
       gate: t.pipeline?.gate_result,
       context: t.pipeline?.context_policy,
       publication: t.pipeline?.publication_state,
+      publication_id: t.pipeline?.publication_id,
+      effect: t.pipeline?.effect_kind
+        ? `${t.pipeline.effect_kind}:${t.pipeline.effect_status ?? t.pipeline.effect_state}`
+        : t.pipeline?.effect_state,
+      effect_attempts: t.pipeline?.effect_attempts,
+      error: t.pipeline?.effect_error ?? t.pipeline?.publication_error,
+      recovery: t.pipeline?.recovery_action,
       wait: t.pipeline?.wait_reason,
       pr: t.pr_url,
       updated: t.updated_at,
     })),
     [
-      'issue', 'branch', 'agent', 'mode', 'pipeline', 'task', 'state', 'stage', 'attempt',
-      'retry', 'reentry', 'subject', 'provider', 'gate', 'context', 'publication', 'wait', 'pr', 'updated',
+      'issue', 'branch', 'agent', 'pipeline', 'task', 'state', 'stage', 'attempt',
+      'retry', 'reentry', 'subject', 'provider', 'gate', 'context', 'publication', 'publication_id',
+      'effect', 'effect_attempts', 'error', 'recovery', 'wait', 'pr', 'updated',
     ]
   );
 }

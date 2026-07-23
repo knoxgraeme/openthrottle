@@ -27,9 +27,9 @@ execution: code
 | Product authority | The decisions confirmed in the planning dialogue, then this plan's Product Contract, then `docs/SPEC.md` after U1 reconciles it. Existing implementation details do not override those contracts. |
 | Execution profile | Deep, migration-oriented software change delivered in dependency order. Characterize the current path before changing durable state or cutover behavior. |
 | Safety boundary | Agent reasoning remains inside explicit sandbox stages. The supervisor validates data and advances state; it never performs semantic reasoning. Runtime safety invariants remain non-configurable. |
-| Migration rule | Existing active tickets remain on the legacy execution path. Only newly delegated or explicitly re-delegated tickets may receive a new pinned pipeline instance. |
-| Stop conditions | Do not enable the new default until engine capability tests, crash/recovery matrices, publication acknowledgement tests, full contract CI, and a live delegation-to-feedback acceptance run pass. |
-| Tail ownership | The final unit removes legacy declarations only after zero legacy instances remain, reruns the original audit line by line, and leaves unresolved credential findings visibly open. |
+| Migration rule | POC cutover: every new generation receives a pinned pipeline instance. Historical schema rows are reconciliation input only; there is no live legacy execution cohort. |
+| Stop conditions | Require engine capability tests, crash/recovery matrices, publication acknowledgement tests, the full local/CI contract, and resolved PR review. The credentialed delegation-to-feedback exercise is explicitly deferred for this POC. |
+| Tail ownership | The final unit removes all live legacy execution declarations and reruns the original audit line by line. Destructive historical-column contraction remains a separate schema-only change. |
 
 ---
 

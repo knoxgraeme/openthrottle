@@ -456,6 +456,28 @@ describe("pipeline publication", () => {
       .toMatchObject({ status: "failed", target_url: null });
   });
 
+  it("acknowledges terminal GitHub summaries when no pull request was created", async () => {
+    const { tickets, pipelines, instance, attempt } = setup();
+    const input = event(instance, attempt, "Investigation completed without a repository change.");
+    input.event.outcome = "no_change";
+    coordinatePipelineEvent(pipelines, input.event, undefined, input.receipt);
+    const fetchImpl = vi.fn();
+    const processor = createGithubPublicationProcessor({
+      store: pipelines,
+      tickets,
+      client: { token: "github", fetch: fetchImpl as unknown as typeof fetch },
+    });
+
+    await processor.drain();
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(pipelines.listPublications(instance.id)
+      .filter((row) => row.kind === "github_summary"))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ status: "acknowledged", external_id: "skipped:no-pull-request" }),
+      ]));
+  });
+
   it("keeps a late receipt bound to its original Linear session generation", async () => {
     const { tickets, pipelines, instance } = setup();
     tickets.upsert({

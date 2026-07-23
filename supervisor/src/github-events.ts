@@ -1,20 +1,14 @@
-// GitHub feedback enters the generation-pinned execution mode: pipeline
-// generations commit typed provider evidence, while legacy generations create
-// deduplicated `automatic` work that resumes the original native session.
+// GitHub feedback is committed as typed provider evidence for the generation-
+// pinned pipeline. There is no automatic task-resume fallback.
 
-import type { Daytona } from "@daytona/sdk";
 import type { Config } from "./config.js";
 import type { TicketStore } from "./db.js";
-import { type LinearClient } from "./linear.js";
 import {
   getAuthenticatedLogin,
   isOpenthrottleBranch,
   type GithubWebhookEvent,
 } from "./github.js";
 import { enqueueActivity, type LinearOutboxProcessor } from "./linear-outbox.js";
-import { launchExistingTask } from "./run-lifecycle.js";
-import { enqueueFeedbackWork, feedbackMessage } from "./scheduler.js";
-import { closeTicketForPullRequest } from "./ticket-control.js";
 import { sanitizeText } from "./sanitize.js";
 import type { FeedbackSnapshot, FeedbackSnapshotEvent } from "./feedback-store.js";
 import type { PipelineInstance, PipelineStore } from "./pipeline-store.js";
@@ -171,7 +165,7 @@ export function drainPipelineFeedbackSnapshots(
 }
 
 export function routePipelineProviderEvent(params: {
-  pipelines?: PipelineStore;
+  pipelines: PipelineStore;
   store: TicketStore;
   ticket: NonNullable<ReturnType<TicketStore["getByIssueId"]>>;
   eventId: string;
@@ -182,7 +176,7 @@ export function routePipelineProviderEvent(params: {
   headSha: string | undefined;
   pullRequestUrl?: string;
 }): boolean {
-  const instance = params.pipelines?.getInstanceForSession(params.ticket.linear_session_id);
+  const instance = params.pipelines.getInstanceForSession(params.ticket.linear_session_id);
   if (!instance) return false;
   if (params.pullRequestUrl && params.ticket.pr_url && params.pullRequestUrl !== params.ticket.pr_url) {
     return true;
@@ -190,10 +184,10 @@ export function routePipelineProviderEvent(params: {
   if (pipelineIsTerminal(instance)) return true;
   const authoritativeHead = params.store.getSetting(`github-head:${params.ticket.linear_issue_id}`);
   if (params.headSha === undefined || params.headSha !== authoritativeHead) return true;
-  const canReceive = providerStageCanReceive(params.pipelines!, instance);
+  const canReceive = providerStageCanReceive(params.pipelines, instance);
   const revisionMatches = instance.published_commit !== null && params.headSha === instance.published_commit;
   if (canReceive && !revisionMatches) {
-    processProviderEvidence(params.pipelines!, {
+    processProviderEvidence(params.pipelines, {
       id: params.eventId,
       instanceId: instance.id,
       outcome: "needs_human",
@@ -225,12 +219,12 @@ export function routePipelineProviderEvent(params: {
       pullRequestUrl: params.pullRequestUrl,
     });
     if (canReceive) {
-      processPipelineFeedbackSnapshot({ pipelines: params.pipelines!, store: params.store, instance, snapshot });
+      processPipelineFeedbackSnapshot({ pipelines: params.pipelines, store: params.store, instance, snapshot });
     }
     return true;
   }
   if (canReceive) {
-    processProviderEvidence(params.pipelines!, {
+    processProviderEvidence(params.pipelines, {
       id: params.eventId,
       instanceId: instance.id,
       outcome: params.outcome,
@@ -277,49 +271,6 @@ export function considerCiGithubHead(
   store.setSetting(sourceKey, JSON.stringify({ source, sequence }));
 }
 
-async function enqueueProviderFeedback(params: {
-  cfg: Config;
-  store: TicketStore;
-  daytona: Daytona;
-  linear: LinearClient;
-  linearOutbox: LinearOutboxProcessor;
-  ticket: NonNullable<ReturnType<TicketStore["getByIssueId"]>>;
-  providerEventId: string;
-  pullNumber: number;
-  headSha: string;
-  kind: string;
-  payload: unknown;
-  workId: string;
-  body: string;
-}): Promise<void> {
-  const session = params.store.getCurrentSession(params.ticket.linear_issue_id);
-  const recorded = params.store.recordProviderFeedback({
-    provider: "github",
-    providerEventId: params.providerEventId,
-    issueId: params.ticket.linear_issue_id,
-    sessionId: params.ticket.linear_session_id,
-    generation: session?.generation ?? 1,
-    repository: params.ticket.repo,
-    pullNumber: params.pullNumber,
-    headSha: params.headSha,
-    kind: params.kind,
-    payload: sanitizeText(JSON.stringify(params.payload)).slice(0, 16_000),
-    workItemId: params.workId,
-    workBody: params.body,
-  });
-  await enqueueFeedbackWork({
-    cfg: params.cfg,
-    store: params.store,
-    daytona: params.daytona,
-    linear: params.linear,
-    linearOutbox: params.linearOutbox,
-    ticket: params.ticket,
-    workId: recorded.snapshot.work_item_id!,
-    body: params.body,
-    launch: launchExistingTask,
-  });
-}
-
 async function selfGithubLogin(cfg: Config): Promise<string | undefined> {
   const cached = githubLoginCache.get(cfg.githubToken);
   if (cached) return cached;
@@ -336,20 +287,17 @@ async function selfGithubLogin(cfg: Config): Promise<string | undefined> {
 export async function handleGithubEvent(
   cfg: Config,
   store: TicketStore,
-  daytona: Daytona,
-  getLinearClient: () => Promise<LinearClient | undefined>,
   linearOutbox: LinearOutboxProcessor,
   event: GithubWebhookEvent,
-  pipelines?: PipelineStore
+  pipelines: PipelineStore
 ): Promise<void> {
-  const linear = await getLinearClient();
-
   if (event.kind === "pull_request") {
     const branch = event.pull_request.head.ref;
     if (!isOpenthrottleBranch(branch)) return;
     const ticket = store.getByBranch(event.repository.full_name, branch);
     if (!ticket) return;
-    const pipelineInstance = pipelines?.getInstanceForSession(ticket.linear_session_id);
+    const pipelineInstance = pipelines.getInstanceForSession(ticket.linear_session_id);
+    if (!pipelineInstance) return;
     if (pipelineInstance && ticket.pr_url && ticket.pr_url !== event.pull_request.html_url) return;
     if (event.action === "opened" || event.action === "reopened" || event.action === "synchronize") {
       store.setPrUrl(ticket.linear_issue_id, event.pull_request.html_url);
@@ -389,11 +337,11 @@ export async function handleGithubEvent(
         pullRequestUrl: event.pull_request.html_url,
       });
       const currentPipeline = routedPipeline
-        ? pipelines!.getInstanceForSession(ticket.linear_session_id)
+        ? pipelines.getInstanceForSession(ticket.linear_session_id)
         : undefined;
       if (currentPipeline && !pipelineIsTerminal(currentPipeline)) {
         requestPipelineStop({
-          store: pipelines!,
+          store: pipelines,
           sessionId: ticket.linear_session_id,
           eventId: `github-pull-closed-stop:${event.pull_request.number}:${event.pull_request.head.sha ?? "unknown"}`,
           reason: event.pull_request.merged
@@ -402,22 +350,11 @@ export async function handleGithubEvent(
           ticketState: "closed",
         });
       }
-      await closeTicketForPullRequest({
-        store,
-        daytona,
-        linear,
-        linearOutbox,
-        ticket,
-        prUrl: event.pull_request.html_url,
-        merged: event.pull_request.merged,
-      });
-      if (routedPipeline) {
-        const instance = pipelines!.getInstanceForSession(ticket.linear_session_id);
-        const resource = instance && pipelines!.getRuntimeResource(instance.id);
-        if (resource && store.getByIssueId(ticket.linear_issue_id)?.sandbox_id === null) {
-          pipelines!.setRuntimeResourceStatus(instance!.id, "cleaned");
-        }
-      }
+      // GitHub close is authoritative even when a stage already settled and
+      // has no live attempt left for a stop event to cancel.
+      store.setState(ticket.linear_issue_id, "closed");
+      store.markSessionState(ticket.linear_session_id, "stopped");
+      store.cancelPendingInbox(ticket.linear_issue_id);
     }
     return;
   }
@@ -457,7 +394,7 @@ export async function handleGithubEvent(
     } else if (!store.getSetting(`github-head:${ticket.linear_issue_id}`)) {
       store.setSetting(`github-head:${ticket.linear_issue_id}`, headSha);
     }
-    if (routePipelineProviderEvent({
+    routePipelineProviderEvent({
       pipelines,
       store,
       ticket,
@@ -468,34 +405,6 @@ export async function handleGithubEvent(
       payload: { kind: "pull_request_review", state: event.review.state, head_sha: headSha },
       headSha,
       pullRequestUrl: event.pull_request.html_url,
-    })) return;
-    if (!linear) return;
-    await enqueueProviderFeedback({
-      cfg,
-      store,
-      daytona,
-      linear,
-      linearOutbox,
-      ticket,
-      // A review with only a summary body creates no inline review threads,
-      // so the resolved-thread skip would measure unrelated (older) threads
-      // and could cancel it. `gh-rvbody-` marks it exempt from that skip;
-      // only reviews whose feedback lives in inline threads are `gh-review-`.
-      providerEventId: `review:${event.review.id}`,
-      pullNumber: event.pull_request.number,
-      headSha,
-      kind: "pull_request_review",
-      payload: { state: event.review.state, url: event.review.html_url, body: event.review.body },
-      workId: event.review.body?.trim()
-        ? `gh-rvbody-${event.review.id}`
-        : `gh-review-${event.review.id}`,
-      body: feedbackMessage({
-        kind: "review",
-        author,
-        pullNumber: event.pull_request.number,
-        url: event.review.html_url,
-        body: event.review.body,
-      }),
     });
     return;
   }
@@ -519,7 +428,7 @@ export async function handleGithubEvent(
     }, ticket.linear_issue_id);
     const headSha = store.getSetting(`github-head:${ticket.linear_issue_id}`) ??
       `unknown:${ticket.branch}`;
-    if (routePipelineProviderEvent({
+    routePipelineProviderEvent({
       pipelines,
       store,
       ticket,
@@ -529,28 +438,6 @@ export async function handleGithubEvent(
       evidence: [event.comment.html_url],
       payload: { kind: "issue_comment", head_sha: headSha },
       headSha,
-    })) return;
-    if (!linear) return;
-    await enqueueProviderFeedback({
-      cfg,
-      store,
-      daytona,
-      linear,
-      linearOutbox,
-      ticket,
-      providerEventId: `comment:${event.comment.id}`,
-      pullNumber: event.issue.number,
-      headSha,
-      kind: "issue_comment",
-      payload: { url: event.comment.html_url, body: event.comment.body },
-      workId: `gh-comment-${event.comment.id}`,
-      body: feedbackMessage({
-        kind: "comment",
-        author,
-        pullNumber: event.issue.number,
-        url: event.comment.html_url,
-        body: event.comment.body,
-      }),
     });
     return;
   }
@@ -587,55 +474,21 @@ export async function handleGithubEvent(
   // settled: another required check may still be pending. GitHub's merged PR
   // event is the authoritative success boundary. Red checks can immediately
   // re-enter the bounded repair path, while every pipeline CI completion stays
-  // out of the legacy feedback scheduler.
-  const pipelineInstance = pipelines?.getInstanceForSession(ticket.linear_session_id);
-  if (pipelineInstance) {
-    if (conclusion === "failure" || conclusion === "timed_out") {
-      routePipelineProviderEvent({
-        pipelines,
-        store,
-        ticket,
-        eventId: event.kind === "workflow_run"
-          ? `github-workflow:${event.workflow_run.id}`
-          : `github-check-suite:${event.check_suite.id}`,
-        outcome: "semantic_repair_required",
-        summary: `${event.kind === "workflow_run" ? event.workflow_run.name : "GitHub check suite"} concluded ${conclusion}.`,
-        evidence: [url],
-        payload: { kind: event.kind, conclusion, head_sha: headSha, url },
-        headSha,
-      });
-    }
-    return;
+  // out of the deterministic coordinator.
+  if (!pipelines.getInstanceForSession(ticket.linear_session_id)) return;
+  if (conclusion === "failure" || conclusion === "timed_out") {
+    routePipelineProviderEvent({
+      pipelines,
+      store,
+      ticket,
+      eventId: event.kind === "workflow_run"
+        ? `github-workflow:${event.workflow_run.id}`
+        : `github-check-suite:${event.check_suite.id}`,
+      outcome: "semantic_repair_required",
+      summary: `${event.kind === "workflow_run" ? event.workflow_run.name : "GitHub check suite"} concluded ${conclusion}.`,
+      evidence: [url],
+      payload: { kind: event.kind, conclusion, head_sha: headSha, url },
+      headSha,
+    });
   }
-
-  if (!linear) return;
-
-  if (
-    (conclusion !== "failure" && conclusion !== "timed_out") ||
-    ticket.state !== "active" ||
-    !ticket.pr_url
-  ) {
-    return;
-  }
-  const name = event.kind === "workflow_run" ? event.workflow_run.name : "CI check suite";
-  // Keyed by head_sha so failures from one push coalesce into one collecting
-  // snapshot. Each provider event still retains its stable identity and payload.
-  const workId = `gh-ci-${headSha}`;
-  await enqueueProviderFeedback({
-    cfg,
-    store,
-    daytona,
-    linear,
-    linearOutbox,
-    ticket,
-    providerEventId: event.kind === "workflow_run"
-      ? `workflow-run:${event.workflow_run.id}`
-      : `check-suite:${event.check_suite.id}`,
-    pullNumber: Number(ticket.pr_url.match(/\/pull\/(\d+)$/)?.[1] ?? 0),
-    headSha,
-    kind: event.kind,
-    payload: { name, conclusion, url },
-    workId,
-    body: feedbackMessage({ kind: "ci", name, conclusion, url }),
-  });
 }

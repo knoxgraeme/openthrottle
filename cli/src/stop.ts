@@ -13,7 +13,10 @@ export default async function stop(ticket: string | undefined): Promise<void> {
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${await response.text()}`);
     }
-    console.log(`Stopped ${ticket}.`);
+    const body = await response.json() as { status?: string };
+    console.log(body.status === 'stop_requested' || response.status === 202
+      ? `Stop requested for ${ticket}.`
+      : `Stopped ${ticket}.`);
   } catch (error) {
     console.error(`Could not stop ${ticket}: ${getErrorMessage(error)}`);
     process.exit(1);

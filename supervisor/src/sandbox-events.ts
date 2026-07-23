@@ -3,8 +3,6 @@ import type { AgentActivityInput, AgentPlanItem, AgentPlanStatus } from "./linea
 import type { Ticket, TicketStore } from "./db.js";
 import { ensureSandboxActive, setSandboxActive, setSandboxIdle } from "./daytona.js";
 import { reconcileSandboxAutostop } from "./sandbox-lifecycle.js";
-import { isGithubPullRequestUrl } from "./github.js";
-import { MAX_PRIVATE_LOG_TAIL_BYTES, MAX_PRIVATE_LOG_TAIL_CHARS } from "./logs.js";
 import { sanitizeText } from "./sanitize.js";
 import { STAGE_OUTCOMES } from "./pipeline-manifest.js";
 import type { PipelineCoordinatorEvent, PipelineEventArtifact } from "./pipeline-coordinator.js";
@@ -13,7 +11,6 @@ const OUTBOX_DIR = "/home/agent/.ot/outbox";
 const SEALED_HEARTBEAT_FILE = "/var/lib/openthrottle/heartbeat/heartbeat.json";
 const SEALED_STAGE_RESULT_DIR = "/var/lib/openthrottle/stage-results";
 const WORKSPACE_SUBJECT_COMMAND = "node /opt/openthrottle/runner/execute-stage.mjs --print-subject --repo /home/agent/repo";
-const TASK_LOG_TAIL_COMMAND = `tail -c ${MAX_PRIVATE_LOG_TAIL_BYTES} /home/agent/.ot/task.log`;
 const MAX_EVENT_BYTES = 32 * 1024;
 const MAX_STAGE_EVENT_BYTES = 64 * 1024;
 const MAX_BODY_LENGTH = 8_000;
@@ -35,7 +32,7 @@ const PLAN_STATUSES: ReadonlyArray<AgentPlanStatus> = [
 const MAX_PLAN_ITEMS = 50;
 const MAX_PLAN_CONTENT = 500;
 
-export type SandboxEvent = SandboxActivityEvent | SandboxPlanEvent | SandboxCompletionEvent | SandboxHeartbeatEvent | SandboxStageResultEvent;
+export type SandboxEvent = SandboxActivityEvent | SandboxPlanEvent | SandboxHeartbeatEvent | SandboxStageResultEvent;
 
 export interface SandboxStageResultEvent {
   version: 1;
@@ -89,20 +86,6 @@ interface SandboxPlanEvent {
   run_id: string;
   created_at: string;
   plan: AgentPlanItem[];
-}
-
-interface SandboxCompletionEvent {
-  version: 1;
-  kind: "completion";
-  event_id: string;
-  run_id: string;
-  created_at: string;
-  token: string;
-  exit_code: number;
-  cost_usd?: number;
-  pr_url?: string;
-  failure_tail?: string;
-  final_response?: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -258,52 +241,6 @@ export function parseSandboxEvent(raw: string): SandboxEvent {
       plan: parsePlanItems(value.plan),
     };
   }
-  if (value.kind === "completion") {
-    if (typeof value.token !== "string" || value.token.length < 16 || value.token.length > 256) {
-      throw new Error("sandbox completion has an invalid token");
-    }
-    if (typeof value.exit_code !== "number" || !Number.isInteger(value.exit_code)) {
-      throw new Error("sandbox completion has an invalid exit_code");
-    }
-    if (
-      value.cost_usd !== undefined &&
-      (typeof value.cost_usd !== "number" || !Number.isFinite(value.cost_usd) || value.cost_usd < 0)
-    ) {
-      throw new Error("sandbox completion has an invalid cost_usd");
-    }
-    if (value.pr_url !== undefined && !isGithubPullRequestUrl(value.pr_url)) {
-      throw new Error("sandbox completion has an invalid pr_url");
-    }
-    if (
-      value.failure_tail !== undefined &&
-      (typeof value.failure_tail !== "string" || value.failure_tail.length > 4_000)
-    ) {
-      throw new Error("sandbox completion has an invalid failure_tail");
-    }
-    if (
-      value.final_response !== undefined &&
-      (typeof value.final_response !== "string" || value.final_response.length > MAX_BODY_LENGTH)
-    ) {
-      throw new Error("sandbox completion has an invalid final_response");
-    }
-    return {
-      version: 1,
-      kind: "completion",
-      event_id: value.event_id,
-      run_id: value.run_id,
-      created_at: value.created_at,
-      token: value.token,
-      exit_code: value.exit_code,
-      ...(typeof value.cost_usd === "number" ? { cost_usd: value.cost_usd } : {}),
-      ...(isGithubPullRequestUrl(value.pr_url) ? { pr_url: value.pr_url } : {}),
-      ...(typeof value.failure_tail === "string"
-        ? { failure_tail: value.failure_tail }
-        : {}),
-      ...(typeof value.final_response === "string"
-        ? { final_response: sanitizeText(value.final_response).slice(0, MAX_BODY_LENGTH) }
-        : {}),
-    };
-  }
   throw new Error("sandbox event has an invalid kind");
 }
 
@@ -312,8 +249,8 @@ function toLinearActivity(event: SandboxActivityEvent, sessionId: string): Agent
   // Linear only honors `ephemeral` on thought/action activities; it is ignored
   // (and omitted) for the others.
   if (event.type === "action") {
-    // Prefer the structured verb/parameter/result; fall back to the flat
-    // "Progress: <body>" shape for legacy single-string actions.
+    // Prefer the structured verb/parameter/result; fall back to a flat
+    // progress action for runtimes that emit only a body.
     if (event.action && event.parameter) {
       return {
         sessionId,
@@ -405,18 +342,6 @@ async function readWorkspaceSubject(sandbox: Sandbox): Promise<string> {
   return subject;
 }
 
-async function readTaskLogTail(sandbox: Sandbox, callbackToken: string): Promise<string | undefined> {
-  if (!sandbox.process?.executeCommand) return undefined;
-  try {
-    const result = await sandbox.process.executeCommand(TASK_LOG_TAIL_COMMAND, undefined, undefined, 10);
-    if (result.exitCode !== 0 || !result.result) return undefined;
-    return sanitizeText(result.result, process.env, [callbackToken]).slice(-MAX_PRIVATE_LOG_TAIL_CHARS);
-  } catch (error) {
-    console.warn("[sandbox-events] could not preserve the private task log tail:", error);
-    return undefined;
-  }
-}
-
 interface SandboxEventPollerParams {
   daytona: Daytona;
   store: TicketStore;
@@ -433,18 +358,8 @@ interface SandboxEventPollerParams {
     plan: AgentPlanItem[];
     eventId: string;
   }) => Promise<unknown>;
-  finishCompletion: (completion: {
-    runId: string;
-    token: string;
-    exitCode: number;
-    costUsd?: number;
-    prUrl?: string;
-    failureTail?: string;
-    finalResponse?: string;
-    logTail?: string;
-  }) => Promise<{ status: number }>;
   // Best-effort read-back of a rotating agent credential (Codex refresh token)
-  // from the sandbox after a run completes. Must not throw.
+  // from the sandbox after a stage completes. Must not throw.
   captureAgentAuth?: (sandbox: Sandbox, ticket: Ticket) => Promise<void>;
   postStageResult?: (event: SandboxStageResultEvent, observedSubject: string) => Promise<unknown>;
 }
@@ -541,13 +456,7 @@ async function pollTicketEvents(
             }
           : event.kind === "plan"
             ? { ...event, plan: sanitizePlan(event.plan) }
-            : event.kind === "completion" ? {
-                ...event,
-                token: "[redacted]",
-                ...(event.failure_tail
-                  ? { failure_tail: sanitizeText(event.failure_tail) }
-                  : {}),
-              } : event
+            : event
       ),
     });
     if (
@@ -619,27 +528,6 @@ async function pollTicketEvents(
         if (!params.postStageResult) throw new Error("sealed stage result handler is not configured");
         await params.captureAgentAuth?.(sandbox, ticket);
         await params.postStageResult(event, await readWorkspaceSubject(sandbox));
-      } else {
-        const logTail = await readTaskLogTail(sandbox, event.token);
-        // Capture the token the run rotated in the sandbox BEFORE finishing:
-        // completeRun schedules follow-up work (a queued resume) before it
-        // returns, and that resume reseeds Codex auth from the settings store.
-        // Persisting the rotation first keeps the resume from replaying the
-        // spent token. Best-effort — the hook must not throw.
-        await params.captureAgentAuth?.(sandbox, ticket);
-        const result = await params.finishCompletion({
-          runId: event.run_id,
-          token: event.token,
-          exitCode: event.exit_code,
-          costUsd: event.cost_usd,
-          prUrl: event.pr_url,
-          failureTail: event.failure_tail,
-          finalResponse: event.final_response,
-          logTail,
-        });
-        if (result.status !== 200 && result.status !== 409) {
-          throw new Error(`completion rejected with status ${result.status}`);
-        }
       }
       params.store.markSandboxEventProcessed(event.event_id);
     } catch (error) {

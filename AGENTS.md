@@ -6,12 +6,12 @@ it via `@AGENTS.md`.
 
 ## What this is
 
-OpenThrottle is a plan-first coding pipeline. An approved Linear ticket is
-delegated to an isolated Daytona sandbox running an agent CLI (Claude Code,
-Codex, or OpenCode); the agent opens a GitHub PR on an `ot/*` branch; external
-GitHub-native reviewers own review from there, and their feedback re-enters the
-**same agent session** as a `resume`. The GitHub repo is `openthrottle-v2`; the
-product, CLI, npm package, and Daytona snapshot are all named `openthrottle`.
+OpenThrottle is a plan-first coding pipeline. An approved Linear ticket selects
+an immutable configurable pipeline. The Fly supervisor coordinates one fenced
+stage at a time in a Daytona sandbox running Claude Code, Codex, or OpenCode;
+GitHub supplies publication and provider evidence. The GitHub repo is
+`openthrottle-v2`; the product, CLI, npm package, and Daytona snapshot are all
+named `openthrottle`.
 
 ```
 Linear ticket ──> Fly supervisor ──> Daytona sandbox ──> ot/* branch + PR
@@ -85,21 +85,20 @@ Engineering / "CE")**. Keep new logic on the correct side:
   state, controls Daytona sandboxes, and publishes to Linear. It never contains
   agent reasoning. Key seams:
   - `db.ts` — the SQLite schema and store. Everything durable lives here:
-    `tickets`, `runs`, `agent_sessions`, `session_work`, `webhook_deliveries`
-    (leased/retrying inbox), `linear_outbox` (per-session-ordered delivery
-    outbox), `sandbox_events`, `repository_registrations`, `settings`.
+    `tickets`, `runs`, `agent_sessions`, webhook and Linear inbox/outbox state,
+    repository registrations, immutable pipeline instances/stages/attempts,
+    artifacts, gate/publication receipts, effect intents, and runtime resources.
   - `server.ts` — all HTTP routes (`/webhooks/linear`, `/webhooks/github`,
-    `/runs/:id/complete`, operator `/status` `/repositories` `/tickets/*`,
-    `/oauth/*`, `/preview/*`, `/healthz`).
+    operator `/status` `/repositories` `/tickets/*`, `/oauth/*`, `/healthz`).
   - `webhook-delivery.ts` — the durable inbox: signature-verified events are
     stored, leased, and retried so a delivery survives restarts.
-  - `sandbox-events.ts` — short-interval poller that reads agent activities and
-    completion markers out of live Daytona sandboxes and feeds the outbox.
+  - `sandbox-events.ts` — short-interval poller that reads typed stage results,
+    agent activities, plans, and heartbeats from live Daytona sandboxes.
   - `linear-outbox.ts` / `linear.ts` / `linear-auth.ts` — Linear activities and
     session updates are persisted **before** delivery, with per-session ordering
     and OAuth refresh shared across webhook and sweep paths.
-  - `run-lifecycle.ts` / `sandbox-lifecycle.ts` / `scheduler.ts` — one sandbox
-    per ticket, run serialization, follow-up scheduling, review-rounds bounding.
+  - `pipeline-coordinator.ts` / `pipeline-store.ts` / `pipeline-effects.ts` —
+    deterministic reduction, durable fences, and retryable external effects.
   - `sweep.ts` — reaps stale sandboxes/resources on boot and periodically.
   - `sanitize.ts` — redacts named/nested secret values and known GitHub / OpenAI
     / Linear / bearer token shapes before anything is logged or published.
@@ -107,13 +106,12 @@ Engineering / "CE")**. Keep new logic on the correct side:
 
 - **`sandbox/`** — the Daytona image and its runtime boundary.
   `entrypoint.sh` is Fly-launched (the image's own entrypoint is an inert no-op
-  so provisioning can't race the supervisor) and runs an **8-phase lifecycle**:
-  auth → checkout/push → sealed safety config → project config → post_bootstrap
-  → dev server → agent task → completion marker. Supported task types are
-  `implement`, `investigate`, and `resume`. `~/.ot` holds ticket context, logs,
-  the agent session id, the normalized result, and the activity outbox that
-  `bin/ot-activity.mjs` writes into. `runner/normalize.mjs` normalizes each
-  engine's JSONL and emits throttled heartbeat `thought`s. `safety/pre-push`
+  so provisioning can't race the supervisor) and executes exactly one sealed
+  stage request. `runner/execute-stage.mjs` validates the manifest/config/runtime
+  fences, applies the context policy, invokes an agent or command executor, and
+  writes one typed result. Native session continuation is stage context, not a
+  separate task. `~/.ot` holds private context, logs, native session metadata,
+  activities, and steering inbox files. `safety/pre-push`
   (with `core.hooksPath` root-sealed) blocks pushes to main/master and
   non-fast-forward — this complements, does not replace, GitHub branch
   protection.
@@ -121,11 +119,10 @@ Engineering / "CE")**. Keep new logic on the correct side:
 - **`skills/`** — thin OpenThrottle task **adapters** over the native CE
   toolkit, not reimplementations. `skills/tasks/<name>/SKILL.md` is the single
   hand-maintained source per task (`implement-plan`, `investigate`); its YAML
-  frontmatter is exactly what Claude Code loads as a user skill. The two agent
-  loops: **implement** = plan gate → `ce-work` → local `ce-code-review` →
-  conditional `ce-simplify-code` → configured gates → `ce-commit-push-pr` →
-  resolve/retarget PR; **investigate** = action-capable `ce-debug
-  mode:pipeline`. Read `skills/README.md` before editing anything here.
+  frontmatter is exactly what Claude Code loads as a user skill. Pipeline
+  manifests own ordering across CE planning, implementation, review,
+  simplification, command gates, publication, and provider verification. Read
+  `skills/README.md` before editing anything here.
 
 - **`cli/`** — the published `openthrottle` package (`src/index.ts` is a plain
   argv router, no framework). Commands: `setup`, `init`, `ship <file.md>`,
@@ -154,18 +151,15 @@ Engineering / "CE")**. Keep new logic on the correct side:
   untrusted data** regardless of where they're read.
 
 - **Routing is fail-closed.** One Linear team routes to one GitHub repo via
-  `repository_registrations`. `GITHUB_REPO`/`BASE_BRANCH`/`GITHUB_REPO_MAPPINGS`
-  are legacy fallbacks only until the first durable registration exists; after
-  that an unmatched team is rejected, not sent to a fallback. A `branch` Linear
+  `repository_registrations`; an unmatched team is rejected. A `branch` Linear
   label (group child, or flat `branch › <name>`) overrides the base branch for a
   single ticket and is read at delegation time (`created`), so it must be applied
   before assigning.
 
 - **Session binding prevents cross-talk.** Sandbox events are bound to the
-  supervisor run record before entering the Linear outbox, so a late event from
-  an older delegated session can't be redirected into a newer Linear
-  conversation. Resume continues the saved native session/thread with a
-  follow-up message; it does not start a fresh adapter.
+  pipeline instance, generation, attempt, sealed request hash, run, and expected
+  Git subject. Native continuation identifiers are accepted only under the
+  pinned stage context policy.
 
 - **`.openthrottle.yml`** (repo root, committed) is the per-repo gate config the
   sandbox reads in phase 4: `agent`, `test`/`lint`/`build` commands,

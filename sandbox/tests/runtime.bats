@@ -1,7 +1,6 @@
 #!/usr/bin/env bats
 
 setup() {
-  export OT_TASK_ADAPTERS_FILE="${BATS_TEST_DIRNAME}/../../skills/task-adapters-v1.json"
   source "${BATS_TEST_DIRNAME}/../lib/runtime.sh"
 }
 
@@ -20,22 +19,11 @@ setup() {
   [ "$output" = "[REDACTED] [REDACTED] [REDACTED] [REDACTED] visible" ]
 }
 
-@test "task types map to the correct skill" {
-  run task_adapter_value implement skill
-  [ "$output" = "implement-plan" ]
-  run task_adapter_value investigate skill
-  [ "$output" = "investigate" ]
-  run task_adapter_value resume skill
-  [ "$status" -ne 0 ]
-  run is_supported_task_type unknown
-  [ "$status" -ne 0 ]
-}
-
-@test "task types collapse to implement, resume, investigate" {
+@test "stage task types are implement or investigate" {
   run is_supported_task_type implement
   [ "$status" -eq 0 ]
   run is_supported_task_type resume
-  [ "$status" -eq 0 ]
+  [ "$status" -ne 0 ]
   run is_supported_task_type investigate
   [ "$status" -eq 0 ]
   run is_supported_task_type review
@@ -44,47 +32,14 @@ setup() {
   [ "$status" -ne 0 ]
 }
 
-@test "task types declare their native Compound Engineering pipeline" {
-  run task_adapter_value implement legacyPipeline
-  [ "$status" -eq 0 ]
-  [ "$output" = "ce-work,ce-code-review,ce-commit-push-pr" ]
-
-  run task_adapter_value investigate legacyPipeline
-  [ "$output" = "ce-debug,ce-commit-push-pr" ]
-
-  run task_adapter_value resume legacyPipeline
-  [ "$output" = "resume" ]
-
-  run task_adapter_value review legacyPipeline
-  [ "$status" -ne 0 ]
-
-  run task_adapter_value review-fix legacyPipeline
-  [ "$status" -ne 0 ]
-}
-
-@test "no pipeline mentions ce-babysit-pr" {
-  for task in implement investigate resume; do
-    run task_adapter_value "$task" legacyPipeline
-    [[ "$output" != *ce-babysit-pr* ]]
-  done
-}
-
-@test "resolve_git_identity prefers override, then GitHub noreply, then placeholder" {
-  # Explicit override email wins and keeps an explicit name.
-  run resolve_git_identity "Ada" "ada@example.com" "octocat" "583231"
-  [ "$output" = $'Ada\tada@example.com' ]
-
-  # No override: derive the account's GitHub noreply identity.
-  run resolve_git_identity "" "" "knoxgraeme" "42"
+@test "resolve_git_identity uses GitHub noreply, then a placeholder" {
+  run resolve_git_identity "knoxgraeme" "42"
   [ "$output" = $'knoxgraeme\t42+knoxgraeme@users.noreply.github.com' ]
 
-  # Override email with no name derives the name from the address local part
-  # (git refuses to commit with an empty author name).
-  run resolve_git_identity "" "custom@example.com" "" ""
-  [ "$output" = $'custom\tcustom@example.com' ]
+  run resolve_git_identity "" ""
+  [ "$output" = $'OpenThrottle Agent\tagent@openthrottle.dev' ]
 
-  # Account lookup failed and no override: placeholder of last resort.
-  run resolve_git_identity "" "" "" ""
+  run resolve_git_identity '{"message":"Bad credentials"}' '{"status":401}'
   [ "$output" = $'OpenThrottle Agent\tagent@openthrottle.dev' ]
 }
 

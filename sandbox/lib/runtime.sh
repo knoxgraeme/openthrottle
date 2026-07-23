@@ -12,25 +12,21 @@ strip_nl() {
   printf '%s' "$value"
 }
 
-# resolve_git_identity OVERRIDE_NAME OVERRIDE_EMAIL GH_LOGIN GH_UID
+# resolve_git_identity GH_LOGIN GH_UID
 #
-# Chooses the git commit author identity, preferring an explicit override
-# email, then the GitHub account's noreply identity (so GitHub attributes
-# commits to a real account and author-gated integrations such as Vercel
-# accept the deployment), then a placeholder. Emits "<name>\t<email>".
+# Chooses the authenticated GitHub account's noreply identity so GitHub
+# attributes commits correctly, with a deterministic placeholder only when the
+# account lookup fails. Emits "<name>\t<email>".
 resolve_git_identity() {
-  local name="$1" email="$2" login="$3" uid="$4"
-  if [[ -z "$email" && -n "$login" && -n "$uid" ]]; then
-    name="${name:-$login}"
+  local login="$1" uid="$2" name="" email=""
+  if [[ "$login" =~ ^[A-Za-z0-9-]+$ && "$uid" =~ ^[0-9]+$ ]]; then
+    name="$login"
     email="${uid}+${login}@users.noreply.github.com"
   fi
   if [[ -z "$email" ]]; then
     name="${name:-OpenThrottle Agent}"
     email="agent@openthrottle.dev"
   fi
-  # Never emit an empty author name: git refuses to commit without one, so an
-  # override email supplied without a name derives the name from its local part.
-  name="${name:-${email%%@*}}"
   printf '%s\t%s\n' "$name" "$email"
 }
 
@@ -71,19 +67,9 @@ yq_value_or_default() {
 
 is_supported_task_type() {
   case "$1" in
-    implement|resume|investigate) return 0 ;;
+    implement|investigate) return 0 ;;
     *) return 1 ;;
   esac
-}
-
-task_adapter_value() {
-  local task="$1"
-  local field="$2"
-  local registry="${OT_TASK_ADAPTERS_FILE:-/opt/openthrottle/skills/task-adapters-v1.json}"
-  jq -er --arg task "$task" --arg field "$field" '
-    .tasks[$task][$field]
-    | if type == "array" then join(",") elif type == "string" then . else error("missing adapter field") end
-  ' "$registry"
 }
 
 # Extract a string field from a Codex auth.json blob; empty on absent/invalid.
@@ -104,7 +90,7 @@ codex_auth_timestamp_ms() {
 }
 
 # Decide how to reconcile a freshly-seeded Codex auth blob against the blob
-# already present in the sandbox on resume. The supervisor now refreshes the
+# already present from an earlier stage. The supervisor refreshes the
 # rotating subscription token centrally before seeding (see codex-auth.ts), so
 # the seed can be *newer* than the sandbox's local copy — but it can also be
 # older if Codex rotated again mid-run. Install whichever is newest and trusted;

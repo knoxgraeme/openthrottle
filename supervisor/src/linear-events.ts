@@ -1,11 +1,9 @@
-// Phase 2 item 3: Linear event handling — creating a ticket/sandbox for a new
-// agent session and continuing an existing one from a human reply. Split out
-// of server.ts.
+// Linear admission and operator-thread control for the durable pipeline
+// coordinator. Every delegated session is pinned to an immutable manifest;
+// there is no direct task launcher fallback.
 
-import { randomBytes } from "node:crypto";
-import type { Daytona } from "@daytona/sdk";
 import type { Config } from "./config.js";
-import type { TaskType, Ticket, TicketStore } from "./db.js";
+import type { Agent, TaskType, Ticket, TicketStore } from "./db.js";
 import {
   extractLabelNames,
   fetchIssueLabels,
@@ -29,33 +27,12 @@ import {
 import type { PipelineStore } from "./pipeline-store.js";
 import type { ValidatedRuntimeCapabilityDescriptor } from "./sandbox-runtime.js";
 import {
-  createForTicket,
-  deleteSandbox,
-  findSandboxForTicket,
-  startTask,
-  stopSandbox,
-} from "./daytona.js";
-import {
-  agentDisplayName,
-  baseSandboxEnv,
-  beginRun,
-  hasAgentSubscription,
-  launchExistingTask,
-  pickAgent,
-  scheduleSandboxSettlement,
-  tokenHash,
-} from "./run-lifecycle.js";
-import {
   enqueueActivity,
-  enqueueSessionUpdate,
   tryPostError,
   type LinearOutboxProcessor,
 } from "./linear-outbox.js";
-import { getCodexAuthForSeed } from "./codex-auth.js";
 import { sanitizeText } from "./sanitize.js";
 import { parseCommand } from "./commands.js";
-import { stopTicket } from "./ticket-control.js";
-import { selectExecutionMode } from "./scheduler.js";
 import { canSteerPipelineRun, requestPipelineStop } from "./pipeline-control.js";
 
 function linearContext(
@@ -69,10 +46,23 @@ function branchFor(issueIdentifier: string): string {
   return `ot/${issueIdentifier.toLowerCase()}`;
 }
 
-function repoLabelKeys(label: string): string[] {
-  const trimmed = label.trim();
-  const withoutPrefix = trimmed.replace(/^Repo\s*(?:›|>|:|\/)\s*/i, "").trim();
-  return [...new Set([trimmed, withoutPrefix].filter(Boolean))];
+function pickAgent(labels: string[], defaultAgent: Agent): Agent {
+  if (labels.includes("agent:opencode")) return "opencode";
+  if (labels.includes("agent:codex")) return "codex";
+  if (labels.includes("agent:claude")) return "claude";
+  return defaultAgent;
+}
+
+function hasAgentSubscription(cfg: Config, agent: Agent): boolean {
+  if (agent === "codex") return Boolean(cfg.codexAuthJson);
+  if (agent === "claude") return Boolean(cfg.claudeCodeOauthToken);
+  return Boolean(cfg.kimiCodeApiKey);
+}
+
+function agentDisplayName(agent: Agent): string {
+  if (agent === "codex") return "Codex";
+  if (agent === "claude") return "Claude";
+  return "OpenCode";
 }
 
 // A `branch › <name>` label (also `branch >`, `branch:`, `branch/`) targets a
@@ -95,50 +85,35 @@ function isSafeBranchName(value: string): boolean {
 }
 
 function repositoryFor(
-  cfg: Config,
   store: TicketStore,
-  issue: { team?: { id?: string; key?: string } },
-  labels: string[] = []
+  issue: { team?: { id?: string; key?: string } }
 ): { repo: string; baseBranch: string } | undefined {
-  for (const label of labels) {
-    for (const key of repoLabelKeys(label)) {
-      const byLabel = cfg.githubRepoLabelMappings[key];
-      if (byLabel) return { repo: byLabel, baseBranch: cfg.baseBranch };
-    }
-  }
   const registered = store.getRepositoryRegistration(issue.team?.id, issue.team?.key);
-  if (registered) {
-    return { repo: registered.github_repo, baseBranch: registered.base_branch };
-  }
-  const byId = issue.team?.id ? cfg.githubRepoMappings[issue.team.id] : undefined;
-  const byKey = issue.team?.key ? cfg.githubRepoMappings[issue.team.key] : undefined;
-  const legacyMapped = byId ?? byKey;
-  if (legacyMapped) return { repo: legacyMapped, baseBranch: cfg.baseBranch };
-  if (store.hasRepositoryRegistrations()) return undefined;
-  return { repo: cfg.githubRepo, baseBranch: cfg.baseBranch };
+  return registered
+    ? { repo: registered.github_repo, baseBranch: registered.base_branch }
+    : undefined;
 }
 
 export async function handleLinearEvent(
   cfg: Config,
   store: TicketStore,
-  daytona: Daytona,
   getLinearClient: () => Promise<LinearClient | undefined>,
   linearOutbox: LinearOutboxProcessor,
   payload: ReturnType<typeof parseLinearWebhook>,
-  pipelineAdmission?: PipelineAdmissionContext
+  coordinator: PipelineCoordinatorContext
 ): Promise<void> {
   const linear = await getLinearClient();
   if (!linear) {
     throw new Error("No valid Linear OAuth token is stored");
   }
   if (payload.action === "created") {
-    await handleCreated(cfg, store, daytona, linear, linearOutbox, payload, pipelineAdmission);
+    await handleCreated(cfg, store, linear, linearOutbox, payload, coordinator);
   } else {
-    await handlePrompted(cfg, store, daytona, linear, linearOutbox, payload, pipelineAdmission);
+    await handlePrompted(cfg, store, linearOutbox, payload, coordinator);
   }
 }
 
-export interface PipelineAdmissionContext {
+export interface PipelineCoordinatorContext {
   catalog: ValidatedPipelineCatalog;
   runtime: ValidatedRuntimeCapabilityDescriptor;
   store: PipelineStore;
@@ -148,11 +123,10 @@ export interface PipelineAdmissionContext {
 async function handleCreated(
   cfg: Config,
   store: TicketStore,
-  daytona: Daytona,
   linear: LinearClient,
   linearOutbox: LinearOutboxProcessor,
   payload: ReturnType<typeof parseLinearWebhook>,
-  pipelineAdmission?: PipelineAdmissionContext
+  coordinator: PipelineCoordinatorContext
 ): Promise<void> {
   const issue = payload.agentSession.issue;
   const sessionId = payload.agentSession.id;
@@ -173,9 +147,9 @@ async function handleCreated(
 
   const labels = extractLabelNames(payload);
   const existing = store.getByIssueId(issue.id);
-  const pinnedMode = pipelineAdmission?.store.getSessionExecutionMode(sessionId);
-  if (pinnedMode === "pipeline") {
-    const pinned = pipelineAdmission?.store.getInstanceForSession(sessionId);
+  const existingSessionInstance = coordinator.store.getInstanceForSession(sessionId);
+  if (existingSessionInstance) {
+    const pinned = existingSessionInstance;
     if (!pinned || pinned.linear_issue_id !== issue.id) {
       throw new Error(`pipeline session ${sessionId} has an invalid issue binding`);
     }
@@ -190,7 +164,7 @@ async function handleCreated(
   // label is a base-branch directive, not a routing label, so grouped `branch`
   // children (which arrive as bare leaves) are dropped from the label set that
   // drives repo/agent/task routing below; otherwise a child leaf could collide
-  // with a `GITHUB_REPO_LABEL_MAPPINGS` key or an agent/investigate label and
+  // with an agent/investigate label and
   // misroute the ticket. The branch itself is verified further down, once the
   // repository is resolved.
   let routingLabels = labels;
@@ -230,7 +204,7 @@ async function handleCreated(
     }
   }
   const selectedAgent = pickAgent(routingLabels, existing?.agent ?? cfg.defaultAgent);
-  const selectedRepository = repositoryFor(cfg, store, issue, routingLabels);
+  const selectedRepository = repositoryFor(store, issue);
   if (!selectedRepository) {
     await tryPostError(
       store,
@@ -283,130 +257,6 @@ async function handleCreated(
     }
     selectedRepository.baseBranch = requestedBase;
   }
-  // The shipped supervisor always supplies the coordinator context. Keeping
-  // the context-free path here lets embedded/unit callers finish their
-  // historical fixtures without reintroducing a deploy-time admission flag.
-  const executionMode = pipelineAdmission
-    ? selectExecutionMode({ pinnedMode })
-    : pinnedMode ?? "legacy";
-  const existingMode = existing
-    ? pipelineAdmission?.store.getSessionExecutionMode(existing.linear_session_id)
-    : undefined;
-  if (executionMode === "legacy" && !hasAgentSubscription(cfg, selectedAgent)) {
-    await tryPostError(
-      store,
-      linearOutbox,
-      sessionId,
-      issue.id,
-      `${agentDisplayName(selectedAgent)} subscription login is not configured for OpenThrottle.`
-    );
-    return;
-  }
-  const retireExistingWorkspace = async (): Promise<boolean> => {
-    if (!existing?.sandbox_id || existing.state === "closed" || existing.state === "expired") {
-      return true;
-    }
-    const priorPipeline = pipelineAdmission?.store.getInstanceForSession(existing.linear_session_id);
-    await stopTicket({
-      store,
-      daytona,
-      linear,
-      linearOutbox,
-      ticket: existing,
-      reason: "Stopped because a new execution generation was delegated.",
-    });
-    const stopped = store.getByIssueId(issue.id);
-    if (stopped?.run_id) {
-      await tryPostError(
-        store,
-        linearOutbox,
-        sessionId,
-        issue.id,
-        "The prior workspace could not be stopped safely. It remains quarantined; resolve it before re-delegating."
-      );
-      return false;
-    }
-    try {
-      await deleteSandbox(daytona, existing.sandbox_id);
-      store.setSandboxId(issue.id, null);
-      if (priorPipeline && pipelineAdmission?.store.getRuntimeResource(priorPipeline.id)) {
-        pipelineAdmission.store.setRuntimeResourceStatus(priorPipeline.id, "cleaned");
-      }
-    } catch (error) {
-      await tryPostError(
-        store,
-        linearOutbox,
-        sessionId,
-        issue.id,
-        sanitizeText(`The prior workspace stopped but could not be deleted before new-generation admission: ${String(error)}`)
-      );
-      return false;
-    }
-    return true;
-  };
-  if (executionMode === "legacy" && existingMode === "pipeline") {
-    if (!(await retireExistingWorkspace())) return;
-  }
-  if (
-    executionMode === "legacy" &&
-    existingMode !== "pipeline" &&
-    existing?.sandbox_id &&
-    existing.state !== "closed" &&
-    existing.state !== "expired"
-  ) {
-    const agentChanged = existing.agent !== selectedAgent;
-    const repoChanged =
-      existing.repo !== selectedRepository.repo ||
-      existing.base_branch !== selectedRepository.baseBranch;
-    if (repoChanged) {
-      if (existing.run_id) {
-        store.finishRun({
-          runId: existing.run_id,
-          status: "stopped",
-          failureTail: `Repository route changed from ${existing.repo} to ${selectedRepository.repo}; starting a fresh workspace.`,
-          ticketState: "active",
-        });
-      }
-      try {
-        await stopSandbox(daytona, existing.sandbox_id);
-        await deleteSandbox(daytona, existing.sandbox_id);
-      } catch (error) {
-        const message = sanitizeText(
-          `OpenThrottle resolved this ticket to ${selectedRepository.repo}, but could not delete the existing ${existing.repo} workspace: ${String(error)}`
-        );
-        await tryPostError(store, linearOutbox, sessionId, issue.id, message);
-        return;
-      }
-    } else {
-      store.upsert({
-        ...existing,
-        linear_session_id: sessionId,
-        agent: selectedAgent,
-        state: "active",
-      });
-      store.setLinearContext(issue.id, initialContext);
-      const current = store.getByIssueId(issue.id)!;
-      await launchExistingTask({
-        cfg,
-        store,
-        daytona,
-        linear,
-        linearOutbox,
-        ticket: current,
-        taskType: routingLabels.includes("investigate")
-          ? "investigate"
-          : agentChanged
-            ? "implement"
-            : "resume",
-        resumeMessage: agentChanged
-          ? undefined
-          : "This ticket was re-delegated. Re-read it and continue from the existing branch.",
-        linearContext: initialContext,
-      });
-      return;
-    }
-  }
-
   const taskType: TaskType = routingLabels.includes("investigate") ? "investigate" : "implement";
   const ticketCore = {
     linear_issue_id: issue.id,
@@ -420,250 +270,88 @@ async function handleCreated(
     pr_url: null,
     state: "active" as const,
   };
-  if (executionMode === "pipeline") {
-    if (!pipelineAdmission) throw new Error("pipeline admission is enabled without a catalog/runtime context");
-    const failSelection = async (error: unknown) => {
-      const message = sanitizeText(`Pipeline selection failed before sandbox provisioning: ${String(error)}`);
-      // Selection has not earned the right to supersede or detach a prior
-      // generation. Keep that workspace/session binding intact so a corrected
-      // replay can retire it safely after validation succeeds.
-      if (!existing) {
-        store.upsertUnpinned({ ...ticketCore, state: "error" });
-      }
+  const failSelection = async (error: unknown) => {
+    const message = sanitizeText(`Pipeline selection failed before sandbox provisioning: ${String(error)}`);
+    // A failed selection must not supersede the currently pinned generation.
+    if (!existing) {
+      store.upsertUnpinned({ ...ticketCore, state: "error" });
       store.setState(issue.id, "error", message);
       store.setLinearContext(issue.id, initialContext);
-      await tryPostError(store, linearOutbox, sessionId, issue.id, message);
-    };
-    let pinned: {
-      remote: Awaited<ReturnType<typeof getRepositoryConfigAtCommit>>;
-      manifest: ReturnType<typeof resolvePipelineReference>;
-      snapshot: ReturnType<PipelineStore["saveRepositoryConfigSnapshot"]>;
-    };
-    try {
-      const remote = await getRepositoryConfigAtCommit(
-        { token: cfg.githubToken },
-        selectedRepository.repo,
-        selectedRepository.baseBranch
-      );
-      const repositoryConfig = parseRepositoryConfig(
-        remote.content,
-        `${selectedRepository.repo}@${remote.baseCommit}:.openthrottle.yml`
-      );
-      const intent = taskType === "investigate" ? "investigate" : "implement";
-      const reference = repositoryConfig.config.pipelines?.[intent] ?? intent;
-      const manifest = resolvePipelineReference(pipelineAdmission.catalog, reference);
-      const needsModel = manifest.manifest.stages.some((stage) => stage.credentials.includes("model.invoke"));
-      if (needsModel && !hasAgentSubscription(cfg, selectedAgent)) {
-        throw new Error(`${agentDisplayName(selectedAgent)} subscription login is not configured for this pipeline`);
-      }
-      const snapshot = pipelineAdmission.store.saveRepositoryConfigSnapshot({
-        repository: selectedRepository.repo,
-        baseCommit: remote.baseCommit,
-        blobSha: remote.blobSha,
-        config: repositoryConfig,
-      });
-      pinned = { remote, manifest, snapshot };
-    } catch (error) {
-      await failSelection(error);
-      return;
     }
-    if (!(await retireExistingWorkspace())) return;
-    try {
-      store.upsert({
-        ...ticketCore,
-        pipeline: {
-          repository: selectedRepository.repo,
-          baseCommit: pinned.remote.baseCommit,
-          baseBranch: selectedRepository.baseBranch,
-          manifest: pinned.manifest,
-          repositoryConfig: pinned.snapshot,
-          runtime: pipelineAdmission.runtime,
-          authorizedCapabilities: pinned.manifest.manifest.requires.capabilities,
-          taskType,
-          taskContext: sanitizeText(initialContext).slice(0, 64_000),
-        },
-      });
-    } catch (error) {
-      await failSelection(error);
-      return;
-    }
-    store.setLinearContext(issue.id, initialContext);
-    await enqueueActivity(store, linearOutbox, {
-      sessionId,
-      type: "thought",
-      body: `Pinned pipeline ${pinned.manifest.manifest.id}@${pinned.manifest.manifest.version} (${pinned.manifest.digest.slice(0, 12)}) at base ${pinned.remote.baseCommit.slice(0, 12)}. The durable coordinator will dispatch its first stage.`,
-    }, issue.id);
-    await pipelineAdmission.drainEffects?.();
-    return;
-  }
-  store.upsert(ticketCore);
-  store.setLinearContext(issue.id, initialContext);
-  const recovered = await findSandboxForTicket(daytona, issue.identifier);
-  if (recovered) {
-    store.setSandboxId(issue.id, recovered.id);
-    const recoveredTicket = store.getByIssueId(issue.id)!;
-    if (recoveredTicket.run_id) {
-      await reportCreatedWorkspace(cfg, store, linearOutbox, recoveredTicket, recovered.id);
-      return;
-    }
-    await launchExistingTask({
-      cfg,
-      store,
-      daytona,
-      linear,
-      linearOutbox,
-      ticket: recoveredTicket,
-      taskType,
-      resumeMessage: "Recovered the existing workspace. Re-read the ticket and continue.",
-      linearContext: initialContext,
-    });
-    return;
-  }
-
-  const staleRunId = store.getByIssueId(issue.id)?.run_id;
-  if (staleRunId) {
-    store.finishRun({
-      runId: staleRunId,
-      status: "failed",
-      failureTail: "Provisioning was interrupted before a workspace was created; retrying.",
-      ticketState: "error",
-    });
-  }
-  const run = beginRun(store, cfg, issue.id, taskType);
-  if (!run) {
-    await enqueueActivity(store, linearOutbox, {
-      sessionId,
-      type: "thought",
-      body: "Still working on this ticket — no second workspace was created.",
-    }, issue.id);
-    return;
-  }
-
-  const ticket = store.getByIssueId(issue.id)!;
-  const env = baseSandboxEnv(cfg, {
-    ticket,
-    taskType,
-    run,
-    codexAuthJson:
-      ticket.agent === "codex" ? await getCodexAuthForSeed(cfg, store) : undefined,
-  });
-  let sandbox;
+    await tryPostError(store, linearOutbox, sessionId, issue.id, message);
+  };
+  let pinned: {
+    remote: Awaited<ReturnType<typeof getRepositoryConfigAtCommit>>;
+    manifest: ReturnType<typeof resolvePipelineReference>;
+    snapshot: ReturnType<PipelineStore["saveRepositoryConfigSnapshot"]>;
+  };
   try {
-    sandbox = await createForTicket(daytona, cfg, {
-      issueIdentifier: issue.identifier,
-      env,
-    });
-    store.setSandboxId(issue.id, sandbox.id);
-  } catch (error) {
-    const partiallyCreated = await findSandboxForTicket(daytona, issue.identifier).catch(
-      () => undefined
+    const remote = await getRepositoryConfigAtCommit(
+      { token: cfg.githubToken },
+      selectedRepository.repo,
+      selectedRepository.baseBranch
     );
-    if (partiallyCreated) {
-      store.setSandboxId(issue.id, partiallyCreated.id);
-      await reportCreatedWorkspace(
-        cfg,
-        store,
-        linearOutbox,
-        store.getByIssueId(issue.id)!,
-        partiallyCreated.id
-      );
-      return;
+    const repositoryConfig = parseRepositoryConfig(
+      remote.content,
+      `${selectedRepository.repo}@${remote.baseCommit}:.openthrottle.yml`
+    );
+    const reference = repositoryConfig.config.pipelines?.[taskType] ?? taskType;
+    const manifest = resolvePipelineReference(coordinator.catalog, reference);
+    const needsModel = manifest.manifest.stages.some((stage) =>
+      stage.credentials.includes("model.invoke")
+    );
+    if (needsModel && !hasAgentSubscription(cfg, selectedAgent)) {
+      throw new Error(`${agentDisplayName(selectedAgent)} subscription login is not configured for this pipeline`);
     }
-    const message = sanitizeText(`Failed to create a workspace: ${String(error)}`);
-    store.finishRun({
-      runId: run.id,
-      status: "failed",
-      failureTail: message,
-      ticketState: "error",
+    const snapshot = coordinator.store.saveRepositoryConfigSnapshot({
+      repository: selectedRepository.repo,
+      baseCommit: remote.baseCommit,
+      blobSha: remote.blobSha,
+      config: repositoryConfig,
     });
-    // Surface the failure in the Linear session and return, matching every other
-    // provisioning-failure branch above. Re-throwing here left the session stuck
-    // on the ephemeral "Spinning up a workspace…" thought while the webhook layer
-    // retried silently — e.g. a Daytona "Total disk limit exceeded" quota error
-    // was invisible in Linear and only showed up in the supervisor logs.
-    await tryPostError(store, linearOutbox, sessionId, issue.id, message);
+    pinned = { remote, manifest, snapshot };
+  } catch (error) {
+    await failSelection(error);
     return;
   }
-  const provisionedTicket = store.getByIssueId(issue.id)!;
-
   try {
-    await startTask(sandbox, {
-      env,
-      linearContext: initialContext,
-      taskTimeoutSeconds: cfg.taskTimeout,
+    store.upsert({
+      ...ticketCore,
+      pipeline: {
+        repository: selectedRepository.repo,
+        baseCommit: pinned.remote.baseCommit,
+        baseBranch: selectedRepository.baseBranch,
+        manifest: pinned.manifest,
+        repositoryConfig: pinned.snapshot,
+        runtime: coordinator.runtime,
+        authorizedCapabilities: pinned.manifest.manifest.requires.capabilities,
+        taskType,
+        taskContext: sanitizeText(initialContext).slice(0, 64_000),
+      },
     });
   } catch (error) {
-    const message = sanitizeText(`Failed to start ${taskType}: ${String(error)}`);
-    store.finishRun({
-      runId: run.id,
-      status: "failed",
-      failureTail: message,
-      ticketState: "error",
-    });
-    await tryPostError(store, linearOutbox, sessionId, issue.id, message);
-    scheduleSandboxSettlement({ daytona, store, ticket: provisionedTicket, taskType });
+    await failSelection(error);
     return;
   }
-
-  await reportCreatedWorkspace(cfg, store, linearOutbox, provisionedTicket, sandbox.id);
-  try {
-    await enqueueActivity(store, linearOutbox, {
-      sessionId,
-      type: "action",
-      action: "Started",
-      parameter: `${taskType} run on ${provisionedTicket.branch}`,
-    }, issue.id, run.id);
-  } catch (error) {
-    console.error(`[linear] ${taskType} started but its activity could not be posted:`, error);
-  }
-}
-
-async function reportCreatedWorkspace(
-  cfg: Config,
-  store: TicketStore,
-  linearOutbox: LinearOutboxProcessor,
-  ticket: Ticket,
-  sandboxId: string
-): Promise<void> {
-  const previewToken = randomBytes(24).toString("base64url");
-  store.setPreviewTokenHash(ticket.linear_issue_id, tokenHash(previewToken));
-  const previewUrl = `${cfg.supervisorUrl}/preview/${encodeURIComponent(
-    ticket.linear_issue_identifier
-  )}?token=${encodeURIComponent(previewToken)}`;
-  try {
-    await enqueueActivity(store, linearOutbox, {
-      sessionId: ticket.linear_session_id,
-      type: "action",
-      action: "Created workspace",
-      parameter: `${sandboxId} on ${ticket.repo}:${ticket.branch}`,
-      result: `Wake-on-click preview: ${previewUrl}`,
-    }, ticket.linear_issue_id);
-  } catch (error) {
-    console.error("[linear] failed to enqueue workspace activity:", error);
-  }
-  try {
-    await enqueueSessionUpdate(store, linearOutbox, {
-      sessionId: ticket.linear_session_id,
-      issueId: ticket.linear_issue_id,
-      addedExternalUrls: [{ label: "Workspace Preview", url: previewUrl }],
-    });
-  } catch (error) {
-    console.error("[linear] failed to enqueue workspace preview:", error);
-  }
+  store.setLinearContext(issue.id, initialContext);
+  await enqueueActivity(store, linearOutbox, {
+    sessionId,
+    type: "thought",
+    body: `Pinned pipeline ${pinned.manifest.manifest.id}@${pinned.manifest.manifest.version} (${pinned.manifest.digest.slice(0, 12)}) at base ${pinned.remote.baseCommit.slice(0, 12)}. The durable coordinator will dispatch its first stage.`,
+  }, issue.id);
+  await coordinator.drainEffects?.();
 }
 
 async function handlePrompted(
   cfg: Config,
   store: TicketStore,
-  daytona: Daytona,
-  linear: LinearClient,
   linearOutbox: LinearOutboxProcessor,
   payload: ReturnType<typeof parseLinearWebhook>,
-  pipelineAdmission?: PipelineAdmissionContext
+  coordinator: PipelineCoordinatorContext
 ): Promise<void> {
   const sessionId = payload.agentSession.id;
   const issue = payload.agentSession.issue;
-  const resumeMessage =
+  const promptBody =
     payload.agentActivity?.content?.body ?? payload.agentActivity?.body ?? "";
   const ticket = issue
     ? store.getByIssueId(issue.id)
@@ -679,42 +367,30 @@ async function handlePrompted(
     return;
   }
 
-  const labels = extractLabelNames(payload);
-  const command = parseCommand(resumeMessage, { investigateLabel: labels.includes("investigate") });
-  const pipelineInstance = pipelineAdmission?.store.getInstanceForSession(sessionId);
+  const command = parseCommand(promptBody);
+  const pipelineInstance = coordinator.store.getInstanceForSession(sessionId);
   // The native Linear `signal: "stop"` control signal is checked directly
   // here (it's not a chat command); a textual "/stop" is handled by
-  // parseCommand alongside /merge and /implement.
+  // parseCommand alongside /merge.
   const isStop = payload.agentActivity?.signal?.toLowerCase() === "stop" || command.kind === "stop";
   if (isStop) {
-    if (pipelineInstance && pipelineAdmission) {
-      requestPipelineStop({
-        store: pipelineAdmission.store,
-        sessionId,
-        eventId: `linear-stop:${pipelineInstance.id}:${payload.agentActivity?.id ?? "signal"}`,
-        reason: "Stopped from the Linear thread.",
-      });
-      await pipelineAdmission.drainEffects?.();
-      return;
-    }
-    if (!ticket.sandbox_id) {
+    if (!pipelineInstance) {
       await tryPostError(
         store,
         linearOutbox,
         sessionId,
         ticket.linear_issue_id,
-        "OpenThrottle couldn't find an existing workspace. Delegate the issue again to start one."
+        "OpenThrottle couldn't find a pipeline for this session. Delegate the issue again to start one."
       );
       return;
     }
-    await stopTicket({
-      store,
-      daytona,
-      linear,
-      linearOutbox,
-      ticket,
+    requestPipelineStop({
+      store: coordinator.store,
+      sessionId,
+      eventId: `linear-stop:${pipelineInstance.id}:${payload.agentActivity?.id ?? "signal"}`,
       reason: "Stopped from the Linear thread.",
     });
+    await coordinator.drainEffects?.();
     return;
   }
 
@@ -723,136 +399,51 @@ async function handlePrompted(
     return;
   }
 
-  if (pipelineInstance && pipelineAdmission) {
-    const workId = payload.agentActivity?.id;
-    if (
-      command.kind === "reply" &&
-      workId &&
-      canSteerPipelineRun({
-        store: pipelineAdmission.store,
-        sessionId,
-        runId: ticket.run_id,
-        agent: ticket.agent,
-      })
-    ) {
-      store.enqueueInbox({
-        id: workId,
-        issueId: ticket.linear_issue_id,
-        sessionId,
-        runId: ticket.run_id,
-        source: "human",
-        body: sanitizeText(resumeMessage),
-      });
-      await enqueueActivity(store, linearOutbox, {
-        sessionId,
-        type: "thought",
-        body: "Steering the current pipeline stage with your message…",
-        ephemeral: true,
-      }, ticket.linear_issue_id);
-      return;
-    }
-    await tryPostError(
-      store,
-      linearOutbox,
-      sessionId,
-      ticket.linear_issue_id,
-      command.kind === "implement"
-        ? "This session is pinned to the pipeline coordinator and cannot start a legacy implementation run. Re-delegate the issue to create a new generation."
-        : "The current pipeline stage does not accept live steering. Add feedback to the pull request, or re-delegate the issue to create a new generation."
-    );
-    return;
-  }
-
-  if (!ticket.sandbox_id) {
-    await tryPostError(
-      store,
-      linearOutbox,
-      sessionId,
-      ticket.linear_issue_id,
-      "OpenThrottle couldn't find an existing workspace. Delegate the issue again to start one."
-    );
-    return;
-  }
-
   const workId = payload.agentActivity?.id;
-  if (workId) {
-    const inserted = store.enqueueSessionWork({
-      id: workId,
-      linearSessionId: sessionId,
-      issueId: ticket.linear_issue_id,
-      source: "human",
-      body: sanitizeText(resumeMessage),
-    });
-    if (!inserted) return;
-  }
-
-  await enqueueActivity(store, linearOutbox, {
-    sessionId,
-    type: "thought",
-    body: "Picking this back up…",
-    ephemeral: true,
-  }, ticket.linear_issue_id);
-
-  const nextContext = linearContext(
-    payload,
-    `${ticket.linear_context ?? `# ${ticket.linear_issue_identifier}`}\n\n## Latest human reply\n\n${resumeMessage}`
-  );
-  store.setLinearContext(ticket.linear_issue_id, nextContext);
-  const currentTicket = store.getByIssueId(ticket.linear_issue_id) ?? ticket;
-
-  if (command.kind === "implement" && command.legacy) {
-    console.warn(
-      `[commands] legacy "fix it/implement/go ahead" phrase promoted ${currentTicket.linear_issue_identifier} to implement — use /implement instead`
-    );
-  }
-  const taskType: TaskType = command.kind === "implement" ? "implement" : "resume";
-
-  // Interrupt-on-send: a plain reply that arrives while a run is active on a
-  // steering-capable agent (Claude/Codex) is delivered into the running sandbox
-  // now via the steering inbox — using the SAME id as the session_work row above
-  // so completeRun's drain dedups (cancels the after-run resume once the steer
-  // was delivered). The session_work row stays as the durable fallback: if the
-  // steer never reaches a live sandbox before the run ends, it drains as a normal
-  // resume. launchExistingTask would fail here anyway (a run is already active),
-  // so skip it and leave the item pending.
   if (
-    taskType === "resume" &&
+    pipelineInstance &&
+    command.kind === "reply" &&
     workId &&
-    currentTicket.run_id &&
-    (currentTicket.agent === "claude" || currentTicket.agent === "codex")
+    canSteerPipelineRun({
+      store: coordinator.store,
+      sessionId,
+      runId: ticket.run_id,
+      agent: ticket.agent,
+    })
   ) {
     store.enqueueInbox({
       id: workId,
-      issueId: currentTicket.linear_issue_id,
+      issueId: ticket.linear_issue_id,
       sessionId,
-      runId: currentTicket.run_id,
+      runId: ticket.run_id,
       source: "human",
-      body: sanitizeText(resumeMessage),
+      body: sanitizeText(promptBody),
     });
     await enqueueActivity(store, linearOutbox, {
       sessionId,
       type: "thought",
-      body: "Steering the current run with your message…",
+      body: "Steering the current pipeline stage with your message…",
       ephemeral: true,
-    }, currentTicket.linear_issue_id);
+    }, ticket.linear_issue_id);
     return;
   }
-
-  const launched = await launchExistingTask({
-    cfg,
-    store,
-    daytona,
-    linear,
-    linearOutbox,
-    ticket: currentTicket,
-    taskType,
-    resumeMessage: taskType === "resume" ? resumeMessage : undefined,
-    linearContext: nextContext,
-  });
-  const runId = store.getByIssueId(ticket.linear_issue_id)?.run_id;
-  if (launched && workId && runId) {
-    store.markSessionWorkConsumed(workId, runId);
+  if (!pipelineInstance) {
+    await tryPostError(
+      store,
+      linearOutbox,
+      sessionId,
+      ticket.linear_issue_id,
+      "OpenThrottle couldn't find a pipeline for this session. Delegate the issue again to start one."
+    );
+    return;
   }
+  await tryPostError(
+    store,
+    linearOutbox,
+    sessionId,
+    ticket.linear_issue_id,
+    "The current pipeline stage does not accept live steering. Add feedback to the pull request, or re-delegate the issue to create a new generation."
+  );
 }
 
 async function mergeFromLinear(
