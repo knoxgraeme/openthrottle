@@ -1,6 +1,6 @@
 {
   "schema": "openthrottle.runtime-capabilities/v1",
-  "release": "openthrottle-snapshot/v1",
+  "release": "openthrottle-snapshot/v2",
   "generatedBy": "sandbox-runtime-build",
   "protocol": "stage-executor@1",
   "capabilities": [
@@ -12,10 +12,9 @@
     "ce/review@1",
     "ce/simplify@1",
     "command/run@1",
-    "provider/wait@1",
-    "repository/publish@1"
+    "provider/wait@1"
   ],
-  "executors": ["agent", "command", "provider_wait", "publish"],
+  "executors": ["agent", "command", "provider_wait"],
   "evaluators": ["command", "human", "provider", "publish_subject", "result", "semantic"],
   "artifacts": ["command_result", "human_approval", "provider_check", "publish_subject", "review", "stage_result"],
   "contextPolicies": ["fresh", "fresh_review", "none", "prefer_resume", "resume_required"],

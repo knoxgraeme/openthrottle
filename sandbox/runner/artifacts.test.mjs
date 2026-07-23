@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { RUNTIME_DESCRIPTOR } from "./capabilities.mjs";
 import {
   buildCommandArtifacts,
   buildSemanticArtifacts,
@@ -9,7 +10,7 @@ import {
 const fence = {
   pipelineInstanceId: "pipeline-1",
   manifestDigest: "a".repeat(64),
-  runtimeRelease: "openthrottle-snapshot/v1",
+  runtimeRelease: RUNTIME_DESCRIPTOR.release,
   capabilityDigest: "b".repeat(64),
   stageId: "review",
   attemptId: "attempt-1",

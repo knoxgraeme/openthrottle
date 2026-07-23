@@ -135,7 +135,7 @@ export function validateSemanticProposal(value, env = process.env) {
 function assuranceForCapability(capability) {
   const contract = CAPABILITY_CONTRACTS[capability];
   if (!contract) throw new Error(`unknown artifact producer capability ${capability}`);
-  if (contract.kind === "command" || contract.kind === "publish") return "executor_verified";
+  if (contract.kind === "command") return "executor_verified";
   if (contract.kind === "provider_wait") return "provider_verified";
   return "semantic_attested";
 }

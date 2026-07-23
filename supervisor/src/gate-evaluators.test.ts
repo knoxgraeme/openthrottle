@@ -36,14 +36,14 @@ describe("deterministic supervisor stage gates", () => {
   let database: Database.Database | undefined;
   afterEach(() => database?.close());
 
-  function setup(manifestKey = "ce/investigate@1"): Fixture {
+  function setup(manifestKey = "ce/investigate@2"): Fixture {
     database = openDb(":memory:");
     const tickets = createTicketStore(database);
     const pipelines = createPipelineStore(database);
     const catalog = loadPipelineCatalog(catalogPath, runtime.descriptor);
     pipelines.acceptRuntimeDescriptor(runtime);
     pipelines.acceptCatalog(catalog);
-    const config = parseRepositoryConfig("pipelines: { investigate: ce/investigate@1 }\ntest: npm test\n");
+    const config = parseRepositoryConfig("pipelines: { investigate: ce/investigate@2 }\ntest: npm test\n");
     const snapshot = pipelines.saveRepositoryConfigSnapshot({
       repository: "owner/repo",
       baseCommit: "a".repeat(40),
@@ -77,7 +77,7 @@ describe("deterministic supervisor stage gates", () => {
     expect(tickets.beginRun({
       issueId: "issue-1",
       runId: request.runId,
-      taskType: manifestKey === "fixture/command@1" ? "implement" : "investigate",
+      taskType: manifestKey.startsWith("ce/investigate") ? "investigate" : "implement",
       tokenHash: "token-hash",
       expiresAt: "2099-01-01T00:00:00.000Z",
     })).toBe(true);
@@ -276,11 +276,11 @@ describe("deterministic supervisor stage gates", () => {
     expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM pipeline_artifacts").get()).toEqual({ count: 0 });
 
     const completed = processStageEvidence(fixture.pipelines, input, { observedSubject: SUBJECT });
-    expect(completed.status).toBe("completion_pending_publication");
+    expect(completed).toMatchObject({ status: "dispatchable", active_stage_id: "publish" });
     expect(fixture.db.prepare(
       "SELECT evaluator_kind, result, payload, receipt_hash FROM pipeline_gate_receipts"
     ).get()).toMatchObject({ evaluator_kind: "semantic", result: "passed" });
-    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM pipeline_artifacts").get()).toEqual({ count: 1 });
+    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM pipeline_artifacts").get()).toEqual({ count: 2 });
   });
 
   it("settles the actor and pipeline transition in one replayable transaction", () => {
@@ -302,7 +302,7 @@ describe("deterministic supervisor stage gates", () => {
       input,
       { observedSubject: SUBJECT }
     );
-    expect(completed.status).toBe("completion_pending_publication");
+    expect(completed).toMatchObject({ status: "dispatchable", active_stage_id: "publish" });
     expect(fixture.tickets.getRun(input.runId!)?.status).toBe("completed");
     expect(fixture.tickets.getByIssueId("issue-1")?.run_id).toBeNull();
   });
@@ -362,13 +362,13 @@ describe("deterministic supervisor stage gates", () => {
     })).toMatchObject({ state_version: transitioned!.state_version });
   });
 
-  it("pins the executor-verified provider commit when the publish gate passes", () => {
-    const fixture = setup("ce/implement@1");
+  it("pins the exact provider commit when the agent-backed publish gate passes", () => {
+    const fixture = setup("ce/implement@2");
     const stage = fixture.manifest.stages.find((candidate) => candidate.id === "publish")!;
     const publishedCommit = "e".repeat(40);
     fixture.db.prepare(`
       UPDATE pipeline_stage_attempts
-      SET stage_id = 'publish', native_context_policy = 'none'
+      SET stage_id = 'publish', native_context_policy = 'resume_required'
       WHERE id = ?
     `).run(fixture.attempt.id);
     fixture.db.prepare(`
@@ -396,8 +396,44 @@ describe("deterministic supervisor stage gates", () => {
     expect(() => evaluateStageGate(fixture.pipelines, missing)).toThrow(/provider commit/);
   });
 
+  it("keeps non-blocking publication diagnostics on the bounded publish retry", () => {
+    const fixture = setup("ce/implement@2");
+    const stage = fixture.manifest.stages.find((candidate) => candidate.id === "publish")!;
+    fixture.db.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET stage_id = 'publish', native_context_policy = 'resume_required'
+      WHERE id = ?
+    `).run(fixture.attempt.id);
+    fixture.db.prepare(`
+      UPDATE pipeline_instances SET status = 'running', active_stage_id = 'publish' WHERE id = ?
+    `).run(fixture.instance.id);
+    const publishFixture: Fixture = {
+      ...fixture,
+      stage,
+      attempt: fixture.pipelines.getAttempt(fixture.attempt.id)!,
+    };
+    const input = event(publishFixture, "retryable_infrastructure_failure", {
+      findings: [{
+        severity: "P2",
+        code: "publish-reconciliation-incomplete",
+        summary: "Publication needs a bounded reconciliation retry.",
+      }],
+    });
+
+    const evaluated = evaluateStageGate(fixture.pipelines, input);
+    expect(evaluated.event.outcome).toBe("retryable_infrastructure_failure");
+    expect(evaluated.receipt.result).toBe("indeterminate");
+
+    const transitioned = processStageEvidence(fixture.pipelines, input);
+    expect(transitioned).toMatchObject({ status: "dispatchable", active_stage_id: "publish" });
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "publish",
+      reentry_ordinal: 1,
+    });
+  });
+
   it("turns supervisor-owned provider evidence into a fenced terminal receipt", () => {
-    const fixture = setup("ce/implement@1");
+    const fixture = setup("ce/implement@2");
     fixture.db.prepare(`
       UPDATE pipeline_stage_attempts
       SET stage_id = 'provider', native_context_policy = 'none', expected_subject = ?, native_session_id = 'native-1'
@@ -485,7 +521,7 @@ describe("deterministic supervisor stage gates", () => {
     { merged: true, terminalOutcome: "shipped" },
     { merged: false, terminalOutcome: "no_change" },
   ])("preserves deferred close evidence when merged=$merged during publication", async ({ merged, terminalOutcome }) => {
-    const fixture = setup("ce/implement@1");
+    const fixture = setup("ce/implement@2");
     fixture.db.prepare(`
       UPDATE pipeline_stage_attempts
       SET stage_id = 'provider', native_context_policy = 'none', expected_subject = ?
@@ -534,7 +570,7 @@ describe("deterministic supervisor stage gates", () => {
   });
 
   it("fails closed when GitHub's current head differs from the executor-verified commit", () => {
-    const fixture = setup("ce/implement@1");
+    const fixture = setup("ce/implement@2");
     const observedHead = "d".repeat(40);
     fixture.db.prepare(`
       UPDATE pipeline_stage_attempts
@@ -573,7 +609,7 @@ describe("deterministic supervisor stage gates", () => {
   });
 
   it("coalesces feedback arriving during repair and replays a claimed snapshot at provider wait", () => {
-    const fixture = setup("ce/implement@1");
+    const fixture = setup("ce/implement@2");
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
     fixture.tickets.setSetting("github-head:issue-1", SUBJECT);
     fixture.db.prepare(`
@@ -611,7 +647,7 @@ describe("deterministic supervisor stage gates", () => {
     `).run(SUBJECT, fixture.attempt.id);
     fixture.db.prepare(`
       UPDATE pipeline_instance_stages SET status = 'passed'
-      WHERE pipeline_instance_id = ? AND stage_id = 'implement'
+      WHERE pipeline_instance_id = ? AND stage_id = 'implementation'
     `).run(fixture.instance.id);
     fixture.db.prepare(`
       UPDATE pipeline_instance_stages SET status = 'waiting'
@@ -627,7 +663,7 @@ describe("deterministic supervisor stage gates", () => {
     expect(fixture.db.prepare("SELECT status FROM feedback_snapshots WHERE id = ?").get(snapshot.id))
       .toEqual({ status: "consumed" });
     expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
-      stage_id: "implement",
+      stage_id: "implementation",
       reentry_ordinal: 1,
     });
     expect(drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(0);

@@ -58,15 +58,17 @@ describe("pipeline manifest validation", () => {
 
     expect(first.digest).toBe(second.digest);
     expect([...first.manifests.keys()]).toEqual([
-      "ce/implement@1",
       "ce/implement@2",
-      "ce/investigate@1",
       "ce/investigate@2",
       "fixture/command@1",
       "fixture/command@2",
       "fixture/agent@1",
     ]);
     expect(resolvePipelineReference(first, "implement").manifest.id).toBe("ce/implement");
+    expect(() => resolvePipelineReference(first, "ce/implement@1"))
+      .toThrow(/unknown pipeline selection/);
+    expect(() => resolvePipelineReference(first, "ce/investigate@1"))
+      .toThrow(/unknown pipeline selection/);
     expect(resolvePipelineReference(first, "fixture/command@1").manifest.id).toBe("fixture/command");
     expect(resolvePipelineReference(first, "fixture-command").manifest.version).toBe(2);
     expect(resolvePipelineReference(first, "implement").manifest.stages.map((stage) => stage.id)).toEqual([
@@ -110,6 +112,7 @@ describe("pipeline manifest validation", () => {
 
     for (const [path, update, expected] of [
       ["executor", (stage: Record<string, unknown>) => { stage.executor = { kind: "shell", capability: "agent/semantic@1" }; }, /must be one of/],
+      ["retired publisher", (stage: Record<string, unknown>) => { stage.executor = { kind: "publish", capability: "agent/semantic@1" }; }, /must be one of/],
       ["artifact", (stage: Record<string, unknown>) => { stage.produces = ["mystery"]; }, /must be one of/],
       ["assurance", (stage: Record<string, unknown>) => { stage.evaluator = { kind: "semantic", assurance: "agent_says_pass", required_artifacts: ["stage_result"] }; }, /must be one of/],
     ] as const) {
@@ -135,12 +138,12 @@ describe("pipeline manifest validation", () => {
 agent: codex
 test: npm test --prefix supervisor
 limits: { max_turns: 20, task_timeout: 300 }
-pipelines: { implement: implement, investigate: ce/investigate@1 }
+pipelines: { implement: implement, investigate: ce/investigate@2 }
 mcp_servers: {}
 `);
     expect(parsed.config.pipelines).toEqual({
       implement: "implement",
-      investigate: "ce/investigate@1",
+      investigate: "ce/investigate@2",
     });
     expect(parseRepositoryConfig(parsed.normalized.replace(/^/, "")).digest).toBe(parsed.digest);
     expect(() => parseRepositoryConfig("pipeline_logic: !!js/function evil")).toThrow();

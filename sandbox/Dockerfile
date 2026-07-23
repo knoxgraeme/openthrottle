@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
       gnupg \
       jq \
+      procps \
       ripgrep \
       util-linux \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -126,15 +127,18 @@ COPY supervisor/pipelines/runtime-capabilities-v1.json /opt/openthrottle/runtime
 COPY skills /opt/openthrottle/skills
 
 # The canonical task skills (skills/tasks/<name>/SKILL.md, agents/openai.yaml)
-# are the single source of truth. Claude picks them up at runtime from
-# /opt/openthrottle/skills/tasks (entrypoint.sh copies them into the sandbox
-# user's ~/.claude/skills). Codex instead gets them baked in here at
-# admin scope (/etc/codex/skills), which Codex discovers natively without any
-# per-run copy; each skill's agents/openai.yaml sets
+# are the single source of truth. Claude loads CE from the root-owned pinned
+# marketplace and gets only the OpenThrottle adapters copied into its runtime
+# profile. Codex gets both the pinned CE skills and the adapters baked at admin
+# scope (/etc/codex/skills), so mutable user plugin state is never executable
+# across stage credentials. Each adapter's agents/openai.yaml sets
 # policy.allow_implicit_invocation: false so a skill only runs when the
 # entrypoint's prompt names it explicitly via `$<skill-name>`.
 RUN mkdir -p /etc/codex/skills \
-    && cp -r /opt/openthrottle/skills/tasks/. /etc/codex/skills/
+    && cp -r /opt/openthrottle/compound-engineering-marketplace/skills/. /etc/codex/skills/ \
+    && cp -r /opt/openthrottle/skills/tasks/. /etc/codex/skills/ \
+    && chown -R root:root /etc/codex/skills \
+    && chmod -R a-w /etc/codex/skills
 
 RUN chmod 0755 /opt/openthrottle/entrypoint.sh \
     && chmod 0755 /opt/openthrottle/lib/runtime.sh \
@@ -142,6 +146,7 @@ RUN chmod 0755 /opt/openthrottle/entrypoint.sh \
     && chmod 0755 /opt/openthrottle/bin/ot-stage-result.mjs \
     && ln -s /opt/openthrottle/bin/ot-stage-result.mjs /usr/local/bin/ot-stage-result \
     && chmod 0755 /opt/openthrottle/safety/pre-push \
+      /opt/openthrottle/safety/enforce-stage-push-policy \
       /opt/openthrottle/safety/seal.sh \
       /opt/openthrottle/hooks/ot-inbox-drain.sh
 

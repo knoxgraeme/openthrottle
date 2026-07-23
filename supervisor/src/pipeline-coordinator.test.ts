@@ -159,23 +159,23 @@ describe("pipeline coordinator", () => {
   });
 
   it("enforces bounded repair and uses explicit on_exhausted policy", () => {
-    const { manifest, instance, attempt, stages } = setup("ce/implement@1");
+    const { manifest, instance, attempt, stages } = setup("ce/implement@2");
     const repair = event(instance, attempt, "semantic_repair_required", "repair-event");
     const allowed = reducePipelineEvent({
       manifest,
       instance: { ...instance, reentry_count: 2 },
       attempt,
-      stages: stages.map((stage) => ({ ...stage, reentry_count: stage.stage_id === "implement" ? 2 : stage.reentry_count })),
+      stages: stages.map((stage) => ({ ...stage, reentry_count: stage.stage_id === "planning" ? 2 : stage.reentry_count })),
       event: repair,
     });
-    expect(allowed.nextStageId).toBe("implement");
+    expect(allowed.nextStageId).toBe("planning");
     expect(allowed.nextAttempt?.reentryOrdinal).toBe(3);
 
     const exhausted = reducePipelineEvent({
       manifest,
       instance: { ...instance, reentry_count: 3 },
       attempt,
-      stages: stages.map((stage) => ({ ...stage, reentry_count: stage.stage_id === "implement" ? 3 : stage.reentry_count })),
+      stages: stages.map((stage) => ({ ...stage, reentry_count: stage.stage_id === "planning" ? 3 : stage.reentry_count })),
       event: repair,
     });
     expect(exhausted.nextStatus).toBe("completion_pending_publication");
@@ -195,7 +195,7 @@ describe("pipeline coordinator", () => {
   });
 
   it("persists a complete immutable request for a repair attempt", () => {
-    const { pipelines, instance, attempt } = setup("ce/implement@1");
+    const { pipelines, instance, attempt } = setup("ce/implement@2");
     const repaired = coordinatePipelineEvent(
       pipelines,
       event(instance, attempt, "semantic_repair_required", "repair-request")
@@ -204,7 +204,7 @@ describe("pipeline coordinator", () => {
     const request = pipelines.getStageRequest(next.id);
     expect(request).toMatchObject({
       pipelineInstanceId: instance.id,
-      stageId: "implement",
+      stageId: "planning",
       attemptId: next.id,
       runId: next.planned_run_id,
       requestHash: next.request_hash,
@@ -221,13 +221,13 @@ describe("pipeline coordinator", () => {
   });
 
   it("cannot enter provider wait until the publishing stage establishes an exact subject", () => {
-    const { manifest, instance, attempt, stages } = setup("ce/implement@1");
+    const { manifest, instance, attempt, stages } = setup("ce/implement@2");
     const publishAttempt = {
       ...attempt,
       id: "publish-attempt",
       stage_id: "publish",
       request_hash: "f".repeat(64),
-      native_context_policy: "none",
+      native_context_policy: "resume_required",
     };
     const payload = JSON.stringify({ outcome: "success" });
     const publishPayload = JSON.stringify({ published: true });
@@ -249,14 +249,14 @@ describe("pipeline coordinator", () => {
           {
             kind: "stage_result",
             schemaVersion: 1,
-            assurance: "executor_verified",
+            assurance: "semantic_attested",
             payload,
             hash: digestNormalized(payload),
           },
           {
             kind: "publish_subject",
             schemaVersion: 1,
-            assurance: "executor_verified",
+            assurance: "semantic_attested",
             payload: publishPayload,
             hash: digestNormalized(publishPayload),
           },
@@ -266,7 +266,7 @@ describe("pipeline coordinator", () => {
   });
 
   it("turns a current-head provider snapshot into a bounded typed repair re-entry", () => {
-    const { manifest, instance, attempt, stages } = setup("ce/implement@1");
+    const { manifest, instance, attempt, stages } = setup("ce/implement@2");
     const providerAttempt = {
       ...attempt,
       id: "provider-attempt",
@@ -317,7 +317,7 @@ describe("pipeline coordinator", () => {
         ],
       },
     });
-    expect(write.nextStageId).toBe("implement");
+    expect(write.nextStageId).toBe("implementation");
     expect(write.nextStatus).toBe("dispatchable");
     expect(write.reentryIncrement).toBe(1);
   });

@@ -32,6 +32,23 @@ setup() {
   [ "$status" -ne 0 ]
 }
 
+@test "sealed stage push policy blocks fresh review and fails closed" {
+  policy="${BATS_TEST_TMPDIR}/stage-push-policy"
+  printf '%s\n' fresh_review > "$policy"
+  run "${BATS_TEST_DIRNAME}/../safety/enforce-stage-push-policy" "$policy"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"pushes are forbidden during a fresh-review stage"* ]]
+
+  printf '%s\n' prefer_resume > "$policy"
+  run "${BATS_TEST_DIRNAME}/../safety/enforce-stage-push-policy" "$policy"
+  [ "$status" -eq 0 ]
+
+  printf '%s\n' attacker_selected > "$policy"
+  run "${BATS_TEST_DIRNAME}/../safety/enforce-stage-push-policy" "$policy"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"absent or invalid"* ]]
+}
+
 @test "resolve_git_identity uses GitHub noreply, then a placeholder" {
   run resolve_git_identity "knoxgraeme" "42"
   [ "$output" = $'knoxgraeme\t42+knoxgraeme@users.noreply.github.com' ]

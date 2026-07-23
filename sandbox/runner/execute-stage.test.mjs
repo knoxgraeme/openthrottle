@@ -1,9 +1,19 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { canonicalJson } from "./capabilities.mjs";
+import { RUNTIME_DESCRIPTOR, canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
 import {
   computeWorkspaceTreeOid,
@@ -12,6 +22,7 @@ import {
   extractNativeSessionId,
   resolveContextInvocation,
   runCapturedProcess,
+  runWithAgentProcessFence,
   runtimeCapabilityDigest,
   stagePrompt,
   validateStageRequest,
@@ -64,7 +75,7 @@ function fixture({
     protocol: "stage-executor@1",
     pipelineInstanceId: "pipeline-1",
     manifestDigest: digest(manifestRaw),
-    runtimeRelease: "openthrottle-snapshot/v1",
+    runtimeRelease: RUNTIME_DESCRIPTOR.release,
     capabilityDigest: runtimeCapabilityDigest(),
     repositoryConfigDigest: digest(configRaw),
     stageId: stage.id,
@@ -105,6 +116,36 @@ function successProposal() {
     actions: [],
     uncertainty: [],
   };
+}
+
+function publishFixture() {
+  return fixture({
+    capability: "ce/publish@1",
+    contextPolicy: "prefer_resume",
+    requiredArtifacts: ["stage_result", "publish_subject"],
+    credentialScopes: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+    liveSteering: false,
+  });
+}
+
+function addBareOrigin(input, { push = false } = {}) {
+  const remote = mkdtempSync(join(tmpdir(), "ot-stage-remote-"));
+  directories.push(remote);
+  execFileSync("git", ["init", "--bare", "-q"], { cwd: remote });
+  execFileSync("git", ["remote", "add", "origin", remote], { cwd: input.repoDir });
+  if (push) {
+    execFileSync("git", ["push", "-q", "origin", `HEAD:refs/heads/${input.request.branch}`], {
+      cwd: input.repoDir,
+    });
+  }
+  return remote;
+}
+
+function repositoryRefs(repoDir) {
+  return execFileSync("git", ["for-each-ref", "--format=%(refname) %(objectname)"], {
+    cwd: repoDir,
+    encoding: "utf8",
+  });
 }
 
 function clock() {
@@ -217,6 +258,126 @@ describe("one-stage executor", () => {
     expect(existsSync(join(input.repoDir, "review-output.txt"))).toBe(false);
   });
 
+  it("restores fresh-review HEAD, symbolic ref, real index, and tree after a commit then throw", () => {
+    const input = fixture({ contextPolicy: "fresh_review", liveSteering: false, requiredArtifacts: ["stage_result", "review"] });
+    const beforeHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: input.repoDir, encoding: "utf8" }).trim();
+    const beforeRef = execFileSync("git", ["symbolic-ref", "HEAD"], { cwd: input.repoDir, encoding: "utf8" }).trim();
+    const indexPath = join(input.repoDir, ".git", "index");
+    const beforeIndex = readFileSync(indexPath);
+    const result = executeStage({
+      ...input,
+      now: clock(),
+      runAgent: ({ repoDir }) => {
+        writeFileSync(join(repoDir, "file.txt"), "mutated before invalid proposal\n");
+        writeFileSync(join(repoDir, "invalid-review-output.txt"), "must be rolled back\n");
+        execFileSync("git", ["add", "-A"], { cwd: repoDir });
+        execFileSync("git", ["commit", "-qm", "review must not commit"], { cwd: repoDir });
+        throw new Error("invalid stage proposal JSON");
+      },
+    });
+
+    expect(result.outcome).toBe("semantic_repair_required");
+    const payload = JSON.parse(result.artifacts[0].payload);
+    expect(payload.findings[0].code).toBe("review-mutated-workspace");
+    expect(computeWorkspaceTreeOid(input.repoDir)).toBe(payload.repository.pre_subject);
+    expect(readFileSync(join(input.repoDir, "file.txt"), "utf8")).toBe("initial\n");
+    expect(existsSync(join(input.repoDir, "invalid-review-output.txt"))).toBe(false);
+    expect(execFileSync("git", ["rev-parse", "HEAD"], { cwd: input.repoDir, encoding: "utf8" }).trim()).toBe(beforeHead);
+    expect(execFileSync("git", ["symbolic-ref", "HEAD"], { cwd: input.repoDir, encoding: "utf8" }).trim()).toBe(beforeRef);
+    expect(readFileSync(indexPath).equals(beforeIndex)).toBe(true);
+  });
+
+  it.each(["HEAD", "index"])(
+    "never follows a fresh-review %s symlink substitution into an external target",
+    (controlName) => {
+      const input = fixture({ contextPolicy: "fresh_review", liveSteering: false, requiredArtifacts: ["stage_result", "review"] });
+      const controlPath = join(input.repoDir, ".git", controlName);
+      const beforeControl = readFileSync(controlPath);
+      const external = mkdtempSync(join(tmpdir(), "ot-stage-external-control-"));
+      directories.push(external);
+      const externalTarget = join(external, "sentinel");
+      writeFileSync(externalTarget, "external target must remain untouched\n");
+
+      let result;
+      let failure;
+      try {
+        result = executeStage({
+          ...input,
+          now: clock(),
+          runAgent: () => {
+            unlinkSync(controlPath);
+            symlinkSync(externalTarget, controlPath);
+            return { exitCode: 0, proposal: successProposal(), nativeSessionId: "review-session" };
+          },
+        });
+      } catch (error) {
+        failure = error;
+      }
+
+      expect(readFileSync(externalTarget, "utf8")).toBe("external target must remain untouched\n");
+      expect(result ?? failure).toBeDefined();
+      if (result) {
+        expect(result.outcome).not.toBe("success");
+        if (existsSync(controlPath) && !lstatSync(controlPath).isSymbolicLink()) {
+          expect(readFileSync(controlPath).equals(beforeControl)).toBe(true);
+        }
+      }
+    },
+  );
+
+  it("detects branch/tag-only fresh-review mutations and restores the exact ref namespace", () => {
+    const input = fixture({ contextPolicy: "fresh_review", liveSteering: false, requiredArtifacts: ["stage_result", "review"] });
+    const initialHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: input.repoDir, encoding: "utf8" }).trim();
+    const initialTree = execFileSync("git", ["rev-parse", "HEAD^{tree}"], { cwd: input.repoDir, encoding: "utf8" }).trim();
+    const alternateCommit = execFileSync("git", ["commit-tree", initialTree, "-m", "alternate ref target"], {
+      cwd: input.repoDir,
+      encoding: "utf8",
+    }).trim();
+    execFileSync("git", ["update-ref", "refs/heads/side", initialHead], { cwd: input.repoDir });
+    execFileSync("git", ["update-ref", "refs/tags/stable", initialHead], { cwd: input.repoDir });
+    const beforeRefs = repositoryRefs(input.repoDir);
+
+    const result = executeStage({
+      ...input,
+      now: clock(),
+      runAgent: ({ repoDir }) => {
+        execFileSync("git", ["update-ref", "refs/heads/side", alternateCommit], { cwd: repoDir });
+        execFileSync("git", ["update-ref", "-d", "refs/tags/stable"], { cwd: repoDir });
+        execFileSync("git", ["update-ref", "refs/tags/intruder", alternateCommit], { cwd: repoDir });
+        return { exitCode: 0, proposal: successProposal(), nativeSessionId: "review-session" };
+      },
+    });
+
+    expect(result.outcome).toBe("semantic_repair_required");
+    expect(JSON.parse(result.artifacts[0].payload).findings[0].code).toBe("review-mutated-workspace");
+    expect(repositoryRefs(input.repoDir)).toBe(beforeRefs);
+    expect(execFileSync("git", ["rev-parse", "HEAD"], { cwd: input.repoDir, encoding: "utf8" }).trim()).toBe(initialHead);
+  });
+
+  it("detects and removes fresh-review merge and sequencer state", () => {
+    const input = fixture({ contextPolicy: "fresh_review", liveSteering: false, requiredArtifacts: ["stage_result", "review"] });
+    const gitDir = join(input.repoDir, ".git");
+    const mergeHead = join(gitDir, "MERGE_HEAD");
+    const sequencer = join(gitDir, "sequencer");
+    const initialHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: input.repoDir, encoding: "utf8" }).trim();
+
+    const result = executeStage({
+      ...input,
+      now: clock(),
+      runAgent: () => {
+        writeFileSync(mergeHead, `${initialHead}\n`);
+        mkdirSync(sequencer);
+        writeFileSync(join(sequencer, "todo"), `pick ${initialHead} review-state\n`);
+        return { exitCode: 0, proposal: successProposal(), nativeSessionId: "review-session" };
+      },
+    });
+
+    expect(result.outcome).toBe("semantic_repair_required");
+    expect(JSON.parse(result.artifacts[0].payload).findings[0].code).toBe("review-mutated-workspace");
+    expect(existsSync(mergeHead)).toBe(false);
+    expect(existsSync(sequencer)).toBe(false);
+  });
+
   it("streams agent output beyond the old spawn buffer while retaining bounded diagnostics", () => {
     const result = runCapturedProcess(process.execPath, [
       "-e",
@@ -243,6 +404,34 @@ describe("one-stage executor", () => {
     expect(result.stderr).toContain("output bytes omitted");
     expect(result.stderr).toContain("stderr-tail");
     expect(Buffer.byteLength(result.stderr)).toBeLessThan(2.1 * 1024 * 1024);
+  });
+
+  it("escalates a timed-out process that ignores SIGTERM", () => {
+    const startedAt = Date.now();
+    const result = runCapturedProcess(process.execPath, [
+      "-e",
+      'process.on("SIGTERM", () => {}); setInterval(() => {}, 1_000)',
+    ], { timeout: 50, killAfterMs: 50 });
+
+    expect(result.timedOut).toBe(true);
+    expect(result.error?.code).toBe("ETIMEDOUT");
+    expect(result.signal).toBe("SIGKILL");
+    expect(Date.now() - startedAt).toBeLessThan(3_000);
+  });
+
+  it("terminates agent descendants before repository observation can continue", () => {
+    const events = [];
+    const result = runWithAgentProcessFence(
+      () => {
+        events.push("agent-returned");
+        return "execution";
+      },
+      () => events.push("descendants-terminated"),
+    );
+    events.push("repository-observed");
+
+    expect(result).toBe("execution");
+    expect(events).toEqual(["agent-returned", "descendants-terminated", "repository-observed"]);
   });
 
   it("treats exit zero without a proposal as a non-recoverable failure", () => {
@@ -325,20 +514,8 @@ describe("one-stage executor", () => {
   });
 
   it("seals the exact pushed commit after publication reconciles its tree", () => {
-    const input = fixture({
-      capability: "ce/publish@1",
-      contextPolicy: "prefer_resume",
-      requiredArtifacts: ["stage_result", "publish_subject"],
-      credentialScopes: ["model.invoke", "provider.read", "repo.read", "repo.write"],
-      liveSteering: false,
-    });
-    const remote = mkdtempSync(join(tmpdir(), "ot-stage-remote-"));
-    directories.push(remote);
-    execFileSync("git", ["init", "--bare", "-q"], { cwd: remote });
-    execFileSync("git", ["remote", "add", "origin", remote], { cwd: input.repoDir });
-    execFileSync("git", ["push", "-q", "origin", `HEAD:refs/heads/${input.request.branch}`], {
-      cwd: input.repoDir,
-    });
+    const input = publishFixture();
+    addBareOrigin(input, { push: true });
 
     const result = executeStage({
       ...input,
@@ -350,6 +527,227 @@ describe("one-stage executor", () => {
 
     expect(result.outcome).toBe("success");
     expect(JSON.parse(publish.payload).details.published_commit).toBe(head);
+  });
+
+  it("makes a malformed publish-success proposal retryable even when the exact branch exists", () => {
+    const input = publishFixture();
+    addBareOrigin(input, { push: true });
+
+    const result = executeStage({
+      ...input,
+      runAgent: () => ({
+        exitCode: 0,
+        proposal: { ...successProposal(), findings: "not-an-array" },
+        nativeSessionId: "publish-session",
+      }),
+      now: clock(),
+    });
+    const payload = JSON.parse(result.artifacts[0].payload);
+
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+    expect(payload.findings).toContainEqual(expect.objectContaining({
+      severity: "P2",
+      code: "publish-reconciliation-incomplete",
+    }));
+  });
+
+  it("retains blocking findings from a valid publish-success proposal", () => {
+    const input = publishFixture();
+    addBareOrigin(input, { push: true });
+    const blockingFinding = {
+      severity: "P1",
+      code: "publish-pr-evidence-gap",
+      summary: "The pull request evidence needs follow-up.",
+    };
+
+    const result = executeStage({
+      ...input,
+      runAgent: () => ({
+        exitCode: 0,
+        proposal: { ...successProposal(), findings: [blockingFinding] },
+        nativeSessionId: "publish-session",
+      }),
+      now: clock(),
+    });
+    const payload = JSON.parse(result.artifacts[0].payload);
+
+    expect(result.outcome).toBe("success");
+    expect(payload.findings).toContainEqual(blockingFinding);
+  });
+
+  it("requires semantic repair when publish reports success without a matching remote subject", () => {
+    const input = publishFixture();
+    addBareOrigin(input);
+
+    const result = executeStage({
+      ...input,
+      runAgent: () => ({ exitCode: 0, proposal: successProposal(), nativeSessionId: "publish-session" }),
+      now: clock(),
+    });
+    const payload = JSON.parse(result.artifacts[0].payload);
+
+    expect(result.outcome).toBe("semantic_repair_required");
+    expect(payload.findings).toContainEqual(expect.objectContaining({
+      severity: "P1",
+      code: "publish-subject-mismatch",
+    }));
+  });
+
+  it("makes an uncertain remote inspection retryable with advisory diagnostics", () => {
+    const input = publishFixture();
+    const remoteParent = mkdtempSync(join(tmpdir(), "ot-stage-missing-remote-"));
+    directories.push(remoteParent);
+    const missingRemote = join(remoteParent, "not-present.git");
+    execFileSync("git", ["remote", "add", "origin", missingRemote], { cwd: input.repoDir });
+
+    const result = executeStage({
+      ...input,
+      runAgent: () => ({ exitCode: 0, proposal: successProposal(), nativeSessionId: "publish-session" }),
+      now: clock(),
+    });
+    const payload = JSON.parse(result.artifacts[0].payload);
+
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+    expect(payload.findings).toContainEqual(expect.objectContaining({
+      severity: "P2",
+      code: "publish-reconciliation-uncertain",
+    }));
+  });
+
+  it("retries publication when the exact branch push succeeds before terminal PR evidence", () => {
+    const input = publishFixture();
+    const remote = addBareOrigin(input);
+
+    const result = executeStage({
+      ...input,
+      runAgent: ({ repoDir, request }) => {
+        execFileSync("git", ["push", "-q", "origin", `HEAD:refs/heads/${request.branch}`], { cwd: repoDir });
+        throw new Error("transport ended after the remote accepted the push");
+      },
+      now: clock(),
+    });
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: input.repoDir, encoding: "utf8" }).trim();
+    const remoteHead = execFileSync("git", ["rev-parse", `refs/heads/${input.request.branch}`], {
+      cwd: remote,
+      encoding: "utf8",
+    }).trim();
+
+    expect(remoteHead).toBe(head);
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+    expect(JSON.parse(result.artifacts[0].payload).findings[0]).toMatchObject({
+      severity: "P2",
+      code: "publish-reconciliation-incomplete",
+    });
+  });
+
+  it("makes an unconfirmed failed publication retryable", () => {
+    const input = publishFixture();
+    addBareOrigin(input);
+
+    const result = executeStage({
+      ...input,
+      runAgent: () => {
+        throw new Error("transport failed before push");
+      },
+      now: clock(),
+    });
+
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+    expect(JSON.parse(result.artifacts[0].payload).findings[0]).toMatchObject({
+      severity: "P2",
+      code: "publish-reconciliation-incomplete",
+    });
+  });
+
+  it("retries publication when a valid failure follows an exact branch push", () => {
+    const input = publishFixture();
+    addBareOrigin(input, { push: true });
+
+    const result = executeStage({
+      ...input,
+      runAgent: () => ({
+        exitCode: 0,
+        proposal: { ...successProposal(), suggested_outcome: "failure", summary: "PR creation failed" },
+        nativeSessionId: "publish-session",
+      }),
+      now: clock(),
+    });
+
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+    expect(JSON.parse(result.artifacts[0].payload).findings[0]).toMatchObject({
+      severity: "P2",
+      code: "publish-reconciliation-incomplete",
+    });
+  });
+
+  it("retries publication when a timed-out publisher left an exact branch push", () => {
+    const input = publishFixture();
+    addBareOrigin(input, { push: true });
+
+    const result = executeStage({
+      ...input,
+      runAgent: () => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: true,
+        proposal: successProposal(),
+        nativeSessionId: "publish-session",
+      }),
+      now: clock(),
+    });
+
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+    expect(JSON.parse(result.artifacts[0].payload).findings[0]).toMatchObject({
+      severity: "P2",
+      code: "publish-reconciliation-incomplete",
+    });
+  });
+
+  it("classifies agent runner and cleanup exceptions as retryable infrastructure failures", () => {
+    const input = fixture();
+    const result = executeStage({
+      ...input,
+      runAgent: () => {
+        throw new Error("agent cleanup failed");
+      },
+      now: clock(),
+    });
+
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+    expect(JSON.parse(result.artifacts[0].payload).summary).toMatch(/agent cleanup failed/);
+  });
+
+  it("rejects a valid proposal when agent execution exceeded its timeout", () => {
+    const input = fixture();
+    const result = executeStage({
+      ...input,
+      runAgent: () => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: true,
+        proposal: successProposal(),
+        nativeSessionId: "native-1",
+      }),
+      now: clock(),
+    });
+
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+    expect(JSON.parse(result.artifacts[0].payload).summary).toMatch(/timed_out=true/);
+  });
+
+  it("preserves a valid publish needs-human proposal without remote reconciliation", () => {
+    const input = publishFixture();
+    const result = executeStage({
+      ...input,
+      runAgent: () => ({
+        exitCode: 0,
+        proposal: { ...successProposal(), suggested_outcome: "needs_human", summary: "PR target needs a decision" },
+      }),
+      now: clock(),
+    });
+
+    expect(result.outcome).toBe("needs_human");
+    expect(JSON.parse(result.artifacts[0].payload).summary).toBe("PR target needs a decision");
   });
 
   it("computes subjects from a private index and excludes ignored generated files", () => {

@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,10 +14,46 @@ import {
   type ValidatedPipelineCatalog,
 } from "./pipeline-manifest.js";
 import { createPipelineStore } from "./pipeline-store.js";
-import { buildInstalledRuntimeDescriptor } from "./sandbox-runtime.js";
+import { buildInstalledRuntimeDescriptor, loadRuntimeCapabilityDescriptor } from "./sandbox-runtime.js";
 
 const catalogPath = fileURLToPath(new URL("../pipelines/catalog.yaml", import.meta.url));
+const runtimeDescriptorPath = fileURLToPath(new URL("../pipelines/runtime-capabilities-v1.json", import.meta.url));
+const retiredHistoryPath = fileURLToPath(new URL("./__fixtures__/retired-pipeline-history-v1.json", import.meta.url));
 const runtime = buildInstalledRuntimeDescriptor("test-runtime/v1");
+
+function seedRetiredPipelineHistory(database: Database.Database) {
+  const fixture = JSON.parse(readFileSync(retiredHistoryPath, "utf8")) as {
+    runtime: { release: string; protocol: string };
+    aliases: Record<string, { id: string; version: number }>;
+    manifests: Array<{ id: string; version: number }>;
+  };
+  const runtimeNormalized = canonicalJson(fixture.runtime);
+  const historicalRuntime = { normalized: runtimeNormalized, digest: digestNormalized(runtimeNormalized) };
+  database.prepare(`
+    INSERT INTO runtime_capability_descriptors (
+      runtime_release, digest, protocol, normalized_descriptor, accepted_at
+    ) VALUES (?, ?, ?, ?, ?)
+  `).run(fixture.runtime.release, historicalRuntime.digest, fixture.runtime.protocol, runtimeNormalized, "2026-07-21T00:00:00.000Z");
+  const manifests = new Map<string, { digest: string }>();
+  for (const manifest of fixture.manifests) {
+    const normalized = canonicalJson(manifest);
+    const digest = digestNormalized(normalized);
+    database.prepare(`
+      INSERT INTO pipeline_catalog_entries (
+        pipeline_id, version, digest, normalized_manifest, accepted_at
+      ) VALUES (?, ?, ?, ?, ?)
+    `).run(manifest.id, manifest.version, digest, normalized, "2026-07-21T00:00:00.000Z");
+    manifests.set(`${manifest.id}@${manifest.version}`, { digest });
+  }
+  for (const [alias, reference] of Object.entries(fixture.aliases)) {
+    const manifest = manifests.get(`${reference.id}@${reference.version}`)!;
+    database.prepare(`
+      INSERT INTO pipeline_catalog_aliases(alias, pipeline_id, version, digest, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(alias, reference.id, reference.version, manifest.digest, "2026-07-21T00:00:00.000Z");
+  }
+  return { runtime: historicalRuntime, manifests };
+}
 
 describe("pipeline store", () => {
   let db: Database.Database | undefined;
@@ -66,7 +102,7 @@ describe("pipeline store", () => {
     tickets.upsertUnpinned(ticket("unpinned-session"));
     expect(db!.prepare("SELECT execution_mode FROM session_executions WHERE linear_session_id = ?").pluck().get("unpinned-session")).toBeUndefined();
 
-    const manifest = catalog.manifests.get("ce/implement@1")!;
+    const manifest = catalog.manifests.get("ce/implement@2")!;
     const input = {
       ...ticket("pipeline-session"),
       pipeline: {
@@ -87,7 +123,7 @@ describe("pipeline store", () => {
     expect(instance.status).toBe("dispatchable");
     expect(instance.attempt_count).toBe(1);
     const attempt = pipelines.getActiveAttempt(instance.id)!;
-    expect(attempt.stage_id).toBe("implement");
+    expect(attempt.stage_id).toBe("planning");
     const request = pipelines.getStageRequest(attempt.id);
     expect(request).toMatchObject({
       pipelineInstanceId: instance.id,
@@ -106,7 +142,7 @@ describe("pipeline store", () => {
 
   it("rolls ticket/session/instance state back together when pinning fails", () => {
     const { tickets, catalog, snapshot } = setup();
-    const manifest = catalog.manifests.get("ce/implement@1")!;
+    const manifest = catalog.manifests.get("ce/implement@2")!;
     expect(() => tickets.upsert({
       ...ticket("broken-session"),
       pipeline: {
@@ -406,6 +442,52 @@ describe("pipeline store", () => {
     expect(recovered.getActiveAttempt(after.id)?.request_hash).toHaveLength(64);
     expect(recovered.listEffects(after.id).map((effect) => [effect.kind, effect.status])).toEqual([
       ["provision", "pending"],
+    ]);
+  });
+
+  it("upgrades the current catalog and runtime without rewriting accepted v1 history", () => {
+    const directory = mkdtempSync(join(tmpdir(), "openthrottle-pipeline-upgrade-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "supervisor.db");
+    const changedV1Runtime = buildInstalledRuntimeDescriptor("openthrottle-snapshot/v1");
+
+    db = openDb(path);
+    const historical = seedRetiredPipelineHistory(db);
+    db.close();
+
+    db = openDb(path);
+    const recovered = createPipelineStore(db);
+    expect(changedV1Runtime.digest).not.toBe(historical.runtime.digest);
+    expect(() => recovered.acceptRuntimeDescriptor(changedV1Runtime))
+      .toThrow(/runtime release openthrottle-snapshot\/v1 was already accepted with a different digest/);
+
+    const shippedRuntime = loadRuntimeCapabilityDescriptor(runtimeDescriptorPath, "openthrottle-snapshot/v2");
+    const shippedCatalog = loadPipelineCatalog(catalogPath, shippedRuntime.descriptor);
+    recovered.acceptRuntimeDescriptor(shippedRuntime);
+    recovered.acceptCatalog(shippedCatalog);
+
+    expect(db.prepare(`
+      SELECT runtime_release, digest FROM runtime_capability_descriptors ORDER BY runtime_release
+    `).all()).toEqual([
+      { runtime_release: "openthrottle-snapshot/v1", digest: historical.runtime.digest },
+      { runtime_release: "openthrottle-snapshot/v2", digest: shippedRuntime.digest },
+    ]);
+    expect(db.prepare(`
+      SELECT pipeline_id, version, digest FROM pipeline_catalog_entries
+      WHERE pipeline_id IN ('ce/implement', 'ce/investigate')
+      ORDER BY pipeline_id, version
+    `).all()).toEqual([
+      { pipeline_id: "ce/implement", version: 1, digest: historical.manifests.get("ce/implement@1")!.digest },
+      { pipeline_id: "ce/implement", version: 2, digest: shippedCatalog.manifests.get("ce/implement@2")!.digest },
+      { pipeline_id: "ce/investigate", version: 1, digest: historical.manifests.get("ce/investigate@1")!.digest },
+      { pipeline_id: "ce/investigate", version: 2, digest: shippedCatalog.manifests.get("ce/investigate@2")!.digest },
+    ]);
+    expect(db.prepare(`
+      SELECT alias, version FROM pipeline_catalog_aliases
+      WHERE alias IN ('implement', 'investigate') ORDER BY alias
+    `).all()).toEqual([
+      { alias: "implement", version: 2 },
+      { alias: "investigate", version: 2 },
     ]);
   });
 

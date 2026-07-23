@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# The installed hook calls this without arguments, so authorization always
+# comes from the root-owned policy written from the validated sealed request.
+# A positional path exists only to let the shell suite exercise this helper.
+policy_file="${1:-/run/openthrottle/stage-push-policy}"
+if [[ $# -eq 0 ]]; then
+  if [[ ! -f "$policy_file" || "$(stat -c '%u:%a' "$policy_file" 2>/dev/null || true)" != "0:444" ]]; then
+    echo "BLOCKED: sealed stage push policy is missing or mutable." >&2
+    exit 1
+  fi
+elif [[ $# -ne 1 ]]; then
+  echo "BLOCKED: invalid stage push policy invocation." >&2
+  exit 1
+fi
+
+context_policy="$(tr -d '\r\n' < "$policy_file" 2>/dev/null || true)"
+case "$context_policy" in
+  fresh_review)
+    echo "BLOCKED: pushes are forbidden during a fresh-review stage." >&2
+    exit 1
+    ;;
+  fresh|none|prefer_resume|resume_required)
+    exit 0
+    ;;
+  *)
+    echo "BLOCKED: sealed stage push policy is absent or invalid." >&2
+    exit 1
+    ;;
+esac

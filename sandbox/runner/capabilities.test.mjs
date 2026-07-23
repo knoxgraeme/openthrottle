@@ -12,6 +12,8 @@ describe("installed stage capabilities", () => {
     expect(RUNTIME_DESCRIPTOR.protocol).toBe("stage-executor@1");
     expect(RUNTIME_DESCRIPTOR.capabilities).toEqual([...RUNTIME_DESCRIPTOR.capabilities].sort());
     expect(canonicalJson(RUNTIME_DESCRIPTOR)).not.toContain("ce-implement-v1.yaml");
+    expect(RUNTIME_DESCRIPTOR.capabilities).not.toContain("repository/publish@1");
+    expect(RUNTIME_DESCRIPTOR.executors).not.toContain("publish");
     expect(capabilityContract("command/run@1").kind).toBe("command");
     const supervisorDescriptor = JSON.parse(readFileSync(
       new URL("../../supervisor/pipelines/runtime-capabilities-v1.json", import.meta.url),

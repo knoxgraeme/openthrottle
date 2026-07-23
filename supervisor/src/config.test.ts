@@ -59,7 +59,7 @@ describe("loadConfig", () => {
       githubReadToken: "github-read-token",
       kimiCodeApiKey: "kimi",
       sandboxEventPollIntervalMs: 5_000,
-      sandboxRuntimeRelease: "openthrottle-snapshot/v1",
+      sandboxRuntimeRelease: "openthrottle-snapshot/v2",
     });
   });
 

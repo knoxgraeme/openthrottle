@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 # safety/pre-push — installed via `git config core.hooksPath` by entrypoint.sh
-# (phase 3). Two independent checks, adapted from openthrottle v1
-# (git-hooks/pre-push):
+# (phase 3). Three independent checks:
 #
-#   1. Block any push whose remote ref is refs/heads/main or refs/heads/master.
-#   2. Refuse force / non-fast-forward pushes on any branch (history must
+#   1. Block every push from a sealed fresh-review stage.
+#   2. Block any push whose remote ref is refs/heads/main or refs/heads/master.
+#   3. Refuse force / non-fast-forward pushes on any branch (history must
 #      only move forward on agent branches — the pushed branch is the human
 #      escape hatch, so it must never silently lose commits).
 #
-# This is defense-in-depth: the primary control is GitHub branch protection
-# on the target repo (documented in sandbox/README.md), which this hook
-# cannot see or enforce on its own. core.hooksPath points at this directory,
-# and .git/config is sealed immutable right after this is installed, so the
-# agent cannot `git config --unset core.hooksPath` to bypass it.
+# The ref and fast-forward checks are defense-in-depth for GitHub branch
+# protection (documented in sandbox/README.md). The stage-policy check is the
+# local read-only boundary. core.hooksPath points at this root-owned directory,
+# and .git/config is sealed immutable after installation.
 
 set -euo pipefail
+
+"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/enforce-stage-push-policy"
 
 zero="0000000000000000000000000000000000000000"
 

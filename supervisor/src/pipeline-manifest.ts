@@ -43,7 +43,7 @@ export const ASSURANCE_CLASSES = [
 ] as const;
 export type AssuranceClass = (typeof ASSURANCE_CLASSES)[number];
 
-export const EXECUTOR_KINDS = ["agent", "command", "provider_wait", "publish"] as const;
+export const EXECUTOR_KINDS = ["agent", "command", "provider_wait"] as const;
 export type ExecutorKind = (typeof EXECUTOR_KINDS)[number];
 export const EVALUATOR_KINDS = [
   "result",

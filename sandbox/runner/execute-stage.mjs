@@ -3,19 +3,12 @@
 import { randomUUID } from "node:crypto";
 import {
   chmodSync,
-  closeSync,
   existsSync,
-  fstatSync,
-  mkdtempSync,
-  openSync,
   readFileSync,
-  readSync,
-  rmSync,
   writeFileSync,
   mkdirSync,
   renameSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
@@ -30,7 +23,20 @@ import {
   buildSemanticArtifacts,
   digest,
   sanitizeArtifactText,
+  validateSemanticProposal,
 } from "./artifacts.mjs";
+import {
+  captureRepositoryControl,
+  computeWorkspaceTreeOid,
+  computeWorkspaceTreeOidFromTree,
+  repositoryControlMatches,
+  restoreReadOnlyRepository,
+  runGitAsRepositoryOwner,
+} from "./repository-control.mjs";
+import { runCapturedProcess } from "./bounded-process.mjs";
+
+export { computeWorkspaceTreeOid } from "./repository-control.mjs";
+export { runCapturedProcess } from "./bounded-process.mjs";
 
 const REQUEST_KEYS = new Set([
   "protocol", "pipelineInstanceId", "manifestDigest", "runtimeRelease",
@@ -52,6 +58,7 @@ const CONTEXT_POLICIES = new Set([
   "none", "fresh", "resume_required", "prefer_resume", "fresh_review",
 ]);
 const COMMAND_NAMES = new Set(["test", "lint", "build", "format"]);
+const REMOTE_GIT_TIMEOUT_MS = 15_000;
 
 function record(value, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -190,57 +197,6 @@ export function validateSealedInputs({ request, configRaw, manifestRaw }) {
   return { config, manifest, stage };
 }
 
-function runGit(repoDir, args, env = {}) {
-  const result = spawnSync("git", ["-c", `safe.directory=${repoDir}`, ...args], {
-    cwd: repoDir,
-    env: { ...process.env, ...env },
-    encoding: "utf8",
-    maxBuffer: 8 * 1024 * 1024,
-  });
-  if (result.status !== 0) {
-    throw new Error(`git ${args.join(" ")} failed: ${sanitizeArtifactText(result.stderr).slice(-1_000)}`);
-  }
-  return result.stdout.trim();
-}
-
-// Canonical workspace subject: tracked files plus non-ignored untracked files,
-// with Git's native blob/tree hashing and executable/symlink modes. A private
-// temporary index is rebuilt from HEAD, so the agent-controlled index is never
-// consulted or mutated. Ignored/generated files are excluded by Git's sealed
-// repository rules; .git itself and ~/.ot are outside the tree.
-export function computeWorkspaceTreeOid(repoDir) {
-  const temporary = mkdtempSync(join(tmpdir(), "ot-stage-index-"));
-  const indexPath = join(temporary, "index");
-  try {
-    const env = { GIT_INDEX_FILE: indexPath };
-    runGit(repoDir, ["read-tree", "HEAD"], env);
-    runGit(repoDir, ["add", "-A", "--", "."], env);
-    return string(runGit(repoDir, ["write-tree"], env), "workspace tree", COMMIT);
-  } finally {
-    rmSync(temporary, { recursive: true, force: true });
-  }
-}
-
-function restoreWorkspaceTreeOid(repoDir, postSubject, preSubject) {
-  const temporary = mkdtempSync(join(tmpdir(), "ot-stage-restore-"));
-  const indexPath = join(temporary, "index");
-  try {
-    const env = { GIT_INDEX_FILE: indexPath };
-    // Model the agent's observed tree in an executor-owned index, then let Git
-    // apply the exact inverse tree transition to the worktree. Ignored files
-    // remain untouched because they are absent from both canonical subjects.
-    runGit(repoDir, ["read-tree", postSubject], env);
-    runGit(repoDir, ["read-tree", "--reset", "-u", preSubject], env);
-    const restoredSubject = computeWorkspaceTreeOid(repoDir);
-    if (restoredSubject !== preSubject) {
-      throw new Error("fresh-review workspace restoration did not recover the fenced subject");
-    }
-    return restoredSubject;
-  } finally {
-    rmSync(temporary, { recursive: true, force: true });
-  }
-}
-
 export function resolveContextInvocation(request) {
   if (request.contextPolicy === "none") return { mode: "none", nativeSessionId: null, reconstructed: false, readOnly: false };
   if (request.contextPolicy === "fresh") return { mode: "fresh", nativeSessionId: null, reconstructed: false, readOnly: false };
@@ -256,78 +212,42 @@ export function resolveContextInvocation(request) {
 
 function defaultExecuteCommand({ command, repoDir, timeoutMs }) {
   if (!command) return { notConfigured: true, exitCode: null, signal: null, timedOut: false, stdout: "", stderr: "" };
-  const result = spawnSync("gosu", ["agent", "env", "HOME=/home/agent", "USER=agent", "bash", "-lc", command], {
-    cwd: repoDir,
-    encoding: "utf8",
-    timeout: timeoutMs,
-    maxBuffer: 8 * 1024 * 1024,
-  });
+  const result = runWithAgentProcessFence(
+    () => runCapturedProcess("gosu", ["agent", "env", "HOME=/home/agent", "USER=agent", "bash", "-lc", command], {
+      cwd: repoDir,
+      timeout: timeoutMs,
+      captureBytes: 8 * 1024 * 1024,
+    }),
+  );
   return {
     exitCode: result.status,
     signal: result.signal,
-    timedOut: result.error?.code === "ETIMEDOUT",
+    timedOut: result.timedOut,
     stdout: result.stdout ?? "",
     stderr: result.stderr ?? result.error?.message ?? "",
   };
 }
 
-function readCapturedWindow(path, maxBytes = 2 * 1024 * 1024) {
-  const descriptor = openSync(path, "r");
-  try {
-    const size = fstatSync(descriptor).size;
-    if (size === 0) return "";
-    if (size <= maxBytes) {
-      const output = Buffer.alloc(size);
-      readSync(descriptor, output, 0, size, 0);
-      return output.toString("utf8");
-    }
-    const headSize = Math.floor(maxBytes / 2);
-    const tailSize = maxBytes - headSize;
-    const head = Buffer.alloc(headSize);
-    const tail = Buffer.alloc(tailSize);
-    readSync(descriptor, head, 0, headSize, 0);
-    readSync(descriptor, tail, 0, tailSize, size - tailSize);
-    return `${head.toString("utf8")}\n...[${size - maxBytes} output bytes omitted]...\n${tail.toString("utf8")}`;
-  } finally {
-    closeSync(descriptor);
+function terminateAgentProcesses() {
+  if (typeof process.getuid !== "function" || process.getuid() !== 0) return;
+  const result = spawnSync("pkill", ["-KILL", "-u", "agent"], {
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  if (result.error?.code === "ETIMEDOUT") throw new Error("agent process cleanup timed out");
+  // pkill exits 1 when the agent has no remaining processes, which is the
+  // expected steady state after a well-behaved CLI exits.
+  if (result.error || (result.status !== 0 && result.status !== 1)) {
+    throw new Error(`agent process cleanup failed: ${sanitizeArtifactText(result.stderr ?? result.error?.message ?? "").slice(-800)}`);
   }
 }
 
-export function runCapturedProcess(command, args, {
-  cwd,
-  env,
-  input,
-  timeout,
-  captureBytes = 2 * 1024 * 1024,
-} = {}) {
-  const captureDir = mkdtempSync(join(tmpdir(), "ot-stage-output-"));
-  const stdoutPath = join(captureDir, "stdout.log");
-  const stderrPath = join(captureDir, "stderr.log");
-  let stdoutDescriptor = openSync(stdoutPath, "w");
-  let stderrDescriptor = openSync(stderrPath, "w");
+export function runWithAgentProcessFence(execute, terminate = terminateAgentProcesses) {
   try {
-    const result = spawnSync(command, args, {
-      cwd,
-      env,
-      input,
-      timeout,
-      stdio: ["pipe", stdoutDescriptor, stderrDescriptor],
-    });
-    closeSync(stdoutDescriptor);
-    stdoutDescriptor = -1;
-    closeSync(stderrDescriptor);
-    stderrDescriptor = -1;
-    return {
-      status: result.status,
-      signal: result.signal,
-      error: result.error,
-      stdout: readCapturedWindow(stdoutPath, captureBytes),
-      stderr: readCapturedWindow(stderrPath, captureBytes),
-    };
+    return execute();
   } finally {
-    if (stdoutDescriptor !== -1) closeSync(stdoutDescriptor);
-    if (stderrDescriptor !== -1) closeSync(stderrDescriptor);
-    rmSync(captureDir, { recursive: true, force: true });
+    // executeStage cannot hash, restore, or publish until this wrapper returns.
+    terminate();
   }
 }
 
@@ -402,6 +322,7 @@ function defaultRunAgent({ request, invocation, repoDir, proposalPath, timeoutMs
       ...(model ? ["--model", model] : []),
       "--dangerously-skip-permissions",
       ...(mcpConfig ? ["--mcp-config", mcpConfig, "--strict-mcp-config"] : []),
+      "--plugin-dir", "/opt/openthrottle/compound-engineering-marketplace",
       "--setting-sources", "user",
     ];
     command = "claude";
@@ -422,11 +343,13 @@ function defaultRunAgent({ request, invocation, repoDir, proposalPath, timeoutMs
   } else {
     throw new Error(`unsupported agent adapter ${agent}`);
   }
-  const result = runCapturedProcess("gosu", ["agent", "env", ...env, command, ...args], {
-    cwd: repoDir,
-    input: stdin,
-    timeout: timeoutMs,
-  });
+  const result = runWithAgentProcessFence(
+    () => runCapturedProcess("gosu", ["agent", "env", ...env, command, ...args], {
+      cwd: repoDir,
+      input: stdin,
+      timeout: timeoutMs,
+    }),
+  );
   const authRead = agent === "codex"
     ? spawnSync("gosu", ["agent", "head", "-c", "262144", "/home/agent/.codex/auth.json"], {
         encoding: "utf8",
@@ -434,14 +357,22 @@ function defaultRunAgent({ request, invocation, repoDir, proposalPath, timeoutMs
         maxBuffer: 262_144,
       })
     : undefined;
+  const proposalRead = spawnSync("gosu", ["agent", "head", "-c", "1048577", proposalPath], {
+    encoding: "utf8",
+    timeout: 2_000,
+    maxBuffer: 1_048_577,
+  });
+  if (proposalRead.status === 0 && Buffer.byteLength(proposalRead.stdout) > 1_048_576) {
+    throw new Error("stage proposal exceeds the 1 MiB limit");
+  }
   return {
     exitCode: result.status,
     signal: result.signal,
-    timedOut: result.error?.code === "ETIMEDOUT",
+    timedOut: result.timedOut,
     stdout: result.stdout ?? "",
     stderr: result.stderr ?? result.error?.message ?? "",
     nativeSessionId: request.nativeSessionId ?? extractNativeSessionId(result.stdout, agent),
-    proposal: existsSync(proposalPath) ? JSON.parse(readFileSync(proposalPath, "utf8")) : undefined,
+    proposal: proposalRead.status === 0 ? JSON.parse(proposalRead.stdout) : undefined,
     authSnapshot: authRead?.status === 0 ? authRead.stdout : undefined,
   };
 }
@@ -456,6 +387,112 @@ function failureProposal(summary, suggestedOutcome = "retryable_infrastructure_f
     actions: [],
     uncertainty: ["The stage did not produce complete semantic evidence."],
   };
+}
+
+function reconcilePublication({ repoDir, request, gatedSubject, execution, proposal, redactionEnv }) {
+  const incompleteExecution = execution.executorFailure || execution.timedOut || execution.exitCode !== 0 || !proposal;
+  let normalizedProposal;
+  let terminalEvidenceError;
+  if (!incompleteExecution) {
+    try {
+      normalizedProposal = validateSemanticProposal(proposal, redactionEnv);
+    } catch (error) {
+      terminalEvidenceError = error;
+    }
+  }
+  const incompleteTerminalEvidence = incompleteExecution || Boolean(terminalEvidenceError);
+  const recoverablePublishFailure = !incompleteTerminalEvidence &&
+    ["failure", "retryable_infrastructure_failure"].includes(normalizedProposal.suggested_outcome);
+  if (!incompleteTerminalEvidence && normalizedProposal.suggested_outcome !== "success" && !recoverablePublishFailure) {
+    return { publishedCommit: undefined, proposal: normalizedProposal };
+  }
+  try {
+    const head = runGitAsRepositoryOwner(repoDir, ["rev-parse", "HEAD"]);
+    const headTree = runGitAsRepositoryOwner(repoDir, ["rev-parse", "HEAD^{tree}"]);
+    const remote = runGitAsRepositoryOwner(
+      repoDir,
+      ["ls-remote", "--heads", "origin", `refs/heads/${request.branch}`],
+      {},
+      { timeoutMs: REMOTE_GIT_TIMEOUT_MS },
+    );
+    const remoteHead = remote.split(/\s+/)[0] ?? "";
+    const exactBranch = headTree === gatedSubject && remoteHead === head;
+    if (!incompleteTerminalEvidence && !recoverablePublishFailure && exactBranch) {
+      return {
+        publishedCommit: head,
+        // Preserve the agent's validated terminal evidence. The executor-owned
+        // published commit is recorded separately in the sealed artifact.
+        proposal: normalizedProposal,
+      };
+    }
+    if (recoverablePublishFailure) {
+      if (!exactBranch) return { publishedCommit: undefined, proposal: normalizedProposal };
+      return {
+        publishedCommit: undefined,
+        proposal: {
+          ...failureProposal(
+            "The exact branch was pushed, but pull-request publication reported failure without durable terminal evidence.",
+            "retryable_infrastructure_failure",
+          ),
+          findings: [{
+            severity: "P2",
+            code: "publish-reconciliation-incomplete",
+            summary: "Publication requires a bounded retry to reconcile the branch and pull request.",
+          }],
+        },
+      };
+    }
+    if (incompleteTerminalEvidence) {
+      const malformed = terminalEvidenceError
+        ? ` Terminal evidence was malformed: ${sanitizeArtifactText(String(terminalEvidenceError), redactionEnv).slice(-500)}`
+        : "";
+      return {
+        publishedCommit: undefined,
+        proposal: {
+          ...failureProposal(
+            exactBranch
+              ? `The exact branch was pushed, but pull-request publication did not produce durable terminal evidence.${malformed}`
+              : `Publication did not yet reconcile the gated workspace tree to the remote branch head.${malformed}`,
+            "retryable_infrastructure_failure",
+          ),
+          findings: [{
+            severity: "P2",
+            code: "publish-reconciliation-incomplete",
+            summary: "Publication requires a bounded retry to reconcile the branch and pull request.",
+          }],
+        },
+      };
+    }
+    return {
+      publishedCommit: undefined,
+      proposal: {
+        ...failureProposal(
+          "Publication did not reconcile the gated workspace tree to the remote branch head.",
+          "semantic_repair_required",
+        ),
+        findings: [{
+          severity: "P1",
+          code: "publish-subject-mismatch",
+          summary: "The remote branch does not contain the exact gated publication subject.",
+        }],
+      },
+    };
+  } catch (error) {
+    return {
+      publishedCommit: undefined,
+      proposal: {
+        ...failureProposal(
+          `Publication reconciliation was uncertain: ${sanitizeArtifactText(String(error), redactionEnv).slice(-800)}`,
+          "retryable_infrastructure_failure",
+        ),
+        findings: [{
+          severity: "P2",
+          code: "publish-reconciliation-uncertain",
+          summary: "The executor could not verify the remote publication subject.",
+        }],
+      },
+    };
+  }
 }
 
 export function executeStage({
@@ -478,6 +515,9 @@ export function executeStage({
   if (request.expectedSubject && request.expectedSubject !== preSubject) {
     throw new Error("workspace subject does not match the fenced expected subject");
   }
+  const preControl = request.contextPolicy === "fresh_review"
+    ? captureRepositoryControl(repoDir)
+    : null;
   let nativeSessionId = request.nativeSessionId;
   let artifacts;
   if (contract.kind === "command") {
@@ -494,29 +534,13 @@ export function executeStage({
       execution,
       requiredArtifacts: request.requiredArtifacts,
     });
-  } else if (contract.kind === "publish") {
-    throw new Error("repository publication is dispatched by the supervisor publication boundary");
   } else {
-    let invocation;
+    let invocation = { mode: "none", nativeSessionId: null, reconstructed: false, readOnly: false };
     let execution;
     let redactionEnv = process.env;
     try {
       invocation = resolveContextInvocation(request);
-      execution = runAgent({
-        request,
-        invocation,
-        repoDir,
-        proposalPath,
-        timeoutMs,
-        model: config.model,
-        agent: request.agent,
-      });
-      nativeSessionId = execution.nativeSessionId ?? nativeSessionId;
-      redactionEnv = execution.authSnapshot
-        ? { ...process.env, OT_RUNTIME_AUTH_JSON: execution.authSnapshot }
-        : process.env;
     } catch (error) {
-      invocation = { mode: "none", nativeSessionId: null, reconstructed: false, readOnly: false };
       execution = {
         exitCode: null,
         signal: null,
@@ -525,10 +549,38 @@ export function executeStage({
         proposal: failureProposal(String(error), "failure"),
       };
     }
-    const observedPostSubject = computeWorkspaceTreeOid(repoDir);
-    const readOnlyMutation = invocation.readOnly && observedPostSubject !== preSubject;
+    if (!execution) {
+      try {
+        execution = runAgent({
+          request,
+          invocation,
+          repoDir,
+          proposalPath,
+          timeoutMs,
+          model: config.model,
+          agent: request.agent,
+        });
+        nativeSessionId = execution.nativeSessionId ?? nativeSessionId;
+        redactionEnv = execution.authSnapshot
+          ? { ...process.env, OT_RUNTIME_AUTH_JSON: execution.authSnapshot }
+          : process.env;
+      } catch (error) {
+        execution = {
+          exitCode: null,
+          signal: null,
+          timedOut: false,
+          executorFailure: true,
+          proposal: failureProposal(String(error), "retryable_infrastructure_failure"),
+        };
+      }
+    }
+    const observedPostSubject = invocation.readOnly
+      ? computeWorkspaceTreeOidFromTree(repoDir, preSubject)
+      : computeWorkspaceTreeOid(repoDir);
+    const readOnlyMutation = invocation.readOnly &&
+      (observedPostSubject !== preSubject || !preControl || !repositoryControlMatches(repoDir, preControl));
     const gatedSubject = readOnlyMutation
-      ? restoreWorkspaceTreeOid(repoDir, observedPostSubject, preSubject)
+      ? restoreReadOnlyRepository(repoDir, observedPostSubject, preSubject, preControl)
       : observedPostSubject;
     let proposal = execution.proposal;
     let publishedCommit;
@@ -537,7 +589,16 @@ export function executeStage({
         ...failureProposal("A fresh-review stage mutated the workspace.", "semantic_repair_required"),
         findings: [{ severity: "P1", code: "review-mutated-workspace", summary: "Read-only review changed the gated tree." }],
       };
-    } else if (!execution.executorFailure && (execution.exitCode !== 0 || !proposal)) {
+    } else if (request.capability === "ce/publish@1") {
+      ({ proposal, publishedCommit } = reconcilePublication({
+        repoDir,
+        request,
+        gatedSubject,
+        execution,
+        proposal,
+        redactionEnv,
+      }));
+    } else if (!execution.executorFailure && (execution.timedOut || execution.exitCode !== 0 || !proposal)) {
       const terminated = execution.timedOut || execution.signal || execution.exitCode === 137;
       const diagnostic = sanitizeArtifactText(execution.stderr ?? "", redactionEnv).trim().slice(-1_000);
       const termination = [
@@ -550,26 +611,6 @@ export function executeStage({
           (diagnostic ? ` Executor diagnostic: ${diagnostic}` : ""),
         terminated ? "retryable_infrastructure_failure" : "failure",
       );
-    } else if (request.capability === "ce/publish@1" && proposal?.suggested_outcome === "success") {
-      try {
-        const head = runGit(repoDir, ["rev-parse", "HEAD"]);
-        const headTree = runGit(repoDir, ["rev-parse", "HEAD^{tree}"]);
-        const remote = runGit(repoDir, ["ls-remote", "--heads", "origin", `refs/heads/${request.branch}`]);
-        const remoteHead = remote.split(/\s+/)[0] ?? "";
-        if (headTree !== gatedSubject || remoteHead !== head) {
-          proposal = {
-            ...failureProposal("Publication did not reconcile the gated workspace tree to the pushed branch head.", "semantic_repair_required"),
-            findings: [{ severity: "P1", code: "publish-subject-mismatch", summary: "The pushed commit tree is not the gated workspace subject." }],
-          };
-        } else {
-          publishedCommit = head;
-        }
-      } catch (error) {
-        proposal = {
-          ...failureProposal(`Publication reconciliation failed: ${sanitizeArtifactText(String(error), redactionEnv).slice(-800)}`, "failure"),
-          findings: [{ severity: "P1", code: "publish-reconciliation-failed", summary: "The executor could not verify the pushed branch subject." }],
-        };
-      }
     }
     const completedAt = now();
     const fence = {

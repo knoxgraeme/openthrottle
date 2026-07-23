@@ -221,7 +221,6 @@ export function buildInstalledRuntimeDescriptor(
       "ce/simplify@1",
       "command/run@1",
       "provider/wait@1",
-      "repository/publish@1",
     ]),
     executors: sortedUnique(overrides.executors ?? EXECUTOR_KINDS) as ExecutorKind[],
     evaluators: sortedUnique(overrides.evaluators ?? EVALUATOR_KINDS) as EvaluatorKind[],

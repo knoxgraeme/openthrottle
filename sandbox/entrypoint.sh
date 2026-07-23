@@ -35,6 +35,150 @@ as_agent() {
   gosu "$AGENT_USER" env HOME="$AGENT_HOME" USER="$AGENT_USER" bash -c "$1"
 }
 
+# A stage may be followed by another stage in the same sandbox. Kill any
+# agent-owned descendants before new credentials or trusted runtime config are
+# materialized so a process from an untrusted review cannot cross that boundary.
+terminate_agent_processes() {
+  local status=0
+  pkill -KILL -u "$AGENT_USER" 2>/dev/null || status=$?
+  if [[ "$status" -ne 0 && "$status" -ne 1 ]]; then
+    log "FATAL: could not terminate stale agent processes"
+    return "$status"
+  fi
+}
+
+# Preserve native session/auth data, but discard every executable user-level
+# config surface. Claude loads CE from the root-owned marketplace; Codex loads
+# CE from /etc/codex/skills. Per-stage hooks/config are rebuilt later below.
+reset_agent_execution_state() {
+  for profile in "${AGENT_HOME}/.claude" "${AGENT_HOME}/.codex"; do
+    if [[ -L "$profile" ]]; then
+      log "FATAL: agent profile path is a symlink: ${profile}"
+      return 1
+    fi
+    install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0700 "$profile"
+  done
+  # These trees carry no durable native session/auth state. Replacing the
+  # top-level entry is safe even when an earlier agent made it a symlink;
+  # rm removes a final symlink without traversing its target.
+  rm -rf "${AGENT_HOME}/.config"
+  install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0700 "${AGENT_HOME}/.config"
+  if [[ -L "${AGENT_HOME}/.local" || ( -e "${AGENT_HOME}/.local" && ! -d "${AGENT_HOME}/.local" ) ]]; then
+    rm -rf "${AGENT_HOME}/.local"
+  fi
+  install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0700 "${AGENT_HOME}/.local"
+  rm -rf "${AGENT_HOME}/.codex/.tmp"
+  install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0700 "${AGENT_HOME}/.codex/.tmp"
+  rm -rf \
+    "${AGENT_HOME}/.agents" \
+    "${AGENT_HOME}/.claude/agents" \
+    "${AGENT_HOME}/.claude/commands" \
+    "${AGENT_HOME}/.claude/hooks" \
+    "${AGENT_HOME}/.claude/plugins" \
+    "${AGENT_HOME}/.claude/skills" \
+    "${AGENT_HOME}/.codex/agents" \
+    "${AGENT_HOME}/.codex/plugins" \
+    "${AGENT_HOME}/.codex/prompts" \
+    "${AGENT_HOME}/.codex/rules" \
+    "${AGENT_HOME}/.codex/skills" \
+    "${AGENT_HOME}/.local/bin" \
+    "${AGENT_HOME}/bin"
+  rm -f \
+    "${AGENT_HOME}/.bash_profile" \
+    "${AGENT_HOME}/.bashrc" \
+    "${AGENT_HOME}/.claude/settings.json" \
+    "${AGENT_HOME}/.claude/CLAUDE.md" \
+    "${AGENT_HOME}/.claude.json" \
+    "${AGENT_HOME}/.codex/AGENTS.md" \
+    "${AGENT_HOME}/.codex/config.toml" \
+    "${AGENT_HOME}/.codex/hooks.json" \
+    "${AGENT_HOME}/.gitconfig" \
+    "${AGENT_HOME}/.mcp.json" \
+    "${AGENT_HOME}/.profile" \
+    "${AGENT_HOME}/.zprofile" \
+    "${AGENT_HOME}/.zshrc" \
+    "${AGENT_HOME}/AGENTS.md" \
+    "${AGENT_HOME}/CLAUDE.md"
+}
+
+assert_agent_directory() {
+  local path="$1"
+  if [[ -L "$path" || ( -e "$path" && ! -d "$path" ) ]]; then
+    log "FATAL: agent state path is not a directory: ${path}"
+    return 1
+  fi
+}
+
+FRESH_REVIEW_BACKUP=""
+FRESH_REVIEW_REPO=""
+AGENT_HOME_UID=""
+AGENT_HOME_GID=""
+AGENT_HOME_MODE=""
+STAGE_REPO_DIR="$REPO_DIR"
+
+# Review runs against a disposable copy while the canonical checkout is hidden
+# below a root-only directory. Even a full .git swap or ignored-file mutation
+# is discarded before the next stage receives repository credentials.
+prepare_fresh_review_checkout() {
+  [[ -z "$FRESH_REVIEW_BACKUP" ]] || return 1
+  AGENT_HOME_UID="$(stat -c '%u' "$AGENT_HOME")"
+  AGENT_HOME_GID="$(stat -c '%g' "$AGENT_HOME")"
+  AGENT_HOME_MODE="$(stat -c '%a' "$AGENT_HOME")"
+  chown root:root "$AGENT_HOME"
+  chmod 0755 "$AGENT_HOME"
+  FRESH_REVIEW_BACKUP="$(mktemp -d "${AGENT_HOME}/.ot-review-backup-XXXXXX")"
+  chown root:root "$FRESH_REVIEW_BACKUP"
+  mv "$REPO_DIR" "${FRESH_REVIEW_BACKUP}/repo"
+  FRESH_REVIEW_REPO="$(mktemp -d /tmp/ot-fresh-review-repo-XXXXXX)"
+  chown "${AGENT_USER}:${AGENT_USER}" "$FRESH_REVIEW_REPO"
+  chmod 0700 "$FRESH_REVIEW_REPO"
+  # Briefly expose the source only to the trusted copy process. The disposable
+  # checkout lives off the persistent home bind mount, so platform-specific
+  # bind metadata cannot weaken or break the isolation copy.
+  chmod 0755 "$FRESH_REVIEW_BACKUP"
+  as_agent "cp -R --reflink=auto '${FRESH_REVIEW_BACKUP}/repo/.' '$FRESH_REVIEW_REPO/'"
+  chmod 0700 "$FRESH_REVIEW_BACKUP"
+  STAGE_REPO_DIR="$FRESH_REVIEW_REPO"
+}
+
+restore_fresh_review_checkout() {
+  [[ -n "$FRESH_REVIEW_BACKUP" ]] || return 0
+  if ! terminate_agent_processes; then
+    log "FATAL: fresh-review checkout remains root-hidden because agent termination was not confirmed"
+    return 1
+  fi
+  if ! rm -rf -- "$FRESH_REVIEW_REPO"; then
+    log "FATAL: could not discard the fresh-review checkout"
+    return 1
+  fi
+  if [[ -d "${FRESH_REVIEW_BACKUP}/repo" && ! -e "$REPO_DIR" && ! -L "$REPO_DIR" ]]; then
+    if ! mv "${FRESH_REVIEW_BACKUP}/repo" "$REPO_DIR"; then
+      log "FATAL: could not restore the canonical checkout"
+      return 1
+    fi
+  elif [[ -e "${FRESH_REVIEW_BACKUP}/repo" || -L "${FRESH_REVIEW_BACKUP}/repo" || ! -d "$REPO_DIR" || -L "$REPO_DIR" ]]; then
+    log "FATAL: fresh-review checkout restoration is in an inconsistent state"
+    return 1
+  fi
+  if [[ -d "$FRESH_REVIEW_BACKUP" ]]; then
+    if ! rmdir "$FRESH_REVIEW_BACKUP"; then
+      log "FATAL: fresh-review backup directory is not empty"
+      return 1
+    fi
+  elif [[ -e "$FRESH_REVIEW_BACKUP" || -L "$FRESH_REVIEW_BACKUP" ]]; then
+    log "FATAL: fresh-review backup path is not a directory"
+    return 1
+  fi
+  if ! chown "${AGENT_HOME_UID}:${AGENT_HOME_GID}" "$AGENT_HOME" ||
+      ! chmod "$AGENT_HOME_MODE" "$AGENT_HOME"; then
+    log "FATAL: could not restore agent-home ownership"
+    return 1
+  fi
+  FRESH_REVIEW_BACKUP=""
+  FRESH_REVIEW_REPO=""
+  STAGE_REPO_DIR="$REPO_DIR"
+}
+
 # Author agent commits as the GitHub account that owns GH_TOKEN so GitHub can
 # attribute them to a real account and integrations that gate on commit-author
 # identity (e.g. Vercel) accept the deployment. The account's GitHub noreply
@@ -61,6 +205,8 @@ configure_git_identity() {
 HEARTBEAT_PID=""
 
 handle_exit() {
+  terminate_agent_processes || true
+  restore_fresh_review_checkout || true
   if [[ -n "${HEARTBEAT_PID:-}" ]]; then
     kill "$HEARTBEAT_PID" 2>/dev/null || true
     wait "$HEARTBEAT_PID" 2>/dev/null || true
@@ -70,6 +216,9 @@ handle_exit() {
   fi
   if [[ -n "${OPENCODE_CONFIG_DIR:-}" ]]; then
     rm -rf "$OPENCODE_CONFIG_DIR"
+  fi
+  if [[ -n "${STAGE_POLICY_TEMP:-}" ]]; then
+    rm -f "$STAGE_POLICY_TEMP"
   fi
 }
 
@@ -106,6 +255,7 @@ AGENT="$(jq -er '.agent' "$OT_STAGE_REQUEST_FILE")"
 LINEAR_ISSUE_ID="$(jq -er '.issueId' "$OT_STAGE_REQUEST_FILE")"
 LINEAR_ISSUE_IDENTIFIER="$LINEAR_ISSUE_ID"
 TASK_TYPE="$(jq -er '.taskType' "$OT_STAGE_REQUEST_FILE")"
+STAGE_CONTEXT_POLICY="$(jq -er '.contextPolicy' "$OT_STAGE_REQUEST_FILE")"
 if ! jq -e '.credentialScopes | index("model.invoke") != null' "$OT_STAGE_REQUEST_FILE" >/dev/null; then
   STAGE_MODEL_REQUIRED=0
 fi
@@ -113,6 +263,9 @@ fi
 : "${RUN_ID:?RUN_ID is required}"
 
 trap 'handle_exit "$?"' EXIT
+
+terminate_agent_processes
+reset_agent_execution_state
 
 : "${TASK_TYPE:?TASK_TYPE is required}"
 is_supported_task_type "$TASK_TYPE" \
@@ -138,15 +291,19 @@ KIMI_CODE_API_KEY="$(strip_nl "${KIMI_CODE_API_KEY:-}")"
 export GITHUB_TOKEN CLAUDE_CODE_OAUTH_TOKEN KIMI_CODE_API_KEY
 export GH_TOKEN="$GITHUB_TOKEN"
 
-mkdir -p "$OT_DIR" "${OT_DIR}/outbox" "${OT_DIR}/inbox"
-chown -R "${AGENT_USER}:${AGENT_USER}" "$AGENT_HOME"
+assert_agent_directory "$OT_DIR"
+install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0700 "$OT_DIR"
+for state_dir in "${OT_DIR}/outbox" "${OT_DIR}/inbox"; do
+  assert_agent_directory "$state_dir"
+  install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0700 "$state_dir"
+done
 HEARTBEAT_DIR="/var/lib/openthrottle/heartbeat"
 install -d -o root -g root -m 0700 "$HEARTBEAT_DIR"
 rm -f "${HEARTBEAT_DIR}/heartbeat.json" "${HEARTBEAT_DIR}/heartbeat.json.tmp"
 TASK_LOG="${OT_DIR}/task.log"
 rm -f "${OT_DIR}/run-result.json"
-: > "$TASK_LOG" || true
-chown "${AGENT_USER}:${AGENT_USER}" "$TASK_LOG" || true
+rm -f "$TASK_LOG"
+install -o "$AGENT_USER" -g "$AGENT_USER" -m 0600 /dev/null "$TASK_LOG"
 
 # Everything from here on (our own log() calls, and anything the agent
 # writes to stdout/stderr through runner/normalize.mjs) is tee'd into
@@ -178,14 +335,14 @@ if [[ -n "${CODEX_AUTH_JSON:-}" ]]; then
     # rotation). But the supervisor now refreshes centrally before seeding, so
     # the seed can be *newer* than the local copy. Install whichever is newest
     # and from the same account; fail closed if the accounts differ.
-    EXISTING_AUTH="$(cat "${AGENT_HOME}/.codex/auth.json")"
+    EXISTING_AUTH="$(as_agent "cat '${AGENT_HOME}/.codex/auth.json'")"
     case "$(codex_reconcile_auth "$SEED_AUTH" "$EXISTING_AUTH")" in
       incompatible)
         log "FATAL: seeded Codex auth account does not match the sandbox's existing token; refusing to cross accounts"
         exit 1
         ;;
       seed)
-        printf '%s' "$SEED_AUTH" > "${AGENT_HOME}/.codex/auth.json"
+        printf '%s' "$SEED_AUTH" | gosu "$AGENT_USER" tee "${AGENT_HOME}/.codex/auth.json" >/dev/null
         chmod 0600 "${AGENT_HOME}/.codex/auth.json"
         log "~/.codex/auth.json present but the seeded token is newer — installing the supervisor's refreshed token"
         ;;
@@ -194,11 +351,10 @@ if [[ -n "${CODEX_AUTH_JSON:-}" ]]; then
         ;;
     esac
   else
-    printf '%s' "$SEED_AUTH" > "${AGENT_HOME}/.codex/auth.json"
+    printf '%s' "$SEED_AUTH" | gosu "$AGENT_USER" tee "${AGENT_HOME}/.codex/auth.json" >/dev/null
     chmod 0600 "${AGENT_HOME}/.codex/auth.json"
     log "wrote ~/.codex/auth.json"
   fi
-  chown -R "${AGENT_USER}:${AGENT_USER}" "${AGENT_HOME}/.codex"
 else
   rm -f "${AGENT_HOME}/.codex/auth.json"
 fi
@@ -254,6 +410,11 @@ else
   as_agent "git -C '$REPO_DIR' reset --hard --quiet '$STAGE_BASE_COMMIT' && git -C '$REPO_DIR' clean -fdq"
 fi
 
+# Ignored files are intentionally outside the canonical workspace subject, so
+# never carry them across a stage boundary. post_bootstrap recreates required
+# dependencies from the trusted tracked repository before the next agent runs.
+as_agent "git -C '$REPO_DIR' clean -fdXq"
+
 # =============================================================================
 # Phase 3 — safety: pre-push hook + sealed .git/config. Claude is invoked
 # with user-only setting sources, so target-repository hooks/settings remain
@@ -262,6 +423,14 @@ fi
 log "phase 3: safety"
 
 HOOKS_PATH="${OPT_DIR}/safety"
+STAGE_POLICY_DIR="/run/openthrottle"
+STAGE_POLICY_FILE="${STAGE_POLICY_DIR}/stage-push-policy"
+STAGE_POLICY_TEMP="$(mktemp)"
+install -d -o root -g root -m 0755 "$STAGE_POLICY_DIR"
+printf '%s\n' "$STAGE_CONTEXT_POLICY" > "$STAGE_POLICY_TEMP"
+install -o root -g root -m 0444 "$STAGE_POLICY_TEMP" "$STAGE_POLICY_FILE"
+rm -f "$STAGE_POLICY_TEMP"
+STAGE_POLICY_TEMP=""
 CURRENT_HOOKS_PATH="$(as_agent "git -C '$REPO_DIR' config --get core.hooksPath" 2>/dev/null || true)"
 if [[ "$CURRENT_HOOKS_PATH" != "$HOOKS_PATH" ]]; then
   as_agent "git -C '$REPO_DIR' config core.hooksPath '$HOOKS_PATH'"
@@ -269,12 +438,28 @@ if [[ "$CURRENT_HOOKS_PATH" != "$HOOKS_PATH" ]]; then
 else
   log "pre-push hook already installed"
 fi
+log "installed sealed stage push policy (${STAGE_CONTEXT_POLICY})"
 
 # Seal .git/config as root so the agent (and the agent process itself,
 # should it get compromised via prompt injection) cannot unset
 # core.hooksPath or repoint origin. Idempotent — seal.sh no-ops if already
 # sealed.
 "${OPT_DIR}/safety/seal.sh" "${REPO_DIR}/.git/config"
+
+# Local excludes/attributes are runtime control state, not repository content.
+# Keep them empty and make their parent non-writable so a review cannot hide a
+# later executable project config from the read-only workspace fence.
+GIT_INFO_DIR="${REPO_DIR}/.git/info"
+if [[ -L "$GIT_INFO_DIR" || ! -d "$GIT_INFO_DIR" ]]; then
+  log "FATAL: repository info path is not a directory"
+  exit 1
+fi
+chmod 0755 "$GIT_INFO_DIR"
+rm -f "${GIT_INFO_DIR}/exclude" "${GIT_INFO_DIR}/attributes"
+install -o root -g root -m 0444 /dev/null "${GIT_INFO_DIR}/exclude"
+install -o root -g root -m 0444 /dev/null "${GIT_INFO_DIR}/attributes"
+chown root:root "$GIT_INFO_DIR"
+chmod 0555 "$GIT_INFO_DIR"
 
 # =============================================================================
 # Phase 4 — read .openthrottle.yml (yq), with defaults
@@ -392,47 +577,54 @@ for sealed_input in "$OT_STAGE_REQUEST_FILE" "$OT_STAGE_CONFIG_FILE" "$OT_STAGE_
   chmod 0400 "$sealed_input"
 done
 install -d -o root -g root -m 0700 /var/lib/openthrottle/stage-results
-mkdir -p "${OT_DIR}/stage" "${AGENT_HOME}/.claude/skills"
-jq -r '.taskContext' "$OT_STAGE_REQUEST_FILE" > "${OT_DIR}/linear-context.md"
+assert_agent_directory "$OT_DIR"
+rm -rf "${OT_DIR}/stage"
+install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0700 "${OT_DIR}/stage"
+assert_agent_directory "${AGENT_HOME}/.claude"
+assert_agent_directory "${AGENT_HOME}/.codex"
+rm -rf "${AGENT_HOME}/.claude/skills"
+install -d -o root -g root -m 0755 "${AGENT_HOME}/.claude/skills"
+LINEAR_CONTEXT_TEMP="$(mktemp)"
+jq -r '.taskContext' "$OT_STAGE_REQUEST_FILE" > "$LINEAR_CONTEXT_TEMP"
+rm -f "${OT_DIR}/linear-context.md"
+install -o "$AGENT_USER" -g "$AGENT_USER" -m 0600 "$LINEAR_CONTEXT_TEMP" "${OT_DIR}/linear-context.md"
+rm -f "$LINEAR_CONTEXT_TEMP"
 if [[ -d "${OPT_DIR}/skills/tasks" ]]; then
   cp -r "${OPT_DIR}/skills/tasks/." "${AGENT_HOME}/.claude/skills/"
 fi
-chown "${AGENT_USER}:${AGENT_USER}" "${OT_DIR}/linear-context.md"
-chmod 0600 "${OT_DIR}/linear-context.md"
-chown -R "${AGENT_USER}:${AGENT_USER}" "${OT_DIR}/stage" "${AGENT_HOME}/.claude"
+chown -R root:root "${AGENT_HOME}/.claude/skills"
+chmod -R a-w "${AGENT_HOME}/.claude/skills"
 
 LIVE_STEERING="$(jq -r '.liveSteering' "$OT_STAGE_REQUEST_FILE")"
 DRAIN_HOOK="${OPT_DIR}/hooks/ot-inbox-drain.sh"
-if [[ "$AGENT" == "claude" && "$LIVE_STEERING" == "true" ]]; then
+if [[ "$AGENT" == "claude" ]]; then
   CLAUDE_SETTINGS="${AGENT_HOME}/.claude/settings.json"
-  CLAUDE_SETTINGS_BASE='{}'
-  [[ -s "$CLAUDE_SETTINGS" ]] && CLAUDE_SETTINGS_BASE="$(cat "$CLAUDE_SETTINGS")"
-  if ! printf '%s' "$CLAUDE_SETTINGS_BASE" | jq --arg cmd "$DRAIN_HOOK" '
-      .hooks = (.hooks // {})
-      | .hooks.Stop = [ { hooks: [ { type: "command", command: $cmd } ] } ]
-      | .hooks.PostToolUse = [ { matcher: "*", hooks: [ { type: "command", command: $cmd } ] } ]
-    ' > "${CLAUDE_SETTINGS}.tmp" 2>/dev/null; then
+  if [[ "$LIVE_STEERING" == "true" ]]; then
     jq -n --arg cmd "$DRAIN_HOOK" '{ hooks: {
       Stop: [ { hooks: [ { type: "command", command: $cmd } ] } ],
       PostToolUse: [ { matcher: "*", hooks: [ { type: "command", command: $cmd } ] } ]
     } }' > "${CLAUDE_SETTINGS}.tmp"
+  else
+    printf '{}\n' > "${CLAUDE_SETTINGS}.tmp"
   fi
   mv "${CLAUDE_SETTINGS}.tmp" "$CLAUDE_SETTINGS"
-  chmod 0644 "$CLAUDE_SETTINGS"
-  chown "${AGENT_USER}:${AGENT_USER}" "$CLAUDE_SETTINGS"
+  chown root:root "$CLAUDE_SETTINGS"
+  chmod 0444 "$CLAUDE_SETTINGS"
 fi
 
 if [[ "$AGENT" == "codex" ]]; then
-  mkdir -p "${AGENT_HOME}/.codex"
+  rm -f "${AGENT_HOME}/.codex/AGENTS.md" "${AGENT_HOME}/.codex/hooks.json"
   if [[ -f "${OPT_DIR}/skills/codex/AGENTS-fragment.md" ]]; then
-    cp "${OPT_DIR}/skills/codex/AGENTS-fragment.md" "${AGENT_HOME}/.codex/AGENTS.md"
+    install -o root -g root -m 0444 \
+      "${OPT_DIR}/skills/codex/AGENTS-fragment.md" "${AGENT_HOME}/.codex/AGENTS.md"
   fi
   if [[ "$LIVE_STEERING" == "true" ]]; then
     jq -n --arg cmd "$DRAIN_HOOK" '{ hooks: {
       PostToolUse: [ { matcher: "", hooks: [ { type: "command", command: $cmd } ] } ],
       Stop: [ { hooks: [ { type: "command", command: $cmd } ] } ]
     } }' > "${AGENT_HOME}/.codex/hooks.json"
-    chmod 0644 "${AGENT_HOME}/.codex/hooks.json"
+    chown root:root "${AGENT_HOME}/.codex/hooks.json"
+    chmod 0444 "${AGENT_HOME}/.codex/hooks.json"
     if { as_agent "codex exec --help 2>/dev/null" || true; as_agent "codex --help 2>/dev/null" || true; } \
          | grep -q -- "--dangerously-bypass-hook-trust"; then
       export OT_CODEX_HOOK_TRUST_FLAG=1
@@ -440,7 +632,6 @@ if [[ "$AGENT" == "codex" ]]; then
       log "WARNING: codex lacks --dangerously-bypass-hook-trust; steering remains subject to its trust gate"
     fi
   fi
-  chown -R "${AGENT_USER}:${AGENT_USER}" "${AGENT_HOME}/.codex"
 fi
 
 MCP_CONFIG_FILE=""
@@ -467,8 +658,22 @@ if [[ "$AGENT" == "opencode" && "$STAGE_MODEL_REQUIRED" == "1" ]]; then
   export OPENCODE_DISABLE_SHARE=1
 fi
 
+if [[ "$STAGE_CONTEXT_POLICY" == "fresh_review" ]]; then
+  # Checkout is complete. Do not expose the repository credential to the
+  # review agent; the root-sealed hook policy remains the independent guard.
+  unset GITHUB_TOKEN GH_TOKEN
+  log "withheld repository write credential from fresh-review executor"
+  prepare_fresh_review_checkout
+fi
+export OT_REPO_DIR="$STAGE_REPO_DIR"
+
+STAGE_EXECUTOR_STATUS=0
 node "${OPT_DIR}/runner/execute-stage.mjs" \
   --request "$OT_STAGE_REQUEST_FILE" \
   --config "$OT_STAGE_CONFIG_FILE" \
   --manifest "$OT_STAGE_MANIFEST_FILE" \
-  --repo "$REPO_DIR"
+  --repo "$STAGE_REPO_DIR" || STAGE_EXECUTOR_STATUS=$?
+if ! restore_fresh_review_checkout; then
+  STAGE_EXECUTOR_STATUS=1
+fi
+exit "$STAGE_EXECUTOR_STATUS"
