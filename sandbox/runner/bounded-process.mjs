@@ -12,6 +12,9 @@ import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
 const PROCESS_HELPER = fileURLToPath(new URL("./bounded-process-helper.mjs", import.meta.url));
+const DEFAULT_KILL_AFTER_MS = 5_000;
+const EXIT_DRAIN_MS = 250;
+const HELPER_DEADLINE_SLACK_MS = 1_000;
 
 function readCapturedWindow(path, maxBytes) {
   const descriptor = openSync(path, "r");
@@ -44,9 +47,16 @@ export function runCapturedProcess(command, args, {
   env,
   input,
   timeout,
-  killAfterMs = 5_000,
+  killAfterMs = DEFAULT_KILL_AFTER_MS,
   captureBytes = 2 * 1024 * 1024,
 } = {}) {
+  const timeoutMs = Number.isFinite(timeout) && timeout > 0 ? timeout : null;
+  const boundedKillAfterMs = Number.isFinite(killAfterMs) && killAfterMs >= 0
+    ? killAfterMs
+    : DEFAULT_KILL_AFTER_MS;
+  const helperDeadlineMs = timeoutMs === null
+    ? undefined
+    : Math.ceil(timeoutMs + boundedKillAfterMs + EXIT_DRAIN_MS + HELPER_DEADLINE_SLACK_MS);
   const captureDir = mkdtempSync(join(tmpdir(), "ot-stage-output-"));
   const stdoutPath = join(captureDir, "stdout.log");
   const stderrPath = join(captureDir, "stderr.log");
@@ -60,14 +70,17 @@ export function runCapturedProcess(command, args, {
         cwd: cwd ?? null,
         env: env ?? null,
         input: input ?? null,
-        timeoutMs: timeout ?? null,
-        killAfterMs,
+        timeoutMs,
+        killAfterMs: boundedKillAfterMs,
+        exitDrainMs: EXIT_DRAIN_MS,
         captureBytes,
         stdoutPath,
         stderrPath,
       }),
       encoding: "utf8",
       maxBuffer: 1024 * 1024,
+      timeout: helperDeadlineMs,
+      killSignal: "SIGKILL",
     });
     if (helper.error || helper.status !== 0) {
       throw new Error(`bounded process helper failed: ${helper.stderr ?? helper.error?.message ?? "unknown error"}`);

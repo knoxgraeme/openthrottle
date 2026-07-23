@@ -8,9 +8,13 @@ const input = JSON.parse(readFileSync(0, "utf8"));
 const captureBytes = Number.isSafeInteger(input.captureBytes) && input.captureBytes >= 1024
   ? Math.min(input.captureBytes, 16 * 1024 * 1024)
   : 2 * 1024 * 1024;
+const exitDrainMs = Number.isFinite(input.exitDrainMs) && input.exitDrainMs >= 0
+  ? input.exitDrainMs
+  : 250;
 let timedOut = false;
 let terminationTimer;
 let killTimer;
+let exitDrainTimer;
 let settled = false;
 
 class BoundedOutput extends Writable {
@@ -97,18 +101,34 @@ function finish(result) {
   settled = true;
   if (terminationTimer) clearTimeout(terminationTimer);
   if (killTimer) clearTimeout(killTimer);
+  if (exitDrainTimer) clearTimeout(exitDrainTimer);
   writeFileSync(input.stdoutPath, stdout.value());
   writeFileSync(input.stderrPath, stderr.value());
   process.stdout.write(JSON.stringify({ ...result, timedOut }));
 }
 
+function stopCapture() {
+  child.stdout.unpipe(stdout);
+  child.stderr.unpipe(stderr);
+  child.stdout.destroy();
+  child.stderr.destroy();
+  stdout.end();
+  stderr.end();
+}
+
 child.once("error", (error) => {
   finish({ status: null, signal: null, error: { code: error.code ?? null, message: error.message } });
 });
-child.once("exit", () => {
+child.once("exit", (status, signal) => {
+  if (terminationTimer) clearTimeout(terminationTimer);
+  if (killTimer) clearTimeout(killTimer);
   // Do not let a background descendant keep the capture pipes open or outlive
   // the direct command. The outer agent-user fence remains a second boundary.
   signalGroup("SIGKILL");
+  exitDrainTimer = setTimeout(() => {
+    stopCapture();
+    finish({ status, signal, error: null });
+  }, exitDrainMs);
 });
 child.once("close", (status, signal) => {
   finish({ status, signal, error: null });

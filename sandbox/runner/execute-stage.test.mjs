@@ -411,12 +411,38 @@ describe("one-stage executor", () => {
     const result = runCapturedProcess(process.execPath, [
       "-e",
       'process.on("SIGTERM", () => {}); setInterval(() => {}, 1_000)',
-    ], { timeout: 50, killAfterMs: 50 });
+    ], { timeout: 500, killAfterMs: 50 });
 
     expect(result.timedOut).toBe(true);
     expect(result.error?.code).toBe("ETIMEDOUT");
     expect(result.signal).toBe("SIGKILL");
     expect(Date.now() - startedAt).toBeLessThan(3_000);
+  });
+
+  it("returns after a direct child exits even when a detached descendant holds its output pipes", () => {
+    const startedAt = Date.now();
+    const result = runCapturedProcess(process.execPath, [
+      "-e",
+      `
+        const { spawn } = require("node:child_process");
+        const descendant = spawn(process.execPath, ["-e", "setTimeout(() => {}, 3500)"], {
+          detached: true,
+          stdio: ["ignore", "inherit", "inherit"],
+        });
+        descendant.unref();
+        process.stdout.write("direct-stdout\\n");
+        process.stderr.write("direct-stderr\\n");
+        process.exit(23);
+      `,
+    ], { timeout: 5_000, killAfterMs: 50 });
+
+    expect(result.status).toBe(23);
+    expect(result.signal).toBeNull();
+    expect(result.timedOut).toBe(false);
+    expect(result.error).toBeUndefined();
+    expect(result.stdout).toContain("direct-stdout");
+    expect(result.stderr).toContain("direct-stderr");
+    expect(Date.now() - startedAt).toBeLessThan(2_500);
   });
 
   it("terminates agent descendants before repository observation can continue", () => {
