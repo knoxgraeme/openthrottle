@@ -60,17 +60,16 @@ describe("pipeline manifest validation", () => {
     expect([...first.manifests.keys()]).toEqual([
       "ce/implement@2",
       "ce/investigate@2",
-      "fixture/command@1",
-      "fixture/command@2",
-      "fixture/agent@1",
     ]);
     expect(resolvePipelineReference(first, "implement").manifest.id).toBe("ce/implement");
     expect(() => resolvePipelineReference(first, "ce/implement@1"))
       .toThrow(/unknown pipeline selection/);
     expect(() => resolvePipelineReference(first, "ce/investigate@1"))
       .toThrow(/unknown pipeline selection/);
-    expect(resolvePipelineReference(first, "fixture/command@1").manifest.id).toBe("fixture/command");
-    expect(resolvePipelineReference(first, "fixture-command").manifest.version).toBe(2);
+    expect(() => resolvePipelineReference(first, "fixture/command@1"))
+      .toThrow(/unknown pipeline selection/);
+    expect(() => resolvePipelineReference(first, "fixture-command"))
+      .toThrow(/unknown pipeline selection/);
     expect(resolvePipelineReference(first, "implement").manifest.stages.map((stage) => stage.id)).toEqual([
       "planning",
       "implementation",
@@ -86,6 +85,20 @@ describe("pipeline manifest validation", () => {
       "investigate",
       "publish",
     ]);
+  });
+
+  it("keeps multi-version and provider-neutral manifests in a test-only catalog", () => {
+    const path = fileURLToPath(new URL("./__fixtures__/pipelines/catalog.yaml", import.meta.url));
+    const runtime = buildInstalledRuntimeDescriptor("test-runtime/v1");
+    const catalog = loadPipelineCatalog(path, runtime.descriptor);
+
+    expect([...catalog.manifests.keys()]).toEqual([
+      "fixture/command@1",
+      "fixture/command@2",
+      "fixture/agent@1",
+    ]);
+    expect(resolvePipelineReference(catalog, "fixture/command@1").manifest.id).toBe("fixture/command");
+    expect(resolvePipelineReference(catalog, "fixture-command").manifest.version).toBe(2);
   });
 
   it("normalizes key order and rejects unknown or duplicate YAML fields", () => {

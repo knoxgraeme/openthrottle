@@ -10,7 +10,8 @@ import { loadPipelineCatalog } from "./pipeline-manifest.js";
 import { createPipelineStore } from "./pipeline-store.js";
 import { buildInstalledRuntimeDescriptor } from "./sandbox-runtime.js";
 
-const catalogPath = fileURLToPath(new URL("../pipelines/catalog.yaml", import.meta.url));
+const shippedCatalogPath = fileURLToPath(new URL("../pipelines/catalog.yaml", import.meta.url));
+const fixtureCatalogPath = fileURLToPath(new URL("./__fixtures__/pipelines/catalog.yaml", import.meta.url));
 
 function config(): Config {
   return {
@@ -37,7 +38,7 @@ function config(): Config {
     allowLinearMerge: false,
     sandboxEventPollIntervalMs: 5_000,
     stallTimeoutSeconds: 900,
-    pipelineCatalogPath: catalogPath,
+    pipelineCatalogPath: shippedCatalogPath,
     sandboxRuntimeRelease: "admission-test/v1",
     sandboxRuntimeDescriptorPath: "pipelines/runtime-capabilities-v1.json",
   };
@@ -69,7 +70,11 @@ describe("pipeline admission", () => {
     db?.close();
   });
 
-  async function run(repositoryConfig: string, overrides: Partial<Config> = {}) {
+  async function run(
+    repositoryConfig: string,
+    overrides: Partial<Config> = {},
+    catalogPath = shippedCatalogPath
+  ) {
     db = openDb(":memory:");
     const tickets = createTicketStore(db);
     tickets.registerRepository({
@@ -174,7 +179,8 @@ mcp_servers: {}
   it("admits a command-only fixture without requiring a model subscription", async () => {
     const { tickets, pipelines } = await run(
       "pipelines: { implement: fixture-command }\n",
-      { codexAuthJson: undefined, claudeCodeOauthToken: undefined, kimiCodeApiKey: undefined }
+      { codexAuthJson: undefined, claudeCodeOauthToken: undefined, kimiCodeApiKey: undefined },
+      fixtureCatalogPath
     );
 
     expect(tickets.getByIssueId("issue-1")).toMatchObject({

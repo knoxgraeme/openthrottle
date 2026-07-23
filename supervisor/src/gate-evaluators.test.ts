@@ -18,7 +18,8 @@ import { buildInstalledRuntimeDescriptor } from "./sandbox-runtime.js";
 import { processPipelineInfrastructureFailure } from "./pipeline-control.js";
 import { drainPipelineFeedbackSnapshots, handleGithubEvent, routePipelineProviderEvent } from "./github-events.js";
 
-const catalogPath = fileURLToPath(new URL("../pipelines/catalog.yaml", import.meta.url));
+const catalogPath = fileURLToPath(new URL("./__fixtures__/pipelines/catalog.yaml", import.meta.url));
+const shippedCatalogPath = fileURLToPath(new URL("../pipelines/catalog.yaml", import.meta.url));
 const runtime = buildInstalledRuntimeDescriptor("gate-test/v1");
 const SUBJECT = "c".repeat(40);
 
@@ -40,7 +41,10 @@ describe("deterministic supervisor stage gates", () => {
     database = openDb(":memory:");
     const tickets = createTicketStore(database);
     const pipelines = createPipelineStore(database);
-    const catalog = loadPipelineCatalog(catalogPath, runtime.descriptor);
+    const catalog = loadPipelineCatalog(
+      manifestKey.startsWith("fixture/") ? catalogPath : shippedCatalogPath,
+      runtime.descriptor
+    );
     pipelines.acceptRuntimeDescriptor(runtime);
     pipelines.acceptCatalog(catalog);
     const config = parseRepositoryConfig("pipelines: { investigate: ce/investigate@2 }\ntest: npm test\n");

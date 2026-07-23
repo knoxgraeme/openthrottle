@@ -17,7 +17,8 @@ import {
 import { createPipelineStore, type PipelineInstance, type PipelineStageAttempt } from "./pipeline-store.js";
 import { buildInstalledRuntimeDescriptor } from "./sandbox-runtime.js";
 
-const catalogPath = fileURLToPath(new URL("../pipelines/catalog.yaml", import.meta.url));
+const catalogPath = fileURLToPath(new URL("./__fixtures__/pipelines/catalog.yaml", import.meta.url));
+const shippedCatalogPath = fileURLToPath(new URL("../pipelines/catalog.yaml", import.meta.url));
 const runtime = buildInstalledRuntimeDescriptor("coordinator-test/v1");
 
 describe("pipeline coordinator", () => {
@@ -28,7 +29,10 @@ describe("pipeline coordinator", () => {
     db = openDb(":memory:");
     const tickets = createTicketStore(db);
     const pipelines = createPipelineStore(db);
-    const catalog = loadPipelineCatalog(catalogPath, runtime.descriptor);
+    const catalog = loadPipelineCatalog(
+      manifestKey.startsWith("fixture/") ? catalogPath : shippedCatalogPath,
+      runtime.descriptor
+    );
     pipelines.acceptRuntimeDescriptor(runtime);
     pipelines.acceptCatalog(catalog);
     const config = parseRepositoryConfig("pipelines: { implement: fixture-command }\n");

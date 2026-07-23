@@ -8,7 +8,7 @@ import { loadPipelineCatalog, parseRepositoryConfig } from "./pipeline-manifest.
 import { createPipelineStore } from "./pipeline-store.js";
 import { buildInstalledRuntimeDescriptor, type SandboxRuntime } from "./sandbox-runtime.js";
 
-const catalogPath = fileURLToPath(new URL("../pipelines/catalog.yaml", import.meta.url));
+const catalogPath = fileURLToPath(new URL("./__fixtures__/pipelines/catalog.yaml", import.meta.url));
 
 describe("pipeline effect processor", () => {
   let db: Database.Database | undefined;

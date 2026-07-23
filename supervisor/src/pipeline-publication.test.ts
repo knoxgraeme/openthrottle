@@ -26,7 +26,7 @@ import {
 } from "./pipeline-store.js";
 import { buildInstalledRuntimeDescriptor } from "./sandbox-runtime.js";
 
-const catalogPath = fileURLToPath(new URL("../pipelines/catalog.yaml", import.meta.url));
+const catalogPath = fileURLToPath(new URL("./__fixtures__/pipelines/catalog.yaml", import.meta.url));
 const runtime = buildInstalledRuntimeDescriptor("publication-test/v1");
 const SUBJECT = "c".repeat(40);
 

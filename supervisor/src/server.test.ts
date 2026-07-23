@@ -85,7 +85,7 @@ describe("coordinator-only server", () => {
   function seedPipelineTicket(): void {
     const runtime = buildInstalledRuntimeDescriptor("server-test/v1");
     const catalog = loadPipelineCatalog(
-      fileURLToPath(new URL("../pipelines/catalog.yaml", import.meta.url)),
+      fileURLToPath(new URL("./__fixtures__/pipelines/catalog.yaml", import.meta.url)),
       runtime.descriptor
     );
     pipelines.acceptRuntimeDescriptor(runtime);

@@ -16,7 +16,8 @@ import {
 import { createPipelineStore } from "./pipeline-store.js";
 import { buildInstalledRuntimeDescriptor, loadRuntimeCapabilityDescriptor } from "./sandbox-runtime.js";
 
-const catalogPath = fileURLToPath(new URL("../pipelines/catalog.yaml", import.meta.url));
+const catalogPath = fileURLToPath(new URL("./__fixtures__/pipelines/catalog.yaml", import.meta.url));
+const shippedCatalogPath = fileURLToPath(new URL("../pipelines/catalog.yaml", import.meta.url));
 const runtimeDescriptorPath = fileURLToPath(new URL("../pipelines/runtime-capabilities-v1.json", import.meta.url));
 const retiredHistoryPath = fileURLToPath(new URL("./__fixtures__/retired-pipeline-history-v1.json", import.meta.url));
 const runtime = buildInstalledRuntimeDescriptor("test-runtime/v1");
@@ -66,11 +67,11 @@ describe("pipeline store", () => {
     }
   });
 
-  function setup() {
+  function setup(selectedCatalogPath = catalogPath) {
     db = openDb(":memory:");
     const tickets = createTicketStore(db);
     const pipelines = createPipelineStore(db);
-    const catalog = loadPipelineCatalog(catalogPath, runtime.descriptor);
+    const catalog = loadPipelineCatalog(selectedCatalogPath, runtime.descriptor);
     pipelines.acceptRuntimeDescriptor(runtime);
     pipelines.acceptCatalog(catalog);
     const config = parseRepositoryConfig("pipelines: { implement: implement }\n");
@@ -98,7 +99,7 @@ describe("pipeline store", () => {
   }
 
   it("creates only explicitly configured pipeline graphs", () => {
-    const { tickets, pipelines, catalog, snapshot } = setup();
+    const { tickets, pipelines, catalog, snapshot } = setup(shippedCatalogPath);
     tickets.upsertUnpinned(ticket("unpinned-session"));
     expect(db!.prepare("SELECT execution_mode FROM session_executions WHERE linear_session_id = ?").pluck().get("unpinned-session")).toBeUndefined();
 
@@ -141,7 +142,7 @@ describe("pipeline store", () => {
   });
 
   it("rolls ticket/session/instance state back together when pinning fails", () => {
-    const { tickets, catalog, snapshot } = setup();
+    const { tickets, catalog, snapshot } = setup(shippedCatalogPath);
     const manifest = catalog.manifests.get("ce/implement@2")!;
     expect(() => tickets.upsert({
       ...ticket("broken-session"),
@@ -462,7 +463,7 @@ describe("pipeline store", () => {
       .toThrow(/runtime release openthrottle-snapshot\/v1 was already accepted with a different digest/);
 
     const shippedRuntime = loadRuntimeCapabilityDescriptor(runtimeDescriptorPath, "openthrottle-snapshot/v2");
-    const shippedCatalog = loadPipelineCatalog(catalogPath, shippedRuntime.descriptor);
+    const shippedCatalog = loadPipelineCatalog(shippedCatalogPath, shippedRuntime.descriptor);
     recovered.acceptRuntimeDescriptor(shippedRuntime);
     recovered.acceptCatalog(shippedCatalog);
 
