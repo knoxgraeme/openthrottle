@@ -3,9 +3,13 @@
 import { randomUUID } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
   existsSync,
+  fstatSync,
   mkdtempSync,
+  openSync,
   readFileSync,
+  readSync,
   rmSync,
   writeFileSync,
   mkdirSync,
@@ -217,6 +221,26 @@ export function computeWorkspaceTreeOid(repoDir) {
   }
 }
 
+function restoreWorkspaceTreeOid(repoDir, postSubject, preSubject) {
+  const temporary = mkdtempSync(join(tmpdir(), "ot-stage-restore-"));
+  const indexPath = join(temporary, "index");
+  try {
+    const env = { GIT_INDEX_FILE: indexPath };
+    // Model the agent's observed tree in an executor-owned index, then let Git
+    // apply the exact inverse tree transition to the worktree. Ignored files
+    // remain untouched because they are absent from both canonical subjects.
+    runGit(repoDir, ["read-tree", postSubject], env);
+    runGit(repoDir, ["read-tree", "--reset", "-u", preSubject], env);
+    const restoredSubject = computeWorkspaceTreeOid(repoDir);
+    if (restoredSubject !== preSubject) {
+      throw new Error("fresh-review workspace restoration did not recover the fenced subject");
+    }
+    return restoredSubject;
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+}
+
 export function resolveContextInvocation(request) {
   if (request.contextPolicy === "none") return { mode: "none", nativeSessionId: null, reconstructed: false, readOnly: false };
   if (request.contextPolicy === "fresh") return { mode: "fresh", nativeSessionId: null, reconstructed: false, readOnly: false };
@@ -245,6 +269,66 @@ function defaultExecuteCommand({ command, repoDir, timeoutMs }) {
     stdout: result.stdout ?? "",
     stderr: result.stderr ?? result.error?.message ?? "",
   };
+}
+
+function readCapturedWindow(path, maxBytes = 2 * 1024 * 1024) {
+  const descriptor = openSync(path, "r");
+  try {
+    const size = fstatSync(descriptor).size;
+    if (size === 0) return "";
+    if (size <= maxBytes) {
+      const output = Buffer.alloc(size);
+      readSync(descriptor, output, 0, size, 0);
+      return output.toString("utf8");
+    }
+    const headSize = Math.floor(maxBytes / 2);
+    const tailSize = maxBytes - headSize;
+    const head = Buffer.alloc(headSize);
+    const tail = Buffer.alloc(tailSize);
+    readSync(descriptor, head, 0, headSize, 0);
+    readSync(descriptor, tail, 0, tailSize, size - tailSize);
+    return `${head.toString("utf8")}\n...[${size - maxBytes} output bytes omitted]...\n${tail.toString("utf8")}`;
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+export function runCapturedProcess(command, args, {
+  cwd,
+  env,
+  input,
+  timeout,
+  captureBytes = 2 * 1024 * 1024,
+} = {}) {
+  const captureDir = mkdtempSync(join(tmpdir(), "ot-stage-output-"));
+  const stdoutPath = join(captureDir, "stdout.log");
+  const stderrPath = join(captureDir, "stderr.log");
+  let stdoutDescriptor = openSync(stdoutPath, "w");
+  let stderrDescriptor = openSync(stderrPath, "w");
+  try {
+    const result = spawnSync(command, args, {
+      cwd,
+      env,
+      input,
+      timeout,
+      stdio: ["pipe", stdoutDescriptor, stderrDescriptor],
+    });
+    closeSync(stdoutDescriptor);
+    stdoutDescriptor = -1;
+    closeSync(stderrDescriptor);
+    stderrDescriptor = -1;
+    return {
+      status: result.status,
+      signal: result.signal,
+      error: result.error,
+      stdout: readCapturedWindow(stdoutPath, captureBytes),
+      stderr: readCapturedWindow(stderrPath, captureBytes),
+    };
+  } finally {
+    if (stdoutDescriptor !== -1) closeSync(stdoutDescriptor);
+    if (stderrDescriptor !== -1) closeSync(stderrDescriptor);
+    rmSync(captureDir, { recursive: true, force: true });
+  }
 }
 
 function skillBody(raw) {
@@ -338,12 +422,10 @@ function defaultRunAgent({ request, invocation, repoDir, proposalPath, timeoutMs
   } else {
     throw new Error(`unsupported agent adapter ${agent}`);
   }
-  const result = spawnSync("gosu", ["agent", "env", ...env, command, ...args], {
+  const result = runCapturedProcess("gosu", ["agent", "env", ...env, command, ...args], {
     cwd: repoDir,
-    encoding: "utf8",
     input: stdin,
     timeout: timeoutMs,
-    maxBuffer: 8 * 1024 * 1024,
   });
   const authRead = agent === "codex"
     ? spawnSync("gosu", ["agent", "head", "-c", "262144", "/home/agent/.codex/auth.json"], {
@@ -443,10 +525,14 @@ export function executeStage({
         proposal: failureProposal(String(error), "failure"),
       };
     }
-    const postSubject = computeWorkspaceTreeOid(repoDir);
+    const observedPostSubject = computeWorkspaceTreeOid(repoDir);
+    const readOnlyMutation = invocation.readOnly && observedPostSubject !== preSubject;
+    const gatedSubject = readOnlyMutation
+      ? restoreWorkspaceTreeOid(repoDir, observedPostSubject, preSubject)
+      : observedPostSubject;
     let proposal = execution.proposal;
     let publishedCommit;
-    if (invocation.readOnly && postSubject !== preSubject) {
+    if (readOnlyMutation) {
       proposal = {
         ...failureProposal("A fresh-review stage mutated the workspace.", "semantic_repair_required"),
         findings: [{ severity: "P1", code: "review-mutated-workspace", summary: "Read-only review changed the gated tree." }],
@@ -470,7 +556,7 @@ export function executeStage({
         const headTree = runGit(repoDir, ["rev-parse", "HEAD^{tree}"]);
         const remote = runGit(repoDir, ["ls-remote", "--heads", "origin", `refs/heads/${request.branch}`]);
         const remoteHead = remote.split(/\s+/)[0] ?? "";
-        if (headTree !== postSubject || remoteHead !== head) {
+        if (headTree !== gatedSubject || remoteHead !== head) {
           proposal = {
             ...failureProposal("Publication did not reconcile the gated workspace tree to the pushed branch head.", "semantic_repair_required"),
             findings: [{ severity: "P1", code: "publish-subject-mismatch", summary: "The pushed commit tree is not the gated workspace subject." }],
@@ -489,9 +575,9 @@ export function executeStage({
     const fence = {
       ...request,
       nativeSessionId,
-      subject: postSubject,
+      subject: gatedSubject,
       preSubject,
-      postSubject,
+      postSubject: gatedSubject,
       startedAt,
       completedAt,
     };

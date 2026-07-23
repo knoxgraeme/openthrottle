@@ -186,7 +186,8 @@ the active manifest stage declares `live_steering`, the active run is fenced to
 that attempt, and the selected agent supports injection. Deliveries use the
 durable work store, bind to the pipeline instance/attempt/run/context revision,
 and require an exact sandbox acknowledgement before consumption. Actor exit
-releases unacknowledged deliveries for a later eligible attempt.
+expires and cancels unacknowledged deliveries. Steering is sealed to its owning
+run and attempt and never crosses that boundary into a later actor.
 
 Native session continuation is not steering and is not a task type. It is
 selected solely by the next stage’s context policy and sealed native session id.

@@ -153,14 +153,14 @@ describe("deliverPendingInbox", () => {
     });
   });
 
-  it("re-fences unacknowledged operator steering when its owning actor ends", async () => {
+  it("cancels unacknowledged steering when its owning actor ends", async () => {
     const store = seedRunningTicket();
     const record = store.enqueueInbox({
       issueId: "issue-1",
       sessionId: "session-1",
       runId: "run-1",
       source: "operator",
-      body: "carry this guidance into the continuation",
+      body: "do not carry this guidance across the stage boundary",
     });
     const sandbox = makeSandbox();
     const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
@@ -177,15 +177,12 @@ describe("deliverPendingInbox", () => {
     });
     await deliverPendingInbox({ daytona, store });
 
-    const rebound = store.getInbox(record.id)!;
-    expect(rebound.run_id).toBe("run-2");
-    expect(rebound.delivery_id).not.toBe(firstDeliveryId);
+    const canceled = store.getInbox(record.id)!;
+    expect(canceled.run_id).toBe("run-1");
+    expect(canceled.status).toBe("canceled");
     expect(store.getWorkDelivery(firstDeliveryId)?.status).toBe("expired");
-    expect(store.getWorkDelivery(rebound.delivery_id!)?.status).toBe("dispatched");
-    const latestEnvelope = JSON.parse(
-      (sandbox.fs.uploadFile.mock.calls.at(-1)?.[0] as Buffer).toString("utf8")
-    );
-    expect(latestEnvelope).toMatchObject({ run_id: "run-2", body: record.body });
+    expect(store.getWorkItem(record.id)?.status).toBe("canceled");
+    expect(sandbox.fs.uploadFile).toHaveBeenCalledTimes(1);
   });
 
   it("delivers to Codex tickets, which have a wired drain hook", async () => {
@@ -252,7 +249,7 @@ describe("deliverPendingInbox", () => {
     expect(sandbox.fs.uploadFile).toHaveBeenCalledOnce();
   });
 
-  it("leaves a message pending when the write fails and never throws", async () => {
+  it("cancels a failed steering upload instead of retrying it in a later run", async () => {
     const store = seedRunningTicket();
     const record = store.enqueueInbox({
       issueId: "issue-1",
@@ -273,6 +270,21 @@ describe("deliverPendingInbox", () => {
     expect(store.getInbox(record.id)?.status).toBe("pending");
     expect(store.listPendingInbox("issue-1")).toHaveLength(1);
     expect(errorSpy).toHaveBeenCalled();
+
+    store.finishRun({ runId: "run-1", status: "completed", ticketState: "active" });
+    store.beginRun({
+      issueId: "issue-1",
+      runId: "run-2",
+      taskType: "implement",
+      tokenHash: "next-run-hash",
+      expiresAt: "2999-01-01T00:00:00.000Z",
+    });
+    (sandbox.fs.uploadFile as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    await expect(deliverPendingInbox({ daytona, store })).resolves.toBeUndefined();
+
+    expect(store.getInbox(record.id)?.status).toBe("canceled");
+    expect(store.getWorkItem(record.id)?.status).toBe("canceled");
+    expect(sandbox.fs.uploadFile).toHaveBeenCalledTimes(1);
     errorSpy.mockRestore();
   });
 });

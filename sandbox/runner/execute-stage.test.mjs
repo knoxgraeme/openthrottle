@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -11,6 +11,7 @@ import {
   executeStage,
   extractNativeSessionId,
   resolveContextInvocation,
+  runCapturedProcess,
   runtimeCapabilityDigest,
   stagePrompt,
   validateStageRequest,
@@ -202,11 +203,46 @@ describe("one-stage executor", () => {
       now: clock(),
       runAgent: ({ repoDir }) => {
         writeFileSync(join(repoDir, "file.txt"), "mutated\n");
+        writeFileSync(join(repoDir, "review-output.txt"), "must not escape the review stage\n");
         return { exitCode: 0, proposal: successProposal(), nativeSessionId: "review-session" };
       },
     });
     expect(result.outcome).toBe("semantic_repair_required");
-    expect(JSON.parse(result.artifacts[0].payload).findings[0].code).toBe("review-mutated-workspace");
+    const payload = JSON.parse(result.artifacts[0].payload);
+    expect(payload.findings[0].code).toBe("review-mutated-workspace");
+    expect(payload.repository.subject).toBe(payload.repository.pre_subject);
+    expect(payload.repository.post_subject).toBe(payload.repository.pre_subject);
+    expect(computeWorkspaceTreeOid(input.repoDir)).toBe(payload.repository.subject);
+    expect(readFileSync(join(input.repoDir, "file.txt"), "utf8")).toBe("initial\n");
+    expect(existsSync(join(input.repoDir, "review-output.txt"))).toBe(false);
+  });
+
+  it("streams agent output beyond the old spawn buffer while retaining bounded diagnostics", () => {
+    const result = runCapturedProcess(process.execPath, [
+      "-e",
+      'process.stdout.write("head-marker\\n"); process.stdout.write("x".repeat(9 * 1024 * 1024)); process.stdout.write("\\ntail-marker\\n")',
+    ], { timeout: 10_000 });
+
+    expect(result.status).toBe(0);
+    expect(result.error).toBeUndefined();
+    expect(result.stdout).toContain("head-marker");
+    expect(result.stdout).toContain("output bytes omitted");
+    expect(result.stdout).toContain("tail-marker");
+    expect(Buffer.byteLength(result.stdout)).toBeLessThan(2.1 * 1024 * 1024);
+  });
+
+  it("retains bounded stderr diagnostics beyond the old spawn buffer", () => {
+    const result = runCapturedProcess(process.execPath, [
+      "-e",
+      'process.stderr.write("stderr-head\\n"); process.stderr.write("x".repeat(9 * 1024 * 1024)); process.stderr.write("\\nstderr-tail\\n")',
+    ], { timeout: 10_000 });
+
+    expect(result.status).toBe(0);
+    expect(result.error).toBeUndefined();
+    expect(result.stderr).toContain("stderr-head");
+    expect(result.stderr).toContain("output bytes omitted");
+    expect(result.stderr).toContain("stderr-tail");
+    expect(Buffer.byteLength(result.stderr)).toBeLessThan(2.1 * 1024 * 1024);
   });
 
   it("treats exit zero without a proposal as a non-recoverable failure", () => {

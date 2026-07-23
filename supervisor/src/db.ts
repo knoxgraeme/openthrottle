@@ -756,6 +756,9 @@ export function createTicketStore(db: Database.Database): TicketStore {
   const cancelPendingInboxStmt = db.prepare(
     "UPDATE session_inbox SET status = 'canceled' WHERE linear_issue_id = ? AND status IN ('pending', 'dispatched')"
   );
+  const cancelInboxStmt = db.prepare(
+    "UPDATE session_inbox SET status = 'canceled' WHERE id = ? AND status IN ('pending', 'dispatched')"
+  );
   const getInboxStmt = db.prepare(`
     SELECT si.*, wi.active_delivery_id AS delivery_id, wi.request_hash,
       wi.generation, wi.context_revision, wi.native_session_id,
@@ -1574,6 +1577,7 @@ export function createTicketStore(db: Database.Database): TicketStore {
     listPendingInbox(issueId) {
       const timestamp = now();
       const records = listPendingInboxStmt.all(issueId, timestamp) as SteerInboxRecord[];
+      const deliverable: SteerInboxRecord[] = [];
       for (const record of records) {
         const item = workStore.get(record.id);
         const activeRunId =
@@ -1582,23 +1586,23 @@ export function createTicketStore(db: Database.Database): TicketStore {
         const activeDelivery = record.delivery_id
           ? workStore.getDelivery(record.delivery_id)
           : undefined;
-        if (activeDelivery && activeDelivery.run_id !== activeRunId) {
-          workStore.expireUnacknowledged(
-            activeDelivery.id,
-            activeDelivery.run_id,
-            `owning run ${activeDelivery.run_id} ended before acknowledgement`
-          );
-          db.prepare(`
-            UPDATE session_inbox
-            SET status = 'pending', run_id = ?, delivered_at = NULL
-            WHERE id = ? AND status IN ('pending', 'dispatched')
-          `).run(activeRunId, record.id);
-        } else if (record.status === "pending" && record.delivery_id) {
+        if (record.run_id !== activeRunId || (activeDelivery && activeDelivery.run_id !== activeRunId)) {
+          db.transaction(() => {
+            if (activeDelivery) {
+              workStore.expireUnacknowledged(
+                activeDelivery.id,
+                activeDelivery.run_id,
+                `owning run ${activeDelivery.run_id} ended before acknowledgement`
+              );
+            }
+            cancelInboxStmt.run(record.id);
+            workStore.cancel(record.id, `steering was fenced to ended run ${record.run_id ?? "unknown"}`);
+          })();
           continue;
         }
-        if (record.run_id !== activeRunId) {
-          db.prepare("UPDATE session_inbox SET run_id = ? WHERE id = ?")
-            .run(activeRunId, record.id);
+        if (record.status === "pending" && record.delivery_id) {
+          deliverable.push(getInboxStmt.get(record.id) as SteerInboxRecord);
+          continue;
         }
         workStore.lease({
           workItemId: record.id,
@@ -1611,8 +1615,9 @@ export function createTicketStore(db: Database.Database): TicketStore {
           now: timestamp,
           leaseUntil: new Date(Date.now() + 30_000).toISOString(),
         });
+        deliverable.push(getInboxStmt.get(record.id) as SteerInboxRecord);
       }
-      return records.map((record) => getInboxStmt.get(record.id) as SteerInboxRecord);
+      return deliverable;
     },
     markInboxDispatched(id) {
       const record = getInboxStmt.get(id) as SteerInboxRecord | undefined;

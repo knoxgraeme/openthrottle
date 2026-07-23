@@ -16,7 +16,7 @@ import type { PipelineCoordinatorEvent, PipelineEventArtifact } from "./pipeline
 import { createPipelineStore, type PipelineInstance, type PipelineStageAttempt, type PipelineStore } from "./pipeline-store.js";
 import { buildInstalledRuntimeDescriptor } from "./sandbox-runtime.js";
 import { processPipelineInfrastructureFailure } from "./pipeline-control.js";
-import { drainPipelineFeedbackSnapshots, routePipelineProviderEvent } from "./github-events.js";
+import { drainPipelineFeedbackSnapshots, handleGithubEvent, routePipelineProviderEvent } from "./github-events.js";
 
 const catalogPath = fileURLToPath(new URL("../pipelines/catalog.yaml", import.meta.url));
 const runtime = buildInstalledRuntimeDescriptor("gate-test/v1");
@@ -307,6 +307,32 @@ describe("deterministic supervisor stage gates", () => {
     expect(fixture.tickets.getByIssueId("issue-1")?.run_id).toBeNull();
   });
 
+  it("accepts restored fresh-review evidence and enters the bounded semantic-repair transition", () => {
+    const fixture = setup();
+    const input = event(fixture, "semantic_repair_required", {
+      findings: [{
+        severity: "P1",
+        code: "review-mutated-workspace",
+        summary: "Read-only review changed the gated tree.",
+      }],
+    });
+
+    const transitioned = settleStageEvidence(
+      fixture.pipelines,
+      fixture.tickets,
+      input,
+      { observedSubject: SUBJECT }
+    );
+
+    expect(transitioned).toMatchObject({ status: "dispatchable", immutable_subject: SUBJECT });
+    expect(fixture.tickets.getRun(input.runId!)?.status).toBe("completed");
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "investigate",
+      expected_subject: SUBJECT,
+      reentry_ordinal: 1,
+    });
+  });
+
   it("turns an executor lease expiry into a bounded coordinator retry without semantic artifacts", () => {
     const fixture = setup();
     const transitioned = processPipelineInfrastructureFailure({
@@ -453,6 +479,58 @@ describe("deterministic supervisor stage gates", () => {
     expect(fixture.db.prepare(
       "SELECT evaluator_kind, result FROM pipeline_gate_receipts WHERE attempt_id = ?"
     ).get(fixture.attempt.id)).toEqual({ evaluator_kind: "provider", result: "passed" });
+  });
+
+  it.each([
+    { merged: true, terminalOutcome: "shipped" },
+    { merged: false, terminalOutcome: "no_change" },
+  ])("preserves deferred close evidence when merged=$merged during publication", async ({ merged, terminalOutcome }) => {
+    const fixture = setup("ce/implement@1");
+    fixture.db.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET stage_id = 'provider', native_context_policy = 'none', expected_subject = ?
+      WHERE id = ?
+    `).run(SUBJECT, fixture.attempt.id);
+    fixture.db.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'completion_pending_publication', active_stage_id = 'provider',
+          immutable_subject = ?, published_commit = ?
+      WHERE id = ?
+    `).run(SUBJECT, SUBJECT, fixture.instance.id);
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    fixture.tickets.setSetting("github-head:issue-1", SUBJECT);
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      {} as never,
+      {
+        kind: "pull_request",
+        action: "closed",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 1,
+          html_url: "https://github.com/owner/repo/pull/1",
+          merged,
+          head: { ref: "ot/issue-1", sha: SUBJECT },
+          base: { ref: "main" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    const providerEventId = `github-pull-closed:1:${SUBJECT}`;
+    expect(fixture.pipelines.getInboxEvent(providerEventId)?.status).toBe("pending");
+    expect(fixture.pipelines.getAttempt(fixture.attempt.id)?.status).toBe("pending");
+    expect(fixture.pipelines.getInstance(fixture.instance.id)?.terminal_outcome).toBeNull();
+
+    fixture.db.prepare("UPDATE pipeline_instances SET status = 'waiting_provider' WHERE id = ?")
+      .run(fixture.instance.id);
+    expect(drainDeferredProviderEvidence(fixture.pipelines)).toBe(1);
+    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+      status: "completion_pending_publication",
+      terminal_outcome: terminalOutcome,
+    });
   });
 
   it("fails closed when GitHub's current head differs from the executor-verified commit", () => {

@@ -74,10 +74,18 @@ describe("ticket store", () => {
     });
     expect([first.sequence, second.sequence]).toEqual([1, 2]);
 
+    expect(store.beginRun({
+      issueId: "issue-1",
+      runId: "run-steer",
+      taskType: "implement",
+      tokenHash: "steering-token-hash",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    })).toBe(true);
     const steer = store.enqueueInbox({
       id: "steer-1",
       issueId: "issue-1",
       sessionId: "session-1",
+      runId: "run-steer",
       source: "human",
       body: "Please check the edge case.",
     });

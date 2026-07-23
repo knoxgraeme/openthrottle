@@ -320,6 +320,8 @@ export async function handleGithubEvent(
       });
     }
     if (event.action === "closed") {
+      const providerEventId =
+        `github-pull-closed:${event.pull_request.number}:${event.pull_request.head.sha ?? "unknown"}`;
       if (event.pull_request.head.sha) {
         setAuthoritativeGithubHead(store, ticket.linear_issue_id, event.pull_request.head.sha);
       }
@@ -328,7 +330,7 @@ export async function handleGithubEvent(
         pipelines,
         store,
         ticket,
-        eventId: `github-pull-closed:${event.pull_request.number}:${event.pull_request.head.sha ?? "unknown"}`,
+        eventId: providerEventId,
         outcome: event.pull_request.merged ? "success" : "no_change",
         summary: event.pull_request.merged ? "GitHub reports the pull request merged." : "GitHub reports the pull request closed without merge.",
         evidence: [event.pull_request.html_url],
@@ -339,7 +341,9 @@ export async function handleGithubEvent(
       const currentPipeline = routedPipeline
         ? pipelines.getInstanceForSession(ticket.linear_session_id)
         : undefined;
-      if (currentPipeline && !pipelineIsTerminal(currentPipeline)) {
+      const providerEvidenceDeferred =
+        pipelines.getInboxEvent(providerEventId)?.status === "pending";
+      if (currentPipeline && !pipelineIsTerminal(currentPipeline) && !providerEvidenceDeferred) {
         requestPipelineStop({
           store: pipelines,
           sessionId: ticket.linear_session_id,
