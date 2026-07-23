@@ -81,9 +81,11 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
   const runMatchesInstance = (runId: string, instance: PipelineInstance): boolean => {
     const run = deps.tickets.getRun(runId);
     const attempt = deps.store.getAttemptForRun(runId);
-    return run?.linear_issue_id === instance.linear_issue_id &&
-      run.linear_session_id === instance.linear_session_id &&
-      attempt?.pipeline_instance_id === instance.id;
+    return attempt?.pipeline_instance_id === instance.id &&
+      (!run || (
+        run.linear_issue_id === instance.linear_issue_id &&
+        run.linear_session_id === instance.linear_session_id
+      ));
   };
 
   const resolveStopRunId = (

@@ -402,6 +402,85 @@ describe("pipeline effect processor", () => {
       .toMatchObject({ status: "acknowledged" });
   });
 
+  it("settles the planned actor after a crash between beginRun and bindStageRun", async () => {
+    const { tickets, pipelines, runtime, processor, instance, attempt } =
+      harness("issue-planned-run-stop", "session-planned-run-stop");
+    await processor.drain();
+    const runId = attempt.planned_run_id!;
+
+    db!.transaction(() => {
+      db!.prepare("DELETE FROM run_stage_bindings WHERE run_id = ?").run(runId);
+      db!.prepare("UPDATE pipeline_stage_attempts SET run_id = NULL WHERE id = ?").run(attempt.id);
+    })();
+    expect(tickets.getByIssueId("issue-planned-run-stop")?.run_id).toBe(runId);
+    expect(pipelines.getAttempt(attempt.id)?.run_id).toBeNull();
+    expect(pipelines.getAttemptForRun(runId)?.id).toBe(attempt.id);
+
+    requestPipelineStop({
+      store: pipelines,
+      sessionId: "session-planned-run-stop",
+      eventId: "operator-stop:planned-run-crash-window",
+      reason: "Stopped after recovered dispatch.",
+    });
+    const stop = pipelines.listEffects(instance.id).find((effect) => effect.kind === "stop")!;
+    expect(JSON.parse(stop.payload)).toMatchObject({ runId });
+
+    await processor.drain();
+
+    expect(runtime.stop).toHaveBeenCalledWith(
+      { providerResourceId: "sandbox-issue-planned-run-stop" },
+      "pipeline stop"
+    );
+    expect(tickets.getRun(runId)).toMatchObject({ status: "stopped" });
+    expect(tickets.getByIssueId("issue-planned-run-stop")).toMatchObject({
+      state: "stopped",
+      run_id: null,
+    });
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.id === stop.id))
+      .toMatchObject({ status: "acknowledged" });
+  });
+
+  it("settles a superseded planned actor after a crash before bindStageRun", async () => {
+    const { tickets, pipelines, runtime, processor, instance, attempt } =
+      harness("issue-planned-run-superseded", "session-planned-run-superseded");
+    await processor.drain();
+    const runId = attempt.planned_run_id!;
+
+    db!.transaction(() => {
+      db!.prepare("DELETE FROM run_stage_bindings WHERE run_id = ?").run(runId);
+      db!.prepare("UPDATE pipeline_stage_attempts SET run_id = NULL WHERE id = ?").run(attempt.id);
+    })();
+    tickets.upsertUnpinned({
+      linear_issue_id: "issue-planned-run-superseded",
+      linear_issue_identifier: "ISSUE-PLANNED-RUN-SUPERSEDED",
+      linear_session_id: "session-planned-run-replacement",
+      sandbox_id: "sandbox-planned-run-replacement",
+      branch: "ot/issue-planned-run-superseded",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+    });
+    const stop = pipelines.listEffects(instance.id).find((effect) => effect.kind === "stop")!;
+    expect(JSON.parse(stop.payload)).toMatchObject({ runId });
+
+    await processor.drain();
+
+    expect(runtime.stop).toHaveBeenCalledWith(
+      { providerResourceId: "sandbox-issue-planned-run-superseded" },
+      "pipeline stop"
+    );
+    expect(tickets.getRun(runId)).toMatchObject({ status: "stopped" });
+    expect(tickets.getByIssueId("issue-planned-run-superseded")).toMatchObject({
+      linear_session_id: "session-planned-run-replacement",
+      sandbox_id: "sandbox-planned-run-replacement",
+      state: "active",
+      run_id: null,
+    });
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.id === stop.id))
+      .toMatchObject({ status: "acknowledged" });
+  });
+
   it("recovers an original run binding from a legacy supersede stop intent", async () => {
     const { tickets, pipelines, runtime, processor, instance, attempt } =
       harness("issue-legacy-superseded", "session-legacy-superseded");

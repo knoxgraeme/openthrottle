@@ -266,6 +266,13 @@ function artifactsFor(event: PipelineCoordinatorEvent): CoordinatorArtifactWrite
   return (event.artifacts ?? []).map((artifact) => ({ ...artifact }));
 }
 
+function stopRunId(attempt: PipelineStageAttempt): string | null {
+  // beginRun commits the immutable planned id before bindStageRun records the
+  // attempt binding. A stop authored in that crash window must still carry the
+  // actor id instead of sealing an authoritative null.
+  return attempt.run_id ?? attempt.planned_run_id ?? null;
+}
+
 export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorTransitionWrite {
   const stage = verifyInput(input);
   const eventPayloadHash = digestNormalized(canonicalJson(input.event));
@@ -278,7 +285,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
       pipelineInstanceId: input.instance.id,
       reason: input.event.kind,
       generation: input.instance.generation,
-      runId: input.attempt.run_id ?? null,
+      runId: stopRunId(input.attempt),
       ticketState: input.event.controlTicketState ?? "stopped",
     });
     return {
@@ -348,7 +355,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
             payload: canonicalJson({
               pipelineInstanceId: input.instance.id,
               outcome: exhausted,
-              runId: input.attempt.run_id ?? null,
+              runId: stopRunId(input.attempt),
               ticketState: "error",
             }),
           }] : []),
@@ -387,7 +394,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
             payload: canonicalJson({
               pipelineInstanceId: input.instance.id,
               outcome: "failed",
-              runId: input.attempt.run_id ?? null,
+              runId: stopRunId(input.attempt),
               ticketState: "error",
             }),
           },
@@ -469,7 +476,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
       payload: canonicalJson({
         pipelineInstanceId: input.instance.id,
         outcome: terminal,
-        runId: input.attempt.run_id ?? null,
+        runId: stopRunId(input.attempt),
         ticketState: "error",
       }),
     });

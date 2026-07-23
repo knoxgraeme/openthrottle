@@ -805,7 +805,10 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
         pipelineInstanceId: instance.id,
         reason: "newer_delegated_generation",
         replacementSessionId: currentSessionId,
-        runId: activeAttempt?.run_id ?? null,
+        // beginRun can commit immediately before bindStageRun. Preserve the
+        // immutable planned id across that crash window so the superseding
+        // stop can settle the original actor.
+        runId: activeAttempt?.run_id ?? activeAttempt?.planned_run_id ?? null,
       });
       db.prepare(`
         INSERT INTO pipeline_effect_intents (
@@ -1704,10 +1707,11 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
     },
     getAttemptForRun(runId) {
       return db.prepare(`
-        SELECT psa.* FROM run_stage_bindings rsb
-        JOIN pipeline_stage_attempts psa ON psa.id = rsb.attempt_id
-        WHERE rsb.run_id = ?
-      `).get(runId) as PipelineStageAttempt | undefined;
+        SELECT * FROM pipeline_stage_attempts
+        WHERE run_id = ? OR planned_run_id = ?
+        ORDER BY CASE WHEN run_id = ? THEN 0 ELSE 1 END
+        LIMIT 1
+      `).get(runId, runId, runId) as PipelineStageAttempt | undefined;
     },
     getRepositoryConfigSnapshot(id) {
       return db.prepare("SELECT * FROM repository_config_snapshots WHERE id = ?")
