@@ -6,9 +6,18 @@ SMOKE_DIR="$(mktemp -d)"
 NETWORK="ot-smoke-$RANDOM-$$"
 CLAUDE_CONTAINER="ot-smoke-claude-$RANDOM-$$"
 
+restore_host_ownership() {
+  local path="$1"
+  [[ -d "$path" ]] || return 0
+  docker run --rm --entrypoint sh -v "$path:/state" "$IMAGE" \
+    -c 'chattr -R -i /state >/dev/null 2>&1 || true; chown -R "$1:$2" /state; chmod -R u+rwX /state' \
+    sh "$(id -u)" "$(id -g)"
+}
+
 cleanup() {
   docker rm -f "$CLAUDE_CONTAINER" >/dev/null 2>&1 || true
   docker network rm "$NETWORK" >/dev/null 2>&1 || true
+  restore_host_ownership "$SMOKE_DIR" >/dev/null 2>&1 || true
   rm -rf "$SMOKE_DIR"
 }
 trap cleanup EXIT
@@ -466,8 +475,7 @@ run_stage_smoke() {
   # The runtime intentionally creates its spool root-only. Make this bind
   # mounted smoke fixture readable/removable by the non-root GitHub runner
   # without weakening the permissions used in real Daytona sandboxes.
-  docker run --rm --entrypoint sh -v "$state_dir:/state" "$IMAGE" \
-    -c 'chown -R "$1:$2" /state && chmod -R u+rwX /state' sh "$(id -u)" "$(id -g)"
+  restore_host_ownership "$state_dir"
 
   test "$(git -c "safe.directory=$home_dir/repo" -C "$home_dir/repo" branch --show-current)" = "$branch"
   if [[ "$stage_kind" == fresh_review* ]] &&
@@ -496,7 +504,7 @@ run_stage_smoke() {
     cat "$result" >&2
     exit 1
   fi
-  if find "$home_dir/.ot/outbox" -name "*completion-$run_id.json" -print -quit | rg -q .; then
+  if find "$home_dir/.ot/outbox" -name "*completion-$run_id.json" -print -quit | grep -q .; then
     echo "stage execution emitted an unexpected completion event" >&2
     exit 1
   fi
