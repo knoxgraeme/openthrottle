@@ -740,6 +740,7 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
     const instances = db.prepare(`
       SELECT * FROM pipeline_instances
       WHERE linear_issue_id = ? AND linear_session_id <> ?
+        AND terminal_outcome IS NULL
         AND status NOT IN ('shipped', 'no_change', 'needs_human', 'canceled', 'superseded', 'failed')
     `).all(issueId, currentSessionId) as PipelineInstance[];
     const timestamp = now();
@@ -804,6 +805,7 @@ export function createPipelineStore(db: Database.Database): PipelineStore {
         pipelineInstanceId: instance.id,
         reason: "newer_delegated_generation",
         replacementSessionId: currentSessionId,
+        runId: activeAttempt?.run_id ?? null,
       });
       db.prepare(`
         INSERT INTO pipeline_effect_intents (

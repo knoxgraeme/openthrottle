@@ -4,7 +4,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createTicketStore, openDb } from "./db.js";
 import { createPipelineEffectProcessor } from "./pipeline-effects.js";
 import { requestPipelineStop } from "./pipeline-control.js";
-import { loadPipelineCatalog, parseRepositoryConfig } from "./pipeline-manifest.js";
+import {
+  canonicalJson,
+  digestNormalized,
+  loadPipelineCatalog,
+  parseRepositoryConfig,
+} from "./pipeline-manifest.js";
 import { createPipelineStore } from "./pipeline-store.js";
 import { buildInstalledRuntimeDescriptor, type SandboxRuntime } from "./sandbox-runtime.js";
 
@@ -70,6 +75,22 @@ describe("pipeline effect processor", () => {
     const instance = pipelines.getInstanceForSession(sessionId)!;
     const attempt = pipelines.getActiveAttempt(instance.id)!;
     return { tickets, pipelines, runtime, processor, instance, attempt };
+  }
+
+  function rewriteEffectPayload(
+    effectId: string,
+    transform: (payload: Record<string, unknown>) => Record<string, unknown>
+  ): void {
+    const effect = db!.prepare("SELECT payload FROM pipeline_effect_intents WHERE id = ?")
+      .get(effectId) as { payload: string };
+    const payload = canonicalJson(transform(JSON.parse(effect.payload) as Record<string, unknown>));
+    setEffectPayload(effectId, payload);
+  }
+
+  function setEffectPayload(effectId: string, payload: string): void {
+    db!.prepare(`
+      UPDATE pipeline_effect_intents SET payload = ?, payload_hash = ? WHERE id = ?
+    `).run(payload, digestNormalized(payload), effectId);
   }
 
   it("provisions, seals, credentials, and dispatches the first stage exactly through the durable intent", async () => {
@@ -329,6 +350,170 @@ describe("pipeline effect processor", () => {
     ]));
   });
 
+  it("settles a superseded actor from its original run binding without touching the replacement session", async () => {
+    const { tickets, pipelines, runtime, processor, instance, attempt } =
+      harness("issue-superseded", "session-superseded");
+    await processor.drain();
+    const runId = attempt.planned_run_id!;
+
+    tickets.upsertUnpinned({
+      linear_issue_id: "issue-superseded",
+      linear_issue_identifier: "ISSUE-SUPERSEDED",
+      linear_session_id: "session-replacement",
+      sandbox_id: "sandbox-replacement",
+      branch: "ot/issue-superseded",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+    });
+
+    expect(pipelines.getInstance(instance.id)).toMatchObject({
+      status: "superseded",
+      terminal_outcome: "superseded",
+    });
+    expect(tickets.getByIssueId("issue-superseded")).toMatchObject({
+      linear_session_id: "session-replacement",
+      sandbox_id: "sandbox-replacement",
+      run_id: runId,
+      state: "active",
+    });
+    const stop = pipelines.listEffects(instance.id).find((effect) => effect.kind === "stop")!;
+    expect(JSON.parse(stop.payload)).toMatchObject({ runId });
+
+    await processor.drain();
+
+    expect(runtime.stop).toHaveBeenCalledWith(
+      { providerResourceId: "sandbox-issue-superseded" },
+      "pipeline stop"
+    );
+    expect(tickets.getRun(runId)).toMatchObject({ status: "stopped" });
+    expect(tickets.db.prepare(
+      "SELECT actor_state FROM run_liveness WHERE run_id = ?"
+    ).pluck().get(runId)).toBe("settled");
+    expect(tickets.getByIssueId("issue-superseded")).toMatchObject({
+      linear_session_id: "session-replacement",
+      sandbox_id: "sandbox-replacement",
+      run_id: null,
+      state: "active",
+    });
+    expect(tickets.getSession("session-superseded")?.state).toBe("superseded");
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.id === stop.id))
+      .toMatchObject({ status: "acknowledged" });
+  });
+
+  it("recovers an original run binding from a legacy supersede stop intent", async () => {
+    const { tickets, pipelines, runtime, processor, instance, attempt } =
+      harness("issue-legacy-superseded", "session-legacy-superseded");
+    await processor.drain();
+    const runId = attempt.planned_run_id!;
+
+    tickets.upsertUnpinned({
+      linear_issue_id: "issue-legacy-superseded",
+      linear_issue_identifier: "ISSUE-LEGACY-SUPERSEDED",
+      linear_session_id: "session-legacy-replacement",
+      sandbox_id: "sandbox-legacy-replacement",
+      branch: "ot/issue-legacy-superseded",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+    });
+    const stop = pipelines.listEffects(instance.id).find((effect) => effect.kind === "stop")!;
+    rewriteEffectPayload(stop.id, (payload) => {
+      const { runId: _runId, ...legacyPayload } = payload;
+      return legacyPayload;
+    });
+
+    await processor.drain();
+
+    expect(runtime.stop).toHaveBeenCalledOnce();
+    expect(tickets.getRun(runId)).toMatchObject({ status: "stopped" });
+    expect(tickets.db.prepare(
+      "SELECT actor_state FROM run_liveness WHERE run_id = ?"
+    ).pluck().get(runId)).toBe("settled");
+    expect(tickets.getByIssueId("issue-legacy-superseded")).toMatchObject({
+      linear_session_id: "session-legacy-replacement",
+      sandbox_id: "sandbox-legacy-replacement",
+      run_id: null,
+      state: "active",
+    });
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.id === stop.id))
+      .toMatchObject({ status: "acknowledged" });
+  });
+
+  it("does not project a stop across replacement admission during provider termination", async () => {
+    const { tickets, pipelines, runtime, processor } =
+      harness("issue-concurrent-replacement", "session-concurrent-replacement");
+    await processor.drain();
+    requestPipelineStop({
+      store: pipelines,
+      sessionId: "session-concurrent-replacement",
+      eventId: "operator-stop:concurrent-replacement",
+      reason: "Stopped by test.",
+    });
+    let confirmTermination!: () => void;
+    let reportStopStarted!: () => void;
+    const termination = new Promise<void>((resolve) => { confirmTermination = resolve; });
+    const stopStarted = new Promise<void>((resolve) => { reportStopStarted = resolve; });
+    runtime.stop.mockImplementation(async () => {
+      reportStopStarted();
+      await termination;
+      return { confirmed: true };
+    });
+
+    const draining = processor.drain();
+    await stopStarted;
+    tickets.upsertUnpinned({
+      linear_issue_id: "issue-concurrent-replacement",
+      linear_issue_identifier: "ISSUE-CONCURRENT-REPLACEMENT",
+      linear_session_id: "session-concurrent-successor",
+      sandbox_id: "sandbox-concurrent-successor",
+      branch: "ot/issue-concurrent-replacement",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+    });
+    confirmTermination();
+    await draining;
+
+    expect(tickets.getByIssueId("issue-concurrent-replacement")).toMatchObject({
+      linear_session_id: "session-concurrent-successor",
+      sandbox_id: "sandbox-concurrent-successor",
+      run_id: null,
+      state: "active",
+      last_error: null,
+    });
+    expect(tickets.getSession("session-concurrent-replacement")?.state).toBe("superseded");
+  });
+
+  it("projects a terminal error after the sealed run has already completed", async () => {
+    const { tickets, pipelines, processor, instance, attempt } =
+      harness("issue-completed-terminal", "session-completed-terminal");
+    await processor.drain();
+    const runId = attempt.planned_run_id!;
+    tickets.finishRun({ runId, status: "completed", ticketState: "active" });
+    requestPipelineStop({
+      store: pipelines,
+      sessionId: "session-completed-terminal",
+      eventId: "terminal-error-after-completion",
+      reason: "Terminal pipeline failure.",
+    });
+    const stop = pipelines.listEffects(instance.id).find((effect) => effect.kind === "stop")!;
+    rewriteEffectPayload(stop.id, (payload) => ({ ...payload, ticketState: "error" }));
+
+    await processor.drain();
+
+    expect(tickets.getRun(runId)).toMatchObject({ status: "completed" });
+    expect(tickets.getByIssueId("issue-completed-terminal")).toMatchObject({
+      state: "error",
+      run_id: null,
+    });
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.id === stop.id))
+      .toMatchObject({ status: "acknowledged" });
+  });
+
   it("atomically converts exhausted provisioning into a typed failed terminal and stop cleanup", async () => {
     const { tickets, pipelines, runtime, processor, instance } = harness("issue-3", "session-3");
     runtime.provision.mockRejectedValue(new Error("provider unavailable"));
@@ -390,5 +575,140 @@ describe("pipeline effect processor", () => {
     expect(tickets.getByIssueId("issue-4")).toMatchObject({ state: "error", run_id: attempt.planned_run_id });
     expect(pipelines.listEffects(instance.id).find((effect) => effect.kind === "quarantine"))
       .toMatchObject({ status: "acknowledged" });
+  });
+
+  it("never forwards an invalid sealed stop binding into quarantine", async () => {
+    const { tickets, pipelines, runtime, processor, instance, attempt } =
+      harness("issue-invalid-stop-binding", "session-invalid-stop-binding");
+    await processor.drain();
+    const runId = attempt.planned_run_id!;
+    requestPipelineStop({
+      store: pipelines,
+      sessionId: "session-invalid-stop-binding",
+      eventId: "operator-stop:invalid-binding",
+      reason: "Stopped by test.",
+    });
+    const stop = pipelines.listEffects(instance.id).find((effect) => effect.kind === "stop")!;
+    rewriteEffectPayload(stop.id, (payload) => ({ ...payload, runId: "unrelated-run" }));
+    db!.prepare("UPDATE pipeline_effect_intents SET attempts = 7 WHERE id = ?").run(stop.id);
+
+    await processor.drain();
+    await processor.drain();
+
+    expect(runtime.stop).not.toHaveBeenCalled();
+    expect(runtime.quarantine).toHaveBeenCalledOnce();
+    expect(tickets.getRun("unrelated-run")).toBeUndefined();
+    expect(tickets.getRun(runId)).toMatchObject({ status: "quarantined" });
+    const quarantine = pipelines.listEffects(instance.id)
+      .find((effect) => effect.kind === "quarantine")!;
+    expect(JSON.parse(quarantine.payload)).toMatchObject({ runId });
+    expect(quarantine).toMatchObject({ status: "acknowledged" });
+  });
+
+  it.each([
+    ["malformed JSON", "{"],
+    ["an invalid run binding type", canonicalJson({ runId: 42, ticketState: "stopped" })],
+  ])("exhausts a stop intent with %s instead of leaving it processing", async (_case, payload) => {
+    const { tickets, pipelines, processor, instance, attempt } =
+      harness(`issue-poison-stop-${_case.replaceAll(" ", "-")}`, `session-poison-stop-${_case.replaceAll(" ", "-")}`);
+    await processor.drain();
+    const runId = attempt.planned_run_id!;
+    requestPipelineStop({
+      store: pipelines,
+      sessionId: instance.linear_session_id,
+      eventId: `operator-stop:poison:${_case}`,
+      reason: "Stopped by test.",
+    });
+    const stop = pipelines.listEffects(instance.id).find((effect) => effect.kind === "stop")!;
+    setEffectPayload(stop.id, payload);
+    db!.prepare("UPDATE pipeline_effect_intents SET attempts = 7 WHERE id = ?").run(stop.id);
+
+    await expect(processor.drain()).resolves.toBeUndefined();
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.id === stop.id))
+      .toMatchObject({ status: "dead", attempts: 8 });
+
+    await processor.drain();
+    expect(tickets.getRun(runId)).toMatchObject({ status: "quarantined" });
+  });
+
+  it("projects an exhausted terminal stop after its sealed run already completed", async () => {
+    const { tickets, pipelines, runtime, processor, instance, attempt } =
+      harness("issue-completed-stop-exhaustion", "session-completed-stop-exhaustion");
+    await processor.drain();
+    const runId = attempt.planned_run_id!;
+    tickets.finishRun({ runId, status: "completed", ticketState: "active" });
+    requestPipelineStop({
+      store: pipelines,
+      sessionId: instance.linear_session_id,
+      eventId: "terminal-error-stop-exhaustion",
+      reason: "Terminal pipeline failure.",
+    });
+    const stop = pipelines.listEffects(instance.id).find((effect) => effect.kind === "stop")!;
+    rewriteEffectPayload(stop.id, (payload) => ({ ...payload, ticketState: "error" }));
+    db!.prepare("UPDATE pipeline_effect_intents SET attempts = 7 WHERE id = ?").run(stop.id);
+    runtime.stop.mockResolvedValue({ confirmed: false });
+
+    await processor.drain();
+    await processor.drain();
+
+    expect(tickets.getRun(runId)).toMatchObject({ status: "completed" });
+    expect(runtime.quarantine).toHaveBeenCalledOnce();
+    expect(tickets.getByIssueId("issue-completed-stop-exhaustion")).toMatchObject({
+      state: "error",
+      run_id: null,
+      last_error: expect.stringContaining("did not confirm termination"),
+    });
+  });
+
+  it("quarantines and settles a legacy superseded stop without poisoning its replacement", async () => {
+    const { tickets, pipelines, runtime, processor, instance, attempt } =
+      harness("issue-superseded-quarantine", "session-superseded-quarantine");
+    await processor.drain();
+    const runId = attempt.planned_run_id!;
+    tickets.upsertUnpinned({
+      linear_issue_id: "issue-superseded-quarantine",
+      linear_issue_identifier: "ISSUE-SUPERSEDED-QUARANTINE",
+      linear_session_id: "session-quarantine-replacement",
+      sandbox_id: "sandbox-quarantine-replacement",
+      branch: "ot/issue-superseded-quarantine",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+    });
+    const stop = pipelines.listEffects(instance.id).find((effect) => effect.kind === "stop")!;
+    rewriteEffectPayload(stop.id, (payload) => {
+      const { runId: _runId, ...legacyPayload } = payload;
+      return legacyPayload;
+    });
+    db!.prepare("UPDATE pipeline_effect_intents SET attempts = 7 WHERE id = ?").run(stop.id);
+    runtime.stop.mockResolvedValue({ confirmed: false });
+
+    await processor.drain();
+    await processor.drain();
+
+    expect(runtime.quarantine).toHaveBeenCalledOnce();
+    expect(tickets.getRun(runId)).toMatchObject({ status: "quarantined" });
+    expect(tickets.getByIssueId("issue-superseded-quarantine")).toMatchObject({
+      linear_session_id: "session-quarantine-replacement",
+      sandbox_id: "sandbox-quarantine-replacement",
+      run_id: runId,
+      state: "active",
+      last_error: null,
+    });
+
+    expect(tickets.settleQuarantinedRun({
+      runId,
+      status: "stopped",
+      ticketState: "error",
+      failureTail: "old runtime termination confirmed",
+    })).toMatchObject({ status: "stopped" });
+    expect(tickets.getByIssueId("issue-superseded-quarantine")).toMatchObject({
+      linear_session_id: "session-quarantine-replacement",
+      sandbox_id: "sandbox-quarantine-replacement",
+      run_id: null,
+      state: "active",
+      last_error: null,
+    });
   });
 });

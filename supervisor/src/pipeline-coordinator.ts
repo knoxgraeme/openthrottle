@@ -278,6 +278,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
       pipelineInstanceId: input.instance.id,
       reason: input.event.kind,
       generation: input.instance.generation,
+      runId: input.attempt.run_id ?? null,
       ticketState: input.event.controlTicketState ?? "stopped",
     });
     return {
@@ -344,7 +345,12 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
           ...(exhausted === "failed" ? [{
             kind: "stop" as const,
             idempotencyKey: `stop:${input.instance.id}:reentry-exhausted`,
-            payload: canonicalJson({ pipelineInstanceId: input.instance.id, outcome: exhausted, ticketState: "error" }),
+            payload: canonicalJson({
+              pipelineInstanceId: input.instance.id,
+              outcome: exhausted,
+              runId: input.attempt.run_id ?? null,
+              ticketState: "error",
+            }),
           }] : []),
         ],
       };
@@ -378,7 +384,12 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
           {
             kind: "stop",
             idempotencyKey: `stop:${input.instance.id}:attempts-exhausted`,
-            payload: canonicalJson({ pipelineInstanceId: input.instance.id, outcome: "failed", ticketState: "error" }),
+            payload: canonicalJson({
+              pipelineInstanceId: input.instance.id,
+              outcome: "failed",
+              runId: input.attempt.run_id ?? null,
+              ticketState: "error",
+            }),
           },
         ],
       };
@@ -458,6 +469,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
       payload: canonicalJson({
         pipelineInstanceId: input.instance.id,
         outcome: terminal,
+        runId: input.attempt.run_id ?? null,
         ticketState: "error",
       }),
     });

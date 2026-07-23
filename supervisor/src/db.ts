@@ -986,22 +986,34 @@ export function createTicketStore(db: Database.Database): TicketStore {
         params.owner
       );
       if (update.changes !== 1) return undefined;
-      db.prepare(`
-        UPDATE tickets SET
-          running_since = NULL, run_id = NULL,
-          state = COALESCE(?, state), pr_url = COALESCE(?, pr_url),
-          total_cost_usd = total_cost_usd + COALESCE(?, 0),
-          last_error = ?, updated_at = ?
-        WHERE linear_issue_id = ? AND run_id = ?
-      `).run(
-        params.ticketState ?? null,
-        params.prUrl ?? null,
-        params.costUsd ?? null,
-        params.failureTail ?? null,
-        completedAt,
-        existing.linear_issue_id,
-        params.runId
-      );
+      const ticket = getByIssueIdStmt.get(existing.linear_issue_id) as Ticket | undefined;
+      if (existing.linear_session_id && ticket?.linear_session_id !== existing.linear_session_id) {
+        // A newer delegated session may retain the old run id solely as an
+        // exclusivity fence while its predecessor stops. Release that fence,
+        // but do not project the predecessor's state, PR, cost, or error onto
+        // the replacement session.
+        db.prepare(`
+          UPDATE tickets SET running_since = NULL, run_id = NULL, updated_at = ?
+          WHERE linear_issue_id = ? AND run_id = ?
+        `).run(completedAt, existing.linear_issue_id, params.runId);
+      } else {
+        db.prepare(`
+          UPDATE tickets SET
+            running_since = NULL, run_id = NULL,
+            state = COALESCE(?, state), pr_url = COALESCE(?, pr_url),
+            total_cost_usd = total_cost_usd + COALESCE(?, 0),
+            last_error = ?, updated_at = ?
+          WHERE linear_issue_id = ? AND run_id = ?
+        `).run(
+          params.ticketState ?? null,
+          params.prUrl ?? null,
+          params.costUsd ?? null,
+          params.failureTail ?? null,
+          completedAt,
+          existing.linear_issue_id,
+          params.runId
+        );
+      }
       db.prepare(`
         UPDATE run_liveness
         SET actor_state = 'settled', termination_confirmed_at = ?, updated_at = ?
@@ -1044,10 +1056,13 @@ export function createTicketStore(db: Database.Database): TicketStore {
       const run = getRunStmt.get(runId) as Run;
       // Preserve run_id/running_since: quarantine intentionally retains ticket
       // exclusivity until an operator proves the old actor is gone.
-      db.prepare(`
-        UPDATE tickets SET state = 'error', last_error = ?, updated_at = ?
-        WHERE linear_issue_id = ? AND run_id = ?
-      `).run(reason, timestamp, run.linear_issue_id, runId);
+      const ticket = getByIssueIdStmt.get(run.linear_issue_id) as Ticket | undefined;
+      if (!run.linear_session_id || ticket?.linear_session_id === run.linear_session_id) {
+        db.prepare(`
+          UPDATE tickets SET state = 'error', last_error = ?, updated_at = ?
+          WHERE linear_issue_id = ? AND run_id = ?
+        `).run(reason, timestamp, run.linear_issue_id, runId);
+      }
       return run;
     }
   );
@@ -1060,19 +1075,27 @@ export function createTicketStore(db: Database.Database): TicketStore {
       UPDATE runs SET status = ?, completed_at = ?, failure_tail = ?, pr_url = COALESCE(?, pr_url)
       WHERE id = ? AND status = 'quarantined'
     `).run(params.status, completedAt, params.failureTail ?? null, params.prUrl ?? null, params.runId);
-    db.prepare(`
-      UPDATE tickets SET running_since = NULL, run_id = NULL,
-        state = COALESCE(?, state), pr_url = COALESCE(?, pr_url),
-        last_error = ?, updated_at = ?
-      WHERE linear_issue_id = ? AND run_id = ?
-    `).run(
-      params.ticketState ?? null,
-      params.prUrl ?? null,
-      params.failureTail ?? null,
-      completedAt,
-      existing.linear_issue_id,
-      params.runId
-    );
+    const ticket = getByIssueIdStmt.get(existing.linear_issue_id) as Ticket | undefined;
+    if (existing.linear_session_id && ticket?.linear_session_id !== existing.linear_session_id) {
+      db.prepare(`
+        UPDATE tickets SET running_since = NULL, run_id = NULL, updated_at = ?
+        WHERE linear_issue_id = ? AND run_id = ?
+      `).run(completedAt, existing.linear_issue_id, params.runId);
+    } else {
+      db.prepare(`
+        UPDATE tickets SET running_since = NULL, run_id = NULL,
+          state = COALESCE(?, state), pr_url = COALESCE(?, pr_url),
+          last_error = ?, updated_at = ?
+        WHERE linear_issue_id = ? AND run_id = ?
+      `).run(
+        params.ticketState ?? null,
+        params.prUrl ?? null,
+        params.failureTail ?? null,
+        completedAt,
+        existing.linear_issue_id,
+        params.runId
+      );
+    }
     db.prepare(`
       UPDATE run_liveness SET actor_state = 'settled', termination_confirmed_at = ?, updated_at = ?
       WHERE run_id = ? AND actor_state = 'quarantined'
