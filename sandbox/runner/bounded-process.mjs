@@ -15,6 +15,7 @@ const PROCESS_HELPER = fileURLToPath(new URL("./bounded-process-helper.mjs", imp
 const DEFAULT_KILL_AFTER_MS = 5_000;
 const EXIT_DRAIN_MS = 250;
 const HELPER_DEADLINE_SLACK_MS = 1_000;
+const MAX_PID_FILE_BYTES = 32;
 
 function readCapturedWindow(path, maxBytes) {
   const descriptor = openSync(path, "r");
@@ -38,10 +39,58 @@ function readCapturedWindow(path, maxBytes) {
   }
 }
 
+function readRecordedChildPid(path) {
+  const descriptor = openSync(path, "r");
+  try {
+    const metadata = fstatSync(descriptor);
+    if (!metadata.isFile() || metadata.size > MAX_PID_FILE_BYTES) {
+      throw new Error("bounded process helper recorded an invalid child PID");
+    }
+    if (metadata.size === 0) return null;
+    const contents = Buffer.alloc(metadata.size);
+    readSync(descriptor, contents, 0, metadata.size, 0);
+    const value = contents.toString("utf8");
+    if (!/^[1-9][0-9]{0,9}\n?$/.test(value)) {
+      throw new Error("bounded process helper recorded an invalid child PID");
+    }
+    const pid = Number(value.trim());
+    if (!Number.isSafeInteger(pid) || pid <= 1 || pid > 2_147_483_647) {
+      throw new Error("bounded process helper recorded an invalid child PID");
+    }
+    return pid;
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function killRecordedChildGroup(path) {
+  const pid = readRecordedChildPid(path);
+  if (pid === null) return;
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch (error) {
+    if (error?.code !== "ESRCH") throw error;
+  }
+}
+
+function helperFailure(helper, helperDeadlineMs, cleanupError) {
+  const diagnostics = [];
+  if (helper.error?.code === "ETIMEDOUT" && helperDeadlineMs !== undefined) {
+    diagnostics.push(`timed out after ${helperDeadlineMs}ms`);
+  }
+  if (helper.error?.message) diagnostics.push(helper.error.message);
+  if (helper.signal) diagnostics.push(`terminated by ${helper.signal}`);
+  if (helper.status !== null && helper.status !== 0) diagnostics.push(`exited with status ${helper.status}`);
+  if (helper.stderr?.trim()) diagnostics.push(helper.stderr.trim());
+  if (cleanupError) diagnostics.push(`command process-group cleanup failed: ${cleanupError.message}`);
+  const failure = new Error(`bounded process helper failed: ${diagnostics.join("; ") || "unknown error"}`);
+  if (helper.error?.code) failure.code = helper.error.code;
+  return failure;
+}
+
 // A trusted async helper owns a detached process group and escalates
-// SIGTERM -> SIGKILL. The caller remains synchronous without relying on
-// spawnSync's timeout behavior, which can wait forever for a signal-ignoring
-// child.
+// SIGTERM -> SIGKILL. A private PID handoff lets the synchronous caller reap
+// that group if its defense-in-depth helper deadline fires.
 export function runCapturedProcess(command, args, {
   cwd,
   env,
@@ -60,8 +109,10 @@ export function runCapturedProcess(command, args, {
   const captureDir = mkdtempSync(join(tmpdir(), "ot-stage-output-"));
   const stdoutPath = join(captureDir, "stdout.log");
   const stderrPath = join(captureDir, "stderr.log");
+  const childPidPath = join(captureDir, "child.pid");
   closeSync(openSync(stdoutPath, "w", 0o600));
   closeSync(openSync(stderrPath, "w", 0o600));
+  closeSync(openSync(childPidPath, "w", 0o600));
   try {
     const helper = spawnSync(process.execPath, [PROCESS_HELPER], {
       input: JSON.stringify({
@@ -76,6 +127,7 @@ export function runCapturedProcess(command, args, {
         captureBytes,
         stdoutPath,
         stderrPath,
+        childPidPath,
       }),
       encoding: "utf8",
       maxBuffer: 1024 * 1024,
@@ -83,7 +135,13 @@ export function runCapturedProcess(command, args, {
       killSignal: "SIGKILL",
     });
     if (helper.error || helper.status !== 0) {
-      throw new Error(`bounded process helper failed: ${helper.stderr ?? helper.error?.message ?? "unknown error"}`);
+      let cleanupError;
+      try {
+        killRecordedChildGroup(childPidPath);
+      } catch (error) {
+        cleanupError = error;
+      }
+      throw helperFailure(helper, helperDeadlineMs, cleanupError);
     }
     const metadata = JSON.parse(helper.stdout);
     return {

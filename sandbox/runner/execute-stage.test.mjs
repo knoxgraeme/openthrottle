@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   existsSync,
   lstatSync,
@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RUNTIME_DESCRIPTOR, canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
@@ -32,6 +33,31 @@ const directories = [];
 afterEach(() => {
   for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
+
+function processGroupExists(pid) {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    // macOS can report EPERM briefly while the killed orphan is awaiting
+    // reaping; it still means the group has not disappeared yet.
+    if (error?.code === "EPERM") return true;
+    throw error;
+  }
+}
+
+function expectProcessGroupGone(pid) {
+  const reapedBy = Date.now() + 1_000;
+  while (processGroupExists(pid) && Date.now() < reapedBy) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  }
+  try {
+    expect(processGroupExists(pid)).toBe(false);
+  } finally {
+    if (processGroupExists(pid)) process.kill(-pid, "SIGKILL");
+  }
+}
 
 function repository() {
   const directory = mkdtempSync(join(tmpdir(), "ot-stage-repo-"));
@@ -443,6 +469,70 @@ describe("one-stage executor", () => {
     expect(result.stdout).toContain("direct-stdout");
     expect(result.stderr).toContain("direct-stderr");
     expect(Date.now() - startedAt).toBeLessThan(2_500);
+  });
+
+  it("kills the command process group when the outer helper deadline fires", () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "ot-bounded-helper-"));
+    directories.push(stateDir);
+    const commandPidPath = join(stateDir, "command.pid");
+    const startedAt = Date.now();
+    let failure;
+
+    try {
+      runCapturedProcess(process.execPath, [
+        "-e",
+        `
+          const { writeFileSync } = require("node:fs");
+          writeFileSync(${JSON.stringify(commandPidPath)}, String(process.pid));
+          process.stdin.resume();
+          process.stdin.once("end", () => process.kill(process.ppid, "SIGSTOP"));
+          setInterval(() => {}, 1000);
+        `,
+      ], { timeout: 100, killAfterMs: 50 });
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure.code).toBe("ETIMEDOUT");
+    expect(failure.message).toContain("timed out after 1400ms");
+    expect(Date.now() - startedAt).toBeLessThan(3_000);
+
+    const commandPidText = readFileSync(commandPidPath, "utf8");
+    expect(commandPidText).toMatch(/^[1-9][0-9]*$/);
+    const commandPid = Number(commandPidText);
+    expectProcessGroupGone(commandPid);
+  });
+
+  it("kills the command process group when the PID handoff cannot be written", () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "ot-bounded-handoff-"));
+    directories.push(stateDir);
+    const helperPath = fileURLToPath(new URL("./bounded-process-helper.mjs", import.meta.url));
+    const result = spawnSync(process.execPath, [helperPath], {
+      input: JSON.stringify({
+        command: process.execPath,
+        args: ["-e", "setInterval(() => {}, 1000)"],
+        cwd: null,
+        env: null,
+        input: null,
+        timeoutMs: 5_000,
+        killAfterMs: 50,
+        exitDrainMs: 250,
+        captureBytes: 1024,
+        stdoutPath: join(stateDir, "stdout.log"),
+        stderrPath: join(stateDir, "stderr.log"),
+        childPidPath: stateDir,
+      }),
+      encoding: "utf8",
+      timeout: 3_000,
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("failed to record command process group");
+    const commandPid = Number(result.stderr.match(/command process group ([1-9][0-9]*)/)?.[1]);
+    expect(Number.isSafeInteger(commandPid)).toBe(true);
+    expectProcessGroupGone(commandPid);
   });
 
   it("terminates agent descendants before repository observation can continue", () => {

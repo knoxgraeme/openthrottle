@@ -84,6 +84,27 @@ const child = spawn(input.command, input.args, {
   detached: true,
   stdio: ["pipe", "pipe", "pipe"],
 });
+if (Number.isSafeInteger(child.pid) && child.pid > 1) {
+  try {
+    writeFileSync(input.childPidPath, `${child.pid}\n`);
+  } catch (writeError) {
+    let cleanupError;
+    try {
+      signalGroup("SIGKILL");
+    } catch (error) {
+      cleanupError = error;
+    }
+    const diagnostics = [
+      `failed to record command process group ${child.pid}: ${writeError.message}`,
+    ];
+    if (cleanupError) {
+      diagnostics.push(`command process-group cleanup failed: ${cleanupError.message}`);
+    }
+    const failure = new Error(diagnostics.join("; "), { cause: writeError });
+    if (writeError?.code) failure.code = writeError.code;
+    throw failure;
+  }
+}
 child.stdout.pipe(stdout);
 child.stderr.pipe(stderr);
 
