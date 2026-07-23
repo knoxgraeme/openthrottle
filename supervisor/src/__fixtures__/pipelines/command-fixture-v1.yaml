@@ -1,0 +1,29 @@
+schema: openthrottle.pipeline/v1
+id: fixture/command
+version: 1
+description: Non-CE command-only pipeline used to prove core neutrality.
+entry_stage: command
+max_attempts: 3
+requires:
+  protocol: stage-executor@1
+  capabilities: [command/run@1]
+stages:
+  - id: command
+    executor: { kind: command, capability: command/run@1 }
+    evaluator:
+      kind: command
+      assurance: executor_verified
+      required_artifacts: [command_result]
+    context: none
+    live_steering: false
+    credentials: [repo.read]
+    produces: [command_result, stage_result]
+    transitions:
+      success: { terminal: shipped }
+      no_change: { terminal: no_change }
+      semantic_repair_required: { terminal: failed }
+      retryable_infrastructure_failure: { to: command, max_reentries: 2, on_exhausted: failed }
+      needs_human: { terminal: needs_human }
+      canceled: { terminal: canceled }
+      superseded: { terminal: superseded }
+      failure: { terminal: failed }

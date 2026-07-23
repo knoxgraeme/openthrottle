@@ -342,65 +342,82 @@ export async function branchExists(
   return true;
 }
 
-async function githubGraphQL<T>(
-  client: GithubClient,
-  query: string,
-  variables: Record<string, unknown>
-): Promise<T> {
-  const fetchImpl = client.fetch ?? fetch;
-  const response = await fetchImpl(`${client.apiBaseUrl ?? "https://api.github.com"}/graphql`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${client.token}`,
-    },
-    body: JSON.stringify({ query, variables }),
-    signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
-  });
-  const json = (await response.json()) as { data?: T; errors?: unknown[] };
-  if (!response.ok || json.errors?.length) {
-    throw new Error(`GitHub GraphQL error (${response.status}): ${JSON.stringify(json.errors ?? json)}`);
-  }
-  if (!json.data) throw new Error("GitHub GraphQL response missing data");
-  return json.data;
+export interface RepositoryConfigAtCommit {
+  repository: string;
+  branch: string;
+  baseCommit: string;
+  blobSha: string;
+  content: string;
 }
 
-// Best-effort skip for already-resolved queued feedback (Phase 1 item 7): a
-// prior resume may have addressed several queued review comments/threads at
-// once, so re-litigating a resolved thread wastes a round. Returns false (do
-// not skip) when the PR has no review threads at all — that covers plain PR
-// conversation comments, which never create a review thread to resolve.
-export async function areAllReviewThreadsResolved(
+// Resolve branch state once, then fetch repository configuration by that exact
+// commit. The returned blob/commit pair is suitable for sealing into a pipeline
+// instance; later branch or working-tree changes cannot reinterpret it.
+export async function getRepositoryConfigAtCommit(
   client: GithubClient,
-  repo: string,
-  pullNumber: number
-): Promise<boolean> {
-  const [owner, name] = repo.split("/");
-  const data = await githubGraphQL<{
-    repository?: {
-      pullRequest?: { reviewThreads?: { nodes?: Array<{ isResolved: boolean }> } };
-    };
+  repository: string,
+  branch: string
+): Promise<RepositoryConfigAtCommit> {
+  const commit = await githubRequest<{ sha: string }>(
+    client,
+    `/repos/${repository}/commits/${encodeURIComponent(branch)}`
+  );
+  if (!/^[a-f0-9]{40}$/i.test(commit.sha)) throw new Error("GitHub returned an invalid base commit SHA");
+  const file = await githubRequest<{
+    type: string;
+    sha: string;
+    encoding: string;
+    content: string;
+    size: number;
   }>(
     client,
-    `query PullRequestReviewThreads($owner: String!, $name: String!, $number: Int!) {
-      repository(owner: $owner, name: $name) {
-        pullRequest(number: $number) {
-          reviewThreads(first: 100) { nodes { isResolved } }
-        }
-      }
-    }`,
-    { owner, name, number: pullNumber }
+    `/repos/${repository}/contents/.openthrottle.yml?ref=${encodeURIComponent(commit.sha)}`
   );
-  const nodes = data.repository?.pullRequest?.reviewThreads?.nodes ?? [];
-  return nodes.length > 0 && nodes.every((node) => node.isResolved);
+  if (file.type !== "file" || file.encoding !== "base64" || !/^[a-f0-9]{40}$/i.test(file.sha)) {
+    throw new Error("GitHub returned an invalid .openthrottle.yml blob");
+  }
+  if (!Number.isSafeInteger(file.size) || file.size < 0 || file.size > 256 * 1024) {
+    throw new Error(".openthrottle.yml exceeds the 256 KiB snapshot limit");
+  }
+  const content = Buffer.from(file.content.replace(/\s/g, ""), "base64").toString("utf8");
+  if (Buffer.byteLength(content, "utf8") !== file.size) {
+    throw new Error(".openthrottle.yml content size does not match GitHub metadata");
+  }
+  return {
+    repository,
+    branch,
+    baseCommit: commit.sha.toLowerCase(),
+    blobSha: file.sha.toLowerCase(),
+    content,
+  };
 }
 
-export function commentOnPullRequest(
+export async function upsertPullRequestComment(
   client: GithubClient,
   repo: string,
   pullNumber: number,
+  identity: string,
   body: string
-): Promise<{ html_url: string }> {
+): Promise<{ id: number; html_url: string }> {
+  if (!/^[A-Za-z0-9_.:-]{1,200}$/.test(identity)) throw new Error("GitHub comment identity is unsafe");
+  const marker = `<!-- openthrottle:pipeline-summary:${identity} -->`;
+  if (!body.startsWith(marker)) throw new Error("GitHub pipeline summary is missing its stable marker");
+  let existing: { id: number; body?: string; html_url: string } | undefined;
+  for (let page = 1; page <= 10 && !existing; page += 1) {
+    const comments = await githubRequest<Array<{ id: number; body?: string; html_url: string }>>(
+      client,
+      `/repos/${repo}/issues/${pullNumber}/comments?per_page=100${page === 1 ? "" : `&page=${page}`}`
+    );
+    existing = comments.find((comment) => comment.body?.includes(marker));
+    if (comments.length < 100) break;
+  }
+  if (existing) {
+    return githubRequest(client, `/repos/${repo}/issues/comments/${existing.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ body }),
+    });
+  }
   return githubRequest(client, `/repos/${repo}/issues/${pullNumber}/comments`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

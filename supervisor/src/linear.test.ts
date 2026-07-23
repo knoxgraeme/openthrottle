@@ -8,6 +8,7 @@ import {
   fetchIssueLabels,
   isRecentLinearWebhook,
   labelMatchNames,
+  linearFileUpload,
   parseLinearWebhook,
   verifyLinearSignature,
 } from "./linear.js";
@@ -94,10 +95,10 @@ describe("Linear contracts", () => {
         ...parsed,
         agentSession: {
           ...parsed.agentSession,
-          issue: { ...parsed.agentSession.issue!, labels: { nodes: [{ name: "legacy" }] } },
+          issue: { ...parsed.agentSession.issue!, labels: { nodes: [{ name: "backend" }] } },
         },
       })
-    ).toEqual(["legacy"]);
+    ).toEqual(["backend"]);
   });
 
   it("sends exact activity and session-update GraphQL variables", async () => {
@@ -214,5 +215,34 @@ describe("Linear contracts", () => {
         { sessionId: "session-1", type: "thought", body: "working" }
       )
     ).rejects.toThrow("success: false");
+  });
+
+  it("obtains a private upload target and uploads without forwarding Linear authorization", async () => {
+    const requests: Array<{ url: string; authorization: string | null; body: string }> = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      requests.push({
+        url: String(input),
+        authorization: headers.get("Authorization"),
+        body: String(init?.body ?? ""),
+      });
+      if (String(input) === "https://uploads.linear.test/put") {
+        expect(headers.get("Content-Type")).toBe("application/json");
+        expect(headers.get("x-upload-token")).toBe("opaque");
+        return new Response(null, { status: 200 });
+      }
+      return Response.json({ data: { fileUpload: { success: true, uploadFile: {
+        uploadUrl: "https://uploads.linear.test/put",
+        assetUrl: "https://uploads.linear.test/private/evidence.json",
+        headers: [{ key: "x-upload-token", value: "opaque" }],
+      } } } });
+    }) as unknown as typeof fetch;
+
+    await expect(linearFileUpload(
+      { accessToken: "oauth-secret", fetch: fetchMock },
+      { filename: "evidence.json", contentType: "application/json", content: "{\"ok\":true}" }
+    )).resolves.toEqual({ assetUrl: "https://uploads.linear.test/private/evidence.json" });
+    expect(requests[0]?.authorization).toBe("Bearer oauth-secret");
+    expect(requests[1]?.authorization).toBeNull();
   });
 });

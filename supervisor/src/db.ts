@@ -2,6 +2,23 @@ import Database from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { applyDatabaseMigrations } from "./db-migrations.js";
+import {
+  createWorkStore,
+  type WorkBinding,
+  type WorkDelivery,
+  type WorkItem,
+} from "./work-store.js";
+import {
+  createFeedbackStore,
+  type FeedbackRecordParams,
+  type FeedbackSnapshot,
+  type FeedbackSnapshotEvent,
+} from "./feedback-store.js";
+import {
+  createPipelineStore,
+  type PipelineInstanceSeed,
+} from "./pipeline-store.js";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS tickets (
@@ -18,10 +35,8 @@ CREATE TABLE IF NOT EXISTS tickets (
   run_id TEXT,
   total_cost_usd REAL NOT NULL DEFAULT 0,
   last_error TEXT,
-  preview_token_hash TEXT,
   linear_context TEXT,
   base_branch TEXT NOT NULL DEFAULT 'main',
-  pending_re_review INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -66,26 +81,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS agent_sessions_current_issue_idx
   WHERE state = 'current';
 CREATE INDEX IF NOT EXISTS agent_sessions_issue_generation_idx
   ON agent_sessions(linear_issue_id, generation);
-
-CREATE TABLE IF NOT EXISTS session_work (
-  id TEXT PRIMARY KEY,
-  linear_session_id TEXT NOT NULL,
-  linear_issue_id TEXT NOT NULL,
-  source TEXT NOT NULL,
-  priority INTEGER NOT NULL,
-  body TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',
-  claimed_run_id TEXT,
-  available_at TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  consumed_at TEXT,
-  canceled_at TEXT,
-  UNIQUE(linear_session_id, source, id),
-  FOREIGN KEY(linear_session_id) REFERENCES agent_sessions(id),
-  FOREIGN KEY(linear_issue_id) REFERENCES tickets(linear_issue_id)
-);
-CREATE INDEX IF NOT EXISTS session_work_claim_idx
-  ON session_work(linear_session_id, status, priority, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS agent_sessions_identity_idx
+  ON agent_sessions(id, linear_issue_id, generation);
 
 CREATE TABLE IF NOT EXISTS linear_outbox (
   id TEXT PRIMARY KEY,
@@ -101,6 +98,9 @@ CREATE TABLE IF NOT EXISTS linear_outbox (
   next_attempt_at TEXT NOT NULL,
   processed_at TEXT,
   last_error TEXT,
+  external_id TEXT,
+  external_url TEXT,
+  attachment_url TEXT,
   created_at TEXT NOT NULL,
   UNIQUE(linear_session_id, sequence),
   FOREIGN KEY(run_id) REFERENCES runs(id)
@@ -110,10 +110,10 @@ CREATE INDEX IF NOT EXISTS linear_outbox_process_idx
 CREATE INDEX IF NOT EXISTS linear_outbox_session_order_idx
   ON linear_outbox(linear_session_id, sequence);
 
--- Inbound counterpart of linear_outbox: durable, per-issue steering messages
--- delivered INTO a running sandbox mid-run (the "inbox"). A message is enqueued
--- pending, written into ~/.ot/inbox by the delivery poller, then marked
--- delivered. See docs/SPEC.md "Mid-run steering".
+-- Inbound counterpart of linear_outbox: durable, per-issue steering messages.
+-- A message is leased and dispatched into ~/.ot/inbox, then becomes consumable
+-- only after the sandbox records an acknowledgement for the exact fenced
+-- delivery. See docs/SPEC.md "Mid-run steering".
 CREATE TABLE IF NOT EXISTS session_inbox (
   id TEXT PRIMARY KEY,
   linear_issue_id TEXT NOT NULL,
@@ -185,10 +185,8 @@ const TICKET_MIGRATIONS: Array<[string, string]> = [
   ["run_id", "ALTER TABLE tickets ADD COLUMN run_id TEXT"],
   ["total_cost_usd", "ALTER TABLE tickets ADD COLUMN total_cost_usd REAL NOT NULL DEFAULT 0"],
   ["last_error", "ALTER TABLE tickets ADD COLUMN last_error TEXT"],
-  ["preview_token_hash", "ALTER TABLE tickets ADD COLUMN preview_token_hash TEXT"],
   ["linear_context", "ALTER TABLE tickets ADD COLUMN linear_context TEXT"],
   ["base_branch", "ALTER TABLE tickets ADD COLUMN base_branch TEXT NOT NULL DEFAULT 'main'"],
-  ["pending_re_review", "ALTER TABLE tickets ADD COLUMN pending_re_review INTEGER NOT NULL DEFAULT 0"],
 ];
 
 const RUN_MIGRATIONS: Array<[string, string]> = [
@@ -247,16 +245,11 @@ function backfillAgentSessions(db: Database.Database): void {
 
 export type Agent = "claude" | "codex" | "opencode";
 type TicketState = "active" | "closed" | "expired" | "error" | "stopped";
-// Task taxonomy: implement (feature/bug plan) and investigate (debugging) are the
-// two loops; resume is the single continuation mechanism for either loop, fed by
-// a human reply or queued GitHub feedback. `review`/`review-fix` were removed —
-// see docs/SIMPLIFICATION-PLAN.md Phase 1. This is an additive migration: any
-// historical `runs` rows already written with the old task types are left as
-// free-form text (there is no CHECK constraint to violate), and the ticket's
-// `pending_re_review` column stays in the schema — no code reads or writes it
-// anymore.
-export type TaskType = "implement" | "resume" | "investigate";
-type RunStatus = "running" | "completed" | "failed" | "timed_out" | "stopped";
+// The pipeline intent is selected at delegation. Continuation happens inside
+// stage attempts through pinned native-session policy, not as a task type.
+export type TaskType = "implement" | "investigate";
+type TerminalRunStatus = "completed" | "failed" | "timed_out" | "stopped";
+type RunStatus = "running" | "reaping" | "quarantined" | TerminalRunStatus;
 
 export interface Ticket {
   linear_issue_id: string;
@@ -272,7 +265,6 @@ export interface Ticket {
   run_id: string | null;
   total_cost_usd: number;
   last_error: string | null;
-  preview_token_hash: string | null;
   linear_context: string | null;
   base_branch: string;
   created_at: string;
@@ -308,7 +300,10 @@ type TicketUpsert = Pick<
   | "repo"
   | "pr_url"
   | "state"
-> & { base_branch?: string };
+> & {
+  base_branch?: string;
+  pipeline?: Omit<PipelineInstanceSeed, "issueId" | "sessionId" | "generation" | "branch" | "agent">;
+};
 
 interface RepositoryRegistration {
   linear_team_key: string;
@@ -360,7 +355,7 @@ interface SandboxEventRecord {
   event_id: string;
   run_id: string;
   sandbox_id: string;
-  kind: "activity" | "completion" | "plan";
+  kind: "activity" | "plan" | "heartbeat" | "stage_result";
   payload: string;
   status: "pending" | "processing" | "failed" | "processed";
   attempts: number;
@@ -387,7 +382,7 @@ export interface LinearOutboxRecord {
   linear_issue_id: string | null;
   run_id: string | null;
   sequence: number;
-  kind: "activity" | "session_update";
+  kind: "activity" | "session_update" | "pipeline_receipt";
   payload: string;
   payload_hash: string;
   status: "pending" | "processing" | "failed" | "processed" | "dead";
@@ -395,6 +390,9 @@ export interface LinearOutboxRecord {
   next_attempt_at: string;
   processed_at: string | null;
   last_error: string | null;
+  external_id: string | null;
+  external_url: string | null;
+  attachment_url: string | null;
   created_at: string;
 }
 
@@ -405,29 +403,20 @@ export interface SteerInboxRecord {
   run_id: string | null;
   source: "human" | "operator";
   body: string;
-  status: "pending" | "delivered" | "canceled";
+  status: "pending" | "dispatched" | "acknowledged" | "canceled";
   created_at: string;
   delivered_at: string | null;
-}
-
-interface SessionWork {
-  id: string;
-  linear_session_id: string;
-  linear_issue_id: string;
-  source: "human" | "automatic";
-  priority: number;
-  body: string;
-  status: "pending" | "claimed" | "consumed" | "canceled";
-  claimed_run_id: string | null;
-  available_at: string;
-  created_at: string;
-  consumed_at: string | null;
-  canceled_at: string | null;
+  delivery_id: string | null;
+  request_hash: string | null;
+  generation: number | null;
+  context_revision: number | null;
+  native_session_id: string | null;
+  lease_until: string | null;
 }
 
 interface FinishRunParams {
   runId: string;
-  status: Exclude<RunStatus, "running">;
+  status: TerminalRunStatus;
   exitCode?: number;
   costUsd?: number;
   prUrl?: string;
@@ -447,6 +436,7 @@ export function openDb(path: string): Database.Database {
   applyColumnMigrations(db, "webhook_deliveries", DELIVERY_MIGRATIONS);
   applyColumnMigrations(db, "runs", RUN_MIGRATIONS);
   backfillAgentSessions(db);
+  applyDatabaseMigrations(db);
   db.exec(
     "CREATE INDEX IF NOT EXISTS tickets_repo_branch_idx ON tickets(repo, branch);" +
       "CREATE INDEX IF NOT EXISTS tickets_sandbox_idx ON tickets(sandbox_id);" +
@@ -459,6 +449,7 @@ export function openDb(path: string): Database.Database {
 export interface TicketStore {
   db: Database.Database;
   upsert(ticket: TicketUpsert): void;
+  upsertUnpinned(ticket: Omit<TicketUpsert, "pipeline">): void;
   getByIssueId(issueId: string): Ticket | undefined;
   getByIdentifier(identifier: string): Ticket | undefined;
   getByBranch(repo: string, branch: string): Ticket | undefined;
@@ -467,31 +458,23 @@ export interface TicketStore {
   setSandboxId(issueId: string, sandboxId: string | null): void;
   setState(issueId: string, state: TicketState, lastError?: string): void;
   setPrUrl(issueId: string, prUrl: string): void;
-  setPreviewTokenHash(issueId: string, tokenHash: string): void;
   setLinearContext(issueId: string, context: string): void;
-  listActive(): Ticket[];
   listRunning(): Ticket[];
   listAll(): Ticket[];
-  listTicketsWithPendingSessionWork(nowIso: string): Ticket[];
   getCurrentSession(issueId: string): AgentSession | undefined;
   getSession(sessionId: string): AgentSession | undefined;
-  supersedeCurrentSession(issueId: string, newSessionId: string): AgentSession;
   markSessionState(sessionId: string, state: AgentSession["state"]): void;
-  enqueueSessionWork(params: {
-    id: string;
-    linearSessionId: string;
-    issueId: string;
-    source: "human" | "automatic";
-    body: string;
-    priority?: number;
-  }): boolean;
-  claimNextSessionWork(linearSessionId: string, nowIso: string): SessionWork | undefined;
-  markSessionWorkConsumed(workId: string, runId: string): void;
-  releaseSessionWork(workId: string): void;
-  cancelPendingSessionWork(linearSessionId: string): number;
-  cancelSessionWork(workId: string): void;
-  countConsumedAutomaticSessionWork(issueId: string): number;
-  getConsumedSessionWorkForRun(runId: string): SessionWork | undefined;
+  recordProviderFeedback(params: FeedbackRecordParams): {
+    snapshot: FeedbackSnapshot;
+    eventInserted: boolean;
+    snapshotCreated: boolean;
+  };
+  listPendingFeedbackSnapshots(linearSessionId: string, limit?: number): FeedbackSnapshot[];
+  claimFeedbackSnapshot(snapshotId: string, maxRounds: number):
+    | { status: "claimed"; snapshot: FeedbackSnapshot; events: FeedbackSnapshotEvent[] }
+    | { status: "exhausted"; completedRounds: number }
+    | { status: "stale" };
+  consumeFeedbackSnapshot(snapshotId: string): boolean;
   enqueueLinearOutbox(params: {
     id?: string;
     linearSessionId?: string | null;
@@ -501,13 +484,17 @@ export interface TicketStore {
     payload: string;
   }): LinearOutboxRecord;
   claimLinearOutbox(nowIso: string, leaseUntilIso: string, limit: number): LinearOutboxRecord[];
-  markLinearOutboxProcessed(id: string): void;
+  markLinearOutboxProcessed(id: string, receipt?: {
+    externalId?: string | null;
+    externalUrl?: string | null;
+    attachmentUrl?: string | null;
+  }): void;
   markLinearOutboxFailed(id: string, error: string, retryAt: string | null): void;
+  recordLinearOutboxAttachment(id: string, attachmentUrl: string): void;
   getLinearOutbox(id: string): LinearOutboxRecord | undefined;
   listLinearOutbox(): LinearOutboxRecord[];
   registerRepository(input: RepositoryRegistrationInput): RepositoryRegistration;
   getRepositoryRegistration(teamId?: string, teamKey?: string): RepositoryRegistration | undefined;
-  hasRepositoryRegistrations(): boolean;
   listRepositoryRegistrations(): RepositoryRegistration[];
   claimDelivery(claim: DeliveryClaim): boolean;
   claimDeliveryForProcessing(params: {
@@ -527,22 +514,21 @@ export interface TicketStore {
     expiresAt: string;
   }): boolean;
   getRun(runId: string): Run | undefined;
-  getLatestRun(issueId: string): Run | undefined;
   getLatestRunWithLog(issueId: string): Run | undefined;
-  countRunsByType(issueId: string, taskType: TaskType): number;
   finishRun(params: FinishRunParams): Run | undefined;
+  claimRunForReaping(runId: string, owner: string, reason: string): Run | undefined;
+  finishReapingRun(params: FinishRunParams & { owner: string }): Run | undefined;
+  quarantineRun(runId: string, owner: string, reason: string): Run | undefined;
+  settleQuarantinedRun(params: FinishRunParams): Run | undefined;
+  renewRunLiveness(runId: string, heartbeatAt: string): boolean;
   listExpiredRuns(nowIso: string): Run[];
-  // Feature 1 (heartbeat-silence reaper): running runs that have emitted at
-  // least one sandbox event (any kind, including ephemeral heartbeats) whose
-  // most recent one is at or before `cutoffIso`. Runs that have not emitted any
-  // event yet — still in sandbox bootstrap before normalize.mjs starts — are
-  // exempt, so a slow bootstrap is never mistaken for a stall; the hard
-  // wall-clock cap (listExpiredRuns) covers a run that never produces output.
-  // This is the liveness cap.
+  // Running actors whose sealed executor heartbeat is at or before `cutoffIso`.
+  // Before the first heartbeat, started_at is the liveness baseline so a wedged
+  // bootstrap is still bounded independently of semantic agent output.
   listStalledRuns(cutoffIso: string): Run[];
   // Feature 5 (mid-run steering inbox): the inbound counterpart of the Linear
-  // outbox. Messages are enqueued pending, delivered into the running sandbox's
-  // ~/.ot/inbox by the delivery poller, then marked delivered.
+  // outbox. Messages are leased and dispatched into ~/.ot/inbox, then become
+  // consumable only after an exact fenced acknowledgement.
   enqueueInbox(params: {
     id?: string;
     issueId: string;
@@ -552,29 +538,56 @@ export interface TicketStore {
     body: string;
   }): SteerInboxRecord;
   listPendingInbox(issueId: string): SteerInboxRecord[];
-  markInboxDelivered(id: string): void;
+  markInboxDispatched(id: string): void;
+  acknowledgeInboxDelivery(deliveryId: string, binding: WorkBinding & { requestHash: string }): void;
   cancelPendingInbox(issueId: string): number;
   getInbox(id: string): SteerInboxRecord | undefined;
+  getWorkItem(id: string): WorkItem | undefined;
+  getWorkDelivery(id: string): WorkDelivery | undefined;
   insertSandboxEvent(params: {
     eventId: string;
     runId: string;
     sandboxId: string;
-    kind: "activity" | "completion" | "plan";
+    kind: "activity" | "plan" | "heartbeat" | "stage_result";
     payload: string;
   }): SandboxEventRecord;
   getSandboxEvent(eventId: string): SandboxEventRecord | undefined;
-  getLastProcessedSandboxActivity(runId: string): SandboxEventRecord | undefined;
   claimSandboxEvent(eventId: string, nowIso: string, leaseUntilIso: string): SandboxEventRecord | undefined;
   markSandboxEventProcessed(eventId: string): void;
   markSandboxEventFailed(eventId: string, error: string, retryAt: string): void;
   pruneSandboxEvents(beforeIso: string): number;
+  pruneEphemeralLinearOutbox(beforeIso: string): number;
+  acquireSupervisorLease(name: string, owner: string, nowIso: string, leaseUntilIso: string): boolean;
+  releaseSupervisorLease(name: string, owner: string): boolean;
   getSetting(key: string): string | undefined;
   setSetting(key: string, value: string): void;
 }
 
 export function createTicketStore(db: Database.Database): TicketStore {
   const now = () => new Date().toISOString();
+  const workStore = createWorkStore(db);
+  const feedbackStore = createFeedbackStore(db);
+  const pipelineStore = createPipelineStore(db);
   const hashPayload = (payload: string) => createHash("sha256").update(payload).digest("hex");
+  const claimFeedbackSnapshot = (snapshot: FeedbackSnapshot, maxRounds: number) => {
+    const events = feedbackStore.listEvents(snapshot.id);
+    const isConversationSnapshot = events.length > 0 &&
+      events.every((event) => event.kind === "issue_comment");
+    const currentHead = (db.prepare("SELECT value FROM settings WHERE key = ?").get(
+      `github-head:${snapshot.linear_issue_id}`
+    ) as { value: string } | undefined)?.value;
+    if (!isConversationSnapshot && currentHead && currentHead !== snapshot.head_sha) {
+      db.prepare(`
+        UPDATE feedback_snapshots SET status = 'stale'
+        WHERE id = ? AND status IN ('collecting', 'claimed')
+      `).run(snapshot.id);
+      return { status: "stale" as const };
+    }
+    const claim = feedbackStore.claim(snapshot.id, maxRounds);
+    return claim.status === "claimed"
+      ? { ...claim, events }
+      : claim;
+  };
   const upsertStmt = db.prepare(`
     INSERT INTO tickets (
       linear_issue_id, linear_issue_identifier, linear_session_id,
@@ -603,9 +616,6 @@ export function createTicketStore(db: Database.Database): TicketStore {
   const getByPrUrlStmt = db.prepare(
     "SELECT * FROM tickets WHERE lower(repo) = lower(?) AND lower(pr_url) = lower(?)"
   );
-  const countRunsByTypeStmt = db.prepare(
-    "SELECT COUNT(*) AS count FROM runs WHERE linear_issue_id = ? AND task_type = ?"
-  );
   const getBySandboxIdStmt = db.prepare("SELECT * FROM tickets WHERE sandbox_id = ?");
   const setSandboxIdStmt = db.prepare(
     "UPDATE tickets SET sandbox_id = ?, updated_at = ? WHERE linear_issue_id = ?"
@@ -616,16 +626,15 @@ export function createTicketStore(db: Database.Database): TicketStore {
   const setPrUrlStmt = db.prepare(
     "UPDATE tickets SET pr_url = ?, updated_at = ? WHERE linear_issue_id = ?"
   );
-  const setPreviewTokenHashStmt = db.prepare(
-    "UPDATE tickets SET preview_token_hash = ?, updated_at = ? WHERE linear_issue_id = ?"
-  );
   const setLinearContextStmt = db.prepare(
     "UPDATE tickets SET linear_context = ?, updated_at = ? WHERE linear_issue_id = ?"
   );
-  const listActiveStmt = db.prepare("SELECT * FROM tickets WHERE state = 'active'");
-  const listRunningStmt = db.prepare(
-    "SELECT * FROM tickets WHERE run_id IS NOT NULL AND running_since IS NOT NULL ORDER BY running_since"
-  );
+  const listRunningStmt = db.prepare(`
+    SELECT t.* FROM tickets t
+    JOIN runs r ON r.id = t.run_id
+    WHERE t.run_id IS NOT NULL AND t.running_since IS NOT NULL AND r.status = 'running'
+    ORDER BY t.running_since
+  `);
   const listAllStmt = db.prepare("SELECT * FROM tickets ORDER BY created_at DESC");
   const getRepositoryByTeamIdStmt = db.prepare(
     "SELECT * FROM repository_registrations WHERE linear_team_id = ?"
@@ -635,9 +644,6 @@ export function createTicketStore(db: Database.Database): TicketStore {
   );
   const listRepositoryRegistrationsStmt = db.prepare(
     "SELECT * FROM repository_registrations ORDER BY linear_team_key"
-  );
-  const hasRepositoryRegistrationsStmt = db.prepare(
-    "SELECT 1 AS found FROM repository_registrations LIMIT 1"
   );
   const upsertRepositoryRegistrationStmt = db.prepare(`
     INSERT INTO repository_registrations (
@@ -672,55 +678,6 @@ export function createTicketStore(db: Database.Database): TicketStore {
   const markSessionStateStmt = db.prepare(
     "UPDATE agent_sessions SET state = ?, updated_at = ? WHERE id = ?"
   );
-  const insertSessionWorkStmt = db.prepare(`
-    INSERT OR IGNORE INTO session_work (
-      id, linear_session_id, linear_issue_id, source, priority, body,
-      status, available_at, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-  `);
-  const cancelPendingSessionWorkStmt = db.prepare(`
-    UPDATE session_work
-    SET status = 'canceled', canceled_at = ?
-    WHERE linear_session_id = ? AND status = 'pending'
-  `);
-  const cancelSessionWorkStmt = db.prepare(`
-    UPDATE session_work
-    SET status = 'canceled', canceled_at = ?
-    WHERE id = ? AND status IN ('pending', 'claimed')
-  `);
-  const countConsumedAutomaticSessionWorkStmt = db.prepare(`
-    SELECT COUNT(*) AS count FROM session_work
-    WHERE linear_issue_id = ? AND source = 'automatic' AND status = 'consumed'
-  `);
-  const getConsumedSessionWorkForRunStmt = db.prepare(`
-    SELECT * FROM session_work WHERE claimed_run_id = ? AND status = 'consumed' LIMIT 1
-  `);
-  const getSessionWorkStmt = db.prepare("SELECT * FROM session_work WHERE id = ?");
-  const nextSessionWorkStmt = db.prepare(`
-    SELECT * FROM session_work
-    WHERE linear_session_id = ? AND status = 'pending' AND available_at <= ?
-    ORDER BY priority ASC, created_at ASC, id ASC
-    LIMIT 1
-  `);
-  // Recovery net for the drain path: idle (no active run), still-active tickets
-  // whose *current* session has claimable pending work. completeRun is normally
-  // the only thing that drains queued feedback after a run, so a single missed
-  // drain would otherwise strand the work forever; the lifecycle sweep re-drains
-  // these. Matching on the ticket's current linear_session_id avoids reviving
-  // work left over from a superseded session.
-  const listTicketsWithPendingSessionWorkStmt = db.prepare(`
-    SELECT t.* FROM tickets t
-    WHERE t.run_id IS NULL
-      AND t.state = 'active'
-      AND EXISTS (
-        SELECT 1 FROM session_work sw
-        WHERE sw.linear_issue_id = t.linear_issue_id
-          AND sw.linear_session_id = t.linear_session_id
-          AND sw.status = 'pending'
-          AND sw.available_at <= ?
-      )
-    ORDER BY t.updated_at ASC
-  `);
   const nextOutboxSequenceStmt = db.prepare(
     "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM linear_outbox WHERE linear_session_id IS ?"
   );
@@ -741,13 +698,19 @@ export function createTicketStore(db: Database.Database): TicketStore {
   const pruneDeliveriesStmt = db.prepare(
     "DELETE FROM webhook_deliveries WHERE received_at < ?"
   );
-  const pruneSandboxEventsStmt = db.prepare(
-    "DELETE FROM sandbox_events WHERE status = 'processed' AND processed_at < ?"
-  );
+  const pruneSandboxEventsStmt = db.prepare(`
+    DELETE FROM sandbox_events
+    WHERE status = 'processed' AND processed_at < ?
+      AND (kind = 'heartbeat'
+        OR (kind = 'activity' AND json_extract(payload, '$.ephemeral') IS 1))
+  `);
+  const pruneEphemeralLinearOutboxStmt = db.prepare(`
+    DELETE FROM linear_outbox
+    WHERE status = 'processed' AND processed_at < ?
+      AND kind = 'activity'
+      AND json_extract(payload, '$.activity.ephemeral') IS 1
+  `);
   const getRunStmt = db.prepare("SELECT * FROM runs WHERE id = ?");
-  const getLatestRunStmt = db.prepare(
-    "SELECT * FROM runs WHERE linear_issue_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1"
-  );
   const getLatestRunWithLogStmt = db.prepare(
     `SELECT * FROM runs
      WHERE linear_issue_id = ? AND log_tail IS NOT NULL
@@ -756,16 +719,14 @@ export function createTicketStore(db: Database.Database): TicketStore {
   const listExpiredRunsStmt = db.prepare(
     "SELECT * FROM runs WHERE status = 'running' AND expires_at <= ? ORDER BY expires_at"
   );
-  // Only runs that have ALREADY emitted at least one sandbox event and then
-  // gone silent are stall candidates: MAX over no rows is NULL and `NULL <= ?`
-  // is never true, so a run still in sandbox bootstrap (checkout/post_bootstrap/
-  // dev server, before normalize.mjs emits its first event) is never reaped —
-  // a slow bootstrap must not look like a stall. The hard-timeout expiry
-  // (listExpiredRuns) still covers a run that never produces any output.
+  // Liveness is an executor-owned lease, independent of semantic agent output.
+  // Before the first sealed heartbeat, started_at is authoritative so a wedged
+  // bootstrap is bounded too.
   const listStalledRunsStmt = db.prepare(`
     SELECT r.* FROM runs r
-    WHERE r.status = 'running'
-      AND (SELECT MAX(e.created_at) FROM sandbox_events e WHERE e.run_id = r.id) <= ?
+    JOIN run_liveness l ON l.run_id = r.id
+    WHERE r.status = 'running' AND l.actor_state = 'running'
+      AND COALESCE(l.last_heartbeat_at, r.started_at) <= ?
     ORDER BY r.started_at
   `);
   const insertInboxStmt = db.prepare(`
@@ -774,17 +735,39 @@ export function createTicketStore(db: Database.Database): TicketStore {
     ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
   `);
   const listPendingInboxStmt = db.prepare(`
-    SELECT * FROM session_inbox
-    WHERE linear_issue_id = ? AND status = 'pending'
-    ORDER BY created_at ASC, id ASC
+    SELECT si.*, wi.active_delivery_id AS delivery_id, wi.request_hash,
+      wi.generation, wi.context_revision, wi.native_session_id,
+      wd.lease_until
+    FROM session_inbox si
+    LEFT JOIN work_items wi ON wi.id = si.id
+    LEFT JOIN work_deliveries wd ON wd.id = wi.active_delivery_id
+    WHERE si.linear_issue_id = ?
+      AND (si.status = 'pending'
+        OR (si.status = 'dispatched' AND (
+          wd.lease_until <= ? OR wd.run_id IS NOT (
+            SELECT t.run_id FROM tickets t WHERE t.linear_issue_id = si.linear_issue_id
+          )
+        )))
+    ORDER BY si.created_at ASC, si.id ASC
   `);
-  const markInboxDeliveredStmt = db.prepare(
-    "UPDATE session_inbox SET status = 'delivered', delivered_at = ? WHERE id = ? AND status = 'pending'"
+  const markInboxDispatchedStmt = db.prepare(
+    "UPDATE session_inbox SET status = 'dispatched', delivered_at = ? WHERE id = ? AND status IN ('pending', 'dispatched')"
   );
   const cancelPendingInboxStmt = db.prepare(
-    "UPDATE session_inbox SET status = 'canceled' WHERE linear_issue_id = ? AND status = 'pending'"
+    "UPDATE session_inbox SET status = 'canceled' WHERE linear_issue_id = ? AND status IN ('pending', 'dispatched')"
   );
-  const getInboxStmt = db.prepare("SELECT * FROM session_inbox WHERE id = ?");
+  const cancelInboxStmt = db.prepare(
+    "UPDATE session_inbox SET status = 'canceled' WHERE id = ? AND status IN ('pending', 'dispatched')"
+  );
+  const getInboxStmt = db.prepare(`
+    SELECT si.*, wi.active_delivery_id AS delivery_id, wi.request_hash,
+      wi.generation, wi.context_revision, wi.native_session_id,
+      wd.lease_until
+    FROM session_inbox si
+    LEFT JOIN work_items wi ON wi.id = si.id
+    LEFT JOIN work_deliveries wd ON wd.id = wi.active_delivery_id
+    WHERE si.id = ?
+  `);
   const insertSandboxEventStmt = db.prepare(`
     INSERT OR IGNORE INTO sandbox_events (
       event_id, run_id, sandbox_id, kind, payload, status,
@@ -792,19 +775,6 @@ export function createTicketStore(db: Database.Database): TicketStore {
     ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)
   `);
   const getSandboxEventStmt = db.prepare("SELECT * FROM sandbox_events WHERE event_id = ?");
-  // Ephemeral activities (the live progress heartbeat) must never count as the
-  // run's last terminal activity: an agent's terminal `ot-activity
-  // elicitation/response` can be followed by a heartbeat with a newer timestamp
-  // (e.g. Codex reports the command_execution after the file is written), which
-  // would otherwise mask the terminal event and make completion post a generic
-  // response or drain queued work instead of pausing.
-  const getLastProcessedSandboxActivityStmt = db.prepare(`
-    SELECT * FROM sandbox_events
-    WHERE run_id = ? AND kind = 'activity' AND status = 'processed'
-      AND (json_extract(payload, '$.ephemeral') IS NOT 1)
-    ORDER BY processed_at DESC, created_at DESC
-    LIMIT 1
-  `);
   const getSettingStmt = db.prepare("SELECT value FROM settings WHERE key = ?");
   const setSettingStmt = db.prepare(`
     INSERT INTO settings (key, value) VALUES (?, ?)
@@ -882,6 +852,7 @@ export function createTicketStore(db: Database.Database): TicketStore {
           UPDATE tickets
           SET running_since = ?, run_id = ?, state = 'active', last_error = NULL, updated_at = ?
           WHERE linear_issue_id = ? AND running_since IS NULL
+            AND state NOT IN ('stopped', 'closed', 'expired')
         `)
         .run(startedAt, params.runId, startedAt, params.issueId);
       if (update.changes !== 1) return false;
@@ -900,6 +871,10 @@ export function createTicketStore(db: Database.Database): TicketStore {
         startedAt,
         params.expiresAt
       );
+      db.prepare(`
+        INSERT INTO run_liveness (run_id, actor_state, updated_at)
+        VALUES (?, 'running', ?)
+      `).run(params.runId, startedAt);
       return true;
     }
   );
@@ -947,8 +922,209 @@ export function createTicketStore(db: Database.Database): TicketStore {
       existing.linear_issue_id,
       params.runId
     );
+    db.prepare(`
+      UPDATE run_liveness
+      SET actor_state = 'settled', settlement_reason = ?, updated_at = ?
+      WHERE run_id = ? AND actor_state = 'running'
+    `).run(params.status, completedAt, params.runId);
+    workStore.consumeAcknowledgedForRun(params.runId, params.runId);
+    workStore.releaseUnacknowledgedForRun(
+      params.runId,
+      `owning run ${params.runId} ended before acknowledgement`
+    );
     return getRunStmt.get(params.runId) as Run;
   });
+
+  const claimRunForReapingTransaction = db.transaction(
+    (runId: string, owner: string, reason: string): Run | undefined => {
+      const timestamp = now();
+      const existing = getRunStmt.get(runId) as Run | undefined;
+      if (existing?.status === "reaping") {
+        const liveness = db.prepare(`
+          SELECT settlement_owner FROM run_liveness
+          WHERE run_id = ? AND actor_state = 'reaping'
+        `).get(runId) as { settlement_owner: string | null } | undefined;
+        return liveness?.settlement_owner === owner ? existing : undefined;
+      }
+      const update = db.prepare(
+        "UPDATE runs SET status = 'reaping' WHERE id = ? AND status = 'running'"
+      ).run(runId);
+      if (update.changes !== 1) return undefined;
+      const liveness = db.prepare(`
+        UPDATE run_liveness
+        SET actor_state = 'reaping', settlement_owner = ?, settlement_reason = ?, updated_at = ?
+        WHERE run_id = ? AND actor_state = 'running'
+      `).run(owner, reason, timestamp, runId);
+      if (liveness.changes !== 1) throw new Error(`run ${runId} has inconsistent liveness state`);
+      return getRunStmt.get(runId) as Run;
+    }
+  );
+
+  const finishReapingRunTransaction = db.transaction(
+    (params: FinishRunParams & { owner: string }): Run | undefined => {
+      const existing = getRunStmt.get(params.runId) as Run | undefined;
+      if (!existing || existing.status !== "reaping") return undefined;
+      const completedAt = now();
+      const update = db.prepare(`
+        UPDATE runs SET
+          status = ?, completed_at = ?, exit_code = ?, cost_usd = ?,
+          pr_url = ?, failure_tail = ?, log_tail = ?
+        WHERE id = ? AND status = 'reaping'
+          AND EXISTS (
+            SELECT 1 FROM run_liveness l
+            WHERE l.run_id = runs.id AND l.actor_state = 'reaping' AND l.settlement_owner = ?
+          )
+      `).run(
+        params.status,
+        completedAt,
+        params.exitCode ?? null,
+        params.costUsd ?? null,
+        params.prUrl ?? null,
+        params.failureTail ?? null,
+        params.logTail ?? null,
+        params.runId,
+        params.owner
+      );
+      if (update.changes !== 1) return undefined;
+      const ticket = getByIssueIdStmt.get(existing.linear_issue_id) as Ticket | undefined;
+      if (existing.linear_session_id && ticket?.linear_session_id !== existing.linear_session_id) {
+        // A newer delegated session may retain the old run id solely as an
+        // exclusivity fence while its predecessor stops. Release that fence,
+        // but do not project the predecessor's state, PR, cost, or error onto
+        // the replacement session.
+        db.prepare(`
+          UPDATE tickets SET running_since = NULL, run_id = NULL, updated_at = ?
+          WHERE linear_issue_id = ? AND run_id = ?
+        `).run(completedAt, existing.linear_issue_id, params.runId);
+      } else {
+        db.prepare(`
+          UPDATE tickets SET
+            running_since = NULL, run_id = NULL,
+            state = COALESCE(?, state), pr_url = COALESCE(?, pr_url),
+            total_cost_usd = total_cost_usd + COALESCE(?, 0),
+            last_error = ?, updated_at = ?
+          WHERE linear_issue_id = ? AND run_id = ?
+        `).run(
+          params.ticketState ?? null,
+          params.prUrl ?? null,
+          params.costUsd ?? null,
+          params.failureTail ?? null,
+          completedAt,
+          existing.linear_issue_id,
+          params.runId
+        );
+      }
+      db.prepare(`
+        UPDATE run_liveness
+        SET actor_state = 'settled', termination_confirmed_at = ?, updated_at = ?
+        WHERE run_id = ? AND actor_state = 'reaping' AND settlement_owner = ?
+      `).run(completedAt, completedAt, params.runId, params.owner);
+      workStore.consumeAcknowledgedForRun(params.runId, params.runId);
+      workStore.releaseUnacknowledgedForRun(
+        params.runId,
+        `owning run ${params.runId} ended before acknowledgement`
+      );
+      return getRunStmt.get(params.runId) as Run;
+    }
+  );
+
+  const quarantineRunTransaction = db.transaction(
+    (runId: string, owner: string, reason: string): Run | undefined => {
+      const timestamp = now();
+      const existing = getRunStmt.get(runId) as Run | undefined;
+      if (existing?.status === "quarantined") {
+        const liveness = db.prepare(`
+          SELECT settlement_owner FROM run_liveness
+          WHERE run_id = ? AND actor_state = 'quarantined'
+        `).get(runId) as { settlement_owner: string | null } | undefined;
+        return liveness?.settlement_owner === owner ? existing : undefined;
+      }
+      const update = db.prepare(`
+        UPDATE runs SET status = 'quarantined', failure_tail = ?
+        WHERE id = ? AND status = 'reaping'
+          AND EXISTS (
+            SELECT 1 FROM run_liveness l
+            WHERE l.run_id = runs.id AND l.actor_state = 'reaping' AND l.settlement_owner = ?
+          )
+      `).run(reason, runId, owner);
+      if (update.changes !== 1) return undefined;
+      db.prepare(`
+        UPDATE run_liveness
+        SET actor_state = 'quarantined', quarantine_reason = ?, updated_at = ?
+        WHERE run_id = ? AND settlement_owner = ?
+      `).run(reason, timestamp, runId, owner);
+      const run = getRunStmt.get(runId) as Run;
+      // Preserve run_id/running_since: quarantine intentionally retains ticket
+      // exclusivity until an operator proves the old actor is gone.
+      const ticket = getByIssueIdStmt.get(run.linear_issue_id) as Ticket | undefined;
+      if (!run.linear_session_id || ticket?.linear_session_id === run.linear_session_id) {
+        db.prepare(`
+          UPDATE tickets SET state = 'error', last_error = ?, updated_at = ?
+          WHERE linear_issue_id = ? AND run_id = ?
+        `).run(reason, timestamp, run.linear_issue_id, runId);
+      }
+      return run;
+    }
+  );
+
+  const settleQuarantinedRunTransaction = db.transaction((params: FinishRunParams): Run | undefined => {
+    const existing = getRunStmt.get(params.runId) as Run | undefined;
+    if (!existing || existing.status !== "quarantined") return undefined;
+    const completedAt = now();
+    db.prepare(`
+      UPDATE runs SET status = ?, completed_at = ?, failure_tail = ?, pr_url = COALESCE(?, pr_url)
+      WHERE id = ? AND status = 'quarantined'
+    `).run(params.status, completedAt, params.failureTail ?? null, params.prUrl ?? null, params.runId);
+    const ticket = getByIssueIdStmt.get(existing.linear_issue_id) as Ticket | undefined;
+    if (existing.linear_session_id && ticket?.linear_session_id !== existing.linear_session_id) {
+      db.prepare(`
+        UPDATE tickets SET running_since = NULL, run_id = NULL, updated_at = ?
+        WHERE linear_issue_id = ? AND run_id = ?
+      `).run(completedAt, existing.linear_issue_id, params.runId);
+    } else {
+      db.prepare(`
+        UPDATE tickets SET running_since = NULL, run_id = NULL,
+          state = COALESCE(?, state), pr_url = COALESCE(?, pr_url),
+          last_error = ?, updated_at = ?
+        WHERE linear_issue_id = ? AND run_id = ?
+      `).run(
+        params.ticketState ?? null,
+        params.prUrl ?? null,
+        params.failureTail ?? null,
+        completedAt,
+        existing.linear_issue_id,
+        params.runId
+      );
+    }
+    db.prepare(`
+      UPDATE run_liveness SET actor_state = 'settled', termination_confirmed_at = ?, updated_at = ?
+      WHERE run_id = ? AND actor_state = 'quarantined'
+    `).run(completedAt, completedAt, params.runId);
+    workStore.consumeAcknowledgedForRun(params.runId, params.runId);
+    workStore.releaseUnacknowledgedForRun(
+      params.runId,
+      `owning run ${params.runId} ended after confirmed quarantine recovery`
+    );
+    return getRunStmt.get(params.runId) as Run;
+  });
+
+  const acquireSupervisorLeaseTransaction = db.transaction(
+    (name: string, owner: string, nowIso: string, leaseUntilIso: string): boolean => {
+      const existing = db.prepare(
+        "SELECT owner, lease_until FROM supervisor_leases WHERE name = ?"
+      ).get(name) as { owner: string; lease_until: string } | undefined;
+      if (existing && existing.owner !== owner && existing.lease_until > nowIso) return false;
+      db.prepare(`
+        INSERT INTO supervisor_leases(name, owner, lease_until, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET
+          owner = excluded.owner,
+          lease_until = excluded.lease_until,
+          updated_at = excluded.updated_at
+      `).run(name, owner, leaseUntilIso, nowIso);
+      return true;
+    }
+  );
 
   const supersedeCurrentSessionTransaction = db.transaction(
     (issueId: string, newSessionId: string): AgentSession => {
@@ -1032,13 +1208,44 @@ export function createTicketStore(db: Database.Database): TicketStore {
     upsert(ticket) {
       const existing = getByIssueIdStmt.get(ticket.linear_issue_id) as Ticket | undefined;
       db.transaction(() => {
+        const { pipeline, ...ticketRow } = ticket;
         upsertStmt.run({
-        ...ticket,
-        base_branch: ticket.base_branch ?? existing?.base_branch ?? "main",
-        created_at: existing?.created_at ?? now(),
-        updated_at: now(),
+          ...ticketRow,
+          base_branch: ticket.base_branch ?? existing?.base_branch ?? "main",
+          created_at: existing?.created_at ?? now(),
+          updated_at: now(),
+        });
+        const session = supersedeCurrentSessionTransaction(
+          ticket.linear_issue_id,
+          ticket.linear_session_id
+        );
+        pipelineStore.supersedeOtherInstances(
+          ticket.linear_issue_id,
+          ticket.linear_session_id
+        );
+        if (pipeline) {
+          pipelineStore.createInstance({
+            ...pipeline,
+            issueId: ticket.linear_issue_id,
+            sessionId: ticket.linear_session_id,
+            generation: session.generation,
+            branch: ticket.branch,
+            agent: ticket.agent,
+          });
+        }
+      })();
+    },
+    upsertUnpinned(ticket) {
+      const existing = getByIssueIdStmt.get(ticket.linear_issue_id) as Ticket | undefined;
+      db.transaction(() => {
+        upsertStmt.run({
+          ...ticket,
+          base_branch: ticket.base_branch ?? existing?.base_branch ?? "main",
+          created_at: existing?.created_at ?? now(),
+          updated_at: now(),
         });
         supersedeCurrentSessionTransaction(ticket.linear_issue_id, ticket.linear_session_id);
+        pipelineStore.supersedeOtherInstances(ticket.linear_issue_id, ticket.linear_session_id);
       })();
     },
     getByIssueId(issueId) {
@@ -1065,14 +1272,8 @@ export function createTicketStore(db: Database.Database): TicketStore {
     setPrUrl(issueId, prUrl) {
       setPrUrlStmt.run(prUrl, now(), issueId);
     },
-    setPreviewTokenHash(issueId, tokenHash) {
-      setPreviewTokenHashStmt.run(tokenHash, now(), issueId);
-    },
     setLinearContext(issueId, context) {
       setLinearContextStmt.run(context, now(), issueId);
-    },
-    listActive() {
-      return listActiveStmt.all() as Ticket[];
     },
     listRunning() {
       return listRunningStmt.all() as Ticket[];
@@ -1080,74 +1281,32 @@ export function createTicketStore(db: Database.Database): TicketStore {
     listAll() {
       return listAllStmt.all() as Ticket[];
     },
-    listTicketsWithPendingSessionWork(nowIso) {
-      return listTicketsWithPendingSessionWorkStmt.all(nowIso) as Ticket[];
-    },
     getCurrentSession(issueId) {
       return getCurrentSessionStmt.get(issueId) as AgentSession | undefined;
     },
     getSession(sessionId) {
       return getSessionStmt.get(sessionId) as AgentSession | undefined;
     },
-    supersedeCurrentSession(issueId, newSessionId) {
-      return supersedeCurrentSessionTransaction(issueId, newSessionId);
-    },
     markSessionState(sessionId, state) {
       markSessionStateStmt.run(state, now(), sessionId);
     },
-    enqueueSessionWork(params) {
-      const timestamp = now();
-      return (
-        insertSessionWorkStmt.run(
-          params.id,
-          params.linearSessionId,
-          params.issueId,
-          params.source,
-          params.priority ?? (params.source === "human" ? 0 : 10),
-          params.body,
-          timestamp,
-          timestamp
-        ).changes === 1
-      );
+    recordProviderFeedback(params) {
+      return feedbackStore.record(params);
     },
-    claimNextSessionWork(linearSessionId, nowIso) {
-      const candidate = nextSessionWorkStmt.get(linearSessionId, nowIso) as SessionWork | undefined;
-      if (!candidate) return undefined;
-      const update = db.prepare(`
-        UPDATE session_work
-        SET status = 'claimed'
-        WHERE id = ? AND status = 'pending'
-      `).run(candidate.id);
-      return update.changes === 1
-        ? (getSessionWorkStmt.get(candidate.id) as SessionWork)
-        : undefined;
+    listPendingFeedbackSnapshots(linearSessionId, limit = 50) {
+      return db.prepare(`
+        SELECT * FROM feedback_snapshots
+        WHERE linear_session_id = ? AND status IN ('collecting', 'claimed')
+        ORDER BY created_at, id LIMIT ?
+      `).all(linearSessionId, limit) as FeedbackSnapshot[];
     },
-    markSessionWorkConsumed(workId, runId) {
-      const timestamp = now();
-      db.prepare(`
-        UPDATE session_work
-        SET status = 'consumed', claimed_run_id = ?, consumed_at = ?
-        WHERE id = ? AND status IN ('pending', 'claimed')
-      `).run(runId, timestamp, workId);
+    claimFeedbackSnapshot(snapshotId, maxRounds) {
+      const snapshot = feedbackStore.get(snapshotId);
+      if (!snapshot) return { status: "stale" as const };
+      return claimFeedbackSnapshot(snapshot, maxRounds);
     },
-    releaseSessionWork(workId) {
-      db.prepare(`
-        UPDATE session_work
-        SET status = 'pending'
-        WHERE id = ? AND status = 'claimed'
-      `).run(workId);
-    },
-    cancelPendingSessionWork(linearSessionId) {
-      return cancelPendingSessionWorkStmt.run(now(), linearSessionId).changes;
-    },
-    cancelSessionWork(workId) {
-      cancelSessionWorkStmt.run(now(), workId);
-    },
-    countConsumedAutomaticSessionWork(issueId) {
-      return (countConsumedAutomaticSessionWorkStmt.get(issueId) as { count: number }).count;
-    },
-    getConsumedSessionWorkForRun(runId) {
-      return getConsumedSessionWorkForRunStmt.get(runId) as SessionWork | undefined;
+    consumeFeedbackSnapshot(snapshotId) {
+      return feedbackStore.consume(snapshotId);
     },
     enqueueLinearOutbox(params) {
       return enqueueLinearOutboxTransaction(params);
@@ -1180,20 +1339,109 @@ export function createTicketStore(db: Database.Database): TicketStore {
       }
       return claimed;
     },
-    markLinearOutboxProcessed(id) {
-      const processedAt = now();
-      db.prepare(`
-        UPDATE linear_outbox
-        SET status = 'processed', processed_at = ?, next_attempt_at = ?, last_error = NULL
-        WHERE id = ?
-      `).run(processedAt, processedAt, id);
+    markLinearOutboxProcessed(id, receipt) {
+      db.transaction(() => {
+        const processedAt = now();
+        db.prepare(`
+          UPDATE linear_outbox
+          SET status = 'processed', processed_at = ?, next_attempt_at = ?, last_error = NULL,
+              external_id = COALESCE(?, external_id),
+              external_url = COALESCE(?, external_url),
+              attachment_url = COALESCE(?, attachment_url)
+          WHERE id = ?
+        `).run(
+          processedAt,
+          processedAt,
+          receipt?.externalId ?? null,
+          receipt?.externalUrl ?? null,
+          receipt?.attachmentUrl ?? null,
+          id
+        );
+        const publication = db.prepare(`
+          SELECT * FROM pipeline_publication_receipts WHERE id = ?
+        `).get(id) as {
+          pipeline_instance_id: string;
+          resume_status: string | null;
+          status: string;
+        } | undefined;
+        if (!publication) return;
+        db.prepare(`
+          UPDATE pipeline_publication_receipts
+          SET status = 'acknowledged', external_id = COALESCE(?, external_id),
+              external_url = COALESCE(?, external_url),
+              attachment_url = COALESCE(?, attachment_url), acknowledged_at = ?,
+              last_error = NULL, updated_at = ?
+          WHERE id = ?
+        `).run(
+          receipt?.externalId ?? null,
+          receipt?.externalUrl ?? null,
+          receipt?.attachmentUrl ?? null,
+          processedAt,
+          processedAt,
+          id
+        );
+        if (publication.resume_status) {
+          db.prepare(`
+            UPDATE pipeline_instances
+            SET status = ?, state_version = state_version + 1,
+                wait_reason = CASE WHEN ? = 'waiting_human' THEN wait_reason ELSE NULL END,
+                updated_at = ?
+            WHERE id = ? AND status = 'completion_pending_publication'
+          `).run(
+            publication.resume_status,
+            publication.resume_status,
+            processedAt,
+            publication.pipeline_instance_id
+          );
+        }
+      })();
     },
     markLinearOutboxFailed(id, error, retryAt) {
-      db.prepare(`
-        UPDATE linear_outbox
-        SET status = ?, next_attempt_at = ?, last_error = ?
-        WHERE id = ?
-      `).run(retryAt ? "failed" : "dead", retryAt ?? now(), error, id);
+      db.transaction(() => {
+        const timestamp = now();
+        const status = retryAt ? "failed" : "dead";
+        db.prepare(`
+          UPDATE linear_outbox
+          SET status = ?, next_attempt_at = ?, last_error = ?
+          WHERE id = ?
+        `).run(status, retryAt ?? timestamp, error, id);
+        const publication = db.prepare(`
+          SELECT pipeline_instance_id FROM pipeline_publication_receipts WHERE id = ?
+        `).get(id) as { pipeline_instance_id: string } | undefined;
+        if (!publication) return;
+        const instanceStatus = db.prepare(
+          "SELECT status FROM pipeline_instances WHERE id = ?"
+        ).pluck().get(publication.pipeline_instance_id) as string | undefined;
+        db.prepare(`
+          UPDATE pipeline_publication_receipts
+          SET status = ?, attempts = (
+                SELECT attempts FROM linear_outbox WHERE linear_outbox.id = pipeline_publication_receipts.id
+              ),
+              next_attempt_at = ?, last_error = ?, updated_at = ?,
+              blocked_from_status = CASE WHEN ? = 'dead' THEN COALESCE(
+                blocked_from_status, ?
+              ) ELSE blocked_from_status END
+          WHERE id = ?
+        `).run(status, retryAt ?? timestamp, error, timestamp, status, instanceStatus ?? null, id);
+        if (status === "dead") {
+          db.prepare(`
+            UPDATE pipeline_instances
+            SET status = 'publication_blocked', state_version = state_version + 1,
+                wait_reason = 'permanent publication failure', updated_at = ?
+            WHERE id = ? AND status NOT IN (
+              'shipped', 'no_change', 'needs_human', 'canceled', 'superseded', 'failed',
+              'publication_blocked'
+            )
+          `).run(timestamp, publication.pipeline_instance_id);
+        }
+      })();
+    },
+    recordLinearOutboxAttachment(id, attachmentUrl) {
+      const updated = db.prepare(`
+        UPDATE linear_outbox SET attachment_url = ?
+        WHERE id = ? AND status = 'processing'
+      `).run(attachmentUrl, id);
+      if (updated.changes !== 1) throw new Error(`linear outbox ${id} is not processing`);
     },
     getLinearOutbox(id) {
       return getLinearOutboxStmt.get(id) as LinearOutboxRecord | undefined;
@@ -1212,9 +1460,6 @@ export function createTicketStore(db: Database.Database): TicketStore {
       return teamKey
         ? (getRepositoryByTeamKeyStmt.get(teamKey) as RepositoryRegistration | undefined)
         : undefined;
-    },
-    hasRepositoryRegistrations() {
-      return Boolean(hasRepositoryRegistrationsStmt.get());
     },
     listRepositoryRegistrations() {
       return listRepositoryRegistrationsStmt.all() as RepositoryRegistration[];
@@ -1260,22 +1505,39 @@ export function createTicketStore(db: Database.Database): TicketStore {
       return pruneDeliveriesStmt.run(beforeIso).changes;
     },
     beginRun(params) {
-      return beginRunTransaction(params);
+      return beginRunTransaction.immediate(params);
     },
     getRun(runId) {
       return getRunStmt.get(runId) as Run | undefined;
     },
-    getLatestRun(issueId) {
-      return getLatestRunStmt.get(issueId) as Run | undefined;
-    },
     getLatestRunWithLog(issueId) {
       return getLatestRunWithLogStmt.get(issueId) as Run | undefined;
     },
-    countRunsByType(issueId, taskType) {
-      return (countRunsByTypeStmt.get(issueId, taskType) as { count: number }).count;
-    },
     finishRun(params) {
-      return finishRunTransaction(params);
+      return finishRunTransaction.immediate(params);
+    },
+    claimRunForReaping(runId, owner, reason) {
+      return claimRunForReapingTransaction.immediate(runId, owner, reason);
+    },
+    finishReapingRun(params) {
+      return finishReapingRunTransaction.immediate(params);
+    },
+    quarantineRun(runId, owner, reason) {
+      return quarantineRunTransaction.immediate(runId, owner, reason);
+    },
+    settleQuarantinedRun(params) {
+      return settleQuarantinedRunTransaction.immediate(params);
+    },
+    renewRunLiveness(runId, heartbeatAt) {
+      return db.prepare(`
+        UPDATE run_liveness
+        SET last_heartbeat_at = CASE
+              WHEN last_heartbeat_at IS NULL OR last_heartbeat_at < ? THEN ?
+              ELSE last_heartbeat_at
+            END,
+            updated_at = ?
+        WHERE run_id = ? AND actor_state = 'running'
+      `).run(heartbeatAt, heartbeatAt, now(), runId).changes === 1;
     },
     listExpiredRuns(nowIso) {
       return listExpiredRunsStmt.all(nowIso) as Run[];
@@ -1285,28 +1547,149 @@ export function createTicketStore(db: Database.Database): TicketStore {
     },
     enqueueInbox(params) {
       const id = params.id ?? randomUUID();
-      insertInboxStmt.run(
-        id,
-        params.issueId,
-        params.sessionId,
-        params.runId ?? null,
-        params.source,
-        params.body,
-        now()
-      );
+      db.transaction(() => {
+        const timestamp = now();
+        insertInboxStmt.run(
+          id,
+          params.issueId,
+          params.sessionId,
+          params.runId ?? null,
+          params.source,
+          params.body,
+          timestamp
+        );
+        const session = getSessionStmt.get(params.sessionId) as AgentSession | undefined;
+        const ticket = getByIssueIdStmt.get(params.issueId) as Ticket | undefined;
+        const runId = params.runId ?? ticket?.run_id;
+        let item = workStore.get(id);
+        if (!item) {
+          item = workStore.enqueue({
+            id,
+            issueId: params.issueId,
+            sessionId: params.sessionId,
+            generation: session?.generation ?? 1,
+            contextRevision: 0,
+            nativeSessionId: session?.provider_conversation_id ?? null,
+            source: params.source,
+            body: params.body,
+          });
+        }
+        db.prepare(
+          "INSERT OR IGNORE INTO work_item_sources(source_table, source_id, work_item_id) VALUES ('session_inbox', ?, ?)"
+        ).run(id, id);
+        if (
+          runId &&
+          ticket?.run_id === runId &&
+          ticket.agent !== "opencode" &&
+          (getRunStmt.get(runId) as Run | undefined)?.status === "running"
+        ) {
+          workStore.lease({
+            workItemId: id,
+            issueId: params.issueId,
+            sessionId: params.sessionId,
+            runId,
+            nativeSessionId: item.native_session_id,
+            generation: item.generation,
+            contextRevision: item.context_revision,
+            leaseUntil: new Date(Date.now() + 30_000).toISOString(),
+          });
+        }
+      })();
       return getInboxStmt.get(id) as SteerInboxRecord;
     },
     listPendingInbox(issueId) {
-      return listPendingInboxStmt.all(issueId) as SteerInboxRecord[];
+      const timestamp = now();
+      const records = listPendingInboxStmt.all(issueId, timestamp) as SteerInboxRecord[];
+      const deliverable: SteerInboxRecord[] = [];
+      for (const record of records) {
+        const item = workStore.get(record.id);
+        const activeRunId =
+          (getByIssueIdStmt.get(record.linear_issue_id) as Ticket | undefined)?.run_id;
+        if (!item || !activeRunId) continue;
+        const activeDelivery = record.delivery_id
+          ? workStore.getDelivery(record.delivery_id)
+          : undefined;
+        if (record.run_id !== activeRunId || (activeDelivery && activeDelivery.run_id !== activeRunId)) {
+          db.transaction(() => {
+            if (activeDelivery) {
+              workStore.expireUnacknowledged(
+                activeDelivery.id,
+                activeDelivery.run_id,
+                `owning run ${activeDelivery.run_id} ended before acknowledgement`
+              );
+            }
+            cancelInboxStmt.run(record.id);
+            workStore.cancel(record.id, `steering was fenced to ended run ${record.run_id ?? "unknown"}`);
+          })();
+          continue;
+        }
+        if (record.status === "pending" && record.delivery_id) {
+          deliverable.push(getInboxStmt.get(record.id) as SteerInboxRecord);
+          continue;
+        }
+        workStore.lease({
+          workItemId: record.id,
+          issueId: record.linear_issue_id,
+          sessionId: record.linear_session_id,
+          runId: activeRunId,
+          nativeSessionId: item.native_session_id,
+          generation: item.generation,
+          contextRevision: item.context_revision,
+          now: timestamp,
+          leaseUntil: new Date(Date.now() + 30_000).toISOString(),
+        });
+        deliverable.push(getInboxStmt.get(record.id) as SteerInboxRecord);
+      }
+      return deliverable;
     },
-    markInboxDelivered(id) {
-      markInboxDeliveredStmt.run(now(), id);
+    markInboxDispatched(id) {
+      const record = getInboxStmt.get(id) as SteerInboxRecord | undefined;
+      if (!record?.delivery_id || !record.run_id || record.generation === null || record.context_revision === null) {
+        throw new Error(`inbox work ${id} has no leased delivery`);
+      }
+      const binding = {
+        issueId: record.linear_issue_id,
+        sessionId: record.linear_session_id,
+        runId: record.run_id,
+        nativeSessionId: record.native_session_id,
+        generation: record.generation,
+        contextRevision: record.context_revision,
+      };
+      db.transaction(() => {
+        workStore.markDispatched(record.delivery_id!, binding);
+        markInboxDispatchedStmt.run(now(), id);
+      })();
+    },
+    acknowledgeInboxDelivery(deliveryId, binding) {
+      const delivery = workStore.getDelivery(deliveryId);
+      if (!delivery || delivery.request_hash !== binding.requestHash) {
+        throw new Error(`inbox acknowledgement ${deliveryId} request hash mismatch`);
+      }
+      db.transaction(() => {
+        workStore.acknowledge(deliveryId, binding);
+        db.prepare(
+          "UPDATE session_inbox SET status = 'acknowledged' WHERE id = ? AND status = 'dispatched'"
+        ).run(delivery.work_item_id);
+      })();
     },
     cancelPendingInbox(issueId) {
-      return cancelPendingInboxStmt.run(issueId).changes;
+      return db.transaction(() => {
+        const ids = db.prepare(
+          "SELECT id FROM session_inbox WHERE linear_issue_id = ? AND status IN ('pending', 'dispatched')"
+        ).all(issueId) as Array<{ id: string }>;
+        const changes = cancelPendingInboxStmt.run(issueId).changes;
+        for (const { id } of ids) workStore.cancel(id, "inbox canceled");
+        return changes;
+      })();
     },
     getInbox(id) {
       return getInboxStmt.get(id) as SteerInboxRecord | undefined;
+    },
+    getWorkItem(id) {
+      return workStore.get(id);
+    },
+    getWorkDelivery(id) {
+      return workStore.getDelivery(id);
     },
     insertSandboxEvent(params) {
       const createdAt = now();
@@ -1323,9 +1706,6 @@ export function createTicketStore(db: Database.Database): TicketStore {
     },
     getSandboxEvent(eventId) {
       return getSandboxEventStmt.get(eventId) as SandboxEventRecord | undefined;
-    },
-    getLastProcessedSandboxActivity(runId) {
-      return getLastProcessedSandboxActivityStmt.get(runId) as SandboxEventRecord | undefined;
     },
     claimSandboxEvent(eventId, nowIso, leaseUntilIso) {
       return claimSandboxEventTransaction(eventId, nowIso, leaseUntilIso);
@@ -1347,6 +1727,17 @@ export function createTicketStore(db: Database.Database): TicketStore {
     },
     pruneSandboxEvents(beforeIso) {
       return pruneSandboxEventsStmt.run(beforeIso).changes;
+    },
+    pruneEphemeralLinearOutbox(beforeIso) {
+      return pruneEphemeralLinearOutboxStmt.run(beforeIso).changes;
+    },
+    acquireSupervisorLease(name, owner, nowIso, leaseUntilIso) {
+      return acquireSupervisorLeaseTransaction.immediate(name, owner, nowIso, leaseUntilIso);
+    },
+    releaseSupervisorLease(name, owner) {
+      return db.prepare(
+        "DELETE FROM supervisor_leases WHERE name = ? AND owner = ?"
+      ).run(name, owner).changes === 1;
     },
     getSetting(key) {
       const row = getSettingStmt.get(key) as { value: string } | undefined;

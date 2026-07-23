@@ -9,76 +9,72 @@ daytona snapshot create openthrottle --dockerfile sandbox/Dockerfile --context .
 ```
 
 It contains Node 22, git/curl/jq/yq/ripgrep/GitHub CLI, Claude Code, Codex,
-OpenCode, a pinned native Compound Engineering installation for all agent CLIs, and an
-unprivileged `agent` user. Its automatic image entrypoint is an inert no-op so
-Daytona provisioning cannot race the supervisor. Fly uploads the run context
-and explicitly launches the root task script, which owns checkout and safety
-setup before dropping privileges for repo and agent commands.
+OpenCode, a pinned native Compound Engineering installation, and an
+unprivileged `agent` user. Its image entrypoint is inert; the supervisor uploads
+sealed stage inputs and explicitly launches `/opt/openthrottle/entrypoint.sh`.
 
-## Lifecycle
+## Fenced stage lifecycle
 
-The eight phases are auth, checkout/push, sealed safety config, project config,
-post-bootstrap, dev server, agent task, and completion marker. Supported
-tasks are `implement`, `resume`, and `investigate`. Fresh tasks use their
-corresponding canonical skill from `skills/tasks/`; resume continues the saved
-Claude session, Codex thread, or OpenCode session — including PR feedback
-(reviews, comments, CI failures) queued while the sandbox was idle, which is
-delivered as a resume message in the same session rather than a new task.
-OpenCode also saves the initial model in `~/.ot/agent-model` so a resumed
-session cannot switch models after a project config change.
+Every invocation executes exactly one coordinator-selected stage:
 
-The corresponding OpenThrottle skill is a thin product adapter over native CE:
+1. Require the sealed stage request, repository config snapshot, and immutable
+   pipeline manifest.
+2. Verify hashes, runtime capability compatibility, request identity, and file
+   ownership/mode.
+3. Materialize only the credentials declared by the stage.
+4. Clone the registered repository and reconstruct the branch from the sealed
+   base commit or expected subject.
+5. Seal the pre-push hook and Git configuration.
+6. Apply the validated repository config and `post_bootstrap` commands.
+7. Invoke the command or agent executor with the manifest’s context policy.
+8. Write one normalized, typed stage result to the supervisor-owned spool.
 
-- `implement` → `ce-work` → `ce-code-review` → configured gates →
-  `ce-commit-push-pr` → resolve/retarget the PR.
-- `investigate` → action-capable `ce-debug mode:pipeline`, with convergent fixes
-  shipped and divergent decisions escalated as elicitation questions.
+`TASK_TYPE` is ticket intent (`implement` or `investigate`), not an execution
+mode. Native Claude/Codex/OpenCode continuation is controlled by the stage
+request’s context policy and `nativeSessionId`; there is no standalone resume
+task, task adapter registry, callback endpoint, or completion marker.
 
-Neither task babysits its own PR after opening it. GitHub-native reviewers
-(bot or human) own review from there, and their feedback re-enters as a
-`resume` of the same session — see `skills/README.md` for the full loop.
+Agent stages write semantic proposals through `OT_STAGE_PROPOSAL_FILE`.
+Command stages execute a configured gate directly. The runner verifies declared
+artifact kinds and assurance, bounds output, records the Git subject, and emits
+`stage_result` for the coordinator. Publication stages are additionally fenced
+to the exact subject accepted by the publish evaluator.
 
-Fly owns run serialization, webhook retries, follow-up scheduling, and Linear
-publication. Sandbox events are session-bound by the supervisor run record
-before they enter the Linear outbox, so a late event from an older delegated
-session cannot be redirected into a newer Linear conversation. CE owns agent
-reasoning and code/PR work within the run.
+Configured `limits.max_turns`, `limits.task_timeout`, and `mcp_servers` are
+materialized for the selected engine. Claude uses slash-command skill entry;
+Codex uses native `$skill` discovery and its sandbox-owned instructions;
+OpenCode receives the canonical adapter body in its fenced prompt. Eligible
+Claude/Codex stages install only the sandbox-owned live-steering hooks.
 
-`~/.ot` holds ticket context, task/dev logs, the agent session ID, normalized
-run result, and a structured outbox. `ot-activity` writes progress into that
-outbox. The exit trap writes exit code, Claude cost, PR URL, and sanitized
-final assistant output/failure tail as a completion marker. Fly reads both
-through the Daytona SDK.
-At completion Fly also reads, sanitizes, and persists only the last 100,000
-characters of `task.log` in its private SQLite database. Live logs are served
-while the workspace exists and this durable tail is the fallback after cleanup;
-only the newest captured tail per ticket is retained, and neither form is
-automatically attached to Linear or the PR.
+`~/.ot` holds private logs, native session metadata, task context, activities,
+and live-steering inbox files. `/var/lib/openthrottle/stage-results` is the
+root-owned result boundary read by the supervisor. Activities and heartbeat
+events are bound to the current run before they enter the Linear outbox.
 
-Claude receives only project-declared MCP servers through a strict runtime
-config and user-level setting sources. Claude and Codex receive the same native
-Compound Engineering release through their normal user plugin installations;
-Codex also receives OpenThrottle global instructions in `~/.codex/AGENTS.md`.
-Neither engine receives Linear credentials. The target repo's `AGENTS.md` and
-Claude settings remain untouched and editable. Git uses the `gh` credential
-helper against a clean origin URL, so the token never enters `.git/config` and
-the sealed config remains safe across resume runs.
+## Agent configuration
 
-OpenCode receives a root-owned runtime config outside the repository through
-`OPENCODE_CONFIG_DIR`. Repository `opencode.json[c]`, `.opencode` content,
-Claude compatibility loading, and external skills are disabled; only validated
-`.openthrottle.yml` MCP declarations and the allowlisted
-`kimi-code/kimi-for-coding` profile enter the config. The Kimi key remains an
-environment value referenced by name and is not written to JSON.
+Claude and Codex receive the same native Compound Engineering release through
+their standard plugin installations; Codex also receives OpenThrottle standing
+instructions outside the checkout. OpenCode receives a root-owned runtime
+config outside the repository, with repository and compatibility config loading
+disabled. Only validated `.openthrottle.yml` MCP declarations and the
+allowlisted Kimi profile enter its config.
+
+The target repository’s own agent instructions remain available as untrusted
+project context. Registered repositories are trusted for code execution because
+`post_bootstrap` can run arbitrary commands. Linear, Fly, Daytona, webhook,
+install, and operator credentials never enter the sandbox.
 
 ## Safety and sanitization
 
 The pre-push hook blocks main/master and non-fast-forward pushes, with
-`core.hooksPath` root-sealed. This complements—does not replace—GitHub branch
-protection.
+`core.hooksPath` root-sealed. Git uses the authenticated `gh` credential helper
+against a clean origin URL so the token never appears in `.git/config`.
 
-Both shell and Node sanitizers redact direct named secret values, inner values
-from `CODEX_AUTH_JSON`, and known GitHub/OpenAI/Linear/bearer token shapes.
+Shell and Node sanitizers redact named secret values, nested values from
+`CODEX_AUTH_JSON`, the current Codex auth file after token rotation, and known
+GitHub/OpenAI/Linear/bearer token shapes before logs or activities leave the
+sandbox.
 
 ## Verification
 
@@ -90,20 +86,7 @@ docker build -f sandbox/Dockerfile -t openthrottle:test .
 sandbox/tests/smoke.sh openthrottle:test
 ```
 
-The smoke checks the pinned real Claude, Codex, and OpenCode CLI versions,
-required flags, and native Compound Engineering installation and skill discovery. It then uses
-a local bare repository and deterministic agent JSONL stubs. It verifies
-implement and same-session resume for all engines, checkout/branch creation,
-safety/config phases, session/cost capture, completion markers, and absence of
-secrets in human-visible artifacts.
-
-For live monitoring, use Daytona’s normal controls:
-
-```bash
-daytona list
-daytona ssh <sandbox-id>
-```
-
-Or use `openthrottle logs <ticket>` for authenticated, sanitized live output or
-the latest durable private tail after workspace deletion. The wake-on-click
-preview link remains attached to the Linear session.
+The Docker smoke verifies pinned agent CLIs and native CE discovery, then runs
+sealed agent stages for Claude, Codex, and OpenCode plus a command stage against
+a local bare repository. It checks stage-result assurance, branch fencing,
+environment-tamper resistance, and absence of old completion events.

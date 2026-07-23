@@ -33,6 +33,38 @@ describe('operator commands', () => {
             pr_url: null,
             updated_at: '2026-07-18T00:00:00.000Z',
           },
+          {
+            linear_issue_identifier: 'OT-PIPE',
+            branch: 'ot/pipe',
+            agent: 'codex',
+            state: 'active',
+            pr_url: 'https://github.com/o/r/pull/1',
+            updated_at: '2026-07-18T00:01:00.000Z',
+            pipeline: {
+              pipeline_id: 'ce/implement',
+              pipeline_version: 1,
+              task_type: 'implement',
+              status: 'publication_blocked',
+              stage_id: 'review',
+              attempt_ordinal: 3,
+              retry_count: 1,
+              reentry_count: 2,
+              wait_reason: 'permanent publication failure',
+              subject: 'abcdef0123456789',
+              published_commit: '0123456789abcdef',
+              gate_result: 'passed',
+              context_policy: 'fresh_review',
+              publication_state: 'blocked',
+              publication_id: 'publication-1',
+              publication_error: 'GitHub denied the update',
+              recovery_action: 'POST /tickets/:identifier/publications/publication-1/retry',
+              effect_state: 'blocked',
+              effect_kind: 'stop',
+              effect_status: 'dead',
+              effect_attempts: 8,
+              effect_error: 'termination was not confirmed',
+            },
+          },
         ],
       })
     );
@@ -51,6 +83,14 @@ describe('operator commands', () => {
     const headers = fetchMock.mock.calls[0]![1]!.headers as Headers;
     expect(headers.get('Authorization')).toBe('Bearer operator-token');
     expect(output.mock.calls.flat().join('\n')).toContain('OT-1');
+    expect(output.mock.calls.flat().join('\n')).toContain('ce/implement@1');
+    expect(output.mock.calls.flat().join('\n')).toContain('publication_blocked');
+    expect(output.mock.calls.flat().join('\n')).toContain('fresh_review');
+    expect(output.mock.calls.flat().join('\n')).toContain('implement');
+    expect(output.mock.calls.flat().join('\n')).toContain('0123456789ab');
+    expect(output.mock.calls.flat().join('\n')).toContain('stop:dead');
+    expect(output.mock.calls.flat().join('\n')).toContain('termination was not confirmed');
+    expect(output.mock.calls.flat().join('\n')).not.toContain('legacy=');
   });
 
   it('stops an encoded ticket with the operator endpoint', async () => {
@@ -67,6 +107,19 @@ describe('operator commands', () => {
       expect.objectContaining({ method: 'POST', signal: expect.any(AbortSignal) })
     );
     expect(output).toHaveBeenCalledWith('Stopped OT/1.');
+  });
+
+  it('reports an accepted stop that is still draining without claiming completion', async () => {
+    const fetchMock = vi.fn(async () => Response.json(
+      { ok: true, status: 'stop_requested' },
+      { status: 202 }
+    ));
+    vi.stubGlobal('fetch', fetchMock);
+    const output = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    await stop('OT-2');
+
+    expect(output).toHaveBeenCalledWith('Stop requested for OT-2.');
   });
 
   it('writes sanitized logs returned by the supervisor', async () => {

@@ -12,7 +12,7 @@
 # still stops the unprivileged `agent` user from editing it directly.
 #
 # Idempotent: safe to call again on an already-sealed file (e.g. on a
-# resumed sandbox where the file was sealed on the first run).
+# reused sandbox where the file was sealed by an earlier stage).
 
 set -euo pipefail
 

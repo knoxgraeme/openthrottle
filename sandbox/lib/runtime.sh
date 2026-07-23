@@ -12,25 +12,21 @@ strip_nl() {
   printf '%s' "$value"
 }
 
-# resolve_git_identity OVERRIDE_NAME OVERRIDE_EMAIL GH_LOGIN GH_UID
+# resolve_git_identity GH_LOGIN GH_UID
 #
-# Chooses the git commit author identity, preferring an explicit override
-# email, then the GitHub account's noreply identity (so GitHub attributes
-# commits to a real account and author-gated integrations such as Vercel
-# accept the deployment), then a placeholder. Emits "<name>\t<email>".
+# Chooses the authenticated GitHub account's noreply identity so GitHub
+# attributes commits correctly, with a deterministic placeholder only when the
+# account lookup fails. Emits "<name>\t<email>".
 resolve_git_identity() {
-  local name="$1" email="$2" login="$3" uid="$4"
-  if [[ -z "$email" && -n "$login" && -n "$uid" ]]; then
-    name="${name:-$login}"
+  local login="$1" uid="$2" name="" email=""
+  if [[ "$login" =~ ^[A-Za-z0-9-]+$ && "$uid" =~ ^[0-9]+$ ]]; then
+    name="$login"
     email="${uid}+${login}@users.noreply.github.com"
   fi
   if [[ -z "$email" ]]; then
     name="${name:-OpenThrottle Agent}"
     email="agent@openthrottle.dev"
   fi
-  # Never emit an empty author name: git refuses to commit without one, so an
-  # override email supplied without a name derives the name from its local part.
-  name="${name:-${email%%@*}}"
   printf '%s\t%s\n' "$name" "$email"
 }
 
@@ -71,27 +67,59 @@ yq_value_or_default() {
 
 is_supported_task_type() {
   case "$1" in
-    implement|resume|investigate) return 0 ;;
+    implement|investigate) return 0 ;;
     *) return 1 ;;
   esac
 }
 
-task_skill_name() {
-  case "$1" in
-    implement) printf '%s' 'implement-plan' ;;
-    investigate) printf '%s' 'investigate' ;;
-    *) return 1 ;;
-  esac
+# Extract a string field from a Codex auth.json blob; empty on absent/invalid.
+codex_auth_field() {
+  # $1 = json blob, $2 = jq path (e.g. '.last_refresh')
+  jq -r "$2 // empty" <<<"$1" 2>/dev/null || true
 }
 
-# The OpenThrottle adapters are intentionally thin. This declaration makes
-# their native Compound Engineering composition explicit to the entrypoint,
-# tests, logs, and the agent itself while Fly remains the outer scheduler.
-task_ce_pipeline() {
-  case "$1" in
-    implement) printf '%s' 'ce-work,ce-code-review,ce-commit-push-pr' ;;
-    investigate) printf '%s' 'ce-debug,ce-commit-push-pr' ;;
-    resume) printf '%s' 'resume' ;;
-    *) return 1 ;;
-  esac
+# Convert any valid ISO-8601 instant accepted by the JavaScript runtime to
+# epoch milliseconds. Empty output means the value is absent or invalid. This
+# avoids byte-order comparisons, which are wrong for equivalent timestamps
+# expressed with different offsets or fractional-second precision.
+codex_auth_timestamp_ms() {
+  node -e '
+    const value = Date.parse(process.argv[1] ?? "");
+    if (Number.isFinite(value)) process.stdout.write(String(value));
+  ' "$1" 2>/dev/null || true
+}
+
+# Decide how to reconcile a freshly-seeded Codex auth blob against the blob
+# already present from an earlier stage. The supervisor refreshes the
+# rotating subscription token centrally before seeding (see codex-auth.ts), so
+# the seed can be *newer* than the sandbox's local copy — but it can also be
+# older if Codex rotated again mid-run. Install whichever is newest and trusted;
+# never cross accounts. Echoes exactly one of:
+#   seed         -> the seed is strictly newer; install it
+#   keep         -> the existing sandbox token is newer-or-equal (or ages are
+#                   unknown); keep it, since overwriting with an older/unknown
+#                   blob would replay a spent refresh token
+#   incompatible -> the two blobs name different accounts; caller must fail closed
+# Args: $1 = seed blob, $2 = existing blob
+codex_reconcile_auth() {
+  local seed="$1" existing="$2"
+  local seed_acct existing_acct seed_ts existing_ts seed_ms existing_ms
+  seed_acct="$(codex_auth_field "$seed" '.tokens.account_id')"
+  existing_acct="$(codex_auth_field "$existing" '.tokens.account_id')"
+  if [[ -n "$seed_acct" && -n "$existing_acct" && "$seed_acct" != "$existing_acct" ]]; then
+    printf '%s' 'incompatible'
+    return 0
+  fi
+  seed_ts="$(codex_auth_field "$seed" '.last_refresh')"
+  existing_ts="$(codex_auth_field "$existing" '.last_refresh')"
+  seed_ms="$(codex_auth_timestamp_ms "$seed_ts")"
+  existing_ms="$(codex_auth_timestamp_ms "$existing_ts")"
+  # Only override the rotated sandbox token when the seed is provably and
+  # strictly newer. An invalid existing timestamp remains conservative unless
+  # the timestamp is wholly absent.
+  if [[ -n "$seed_ms" && ( -z "$existing_ts" || ( -n "$existing_ms" && "$seed_ms" -gt "$existing_ms" ) ) ]]; then
+    printf '%s' 'seed'
+    return 0
+  fi
+  printf '%s' 'keep'
 }

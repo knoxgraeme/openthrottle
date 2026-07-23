@@ -26,14 +26,41 @@ function seedRunningTicket() {
     issueId: "issue-1",
     runId: "run-1",
     taskType: "implement",
-    tokenHash: createHash("sha256").update("callback-token-123").digest("hex"),
+    tokenHash: createHash("sha256").update("sealed-request-hash").digest("hex"),
     expiresAt: "2099-01-01T00:00:00.000Z",
   });
   return store;
 }
 
 describe("sandbox event contracts", () => {
-  it("accepts bounded activity and completion records and rejects unsafe input", () => {
+  function stageResultEvent() {
+    return JSON.stringify({
+      version: 1,
+      kind: "stage_result",
+      event_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      run_id: "run-1",
+      created_at: "2026-07-22T00:00:01.000Z",
+      pipeline_instance_id: "pipeline-1",
+      generation: 1,
+      stage_id: "review",
+      attempt_id: "attempt-1",
+      request_hash: "1".repeat(64),
+      outcome: "success",
+      result_hash: "2".repeat(64),
+      native_session_id: "native-1",
+      subject: "c".repeat(40),
+      artifacts: [{
+        kind: "stage_result",
+        schema_version: 1,
+        assurance: "semantic_attested",
+        subject: "c".repeat(40),
+        payload: JSON.stringify({ summary: "Bearer private-stage-token" }),
+        hash: "2".repeat(64),
+      }],
+    });
+  }
+
+  it("accepts bounded activity records and rejects unsafe input", () => {
     const parsed = parseSandboxEvent(JSON.stringify({
         version: 1,
         kind: "activity",
@@ -76,6 +103,21 @@ describe("sandbox event contracts", () => {
     );
     expect(ephemeral).toMatchObject({ type: "thought", ephemeral: true });
 
+    expect(parseSandboxEvent(JSON.stringify({
+      version: 1,
+      kind: "heartbeat",
+      event_id: "22222222-2222-4222-8222-222222222222",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:01.000Z",
+      injected_agent_text: "must be dropped",
+    }))).toEqual({
+      version: 1,
+      kind: "heartbeat",
+      event_id: "22222222-2222-4222-8222-222222222222",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:01.000Z",
+    });
+
     const plan = parseSandboxEvent(
       JSON.stringify({
         version: 1,
@@ -115,6 +157,175 @@ describe("sandbox event contracts", () => {
         )
       ).toThrow();
     }
+  });
+
+  it("renews liveness from a sealed heartbeat without publishing semantic activity", async () => {
+    const store = seedRunningTicket();
+    const heartbeatAt = "2026-07-22T16:00:00.000Z";
+    const heartbeat = Buffer.from(JSON.stringify({
+      version: 1,
+      kind: "heartbeat",
+      event_id: "77777777-7777-4777-8777-777777777777",
+      run_id: "run-1",
+      created_at: heartbeatAt,
+    }));
+    const files = new Map([["/var/lib/openthrottle/heartbeat/heartbeat.json", heartbeat]]);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      fs: {
+        listFiles: vi.fn(async (directory: string) => [...files.entries()]
+          .filter(([path]) => path.startsWith(`${directory}/`))
+          .map(([path, value]) => ({
+            name: path.split("/").at(-1), path, size: value.length, isDir: false,
+          }))),
+        downloadFile: vi.fn(async (path: string) => files.get(path)!),
+        deleteFile: vi.fn(async (path: string) => files.delete(path)),
+      },
+    } as unknown as Sandbox;
+    const postActivity = vi.fn(async () => undefined);
+
+    await pollSandboxEvents({
+      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      store,
+      postActivity,
+    });
+
+    expect(postActivity).not.toHaveBeenCalled();
+    expect(store.db.prepare(
+      "SELECT actor_state, last_heartbeat_at FROM run_liveness WHERE run_id = 'run-1'"
+    ).get()).toEqual({ actor_state: "running", last_heartbeat_at: expect.any(String) });
+    expect(store.getSandboxEvent("77777777-7777-4777-8777-777777777777")?.status)
+      .toBe("processed");
+    expect(files.size).toBe(0);
+  });
+
+  it("rejects an agent-writable outbox event that impersonates the executor heartbeat", async () => {
+    const store = seedRunningTicket();
+    const forged = Buffer.from(JSON.stringify({
+      version: 1,
+      kind: "heartbeat",
+      event_id: "66666666-6666-4666-8666-666666666666",
+      run_id: "run-1",
+      created_at: "2999-01-01T00:00:00.000Z",
+    }));
+    const files = new Map([["/home/agent/.ot/outbox/forged.json", forged]]);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      fs: {
+        listFiles: vi.fn(async () => [{
+          name: "forged.json", path: "/home/agent/.ot/outbox/forged.json",
+          size: forged.length, isDir: false,
+        }]),
+        downloadFile: vi.fn(async (path: string) => files.get(path)),
+        deleteFile: vi.fn(async (path: string) => files.delete(path)),
+      },
+    } as unknown as Sandbox;
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await pollSandboxEvents({
+      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      store,
+      postActivity: vi.fn(async () => undefined),
+    });
+
+    expect(store.getSandboxEvent("66666666-6666-4666-8666-666666666666")).toBeUndefined();
+    expect(store.db.prepare(
+      "SELECT last_heartbeat_at FROM run_liveness WHERE run_id = 'run-1'"
+    ).get()).toEqual({ last_heartbeat_at: null });
+    expect(files.size).toBe(0);
+    error.mockRestore();
+  });
+
+  it("accepts stage evidence only from the sealed executor path and persists only its fence", async () => {
+    const store = seedRunningTicket();
+    const raw = Buffer.from(stageResultEvent());
+    expect(parseSandboxEvent(raw.toString())).toMatchObject({
+      kind: "stage_result",
+      pipeline_instance_id: "pipeline-1",
+      attempt_id: "attempt-1",
+    });
+    const sealedPath = "/var/lib/openthrottle/stage-results/attempt-1.json";
+    const files = new Map([[sealedPath, raw]]);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      process: {
+        executeCommand: vi.fn(async () => ({ exitCode: 0, result: `${"c".repeat(40)}\n` })),
+      },
+      fs: {
+        listFiles: vi.fn(async (directory: string) => [...files.entries()]
+          .filter(([path]) => path.startsWith(`${directory}/`))
+          .map(([path, value]) => ({
+            name: path.split("/").at(-1), path, size: value.length, isDir: false,
+          }))),
+        downloadFile: vi.fn(async (path: string) => files.get(path)!),
+        deleteFile: vi.fn(async (path: string) => files.delete(path)),
+      },
+    } as unknown as Sandbox;
+    const postStageResult = vi.fn(async () => undefined);
+    const captureAgentAuth = vi.fn(async () => undefined);
+
+    await pollSandboxEvents({
+      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      store,
+      postActivity: vi.fn(async () => undefined),
+      postStageResult,
+      captureAgentAuth,
+    });
+
+    expect(postStageResult).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "stage_result", attempt_id: "attempt-1" }),
+      "c".repeat(40)
+    );
+    expect(captureAgentAuth).toHaveBeenCalledWith(
+      sandbox,
+      expect.objectContaining({ linear_issue_id: "issue-1" })
+    );
+    const stored = store.getSandboxEvent("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")!;
+    expect(stored.status).toBe("processed");
+    expect(stored.payload).not.toContain("private-stage-token");
+    expect(files.size).toBe(0);
+  });
+
+  it("deletes an agent-writable outbox event that impersonates a stage result", async () => {
+    const store = seedRunningTicket();
+    const raw = Buffer.from(stageResultEvent().replace(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    ));
+    const path = "/home/agent/.ot/outbox/forged-stage.json";
+    const files = new Map([[path, raw]]);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      fs: {
+        listFiles: vi.fn(async (directory: string) => directory === "/home/agent/.ot/outbox"
+          ? [{ name: "forged-stage.json", path, size: raw.length, isDir: false }]
+          : []),
+        downloadFile: vi.fn(async (remotePath: string) => files.get(remotePath)!),
+        deleteFile: vi.fn(async (remotePath: string) => files.delete(remotePath)),
+      },
+    } as unknown as Sandbox;
+    const postStageResult = vi.fn(async () => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await pollSandboxEvents({
+      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      store,
+      postActivity: vi.fn(async () => undefined),
+      postStageResult,
+    });
+
+    expect(postStageResult).not.toHaveBeenCalled();
+    expect(store.getSandboxEvent("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")).toBeUndefined();
+    expect(files.size).toBe(0);
+    error.mockRestore();
   });
 
   it("forwards structured action verb/parameter/result to Linear", async () => {
@@ -159,7 +370,6 @@ describe("sandbox event contracts", () => {
       daytona,
       store,
       postActivity,
-      finishCompletion: vi.fn(async () => ({ status: 200 })),
     });
 
     expect(postActivity).toHaveBeenCalledWith(
@@ -214,7 +424,6 @@ describe("sandbox event contracts", () => {
       daytona,
       store,
       postActivity: vi.fn(async () => undefined),
-      finishCompletion: vi.fn(async () => ({ status: 200 })),
       postSessionUpdate,
     });
 
@@ -230,210 +439,6 @@ describe("sandbox event contracts", () => {
       })
     );
     expect(files.size).toBe(0);
-  });
-
-  it("posts activities once, finalizes completion once, and removes processed files", async () => {
-    const store = seedRunningTicket();
-    const activity = JSON.stringify({
-      version: 1,
-      kind: "activity",
-      event_id: "11111111-1111-4111-8111-111111111111",
-      run_id: "run-1",
-      created_at: "2026-07-18T00:00:00.000Z",
-      type: "elicitation",
-      body: "Please add a plan",
-    });
-    const completion = JSON.stringify({
-      version: 1,
-      kind: "completion",
-      event_id: "22222222-2222-4222-8222-222222222222",
-      run_id: "run-1",
-      created_at: "2026-07-18T00:00:01.000Z",
-      token: "callback-token-123",
-      exit_code: 0,
-      pr_url: "https://github.com/owner/repo/pull/1",
-      final_response: "Finished the implementation.",
-    });
-    const files = new Map([
-      ["/home/agent/.ot/outbox/001.json", Buffer.from(activity)],
-      ["/home/agent/.ot/outbox/002.json", Buffer.from(completion)],
-    ]);
-    let failDeleteOnce = true;
-    const setAutostopInterval = vi.fn(async (minutes: number) => {
-      sandbox.autoStopInterval = minutes;
-    });
-    const sandbox = {
-      id: "sandbox-1",
-      state: "started",
-      autoStopInterval: 5,
-      setAutostopInterval,
-      process: {
-        executeCommand: vi.fn(async () => ({
-          exitCode: 0,
-          result: "safe ghp_abcdefghijklmnop callback-token-123",
-        })),
-      },
-      fs: {
-        listFiles: vi.fn(async () =>
-          [...files.entries()].map(([path, value]) => ({
-            name: path.split("/").at(-1), path, size: value.length, isDir: false,
-          }))
-        ),
-        downloadFile: vi.fn(async (path: string) => files.get(path)!),
-        deleteFile: vi.fn(async (path: string) => {
-          if (path.endsWith("001.json") && failDeleteOnce) {
-            failDeleteOnce = false;
-            throw new Error("temporary delete failure");
-          }
-          files.delete(path);
-        }),
-      },
-    } as unknown as Sandbox;
-    const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
-    const postActivity = vi.fn(async () => undefined);
-    const finishCompletion = vi.fn(async () => ({ status: 200 }));
-
-    await pollSandboxEvents({ daytona, store, postActivity, finishCompletion });
-    await pollSandboxEvents({ daytona, store, postActivity, finishCompletion });
-
-    expect(postActivity).toHaveBeenCalledOnce();
-    expect(postActivity).toHaveBeenCalledWith(
-      expect.objectContaining({ sessionId: "session-1", type: "elicitation", body: "Please add a plan" }),
-      expect.objectContaining({ issueId: "issue-1", event_id: "11111111-1111-4111-8111-111111111111" })
-    );
-    expect(finishCompletion).toHaveBeenCalledOnce();
-    expect(finishCompletion).toHaveBeenCalledWith(
-      expect.objectContaining({
-        runId: "run-1",
-        token: "callback-token-123",
-        exitCode: 0,
-        finalResponse: "Finished the implementation.",
-        logTail: "safe [REDACTED] [REDACTED]",
-      })
-    );
-    expect(setAutostopInterval).toHaveBeenCalledOnce();
-    expect(setAutostopInterval).toHaveBeenCalledWith(60);
-    expect(files.size).toBe(0);
-    expect(store.getSandboxEvent("11111111-1111-4111-8111-111111111111")?.status)
-      .toBe("processed");
-  });
-
-  it("captures rotated agent auth before finishing the run", async () => {
-    const store = seedRunningTicket();
-    const completion = Buffer.from(JSON.stringify({
-      version: 1,
-      kind: "completion",
-      event_id: "44444444-4444-4444-8444-444444444444",
-      run_id: "run-1",
-      created_at: "2026-07-18T00:00:01.000Z",
-      token: "callback-token-123",
-      exit_code: 0,
-    }));
-    const files = new Map([["/home/agent/.ot/outbox/001.json", completion]]);
-    const sandbox = {
-      id: "sandbox-1",
-      state: "started",
-      autoStopInterval: 60,
-      process: { executeCommand: vi.fn(async () => ({ exitCode: 0, result: "" })) },
-      fs: {
-        listFiles: vi.fn(async () =>
-          [...files.entries()].map(([path, value]) => ({
-            name: path.split("/").at(-1), path, size: value.length, isDir: false,
-          }))
-        ),
-        downloadFile: vi.fn(async (path: string) => files.get(path)!),
-        deleteFile: vi.fn(async (path: string) => files.delete(path)),
-      },
-    } as unknown as Sandbox;
-    const order: string[] = [];
-    const captureAgentAuth = vi.fn(async () => {
-      order.push("capture");
-    });
-    const finishCompletion = vi.fn(async () => {
-      order.push("finish");
-      return { status: 200 };
-    });
-
-    await pollSandboxEvents({
-      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
-      store,
-      postActivity: vi.fn(async () => undefined),
-      finishCompletion,
-      captureAgentAuth,
-    });
-
-    expect(captureAgentAuth).toHaveBeenCalledOnce();
-    expect(captureAgentAuth).toHaveBeenCalledWith(sandbox, expect.objectContaining({ agent: "codex" }));
-    expect(order).toEqual(["capture", "finish"]);
-  });
-
-  it("retries a failed activity before processing the completion behind it", async () => {
-    const store = seedRunningTicket();
-    const activityId = "55555555-5555-4555-8555-555555555555";
-    const activity = Buffer.from(JSON.stringify({
-      version: 1,
-      kind: "activity",
-      event_id: activityId,
-      run_id: "run-1",
-      created_at: "2026-07-18T00:00:00.000Z",
-      type: "response",
-      body: "Implementation is ready",
-    }));
-    const completion = Buffer.from(JSON.stringify({
-      version: 1,
-      kind: "completion",
-      event_id: "66666666-6666-4666-8666-666666666666",
-      run_id: "run-1",
-      created_at: "2026-07-18T00:00:01.000Z",
-      token: "callback-token-123",
-      exit_code: 0,
-    }));
-    const files = new Map([
-      ["/home/agent/.ot/outbox/001.json", activity],
-      ["/home/agent/.ot/outbox/002.json", completion],
-    ]);
-    const sandbox = {
-      id: "sandbox-1",
-      state: "started",
-      autoStopInterval: 60,
-      fs: {
-        listFiles: vi.fn(async () =>
-          [...files.entries()].map(([path, value]) => ({
-            name: path.split("/").at(-1), path, size: value.length, isDir: false,
-          }))
-        ),
-        downloadFile: vi.fn(async (path: string) => files.get(path)!),
-        deleteFile: vi.fn(async (path: string) => files.delete(path)),
-      },
-    } as unknown as Sandbox;
-    const postActivity = vi
-      .fn<() => Promise<void>>()
-      .mockRejectedValueOnce(new Error("Linear unavailable"))
-      .mockResolvedValue(undefined);
-    const finishCompletion = vi.fn(async () => ({ status: 200 }));
-    const params = {
-      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
-      store,
-      postActivity,
-      finishCompletion,
-    };
-
-    await pollSandboxEvents(params);
-
-    expect(postActivity).toHaveBeenCalledOnce();
-    expect(finishCompletion).not.toHaveBeenCalled();
-    expect(store.getSandboxEvent(activityId)).toMatchObject({
-      status: "failed",
-      payload: expect.not.stringContaining("callback-token-123"),
-    });
-
-    db!.prepare("UPDATE sandbox_events SET next_attempt_at = ? WHERE event_id = ?")
-      .run("2000-01-01T00:00:00.000Z", activityId);
-    await pollSandboxEvents(params);
-
-    expect(postActivity).toHaveBeenCalledTimes(2);
-    expect(finishCompletion).toHaveBeenCalledOnce();
-    expect(store.getSandboxEvent(activityId)?.status).toBe("processed");
   });
 
   it("returns a sandbox to idle when a stale poll reactivates it after completion", async () => {
@@ -466,7 +471,6 @@ describe("sandbox event contracts", () => {
       daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
       store,
       postActivity: vi.fn(),
-      finishCompletion: vi.fn(),
     });
 
     await activeStarted;
@@ -499,7 +503,12 @@ describe("sandbox event contracts", () => {
         listFiles: vi.fn(async () => [{
           name: "stale.json", path: "/home/agent/.ot/outbox/stale.json", size: stale.length, isDir: false,
         }]),
-        downloadFile: vi.fn(async () => stale),
+        downloadFile: vi.fn(async (path: string) => {
+          if (path === "/var/lib/openthrottle/heartbeat/heartbeat.json") {
+            throw new Error("not found");
+          }
+          return stale;
+        }),
         deleteFile,
       },
     } as unknown as Sandbox;
@@ -509,7 +518,6 @@ describe("sandbox event contracts", () => {
       daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
       store,
       postActivity,
-      finishCompletion: vi.fn(),
     });
 
     expect(postActivity).not.toHaveBeenCalled();
@@ -543,7 +551,12 @@ describe("sandbox event contracts", () => {
         listFiles: vi.fn(async () => [{
           name: "late.json", path: "/home/agent/.ot/outbox/late.json", size: late.length, isDir: false,
         }]),
-        downloadFile: vi.fn(async () => late),
+        downloadFile: vi.fn(async (path: string) => {
+          if (path === "/var/lib/openthrottle/heartbeat/heartbeat.json") {
+            throw new Error("not found");
+          }
+          return late;
+        }),
         deleteFile,
       },
     } as unknown as Sandbox;
@@ -553,7 +566,6 @@ describe("sandbox event contracts", () => {
       daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
       store,
       postActivity,
-      finishCompletion: vi.fn(),
     });
 
     expect(postActivity).not.toHaveBeenCalled();

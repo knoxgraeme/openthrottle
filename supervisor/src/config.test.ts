@@ -12,24 +12,19 @@ function setRequiredEnv(): void {
   for (const name of [
     "PORT",
     "DATABASE_PATH",
-    "GITHUB_REPO_MAPPINGS",
-    "GITHUB_REPO_LABEL_MAPPINGS",
     "DAYTONA_SNAPSHOT",
     "DEFAULT_AGENT",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CODEX_AUTH_JSON",
     "KIMI_CODE_API_KEY",
-    "BASE_BRANCH",
-    "MAX_TURNS",
     "TASK_TIMEOUT",
-    "CALLBACK_GRACE_SECONDS",
-    "DEV_PORT",
-    "SWEEP_MAX_AGE_DAYS",
     "ORPHAN_GRACE_MINUTES",
     "WEBHOOK_MAX_AGE_SECONDS",
-    "REVIEW_MAX_ROUNDS",
     "ALLOW_LINEAR_MERGE",
     "SANDBOX_EVENT_POLL_INTERVAL_MS",
+    "PIPELINE_CATALOG_PATH",
+    "SANDBOX_RUNTIME_RELEASE",
+    "SANDBOX_RUNTIME_DESCRIPTOR_PATH",
   ]) {
     delete process.env[name];
   }
@@ -42,7 +37,7 @@ function setRequiredEnv(): void {
     LINEAR_CLIENT_SECRET: "linear-client-secret",
     GITHUB_WEBHOOK_SECRET: "github-webhook",
     GITHUB_TOKEN: "github-token",
-    GITHUB_REPO: "owner/repo",
+    GITHUB_READ_TOKEN: "github-read-token",
     DAYTONA_API_KEY: "daytona",
     CLAUDE_CODE_OAUTH_TOKEN: "claude",
     CODEX_AUTH_JSON: "{}",
@@ -51,50 +46,41 @@ function setRequiredEnv(): void {
 }
 
 describe("loadConfig", () => {
-  it("loads safe defaults and repo mappings", () => {
+  it("loads safe coordinator defaults", () => {
     setRequiredEnv();
-    process.env.GITHUB_REPO_MAPPINGS = JSON.stringify({ OT: "other/project" });
-    process.env.GITHUB_REPO_LABEL_MAPPINGS = JSON.stringify({ "Repo/web-app": "owner/web-app" });
     process.env.ALLOW_LINEAR_MERGE = "true";
 
     expect(loadConfig()).toMatchObject({
       supervisorUrl: "https://openthrottle.test",
-      githubRepo: "owner/repo",
-      githubRepoMappings: { OT: "other/project" },
-      githubRepoLabelMappings: { "Repo/web-app": "owner/web-app" },
-      baseBranch: "main",
       port: 8080,
       taskTimeout: 7200,
       allowLinearMerge: true,
       defaultAgent: "codex",
+      githubReadToken: "github-read-token",
       kimiCodeApiKey: "kimi",
       sandboxEventPollIntervalMs: 5_000,
-      reviewNudgeComment: "",
+      sandboxRuntimeRelease: "openthrottle-snapshot/v2",
     });
   });
 
-  it("loads a configured review nudge comment", () => {
+  it("validates explicit runtime settings", () => {
     setRequiredEnv();
-    process.env.REVIEW_NUDGE_COMMENT = "@codex review";
-    expect(loadConfig().reviewNudgeComment).toBe("@codex review");
+    process.env.PIPELINE_CATALOG_PATH = "/opt/catalog.yaml";
+    process.env.SANDBOX_RUNTIME_RELEASE = "snapshot/2026-07-22";
+    process.env.SANDBOX_RUNTIME_DESCRIPTOR_PATH = "/opt/runtime.json";
+    expect(loadConfig()).toMatchObject({
+      pipelineCatalogPath: "/opt/catalog.yaml",
+      sandboxRuntimeRelease: "snapshot/2026-07-22",
+      sandboxRuntimeDescriptorPath: "/opt/runtime.json",
+    });
+    process.env.SANDBOX_RUNTIME_RELEASE = "unsafe release";
+    expect(() => loadConfig()).toThrow(/SANDBOX_RUNTIME_RELEASE/);
   });
 
-  it("rejects malformed integers, unsafe repos, and unsafe branch names", () => {
+  it("rejects malformed integers", () => {
     setRequiredEnv();
     process.env.PORT = "8080junk";
     expect(() => loadConfig()).toThrow("PORT must be an integer");
-
-    process.env.PORT = "8080";
-    process.env.GITHUB_REPO = "owner/repo'";
-    expect(() => loadConfig()).toThrow('GITHUB_REPO must be "owner/name"');
-
-    process.env.GITHUB_REPO = "owner/repo";
-    process.env.GITHUB_REPO_LABEL_MAPPINGS = JSON.stringify({ "Repo/web-app": "owner/repo'" });
-    expect(() => loadConfig()).toThrow('GITHUB_REPO_LABEL_MAPPINGS.Repo/web-app must be an "owner/name"');
-
-    process.env.GITHUB_REPO_LABEL_MAPPINGS = "";
-    process.env.BASE_BRANCH = "main; unsafe";
-    expect(() => loadConfig()).toThrow("BASE_BRANCH must be a safe Git branch name");
   });
 
   it("rejects out-of-range lifecycle limits", () => {

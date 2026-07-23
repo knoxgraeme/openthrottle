@@ -6,27 +6,18 @@ import type { TicketStore } from "./db.js";
 import { createTicketStore, openDb } from "./db.js";
 import { createLinearOutboxProcessor } from "./linear-outbox.js";
 import { reapStalledRuns } from "./reaper.js";
+import type { PipelineStore } from "./pipeline-store.js";
 
 let db: Database.Database | undefined;
 afterEach(() => db?.close());
 
 const cfg = { stallTimeoutSeconds: 900 } as Config;
 
-// Sandbox settlement is fire-and-forget (scheduleSandboxSettlement without a
-// scheduler). A single macrotask turn drains its microtask chain so the idle
-// reconciliation has run before we assert on the fake sandbox.
-const flushMicrotasks = (): Promise<void> =>
-  new Promise((resolve) => setImmediate(resolve));
-
-// Minimal Daytona: settlement only touches daytona.get(...).setAutostopInterval
-// (reconcileSandboxAutostop idles the sandbox once its run_id is cleared). Mirrors
-// sweep.test.ts's `timedSandbox`.
-function makeDaytona() {
+function makeDaytona(stopError?: Error) {
   const sandbox = {
     id: "sandbox-1",
-    autoStopInterval: 60,
-    setAutostopInterval: vi.fn(async (minutes: number) => {
-      sandbox.autoStopInterval = minutes;
+    stop: vi.fn(async () => {
+      if (stopError) throw stopError;
     }),
   };
   const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
@@ -87,9 +78,9 @@ describe("reapStalledRuns", () => {
       "2020-01-01T00:00:00.000Z",
       "evt-stalled"
     );
+    store.renewRunLiveness("run-stalled", "2020-01-01T00:00:00.000Z");
 
     await reapStalledRuns({ daytona, store, linearOutbox, cfg });
-    await flushMicrotasks();
 
     // The stalled run is reaped: run terminal, ticket errored, run_id cleared.
     expect(store.getRun("run-stalled")?.status).toBe("timed_out");
@@ -108,8 +99,8 @@ describe("reapStalledRuns", () => {
     expect(payload.activity.type).toBe("error");
     expect(payload.activity.body).toContain("reaped");
 
-    // Settlement idled the sandbox (active 60 → idle 5).
-    expect(sandbox.setAutostopInterval).toHaveBeenCalledWith(5);
+    // The actor was stopped before ticket exclusivity was released.
+    expect(sandbox.stop).toHaveBeenCalledWith(60, true);
 
     // The freshly-started run is untouched.
     expect(store.getRun("run-fresh")?.status).toBe("running");
@@ -142,6 +133,7 @@ describe("reapStalledRuns", () => {
       kind: "activity",
       payload: JSON.stringify({ type: "thought", ephemeral: true }),
     });
+    store.renewRunLiveness("run-beating", new Date().toISOString());
 
     await reapStalledRuns({ daytona, store, linearOutbox, cfg });
 
@@ -150,7 +142,7 @@ describe("reapStalledRuns", () => {
     expect(store.listLinearOutbox()).toHaveLength(0);
   });
 
-  it("does not reap a bootstrapping run that has not emitted any event yet", async () => {
+  it("reaps a bootstrapping run from started_at when no heartbeat ever arrives", async () => {
     db = openDb(":memory:");
     const store = createTicketStore(db);
     const { daytona } = makeDaytona();
@@ -164,9 +156,8 @@ describe("reapStalledRuns", () => {
       tokenHash: "hash",
       expiresAt: "2999-01-01T00:00:00.000Z",
     });
-    // A slow bootstrap (e.g. a long post_bootstrap `npm ci`): started well
-    // before the cutoff, but normalize.mjs has not emitted its first event yet.
-    // The hard TASK_TIMEOUT expiry — not the stall reaper — governs this case.
+    // A wedged bootstrap cannot hide forever behind an absence of agent output;
+    // started_at is authoritative until the first sealed executor heartbeat.
     db.prepare("UPDATE runs SET started_at = ? WHERE id = ?").run(
       "2020-01-01T00:00:00.000Z",
       "run-booting"
@@ -174,9 +165,171 @@ describe("reapStalledRuns", () => {
 
     await reapStalledRuns({ daytona, store, linearOutbox, cfg });
 
-    expect(store.getRun("run-booting")?.status).toBe("running");
-    expect(store.getByIssueId("booting")?.run_id).toBe("run-booting");
-    expect(store.listLinearOutbox()).toHaveLength(0);
+    expect(store.getRun("run-booting")?.status).toBe("timed_out");
+    expect(store.getByIssueId("booting")?.run_id).toBeNull();
+    expect(store.listLinearOutbox()).toHaveLength(1);
+  });
+
+  it("quarantines a claimed run when termination cannot be confirmed", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    const { daytona } = makeDaytona(new Error("provider timeout"));
+    const linearOutbox = makeOutbox(store);
+    addTicket(store, "wedged", "sandbox-1");
+    store.beginRun({
+      issueId: "wedged",
+      runId: "run-wedged",
+      taskType: "implement",
+      tokenHash: "hash",
+      expiresAt: "2999-01-01T00:00:00.000Z",
+    });
+    db.prepare("UPDATE runs SET started_at = ? WHERE id = ?").run(
+      "2020-01-01T00:00:00.000Z",
+      "run-wedged"
+    );
+
+    await reapStalledRuns({ daytona, store, linearOutbox, cfg });
+
+    expect(store.getRun("run-wedged")?.status).toBe("quarantined");
+    expect(store.getByIssueId("wedged")).toMatchObject({
+      state: "error",
+      run_id: "run-wedged",
+    });
+    expect(store.beginRun({
+      issueId: "wedged",
+      runId: "replacement",
+      taskType: "implement",
+      tokenHash: "hash",
+      expiresAt: "2999-01-01T00:00:00.000Z",
+    })).toBe(false);
+    expect(store.listLinearOutbox()).toHaveLength(1);
+
+    expect(store.settleQuarantinedRun({
+      runId: "run-wedged",
+      status: "stopped",
+      ticketState: "stopped",
+      failureTail: "termination later confirmed",
+    })).toMatchObject({ status: "stopped" });
+    expect(store.getByIssueId("wedged")).toMatchObject({ state: "stopped", run_id: null });
+  });
+
+  it("quarantines a pipeline resource without advancing to a retry before actor termination", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    const { daytona } = makeDaytona(new Error("provider timeout"));
+    const linearOutbox = makeOutbox(store);
+    addTicket(store, "pipeline-wedged", "sandbox-1");
+    store.beginRun({
+      issueId: "pipeline-wedged",
+      runId: "run-pipeline-wedged",
+      taskType: "implement",
+      tokenHash: "hash",
+      expiresAt: "2999-01-01T00:00:00.000Z",
+    });
+    db.prepare("UPDATE runs SET started_at = ? WHERE id = ?").run(
+      "2020-01-01T00:00:00.000Z",
+      "run-pipeline-wedged"
+    );
+    const setRuntimeResourceStatus = vi.fn();
+    const getActiveAttempt = vi.fn();
+    const pipelines = {
+      getAttemptForRun: vi.fn(() => ({ pipeline_instance_id: "pipeline-1" })),
+      getInstance: vi.fn(() => ({ id: "pipeline-1" })),
+      getRuntimeResource: vi.fn(() => ({ provider_resource_id: "sandbox-1" })),
+      setRuntimeResourceStatus,
+      getActiveAttempt,
+    } as unknown as PipelineStore;
+
+    await reapStalledRuns({ daytona, store, linearOutbox, cfg, pipelines });
+
+    expect(setRuntimeResourceStatus).toHaveBeenCalledWith("pipeline-1", "quarantined");
+    expect(getActiveAttempt).not.toHaveBeenCalled();
+    expect(store.getRun("run-pipeline-wedged")?.status).toBe("quarantined");
+  });
+
+  it("allows only the settlement owner to finish a reaping run", () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    addTicket(store, "race", null);
+    store.beginRun({
+      issueId: "race",
+      runId: "run-race",
+      taskType: "implement",
+      tokenHash: "hash",
+      expiresAt: "2999-01-01T00:00:00.000Z",
+    });
+    expect(store.claimRunForReaping("run-race", "reaper-a", "stalled")?.status).toBe("reaping");
+    expect(store.finishRun({ runId: "run-race", status: "completed" })).toBeUndefined();
+    expect(store.finishReapingRun({
+      runId: "run-race",
+      owner: "reaper-b",
+      status: "timed_out",
+    })).toBeUndefined();
+    expect(store.finishReapingRun({
+      runId: "run-race",
+      owner: "reaper-a",
+      status: "timed_out",
+      ticketState: "error",
+    })?.status).toBe("timed_out");
+  });
+
+  it("holds an exclusive supervisor lease across the termination call", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    addTicket(store, "overlap", "sandbox-1");
+    store.beginRun({
+      issueId: "overlap",
+      runId: "run-overlap",
+      taskType: "implement",
+      tokenHash: "hash",
+      expiresAt: "2999-01-01T00:00:00.000Z",
+    });
+    db.prepare("UPDATE runs SET started_at = ? WHERE id = ?").run(
+      "2020-01-01T00:00:00.000Z",
+      "run-overlap"
+    );
+    let confirmStop!: () => void;
+    const stopGate = new Promise<void>((resolve) => { confirmStop = resolve; });
+    const sandbox = { id: "sandbox-1", stop: vi.fn(async () => stopGate) };
+    const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
+    const linearOutbox = makeOutbox(store);
+
+    const first = reapStalledRuns({ daytona, store, linearOutbox, cfg });
+    await vi.waitFor(() => expect(sandbox.stop).toHaveBeenCalledOnce());
+    await reapStalledRuns({ daytona, store, linearOutbox, cfg });
+    expect(daytona.get).toHaveBeenCalledOnce();
+
+    confirmStop();
+    await first;
+    expect(store.getRun("run-overlap")?.status).toBe("timed_out");
+  });
+
+  it("renews the supervisor lease before every stalled actor", async () => {
+    db = openDb(":memory:");
+    const store = createTicketStore(db);
+    const { daytona } = makeDaytona();
+    const linearOutbox = makeOutbox(store);
+    for (const id of ["first", "second"]) {
+      addTicket(store, id, "sandbox-1");
+      store.beginRun({
+        issueId: id,
+        runId: `run-${id}`,
+        taskType: "implement",
+        tokenHash: "hash",
+        expiresAt: "2999-01-01T00:00:00.000Z",
+      });
+      db.prepare("UPDATE runs SET started_at = ? WHERE id = ?").run(
+        "2020-01-01T00:00:00.000Z",
+        `run-${id}`
+      );
+    }
+    const acquire = vi.spyOn(store, "acquireSupervisorLease");
+
+    await reapStalledRuns({ daytona, store, linearOutbox, cfg });
+
+    expect(acquire).toHaveBeenCalledTimes(3); // initial acquisition + each actor
+    expect(store.getRun("run-first")?.status).toBe("timed_out");
+    expect(store.getRun("run-second")?.status).toBe("timed_out");
   });
 
   it("is a no-op when there are no stalled runs", async () => {

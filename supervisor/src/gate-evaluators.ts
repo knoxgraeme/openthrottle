@@ -1,0 +1,660 @@
+import {
+  ASSURANCE_CLASSES,
+  STAGE_OUTCOMES,
+  canonicalJson,
+  digestNormalized,
+  type AssuranceClass,
+  type PipelineManifest,
+  type PipelineStage,
+  type StageOutcome,
+} from "./pipeline-manifest.js";
+import {
+  coordinatePipelineEvent,
+  type PipelineCoordinatorEvent,
+  type PipelineEventArtifact,
+} from "./pipeline-coordinator.js";
+import type {
+  CoordinatorGateReceiptWrite,
+  PipelineInstance,
+  PipelineStageAttempt,
+  PipelineStore,
+} from "./pipeline-store.js";
+import type { TicketStore } from "./db.js";
+
+const SHA256 = /^[a-f0-9]{64}$/;
+const GIT_SUBJECT = /^[a-f0-9]{40,64}$/;
+const GIT_COMMIT = /^[a-f0-9]{40}$/;
+const ARTIFACT_LIMIT = 12 * 1024;
+const SECRET_PATTERNS = [
+  /gh[opsu]_[A-Za-z0-9_]+/,
+  /github_pat_[A-Za-z0-9_]+/,
+  /sk-[A-Za-z0-9_-]+/,
+  /lin_(?:api|oauth)_[A-Za-z0-9_]+/,
+  /Bearer\s+\S+/i,
+];
+const ARTIFACT_KEYS = new Set([
+  "schema", "kind", "producer", "pipeline", "stage", "run", "repository",
+  "assurance", "result", "summary", "evidence", "findings", "actions",
+  "uncertainty", "started_at", "completed_at", "details",
+]);
+
+type ArtifactResult = StageOutcome | "not_configured";
+type GateResult = CoordinatorGateReceiptWrite["result"];
+
+interface Finding {
+  severity: "P0" | "P1" | "P2" | "P3";
+  code: string;
+  summary: string;
+  path?: string;
+  line?: number;
+}
+
+interface TypedArtifactPayload {
+  schema: string;
+  kind: string;
+  producer: {
+    capability: string;
+    runtime_release: string;
+    capability_digest: string;
+    version: number;
+  };
+  pipeline: { instance_id: string; manifest_digest: string };
+  stage: {
+    id: string;
+    attempt_id: string;
+    request_hash: string;
+    context_revision: number;
+    context_policy: string;
+  };
+  run: {
+    id: string;
+    ticket_id: string;
+    session_id: string;
+    generation: number;
+    native_session_id: string | null;
+  };
+  repository: {
+    name: string;
+    base_commit: string;
+    subject: string;
+    pre_subject: string;
+    post_subject: string;
+  };
+  assurance: AssuranceClass;
+  result: ArtifactResult;
+  summary: string;
+  evidence: string[];
+  findings: Finding[];
+  actions: string[];
+  uncertainty: string[];
+  started_at: string;
+  completed_at: string;
+  details: Record<string, unknown>;
+}
+
+export interface StageGateEvaluation {
+  event: PipelineCoordinatorEvent;
+  receipt: CoordinatorGateReceiptWrite;
+}
+
+function record(value: unknown, label: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function exactKeys(value: Record<string, unknown>, keys: readonly string[] | Set<string>, label: string): void {
+  const allowed = keys instanceof Set ? keys : new Set(keys);
+  const unknown = Object.keys(value).find((key) => !allowed.has(key));
+  const missing = [...allowed].find((key) => !(key in value));
+  if (unknown) throw new Error(`${label} has unknown field ${unknown}`);
+  if (missing) throw new Error(`${label} is missing field ${missing}`);
+}
+
+function boundedString(value: unknown, label: string, max = 8_000): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > max) {
+    throw new Error(`${label} must be a bounded non-empty string`);
+  }
+  return value;
+}
+
+function nullableString(value: unknown, label: string): string | null {
+  if (value === null) return null;
+  return boundedString(value, label, 200);
+}
+
+function integer(value: unknown, label: string, min = 0): number {
+  if (!Number.isSafeInteger(value) || (value as number) < min) throw new Error(`${label} is invalid`);
+  return value as number;
+}
+
+function strings(value: unknown, label: string, maxItems: number, maxLength: number): string[] {
+  if (!Array.isArray(value) || value.length > maxItems) throw new Error(`${label} is not a bounded array`);
+  return value.map((entry, index) => boundedString(entry, `${label}[${index}]`, maxLength));
+}
+
+function timestamp(value: unknown, label: string): string {
+  const result = boundedString(value, label, 64);
+  if (Number.isNaN(Date.parse(result))) throw new Error(`${label} is invalid`);
+  return result;
+}
+
+function parseFindings(value: unknown): Finding[] {
+  if (!Array.isArray(value) || value.length > 50) throw new Error("artifact findings are not bounded");
+  return value.map((entry, index) => {
+    const finding = record(entry, `findings[${index}]`);
+    const allowed = ["severity", "code", "summary", "path", "line"];
+    const unknown = Object.keys(finding).find((key) => !allowed.includes(key));
+    if (unknown) throw new Error(`findings[${index}] has unknown field ${unknown}`);
+    if (!["P0", "P1", "P2", "P3"].includes(String(finding.severity))) {
+      throw new Error(`findings[${index}] has invalid severity`);
+    }
+    return {
+      severity: finding.severity as Finding["severity"],
+      code: boundedString(finding.code, `findings[${index}].code`, 80),
+      summary: boundedString(finding.summary, `findings[${index}].summary`, 1_000),
+      ...(finding.path === undefined
+        ? {}
+        : { path: boundedString(finding.path, `findings[${index}].path`, 500) }),
+      ...(finding.line === undefined ? {} : { line: integer(finding.line, `findings[${index}].line`, 1) }),
+    };
+  });
+}
+
+function parseArtifactPayload(artifact: PipelineEventArtifact): TypedArtifactPayload {
+  if (artifact.schemaVersion !== 1) throw new Error(`artifact ${artifact.kind} schema version is unsupported`);
+  if (Buffer.byteLength(artifact.payload, "utf8") > ARTIFACT_LIMIT) {
+    throw new Error(`artifact ${artifact.kind} exceeds the gate size limit`);
+  }
+  if (SECRET_PATTERNS.some((pattern) => pattern.test(artifact.payload))) {
+    throw new Error(`artifact ${artifact.kind} contains a secret-shaped value`);
+  }
+  if (!SHA256.test(artifact.hash) || digestNormalized(artifact.payload) !== artifact.hash) {
+    throw new Error(`artifact ${artifact.kind} hash mismatch`);
+  }
+  const parsed: unknown = JSON.parse(artifact.payload);
+  if (canonicalJson(parsed) !== artifact.payload) {
+    throw new Error(`artifact ${artifact.kind} is not canonical JSON`);
+  }
+  const input = record(parsed, `artifact ${artifact.kind}`);
+  exactKeys(input, ARTIFACT_KEYS, `artifact ${artifact.kind}`);
+  if (input.schema !== `openthrottle.artifact/${artifact.kind}@1` || input.kind !== artifact.kind) {
+    throw new Error(`artifact ${artifact.kind} schema binding mismatch`);
+  }
+  const producer = record(input.producer, `artifact ${artifact.kind}.producer`);
+  exactKeys(producer, ["capability", "runtime_release", "capability_digest", "version"], "artifact producer");
+  const pipeline = record(input.pipeline, `artifact ${artifact.kind}.pipeline`);
+  exactKeys(pipeline, ["instance_id", "manifest_digest"], "artifact pipeline");
+  const stage = record(input.stage, `artifact ${artifact.kind}.stage`);
+  exactKeys(stage, ["id", "attempt_id", "request_hash", "context_revision", "context_policy"], "artifact stage");
+  const run = record(input.run, `artifact ${artifact.kind}.run`);
+  exactKeys(run, ["id", "ticket_id", "session_id", "generation", "native_session_id"], "artifact run");
+  const repository = record(input.repository, `artifact ${artifact.kind}.repository`);
+  exactKeys(repository, ["name", "base_commit", "subject", "pre_subject", "post_subject"], "artifact repository");
+  if (!ASSURANCE_CLASSES.includes(input.assurance as AssuranceClass)) throw new Error("artifact assurance is invalid");
+  if (![...STAGE_OUTCOMES, "not_configured"].includes(input.result as ArtifactResult)) {
+    throw new Error("artifact result is invalid");
+  }
+  const startedAt = timestamp(input.started_at, "artifact started_at");
+  const completedAt = timestamp(input.completed_at, "artifact completed_at");
+  if (Date.parse(completedAt) < Date.parse(startedAt)) throw new Error("artifact completion precedes its start");
+  const subject = boundedString(repository.subject, "artifact repository subject", 64);
+  const preSubject = boundedString(repository.pre_subject, "artifact repository pre_subject", 64);
+  const postSubject = boundedString(repository.post_subject, "artifact repository post_subject", 64);
+  if (![subject, preSubject, postSubject].every((value) => GIT_SUBJECT.test(value))) {
+    throw new Error("artifact repository subject is invalid");
+  }
+  return {
+    schema: input.schema as string,
+    kind: input.kind as string,
+    producer: {
+      capability: boundedString(producer.capability, "artifact producer capability", 160),
+      runtime_release: boundedString(producer.runtime_release, "artifact runtime release", 160),
+      capability_digest: boundedString(producer.capability_digest, "artifact capability digest", 64),
+      version: integer(producer.version, "artifact producer version", 1),
+    },
+    pipeline: {
+      instance_id: boundedString(pipeline.instance_id, "artifact pipeline instance", 200),
+      manifest_digest: boundedString(pipeline.manifest_digest, "artifact manifest digest", 64),
+    },
+    stage: {
+      id: boundedString(stage.id, "artifact stage id", 200),
+      attempt_id: boundedString(stage.attempt_id, "artifact attempt id", 200),
+      request_hash: boundedString(stage.request_hash, "artifact request hash", 64),
+      context_revision: integer(stage.context_revision, "artifact context revision"),
+      context_policy: boundedString(stage.context_policy, "artifact context policy", 40),
+    },
+    run: {
+      id: boundedString(run.id, "artifact run id", 200),
+      ticket_id: boundedString(run.ticket_id, "artifact ticket id", 200),
+      session_id: boundedString(run.session_id, "artifact session id", 200),
+      generation: integer(run.generation, "artifact generation", 1),
+      native_session_id: nullableString(run.native_session_id, "artifact native session id"),
+    },
+    repository: {
+      name: boundedString(repository.name, "artifact repository", 240),
+      base_commit: boundedString(repository.base_commit, "artifact base commit", 64),
+      subject,
+      pre_subject: preSubject,
+      post_subject: postSubject,
+    },
+    assurance: input.assurance as AssuranceClass,
+    result: input.result as ArtifactResult,
+    summary: boundedString(input.summary, "artifact summary", 2_000),
+    evidence: strings(input.evidence, "artifact evidence", 50, 1_000),
+    findings: parseFindings(input.findings),
+    actions: strings(input.actions, "artifact actions", 50, 1_000),
+    uncertainty: strings(input.uncertainty, "artifact uncertainty", 20, 1_000),
+    started_at: startedAt,
+    completed_at: completedAt,
+    details: record(input.details, "artifact details"),
+  };
+}
+
+function validateFence(
+  payload: TypedArtifactPayload,
+  artifact: PipelineEventArtifact,
+  instance: PipelineInstance,
+  attempt: PipelineStageAttempt,
+  stage: PipelineStage,
+  event: PipelineCoordinatorEvent,
+  subject: string
+): void {
+  if (
+    payload.producer.capability !== stage.executor.capability ||
+    payload.producer.runtime_release !== instance.runtime_release ||
+    payload.producer.capability_digest !== instance.capability_digest ||
+    payload.pipeline.instance_id !== instance.id ||
+    payload.pipeline.manifest_digest !== instance.manifest_digest ||
+    payload.stage.id !== stage.id ||
+    payload.stage.attempt_id !== attempt.id ||
+    payload.stage.request_hash !== attempt.request_hash ||
+    payload.stage.context_revision !== attempt.context_revision ||
+    payload.stage.context_policy !== attempt.native_context_policy ||
+    payload.run.id !== event.runId ||
+    payload.run.ticket_id !== instance.linear_issue_id ||
+    payload.run.session_id !== instance.linear_session_id ||
+    payload.run.generation !== instance.generation ||
+    payload.run.native_session_id !== (event.nativeSessionId ?? null) ||
+    payload.repository.name !== instance.repository ||
+    payload.repository.base_commit !== instance.base_commit
+  ) throw new Error(`artifact ${artifact.kind} provenance fence mismatch`);
+  if (attempt.expected_subject !== null && payload.repository.pre_subject !== attempt.expected_subject) {
+    throw new Error(`artifact ${artifact.kind} input subject fence mismatch`);
+  }
+  if (attempt.native_session_id !== null && payload.run.native_session_id !== attempt.native_session_id) {
+    throw new Error(`artifact ${artifact.kind} native session fence mismatch`);
+  }
+  if (payload.assurance !== stage.evaluator.assurance || artifact.assurance !== payload.assurance) {
+    throw new Error(`artifact ${artifact.kind} assurance mismatch`);
+  }
+  if (payload.repository.subject !== payload.repository.post_subject ||
+      payload.repository.subject !== subject || artifact.subject !== subject) {
+    throw new Error(`artifact ${artifact.kind} subject fence mismatch`);
+  }
+}
+
+function gateResultForOutcome(outcome: StageOutcome): GateResult {
+  if (outcome === "success" || outcome === "no_change") return "passed";
+  if (outcome === "retryable_infrastructure_failure" || outcome === "needs_human") return "indeterminate";
+  return "failed";
+}
+
+function semanticDecision(payloads: TypedArtifactPayload[]): { outcome: StageOutcome; result: GateResult; reason: string } {
+  const stageResult = payloads.find((payload) => payload.kind === "stage_result")!;
+  if (stageResult.result === "not_configured" || stageResult.result === "canceled" || stageResult.result === "superseded") {
+    throw new Error(`semantic stage proposed forbidden result ${stageResult.result}`);
+  }
+  const blocking = payloads.flatMap((payload) => payload.findings)
+    .filter((finding) => finding.severity === "P0" || finding.severity === "P1");
+  if (blocking.length > 0) {
+    return { outcome: "semantic_repair_required", result: "failed", reason: "blocking_findings" };
+  }
+  return {
+    outcome: stageResult.result,
+    result: gateResultForOutcome(stageResult.result),
+    reason: "typed_semantic_result",
+  };
+}
+
+function commandDecision(payloads: TypedArtifactPayload[]): { outcome: StageOutcome; result: GateResult; reason: string } {
+  const command = payloads.find((payload) => payload.kind === "command_result");
+  if (!command) throw new Error("command gate is missing command_result");
+  const details = command.details;
+  const notConfigured = details.not_configured;
+  const timedOut = details.timed_out;
+  const exitCode = details.exit_code;
+  const signal = details.signal;
+  if (typeof notConfigured !== "boolean" || typeof timedOut !== "boolean" ||
+      (exitCode !== null && !Number.isInteger(exitCode)) ||
+      (signal !== null && typeof signal !== "string")) {
+    throw new Error("command_result has invalid executor evidence");
+  }
+  if (notConfigured) return { outcome: "no_change", result: "not_configured", reason: "command_not_configured" };
+  if (timedOut || signal !== null || exitCode === 137) {
+    return { outcome: "retryable_infrastructure_failure", result: "indeterminate", reason: "command_terminated" };
+  }
+  if (exitCode === 0) return { outcome: "success", result: "passed", reason: "command_exit_zero" };
+  return { outcome: "failure", result: "failed", reason: "command_exit_nonzero" };
+}
+
+export function evaluateStageGate(
+  store: PipelineStore,
+  event: PipelineCoordinatorEvent,
+  options: { observedSubject?: string } = {}
+): StageGateEvaluation {
+  if (event.kind !== "stage_result") throw new Error("sandbox gate accepts only stage_result events");
+  if (!event.runId || !event.stageId) throw new Error("stage result is missing its run or stage fence");
+  const instance = store.getInstance(event.instanceId);
+  if (!instance) throw new Error(`unknown pipeline instance ${event.instanceId}`);
+  const attempt = store.getAttempt(event.attemptId);
+  if (!attempt || attempt.pipeline_instance_id !== instance.id) throw new Error(`unknown pipeline attempt ${event.attemptId}`);
+  if (!attempt.run_id || attempt.run_id !== event.runId) throw new Error("stage result run fence mismatch");
+  if (attempt.stage_id !== event.stageId || attempt.request_hash !== event.requestHash) {
+    throw new Error("stage result attempt fence mismatch");
+  }
+  if (instance.generation !== event.generation) throw new Error("stage result generation is stale");
+  const manifest = JSON.parse(instance.normalized_manifest) as PipelineManifest;
+  const stage = manifest.stages.find((candidate) => candidate.id === attempt.stage_id);
+  if (!stage) throw new Error(`stage ${attempt.stage_id} is absent from the pinned manifest`);
+  const artifacts = event.artifacts ?? [];
+  if (new Set(artifacts.map((artifact) => artifact.kind)).size !== artifacts.length) {
+    throw new Error("stage result contains duplicate artifact kinds");
+  }
+  for (const required of ["stage_result", ...stage.evaluator.required_artifacts]) {
+    if (!artifacts.some((artifact) => artifact.kind === required)) {
+      throw new Error(`stage result is missing required ${required}`);
+    }
+  }
+  if (artifacts.some((artifact) => !stage.produces.includes(artifact.kind as never))) {
+    throw new Error("stage result contains undeclared evidence");
+  }
+  const subject = options.observedSubject ?? event.subject;
+  if (!subject || !GIT_SUBJECT.test(subject)) throw new Error("stage result has no valid gated subject");
+  if (options.observedSubject && event.subject !== options.observedSubject) {
+    throw new Error("workspace changed after stage evidence was sealed");
+  }
+  const payloads = artifacts.map((artifact) => {
+    const payload = parseArtifactPayload(artifact);
+    validateFence(payload, artifact, instance, attempt, stage, event, subject);
+    return payload;
+  });
+  const stageResult = payloads.find((payload) => payload.kind === "stage_result")!;
+  if (artifacts.find((artifact) => artifact.kind === "stage_result")?.hash !== event.resultHash) {
+    throw new Error("stage result event hash does not match its artifact");
+  }
+  if (payloads.some((payload) => payload.result !== stageResult.result)) {
+    throw new Error("stage artifacts disagree on their proposed result");
+  }
+  const decision = stage.evaluator.kind === "command"
+    ? commandDecision(payloads)
+    : semanticDecision(payloads);
+  let providerRevision: string | undefined;
+  if (stage.evaluator.kind === "publish_subject" && decision.outcome === "success") {
+    const revision = payloads.find((payload) => payload.kind === "publish_subject")?.details.published_commit;
+    if (typeof revision !== "string" || !GIT_COMMIT.test(revision)) {
+      throw new Error("publish gate has no executor-verified provider commit");
+    }
+    providerRevision = revision;
+  }
+  const artifactHashes = artifacts.map((artifact) => artifact.hash).sort();
+  const policy = {
+    evaluator: stage.evaluator,
+    executor: stage.executor,
+    context: stage.context,
+    produces: [...stage.produces].sort(),
+  };
+  const policyDigest = digestNormalized(canonicalJson(policy));
+  const receiptPayload = canonicalJson({
+    schema: "openthrottle.gate-receipt/v1",
+    pipeline_instance_id: instance.id,
+    manifest_digest: instance.manifest_digest,
+    stage_id: stage.id,
+    attempt_id: attempt.id,
+    request_hash: attempt.request_hash,
+    run_id: event.runId,
+    generation: instance.generation,
+    evaluator_kind: stage.evaluator.kind,
+    policy_digest: policyDigest,
+    subject,
+    proposed_result: stageResult.result,
+    decision: decision.result,
+    outcome: decision.outcome,
+    reason: decision.reason,
+    provider_revision: providerRevision ?? null,
+    artifact_hashes: artifactHashes,
+  });
+  return {
+    event: {
+      ...event,
+      outcome: decision.outcome,
+      subject,
+      ...(providerRevision ? { providerRevision } : {}),
+      resultHash: artifacts.find((artifact) => artifact.kind === "stage_result")!.hash,
+    },
+    receipt: {
+      evaluatorKind: stage.evaluator.kind,
+      policyDigest,
+      subject,
+      result: decision.result,
+      artifactHashes,
+      payload: receiptPayload,
+      hash: digestNormalized(receiptPayload),
+    },
+  };
+}
+
+export function processStageEvidence(
+  store: PipelineStore,
+  event: PipelineCoordinatorEvent,
+  options: { observedSubject?: string; faultAfterWrite?: (writeCount: number) => void } = {}
+): PipelineInstance {
+  const evaluated = evaluateStageGate(store, event, options);
+  return coordinatePipelineEvent(store, evaluated.event, options.faultAfterWrite, evaluated.receipt);
+}
+
+export function settleStageEvidence(
+  store: PipelineStore,
+  tickets: TicketStore,
+  event: PipelineCoordinatorEvent,
+  options: { observedSubject?: string; faultAfterWrite?: (writeCount: number) => void } = {}
+): PipelineInstance {
+  const evaluated = evaluateStageGate(store, event, options);
+  if (!event.runId) throw new Error(`pipeline stage event ${event.id} has no run binding`);
+  return tickets.db.transaction(() => {
+    const settled = tickets.finishRun({
+      runId: event.runId!,
+      status: "completed",
+      exitCode: 0,
+      ticketState: "active",
+    });
+    if (!settled && tickets.getRun(event.runId!)?.status !== "completed") {
+      throw new Error(`pipeline stage run ${event.runId} lost terminal settlement`);
+    }
+    return coordinatePipelineEvent(
+      store,
+      evaluated.event,
+      options.faultAfterWrite,
+      evaluated.receipt
+    );
+  }).immediate();
+}
+
+function providerGateReceipt(
+  instance: PipelineInstance,
+  attempt: PipelineStageAttempt,
+  stage: PipelineStage,
+  event: PipelineCoordinatorEvent
+): CoordinatorGateReceiptWrite {
+  const artifactHashes = (event.artifacts ?? []).map((artifact) => artifact.hash).sort();
+  const subject = event.subject ?? null;
+  const policyDigest = digestNormalized(canonicalJson({ evaluator: stage.evaluator, executor: stage.executor }));
+  const payload = canonicalJson({
+    schema: "openthrottle.gate-receipt/v1",
+    pipeline_instance_id: instance.id,
+    stage_id: stage.id,
+    attempt_id: attempt.id,
+    evaluator_kind: "provider",
+    policy_digest: policyDigest,
+    subject,
+    outcome: event.outcome,
+    artifact_hashes: artifactHashes,
+  });
+  return {
+    evaluatorKind: "provider",
+    policyDigest,
+    subject,
+    result: event.outcome === "success" || event.outcome === "no_change" ? "passed" : "failed",
+    artifactHashes,
+    payload,
+    hash: digestNormalized(payload),
+  };
+}
+
+export function processProviderEvidence(
+  store: PipelineStore,
+  input: {
+    id: string;
+    instanceId: string;
+    outcome: "success" | "no_change" | "semantic_repair_required" | "retryable_infrastructure_failure" | "needs_human" | "failure";
+    summary: string;
+    evidence: string[];
+    providerPayload: Record<string, unknown>;
+  }
+): PipelineInstance {
+  const instance = store.getInstance(input.instanceId);
+  if (!instance) throw new Error(`unknown pipeline instance ${input.instanceId}`);
+  const existing = store.getInboxEvent(input.id);
+  if (existing?.status === "consumed") {
+    if (existing.pipeline_instance_id !== instance.id || existing.generation !== instance.generation) {
+      throw new Error(`provider event ${input.id} was consumed by a different pipeline generation`);
+    }
+    const prior = JSON.parse(existing.payload) as PipelineCoordinatorEvent;
+    const priorStageResult = prior.artifacts?.find((artifact) => artifact.kind === "stage_result");
+    const priorPayload = priorStageResult
+      ? JSON.parse(priorStageResult.payload) as { summary?: unknown; evidence?: unknown; details?: unknown }
+      : undefined;
+    if (prior.outcome !== input.outcome || priorPayload?.summary !== input.summary ||
+        canonicalJson(priorPayload?.evidence) !== canonicalJson(input.evidence) ||
+        canonicalJson(priorPayload?.details) !== canonicalJson(input.providerPayload)) {
+      throw new Error(`provider event ${input.id} conflicts with its consumed payload`);
+    }
+    return instance;
+  }
+  const attempt = store.getActiveAttempt(instance.id);
+  if (!attempt) throw new Error(`pipeline instance ${input.instanceId} has no provider attempt`);
+  const manifest = JSON.parse(instance.normalized_manifest) as PipelineManifest;
+  const stage = manifest.stages.find((candidate) => candidate.id === attempt.stage_id);
+  if (!stage || stage.executor.kind !== "provider_wait" || stage.evaluator.kind !== "provider") {
+    throw new Error(`pipeline attempt ${attempt.id} is not a provider-wait stage`);
+  }
+  const subject = instance.immutable_subject;
+  if (!subject || !GIT_SUBJECT.test(subject)) throw new Error("provider evidence has no immutable subject");
+  // Provider webhook identities are replayed by GitHub. Bind receipt time to
+  // the immutable provider attempt so the same stable event ID always hashes
+  // to the same inbox payload across retries and supervisor restarts.
+  const timestamp = attempt.created_at;
+  const makeArtifact = (kind: "stage_result" | "provider_check"): PipelineEventArtifact => {
+    const payload = canonicalJson({
+      schema: `openthrottle.artifact/${kind}@1`,
+      kind,
+      producer: {
+        capability: stage.executor.capability,
+        runtime_release: instance.runtime_release,
+        capability_digest: instance.capability_digest,
+        version: 1,
+      },
+      pipeline: { instance_id: instance.id, manifest_digest: instance.manifest_digest },
+      stage: {
+        id: stage.id,
+        attempt_id: attempt.id,
+        request_hash: attempt.request_hash,
+        context_revision: attempt.context_revision,
+        context_policy: attempt.native_context_policy,
+      },
+      run: {
+        id: attempt.planned_run_id,
+        ticket_id: instance.linear_issue_id,
+        session_id: instance.linear_session_id,
+        generation: instance.generation,
+        native_session_id: attempt.native_session_id,
+      },
+      repository: {
+        name: instance.repository,
+        base_commit: instance.base_commit,
+        subject,
+        pre_subject: subject,
+        post_subject: subject,
+      },
+      assurance: "provider_verified",
+      result: input.outcome,
+      summary: input.summary,
+      evidence: input.evidence,
+      findings: [],
+      actions: [],
+      uncertainty: [],
+      started_at: timestamp,
+      completed_at: timestamp,
+      details: input.providerPayload,
+    });
+    return {
+      kind,
+      schemaVersion: 1,
+      assurance: "provider_verified",
+      subject,
+      payload,
+      hash: digestNormalized(payload),
+    };
+  };
+  const artifacts = [makeArtifact("stage_result"), makeArtifact("provider_check")];
+  const event: PipelineCoordinatorEvent = {
+    id: input.id,
+    kind: "provider_snapshot",
+    instanceId: instance.id,
+    generation: instance.generation,
+    attemptId: attempt.id,
+    requestHash: attempt.request_hash,
+    outcome: input.outcome,
+    resultHash: artifacts[0]!.hash,
+    subject,
+    nativeSessionId: attempt.native_session_id,
+    artifacts,
+  };
+  if (instance.status === "completion_pending_publication" || instance.status === "publication_blocked") {
+    store.enqueueInboxEvent({
+      id: event.id,
+      instanceId: instance.id,
+      generation: instance.generation,
+      kind: event.kind,
+      payload: canonicalJson(event),
+      subject,
+    });
+    return instance;
+  }
+  if (instance.status !== "waiting_provider") {
+    throw new Error(`pipeline instance ${input.instanceId} is not waiting for provider evidence`);
+  }
+  return coordinatePipelineEvent(store, event, undefined, providerGateReceipt(instance, attempt, stage, event));
+}
+
+export function drainDeferredProviderEvidence(store: PipelineStore, limit = 50): number {
+  let processed = 0;
+  for (const record of store.listPendingInboxEvents("provider_snapshot", limit)) {
+    const instance = store.getInstance(record.pipeline_instance_id);
+    if (!instance || instance.status !== "waiting_provider") continue;
+    const event = JSON.parse(record.payload) as PipelineCoordinatorEvent;
+    const attempt = store.getAttempt(event.attemptId);
+    if (!attempt || attempt.pipeline_instance_id !== instance.id) {
+      throw new Error(`deferred provider event ${event.id} lost its attempt binding`);
+    }
+    const manifest = JSON.parse(instance.normalized_manifest) as PipelineManifest;
+    const stage = manifest.stages.find((candidate) => candidate.id === attempt.stage_id);
+    if (!stage || stage.executor.kind !== "provider_wait" || stage.evaluator.kind !== "provider") {
+      throw new Error(`deferred provider event ${event.id} does not target a provider stage`);
+    }
+    coordinatePipelineEvent(store, event, undefined, providerGateReceipt(instance, attempt, stage, event));
+    processed += 1;
+  }
+  return processed;
+}

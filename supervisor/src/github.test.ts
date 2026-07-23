@@ -1,18 +1,41 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
+import { createTicketStore, openDb } from "./db.js";
+import { considerCiGithubHead } from "./github-events.js";
 import {
-  areAllReviewThreadsResolved,
   branchExists,
+  getRepositoryConfigAtCommit,
   getMergeReadiness,
   isGithubPullRequestUrl,
   isOpenthrottleBranch,
   parseGithubWebhook,
   parsePullRequestUrl,
   prepareRepository,
+  upsertPullRequestComment,
   verifyGithubSignature,
 } from "./github.js";
 
 describe("GitHub contracts", () => {
+  it("advances CI head watermarks across workflow-run and check-suite sources", () => {
+    const db = openDb(":memory:");
+    try {
+      const store = createTicketStore(db);
+      considerCiGithubHead(store, "issue-1", "head-workflow", "workflow_run", 100);
+      // IDs from different webhook object types are not a shared sequence.
+      considerCiGithubHead(store, "issue-1", "head-check", "check_suite", 1);
+      expect(store.getSetting("github-head:issue-1")).toBe("head-check");
+      expect(store.getSetting("github-head-source:issue-1")).toBe(
+        JSON.stringify({ source: "check_suite", sequence: 1 })
+      );
+
+      // A delayed older event cannot move the watermark backwards.
+      considerCiGithubHead(store, "issue-1", "head-old", "workflow_run", 99);
+      expect(store.getSetting("github-head:issue-1")).toBe("head-check");
+    } finally {
+      db.close();
+    }
+  });
+
   it("verifies sha256 signatures", () => {
     const raw = '{"action":"closed"}';
     const signature = `sha256=${createHmac("sha256", "secret").update(raw).digest("hex")}`;
@@ -99,28 +122,6 @@ describe("GitHub contracts", () => {
     expect(signals.every((signal) => signal instanceof AbortSignal)).toBe(true);
   });
 
-  it("resolves whether every PR review thread is resolved via GraphQL", async () => {
-    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-      expect(String(input)).toBe("https://api.github.com/graphql");
-      const body = JSON.parse(String(init?.body)) as { variables: { number: number } };
-      const nodes =
-        body.variables.number === 1
-          ? [{ isResolved: true }, { isResolved: true }]
-          : body.variables.number === 2
-            ? [{ isResolved: true }, { isResolved: false }]
-            : [];
-      return Response.json({
-        data: { repository: { pullRequest: { reviewThreads: { nodes } } } },
-      });
-    }) as unknown as typeof fetch;
-    const client = { token: "github", fetch: fetchMock };
-    expect(await areAllReviewThreadsResolved(client, "o/r", 1)).toBe(true);
-    expect(await areAllReviewThreadsResolved(client, "o/r", 2)).toBe(false);
-    // No review threads at all (e.g. a plain PR comment) must not be treated
-    // as vacuously "all resolved" — there is nothing to skip launching for.
-    expect(await areAllReviewThreadsResolved(client, "o/r", 3)).toBe(false);
-  });
-
   it("resolves branch existence and distinguishes 404 from other errors", async () => {
     const fetchMock = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
@@ -132,6 +133,41 @@ describe("GitHub contracts", () => {
     expect(await branchExists(client, "o/r", "feature/x")).toBe(true);
     expect(await branchExists(client, "o/r", "missing")).toBe(false);
     await expect(branchExists(client, "o/r", "boom")).rejects.toThrow(/GitHub API error \(500\)/);
+  });
+
+  it("pins repository config to the exact resolved commit and blob", async () => {
+    const content = "pipelines:\n  implement: implement\n";
+    const requested: string[] = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      requested.push(url);
+      if (url.endsWith("/commits/feature%2Fpipeline")) {
+        return Response.json({ sha: "a".repeat(40) });
+      }
+      if (url.endsWith(`/contents/.openthrottle.yml?ref=${"a".repeat(40)}`)) {
+        return Response.json({
+          type: "file",
+          sha: "b".repeat(40),
+          encoding: "base64",
+          content: Buffer.from(content).toString("base64"),
+          size: Buffer.byteLength(content),
+        });
+      }
+      throw new Error(`unexpected request ${url}`);
+    }) as unknown as typeof fetch;
+
+    await expect(getRepositoryConfigAtCommit(
+      { token: "github", fetch: fetchMock },
+      "owner/repo",
+      "feature/pipeline"
+    )).resolves.toEqual({
+      repository: "owner/repo",
+      branch: "feature/pipeline",
+      baseCommit: "a".repeat(40),
+      blobSha: "b".repeat(40),
+      content,
+    });
+    expect(requested[1]).toContain(`ref=${"a".repeat(40)}`);
   });
 
   it("verifies a repository and creates its OpenThrottle webhook", async () => {
@@ -209,5 +245,39 @@ describe("GitHub contracts", () => {
       }
     );
     expect(result).toMatchObject({ webhookId: 7, webhookAction: "updated" });
+  });
+
+  it("creates then updates one stable neutral PR summary without using the reviews API", async () => {
+    const requests: Array<{ url: string; method: string }> = [];
+    let existing = false;
+    const marker = "<!-- openthrottle:pipeline-summary:pipeline-1 -->";
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      requests.push({ url, method });
+      if (url.endsWith("/issues/7/comments?per_page=100")) {
+        return Response.json(existing ? [{
+          id: 99,
+          body: `${marker}\nold`,
+          html_url: "https://github.com/o/r/pull/7#issuecomment-99",
+        }] : []);
+      }
+      if (url.endsWith("/issues/7/comments") && method === "POST") {
+        existing = true;
+        return Response.json({ id: 99, html_url: "https://github.com/o/r/pull/7#issuecomment-99" });
+      }
+      if (url.endsWith("/issues/comments/99") && method === "PATCH") {
+        return Response.json({ id: 99, html_url: "https://github.com/o/r/pull/7#issuecomment-99" });
+      }
+      throw new Error(`Unexpected GitHub request: ${method} ${url}`);
+    }) as unknown as typeof fetch;
+    const client = { token: "github", fetch: fetchMock };
+    const first = await upsertPullRequestComment(client, "o/r", 7, "pipeline-1", `${marker}\nfirst`);
+    const second = await upsertPullRequestComment(client, "o/r", 7, "pipeline-1", `${marker}\nsecond`);
+    expect(first.id).toBe(99);
+    expect(second.id).toBe(99);
+    expect(requests.filter((request) => request.method === "POST")).toHaveLength(1);
+    expect(requests.filter((request) => request.method === "PATCH")).toHaveLength(1);
+    expect(requests.some((request) => request.url.includes("/reviews"))).toBe(false);
   });
 });

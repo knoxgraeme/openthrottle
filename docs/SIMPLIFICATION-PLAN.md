@@ -1,5 +1,10 @@
 # Pipeline simplification plan
 
+> **Historical design record:** this plan describes the retired direct-task
+> architecture and is not an execution contract. The coordinator-only runtime
+> in `docs/SPEC.md` and `docs/PLAN.md` supersedes its scheduler, resume-task,
+> callback, and completion-marker proposals.
+
 Outcome of the July 2026 architecture review. The four-layer split (Fly
 supervisor → sandbox entrypoint → task adapters → native Compound Engineering)
 stays. The changes below remove competing logic left over from the previous

@@ -10,7 +10,7 @@
 //   - claude `--output-format stream-json`: capture `session_id` (from the
 //     "system"/"init" event, and opportunistically from any later line that
 //     carries one) and write it to ~/.ot/agent-session-id so a future
-//     `TASK_TYPE=resume` run can `claude -p --resume <id>`.
+//     a later pipeline stage can continue with `claude -p --resume <id>`.
 //   - codex `exec --json`: capture the thread id from a `thread.started`
 //     event and write it to the same file for `codex exec resume <id>`.
 //   - Pretty-print assistant text / tool-use lines (claude) and

@@ -1,0 +1,11 @@
+schema: openthrottle.catalog/v1
+manifests:
+  - ce-implement-v2.yaml
+  - ce-investigate-v2.yaml
+aliases:
+  implement:
+    id: ce/implement
+    version: 2
+  investigate:
+    id: ce/investigate
+    version: 2
