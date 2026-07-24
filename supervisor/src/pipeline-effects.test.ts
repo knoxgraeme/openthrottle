@@ -623,6 +623,58 @@ describe("pipeline effect processor", () => {
       .toMatchObject({ status: "acknowledged" });
   });
 
+  it("exhausts a 403 dispatch on its first failure with the sanitized cause in the failure event", async () => {
+    const { pipelines, runtime, processor, instance } = harness("issue-auth-403", "session-auth-403");
+    runtime.dispatchStage.mockRejectedValue(
+      new Error("GitHub API 403: Write access to repository not granted")
+    );
+    const provision = pipelines.listEffects(instance.id).find((effect) => effect.kind === "provision")!;
+
+    await processor.drain();
+
+    expect(runtime.dispatchStage).toHaveBeenCalledTimes(1);
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.id === provision.id))
+      .toMatchObject({
+        status: "dead",
+        attempts: 1,
+        last_error: expect.stringContaining("Write access to repository not granted"),
+      });
+    expect(pipelines.getInboxEvent(`pipeline-effect-exhausted:${provision.id}`)?.payload)
+      .toContain("Write access to repository not granted");
+  });
+
+  it("retries a capacity-exhausted provision on a patient fixed interval", async () => {
+    const { pipelines, runtime, processor, instance } = harness("issue-capacity", "session-capacity");
+    runtime.provision.mockRejectedValue(new Error("Total memory limit exceeded"));
+
+    await processor.drain();
+
+    expect(runtime.provision).toHaveBeenCalledTimes(1);
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.kind === "provision"))
+      .toMatchObject({
+        status: "failed",
+        attempts: 1,
+        next_attempt_at: "2099-07-22T12:05:00.000Z",
+        last_error: expect.stringContaining("Total memory limit exceeded"),
+      });
+    expect(pipelines.getInstance(instance.id)).toMatchObject({ terminal_outcome: null });
+  });
+
+  it("keeps exponential backoff for transient provision failures", async () => {
+    const { pipelines, runtime, processor, instance } = harness("issue-transient", "session-transient");
+    runtime.provision.mockRejectedValue(new Error("connect ETIMEDOUT 10.20.30.40:8443"));
+
+    await processor.drain();
+
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.kind === "provision"))
+      .toMatchObject({
+        status: "failed",
+        attempts: 1,
+        next_attempt_at: "2099-07-22T12:00:05.000Z",
+        last_error: expect.stringContaining("ETIMEDOUT"),
+      });
+  });
+
   it("quarantines the runtime and retains exclusivity when stop attempts exhaust", async () => {
     const { tickets, pipelines, runtime, processor, instance, attempt } = harness("issue-4", "session-4");
     await processor.drain();
