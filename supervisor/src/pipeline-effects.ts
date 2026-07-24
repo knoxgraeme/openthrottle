@@ -37,8 +37,11 @@ type EffectErrorClass = "auth" | "capacity" | "transient";
 
 function classifyEffectError(message: string): EffectErrorClass {
   const text = message.toLowerCase();
-  if (AUTH_ERROR_PATTERNS.some((pattern) => pattern.test(text))) return "auth";
+  // Capacity wins over auth: a provider may wrap a quota rejection in an HTTP
+  // 403, and the broad 401/403 auth patterns would otherwise fast-fail an
+  // error that clears once resources free up.
   if (CAPACITY_ERROR_PATTERNS.some((pattern) => pattern.test(text))) return "capacity";
+  if (AUTH_ERROR_PATTERNS.some((pattern) => pattern.test(text))) return "auth";
   return "transient";
 }
 

@@ -661,6 +661,22 @@ describe("pipeline effect processor", () => {
     expect(pipelines.getInstance(instance.id)).toMatchObject({ terminal_outcome: null });
   });
 
+  it("classifies an HTTP-403-wrapped quota error as capacity, not auth", async () => {
+    const { pipelines, runtime, processor, instance } =
+      harness("issue-capacity-403", "session-capacity-403");
+    runtime.provision.mockRejectedValue(new Error("HTTP 403: Total memory limit exceeded"));
+
+    await processor.drain();
+
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.kind === "provision"))
+      .toMatchObject({
+        status: "failed",
+        attempts: 1,
+        next_attempt_at: "2099-07-22T12:05:00.000Z",
+      });
+    expect(pipelines.getInstance(instance.id)).toMatchObject({ terminal_outcome: null });
+  });
+
   it("keeps exponential backoff for transient provision failures", async () => {
     const { pipelines, runtime, processor, instance } = harness("issue-transient", "session-transient");
     runtime.provision.mockRejectedValue(new Error("connect ETIMEDOUT 10.20.30.40:8443"));

@@ -713,19 +713,24 @@ export function buildStageResultEvent({ request, result }) {
 
 export function fallbackStageResultEvent({ request, repoDir, error }) {
   const timestamp = new Date().toISOString();
-  let subject;
-  try {
-    subject = computeWorkspaceTreeOid(repoDir);
-  } catch {
-    subject = request.expectedSubject;
+  // Never launder a drifted workspace into the fence chain: when the attempt
+  // is fenced to an expected subject, the sealed fallback reports that fenced
+  // subject for pre/post/subject alike, so a stale or corrupted checkout can
+  // never become the next attempt's expected tree. Drift evidence stays in
+  // the failure diagnostics, not the subject fields.
+  let subject = request.expectedSubject ?? null;
+  if (!subject) {
+    try {
+      subject = computeWorkspaceTreeOid(repoDir);
+    } catch {
+      subject = null;
+    }
   }
   if (!subject) throw new Error("no observable workspace subject");
   const fence = {
     ...request,
     subject,
-    // The attempt fence pins expectedSubject as the sealed input subject; a
-    // fallback that reported anything else would be rejected by the gate.
-    preSubject: request.expectedSubject ?? subject,
+    preSubject: subject,
     postSubject: subject,
     startedAt: timestamp,
     completedAt: timestamp,
