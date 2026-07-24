@@ -356,12 +356,22 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         }
       }
     } else if (effect.kind === "cleanup") {
+      // preserve stops the sandbox instead of deleting it: memory is released
+      // while the workspace (and any unpushed work) survives for the human a
+      // needs_human terminal is waiting on. The ticket keeps its sandbox link
+      // so the workspace stays findable and the orphan sweep retains it.
+      const preserve = (JSON.parse(effect.payload) as { preserve?: boolean }).preserve === true;
       if (resource && binding?.status !== "cleaned") {
-        await deps.runtime.cleanup(resource);
-        deps.store.setRuntimeResourceStatus(instance.id, "cleaned");
+        if (preserve) {
+          await deps.runtime.stop(resource, "pipeline needs a human decision; the workspace is preserved");
+          deps.store.setRuntimeResourceStatus(instance.id, "stopped");
+        } else {
+          await deps.runtime.cleanup(resource);
+          deps.store.setRuntimeResourceStatus(instance.id, "cleaned");
+        }
       }
       const ticket = deps.tickets.getByIssueId(instance.linear_issue_id);
-      if (ticket?.linear_session_id === instance.linear_session_id &&
+      if (!preserve && ticket?.linear_session_id === instance.linear_session_id &&
           (!resource || ticket.sandbox_id === resource.providerResourceId)) {
         deps.tickets.setSandboxId(instance.linear_issue_id, null);
       }
