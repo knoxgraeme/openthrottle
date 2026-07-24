@@ -120,8 +120,37 @@ describe("pipeline coordinator", () => {
       expect(write.instanceId).toBe(instance.id);
       expect(write.outcome).toBe(outcome);
       expect(write.effects).toHaveLength(
-        write.terminalOutcome === "shipped" || write.terminalOutcome === "no_change" ||
-          write.terminalOutcome === "failed" ? 2 : 1
+        write.terminalOutcome === "failed" ? 3 : write.terminalOutcome ? 2 : 1
+      );
+    }
+  });
+
+  it("releases the runtime with a cleanup effect on every terminal outcome", () => {
+    const { manifest, instance, attempt, stages } = setup();
+    const terminals = [
+      { outcome: "needs_human", terminal: "needs_human", kinds: ["publish_linear", "cleanup"] },
+      { outcome: "canceled", terminal: "canceled", kinds: ["publish_linear", "cleanup"] },
+      { outcome: "superseded", terminal: "superseded", kinds: ["publish_linear", "cleanup"] },
+      { outcome: "failure", terminal: "failed", kinds: ["publish_linear", "stop", "cleanup"] },
+    ] as const;
+    for (const { outcome, terminal, kinds } of terminals) {
+      const write = reducePipelineEvent({
+        manifest,
+        instance: { ...instance },
+        attempt: { ...attempt },
+        stages,
+        event: event(instance, attempt, outcome),
+      });
+      expect(write.terminalOutcome).toBe(terminal);
+      expect(write.effects.map((effect) => effect.kind)).toEqual([...kinds]);
+      const cleanup = write.effects[write.effects.length - 1];
+      expect(cleanup).toMatchObject({
+        kind: "cleanup",
+        idempotencyKey: `cleanup:${instance.id}:${terminal}`,
+      });
+      // Only needs_human preserves the workspace; every other terminal deletes.
+      expect(JSON.parse(cleanup.payload).preserve).toBe(
+        terminal === "needs_human" ? true : undefined
       );
     }
   });
@@ -185,6 +214,11 @@ describe("pipeline coordinator", () => {
     expect(exhausted.nextStatus).toBe("completion_pending_publication");
     expect(exhausted.terminalOutcome).toBe("needs_human");
     expect(exhausted.nextAttempt).toBeUndefined();
+    expect(exhausted.effects.map((effect) => effect.kind)).toEqual(["publish_linear", "cleanup"]);
+    expect(exhausted.effects[1]).toMatchObject({
+      idempotencyKey: `cleanup:${instance.id}:needs_human`,
+    });
+    expect(JSON.parse(exhausted.effects[1].payload).preserve).toBe(true);
 
     const attemptsExhausted = reducePipelineEvent({
       manifest,
@@ -196,14 +230,28 @@ describe("pipeline coordinator", () => {
     expect(attemptsExhausted.nextStatus).toBe("completion_pending_publication");
     expect(attemptsExhausted.waitReason).toMatch(/attempt limit/);
     expect(attemptsExhausted.nextAttempt).toBeUndefined();
+    expect(attemptsExhausted.effects.map((effect) => effect.kind))
+      .toEqual(["publish_linear", "stop", "cleanup"]);
   });
 
   it("persists a complete immutable request for a repair attempt", () => {
     const { pipelines, instance, attempt } = setup("ce/implement@2");
-    const repaired = coordinatePipelineEvent(
-      pipelines,
-      event(instance, attempt, "semantic_repair_required", "repair-request")
-    );
+    const input = event(instance, attempt, "semantic_repair_required", "repair-request");
+    const payload = JSON.stringify({
+      id: "repair-request",
+      outcome: "semantic_repair_required",
+      summary: "A blocking defect must be repaired.",
+      findings: [{ severity: "P1", code: "review-blocking", summary: "The gate found a blocking defect." }],
+    });
+    input.resultHash = digestNormalized(payload);
+    input.artifacts = [{
+      kind: "stage_result",
+      schemaVersion: 1,
+      assurance: "semantic_attested",
+      payload,
+      hash: digestNormalized(payload),
+    }];
+    const repaired = coordinatePipelineEvent(pipelines, input);
     const next = pipelines.getActiveAttempt(repaired.id)!;
     const request = pipelines.getStageRequest(next.id);
     expect(request).toMatchObject({
@@ -218,6 +266,11 @@ describe("pipeline coordinator", () => {
       taskContext: "Approved ticket plan",
     });
     expect(request.transitionContext).toContain("semantic_repair_required");
+    // The structured findings must ride the sealed request: the resumed
+    // session's memory of them is best-effort, the request is the guarantee.
+    expect(JSON.parse(request.transitionContext).findings).toEqual([
+      { severity: "P1", code: "review-blocking", summary: "The gate found a blocking defect." },
+    ]);
     expect(pipelines.listEffects(instance.id).find((effect) => effect.kind === "dispatch_stage")).toMatchObject({
       kind: "dispatch_stage",
       payload: next.request_payload,

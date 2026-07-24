@@ -97,7 +97,13 @@ describe("reapStalledRuns", () => {
     };
     expect(payload.type).toBe("activity");
     expect(payload.activity.type).toBe("error");
-    expect(payload.activity.body).toContain("reaped");
+    // The reaper cannot distinguish a stalled executor from one that crashed or
+    // never started, so the message must not misattribute the cause.
+    expect(payload.activity.body).toContain("run reaped — no executor progress for over 900s");
+    expect(payload.activity.body).toContain(
+      "crashed, never started, or exited without reporting a result"
+    );
+    expect(payload.activity.body).not.toContain("heartbeat");
 
     // The actor was stopped before ticket exclusivity was released.
     expect(sandbox.stop).toHaveBeenCalledWith(60, true);

@@ -9,6 +9,41 @@ import { sanitizeText } from "./sanitize.js";
 const EFFECT_LEASE_MS = 60_000;
 const RETRY_BASE_MS = 5_000;
 const MAX_EFFECT_ATTEMPTS = 8;
+const CAPACITY_RETRY_MS = 5 * 60_000;
+
+// Deterministic provider failures must not burn the whole retry budget on hot
+// exponential backoff. Auth failures never self-heal, so they exhaust on the
+// first attempt carrying the real sanitized message. Capacity failures clear
+// only when unrelated resources are released, so they retry on a fixed patient
+// interval while still counting against MAX_EFFECT_ATTEMPTS.
+const AUTH_ERROR_PATTERNS: RegExp[] = [
+  /\bunauthorized\b/,
+  /\bforbidden\b/,
+  /\b40[13]\b/,
+  /write access to repository not granted/,
+  /resource not accessible/,
+  /bad credentials/,
+  /\b(?:invalid|expired|revoked)\b[^\n]{0,40}\btoken\b/,
+  /\btoken\b[^\n]{0,40}\b(?:invalid|expired|revoked)\b/,
+];
+
+const CAPACITY_ERROR_PATTERNS: RegExp[] = [
+  /total (?:memory|disk|cpu) limit exceeded/,
+  /quota exceeded/,
+  /insufficient (?:memory|disk|capacity)/,
+];
+
+type EffectErrorClass = "auth" | "capacity" | "transient";
+
+function classifyEffectError(message: string): EffectErrorClass {
+  const text = message.toLowerCase();
+  // Capacity wins over auth: a provider may wrap a quota rejection in an HTTP
+  // 403, and the broad 401/403 auth patterns would otherwise fast-fail an
+  // error that clears once resources free up.
+  if (CAPACITY_ERROR_PATTERNS.some((pattern) => pattern.test(text))) return "capacity";
+  if (AUTH_ERROR_PATTERNS.some((pattern) => pattern.test(text))) return "auth";
+  return "transient";
+}
 
 export interface PipelineEffectProcessor {
   drain(): Promise<void>;
@@ -324,12 +359,22 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         }
       }
     } else if (effect.kind === "cleanup") {
+      // preserve stops the sandbox instead of deleting it: memory is released
+      // while the workspace (and any unpushed work) survives for the human a
+      // needs_human terminal is waiting on. The ticket keeps its sandbox link
+      // so the workspace stays findable and the orphan sweep retains it.
+      const preserve = (JSON.parse(effect.payload) as { preserve?: boolean }).preserve === true;
       if (resource && binding?.status !== "cleaned") {
-        await deps.runtime.cleanup(resource);
-        deps.store.setRuntimeResourceStatus(instance.id, "cleaned");
+        if (preserve) {
+          await deps.runtime.stop(resource, "pipeline needs a human decision; the workspace is preserved");
+          deps.store.setRuntimeResourceStatus(instance.id, "stopped");
+        } else {
+          await deps.runtime.cleanup(resource);
+          deps.store.setRuntimeResourceStatus(instance.id, "cleaned");
+        }
       }
       const ticket = deps.tickets.getByIssueId(instance.linear_issue_id);
-      if (ticket?.linear_session_id === instance.linear_session_id &&
+      if (!preserve && ticket?.linear_session_id === instance.linear_session_id &&
           (!resource || ticket.sandbox_id === resource.providerResourceId)) {
         deps.tickets.setSandboxId(instance.linear_issue_id, null);
       }
@@ -348,10 +393,16 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       await handle(effect);
     } catch (error) {
       const message = sanitizeText(String(error)).slice(-2_000);
-      const exhausted = effect.attempts >= MAX_EFFECT_ATTEMPTS;
+      const errorClass = classifyEffectError(message);
+      // Stop settlement keeps its full retry budget: exhausting it early would
+      // reroute live actors into quarantine on the first provider auth blip.
+      const exhausted = (errorClass === "auth" && effect.kind !== "stop") ||
+        effect.attempts >= MAX_EFFECT_ATTEMPTS;
       const retryAt = exhausted
         ? null
-        : new Date(now().getTime() + RETRY_BASE_MS * 2 ** Math.min(effect.attempts - 1, 6)).toISOString();
+        : errorClass === "capacity"
+          ? new Date(now().getTime() + CAPACITY_RETRY_MS).toISOString()
+          : new Date(now().getTime() + RETRY_BASE_MS * 2 ** Math.min(effect.attempts - 1, 6)).toISOString();
       if (exhausted && (effect.kind === "provision" || effect.kind === "dispatch_stage")) {
         const instance = deps.store.getInstance(effect.pipeline_instance_id);
         const attempt = instance ? deps.store.getActiveAttempt(instance.id) : undefined;

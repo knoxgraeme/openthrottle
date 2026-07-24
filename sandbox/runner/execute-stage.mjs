@@ -524,16 +524,44 @@ export function executeStage({
     const commandName = request.commandName ?? request.stageId;
     if (!COMMAND_NAMES.has(commandName)) throw new Error(`stage ${request.stageId} does not select an allowlisted repository command`);
     const command = typeof config[commandName] === "string" ? config[commandName] : "";
-    const execution = executeCommand({ command, commandName, repoDir, timeoutMs });
-    const postSubject = computeWorkspaceTreeOid(repoDir);
-    const completedAt = now();
-    artifacts = buildCommandArtifacts({
-      fence: { ...request, subject: postSubject, preSubject, postSubject, startedAt, completedAt },
-      command,
-      commandName,
-      execution,
-      requiredArtifacts: request.requiredArtifacts,
-    });
+    try {
+      const execution = executeCommand({ command, commandName, repoDir, timeoutMs });
+      const postSubject = computeWorkspaceTreeOid(repoDir);
+      const completedAt = now();
+      artifacts = buildCommandArtifacts({
+        fence: { ...request, subject: postSubject, preSubject, postSubject, startedAt, completedAt },
+        command,
+        commandName,
+        execution,
+        requiredArtifacts: request.requiredArtifacts,
+      });
+    } catch (error) {
+      // The supervisor can only settle this attempt from a sealed stage
+      // result, so an executor throw must become typed retryable evidence
+      // instead of stranding the run until the stall reaper.
+      const execution = {
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        executorFailure: true,
+        stdout: "",
+        stderr: String(error),
+      };
+      let postSubject;
+      try {
+        postSubject = computeWorkspaceTreeOid(repoDir);
+      } catch {
+        postSubject = preSubject;
+      }
+      const completedAt = now();
+      artifacts = buildCommandArtifacts({
+        fence: { ...request, subject: postSubject, preSubject, postSubject, startedAt, completedAt },
+        command,
+        commandName,
+        execution,
+        requiredArtifacts: request.requiredArtifacts,
+      });
+    }
   } else {
     let invocation = { mode: "none", nativeSessionId: null, reconstructed: false, readOnly: false };
     let execution;
@@ -683,6 +711,66 @@ export function buildStageResultEvent({ request, result }) {
   };
 }
 
+export function fallbackStageResultEvent({ request, repoDir, error }) {
+  const timestamp = new Date().toISOString();
+  // Never launder a drifted workspace into the fence chain: when the attempt
+  // is fenced to an expected subject, the sealed fallback reports that fenced
+  // subject for pre/post/subject alike, so a stale or corrupted checkout can
+  // never become the next attempt's expected tree. Drift evidence stays in
+  // the failure diagnostics, not the subject fields.
+  let subject = request.expectedSubject ?? null;
+  if (!subject) {
+    try {
+      subject = computeWorkspaceTreeOid(repoDir);
+    } catch {
+      subject = null;
+    }
+  }
+  if (!subject) throw new Error("no observable workspace subject");
+  const fence = {
+    ...request,
+    subject,
+    preSubject: subject,
+    postSubject: subject,
+    startedAt: timestamp,
+    completedAt: timestamp,
+  };
+  const artifacts = authorizeCapability(request).kind === "command"
+    ? buildCommandArtifacts({
+        fence,
+        command: "",
+        commandName: request.commandName ?? request.stageId,
+        execution: {
+          exitCode: null,
+          signal: null,
+          timedOut: false,
+          executorFailure: true,
+          stdout: "",
+          stderr: String(error),
+        },
+        requiredArtifacts: request.requiredArtifacts,
+      })
+    : buildSemanticArtifacts({
+        proposal: failureProposal(`Stage execution failed before sealing evidence: ${String(error)}`),
+        fence,
+        requiredArtifacts: request.requiredArtifacts,
+      });
+  const stageResult = artifacts.find((artifact) => artifact.kind === "stage_result");
+  const payload = JSON.parse(stageResult.payload);
+  return buildStageResultEvent({
+    request,
+    result: {
+      attemptId: request.attemptId,
+      requestHash: request.requestHash,
+      outcome: payload.result,
+      nativeSessionId: request.nativeSessionId ?? null,
+      subject: stageResult.subject ?? null,
+      artifacts,
+      completedAt: payload.completed_at,
+    },
+  });
+}
+
 function writeAtomic(path, value) {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const temporary = `${path}.tmp`;
@@ -721,14 +809,28 @@ function main() {
     "--output",
     process.env.OT_STAGE_RESULT_FILE ?? `/var/lib/openthrottle/stage-results/${validatedRequest.attemptId}.json`,
   ));
-  const result = executeStage({
-    request: rawRequest,
-    configRaw,
-    manifestRaw,
-    repoDir,
-    timeoutMs: Number(process.env.TASK_TIMEOUT ?? 7_200) * 1_000,
-  });
-  writeAtomic(outputPath, buildStageResultEvent({ request: validatedRequest, result }));
+  try {
+    const result = executeStage({
+      request: rawRequest,
+      configRaw,
+      manifestRaw,
+      repoDir,
+      timeoutMs: Number(process.env.TASK_TIMEOUT ?? 7_200) * 1_000,
+    });
+    writeAtomic(outputPath, buildStageResultEvent({ request: validatedRequest, result }));
+  } catch (error) {
+    // Last-resort fence: the request is validated and the output path is
+    // known, so even an executor crash must leave a sealed typed result the
+    // supervisor can settle instead of a stall the reaper misreports.
+    try {
+      writeAtomic(outputPath, fallbackStageResultEvent({ request: validatedRequest, repoDir, error }));
+    } catch (fallbackError) {
+      console.error(`execute-stage: fallback stage result was not written: ${
+        fallbackError instanceof Error ? fallbackError.message : String(fallbackError)
+      }`);
+    }
+    throw error;
+  }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

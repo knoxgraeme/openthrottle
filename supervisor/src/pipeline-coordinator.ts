@@ -68,13 +68,34 @@ function terminalStatus(_outcome: PipelineOutcome): PipelineInstanceStatus {
   return "completion_pending_publication";
 }
 
+function transitionFindings(value: unknown): Array<{ severity: string; code: string | null; summary: string }> {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
+    .slice(0, 20)
+    .map((item) => ({
+      severity: typeof item.severity === "string" ? item.severity.slice(0, 20) : "",
+      code: typeof item.code === "string" ? item.code.slice(0, 100) : null,
+      summary: typeof item.summary === "string" ? item.summary.slice(0, 500) : "",
+    }));
+}
+
 function transitionContext(event: PipelineCoordinatorEvent, fromStage: string): string {
   const stageResult = event.artifacts?.find((artifact) => artifact.kind === "stage_result");
+  const review = event.artifacts?.find((artifact) => artifact.kind === "review");
   let summary = "";
   let evidence: string[] = [];
+  // The resumed native session usually remembers the findings, but that memory
+  // is best-effort (compaction, lost sessions, external feedback). The sealed
+  // request is the deterministic channel, so the structured findings ride it.
+  let findings: ReturnType<typeof transitionFindings> = [];
   if (stageResult) {
     try {
-      const payload = JSON.parse(stageResult.payload) as { summary?: unknown; evidence?: unknown };
+      const payload = JSON.parse(stageResult.payload) as {
+        summary?: unknown;
+        evidence?: unknown;
+        findings?: unknown;
+      };
       if (typeof payload.summary === "string") summary = payload.summary.slice(0, 2_000);
       if (Array.isArray(payload.evidence)) {
         evidence = payload.evidence
@@ -82,9 +103,17 @@ function transitionContext(event: PipelineCoordinatorEvent, fromStage: string): 
           .slice(0, 20)
           .map((item) => item.slice(0, 1_000));
       }
+      findings = transitionFindings(payload.findings);
     } catch {
       // The gate already validates typed artifact JSON. A control-event test
       // may omit it; retain only the deterministic transition metadata then.
+    }
+  }
+  if (findings.length === 0 && review) {
+    try {
+      findings = transitionFindings((JSON.parse(review.payload) as { findings?: unknown }).findings);
+    } catch {
+      // Same rationale as above.
     }
   }
   return canonicalJson({
@@ -93,6 +122,7 @@ function transitionContext(event: PipelineCoordinatorEvent, fromStage: string): 
     outcome: event.outcome,
     summary,
     evidence,
+    findings,
   });
 }
 
@@ -359,6 +389,19 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
               ticketState: "error",
             }),
           }] : []),
+          // Exhaustion terminals must release the runtime like every other
+          // terminal; a needs_human exhaustion previously held the sandbox
+          // until autostop. needs_human preserves the stopped workspace so
+          // unpushed work survives for the human the outcome is asking.
+          {
+            kind: "cleanup" as const,
+            idempotencyKey: `cleanup:${input.instance.id}:${exhausted}`,
+            payload: canonicalJson({
+              pipelineInstanceId: input.instance.id,
+              outcome: exhausted,
+              ...(exhausted === "needs_human" ? { preserve: true } : {}),
+            }),
+          },
         ],
       };
     }
@@ -397,6 +440,11 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
               runId: stopRunId(input.attempt),
               ticketState: "error",
             }),
+          },
+          {
+            kind: "cleanup",
+            idempotencyKey: `cleanup:${input.instance.id}:failed`,
+            payload: canonicalJson({ pipelineInstanceId: input.instance.id, outcome: "failed" }),
           },
         ],
       };
@@ -463,13 +511,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
       subject: input.event.subject ?? input.instance.immutable_subject,
     }),
   }];
-  if (terminal === "shipped" || terminal === "no_change") {
-    terminalEffects.push({
-      kind: "cleanup",
-      idempotencyKey: `cleanup:${input.instance.id}:${terminal}`,
-      payload: canonicalJson({ pipelineInstanceId: input.instance.id, outcome: terminal }),
-    });
-  } else if (terminal === "failed") {
+  if (terminal === "failed") {
     terminalEffects.push({
       kind: "stop",
       idempotencyKey: `stop:${input.instance.id}:${terminal}`,
@@ -481,6 +523,20 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
       }),
     });
   }
+  // Every terminal releases the runtime resource. A needs_human, canceled, or
+  // superseded terminal previously enqueued no cleanup, leaving the sandbox
+  // holding its quota until autostop; for failed, stop settles the actor first
+  // and cleanup then releases the runtime. needs_human preserves the stopped
+  // workspace: unpushed work must survive for the human the outcome is asking.
+  terminalEffects.push({
+    kind: "cleanup",
+    idempotencyKey: `cleanup:${input.instance.id}:${terminal}`,
+    payload: canonicalJson({
+      pipelineInstanceId: input.instance.id,
+      outcome: terminal,
+      ...(terminal === "needs_human" ? { preserve: true } : {}),
+    }),
+  });
   return {
     instanceId: input.instance.id,
     eventId: input.event.id,
