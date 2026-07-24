@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createTicketStore, openDb } from "./db.js";
 import { createPipelineEffectProcessor } from "./pipeline-effects.js";
+import { coordinatePipelineEvent } from "./pipeline-coordinator.js";
 import { requestPipelineStop } from "./pipeline-control.js";
 import {
   canonicalJson,
@@ -673,6 +674,52 @@ describe("pipeline effect processor", () => {
         next_attempt_at: "2099-07-22T12:00:05.000Z",
         last_error: expect.stringContaining("ETIMEDOUT"),
       });
+  });
+
+  it("preserves the stopped workspace on a needs_human terminal", async () => {
+    const { tickets, pipelines, runtime, processor, instance } =
+      harness("issue-needs-human-preserve", "session-needs-human-preserve");
+    await processor.drain();
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    const payload = JSON.stringify({ id: "needs-human-preserve", outcome: "needs_human" });
+    coordinatePipelineEvent(pipelines, {
+      id: "needs-human-preserve",
+      kind: "stage_result",
+      instanceId: instance.id,
+      generation: instance.generation,
+      attemptId: attempt.id,
+      requestHash: attempt.request_hash,
+      outcome: "needs_human",
+      resultHash: digestNormalized(payload),
+      artifacts: [{
+        kind: "stage_result",
+        schemaVersion: 1,
+        assurance: "executor_verified",
+        payload,
+        hash: digestNormalized(payload),
+      }, {
+        kind: "command_result",
+        schemaVersion: 1,
+        assurance: "executor_verified",
+        payload: JSON.stringify({ exitCode: 1 }),
+        hash: digestNormalized(JSON.stringify({ exitCode: 1 })),
+      }],
+    });
+    const cleanup = pipelines.listEffects(instance.id).find((effect) => effect.kind === "cleanup")!;
+    expect(JSON.parse(cleanup.payload)).toMatchObject({ preserve: true });
+
+    await processor.drain();
+
+    expect(runtime.stop).toHaveBeenCalledWith(
+      { providerResourceId: "sandbox-issue-needs-human-preserve" },
+      expect.stringContaining("preserved")
+    );
+    expect(runtime.cleanup).not.toHaveBeenCalled();
+    expect(pipelines.getRuntimeResource(instance.id)).toMatchObject({ status: "stopped" });
+    expect(tickets.getByIssueId("issue-needs-human-preserve"))
+      .toMatchObject({ sandbox_id: "sandbox-issue-needs-human-preserve" });
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.id === cleanup.id))
+      .toMatchObject({ status: "acknowledged" });
   });
 
   it("quarantines the runtime and retains exclusivity when stop attempts exhaust", async () => {

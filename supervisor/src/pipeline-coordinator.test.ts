@@ -143,10 +143,15 @@ describe("pipeline coordinator", () => {
       });
       expect(write.terminalOutcome).toBe(terminal);
       expect(write.effects.map((effect) => effect.kind)).toEqual([...kinds]);
-      expect(write.effects[write.effects.length - 1]).toMatchObject({
+      const cleanup = write.effects[write.effects.length - 1];
+      expect(cleanup).toMatchObject({
         kind: "cleanup",
         idempotencyKey: `cleanup:${instance.id}:${terminal}`,
       });
+      // Only needs_human preserves the workspace; every other terminal deletes.
+      expect(JSON.parse(cleanup.payload).preserve).toBe(
+        terminal === "needs_human" ? true : undefined
+      );
     }
   });
 
@@ -213,6 +218,7 @@ describe("pipeline coordinator", () => {
     expect(exhausted.effects[1]).toMatchObject({
       idempotencyKey: `cleanup:${instance.id}:needs_human`,
     });
+    expect(JSON.parse(exhausted.effects[1].payload).preserve).toBe(true);
 
     const attemptsExhausted = reducePipelineEvent({
       manifest,

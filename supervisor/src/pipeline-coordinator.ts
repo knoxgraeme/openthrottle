@@ -361,11 +361,16 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
           }] : []),
           // Exhaustion terminals must release the runtime like every other
           // terminal; a needs_human exhaustion previously held the sandbox
-          // until autostop.
+          // until autostop. needs_human preserves the stopped workspace so
+          // unpushed work survives for the human the outcome is asking.
           {
             kind: "cleanup" as const,
             idempotencyKey: `cleanup:${input.instance.id}:${exhausted}`,
-            payload: canonicalJson({ pipelineInstanceId: input.instance.id, outcome: exhausted }),
+            payload: canonicalJson({
+              pipelineInstanceId: input.instance.id,
+              outcome: exhausted,
+              ...(exhausted === "needs_human" ? { preserve: true } : {}),
+            }),
           },
         ],
       };
@@ -491,11 +496,16 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
   // Every terminal releases the runtime resource. A needs_human, canceled, or
   // superseded terminal previously enqueued no cleanup, leaving the sandbox
   // holding its quota until autostop; for failed, stop settles the actor first
-  // and cleanup then releases the runtime.
+  // and cleanup then releases the runtime. needs_human preserves the stopped
+  // workspace: unpushed work must survive for the human the outcome is asking.
   terminalEffects.push({
     kind: "cleanup",
     idempotencyKey: `cleanup:${input.instance.id}:${terminal}`,
-    payload: canonicalJson({ pipelineInstanceId: input.instance.id, outcome: terminal }),
+    payload: canonicalJson({
+      pipelineInstanceId: input.instance.id,
+      outcome: terminal,
+      ...(terminal === "needs_human" ? { preserve: true } : {}),
+    }),
   });
   return {
     instanceId: input.instance.id,
