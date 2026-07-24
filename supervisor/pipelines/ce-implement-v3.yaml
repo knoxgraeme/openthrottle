@@ -24,7 +24,11 @@ stages:
     transitions:
       success: { to: semantic_review }
       no_change: { terminal: no_change }
-      semantic_repair_required: { to: implementation, max_reentries: 3, on_exhausted: needs_human }
+      # Agents also propose semantic_repair_required as "continue: the plan is
+      # bigger than one pass" — a live multi-unit run consumed four slices of
+      # real progress before exhausting the old bound of 3. This budget covers
+      # continuation slices for large plans as well as genuine repair.
+      semantic_repair_required: { to: implementation, max_reentries: 8, on_exhausted: needs_human }
       retryable_infrastructure_failure: { to: implementation, max_reentries: 3, on_exhausted: failed }
       needs_human: { terminal: needs_human }
       canceled: { terminal: canceled }
