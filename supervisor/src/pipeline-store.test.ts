@@ -480,6 +480,7 @@ describe("pipeline store", () => {
     `).all()).toEqual([
       { pipeline_id: "ce/implement", version: 1, digest: historical.manifests.get("ce/implement@1")!.digest },
       { pipeline_id: "ce/implement", version: 2, digest: shippedCatalog.manifests.get("ce/implement@2")!.digest },
+      { pipeline_id: "ce/implement", version: 3, digest: shippedCatalog.manifests.get("ce/implement@3")!.digest },
       { pipeline_id: "ce/investigate", version: 1, digest: historical.manifests.get("ce/investigate@1")!.digest },
       { pipeline_id: "ce/investigate", version: 2, digest: shippedCatalog.manifests.get("ce/investigate@2")!.digest },
     ]);
@@ -487,7 +488,7 @@ describe("pipeline store", () => {
       SELECT alias, version FROM pipeline_catalog_aliases
       WHERE alias IN ('implement', 'investigate') ORDER BY alias
     `).all()).toEqual([
-      { alias: "implement", version: 2 },
+      { alias: "implement", version: 3 },
       { alias: "investigate", version: 2 },
     ]);
   });

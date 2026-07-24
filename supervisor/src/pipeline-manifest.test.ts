@@ -59,9 +59,11 @@ describe("pipeline manifest validation", () => {
     expect(first.digest).toBe(second.digest);
     expect([...first.manifests.keys()]).toEqual([
       "ce/implement@2",
+      "ce/implement@3",
       "ce/investigate@2",
     ]);
     expect(resolvePipelineReference(first, "implement").manifest.id).toBe("ce/implement");
+    expect(resolvePipelineReference(first, "implement").manifest.version).toBe(3);
     expect(() => resolvePipelineReference(first, "ce/implement@1"))
       .toThrow(/unknown pipeline selection/);
     expect(() => resolvePipelineReference(first, "ce/investigate@1"))
@@ -71,7 +73,6 @@ describe("pipeline manifest validation", () => {
     expect(() => resolvePipelineReference(first, "fixture-command"))
       .toThrow(/unknown pipeline selection/);
     expect(resolvePipelineReference(first, "implement").manifest.stages.map((stage) => stage.id)).toEqual([
-      "planning",
       "implementation",
       "semantic_review",
       "simplification",
@@ -85,6 +86,40 @@ describe("pipeline manifest validation", () => {
       "investigate",
       "publish",
     ]);
+  });
+
+  it("ships ce/implement@3 as a plan-in pipeline while keeping ce/implement@2 pinned-instance immutable", () => {
+    const path = fileURLToPath(new URL("../pipelines/catalog.yaml", import.meta.url));
+    const runtime = buildInstalledRuntimeDescriptor("test-runtime/v1");
+    const catalog = loadPipelineCatalog(path, runtime.descriptor);
+
+    // v2 stays registered so pinned instances keep resolving to an identical manifest.
+    const v2 = resolvePipelineReference(catalog, "ce/implement@2").manifest;
+    expect(v2.version).toBe(2);
+    expect(v2.entry_stage).toBe("planning");
+    expect(v2.requires.capabilities).toContain("ce/plan@1");
+
+    // v3 removes planning: the shipped plan is already approved, implementation enters directly.
+    const v3 = resolvePipelineReference(catalog, "ce/implement@3").manifest;
+    expect(v3.version).toBe(3);
+    expect(v3.entry_stage).toBe("implementation");
+    expect(v3.stages.some((stage) => stage.id === "planning")).toBe(false);
+    expect(v3.requires.capabilities).not.toContain("ce/plan@1");
+
+    // With no prior native session, the entry stage must start fresh, not resume.
+    const implementation = v3.stages.find((stage) => stage.id === "implementation")!;
+    expect(implementation.context).toBe("fresh");
+    expect(implementation.live_steering).toBe(true);
+
+    // Downstream stages still resume implementation's session, and nothing references planning.
+    for (const id of ["semantic_review", "simplification", "publish"]) {
+      expect(v3.stages.find((stage) => stage.id === id)?.context).toBe("resume_required");
+    }
+    for (const stage of v3.stages) {
+      for (const transition of Object.values(stage.transitions)) {
+        expect(transition.to).not.toBe("planning");
+      }
+    }
   });
 
   it("keeps multi-version and provider-neutral manifests in a test-only catalog", () => {

@@ -157,7 +157,7 @@ mcp_servers: {}
     expect(instance.base_commit).toBe("a".repeat(40));
     expect(instance.base_branch).toBe("main");
     expect(pipelines.getStageRequest(pipelines.getActiveAttempt(instance.id)!.id).baseBranch).toBe("main");
-    expect(pipelines.getActiveAttempt(instance.id)?.stage_id).toBe("planning");
+    expect(pipelines.getActiveAttempt(instance.id)?.stage_id).toBe("implementation");
     expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
     expect(githubFetch).toHaveBeenCalledTimes(2);
   });
