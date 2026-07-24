@@ -463,13 +463,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
       subject: input.event.subject ?? input.instance.immutable_subject,
     }),
   }];
-  if (terminal === "shipped" || terminal === "no_change") {
-    terminalEffects.push({
-      kind: "cleanup",
-      idempotencyKey: `cleanup:${input.instance.id}:${terminal}`,
-      payload: canonicalJson({ pipelineInstanceId: input.instance.id, outcome: terminal }),
-    });
-  } else if (terminal === "failed") {
+  if (terminal === "failed") {
     terminalEffects.push({
       kind: "stop",
       idempotencyKey: `stop:${input.instance.id}:${terminal}`,
@@ -481,6 +475,15 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
       }),
     });
   }
+  // Every terminal releases the runtime resource. A needs_human, canceled, or
+  // superseded terminal previously enqueued no cleanup, leaving the sandbox
+  // holding its quota until autostop; for failed, stop settles the actor first
+  // and cleanup then releases the runtime.
+  terminalEffects.push({
+    kind: "cleanup",
+    idempotencyKey: `cleanup:${input.instance.id}:${terminal}`,
+    payload: canonicalJson({ pipelineInstanceId: input.instance.id, outcome: terminal }),
+  });
   return {
     instanceId: input.instance.id,
     eventId: input.event.id,

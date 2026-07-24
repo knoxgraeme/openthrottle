@@ -120,9 +120,33 @@ describe("pipeline coordinator", () => {
       expect(write.instanceId).toBe(instance.id);
       expect(write.outcome).toBe(outcome);
       expect(write.effects).toHaveLength(
-        write.terminalOutcome === "shipped" || write.terminalOutcome === "no_change" ||
-          write.terminalOutcome === "failed" ? 2 : 1
+        write.terminalOutcome === "failed" ? 3 : write.terminalOutcome ? 2 : 1
       );
+    }
+  });
+
+  it("releases the runtime with a cleanup effect on every terminal outcome", () => {
+    const { manifest, instance, attempt, stages } = setup();
+    const terminals = [
+      { outcome: "needs_human", terminal: "needs_human", kinds: ["publish_linear", "cleanup"] },
+      { outcome: "canceled", terminal: "canceled", kinds: ["publish_linear", "cleanup"] },
+      { outcome: "superseded", terminal: "superseded", kinds: ["publish_linear", "cleanup"] },
+      { outcome: "failure", terminal: "failed", kinds: ["publish_linear", "stop", "cleanup"] },
+    ] as const;
+    for (const { outcome, terminal, kinds } of terminals) {
+      const write = reducePipelineEvent({
+        manifest,
+        instance: { ...instance },
+        attempt: { ...attempt },
+        stages,
+        event: event(instance, attempt, outcome),
+      });
+      expect(write.terminalOutcome).toBe(terminal);
+      expect(write.effects.map((effect) => effect.kind)).toEqual([...kinds]);
+      expect(write.effects[write.effects.length - 1]).toMatchObject({
+        kind: "cleanup",
+        idempotencyKey: `cleanup:${instance.id}:${terminal}`,
+      });
     }
   });
 
