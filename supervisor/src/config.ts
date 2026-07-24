@@ -67,6 +67,10 @@ export interface Config {
 
   daytonaApiKey: string;
   daytonaSnapshot: string;
+  // Optional so Config literals elsewhere (tests) stay valid; admission
+  // preflight applies the 10/8 GiB defaults when they are absent.
+  daytonaTotalMemoryGib?: number;
+  daytonaSandboxMemoryGib?: number;
 
   defaultAgent: Agent;
   claudeCodeOauthToken: string | undefined;
@@ -102,6 +106,8 @@ export function loadConfig(): Config {
 
     daytonaApiKey: required("DAYTONA_API_KEY"),
     daytonaSnapshot: optional("DAYTONA_SNAPSHOT", "openthrottle"),
+    daytonaTotalMemoryGib: optionalInt("DAYTONA_TOTAL_MEMORY_GIB", 10),
+    daytonaSandboxMemoryGib: optionalInt("DAYTONA_SANDBOX_MEMORY_GIB", 8),
 
     defaultAgent: optionalAgent("DEFAULT_AGENT", "codex"),
     claudeCodeOauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN,
@@ -145,6 +151,8 @@ export function loadConfig(): Config {
   requireRange("ORPHAN_GRACE_MINUTES", cfg.orphanGraceMinutes, 0);
   requireRange("WEBHOOK_MAX_AGE_SECONDS", cfg.webhookMaxAgeSeconds, 1);
   requireRange("SANDBOX_EVENT_POLL_INTERVAL_MS", cfg.sandboxEventPollIntervalMs, 1_000);
+  requireRange("DAYTONA_TOTAL_MEMORY_GIB", cfg.daytonaTotalMemoryGib!, 1);
+  requireRange("DAYTONA_SANDBOX_MEMORY_GIB", cfg.daytonaSandboxMemoryGib!, 1);
   requireRange("STALL_TIMEOUT_SECONDS", cfg.stallTimeoutSeconds, 60);
   if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}$/.test(cfg.sandboxRuntimeRelease)) {
     throw new Error(`SANDBOX_RUNTIME_RELEASE has an invalid format: ${cfg.sandboxRuntimeRelease}`);
