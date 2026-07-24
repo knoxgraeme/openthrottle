@@ -359,6 +359,14 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
               ticketState: "error",
             }),
           }] : []),
+          // Exhaustion terminals must release the runtime like every other
+          // terminal; a needs_human exhaustion previously held the sandbox
+          // until autostop.
+          {
+            kind: "cleanup" as const,
+            idempotencyKey: `cleanup:${input.instance.id}:${exhausted}`,
+            payload: canonicalJson({ pipelineInstanceId: input.instance.id, outcome: exhausted }),
+          },
         ],
       };
     }
@@ -397,6 +405,11 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
               runId: stopRunId(input.attempt),
               ticketState: "error",
             }),
+          },
+          {
+            kind: "cleanup",
+            idempotencyKey: `cleanup:${input.instance.id}:failed`,
+            payload: canonicalJson({ pipelineInstanceId: input.instance.id, outcome: "failed" }),
           },
         ],
       };
