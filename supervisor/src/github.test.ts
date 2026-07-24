@@ -1,6 +1,7 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
-import { createTicketStore, openDb } from "./db.js";
+import { createSupervisorStore } from "./persistence/store.js";
+import { openDb } from "./persistence/database.js";
 import { considerCiGithubHead } from "./github-events.js";
 import {
   branchExists,
@@ -19,7 +20,7 @@ describe("GitHub contracts", () => {
   it("advances CI head watermarks across workflow-run and check-suite sources", () => {
     const db = openDb(":memory:");
     try {
-      const store = createTicketStore(db);
+      const store = createSupervisorStore(db);
       considerCiGithubHead(store, "issue-1", "head-workflow", "workflow_run", 100);
       // IDs from different webhook object types are not a shared sequence.
       considerCiGithubHead(store, "issue-1", "head-check", "check_suite", 1);

@@ -1,20 +1,20 @@
 // GitHub feedback is committed as typed provider evidence for the generation-
 // pinned pipeline. There is no automatic task-resume fallback.
 
-import type { Config } from "./config.js";
-import type { TicketStore } from "./db.js";
+import type { Config } from "./app/config.js";
+import type { SupervisorStore } from "./persistence/store.js";
 import {
   getAuthenticatedLogin,
   isOpenthrottleBranch,
   type GithubWebhookEvent,
 } from "./github.js";
 import { enqueueActivity, type LinearOutboxProcessor } from "./linear-outbox.js";
-import { sanitizeText } from "./sanitize.js";
-import type { FeedbackSnapshot, FeedbackSnapshotEvent } from "./feedback-store.js";
-import type { PipelineInstance, PipelineStore } from "./pipeline-store.js";
-import { processProviderEvidence } from "./gate-evaluators.js";
-import { canonicalJson, type PipelineManifest } from "./pipeline-manifest.js";
-import { requestPipelineStop } from "./pipeline-control.js";
+import { sanitizeText } from "./shared/sanitize.js";
+import type { FeedbackSnapshot, FeedbackSnapshotEvent } from "./persistence/feedback-store.js";
+import type { PipelineInstance, PipelineStore } from "./pipeline/store.js";
+import { processProviderEvidence } from "./pipeline/gates.js";
+import { canonicalJson, type PipelineManifest } from "./pipeline/manifest.js";
+import { requestPipelineStop } from "./pipeline/control.js";
 
 const githubLoginCache = new Map<string, string>();
 const UNBOUNDED_SNAPSHOT_CLAIM = Number.MAX_SAFE_INTEGER;
@@ -62,14 +62,14 @@ function pipelineIsTerminal(instance: PipelineInstance): boolean {
   return instance.terminal_outcome != null || TERMINAL_PIPELINE_STATUSES.has(instance.status);
 }
 
-function pullNumber(ticket: NonNullable<ReturnType<TicketStore["getByIssueId"]>>, url?: string): number {
+function pullNumber(ticket: NonNullable<ReturnType<SupervisorStore["getByIssueId"]>>, url?: string): number {
   return Number((url ?? ticket.pr_url)?.match(/\/pull\/(\d+)$/)?.[1] ?? 0);
 }
 
 function recordPipelineProviderEvent(params: {
-  store: TicketStore;
+  store: SupervisorStore;
   instance: PipelineInstance;
-  ticket: NonNullable<ReturnType<TicketStore["getByIssueId"]>>;
+  ticket: NonNullable<ReturnType<SupervisorStore["getByIssueId"]>>;
   eventId: string;
   outcome: PipelineProviderOutcome;
   summary: string;
@@ -111,7 +111,7 @@ function parseStoredPipelineEvent(event: FeedbackSnapshotEvent): StoredPipelineP
 
 function processPipelineFeedbackSnapshot(params: {
   pipelines: PipelineStore;
-  store: TicketStore;
+  store: SupervisorStore;
   instance: PipelineInstance;
   snapshot: FeedbackSnapshot;
 }): boolean {
@@ -151,7 +151,7 @@ function processPipelineFeedbackSnapshot(params: {
 
 export function drainPipelineFeedbackSnapshots(
   pipelines: PipelineStore,
-  store: TicketStore,
+  store: SupervisorStore,
   limit = 50
 ): number {
   let processed = 0;
@@ -166,8 +166,8 @@ export function drainPipelineFeedbackSnapshots(
 
 export function routePipelineProviderEvent(params: {
   pipelines: PipelineStore;
-  store: TicketStore;
-  ticket: NonNullable<ReturnType<TicketStore["getByIssueId"]>>;
+  store: SupervisorStore;
+  ticket: NonNullable<ReturnType<SupervisorStore["getByIssueId"]>>;
   eventId: string;
   outcome: PipelineProviderOutcome;
   summary: string;
@@ -240,13 +240,13 @@ export function routePipelineProviderEvent(params: {
   return true;
 }
 
-function setAuthoritativeGithubHead(store: TicketStore, issueId: string, headSha: string): void {
+function setAuthoritativeGithubHead(store: SupervisorStore, issueId: string, headSha: string): void {
   store.setSetting(`github-head:${issueId}`, headSha);
   store.setSetting(`github-head-source:${issueId}`, "authoritative");
 }
 
 export function considerCiGithubHead(
-  store: TicketStore,
+  store: SupervisorStore,
   issueId: string,
   headSha: string,
   source: "workflow_run" | "check_suite",
@@ -286,7 +286,7 @@ async function selfGithubLogin(cfg: Config): Promise<string | undefined> {
 
 export async function handleGithubEvent(
   cfg: Config,
-  store: TicketStore,
+  store: SupervisorStore,
   linearOutbox: LinearOutboxProcessor,
   event: GithubWebhookEvent,
   pipelines: PipelineStore

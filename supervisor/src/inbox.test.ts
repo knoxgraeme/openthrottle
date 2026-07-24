@@ -2,7 +2,8 @@ import type { Daytona, Sandbox } from "@daytona/sdk";
 import type Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
-import { createTicketStore, openDb } from "./db.js";
+import { createSupervisorStore } from "./persistence/store.js";
+import { openDb } from "./persistence/database.js";
 import { deliverPendingInbox } from "./inbox.js";
 
 let db: Database.Database | undefined;
@@ -13,7 +14,7 @@ afterEach(() => {
 
 function seedRunningTicket(agent: "claude" | "codex" | "opencode" = "claude") {
   db = openDb(":memory:");
-  const store = createTicketStore(db);
+  const store = createSupervisorStore(db);
   store.upsert({
     linear_issue_id: "issue-1",
     linear_issue_identifier: "OT-1",

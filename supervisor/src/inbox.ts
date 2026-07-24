@@ -9,7 +9,7 @@
 // the poll interval.
 
 import type { Daytona } from "@daytona/sdk";
-import type { TicketStore } from "./db.js";
+import type { SupervisorStore } from "./persistence/store.js";
 
 const INBOX_DIR = "/home/agent/.ot/inbox";
 const INBOX_ACK_DIR = "/home/agent/.ot/inbox-processed";
@@ -51,7 +51,7 @@ function parseAcknowledgement(raw: string): InboxAcknowledgement {
 
 async function collectAcknowledgements(
   sandbox: Awaited<ReturnType<Daytona["get"]>>,
-  store: TicketStore
+  store: SupervisorStore
 ): Promise<void> {
   const files = await sandbox.fs.listFiles(INBOX_ACK_DIR).catch(() => []);
   for (const file of files) {
@@ -98,7 +98,7 @@ async function collectAcknowledgements(
 
 export async function deliverPendingInbox(params: {
   daytona: Daytona;
-  store: TicketStore;
+  store: SupervisorStore;
 }): Promise<void> {
   for (const ticket of params.store.listRunning()) {
     if (!ticket.sandbox_id) continue;

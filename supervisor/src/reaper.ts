@@ -14,16 +14,16 @@
 
 import type { Daytona } from "@daytona/sdk";
 import { randomUUID } from "node:crypto";
-import type { Config } from "./config.js";
-import type { TicketStore } from "./db.js";
+import type { Config } from "./app/config.js";
+import type { SupervisorStore } from "./persistence/store.js";
 import { terminateAndSettleActor } from "./actor-settlement.js";
 import { tryPostError, type LinearOutboxProcessor } from "./linear-outbox.js";
-import type { PipelineStore } from "./pipeline-store.js";
-import { processPipelineInfrastructureFailure } from "./pipeline-control.js";
+import type { PipelineStore } from "./pipeline/store.js";
+import { processPipelineInfrastructureFailure } from "./pipeline/control.js";
 
 export async function reapStalledRuns(params: {
   daytona: Daytona;
-  store: TicketStore;
+  store: SupervisorStore;
   linearOutbox: LinearOutboxProcessor;
   cfg: Config;
   pipelines?: PipelineStore;
@@ -103,7 +103,7 @@ export async function reapStalledRuns(params: {
 
 export async function reapExpiredRuns(params: {
   daytona: Daytona;
-  store: TicketStore;
+  store: SupervisorStore;
   linearOutbox: LinearOutboxProcessor;
   pipelines: PipelineStore;
 }): Promise<void> {

@@ -1,0 +1,189 @@
+import type Database from "better-sqlite3";
+import type {
+  PipelineInstance,
+  PipelinePublicationReceipt,
+  PipelineStore,
+} from "../../pipeline/store.js";
+
+export function createPublicationStore(db: Database.Database, now: () => string): Pick<
+  PipelineStore,
+  | "claimGithubPublications"
+  | "bindGithubPublicationTarget"
+  | "markGithubPublicationProcessed"
+  | "markGithubPublicationSkipped"
+  | "markGithubPublicationFailed"
+  | "retryPublication"
+> {
+  const claimGithubPublications = db.transaction((
+    nowIso: string,
+    leaseUntilIso: string,
+    limit = 50
+  ): PipelinePublicationReceipt[] => {
+    const candidates = db.prepare(`
+      SELECT id FROM pipeline_publication_receipts
+      WHERE kind = 'github_summary'
+        AND ((status IN ('pending', 'failed') AND next_attempt_at <= ?)
+          OR (status = 'processing' AND next_attempt_at <= ?))
+      ORDER BY next_attempt_at, created_at, id LIMIT ?
+    `).all(nowIso, nowIso, limit) as Array<{ id: string }>;
+    const claimed: PipelinePublicationReceipt[] = [];
+    for (const candidate of candidates) {
+      const update = db.prepare(`
+        UPDATE pipeline_publication_receipts
+        SET status = 'processing', attempts = attempts + 1,
+            next_attempt_at = ?, last_error = NULL, updated_at = ?
+        WHERE id = ? AND kind = 'github_summary'
+          AND ((status IN ('pending', 'failed') AND next_attempt_at <= ?)
+            OR (status = 'processing' AND next_attempt_at <= ?))
+      `).run(leaseUntilIso, nowIso, candidate.id, nowIso, nowIso);
+      if (update.changes === 1) {
+        claimed.push(db.prepare("SELECT * FROM pipeline_publication_receipts WHERE id = ?")
+          .get(candidate.id) as PipelinePublicationReceipt);
+      }
+    }
+    return claimed;
+  });
+
+  const bindGithubPublicationTarget = db.transaction((
+    id: string,
+    expectedPayloadHash: string,
+    targetUrl: string
+  ): PipelinePublicationReceipt | undefined => {
+    const publication = db.prepare("SELECT * FROM pipeline_publication_receipts WHERE id = ?")
+      .get(id) as PipelinePublicationReceipt | undefined;
+    if (!publication || publication.kind !== "github_summary" ||
+        publication.status !== "processing" || publication.payload_hash !== expectedPayloadHash) {
+      return undefined;
+    }
+    if (publication.target_url) {
+      return publication.target_url === targetUrl ? publication : undefined;
+    }
+    const update = db.prepare(`
+      UPDATE pipeline_publication_receipts
+      SET target_url = ?, updated_at = ?
+      WHERE id = ? AND kind = 'github_summary' AND status = 'processing'
+        AND payload_hash = ? AND target_url IS NULL
+        AND EXISTS (
+          SELECT 1
+          FROM pipeline_instances pi
+          JOIN tickets t ON t.linear_issue_id = pi.linear_issue_id
+          WHERE pi.id = pipeline_publication_receipts.pipeline_instance_id
+            AND t.linear_session_id = pi.linear_session_id
+            AND t.pr_url = ?
+        )
+    `).run(targetUrl, now(), id, expectedPayloadHash, targetUrl);
+    if (update.changes !== 1) return undefined;
+    return db.prepare("SELECT * FROM pipeline_publication_receipts WHERE id = ?")
+      .get(id) as PipelinePublicationReceipt;
+  });
+
+  const markGithubPublicationProcessed = db.transaction((
+    id: string,
+    expectedPayloadHash: string,
+    externalId: string,
+    externalUrl: string
+  ): boolean => {
+    const timestamp = now();
+    const update = db.prepare(`
+      UPDATE pipeline_publication_receipts
+      SET status = 'acknowledged', external_id = ?, external_url = ?,
+          acknowledged_at = ?, last_error = NULL, updated_at = ?
+      WHERE id = ? AND kind = 'github_summary' AND status = 'processing'
+        AND payload_hash = ?
+    `).run(externalId, externalUrl, timestamp, timestamp, id, expectedPayloadHash);
+    return update.changes === 1;
+  });
+
+  const markGithubPublicationSkipped = db.transaction((
+    id: string,
+    expectedPayloadHash: string
+  ): boolean => {
+    const timestamp = now();
+    const update = db.prepare(`
+      UPDATE pipeline_publication_receipts
+      SET status = 'acknowledged', external_id = 'skipped:no-pull-request',
+          external_url = NULL, acknowledged_at = ?, last_error = NULL, updated_at = ?
+      WHERE id = ? AND kind = 'github_summary' AND status = 'processing'
+        AND payload_hash = ? AND target_url IS NULL
+    `).run(timestamp, timestamp, id, expectedPayloadHash);
+    return update.changes === 1;
+  });
+
+  const markGithubPublicationFailed = db.transaction((
+    id: string,
+    expectedPayloadHash: string,
+    error: string,
+    retryAt: string | null
+  ): boolean => {
+    const publication = db.prepare("SELECT * FROM pipeline_publication_receipts WHERE id = ?")
+      .get(id) as PipelinePublicationReceipt | undefined;
+    if (!publication || publication.kind !== "github_summary" ||
+        publication.status !== "processing" || publication.payload_hash !== expectedPayloadHash) return false;
+    const timestamp = now();
+    const status = retryAt ? "failed" : "dead";
+    const instance = db.prepare("SELECT * FROM pipeline_instances WHERE id = ?")
+      .get(publication.pipeline_instance_id) as PipelineInstance;
+    db.prepare(`
+      UPDATE pipeline_publication_receipts
+      SET status = ?, next_attempt_at = ?, last_error = ?, updated_at = ?,
+          blocked_from_status = CASE WHEN ? = 'dead' THEN COALESCE(blocked_from_status, ?) ELSE blocked_from_status END
+      WHERE id = ?
+    `).run(status, retryAt ?? timestamp, error, timestamp, status, instance.status, id);
+    if (status === "dead" && ![
+      "shipped", "no_change", "needs_human", "canceled", "superseded", "failed", "publication_blocked",
+    ].includes(instance.status)) {
+      db.prepare(`
+        UPDATE pipeline_instances
+        SET status = 'publication_blocked', state_version = state_version + 1,
+            wait_reason = 'permanent publication failure', updated_at = ?
+        WHERE id = ? AND state_version = ?
+      `).run(timestamp, instance.id, instance.state_version);
+    }
+    return true;
+  });
+
+  const retryPublication = db.transaction((id: string): PipelinePublicationReceipt => {
+    const publication = db.prepare("SELECT * FROM pipeline_publication_receipts WHERE id = ?")
+      .get(id) as PipelinePublicationReceipt | undefined;
+    if (!publication) throw new Error(`unknown pipeline publication ${id}`);
+    if (publication.status !== "dead" && publication.status !== "failed") {
+      throw new Error(`pipeline publication ${id} is not recoverable`);
+    }
+    const timestamp = now();
+    db.prepare(`
+      UPDATE pipeline_publication_receipts
+      SET status = 'pending', next_attempt_at = ?, last_error = NULL, updated_at = ?
+      WHERE id = ?
+    `).run(timestamp, timestamp, id);
+    if (publication.kind === "linear_ledger") {
+      const update = db.prepare(`
+        UPDATE linear_outbox
+        SET status = 'pending', next_attempt_at = ?, last_error = NULL, processed_at = NULL
+        WHERE id = ? AND status IN ('dead', 'failed')
+      `).run(timestamp, id);
+      if (update.changes !== 1) throw new Error(`pipeline publication ${id} has no recoverable outbox row`);
+    }
+    const remainingDead = db.prepare(`
+      SELECT COUNT(*) AS count FROM pipeline_publication_receipts
+      WHERE pipeline_instance_id = ? AND status = 'dead'
+    `).get(publication.pipeline_instance_id) as { count: number };
+    if (remainingDead.count === 0) {
+      db.prepare(`
+        UPDATE pipeline_instances
+        SET status = ?, wait_reason = NULL, state_version = state_version + 1, updated_at = ?
+        WHERE id = ? AND status = 'publication_blocked'
+      `).run(publication.blocked_from_status ?? "completion_pending_publication", timestamp, publication.pipeline_instance_id);
+    }
+    return db.prepare("SELECT * FROM pipeline_publication_receipts WHERE id = ?")
+      .get(id) as PipelinePublicationReceipt;
+  });
+
+  return {
+    claimGithubPublications,
+    bindGithubPublicationTarget,
+    markGithubPublicationProcessed,
+    markGithubPublicationSkipped,
+    markGithubPublicationFailed,
+    retryPublication,
+  };
+}

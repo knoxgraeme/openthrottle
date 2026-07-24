@@ -2,8 +2,9 @@
 // coordinator. Every delegated session is pinned to an immutable manifest;
 // there is no direct task launcher fallback.
 
-import type { Config } from "./config.js";
-import type { Agent, TaskType, Ticket, TicketStore } from "./db.js";
+import type { Config } from "./app/config.js";
+import type { Ticket, SupervisorStore } from "./persistence/store.js";
+import type { Agent, TaskType } from "./pipeline/types.js";
 import {
   extractLabelNames,
   fetchIssueLabels,
@@ -23,17 +24,17 @@ import {
   parseRepositoryConfig,
   resolvePipelineReference,
   type ValidatedPipelineCatalog,
-} from "./pipeline-manifest.js";
-import type { PipelineStore } from "./pipeline-store.js";
+} from "./pipeline/manifest.js";
+import type { PipelineStore } from "./pipeline/store.js";
 import type { ValidatedRuntimeCapabilityDescriptor } from "./sandbox-runtime.js";
 import {
   enqueueActivity,
   tryPostError,
   type LinearOutboxProcessor,
 } from "./linear-outbox.js";
-import { sanitizeText } from "./sanitize.js";
-import { parseCommand } from "./commands.js";
-import { canSteerPipelineRun, requestPipelineStop } from "./pipeline-control.js";
+import { sanitizeText } from "./shared/sanitize.js";
+import { parseCommand } from "./app/commands.js";
+import { canSteerPipelineRun, requestPipelineStop } from "./pipeline/control.js";
 import type { AdmissionPreflight } from "./admission-preflight.js";
 
 function linearContext(
@@ -86,7 +87,7 @@ function isSafeBranchName(value: string): boolean {
 }
 
 function repositoryFor(
-  store: TicketStore,
+  store: SupervisorStore,
   issue: { team?: { id?: string; key?: string } }
 ): { repo: string; baseBranch: string } | undefined {
   const registered = store.getRepositoryRegistration(issue.team?.id, issue.team?.key);
@@ -97,7 +98,7 @@ function repositoryFor(
 
 export async function handleLinearEvent(
   cfg: Config,
-  store: TicketStore,
+  store: SupervisorStore,
   getLinearClient: () => Promise<LinearClient | undefined>,
   linearOutbox: LinearOutboxProcessor,
   payload: ReturnType<typeof parseLinearWebhook>,
@@ -124,7 +125,7 @@ export interface PipelineCoordinatorContext {
 
 async function handleCreated(
   cfg: Config,
-  store: TicketStore,
+  store: SupervisorStore,
   linear: LinearClient,
   linearOutbox: LinearOutboxProcessor,
   payload: ReturnType<typeof parseLinearWebhook>,
@@ -362,7 +363,7 @@ async function handleCreated(
 
 async function handlePrompted(
   cfg: Config,
-  store: TicketStore,
+  store: SupervisorStore,
   linearOutbox: LinearOutboxProcessor,
   payload: ReturnType<typeof parseLinearWebhook>,
   coordinator: PipelineCoordinatorContext
@@ -466,7 +467,7 @@ async function handlePrompted(
 
 async function mergeFromLinear(
   cfg: Config,
-  store: TicketStore,
+  store: SupervisorStore,
   linearOutbox: LinearOutboxProcessor,
   ticket: Ticket
 ): Promise<void> {

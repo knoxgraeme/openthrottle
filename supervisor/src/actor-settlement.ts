@@ -1,7 +1,7 @@
 import type { Daytona } from "@daytona/sdk";
-import type { Run, Ticket, TicketStore } from "./db.js";
+import type { Run, Ticket, SupervisorStore } from "./persistence/store.js";
 import { stopSandbox } from "./daytona.js";
-import { sanitizeText } from "./sanitize.js";
+import { sanitizeText } from "./shared/sanitize.js";
 
 export type ActorSettlementResult =
   | { kind: "settled"; run: Run }
@@ -13,7 +13,7 @@ export type ActorSettlementResult =
 // confirms termination. Callers publish effects only for the returned winner.
 export async function terminateAndSettleActor(params: {
   daytona: Daytona;
-  store: TicketStore;
+  store: SupervisorStore;
   runId: string;
   sandboxId: string | null;
   owner: string;
@@ -38,17 +38,16 @@ export async function terminateAndSettleActor(params: {
       : { kind: "lost" };
   }
 
-  const settled = params.store.db.transaction(() => {
-    const result = params.store.finishReapingRun({
+  const settled = params.store.finishReapingRunAndThen(
+    {
       runId: params.runId,
       owner: params.owner,
       status: params.status,
       failureTail: params.reason,
       ticketState: params.ticketState,
       prUrl: params.prUrl,
-    });
-    if (result) params.onSettled?.(result);
-    return result;
-  }).immediate();
+    },
+    (run) => params.onSettled?.(run)
+  );
   return settled ? { kind: "settled", run: settled } : { kind: "lost" };
 }

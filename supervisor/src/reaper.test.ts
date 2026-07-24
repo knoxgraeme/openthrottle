@@ -1,12 +1,13 @@
 import type { Daytona } from "@daytona/sdk";
 import type Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Config } from "./config.js";
-import type { TicketStore } from "./db.js";
-import { createTicketStore, openDb } from "./db.js";
+import type { Config } from "./app/config.js";
+import type { SupervisorStore } from "./persistence/store.js";
+import { createSupervisorStore } from "./persistence/store.js";
+import { openDb } from "./persistence/database.js";
 import { createLinearOutboxProcessor } from "./linear-outbox.js";
 import { reapStalledRuns } from "./reaper.js";
-import type { PipelineStore } from "./pipeline-store.js";
+import type { PipelineStore } from "./pipeline/store.js";
 
 let db: Database.Database | undefined;
 afterEach(() => db?.close());
@@ -26,10 +27,10 @@ function makeDaytona(stopError?: Error) {
 
 // No Linear client: enqueue succeeds, delivery throws and is swallowed by
 // tryPostError, so the enqueued error row stays visible in listLinearOutbox().
-const makeOutbox = (store: TicketStore) =>
+const makeOutbox = (store: SupervisorStore) =>
   createLinearOutboxProcessor({ store, getLinearClient: async () => undefined });
 
-const addTicket = (store: TicketStore, id: string, sandboxId: string | null) =>
+const addTicket = (store: SupervisorStore, id: string, sandboxId: string | null) =>
   store.upsert({
     linear_issue_id: id,
     linear_issue_identifier: id.toUpperCase(),
@@ -45,7 +46,7 @@ const addTicket = (store: TicketStore, id: string, sandboxId: string | null) =>
 describe("reapStalledRuns", () => {
   it("reaps a silent run, settles its sandbox, and leaves fresh runs alone", async () => {
     db = openDb(":memory:");
-    const store = createTicketStore(db);
+    const store = createSupervisorStore(db);
     const { daytona, sandbox } = makeDaytona();
     const linearOutbox = makeOutbox(store);
 
@@ -115,7 +116,7 @@ describe("reapStalledRuns", () => {
 
   it("does not reap a run kept alive by a recent sandbox event", async () => {
     db = openDb(":memory:");
-    const store = createTicketStore(db);
+    const store = createSupervisorStore(db);
     const { daytona } = makeDaytona();
     const linearOutbox = makeOutbox(store);
 
@@ -150,7 +151,7 @@ describe("reapStalledRuns", () => {
 
   it("reaps a bootstrapping run from started_at when no heartbeat ever arrives", async () => {
     db = openDb(":memory:");
-    const store = createTicketStore(db);
+    const store = createSupervisorStore(db);
     const { daytona } = makeDaytona();
     const linearOutbox = makeOutbox(store);
 
@@ -178,7 +179,7 @@ describe("reapStalledRuns", () => {
 
   it("quarantines a claimed run when termination cannot be confirmed", async () => {
     db = openDb(":memory:");
-    const store = createTicketStore(db);
+    const store = createSupervisorStore(db);
     const { daytona } = makeDaytona(new Error("provider timeout"));
     const linearOutbox = makeOutbox(store);
     addTicket(store, "wedged", "sandbox-1");
@@ -221,7 +222,7 @@ describe("reapStalledRuns", () => {
 
   it("quarantines a pipeline resource without advancing to a retry before actor termination", async () => {
     db = openDb(":memory:");
-    const store = createTicketStore(db);
+    const store = createSupervisorStore(db);
     const { daytona } = makeDaytona(new Error("provider timeout"));
     const linearOutbox = makeOutbox(store);
     addTicket(store, "pipeline-wedged", "sandbox-1");
@@ -255,7 +256,7 @@ describe("reapStalledRuns", () => {
 
   it("allows only the settlement owner to finish a reaping run", () => {
     db = openDb(":memory:");
-    const store = createTicketStore(db);
+    const store = createSupervisorStore(db);
     addTicket(store, "race", null);
     store.beginRun({
       issueId: "race",
@@ -281,7 +282,7 @@ describe("reapStalledRuns", () => {
 
   it("holds an exclusive supervisor lease across the termination call", async () => {
     db = openDb(":memory:");
-    const store = createTicketStore(db);
+    const store = createSupervisorStore(db);
     addTicket(store, "overlap", "sandbox-1");
     store.beginRun({
       issueId: "overlap",
@@ -312,7 +313,7 @@ describe("reapStalledRuns", () => {
 
   it("renews the supervisor lease before every stalled actor", async () => {
     db = openDb(":memory:");
-    const store = createTicketStore(db);
+    const store = createSupervisorStore(db);
     const { daytona } = makeDaytona();
     const linearOutbox = makeOutbox(store);
     for (const id of ["first", "second"]) {
@@ -340,7 +341,7 @@ describe("reapStalledRuns", () => {
 
   it("is a no-op when there are no stalled runs", async () => {
     db = openDb(":memory:");
-    const store = createTicketStore(db);
+    const store = createSupervisorStore(db);
     const { daytona } = makeDaytona();
     const linearOutbox = makeOutbox(store);
 

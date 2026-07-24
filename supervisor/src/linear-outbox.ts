@@ -1,7 +1,7 @@
 import type { AgentActivityInput, AgentPlanItem, LinearClient } from "./linear.js";
 import { agentActivityCreate, agentSessionUpdate, linearFileUpload } from "./linear.js";
-import type { LinearOutboxRecord, TicketStore } from "./db.js";
-import { sanitizeText } from "./sanitize.js";
+import type { LinearOutboxRecord, SupervisorStore } from "./persistence/store.js";
+import { sanitizeText } from "./shared/sanitize.js";
 
 // Shared helpers for enqueueing a single Linear outbox row and processing it
 // immediately, used across pipeline effects and the Linear/GitHub event
@@ -9,7 +9,7 @@ import { sanitizeText } from "./sanitize.js";
 // per caller) since they are pure wrappers over this module's own processor.
 
 export async function tryPostError(
-  store: TicketStore,
+  store: SupervisorStore,
   outbox: LinearOutboxProcessor,
   sessionId: string | undefined,
   issueId: string | undefined,
@@ -34,7 +34,7 @@ export async function tryPostError(
 }
 
 export async function enqueueActivity(
-  store: TicketStore,
+  store: SupervisorStore,
   outbox: LinearOutboxProcessor,
   activity: AgentActivityInput,
   issueId?: string,
@@ -51,7 +51,7 @@ export async function enqueueActivity(
 }
 
 export async function enqueueSessionUpdate(
-  store: TicketStore,
+  store: SupervisorStore,
   outbox: LinearOutboxProcessor,
   params: {
     id?: string;
@@ -123,7 +123,7 @@ function parsePayload(row: LinearOutboxRecord): LinearOutboxPayload {
 async function deliver(
   linear: LinearClient,
   row: LinearOutboxRecord,
-  store: TicketStore
+  store: SupervisorStore
 ): Promise<{ externalId?: string; attachmentUrl?: string }> {
   const payload = parsePayload(row);
   if (payload.type === "activity") {
@@ -163,7 +163,7 @@ async function deliver(
 }
 
 export function createLinearOutboxProcessor(params: {
-  store: TicketStore;
+  store: SupervisorStore;
   getLinearClient: () => Promise<LinearClient | undefined>;
   leaseMs?: number;
 }): LinearOutboxProcessor {

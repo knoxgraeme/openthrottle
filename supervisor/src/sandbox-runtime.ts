@@ -14,7 +14,7 @@ import {
   type ExecutorKind,
   type RuntimeCapabilityInventory,
   type StageOutcome,
-} from "./pipeline-manifest.js";
+} from "./pipeline/manifest.js";
 
 export const STAGE_EXECUTOR_PROTOCOL = "stage-executor@1";
 
