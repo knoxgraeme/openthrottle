@@ -34,6 +34,7 @@ import {
 import { sanitizeText } from "./sanitize.js";
 import { parseCommand } from "./commands.js";
 import { canSteerPipelineRun, requestPipelineStop } from "./pipeline-control.js";
+import type { AdmissionPreflight } from "./admission-preflight.js";
 
 function linearContext(
   payload: ReturnType<typeof parseLinearWebhook>,
@@ -100,14 +101,15 @@ export async function handleLinearEvent(
   getLinearClient: () => Promise<LinearClient | undefined>,
   linearOutbox: LinearOutboxProcessor,
   payload: ReturnType<typeof parseLinearWebhook>,
-  coordinator: PipelineCoordinatorContext
+  coordinator: PipelineCoordinatorContext,
+  preflight?: AdmissionPreflight
 ): Promise<void> {
   const linear = await getLinearClient();
   if (!linear) {
     throw new Error("No valid Linear OAuth token is stored");
   }
   if (payload.action === "created") {
-    await handleCreated(cfg, store, linear, linearOutbox, payload, coordinator);
+    await handleCreated(cfg, store, linear, linearOutbox, payload, coordinator, preflight);
   } else {
     await handlePrompted(cfg, store, linearOutbox, payload, coordinator);
   }
@@ -126,7 +128,8 @@ async function handleCreated(
   linear: LinearClient,
   linearOutbox: LinearOutboxProcessor,
   payload: ReturnType<typeof parseLinearWebhook>,
-  coordinator: PipelineCoordinatorContext
+  coordinator: PipelineCoordinatorContext,
+  preflight?: AdmissionPreflight
 ): Promise<void> {
   const issue = payload.agentSession.issue;
   const sessionId = payload.agentSession.id;
@@ -270,9 +273,9 @@ async function handleCreated(
     pr_url: null,
     state: "active" as const,
   };
-  const failSelection = async (error: unknown) => {
-    const message = sanitizeText(`Pipeline selection failed before sandbox provisioning: ${String(error)}`);
-    // A failed selection must not supersede the currently pinned generation.
+  const failAdmission = async (rawMessage: string) => {
+    const message = sanitizeText(rawMessage);
+    // A failed admission must not supersede the currently pinned generation.
     if (!existing) {
       store.upsertUnpinned({ ...ticketCore, state: "error" });
       store.setState(issue.id, "error", message);
@@ -280,6 +283,8 @@ async function handleCreated(
     }
     await tryPostError(store, linearOutbox, sessionId, issue.id, message);
   };
+  const failSelection = (error: unknown) =>
+    failAdmission(`Pipeline selection failed before sandbox provisioning: ${String(error)}`);
   let pinned: {
     remote: Awaited<ReturnType<typeof getRepositoryConfigAtCommit>>;
     manifest: ReturnType<typeof resolvePipelineReference>;
@@ -313,6 +318,19 @@ async function handleCreated(
   } catch (error) {
     await failSelection(error);
     return;
+  }
+  // Preflight after the selection is pinned but before any pipeline instance
+  // or sandbox exists: a rejection here surfaces as a clean Linear error
+  // instead of a silent in-sandbox clone failure or opaque provisioning churn.
+  if (preflight) {
+    const verdict = await preflight({
+      repository: selectedRepository.repo,
+      baseCommit: pinned.remote.baseCommit,
+    });
+    if (!verdict.ok) {
+      await failAdmission(verdict.reason);
+      return;
+    }
   }
   try {
     store.upsert({

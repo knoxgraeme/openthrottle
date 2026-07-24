@@ -31,6 +31,7 @@ import {
 } from "./webhook-delivery.js";
 import { createLinearOutboxProcessor, tryPostError, type LinearOutboxProcessor } from "./linear-outbox.js";
 import { handleLinearEvent, type PipelineCoordinatorContext } from "./linear-events.js";
+import { createAdmissionPreflight } from "./admission-preflight.js";
 import { handleGithubEvent } from "./github-events.js";
 import { renderPipelineLogHeader } from "./pipeline-publication.js";
 import { canSteerPipelineRun, requestPipelineStop } from "./pipeline-control.js";
@@ -149,6 +150,7 @@ export function createServerWebhookDeliveryProcessor(deps: {
   const linearOutbox =
     deps.linearOutbox ??
     createLinearOutboxProcessor({ store: deps.store, getLinearClient: deps.getLinearClient });
+  const admissionPreflight = createAdmissionPreflight(deps.cfg, deps.daytona);
   return createWebhookDeliveryProcessor({
     store: deps.store,
     maxAttempts: 8,
@@ -172,7 +174,8 @@ export function createServerWebhookDeliveryProcessor(deps: {
           deps.getLinearClient,
           linearOutbox,
           parseLinearWebhook(delivery.payload),
-          deps.pipelineCoordinator
+          deps.pipelineCoordinator,
+          admissionPreflight
         );
         return;
       }
