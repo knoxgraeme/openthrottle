@@ -9,6 +9,38 @@ import { sanitizeText } from "./sanitize.js";
 const EFFECT_LEASE_MS = 60_000;
 const RETRY_BASE_MS = 5_000;
 const MAX_EFFECT_ATTEMPTS = 8;
+const CAPACITY_RETRY_MS = 5 * 60_000;
+
+// Deterministic provider failures must not burn the whole retry budget on hot
+// exponential backoff. Auth failures never self-heal, so they exhaust on the
+// first attempt carrying the real sanitized message. Capacity failures clear
+// only when unrelated resources are released, so they retry on a fixed patient
+// interval while still counting against MAX_EFFECT_ATTEMPTS.
+const AUTH_ERROR_PATTERNS: RegExp[] = [
+  /\bunauthorized\b/,
+  /\bforbidden\b/,
+  /\b40[13]\b/,
+  /write access to repository not granted/,
+  /resource not accessible/,
+  /bad credentials/,
+  /\b(?:invalid|expired|revoked)\b[^\n]{0,40}\btoken\b/,
+  /\btoken\b[^\n]{0,40}\b(?:invalid|expired|revoked)\b/,
+];
+
+const CAPACITY_ERROR_PATTERNS: RegExp[] = [
+  /total (?:memory|disk|cpu) limit exceeded/,
+  /quota exceeded/,
+  /insufficient (?:memory|disk|capacity)/,
+];
+
+type EffectErrorClass = "auth" | "capacity" | "transient";
+
+function classifyEffectError(message: string): EffectErrorClass {
+  const text = message.toLowerCase();
+  if (AUTH_ERROR_PATTERNS.some((pattern) => pattern.test(text))) return "auth";
+  if (CAPACITY_ERROR_PATTERNS.some((pattern) => pattern.test(text))) return "capacity";
+  return "transient";
+}
 
 export interface PipelineEffectProcessor {
   drain(): Promise<void>;
@@ -348,10 +380,16 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       await handle(effect);
     } catch (error) {
       const message = sanitizeText(String(error)).slice(-2_000);
-      const exhausted = effect.attempts >= MAX_EFFECT_ATTEMPTS;
+      const errorClass = classifyEffectError(message);
+      // Stop settlement keeps its full retry budget: exhausting it early would
+      // reroute live actors into quarantine on the first provider auth blip.
+      const exhausted = (errorClass === "auth" && effect.kind !== "stop") ||
+        effect.attempts >= MAX_EFFECT_ATTEMPTS;
       const retryAt = exhausted
         ? null
-        : new Date(now().getTime() + RETRY_BASE_MS * 2 ** Math.min(effect.attempts - 1, 6)).toISOString();
+        : errorClass === "capacity"
+          ? new Date(now().getTime() + CAPACITY_RETRY_MS).toISOString()
+          : new Date(now().getTime() + RETRY_BASE_MS * 2 ** Math.min(effect.attempts - 1, 6)).toISOString();
       if (exhausted && (effect.kind === "provision" || effect.kind === "dispatch_stage")) {
         const instance = deps.store.getInstance(effect.pipeline_instance_id);
         const attempt = instance ? deps.store.getActiveAttempt(instance.id) : undefined;
