@@ -209,6 +209,10 @@ describe("pipeline coordinator", () => {
     expect(exhausted.nextStatus).toBe("completion_pending_publication");
     expect(exhausted.terminalOutcome).toBe("needs_human");
     expect(exhausted.nextAttempt).toBeUndefined();
+    expect(exhausted.effects.map((effect) => effect.kind)).toEqual(["publish_linear", "cleanup"]);
+    expect(exhausted.effects[1]).toMatchObject({
+      idempotencyKey: `cleanup:${instance.id}:needs_human`,
+    });
 
     const attemptsExhausted = reducePipelineEvent({
       manifest,
@@ -220,6 +224,8 @@ describe("pipeline coordinator", () => {
     expect(attemptsExhausted.nextStatus).toBe("completion_pending_publication");
     expect(attemptsExhausted.waitReason).toMatch(/attempt limit/);
     expect(attemptsExhausted.nextAttempt).toBeUndefined();
+    expect(attemptsExhausted.effects.map((effect) => effect.kind))
+      .toEqual(["publish_linear", "stop", "cleanup"]);
   });
 
   it("persists a complete immutable request for a repair attempt", () => {
