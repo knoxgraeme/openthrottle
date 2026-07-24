@@ -52,7 +52,7 @@ export async function reapStalledRuns(params: {
         return;
       }
       try {
-        const message = `OpenThrottle ${run.task_type} run reaped — no executor heartbeat for over ${cfg.stallTimeoutSeconds}s (stalled).`;
+        const message = `OpenThrottle ${run.task_type} run reaped — no executor progress for over ${cfg.stallTimeoutSeconds}s. The stage executor likely crashed, never started, or exited without reporting a result; check the stage attempt logs.`;
         const ticket = store.getByIssueId(run.linear_issue_id);
         if (!ticket) continue;
         const pipelineAttempt = params.pipelines?.getAttemptForRun(run.id);
