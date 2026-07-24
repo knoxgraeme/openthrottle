@@ -1,11 +1,12 @@
 schema: openthrottle.catalog/v1
 manifests:
   - ce-implement-v2.yaml
+  - ce-implement-v3.yaml
   - ce-investigate-v2.yaml
 aliases:
   implement:
     id: ce/implement
-    version: 2
+    version: 3
   investigate:
     id: ce/investigate
     version: 2
