@@ -234,11 +234,13 @@ export function buildCommandArtifacts({ fence, command, commandName, execution, 
   const terminated = Boolean(execution.timedOut || execution.signal || execution.exitCode === 137);
   const result = execution.notConfigured
     ? "not_configured"
-    : execution.exitCode === 0 && !terminated
-      ? "success"
-      : terminated
-        ? "retryable_infrastructure_failure"
-        : "failure";
+    : execution.executorFailure
+      ? "retryable_infrastructure_failure"
+      : execution.exitCode === 0 && !terminated
+        ? "success"
+        : terminated
+          ? "retryable_infrastructure_failure"
+          : "failure";
   const details = {
     command_name: commandName,
     command_digest: digest(command),
@@ -246,6 +248,7 @@ export function buildCommandArtifacts({ fence, command, commandName, execution, 
     signal: execution.signal ?? null,
     timed_out: Boolean(execution.timedOut),
     not_configured: Boolean(execution.notConfigured),
+    ...(execution.executorFailure ? { executor_failure: true } : {}),
     stdout: sanitizeArtifactText(execution.stdout ?? "", env).slice(-2_000),
     stderr: sanitizeArtifactText(execution.stderr ?? "", env).slice(-2_000),
   };
@@ -257,7 +260,9 @@ export function buildCommandArtifacts({ fence, command, commandName, execution, 
     result,
     summary: execution.notConfigured
       ? `Repository command ${commandName} is not configured.`
-      : `Repository command ${commandName} exited with ${execution.exitCode}.`,
+      : execution.executorFailure
+        ? `Repository command ${commandName} executor failed before verified completion.`
+        : `Repository command ${commandName} exited with ${execution.exitCode}.`,
     evidence: [],
     findings: [],
     actions: [],
