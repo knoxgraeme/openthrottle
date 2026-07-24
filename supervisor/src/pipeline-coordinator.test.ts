@@ -236,10 +236,22 @@ describe("pipeline coordinator", () => {
 
   it("persists a complete immutable request for a repair attempt", () => {
     const { pipelines, instance, attempt } = setup("ce/implement@2");
-    const repaired = coordinatePipelineEvent(
-      pipelines,
-      event(instance, attempt, "semantic_repair_required", "repair-request")
-    );
+    const input = event(instance, attempt, "semantic_repair_required", "repair-request");
+    const payload = JSON.stringify({
+      id: "repair-request",
+      outcome: "semantic_repair_required",
+      summary: "A blocking defect must be repaired.",
+      findings: [{ severity: "P1", code: "review-blocking", summary: "The gate found a blocking defect." }],
+    });
+    input.resultHash = digestNormalized(payload);
+    input.artifacts = [{
+      kind: "stage_result",
+      schemaVersion: 1,
+      assurance: "semantic_attested",
+      payload,
+      hash: digestNormalized(payload),
+    }];
+    const repaired = coordinatePipelineEvent(pipelines, input);
     const next = pipelines.getActiveAttempt(repaired.id)!;
     const request = pipelines.getStageRequest(next.id);
     expect(request).toMatchObject({
@@ -254,6 +266,11 @@ describe("pipeline coordinator", () => {
       taskContext: "Approved ticket plan",
     });
     expect(request.transitionContext).toContain("semantic_repair_required");
+    // The structured findings must ride the sealed request: the resumed
+    // session's memory of them is best-effort, the request is the guarantee.
+    expect(JSON.parse(request.transitionContext).findings).toEqual([
+      { severity: "P1", code: "review-blocking", summary: "The gate found a blocking defect." },
+    ]);
     expect(pipelines.listEffects(instance.id).find((effect) => effect.kind === "dispatch_stage")).toMatchObject({
       kind: "dispatch_stage",
       payload: next.request_payload,
