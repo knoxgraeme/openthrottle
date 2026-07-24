@@ -205,6 +205,11 @@ function repositoryOwnerControl(operation, snapshot) {
 
 export function captureRepositoryControl(repoDir) {
   const gitDir = runGitAsRepositoryOwner(repoDir, ["rev-parse", "--absolute-git-dir"]);
+  // The disposable fresh-review checkout is copied without preserved stat
+  // metadata, so every index entry starts stat-stale and the stage's first
+  // read-only `git status` would rewrite .git/index. Settle the stat cache
+  // before snapshotting the bytes so read-only git commands leave them stable.
+  runGitAsRepositoryOwner(repoDir, ["status", "--porcelain"]);
   const headPath = join(gitDir, "HEAD");
   const indexPath = join(gitDir, "index");
   const headMode = fileModeAt(headPath);
@@ -222,6 +227,7 @@ export function captureRepositoryControl(repoDir) {
     index,
     indexMode,
     indexSignature: bufferSignature(index, indexMode),
+    stagedEntries: runGitAsRepositoryOwner(repoDir, ["ls-files", "-s"]),
     refs: captureRepositoryRefs(repoDir),
     operationPaths: GIT_OPERATION_STATE.map((name) => join(gitDir, name)),
   };
@@ -233,10 +239,23 @@ export function captureRepositoryControl(repoDir) {
   return snapshot;
 }
 
+// Git rewrites .git/index during nominally read-only commands whenever cached
+// stat data goes stale, so index bytes alone cannot prove an agent mutation.
+// A byte mismatch is benign exactly when the staged entries (mode, object,
+// stage, path) are unchanged; anything staged, unstaged, or swapped changes
+// `git ls-files -s` and still fails.
+function indexMatches(repoDir, currentSignature, snapshot) {
+  if (canonicalJson(currentSignature) === canonicalJson(snapshot.indexSignature)) return true;
+  if (typeof snapshot.stagedEntries !== "string") return false;
+  if (!currentSignature.exists || !snapshot.indexSignature.exists) return false;
+  if (currentSignature.type !== "file" || currentSignature.mode !== snapshot.indexSignature.mode) return false;
+  return runGitAsRepositoryOwner(repoDir, ["ls-files", "-s"]) === snapshot.stagedEntries;
+}
+
 export function repositoryControlMatches(repoDir, snapshot) {
   const control = repositoryOwnerControl("inspect", snapshot);
   return canonicalJson(control.head) === canonicalJson(snapshot.headSignature) &&
-    canonicalJson(control.index) === canonicalJson(snapshot.indexSignature) &&
+    indexMatches(repoDir, control.index, snapshot) &&
     canonicalJson(control.operationState) === canonicalJson(snapshot.operationState) &&
     optionalRepositoryOwnerGit(repoDir, ["rev-parse", "HEAD"]) === snapshot.headOid &&
     optionalRepositoryOwnerGit(repoDir, ["symbolic-ref", "-q", "HEAD"]) === snapshot.symbolicRef &&
