@@ -696,9 +696,12 @@ describe("one-stage executor", () => {
     expect(payload.result).toBe("retryable_infrastructure_failure");
     expect(payload.details.executor_failure).toBe(true);
     expect(payload.details.stderr).toMatch(/fenced expected subject/);
+    // The fallback must not launder the drifted tree into the fence chain:
+    // every subject field reports the fenced expected subject.
     expect(payload.repository.pre_subject).toBe(input.request.expectedSubject);
-    expect(payload.repository.post_subject).toBe(computeWorkspaceTreeOid(input.repoDir));
-    expect(event.subject).toBe(payload.repository.post_subject);
+    expect(payload.repository.post_subject).toBe(input.request.expectedSubject);
+    expect(event.subject).toBe(input.request.expectedSubject);
+    expect(computeWorkspaceTreeOid(input.repoDir)).not.toBe(input.request.expectedSubject);
   });
 
   it("builds a semantic fallback result for agent stages that crash before evidence", () => {
