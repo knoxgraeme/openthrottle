@@ -21,6 +21,7 @@ import {
   createStageRequestHash,
   executeStage,
   extractNativeSessionId,
+  fallbackStageResultEvent,
   resolveContextInvocation,
   runCapturedProcess,
   runWithAgentProcessFence,
@@ -627,6 +628,92 @@ describe("one-stage executor", () => {
     const result = executeStage({ ...input, now: clock() });
     expect(result.outcome).toBe("no_change");
     expect(JSON.parse(result.artifacts[0].payload).result).toBe("not_configured");
+  });
+
+  it("seals a typed retryable result when the command executor throws", () => {
+    const input = fixture({
+      capability: "command/run@1",
+      contextPolicy: "none",
+      requiredArtifacts: ["stage_result", "command_result"],
+      credentialScopes: ["repo.read"],
+      liveSteering: false,
+      commandName: "test",
+    });
+    const result = executeStage({
+      ...input,
+      now: clock(),
+      executeCommand: () => {
+        throw new Error("bounded process helper failed: terminated by SIGKILL");
+      },
+    });
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+    expect(result.artifacts.map((artifact) => artifact.kind)).toEqual(["stage_result", "command_result"]);
+    const payload = JSON.parse(result.artifacts[0].payload);
+    expect(payload.result).toBe("retryable_infrastructure_failure");
+    expect(payload.details.executor_failure).toBe(true);
+    expect(payload.details.exit_code).toBeNull();
+    expect(payload.details.stderr).toMatch(/bounded process helper failed/);
+    expect(payload.repository.post_subject).toBe(payload.repository.pre_subject);
+  });
+
+  it("writes a sealed typed result when the expected-subject fence rejects the workspace", () => {
+    const input = fixture({
+      capability: "command/run@1",
+      contextPolicy: "none",
+      requiredArtifacts: ["stage_result", "command_result"],
+      credentialScopes: ["repo.read"],
+      liveSteering: false,
+      commandName: "test",
+    });
+    writeFileSync(join(input.repoDir, "drift.txt"), "workspace drifted after sealing\n");
+    const stateDir = mkdtempSync(join(tmpdir(), "ot-stage-fallback-"));
+    directories.push(stateDir);
+    writeFileSync(join(stateDir, "request.json"), JSON.stringify(input.request));
+    writeFileSync(join(stateDir, "config.json"), input.configRaw);
+    writeFileSync(join(stateDir, "manifest.json"), input.manifestRaw);
+    const outputPath = join(stateDir, "results", `${input.request.attemptId}.json`);
+
+    const executed = spawnSync(process.execPath, [
+      fileURLToPath(new URL("./execute-stage.mjs", import.meta.url)),
+      "--request", join(stateDir, "request.json"),
+      "--config", join(stateDir, "config.json"),
+      "--manifest", join(stateDir, "manifest.json"),
+      "--repo", input.repoDir,
+      "--output", outputPath,
+    ], { encoding: "utf8", timeout: 30_000 });
+
+    expect(executed.status).toBe(1);
+    expect(executed.stderr).toContain("workspace subject does not match the fenced expected subject");
+    const event = JSON.parse(readFileSync(outputPath, "utf8"));
+    expect(event.kind).toBe("stage_result");
+    expect(event.outcome).toBe("retryable_infrastructure_failure");
+    expect(event.attempt_id).toBe(input.request.attemptId);
+    expect(event.request_hash).toBe(input.request.requestHash);
+    const stageResult = event.artifacts.find((artifact) => artifact.kind === "stage_result");
+    expect(event.result_hash).toBe(stageResult.hash);
+    expect(event.artifacts.map((artifact) => artifact.kind)).toEqual(["stage_result", "command_result"]);
+    const payload = JSON.parse(stageResult.payload);
+    expect(payload.result).toBe("retryable_infrastructure_failure");
+    expect(payload.details.executor_failure).toBe(true);
+    expect(payload.details.stderr).toMatch(/fenced expected subject/);
+    expect(payload.repository.pre_subject).toBe(input.request.expectedSubject);
+    expect(payload.repository.post_subject).toBe(computeWorkspaceTreeOid(input.repoDir));
+    expect(event.subject).toBe(payload.repository.post_subject);
+  });
+
+  it("builds a semantic fallback result for agent stages that crash before evidence", () => {
+    const input = fixture();
+    const event = fallbackStageResultEvent({
+      request: input.request,
+      repoDir: input.repoDir,
+      error: new Error("agent process cleanup timed out"),
+    });
+    expect(event.kind).toBe("stage_result");
+    expect(event.outcome).toBe("retryable_infrastructure_failure");
+    expect(event.request_hash).toBe(input.request.requestHash);
+    const payload = JSON.parse(event.artifacts[0].payload);
+    expect(payload.summary).toMatch(/agent process cleanup timed out/);
+    expect(payload.repository.pre_subject).toBe(input.request.expectedSubject);
   });
 
   it("seals the exact pushed commit after publication reconciles its tree", () => {
