@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type Database from "better-sqlite3";
-import type { Config } from "./app/config.js";
-import { createSupervisorStore } from "./persistence/store.js";
-import { openDb } from "./persistence/database.js";
-import { createLinearClientProvider, createLinearOAuthStateStore } from "./linear-auth.js";
+import type { Config } from "../../app/config.js";
+import { createSupervisorStore } from "../../persistence/store.js";
+import { openDb } from "../../persistence/database.js";
+import { createLinearClientProvider, createLinearOAuthStateStore } from "./auth.js";
 
 let db: Database.Database | undefined;
 afterEach(() => {

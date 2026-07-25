@@ -2,46 +2,50 @@
 // coordinator. Every delegated session is pinned to an immutable manifest;
 // there is no direct task launcher fallback.
 
-import type { Config } from "./app/config.js";
-import type { Ticket, SupervisorStore } from "./persistence/store.js";
-import type { Agent, TaskType } from "./pipeline/types.js";
-import {
-  extractLabelNames,
-  fetchIssueLabels,
-  labelMatchNames,
-  parseLinearWebhook,
-  type LinearClient,
-} from "./linear.js";
-import {
-  branchExists,
-  getRepositoryConfigAtCommit,
-  getMergeReadiness,
-  mergePullRequest,
-  parsePullRequestUrl,
-  type GithubClient,
-} from "./github.js";
+import type { Config } from "./config.js";
+import type { Ticket, SupervisorStore } from "../persistence/store.js";
+import type { Agent, TaskType } from "../pipeline/types.js";
+import type {
+  ActivityPublicationPort,
+  LinearAgentSessionEvent,
+  LinearLabelPort,
+  MergePort,
+  RepositoryReadPort,
+  RepositoryConfigSnapshot,
+  ResolvedLinearLabel,
+} from "./ports.js";
 import {
   parseRepositoryConfig,
   resolvePipelineReference,
   type ValidatedPipelineCatalog,
-} from "./pipeline/manifest.js";
-import type { PipelineStore } from "./pipeline/store.js";
-import type { ValidatedRuntimeCapabilityDescriptor } from "./sandbox-runtime.js";
-import {
-  enqueueActivity,
-  tryPostError,
-  type LinearOutboxProcessor,
-} from "./linear-outbox.js";
-import { sanitizeText } from "./shared/sanitize.js";
-import { parseCommand } from "./app/commands.js";
-import { canSteerPipelineRun, requestPipelineStop } from "./pipeline/control.js";
-import type { AdmissionPreflight } from "./admission-preflight.js";
+} from "../pipeline/manifest.js";
+import type { PipelineStore } from "../pipeline/store.js";
+import type { ValidatedRuntimeCapabilityDescriptor } from "../sandbox-runtime.js";
+import { sanitizeText } from "../shared/sanitize.js";
+import { parseCommand } from "./commands.js";
+import { canSteerPipelineRun, requestPipelineStop } from "../pipeline/control.js";
+import type { AdmissionPreflight } from "../admission-preflight.js";
 
 function linearContext(
-  payload: ReturnType<typeof parseLinearWebhook>,
+  payload: LinearAgentSessionEvent,
   fallback: string
 ): string {
   return payload.promptContext?.trim() || fallback;
+}
+
+function extractLabelNames(payload: LinearAgentSessionEvent): string[] {
+  const labels = payload.agentSession.issue?.labels;
+  if (Array.isArray(labels)) return labels.map((label) => label.name);
+  return labels?.nodes?.map((label) => label.name) ?? [];
+}
+
+function labelMatchNames(labels: ResolvedLinearLabel[]): string[] {
+  const names: string[] = [];
+  for (const label of labels) {
+    names.push(label.name);
+    if (label.parentName) names.push(`${label.parentName} › ${label.name}`);
+  }
+  return names;
 }
 
 function branchFor(issueIdentifier: string): string {
@@ -99,21 +103,23 @@ function repositoryFor(
 export async function handleLinearEvent(
   cfg: Config,
   store: SupervisorStore,
-  getLinearClient: () => Promise<LinearClient | undefined>,
-  linearOutbox: LinearOutboxProcessor,
-  payload: ReturnType<typeof parseLinearWebhook>,
+  providers: SessionServicePorts,
+  payload: LinearAgentSessionEvent,
   coordinator: PipelineCoordinatorContext,
   preflight?: AdmissionPreflight
 ): Promise<void> {
-  const linear = await getLinearClient();
-  if (!linear) {
-    throw new Error("No valid Linear OAuth token is stored");
-  }
   if (payload.action === "created") {
-    await handleCreated(cfg, store, linear, linearOutbox, payload, coordinator, preflight);
+    await handleCreated(cfg, store, providers, payload, coordinator, preflight);
   } else {
-    await handlePrompted(cfg, store, linearOutbox, payload, coordinator);
+    await handlePrompted(cfg, store, providers, payload, coordinator);
   }
+}
+
+export interface SessionServicePorts {
+  activityPublisher: ActivityPublicationPort;
+  labelResolver: LinearLabelPort;
+  repositoryReader: RepositoryReadPort;
+  merger: MergePort;
 }
 
 export interface PipelineCoordinatorContext {
@@ -126,23 +132,22 @@ export interface PipelineCoordinatorContext {
 async function handleCreated(
   cfg: Config,
   store: SupervisorStore,
-  linear: LinearClient,
-  linearOutbox: LinearOutboxProcessor,
-  payload: ReturnType<typeof parseLinearWebhook>,
+  providers: SessionServicePorts,
+  payload: LinearAgentSessionEvent,
   coordinator: PipelineCoordinatorContext,
   preflight?: AdmissionPreflight
 ): Promise<void> {
   const issue = payload.agentSession.issue;
   const sessionId = payload.agentSession.id;
   if (!issue) {
-    await tryPostError(store, linearOutbox, sessionId, undefined, "OpenThrottle could not find an issue on this agent session.");
+    await providers.activityPublisher.publishError(sessionId, undefined, "OpenThrottle could not find an issue on this agent session.");
     return;
   }
   const initialContext = linearContext(
     payload,
     `# ${issue.identifier}\n\nNo Linear prompt context was supplied for this delegation.`
   );
-  await enqueueActivity(store, linearOutbox, {
+  await providers.activityPublisher.publishActivity({
     sessionId,
     type: "thought",
     body: "Spinning up a workspace…",
@@ -153,8 +158,7 @@ async function handleCreated(
   const existing = store.getByIssueId(issue.id);
   const existingSessionInstance = coordinator.store.getInstanceForSession(sessionId);
   if (existingSessionInstance) {
-    const pinned = existingSessionInstance;
-    if (!pinned || pinned.linear_issue_id !== issue.id) {
+    if (existingSessionInstance.linear_issue_id !== issue.id) {
       throw new Error(`pipeline session ${sessionId} has an invalid issue binding`);
     }
     store.setLinearContext(issue.id, initialContext);
@@ -181,8 +185,9 @@ async function handleCreated(
   // route default.
   if (!requestedBase) {
     try {
-      const resolved = await fetchIssueLabels(linear, issue.id);
-      requestedBase = baseBranchFromLabels(labelMatchNames(resolved));
+      const resolved = await providers.labelResolver.fetchIssueLabels(issue.id);
+      const resolvedMatchNames = labelMatchNames(resolved);
+      requestedBase = baseBranchFromLabels(resolvedMatchNames);
       const baseChildren = new Set(
         resolved
           .filter(
@@ -198,7 +203,7 @@ async function handleCreated(
       // mislabeled group (or an empty result) is visible in the supervisor logs.
       console.log(
         `[base-label] ${issue.identifier}: resolved=${JSON.stringify(
-          labelMatchNames(resolved)
+          resolvedMatchNames
         )} base=${requestedBase ?? "(route default)"}`
       );
     } catch (error) {
@@ -210,9 +215,7 @@ async function handleCreated(
   const selectedAgent = pickAgent(routingLabels, existing?.agent ?? cfg.defaultAgent);
   const selectedRepository = repositoryFor(store, issue);
   if (!selectedRepository) {
-    await tryPostError(
-      store,
-      linearOutbox,
+    await providers.activityPublisher.publishError(
       sessionId,
       issue.id,
       `No repository is registered for Linear team ${issue.team?.key ?? issue.team?.id ?? "unknown"}. Run \`openthrottle init\` in the target repository first.`
@@ -223,9 +226,7 @@ async function handleCreated(
   // surfaces as a clean Linear message instead of a clone failure in the sandbox.
   if (requestedBase) {
     if (!isSafeBranchName(requestedBase)) {
-      await tryPostError(
-        store,
-        linearOutbox,
+      await providers.activityPublisher.publishError(
         sessionId,
         issue.id,
         `The \`branch\` label value \`${requestedBase}\` is not a valid Git branch name.`
@@ -234,15 +235,12 @@ async function handleCreated(
     }
     let baseExists: boolean;
     try {
-      baseExists = await branchExists(
-        { token: cfg.githubToken },
+      baseExists = await providers.repositoryReader.branchExists(
         selectedRepository.repo,
         requestedBase
       );
     } catch (error) {
-      await tryPostError(
-        store,
-        linearOutbox,
+      await providers.activityPublisher.publishError(
         sessionId,
         issue.id,
         `OpenThrottle could not verify base branch \`${requestedBase}\` on ${selectedRepository.repo}: ${String(error)}`
@@ -250,9 +248,7 @@ async function handleCreated(
       return;
     }
     if (!baseExists) {
-      await tryPostError(
-        store,
-        linearOutbox,
+      await providers.activityPublisher.publishError(
         sessionId,
         issue.id,
         `Base branch \`${requestedBase}\` does not exist on ${selectedRepository.repo}.`
@@ -282,18 +278,17 @@ async function handleCreated(
       store.setState(issue.id, "error", message);
       store.setLinearContext(issue.id, initialContext);
     }
-    await tryPostError(store, linearOutbox, sessionId, issue.id, message);
+    await providers.activityPublisher.publishError(sessionId, issue.id, message);
   };
   const failSelection = (error: unknown) =>
     failAdmission(`Pipeline selection failed before sandbox provisioning: ${String(error)}`);
   let pinned: {
-    remote: Awaited<ReturnType<typeof getRepositoryConfigAtCommit>>;
+    remote: RepositoryConfigSnapshot;
     manifest: ReturnType<typeof resolvePipelineReference>;
     snapshot: ReturnType<PipelineStore["saveRepositoryConfigSnapshot"]>;
   };
   try {
-    const remote = await getRepositoryConfigAtCommit(
-      { token: cfg.githubToken },
+    const remote = await providers.repositoryReader.getRepositoryConfigAtCommit(
       selectedRepository.repo,
       selectedRepository.baseBranch
     );
@@ -353,7 +348,7 @@ async function handleCreated(
     return;
   }
   store.setLinearContext(issue.id, initialContext);
-  await enqueueActivity(store, linearOutbox, {
+  await providers.activityPublisher.publishActivity({
     sessionId,
     type: "thought",
     body: `Pinned pipeline ${pinned.manifest.manifest.id}@${pinned.manifest.manifest.version} (${pinned.manifest.digest.slice(0, 12)}) at base ${pinned.remote.baseCommit.slice(0, 12)}. The durable coordinator will dispatch its first stage.`,
@@ -364,8 +359,8 @@ async function handleCreated(
 async function handlePrompted(
   cfg: Config,
   store: SupervisorStore,
-  linearOutbox: LinearOutboxProcessor,
-  payload: ReturnType<typeof parseLinearWebhook>,
+  providers: SessionServicePorts,
+  payload: LinearAgentSessionEvent,
   coordinator: PipelineCoordinatorContext
 ): Promise<void> {
   const sessionId = payload.agentSession.id;
@@ -376,9 +371,7 @@ async function handlePrompted(
     ? store.getByIssueId(issue.id)
     : store.listAll().find((candidate) => candidate.linear_session_id === sessionId);
   if (!ticket) {
-    await tryPostError(
-      store,
-      linearOutbox,
+    await providers.activityPublisher.publishError(
       sessionId,
       issue?.id,
       "OpenThrottle couldn't find an existing workspace. Delegate the issue again to start one."
@@ -394,9 +387,7 @@ async function handlePrompted(
   const isStop = payload.agentActivity?.signal?.toLowerCase() === "stop" || command.kind === "stop";
   if (isStop) {
     if (!pipelineInstance) {
-      await tryPostError(
-        store,
-        linearOutbox,
+      await providers.activityPublisher.publishError(
         sessionId,
         ticket.linear_issue_id,
         "OpenThrottle couldn't find a pipeline for this session. Delegate the issue again to start one."
@@ -414,7 +405,7 @@ async function handlePrompted(
   }
 
   if (command.kind === "merge") {
-    await mergeFromLinear(cfg, store, linearOutbox, ticket);
+    await mergeFromLinear(cfg, providers, ticket);
     return;
   }
 
@@ -438,7 +429,7 @@ async function handlePrompted(
       source: "human",
       body: sanitizeText(promptBody),
     });
-    await enqueueActivity(store, linearOutbox, {
+    await providers.activityPublisher.publishActivity({
       sessionId,
       type: "thought",
       body: "Steering the current pipeline stage with your message…",
@@ -447,18 +438,14 @@ async function handlePrompted(
     return;
   }
   if (!pipelineInstance) {
-    await tryPostError(
-      store,
-      linearOutbox,
+    await providers.activityPublisher.publishError(
       sessionId,
       ticket.linear_issue_id,
       "OpenThrottle couldn't find a pipeline for this session. Delegate the issue again to start one."
     );
     return;
   }
-  await tryPostError(
-    store,
-    linearOutbox,
+  await providers.activityPublisher.publishError(
     sessionId,
     ticket.linear_issue_id,
     "The current pipeline stage does not accept live steering. Add feedback to the pull request, or re-delegate the issue to create a new generation."
@@ -467,12 +454,11 @@ async function handlePrompted(
 
 async function mergeFromLinear(
   cfg: Config,
-  store: SupervisorStore,
-  linearOutbox: LinearOutboxProcessor,
+  providers: SessionServicePorts,
   ticket: Ticket
 ): Promise<void> {
   if (!cfg.allowLinearMerge) {
-    await enqueueActivity(store, linearOutbox, {
+    await providers.activityPublisher.publishActivity({
       sessionId: ticket.linear_session_id,
       type: "error",
       body: "Linear merge is disabled. Merge from GitHub, or set ALLOW_LINEAR_MERGE=true.",
@@ -480,22 +466,21 @@ async function mergeFromLinear(
     return;
   }
   if (!ticket.pr_url) {
-    await tryPostError(store, linearOutbox, ticket.linear_session_id, ticket.linear_issue_id, "This ticket has no pull request to merge.");
+    await providers.activityPublisher.publishError(ticket.linear_session_id, ticket.linear_issue_id, "This ticket has no pull request to merge.");
     return;
   }
-  const pull = parsePullRequestUrl(ticket.pr_url);
-  const github: GithubClient = { token: cfg.githubToken };
-  const readiness = await getMergeReadiness(github, pull.repo, pull.number);
+  const pull = providers.merger.parsePullRequestUrl(ticket.pr_url);
+  const readiness = await providers.merger.getMergeReadiness(pull.repo, pull.number);
   if (readiness.draft || !readiness.mergeable || !readiness.checksPresent || !readiness.checksGreen) {
-    await enqueueActivity(store, linearOutbox, {
+    await providers.activityPublisher.publishActivity({
       sessionId: ticket.linear_session_id,
       type: "error",
       body: "The PR is not merge-ready: it must be non-draft, mergeable, and have terminal green checks.",
     }, ticket.linear_issue_id);
     return;
   }
-  const result = await mergePullRequest(github, pull.repo, pull.number, readiness.headSha);
-  await enqueueActivity(store, linearOutbox, {
+  const result = await providers.merger.mergePullRequest(pull.repo, pull.number, readiness.headSha);
+  await providers.activityPublisher.publishActivity({
     sessionId: ticket.linear_session_id,
     type: result.merged ? "response" : "error",
     body: result.merged ? `Merged ${ticket.pr_url}.` : `GitHub did not merge the PR: ${result.message}`,

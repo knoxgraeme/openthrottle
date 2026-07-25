@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSupervisorStore, type SupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
-import { createLinearOutboxProcessor } from "../linear-outbox.js";
+import { createLinearOutboxProcessor } from "../providers/linear/outbox.js";
 import {
   canonicalJson,
   digestNormalized,

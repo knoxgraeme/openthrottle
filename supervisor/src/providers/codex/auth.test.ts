@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type Database from "better-sqlite3";
-import type { Config } from "./app/config.js";
-import { createSupervisorStore, type SupervisorStore } from "./persistence/store.js";
-import { openDb } from "./persistence/database.js";
+import type { Config } from "../../app/config.js";
+import { createSupervisorStore, type SupervisorStore } from "../../persistence/store.js";
+import { openDb } from "../../persistence/database.js";
 import {
   SETTINGS_CODEX_AUTH_JSON,
   captureCodexAuthJson,
@@ -10,7 +10,7 @@ import {
   getCodexAuthForSeed,
   refreshCodexAuthJson,
   resolveStoredCodexAuthJson,
-} from "./codex-auth.js";
+} from "./auth.js";
 
 function cfgWith(codexAuthJson: string | undefined): Config {
   return { codexAuthJson } as unknown as Config;

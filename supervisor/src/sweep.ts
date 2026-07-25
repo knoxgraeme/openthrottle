@@ -2,7 +2,7 @@ import type { Daytona } from "@daytona/sdk";
 import type { Config } from "./app/config.js";
 import type { SupervisorStore } from "./persistence/store.js";
 import { listLabeledSandboxes } from "./daytona.js";
-import type { LinearOutboxProcessor } from "./linear-outbox.js";
+import type { LinearOutboxProcessor } from "./providers/linear/outbox.js";
 import type { PipelineStore } from "./pipeline/store.js";
 import { reapExpiredRuns } from "./reaper.js";
 

@@ -10,7 +10,7 @@ import {
   parseRepositoryConfig,
 } from "../../pipeline/manifest.js";
 import { coordinatePipelineEvent, type PipelineCoordinatorEvent } from "../../pipeline/coordinator.js";
-import { createGithubPublicationProcessor } from "./publication-delivery.js";
+import { createGithubPublicationProcessor } from "./pipeline-publication.js";
 import { createPipelineStore } from "../../persistence/pipeline/create-store.js";
 import type {
   CoordinatorGateReceiptWrite,

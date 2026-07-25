@@ -8,11 +8,20 @@ import {
   type AdmissionPreflight,
 } from "./admission-preflight.js";
 import type { Config } from "./app/config.js";
+import type { ActivityPublicationInput } from "./app/ports.js";
 import { createSupervisorStore } from "./persistence/store.js";
 import { openDb } from "./persistence/database.js";
-import { handleLinearEvent } from "./linear-events.js";
-import type { LinearClient } from "./linear.js";
-import { parseLinearWebhook } from "./linear.js";
+import { handleLinearEvent } from "./app/session-service.js";
+import type { LinearClient } from "./providers/linear/client.js";
+import { fetchIssueLabels, parseLinearWebhook } from "./providers/linear/events.js";
+import {
+  branchExists,
+  getMergeReadiness,
+  getRepositoryConfigAtCommit,
+  mergePullRequest,
+  parsePullRequestUrl,
+} from "./providers/github/client.js";
+import { enqueueActivity, tryPostError } from "./providers/linear/outbox.js";
 import { loadPipelineCatalog } from "./pipeline/manifest.js";
 import { createPipelineStore } from "./persistence/pipeline/create-store.js";
 import { buildInstalledRuntimeDescriptor } from "./sandbox-runtime.js";
@@ -246,11 +255,34 @@ describe("admission preflight wired into Linear admission", () => {
       process: vi.fn(async () => undefined),
       drain: vi.fn(async () => undefined),
     };
+    const providers = {
+      activityPublisher: {
+        publishActivity: (activity: ActivityPublicationInput, issueId?: string, runId?: string) =>
+          enqueueActivity(tickets, outbox, activity, issueId, runId),
+        publishError: (sessionId: string | undefined, issueId: string | undefined, message: string) =>
+          tryPostError(tickets, outbox, sessionId, issueId, message),
+      },
+      labelResolver: {
+        fetchIssueLabels: (issueId: string) => fetchIssueLabels(linear, issueId),
+      },
+      repositoryReader: {
+        branchExists: (repository: string, branch: string) =>
+          branchExists({ token: "github-token" }, repository, branch),
+        getRepositoryConfigAtCommit: (repository: string, branch: string) =>
+          getRepositoryConfigAtCommit({ token: "github-token" }, repository, branch),
+      },
+      merger: {
+        parsePullRequestUrl,
+        getMergeReadiness: (repo: string, pullNumber: number) =>
+          getMergeReadiness({ token: "github-token" }, repo, pullNumber),
+        mergePullRequest: (repo: string, pullNumber: number, expectedHeadSha: string) =>
+          mergePullRequest({ token: "github-token" }, repo, pullNumber, expectedHeadSha),
+      },
+    };
     await handleLinearEvent(
       config(),
       tickets,
-      async () => linear,
-      outbox,
+      providers,
       payload(),
       { catalog, runtime, store: pipelines },
       options.preflight

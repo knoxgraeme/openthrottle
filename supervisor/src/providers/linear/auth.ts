@@ -1,10 +1,10 @@
-import type { Config } from "./app/config.js";
-import type { SupervisorStore } from "./persistence/store.js";
+import type { Config } from "../../app/config.js";
+import type { SupervisorStore } from "../../persistence/store.js";
 import {
   refreshLinearOAuthToken,
   type LinearClient,
   type LinearOAuthTokenResponse,
-} from "./linear.js";
+} from "./client.js";
 
 const SETTINGS_LINEAR_ACCESS_TOKEN = "linear_access_token";
 const SETTINGS_LINEAR_REFRESH_TOKEN = "linear_refresh_token";

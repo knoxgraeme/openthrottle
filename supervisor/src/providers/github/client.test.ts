@@ -1,8 +1,8 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
-import { createSupervisorStore } from "./persistence/store.js";
-import { openDb } from "./persistence/database.js";
-import { considerCiGithubHead } from "./github-events.js";
+import { createSupervisorStore } from "../../persistence/store.js";
+import { openDb } from "../../persistence/database.js";
+import { considerCiGithubHead } from "./events.js";
 import {
   branchExists,
   getRepositoryConfigAtCommit,
@@ -14,7 +14,7 @@ import {
   prepareRepository,
   upsertPullRequestComment,
   verifyGithubSignature,
-} from "./github.js";
+} from "./client.js";
 
 describe("GitHub contracts", () => {
   it("advances CI head watermarks across workflow-run and check-suite sources", () => {

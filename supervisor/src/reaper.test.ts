@@ -5,7 +5,7 @@ import type { Config } from "./app/config.js";
 import type { SupervisorStore } from "./persistence/store.js";
 import { createSupervisorStore } from "./persistence/store.js";
 import { openDb } from "./persistence/database.js";
-import { createLinearOutboxProcessor } from "./linear-outbox.js";
+import { createLinearOutboxProcessor } from "./providers/linear/outbox.js";
 import { reapStalledRuns } from "./reaper.js";
 import type { PipelineStore } from "./pipeline/store.js";
 

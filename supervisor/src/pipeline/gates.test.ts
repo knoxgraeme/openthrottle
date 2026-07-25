@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSupervisorStore, type SupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
 import { drainDeferredProviderEvidence, evaluateStageGate, processStageEvidence, settleStageEvidence } from "./gates.js";
@@ -18,7 +18,7 @@ import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import type { PipelineInstance, PipelineStageAttempt, PipelineStore } from "./store.js";
 import { buildInstalledRuntimeDescriptor } from "../sandbox-runtime.js";
 import { processPipelineInfrastructureFailure } from "./control.js";
-import { drainPipelineFeedbackSnapshots, handleGithubEvent, routePipelineProviderEvent } from "../github-events.js";
+import { drainPipelineFeedbackSnapshots, handleGithubEvent, routePipelineProviderEvent } from "../providers/github/events.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
 const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
@@ -573,6 +573,77 @@ describe("deterministic supervisor stage gates", () => {
       status: "completion_pending_publication",
       terminal_outcome: terminalOutcome,
     });
+  });
+
+  it("publishes Linear activity for GitHub review and CI completion events through the injected port", async () => {
+    const fixture = setup("ce/implement@2");
+    const publishActivity = vi.fn(async () => undefined);
+    const activityPublisher = {
+      publishActivity,
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "pull_request_review",
+        action: "submitted",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 1,
+          html_url: "https://github.com/owner/repo/pull/1",
+          merged: false,
+          head: { ref: "ot/issue-1", sha: SUBJECT },
+          base: { ref: "main" },
+        },
+        review: {
+          id: 10,
+          state: "approved",
+          html_url: "https://github.com/owner/repo/pull/1#pullrequestreview-10",
+          user: { login: "reviewer" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "workflow_run",
+        action: "completed",
+        repository: { full_name: "owner/repo" },
+        workflow_run: {
+          id: 20,
+          name: "CI",
+          status: "completed",
+          conclusion: "success",
+          head_branch: "ot/issue-1",
+          head_sha: SUBJECT,
+          html_url: "https://github.com/owner/repo/actions/runs/20",
+        },
+      },
+      fixture.pipelines
+    );
+
+    expect(publishActivity).toHaveBeenNthCalledWith(1, {
+      sessionId: "session-1",
+      type: "action",
+      action: "PR review submitted",
+      parameter: "reviewer: approved",
+      result: "https://github.com/owner/repo/pull/1#pullrequestreview-10",
+    }, "issue-1");
+    expect(publishActivity).toHaveBeenNthCalledWith(2, {
+      sessionId: "session-1",
+      type: "action",
+      action: "CI completed",
+      parameter: "success",
+      result: "https://github.com/owner/repo/actions/runs/20",
+    }, "issue-1");
   });
 
   it("fails closed when GitHub's current head differs from the executor-verified commit", () => {

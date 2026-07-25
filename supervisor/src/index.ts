@@ -5,20 +5,20 @@ import { openDb } from "./persistence/database.js";
 import { listen } from "./http/listener.js";
 import { createServer, createServerWebhookDeliveryProcessor } from "./http/server.js";
 import { runSweep } from "./sweep.js";
-import { createLinearClientProvider } from "./linear-auth.js";
-import { captureCodexAuthJson, getCodexAuthForSeed } from "./codex-auth.js";
+import { createLinearClientProvider } from "./providers/linear/auth.js";
+import { captureCodexAuthJson, getCodexAuthForSeed } from "./providers/codex/auth.js";
 import { pollSandboxEvents } from "./sandbox-events.js";
 import { deliverPendingInbox } from "./inbox.js";
 import { reapStalledRuns } from "./reaper.js";
-import { activityPayload, createLinearOutboxProcessor, enqueueSessionUpdate } from "./linear-outbox.js";
+import { activityPayload, createLinearOutboxProcessor, enqueueSessionUpdate } from "./providers/linear/outbox.js";
 import { loadPipelineCatalog } from "./pipeline/manifest.js";
 import { createPipelineStore } from "./persistence/pipeline/create-store.js";
 import { loadRuntimeCapabilityDescriptor } from "./sandbox-runtime.js";
 import { drainDeferredProviderEvidence, settleStageEvidence } from "./pipeline/gates.js";
-import { createGithubPublicationProcessor } from "./providers/github/publication-delivery.js";
+import { createGithubPublicationProcessor } from "./providers/github/pipeline-publication.js";
 import { createDaytonaSandboxRuntime } from "./daytona.js";
 import { createPipelineEffectProcessor } from "./operations/pipeline-effects.js";
-import { drainPipelineFeedbackSnapshots } from "./github-events.js";
+import { drainPipelineFeedbackSnapshots } from "./providers/github/events.js";
 
 const SWEEP_INTERVAL_MS = 15 * 60 * 1000; // run every 15 min while awake; SPEC only requires "on every boot" + periodic while awake
 const DELIVERY_DRAIN_INTERVAL_MS = 30 * 1000;
