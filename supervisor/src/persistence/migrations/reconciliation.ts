@@ -58,6 +58,38 @@ export function backfillRunLiveness(db: Database.Database): void {
   `).run();
 }
 
+export function backfillPipelineAttemptActors(db: Database.Database): void {
+  if (
+    !hasColumns(db, "pipeline_stage_attempts", ["id", "run_id", "planned_run_id", "created_at", "updated_at"]) ||
+    !hasColumns(db, "runs", ["id", "status", "started_at"])
+  ) return;
+  const timestamp = new Date().toISOString();
+  db.prepare(`
+    INSERT OR IGNORE INTO pipeline_attempt_actors (
+      attempt_id, run_id, actor_state, last_heartbeat_at, settlement_owner,
+      settlement_reason, termination_confirmed_at, quarantine_reason, created_at, updated_at
+    )
+    SELECT
+      psa.id,
+      r.id,
+      CASE
+        WHEN l.actor_state IN ('running', 'reaping', 'quarantined', 'settled') THEN l.actor_state
+        WHEN r.status IN ('running', 'reaping', 'quarantined') THEN r.status
+        ELSE 'settled'
+      END,
+      l.last_heartbeat_at,
+      l.settlement_owner,
+      l.settlement_reason,
+      l.termination_confirmed_at,
+      l.quarantine_reason,
+      COALESCE(r.started_at, psa.created_at, ?),
+      COALESCE(l.updated_at, r.started_at, psa.updated_at, ?)
+    FROM pipeline_stage_attempts psa
+    JOIN runs r ON r.id = COALESCE(psa.run_id, psa.planned_run_id)
+    LEFT JOIN run_liveness l ON l.run_id = r.id
+  `).run(timestamp, timestamp);
+}
+
 export function backfillLegacyWork(db: Database.Database): void {
   if (!hasTable(db, "session_work")) return;
   const timestamp = new Date().toISOString();

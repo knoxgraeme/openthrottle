@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSupervisorStore, type SupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
-import { drainDeferredProviderEvidence, evaluateStageGate, processStageEvidence, settleStageEvidence } from "./gates.js";
+import { drainDeferredProviderEvidence, evaluateStageGate, processStageEvidence } from "./gates.js";
 import {
   canonicalJson,
   digestNormalized,
@@ -13,7 +13,7 @@ import {
   type PipelineStage,
   type StageOutcome,
 } from "./manifest.js";
-import type { PipelineCoordinatorEvent, PipelineEventArtifact } from "./coordinator.js";
+import { coordinatePipelineEvent, type PipelineCoordinatorEvent, type PipelineEventArtifact } from "./coordinator.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import type { PipelineInstance, PipelineStageAttempt, PipelineStore } from "./store.js";
 import { buildInstalledRuntimeDescriptor } from "../runtime/contracts.js";
@@ -24,6 +24,25 @@ const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yam
 const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
 const runtime = buildInstalledRuntimeDescriptor("gate-test/v1");
 const SUBJECT = "c".repeat(40);
+
+function completeStageAttemptActor(
+  store: PipelineStore,
+  tickets: SupervisorStore,
+  event: PipelineCoordinatorEvent,
+  options: { observedSubject?: string; faultAfterWrite?: (writeCount: number) => void } = {}
+): PipelineInstance {
+  const evaluated = evaluateStageGate(store, event, options);
+  if (!event.runId) throw new Error(`pipeline stage event ${event.id} has no run binding`);
+  return tickets.finishRunAndThen(
+    {
+      runId: event.runId,
+      status: "completed",
+      exitCode: 0,
+      ticketState: "active",
+    },
+    () => coordinatePipelineEvent(store, evaluated.event, options.faultAfterWrite, evaluated.receipt)
+  );
+}
 
 interface Fixture {
   db: Database.Database;
@@ -292,7 +311,7 @@ describe("deterministic supervisor stage gates", () => {
   it("settles the actor and pipeline transition in one replayable transaction", () => {
     const fixture = setup();
     const input = event(fixture);
-    expect(() => settleStageEvidence(fixture.pipelines, fixture.tickets, input, {
+    expect(() => completeStageAttemptActor(fixture.pipelines, fixture.tickets, input, {
       observedSubject: SUBJECT,
       faultAfterWrite: (count) => {
         if (count === 3) throw new Error("fault after run settlement");
@@ -302,7 +321,7 @@ describe("deterministic supervisor stage gates", () => {
     expect(fixture.tickets.getByIssueId("issue-1")?.run_id).toBe(input.runId);
     expect(fixture.pipelines.getInstance(fixture.instance.id)?.state_version).toBe(0);
 
-    const completed = settleStageEvidence(
+    const completed = completeStageAttemptActor(
       fixture.pipelines,
       fixture.tickets,
       input,
@@ -323,7 +342,7 @@ describe("deterministic supervisor stage gates", () => {
       }],
     });
 
-    const transitioned = settleStageEvidence(
+    const transitioned = completeStageAttemptActor(
       fixture.pipelines,
       fixture.tickets,
       input,

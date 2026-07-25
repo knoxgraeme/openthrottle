@@ -391,7 +391,7 @@ describe("pipeline effect processor", () => {
     );
     expect(tickets.getRun(runId)).toMatchObject({ status: "stopped" });
     expect(db!.prepare(
-      "SELECT actor_state FROM run_liveness WHERE run_id = ?"
+      "SELECT actor_state FROM pipeline_attempt_actors WHERE run_id = ?"
     ).pluck().get(runId)).toBe("settled");
     expect(tickets.getByIssueId("issue-superseded")).toMatchObject({
       linear_session_id: "session-replacement",
@@ -511,7 +511,7 @@ describe("pipeline effect processor", () => {
     expect(runtime.stop).toHaveBeenCalledOnce();
     expect(tickets.getRun(runId)).toMatchObject({ status: "stopped" });
     expect(db!.prepare(
-      "SELECT actor_state FROM run_liveness WHERE run_id = ?"
+      "SELECT actor_state FROM pipeline_attempt_actors WHERE run_id = ?"
     ).pluck().get(runId)).toBe("settled");
     expect(tickets.getByIssueId("issue-legacy-superseded")).toMatchObject({
       linear_session_id: "session-legacy-replacement",
