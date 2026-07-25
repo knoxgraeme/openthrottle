@@ -15,7 +15,7 @@ import { loadPipelineCatalog } from "./pipeline/manifest.js";
 import { createPipelineStore } from "./persistence/pipeline/create-store.js";
 import { loadRuntimeCapabilityDescriptor } from "./sandbox-runtime.js";
 import { drainDeferredProviderEvidence, settleStageEvidence } from "./pipeline/gates.js";
-import { createGithubPublicationProcessor } from "./pipeline/publication.js";
+import { createGithubPublicationProcessor } from "./providers/github/publication-delivery.js";
 import { createDaytonaSandboxRuntime } from "./daytona.js";
 import { createPipelineEffectProcessor } from "./operations/pipeline-effects.js";
 import { drainPipelineFeedbackSnapshots } from "./github-events.js";

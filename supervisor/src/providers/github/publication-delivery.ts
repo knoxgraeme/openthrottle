@@ -1,0 +1,132 @@
+import type { GithubClient } from "../../github.js";
+import { parsePullRequestUrl, upsertPullRequestComment } from "../../github.js";
+import {
+  parsePipelinePublication,
+  renderGithubPipelineSummary,
+} from "../../pipeline/publication.js";
+import type { PipelinePublicationReceipt, PipelineStore } from "../../pipeline/store.js";
+import { sanitizeText } from "../../shared/sanitize.js";
+
+export interface GithubPublicationProcessor {
+  process(id: string): Promise<void>;
+  drain(limit?: number): Promise<void>;
+}
+
+interface GithubPublicationTicketStore {
+  getByIssueId(issueId: string): { linear_session_id: string; pr_url: string | null } | undefined;
+}
+
+function githubRetry(error: unknown): { retry: boolean; message: string } {
+  const message = sanitizeText(String(error)).slice(-2_000);
+  return {
+    retry: !/unauthorized|forbidden|invalid|API error \((?:400|401|403|404|422)\)/i.test(message),
+    message,
+  };
+}
+
+function publicationRetryDelay(attempts: number): number {
+  return Math.min(5 * 60_000, 2 ** Math.max(0, attempts - 1) * 5_000);
+}
+
+export function createGithubPublicationProcessor(params: {
+  store: PipelineStore;
+  tickets: GithubPublicationTicketStore;
+  client: GithubClient;
+  leaseMs?: number;
+}): GithubPublicationProcessor {
+  const leaseMs = params.leaseMs ?? 30_000;
+
+  async function deliver(publication: PipelinePublicationReceipt): Promise<void> {
+    const instance = params.store.getInstance(publication.pipeline_instance_id);
+    if (!instance) throw new Error(`unknown pipeline instance ${publication.pipeline_instance_id}`);
+    let bound = publication;
+    if (!bound.target_url) {
+      const ticket = params.tickets.getByIssueId(instance.linear_issue_id);
+      if (!ticket?.pr_url) {
+        const terminal = instance.terminal_outcome != null || [
+          "shipped", "no_change", "needs_human", "canceled", "superseded", "failed",
+        ].includes(instance.status);
+        if (terminal) {
+          if (!params.store.markGithubPublicationSkipped(publication.id, publication.payload_hash)) {
+            throw new Error("terminal pipeline publication changed before it could be skipped");
+          }
+          return;
+        }
+        throw new Error("pipeline pull request is not available yet");
+      }
+      if (ticket.linear_session_id !== instance.linear_session_id) {
+        throw new Error("pipeline publication no longer has its original session binding");
+      }
+      const persisted = params.store.bindGithubPublicationTarget(
+        publication.id,
+        publication.payload_hash,
+        ticket.pr_url
+      );
+      if (!persisted) throw new Error("pipeline publication target binding is stale");
+      bound = persisted;
+    }
+    const current = params.store.getPublication(publication.id);
+    if (!current || current.pipeline_instance_id !== publication.pipeline_instance_id ||
+        current.payload_hash !== publication.payload_hash || current.status !== "processing" ||
+        current.target_url !== bound.target_url) {
+      throw new Error("pipeline publication changed before delivery");
+    }
+    const pull = parsePullRequestUrl(bound.target_url!);
+    if (pull.host !== "github.com" || pull.repo.toLowerCase() !== instance.repository.toLowerCase()) {
+      throw new Error("invalid pipeline pull request binding for the pinned instance");
+    }
+    const envelope = parsePipelinePublication(publication.payload);
+    const result = await upsertPullRequestComment(
+      params.client,
+      instance.repository,
+      pull.number,
+      instance.linear_issue_id,
+      renderGithubPipelineSummary(envelope)
+    );
+    params.store.markGithubPublicationProcessed(
+      publication.id,
+      publication.payload_hash,
+      String(result.id),
+      result.html_url
+    );
+  }
+
+  async function processRows(rows: PipelinePublicationReceipt[]): Promise<void> {
+    for (const publication of rows) {
+      try {
+        await deliver(publication);
+      } catch (error) {
+        const classified = githubRetry(error);
+        params.store.markGithubPublicationFailed(
+          publication.id,
+          publication.payload_hash,
+          classified.message,
+          classified.retry
+            ? new Date(Date.now() + publicationRetryDelay(publication.attempts)).toISOString()
+            : null
+        );
+      }
+    }
+  }
+
+  return {
+    async process(id) {
+      const now = new Date();
+      const rows = params.store.claimGithubPublications(
+        now.toISOString(),
+        new Date(now.getTime() + leaseMs).toISOString(),
+        50
+      );
+      if (!rows.some((row) => row.id === id)) return;
+      await processRows(rows);
+    },
+    async drain(limit = 50) {
+      const now = new Date();
+      await processRows(params.store.claimGithubPublications(
+        now.toISOString(),
+        new Date(now.getTime() + leaseMs).toISOString(),
+        limit
+      ));
+    },
+  };
+}
