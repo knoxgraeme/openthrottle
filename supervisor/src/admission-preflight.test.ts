@@ -23,7 +23,7 @@ import {
 import { enqueueActivity, tryPostError } from "./providers/linear/outbox.js";
 import { loadPipelineCatalog } from "./pipeline/manifest.js";
 import { createPipelineStore } from "./persistence/pipeline/create-store.js";
-import { buildInstalledRuntimeDescriptor, type RuntimeInventory } from "./runtime/contracts.js";
+import { buildInstalledRuntimeDescriptor } from "./runtime/contracts.js";
 
 const shippedCatalogPath = fileURLToPath(new URL("../pipelines/catalog.yaml", import.meta.url));
 
@@ -289,10 +289,10 @@ describe("admission preflight wired into Linear admission", () => {
     return { tickets, pipelines, githubFetch };
   }
 
-  const cfgPreflight = (runtime: RuntimeInventory) => createAdmissionPreflight(config(), runtime);
+  const cfgPreflight = (runtime: Parameters<typeof createAdmissionPreflight>[1]) =>
+    createAdmissionPreflight(config(), runtime);
   const emptyDaytona = {
     listLabeledResources: async () => [],
-    deleteResource: vi.fn(async () => undefined),
   };
 
   it("rejects admission before any pipeline instance when the read token 403s", async () => {

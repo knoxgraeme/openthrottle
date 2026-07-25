@@ -3,7 +3,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
 import { createSupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
-import { parseSandboxEvent, pollSandboxEvents } from "./event-poller.js";
+import { parseSandboxEvent } from "./events.js";
+import { pollSandboxEvents } from "./event-poller.js";
 
 let db: Database.Database | undefined;
 afterEach(() => db?.close());
@@ -268,7 +269,10 @@ describe("sandbox event contracts", () => {
       },
     } ;
     const postStageResult = vi.fn(async () => undefined);
-    const captureAgentAuth = vi.fn(async () => undefined);
+    const captureAgentAuth = vi.fn(async () => {
+      throw new Error("Bearer private-stage-token");
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
     await pollSandboxEvents({
       runtime: { getWorkspace: vi.fn(async () => sandbox), setActive: vi.fn(async () => undefined), setIdle: vi.fn(async () => undefined) } ,
@@ -286,10 +290,16 @@ describe("sandbox event contracts", () => {
       sandbox,
       expect.objectContaining({ linear_issue_id: "issue-1" })
     );
+    expect(warn).toHaveBeenCalledWith(
+      "[sandbox-events] agent auth capture failed:",
+      expect.stringContaining("[REDACTED]")
+    );
+    expect(warn.mock.calls.flat().join(" ")).not.toContain("private-stage-token");
     const stored = store.getSandboxEvent("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")!;
     expect(stored.status).toBe("processed");
     expect(stored.payload).not.toContain("private-stage-token");
     expect(files.size).toBe(0);
+    warn.mockRestore();
   });
 
   it("deletes an agent-writable outbox event that impersonates a stage result", async () => {

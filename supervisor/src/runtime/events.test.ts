@@ -1,0 +1,90 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it } from "vitest";
+import { parseSandboxEvent, toProgressActivity } from "./events.js";
+
+describe("runtime event contracts", () => {
+  it("parses bounded runtime events without leaking provider dependencies", () => {
+    const event = parseSandboxEvent(JSON.stringify({
+      version: 1,
+      kind: "activity",
+      event_id: "11111111-1111-4111-8111-111111111111",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:00.000Z",
+      type: "action",
+      body: "running",
+      action: "Run",
+      parameter: "npm test",
+      result: "passed",
+      ephemeral: true,
+      ignored_provider_field: "@daytona/sdk",
+    }));
+
+    expect(event).toMatchObject({
+      kind: "activity",
+      type: "action",
+      body: "running",
+      action: "Run",
+      parameter: "npm test",
+      result: "passed",
+      ephemeral: true,
+    });
+    expect(event).not.toHaveProperty("ignored_provider_field");
+    if (event.kind !== "activity") throw new Error("expected activity event");
+    expect(toProgressActivity(event, "session-1")).toEqual({
+      sessionId: "session-1",
+      type: "action",
+      action: "Run",
+      parameter: "npm test",
+      result: "passed",
+      ephemeral: true,
+    });
+
+    const source = readFileSync(fileURLToPath(new URL("./events.ts", import.meta.url)), "utf8");
+    expect(source).not.toContain("@daytona/sdk");
+  });
+
+  it("rejects invalid heartbeat, plan, and stage-result envelopes", () => {
+    expect(() => parseSandboxEvent(JSON.stringify({
+      version: 1,
+      kind: "heartbeat",
+      event_id: "../bad",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:00.000Z",
+    }))).toThrow(/event_id/);
+
+    expect(() => parseSandboxEvent(JSON.stringify({
+      version: 1,
+      kind: "plan",
+      event_id: "22222222-2222-4222-8222-222222222222",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:00.000Z",
+      plan: [{ content: "", status: "completed" }],
+    }))).toThrow(/plan/);
+
+    expect(() => parseSandboxEvent(JSON.stringify({
+      version: 1,
+      kind: "stage_result",
+      event_id: "33333333-3333-4333-8333-333333333333",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:00.000Z",
+      pipeline_instance_id: "pipeline-1",
+      generation: 1,
+      stage_id: "implementation",
+      attempt_id: "attempt-1",
+      request_hash: "x",
+      outcome: "success",
+      result_hash: "2".repeat(64),
+      native_session_id: null,
+      subject: "c".repeat(40),
+      artifacts: [{
+        kind: "stage_result",
+        schema_version: 1,
+        assurance: "semantic_attested",
+        subject: "c".repeat(40),
+        payload: "{}",
+        hash: "2".repeat(64),
+      }],
+    }))).toThrow(/request_hash/);
+  });
+});

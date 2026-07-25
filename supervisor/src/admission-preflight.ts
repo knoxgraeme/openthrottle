@@ -41,6 +41,8 @@ export interface AdmissionPreflightDeps {
   sandboxMemoryGib?: number;
 }
 
+type RuntimeInventoryReader = Pick<RuntimeInventory, "listLabeledResources">;
+
 export async function runAdmissionPreflight(
   deps: AdmissionPreflightDeps,
   target: AdmissionPreflightTarget
@@ -51,7 +53,7 @@ export async function runAdmissionPreflight(
 }
 
 /** Bind the preflight to supervisor config and the live runtime inventory. */
-export function createAdmissionPreflight(cfg: Config, runtime: RuntimeInventory): AdmissionPreflight {
+export function createAdmissionPreflight(cfg: Config, runtime: RuntimeInventoryReader): AdmissionPreflight {
   return (target) =>
     runAdmissionPreflight(
       {
