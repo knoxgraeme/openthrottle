@@ -13,7 +13,8 @@ import {
   type PipelineStage,
   type StageOutcome,
 } from "./manifest.js";
-import { coordinatePipelineEvent, type PipelineCoordinatorEvent, type PipelineEventArtifact } from "./coordinator.js";
+import type { PipelineCoordinatorEvent, PipelineEventArtifact } from "./coordinator.js";
+import { completeStageAttemptActor } from "./settlement.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import type { PipelineInstance, PipelineStageAttempt, PipelineStore } from "./store.js";
 import { buildInstalledRuntimeDescriptor } from "../runtime/contracts.js";
@@ -24,25 +25,6 @@ const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yam
 const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
 const runtime = buildInstalledRuntimeDescriptor("gate-test/v1");
 const SUBJECT = "c".repeat(40);
-
-function completeStageAttemptActor(
-  store: PipelineStore,
-  tickets: SupervisorStore,
-  event: PipelineCoordinatorEvent,
-  options: { observedSubject?: string; faultAfterWrite?: (writeCount: number) => void } = {}
-): PipelineInstance {
-  const evaluated = evaluateStageGate(store, event, options);
-  if (!event.runId) throw new Error(`pipeline stage event ${event.id} has no run binding`);
-  return tickets.finishRunAndThen(
-    {
-      runId: event.runId,
-      status: "completed",
-      exitCode: 0,
-      ticketState: "active",
-    },
-    () => coordinatePipelineEvent(store, evaluated.event, options.faultAfterWrite, evaluated.receipt)
-  );
-}
 
 interface Fixture {
   db: Database.Database;

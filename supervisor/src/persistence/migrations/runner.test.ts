@@ -128,6 +128,10 @@ describe("database migrations", () => {
       );
       INSERT INTO runs VALUES ('run-bound', 'running', '2026-01-01T00:00:00.000Z', NULL);
       INSERT INTO runs VALUES ('run-planned', 'reaping', '2026-01-01T00:00:01.000Z', NULL);
+      INSERT INTO runs VALUES ('run-quarantined', 'quarantined', '2026-01-01T00:00:02.000Z', NULL);
+      INSERT INTO runs VALUES (
+        'run-settled', 'completed', '2026-01-01T00:00:03.000Z', '2026-01-01T00:00:09.000Z'
+      );
       INSERT INTO run_liveness VALUES (
         'run-bound', 'running', '2026-01-01T00:00:02.000Z', NULL, NULL, NULL, NULL,
         '2026-01-01T00:00:03.000Z'
@@ -135,6 +139,14 @@ describe("database migrations", () => {
       INSERT INTO run_liveness VALUES (
         'run-planned', 'reaping', '2026-01-01T00:00:04.000Z', 'owner-1',
         'stalled', NULL, NULL, '2026-01-01T00:00:05.000Z'
+      );
+      INSERT INTO run_liveness VALUES (
+        'run-quarantined', 'quarantined', '2026-01-01T00:00:06.000Z', 'owner-2',
+        'stalled', NULL, 'stop unconfirmed', '2026-01-01T00:00:07.000Z'
+      );
+      INSERT INTO run_liveness VALUES (
+        'run-settled', 'settled', '2026-01-01T00:00:08.000Z', 'owner-3',
+        'completed', '2026-01-01T00:00:09.000Z', NULL, '2026-01-01T00:00:09.000Z'
       );
       INSERT INTO pipeline_stage_attempts VALUES (
         'attempt-bound', 'run-bound', 'run-bound',
@@ -144,12 +156,21 @@ describe("database migrations", () => {
         'attempt-planned', NULL, 'run-planned',
         '2026-01-01T00:00:01.000Z', '2026-01-01T00:00:01.000Z'
       );
+      INSERT INTO pipeline_stage_attempts VALUES (
+        'attempt-quarantined', 'run-quarantined', 'run-quarantined',
+        '2026-01-01T00:00:02.000Z', '2026-01-01T00:00:02.000Z'
+      );
+      INSERT INTO pipeline_stage_attempts VALUES (
+        'attempt-settled', 'run-settled', 'run-settled',
+        '2026-01-01T00:00:03.000Z', '2026-01-01T00:00:03.000Z'
+      );
     `);
 
     applyDatabaseMigrations(db);
 
     expect(db.prepare(`
-      SELECT attempt_id, run_id, actor_state, last_heartbeat_at, settlement_owner, settlement_reason
+      SELECT attempt_id, run_id, actor_state, last_heartbeat_at, settlement_owner,
+        settlement_reason, termination_confirmed_at, quarantine_reason
       FROM pipeline_attempt_actors ORDER BY attempt_id
     `).all()).toEqual([
       {
@@ -159,6 +180,8 @@ describe("database migrations", () => {
         last_heartbeat_at: "2026-01-01T00:00:02.000Z",
         settlement_owner: null,
         settlement_reason: null,
+        termination_confirmed_at: null,
+        quarantine_reason: null,
       },
       {
         attempt_id: "attempt-planned",
@@ -167,6 +190,28 @@ describe("database migrations", () => {
         last_heartbeat_at: "2026-01-01T00:00:04.000Z",
         settlement_owner: "owner-1",
         settlement_reason: "stalled",
+        termination_confirmed_at: null,
+        quarantine_reason: null,
+      },
+      {
+        attempt_id: "attempt-quarantined",
+        run_id: "run-quarantined",
+        actor_state: "quarantined",
+        last_heartbeat_at: "2026-01-01T00:00:06.000Z",
+        settlement_owner: "owner-2",
+        settlement_reason: "stalled",
+        termination_confirmed_at: null,
+        quarantine_reason: "stop unconfirmed",
+      },
+      {
+        attempt_id: "attempt-settled",
+        run_id: "run-settled",
+        actor_state: "settled",
+        last_heartbeat_at: "2026-01-01T00:00:08.000Z",
+        settlement_owner: "owner-3",
+        settlement_reason: "completed",
+        termination_confirmed_at: "2026-01-01T00:00:09.000Z",
+        quarantine_reason: null,
       },
     ]);
   });
