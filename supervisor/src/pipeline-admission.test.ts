@@ -1,13 +1,14 @@
 import type Database from "better-sqlite3";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Config } from "./config.js";
-import { createTicketStore, openDb } from "./db.js";
+import type { Config } from "./app/config.js";
+import { createSupervisorStore } from "./persistence/store.js";
+import { openDb } from "./persistence/database.js";
 import { handleLinearEvent } from "./linear-events.js";
 import type { LinearClient } from "./linear.js";
 import { parseLinearWebhook } from "./linear.js";
-import { loadPipelineCatalog } from "./pipeline-manifest.js";
-import { createPipelineStore } from "./pipeline-store.js";
+import { loadPipelineCatalog } from "./pipeline/manifest.js";
+import { createPipelineStore } from "./persistence/pipeline/create-store.js";
 import { buildInstalledRuntimeDescriptor } from "./sandbox-runtime.js";
 
 const shippedCatalogPath = fileURLToPath(new URL("../pipelines/catalog.yaml", import.meta.url));
@@ -76,7 +77,8 @@ describe("pipeline admission", () => {
     catalogPath = shippedCatalogPath
   ) {
     db = openDb(":memory:");
-    const tickets = createTicketStore(db);
+    const pipelines = createPipelineStore(db);
+    const tickets = createSupervisorStore(db, pipelines);
     tickets.registerRepository({
       linearTeamKey: "OT",
       linearTeamId: "team-1",
@@ -85,7 +87,6 @@ describe("pipeline admission", () => {
       webhookId: 1,
       snapshot: "snapshot",
     });
-    const pipelines = createPipelineStore(db);
     const runtime = buildInstalledRuntimeDescriptor("admission-test/v1");
     const catalog = loadPipelineCatalog(catalogPath, runtime.descriptor);
     pipelines.acceptRuntimeDescriptor(runtime);
@@ -278,7 +279,7 @@ mcp_servers: {}
     expect(pipelines.listEffects(previous.id)).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: "stop", status: "pending" }),
     ]));
-    expect(tickets.db.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
   });
 
   it("does not retire the current generation when re-delegation selects an invalid pipeline", async () => {

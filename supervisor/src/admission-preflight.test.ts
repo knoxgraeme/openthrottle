@@ -7,13 +7,14 @@ import {
   runAdmissionPreflight,
   type AdmissionPreflight,
 } from "./admission-preflight.js";
-import type { Config } from "./config.js";
-import { createTicketStore, openDb } from "./db.js";
+import type { Config } from "./app/config.js";
+import { createSupervisorStore } from "./persistence/store.js";
+import { openDb } from "./persistence/database.js";
 import { handleLinearEvent } from "./linear-events.js";
 import type { LinearClient } from "./linear.js";
 import { parseLinearWebhook } from "./linear.js";
-import { loadPipelineCatalog } from "./pipeline-manifest.js";
-import { createPipelineStore } from "./pipeline-store.js";
+import { loadPipelineCatalog } from "./pipeline/manifest.js";
+import { createPipelineStore } from "./persistence/pipeline/create-store.js";
 import { buildInstalledRuntimeDescriptor } from "./sandbox-runtime.js";
 
 const shippedCatalogPath = fileURLToPath(new URL("../pipelines/catalog.yaml", import.meta.url));
@@ -196,7 +197,8 @@ describe("admission preflight wired into Linear admission", () => {
     treesStatus?: number;
   }) {
     db = openDb(":memory:");
-    const tickets = createTicketStore(db);
+    const pipelines = createPipelineStore(db);
+    const tickets = createSupervisorStore(db, pipelines);
     tickets.registerRepository({
       linearTeamKey: "OT",
       linearTeamId: "team-1",
@@ -205,7 +207,6 @@ describe("admission preflight wired into Linear admission", () => {
       webhookId: 1,
       snapshot: "snapshot",
     });
-    const pipelines = createPipelineStore(db);
     const runtime = buildInstalledRuntimeDescriptor("preflight-test/v1");
     const catalog = loadPipelineCatalog(shippedCatalogPath, runtime.descriptor);
     pipelines.acceptRuntimeDescriptor(runtime);

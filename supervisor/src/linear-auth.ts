@@ -1,5 +1,5 @@
-import type { Config } from "./config.js";
-import type { TicketStore } from "./db.js";
+import type { Config } from "./app/config.js";
+import type { SupervisorStore } from "./persistence/store.js";
 import {
   refreshLinearOAuthToken,
   type LinearClient,
@@ -11,7 +11,7 @@ const SETTINGS_LINEAR_REFRESH_TOKEN = "linear_refresh_token";
 const SETTINGS_LINEAR_TOKEN_EXPIRES_AT = "linear_token_expires_at";
 const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 
-export function persistLinearToken(store: TicketStore, token: LinearOAuthTokenResponse): void {
+export function persistLinearToken(store: SupervisorStore, token: LinearOAuthTokenResponse): void {
   store.setSetting(SETTINGS_LINEAR_ACCESS_TOKEN, token.access_token);
   if (token.refresh_token) store.setSetting(SETTINGS_LINEAR_REFRESH_TOKEN, token.refresh_token);
   if (token.expires_in) {
@@ -24,7 +24,7 @@ export function persistLinearToken(store: TicketStore, token: LinearOAuthTokenRe
 
 export function createLinearClientProvider(
   cfg: Config,
-  store: TicketStore
+  store: SupervisorStore
 ): () => Promise<LinearClient | undefined> {
   let refreshInFlight: Promise<LinearClient | undefined> | undefined;
   return async (): Promise<LinearClient | undefined> => {

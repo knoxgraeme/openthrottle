@@ -1,5 +1,5 @@
-import type { Config } from "./config.js";
-import type { TicketStore } from "./db.js";
+import type { Config } from "./app/config.js";
+import type { SupervisorStore } from "./persistence/store.js";
 
 /**
  * Durable Codex subscription auth.
@@ -84,7 +84,7 @@ function codexLastRefreshMs(blob: string | undefined): number | undefined {
  * operator re-logs-in and supplies a strictly newer `last_refresh` (recovering
  * a lineage that has been fully spent).
  */
-export function resolveStoredCodexAuthJson(cfg: Config, store: TicketStore): string | undefined {
+export function resolveStoredCodexAuthJson(cfg: Config, store: SupervisorStore): string | undefined {
   const stored = store.getSetting(SETTINGS_CODEX_AUTH_JSON);
   const seed = cfg.codexAuthJson;
   if (!stored) {
@@ -108,7 +108,7 @@ export function resolveStoredCodexAuthJson(cfg: Config, store: TicketStore): str
  * with no refresh token, an unchanged token, or an older `last_refresh` than we
  * already hold. Returns whether the store was updated.
  */
-export function captureCodexAuthJson(store: TicketStore, blob: string): boolean {
+export function captureCodexAuthJson(store: SupervisorStore, blob: string): boolean {
   const refreshToken = codexRefreshToken(blob);
   if (!refreshToken) return false;
   const stored = store.getSetting(SETTINGS_CODEX_AUTH_JSON);
@@ -247,7 +247,7 @@ export async function refreshCodexAuthJson(
 // One in-flight refresh per store (i.e. per supervisor process, one shared
 // account): concurrent seed requests coalesce onto the same promise so they
 // never spend the same refresh token twice.
-const refreshInFlight = new WeakMap<TicketStore, Promise<string | undefined>>();
+const refreshInFlight = new WeakMap<SupervisorStore, Promise<string | undefined>>();
 
 /**
  * Resolve the Codex auth blob to seed into a sandbox, refreshing a near-expiry
@@ -256,7 +256,7 @@ const refreshInFlight = new WeakMap<TicketStore, Promise<string | undefined>>();
  */
 export async function getCodexAuthForSeed(
   cfg: Config,
-  store: TicketStore
+  store: SupervisorStore
 ): Promise<string | undefined> {
   const current = resolveStoredCodexAuthJson(cfg, store);
   if (!current || !codexAccessTokenNearExpiry(current, Date.now())) return current;

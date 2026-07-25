@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type Database from "better-sqlite3";
-import type { Config } from "./config.js";
-import { createTicketStore, openDb, type TicketStore } from "./db.js";
+import type { Config } from "./app/config.js";
+import { createSupervisorStore, type SupervisorStore } from "./persistence/store.js";
+import { openDb } from "./persistence/database.js";
 import {
   SETTINGS_CODEX_AUTH_JSON,
   captureCodexAuthJson,
@@ -41,11 +42,11 @@ function authBlob(
 
 describe("Codex durable auth", () => {
   let db: Database.Database;
-  let store: TicketStore;
+  let store: SupervisorStore;
 
   beforeEach(() => {
     db = openDb(":memory:");
-    store = createTicketStore(db);
+    store = createSupervisorStore(db);
   });
 
   afterEach(() => {

@@ -2,7 +2,8 @@ import type Database from "better-sqlite3";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createTicketStore, openDb } from "./db.js";
+import { createSupervisorStore } from "./persistence/store.js";
+import { openDb } from "./persistence/database.js";
 import { reconcileSandboxAutostop } from "./sandbox-lifecycle.js";
 import {
   STAGE_EXECUTOR_PROTOCOL,
@@ -81,7 +82,7 @@ describe("sandbox runtime port", () => {
 
   it("reconciles lifecycle through opaque provider resource IDs", async () => {
     db = openDb(":memory:");
-    const store = createTicketStore(db);
+    const store = createSupervisorStore(db);
     store.upsert({
       linear_issue_id: "issue-1",
       linear_issue_identifier: "ISSUE-1",

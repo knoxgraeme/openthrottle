@@ -14,7 +14,7 @@
 //     sandbox cannot fit. A broken capacity probe never blocks admission.
 
 import type { Daytona } from "@daytona/sdk";
-import type { Config } from "./config.js";
+import type { Config } from "./app/config.js";
 import { listLabeledSandboxes } from "./daytona.js";
 
 const HTTP_TIMEOUT_MS = 15_000;

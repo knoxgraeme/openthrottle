@@ -1,9 +1,9 @@
 import type { Daytona } from "@daytona/sdk";
-import type { Config } from "./config.js";
-import type { TicketStore } from "./db.js";
+import type { Config } from "./app/config.js";
+import type { SupervisorStore } from "./persistence/store.js";
 import { listLabeledSandboxes } from "./daytona.js";
 import type { LinearOutboxProcessor } from "./linear-outbox.js";
-import type { PipelineStore } from "./pipeline-store.js";
+import type { PipelineStore } from "./pipeline/store.js";
 import { reapExpiredRuns } from "./reaper.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -17,7 +17,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  */
 export async function runSweep(
   daytona: Daytona,
-  store: TicketStore,
+  store: SupervisorStore,
   cfg: Config,
   pipelines: PipelineStore,
   linearOutbox: LinearOutboxProcessor
@@ -32,7 +32,7 @@ export async function runSweep(
 
 async function deleteOrphanSandboxes(
   daytona: Daytona,
-  store: TicketStore,
+  store: SupervisorStore,
   cfg: Config
 ): Promise<void> {
   let sandboxes;

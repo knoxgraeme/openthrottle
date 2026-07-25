@@ -1,7 +1,7 @@
 import type { Sandbox } from "@daytona/sdk";
 import { describe, expect, it, vi } from "vitest";
 import { createDaytonaSandboxRuntime } from "./daytona.js";
-import { canonicalJson, digestNormalized } from "./pipeline-manifest.js";
+import { canonicalJson, digestNormalized } from "./pipeline/manifest.js";
 import { STAGE_EXECUTOR_PROTOCOL, createStageRequestHash, type StageRequestEnvelope } from "./sandbox-runtime.js";
 
 describe("Daytona stage execution", () => {

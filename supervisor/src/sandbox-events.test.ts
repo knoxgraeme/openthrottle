@@ -2,7 +2,8 @@ import type { Daytona, Sandbox } from "@daytona/sdk";
 import type Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
-import { createTicketStore, openDb } from "./db.js";
+import { createSupervisorStore } from "./persistence/store.js";
+import { openDb } from "./persistence/database.js";
 import { parseSandboxEvent, pollSandboxEvents } from "./sandbox-events.js";
 
 let db: Database.Database | undefined;
@@ -10,7 +11,7 @@ afterEach(() => db?.close());
 
 function seedRunningTicket() {
   db = openDb(":memory:");
-  const store = createTicketStore(db);
+  const store = createSupervisorStore(db);
   store.upsert({
     linear_issue_id: "issue-1",
     linear_issue_identifier: "OT-1",
@@ -193,7 +194,7 @@ describe("sandbox event contracts", () => {
     });
 
     expect(postActivity).not.toHaveBeenCalled();
-    expect(store.db.prepare(
+    expect(db!.prepare(
       "SELECT actor_state, last_heartbeat_at FROM run_liveness WHERE run_id = 'run-1'"
     ).get()).toEqual({ actor_state: "running", last_heartbeat_at: expect.any(String) });
     expect(store.getSandboxEvent("77777777-7777-4777-8777-777777777777")?.status)
@@ -233,7 +234,7 @@ describe("sandbox event contracts", () => {
     });
 
     expect(store.getSandboxEvent("66666666-6666-4666-8666-666666666666")).toBeUndefined();
-    expect(store.db.prepare(
+    expect(db!.prepare(
       "SELECT last_heartbeat_at FROM run_liveness WHERE run_id = 'run-1'"
     ).get()).toEqual({ last_heartbeat_at: null });
     expect(files.size).toBe(0);

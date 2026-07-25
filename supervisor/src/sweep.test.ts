@@ -1,9 +1,10 @@
 import type { Daytona, Sandbox } from "@daytona/sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Config } from "./config.js";
-import { createTicketStore, openDb } from "./db.js";
+import type { Config } from "./app/config.js";
+import { createSupervisorStore } from "./persistence/store.js";
+import { openDb } from "./persistence/database.js";
 import { createLinearOutboxProcessor } from "./linear-outbox.js";
-import { createPipelineStore } from "./pipeline-store.js";
+import { createPipelineStore } from "./persistence/pipeline/create-store.js";
 import { runSweep } from "./sweep.js";
 
 describe("runSweep", () => {
@@ -11,8 +12,8 @@ describe("runSweep", () => {
   afterEach(() => db.close());
 
   it("deletes old orphan runtimes, protects active bindings, and prunes deliveries", async () => {
-    const store = createTicketStore(db);
     const pipelines = createPipelineStore(db);
+    const store = createSupervisorStore(db, pipelines);
     store.upsertUnpinned({
       linear_issue_id: "active",
       linear_issue_identifier: "ACTIVE",

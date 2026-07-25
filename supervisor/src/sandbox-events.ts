@@ -1,11 +1,11 @@
 import type { Daytona, Sandbox } from "@daytona/sdk";
 import type { AgentActivityInput, AgentPlanItem, AgentPlanStatus } from "./linear.js";
-import type { Ticket, TicketStore } from "./db.js";
+import type { Ticket, SupervisorStore } from "./persistence/store.js";
 import { ensureSandboxActive, setSandboxActive, setSandboxIdle } from "./daytona.js";
 import { reconcileSandboxAutostop } from "./sandbox-lifecycle.js";
-import { sanitizeText } from "./sanitize.js";
-import { STAGE_OUTCOMES } from "./pipeline-manifest.js";
-import type { PipelineCoordinatorEvent, PipelineEventArtifact } from "./pipeline-coordinator.js";
+import { sanitizeText } from "./shared/sanitize.js";
+import { STAGE_OUTCOMES } from "./pipeline/manifest.js";
+import type { PipelineCoordinatorEvent, PipelineEventArtifact } from "./pipeline/coordinator.js";
 
 const OUTBOX_DIR = "/home/agent/.ot/outbox";
 const SEALED_HEARTBEAT_FILE = "/var/lib/openthrottle/heartbeat/heartbeat.json";
@@ -344,7 +344,7 @@ async function readWorkspaceSubject(sandbox: Sandbox): Promise<string> {
 
 interface SandboxEventPollerParams {
   daytona: Daytona;
-  store: TicketStore;
+  store: SupervisorStore;
   postActivity: (
     activity: AgentActivityInput,
     event: SandboxActivityEvent & { issueId: string }

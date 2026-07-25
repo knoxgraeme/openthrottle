@@ -1,11 +1,11 @@
-import type { TicketStore } from "./db.js";
+import type { SupervisorStore } from "./persistence/store.js";
 import type { SandboxAutostopRuntime } from "./sandbox-runtime.js";
 
 const MAX_RECONCILIATION_ATTEMPTS = 3;
 
 export async function reconcileSandboxAutostop(params: {
   runtime: SandboxAutostopRuntime;
-  store: TicketStore;
+  store: SupervisorStore;
   issueId: string;
   providerResourceId: string;
 }): Promise<void> {

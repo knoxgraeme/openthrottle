@@ -1,8 +1,9 @@
-import { serve } from "@hono/node-server";
 import { Daytona } from "@daytona/sdk";
-import { loadConfig } from "./config.js";
-import { openDb, createTicketStore } from "./db.js";
-import { createServer, createServerWebhookDeliveryProcessor } from "./server.js";
+import { loadConfig } from "./app/config.js";
+import { createSupervisorStore } from "./persistence/store.js";
+import { openDb } from "./persistence/database.js";
+import { listen } from "./http/listener.js";
+import { createServer, createServerWebhookDeliveryProcessor } from "./http/server.js";
 import { runSweep } from "./sweep.js";
 import { createLinearClientProvider } from "./linear-auth.js";
 import { captureCodexAuthJson, getCodexAuthForSeed } from "./codex-auth.js";
@@ -10,13 +11,13 @@ import { pollSandboxEvents } from "./sandbox-events.js";
 import { deliverPendingInbox } from "./inbox.js";
 import { reapStalledRuns } from "./reaper.js";
 import { activityPayload, createLinearOutboxProcessor, enqueueSessionUpdate } from "./linear-outbox.js";
-import { loadPipelineCatalog } from "./pipeline-manifest.js";
-import { createPipelineStore } from "./pipeline-store.js";
+import { loadPipelineCatalog } from "./pipeline/manifest.js";
+import { createPipelineStore } from "./persistence/pipeline/create-store.js";
 import { loadRuntimeCapabilityDescriptor } from "./sandbox-runtime.js";
-import { drainDeferredProviderEvidence, settleStageEvidence } from "./gate-evaluators.js";
-import { createGithubPublicationProcessor } from "./pipeline-publication.js";
+import { drainDeferredProviderEvidence, settleStageEvidence } from "./pipeline/gates.js";
+import { createGithubPublicationProcessor } from "./providers/github/publication-delivery.js";
 import { createDaytonaSandboxRuntime } from "./daytona.js";
-import { createPipelineEffectProcessor } from "./pipeline-effects.js";
+import { createPipelineEffectProcessor } from "./operations/pipeline-effects.js";
 import { drainPipelineFeedbackSnapshots } from "./github-events.js";
 
 const SWEEP_INTERVAL_MS = 15 * 60 * 1000; // run every 15 min while awake; SPEC only requires "on every boot" + periodic while awake
@@ -29,8 +30,8 @@ async function main() {
   const cfg = loadConfig();
 
   const db = openDb(cfg.databasePath);
-  const store = createTicketStore(db);
   const pipelineStore = createPipelineStore(db);
+  const store = createSupervisorStore(db, pipelineStore);
   const runtimeCapabilities = loadRuntimeCapabilityDescriptor(
     cfg.sandboxRuntimeDescriptorPath,
     cfg.sandboxRuntimeRelease
@@ -190,7 +191,7 @@ async function main() {
     }
   };
 
-  serve({ fetch: app.fetch, port: cfg.port }, (info) => {
+  listen(app, cfg.port, (info) => {
     console.log(`[supervisor] listening on :${info.port}`);
   });
 

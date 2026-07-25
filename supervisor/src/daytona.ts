@@ -6,7 +6,7 @@ import {
   type StageExecutionResult,
   type StageRequestEnvelope,
 } from "./sandbox-runtime.js";
-import { canonicalJson, digestNormalized, STAGE_OUTCOMES } from "./pipeline-manifest.js";
+import { canonicalJson, digestNormalized, STAGE_OUTCOMES } from "./pipeline/manifest.js";
 
 const ACTIVE_SANDBOX_AUTOSTOP_MINUTES = 60;
 const IDLE_SANDBOX_AUTOSTOP_MINUTES = 5;

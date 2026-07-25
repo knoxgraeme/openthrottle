@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type Database from "better-sqlite3";
-import type { Config } from "./config.js";
-import { createTicketStore, openDb } from "./db.js";
+import type { Config } from "./app/config.js";
+import { createSupervisorStore } from "./persistence/store.js";
+import { openDb } from "./persistence/database.js";
 import { createLinearClientProvider, createLinearOAuthStateStore } from "./linear-auth.js";
 
 let db: Database.Database | undefined;
@@ -22,7 +23,7 @@ describe("Linear OAuth state and refresh", () => {
 
   it("refreshes an expired token once for concurrent consumers", async () => {
     db = openDb(":memory:");
-    const store = createTicketStore(db);
+    const store = createSupervisorStore(db);
     store.setSetting("linear_access_token", "expired");
     store.setSetting("linear_refresh_token", "refresh");
     store.setSetting("linear_token_expires_at", "2020-01-01T00:00:00.000Z");
