@@ -3,6 +3,7 @@ import type Database from "better-sqlite3";
 import {
   backfillLegacySessionExecutions,
   backfillLegacyWork,
+  backfillPipelineAttemptActors,
   backfillPipelineExecutionIdentity,
   backfillPipelinePublicationState,
   backfillRunLiveness,
@@ -551,6 +552,31 @@ base-branch-contract:review and publication receive the immutable selected branc
 backfill-contract:existing pipeline instances inherit the selected branch from their bound ticket when available
 provider-revision-contract:executor-verified published commit is pinned separately from the gated tree/v1`;
 
+const pipelineAttemptActorSchema = `
+CREATE TABLE pipeline_attempt_actors (
+  attempt_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL UNIQUE,
+  actor_state TEXT NOT NULL DEFAULT 'running'
+    CHECK(actor_state IN ('running', 'reaping', 'quarantined', 'settled')),
+  last_heartbeat_at TEXT,
+  settlement_owner TEXT,
+  settlement_reason TEXT,
+  termination_confirmed_at TEXT,
+  quarantine_reason TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(attempt_id) REFERENCES pipeline_stage_attempts(id) ON DELETE RESTRICT,
+  FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE RESTRICT
+);
+CREATE INDEX pipeline_attempt_actors_state_idx
+  ON pipeline_attempt_actors(actor_state, last_heartbeat_at);
+`;
+
+const pipelineAttemptActorMigrationSource = `${pipelineAttemptActorSchema}
+actor-contract:pipeline stage attempts own sandbox actor liveness and settlement/v1
+legacy runs and run_liveness remain retained history
+backfill-contract:bound or planned pipeline run maps to one attempt actor without losing heartbeat, reaping, or quarantine state`;
+
 const definitions: DatabaseMigrationDefinition[] = [
   {
     version: 1,
@@ -637,6 +663,15 @@ const definitions: DatabaseMigrationDefinition[] = [
           ), base_branch)
         `);
       }
+    },
+  },
+  {
+    version: 9,
+    name: "pipeline-attempt-actors",
+    source: pipelineAttemptActorMigrationSource,
+    up(db) {
+      db.exec(pipelineAttemptActorSchema);
+      backfillPipelineAttemptActors(db);
     },
   },
 ];

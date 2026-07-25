@@ -40,18 +40,6 @@ const ARTIFACT_KEYS = new Set([
 type ArtifactResult = StageOutcome | "not_configured";
 type GateResult = CoordinatorGateReceiptWrite["result"];
 
-interface StageEvidenceRunStore {
-  finishRunAndThen<T>(
-    params: {
-      runId: string;
-      status: "completed";
-      exitCode: number;
-      ticketState: "active";
-    },
-    after: () => T
-  ): T;
-}
-
 interface Finding {
   severity: "P0" | "P1" | "P2" | "P3";
   code: string;
@@ -463,30 +451,6 @@ export function processStageEvidence(
 ): PipelineInstance {
   const evaluated = evaluateStageGate(store, event, options);
   return coordinatePipelineEvent(store, evaluated.event, options.faultAfterWrite, evaluated.receipt);
-}
-
-export function settleStageEvidence(
-  store: PipelineStore,
-  tickets: StageEvidenceRunStore,
-  event: PipelineCoordinatorEvent,
-  options: { observedSubject?: string; faultAfterWrite?: (writeCount: number) => void } = {}
-): PipelineInstance {
-  const evaluated = evaluateStageGate(store, event, options);
-  if (!event.runId) throw new Error(`pipeline stage event ${event.id} has no run binding`);
-  return tickets.finishRunAndThen(
-    {
-      runId: event.runId!,
-      status: "completed",
-      exitCode: 0,
-      ticketState: "active",
-    },
-    () => coordinatePipelineEvent(
-      store,
-      evaluated.event,
-      options.faultAfterWrite,
-      evaluated.receipt
-    )
-  );
 }
 
 function providerGateReceipt(

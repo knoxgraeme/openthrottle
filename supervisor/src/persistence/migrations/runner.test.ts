@@ -40,6 +40,7 @@ describe("database migrations", () => {
       "a25c3d25dbbbabaeb00a7b74d77ff186706f92579333aeee8b78f18eb1de4644",
       "3da725659a91d7b2babf5a2dac20f1cca26cbe7957d238c5f1877f7bf38de40a",
       "e2cd34be32f4dd0ab9fdacb87732dae7121574efb7bd1aa166090e3591b851e6",
+      "a8687cedc0fd1fc88b1cc8a6c39589d9cbe3279f6360195975de9f87e1d25ba3",
     ]);
   });
 
@@ -91,6 +92,81 @@ describe("database migrations", () => {
         run_id: "legacy-running",
         actor_state: "running",
         updated_at: "2026-01-01T00:00:00.000Z",
+      },
+    ]);
+  });
+
+  it("backfills pipeline attempt actors from legacy liveness state", () => {
+    db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
+    for (const migration of databaseMigrations.slice(0, 8)) {
+      db.prepare(`
+        INSERT INTO schema_migrations(version, name, checksum, applied_at)
+        VALUES (?, ?, ?, '2026-01-01T00:00:00.000Z')
+      `).run(migration.version, migration.name, migration.checksum);
+    }
+    db.exec(`
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY, status TEXT NOT NULL, started_at TEXT NOT NULL,
+        completed_at TEXT
+      );
+      CREATE TABLE run_liveness (
+        run_id TEXT PRIMARY KEY, actor_state TEXT NOT NULL,
+        last_heartbeat_at TEXT, settlement_owner TEXT, settlement_reason TEXT,
+        termination_confirmed_at TEXT, quarantine_reason TEXT, updated_at TEXT NOT NULL
+      );
+      CREATE TABLE pipeline_stage_attempts (
+        id TEXT PRIMARY KEY, run_id TEXT, planned_run_id TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      INSERT INTO runs VALUES ('run-bound', 'running', '2026-01-01T00:00:00.000Z', NULL);
+      INSERT INTO runs VALUES ('run-planned', 'reaping', '2026-01-01T00:00:01.000Z', NULL);
+      INSERT INTO run_liveness VALUES (
+        'run-bound', 'running', '2026-01-01T00:00:02.000Z', NULL, NULL, NULL, NULL,
+        '2026-01-01T00:00:03.000Z'
+      );
+      INSERT INTO run_liveness VALUES (
+        'run-planned', 'reaping', '2026-01-01T00:00:04.000Z', 'owner-1',
+        'stalled', NULL, NULL, '2026-01-01T00:00:05.000Z'
+      );
+      INSERT INTO pipeline_stage_attempts VALUES (
+        'attempt-bound', 'run-bound', 'run-bound',
+        '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+      );
+      INSERT INTO pipeline_stage_attempts VALUES (
+        'attempt-planned', NULL, 'run-planned',
+        '2026-01-01T00:00:01.000Z', '2026-01-01T00:00:01.000Z'
+      );
+    `);
+
+    applyDatabaseMigrations(db);
+
+    expect(db.prepare(`
+      SELECT attempt_id, run_id, actor_state, last_heartbeat_at, settlement_owner, settlement_reason
+      FROM pipeline_attempt_actors ORDER BY attempt_id
+    `).all()).toEqual([
+      {
+        attempt_id: "attempt-bound",
+        run_id: "run-bound",
+        actor_state: "running",
+        last_heartbeat_at: "2026-01-01T00:00:02.000Z",
+        settlement_owner: null,
+        settlement_reason: null,
+      },
+      {
+        attempt_id: "attempt-planned",
+        run_id: "run-planned",
+        actor_state: "reaping",
+        last_heartbeat_at: "2026-01-01T00:00:04.000Z",
+        settlement_owner: "owner-1",
+        settlement_reason: "stalled",
       },
     ]);
   });

@@ -13,7 +13,10 @@ import { activityPayload, createLinearOutboxProcessor, enqueueSessionUpdate } fr
 import { loadPipelineCatalog } from "./pipeline/manifest.js";
 import { createPipelineStore } from "./persistence/pipeline/create-store.js";
 import { loadRuntimeCapabilityDescriptor } from "./runtime/contracts.js";
-import { drainDeferredProviderEvidence, settleStageEvidence } from "./pipeline/gates.js";
+import { drainDeferredProviderEvidence, evaluateStageGate } from "./pipeline/gates.js";
+import { coordinatePipelineEvent, type PipelineCoordinatorEvent } from "./pipeline/coordinator.js";
+import type { PipelineInstance, PipelineStore } from "./pipeline/store.js";
+import type { SupervisorStore } from "./persistence/store.js";
 import { createGithubPublicationProcessor } from "./providers/github/pipeline-publication.js";
 import { createDaytonaRuntime } from "./providers/daytona/adapter.js";
 import { createPipelineEffectProcessor } from "./operations/pipeline-effects.js";
@@ -24,6 +27,27 @@ const DELIVERY_DRAIN_INTERVAL_MS = 30 * 1000;
 // Liveness reap runs far more often than the hard-timeout sweep so a stalled
 // run is caught within ~a minute of crossing STALL_TIMEOUT_SECONDS.
 const REAP_INTERVAL_MS = 60 * 1000;
+
+function completeStageAttemptActor(params: {
+  pipelines: PipelineStore;
+  store: SupervisorStore;
+  event: PipelineCoordinatorEvent;
+  observedSubject?: string;
+}): PipelineInstance {
+  const evaluated = evaluateStageGate(params.pipelines, params.event, {
+    observedSubject: params.observedSubject,
+  });
+  if (!params.event.runId) throw new Error(`pipeline stage event ${params.event.id} has no run binding`);
+  return params.store.finishRunAndThen(
+    {
+      runId: params.event.runId,
+      status: "completed",
+      exitCode: 0,
+      ticketState: "active",
+    },
+    () => coordinatePipelineEvent(params.pipelines, evaluated.event, undefined, evaluated.receipt)
+  );
+}
 
 async function main() {
   const cfg = loadConfig();
@@ -149,21 +173,26 @@ async function main() {
             plan: params.plan,
           }),
         postStageResult: async (event, observedSubject) => {
-          settleStageEvidence(pipelineStore, store, {
-            id: event.event_id,
-            kind: "stage_result",
-            instanceId: event.pipeline_instance_id,
-            generation: event.generation,
-            runId: event.run_id,
-            stageId: event.stage_id,
-            attemptId: event.attempt_id,
-            requestHash: event.request_hash,
-            outcome: event.outcome,
-            resultHash: event.result_hash,
-            subject: event.subject,
-            nativeSessionId: event.native_session_id,
-            artifacts: event.artifacts,
-          }, { observedSubject });
+          completeStageAttemptActor({
+            pipelines: pipelineStore,
+            store,
+            event: {
+              id: event.event_id,
+              kind: "stage_result",
+              instanceId: event.pipeline_instance_id,
+              generation: event.generation,
+              runId: event.run_id,
+              stageId: event.stage_id,
+              attemptId: event.attempt_id,
+              requestHash: event.request_hash,
+              outcome: event.outcome,
+              resultHash: event.result_hash,
+              subject: event.subject,
+              nativeSessionId: event.native_session_id,
+              artifacts: event.artifacts,
+            },
+            observedSubject,
+          });
           await pipelineEffectProcessor.drain();
         },
         captureAgentAuth: async (sandbox, ticket) => {
