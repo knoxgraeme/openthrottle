@@ -1,5 +1,5 @@
-import type { SupervisorStore } from "./persistence/store.js";
-import type { SandboxAutostopRuntime } from "./sandbox-runtime.js";
+import type { SupervisorStore } from "../persistence/store.js";
+import type { SandboxAutostopRuntime } from "./contracts.js";
 
 const MAX_RECONCILIATION_ATTEMPTS = 3;
 

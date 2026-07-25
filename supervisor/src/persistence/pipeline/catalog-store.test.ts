@@ -9,7 +9,7 @@ import {
   loadPipelineCatalog,
   validatePipelineManifest,
 } from "../../pipeline/manifest.js";
-import { buildInstalledRuntimeDescriptor, loadRuntimeCapabilityDescriptor } from "../../sandbox-runtime.js";
+import { buildInstalledRuntimeDescriptor, loadRuntimeCapabilityDescriptor } from "../../runtime/contracts.js";
 import { openDb } from "../database.js";
 import { createPipelineStore } from "./create-store.js";
 import {

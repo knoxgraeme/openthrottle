@@ -1,12 +1,13 @@
-import type { Daytona, Sandbox } from "@daytona/sdk";
+import { Daytona, type Sandbox } from "@daytona/sdk";
 import {
   createStageRequestHash,
   type RuntimeResource,
-  type SandboxRuntime,
+  type RuntimeControl,
+  type RuntimeInventoryResource,
   type StageExecutionResult,
   type StageRequestEnvelope,
-} from "./sandbox-runtime.js";
-import { canonicalJson, digestNormalized, STAGE_OUTCOMES } from "./pipeline/manifest.js";
+} from "../../runtime/contracts.js";
+import { canonicalJson, digestNormalized, STAGE_OUTCOMES } from "../../pipeline/manifest.js";
 
 const ACTIVE_SANDBOX_AUTOSTOP_MINUTES = 60;
 const IDLE_SANDBOX_AUTOSTOP_MINUTES = 5;
@@ -33,13 +34,21 @@ export interface DaytonaSandboxRuntimeOptions {
   taskTimeoutSeconds?: number;
 }
 
+export interface DaytonaRuntimeFactoryOptions extends DaytonaSandboxRuntimeOptions {
+  apiKey: string;
+}
+
+export function createDaytonaRuntime(options: DaytonaRuntimeFactoryOptions): RuntimeControl {
+  return createDaytonaSandboxRuntime(new Daytona({ apiKey: options.apiKey }), options);
+}
+
 function ensureSandboxAutostop(sandbox: Sandbox, minutes: number): Promise<void> {
   return sandbox.autoStopInterval === minutes
     ? Promise.resolve()
     : sandbox.setAutostopInterval(minutes);
 }
 
-export function ensureSandboxActive(sandbox: Sandbox): Promise<void> {
+function ensureSandboxActive(sandbox: Sandbox): Promise<void> {
   return ensureSandboxAutostop(sandbox, ACTIVE_SANDBOX_AUTOSTOP_MINUTES);
 }
 
@@ -110,7 +119,7 @@ function parseCollectedStageResult(raw: string, attemptId: string): StageExecuti
 export function createDaytonaSandboxRuntime(
   daytona: Daytona,
   options: DaytonaSandboxRuntimeOptions
-): SandboxRuntime {
+): RuntimeControl {
   const materializedScopes = new Map<string, string>();
   const bootstrapped = new Map<string, { configDigest: string; manifestDigest: string }>();
   const getSandbox = async (resource: RuntimeResource) => daytona.get(resource.providerResourceId);
@@ -284,40 +293,79 @@ export function createDaytonaSandboxRuntime(
       materializedScopes.delete(resource.providerResourceId);
       bootstrapped.delete(resource.providerResourceId);
     },
+
+    async setActive(providerResourceId) {
+      await setSandboxActive(daytona, providerResourceId);
+    },
+
+    async setIdle(providerResourceId) {
+      await setSandboxIdle(daytona, providerResourceId);
+    },
+
+    async getWorkspace(providerResourceId) {
+      return daytona.get(providerResourceId);
+    },
+
+    async getLogs(providerResourceId) {
+      return getSandboxLogs(daytona, providerResourceId);
+    },
+
+    async stopResource(providerResourceId) {
+      await stopSandbox(daytona, providerResourceId);
+    },
+
+    async listLabeledResources() {
+      return listLabeledSandboxes(daytona);
+    },
+
+    async deleteResource(providerResourceId) {
+      await deleteSandbox(daytona, providerResourceId);
+    },
+
+    async getSnapshot(name) {
+      const snapshot = await daytona.snapshot.get(name);
+      return { name: String(snapshot.name), state: String(snapshot.state) };
+    },
   };
 }
 
-export async function setSandboxActive(daytona: Daytona, sandboxId: string): Promise<void> {
+async function setSandboxActive(daytona: Daytona, sandboxId: string): Promise<void> {
   const sandbox = await daytona.get(sandboxId);
   await ensureSandboxActive(sandbox);
 }
 
-export async function setSandboxIdle(daytona: Daytona, sandboxId: string): Promise<void> {
+async function setSandboxIdle(daytona: Daytona, sandboxId: string): Promise<void> {
   const sandbox = await daytona.get(sandboxId);
   await ensureSandboxAutostop(sandbox, IDLE_SANDBOX_AUTOSTOP_MINUTES);
 }
 
-export async function stopSandbox(daytona: Daytona, sandboxId: string): Promise<void> {
+async function stopSandbox(daytona: Daytona, sandboxId: string): Promise<void> {
   const sandbox = await daytona.get(sandboxId);
   await sandbox.stop(60, true);
 }
 
-export async function deleteSandbox(daytona: Daytona, sandboxId: string): Promise<void> {
+async function deleteSandbox(daytona: Daytona, sandboxId: string): Promise<void> {
   const sandbox = await daytona.get(sandboxId);
   await sandbox.delete(60, false);
 }
 
-export async function getSandboxLogs(daytona: Daytona, sandboxId: string): Promise<string> {
+async function getSandboxLogs(daytona: Daytona, sandboxId: string): Promise<string> {
   const sandbox = await daytona.get(sandboxId);
   if (sandbox.state !== "started") await sandbox.start(60);
   const logs = await sandbox.process.getEntrypointLogs();
   return logs.output ?? [logs.stdout, logs.stderr].filter(Boolean).join("\n");
 }
 
-export async function listLabeledSandboxes(daytona: Daytona): Promise<Sandbox[]> {
-  const sandboxes: Sandbox[] = [];
+async function listLabeledSandboxes(daytona: Daytona): Promise<RuntimeInventoryResource[]> {
+  const sandboxes: RuntimeInventoryResource[] = [];
   for await (const sandbox of daytona.list({ labels: { openthrottle: "true" } })) {
-    sandboxes.push(sandbox);
+    sandboxes.push({
+      id: sandbox.id,
+      state: sandbox.state,
+      createdAt: sandbox.createdAt,
+      labels: sandbox.labels,
+      memory: sandbox.memory,
+    });
   }
   return sandboxes;
 }

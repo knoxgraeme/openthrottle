@@ -16,7 +16,7 @@ import {
 import type { PipelineCoordinatorEvent, PipelineEventArtifact } from "./coordinator.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import type { PipelineInstance, PipelineStageAttempt, PipelineStore } from "./store.js";
-import { buildInstalledRuntimeDescriptor } from "../sandbox-runtime.js";
+import { buildInstalledRuntimeDescriptor } from "../runtime/contracts.js";
 import { processPipelineInfrastructureFailure } from "./control.js";
 import { drainPipelineFeedbackSnapshots, handleGithubEvent, routePipelineProviderEvent } from "../providers/github/events.js";
 

@@ -2,16 +2,16 @@ import type Database from "better-sqlite3";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createSupervisorStore } from "./persistence/store.js";
-import { openDb } from "./persistence/database.js";
-import { reconcileSandboxAutostop } from "./sandbox-lifecycle.js";
+import { createSupervisorStore } from "../persistence/store.js";
+import { openDb } from "../persistence/database.js";
+import { reconcileSandboxAutostop } from "./lifecycle.js";
 import {
   STAGE_EXECUTOR_PROTOCOL,
   buildInstalledRuntimeDescriptor,
   createStageRequestHash,
   loadRuntimeCapabilityDescriptor,
   type StageRequestEnvelope,
-} from "./sandbox-runtime.js";
+} from "./contracts.js";
 
 describe("sandbox runtime port", () => {
   let db: Database.Database | undefined;
@@ -30,7 +30,7 @@ describe("sandbox runtime port", () => {
   });
 
   it("loads the shipped descriptor and rejects a mismatched configured release", () => {
-    const path = fileURLToPath(new URL("../pipelines/runtime-capabilities-v1.json", import.meta.url));
+    const path = fileURLToPath(new URL("../../pipelines/runtime-capabilities-v1.json", import.meta.url));
     const runtime = loadRuntimeCapabilityDescriptor(path, "openthrottle-snapshot/v2");
     expect(runtime.descriptor.capabilities).toContain("ce/implement@1");
     expect(() => loadRuntimeCapabilityDescriptor(path, "different-release/v1"))
@@ -106,7 +106,7 @@ describe("sandbox runtime port", () => {
   });
 
   it("keeps provider SDK types outside the runtime port", () => {
-    const source = readFileSync(fileURLToPath(new URL("./sandbox-runtime.ts", import.meta.url)), "utf8");
+    const source = readFileSync(fileURLToPath(new URL("./contracts.ts", import.meta.url)), "utf8");
     expect(source).not.toContain("@daytona/sdk");
     expect(source).not.toMatch(/Daytona/);
   });

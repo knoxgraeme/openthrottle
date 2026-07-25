@@ -14,7 +14,7 @@ import {
   type ExecutorKind,
   type RuntimeCapabilityInventory,
   type StageOutcome,
-} from "./pipeline/manifest.js";
+} from "../pipeline/manifest.js";
 
 export const STAGE_EXECUTOR_PROTOCOL = "stage-executor@1";
 
@@ -112,6 +112,74 @@ export interface SandboxAutostopRuntime {
   setActive(providerResourceId: string): Promise<void>;
   setIdle(providerResourceId: string): Promise<void>;
 }
+
+export interface RuntimeFileEntry {
+  name?: string;
+  path?: string;
+  size: number;
+  isDir: boolean;
+}
+
+export interface RuntimeWorkspace {
+  id: string;
+  state?: string;
+  createdAt?: string;
+  labels?: Record<string, string>;
+  memory?: number;
+  start?(timeoutSeconds?: number): Promise<void>;
+  fs: {
+    listFiles?(path: string): Promise<RuntimeFileEntry[]>;
+    downloadFile?(path: string): Promise<Buffer | undefined>;
+    uploadFile?(content: Buffer, path: string): Promise<void>;
+    deleteFile?(path: string): Promise<unknown>;
+    createFolder?(path: string, mode?: string): Promise<void>;
+    setFilePermissions?(path: string, permissions: {
+      owner: string;
+      group: string;
+      mode: string;
+    }): Promise<void>;
+  };
+  process?: {
+    executeCommand?(
+      command: string,
+      cwd?: string,
+      env?: Record<string, string>,
+      timeoutSeconds?: number
+    ): Promise<{ exitCode?: number; result?: string }>;
+  };
+}
+
+export interface RuntimeWorkspaceAccess {
+  getWorkspace(providerResourceId: string): Promise<RuntimeWorkspace>;
+}
+
+export interface RuntimeLogs {
+  getLogs(providerResourceId: string): Promise<string>;
+}
+
+export interface RuntimeStopper {
+  stopResource(providerResourceId: string, reason: string): Promise<void>;
+}
+
+export type RuntimeInventoryResource = Pick<RuntimeWorkspace, "id" | "state" | "createdAt" | "labels" | "memory">;
+
+export interface RuntimeInventory {
+  listLabeledResources(): Promise<RuntimeInventoryResource[]>;
+  deleteResource(providerResourceId: string): Promise<void>;
+}
+
+export interface RuntimeSnapshotReadiness {
+  getSnapshot(name: string): Promise<{ name: string; state: string }>;
+}
+
+export interface RuntimeControl
+  extends SandboxRuntime,
+    SandboxAutostopRuntime,
+    RuntimeWorkspaceAccess,
+    RuntimeLogs,
+    RuntimeStopper,
+    RuntimeInventory,
+    RuntimeSnapshotReadiness {}
 
 function sortedUnique(values: readonly string[]): string[] {
   return [...new Set(values)].sort();

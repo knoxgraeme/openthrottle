@@ -42,7 +42,7 @@ jobs:
           npm run build --prefix cli
       - name: Verify catalog, runtime, and adapter parity
         run: |
-          npm test --prefix supervisor -- src/pipeline-manifest.test.ts src/sandbox-runtime.test.ts
+          npm test --prefix supervisor -- src/pipeline/manifest.test.ts src/runtime/contracts.test.ts
           npm test --prefix sandbox -- runner/capabilities.test.mjs tests/ce-adapters.test.mjs
       - name: Test
         run: |

@@ -13,7 +13,7 @@ import {
   parseRepositoryConfig,
 } from "../pipeline/manifest.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
-import { buildInstalledRuntimeDescriptor, type SandboxRuntime } from "../sandbox-runtime.js";
+import { buildInstalledRuntimeDescriptor, type SandboxRuntime } from "../runtime/contracts.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
 

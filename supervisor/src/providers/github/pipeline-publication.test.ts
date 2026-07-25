@@ -18,7 +18,7 @@ import type {
   PipelineStageAttempt,
   PipelineStore,
 } from "../../pipeline/store.js";
-import { buildInstalledRuntimeDescriptor } from "../../sandbox-runtime.js";
+import { buildInstalledRuntimeDescriptor } from "../../runtime/contracts.js";
 
 const catalogPath = fileURLToPath(new URL("../../__fixtures__/pipelines/catalog.yaml", import.meta.url));
 const runtime = buildInstalledRuntimeDescriptor("publication-test/v1");

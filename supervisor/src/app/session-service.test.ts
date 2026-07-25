@@ -18,7 +18,7 @@ import {
 import { enqueueActivity, tryPostError } from "../providers/linear/outbox.js";
 import { loadPipelineCatalog } from "../pipeline/manifest.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
-import { buildInstalledRuntimeDescriptor } from "../sandbox-runtime.js";
+import { buildInstalledRuntimeDescriptor } from "../runtime/contracts.js";
 
 const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
 const fixtureCatalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));

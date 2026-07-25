@@ -1,9 +1,8 @@
-import type { Daytona } from "@daytona/sdk";
-import type { Config } from "./app/config.js";
-import type { SupervisorStore } from "./persistence/store.js";
-import { listLabeledSandboxes } from "./daytona.js";
-import type { LinearOutboxProcessor } from "./providers/linear/outbox.js";
-import type { PipelineStore } from "./pipeline/store.js";
+import type { Config } from "../app/config.js";
+import type { SupervisorStore } from "../persistence/store.js";
+import type { LinearOutboxProcessor } from "../providers/linear/outbox.js";
+import type { PipelineStore } from "../pipeline/store.js";
+import type { RuntimeInventory, RuntimeInventoryResource, RuntimeStopper } from "../runtime/contracts.js";
 import { reapExpiredRuns } from "./reaper.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -16,14 +15,14 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  *    delete (orphans).
  */
 export async function runSweep(
-  daytona: Daytona,
+  runtime: RuntimeInventory & RuntimeStopper,
   store: SupervisorStore,
   cfg: Config,
   pipelines: PipelineStore,
   linearOutbox: LinearOutboxProcessor
 ): Promise<void> {
-  await reapExpiredRuns({ daytona, store, linearOutbox, pipelines });
-  await deleteOrphanSandboxes(daytona, store, cfg);
+  await reapExpiredRuns({ runtime, store, linearOutbox, pipelines });
+  await deleteOrphanSandboxes(runtime, store, cfg);
   const retentionCutoff = new Date(Date.now() - 7 * DAY_MS).toISOString();
   store.pruneDeliveries(retentionCutoff);
   store.pruneSandboxEvents(retentionCutoff);
@@ -31,13 +30,13 @@ export async function runSweep(
 }
 
 async function deleteOrphanSandboxes(
-  daytona: Daytona,
+  runtime: RuntimeInventory,
   store: SupervisorStore,
   cfg: Config
 ): Promise<void> {
-  let sandboxes;
+  let sandboxes: RuntimeInventoryResource[];
   try {
-    sandboxes = await listLabeledSandboxes(daytona);
+    sandboxes = await runtime.listLabeledResources();
   } catch (err) {
     console.error("[sweep] failed to list Daytona sandboxes:", err);
     return;
@@ -62,7 +61,7 @@ async function deleteOrphanSandboxes(
 
     console.log(`[sweep] deleting orphan sandbox ${sandbox.id} (label ticket=${sandbox.labels?.ticket ?? "?"})`);
     try {
-      await daytona.delete(sandbox, 60, false);
+      await runtime.deleteResource(sandbox.id);
     } catch (err) {
       console.error(`[sweep] failed to delete orphan sandbox ${sandbox.id}:`, err);
     }

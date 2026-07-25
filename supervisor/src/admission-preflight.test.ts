@@ -1,4 +1,3 @@
-import type { Daytona } from "@daytona/sdk";
 import type Database from "better-sqlite3";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -24,7 +23,7 @@ import {
 import { enqueueActivity, tryPostError } from "./providers/linear/outbox.js";
 import { loadPipelineCatalog } from "./pipeline/manifest.js";
 import { createPipelineStore } from "./persistence/pipeline/create-store.js";
-import { buildInstalledRuntimeDescriptor } from "./sandbox-runtime.js";
+import { buildInstalledRuntimeDescriptor } from "./runtime/contracts.js";
 
 const shippedCatalogPath = fileURLToPath(new URL("../pipelines/catalog.yaml", import.meta.url));
 
@@ -129,7 +128,7 @@ describe("runAdmissionPreflight", () => {
       readCheckDeps({
         fetch: async () => Response.json({ tree: [] }),
         listSandboxes: async () => {
-          throw new Error("daytona API is down");
+          throw new Error("runtime API is down");
         },
         totalMemoryGib: 10,
         sandboxMemoryGib: 8,
@@ -162,7 +161,7 @@ describe("admission preflight wired into Linear admission", () => {
       githubWebhookSecret: "github-webhook",
       githubToken: "github-write-token",
       githubReadToken: "github-read-token",
-      daytonaApiKey: "daytona",
+      daytonaApiKey: "runtime",
       daytonaSnapshot: "snapshot",
       daytonaTotalMemoryGib: 10,
       daytonaSandboxMemoryGib: 8,
@@ -290,8 +289,11 @@ describe("admission preflight wired into Linear admission", () => {
     return { tickets, pipelines, githubFetch };
   }
 
-  const cfgPreflight = (daytona: Daytona) => createAdmissionPreflight(config(), daytona);
-  const emptyDaytona = { list: async function* () {} } as unknown as Daytona;
+  const cfgPreflight = (runtime: Parameters<typeof createAdmissionPreflight>[1]) =>
+    createAdmissionPreflight(config(), runtime);
+  const emptyDaytona = {
+    listLabeledResources: async () => [],
+  };
 
   it("rejects admission before any pipeline instance when the read token 403s", async () => {
     const { tickets, githubFetch } = await admit({
@@ -327,10 +329,9 @@ describe("admission preflight wired into Linear admission", () => {
 
   it("rejects admission when the org memory quota is exhausted", async () => {
     const fullDaytona = {
-      list: async function* () {
-        yield { id: "sb-1", state: "started", memory: 8 };
-      },
-    } as unknown as Daytona;
+      listLabeledResources: async () => [{ id: "sb-1", state: "started", memory: 8 }],
+      deleteResource: vi.fn(async () => undefined),
+    };
 
     const { tickets } = await admit({ preflight: cfgPreflight(fullDaytona) });
 
@@ -343,10 +344,11 @@ describe("admission preflight wired into Linear admission", () => {
   it("admits when the capacity probe is broken instead of blocking delegation", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const brokenDaytona = {
-      list: () => {
-        throw new Error("daytona listing exploded");
+      listLabeledResources: () => {
+        throw new Error("runtime listing exploded");
       },
-    } as unknown as Daytona;
+      deleteResource: vi.fn(async () => undefined),
+    };
 
     const { pipelines } = await admit({ preflight: cfgPreflight(brokenDaytona) });
 

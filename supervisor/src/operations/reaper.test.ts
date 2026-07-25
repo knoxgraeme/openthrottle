@@ -1,13 +1,12 @@
-import type { Daytona } from "@daytona/sdk";
 import type Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Config } from "./app/config.js";
-import type { SupervisorStore } from "./persistence/store.js";
-import { createSupervisorStore } from "./persistence/store.js";
-import { openDb } from "./persistence/database.js";
-import { createLinearOutboxProcessor } from "./providers/linear/outbox.js";
+import type { Config } from "../app/config.js";
+import type { SupervisorStore } from "../persistence/store.js";
+import { createSupervisorStore } from "../persistence/store.js";
+import { openDb } from "../persistence/database.js";
+import { createLinearOutboxProcessor } from "../providers/linear/outbox.js";
 import { reapStalledRuns } from "./reaper.js";
-import type { PipelineStore } from "./pipeline/store.js";
+import type { PipelineStore } from "../pipeline/store.js";
 
 let db: Database.Database | undefined;
 afterEach(() => db?.close());
@@ -15,14 +14,11 @@ afterEach(() => db?.close());
 const cfg = { stallTimeoutSeconds: 900 } as Config;
 
 function makeDaytona(stopError?: Error) {
-  const sandbox = {
-    id: "sandbox-1",
-    stop: vi.fn(async () => {
-      if (stopError) throw stopError;
-    }),
-  };
-  const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
-  return { daytona, sandbox };
+  const stop = vi.fn(async () => {
+    if (stopError) throw stopError;
+  });
+  const runtime = { stopResource: stop };
+  return { runtime, sandbox: { stop } };
 }
 
 // No Linear client: enqueue succeeds, delivery throws and is swallowed by
@@ -47,7 +43,7 @@ describe("reapStalledRuns", () => {
   it("reaps a silent run, settles its sandbox, and leaves fresh runs alone", async () => {
     db = openDb(":memory:");
     const store = createSupervisorStore(db);
-    const { daytona, sandbox } = makeDaytona();
+    const { runtime, sandbox } = makeDaytona();
     const linearOutbox = makeOutbox(store);
 
     addTicket(store, "stalled", "sandbox-1");
@@ -81,7 +77,7 @@ describe("reapStalledRuns", () => {
     );
     store.renewRunLiveness("run-stalled", "2020-01-01T00:00:00.000Z");
 
-    await reapStalledRuns({ daytona, store, linearOutbox, cfg });
+    await reapStalledRuns({ runtime, store, linearOutbox, cfg });
 
     // The stalled run is reaped: run terminal, ticket errored, run_id cleared.
     expect(store.getRun("run-stalled")?.status).toBe("timed_out");
@@ -107,7 +103,7 @@ describe("reapStalledRuns", () => {
     expect(payload.activity.body).not.toContain("heartbeat");
 
     // The actor was stopped before ticket exclusivity was released.
-    expect(sandbox.stop).toHaveBeenCalledWith(60, true);
+    expect(sandbox.stop).toHaveBeenCalledWith("sandbox-1", expect.stringContaining("run reaped"));
 
     // The freshly-started run is untouched.
     expect(store.getRun("run-fresh")?.status).toBe("running");
@@ -117,7 +113,7 @@ describe("reapStalledRuns", () => {
   it("does not reap a run kept alive by a recent sandbox event", async () => {
     db = openDb(":memory:");
     const store = createSupervisorStore(db);
-    const { daytona } = makeDaytona();
+    const { runtime } = makeDaytona();
     const linearOutbox = makeOutbox(store);
 
     addTicket(store, "beating", "sandbox-1");
@@ -142,7 +138,7 @@ describe("reapStalledRuns", () => {
     });
     store.renewRunLiveness("run-beating", new Date().toISOString());
 
-    await reapStalledRuns({ daytona, store, linearOutbox, cfg });
+    await reapStalledRuns({ runtime, store, linearOutbox, cfg });
 
     expect(store.getRun("run-beating")?.status).toBe("running");
     expect(store.getByIssueId("beating")?.run_id).toBe("run-beating");
@@ -152,7 +148,7 @@ describe("reapStalledRuns", () => {
   it("reaps a bootstrapping run from started_at when no heartbeat ever arrives", async () => {
     db = openDb(":memory:");
     const store = createSupervisorStore(db);
-    const { daytona } = makeDaytona();
+    const { runtime } = makeDaytona();
     const linearOutbox = makeOutbox(store);
 
     addTicket(store, "booting", "sandbox-1");
@@ -170,7 +166,7 @@ describe("reapStalledRuns", () => {
       "run-booting"
     );
 
-    await reapStalledRuns({ daytona, store, linearOutbox, cfg });
+    await reapStalledRuns({ runtime, store, linearOutbox, cfg });
 
     expect(store.getRun("run-booting")?.status).toBe("timed_out");
     expect(store.getByIssueId("booting")?.run_id).toBeNull();
@@ -180,7 +176,7 @@ describe("reapStalledRuns", () => {
   it("quarantines a claimed run when termination cannot be confirmed", async () => {
     db = openDb(":memory:");
     const store = createSupervisorStore(db);
-    const { daytona } = makeDaytona(new Error("provider timeout"));
+    const { runtime } = makeDaytona(new Error("provider timeout"));
     const linearOutbox = makeOutbox(store);
     addTicket(store, "wedged", "sandbox-1");
     store.beginRun({
@@ -195,7 +191,7 @@ describe("reapStalledRuns", () => {
       "run-wedged"
     );
 
-    await reapStalledRuns({ daytona, store, linearOutbox, cfg });
+    await reapStalledRuns({ runtime, store, linearOutbox, cfg });
 
     expect(store.getRun("run-wedged")?.status).toBe("quarantined");
     expect(store.getByIssueId("wedged")).toMatchObject({
@@ -223,7 +219,7 @@ describe("reapStalledRuns", () => {
   it("quarantines a pipeline resource without advancing to a retry before actor termination", async () => {
     db = openDb(":memory:");
     const store = createSupervisorStore(db);
-    const { daytona } = makeDaytona(new Error("provider timeout"));
+    const { runtime } = makeDaytona(new Error("provider timeout"));
     const linearOutbox = makeOutbox(store);
     addTicket(store, "pipeline-wedged", "sandbox-1");
     store.beginRun({
@@ -247,7 +243,7 @@ describe("reapStalledRuns", () => {
       getActiveAttempt,
     } as unknown as PipelineStore;
 
-    await reapStalledRuns({ daytona, store, linearOutbox, cfg, pipelines });
+    await reapStalledRuns({ runtime, store, linearOutbox, cfg, pipelines });
 
     expect(setRuntimeResourceStatus).toHaveBeenCalledWith("pipeline-1", "quarantined");
     expect(getActiveAttempt).not.toHaveBeenCalled();
@@ -298,13 +294,13 @@ describe("reapStalledRuns", () => {
     let confirmStop!: () => void;
     const stopGate = new Promise<void>((resolve) => { confirmStop = resolve; });
     const sandbox = { id: "sandbox-1", stop: vi.fn(async () => stopGate) };
-    const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
+    const runtime = { stopResource: sandbox.stop };
     const linearOutbox = makeOutbox(store);
 
-    const first = reapStalledRuns({ daytona, store, linearOutbox, cfg });
+    const first = reapStalledRuns({ runtime, store, linearOutbox, cfg });
     await vi.waitFor(() => expect(sandbox.stop).toHaveBeenCalledOnce());
-    await reapStalledRuns({ daytona, store, linearOutbox, cfg });
-    expect(daytona.get).toHaveBeenCalledOnce();
+    await reapStalledRuns({ runtime, store, linearOutbox, cfg });
+    expect(runtime.stopResource).toHaveBeenCalledOnce();
 
     confirmStop();
     await first;
@@ -314,7 +310,7 @@ describe("reapStalledRuns", () => {
   it("renews the supervisor lease before every stalled actor", async () => {
     db = openDb(":memory:");
     const store = createSupervisorStore(db);
-    const { daytona } = makeDaytona();
+    const { runtime } = makeDaytona();
     const linearOutbox = makeOutbox(store);
     for (const id of ["first", "second"]) {
       addTicket(store, id, "sandbox-1");
@@ -332,7 +328,7 @@ describe("reapStalledRuns", () => {
     }
     const acquire = vi.spyOn(store, "acquireSupervisorLease");
 
-    await reapStalledRuns({ daytona, store, linearOutbox, cfg });
+    await reapStalledRuns({ runtime, store, linearOutbox, cfg });
 
     expect(acquire).toHaveBeenCalledTimes(3); // initial acquisition + each actor
     expect(store.getRun("run-first")?.status).toBe("timed_out");
@@ -342,11 +338,11 @@ describe("reapStalledRuns", () => {
   it("is a no-op when there are no stalled runs", async () => {
     db = openDb(":memory:");
     const store = createSupervisorStore(db);
-    const { daytona } = makeDaytona();
+    const { runtime } = makeDaytona();
     const linearOutbox = makeOutbox(store);
 
     await expect(
-      reapStalledRuns({ daytona, store, linearOutbox, cfg })
+      reapStalledRuns({ runtime, store, linearOutbox, cfg })
     ).resolves.toBeUndefined();
     expect(store.listLinearOutbox()).toHaveLength(0);
   });

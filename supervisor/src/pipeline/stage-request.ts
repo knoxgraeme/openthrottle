@@ -7,7 +7,7 @@ import {
   STAGE_EXECUTOR_PROTOCOL,
   createStageRequestHash,
   type StageRequestEnvelope,
-} from "../sandbox-runtime.js";
+} from "../runtime/contracts.js";
 
 function deterministicId(prefix: string, input: unknown): string {
   return `${prefix}-${digestNormalized(canonicalJson(input)).slice(0, 32)}`;

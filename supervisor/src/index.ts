@@ -1,22 +1,21 @@
-import { Daytona } from "@daytona/sdk";
 import { loadConfig } from "./app/config.js";
 import { createSupervisorStore } from "./persistence/store.js";
 import { openDb } from "./persistence/database.js";
 import { listen } from "./http/listener.js";
 import { createServer, createServerWebhookDeliveryProcessor } from "./http/server.js";
-import { runSweep } from "./sweep.js";
+import { runSweep } from "./operations/sweep.js";
 import { createLinearClientProvider } from "./providers/linear/auth.js";
 import { captureCodexAuthJson, getCodexAuthForSeed } from "./providers/codex/auth.js";
-import { pollSandboxEvents } from "./sandbox-events.js";
-import { deliverPendingInbox } from "./inbox.js";
-import { reapStalledRuns } from "./reaper.js";
+import { pollSandboxEvents } from "./runtime/event-poller.js";
+import { deliverPendingInbox } from "./runtime/steering.js";
+import { reapStalledRuns } from "./operations/reaper.js";
 import { activityPayload, createLinearOutboxProcessor, enqueueSessionUpdate } from "./providers/linear/outbox.js";
 import { loadPipelineCatalog } from "./pipeline/manifest.js";
 import { createPipelineStore } from "./persistence/pipeline/create-store.js";
-import { loadRuntimeCapabilityDescriptor } from "./sandbox-runtime.js";
+import { loadRuntimeCapabilityDescriptor } from "./runtime/contracts.js";
 import { drainDeferredProviderEvidence, settleStageEvidence } from "./pipeline/gates.js";
 import { createGithubPublicationProcessor } from "./providers/github/pipeline-publication.js";
-import { createDaytonaSandboxRuntime } from "./daytona.js";
+import { createDaytonaRuntime } from "./providers/daytona/adapter.js";
 import { createPipelineEffectProcessor } from "./operations/pipeline-effects.js";
 import { drainPipelineFeedbackSnapshots } from "./providers/github/events.js";
 
@@ -45,10 +44,10 @@ async function main() {
   pipelineStore.acceptRuntimeDescriptor(runtimeCapabilities);
   pipelineStore.acceptCatalog(pipelineCatalog);
 
-  const daytona = new Daytona({ apiKey: cfg.daytonaApiKey });
   const getLinearClient = createLinearClientProvider(cfg, store);
   const linearOutboxProcessor = createLinearOutboxProcessor({ store, getLinearClient });
-  const pipelineRuntime = createDaytonaSandboxRuntime(daytona, {
+  const runtime = createDaytonaRuntime({
+    apiKey: cfg.daytonaApiKey,
     snapshot: cfg.daytonaSnapshot,
     taskTimeoutSeconds: cfg.taskTimeout,
     materializeCredentialEnv: async (resource, scopes) => {
@@ -82,7 +81,7 @@ async function main() {
   const pipelineEffectProcessor = createPipelineEffectProcessor({
     store: pipelineStore,
     tickets: store,
-    runtime: pipelineRuntime,
+    runtime,
     taskTimeoutSeconds: cfg.taskTimeout,
   });
   const pipelineCoordinator = {
@@ -99,7 +98,7 @@ async function main() {
   const deliveryProcessor = createServerWebhookDeliveryProcessor({
     cfg,
     store,
-    daytona,
+    runtime,
     getLinearClient,
     linearOutbox: linearOutboxProcessor,
     pipelineCoordinator,
@@ -108,7 +107,7 @@ async function main() {
   const app = createServer({
     cfg,
     store,
-    daytona,
+    runtime,
     getLinearClient,
     deliveryProcessor,
     linearOutboxProcessor,
@@ -129,7 +128,7 @@ async function main() {
     sandboxPollRunning = true;
     try {
       await pollSandboxEvents({
-        daytona,
+        runtime,
         store,
         postActivity: async (activity, event) => {
           const row = store.enqueueLinearOutbox({
@@ -173,8 +172,8 @@ async function main() {
           if (ticket.agent !== "codex") return;
           try {
             const raw = (
-              await sandbox.fs.downloadFile("/home/agent/.codex/auth.json")
-            ).toString("utf8");
+              await sandbox.fs.downloadFile!("/home/agent/.codex/auth.json")
+            )!.toString("utf8");
             if (captureCodexAuthJson(store, raw)) {
               console.log("[codex-auth] captured a rotated refresh token from the sandbox");
             }
@@ -185,7 +184,7 @@ async function main() {
       });
       // Deliver any queued mid-run steering into running sandboxes on the same
       // fast cadence, so a steer reaches the agent within one poll interval.
-      await deliverPendingInbox({ daytona, store });
+      await deliverPendingInbox({ runtime, store });
     } finally {
       sandboxPollRunning = false;
     }
@@ -201,10 +200,10 @@ async function main() {
   githubPublicationProcessor.drain().catch((err) => console.error("[github-publication] boot drain failed:", err));
   pipelineEffectProcessor.drain().catch((err) => console.error("[pipeline-effects] boot drain failed:", err));
   pollActiveSandboxes().catch((err) => console.error("[sandbox-events] boot poll failed:", err));
-  runSweep(daytona, store, cfg, pipelineStore, linearOutboxProcessor)
+  runSweep(runtime, store, cfg, pipelineStore, linearOutboxProcessor)
     .catch((err) => console.error("[sweep] boot sweep failed:", err));
   const reapStalled = () =>
-    reapStalledRuns({ daytona, store, linearOutbox: linearOutboxProcessor, cfg, pipelines: pipelineStore }).catch((err) =>
+    reapStalledRuns({ runtime, store, linearOutbox: linearOutboxProcessor, cfg, pipelines: pipelineStore }).catch((err) =>
       console.error("[reaper] stall reap failed:", err)
     );
   reapStalled();
@@ -228,7 +227,7 @@ async function main() {
     );
   }, cfg.sandboxEventPollIntervalMs).unref();
   setInterval(() => {
-    runSweep(daytona, store, cfg, pipelineStore, linearOutboxProcessor)
+    runSweep(runtime, store, cfg, pipelineStore, linearOutboxProcessor)
       .catch((err) => console.error("[sweep] interval sweep failed:", err));
   }, SWEEP_INTERVAL_MS).unref();
 

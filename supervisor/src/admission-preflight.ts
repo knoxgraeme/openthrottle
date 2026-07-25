@@ -13,9 +13,8 @@
 //     opaquely. Estimate usage from live sandboxes and reject when one more
 //     sandbox cannot fit. A broken capacity probe never blocks admission.
 
-import type { Daytona } from "@daytona/sdk";
 import type { Config } from "./app/config.js";
-import { listLabeledSandboxes } from "./daytona.js";
+import type { RuntimeInventory } from "./runtime/contracts.js";
 
 const HTTP_TIMEOUT_MS = 15_000;
 export const DEFAULT_DAYTONA_TOTAL_MEMORY_GIB = 10;
@@ -42,6 +41,8 @@ export interface AdmissionPreflightDeps {
   sandboxMemoryGib?: number;
 }
 
+type RuntimeInventoryReader = Pick<RuntimeInventory, "listLabeledResources">;
+
 export async function runAdmissionPreflight(
   deps: AdmissionPreflightDeps,
   target: AdmissionPreflightTarget
@@ -51,13 +52,13 @@ export async function runAdmissionPreflight(
   return checkDaytonaCapacity(deps);
 }
 
-/** Bind the preflight to supervisor config and the live Daytona client. */
-export function createAdmissionPreflight(cfg: Config, daytona: Daytona): AdmissionPreflight {
+/** Bind the preflight to supervisor config and the live runtime inventory. */
+export function createAdmissionPreflight(cfg: Config, runtime: RuntimeInventoryReader): AdmissionPreflight {
   return (target) =>
     runAdmissionPreflight(
       {
         githubReadToken: cfg.githubReadToken,
-        listSandboxes: () => listLabeledSandboxes(daytona),
+        listSandboxes: () => runtime.listLabeledResources(),
         totalMemoryGib: cfg.daytonaTotalMemoryGib,
         sandboxMemoryGib: cfg.daytonaSandboxMemoryGib,
       },
