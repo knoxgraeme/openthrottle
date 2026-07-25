@@ -1,7 +1,11 @@
 import type Database from "better-sqlite3";
 import { canonicalJson, digestNormalized } from "../../pipeline/manifest.js";
-import { buildStageRequest, plannedStageRunId } from "../../pipeline/stage-request.js";
-import { createStageRequestHash, type StageRequestEnvelope } from "../../runtime/contracts.js";
+import {
+  buildStageRequest,
+  createStageRequestHash,
+  plannedStageRunId,
+  type StageRequestEnvelope,
+} from "../../pipeline/stage-request.js";
 import type {
   PipelineEffectIntent,
   PipelineInstance,

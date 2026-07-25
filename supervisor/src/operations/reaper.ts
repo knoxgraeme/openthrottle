@@ -14,9 +14,9 @@
 
 import { randomUUID } from "node:crypto";
 import type { Config } from "../app/config.js";
+import type { ActivityPublicationPort } from "../app/ports.js";
 import type { SupervisorStore } from "../persistence/store.js";
 import { terminateAndSettleActor } from "./actor-settlement.js";
-import { tryPostError, type LinearOutboxProcessor } from "../providers/linear/outbox.js";
 import type { PipelineStore } from "../pipeline/store.js";
 import { processPipelineInfrastructureFailure } from "../pipeline/control.js";
 import type { RuntimeStopper } from "../runtime/contracts.js";
@@ -24,11 +24,11 @@ import type { RuntimeStopper } from "../runtime/contracts.js";
 export async function reapStalledRuns(params: {
   runtime: RuntimeStopper;
   store: SupervisorStore;
-  linearOutbox: LinearOutboxProcessor;
+  activityPublisher: Pick<ActivityPublicationPort, "publishError">;
   cfg: Config;
   pipelines?: PipelineStore;
 }): Promise<void> {
-  const { runtime, store, linearOutbox, cfg } = params;
+  const { runtime, store, activityPublisher, cfg } = params;
   const now = new Date();
   const cutoffIso = new Date(now.getTime() - cfg.stallTimeoutSeconds * 1000).toISOString();
   const owner = `reaper-${randomUUID()}`;
@@ -76,17 +76,13 @@ export async function reapStalledRuns(params: {
           if (pipeline && params.pipelines?.getRuntimeResource(pipeline.id)) {
             params.pipelines.setRuntimeResourceStatus(pipeline.id, "quarantined");
           }
-          await tryPostError(
-            store,
-            linearOutbox,
+          await activityPublisher.publishError(
             run.linear_session_id ?? ticket.linear_session_id,
             ticket.linear_issue_id,
             settlement.message
           );
         } else if (settlement.kind === "settled") {
-          await tryPostError(
-            store,
-            linearOutbox,
+          await activityPublisher.publishError(
             run.linear_session_id ?? ticket.linear_session_id,
             ticket.linear_issue_id,
             message
@@ -104,7 +100,7 @@ export async function reapStalledRuns(params: {
 export async function reapExpiredRuns(params: {
   runtime: RuntimeStopper;
   store: SupervisorStore;
-  linearOutbox: LinearOutboxProcessor;
+  activityPublisher: Pick<ActivityPublicationPort, "publishError">;
   pipelines: PipelineStore;
 }): Promise<void> {
   const owner = `expiry-reaper-${randomUUID()}`;
@@ -135,17 +131,13 @@ export async function reapExpiredRuns(params: {
         if (params.pipelines.getRuntimeResource(pipeline.id)) {
           params.pipelines.setRuntimeResourceStatus(pipeline.id, "quarantined");
         }
-        await tryPostError(
-          params.store,
-          params.linearOutbox,
+        await params.activityPublisher.publishError(
           run.linear_session_id ?? ticket.linear_session_id,
           ticket.linear_issue_id,
           settlement.message
         );
       } else if (settlement.kind === "settled") {
-        await tryPostError(
-          params.store,
-          params.linearOutbox,
+        await params.activityPublisher.publishError(
           run.linear_session_id ?? ticket.linear_session_id,
           ticket.linear_issue_id,
           message

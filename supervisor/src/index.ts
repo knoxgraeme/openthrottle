@@ -9,7 +9,7 @@ import { captureCodexAuthJson, getCodexAuthForSeed } from "./providers/codex/aut
 import { pollSandboxEvents } from "./runtime/event-poller.js";
 import { deliverPendingInbox } from "./runtime/steering.js";
 import { reapStalledRuns } from "./operations/reaper.js";
-import { activityPayload, createLinearOutboxProcessor, enqueueSessionUpdate } from "./providers/linear/outbox.js";
+import { activityPayload, createLinearActivityPublisher, createLinearOutboxProcessor, enqueueSessionUpdate } from "./providers/linear/outbox.js";
 import { loadPipelineCatalog } from "./pipeline/manifest.js";
 import { createPipelineStore } from "./persistence/pipeline/create-store.js";
 import { loadRuntimeCapabilityDescriptor } from "./runtime/contracts.js";
@@ -70,6 +70,7 @@ async function main() {
 
   const getLinearClient = createLinearClientProvider(cfg, store);
   const linearOutboxProcessor = createLinearOutboxProcessor({ store, getLinearClient });
+  const activityPublisher = createLinearActivityPublisher(store, linearOutboxProcessor);
   const runtime = createDaytonaRuntime({
     apiKey: cfg.daytonaApiKey,
     snapshot: cfg.daytonaSnapshot,
@@ -229,10 +230,10 @@ async function main() {
   githubPublicationProcessor.drain().catch((err) => console.error("[github-publication] boot drain failed:", err));
   pipelineEffectProcessor.drain().catch((err) => console.error("[pipeline-effects] boot drain failed:", err));
   pollActiveSandboxes().catch((err) => console.error("[sandbox-events] boot poll failed:", err));
-  runSweep(runtime, store, cfg, pipelineStore, linearOutboxProcessor)
+  runSweep(runtime, store, cfg, pipelineStore, activityPublisher)
     .catch((err) => console.error("[sweep] boot sweep failed:", err));
   const reapStalled = () =>
-    reapStalledRuns({ runtime, store, linearOutbox: linearOutboxProcessor, cfg, pipelines: pipelineStore }).catch((err) =>
+    reapStalledRuns({ runtime, store, activityPublisher, cfg, pipelines: pipelineStore }).catch((err) =>
       console.error("[reaper] stall reap failed:", err)
     );
   reapStalled();
@@ -256,7 +257,7 @@ async function main() {
     );
   }, cfg.sandboxEventPollIntervalMs).unref();
   setInterval(() => {
-    runSweep(runtime, store, cfg, pipelineStore, linearOutboxProcessor)
+    runSweep(runtime, store, cfg, pipelineStore, activityPublisher)
       .catch((err) => console.error("[sweep] interval sweep failed:", err));
   }, SWEEP_INTERVAL_MS).unref();
 

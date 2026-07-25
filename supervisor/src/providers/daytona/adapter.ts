@@ -1,13 +1,15 @@
 import { Daytona, type Sandbox } from "@daytona/sdk";
 import {
-  createStageRequestHash,
   type RuntimeResource,
   type RuntimeControl,
   type RuntimeInventoryResource,
   type StageExecutionResult,
-  type StageRequestEnvelope,
 } from "../../runtime/contracts.js";
 import { canonicalJson, digestNormalized, STAGE_OUTCOMES } from "../../pipeline/manifest.js";
+import {
+  createStageRequestHash,
+  type StageRequestEnvelope,
+} from "../../pipeline/stage-request.js";
 
 const ACTIVE_SANDBOX_AUTOSTOP_MINUTES = 60;
 const IDLE_SANDBOX_AUTOSTOP_MINUTES = 5;

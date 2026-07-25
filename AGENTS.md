@@ -43,7 +43,8 @@ npm test --prefix sandbox                 # vitest over runner/bin/tests *.test.
 bats sandbox/tests/runtime.bats           # shell-level runtime.sh tests
 
 # a single test file / name (npm passes args after `--` to vitest)
-npm test --prefix supervisor -- src/db.test.ts
+npm test --prefix supervisor -- src/persistence/run-store.test.ts
+npm test --prefix supervisor -- src/__tests__/architecture.test.ts
 npm test --prefix supervisor -- -t "leases a delivery"
 
 # supervisor local dev (tsx watch). NOTE: .env is NOT auto-loaded — export the
@@ -80,29 +81,33 @@ The whole system is split between a **deterministic outer state machine (Fly
 supervisor)** and **agent reasoning inside the sandbox (native Compound
 Engineering / "CE")**. Keep new logic on the correct side:
 
-- **`supervisor/`** — Hono + `better-sqlite3` control plane deployed on Fly
-  (`src/index.ts` wires it up). It authenticates webhooks, owns all durable
-  state, controls Daytona sandboxes, and publishes to Linear. It never contains
-  agent reasoning. Key seams:
-  - `db.ts` — the SQLite schema and store. Everything durable lives here:
-    `tickets`, `runs`, `agent_sessions`, webhook and Linear inbox/outbox state,
-    repository registrations, immutable pipeline instances/stages/attempts,
-    artifacts, gate/publication receipts, effect intents, and runtime resources.
-  - `server.ts` — all HTTP routes (`/webhooks/linear`, `/webhooks/github`,
-    operator `/status` `/repositories` `/tickets/*`, `/oauth/*`, `/healthz`).
-  - `webhook-delivery.ts` — the durable inbox: signature-verified events are
-    stored, leased, and retried so a delivery survives restarts.
-  - `sandbox-events.ts` — short-interval poller that reads typed stage results,
-    agent activities, plans, and heartbeats from live Daytona sandboxes.
-  - `linear-outbox.ts` / `linear.ts` / `linear-auth.ts` — Linear activities and
-    session updates are persisted **before** delivery, with per-session ordering
-    and OAuth refresh shared across webhook and sweep paths.
-  - `pipeline-coordinator.ts` / `pipeline-store.ts` / `pipeline-effects.ts` —
-    deterministic reduction, durable fences, and retryable external effects.
-  - `sweep.ts` — reaps stale sandboxes/resources on boot and periodically.
-  - `sanitize.ts` — redacts named/nested secret values and known GitHub / OpenAI
-    / Linear / bearer token shapes before anything is logged or published.
-  - `daytona.ts`, `github.ts`/`github-events.ts`, `codex-auth.ts`, `config.ts`.
+- **`supervisor/`** — Hono + `better-sqlite3` control plane deployed on Fly.
+  `src/index.ts` is the only top-level production module and composition root:
+  it constructs the SQLite-backed stores, provider clients, Daytona runtime
+  adapter, operations workers, pipeline services, and HTTP server. It never
+  contains agent reasoning. Ownership boundaries:
+  - `src/app/` — config parsing, command/session orchestration, admission
+    preflight, and provider-neutral application ports.
+  - `src/http/` — Hono routes, listener startup, bearer/HMAC handling, and
+    durable webhook delivery leasing.
+  - `src/pipeline/` — manifests, reducer/control logic, gates/evidence,
+    stage-request construction, publication envelopes, and store contracts.
+  - `src/persistence/` — SQLite lifecycle, schema, immutable migrations, the
+    composed supervisor store, and concrete ticket/run/delivery/steering/work/
+    feedback/settings/pipeline repositories. Production code outside this
+    boundary must not import `better-sqlite3` or query `runs`/`run_liveness`.
+  - `src/providers/` — Linear, GitHub, Codex, and Daytona adapters. Provider
+    SDK/client imports stay in their owning provider subtree.
+  - `src/runtime/` — provider-neutral runtime contracts, event parsing/polling,
+    lifecycle reconciliation, and steering delivery.
+  - `src/operations/` — reaping, sweeping, actor settlement, and retryable
+    pipeline-effect draining through provider-neutral ports.
+  - `src/shared/` — sanitization and bounded log constants.
+  - `src/__tests__/architecture.test.ts` enforces the final import map: no flat
+    production facades, Hono only under `http`, Daytona SDK only under
+    `providers/daytona`, SQLite only under `persistence`, no provider siblings,
+    no production fixture imports, and no root production module except
+    `index.ts`.
 
 - **`sandbox/`** — the Daytona image and its runtime boundary.
   `entrypoint.sh` is Fly-launched (the image's own entrypoint is an inert no-op

@@ -6,26 +6,25 @@ import {
   runAdmissionPreflight,
   type AdmissionPreflight,
 } from "./admission-preflight.js";
-import type { Config } from "./app/config.js";
-import type { ActivityPublicationInput } from "./app/ports.js";
-import { createSupervisorStore } from "./persistence/store.js";
-import { openDb } from "./persistence/database.js";
-import { handleLinearEvent } from "./app/session-service.js";
-import type { LinearClient } from "./providers/linear/client.js";
-import { fetchIssueLabels, parseLinearWebhook } from "./providers/linear/events.js";
+import type { Config } from "./config.js";
+import { createSupervisorStore } from "../persistence/store.js";
+import { openDb } from "../persistence/database.js";
+import { handleLinearEvent } from "./session-service.js";
+import type { LinearClient } from "../providers/linear/client.js";
+import { fetchIssueLabels, parseLinearWebhook } from "../providers/linear/events.js";
 import {
   branchExists,
   getMergeReadiness,
   getRepositoryConfigAtCommit,
   mergePullRequest,
   parsePullRequestUrl,
-} from "./providers/github/client.js";
-import { enqueueActivity, tryPostError } from "./providers/linear/outbox.js";
-import { loadPipelineCatalog } from "./pipeline/manifest.js";
-import { createPipelineStore } from "./persistence/pipeline/create-store.js";
-import { buildInstalledRuntimeDescriptor } from "./runtime/contracts.js";
+} from "../providers/github/client.js";
+import { createLinearActivityPublisher } from "../providers/linear/outbox.js";
+import { loadPipelineCatalog } from "../pipeline/manifest.js";
+import { createPipelineStore } from "../persistence/pipeline/create-store.js";
+import { buildInstalledRuntimeDescriptor } from "../runtime/contracts.js";
 
-const shippedCatalogPath = fileURLToPath(new URL("../pipelines/catalog.yaml", import.meta.url));
+const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
 
 const target = { repository: "owner/repo", baseCommit: "a".repeat(40) };
 
@@ -255,12 +254,7 @@ describe("admission preflight wired into Linear admission", () => {
       drain: vi.fn(async () => undefined),
     };
     const providers = {
-      activityPublisher: {
-        publishActivity: (activity: ActivityPublicationInput, issueId?: string, runId?: string) =>
-          enqueueActivity(tickets, outbox, activity, issueId, runId),
-        publishError: (sessionId: string | undefined, issueId: string | undefined, message: string) =>
-          tryPostError(tickets, outbox, sessionId, issueId, message),
-      },
+      activityPublisher: createLinearActivityPublisher(tickets, outbox),
       labelResolver: {
         fetchIssueLabels: (issueId: string) => fetchIssueLabels(linear, issueId),
       },

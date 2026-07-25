@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "../app/config.js";
 import { createSupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
-import { createLinearOutboxProcessor } from "../providers/linear/outbox.js";
+import { createLinearActivityPublisher, createLinearOutboxProcessor } from "../providers/linear/outbox.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { runSweep } from "./sweep.js";
 
@@ -53,13 +53,14 @@ describe("runSweep", () => {
       store,
       getLinearClient: async () => undefined,
     });
+    const activityPublisher = createLinearActivityPublisher(store, outbox);
 
     await runSweep(
       runtime,
       store,
       { orphanGraceMinutes: 5 } as Config,
       pipelines,
-      outbox
+      activityPublisher
     );
 
     expect(remove).toHaveBeenCalledOnce();
