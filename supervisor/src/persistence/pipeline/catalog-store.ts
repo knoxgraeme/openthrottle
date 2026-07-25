@@ -4,7 +4,7 @@ import {
   type ValidatedPipelineCatalog,
   type ValidatedRepositoryConfig,
 } from "../../pipeline/manifest.js";
-import type { ValidatedRuntimeCapabilityDescriptor } from "../../sandbox-runtime.js";
+import type { ValidatedRuntimeCapabilityDescriptor } from "../../runtime/contracts.js";
 import type { PipelineStore, RepositoryConfigSnapshot } from "../../pipeline/store.js";
 import { assertDigest, deterministicId } from "./helpers.js";
 

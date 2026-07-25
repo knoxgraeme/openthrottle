@@ -20,7 +20,7 @@ import {
   type ValidatedPipelineCatalog,
 } from "../pipeline/manifest.js";
 import type { PipelineStore } from "../pipeline/store.js";
-import type { ValidatedRuntimeCapabilityDescriptor } from "../sandbox-runtime.js";
+import type { ValidatedRuntimeCapabilityDescriptor } from "../runtime/contracts.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import { parseCommand } from "./commands.js";
 import { canSteerPipelineRun, requestPipelineStop } from "../pipeline/control.js";

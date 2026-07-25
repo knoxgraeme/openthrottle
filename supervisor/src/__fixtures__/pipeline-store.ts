@@ -11,7 +11,7 @@ import {
   type ValidatedPipelineCatalog,
 } from "../pipeline/manifest.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
-import { buildInstalledRuntimeDescriptor } from "../sandbox-runtime.js";
+import { buildInstalledRuntimeDescriptor } from "../runtime/contracts.js";
 
 export const catalogPath = fileURLToPath(new URL("./pipelines/catalog.yaml", import.meta.url));
 export const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));

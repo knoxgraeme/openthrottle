@@ -9,7 +9,7 @@ import type {
 import type {
   StageRequestEnvelope,
   ValidatedRuntimeCapabilityDescriptor,
-} from "../sandbox-runtime.js";
+} from "../runtime/contracts.js";
 
 export type PipelineInstanceStatus =
   | "pending"

@@ -1,4 +1,3 @@
-import type { Daytona } from "@daytona/sdk";
 import { createHmac } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -8,7 +7,7 @@ import { openDb } from "../persistence/database.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import type { PipelineStore } from "../pipeline/store.js";
 import { loadPipelineCatalog, parseRepositoryConfig } from "../pipeline/manifest.js";
-import { buildInstalledRuntimeDescriptor } from "../sandbox-runtime.js";
+import { buildInstalledRuntimeDescriptor, type RuntimeInventory, type RuntimeLogs, type RuntimeSnapshotReadiness } from "../runtime/contracts.js";
 import { createServer, createServerWebhookDeliveryProcessor } from "./server.js";
 
 const cfg: Config = {
@@ -23,7 +22,7 @@ const cfg: Config = {
   githubWebhookSecret: "github-secret",
   githubToken: "github-token",
   githubReadToken: "github-read-token",
-  daytonaApiKey: "daytona-key",
+  daytonaApiKey: "runtime-key",
   daytonaSnapshot: "snapshot",
   defaultAgent: "codex",
   claudeCodeOauthToken: undefined,
@@ -39,6 +38,8 @@ const cfg: Config = {
   sandboxRuntimeRelease: "release",
   sandboxRuntimeDescriptorPath: "runtime.json",
 };
+
+type ServerRuntime = RuntimeInventory & RuntimeLogs & RuntimeSnapshotReadiness;
 
 describe("coordinator-only server", () => {
   let db: ReturnType<typeof openDb>;
@@ -57,7 +58,7 @@ describe("coordinator-only server", () => {
     return createServer({
       cfg,
       store,
-      daytona: {} as Daytona,
+      runtime: {} as ServerRuntime,
       getLinearClient: async () => undefined,
       pipelineCoordinator: {
         catalog: {} as never,
@@ -288,7 +289,10 @@ describe("coordinator-only server", () => {
     const processor = createServerWebhookDeliveryProcessor({
       cfg,
       store,
-      daytona: { list: async function* () {} } as unknown as Daytona,
+      runtime: {
+        listLabeledResources: async () => [],
+        deleteResource: vi.fn(async () => undefined),
+      },
       getLinearClient: async () => undefined,
       pipelineCoordinator: {
         catalog,

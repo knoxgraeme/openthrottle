@@ -1,10 +1,9 @@
-import type { Daytona, Sandbox } from "@daytona/sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Config } from "./app/config.js";
-import { createSupervisorStore } from "./persistence/store.js";
-import { openDb } from "./persistence/database.js";
-import { createLinearOutboxProcessor } from "./providers/linear/outbox.js";
-import { createPipelineStore } from "./persistence/pipeline/create-store.js";
+import type { Config } from "../app/config.js";
+import { createSupervisorStore } from "../persistence/store.js";
+import { openDb } from "../persistence/database.js";
+import { createLinearOutboxProcessor } from "../providers/linear/outbox.js";
+import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { runSweep } from "./sweep.js";
 
 describe("runSweep", () => {
@@ -33,33 +32,30 @@ describe("runSweep", () => {
       id: "old-orphan",
       createdAt: "2020-01-01T00:00:00.000Z",
       labels: { ticket: "OLD-1" },
-    } as unknown as Sandbox;
+    };
     const newOrphan = {
       id: "new-orphan",
       createdAt: new Date().toISOString(),
       labels: { ticket: "NEW-1" },
-    } as unknown as Sandbox;
+    };
     const knownActive = {
       id: "known-active",
       createdAt: "2020-01-01T00:00:00.000Z",
       labels: { ticket: "ACTIVE" },
-    } as unknown as Sandbox;
+    };
     const remove = vi.fn(async () => undefined);
-    const daytona = {
-      delete: remove,
-      list: async function* () {
-        yield oldOrphan;
-        yield newOrphan;
-        yield knownActive;
-      },
-    } as unknown as Daytona;
+    const runtime = {
+      deleteResource: remove,
+      stopResource: vi.fn(async () => undefined),
+      listLabeledResources: async () => [oldOrphan, newOrphan, knownActive],
+    };
     const outbox = createLinearOutboxProcessor({
       store,
       getLinearClient: async () => undefined,
     });
 
     await runSweep(
-      daytona,
+      runtime,
       store,
       { orphanGraceMinutes: 5 } as Config,
       pipelines,
@@ -67,9 +63,9 @@ describe("runSweep", () => {
     );
 
     expect(remove).toHaveBeenCalledOnce();
-    expect(remove).toHaveBeenCalledWith(oldOrphan, 60, false);
-    expect(remove).not.toHaveBeenCalledWith(newOrphan, 60, false);
-    expect(remove).not.toHaveBeenCalledWith(knownActive, 60, false);
+    expect(remove).toHaveBeenCalledWith("old-orphan");
+    expect(remove).not.toHaveBeenCalledWith("new-orphan");
+    expect(remove).not.toHaveBeenCalledWith("known-active");
     expect(db.prepare("SELECT COUNT(*) FROM webhook_deliveries").pluck().get()).toBe(0);
   });
 });

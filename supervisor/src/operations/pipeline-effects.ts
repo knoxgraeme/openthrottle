@@ -3,7 +3,7 @@ import { canonicalJson } from "../pipeline/manifest.js";
 import { digestNormalized } from "../pipeline/manifest.js";
 import { coordinatePipelineEvent } from "../pipeline/coordinator.js";
 import type { PipelineEffectIntent, PipelineInstance, PipelineStore } from "../pipeline/store.js";
-import type { RuntimeResource, SandboxRuntime, StageRequestEnvelope } from "../sandbox-runtime.js";
+import type { RuntimeResource, SandboxRuntime, StageRequestEnvelope } from "../runtime/contracts.js";
 import { sanitizeText } from "../shared/sanitize.js";
 
 const EFFECT_LEASE_MS = 60_000;

@@ -1,10 +1,9 @@
-import type { Daytona, Sandbox } from "@daytona/sdk";
 import type Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
-import { createSupervisorStore } from "./persistence/store.js";
-import { openDb } from "./persistence/database.js";
-import { parseSandboxEvent, pollSandboxEvents } from "./sandbox-events.js";
+import { createSupervisorStore } from "../persistence/store.js";
+import { openDb } from "../persistence/database.js";
+import { parseSandboxEvent, pollSandboxEvents } from "./event-poller.js";
 
 let db: Database.Database | undefined;
 afterEach(() => db?.close());
@@ -184,11 +183,11 @@ describe("sandbox event contracts", () => {
         downloadFile: vi.fn(async (path: string) => files.get(path)!),
         deleteFile: vi.fn(async (path: string) => files.delete(path)),
       },
-    } as unknown as Sandbox;
+    } ;
     const postActivity = vi.fn(async () => undefined);
 
     await pollSandboxEvents({
-      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      runtime: { getWorkspace: vi.fn(async () => sandbox), setActive: vi.fn(async () => undefined), setIdle: vi.fn(async () => undefined) } ,
       store,
       postActivity,
     });
@@ -224,11 +223,11 @@ describe("sandbox event contracts", () => {
         downloadFile: vi.fn(async (path: string) => files.get(path)),
         deleteFile: vi.fn(async (path: string) => files.delete(path)),
       },
-    } as unknown as Sandbox;
+    } ;
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
     await pollSandboxEvents({
-      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      runtime: { getWorkspace: vi.fn(async () => sandbox), setActive: vi.fn(async () => undefined), setIdle: vi.fn(async () => undefined) } ,
       store,
       postActivity: vi.fn(async () => undefined),
     });
@@ -267,12 +266,12 @@ describe("sandbox event contracts", () => {
         downloadFile: vi.fn(async (path: string) => files.get(path)!),
         deleteFile: vi.fn(async (path: string) => files.delete(path)),
       },
-    } as unknown as Sandbox;
+    } ;
     const postStageResult = vi.fn(async () => undefined);
     const captureAgentAuth = vi.fn(async () => undefined);
 
     await pollSandboxEvents({
-      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      runtime: { getWorkspace: vi.fn(async () => sandbox), setActive: vi.fn(async () => undefined), setIdle: vi.fn(async () => undefined) } ,
       store,
       postActivity: vi.fn(async () => undefined),
       postStageResult,
@@ -312,12 +311,12 @@ describe("sandbox event contracts", () => {
         downloadFile: vi.fn(async (remotePath: string) => files.get(remotePath)!),
         deleteFile: vi.fn(async (remotePath: string) => files.delete(remotePath)),
       },
-    } as unknown as Sandbox;
+    } ;
     const postStageResult = vi.fn(async () => undefined);
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
     await pollSandboxEvents({
-      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      runtime: { getWorkspace: vi.fn(async () => sandbox), setActive: vi.fn(async () => undefined), setIdle: vi.fn(async () => undefined) } ,
       store,
       postActivity: vi.fn(async () => undefined),
       postStageResult,
@@ -363,12 +362,12 @@ describe("sandbox event contracts", () => {
           files.delete(path);
         }),
       },
-    } as unknown as Sandbox;
-    const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
+    } ;
+    const runtime = { getWorkspace: vi.fn(async () => sandbox), setActive: vi.fn(async () => undefined), setIdle: vi.fn(async () => undefined) } ;
     const postActivity = vi.fn(async () => undefined);
 
     await pollSandboxEvents({
-      daytona,
+      runtime,
       store,
       postActivity,
     });
@@ -417,12 +416,12 @@ describe("sandbox event contracts", () => {
           files.delete(path);
         }),
       },
-    } as unknown as Sandbox;
-    const daytona = { get: vi.fn(async () => sandbox) } as unknown as Daytona;
+    } ;
+    const runtime = { getWorkspace: vi.fn(async () => sandbox), setActive: vi.fn(async () => undefined), setIdle: vi.fn(async () => undefined) } ;
     const postSessionUpdate = vi.fn(async () => undefined);
 
     await pollSandboxEvents({
-      daytona,
+      runtime,
       store,
       postActivity: vi.fn(async () => undefined),
       postSessionUpdate,
@@ -452,24 +451,19 @@ describe("sandbox event contracts", () => {
     const activeStarted = new Promise<void>((resolve) => {
       markActiveStarted = resolve;
     });
-    const autostopIntervals: number[] = [];
     const listFiles = vi.fn(async () => []);
     const sandbox = {
       id: "sandbox-1",
       state: "started",
-      autoStopInterval: 5,
-      setAutostopInterval: vi.fn(async (minutes: number) => {
-        autostopIntervals.push(minutes);
-        if (minutes === 60) {
-          markActiveStarted();
-          await activeReleased;
-        }
-        sandbox.autoStopInterval = minutes;
-      }),
       fs: { listFiles },
-    } as unknown as Sandbox;
+    } ;
+    const setActive = vi.fn(async () => {
+      markActiveStarted();
+      await activeReleased;
+    });
+    const setIdle = vi.fn(async () => undefined);
     const polling = pollSandboxEvents({
-      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      runtime: { getWorkspace: vi.fn(async () => sandbox), setActive, setIdle } ,
       store,
       postActivity: vi.fn(),
     });
@@ -479,8 +473,8 @@ describe("sandbox event contracts", () => {
     releaseActive();
     await polling;
 
-    expect(autostopIntervals).toEqual([60, 5]);
-    expect(sandbox.autoStopInterval).toBe(5);
+    expect(setActive).toHaveBeenCalledWith("sandbox-1");
+    expect(setIdle).toHaveBeenCalledWith("sandbox-1");
     expect(listFiles).not.toHaveBeenCalled();
   });
 
@@ -512,11 +506,11 @@ describe("sandbox event contracts", () => {
         }),
         deleteFile,
       },
-    } as unknown as Sandbox;
+    } ;
     const postActivity = vi.fn();
 
     await pollSandboxEvents({
-      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      runtime: { getWorkspace: vi.fn(async () => sandbox), setActive: vi.fn(async () => undefined), setIdle: vi.fn(async () => undefined) } ,
       store,
       postActivity,
     });
@@ -560,11 +554,11 @@ describe("sandbox event contracts", () => {
         }),
         deleteFile,
       },
-    } as unknown as Sandbox;
+    } ;
     const postActivity = vi.fn();
 
     await pollSandboxEvents({
-      daytona: { get: vi.fn(async () => sandbox) } as unknown as Daytona,
+      runtime: { getWorkspace: vi.fn(async () => sandbox), setActive: vi.fn(async () => undefined), setIdle: vi.fn(async () => undefined) } ,
       store,
       postActivity,
     });

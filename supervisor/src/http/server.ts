@@ -1,6 +1,5 @@
 import { Hono } from "hono";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import type { Daytona } from "@daytona/sdk";
 import type { Config } from "../app/config.js";
 import type { Ticket, SupervisorStore, WebhookDelivery } from "../persistence/store.js";
 import {
@@ -25,7 +24,6 @@ import {
   verifyGithubSignature,
   type GithubWebhookEvent,
 } from "../providers/github/client.js";
-import { getSandboxLogs } from "../daytona.js";
 import { MAX_PRIVATE_LOG_TAIL_CHARS } from "../shared/logs.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import {
@@ -44,11 +42,12 @@ import { createAdmissionPreflight } from "../admission-preflight.js";
 import { handleGithubEvent } from "../providers/github/events.js";
 import { renderPipelineLogHeader } from "../pipeline/publication.js";
 import { canSteerPipelineRun, requestPipelineStop } from "../pipeline/control.js";
+import type { RuntimeInventory, RuntimeLogs, RuntimeSnapshotReadiness } from "../runtime/contracts.js";
 
 export interface ServerDeps {
   cfg: Config;
   store: SupervisorStore;
-  daytona: Daytona;
+  runtime: RuntimeLogs & RuntimeSnapshotReadiness & RuntimeInventory;
   runBackground?: (task: Promise<void>) => void;
   getLinearClient?: () => Promise<LinearClient | undefined>;
   deliveryProcessor?: WebhookDeliveryProcessor;
@@ -151,7 +150,7 @@ function repositoryRegistrationInput(value: unknown): {
 export function createServerWebhookDeliveryProcessor(deps: {
   cfg: Config;
   store: SupervisorStore;
-  daytona: Daytona;
+  runtime: RuntimeInventory;
   getLinearClient: () => Promise<LinearClient | undefined>;
   linearOutbox?: LinearOutboxProcessor;
   pipelineCoordinator: PipelineCoordinatorContext;
@@ -159,7 +158,7 @@ export function createServerWebhookDeliveryProcessor(deps: {
   const linearOutbox =
     deps.linearOutbox ??
     createLinearOutboxProcessor({ store: deps.store, getLinearClient: deps.getLinearClient });
-  const admissionPreflight = createAdmissionPreflight(deps.cfg, deps.daytona);
+  const admissionPreflight = createAdmissionPreflight(deps.cfg, deps.runtime);
   const activityPublisher = {
     publishActivity: (activity: ActivityPublicationInput, issueId?: string, runId?: string) =>
       enqueueActivity(deps.store, linearOutbox, activity, issueId, runId),
@@ -227,7 +226,7 @@ export function createServerWebhookDeliveryProcessor(deps: {
 }
 
 export function createServer(deps: ServerDeps): Hono {
-  const { cfg, store, daytona } = deps;
+  const { cfg, store, runtime } = deps;
   const getLinearClient = deps.getLinearClient ?? createLinearClientProvider(cfg, store);
   const linearOutboxProcessor =
     deps.linearOutboxProcessor ??
@@ -237,7 +236,7 @@ export function createServer(deps: ServerDeps): Hono {
     createServerWebhookDeliveryProcessor({
       cfg,
       store,
-      daytona,
+      runtime,
       getLinearClient,
       linearOutbox: linearOutboxProcessor,
       pipelineCoordinator: deps.pipelineCoordinator,
@@ -300,7 +299,7 @@ export function createServer(deps: ServerDeps): Hono {
       return context.json({ error: sanitizeText(String(error)) }, 400);
     }
     try {
-      const snapshot = await daytona.snapshot.get(cfg.daytonaSnapshot);
+      const snapshot = await runtime.getSnapshot(cfg.daytonaSnapshot);
       if (String(snapshot.state).toLowerCase() !== "active") {
         throw new Error(
           `Daytona snapshot ${cfg.daytonaSnapshot} is not active (${String(snapshot.state)})`
@@ -534,7 +533,7 @@ export function createServer(deps: ServerDeps): Hono {
       prefix + sanitizeText(logs).slice(-Math.max(0, MAX_PRIVATE_LOG_TAIL_CHARS - prefix.length));
     if (ticket.sandbox_id) {
       try {
-        const logs = await getSandboxLogs(daytona, ticket.sandbox_id);
+        const logs = await runtime.getLogs(ticket.sandbox_id);
         return context.text(withPipelinePrefix(logs));
       } catch (error) {
         console.warn(`[logs] live workspace unavailable for ${ticket.linear_issue_identifier}:`, error);

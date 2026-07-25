@@ -12,23 +12,23 @@
 // non-dispatchable state, then confirms termination before releasing ticket
 // exclusivity. Failed termination is quarantined and remains operator-visible.
 
-import type { Daytona } from "@daytona/sdk";
 import { randomUUID } from "node:crypto";
-import type { Config } from "./app/config.js";
-import type { SupervisorStore } from "./persistence/store.js";
+import type { Config } from "../app/config.js";
+import type { SupervisorStore } from "../persistence/store.js";
 import { terminateAndSettleActor } from "./actor-settlement.js";
-import { tryPostError, type LinearOutboxProcessor } from "./providers/linear/outbox.js";
-import type { PipelineStore } from "./pipeline/store.js";
-import { processPipelineInfrastructureFailure } from "./pipeline/control.js";
+import { tryPostError, type LinearOutboxProcessor } from "../providers/linear/outbox.js";
+import type { PipelineStore } from "../pipeline/store.js";
+import { processPipelineInfrastructureFailure } from "../pipeline/control.js";
+import type { RuntimeStopper } from "../runtime/contracts.js";
 
 export async function reapStalledRuns(params: {
-  daytona: Daytona;
+  runtime: RuntimeStopper;
   store: SupervisorStore;
   linearOutbox: LinearOutboxProcessor;
   cfg: Config;
   pipelines?: PipelineStore;
 }): Promise<void> {
-  const { daytona, store, linearOutbox, cfg } = params;
+  const { runtime, store, linearOutbox, cfg } = params;
   const now = new Date();
   const cutoffIso = new Date(now.getTime() - cfg.stallTimeoutSeconds * 1000).toISOString();
   const owner = `reaper-${randomUUID()}`;
@@ -60,7 +60,7 @@ export async function reapStalledRuns(params: {
           ? params.pipelines?.getInstance(pipelineAttempt.pipeline_instance_id)
           : undefined;
         const settlement = await terminateAndSettleActor({
-          daytona,
+          runtime,
           store,
           runId: run.id,
           sandboxId: ticket.sandbox_id,
@@ -102,7 +102,7 @@ export async function reapStalledRuns(params: {
 }
 
 export async function reapExpiredRuns(params: {
-  daytona: Daytona;
+  runtime: RuntimeStopper;
   store: SupervisorStore;
   linearOutbox: LinearOutboxProcessor;
   pipelines: PipelineStore;
@@ -118,7 +118,7 @@ export async function reapExpiredRuns(params: {
     const message = `OpenThrottle ${run.task_type} stage exceeded its hard execution timeout.`;
     try {
       const settlement = await terminateAndSettleActor({
-        daytona: params.daytona,
+        runtime: params.runtime,
         store: params.store,
         runId: run.id,
         sandboxId: ticket.sandbox_id,

@@ -1,15 +1,10 @@
-// inbox.ts — mid-run steering delivery poller. The inbound mirror of
-// linear-outbox: durable steering messages queued by a human/operator (see the
-// session_inbox store in db.ts) are written into a running sandbox's
-// ~/.ot/inbox as per-message files, where the baked ot-inbox-drain.sh hook
-// injects them into the agent at the next tool/stop boundary — steering the run
-// without killing it. The message body is UNTRUSTED data: it is only ever
-// written as file contents here (never executed), and the sandbox hook frames
-// it as data on injection. Not wired into index.ts here — the integrator wires
-// the poll interval.
+// Mid-run steering delivery poller. Durable steering messages queued by a
+// human/operator are written into a running sandbox's ~/.ot/inbox as per-message
+// files, where the baked ot-inbox-drain.sh hook frames them as untrusted data
+// and injects them into the agent at the next tool/stop boundary.
 
-import type { Daytona } from "@daytona/sdk";
-import type { SupervisorStore } from "./persistence/store.js";
+import type { RuntimeWorkspace, RuntimeWorkspaceAccess } from "./contracts.js";
+import type { SupervisorStore } from "../persistence/store.js";
 
 const INBOX_DIR = "/home/agent/.ot/inbox";
 const INBOX_ACK_DIR = "/home/agent/.ot/inbox-processed";
@@ -50,28 +45,28 @@ function parseAcknowledgement(raw: string): InboxAcknowledgement {
 }
 
 async function collectAcknowledgements(
-  sandbox: Awaited<ReturnType<Daytona["get"]>>,
+  sandbox: RuntimeWorkspace,
   store: SupervisorStore
 ): Promise<void> {
-  const files = await sandbox.fs.listFiles(INBOX_ACK_DIR).catch(() => []);
+  const files = await sandbox.fs.listFiles!(INBOX_ACK_DIR).catch(() => []);
   for (const file of files) {
-    if (file.isDir || !/^[A-Za-z0-9._-]+\.json$/.test(file.name)) {
+    if (file.isDir || typeof file.name !== "string" || !/^[A-Za-z0-9._-]+\.json$/.test(file.name)) {
       continue;
     }
     const remotePath = `${INBOX_ACK_DIR}/${file.name}`;
     if (file.size > 16 * 1024) {
       console.error(`[inbox] deleting oversized acknowledgement ${file.name}`);
-      await sandbox.fs.deleteFile(remotePath).catch(() => undefined);
+      await sandbox.fs.deleteFile!(remotePath).catch(() => undefined);
       continue;
     }
     let acknowledgement: InboxAcknowledgement;
     try {
       acknowledgement = parseAcknowledgement(
-        (await sandbox.fs.downloadFile(remotePath)).toString("utf8")
+        (await sandbox.fs.downloadFile!(remotePath))!.toString("utf8")
       );
     } catch (error) {
       console.error(`[inbox] rejected malformed acknowledgement ${file.name}:`, error);
-      await sandbox.fs.deleteFile(remotePath).catch(() => undefined);
+      await sandbox.fs.deleteFile!(remotePath).catch(() => undefined);
       continue;
     }
     try {
@@ -84,20 +79,20 @@ async function collectAcknowledgements(
         generation: acknowledgement.generation,
         contextRevision: acknowledgement.context_revision,
       });
-      await sandbox.fs.deleteFile(remotePath);
+      await sandbox.fs.deleteFile!(remotePath);
     } catch (error) {
       // Retain a well-formed journal when storage is unavailable so the exact
       // acknowledgement can be retried without redelivering semantic work.
       console.error(`[inbox] could not persist acknowledgement ${file.name}:`, error);
       if (/not found|mismatch|must be dispatched/i.test(String(error))) {
-        await sandbox.fs.deleteFile(remotePath).catch(() => undefined);
+        await sandbox.fs.deleteFile!(remotePath).catch(() => undefined);
       }
     }
   }
 }
 
 export async function deliverPendingInbox(params: {
-  daytona: Daytona;
+  runtime: RuntimeWorkspaceAccess;
   store: SupervisorStore;
 }): Promise<void> {
   for (const ticket of params.store.listRunning()) {
@@ -108,14 +103,14 @@ export async function deliverPendingInbox(params: {
     // unacknowledged — keep it pending until an OpenCode hook is wired.
     if (ticket.agent !== "claude" && ticket.agent !== "codex") continue;
     try {
-      const sandbox = await params.daytona.get(ticket.sandbox_id);
-      if (sandbox.state !== "started") await sandbox.start(60);
+      const sandbox = await params.runtime.getWorkspace(ticket.sandbox_id);
+      if (sandbox.state !== "started") await sandbox.start?.(60);
       await collectAcknowledgements(sandbox, params.store);
       const pending = params.store.listPendingInbox(ticket.linear_issue_id);
       if (pending.length === 0) continue;
       // Best-effort dir creation; the entrypoint also mkdir's this on startup,
       // so an "already exists" here must not block delivery.
-      await sandbox.fs.createFolder(INBOX_DIR, "700").catch(() => undefined);
+      await sandbox.fs.createFolder!(INBOX_DIR, "700").catch(() => undefined);
       for (const message of pending) {
         if (
           !message.delivery_id ||
@@ -131,7 +126,7 @@ export async function deliverPendingInbox(params: {
         const remotePath = `${INBOX_DIR}/${message.delivery_id}.json`;
         // The body is untrusted human/operator data — written verbatim as file
         // contents only, never interpreted here.
-        await sandbox.fs.uploadFile(
+        await sandbox.fs.uploadFile!(
           Buffer.from(JSON.stringify({
             version: 1,
             delivery_id: message.delivery_id,
@@ -146,7 +141,7 @@ export async function deliverPendingInbox(params: {
           })),
           remotePath
         );
-        await sandbox.fs.setFilePermissions(remotePath, {
+        await sandbox.fs.setFilePermissions!(remotePath, {
           owner: "agent",
           group: "agent",
           mode: "600",

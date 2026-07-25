@@ -1,7 +1,6 @@
-import type { Daytona } from "@daytona/sdk";
-import type { Run, Ticket, SupervisorStore } from "./persistence/store.js";
-import { stopSandbox } from "./daytona.js";
-import { sanitizeText } from "./shared/sanitize.js";
+import type { Run, Ticket, SupervisorStore } from "../persistence/store.js";
+import type { RuntimeStopper } from "../runtime/contracts.js";
+import { sanitizeText } from "../shared/sanitize.js";
 
 export type ActorSettlementResult =
   | { kind: "settled"; run: Run }
@@ -12,7 +11,7 @@ export type ActorSettlementResult =
 // non-dispatchable first; ticket exclusivity is released only after Daytona
 // confirms termination. Callers publish effects only for the returned winner.
 export async function terminateAndSettleActor(params: {
-  daytona: Daytona;
+  runtime: RuntimeStopper;
   store: SupervisorStore;
   runId: string;
   sandboxId: string | null;
@@ -27,7 +26,7 @@ export async function terminateAndSettleActor(params: {
   if (!claimed) return { kind: "lost" };
 
   try {
-    if (params.sandboxId) await stopSandbox(params.daytona, params.sandboxId);
+    if (params.sandboxId) await params.runtime.stopResource(params.sandboxId, params.reason);
   } catch (error) {
     const message = sanitizeText(
       `${params.reason} Actor termination could not be confirmed; the ticket remains quarantined: ${String(error)}`

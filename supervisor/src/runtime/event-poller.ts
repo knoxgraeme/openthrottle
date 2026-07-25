@@ -1,11 +1,13 @@
-import type { Daytona, Sandbox } from "@daytona/sdk";
-import type { AgentActivityInput, AgentPlanItem, AgentPlanStatus } from "./providers/linear/client.js";
-import type { Ticket, SupervisorStore } from "./persistence/store.js";
-import { ensureSandboxActive, setSandboxActive, setSandboxIdle } from "./daytona.js";
-import { reconcileSandboxAutostop } from "./sandbox-lifecycle.js";
-import { sanitizeText } from "./shared/sanitize.js";
-import { STAGE_OUTCOMES } from "./pipeline/manifest.js";
-import type { PipelineCoordinatorEvent, PipelineEventArtifact } from "./pipeline/coordinator.js";
+import type {
+  RuntimeWorkspace,
+  RuntimeWorkspaceAccess,
+  SandboxAutostopRuntime,
+} from "./contracts.js";
+import type { Ticket, SupervisorStore } from "../persistence/store.js";
+import { reconcileSandboxAutostop } from "./lifecycle.js";
+import { sanitizeText } from "../shared/sanitize.js";
+import { STAGE_OUTCOMES } from "../pipeline/manifest.js";
+import type { PipelineCoordinatorEvent, PipelineEventArtifact } from "../pipeline/coordinator.js";
 
 const OUTBOX_DIR = "/home/agent/.ot/outbox";
 const SEALED_HEARTBEAT_FILE = "/var/lib/openthrottle/heartbeat/heartbeat.json";
@@ -23,7 +25,7 @@ const ACTIVITY_TYPES: ReadonlyArray<SandboxActivityEvent["type"]> = [
   "response",
   "error",
 ];
-const PLAN_STATUSES: ReadonlyArray<AgentPlanStatus> = [
+const PLAN_STATUSES: ReadonlyArray<RuntimePlanStatus> = [
   "pending",
   "inProgress",
   "completed",
@@ -31,6 +33,31 @@ const PLAN_STATUSES: ReadonlyArray<AgentPlanStatus> = [
 ];
 const MAX_PLAN_ITEMS = 50;
 const MAX_PLAN_CONTENT = 500;
+
+export type RuntimeProgressActivityInput =
+  | {
+      id?: string;
+      sessionId: string;
+      type: "thought" | "elicitation" | "response" | "error";
+      body: string;
+      ephemeral?: boolean;
+    }
+  | {
+      id?: string;
+      sessionId: string;
+      type: "action";
+      action: string;
+      parameter: string;
+      result?: string;
+      ephemeral?: boolean;
+    };
+
+export type RuntimePlanStatus = "pending" | "inProgress" | "completed" | "canceled";
+
+export interface RuntimePlanItem {
+  content: string;
+  status: RuntimePlanStatus;
+}
 
 export type SandboxEvent = SandboxActivityEvent | SandboxPlanEvent | SandboxHeartbeatEvent | SandboxStageResultEvent;
 
@@ -85,7 +112,7 @@ interface SandboxPlanEvent {
   event_id: string;
   run_id: string;
   created_at: string;
-  plan: AgentPlanItem[];
+  plan: RuntimePlanItem[];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -96,7 +123,7 @@ function isActivityType(value: unknown): value is SandboxActivityEvent["type"] {
   return typeof value === "string" && ACTIVITY_TYPES.includes(value as SandboxActivityEvent["type"]);
 }
 
-function parsePlanItems(value: unknown): AgentPlanItem[] {
+function parsePlanItems(value: unknown): RuntimePlanItem[] {
   if (!Array.isArray(value) || value.length === 0 || value.length > MAX_PLAN_ITEMS) {
     throw new Error("sandbox plan has an invalid item list");
   }
@@ -106,11 +133,11 @@ function parsePlanItems(value: unknown): AgentPlanItem[] {
       typeof item.content !== "string" ||
       !item.content.trim() ||
       item.content.length > MAX_PLAN_CONTENT ||
-      !PLAN_STATUSES.includes(item.status as AgentPlanStatus)
+      !PLAN_STATUSES.includes(item.status as RuntimePlanStatus)
     ) {
       throw new Error("sandbox plan has an invalid item");
     }
-    return { content: item.content, status: item.status as AgentPlanStatus };
+    return { content: item.content, status: item.status as RuntimePlanStatus };
   });
 }
 
@@ -244,7 +271,7 @@ export function parseSandboxEvent(raw: string): SandboxEvent {
   throw new Error("sandbox event has an invalid kind");
 }
 
-function toLinearActivity(event: SandboxActivityEvent, sessionId: string): AgentActivityInput {
+function toProgressActivity(event: SandboxActivityEvent, sessionId: string): RuntimeProgressActivityInput {
   const body = sanitizeText(event.body);
   // Linear only honors `ephemeral` on thought/action activities; it is ignored
   // (and omitted) for the others.
@@ -275,7 +302,7 @@ function toLinearActivity(event: SandboxActivityEvent, sessionId: string): Agent
   return { sessionId, type: event.type, body };
 }
 
-function sanitizePlan(plan: AgentPlanItem[]): AgentPlanItem[] {
+function sanitizePlan(plan: RuntimePlanItem[]): RuntimePlanItem[] {
   return plan.map((item) => ({ content: sanitizeText(item.content), status: item.status }));
 }
 
@@ -288,19 +315,19 @@ interface SandboxEventFile {
   prefetched?: Buffer;
 }
 
-async function listEventFiles(sandbox: Sandbox): Promise<SandboxEventFile[]> {
-  const files = await sandbox.fs.listFiles(OUTBOX_DIR);
+async function listEventFiles(sandbox: RuntimeWorkspace): Promise<SandboxEventFile[]> {
+  const files = await sandbox.fs.listFiles!(OUTBOX_DIR);
   const events: SandboxEventFile[] = files
-    .filter((file) => !file.isDir && /^[A-Za-z0-9._-]+\.json$/.test(file.name))
+    .filter((file) => !file.isDir && typeof file.name === "string" && /^[A-Za-z0-9._-]+\.json$/.test(file.name))
     .map((file) => ({
-      name: file.name,
+      name: file.name!,
       remotePath: `${OUTBOX_DIR}/${file.name}`,
       size: file.size,
       sealedHeartbeat: false,
       sealedStageResult: false,
     }));
   try {
-    const heartbeat = await sandbox.fs.downloadFile(SEALED_HEARTBEAT_FILE);
+    const heartbeat = await sandbox.fs.downloadFile!(SEALED_HEARTBEAT_FILE);
     if (Buffer.isBuffer(heartbeat) && heartbeat.length > 0) {
       events.push({
         name: "000-sealed-heartbeat.json",
@@ -315,9 +342,9 @@ async function listEventFiles(sandbox: Sandbox): Promise<SandboxEventFile[]> {
     // No sealed pulse has landed yet.
   }
   try {
-    const stageResults = await sandbox.fs.listFiles(SEALED_STAGE_RESULT_DIR);
+    const stageResults = await sandbox.fs.listFiles!(SEALED_STAGE_RESULT_DIR);
     events.push(...stageResults
-      .filter((file) => !file.isDir && /^[A-Za-z0-9._-]+\.json$/.test(file.name) &&
+      .filter((file) => !file.isDir && typeof file.name === "string" && /^[A-Za-z0-9._-]+\.json$/.test(file.name) &&
         (!file.path || file.path.startsWith(`${SEALED_STAGE_RESULT_DIR}/`)))
       .map((file) => ({
         name: `100-stage-${file.name}`,
@@ -332,7 +359,7 @@ async function listEventFiles(sandbox: Sandbox): Promise<SandboxEventFile[]> {
   return events.sort((left, right) => left.name.localeCompare(right.name));
 }
 
-async function readWorkspaceSubject(sandbox: Sandbox): Promise<string> {
+async function readWorkspaceSubject(sandbox: RuntimeWorkspace): Promise<string> {
   if (!sandbox.process?.executeCommand) throw new Error("sandbox cannot attest the current workspace subject");
   const result = await sandbox.process.executeCommand(WORKSPACE_SUBJECT_COMMAND, undefined, undefined, 30);
   const subject = result.result?.trim();
@@ -343,10 +370,10 @@ async function readWorkspaceSubject(sandbox: Sandbox): Promise<string> {
 }
 
 interface SandboxEventPollerParams {
-  daytona: Daytona;
+  runtime: RuntimeWorkspaceAccess & SandboxAutostopRuntime;
   store: SupervisorStore;
   postActivity: (
-    activity: AgentActivityInput,
+    activity: RuntimeProgressActivityInput,
     event: SandboxActivityEvent & { issueId: string }
   ) => Promise<unknown>;
   // Forwards a session-level plan (live gate/phase checklist) to Linear.
@@ -355,12 +382,12 @@ interface SandboxEventPollerParams {
   postSessionUpdate?: (params: {
     sessionId: string;
     issueId: string;
-    plan: AgentPlanItem[];
+    plan: RuntimePlanItem[];
     eventId: string;
   }) => Promise<unknown>;
   // Best-effort read-back of a rotating agent credential (Codex refresh token)
   // from the sandbox after a stage completes. Must not throw.
-  captureAgentAuth?: (sandbox: Sandbox, ticket: Ticket) => Promise<void>;
+  captureAgentAuth?: (sandbox: RuntimeWorkspace, ticket: Ticket) => Promise<void>;
   postStageResult?: (event: SandboxStageResultEvent, observedSubject: string) => Promise<unknown>;
 }
 
@@ -369,18 +396,15 @@ async function pollTicketEvents(
   ticket: Ticket
 ): Promise<void> {
   if (!ticket.sandbox_id || !ticket.run_id) return;
-  let sandbox: Sandbox;
+  let sandbox: RuntimeWorkspace;
   let files;
   try {
-    sandbox = await params.daytona.get(ticket.sandbox_id);
-    if (sandbox.state !== "started") await sandbox.start(60);
-    await ensureSandboxActive(sandbox);
+    sandbox = await params.runtime.getWorkspace(ticket.sandbox_id);
+    if (sandbox.state !== "started") await sandbox.start?.(60);
+    await params.runtime.setActive(ticket.sandbox_id);
     if (params.store.getByIssueId(ticket.linear_issue_id)?.run_id !== ticket.run_id) {
       await reconcileSandboxAutostop({
-        runtime: {
-          setActive: (id) => setSandboxActive(params.daytona, id),
-          setIdle: (id) => setSandboxIdle(params.daytona, id),
-        },
+        runtime: params.runtime,
         store: params.store,
         issueId: ticket.linear_issue_id,
         providerResourceId: ticket.sandbox_id,
@@ -398,17 +422,17 @@ async function pollTicketEvents(
     const eventLimit = file.sealedStageResult ? MAX_STAGE_EVENT_BYTES : MAX_EVENT_BYTES;
     if (file.size > eventLimit) {
       console.error(`[sandbox-events] deleting oversized event ${file.name}`);
-      await sandbox.fs.deleteFile(remotePath).catch(() => undefined);
+      await sandbox.fs.deleteFile!(remotePath).catch(() => undefined);
       continue;
     }
 
     let event: SandboxEvent;
     try {
-      const raw = (file.prefetched ?? await sandbox.fs.downloadFile(remotePath)).toString("utf8");
+      const raw = (file.prefetched ?? await sandbox.fs.downloadFile!(remotePath))!.toString("utf8");
       event = parseSandboxEvent(raw);
     } catch (error) {
       console.error(`[sandbox-events] deleting invalid event ${file.name}:`, error);
-      await sandbox.fs.deleteFile(remotePath).catch(() => undefined);
+      await sandbox.fs.deleteFile!(remotePath).catch(() => undefined);
       continue;
     }
 
@@ -419,13 +443,13 @@ async function pollTicketEvents(
       (event.kind !== "stage_result" && file.sealedStageResult)
     ) {
       console.error(`[sandbox-events] deleting event with invalid trust origin ${file.name}`);
-      await sandbox.fs.deleteFile(remotePath).catch(() => undefined);
+      await sandbox.fs.deleteFile!(remotePath).catch(() => undefined);
       continue;
     }
 
     if (event.run_id !== ticket.run_id) {
       console.warn(`[sandbox-events] deleting stale event ${event.event_id} for ${event.run_id}`);
-      await sandbox.fs.deleteFile(remotePath).catch(() => undefined);
+      await sandbox.fs.deleteFile!(remotePath).catch(() => undefined);
       continue;
     }
 
@@ -465,11 +489,11 @@ async function pollTicketEvents(
       existing.kind !== event.kind
     ) {
       console.error(`[sandbox-events] deleting conflicting event id ${event.event_id}`);
-      await sandbox.fs.deleteFile(remotePath).catch(() => undefined);
+      await sandbox.fs.deleteFile!(remotePath).catch(() => undefined);
       continue;
     }
     if (existing.status === "processed") {
-      await sandbox.fs.deleteFile(remotePath).catch(() => undefined);
+      await sandbox.fs.deleteFile!(remotePath).catch(() => undefined);
       continue;
     }
 
@@ -494,12 +518,12 @@ async function pollTicketEvents(
         if (run?.linear_session_id && run.linear_session_id !== ticket.linear_session_id) {
           const session = params.store.getSession(run.linear_session_id);
           if (session?.state === "superseded") {
-            await sandbox.fs.deleteFile(remotePath).catch(() => undefined);
+            await sandbox.fs.deleteFile!(remotePath).catch(() => undefined);
             params.store.markSandboxEventProcessed(event.event_id);
             continue;
           }
         }
-        await params.postActivity(toLinearActivity(event, sessionId), {
+        await params.postActivity(toProgressActivity(event, sessionId), {
           ...event,
           issueId: run?.linear_issue_id ?? ticket.linear_issue_id,
         });
@@ -509,7 +533,7 @@ async function pollTicketEvents(
         if (run?.linear_session_id && run.linear_session_id !== ticket.linear_session_id) {
           const session = params.store.getSession(run.linear_session_id);
           if (session?.state === "superseded") {
-            await sandbox.fs.deleteFile(remotePath).catch(() => undefined);
+            await sandbox.fs.deleteFile!(remotePath).catch(() => undefined);
             params.store.markSandboxEventProcessed(event.event_id);
             continue;
           }
@@ -540,7 +564,7 @@ async function pollTicketEvents(
       console.error(`[sandbox-events] event ${event.event_id} failed:`, error);
       break;
     }
-    await sandbox.fs.deleteFile(remotePath).catch((error) =>
+    await sandbox.fs.deleteFile!(remotePath).catch((error) =>
       console.warn(`[sandbox-events] processed ${event.event_id} but could not delete its file:`, error)
     );
   }

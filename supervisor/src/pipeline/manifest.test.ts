@@ -7,7 +7,7 @@ import {
   resolvePipelineReference,
   validatePipelineManifest,
 } from "./manifest.js";
-import { buildInstalledRuntimeDescriptor } from "../sandbox-runtime.js";
+import { buildInstalledRuntimeDescriptor } from "../runtime/contracts.js";
 
 function transitions(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
