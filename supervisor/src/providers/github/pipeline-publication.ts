@@ -1,5 +1,5 @@
-import type { GithubClient } from "../../github.js";
-import { parsePullRequestUrl, upsertPullRequestComment } from "../../github.js";
+import type { GithubClient } from "./client.js";
+import { parsePullRequestUrl, upsertPullRequestComment } from "./client.js";
 import {
   parsePipelinePublication,
   renderGithubPipelineSummary,

@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "./app/config.js";
 import { createSupervisorStore } from "./persistence/store.js";
 import { openDb } from "./persistence/database.js";
-import { createLinearOutboxProcessor } from "./linear-outbox.js";
+import { createLinearOutboxProcessor } from "./providers/linear/outbox.js";
 import { createPipelineStore } from "./persistence/pipeline/create-store.js";
 import { runSweep } from "./sweep.js";
 

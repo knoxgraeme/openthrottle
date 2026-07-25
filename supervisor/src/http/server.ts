@@ -6,17 +6,25 @@ import type { Ticket, SupervisorStore, WebhookDelivery } from "../persistence/st
 import {
   buildLinearInstallUrl,
   exchangeLinearOAuthCode,
+  type LinearClient,
+} from "../providers/linear/client.js";
+import {
+  fetchIssueLabels,
   isRecentLinearWebhook,
   parseLinearWebhook,
   verifyLinearSignature,
-  type LinearClient,
-} from "../linear.js";
+} from "../providers/linear/events.js";
 import {
+  branchExists,
+  getMergeReadiness,
+  getRepositoryConfigAtCommit,
+  mergePullRequest,
   parseGithubWebhook,
+  parsePullRequestUrl,
   prepareRepository,
   verifyGithubSignature,
   type GithubWebhookEvent,
-} from "../github.js";
+} from "../providers/github/client.js";
 import { getSandboxLogs } from "../daytona.js";
 import { MAX_PRIVATE_LOG_TAIL_CHARS } from "../shared/logs.js";
 import { sanitizeText } from "../shared/sanitize.js";
@@ -24,15 +32,16 @@ import {
   createLinearClientProvider,
   createLinearOAuthStateStore,
   persistLinearToken,
-} from "../linear-auth.js";
+} from "../providers/linear/auth.js";
 import {
   createWebhookDeliveryProcessor,
   type WebhookDeliveryProcessor,
 } from "./webhook-delivery.js";
-import { createLinearOutboxProcessor, tryPostError, type LinearOutboxProcessor } from "../linear-outbox.js";
-import { handleLinearEvent, type PipelineCoordinatorContext } from "../linear-events.js";
+import { createLinearOutboxProcessor, enqueueActivity, tryPostError, type LinearOutboxProcessor } from "../providers/linear/outbox.js";
+import { handleLinearEvent, type PipelineCoordinatorContext, type SessionServicePorts } from "../app/session-service.js";
+import type { ActivityPublicationInput } from "../app/ports.js";
 import { createAdmissionPreflight } from "../admission-preflight.js";
-import { handleGithubEvent } from "../github-events.js";
+import { handleGithubEvent } from "../providers/github/events.js";
 import { renderPipelineLogHeader } from "../pipeline/publication.js";
 import { canSteerPipelineRun, requestPipelineStop } from "../pipeline/control.js";
 
@@ -151,6 +160,31 @@ export function createServerWebhookDeliveryProcessor(deps: {
     deps.linearOutbox ??
     createLinearOutboxProcessor({ store: deps.store, getLinearClient: deps.getLinearClient });
   const admissionPreflight = createAdmissionPreflight(deps.cfg, deps.daytona);
+  const activityPublisher = {
+    publishActivity: (activity: ActivityPublicationInput, issueId?: string, runId?: string) =>
+      enqueueActivity(deps.store, linearOutbox, activity, issueId, runId),
+    publishError: (sessionId: string | undefined, issueId: string | undefined, message: string) =>
+      tryPostError(deps.store, linearOutbox, sessionId, issueId, message),
+  };
+  const createSessionServicePorts = (linear: LinearClient): SessionServicePorts => ({
+    activityPublisher,
+    labelResolver: {
+      fetchIssueLabels: (issueId: string) => fetchIssueLabels(linear, issueId),
+    },
+    repositoryReader: {
+      branchExists: (repository: string, branch: string) =>
+        branchExists({ token: deps.cfg.githubToken }, repository, branch),
+      getRepositoryConfigAtCommit: (repository: string, branch: string) =>
+        getRepositoryConfigAtCommit({ token: deps.cfg.githubToken }, repository, branch),
+    },
+    merger: {
+      parsePullRequestUrl,
+      getMergeReadiness: (repo: string, pullNumber: number) =>
+        getMergeReadiness({ token: deps.cfg.githubToken }, repo, pullNumber),
+      mergePullRequest: (repo: string, pullNumber: number, expectedHeadSha: string) =>
+        mergePullRequest({ token: deps.cfg.githubToken }, repo, pullNumber, expectedHeadSha),
+    },
+  });
   return createWebhookDeliveryProcessor({
     store: deps.store,
     maxAttempts: 8,
@@ -168,11 +202,12 @@ export function createServerWebhookDeliveryProcessor(deps: {
     handler: async (delivery: WebhookDelivery) => {
       if (!delivery.payload) throw new Error(`Delivery ${delivery.id} has no stored payload`);
       if (delivery.source === "linear") {
+        const linear = await deps.getLinearClient();
+        if (!linear) throw new Error("No valid Linear OAuth token is stored");
         await handleLinearEvent(
           deps.cfg,
           deps.store,
-          deps.getLinearClient,
-          linearOutbox,
+          createSessionServicePorts(linear),
           parseLinearWebhook(delivery.payload),
           deps.pipelineCoordinator,
           admissionPreflight
@@ -182,7 +217,7 @@ export function createServerWebhookDeliveryProcessor(deps: {
       await handleGithubEvent(
         deps.cfg,
         deps.store,
-        linearOutbox,
+        activityPublisher,
         parseGithubWebhook(delivery.event_name ?? undefined, delivery.payload),
         deps.pipelineCoordinator.store
       );

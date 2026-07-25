@@ -1,20 +1,20 @@
 // GitHub feedback is committed as typed provider evidence for the generation-
 // pinned pipeline. There is no automatic task-resume fallback.
 
-import type { Config } from "./app/config.js";
-import type { SupervisorStore } from "./persistence/store.js";
+import type { Config } from "../../app/config.js";
+import type { SupervisorStore } from "../../persistence/store.js";
 import {
   getAuthenticatedLogin,
   isOpenthrottleBranch,
   type GithubWebhookEvent,
-} from "./github.js";
-import { enqueueActivity, type LinearOutboxProcessor } from "./linear-outbox.js";
-import { sanitizeText } from "./shared/sanitize.js";
-import type { FeedbackSnapshot, FeedbackSnapshotEvent } from "./persistence/feedback-store.js";
-import type { PipelineInstance, PipelineStore } from "./pipeline/store.js";
-import { processProviderEvidence } from "./pipeline/gates.js";
-import { canonicalJson, type PipelineManifest } from "./pipeline/manifest.js";
-import { requestPipelineStop } from "./pipeline/control.js";
+} from "./client.js";
+import type { ActivityPublicationPort } from "../../app/ports.js";
+import { sanitizeText } from "../../shared/sanitize.js";
+import type { FeedbackSnapshot, FeedbackSnapshotEvent } from "../../persistence/feedback-store.js";
+import type { PipelineInstance, PipelineStore } from "../../pipeline/store.js";
+import { processProviderEvidence } from "../../pipeline/gates.js";
+import { canonicalJson, type PipelineManifest } from "../../pipeline/manifest.js";
+import { requestPipelineStop } from "../../pipeline/control.js";
 
 const githubLoginCache = new Map<string, string>();
 const UNBOUNDED_SNAPSHOT_CLAIM = Number.MAX_SAFE_INTEGER;
@@ -157,7 +157,7 @@ export function drainPipelineFeedbackSnapshots(
   let processed = 0;
   for (const instance of pipelines.listProviderReadyInstances(limit)) {
     if (!providerStageCanReceive(pipelines, instance)) continue;
-    const [snapshot] = store.listPendingFeedbackSnapshots(instance.linear_session_id, limit);
+    const [snapshot] = store.listPendingFeedbackSnapshots(instance.linear_session_id, 1);
     if (!snapshot) continue;
     if (processPipelineFeedbackSnapshot({ pipelines, store, instance, snapshot })) processed += 1;
   }
@@ -287,7 +287,7 @@ async function selfGithubLogin(cfg: Config): Promise<string | undefined> {
 export async function handleGithubEvent(
   cfg: Config,
   store: SupervisorStore,
-  linearOutbox: LinearOutboxProcessor,
+  activityPublisher: ActivityPublicationPort,
   event: GithubWebhookEvent,
   pipelines: PipelineStore
 ): Promise<void> {
@@ -298,7 +298,7 @@ export async function handleGithubEvent(
     if (!ticket) return;
     const pipelineInstance = pipelines.getInstanceForSession(ticket.linear_session_id);
     if (!pipelineInstance) return;
-    if (pipelineInstance && ticket.pr_url && ticket.pr_url !== event.pull_request.html_url) return;
+    if (ticket.pr_url && ticket.pr_url !== event.pull_request.html_url) return;
     if (event.action === "opened" || event.action === "reopened" || event.action === "synchronize") {
       store.setPrUrl(ticket.linear_issue_id, event.pull_request.html_url);
       if (event.pull_request.head.sha) {
@@ -366,7 +366,7 @@ export async function handleGithubEvent(
   if (event.kind === "pull_request_review") {
     const ticket = store.getByBranch(event.repository.full_name, event.pull_request.head.ref);
     if (!ticket || event.action !== "submitted") return;
-    await enqueueActivity(store, linearOutbox, {
+    await activityPublisher.publishActivity({
       sessionId: ticket.linear_session_id,
       type: "action",
       action: "PR review submitted",
@@ -423,7 +423,7 @@ export async function handleGithubEvent(
     const author = event.comment.user?.login;
     const self = await selfGithubLogin(cfg);
     if (!author || !self || author === self) return;
-    await enqueueActivity(store, linearOutbox, {
+    await activityPublisher.publishActivity({
       sessionId: ticket.linear_session_id,
       type: "action",
       action: "PR comment",
@@ -449,29 +449,41 @@ export async function handleGithubEvent(
   // workflow_run / check_suite: mirror every completion to Linear (success and
   // failure alike); a failed/timed-out completion on an active, PR-backed
   // ticket additionally becomes queued feedback work (Phase 1 item 1, new).
-  const branch =
-    event.kind === "workflow_run" ? event.workflow_run.head_branch : event.check_suite.head_branch;
-  if (!isOpenthrottleBranch(branch) || event.action !== "completed") return;
-  const ticket = store.getByBranch(event.repository.full_name, branch);
+  const ci = event.kind === "workflow_run"
+    ? {
+        branch: event.workflow_run.head_branch,
+        conclusion: event.workflow_run.conclusion,
+        url: event.workflow_run.html_url,
+        headSha: event.workflow_run.head_sha,
+        sequence: event.workflow_run.id,
+        eventId: `github-workflow:${event.workflow_run.id}`,
+        name: event.workflow_run.name,
+      }
+    : {
+        branch: event.check_suite.head_branch,
+        conclusion: event.check_suite.conclusion,
+        url: event.check_suite.url,
+        headSha: event.check_suite.head_sha,
+        sequence: event.check_suite.id,
+        eventId: `github-check-suite:${event.check_suite.id}`,
+        name: "GitHub check suite",
+      };
+  if (!isOpenthrottleBranch(ci.branch) || event.action !== "completed") return;
+  const ticket = store.getByBranch(event.repository.full_name, ci.branch);
   if (!ticket) return;
-  const conclusion =
-    event.kind === "workflow_run" ? event.workflow_run.conclusion : event.check_suite.conclusion;
-  const url = event.kind === "workflow_run" ? event.workflow_run.html_url : event.check_suite.url;
-  const headSha =
-    event.kind === "workflow_run" ? event.workflow_run.head_sha : event.check_suite.head_sha;
-  await enqueueActivity(store, linearOutbox, {
+  await activityPublisher.publishActivity({
     sessionId: ticket.linear_session_id,
     type: "action",
     action: "CI completed",
-    parameter: conclusion ?? "unknown",
-    result: url,
+    parameter: ci.conclusion ?? "unknown",
+    result: ci.url,
   }, ticket.linear_issue_id);
   considerCiGithubHead(
     store,
     ticket.linear_issue_id,
-    headSha,
+    ci.headSha,
     event.kind,
-    event.kind === "workflow_run" ? event.workflow_run.id : event.check_suite.id
+    ci.sequence
   );
 
   // A single green workflow/check is not proof that the provider wait has
@@ -480,19 +492,17 @@ export async function handleGithubEvent(
   // re-enter the bounded repair path, while every pipeline CI completion stays
   // out of the deterministic coordinator.
   if (!pipelines.getInstanceForSession(ticket.linear_session_id)) return;
-  if (conclusion === "failure" || conclusion === "timed_out") {
+  if (ci.conclusion === "failure" || ci.conclusion === "timed_out") {
     routePipelineProviderEvent({
       pipelines,
       store,
       ticket,
-      eventId: event.kind === "workflow_run"
-        ? `github-workflow:${event.workflow_run.id}`
-        : `github-check-suite:${event.check_suite.id}`,
+      eventId: ci.eventId,
       outcome: "semantic_repair_required",
-      summary: `${event.kind === "workflow_run" ? event.workflow_run.name : "GitHub check suite"} concluded ${conclusion}.`,
-      evidence: [url],
-      payload: { kind: event.kind, conclusion, head_sha: headSha, url },
-      headSha,
+      summary: `${ci.name} concluded ${ci.conclusion}.`,
+      evidence: [ci.url],
+      payload: { kind: event.kind, conclusion: ci.conclusion, head_sha: ci.headSha, url: ci.url },
+      headSha: ci.headSha,
     });
   }
 }

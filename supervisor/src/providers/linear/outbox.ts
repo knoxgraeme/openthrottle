@@ -1,7 +1,7 @@
-import type { AgentActivityInput, AgentPlanItem, LinearClient } from "./linear.js";
-import { agentActivityCreate, agentSessionUpdate, linearFileUpload } from "./linear.js";
-import type { LinearOutboxRecord, SupervisorStore } from "./persistence/store.js";
-import { sanitizeText } from "./shared/sanitize.js";
+import type { AgentActivityInput, AgentPlanItem, LinearClient } from "./client.js";
+import { agentActivityCreate, agentSessionUpdate, linearFileUpload } from "./client.js";
+import type { LinearOutboxRecord, SupervisorStore } from "../../persistence/store.js";
+import { sanitizeText } from "../../shared/sanitize.js";
 
 // Shared helpers for enqueueing a single Linear outbox row and processing it
 // immediately, used across pipeline effects and the Linear/GitHub event
@@ -176,6 +176,23 @@ export function createLinearOutboxProcessor(params: {
     params.store.markLinearOutboxProcessed(row.id, receipt);
   }
 
+  async function processRows(rows: LinearOutboxRecord[]): Promise<void> {
+    for (const row of rows) {
+      try {
+        await processRow(row);
+      } catch (error) {
+        const classified = classifyRetry(error);
+        params.store.markLinearOutboxFailed(
+          row.id,
+          classified.message,
+          classified.retry
+            ? new Date(Date.now() + retryDelayMs(row.attempts)).toISOString()
+            : null
+        );
+      }
+    }
+  }
+
   return {
     async process(id: string) {
       const now = new Date();
@@ -185,42 +202,15 @@ export function createLinearOutboxProcessor(params: {
         50
       );
       if (!rows.some((candidate) => candidate.id === id)) return;
-      for (const row of rows) {
-        try {
-          await processRow(row);
-        } catch (error) {
-          const classified = classifyRetry(error);
-          params.store.markLinearOutboxFailed(
-            row.id,
-            classified.message,
-            classified.retry
-              ? new Date(Date.now() + retryDelayMs(row.attempts)).toISOString()
-              : null
-          );
-        }
-      }
+      await processRows(rows);
     },
     async drain(limit = 50) {
       const now = new Date();
-      const rows = params.store.claimLinearOutbox(
+      await processRows(params.store.claimLinearOutbox(
         now.toISOString(),
         new Date(now.getTime() + leaseMs).toISOString(),
         limit
-      );
-      for (const row of rows) {
-        try {
-          await processRow(row);
-        } catch (error) {
-          const classified = classifyRetry(error);
-          params.store.markLinearOutboxFailed(
-            row.id,
-            classified.message,
-            classified.retry
-              ? new Date(Date.now() + retryDelayMs(row.attempts)).toISOString()
-              : null
-          );
-        }
-      }
+      ));
     },
   };
 }

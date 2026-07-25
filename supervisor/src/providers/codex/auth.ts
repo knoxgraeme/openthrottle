@@ -1,5 +1,5 @@
-import type { Config } from "./app/config.js";
-import type { SupervisorStore } from "./persistence/store.js";
+import type { Config } from "../../app/config.js";
+import type { SupervisorStore } from "../../persistence/store.js";
 
 /**
  * Durable Codex subscription auth.

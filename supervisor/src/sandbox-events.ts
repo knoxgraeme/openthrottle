@@ -1,5 +1,5 @@
 import type { Daytona, Sandbox } from "@daytona/sdk";
-import type { AgentActivityInput, AgentPlanItem, AgentPlanStatus } from "./linear.js";
+import type { AgentActivityInput, AgentPlanItem, AgentPlanStatus } from "./providers/linear/client.js";
 import type { Ticket, SupervisorStore } from "./persistence/store.js";
 import { ensureSandboxActive, setSandboxActive, setSandboxIdle } from "./daytona.js";
 import { reconcileSandboxAutostop } from "./sandbox-lifecycle.js";

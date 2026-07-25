@@ -9,7 +9,7 @@ import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import type { PipelineStore } from "../pipeline/store.js";
 import { loadPipelineCatalog, parseRepositoryConfig } from "../pipeline/manifest.js";
 import { buildInstalledRuntimeDescriptor } from "../sandbox-runtime.js";
-import { createServer } from "./server.js";
+import { createServer, createServerWebhookDeliveryProcessor } from "./server.js";
 
 const cfg: Config = {
   port: 3000,
@@ -275,6 +275,60 @@ describe("coordinator-only server", () => {
     });
     expect(stale.status).toBe(401);
     expect(db.prepare("SELECT COUNT(*) FROM webhook_deliveries").pluck().get()).toBe(1);
+  });
+
+  it("fails Linear deliveries before admission when OAuth is unavailable", async () => {
+    const runtime = buildInstalledRuntimeDescriptor("server-test/v1");
+    const catalog = loadPipelineCatalog(
+      fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url)),
+      runtime.descriptor
+    );
+    pipelines.acceptRuntimeDescriptor(runtime);
+    pipelines.acceptCatalog(catalog);
+    const processor = createServerWebhookDeliveryProcessor({
+      cfg,
+      store,
+      daytona: { list: async function* () {} } as unknown as Daytona,
+      getLinearClient: async () => undefined,
+      pipelineCoordinator: {
+        catalog,
+        runtime,
+        store: pipelines,
+        drainEffects: async () => undefined,
+      },
+    });
+    store.claimDelivery({
+      deliveryId: "linear-no-oauth",
+      source: "linear",
+      action: "created",
+      eventName: "AgentSessionEvent",
+      payload: JSON.stringify({
+        action: "created",
+        type: "AgentSessionEvent",
+        webhookId: "linear-no-oauth",
+        webhookTimestamp: Date.now(),
+        organizationId: "org-1",
+        agentSession: {
+          id: "session-1",
+          issue: {
+            id: "issue-1",
+            identifier: "OT-1",
+            team: { id: "team-1", key: "OT" },
+            labels: [{ name: "branch \u203a main" }],
+          },
+        },
+      }),
+    });
+
+    await expect(processor.process("linear-no-oauth")).rejects.toThrow(
+      "No valid Linear OAuth token is stored"
+    );
+    expect(store.getByIssueId("issue-1")).toBeUndefined();
+    expect(
+      db.prepare("SELECT status, attempts FROM webhook_deliveries WHERE delivery_id = ?").get(
+        "linear-no-oauth"
+      )
+    ).toEqual({ status: "failed", attempts: 1 });
   });
 
   it("rejects bad GitHub signatures and ignores signed unsupported events without persistence", async () => {

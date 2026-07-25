@@ -4,14 +4,14 @@ import {
   agentActivityCreate,
   agentSessionUpdate,
   buildLinearInstallUrl,
-  extractLabelNames,
+  linearFileUpload,
+} from "./client.js";
+import {
   fetchIssueLabels,
   isRecentLinearWebhook,
-  labelMatchNames,
-  linearFileUpload,
   parseLinearWebhook,
   verifyLinearSignature,
-} from "./linear.js";
+} from "./events.js";
 
 const createdPayload = {
   action: "created",
@@ -42,7 +42,10 @@ describe("Linear contracts", () => {
 
   it("validates created and prompted payloads and both label encodings", () => {
     const parsed = parseLinearWebhook(JSON.stringify(createdPayload));
-    expect(extractLabelNames(parsed)).toEqual(["agent:codex", "investigate"]);
+    expect(parsed.agentSession.issue?.labels).toEqual([
+      { name: "agent:codex" },
+      { name: "investigate" },
+    ]);
     expect(() =>
       parseLinearWebhook(JSON.stringify({ ...createdPayload, promptContext: { unsafe: true } }))
     ).toThrow("invalid promptContext");
@@ -91,14 +94,14 @@ describe("Linear contracts", () => {
       )
     ).toThrow(/unsafe/);
     expect(
-      extractLabelNames({
+      parseLinearWebhook(JSON.stringify({
         ...parsed,
         agentSession: {
           ...parsed.agentSession,
           issue: { ...parsed.agentSession.issue!, labels: { nodes: [{ name: "backend" }] } },
         },
-      })
-    ).toEqual(["backend"]);
+      })).agentSession.issue?.labels
+    ).toEqual({ nodes: [{ name: "backend" }] });
   });
 
   it("sends exact activity and session-update GraphQL variables", async () => {
@@ -153,7 +156,7 @@ describe("Linear contracts", () => {
     expect(signals.every((signal) => signal instanceof AbortSignal)).toBe(true);
   });
 
-  it("fetches issue labels with their parent group and expands grouped names", async () => {
+  it("fetches issue labels with their parent group", async () => {
     const requests: Array<Record<string, unknown>> = [];
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
@@ -179,13 +182,6 @@ describe("Linear contracts", () => {
       { name: "bad", parentName: undefined },
     ]);
     expect(requests[0]).toMatchObject({ variables: { id: "issue-1" } });
-
-    expect(labelMatchNames(resolved)).toEqual([
-      "feature/x",
-      "branch › feature/x",
-      "investigate",
-      "bad",
-    ]);
   });
 
   it("tolerates an issue with no labels", async () => {
