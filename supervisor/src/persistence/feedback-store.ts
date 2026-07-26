@@ -24,7 +24,7 @@ export interface FeedbackSnapshotEvent {
 }
 
 export interface FeedbackRecordParams {
-  provider: "github";
+  provider: "github" | "linear";
   providerEventId: string;
   issueId: string;
   sessionId: string;

@@ -18,7 +18,7 @@ import { completeStageAttemptActor } from "./pipeline/settlement.js";
 import { createGithubPublicationProcessor } from "./providers/github/pipeline-publication.js";
 import { createDaytonaRuntime } from "./providers/daytona/adapter.js";
 import { createPipelineEffectProcessor } from "./operations/pipeline-effects.js";
-import { drainPipelineFeedbackSnapshots } from "./providers/github/events.js";
+import { drainPipelineFeedbackSnapshots } from "./app/provider-feedback.js";
 
 const SWEEP_INTERVAL_MS = 15 * 60 * 1000; // run every 15 min while awake; SPEC only requires "on every boot" + periodic while awake
 const DELIVERY_DRAIN_INTERVAL_MS = 30 * 1000;

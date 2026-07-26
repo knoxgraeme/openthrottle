@@ -25,6 +25,12 @@ import { sanitizeText } from "../shared/sanitize.js";
 import { parseCommand } from "./commands.js";
 import { canSteerPipelineRun, requestPipelineStop } from "../pipeline/control.js";
 import type { AdmissionPreflight } from "./admission-preflight.js";
+import {
+  pipelineIsTerminal,
+  processPipelineFeedbackSnapshot,
+  providerStageCanReceive,
+  recordPipelineProviderEvent,
+} from "./provider-feedback.js";
 
 function linearContext(
   payload: LinearAgentSessionEvent,
@@ -444,6 +450,39 @@ async function handlePrompted(
       "OpenThrottle couldn't find a pipeline for this session. Delegate the issue again to start one."
     );
     return;
+  }
+  if (command.kind === "reply" && workId && pipelineInstance.status === "waiting_provider") {
+    const sanitizedReply = sanitizeText(promptBody).slice(0, 2_000);
+    if (
+      !pipelineIsTerminal(pipelineInstance) &&
+      providerStageCanReceive(coordinator.store, pipelineInstance) &&
+      pipelineInstance.published_commit
+    ) {
+      const snapshot = recordPipelineProviderEvent({
+        store,
+        instance: pipelineInstance,
+        ticket,
+        provider: "linear",
+        eventId: `linear-reply:${workId}`,
+        outcome: "semantic_repair_required",
+        summary: "Linear reply requires another implementation pass.",
+        evidence: [sanitizedReply],
+        payload: {
+          kind: "linear_reply",
+          activity_id: workId,
+          body: sanitizedReply,
+        },
+        headSha: pipelineInstance.published_commit,
+      });
+      processPipelineFeedbackSnapshot({ pipelines: coordinator.store, store, instance: pipelineInstance, snapshot });
+      await coordinator.drainEffects?.();
+      await providers.activityPublisher.publishActivity({
+        sessionId,
+        type: "thought",
+        body: "Waking the run to address your message in the honest ledger.",
+      }, ticket.linear_issue_id);
+      return;
+    }
   }
   await providers.activityPublisher.publishError(
     sessionId,

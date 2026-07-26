@@ -19,7 +19,8 @@ import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import type { PipelineInstance, PipelineStageAttempt, PipelineStore } from "./store.js";
 import { buildInstalledRuntimeDescriptor } from "../runtime/contracts.js";
 import { processPipelineInfrastructureFailure } from "./control.js";
-import { drainPipelineFeedbackSnapshots, handleGithubEvent, routePipelineProviderEvent } from "../providers/github/events.js";
+import { drainPipelineFeedbackSnapshots } from "../app/provider-feedback.js";
+import { handleGithubEvent, routePipelineProviderEvent } from "../providers/github/events.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
 const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
@@ -1078,5 +1079,76 @@ describe("deterministic supervisor stage gates", () => {
       reentry_ordinal: 1,
     });
     expect(drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(0);
+  });
+
+  it("continues draining when the oldest same-session feedback snapshot is stale", () => {
+    const fixture = setup("ce/implement@2");
+    const staleHead = "d".repeat(40);
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    fixture.tickets.setSetting("github-head:issue-1", SUBJECT);
+    const eventPayload = (summary: string) => canonicalJson({
+      outcome: "semantic_repair_required",
+      summary,
+      evidence: [summary],
+      payload: "{}",
+    });
+    const stale = fixture.tickets.recordProviderFeedback({
+      provider: "github",
+      providerEventId: "github-review:stale",
+      issueId: fixture.instance.linear_issue_id,
+      sessionId: fixture.instance.linear_session_id,
+      generation: fixture.instance.generation,
+      repository: fixture.instance.repository,
+      pullNumber: 1,
+      headSha: staleHead,
+      kind: "pipeline_provider_event",
+      payload: eventPayload("stale feedback"),
+      workItemId: `pipeline-feedback:${fixture.instance.id}:${staleHead}`,
+      receivedAt: "2026-01-01T00:00:00.000Z",
+    }).snapshot;
+    const fresh = fixture.tickets.recordProviderFeedback({
+      provider: "github",
+      providerEventId: "github-review:fresh",
+      issueId: fixture.instance.linear_issue_id,
+      sessionId: fixture.instance.linear_session_id,
+      generation: fixture.instance.generation,
+      repository: fixture.instance.repository,
+      pullNumber: 1,
+      headSha: SUBJECT,
+      kind: "pipeline_provider_event",
+      payload: eventPayload("fresh feedback"),
+      workItemId: `pipeline-feedback:${fixture.instance.id}:${SUBJECT}`,
+      receivedAt: "2026-01-01T00:00:01.000Z",
+    }).snapshot;
+
+    fixture.db.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET stage_id = 'provider', native_context_policy = 'none', expected_subject = ?
+      WHERE id = ?
+    `).run(SUBJECT, fixture.attempt.id);
+    fixture.db.prepare(`
+      UPDATE pipeline_instance_stages SET status = 'passed'
+      WHERE pipeline_instance_id = ? AND stage_id = 'implementation'
+    `).run(fixture.instance.id);
+    fixture.db.prepare(`
+      UPDATE pipeline_instance_stages SET status = 'waiting'
+      WHERE pipeline_instance_id = ? AND stage_id = 'provider'
+    `).run(fixture.instance.id);
+    fixture.db.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'waiting_provider', active_stage_id = 'provider',
+          immutable_subject = ?, published_commit = ?
+      WHERE id = ?
+    `).run(SUBJECT, SUBJECT, fixture.instance.id);
+
+    expect(drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(1);
+    expect(fixture.db.prepare("SELECT status FROM feedback_snapshots WHERE id = ?").get(stale.id))
+      .toEqual({ status: "stale" });
+    expect(fixture.db.prepare("SELECT status FROM feedback_snapshots WHERE id = ?").get(fresh.id))
+      .toEqual({ status: "consumed" });
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "implementation",
+      reentry_ordinal: 1,
+    });
   });
 });

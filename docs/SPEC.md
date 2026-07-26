@@ -218,6 +218,14 @@ human attention; evidence for a future stage remains pending. A feedback
 snapshot is immutable once claimed and is consumed only after the coordinator
 commits the provider event.
 
+Linear replies sent while the current pipeline instance is in `waiting_provider`
+are recorded on the same provider-feedback channel as GitHub evidence, with
+provider `linear`, an idempotency identity derived from the Linear agent
+activity id, and the executor-verified published commit as the head fence. The
+sanitized, bounded reply body is carried in the provider event evidence/payload
+so a repair stage receives it through sealed transition context rather than
+session memory.
+
 PR close is authoritative for ticket closure. If a stage actor is live, a typed
 stop event schedules termination/cleanup; ticket/session/inbox closure does not
 depend on a live attempt still existing. Optional merge-from-Linear is guarded
