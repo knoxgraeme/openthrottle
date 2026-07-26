@@ -43,6 +43,7 @@ jobs:
       - name: Verify pipeline docs are regenerated
         run: |
           npm run docs:pipelines --prefix supervisor
+          git add --intent-to-add -- docs/pipelines
           git diff --exit-code -- docs/pipelines
       - name: Verify supervisor architecture, catalog, runtime, and adapter parity
         run: |
