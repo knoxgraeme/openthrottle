@@ -93,6 +93,75 @@ setup() {
   [ "$output" = "incompatible" ]
 }
 
+@test "bake-once bootstrap gate: fresh sandbox runs, completed marker skips" {
+  marker="${BATS_TEST_TMPDIR}/bootstrap.json"
+  sentinel="${BATS_TEST_TMPDIR}/bootstrap.started"
+  digest_a="$(printf 'a%.0s' {1..64})"
+
+  # Fresh sandbox (no marker, no sentinel): the bake-once bootstrap must run,
+  # whether or not this stage performed the initial clone.
+  run evaluate_bootstrap_marker "$marker" "$sentinel" "$digest_a" 1
+  [ "$status" -eq 0 ]
+  [ "$output" = "run" ]
+  run evaluate_bootstrap_marker "$marker" "$sentinel" "$digest_a" 0
+  [ "$status" -eq 0 ]
+  [ "$output" = "run" ]
+
+  # Second stage: a completed marker for the same sealed digest skips the
+  # bootstrap and replays the recorded codex hook-trust probe.
+  printf '{"schema":"openthrottle.sandbox-bootstrap/v1","repositoryConfigDigest":"%s","codexHookTrust":true,"completedAt":"2026-07-26T00:00:00Z"}\n' \
+    "$digest_a" > "$marker"
+  run evaluate_bootstrap_marker "$marker" "$sentinel" "$digest_a" 0
+  [ "$status" -eq 0 ]
+  [ "$output" = "skip 1" ]
+
+  printf '{"schema":"openthrottle.sandbox-bootstrap/v1","repositoryConfigDigest":"%s","codexHookTrust":false,"completedAt":"2026-07-26T00:00:00Z"}\n' \
+    "$digest_a" > "$marker"
+  run evaluate_bootstrap_marker "$marker" "$sentinel" "$digest_a" 0
+  [ "$status" -eq 0 ]
+  [ "$output" = "skip 0" ]
+}
+
+@test "bake-once bootstrap gate fails closed on digest mismatch with the exact error" {
+  marker="${BATS_TEST_TMPDIR}/bootstrap.json"
+  sentinel="${BATS_TEST_TMPDIR}/bootstrap.started"
+  digest_a="$(printf 'a%.0s' {1..64})"
+  digest_b="$(printf 'b%.0s' {1..64})"
+  printf '{"schema":"openthrottle.sandbox-bootstrap/v1","repositoryConfigDigest":"%s","codexHookTrust":true,"completedAt":"2026-07-26T00:00:00Z"}\n' \
+    "$digest_a" > "$marker"
+
+  run evaluate_bootstrap_marker "$marker" "$sentinel" "$digest_b" 0
+  [ "$status" -eq 1 ]
+  [ "$output" = "FATAL: sandbox bootstrap marker records repository config digest ${digest_a} but the sealed stage request requires ${digest_b}; the sandbox is stale — the supervisor must reprovision it" ]
+}
+
+@test "bake-once bootstrap gate fails closed on torn or inconsistent state" {
+  marker="${BATS_TEST_TMPDIR}/bootstrap.json"
+  sentinel="${BATS_TEST_TMPDIR}/bootstrap.started"
+  digest_a="$(printf 'a%.0s' {1..64})"
+
+  # Sentinel without a completion marker: a previous bootstrap died mid-run.
+  printf '%s\n' "$digest_a" > "$sentinel"
+  run evaluate_bootstrap_marker "$marker" "$sentinel" "$digest_a" 0
+  [ "$status" -eq 1 ]
+  [ "$output" = "FATAL: sandbox bootstrap started but never completed; the sandbox is stale — the supervisor must reprovision it" ]
+  rm -f "$sentinel"
+
+  # Matching marker but the checkout was recreated this stage: the baked
+  # dependency state is gone, so skipping would be a silent lie.
+  printf '{"schema":"openthrottle.sandbox-bootstrap/v1","repositoryConfigDigest":"%s","codexHookTrust":true,"completedAt":"2026-07-26T00:00:00Z"}\n' \
+    "$digest_a" > "$marker"
+  run evaluate_bootstrap_marker "$marker" "$sentinel" "$digest_a" 1
+  [ "$status" -eq 1 ]
+  [ "$output" = "FATAL: sandbox bootstrap marker is present but the repository checkout was recreated; the sandbox is stale — the supervisor must reprovision it" ]
+
+  # Corrupt marker JSON is never trusted.
+  printf 'not json\n' > "$marker"
+  run evaluate_bootstrap_marker "$marker" "$sentinel" "$digest_a" 0
+  [ "$status" -eq 1 ]
+  [ "$output" = "FATAL: sandbox bootstrap marker is unreadable; the sandbox is stale — the supervisor must reprovision it" ]
+}
+
 @test "codex_reconcile_auth orders ISO-8601 offsets and fractional seconds by instant" {
   before='{"tokens":{"account_id":"acct"},"last_refresh":"2026-07-01T23:59:59.900Z"}'
   after_offset='{"tokens":{"account_id":"acct"},"last_refresh":"2026-07-02T02:00:00.100+02:00"}'
