@@ -2,7 +2,12 @@ import type { Ticket, SupervisorStore } from "../persistence/store.js";
 import { canonicalJson } from "../pipeline/manifest.js";
 import { digestNormalized } from "../pipeline/manifest.js";
 import { coordinatePipelineEvent } from "../pipeline/coordinator.js";
-import type { PipelineEffectIntent, PipelineInstance, PipelineStore } from "../pipeline/store.js";
+import type {
+  PipelineEffectIntent,
+  PipelineInstance,
+  PipelineRuntimeResource,
+  PipelineStore,
+} from "../pipeline/store.js";
 import type { StageRequestEnvelope } from "../pipeline/stage-request.js";
 import type { RuntimeResource, SandboxRuntime } from "../runtime/contracts.js";
 import { sanitizeText } from "../shared/sanitize.js";
@@ -66,7 +71,7 @@ interface StopEffectControl {
 
 interface EffectRuntimeBinding {
   resource: RuntimeResource | undefined;
-  status: string | undefined;
+  status: PipelineRuntimeResource["status"] | undefined;
 }
 
 function parseStopEffectControl(effect: PipelineEffectIntent): StopEffectControl {

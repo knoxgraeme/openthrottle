@@ -159,10 +159,9 @@ export function createSupervisorStore(
   pipelineAdmission: PipelineAdmissionCapability = createNoopPipelineAdmission()
 ): SupervisorStore {
   const workStore = createWorkStore(db);
+  const settingsStore = createSettingsStore(db);
   const feedbackStore = createFeedbackStore(db, (issueId) =>
-    (db.prepare("SELECT value FROM settings WHERE key = ?").get(
-      `github-head:${issueId}`
-    ) as { value: string } | undefined)?.value
+    settingsStore.getSetting(`github-head:${issueId}`)
   );
   const feedbackCapability: FeedbackCapability = {
     recordProviderFeedback(params) {
@@ -187,7 +186,7 @@ export function createSupervisorStore(
     ...createRunStore(db, workStore),
     ...createDeliveryStore(db),
     ...createSteeringStore(db, workStore),
-    ...createSettingsStore(db),
+    ...settingsStore,
     ...feedbackCapability,
   };
 }
