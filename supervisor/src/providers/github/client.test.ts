@@ -6,6 +6,7 @@ import { considerCiGithubHead } from "./events.js";
 import {
   branchExists,
   getRepositoryConfigAtCommit,
+  getFailingGithubCheckDetails,
   getMergeReadiness,
   isGithubPullRequestUrl,
   isOpenthrottleBranch,
@@ -121,6 +122,120 @@ describe("GitHub contracts", () => {
     });
     expect(signals).toHaveLength(2);
     expect(signals.every((signal) => signal instanceof AbortSignal)).toBe(true);
+  });
+
+  it("fetches bounded failed workflow job details and log tails", async () => {
+    const longLog = `${"x".repeat(2_100)}\n[REDACTED-ME]`;
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/actions/runs/20/jobs?filter=latest&per_page=100")) {
+        return Response.json({
+          jobs: [
+            {
+              id: 101,
+              name: "test",
+              workflow_name: "CI",
+              html_url: "https://github.com/o/r/actions/runs/20/job/101",
+              conclusion: "failure",
+              steps: [
+                { name: "install", conclusion: "success" },
+                { name: "unit tests", conclusion: "failure" },
+              ],
+            },
+            { id: 102, name: "lint", conclusion: "success", steps: [] },
+          ],
+        });
+      }
+      if (url.endsWith("/actions/jobs/101/logs")) return new Response(longLog);
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    }) as unknown as typeof fetch;
+
+    const details = await getFailingGithubCheckDetails(
+      { token: "github", fetch: fetchMock },
+      "o/r",
+      { headSha: "c".repeat(40), workflowRunId: 20, workflowName: "CI" }
+    );
+
+    expect(details).toEqual([{
+      workflowName: "CI",
+      jobName: "test",
+      stepNames: ["unit tests"],
+      logTail: expect.stringContaining("[REDACTED-ME]"),
+      htmlUrl: "https://github.com/o/r/actions/runs/20/job/101",
+    }]);
+    expect(details[0]!.logTail).toHaveLength(2_000);
+  });
+
+  it("streams failed job logs while keeping only the bounded tail", async () => {
+    const encoder = new TextEncoder();
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/actions/runs/20/jobs?filter=latest&per_page=100")) {
+        return Response.json({
+          jobs: [{ id: 101, name: "test", workflow_name: "CI", conclusion: "failure", steps: [] }],
+        });
+      }
+      if (url.endsWith("/actions/jobs/101/logs")) {
+        return new Response(new ReadableStream({
+          start(controller) {
+            controller.enqueue(encoder.encode("a".repeat(100_000)));
+            controller.enqueue(encoder.encode("final failure"));
+            controller.close();
+          },
+        }));
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    }) as unknown as typeof fetch;
+
+    const details = await getFailingGithubCheckDetails(
+      { token: "github", fetch: fetchMock },
+      "o/r",
+      { headSha: "c".repeat(40), workflowRunId: 20, workflowName: "CI" }
+    );
+
+    expect(details[0]!.logTail).toHaveLength(2_000);
+    expect(details[0]!.logTail).toContain("final failure");
+  });
+
+  it("fetches failed check-suite jobs from commit check runs", async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith(`/commits/${"c".repeat(40)}/check-runs?per_page=100`)) {
+        return Response.json({
+          check_runs: [{
+            id: 501,
+            name: "build",
+            conclusion: "failure",
+            details_url: "https://github.com/o/r/actions/runs/20/job/101",
+            html_url: "https://github.com/o/r/runs/501",
+          }],
+        });
+      }
+      if (url.endsWith("/actions/jobs/101")) {
+        return Response.json({
+          id: 101,
+          name: "build",
+          workflow_name: "CI",
+          html_url: "https://github.com/o/r/actions/runs/20/job/101",
+          conclusion: "failure",
+          steps: [{ name: "compile", conclusion: "failure" }],
+        });
+      }
+      if (url.endsWith("/actions/jobs/101/logs")) return new Response("compile failed");
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    }) as unknown as typeof fetch;
+
+    await expect(getFailingGithubCheckDetails(
+      { token: "github", fetch: fetchMock },
+      "o/r",
+      { headSha: "c".repeat(40), workflowName: "GitHub check suite" }
+    )).resolves.toEqual([{
+      workflowName: "CI",
+      jobName: "build",
+      stepNames: ["compile"],
+      logTail: "compile failed",
+      htmlUrl: "https://github.com/o/r/actions/runs/20/job/101",
+    }]);
   });
 
   it("resolves branch existence and distinguishes 404 from other errors", async () => {

@@ -4,6 +4,7 @@
 import type { Config } from "../../app/config.js";
 import type { SupervisorStore } from "../../persistence/store.js";
 import {
+  getFailingGithubCheckDetails,
   OPENTHROTTLE_COMMENT_MARKER_PREFIX,
   isOpenthrottleBranch,
   type GithubWebhookEvent,
@@ -19,6 +20,13 @@ import {
   recordPipelineProviderEvent,
   type PipelineProviderOutcome,
 } from "../../app/provider-feedback.js";
+import { sanitizeText } from "../../shared/sanitize.js";
+
+type ProviderFinding = {
+  severity: "P1";
+  code: "ci-check-failed";
+  summary: string;
+};
 
 export function routePipelineProviderEvent(params: {
   pipelines: PipelineStore;
@@ -28,6 +36,7 @@ export function routePipelineProviderEvent(params: {
   outcome: PipelineProviderOutcome;
   summary: string;
   evidence: string[];
+  findings?: ProviderFinding[];
   payload: Record<string, unknown>;
   headSha: string | undefined;
   pullRequestUrl?: string;
@@ -49,6 +58,7 @@ export function routePipelineProviderEvent(params: {
       outcome: "needs_human",
       summary: "GitHub's current pull-request head does not match the executor-verified published commit.",
       evidence: params.evidence,
+      findings: params.findings,
       providerPayload: {
         ...params.payload,
         expected_published_commit: instance.published_commit,
@@ -71,6 +81,7 @@ export function routePipelineProviderEvent(params: {
       outcome: params.outcome,
       summary: params.summary,
       evidence: params.evidence,
+      findings: params.findings,
       payload: params.payload,
       headSha: params.headSha,
       pullRequestUrl: params.pullRequestUrl,
@@ -87,6 +98,7 @@ export function routePipelineProviderEvent(params: {
       outcome: params.outcome,
       summary: params.summary,
       evidence: params.evidence,
+      findings: params.findings,
       providerPayload: {
         ...params.payload,
         expected_published_commit: instance.published_commit,
@@ -143,6 +155,62 @@ const SUMMARY_MARKER_PREFIX = `${OPENTHROTTLE_COMMENT_MARKER_PREFIX}pipeline-sum
 
 function looksLikeSupervisorSummary(body: string | undefined): boolean {
   return body?.startsWith(SUMMARY_MARKER_PREFIX) === true;
+}
+
+function boundedSanitized(value: string, maxChars: number): string {
+  return sanitizeText(value).slice(0, maxChars);
+}
+
+async function enrichCiFailure(input: {
+  cfg: Config;
+  repository: string;
+  headSha: string;
+  workflowRunId?: number;
+  workflowName: string;
+}): Promise<{
+  failures: Array<{
+    workflow_name: string;
+    job_name: string;
+    step_names: string[];
+    log_tail: string | null;
+    html_url: string | null;
+  }>;
+  findings: ProviderFinding[];
+}> {
+  try {
+    const details = await getFailingGithubCheckDetails(
+      { token: input.cfg.githubReadToken },
+      input.repository,
+      {
+        headSha: input.headSha,
+        workflowRunId: input.workflowRunId,
+        workflowName: input.workflowName,
+      }
+    );
+    const failures = details.map((detail) => {
+      const stepNames = detail.stepNames.map((name) => boundedSanitized(name, 200));
+      return {
+        workflow_name: boundedSanitized(detail.workflowName, 200),
+        job_name: boundedSanitized(detail.jobName, 200),
+        step_names: stepNames,
+        log_tail: detail.logTail === null ? null : sanitizeText(detail.logTail).slice(-2_000),
+        html_url: detail.htmlUrl === null ? null : boundedSanitized(detail.htmlUrl, 1_000),
+      };
+    }).slice(0, 3);
+    return {
+      failures,
+      findings: failures.map((failure) => {
+        const step = failure.step_names.length > 0 ? failure.step_names.join(", ") : "unknown failing step";
+        return {
+          severity: "P1",
+          code: "ci-check-failed",
+          summary: `${failure.workflow_name} / ${failure.job_name} failed at ${step}.`,
+        };
+      }),
+    };
+  } catch {
+    return { failures: [], findings: [] };
+  }
 }
 
 export async function handleGithubEvent(
@@ -316,6 +384,7 @@ export async function handleGithubEvent(
         sequence: event.workflow_run.id,
         eventId: `github-workflow:${event.workflow_run.id}`,
         name: event.workflow_run.name,
+        workflowRunId: event.workflow_run.id,
       }
     : {
         branch: event.check_suite.head_branch,
@@ -325,6 +394,7 @@ export async function handleGithubEvent(
         sequence: event.check_suite.id,
         eventId: `github-check-suite:${event.check_suite.id}`,
         name: "GitHub check suite",
+        workflowRunId: undefined,
       };
   if (!isOpenthrottleBranch(ci.branch) || event.action !== "completed") return;
   const ticket = store.getByBranch(event.repository.full_name, ci.branch);
@@ -351,6 +421,13 @@ export async function handleGithubEvent(
   // out of the deterministic coordinator.
   if (!pipelines.getInstanceForSession(ticket.linear_session_id)) return;
   if (ci.conclusion === "failure" || ci.conclusion === "timed_out") {
+    const enrichment = await enrichCiFailure({
+      cfg: _cfg,
+      repository: event.repository.full_name,
+      headSha: ci.headSha,
+      workflowRunId: ci.workflowRunId,
+      workflowName: ci.name,
+    });
     routePipelineProviderEvent({
       pipelines,
       store,
@@ -358,8 +435,21 @@ export async function handleGithubEvent(
       eventId: ci.eventId,
       outcome: "semantic_repair_required",
       summary: `${ci.name} concluded ${ci.conclusion}.`,
-      evidence: [ci.url],
-      payload: { kind: event.kind, conclusion: ci.conclusion, head_sha: ci.headSha, url: ci.url },
+      evidence: [
+        ci.url,
+        ...enrichment.failures
+          .map((failure) => failure.html_url)
+          .filter((url): url is string => typeof url === "string" && url.length > 0),
+      ],
+      findings: enrichment.findings,
+      payload: {
+        kind: event.kind,
+        conclusion: ci.conclusion,
+        head_sha: ci.headSha,
+        url: ci.url,
+        failures: enrichment.failures,
+        findings: enrichment.findings,
+      },
       headSha: ci.headSha,
     });
   }

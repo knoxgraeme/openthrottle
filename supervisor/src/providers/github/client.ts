@@ -241,6 +241,41 @@ async function githubRequest<T>(
   return (await response.json()) as T;
 }
 
+async function githubTextTailRequest(
+  client: GithubClient,
+  path: string,
+  maxChars: number,
+  init: RequestInit = {}
+): Promise<string> {
+  const fetchImpl = client.fetch ?? fetch;
+  const response = await fetchImpl(`${client.apiBaseUrl ?? "https://api.github.com"}${path}`, {
+    ...init,
+    signal: init.signal ?? AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    headers: {
+      Accept: "text/plain",
+      Authorization: `Bearer ${client.token}`,
+      "X-GitHub-Api-Version": "2022-11-28",
+      ...(init.headers ?? {}),
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`GitHub API error (${response.status}): ${await response.text()}`);
+  }
+  if (!response.body) return logTail(await response.text(), maxChars);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let tail = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = decoder.decode(value, { stream: true }).slice(-maxChars * 2);
+    tail += chunk;
+    if (tail.length > maxChars * 2) tail = tail.slice(-maxChars * 2);
+  }
+  tail += decoder.decode();
+  return logTail(tail, maxChars);
+}
+
 export interface RepositoryReadiness {
   repo: string;
   baseBranch: string;
@@ -464,6 +499,123 @@ export async function getMergeReadiness(
       ),
     headSha: pull.head.sha,
   };
+}
+
+export interface GithubFailedCheckDetail {
+  workflowName: string;
+  jobName: string;
+  stepNames: string[];
+  logTail: string | null;
+  htmlUrl: string | null;
+}
+
+interface GithubActionsJob {
+  id: number;
+  name: string;
+  html_url?: string | null;
+  conclusion: string | null;
+  steps?: Array<{ name: string; conclusion: string | null }>;
+  workflow_name?: string | null;
+}
+
+function failingConclusion(conclusion: string | null | undefined): boolean {
+  return ["failure", "timed_out", "cancelled", "action_required"].includes(conclusion ?? "");
+}
+
+function logTail(text: string, maxChars = 2_000): string {
+  return text.length <= maxChars ? text : text.slice(-maxChars);
+}
+
+function stepNames(steps: GithubActionsJob["steps"]): string[] {
+  return (steps ?? [])
+    .filter((step) => failingConclusion(step.conclusion))
+    .map((step) => step.name)
+    .filter((name) => name.length > 0)
+    .slice(0, 10);
+}
+
+async function jobLogTail(client: GithubClient, repo: string, jobId: number): Promise<string | null> {
+  try {
+    return await githubTextTailRequest(client, `/repos/${repo}/actions/jobs/${jobId}/logs`, 2_000);
+  } catch {
+    return null;
+  }
+}
+
+async function detailFromJob(
+  client: GithubClient,
+  repo: string,
+  job: GithubActionsJob,
+  fallbackWorkflowName: string,
+  fallbackJobName = job.name,
+  fallbackHtmlUrl: string | null = null
+): Promise<GithubFailedCheckDetail> {
+  return {
+    workflowName: job.workflow_name ?? fallbackWorkflowName,
+    jobName: job.name || fallbackJobName,
+    stepNames: stepNames(job.steps),
+    logTail: await jobLogTail(client, repo, job.id),
+    htmlUrl: job.html_url ?? fallbackHtmlUrl,
+  };
+}
+
+export async function getFailingGithubCheckDetails(
+  client: GithubClient,
+  repo: string,
+  input: {
+    headSha: string;
+    workflowRunId?: number;
+    workflowName?: string;
+  }
+): Promise<GithubFailedCheckDetail[]> {
+  if (input.workflowRunId !== undefined) {
+    const jobs = await githubRequest<{ jobs: GithubActionsJob[] }>(
+      client,
+      `/repos/${repo}/actions/runs/${input.workflowRunId}/jobs?filter=latest&per_page=100`
+    );
+    const failingJobs = jobs.jobs.filter((job) => failingConclusion(job.conclusion)).slice(0, 3);
+    return Promise.all(failingJobs.map((job) =>
+      detailFromJob(client, repo, job, input.workflowName ?? "GitHub workflow")
+    ));
+  }
+
+  const checks = await githubRequest<{
+    check_runs: Array<{
+      id: number;
+      name: string;
+      conclusion: string | null;
+      details_url?: string | null;
+      external_id?: string | null;
+      html_url?: string | null;
+    }>;
+  }>(client, `/repos/${repo}/commits/${input.headSha}/check-runs?per_page=100`);
+  const failingChecks = checks.check_runs.filter((check) => failingConclusion(check.conclusion)).slice(0, 3);
+  return Promise.all(failingChecks.map(async (check) => {
+    const parsedJobId = check.details_url?.match(/\/job\/(\d+)(?:\?|$)/)?.[1];
+    const jobId = Number(parsedJobId ?? check.external_id);
+    if (Number.isSafeInteger(jobId) && jobId > 0) {
+      try {
+        const job = await githubRequest<GithubActionsJob>(client, `/repos/${repo}/actions/jobs/${jobId}`);
+        return detailFromJob(
+          client,
+          repo,
+          job,
+          input.workflowName ?? "GitHub check suite",
+          check.name,
+          check.html_url ?? null
+        );
+      } catch {
+        // Fall back to check-run metadata below.
+      }
+    }
+    return {
+      workflowName: input.workflowName ?? "GitHub check suite",
+      jobName: check.name,
+      stepNames: [],
+      logTail: null,
+      htmlUrl: check.html_url ?? check.details_url ?? null,
+    };
+  }));
 }
 
 export function mergePullRequest(

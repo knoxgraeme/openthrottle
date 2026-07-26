@@ -263,6 +263,25 @@ Bearer tokens are compared by hashed value with timing-safe equality. Webhook
 deliveries are acknowledged after durable claim and processed asynchronously
 through leases so restart does not lose accepted work.
 
+`GET /status` returns one block per ticket. For tickets with a pipeline
+instance, the nested `pipeline` object includes:
+
+| Field | Meaning |
+|---|---|
+| `pipeline_id` | pinned pipeline manifest id |
+| `pipeline_version` | pinned pipeline manifest version |
+| `generation` | Linear session generation bound to the instance |
+| `status` | current pipeline instance status |
+| `terminal_outcome` | terminal pipeline outcome, or `null` while active |
+| `stage_id` | active stage id, falling back to the latest attempt stage |
+| `attempt_ordinal` | latest stage attempt ordinal |
+| `reentry_ordinal` | latest stage re-entry ordinal |
+| `wait_reason` | reason the pipeline is waiting, or `null` |
+| `whose_move` | honest-ledger owner: `waiting on you`, `waiting on GitHub`, `working`, or `finished` |
+| `published_pr_url` | published pull request URL when known |
+| `last_error` | newest failed/dead effect or failed gate summary, sanitized and capped at 500 chars |
+| `last_state_change_at` | pipeline instance state-change timestamp |
+
 ## Persistence contract
 
 SQLite is the authority. Core tables include:

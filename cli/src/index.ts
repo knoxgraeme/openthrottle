@@ -44,7 +44,7 @@ async function main(): Promise<void> {
     }
     case 'status': {
       const { default: status } = await import('./status.js');
-      await status();
+      await status(rest[0]);
       break;
     }
     case 'stop': {

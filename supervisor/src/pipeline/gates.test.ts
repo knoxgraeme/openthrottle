@@ -43,7 +43,10 @@ interface Fixture {
 
 describe("deterministic supervisor stage gates", () => {
   let database: Database.Database | undefined;
-  afterEach(() => database?.close());
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    database?.close();
+  });
 
   function setup(manifestKey = "ce/investigate@2", options: { maxAttempts?: number } = {}): Fixture {
     database = openDb(":memory:");
@@ -132,6 +135,32 @@ describe("deterministic supervisor stage gates", () => {
       instance,
       attempt: boundAttempt,
     };
+  }
+
+  function moveFixtureToProviderWait(fixture: Fixture, headSha = SUBJECT): void {
+    fixture.db.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET stage_id = 'provider', native_context_policy = 'none', expected_subject = ?
+      WHERE id = ?
+    `).run(headSha, fixture.attempt.id);
+    fixture.db.prepare(`
+      UPDATE pipeline_instance_stages SET status = 'waiting'
+      WHERE pipeline_instance_id = ? AND stage_id = 'provider'
+    `).run(fixture.instance.id);
+    fixture.db.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'waiting_provider', active_stage_id = 'provider',
+          immutable_subject = ?, published_commit = ?
+      WHERE id = ?
+    `).run(headSha, headSha, fixture.instance.id);
+    fixture.tickets.setSetting("github-head:issue-1", headSha);
+  }
+
+  function firstProviderStagePayload(fixture: Fixture): string | undefined {
+    const payloads = fixture.db.prepare("SELECT payload FROM pipeline_artifacts WHERE kind = 'stage_result'")
+      .all() as Array<{ payload: string }>;
+    return payloads.map((row) => JSON.parse(row.payload) as { details?: { events?: Array<{ payload: string }> } })
+      .find((payload) => payload.details?.events)?.details?.events?.[0]?.payload;
   }
 
   function artifact(
@@ -983,6 +1012,214 @@ describe("deterministic supervisor stage gates", () => {
       parameter: "success",
       result: "https://github.com/owner/repo/actions/runs/20",
     }, "issue-1");
+  });
+
+  it("enriches failed GitHub workflow feedback into sealed repair findings", async () => {
+    const fixture = setup("ce/implement@2");
+    moveFixtureToProviderWait(fixture);
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/actions/runs/20/jobs?filter=latest&per_page=100")) {
+        return Response.json({
+          jobs: [{
+            id: 101,
+            name: "test",
+            workflow_name: "CI",
+            html_url: "https://github.com/owner/repo/actions/runs/20/job/101",
+            conclusion: "failure",
+            steps: [{ name: "unit tests", conclusion: "failure" }],
+          }],
+        });
+      }
+      if (url.endsWith("/actions/jobs/101/logs")) {
+        return new Response(`tail\nBearer ghp_secretvalue\nexpected failure\n`);
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    }) as unknown as typeof fetch;
+    vi.stubGlobal("fetch", fetchMock);
+
+    await handleGithubEvent(
+      { githubReadToken: "github-read-token" } as never,
+      fixture.tickets,
+      { publishActivity: vi.fn(async () => undefined), publishError: vi.fn(async () => undefined) },
+      {
+        kind: "workflow_run",
+        action: "completed",
+        repository: { full_name: "owner/repo" },
+        workflow_run: {
+          id: 20,
+          name: "CI",
+          status: "completed",
+          conclusion: "failure",
+          head_branch: "ot/issue-1",
+          head_sha: SUBJECT,
+          html_url: "https://github.com/owner/repo/actions/runs/20",
+        },
+      },
+      fixture.pipelines
+    );
+
+    const next = fixture.pipelines.getActiveAttempt(fixture.instance.id)!;
+    const request = fixture.pipelines.getStageRequest(next.id);
+    const transition = JSON.parse(request.transitionContext) as {
+      findings: Array<{ severity: string; code: string; summary: string }>;
+    };
+    expect(transition.findings).toEqual([{
+      severity: "P1",
+      code: "ci-check-failed",
+      summary: "CI / test failed at unit tests.",
+    }]);
+    const providerPayload = firstProviderStagePayload(fixture);
+    expect(providerPayload).toContain("expected failure");
+    expect(providerPayload).toContain("[REDACTED]");
+    expect(providerPayload).not.toContain("ghp_secretvalue");
+  });
+
+  it("enriches failed GitHub check-suite feedback into sealed repair findings", async () => {
+    const fixture = setup("ce/implement@2");
+    moveFixtureToProviderWait(fixture);
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith(`/commits/${SUBJECT}/check-runs?per_page=100`)) {
+        return Response.json({
+          check_runs: [{
+            id: 501,
+            name: "build",
+            conclusion: "failure",
+            details_url: "https://github.com/owner/repo/actions/runs/20/job/101",
+            html_url: "https://github.com/owner/repo/runs/501",
+          }],
+        });
+      }
+      if (url.endsWith("/actions/jobs/101")) {
+        return Response.json({
+          id: 101,
+          name: "build",
+          workflow_name: "CI",
+          html_url: "https://github.com/owner/repo/actions/runs/20/job/101",
+          conclusion: "failure",
+          steps: [{ name: "compile", conclusion: "failure" }],
+        });
+      }
+      if (url.endsWith("/actions/jobs/101/logs")) {
+        return new Response("compile failed with sk-secretvalue");
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    }) as unknown as typeof fetch;
+    vi.stubGlobal("fetch", fetchMock);
+
+    await handleGithubEvent(
+      { githubReadToken: "github-read-token" } as never,
+      fixture.tickets,
+      { publishActivity: vi.fn(async () => undefined), publishError: vi.fn(async () => undefined) },
+      {
+        kind: "check_suite",
+        action: "completed",
+        repository: { full_name: "owner/repo" },
+        check_suite: {
+          id: 30,
+          status: "completed",
+          conclusion: "failure",
+          head_branch: "ot/issue-1",
+          head_sha: SUBJECT,
+          url: "https://api.github.com/repos/owner/repo/check-suites/30",
+        },
+      },
+      fixture.pipelines
+    );
+
+    const next = fixture.pipelines.getActiveAttempt(fixture.instance.id)!;
+    const transition = JSON.parse(fixture.pipelines.getStageRequest(next.id).transitionContext) as {
+      findings: Array<{ severity: string; code: string; summary: string }>;
+    };
+    expect(transition.findings).toEqual([{
+      severity: "P1",
+      code: "ci-check-failed",
+      summary: "CI / build failed at compile.",
+    }]);
+    const providerPayload = firstProviderStagePayload(fixture);
+    expect(providerPayload).toContain("compile failed");
+    expect(providerPayload).toContain("[REDACTED]");
+    expect(providerPayload).not.toContain("sk-secretvalue");
+  });
+
+  it("records failed GitHub workflow feedback when enrichment fails", async () => {
+    const fixture = setup("ce/implement@2");
+    fixture.db.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'running', immutable_subject = ?, published_commit = ?
+      WHERE id = ?
+    `).run(SUBJECT, SUBJECT, fixture.instance.id);
+    fixture.tickets.setSetting("github-head:issue-1", SUBJECT);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("boom", { status: 500 })));
+
+    await handleGithubEvent(
+      { githubReadToken: "github-read-token" } as never,
+      fixture.tickets,
+      { publishActivity: vi.fn(async () => undefined), publishError: vi.fn(async () => undefined) },
+      {
+        kind: "workflow_run",
+        action: "completed",
+        repository: { full_name: "owner/repo" },
+        workflow_run: {
+          id: 21,
+          name: "CI",
+          status: "completed",
+          conclusion: "failure",
+          head_branch: "ot/issue-1",
+          head_sha: SUBJECT,
+          html_url: "https://github.com/owner/repo/actions/runs/21",
+        },
+      },
+      fixture.pipelines
+    );
+
+    const events = fixture.db.prepare("SELECT payload FROM provider_events").all() as Array<{ payload: string }>;
+    expect(events).toHaveLength(1);
+    const stored = JSON.parse(events[0]!.payload) as { evidence: string[]; payload: string };
+    expect(stored.evidence).toEqual(["https://github.com/owner/repo/actions/runs/21"]);
+    expect(JSON.parse(stored.payload)).toMatchObject({ failures: [], findings: [] });
+  });
+
+  it("keeps oversized enriched provider snapshot payloads valid JSON", () => {
+    const fixture = setup("ce/implement@2");
+    fixture.db.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'running', immutable_subject = ?, published_commit = ?
+      WHERE id = ?
+    `).run(SUBJECT, SUBJECT, fixture.instance.id);
+    fixture.tickets.setSetting("github-head:issue-1", SUBJECT);
+    const largeFailure = {
+      workflow_name: "CI",
+      job_name: "test",
+      step_names: Array.from({ length: 10 }, (_, index) => `step-${index}-${"s".repeat(200)}`),
+      log_tail: "x".repeat(2_000),
+      html_url: "https://github.com/owner/repo/actions/runs/20/job/101",
+    };
+
+    expect(routePipelineProviderEvent({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      ticket: fixture.tickets.getByIssueId("issue-1")!,
+      eventId: "large-ci-feedback",
+      outcome: "semantic_repair_required",
+      summary: "CI concluded failure.",
+      evidence: ["https://github.com/owner/repo/actions/runs/20"],
+      findings: [{ severity: "P1", code: "ci-check-failed", summary: "CI / test failed at step." }],
+      payload: {
+        kind: "workflow_run",
+        failures: [largeFailure, largeFailure, largeFailure],
+        findings: [{ severity: "P1", code: "ci-check-failed", summary: "CI / test failed at step." }],
+      },
+      headSha: SUBJECT,
+    })).toBe(true);
+
+    const stored = fixture.db.prepare("SELECT payload FROM provider_events WHERE provider_event_id = ?")
+      .get("large-ci-feedback") as { payload: string };
+    const wrapper = JSON.parse(stored.payload) as { payload: string; findings: unknown[] };
+    expect(wrapper.findings).toHaveLength(1);
+    expect(Buffer.byteLength(wrapper.payload, "utf8")).toBeLessThanOrEqual(8_000);
+    expect(() => JSON.parse(wrapper.payload)).not.toThrow();
   });
 
   it("fails closed when GitHub's current head differs from the executor-verified commit", () => {

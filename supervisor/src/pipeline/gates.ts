@@ -40,7 +40,7 @@ const ARTIFACT_KEYS = new Set([
 type ArtifactResult = StageOutcome | "not_configured";
 type GateResult = CoordinatorGateReceiptWrite["result"];
 
-interface Finding {
+export interface Finding {
   severity: "P0" | "P1" | "P2" | "P3";
   code: string;
   summary: string;
@@ -492,6 +492,7 @@ export function processProviderEvidence(
     outcome: "success" | "no_change" | "semantic_repair_required" | "retryable_infrastructure_failure" | "needs_human" | "failure";
     summary: string;
     evidence: string[];
+    findings?: Finding[];
     providerPayload: Record<string, unknown>;
   }
 ): PipelineInstance {
@@ -563,7 +564,7 @@ export function processProviderEvidence(
       result: input.outcome,
       summary: input.summary,
       evidence: input.evidence,
-      findings: [],
+      findings: input.findings ?? [],
       actions: [],
       uncertainty: [],
       started_at: timestamp,
