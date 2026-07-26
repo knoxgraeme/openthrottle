@@ -165,6 +165,10 @@ interface RenderContext {
   transition: PipelineManifest["stages"][number]["transitions"][StageOutcome] | undefined;
 }
 
+interface RenderExtras {
+  scheduledReentryOrdinal?: number;
+}
+
 function renderContext(envelope: PipelinePublicationBodyInput, normalizedManifest: string): RenderContext {
   const manifest = JSON.parse(normalizedManifest) as PipelineManifest;
   const stageIndex = envelope.stage
@@ -200,11 +204,29 @@ function nextStageName(envelope: PipelinePublicationBodyInput, context: RenderCo
   return context.manifest.entry_stage;
 }
 
-function repairRound(envelope: PipelinePublicationBodyInput, context: RenderContext): string {
-  const currentRound = (envelope.stage?.reentry_ordinal ?? 0) + 1;
+function reentryRound(
+  envelope: PipelinePublicationBodyInput,
+  context: RenderContext,
+  extras?: RenderExtras
+): string {
+  // The scheduled target attempt's re-entry ordinal is the round number; the
+  // pinned transition's max_reentries is already the number of permitted
+  // rounds, so the final allowed round renders as k of k.
+  const round = extras?.scheduledReentryOrdinal ?? (envelope.stage?.reentry_ordinal ?? 0) + 1;
   const max = context.transition?.max_reentries;
-  const totalRounds = max === undefined ? context.manifest.max_attempts : max + 1;
-  return `repair round ${currentRound} of ${totalRounds}`;
+  return max === undefined ? `${round}` : `${round} of ${max}`;
+}
+
+function reentrySentence(
+  envelope: PipelinePublicationBodyInput,
+  context: RenderContext,
+  extras?: RenderExtras
+): string {
+  const round = reentryRound(envelope, context, extras);
+  const target = nextStageName(envelope, context);
+  return envelope.decision.outcome === "retryable_infrastructure_failure"
+    ? `The supervisor is retrying the ${target} stage after an infrastructure failure (attempt ${round}).`
+    : `The supervisor accepted the stage result and scheduled repair round ${round} at the ${target} stage.`;
 }
 
 function sentenceForOutcome(outcome: StageOutcome | PipelineOutcome | "selected"): string {
@@ -233,7 +255,11 @@ function sentenceForOutcome(outcome: StageOutcome | PipelineOutcome | "selected"
   }
 }
 
-function eventSentence(envelope: PipelinePublicationBodyInput, context: RenderContext): string {
+function eventSentence(
+  envelope: PipelinePublicationBodyInput,
+  context: RenderContext,
+  extras?: RenderExtras
+): string {
   switch (envelope.template.name) {
     case "selection":
       return "OpenThrottle selected the pinned pipeline and recorded the starting receipt.";
@@ -242,7 +268,7 @@ function eventSentence(envelope: PipelinePublicationBodyInput, context: RenderCo
         ? "The supervisor accepted the stage result and verified the required fences."
         : `The supervisor recorded the stage result: ${sentenceForOutcome(envelope.decision.outcome)}`;
     case "repair_reentry":
-      return `The supervisor accepted the stage result and scheduled ${repairRound(envelope, context)}.`;
+      return reentrySentence(envelope, context, extras);
     case "needs_human":
       return terminalSentence(envelope);
     case "provider_wait":
@@ -301,10 +327,14 @@ function whoseMoveLine(envelope: PipelinePublicationBodyInput, context: RenderCo
   return `Working — next receipt expected from the ${nextStageName(envelope, context)} stage.`;
 }
 
-function renderBody(envelope: PipelinePublicationBodyInput, normalizedManifest: string): string {
+function renderBody(
+  envelope: PipelinePublicationBodyInput,
+  normalizedManifest: string,
+  extras?: RenderExtras
+): string {
   const context = renderContext(envelope, normalizedManifest);
   const lines = [
-    eventSentence(envelope, context),
+    eventSentence(envelope, context, extras),
     progressLine(envelope, context),
   ];
   envelope.evidence.summaries.forEach((summary) => lines.push(summary));
@@ -464,7 +494,9 @@ export function buildStagePublication(input: {
     links: githubLinks(input.instance, subject ?? null),
     resume_status: resumeStatus,
   };
-  const body = renderBody(partial, input.instance.normalized_manifest);
+  const body = renderBody(partial, input.instance.normalized_manifest, {
+    scheduledReentryOrdinal: input.write.nextAttempt?.reentryOrdinal,
+  });
   return artifactBytes <= INLINE_ARTIFACT_LIMIT_BYTES
     ? {
         ...partial,

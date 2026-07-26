@@ -167,6 +167,22 @@ describe("pipeline publication", () => {
     return processor;
   }
 
+  function nextAttemptStub(stageId: string, reentryOrdinal: number) {
+    return {
+      stageId,
+      attemptOrdinal: 2,
+      reentryOrdinal,
+      requestHash: "f".repeat(64),
+      idempotencyKey: `dispatch:${stageId}:${reentryOrdinal}`,
+      contextRevision: 1,
+      contextPolicy: "fresh",
+      plannedRunId: "run-next",
+      expectedSubject: null,
+      nativeSessionId: null,
+      requestPayload: "{}",
+    };
+  }
+
   function expectReceiptShape(body: string, stageLine: string, turnLine: RegExp | string) {
     expect(body).toContain(stageLine);
     expect(body).not.toContain("coordinator_pinned");
@@ -273,20 +289,72 @@ describe("pipeline publication", () => {
 
     const repair = buildStagePublication({
       instance,
-      attempt: { ...attempt, reentry_ordinal: 1 },
+      attempt,
       event: { ...input.event, outcome: "semantic_repair_required" },
       write: {
         ...baseWrite,
         outcome: "semantic_repair_required" as const,
         nextStatus: "dispatchable" as const,
         reentryIncrement: 1,
+        nextAttempt: nextAttemptStub("fresh", 1),
       },
       gateReceipt: input.receipt,
     });
-    expect(repair.body).toContain("repair round 2 of 2");
+    expect(repair.body).toContain("scheduled repair round 1 of 1 at the fresh stage");
     expectReceiptShape(
       repair.body,
       "Stage 1 of 3: fresh — the stage completed and asked for a repair pass.",
+      "Working — next receipt expected from the fresh stage."
+    );
+
+    // A backward repair edge (review -> resume) at the final allowed round:
+    // the round comes from the scheduled target attempt's re-entry ordinal and
+    // the bound from the pinned transition's max_reentries, so the numerator
+    // never exceeds the denominator.
+    const finalRepair = buildStagePublication({
+      instance,
+      attempt: { ...attempt, stage_id: "review" },
+      event: { ...input.event, outcome: "semantic_repair_required" },
+      write: {
+        ...baseWrite,
+        outcome: "semantic_repair_required" as const,
+        nextStatus: "dispatchable" as const,
+        reentryIncrement: 1,
+        nextAttempt: nextAttemptStub("resume", 2),
+      },
+      gateReceipt: input.receipt,
+    });
+    expect(finalRepair.body).toContain("scheduled repair round 2 of 2 at the resume stage");
+    for (const [, round, bound] of finalRepair.body.matchAll(/repair round (\d+) of (\d+)/g)) {
+      expect(Number(round)).toBeLessThanOrEqual(Number(bound));
+    }
+    expectReceiptShape(
+      finalRepair.body,
+      "Stage 3 of 3: review — the stage completed and asked for a repair pass.",
+      "Working — next receipt expected from the resume stage."
+    );
+
+    // An infrastructure self-retry is not a semantic repair pass and must not
+    // be described as one.
+    const infraRetry = buildStagePublication({
+      instance,
+      attempt,
+      event: { ...input.event, outcome: "retryable_infrastructure_failure" },
+      write: {
+        ...baseWrite,
+        outcome: "retryable_infrastructure_failure" as const,
+        nextStatus: "dispatchable" as const,
+        reentryIncrement: 1,
+        nextAttempt: nextAttemptStub("fresh", 1),
+      },
+      gateReceipt: input.receipt,
+    });
+    expect(infraRetry.body)
+      .toContain("retrying the fresh stage after an infrastructure failure (attempt 1 of 1)");
+    expect(infraRetry.body).not.toMatch(/repair/i);
+    expectReceiptShape(
+      infraRetry.body,
+      "Stage 1 of 3: fresh — the stage could not complete because infrastructure failed.",
       "Working — next receipt expected from the fresh stage."
     );
 
