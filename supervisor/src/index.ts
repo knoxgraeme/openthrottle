@@ -19,12 +19,31 @@ import { createGithubPublicationProcessor } from "./providers/github/pipeline-pu
 import { createDaytonaRuntime } from "./providers/daytona/adapter.js";
 import { createPipelineEffectProcessor } from "./operations/pipeline-effects.js";
 import { drainPipelineFeedbackSnapshots } from "./app/provider-feedback.js";
+import { reconcileRepositoryWebhook } from "./providers/github/client.js";
 
 const SWEEP_INTERVAL_MS = 15 * 60 * 1000; // run every 15 min while awake; SPEC only requires "on every boot" + periodic while awake
 const DELIVERY_DRAIN_INTERVAL_MS = 30 * 1000;
+const WEBHOOK_RECONCILIATION_CONCURRENCY = 4;
 // Liveness reap runs far more often than the hard-timeout sweep so a stalled
 // run is caught within ~a minute of crossing STALL_TIMEOUT_SECONDS.
 const REAP_INTERVAL_MS = 60 * 1000;
+
+async function runBounded<T>(
+  items: readonly T[],
+  concurrency: number,
+  task: (item: T) => Promise<void>
+): Promise<void> {
+  let next = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    for (;;) {
+      const item = items[next];
+      next += 1;
+      if (item === undefined) return;
+      await task(item);
+    }
+  });
+  await Promise.all(workers);
+}
 
 async function main() {
   const cfg = loadConfig();
@@ -97,6 +116,49 @@ async function main() {
     tickets: store,
     client: { token: cfg.githubToken },
   });
+  const reconcileGithubWebhooks = async () => {
+    await runBounded(
+      store.listRepositoryRegistrations(),
+      WEBHOOK_RECONCILIATION_CONCURRENCY,
+      async (registration) => {
+        try {
+          const result = await reconcileRepositoryWebhook(
+            { token: cfg.githubToken },
+            {
+              repo: registration.github_repo,
+              webhookId: registration.webhook_id,
+              webhookUrl: `${cfg.supervisorUrl}/webhooks/github`,
+              webhookSecret: cfg.githubWebhookSecret,
+            }
+          );
+          if (result.webhookId !== registration.webhook_id) {
+            store.registerRepository({
+              linearTeamKey: registration.linear_team_key,
+              linearTeamId: registration.linear_team_id ?? undefined,
+              githubRepo: registration.github_repo,
+              baseBranch: registration.base_branch,
+              webhookId: result.webhookId,
+              snapshot: registration.snapshot,
+            });
+          }
+          if (result.webhookAction === "updated") {
+            console.warn(
+              `[github-webhook] reconciled ${result.repo} hook ${result.webhookId}; missing events: ${result.missingEvents.join(", ") || "none"}`
+            );
+          } else if (result.webhookAction === "created") {
+            console.warn(
+              `[github-webhook] recreated ${result.repo} hook ${result.webhookId}; previous hook ${registration.webhook_id} was unavailable`
+            );
+          }
+        } catch (error) {
+          console.error(
+            `[github-webhook] reconciliation failed for ${registration.github_repo} hook ${registration.webhook_id}:`,
+            error
+          );
+        }
+      }
+    );
+  };
   const deliveryProcessor = createServerWebhookDeliveryProcessor({
     cfg,
     store,
@@ -207,7 +269,7 @@ async function main() {
   githubPublicationProcessor.drain().catch((err) => console.error("[github-publication] boot drain failed:", err));
   pipelineEffectProcessor.drain().catch((err) => console.error("[pipeline-effects] boot drain failed:", err));
   pollActiveSandboxes().catch((err) => console.error("[sandbox-events] boot poll failed:", err));
-  runSweep(runtime, store, cfg, pipelineStore, activityPublisher)
+  runSweep(runtime, store, cfg, pipelineStore, activityPublisher, reconcileGithubWebhooks)
     .catch((err) => console.error("[sweep] boot sweep failed:", err));
   const reapStalled = () =>
     reapStalledRuns({ runtime, store, activityPublisher, cfg, pipelines: pipelineStore }).catch((err) =>
@@ -234,7 +296,7 @@ async function main() {
     );
   }, cfg.sandboxEventPollIntervalMs).unref();
   setInterval(() => {
-    runSweep(runtime, store, cfg, pipelineStore, activityPublisher)
+    runSweep(runtime, store, cfg, pipelineStore, activityPublisher, reconcileGithubWebhooks)
       .catch((err) => console.error("[sweep] interval sweep failed:", err));
   }, SWEEP_INTERVAL_MS).unref();
 

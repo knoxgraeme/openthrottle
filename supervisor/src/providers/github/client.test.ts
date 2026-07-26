@@ -13,6 +13,7 @@ import {
   parseGithubWebhook,
   parsePullRequestUrl,
   prepareRepository,
+  reconcileRepositoryWebhook,
   upsertPullRequestComment,
   verifyGithubSignature,
 } from "./client.js";
@@ -58,6 +59,27 @@ describe("GitHub contracts", () => {
       },
     });
     expect(parseGithubWebhook("pull_request", raw).kind).toBe("pull_request");
+    const review = JSON.stringify({
+      action: "submitted",
+      repository: { full_name: "o/r" },
+      pull_request: {
+        number: 1,
+        html_url: "https://github.com/o/r/pull/1",
+        merged_at: null,
+        head: { ref: "ot/test" },
+        base: { ref: "main" },
+      },
+      review: {
+        id: 9,
+        state: "commented",
+        html_url: "https://github.com/o/r/pull/1#pullrequestreview-9",
+        user: { login: "reviewer" },
+      },
+    });
+    expect(parseGithubWebhook("pull_request_review", review)).toMatchObject({
+      kind: "pull_request_review",
+      review: { id: 9 },
+    });
     const comment = JSON.stringify({
       action: "created",
       repository: { full_name: "o/r" },
@@ -361,6 +383,145 @@ describe("GitHub contracts", () => {
       }
     );
     expect(result).toMatchObject({ webhookId: 7, webhookAction: "updated" });
+  });
+
+  it("reconciles a persisted webhook whose subscribed event list drifted", async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/repos/acme/widget/hooks/7") && !init?.method) {
+        return Response.json({
+          id: 7,
+          active: true,
+          events: ["pull_request", "pull_request_review", "workflow_run", "check_suite"],
+          config: { url: "https://ot.test/webhooks/github" },
+        });
+      }
+      if (url.endsWith("/repos/acme/widget/hooks/7") && init?.method === "PATCH") {
+        expect(JSON.parse(String(init.body))).toMatchObject({
+          active: true,
+          events: [
+            "pull_request",
+            "pull_request_review",
+            "issue_comment",
+            "workflow_run",
+            "check_suite",
+          ],
+          config: { url: "https://ot.test/webhooks/github" },
+        });
+        return Response.json({ id: 7 });
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    }) as unknown as typeof fetch;
+
+    await expect(reconcileRepositoryWebhook(
+      { token: "github", fetch: fetchMock },
+      {
+        repo: "acme/widget",
+        webhookId: 7,
+        webhookUrl: "https://ot.test/webhooks/github",
+        webhookSecret: "webhook-secret",
+      }
+    )).resolves.toEqual({
+      repo: "acme/widget",
+      webhookId: 7,
+      webhookAction: "updated",
+      missingEvents: ["issue_comment"],
+    });
+  });
+
+  it("reconciles a deleted persisted webhook by adopting an existing hook with the configured URL", async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/repos/acme/widget/hooks/7") && !init?.method) {
+        return new Response("missing", { status: 404 });
+      }
+      if (url.endsWith("/repos/acme/widget/hooks?per_page=100")) {
+        return Response.json([{
+          id: 8,
+          active: true,
+          events: ["pull_request"],
+          config: { url: "https://ot.test/webhooks/github" },
+        }]);
+      }
+      if (url.endsWith("/repos/acme/widget/hooks/8") && init?.method === "PATCH") {
+        expect(JSON.parse(String(init.body))).toMatchObject({
+          active: true,
+          events: [
+            "pull_request",
+            "pull_request_review",
+            "issue_comment",
+            "workflow_run",
+            "check_suite",
+          ],
+        });
+        return Response.json({ id: 8 });
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    }) as unknown as typeof fetch;
+
+    await expect(reconcileRepositoryWebhook(
+      { token: "github", fetch: fetchMock },
+      {
+        repo: "acme/widget",
+        webhookId: 7,
+        webhookUrl: "https://ot.test/webhooks/github",
+        webhookSecret: "webhook-secret",
+      }
+    )).resolves.toEqual({
+      repo: "acme/widget",
+      webhookId: 8,
+      webhookAction: "updated",
+      missingEvents: ["pull_request_review", "issue_comment", "workflow_run", "check_suite"],
+    });
+  });
+
+  it("recreates a deleted persisted webhook when no matching URL remains", async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/repos/acme/widget/hooks/7") && !init?.method) {
+        return new Response("missing", { status: 404 });
+      }
+      if (url.endsWith("/repos/acme/widget/hooks?per_page=100")) {
+        return Response.json([{ id: 2, active: true, events: [], config: { url: "https://other.test/hook" } }]);
+      }
+      if (url.endsWith("/repos/acme/widget/hooks") && init?.method === "POST") {
+        expect(JSON.parse(String(init.body))).toMatchObject({
+          name: "web",
+          active: true,
+          events: [
+            "pull_request",
+            "pull_request_review",
+            "issue_comment",
+            "workflow_run",
+            "check_suite",
+          ],
+          config: { url: "https://ot.test/webhooks/github" },
+        });
+        return Response.json({ id: 9 });
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    }) as unknown as typeof fetch;
+
+    await expect(reconcileRepositoryWebhook(
+      { token: "github", fetch: fetchMock },
+      {
+        repo: "acme/widget",
+        webhookId: 7,
+        webhookUrl: "https://ot.test/webhooks/github",
+        webhookSecret: "webhook-secret",
+      }
+    )).resolves.toEqual({
+      repo: "acme/widget",
+      webhookId: 9,
+      webhookAction: "created",
+      missingEvents: [
+        "pull_request",
+        "pull_request_review",
+        "issue_comment",
+        "workflow_run",
+        "check_suite",
+      ],
+    });
   });
 
   it("creates then updates one stable neutral PR summary without using the reviews API", async () => {

@@ -18,7 +18,7 @@ export async function terminateAndSettleActor(params: {
   owner: string;
   reason: string;
   status: "timed_out" | "stopped";
-  ticketState: Ticket["state"];
+  ticketState?: Ticket["state"];
   prUrl?: string;
   onSettled?: (run: Run) => void;
 }): Promise<ActorSettlementResult> {

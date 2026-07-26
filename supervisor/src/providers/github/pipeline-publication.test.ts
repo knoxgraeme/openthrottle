@@ -215,6 +215,40 @@ describe("github publication delivery", () => {
     expect(pipelines.getInstance(instance.id)?.status).toBe("dispatchable");
   });
 
+  it("does not leave a GitHub summary receipt reclaimable when the processed CAS returns false", async () => {
+    const { tickets, pipelines, instance } = setup();
+    tickets.setPrUrl(instance.linear_issue_id, "https://github.com/owner/repo/pull/9");
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      if (url.endsWith("/issues/9/comments?per_page=100")) return Response.json([]);
+      if (method === "POST") {
+        return Response.json({
+          id: 77,
+          html_url: "https://github.com/owner/repo/pull/9#issuecomment-77",
+        });
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    }) as unknown as typeof fetch;
+    vi.spyOn(pipelines, "markGithubPublicationProcessed").mockReturnValue(false);
+    const processor = createGithubPublicationProcessor({
+      store: pipelines,
+      tickets,
+      client: { token: "github", fetch: fetchMock },
+    });
+
+    await processor.drain();
+
+    const publication = pipelines.listPublications(instance.id)
+      .find((row) => row.kind === "github_summary")!;
+    expect(publication.status).toBe("dead");
+    expect(publication.last_error).toContain("CAS failed");
+    expect(pipelines.claimGithubPublications(
+      "2999-01-01T00:00:00.000Z",
+      "2999-01-01T00:01:00.000Z"
+    )).toHaveLength(0);
+  });
+
   it("never sends an unbound summary to a replacement session's pull request", async () => {
     const { tickets, pipelines, instance } = setup();
     tickets.setPrUrl(instance.linear_issue_id, "https://github.com/owner/repo/pull/9");

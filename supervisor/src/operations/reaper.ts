@@ -19,7 +19,28 @@ import type { SupervisorStore } from "../persistence/store.js";
 import { terminateAndSettleActor } from "./actor-settlement.js";
 import type { PipelineStore } from "../pipeline/store.js";
 import { processPipelineInfrastructureFailure } from "../pipeline/control.js";
+import { PIPELINE_OUTCOMES } from "../pipeline/manifest.js";
 import type { RuntimeStopper } from "../runtime/contracts.js";
+
+const TERMINAL_PIPELINE_STATUSES = new Set<string>(PIPELINE_OUTCOMES);
+const ACTIVE_ATTEMPT_STATUSES = new Set([
+  "pending",
+  "leased",
+  "dispatched",
+  "acknowledged",
+  "running",
+]);
+
+function pipelineRemainsHealthyAfterRunReap(params: {
+  pipeline: ReturnType<PipelineStore["getInstance"]> | undefined;
+  pipelineAttempt: ReturnType<PipelineStore["getAttemptForRun"]> | undefined;
+}): boolean {
+  if (!params.pipeline || !params.pipelineAttempt) return false;
+  if (params.pipeline.terminal_outcome !== null || TERMINAL_PIPELINE_STATUSES.has(params.pipeline.status)) {
+    return false;
+  }
+  return !ACTIVE_ATTEMPT_STATUSES.has(params.pipelineAttempt.status);
+}
 
 export async function reapStalledRuns(params: {
   runtime: RuntimeStopper;
@@ -59,6 +80,7 @@ export async function reapStalledRuns(params: {
         const pipeline = pipelineAttempt
           ? params.pipelines?.getInstance(pipelineAttempt.pipeline_instance_id)
           : undefined;
+        const pipelineStillHealthy = pipelineRemainsHealthyAfterRunReap({ pipeline, pipelineAttempt });
         const settlement = await terminateAndSettleActor({
           runtime,
           store,
@@ -67,7 +89,7 @@ export async function reapStalledRuns(params: {
           owner,
           reason: message,
           status: "timed_out",
-          ticketState: "error",
+          ticketState: pipelineStillHealthy ? "active" : "error",
           onSettled: pipeline
             ? () => processPipelineInfrastructureFailure({ store: params.pipelines!, runId: run.id })
             : undefined,
@@ -81,7 +103,7 @@ export async function reapStalledRuns(params: {
             ticket.linear_issue_id,
             settlement.message
           );
-        } else if (settlement.kind === "settled") {
+        } else if (settlement.kind === "settled" && !pipelineStillHealthy) {
           await activityPublisher.publishError(
             run.linear_session_id ?? ticket.linear_session_id,
             ticket.linear_issue_id,
@@ -112,6 +134,10 @@ export async function reapExpiredRuns(params: {
     const pipeline = params.pipelines.getInstance(attempt.pipeline_instance_id);
     if (!pipeline) continue;
     const message = `OpenThrottle ${run.task_type} stage exceeded its hard execution timeout.`;
+    const pipelineStillHealthy = pipelineRemainsHealthyAfterRunReap({
+      pipeline,
+      pipelineAttempt: attempt,
+    });
     try {
       const settlement = await terminateAndSettleActor({
         runtime: params.runtime,
@@ -121,7 +147,7 @@ export async function reapExpiredRuns(params: {
         owner,
         reason: message,
         status: "timed_out",
-        ticketState: "error",
+        ticketState: pipelineStillHealthy ? "active" : "error",
         onSettled: () => processPipelineInfrastructureFailure({
           store: params.pipelines,
           runId: run.id,
@@ -136,7 +162,7 @@ export async function reapExpiredRuns(params: {
           ticket.linear_issue_id,
           settlement.message
         );
-      } else if (settlement.kind === "settled") {
+      } else if (settlement.kind === "settled" && !pipelineStillHealthy) {
         await params.activityPublisher.publishError(
           run.linear_session_id ?? ticket.linear_session_id,
           ticket.linear_issue_id,

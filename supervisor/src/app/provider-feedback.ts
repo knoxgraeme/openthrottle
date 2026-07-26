@@ -189,6 +189,7 @@ export function processPipelineFeedbackSnapshot(params: {
   store: SupervisorStore;
   instance: PipelineInstance;
   snapshot: FeedbackSnapshot;
+  drainSource?: string;
 }): boolean {
   const claim = params.store.claimFeedbackSnapshot(params.snapshot.id, UNBOUNDED_SNAPSHOT_CLAIM);
   if (claim.status !== "claimed") return false;
@@ -199,6 +200,12 @@ export function processPipelineFeedbackSnapshot(params: {
   const outcome: PipelineProviderOutcome = revisionMatches
     ? PROVIDER_OUTCOME_PRIORITY.find((candidate) => outcomes.has(candidate))!
     : "needs_human";
+  const drainedAt = new Date().toISOString();
+  params.store.setSetting(`feedback-snapshot-drained-at:${claim.snapshot.id}`, drainedAt);
+  params.store.setSetting(
+    `feedback-snapshot-drain-source:${claim.snapshot.id}`,
+    params.drainSource ?? "direct"
+  );
   processProviderEvidence(params.pipelines, {
     id: `provider-feedback-snapshot:${claim.snapshot.id}`,
     instanceId: params.instance.id,
@@ -237,7 +244,13 @@ export function drainPipelineFeedbackSnapshots(
   for (const instance of pipelines.listProviderReadyInstances(limit)) {
     if (!providerStageCanReceive(pipelines, instance)) continue;
     for (const snapshot of store.listPendingFeedbackSnapshots(instance.linear_session_id, limit)) {
-      if (processPipelineFeedbackSnapshot({ pipelines, store, instance, snapshot })) {
+      if (processPipelineFeedbackSnapshot({
+        pipelines,
+        store,
+        instance,
+        snapshot,
+        drainSource: "periodic-feedback-drain",
+      })) {
         processed += 1;
         break;
       }

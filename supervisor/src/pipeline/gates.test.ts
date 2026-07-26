@@ -1014,6 +1014,50 @@ describe("deterministic supervisor stage gates", () => {
     }, "issue-1");
   });
 
+  it("accepts GitHub feedback from the live provider-wait instance even when the ticket projection says error", async () => {
+    const fixture = setup("ce/implement@2");
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    moveFixtureToProviderWait(fixture);
+    fixture.tickets.setState("issue-1", "error");
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "issue_comment",
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
+        comment: {
+          id: 404,
+          body: "This review feedback still belongs to the live provider wait.",
+          html_url: "https://github.com/owner/repo/pull/1#issuecomment-404",
+          user: { login: "reviewer" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    const snapshot = fixture.db.prepare("SELECT id, status FROM feedback_snapshots").get() as {
+      id: string;
+      status: string;
+    };
+    expect(snapshot.status).toBe("consumed");
+    expect(fixture.tickets.getSetting(`feedback-snapshot-drained-at:${snapshot.id}`))
+      .toEqual(expect.any(String));
+    expect(fixture.tickets.getSetting(`feedback-snapshot-drain-source:${snapshot.id}`))
+      .toBe("github-webhook");
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "implementation",
+      reentry_ordinal: 1,
+    });
+  });
+
   it("enriches failed GitHub workflow feedback into sealed repair findings", async () => {
     const fixture = setup("ce/implement@2");
     moveFixtureToProviderWait(fixture);

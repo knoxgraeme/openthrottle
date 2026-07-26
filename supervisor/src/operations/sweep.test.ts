@@ -54,15 +54,18 @@ describe("runSweep", () => {
       getLinearClient: async () => undefined,
     });
     const activityPublisher = createLinearActivityPublisher(store, outbox);
+    const reconcileWebhooks = vi.fn(async () => undefined);
 
     await runSweep(
       runtime,
       store,
       { orphanGraceMinutes: 5 } as Config,
       pipelines,
-      activityPublisher
+      activityPublisher,
+      reconcileWebhooks
     );
 
+    expect(reconcileWebhooks).toHaveBeenCalledOnce();
     expect(remove).toHaveBeenCalledOnce();
     expect(remove).toHaveBeenCalledWith("old-orphan");
     expect(remove).not.toHaveBeenCalledWith("new-orphan");
