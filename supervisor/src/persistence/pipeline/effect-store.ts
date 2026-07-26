@@ -128,11 +128,12 @@ export function createEffectStore(db: Database.Database, now: () => string): Pic
     recordEffectAcknowledgement,
     markStopEffectExhausted,
     markEffectFailed(effectId, error, retryAt) {
+      const timestamp = now();
       const update = db.prepare(`
         UPDATE pipeline_effect_intents
-        SET status = ?, next_attempt_at = COALESCE(?, next_attempt_at), last_error = ?
+        SET status = ?, next_attempt_at = COALESCE(?, ?), last_error = ?
         WHERE id = ? AND status = 'processing'
-      `).run(retryAt ? "failed" : "dead", retryAt, error, effectId);
+      `).run(retryAt ? "failed" : "dead", retryAt, timestamp, error, effectId);
       if (update.changes !== 1) throw new Error(`pipeline effect ${effectId} is not processing`);
     },
   };

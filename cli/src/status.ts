@@ -1,12 +1,4 @@
-// =============================================================================
-// openthrottle status
-//
-// GET {OT_SUPERVISOR_URL}/status and print a plain table. `/status` is a
-// read-only endpoint the supervisor must add per SPEC.md "CLI contract"
-// (returns the `tickets` DB rows).
-// =============================================================================
-
-import { getErrorMessage, printTable, supervisorRequest } from './util.js';
+import { getErrorMessage, supervisorRequest } from './util.js';
 
 interface TicketRow {
   linear_issue_identifier: string;
@@ -18,15 +10,22 @@ interface TicketRow {
   pipeline?: {
     pipeline_id: string;
     pipeline_version: number;
+    generation: number;
     task_type: 'implement' | 'investigate';
     status: string;
+    terminal_outcome: string | null;
     stage_id: string | null;
     attempt_ordinal: number | null;
+    reentry_ordinal: number | null;
     retry_count: number;
     reentry_count: number;
     wait_reason: string | null;
+    whose_move: 'waiting on you' | 'waiting on GitHub' | 'working' | 'finished';
+    last_error: string | null;
+    last_state_change_at: string;
     subject: string | null;
     published_commit: string | null;
+    published_pr_url: string | null;
     gate_result: string | null;
     context_policy: string | null;
     publication_state: string;
@@ -48,7 +47,43 @@ interface StatusResponse {
   tickets?: TicketRow[];
 }
 
-export default async function status(): Promise<void> {
+function value(input: string | number | null | undefined): string {
+  return input === null || input === undefined || input === '' ? '-' : String(input);
+}
+
+function shortSha(input: string | null | undefined): string {
+  return input ? input.slice(0, 12) : '-';
+}
+
+function renderTicket(ticket: TicketRow): void {
+  console.log(`${ticket.linear_issue_identifier}`);
+  console.log(`  whose move: ${ticket.pipeline?.whose_move ?? (ticket.state === 'closed' ? 'finished' : 'working')}`);
+  console.log(`  branch: ${ticket.branch}`);
+  console.log(`  agent: ${ticket.agent}`);
+  console.log(`  state: ${ticket.state}`);
+  console.log(`  pr: ${value(ticket.pipeline?.published_pr_url ?? ticket.pr_url)}`);
+  if (!ticket.pipeline) {
+    console.log(`  pipeline: -`);
+    console.log(`  updated: ${ticket.updated_at}`);
+    return;
+  }
+  const p = ticket.pipeline;
+  console.log(`  pipeline: ${p.pipeline_id}@${p.pipeline_version} generation ${p.generation}`);
+  console.log(`  status: ${p.status}`);
+  console.log(`  terminal outcome: ${value(p.terminal_outcome)}`);
+  console.log(`  stage: ${value(p.stage_id)}`);
+  console.log(`  attempt: ${value(p.attempt_ordinal)} re-entry: ${value(p.reentry_ordinal)}`);
+  console.log(`  wait reason: ${value(p.wait_reason)}`);
+  console.log(`  last error: ${value(p.last_error ?? p.sandbox_ingestion_error ?? p.effect_error ?? p.publication_error)}`);
+  console.log(`  subject: ${shortSha(p.subject)} published: ${shortSha(p.published_commit)}`);
+  console.log(`  gate: ${value(p.gate_result)} context: ${value(p.context_policy)}`);
+  console.log(`  publication: ${p.publication_state}${p.publication_id ? ` (${p.publication_id})` : ''}`);
+  console.log(`  effect: ${p.effect_kind ? `${p.effect_kind}:${p.effect_status ?? p.effect_state}` : p.effect_state}`);
+  console.log(`  recovery: ${value(p.recovery_action)}`);
+  console.log(`  last state change: ${p.last_state_change_at}`);
+}
+
+export default async function status(ticketFilter?: string): Promise<void> {
   let res: Response;
   try {
     res = await supervisorRequest('/status');
@@ -75,41 +110,15 @@ export default async function status(): Promise<void> {
     process.exit(1);
   }
 
-  const tickets = data.tickets ?? [];
-  printTable(
-    tickets.map((t) => ({
-      issue: t.linear_issue_identifier,
-      branch: t.branch,
-      agent: t.agent,
-      pipeline: t.pipeline ? `${t.pipeline.pipeline_id}@${t.pipeline.pipeline_version}` : null,
-      task: t.pipeline?.task_type,
-      state: t.pipeline?.status ?? t.state,
-      stage: t.pipeline?.stage_id,
-      attempt: t.pipeline?.attempt_ordinal,
-      retry: t.pipeline?.retry_count,
-      reentry: t.pipeline?.reentry_count,
-      subject: t.pipeline?.subject ? t.pipeline.subject.slice(0, 12) : null,
-      provider: t.pipeline?.published_commit ? t.pipeline.published_commit.slice(0, 12) : null,
-      gate: t.pipeline?.gate_result,
-      context: t.pipeline?.context_policy,
-      publication: t.pipeline?.publication_state,
-      publication_id: t.pipeline?.publication_id,
-      effect: t.pipeline?.effect_kind
-        ? `${t.pipeline.effect_kind}:${t.pipeline.effect_status ?? t.pipeline.effect_state}`
-        : t.pipeline?.effect_state,
-      effect_attempts: t.pipeline?.effect_attempts,
-      sandbox_event: t.pipeline?.sandbox_event_id,
-      sandbox_attempts: t.pipeline?.sandbox_event_attempts,
-      error: t.pipeline?.sandbox_ingestion_error ?? t.pipeline?.effect_error ?? t.pipeline?.publication_error,
-      recovery: t.pipeline?.recovery_action,
-      wait: t.pipeline?.wait_reason,
-      pr: t.pr_url,
-      updated: t.updated_at,
-    })),
-    [
-      'issue', 'branch', 'agent', 'pipeline', 'task', 'state', 'stage', 'attempt',
-      'retry', 'reentry', 'subject', 'provider', 'gate', 'context', 'publication', 'publication_id',
-      'effect', 'effect_attempts', 'sandbox_event', 'sandbox_attempts', 'error', 'recovery', 'wait', 'pr', 'updated',
-    ]
-  );
+  const tickets = ticketFilter
+    ? (data.tickets ?? []).filter((ticket) => ticket.linear_issue_identifier === ticketFilter)
+    : data.tickets ?? [];
+  if (tickets.length === 0) {
+    console.log(ticketFilter ? `(no ticket ${ticketFilter})` : '(no tickets)');
+    return;
+  }
+  tickets.forEach((ticket, index) => {
+    if (index > 0) console.log('');
+    renderTicket(ticket);
+  });
 }

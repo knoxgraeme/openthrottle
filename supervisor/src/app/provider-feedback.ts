@@ -2,7 +2,7 @@ import type { SupervisorStore } from "../persistence/store.js";
 import type { FeedbackSnapshot, FeedbackSnapshotEvent } from "../persistence/feedback-store.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import type { PipelineInstance, PipelineStore } from "../pipeline/store.js";
-import { processProviderEvidence } from "../pipeline/gates.js";
+import { processProviderEvidence, type Finding } from "../pipeline/gates.js";
 import { canonicalJson, type PipelineManifest } from "../pipeline/manifest.js";
 
 const UNBOUNDED_SNAPSHOT_CLAIM = Number.MAX_SAFE_INTEGER;
@@ -42,7 +42,37 @@ interface StoredPipelineProviderEvent {
   outcome: PipelineProviderOutcome;
   summary: string;
   evidence: string[];
+  findings: ProviderFinding[];
   payload: string;
+}
+
+type ProviderFinding = Pick<Finding, "severity" | "code" | "summary">;
+const PROVIDER_FINDING_SEVERITIES = new Set<Finding["severity"]>(["P0", "P1", "P2", "P3"]);
+
+function boundedProviderPayload(payload: Record<string, unknown>): string {
+  const serialized = sanitizeText(canonicalJson(payload));
+  if (Buffer.byteLength(serialized, "utf8") <= 8_000) return serialized;
+  try {
+    const parsed = JSON.parse(serialized) as { failures?: unknown };
+    if (Array.isArray(parsed.failures)) {
+      parsed.failures = parsed.failures.slice(0, 3).map((failure) => {
+        if (!failure || typeof failure !== "object" || Array.isArray(failure)) return failure;
+        const record = failure as Record<string, unknown>;
+        return {
+          ...record,
+          step_names: Array.isArray(record.step_names)
+            ? record.step_names.filter((item) => typeof item === "string").slice(0, 3)
+            : record.step_names,
+          log_tail: typeof record.log_tail === "string" ? record.log_tail.slice(-1_000) : record.log_tail,
+        };
+      });
+      const bounded = canonicalJson(parsed);
+      if (Buffer.byteLength(bounded, "utf8") <= 8_000) return bounded;
+    }
+  } catch {
+    // Fall back to the compact marker below.
+  }
+  return canonicalJson({ truncated: true });
 }
 
 export function providerStageCanReceive(
@@ -78,6 +108,7 @@ export function recordPipelineProviderEvent(params: {
   outcome: PipelineProviderOutcome;
   summary: string;
   evidence: string[];
+  findings?: ProviderFinding[];
   payload: Record<string, unknown>;
   headSha: string;
   pullRequestUrl?: string;
@@ -86,7 +117,12 @@ export function recordPipelineProviderEvent(params: {
     outcome: params.outcome,
     summary: sanitizeText(params.summary).slice(0, 2_000),
     evidence: params.evidence.slice(0, 20).map((item) => sanitizeText(item).slice(0, 1_000)),
-    payload: sanitizeText(canonicalJson(params.payload)).slice(0, 8_000),
+    findings: (params.findings ?? []).slice(0, 20).map((finding) => ({
+      severity: finding.severity,
+      code: sanitizeText(finding.code).slice(0, 80),
+      summary: sanitizeText(finding.summary).slice(0, 1_000),
+    })),
+    payload: boundedProviderPayload(params.payload),
   } satisfies StoredPipelineProviderEvent);
   return params.store.recordProviderFeedback({
     provider: params.provider,
@@ -108,14 +144,44 @@ function parseStoredPipelineEvent(event: FeedbackSnapshotEvent): StoredPipelineP
     outcome?: unknown;
     summary?: unknown;
     evidence?: unknown;
+    findings?: unknown;
     payload?: unknown;
   };
   if (typeof parsed.outcome !== "string" || !PROVIDER_OUTCOME_SET.has(parsed.outcome) ||
       typeof parsed.summary !== "string" || !Array.isArray(parsed.evidence) ||
-      parsed.evidence.some((item) => typeof item !== "string") || typeof parsed.payload !== "string") {
+      parsed.evidence.some((item) => typeof item !== "string") ||
+      !validProviderFindings(parsed.findings) || typeof parsed.payload !== "string") {
     throw new Error(`pipeline provider event ${event.provider}:${event.provider_event_id} is malformed`);
   }
-  return parsed as StoredPipelineProviderEvent;
+  return { ...parsed, findings: parsed.findings ?? [] } as StoredPipelineProviderEvent;
+}
+
+function isProviderFinding(item: unknown): item is Record<"severity" | "code" | "summary", string> {
+  return typeof item === "object" && item !== null &&
+    PROVIDER_FINDING_SEVERITIES.has((item as Record<string, unknown>).severity as Finding["severity"]) &&
+    typeof (item as Record<string, unknown>).code === "string" &&
+    typeof (item as Record<string, unknown>).summary === "string";
+}
+
+function validProviderFindings(value: unknown): boolean {
+  return value === undefined || (Array.isArray(value) && value.every(isProviderFinding));
+}
+
+function providerFindings(payload: string): ProviderFinding[] {
+  try {
+    const parsed = JSON.parse(payload) as { findings?: unknown };
+    if (!Array.isArray(parsed.findings)) return [];
+    return parsed.findings
+      .filter(isProviderFinding)
+      .slice(0, 20)
+      .map((item) => ({
+        severity: item.severity as Finding["severity"],
+        code: item.code.slice(0, 80),
+        summary: item.summary.slice(0, 1_000),
+      }));
+  } catch {
+    return [];
+  }
 }
 
 export function processPipelineFeedbackSnapshot(params: {
@@ -141,6 +207,10 @@ export function processPipelineFeedbackSnapshot(params: {
       ? `Immutable provider snapshot contains ${events.length} event(s) for the published commit.`
       : "The current provider head does not match the executor-verified published commit.",
     evidence: events.flatMap(({ parsed }) => parsed.evidence).slice(0, 50),
+    findings: events.flatMap(({ parsed }) => parsed.findings.length > 0
+      ? parsed.findings
+      : providerFindings(parsed.payload)
+    ).slice(0, 50),
     providerPayload: {
       snapshot_id: claim.snapshot.id,
       repair_round: claim.snapshot.repair_round,
