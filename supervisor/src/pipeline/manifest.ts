@@ -106,6 +106,16 @@ export interface PipelineManifest {
   stages: PipelineStage[];
 }
 
+interface RetryDeclaration {
+  max_reentries: number;
+  on_exhausted: PipelineOutcome;
+}
+
+interface ManifestDefaults {
+  transitions: Partial<Record<StageOutcome, PipelineTransition>>;
+  retry?: RetryDeclaration;
+}
+
 export interface ValidatedPipelineManifest {
   manifest: PipelineManifest;
   normalized: string;
@@ -257,10 +267,47 @@ function parseTransition(value: unknown, path: string): PipelineTransition {
     ...(maxReentries ? { max_reentries: maxReentries, on_exhausted: onExhausted } : {}) };
 }
 
-function parseStage(value: unknown, path: string): PipelineStage {
+function parseRetry(value: unknown, path: string): RetryDeclaration {
+  const input = objectAt(value, path, ["max_reentries", "on_exhausted"]);
+  return {
+    max_reentries: integerAt(input.max_reentries, `${path}.max_reentries`, 1, 20),
+    on_exhausted: enumAt(input.on_exhausted, `${path}.on_exhausted`, PIPELINE_OUTCOMES),
+  };
+}
+
+function retryTransition(stageId: string, retry: RetryDeclaration): PipelineTransition {
+  return {
+    to: stageId,
+    max_reentries: retry.max_reentries,
+    on_exhausted: retry.on_exhausted,
+  };
+}
+
+function parseTransitionMap(value: unknown, path: string): Partial<Record<StageOutcome, PipelineTransition>> {
+  const input = objectAt(value, path);
+  const transitions: Partial<Record<StageOutcome, PipelineTransition>> = {};
+  for (const [outcome, transition] of Object.entries(input)) {
+    if (outcome === "same_as") fail(`${path}.${outcome}`, "is reserved but not implemented");
+    if (!STAGE_OUTCOMES.includes(outcome as StageOutcome)) fail(`${path}.${outcome}`, "unknown outcome");
+    transitions[outcome as StageOutcome] = parseTransition(transition, `${path}.${outcome}`);
+  }
+  return transitions;
+}
+
+function parseManifestDefaults(value: unknown, path: string): ManifestDefaults {
+  if (value === undefined) return { transitions: {} };
+  const input = objectAt(value, path, ["transitions", "retry"]);
+  return {
+    transitions: input.transitions === undefined ? {} : parseTransitionMap(input.transitions, `${path}.transitions`),
+    ...(input.retry === undefined ? {} : { retry: parseRetry(input.retry, `${path}.retry`) }),
+  };
+}
+
+function parseStage(value: unknown, path: string, defaults: ManifestDefaults): PipelineStage {
   const input = objectAt(value, path, [
-    "id", "executor", "evaluator", "context", "live_steering", "credentials", "produces", "transitions",
+    "id", "executor", "evaluator", "context", "live_steering", "credentials", "produces", "transitions", "retry",
   ]);
+  const id = stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER });
   const executorInput = objectAt(input.executor, `${path}.executor`, ["kind", "capability"]);
   const executor = {
     kind: enumAt(executorInput.kind, `${path}.executor.kind`, EXECUTOR_KINDS),
@@ -277,14 +324,24 @@ function parseStage(value: unknown, path: string): PipelineStage {
       { min: 1, max: 8 }
     ), `${path}.evaluator.required_artifacts`),
   };
-  const transitionsInput = objectAt(input.transitions, `${path}.transitions`, STAGE_OUTCOMES);
+  const declaredTransitions = input.transitions === undefined
+    ? {}
+    : parseTransitionMap(input.transitions, `${path}.transitions`);
+  const mergedTransitions: Partial<Record<StageOutcome, PipelineTransition>> = { ...defaults.transitions };
+  if (defaults.retry && declaredTransitions.retryable_infrastructure_failure === undefined) {
+    mergedTransitions.retryable_infrastructure_failure = retryTransition(id, defaults.retry);
+  }
+  Object.assign(mergedTransitions, declaredTransitions);
+  if (input.retry !== undefined) {
+    mergedTransitions.retryable_infrastructure_failure = retryTransition(id, parseRetry(input.retry, `${path}.retry`));
+  }
   const transitions = {} as Record<StageOutcome, PipelineTransition>;
   for (const outcome of STAGE_OUTCOMES) {
-    if (transitionsInput[outcome] === undefined) fail(`${path}.transitions.${outcome}`, "is required");
-    transitions[outcome] = parseTransition(transitionsInput[outcome], `${path}.transitions.${outcome}`);
+    if (mergedTransitions[outcome] === undefined) fail(`${path}.transitions.${outcome}`, "is required");
+    transitions[outcome] = mergedTransitions[outcome];
   }
   const stage: PipelineStage = {
-    id: stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER }),
+    id,
     executor,
     evaluator,
     context: enumAt(input.context, `${path}.context`, CONTEXT_POLICIES),
@@ -363,10 +420,11 @@ export function validatePipelineManifest(
 ): ValidatedPipelineManifest {
   const source = options.source ?? "pipeline";
   const input = objectAt(value, source, [
-    "schema", "id", "version", "description", "entry_stage", "max_attempts", "requires", "stages",
+    "schema", "id", "version", "description", "entry_stage", "max_attempts", "requires", "defaults", "stages",
   ]);
   if (input.schema !== "openthrottle.pipeline/v1") fail(`${source}.schema`, "must be openthrottle.pipeline/v1");
   const requiresInput = objectAt(input.requires, `${source}.requires`, ["protocol", "capabilities"]);
+  const defaults = parseManifestDefaults(input.defaults, `${source}.defaults`);
   const manifest: PipelineManifest = {
     schema: "openthrottle.pipeline/v1",
     id: stringAt(input.id, `${source}.id`, { max: 120, pattern: IDENTIFIER }),
@@ -383,7 +441,7 @@ export function validatePipelineManifest(
         { min: 1, max: 32 }
       ), `${source}.requires.capabilities`),
     },
-    stages: arrayAt(input.stages, `${source}.stages`, parseStage, { min: 1, max: 32 }),
+    stages: arrayAt(input.stages, `${source}.stages`, (stage, path) => parseStage(stage, path, defaults), { min: 1, max: 32 }),
   };
   validateGraph(manifest, source);
   for (const stage of manifest.stages) {

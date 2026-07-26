@@ -1,6 +1,8 @@
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
+  canonicalJson,
+  digestNormalized,
   loadPipelineCatalog,
   parsePipelineManifest,
   parseRepositoryConfig,
@@ -10,7 +12,7 @@ import {
 import { buildInstalledRuntimeDescriptor } from "../runtime/contracts.js";
 
 function transitions(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return {
+  const output: Record<string, unknown> = {
     success: { terminal: "shipped" },
     no_change: { terminal: "no_change" },
     semantic_repair_required: { terminal: "needs_human" },
@@ -19,8 +21,12 @@ function transitions(overrides: Record<string, unknown> = {}): Record<string, un
     canceled: { terminal: "canceled" },
     superseded: { terminal: "superseded" },
     failure: { terminal: "failed" },
-    ...overrides,
   };
+  for (const [outcome, transition] of Object.entries(overrides)) {
+    if (transition === undefined) delete output[outcome];
+    else output[outcome] = transition;
+  }
+  return output;
 }
 
 function manifest(): Record<string, unknown> {
@@ -49,6 +55,17 @@ function manifest(): Record<string, unknown> {
   };
 }
 
+function withoutIdentity(value: unknown): unknown {
+  const copy = { ...(value as Record<string, unknown>) };
+  delete copy.id;
+  delete copy.version;
+  return copy;
+}
+
+function firstStage(value: Record<string, unknown>): Record<string, unknown> {
+  return (value.stages as Array<Record<string, unknown>>)[0]!;
+}
+
 describe("pipeline manifest validation", () => {
   it("loads the shipped catalog deterministically against independent runtime evidence", () => {
     const path = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
@@ -58,12 +75,15 @@ describe("pipeline manifest validation", () => {
 
     expect(first.digest).toBe(second.digest);
     expect([...first.manifests.keys()]).toEqual([
+      "core/implement@1",
+      "core/investigate@1",
       "ce/implement@2",
       "ce/implement@3",
       "ce/investigate@2",
     ]);
-    expect(resolvePipelineReference(first, "implement").manifest.id).toBe("ce/implement");
-    expect(resolvePipelineReference(first, "implement").manifest.version).toBe(3);
+    expect(resolvePipelineReference(first, "implement").manifest.id).toBe("core/implement");
+    expect(resolvePipelineReference(first, "implement").manifest.version).toBe(1);
+    expect(resolvePipelineReference(first, "ce/implement@3").manifest.id).toBe("ce/implement");
     expect(() => resolvePipelineReference(first, "ce/implement@1"))
       .toThrow(/unknown pipeline selection/);
     expect(() => resolvePipelineReference(first, "ce/investigate@1"))
@@ -86,6 +106,128 @@ describe("pipeline manifest validation", () => {
       "investigate",
       "publish",
     ]);
+  });
+
+  it("normalizes defaults and retry shorthand to the same JSON and digest as explicit transitions", () => {
+    const explicit = manifest();
+    firstStage(explicit).transitions = transitions({
+      retryable_infrastructure_failure: { to: "stage", max_reentries: 2, on_exhausted: "failed" },
+    });
+    const shorthand = structuredClone(explicit) as Record<string, unknown>;
+    shorthand.defaults = {
+      transitions: transitions({ retryable_infrastructure_failure: undefined }),
+      retry: { max_reentries: 2, on_exhausted: "failed" },
+    };
+    delete firstStage(shorthand).transitions;
+
+    const explicitValidated = validatePipelineManifest(explicit);
+    const shorthandValidated = validatePipelineManifest(shorthand);
+    expect(shorthandValidated.normalized).toBe(explicitValidated.normalized);
+    expect(shorthandValidated.digest).toBe(explicitValidated.digest);
+    expect(digestNormalized(canonicalJson(shorthandValidated.manifest))).toBe(shorthandValidated.digest);
+  });
+
+  it("lets stage transitions and stage retry override manifest defaults", () => {
+    const value = manifest();
+    value.defaults = {
+      transitions: transitions({ success: { terminal: "failed" } }),
+      retry: { max_reentries: 2, on_exhausted: "failed" },
+    };
+    firstStage(value).transitions = {
+      success: { terminal: "no_change" },
+    };
+    firstStage(value).retry = {
+      max_reentries: 4,
+      on_exhausted: "needs_human",
+    };
+
+    const stage = validatePipelineManifest(value).manifest.stages[0]!;
+    expect(stage.transitions.success).toEqual({ terminal: "no_change" });
+    expect(stage.transitions.retryable_infrastructure_failure).toEqual({
+      to: "stage",
+      max_reentries: 4,
+      on_exhausted: "needs_human",
+    });
+  });
+
+  it("applies retry shorthand after same-scope explicit retryable transitions", () => {
+    const value = manifest();
+    value.defaults = {
+      transitions: transitions({
+        retryable_infrastructure_failure: { terminal: "failed" },
+      }),
+      retry: { max_reentries: 2, on_exhausted: "failed" },
+    };
+    firstStage(value).transitions = {
+      retryable_infrastructure_failure: { terminal: "needs_human" },
+    };
+    firstStage(value).retry = {
+      max_reentries: 4,
+      on_exhausted: "needs_human",
+    };
+
+    expect(validatePipelineManifest(value).manifest.stages[0]!.transitions.retryable_infrastructure_failure)
+      .toEqual({ to: "stage", max_reentries: 4, on_exhausted: "needs_human" });
+  });
+
+  it("expands stage retry shorthand without manifest retry defaults", () => {
+    const value = manifest();
+    firstStage(value).transitions = transitions({
+      retryable_infrastructure_failure: undefined,
+    });
+    firstStage(value).retry = {
+      max_reentries: 5,
+      on_exhausted: "failed",
+    };
+
+    expect(validatePipelineManifest(value).manifest.stages[0]!.transitions.retryable_infrastructure_failure)
+      .toEqual({ to: "stage", max_reentries: 5, on_exhausted: "failed" });
+  });
+
+  it("rejects invalid defaults before reducers can observe them", () => {
+    expect(() => validatePipelineManifest({
+      ...manifest(),
+      defaults: { transitions: { mystery: { terminal: "failed" } } },
+    })).toThrow(/pipeline\.defaults\.transitions\.mystery: unknown outcome/);
+
+    expect(() => validatePipelineManifest({
+      ...manifest(),
+      defaults: { transitions: { same_as: { terminal: "failed" } } },
+    })).toThrow(/pipeline\.defaults\.transitions\.same_as: is reserved but not implemented/);
+
+    const unknownTarget = manifest();
+    unknownTarget.defaults = { transitions: { success: { to: "missing" } } };
+    firstStage(unknownTarget).transitions = transitions({
+      success: undefined,
+    });
+    expect(() => validatePipelineManifest(unknownTarget))
+      .toThrow(/pipeline\.stages\.stage\.transitions\.success\.to: references an unknown stage/);
+  });
+
+  it("rejects retry shorthand targets because self-loop targets are implied", () => {
+    expect(() => validatePipelineManifest({
+      ...manifest(),
+      defaults: { retry: { to: "stage", max_reentries: 2, on_exhausted: "failed" } },
+    })).toThrow(/pipeline\.defaults\.retry\.to: unknown field/);
+
+    const value = manifest();
+    firstStage(value).retry = {
+      to: "stage",
+      max_reentries: 2,
+      on_exhausted: "failed",
+    };
+    expect(() => validatePipelineManifest(value))
+      .toThrow(/pipeline\.stages\[0\]\.retry\.to: unknown field/);
+  });
+
+  it("keeps neutral core manifests topology-equivalent to their immutable ce twins", () => {
+    const path = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
+    const catalog = loadPipelineCatalog(path, buildInstalledRuntimeDescriptor("test-runtime/v1").descriptor);
+
+    expect(withoutIdentity(resolvePipelineReference(catalog, "core/implement@1").manifest))
+      .toEqual(withoutIdentity(resolvePipelineReference(catalog, "ce/implement@3").manifest));
+    expect(withoutIdentity(resolvePipelineReference(catalog, "core/investigate@1").manifest))
+      .toEqual(withoutIdentity(resolvePipelineReference(catalog, "ce/investigate@2").manifest));
   });
 
   it("ships ce/implement@3 as a plan-in pipeline while keeping ce/implement@2 pinned-instance immutable", () => {

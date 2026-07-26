@@ -316,7 +316,7 @@ describe("admission preflight wired into Linear admission", () => {
 
     expect(tickets.getByIssueId("issue-1")).toMatchObject({ state: "active" });
     expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
-      pipeline_id: "ce/implement",
+      pipeline_id: "core/implement",
       base_commit: "a".repeat(40),
     });
   });
@@ -346,6 +346,6 @@ describe("admission preflight wired into Linear admission", () => {
 
     const { pipelines } = await admit({ preflight: cfgPreflight(brokenDaytona) });
 
-    expect(pipelines.getInstanceForSession("session-1")).toMatchObject({ pipeline_id: "ce/implement" });
+    expect(pipelines.getInstanceForSession("session-1")).toMatchObject({ pipeline_id: "core/implement" });
   });
 });

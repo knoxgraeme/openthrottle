@@ -81,6 +81,8 @@ Each `openthrottle.pipeline/v1` manifest declares:
 
 - immutable `id`, integer `version`, `entry_stage`, and `max_attempts`;
 - required executor protocol and capabilities;
+- optional `defaults.transitions` and `defaults.retry` authoring shortcuts that
+  expand before normalization and digesting;
 - ordered stages with executor/evaluator kind, assurance, required artifacts,
   context policy, live-steering flag, credential scopes, produced artifacts,
   and outcome transitions;
@@ -90,11 +92,22 @@ Allowed outcomes are `success`, `no_change`,
 `semantic_repair_required`, `retryable_infrastructure_failure`, `needs_human`,
 `canceled`, `superseded`, and `failure`. Terminal pipeline outcomes are
 `shipped`, `no_change`, `needs_human`, `canceled`, `superseded`, and `failed`.
+Every normalized stage has an explicit transition for every stage outcome. A
+manifest-level `defaults.transitions` map may supply shared outcome
+transitions, and a stage-level transition for the same outcome wins. Unknown
+default outcome keys are rejected. The key `same_as` is reserved and rejected.
+`defaults.retry: { max_reentries, on_exhausted }` and stage-level `retry`
+expand to `retryable_infrastructure_failure` self-loops for the declaring
+stage; the target is implied and cannot be authored.
 
 Context policies are `none`, `fresh`, `resume_required`, `prefer_resume`, and
 `fresh_review`. Assurance classes are `semantic_attested`,
 `semantic_corroborated`, `executor_verified`, `provider_verified`, and
 `human_approved`. An evaluator may accept only its declared assurance class.
+
+Platform-authored pipelines use the `core/` namespace. CE remains the default
+skill pack, but the `ce/` namespace is reserved for capability IDs such as
+`ce/implement@1`, `ce/review@1`, and `ce/publish@1`.
 
 Catalog aliases resolve to exact manifest id/version pairs. Repository config
 may override the implement or investigate alias, but cannot supply arbitrary
