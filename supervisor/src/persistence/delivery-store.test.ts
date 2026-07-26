@@ -43,6 +43,34 @@ describe("delivery store", () => {
     expect([first.sequence, second.sequence]).toEqual([1, 2]);
   });
 
+  it("does not acknowledge a Linear outbox row after its payload changed", () => {
+    const row = store.enqueueLinearOutbox({
+      id: "linear-status",
+      linearSessionId: "session-1",
+      issueId: "issue-1",
+      kind: "pipeline_status",
+      payload: '{"type":"pipeline_status","publication":{"body":"old"}}',
+    });
+    db.prepare(`
+      UPDATE linear_outbox
+      SET payload = ?, payload_hash = 'new-hash'
+      WHERE id = ?
+    `).run('{"type":"pipeline_status","publication":{"body":"new"}}', row.id);
+
+    store.markLinearOutboxProcessed(row.id, { externalId: "stale-comment" }, row.payload_hash);
+    expect(store.getLinearOutbox(row.id)).toMatchObject({
+      status: "pending",
+      payload_hash: "new-hash",
+      external_id: null,
+    });
+
+    store.markLinearOutboxFailed(row.id, "stale failure", null, row.payload_hash);
+    expect(store.getLinearOutbox(row.id)).toMatchObject({
+      status: "pending",
+      last_error: null,
+    });
+  });
+
   it("deduplicates accepted webhooks", () => {
     const claim = { deliveryId: "delivery-1", source: "linear" as const, action: "created" };
     expect(store.claimDelivery(claim)).toBe(true);

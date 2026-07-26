@@ -154,7 +154,7 @@ export interface LinearOutboxRecord {
   linear_issue_id: string | null;
   run_id: string | null;
   sequence: number;
-  kind: "activity" | "session_update" | "pipeline_receipt";
+  kind: "activity" | "session_update" | "pipeline_receipt" | "pipeline_status";
   payload: string;
   payload_hash: string;
   status: "pending" | "processing" | "failed" | "processed" | "dead";

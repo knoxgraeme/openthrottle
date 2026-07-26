@@ -21,8 +21,8 @@ export interface DeliveryStore {
     externalId?: string | null;
     externalUrl?: string | null;
     attachmentUrl?: string | null;
-  }): void;
-  markLinearOutboxFailed(id: string, error: string, retryAt: string | null): void;
+  }, expectedPayloadHash?: string): void;
+  markLinearOutboxFailed(id: string, error: string, retryAt: string | null, expectedPayloadHash?: string): void;
   recordLinearOutboxAttachment(id: string, attachmentUrl: string): void;
   getLinearOutbox(id: string): LinearOutboxRecord | undefined;
   listLinearOutbox(): LinearOutboxRecord[];
@@ -192,6 +192,7 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
             SELECT 1 FROM linear_outbox earlier
             WHERE earlier.linear_session_id IS candidate.linear_session_id
               AND earlier.sequence < candidate.sequence
+              AND earlier.kind <> 'pipeline_status'
               AND earlier.status IN ('pending', 'processing', 'failed')
           )
         ORDER BY candidate.created_at, candidate.sequence
@@ -211,24 +212,28 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
       }
       return claimed;
     },
-    markLinearOutboxProcessed(id, receipt) {
+    markLinearOutboxProcessed(id, receipt, expectedPayloadHash) {
       db.transaction(() => {
         const processedAt = now();
-        db.prepare(`
+        const update = db.prepare(`
           UPDATE linear_outbox
           SET status = 'processed', processed_at = ?, next_attempt_at = ?, last_error = NULL,
               external_id = COALESCE(?, external_id),
               external_url = COALESCE(?, external_url),
               attachment_url = COALESCE(?, attachment_url)
           WHERE id = ?
+            AND (? IS NULL OR payload_hash = ?)
         `).run(
           processedAt,
           processedAt,
           receipt?.externalId ?? null,
           receipt?.externalUrl ?? null,
           receipt?.attachmentUrl ?? null,
-          id
+          id,
+          expectedPayloadHash ?? null,
+          expectedPayloadHash ?? null
         );
+        if (update.changes !== 1) return;
         const publication = db.prepare(`
           SELECT * FROM pipeline_publication_receipts WHERE id = ?
         `).get(id) as {
@@ -268,15 +273,17 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
         }
       })();
     },
-    markLinearOutboxFailed(id, error, retryAt) {
+    markLinearOutboxFailed(id, error, retryAt, expectedPayloadHash) {
       db.transaction(() => {
         const timestamp = now();
         const status = retryAt ? "failed" : "dead";
-        db.prepare(`
+        const update = db.prepare(`
           UPDATE linear_outbox
           SET status = ?, next_attempt_at = ?, last_error = ?
           WHERE id = ?
-        `).run(status, retryAt ?? timestamp, error, id);
+            AND (? IS NULL OR payload_hash = ?)
+        `).run(status, retryAt ?? timestamp, error, id, expectedPayloadHash ?? null, expectedPayloadHash ?? null);
+        if (update.changes !== 1) return;
         const publication = db.prepare(`
           SELECT pipeline_instance_id FROM pipeline_publication_receipts WHERE id = ?
         `).get(id) as { pipeline_instance_id: string } | undefined;

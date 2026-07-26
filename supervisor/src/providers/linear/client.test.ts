@@ -4,6 +4,7 @@ import {
   agentActivityCreate,
   agentSessionUpdate,
   buildLinearInstallUrl,
+  findIssueCommentByMarker,
   linearFileUpload,
 } from "./client.js";
 import {
@@ -182,6 +183,35 @@ describe("Linear contracts", () => {
       { name: "bad", parentName: undefined },
     ]);
     expect(requests[0]).toMatchObject({ variables: { id: "issue-1" } });
+  });
+
+  it("paginates issue comments until it finds a marker", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      requests.push(request);
+      const after = (request.variables as { after?: string | null }).after;
+      return Response.json({
+        data: {
+          issue: {
+            comments: after
+              ? {
+                  nodes: [{ id: "comment-2", body: "second <!-- marker -->", url: "https://linear.test/comment/2" }],
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                }
+              : {
+                  nodes: [{ id: "comment-1", body: "first", url: "https://linear.test/comment/1" }],
+                  pageInfo: { hasNextPage: true, endCursor: "cursor-1" },
+                },
+          },
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    await expect(findIssueCommentByMarker({ accessToken: "oauth", fetch: fetchMock }, "issue-1", "<!-- marker -->"))
+      .resolves.toEqual({ id: "comment-2", body: "second <!-- marker -->", url: "https://linear.test/comment/2" });
+    expect(requests.map((request) => (request.variables as { after?: string | null }).after))
+      .toEqual([null, "cursor-1"]);
   });
 
   it("tolerates an issue with no labels", async () => {

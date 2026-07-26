@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import {
   canonicalJson,
   digestNormalized,
+  PIPELINE_OUTCOMES,
   type PipelineManifest,
   type PipelineOutcome,
   type StageOutcome,
@@ -25,6 +26,7 @@ const SUPPORTED_PIPELINE_PUBLICATION_TEMPLATE_VERSIONS = new Set<number>([
 const INLINE_ARTIFACT_LIMIT_BYTES = 4 * 1024;
 const PUBLICATION_BODY_LIMIT = 12_000;
 const ATTACHMENT_LIMIT_BYTES = 256 * 1024;
+const TERMINAL_STATUSES = new Set<string>(PIPELINE_OUTCOMES);
 
 export type PipelinePublicationTemplate =
   | "selection"
@@ -314,21 +316,57 @@ function whoseMoveLine(envelope: PipelinePublicationBodyInput, context: RenderCo
     ? boundedPublicationLine(envelope.decision.wait_reason, 1_000)
     : "the published receipt in this Linear session";
   if (envelope.decision.next_status === "waiting_human" || envelope.template.name === "needs_human") {
-    return `Waiting on you: ${waitReason}.`;
+    return `Your move: decision required: ${waitReason}.`;
   }
   if (envelope.decision.next_status === "waiting_provider" || envelope.template.name === "provider_wait") {
-    return `Waiting on GitHub: ${waitReason}.`;
+    return `Your move: nothing - merge when CI is green. Waiting on GitHub: ${waitReason}.`;
   }
   if (envelope.template.name === "terminal" ||
       envelope.decision.next_status === envelope.decision.outcome &&
-      ["shipped", "no_change", "needs_human", "failed", "canceled", "superseded"].includes(envelope.decision.next_status)) {
-    return `This run is finished: ${terminalSentence(envelope)}`;
+      TERMINAL_STATUSES.has(envelope.decision.next_status)) {
+    return `Your move: nothing - this run is finished. ${terminalSentence(envelope)}`;
   }
-  return `Working — next receipt expected from the ${nextStageName(envelope, context)} stage.`;
+  return `Your move: nothing - OpenThrottle is working on ${nextStageName(envelope, context)}.`;
 }
 
-function dedupeAdjacentLines(lines: string[]): string[] {
-  return lines.filter((line, index) => line === "" || line !== lines[index - 1]);
+function dedupeLines(lines: string[]): string[] {
+  return Array.from(new Set(lines));
+}
+
+function activeChecklistIndex(envelope: PipelinePublicationBodyInput, context: RenderContext): number {
+  if (envelope.template.name === "terminal" ||
+      TERMINAL_STATUSES.has(envelope.decision.next_status) ||
+      (envelope.resume_status && TERMINAL_STATUSES.has(envelope.resume_status))) {
+    return context.manifest.stages.length;
+  }
+  const next = nextStageName(envelope, context);
+  const nextIndex = context.manifest.stages.findIndex((stage) => stage.id === next);
+  if (nextIndex >= 0 && next !== envelope.stage?.id) return nextIndex;
+  return context.stageIndex >= 0 ? context.stageIndex : 0;
+}
+
+function stageChecklistLines(envelope: PipelinePublicationBodyInput, context: RenderContext): string[] {
+  const activeIndex = activeChecklistIndex(envelope, context);
+  return context.manifest.stages.map((stage, index) => {
+    if (index < activeIndex || activeIndex >= context.manifest.stages.length) {
+      return `- [x] ${stage.id}`;
+    }
+    if (index === activeIndex) {
+      const wait = envelope.decision.wait_reason
+        ? ` - ${boundedPublicationLine(envelope.decision.wait_reason, 500)}`
+        : "";
+      return `- [...] ${stage.id}${wait}`;
+    }
+    return `- [ ] ${stage.id}`;
+  });
+}
+
+function summaryHeaderLines(envelope: PipelinePublicationBodyInput, context: RenderContext): string[] {
+  return [
+    "### Run status",
+    ...stageChecklistLines(envelope, context),
+    whoseMoveLine(envelope, context),
+  ];
 }
 
 function renderBody(
@@ -338,6 +376,8 @@ function renderBody(
 ): string {
   const context = renderContext(envelope, normalizedManifest);
   const lines = [
+    ...summaryHeaderLines(envelope, context),
+    "",
     eventSentence(envelope, context, extras),
     progressLine(envelope, context),
   ];
@@ -347,8 +387,14 @@ function renderBody(
   if (envelope.links.length > 0) {
     envelope.links.forEach((link) => lines.push(`- [${link.label}](${link.url})`));
   }
-  lines.push(whoseMoveLine(envelope, context));
-  return boundedSanitized(dedupeAdjacentLines(lines).join("\n"), PUBLICATION_BODY_LIMIT);
+  return boundedSanitized(dedupeLines(lines).join("\n"), PUBLICATION_BODY_LIMIT);
+}
+
+export function shouldPostLinearEventComment(envelope: PipelinePublicationEnvelope): boolean {
+  return envelope.template.name === "selection" ||
+    envelope.template.name === "provider_wait" ||
+    envelope.template.name === "needs_human" ||
+    envelope.template.name === "terminal";
 }
 
 export function deterministicPublicationId(idempotencyKey: string): string {
@@ -554,19 +600,52 @@ export function pipelinePublicationOutboxPayload(envelope: PipelinePublicationEn
   });
 }
 
+export function pipelineStatusCommentMarker(linearIssueId: string): string {
+  return `<!-- openthrottle:pipeline-status:${linearIssueId} -->`;
+}
+
+export function renderLinearStatusComment(envelope: PipelinePublicationEnvelope, prUrl?: string | null): string {
+  const bodyLines = envelope.body.split("\n");
+  const headerEnd = bodyLines.indexOf("");
+  const rendered = [
+    pipelineStatusCommentMarker(envelope.pipeline.linear_issue_id),
+    bodyLines.slice(0, headerEnd < 0 ? undefined : headerEnd).join("\n"),
+    ...(prUrl ? ["", `Pull request: ${prUrl}`] : []),
+  ];
+  return boundedSanitized(dedupeLines(rendered.join("\n").split("\n")).join("\n"), PUBLICATION_BODY_LIMIT);
+}
+
+function bodyWithoutStatusHeader(envelope: PipelinePublicationEnvelope): string {
+  const lines = envelope.body.split("\n");
+  const headerEnd = lines.indexOf("");
+  return (headerEnd < 0 ? [] : lines.slice(headerEnd + 1)).join("\n");
+}
+
+export function pipelineStatusOutboxPayload(envelope: PipelinePublicationEnvelope): string {
+  return JSON.stringify({
+    type: "pipeline_status",
+    publication: {
+      body: renderLinearStatusComment(envelope),
+    },
+  });
+}
+
 export function publicationPayloadHash(envelope: PipelinePublicationEnvelope): string {
   return digestNormalized(canonicalJson(envelope));
 }
 
-export function renderGithubPipelineSummary(envelope: PipelinePublicationEnvelope): string {
-  return boundedSanitized([
+export function renderGithubPipelineSummary(envelope: PipelinePublicationEnvelope, prUrl?: string | null): string {
+  const lines = [
     `<!-- openthrottle:pipeline-summary:${envelope.pipeline.linear_issue_id} -->`,
     "## OpenThrottle pipeline summary",
     "",
-    envelope.body.replace(/^### /, "### Latest decision: "),
+    renderLinearStatusComment(envelope, prUrl).split("\n").slice(1).join("\n"),
+    "",
+    bodyWithoutStatusHeader(envelope),
     "",
     "_This is a neutral supervisor evidence summary. It is not a code-review approval._",
-  ].join("\n"), 60_000);
+  ].join("\n").split("\n");
+  return boundedSanitized(dedupeLines(lines).join("\n"), 60_000);
 }
 
 export function renderPipelineLogHeader(status: {

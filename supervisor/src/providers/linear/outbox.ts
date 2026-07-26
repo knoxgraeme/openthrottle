@@ -1,7 +1,15 @@
 import type { AgentActivityInput, AgentPlanItem, LinearClient } from "./client.js";
-import { agentActivityCreate, agentSessionUpdate, linearFileUpload } from "./client.js";
+import {
+  agentActivityCreate,
+  agentSessionUpdate,
+  commentCreate,
+  commentUpdate,
+  findIssueCommentByMarker,
+  linearFileUpload,
+} from "./client.js";
 import type { ActivityPublicationPort } from "../../app/ports.js";
 import type { LinearOutboxRecord, SupervisorStore } from "../../persistence/store.js";
+import { pipelineStatusCommentMarker } from "../../pipeline/publication.js";
 import { sanitizeText } from "../../shared/sanitize.js";
 
 // Shared helpers for enqueueing a single Linear outbox row and processing it
@@ -111,6 +119,12 @@ type LinearOutboxPayload =
         artifactInline?: string;
         attachment?: { filename: string; contentType: "application/json"; content: string };
       };
+    }
+  | {
+      type: "pipeline_status";
+      publication: {
+        body: string;
+      };
     };
 
 function retryDelayMs(attempts: number): number {
@@ -137,7 +151,7 @@ async function deliver(
   linear: LinearClient,
   row: LinearOutboxRecord,
   store: SupervisorStore
-): Promise<{ externalId?: string; attachmentUrl?: string }> {
+): Promise<{ externalId?: string; externalUrl?: string; attachmentUrl?: string }> {
   const payload = parsePayload(row);
   if (payload.type === "activity") {
     const result = await agentActivityCreate(linear, { ...payload.activity, id: row.id });
@@ -151,6 +165,30 @@ async function deliver(
       plan: payload.plan,
     });
     return {};
+  }
+  if (payload.type === "pipeline_status") {
+    if (!row.linear_issue_id) throw new Error(`pipeline status ${row.id} has no Linear issue`);
+    const marker = pipelineStatusCommentMarker(row.linear_issue_id);
+    if (!payload.publication.body.startsWith(marker)) {
+      throw new Error(`pipeline status ${row.id} is missing its stable marker`);
+    }
+    const ticket = store.getByIssueId(row.linear_issue_id);
+    const body = sanitizeText([
+      payload.publication.body,
+      ...(ticket?.pr_url ? ["", `Pull request: ${ticket.pr_url}`] : []),
+    ].join("\n")).slice(0, 20_000);
+    const existing = row.external_id
+      ? { id: row.external_id, url: row.external_url }
+      : await findIssueCommentByMarker(linear, row.linear_issue_id, marker);
+    if (existing?.id) {
+      if ("body" in existing && existing.body === body) {
+        return { externalId: existing.id, externalUrl: existing.url ?? undefined };
+      }
+      const result = await commentUpdate(linear, { id: existing.id, body });
+      return { externalId: result.comment?.id ?? existing.id, externalUrl: result.comment?.url ?? existing.url ?? undefined };
+    }
+    const result = await commentCreate(linear, { issueId: row.linear_issue_id, body });
+    return { externalId: result.comment?.id, externalUrl: result.comment?.url ?? undefined };
   }
   if (!row.linear_session_id) throw new Error(`pipeline receipt ${row.id} has no Linear session`);
   let attachmentUrl = row.attachment_url ?? undefined;
@@ -186,7 +224,7 @@ export function createLinearOutboxProcessor(params: {
     const linear = await params.getLinearClient();
     if (!linear) throw new Error("No valid Linear OAuth token is stored");
     const receipt = await deliver(linear, row, params.store);
-    params.store.markLinearOutboxProcessed(row.id, receipt);
+    params.store.markLinearOutboxProcessed(row.id, receipt, row.payload_hash);
   }
 
   async function processRows(rows: LinearOutboxRecord[]): Promise<void> {
@@ -200,21 +238,21 @@ export function createLinearOutboxProcessor(params: {
           classified.message,
           classified.retry
             ? new Date(Date.now() + retryDelayMs(row.attempts)).toISOString()
-            : null
+            : null,
+          row.payload_hash
         );
       }
     }
   }
 
   return {
-    async process(id: string) {
+    async process(_id: string) {
       const now = new Date();
       const rows = params.store.claimLinearOutbox(
         now.toISOString(),
         new Date(now.getTime() + leaseMs).toISOString(),
         50
       );
-      if (!rows.some((candidate) => candidate.id === id)) return;
       await processRows(rows);
     },
     async drain(limit = 50) {
