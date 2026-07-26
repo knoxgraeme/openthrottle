@@ -146,16 +146,21 @@ describe("coordinator-only server", () => {
 
   it("includes repeated sandbox ingestion failures in pipeline status", async () => {
     seedPipelineTicket();
+    // Diagnostics are instance-scoped through the run/attempt binding, so the
+    // failing event must belong to the pinned attempt's planned run.
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    const runId = attempt.planned_run_id!;
     expect(store.beginRun({
       issueId: "issue-1",
-      runId: "run-ingestion",
+      runId,
       taskType: "implement",
       tokenHash: "token-hash",
       expiresAt: "2099-01-01T00:00:00.000Z",
     })).toBe(true);
     store.insertSandboxEvent({
       eventId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-      runId: "run-ingestion",
+      runId,
       sandboxId: "sandbox-1",
       kind: "stage_result",
       payload: JSON.stringify({ kind: "stage_result" }),
@@ -164,6 +169,32 @@ describe("coordinator-only server", () => {
       UPDATE sandbox_events
       SET status = 'failed', attempts = 5, last_error = 'stage result attempt fence mismatch'
       WHERE event_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+    `).run();
+    // A superseded generation's failed event on the same ticket — diagnosed,
+    // MORE attempts — must neither surface on nor mask the current instance.
+    expect(store.beginRun({
+      issueId: "issue-1",
+      runId: "run-old-generation",
+      taskType: "implement",
+      tokenHash: "token-hash",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    })).toBe(false);
+    db.prepare(`
+      INSERT INTO runs (id, linear_issue_id, task_type, token_hash, status, started_at, expires_at)
+      VALUES ('run-old-generation', 'issue-1', 'implement', 'token-hash', 'timed_out', '2026-07-25T00:00:00.000Z', '2026-07-25T02:00:00.000Z')
+    `).run();
+    store.insertSandboxEvent({
+      eventId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+      runId: "run-old-generation",
+      sandboxId: "sandbox-0",
+      kind: "stage_result",
+      payload: JSON.stringify({ kind: "stage_result" }),
+    });
+    db.prepare(`
+      UPDATE sandbox_events
+      SET status = 'failed', attempts = 9, last_error = 'stale generation error',
+          ingestion_diagnosed_at = '2026-07-25T00:00:00.000Z'
+      WHERE event_id = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
     `).run();
 
     const transientResponse = await app().request("/status", {

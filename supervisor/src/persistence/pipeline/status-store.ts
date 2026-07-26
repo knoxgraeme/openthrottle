@@ -79,17 +79,21 @@ export function createStatusStore(db: Database.Database): Pick<PipelineStore, "g
           : pendingEffect
             ? "pending"
             : "none";
+      // Diagnostics preserve the pipeline-instance boundary: join through the
+      // run/attempt binding so a superseded generation's failed events can
+      // never surface on (or mask a failure in) the current instance.
       const sandboxEvent = db.prepare(`
         SELECT se.event_id, se.attempts, se.last_error
         FROM sandbox_events se
-        JOIN runs r ON r.id = se.run_id
-        WHERE r.linear_issue_id = ?
+        JOIN pipeline_stage_attempts psa
+          ON se.run_id IN (psa.run_id, psa.planned_run_id)
+        WHERE psa.pipeline_instance_id = ?
           AND se.status = 'failed'
           AND se.last_error IS NOT NULL
           AND se.ingestion_diagnosed_at IS NOT NULL
         ORDER BY se.attempts DESC, se.created_at DESC, se.event_id DESC
         LIMIT 1
-      `).get(instance.linear_issue_id) as
+      `).get(instance.id) as
         | { event_id: string; attempts: number; last_error: string | null }
         | undefined;
       return {
