@@ -392,6 +392,12 @@ export async function getRepositoryConfigAtCommit(
   };
 }
 
+// Every supervisor-authored PR comment starts with this prefix — enforced at
+// the single write path below — so the webhook filter can recognize the
+// pipeline's own comments without relying on account identity. That is what
+// lets a solo operator share one GitHub account with the pipeline.
+export const OPENTHROTTLE_COMMENT_MARKER_PREFIX = "<!-- openthrottle:";
+
 export async function upsertPullRequestComment(
   client: GithubClient,
   repo: string,
@@ -400,7 +406,7 @@ export async function upsertPullRequestComment(
   body: string
 ): Promise<{ id: number; html_url: string }> {
   if (!/^[A-Za-z0-9_.:-]{1,200}$/.test(identity)) throw new Error("GitHub comment identity is unsafe");
-  const marker = `<!-- openthrottle:pipeline-summary:${identity} -->`;
+  const marker = `${OPENTHROTTLE_COMMENT_MARKER_PREFIX}pipeline-summary:${identity} -->`;
   if (!body.startsWith(marker)) throw new Error("GitHub pipeline summary is missing its stable marker");
   let existing: { id: number; body?: string; html_url: string } | undefined;
   for (let page = 1; page <= 10 && !existing; page += 1) {

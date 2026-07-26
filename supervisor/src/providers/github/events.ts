@@ -4,7 +4,7 @@
 import type { Config } from "../../app/config.js";
 import type { SupervisorStore } from "../../persistence/store.js";
 import {
-  getAuthenticatedLogin,
+  OPENTHROTTLE_COMMENT_MARKER_PREFIX,
   isOpenthrottleBranch,
   type GithubWebhookEvent,
 } from "./client.js";
@@ -16,7 +16,6 @@ import { processProviderEvidence } from "../../pipeline/gates.js";
 import { canonicalJson, type PipelineManifest } from "../../pipeline/manifest.js";
 import { requestPipelineStop } from "../../pipeline/control.js";
 
-const githubLoginCache = new Map<string, string>();
 const UNBOUNDED_SNAPSHOT_CLAIM = Number.MAX_SAFE_INTEGER;
 const TERMINAL_PIPELINE_STATUSES = new Set([
   "shipped",
@@ -271,21 +270,23 @@ export function considerCiGithubHead(
   store.setSetting(sourceKey, JSON.stringify({ source, sequence }));
 }
 
-async function selfGithubLogin(cfg: Config): Promise<string | undefined> {
-  const cached = githubLoginCache.get(cfg.githubToken);
-  if (cached) return cached;
-  try {
-    const login = await getAuthenticatedLogin({ token: cfg.githubToken });
-    githubLoginCache.set(cfg.githubToken, login);
-    return login;
-  } catch (error) {
-    console.error("[github] could not resolve the token account for self-feedback filtering:", error);
-    return undefined;
-  }
+// Solo-operator feedback mode: the operator and the pipeline share one GitHub
+// account, so authorship cannot distinguish human feedback from the pipeline's
+// own output. The reliable discriminator is the openthrottle comment marker,
+// which the supervisor's single comment write path enforces on everything it
+// authors. Marker-bearing bodies are the machine talking; everything else is
+// treated as human. An agent-authored unmarked comment could echo one repair
+// cycle, bounded by the manifest's provider re-entry limit — revisit with a
+// distinct machine identity (machine user or GitHub App) if this ever runs
+// multi-user.
+function isPipelineAuthoredBody(body: string | undefined): boolean {
+  return body?.startsWith(OPENTHROTTLE_COMMENT_MARKER_PREFIX) === true;
 }
 
 export async function handleGithubEvent(
-  cfg: Config,
+  // Retained for signature stability at the composition/HTTP call sites; the
+  // solo-mode feedback filter no longer needs a token-account lookup.
+  _cfg: Config,
   store: SupervisorStore,
   activityPublisher: ActivityPublicationPort,
   event: GithubWebhookEvent,
@@ -377,19 +378,10 @@ export async function handleGithubEvent(
     if (reviewState !== "changes_requested" && reviewState !== "commented") return;
     if (ticket.state !== "active") return;
     const author = event.review.user?.login;
-    const self = await selfGithubLogin(cfg);
-    if (reviewState === "commented") {
-      // A bot's commented review is only actionable when provably not the
-      // agent's own account; fail closed (skip) when either side of that
-      // comparison is unknown, since we can't otherwise rule out self-feedback.
-      if (!author || !self || author === self) return;
-    } else if (author && self && author === self) {
-      // changes_requested: skip ONLY when the author is positively known to
-      // be the token account. A transient self-lookup failure (or missing
-      // author) must not silently drop a genuine human CHANGES_REQUESTED —
-      // that would fail closed on exactly the review that matters most.
-      return;
-    }
+    // A review without an attested author cannot be trusted feedback; a
+    // marker-bearing body is the pipeline's own output regardless of author.
+    if (!author) return;
+    if (isPipelineAuthoredBody(event.review.body)) return;
     const headSha = event.pull_request.head.sha ??
       store.getSetting(`github-head:${ticket.linear_issue_id}`) ??
       `unknown:${event.pull_request.head.ref}`;
@@ -421,8 +413,10 @@ export async function handleGithubEvent(
     );
     if (!ticket || ticket.state !== "active") return;
     const author = event.comment.user?.login;
-    const self = await selfGithubLogin(cfg);
-    if (!author || !self || author === self) return;
+    // Same solo-mode rule as reviews: marker-bearing bodies are the pipeline's
+    // own gate summaries; everything else with an attested author is human.
+    if (!author) return;
+    if (isPipelineAuthoredBody(event.comment.body)) return;
     await activityPublisher.publishActivity({
       sessionId: ticket.linear_session_id,
       type: "action",

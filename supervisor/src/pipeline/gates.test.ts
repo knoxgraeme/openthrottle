@@ -594,6 +594,96 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
+  it("treats unmarked feedback as human and marker-bearing bodies as the pipeline's own, regardless of author", async () => {
+    const fixture = setup("ce/implement@2");
+    const publishActivity = vi.fn(async () => undefined);
+    const activityPublisher = { publishActivity, publishError: vi.fn(async () => undefined) };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    fixture.tickets.setSetting("github-head:issue-1", SUBJECT);
+    const review = (id: number, body?: string) => handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "pull_request_review",
+        action: "submitted",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 1,
+          html_url: "https://github.com/owner/repo/pull/1",
+          merged: false,
+          head: { ref: "ot/issue-1", sha: SUBJECT },
+          base: { ref: "main" },
+        },
+        review: {
+          id,
+          state: "commented",
+          body,
+          html_url: `https://github.com/owner/repo/pull/1#pullrequestreview-${id}`,
+          // The solo operator IS the token account; authorship no longer skips.
+          user: { login: "knoxgraeme" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    await review(11, "please rename the helper before merging");
+    expect(fixture.tickets.listPendingFeedbackSnapshots("session-1")).toHaveLength(1);
+
+    // The supervisor's own gate summary carries the enforced marker prefix and
+    // must never come back as feedback, even from the same shared account.
+    await review(12, "<!-- openthrottle:pipeline-summary:pipeline-1 -->\nGate summary body");
+    expect(fixture.tickets.listPendingFeedbackSnapshots("session-1")).toHaveLength(1);
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "issue_comment",
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
+        comment: {
+          id: 31,
+          body: "<!-- openthrottle:pipeline-summary:pipeline-1 -->\nGate summary body",
+          html_url: "https://github.com/owner/repo/pull/1#issuecomment-31",
+          user: { login: "knoxgraeme" },
+        },
+      },
+      fixture.pipelines
+    );
+    expect(fixture.tickets.listPendingFeedbackSnapshots("session-1")).toHaveLength(1);
+    expect(publishActivity).not.toHaveBeenCalledWith(
+      expect.objectContaining({ action: "PR comment" }),
+      expect.anything()
+    );
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "issue_comment",
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
+        comment: {
+          id: 32,
+          body: "the retry loop still double-counts attempts",
+          html_url: "https://github.com/owner/repo/pull/1#issuecomment-32",
+          user: { login: "knoxgraeme" },
+        },
+      },
+      fixture.pipelines
+    );
+    // Events on the same PR head coalesce into one snapshot; the human comment
+    // joins the human review as a second provider event inside it.
+    expect(fixture.tickets.listPendingFeedbackSnapshots("session-1")).toHaveLength(1);
+    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM provider_events").get())
+      .toEqual({ count: 2 });
+  });
+
   it("publishes Linear activity for GitHub review and CI completion events through the injected port", async () => {
     const fixture = setup("ce/implement@2");
     const publishActivity = vi.fn(async () => undefined);
