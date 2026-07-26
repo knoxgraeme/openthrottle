@@ -13,6 +13,7 @@ export function createPublicationStore(db: Database.Database, now: () => string)
   | "markGithubPublicationSkipped"
   | "markGithubPublicationFailed"
   | "retryPublication"
+  | "isSupervisorGithubComment"
 > {
   const claimGithubPublications = db.transaction((
     nowIso: string,
@@ -178,6 +179,14 @@ export function createPublicationStore(db: Database.Database, now: () => string)
       .get(id) as PipelinePublicationReceipt;
   });
 
+  // Provenance for the solo-operator feedback filter: the supervisor knows
+  // exactly which GitHub comment IDs it has ever written, because the upsert
+  // acknowledgement persists them as github_summary external IDs.
+  const isSupervisorGithubCommentStmt = db.prepare(`
+    SELECT 1 FROM pipeline_publication_receipts
+    WHERE kind = 'github_summary' AND external_id = ? LIMIT 1
+  `);
+
   return {
     claimGithubPublications,
     bindGithubPublicationTarget,
@@ -185,5 +194,7 @@ export function createPublicationStore(db: Database.Database, now: () => string)
     markGithubPublicationSkipped,
     markGithubPublicationFailed,
     retryPublication,
+    isSupervisorGithubComment: (externalId: string) =>
+      isSupervisorGithubCommentStmt.get(externalId) !== undefined,
   };
 }

@@ -272,15 +272,19 @@ export function considerCiGithubHead(
 
 // Solo-operator feedback mode: the operator and the pipeline share one GitHub
 // account, so authorship cannot distinguish human feedback from the pipeline's
-// own output. The reliable discriminator is the openthrottle comment marker,
-// which the supervisor's single comment write path enforces on everything it
-// authors. Marker-bearing bodies are the machine talking; everything else is
-// treated as human. An agent-authored unmarked comment could echo one repair
-// cycle, bounded by the manifest's provider re-entry limit — revisit with a
-// distinct machine identity (machine user or GitHub App) if this ever runs
-// multi-user.
-function isPipelineAuthoredBody(body: string | undefined): boolean {
-  return body?.startsWith(OPENTHROTTLE_COMMENT_MARKER_PREFIX) === true;
+// own output. Provenance comes from the supervisor's own records — the comment
+// IDs its summary upsert persisted as github_summary external IDs. The marker
+// prefix below is only a fallback for the narrow window where the comment
+// webhook races the receipt acknowledgement, and it matches the full enforced
+// summary marker so a human merely mentioning openthrottle markup is not
+// silently dropped. An agent-authored unmarked comment could echo one repair
+// cycle, bounded by the manifest's provider re-entry limit — a distinct
+// machine identity (machine user or GitHub App) restores account-level
+// filtering if this ever runs multi-user.
+const SUMMARY_MARKER_PREFIX = `${OPENTHROTTLE_COMMENT_MARKER_PREFIX}pipeline-summary:`;
+
+function looksLikeSupervisorSummary(body: string | undefined): boolean {
+  return body?.startsWith(SUMMARY_MARKER_PREFIX) === true;
 }
 
 export async function handleGithubEvent(
@@ -378,10 +382,10 @@ export async function handleGithubEvent(
     if (reviewState !== "changes_requested" && reviewState !== "commented") return;
     if (ticket.state !== "active") return;
     const author = event.review.user?.login;
-    // A review without an attested author cannot be trusted feedback; a
-    // marker-bearing body is the pipeline's own output regardless of author.
+    // A review without an attested author cannot be trusted feedback. The
+    // supervisor never authors pull-request reviews, so no machine-output
+    // filtering applies here — every attested review is human.
     if (!author) return;
-    if (isPipelineAuthoredBody(event.review.body)) return;
     const headSha = event.pull_request.head.sha ??
       store.getSetting(`github-head:${ticket.linear_issue_id}`) ??
       `unknown:${event.pull_request.head.ref}`;
@@ -413,10 +417,12 @@ export async function handleGithubEvent(
     );
     if (!ticket || ticket.state !== "active") return;
     const author = event.comment.user?.login;
-    // Same solo-mode rule as reviews: marker-bearing bodies are the pipeline's
-    // own gate summaries; everything else with an attested author is human.
     if (!author) return;
-    if (isPipelineAuthoredBody(event.comment.body)) return;
+    // Provenance first: comment IDs the supervisor's summary upsert persisted
+    // are the machine's own output. The marker check only covers the window
+    // where this webhook races the receipt acknowledgement.
+    if (pipelines.isSupervisorGithubComment(String(event.comment.id))) return;
+    if (looksLikeSupervisorSummary(event.comment.body)) return;
     await activityPublisher.publishActivity({
       sessionId: ticket.linear_session_id,
       type: "action",

@@ -627,15 +627,7 @@ describe("deterministic supervisor stage gates", () => {
       fixture.pipelines
     );
 
-    await review(11, "please rename the helper before merging");
-    expect(fixture.tickets.listPendingFeedbackSnapshots("session-1")).toHaveLength(1);
-
-    // The supervisor's own gate summary carries the enforced marker prefix and
-    // must never come back as feedback, even from the same shared account.
-    await review(12, "<!-- openthrottle:pipeline-summary:pipeline-1 -->\nGate summary body");
-    expect(fixture.tickets.listPendingFeedbackSnapshots("session-1")).toHaveLength(1);
-
-    await handleGithubEvent(
+    const comment = (id: number, body: string) => handleGithubEvent(
       {} as never,
       fixture.tickets,
       activityPublisher,
@@ -645,43 +637,51 @@ describe("deterministic supervisor stage gates", () => {
         repository: { full_name: "owner/repo" },
         issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
         comment: {
-          id: 31,
-          body: "<!-- openthrottle:pipeline-summary:pipeline-1 -->\nGate summary body",
-          html_url: "https://github.com/owner/repo/pull/1#issuecomment-31",
+          id,
+          body,
+          html_url: `https://github.com/owner/repo/pull/1#issuecomment-${id}`,
           user: { login: "knoxgraeme" },
         },
       },
       fixture.pipelines
     );
+    const providerEventCount = () =>
+      (fixture.db.prepare("SELECT COUNT(*) AS count FROM provider_events").get() as { count: number }).count;
+
+    await review(11, "please rename the helper before merging");
     expect(fixture.tickets.listPendingFeedbackSnapshots("session-1")).toHaveLength(1);
+    expect(providerEventCount()).toBe(1);
+
+    // The supervisor never authors reviews, so a review is human feedback even
+    // when its body quotes the pipeline's marker markup.
+    await review(12, "<!-- openthrottle:pipeline-summary:pipeline-1 -->\nquoted while replying");
+    expect(providerEventCount()).toBe(2);
+
+    // A comment whose ID the supervisor's summary upsert persisted is the
+    // machine's own output — provenance by record, not by body content.
+    fixture.db.prepare(`
+      INSERT INTO pipeline_publication_receipts (
+        id, pipeline_instance_id, kind, idempotency_key, payload_hash,
+        status, external_id, created_at
+      ) VALUES (?, ?, 'github_summary', ?, ?, 'acknowledged', ?, ?)
+    `).run("pub-1", fixture.instance.id, "github-summary:test", "h".repeat(64), "31", "2026-07-25T00:00:00.000Z");
+    await comment(31, "any body at all — the persisted ID decides");
+    expect(providerEventCount()).toBe(2);
     expect(publishActivity).not.toHaveBeenCalledWith(
       expect.objectContaining({ action: "PR comment" }),
       expect.anything()
     );
 
-    await handleGithubEvent(
-      {} as never,
-      fixture.tickets,
-      activityPublisher,
-      {
-        kind: "issue_comment",
-        action: "created",
-        repository: { full_name: "owner/repo" },
-        issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
-        comment: {
-          id: 32,
-          body: "the retry loop still double-counts attempts",
-          html_url: "https://github.com/owner/repo/pull/1#issuecomment-32",
-          user: { login: "knoxgraeme" },
-        },
-      },
-      fixture.pipelines
-    );
+    // Fallback for the webhook-races-acknowledgement window: a full summary
+    // marker at the start of an unknown-ID comment is treated as the machine's.
+    await comment(33, "<!-- openthrottle:pipeline-summary:pipeline-1 -->\nGate summary body");
+    expect(providerEventCount()).toBe(2);
+
+    await comment(32, "the retry loop still double-counts attempts");
     // Events on the same PR head coalesce into one snapshot; the human comment
-    // joins the human review as a second provider event inside it.
+    // joins the human reviews as another provider event inside it.
     expect(fixture.tickets.listPendingFeedbackSnapshots("session-1")).toHaveLength(1);
-    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM provider_events").get())
-      .toEqual({ count: 2 });
+    expect(providerEventCount()).toBe(3);
   });
 
   it("publishes Linear activity for GitHub review and CI completion events through the injected port", async () => {
