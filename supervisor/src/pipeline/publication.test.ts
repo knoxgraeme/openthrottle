@@ -650,6 +650,74 @@ describe("pipeline publication", () => {
     });
   });
 
+  it("keeps transient status update failures on the retry path without recreating", async () => {
+    const { tickets, pipelines, instance, attempt } = setup("fixture/agent@1");
+    const initialProcessor = createLinearOutboxProcessor({
+      store: tickets,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: successfulLinearFetch() }),
+    });
+    const status = tickets.listLinearOutbox().find((row) => row.kind === "pipeline_status")!;
+
+    await initialProcessor.process(status.id);
+    expect(tickets.getLinearOutbox(status.id)).toMatchObject({
+      status: "processed",
+      external_id: "status-comment",
+    });
+
+    const input = event(instance, attempt, "fresh stage accepted");
+    coordinatePipelineEvent(pipelines, input.event, undefined, input.receipt);
+
+    const calls: string[] = [];
+    let outage = true;
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as {
+        query?: string;
+        variables?: { id?: string };
+      };
+      if (request.query?.includes("CommentUpdate")) {
+        calls.push(`update:${request.variables?.id}`);
+        if (outage) {
+          // A transient provider failure is not a deleted comment: it must
+          // stay on the retry path and never trigger recreation.
+          return new Response(
+            JSON.stringify({ errors: [{ message: "temporary outage" }] }),
+            { status: 503 }
+          );
+        }
+        return Response.json({ data: { commentUpdate: {
+          success: true,
+          comment: { id: request.variables?.id, url: "https://linear.test/comment/status-updated" },
+        } } });
+      }
+      if (request.query?.includes("CommentCreate") || request.query?.includes("IssueComments")) {
+        calls.push("recreate-path");
+      }
+      throw new Error("unexpected Linear request");
+    }) as unknown as typeof fetch;
+    const processor = createLinearOutboxProcessor({
+      store: tickets,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: fetchMock }),
+    });
+
+    await processor.process(status.id);
+    const failed = tickets.getLinearOutbox(status.id)!;
+    expect(failed).toMatchObject({ status: "failed", external_id: "status-comment" });
+    expect(failed.last_error).toContain("temporary outage");
+    expect(failed.next_attempt_at).toBeTruthy();
+    expect(calls).toEqual(["update:status-comment"]);
+
+    outage = false;
+    db!.prepare("UPDATE linear_outbox SET next_attempt_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
+      .run(status.id);
+    await processor.process(status.id);
+    expect(calls).toEqual(["update:status-comment", "update:status-comment"]);
+    expect(tickets.getLinearOutbox(status.id)).toMatchObject({
+      status: "processed",
+      external_id: "status-comment",
+      external_url: "https://linear.test/comment/status-updated",
+    });
+  });
+
   it("renders every pipeline receipt template as plain progress and turn sentences", () => {
     const { instance, attempt } = setup("fixture/agent@1");
     const input = event(instance, attempt);
