@@ -4,7 +4,7 @@
 import type { Config } from "../../app/config.js";
 import type { SupervisorStore } from "../../persistence/store.js";
 import {
-  getAuthenticatedLogin,
+  OPENTHROTTLE_COMMENT_MARKER_PREFIX,
   isOpenthrottleBranch,
   type GithubWebhookEvent,
 } from "./client.js";
@@ -16,7 +16,6 @@ import { processProviderEvidence } from "../../pipeline/gates.js";
 import { canonicalJson, type PipelineManifest } from "../../pipeline/manifest.js";
 import { requestPipelineStop } from "../../pipeline/control.js";
 
-const githubLoginCache = new Map<string, string>();
 const UNBOUNDED_SNAPSHOT_CLAIM = Number.MAX_SAFE_INTEGER;
 const TERMINAL_PIPELINE_STATUSES = new Set([
   "shipped",
@@ -271,21 +270,27 @@ export function considerCiGithubHead(
   store.setSetting(sourceKey, JSON.stringify({ source, sequence }));
 }
 
-async function selfGithubLogin(cfg: Config): Promise<string | undefined> {
-  const cached = githubLoginCache.get(cfg.githubToken);
-  if (cached) return cached;
-  try {
-    const login = await getAuthenticatedLogin({ token: cfg.githubToken });
-    githubLoginCache.set(cfg.githubToken, login);
-    return login;
-  } catch (error) {
-    console.error("[github] could not resolve the token account for self-feedback filtering:", error);
-    return undefined;
-  }
+// Solo-operator feedback mode: the operator and the pipeline share one GitHub
+// account, so authorship cannot distinguish human feedback from the pipeline's
+// own output. Provenance comes from the supervisor's own records — the comment
+// IDs its summary upsert persisted as github_summary external IDs. The marker
+// prefix below is only a fallback for the narrow window where the comment
+// webhook races the receipt acknowledgement, and it matches the full enforced
+// summary marker so a human merely mentioning openthrottle markup is not
+// silently dropped. An agent-authored unmarked comment could echo one repair
+// cycle, bounded by the manifest's provider re-entry limit — a distinct
+// machine identity (machine user or GitHub App) restores account-level
+// filtering if this ever runs multi-user.
+const SUMMARY_MARKER_PREFIX = `${OPENTHROTTLE_COMMENT_MARKER_PREFIX}pipeline-summary:`;
+
+function looksLikeSupervisorSummary(body: string | undefined): boolean {
+  return body?.startsWith(SUMMARY_MARKER_PREFIX) === true;
 }
 
 export async function handleGithubEvent(
-  cfg: Config,
+  // Retained for signature stability at the composition/HTTP call sites; the
+  // solo-mode feedback filter no longer needs a token-account lookup.
+  _cfg: Config,
   store: SupervisorStore,
   activityPublisher: ActivityPublicationPort,
   event: GithubWebhookEvent,
@@ -377,19 +382,10 @@ export async function handleGithubEvent(
     if (reviewState !== "changes_requested" && reviewState !== "commented") return;
     if (ticket.state !== "active") return;
     const author = event.review.user?.login;
-    const self = await selfGithubLogin(cfg);
-    if (reviewState === "commented") {
-      // A bot's commented review is only actionable when provably not the
-      // agent's own account; fail closed (skip) when either side of that
-      // comparison is unknown, since we can't otherwise rule out self-feedback.
-      if (!author || !self || author === self) return;
-    } else if (author && self && author === self) {
-      // changes_requested: skip ONLY when the author is positively known to
-      // be the token account. A transient self-lookup failure (or missing
-      // author) must not silently drop a genuine human CHANGES_REQUESTED —
-      // that would fail closed on exactly the review that matters most.
-      return;
-    }
+    // A review without an attested author cannot be trusted feedback. The
+    // supervisor never authors pull-request reviews, so no machine-output
+    // filtering applies here — every attested review is human.
+    if (!author) return;
     const headSha = event.pull_request.head.sha ??
       store.getSetting(`github-head:${ticket.linear_issue_id}`) ??
       `unknown:${event.pull_request.head.ref}`;
@@ -421,8 +417,12 @@ export async function handleGithubEvent(
     );
     if (!ticket || ticket.state !== "active") return;
     const author = event.comment.user?.login;
-    const self = await selfGithubLogin(cfg);
-    if (!author || !self || author === self) return;
+    if (!author) return;
+    // Provenance first: comment IDs the supervisor's summary upsert persisted
+    // are the machine's own output. The marker check only covers the window
+    // where this webhook races the receipt acknowledgement.
+    if (pipelines.isSupervisorGithubComment(String(event.comment.id))) return;
+    if (looksLikeSupervisorSummary(event.comment.body)) return;
     await activityPublisher.publishActivity({
       sessionId: ticket.linear_session_id,
       type: "action",

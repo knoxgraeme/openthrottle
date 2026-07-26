@@ -314,6 +314,8 @@ export interface PipelineStore {
     externalUrl: string
   ): boolean;
   markGithubPublicationSkipped(id: string, expectedPayloadHash: string): boolean;
+  /** True when the GitHub comment ID was written by the supervisor's own summary upsert. */
+  isSupervisorGithubComment(externalId: string): boolean;
   markGithubPublicationFailed(
     id: string,
     expectedPayloadHash: string,
