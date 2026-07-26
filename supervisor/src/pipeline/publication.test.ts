@@ -150,6 +150,89 @@ describe("pipeline publication", () => {
     };
   }
 
+  function semanticEvent(input: {
+    instance: PipelineInstance;
+    attempt: PipelineStageAttempt;
+    outcome: PipelineCoordinatorEvent["outcome"];
+    summary: string;
+    findings?: Array<{ severity: string; code: string; summary: string }>;
+    actions?: string[];
+    withReviewArtifact?: boolean;
+  }): { event: PipelineCoordinatorEvent; receipt: CoordinatorGateReceiptWrite } {
+    const artifactBody = {
+      summary: input.summary,
+      evidence: [`${input.attempt.stage_id} stage evidence for ${input.summary}`],
+      findings: input.findings ?? [],
+      actions: input.actions ?? [],
+      uncertainty: [],
+    };
+    const stagePayload = canonicalJson({ kind: "stage_result", ...artifactBody });
+    const artifacts = [{
+      kind: "stage_result",
+      schemaVersion: 1,
+      assurance: "semantic_attested" as const,
+      subject: SUBJECT,
+      payload: stagePayload,
+      hash: digestNormalized(stagePayload),
+    }];
+    if (input.withReviewArtifact) {
+      const reviewPayload = canonicalJson({ kind: "review", ...artifactBody });
+      artifacts.push({
+        kind: "review",
+        schemaVersion: 1,
+        assurance: "semantic_attested" as const,
+        subject: SUBJECT,
+        payload: reviewPayload,
+        hash: digestNormalized(reviewPayload),
+      });
+    }
+    const receiptPayload = canonicalJson({
+      attempt_id: input.attempt.id,
+      decision: "passed",
+      subject: SUBJECT,
+    });
+    return {
+      event: {
+        id: `event-${digestNormalized(canonicalJson([input.attempt.id, stagePayload])).slice(0, 12)}`,
+        kind: "stage_result",
+        instanceId: input.instance.id,
+        generation: input.instance.generation,
+        attemptId: input.attempt.id,
+        requestHash: input.attempt.request_hash,
+        outcome: input.outcome,
+        resultHash: artifacts[0]!.hash,
+        subject: SUBJECT,
+        artifacts,
+      },
+      receipt: {
+        evaluatorKind: "semantic",
+        policyDigest: "d".repeat(64),
+        subject: SUBJECT,
+        result: "passed",
+        artifactHashes: artifacts.map((artifact) => artifact.hash).sort(),
+        payload: receiptPayload,
+        hash: digestNormalized(receiptPayload),
+      },
+    };
+  }
+
+  function replaceStagePayload(
+    input: { event: PipelineCoordinatorEvent; receipt: CoordinatorGateReceiptWrite },
+    payload: Record<string, unknown>
+  ) {
+    const stagePayload = canonicalJson(payload);
+    input.event.artifacts = [{
+      kind: "stage_result",
+      schemaVersion: 1,
+      assurance: "semantic_attested",
+      subject: SUBJECT,
+      payload: stagePayload,
+      hash: digestNormalized(stagePayload),
+    }];
+    input.event.resultHash = input.event.artifacts[0]!.hash;
+    input.receipt.artifactHashes = [input.event.artifacts[0]!.hash];
+  }
+
   function successfulLinearFetch() {
     return vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       const request = JSON.parse(String(init?.body)) as { query?: string };
@@ -261,6 +344,12 @@ describe("pipeline publication", () => {
     };
 
     expect(parsePipelinePublication(canonicalJson(persistedV1))).toEqual(persistedV1);
+
+    const legacyEvidence = { ...persistedV1.evidence };
+    delete legacyEvidence.findings;
+    delete legacyEvidence.actions;
+    const legacyV1 = { ...persistedV1, evidence: legacyEvidence };
+    expect(parsePipelinePublication(canonicalJson(legacyV1))).toEqual(legacyV1);
   });
 
   it("deduplicates adjacent rendered evidence lines without changing recorded evidence", () => {
@@ -423,6 +512,376 @@ describe("pipeline publication", () => {
         "- [ ] review",
         "Your move: nothing - merge when CI is green. Waiting on GitHub: GitHub checks are still running.",
       ]);
+  });
+
+  it("renders artifact findings with severity, code, summary, and fixed or remaining dispositions", () => {
+    const { instance, attempt } = setup("fixture/agent@1");
+    const input = event(instance, attempt);
+    replaceStagePayload(input, {
+      summary: "Semantic review completed.",
+      evidence: ["Reviewed publication rendering."],
+      findings: [
+        { severity: "P1", code: "provider-snapshot-bounding", summary: "snapshot payload unbounded" },
+        { severity: "P3", code: "status-copy", summary: "receipt copy needs clarity" },
+      ],
+      actions: ["Applied verified in-scope fixes for valid provider snapshot payload bounding."],
+      uncertainty: [],
+    });
+    const publication = buildStagePublication({
+      instance,
+      attempt,
+      event: input.event,
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: attempt.id,
+        outcome: "success",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+    });
+
+    expect(publication.body).toContain("### Findings");
+    expect(publication.body).toContain("[P1] provider-snapshot-bounding — snapshot payload unbounded → fixed in-stage");
+    expect(publication.body).toContain("[P3] status-copy — receipt copy needs clarity → remaining/accepted");
+    expect(renderLinearStatusComment(publication)).toContain("[P1] provider-snapshot-bounding");
+    expect(renderGithubPipelineSummary(publication)).toContain("[P3] status-copy");
+  });
+
+  it("renders repair reentry findings as carried into the scheduled repair round", () => {
+    const { instance, attempt } = setup("fixture/agent@1");
+    const input = event(instance, attempt);
+    replaceStagePayload(input, {
+      summary: "Semantic review found blocking issues.",
+      evidence: ["Review found a provider snapshot issue."],
+      findings: [
+        { severity: "P0", code: "provider-snapshot-bounding", summary: "snapshot payload unbounded" },
+      ],
+      actions: [],
+      uncertainty: [],
+    });
+    const publication = buildStagePublication({
+      instance,
+      attempt: { ...attempt, stage_id: "review" },
+      event: { ...input.event, outcome: "semantic_repair_required" },
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: attempt.id,
+        outcome: "semantic_repair_required",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        reentryIncrement: 1,
+        nextAttempt: nextAttemptStub("resume", 2),
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+    });
+
+    expect(publication.body).toContain("scheduled repair round 2 of 2 at the resume stage");
+    expect(publication.body)
+      .toContain("[P0] provider-snapshot-bounding — snapshot payload unbounded → carried to repair");
+  });
+
+  it("renders post-repair findings with per-item resolution status", () => {
+    const { instance, attempt } = setup("fixture/agent@1");
+    const input = event(instance, attempt);
+    replaceStagePayload(input, {
+      summary: "Repair completed.",
+      evidence: ["Rechecked the findings that triggered repair."],
+      findings: [
+        { severity: "P1", code: "provider-snapshot-bounding", summary: "snapshot payload unbounded" },
+        { severity: "P2", code: "status-copy", summary: "receipt copy needs clarity" },
+      ],
+      actions: ["Fixed provider snapshot bounding and verified coverage."],
+      uncertainty: [],
+    });
+    const publication = buildStagePublication({
+      instance,
+      attempt: { ...attempt, stage_id: "resume", reentry_ordinal: 1 },
+      event: input.event,
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: attempt.id,
+        outcome: "success",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+    });
+
+    expect(publication.body)
+      .toContain("[P1] provider-snapshot-bounding — snapshot payload unbounded → fixed in-stage");
+    expect(publication.body)
+      .toContain("[P2] status-copy — receipt copy needs clarity → remaining/accepted");
+  });
+
+  it("omits findings scaffolding when artifacts have no findings", () => {
+    const { instance, attempt } = setup("fixture/agent@1");
+    const input = event(instance, attempt);
+    replaceStagePayload(input, {
+      summary: "Semantic review completed cleanly.",
+      evidence: ["No issues found."],
+      findings: [],
+      actions: [],
+      uncertainty: [],
+    });
+    const publication = buildStagePublication({
+      instance,
+      attempt,
+      event: input.event,
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: attempt.id,
+        outcome: "success",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+    });
+
+    expect(publication.body).not.toContain("### Findings");
+    expect(renderGithubPipelineSummary(publication)).not.toContain("### Findings");
+  });
+
+  it("truncates long finding lists with an explicit remainder marker", () => {
+    const { instance, attempt } = setup("fixture/agent@1");
+    const input = event(instance, attempt);
+    replaceStagePayload(input, {
+      summary: "Semantic review completed with many findings.",
+      evidence: ["Review emitted bounded findings."],
+      findings: Array.from({ length: 12 }, (_, index) => ({
+        severity: (index % 4 === 0 ? "P0" : index % 4 === 1 ? "P1" : index % 4 === 2 ? "P2" : "P3"),
+        code: `finding-${index + 1}`,
+        summary: `finding summary ${index + 1}`,
+      })),
+      actions: [],
+      uncertainty: [],
+    });
+    const publication = buildStagePublication({
+      instance,
+      attempt,
+      event: input.event,
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: attempt.id,
+        outcome: "success",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+    });
+
+    expect(publication.body).toContain("[P1] finding-10 — finding summary 10 → remaining/accepted");
+    expect(publication.body).not.toContain("finding-11");
+    expect(publication.body).toContain("+2 more");
+  });
+
+  it("deduplicates findings shared by stage_result and review artifacts before truncating", () => {
+    const { instance, attempt } = setup("fixture/agent@1");
+    const reviewAttempt = { ...attempt, stage_id: "review" };
+    const input = semanticEvent({
+      instance,
+      attempt: reviewAttempt,
+      outcome: "success",
+      summary: "Semantic review emitted duplicate finding copies.",
+      findings: Array.from({ length: 12 }, (_, index) => ({
+        severity: "P1",
+        code: `finding-${index + 1}`,
+        summary: `finding summary ${index + 1}`,
+      })),
+      withReviewArtifact: true,
+    });
+    const publication = buildStagePublication({
+      instance,
+      attempt: reviewAttempt,
+      event: input.event,
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: reviewAttempt.id,
+        outcome: "success",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+    });
+
+    // Each unique finding is recorded once even though both artifacts carry it.
+    expect(publication.evidence.findings).toHaveLength(12);
+    expect(publication.body.match(/^\[P1\] finding-1 — finding summary 1 → remaining\/accepted$/gm))
+      .toHaveLength(1);
+    expect(publication.body.match(/^\[P1\] finding-10 — finding summary 10 → remaining\/accepted$/gm))
+      .toHaveLength(1);
+    expect(publication.body).not.toContain("finding-11");
+    // The omitted count reflects unique findings (12 - 10), not raw copies (24 - 10).
+    expect(publication.body).toContain("+2 more");
+  });
+
+  it("does not report omitted findings when the duplicated findings all fit the rendered list", () => {
+    const { instance, attempt } = setup("fixture/agent@1");
+    const reviewAttempt = { ...attempt, stage_id: "review" };
+    const input = semanticEvent({
+      instance,
+      attempt: reviewAttempt,
+      outcome: "success",
+      summary: "Semantic review emitted six duplicated findings.",
+      findings: Array.from({ length: 6 }, (_, index) => ({
+        severity: "P1",
+        code: `finding-${index + 1}`,
+        summary: `finding summary ${index + 1}`,
+      })),
+      withReviewArtifact: true,
+    });
+    const publication = buildStagePublication({
+      instance,
+      attempt: reviewAttempt,
+      event: input.event,
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: reviewAttempt.id,
+        outcome: "success",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+    });
+
+    expect(publication.evidence.findings).toHaveLength(6);
+    for (let index = 1; index <= 6; index += 1) {
+      expect(publication.body.match(new RegExp(
+        `^\\[P1\\] finding-${index} — finding summary ${index} → remaining/accepted$`, "gm"
+      ))).toHaveLength(1);
+    }
+    expect(publication.body).not.toMatch(/^\+\d+ more$/m);
+  });
+
+  it("carries review findings and dispositions into later publications and the final summary", () => {
+    const { pipelines, instance, attempt } = setup("fixture/agent@1");
+
+    const fresh = semanticEvent({
+      instance,
+      attempt,
+      outcome: "success",
+      summary: "fresh implementation completed",
+    });
+    const afterFresh = coordinatePipelineEvent(pipelines, fresh.event, undefined, fresh.receipt);
+    expect(afterFresh.active_stage_id).toBe("resume");
+
+    const resumeAttempt = pipelines.getActiveAttempt(instance.id)!;
+    const resume = semanticEvent({
+      instance: afterFresh,
+      attempt: resumeAttempt,
+      outcome: "success",
+      summary: "resume implementation completed",
+    });
+    const afterResume = coordinatePipelineEvent(pipelines, resume.event, undefined, resume.receipt);
+    expect(afterResume.active_stage_id).toBe("review");
+
+    const reviewAttempt = pipelines.getActiveAttempt(instance.id)!;
+    const review = semanticEvent({
+      instance: afterResume,
+      attempt: reviewAttempt,
+      outcome: "semantic_repair_required",
+      summary: "review found blocking issues",
+      findings: [
+        { severity: "P1", code: "provider-snapshot-bounding", summary: "snapshot payload unbounded" },
+        { severity: "P2", code: "status-copy", summary: "receipt copy needs clarity" },
+      ],
+      withReviewArtifact: true,
+    });
+    const afterReview = coordinatePipelineEvent(pipelines, review.event, undefined, review.receipt);
+    expect(afterReview.active_stage_id).toBe("resume");
+    const reviewPublication = parsePipelinePublication(pipelines.listPublications(instance.id)
+      .find((row) => row.kind === "linear_ledger" && row.attempt_id === reviewAttempt.id)!.payload);
+    // Findings duplicated across stage_result and review artifacts render once.
+    expect(reviewPublication.body.match(/provider-snapshot-bounding/g)).toHaveLength(1);
+    expect(reviewPublication.body)
+      .toContain("[P1] provider-snapshot-bounding — snapshot payload unbounded → carried to repair");
+    expect(reviewPublication.body)
+      .toContain("[P2] status-copy — receipt copy needs clarity → carried to repair");
+
+    const repairAttempt = pipelines.getActiveAttempt(instance.id)!;
+    expect(repairAttempt.stage_id).toBe("resume");
+    const repair = semanticEvent({
+      instance: afterReview,
+      attempt: repairAttempt,
+      outcome: "success",
+      summary: "repair round applied the requested fix",
+      actions: ["Fixed provider snapshot bounding and verified coverage."],
+    });
+    coordinatePipelineEvent(pipelines, repair.event, undefined, repair.receipt);
+    const repairPublication = parsePipelinePublication(pipelines.listPublications(instance.id)
+      .find((row) => row.kind === "linear_ledger" && row.attempt_id === repairAttempt.id)!.payload);
+    // The repair stage emitted no findings of its own, yet the earlier review
+    // findings stay visible with their updated dispositions.
+    expect(repairPublication.body)
+      .toContain("[P1] provider-snapshot-bounding — snapshot payload unbounded → fixed in-stage");
+    expect(repairPublication.body)
+      .toContain("[P2] status-copy — receipt copy needs clarity → carried to repair");
+
+    const finalAttempt = pipelines.getActiveAttempt(instance.id)!;
+    expect(finalAttempt.stage_id).toBe("review");
+    const finalReview = semanticEvent({
+      instance: pipelines.getInstance(instance.id)!,
+      attempt: finalAttempt,
+      outcome: "success",
+      summary: "review accepted the remaining finding",
+      findings: [
+        { severity: "P2", code: "status-copy", summary: "receipt copy needs clarity" },
+      ],
+      withReviewArtifact: true,
+    });
+    const terminal = coordinatePipelineEvent(pipelines, finalReview.event, undefined, finalReview.receipt);
+    expect(terminal.terminal_outcome).toBe("shipped");
+    const finalPublication = parsePipelinePublication(pipelines.listPublications(instance.id)
+      .find((row) => row.kind === "linear_ledger" && row.attempt_id === finalAttempt.id)!.payload);
+    // The terminal publication and the GitHub summary show the whole run's
+    // findings with their ultimate dispositions.
+    expect(finalPublication.body)
+      .toContain("[P1] provider-snapshot-bounding — snapshot payload unbounded → fixed in-stage");
+    expect(finalPublication.body)
+      .toContain("[P2] status-copy — receipt copy needs clarity → remaining/accepted");
+    const githubSummary = renderGithubPipelineSummary(finalPublication, "https://github.com/owner/repo/pull/10");
+    expect(githubSummary)
+      .toContain("[P1] provider-snapshot-bounding — snapshot payload unbounded → fixed in-stage");
+    expect(githubSummary)
+      .toContain("[P2] status-copy — receipt copy needs clarity → remaining/accepted");
+    const githubReceipt = pipelines.listPublications(instance.id)
+      .find((row) => row.kind === "github_summary")!;
+    expect(parsePipelinePublication(githubReceipt.payload).evidence.findings).toHaveLength(2);
   });
 
   it("posts new Linear comments only for run events and keeps routine receipts status-only", () => {
