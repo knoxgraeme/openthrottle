@@ -6,6 +6,11 @@ import { processProviderEvidence, type Finding } from "../pipeline/gates.js";
 import { canonicalJson, type PipelineManifest } from "../pipeline/manifest.js";
 
 const UNBOUNDED_SNAPSHOT_CLAIM = Number.MAX_SAFE_INTEGER;
+const DEFAULT_FEEDBACK_SNAPSHOT_DRAIN_SOURCE = "direct";
+export type FeedbackSnapshotDrainSource =
+  | typeof DEFAULT_FEEDBACK_SNAPSHOT_DRAIN_SOURCE
+  | "periodic-feedback-drain"
+  | "github-webhook";
 const TERMINAL_PIPELINE_STATUSES = new Set([
   "shipped",
   "no_change",
@@ -189,7 +194,7 @@ export function processPipelineFeedbackSnapshot(params: {
   store: SupervisorStore;
   instance: PipelineInstance;
   snapshot: FeedbackSnapshot;
-  drainSource?: string;
+  drainSource?: FeedbackSnapshotDrainSource;
 }): boolean {
   const claim = params.store.claimFeedbackSnapshot(params.snapshot.id, UNBOUNDED_SNAPSHOT_CLAIM);
   if (claim.status !== "claimed") return false;
@@ -204,7 +209,7 @@ export function processPipelineFeedbackSnapshot(params: {
   params.store.setSetting(`feedback-snapshot-drained-at:${claim.snapshot.id}`, drainedAt);
   params.store.setSetting(
     `feedback-snapshot-drain-source:${claim.snapshot.id}`,
-    params.drainSource ?? "direct"
+    params.drainSource ?? DEFAULT_FEEDBACK_SNAPSHOT_DRAIN_SOURCE
   );
   processProviderEvidence(params.pipelines, {
     id: `provider-feedback-snapshot:${claim.snapshot.id}`,

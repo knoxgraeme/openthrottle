@@ -19,6 +19,7 @@ export async function terminateAndSettleActor(params: {
   reason: string;
   status: "timed_out" | "stopped";
   ticketState?: Ticket["state"];
+  ticketFailureTail?: string | null;
   prUrl?: string;
   onSettled?: (run: Run) => void;
 }): Promise<ActorSettlementResult> {
@@ -43,6 +44,7 @@ export async function terminateAndSettleActor(params: {
       owner: params.owner,
       status: params.status,
       failureTail: params.reason,
+      ticketFailureTail: params.ticketFailureTail,
       ticketState: params.ticketState,
       prUrl: params.prUrl,
     },

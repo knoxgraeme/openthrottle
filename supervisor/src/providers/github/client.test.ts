@@ -4,6 +4,7 @@ import { createSupervisorStore } from "../../persistence/store.js";
 import { openDb } from "../../persistence/database.js";
 import { considerCiGithubHead } from "./events.js";
 import {
+  OPENTHROTTLE_WEBHOOK_EVENTS,
   branchExists,
   getRepositoryConfigAtCommit,
   getFailingGithubCheckDetails,
@@ -399,13 +400,7 @@ describe("GitHub contracts", () => {
       if (url.endsWith("/repos/acme/widget/hooks/7") && init?.method === "PATCH") {
         expect(JSON.parse(String(init.body))).toMatchObject({
           active: true,
-          events: [
-            "pull_request",
-            "pull_request_review",
-            "issue_comment",
-            "workflow_run",
-            "check_suite",
-          ],
+          events: OPENTHROTTLE_WEBHOOK_EVENTS,
           config: { url: "https://ot.test/webhooks/github" },
         });
         return Response.json({ id: 7 });
@@ -446,13 +441,7 @@ describe("GitHub contracts", () => {
       if (url.endsWith("/repos/acme/widget/hooks/8") && init?.method === "PATCH") {
         expect(JSON.parse(String(init.body))).toMatchObject({
           active: true,
-          events: [
-            "pull_request",
-            "pull_request_review",
-            "issue_comment",
-            "workflow_run",
-            "check_suite",
-          ],
+          events: OPENTHROTTLE_WEBHOOK_EVENTS,
         });
         return Response.json({ id: 8 });
       }
@@ -488,13 +477,7 @@ describe("GitHub contracts", () => {
         expect(JSON.parse(String(init.body))).toMatchObject({
           name: "web",
           active: true,
-          events: [
-            "pull_request",
-            "pull_request_review",
-            "issue_comment",
-            "workflow_run",
-            "check_suite",
-          ],
+          events: OPENTHROTTLE_WEBHOOK_EVENTS,
           config: { url: "https://ot.test/webhooks/github" },
         });
         return Response.json({ id: 9 });
@@ -515,11 +498,7 @@ describe("GitHub contracts", () => {
       webhookId: 9,
       webhookAction: "created",
       missingEvents: [
-        "pull_request",
-        "pull_request_review",
-        "issue_comment",
-        "workflow_run",
-        "check_suite",
+        ...OPENTHROTTLE_WEBHOOK_EVENTS,
       ],
     });
   });

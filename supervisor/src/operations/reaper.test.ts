@@ -305,7 +305,11 @@ describe("reapStalledRuns", () => {
     });
 
     expect(store.getRun(runId)?.status).toBe("timed_out");
-    expect(store.getByIssueId("issue-stale")).toMatchObject({ state: "active", run_id: null });
+    expect(store.getByIssueId("issue-stale")).toMatchObject({
+      state: "active",
+      run_id: null,
+      last_error: null,
+    });
     expect(fixture.pipelines.getInstance(instance.id)).toMatchObject({ status: "waiting_provider" });
     expect(store.listLinearOutbox().filter((row) => row.kind === "activity")).toHaveLength(0);
   });

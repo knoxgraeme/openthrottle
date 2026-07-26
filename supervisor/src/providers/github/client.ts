@@ -399,7 +399,6 @@ export async function reconcileRepositoryWebhook(
     webhookSecret: string;
   }
 ): Promise<RepositoryWebhookReconciliation> {
-  const hookConfiguration = githubWebhookConfiguration(input);
   let hook: GithubRepositoryHook;
   try {
     hook = await githubRequest<GithubRepositoryHook>(
@@ -416,7 +415,11 @@ export async function reconcileRepositoryWebhook(
     if (existing) {
       hook = existing;
     } else {
-      const created = await createRepositoryWebhook(client, input.repo, hookConfiguration);
+      const created = await createRepositoryWebhook(
+        client,
+        input.repo,
+        githubWebhookConfiguration(input)
+      );
       return {
         repo: input.repo,
         webhookId: created.id,
@@ -431,7 +434,7 @@ export async function reconcileRepositoryWebhook(
   const replacementHook = hook.id !== input.webhookId;
   const needsPatch = replacementHook || missingEvents.length > 0 || !hook.active || hook.config?.url !== input.webhookUrl;
   if (needsPatch) {
-    await patchRepositoryWebhook(client, input.repo, hook.id, hookConfiguration);
+    await patchRepositoryWebhook(client, input.repo, hook.id, githubWebhookConfiguration(input));
   }
   return {
     repo: input.repo,

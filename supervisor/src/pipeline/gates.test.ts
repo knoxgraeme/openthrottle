@@ -870,7 +870,6 @@ describe("deterministic supervisor stage gates", () => {
         pull_request: {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
-          merged: false,
           head: { ref: "ot/issue-1", sha: SUBJECT },
           base: { ref: "main" },
         },
@@ -963,7 +962,6 @@ describe("deterministic supervisor stage gates", () => {
         pull_request: {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
-          merged: false,
           head: { ref: "ot/issue-1", sha: SUBJECT },
           base: { ref: "main" },
         },
@@ -1037,6 +1035,56 @@ describe("deterministic supervisor stage gates", () => {
           id: 404,
           body: "This review feedback still belongs to the live provider wait.",
           html_url: "https://github.com/owner/repo/pull/1#issuecomment-404",
+          user: { login: "reviewer" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    const snapshot = fixture.db.prepare("SELECT id, status FROM feedback_snapshots").get() as {
+      id: string;
+      status: string;
+    };
+    expect(snapshot.status).toBe("consumed");
+    expect(fixture.tickets.getSetting(`feedback-snapshot-drained-at:${snapshot.id}`))
+      .toEqual(expect.any(String));
+    expect(fixture.tickets.getSetting(`feedback-snapshot-drain-source:${snapshot.id}`))
+      .toBe("github-webhook");
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "implementation",
+      reentry_ordinal: 1,
+    });
+  });
+
+  it("accepts GitHub review feedback from the live provider-wait instance even when the ticket projection says error", async () => {
+    const fixture = setup("ce/implement@2");
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    moveFixtureToProviderWait(fixture);
+    fixture.tickets.setState("issue-1", "error");
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "pull_request_review",
+        action: "submitted",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 1,
+          html_url: "https://github.com/owner/repo/pull/1",
+          head: { ref: "ot/issue-1", sha: SUBJECT },
+          base: { ref: "main" },
+        },
+        review: {
+          id: 405,
+          state: "commented",
+          body: "This review feedback still belongs to the live provider wait.",
+          html_url: "https://github.com/owner/repo/pull/1#pullrequestreview-405",
           user: { login: "reviewer" },
         },
       },

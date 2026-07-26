@@ -17,13 +17,13 @@ import type { Config } from "../app/config.js";
 import type { ActivityPublicationPort } from "../app/ports.js";
 import type { SupervisorStore } from "../persistence/store.js";
 import { terminateAndSettleActor } from "./actor-settlement.js";
-import type { PipelineStore } from "../pipeline/store.js";
+import type { PipelineInstanceStatus, PipelineStageAttempt, PipelineStore } from "../pipeline/store.js";
 import { processPipelineInfrastructureFailure } from "../pipeline/control.js";
 import { PIPELINE_OUTCOMES } from "../pipeline/manifest.js";
 import type { RuntimeStopper } from "../runtime/contracts.js";
 
-const TERMINAL_PIPELINE_STATUSES = new Set<string>(PIPELINE_OUTCOMES);
-const ACTIVE_ATTEMPT_STATUSES = new Set([
+const TERMINAL_PIPELINE_STATUSES = new Set<PipelineInstanceStatus>(PIPELINE_OUTCOMES);
+const ACTIVE_ATTEMPT_STATUSES = new Set<PipelineStageAttempt["status"]>([
   "pending",
   "leased",
   "dispatched",
@@ -90,6 +90,7 @@ export async function reapStalledRuns(params: {
           reason: message,
           status: "timed_out",
           ticketState: pipelineStillHealthy ? "active" : "error",
+          ticketFailureTail: pipelineStillHealthy ? null : message,
           onSettled: pipeline
             ? () => processPipelineInfrastructureFailure({ store: params.pipelines!, runId: run.id })
             : undefined,
@@ -148,6 +149,7 @@ export async function reapExpiredRuns(params: {
         reason: message,
         status: "timed_out",
         ticketState: pipelineStillHealthy ? "active" : "error",
+        ticketFailureTail: pipelineStillHealthy ? null : message,
         onSettled: () => processPipelineInfrastructureFailure({
           store: params.pipelines,
           runId: run.id,

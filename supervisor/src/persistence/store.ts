@@ -193,6 +193,7 @@ export interface FinishRunParams {
   costUsd?: number;
   prUrl?: string;
   failureTail?: string;
+  ticketFailureTail?: string | null;
   logTail?: string;
   ticketState?: TicketState;
 }
