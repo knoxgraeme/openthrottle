@@ -5,7 +5,10 @@ import { listen } from "./http/listener.js";
 import { createServer, createServerWebhookDeliveryProcessor } from "./http/server.js";
 import { runSweep } from "./operations/sweep.js";
 import { createLinearClientProvider } from "./providers/linear/auth.js";
-import { captureCodexAuthJson, getCodexAuthForSeed } from "./providers/codex/auth.js";
+import {
+  captureCodexAuthFromSandbox,
+  createCredentialMaterializer,
+} from "./providers/codex/auth.js";
 import { pollSandboxEvents } from "./runtime/event-poller.js";
 import { deliverPendingInbox } from "./runtime/steering.js";
 import { reapStalledRuns } from "./operations/reaper.js";
@@ -55,33 +58,7 @@ async function main() {
     apiKey: cfg.daytonaApiKey,
     snapshot: cfg.daytonaSnapshot,
     taskTimeoutSeconds: cfg.taskTimeout,
-    materializeCredentialEnv: async (resource, scopes) => {
-      const ticket = store.getBySandboxId(resource.providerResourceId);
-      if (!ticket) throw new Error(`runtime resource ${resource.providerResourceId} has no ticket binding`);
-      const requested = new Set(scopes);
-      const env: Record<string, string> = {};
-      if (requested.has("repo.write")) {
-        env.GITHUB_TOKEN = cfg.githubToken;
-      } else if (requested.has("repo.read") || requested.has("provider.read")) {
-        env.GITHUB_TOKEN = cfg.githubReadToken;
-      }
-      if (requested.has("model.invoke")) {
-        const claudeCredential = cfg.claudeCodeOauthToken;
-        const openCodeCredential = cfg.kimiCodeApiKey;
-        if (ticket.agent === "claude" && claudeCredential) {
-          env.CLAUDE_CODE_OAUTH_TOKEN = claudeCredential;
-        } else if (ticket.agent === "codex") {
-          const codexCredential = await getCodexAuthForSeed(cfg, store);
-          if (!codexCredential) throw new Error("model credential for codex is unavailable");
-          env.CODEX_AUTH_JSON = codexCredential;
-        } else if (ticket.agent === "opencode" && openCodeCredential) {
-          env.KIMI_CODE_API_KEY = openCodeCredential;
-        } else {
-          throw new Error(`model credential for ${ticket.agent} is unavailable`);
-        }
-      }
-      return { env };
-    },
+    materializeCredentialEnv: createCredentialMaterializer(cfg, store),
   });
   const pipelineEffectProcessor = createPipelineEffectProcessor({
     store: pipelineStore,
@@ -184,21 +161,7 @@ async function main() {
           );
           await pipelineEffectProcessor.drain();
         },
-        captureAgentAuth: async (sandbox, ticket) => {
-          // Codex rotates its OAuth refresh token inside the sandbox; persist
-          // it so the next run seeds the live token instead of a spent one.
-          if (ticket.agent !== "codex") return;
-          try {
-            const raw = (
-              await sandbox.fs.downloadFile!("/home/agent/.codex/auth.json")
-            )!.toString("utf8");
-            if (captureCodexAuthJson(store, raw)) {
-              console.log("[codex-auth] captured a rotated refresh token from the sandbox");
-            }
-          } catch (error) {
-            console.warn("[codex-auth] could not read back ~/.codex/auth.json:", error);
-          }
-        },
+        captureAgentAuth: (sandbox, ticket) => captureCodexAuthFromSandbox(store, sandbox, ticket),
       });
       // Deliver any queued mid-run steering into running sandboxes on the same
       // fast cadence, so a steer reaches the agent within one poll interval.
