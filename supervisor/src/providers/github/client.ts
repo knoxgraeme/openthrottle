@@ -25,7 +25,7 @@ export function verifyGithubSignature(
 interface GithubPullRequest {
   number: number;
   html_url: string;
-  merged: boolean;
+  merged?: boolean;
   head: { ref: string; sha?: string };
   base: { ref: string };
   labels?: Array<{ name: string }>;
@@ -136,31 +136,44 @@ function numberField(value: Record<string, unknown>, field: string): number {
   return result;
 }
 
-function validatePullRequest(payload: Record<string, unknown>): void {
+function validatePullRequestShape(payload: Record<string, unknown>): Record<string, unknown> {
   const pullRequest = recordField(payload, "pull_request");
   numberField(pullRequest, "number");
   stringField(pullRequest, "html_url");
+  stringField(recordField(pullRequest, "head"), "ref");
+  stringField(recordField(pullRequest, "base"), "ref");
+  return pullRequest;
+}
+
+function validatePullRequestEvent(payload: Record<string, unknown>): void {
+  const pullRequest = validatePullRequestShape(payload);
   if (typeof pullRequest.merged !== "boolean") {
     throw new Error("GitHub webhook is missing pull_request.merged");
   }
-  stringField(recordField(pullRequest, "head"), "ref");
-  stringField(recordField(pullRequest, "base"), "ref");
 }
+
+const OPENTHROTTLE_WEBHOOK_EVENTS = [
+  "pull_request",
+  "pull_request_review",
+  "issue_comment",
+  "workflow_run",
+  "check_suite",
+] as const;
+
+export { OPENTHROTTLE_WEBHOOK_EVENTS };
 
 export function parseGithubWebhook(eventName: string | undefined, raw: string): GithubWebhookEvent {
   const payload = parseObject(raw);
   if (!eventName) throw new Error("Missing X-GitHub-Event header");
-  if (
-    !["pull_request", "pull_request_review", "issue_comment", "workflow_run", "check_suite"].includes(
-      eventName
-    )
-  ) {
+  if (!(OPENTHROTTLE_WEBHOOK_EVENTS as readonly string[]).includes(eventName)) {
     throw new Error(`Unsupported GitHub event: ${eventName}`);
   }
   if (typeof payload.action !== "string") throw new Error("GitHub webhook is missing action");
   stringField(recordField(payload, "repository"), "full_name");
-  if (eventName === "pull_request" || eventName === "pull_request_review") {
-    validatePullRequest(payload);
+  if (eventName === "pull_request") {
+    validatePullRequestEvent(payload);
+  } else if (eventName === "pull_request_review") {
+    validatePullRequestShape(payload);
   }
   if (eventName === "pull_request_review") {
     const review = recordField(payload, "review");
@@ -283,13 +296,60 @@ export interface RepositoryReadiness {
   webhookAction: "created" | "updated";
 }
 
-const OPENTHROTTLE_WEBHOOK_EVENTS = [
-  "pull_request",
-  "pull_request_review",
-  "issue_comment",
-  "workflow_run",
-  "check_suite",
-];
+export interface RepositoryWebhookReconciliation {
+  repo: string;
+  webhookId: number;
+  webhookAction: "unchanged" | "updated" | "created";
+  missingEvents: string[];
+}
+
+interface GithubRepositoryHook {
+  id: number;
+  active: boolean;
+  events: string[];
+  config?: { url?: string };
+}
+
+function githubWebhookConfiguration(input: {
+  webhookUrl: string;
+  webhookSecret: string;
+}) {
+  return {
+    active: true,
+    events: OPENTHROTTLE_WEBHOOK_EVENTS,
+    config: {
+      url: input.webhookUrl,
+      content_type: "json",
+      secret: input.webhookSecret,
+      insecure_ssl: "0",
+    },
+  };
+}
+
+async function patchRepositoryWebhook(
+  client: GithubClient,
+  repo: string,
+  hookId: number,
+  configuration: ReturnType<typeof githubWebhookConfiguration>
+): Promise<{ id: number }> {
+  return githubRequest<{ id: number }>(client, `/repos/${repo}/hooks/${hookId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(configuration),
+  });
+}
+
+async function createRepositoryWebhook(
+  client: GithubClient,
+  repo: string,
+  configuration: ReturnType<typeof githubWebhookConfiguration>
+): Promise<{ id: number }> {
+  return githubRequest<{ id: number }>(client, `/repos/${repo}/hooks`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "web", ...configuration }),
+  });
+}
 
 export async function getAuthenticatedLogin(client: GithubClient): Promise<string> {
   const user = await githubRequest<{ login: string }>(client, "/user");
@@ -312,44 +372,75 @@ export async function prepareRepository(
   const baseBranch = input.requestedBaseBranch || repository.default_branch;
   await githubRequest(client, `/repos/${repository.full_name}/branches/${encodeURIComponent(baseBranch)}`);
 
-  const hooks = await githubRequest<Array<{
-    id: number;
-    active: boolean;
-    events: string[];
-    config?: { url?: string };
-  }>>(client, `/repos/${repository.full_name}/hooks?per_page=100`);
+  const hooks = await githubRequest<GithubRepositoryHook[]>(
+    client,
+    `/repos/${repository.full_name}/hooks?per_page=100`
+  );
   const existing = hooks.find((hook) => hook.config?.url === input.webhookUrl);
-  const hookConfiguration = {
-    active: true,
-    events: OPENTHROTTLE_WEBHOOK_EVENTS,
-    config: {
-      url: input.webhookUrl,
-      content_type: "json",
-      secret: input.webhookSecret,
-      insecure_ssl: "0",
-    },
-  };
+  const hookConfiguration = githubWebhookConfiguration(input);
   const hook = existing
-    ? await githubRequest<{ id: number }>(
-        client,
-        `/repos/${repository.full_name}/hooks/${existing.id}`,
-        {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(hookConfiguration),
-        }
-      )
-    : await githubRequest<{ id: number }>(client, `/repos/${repository.full_name}/hooks`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: "web", ...hookConfiguration }),
-      });
+    ? await patchRepositoryWebhook(client, repository.full_name, existing.id, hookConfiguration)
+    : await createRepositoryWebhook(client, repository.full_name, hookConfiguration);
 
   return {
     repo: repository.full_name,
     baseBranch,
     webhookId: hook.id,
     webhookAction: existing ? "updated" : "created",
+  };
+}
+
+export async function reconcileRepositoryWebhook(
+  client: GithubClient,
+  input: {
+    repo: string;
+    webhookId: number;
+    webhookUrl: string;
+    webhookSecret: string;
+  }
+): Promise<RepositoryWebhookReconciliation> {
+  let hook: GithubRepositoryHook;
+  try {
+    hook = await githubRequest<GithubRepositoryHook>(
+      client,
+      `/repos/${input.repo}/hooks/${input.webhookId}`
+    );
+  } catch (error) {
+    if (!String(error).includes("GitHub API error (404)")) throw error;
+    const hooks = await githubRequest<GithubRepositoryHook[]>(
+      client,
+      `/repos/${input.repo}/hooks?per_page=100`
+    );
+    const existing = hooks.find((candidate) => candidate.config?.url === input.webhookUrl);
+    if (existing) {
+      hook = existing;
+    } else {
+      const created = await createRepositoryWebhook(
+        client,
+        input.repo,
+        githubWebhookConfiguration(input)
+      );
+      return {
+        repo: input.repo,
+        webhookId: created.id,
+        webhookAction: "created",
+        missingEvents: [...OPENTHROTTLE_WEBHOOK_EVENTS],
+      };
+    }
+  }
+  const missingEvents = OPENTHROTTLE_WEBHOOK_EVENTS.filter(
+    (event) => !hook.events.includes(event)
+  );
+  const replacementHook = hook.id !== input.webhookId;
+  const needsPatch = replacementHook || missingEvents.length > 0 || !hook.active || hook.config?.url !== input.webhookUrl;
+  if (needsPatch) {
+    await patchRepositoryWebhook(client, input.repo, hook.id, githubWebhookConfiguration(input));
+  }
+  return {
+    repo: input.repo,
+    webhookId: hook.id,
+    webhookAction: needsPatch ? "updated" : "unchanged",
+    missingEvents,
   };
 }
 

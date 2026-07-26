@@ -83,12 +83,26 @@ export function createGithubPublicationProcessor(params: {
       instance.linear_issue_id,
       renderGithubPipelineSummary(envelope, bound.target_url)
     );
-    params.store.markGithubPublicationProcessed(
+    const processed = params.store.markGithubPublicationProcessed(
       publication.id,
       publication.payload_hash,
       String(result.id),
       result.html_url
     );
+    if (!processed) {
+      const latest = params.store.getPublication(publication.id);
+      if (latest?.status === "acknowledged" && latest.external_id === String(result.id)) {
+        return;
+      }
+      if (latest?.status === "processing" && latest.payload_hash === publication.payload_hash) {
+        params.store.markGithubPublicationFailed(
+          publication.id,
+          publication.payload_hash,
+          "GitHub summary acknowledgement CAS failed after comment upsert; manual reconciliation required.",
+          null
+        );
+      }
+    }
   }
 
   async function processRows(rows: PipelinePublicationReceipt[]): Promise<void> {

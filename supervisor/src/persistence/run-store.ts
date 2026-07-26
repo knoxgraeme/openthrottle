@@ -31,6 +31,10 @@ export interface RunStore {
 
 export function createRunStore(db: Database.Database, workStore: WorkStore): RunStore {
   const now = () => new Date().toISOString();
+  const ticketFailureTail = (params: FinishRunParams): string | null =>
+    params.ticketFailureTail === undefined
+      ? params.failureTail ?? null
+      : params.ticketFailureTail;
   const getByIssueIdStmt = db.prepare("SELECT * FROM tickets WHERE linear_issue_id = ?");
   const getCurrentSessionStmt = db.prepare(
     "SELECT * FROM agent_sessions WHERE linear_issue_id = ? AND state = 'current'"
@@ -243,7 +247,7 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
       params.ticketState ?? null,
       params.prUrl ?? null,
       params.costUsd ?? null,
-      params.failureTail ?? null,
+      ticketFailureTail(params),
       completedAt,
       existing.linear_issue_id,
       params.runId
@@ -325,7 +329,7 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
           params.ticketState ?? null,
           params.prUrl ?? null,
           params.costUsd ?? null,
-          params.failureTail ?? null,
+          ticketFailureTail(params),
           completedAt,
           existing.linear_issue_id,
           params.runId
@@ -400,7 +404,7 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
       `).run(
         params.ticketState ?? null,
         params.prUrl ?? null,
-        params.failureTail ?? null,
+        ticketFailureTail(params),
         completedAt,
         existing.linear_issue_id,
         params.runId

@@ -87,7 +87,13 @@ export function routePipelineProviderEvent(params: {
       pullRequestUrl: params.pullRequestUrl,
     });
     if (canReceive) {
-      processPipelineFeedbackSnapshot({ pipelines: params.pipelines, store: params.store, instance, snapshot });
+      processPipelineFeedbackSnapshot({
+        pipelines: params.pipelines,
+        store: params.store,
+        instance,
+        snapshot,
+        drainSource: "github-webhook",
+      });
     }
     return true;
   }
@@ -316,7 +322,6 @@ export async function handleGithubEvent(
     }, ticket.linear_issue_id);
     const reviewState = event.review.state.toLowerCase();
     if (reviewState !== "changes_requested" && reviewState !== "commented") return;
-    if (ticket.state !== "active") return;
     const author = event.review.user?.login;
     // A review without an attested author cannot be trusted feedback. The
     // supervisor never authors pull-request reviews, so no machine-output
@@ -351,7 +356,7 @@ export async function handleGithubEvent(
       event.repository.full_name,
       `https://github.com/${event.repository.full_name}/pull/${event.issue.number}`
     );
-    if (!ticket || ticket.state !== "active") return;
+    if (!ticket) return;
     const author = event.comment.user?.login;
     if (!author) return;
     // Provenance first: comment IDs the supervisor's summary upsert persisted

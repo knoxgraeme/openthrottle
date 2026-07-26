@@ -253,6 +253,67 @@ describe("reapStalledRuns", () => {
     });
   });
 
+  it("keeps the ticket active when reaping a stale run from an already-settled attempt of a live instance", async () => {
+    const fixture = setupPipelineStore();
+    db = fixture.db;
+    const store = fixture.tickets;
+    const { runtime } = makeDaytona();
+    const linearOutbox = makeOutbox(store);
+    const manifest = fixture.catalog.manifests.get("fixture/command@2")!;
+    store.upsert({
+      ...ticket("session-stale", "issue-stale"),
+      sandbox_id: "sandbox-stale",
+      pipeline: {
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        manifest,
+        repositoryConfig: fixture.snapshot,
+        runtime: fixture.runtime,
+        authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
+      },
+    });
+    const instance = fixture.pipelines.getInstanceForSession("session-stale")!;
+    const attempt = fixture.pipelines.getActiveAttempt(instance.id)!;
+    const runId = attempt.planned_run_id!;
+    expect(store.beginRun({
+      issueId: "issue-stale",
+      runId,
+      taskType: "implement",
+      tokenHash: "hash",
+      expiresAt: "2999-01-01T00:00:00.000Z",
+    })).toBe(true);
+    fixture.pipelines.bindStageRun(attempt.id, runId);
+    db.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET status = 'completed', outcome = 'success', completed_at = ?
+      WHERE id = ?
+    `).run("2026-07-26T00:00:00.000Z", attempt.id);
+    db.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'waiting_provider', active_stage_id = 'provider', published_commit = ?
+      WHERE id = ?
+    `).run("c".repeat(40), instance.id);
+    store.renewRunLiveness(runId, "2020-01-01T00:00:00.000Z");
+
+    await reapStalledRuns({
+      runtime,
+      store,
+      activityPublisher: makeActivityPublisher(store, linearOutbox),
+      cfg,
+      pipelines: fixture.pipelines,
+    });
+
+    expect(store.getRun(runId)?.status).toBe("timed_out");
+    expect(store.getByIssueId("issue-stale")).toMatchObject({
+      state: "active",
+      run_id: null,
+      last_error: null,
+    });
+    expect(fixture.pipelines.getInstance(instance.id)).toMatchObject({ status: "waiting_provider" });
+    expect(store.listLinearOutbox().filter((row) => row.kind === "activity")).toHaveLength(0);
+  });
+
   it("quarantines a claimed run when termination cannot be confirmed", async () => {
     db = openDb(":memory:");
     const store = createSupervisorStore(db);

@@ -19,9 +19,12 @@ import { createGithubPublicationProcessor } from "./providers/github/pipeline-pu
 import { createDaytonaRuntime } from "./providers/daytona/adapter.js";
 import { createPipelineEffectProcessor } from "./operations/pipeline-effects.js";
 import { drainPipelineFeedbackSnapshots } from "./app/provider-feedback.js";
+import { createGithubWebhookReconciler } from "./operations/github-webhook-reconciliation.js";
+import { reconcileRepositoryWebhook } from "./providers/github/client.js";
 
 const SWEEP_INTERVAL_MS = 15 * 60 * 1000; // run every 15 min while awake; SPEC only requires "on every boot" + periodic while awake
 const DELIVERY_DRAIN_INTERVAL_MS = 30 * 1000;
+const WEBHOOK_RECONCILIATION_CONCURRENCY = 4;
 // Liveness reap runs far more often than the hard-timeout sweep so a stalled
 // run is caught within ~a minute of crossing STALL_TIMEOUT_SECONDS.
 const REAP_INTERVAL_MS = 60 * 1000;
@@ -96,6 +99,14 @@ async function main() {
     store: pipelineStore,
     tickets: store,
     client: { token: cfg.githubToken },
+  });
+  const reconcileGithubWebhooks = createGithubWebhookReconciler({
+    store,
+    client: { token: cfg.githubToken },
+    webhookUrl: `${cfg.supervisorUrl}/webhooks/github`,
+    webhookSecret: cfg.githubWebhookSecret,
+    reconcileRepositoryWebhook,
+    concurrency: WEBHOOK_RECONCILIATION_CONCURRENCY,
   });
   const deliveryProcessor = createServerWebhookDeliveryProcessor({
     cfg,
@@ -207,7 +218,7 @@ async function main() {
   githubPublicationProcessor.drain().catch((err) => console.error("[github-publication] boot drain failed:", err));
   pipelineEffectProcessor.drain().catch((err) => console.error("[pipeline-effects] boot drain failed:", err));
   pollActiveSandboxes().catch((err) => console.error("[sandbox-events] boot poll failed:", err));
-  runSweep(runtime, store, cfg, pipelineStore, activityPublisher)
+  runSweep(runtime, store, cfg, pipelineStore, activityPublisher, reconcileGithubWebhooks)
     .catch((err) => console.error("[sweep] boot sweep failed:", err));
   const reapStalled = () =>
     reapStalledRuns({ runtime, store, activityPublisher, cfg, pipelines: pipelineStore }).catch((err) =>
@@ -234,7 +245,7 @@ async function main() {
     );
   }, cfg.sandboxEventPollIntervalMs).unref();
   setInterval(() => {
-    runSweep(runtime, store, cfg, pipelineStore, activityPublisher)
+    runSweep(runtime, store, cfg, pipelineStore, activityPublisher, reconcileGithubWebhooks)
       .catch((err) => console.error("[sweep] interval sweep failed:", err));
   }, SWEEP_INTERVAL_MS).unref();
 
