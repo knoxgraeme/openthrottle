@@ -8,6 +8,7 @@ import { openDb } from "../persistence/database.js";
 import { handleLinearEvent } from "./session-service.js";
 import type { LinearClient } from "../providers/linear/client.js";
 import { fetchIssueLabels, parseLinearWebhook } from "../providers/linear/events.js";
+import { routePipelineProviderEvent } from "../providers/github/events.js";
 import {
   branchExists,
   getMergeReadiness,
@@ -16,7 +17,7 @@ import {
   parsePullRequestUrl,
 } from "../providers/github/client.js";
 import { enqueueActivity, tryPostError } from "../providers/linear/outbox.js";
-import { loadPipelineCatalog } from "../pipeline/manifest.js";
+import { canonicalJson, loadPipelineCatalog } from "../pipeline/manifest.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { buildInstalledRuntimeDescriptor } from "../runtime/contracts.js";
 
@@ -54,7 +55,7 @@ function config(): Config {
   };
 }
 
-function payload(sessionId = "session-1") {
+function payload(sessionId = "session-1", issueId = "issue-1", identifier = "OT-1") {
   return parseLinearWebhook(JSON.stringify({
     action: "created",
     type: "AgentSessionEvent",
@@ -64,8 +65,8 @@ function payload(sessionId = "session-1") {
     agentSession: {
       id: sessionId,
       issue: {
-        id: "issue-1",
-        identifier: "OT-1",
+        id: issueId,
+        identifier,
         team: { id: "team-1", key: "OT" },
         labels: [],
       },
@@ -79,6 +80,59 @@ describe("pipeline admission", () => {
     vi.unstubAllGlobals();
     db?.close();
   });
+
+  function promptedReply(body: string, activityId = "activity-reply", sessionId = "session-1") {
+    return parseLinearWebhook(JSON.stringify({
+      action: "prompted",
+      type: "AgentSessionEvent",
+      webhookId: `pipeline-reply-${activityId}`,
+      webhookTimestamp: Date.now(),
+      organizationId: "org",
+      agentSession: { id: sessionId },
+      agentActivity: { id: activityId, content: { type: "prompt", body } },
+    }));
+  }
+
+  function moveToProviderWait(
+    pipelines: ReturnType<typeof createPipelineStore>,
+    head = "c".repeat(40),
+    sessionId = "session-1"
+  ) {
+    const instance = pipelines.getInstanceForSession(sessionId)!;
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    db!.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET stage_id = 'provider', native_context_policy = 'none', expected_subject = ?
+      WHERE id = ?
+    `).run(head, attempt.id);
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'waiting_provider', active_stage_id = 'provider',
+          immutable_subject = ?, published_commit = ?
+      WHERE id = ?
+    `).run(head, head, instance.id);
+    db!.prepare(`
+      UPDATE pipeline_instance_stages SET status = 'passed'
+      WHERE pipeline_instance_id = ? AND stage_id = 'implementation'
+    `).run(instance.id);
+    db!.prepare(`
+      UPDATE pipeline_instance_stages SET status = 'waiting'
+      WHERE pipeline_instance_id = ? AND stage_id = 'provider'
+    `).run(instance.id);
+    return pipelines.getInstance(instance.id)!;
+  }
+
+  function providerEvents() {
+    return db!.prepare(`
+      SELECT provider, provider_event_id, kind, payload FROM provider_events
+      ORDER BY received_at, provider, provider_event_id
+    `).all() as Array<{
+      provider: string;
+      provider_event_id: string;
+      kind: string;
+      payload: string;
+    }>;
+  }
 
   async function run(
     repositoryConfig: string,
@@ -270,15 +324,7 @@ mcp_servers: {}
   it("rejects an idle pipeline reply instead of starting another task", async () => {
     const { pipelines, invoke } = await run("pipelines: { implement: implement }\n");
     const instance = pipelines.getInstanceForSession("session-1")!;
-    const prompted = parseLinearWebhook(JSON.stringify({
-      action: "prompted",
-      type: "AgentSessionEvent",
-      webhookId: "pipeline-reply",
-      webhookTimestamp: Date.now(),
-      organizationId: "org",
-      agentSession: { id: "session-1" },
-      agentActivity: { id: "activity-reply", content: { type: "prompt", body: "keep going" } },
-    }));
+    const prompted = promptedReply("keep going");
 
     await invoke({}, prompted);
 
@@ -288,6 +334,206 @@ mcp_servers: {}
     expect(db!.prepare("SELECT COUNT(*) FROM session_inbox").pluck().get()).toBe(0);
     const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
     expect(payloads.some((entry) => entry.includes("does not accept live steering"))).toBe(true);
+  });
+
+  it("records a waiting-provider Linear reply as feedback and acknowledges the wakeup", async () => {
+    const { pipelines, invoke } = await run("pipelines: { implement: implement }\n");
+    const head = "c".repeat(40);
+    moveToProviderWait(pipelines, head);
+
+    await invoke({}, promptedReply("please fix the retry summary"));
+
+    const events = providerEvents();
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      provider: "linear",
+      provider_event_id: "linear-reply:activity-reply",
+      kind: "pipeline_provider_event",
+    });
+    const stored = JSON.parse(events[0]!.payload) as { summary: string; evidence: string[]; payload: string };
+    expect(stored.summary).toBe("Linear reply requires another implementation pass.");
+    expect(stored.evidence).toEqual(["please fix the retry summary"]);
+    expect(JSON.parse(stored.payload)).toMatchObject({
+      kind: "linear_reply",
+      activity_id: "activity-reply",
+      body: "please fix the retry summary",
+    });
+    expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
+      status: "dispatchable",
+      active_stage_id: "implementation",
+    });
+    expect(db!.prepare("SELECT COUNT(*) FROM feedback_snapshots WHERE status = 'consumed'").pluck().get()).toBe(1);
+    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(payloads.some((entry) => entry.includes("Waking the run to address your message in the honest ledger."))).toBe(true);
+    expect(payloads.some((entry) => entry.includes("does not accept live steering"))).toBe(false);
+  });
+
+  it("sanitizes and bounds waiting-provider Linear reply feedback", async () => {
+    const { pipelines, invoke } = await run("pipelines: { implement: implement }\n");
+    moveToProviderWait(pipelines);
+    const body = `please inspect sk-${"a".repeat(24)} ${"x".repeat(2_500)}`;
+
+    await invoke({}, promptedReply(body, "activity-long"));
+
+    const [event] = providerEvents();
+    const stored = JSON.parse(event!.payload) as { evidence: string[]; payload: string };
+    const payloadBody = (JSON.parse(stored.payload) as { body: string }).body;
+    expect(stored.evidence[0]).toHaveLength(1_000);
+    expect(payloadBody).toHaveLength(2_000);
+    expect(stored.evidence[0]).toContain("[REDACTED]");
+    expect(payloadBody).toContain("[REDACTED]");
+    expect(stored.evidence[0]).not.toContain("sk-");
+    expect(payloadBody).not.toContain("sk-");
+  });
+
+  it("processes the Linear reply snapshot even when another provider-ready instance is older", async () => {
+    const { tickets, pipelines, invoke } = await run("pipelines: { implement: implement }\n");
+    const oldHead = "a".repeat(40);
+    const newHead = "b".repeat(40);
+    const oldInstance = moveToProviderWait(pipelines, oldHead);
+    const oldSnapshot = tickets.recordProviderFeedback({
+      provider: "github",
+      providerEventId: "github-review:older",
+      issueId: oldInstance.linear_issue_id,
+      sessionId: oldInstance.linear_session_id,
+      generation: oldInstance.generation,
+      repository: oldInstance.repository,
+      pullNumber: 1,
+      headSha: oldHead,
+      kind: "pipeline_provider_event",
+      payload: canonicalJson({
+        outcome: "semantic_repair_required",
+        summary: "Older feedback",
+        evidence: ["older feedback"],
+        payload: "{}",
+      }),
+      workItemId: `pipeline-feedback:${oldInstance.id}:${oldHead}`,
+    }).snapshot;
+
+    await invoke({}, payload("session-2", "issue-2", "OT-2"));
+    const currentInstance = moveToProviderWait(pipelines, newHead, "session-2");
+
+    await invoke({}, promptedReply("wake this specific run", "activity-specific", "session-2"));
+
+    expect(db!.prepare("SELECT status FROM feedback_snapshots WHERE id = ?").get(oldSnapshot.id))
+      .toEqual({ status: "collecting" });
+    expect(pipelines.getInstance(currentInstance.id)).toMatchObject({
+      status: "dispatchable",
+      active_stage_id: "implementation",
+    });
+    expect(providerEvents().map((event) => `${event.provider}:${event.provider_event_id}`).sort()).toEqual([
+      "github:github-review:older",
+      "linear:linear-reply:activity-specific",
+    ]);
+  });
+
+  it("deduplicates a redelivered waiting-provider Linear reply by activity id", async () => {
+    const { pipelines, invoke } = await run("pipelines: { implement: implement }\n");
+    moveToProviderWait(pipelines);
+    const prompted = promptedReply("same delivery", "activity-redelivered");
+
+    await invoke({}, prompted);
+    moveToProviderWait(pipelines);
+    await invoke({}, prompted);
+
+    expect(providerEvents()).toHaveLength(1);
+    expect(db!.prepare("SELECT COUNT(*) FROM feedback_snapshots").pluck().get()).toBe(1);
+  });
+
+  it("coalesces pending GitHub feedback and a waiting-provider Linear reply into one repair snapshot", async () => {
+    const { tickets, pipelines, invoke } = await run("pipelines: { implement: implement }\n");
+    const head = "d".repeat(40);
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    tickets.setSetting("github-head:issue-1", head);
+    db!.prepare("UPDATE pipeline_instances SET status = 'running', published_commit = ? WHERE id = ?")
+      .run(head, instance.id);
+
+    expect(routePipelineProviderEvent({
+      pipelines,
+      store: tickets,
+      ticket: tickets.getByIssueId("issue-1")!,
+      eventId: "github-review:77",
+      outcome: "semantic_repair_required",
+      summary: "GitHub review requires another implementation pass.",
+      evidence: ["https://github.com/owner/repo/pull/1#pullrequestreview-77"],
+      payload: { kind: "pull_request_review", id: 77 },
+      headSha: head,
+      pullRequestUrl: "https://github.com/owner/repo/pull/1",
+    })).toBe(true);
+    expect(tickets.listPendingFeedbackSnapshots("session-1")).toHaveLength(1);
+
+    moveToProviderWait(pipelines, head);
+    await invoke({}, promptedReply("also fix the Linear note", "activity-linear-join"));
+
+    const events = providerEvents();
+    expect(events.map((event) => `${event.provider}:${event.provider_event_id}`).sort()).toEqual([
+      "github:github-review:77",
+      "linear:linear-reply:activity-linear-join",
+    ]);
+    expect(db!.prepare("SELECT COUNT(*) FROM feedback_snapshots").pluck().get()).toBe(1);
+    expect(db!.prepare("SELECT COUNT(*) FROM feedback_snapshots WHERE status = 'consumed'").pluck().get()).toBe(1);
+    expect(pipelines.getActiveAttempt(instance.id)).toMatchObject({
+      stage_id: "implementation",
+      reentry_ordinal: 1,
+    });
+  });
+
+  it("keeps a steerable running stage on the live-steer inbox path", async () => {
+    const { tickets, pipelines, invoke } = await run("pipelines: { implement: implement }\n");
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    const request = pipelines.getStageRequest(attempt.id);
+    expect(tickets.beginRun({
+      issueId: "issue-1",
+      runId: request.runId,
+      taskType: "implement",
+      tokenHash: "token-hash",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    })).toBe(true);
+    pipelines.bindStageRun(attempt.id, request.runId);
+    pipelines.markStageDispatched(attempt.id);
+
+    await invoke({}, promptedReply("please adjust the current stage", "activity-steer"));
+
+    expect(providerEvents()).toHaveLength(0);
+    expect(db!.prepare("SELECT id, body FROM session_inbox").get()).toEqual({
+      id: "activity-steer",
+      body: "please adjust the current stage",
+    });
+  });
+
+  it("rejects a waiting-provider reply for a just-terminal instance without feedback", async () => {
+    const { pipelines, invoke } = await run("pipelines: { implement: implement }\n");
+    const instance = moveToProviderWait(pipelines);
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'needs_human', terminal_outcome = 'needs_human'
+      WHERE id = ?
+    `).run(instance.id);
+
+    await invoke({}, promptedReply("can you still fix this?", "activity-terminal"));
+
+    expect(providerEvents()).toHaveLength(0);
+    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(payloads.some((entry) => entry.includes("does not accept live steering"))).toBe(true);
+  });
+
+  it("rejects a superseded-session reply without feedback", async () => {
+    const { tickets, pipelines, invoke } = await run("pipelines: { implement: implement }\n");
+    const previous = moveToProviderWait(pipelines);
+    tickets.setSandboxId("issue-1", "sandbox-old");
+    await invoke({}, payload("session-2"));
+
+    await invoke({}, promptedReply("old generation reply", "activity-superseded", "session-1"));
+
+    expect(pipelines.getInstance(previous.id)).toMatchObject({
+      status: "superseded",
+      terminal_outcome: "superseded",
+    });
+    expect(providerEvents()).toHaveLength(0);
+    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(payloads.some((entry) => entry.includes("couldn't find an existing workspace"))).toBe(true);
   });
 
   it("supersedes an earlier pipeline generation on re-delegation", async () => {
