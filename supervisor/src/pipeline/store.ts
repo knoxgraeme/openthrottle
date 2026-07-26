@@ -7,9 +7,9 @@ import type {
   ValidatedRepositoryConfig,
 } from "./manifest.js";
 import type {
-  StageRequestEnvelope,
   ValidatedRuntimeCapabilityDescriptor,
 } from "../runtime/contracts.js";
+import type { StageRequestEnvelope } from "./stage-request.js";
 
 export type PipelineInstanceStatus =
   | "pending"

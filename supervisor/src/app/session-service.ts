@@ -24,7 +24,7 @@ import type { ValidatedRuntimeCapabilityDescriptor } from "../runtime/contracts.
 import { sanitizeText } from "../shared/sanitize.js";
 import { parseCommand } from "./commands.js";
 import { canSteerPipelineRun, requestPipelineStop } from "../pipeline/control.js";
-import type { AdmissionPreflight } from "../admission-preflight.js";
+import type { AdmissionPreflight } from "./admission-preflight.js";
 
 function linearContext(
   payload: LinearAgentSessionEvent,

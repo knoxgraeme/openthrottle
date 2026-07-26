@@ -4,7 +4,8 @@ import type { Config } from "../app/config.js";
 import type { SupervisorStore } from "../persistence/store.js";
 import { createSupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
-import { createLinearOutboxProcessor } from "../providers/linear/outbox.js";
+import { setupPipelineStore, ticket } from "../__fixtures__/pipeline-store.js";
+import { createLinearActivityPublisher, createLinearOutboxProcessor } from "../providers/linear/outbox.js";
 import { reapStalledRuns } from "./reaper.js";
 import type { PipelineStore } from "../pipeline/store.js";
 
@@ -25,6 +26,9 @@ function makeDaytona(stopError?: Error) {
 // tryPostError, so the enqueued error row stays visible in listLinearOutbox().
 const makeOutbox = (store: SupervisorStore) =>
   createLinearOutboxProcessor({ store, getLinearClient: async () => undefined });
+
+const makeActivityPublisher = (store: SupervisorStore, outbox: ReturnType<typeof makeOutbox>) =>
+  createLinearActivityPublisher(store, outbox);
 
 const addTicket = (store: SupervisorStore, id: string, sandboxId: string | null) =>
   store.upsert({
@@ -77,7 +81,7 @@ describe("reapStalledRuns", () => {
     );
     store.renewRunLiveness("run-stalled", "2020-01-01T00:00:00.000Z");
 
-    await reapStalledRuns({ runtime, store, linearOutbox, cfg });
+    await reapStalledRuns({ runtime, store, activityPublisher: makeActivityPublisher(store, linearOutbox), cfg });
 
     // The stalled run is reaped: run terminal, ticket errored, run_id cleared.
     expect(store.getRun("run-stalled")?.status).toBe("timed_out");
@@ -138,7 +142,7 @@ describe("reapStalledRuns", () => {
     });
     store.renewRunLiveness("run-beating", new Date().toISOString());
 
-    await reapStalledRuns({ runtime, store, linearOutbox, cfg });
+    await reapStalledRuns({ runtime, store, activityPublisher: makeActivityPublisher(store, linearOutbox), cfg });
 
     expect(store.getRun("run-beating")?.status).toBe("running");
     expect(store.getByIssueId("beating")?.run_id).toBe("run-beating");
@@ -166,11 +170,87 @@ describe("reapStalledRuns", () => {
       "run-booting"
     );
 
-    await reapStalledRuns({ runtime, store, linearOutbox, cfg });
+    await reapStalledRuns({ runtime, store, activityPublisher: makeActivityPublisher(store, linearOutbox), cfg });
 
     expect(store.getRun("run-booting")?.status).toBe("timed_out");
     expect(store.getByIssueId("booting")?.run_id).toBeNull();
     expect(store.listLinearOutbox()).toHaveLength(1);
+  });
+
+  it("reaps a stalled attempt-backed run through the pipeline actor table", async () => {
+    const fixture = setupPipelineStore();
+    db = fixture.db;
+    const store = fixture.tickets;
+    const { runtime, sandbox } = makeDaytona();
+    const linearOutbox = makeOutbox(store);
+    const manifest = fixture.catalog.manifests.get("fixture/command@2")!;
+    store.upsert({
+      ...ticket("session-stalled", "issue-stalled"),
+      sandbox_id: "sandbox-1",
+      pipeline: {
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        manifest,
+        repositoryConfig: fixture.snapshot,
+        runtime: fixture.runtime,
+        authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
+      },
+    });
+    const instance = fixture.pipelines.getInstanceForSession("session-stalled")!;
+    const attempt = fixture.pipelines.getActiveAttempt(instance.id)!;
+    const runId = attempt.planned_run_id!;
+    expect(store.beginRun({
+      issueId: "issue-stalled",
+      runId,
+      taskType: "implement",
+      tokenHash: "hash",
+      expiresAt: "2999-01-01T00:00:00.000Z",
+    })).toBe(true);
+    fixture.pipelines.bindStageRun(attempt.id, runId);
+    // The sealed executor heartbeat went silent long before the stall cutoff.
+    // No run_liveness row exists, so the whole stall-reap → claim → settle
+    // path must run against pipeline_attempt_actors.
+    store.renewRunLiveness(runId, "2020-01-01T00:00:00.000Z");
+    expect(db.prepare("SELECT COUNT(*) AS count FROM run_liveness WHERE run_id = ?").get(runId))
+      .toEqual({ count: 0 });
+
+    await reapStalledRuns({
+      runtime,
+      store,
+      activityPublisher: makeActivityPublisher(store, linearOutbox),
+      cfg,
+      pipelines: fixture.pipelines,
+    });
+
+    expect(store.getRun(runId)?.status).toBe("timed_out");
+    expect(store.getByIssueId("issue-stalled")).toMatchObject({ state: "error", run_id: null });
+    expect(db.prepare(`
+      SELECT actor_state, settlement_reason, termination_confirmed_at
+      FROM pipeline_attempt_actors WHERE run_id = ?
+    `).get(runId)).toMatchObject({
+      actor_state: "settled",
+      settlement_reason: expect.stringContaining("run reaped"),
+      termination_confirmed_at: expect.any(String),
+    });
+    expect(sandbox.stop).toHaveBeenCalledWith("sandbox-1", expect.stringContaining("run reaped"));
+    // Settlement re-entered the pipeline as a bounded infrastructure retry.
+    expect(fixture.pipelines.getAttempt(attempt.id)).toMatchObject({
+      status: "failed",
+      outcome: "retryable_infrastructure_failure",
+    });
+    expect(fixture.pipelines.getActiveAttempt(instance.id)).toMatchObject({
+      stage_id: "test",
+      reentry_ordinal: 1,
+    });
+    // Alongside the pipeline_receipt publications, exactly one reap error
+    // activity was enqueued for the settled run.
+    const activities = store.listLinearOutbox().filter((row) => row.kind === "activity");
+    expect(activities).toHaveLength(1);
+    expect(JSON.parse(activities[0].payload)).toMatchObject({
+      type: "activity",
+      activity: { type: "error", body: expect.stringContaining("run reaped") },
+    });
   });
 
   it("quarantines a claimed run when termination cannot be confirmed", async () => {
@@ -191,7 +271,7 @@ describe("reapStalledRuns", () => {
       "run-wedged"
     );
 
-    await reapStalledRuns({ runtime, store, linearOutbox, cfg });
+    await reapStalledRuns({ runtime, store, activityPublisher: makeActivityPublisher(store, linearOutbox), cfg });
 
     expect(store.getRun("run-wedged")?.status).toBe("quarantined");
     expect(store.getByIssueId("wedged")).toMatchObject({
@@ -243,7 +323,7 @@ describe("reapStalledRuns", () => {
       getActiveAttempt,
     } as unknown as PipelineStore;
 
-    await reapStalledRuns({ runtime, store, linearOutbox, cfg, pipelines });
+    await reapStalledRuns({ runtime, store, activityPublisher: makeActivityPublisher(store, linearOutbox), cfg, pipelines });
 
     expect(setRuntimeResourceStatus).toHaveBeenCalledWith("pipeline-1", "quarantined");
     expect(getActiveAttempt).not.toHaveBeenCalled();
@@ -297,9 +377,9 @@ describe("reapStalledRuns", () => {
     const runtime = { stopResource: sandbox.stop };
     const linearOutbox = makeOutbox(store);
 
-    const first = reapStalledRuns({ runtime, store, linearOutbox, cfg });
+    const first = reapStalledRuns({ runtime, store, activityPublisher: makeActivityPublisher(store, linearOutbox), cfg });
     await vi.waitFor(() => expect(sandbox.stop).toHaveBeenCalledOnce());
-    await reapStalledRuns({ runtime, store, linearOutbox, cfg });
+    await reapStalledRuns({ runtime, store, activityPublisher: makeActivityPublisher(store, linearOutbox), cfg });
     expect(runtime.stopResource).toHaveBeenCalledOnce();
 
     confirmStop();
@@ -328,7 +408,7 @@ describe("reapStalledRuns", () => {
     }
     const acquire = vi.spyOn(store, "acquireSupervisorLease");
 
-    await reapStalledRuns({ runtime, store, linearOutbox, cfg });
+    await reapStalledRuns({ runtime, store, activityPublisher: makeActivityPublisher(store, linearOutbox), cfg });
 
     expect(acquire).toHaveBeenCalledTimes(3); // initial acquisition + each actor
     expect(store.getRun("run-first")?.status).toBe("timed_out");
@@ -342,7 +422,7 @@ describe("reapStalledRuns", () => {
     const linearOutbox = makeOutbox(store);
 
     await expect(
-      reapStalledRuns({ runtime, store, linearOutbox, cfg })
+      reapStalledRuns({ runtime, store, activityPublisher: makeActivityPublisher(store, linearOutbox), cfg })
     ).resolves.toBeUndefined();
     expect(store.listLinearOutbox()).toHaveLength(0);
   });

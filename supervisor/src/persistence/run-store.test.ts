@@ -92,6 +92,49 @@ describe("run store", () => {
       .toEqual({ count: 0 });
   });
 
+  it("lists a stalled run through its pipeline attempt actor", () => {
+    db.close();
+    const fixture = setupPipelineStore();
+    db = fixture.db;
+    store = fixture.tickets;
+    const manifest = fixture.catalog.manifests.get("fixture/command@2")!;
+    store.upsert({
+      ...ticket("session-pipeline", "issue-pipeline"),
+      pipeline: {
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        manifest,
+        repositoryConfig: fixture.snapshot,
+        runtime: fixture.runtime,
+        authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
+      },
+    });
+    const instance = fixture.pipelines.getInstanceForSession("session-pipeline")!;
+    const attempt = fixture.pipelines.getActiveAttempt(instance.id)!;
+    const runId = attempt.planned_run_id!;
+
+    expect(store.beginRun({
+      issueId: "issue-pipeline",
+      runId,
+      taskType: "implement",
+      tokenHash: "c".repeat(64),
+      expiresAt: "2026-07-23T00:00:00.000Z",
+    })).toBe(true);
+    // The run has no legacy liveness row, so only the pipeline_attempt_actors
+    // branch of the stall query can surface it to the reaper.
+    expect(db.prepare("SELECT COUNT(*) AS count FROM run_liveness WHERE run_id = ?").get(runId))
+      .toEqual({ count: 0 });
+
+    expect(store.renewRunLiveness(runId, "2026-07-22T10:00:00.000Z")).toBe(true);
+    expect(store.listStalledRuns("2026-07-22T10:00:00.000Z").map((run) => run.id)).toEqual([runId]);
+    expect(store.listStalledRuns("2026-07-22T09:59:59.000Z")).toEqual([]);
+
+    // A fresh heartbeat moves the actor past the cutoff and out of the sweep.
+    expect(store.renewRunLiveness(runId, new Date().toISOString())).toBe(true);
+    expect(store.listStalledRuns("2026-07-22T10:00:00.000Z")).toEqual([]);
+  });
+
   it("keeps legacy direct-run liveness as a compatibility fallback", () => {
     expect(store.beginRun({
       issueId: "issue-1",

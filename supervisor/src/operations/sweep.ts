@@ -1,6 +1,6 @@
 import type { Config } from "../app/config.js";
+import type { ActivityPublicationPort } from "../app/ports.js";
 import type { SupervisorStore } from "../persistence/store.js";
-import type { LinearOutboxProcessor } from "../providers/linear/outbox.js";
 import type { PipelineStore } from "../pipeline/store.js";
 import type { RuntimeInventory, RuntimeInventoryResource, RuntimeStopper } from "../runtime/contracts.js";
 import { reapExpiredRuns } from "./reaper.js";
@@ -19,9 +19,9 @@ export async function runSweep(
   store: SupervisorStore,
   cfg: Config,
   pipelines: PipelineStore,
-  linearOutbox: LinearOutboxProcessor
+  activityPublisher: Pick<ActivityPublicationPort, "publishError">
 ): Promise<void> {
-  await reapExpiredRuns({ runtime, store, linearOutbox, pipelines });
+  await reapExpiredRuns({ runtime, store, activityPublisher, pipelines });
   await deleteOrphanSandboxes(runtime, store, cfg);
   const retentionCutoff = new Date(Date.now() - 7 * DAY_MS).toISOString();
   store.pruneDeliveries(retentionCutoff);

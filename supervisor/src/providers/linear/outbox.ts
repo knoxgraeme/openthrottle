@@ -1,5 +1,6 @@
 import type { AgentActivityInput, AgentPlanItem, LinearClient } from "./client.js";
 import { agentActivityCreate, agentSessionUpdate, linearFileUpload } from "./client.js";
+import type { ActivityPublicationPort } from "../../app/ports.js";
 import type { LinearOutboxRecord, SupervisorStore } from "../../persistence/store.js";
 import { sanitizeText } from "../../shared/sanitize.js";
 
@@ -48,6 +49,18 @@ export async function enqueueActivity(
     payload: activityPayload(activity),
   });
   await outbox.process(row.id);
+}
+
+export function createLinearActivityPublisher(
+  store: SupervisorStore,
+  outbox: LinearOutboxProcessor
+): ActivityPublicationPort {
+  return {
+    publishActivity: (activity, issueId, runId) =>
+      enqueueActivity(store, outbox, activity, issueId, runId),
+    publishError: (sessionId, issueId, message) =>
+      tryPostError(store, outbox, sessionId, issueId, message),
+  };
 }
 
 export async function enqueueSessionUpdate(

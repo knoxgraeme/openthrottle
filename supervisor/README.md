@@ -18,11 +18,38 @@ results, activities, plans, and heartbeats from active Daytona sandboxes.
 npm ci
 npm run typecheck
 npm test
+npm test -- src/__tests__/architecture.test.ts src/pipeline/manifest.test.ts src/pipeline/stage-request.test.ts src/runtime/contracts.test.ts
 npm run dev
 ```
 
 Export the values from `.env.example`; the process does not implicitly load
 `.env`. `GET /healthz` is the only public operator endpoint.
+
+## Source boundaries
+
+`src/index.ts` is the sole composition root. It opens SQLite, builds the
+composed supervisor and pipeline stores, constructs provider clients and the
+Daytona runtime adapter, wires operations workers, and starts the HTTP server.
+All other production modules live under an owning boundary:
+
+- `app/` owns config, command/session orchestration, admission preflight, and
+  provider-neutral application ports.
+- `http/` owns Hono routes, listener startup, route auth, and durable webhook
+  delivery leasing.
+- `pipeline/` owns manifests, reducer/control logic, gates, stage requests,
+  publication envelopes, and persistence capability contracts.
+- `persistence/` owns SQLite bootstrap, schema, migrations, and concrete stores;
+  production code outside this boundary does not import `better-sqlite3` or
+  query legacy `runs`/`run_liveness` tables directly.
+- `providers/` owns Linear, GitHub, Codex, and Daytona adapters; the Daytona SDK
+  is confined to `providers/daytona`.
+- `runtime/` owns provider-neutral runtime contracts, event polling, lifecycle,
+  and steering.
+- `operations/` owns reaping, sweeping, actor settlement, and retryable effect
+  draining through neutral ports.
+- `shared/` owns sanitization and bounded log constants.
+
+`src/__tests__/architecture.test.ts` enforces these boundaries in Vitest.
 
 ## Deploy to Fly
 
