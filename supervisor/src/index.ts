@@ -21,6 +21,7 @@ import { createPipelineEffectProcessor } from "./operations/pipeline-effects.js"
 import { drainPipelineFeedbackSnapshots } from "./app/provider-feedback.js";
 import { createGithubWebhookReconciler } from "./operations/github-webhook-reconciliation.js";
 import { reconcileRepositoryWebhook } from "./providers/github/client.js";
+import { sanitizeText } from "./shared/sanitize.js";
 
 const SWEEP_INTERVAL_MS = 15 * 60 * 1000; // run every 15 min while awake; SPEC only requires "on every boot" + periodic while awake
 const DELIVERY_DRAIN_INTERVAL_MS = 30 * 1000;
@@ -28,6 +29,7 @@ const WEBHOOK_RECONCILIATION_CONCURRENCY = 4;
 // Liveness reap runs far more often than the hard-timeout sweep so a stalled
 // run is caught within ~a minute of crossing STALL_TIMEOUT_SECONDS.
 const REAP_INTERVAL_MS = 60 * 1000;
+const missingCodexAuthWarnings = new Set<string>();
 
 async function main() {
   const cfg = loadConfig();
@@ -196,7 +198,17 @@ async function main() {
               console.log("[codex-auth] captured a rotated refresh token from the sandbox");
             }
           } catch (error) {
-            console.warn("[codex-auth] could not read back ~/.codex/auth.json:", error);
+            const message = String(error);
+            const sanitized = sanitizeText(message).slice(-2_000);
+            const warningKey = `${sandbox.id}:missing-codex-auth`;
+            if (message.includes("FILE_NOT_FOUND")) {
+              if (!missingCodexAuthWarnings.has(warningKey)) {
+                missingCodexAuthWarnings.add(warningKey);
+                console.warn("[codex-auth] could not read back ~/.codex/auth.json; will retry silently:", sanitized);
+              }
+            } else {
+              console.warn("[codex-auth] could not read back ~/.codex/auth.json:", sanitized);
+            }
           }
         },
       });

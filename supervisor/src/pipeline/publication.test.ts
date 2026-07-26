@@ -912,6 +912,19 @@ describe("pipeline publication", () => {
       write: { ...baseWrite, nextStatus: "waiting_provider", waitReason: "provider evidence required at provider_wait" },
       gateReceipt: input.receipt,
     });
+    const repairReentry = buildStagePublication({
+      instance,
+      attempt,
+      event: { ...input.event, outcome: "semantic_repair_required" },
+      write: {
+        ...baseWrite,
+        outcome: "semantic_repair_required",
+        nextStatus: "dispatchable",
+        nextStageId: "fresh",
+        reentryIncrement: 1,
+      },
+      gateReceipt: input.receipt,
+    });
     const needsHuman = buildStagePublication({
       instance,
       attempt,
@@ -927,6 +940,7 @@ describe("pipeline publication", () => {
 
     expect(shouldPostLinearEventComment(buildSelectionPublication(instance))).toBe(true);
     expect(shouldPostLinearEventComment(routine)).toBe(false);
+    expect(shouldPostLinearEventComment(repairReentry)).toBe(true);
     expect(shouldPostLinearEventComment(prPublished)).toBe(true);
     expect(shouldPostLinearEventComment(needsHuman)).toBe(true);
     expect(shouldPostLinearEventComment(buildLifecyclePublication({

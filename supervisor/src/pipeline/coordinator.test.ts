@@ -236,6 +236,41 @@ describe("pipeline coordinator", () => {
       .toEqual(["publish_linear", "stop", "cleanup"]);
   });
 
+  it("does not exhaust the raw attempt budget in the middle of a forward repair round", () => {
+    const { manifest, instance, attempt, stages } = setup("ce/implement@2");
+    const repairedImplementation = reducePipelineEvent({
+      manifest,
+      instance: {
+        ...instance,
+        status: "running",
+        active_stage_id: "implementation",
+        attempt_count: manifest.max_attempts,
+      },
+      attempt: {
+        ...attempt,
+        stage_id: "implementation",
+        request_hash: "d".repeat(64),
+        native_context_policy: "resume_required",
+        reentry_ordinal: 2,
+      },
+      stages: stages.map((stage) => stage.stage_id === "implementation"
+        ? { ...stage, status: "running", reentry_count: 2 }
+        : stage),
+      event: {
+        ...event(instance, attempt, "success", "repair-forward"),
+        attemptId: attempt.id,
+        requestHash: "d".repeat(64),
+      },
+    });
+
+    expect(repairedImplementation.nextStageId).toBe("semantic_review");
+    expect(repairedImplementation.nextAttempt).toMatchObject({
+      stageId: "semantic_review",
+      reentryOrdinal: 0,
+    });
+    expect(repairedImplementation.terminalOutcome).toBeUndefined();
+  });
+
   it("persists a complete immutable request for a repair attempt", () => {
     const { pipelines, instance, attempt } = setup("ce/implement@2");
     const input = event(instance, attempt, "semantic_repair_required", "repair-request");

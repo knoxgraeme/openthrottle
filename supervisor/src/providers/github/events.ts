@@ -163,6 +163,15 @@ function looksLikeSupervisorSummary(body: string | undefined): boolean {
   return body?.startsWith(SUMMARY_MARKER_PREFIX) === true;
 }
 
+function isGithubBotLinkback(author: string, body: string | undefined): boolean {
+  const normalizedAuthor = author.toLowerCase();
+  if (normalizedAuthor === "linear-code[bot]" || normalizedAuthor === "linear[bot]") return true;
+  if (!normalizedAuthor.endsWith("[bot]")) return false;
+  const normalizedBody = (body ?? "").toLowerCase();
+  return normalizedBody.includes("linear") &&
+    (normalizedBody.includes("linked") || normalizedBody.includes("mentioned") || normalizedBody.includes("issue"));
+}
+
 function boundedSanitized(value: string, maxChars: number): string {
   return sanitizeText(value).slice(0, maxChars);
 }
@@ -364,6 +373,7 @@ export async function handleGithubEvent(
     // where this webhook races the receipt acknowledgement.
     if (pipelines.isSupervisorGithubComment(String(event.comment.id))) return;
     if (looksLikeSupervisorSummary(event.comment.body)) return;
+    if (isGithubBotLinkback(author, event.comment.body)) return;
     await activityPublisher.publishActivity({
       sessionId: ticket.linear_session_id,
       type: "action",

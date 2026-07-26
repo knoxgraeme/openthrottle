@@ -1056,6 +1056,42 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
+  it("ignores Linear bot PR linkback comments instead of starting phantom repair feedback", async () => {
+    const fixture = setup("ce/implement@2");
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    moveFixtureToProviderWait(fixture);
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "issue_comment",
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
+        comment: {
+          id: 406,
+          body: "Linked Linear issue OPE-19 to this pull request.",
+          html_url: "https://github.com/owner/repo/pull/1#issuecomment-406",
+          user: { login: "linear-code[bot]" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    expect(activityPublisher.publishActivity).not.toHaveBeenCalled();
+    expect(fixture.db.prepare("SELECT COUNT(*) FROM provider_events").pluck().get()).toBe(0);
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "provider",
+      reentry_ordinal: 0,
+    });
+  });
+
   it("accepts GitHub review feedback from the live provider-wait instance even when the ticket projection says error", async () => {
     const fixture = setup("ce/implement@2");
     const activityPublisher = {
