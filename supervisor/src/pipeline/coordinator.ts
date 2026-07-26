@@ -18,7 +18,7 @@ import type {
   PipelineStore,
 } from "./store.js";
 import { buildStageRequest, plannedStageRunId } from "./stage-request.js";
-import { buildStagePublication } from "./publication.js";
+import { accumulatedPublicationFindings, buildStagePublication } from "./publication.js";
 
 export interface PipelineEventArtifact {
   id?: string;
@@ -591,6 +591,17 @@ export function coordinatePipelineEvent(
     : target?.evaluator.kind === "human" && write.nextStatus === "completion_pending_publication"
       ? "waiting_human"
       : null;
+  // Findings and dispositions accumulate across the run. The single mutable
+  // GitHub summary receipt always holds the latest full publication envelope
+  // for this instance, so it is the deterministic prior-state source; the
+  // per-attempt Linear ledger receipts are the fallback when it is absent.
+  const receipts = store.listPublications(instance.id);
+  const summaryPayloads = receipts
+    .filter((receipt) => receipt.kind === "github_summary")
+    .map((receipt) => receipt.payload);
+  const priorFindings = accumulatedPublicationFindings(
+    summaryPayloads.length > 0 ? summaryPayloads : receipts.map((receipt) => receipt.payload)
+  );
   const publication = canonicalJson(buildStagePublication({
     instance,
     attempt,
@@ -598,6 +609,7 @@ export function coordinatePipelineEvent(
     write,
     gateReceipt,
     resumeStatus,
+    priorFindings,
   }));
   const linear = write.effects.find((effect) => effect.kind === "publish_linear");
   if (linear) linear.payload = publication;

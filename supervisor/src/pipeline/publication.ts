@@ -105,9 +105,14 @@ interface PublicationFinding {
   severity: "P0" | "P1" | "P2" | "P3";
   code: string;
   summary: string;
+  /** The latest run-level disposition, persisted so later publications keep it. */
+  disposition?: FindingDisposition;
 }
 
 type FindingDisposition = "fixed in-stage" | "carried to repair" | "remaining/accepted";
+
+const FINDING_DISPOSITIONS: readonly FindingDisposition[] =
+  ["fixed in-stage", "carried to repair", "remaining/accepted"];
 
 const OMITTED_EVIDENCE_KEY = /(?:reasoning|chain[_-]?of[_-]?thought|thoughts?|analysis|prompt|token|secret|password|auth)/i;
 
@@ -423,27 +428,130 @@ function actionAddressesFinding(action: string, finding: PublicationFinding): bo
     (normalizedSummary.length > 0 && normalizedAction.includes(normalizedSummary));
 }
 
+interface FindingDispositionContext {
+  outcome: StageOutcome | PipelineOutcome | "selected";
+  template: PipelinePublicationTemplate;
+}
+
 function dispositionForFinding(
   finding: PublicationFinding,
-  actions: string[],
-  envelope: PipelinePublicationBodyInput
+  actions: readonly string[],
+  context: FindingDispositionContext
 ): FindingDisposition {
   if (actions.some((action) => actionAddressesFinding(action, finding))) return "fixed in-stage";
-  if (envelope.decision.outcome === "semantic_repair_required" && envelope.template.name === "repair_reentry") {
+  if (context.outcome === "semantic_repair_required" && context.template === "repair_reentry") {
     return "carried to repair";
   }
   return "remaining/accepted";
 }
 
+function findingIdentity(finding: PublicationFinding): string {
+  return `${finding.severity}|${finding.code}|${finding.summary}`;
+}
+
+function dedupeFindings(findings: readonly PublicationFinding[]): PublicationFinding[] {
+  const unique = new Map<string, PublicationFinding>();
+  for (const finding of findings) {
+    const identity = findingIdentity(finding);
+    if (!unique.has(identity)) unique.set(identity, finding);
+  }
+  return [...unique.values()];
+}
+
+/**
+ * Accumulates the run's finding state: prior findings keep their persisted
+ * disposition unless this stage's recorded actions resolve them, and findings
+ * re-emitted by the current stage take a freshly computed disposition.
+ */
+function mergeRunFindings(
+  prior: readonly PublicationFinding[],
+  current: readonly PublicationFinding[],
+  actions: readonly string[],
+  context: FindingDispositionContext
+): PublicationFinding[] {
+  const merged = new Map<string, PublicationFinding>();
+  for (const finding of dedupeFindings(prior)) {
+    const resolved = finding.disposition !== "fixed in-stage" &&
+      actions.some((action) => actionAddressesFinding(action, finding));
+    merged.set(findingIdentity(finding), resolved
+      ? { ...finding, disposition: "fixed in-stage" }
+      : finding);
+  }
+  for (const finding of dedupeFindings(current)) {
+    merged.set(findingIdentity(finding), {
+      ...finding,
+      disposition: dispositionForFinding(finding, actions, context),
+    });
+  }
+  return [...merged.values()].slice(0, 50);
+}
+
+function storedFindingDisposition(value: unknown): FindingDisposition | undefined {
+  return FINDING_DISPOSITIONS.find((disposition) => disposition === value);
+}
+
+/**
+ * Reads a finding from a persisted publication envelope. The values were
+ * bounded and markdown-escaped when the envelope was built, so this only
+ * re-sanitizes without re-escaping (which would corrupt prior escapes and
+ * break finding identity across stages).
+ */
+function safeStoredFinding(value: unknown): PublicationFinding | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const finding = value as Record<string, unknown>;
+  if (!["P0", "P1", "P2", "P3"].includes(String(finding.severity)) ||
+      typeof finding.code !== "string" || typeof finding.summary !== "string") {
+    return null;
+  }
+  const disposition = storedFindingDisposition(finding.disposition);
+  return {
+    severity: finding.severity as PublicationFinding["severity"],
+    code: boundedSanitized(finding.code, 160).replace(/[\r\n\t]+/g, " ").trim(),
+    summary: boundedSanitized(finding.summary, 600).replace(/[\r\n\t]+/g, " ").trim(),
+    ...(disposition ? { disposition } : {}),
+  };
+}
+
+/**
+ * Extracts the accumulated finding state from persisted publication payloads,
+ * later payloads overriding earlier dispositions for the same finding.
+ */
+export function accumulatedPublicationFindings(payloads: readonly string[]): PublicationFinding[] {
+  const merged = new Map<string, PublicationFinding>();
+  for (const payload of payloads) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object") continue;
+    const envelope = parsed as { schema?: unknown; evidence?: { findings?: unknown } };
+    if (envelope.schema !== PIPELINE_PUBLICATION_SCHEMA ||
+        !Array.isArray(envelope.evidence?.findings)) {
+      continue;
+    }
+    for (const value of envelope.evidence.findings.slice(0, 50)) {
+      const finding = safeStoredFinding(value);
+      if (finding) merged.set(findingIdentity(finding), finding);
+    }
+  }
+  return [...merged.values()].slice(0, 50);
+}
+
 function findingsSectionLines(envelope: PipelinePublicationBodyInput): string[] {
-  const findings = envelope.evidence.findings ?? [];
+  const findings = dedupeFindings(envelope.evidence.findings ?? []);
   if (findings.length === 0) return [];
   const actions = envelope.evidence.actions ?? [];
+  const context: FindingDispositionContext = {
+    outcome: envelope.decision.outcome,
+    template: envelope.template.name,
+  };
   const visible = findings.slice(0, MAX_RENDERED_FINDINGS);
   const lines = [
     "### Findings",
     ...visible.map((finding) => {
-      const disposition = dispositionForFinding(finding, actions, envelope);
+      const disposition = finding.disposition ?? dispositionForFinding(finding, actions, context);
       return `[${finding.severity}] ${finding.code} — ${finding.summary} → ${disposition}`;
     }),
   ];
@@ -582,6 +690,8 @@ export function buildStagePublication(input: {
   write: CoordinatorTransitionWrite;
   gateReceipt?: CoordinatorGateReceiptWrite;
   resumeStatus?: PipelineInstanceStatus | null;
+  /** Findings accumulated from the run's earlier publications. */
+  priorFindings?: readonly PublicationFinding[];
 }): PipelinePublicationEnvelope {
   const resumeStatus = input.resumeStatus ?? null;
   const evidence = (input.event.artifacts ?? []).map((artifact) => safeEvidence(artifact.payload));
@@ -596,9 +706,18 @@ export function buildStagePublication(input: {
   if (artifactBytes > ATTACHMENT_LIMIT_BYTES) throw new Error("publication evidence exceeds the private attachment limit");
   const subject = input.gateReceipt?.subject ?? input.event.subject ?? input.instance.immutable_subject;
   const assurance = input.event.artifacts?.[0]?.assurance ?? "coordinator_verified";
+  const template = chooseTemplate(input.write, resumeStatus);
+  const outcome = input.write.terminalOutcome ?? input.write.outcome;
+  const actions = evidence.flatMap((item) => item.actions).slice(0, 50);
+  const findings = mergeRunFindings(
+    input.priorFindings ?? [],
+    evidence.flatMap((item) => item.findings),
+    actions,
+    { outcome, template }
+  );
   const partial: PipelinePublicationBodyInput = {
     schema: PIPELINE_PUBLICATION_SCHEMA,
-    template: { name: chooseTemplate(input.write, resumeStatus), version: PIPELINE_PUBLICATION_TEMPLATE_VERSION },
+    template: { name: template, version: PIPELINE_PUBLICATION_TEMPLATE_VERSION },
     pipeline: {
       instance_id: input.instance.id,
       linear_issue_id: input.instance.linear_issue_id,
@@ -615,7 +734,7 @@ export function buildStagePublication(input: {
       context_policy: input.attempt.native_context_policy,
     },
     decision: {
-      outcome: input.write.terminalOutcome ?? input.write.outcome,
+      outcome,
       gate_result: input.gateReceipt?.result ?? "not_evaluated" as const,
       assurance,
       policy_digest: input.gateReceipt?.policyDigest ?? null,
@@ -627,8 +746,8 @@ export function buildStagePublication(input: {
       artifact_hashes: (input.event.artifacts ?? []).map((artifact) => artifact.hash).sort(),
       summaries: evidence.flatMap((item) => item.summary ? [item.summary] : []).slice(0, 20),
       details: evidence.flatMap((item) => item.evidence).slice(0, 50),
-      findings: evidence.flatMap((item) => item.findings).slice(0, 50),
-      actions: evidence.flatMap((item) => item.actions).slice(0, 50),
+      findings,
+      actions,
       uncertainty: evidence.flatMap((item) => item.uncertainty).slice(0, 20),
     },
     links: githubLinks(input.instance, subject ?? null),
