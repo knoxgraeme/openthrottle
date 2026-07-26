@@ -19,7 +19,10 @@ const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yam
 
 describe("pipeline effect processor", () => {
   let db: Database.Database | undefined;
-  afterEach(() => db?.close());
+  afterEach(() => {
+    db?.close();
+    vi.restoreAllMocks();
+  });
 
   function harness(issueId: string, sessionId: string) {
     db = openDb(":memory:");
@@ -646,20 +649,41 @@ describe("pipeline effect processor", () => {
   });
 
   it("retries a capacity-exhausted provision on a patient fixed interval", async () => {
-    const { pipelines, runtime, processor, instance } = harness("issue-capacity", "session-capacity");
+    const { tickets, pipelines, runtime, processor, instance } = harness("issue-capacity", "session-capacity");
     runtime.provision.mockRejectedValue(new Error("Total memory limit exceeded"));
+    const provision = pipelines.listEffects(instance.id).find((effect) => effect.kind === "provision")!;
+    const makeRetryEligible = () => {
+      db!.prepare("UPDATE pipeline_effect_intents SET next_attempt_at = ? WHERE id = ?")
+        .run("2099-07-22T12:00:00.000Z", provision.id);
+    };
 
     await processor.drain();
+    for (let retry = 0; retry < 2; retry += 1) {
+      makeRetryEligible();
+      await processor.drain();
+    }
 
-    expect(runtime.provision).toHaveBeenCalledTimes(1);
+    expect(runtime.provision).toHaveBeenCalledTimes(3);
     expect(pipelines.listEffects(instance.id).find((effect) => effect.kind === "provision"))
       .toMatchObject({
         status: "failed",
-        attempts: 1,
+        attempts: 3,
         next_attempt_at: "2099-07-22T12:05:00.000Z",
         last_error: expect.stringContaining("Total memory limit exceeded"),
       });
     expect(pipelines.getInstance(instance.id)).toMatchObject({ terminal_outcome: null });
+    const activities = tickets.listLinearOutbox().filter((row) => row.id === `capacity-wait:${provision.id}`);
+    expect(activities).toHaveLength(1);
+    expect(activities[0]).toMatchObject({
+      kind: "activity",
+      linear_session_id: "session-capacity",
+      linear_issue_id: "issue-capacity",
+    });
+    const payload = JSON.parse(activities[0]!.payload) as { type: string; activity: { type: string; body: string } };
+    expect(payload).toMatchObject({ type: "activity", activity: { type: "response" } });
+    expect(payload.activity.body).toContain("waiting on sandbox capacity");
+    expect(payload.activity.body).toContain("Total memory limit exceeded");
+    expect(payload.activity.body).toContain("retry automatically");
   });
 
   it("classifies an HTTP-403-wrapped quota error as capacity, not auth", async () => {
@@ -674,12 +698,39 @@ describe("pipeline effect processor", () => {
         status: "failed",
         attempts: 1,
         next_attempt_at: "2099-07-22T12:05:00.000Z",
-      });
+    });
     expect(pipelines.getInstance(instance.id)).toMatchObject({ terminal_outcome: null });
   });
 
+  it("keeps the capacity retry when the wait activity cannot be enqueued", async () => {
+    const { tickets, pipelines, runtime, processor, instance } =
+      harness("issue-capacity-activity-fail", "session-capacity-activity-fail");
+    runtime.provision.mockRejectedValue(new Error("Total memory limit exceeded"));
+    const enqueueLinearOutbox = tickets.enqueueLinearOutbox.bind(tickets);
+    vi.spyOn(tickets, "enqueueLinearOutbox").mockImplementation((params) => {
+      if (params.id?.startsWith("capacity-wait:")) throw new Error("outbox unavailable");
+      return enqueueLinearOutbox(params);
+    });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await processor.drain();
+
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.kind === "provision"))
+      .toMatchObject({
+        status: "failed",
+        attempts: 1,
+        next_attempt_at: "2099-07-22T12:05:00.000Z",
+        last_error: expect.stringContaining("Total memory limit exceeded"),
+      });
+    expect(tickets.listLinearOutbox().filter((row) => row.id.startsWith("capacity-wait:"))).toEqual([]);
+    expect(consoleError).toHaveBeenCalledWith(
+      "[pipeline-effects] failed to enqueue capacity wait activity:",
+      expect.stringContaining("outbox unavailable")
+    );
+  });
+
   it("keeps exponential backoff for transient provision failures", async () => {
-    const { pipelines, runtime, processor, instance } = harness("issue-transient", "session-transient");
+    const { tickets, pipelines, runtime, processor, instance } = harness("issue-transient", "session-transient");
     runtime.provision.mockRejectedValue(new Error("connect ETIMEDOUT 10.20.30.40:8443"));
 
     await processor.drain();
@@ -691,6 +742,7 @@ describe("pipeline effect processor", () => {
         next_attempt_at: "2099-07-22T12:00:05.000Z",
         last_error: expect.stringContaining("ETIMEDOUT"),
       });
+    expect(tickets.listLinearOutbox().filter((row) => row.id.startsWith("capacity-wait:"))).toEqual([]);
   });
 
   it("preserves the stopped workspace on a needs_human terminal", async () => {

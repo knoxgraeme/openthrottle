@@ -14,8 +14,11 @@ import {
 } from "./manifest.js";
 import { coordinatePipelineEvent, type PipelineCoordinatorEvent } from "./coordinator.js";
 import {
+  buildLifecyclePublication,
+  buildSelectionPublication,
   buildStagePublication,
   parsePipelinePublication,
+  PIPELINE_PUBLICATION_TEMPLATE_VERSION,
 } from "./publication.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import type {
@@ -164,6 +167,35 @@ describe("pipeline publication", () => {
     return processor;
   }
 
+  function nextAttemptStub(stageId: string, reentryOrdinal: number) {
+    return {
+      stageId,
+      attemptOrdinal: 2,
+      reentryOrdinal,
+      requestHash: "f".repeat(64),
+      idempotencyKey: `dispatch:${stageId}:${reentryOrdinal}`,
+      contextRevision: 1,
+      contextPolicy: "fresh",
+      plannedRunId: "run-next",
+      expectedSubject: null,
+      nativeSessionId: null,
+      requestPayload: "{}",
+    };
+  }
+
+  function expectReceiptShape(body: string, stageLine: string, turnLine: RegExp | string) {
+    expect(body).toContain(stageLine);
+    expect(body).not.toContain("coordinator_pinned");
+    expect(body).not.toContain("not_evaluated");
+    expect(body).not.toContain("semantic_attested");
+    expect(body).not.toContain("Residual uncertainty: None declared");
+    expect((body.match(/^Stage \d+ of \d+:/gm) ?? [])).toHaveLength(1);
+    expect((body.match(/^(Working —|Waiting on you:|Waiting on GitHub:|This run is finished:)/gm) ?? []))
+      .toHaveLength(1);
+    if (typeof turnLine === "string") expect(body).toContain(turnLine);
+    else expect(body).toMatch(turnLine);
+  }
+
   it("uses a closed supervisor template with required evidence fields and no reasoning or secrets", () => {
     const { instance, attempt } = setup();
     const input = event(
@@ -194,15 +226,232 @@ describe("pipeline publication", () => {
     });
     const canonical = canonicalJson(publication);
     expect(parsePipelinePublication(canonical)).toEqual(publication);
-    expect(publication.body).toContain("fixture/command@1");
-    expect(publication.body).toContain(`Stage: \`${attempt.stage_id}\``);
-    expect(publication.body).toContain("Assurance: `executor_verified`");
-    expect(publication.body).toContain(`Policy: \`${"d".repeat(64)}\``);
-    expect(publication.body).toContain("Result: `passed` → `shipped`");
+    expectReceiptShape(
+      publication.body,
+      "Stage 1 of 1: command — the job shipped.",
+      /^This run is finished: The job shipped\./m
+    );
     expect(publication.body).toContain("exit code and tree subject were executor verified");
     expect(canonical).not.toContain("ghp_");
     expect(canonical).not.toContain("private model reasoning");
     expect(publication.body).not.toContain("\n- Result: forged");
+  });
+
+  it("keeps persisted v1 publication envelopes parseable after the template bump", () => {
+    const { instance } = setup();
+    const publication = buildSelectionPublication(instance);
+    expect(publication.template.version).toBe(PIPELINE_PUBLICATION_TEMPLATE_VERSION);
+    const persistedV1 = {
+      ...publication,
+      template: { ...publication.template, version: 1 },
+    };
+
+    expect(parsePipelinePublication(canonicalJson(persistedV1))).toEqual(persistedV1);
+  });
+
+  it("renders every pipeline receipt template as plain progress and turn sentences", () => {
+    const { instance, attempt } = setup("fixture/agent@1");
+    const input = event(instance, attempt);
+    const baseWrite = {
+      instanceId: instance.id,
+      eventId: input.event.id,
+      eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+      expectedVersion: instance.state_version,
+      expectedStatus: instance.status,
+      attemptId: attempt.id,
+      resultHash: input.event.resultHash,
+      effects: [],
+    };
+
+    const selection = buildSelectionPublication(instance);
+    expectReceiptShape(
+      selection.body,
+      "Stage 0 of 3: selection — the supervisor selected the pinned pipeline for this ticket.",
+      "Working — next receipt expected from the fresh stage."
+    );
+
+    const gate = buildStagePublication({
+      instance,
+      attempt,
+      event: input.event,
+      write: {
+        ...baseWrite,
+        outcome: "success" as const,
+        nextStatus: "dispatchable" as const,
+      },
+      gateReceipt: input.receipt,
+    });
+    expectReceiptShape(
+      gate.body,
+      "Stage 1 of 3: fresh — the stage completed successfully.",
+      "Working — next receipt expected from the resume stage."
+    );
+
+    const repair = buildStagePublication({
+      instance,
+      attempt,
+      event: { ...input.event, outcome: "semantic_repair_required" },
+      write: {
+        ...baseWrite,
+        outcome: "semantic_repair_required" as const,
+        nextStatus: "dispatchable" as const,
+        reentryIncrement: 1,
+        nextAttempt: nextAttemptStub("fresh", 1),
+      },
+      gateReceipt: input.receipt,
+    });
+    expect(repair.body).toContain("scheduled repair round 1 of 1 at the fresh stage");
+    expectReceiptShape(
+      repair.body,
+      "Stage 1 of 3: fresh — the stage completed and asked for a repair pass.",
+      "Working — next receipt expected from the fresh stage."
+    );
+
+    // A backward repair edge (review -> resume) at the final allowed round:
+    // the round comes from the scheduled target attempt's re-entry ordinal and
+    // the bound from the pinned transition's max_reentries, so the numerator
+    // never exceeds the denominator.
+    const finalRepair = buildStagePublication({
+      instance,
+      attempt: { ...attempt, stage_id: "review" },
+      event: { ...input.event, outcome: "semantic_repair_required" },
+      write: {
+        ...baseWrite,
+        outcome: "semantic_repair_required" as const,
+        nextStatus: "dispatchable" as const,
+        reentryIncrement: 1,
+        nextAttempt: nextAttemptStub("resume", 2),
+      },
+      gateReceipt: input.receipt,
+    });
+    expect(finalRepair.body).toContain("scheduled repair round 2 of 2 at the resume stage");
+    for (const [, round, bound] of finalRepair.body.matchAll(/repair round (\d+) of (\d+)/g)) {
+      expect(Number(round)).toBeLessThanOrEqual(Number(bound));
+    }
+    expectReceiptShape(
+      finalRepair.body,
+      "Stage 3 of 3: review — the stage completed and asked for a repair pass.",
+      "Working — next receipt expected from the resume stage."
+    );
+
+    // An infrastructure self-retry is not a semantic repair pass and must not
+    // be described as one.
+    const infraRetry = buildStagePublication({
+      instance,
+      attempt,
+      event: { ...input.event, outcome: "retryable_infrastructure_failure" },
+      write: {
+        ...baseWrite,
+        outcome: "retryable_infrastructure_failure" as const,
+        nextStatus: "dispatchable" as const,
+        reentryIncrement: 1,
+        nextAttempt: nextAttemptStub("fresh", 1),
+      },
+      gateReceipt: input.receipt,
+    });
+    expect(infraRetry.body)
+      .toContain("retrying the fresh stage after an infrastructure failure (attempt 1 of 1)");
+    expect(infraRetry.body).not.toMatch(/repair/i);
+    expectReceiptShape(
+      infraRetry.body,
+      "Stage 1 of 3: fresh — the stage could not complete because infrastructure failed.",
+      "Working — next receipt expected from the fresh stage."
+    );
+
+    const needsHuman = buildStagePublication({
+      instance,
+      attempt,
+      event: { ...input.event, outcome: "needs_human" },
+      write: {
+        ...baseWrite,
+        outcome: "needs_human" as const,
+        nextStatus: "waiting_human" as const,
+        terminalOutcome: "needs_human" as const,
+        waitReason: "Choose whether to continue in the Linear session.",
+      },
+      resumeStatus: "waiting_human",
+    });
+    expectReceiptShape(
+      needsHuman.body,
+      "Stage 1 of 3: fresh — the run needs a human decision before it can continue.",
+      "Waiting on you: Choose whether to continue in the Linear session."
+    );
+
+    const providerWait = buildStagePublication({
+      instance,
+      attempt,
+      event: input.event,
+      write: {
+        ...baseWrite,
+        outcome: "success" as const,
+        nextStatus: "waiting_provider" as const,
+        waitReason: "GitHub checks are still running",
+      },
+      gateReceipt: input.receipt,
+    });
+    expectReceiptShape(
+      providerWait.body,
+      "Stage 1 of 3: fresh — the stage completed successfully.",
+      "Waiting on GitHub: GitHub checks are still running."
+    );
+  });
+
+  it.each([
+    [
+      "shipped",
+      "The job shipped.",
+      "Stage 1 of 1: command — the job shipped.",
+      "This run is finished: The job shipped.",
+    ],
+    [
+      "no_change",
+      "The job finished because no code change was needed; no pull request was created.",
+      "Stage 1 of 1: command — the stage completed and reported that no change was needed.",
+      "This run is finished: The job finished because no code change was needed; no pull request was created.",
+    ],
+    [
+      "needs_human",
+      "The job needs a human decision before it can finish: Pick a deployment target. The workspace is preserved.",
+      "Stage 1 of 1: command — the run needs a human decision before it can continue.",
+      "Waiting on you: Pick a deployment target.",
+    ],
+    [
+      "failed",
+      "The job failed: Daytona could not provision the sandbox.",
+      "Stage 1 of 1: command — the run failed.",
+      "This run is finished: The job failed: Daytona could not provision the sandbox.",
+    ],
+    [
+      "canceled",
+      "The job was canceled before it could finish.",
+      "Stage 1 of 1: command — the run was canceled.",
+      "This run is finished: The job was canceled before it could finish.",
+    ],
+    [
+      "superseded",
+      "The job was superseded by a newer run.",
+      "Stage 1 of 1: command — the run was replaced by a newer session.",
+      "This run is finished: The job was superseded by a newer run.",
+    ],
+  ] as const)("renders the %s terminal job outcome honestly", (outcome, sentence, stageLine, turnLine) => {
+    const { instance, attempt } = setup();
+    const publication = buildLifecyclePublication({
+      instance: {
+        ...instance,
+        status: outcome,
+        terminal_outcome: outcome,
+        immutable_subject: outcome === "shipped" ? SUBJECT : instance.immutable_subject,
+      },
+      attempt,
+      outcome,
+      reason: outcome === "needs_human"
+        ? "Pick a deployment target"
+        : outcome === "failed"
+          ? "Daytona could not provision the sandbox"
+          : sentence,
+    });
+    expectReceiptShape(publication.body, stageLine, turnLine);
+    expect(publication.body).toContain(sentence);
   });
 
   it("queues one permanent receipt through an outage and finalizes only after acknowledgement", async () => {

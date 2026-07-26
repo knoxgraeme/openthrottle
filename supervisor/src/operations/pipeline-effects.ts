@@ -389,6 +389,32 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     });
   };
 
+  const enqueueCapacityWaitActivity = (effect: PipelineEffectIntent, message: string): void => {
+    try {
+      const id = `capacity-wait:${effect.id}`;
+      const instance = deps.store.getInstance(effect.pipeline_instance_id);
+      if (!instance) return;
+      const holding = sanitizeText(message).replace(/[\r\n\t]+/g, " ").replace(/\s{2,}/g, " ").trim();
+      deps.tickets.enqueueLinearOutbox({
+        id,
+        linearSessionId: instance.linear_session_id,
+        issueId: instance.linear_issue_id,
+        kind: "activity",
+        payload: JSON.stringify({
+          type: "activity",
+          activity: {
+            sessionId: instance.linear_session_id,
+            type: "response",
+            body: `This run is waiting on sandbox capacity. Daytona is holding it because ${holding || "capacity is not available"}. OpenThrottle will retry automatically.`,
+          },
+        }),
+      });
+    } catch (activityError) {
+      console.error("[pipeline-effects] failed to enqueue capacity wait activity:",
+        sanitizeText(String(activityError)).slice(-500));
+    }
+  };
+
   const processClaimed = async (effect: PipelineEffectIntent): Promise<void> => {
     try {
       await handle(effect);
@@ -404,6 +430,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         : errorClass === "capacity"
           ? new Date(now().getTime() + CAPACITY_RETRY_MS).toISOString()
           : new Date(now().getTime() + RETRY_BASE_MS * 2 ** Math.min(effect.attempts - 1, 6)).toISOString();
+      if (!exhausted && errorClass === "capacity") enqueueCapacityWaitActivity(effect, message);
       if (exhausted && (effect.kind === "provision" || effect.kind === "dispatch_stage")) {
         const instance = deps.store.getInstance(effect.pipeline_instance_id);
         const attempt = instance ? deps.store.getActiveAttempt(instance.id) : undefined;

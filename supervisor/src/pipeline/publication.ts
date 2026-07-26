@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import {
   canonicalJson,
   digestNormalized,
+  type PipelineManifest,
   type PipelineOutcome,
   type StageOutcome,
 } from "./manifest.js";
@@ -16,7 +17,11 @@ import type { PipelineCoordinatorEvent } from "./coordinator.js";
 import { sanitizeText } from "../shared/sanitize.js";
 
 export const PIPELINE_PUBLICATION_SCHEMA = "openthrottle.pipeline-publication/v1";
-export const PIPELINE_PUBLICATION_TEMPLATE_VERSION = 1;
+export const PIPELINE_PUBLICATION_TEMPLATE_VERSION = 2;
+const SUPPORTED_PIPELINE_PUBLICATION_TEMPLATE_VERSIONS = new Set<number>([
+  1,
+  PIPELINE_PUBLICATION_TEMPLATE_VERSION,
+]);
 const INLINE_ARTIFACT_LIMIT_BYTES = 4 * 1024;
 const PUBLICATION_BODY_LIMIT = 12_000;
 const ATTACHMENT_LIMIT_BYTES = 256 * 1024;
@@ -154,37 +159,191 @@ function chooseTemplate(
   return "gate";
 }
 
-function renderBody(envelope: PipelinePublicationBodyInput): string {
-  const stage = envelope.stage;
+interface RenderContext {
+  manifest: PipelineManifest;
+  stageIndex: number;
+  transition: PipelineManifest["stages"][number]["transitions"][StageOutcome] | undefined;
+}
+
+interface RenderExtras {
+  scheduledReentryOrdinal?: number;
+}
+
+function renderContext(envelope: PipelinePublicationBodyInput, normalizedManifest: string): RenderContext {
+  const manifest = JSON.parse(normalizedManifest) as PipelineManifest;
+  const stageIndex = envelope.stage
+    ? manifest.stages.findIndex((stage) => stage.id === envelope.stage?.id)
+    : -1;
+  const stage = stageIndex >= 0 ? manifest.stages[stageIndex] : undefined;
+  return {
+    manifest,
+    stageIndex,
+    transition: stage?.transitions[envelope.decision.outcome as StageOutcome],
+  };
+}
+
+function stagePosition(envelope: PipelinePublicationBodyInput, context: RenderContext): {
+  ordinal: number;
+  total: number;
+  stage: string;
+} {
+  const manifest = context.manifest;
+  if (!envelope.stage) {
+    return { ordinal: 0, total: manifest.stages.length, stage: envelope.template.name.replaceAll("_", " ") };
+  }
+  return {
+    ordinal: context.stageIndex >= 0 ? context.stageIndex + 1 : envelope.stage.attempt_ordinal,
+    total: manifest.stages.length,
+    stage: envelope.stage.id,
+  };
+}
+
+function nextStageName(envelope: PipelinePublicationBodyInput, context: RenderContext): string {
+  if (context.transition?.to) return context.transition.to;
+  if (envelope.stage) return envelope.stage.id;
+  return context.manifest.entry_stage;
+}
+
+function reentryRound(
+  envelope: PipelinePublicationBodyInput,
+  context: RenderContext,
+  extras?: RenderExtras
+): string {
+  // The scheduled target attempt's re-entry ordinal is the round number; the
+  // pinned transition's max_reentries is already the number of permitted
+  // rounds, so the final allowed round renders as k of k.
+  const round = extras?.scheduledReentryOrdinal ?? (envelope.stage?.reentry_ordinal ?? 0) + 1;
+  const max = context.transition?.max_reentries;
+  return max === undefined ? `${round}` : `${round} of ${max}`;
+}
+
+function reentrySentence(
+  envelope: PipelinePublicationBodyInput,
+  context: RenderContext,
+  extras?: RenderExtras
+): string {
+  const round = reentryRound(envelope, context, extras);
+  const target = nextStageName(envelope, context);
+  return envelope.decision.outcome === "retryable_infrastructure_failure"
+    ? `The supervisor is retrying the ${target} stage after an infrastructure failure (attempt ${round}).`
+    : `The supervisor accepted the stage result and scheduled repair round ${round} at the ${target} stage.`;
+}
+
+function sentenceForOutcome(outcome: StageOutcome | PipelineOutcome | "selected"): string {
+  switch (outcome) {
+    case "selected":
+      return "the supervisor selected the pinned pipeline for this ticket.";
+    case "success":
+      return "the stage completed successfully.";
+    case "no_change":
+      return "the stage completed and reported that no change was needed.";
+    case "semantic_repair_required":
+      return "the stage completed and asked for a repair pass.";
+    case "retryable_infrastructure_failure":
+      return "the stage could not complete because infrastructure failed.";
+    case "needs_human":
+      return "the run needs a human decision before it can continue.";
+    case "canceled":
+      return "the run was canceled.";
+    case "superseded":
+      return "the run was replaced by a newer session.";
+    case "failure":
+    case "failed":
+      return "the run failed.";
+    case "shipped":
+      return "the job shipped.";
+  }
+}
+
+function eventSentence(
+  envelope: PipelinePublicationBodyInput,
+  context: RenderContext,
+  extras?: RenderExtras
+): string {
+  switch (envelope.template.name) {
+    case "selection":
+      return "OpenThrottle selected the pinned pipeline and recorded the starting receipt.";
+    case "gate":
+      return envelope.decision.gate_result === "passed"
+        ? "The supervisor accepted the stage result and verified the required fences."
+        : `The supervisor recorded the stage result: ${sentenceForOutcome(envelope.decision.outcome)}`;
+    case "repair_reentry":
+      return reentrySentence(envelope, context, extras);
+    case "needs_human":
+      return terminalSentence(envelope);
+    case "provider_wait":
+      return "The run is waiting for GitHub provider evidence.";
+    case "terminal":
+      return terminalSentence(envelope);
+  }
+}
+
+function terminalSentence(envelope: PipelinePublicationBodyInput): string {
+  const reason = envelope.decision.wait_reason
+    ? boundedPublicationLine(envelope.decision.wait_reason, 1_000)
+    : null;
+  const providerLink = envelope.links[0]
+    ? ` Provider link: [${boundedPublicationLine(envelope.links[0].label, 100)}](${envelope.links[0].url}).`
+    : "";
+  switch (envelope.decision.outcome) {
+    case "shipped":
+      return `The job shipped.${providerLink}`;
+    case "no_change":
+      return "The job finished because no code change was needed; no pull request was created.";
+    case "needs_human":
+      return `The job needs a human decision before it can finish${reason ? `: ${reason}` : ""}. The workspace is preserved.`;
+    case "failed":
+    case "failure":
+      return `The job failed${reason ? `: ${reason}.` : "."}`;
+    case "canceled":
+      return "The job was canceled before it could finish.";
+    case "superseded":
+      return "The job was superseded by a newer run.";
+    default:
+      return sentenceForOutcome(envelope.decision.outcome);
+  }
+}
+
+function progressLine(envelope: PipelinePublicationBodyInput, context: RenderContext): string {
+  const position = stagePosition(envelope, context);
+  return `Stage ${position.ordinal} of ${position.total}: ${position.stage} — ${sentenceForOutcome(envelope.decision.outcome)}`;
+}
+
+function whoseMoveLine(envelope: PipelinePublicationBodyInput, context: RenderContext): string {
+  const waitReason = envelope.decision.wait_reason
+    ? boundedPublicationLine(envelope.decision.wait_reason, 1_000)
+    : "the published receipt in this Linear session";
+  if (envelope.decision.next_status === "waiting_human" || envelope.template.name === "needs_human") {
+    return `Waiting on you: ${waitReason}.`;
+  }
+  if (envelope.decision.next_status === "waiting_provider" || envelope.template.name === "provider_wait") {
+    return `Waiting on GitHub: ${waitReason}.`;
+  }
+  if (envelope.template.name === "terminal" ||
+      envelope.decision.next_status === envelope.decision.outcome &&
+      ["shipped", "no_change", "needs_human", "failed", "canceled", "superseded"].includes(envelope.decision.next_status)) {
+    return `This run is finished: ${terminalSentence(envelope)}`;
+  }
+  return `Working — next receipt expected from the ${nextStageName(envelope, context)} stage.`;
+}
+
+function renderBody(
+  envelope: PipelinePublicationBodyInput,
+  normalizedManifest: string,
+  extras?: RenderExtras
+): string {
+  const context = renderContext(envelope, normalizedManifest);
   const lines = [
-    `### OpenThrottle pipeline ${envelope.template.name.replaceAll("_", " ")}`,
-    "",
-    `- Pipeline: \`${envelope.pipeline.id}@${envelope.pipeline.version}\``,
-    `- Instance: \`${envelope.pipeline.instance_id}\` (generation ${envelope.pipeline.generation})`,
-    ...(stage ? [
-      `- Stage: \`${stage.id}\``,
-      `- Attempt: ${stage.attempt_ordinal} (re-entry ${stage.reentry_ordinal})`,
-      `- Context policy: \`${stage.context_policy}\``,
-    ] : []),
-    `- Subject: ${envelope.decision.subject ? `\`${envelope.decision.subject}\`` : "not established"}`,
-    `- Assurance: \`${envelope.decision.assurance}\``,
-    `- Policy: ${envelope.decision.policy_digest ? `\`${envelope.decision.policy_digest}\`` : "not evaluated"}`,
-    `- Result: \`${envelope.decision.gate_result}\` → \`${envelope.decision.outcome}\``,
-    `- Coordinator state: \`${envelope.decision.next_status}\``,
+    eventSentence(envelope, context, extras),
+    progressLine(envelope, context),
   ];
-  if (envelope.decision.wait_reason) lines.push(`- Wait reason: ${envelope.decision.wait_reason}`);
-  lines.push("", "Evidence:");
-  if (envelope.evidence.summaries.length === 0) lines.push("- No human-authored summary was accepted; hashes are retained below.");
-  else envelope.evidence.summaries.forEach((summary) => lines.push(`- ${summary}`));
-  envelope.evidence.details.forEach((detail) => lines.push(`- ${detail}`));
-  envelope.evidence.artifact_hashes.forEach((hash) => lines.push(`- Artifact \`${hash}\``));
-  lines.push("", "Residual uncertainty:");
-  if (envelope.evidence.uncertainty.length === 0) lines.push("- None declared by the typed evidence.");
-  else envelope.evidence.uncertainty.forEach((item) => lines.push(`- ${item}`));
+  envelope.evidence.summaries.forEach((summary) => lines.push(summary));
+  envelope.evidence.details.forEach((detail) => lines.push(detail));
+  envelope.evidence.uncertainty.forEach((item) => lines.push(`Still uncertain: ${item}`));
   if (envelope.links.length > 0) {
-    lines.push("", "Provider evidence:");
     envelope.links.forEach((link) => lines.push(`- [${link.label}](${link.url})`));
   }
+  lines.push(whoseMoveLine(envelope, context));
   return boundedSanitized(lines.join("\n"), PUBLICATION_BODY_LIMIT);
 }
 
@@ -227,7 +386,7 @@ export function buildSelectionPublication(instance: PipelineInstance): PipelineP
     links: githubLinks(instance, null),
     resume_status: null,
   };
-  return { ...partial, body: renderBody(partial) };
+  return { ...partial, body: renderBody(partial, instance.normalized_manifest) };
 }
 
 export function buildLifecyclePublication(input: {
@@ -275,7 +434,7 @@ export function buildLifecyclePublication(input: {
     links: githubLinks(input.instance, input.instance.immutable_subject),
     resume_status: null,
   };
-  return { ...partial, body: renderBody(partial) };
+  return { ...partial, body: renderBody(partial, input.instance.normalized_manifest) };
 }
 
 export function buildStagePublication(input: {
@@ -335,7 +494,9 @@ export function buildStagePublication(input: {
     links: githubLinks(input.instance, subject ?? null),
     resume_status: resumeStatus,
   };
-  const body = renderBody(partial);
+  const body = renderBody(partial, input.instance.normalized_manifest, {
+    scheduledReentryOrdinal: input.write.nextAttempt?.reentryOrdinal,
+  });
   return artifactBytes <= INLINE_ARTIFACT_LIMIT_BYTES
     ? {
         ...partial,
@@ -356,7 +517,8 @@ export function buildStagePublication(input: {
 
 export function parsePipelinePublication(payload: string): PipelinePublicationEnvelope {
   const value = JSON.parse(payload) as PipelinePublicationEnvelope;
-  if (value.schema !== PIPELINE_PUBLICATION_SCHEMA || value.template?.version !== PIPELINE_PUBLICATION_TEMPLATE_VERSION) {
+  if (value.schema !== PIPELINE_PUBLICATION_SCHEMA ||
+      !SUPPORTED_PIPELINE_PUBLICATION_TEMPLATE_VERSIONS.has(value.template?.version)) {
     throw new Error("pipeline publication schema is unsupported");
   }
   if (!value.pipeline?.instance_id || !value.pipeline.linear_issue_id ||
