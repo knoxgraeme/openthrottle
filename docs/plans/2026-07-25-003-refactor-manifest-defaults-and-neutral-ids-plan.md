@@ -31,6 +31,7 @@ Two authoring problems, one PR. First, `ce-implement-v3.yaml` declares 64 transi
 - `supervisor/pipelines/core-implement-v1.yaml`, `supervisor/pipelines/core-investigate-v1.yaml` — new short-form manifests (content-equivalent to `ce-implement-v3.yaml` / `ce-investigate-v2.yaml` apart from id/version).
 - `supervisor/pipelines/catalog.yaml` — register `core/*`, move both aliases; `ce/*` entries retained.
 - Tests that enumerate the shipped catalog or aliases (`manifest.test.ts`, admission and store tests) — extend for the new entries and alias targets.
+- `docs/pipelines/` — regenerate with `npm run docs:pipelines --prefix supervisor` (renderer landed in PR #57): pages for `core/implement@1` and `core/investigate@1` must exist, and comparing the rendered graphs of each `core/*` manifest against its `ce/*` twin is the visual content-equivalence check the original proposal recommended. The retained `ce/*` pages stay.
 - `docs/SPEC.md` — R7.
 
 ## Approach
@@ -46,6 +47,7 @@ Two authoring problems, one PR. First, `ce-implement-v3.yaml` declares 64 transi
 - Negative: unknown outcome key in defaults; `defaults` transition to an unknown stage; `same_as` key present; a stage override winning over a default (positive assertion of precedence).
 - Alias resolution: `implement` → `core/implement@1`; a pinned historical instance carrying a `ce/implement@3` digest still resolves its manifest.
 - Full supervisor suite green with zero edits to coordinator/gates/store tests (R8).
+- `docs/pipelines/` regenerated and committed in the same PR; the `core/*` rendered graphs are topology-identical to their `ce/*` twins.
 
 ## Out of scope
 
