@@ -89,6 +89,84 @@ export async function agentActivityCreate(
   return data.agentActivityCreate;
 }
 
+export interface LinearComment {
+  id: string;
+  body?: string | null;
+  url?: string | null;
+  user?: {
+    id?: string | null;
+    app?: boolean | null;
+    isMe?: boolean | null;
+  } | null;
+}
+
+function isCurrentAppComment(comment: LinearComment): boolean {
+  return comment.user?.app === true && comment.user.isMe === true;
+}
+
+export async function findIssueCommentByMarker(
+  client: LinearClient,
+  issueId: string,
+  marker: string
+): Promise<LinearComment | undefined> {
+  type IssueCommentsResponse = {
+    issue?: {
+      comments?: {
+        nodes?: LinearComment[];
+        pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+      };
+    };
+  };
+  let after: string | null = null;
+  const seenCursors = new Set<string>();
+  while (true) {
+    const data: IssueCommentsResponse = await linearGraphQL<IssueCommentsResponse>(
+      client,
+      `query IssueComments($id: String!, $after: String) {
+        issue(id: $id) {
+          comments(first: 100, after: $after) {
+            nodes { id body url user { id app isMe } }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      }`,
+      { id: issueId, after }
+    );
+    const connection = data.issue?.comments;
+    const match = (connection?.nodes ?? []).find(
+      (comment) => comment.body?.includes(marker) && isCurrentAppComment(comment)
+    );
+    if (match) return match;
+    const endCursor = connection?.pageInfo?.endCursor ?? null;
+    if (!connection?.pageInfo?.hasNextPage || !endCursor || seenCursors.has(endCursor)) break;
+    seenCursors.add(endCursor);
+    after = endCursor;
+  }
+  return undefined;
+}
+
+export async function commentUpdate(
+  client: LinearClient,
+  params: { id: string; body: string }
+): Promise<{ success: boolean; comment?: { id: string; url?: string | null } }> {
+  const data = await linearGraphQL<{
+    commentUpdate: { success: boolean; comment?: { id: string; url?: string | null } };
+  }>(
+    client,
+    `mutation CommentUpdate($id: String!, $input: CommentUpdateInput!) {
+      commentUpdate(id: $id, input: $input) {
+        success
+        comment { id url }
+      }
+    }`,
+    { id: params.id, input: { body: params.body } }
+  );
+  if (!data.commentUpdate.success) {
+    throw new Error("Linear commentUpdate returned success: false");
+  }
+  return data.commentUpdate;
+}
+
 export async function linearFileUpload(
   client: LinearClient,
   params: { filename: string; contentType: string; content: string }
@@ -183,11 +261,14 @@ export async function agentSessionUpdate(
 export async function commentCreate(
   client: LinearClient,
   params: { issueId: string; body: string }
-): Promise<{ success: boolean }> {
-  const data = await linearGraphQL<{ commentCreate: { success: boolean } }>(
+): Promise<{ success: boolean; comment?: { id: string; url?: string | null } }> {
+  const data = await linearGraphQL<{ commentCreate: { success: boolean; comment?: { id: string; url?: string | null } } }>(
     client,
     `mutation CommentCreate($input: CommentCreateInput!) {
-      commentCreate(input: $input) { success }
+      commentCreate(input: $input) {
+        success
+        comment { id url }
+      }
     }`,
     { input: { issueId: params.issueId, body: params.body } }
   );

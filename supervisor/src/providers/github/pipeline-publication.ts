@@ -81,7 +81,7 @@ export function createGithubPublicationProcessor(params: {
       instance.repository,
       pull.number,
       instance.linear_issue_id,
-      renderGithubPipelineSummary(envelope)
+      renderGithubPipelineSummary(envelope, bound.target_url)
     );
     params.store.markGithubPublicationProcessed(
       publication.id,
