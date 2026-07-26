@@ -327,6 +327,10 @@ function whoseMoveLine(envelope: PipelinePublicationBodyInput, context: RenderCo
   return `Working — next receipt expected from the ${nextStageName(envelope, context)} stage.`;
 }
 
+function dedupeAdjacentLines(lines: string[]): string[] {
+  return lines.filter((line, index) => line === "" || line !== lines[index - 1]);
+}
+
 function renderBody(
   envelope: PipelinePublicationBodyInput,
   normalizedManifest: string,
@@ -344,7 +348,7 @@ function renderBody(
     envelope.links.forEach((link) => lines.push(`- [${link.label}](${link.url})`));
   }
   lines.push(whoseMoveLine(envelope, context));
-  return boundedSanitized(lines.join("\n"), PUBLICATION_BODY_LIMIT);
+  return boundedSanitized(dedupeAdjacentLines(lines).join("\n"), PUBLICATION_BODY_LIMIT);
 }
 
 export function deterministicPublicationId(idempotencyKey: string): string {

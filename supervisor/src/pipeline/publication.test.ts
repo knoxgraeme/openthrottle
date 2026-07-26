@@ -19,6 +19,7 @@ import {
   buildStagePublication,
   parsePipelinePublication,
   PIPELINE_PUBLICATION_TEMPLATE_VERSION,
+  renderGithubPipelineSummary,
 } from "./publication.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import type {
@@ -247,6 +248,50 @@ describe("pipeline publication", () => {
     };
 
     expect(parsePipelinePublication(canonicalJson(persistedV1))).toEqual(persistedV1);
+  });
+
+  it("deduplicates adjacent rendered evidence lines without changing recorded evidence", () => {
+    const { instance, attempt } = setup();
+    const input = event(instance, attempt, "Repeated evidence line.");
+    const repeatedPayload = canonicalJson({
+      summary: "Repeated evidence line.",
+      evidence: ["Repeated evidence line.", "Unique follow-up evidence."],
+      uncertainty: [],
+    });
+    input.event.artifacts = [{
+      kind: "stage_result",
+      schemaVersion: 1,
+      assurance: "executor_verified",
+      subject: SUBJECT,
+      payload: repeatedPayload,
+      hash: digestNormalized(repeatedPayload),
+    }];
+    input.event.resultHash = input.event.artifacts[0]!.hash;
+    input.receipt.artifactHashes = [input.event.artifacts[0]!.hash];
+    const publication = buildStagePublication({
+      instance,
+      attempt,
+      event: input.event,
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: attempt.id,
+        outcome: "success",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+    });
+
+    expect(publication.evidence.summaries).toEqual(["Repeated evidence line."]);
+    expect(publication.evidence.details).toEqual(["Repeated evidence line.", "Unique follow-up evidence."]);
+    expect(publication.body.match(/^Repeated evidence line\.$/gm)).toHaveLength(1);
+    expect(publication.body).toContain("Unique follow-up evidence.");
+    expect(renderGithubPipelineSummary(publication).match(/^Repeated evidence line\.$/gm)).toHaveLength(1);
   });
 
   it("renders every pipeline receipt template as plain progress and turn sentences", () => {
