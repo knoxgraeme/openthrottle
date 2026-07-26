@@ -93,6 +93,15 @@ export interface LinearComment {
   id: string;
   body?: string | null;
   url?: string | null;
+  user?: {
+    id?: string | null;
+    app?: boolean | null;
+    isMe?: boolean | null;
+  } | null;
+}
+
+function isCurrentAppComment(comment: LinearComment): boolean {
+  return comment.user?.app === true && comment.user.isMe === true;
 }
 
 export async function findIssueCommentByMarker(
@@ -116,7 +125,7 @@ export async function findIssueCommentByMarker(
       `query IssueComments($id: String!, $after: String) {
         issue(id: $id) {
           comments(first: 100, after: $after) {
-            nodes { id body url }
+            nodes { id body url user { id app isMe } }
             pageInfo { hasNextPage endCursor }
           }
         }
@@ -124,7 +133,9 @@ export async function findIssueCommentByMarker(
       { id: issueId, after }
     );
     const connection = data.issue?.comments;
-    const match = (connection?.nodes ?? []).find((comment) => comment.body?.includes(marker));
+    const match = (connection?.nodes ?? []).find(
+      (comment) => comment.body?.includes(marker) && isCurrentAppComment(comment)
+    );
     if (match) return match;
     const endCursor = connection?.pageInfo?.endCursor ?? null;
     if (!connection?.pageInfo?.hasNextPage || !endCursor || seenCursors.has(endCursor)) break;

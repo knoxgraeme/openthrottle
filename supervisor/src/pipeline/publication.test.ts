@@ -552,6 +552,104 @@ describe("pipeline publication", () => {
     });
   });
 
+  it("reuses an already-current Linear status comment without another write", async () => {
+    const { tickets } = setup("fixture/agent@1");
+    const status = tickets.listLinearOutbox().find((row) => row.kind === "pipeline_status")!;
+    const body = (JSON.parse(status.payload) as { publication: { body: string } }).publication.body;
+    const calls: string[] = [];
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as { query?: string };
+      if (request.query?.includes("IssueComments")) {
+        calls.push("list");
+        return Response.json({ data: { issue: { comments: {
+          nodes: [{
+            id: "status-comment",
+            body,
+            url: "https://linear.test/comment/status",
+            user: { id: "app-user", app: true, isMe: true },
+          }],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        } } } });
+      }
+      if (request.query?.includes("CommentUpdate")) calls.push("update");
+      if (request.query?.includes("CommentCreate")) calls.push("create");
+      throw new Error("unexpected Linear request");
+    }) as unknown as typeof fetch;
+    const processor = createLinearOutboxProcessor({
+      store: tickets,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: fetchMock }),
+    });
+
+    await processor.process(status.id);
+
+    expect(calls).toEqual(["list"]);
+    expect(tickets.getLinearOutbox(status.id)).toMatchObject({
+      status: "processed",
+      external_id: "status-comment",
+      external_url: "https://linear.test/comment/status",
+    });
+  });
+
+  it("recreates the Linear status comment when the persisted comment was deleted", async () => {
+    const { tickets, pipelines, instance, attempt } = setup("fixture/agent@1");
+    const initialFetch = successfulLinearFetch();
+    const initialProcessor = createLinearOutboxProcessor({
+      store: tickets,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: initialFetch }),
+    });
+    const status = tickets.listLinearOutbox().find((row) => row.kind === "pipeline_status")!;
+
+    await initialProcessor.process(status.id);
+    expect(tickets.getLinearOutbox(status.id)).toMatchObject({
+      status: "processed",
+      external_id: "status-comment",
+    });
+
+    const input = event(instance, attempt, "fresh stage accepted");
+    coordinatePipelineEvent(pipelines, input.event, undefined, input.receipt);
+    expect(tickets.getLinearOutbox(status.id)).toMatchObject({
+      status: "pending",
+      external_id: "status-comment",
+    });
+
+    const calls: string[] = [];
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as {
+        query?: string;
+        variables?: { id?: string; input?: { body?: string } };
+      };
+      if (request.query?.includes("CommentUpdate")) {
+        calls.push(`update:${request.variables?.id}`);
+        return Response.json(
+          { errors: [{ message: "Comment not found", extensions: { code: "NOT_FOUND" } }] },
+          { status: 200 }
+        );
+      }
+      if (request.query?.includes("CommentCreate")) {
+        calls.push(`create:${request.variables?.input?.body ?? ""}`);
+        return Response.json({ data: { commentCreate: {
+          success: true,
+          comment: { id: "replacement-status-comment", url: "https://linear.test/comment/replacement" },
+        } } });
+      }
+      throw new Error("unexpected Linear request");
+    }) as unknown as typeof fetch;
+    const recovered = createLinearOutboxProcessor({
+      store: tickets,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: fetchMock }),
+    });
+
+    await recovered.process(status.id);
+
+    expect(calls[0]).toBe("update:status-comment");
+    expect(calls[1]).toContain("create:<!-- openthrottle:pipeline-status:issue-1 -->");
+    expect(tickets.getLinearOutbox(status.id)).toMatchObject({
+      status: "processed",
+      external_id: "replacement-status-comment",
+      external_url: "https://linear.test/comment/replacement",
+    });
+  });
+
   it("renders every pipeline receipt template as plain progress and turn sentences", () => {
     const { instance, attempt } = setup("fixture/agent@1");
     const input = event(instance, attempt);
@@ -939,6 +1037,46 @@ describe("pipeline publication", () => {
     expect(deliveredSessions).toEqual(["session-1"]);
     expect(deliveredSessions).not.toContain("session-2");
     expect(pipelines.getInstance(instance.id)?.status).toBe("superseded");
+  });
+
+  it("does not let a late status row update a newer Linear session generation", async () => {
+    const { tickets, instance } = setup("fixture/agent@1");
+    const status = tickets.listLinearOutbox().find((row) => row.kind === "pipeline_status")!;
+    tickets.upsert({
+      linear_issue_id: instance.linear_issue_id,
+      linear_issue_identifier: "ISSUE-1",
+      linear_session_id: "session-2",
+      sandbox_id: null,
+      branch: "ot/issue-1-next",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: "https://github.com/owner/repo/pull/2",
+      state: "active",
+    });
+    const commentCalls: string[] = [];
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as { query?: string };
+      if (request.query?.includes("IssueComments")) commentCalls.push("list");
+      if (request.query?.includes("CommentUpdate")) commentCalls.push("update");
+      if (request.query?.includes("CommentCreate")) commentCalls.push("create");
+      if (commentCalls.length > 0) throw new Error("stale status row should not touch Linear comments");
+      return Response.json({ data: { agentActivityCreate: {
+        success: true,
+        agentActivity: { id: "old-receipt" },
+      } } });
+    }) as unknown as typeof fetch;
+    const processor = createLinearOutboxProcessor({
+      store: tickets,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: fetchMock }),
+    });
+
+    await processor.process(status.id);
+
+    expect(commentCalls).toEqual([]);
+    expect(tickets.getLinearOutbox(status.id)).toMatchObject({
+      status: "processed",
+      external_id: null,
+    });
   });
 
   it("moves the single GitHub summary projection to a newer generation and rejects a stale ack", () => {

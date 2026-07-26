@@ -139,6 +139,10 @@ function classifyRetry(error: unknown): { retry: boolean; message: string } {
   return { retry: true, message };
 }
 
+function isNotFoundError(error: unknown): boolean {
+  return /\bnot[ _-]?found\b|not_found|does not exist|could not find/i.test(String(error));
+}
+
 function parsePayload(row: LinearOutboxRecord): LinearOutboxPayload {
   const payload = JSON.parse(row.payload) as LinearOutboxPayload;
   if (payload.type !== row.kind) {
@@ -173,6 +177,9 @@ async function deliver(
       throw new Error(`pipeline status ${row.id} is missing its stable marker`);
     }
     const ticket = store.getByIssueId(row.linear_issue_id);
+    if (ticket && row.linear_session_id && ticket.linear_session_id !== row.linear_session_id) {
+      return {};
+    }
     const body = sanitizeText([
       payload.publication.body,
       ...(ticket?.pr_url ? ["", `Pull request: ${ticket.pr_url}`] : []),
@@ -184,8 +191,12 @@ async function deliver(
       if ("body" in existing && existing.body === body) {
         return { externalId: existing.id, externalUrl: existing.url ?? undefined };
       }
-      const result = await commentUpdate(linear, { id: existing.id, body });
-      return { externalId: result.comment?.id ?? existing.id, externalUrl: result.comment?.url ?? existing.url ?? undefined };
+      try {
+        const result = await commentUpdate(linear, { id: existing.id, body });
+        return { externalId: result.comment?.id ?? existing.id, externalUrl: result.comment?.url ?? existing.url ?? undefined };
+      } catch (error) {
+        if (!isNotFoundError(error)) throw error;
+      }
     }
     const result = await commentCreate(linear, { issueId: row.linear_issue_id, body });
     return { externalId: result.comment?.id, externalUrl: result.comment?.url ?? undefined };
@@ -246,9 +257,10 @@ export function createLinearOutboxProcessor(params: {
   }
 
   return {
-    async process(_id: string) {
+    async process(id: string) {
       const now = new Date();
-      const rows = params.store.claimLinearOutbox(
+      const rows = params.store.claimLinearOutboxForId(
+        id,
         now.toISOString(),
         new Date(now.getTime() + leaseMs).toISOString(),
         50

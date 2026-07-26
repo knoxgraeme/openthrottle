@@ -17,6 +17,7 @@ export interface DeliveryStore {
     payload: string;
   }): LinearOutboxRecord;
   claimLinearOutbox(nowIso: string, leaseUntilIso: string, limit: number): LinearOutboxRecord[];
+  claimLinearOutboxForId(id: string, nowIso: string, leaseUntilIso: string, limit: number): LinearOutboxRecord[];
   markLinearOutboxProcessed(id: string, receipt?: {
     externalId?: string | null;
     externalUrl?: string | null;
@@ -104,6 +105,28 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
       AND kind = 'activity'
       AND json_extract(payload, '$.activity.ephemeral') IS 1
   `);
+  const listClaimableLinearOutboxRowsStmt = db.prepare(`
+    SELECT * FROM linear_outbox candidate
+    WHERE ((candidate.status IN ('pending', 'failed') AND candidate.next_attempt_at <= ?)
+      OR (candidate.status = 'processing' AND candidate.next_attempt_at <= ?))
+      AND NOT EXISTS (
+        SELECT 1 FROM linear_outbox earlier
+        WHERE earlier.linear_session_id IS candidate.linear_session_id
+          AND earlier.sequence < candidate.sequence
+          AND earlier.kind <> 'pipeline_status'
+          AND earlier.status IN ('pending', 'processing', 'failed')
+      )
+    ORDER BY candidate.created_at, candidate.sequence
+    LIMIT ?
+  `);
+  const claimLinearOutboxRowStmt = db.prepare(`
+    UPDATE linear_outbox
+    SET status = 'processing', attempts = attempts + 1,
+        next_attempt_at = ?, last_error = NULL
+    WHERE id = ?
+      AND ((status IN ('pending', 'failed') AND next_attempt_at <= ?)
+        OR (status = 'processing' AND next_attempt_at <= ?))
+  `);
   const enqueueLinearOutboxTransaction = db.transaction(
     (params: {
       id?: string;
@@ -179,38 +202,31 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
       return getSandboxEventStmt.get(eventId) as SandboxEventRecord;
     }
   );
+  const listClaimableLinearOutboxRows = (nowIso: string, limit: number): LinearOutboxRecord[] =>
+    listClaimableLinearOutboxRowsStmt.all(nowIso, nowIso, limit) as LinearOutboxRecord[];
+  const claimLinearOutboxRows = (
+    rows: LinearOutboxRecord[],
+    nowIso: string,
+    leaseUntilIso: string
+  ): LinearOutboxRecord[] => {
+    const claimed: LinearOutboxRecord[] = [];
+    for (const row of rows) {
+      const update = claimLinearOutboxRowStmt.run(leaseUntilIso, row.id, nowIso, nowIso);
+      if (update.changes === 1) claimed.push(getLinearOutboxStmt.get(row.id) as LinearOutboxRecord);
+    }
+    return claimed;
+  };
   return {
     enqueueLinearOutbox(params) {
       return enqueueLinearOutboxTransaction(params);
     },
     claimLinearOutbox(nowIso, leaseUntilIso, limit) {
-      const rows = db.prepare(`
-        SELECT * FROM linear_outbox candidate
-        WHERE ((candidate.status IN ('pending', 'failed') AND candidate.next_attempt_at <= ?)
-          OR (candidate.status = 'processing' AND candidate.next_attempt_at <= ?))
-          AND NOT EXISTS (
-            SELECT 1 FROM linear_outbox earlier
-            WHERE earlier.linear_session_id IS candidate.linear_session_id
-              AND earlier.sequence < candidate.sequence
-              AND earlier.kind <> 'pipeline_status'
-              AND earlier.status IN ('pending', 'processing', 'failed')
-          )
-        ORDER BY candidate.created_at, candidate.sequence
-        LIMIT ?
-      `).all(nowIso, nowIso, limit) as LinearOutboxRecord[];
-      const claimed: LinearOutboxRecord[] = [];
-      for (const row of rows) {
-        const update = db.prepare(`
-          UPDATE linear_outbox
-          SET status = 'processing', attempts = attempts + 1,
-              next_attempt_at = ?, last_error = NULL
-          WHERE id = ?
-            AND ((status IN ('pending', 'failed') AND next_attempt_at <= ?)
-              OR (status = 'processing' AND next_attempt_at <= ?))
-        `).run(leaseUntilIso, row.id, nowIso, nowIso);
-        if (update.changes === 1) claimed.push(getLinearOutboxStmt.get(row.id) as LinearOutboxRecord);
-      }
-      return claimed;
+      return claimLinearOutboxRows(listClaimableLinearOutboxRows(nowIso, limit), nowIso, leaseUntilIso);
+    },
+    claimLinearOutboxForId(id, nowIso, leaseUntilIso, limit) {
+      const rows = listClaimableLinearOutboxRows(nowIso, limit);
+      if (!rows.some((row) => row.id === id)) return [];
+      return claimLinearOutboxRows(rows, nowIso, leaseUntilIso);
     },
     markLinearOutboxProcessed(id, receipt, expectedPayloadHash) {
       db.transaction(() => {

@@ -71,6 +71,32 @@ describe("delivery store", () => {
     });
   });
 
+  it("does not lease unrelated Linear outbox rows when a requested id is not claimable", () => {
+    const first = store.enqueueLinearOutbox({
+      id: "linear-1",
+      linearSessionId: "session-1",
+      issueId: "issue-1",
+      kind: "activity",
+      payload: '{"type":"activity","activity":{"sessionId":"session-1","type":"response","body":"first"}}',
+    });
+    const second = store.enqueueLinearOutbox({
+      id: "linear-2",
+      linearSessionId: "session-2",
+      issueId: "issue-2",
+      kind: "activity",
+      payload: '{"type":"activity","activity":{"sessionId":"session-2","type":"response","body":"second"}}',
+    });
+
+    expect(store.claimLinearOutboxForId(
+      "missing",
+      "2099-01-01T00:00:00.000Z",
+      "2099-01-01T00:01:00.000Z",
+      50
+    )).toEqual([]);
+    expect(store.getLinearOutbox(first.id)?.status).toBe("pending");
+    expect(store.getLinearOutbox(second.id)?.status).toBe("pending");
+  });
+
   it("deduplicates accepted webhooks", () => {
     const claim = { deliveryId: "delivery-1", source: "linear" as const, action: "created" };
     expect(store.claimDelivery(claim)).toBe(true);
