@@ -4,14 +4,14 @@ type: feat
 date: 2026-07-22
 deepened: 2026-07-22
 artifact_contract: ce-unified-plan/v1
-artifact_readiness: requires-regrounding
+artifact_readiness: implementation-ready
 product_contract_source: ce-plan-bootstrap
 execution: code
 ---
 
 # Repository-configurable execution graphs - Plan
 
-> **REGROUNDING REQUIRED before shipping.** This contract was authored against the pre-refactor flat `supervisor/src` layout. The 2026-07-25 module-boundaries refactor (PRs #49-#53) moved those responsibilities under `app/`, `http/`, `pipeline/`, `persistence/`, `providers/`, `runtime/`, `operations/`, and `shared/`, and only `index.ts` may exist at the source root. Every `Files` list and flat-path reference in the implementation units (e.g. `supervisor/src/execution-graph.ts`, `supervisor/src/pipeline-manifest.ts`) is historical and must be re-derived against `AGENTS.md`'s ownership map and the architecture test before this plan is delegated. Requirements, KTDs, flows, and acceptance examples remain the authoritative contract; the unit file inventories do not.
+> **Re-grounded 2026-07-26 against the post-refactor boundaries (PRs #49–#53).** The 2026-07-25 module-boundaries refactor moved supervisor responsibilities under `app/`, `http/`, `pipeline/`, `persistence/`, `providers/`, `runtime/`, `operations/`, and `shared/`, leaving only `index.ts` at the source root. Every `Files` list, verification command, and path reference now targets that layout, and new files are placed in the boundary the architecture test (`supervisor/src/__tests__/architecture.test.ts`) requires: graph/gate/publication contracts under `pipeline/`, SQLite stores under `persistence/pipeline/`, retryable effect draining under `operations/`, admission orchestration under `app/`, and provider fetch/delivery under `providers/`. Requirements, KTDs, flows, and acceptance examples remain the authoritative contract.
 
 ## Goal Capsule
 
@@ -131,6 +131,11 @@ The first structured release should improve plan-wide control without building a
 - R36. The lead may propose splitting one pending, never-attempted unit into two or more child units via a typed `openthrottle.unit-split/v1` artifact carrying, per child, instructions, acceptance criteria, owned scope, and intra-split ordering. The supervisor validates deterministically — the union of child scopes and acceptance criteria must equal the parent's (no expansion, no loss), children inherit the parent's external dependency edges, and total attempt/budget limits are partitioned rather than multiplied — then applies the split as a recorded graph revision with its own digest, closing the parent unit as `split`. A proposal failing validation returns to the lead once; a second failure or any scope change returns `needs_human`. Splitting an in-progress unit is not permitted — continuation slices remain the mechanism inside an attempted unit.
 - R37. When at least one unit has integrated and at least one pending unit remains, the lead may propose publishing the integrated units as a coherent releasable slice. The full final gate sequence (R23) runs over the exact integrated subject; the run then terminates `shipped` carrying a typed, digested **continuation frontier**: the remaining execution-plan units by stable ID (byte-identical to the pinned plan — the supervisor rejects any edit), the accepted downstream context records, and the published head. The frontier is durable state and is rendered in the terminal Linear receipt and PR body as the explicit remaining work.
 - R38. Continuation is supervisor-owned, never agent-owned: when provider evidence confirms the slice PR **merged**, the supervisor admits a new generation on the same ticket seeded from the frontier — base resolved from the merge result, execution plan equal to the frontier units revalidated by the R9 validator, prior accepted context carried forward, fresh session lineage. Bounded by a configured maximum auto-continuation count per ticket. A PR closed without merging, a frontier that fails revalidation against the new base, or an exhausted continuation bound returns `needs_human` instead of chaining. No new Linear issue is created and no agent gains work-item creation authority: the human approved the full plan at ship time, and PR merge remains the recurring human gate (a repository with auto-merge policy thereby opts into a fully autonomous chain).
+
+#### Unit status leveling and budget wind-down
+
+- R39. A unit's terminal state must be leveled into exactly one of `completed` (its acceptance gate passed under R22), `exited` (it ended for a structural reason — superseded by a validated R36 split, a stop/supersede fence, or a drained budget reserve under R40), or `failed` (a defect — an executor/gate boundary violation, a malformed or unbindable receipt, or an unrecoverable effect error). The child reducer must derive one binary `alarm` bit from that level for operator surfaces (`failed` sets the alarm; `completed` and `exited` clear it) so Linear, the PR ledger, and `openthrottle status` distinguish "needs attention" from "ended cleanly" without re-deriving the taxonomy. When a leased unit action loses liveness past its heartbeat fence and cannot be reconciled to a current attempt, the supervisor must heal that unit to `exited` (never `failed`) and release its worktree/action so serial dispatch resumes deterministically rather than the unit lingering silently `running`. Terminal levels and the alarm bit are supervisor-derived from durable evidence only; no agent receipt may assert either.
+- R40. Each unit attempt and each final-repair attempt must reserve a configured tail (default ~10%, a `budget_reserve_fraction` bound governed by R33) of its remaining budget across attempts, loop reentries, and wall-clock. When any of those axes drains into the reserve, the supervisor must instruct the active worker to stop starting new work and instead land committed, coherent state and hand off — the executor derives a candidate over its owned worktree, and the worker returns a bounded downstream-context record plus a wind-down receipt — so budget exhaustion yields resumable state rather than a stranded worktree. A wind-down that reaches a coherent handoff terminates the attempt as `exited` (R39) and carries its downstream context into the continuation frontier (R37); a wind-down that cannot reach coherence returns `needs_human`. The reserve is bounded by R33 and never raises platform or runtime limits.
 
 ### Key Flows
 
@@ -277,6 +282,8 @@ The first structured release should improve plan-wide control without building a
 - KTD12. **Keep commands repository-defined.** The executor implements one bounded named-command protocol; `test`, `lint`, and `build` are default config names rather than hard-coded executor mechanics. (session-settled: user-directed — chosen over fixed command enums: platform defaults should use the same surface as repository graphs.)
 - KTD13. **Bound structure and time before cost.** Enforce graph/unit/attempt/reentry/output/time limits and defer token budgets until provider usage is trustworthy and comparable. (session-settled: user-directed — chosen over V1 token accounting: portable usage data is not yet a reliable control input.)
 - KTD14. **Make partial completion a managed handoff, not prose.** The 2026-07-24 gen-7 run self-scoped its PR to a coherent slice — the right instinct — but the remainder existed only in the PR body with no durable next action. Because execution-plan units are validated schema (R8-R9), the remainder needs no new authoring or approval: R37 captures it as a typed frontier and R38 lets the supervisor chain a continuation generation on merge evidence. Human authority is preserved at its two existing gates — plan approval and PR merge — and the agent never gains work-item creation authority. (session-settled: user-directed 2026-07-24.)
+- KTD15. **Level unit terminal states and heal missing liveness to `exited`.** Distinguish `completed`/`exited`/`failed` and derive one operator alarm bit (R39), so a unit that ends for a structural reason (split, stop, drained reserve) or loses liveness is never conflated with a defect and never lingers as silently `running`. (session-settled: user-directed 2026-07-25 — adopted from the reviewed Fractal comparison's completed/exited/failed status leveling; the OPE-6/2026-07-24 incident window showed stuck-`running` actors were the dominant failure signature, so heal-to-`exited` is a first-class unit-level invariant rather than an incidental reaper side effect.)
+- KTD16. **Spend a budget reserve on handoff, not new work.** When a unit or final-repair attempt drains into its ~10% reserve, wind down to committed coherent state plus a downstream-context record and a receipt instead of starting new work (R40), so exhaustion produces a resumable frontier rather than a stranded worktree. (session-settled: user-directed 2026-07-25 — adopted from the reviewed Fractal comparison's reserve wind-down budget; it wires to R33 bounds and the R37 frontier so the existing continuation machinery, not fresh human triage, absorbs budget-limited runs.)
 
 ### High-Level Technical Design
 
@@ -343,6 +350,7 @@ limits:
   max_units: 24
   max_unit_attempts: 3
   max_final_repairs: 2
+  budget_reserve_fraction: 0.1
 ```
 
 Directional graph bundle:
@@ -542,7 +550,7 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 - **Long-lived lead drift:** pass bounded receipts plus durable references, publish assumptions, and support explicit lead reconstruction without claiming identity continuity.
 - **Semantic false confidence:** name assurance classes in receipts and display the distinction between semantic attestation and executor/provider verification in Linear and the PR.
 - **Linear outage:** progression may continue under configured policy, but ordered outbox debt and terminal publication gaps must remain visible and retryable.
-- **Provider coupling:** keep worktree/session/secret handles opaque; Daytona APIs stay in `daytona.ts`.
+- **Provider coupling:** keep worktree/session/secret handles opaque; Daytona APIs stay in `providers/daytona/adapter.ts`.
 - **Final repair loops:** cap them and require a fresh review after each repair so autonomous convergence cannot become unbounded self-approval.
 
 ### Sources and Research
@@ -551,10 +559,10 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 - `docs/PLAN.md` — completed coordinator cutover and current POC boundary.
 - `docs/plans/2026-07-21-001-feat-configurable-agentic-pipeline-coordinator-plan.md` — implemented predecessor and explicit no-fan-out boundary.
 - `docs/AGENTIC-LOOP-REVIEW.md` — original findings and current cutover re-audit.
-- `supervisor/src/pipeline-manifest.ts` — strict manifest/config schema, installed executor/evaluator/artifact vocabulary, and normalized digests.
-- `supervisor/src/pipeline-coordinator.ts`, `supervisor/src/pipeline-store.ts`, and `supervisor/src/pipeline-effects.ts` — pure reduction, durable attempts/effects, one runtime resource, and current single-stage dispatch seam.
-- `supervisor/src/gate-evaluators.ts` — current canonical artifact parsing, fence validation, exact-subject checks, and deterministic gate receipt creation.
-- `supervisor/src/sandbox-runtime.ts` — current `stage-executor@1` request and one-native-session-per-stage contract.
+- `supervisor/src/pipeline/manifest.ts` — strict manifest/config schema, installed executor/evaluator/artifact vocabulary, and normalized digests.
+- `supervisor/src/pipeline/coordinator.ts`, `supervisor/src/pipeline/store.ts`, the SQLite implementations under `supervisor/src/persistence/pipeline/`, and `supervisor/src/operations/pipeline-effects.ts` — pure reduction, durable attempts/effects, one runtime resource, and current single-stage dispatch seam.
+- `supervisor/src/pipeline/gates.ts` — current canonical artifact parsing, fence validation, exact-subject checks, and deterministic gate receipt creation.
+- `supervisor/src/runtime/contracts.ts` — current `stage-executor@1` request and one-native-session-per-stage contract.
 - `sandbox/runner/execute-stage.mjs` — current 64 KiB task context, context policy handling, fixed command names, CE capability dispatch, and one typed result.
 - `skills/tasks/implement-plan/SKILL.md` and `skills/README.md` — current full-plan `ce-work mode:return-to-caller`, separate review/simplify/publish stages, and single-source CE adapter rules.
 - No `STRATEGY.md`, `CONCEPTS.md`, or `docs/solutions/` corpus exists in this repository, so no additional institutional learning changed the plan.
@@ -654,11 +662,11 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 
 **Files:**
 
-- Add `supervisor/src/execution-graph.ts` and `supervisor/src/execution-graph.test.ts` — resolve graph bundles and compile them to validated manifests.
-- Modify `supervisor/src/pipeline-manifest.ts` and `supervisor/src/pipeline-manifest.test.ts` — consume canonical config/commands and add only installed composite capability/artifact vocabulary.
+- Add `supervisor/src/pipeline/execution-graph.ts` and `supervisor/src/pipeline/execution-graph.test.ts` — compile resolved graph bundles to validated manifests (the compiler is a pure `pipeline` module importing only `pipeline`/`shared` plus the external `contracts` package; byte fetch and pinning stay in `app`/`providers`).
+- Modify `supervisor/src/pipeline/manifest.ts` and `supervisor/src/pipeline/manifest.test.ts` — consume canonical config/commands and add only installed composite capability/artifact vocabulary.
 - Add `supervisor/graphs/simple-v1.yaml`, `supervisor/graphs/investigate-v1.yaml`, and `supervisor/graphs/structured-v1.yaml`; modify `supervisor/pipelines/catalog.yaml` to expose compiled immutable identities.
-- Modify `supervisor/src/github.ts` and tests — fetch bounded repository graph/skill closures at the exact base commit.
-- Modify `supervisor/src/linear-events.ts` and `supervisor/src/pipeline-admission.test.ts` — resolve graph selection, validate the execution plan, pin sources/digests, compile, and reject before provisioning.
+- Modify `supervisor/src/providers/github/client.ts` and tests — fetch bounded repository graph/skill closures at the exact base commit.
+- Modify `supervisor/src/app/session-service.ts` and `supervisor/src/app/session-service.test.ts` — resolve graph selection, validate the execution plan, pin sources/digests, compile through the `pipeline` compiler, and reject before provisioning (provider fetch flows through an application port, since `app` may not import `providers`).
 - Add `cli/src/graph.ts` and `cli/src/graph.test.ts`; modify `cli/src/index.ts` — inspect, copy, validate, and explain built-in/repository graph bundles.
 
 **Approach:**
@@ -679,7 +687,7 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 
 **Verification:**
 
-- `npm test --prefix supervisor -- src/execution-graph.test.ts src/pipeline-manifest.test.ts src/pipeline-admission.test.ts src/github.test.ts`
+- `npm test --prefix supervisor -- src/pipeline/execution-graph.test.ts src/pipeline/manifest.test.ts src/app/session-service.test.ts src/providers/github/client.test.ts`
 - `npm test --prefix cli -- src/graph.test.ts`
 - `npm run typecheck --prefix supervisor`
 - `npm run build --prefix supervisor`
@@ -688,18 +696,18 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 
 **Goal:** Keep one parent composite stage active while the supervisor durably advances one unit/loop/effect at a time, including ready-unit selection and validated split revisions.
 
-**Requirements:** R12–R15, R21–R26, R33–R37; F3–F8; AE3–AE4, AE6–AE11, AE17; KTD4, KTD7, KTD11, KTD13–KTD14.
+**Requirements:** R12–R15, R21–R26, R33–R37, R39–R40; F3–F8; AE3–AE4, AE6–AE11, AE17; KTD4, KTD7, KTD11, KTD13–KTD16.
 
 **Dependencies:** U3.
 
 **Files:**
 
-- Modify `supervisor/src/db-migrations.ts`, `supervisor/src/db.ts`, and migration tests — add child graph/unit/session/context/gate/effect records with checksum-pinned migrations.
-- Add `supervisor/src/unit-store.ts` and `supervisor/src/unit-store.test.ts`.
-- Add `supervisor/src/unit-coordinator.ts` and `supervisor/src/unit-coordinator.test.ts` — pure reducer and stable serial readiness.
-- Add `supervisor/src/unit-effects.ts` and `supervisor/src/unit-effects.test.ts` — idempotent worktree, loop, command, candidate, integration, stop, and cleanup effects.
-- Modify `supervisor/src/pipeline-coordinator.ts`, `supervisor/src/pipeline-store.ts`, `supervisor/src/pipeline-effects.ts`, and focused tests only at the composite-stage/aggregate seams.
-- Modify `supervisor/src/sandbox-events.ts` and tests — accept child liveness/results only under parent and child fences.
+- Modify `supervisor/src/persistence/migrations/definitions.ts`, `supervisor/src/persistence/schema.ts`, and `supervisor/src/persistence/migrations/runner.test.ts` — add child graph/unit/session/context/gate/effect records with checksum-pinned immutable migrations.
+- Add `supervisor/src/persistence/pipeline/unit-store.ts` and `supervisor/src/persistence/pipeline/unit-store.test.ts` — the SQLite child store (only `persistence` may touch `better-sqlite3`).
+- Add `supervisor/src/pipeline/unit-coordinator.ts` and `supervisor/src/pipeline/unit-coordinator.test.ts` — pure reducer and stable serial readiness (imports only `pipeline`/`shared`).
+- Add `supervisor/src/operations/unit-effects.ts` and `supervisor/src/operations/unit-effects.test.ts` — idempotent worktree, loop, command, candidate, integration, stop, and cleanup effects; intent creation stays in the pipeline reducer while draining/runtime invocation is `operations` orchestration.
+- Modify `supervisor/src/pipeline/coordinator.ts`, `supervisor/src/pipeline/store.ts`, `supervisor/src/operations/pipeline-effects.ts`, and focused tests only at the composite-stage/aggregate seams.
+- Modify `supervisor/src/runtime/events.ts`, `supervisor/src/runtime/event-poller.ts`, and tests — accept child liveness/results only under parent and child fences.
 
 **Approach:**
 
@@ -711,6 +719,7 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 6. Treat downstream context as immutable records addressed to existing pending U-IDs. Reject every topology change except a validated R36 scope-preserving split of a pending, never-attempted unit, which the reducer applies as a recorded, digested graph revision (parent unit closed as `split`); anything else returns `needs_human`.
 7. Roll all integrated units into one aggregate artifact that settles the parent stage exactly once.
 8. Parent stop/supersede fences new child effects, terminates the active action, cleans known worktrees, and settles once.
+9. Level each unit terminal into `completed`/`exited`/`failed`, derive the operator alarm bit, and heal a unit that loses liveness past its heartbeat fence to `exited` with action release (R39). Reserve a configured budget tail per attempt; on drain, transition the active worker to wind-down — a committed candidate plus a downstream-context record terminates the attempt `exited` into the frontier, and an incoherent wind-down returns `needs_human` (R40).
 
 **Test Scenarios:**
 
@@ -722,11 +731,13 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 - Stale unit/loop/session/subject/context receipts cannot advance state.
 - A context update reaches only named pending units; any unit/dependency mutation proposal returns `needs_human`.
 - Stop during implement, command, lead review, or integration prevents later dispatch and cleans only bound resources.
+- A unit whose lease loses liveness past its heartbeat fence heals to `exited` (not `failed`), releases its action, and lets serial dispatch resume; terminal levels and the derived alarm bit are supervisor-derived and no agent receipt can assert either.
+- An attempt draining into its configured reserve winds down to a committed candidate plus a downstream-context record, terminates `exited`, and carries context into the continuation frontier; a wind-down that cannot reach coherence returns `needs_human`.
 - Simple stages execute without creating child records.
 
 **Verification:**
 
-- `npm test --prefix supervisor -- src/db-migrations.test.ts src/unit-store.test.ts src/unit-coordinator.test.ts src/unit-effects.test.ts src/pipeline-coordinator.test.ts src/pipeline-effects.test.ts src/sandbox-events.test.ts`
+- `npm test --prefix supervisor -- src/persistence/migrations/runner.test.ts src/persistence/pipeline/unit-store.test.ts src/pipeline/unit-coordinator.test.ts src/operations/unit-effects.test.ts src/pipeline/coordinator.test.ts src/operations/pipeline-effects.test.ts src/runtime/events.test.ts`
 - `npm run typecheck --prefix supervisor`
 - `npm run build --prefix supervisor`
 
@@ -740,8 +751,8 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 
 **Files:**
 
-- Modify `supervisor/src/sandbox-runtime.ts` and `supervisor/src/sandbox-runtime.test.ts` — add opaque worktree and loop-action operations under a versioned capability.
-- Modify `supervisor/src/daytona.ts` and tests — implement those operations without exposing Daytona identifiers to graph policy.
+- Modify `supervisor/src/runtime/contracts.ts` and `supervisor/src/runtime/contracts.test.ts` — add opaque worktree and loop-action operations under a versioned capability.
+- Modify `supervisor/src/providers/daytona/adapter.ts` and tests — implement those operations without exposing Daytona identifiers to graph policy (`@daytona/sdk` stays confined to `providers/daytona`).
 - Add `sandbox/runner/worktrees.mjs` and `sandbox/runner/worktrees.test.mjs`.
 - Add `sandbox/runner/execute-loop.mjs` and `sandbox/runner/execute-loop.test.mjs` — validate the sealed loop request, materialize worker policy, invoke or resume the correct engine session, and write one typed result.
 - Modify `sandbox/runner/capabilities.mjs`, `sandbox/entrypoint.sh`, `sandbox/lib/runtime.sh`, and runtime tests — install/admit the new protocol and attempt-scoped paths.
@@ -771,7 +782,7 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 
 **Verification:**
 
-- `npm test --prefix supervisor -- src/sandbox-runtime.test.ts src/daytona.test.ts`
+- `npm test --prefix supervisor -- src/runtime/contracts.test.ts src/providers/daytona/adapter.test.ts`
 - `npm test --prefix sandbox -- runner/worktrees.test.mjs runner/execute-loop.test.mjs runner/capabilities.test.mjs`
 - `bats sandbox/tests/runtime.bats`
 - `docker build -f sandbox/Dockerfile -t openthrottle:graphs-test .`
@@ -780,7 +791,7 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 
 **Goal:** Connect CE and replaceable skills to deterministic unit/final gates; the lead gains recorded ready-unit selection and split proposals, but never Git or gate authority.
 
-**Requirements:** R5–R6, R16–R26, R32–R37; F3–F6, F8; AE5–AE9, AE12–AE15, AE17; KTD5–KTD8, KTD12–KTD14.
+**Requirements:** R5–R6, R16–R26, R32–R37, R40; F3–F6, F8; AE5–AE9, AE12–AE15, AE17; KTD5–KTD8, KTD12–KTD14, KTD16.
 
 **Dependencies:** U4, U5.
 
@@ -792,8 +803,8 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 - Add `sandbox/runner/unit-evidence.mjs` and `sandbox/runner/unit-evidence.test.mjs` — derive candidate Git facts and bind command receipts.
 - Add `sandbox/runner/integrate-unit.mjs` and `sandbox/runner/integrate-unit.test.mjs` — executor commit/fast-forward and idempotent replay.
 - Modify `sandbox/runner/artifacts.mjs`, `sandbox/bin/ot-stage-result.mjs`, and tests — support standard child receipts without assurance upgrades.
-- Add `supervisor/src/execution-gates.ts` and `supervisor/src/execution-gates.test.ts` — deterministic unit/final gate templates.
-- Complete `supervisor/src/unit-effects.ts` integration with the U5 runtime.
+- Add `supervisor/src/pipeline/execution-gates.ts` and `supervisor/src/pipeline/execution-gates.test.ts` — deterministic unit/final gate templates (pure `pipeline` evaluators alongside `pipeline/gates.ts`).
+- Complete `supervisor/src/operations/unit-effects.ts` integration with the U5 runtime.
 
 **Approach:**
 
@@ -819,7 +830,7 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 **Verification:**
 
 - `npm test --prefix sandbox -- runner/unit-evidence.test.mjs runner/integrate-unit.test.mjs runner/artifacts.test.mjs tests/ce-adapters.test.mjs`
-- `npm test --prefix supervisor -- src/execution-gates.test.ts src/unit-effects.test.ts src/unit-coordinator.test.ts`
+- `npm test --prefix supervisor -- src/pipeline/execution-gates.test.ts src/operations/unit-effects.test.ts src/pipeline/unit-coordinator.test.ts`
 - Behavioral skill fixtures cover unit success, command repair, lead revision, final review repair, and non-CE substitution.
 - Docker smoke integrates two serial stub units into one exact final subject.
 
@@ -827,18 +838,18 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 
 **Goal:** Make the parent Linear issue and final PR sufficient to understand how the structured run advanced.
 
-**Requirements:** R19–R20, R27–R29, R37–R38; F4–F8; AE6–AE12, AE15, AE17; KTD7, KTD9, KTD14.
+**Requirements:** R19–R20, R27–R29, R37–R39; F4–F8; AE6–AE12, AE15, AE17; KTD7, KTD9, KTD14–KTD15.
 
 **Dependencies:** U6.
 
 **Files:**
 
-- Add `supervisor/src/execution-publication.ts` and `supervisor/src/execution-publication.test.ts` — render unit status, receipts, decisions, context, gate rationale, subjects, and evidence links.
-- Modify `supervisor/src/linear-outbox.ts`, `supervisor/src/linear.ts`, and tests — queue ordered parent activities and full-plan replacements where supported.
-- Modify `supervisor/src/linear-events.ts` and tests — route parent human replies to exact current child fences.
-- Modify `supervisor/src/pipeline-publication.ts` and tests — include aggregate and final gate receipts.
-- Modify `supervisor/src/github.ts`, `supervisor/src/github-events.ts`, and tests — render final unit/gate ledger in the PR and retain exact-head feedback behavior.
-- Modify `supervisor/src/sanitize.ts`, `supervisor/src/server.ts`, and `cli/src/status.ts` with focused tests — bound/redact new fields and expose unit state/publication debt.
+- Add `supervisor/src/pipeline/execution-publication.ts` and `supervisor/src/pipeline/execution-publication.test.ts` — render unit status, receipts, decisions, context, gate rationale, subjects, and evidence links as neutral publication envelopes.
+- Modify `supervisor/src/providers/linear/outbox.ts`, `supervisor/src/providers/linear/client.ts`, and tests — queue ordered parent activities and full-plan replacements where supported.
+- Modify `supervisor/src/app/session-service.ts` and tests — route parent human replies to exact current child fences.
+- Modify `supervisor/src/pipeline/publication.ts` and tests — include aggregate and final gate receipts.
+- Modify `supervisor/src/providers/github/pipeline-publication.ts`, `supervisor/src/providers/github/events.ts`, and tests — render the final unit/gate ledger in the PR and retain exact-head feedback behavior.
+- Modify `supervisor/src/shared/sanitize.ts`, `supervisor/src/http/server.ts`, and `cli/src/status.ts` with focused tests — bound/redact new fields and expose unit state/publication debt.
 
 **Approach:**
 
@@ -855,10 +866,11 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 - Linear outage preserves outbox order and later converges without rolling back unit state.
 - A stale human answer or stale PR head cannot advance or overwrite current evidence.
 - The PR gate ledger distinguishes semantic attestation, executor verification, and provider verification.
+- The parent Linear activity and PR ledger show each unit's `completed`/`exited`/`failed` level and the derived alarm bit, so an operator reads "needs attention" versus "ended cleanly" without re-deriving the taxonomy from raw state.
 
 **Verification:**
 
-- `npm test --prefix supervisor -- src/execution-publication.test.ts src/pipeline-publication.test.ts src/linear-outbox.test.ts src/linear.test.ts src/linear-events.test.ts src/sanitize.test.ts src/github.test.ts src/github-events.test.ts`
+- `npm test --prefix supervisor -- src/pipeline/execution-publication.test.ts src/pipeline/publication.test.ts src/providers/linear/outbox.test.ts src/providers/linear/client.test.ts src/app/session-service.test.ts src/shared/sanitize.test.ts src/providers/github/pipeline-publication.test.ts src/providers/github/client.test.ts`
 - `npm test --prefix cli -- src/operator.test.ts`
 - Fault-injection publication test completes a serial graph during a Linear outage, restarts, restores delivery, and proves ordered convergence.
 
@@ -940,6 +952,7 @@ bats sandbox/tests/runtime.bats
 6. **Publication:** parent Linear ledger, sanitization, ordered retry, stale answer, final PR gate section, and visible publication debt.
 7. **Skill portability:** CE defaults and non-CE fixtures for unit, lead, review, repair, and publish receipt contracts.
 8. **Slice continuation:** lead slice-proposal validation, frontier byte-identity and digesting, terminal rendering of remaining work, merge-evidence continuation admission on the same ticket, and the needs_human paths for closed-unmerged PRs, stale frontiers, and exhausted continuation bounds.
+9. **Unit status and budget wind-down:** terminal leveling into `completed`/`exited`/`failed`, the derived operator alarm bit, missing-liveness heal-to-`exited` with action release, reserve-triggered wind-down to a committed candidate plus downstream context and receipt, exited-into-frontier carry, and the needs_human path when wind-down cannot reach coherence.
 
 ### Image and lifecycle gate
 
@@ -983,8 +996,10 @@ This gate consumes operator credentials and must never be reported as locally pa
 
 ### Global completion
 
-- R1–R38 and AE1–AE17 are traceable to code, tests, and durable artifacts.
+- R1–R40 and AE1–AE17 are traceable to code, tests, and durable artifacts.
 - Lead ready-unit selection is recorded on dispatch receipts, a validated scope-preserving split lands as a digested graph revision, and a merged slice PR admits a continuation generation from the typed frontier without human action — each proven by the R35–R38 matrices.
+- Unit terminal states are leveled `completed`/`exited`/`failed` with a supervisor-derived operator alarm bit, and a unit that loses liveness heals to `exited` and releases its action rather than lingering `running` — proven by the R39 matrix.
+- A unit or final-repair attempt that drains into its configured reserve winds down to committed, resumable state and downstream context instead of starting new work, so budget exhaustion feeds the continuation frontier rather than stranding a worktree — proven by the R40 matrix.
 - Repositories select among multiple named graphs and can copy/edit a built-in using graph/loop/worker/command/skill/MCP/limit configuration only.
 - `simple` continues to accept a complete plan and preserves current whole-plan behavior.
 - `structured` requires validator-clean unit JSON and executes one serial unit at a time.
@@ -1023,6 +1038,8 @@ This gate consumes operator credentials and must never be reported as locally pa
 | Linear, PR, credentials, MCP | R27–R31 | U5, U7, U8 |
 | Commands and bounds | R32–R34 | U1, U3, U4, U6, U8 |
 | Lead scheduling, splits, slice continuation | R35–R38 | U3, U4, U6, U7 |
+| Unit status leveling and liveness heal | R39 | U4, U7 |
+| Budget reserve wind-down | R40 | U4, U6 |
 
 ### Execution contract for this plan
 
