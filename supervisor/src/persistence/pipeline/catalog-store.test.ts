@@ -156,7 +156,7 @@ describe("pipeline catalog store", () => {
     ]);
     expect(db.prepare(`
       SELECT pipeline_id, version, digest FROM pipeline_catalog_entries
-      WHERE pipeline_id IN ('ce/implement', 'ce/investigate')
+      WHERE pipeline_id IN ('ce/implement', 'ce/investigate', 'core/implement', 'core/investigate')
       ORDER BY pipeline_id, version
     `).all()).toEqual([
       { pipeline_id: "ce/implement", version: 1, digest: historical.manifests.get("ce/implement@1")!.digest },
@@ -164,13 +164,15 @@ describe("pipeline catalog store", () => {
       { pipeline_id: "ce/implement", version: 3, digest: shippedCatalog.manifests.get("ce/implement@3")!.digest },
       { pipeline_id: "ce/investigate", version: 1, digest: historical.manifests.get("ce/investigate@1")!.digest },
       { pipeline_id: "ce/investigate", version: 2, digest: shippedCatalog.manifests.get("ce/investigate@2")!.digest },
+      { pipeline_id: "core/implement", version: 1, digest: shippedCatalog.manifests.get("core/implement@1")!.digest },
+      { pipeline_id: "core/investigate", version: 1, digest: shippedCatalog.manifests.get("core/investigate@1")!.digest },
     ]);
     expect(db.prepare(`
-      SELECT alias, version FROM pipeline_catalog_aliases
+      SELECT alias, pipeline_id, version FROM pipeline_catalog_aliases
       WHERE alias IN ('implement', 'investigate') ORDER BY alias
     `).all()).toEqual([
-      { alias: "implement", version: 3 },
-      { alias: "investigate", version: 2 },
+      { alias: "implement", pipeline_id: "core/implement", version: 1 },
+      { alias: "investigate", pipeline_id: "core/investigate", version: 1 },
     ]);
   });
 });
