@@ -302,6 +302,149 @@ describe("sandbox event contracts", () => {
     warn.mockRestore();
   });
 
+  it("surfaces a repeated sealed stage-result ingestion failure once and keeps retrying", async () => {
+    const store = seedRunningTicket();
+    const raw = Buffer.from(stageResultEvent().replace(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    ));
+    const sealedPath = "/var/lib/openthrottle/stage-results/attempt-1.json";
+    const files = new Map([[sealedPath, raw]]);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      process: {
+        executeCommand: vi.fn(async () => ({ exitCode: 0, result: `${"c".repeat(40)}\n` })),
+      },
+      fs: {
+        listFiles: vi.fn(async (directory: string) => [...files.entries()]
+          .filter(([path]) => path.startsWith(`${directory}/`))
+          .map(([path, value]) => ({
+            name: path.split("/").at(-1), path, size: value.length, isDir: false,
+          }))),
+        downloadFile: vi.fn(async (path: string) => files.get(path)!),
+        deleteFile: vi.fn(async (path: string) => files.delete(path)),
+      },
+    } ;
+    const postActivity = vi.fn(async () => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    for (let attempt = 1; attempt <= 6; attempt += 1) {
+      await pollSandboxEvents({
+        runtime: { getWorkspace: vi.fn(async () => sandbox), setActive: vi.fn(async () => undefined), setIdle: vi.fn(async () => undefined) } ,
+        store,
+        postActivity,
+        postStageResult: vi.fn(async () => {
+          throw new Error("Bearer private-stage-token cannot settle");
+        }),
+      });
+      db!.prepare(`
+        UPDATE sandbox_events SET next_attempt_at = '2000-01-01T00:00:00.000Z'
+        WHERE event_id = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+      `).run();
+    }
+
+    const stored = store.getSandboxEvent("cccccccc-cccc-4ccc-8ccc-cccccccccccc")!;
+    expect(stored).toMatchObject({
+      status: "failed",
+      attempts: 6,
+      last_error: expect.stringContaining("[REDACTED]"),
+      ingestion_diagnosed_at: expect.any(String),
+    });
+    expect(stored.last_error).not.toContain("private-stage-token");
+    expect(postActivity).toHaveBeenCalledTimes(1);
+    expect(postActivity).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "error",
+        body: expect.stringContaining("The supervisor cannot ingest the stage result:"),
+      }),
+      expect.objectContaining({ issueId: "issue-1" })
+    );
+    expect(files.has(sealedPath)).toBe(true);
+    error.mockRestore();
+  });
+
+  it("keeps retrying diagnostic publication when the first diagnostic activity fails", async () => {
+    const store = seedRunningTicket();
+    const raw = Buffer.from(stageResultEvent().replace(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+    ));
+    const sealedPath = "/var/lib/openthrottle/stage-results/attempt-1.json";
+    const files = new Map([[sealedPath, raw]]);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      process: {
+        executeCommand: vi.fn(async () => ({ exitCode: 0, result: `${"d".repeat(40)}\n` })),
+      },
+      fs: {
+        listFiles: vi.fn(async (directory: string) => [...files.entries()]
+          .filter(([path]) => path.startsWith(`${directory}/`))
+          .map(([path, value]) => ({
+            name: path.split("/").at(-1), path, size: value.length, isDir: false,
+          }))),
+        downloadFile: vi.fn(async (path: string) => files.get(path)!),
+        deleteFile: vi.fn(async (path: string) => files.delete(path)),
+      },
+    } ;
+    const postActivity = vi.fn()
+      .mockRejectedValueOnce(new Error("Linear GraphQL error: Bearer private-stage-token"))
+      .mockResolvedValue(undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      await pollSandboxEvents({
+        runtime: { getWorkspace: vi.fn(async () => sandbox), setActive: vi.fn(async () => undefined), setIdle: vi.fn(async () => undefined) } ,
+        store,
+        postActivity,
+        postStageResult: vi.fn(async () => {
+          throw new Error("stage result attempt fence mismatch");
+        }),
+      });
+      db!.prepare(`
+        UPDATE sandbox_events SET next_attempt_at = '2000-01-01T00:00:00.000Z'
+        WHERE event_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+      `).run();
+    }
+
+    expect(store.getSandboxEvent("dddddddd-dddd-4ddd-8ddd-dddddddddddd")).toMatchObject({
+      status: "failed",
+      attempts: 5,
+      ingestion_diagnosed_at: null,
+      last_error: "Error: stage result attempt fence mismatch",
+    });
+
+    await pollSandboxEvents({
+      runtime: { getWorkspace: vi.fn(async () => sandbox), setActive: vi.fn(async () => undefined), setIdle: vi.fn(async () => undefined) } ,
+      store,
+      postActivity,
+      postStageResult: vi.fn(async () => {
+        throw new Error("stage result attempt fence mismatch");
+      }),
+    });
+
+    const stored = store.getSandboxEvent("dddddddd-dddd-4ddd-8ddd-dddddddddddd")!;
+    expect(stored).toMatchObject({
+      status: "failed",
+      attempts: 6,
+      ingestion_diagnosed_at: expect.any(String),
+    });
+    expect(postActivity).toHaveBeenCalledTimes(2);
+    expect(error).toHaveBeenCalledWith(
+      expect.stringContaining("failed to publish ingestion diagnostic"),
+      expect.stringContaining("[REDACTED]")
+    );
+    expect(error).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining("private-stage-token")
+    );
+    expect(files.has(sealedPath)).toBe(true);
+    error.mockRestore();
+  });
+
   it("deletes an agent-writable outbox event that impersonates a stage result", async () => {
     const store = seedRunningTicket();
     const raw = Buffer.from(stageResultEvent().replace(

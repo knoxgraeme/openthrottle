@@ -185,7 +185,7 @@ mcp_servers: {}
     const instance = pipelines.getInstanceForSession("session-1")!;
     expect(ticket.sandbox_id).toBeNull();
     expect(ticket.run_id).toBeNull();
-    expect(instance.pipeline_id).toBe("ce/implement");
+    expect(instance.pipeline_id).toBe("core/implement");
     expect(instance.task_type).toBe("implement");
     expect(instance.base_commit).toBe("a".repeat(40));
     expect(instance.base_branch).toBe("main");

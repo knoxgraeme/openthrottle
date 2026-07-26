@@ -47,6 +47,7 @@ export interface DeliveryStore {
   claimSandboxEvent(eventId: string, nowIso: string, leaseUntilIso: string): SandboxEventRecord | undefined;
   markSandboxEventProcessed(eventId: string): void;
   markSandboxEventFailed(eventId: string, error: string, retryAt: string): void;
+  markSandboxEventDiagnosed(eventId: string, diagnosedAt: string): boolean;
   pruneSandboxEvents(beforeIso: string): number;
   pruneEphemeralLinearOutbox(beforeIso: string): number;
 }
@@ -393,6 +394,13 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
         SET status = 'failed', next_attempt_at = ?, last_error = ?
         WHERE event_id = ?
       `).run(retryAt, error, eventId);
+    },
+    markSandboxEventDiagnosed(eventId, diagnosedAt) {
+      return db.prepare(`
+        UPDATE sandbox_events
+        SET ingestion_diagnosed_at = ?
+        WHERE event_id = ? AND ingestion_diagnosed_at IS NULL
+      `).run(diagnosedAt, eventId).changes === 1;
     },
     pruneSandboxEvents(beforeIso) {
       return pruneSandboxEventsStmt.run(beforeIso).changes;
