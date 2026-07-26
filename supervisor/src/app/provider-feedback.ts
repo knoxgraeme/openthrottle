@@ -22,12 +22,16 @@ const PROVIDER_OUTCOMES = [
   "failure",
 ] as const;
 const PROVIDER_OUTCOME_SET = new Set<string>(PROVIDER_OUTCOMES);
+// A mixed same-head snapshot must fail closed: evidence that demands action
+// (a repair request, a failure, or a human-required event) outranks successful
+// evidence, so a Linear reply or review cannot be silently dropped because a
+// merge/close event joined the same snapshot first.
 const PROVIDER_OUTCOME_PRIORITY: readonly PipelineProviderOutcome[] = [
-  "success",
-  "no_change",
   "failure",
   "needs_human",
   "semantic_repair_required",
+  "success",
+  "no_change",
 ];
 
 export type PipelineProvider = "github" | "linear";

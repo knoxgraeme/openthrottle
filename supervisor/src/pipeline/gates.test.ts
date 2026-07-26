@@ -19,7 +19,11 @@ import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import type { PipelineInstance, PipelineStageAttempt, PipelineStore } from "./store.js";
 import { buildInstalledRuntimeDescriptor } from "../runtime/contracts.js";
 import { processPipelineInfrastructureFailure } from "./control.js";
-import { drainPipelineFeedbackSnapshots } from "../app/provider-feedback.js";
+import {
+  drainPipelineFeedbackSnapshots,
+  processPipelineFeedbackSnapshot,
+  recordPipelineProviderEvent,
+} from "../app/provider-feedback.js";
 import { handleGithubEvent, routePipelineProviderEvent } from "../providers/github/events.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
@@ -1079,6 +1083,81 @@ describe("deterministic supervisor stage gates", () => {
       reentry_ordinal: 1,
     });
     expect(drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(0);
+  });
+
+  it("routes a mixed same-head snapshot to repair re-entry, not the successful outcome", () => {
+    const fixture = setup("ce/implement@2");
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    fixture.tickets.setSetting("github-head:issue-1", SUBJECT);
+    fixture.db.prepare(`
+      UPDATE pipeline_instances SET status = 'running', published_commit = ? WHERE id = ?
+    `).run(SUBJECT, fixture.instance.id);
+
+    // GitHub reports success for the published head before the provider-wait
+    // stage can receive, so the event is collected into the pending snapshot.
+    expect(routePipelineProviderEvent({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      ticket: fixture.tickets.getByIssueId("issue-1")!,
+      eventId: `github-pull-closed:1:${SUBJECT}`,
+      outcome: "success",
+      summary: "GitHub reports the pull request merged.",
+      evidence: ["https://github.com/owner/repo/pull/1"],
+      payload: { kind: "pull_request", action: "closed", merged: true },
+      headSha: SUBJECT,
+      pullRequestUrl: "https://github.com/owner/repo/pull/1",
+    })).toBe(true);
+    expect(fixture.db.prepare("SELECT status FROM feedback_snapshots").pluck().get()).toBe("collecting");
+
+    fixture.db.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET stage_id = 'provider', native_context_policy = 'none', expected_subject = ?
+      WHERE id = ?
+    `).run(SUBJECT, fixture.attempt.id);
+    fixture.db.prepare(`
+      UPDATE pipeline_instance_stages SET status = 'passed'
+      WHERE pipeline_instance_id = ? AND stage_id = 'implementation'
+    `).run(fixture.instance.id);
+    fixture.db.prepare(`
+      UPDATE pipeline_instance_stages SET status = 'waiting'
+      WHERE pipeline_instance_id = ? AND stage_id = 'provider'
+    `).run(fixture.instance.id);
+    fixture.db.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'waiting_provider', active_stage_id = 'provider', immutable_subject = ?
+      WHERE id = ?
+    `).run(SUBJECT, fixture.instance.id);
+
+    // A Linear reply for the same head joins that snapshot as a repair request.
+    const instance = fixture.pipelines.getInstance(fixture.instance.id)!;
+    const snapshot = recordPipelineProviderEvent({
+      store: fixture.tickets,
+      instance,
+      ticket: fixture.tickets.getByIssueId("issue-1")!,
+      provider: "linear",
+      eventId: "linear-reply:activity-1",
+      outcome: "semantic_repair_required",
+      summary: "Linear reply requires another implementation pass.",
+      evidence: ["Please rename the flag before shipping."],
+      payload: { kind: "linear_reply", activity_id: "activity-1" },
+      headSha: SUBJECT,
+    });
+    expect(processPipelineFeedbackSnapshot({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      instance,
+      snapshot,
+    })).toBe(true);
+
+    // The repair request must outrank the successful evidence: the pipeline
+    // re-enters implementation instead of passing the provider gate.
+    expect(fixture.db.prepare("SELECT status FROM feedback_snapshots WHERE id = ?").get(snapshot.id))
+      .toEqual({ status: "consumed" });
+    expect(fixture.pipelines.getInstance(fixture.instance.id)!.terminal_outcome).toBeNull();
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "implementation",
+      reentry_ordinal: 1,
+    });
   });
 
   it("continues draining when the oldest same-session feedback snapshot is stale", () => {
