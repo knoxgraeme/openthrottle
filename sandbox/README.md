@@ -25,9 +25,20 @@ Every invocation executes exactly one coordinator-selected stage:
 4. Clone the registered repository and reconstruct the branch from the sealed
    base commit or expected subject.
 5. Seal the pre-push hook and Git configuration.
-6. Apply the validated repository config and `post_bootstrap` commands.
+6. Apply the validated repository config, then run the bake-once bootstrap:
+   `post_bootstrap` commands and engine probes execute only on the first stage
+   of a sandbox and seal a root-owned marker recording the repository-config
+   digest they ran under. Later stages verify the marker and skip the
+   bootstrap; a missing-but-started, torn, or digest-mismatched marker fails
+   the stage closed so the supervisor reprovisions the sandbox.
 7. Invoke the command or agent executor with the manifest’s context policy.
 8. Write one normalized, typed stage result to the supervisor-owned spool.
+
+Credential materialization, `gh` credential-helper setup, commit identity,
+branch reconstruction, fence validation, and the scrub of ignored
+agent-executable config surfaces (`.claude`, `.codex`, `.agents`, and similar)
+stay per-stage. Ignored dependency state installed by `post_bootstrap`
+persists for the sandbox lifetime under the recorded config digest.
 
 `TASK_TYPE` is ticket intent (`implement` or `investigate`), not an execution
 mode. Native Claude/Codex/OpenCode continuation is controlled by the stage

@@ -176,6 +176,19 @@ digests before cloning. An initial stage starts from the exact sealed base
 commit; later stages reconstruct the exact expected subject. Git safety config
 is root-sealed.
 
+Sandbox setup is split between bake-once and per-run work. `post_bootstrap`
+commands and image-derived engine probes are bake-once: they execute exactly
+once per sandbox lifetime and seal a root-owned completion marker recording
+the repository-config digest they ran under. Every stage verifies that marker
+before executing; a digest-mismatched, torn (started but never completed), or
+otherwise inconsistent marker fails the stage closed — the sandbox no longer
+matches its sealed config and the supervisor must reprovision it. There is no
+silent re-bootstrap and no silent skip. Credential materialization, `gh`
+credential-helper setup, commit identity, branch reconstruction, fence
+validation, and the per-stage scrub of ignored agent-executable config
+surfaces remain per-run; ignored dependency state installed by the bake-once
+bootstrap persists for the sandbox lifetime under the recorded digest.
+
 The executor runs exactly one stage:
 
 - agent capabilities invoke the appropriate OpenThrottle adapter and native CE
@@ -346,7 +359,9 @@ Committed `.openthrottle.yml` may declare `agent`, OpenCode `model`,
 `mcp_servers`, and implement/investigate pipeline aliases. It is fetched from
 the exact base commit, strictly validated, normalized, hashed, and uploaded as a
 sealed snapshot. Registered repositories are trusted for code execution because
-`post_bootstrap` is arbitrary code.
+`post_bootstrap` is arbitrary code. `post_bootstrap` runs once per sandbox
+lifetime under the bake-once marker (see Sandbox stage contract), not once per
+stage.
 
 ## CLI contract
 
