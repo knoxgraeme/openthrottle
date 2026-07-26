@@ -26,6 +26,7 @@ const SUPPORTED_PIPELINE_PUBLICATION_TEMPLATE_VERSIONS = new Set<number>([
 const INLINE_ARTIFACT_LIMIT_BYTES = 4 * 1024;
 const PUBLICATION_BODY_LIMIT = 12_000;
 const ATTACHMENT_LIMIT_BYTES = 256 * 1024;
+const MAX_RENDERED_FINDINGS = 10;
 const TERMINAL_STATUSES = new Set<string>(PIPELINE_OUTCOMES);
 
 export type PipelinePublicationTemplate =
@@ -76,6 +77,8 @@ export interface PipelinePublicationEnvelope {
     artifact_hashes: string[];
     summaries: string[];
     details: string[];
+    findings?: PublicationFinding[];
+    actions?: string[];
     uncertainty: string[];
   };
   links: Array<{ label: string; url: string }>;
@@ -93,8 +96,18 @@ type PipelinePublicationBodyInput = Omit<
 interface EvidenceSummary {
   summary?: unknown;
   evidence?: unknown;
+  findings?: unknown;
+  actions?: unknown;
   uncertainty?: unknown;
 }
+
+interface PublicationFinding {
+  severity: "P0" | "P1" | "P2" | "P3";
+  code: string;
+  summary: string;
+}
+
+type FindingDisposition = "fixed in-stage" | "carried to repair" | "remaining/accepted";
 
 const OMITTED_EVIDENCE_KEY = /(?:reasoning|chain[_-]?of[_-]?thought|thoughts?|analysis|prompt|token|secret|password|auth)/i;
 
@@ -120,9 +133,25 @@ function boundedPublicationLine(value: string, max: number): string {
     .trim();
 }
 
+function safeFinding(value: unknown): PublicationFinding | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const finding = value as Record<string, unknown>;
+  if (!["P0", "P1", "P2", "P3"].includes(String(finding.severity)) ||
+      typeof finding.code !== "string" || typeof finding.summary !== "string") {
+    return null;
+  }
+  return {
+    severity: finding.severity as PublicationFinding["severity"],
+    code: boundedPublicationLine(finding.code, 80),
+    summary: boundedPublicationLine(finding.summary, 300),
+  };
+}
+
 function safeEvidence(raw: string): {
   summary?: string;
   evidence: string[];
+  findings: PublicationFinding[];
+  actions: string[];
   uncertainty: string[];
 } {
   try {
@@ -133,13 +162,20 @@ function safeEvidence(raw: string): {
         ? value.evidence.filter((entry): entry is string => typeof entry === "string")
             .slice(0, 20).map((entry) => boundedPublicationLine(entry, 500))
         : [],
+      findings: Array.isArray(value.findings)
+        ? value.findings.map(safeFinding).filter((finding): finding is PublicationFinding => finding !== null)
+        : [],
+      actions: Array.isArray(value.actions)
+        ? value.actions.filter((entry): entry is string => typeof entry === "string")
+            .slice(0, 50).map((entry) => boundedPublicationLine(entry, 500))
+        : [],
       uncertainty: Array.isArray(value.uncertainty)
         ? value.uncertainty.filter((entry): entry is string => typeof entry === "string")
             .slice(0, 10).map((entry) => boundedPublicationLine(entry, 500))
         : [],
     };
   } catch {
-    return { evidence: [], uncertainty: [] };
+    return { evidence: [], findings: [], actions: [], uncertainty: [] };
   }
 }
 
@@ -369,6 +405,53 @@ function summaryHeaderLines(envelope: PipelinePublicationBodyInput, context: Ren
   ];
 }
 
+function normalizedFindingToken(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/\s{2,}/g, " ").trim();
+}
+
+function findingCodeTokens(value: string): string[] {
+  return normalizedFindingToken(value).split(" ").filter((token) => token.length > 1);
+}
+
+function actionAddressesFinding(action: string, finding: PublicationFinding): boolean {
+  const normalizedAction = normalizedFindingToken(action);
+  const normalizedCode = normalizedFindingToken(finding.code);
+  const normalizedSummary = normalizedFindingToken(finding.summary);
+  return (normalizedCode.length > 0 && normalizedAction.includes(normalizedCode)) ||
+    (findingCodeTokens(finding.code).length > 1 &&
+      findingCodeTokens(finding.code).every((token) => normalizedAction.includes(token))) ||
+    (normalizedSummary.length > 0 && normalizedAction.includes(normalizedSummary));
+}
+
+function dispositionForFinding(
+  finding: PublicationFinding,
+  actions: string[],
+  envelope: PipelinePublicationBodyInput
+): FindingDisposition {
+  if (actions.some((action) => actionAddressesFinding(action, finding))) return "fixed in-stage";
+  if (envelope.decision.outcome === "semantic_repair_required" && envelope.template.name === "repair_reentry") {
+    return "carried to repair";
+  }
+  return "remaining/accepted";
+}
+
+function findingsSectionLines(envelope: PipelinePublicationBodyInput): string[] {
+  const findings = envelope.evidence.findings ?? [];
+  if (findings.length === 0) return [];
+  const actions = envelope.evidence.actions ?? [];
+  const visible = findings.slice(0, MAX_RENDERED_FINDINGS);
+  const lines = [
+    "### Findings",
+    ...visible.map((finding) => {
+      const disposition = dispositionForFinding(finding, actions, envelope);
+      return `[${finding.severity}] ${finding.code} — ${finding.summary} -> ${disposition}`;
+    }),
+  ];
+  const omitted = findings.length - visible.length;
+  if (omitted > 0) lines.push(`+${omitted} more`);
+  return lines;
+}
+
 function renderBody(
   envelope: PipelinePublicationBodyInput,
   normalizedManifest: string,
@@ -377,6 +460,7 @@ function renderBody(
   const context = renderContext(envelope, normalizedManifest);
   const lines = [
     ...summaryHeaderLines(envelope, context),
+    ...findingsSectionLines(envelope),
     "",
     eventSentence(envelope, context, extras),
     progressLine(envelope, context),
@@ -431,6 +515,8 @@ export function buildSelectionPublication(instance: PipelineInstance): PipelineP
       artifact_hashes: [],
       summaries: ["The supervisor pinned the manifest, repository configuration, runtime release, and capability digest."],
       details: [],
+      findings: [],
+      actions: [],
       uncertainty: [],
     },
     links: githubLinks(instance, null),
@@ -479,6 +565,8 @@ export function buildLifecyclePublication(input: {
       artifact_hashes: [],
       summaries: [boundedPublicationLine(input.reason, 1_000)],
       details: [],
+      findings: [],
+      actions: [],
       uncertainty: [],
     },
     links: githubLinks(input.instance, input.instance.immutable_subject),
@@ -539,6 +627,8 @@ export function buildStagePublication(input: {
       artifact_hashes: (input.event.artifacts ?? []).map((artifact) => artifact.hash).sort(),
       summaries: evidence.flatMap((item) => item.summary ? [item.summary] : []).slice(0, 20),
       details: evidence.flatMap((item) => item.evidence).slice(0, 50),
+      findings: evidence.flatMap((item) => item.findings).slice(0, 50),
+      actions: evidence.flatMap((item) => item.actions).slice(0, 50),
       uncertainty: evidence.flatMap((item) => item.uncertainty).slice(0, 20),
     },
     links: githubLinks(input.instance, subject ?? null),
@@ -575,6 +665,10 @@ export function parsePipelinePublication(payload: string): PipelinePublicationEn
       !value.body || !Array.isArray(value.evidence?.artifact_hashes) ||
       !Array.isArray(value.evidence?.summaries) || !Array.isArray(value.evidence?.details) ||
       !Array.isArray(value.evidence?.uncertainty)) {
+    throw new Error("pipeline publication is incomplete");
+  }
+  if ((value.evidence.findings !== undefined && !Array.isArray(value.evidence.findings)) ||
+      (value.evidence.actions !== undefined && !Array.isArray(value.evidence.actions))) {
     throw new Error("pipeline publication is incomplete");
   }
   if (canonicalJson(value) !== payload) throw new Error("pipeline publication is not canonical");
