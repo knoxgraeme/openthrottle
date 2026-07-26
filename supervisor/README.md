@@ -71,7 +71,10 @@ Add `CLAUDE_CODE_OAUTH_TOKEN`, `CODEX_AUTH_JSON`, and/or `KIMI_CODE_API_KEY`
 from subscription logins. `DEFAULT_AGENT=codex` applies when the ticket has no agent label.
 Linear credentials remain in Fly and are never passed into Daytona.
 Use a separate fine-grained `GITHUB_READ_TOKEN` with contents, pull-request,
-and checks read access. Read-only stages never receive `GITHUB_TOKEN`.
+checks, and Actions read access. Actions read powers CI-failure enrichment
+(failing jobs, steps, and log tails); without it GitHub returns 403 on the
+Actions endpoints and CI failures lose that detail. Read-only stages never
+receive `GITHUB_TOKEN`.
 
 ## Automated deploys
 

@@ -334,6 +334,21 @@ describe("coordinator-only server", () => {
           published_commit = ?, updated_at = '2026-07-26T00:20:00.000Z'
       WHERE id = ?
     `).run("c".repeat(40), instance.id);
+    // Production transitions never persist a pull_request receipt, so the
+    // ticket projection (populated by the pull-request webhook) must back
+    // published_pr_url on its own.
+    store.setPrUrl("issue-1", "https://github.com/owner/repo/pull/11");
+    const ticketFallbackResponse = await app().request("/status", {
+      headers: { Authorization: "Bearer status-token" },
+    });
+    expect(ticketFallbackResponse.status).toBe(200);
+    const ticketFallbackBody = await ticketFallbackResponse.json() as {
+      tickets: Array<{ pipeline: Record<string, unknown> | null }>;
+    };
+    expect(ticketFallbackBody.tickets[0]?.pipeline).toMatchObject({
+      published_pr_url: "https://github.com/owner/repo/pull/11",
+    });
+
     db.prepare(`
       INSERT INTO pipeline_publication_receipts (
         id, pipeline_instance_id, kind, idempotency_key, payload, payload_hash,

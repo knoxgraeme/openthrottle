@@ -176,6 +176,7 @@ async function enrichCiFailure(input: {
     html_url: string | null;
   }>;
   findings: ProviderFinding[];
+  note: string | null;
 }> {
   try {
     const details = await getFailingGithubCheckDetails(
@@ -207,9 +208,18 @@ async function enrichCiFailure(input: {
           summary: `${failure.workflow_name} / ${failure.job_name} failed at ${step}.`,
         };
       }),
+      note: null,
     };
-  } catch {
-    return { failures: [], findings: [] };
+  } catch (error) {
+    // Enrichment stays non-fatal, but its absence must be legible: a 403 here
+    // almost always means GITHUB_READ_TOKEN lacks the Actions read permission
+    // that the jobs/job-log endpoints require on fine-grained PATs.
+    const message = error instanceof Error ? error.message : String(error);
+    const note = message.includes("(403)")
+      ? "CI failure details are unavailable: GitHub returned 403 for the Actions jobs/logs lookup. " +
+        "Grant the fine-grained GITHUB_READ_TOKEN Actions read permission to restore failing-job and log-tail enrichment."
+      : `CI failure details are unavailable: ${boundedSanitized(message, 300)}`;
+    return { failures: [], findings: [], note };
   }
 }
 
@@ -434,7 +444,9 @@ export async function handleGithubEvent(
       ticket,
       eventId: ci.eventId,
       outcome: "semantic_repair_required",
-      summary: `${ci.name} concluded ${ci.conclusion}.`,
+      summary: enrichment.note === null
+        ? `${ci.name} concluded ${ci.conclusion}.`
+        : `${ci.name} concluded ${ci.conclusion}. ${enrichment.note}`,
       evidence: [
         ci.url,
         ...enrichment.failures
@@ -449,6 +461,7 @@ export async function handleGithubEvent(
         url: ci.url,
         failures: enrichment.failures,
         findings: enrichment.findings,
+        ...(enrichment.note === null ? {} : { enrichment_note: enrichment.note }),
       },
       headSha: ci.headSha,
     });

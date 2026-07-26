@@ -84,11 +84,11 @@ export function createStatusStore(db: Database.Database): Pick<PipelineStore, "g
   return {
     getStatusForIssue(issueId: string): PipelineStatusProjection | undefined {
       const instance = db.prepare(`
-        SELECT pi.* FROM session_executions se
+        SELECT pi.*, t.pr_url AS ticket_pr_url FROM session_executions se
         JOIN pipeline_instances pi ON pi.id = se.pipeline_instance_id
         JOIN tickets t ON t.linear_session_id = se.linear_session_id
         WHERE t.linear_issue_id = ? AND se.execution_mode = 'pipeline'
-      `).get(issueId) as PipelineInstance | undefined;
+      `).get(issueId) as (PipelineInstance & { ticket_pr_url: string | null }) | undefined;
       if (!instance) return undefined;
       const attempt = db.prepare(`
         SELECT * FROM pipeline_stage_attempts
@@ -197,7 +197,12 @@ export function createStatusStore(db: Database.Database): Pick<PipelineStore, "g
         last_state_change_at: instance.updated_at,
         subject: instance.immutable_subject,
         published_commit: instance.published_commit,
-        published_pr_url: publishedPr?.external_url ?? publishedPr?.target_url ?? null,
+        // Production transitions persist only linear_ledger/github_summary
+        // receipts, so normal runs have no pull_request receipt; the ticket
+        // projection (populated by the pull-request webhook) is the durable
+        // fallback that keeps this field honest for the /status contract.
+        published_pr_url:
+          publishedPr?.external_url ?? publishedPr?.target_url ?? instance.ticket_pr_url ?? null,
         gate_result: gate?.result ?? null,
         assurance: gate?.assurance ?? null,
         policy_digest: gate?.policy_digest ?? null,

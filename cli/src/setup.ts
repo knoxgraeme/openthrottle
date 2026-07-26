@@ -11,7 +11,7 @@ const SUPERVISOR_ENV_VARS: Array<{ name: string; hint: string }> = [
   { name: "LINEAR_CLIENT_SECRET", hint: "Linear OAuth agent app" },
   { name: "GITHUB_WEBHOOK_SECRET", hint: "shared GitHub webhook signing secret" },
   { name: "GITHUB_TOKEN", hint: "fine-grained PAT with target-repository access" },
-  { name: "GITHUB_READ_TOKEN", hint: "fine-grained PAT with contents/PRs/checks read only" },
+  { name: "GITHUB_READ_TOKEN", hint: "fine-grained PAT with contents/PRs/checks/actions read only" },
   { name: "DAYTONA_API_KEY", hint: "Daytona API key" },
   { name: "DAYTONA_SNAPSHOT", hint: "default: openthrottle" },
   { name: "DEFAULT_AGENT", hint: "codex, claude, or opencode; default: codex" },

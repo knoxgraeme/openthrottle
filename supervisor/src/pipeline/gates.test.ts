@@ -1181,6 +1181,49 @@ describe("deterministic supervisor stage gates", () => {
     expect(JSON.parse(stored.payload)).toMatchObject({ failures: [], findings: [] });
   });
 
+  it("names the missing Actions read permission when enrichment is rejected with 403", async () => {
+    const fixture = setup("ce/implement@2");
+    fixture.db.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'running', immutable_subject = ?, published_commit = ?
+      WHERE id = ?
+    `).run(SUBJECT, SUBJECT, fixture.instance.id);
+    fixture.tickets.setSetting("github-head:issue-1", SUBJECT);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("Resource not accessible", { status: 403 })));
+
+    await handleGithubEvent(
+      { githubReadToken: "github-read-token" } as never,
+      fixture.tickets,
+      { publishActivity: vi.fn(async () => undefined), publishError: vi.fn(async () => undefined) },
+      {
+        kind: "workflow_run",
+        action: "completed",
+        repository: { full_name: "owner/repo" },
+        workflow_run: {
+          id: 22,
+          name: "CI",
+          status: "completed",
+          conclusion: "failure",
+          head_branch: "ot/issue-1",
+          head_sha: SUBJECT,
+          html_url: "https://github.com/owner/repo/actions/runs/22",
+        },
+      },
+      fixture.pipelines
+    );
+
+    const events = fixture.db.prepare("SELECT payload FROM provider_events").all() as Array<{ payload: string }>;
+    expect(events).toHaveLength(1);
+    const stored = JSON.parse(events[0]!.payload) as { summary: string; payload: string };
+    expect(stored.summary).toContain("CI concluded failure.");
+    expect(stored.summary).toContain("Actions read permission");
+    expect(JSON.parse(stored.payload)).toMatchObject({
+      failures: [],
+      findings: [],
+      enrichment_note: expect.stringContaining("Actions read permission") as unknown as string,
+    });
+  });
+
   it("keeps oversized enriched provider snapshot payloads valid JSON", () => {
     const fixture = setup("ce/implement@2");
     fixture.db.prepare(`
