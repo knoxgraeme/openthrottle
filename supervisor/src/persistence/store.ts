@@ -144,6 +144,7 @@ export interface SandboxEventRecord {
   next_attempt_at: string;
   processed_at: string | null;
   last_error: string | null;
+  ingestion_diagnosed_at: string | null;
   created_at: string;
 }
 

@@ -144,6 +144,62 @@ describe("coordinator-only server", () => {
     });
   });
 
+  it("includes repeated sandbox ingestion failures in pipeline status", async () => {
+    seedPipelineTicket();
+    expect(store.beginRun({
+      issueId: "issue-1",
+      runId: "run-ingestion",
+      taskType: "implement",
+      tokenHash: "token-hash",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    })).toBe(true);
+    store.insertSandboxEvent({
+      eventId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      runId: "run-ingestion",
+      sandboxId: "sandbox-1",
+      kind: "stage_result",
+      payload: JSON.stringify({ kind: "stage_result" }),
+    });
+    db.prepare(`
+      UPDATE sandbox_events
+      SET status = 'failed', attempts = 5, last_error = 'stage result attempt fence mismatch'
+      WHERE event_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+    `).run();
+
+    const transientResponse = await app().request("/status", {
+      headers: { Authorization: "Bearer status-token" },
+    });
+    expect(transientResponse.status).toBe(200);
+    const transientBody = await transientResponse.json() as {
+      tickets: Array<{ pipeline: Record<string, unknown> | null }>;
+    };
+    expect(transientBody.tickets[0]?.pipeline).toMatchObject({
+      sandbox_event_id: null,
+      sandbox_event_attempts: null,
+      sandbox_ingestion_error: null,
+    });
+
+    db.prepare(`
+      UPDATE sandbox_events
+      SET ingestion_diagnosed_at = '2026-07-26T00:00:00.000Z'
+      WHERE event_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+    `).run();
+
+    const response = await app().request("/status", {
+      headers: { Authorization: "Bearer status-token" },
+    });
+    expect(response.status).toBe(200);
+    const body = await response.json() as {
+      tickets: Array<{ pipeline: Record<string, unknown> | null }>;
+    };
+
+    expect(body.tickets[0]?.pipeline).toMatchObject({
+      sandbox_event_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      sandbox_event_attempts: 5,
+      sandbox_ingestion_error: "stage result attempt fence mismatch",
+    });
+  });
+
   it("does not fall back to direct stop or steering for an unpinned ticket", async () => {
     seedTicket();
     const stop = await app().request("/tickets/OT-1/stop", {

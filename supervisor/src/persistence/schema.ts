@@ -120,6 +120,7 @@ CREATE TABLE IF NOT EXISTS sandbox_events (
   next_attempt_at TEXT NOT NULL,
   processed_at TEXT,
   last_error TEXT,
+  ingestion_diagnosed_at TEXT,
   created_at TEXT NOT NULL,
   FOREIGN KEY(run_id) REFERENCES runs(id)
 );

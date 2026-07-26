@@ -79,6 +79,19 @@ export function createStatusStore(db: Database.Database): Pick<PipelineStore, "g
           : pendingEffect
             ? "pending"
             : "none";
+      const sandboxEvent = db.prepare(`
+        SELECT se.event_id, se.attempts, se.last_error
+        FROM sandbox_events se
+        JOIN runs r ON r.id = se.run_id
+        WHERE r.linear_issue_id = ?
+          AND se.status = 'failed'
+          AND se.last_error IS NOT NULL
+          AND se.ingestion_diagnosed_at IS NOT NULL
+        ORDER BY se.attempts DESC, se.created_at DESC, se.event_id DESC
+        LIMIT 1
+      `).get(instance.linear_issue_id) as
+        | { event_id: string; attempts: number; last_error: string | null }
+        | undefined;
       return {
         execution_mode: "pipeline",
         instance_id: instance.id,
@@ -111,6 +124,9 @@ export function createStatusStore(db: Database.Database): Pick<PipelineStore, "g
         effect_status: relevantEffect?.status ?? null,
         effect_attempts: relevantEffect?.attempts ?? null,
         effect_error: relevantEffect?.last_error ?? null,
+        sandbox_event_id: sandboxEvent?.event_id ?? null,
+        sandbox_event_attempts: sandboxEvent?.attempts ?? null,
+        sandbox_ingestion_error: sandboxEvent?.last_error ?? null,
       };
     },
   };

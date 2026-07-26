@@ -40,7 +40,7 @@ describe("deterministic supervisor stage gates", () => {
   let database: Database.Database | undefined;
   afterEach(() => database?.close());
 
-  function setup(manifestKey = "ce/investigate@2"): Fixture {
+  function setup(manifestKey = "ce/investigate@2", options: { maxAttempts?: number } = {}): Fixture {
     database = openDb(":memory:");
     const pipelines = createPipelineStore(database);
     const tickets = createSupervisorStore(database, pipelines);
@@ -48,6 +48,34 @@ describe("deterministic supervisor stage gates", () => {
       manifestKey.startsWith("fixture/") ? catalogPath : shippedCatalogPath,
       runtime.descriptor
     );
+    if (options.maxAttempts !== undefined) {
+      const selected = catalog.manifests.get(manifestKey)!;
+      const manifest = { ...selected.manifest, max_attempts: options.maxAttempts };
+      const normalized = canonicalJson(manifest);
+      (catalog.manifests as Map<string, typeof selected>).set(manifestKey, {
+        manifest,
+        normalized,
+        digest: digestNormalized(normalized),
+      });
+      const catalogNormalized = canonicalJson({
+        aliases: catalog.aliases,
+        manifests: [...catalog.manifests.values()].map((entry) => ({
+          id: entry.manifest.id,
+          version: entry.manifest.version,
+          digest: entry.digest,
+        })).sort((left, right) =>
+          `${left.id}@${left.version}`.localeCompare(`${right.id}@${right.version}`)
+        ),
+      });
+      (catalog as {
+        normalized: string;
+        digest: string;
+      }).normalized = catalogNormalized;
+      (catalog as {
+        normalized: string;
+        digest: string;
+      }).digest = digestNormalized(catalogNormalized);
+    }
     pipelines.acceptRuntimeDescriptor(runtime);
     pipelines.acceptCatalog(catalog);
     const config = parseRepositoryConfig("pipelines: { investigate: ce/investigate@2 }\ntest: npm test\n");
@@ -110,9 +138,12 @@ describe("deterministic supervisor stage gates", () => {
       details?: Record<string, unknown>;
       summary?: string;
       assurance?: "semantic_attested" | "executor_verified";
+      subject?: string;
+      preSubject?: string;
     } = {}
   ): PipelineEventArtifact {
     const assurance = options.assurance ?? fixture.stage.evaluator.assurance;
+    const subject = options.subject ?? SUBJECT;
     const payload = canonicalJson({
       schema: `openthrottle.artifact/${kind}@1`,
       kind,
@@ -143,9 +174,9 @@ describe("deterministic supervisor stage gates", () => {
       repository: {
         name: fixture.instance.repository,
         base_commit: fixture.instance.base_commit,
-        subject: SUBJECT,
-        pre_subject: fixture.instance.base_commit,
-        post_subject: SUBJECT,
+        subject,
+        pre_subject: options.preSubject ?? fixture.attempt.expected_subject ?? fixture.instance.base_commit,
+        post_subject: subject,
       },
       assurance,
       result,
@@ -158,19 +189,22 @@ describe("deterministic supervisor stage gates", () => {
       completed_at: "2026-07-22T00:00:01.000Z",
       details: options.details ?? { proposal_schema: "openthrottle.stage-proposal/v1" },
     });
-    return { kind, schemaVersion: 1, assurance, subject: SUBJECT, payload, hash: digestNormalized(payload) };
+    return { kind, schemaVersion: 1, assurance, subject, payload, hash: digestNormalized(payload) };
   }
 
   function event(fixture: Fixture, result: StageOutcome | "not_configured" = "success", options: {
     findings?: Array<{ severity: "P0" | "P1" | "P2" | "P3"; code: string; summary: string }>;
     details?: Record<string, unknown>;
     summary?: string;
+    subject?: string;
+    preSubject?: string;
+    id?: string;
   } = {}): PipelineCoordinatorEvent {
     const kinds = ["stage_result", ...fixture.stage.evaluator.required_artifacts]
       .filter((kind, index, values) => values.indexOf(kind) === index);
     const artifacts = kinds.map((kind) => artifact(fixture, kind, result, options));
     return {
-      id: `event-${digestNormalized(canonicalJson([result, options])).slice(0, 16)}`,
+      id: options.id ?? `event-${digestNormalized(canonicalJson([result, options])).slice(0, 16)}`,
       kind: "stage_result",
       instanceId: fixture.instance.id,
       generation: fixture.instance.generation,
@@ -180,9 +214,149 @@ describe("deterministic supervisor stage gates", () => {
       requestHash: fixture.attempt.request_hash,
       outcome: result === "not_configured" ? "no_change" : result,
       resultHash: artifacts.find((candidate) => candidate.kind === "stage_result")!.hash,
-      subject: SUBJECT,
+      subject: options.subject ?? SUBJECT,
       artifacts,
     };
+  }
+
+  function currentStageFixture(fixture: Fixture): Fixture {
+    const instance = fixture.pipelines.getInstance(fixture.instance.id)!;
+    const attempt = fixture.pipelines.getActiveAttempt(instance.id)!;
+    return {
+      ...fixture,
+      instance,
+      attempt,
+      stage: fixture.manifest.stages.find((candidate) => candidate.id === attempt.stage_id)!,
+    };
+  }
+
+  function startAttempt(fixture: Fixture): Fixture {
+    const current = currentStageFixture(fixture);
+    const request = current.pipelines.getStageRequest(current.attempt.id);
+    const ticket = current.tickets.getByIssueId(current.instance.linear_issue_id)!;
+    if (ticket.run_id !== request.runId) {
+      expect(current.tickets.beginRun({
+        issueId: current.instance.linear_issue_id,
+        runId: request.runId,
+        taskType: current.instance.task_type,
+        tokenHash: `token-${request.runId}`,
+        expiresAt: "2099-01-01T00:00:00.000Z",
+      })).toBe(true);
+    }
+    if (!current.pipelines.getAttempt(current.attempt.id)!.run_id) {
+      current.pipelines.bindStageRun(current.attempt.id, request.runId);
+    }
+    current.pipelines.markStageDispatched(current.attempt.id);
+    return currentStageFixture(current);
+  }
+
+  function settleCurrentStage(
+    fixture: Fixture,
+    result: StageOutcome | "not_configured",
+    options: Parameters<typeof event>[2] = {}
+  ): PipelineInstance {
+    const running = startAttempt(fixture);
+    const input = event(running, result, {
+      ...options,
+      details: options.details ?? (running.stage.evaluator.kind === "command"
+        ? { not_configured: false, timed_out: false, exit_code: 0, signal: null }
+        : undefined),
+    });
+    return completeStageAttemptActor(
+      running.pipelines,
+      running.tickets,
+      input,
+      { observedSubject: options.subject ?? SUBJECT }
+    );
+  }
+
+  function settleForwardChainToPublish(
+    fixture: Fixture,
+    subject: string,
+    previousSubject: string,
+    round: number
+  ): PipelineInstance {
+    let instance = fixture.pipelines.getInstance(fixture.instance.id)!;
+    while (instance.active_stage_id !== "implementation") {
+      const stageId = instance.active_stage_id!;
+      instance = settleCurrentStage(fixture, "success", {
+        id: `${stageId}-${round}`,
+        subject: previousSubject,
+        preSubject: previousSubject,
+      });
+    }
+    instance = settleCurrentStage(fixture, "success", {
+      id: `implementation-${round}`,
+      subject,
+      preSubject: previousSubject,
+    });
+    while (instance.active_stage_id !== "publish") {
+      const stageId = instance.active_stage_id!;
+      instance = settleCurrentStage(fixture, "success", {
+        id: `${stageId}-${round}`,
+        subject,
+        preSubject: subject,
+      });
+    }
+    return instance;
+  }
+
+  function settleRepairRoundPublishes(fixture: Fixture, rounds: number): PipelineInstance {
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    let instance = fixture.instance;
+    let previousSubject = fixture.instance.base_commit;
+    for (let round = 1; round <= rounds; round += 1) {
+      const subject = `${round}`.repeat(40);
+      const commit = `${String.fromCharCode(96 + round)}`.repeat(40);
+      instance = settleForwardChainToPublish(fixture, subject, previousSubject, round);
+      expect(instance).toMatchObject({ status: "dispatchable", active_stage_id: "publish" });
+
+      instance = settleCurrentStage(fixture, "success", {
+        id: `publish-${round}`,
+        subject,
+        preSubject: subject,
+        details: {
+          proposal_schema: "openthrottle.stage-proposal/v1",
+          published_commit: commit,
+        },
+      });
+      expect(instance).toMatchObject({
+        status: "waiting_provider",
+        active_stage_id: "provider",
+        immutable_subject: subject,
+        published_commit: commit,
+      });
+      fixture.tickets.setSetting("github-head:issue-1", commit);
+
+      if (round === rounds) break;
+
+      expect(routePipelineProviderEvent({
+        pipelines: fixture.pipelines,
+        store: fixture.tickets,
+        ticket: fixture.tickets.getByIssueId("issue-1")!,
+        eventId: `provider-repair-${round}`,
+        outcome: "semantic_repair_required",
+        summary: `Provider feedback for round ${round}`,
+        evidence: [`https://github.com/owner/repo/pull/1#round-${round}`],
+        payload: { round, head_sha: commit },
+        headSha: commit,
+        pullRequestUrl: "https://github.com/owner/repo/pull/1",
+      })).toBe(true);
+
+      instance = fixture.pipelines.getInstance(fixture.instance.id)!;
+      expect(instance).toMatchObject({
+        status: "dispatchable",
+        active_stage_id: "implementation",
+        immutable_subject: subject,
+        published_commit: commit,
+      });
+      expect(fixture.pipelines.getActiveAttempt(instance.id)).toMatchObject({
+        stage_id: "implementation",
+        expected_subject: subject,
+      });
+      previousSubject = subject;
+    }
+    return instance;
   }
 
   it("creates an identical canonical receipt for identical evidence", () => {
@@ -401,6 +575,75 @@ describe("deterministic supervisor stage gates", () => {
 
     const missing = event(publishFixture, "success");
     expect(() => evaluateStageGate(fixture.pipelines, missing)).toThrow(/provider commit/);
+  });
+
+  it("settles a second publish after provider feedback repair re-entry", () => {
+    const fixture = setup("ce/implement@3");
+
+    const completed = settleRepairRoundPublishes(fixture, 2);
+
+    expect(completed).toMatchObject({
+      status: "waiting_provider",
+      active_stage_id: "provider",
+      immutable_subject: "2".repeat(40),
+      published_commit: "b".repeat(40),
+    });
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "provider",
+      expected_subject: "2".repeat(40),
+    });
+    expect(fixture.db.prepare(`
+      SELECT COUNT(*) AS count FROM pipeline_inbox_events
+      WHERE id = 'publish-2' AND status = 'consumed'
+    `).get()).toEqual({ count: 1 });
+    expect(fixture.db.prepare(`
+      SELECT evaluator_kind, subject, result FROM pipeline_gate_receipts
+      WHERE attempt_id = (
+        SELECT id FROM pipeline_stage_attempts
+        WHERE pipeline_instance_id = ? AND stage_id = 'publish'
+        ORDER BY attempt_ordinal DESC LIMIT 1
+      )
+    `).get(fixture.instance.id)).toEqual({
+      evaluator_kind: "publish_subject",
+      subject: "2".repeat(40),
+      result: "passed",
+    });
+    expect(fixture.db.prepare(`
+      SELECT attempt_id FROM pipeline_publication_receipts
+      WHERE pipeline_instance_id = ? AND kind = 'github_summary'
+    `).get(fixture.instance.id)).toEqual({
+      attempt_id: (fixture.db.prepare(`
+        SELECT id FROM pipeline_stage_attempts
+        WHERE pipeline_instance_id = ? AND stage_id = 'publish'
+        ORDER BY attempt_ordinal DESC LIMIT 1
+      `).pluck().get(fixture.instance.id) as string),
+    });
+    expect(fixture.db.prepare(`
+      SELECT COUNT(*) AS count FROM pipeline_publication_receipts
+      WHERE pipeline_instance_id = ? AND kind = 'linear_ledger'
+        AND idempotency_key LIKE 'linear-wait:%:provider:%'
+    `).get(fixture.instance.id)).toEqual({ count: 2 });
+  });
+
+  it("settles a third publish after two provider feedback repair rounds", () => {
+    const fixture = setup("ce/implement@3", { maxAttempts: 40 });
+
+    const completed = settleRepairRoundPublishes(fixture, 3);
+
+    expect(completed).toMatchObject({
+      status: "waiting_provider",
+      active_stage_id: "provider",
+      immutable_subject: "3".repeat(40),
+      published_commit: "c".repeat(40),
+    });
+    expect(fixture.db.prepare(`
+      SELECT COUNT(*) AS count FROM pipeline_inbox_events
+      WHERE id IN ('publish-1', 'publish-2', 'publish-3') AND status = 'consumed'
+    `).get()).toEqual({ count: 3 });
+    expect(fixture.db.prepare(`
+      SELECT COUNT(*) AS count FROM pipeline_gate_receipts
+      WHERE pipeline_instance_id = ? AND evaluator_kind = 'publish_subject'
+    `).get(fixture.instance.id)).toEqual({ count: 3 });
   });
 
   it("keeps non-blocking publication diagnostics on the bounded publish retry", () => {
