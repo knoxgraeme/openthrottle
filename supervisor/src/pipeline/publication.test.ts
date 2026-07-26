@@ -481,8 +481,8 @@ describe("pipeline publication", () => {
     });
 
     expect(publication.body).toContain("### Findings");
-    expect(publication.body).toContain("[P1] provider-snapshot-bounding — snapshot payload unbounded -> fixed in-stage");
-    expect(publication.body).toContain("[P3] status-copy — receipt copy needs clarity -> remaining/accepted");
+    expect(publication.body).toContain("[P1] provider-snapshot-bounding — snapshot payload unbounded → fixed in-stage");
+    expect(publication.body).toContain("[P3] status-copy — receipt copy needs clarity → remaining/accepted");
     expect(renderLinearStatusComment(publication)).toContain("[P1] provider-snapshot-bounding");
     expect(renderGithubPipelineSummary(publication)).toContain("[P3] status-copy");
   });
@@ -522,7 +522,45 @@ describe("pipeline publication", () => {
 
     expect(publication.body).toContain("scheduled repair round 2 of 2 at the resume stage");
     expect(publication.body)
-      .toContain("[P0] provider-snapshot-bounding — snapshot payload unbounded -> carried to repair");
+      .toContain("[P0] provider-snapshot-bounding — snapshot payload unbounded → carried to repair");
+  });
+
+  it("renders post-repair findings with per-item resolution status", () => {
+    const { instance, attempt } = setup("fixture/agent@1");
+    const input = event(instance, attempt);
+    replaceStagePayload(input, {
+      summary: "Repair completed.",
+      evidence: ["Rechecked the findings that triggered repair."],
+      findings: [
+        { severity: "P1", code: "provider-snapshot-bounding", summary: "snapshot payload unbounded" },
+        { severity: "P2", code: "status-copy", summary: "receipt copy needs clarity" },
+      ],
+      actions: ["Fixed provider snapshot bounding and verified coverage."],
+      uncertainty: [],
+    });
+    const publication = buildStagePublication({
+      instance,
+      attempt: { ...attempt, stage_id: "resume", reentry_ordinal: 1 },
+      event: input.event,
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: attempt.id,
+        outcome: "success",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+    });
+
+    expect(publication.body)
+      .toContain("[P1] provider-snapshot-bounding — snapshot payload unbounded → fixed in-stage");
+    expect(publication.body)
+      .toContain("[P2] status-copy — receipt copy needs clarity → remaining/accepted");
   });
 
   it("omits findings scaffolding when artifacts have no findings", () => {
@@ -591,7 +629,7 @@ describe("pipeline publication", () => {
       gateReceipt: input.receipt,
     });
 
-    expect(publication.body).toContain("[P1] finding-10 — finding summary 10 -> remaining/accepted");
+    expect(publication.body).toContain("[P1] finding-10 — finding summary 10 → remaining/accepted");
     expect(publication.body).not.toContain("finding-11");
     expect(publication.body).toContain("+2 more");
   });

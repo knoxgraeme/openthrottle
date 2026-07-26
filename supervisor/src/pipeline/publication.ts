@@ -417,9 +417,9 @@ function actionAddressesFinding(action: string, finding: PublicationFinding): bo
   const normalizedAction = normalizedFindingToken(action);
   const normalizedCode = normalizedFindingToken(finding.code);
   const normalizedSummary = normalizedFindingToken(finding.summary);
+  const codeTokens = findingCodeTokens(finding.code);
   return (normalizedCode.length > 0 && normalizedAction.includes(normalizedCode)) ||
-    (findingCodeTokens(finding.code).length > 1 &&
-      findingCodeTokens(finding.code).every((token) => normalizedAction.includes(token))) ||
+    (codeTokens.length > 1 && codeTokens.every((token) => normalizedAction.includes(token))) ||
     (normalizedSummary.length > 0 && normalizedAction.includes(normalizedSummary));
 }
 
@@ -444,7 +444,7 @@ function findingsSectionLines(envelope: PipelinePublicationBodyInput): string[] 
     "### Findings",
     ...visible.map((finding) => {
       const disposition = dispositionForFinding(finding, actions, envelope);
-      return `[${finding.severity}] ${finding.code} — ${finding.summary} -> ${disposition}`;
+      return `[${finding.severity}] ${finding.code} — ${finding.summary} → ${disposition}`;
     }),
   ];
   const omitted = findings.length - visible.length;
