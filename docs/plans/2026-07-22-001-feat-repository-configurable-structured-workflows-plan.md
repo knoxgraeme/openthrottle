@@ -4,12 +4,14 @@ type: feat
 date: 2026-07-22
 deepened: 2026-07-22
 artifact_contract: ce-unified-plan/v1
-artifact_readiness: implementation-ready
+artifact_readiness: requires-regrounding
 product_contract_source: ce-plan-bootstrap
 execution: code
 ---
 
 # Repository-configurable execution graphs - Plan
+
+> **REGROUNDING REQUIRED before shipping.** This contract was authored against the pre-refactor flat `supervisor/src` layout. The 2026-07-25 module-boundaries refactor (PRs #49-#53) moved those responsibilities under `app/`, `http/`, `pipeline/`, `persistence/`, `providers/`, `runtime/`, `operations/`, and `shared/`, and only `index.ts` may exist at the source root. Every `Files` list and flat-path reference in the implementation units (e.g. `supervisor/src/execution-graph.ts`, `supervisor/src/pipeline-manifest.ts`) is historical and must be re-derived against `AGENTS.md`'s ownership map and the architecture test before this plan is delegated. Requirements, KTDs, flows, and acceptance examples remain the authoritative contract; the unit file inventories do not.
 
 ## Goal Capsule
 
@@ -706,7 +708,7 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 3. Persist child effects before execution and reconcile provider/Git success by idempotency key and exact subject after crashes.
 4. Enforce one-active-action, one-current-attempt-per-unit, accepted-candidate uniqueness, and integration-head compare-and-swap in the same transaction that records a gate and plans the next effect.
 5. Evaluate unit gates deterministically from current standard receipts. Persist the full decision payload/hash and publish it before advancing when publication policy requires.
-6. Treat downstream context as immutable records addressed to existing pending U-IDs. Reject topology changes.
+6. Treat downstream context as immutable records addressed to existing pending U-IDs. Reject every topology change except a validated R36 scope-preserving split of a pending, never-attempted unit, which the reducer applies as a recorded, digested graph revision (parent unit closed as `split`); anything else returns `needs_human`.
 7. Roll all integrated units into one aggregate artifact that settles the parent stage exactly once.
 8. Parent stop/supersede fences new child effects, terminates the active action, cleans known worktrees, and settles once.
 
@@ -932,11 +934,12 @@ bats sandbox/tests/runtime.bats
 
 1. **Config/compiler:** built-in and repository sources, simple parity, all node kinds, unknown fields, missing refs, unsupported capabilities, canonical digests, and exact-commit skill closures.
 2. **Execution plan:** valid CE plan, missing/multiple blocks, duplicate IDs, cycles, unknown refs, bounds, structured-required versus simple-optional behavior, and CLI/supervisor parity.
-3. **Serial reducer:** stable readiness order, one action lease, loop retries, same/fresh session rules, downstream context, human pause, stop, exhaustion, and exact-once aggregate.
+3. **Serial reducer:** stable readiness order, recorded lead unit selection with deterministic fallback order, one action lease, loop retries, same/fresh session rules, downstream context, validated split application and split-rejection paths, human pause, stop, exhaustion, and exact-once aggregate.
 4. **Worktree/Git:** exact integration base, sealed state, worker no-commit/no-push, unit and final-repair candidate creation, lead-bound unit subjects, executor-owned integration, cleanup, and wrong-subject rejection.
 5. **Gates:** semantic pass/fail, executor discrepancy, command pass/fail/missing, freshness/provenance/fence checks, final repair invalidating prior review, publish subject, and provider head.
 6. **Publication:** parent Linear ledger, sanitization, ordered retry, stale answer, final PR gate section, and visible publication debt.
 7. **Skill portability:** CE defaults and non-CE fixtures for unit, lead, review, repair, and publish receipt contracts.
+8. **Slice continuation:** lead slice-proposal validation, frontier byte-identity and digesting, terminal rendering of remaining work, merge-evidence continuation admission on the same ticket, and the needs_human paths for closed-unmerged PRs, stale frontiers, and exhausted continuation bounds.
 
 ### Image and lifecycle gate
 
@@ -980,7 +983,8 @@ This gate consumes operator credentials and must never be reported as locally pa
 
 ### Global completion
 
-- R1–R34 and AE1–AE16 are traceable to code, tests, and durable artifacts.
+- R1–R38 and AE1–AE17 are traceable to code, tests, and durable artifacts.
+- Lead ready-unit selection is recorded on dispatch receipts, a validated scope-preserving split lands as a digested graph revision, and a merged slice PR admits a continuation generation from the typed frontier without human action — each proven by the R35–R38 matrices.
 - Repositories select among multiple named graphs and can copy/edit a built-in using graph/loop/worker/command/skill/MCP/limit configuration only.
 - `simple` continues to accept a complete plan and preserves current whole-plan behavior.
 - `structured` requires validator-clean unit JSON and executes one serial unit at a time.
@@ -1018,6 +1022,7 @@ This gate consumes operator credentials and must never be reported as locally pa
 | Deterministic gates and repair | R21–R26 | U4, U6 |
 | Linear, PR, credentials, MCP | R27–R31 | U5, U7, U8 |
 | Commands and bounds | R32–R34 | U1, U3, U4, U6, U8 |
+| Lead scheduling, splits, slice continuation | R35–R38 | U3, U4, U6, U7 |
 
 ### Execution contract for this plan
 

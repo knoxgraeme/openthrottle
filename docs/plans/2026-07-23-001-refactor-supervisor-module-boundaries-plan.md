@@ -12,17 +12,21 @@ execution: code
 
 ## PLAN COMPLETE (2026-07-25)
 
-All eight units are merged to `main`: U1-U4 (#49, `566f552`), U5 (#50, `010bf1f`), U6 (#51, `527fad9`), U8 (#52, `8483233`), U7 (#53, `44cf6a6`). The post-merge U8 review follow-up (attempt-actor stall coverage + settlement dedup) is PR #55. Remaining tail, outside this plan's scope by design: destructive schema contraction of the legacy `runs`/`run_liveness` rows (separate, later, independently approved release per R21), and disposition of the recorded coverage-gap debt if #53 did not close it. The status below is retained as the execution record. **U1–U4, U5, U6, and U8 are complete**:
-- U1–U4: PR #49, merged to `main` as `566f552`.
+**This plan is a closed historical record. No units remain. Do not execute, ship, or delegate it — a run admitted against this document must stop immediately and surface that it was given a completed plan.**
+
+Execution record — all eight units merged to `main`:
+- U1–U4: PR #49, merged as `566f552`.
 - U5: PR #50 ("rehome provider boundaries"), merged as `010bf1f`.
 - U6: PR #51 ("isolate runtime operations", plus the `runtime/events` extraction and the `337b106` CI parity-path fix), merged as `527fad9`.
-- U8: PR #52 ("unify stage attempt actor state") — additive `pipeline_attempt_actors` migration with backfill preserving heartbeat/reaping/quarantine/settlement state; sandbox-backed attempts own actor liveness and settlement directly; the `settleStageEvidence -> finishRun` bridge is removed from the live path; legacy `runs`/`run_liveness` rows retained as read-only compatibility history with the legacy direct-run fallback preserved. **Verify PR #52 is merged to `main` before starting; if it is not, stop and surface that.**
+- U8: PR #52 ("unify stage attempt actor state"), merged as `8483233` — additive `pipeline_attempt_actors` migration with a backfill preserving heartbeat/reaping/quarantine/settlement state; sandbox-backed attempts own actor liveness and settlement directly; legacy `runs`/`run_liveness` rows retained as read-only compatibility history.
+- U7: PR #53 ("enforce module boundaries"), merged as `44cf6a6` — composition root, executable architecture test, CI focused-path updates, `AGENTS.md`/README ownership map, transitional structure removed.
+- Post-merge U8 review follow-up (attempt-actor stall coverage + settlement dedup): PR #55.
 
-Do not redo completed units. Begin by verifying their acceptance against the merged base — supervisor typecheck/build/tests green, `better-sqlite3` confined to `persistence/`, `hono` confined to `http/`, provider SDK/client imports confined to `providers/*`, `@daytona/sdk` confined to the Daytona adapter, historical migration checksums identical with exactly one new `pipeline_attempt_actors` ledger entry, and the reaper/stop/settlement test matrices green against the unified actor model — and treat any verification failure as a blocker to surface, not as a trigger to re-execute those units.
+Completion verification performed and satisfied: supervisor typecheck/build/tests green (241 tests at close); `better-sqlite3` confined to `persistence/`; `hono` confined to `http/`; provider SDK/client imports confined to `providers/*`; `@daytona/sdk` confined to the Daytona adapter; historical migration checksums identical with exactly one new `pipeline_attempt_actors` ledger entry; reaper/stop/settlement matrices green against the unified actor model.
 
-**Remaining execution: U7 only — the closing unit.** U7 finalizes the refactor: `supervisor/src/index.ts` as the sole composition root constructing the composed store, provider clients, Daytona adapter, runtime services, and HTTP server; the executable architecture test (Vitest + TypeScript compiler API per KTD10) enforcing the final import/ownership rules including the R20-R22 rule that no production path outside persistence reads `runs`/`run_liveness`; verification of every remaining CI focused-test path (the parity step is already fixed — check all others); `AGENTS.md` and `supervisor/README.md` updated to the new ownership map; and removal of every transitional facade, shim, or root-level production module other than `index.ts`. Also disposition the known coverage-gap debt for new persistence/pipeline modules: close it where U7's enforcement touches those modules, or record it explicitly as accepted follow-up in the PR body.
+Remaining tail, intentionally outside this plan's scope: destructive schema contraction of the legacy `runs`/`run_liveness` rows (a separate, later, independently approved release per R21), and disposition of the recorded coverage-gap debt for new persistence/pipeline modules.
 
-The Problem Frame's file/line/test counts below describe the pre-U1 baseline and are now historical; re-verify current counts against `main` before relying on them.
+Everything below this banner — per-unit STATUS markers included — is preserved authoring and continuation history: read it as record, not instruction. The Problem Frame's counts describe the pre-U1 baseline.
 
 ## Goal Capsule
 
