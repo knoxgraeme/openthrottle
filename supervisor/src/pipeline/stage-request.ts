@@ -1,13 +1,56 @@
 import {
+  type ArtifactKind,
   canonicalJson,
   digestNormalized,
+  type ContextPolicy,
   type PipelineStage,
 } from "./manifest.js";
-import {
-  STAGE_EXECUTOR_PROTOCOL,
-  createStageRequestHash,
-  type StageRequestEnvelope,
-} from "../runtime/contracts.js";
+
+export const STAGE_EXECUTOR_PROTOCOL = "stage-executor@1";
+
+export interface StageRequestEnvelope {
+  protocol: typeof STAGE_EXECUTOR_PROTOCOL;
+  pipelineInstanceId: string;
+  manifestDigest: string;
+  runtimeRelease: string;
+  capabilityDigest: string;
+  repositoryConfigDigest: string;
+  stageId: string;
+  attemptId: string;
+  requestHash: string;
+  idempotencyKey: string;
+  runId: string;
+  issueId: string;
+  sessionId: string;
+  generation: number;
+  taskType: "implement" | "investigate";
+  taskContext: string;
+  transitionContext: string;
+  repository: string;
+  baseCommit: string;
+  baseBranch: string;
+  branch: string;
+  agent: "claude" | "codex" | "opencode";
+  contextRevision: number;
+  expectedSubject: string | null;
+  contextPolicy: ContextPolicy;
+  nativeSessionId: string | null;
+  capability: string;
+  requiredArtifacts: ArtifactKind[];
+  credentialScopes: string[];
+  liveSteering: boolean;
+  commandName?: "test" | "lint" | "build" | "format";
+}
+
+export function createStageRequestHash(
+  request: Omit<StageRequestEnvelope, "requestHash" | "idempotencyKey">
+): Pick<StageRequestEnvelope, "requestHash" | "idempotencyKey"> {
+  const requestHash = digestNormalized(canonicalJson(request));
+  return {
+    requestHash,
+    idempotencyKey: `stage:${request.pipelineInstanceId}:${request.stageId}:${request.attemptId}:${requestHash}`,
+  };
+}
 
 function deterministicId(prefix: string, input: unknown): string {
   return `${prefix}-${digestNormalized(canonicalJson(input)).slice(0, 32)}`;

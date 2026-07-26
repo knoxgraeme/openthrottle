@@ -4,7 +4,7 @@ import type { Config } from "../app/config.js";
 import type { SupervisorStore } from "../persistence/store.js";
 import { createSupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
-import { createLinearOutboxProcessor } from "../providers/linear/outbox.js";
+import { createLinearActivityPublisher, createLinearOutboxProcessor } from "../providers/linear/outbox.js";
 import { reapStalledRuns } from "./reaper.js";
 import type { PipelineStore } from "../pipeline/store.js";
 
@@ -25,6 +25,9 @@ function makeDaytona(stopError?: Error) {
 // tryPostError, so the enqueued error row stays visible in listLinearOutbox().
 const makeOutbox = (store: SupervisorStore) =>
   createLinearOutboxProcessor({ store, getLinearClient: async () => undefined });
+
+const makeActivityPublisher = (store: SupervisorStore, outbox: ReturnType<typeof makeOutbox>) =>
+  createLinearActivityPublisher(store, outbox);
 
 const addTicket = (store: SupervisorStore, id: string, sandboxId: string | null) =>
   store.upsert({
@@ -77,7 +80,7 @@ describe("reapStalledRuns", () => {
     );
     store.renewRunLiveness("run-stalled", "2020-01-01T00:00:00.000Z");
 
-    await reapStalledRuns({ runtime, store, linearOutbox, cfg });
+    await reapStalledRuns({ runtime, store, activityPublisher: makeActivityPublisher(store, linearOutbox), cfg });
 
     // The stalled run is reaped: run terminal, ticket errored, run_id cleared.
     expect(store.getRun("run-stalled")?.status).toBe("timed_out");
@@ -138,7 +141,7 @@ describe("reapStalledRuns", () => {
     });
     store.renewRunLiveness("run-beating", new Date().toISOString());
 
-    await reapStalledRuns({ runtime, store, linearOutbox, cfg });
+    await reapStalledRuns({ runtime, store, activityPublisher: makeActivityPublisher(store, linearOutbox), cfg });
 
     expect(store.getRun("run-beating")?.status).toBe("running");
     expect(store.getByIssueId("beating")?.run_id).toBe("run-beating");
@@ -166,7 +169,7 @@ describe("reapStalledRuns", () => {
       "run-booting"
     );
 
-    await reapStalledRuns({ runtime, store, linearOutbox, cfg });
+    await reapStalledRuns({ runtime, store, activityPublisher: makeActivityPublisher(store, linearOutbox), cfg });
 
     expect(store.getRun("run-booting")?.status).toBe("timed_out");
     expect(store.getByIssueId("booting")?.run_id).toBeNull();
@@ -191,7 +194,7 @@ describe("reapStalledRuns", () => {
       "run-wedged"
     );
 
-    await reapStalledRuns({ runtime, store, linearOutbox, cfg });
+    await reapStalledRuns({ runtime, store, activityPublisher: makeActivityPublisher(store, linearOutbox), cfg });
 
     expect(store.getRun("run-wedged")?.status).toBe("quarantined");
     expect(store.getByIssueId("wedged")).toMatchObject({
@@ -243,7 +246,7 @@ describe("reapStalledRuns", () => {
       getActiveAttempt,
     } as unknown as PipelineStore;
 
-    await reapStalledRuns({ runtime, store, linearOutbox, cfg, pipelines });
+    await reapStalledRuns({ runtime, store, activityPublisher: makeActivityPublisher(store, linearOutbox), cfg, pipelines });
 
     expect(setRuntimeResourceStatus).toHaveBeenCalledWith("pipeline-1", "quarantined");
     expect(getActiveAttempt).not.toHaveBeenCalled();
@@ -297,9 +300,9 @@ describe("reapStalledRuns", () => {
     const runtime = { stopResource: sandbox.stop };
     const linearOutbox = makeOutbox(store);
 
-    const first = reapStalledRuns({ runtime, store, linearOutbox, cfg });
+    const first = reapStalledRuns({ runtime, store, activityPublisher: makeActivityPublisher(store, linearOutbox), cfg });
     await vi.waitFor(() => expect(sandbox.stop).toHaveBeenCalledOnce());
-    await reapStalledRuns({ runtime, store, linearOutbox, cfg });
+    await reapStalledRuns({ runtime, store, activityPublisher: makeActivityPublisher(store, linearOutbox), cfg });
     expect(runtime.stopResource).toHaveBeenCalledOnce();
 
     confirmStop();
@@ -328,7 +331,7 @@ describe("reapStalledRuns", () => {
     }
     const acquire = vi.spyOn(store, "acquireSupervisorLease");
 
-    await reapStalledRuns({ runtime, store, linearOutbox, cfg });
+    await reapStalledRuns({ runtime, store, activityPublisher: makeActivityPublisher(store, linearOutbox), cfg });
 
     expect(acquire).toHaveBeenCalledTimes(3); // initial acquisition + each actor
     expect(store.getRun("run-first")?.status).toBe("timed_out");
@@ -342,7 +345,7 @@ describe("reapStalledRuns", () => {
     const linearOutbox = makeOutbox(store);
 
     await expect(
-      reapStalledRuns({ runtime, store, linearOutbox, cfg })
+      reapStalledRuns({ runtime, store, activityPublisher: makeActivityPublisher(store, linearOutbox), cfg })
     ).resolves.toBeUndefined();
     expect(store.listLinearOutbox()).toHaveLength(0);
   });

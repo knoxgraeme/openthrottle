@@ -15,8 +15,10 @@ import {
   type RuntimeCapabilityInventory,
   type StageOutcome,
 } from "../pipeline/manifest.js";
-
-export const STAGE_EXECUTOR_PROTOCOL = "stage-executor@1";
+import {
+  STAGE_EXECUTOR_PROTOCOL,
+  type StageRequestEnvelope,
+} from "../pipeline/stage-request.js";
 
 export interface RuntimeCapabilityDescriptor extends RuntimeCapabilityInventory {
   schema: "openthrottle.runtime-capabilities/v1";
@@ -29,40 +31,6 @@ export interface ValidatedRuntimeCapabilityDescriptor {
   descriptor: RuntimeCapabilityDescriptor;
   normalized: string;
   digest: string;
-}
-
-export interface StageRequestEnvelope {
-  protocol: typeof STAGE_EXECUTOR_PROTOCOL;
-  pipelineInstanceId: string;
-  manifestDigest: string;
-  runtimeRelease: string;
-  capabilityDigest: string;
-  repositoryConfigDigest: string;
-  stageId: string;
-  attemptId: string;
-  requestHash: string;
-  idempotencyKey: string;
-  runId: string;
-  issueId: string;
-  sessionId: string;
-  generation: number;
-  taskType: "implement" | "investigate";
-  taskContext: string;
-  transitionContext: string;
-  repository: string;
-  baseCommit: string;
-  baseBranch: string;
-  branch: string;
-  agent: "claude" | "codex" | "opencode";
-  contextRevision: number;
-  expectedSubject: string | null;
-  contextPolicy: ContextPolicy;
-  nativeSessionId: string | null;
-  capability: string;
-  requiredArtifacts: ArtifactKind[];
-  credentialScopes: string[];
-  liveSteering: boolean;
-  commandName?: "test" | "lint" | "build" | "format";
 }
 
 export interface StageExecutionResult {
@@ -307,16 +275,6 @@ export function buildInstalledRuntimeDescriptor(
     }).sort(([left], [right]) => left.localeCompare(right))),
   } satisfies RuntimeCapabilityDescriptor;
   return validateRuntimeCapabilityDescriptor(descriptor, release);
-}
-
-export function createStageRequestHash(
-  request: Omit<StageRequestEnvelope, "requestHash" | "idempotencyKey">
-): Pick<StageRequestEnvelope, "requestHash" | "idempotencyKey"> {
-  const requestHash = digestNormalized(canonicalJson(request));
-  return {
-    requestHash,
-    idempotencyKey: `stage:${request.pipelineInstanceId}:${request.stageId}:${request.attemptId}:${requestHash}`,
-  };
 }
 
 export function newOpaqueResourceId(): string {

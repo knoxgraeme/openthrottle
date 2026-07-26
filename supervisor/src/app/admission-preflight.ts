@@ -13,8 +13,8 @@
 //     opaquely. Estimate usage from live sandboxes and reject when one more
 //     sandbox cannot fit. A broken capacity probe never blocks admission.
 
-import type { Config } from "./app/config.js";
-import type { RuntimeInventory } from "./runtime/contracts.js";
+import type { Config } from "./config.js";
+import type { RuntimeInventory } from "../runtime/contracts.js";
 
 const HTTP_TIMEOUT_MS = 15_000;
 export const DEFAULT_DAYTONA_TOTAL_MEMORY_GIB = 10;

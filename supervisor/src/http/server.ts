@@ -35,10 +35,9 @@ import {
   createWebhookDeliveryProcessor,
   type WebhookDeliveryProcessor,
 } from "./webhook-delivery.js";
-import { createLinearOutboxProcessor, enqueueActivity, tryPostError, type LinearOutboxProcessor } from "../providers/linear/outbox.js";
+import { createLinearActivityPublisher, createLinearOutboxProcessor, tryPostError, type LinearOutboxProcessor } from "../providers/linear/outbox.js";
 import { handleLinearEvent, type PipelineCoordinatorContext, type SessionServicePorts } from "../app/session-service.js";
-import type { ActivityPublicationInput } from "../app/ports.js";
-import { createAdmissionPreflight } from "../admission-preflight.js";
+import { createAdmissionPreflight } from "../app/admission-preflight.js";
 import { handleGithubEvent } from "../providers/github/events.js";
 import { renderPipelineLogHeader } from "../pipeline/publication.js";
 import { canSteerPipelineRun, requestPipelineStop } from "../pipeline/control.js";
@@ -159,12 +158,7 @@ export function createServerWebhookDeliveryProcessor(deps: {
     deps.linearOutbox ??
     createLinearOutboxProcessor({ store: deps.store, getLinearClient: deps.getLinearClient });
   const admissionPreflight = createAdmissionPreflight(deps.cfg, deps.runtime);
-  const activityPublisher = {
-    publishActivity: (activity: ActivityPublicationInput, issueId?: string, runId?: string) =>
-      enqueueActivity(deps.store, linearOutbox, activity, issueId, runId),
-    publishError: (sessionId: string | undefined, issueId: string | undefined, message: string) =>
-      tryPostError(deps.store, linearOutbox, sessionId, issueId, message),
-  };
+  const activityPublisher = createLinearActivityPublisher(deps.store, linearOutbox);
   const createSessionServicePorts = (linear: LinearClient): SessionServicePorts => ({
     activityPublisher,
     labelResolver: {
