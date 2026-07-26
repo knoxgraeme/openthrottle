@@ -144,6 +144,93 @@ describe("coordinator-only server", () => {
     });
   });
 
+  it("includes repeated sandbox ingestion failures in pipeline status", async () => {
+    seedPipelineTicket();
+    // Diagnostics are instance-scoped through the run/attempt binding, so the
+    // failing event must belong to the pinned attempt's planned run.
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    const runId = attempt.planned_run_id!;
+    expect(store.beginRun({
+      issueId: "issue-1",
+      runId,
+      taskType: "implement",
+      tokenHash: "token-hash",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    })).toBe(true);
+    store.insertSandboxEvent({
+      eventId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      runId,
+      sandboxId: "sandbox-1",
+      kind: "stage_result",
+      payload: JSON.stringify({ kind: "stage_result" }),
+    });
+    db.prepare(`
+      UPDATE sandbox_events
+      SET status = 'failed', attempts = 5, last_error = 'stage result attempt fence mismatch'
+      WHERE event_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+    `).run();
+    // A superseded generation's failed event on the same ticket — diagnosed,
+    // MORE attempts — must neither surface on nor mask the current instance.
+    expect(store.beginRun({
+      issueId: "issue-1",
+      runId: "run-old-generation",
+      taskType: "implement",
+      tokenHash: "token-hash",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    })).toBe(false);
+    db.prepare(`
+      INSERT INTO runs (id, linear_issue_id, task_type, token_hash, status, started_at, expires_at)
+      VALUES ('run-old-generation', 'issue-1', 'implement', 'token-hash', 'timed_out', '2026-07-25T00:00:00.000Z', '2026-07-25T02:00:00.000Z')
+    `).run();
+    store.insertSandboxEvent({
+      eventId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+      runId: "run-old-generation",
+      sandboxId: "sandbox-0",
+      kind: "stage_result",
+      payload: JSON.stringify({ kind: "stage_result" }),
+    });
+    db.prepare(`
+      UPDATE sandbox_events
+      SET status = 'failed', attempts = 9, last_error = 'stale generation error',
+          ingestion_diagnosed_at = '2026-07-25T00:00:00.000Z'
+      WHERE event_id = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
+    `).run();
+
+    const transientResponse = await app().request("/status", {
+      headers: { Authorization: "Bearer status-token" },
+    });
+    expect(transientResponse.status).toBe(200);
+    const transientBody = await transientResponse.json() as {
+      tickets: Array<{ pipeline: Record<string, unknown> | null }>;
+    };
+    expect(transientBody.tickets[0]?.pipeline).toMatchObject({
+      sandbox_event_id: null,
+      sandbox_event_attempts: null,
+      sandbox_ingestion_error: null,
+    });
+
+    db.prepare(`
+      UPDATE sandbox_events
+      SET ingestion_diagnosed_at = '2026-07-26T00:00:00.000Z'
+      WHERE event_id = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+    `).run();
+
+    const response = await app().request("/status", {
+      headers: { Authorization: "Bearer status-token" },
+    });
+    expect(response.status).toBe(200);
+    const body = await response.json() as {
+      tickets: Array<{ pipeline: Record<string, unknown> | null }>;
+    };
+
+    expect(body.tickets[0]?.pipeline).toMatchObject({
+      sandbox_event_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      sandbox_event_attempts: 5,
+      sandbox_ingestion_error: "stage result attempt fence mismatch",
+    });
+  });
+
   it("does not fall back to direct stop or steering for an unpinned ticket", async () => {
     seedTicket();
     const stop = await app().request("/tickets/OT-1/stop", {

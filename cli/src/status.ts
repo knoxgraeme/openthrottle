@@ -38,6 +38,9 @@ interface TicketRow {
     effect_status: string | null;
     effect_attempts: number | null;
     effect_error: string | null;
+    sandbox_event_id: string | null;
+    sandbox_event_attempts: number | null;
+    sandbox_ingestion_error: string | null;
   } | null;
 }
 
@@ -95,7 +98,9 @@ export default async function status(): Promise<void> {
         ? `${t.pipeline.effect_kind}:${t.pipeline.effect_status ?? t.pipeline.effect_state}`
         : t.pipeline?.effect_state,
       effect_attempts: t.pipeline?.effect_attempts,
-      error: t.pipeline?.effect_error ?? t.pipeline?.publication_error,
+      sandbox_event: t.pipeline?.sandbox_event_id,
+      sandbox_attempts: t.pipeline?.sandbox_event_attempts,
+      error: t.pipeline?.sandbox_ingestion_error ?? t.pipeline?.effect_error ?? t.pipeline?.publication_error,
       recovery: t.pipeline?.recovery_action,
       wait: t.pipeline?.wait_reason,
       pr: t.pr_url,
@@ -104,7 +109,7 @@ export default async function status(): Promise<void> {
     [
       'issue', 'branch', 'agent', 'pipeline', 'task', 'state', 'stage', 'attempt',
       'retry', 'reentry', 'subject', 'provider', 'gate', 'context', 'publication', 'publication_id',
-      'effect', 'effect_attempts', 'error', 'recovery', 'wait', 'pr', 'updated',
+      'effect', 'effect_attempts', 'sandbox_event', 'sandbox_attempts', 'error', 'recovery', 'wait', 'pr', 'updated',
     ]
   );
 }

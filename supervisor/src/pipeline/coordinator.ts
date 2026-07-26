@@ -467,7 +467,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
         }
       : {
           kind: "publish_linear" as const,
-          idempotencyKey: `linear-wait:${input.instance.id}:${target.id}:${nextAttempt.reentryOrdinal}`,
+          idempotencyKey: `linear-wait:${input.instance.id}:${target.id}:${nextAttempt.id}`,
           payload: canonicalJson({
             pipelineInstanceId: input.instance.id,
             stageId: target.id,

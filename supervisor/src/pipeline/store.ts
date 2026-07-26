@@ -186,6 +186,9 @@ export interface PipelineStatusProjection {
   effect_status: PipelineEffectIntent["status"] | null;
   effect_attempts: number | null;
   effect_error: string | null;
+  sandbox_event_id: string | null;
+  sandbox_event_attempts: number | null;
+  sandbox_ingestion_error: string | null;
 }
 
 export interface PipelineInstanceSeed {

@@ -577,6 +577,13 @@ actor-contract:pipeline stage attempts own sandbox actor liveness and settlement
 legacy runs and run_liveness remain retained history
 backfill-contract:bound or planned pipeline run maps to one attempt actor without losing heartbeat, reaping, or quarantine state`;
 
+const sandboxEventDiagnosticsSchema = `
+ALTER TABLE sandbox_events ADD COLUMN ingestion_diagnosed_at TEXT;
+`;
+
+const sandboxEventDiagnosticsMigrationSource = `${sandboxEventDiagnosticsSchema}
+sandbox-event-diagnostics:repeated ingestion failures retain a one-time surfaced diagnostic/v1`;
+
 const definitions: DatabaseMigrationDefinition[] = [
   {
     version: 1,
@@ -672,6 +679,16 @@ const definitions: DatabaseMigrationDefinition[] = [
     up(db) {
       db.exec(pipelineAttemptActorSchema);
       backfillPipelineAttemptActors(db);
+    },
+  },
+  {
+    version: 10,
+    name: "sandbox-event-ingestion-diagnostics",
+    source: sandboxEventDiagnosticsMigrationSource,
+    up(db) {
+      if (hasTable(db, "sandbox_events") && !hasColumns(db, "sandbox_events", ["ingestion_diagnosed_at"])) {
+        db.exec(sandboxEventDiagnosticsSchema);
+      }
     },
   },
 ];

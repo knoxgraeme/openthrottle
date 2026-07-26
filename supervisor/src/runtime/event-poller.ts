@@ -24,6 +24,7 @@ const SEALED_STAGE_RESULT_DIR = "/var/lib/openthrottle/stage-results";
 const WORKSPACE_SUBJECT_COMMAND = "node /opt/openthrottle/runner/execute-stage.mjs --print-subject --repo /home/agent/repo";
 const MAX_EVENT_BYTES = 32 * 1024;
 const MAX_STAGE_EVENT_BYTES = 64 * 1024;
+const INGESTION_DIAGNOSTIC_ATTEMPTS = 5;
 
 interface SandboxEventFile {
   name: string;
@@ -300,6 +301,37 @@ async function pollTicketEvents(
         message,
         new Date(Date.now() + 5_000).toISOString()
       );
+      const failed = params.store.getSandboxEvent(event.event_id);
+      if (
+        event.kind === "stage_result" &&
+        failed &&
+        failed.attempts >= INGESTION_DIAGNOSTIC_ATTEMPTS &&
+        !failed.ingestion_diagnosed_at
+      ) {
+        try {
+          await params.postActivity({
+            id: `sandbox-ingestion-diagnostic:${event.event_id}`,
+            sessionId: ticket.linear_session_id,
+            type: "error",
+            body: `The supervisor cannot ingest the stage result: ${message}. It will keep retrying.`,
+          }, {
+            version: 1,
+            kind: "activity",
+            event_id: event.event_id,
+            run_id: event.run_id,
+            created_at: event.created_at,
+            type: "error",
+            body: message,
+            issueId: ticket.linear_issue_id,
+          });
+          params.store.markSandboxEventDiagnosed(event.event_id, new Date().toISOString());
+        } catch (activityError) {
+          console.error(
+            `[sandbox-events] failed to publish ingestion diagnostic for ${event.event_id}:`,
+            sanitizeText(String(activityError)).slice(-2_000)
+          );
+        }
+      }
       console.error(`[sandbox-events] event ${event.event_id} failed:`, message);
       break;
     }
