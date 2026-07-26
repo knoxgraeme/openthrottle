@@ -19,7 +19,7 @@ execution: code
 | Baseline | The current `openthrottle.pipeline/v1` manifest, coordinator, effect, artifact, gate, session, publication, and sandbox-stage contracts in `docs/SPEC.md`. |
 | Public model | A repository selects a named graph. A graph contains closed node kinds. Agent nodes invoke loops. Each loop binds one skill, worker, input scope, receipt type, and bounded retry behavior. |
 | Runtime model | The public graph compiles into the existing immutable `PipelineManifest`. Structured unit execution is one new composite stage capability whose child state remains supervisor-owned. |
-| Default | The built-in `simple` graph remains the default and preserves the current whole-plan CE pipeline. The built-in `structured-ce` graph is opt-in. Both use the same public graph schema users can copy and edit. |
+| Default | The built-in `simple` graph remains the default and preserves the current whole-plan CE pipeline. The built-in `structured` graph is opt-in. Both use the same public graph schema users can copy and edit. |
 | Unit behavior | A prepared plan supplies immutable units and dependencies. V1 executes units serially. One unit attempt keeps one worktree and worker native session across implementation, simplification, command verification, and bounded repair. |
 | Lead behavior | One graph-scoped lead session reviews verified unit receipts, accepts or requests revision, records downstream context, or asks for a human. It also selects which ready unit dispatches next (R35), may propose a scope-preserving split of a pending unit (R36), and may propose publishing the integrated units as a releasable slice whose remainder becomes a typed continuation frontier (R37) — without these first-class moves, agents express ordering, granularity, and partial-completion needs by overloading repair/continuation outcomes or stranding remainder work in PR prose. It does not create worktrees, integrate Git, pass gates, or create work items: continuation across slices is supervisor-owned (R38). |
 | Gate rule | Every gate decision is deterministic. Semantic skills may supply attestations, but only the supervisor can pass a gate after validating the receipt schema, producer, fences, exact Git subject, freshness, required corroborating evidence, and configured outcome. |
@@ -37,7 +37,7 @@ execution: code
 OpenThrottle will offer two implementation graphs through one execution architecture:
 
 1. `simple` passes the complete approved plan through the existing staged CE flow in one continuing agent context.
-2. `structured-ce` requires a validated execution-plan artifact, iterates its units serially in executor-owned worktrees, uses a persistent lead for semantic acceptance, runs whole-change gates, and publishes one branch and PR.
+2. `structured` requires a validated execution-plan artifact, iterates its units serially in executor-owned worktrees, uses a persistent lead for semantic acceptance, runs whole-change gates, and publishes one branch and PR.
 
 Repositories can add more named graphs as configuration. A graph may compose only installed, closed node kinds. A `run` node invokes a configured loop; deterministic nodes run named commands, iterate prepared units, publish an exact subject, wait for provider evidence, or pause for a human. Graph configuration cannot define supervisor code, arbitrary expressions, runtime-generated topology, new credential authority, or a new artifact assurance class.
 
@@ -137,7 +137,7 @@ The first structured release should improve plan-wide control without building a
 1. The author completes a CE unified plan.
 2. `prepare-execution-plan` reads the Product Contract and Implementation Units, proposes normalized unit JSON, and calls `openthrottle plan validate`.
 3. The author resolves semantic ambiguity; deterministic validation confirms the final block.
-4. `openthrottle ship <plan> --graph structured-ce` validates the selected local graph and plan before creating/delegating the Linear issue.
+4. `openthrottle ship <plan> --graph structured` validates the selected local graph and plan before creating/delegating the Linear issue.
 5. `--graph simple` accepts the full plan without requiring unit JSON.
 
 #### F2. Resolve and admit a graph
@@ -196,7 +196,7 @@ The first structured release should improve plan-wide control without building a
 ### Acceptance Examples
 
 - AE1. Given the default `simple` graph and a plan with no execution-plan block, delegation compiles to the current whole-plan CE stages and completes without child unit state.
-- AE2. Given `simple`, `structured-ce`, and a repository graph as allowed implement options, `--graph repo-docs` selects and pins only that allowed graph; an unknown option fails before issue delegation or provisioning.
+- AE2. Given `simple`, `structured`, and a repository graph as allowed implement options, `--graph repo-docs` selects and pins only that allowed graph; an unknown option fails before issue delegation or provisioning.
 - AE3. Given U3 depends on U4 and U4 depends on U3, local validation and supervisor admission identify the cycle and no sandbox is created.
 - AE4. Given two dependency-independent units, the V1 reducer marks both logically ready but dispatches only the earlier stable unit; the second starts only after the first integrates.
 - AE5. Given a worker tries to modify the integration checkout, sealed request, or another retained attempt, the executor rejects the attempt and records the boundary violation.
@@ -308,7 +308,7 @@ Directional repository layout:
       SKILL.md
 ```
 
-Package-owned built-ins live in `supervisor/graphs/` with the same graph-bundle schema. `openthrottle graph copy structured-ce` materializes an editable repository bundle under `.openthrottle/graphs/`.
+Package-owned built-ins live in `supervisor/graphs/` with the same graph-bundle schema. `openthrottle graph copy structured` materializes an editable repository bundle under `.openthrottle/graphs/`.
 
 Directional root configuration:
 
@@ -326,7 +326,7 @@ intents:
     default: simple
     options:
       simple: builtin://simple@1
-      structured-ce: builtin://structured-ce@1
+      structured: builtin://structured@1
       docs-release: repo://.openthrottle/graphs/docs-release.yml
 
 commands:
@@ -347,7 +347,7 @@ Directional graph bundle:
 
 ```yaml
 schema: openthrottle.graph/v1
-id: structured-ce
+id: structured
 
 workers:
   lead:
@@ -654,7 +654,7 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 
 - Add `supervisor/src/execution-graph.ts` and `supervisor/src/execution-graph.test.ts` — resolve graph bundles and compile them to validated manifests.
 - Modify `supervisor/src/pipeline-manifest.ts` and `supervisor/src/pipeline-manifest.test.ts` — consume canonical config/commands and add only installed composite capability/artifact vocabulary.
-- Add `supervisor/graphs/simple-v1.yaml`, `supervisor/graphs/investigate-v1.yaml`, and `supervisor/graphs/structured-ce-v1.yaml`; modify `supervisor/pipelines/catalog.yaml` to expose compiled immutable identities.
+- Add `supervisor/graphs/simple-v1.yaml`, `supervisor/graphs/investigate-v1.yaml`, and `supervisor/graphs/structured-v1.yaml`; modify `supervisor/pipelines/catalog.yaml` to expose compiled immutable identities.
 - Modify `supervisor/src/github.ts` and tests — fetch bounded repository graph/skill closures at the exact base commit.
 - Modify `supervisor/src/linear-events.ts` and `supervisor/src/pipeline-admission.test.ts` — resolve graph selection, validate the execution plan, pin sources/digests, compile, and reject before provisioning.
 - Add `cli/src/graph.ts` and `cli/src/graph.test.ts`; modify `cli/src/index.ts` — inspect, copy, validate, and explain built-in/repository graph bundles.
@@ -952,7 +952,7 @@ The smoke must cover simple and structured serial modes, at least two units, one
 Using a registered test repository/team and real Linear, Daytona, selected agent engine, and GitHub:
 
 1. Prepare and validate a multi-unit CE plan.
-2. Select `structured-ce` and confirm all graph/config/plan/skill/runtime/base digests pin before provisioning.
+2. Select `structured` and confirm all graph/config/plan/skill/runtime/base digests pin before provisioning.
 3. Observe serial unit worktrees/sessions, one reused lead session, deterministic unit gates, and parent Linear receipts.
 4. Trigger one bounded repair and verify the same current unit session resumes.
 5. Restart the supervisor after a persisted child effect and verify reconciliation.
@@ -983,7 +983,7 @@ This gate consumes operator credentials and must never be reported as locally pa
 - R1–R34 and AE1–AE16 are traceable to code, tests, and durable artifacts.
 - Repositories select among multiple named graphs and can copy/edit a built-in using graph/loop/worker/command/skill/MCP/limit configuration only.
 - `simple` continues to accept a complete plan and preserves current whole-plan behavior.
-- `structured-ce` requires validator-clean unit JSON and executes one serial unit at a time.
+- `structured` requires validator-clean unit JSON and executes one serial unit at a time.
 - The supervisor owns every durable transition and deterministically passes every gate from typed, current, exact-subject evidence.
 - One unit attempt keeps one worktree/session through implement, simplify, verification, and bounded repair; a final-repair attempt uses the same isolated attempt contract; the lead persists across units; final reviews are fresh.
 - The executor owns candidate commits and integration; only the final publisher can push one integration branch/PR.
