@@ -1,7 +1,25 @@
 import type Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import type { WorkBinding, WorkStore } from "./work-store.js";
-import type { AgentSession, Run, SteerInboxRecord, Ticket } from "./store.js";
+import type { AgentSession, Run, Ticket } from "./store.js";
+
+export interface SteerInboxRecord {
+  id: string;
+  linear_issue_id: string;
+  linear_session_id: string;
+  run_id: string | null;
+  source: "human" | "operator";
+  body: string;
+  status: "pending" | "dispatched" | "acknowledged" | "canceled";
+  created_at: string | null;
+  delivered_at: string | null;
+  delivery_id: string | null;
+  request_hash: string | null;
+  generation: number | null;
+  context_revision: number | null;
+  native_session_id: string | null;
+  lease_until: string | null;
+}
 
 export interface SteeringStore {
   enqueueInbox(params: {
