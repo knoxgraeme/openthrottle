@@ -375,11 +375,16 @@ fi
 
 # GitHub CLI's credential helper reads the current run's GH_TOKEN. The token
 # never lands in `.git/config`, so rotation does not require modifying the
-# root-sealed repository config in a later stage.
+# root-sealed repository config in a later stage. Credential-helper setup and
+# the commit identity below stay PER-RUN by design (not bake-once): the stage
+# credential set is materialized per stage and can rotate or be withheld, and
+# reset_agent_execution_state wipes ~/.gitconfig at every stage boundary.
 as_agent "gh auth setup-git >/dev/null"
 
+FRESH_CLONE=0
 if [[ ! -d "${REPO_DIR}/.git" ]]; then
   log "cloning ${GITHUB_REPO} -> ${REPO_DIR}"
+  FRESH_CLONE=1
   as_agent "git clone --quiet '$GIT_URL' '$REPO_DIR'"
   as_agent "git config --global --add safe.directory '$REPO_DIR'"
 else
@@ -410,10 +415,26 @@ else
   as_agent "git -C '$REPO_DIR' reset --hard --quiet '$STAGE_BASE_COMMIT' && git -C '$REPO_DIR' clean -fdq"
 fi
 
-# Ignored files are intentionally outside the canonical workspace subject, so
-# never carry them across a stage boundary. post_bootstrap recreates required
-# dependencies from the trusted tracked repository before the next agent runs.
-as_agent "git -C '$REPO_DIR' clean -fdXq"
+# Ignored files are intentionally outside the canonical workspace subject.
+# Dependency state produced by the bake-once bootstrap (phase 5) persists for
+# the sandbox lifetime under the recorded repository-config digest, so it is
+# NOT wiped per stage — that is the entire point of paying post_bootstrap only
+# once. What must never carry across a stage boundary is an ignored
+# agent-executable config surface (commands/hooks/skills/instructions) that a
+# later stage's engine could load, so those paths are still scrubbed every
+# stage. This does not extend any stage's authority: tracked content is fenced
+# by the sealed base commit / expected subject, engines run with user-only
+# setting sources, and fresh-review stages execute against a disposable copy
+# with no repository credential.
+AGENT_CONFIG_SCRUB_PATHS=(
+  ".agents" ".claude" ".claude.json" ".codex" ".config" ".cursor" ".mcp.json"
+  ".opencode" ".vscode" "AGENTS.md" "CLAUDE.md"
+)
+AGENT_CONFIG_SCRUB_ARGS=""
+for scrub_path in "${AGENT_CONFIG_SCRUB_PATHS[@]}"; do
+  AGENT_CONFIG_SCRUB_ARGS+=" '${scrub_path}'"
+done
+as_agent "git -C '$REPO_DIR' clean -fdXq --${AGENT_CONFIG_SCRUB_ARGS}"
 
 # =============================================================================
 # Phase 3 — safety: pre-push hook + sealed .git/config. Claude is invoked
@@ -559,18 +580,75 @@ fi
 log "config: agent=${AGENT}${OPENCODE_MODEL:+ model=${OPENCODE_MODEL}} ce_pipeline=${OT_CE_PIPELINE} dev='${CFG_DEV}' max_turns=${MAX_TURNS} task_timeout=${TASK_TIMEOUT}"
 
 # =============================================================================
-# Phase 5 — post_bootstrap
+# Phase 5 — bake-once bootstrap. post_bootstrap installs and image-derived
+# engine probes are paid once per sandbox lifetime, then fenced by a
+# root-owned completion marker recording the sealed repository-config digest
+# they ran under. Every later stage verifies that marker: a matching marker
+# skips the bootstrap (logged, never silent); a mismatched, torn, or
+# inconsistent marker fails closed — the sandbox is stale and the supervisor
+# must reprovision it. There is no silent re-bootstrap path.
 # =============================================================================
-log "phase 5: post_bootstrap"
+log "phase 5: bake-once bootstrap"
 
-if [[ "${#POST_BOOTSTRAP_CMDS[@]}" -gt 0 ]]; then
-  for cmd in "${POST_BOOTSTRAP_CMDS[@]}"; do
-    log "  > ${cmd}"
-    as_agent "cd '$REPO_DIR' && ${cmd}"
-  done
-else
-  log "no post_bootstrap commands configured"
+BOOTSTRAP_STATE_DIR="/var/lib/openthrottle/bootstrap"
+BOOTSTRAP_MARKER="${BOOTSTRAP_STATE_DIR}/bootstrap.json"
+BOOTSTRAP_SENTINEL="${BOOTSTRAP_STATE_DIR}/bootstrap.started"
+# The request digest is authoritative: --validate-inputs already proved the
+# sealed config file's content hashes to exactly this value.
+STAGE_CONFIG_DIGEST="$(jq -er '.repositoryConfigDigest' "$OT_STAGE_REQUEST_FILE")"
+install -d -o root -g root -m 0700 "$BOOTSTRAP_STATE_DIR"
+
+BOOTSTRAP_DECISION=""
+if ! BOOTSTRAP_DECISION="$(evaluate_bootstrap_marker \
+    "$BOOTSTRAP_MARKER" "$BOOTSTRAP_SENTINEL" "$STAGE_CONFIG_DIGEST" "$FRESH_CLONE")"; then
+  log "$BOOTSTRAP_DECISION"
+  exit 1
 fi
+
+CODEX_HOOK_TRUST=0
+case "$BOOTSTRAP_DECISION" in
+  run)
+    # The sentinel makes an interrupted bootstrap observable: if this stage
+    # dies before the completion marker is sealed, the next stage fails closed
+    # instead of silently re-running arbitrary install commands.
+    printf '%s\n' "$STAGE_CONFIG_DIGEST" > "$BOOTSTRAP_SENTINEL"
+    chmod 0600 "$BOOTSTRAP_SENTINEL"
+    if [[ "${#POST_BOOTSTRAP_CMDS[@]}" -gt 0 ]]; then
+      for cmd in "${POST_BOOTSTRAP_CMDS[@]}"; do
+        log "  > ${cmd}"
+        as_agent "cd '$REPO_DIR' && ${cmd}"
+      done
+    else
+      log "no post_bootstrap commands configured"
+    fi
+    # Probe the installed Codex build once per sandbox. The result depends
+    # only on the baked image, so later stages read it from the marker
+    # instead of re-invoking the CLI.
+    if { as_agent "codex exec --help 2>/dev/null" || true; as_agent "codex --help 2>/dev/null" || true; } \
+         | grep -q -- "--dangerously-bypass-hook-trust"; then
+      CODEX_HOOK_TRUST=1
+    fi
+    BOOTSTRAP_MARKER_TEMP="$(mktemp "${BOOTSTRAP_STATE_DIR}/.bootstrap.json.XXXXXX")"
+    jq -n \
+      --arg digest "$STAGE_CONFIG_DIGEST" \
+      --argjson codexHookTrust "$([[ "$CODEX_HOOK_TRUST" == "1" ]] && printf 'true' || printf 'false')" \
+      --arg completedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '{schema: "openthrottle.sandbox-bootstrap/v1", repositoryConfigDigest: $digest, codexHookTrust: $codexHookTrust, completedAt: $completedAt}' \
+      > "$BOOTSTRAP_MARKER_TEMP"
+    chmod 0400 "$BOOTSTRAP_MARKER_TEMP"
+    mv "$BOOTSTRAP_MARKER_TEMP" "$BOOTSTRAP_MARKER"
+    rm -f "$BOOTSTRAP_SENTINEL"
+    log "bake-once bootstrap complete (config digest ${STAGE_CONFIG_DIGEST})"
+    ;;
+  "skip 0"|"skip 1")
+    CODEX_HOOK_TRUST="${BOOTSTRAP_DECISION#skip }"
+    log "bake-once bootstrap already complete (config digest ${STAGE_CONFIG_DIGEST}); skipping post_bootstrap"
+    ;;
+  *)
+    log "FATAL: unrecognized bootstrap gate decision '${BOOTSTRAP_DECISION}'"
+    exit 1
+    ;;
+esac
 
 log "phase 6-8: fenced one-stage executor"
 for sealed_input in "$OT_STAGE_REQUEST_FILE" "$OT_STAGE_CONFIG_FILE" "$OT_STAGE_MANIFEST_FILE"; do
@@ -625,8 +703,10 @@ if [[ "$AGENT" == "codex" ]]; then
     } }' > "${AGENT_HOME}/.codex/hooks.json"
     chown root:root "${AGENT_HOME}/.codex/hooks.json"
     chmod 0444 "${AGENT_HOME}/.codex/hooks.json"
-    if { as_agent "codex exec --help 2>/dev/null" || true; as_agent "codex --help 2>/dev/null" || true; } \
-         | grep -q -- "--dangerously-bypass-hook-trust"; then
+    # The hook-trust capability was probed once during the bake-once
+    # bootstrap; CODEX_HOOK_TRUST carries the probed (or marker-recorded)
+    # result for this sandbox's baked Codex build.
+    if [[ "$CODEX_HOOK_TRUST" == "1" ]]; then
       export OT_CODEX_HOOK_TRUST_FLAG=1
     else
       log "WARNING: codex lacks --dangerously-bypass-hook-trust; steering remains subject to its trust gate"
