@@ -102,4 +102,22 @@ describe("delivery store", () => {
     expect(store.claimDelivery(claim)).toBe(true);
     expect(store.claimDelivery(claim)).toBe(false);
   });
+
+  it("keeps dead webhook deliveries off the retry clock", () => {
+    const claim = { deliveryId: "delivery-1", source: "linear" as const, action: "created" };
+    expect(store.claimDelivery(claim)).toBe(true);
+
+    store.markDeliveryFailed("delivery-1", "permanent failure", null);
+
+    const delivery = db.prepare(`
+      SELECT status, next_attempt_at, last_error
+      FROM webhook_deliveries
+      WHERE delivery_id = ?
+    `).get("delivery-1");
+    expect(delivery).toEqual({
+      status: "dead",
+      next_attempt_at: null,
+      last_error: "permanent failure",
+    });
+  });
 });
