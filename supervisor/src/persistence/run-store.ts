@@ -279,7 +279,7 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
       const actor = claimAttemptActorForReapingStmt.run(owner, reason, timestamp, runId);
       if (actor.changes === 1) return getRunStmt.get(runId) as Run;
       const liveness = claimRunLivenessForReapingStmt.run(owner, reason, timestamp, runId);
-      if (liveness.changes !== 1) throw new Error(`run ${runId} has inconsistent liveness state`);
+      if (liveness.changes !== 1) throw new Error(`run ${runId} has inconsistent actor/liveness state`);
       return getRunStmt.get(runId) as Run;
     }
   );
