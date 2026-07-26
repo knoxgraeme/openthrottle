@@ -40,6 +40,10 @@ jobs:
         run: |
           npm run build --prefix supervisor
           npm run build --prefix cli
+      - name: Verify pipeline docs are regenerated
+        run: |
+          npm run docs:pipelines --prefix supervisor
+          git diff --exit-code -- docs/pipelines
       - name: Verify supervisor architecture, catalog, runtime, and adapter parity
         run: |
           npm test --prefix supervisor -- src/__tests__/architecture.test.ts src/pipeline/manifest.test.ts src/pipeline/stage-request.test.ts src/runtime/contracts.test.ts
