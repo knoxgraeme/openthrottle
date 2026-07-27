@@ -286,10 +286,9 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
       return claimLinearOutboxRows(listClaimableLinearOutboxRows(nowIso, limit), nowIso, leaseUntilIso);
     },
     claimLinearOutboxForId(id, nowIso, leaseUntilIso, limit) {
-      const target = getLinearOutboxStmt.get(id) as LinearOutboxRecord | undefined;
-      if (!target) return [];
       const rows = listClaimableLinearOutboxRows(nowIso, limit);
-      if (!rows.some((row) => row.id === id)) return [];
+      const target = rows.find((row) => row.id === id);
+      if (!target) return [];
       return claimLinearOutboxRows(
         rows.filter((row) =>
           row.linear_session_id === target.linear_session_id && row.sequence <= target.sequence

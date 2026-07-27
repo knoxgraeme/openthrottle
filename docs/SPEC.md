@@ -274,6 +274,20 @@ installation when required. Failures retry with bounded backoff. Pipeline
 terminal acknowledgement uses a publication receipt; a failed receipt can be
 reopened only by the authenticated operator retry endpoint.
 
+Linear issue workflow state is a side-effect projection of the run lifecycle,
+not coordinator authority. Workflow states are resolved dynamically from the
+issue team by Linear workflow state `type`; state ids are never hardcoded.
+Selection/dispatch projects the issue to the first `started` state only when
+the current state is `triage`, `backlog`, or `unstarted`. Provider wait after PR
+publication projects to the `started` state named `In Review` when present,
+falling back to the first `started` state. A shipped terminal outcome or PR
+merge webhook projects to the team's `completed` state. Failed and
+needs-human terminal outcomes do not advance the issue to completed. Projection
+delivery is idempotent and forward-only: issues already at or beyond the target,
+or manually moved to `completed` or `canceled`, are skipped. Projection delivery
+failures are logged and retried by the Linear outbox but never block the run,
+publication, provider evidence handling, or terminal acknowledgement.
+
 Published content is sanitized and bounded. Raw task logs, secret values, and
 untrusted webhook bodies are never automatically attached to Linear or a PR.
 

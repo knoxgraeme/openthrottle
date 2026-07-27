@@ -44,9 +44,27 @@ describe("Linear OAuth state and refresh", () => {
     const [first, second] = await Promise.all([provider(), provider()]);
 
     expect(first?.accessToken).toBe("fresh");
+    expect(first?.cacheKey).toBe("stored-oauth");
     expect(second?.accessToken).toBe("fresh");
+    expect(second?.cacheKey).toBe("stored-oauth");
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(store.getSetting("linear_access_token")).toBe("fresh");
     expect(store.getSetting("linear_refresh_token")).toBe("refresh-2");
+  });
+
+  it("returns the stable workflow cache identity for a fresh stored token", async () => {
+    db = openDb(":memory:");
+    const store = createSupervisorStore(db);
+    store.setSetting("linear_access_token", "fresh");
+    store.setSetting("linear_token_expires_at", "2100-01-01T00:00:00.000Z");
+    const provider = createLinearClientProvider(
+      { linearClientId: "client", linearClientSecret: "secret" } as Config,
+      store
+    );
+
+    await expect(provider()).resolves.toMatchObject({
+      accessToken: "fresh",
+      cacheKey: "stored-oauth",
+    });
   });
 });

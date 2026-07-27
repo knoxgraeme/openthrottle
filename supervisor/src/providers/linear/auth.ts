@@ -10,6 +10,7 @@ const SETTINGS_LINEAR_ACCESS_TOKEN = "linear_access_token";
 const SETTINGS_LINEAR_REFRESH_TOKEN = "linear_refresh_token";
 const SETTINGS_LINEAR_TOKEN_EXPIRES_AT = "linear_token_expires_at";
 const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
+const LINEAR_OAUTH_CACHE_KEY = "stored-oauth";
 
 export function persistLinearToken(store: SupervisorStore, token: LinearOAuthTokenResponse): void {
   store.setSetting(SETTINGS_LINEAR_ACCESS_TOKEN, token.access_token);
@@ -32,7 +33,7 @@ export function createLinearClientProvider(
     if (!accessToken) return undefined;
     const expiresAt = Date.parse(store.getSetting(SETTINGS_LINEAR_TOKEN_EXPIRES_AT) ?? "");
     if (Number.isNaN(expiresAt) || expiresAt - Date.now() > 5 * 60 * 1000) {
-      return { accessToken };
+      return { accessToken, cacheKey: LINEAR_OAUTH_CACHE_KEY };
     }
     if (refreshInFlight) return refreshInFlight;
     refreshInFlight = (async () => {
@@ -47,7 +48,7 @@ export function createLinearClientProvider(
         refreshToken,
       });
       persistLinearToken(store, token);
-      return { accessToken: token.access_token };
+      return { accessToken: token.access_token, cacheKey: LINEAR_OAUTH_CACHE_KEY };
     })().finally(() => {
       refreshInFlight = undefined;
     });

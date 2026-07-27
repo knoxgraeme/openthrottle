@@ -8,12 +8,13 @@ import {
   buildLifecyclePublication,
   buildSelectionPublication,
   deterministicPublicationId,
+  issueStateSignalForPublication,
   parsePipelinePublication,
+  type PipelinePublicationEnvelope,
   pipelinePublicationOutboxPayload,
   pipelineStatusOutboxPayload,
   publicationPayloadHash,
   shouldPostLinearEventComment,
-  type PipelinePublicationEnvelope,
 } from "../../pipeline/publication.js";
 import type {
   PipelineInstance,
@@ -270,15 +271,6 @@ export function validatePinnedInstance(
   return manifest;
 }
 
-function issueStateSignalFor(envelope: PipelinePublicationEnvelope): "started" | "review" | "completed" | undefined {
-  if (envelope.template.name === "selection") return "started";
-  if (envelope.template.name === "provider_wait") return "review";
-  if (envelope.template.name === "terminal" && envelope.decision.outcome === "shipped") {
-    return "completed";
-  }
-  return undefined;
-}
-
 function nextLinearOutboxSequence(db: Database.Database, linearSessionId: string): number {
   return (db.prepare(`
     SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence
@@ -319,7 +311,7 @@ function persistIssueStateProjection(input: {
   envelope: PipelinePublicationEnvelope;
   timestamp: string;
 }): void {
-  const signal = issueStateSignalFor(input.envelope);
+  const signal = issueStateSignalForPublication(input.envelope);
   if (!signal) return;
   const id = deterministicPublicationId(`linear-issue-state:${input.instance.id}:${signal}`);
   const payload = JSON.stringify({

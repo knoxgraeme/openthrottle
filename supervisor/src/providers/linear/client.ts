@@ -5,10 +5,17 @@ const HTTP_TIMEOUT_MS = 15_000;
 
 export interface LinearClient {
   accessToken: string;
+  cacheKey?: string;
   fetch?: typeof fetch;
 }
 
-type LinearWorkflowStateType = "backlog" | "unstarted" | "started" | "completed" | "canceled";
+type LinearWorkflowStateType =
+  | "triage"
+  | "backlog"
+  | "unstarted"
+  | "started"
+  | "completed"
+  | "canceled";
 
 interface LinearWorkflowState {
   id: string;
@@ -18,7 +25,14 @@ interface LinearWorkflowState {
 
 export type LinearIssueStateSignal = "started" | "review" | "completed";
 
-const teamStateCache = new WeakMap<LinearClient, Map<string, LinearWorkflowState[]>>();
+const TEAM_WORKFLOW_STATE_CACHE_TTL_MS = 5 * 60 * 1000;
+
+interface LinearWorkflowStateCacheEntry {
+  states: LinearWorkflowState[];
+  expiresAt: number;
+}
+
+const teamStateCache = new Map<string, Map<string, LinearWorkflowStateCacheEntry>>();
 
 export async function linearGraphQL<T>(
   client: LinearClient,
@@ -287,16 +301,38 @@ export async function agentSessionUpdate(
   return data.agentSessionUpdate;
 }
 
-function workflowCacheFor(client: LinearClient): Map<string, LinearWorkflowState[]> {
-  let cache = teamStateCache.get(client);
+function workflowCacheFor(client: LinearClient): Map<string, LinearWorkflowStateCacheEntry> {
+  const cacheKey = client.cacheKey ?? client.accessToken;
+  let cache = teamStateCache.get(cacheKey);
   if (!cache) {
     cache = new Map();
-    teamStateCache.set(client, cache);
+    teamStateCache.set(cacheKey, cache);
   }
   return cache;
 }
 
+async function fetchTeamWorkflowStates(
+  client: LinearClient,
+  teamId: string
+): Promise<LinearWorkflowState[]> {
+  const teamData = await linearGraphQL<{
+    team?: {
+      states?: { nodes?: LinearWorkflowState[] };
+    } | null;
+  }>(
+    client,
+    `query TeamWorkflowStates($id: String!) {
+      team(id: $id) {
+        states { nodes { id name type } }
+      }
+    }`,
+    { id: teamId }
+  );
+  return teamData.team?.states?.nodes ?? [];
+}
+
 function stateRank(type: string): number {
+  if (type === "triage") return 0;
   if (type === "backlog") return 0;
   if (type === "unstarted") return 1;
   if (type === "started") return 2;
@@ -307,10 +343,12 @@ function stateRank(type: string): number {
 
 async function issueWorkflowSnapshot(
   client: LinearClient,
-  issueId: string
+  issueId: string,
+  options: { refreshStates?: boolean } = {}
 ): Promise<{
   issue: { id: string; state?: LinearWorkflowState | null; team?: { id?: string | null } | null };
   states: LinearWorkflowState[];
+  fromCache: boolean;
 }> {
   const issueData = await linearGraphQL<{
     issue?: {
@@ -333,24 +371,17 @@ async function issueWorkflowSnapshot(
   const teamId = issue?.team?.id;
   if (!issue || !teamId) throw new Error("Linear issue workflow snapshot is incomplete");
   const cache = workflowCacheFor(client);
+  if (options.refreshStates) cache.delete(teamId);
   const cached = cache.get(teamId);
-  if (cached) return { issue, states: cached };
-  const teamData = await linearGraphQL<{
-    team?: {
-      states?: { nodes?: LinearWorkflowState[] };
-    } | null;
-  }>(
-    client,
-    `query TeamWorkflowStates($id: String!) {
-      team(id: $id) {
-        states { nodes { id name type } }
-      }
-    }`,
-    { id: teamId }
-  );
-  const states = teamData.team?.states?.nodes ?? [];
-  cache.set(teamId, states);
-  return { issue, states };
+  if (cached && cached.expiresAt > Date.now()) {
+    return { issue, states: cached.states, fromCache: true };
+  }
+  const states = await fetchTeamWorkflowStates(client, teamId);
+  cache.set(teamId, {
+    states,
+    expiresAt: Date.now() + TEAM_WORKFLOW_STATE_CACHE_TTL_MS,
+  });
+  return { issue, states, fromCache: false };
 }
 
 function targetStateFor(
@@ -374,7 +405,9 @@ function shouldMoveIssueState(
 ): boolean {
   if (current.id === target.id) return false;
   if (current.type === "canceled" || current.type === "completed") return false;
-  if (signal === "started") return current.type === "backlog" || current.type === "unstarted";
+  if (signal === "started") {
+    return stateRank(current.type) < stateRank("started");
+  }
   const currentRank = stateRank(current.type);
   const targetRank = stateRank(target.type);
   if (currentRank > targetRank) return false;
@@ -386,20 +419,27 @@ function shouldMoveIssueState(
   return currentIndex < targetIndex;
 }
 
-export async function issueStateUpdate(
+function skippedIssueState(current: LinearWorkflowState | null | undefined): {
+  success: true;
+  skipped: true;
+  state?: { id: string; name: string };
+} {
+  return {
+    success: true,
+    skipped: true,
+    state: current ? { id: current.id, name: current.name } : undefined,
+  };
+}
+
+function staleWorkflowStateError(error: unknown): boolean {
+  return /\binvalid\b|not[ _-]?found|missing|does not exist|could not find/i.test(String(error));
+}
+
+async function updateIssueState(
   client: LinearClient,
-  params: { issueId: string; signal: LinearIssueStateSignal }
-): Promise<{ success: boolean; skipped?: boolean; state?: { id: string; name: string } }> {
-  const snapshot = await issueWorkflowSnapshot(client, params.issueId);
-  const current = snapshot.issue.state;
-  const target = targetStateFor(params.signal, snapshot.states);
-  if (!current || !target || !shouldMoveIssueState(params.signal, current, target, snapshot.states)) {
-    return {
-      success: true,
-      skipped: true,
-      state: current ? { id: current.id, name: current.name } : undefined,
-    };
-  }
+  issueId: string,
+  target: LinearWorkflowState
+): Promise<{ success: true; state: { id: string; name: string } }> {
   const data = await linearGraphQL<{
     issueUpdate: {
       success: boolean;
@@ -413,7 +453,7 @@ export async function issueStateUpdate(
         issue { id state { id name } }
       }
     }`,
-    { id: params.issueId, stateId: target.id }
+    { id: issueId, stateId: target.id }
   );
   if (!data.issueUpdate.success) {
     throw new Error("Linear issueUpdate returned success: false");
@@ -424,6 +464,42 @@ export async function issueStateUpdate(
       ? { id: data.issueUpdate.issue.state.id, name: data.issueUpdate.issue.state.name }
       : { id: target.id, name: target.name },
   };
+}
+
+function issueStatePlan(
+  signal: LinearIssueStateSignal,
+  snapshot: Awaited<ReturnType<typeof issueWorkflowSnapshot>>
+): { target: LinearWorkflowState } | { skipped: ReturnType<typeof skippedIssueState> } {
+  const current = snapshot.issue.state;
+  const target = targetStateFor(signal, snapshot.states);
+  if (!current || !target || !shouldMoveIssueState(signal, current, target, snapshot.states)) {
+    return { skipped: skippedIssueState(current) };
+  }
+  return { target };
+}
+
+export async function issueStateUpdate(
+  client: LinearClient,
+  params: { issueId: string; signal: LinearIssueStateSignal }
+): Promise<{ success: boolean; skipped?: boolean; state?: { id: string; name: string } }> {
+  const snapshot = await issueWorkflowSnapshot(client, params.issueId);
+  let plan = issueStatePlan(params.signal, snapshot);
+  if ("skipped" in plan) {
+    if (!snapshot.fromCache) return plan.skipped;
+    const refreshed = await issueWorkflowSnapshot(client, params.issueId, { refreshStates: true });
+    plan = issueStatePlan(params.signal, refreshed);
+    return "skipped" in plan ? plan.skipped : updateIssueState(client, params.issueId, plan.target);
+  }
+  try {
+    return await updateIssueState(client, params.issueId, plan.target);
+  } catch (error) {
+    if (!snapshot.fromCache || !staleWorkflowStateError(error)) throw error;
+    const refreshed = await issueWorkflowSnapshot(client, params.issueId, { refreshStates: true });
+    const refreshedPlan = issueStatePlan(params.signal, refreshed);
+    if ("skipped" in refreshedPlan) return refreshedPlan.skipped;
+    if (refreshedPlan.target.id === plan.target.id) throw error;
+    return updateIssueState(client, params.issueId, refreshedPlan.target);
+  }
 }
 
 export async function commentCreate(
