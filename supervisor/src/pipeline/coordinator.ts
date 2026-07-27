@@ -8,6 +8,7 @@ import {
   type StageOutcome,
 } from "./manifest.js";
 import type {
+  CoordinatorEffectWrite,
   CoordinatorArtifactWrite,
   CoordinatorGateReceiptWrite,
   CoordinatorTransitionWrite,
@@ -66,6 +67,14 @@ export interface PipelineReductionInput {
 
 function terminalStatus(_outcome: PipelineOutcome): PipelineInstanceStatus {
   return "completion_pending_publication";
+}
+
+function publishLinearEffect(idempotencyKey: string): CoordinatorEffectWrite {
+  return {
+    kind: "publish_linear",
+    idempotencyKey,
+    payload: canonicalJson({ publication: "deferred_to_coordinator" }),
+  };
 }
 
 function transitionFindings(value: unknown): Array<{ severity: string; code: string | null; summary: string }> {
@@ -303,6 +312,105 @@ function stopRunId(attempt: PipelineStageAttempt): string | null {
   return attempt.run_id ?? attempt.planned_run_id ?? null;
 }
 
+function terminalCleanupEffect(input: {
+  instanceId: string;
+  outcome: PipelineOutcome;
+}): CoordinatorEffectWrite {
+  return {
+    id: `effect-z-cleanup-${digestNormalized(canonicalJson([
+      input.instanceId,
+      input.outcome,
+      null,
+    ])).slice(0, 32)}`,
+    kind: "cleanup",
+    idempotencyKey: `cleanup:${input.instanceId}:${input.outcome}`,
+    payload: canonicalJson({
+      pipelineInstanceId: input.instanceId,
+      outcome: input.outcome,
+      ...(input.outcome === "needs_human" ? { preserve: true } : {}),
+    }),
+  };
+}
+
+function failedTerminalStopEffect(input: {
+  instanceId: string;
+  idempotencyKey: string;
+  runId: string | null;
+}): CoordinatorEffectWrite {
+  return {
+    kind: "stop",
+    idempotencyKey: input.idempotencyKey,
+    payload: canonicalJson({
+      pipelineInstanceId: input.instanceId,
+      outcome: "failed",
+      runId: input.runId,
+      ticketState: "error",
+    }),
+  };
+}
+
+function terminalWrite(input: PipelineReductionInput & {
+  eventPayloadHash: string;
+  terminal: PipelineOutcome;
+  publishIdempotencyKey: string;
+  waitReason?: string | null;
+  immutableSubject?: string | null;
+  publishedCommit?: string | null;
+  cleanup?: boolean;
+  effects?: CoordinatorEffectWrite[];
+}): CoordinatorTransitionWrite {
+  return {
+    instanceId: input.instance.id,
+    eventId: input.event.id,
+    eventPayloadHash: input.eventPayloadHash,
+    expectedVersion: input.instance.state_version,
+    expectedStatus: input.instance.status,
+    attemptId: input.attempt.id,
+    outcome: input.event.outcome,
+    resultHash: input.event.resultHash,
+    nextStatus: terminalStatus(input.terminal),
+    resumeStatus: input.terminal,
+    terminalOutcome: input.terminal,
+    nextStageId: null,
+    waitReason: input.waitReason ?? (input.terminal === "needs_human" ? "pipeline requires a human decision" : null),
+    immutableSubject: input.immutableSubject,
+    publishedCommit: input.publishedCommit,
+    artifacts: artifactsFor(input.event),
+    effects: [
+      publishLinearEffect(input.publishIdempotencyKey),
+      ...(input.effects ?? []),
+      ...(input.cleanup === false ? [] : [terminalCleanupEffect({
+        instanceId: input.instance.id,
+        outcome: input.terminal,
+      })]),
+    ],
+  };
+}
+
+function attachPublicationEffects(input: {
+  write: CoordinatorTransitionWrite;
+  publication: string;
+  instanceId: string;
+  attemptId: string;
+  receiptHash: string;
+}): void {
+  const linear = input.write.effects.find((effect) => effect.kind === "publish_linear");
+  if (linear) {
+    linear.payload = input.publication;
+  } else {
+    input.write.effects.push({
+      kind: "publish_linear",
+      idempotencyKey: `linear-gate:${input.instanceId}:${input.attemptId}:${input.receiptHash}`,
+      payload: input.publication,
+    });
+  }
+  input.write.effects.push({
+    kind: "publish_github",
+    idempotencyKey: `github-summary-update:${input.instanceId}:${input.attemptId}:${input.receiptHash}`,
+    payload: input.publication,
+  });
+}
+
 export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorTransitionWrite {
   const stage = verifyInput(input);
   const eventPayloadHash = digestNormalized(canonicalJson(input.event));
@@ -311,39 +419,24 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
 
   if (input.event.kind === "stop" || input.event.kind === "supersede") {
     const terminal = input.event.kind === "stop" ? "canceled" : "superseded";
-    const payload = canonicalJson({
-      pipelineInstanceId: input.instance.id,
-      reason: input.event.kind,
-      generation: input.instance.generation,
-      runId: stopRunId(input.attempt),
-      ticketState: input.event.controlTicketState ?? "stopped",
-    });
-    return {
-      instanceId: input.instance.id,
-      eventId: input.event.id,
+    return terminalWrite({
+      ...input,
       eventPayloadHash,
-      expectedVersion: input.instance.state_version,
-      expectedStatus: input.instance.status,
-      attemptId: input.attempt.id,
-      outcome: input.event.outcome,
-      resultHash: input.event.resultHash,
-      nextStatus: terminalStatus(terminal),
-      terminalOutcome: terminal,
-      nextStageId: null,
-      artifacts: artifactsFor(input.event),
-      effects: [
-        {
-          kind: "stop",
-          idempotencyKey: `stop:${input.instance.id}:${input.instance.state_version + 1}`,
-          payload,
-        },
-        {
-          kind: "publish_linear",
-          idempotencyKey: `linear-terminal:${input.instance.id}:${terminal}`,
-          payload: canonicalJson({ pipelineInstanceId: input.instance.id, outcome: terminal }),
-        },
-      ],
-    };
+      terminal,
+      publishIdempotencyKey: `linear-terminal:${input.instance.id}:${terminal}`,
+      cleanup: false,
+      effects: [{
+        kind: "stop",
+        idempotencyKey: `stop:${input.instance.id}:${input.instance.state_version + 1}`,
+        payload: canonicalJson({
+          pipelineInstanceId: input.instance.id,
+          reason: input.event.kind,
+          generation: input.instance.generation,
+          runId: stopRunId(input.attempt),
+          ticketState: input.event.controlTicketState ?? "stopped",
+        }),
+      }],
+    });
   }
 
   if (transition.to) {
@@ -359,99 +452,36 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
     if (!targetState) throw new Error(`stage state ${target.id} is absent for pipeline instance ${input.instance.id}`);
     if (isReentry && transition.max_reentries !== undefined && targetState.reentry_count >= transition.max_reentries) {
       const exhausted = transition.on_exhausted!;
-      return {
-        instanceId: input.instance.id,
-        eventId: input.event.id,
+      return terminalWrite({
+        ...input,
         eventPayloadHash,
-        expectedVersion: input.instance.state_version,
-        expectedStatus: input.instance.status,
-        attemptId: input.attempt.id,
-        outcome: input.event.outcome,
-        resultHash: input.event.resultHash,
-        nextStatus: terminalStatus(exhausted),
-        terminalOutcome: exhausted,
-        nextStageId: null,
+        terminal: exhausted,
+        publishIdempotencyKey: `linear-exhausted:${input.instance.id}:${stage.id}:${targetState.reentry_count}`,
         waitReason: `re-entry exhausted at ${stage.id}`,
-        artifacts: artifactsFor(input.event),
-        effects: [
-          {
-            kind: "publish_linear",
-            idempotencyKey: `linear-exhausted:${input.instance.id}:${stage.id}:${targetState.reentry_count}`,
-            payload: canonicalJson({ pipelineInstanceId: input.instance.id, stageId: stage.id, outcome: exhausted }),
-          },
-          ...(exhausted === "failed" ? [{
-            kind: "stop" as const,
-            idempotencyKey: `stop:${input.instance.id}:reentry-exhausted`,
-            payload: canonicalJson({
-              pipelineInstanceId: input.instance.id,
-              outcome: exhausted,
-              runId: stopRunId(input.attempt),
-              ticketState: "error",
-            }),
-          }] : []),
-          // Exhaustion terminals must release the runtime like every other
-          // terminal; a needs_human exhaustion previously held the sandbox
-          // until autostop. needs_human preserves the stopped workspace so
-          // unpushed work survives for the human the outcome is asking.
-          {
-            kind: "cleanup" as const,
-            idempotencyKey: `cleanup:${input.instance.id}:${exhausted}`,
-            payload: canonicalJson({
-              pipelineInstanceId: input.instance.id,
-              outcome: exhausted,
-              ...(exhausted === "needs_human" ? { preserve: true } : {}),
-            }),
-          },
-        ],
-      };
+        effects: exhausted === "failed" ? [failedTerminalStopEffect({
+          instanceId: input.instance.id,
+          idempotencyKey: `stop:${input.instance.id}:reentry-exhausted`,
+          runId: stopRunId(input.attempt),
+        })] : [],
+      });
     }
     // `max_attempts` is a whole-run guard against starting another bounded
     // repair/retry pass. Once a pass is already moving forward, per-transition
     // re-entry caps are the loop bound and the coordinator must not strand a
     // successfully repaired tree before publish/provider.
     if (isReentry && input.instance.attempt_count >= input.manifest.max_attempts) {
-      return {
-        instanceId: input.instance.id,
-        eventId: input.event.id,
+      return terminalWrite({
+        ...input,
         eventPayloadHash,
-        expectedVersion: input.instance.state_version,
-        expectedStatus: input.instance.status,
-        attemptId: input.attempt.id,
-        outcome: input.event.outcome,
-        resultHash: input.event.resultHash,
-        nextStatus: terminalStatus("failed"),
-        terminalOutcome: "failed",
-        nextStageId: null,
+        terminal: "failed",
+        publishIdempotencyKey: `linear-attempts-exhausted:${input.instance.id}:${input.manifest.max_attempts}`,
         waitReason: `pipeline attempt limit ${input.manifest.max_attempts} exhausted`,
-        artifacts: artifactsFor(input.event),
-        effects: [
-          {
-            kind: "publish_linear",
-            idempotencyKey: `linear-attempts-exhausted:${input.instance.id}:${input.manifest.max_attempts}`,
-            payload: canonicalJson({
-              pipelineInstanceId: input.instance.id,
-              stageId: stage.id,
-              outcome: "failed",
-              reason: "attempts_exhausted",
-            }),
-          },
-          {
-            kind: "stop",
-            idempotencyKey: `stop:${input.instance.id}:attempts-exhausted`,
-            payload: canonicalJson({
-              pipelineInstanceId: input.instance.id,
-              outcome: "failed",
-              runId: stopRunId(input.attempt),
-              ticketState: "error",
-            }),
-          },
-          {
-            kind: "cleanup",
-            idempotencyKey: `cleanup:${input.instance.id}:failed`,
-            payload: canonicalJson({ pipelineInstanceId: input.instance.id, outcome: "failed" }),
-          },
-        ],
-      };
+        effects: [failedTerminalStopEffect({
+          instanceId: input.instance.id,
+          idempotencyKey: `stop:${input.instance.id}:attempts-exhausted`,
+          runId: stopRunId(input.attempt),
+        })],
+      });
     }
     const reentryOrdinal = isReentry ? targetState.reentry_count + 1 : targetState.reentry_count;
     const nextAttempt = nextAttemptFor(input, target, reentryOrdinal);
@@ -488,6 +518,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
       outcome: input.event.outcome,
       resultHash: input.event.resultHash,
       nextStatus,
+      resumeStatus: resumeStatus === nextStatus ? null : resumeStatus,
       nextStageId: target.id,
       nextStageStatus: nextStatus === "dispatchable" ? "dispatchable" : "waiting",
       waitReason: resumeStatus === "waiting_human"
@@ -505,60 +536,19 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
   }
 
   const terminal = transition.terminal!;
-  const terminalEffects: CoordinatorTransitionWrite["effects"] = [{
-    kind: "publish_linear",
-    idempotencyKey: `linear-terminal:${input.instance.id}:${terminal}`,
-    payload: canonicalJson({
-      pipelineInstanceId: input.instance.id,
-      pipeline: `${input.instance.pipeline_id}@${input.instance.pipeline_version}`,
-      outcome: terminal,
-      subject: input.event.subject ?? input.instance.immutable_subject,
-    }),
-  }];
-  if (terminal === "failed") {
-    terminalEffects.push({
-      kind: "stop",
-      idempotencyKey: `stop:${input.instance.id}:${terminal}`,
-      payload: canonicalJson({
-        pipelineInstanceId: input.instance.id,
-        outcome: terminal,
-        runId: stopRunId(input.attempt),
-        ticketState: "error",
-      }),
-    });
-  }
-  // Every terminal releases the runtime resource. A needs_human, canceled, or
-  // superseded terminal previously enqueued no cleanup, leaving the sandbox
-  // holding its quota until autostop; for failed, stop settles the actor first
-  // and cleanup then releases the runtime. needs_human preserves the stopped
-  // workspace: unpushed work must survive for the human the outcome is asking.
-  terminalEffects.push({
-    kind: "cleanup",
-    idempotencyKey: `cleanup:${input.instance.id}:${terminal}`,
-    payload: canonicalJson({
-      pipelineInstanceId: input.instance.id,
-      outcome: terminal,
-      ...(terminal === "needs_human" ? { preserve: true } : {}),
-    }),
-  });
-  return {
-    instanceId: input.instance.id,
-    eventId: input.event.id,
+  return terminalWrite({
+    ...input,
     eventPayloadHash,
-    expectedVersion: input.instance.state_version,
-    expectedStatus: input.instance.status,
-    attemptId: input.attempt.id,
-    outcome: input.event.outcome,
-    resultHash: input.event.resultHash,
-    nextStatus: terminalStatus(terminal),
-    terminalOutcome: terminal,
-    nextStageId: null,
-    waitReason: terminal === "needs_human" ? "pipeline requires a human decision" : null,
+    terminal,
+    publishIdempotencyKey: `linear-terminal:${input.instance.id}:${terminal}`,
     immutableSubject: input.event.subject ?? null,
     publishedCommit: input.event.providerRevision ?? null,
-    artifacts: artifactsFor(input.event),
-    effects: terminalEffects,
-  };
+    effects: terminal === "failed" ? [failedTerminalStopEffect({
+      instanceId: input.instance.id,
+      idempotencyKey: `stop:${input.instance.id}:${terminal}`,
+      runId: stopRunId(input.attempt),
+    })] : [],
+  });
 }
 
 export function coordinatePipelineEvent(
@@ -587,14 +577,6 @@ export function coordinatePipelineEvent(
   write.exhaustedEffectId = event.exhaustedEffectId;
   write.exhaustedEffectError = event.exhaustedEffectError;
   write.gateReceipt = gateReceipt;
-  const target = write.nextStageId
-    ? manifest.stages.find((stage) => stage.id === write.nextStageId)
-    : undefined;
-  const resumeStatus: PipelineInstanceStatus | null = write.terminalOutcome
-    ? write.terminalOutcome
-    : target?.evaluator.kind === "human" && write.nextStatus === "completion_pending_publication"
-      ? "waiting_human"
-      : null;
   // Findings and dispositions accumulate across the run. The single mutable
   // GitHub summary receipt always holds the latest full publication envelope
   // for this instance, so it is the deterministic prior-state source; the
@@ -612,20 +594,15 @@ export function coordinatePipelineEvent(
     event,
     write,
     gateReceipt,
-    resumeStatus,
+    resumeStatus: write.resumeStatus ?? null,
     priorFindings,
   }));
-  const linear = write.effects.find((effect) => effect.kind === "publish_linear");
-  if (linear) linear.payload = publication;
-  else write.effects.push({
-    kind: "publish_linear",
-    idempotencyKey: `linear-gate:${instance.id}:${attempt.id}:${gateReceipt?.hash ?? event.resultHash}`,
-    payload: publication,
-  });
-  write.effects.push({
-    kind: "publish_github",
-    idempotencyKey: `github-summary-update:${instance.id}:${attempt.id}:${gateReceipt?.hash ?? event.resultHash}`,
-    payload: publication,
+  attachPublicationEffects({
+    write,
+    publication,
+    instanceId: instance.id,
+    attemptId: attempt.id,
+    receiptHash: gateReceipt?.hash ?? event.resultHash,
   });
   return store.applyTransition(write, faultAfterWrite);
 }

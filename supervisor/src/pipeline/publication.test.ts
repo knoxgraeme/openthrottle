@@ -1685,6 +1685,7 @@ describe("pipeline publication", () => {
         {
           id: "command",
           executor: { kind: "command", capability: "command/run@1" },
+          commandName: "test",
           evaluator: { kind: "command", assurance: "executor_verified", required_artifacts: ["command_result"] },
           context: "none",
           live_steering: false,
@@ -1700,6 +1701,7 @@ describe("pipeline publication", () => {
         {
           id: "approval",
           executor: { kind: "command", capability: "command/run@1" },
+          commandName: "test",
           evaluator: { kind: "human", assurance: "human_approved", required_artifacts: ["human_approval"] },
           context: "none",
           live_steering: false,
