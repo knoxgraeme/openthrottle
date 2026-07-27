@@ -667,6 +667,11 @@ describe("pipeline publication", () => {
         code: "stale-review-feedback",
         summary: "Superseded PR review comments trigger another repair.",
         disposition: "carried to repair",
+      }, {
+        severity: "P2",
+        code: "older-feedback",
+        summary: "A finding fixed by an earlier repair.",
+        disposition: "fixed in-stage",
       }],
     });
 
@@ -676,6 +681,7 @@ describe("pipeline publication", () => {
       "Addressed in `cccccccccccc`:",
       "- [P2] stale-review-feedback: Superseded PR review comments trigger another repair.",
     ].join("\n"));
+    expect(summary).not.toContain("- [P2] older-feedback: A finding fixed by an earlier repair.");
   });
 
   it("renders artifact findings with severity, code, summary, and fixed or remaining dispositions", () => {

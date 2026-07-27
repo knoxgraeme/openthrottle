@@ -1975,6 +1975,67 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
+  it("does not carry an old snapshot after a post-publication event joins it", () => {
+    const fixture = setup("core/implement@4");
+    const previousHead = "d".repeat(40);
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    fixture.tickets.setSetting("github-head:issue-1", SUBJECT);
+    recordAcknowledgedPublication(fixture, "b".repeat(40), { publishedCommit: previousHead }, "publication-previous");
+    recordAcknowledgedPublication(fixture, SUBJECT, {}, "publication-current");
+    moveFixtureToProviderWait(fixture, SUBJECT);
+    fixture.db.prepare("UPDATE pipeline_instances SET reentry_count = 1 WHERE id = ?")
+      .run(fixture.instance.id);
+    const eventPayload = (summary: string) => canonicalJson({
+      outcome: "semantic_repair_required",
+      summary,
+      evidence: [summary],
+      payload: "{}",
+    });
+    const first = fixture.tickets.recordProviderFeedback({
+      provider: "github",
+      providerEventId: "github-review:prepublish-in-mixed-snapshot",
+      issueId: fixture.instance.linear_issue_id,
+      sessionId: fixture.instance.linear_session_id,
+      generation: fixture.instance.generation,
+      repository: fixture.instance.repository,
+      pullNumber: 1,
+      headSha: previousHead,
+      kind: "pipeline_provider_event",
+      payload: eventPayload("Feedback captured before the republish completed."),
+      workItemId: `pipeline-feedback:${fixture.instance.id}:${previousHead}`,
+      receivedAt: "2025-12-31T23:59:59.000Z",
+    }).snapshot;
+    const second = fixture.tickets.recordProviderFeedback({
+      provider: "github",
+      providerEventId: "github-review:postpublish-in-mixed-snapshot",
+      issueId: fixture.instance.linear_issue_id,
+      sessionId: fixture.instance.linear_session_id,
+      generation: fixture.instance.generation,
+      repository: fixture.instance.repository,
+      pullNumber: 1,
+      headSha: previousHead,
+      kind: "pipeline_provider_event",
+      payload: eventPayload("Stale feedback re-observed after the republish completed."),
+      workItemId: `pipeline-feedback:${fixture.instance.id}:${previousHead}`,
+      receivedAt: "2026-01-01T00:00:01.000Z",
+    }).snapshot;
+    expect(second.id).toBe(first.id);
+
+    expect(processPipelineFeedbackSnapshot({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      instance: fixture.pipelines.getInstance(fixture.instance.id)!,
+      snapshot: second,
+    })).toBe(false);
+
+    expect(fixture.db.prepare("SELECT status, head_sha FROM feedback_snapshots WHERE id = ?").get(first.id))
+      .toEqual({ status: "stale", head_sha: previousHead });
+    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+      status: "waiting_provider",
+      terminal_outcome: null,
+    });
+  });
+
   it("seals carried feedback under the head it was observed against, not the drainable head", () => {
     const fixture = setup("core/implement@4");
     const observedHead = "d".repeat(40);

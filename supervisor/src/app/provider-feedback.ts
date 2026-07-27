@@ -291,13 +291,13 @@ function currentPublicationAcknowledgedAt(pipelines: PipelineStore, instance: Pi
     .at(-1);
 }
 
-function snapshotPredatesCurrentPublication(
+function snapshotFeedbackPredatesCurrentPublication(
   pipelines: PipelineStore,
   snapshot: FeedbackSnapshot,
   instance: PipelineInstance
 ): boolean {
   const acknowledgedAt = currentPublicationAcknowledgedAt(pipelines, instance);
-  return acknowledgedAt !== undefined && snapshot.created_at < acknowledgedAt;
+  return acknowledgedAt !== undefined && snapshot.provider_watermark < acknowledgedAt;
 }
 
 function staleFeedbackNotice(params: {
@@ -344,10 +344,11 @@ export function processPipelineFeedbackSnapshot(params: {
     ? params.acknowledgedPublicationSubjects ?? acknowledgedPublicationSubjects(params.pipelines, params.instance.id)
     : undefined;
   // Feedback observed before the current head was published may still be the
-  // repair request that caused this republish. Feedback observed after that
-  // publication is a stale anchor and must not consume another repair round.
+  // repair request that caused this republish. The provider watermark tracks
+  // the latest event in the snapshot, so delayed post-publication stale anchors
+  // appended to an older snapshot cannot ride along with pre-publication events.
   const canCarryPastFirstRepair = params.instance.reentry_count === 0 ||
-    snapshotPredatesCurrentPublication(params.pipelines, params.snapshot, params.instance);
+    snapshotFeedbackPredatesCurrentPublication(params.pipelines, params.snapshot, params.instance);
   const currentSnapshot = subjects && snapshotCanCarryForward(subjects, params.snapshot, params.instance)
     && canCarryPastFirstRepair
     ? params.store.carryForwardFeedbackSnapshot(
