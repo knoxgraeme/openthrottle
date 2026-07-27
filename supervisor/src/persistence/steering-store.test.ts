@@ -138,4 +138,64 @@ describe("steering store", () => {
     expect(db.prepare("SELECT status FROM work_items WHERE id = ?").pluck().get("steer-old-session"))
       .toBe("canceled");
   });
+
+  it("delivers buffered steering only to the generation that produced it", () => {
+    // A message is buffered during generation 1 (the beforeEach session-1) while
+    // the run is mid-flight on a non-steerable stage, so run_id stays NULL.
+    store.enqueueInbox({
+      id: "steer-gen-1",
+      issueId: "issue-1",
+      sessionId: "session-1",
+      runId: null,
+      source: "human",
+      body: "Guidance meant only for generation 1.",
+    });
+
+    // The issue is re-delegated: a fresh session (generation 2) supersedes the
+    // old one and a replacement run begins for the successor pipeline.
+    store.upsertUnpinned({
+      linear_issue_id: "issue-1",
+      linear_issue_identifier: "OT-1",
+      linear_session_id: "session-2",
+      sandbox_id: null,
+      branch: "ot/ot-1",
+      agent: "codex",
+      repo: "owner/repo",
+      base_branch: "main",
+      pr_url: null,
+      state: "active",
+    });
+    expect(store.beginRun({
+      issueId: "issue-1",
+      runId: "run-gen-2",
+      taskType: "implement",
+      tokenHash: "steering-token-hash",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    })).toBe(true);
+
+    // The generation-1 buffer must never cross into the generation-2 run/sandbox:
+    // it is cancelled instead of bound. Without the session/generation fence it
+    // would instead be leased to run-gen-2 and returned here (cross-generation
+    // cross-talk), so this assertion fails without the fix.
+    expect(store.listPendingInbox("issue-1")).toHaveLength(0);
+    expect(store.getInbox("steer-gen-1")).toMatchObject({ status: "canceled", run_id: null });
+
+    // A message buffered under generation 2 IS still delivered to generation 2 —
+    // proving the fence targets only the superseded generation, not every buffer.
+    store.enqueueInbox({
+      id: "steer-gen-2",
+      issueId: "issue-1",
+      sessionId: "session-2",
+      runId: null,
+      source: "human",
+      body: "Guidance for generation 2.",
+    });
+    const deliverable = store.listPendingInbox("issue-1");
+    expect(deliverable.map((message) => message.id)).toEqual(["steer-gen-2"]);
+    expect(deliverable[0]).toMatchObject({ id: "steer-gen-2", run_id: "run-gen-2" });
+    expect(deliverable[0]?.delivery_id).toEqual(expect.any(String));
+
+    // The superseded generation-1 buffer stays cancelled and is never resurrected.
+    expect(store.getInbox("steer-gen-1")?.status).toBe("canceled");
+  });
 });
