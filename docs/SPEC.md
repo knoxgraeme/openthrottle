@@ -135,10 +135,11 @@ Provider and human events cannot enter other stage kinds. Duplicate event ids
 return the previously committed result; a stale generation, request, run, or Git
 subject is rejected.
 
-The default implement v2 graph is planning → implementation → semantic review
-→ simplification → test → lint → build → publish → provider. Semantic repair
-returns to implementation within manifest bounds. The investigate v2 graph is
-investigate → conditional publish.
+The default `core/implement@1` graph starts at implementation, then proceeds
+through semantic review, a simplification stage that may no-op, configured
+command gates, publication, and provider evidence. Semantic repair returns to
+implementation within manifest bounds. The default `core/investigate@1` graph
+runs investigation, then conditionally publishes an exact-subject result.
 
 Provider feedback excludes supervisor-authored GitHub summary comments and
 Linear bridge linkback comments; those are publication/linkage artifacts, not

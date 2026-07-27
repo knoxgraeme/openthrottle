@@ -34,14 +34,13 @@ session identifier. Continuation is a context policy, not a separate task type.
 
 ## Coordinator-owned composition
 
-The current catalog aliases `implement` and `investigate` to immutable v2
+The current catalog aliases `implement` and `investigate` to immutable `core/`
 manifests:
 
-- `ce/implement@2`: planning → implementation → semantic review →
-  simplification → test → lint → build → exact-subject publication → provider
-  verification. Repair transitions return to implementation within manifest
-  bounds.
-- `ce/investigate@2`: investigation → conditional exact-subject publication.
+- `core/implement@1`: implementation → semantic review → simplification →
+  test → lint → build → exact-subject publication → provider verification.
+  Repair transitions return to implementation within manifest bounds.
+- `core/investigate@1`: investigation → conditional exact-subject publication.
   Convergent fixes may ship; divergent decisions terminate as `needs_human`.
 
 Agent stages emit semantic proposals. Command stages produce
