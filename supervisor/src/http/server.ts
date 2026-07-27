@@ -1,7 +1,8 @@
 import { Hono } from "hono";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { Config } from "../app/config.js";
-import type { Ticket, SupervisorStore, WebhookDelivery } from "../persistence/store.js";
+import type { WebhookDelivery } from "../persistence/delivery-store.js";
+import type { Ticket, SupervisorStore } from "../persistence/store.js";
 import {
   buildLinearInstallUrl,
   exchangeLinearOAuthCode,

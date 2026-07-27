@@ -48,12 +48,19 @@ export interface FeedbackStore {
     | { status: "claimed"; snapshot: FeedbackSnapshot }
     | { status: "exhausted"; completedRounds: number }
     | { status: "stale" };
+  claimWithEvents(snapshotId: string, maxRounds: number):
+    | { status: "claimed"; snapshot: FeedbackSnapshot; events: FeedbackSnapshotEvent[] }
+    | { status: "exhausted"; completedRounds: number }
+    | { status: "stale" };
   consume(snapshotId: string): boolean;
   get(snapshotId: string): FeedbackSnapshot | undefined;
   listEvents(snapshotId: string): FeedbackSnapshotEvent[];
 }
 
-export function createFeedbackStore(db: Database.Database): FeedbackStore {
+export function createFeedbackStore(
+  db: Database.Database,
+  getCurrentHead: (issueId: string) => string | undefined = () => undefined
+): FeedbackStore {
   const getSnapshot = db.prepare("SELECT * FROM feedback_snapshots WHERE id = ?");
   const recordTransaction = db.transaction((params: Parameters<FeedbackStore["record"]>[0]) => {
     const receivedAt = params.receivedAt ?? new Date().toISOString();
@@ -212,6 +219,15 @@ export function createFeedbackStore(db: Database.Database): FeedbackStore {
       snapshot: getSnapshot.get(snapshotId) as FeedbackSnapshot,
     };
   });
+  const listEvents = (snapshotId: string): FeedbackSnapshotEvent[] =>
+    db.prepare(`
+      SELECT pe.provider, pe.provider_event_id, pe.kind, pe.payload
+      FROM feedback_snapshot_events fse
+      JOIN provider_events pe
+        ON pe.provider = fse.provider AND pe.provider_event_id = fse.provider_event_id
+      WHERE fse.snapshot_id = ?
+      ORDER BY pe.received_at, pe.provider, pe.provider_event_id
+    `).all(snapshotId) as FeedbackSnapshotEvent[];
 
   return {
     record(params) {
@@ -219,6 +235,23 @@ export function createFeedbackStore(db: Database.Database): FeedbackStore {
     },
     claim(snapshotId, maxRounds) {
       return claimTransaction.immediate(snapshotId, maxRounds);
+    },
+    claimWithEvents(snapshotId, maxRounds) {
+      const snapshot = getSnapshot.get(snapshotId) as FeedbackSnapshot | undefined;
+      if (!snapshot) return { status: "stale" as const };
+      const events = listEvents(snapshot.id);
+      const isConversationSnapshot = events.length > 0 &&
+        events.every((event) => event.kind === "issue_comment");
+      const currentHead = getCurrentHead(snapshot.linear_issue_id);
+      if (!isConversationSnapshot && currentHead && currentHead !== snapshot.head_sha) {
+        db.prepare(`
+          UPDATE feedback_snapshots SET status = 'stale'
+          WHERE id = ? AND status IN ('collecting', 'claimed')
+        `).run(snapshot.id);
+        return { status: "stale" as const };
+      }
+      const claim = claimTransaction.immediate(snapshot.id, maxRounds);
+      return claim.status === "claimed" ? { ...claim, events } : claim;
     },
     consume(snapshotId) {
       const timestamp = new Date().toISOString();
@@ -232,14 +265,7 @@ export function createFeedbackStore(db: Database.Database): FeedbackStore {
       return getSnapshot.get(snapshotId) as FeedbackSnapshot | undefined;
     },
     listEvents(snapshotId) {
-      return db.prepare(`
-        SELECT pe.provider, pe.provider_event_id, pe.kind, pe.payload
-        FROM feedback_snapshot_events fse
-        JOIN provider_events pe
-          ON pe.provider = fse.provider AND pe.provider_event_id = fse.provider_event_id
-        WHERE fse.snapshot_id = ?
-        ORDER BY pe.received_at, pe.provider, pe.provider_event_id
-      `).all(snapshotId) as FeedbackSnapshotEvent[];
+      return listEvents(snapshotId);
     },
   };
 }

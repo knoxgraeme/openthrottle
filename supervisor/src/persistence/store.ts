@@ -1,6 +1,9 @@
 import type Database from "better-sqlite3";
 import { createAdmissionStore, type AdmissionStore } from "./admission-store.js";
-import { createDeliveryStore, type DeliveryStore } from "./delivery-store.js";
+import {
+  createDeliveryStore,
+  type DeliveryStore,
+} from "./delivery-store.js";
 import {
   createFeedbackStore,
   type FeedbackRecordParams,
@@ -10,11 +13,7 @@ import {
 import { createRunStore, type RunStore } from "./run-store.js";
 import { createSettingsStore, type SettingsStore } from "./settings-store.js";
 import { createSteeringStore, type SteeringStore } from "./steering-store.js";
-import {
-  createWorkStore,
-  type WorkDelivery,
-  type WorkItem,
-} from "./work-store.js";
+import { createWorkStore } from "./work-store.js";
 import type { PipelineInstance, PipelineInstanceSeed } from "../pipeline/store.js";
 import type { Agent, TaskType } from "../pipeline/types.js";
 
@@ -107,85 +106,6 @@ export interface RepositoryRegistrationInput {
   snapshot: string;
 }
 
-export interface DeliveryClaim {
-  deliveryId: string;
-  source: "linear" | "github";
-  sessionId?: string;
-  action: string;
-  activityId?: string;
-  eventName?: string;
-  payload?: string;
-}
-
-export interface WebhookDelivery {
-  id: string;
-  source: "linear" | "github";
-  session_id: string | null;
-  action: string;
-  activity_id: string | null;
-  event_name: string | null;
-  payload: string | null;
-  status: "pending" | "processing" | "failed" | "processed" | "dead";
-  attempts: number;
-  next_attempt_at: string | null;
-  processed_at: string | null;
-  last_error: string | null;
-  received_at: string;
-}
-
-export interface SandboxEventRecord {
-  event_id: string;
-  run_id: string;
-  sandbox_id: string;
-  kind: "activity" | "plan" | "heartbeat" | "stage_result";
-  payload: string;
-  status: "pending" | "processing" | "failed" | "processed";
-  attempts: number;
-  next_attempt_at: string;
-  processed_at: string | null;
-  last_error: string | null;
-  ingestion_diagnosed_at: string | null;
-  created_at: string;
-}
-
-export interface LinearOutboxRecord {
-  id: string;
-  linear_session_id: string | null;
-  linear_issue_id: string | null;
-  run_id: string | null;
-  sequence: number;
-  kind: "activity" | "session_update" | "pipeline_receipt" | "pipeline_status";
-  payload: string;
-  payload_hash: string;
-  status: "pending" | "processing" | "failed" | "processed" | "dead";
-  attempts: number;
-  next_attempt_at: string;
-  processed_at: string | null;
-  last_error: string | null;
-  external_id: string | null;
-  external_url: string | null;
-  attachment_url: string | null;
-  created_at: string;
-}
-
-export interface SteerInboxRecord {
-  id: string;
-  linear_issue_id: string;
-  linear_session_id: string;
-  run_id: string | null;
-  source: "human" | "operator";
-  body: string;
-  status: "pending" | "dispatched" | "acknowledged" | "canceled";
-  created_at: string | null;
-  delivered_at: string | null;
-  delivery_id: string | null;
-  request_hash: string | null;
-  generation: number | null;
-  context_revision: number | null;
-  native_session_id: string | null;
-  lease_until: string | null;
-}
-
 export interface FinishRunParams {
   runId: string;
   status: TerminalRunStatus;
@@ -212,19 +132,13 @@ export interface FeedbackCapability {
   consumeFeedbackSnapshot(snapshotId: string): boolean;
 }
 
-export interface WorkCapability {
-  getWorkItem(id: string): WorkItem | undefined;
-  getWorkDelivery(id: string): WorkDelivery | undefined;
-}
-
 export type SupervisorStore =
   AdmissionStore &
   RunStore &
   DeliveryStore &
   SteeringStore &
   SettingsStore &
-  FeedbackCapability &
-  WorkCapability;
+  FeedbackCapability;
 
 export interface PipelineAdmissionCapability {
   createInstance(seed: PipelineInstanceSeed): PipelineInstance;
@@ -245,7 +159,10 @@ export function createSupervisorStore(
   pipelineAdmission: PipelineAdmissionCapability = createNoopPipelineAdmission()
 ): SupervisorStore {
   const workStore = createWorkStore(db);
-  const feedbackStore = createFeedbackStore(db);
+  const settingsStore = createSettingsStore(db);
+  const feedbackStore = createFeedbackStore(db, (issueId) =>
+    settingsStore.getSetting(`github-head:${issueId}`)
+  );
   const feedbackCapability: FeedbackCapability = {
     recordProviderFeedback(params) {
       return feedbackStore.record(params);
@@ -258,23 +175,7 @@ export function createSupervisorStore(
       `).all(linearSessionId, limit) as FeedbackSnapshot[];
     },
     claimFeedbackSnapshot(snapshotId, maxRounds) {
-      const snapshot = feedbackStore.get(snapshotId);
-      if (!snapshot) return { status: "stale" as const };
-      const events = feedbackStore.listEvents(snapshot.id);
-      const isConversationSnapshot = events.length > 0 &&
-        events.every((event) => event.kind === "issue_comment");
-      const currentHead = (db.prepare("SELECT value FROM settings WHERE key = ?").get(
-        `github-head:${snapshot.linear_issue_id}`
-      ) as { value: string } | undefined)?.value;
-      if (!isConversationSnapshot && currentHead && currentHead !== snapshot.head_sha) {
-        db.prepare(`
-          UPDATE feedback_snapshots SET status = 'stale'
-          WHERE id = ? AND status IN ('collecting', 'claimed')
-        `).run(snapshot.id);
-        return { status: "stale" as const };
-      }
-      const claim = feedbackStore.claim(snapshot.id, maxRounds);
-      return claim.status === "claimed" ? { ...claim, events } : claim;
+      return feedbackStore.claimWithEvents(snapshotId, maxRounds);
     },
     consumeFeedbackSnapshot(snapshotId) {
       return feedbackStore.consume(snapshotId);
@@ -285,13 +186,7 @@ export function createSupervisorStore(
     ...createRunStore(db, workStore),
     ...createDeliveryStore(db),
     ...createSteeringStore(db, workStore),
-    ...createSettingsStore(db),
+    ...settingsStore,
     ...feedbackCapability,
-    getWorkItem(id) {
-      return workStore.get(id);
-    },
-    getWorkDelivery(id) {
-      return workStore.getDelivery(id);
-    },
   };
 }

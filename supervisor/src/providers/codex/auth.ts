@@ -1,5 +1,7 @@
 import type { Config } from "../../app/config.js";
+import type { Ticket } from "../../persistence/store.js";
 import type { SupervisorStore } from "../../persistence/store.js";
+import type { RuntimeWorkspace } from "../../runtime/contracts.js";
 
 /**
  * Durable Codex subscription auth.
@@ -282,4 +284,57 @@ export async function getCodexAuthForSeed(
   })();
   refreshInFlight.set(store, inflight);
   return inflight;
+}
+
+export function createCredentialMaterializer(cfg: Config, store: SupervisorStore) {
+  return async (
+    resource: { providerResourceId: string },
+    scopes: readonly string[]
+  ): Promise<{ env: Record<string, string> }> => {
+    const ticket = store.getBySandboxId(resource.providerResourceId);
+    if (!ticket) throw new Error(`runtime resource ${resource.providerResourceId} has no ticket binding`);
+    const requested = new Set(scopes);
+    const env: Record<string, string> = {};
+    if (requested.has("repo.write")) {
+      env.GITHUB_TOKEN = cfg.githubToken;
+    } else if (requested.has("repo.read") || requested.has("provider.read")) {
+      env.GITHUB_TOKEN = cfg.githubReadToken;
+    }
+    if (requested.has("model.invoke")) {
+      const claudeCredential = cfg.claudeCodeOauthToken;
+      const openCodeCredential = cfg.kimiCodeApiKey;
+      if (ticket.agent === "claude" && claudeCredential) {
+        env.CLAUDE_CODE_OAUTH_TOKEN = claudeCredential;
+      } else if (ticket.agent === "codex") {
+        const codexCredential = await getCodexAuthForSeed(cfg, store);
+        if (!codexCredential) throw new Error("model credential for codex is unavailable");
+        env.CODEX_AUTH_JSON = codexCredential;
+      } else if (ticket.agent === "opencode" && openCodeCredential) {
+        env.KIMI_CODE_API_KEY = openCodeCredential;
+      } else {
+        throw new Error(`model credential for ${ticket.agent} is unavailable`);
+      }
+    }
+    return { env };
+  };
+}
+
+export async function captureCodexAuthFromSandbox(
+  store: SupervisorStore,
+  sandbox: RuntimeWorkspace,
+  ticket: Ticket
+): Promise<void> {
+  // Codex rotates its OAuth refresh token inside the sandbox; persist it so the
+  // next run seeds the live token instead of a spent one.
+  if (ticket.agent !== "codex") return;
+  try {
+    const raw = (
+      await sandbox.fs.downloadFile!("/home/agent/.codex/auth.json")
+    )!.toString("utf8");
+    if (captureCodexAuthJson(store, raw)) {
+      console.log("[codex-auth] captured a rotated refresh token from the sandbox");
+    }
+  } catch (error) {
+    console.warn("[codex-auth] could not read back ~/.codex/auth.json:", error);
+  }
 }

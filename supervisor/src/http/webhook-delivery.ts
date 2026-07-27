@@ -1,4 +1,5 @@
-import type { SupervisorStore, WebhookDelivery } from "../persistence/store.js";
+import type { WebhookDelivery } from "../persistence/delivery-store.js";
+import type { SupervisorStore } from "../persistence/store.js";
 import { sanitizeText } from "../shared/sanitize.js";
 
 const DEFAULT_MAX_ATTEMPTS = 5;

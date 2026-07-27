@@ -16,6 +16,7 @@ import {
 } from "../../pipeline/publication.js";
 import type {
   PipelineInstance,
+  PipelineInstanceStatus,
   PipelinePublicationReceipt,
   PipelineStageAttempt,
   RepositoryConfigSnapshot,
@@ -29,6 +30,184 @@ export function assertDigest(label: string, normalized: string, digest: string):
 
 export function deterministicId(prefix: string, input: unknown): string {
   return `${prefix}-${digestNormalized(canonicalJson(input)).slice(0, 32)}`;
+}
+
+export function claimLeasable<T>(input: {
+  rows: Array<{ id: string }>;
+  leaseUntilIso: string;
+  nowIso: string;
+  update: (id: string, leaseUntilIso: string, nowIso: string) => number;
+  get: (id: string) => T;
+}): T[] {
+  const claimed: T[] = [];
+  for (const row of input.rows) {
+    if (input.update(row.id, input.leaseUntilIso, input.nowIso) === 1) {
+      claimed.push(input.get(row.id));
+    }
+  }
+  return claimed;
+}
+
+export function markQueueFailed(input: {
+  update: (status: "failed" | "dead", nextAttemptAt: string | null, error: string) => number;
+  error: string;
+  retryAt: string | null;
+  timestamp: string;
+  deadNextAttemptAt?: string | null;
+}): "failed" | "dead" | undefined {
+  const status = input.retryAt ? "failed" : "dead";
+  let nextAttemptAt: string | null = input.timestamp;
+  if (input.retryAt) {
+    nextAttemptAt = input.retryAt;
+  } else if (Object.prototype.hasOwnProperty.call(input, "deadNextAttemptAt")) {
+    nextAttemptAt = input.deadNextAttemptAt ?? null;
+  }
+  const updated = input.update(status, nextAttemptAt, input.error);
+  return updated === 1 ? status : undefined;
+}
+
+export interface PublicationReceiptFields {
+  externalId?: string | null;
+  externalUrl?: string | null;
+  attachmentUrl?: string | null;
+}
+
+const TERMINAL_OR_BLOCKED_STATUSES = [
+  "shipped",
+  "no_change",
+  "needs_human",
+  "canceled",
+  "superseded",
+  "failed",
+  "publication_blocked",
+] as const;
+
+export function acknowledgePublicationReceipt(input: {
+  db: Database.Database;
+  id: string;
+  timestamp: string;
+  receipt?: PublicationReceiptFields;
+}): void {
+  const publication = input.db.prepare(`
+    SELECT pipeline_instance_id, resume_status FROM pipeline_publication_receipts WHERE id = ?
+  `).get(input.id) as {
+    pipeline_instance_id: string;
+    resume_status: PipelineInstanceStatus | null;
+  } | undefined;
+  if (!publication) return;
+  input.db.prepare(`
+    UPDATE pipeline_publication_receipts
+    SET status = 'acknowledged', external_id = COALESCE(?, external_id),
+        external_url = COALESCE(?, external_url),
+        attachment_url = COALESCE(?, attachment_url), acknowledged_at = ?,
+        last_error = NULL, updated_at = ?
+    WHERE id = ?
+  `).run(
+    input.receipt?.externalId ?? null,
+    input.receipt?.externalUrl ?? null,
+    input.receipt?.attachmentUrl ?? null,
+    input.timestamp,
+    input.timestamp,
+    input.id
+  );
+  if (publication.resume_status) {
+    input.db.prepare(`
+      UPDATE pipeline_instances
+      SET status = ?, state_version = state_version + 1,
+          wait_reason = CASE WHEN ? = 'waiting_human' THEN wait_reason ELSE NULL END,
+          updated_at = ?
+      WHERE id = ? AND status = 'completion_pending_publication'
+    `).run(
+      publication.resume_status,
+      publication.resume_status,
+      input.timestamp,
+      publication.pipeline_instance_id
+    );
+  }
+}
+
+export function failPublicationReceipt(input: {
+  db: Database.Database;
+  id: string;
+  status: "failed" | "dead";
+  nextAttemptAt: string;
+  error: string;
+  timestamp: string;
+  attempts?: number;
+  instanceStatus?: PipelineInstanceStatus | string | null;
+  instanceVersion?: number;
+}): void {
+  const publication = input.db.prepare(`
+    SELECT pipeline_instance_id FROM pipeline_publication_receipts WHERE id = ?
+  `).get(input.id) as { pipeline_instance_id: string } | undefined;
+  if (!publication) return;
+  const instance = input.db.prepare("SELECT status, state_version FROM pipeline_instances WHERE id = ?")
+    .get(publication.pipeline_instance_id) as
+    | { status: PipelineInstanceStatus; state_version: number }
+    | undefined;
+  const blockedFromStatus = input.instanceStatus ?? instance?.status ?? null;
+  input.db.prepare(`
+    UPDATE pipeline_publication_receipts
+    SET status = ?,
+        attempts = COALESCE(?, attempts),
+        next_attempt_at = ?, last_error = ?, updated_at = ?,
+        blocked_from_status = CASE WHEN ? = 'dead' THEN COALESCE(blocked_from_status, ?) ELSE blocked_from_status END
+    WHERE id = ?
+  `).run(
+    input.status,
+    input.attempts ?? null,
+    input.nextAttemptAt,
+    input.error,
+    input.timestamp,
+    input.status,
+    blockedFromStatus,
+    input.id
+  );
+  blockPublicationInstanceOnDead({
+    db: input.db,
+    id: input.id,
+    status: input.status,
+    timestamp: input.timestamp,
+    instanceVersion: input.instanceVersion,
+  });
+}
+
+export function blockPublicationInstanceOnDead(input: {
+  db: Database.Database;
+  id: string;
+  status: "failed" | "dead";
+  timestamp: string;
+  instanceVersion?: number;
+}): void {
+  const publication = input.db.prepare(`
+    SELECT pipeline_instance_id FROM pipeline_publication_receipts WHERE id = ?
+  `).get(input.id) as { pipeline_instance_id: string } | undefined;
+  if (!publication) return;
+  const instance = input.db.prepare("SELECT status, state_version FROM pipeline_instances WHERE id = ?")
+    .get(publication.pipeline_instance_id) as
+    | { status: PipelineInstanceStatus; state_version: number }
+    | undefined;
+  if (
+    input.status === "dead" &&
+    instance &&
+    !TERMINAL_OR_BLOCKED_STATUSES.includes(instance.status as typeof TERMINAL_OR_BLOCKED_STATUSES[number])
+  ) {
+    const versionPredicate = input.instanceVersion === undefined ? "" : " AND state_version = ?";
+    const statement = input.db.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'publication_blocked', state_version = state_version + 1,
+          wait_reason = 'permanent publication failure', updated_at = ?
+      WHERE id = ? AND status NOT IN (
+        'shipped', 'no_change', 'needs_human', 'canceled', 'superseded', 'failed',
+        'publication_blocked'
+      )${versionPredicate}
+    `);
+    if (input.instanceVersion === undefined) {
+      statement.run(input.timestamp, publication.pipeline_instance_id);
+    } else {
+      statement.run(input.timestamp, publication.pipeline_instance_id, input.instanceVersion);
+    }
+  }
 }
 
 export function validatePinnedInstance(

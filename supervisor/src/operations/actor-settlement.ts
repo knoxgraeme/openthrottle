@@ -19,8 +19,11 @@ export async function terminateAndSettleActor(params: {
   reason: string;
   status: "timed_out" | "stopped";
   ticketState?: Ticket["state"];
+  failureTail?: string;
   ticketFailureTail?: string | null;
   prUrl?: string;
+  quarantineOnStopFailure?: boolean;
+  onTerminated?: () => void;
   onSettled?: (run: Run) => void;
 }): Promise<ActorSettlementResult> {
   const claimed = params.store.claimRunForReaping(params.runId, params.owner, params.reason);
@@ -28,7 +31,9 @@ export async function terminateAndSettleActor(params: {
 
   try {
     if (params.sandboxId) await params.runtime.stopResource(params.sandboxId, params.reason);
+    params.onTerminated?.();
   } catch (error) {
+    if (params.quarantineOnStopFailure === false) throw error;
     const message = sanitizeText(
       `${params.reason} Actor termination could not be confirmed; the ticket remains quarantined: ${String(error)}`
     ).slice(0, 4_000);
@@ -43,7 +48,7 @@ export async function terminateAndSettleActor(params: {
       runId: params.runId,
       owner: params.owner,
       status: params.status,
-      failureTail: params.reason,
+      failureTail: params.failureTail ?? params.reason,
       ticketFailureTail: params.ticketFailureTail,
       ticketState: params.ticketState,
       prUrl: params.prUrl,

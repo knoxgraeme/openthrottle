@@ -2,18 +2,22 @@ import type Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
 import { createSupervisorStore } from "../persistence/store.js";
+import { createWorkStore, type WorkStore } from "../persistence/work-store.js";
 import { openDb } from "../persistence/database.js";
 import { deliverPendingInbox } from "./steering.js";
 import type { RuntimeWorkspace } from "./contracts.js";
 
 let db: Database.Database | undefined;
+let workStore: WorkStore | undefined;
 afterEach(() => {
   db?.close();
   db = undefined;
+  workStore = undefined;
 });
 
 function seedRunningTicket(agent: "claude" | "codex" | "opencode" = "claude") {
   db = openDb(":memory:");
+  workStore = createWorkStore(db);
   const store = createSupervisorStore(db);
   store.upsert({
     linear_issue_id: "issue-1",
@@ -108,7 +112,7 @@ describe("deliverPendingInbox", () => {
     expect(store.listPendingInbox("issue-1")).toHaveLength(0);
     expect(store.getInbox(first.id)?.status).toBe("dispatched");
     expect(store.getInbox(second.id)?.status).toBe("dispatched");
-    expect(store.getWorkDelivery(store.getInbox(first.id)!.delivery_id!)?.status).toBe("dispatched");
+    expect(workStore!.getDelivery(store.getInbox(first.id)!.delivery_id!)?.status).toBe("dispatched");
   });
 
   it("acknowledges only an exact processed-journal receipt", async () => {
@@ -143,12 +147,12 @@ describe("deliverPendingInbox", () => {
     await deliverPendingInbox({ runtime, store });
 
     expect(store.getInbox(record.id)?.status).toBe("acknowledged");
-    expect(store.getWorkDelivery(dispatched.delivery_id!)?.status).toBe("acknowledged");
+    expect(workStore!.getDelivery(dispatched.delivery_id!)?.status).toBe("acknowledged");
     expect(sandbox.fs.deleteFile).toHaveBeenCalledWith(
       `/home/agent/.ot/inbox-processed/${dispatched.delivery_id}.json`
     );
     store.finishRun({ runId: "run-1", status: "completed", ticketState: "active" });
-    expect(store.getWorkItem(record.id)).toMatchObject({
+    expect(workStore!.get(record.id)).toMatchObject({
       status: "consumed",
       consumed_by_attempt_id: "run-1",
     });
@@ -181,8 +185,8 @@ describe("deliverPendingInbox", () => {
     const canceled = store.getInbox(record.id)!;
     expect(canceled.run_id).toBe("run-1");
     expect(canceled.status).toBe("canceled");
-    expect(store.getWorkDelivery(firstDeliveryId)?.status).toBe("expired");
-    expect(store.getWorkItem(record.id)?.status).toBe("canceled");
+    expect(workStore!.getDelivery(firstDeliveryId)?.status).toBe("expired");
+    expect(workStore!.get(record.id)?.status).toBe("canceled");
     expect(sandbox.fs.uploadFile).toHaveBeenCalledTimes(1);
   });
 
@@ -219,7 +223,7 @@ describe("deliverPendingInbox", () => {
     // Never touched the sandbox, and the row stays pending — not silently lost.
     expect(get).not.toHaveBeenCalled();
     expect(store.getInbox(record.id)?.status).toBe("pending");
-    expect(store.getWorkItem(record.id)?.status).toBe("pending");
+    expect(workStore!.get(record.id)?.status).toBe("pending");
     expect(store.listPendingInbox("issue-1")).toHaveLength(1);
   });
 
@@ -284,7 +288,7 @@ describe("deliverPendingInbox", () => {
     await expect(deliverPendingInbox({ runtime, store })).resolves.toBeUndefined();
 
     expect(store.getInbox(record.id)?.status).toBe("canceled");
-    expect(store.getWorkItem(record.id)?.status).toBe("canceled");
+    expect(workStore!.get(record.id)?.status).toBe("canceled");
     expect(sandbox.fs.uploadFile).toHaveBeenCalledTimes(1);
     errorSpy.mockRestore();
   });
