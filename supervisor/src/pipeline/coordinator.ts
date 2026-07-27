@@ -639,6 +639,9 @@ export function coordinatePipelineEvent(
     gateReceipt,
     resumeStatus: write.resumeStatus ?? null,
     priorFindings,
+    enteredStageIds: stages
+      .filter((stage) => stage.attempt_count > 0)
+      .map((stage) => stage.stage_id),
   }));
   attachPublicationEffects({
     write,

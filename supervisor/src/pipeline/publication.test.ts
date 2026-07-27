@@ -35,6 +35,7 @@ import type {
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
+const productionCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
 const runtime = buildInstalledRuntimeDescriptor("publication-test/v1");
 const SUBJECT = "c".repeat(40);
 
@@ -61,7 +62,9 @@ describe("pipeline publication", () => {
     db = openDb(":memory:");
     const pipelines = createPipelineStore(db);
     const tickets = createSupervisorStore(db, pipelines);
-    const catalog = loadPipelineCatalog(catalogPath, runtime.descriptor);
+    const catalog = loadPipelineCatalog(manifestKey.startsWith("core/")
+      ? productionCatalogPath
+      : catalogPath, runtime.descriptor);
     pipelines.acceptRuntimeDescriptor(runtime);
     pipelines.acceptCatalog(catalog);
     const config = parseRepositoryConfig("pipelines: { implement: fixture-command }\n");
@@ -632,6 +635,236 @@ describe("pipeline publication", () => {
         "- [ ] code review",
         "**Assumptions & decisions**",
       ]);
+  });
+
+  it("renders core implement status in happy-path execution order without unused repair stages", () => {
+    const { instance } = setup("core/implement@4");
+    const publication = buildSelectionPublication(instance);
+
+    expect(publication.body.split("\n").slice(0, 11)).toEqual([
+      "**Your move: nothing — implementing (stage 1 of 9).**",
+      "→ **implementing** — in progress",
+      "- [ ] code review",
+      "- [ ] simplifying",
+      "- [ ] re-review",
+      "- [ ] testing",
+      "- [ ] linting",
+      "- [ ] building",
+      "- [ ] publishing",
+      "- [ ] waiting on GitHub",
+      "",
+    ]);
+    expect(publication.body).not.toContain("repair code review");
+    expect(publication.body).not.toContain("repair implementation");
+    expect(publication.body).not.toContain("semantic review");
+    expect(renderLinearStatusComment(publication)).not.toContain("semantic review");
+    expect(renderGithubPipelineSummary(publication)).not.toContain("semantic review");
+  });
+
+  it("shows terminal needs-human context and carried findings without unused repair rows", () => {
+    const { instance, attempt } = setup("core/implement@4");
+    const reviewAttempt = { ...attempt, stage_id: "semantic_review" };
+    const input = semanticEvent({
+      instance,
+      attempt: reviewAttempt,
+      outcome: "semantic_repair_required",
+      summary: "Code review found issues but repair budget was exhausted.",
+      findings: [
+        { severity: "P2", code: "status-order", summary: "repair rows render before code review" },
+      ],
+      withReviewArtifact: true,
+    });
+    const publication = buildStagePublication({
+      instance,
+      attempt: reviewAttempt,
+      event: input.event,
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: reviewAttempt.id,
+        outcome: "semantic_repair_required",
+        terminalOutcome: "needs_human",
+        resultHash: input.event.resultHash,
+        nextStatus: "completion_pending_publication",
+        waitReason: "re-entry exhausted at semantic_review",
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+    });
+
+    expect(publication.body.split("\n").slice(0, 12)).toEqual([
+      "**Your move: decision required — re-entry exhausted at code review (stage 9 of 9).**",
+      "why: re-entry exhausted at code review",
+      "ask: provide the requested decision or repair direction before the pipeline can continue",
+      "- [x] implementing",
+      "- [x] code review",
+      "- [x] simplifying",
+      "- [x] re-review",
+      "- [x] testing",
+      "- [x] linting",
+      "- [x] building",
+      "- [x] publishing",
+      "- [x] waiting on GitHub",
+    ]);
+    expect(publication.body).toContain("**Findings**");
+    expect(publication.body)
+      .toContain("[P2] status-order — repair rows render before code review → remaining/accepted");
+    expect(publication.body).not.toContain("repair code review");
+    expect(publication.body).not.toContain("semantic review");
+  });
+
+  it("does not show repair stages for implementation self-reentry", () => {
+    const { instance, attempt } = setup("core/implement@4");
+    const reentryAttempt = { ...attempt, reentry_ordinal: 1 };
+    const input = semanticEvent({
+      instance,
+      attempt: reentryAttempt,
+      outcome: "success",
+      summary: "Implementation self-repair completed.",
+    });
+    const publication = buildStagePublication({
+      instance,
+      attempt: reentryAttempt,
+      event: input.event,
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: reentryAttempt.id,
+        outcome: "success",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+      enteredStageIds: ["implementation"],
+    });
+
+    expect(publication.body.split("\n").slice(0, 10)).toEqual([
+      "**Your move: nothing — reviewing changes (stage 2 of 9).**",
+      "- [x] implementing",
+      "→ **code review** — in progress",
+      "- [ ] simplifying",
+      "- [ ] re-review",
+      "- [ ] testing",
+      "- [ ] linting",
+      "- [ ] building",
+      "- [ ] publishing",
+      "- [ ] waiting on GitHub",
+    ]);
+    expect(publication.body).not.toContain("repair implementation");
+    expect(publication.body).not.toContain("repair code review");
+  });
+
+  it("shows repair stages immediately after code review on the first repair handoff", () => {
+    const { instance, attempt } = setup("core/implement@4");
+    const reviewAttempt = { ...attempt, stage_id: "semantic_review" };
+    const input = semanticEvent({
+      instance,
+      attempt: reviewAttempt,
+      outcome: "semantic_repair_required",
+      summary: "Code review found a repairable issue.",
+      findings: [
+        { severity: "P2", code: "status-order", summary: "repair rows render after skipped rows" },
+      ],
+      withReviewArtifact: true,
+    });
+    const publication = buildStagePublication({
+      instance,
+      attempt: reviewAttempt,
+      event: input.event,
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: reviewAttempt.id,
+        outcome: "semantic_repair_required",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        reentryIncrement: 1,
+        nextAttempt: nextAttemptStub("repair_implementation", 1),
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+      enteredStageIds: ["implementation", "semantic_review"],
+    });
+
+    expect(publication.body.split("\n").slice(0, 12)).toEqual([
+      "**Your move: nothing — repair implementation (stage 3 of 11).**",
+      "- [x] implementing",
+      "- [x] code review",
+      "→ **repair implementation** — in progress",
+      "- [ ] repair code review",
+      "- [ ] simplifying",
+      "- [ ] re-review",
+      "- [ ] testing",
+      "- [ ] linting",
+      "- [ ] building",
+      "- [ ] publishing",
+      "- [ ] waiting on GitHub",
+    ]);
+    expect(publication.body).not.toContain("- [x] simplifying");
+    expect(publication.body).not.toContain("- [x] re-review");
+    expect(publication.body).not.toContain("semantic review");
+  });
+
+  it("includes repair stages in execution position once a repair path has been entered", () => {
+    const { instance, attempt } = setup("core/implement@4");
+    const repairAttempt = { ...attempt, stage_id: "repair_implementation", reentry_ordinal: 1 };
+    const input = semanticEvent({
+      instance: { ...instance, reentry_count: 1 },
+      attempt: repairAttempt,
+      outcome: "success",
+      summary: "Repair implementation completed.",
+    });
+    const publication = buildStagePublication({
+      instance: { ...instance, reentry_count: 1 },
+      attempt: repairAttempt,
+      event: input.event,
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: repairAttempt.id,
+        outcome: "success",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+      enteredStageIds: [
+        "implementation",
+        "semantic_review",
+        "simplification",
+        "post_simplify_review",
+        "repair_implementation",
+      ],
+    });
+
+    expect(publication.body.split("\n").slice(0, 12)).toEqual([
+      "**Your move: nothing — reviewing repair changes (stage 6 of 11).**",
+      "- [x] implementing",
+      "- [x] code review",
+      "- [x] simplifying",
+      "- [x] re-review",
+      "- [x] repair implementation",
+      "→ **repair code review** — in progress",
+      "- [ ] testing",
+      "- [ ] linting",
+      "- [ ] building",
+      "- [ ] publishing",
+      "- [ ] waiting on GitHub",
+    ]);
+    expect(publication.body).not.toContain("semantic review");
   });
 
   it("renders artifact findings with severity, code, summary, and fixed or remaining dispositions", () => {
@@ -1704,8 +1937,11 @@ describe("pipeline publication", () => {
     });
     expectReceiptShape(
       needsHuman.body,
-      "**Your move: decision required — Choose whether to continue in the Linear session. (stage 1 of 3).**"
+      "**Your move: decision required — Choose whether to continue in the Linear session. (stage 3 of 3).**"
     );
+    expect(needsHuman.body).toContain("why: Choose whether to continue in the Linear session.");
+    expect(needsHuman.body)
+      .toContain("ask: provide the requested decision or repair direction before the pipeline can continue");
 
     const providerWait = buildStagePublication({
       instance,
@@ -1775,6 +2011,20 @@ describe("pipeline publication", () => {
     });
     expectReceiptShape(publication.body, turnLine);
     expect(publication.body).toContain(sentence);
+    if (outcome === "shipped") {
+      expect(publication.body).not.toContain("why:");
+      expect(publication.body).not.toContain("ask:");
+    } else {
+      const reason = outcome === "needs_human"
+        ? "Pick a deployment target"
+        : outcome === "failed"
+          ? "Daytona could not provision the sandbox"
+          : sentence;
+      expect(publication.body).toContain(`why: ${reason}`);
+      expect(publication.body).toContain(outcome === "needs_human"
+        ? "ask: provide the requested decision or repair direction before the pipeline can continue"
+        : "ask: no decision is pending; inspect the terminal evidence before starting a new run");
+    }
   });
 
   it("queues one permanent receipt through an outage and finalizes only after acknowledgement", async () => {

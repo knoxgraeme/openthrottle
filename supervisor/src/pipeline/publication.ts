@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import {
   canonicalJson,
   digestNormalized,
-  PIPELINE_OUTCOMES,
   type PipelineManifest,
   type PipelineOutcome,
   type StageOutcome,
@@ -15,6 +14,13 @@ import type {
   PipelineStageAttempt,
 } from "./store.js";
 import type { PipelineCoordinatorEvent } from "./coordinator.js";
+import {
+  displayStatusText,
+  isRepairStage,
+  renderStatusHeaderLines,
+  stageDisplayName,
+  type RenderExtras as StatusRenderExtras,
+} from "./publication-status.js";
 import { sanitizeText } from "../shared/sanitize.js";
 
 export const PIPELINE_PUBLICATION_SCHEMA = "openthrottle.pipeline-publication/v1";
@@ -27,7 +33,6 @@ const INLINE_ARTIFACT_LIMIT_BYTES = 4 * 1024;
 const PUBLICATION_BODY_LIMIT = 12_000;
 const ATTACHMENT_LIMIT_BYTES = 256 * 1024;
 const MAX_RENDERED_FINDINGS = 10;
-const TERMINAL_STATUSES = new Set<string>(PIPELINE_OUTCOMES);
 
 export type PipelinePublicationTemplate =
   | "selection"
@@ -209,33 +214,8 @@ interface RenderContext {
   transition: PipelineManifest["stages"][number]["transitions"][StageOutcome] | undefined;
 }
 
-interface RenderExtras {
-  scheduledReentryOrdinal?: number;
+interface RenderExtras extends StatusRenderExtras {
   repairBannerFinding?: PublicationFinding;
-}
-
-const STAGE_LABELS: Readonly<Record<string, { display: string; action?: string }>> = {
-  build: { display: "building" },
-  command: { display: "running command" },
-  implementation: { display: "implementing" },
-  lint: { display: "linting" },
-  planning: { display: "planning" },
-  provider: { display: "waiting on GitHub" },
-  publish: { display: "publishing" },
-  post_simplify_review: { display: "re-review", action: "reviewing simplified changes" },
-  review: { display: "code review", action: "reviewing changes" },
-  semantic_review: { display: "code review", action: "reviewing changes" },
-  simplification: { display: "simplifying", action: "simplifying changes" },
-  test: { display: "testing" },
-};
-
-function stageDisplayName(stageId: string): string {
-  return STAGE_LABELS[stageId]?.display ?? stageId.replaceAll("_", " ");
-}
-
-function stageActionName(stageId: string): string {
-  const label = STAGE_LABELS[stageId];
-  return label?.action ?? label?.display ?? stageDisplayName(stageId);
 }
 
 function renderContext(envelope: PipelinePublicationBodyInput, normalizedManifest: string): RenderContext {
@@ -248,22 +228,6 @@ function renderContext(envelope: PipelinePublicationBodyInput, normalizedManifes
     manifest,
     stageIndex,
     transition: stage?.transitions[envelope.decision.outcome as StageOutcome],
-  };
-}
-
-function stagePosition(envelope: PipelinePublicationBodyInput, context: RenderContext): {
-  ordinal: number;
-  total: number;
-  stage: string;
-} {
-  const manifest = context.manifest;
-  if (!envelope.stage) {
-    return { ordinal: 0, total: manifest.stages.length, stage: envelope.template.name.replaceAll("_", " ") };
-  }
-  return {
-    ordinal: context.stageIndex >= 0 ? context.stageIndex + 1 : envelope.stage.attempt_ordinal,
-    total: manifest.stages.length,
-    stage: envelope.stage.id,
   };
 }
 
@@ -294,8 +258,8 @@ function reentrySentence(
   const round = reentryRound(envelope, context, extras);
   const target = nextStageName(envelope, context);
   return envelope.decision.outcome === "retryable_infrastructure_failure"
-    ? `The supervisor is retrying the ${target} stage after an infrastructure failure (attempt ${round}).`
-    : `The supervisor accepted the stage result and scheduled repair round ${round} at the ${target} stage.`;
+    ? `The supervisor is retrying the ${stageDisplayName(target)} stage after an infrastructure failure (attempt ${round}).`
+    : `The supervisor accepted the stage result and scheduled repair round ${round} at the ${stageDisplayName(target)} stage.`;
 }
 
 function sentenceForOutcome(outcome: StageOutcome | PipelineOutcome | "selected"): string {
@@ -349,7 +313,7 @@ function eventSentence(
 
 function terminalSentence(envelope: PipelinePublicationBodyInput): string {
   const reason = envelope.decision.wait_reason
-    ? boundedPublicationLine(envelope.decision.wait_reason, 1_000)
+    ? displayStatusText(envelope.decision.wait_reason, 1_000)
     : null;
   const providerLink = envelope.links[0]
     ? ` Provider link: [${boundedPublicationLine(envelope.links[0].label, 100)}](${envelope.links[0].url}).`
@@ -381,75 +345,6 @@ function dedupeLines(lines: string[]): string[] {
     seen.add(line);
     return true;
   });
-}
-
-function activeChecklistIndex(envelope: PipelinePublicationBodyInput, context: RenderContext): number {
-  if (envelope.template.name === "terminal" ||
-      TERMINAL_STATUSES.has(envelope.decision.next_status) ||
-      (envelope.resume_status && TERMINAL_STATUSES.has(envelope.resume_status))) {
-    return context.manifest.stages.length;
-  }
-  const next = nextStageName(envelope, context);
-  const nextIndex = context.manifest.stages.findIndex((stage) => stage.id === next);
-  if (nextIndex >= 0 && next !== envelope.stage?.id) return nextIndex;
-  return context.stageIndex >= 0 ? context.stageIndex : 0;
-}
-
-function activeStagePosition(envelope: PipelinePublicationBodyInput, context: RenderContext): {
-  ordinal: number;
-  total: number;
-  stageId: string;
-} {
-  const activeIndex = activeChecklistIndex(envelope, context);
-  const total = context.manifest.stages.length;
-  if (activeIndex >= 0 && activeIndex < total) {
-    return { ordinal: activeIndex + 1, total, stageId: context.manifest.stages[activeIndex]!.id };
-  }
-  const position = stagePosition(envelope, context);
-  return { ordinal: Math.min(position.ordinal, total), total, stageId: position.stage };
-}
-
-function whoseMoveLine(envelope: PipelinePublicationBodyInput, context: RenderContext): string {
-  const waitReason = envelope.decision.wait_reason
-    ? boundedPublicationLine(envelope.decision.wait_reason, 1_000)
-    : "the published receipt in this Linear session";
-  const active = activeStagePosition(envelope, context);
-  const suffix = `(stage ${active.ordinal} of ${active.total}).`;
-  if (envelope.decision.next_status === "waiting_human" || envelope.template.name === "needs_human") {
-    return `**Your move: decision required — ${waitReason} ${suffix}**`;
-  }
-  if (envelope.decision.next_status === "waiting_provider" || envelope.template.name === "provider_wait") {
-    return `**Your move: nothing — waiting on GitHub: ${waitReason} ${suffix}**`;
-  }
-  if (envelope.template.name === "terminal" ||
-      envelope.decision.next_status === envelope.decision.outcome &&
-      TERMINAL_STATUSES.has(envelope.decision.next_status)) {
-    return `**Your move: nothing — this run is finished. ${terminalSentence(envelope)}**`;
-  }
-  return `**Your move: nothing — ${stageActionName(active.stageId)} ${suffix}**`;
-}
-
-function stageChecklistLines(envelope: PipelinePublicationBodyInput, context: RenderContext): string[] {
-  const activeIndex = activeChecklistIndex(envelope, context);
-  return context.manifest.stages.map((stage, index) => {
-    if (index < activeIndex || activeIndex >= context.manifest.stages.length) {
-      return `- [x] ${stageDisplayName(stage.id)}`;
-    }
-    if (index === activeIndex) {
-      const wait = envelope.decision.wait_reason
-        ? ` — ${boundedPublicationLine(envelope.decision.wait_reason, 500)}`
-        : "";
-      return `→ **${stageDisplayName(stage.id)}** — in progress${wait}`;
-    }
-    return `- [ ] ${stageDisplayName(stage.id)}`;
-  });
-}
-
-function summaryHeaderLines(envelope: PipelinePublicationBodyInput, context: RenderContext): string[] {
-  return [
-    whoseMoveLine(envelope, context),
-    ...stageChecklistLines(envelope, context),
-  ];
 }
 
 function normalizedFindingToken(value: string): string {
@@ -643,7 +538,7 @@ function renderBody(
 ): string {
   const context = renderContext(envelope, normalizedManifest);
   const lines = [
-    ...summaryHeaderLines(envelope, context),
+    ...renderStatusHeaderLines(envelope, normalizedManifest, extras),
     ...repairBannerLines(envelope, context, extras),
     ...findingsSectionLines(envelope),
     ...assumptionsSectionLines(envelope),
@@ -757,7 +652,12 @@ export function buildLifecyclePublication(input: {
     links: githubLinks(input.instance, input.instance.immutable_subject),
     resume_status: null,
   };
-  return { ...partial, body: renderBody(partial, input.instance.normalized_manifest) };
+  return {
+    ...partial,
+    body: renderBody(partial, input.instance.normalized_manifest, {
+      hasRepairHistory: false,
+    }),
+  };
 }
 
 export function buildStagePublication(input: {
@@ -769,6 +669,8 @@ export function buildStagePublication(input: {
   resumeStatus?: PipelineInstanceStatus | null;
   /** Findings accumulated from the run's earlier publications. */
   priorFindings?: readonly PublicationFinding[];
+  /** Stage IDs whose state rows show that they were attempted in this run. */
+  enteredStageIds?: readonly string[];
 }): PipelinePublicationEnvelope {
   const resumeStatus = input.resumeStatus ?? input.write.resumeStatus ?? null;
   const evidence = (input.event.artifacts ?? []).map((artifact) => safeEvidence(artifact.payload));
@@ -839,6 +741,8 @@ export function buildStagePublication(input: {
     scheduledReentryOrdinal: input.write.nextAttempt?.reentryOrdinal,
     repairBannerFinding: currentFindingsWithDisposition
       .find((finding) => finding.disposition === "carried to repair"),
+    hasRepairHistory: input.enteredStageIds?.some(isRepairStage) ?? false,
+    enteredStageIds: input.enteredStageIds,
   });
   return artifactBytes <= INLINE_ARTIFACT_LIMIT_BYTES
     ? {
