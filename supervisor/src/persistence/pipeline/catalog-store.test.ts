@@ -167,13 +167,14 @@ describe("pipeline catalog store", () => {
       { pipeline_id: "ce/investigate", version: 2, digest: shippedCatalog.manifests.get("ce/investigate@2")!.digest },
       { pipeline_id: "core/implement", version: 1, digest: shippedCatalog.manifests.get("core/implement@1")!.digest },
       { pipeline_id: "core/implement", version: 2, digest: shippedCatalog.manifests.get("core/implement@2")!.digest },
+      { pipeline_id: "core/implement", version: 3, digest: shippedCatalog.manifests.get("core/implement@3")!.digest },
       { pipeline_id: "core/investigate", version: 1, digest: shippedCatalog.manifests.get("core/investigate@1")!.digest },
     ]);
     expect(db.prepare(`
       SELECT alias, pipeline_id, version FROM pipeline_catalog_aliases
       WHERE alias IN ('implement', 'investigate') ORDER BY alias
     `).all()).toEqual([
-      { alias: "implement", pipeline_id: "core/implement", version: 2 },
+      { alias: "implement", pipeline_id: "core/implement", version: 3 },
       { alias: "investigate", pipeline_id: "core/investigate", version: 1 },
     ]);
   });

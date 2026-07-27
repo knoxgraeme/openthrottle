@@ -154,7 +154,7 @@ describe("OpenThrottle canonical task skills", () => {
 
   it("documents every CE manifest stage and the sealed command/provider boundaries", () => {
     const body = skillBody("implement-plan");
-    for (const stage of ["planning", "implementation", "semantic_review", "simplification", "publish"]) {
+    for (const stage of ["planning", "implementation", "semantic_review", "simplification", "post_simplify_review", "publish"]) {
       expect(body).toContain(stage);
     }
     expect(body).toMatch(/separate sealed command\s+stages/);
