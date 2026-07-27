@@ -315,6 +315,76 @@ describe("Linear contracts", () => {
       .map((request) => request.variables?.stateId)).toEqual(["progress", "done"]);
   });
 
+  it("drives a triage issue forward through started, In Review, and completed", async () => {
+    const requests: Array<{ query?: string; variables?: { id?: string; stateId?: string } }> = [];
+    let currentState = { id: "triage", name: "Triage", type: "triage" };
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as {
+        query?: string;
+        variables?: { id?: string; stateId?: string };
+      };
+      requests.push(request);
+      if (request.query?.includes("IssueWorkflowState")) {
+        return Response.json({
+          data: {
+            issue: {
+              id: request.variables?.id,
+              state: currentState,
+              team: { id: "team-triage-flow" },
+            },
+          },
+        });
+      }
+      if (request.query?.includes("TeamWorkflowStates")) {
+        return Response.json({
+          data: {
+            team: {
+              states: {
+                nodes: [
+                  { id: "triage", name: "Triage", type: "triage" },
+                  { id: "progress", name: "In Progress", type: "started" },
+                  { id: "review", name: "In Review", type: "started" },
+                  { id: "done", name: "Done", type: "completed" },
+                ],
+              },
+            },
+          },
+        });
+      }
+      if (request.query?.includes("IssueStateUpdate")) {
+        currentState = request.variables?.stateId === "done"
+          ? { id: "done", name: "Done", type: "completed" }
+          : request.variables?.stateId === "review"
+            ? { id: "review", name: "In Review", type: "started" }
+            : { id: "progress", name: "In Progress", type: "started" };
+        return Response.json({
+          data: {
+            issueUpdate: {
+              success: true,
+              issue: { id: "issue-1", state: currentState },
+            },
+          },
+        });
+      }
+      throw new Error("unexpected Linear request");
+    }) as unknown as typeof fetch;
+    const client = { accessToken: "triage-flow-token", fetch: fetchMock };
+
+    // Drive the full lifecycle without ever resetting state: a shipped ticket
+    // that started in a triage-type state must not stay stuck / be skipped.
+    const started = await issueStateUpdate(client, { issueId: "issue-1", signal: "started" });
+    const review = await issueStateUpdate(client, { issueId: "issue-1", signal: "review" });
+    const completed = await issueStateUpdate(client, { issueId: "issue-1", signal: "completed" });
+
+    expect(started.skipped).toBeUndefined();
+    expect(review.skipped).toBeUndefined();
+    expect(completed.skipped).toBeUndefined();
+    expect(completed.state).toEqual({ id: "done", name: "Done" });
+    expect(currentState.type).toBe("completed");
+    expect(requests.filter((request) => request.query?.includes("IssueStateUpdate"))
+      .map((request) => request.variables?.stateId)).toEqual(["progress", "review", "done"]);
+  });
+
   it("caches team workflow states across fresh client wrappers sharing a cache identity", async () => {
     const requests: Array<{ query?: string; variables?: { id?: string; stateId?: string } }> = [];
     let currentState = { id: "backlog", name: "Backlog", type: "backlog" };
