@@ -279,6 +279,27 @@ function acknowledgedPublicationSubjects(pipelines: PipelineStore, instanceId: s
     .flatMap((publication) => publicationSubjects(publication.payload)));
 }
 
+function currentPublicationAcknowledgedAt(pipelines: PipelineStore, instance: PipelineInstance): string | undefined {
+  if (instance.published_commit === null) return undefined;
+  return pipelines.listPublications(instance.id)
+    .filter((publication) =>
+      publication.status === "acknowledged" &&
+      publicationSubjects(publication.payload).includes(instance.published_commit!)
+    )
+    .map((publication) => publication.acknowledged_at ?? publication.created_at)
+    .sort()
+    .at(-1);
+}
+
+function snapshotPredatesCurrentPublication(
+  pipelines: PipelineStore,
+  snapshot: FeedbackSnapshot,
+  instance: PipelineInstance
+): boolean {
+  const acknowledgedAt = currentPublicationAcknowledgedAt(pipelines, instance);
+  return acknowledgedAt !== undefined && snapshot.created_at < acknowledgedAt;
+}
+
 function staleFeedbackNotice(params: {
   sessionId: string;
   eventCount: number;
@@ -322,7 +343,13 @@ export function processPipelineFeedbackSnapshot(params: {
   const subjects = canCheckCarryForward
     ? params.acknowledgedPublicationSubjects ?? acknowledgedPublicationSubjects(params.pipelines, params.instance.id)
     : undefined;
+  // Feedback observed before the current head was published may still be the
+  // repair request that caused this republish. Feedback observed after that
+  // publication is a stale anchor and must not consume another repair round.
+  const canCarryPastFirstRepair = params.instance.reentry_count === 0 ||
+    snapshotPredatesCurrentPublication(params.pipelines, params.snapshot, params.instance);
   const currentSnapshot = subjects && snapshotCanCarryForward(subjects, params.snapshot, params.instance)
+    && canCarryPastFirstRepair
     ? params.store.carryForwardFeedbackSnapshot(
       params.snapshot.id,
       params.instance.published_commit!,

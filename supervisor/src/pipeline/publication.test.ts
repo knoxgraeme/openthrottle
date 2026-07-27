@@ -634,6 +634,50 @@ describe("pipeline publication", () => {
       ]);
   });
 
+  it("renders fixed provider feedback as an addressed block in the GitHub summary", () => {
+    const { instance, attempt } = setup("fixture/agent@1");
+    const input = event(instance, attempt, "Repair review passed.");
+    replaceStagePayload(input, {
+      summary: "Repair review passed.",
+      evidence: ["Focused provider-feedback regression passed."],
+      findings: [],
+      actions: ["Fixed stale-review-feedback by ignoring superseded PR review comments after a repair round."],
+      uncertainty: [],
+    });
+    const publication = buildStagePublication({
+      instance,
+      attempt,
+      event: input.event,
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: attempt.id,
+        outcome: "success",
+        resultHash: input.event.resultHash,
+        nextStatus: "waiting_provider",
+        waitReason: "GitHub checks are still running",
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+      priorFindings: [{
+        severity: "P2",
+        code: "stale-review-feedback",
+        summary: "Superseded PR review comments trigger another repair.",
+        disposition: "carried to repair",
+      }],
+    });
+
+    const summary = renderGithubPipelineSummary(publication, "https://github.com/owner/repo/pull/10");
+    expect(summary).toMatch(/^<!-- openthrottle:pipeline-summary:issue-1 -->/);
+    expect(summary).toContain([
+      "Addressed in `cccccccccccc`:",
+      "- [P2] stale-review-feedback: Superseded PR review comments trigger another repair.",
+    ].join("\n"));
+  });
+
   it("renders artifact findings with severity, code, summary, and fixed or remaining dispositions", () => {
     const { instance, attempt } = setup("fixture/agent@1");
     const input = event(instance, attempt);
