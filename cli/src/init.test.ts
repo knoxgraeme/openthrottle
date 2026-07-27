@@ -44,7 +44,6 @@ describe("init project detection", () => {
       test: "npm run test",
       build: "npm run build",
       lint: "",
-      dev: "npm run dev -- --port 3000 --hostname 0.0.0.0",
     });
     writeProjectConfig(
       {
@@ -52,7 +51,6 @@ describe("init project detection", () => {
         test: "npm test",
         build: "",
         lint: "",
-        dev: "",
         post_bootstrap: ["npm install"],
         limits: { max_turns: 20, task_timeout: 60 },
         mcp_servers: {},
@@ -73,7 +71,6 @@ describe("init project detection", () => {
         test: "",
         build: "",
         lint: "",
-        dev: "",
         post_bootstrap: [],
         limits: { max_turns: 20, task_timeout: 60 },
         mcp_servers: {},
@@ -93,7 +90,6 @@ describe("init project detection", () => {
       test: "",
       build: "",
       lint: "",
-      dev: "",
     });
   });
 
