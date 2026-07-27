@@ -116,6 +116,43 @@ describe("pipeline coordinator", () => {
     };
   }
 
+  function stageResultEvent(input: {
+    instance: PipelineInstance;
+    attempt: PipelineStageAttempt;
+    outcome?: PipelineCoordinatorEvent["outcome"];
+    id: string;
+    summary: string;
+    evidence?: string[];
+    uncertainty?: string[];
+  }): PipelineCoordinatorEvent {
+    const payload = JSON.stringify({
+      schema: "openthrottle.stage-proposal/v1",
+      suggested_outcome: input.outcome ?? "success",
+      summary: input.summary,
+      evidence: input.evidence ?? [],
+      findings: [],
+      actions: [],
+      uncertainty: input.uncertainty ?? [],
+    });
+    return {
+      id: input.id,
+      kind: "stage_result",
+      instanceId: input.instance.id,
+      generation: input.instance.generation,
+      attemptId: input.attempt.id,
+      requestHash: input.attempt.request_hash,
+      outcome: input.outcome ?? "success",
+      resultHash: digestNormalized(payload),
+      artifacts: [{
+        kind: "stage_result",
+        schemaVersion: 1,
+        assurance: "semantic_attested",
+        payload,
+        hash: digestNormalized(payload),
+      }],
+    };
+  }
+
   function providerFeedbackEvent(
     instance: PipelineInstance,
     attempt: PipelineStageAttempt,
@@ -271,6 +308,69 @@ describe("pipeline coordinator", () => {
     const replay = coordinatePipelineEvent(pipelines, input);
     expect(replay.state_version).toBe(1);
     expect(pipelines.listEffects(instance.id)).toHaveLength(4);
+  });
+
+  it("projects notable repair stages into run notes without changing transitions", () => {
+    const { pipelines, instance, attempt } = setup("core/implement@4");
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'running', active_stage_id = 'repair_implementation'
+      WHERE id = ?
+    `).run(instance.id);
+    db!.prepare(`
+      UPDATE pipeline_instance_stages
+      SET status = CASE WHEN stage_id = 'repair_implementation' THEN 'running' ELSE status END
+      WHERE pipeline_instance_id = ?
+    `).run(instance.id);
+    db!.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET stage_id = 'repair_implementation', status = 'running'
+      WHERE id = ?
+    `).run(attempt.id);
+    const active = pipelines.getAttempt(attempt.id)!;
+    const result = coordinatePipelineEvent(pipelines, stageResultEvent({
+      instance: { ...instance, status: "running", active_stage_id: "repair_implementation" },
+      attempt: active,
+      id: "repair-result",
+      summary: "Fixed the provider feedback and left no remaining code changes.",
+      evidence: ["Provider response included Bearer provider-token-123."],
+      uncertainty: ["Provider checks have not rerun yet. sk-test-123456"],
+    }));
+
+    expect(result.active_stage_id).not.toBe("repair_implementation");
+    const notes = pipelines.listJournalEntries({ issueId: instance.linear_issue_id })
+      .filter((entry) => entry.kind === "run_note");
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toMatchObject({
+      actor: "stage_agent",
+      issue: "ISSUE-1",
+      repository: "owner/repo",
+      instance_id: instance.id,
+      outcome: "success",
+    });
+    expect(notes[0].note).toContain("Fixed the provider feedback");
+    expect(notes[0].note).not.toContain("sk-test-123456");
+    expect(notes[0].structured).not.toContain("provider-token-123");
+    expect(notes[0].structured).not.toContain("sk-test-123456");
+    expect(JSON.parse(notes[0].structured!)).toMatchObject({
+      suggested_outcome: "success",
+      uncertainty: ["Provider checks have not rerun yet. [REDACTED]"],
+      evidence_refs: ["Provider response included [REDACTED]"],
+    });
+  });
+
+  it("does not write run notes for clean forward agent stages", () => {
+    const { pipelines, instance, attempt } = setup("core/implement@4");
+    const result = coordinatePipelineEvent(pipelines, stageResultEvent({
+      instance,
+      attempt,
+      id: "clean-implementation",
+      summary: "Implemented the planned change.",
+    }));
+
+    expect(result.active_stage_id).toBe("semantic_review");
+    expect(pipelines.listJournalEntries({ issueId: instance.linear_issue_id })
+      .filter((entry) => entry.kind === "run_note")).toEqual([]);
   });
 
   it("rolls back every transition write boundary and recovers one complete intent set", () => {

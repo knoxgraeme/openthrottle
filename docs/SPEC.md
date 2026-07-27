@@ -359,8 +359,17 @@ SQLite is the authority. Core tables include:
 - fenced execution: `pipeline_stage_attempts`, `pipeline_inbox_events`;
 - evidence/effects: `pipeline_artifacts`, `pipeline_gate_receipts`,
   `pipeline_publication_receipts`, `pipeline_effect_intents`;
+- cross-run orchestration history: `orchestration_journal`;
 - operations: `repository_registrations`, `supervisor_leases`, `settings`,
   `schema_migrations`, `migration_reconciliation`.
+
+`orchestration_journal` is append-only data capture, keyed by team,
+repository, issue, and recorded time. Supervisor-owned orchestration decisions
+use `actor = 'supervisor'` with null notes; notable agent proposal projections
+use `actor = 'stage_agent'` with sanitized, bounded notes and structured
+evidence references. The journal is queryable for operator or future
+orchestrator inspection, but no coordinator transition, gate, or effect
+scheduling logic may consume it as authority.
 
 Schema migrations are transactional, checksum-pinned, and idempotent. Migration
 code may recognize historical direct-run rows solely to reconcile an older

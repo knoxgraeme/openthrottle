@@ -258,6 +258,21 @@ export async function handleCreated(
     });
     if (!verdict.ok) {
       await failAdmission(verdict.reason);
+      if (verdict.reason.startsWith("Daytona capacity:")) {
+        coordinator.store.recordJournalEntry({
+          issueId: issue.id,
+          actor: "supervisor",
+          kind: "capacity_refused",
+          trigger: "Admission preflight",
+          action: "Refused delegation before sandbox provisioning because capacity was unavailable.",
+          outcome: "refused",
+          refs: {
+            repository: selectedRepository.repo,
+            base_commit: pinned.remote.baseCommit,
+            reason: sanitizeText(verdict.reason).slice(0, 1_000),
+          },
+        });
+      }
       return;
     }
   }

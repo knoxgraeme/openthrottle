@@ -321,6 +321,24 @@ export async function handleGithubEvent(
           ticketState: "closed",
         });
       }
+      if (event.pull_request.merged) {
+        const observed = currentPipeline ?? pipelineInstance;
+        pipelines.recordJournalEntry({
+          id: `journal-github-merged-${event.pull_request.number}-${event.pull_request.head.sha ?? "unknown"}`,
+          issueId: ticket.linear_issue_id,
+          instanceId: observed.id,
+          actor: "supervisor",
+          kind: "merged",
+          trigger: "GitHub pull_request closed webhook",
+          action: "Observed the pull request merged.",
+          outcome: "merged",
+          refs: {
+            pr: event.pull_request.html_url,
+            commit: event.pull_request.head.sha ?? null,
+            pull_number: event.pull_request.number,
+          },
+        });
+      }
       // GitHub close is authoritative even when a stage already settled and
       // has no live attempt left for a stop event to cancel.
       store.setState(ticket.linear_issue_id, "closed");
