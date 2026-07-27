@@ -78,6 +78,20 @@ const CORE_IMPLEMENT_V3_STAGE_IDS = [
   "provider",
 ];
 
+const CORE_IMPLEMENT_V4_STAGE_IDS = [
+  "implementation",
+  "repair_implementation",
+  "repair_semantic_review",
+  "semantic_review",
+  "simplification",
+  "post_simplify_review",
+  "test",
+  "lint",
+  "build",
+  "publish",
+  "provider",
+];
+
 describe("pipeline manifest validation", () => {
   it("loads the shipped catalog deterministically against independent runtime evidence", () => {
     const path = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
@@ -90,6 +104,7 @@ describe("pipeline manifest validation", () => {
       "core/implement@1",
       "core/implement@2",
       "core/implement@3",
+      "core/implement@4",
       "core/investigate@1",
       "ce/implement@2",
       "ce/implement@3",
@@ -98,7 +113,7 @@ describe("pipeline manifest validation", () => {
     ]);
     const implementManifest = resolvePipelineReference(first, "implement").manifest;
     expect(implementManifest.id).toBe("core/implement");
-    expect(implementManifest.version).toBe(3);
+    expect(implementManifest.version).toBe(4);
     expect(resolvePipelineReference(first, "ce/implement@4").manifest.id).toBe("ce/implement");
     expect(() => resolvePipelineReference(first, "ce/implement@1"))
       .toThrow(/unknown pipeline selection/);
@@ -108,7 +123,7 @@ describe("pipeline manifest validation", () => {
       .toThrow(/unknown pipeline selection/);
     expect(() => resolvePipelineReference(first, "fixture-command"))
       .toThrow(/unknown pipeline selection/);
-    expect(implementManifest.stages.map((stage) => stage.id)).toEqual(CORE_IMPLEMENT_V3_STAGE_IDS);
+    expect(implementManifest.stages.map((stage) => stage.id)).toEqual(CORE_IMPLEMENT_V4_STAGE_IDS);
     expect(resolvePipelineReference(first, "investigate").manifest.stages.map((stage) => stage.id)).toEqual([
       "investigate",
       "publish",
@@ -191,6 +206,22 @@ describe("pipeline manifest validation", () => {
       .toEqual({ to: "stage", max_reentries: 5, on_exhausted: "failed" });
   });
 
+  it("accepts manifest-set raw attempt and repair round budgets", () => {
+    const value = manifest();
+    value.max_attempts = 200;
+    value.max_repair_rounds = 5;
+
+    expect(validatePipelineManifest(value).manifest).toMatchObject({
+      max_attempts: 200,
+      max_repair_rounds: 5,
+    });
+
+    expect(() => validatePipelineManifest({ ...value, max_attempts: 201 }))
+      .toThrow(/pipeline\.max_attempts: must be an integer between 1 and 200/);
+    expect(() => validatePipelineManifest({ ...value, max_repair_rounds: 21 }))
+      .toThrow(/pipeline\.max_repair_rounds: must be an integer between 1 and 20/);
+  });
+
   it("rejects invalid defaults before reducers can observe them", () => {
     expect(() => validatePipelineManifest({
       ...manifest(),
@@ -269,6 +300,39 @@ describe("pipeline manifest validation", () => {
     });
   });
 
+  it("ships core/implement@4 with round-based repair budget and scoped repair re-entry", () => {
+    const path = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
+    const catalog = loadPipelineCatalog(path, buildInstalledRuntimeDescriptor("test-runtime/v1").descriptor);
+    const v4 = resolvePipelineReference(catalog, "core/implement@4").manifest;
+
+    expect(v4.version).toBe(4);
+    expect(v4.max_attempts).toBe(200);
+    expect(v4.max_repair_rounds).toBe(5);
+    expect(v4.stages.map((stage) => stage.id)).toEqual(CORE_IMPLEMENT_V4_STAGE_IDS);
+
+    const implementation = v4.stages.find((stage) => stage.id === "implementation")!;
+    const repairImplementation = v4.stages.find((stage) => stage.id === "repair_implementation")!;
+    const semanticReview = v4.stages.find((stage) => stage.id === "semantic_review")!;
+    const repairSemanticReview = v4.stages.find((stage) => stage.id === "repair_semantic_review")!;
+
+    expect(implementation.transitions.success).toEqual({ to: "semantic_review" });
+    expect(semanticReview.transitions.success).toEqual({ to: "simplification" });
+    expect(semanticReview.transitions.no_change).toEqual({ to: "simplification" });
+    expect(semanticReview.transitions.semantic_repair_required).toEqual({
+      to: "repair_implementation",
+      max_reentries: 5,
+      on_exhausted: "needs_human",
+    });
+
+    expect(repairImplementation.executor).toEqual(implementation.executor);
+    expect(repairImplementation.context).toBe("resume_required");
+    expect(repairImplementation.transitions.success).toEqual({ to: "repair_semantic_review" });
+    expect(repairImplementation.transitions.no_change).toEqual({ to: "repair_semantic_review" });
+    expect(repairSemanticReview.executor).toEqual(semanticReview.executor);
+    expect(repairSemanticReview.transitions.success).toEqual({ to: "test" });
+    expect(repairSemanticReview.transitions.no_change).toEqual({ to: "test" });
+  });
+
   it("ships ce/implement@4 as an explicit-command plan-in pipeline while keeping legacy pinned instances immutable", () => {
     const path = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
     const runtime = buildInstalledRuntimeDescriptor("test-runtime/v1");
@@ -341,7 +405,20 @@ describe("pipeline manifest validation", () => {
     (unbounded.stages as Array<Record<string, unknown>>)[0]!.transitions = transitions({
       semantic_repair_required: { to: "stage" },
     });
-    expect(() => validatePipelineManifest(unbounded)).toThrow(/unbounded cycle/);
+    expect(() => validatePipelineManifest(unbounded)).toThrow(/re-entering transitions must declare max_reentries/);
+
+    const boundedForwardOnly = manifest();
+    const later = structuredClone(firstStage(boundedForwardOnly));
+    later.id = "later";
+    firstStage(boundedForwardOnly).transitions = transitions({
+      success: { to: "later", max_reentries: 1, on_exhausted: "failed" },
+    });
+    later.transitions = transitions({
+      success: { to: "stage" },
+    });
+    (boundedForwardOnly.stages as Array<Record<string, unknown>>).push(later);
+    expect(() => validatePipelineManifest(boundedForwardOnly))
+      .toThrow(/pipeline\.stages\.later\.transitions\.success: re-entering transitions must declare max_reentries/);
 
     const unreachable = manifest();
     (unreachable.stages as unknown[]).push({

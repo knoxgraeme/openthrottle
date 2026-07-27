@@ -1,6 +1,7 @@
 import {
   canonicalJson,
   digestNormalized,
+  isPipelineReentry,
   type AssuranceClass,
   type PipelineManifest,
   type PipelineOutcome,
@@ -465,11 +466,24 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
     if (target.executor.kind === "provider_wait" && !input.event.subject) {
       throw new Error(`stage ${stage.id} cannot enter provider wait without an exact subject`);
     }
-    const isReentry = target.id === stage.id ||
-      input.manifest.stages.findIndex((candidate) => candidate.id === target.id) <=
-        input.manifest.stages.findIndex((candidate) => candidate.id === stage.id);
+    const isReentry = isPipelineReentry(input.manifest, stage.id, target.id);
     const targetState = input.stages.find((candidate) => candidate.stage_id === target.id);
     if (!targetState) throw new Error(`stage state ${target.id} is absent for pipeline instance ${input.instance.id}`);
+    if (isReentry && input.manifest.max_repair_rounds !== undefined &&
+      input.instance.reentry_count >= input.manifest.max_repair_rounds) {
+      return terminalWrite({
+        ...input,
+        eventPayloadHash,
+        terminal: "failed",
+        publishIdempotencyKey: `linear-repair-rounds-exhausted:${input.instance.id}:${input.manifest.max_repair_rounds}`,
+        waitReason: `pipeline repair round limit ${input.manifest.max_repair_rounds} exhausted`,
+        effects: [failedTerminalStopEffect({
+          instanceId: input.instance.id,
+          idempotencyKey: `stop:${input.instance.id}:repair-rounds-exhausted`,
+          runId: stopRunId(input.attempt),
+        })],
+      });
+    }
     if (isReentry && transition.max_reentries !== undefined && targetState.reentry_count >= transition.max_reentries) {
       const exhausted = transition.on_exhausted!;
       return terminalWrite({
@@ -485,10 +499,11 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
         })] : [],
       });
     }
-    // `max_attempts` is a whole-run guard against starting another bounded
+    // `max_attempts` is a whole-run safety net against starting another bounded
     // repair/retry pass. Once a pass is already moving forward, per-transition
-    // re-entry caps are the loop bound and the coordinator must not strand a
-    // successfully repaired tree before publish/provider.
+    // re-entry caps and manifest repair-round caps are the loop bounds and the
+    // coordinator must not strand a successfully repaired tree before
+    // publish/provider.
     if (isReentry && input.instance.attempt_count >= input.manifest.max_attempts) {
       return terminalWrite({
         ...input,

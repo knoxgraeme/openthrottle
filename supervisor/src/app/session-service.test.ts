@@ -360,7 +360,7 @@ mcp_servers: {}
     });
     expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
       status: "dispatchable",
-      active_stage_id: "implementation",
+      active_stage_id: "repair_implementation",
     });
     expect(db!.prepare("SELECT COUNT(*) FROM feedback_snapshots WHERE status = 'consumed'").pluck().get()).toBe(1);
     const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
@@ -419,7 +419,7 @@ mcp_servers: {}
       .toEqual({ status: "collecting" });
     expect(pipelines.getInstance(currentInstance.id)).toMatchObject({
       status: "dispatchable",
-      active_stage_id: "implementation",
+      active_stage_id: "repair_implementation",
     });
     expect(providerEvents().map((event) => `${event.provider}:${event.provider_event_id}`).sort()).toEqual([
       "github:github-review:older",
@@ -474,7 +474,7 @@ mcp_servers: {}
     expect(db!.prepare("SELECT COUNT(*) FROM feedback_snapshots").pluck().get()).toBe(1);
     expect(db!.prepare("SELECT COUNT(*) FROM feedback_snapshots WHERE status = 'consumed'").pluck().get()).toBe(1);
     expect(pipelines.getActiveAttempt(instance.id)).toMatchObject({
-      stage_id: "implementation",
+      stage_id: "repair_implementation",
       reentry_ordinal: 1,
     });
   });

@@ -116,6 +116,46 @@ describe("pipeline coordinator", () => {
     };
   }
 
+  function providerFeedbackEvent(
+    instance: PipelineInstance,
+    attempt: PipelineStageAttempt,
+    outcome: PipelineCoordinatorEvent["outcome"],
+    id: string
+  ): PipelineCoordinatorEvent {
+    const stageResultPayload = JSON.stringify({ id, outcome });
+    const providerCheckPayload = JSON.stringify({ id: `${id}-provider-check`, outcome });
+    const subject = instance.immutable_subject ?? "f".repeat(40);
+    return {
+      id,
+      kind: "provider_snapshot",
+      instanceId: instance.id,
+      generation: instance.generation,
+      attemptId: attempt.id,
+      requestHash: attempt.request_hash,
+      outcome,
+      resultHash: digestNormalized(stageResultPayload),
+      subject,
+      artifacts: [
+        {
+          kind: "stage_result",
+          schemaVersion: 1,
+          assurance: "provider_verified",
+          subject,
+          payload: stageResultPayload,
+          hash: digestNormalized(stageResultPayload),
+        },
+        {
+          kind: "provider_check",
+          schemaVersion: 1,
+          assurance: "provider_verified",
+          subject,
+          payload: providerCheckPayload,
+          hash: digestNormalized(providerCheckPayload),
+        },
+      ],
+    };
+  }
+
   function activeAgentAttempt(
     attempt: PipelineStageAttempt,
     stageId: string
@@ -127,6 +167,17 @@ describe("pipeline coordinator", () => {
       request_hash: digestNormalized(`${stageId}-request`),
       native_context_policy: "resume_required",
     };
+  }
+
+  function providerWaitStages(
+    stages: PipelineInstanceStage[],
+    repairReentryCount: number
+  ): PipelineInstanceStage[] {
+    return stages.map((stage) => stage.stage_id === "repair_implementation"
+      ? { ...stage, reentry_count: repairReentryCount }
+      : stage.stage_id === "provider"
+        ? { ...stage, status: "waiting" }
+        : stage);
   }
 
   function reduceActiveAgentStage(input: {
@@ -374,6 +425,86 @@ describe("pipeline coordinator", () => {
       stageId: "implementation",
       reentryOrdinal: 1,
     });
+  });
+
+  it("routes core/implement@4 repair re-entry around simplification and back through command gates", () => {
+    const { manifest, instance, attempt, stages } = setup("core/implement@4");
+    const providerAttempt = activeAgentAttempt(attempt, "provider");
+    const providerInstance = {
+      ...instance,
+      status: "waiting_provider" as const,
+      active_stage_id: "provider",
+      reentry_count: 3,
+      immutable_subject: "f".repeat(40),
+    };
+    const providerRepair = reducePipelineEvent({
+      manifest,
+      instance: providerInstance,
+      attempt: providerAttempt,
+      stages: providerWaitStages(stages, 3),
+      event: providerFeedbackEvent(providerInstance, providerAttempt, "semantic_repair_required", "provider-repair"),
+    });
+
+    expect(providerRepair.nextStageId).toBe("repair_implementation");
+    expect(providerRepair.nextAttempt).toMatchObject({
+      stageId: "repair_implementation",
+      reentryOrdinal: 4,
+      contextPolicy: "resume_required",
+    });
+
+    const implementedRepair = reduceActiveAgentStage({
+      manifest,
+      instance,
+      attempt,
+      stages,
+      stageId: "repair_implementation",
+      outcome: "success",
+      id: "repair-implemented",
+    });
+    expect(implementedRepair.nextStageId).toBe("repair_semantic_review");
+
+    const reviewedRepair = reduceActiveAgentStage({
+      manifest,
+      instance,
+      attempt,
+      stages,
+      stageId: "repair_semantic_review",
+      outcome: "success",
+      id: "repair-reviewed",
+      artifacts: ["stage_result", "review"],
+    });
+    expect(reviewedRepair.nextStageId).toBe("test");
+    expect(reviewedRepair.nextAttempt).toMatchObject({
+      stageId: "test",
+      reentryOrdinal: 0,
+    });
+  });
+
+  it("exhausts core/implement@4 on repair rounds before the raw attempt safety net", () => {
+    const { manifest, instance, attempt, stages } = setup("core/implement@4");
+    const providerAttempt = activeAgentAttempt(attempt, "provider");
+    const providerInstance = {
+      ...instance,
+      status: "waiting_provider" as const,
+      active_stage_id: "provider",
+      reentry_count: manifest.max_repair_rounds!,
+      attempt_count: 25,
+      immutable_subject: "f".repeat(40),
+    };
+
+    const exhausted = reducePipelineEvent({
+      manifest,
+      instance: providerInstance,
+      attempt: providerAttempt,
+      stages: providerWaitStages(stages, manifest.max_repair_rounds!),
+      event: providerFeedbackEvent(providerInstance, providerAttempt, "semantic_repair_required", "round-limit"),
+    });
+
+    expect(exhausted.nextStatus).toBe("completion_pending_publication");
+    expect(exhausted.terminalOutcome).toBe("failed");
+    expect(exhausted.waitReason).toBe("pipeline repair round limit 5 exhausted");
+    expect(exhausted.nextAttempt).toBeUndefined();
+    expect(exhausted.effects.map((effect) => effect.kind)).toEqual(["publish_linear", "stop", "cleanup"]);
   });
 
   it("persists a complete immutable request for a repair attempt", () => {

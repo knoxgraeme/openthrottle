@@ -102,6 +102,7 @@ export interface PipelineManifest {
   description: string;
   entry_stage: string;
   max_attempts: number;
+  max_repair_rounds?: number;
   requires: {
     protocol: string;
     capabilities: string[];
@@ -247,6 +248,14 @@ export function canonicalJson(value: unknown): string {
 
 export function digestNormalized(normalized: string): string {
   return createHash("sha256").update(normalized).digest("hex");
+}
+
+export function isPipelineReentry(manifest: PipelineManifest, stageId: string, targetId: string): boolean {
+  const stageIndex = manifest.stages.findIndex((stage) => stage.id === stageId);
+  const targetIndex = manifest.stages.findIndex((stage) => stage.id === targetId);
+  if (stageIndex < 0) throw new Error(`stage ${stageId} is absent from ${manifest.id}@${manifest.version}`);
+  if (targetIndex < 0) throw new Error(`stage ${targetId} is absent from ${manifest.id}@${manifest.version}`);
+  return targetId === stageId || targetIndex <= stageIndex;
 }
 
 function parseTransition(value: unknown, path: string): PipelineTransition {
@@ -406,6 +415,11 @@ function validateGraph(manifest: PipelineManifest, source: string): void {
       if (transition.to && !stageById.has(transition.to)) {
         fail(`${source}.stages.${stage.id}.transitions.${outcome}.to`, "references an unknown stage");
       }
+      if (transition.to) {
+        if (isPipelineReentry(manifest, stage.id, transition.to) && transition.max_reentries === undefined) {
+          fail(`${source}.stages.${stage.id}.transitions.${outcome}`, "re-entering transitions must declare max_reentries");
+        }
+      }
     }
   }
 
@@ -422,17 +436,25 @@ function validateGraph(manifest: PipelineManifest, source: string): void {
   if (unreachable) fail(`${source}.stages.${unreachable.id}`, "is unreachable from entry_stage");
 
   const visiting = new Set<string>();
+  const stack: Array<{ stageId: string; incomingBounded: boolean }> = [];
   const visited = new Set<string>();
-  const detectCycle = (stageId: string) => {
+  const detectCycle = (stageId: string, incomingBounded = false) => {
     if (visited.has(stageId)) return;
     visiting.add(stageId);
+    stack.push({ stageId, incomingBounded });
     for (const [outcome, transition] of Object.entries(stageById.get(stageId)!.transitions)) {
       if (!transition.to) continue;
-      if (visiting.has(transition.to) && !transition.max_reentries) {
-        fail(`${source}.stages.${stageId}.transitions.${outcome}`, "creates an unbounded cycle");
+      if (visiting.has(transition.to)) {
+        const targetIndex = stack.findIndex((entry) => entry.stageId === transition.to);
+        let cycleHasBound = transition.max_reentries !== undefined;
+        for (let index = targetIndex + 1; !cycleHasBound && index < stack.length; index += 1) {
+          cycleHasBound = stack[index]!.incomingBounded;
+        }
+        if (!cycleHasBound) fail(`${source}.stages.${stageId}.transitions.${outcome}`, "creates an unbounded cycle");
       }
-      if (!visiting.has(transition.to)) detectCycle(transition.to);
+      if (!visiting.has(transition.to)) detectCycle(transition.to, transition.max_reentries !== undefined);
     }
+    stack.pop();
     visiting.delete(stageId);
     visited.add(stageId);
   };
@@ -445,7 +467,8 @@ export function validatePipelineManifest(
 ): ValidatedPipelineManifest {
   const source = options.source ?? "pipeline";
   const input = objectAt(value, source, [
-    "schema", "id", "version", "description", "entry_stage", "max_attempts", "requires", "defaults", "stages",
+    "schema", "id", "version", "description", "entry_stage", "max_attempts", "max_repair_rounds",
+    "requires", "defaults", "stages",
   ]);
   if (input.schema !== "openthrottle.pipeline/v1") fail(`${source}.schema`, "must be openthrottle.pipeline/v1");
   const requiresInput = objectAt(input.requires, `${source}.requires`, ["protocol", "capabilities"]);
@@ -459,7 +482,10 @@ export function validatePipelineManifest(
     version,
     description: stringAt(input.description, `${source}.description`, { max: 500 }),
     entry_stage: stringAt(input.entry_stage, `${source}.entry_stage`, { pattern: IDENTIFIER }),
-    max_attempts: integerAt(input.max_attempts, `${source}.max_attempts`, 1, 20),
+    max_attempts: integerAt(input.max_attempts, `${source}.max_attempts`, 1, 200),
+    ...(input.max_repair_rounds === undefined ? {} : {
+      max_repair_rounds: integerAt(input.max_repair_rounds, `${source}.max_repair_rounds`, 1, 20),
+    }),
     requires: {
       protocol: stringAt(requiresInput.protocol, `${source}.requires.protocol`, { max: 80, pattern: CAPABILITY }),
       capabilities: unique(arrayAt(
