@@ -2,6 +2,7 @@ schema: openthrottle.catalog/v1
 manifests:
   - core-implement-v1.yaml
   - core-implement-v2.yaml
+  - core-implement-v3.yaml
   - core-investigate-v1.yaml
   - ce-implement-v2.yaml
   - ce-implement-v3.yaml
@@ -10,7 +11,7 @@ manifests:
 aliases:
   implement:
     id: core/implement
-    version: 2
+    version: 3
   investigate:
     id: core/investigate
     version: 1

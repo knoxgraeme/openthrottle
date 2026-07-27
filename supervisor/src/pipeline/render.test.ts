@@ -337,7 +337,7 @@ describe("generated pipeline docs", () => {
   it("derives one page filename per manifest identity", () => {
     const catalog = loadPipelineCatalog(CATALOG);
     const names = [...catalog.manifests.values()].map(({ manifest }) => pipelineDocFilename(manifest));
-    expect(names).toContain("ce-implement-v3.md");
+    expect(names).toContain("core-implement-v3.md");
     expect(new Set(names).size).toBe(names.length);
   });
 

@@ -44,12 +44,13 @@ make no dependent change. Record the decision needed and propose
   A clear implementation is `success`; unresolved semantic work is
   `semantic_repair_required`.
 
-- `semantic_review` / `ce/review@1`: invoke `ce-code-review apply:local
-  base:origin/$BASE_BRANCH`. Review the complete current diff, fix verified
-  findings that are safe and in scope, and include the bounded findings and
-  evidence in both the stage proposal and required `review` artifact. Any
-  remaining P0/P1 finding is `semantic_repair_required`; a clean result is
-  `success` or `no_change`.
+- `semantic_review` or `post_simplify_review` / `ce/review@1`: invoke
+  `ce-code-review apply:local base:origin/$BASE_BRANCH`. Review the complete
+  current diff, fix verified findings that are safe and in scope, and include
+  the bounded findings and evidence in both the stage proposal and required
+  `review` artifact. For `post_simplify_review`, use the transition context to
+  focus on the simplification delta when available. Any remaining P0/P1 finding
+  is `semantic_repair_required`; a clean result is `success` or `no_change`.
 
 - `simplification` / `ce/simplify@1`: invoke `ce-simplify-code` only when the
   current diff is large or structurally complex (roughly more than 300 changed

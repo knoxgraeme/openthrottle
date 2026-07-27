@@ -66,6 +66,18 @@ function firstStage(value: Record<string, unknown>): Record<string, unknown> {
   return (value.stages as Array<Record<string, unknown>>)[0]!;
 }
 
+const CORE_IMPLEMENT_V3_STAGE_IDS = [
+  "implementation",
+  "semantic_review",
+  "simplification",
+  "post_simplify_review",
+  "test",
+  "lint",
+  "build",
+  "publish",
+  "provider",
+];
+
 describe("pipeline manifest validation", () => {
   it("loads the shipped catalog deterministically against independent runtime evidence", () => {
     const path = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
@@ -77,14 +89,16 @@ describe("pipeline manifest validation", () => {
     expect([...first.manifests.keys()]).toEqual([
       "core/implement@1",
       "core/implement@2",
+      "core/implement@3",
       "core/investigate@1",
       "ce/implement@2",
       "ce/implement@3",
       "ce/implement@4",
       "ce/investigate@2",
     ]);
-    expect(resolvePipelineReference(first, "implement").manifest.id).toBe("core/implement");
-    expect(resolvePipelineReference(first, "implement").manifest.version).toBe(2);
+    const implementManifest = resolvePipelineReference(first, "implement").manifest;
+    expect(implementManifest.id).toBe("core/implement");
+    expect(implementManifest.version).toBe(3);
     expect(resolvePipelineReference(first, "ce/implement@4").manifest.id).toBe("ce/implement");
     expect(() => resolvePipelineReference(first, "ce/implement@1"))
       .toThrow(/unknown pipeline selection/);
@@ -94,16 +108,7 @@ describe("pipeline manifest validation", () => {
       .toThrow(/unknown pipeline selection/);
     expect(() => resolvePipelineReference(first, "fixture-command"))
       .toThrow(/unknown pipeline selection/);
-    expect(resolvePipelineReference(first, "implement").manifest.stages.map((stage) => stage.id)).toEqual([
-      "implementation",
-      "semantic_review",
-      "simplification",
-      "test",
-      "lint",
-      "build",
-      "publish",
-      "provider",
-    ]);
+    expect(implementManifest.stages.map((stage) => stage.id)).toEqual(CORE_IMPLEMENT_V3_STAGE_IDS);
     expect(resolvePipelineReference(first, "investigate").manifest.stages.map((stage) => stage.id)).toEqual([
       "investigate",
       "publish",
@@ -232,6 +237,36 @@ describe("pipeline manifest validation", () => {
       .toEqual(withoutIdentity(resolvePipelineReference(catalog, "ce/implement@4").manifest));
     expect(withoutIdentity(resolvePipelineReference(catalog, "core/investigate@1").manifest))
       .toEqual(withoutIdentity(resolvePipelineReference(catalog, "ce/investigate@2").manifest));
+  });
+
+  it("ships core/implement@3 with conditional post-simplification review", () => {
+    const path = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
+    const catalog = loadPipelineCatalog(path, buildInstalledRuntimeDescriptor("test-runtime/v1").descriptor);
+    const v2 = resolvePipelineReference(catalog, "core/implement@2").manifest;
+    const v3 = resolvePipelineReference(catalog, "core/implement@3").manifest;
+
+    expect(v2.stages.some((stage) => stage.id === "post_simplify_review")).toBe(false);
+    expect(v3.version).toBe(3);
+    expect(v3.stages.map((stage) => stage.id)).toEqual(CORE_IMPLEMENT_V3_STAGE_IDS);
+
+    const semanticReview = v3.stages.find((stage) => stage.id === "semantic_review")!;
+    const postSimplifyReview = v3.stages.find((stage) => stage.id === "post_simplify_review")!;
+    expect(postSimplifyReview.executor).toEqual(semanticReview.executor);
+    expect(postSimplifyReview.evaluator).toEqual(semanticReview.evaluator);
+    expect(postSimplifyReview.context).toBe(semanticReview.context);
+    expect(postSimplifyReview.credentials).toEqual(semanticReview.credentials);
+    expect(postSimplifyReview.produces).toEqual(semanticReview.produces);
+
+    const simplification = v3.stages.find((stage) => stage.id === "simplification")!;
+    expect(simplification.transitions.success).toEqual({ to: "post_simplify_review" });
+    expect(simplification.transitions.no_change).toEqual({ to: "test" });
+    expect(postSimplifyReview.transitions.success).toEqual({ to: "test" });
+    expect(postSimplifyReview.transitions.no_change).toEqual({ to: "test" });
+    expect(postSimplifyReview.transitions.semantic_repair_required).toEqual({
+      to: "implementation",
+      max_reentries: 3,
+      on_exhausted: "needs_human",
+    });
   });
 
   it("ships ce/implement@4 as an explicit-command plan-in pipeline while keeping legacy pinned instances immutable", () => {

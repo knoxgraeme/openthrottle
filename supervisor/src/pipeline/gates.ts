@@ -310,6 +310,17 @@ function semanticDecision(payloads: TypedArtifactPayload[]): { outcome: StageOut
   if (blocking.length > 0) {
     return { outcome: "semantic_repair_required", result: "failed", reason: "blocking_findings" };
   }
+  // A no_change outcome is honored only when the sealed tree is genuinely
+  // unchanged. The agent's self-reported result is advisory; the sealed
+  // pre/post subjects are authoritative. If the workspace tree actually moved
+  // (pre_subject != post_subject) the agent misclassified a real edit, so
+  // reclassify to success. Otherwise a modified tree could take a stage's
+  // no_change shortcut (e.g. simplification skipping post_simplify_review) and
+  // reach the command gates unreviewed on the agent's word alone.
+  if (stageResult.result === "no_change" &&
+      stageResult.repository.pre_subject !== stageResult.repository.post_subject) {
+    return { outcome: "success", result: gateResultForOutcome("success"), reason: "no_change_contradicted_by_tree_delta" };
+  }
   return {
     outcome: stageResult.result,
     result: gateResultForOutcome(stageResult.result),
