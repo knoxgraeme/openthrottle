@@ -282,7 +282,6 @@ is_supported_task_type "$TASK_TYPE" \
 
 MAX_TURNS="${MAX_TURNS:-200}"
 TASK_TIMEOUT="${TASK_TIMEOUT:-7200}"
-DEV_PORT="${DEV_PORT:-3000}"
 
 # Strip trailing newlines from token-shaped secrets (SPEC phase 1).
 GITHUB_TOKEN="$(strip_nl "$GITHUB_TOKEN")"
@@ -305,14 +304,13 @@ rm -f "${OT_DIR}/run-result.json"
 rm -f "$TASK_LOG"
 install -o "$AGENT_USER" -g "$AGENT_USER" -m 0600 /dev/null "$TASK_LOG"
 
-# Everything from here on (our own log() calls, and anything the agent
-# writes to stdout/stderr through runner/normalize.mjs) is tee'd into
-# task.log so handle_exit() has something to summarize on failure.
+# Everything from here on (our own log() calls, and anything the agent writes to
+# stdout/stderr) is tee'd into task.log so handle_exit() has something to
+# summarize on failure.
 exec > >(tee -a "$TASK_LOG") 2>&1
 
 # A root-owned executor pulse covers quiet bootstrap and long commands. It is a
-# liveness signal only; unlike normalize.mjs progress, it is never published as
-# semantic activity.
+# liveness signal only; it is never published as semantic activity.
 RUN_ID="$RUN_ID" OT_HEARTBEAT_FILE="${HEARTBEAT_DIR}/heartbeat.json" \
   node "${OPT_DIR}/runner/heartbeat.mjs" &
 HEARTBEAT_PID=$!
@@ -494,7 +492,6 @@ yq_get() { yq_value_or_default "$CONFIG_FILE" "$1" "$2"; }
 
 CFG_AGENT="$(yq_get '.agent' 'codex')"
 CFG_MODEL="$(yq_get '.model' '')"
-CFG_DEV="$(yq_get '.dev' '')"
 CFG_TEST="$(yq_get '.test' '')"
 CFG_LINT="$(yq_get '.lint' '')"
 CFG_BUILD="$(yq_get '.build' '')"
@@ -516,18 +513,13 @@ if [[ -f "$CONFIG_FILE" ]]; then
   done < <(yq -r '.post_bootstrap // [] | .[]' "$CONFIG_FILE" 2>/dev/null || true)
 fi
 
-# Surface test/lint/build/format/dev to the agent process as env vars — SPEC
-# phase 4 has entrypoint read them but doesn't otherwise say how the agent
-# (specifically the implement-plan skill, which must "run configured
-# test/lint/build before opening the PR") is meant to learn them. Exporting
-# them here (inherited by the gosu'd agent process in as_agent/run below) is
-# the simplest option that doesn't make every skill re-parse yq itself.
+# Surface configured command gates to the agent process as env vars. The sealed
+# manifest decides which stage may run each command; exporting here lets the
+# relevant adapter read the validated command without reparsing yq.
 export OT_TEST_CMD="$CFG_TEST"
 export OT_LINT_CMD="$CFG_LINT"
 export OT_BUILD_CMD="$CFG_BUILD"
 export OT_FORMAT_CMD="$CFG_FORMAT"
-export OT_DEV_CMD="$CFG_DEV"
-export OT_DEV_PORT="$DEV_PORT"
 export MAX_TURNS TASK_TIMEOUT
 
 # Cap build-tool fan-out so heavy monorepo builds (Turbo/tsc/Jest launched
@@ -577,7 +569,7 @@ if [[ "$AGENT" == "opencode" && "$STAGE_MODEL_REQUIRED" == "1" ]]; then
   rm -rf "$OPENCODE_VALIDATION_DIR"
 fi
 
-log "config: agent=${AGENT}${OPENCODE_MODEL:+ model=${OPENCODE_MODEL}} ce_pipeline=${OT_CE_PIPELINE} dev='${CFG_DEV}' max_turns=${MAX_TURNS} task_timeout=${TASK_TIMEOUT}"
+log "config: agent=${AGENT}${OPENCODE_MODEL:+ model=${OPENCODE_MODEL}} ce_pipeline=${OT_CE_PIPELINE} max_turns=${MAX_TURNS} task_timeout=${TASK_TIMEOUT}"
 
 # =============================================================================
 # Phase 5 — bake-once bootstrap. post_bootstrap installs and image-derived

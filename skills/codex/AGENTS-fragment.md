@@ -16,16 +16,13 @@ the entrypoint:
 - `BASE_BRANCH` — the branch this task is based on: the repo default (e.g.
   `main`) unless the ticket targeted another with a `branch` label. The PR opens
   against it.
-- `BRANCH_NAME` — `ot/<ticket-id>`, already checked out and already
-  pushed once. Never create or switch to a different branch.
+- `BRANCH_NAME` — `ot/<ticket-id>`, already checked out for this stage. Never
+  create or switch to a different branch.
 - `LINEAR_ISSUE_ID` / `LINEAR_ISSUE_IDENTIFIER` — the ticket driving this
   run.
 - The prompt contains the sealed task and transition context for this exact
   stage. If the manifest requires native continuation, the runner resumes the
   prior session before invoking you.
-- `DEV_PORT` — if `.openthrottle.yml` configures a `dev` command, it's
-  already running in the background, bound to `0.0.0.0:$DEV_PORT`; check
-  `~/.ot/dev.log` if you need to confirm it's healthy.
 - `gh` is authenticated against `GITHUB_REPO`.
 - `~/.ot/linear-context.md` contains the signed Linear delegation context.
 - `ot-activity` writes structured updates for Fly to publish as OpenThrottle.
