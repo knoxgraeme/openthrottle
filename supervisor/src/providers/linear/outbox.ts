@@ -1,9 +1,10 @@
-import type { AgentActivityInput, AgentPlanItem, LinearClient } from "./client.js";
+import type { AgentActivityInput, AgentPlanItem, LinearClient, LinearComment } from "./client.js";
 import {
   agentActivityCreate,
   agentSessionUpdate,
   commentCreate,
   commentUpdate,
+  findCurrentAppCommentById,
   findIssueCommentByMarker,
   linearFileUpload,
 } from "./client.js";
@@ -144,6 +145,18 @@ function isNotFoundError(error: unknown): boolean {
   return /\bnot[ _-]?found\b|not_found|does not exist|could not find/i.test(String(error));
 }
 
+async function findOwnedCommentById(
+  linear: LinearClient,
+  id: string
+): Promise<LinearComment | undefined> {
+  try {
+    return await findCurrentAppCommentById(linear, id);
+  } catch (error) {
+    if (!isNotFoundError(error)) throw error;
+    return undefined;
+  }
+}
+
 function parsePayload(row: LinearOutboxRecord): LinearOutboxPayload {
   const payload = JSON.parse(row.payload) as LinearOutboxPayload;
   if (payload.type !== row.kind) {
@@ -173,10 +186,6 @@ async function deliver(
   }
   if (payload.type === "pipeline_status") {
     if (!row.linear_issue_id) throw new Error(`pipeline status ${row.id} has no Linear issue`);
-    const marker = pipelineStatusCommentMarker(row.linear_issue_id);
-    if (!payload.publication.body.startsWith(marker)) {
-      throw new Error(`pipeline status ${row.id} is missing its stable marker`);
-    }
     const ticket = store.getByIssueId(row.linear_issue_id);
     if (ticket && row.linear_session_id && ticket.linear_session_id !== row.linear_session_id) {
       return {};
@@ -185,9 +194,14 @@ async function deliver(
       payload.publication.body,
       ...(ticket?.pr_url ? ["", `Pull request: ${ticket.pr_url}`] : []),
     ].join("\n")).slice(0, 20_000);
-    const existing = row.external_id
-      ? { id: row.external_id, url: row.external_url }
-      : await findIssueCommentByMarker(linear, row.linear_issue_id, marker);
+    let existing: LinearComment | undefined;
+    if (row.external_id) {
+      existing = await findOwnedCommentById(linear, row.external_id);
+    } else {
+      existing = await findOwnedCommentById(linear, row.id);
+      const marker = pipelineStatusCommentMarker(row.linear_issue_id);
+      existing ??= await findIssueCommentByMarker(linear, row.linear_issue_id, marker);
+    }
     if (existing?.id) {
       if ("body" in existing && existing.body === body) {
         return { externalId: existing.id, externalUrl: existing.url ?? undefined };
@@ -199,7 +213,7 @@ async function deliver(
         if (!isNotFoundError(error)) throw error;
       }
     }
-    const result = await commentCreate(linear, { issueId: row.linear_issue_id, body });
+    const result = await commentCreate(linear, { id: row.id, issueId: row.linear_issue_id, body });
     return { externalId: result.comment?.id, externalUrl: result.comment?.url ?? undefined };
   }
   if (!row.linear_session_id) throw new Error(`pipeline receipt ${row.id} has no Linear session`);

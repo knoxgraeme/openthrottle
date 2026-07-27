@@ -104,6 +104,23 @@ function isCurrentAppComment(comment: LinearComment): boolean {
   return comment.user?.app === true && comment.user.isMe === true;
 }
 
+export async function findCurrentAppCommentById(
+  client: LinearClient,
+  commentId: string
+): Promise<LinearComment | undefined> {
+  const data = await linearGraphQL<{ comment?: LinearComment | null }>(
+    client,
+    `query Comment($id: String!) {
+      comment(id: $id) {
+        id body url user { id app isMe }
+      }
+    }`,
+    { id: commentId }
+  );
+  const comment = data.comment ?? undefined;
+  return comment && isCurrentAppComment(comment) ? comment : undefined;
+}
+
 export async function findIssueCommentByMarker(
   client: LinearClient,
   issueId: string,
@@ -260,7 +277,7 @@ export async function agentSessionUpdate(
 
 export async function commentCreate(
   client: LinearClient,
-  params: { issueId: string; body: string }
+  params: { issueId: string; body: string; id?: string }
 ): Promise<{ success: boolean; comment?: { id: string; url?: string | null } }> {
   const data = await linearGraphQL<{ commentCreate: { success: boolean; comment?: { id: string; url?: string | null } } }>(
     client,
@@ -270,7 +287,7 @@ export async function commentCreate(
         comment { id url }
       }
     }`,
-    { input: { issueId: params.issueId, body: params.body } }
+    { input: { ...(params.id ? { id: params.id } : {}), issueId: params.issueId, body: params.body } }
   );
   if (!data.commentCreate.success) {
     throw new Error("Linear commentCreate returned success: false");

@@ -168,7 +168,8 @@ function safeEvidence(raw: string): {
             .slice(0, 20).map((entry) => boundedPublicationLine(entry, 500))
         : [],
       findings: Array.isArray(value.findings)
-        ? value.findings.map(safeFinding).filter((finding): finding is PublicationFinding => finding !== null)
+        ? value.findings.slice(0, 50)
+            .map(safeFinding).filter((finding): finding is PublicationFinding => finding !== null)
         : [],
       actions: Array.isArray(value.actions)
         ? value.actions.filter((entry): entry is string => typeof entry === "string")
@@ -210,6 +211,29 @@ interface RenderContext {
 
 interface RenderExtras {
   scheduledReentryOrdinal?: number;
+}
+
+const STAGE_LABELS: Readonly<Record<string, { display: string; action?: string }>> = {
+  build: { display: "building" },
+  command: { display: "running command" },
+  implementation: { display: "implementing" },
+  lint: { display: "linting" },
+  planning: { display: "planning" },
+  provider: { display: "waiting on GitHub" },
+  publish: { display: "publishing" },
+  review: { display: "code review", action: "reviewing changes" },
+  semantic_review: { display: "code review", action: "reviewing changes" },
+  simplification: { display: "simplifying", action: "simplifying changes" },
+  test: { display: "testing" },
+};
+
+function stageDisplayName(stageId: string): string {
+  return STAGE_LABELS[stageId]?.display ?? stageId.replaceAll("_", " ");
+}
+
+function stageActionName(stageId: string): string {
+  const label = STAGE_LABELS[stageId];
+  return label?.action ?? label?.display ?? stageDisplayName(stageId);
 }
 
 function renderContext(envelope: PipelinePublicationBodyInput, normalizedManifest: string): RenderContext {
@@ -347,29 +371,6 @@ function terminalSentence(envelope: PipelinePublicationBodyInput): string {
   }
 }
 
-function progressLine(envelope: PipelinePublicationBodyInput, context: RenderContext): string {
-  const position = stagePosition(envelope, context);
-  return `Stage ${position.ordinal} of ${position.total}: ${position.stage} — ${sentenceForOutcome(envelope.decision.outcome)}`;
-}
-
-function whoseMoveLine(envelope: PipelinePublicationBodyInput, context: RenderContext): string {
-  const waitReason = envelope.decision.wait_reason
-    ? boundedPublicationLine(envelope.decision.wait_reason, 1_000)
-    : "the published receipt in this Linear session";
-  if (envelope.decision.next_status === "waiting_human" || envelope.template.name === "needs_human") {
-    return `Your move: decision required: ${waitReason}.`;
-  }
-  if (envelope.decision.next_status === "waiting_provider" || envelope.template.name === "provider_wait") {
-    return `Your move: nothing - merge when CI is green. Waiting on GitHub: ${waitReason}.`;
-  }
-  if (envelope.template.name === "terminal" ||
-      envelope.decision.next_status === envelope.decision.outcome &&
-      TERMINAL_STATUSES.has(envelope.decision.next_status)) {
-    return `Your move: nothing - this run is finished. ${terminalSentence(envelope)}`;
-  }
-  return `Your move: nothing - OpenThrottle is working on ${nextStageName(envelope, context)}.`;
-}
-
 function dedupeLines(lines: string[]): string[] {
   return Array.from(new Set(lines));
 }
@@ -386,27 +387,60 @@ function activeChecklistIndex(envelope: PipelinePublicationBodyInput, context: R
   return context.stageIndex >= 0 ? context.stageIndex : 0;
 }
 
+function activeStagePosition(envelope: PipelinePublicationBodyInput, context: RenderContext): {
+  ordinal: number;
+  total: number;
+  stageId: string;
+} {
+  const activeIndex = activeChecklistIndex(envelope, context);
+  const total = context.manifest.stages.length;
+  if (activeIndex >= 0 && activeIndex < total) {
+    return { ordinal: activeIndex + 1, total, stageId: context.manifest.stages[activeIndex]!.id };
+  }
+  const position = stagePosition(envelope, context);
+  return { ordinal: Math.min(position.ordinal, total), total, stageId: position.stage };
+}
+
+function whoseMoveLine(envelope: PipelinePublicationBodyInput, context: RenderContext): string {
+  const waitReason = envelope.decision.wait_reason
+    ? boundedPublicationLine(envelope.decision.wait_reason, 1_000)
+    : "the published receipt in this Linear session";
+  const active = activeStagePosition(envelope, context);
+  const suffix = `(stage ${active.ordinal} of ${active.total}).`;
+  if (envelope.decision.next_status === "waiting_human" || envelope.template.name === "needs_human") {
+    return `**Your move: decision required — ${waitReason} ${suffix}**`;
+  }
+  if (envelope.decision.next_status === "waiting_provider" || envelope.template.name === "provider_wait") {
+    return `**Your move: nothing — waiting on GitHub: ${waitReason} ${suffix}**`;
+  }
+  if (envelope.template.name === "terminal" ||
+      envelope.decision.next_status === envelope.decision.outcome &&
+      TERMINAL_STATUSES.has(envelope.decision.next_status)) {
+    return `**Your move: nothing — this run is finished. ${terminalSentence(envelope)}**`;
+  }
+  return `**Your move: nothing — ${stageActionName(active.stageId)} ${suffix}**`;
+}
+
 function stageChecklistLines(envelope: PipelinePublicationBodyInput, context: RenderContext): string[] {
   const activeIndex = activeChecklistIndex(envelope, context);
   return context.manifest.stages.map((stage, index) => {
     if (index < activeIndex || activeIndex >= context.manifest.stages.length) {
-      return `- [x] ${stage.id}`;
+      return `- [x] ${stageDisplayName(stage.id)}`;
     }
     if (index === activeIndex) {
       const wait = envelope.decision.wait_reason
-        ? ` - ${boundedPublicationLine(envelope.decision.wait_reason, 500)}`
+        ? ` — ${boundedPublicationLine(envelope.decision.wait_reason, 500)}`
         : "";
-      return `- [...] ${stage.id}${wait}`;
+      return `→ **${stageDisplayName(stage.id)}** — in progress${wait}`;
     }
-    return `- [ ] ${stage.id}`;
+    return `- [ ] ${stageDisplayName(stage.id)}`;
   });
 }
 
 function summaryHeaderLines(envelope: PipelinePublicationBodyInput, context: RenderContext): string[] {
   return [
-    "### Run status",
-    ...stageChecklistLines(envelope, context),
     whoseMoveLine(envelope, context),
+    ...stageChecklistLines(envelope, context),
   ];
 }
 
@@ -549,7 +583,7 @@ function findingsSectionLines(envelope: PipelinePublicationBodyInput): string[] 
   };
   const visible = findings.slice(0, MAX_RENDERED_FINDINGS);
   const lines = [
-    "### Findings",
+    "**Findings**",
     ...visible.map((finding) => {
       const disposition = finding.disposition ?? dispositionForFinding(finding, actions, context);
       return `[${finding.severity}] ${finding.code} — ${finding.summary} → ${disposition}`;
@@ -560,6 +594,30 @@ function findingsSectionLines(envelope: PipelinePublicationBodyInput): string[] 
   return lines;
 }
 
+function assumptionsSectionLines(envelope: PipelinePublicationBodyInput): string[] {
+  if (envelope.evidence.uncertainty.length === 0) return [];
+  return [
+    "**Assumptions & decisions**",
+    ...envelope.evidence.uncertainty.map((item) => `- ${item}`),
+  ];
+}
+
+function repairBannerLines(
+  envelope: PipelinePublicationBodyInput,
+  context: RenderContext,
+  extras?: RenderExtras
+): string[] {
+  if (envelope.template.name !== "repair_reentry" ||
+      envelope.decision.outcome !== "semantic_repair_required") {
+    return [];
+  }
+  const finding = dedupeFindings(envelope.evidence.findings ?? [])[0];
+  const suffix = finding
+    ? `[${finding.severity}] ${finding.code}: ${finding.summary}`
+    : `scheduled at ${stageDisplayName(nextStageName(envelope, context))}`;
+  return [`🔁 Repair round ${reentryRound(envelope, context, extras)} — ${suffix}`];
+}
+
 function renderBody(
   envelope: PipelinePublicationBodyInput,
   normalizedManifest: string,
@@ -568,14 +626,14 @@ function renderBody(
   const context = renderContext(envelope, normalizedManifest);
   const lines = [
     ...summaryHeaderLines(envelope, context),
+    ...repairBannerLines(envelope, context, extras),
     ...findingsSectionLines(envelope),
+    ...assumptionsSectionLines(envelope),
     "",
     eventSentence(envelope, context, extras),
-    progressLine(envelope, context),
   ];
   envelope.evidence.summaries.forEach((summary) => lines.push(summary));
   envelope.evidence.details.forEach((detail) => lines.push(detail));
-  envelope.evidence.uncertainty.forEach((item) => lines.push(`Still uncertain: ${item}`));
   if (envelope.links.length > 0) {
     envelope.links.forEach((link) => lines.push(`- [${link.label}](${link.url})`));
   }
@@ -818,21 +876,29 @@ export function pipelineStatusCommentMarker(linearIssueId: string): string {
   return `<!-- openthrottle:pipeline-status:${linearIssueId} -->`;
 }
 
-export function renderLinearStatusComment(envelope: PipelinePublicationEnvelope, prUrl?: string | null): string {
+function statusBodyParts(envelope: PipelinePublicationEnvelope): {
+  statusLines: string[];
+  detailLines: string[];
+} {
   const bodyLines = envelope.body.split("\n");
   const headerEnd = bodyLines.indexOf("");
-  const rendered = [
-    pipelineStatusCommentMarker(envelope.pipeline.linear_issue_id),
-    bodyLines.slice(0, headerEnd < 0 ? undefined : headerEnd).join("\n"),
-    ...(prUrl ? ["", `Pull request: ${prUrl}`] : []),
-  ];
-  return boundedSanitized(dedupeLines(rendered.join("\n").split("\n")).join("\n"), PUBLICATION_BODY_LIMIT);
+  return {
+    statusLines: bodyLines.slice(0, headerEnd < 0 ? undefined : headerEnd),
+    detailLines: headerEnd < 0 ? [] : bodyLines.slice(headerEnd + 1),
+  };
 }
 
-function bodyWithoutStatusHeader(envelope: PipelinePublicationEnvelope): string {
-  const lines = envelope.body.split("\n");
-  const headerEnd = lines.indexOf("");
-  return (headerEnd < 0 ? [] : lines.slice(headerEnd + 1)).join("\n");
+function linearStatusCommentLines(envelope: PipelinePublicationEnvelope, prUrl?: string | null): string[] {
+  const { statusLines } = statusBodyParts(envelope);
+  const rendered = [
+    ...statusLines,
+    ...(prUrl ? ["", `Pull request: ${prUrl}`] : []),
+  ];
+  return boundedSanitized(dedupeLines(rendered).join("\n"), PUBLICATION_BODY_LIMIT).split("\n");
+}
+
+export function renderLinearStatusComment(envelope: PipelinePublicationEnvelope, prUrl?: string | null): string {
+  return linearStatusCommentLines(envelope, prUrl).join("\n");
 }
 
 export function pipelineStatusOutboxPayload(envelope: PipelinePublicationEnvelope): string {
@@ -849,16 +915,17 @@ export function publicationPayloadHash(envelope: PipelinePublicationEnvelope): s
 }
 
 export function renderGithubPipelineSummary(envelope: PipelinePublicationEnvelope, prUrl?: string | null): string {
+  const { detailLines } = statusBodyParts(envelope);
   const lines = [
     `<!-- openthrottle:pipeline-summary:${envelope.pipeline.linear_issue_id} -->`,
     "## OpenThrottle pipeline summary",
     "",
-    renderLinearStatusComment(envelope, prUrl).split("\n").slice(1).join("\n"),
+    ...linearStatusCommentLines(envelope, prUrl),
     "",
-    bodyWithoutStatusHeader(envelope),
+    ...detailLines,
     "",
     "_This is a neutral supervisor evidence summary. It is not a code-review approval._",
-  ].join("\n").split("\n");
+  ];
   return boundedSanitized(dedupeLines(lines).join("\n"), 60_000);
 }
 
