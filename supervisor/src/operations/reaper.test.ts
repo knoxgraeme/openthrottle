@@ -8,9 +8,13 @@ import { setupPipelineStore, ticket } from "../__fixtures__/pipeline-store.js";
 import { createLinearActivityPublisher, createLinearOutboxProcessor } from "../providers/linear/outbox.js";
 import { reapStalledRuns } from "./reaper.js";
 import type { PipelineStore } from "../pipeline/store.js";
+import type { LinearOutboxRecord } from "../persistence/delivery-store.js";
 
 let db: Database.Database | undefined;
 afterEach(() => db?.close());
+
+const listLinearOutbox = (): LinearOutboxRecord[] =>
+  db!.prepare("SELECT * FROM linear_outbox ORDER BY created_at, sequence").all() as LinearOutboxRecord[];
 
 const cfg = { stallTimeoutSeconds: 900 } as Config;
 
@@ -23,7 +27,7 @@ function makeDaytona(stopError?: Error) {
 }
 
 // No Linear client: enqueue succeeds, delivery throws and is swallowed by
-// tryPostError, so the enqueued error row stays visible in listLinearOutbox().
+// tryPostError, so the enqueued error row stays visible in the outbox.
 const makeOutbox = (store: SupervisorStore) =>
   createLinearOutboxProcessor({ store, getLinearClient: async () => undefined });
 
@@ -90,7 +94,7 @@ describe("reapStalledRuns", () => {
     expect(stalledTicket?.run_id).toBeNull();
 
     // An error activity was enqueued for the reaped run.
-    const rows = store.listLinearOutbox();
+    const rows = listLinearOutbox();
     expect(rows).toHaveLength(1);
     const payload = JSON.parse(rows[0].payload) as {
       type: string;
@@ -146,7 +150,7 @@ describe("reapStalledRuns", () => {
 
     expect(store.getRun("run-beating")?.status).toBe("running");
     expect(store.getByIssueId("beating")?.run_id).toBe("run-beating");
-    expect(store.listLinearOutbox()).toHaveLength(0);
+    expect(listLinearOutbox()).toHaveLength(0);
   });
 
   it("reaps a bootstrapping run from started_at when no heartbeat ever arrives", async () => {
@@ -174,7 +178,7 @@ describe("reapStalledRuns", () => {
 
     expect(store.getRun("run-booting")?.status).toBe("timed_out");
     expect(store.getByIssueId("booting")?.run_id).toBeNull();
-    expect(store.listLinearOutbox()).toHaveLength(1);
+    expect(listLinearOutbox()).toHaveLength(1);
   });
 
   it("reaps a stalled attempt-backed run through the pipeline actor table", async () => {
@@ -209,11 +213,11 @@ describe("reapStalledRuns", () => {
     })).toBe(true);
     fixture.pipelines.bindStageRun(attempt.id, runId);
     // The sealed executor heartbeat went silent long before the stall cutoff.
-    // No run_liveness row exists, so the whole stall-reap → claim → settle
-    // path must run against pipeline_attempt_actors.
+    // The whole stall-reap -> claim -> settle path runs against the owning
+    // pipeline_stage_attempts row.
     store.renewRunLiveness(runId, "2020-01-01T00:00:00.000Z");
-    expect(db.prepare("SELECT COUNT(*) AS count FROM run_liveness WHERE run_id = ?").get(runId))
-      .toEqual({ count: 0 });
+    expect(db.prepare("SELECT actor_state FROM pipeline_stage_attempts WHERE run_id = ?").get(runId))
+      .toEqual({ actor_state: "running" });
 
     await reapStalledRuns({
       runtime,
@@ -227,7 +231,7 @@ describe("reapStalledRuns", () => {
     expect(store.getByIssueId("issue-stalled")).toMatchObject({ state: "error", run_id: null });
     expect(db.prepare(`
       SELECT actor_state, settlement_reason, termination_confirmed_at
-      FROM pipeline_attempt_actors WHERE run_id = ?
+      FROM pipeline_stage_attempts WHERE run_id = ?
     `).get(runId)).toMatchObject({
       actor_state: "settled",
       settlement_reason: expect.stringContaining("run reaped"),
@@ -245,7 +249,7 @@ describe("reapStalledRuns", () => {
     });
     // Alongside the pipeline_receipt publications, exactly one reap error
     // activity was enqueued for the settled run.
-    const activities = store.listLinearOutbox().filter((row) => row.kind === "activity");
+    const activities = listLinearOutbox().filter((row) => row.kind === "activity");
     expect(activities).toHaveLength(1);
     expect(JSON.parse(activities[0].payload)).toMatchObject({
       type: "activity",
@@ -311,7 +315,7 @@ describe("reapStalledRuns", () => {
       last_error: null,
     });
     expect(fixture.pipelines.getInstance(instance.id)).toMatchObject({ status: "waiting_provider" });
-    expect(store.listLinearOutbox().filter((row) => row.kind === "activity")).toHaveLength(0);
+    expect(listLinearOutbox().filter((row) => row.kind === "activity")).toHaveLength(0);
   });
 
   it("quarantines a claimed run when termination cannot be confirmed", async () => {
@@ -346,7 +350,7 @@ describe("reapStalledRuns", () => {
       tokenHash: "hash",
       expiresAt: "2999-01-01T00:00:00.000Z",
     })).toBe(false);
-    expect(store.listLinearOutbox()).toHaveLength(1);
+    expect(listLinearOutbox()).toHaveLength(1);
 
     expect(store.settleQuarantinedRun({
       runId: "run-wedged",
@@ -485,6 +489,6 @@ describe("reapStalledRuns", () => {
     await expect(
       reapStalledRuns({ runtime, store, activityPublisher: makeActivityPublisher(store, linearOutbox), cfg })
     ).resolves.toBeUndefined();
-    expect(store.listLinearOutbox()).toHaveLength(0);
+    expect(listLinearOutbox()).toHaveLength(0);
   });
 });

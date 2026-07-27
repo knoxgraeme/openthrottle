@@ -121,7 +121,6 @@ export async function handleCreated(
     if (existingSessionInstance.linear_issue_id !== issue.id) {
       throw new Error(`pipeline session ${sessionId} has an invalid issue binding`);
     }
-    store.setLinearContext(issue.id, initialContext);
     return;
   }
   let routingLabels = labels;
@@ -214,7 +213,6 @@ export async function handleCreated(
     if (!existing) {
       store.upsertUnpinned({ ...ticketCore, state: "error" });
       store.setState(issue.id, "error", message);
-      store.setLinearContext(issue.id, initialContext);
     }
     await providers.activityPublisher.publishError(sessionId, issue.id, message);
   };
@@ -282,7 +280,6 @@ export async function handleCreated(
     await failSelection(error);
     return;
   }
-  store.setLinearContext(issue.id, initialContext);
   await providers.activityPublisher.publishActivity({
     sessionId,
     type: "thought",

@@ -13,8 +13,9 @@ import {
   parseRepositoryConfig,
 } from "../pipeline/manifest.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
-import { buildInstalledRuntimeDescriptor, type SandboxAutostopRuntime, type SandboxRuntime } from "../runtime/contracts.js";
+import { buildInstalledRuntimeDescriptor, type SandboxAutostopRuntime, type SandboxRuntime } from "../__fixtures__/runtime.js";
 import type { PipelineInstance, PipelineStageAttempt } from "../pipeline/store.js";
+import type { LinearOutboxRecord } from "../persistence/delivery-store.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
 
@@ -24,6 +25,9 @@ describe("pipeline effect processor", () => {
     db?.close();
     vi.restoreAllMocks();
   });
+
+  const listLinearOutbox = (): LinearOutboxRecord[] =>
+    db!.prepare("SELECT * FROM linear_outbox ORDER BY created_at, sequence").all() as LinearOutboxRecord[];
 
   function harness(issueId: string, sessionId: string) {
     db = openDb(":memory:");
@@ -592,7 +596,7 @@ describe("pipeline effect processor", () => {
     );
     expect(tickets.getRun(runId)).toMatchObject({ status: "stopped" });
     expect(db!.prepare(
-      "SELECT actor_state FROM pipeline_attempt_actors WHERE run_id = ?"
+      "SELECT actor_state FROM pipeline_stage_attempts WHERE run_id = ?"
     ).pluck().get(runId)).toBe("settled");
     expect(tickets.getByIssueId("issue-superseded")).toMatchObject({
       linear_session_id: "session-replacement",
@@ -612,7 +616,6 @@ describe("pipeline effect processor", () => {
     const runId = attempt.planned_run_id!;
 
     db!.transaction(() => {
-      db!.prepare("DELETE FROM run_stage_bindings WHERE run_id = ?").run(runId);
       db!.prepare("UPDATE pipeline_stage_attempts SET run_id = NULL WHERE id = ?").run(attempt.id);
     })();
     expect(tickets.getByIssueId("issue-planned-run-stop")?.run_id).toBe(runId);
@@ -650,7 +653,6 @@ describe("pipeline effect processor", () => {
     const runId = attempt.planned_run_id!;
 
     db!.transaction(() => {
-      db!.prepare("DELETE FROM run_stage_bindings WHERE run_id = ?").run(runId);
       db!.prepare("UPDATE pipeline_stage_attempts SET run_id = NULL WHERE id = ?").run(attempt.id);
     })();
     tickets.upsertUnpinned({
@@ -712,7 +714,7 @@ describe("pipeline effect processor", () => {
     expect(runtime.stop).toHaveBeenCalledOnce();
     expect(tickets.getRun(runId)).toMatchObject({ status: "stopped" });
     expect(db!.prepare(
-      "SELECT actor_state FROM pipeline_attempt_actors WHERE run_id = ?"
+      "SELECT actor_state FROM pipeline_stage_attempts WHERE run_id = ?"
     ).pluck().get(runId)).toBe("settled");
     expect(tickets.getByIssueId("issue-legacy-superseded")).toMatchObject({
       linear_session_id: "session-legacy-replacement",
@@ -847,7 +849,7 @@ describe("pipeline effect processor", () => {
   });
 
   it("retries a capacity-exhausted provision on a patient fixed interval", async () => {
-    const { tickets, pipelines, runtime, processor, instance } = harness("issue-capacity", "session-capacity");
+    const { pipelines, runtime, processor, instance } = harness("issue-capacity", "session-capacity");
     runtime.provision.mockRejectedValue(new Error("Total memory limit exceeded"));
     const provision = pipelines.listEffects(instance.id).find((effect) => effect.kind === "provision")!;
     const makeRetryEligible = () => {
@@ -870,7 +872,7 @@ describe("pipeline effect processor", () => {
         last_error: expect.stringContaining("Total memory limit exceeded"),
       });
     expect(pipelines.getInstance(instance.id)).toMatchObject({ terminal_outcome: null });
-    const activities = tickets.listLinearOutbox().filter((row) => row.id === `capacity-wait:${provision.id}`);
+    const activities = listLinearOutbox().filter((row) => row.id === `capacity-wait:${provision.id}`);
     expect(activities).toHaveLength(1);
     expect(activities[0]).toMatchObject({
       kind: "activity",
@@ -920,7 +922,7 @@ describe("pipeline effect processor", () => {
         next_attempt_at: "2099-07-22T12:05:00.000Z",
         last_error: expect.stringContaining("Total memory limit exceeded"),
       });
-    expect(tickets.listLinearOutbox().filter((row) => row.id.startsWith("capacity-wait:"))).toEqual([]);
+    expect(listLinearOutbox().filter((row) => row.id.startsWith("capacity-wait:"))).toEqual([]);
     expect(consoleError).toHaveBeenCalledWith(
       "[pipeline-effects] failed to enqueue capacity wait activity:",
       expect.stringContaining("outbox unavailable")
@@ -928,7 +930,7 @@ describe("pipeline effect processor", () => {
   });
 
   it("keeps exponential backoff for transient provision failures", async () => {
-    const { tickets, pipelines, runtime, processor, instance } = harness("issue-transient", "session-transient");
+    const { pipelines, runtime, processor, instance } = harness("issue-transient", "session-transient");
     runtime.provision.mockRejectedValue(new Error("connect ETIMEDOUT 10.20.30.40:8443"));
 
     await processor.drain();
@@ -940,7 +942,7 @@ describe("pipeline effect processor", () => {
         next_attempt_at: "2099-07-22T12:00:05.000Z",
         last_error: expect.stringContaining("ETIMEDOUT"),
       });
-    expect(tickets.listLinearOutbox().filter((row) => row.id.startsWith("capacity-wait:"))).toEqual([]);
+    expect(listLinearOutbox().filter((row) => row.id.startsWith("capacity-wait:"))).toEqual([]);
   });
 
   it("preserves the stopped workspace on a needs_human terminal", async () => {

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openDb } from "./database.js";
 import { createSupervisorStore, type SupervisorStore } from "./store.js";
+import type { LinearOutboxRecord } from "./delivery-store.js";
 
 describe("delivery store", () => {
   let db: ReturnType<typeof openDb>;
@@ -24,6 +25,9 @@ describe("delivery store", () => {
   });
 
   afterEach(() => db.close());
+
+  const getLinearOutbox = (id: string): LinearOutboxRecord | undefined =>
+    db.prepare("SELECT * FROM linear_outbox WHERE id = ?").get(id) as LinearOutboxRecord | undefined;
 
   it("keeps Linear publication ordered", () => {
     const first = store.enqueueLinearOutbox({
@@ -58,14 +62,14 @@ describe("delivery store", () => {
     `).run('{"type":"pipeline_status","publication":{"body":"new"}}', row.id);
 
     store.markLinearOutboxProcessed(row.id, { externalId: "stale-comment" }, row.payload_hash);
-    expect(store.getLinearOutbox(row.id)).toMatchObject({
+    expect(getLinearOutbox(row.id)).toMatchObject({
       status: "pending",
       payload_hash: "new-hash",
       external_id: null,
     });
 
     store.markLinearOutboxFailed(row.id, "stale failure", null, row.payload_hash);
-    expect(store.getLinearOutbox(row.id)).toMatchObject({
+    expect(getLinearOutbox(row.id)).toMatchObject({
       status: "pending",
       last_error: null,
     });
@@ -93,8 +97,8 @@ describe("delivery store", () => {
       "2099-01-01T00:01:00.000Z",
       50
     )).toEqual([]);
-    expect(store.getLinearOutbox(first.id)?.status).toBe("pending");
-    expect(store.getLinearOutbox(second.id)?.status).toBe("pending");
+    expect(getLinearOutbox(first.id)?.status).toBe("pending");
+    expect(getLinearOutbox(second.id)?.status).toBe("pending");
   });
 
   it("does not let issue-state projections block later Linear outbox rows", () => {
@@ -125,8 +129,8 @@ describe("delivery store", () => {
     );
 
     expect(claimed.map((row) => row.id)).toEqual([activity.id]);
-    expect(store.getLinearOutbox(state.id)?.status).toBe("failed");
-    expect(store.getLinearOutbox(activity.id)?.status).toBe("processing");
+    expect(getLinearOutbox(state.id)?.status).toBe("failed");
+    expect(getLinearOutbox(activity.id)?.status).toBe("processing");
   });
 
   it("deduplicates accepted webhooks", () => {

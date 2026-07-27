@@ -1,13 +1,10 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import {
   existsSync,
-  lstatSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
   rmSync,
-  symlinkSync,
-  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -168,13 +165,6 @@ function addBareOrigin(input, { push = false } = {}) {
   return remote;
 }
 
-function repositoryRefs(repoDir) {
-  return execFileSync("git", ["for-each-ref", "--format=%(refname) %(objectname)"], {
-    cwd: repoDir,
-    encoding: "utf8",
-  });
-}
-
 function clock() {
   const values = ["2026-07-22T00:00:00.000Z", "2026-07-22T00:00:01.000Z"];
   return () => values.shift();
@@ -231,7 +221,7 @@ describe("one-stage executor", () => {
     expect(runAgent).not.toHaveBeenCalled();
   });
 
-  it("implements fresh, required-resume, prefer-resume reconstruction, and fresh-review policies", () => {
+  it("implements fresh, required-resume, and prefer-resume reconstruction policies", () => {
     expect(resolveContextInvocation(fixture().request)).toMatchObject({ mode: "fresh", reconstructed: false });
     expect(() => resolveContextInvocation(fixture({ contextPolicy: "resume_required" }).request))
       .toThrow(/missing its native session/);
@@ -239,8 +229,8 @@ describe("one-stage executor", () => {
       .toMatchObject({ mode: "resume", nativeSessionId: "native-1" });
     expect(resolveContextInvocation(fixture({ contextPolicy: "prefer_resume" }).request))
       .toMatchObject({ mode: "fresh", reconstructed: true });
-    expect(resolveContextInvocation(fixture({ contextPolicy: "fresh_review", liveSteering: false }).request))
-      .toMatchObject({ mode: "fresh", readOnly: true });
+    expect(resolveContextInvocation(fixture({ contextPolicy: "fresh", liveSteering: false }).request))
+      .toMatchObject({ mode: "fresh", readOnly: false });
   });
 
   it("captures provider-neutral native session identifiers from JSONL", () => {
@@ -262,147 +252,6 @@ describe("one-stage executor", () => {
     const result = executeStage({ ...input, runAgent: vi.fn(), now: clock() });
     expect(result.outcome).toBe("failure");
     expect(JSON.parse(result.artifacts[0].payload).summary).toMatch(/missing its native session/);
-  });
-
-  it("invalidates a fresh-review success when the workspace mutates", () => {
-    const input = fixture({ contextPolicy: "fresh_review", liveSteering: false, requiredArtifacts: ["stage_result", "review"] });
-    const result = executeStage({
-      ...input,
-      now: clock(),
-      runAgent: ({ repoDir }) => {
-        writeFileSync(join(repoDir, "file.txt"), "mutated\n");
-        writeFileSync(join(repoDir, "review-output.txt"), "must not escape the review stage\n");
-        return { exitCode: 0, proposal: successProposal(), nativeSessionId: "review-session" };
-      },
-    });
-    expect(result.outcome).toBe("semantic_repair_required");
-    const payload = JSON.parse(result.artifacts[0].payload);
-    expect(payload.findings[0].code).toBe("review-mutated-workspace");
-    expect(payload.repository.subject).toBe(payload.repository.pre_subject);
-    expect(payload.repository.post_subject).toBe(payload.repository.pre_subject);
-    expect(computeWorkspaceTreeOid(input.repoDir)).toBe(payload.repository.subject);
-    expect(readFileSync(join(input.repoDir, "file.txt"), "utf8")).toBe("initial\n");
-    expect(existsSync(join(input.repoDir, "review-output.txt"))).toBe(false);
-  });
-
-  it("restores fresh-review HEAD, symbolic ref, real index, and tree after a commit then throw", () => {
-    const input = fixture({ contextPolicy: "fresh_review", liveSteering: false, requiredArtifacts: ["stage_result", "review"] });
-    const beforeHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: input.repoDir, encoding: "utf8" }).trim();
-    const beforeRef = execFileSync("git", ["symbolic-ref", "HEAD"], { cwd: input.repoDir, encoding: "utf8" }).trim();
-    const indexPath = join(input.repoDir, ".git", "index");
-    const beforeIndex = readFileSync(indexPath);
-    const result = executeStage({
-      ...input,
-      now: clock(),
-      runAgent: ({ repoDir }) => {
-        writeFileSync(join(repoDir, "file.txt"), "mutated before invalid proposal\n");
-        writeFileSync(join(repoDir, "invalid-review-output.txt"), "must be rolled back\n");
-        execFileSync("git", ["add", "-A"], { cwd: repoDir });
-        execFileSync("git", ["commit", "-qm", "review must not commit"], { cwd: repoDir });
-        throw new Error("invalid stage proposal JSON");
-      },
-    });
-
-    expect(result.outcome).toBe("semantic_repair_required");
-    const payload = JSON.parse(result.artifacts[0].payload);
-    expect(payload.findings[0].code).toBe("review-mutated-workspace");
-    expect(computeWorkspaceTreeOid(input.repoDir)).toBe(payload.repository.pre_subject);
-    expect(readFileSync(join(input.repoDir, "file.txt"), "utf8")).toBe("initial\n");
-    expect(existsSync(join(input.repoDir, "invalid-review-output.txt"))).toBe(false);
-    expect(execFileSync("git", ["rev-parse", "HEAD"], { cwd: input.repoDir, encoding: "utf8" }).trim()).toBe(beforeHead);
-    expect(execFileSync("git", ["symbolic-ref", "HEAD"], { cwd: input.repoDir, encoding: "utf8" }).trim()).toBe(beforeRef);
-    expect(readFileSync(indexPath).equals(beforeIndex)).toBe(true);
-  });
-
-  it.each(["HEAD", "index"])(
-    "never follows a fresh-review %s symlink substitution into an external target",
-    (controlName) => {
-      const input = fixture({ contextPolicy: "fresh_review", liveSteering: false, requiredArtifacts: ["stage_result", "review"] });
-      const controlPath = join(input.repoDir, ".git", controlName);
-      const beforeControl = readFileSync(controlPath);
-      const external = mkdtempSync(join(tmpdir(), "ot-stage-external-control-"));
-      directories.push(external);
-      const externalTarget = join(external, "sentinel");
-      writeFileSync(externalTarget, "external target must remain untouched\n");
-
-      let result;
-      let failure;
-      try {
-        result = executeStage({
-          ...input,
-          now: clock(),
-          runAgent: () => {
-            unlinkSync(controlPath);
-            symlinkSync(externalTarget, controlPath);
-            return { exitCode: 0, proposal: successProposal(), nativeSessionId: "review-session" };
-          },
-        });
-      } catch (error) {
-        failure = error;
-      }
-
-      expect(readFileSync(externalTarget, "utf8")).toBe("external target must remain untouched\n");
-      expect(result ?? failure).toBeDefined();
-      if (result) {
-        expect(result.outcome).not.toBe("success");
-        if (existsSync(controlPath) && !lstatSync(controlPath).isSymbolicLink()) {
-          expect(readFileSync(controlPath).equals(beforeControl)).toBe(true);
-        }
-      }
-    },
-  );
-
-  it("detects branch/tag-only fresh-review mutations and restores the exact ref namespace", () => {
-    const input = fixture({ contextPolicy: "fresh_review", liveSteering: false, requiredArtifacts: ["stage_result", "review"] });
-    const initialHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: input.repoDir, encoding: "utf8" }).trim();
-    const initialTree = execFileSync("git", ["rev-parse", "HEAD^{tree}"], { cwd: input.repoDir, encoding: "utf8" }).trim();
-    const alternateCommit = execFileSync("git", ["commit-tree", initialTree, "-m", "alternate ref target"], {
-      cwd: input.repoDir,
-      encoding: "utf8",
-    }).trim();
-    execFileSync("git", ["update-ref", "refs/heads/side", initialHead], { cwd: input.repoDir });
-    execFileSync("git", ["update-ref", "refs/tags/stable", initialHead], { cwd: input.repoDir });
-    const beforeRefs = repositoryRefs(input.repoDir);
-
-    const result = executeStage({
-      ...input,
-      now: clock(),
-      runAgent: ({ repoDir }) => {
-        execFileSync("git", ["update-ref", "refs/heads/side", alternateCommit], { cwd: repoDir });
-        execFileSync("git", ["update-ref", "-d", "refs/tags/stable"], { cwd: repoDir });
-        execFileSync("git", ["update-ref", "refs/tags/intruder", alternateCommit], { cwd: repoDir });
-        return { exitCode: 0, proposal: successProposal(), nativeSessionId: "review-session" };
-      },
-    });
-
-    expect(result.outcome).toBe("semantic_repair_required");
-    expect(JSON.parse(result.artifacts[0].payload).findings[0].code).toBe("review-mutated-workspace");
-    expect(repositoryRefs(input.repoDir)).toBe(beforeRefs);
-    expect(execFileSync("git", ["rev-parse", "HEAD"], { cwd: input.repoDir, encoding: "utf8" }).trim()).toBe(initialHead);
-  });
-
-  it("detects and removes fresh-review merge and sequencer state", () => {
-    const input = fixture({ contextPolicy: "fresh_review", liveSteering: false, requiredArtifacts: ["stage_result", "review"] });
-    const gitDir = join(input.repoDir, ".git");
-    const mergeHead = join(gitDir, "MERGE_HEAD");
-    const sequencer = join(gitDir, "sequencer");
-    const initialHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: input.repoDir, encoding: "utf8" }).trim();
-
-    const result = executeStage({
-      ...input,
-      now: clock(),
-      runAgent: () => {
-        writeFileSync(mergeHead, `${initialHead}\n`);
-        mkdirSync(sequencer);
-        writeFileSync(join(sequencer, "todo"), `pick ${initialHead} review-state\n`);
-        return { exitCode: 0, proposal: successProposal(), nativeSessionId: "review-session" };
-      },
-    });
-
-    expect(result.outcome).toBe("semantic_repair_required");
-    expect(JSON.parse(result.artifacts[0].payload).findings[0].code).toBe("review-mutated-workspace");
-    expect(existsSync(mergeHead)).toBe(false);
-    expect(existsSync(sequencer)).toBe(false);
   });
 
   it("streams agent output beyond the old spawn buffer while retaining bounded diagnostics", () => {

@@ -84,10 +84,10 @@ export function createStatusStore(db: Database.Database): Pick<PipelineStore, "g
   return {
     getStatusForIssue(issueId: string): PipelineStatusProjection | undefined {
       const instance = db.prepare(`
-        SELECT pi.*, t.pr_url AS ticket_pr_url FROM session_executions se
-        JOIN pipeline_instances pi ON pi.id = se.pipeline_instance_id
-        JOIN tickets t ON t.linear_session_id = se.linear_session_id
-        WHERE t.linear_issue_id = ? AND se.execution_mode = 'pipeline'
+        SELECT pi.*, t.pr_url AS ticket_pr_url FROM agent_sessions s
+        JOIN pipeline_instances pi ON pi.id = s.pipeline_instance_id
+        JOIN tickets t ON t.linear_session_id = s.id
+        WHERE t.linear_issue_id = ? AND s.execution_mode = 'pipeline'
       `).get(issueId) as (PipelineInstance & { ticket_pr_url: string | null }) | undefined;
       if (!instance) return undefined;
       const attempt = db.prepare(`

@@ -171,7 +171,11 @@ Engineering / "CE")**. Keep new logic on the correct side:
   `post_bootstrap`, `limits`, `mcp_servers`. Delegated runs of *this* repo use
   it too.
 
-## GitHub / PR workflow in this environment
+## GitHub / PR Workflow For Operator Workstations Only
+
+The following guidance is for a human or local operator workstation that has
+the GitHub MCP tools installed. Sealed OpenThrottle sandbox stages must follow
+their stage request and must not adopt this section as runtime behavior.
 
 Use the `mcp__github__*` tools for all GitHub interaction (no `gh` CLI here).
 Do not open a PR unless explicitly asked. After creating one, subscribe to its

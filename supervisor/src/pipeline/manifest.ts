@@ -30,7 +30,6 @@ export const CONTEXT_POLICIES = [
   "fresh",
   "resume_required",
   "prefer_resume",
-  "fresh_review",
 ] as const;
 export type ContextPolicy = (typeof CONTEXT_POLICIES)[number];
 
@@ -48,7 +47,6 @@ export type ExecutorKind = (typeof EXECUTOR_KINDS)[number];
 export const COMMAND_NAMES = ["test", "lint", "build", "format"] as const;
 export type CommandName = (typeof COMMAND_NAMES)[number];
 export const EVALUATOR_KINDS = [
-  "result",
   "semantic",
   "command",
   "provider",

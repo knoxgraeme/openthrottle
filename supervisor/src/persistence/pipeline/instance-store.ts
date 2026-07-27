@@ -12,6 +12,7 @@ import type {
   PipelineInstanceSeed,
   PipelineInstanceStage,
   PipelinePublicationReceipt,
+  PipelineRuntimeResource,
   PipelineStageAttempt,
   PipelineStore,
   RepositoryConfigSnapshot,
@@ -46,6 +47,9 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
   | "getStageRequest"
   | "bindStageRun"
   | "markStageDispatched"
+  | "bindRuntimeResource"
+  | "getRuntimeResource"
+  | "setRuntimeResourceStatus"
   | "getActiveAttempt"
   | "listProviderReadyInstances"
   | "listStages"
@@ -56,6 +60,19 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
   const getInstanceStmt = db.prepare("SELECT * FROM pipeline_instances WHERE id = ?");
   const getAttemptStmt = db.prepare("SELECT * FROM pipeline_stage_attempts WHERE id = ?");
   const persistPublication = createPipelinePublicationWriter(db);
+  const runtimeResourceForInstance = (
+    instance: PipelineInstance | undefined
+  ): PipelineRuntimeResource | undefined => {
+    if (!instance?.runtime_provider_resource_id) return undefined;
+    return {
+      pipeline_instance_id: instance.id,
+      provider: instance.runtime_provider!,
+      provider_resource_id: instance.runtime_provider_resource_id,
+      status: instance.runtime_resource_status!,
+      created_at: instance.runtime_resource_created_at!,
+      updated_at: instance.runtime_resource_updated_at!,
+    };
+  };
 
   const listSupersedeCandidates = (issueId: string, currentSessionId: string): PipelineInstance[] =>
     db.prepare(`
@@ -194,11 +211,23 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
       seed.issueId, seed.sessionId, seed.generation, seed.manifest.manifest.id,
       seed.manifest.manifest.version, seed.manifest.digest,
     ]);
-    const existingExecution = db.prepare(
-      "SELECT execution_mode, pipeline_instance_id, generation FROM session_executions WHERE linear_session_id = ?"
-    ).get(seed.sessionId) as { execution_mode: string; pipeline_instance_id: string | null; generation: number } | undefined;
-    if (existingExecution) {
-      if (existingExecution.execution_mode === "pipeline" && existingExecution.pipeline_instance_id === instanceId) {
+    const session = db.prepare(`
+      SELECT linear_issue_id, generation, provider_conversation_id, execution_mode, pipeline_instance_id
+      FROM agent_sessions WHERE id = ?
+    `).get(seed.sessionId) as
+      | {
+        linear_issue_id: string;
+        generation: number;
+        provider_conversation_id: string | null;
+        execution_mode: string | null;
+        pipeline_instance_id: string | null;
+      }
+      | undefined;
+    if (!session || session.linear_issue_id !== seed.issueId || session.generation !== seed.generation) {
+      throw new Error(`session ${seed.sessionId} generation binding mismatch`);
+    }
+    if (session.execution_mode) {
+      if (session.execution_mode === "pipeline" && session.pipeline_instance_id === instanceId) {
         const existing = getInstanceStmt.get(instanceId) as PipelineInstance;
         validatePinnedInstance(db, existing);
         if (
@@ -217,12 +246,6 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
         return { existing };
       }
       throw new Error(`session ${seed.sessionId} execution mode is already pinned`);
-    }
-    const session = db.prepare("SELECT linear_issue_id, generation, provider_conversation_id FROM agent_sessions WHERE id = ?").get(seed.sessionId) as
-      | { linear_issue_id: string; generation: number; provider_conversation_id: string | null }
-      | undefined;
-    if (!session || session.linear_issue_id !== seed.issueId || session.generation !== seed.generation) {
-      throw new Error(`session ${seed.sessionId} generation binding mismatch`);
     }
     const catalogEntry = db.prepare(`
       SELECT 1 FROM pipeline_catalog_entries
@@ -290,11 +313,10 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
       );
     });
     db.prepare(`
-      INSERT INTO session_executions (
-        linear_session_id, linear_issue_id, generation, execution_mode,
-        pipeline_instance_id, pinned_at
-      ) VALUES (?, ?, ?, 'pipeline', ?, ?)
-    `).run(seed.sessionId, seed.issueId, seed.generation, validated.instanceId, timestamp);
+      UPDATE agent_sessions
+      SET execution_mode = 'pipeline', pipeline_instance_id = ?, updated_at = ?
+      WHERE id = ? AND execution_mode IS NULL
+    `).run(validated.instanceId, timestamp, seed.sessionId);
   };
 
   const sealEntryAttempt = (
@@ -405,10 +427,6 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
       WHERE id = ? AND run_id IS NULL AND status = 'pending'
     `).run(runId, timestamp, attemptId);
     if (update.changes !== 1) throw new Error(`pipeline attempt ${attemptId} is not bindable`);
-    db.prepare(`
-      INSERT INTO run_stage_bindings(run_id, attempt_id, bound_at)
-      VALUES (?, ?, ?)
-    `).run(runId, attemptId, timestamp);
   });
 
   return {
@@ -421,9 +439,9 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
     },
     getInstanceForSession(sessionId) {
       const instance = db.prepare(`
-        SELECT pi.* FROM session_executions se
-        JOIN pipeline_instances pi ON pi.id = se.pipeline_instance_id
-        WHERE se.linear_session_id = ? AND se.execution_mode = 'pipeline'
+        SELECT pi.* FROM agent_sessions s
+        JOIN pipeline_instances pi ON pi.id = s.pipeline_instance_id
+        WHERE s.id = ? AND s.execution_mode = 'pipeline'
       `).get(sessionId) as PipelineInstance | undefined;
       if (instance) validatePinnedInstance(db, instance);
       return instance;
@@ -482,6 +500,39 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
           WHERE pipeline_instance_id = ? AND stage_id = ? AND status IN ('pending', 'dispatchable', 'running')
         `).run(timestamp, attempt.pipeline_instance_id, attempt.stage_id);
       })();
+    },
+    bindRuntimeResource(instanceId, provider, providerResourceId) {
+      const instance = getInstanceStmt.get(instanceId) as PipelineInstance | undefined;
+      if (!instance) throw new Error(`unknown pipeline instance ${instanceId}`);
+      if (instance.runtime_provider_resource_id) {
+        if (instance.runtime_provider !== provider || instance.runtime_provider_resource_id !== providerResourceId) {
+          throw new Error(`pipeline instance ${instanceId} is already bound to a different runtime resource`);
+        }
+        return runtimeResourceForInstance(instance)!;
+      }
+      const timestamp = now();
+      db.prepare(`
+        UPDATE pipeline_instances
+        SET runtime_provider = ?, runtime_provider_resource_id = ?,
+            runtime_resource_status = 'active',
+            runtime_resource_created_at = ?, runtime_resource_updated_at = ?,
+            updated_at = ?
+        WHERE id = ? AND runtime_provider_resource_id IS NULL
+      `).run(provider, providerResourceId, timestamp, timestamp, timestamp, instanceId);
+      return runtimeResourceForInstance(getInstanceStmt.get(instanceId) as PipelineInstance | undefined)!;
+    },
+    getRuntimeResource(instanceId) {
+      return runtimeResourceForInstance(getInstanceStmt.get(instanceId) as PipelineInstance | undefined);
+    },
+    setRuntimeResourceStatus(instanceId, status) {
+      const timestamp = now();
+      const update = db.prepare(`
+        UPDATE pipeline_instances
+        SET runtime_resource_status = ?, runtime_resource_updated_at = ?, updated_at = ?
+        WHERE id = ? AND runtime_provider_resource_id IS NOT NULL
+      `).run(status, timestamp, timestamp, instanceId);
+      if (update.changes === 1) return;
+      throw new Error(`pipeline instance ${instanceId} has no runtime resource`);
     },
     getActiveAttempt(instanceId) {
       return db.prepare(`

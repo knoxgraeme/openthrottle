@@ -37,9 +37,9 @@ session identifier. Continuation is a context policy, not a separate task type.
 The current catalog aliases `implement` and `investigate` to immutable `core/`
 manifests:
 
-- `core/implement@1`: implementation → semantic review → simplification →
+- `core/implement@4`: implementation → semantic review → simplification →
   test → lint → build → exact-subject publication → provider verification.
-  Repair transitions return to implementation within manifest bounds.
+  Repair transitions use the manifest's scoped repair stages and round budget.
 - `core/investigate@1`: investigation → conditional exact-subject publication.
   Convergent fixes may ship; divergent decisions terminate as `needs_human`.
 

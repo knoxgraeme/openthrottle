@@ -31,12 +31,6 @@ make no dependent change. Record the decision needed and propose
 
 ## Stage capabilities
 
-- `planning` / `ce/plan@1`: inspect the approved ticket context and repository
-  only as needed to decide whether the work is executable. Invoke the native
-  `ce-plan` workflow only if the supplied plan needs normalization. Make no
-  repository changes. Missing or materially ambiguous acceptance criteria is
-  `needs_human`; an executable plan is `success`.
-
 - `implementation` or `repair_implementation` / `ce/implement@1`: invoke
   native Compound Engineering
   `ce-work mode:return-to-caller /home/agent/.ot/linear-context.md`. For

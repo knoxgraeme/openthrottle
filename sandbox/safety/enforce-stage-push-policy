@@ -18,10 +18,6 @@ fi
 
 context_policy="$(tr -d '\r\n' < "$policy_file" 2>/dev/null || true)"
 case "$context_policy" in
-  fresh_review)
-    echo "BLOCKED: pushes are forbidden during a fresh-review stage." >&2
-    exit 1
-    ;;
   fresh|none|prefer_resume|resume_required)
     exit 0
     ;;

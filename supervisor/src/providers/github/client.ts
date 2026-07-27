@@ -28,7 +28,6 @@ interface GithubPullRequest {
   merged?: boolean;
   head: { ref: string; sha?: string };
   base: { ref: string };
-  labels?: Array<{ name: string }>;
 }
 
 interface GithubEventBase {
@@ -39,7 +38,6 @@ interface GithubPullRequestEvent extends GithubEventBase {
   kind: "pull_request";
   action: string;
   pull_request: GithubPullRequest;
-  label?: { name: string };
 }
 
 interface GithubReviewEvent extends GithubEventBase {
@@ -49,7 +47,6 @@ interface GithubReviewEvent extends GithubEventBase {
   review: {
     id: number;
     state: string;
-    body?: string;
     html_url: string;
     user?: { login: string };
   };
@@ -349,11 +346,6 @@ async function createRepositoryWebhook(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: "web", ...configuration }),
   });
-}
-
-export async function getAuthenticatedLogin(client: GithubClient): Promise<string> {
-  const user = await githubRequest<{ login: string }>(client, "/user");
-  return user.login;
 }
 
 export async function prepareRepository(

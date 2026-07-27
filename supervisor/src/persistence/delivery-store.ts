@@ -86,8 +86,6 @@ export interface DeliveryStore {
   }, expectedPayloadHash?: string): void;
   markLinearOutboxFailed(id: string, error: string, retryAt: string | null, expectedPayloadHash?: string): void;
   recordLinearOutboxAttachment(id: string, attachmentUrl: string): void;
-  getLinearOutbox(id: string): LinearOutboxRecord | undefined;
-  listLinearOutbox(): LinearOutboxRecord[];
   claimDelivery(claim: DeliveryClaim): boolean;
   claimDeliveryForProcessing(params: {
     deliveryId: string;
@@ -127,7 +125,6 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
   `);
   const getLinearOutboxStmt = db.prepare("SELECT * FROM linear_outbox WHERE id = ?");
-  const listLinearOutboxStmt = db.prepare("SELECT * FROM linear_outbox ORDER BY created_at, sequence");
   const claimDeliveryStmt = db.prepare(`
     INSERT OR IGNORE INTO webhook_deliveries (
       delivery_id, source, session_id, action, activity_id, event_name,
@@ -363,12 +360,6 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
         WHERE id = ? AND status = 'processing'
       `).run(attachmentUrl, id);
       if (updated.changes !== 1) throw new Error(`linear outbox ${id} is not processing`);
-    },
-    getLinearOutbox(id) {
-      return getLinearOutboxStmt.get(id) as LinearOutboxRecord | undefined;
-    },
-    listLinearOutbox() {
-      return listLinearOutboxStmt.all() as LinearOutboxRecord[];
     },
     claimDelivery(claim) {
       const receivedAt = now();

@@ -25,7 +25,7 @@ describe("pipeline instance store", () => {
     const setup = setupPipelineStore(":memory:", shippedCatalogPath);
     db = setup.db;
     const { tickets, catalog, snapshot } = setup;
-    const manifest = catalog.manifests.get("ce/implement@2")!;
+    const manifest = catalog.manifests.get("core/implement@4")!;
     expect(() => tickets.upsert({
       ...ticket("broken-session"),
       pipeline: {
@@ -101,7 +101,7 @@ describe("pipeline instance store", () => {
     expect(pipelines.getInstance(oldInstance.id)?.status).toBe("dispatchable");
     expect(pipelines.listEffects(oldInstance.id).map((effect) => [effect.kind, effect.status]))
       .toEqual([["provision", "pending"]]);
-    expect(db!.prepare("SELECT execution_mode FROM session_executions WHERE linear_session_id = ?").pluck().get("rollback-new")).toBeUndefined();
+    expect(db!.prepare("SELECT execution_mode FROM agent_sessions WHERE id = ?").pluck().get("rollback-new")).toBeUndefined();
   });
 
   it("enforces run/attempt identities and rejects orphaned audit receipts", () => {

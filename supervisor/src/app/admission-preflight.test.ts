@@ -22,7 +22,7 @@ import {
 import { createLinearActivityPublisher } from "../providers/linear/outbox.js";
 import { loadPipelineCatalog } from "../pipeline/manifest.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
-import { buildInstalledRuntimeDescriptor } from "../runtime/contracts.js";
+import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 
 const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
 

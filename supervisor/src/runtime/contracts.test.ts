@@ -6,9 +6,9 @@ import { createSupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
 import { reconcileSandboxAutostop } from "./lifecycle.js";
 import {
-  buildInstalledRuntimeDescriptor,
   loadRuntimeCapabilityDescriptor,
 } from "./contracts.js";
+import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 
 describe("sandbox runtime port", () => {
   let db: Database.Database | undefined;

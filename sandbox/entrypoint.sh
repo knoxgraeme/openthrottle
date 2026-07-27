@@ -109,75 +109,7 @@ assert_agent_directory() {
   fi
 }
 
-FRESH_REVIEW_BACKUP=""
-FRESH_REVIEW_REPO=""
-AGENT_HOME_UID=""
-AGENT_HOME_GID=""
-AGENT_HOME_MODE=""
 STAGE_REPO_DIR="$REPO_DIR"
-
-# Review runs against a disposable copy while the canonical checkout is hidden
-# below a root-only directory. Even a full .git swap or ignored-file mutation
-# is discarded before the next stage receives repository credentials.
-prepare_fresh_review_checkout() {
-  [[ -z "$FRESH_REVIEW_BACKUP" ]] || return 1
-  AGENT_HOME_UID="$(stat -c '%u' "$AGENT_HOME")"
-  AGENT_HOME_GID="$(stat -c '%g' "$AGENT_HOME")"
-  AGENT_HOME_MODE="$(stat -c '%a' "$AGENT_HOME")"
-  chown root:root "$AGENT_HOME"
-  chmod 0755 "$AGENT_HOME"
-  FRESH_REVIEW_BACKUP="$(mktemp -d "${AGENT_HOME}/.ot-review-backup-XXXXXX")"
-  chown root:root "$FRESH_REVIEW_BACKUP"
-  mv "$REPO_DIR" "${FRESH_REVIEW_BACKUP}/repo"
-  FRESH_REVIEW_REPO="$(mktemp -d /tmp/ot-fresh-review-repo-XXXXXX)"
-  chown "${AGENT_USER}:${AGENT_USER}" "$FRESH_REVIEW_REPO"
-  chmod 0700 "$FRESH_REVIEW_REPO"
-  # Briefly expose the source only to the trusted copy process. The disposable
-  # checkout lives off the persistent home bind mount, so platform-specific
-  # bind metadata cannot weaken or break the isolation copy.
-  chmod 0755 "$FRESH_REVIEW_BACKUP"
-  as_agent "cp -R --reflink=auto '${FRESH_REVIEW_BACKUP}/repo/.' '$FRESH_REVIEW_REPO/'"
-  chmod 0700 "$FRESH_REVIEW_BACKUP"
-  STAGE_REPO_DIR="$FRESH_REVIEW_REPO"
-}
-
-restore_fresh_review_checkout() {
-  [[ -n "$FRESH_REVIEW_BACKUP" ]] || return 0
-  if ! terminate_agent_processes; then
-    log "FATAL: fresh-review checkout remains root-hidden because agent termination was not confirmed"
-    return 1
-  fi
-  if ! rm -rf -- "$FRESH_REVIEW_REPO"; then
-    log "FATAL: could not discard the fresh-review checkout"
-    return 1
-  fi
-  if [[ -d "${FRESH_REVIEW_BACKUP}/repo" && ! -e "$REPO_DIR" && ! -L "$REPO_DIR" ]]; then
-    if ! mv "${FRESH_REVIEW_BACKUP}/repo" "$REPO_DIR"; then
-      log "FATAL: could not restore the canonical checkout"
-      return 1
-    fi
-  elif [[ -e "${FRESH_REVIEW_BACKUP}/repo" || -L "${FRESH_REVIEW_BACKUP}/repo" || ! -d "$REPO_DIR" || -L "$REPO_DIR" ]]; then
-    log "FATAL: fresh-review checkout restoration is in an inconsistent state"
-    return 1
-  fi
-  if [[ -d "$FRESH_REVIEW_BACKUP" ]]; then
-    if ! rmdir "$FRESH_REVIEW_BACKUP"; then
-      log "FATAL: fresh-review backup directory is not empty"
-      return 1
-    fi
-  elif [[ -e "$FRESH_REVIEW_BACKUP" || -L "$FRESH_REVIEW_BACKUP" ]]; then
-    log "FATAL: fresh-review backup path is not a directory"
-    return 1
-  fi
-  if ! chown "${AGENT_HOME_UID}:${AGENT_HOME_GID}" "$AGENT_HOME" ||
-      ! chmod "$AGENT_HOME_MODE" "$AGENT_HOME"; then
-    log "FATAL: could not restore agent-home ownership"
-    return 1
-  fi
-  FRESH_REVIEW_BACKUP=""
-  FRESH_REVIEW_REPO=""
-  STAGE_REPO_DIR="$REPO_DIR"
-}
 
 # Author agent commits as the GitHub account that owns GH_TOKEN so GitHub can
 # attribute them to a real account and integrations that gate on commit-author
@@ -206,7 +138,6 @@ HEARTBEAT_PID=""
 
 handle_exit() {
   terminate_agent_processes || true
-  restore_fresh_review_checkout || true
   if [[ -n "${HEARTBEAT_PID:-}" ]]; then
     kill "$HEARTBEAT_PID" 2>/dev/null || true
     wait "$HEARTBEAT_PID" 2>/dev/null || true
@@ -730,13 +661,6 @@ if [[ "$AGENT" == "opencode" && "$STAGE_MODEL_REQUIRED" == "1" ]]; then
   export OPENCODE_DISABLE_SHARE=1
 fi
 
-if [[ "$STAGE_CONTEXT_POLICY" == "fresh_review" ]]; then
-  # Checkout is complete. Do not expose the repository credential to the
-  # review agent; the root-sealed hook policy remains the independent guard.
-  unset GITHUB_TOKEN GH_TOKEN
-  log "withheld repository write credential from fresh-review executor"
-  prepare_fresh_review_checkout
-fi
 export OT_REPO_DIR="$STAGE_REPO_DIR"
 
 STAGE_EXECUTOR_STATUS=0
@@ -745,7 +669,4 @@ node "${OPT_DIR}/runner/execute-stage.mjs" \
   --config "$OT_STAGE_CONFIG_FILE" \
   --manifest "$OT_STAGE_MANIFEST_FILE" \
   --repo "$STAGE_REPO_DIR" || STAGE_EXECUTOR_STATUS=$?
-if ! restore_fresh_review_checkout; then
-  STAGE_EXECUTOR_STATUS=1
-fi
 exit "$STAGE_EXECUTOR_STATUS"

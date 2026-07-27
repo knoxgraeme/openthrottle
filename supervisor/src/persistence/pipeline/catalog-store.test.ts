@@ -9,7 +9,7 @@ import {
   loadPipelineCatalog,
   validatePipelineManifest,
 } from "../../pipeline/manifest.js";
-import { buildInstalledRuntimeDescriptor, loadRuntimeCapabilityDescriptor } from "../../runtime/contracts.js";
+import { buildInstalledRuntimeDescriptor, loadRuntimeCapabilityDescriptor } from "../../__fixtures__/runtime.js";
 import { openDb } from "../database.js";
 import { createPipelineStore } from "./create-store.js";
 import {
@@ -160,14 +160,7 @@ describe("pipeline catalog store", () => {
       ORDER BY pipeline_id, version
     `).all()).toEqual([
       { pipeline_id: "ce/implement", version: 1, digest: historical.manifests.get("ce/implement@1")!.digest },
-      { pipeline_id: "ce/implement", version: 2, digest: shippedCatalog.manifests.get("ce/implement@2")!.digest },
-      { pipeline_id: "ce/implement", version: 3, digest: shippedCatalog.manifests.get("ce/implement@3")!.digest },
-      { pipeline_id: "ce/implement", version: 4, digest: shippedCatalog.manifests.get("ce/implement@4")!.digest },
       { pipeline_id: "ce/investigate", version: 1, digest: historical.manifests.get("ce/investigate@1")!.digest },
-      { pipeline_id: "ce/investigate", version: 2, digest: shippedCatalog.manifests.get("ce/investigate@2")!.digest },
-      { pipeline_id: "core/implement", version: 1, digest: shippedCatalog.manifests.get("core/implement@1")!.digest },
-      { pipeline_id: "core/implement", version: 2, digest: shippedCatalog.manifests.get("core/implement@2")!.digest },
-      { pipeline_id: "core/implement", version: 3, digest: shippedCatalog.manifests.get("core/implement@3")!.digest },
       { pipeline_id: "core/implement", version: 4, digest: shippedCatalog.manifests.get("core/implement@4")!.digest },
       { pipeline_id: "core/investigate", version: 1, digest: shippedCatalog.manifests.get("core/investigate@1")!.digest },
     ]);

@@ -20,7 +20,6 @@ export interface AdmissionStore {
   setSandboxId(issueId: string, sandboxId: string | null): void;
   setState(issueId: string, state: TicketState, lastError?: string): void;
   setPrUrl(issueId: string, prUrl: string): void;
-  setLinearContext(issueId: string, context: string): void;
   listAll(): Ticket[];
   getCurrentSession(issueId: string): AgentSession | undefined;
   getSession(sessionId: string): AgentSession | undefined;
@@ -72,9 +71,6 @@ export function createAdmissionStore(
   );
   const setPrUrlStmt = db.prepare(
     "UPDATE tickets SET pr_url = ?, updated_at = ? WHERE linear_issue_id = ?"
-  );
-  const setLinearContextStmt = db.prepare(
-    "UPDATE tickets SET linear_context = ?, updated_at = ? WHERE linear_issue_id = ?"
   );
   const listAllStmt = db.prepare("SELECT * FROM tickets ORDER BY created_at DESC");
   const getRepositoryByTeamIdStmt = db.prepare(
@@ -225,9 +221,6 @@ export function createAdmissionStore(
     },
     setPrUrl(issueId, prUrl) {
       setPrUrlStmt.run(prUrl, now(), issueId);
-    },
-    setLinearContext(issueId, context) {
-      setLinearContextStmt.run(context, now(), issueId);
     },
     listAll() {
       return listAllStmt.all() as Ticket[];

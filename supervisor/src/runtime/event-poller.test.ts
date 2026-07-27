@@ -195,7 +195,7 @@ describe("sandbox event contracts", () => {
 
     expect(postActivity).not.toHaveBeenCalled();
     expect(db!.prepare(
-      "SELECT actor_state, last_heartbeat_at FROM run_liveness WHERE run_id = 'run-1'"
+      "SELECT actor_state, last_heartbeat_at FROM runs WHERE id = 'run-1'"
     ).get()).toEqual({ actor_state: "running", last_heartbeat_at: expect.any(String) });
     expect(store.getSandboxEvent("77777777-7777-4777-8777-777777777777")?.status)
       .toBe("processed");
@@ -235,7 +235,7 @@ describe("sandbox event contracts", () => {
 
     expect(store.getSandboxEvent("66666666-6666-4666-8666-666666666666")).toBeUndefined();
     expect(db!.prepare(
-      "SELECT last_heartbeat_at FROM run_liveness WHERE run_id = 'run-1'"
+      "SELECT last_heartbeat_at FROM runs WHERE id = 'run-1'"
     ).get()).toEqual({ last_heartbeat_at: null });
     expect(files.size).toBe(0);
     error.mockRestore();
