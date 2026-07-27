@@ -62,6 +62,11 @@ function journalId(input: OrchestrationJournalWrite, refs: string, structured: s
   ].join("-");
 }
 
+function issueTeamKey(issue: string | undefined): string | undefined {
+  const match = /^([A-Za-z][A-Za-z0-9]*)-\d+$/.exec(issue ?? "");
+  return match?.[1]?.toUpperCase();
+}
+
 function metadataForIssue(db: Database.Database, issueId: string): {
   team: string;
   repository: string;
@@ -71,13 +76,21 @@ function metadataForIssue(db: Database.Database, issueId: string): {
     SELECT linear_issue_identifier, repo FROM tickets WHERE linear_issue_id = ?
   `).get(issueId) as { linear_issue_identifier: string; repo: string } | undefined;
   const repository = ticket?.repo ?? "unknown";
-  const registration = db.prepare(`
+  const teamKey = issueTeamKey(ticket?.linear_issue_identifier);
+  const matchingRegistration = teamKey
+    ? db.prepare(`
+      SELECT linear_team_key FROM repository_registrations
+      WHERE lower(github_repo) = lower(?) AND lower(linear_team_key) = lower(?)
+      LIMIT 1
+    `).get(repository, teamKey) as { linear_team_key: string } | undefined
+    : undefined;
+  const fallbackRegistration = matchingRegistration ? undefined : db.prepare(`
     SELECT linear_team_key FROM repository_registrations
     WHERE lower(github_repo) = lower(?)
     ORDER BY updated_at DESC LIMIT 1
   `).get(repository) as { linear_team_key: string } | undefined;
   return {
-    team: registration?.linear_team_key ?? "unknown",
+    team: matchingRegistration?.linear_team_key ?? teamKey ?? fallbackRegistration?.linear_team_key ?? "unknown",
     repository,
     issue: ticket?.linear_issue_identifier ?? issueId,
   };
@@ -85,8 +98,9 @@ function metadataForIssue(db: Database.Database, issueId: string): {
 
 function queryTimestamp(value: string | undefined, label: string): string | undefined {
   if (value === undefined) return undefined;
-  if (Number.isNaN(Date.parse(value))) throw new Error(`${label} must be an ISO-8601 timestamp`);
-  return value;
+  const timestamp = Date.parse(value);
+  if (Number.isNaN(timestamp)) throw new Error(`${label} must be an ISO-8601 timestamp`);
+  return new Date(timestamp).toISOString();
 }
 
 export function createJournalStore(db: Database.Database, now: () => string): Pick<
@@ -105,7 +119,7 @@ export function createJournalStore(db: Database.Database, now: () => string): Pi
       const metadata = metadataForIssue(db, input.issueId);
       const refs = jsonObject(input.refs);
       const structured = nullableJsonObject(input.structured);
-      const recordedAt = now();
+      const recordedAt = queryTimestamp(now(), "recorded_at")!;
       insert.run(
         journalId(input, refs, structured),
         recordedAt,
