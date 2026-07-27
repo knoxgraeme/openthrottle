@@ -157,7 +157,12 @@ provider evidence and may start a bounded repair round.
 External actions are persisted before execution. Provisioning creates one
 Daytona resource for the instance, uploads sealed request/config/manifest
 inputs, and records the resource binding. Dispatch atomically binds the planned
-run id to the stage attempt and starts the sandbox entrypoint. Stop must be
+run id to the stage attempt and starts the sandbox entrypoint. When a transition
+enters a non-dispatched wait such as provider evidence or human approval, an
+`idle` effect may lower the bound sandbox to the idle autostop window while
+leaving `pipeline_runtime_resources.status = active`; it is a best-effort
+runtime side effect, not gate authority, and stale or failed idle work must not
+block provider evidence, terminal controls, or repair dispatch. Stop must be
 confirmed before cleanup; failed termination quarantines the resource rather
 than pretending cleanup succeeded.
 

@@ -104,7 +104,7 @@ export interface PipelineEffectIntent {
   id: string;
   pipeline_instance_id: string;
   transition_version: number;
-  kind: "provision" | "bootstrap" | "dispatch_stage" | "stop" | "quarantine" | "cleanup" | "publish_linear" | "publish_github" | "publish_pr";
+  kind: "provision" | "bootstrap" | "dispatch_stage" | "idle" | "stop" | "quarantine" | "cleanup" | "publish_linear" | "publish_github" | "publish_pr";
   idempotency_key: string;
   payload: string;
   payload_hash: string;
@@ -309,6 +309,7 @@ export interface PipelineStore {
   getActiveAttempt(instanceId: string): PipelineStageAttempt | undefined;
   listProviderReadyInstances(limit?: number): PipelineInstance[];
   listStages(instanceId: string): PipelineInstanceStage[];
+  getEffect(id: string): PipelineEffectIntent | undefined;
   listEffects(instanceId: string): PipelineEffectIntent[];
   listPublications(instanceId: string): PipelinePublicationReceipt[];
   getPublication(id: string): PipelinePublicationReceipt | undefined;

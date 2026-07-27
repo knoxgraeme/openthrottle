@@ -9,7 +9,7 @@ import type {
   PipelineStore,
 } from "../pipeline/store.js";
 import type { StageRequestEnvelope } from "../pipeline/stage-request.js";
-import type { RuntimeResource, SandboxRuntime } from "../runtime/contracts.js";
+import type { RuntimeResource, SandboxAutostopRuntime, SandboxRuntime } from "../runtime/contracts.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import { terminateAndSettleActor } from "./actor-settlement.js";
 
@@ -41,6 +41,7 @@ const CAPACITY_ERROR_PATTERNS: RegExp[] = [
 ];
 
 type EffectErrorClass = "auth" | "capacity" | "transient";
+type RuntimeEffectHandlerResult = "acknowledge" | "skip_acknowledgement";
 
 function classifyEffectError(message: string): EffectErrorClass {
   const text = message.toLowerCase();
@@ -59,7 +60,7 @@ export interface PipelineEffectProcessor {
 interface PipelineEffectProcessorDeps {
   store: PipelineStore;
   tickets: SupervisorStore;
-  runtime: SandboxRuntime;
+  runtime: SandboxRuntime & SandboxAutostopRuntime;
   taskTimeoutSeconds: number;
   now?: () => Date;
 }
@@ -72,6 +73,12 @@ interface StopEffectControl {
 interface EffectRuntimeBinding {
   resource: RuntimeResource | undefined;
   status: PipelineRuntimeResource["status"] | undefined;
+}
+
+interface IdleEffectControl {
+  stageId: string;
+  attemptId: string;
+  reason: "provider wait" | "human wait";
 }
 
 function parseStopEffectControl(effect: PipelineEffectIntent): StopEffectControl {
@@ -87,6 +94,21 @@ function parseStopEffectControl(effect: PipelineEffectIntent): StopEffectControl
     // the original run id or an explicit null.
     runId: hasRunId ? (parsed.runId as string | null) : undefined,
     ticketState: parsed.ticketState,
+  };
+}
+
+function parseIdleEffectControl(effect: PipelineEffectIntent): IdleEffectControl {
+  const parsed = JSON.parse(effect.payload) as Record<string, unknown>;
+  if (typeof parsed.stageId !== "string" || typeof parsed.attemptId !== "string") {
+    throw new Error(`pipeline idle effect ${effect.id} has no wait fence`);
+  }
+  if (parsed.reason !== "provider wait" && parsed.reason !== "human wait") {
+    throw new Error(`pipeline idle effect ${effect.id} has an invalid wait reason`);
+  }
+  return {
+    stageId: parsed.stageId,
+    attemptId: parsed.attemptId,
+    reason: parsed.reason,
   };
 }
 
@@ -169,6 +191,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       if (existing.status !== "active") {
         throw new Error(`pipeline runtime ${existing.provider_resource_id} is ${existing.status} and cannot dispatch`);
       }
+      await deps.runtime.setActive(existing.provider_resource_id);
       return { providerResourceId: existing.provider_resource_id };
     }
     const resource = await deps.runtime.provision({
@@ -250,6 +273,19 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       status: binding?.status,
     };
   };
+
+  const isCurrentIdleWait = (instanceId: string, control: IdleEffectControl): boolean => {
+    const current = deps.store.getInstance(instanceId);
+    const activeAttempt = deps.store.getActiveAttempt(instanceId);
+    if (!current || current.active_stage_id !== control.stageId || activeAttempt?.id !== control.attemptId) {
+      return false;
+    }
+    if (control.reason === "provider wait") return current.status === "waiting_provider";
+    return current.status === "waiting_human" || current.status === "completion_pending_publication";
+  };
+
+  const idleAcknowledgementResult = (effectId: string): RuntimeEffectHandlerResult =>
+    deps.store.getEffect(effectId)?.status === "dead" ? "skip_acknowledgement" : "acknowledge";
 
   const handleStageDispatchEffect = async (
     effect: PipelineEffectIntent,
@@ -422,14 +458,50 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     }
   };
 
+  const handleIdleEffect = async (
+    effect: PipelineEffectIntent,
+    instance: PipelineInstance,
+    binding: EffectRuntimeBinding
+  ): Promise<RuntimeEffectHandlerResult> => {
+    const control = parseIdleEffectControl(effect);
+    if (!binding.resource || binding.status !== "active" || !isCurrentIdleWait(instance.id, control)) return "acknowledge";
+    try {
+      await deps.runtime.setIdle(binding.resource.providerResourceId);
+    } catch (error) {
+      console.error("[pipeline-effects] failed to idle sandbox:",
+        sanitizeText(String(error)).slice(-500));
+      return idleAcknowledgementResult(effect.id);
+    }
+    if (!isCurrentIdleWait(instance.id, control) &&
+        deps.store.getRuntimeResource(instance.id)?.status === "active") {
+      try {
+        await deps.runtime.setActive(binding.resource.providerResourceId);
+      } catch (error) {
+        console.error("[pipeline-effects] failed to restore active sandbox:",
+          sanitizeText(String(error)).slice(-500));
+      }
+    }
+    return idleAcknowledgementResult(effect.id);
+  };
+
   const runtimeHandlers: Partial<Record<PipelineEffectIntent["kind"], (
     effect: PipelineEffectIntent,
     instance: PipelineInstance,
     binding: EffectRuntimeBinding
-  ) => Promise<void>>> = {
-    stop: handleStopEffect,
-    quarantine: handleQuarantineEffect,
-    cleanup: handleCleanupEffect,
+  ) => Promise<RuntimeEffectHandlerResult>>> = {
+    idle: handleIdleEffect,
+    stop: async (...args) => {
+      await handleStopEffect(...args);
+      return "acknowledge";
+    },
+    quarantine: async (...args) => {
+      await handleQuarantineEffect(...args);
+      return "acknowledge";
+    },
+    cleanup: async (...args) => {
+      await handleCleanupEffect(...args);
+      return "acknowledge";
+    },
   };
 
   const handle = async (effect: PipelineEffectIntent): Promise<void> => {
@@ -443,7 +515,8 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     const handler = runtimeHandlers[effect.kind];
     if (!handler) throw new Error(`pipeline effect kind ${effect.kind} has no runtime handler`);
     const binding = runtimeBindingFor(instance);
-    await handler(effect, instance, binding);
+    const result = await handler(effect, instance, binding);
+    if (result === "skip_acknowledgement") return;
     acknowledgeEffect(effect, eventId, {
       providerResourceId: binding.resource?.providerResourceId ?? null,
       confirmed: true,

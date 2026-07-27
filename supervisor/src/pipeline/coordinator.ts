@@ -349,6 +349,26 @@ function failedTerminalStopEffect(input: {
   };
 }
 
+type IdleRuntimeReason = "provider wait" | "human wait";
+
+function idleRuntimeEffect(input: {
+  instanceId: string;
+  stageId: string;
+  attemptId: string;
+  reason: IdleRuntimeReason;
+}): CoordinatorEffectWrite {
+  return {
+    kind: "idle",
+    idempotencyKey: `idle:${input.instanceId}:${input.stageId}:${input.attemptId}`,
+    payload: canonicalJson({
+      pipelineInstanceId: input.instanceId,
+      stageId: input.stageId,
+      attemptId: input.attemptId,
+      reason: input.reason,
+    }),
+  };
+}
+
 function terminalWrite(input: PipelineReductionInput & {
   eventPayloadHash: string;
   terminal: PipelineOutcome;
@@ -508,6 +528,14 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
             wait: resumeStatus,
           }),
         };
+    const waitEffects = resumeStatus === "waiting_provider" || resumeStatus === "waiting_human"
+      ? [idleRuntimeEffect({
+          instanceId: input.instance.id,
+          stageId: target.id,
+          attemptId: nextAttempt.id,
+          reason: resumeStatus === "waiting_provider" ? "provider wait" : "human wait",
+        })]
+      : [];
     return {
       instanceId: input.instance.id,
       eventId: input.event.id,
@@ -531,7 +559,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
       reentryIncrement: isReentry ? 1 : 0,
       artifacts: artifactsFor(input.event),
       nextAttempt,
-      effects: [nextEffect],
+      effects: [nextEffect, ...waitEffects],
     };
   }
 

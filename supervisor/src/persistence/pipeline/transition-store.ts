@@ -235,7 +235,7 @@ export function createTransitionStore(db: Database.Database, now: () => string):
         UPDATE pipeline_effect_intents
         SET status = 'dead', last_error = 'canceled by a terminal pipeline control event'
         WHERE pipeline_instance_id = ?
-          AND kind IN ('provision', 'bootstrap', 'dispatch_stage')
+          AND kind IN ('provision', 'bootstrap', 'dispatch_stage', 'idle')
           AND status IN ('pending', 'processing', 'failed')
       `).run(instance.id);
       wrote();

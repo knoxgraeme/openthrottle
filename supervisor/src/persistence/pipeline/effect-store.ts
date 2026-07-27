@@ -5,7 +5,7 @@ import { claimLeasable, markQueueFailed } from "./helpers.js";
 
 export function createEffectStore(db: Database.Database, now: () => string): Pick<
   PipelineStore,
-  "claimEffects" | "recordEffectAcknowledgement" | "markEffectFailed" | "markStopEffectExhausted"
+  "getEffect" | "claimEffects" | "recordEffectAcknowledgement" | "markEffectFailed" | "markStopEffectExhausted"
 > {
   const claimEffects = db.transaction((
     nowIso: string,
@@ -125,6 +125,10 @@ export function createEffectStore(db: Database.Database, now: () => string): Pic
   });
 
   return {
+    getEffect(id) {
+      return db.prepare("SELECT * FROM pipeline_effect_intents WHERE id = ?")
+        .get(id) as PipelineEffectIntent | undefined;
+    },
     claimEffects,
     recordEffectAcknowledgement,
     markStopEffectExhausted,

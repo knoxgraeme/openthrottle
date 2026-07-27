@@ -42,6 +42,7 @@ describe("database migrations", () => {
       "e2cd34be32f4dd0ab9fdacb87732dae7121574efb7bd1aa166090e3591b851e6",
       "a8687cedc0fd1fc88b1cc8a6c39589d9cbe3279f6360195975de9f87e1d25ba3",
       "3ad35a452352b7cd5db98b32ba67b2f6906c465fa263a8396cae4ad09b7a3ab7",
+      "1b7f1245f97725dfe081493638283b38fec8f363138fe5b8c4450ba9220ee84c",
     ]);
   });
 
@@ -76,6 +77,103 @@ describe("database migrations", () => {
       "INSERT INTO schema_migrations (version, name, checksum, applied_at) VALUES (999, 'future', 'x', '2026-01-01T00:00:00.000Z')"
     ).run();
     expect(() => applyDatabaseMigrations(db!)).toThrow(/newer schema version/i);
+  });
+
+  it("widens pipeline idle effects without losing queued effect data", () => {
+    db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
+    for (const migration of databaseMigrations.slice(0, 10)) {
+      db.prepare(`
+        INSERT INTO schema_migrations(version, name, checksum, applied_at)
+        VALUES (?, ?, ?, '2026-01-01T00:00:00.000Z')
+      `).run(migration.version, migration.name, migration.checksum);
+    }
+    db.exec(`
+      CREATE TABLE pipeline_instances (id TEXT PRIMARY KEY);
+      INSERT INTO pipeline_instances VALUES ('instance-1');
+      CREATE TABLE pipeline_effect_intents (
+        id TEXT PRIMARY KEY,
+        pipeline_instance_id TEXT NOT NULL,
+        transition_version INTEGER NOT NULL CHECK(transition_version >= 1),
+        kind TEXT NOT NULL CHECK(kind IN (
+          'provision', 'bootstrap', 'dispatch_stage', 'stop', 'quarantine', 'cleanup',
+          'publish_linear', 'publish_github', 'publish_pr'
+        )),
+        idempotency_key TEXT NOT NULL UNIQUE,
+        payload TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending', 'processing', 'acknowledged', 'failed', 'dead')),
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+        next_attempt_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        acknowledged_at TEXT,
+        last_error TEXT,
+        FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
+        UNIQUE(pipeline_instance_id, transition_version, kind, idempotency_key)
+      );
+      CREATE INDEX pipeline_effects_pending_idx ON pipeline_effect_intents(status, next_attempt_at);
+      INSERT INTO pipeline_effect_intents (
+        id, pipeline_instance_id, transition_version, kind, idempotency_key,
+        payload, payload_hash, status, attempts, next_attempt_at, created_at,
+        acknowledged_at, last_error
+      ) VALUES (
+        'dispatch-1', 'instance-1', 1, 'dispatch_stage', 'dispatch-key',
+        '{"dispatch":true}', 'hash-1', 'failed', 3, '2026-01-01T00:00:01.000Z',
+        '2026-01-01T00:00:00.000Z', NULL, 'retry me'
+      );
+    `);
+
+    applyDatabaseMigrations(db);
+
+    expect(db.prepare(`
+      SELECT id, pipeline_instance_id, transition_version, kind, idempotency_key,
+        payload, payload_hash, status, attempts, next_attempt_at, created_at,
+        acknowledged_at, last_error
+      FROM pipeline_effect_intents WHERE id = 'dispatch-1'
+    `).get()).toEqual({
+      id: "dispatch-1",
+      pipeline_instance_id: "instance-1",
+      transition_version: 1,
+      kind: "dispatch_stage",
+      idempotency_key: "dispatch-key",
+      payload: "{\"dispatch\":true}",
+      payload_hash: "hash-1",
+      status: "failed",
+      attempts: 3,
+      next_attempt_at: "2026-01-01T00:00:01.000Z",
+      created_at: "2026-01-01T00:00:00.000Z",
+      acknowledged_at: null,
+      last_error: "retry me",
+    });
+    expect(() => db!.prepare(`
+      INSERT INTO pipeline_effect_intents (
+        id, pipeline_instance_id, transition_version, kind, idempotency_key,
+        payload, payload_hash, status, next_attempt_at, created_at
+      ) VALUES (
+        'idle-1', 'instance-1', 2, 'idle', 'idle-key', '{}', 'hash-2',
+        'pending', '2026-01-01T00:00:02.000Z', '2026-01-01T00:00:02.000Z'
+      )
+    `).run()).not.toThrow();
+    expect(() => db!.prepare(`
+      INSERT INTO pipeline_effect_intents (
+        id, pipeline_instance_id, transition_version, kind, idempotency_key,
+        payload, payload_hash, status, next_attempt_at, created_at
+      ) VALUES (
+        'invalid-1', 'instance-1', 3, 'invalid', 'invalid-key', '{}', 'hash-3',
+        'pending', '2026-01-01T00:00:03.000Z', '2026-01-01T00:00:03.000Z'
+      )
+    `).run()).toThrow();
+    expect(db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'index' AND tbl_name = 'pipeline_effect_intents' AND name = 'pipeline_effects_pending_idx'
+    `).get()).toEqual({ name: "pipeline_effects_pending_idx" });
   });
 
   it("backfills liveness ownership for a pre-upgrade active actor", () => {
