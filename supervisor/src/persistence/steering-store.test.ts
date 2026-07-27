@@ -100,4 +100,42 @@ describe("steering store", () => {
       delivery_id: null,
     });
   });
+
+  it("cancels buffered steering from a superseded session before binding", () => {
+    store.enqueueInbox({
+      id: "steer-old-session",
+      issueId: "issue-1",
+      sessionId: "session-1",
+      runId: null,
+      source: "human",
+      body: "Do not inject this into the replacement session.",
+    });
+    store.upsertUnpinned({
+      linear_issue_id: "issue-1",
+      linear_issue_identifier: "OT-1",
+      linear_session_id: "session-2",
+      sandbox_id: null,
+      branch: "ot/ot-1",
+      agent: "codex",
+      repo: "owner/repo",
+      base_branch: "main",
+      pr_url: null,
+      state: "active",
+    });
+    expect(store.beginRun({
+      issueId: "issue-1",
+      runId: "run-replacement",
+      taskType: "implement",
+      tokenHash: "steering-token-hash",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    })).toBe(true);
+
+    expect(store.listPendingInbox("issue-1")).toHaveLength(0);
+    expect(store.getInbox("steer-old-session")).toMatchObject({
+      status: "canceled",
+      run_id: null,
+    });
+    expect(db.prepare("SELECT status FROM work_items WHERE id = ?").pluck().get("steer-old-session"))
+      .toBe("canceled");
+  });
 });

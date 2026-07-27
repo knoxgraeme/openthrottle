@@ -143,17 +143,31 @@ export function createSteeringStore(db: Database.Database, workStore: WorkStore)
       const timestamp = now();
       const records = listPendingInboxStmt.all(issueId, timestamp) as SteerInboxRecord[];
       const deliverable: SteerInboxRecord[] = [];
-      const activeRunId =
-        (getByIssueIdStmt.get(issueId) as Ticket | undefined)?.run_id;
+      const activeTicket = getByIssueIdStmt.get(issueId) as Ticket | undefined;
+      const activeRunId = activeTicket?.run_id;
+      const activeSession = activeTicket
+        ? getSessionStmt.get(activeTicket.linear_session_id) as AgentSession | undefined
+        : undefined;
       for (const record of records) {
         const item = workStore.get(record.id);
         if (!item || !activeRunId) continue;
         const activeDelivery = record.delivery_id
           ? workStore.getDelivery(record.delivery_id)
           : undefined;
+        const inboxBelongsToSupersededSession = Boolean(
+          activeTicket && record.linear_session_id !== activeTicket.linear_session_id
+        );
+        const inboxBelongsToSupersededGeneration = Boolean(
+          activeSession && item.generation !== activeSession.generation
+        );
         const inboxBelongsToEndedRun = Boolean(record.run_id && record.run_id !== activeRunId);
         const deliveryBelongsToEndedRun = Boolean(activeDelivery && activeDelivery.run_id !== activeRunId);
-        if (inboxBelongsToEndedRun || deliveryBelongsToEndedRun) {
+        if (
+          inboxBelongsToSupersededSession ||
+          inboxBelongsToSupersededGeneration ||
+          inboxBelongsToEndedRun ||
+          deliveryBelongsToEndedRun
+        ) {
           db.transaction(() => {
             if (activeDelivery) {
               workStore.expireUnacknowledged(
@@ -165,7 +179,9 @@ export function createSteeringStore(db: Database.Database, workStore: WorkStore)
             cancelInboxStmt.run(record.id);
             workStore.cancel(
               record.id,
-              `steering was fenced to ended run ${record.run_id ?? "unknown"}`
+              inboxBelongsToSupersededSession || inboxBelongsToSupersededGeneration
+                ? `steering was fenced to superseded session ${record.linear_session_id}`
+                : `steering was fenced to ended run ${record.run_id ?? "unknown"}`
             );
           })();
           continue;
