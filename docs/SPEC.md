@@ -321,6 +321,12 @@ SQLite file conservatively. Such rows never participate in admission,
 selection, routing, scheduling, status summaries, or sandbox execution. New
 databases do not create the retired task-work table.
 
+`pipeline_work_bindings` is intentionally reserved for Stage C child-unit work:
+it will bind durable work deliveries to fenced pipeline attempts and units so
+unit-level inbox/result handling can be audited without overloading
+`run_stage_bindings`. Until Stage C writes those rows, production code must not
+infer behavior from an empty binding table.
+
 ## Supervisor environment
 
 Required:

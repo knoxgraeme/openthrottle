@@ -8,7 +8,8 @@ import {
   linearFileUpload,
 } from "./client.js";
 import type { ActivityPublicationPort } from "../../app/ports.js";
-import type { LinearOutboxRecord, SupervisorStore } from "../../persistence/store.js";
+import type { SupervisorStore } from "../../persistence/store.js";
+import type { LinearOutboxRecord } from "../../persistence/delivery-store.js";
 import { pipelineStatusCommentMarker } from "../../pipeline/publication.js";
 import { sanitizeText } from "../../shared/sanitize.js";
 

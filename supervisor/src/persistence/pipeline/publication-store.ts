@@ -1,9 +1,13 @@
 import type Database from "better-sqlite3";
 import type {
-  PipelineInstance,
   PipelinePublicationReceipt,
   PipelineStore,
 } from "../../pipeline/store.js";
+import {
+  blockPublicationInstanceOnDead,
+  claimLeasable,
+  markQueueFailed,
+} from "./helpers.js";
 
 export function createPublicationStore(db: Database.Database, now: () => string): Pick<
   PipelineStore,
@@ -27,22 +31,21 @@ export function createPublicationStore(db: Database.Database, now: () => string)
           OR (status = 'processing' AND next_attempt_at <= ?))
       ORDER BY next_attempt_at, created_at, id LIMIT ?
     `).all(nowIso, nowIso, limit) as Array<{ id: string }>;
-    const claimed: PipelinePublicationReceipt[] = [];
-    for (const candidate of candidates) {
-      const update = db.prepare(`
+    return claimLeasable({
+      rows: candidates,
+      nowIso,
+      leaseUntilIso,
+      update: (id, lease, nowValue) => db.prepare(`
         UPDATE pipeline_publication_receipts
         SET status = 'processing', attempts = attempts + 1,
             next_attempt_at = ?, last_error = NULL, updated_at = ?
         WHERE id = ? AND kind = 'github_summary'
           AND ((status IN ('pending', 'failed') AND next_attempt_at <= ?)
             OR (status = 'processing' AND next_attempt_at <= ?))
-      `).run(leaseUntilIso, nowIso, candidate.id, nowIso, nowIso);
-      if (update.changes === 1) {
-        claimed.push(db.prepare("SELECT * FROM pipeline_publication_receipts WHERE id = ?")
-          .get(candidate.id) as PipelinePublicationReceipt);
-      }
-    }
-    return claimed;
+      `).run(lease, nowValue, id, nowValue, nowValue).changes,
+      get: (id) => db.prepare("SELECT * FROM pipeline_publication_receipts WHERE id = ?")
+        .get(id) as PipelinePublicationReceipt,
+    });
   });
 
   const bindGithubPublicationTarget = db.transaction((
@@ -121,25 +124,35 @@ export function createPublicationStore(db: Database.Database, now: () => string)
     if (!publication || publication.kind !== "github_summary" ||
         publication.status !== "processing" || publication.payload_hash !== expectedPayloadHash) return false;
     const timestamp = now();
-    const status = retryAt ? "failed" : "dead";
-    const instance = db.prepare("SELECT * FROM pipeline_instances WHERE id = ?")
-      .get(publication.pipeline_instance_id) as PipelineInstance;
-    db.prepare(`
+    const instance = db.prepare("SELECT status, state_version FROM pipeline_instances WHERE id = ?")
+      .get(publication.pipeline_instance_id) as { status: string; state_version: number };
+    const status = markQueueFailed({
+      error,
+      retryAt,
+      timestamp,
+      update: (statusValue, nextAttemptAt, errorValue) => db.prepare(`
       UPDATE pipeline_publication_receipts
       SET status = ?, next_attempt_at = ?, last_error = ?, updated_at = ?,
           blocked_from_status = CASE WHEN ? = 'dead' THEN COALESCE(blocked_from_status, ?) ELSE blocked_from_status END
       WHERE id = ?
-    `).run(status, retryAt ?? timestamp, error, timestamp, status, instance.status, id);
-    if (status === "dead" && ![
-      "shipped", "no_change", "needs_human", "canceled", "superseded", "failed", "publication_blocked",
-    ].includes(instance.status)) {
-      db.prepare(`
-        UPDATE pipeline_instances
-        SET status = 'publication_blocked', state_version = state_version + 1,
-            wait_reason = 'permanent publication failure', updated_at = ?
-        WHERE id = ? AND state_version = ?
-      `).run(timestamp, instance.id, instance.state_version);
-    }
+    `).run(
+        statusValue,
+        nextAttemptAt,
+        errorValue,
+        timestamp,
+        statusValue,
+        instance.status,
+        id
+      ).changes,
+    });
+    if (!status) return false;
+    blockPublicationInstanceOnDead({
+      db,
+      id,
+      status,
+      timestamp,
+      instanceVersion: instance.state_version,
+    });
     return true;
   });
 
