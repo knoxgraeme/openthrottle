@@ -254,6 +254,7 @@ export interface CoordinatorTransitionWrite {
   outcome: StageOutcome;
   resultHash: string;
   nextStatus: PipelineInstanceStatus;
+  resumeStatus?: PipelineInstanceStatus | null;
   nextStageId?: string | null;
   nextStageStatus?: "dispatchable" | "waiting";
   terminalOutcome?: PipelineOutcome | null;

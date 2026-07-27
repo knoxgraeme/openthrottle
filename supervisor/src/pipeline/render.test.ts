@@ -50,6 +50,7 @@ function stage(
   return {
     id,
     executor: { kind, capability },
+    ...(kind === "command" ? { commandName: "test" } : {}),
     evaluator,
     context: "none",
     live_steering: false,

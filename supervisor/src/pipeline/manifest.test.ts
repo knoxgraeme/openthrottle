@@ -76,14 +76,16 @@ describe("pipeline manifest validation", () => {
     expect(first.digest).toBe(second.digest);
     expect([...first.manifests.keys()]).toEqual([
       "core/implement@1",
+      "core/implement@2",
       "core/investigate@1",
       "ce/implement@2",
       "ce/implement@3",
+      "ce/implement@4",
       "ce/investigate@2",
     ]);
     expect(resolvePipelineReference(first, "implement").manifest.id).toBe("core/implement");
-    expect(resolvePipelineReference(first, "implement").manifest.version).toBe(1);
-    expect(resolvePipelineReference(first, "ce/implement@3").manifest.id).toBe("ce/implement");
+    expect(resolvePipelineReference(first, "implement").manifest.version).toBe(2);
+    expect(resolvePipelineReference(first, "ce/implement@4").manifest.id).toBe("ce/implement");
     expect(() => resolvePipelineReference(first, "ce/implement@1"))
       .toThrow(/unknown pipeline selection/);
     expect(() => resolvePipelineReference(first, "ce/investigate@1"))
@@ -226,11 +228,13 @@ describe("pipeline manifest validation", () => {
 
     expect(withoutIdentity(resolvePipelineReference(catalog, "core/implement@1").manifest))
       .toEqual(withoutIdentity(resolvePipelineReference(catalog, "ce/implement@3").manifest));
+    expect(withoutIdentity(resolvePipelineReference(catalog, "core/implement@2").manifest))
+      .toEqual(withoutIdentity(resolvePipelineReference(catalog, "ce/implement@4").manifest));
     expect(withoutIdentity(resolvePipelineReference(catalog, "core/investigate@1").manifest))
       .toEqual(withoutIdentity(resolvePipelineReference(catalog, "ce/investigate@2").manifest));
   });
 
-  it("ships ce/implement@3 as a plan-in pipeline while keeping ce/implement@2 pinned-instance immutable", () => {
+  it("ships ce/implement@4 as an explicit-command plan-in pipeline while keeping legacy pinned instances immutable", () => {
     const path = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
     const runtime = buildInstalledRuntimeDescriptor("test-runtime/v1");
     const catalog = loadPipelineCatalog(path, runtime.descriptor);
@@ -240,6 +244,8 @@ describe("pipeline manifest validation", () => {
     expect(v2.version).toBe(2);
     expect(v2.entry_stage).toBe("planning");
     expect(v2.requires.capabilities).toContain("ce/plan@1");
+    expect(v2.stages.filter((stage) => stage.executor.kind === "command").map((stage) => stage.commandName))
+      .toEqual([undefined, undefined, undefined]);
 
     // v3 removes planning: the shipped plan is already approved, implementation enters directly.
     const v3 = resolvePipelineReference(catalog, "ce/implement@3").manifest;
@@ -247,17 +253,25 @@ describe("pipeline manifest validation", () => {
     expect(v3.entry_stage).toBe("implementation");
     expect(v3.stages.some((stage) => stage.id === "planning")).toBe(false);
     expect(v3.requires.capabilities).not.toContain("ce/plan@1");
+    expect(v3.stages.filter((stage) => stage.executor.kind === "command").map((stage) => stage.commandName))
+      .toEqual([undefined, undefined, undefined]);
+
+    const v4 = resolvePipelineReference(catalog, "ce/implement@4").manifest;
+    expect(v4.version).toBe(4);
+    expect(v4.entry_stage).toBe("implementation");
+    expect(v4.stages.filter((stage) => stage.executor.kind === "command").map((stage) => stage.commandName))
+      .toEqual(["test", "lint", "build"]);
 
     // With no prior native session, the entry stage must start fresh, not resume.
-    const implementation = v3.stages.find((stage) => stage.id === "implementation")!;
+    const implementation = v4.stages.find((stage) => stage.id === "implementation")!;
     expect(implementation.context).toBe("fresh");
     expect(implementation.live_steering).toBe(true);
 
     // Downstream stages still resume implementation's session, and nothing references planning.
     for (const id of ["semantic_review", "simplification", "publish"]) {
-      expect(v3.stages.find((stage) => stage.id === id)?.context).toBe("resume_required");
+      expect(v4.stages.find((stage) => stage.id === id)?.context).toBe("resume_required");
     }
-    for (const stage of v3.stages) {
+    for (const stage of v4.stages) {
       for (const transition of Object.values(stage.transitions)) {
         expect(transition.to).not.toBe("planning");
       }
@@ -321,6 +335,30 @@ describe("pipeline manifest validation", () => {
     const undeclared = manifest();
     (undeclared.requires as { capabilities: string[] }).capabilities = ["command/run@1"];
     expect(() => validatePipelineManifest(undeclared)).toThrow(/not declared in requires.capabilities/);
+  });
+
+  it("requires command executors to declare an allowlisted repository command", () => {
+    const command = manifest();
+    command.requires = { protocol: "stage-executor@1", capabilities: ["command/run@1"] };
+    const stage = firstStage(command);
+    stage.executor = { kind: "command", capability: "command/run@1" };
+    stage.commandName = "test";
+    stage.evaluator = { kind: "command", assurance: "executor_verified", required_artifacts: ["command_result"] };
+    stage.live_steering = false;
+    stage.credentials = ["repo.read"];
+    stage.produces = ["stage_result", "command_result"];
+
+    expect(validatePipelineManifest(command).manifest.stages[0]).toMatchObject({ commandName: "test" });
+
+    delete stage.commandName;
+    expect(() => validatePipelineManifest(command)).toThrow(/commandName: is required for command executors/);
+
+    stage.commandName = "deploy";
+    expect(() => validatePipelineManifest(command)).toThrow(/commandName: must be one of/);
+
+    const agent = manifest();
+    firstStage(agent).commandName = "test";
+    expect(() => validatePipelineManifest(agent)).toThrow(/commandName: is allowed only for command executors/);
   });
 
   it("accepts only bounded repository settings and canonical pipeline selections", () => {

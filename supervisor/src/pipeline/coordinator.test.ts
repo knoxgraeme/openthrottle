@@ -167,8 +167,8 @@ describe("pipeline coordinator", () => {
     expect(pipelines.listEffects(instance.id).map((effect) => effect.kind)).toEqual([
       "provision",
       "publish_linear",
-      "cleanup",
       "publish_github",
+      "cleanup",
     ]);
 
     const replay = coordinatePipelineEvent(pipelines, input);
@@ -507,6 +507,37 @@ describe("pipeline coordinator", () => {
       stages,
       event: { ...event(instance, attempt, "canceled"), kind: "supersede" },
     })).toThrow(/supersede must use outcome superseded/);
+  });
+
+  it("publishes control stop and supersede terminals without racing cleanup", () => {
+    for (const [kind, outcome, terminal] of [
+      ["stop", "canceled", "canceled"],
+      ["supersede", "superseded", "superseded"],
+    ] as const) {
+      const { pipelines, manifest, instance, attempt, stages } = setup();
+      const input = { ...event(instance, attempt, outcome, `${kind}-event`), kind };
+      const write = reducePipelineEvent({ manifest, instance, attempt, stages, event: input });
+
+      expect(write).toMatchObject({
+        terminalOutcome: terminal,
+        resumeStatus: terminal,
+        nextStatus: "completion_pending_publication",
+      });
+      expect(write.effects.map((effect) => effect.kind)).toEqual(["publish_linear", "stop"]);
+      expect(write.effects.find((effect) => effect.kind === "cleanup")).toBeUndefined();
+      expect(write.effects.find((effect) => effect.kind === "publish_linear")?.payload)
+        .toBe(JSON.stringify({ publication: "deferred_to_coordinator" }));
+
+      coordinatePipelineEvent(pipelines, input);
+
+      const effects = pipelines.listEffects(instance.id);
+      expect(effects.filter((effect) => effect.kind === "publish_linear")).toHaveLength(1);
+      expect(effects.filter((effect) => effect.kind === "publish_github")).toHaveLength(1);
+      expect(effects.filter((effect) => effect.kind === "stop")).toHaveLength(1);
+      expect(effects.find((effect) => effect.kind === "cleanup")).toBeUndefined();
+      expect(effects.find((effect) => effect.kind === "publish_linear")?.payload)
+        .toContain("\"schema\":\"openthrottle.pipeline-publication/v1\"");
+    }
   });
 
   it("contains no CE-specific coordinator branch", () => {

@@ -694,7 +694,7 @@ export function buildStagePublication(input: {
   /** Findings accumulated from the run's earlier publications. */
   priorFindings?: readonly PublicationFinding[];
 }): PipelinePublicationEnvelope {
-  const resumeStatus = input.resumeStatus ?? null;
+  const resumeStatus = input.resumeStatus ?? input.write.resumeStatus ?? null;
   const evidence = (input.event.artifacts ?? []).map((artifact) => safeEvidence(artifact.payload));
   const artifactPayload = canonicalJson((input.event.artifacts ?? []).map((artifact) => ({
     kind: artifact.kind,

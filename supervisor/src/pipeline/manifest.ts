@@ -45,6 +45,8 @@ export type AssuranceClass = (typeof ASSURANCE_CLASSES)[number];
 
 export const EXECUTOR_KINDS = ["agent", "command", "provider_wait"] as const;
 export type ExecutorKind = (typeof EXECUTOR_KINDS)[number];
+export const COMMAND_NAMES = ["test", "lint", "build", "format"] as const;
+export type CommandName = (typeof COMMAND_NAMES)[number];
 export const EVALUATOR_KINDS = [
   "result",
   "semantic",
@@ -84,6 +86,7 @@ export interface PipelineTransition {
 export interface PipelineStage {
   id: string;
   executor: { kind: ExecutorKind; capability: string };
+  commandName?: CommandName;
   evaluator: { kind: EvaluatorKind; assurance: AssuranceClass; required_artifacts: ArtifactKind[] };
   context: ContextPolicy;
   live_steering: boolean;
@@ -303,9 +306,14 @@ function parseManifestDefaults(value: unknown, path: string): ManifestDefaults {
   };
 }
 
-function parseStage(value: unknown, path: string, defaults: ManifestDefaults): PipelineStage {
+function parseStage(
+  value: unknown,
+  path: string,
+  defaults: ManifestDefaults,
+  options: { allowLegacyImplicitCommandName?: boolean } = {}
+): PipelineStage {
   const input = objectAt(value, path, [
-    "id", "executor", "evaluator", "context", "live_steering", "credentials", "produces", "transitions", "retry",
+    "id", "executor", "commandName", "evaluator", "context", "live_steering", "credentials", "produces", "transitions", "retry",
   ]);
   const id = stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER });
   const executorInput = objectAt(input.executor, `${path}.executor`, ["kind", "capability"]);
@@ -343,6 +351,9 @@ function parseStage(value: unknown, path: string, defaults: ManifestDefaults): P
   const stage: PipelineStage = {
     id,
     executor,
+    ...(input.commandName === undefined ? {} : {
+      commandName: enumAt(input.commandName, `${path}.commandName`, COMMAND_NAMES),
+    }),
     evaluator,
     context: enumAt(input.context, `${path}.context`, CONTEXT_POLICIES),
     live_steering: booleanAt(input.live_steering, `${path}.live_steering`),
@@ -363,6 +374,13 @@ function parseStage(value: unknown, path: string, defaults: ManifestDefaults): P
   if (stage.live_steering && stage.executor.kind !== "agent") {
     fail(`${path}.live_steering`, "is allowed only for agent executors");
   }
+  if (stage.executor.kind === "command") {
+    if (!stage.commandName && !options.allowLegacyImplicitCommandName) {
+      fail(`${path}.commandName`, "is required for command executors");
+    }
+  } else if (stage.commandName) {
+    fail(`${path}.commandName`, "is allowed only for command executors");
+  }
   for (const required of stage.evaluator.required_artifacts) {
     if (!stage.produces.includes(required)) fail(`${path}.evaluator.required_artifacts`, `${required} is not produced by the stage`);
   }
@@ -370,6 +388,13 @@ function parseStage(value: unknown, path: string, defaults: ManifestDefaults): P
     fail(`${path}.produces`, "must include the typed stage_result artifact");
   }
   return stage;
+}
+
+function allowsLegacyImplicitCommandName(id: string, version: number): boolean {
+  return (
+    (id === "core/implement" && version === 1) ||
+    (id === "ce/implement" && (version === 2 || version === 3))
+  );
 }
 
 function validateGraph(manifest: PipelineManifest, source: string): void {
@@ -425,10 +450,13 @@ export function validatePipelineManifest(
   if (input.schema !== "openthrottle.pipeline/v1") fail(`${source}.schema`, "must be openthrottle.pipeline/v1");
   const requiresInput = objectAt(input.requires, `${source}.requires`, ["protocol", "capabilities"]);
   const defaults = parseManifestDefaults(input.defaults, `${source}.defaults`);
+  const id = stringAt(input.id, `${source}.id`, { max: 120, pattern: IDENTIFIER });
+  const version = integerAt(input.version, `${source}.version`, 1, 1_000_000);
+  const allowLegacyImplicitCommandName = allowsLegacyImplicitCommandName(id, version);
   const manifest: PipelineManifest = {
     schema: "openthrottle.pipeline/v1",
-    id: stringAt(input.id, `${source}.id`, { max: 120, pattern: IDENTIFIER }),
-    version: integerAt(input.version, `${source}.version`, 1, 1_000_000),
+    id,
+    version,
     description: stringAt(input.description, `${source}.description`, { max: 500 }),
     entry_stage: stringAt(input.entry_stage, `${source}.entry_stage`, { pattern: IDENTIFIER }),
     max_attempts: integerAt(input.max_attempts, `${source}.max_attempts`, 1, 20),
@@ -441,7 +469,14 @@ export function validatePipelineManifest(
         { min: 1, max: 32 }
       ), `${source}.requires.capabilities`),
     },
-    stages: arrayAt(input.stages, `${source}.stages`, (stage, path) => parseStage(stage, path, defaults), { min: 1, max: 32 }),
+    stages: arrayAt(
+      input.stages,
+      `${source}.stages`,
+      (stage, path) => parseStage(stage, path, defaults, {
+        allowLegacyImplicitCommandName,
+      }),
+      { min: 1, max: 32 }
+    ),
   };
   validateGraph(manifest, source);
   for (const stage of manifest.stages) {
