@@ -2,6 +2,7 @@ import type { Config } from "../../app/config.js";
 import type { Ticket } from "../../persistence/store.js";
 import type { SupervisorStore } from "../../persistence/store.js";
 import type { RuntimeWorkspace } from "../../runtime/contracts.js";
+import { sanitizeText } from "../../shared/sanitize.js";
 
 /**
  * Durable Codex subscription auth.
@@ -319,6 +320,11 @@ export function createCredentialMaterializer(cfg: Config, store: SupervisorStore
   };
 }
 
+// Sandboxes that legitimately have no ~/.codex/auth.json (agent never logged
+// in) produce a FILE_NOT_FOUND on every capture attempt; warn once per sandbox
+// instead of on every poll.
+const missingCodexAuthWarnings = new Set<string>();
+
 export async function captureCodexAuthFromSandbox(
   store: SupervisorStore,
   sandbox: RuntimeWorkspace,
@@ -335,6 +341,19 @@ export async function captureCodexAuthFromSandbox(
       console.log("[codex-auth] captured a rotated refresh token from the sandbox");
     }
   } catch (error) {
-    console.warn("[codex-auth] could not read back ~/.codex/auth.json:", error);
+    // A sandbox that never ran Codex login has no auth.json; that read miss is
+    // expected and would otherwise spam the log on every poll, so it is warned
+    // once per sandbox. Everything else stays a visible (sanitized) warning.
+    const message = String(error);
+    const sanitized = sanitizeText(message).slice(-2_000);
+    const warningKey = `${sandbox.id}:missing-codex-auth`;
+    if (message.includes("FILE_NOT_FOUND")) {
+      if (!missingCodexAuthWarnings.has(warningKey)) {
+        missingCodexAuthWarnings.add(warningKey);
+        console.warn("[codex-auth] could not read back ~/.codex/auth.json; will retry silently:", sanitized);
+      }
+    } else {
+      console.warn("[codex-auth] could not read back ~/.codex/auth.json:", sanitized);
+    }
   }
 }

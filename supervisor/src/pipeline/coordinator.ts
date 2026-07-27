@@ -405,7 +405,11 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
         ],
       };
     }
-    if (input.instance.attempt_count >= input.manifest.max_attempts) {
+    // `max_attempts` is a whole-run guard against starting another bounded
+    // repair/retry pass. Once a pass is already moving forward, per-transition
+    // re-entry caps are the loop bound and the coordinator must not strand a
+    // successfully repaired tree before publish/provider.
+    if (isReentry && input.instance.attempt_count >= input.manifest.max_attempts) {
       return {
         instanceId: input.instance.id,
         eventId: input.event.id,

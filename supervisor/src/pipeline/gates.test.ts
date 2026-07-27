@@ -659,8 +659,8 @@ describe("deterministic supervisor stage gates", () => {
     `).get(fixture.instance.id)).toEqual({ count: 2 });
   });
 
-  it("settles a third publish after two provider feedback repair rounds", () => {
-    const fixture = setup("ce/implement@3", { maxAttempts: 40 });
+  it("settles a third publish under the raw 20-attempt budget after two provider feedback repair rounds", () => {
+    const fixture = setup("ce/implement@3", { maxAttempts: 20 });
 
     const completed = settleRepairRoundPublishes(fixture, 3);
 
@@ -678,6 +678,7 @@ describe("deterministic supervisor stage gates", () => {
       SELECT COUNT(*) AS count FROM pipeline_gate_receipts
       WHERE pipeline_instance_id = ? AND evaluator_kind = 'publish_subject'
     `).get(fixture.instance.id)).toEqual({ count: 3 });
+    expect(fixture.pipelines.getInstance(fixture.instance.id)?.attempt_count).toBeGreaterThan(20);
   });
 
   it("keeps non-blocking publication diagnostics on the bounded publish retry", () => {
@@ -1053,6 +1054,121 @@ describe("deterministic supervisor stage gates", () => {
     expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
       stage_id: "implementation",
       reentry_ordinal: 1,
+    });
+  });
+
+  it("ignores the Linear bot PR linkback comment that caused phantom repair feedback", async () => {
+    const fixture = setup("ce/implement@2");
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    moveFixtureToProviderWait(fixture);
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "issue_comment",
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
+        comment: {
+          id: 406,
+          body: "Linked Linear issue OPE-19 to this pull request.",
+          html_url: "https://github.com/owner/repo/pull/1#issuecomment-406",
+          user: { login: "linear-code[bot]" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    expect(activityPublisher.publishActivity).not.toHaveBeenCalled();
+    expect(fixture.db.prepare("SELECT COUNT(*) FROM provider_events").pluck().get()).toBe(0);
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "provider",
+      reentry_ordinal: 0,
+    });
+  });
+
+  it("records an app comment that merely mentions a linear issue in prose as repair feedback", async () => {
+    const fixture = setup("ce/implement@2");
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    moveFixtureToProviderWait(fixture);
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "issue_comment",
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
+        comment: {
+          id: 407,
+          body: "Automated review: the retry loop never terminates; the linked linear issue mentioned a bounded budget. Please fix.",
+          html_url: "https://github.com/owner/repo/pull/1#issuecomment-407",
+          user: { login: "review-helper[bot]" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    // Substantive automated feedback must be recorded as provider evidence and
+    // start a repair round — never silently dropped by keyword heuristics.
+    expect(activityPublisher.publishActivity).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      type: "action",
+      action: "PR comment",
+      parameter: "review-helper[bot]",
+      result: "https://github.com/owner/repo/pull/1#issuecomment-407",
+    }, "issue-1");
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "implementation",
+      reentry_ordinal: 1,
+    });
+  });
+
+  it("ignores a bridge linkback comment self-identified by the linear-linkback marker", async () => {
+    const fixture = setup("ce/implement@2");
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    moveFixtureToProviderWait(fixture);
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "issue_comment",
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
+        comment: {
+          id: 408,
+          body: "<!-- linear-linkback -->\nLinked Linear issue OPE-19 to this pull request.",
+          html_url: "https://github.com/owner/repo/pull/1#issuecomment-408",
+          user: { login: "acme-linear-bridge[bot]" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    expect(activityPublisher.publishActivity).not.toHaveBeenCalled();
+    expect(fixture.db.prepare("SELECT COUNT(*) FROM provider_events").pluck().get()).toBe(0);
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "provider",
+      reentry_ordinal: 0,
     });
   });
 

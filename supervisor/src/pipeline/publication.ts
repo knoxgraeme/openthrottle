@@ -584,6 +584,7 @@ function renderBody(
 
 export function shouldPostLinearEventComment(envelope: PipelinePublicationEnvelope): boolean {
   return envelope.template.name === "selection" ||
+    envelope.template.name === "repair_reentry" ||
     envelope.template.name === "provider_wait" ||
     envelope.template.name === "needs_human" ||
     envelope.template.name === "terminal";

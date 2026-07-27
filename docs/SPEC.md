@@ -87,6 +87,11 @@ Each `openthrottle.pipeline/v1` manifest declares:
   context policy, live-steering flag, credential scopes, produced artifacts,
   and outcome transitions;
 - bounded re-entry and an explicit exhausted outcome where a transition loops.
+  `max_attempts` is enforced only when scheduling a backward/self re-entry;
+  once a repair round is moving forward, the coordinator lets it reach a
+  provider wait or terminal boundary. Per-transition `max_reentries` is the
+  repair-round bound, so a successful unpublished repair is not discarded
+  mid-round by the raw attempt counter.
 
 Allowed outcomes are `success`, `no_change`,
 `semantic_repair_required`, `retryable_infrastructure_failure`, `needs_human`,
@@ -134,6 +139,17 @@ The default implement v2 graph is planning → implementation → semantic revie
 → simplification → test → lint → build → publish → provider. Semantic repair
 returns to implementation within manifest bounds. The investigate v2 graph is
 investigate → conditional publish.
+
+Provider feedback excludes supervisor-authored GitHub summary comments and
+Linear bridge linkback comments; those are publication/linkage artifacts, not
+human repair requests. A linkback is recognized only by the exact bridge bot
+identity (`linear[bot]`, `linear-code[bot]`) or by a bot comment whose body
+starts with the explicit `<!-- linear-linkback -->` marker — never by keyword
+heuristics over untrusted comment bodies, so substantive automated review
+feedback is still recorded as provider evidence. Human PR comments,
+reviews requesting changes, Linear replies during provider waits, and failed
+workflow/check-suite completions for the exact published commit remain
+provider evidence and may start a bounded repair round.
 
 ## Effect and runtime-resource contract
 
