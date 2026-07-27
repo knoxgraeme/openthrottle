@@ -1,8 +1,10 @@
 import Database from "better-sqlite3";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { openDb } from "../database.js";
+import { parsePipelineManifest } from "../../pipeline/manifest.js";
 import { applyDatabaseMigrations, databaseMigrations } from "./runner.js";
 
 let db: Database.Database | undefined;
@@ -44,6 +46,8 @@ describe("database migrations", () => {
       "3ad35a452352b7cd5db98b32ba67b2f6906c465fa263a8396cae4ad09b7a3ab7",
       "1b7f1245f97725dfe081493638283b38fec8f363138fe5b8c4450ba9220ee84c",
       "5a368da3f7ec165fef42cdb27545534372e6344c3283f185e65e5c447a671dee",
+      "927f4e9a8a9583b52fed3f537a364ba4a57c47ea9afa4b9475286e2ec8605b71",
+      "e9a57fd85fbca09daeb1b87dbeab27d9cf696da3cb6e00a4a0ee7652bb72d6e2",
     ]);
   });
 
@@ -194,6 +198,22 @@ describe("database migrations", () => {
         updated_at: "2026-01-01T00:00:00.000Z",
       },
     ]);
+    expect(db.prepare(`
+      SELECT id, actor_state, actor_created_at, actor_updated_at FROM runs ORDER BY id
+    `).all()).toEqual([
+      {
+        id: "legacy-complete",
+        actor_state: "settled",
+        actor_created_at: "2025-01-01T00:00:00.000Z",
+        actor_updated_at: "2025-01-01T00:00:00.000Z",
+      },
+      {
+        id: "legacy-running",
+        actor_state: "running",
+        actor_created_at: "2026-01-01T00:00:00.000Z",
+        actor_updated_at: "2026-01-01T00:00:00.000Z",
+      },
+    ]);
   });
 
   it("backfills pipeline attempt actors from legacy liveness state", () => {
@@ -314,152 +334,212 @@ describe("database migrations", () => {
         quarantine_reason: null,
       },
     ]);
-  });
-
-  it("maps legacy claims conservatively and never invents inbox acknowledgement", () => {
-    db = new Database(":memory:");
-    db.exec(`
-      CREATE TABLE agent_sessions (
-        id TEXT PRIMARY KEY, generation INTEGER NOT NULL, provider_conversation_id TEXT
-      );
-      CREATE TABLE runs (id TEXT PRIMARY KEY, session_generation INTEGER);
-      CREATE TABLE session_work (
-        id TEXT PRIMARY KEY, linear_session_id TEXT NOT NULL, linear_issue_id TEXT NOT NULL,
-        source TEXT NOT NULL, priority INTEGER NOT NULL, body TEXT NOT NULL,
-        status TEXT NOT NULL, claimed_run_id TEXT, available_at TEXT NOT NULL,
-        created_at TEXT NOT NULL, consumed_at TEXT, canceled_at TEXT
-      );
-      CREATE TABLE session_inbox (
-        id TEXT PRIMARY KEY, linear_issue_id TEXT NOT NULL, linear_session_id TEXT NOT NULL,
-        run_id TEXT, source TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL,
-        created_at TEXT NOT NULL, delivered_at TEXT
-      );
-      INSERT INTO agent_sessions VALUES ('session-1', 4, 'native-1');
-      INSERT INTO runs VALUES ('run-1', 4);
-      INSERT INTO session_work VALUES (
-        'work-1', 'session-1', 'issue-1', 'human', 0, 'steer',
-        'claimed', 'run-1', '2026-01-01T00:00:00.000Z',
-        '2026-01-01T00:00:00.000Z', NULL, NULL
-      );
-      INSERT INTO session_inbox VALUES (
-        'work-1', 'issue-1', 'session-1', 'run-1', 'human', 'steer',
-        'delivered', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:01.000Z'
-      );
-    `);
-
-    applyDatabaseMigrations(db);
-
-    expect(db.prepare("SELECT status FROM work_items WHERE id = 'work-1'").get()).toEqual({
-      status: "dispatched",
-    });
-    expect(db.prepare(
-      "SELECT status, acknowledged_at FROM work_deliveries WHERE work_item_id = 'work-1'"
-    ).get()).toEqual({ status: "dispatched", acknowledged_at: null });
-    expect(db.prepare(
-      "SELECT category, row_count FROM migration_reconciliation ORDER BY category"
-    ).all()).toEqual(expect.arrayContaining([
-      { category: "legacy_session_inbox", row_count: 1 },
-      { category: "legacy_session_work", row_count: 1 },
-      { category: "mapped_session_inbox", row_count: 1 },
-      { category: "mapped_session_work", row_count: 1 },
-      { category: "authoritative_work_items", row_count: 1 },
-      { category: "legacy_work_deliveries", row_count: 1 },
-      { category: "operator_reconciliation", row_count: 0 },
-    ]));
-  });
-
-  it("maps every legacy assurance class without upgrading ambiguous evidence", () => {
-    db = new Database(":memory:");
-    db.exec(`
-      CREATE TABLE agent_sessions (
-        id TEXT PRIMARY KEY, generation INTEGER NOT NULL, provider_conversation_id TEXT
-      );
-      CREATE TABLE runs (id TEXT PRIMARY KEY, session_generation INTEGER);
-      CREATE TABLE session_work (
-        id TEXT PRIMARY KEY, linear_session_id TEXT NOT NULL, linear_issue_id TEXT NOT NULL,
-        source TEXT NOT NULL, priority INTEGER NOT NULL, body TEXT NOT NULL,
-        status TEXT NOT NULL, claimed_run_id TEXT, available_at TEXT NOT NULL,
-        created_at TEXT NOT NULL, consumed_at TEXT, canceled_at TEXT
-      );
-      CREATE TABLE session_inbox (
-        id TEXT PRIMARY KEY, linear_issue_id TEXT NOT NULL, linear_session_id TEXT NOT NULL,
-        run_id TEXT, source TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL,
-        created_at TEXT NOT NULL, delivered_at TEXT
-      );
-      INSERT INTO agent_sessions VALUES ('session-1', 3, 'native-1');
-      INSERT INTO runs VALUES ('run-1', 3);
-      INSERT INTO session_work VALUES
-        ('pending', 'session-1', 'issue-1', 'human', 0, 'p', 'pending', NULL, '2026-01-01', '2026-01-01', NULL, NULL),
-        ('claimed', 'session-1', 'issue-1', 'human', 0, 'c', 'claimed', 'run-1', '2026-01-01', '2026-01-01', NULL, NULL),
-        ('consumed', 'session-1', 'issue-1', 'automatic', 10, 'done', 'consumed', 'run-1', '2026-01-01', '2026-01-01', '2026-01-02', NULL),
-        ('unowned-consumed', 'session-1', 'issue-1', 'automatic', 10, 'ambiguous', 'consumed', NULL, '2026-01-01', '2026-01-01', '2026-01-02', NULL),
-        ('canceled', 'session-1', 'issue-1', 'human', 0, 'x', 'canceled', NULL, '2026-01-01', '2026-01-01', NULL, '2026-01-02');
-      INSERT INTO session_inbox VALUES
-        ('inbox-pending', 'issue-1', 'session-1', NULL, 'human', 'ip', 'pending', '2026-01-01', NULL),
-        ('inbox-unbound', 'issue-1', 'session-1', NULL, 'human', 'iu', 'delivered', '2026-01-01', '2026-01-02'),
-        ('inbox-dispatched', 'issue-1', 'session-1', 'run-1', 'human', 'id', 'delivered', '2026-01-01', '2026-01-02');
-    `);
-
-    applyDatabaseMigrations(db);
-
-    expect(db.prepare("SELECT id, status FROM work_items ORDER BY id").all()).toEqual([
-      { id: "canceled", status: "canceled" },
-      { id: "claimed", status: "reconciliation" },
-      { id: "consumed", status: "consumed" },
-      { id: "inbox-dispatched", status: "dispatched" },
-      { id: "inbox-pending", status: "pending" },
-      { id: "inbox-unbound", status: "reconciliation" },
-      { id: "pending", status: "pending" },
-      { id: "unowned-consumed", status: "reconciliation" },
+    expect(db.prepare(`
+      SELECT id, actor_state, last_heartbeat_at, settlement_owner,
+        settlement_reason, termination_confirmed_at, quarantine_reason
+      FROM pipeline_stage_attempts ORDER BY id
+    `).all()).toEqual([
+      {
+        id: "attempt-bound",
+        actor_state: "running",
+        last_heartbeat_at: "2026-01-01T00:00:02.000Z",
+        settlement_owner: null,
+        settlement_reason: null,
+        termination_confirmed_at: null,
+        quarantine_reason: null,
+      },
+      {
+        id: "attempt-planned",
+        actor_state: "reaping",
+        last_heartbeat_at: "2026-01-01T00:00:04.000Z",
+        settlement_owner: "owner-1",
+        settlement_reason: "stalled",
+        termination_confirmed_at: null,
+        quarantine_reason: null,
+      },
+      {
+        id: "attempt-quarantined",
+        actor_state: "quarantined",
+        last_heartbeat_at: "2026-01-01T00:00:06.000Z",
+        settlement_owner: "owner-2",
+        settlement_reason: "stalled",
+        termination_confirmed_at: null,
+        quarantine_reason: "stop unconfirmed",
+      },
+      {
+        id: "attempt-settled",
+        actor_state: "settled",
+        last_heartbeat_at: "2026-01-01T00:00:08.000Z",
+        settlement_owner: "owner-3",
+        settlement_reason: "completed",
+        termination_confirmed_at: "2026-01-01T00:00:09.000Z",
+        quarantine_reason: null,
+      },
     ]);
-    expect(db.prepare(
-      "SELECT consumed_by_attempt_id FROM work_items WHERE id = 'consumed'"
-    ).get()).toEqual({ consumed_by_attempt_id: "run-1" });
-    expect(db.prepare(
-      "SELECT status, acknowledged_at FROM work_deliveries WHERE work_item_id = 'inbox-dispatched'"
-    ).get()).toEqual({ status: "dispatched", acknowledged_at: null });
-    expect(db.prepare(
-      "SELECT row_count FROM migration_reconciliation WHERE category = 'operator_reconciliation'"
-    ).get()).toEqual({ row_count: 3 });
   });
 
-  it("routes colliding legacy identities with different bodies to reconciliation", () => {
-    db = new Database(":memory:");
-    db.exec(`
-      CREATE TABLE agent_sessions (
-        id TEXT PRIMARY KEY, generation INTEGER NOT NULL, provider_conversation_id TEXT
-      );
-      CREATE TABLE runs (id TEXT PRIMARY KEY, session_generation INTEGER);
-      CREATE TABLE session_work (
-        id TEXT PRIMARY KEY, linear_session_id TEXT NOT NULL, linear_issue_id TEXT NOT NULL,
-        source TEXT NOT NULL, priority INTEGER NOT NULL, body TEXT NOT NULL,
-        status TEXT NOT NULL, claimed_run_id TEXT, available_at TEXT NOT NULL,
-        created_at TEXT NOT NULL, consumed_at TEXT, canceled_at TEXT
-      );
-      CREATE TABLE session_inbox (
-        id TEXT PRIMARY KEY, linear_issue_id TEXT NOT NULL, linear_session_id TEXT NOT NULL,
-        run_id TEXT, source TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL,
-        created_at TEXT NOT NULL, delivered_at TEXT
-      );
-      INSERT INTO agent_sessions VALUES ('session-1', 1, 'native-1');
-      INSERT INTO runs VALUES ('run-1', 1);
-      INSERT INTO session_work VALUES (
-        'collision', 'session-1', 'issue-1', 'human', 0, 'original body',
-        'claimed', 'run-1', '2026-01-01', '2026-01-01', NULL, NULL
-      );
-      INSERT INTO session_inbox VALUES (
-        'collision', 'issue-1', 'session-1', 'run-1', 'human', 'different body',
-        'delivered', '2026-01-01', '2026-01-02'
-      );
-    `);
+  it("backfills missing selection publications from the migration ledger", () => {
+    db = openDb(":memory:");
+    db.prepare("DELETE FROM schema_migrations WHERE version >= 13").run();
+    const now = "2026-01-01T00:00:00.000Z";
+    const manifest = parsePipelineManifest(readFileSync(
+      join(process.cwd(), "src/__fixtures__/pipelines/command-fixture-v1.yaml"),
+      "utf8"
+    ));
+    db.prepare(`
+      INSERT INTO tickets (
+        linear_issue_id, linear_issue_identifier, linear_session_id, branch, agent,
+        repo, state, base_branch, created_at, updated_at
+      ) VALUES (
+        'issue-selection', 'OPE-SELECT', 'session-selection', 'ot/issue-selection',
+        'codex', 'owner/repo', 'active', 'main', ?, ?
+      )
+    `).run(now, now);
+    db.prepare(`
+      INSERT INTO agent_sessions (
+        id, linear_issue_id, generation, state, provider_conversation_id,
+        created_at, updated_at
+      ) VALUES (
+        'session-selection', 'issue-selection', 1, 'current', NULL, ?, ?
+      )
+    `).run(now, now);
+    db.prepare(`
+      INSERT INTO pipeline_catalog_entries (
+        pipeline_id, version, digest, normalized_manifest, accepted_at
+      ) VALUES (?, ?, ?, ?, ?)
+    `).run(manifest.manifest.id, manifest.manifest.version, manifest.digest, manifest.normalized, now);
+    db.prepare(`
+      INSERT INTO runtime_capability_descriptors (
+        runtime_release, digest, protocol, normalized_descriptor, accepted_at
+      ) VALUES ('runtime-v1', 'capability-digest', 'openthrottle-stage-request/v1', '{"capabilities":[]}', ?)
+    `).run(now);
+    db.prepare(`
+      INSERT INTO repository_config_snapshots (
+        id, repository, base_commit, blob_sha, digest, normalized_config, created_at
+      ) VALUES ('config-selection', 'owner/repo', ?, 'blob-selection', 'config-digest', '{}', ?)
+    `).run("a".repeat(40), now);
+    db.prepare(`
+      INSERT INTO pipeline_instances (
+        id, linear_issue_id, linear_session_id, generation, pipeline_id, pipeline_version,
+        manifest_digest, normalized_manifest, repository, base_commit,
+        repository_config_snapshot_id, repository_config_digest, runtime_release,
+        capability_digest, executor_protocol, authorized_capabilities, status,
+        active_stage_id, wait_reason, created_at, updated_at, branch, agent,
+        task_type, base_branch
+      ) VALUES (
+        'instance-selection', 'issue-selection', 'session-selection', 1,
+        ?, ?, ?, ?,
+        'owner/repo', ?, 'config-selection', 'config-digest', 'runtime-v1',
+        'capability-digest', 'openthrottle-stage-request/v1', '[]',
+        'dispatchable', NULL, NULL, ?, ?, 'ot/issue-selection', 'codex',
+        'implement', 'main'
+      )
+    `).run(
+      manifest.manifest.id,
+      manifest.manifest.version,
+      manifest.digest,
+      manifest.normalized,
+      "a".repeat(40),
+      now,
+      now
+    );
 
     applyDatabaseMigrations(db);
 
-    expect(db.prepare("SELECT status FROM work_items WHERE id = 'collision'").get()).toEqual({
-      status: "reconciliation",
+    expect(db.prepare(`
+      SELECT kind FROM pipeline_publication_receipts
+      WHERE pipeline_instance_id = 'instance-selection'
+      ORDER BY kind
+    `).all()).toEqual([
+      { kind: "github_summary" },
+      { kind: "linear_ledger" },
+    ]);
+  });
+
+  it("contracts satellite table data onto owner rows", () => {
+    db = openDb(":memory:");
+    db.prepare("DELETE FROM schema_migrations WHERE version >= 14").run();
+    const now = "2026-01-01T00:00:00.000Z";
+    db.prepare(`
+      INSERT INTO tickets (
+        linear_issue_id, linear_issue_identifier, linear_session_id, branch, agent,
+        repo, state, base_branch, created_at, updated_at
+      ) VALUES (
+        'issue-contract', 'OPE-CONTRACT', 'session-contract', 'ot/issue-contract',
+        'codex', 'owner/repo', 'active', 'main', ?, ?
+      )
+    `).run(now, now);
+    db.prepare(`
+      INSERT INTO agent_sessions (
+        id, linear_issue_id, generation, state, provider_conversation_id,
+        created_at, updated_at, execution_mode, pipeline_instance_id
+      ) VALUES (
+        'session-contract', 'issue-contract', 1, 'current', NULL, ?, ?,
+        NULL, NULL
+      )
+    `).run(now, now);
+    db.prepare(`
+      INSERT INTO pipeline_catalog_entries (
+        pipeline_id, version, digest, normalized_manifest, accepted_at
+      ) VALUES ('fixture/command', 1, ?, '{}', ?)
+    `).run("a".repeat(64), now);
+    db.prepare(`
+      INSERT INTO runtime_capability_descriptors (
+        runtime_release, digest, protocol, normalized_descriptor, accepted_at
+      ) VALUES ('runtime-v1', 'capability-digest', 'openthrottle-stage-request/v1', '{"capabilities":[]}', ?)
+    `).run(now);
+    db.prepare(`
+      INSERT INTO repository_config_snapshots (
+        id, repository, base_commit, blob_sha, digest, normalized_config, created_at
+      ) VALUES ('config-contract', 'owner/repo', ?, 'blob-contract', 'config-digest', '{}', ?)
+    `).run("a".repeat(40), now);
+    db.prepare(`
+      INSERT INTO pipeline_instances (
+        id, linear_issue_id, linear_session_id, generation, pipeline_id, pipeline_version,
+        manifest_digest, normalized_manifest, repository, base_commit,
+        repository_config_snapshot_id, repository_config_digest, runtime_release,
+        capability_digest, executor_protocol, authorized_capabilities, status,
+        active_stage_id, wait_reason, created_at, updated_at, branch, agent,
+        task_type, base_branch, runtime_provider, runtime_provider_resource_id,
+        runtime_resource_status, runtime_resource_created_at, runtime_resource_updated_at
+      ) VALUES (
+        'instance-contract', 'issue-contract', 'session-contract', 1,
+        'fixture/command', 1, ?, '{}',
+        'owner/repo', ?, 'config-contract', 'config-digest', 'runtime-v1',
+        'capability-digest', 'openthrottle-stage-request/v1', '[]',
+        'dispatchable', NULL, NULL, ?, ?, 'ot/issue-contract', 'codex',
+        'implement', 'main', NULL, NULL, NULL, NULL, NULL
+      )
+    `).run("a".repeat(64), "a".repeat(40), now, now);
+    db.prepare(`
+      INSERT INTO session_executions (
+        linear_session_id, linear_issue_id, generation, execution_mode,
+        pipeline_instance_id, pinned_at
+      ) VALUES (
+        'session-contract', 'issue-contract', 1, 'pipeline', 'instance-contract', ?
+      )
+    `).run(now);
+    db.prepare(`
+      INSERT INTO pipeline_runtime_resources (
+        pipeline_instance_id, provider, provider_resource_id, status, created_at, updated_at
+      ) VALUES ('instance-contract', 'daytona', 'sandbox-contract', 'active', ?, ?)
+    `).run(now, now);
+
+    applyDatabaseMigrations(db);
+
+    expect(db.prepare(`
+      SELECT execution_mode, pipeline_instance_id FROM agent_sessions WHERE id = 'session-contract'
+    `).get()).toEqual({
+      execution_mode: "pipeline",
+      pipeline_instance_id: "instance-contract",
     });
-    expect(db.prepare(
-      "SELECT COUNT(*) AS count FROM work_deliveries WHERE work_item_id = 'collision'"
-    ).get()).toEqual({ count: 0 });
+    expect(db.prepare(`
+      SELECT runtime_provider, runtime_provider_resource_id, runtime_resource_status
+      FROM pipeline_instances WHERE id = 'instance-contract'
+    `).get()).toEqual({
+      runtime_provider: "daytona",
+      runtime_provider_resource_id: "sandbox-contract",
+      runtime_resource_status: "active",
+    });
   });
 });

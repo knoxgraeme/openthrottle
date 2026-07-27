@@ -18,7 +18,7 @@ import {
 } from "./manifest.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import type { PipelineInstance, PipelineInstanceStage, PipelineStageAttempt } from "./store.js";
-import { buildInstalledRuntimeDescriptor } from "../runtime/contracts.js";
+import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
 const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
@@ -291,34 +291,32 @@ describe("pipeline coordinator", () => {
   });
 
   it("enforces bounded repair and uses explicit on_exhausted policy", () => {
-    const { manifest, instance, attempt, stages } = setup("ce/implement@2");
+    const { manifest, instance, attempt, stages } = setup("core/implement@4");
     const repair = event(instance, attempt, "semantic_repair_required", "repair-event");
     const allowed = reducePipelineEvent({
       manifest,
       instance: { ...instance, reentry_count: 2 },
       attempt,
-      stages: stages.map((stage) => ({ ...stage, reentry_count: stage.stage_id === "planning" ? 2 : stage.reentry_count })),
+      stages: stages.map((stage) => ({ ...stage, reentry_count: stage.stage_id === "implementation" ? 2 : stage.reentry_count })),
       event: repair,
     });
-    expect(allowed.nextStageId).toBe("planning");
+    expect(allowed.nextStageId).toBe("implementation");
     expect(allowed.nextAttempt?.reentryOrdinal).toBe(3);
 
     const exhausted = reducePipelineEvent({
       manifest,
-      instance: { ...instance, reentry_count: 3 },
+      instance: { ...instance, reentry_count: 8 },
       attempt,
-      stages: stages.map((stage) => ({ ...stage, reentry_count: stage.stage_id === "planning" ? 3 : stage.reentry_count })),
+      stages: stages.map((stage) => ({ ...stage, reentry_count: stage.stage_id === "implementation" ? 8 : stage.reentry_count })),
       event: repair,
     });
     expect(exhausted.nextStatus).toBe("completion_pending_publication");
-    expect(exhausted.terminalOutcome).toBe("needs_human");
+    expect(exhausted.terminalOutcome).toBe("failed");
     expect(exhausted.nextAttempt).toBeUndefined();
-    expect(exhausted.effects.map((effect) => effect.kind)).toEqual(["publish_linear", "cleanup"]);
-    expect(exhausted.effects[1]).toMatchObject({
-      idempotencyKey: `cleanup:${instance.id}:needs_human`,
+    expect(exhausted.effects.map((effect) => effect.kind)).toEqual(["publish_linear", "stop", "cleanup"]);
+    expect(exhausted.effects[2]).toMatchObject({
+      idempotencyKey: `cleanup:${instance.id}:failed`,
     });
-    expect(JSON.parse(exhausted.effects[1].payload).preserve).toBe(true);
-
     const attemptsExhausted = reducePipelineEvent({
       manifest,
       instance: { ...instance, attempt_count: manifest.max_attempts },
@@ -334,7 +332,7 @@ describe("pipeline coordinator", () => {
   });
 
   it("does not exhaust the raw attempt budget in the middle of a forward repair round", () => {
-    const { manifest, instance, attempt, stages } = setup("ce/implement@2");
+    const { manifest, instance, attempt, stages } = setup("core/implement@4");
     const repairedImplementation = reducePipelineEvent({
       manifest,
       instance: {
@@ -369,7 +367,7 @@ describe("pipeline coordinator", () => {
   });
 
   it("skips post-simplify review when simplification reports no change", () => {
-    const { manifest, instance, attempt, stages } = setup("core/implement@3");
+    const { manifest, instance, attempt, stages } = setup("core/implement@4");
     const write = reduceActiveAgentStage({
       manifest,
       instance,
@@ -390,7 +388,7 @@ describe("pipeline coordinator", () => {
   });
 
   it("runs post-simplify review after simplification changes and routes repairs to implementation", () => {
-    const { manifest, instance, attempt, stages } = setup("core/implement@3");
+    const { manifest, instance, attempt, stages } = setup("core/implement@4");
     const afterSimplify = reduceActiveAgentStage({
       manifest,
       instance,
@@ -419,10 +417,10 @@ describe("pipeline coordinator", () => {
       artifacts: ["stage_result", "review"],
     });
 
-    expect(repair.nextStageId).toBe("implementation");
+    expect(repair.nextStageId).toBe("repair_implementation");
     expect(repair.reentryIncrement).toBe(1);
     expect(repair.nextAttempt).toMatchObject({
-      stageId: "implementation",
+      stageId: "repair_implementation",
       reentryOrdinal: 1,
     });
   });
@@ -508,7 +506,7 @@ describe("pipeline coordinator", () => {
   });
 
   it("persists a complete immutable request for a repair attempt", () => {
-    const { pipelines, instance, attempt } = setup("ce/implement@2");
+    const { pipelines, instance, attempt } = setup("core/implement@4");
     const input = event(instance, attempt, "semantic_repair_required", "repair-request");
     const payload = JSON.stringify({
       id: "repair-request",
@@ -529,7 +527,7 @@ describe("pipeline coordinator", () => {
     const request = pipelines.getStageRequest(next.id);
     expect(request).toMatchObject({
       pipelineInstanceId: instance.id,
-      stageId: "planning",
+      stageId: "implementation",
       attemptId: next.id,
       runId: next.planned_run_id,
       requestHash: next.request_hash,
@@ -551,7 +549,7 @@ describe("pipeline coordinator", () => {
   });
 
   it("cannot enter provider wait until the publishing stage establishes an exact subject", () => {
-    const { manifest, instance, attempt, stages } = setup("ce/implement@2");
+    const { manifest, instance, attempt, stages } = setup("core/implement@4");
     const publishAttempt = {
       ...attempt,
       id: "publish-attempt",
@@ -596,7 +594,7 @@ describe("pipeline coordinator", () => {
   });
 
   it("idles the sandbox when a publish transition enters provider wait", () => {
-    const { manifest, instance, attempt, stages } = setup("ce/implement@2");
+    const { manifest, instance, attempt, stages } = setup("core/implement@4");
     const publishAttempt = {
       ...attempt,
       id: "publish-attempt",
@@ -655,7 +653,7 @@ describe("pipeline coordinator", () => {
   });
 
   it("turns a current-head provider snapshot into a bounded typed repair re-entry", () => {
-    const { manifest, instance, attempt, stages } = setup("ce/implement@2");
+    const { manifest, instance, attempt, stages } = setup("core/implement@4");
     const providerAttempt = {
       ...attempt,
       id: "provider-attempt",
@@ -706,7 +704,7 @@ describe("pipeline coordinator", () => {
         ],
       },
     });
-    expect(write.nextStageId).toBe("implementation");
+    expect(write.nextStageId).toBe("repair_implementation");
     expect(write.nextStatus).toBe("dispatchable");
     expect(write.reentryIncrement).toBe(1);
   });

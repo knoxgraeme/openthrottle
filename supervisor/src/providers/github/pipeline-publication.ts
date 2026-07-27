@@ -5,7 +5,7 @@ import {
   renderGithubPipelineSummary,
 } from "../../pipeline/publication.js";
 import type { PipelinePublicationReceipt, PipelineStore } from "../../pipeline/store.js";
-import { sanitizeText } from "../../shared/sanitize.js";
+import { classifyPermanentFailure, exponentialBackoffDelayMs } from "../../shared/backoff.js";
 
 export interface GithubPublicationProcessor {
   process(id: string): Promise<void>;
@@ -17,15 +17,10 @@ interface GithubPublicationTicketStore {
 }
 
 function githubRetry(error: unknown): { retry: boolean; message: string } {
-  const message = sanitizeText(String(error)).slice(-2_000);
-  return {
-    retry: !/unauthorized|forbidden|invalid|API error \((?:400|401|403|404|422)\)/i.test(message),
-    message,
-  };
-}
-
-function publicationRetryDelay(attempts: number): number {
-  return Math.min(5 * 60_000, 2 ** Math.max(0, attempts - 1) * 5_000);
+  return classifyPermanentFailure(
+    error,
+    /unauthorized|forbidden|invalid|API error \((?:400|401|403|404|422)\)/i
+  );
 }
 
 export function createGithubPublicationProcessor(params: {
@@ -116,7 +111,7 @@ export function createGithubPublicationProcessor(params: {
           publication.payload_hash,
           classified.message,
           classified.retry
-            ? new Date(Date.now() + publicationRetryDelay(publication.attempts)).toISOString()
+            ? new Date(Date.now() + exponentialBackoffDelayMs(publication.attempts)).toISOString()
             : null
         );
       }

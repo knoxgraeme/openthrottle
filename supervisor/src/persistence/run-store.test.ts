@@ -80,16 +80,16 @@ describe("run store", () => {
     expect(store.renewRunLiveness(runId, "2026-07-22T10:00:00.000Z")).toBe(true);
 
     expect(db.prepare(`
-      SELECT attempt_id, run_id, actor_state, last_heartbeat_at
-      FROM pipeline_attempt_actors WHERE run_id = ?
+      SELECT id, planned_run_id, actor_state, last_heartbeat_at
+      FROM pipeline_stage_attempts WHERE planned_run_id = ?
     `).get(runId)).toEqual({
-      attempt_id: attempt.id,
-      run_id: runId,
+      id: attempt.id,
+      planned_run_id: runId,
       actor_state: "running",
       last_heartbeat_at: "2026-07-22T10:00:00.000Z",
     });
-    expect(db.prepare("SELECT COUNT(*) AS count FROM run_liveness WHERE run_id = ?").get(runId))
-      .toEqual({ count: 0 });
+    expect(db.prepare("SELECT actor_state FROM runs WHERE id = ?").get(runId))
+      .toEqual({ actor_state: "running" });
   });
 
   it("lists a stalled run through its pipeline attempt actor", () => {
@@ -121,10 +121,9 @@ describe("run store", () => {
       tokenHash: "c".repeat(64),
       expiresAt: "2026-07-23T00:00:00.000Z",
     })).toBe(true);
-    // The run has no legacy liveness row, so only the pipeline_attempt_actors
-    // branch of the stall query can surface it to the reaper.
-    expect(db.prepare("SELECT COUNT(*) AS count FROM run_liveness WHERE run_id = ?").get(runId))
-      .toEqual({ count: 0 });
+    // The owner-row actor state is the only stall source used by the reaper.
+    expect(db.prepare("SELECT actor_state FROM pipeline_stage_attempts WHERE planned_run_id = ?").get(runId))
+      .toEqual({ actor_state: "running" });
 
     expect(store.renewRunLiveness(runId, "2026-07-22T10:00:00.000Z")).toBe(true);
     expect(store.listStalledRuns("2026-07-22T10:00:00.000Z").map((run) => run.id)).toEqual([runId]);
@@ -135,7 +134,7 @@ describe("run store", () => {
     expect(store.listStalledRuns("2026-07-22T10:00:00.000Z")).toEqual([]);
   });
 
-  it("keeps legacy direct-run liveness as a compatibility fallback", () => {
+  it("keeps direct-run liveness on the run row", () => {
     expect(store.beginRun({
       issueId: "issue-1",
       runId: "run-direct",
@@ -145,10 +144,8 @@ describe("run store", () => {
     })).toBe(true);
     expect(store.renewRunLiveness("run-direct", "2026-07-22T10:00:00.000Z")).toBe(true);
 
-    expect(db.prepare("SELECT COUNT(*) AS count FROM pipeline_attempt_actors WHERE run_id = 'run-direct'").get())
-      .toEqual({ count: 0 });
     expect(db.prepare(`
-      SELECT actor_state, last_heartbeat_at FROM run_liveness WHERE run_id = 'run-direct'
+      SELECT actor_state, last_heartbeat_at FROM runs WHERE id = 'run-direct'
     `).get()).toEqual({
       actor_state: "running",
       last_heartbeat_at: "2026-07-22T10:00:00.000Z",

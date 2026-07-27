@@ -94,7 +94,7 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
     exit 1
   fi
   install -d -o root -g root -m 0755 /run/openthrottle
-  printf "fresh_review\n" > /run/openthrottle/stage-push-policy
+  printf "fresh\n" > /run/openthrottle/stage-push-policy
   chmod 0644 /run/openthrottle/stage-push-policy
   if /opt/openthrottle/safety/enforce-stage-push-policy; then
     echo "mutable default push policy unexpectedly passed" >&2
@@ -333,7 +333,7 @@ run_stage_smoke() {
       import { digest } from "/opt/openthrottle/runner/artifacts.mjs";
       import { createStageRequestHash } from "/opt/openthrottle/runner/execute-stage.mjs";
       const commandStage = process.env.STAGE_KIND === "command";
-      const reviewStage = process.env.STAGE_KIND.startsWith("fresh_review");
+      const reviewStage = process.env.STAGE_KIND.startsWith("fresh");
       const config = {
         agent: process.env.STAGE_AGENT,
         ...(commandStage ? { test: "true" } : { model: "kimi-code/kimi-for-coding" }),
@@ -360,7 +360,7 @@ run_stage_smoke() {
           evaluator: commandStage
             ? { kind: "command", assurance: "executor_verified", required_artifacts: ["command_result"] }
             : { kind: "semantic", assurance: "semantic_attested", required_artifacts: ["stage_result"] },
-          context: commandStage ? "none" : reviewStage ? "fresh_review" : "fresh",
+          context: commandStage ? "none" : reviewStage ? "fresh" : "fresh",
           live_steering: !commandStage,
           credentials: credentialScopes,
           produces: requiredArtifacts,
@@ -392,7 +392,7 @@ run_stage_smoke() {
         agent: process.env.STAGE_AGENT,
         contextRevision: 0,
         expectedSubject: process.env.STAGE_TREE,
-        contextPolicy: commandStage ? "none" : reviewStage ? "fresh_review" : "fresh",
+        contextPolicy: commandStage ? "none" : reviewStage ? "fresh" : "fresh",
         nativeSessionId: null,
         capability,
         requiredArtifacts,
@@ -440,9 +440,9 @@ run_stage_smoke() {
   elif [[ "$stage_kind" != "command" ]]; then
     stage_env+=(-e KIMI_CODE_API_KEY=kimi-smoke-secret)
   fi
-  if [[ "$stage_kind" == fresh_review* ]]; then
+  if [[ "$stage_kind" == fresh* ]]; then
     stage_env+=(-e OT_SMOKE_EXPECT_FRESH_REVIEW=1)
-    if [[ "$stage_kind" == "fresh_review_failure" ]]; then
+    if [[ "$stage_kind" == "fresh_failure" ]]; then
       stage_env+=(-e OT_SMOKE_EXPECT_EXECUTOR_FAILURE=1)
     fi
   elif [[ "$stage_kind" == post_* ]]; then
@@ -454,18 +454,18 @@ run_stage_smoke() {
   else
     docker "${docker_args[@]}" "${stage_env[@]}" "$IMAGE" || stage_failed=$?
   fi
-  if [[ "$stage_failed" -ne 0 && "$stage_kind" != "fresh_review_failure" ]]; then
+  if [[ "$stage_failed" -ne 0 && "$stage_kind" != "fresh_failure" ]]; then
     echo "stage container failed for ${agent}/${stage_kind}" >&2
     if [[ -f "$home_dir/.ot/task.log" ]]; then
       tail -n 200 "$home_dir/.ot/task.log" >&2
     fi
     return 1
-  elif [[ "$stage_failed" -eq 0 && "$stage_kind" == "fresh_review_failure" ]]; then
+  elif [[ "$stage_failed" -eq 0 && "$stage_kind" == "fresh_failure" ]]; then
     echo "failure-path fresh review unexpectedly succeeded" >&2
     return 1
   fi
 
-  if [[ "$stage_kind" == "fresh_review_failure" ]]; then
+  if [[ "$stage_kind" == "fresh_failure" ]]; then
     test "$(git -c "safe.directory=$home_dir/repo" -C "$home_dir/repo" branch --show-current)" = "$branch"
     docker run --rm --entrypoint gosu -v "$home_dir:/home/agent" "$IMAGE" \
       agent sh -c 'test -w /home/agent/repo/package.json && grep -Fq '\''"name":"smoke"'\'' /home/agent/repo/package.json'
@@ -478,12 +478,12 @@ run_stage_smoke() {
   restore_host_ownership "$state_dir"
 
   test "$(git -c "safe.directory=$home_dir/repo" -C "$home_dir/repo" branch --show-current)" = "$branch"
-  if [[ "$stage_kind" == fresh_review* ]] &&
+  if [[ "$stage_kind" == fresh* ]] &&
       git --git-dir "$SMOKE_DIR/repo.git" show-ref --verify --quiet "refs/heads/$branch"; then
     echo "fresh-review smoke moved the remote branch" >&2
     exit 1
   fi
-  if [[ "$stage_kind" == fresh_review* ]]; then
+  if [[ "$stage_kind" == fresh* ]]; then
     docker run --rm --entrypoint gosu -v "$home_dir:/home/agent" "$IMAGE" \
       agent sh -c 'test -w /home/agent/repo/package.json && grep -Fq '\''"name":"smoke"'\'' /home/agent/repo/package.json'
   fi
@@ -491,13 +491,13 @@ run_stage_smoke() {
   local result="$state_dir/stage-results/$attempt_id.json"
   if ! jq -e --arg attempt "$attempt_id" --arg run "$run_id" --arg stageKind "$stage_kind" '
     .kind == "stage_result" and .attempt_id == $attempt and .run_id == $run and
-    .outcome == (if $stageKind == "fresh_review" then "semantic_repair_required" else "success" end) and
+    .outcome == (if $stageKind == "fresh" then "semantic_repair_required" else "success" end) and
     (if $stageKind == "command" then
       (.artifacts | length == 2) and all(.artifacts[]; .assurance == "executor_verified")
     else
       (.artifacts | length == 1) and
       all(.artifacts[]; .assurance == "semantic_attested" and
-        (.payload | fromjson | .result == (if $stageKind == "fresh_review" then "semantic_repair_required" else "success" end)))
+        (.payload | fromjson | .result == (if $stageKind == "fresh" then "semantic_repair_required" else "success" end)))
     end)
   ' "$result" >/dev/null; then
     echo "invalid normalized stage result for $agent" >&2
@@ -525,12 +525,12 @@ run_stage_smoke claude "$CLAUDE_HOME"
 # First stage in a fresh sandbox pays the bake-once bootstrap and seals the
 # digest-fenced completion marker.
 assert_claude_stage_log "bake-once bootstrap complete (config digest"
-run_stage_smoke claude "$CLAUDE_HOME" fresh_review
+run_stage_smoke claude "$CLAUDE_HOME" fresh
 # Second stage in the same sandbox must skip the bootstrap (and say so).
 assert_claude_stage_log "bake-once bootstrap already complete (config digest"
 run_stage_smoke claude "$CLAUDE_HOME" post_review
 assert_claude_stage_log "bake-once bootstrap already complete (config digest"
-run_stage_smoke claude "$CLAUDE_HOME" fresh_review_failure
+run_stage_smoke claude "$CLAUDE_HOME" fresh_failure
 run_stage_smoke claude "$CLAUDE_HOME" post_failure
 run_stage_smoke codex "$CODEX_HOME"
 run_stage_smoke opencode "$OPENCODE_HOME"

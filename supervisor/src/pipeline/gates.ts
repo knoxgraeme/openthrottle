@@ -455,15 +455,6 @@ export function evaluateStageGate(
   };
 }
 
-export function processStageEvidence(
-  store: PipelineStore,
-  event: PipelineCoordinatorEvent,
-  options: { observedSubject?: string; faultAfterWrite?: (writeCount: number) => void } = {}
-): PipelineInstance {
-  const evaluated = evaluateStageGate(store, event, options);
-  return coordinatePipelineEvent(store, evaluated.event, options.faultAfterWrite, evaluated.receipt);
-}
-
 function providerGateReceipt(
   instance: PipelineInstance,
   attempt: PipelineStageAttempt,

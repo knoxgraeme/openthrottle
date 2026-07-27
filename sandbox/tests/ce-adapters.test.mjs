@@ -49,12 +49,9 @@ describe("OpenThrottle canonical task skills", () => {
     expect(existsSync(resolve(repoRoot, "supervisor/src/scheduler.ts"))).toBe(false);
   });
 
-  it("keeps CE v2 execution policies aligned with installed stage contracts", () => {
-    const implement = readFileSync(resolve(repoRoot, "supervisor/pipelines/ce-implement-v2.yaml"), "utf8");
-    const investigate = readFileSync(resolve(repoRoot, "supervisor/pipelines/ce-investigate-v2.yaml"), "utf8");
-    expect(implement).toMatch(
-      /id: planning[\s\S]*?executor: \{ kind: agent, capability: ce\/plan@1 \}[\s\S]*?context: fresh_review/
-    );
+  it("keeps core execution policies aligned with installed stage contracts", () => {
+    const implement = readFileSync(resolve(repoRoot, "supervisor/pipelines/core-implement-v4.yaml"), "utf8");
+    const investigate = readFileSync(resolve(repoRoot, "supervisor/pipelines/core-investigate-v1.yaml"), "utf8");
     expect(implement).toMatch(
       /id: implementation[\s\S]*?credentials: \[model\.invoke, provider\.read, repo\.read, repo\.write\]/
     );
@@ -134,7 +131,7 @@ describe("OpenThrottle canonical task skills", () => {
 
   it("implement-plan keeps the plan gate, decision gate, and assumptions ledger", () => {
     const body = skillBody("implement-plan");
-    expect(body).toContain("Missing or materially ambiguous acceptance criteria");
+    expect(body).toContain("approved plan does not settle");
     expect(body).toContain("needs_human");
     expect(body).toContain("Assumptions & decisions");
     expect(body).toContain(
@@ -154,9 +151,10 @@ describe("OpenThrottle canonical task skills", () => {
 
   it("documents every CE manifest stage and the sealed command/provider boundaries", () => {
     const body = skillBody("implement-plan");
-    for (const stage of ["planning", "implementation", "semantic_review", "simplification", "post_simplify_review", "publish"]) {
+    for (const stage of ["implementation", "semantic_review", "simplification", "post_simplify_review", "publish"]) {
       expect(body).toContain(stage);
     }
+    expect(body).not.toContain("`planning` / `ce/plan@1`");
     expect(body).toMatch(/separate sealed command\s+stages/);
     expect(body).toContain("supervisor-owned stage");
   });

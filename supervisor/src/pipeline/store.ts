@@ -53,6 +53,11 @@ export interface PipelineInstance {
   capability_digest: string;
   executor_protocol: string;
   authorized_capabilities: string;
+  runtime_provider: string | null;
+  runtime_provider_resource_id: string | null;
+  runtime_resource_status: PipelineRuntimeResource["status"] | null;
+  runtime_resource_created_at: string | null;
+  runtime_resource_updated_at: string | null;
   status: PipelineInstanceStatus;
   active_stage_id: string | null;
   wait_reason: string | null;
@@ -85,6 +90,14 @@ export interface PipelineStageAttempt {
   result_hash: string | null;
   started_at: string | null;
   completed_at: string | null;
+  actor_state: "running" | "reaping" | "quarantined" | "settled" | null;
+  last_heartbeat_at: string | null;
+  settlement_owner: string | null;
+  settlement_reason: string | null;
+  termination_confirmed_at: string | null;
+  quarantine_reason: string | null;
+  actor_created_at: string | null;
+  actor_updated_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -104,7 +117,7 @@ export interface PipelineEffectIntent {
   id: string;
   pipeline_instance_id: string;
   transition_version: number;
-  kind: "provision" | "bootstrap" | "dispatch_stage" | "idle" | "stop" | "quarantine" | "cleanup" | "publish_linear" | "publish_github" | "publish_pr";
+  kind: "provision" | "dispatch_stage" | "idle" | "stop" | "quarantine" | "cleanup" | "publish_linear" | "publish_github";
   idempotency_key: string;
   payload: string;
   payload_hash: string;
@@ -235,10 +248,10 @@ export interface CoordinatorEffectWrite {
 
 export interface CoordinatorGateReceiptWrite {
   id?: string;
-  evaluatorKind: "result" | "semantic" | "command" | "provider" | "human" | "publish_subject";
+  evaluatorKind: "semantic" | "command" | "provider" | "human" | "publish_subject";
   policyDigest: string;
   subject?: string | null;
-  result: "passed" | "failed" | "indeterminate" | "skipped" | "not_configured";
+  result: "passed" | "failed" | "indeterminate" | "not_configured";
   artifactHashes: string[];
   payload: string;
   hash: string;

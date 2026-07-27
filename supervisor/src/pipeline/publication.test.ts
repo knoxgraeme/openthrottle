@@ -25,13 +25,14 @@ import {
 } from "./publication.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { createPipelinePublicationWriter } from "../persistence/pipeline/helpers.js";
+import type { LinearOutboxRecord } from "../persistence/delivery-store.js";
 import type {
   CoordinatorGateReceiptWrite,
   PipelineInstance,
   PipelineStageAttempt,
   PipelineStore,
 } from "./store.js";
-import { buildInstalledRuntimeDescriptor } from "../runtime/contracts.js";
+import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
 const runtime = buildInstalledRuntimeDescriptor("publication-test/v1");
@@ -44,6 +45,12 @@ describe("pipeline publication", () => {
     db = undefined;
     vi.restoreAllMocks();
   });
+
+  const getLinearOutbox = (id: string): LinearOutboxRecord | undefined =>
+    db!.prepare("SELECT * FROM linear_outbox WHERE id = ?").get(id) as LinearOutboxRecord | undefined;
+
+  const listLinearOutbox = (): LinearOutboxRecord[] =>
+    db!.prepare("SELECT * FROM linear_outbox ORDER BY created_at, sequence").all() as LinearOutboxRecord[];
 
   function setup(manifestKey = "fixture/command@1"): {
     tickets: SupervisorStore;
@@ -314,14 +321,14 @@ describe("pipeline publication", () => {
       store: tickets,
       getLinearClient: async () => ({ accessToken: "oauth", fetch: fetchImpl }),
     });
-    const selection = tickets.listLinearOutbox().find((row) => row.kind === "pipeline_receipt")!;
+    const selection = listLinearOutbox().find((row) => row.kind === "pipeline_receipt")!;
     await processor.process(selection.id);
     return processor;
   }
 
-  function issueStateRows(tickets: SupervisorStore) {
+  function issueStateRows() {
     const order = new Map([["started", 0], ["review", 1], ["completed", 2]]);
-    return tickets.listLinearOutbox()
+    return listLinearOutbox()
       .filter((row) => row.kind === "issue_state")
       .map((row) => {
         const payload = JSON.parse(row.payload) as { signal: string; issueId: string };
@@ -360,7 +367,7 @@ describe("pipeline publication", () => {
       id,
       executor: { kind: "agent", capability: "agent/semantic@1" },
       evaluator: { kind: "semantic", assurance: "semantic_attested", required_artifacts: ["review"] },
-      context: "fresh_review",
+      context: "fresh",
       live_steering: false,
       credentials: ["model.invoke", "repo.read"],
       produces: ["review", "stage_result"],
@@ -1225,13 +1232,13 @@ describe("pipeline publication", () => {
       store: tickets,
       getLinearClient: async () => ({ accessToken: "oauth", fetch: fetchMock }),
     });
-    const status = tickets.listLinearOutbox().find((row) => row.kind === "pipeline_status")!;
+    const status = listLinearOutbox().find((row) => row.kind === "pipeline_status")!;
 
     await processor.process(status.id);
     expect(calls.filter((call) => call.startsWith("create:"))).toHaveLength(1);
     expect(calls.find((call) => call.startsWith("create:"))).toContain(`create:${status.id}:`);
     expect(calls.find((call) => call.startsWith("create:"))).not.toContain("<!-- openthrottle:pipeline-status:issue-1 -->");
-    expect(tickets.getLinearOutbox(status.id)).toMatchObject({
+    expect(getLinearOutbox(status.id)).toMatchObject({
       status: "processed",
       external_id: "status-comment",
       external_url: "https://linear.test/comment/status",
@@ -1239,8 +1246,8 @@ describe("pipeline publication", () => {
 
     const input = event(instance, attempt, "fresh stage accepted");
     coordinatePipelineEvent(pipelines, input.event, undefined, input.receipt);
-    expect(tickets.listLinearOutbox().filter((row) => row.kind === "pipeline_status")).toHaveLength(1);
-    expect(tickets.getLinearOutbox(status.id)).toMatchObject({
+    expect(listLinearOutbox().filter((row) => row.kind === "pipeline_status")).toHaveLength(1);
+    expect(getLinearOutbox(status.id)).toMatchObject({
       status: "pending",
       external_id: "status-comment",
     });
@@ -1251,7 +1258,7 @@ describe("pipeline publication", () => {
     expect(updates[0]).toContain("update:status-comment:");
     expect(updates[0]).toContain("**Your move: nothing — resume (stage 2 of 3).**");
     expect(calls.filter((call) => call.startsWith("create:"))).toHaveLength(1);
-    expect(tickets.getLinearOutbox(status.id)).toMatchObject({
+    expect(getLinearOutbox(status.id)).toMatchObject({
       status: "processed",
       external_id: "status-comment",
       external_url: "https://linear.test/comment/status-updated",
@@ -1259,9 +1266,9 @@ describe("pipeline publication", () => {
   });
 
   it("queues Linear issue-state projections for selection, provider wait, and shipped only", () => {
-    const { tickets, instance, attempt } = setup("fixture/agent@1");
+    const { instance, attempt } = setup("fixture/agent@1");
     const persistPublication = createPipelinePublicationWriter(db!);
-    expect(issueStateRows(tickets)).toEqual([{ issueId: "issue-1", signal: "started" }]);
+    expect(issueStateRows()).toEqual([{ issueId: "issue-1", signal: "started" }]);
     const baseWrite = {
       instanceId: instance.id,
       eventId: "event-id",
@@ -1324,7 +1331,7 @@ describe("pipeline publication", () => {
       });
     }
 
-    expect(issueStateRows(tickets)).toEqual([
+    expect(issueStateRows()).toEqual([
       { issueId: "issue-1", signal: "started" },
       { issueId: "issue-1", signal: "review" },
       { issueId: "issue-1", signal: "completed" },
@@ -1333,26 +1340,26 @@ describe("pipeline publication", () => {
 
   it("keeps issue-state update failures from blocking Linear receipt completion", async () => {
     const { tickets, pipelines, instance } = setup("fixture/agent@1");
-    const stateRow = tickets.listLinearOutbox().find((row) => row.kind === "issue_state")!;
-    const selection = tickets.listLinearOutbox().find((row) => row.kind === "pipeline_receipt")!;
+    const stateRow = listLinearOutbox().find((row) => row.kind === "issue_state")!;
+    const selection = listLinearOutbox().find((row) => row.kind === "pipeline_receipt")!;
     const failedState = createLinearOutboxProcessor({
       store: tickets,
       getLinearClient: async () => ({ accessToken: "oauth", fetch: failingIssueStateUpdateFetch() }),
     });
     await failedState.process(stateRow.id);
-    expect(tickets.getLinearOutbox(stateRow.id)).toMatchObject({ status: "failed" });
+    expect(getLinearOutbox(stateRow.id)).toMatchObject({ status: "failed" });
 
     expect(pipelines.getPublication(selection.id)).toMatchObject({
       status: "acknowledged",
       external_id: "activity-1",
     });
     expect(pipelines.getInstance(instance.id)?.status).toBe("dispatchable");
-    expect(tickets.getLinearOutbox(stateRow.id)).toMatchObject({ status: "failed" });
+    expect(getLinearOutbox(stateRow.id)).toMatchObject({ status: "failed" });
   });
 
   it("rediscovers a markerless Linear status comment by deterministic outbox id", async () => {
     const { tickets } = setup("fixture/agent@1");
-    const status = tickets.listLinearOutbox().find((row) => row.kind === "pipeline_status")!;
+    const status = listLinearOutbox().find((row) => row.kind === "pipeline_status")!;
     const body = (JSON.parse(status.payload) as { publication: { body: string } }).publication.body;
     const calls: string[] = [];
     const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
@@ -1391,7 +1398,7 @@ describe("pipeline publication", () => {
       `get:${status.id}`,
       `update:${status.id}:${body}`,
     ]);
-    expect(tickets.getLinearOutbox(status.id)).toMatchObject({
+    expect(getLinearOutbox(status.id)).toMatchObject({
       status: "processed",
       external_id: status.id,
       external_url: "https://linear.test/comment/status-updated",
@@ -1400,7 +1407,7 @@ describe("pipeline publication", () => {
 
   it("reuses an already-current Linear status comment without another write", async () => {
     const { tickets } = setup("fixture/agent@1");
-    const status = tickets.listLinearOutbox().find((row) => row.kind === "pipeline_status")!;
+    const status = listLinearOutbox().find((row) => row.kind === "pipeline_status")!;
     const body = (JSON.parse(status.payload) as { publication: { body: string } }).publication.body;
     db!.prepare("UPDATE linear_outbox SET external_id = ?, external_url = ? WHERE id = ?")
       .run("status-comment", "https://linear.test/comment/status", status.id);
@@ -1428,7 +1435,7 @@ describe("pipeline publication", () => {
     await processor.process(status.id);
 
     expect(calls).toEqual(["get"]);
-    expect(tickets.getLinearOutbox(status.id)).toMatchObject({
+    expect(getLinearOutbox(status.id)).toMatchObject({
       status: "processed",
       external_id: "status-comment",
       external_url: "https://linear.test/comment/status",
@@ -1442,17 +1449,17 @@ describe("pipeline publication", () => {
       store: tickets,
       getLinearClient: async () => ({ accessToken: "oauth", fetch: initialFetch }),
     });
-    const status = tickets.listLinearOutbox().find((row) => row.kind === "pipeline_status")!;
+    const status = listLinearOutbox().find((row) => row.kind === "pipeline_status")!;
 
     await initialProcessor.process(status.id);
-    expect(tickets.getLinearOutbox(status.id)).toMatchObject({
+    expect(getLinearOutbox(status.id)).toMatchObject({
       status: "processed",
       external_id: "status-comment",
     });
 
     const input = event(instance, attempt, "fresh stage accepted");
     coordinatePipelineEvent(pipelines, input.event, undefined, input.receipt);
-    expect(tickets.getLinearOutbox(status.id)).toMatchObject({
+    expect(getLinearOutbox(status.id)).toMatchObject({
       status: "pending",
       external_id: "status-comment",
     });
@@ -1489,7 +1496,7 @@ describe("pipeline publication", () => {
     expect(calls[0]).toBe("get:status-comment");
     expect(calls[1]).toContain("create:");
     expect(calls[1]).not.toContain("<!-- openthrottle:pipeline-status:issue-1 -->");
-    expect(tickets.getLinearOutbox(status.id)).toMatchObject({
+    expect(getLinearOutbox(status.id)).toMatchObject({
       status: "processed",
       external_id: "replacement-status-comment",
       external_url: "https://linear.test/comment/replacement",
@@ -1502,10 +1509,10 @@ describe("pipeline publication", () => {
       store: tickets,
       getLinearClient: async () => ({ accessToken: "oauth", fetch: successfulLinearFetch() }),
     });
-    const status = tickets.listLinearOutbox().find((row) => row.kind === "pipeline_status")!;
+    const status = listLinearOutbox().find((row) => row.kind === "pipeline_status")!;
 
     await initialProcessor.process(status.id);
-    expect(tickets.getLinearOutbox(status.id)).toMatchObject({
+    expect(getLinearOutbox(status.id)).toMatchObject({
       status: "processed",
       external_id: "status-comment",
     });
@@ -1555,7 +1562,7 @@ describe("pipeline publication", () => {
     });
 
     await processor.process(status.id);
-    const failed = tickets.getLinearOutbox(status.id)!;
+    const failed = getLinearOutbox(status.id)!;
     expect(failed).toMatchObject({ status: "failed", external_id: "status-comment" });
     expect(failed.last_error).toContain("temporary outage");
     expect(failed.next_attempt_at).toBeTruthy();
@@ -1571,7 +1578,7 @@ describe("pipeline publication", () => {
       "get:status-comment",
       "update:status-comment",
     ]);
-    expect(tickets.getLinearOutbox(status.id)).toMatchObject({
+    expect(getLinearOutbox(status.id)).toMatchObject({
       status: "processed",
       external_id: "status-comment",
       external_url: "https://linear.test/comment/status-updated",
@@ -1828,7 +1835,7 @@ describe("pipeline publication", () => {
     });
     await outage.process(firstPublication.id);
     expect(pipelines.getPublication(firstPublication.id)?.status).toBe("acknowledged");
-    expect(tickets.getLinearOutbox(firstPublication.id)).toBeUndefined();
+    expect(getLinearOutbox(firstPublication.id)).toBeUndefined();
     expect(pipelines.getInstance(instance.id)?.status).toBe("dispatchable");
 
     const resumeAttempt = pipelines.getActiveAttempt(instance.id)!;
@@ -1878,7 +1885,7 @@ describe("pipeline publication", () => {
     await processor.process(publication.id);
     await processor.process(publication.id);
     expect(uploads).toBe(1);
-    expect(tickets.getLinearOutbox(publication.id)?.attachment_url)
+    expect(getLinearOutbox(publication.id)?.attachment_url)
       .toBe("https://uploads.linear.test/private/evidence.json");
     expect(activityBodies.join("\n")).toContain("Private typed evidence attachment");
   });
@@ -1956,7 +1963,7 @@ describe("pipeline publication", () => {
 
   it("does not let a late status row update a newer Linear session generation", async () => {
     const { tickets, instance } = setup("fixture/agent@1");
-    const status = tickets.listLinearOutbox().find((row) => row.kind === "pipeline_status")!;
+    const status = listLinearOutbox().find((row) => row.kind === "pipeline_status")!;
     tickets.upsert({
       linear_issue_id: instance.linear_issue_id,
       linear_issue_identifier: "ISSUE-1",
@@ -1988,7 +1995,7 @@ describe("pipeline publication", () => {
     await processor.process(status.id);
 
     expect(commentCalls).toEqual([]);
-    expect(tickets.getLinearOutbox(status.id)).toMatchObject({
+    expect(getLinearOutbox(status.id)).toMatchObject({
       status: "processed",
       external_id: null,
     });

@@ -57,6 +57,14 @@ export interface Run {
   pr_url: string | null;
   failure_tail: string | null;
   log_tail: string | null;
+  actor_state: "running" | "reaping" | "quarantined" | "settled" | null;
+  last_heartbeat_at: string | null;
+  settlement_owner: string | null;
+  settlement_reason: string | null;
+  termination_confirmed_at: string | null;
+  quarantine_reason: string | null;
+  actor_created_at: string | null;
+  actor_updated_at: string | null;
 }
 
 export interface AgentSession {

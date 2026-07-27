@@ -60,7 +60,7 @@ describe('operator commands', () => {
               published_commit: '0123456789abcdef',
               published_pr_url: 'https://github.com/o/r/pull/1',
               gate_result: 'passed',
-              context_policy: 'fresh_review',
+              context_policy: 'fresh',
               publication_state: 'blocked',
               publication_id: 'publication-1',
               publication_error: 'GitHub denied the update',
@@ -93,7 +93,7 @@ describe('operator commands', () => {
     expect(output.mock.calls.flat().join('\n')).toContain('ce/implement@1');
     expect(output.mock.calls.flat().join('\n')).toContain('publication_blocked');
     expect(output.mock.calls.flat().join('\n')).toContain('whose move: waiting on you');
-    expect(output.mock.calls.flat().join('\n')).toContain('fresh_review');
+    expect(output.mock.calls.flat().join('\n')).toContain('fresh');
     expect(output.mock.calls.flat().join('\n')).toContain('implement');
     expect(output.mock.calls.flat().join('\n')).toContain('0123456789ab');
     expect(output.mock.calls.flat().join('\n')).toContain('stop:dead');

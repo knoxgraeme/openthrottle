@@ -107,14 +107,14 @@ default outcome keys are rejected. The key `same_as` is reserved and rejected.
 expand to `retryable_infrastructure_failure` self-loops for the declaring
 stage; the target is implied and cannot be authored.
 
-Context policies are `none`, `fresh`, `resume_required`, `prefer_resume`, and
-`fresh_review`. Assurance classes are `semantic_attested`,
+Context policies are `none`, `fresh`, `resume_required`, and `prefer_resume`.
+Assurance classes are `semantic_attested`,
 `semantic_corroborated`, `executor_verified`, `provider_verified`, and
 `human_approved`. An evaluator may accept only its declared assurance class.
 
 Platform-authored pipelines use the `core/` namespace. CE remains the default
 skill pack, but the `ce/` namespace is reserved for capability IDs such as
-`ce/implement@1`, `ce/review@1`, and `ce/publish@1`.
+`core/implement@4`, `ce/review@1`, and `ce/publish@1`.
 
 Catalog aliases resolve to exact manifest id/version pairs. Repository config
 may override the implement or investigate alias, but cannot supply arbitrary
@@ -137,11 +137,12 @@ Provider and human events cannot enter other stage kinds. Duplicate event ids
 return the previously committed result; a stale generation, request, run, or Git
 subject is rejected.
 
-The default `core/implement@1` graph starts at implementation, then proceeds
+The default `core/implement@4` graph starts at implementation, then proceeds
 through semantic review, a simplification stage that may no-op, configured
-command gates, publication, and provider evidence. Semantic repair returns to
-implementation within manifest bounds. The default `core/investigate@1` graph
-runs investigation, then conditionally publishes an exact-subject result.
+command gates, publication, and provider evidence. Semantic repair uses the
+manifest's round-based repair budget and scoped repair re-entry. The default
+`core/investigate@1` graph runs investigation, then conditionally publishes an
+exact-subject result.
 
 Provider feedback excludes supervisor-authored GitHub summary comments and
 Linear bridge linkback comments; those are publication/linkage artifacts, not
@@ -167,7 +168,7 @@ inputs, and records the resource binding. Dispatch atomically binds the planned
 run id to the stage attempt and starts the sandbox entrypoint. When a transition
 enters a non-dispatched wait such as provider evidence or human approval, an
 `idle` effect may lower the bound sandbox to the idle autostop window while
-leaving `pipeline_runtime_resources.status = active`; it is a best-effort
+leaving the instance runtime resource status as `active`; it is a best-effort
 runtime side effect, not gate authority, and stale or failed idle work must not
 block provider evidence, terminal controls, or repair dispatch. Stop must be
 confirmed before cleanup; failed termination quarantines the resource rather
@@ -178,8 +179,8 @@ resume unfinished work. A new instance must not reuse another instance’s
 resource. Ticket `sandbox_id` and `run_id` are projections used for operator
 visibility and event polling, not coordinator authority.
 
-Hard expiry uses `TASK_TIMEOUT`. Stalled actors are detected from durable run
-liveness and `STALL_TIMEOUT_SECONDS`. The sweep also resumes pending effects,
+Hard expiry uses `TASK_TIMEOUT`. Stalled actors are detected from actor state
+on `runs` and `pipeline_stage_attempts` plus `STALL_TIMEOUT_SECONDS`. The sweep also resumes pending effects,
 reaps expired runs, releases or quarantines resources safely, and removes
 unbound Daytona orphans after `ORPHAN_GRACE_MINUTES`.
 
@@ -347,20 +348,17 @@ instance, the nested `pipeline` object includes:
 
 SQLite is the authority. Core tables include:
 
-- ticket/run/session projections: `tickets`, `runs`, `agent_sessions`,
-  `run_liveness`;
+- ticket/run/session projections: `tickets`, `runs`, `agent_sessions`;
 - durable transport: `webhook_deliveries`, `linear_outbox`, `session_inbox`,
   `sandbox_events`, `work_items`, `work_item_sources`, `work_deliveries`;
 - provider evidence: `provider_events`, `feedback_snapshots`,
   `feedback_snapshot_events`;
 - immutable selection: `pipeline_catalog_entries`, `pipeline_catalog_aliases`,
   `runtime_capability_descriptors`, `repository_config_snapshots`,
-  `pipeline_instances`, `session_executions`, `pipeline_instance_stages`;
-- fenced execution: `pipeline_stage_attempts`, `run_stage_bindings`,
-  `pipeline_work_bindings`, `pipeline_inbox_events`;
+  `pipeline_instances`, `pipeline_instance_stages`;
+- fenced execution: `pipeline_stage_attempts`, `pipeline_inbox_events`;
 - evidence/effects: `pipeline_artifacts`, `pipeline_gate_receipts`,
-  `pipeline_publication_receipts`, `pipeline_effect_intents`,
-  `pipeline_runtime_resources`;
+  `pipeline_publication_receipts`, `pipeline_effect_intents`;
 - operations: `repository_registrations`, `supervisor_leases`, `settings`,
   `schema_migrations`, `migration_reconciliation`.
 
@@ -368,13 +366,14 @@ Schema migrations are transactional, checksum-pinned, and idempotent. Migration
 code may recognize historical direct-run rows solely to reconcile an older
 SQLite file conservatively. Such rows never participate in admission,
 selection, routing, scheduling, status summaries, or sandbox execution. New
-databases do not create the retired task-work table.
+databases do not create the retired task-work table. Historical satellite
+tables such as `run_liveness`, `session_executions`,
+`pipeline_runtime_resources`, `run_stage_bindings`, and
+`pipeline_work_bindings` remain in immutable migrations only; live state is
+stored on the owning actor, session, instance, attempt, or work row.
 
-`pipeline_work_bindings` is intentionally reserved for Stage C child-unit work:
-it will bind durable work deliveries to fenced pipeline attempts and units so
-unit-level inbox/result handling can be audited without overloading
-`run_stage_bindings`. Until Stage C writes those rows, production code must not
-infer behavior from an empty binding table.
+Stage C child-unit work must add any needed live binding state to the owning
+unit/work records rather than reviving empty historical binding tables.
 
 ## Supervisor environment
 

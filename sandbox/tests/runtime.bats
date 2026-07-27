@@ -32,13 +32,8 @@ setup() {
   [ "$status" -ne 0 ]
 }
 
-@test "sealed stage push policy blocks fresh review and fails closed" {
+@test "sealed stage push policy allows known policies and fails closed" {
   policy="${BATS_TEST_TMPDIR}/stage-push-policy"
-  printf '%s\n' fresh_review > "$policy"
-  run "${BATS_TEST_DIRNAME}/../safety/enforce-stage-push-policy" "$policy"
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"pushes are forbidden during a fresh-review stage"* ]]
-
   printf '%s\n' prefer_resume > "$policy"
   run "${BATS_TEST_DIRNAME}/../safety/enforce-stage-push-policy" "$policy"
   [ "$status" -eq 0 ]

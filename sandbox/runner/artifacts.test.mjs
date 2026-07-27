@@ -20,7 +20,7 @@ const fence = {
   sessionId: "session-1",
   generation: 1,
   contextRevision: 0,
-  contextPolicy: "fresh_review",
+  contextPolicy: "fresh",
   nativeSessionId: null,
   capability: "agent/semantic@1",
   repository: "owner/repo",

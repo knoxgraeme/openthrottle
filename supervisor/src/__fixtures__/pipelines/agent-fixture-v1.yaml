@@ -43,7 +43,7 @@ stages:
   - id: review
     executor: { kind: agent, capability: agent/semantic@1 }
     evaluator: { kind: semantic, assurance: semantic_attested, required_artifacts: [review] }
-    context: fresh_review
+    context: fresh
     live_steering: false
     credentials: [model.invoke, repo.read]
     produces: [review, stage_result]

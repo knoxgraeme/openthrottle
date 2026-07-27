@@ -91,9 +91,9 @@ describe("renderManifestMermaid node shapes", () => {
   });
 
   it("starts with a flowchart header and the pipeline identity comment", () => {
-    const output = renderManifestMermaid(shippedManifest("ce/implement@3"));
+    const output = renderManifestMermaid(shippedManifest("core/implement@4"));
     expect(output.split("\n")[0]).toBe("flowchart TD");
-    expect(output.split("\n")[1]).toBe("    %% ce/implement@3");
+    expect(output.split("\n")[1]).toBe("    %% core/implement@4");
   });
 
   it("renames stage IDs that collide with mermaid keywords", () => {
@@ -148,7 +148,7 @@ describe("renderManifestMermaid edge classification", () => {
   it("classifies re-entry exactly as the coordinator does across the shipped manifest", () => {
     // Coordinator rule (coordinator.ts:355-357): target === stage, or the
     // target's index is <= the stage's index in manifest.stages.
-    const manifest = shippedManifest("ce/implement@3");
+    const manifest = shippedManifest("core/implement@4");
     const output = renderManifestMermaid(manifest, { collapseUniform: false });
     const index = (id: string) => manifest.stages.findIndex((entry) => entry.id === id);
     for (const entry of manifest.stages) {
@@ -182,16 +182,16 @@ describe("renderManifestMermaid edge classification", () => {
   });
 
   it("omits terminal nodes that no rendered edge reaches", () => {
-    const output = renderManifestMermaid(shippedManifest("ce/implement@3"));
+    const output = renderManifestMermaid(shippedManifest("core/implement@4"));
     expect(output).toContain('terminal_shipped(["shipped"])');
     expect(output).not.toContain('terminal_canceled(["canceled"])');
   });
 });
 
 describe("renderManifestMermaid uniform-outcome collapse", () => {
-  it("collapses exactly needs_human, canceled and superseded on ce/implement@3", () => {
-    const output = renderManifestMermaid(shippedManifest("ce/implement@3"));
-    expect(output).toContain("%% every stage also: needs_human (8), canceled (8), superseded (8)");
+  it("collapses exactly needs_human, canceled and superseded on core/implement@4", () => {
+    const output = renderManifestMermaid(shippedManifest("core/implement@4"));
+    expect(output).toContain("%% every stage also: needs_human (11), canceled (11), superseded (11)");
     for (const outcome of ["needs_human", "canceled", "superseded"]) {
       expect(output).not.toContain(`|"${outcome}"|`);
     }
@@ -201,7 +201,7 @@ describe("renderManifestMermaid uniform-outcome collapse", () => {
   });
 
   it("names the collapsed destination in the trailing comment", () => {
-    const output = renderManifestMermaid(shippedManifest("ce/implement@3"));
+    const output = renderManifestMermaid(shippedManifest("core/implement@4"));
     expect(output).toContain("%%   needs_human -> terminal needs_human");
     expect(output).toContain("%%   canceled -> terminal canceled");
     expect(output).toContain("%%   superseded -> terminal superseded");
@@ -246,7 +246,7 @@ describe("renderManifestMermaid uniform-outcome collapse", () => {
   });
 
   it("collapseUniform:false emits every declared transition", () => {
-    const manifest = shippedManifest("ce/implement@3");
+    const manifest = shippedManifest("core/implement@4");
     const output = renderManifestMermaid(manifest, { collapseUniform: false });
     expect(output).not.toContain("%% every stage also:");
     const edges = output.split("\n").filter((line) => /\|"/.test(line));
@@ -259,7 +259,7 @@ describe("renderManifestMermaid uniform-outcome collapse", () => {
 
 describe("renderManifestMermaid position highlighting", () => {
   it("emits a classDef and class line for the active stage", () => {
-    const output = renderManifestMermaid(shippedManifest("ce/implement@3"), {
+    const output = renderManifestMermaid(shippedManifest("core/implement@4"), {
       position: { activeStageId: "simplification" },
     });
     expect(output).toContain("classDef otActive fill:#fff3bf,stroke:#f08c00,stroke-width:3px;");
@@ -267,7 +267,7 @@ describe("renderManifestMermaid position highlighting", () => {
   });
 
   it("appends re-entry usage for nonzero counts only", () => {
-    const output = renderManifestMermaid(shippedManifest("ce/implement@3"), {
+    const output = renderManifestMermaid(shippedManifest("core/implement@4"), {
       position: { activeStageId: "implementation", reentryCounts: { implementation: 4, publish: 0 } },
     });
     expect(output).toContain('implementation["implementation<br/>agent<br/>re-entries: 4"]');
@@ -275,28 +275,28 @@ describe("renderManifestMermaid position highlighting", () => {
   });
 
   it("omits highlighting entirely when no position is supplied", () => {
-    const output = renderManifestMermaid(shippedManifest("ce/implement@3"));
+    const output = renderManifestMermaid(shippedManifest("core/implement@4"));
     expect(output).not.toContain("classDef");
     expect(output).not.toContain("re-entries");
   });
 
   it("rejects an active stage that is not in the manifest", () => {
-    expect(() => renderManifestMermaid(shippedManifest("ce/implement@3"), {
+    expect(() => renderManifestMermaid(shippedManifest("core/implement@4"), {
       position: { activeStageId: "nope" },
-    })).toThrow(/not a stage of ce\/implement/);
+    })).toThrow(/not a stage of core\/implement/);
   });
 });
 
 describe("renderManifestMermaid determinism", () => {
   it("is byte-identical across calls", () => {
-    const manifest = shippedManifest("ce/implement@3");
+    const manifest = shippedManifest("core/implement@4");
     expect(renderManifestMermaid(manifest)).toBe(renderManifestMermaid(manifest));
     expect(renderManifestMermaid(manifest, { collapseUniform: false }))
       .toBe(renderManifestMermaid(manifest, { collapseUniform: false }));
   });
 
   it("orders stages as declared and outcomes in STAGE_OUTCOMES order", () => {
-    const manifest = shippedManifest("ce/implement@3");
+    const manifest = shippedManifest("core/implement@4");
     const output = renderManifestMermaid(manifest, { collapseUniform: false });
     const lines = output.split("\n");
     const nodeOrder = manifest.stages.map((entry) =>
@@ -337,7 +337,7 @@ describe("generated pipeline docs", () => {
   it("derives one page filename per manifest identity", () => {
     const catalog = loadPipelineCatalog(CATALOG);
     const names = [...catalog.manifests.values()].map(({ manifest }) => pipelineDocFilename(manifest));
-    expect(names).toContain("core-implement-v3.md");
+    expect(names).toContain("core-implement-v4.md");
     expect(new Set(names).size).toBe(names.length);
   });
 

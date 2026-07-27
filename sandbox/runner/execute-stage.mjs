@@ -26,11 +26,7 @@ import {
   validateSemanticProposal,
 } from "./artifacts.mjs";
 import {
-  captureRepositoryControl,
   computeWorkspaceTreeOid,
-  computeWorkspaceTreeOidFromTree,
-  repositoryControlMatches,
-  restoreReadOnlyRepository,
   runGitAsRepositoryOwner,
 } from "./repository-control.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
@@ -55,7 +51,7 @@ const ARTIFACT_KINDS = new Set([
   "human_approval", "publish_subject",
 ]);
 const CONTEXT_POLICIES = new Set([
-  "none", "fresh", "resume_required", "prefer_resume", "fresh_review",
+  "none", "fresh", "resume_required", "prefer_resume",
 ]);
 const COMMAND_NAMES = new Set(["test", "lint", "build", "format"]);
 const REMOTE_GIT_TIMEOUT_MS = 15_000;
@@ -200,7 +196,6 @@ export function validateSealedInputs({ request, configRaw, manifestRaw }) {
 export function resolveContextInvocation(request) {
   if (request.contextPolicy === "none") return { mode: "none", nativeSessionId: null, reconstructed: false, readOnly: false };
   if (request.contextPolicy === "fresh") return { mode: "fresh", nativeSessionId: null, reconstructed: false, readOnly: false };
-  if (request.contextPolicy === "fresh_review") return { mode: "fresh", nativeSessionId: null, reconstructed: false, readOnly: true };
   if (request.contextPolicy === "resume_required") {
     if (!request.nativeSessionId) throw new Error("resume-required context is missing its native session");
     return { mode: "resume", nativeSessionId: request.nativeSessionId, reconstructed: false, readOnly: false };
@@ -515,9 +510,6 @@ export function executeStage({
   if (request.expectedSubject && request.expectedSubject !== preSubject) {
     throw new Error("workspace subject does not match the fenced expected subject");
   }
-  const preControl = request.contextPolicy === "fresh_review"
-    ? captureRepositoryControl(repoDir)
-    : null;
   let nativeSessionId = request.nativeSessionId;
   let artifacts;
   if (contract.kind === "command") {
@@ -602,22 +594,10 @@ export function executeStage({
         };
       }
     }
-    const observedPostSubject = invocation.readOnly
-      ? computeWorkspaceTreeOidFromTree(repoDir, preSubject)
-      : computeWorkspaceTreeOid(repoDir);
-    const readOnlyMutation = invocation.readOnly &&
-      (observedPostSubject !== preSubject || !preControl || !repositoryControlMatches(repoDir, preControl));
-    const gatedSubject = readOnlyMutation
-      ? restoreReadOnlyRepository(repoDir, observedPostSubject, preSubject, preControl)
-      : observedPostSubject;
+    const gatedSubject = computeWorkspaceTreeOid(repoDir);
     let proposal = execution.proposal;
     let publishedCommit;
-    if (readOnlyMutation) {
-      proposal = {
-        ...failureProposal("A fresh-review stage mutated the workspace.", "semantic_repair_required"),
-        findings: [{ severity: "P1", code: "review-mutated-workspace", summary: "Read-only review changed the gated tree." }],
-      };
-    } else if (request.capability === "ce/publish@1") {
+    if (request.capability === "ce/publish@1") {
       ({ proposal, publishedCommit } = reconcilePublication({
         repoDir,
         request,

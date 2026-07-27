@@ -49,7 +49,7 @@ describe("installed stage capabilities", () => {
     }).kind).toBe("agent");
     expect(authorizeCapability({
       capability: "ce/plan@1",
-      contextPolicy: "fresh_review",
+      contextPolicy: "fresh",
       credentialScopes: ["model.invoke", "repo.read"],
       requiredArtifacts: ["stage_result"],
     }).kind).toBe("agent");

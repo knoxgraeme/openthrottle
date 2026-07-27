@@ -13,6 +13,7 @@ import type { ActivityPublicationPort } from "../../app/ports.js";
 import type { SupervisorStore } from "../../persistence/store.js";
 import type { LinearOutboxRecord } from "../../persistence/delivery-store.js";
 import { pipelineStatusCommentMarker } from "../../pipeline/publication.js";
+import { classifyPermanentFailure, exponentialBackoffDelayMs } from "../../shared/backoff.js";
 import { sanitizeText } from "../../shared/sanitize.js";
 
 // Shared helpers for enqueueing a single Linear outbox row and processing it
@@ -135,16 +136,8 @@ type LinearOutboxPayload =
       signal: LinearIssueStateSignal;
     };
 
-function retryDelayMs(attempts: number): number {
-  return Math.min(5 * 60_000, 2 ** Math.max(0, attempts - 1) * 5_000);
-}
-
 function classifyRetry(error: unknown): { retry: boolean; message: string } {
-  const message = sanitizeText(String(error)).slice(-2_000);
-  if (/invalid|permission|forbidden|unauthorized|revoked|missing/i.test(message)) {
-    return { retry: false, message };
-  }
-  return { retry: true, message };
+  return classifyPermanentFailure(error, /invalid|permission|forbidden|unauthorized|revoked|missing/i);
 }
 
 function isNotFoundError(error: unknown): boolean {
@@ -276,7 +269,7 @@ export function createLinearOutboxProcessor(params: {
           row.id,
           classified.message,
           classified.retry
-            ? new Date(Date.now() + retryDelayMs(row.attempts)).toISOString()
+            ? new Date(Date.now() + exponentialBackoffDelayMs(row.attempts)).toISOString()
             : null,
           row.payload_hash
         );
