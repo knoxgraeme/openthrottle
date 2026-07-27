@@ -24,6 +24,7 @@ import {
   shouldPostLinearEventComment,
 } from "./publication.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
+import { createPipelinePublicationWriter } from "../persistence/pipeline/helpers.js";
 import type {
   CoordinatorGateReceiptWrite,
   PipelineInstance,
@@ -235,7 +236,7 @@ describe("pipeline publication", () => {
 
   function successfulLinearFetch() {
     return vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
-      const request = JSON.parse(String(init?.body)) as { query?: string };
+      const request = JSON.parse(String(init?.body)) as { query?: string; variables?: { id?: string; stateId?: string } };
       if (request.query?.includes("query Comment")) {
         return Response.json({ data: { comment: null } });
       }
@@ -250,10 +251,61 @@ describe("pipeline publication", () => {
           } },
         });
       }
+      if (request.query?.includes("IssueWorkflowState")) {
+        return Response.json({
+          data: {
+            issue: {
+              id: request.variables?.id ?? "issue-1",
+              state: { id: "backlog", name: "Backlog", type: "backlog" },
+              team: { id: "team-1" },
+            },
+          },
+        });
+      }
+      if (request.query?.includes("TeamWorkflowStates")) {
+        return Response.json({
+          data: {
+            team: {
+              states: {
+                nodes: [
+                  { id: "backlog", name: "Backlog", type: "backlog" },
+                  { id: "progress", name: "In Progress", type: "started" },
+                  { id: "review", name: "In Review", type: "started" },
+                  { id: "done", name: "Done", type: "completed" },
+                ],
+              },
+            },
+          },
+        });
+      }
+      if (request.query?.includes("IssueStateUpdate")) {
+        return Response.json({
+          data: {
+            issueUpdate: {
+              success: true,
+              issue: {
+                id: request.variables?.id ?? "issue-1",
+                state: { id: request.variables?.stateId ?? "progress", name: "target" },
+              },
+            },
+          },
+        });
+      }
       if (!request.query?.includes("AgentActivityCreate")) throw new Error("unexpected Linear request");
       return Response.json({
         data: { agentActivityCreate: { success: true, agentActivity: { id: "activity-1" } } },
       });
+    }) as unknown as typeof fetch;
+  }
+
+  function failingIssueStateUpdateFetch() {
+    const fallback = successfulLinearFetch() as typeof fetch;
+    return vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as { query?: string };
+      if (request.query?.includes("IssueStateUpdate")) {
+        return new Response(JSON.stringify({ errors: [{ message: "temporary outage" }] }), { status: 503 });
+      }
+      return fallback(input, init);
     }) as unknown as typeof fetch;
   }
 
@@ -265,6 +317,17 @@ describe("pipeline publication", () => {
     const selection = tickets.listLinearOutbox().find((row) => row.kind === "pipeline_receipt")!;
     await processor.process(selection.id);
     return processor;
+  }
+
+  function issueStateRows(tickets: SupervisorStore) {
+    const order = new Map([["started", 0], ["review", 1], ["completed", 2]]);
+    return tickets.listLinearOutbox()
+      .filter((row) => row.kind === "issue_state")
+      .map((row) => {
+        const payload = JSON.parse(row.payload) as { signal: string; issueId: string };
+        return { issueId: payload.issueId, signal: payload.signal };
+      })
+      .sort((a, b) => (order.get(a.signal) ?? 99) - (order.get(b.signal) ?? 99));
   }
 
   function nextAttemptStub(stageId: string, reentryOrdinal: number) {
@@ -1193,6 +1256,98 @@ describe("pipeline publication", () => {
       external_id: "status-comment",
       external_url: "https://linear.test/comment/status-updated",
     });
+  });
+
+  it("queues Linear issue-state projections for selection, provider wait, and shipped only", () => {
+    const { tickets, instance, attempt } = setup("fixture/agent@1");
+    const persistPublication = createPipelinePublicationWriter(db!);
+    expect(issueStateRows(tickets)).toEqual([{ issueId: "issue-1", signal: "started" }]);
+    const baseWrite = {
+      instanceId: instance.id,
+      eventId: "event-id",
+      eventPayloadHash: "e".repeat(64),
+      expectedVersion: instance.state_version,
+      expectedStatus: instance.status,
+      attemptId: attempt.id,
+      resultHash: "f".repeat(64),
+      effects: [],
+    };
+    const input = event(instance, attempt, "publish opened a pull request");
+    const providerWait = canonicalJson(buildStagePublication({
+      instance,
+      attempt,
+      event: input.event,
+      write: {
+        ...baseWrite,
+        outcome: "success",
+        nextStatus: "waiting_provider",
+        waitReason: "provider evidence required at provider",
+      },
+      gateReceipt: input.receipt,
+    }));
+    persistPublication({
+      instance,
+      attemptId: attempt.id,
+      kind: "linear_ledger",
+      idempotencyKey: "linear-provider-wait-test",
+      payload: providerWait,
+      timestamp: "2026-07-27T00:00:00.000Z",
+    });
+    const shipped = canonicalJson(buildLifecyclePublication({
+      instance: { ...instance, status: "shipped", terminal_outcome: "shipped", immutable_subject: SUBJECT },
+      attempt,
+      outcome: "shipped",
+      reason: "The pull request merged.",
+    }));
+    persistPublication({
+      instance,
+      attemptId: attempt.id,
+      kind: "linear_ledger",
+      idempotencyKey: "linear-shipped-test",
+      payload: shipped,
+      timestamp: "2026-07-27T00:00:01.000Z",
+    });
+    for (const outcome of ["failed", "needs_human"] as const) {
+      const payload = canonicalJson(buildLifecyclePublication({
+        instance: { ...instance, status: outcome, terminal_outcome: outcome },
+        attempt,
+        outcome,
+        reason: "terminal reason",
+      }));
+      persistPublication({
+        instance,
+        attemptId: attempt.id,
+        kind: "linear_ledger",
+        idempotencyKey: `linear-${outcome}-test`,
+        payload,
+        timestamp: "2026-07-27T00:00:02.000Z",
+      });
+    }
+
+    expect(issueStateRows(tickets)).toEqual([
+      { issueId: "issue-1", signal: "started" },
+      { issueId: "issue-1", signal: "review" },
+      { issueId: "issue-1", signal: "completed" },
+    ]);
+  });
+
+  it("keeps issue-state update failures from blocking Linear receipt completion", async () => {
+    const { tickets, pipelines, instance } = setup("fixture/agent@1");
+    const stateRow = tickets.listLinearOutbox().find((row) => row.kind === "issue_state")!;
+    const selection = tickets.listLinearOutbox().find((row) => row.kind === "pipeline_receipt")!;
+    const failedState = createLinearOutboxProcessor({
+      store: tickets,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: failingIssueStateUpdateFetch() }),
+    });
+    await failedState.process(stateRow.id);
+    expect(tickets.getLinearOutbox(stateRow.id)).toMatchObject({ status: "failed" });
+
+    expect(pipelines.getPublication(selection.id)).toMatchObject({
+      status: "acknowledged",
+      external_id: "activity-1",
+    });
+    expect(pipelines.getInstance(instance.id)?.status).toBe("dispatchable");
+    expect(tickets.getLinearOutbox(stateRow.id)).toMatchObject({ status: "failed" });
   });
 
   it("rediscovers a markerless Linear status comment by deterministic outbox id", async () => {

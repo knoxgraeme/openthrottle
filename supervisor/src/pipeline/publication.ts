@@ -935,6 +935,19 @@ export function pipelineStatusOutboxPayload(envelope: PipelinePublicationEnvelop
   });
 }
 
+export type PipelineIssueStateSignal = "started" | "review" | "completed";
+
+export function issueStateSignalForPublication(
+  envelope: PipelinePublicationEnvelope
+): PipelineIssueStateSignal | undefined {
+  if (envelope.template.name === "selection") return "started";
+  if (envelope.template.name === "provider_wait") return "review";
+  if (envelope.template.name === "terminal" && envelope.decision.outcome === "shipped") {
+    return "completed";
+  }
+  return undefined;
+}
+
 export function publicationPayloadHash(envelope: PipelinePublicationEnvelope): string {
   return digestNormalized(canonicalJson(envelope));
 }

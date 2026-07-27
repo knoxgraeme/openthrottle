@@ -1,4 +1,4 @@
-import type { AgentActivityInput, AgentPlanItem, LinearClient, LinearComment } from "./client.js";
+import type { AgentActivityInput, AgentPlanItem, LinearClient, LinearComment, LinearIssueStateSignal } from "./client.js";
 import {
   agentActivityCreate,
   agentSessionUpdate,
@@ -6,6 +6,7 @@ import {
   commentUpdate,
   findCurrentAppCommentById,
   findIssueCommentByMarker,
+  issueStateUpdate,
   linearFileUpload,
 } from "./client.js";
 import type { ActivityPublicationPort } from "../../app/ports.js";
@@ -127,6 +128,11 @@ type LinearOutboxPayload =
       publication: {
         body: string;
       };
+    }
+  | {
+      type: "issue_state";
+      issueId: string;
+      signal: LinearIssueStateSignal;
     };
 
 function retryDelayMs(attempts: number): number {
@@ -183,6 +189,13 @@ async function deliver(
       plan: payload.plan,
     });
     return {};
+  }
+  if (payload.type === "issue_state") {
+    const result = await issueStateUpdate(linear, {
+      issueId: payload.issueId,
+      signal: payload.signal,
+    });
+    return { externalId: result.state?.id };
   }
   if (payload.type === "pipeline_status") {
     if (!row.linear_issue_id) throw new Error(`pipeline status ${row.id} has no Linear issue`);

@@ -8,7 +8,9 @@ import {
   buildLifecyclePublication,
   buildSelectionPublication,
   deterministicPublicationId,
+  issueStateSignalForPublication,
   parsePipelinePublication,
+  type PipelinePublicationEnvelope,
   pipelinePublicationOutboxPayload,
   pipelineStatusOutboxPayload,
   publicationPayloadHash,
@@ -269,6 +271,75 @@ export function validatePinnedInstance(
   return manifest;
 }
 
+function nextLinearOutboxSequence(db: Database.Database, linearSessionId: string): number {
+  return (db.prepare(`
+    SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence
+    FROM linear_outbox WHERE linear_session_id IS ?
+  `).get(linearSessionId) as { sequence: number }).sequence;
+}
+
+function insertPendingLinearOutbox(input: {
+  db: Database.Database;
+  id: string;
+  linearSessionId: string;
+  linearIssueId: string;
+  kind: "pipeline_receipt" | "issue_state";
+  payload: string;
+  timestamp: string;
+}): void {
+  input.db.prepare(`
+    INSERT INTO linear_outbox (
+      id, linear_session_id, linear_issue_id, run_id, sequence, kind,
+      payload, payload_hash, status, attempts, next_attempt_at, created_at
+    ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, 'pending', 0, ?, ?)
+  `).run(
+    input.id,
+    input.linearSessionId,
+    input.linearIssueId,
+    nextLinearOutboxSequence(input.db, input.linearSessionId),
+    input.kind,
+    input.payload,
+    digestNormalized(input.payload),
+    input.timestamp,
+    input.timestamp
+  );
+}
+
+function persistIssueStateProjection(input: {
+  db: Database.Database;
+  instance: PipelineInstance;
+  envelope: PipelinePublicationEnvelope;
+  timestamp: string;
+}): void {
+  const signal = issueStateSignalForPublication(input.envelope);
+  if (!signal) return;
+  const id = deterministicPublicationId(`linear-issue-state:${input.instance.id}:${signal}`);
+  const payload = JSON.stringify({
+    type: "issue_state",
+    issueId: input.instance.linear_issue_id,
+    signal,
+  });
+  const payloadHash = digestNormalized(payload);
+  const existing = input.db.prepare("SELECT payload_hash FROM linear_outbox WHERE id = ?").get(id) as
+    | { payload_hash: string }
+    | undefined;
+  if (existing) {
+    if (existing.payload_hash !== payloadHash) {
+      throw new Error(`linear issue-state outbox ${id} already exists with different intent`);
+    }
+    return;
+  }
+  insertPendingLinearOutbox({
+    db: input.db,
+    id,
+    linearSessionId: input.instance.linear_session_id,
+    linearIssueId: input.instance.linear_issue_id,
+    kind: "issue_state",
+    payload,
+    timestamp: input.timestamp,
+  });
+}
+
 export function createPipelinePublicationWriter(db: Database.Database) {
   return (input: {
     instance: PipelineInstance;
@@ -317,10 +388,6 @@ export function createPipelinePublicationWriter(db: Database.Database) {
         input.timestamp,
         input.timestamp
       );
-      const sequence = (db.prepare(`
-        SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence
-        FROM linear_outbox WHERE linear_session_id IS ?
-      `).get(input.instance.linear_session_id) as { sequence: number }).sequence;
       const statusId = deterministicPublicationId(`linear-status:${input.instance.id}`);
       const statusPayload = pipelineStatusOutboxPayload(envelope);
       db.prepare(`
@@ -340,7 +407,7 @@ export function createPipelinePublicationWriter(db: Database.Database) {
         statusId,
         input.instance.linear_session_id,
         input.instance.linear_issue_id,
-        sequence,
+        nextLinearOutboxSequence(db, input.instance.linear_session_id),
         statusPayload,
         digestNormalized(statusPayload),
         input.timestamp,
@@ -348,25 +415,15 @@ export function createPipelinePublicationWriter(db: Database.Database) {
       );
       if (shouldPostLinearEventComment(envelope)) {
         const outboxPayload = pipelinePublicationOutboxPayload(envelope);
-        const receiptSequence = (db.prepare(`
-          SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence
-          FROM linear_outbox WHERE linear_session_id IS ?
-        `).get(input.instance.linear_session_id) as { sequence: number }).sequence;
-        db.prepare(`
-          INSERT INTO linear_outbox (
-            id, linear_session_id, linear_issue_id, run_id, sequence, kind,
-            payload, payload_hash, status, attempts, next_attempt_at, created_at
-          ) VALUES (?, ?, ?, NULL, ?, 'pipeline_receipt', ?, ?, 'pending', 0, ?, ?)
-        `).run(
+        insertPendingLinearOutbox({
+          db,
           id,
-          input.instance.linear_session_id,
-          input.instance.linear_issue_id,
-          receiptSequence,
-          outboxPayload,
-          digestNormalized(outboxPayload),
-          input.timestamp,
-          input.timestamp
-        );
+          linearSessionId: input.instance.linear_session_id,
+          linearIssueId: input.instance.linear_issue_id,
+          kind: "pipeline_receipt",
+          payload: outboxPayload,
+          timestamp: input.timestamp,
+        });
       } else {
         db.prepare(`
           UPDATE pipeline_publication_receipts
@@ -374,6 +431,12 @@ export function createPipelinePublicationWriter(db: Database.Database) {
           WHERE id = ?
         `).run(input.timestamp, input.timestamp, id);
       }
+      persistIssueStateProjection({
+        db,
+        instance: input.instance,
+        envelope,
+        timestamp: input.timestamp,
+      });
     } else {
       const stableKey = `github-summary:${input.instance.linear_issue_id}`;
       const stableId = deterministicPublicationId(stableKey);
