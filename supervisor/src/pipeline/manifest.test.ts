@@ -96,8 +96,9 @@ describe("pipeline manifest validation", () => {
       "ce/implement@4",
       "ce/investigate@2",
     ]);
-    expect(resolvePipelineReference(first, "implement").manifest.id).toBe("core/implement");
-    expect(resolvePipelineReference(first, "implement").manifest.version).toBe(3);
+    const implementManifest = resolvePipelineReference(first, "implement").manifest;
+    expect(implementManifest.id).toBe("core/implement");
+    expect(implementManifest.version).toBe(3);
     expect(resolvePipelineReference(first, "ce/implement@4").manifest.id).toBe("ce/implement");
     expect(() => resolvePipelineReference(first, "ce/implement@1"))
       .toThrow(/unknown pipeline selection/);
@@ -107,8 +108,7 @@ describe("pipeline manifest validation", () => {
       .toThrow(/unknown pipeline selection/);
     expect(() => resolvePipelineReference(first, "fixture-command"))
       .toThrow(/unknown pipeline selection/);
-    expect(resolvePipelineReference(first, "implement").manifest.stages.map((stage) => stage.id))
-      .toEqual(CORE_IMPLEMENT_V3_STAGE_IDS);
+    expect(implementManifest.stages.map((stage) => stage.id)).toEqual(CORE_IMPLEMENT_V3_STAGE_IDS);
     expect(resolvePipelineReference(first, "investigate").manifest.stages.map((stage) => stage.id)).toEqual([
       "investigate",
       "publish",

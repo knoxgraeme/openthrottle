@@ -14,9 +14,10 @@ import {
   digestNormalized,
   loadPipelineCatalog,
   parseRepositoryConfig,
+  type PipelineManifest,
 } from "./manifest.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
-import type { PipelineInstance, PipelineStageAttempt } from "./store.js";
+import type { PipelineInstance, PipelineInstanceStage, PipelineStageAttempt } from "./store.js";
 import { buildInstalledRuntimeDescriptor } from "../runtime/contracts.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
@@ -76,7 +77,8 @@ describe("pipeline coordinator", () => {
     instance: PipelineInstance,
     attempt: PipelineStageAttempt,
     outcome: PipelineCoordinatorEvent["outcome"] = "success",
-    id = `event-${outcome}`
+    id = `event-${outcome}`,
+    artifacts: Array<"stage_result" | "review"> = ["stage_result"]
   ): PipelineCoordinatorEvent {
     const stageResultPayload = JSON.stringify({ id, outcome });
     const resultHash = digestNormalized(stageResultPayload);
@@ -91,13 +93,18 @@ describe("pipeline coordinator", () => {
       outcome,
       resultHash,
       artifacts: [
-        {
-          kind: "stage_result",
-          schemaVersion: 1,
-          assurance: command ? "executor_verified" : "semantic_attested",
-          payload: stageResultPayload,
-          hash: resultHash,
-        },
+        ...artifacts.map((kind) => {
+          const payload = kind === "stage_result"
+            ? stageResultPayload
+            : JSON.stringify({ id: `${id}-review`, findings: [] });
+          return {
+            kind,
+            schemaVersion: 1,
+            assurance: command ? "executor_verified" as const : "semantic_attested" as const,
+            payload,
+            hash: kind === "stage_result" ? resultHash : digestNormalized(payload),
+          };
+        }),
         ...(command ? [{
           kind: "command_result",
           schemaVersion: 1,
@@ -106,40 +113,6 @@ describe("pipeline coordinator", () => {
           hash: digestNormalized(JSON.stringify({ exitCode: outcome === "success" ? 0 : 1 })),
         }] : []),
       ],
-    };
-  }
-
-  function agentEventWithArtifacts(
-    instance: PipelineInstance,
-    attempt: PipelineStageAttempt,
-    outcome: PipelineCoordinatorEvent["outcome"],
-    artifacts: Array<"stage_result" | "review">,
-    id = `${attempt.stage_id}-${outcome}`
-  ): PipelineCoordinatorEvent {
-    const stageResultPayload = JSON.stringify({ id, outcome });
-    const stageResultHash = digestNormalized(stageResultPayload);
-    return {
-      id,
-      kind: "stage_result",
-      instanceId: instance.id,
-      generation: instance.generation,
-      attemptId: attempt.id,
-      requestHash: attempt.request_hash,
-      outcome,
-      resultHash: stageResultHash,
-      artifacts: artifacts.map((kind) => {
-        const payload = kind === "stage_result"
-          ? stageResultPayload
-          : JSON.stringify({ id: `${id}-review`, findings: [] });
-        const hash = kind === "stage_result" ? stageResultHash : digestNormalized(payload);
-        return {
-          kind,
-          schemaVersion: 1,
-          assurance: "semantic_attested" as const,
-          payload,
-          hash,
-        };
-      }),
     };
   }
 
@@ -154,6 +127,32 @@ describe("pipeline coordinator", () => {
       request_hash: digestNormalized(`${stageId}-request`),
       native_context_policy: "resume_required",
     };
+  }
+
+  function reduceActiveAgentStage(input: {
+    manifest: PipelineManifest;
+    instance: PipelineInstance;
+    attempt: PipelineStageAttempt;
+    stages: PipelineInstanceStage[];
+    stageId: string;
+    outcome: PipelineCoordinatorEvent["outcome"];
+    id: string;
+    artifacts?: Array<"stage_result" | "review">;
+  }) {
+    const attempt = activeAgentAttempt(input.attempt, input.stageId);
+    return reducePipelineEvent({
+      manifest: input.manifest,
+      instance: {
+        ...input.instance,
+        status: "running",
+        active_stage_id: input.stageId,
+      },
+      attempt,
+      stages: input.stages.map((stage) => stage.stage_id === input.stageId
+        ? { ...stage, status: "running" }
+        : stage),
+      event: event(input.instance, attempt, input.outcome, input.id, input.artifacts),
+    });
   }
 
   it("has one deterministic policy for every declared stage outcome", () => {
@@ -320,25 +319,14 @@ describe("pipeline coordinator", () => {
 
   it("skips post-simplify review when simplification reports no change", () => {
     const { manifest, instance, attempt, stages } = setup("core/implement@3");
-    const simplificationAttempt = activeAgentAttempt(attempt, "simplification");
-    const write = reducePipelineEvent({
+    const write = reduceActiveAgentStage({
       manifest,
-      instance: {
-        ...instance,
-        status: "running",
-        active_stage_id: "simplification",
-      },
-      attempt: simplificationAttempt,
-      stages: stages.map((stage) => stage.stage_id === "simplification"
-        ? { ...stage, status: "running" }
-        : stage),
-      event: agentEventWithArtifacts(
-        instance,
-        simplificationAttempt,
-        "no_change",
-        ["stage_result"],
-        "simplify-no-change"
-      ),
+      instance,
+      attempt,
+      stages,
+      stageId: "simplification",
+      outcome: "no_change",
+      id: "simplify-no-change",
     });
 
     expect(write.nextStageId).toBe("test");
@@ -352,25 +340,14 @@ describe("pipeline coordinator", () => {
 
   it("runs post-simplify review after simplification changes and routes repairs to implementation", () => {
     const { manifest, instance, attempt, stages } = setup("core/implement@3");
-    const simplificationAttempt = activeAgentAttempt(attempt, "simplification");
-    const afterSimplify = reducePipelineEvent({
+    const afterSimplify = reduceActiveAgentStage({
       manifest,
-      instance: {
-        ...instance,
-        status: "running",
-        active_stage_id: "simplification",
-      },
-      attempt: simplificationAttempt,
-      stages: stages.map((stage) => stage.stage_id === "simplification"
-        ? { ...stage, status: "running" }
-        : stage),
-      event: agentEventWithArtifacts(
-        instance,
-        simplificationAttempt,
-        "success",
-        ["stage_result"],
-        "simplify-changed"
-      ),
+      instance,
+      attempt,
+      stages,
+      stageId: "simplification",
+      outcome: "success",
+      id: "simplify-changed",
     });
 
     expect(afterSimplify.nextStageId).toBe("post_simplify_review");
@@ -380,25 +357,15 @@ describe("pipeline coordinator", () => {
       contextPolicy: "resume_required",
     });
 
-    const reviewAttempt = activeAgentAttempt(attempt, "post_simplify_review");
-    const repair = reducePipelineEvent({
+    const repair = reduceActiveAgentStage({
       manifest,
-      instance: {
-        ...instance,
-        status: "running",
-        active_stage_id: "post_simplify_review",
-      },
-      attempt: reviewAttempt,
-      stages: stages.map((stage) => stage.stage_id === "post_simplify_review"
-        ? { ...stage, status: "running" }
-        : stage),
-      event: agentEventWithArtifacts(
-        instance,
-        reviewAttempt,
-        "semantic_repair_required",
-        ["stage_result", "review"],
-        "post-simplify-repair"
-      ),
+      instance,
+      attempt,
+      stages,
+      stageId: "post_simplify_review",
+      outcome: "semantic_repair_required",
+      id: "post-simplify-repair",
+      artifacts: ["stage_result", "review"],
     });
 
     expect(repair.nextStageId).toBe("implementation");
