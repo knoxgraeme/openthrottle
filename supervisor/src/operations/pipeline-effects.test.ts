@@ -13,7 +13,8 @@ import {
   parseRepositoryConfig,
 } from "../pipeline/manifest.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
-import { buildInstalledRuntimeDescriptor, type SandboxRuntime } from "../runtime/contracts.js";
+import { buildInstalledRuntimeDescriptor, type SandboxAutostopRuntime, type SandboxRuntime } from "../runtime/contracts.js";
+import type { PipelineInstance, PipelineStageAttempt } from "../pipeline/store.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
 
@@ -69,7 +70,9 @@ describe("pipeline effect processor", () => {
       stop: vi.fn(async () => ({ confirmed: true })),
       quarantine: vi.fn(async () => undefined),
       cleanup: vi.fn(async () => undefined),
-    } satisfies SandboxRuntime;
+      setActive: vi.fn(async () => undefined),
+      setIdle: vi.fn(async () => undefined),
+    } satisfies SandboxRuntime & SandboxAutostopRuntime;
     const processor = createPipelineEffectProcessor({
       store: pipelines,
       tickets,
@@ -96,6 +99,38 @@ describe("pipeline effect processor", () => {
     db!.prepare(`
       UPDATE pipeline_effect_intents SET payload = ?, payload_hash = ? WHERE id = ?
     `).run(payload, digestNormalized(payload), effectId);
+  }
+
+  function enqueueIdleEffect(input: {
+    id: string;
+    instance: PipelineInstance;
+    attempt: PipelineStageAttempt;
+    reason?: "provider wait" | "human wait";
+    transitionVersion?: number;
+  }): void {
+    const reason = input.reason ?? "provider wait";
+    const timestamp = "2099-07-22T12:00:00.000Z";
+    const payload = canonicalJson({
+      pipelineInstanceId: input.instance.id,
+      stageId: input.attempt.stage_id,
+      attemptId: input.attempt.id,
+      reason,
+    });
+    db!.prepare(`
+      INSERT INTO pipeline_effect_intents (
+        id, pipeline_instance_id, transition_version, kind, idempotency_key,
+        payload, payload_hash, status, next_attempt_at, created_at
+      ) VALUES (?, ?, ?, 'idle', ?, ?, ?, 'pending', ?, ?)
+    `).run(
+      input.id,
+      input.instance.id,
+      input.transitionVersion ?? 2,
+      `idle:${input.instance.id}:${input.attempt.stage_id}:${input.attempt.id}`,
+      payload,
+      digestNormalized(payload),
+      timestamp,
+      timestamp
+    );
   }
 
   it("provisions, seals, credentials, and dispatches the first stage exactly through the durable intent", async () => {
@@ -145,7 +180,9 @@ describe("pipeline effect processor", () => {
       stop: vi.fn(async () => ({ confirmed: true })),
       quarantine: vi.fn(async () => undefined),
       cleanup: vi.fn(async () => undefined),
-    } satisfies SandboxRuntime;
+      setActive: vi.fn(async () => undefined),
+      setIdle: vi.fn(async () => undefined),
+    } satisfies SandboxRuntime & SandboxAutostopRuntime;
     const processor = createPipelineEffectProcessor({
       store: pipelines,
       tickets,
@@ -280,6 +317,58 @@ describe("pipeline effect processor", () => {
     expect(tickets.getByIssueId("issue-1")?.sandbox_id).toBe("sandbox-new-generation");
   });
 
+  it("idles an active bound sandbox through a best-effort runtime effect", async () => {
+    const { pipelines, runtime, processor, instance, attempt } = harness("issue-idle", "session-idle");
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    runtime.setIdle.mockRejectedValueOnce(new Error("provider timeout"));
+
+    await processor.drain();
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'waiting_provider', active_stage_id = ?
+      WHERE id = ?
+    `).run(attempt.stage_id, instance.id);
+    enqueueIdleEffect({ id: "idle-provider-wait", instance, attempt });
+
+    await processor.drain();
+
+    expect(runtime.setIdle).toHaveBeenCalledWith("sandbox-issue-idle");
+    expect(consoleError).toHaveBeenCalledWith(
+      "[pipeline-effects] failed to idle sandbox:",
+      expect.stringContaining("provider timeout")
+    );
+    expect(runtime.cleanup).not.toHaveBeenCalled();
+    expect(pipelines.getRuntimeResource(instance.id)).toMatchObject({
+      provider_resource_id: "sandbox-issue-idle",
+      status: "active",
+    });
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.id === "idle-provider-wait"))
+      .toMatchObject({ status: "acknowledged", attempts: 1 });
+  });
+
+  it("does not let a stale idle completion undo a repair dispatch reactivation", async () => {
+    const { pipelines, runtime, processor, instance, attempt } = harness("issue-stale-idle", "session-stale-idle");
+
+    await processor.drain();
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'waiting_provider', active_stage_id = ?
+      WHERE id = ?
+    `).run(attempt.stage_id, instance.id);
+    enqueueIdleEffect({ id: "idle-provider-wait-stale-after-call", instance, attempt });
+    runtime.setIdle.mockImplementationOnce(async () => {
+      db!.prepare("UPDATE pipeline_instances SET status = 'dispatchable' WHERE id = ?")
+        .run(instance.id);
+    });
+
+    await processor.drain();
+
+    expect(runtime.setIdle).toHaveBeenCalledWith("sandbox-issue-stale-idle");
+    expect(runtime.setActive).toHaveBeenCalledWith("sandbox-issue-stale-idle");
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.id === "idle-provider-wait-stale-after-call"))
+      .toMatchObject({ status: "acknowledged", attempts: 1 });
+  });
+
   it("settles a pre-provision PR-close stop without creating a runtime resource", async () => {
     db = openDb(":memory:");
     const pipelines = createPipelineStore(db);
@@ -326,7 +415,9 @@ describe("pipeline effect processor", () => {
       stop: vi.fn(async () => ({ confirmed: true })),
       quarantine: vi.fn(async () => undefined),
       cleanup: vi.fn(async () => undefined),
-    } satisfies SandboxRuntime;
+      setActive: vi.fn(async () => undefined),
+      setIdle: vi.fn(async () => undefined),
+    } satisfies SandboxRuntime & SandboxAutostopRuntime;
     const processor = createPipelineEffectProcessor({
       store: pipelines,
       tickets,

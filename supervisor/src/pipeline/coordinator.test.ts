@@ -359,6 +359,65 @@ describe("pipeline coordinator", () => {
     })).toThrow(/provider wait without an exact subject/);
   });
 
+  it("idles the sandbox when a publish transition enters provider wait", () => {
+    const { manifest, instance, attempt, stages } = setup("ce/implement@2");
+    const publishAttempt = {
+      ...attempt,
+      id: "publish-attempt",
+      stage_id: "publish",
+      request_hash: "f".repeat(64),
+      native_context_policy: "resume_required",
+    };
+    const subject = "c".repeat(40);
+    const payload = JSON.stringify({ outcome: "success" });
+    const publishPayload = JSON.stringify({
+      details: { published_commit: subject },
+    });
+    const write = reducePipelineEvent({
+      manifest,
+      instance: { ...instance, active_stage_id: "publish", status: "running" },
+      attempt: publishAttempt,
+      stages: stages.map((stage) => stage.stage_id === "publish" ? { ...stage, status: "running" } : stage),
+      event: {
+        id: "publish-with-subject",
+        kind: "stage_result",
+        instanceId: instance.id,
+        generation: instance.generation,
+        attemptId: publishAttempt.id,
+        requestHash: publishAttempt.request_hash,
+        outcome: "success",
+        resultHash: digestNormalized(payload),
+        subject,
+        providerRevision: subject,
+        artifacts: [
+          {
+            kind: "stage_result",
+            schemaVersion: 1,
+            assurance: "semantic_attested",
+            payload,
+            hash: digestNormalized(payload),
+            subject,
+          },
+          {
+            kind: "publish_subject",
+            schemaVersion: 1,
+            assurance: "semantic_attested",
+            payload: publishPayload,
+            hash: digestNormalized(publishPayload),
+            subject,
+          },
+        ],
+      },
+    });
+
+    expect(write.nextStatus).toBe("waiting_provider");
+    expect(write.nextStageId).toBe("provider");
+    expect(write.effects.map((effect) => effect.kind)).toEqual(["publish_linear", "idle"]);
+    expect(write.effects.find((effect) => effect.kind === "idle")).toMatchObject({
+      idempotencyKey: `idle:${instance.id}:provider:${write.nextAttempt!.id}`,
+    });
+  });
+
   it("turns a current-head provider snapshot into a bounded typed repair re-entry", () => {
     const { manifest, instance, attempt, stages } = setup("ce/implement@2");
     const providerAttempt = {
@@ -515,6 +574,27 @@ describe("pipeline coordinator", () => {
       ["supersede", "superseded", "superseded"],
     ] as const) {
       const { pipelines, manifest, instance, attempt, stages } = setup();
+      const idlePayload = JSON.stringify({
+        pipelineInstanceId: instance.id,
+        stageId: attempt.stage_id,
+        attemptId: attempt.id,
+        reason: "provider wait",
+      });
+      db!.prepare(`
+        INSERT INTO pipeline_effect_intents (
+          id, pipeline_instance_id, transition_version, kind, idempotency_key,
+          payload, payload_hash, status, next_attempt_at, created_at
+        ) VALUES (?, ?, ?, 'idle', ?, ?, ?, 'pending', ?, ?)
+      `).run(
+        `idle-before-${kind}`,
+        instance.id,
+        1,
+        `idle-before-${kind}`,
+        idlePayload,
+        digestNormalized(idlePayload),
+        "2026-01-01T00:00:00.000Z",
+        "2026-01-01T00:00:00.000Z"
+      );
       const input = { ...event(instance, attempt, outcome, `${kind}-event`), kind };
       const write = reducePipelineEvent({ manifest, instance, attempt, stages, event: input });
 
@@ -534,6 +614,10 @@ describe("pipeline coordinator", () => {
       expect(effects.filter((effect) => effect.kind === "publish_linear")).toHaveLength(1);
       expect(effects.filter((effect) => effect.kind === "publish_github")).toHaveLength(1);
       expect(effects.filter((effect) => effect.kind === "stop")).toHaveLength(1);
+      expect(effects.find((effect) => effect.id === `idle-before-${kind}`)).toMatchObject({
+        status: "dead",
+        last_error: "canceled by a terminal pipeline control event",
+      });
       expect(effects.find((effect) => effect.kind === "cleanup")).toBeUndefined();
       expect(effects.find((effect) => effect.kind === "publish_linear")?.payload)
         .toContain("\"schema\":\"openthrottle.pipeline-publication/v1\"");

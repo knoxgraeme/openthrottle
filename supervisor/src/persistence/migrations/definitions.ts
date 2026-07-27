@@ -584,6 +584,50 @@ ALTER TABLE sandbox_events ADD COLUMN ingestion_diagnosed_at TEXT;
 const sandboxEventDiagnosticsMigrationSource = `${sandboxEventDiagnosticsSchema}
 sandbox-event-diagnostics:repeated ingestion failures retain a one-time surfaced diagnostic/v1`;
 
+const pipelineIdleEffectSchema = `
+    CREATE TABLE pipeline_effect_intents_next (
+      id TEXT PRIMARY KEY,
+      pipeline_instance_id TEXT NOT NULL,
+      transition_version INTEGER NOT NULL CHECK(transition_version >= 1),
+      kind TEXT NOT NULL CHECK(kind IN (
+        'provision', 'bootstrap', 'dispatch_stage', 'idle', 'stop', 'quarantine', 'cleanup',
+        'publish_linear', 'publish_github', 'publish_pr'
+      )),
+      idempotency_key TEXT NOT NULL UNIQUE,
+      payload TEXT NOT NULL,
+      payload_hash TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('pending', 'processing', 'acknowledged', 'failed', 'dead')),
+      attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+      next_attempt_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      acknowledged_at TEXT,
+      last_error TEXT,
+      FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
+      UNIQUE(pipeline_instance_id, transition_version, kind, idempotency_key)
+    );
+    INSERT INTO pipeline_effect_intents_next (
+      id, pipeline_instance_id, transition_version, kind, idempotency_key,
+      payload, payload_hash, status, attempts, next_attempt_at, created_at,
+      acknowledged_at, last_error
+    )
+    SELECT
+      id, pipeline_instance_id, transition_version, kind, idempotency_key,
+      payload, payload_hash, status, attempts, next_attempt_at, created_at,
+      acknowledged_at, last_error
+    FROM pipeline_effect_intents;
+    DROP TABLE pipeline_effect_intents;
+    ALTER TABLE pipeline_effect_intents_next RENAME TO pipeline_effect_intents;
+    CREATE INDEX pipeline_effects_pending_idx ON pipeline_effect_intents(status, next_attempt_at);
+`;
+
+const pipelineIdleEffectMigrationSource = `${pipelineIdleEffectSchema}
+effect-kind-contract:provider wait can idle an active sandbox without changing coordinator authority/v1`;
+
+function widenPipelineEffectIntentsForIdle(db: Database.Database): void {
+  if (!hasTable(db, "pipeline_effect_intents")) return;
+  db.exec(pipelineIdleEffectSchema);
+}
+
 const definitions: DatabaseMigrationDefinition[] = [
   {
     version: 1,
@@ -689,6 +733,14 @@ const definitions: DatabaseMigrationDefinition[] = [
       if (hasTable(db, "sandbox_events") && !hasColumns(db, "sandbox_events", ["ingestion_diagnosed_at"])) {
         db.exec(sandboxEventDiagnosticsSchema);
       }
+    },
+  },
+  {
+    version: 11,
+    name: "pipeline-idle-runtime-effect",
+    source: pipelineIdleEffectMigrationSource,
+    up(db) {
+      widenPipelineEffectIntentsForIdle(db);
     },
   },
 ];
