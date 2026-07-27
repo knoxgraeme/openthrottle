@@ -867,6 +867,64 @@ describe("pipeline publication", () => {
     expect(publication.body).not.toContain("semantic review");
   });
 
+  it("places completed provider-feedback repair stages before their command-gate rejoin", () => {
+    const { instance, attempt } = setup("core/implement@4");
+    const repairReviewAttempt = { ...attempt, stage_id: "repair_semantic_review", reentry_ordinal: 1 };
+    const input = semanticEvent({
+      instance: { ...instance, reentry_count: 1 },
+      attempt: repairReviewAttempt,
+      outcome: "success",
+      summary: "Repair review completed after provider feedback.",
+    });
+    const publication = buildStagePublication({
+      instance: { ...instance, reentry_count: 1 },
+      attempt: repairReviewAttempt,
+      event: input.event,
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: repairReviewAttempt.id,
+        outcome: "success",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+      enteredStageIds: [
+        "implementation",
+        "semantic_review",
+        "simplification",
+        "post_simplify_review",
+        "test",
+        "lint",
+        "build",
+        "publish",
+        "provider",
+        "repair_implementation",
+        "repair_semantic_review",
+      ],
+    });
+
+    expect(publication.body.split("\n").slice(0, 12)).toEqual([
+      "**Your move: nothing — testing (stage 7 of 11).**",
+      "- [x] implementing",
+      "- [x] code review",
+      "- [x] simplifying",
+      "- [x] re-review",
+      "- [x] repair implementation",
+      "- [x] repair code review",
+      "→ **testing** — in progress",
+      "- [ ] linting",
+      "- [ ] building",
+      "- [ ] publishing",
+      "- [ ] waiting on GitHub",
+    ]);
+    expect(publication.body).not.toContain("semantic review");
+  });
+
   it("renders artifact findings with severity, code, summary, and fixed or remaining dispositions", () => {
     const { instance, attempt } = setup("fixture/agent@1");
     const input = event(instance, attempt);
@@ -2393,6 +2451,14 @@ describe("pipeline publication", () => {
 
     const publication = pipelines.listPublications(instance.id)
       .find((row) => row.kind === "linear_ledger" && row.attempt_id === attempt.id)!;
+    const publicationBody = parsePipelinePublication(publication.payload).body;
+    expect(publicationBody.split("\n").slice(0, 4)).toEqual([
+      "**Your move: decision required — human decision required at approval (stage 2 of 2).**",
+      "- [x] running command",
+      "→ **approval** — in progress — human decision required at approval",
+      "**Assumptions & decisions**",
+    ]);
+    expect(publicationBody).not.toContain("ask:");
     const processor = createLinearOutboxProcessor({
       store: tickets,
       getLinearClient: async () => ({ accessToken: "oauth", fetch: successfulLinearFetch() }),

@@ -75,6 +75,133 @@ describe("pipeline instance store", () => {
     expect(pipelines.getInstanceForSession("session-new")?.status).toBe("dispatchable");
   });
 
+  it("keeps entered repair stages in superseded terminal publications", () => {
+    const setup = setupPipelineStore(":memory:", shippedCatalogPath);
+    db = setup.db;
+    const { tickets, pipelines, catalog, snapshot } = setup;
+    const manifest = catalog.manifests.get("core/implement@4")!;
+    const pipeline = {
+      repository: "owner/repo",
+      baseCommit: "a".repeat(40),
+      manifest,
+      repositoryConfig: snapshot,
+      runtime,
+      authorizedCapabilities: manifest.manifest.requires.capabilities,
+      taskType: "implement" as const,
+    };
+    tickets.upsert({ ...ticket("repair-old", "repair-issue"), pipeline });
+    const oldInstance = pipelines.getInstanceForSession("repair-old")!;
+    const oldAttempt = pipelines.getActiveAttempt(oldInstance.id)!;
+    db.prepare(`
+      UPDATE pipeline_instance_stages
+      SET attempt_count = 1, status = 'passed'
+      WHERE pipeline_instance_id = ?
+        AND stage_id IN ('implementation', 'semantic_review', 'repair_implementation', 'repair_semantic_review')
+    `).run(oldInstance.id);
+
+    tickets.upsert({ ...ticket("repair-new", "repair-issue"), pipeline });
+
+    const terminal = pipelines.listPublications(oldInstance.id)
+      .find((publication) => publication.kind === "linear_ledger" && publication.attempt_id === oldAttempt.id)!;
+    const payload = JSON.parse(terminal.payload) as { body: string };
+    const repairImplementationIndex = payload.body.indexOf("- [x] repair implementation");
+    const repairReviewIndex = payload.body.indexOf("- [x] repair code review");
+    const testIndex = payload.body.indexOf("- [x] testing");
+    expect(repairImplementationIndex).toBeGreaterThanOrEqual(0);
+    expect(repairReviewIndex).toBeGreaterThanOrEqual(0);
+    expect(testIndex).toBeGreaterThanOrEqual(0);
+    expect(repairImplementationIndex).toBeLessThan(testIndex);
+    expect(repairReviewIndex).toBeLessThan(testIndex);
+    expect(payload.body).not.toContain("repair semantic review");
+  });
+
+  it.each(["pending", "dispatchable"] as const)(
+    "does not show %s repair stages in superseded terminal publications",
+    (queuedStatus) => {
+      const setup = setupPipelineStore(":memory:", shippedCatalogPath);
+      db = setup.db;
+      const { tickets, pipelines, catalog, snapshot } = setup;
+      const manifest = catalog.manifests.get("core/implement@4")!;
+      const pipeline = {
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        manifest,
+        repositoryConfig: snapshot,
+        runtime,
+        authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement" as const,
+      };
+      tickets.upsert({ ...ticket("repair-queued-old", "repair-queued-issue"), pipeline });
+      const oldInstance = pipelines.getInstanceForSession("repair-queued-old")!;
+      const oldAttempt = pipelines.getActiveAttempt(oldInstance.id)!;
+      db.prepare(`
+        UPDATE pipeline_instance_stages
+        SET attempt_count = 1, status = 'passed'
+        WHERE pipeline_instance_id = ?
+          AND stage_id IN ('implementation', 'semantic_review')
+      `).run(oldInstance.id);
+      db.prepare(`
+        UPDATE pipeline_instance_stages
+        SET attempt_count = 1, status = ?
+        WHERE pipeline_instance_id = ?
+          AND stage_id = 'repair_implementation'
+      `).run(queuedStatus, oldInstance.id);
+
+      tickets.upsert({ ...ticket("repair-queued-new", "repair-queued-issue"), pipeline });
+
+      const terminal = pipelines.listPublications(oldInstance.id)
+        .find((publication) => publication.kind === "linear_ledger" && publication.attempt_id === oldAttempt.id)!;
+      const payload = JSON.parse(terminal.payload) as { body: string };
+      expect(payload.body).not.toContain("repair implementation");
+      expect(payload.body).not.toContain("repair code review");
+      expect(payload.body).not.toContain("repair semantic review");
+    }
+  );
+
+  it("does not show queued repair review in superseded terminal publications", () => {
+    const setup = setupPipelineStore(":memory:", shippedCatalogPath);
+    db = setup.db;
+    const { tickets, pipelines, catalog, snapshot } = setup;
+    const manifest = catalog.manifests.get("core/implement@4")!;
+    const pipeline = {
+      repository: "owner/repo",
+      baseCommit: "a".repeat(40),
+      manifest,
+      repositoryConfig: snapshot,
+      runtime,
+      authorizedCapabilities: manifest.manifest.requires.capabilities,
+      taskType: "implement" as const,
+    };
+    tickets.upsert({ ...ticket("repair-review-queued-old", "repair-review-queued-issue"), pipeline });
+    const oldInstance = pipelines.getInstanceForSession("repair-review-queued-old")!;
+    const oldAttempt = pipelines.getActiveAttempt(oldInstance.id)!;
+    db.prepare(`
+      UPDATE pipeline_instance_stages
+      SET attempt_count = 1, status = 'passed'
+      WHERE pipeline_instance_id = ?
+        AND stage_id IN ('implementation', 'semantic_review', 'repair_implementation')
+    `).run(oldInstance.id);
+    db.prepare(`
+      UPDATE pipeline_instance_stages
+      SET attempt_count = 1, status = 'dispatchable'
+      WHERE pipeline_instance_id = ?
+        AND stage_id = 'repair_semantic_review'
+    `).run(oldInstance.id);
+
+    tickets.upsert({ ...ticket("repair-review-queued-new", "repair-review-queued-issue"), pipeline });
+
+    const terminal = pipelines.listPublications(oldInstance.id)
+      .find((publication) => publication.kind === "linear_ledger" && publication.attempt_id === oldAttempt.id)!;
+    const payload = JSON.parse(terminal.payload) as { body: string };
+    const repairImplementationIndex = payload.body.indexOf("- [x] repair implementation");
+    const testIndex = payload.body.indexOf("- [x] testing");
+    expect(repairImplementationIndex).toBeGreaterThanOrEqual(0);
+    expect(testIndex).toBeGreaterThanOrEqual(0);
+    expect(repairImplementationIndex).toBeLessThan(testIndex);
+    expect(payload.body).not.toContain("repair code review");
+    expect(payload.body).not.toContain("repair semantic review");
+  });
+
   it("rolls back supersession when a replacement generation cannot be pinned", () => {
     const setup = setupPipelineStore();
     db = setup.db;

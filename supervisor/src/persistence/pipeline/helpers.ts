@@ -509,6 +509,7 @@ export function buildTerminalPublicationPayload(input: {
   attempt: PipelineStageAttempt | undefined;
   outcome: "superseded";
   reason: string;
+  enteredStageIds?: readonly string[];
 }): string {
   return canonicalJson(buildLifecyclePublication(input));
 }

@@ -117,6 +117,12 @@ function shouldShowRepairStages(
   );
 }
 
+function isTerminalEnvelope(envelope: PipelinePublicationStatusInput): boolean {
+  return envelope.template.name === "terminal" ||
+    envelope.template.name === "needs_human" && envelope.decision.outcome === "needs_human" ||
+    Boolean(envelope.resume_status && TERMINAL_STATUSES.has(envelope.resume_status));
+}
+
 function displayStages(
   envelope: PipelinePublicationStatusInput,
   context: RenderContext,
@@ -126,14 +132,19 @@ function displayStages(
   if (!shouldShowRepairStages(envelope, context, extras)) return path;
 
   const pathIds = new Set(path.map((stage) => stage.id));
-  const repairStages = context.manifest.stages.filter((stage) => isRepairStage(stage.id) && !pathIds.has(stage.id));
+  const enteredStageIds = new Set(extras?.enteredStageIds ?? []);
+  const allRepairStages = context.manifest.stages
+    .filter((stage) => isRepairStage(stage.id) && !pathIds.has(stage.id));
+  const repairStages = isTerminalEnvelope(envelope) && extras?.enteredStageIds
+    ? allRepairStages.filter((stage) => enteredStageIds.has(stage.id))
+    : allRepairStages;
   if (repairStages.length === 0) return path;
 
   const transitionTarget = context.transition?.to;
   const currentPathIndex = envelope.stage
     ? path.findIndex((stage) => stage.id === envelope.stage?.id)
     : -1;
-  const enteredPathIndexes = (extras?.enteredStageIds ?? [])
+  const enteredPathIndexes = [...enteredStageIds]
     .map((stageId) => path.findIndex((stage) => stage.id === stageId))
     .filter((index) => index >= 0);
   const latestEnteredPathIndex = Math.max(-1, ...enteredPathIndexes);
@@ -142,10 +153,10 @@ function displayStages(
   const rejoinIndex = rejoin ? path.findIndex((stage) => stage.id === rejoin) : -1;
   const insertAt = transitionTarget && isRepairStage(transitionTarget) && currentPathIndex >= 0
     ? currentPathIndex + 1
-    : latestEnteredPathIndex >= 0
-      ? latestEnteredPathIndex + 1
-      : rejoinIndex >= 0
-        ? rejoinIndex
+    : rejoinIndex >= 0
+      ? rejoinIndex
+      : latestEnteredPathIndex >= 0
+        ? latestEnteredPathIndex + 1
         : path.length;
   return [
     ...path.slice(0, insertAt),
@@ -194,10 +205,7 @@ function activeChecklistIndex(
   context: RenderContext,
   stages: PipelineManifest["stages"]
 ): number {
-  if (envelope.template.name === "terminal" ||
-      envelope.template.name === "needs_human" ||
-      TERMINAL_STATUSES.has(envelope.decision.next_status) ||
-      (envelope.resume_status && TERMINAL_STATUSES.has(envelope.resume_status))) {
+  if (isTerminalEnvelope(envelope)) {
     return stages.length;
   }
   const next = nextStageName(envelope, context);
@@ -296,10 +304,7 @@ function stageChecklistLines(
 }
 
 function terminalContextLines(envelope: PipelinePublicationStatusInput): string[] {
-  const isTerminal = envelope.template.name === "needs_human" ||
-    envelope.template.name === "terminal" ||
-    TERMINAL_STATUSES.has(envelope.decision.next_status);
-  if (!isTerminal || envelope.decision.outcome === "shipped") return [];
+  if (!isTerminalEnvelope(envelope) || envelope.decision.outcome === "shipped") return [];
   const reason = envelope.decision.wait_reason
     ? displayStatusText(envelope.decision.wait_reason, 1_000)
     : terminalSentence(envelope);

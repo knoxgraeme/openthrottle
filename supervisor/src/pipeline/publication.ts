@@ -610,6 +610,7 @@ export function buildLifecyclePublication(input: {
   attempt?: PipelineStageAttempt;
   outcome: PipelineOutcome;
   reason: string;
+  enteredStageIds?: readonly string[];
 }): PipelinePublicationEnvelope {
   const partial: PipelinePublicationBodyInput = {
     schema: PIPELINE_PUBLICATION_SCHEMA,
@@ -655,7 +656,8 @@ export function buildLifecyclePublication(input: {
   return {
     ...partial,
     body: renderBody(partial, input.instance.normalized_manifest, {
-      hasRepairHistory: false,
+      hasRepairHistory: input.enteredStageIds?.some(isRepairStage) ?? false,
+      enteredStageIds: input.enteredStageIds,
     }),
   };
 }
