@@ -379,7 +379,10 @@ export function processPipelineFeedbackSnapshot(params: {
       snapshot_id: claim.snapshot.id,
       repair_round: claim.snapshot.repair_round,
       expected_published_commit: params.instance.published_commit,
-      observed_head_sha: claim.snapshot.head_sha,
+      // Seal against the head the evidence was actually observed against, not
+      // the drainable head it was carried forward to; the latter would falsely
+      // claim a superseded review was observed against the current subject.
+      observed_head_sha: claim.snapshot.observed_head_sha ?? claim.snapshot.head_sha,
       events: events.map(({ event, parsed }) => ({
         provider: event.provider,
         provider_event_id: event.provider_event_id,

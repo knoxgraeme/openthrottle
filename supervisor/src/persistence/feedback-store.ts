@@ -7,6 +7,7 @@ export interface FeedbackSnapshot {
   linear_session_id: string;
   generation: number;
   head_sha: string;
+  observed_head_sha: string;
   provider_watermark: string;
   status: "collecting" | "claimed" | "consumed" | "stale";
   repair_round: number | null;
@@ -135,16 +136,21 @@ export function createFeedbackStore(
     let snapshotCreated = false;
     if (!snapshot) {
       const id = randomUUID();
+      // `head_sha` is the head the snapshot is drainable against and is
+      // retargeted forward on carry-forward; `observed_head_sha` records the
+      // head each provider event was actually observed against and is frozen at
+      // creation so the audit seal keeps the original subject as provenance.
       db.prepare(`
         INSERT INTO feedback_snapshots (
           id, linear_issue_id, linear_session_id, generation, head_sha,
-          provider_watermark, status, work_item_id, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'collecting', ?, ?)
+          observed_head_sha, provider_watermark, status, work_item_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'collecting', ?, ?)
       `).run(
         id,
         params.issueId,
         params.sessionId,
         params.generation,
+        snapshotHeadSha,
         snapshotHeadSha,
         `${receivedAt}:${params.provider}:${params.providerEventId}`,
         effectiveWorkItemId(params.workItemId, id),
@@ -276,6 +282,9 @@ export function createFeedbackStore(
       return getSnapshot.get(target.id) as FeedbackSnapshot;
     }
 
+    // Retarget only the drainable head and work item to the current commit.
+    // `observed_head_sha` is deliberately left untouched so the carried evidence
+    // still seals under the head it was actually observed against.
     const update = db.prepare(`
       UPDATE feedback_snapshots
       SET head_sha = ?, work_item_id = ?

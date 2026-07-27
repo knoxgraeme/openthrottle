@@ -1740,6 +1740,70 @@ describe("deterministic supervisor stage gates", () => {
       .pluck().get()).toBe(0);
   });
 
+  it("seals carried feedback under the head it was observed against, not the drainable head", () => {
+    const fixture = setup("ce/implement@2");
+    const observedHead = "d".repeat(40);
+    const localSubject = "b".repeat(40);
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    fixture.tickets.setSetting("github-head:issue-1", SUBJECT);
+    fixture.db.prepare(`
+      UPDATE pipeline_instances SET status = 'running', published_commit = ? WHERE id = ?
+    `).run(observedHead, fixture.instance.id);
+    recordAcknowledgedPublication(fixture, localSubject, { publishedCommit: observedHead });
+
+    expect(routePipelineProviderEvent({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      ticket: fixture.tickets.getByIssueId("issue-1")!,
+      eventId: "github-review:observed-head-provenance",
+      outcome: "semantic_repair_required",
+      summary: "Feedback observed against the superseded head.",
+      evidence: ["https://github.com/owner/repo/pull/1#pullrequestreview-9"],
+      payload: { kind: "review", id: "observed-head-provenance" },
+      headSha: observedHead,
+      pullRequestUrl: "https://github.com/owner/repo/pull/1",
+    })).toBe(true);
+
+    const snapshot = fixture.db.prepare("SELECT * FROM feedback_snapshots").get() as FeedbackSnapshot;
+    expect(snapshot.head_sha).toBe(observedHead);
+    expect(snapshot.observed_head_sha).toBe(observedHead);
+
+    moveFixtureToProviderWait(fixture, SUBJECT);
+    expect(drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(1);
+
+    // OPE-27 drainability is preserved: the snapshot is retargeted to the
+    // current published commit and re-enters implementation, while its
+    // provenance head stays pinned to the commit the review was observed against.
+    expect(fixture.db.prepare(
+      "SELECT status, head_sha, observed_head_sha FROM feedback_snapshots WHERE id = ?"
+    ).get(snapshot.id)).toEqual({
+      status: "consumed",
+      head_sha: SUBJECT,
+      observed_head_sha: observedHead,
+    });
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "implementation",
+      reentry_ordinal: 1,
+    });
+
+    // The underlying provider event still identifies the superseded commit...
+    expect(fixture.db.prepare("SELECT head_sha FROM provider_events WHERE provider_event_id = ?")
+      .get("github-review:observed-head-provenance")).toEqual({ head_sha: observedHead });
+
+    // ...and the sealed provider-verified artifact reports the observed head as
+    // provenance, not the current subject it was carried to (audit contract).
+    const sealed = fixture.db.prepare("SELECT payload FROM pipeline_artifacts WHERE kind = 'stage_result'")
+      .all()
+      .map((row) => (JSON.parse((row as { payload: string }).payload) as {
+        repository?: { subject?: string };
+        details?: { snapshot_id?: string; observed_head_sha?: string; expected_published_commit?: string };
+      }))
+      .find((artifact) => artifact.details?.snapshot_id === snapshot.id);
+    expect(sealed?.repository?.subject).toBe(SUBJECT);
+    expect(sealed?.details?.observed_head_sha).toBe(observedHead);
+    expect(sealed?.details?.expected_published_commit).toBe(SUBJECT);
+  });
+
   it("continues draining when the oldest same-session feedback snapshot is stale", () => {
     const fixture = setup("ce/implement@2");
     const staleHead = "d".repeat(40);

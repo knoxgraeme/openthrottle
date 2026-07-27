@@ -628,6 +628,20 @@ function widenPipelineEffectIntentsForIdle(db: Database.Database): void {
   db.exec(pipelineIdleEffectSchema);
 }
 
+const feedbackObservedHeadSchema = `
+ALTER TABLE feedback_snapshots ADD COLUMN observed_head_sha TEXT;
+UPDATE feedback_snapshots SET observed_head_sha = head_sha WHERE observed_head_sha IS NULL;
+`;
+
+const feedbackObservedHeadMigrationSource = `${feedbackObservedHeadSchema}
+observed-head-provenance:carried feedback keeps the head each provider event was observed against, distinct from the drainable head, for the exact-subject audit seal/v1`;
+
+function addFeedbackObservedHeadProvenance(db: Database.Database): void {
+  if (!hasTable(db, "feedback_snapshots")) return;
+  if (hasColumns(db, "feedback_snapshots", ["observed_head_sha"])) return;
+  db.exec(feedbackObservedHeadSchema);
+}
+
 const definitions: DatabaseMigrationDefinition[] = [
   {
     version: 1,
@@ -741,6 +755,14 @@ const definitions: DatabaseMigrationDefinition[] = [
     source: pipelineIdleEffectMigrationSource,
     up(db) {
       widenPipelineEffectIntentsForIdle(db);
+    },
+  },
+  {
+    version: 12,
+    name: "feedback-observed-head-provenance",
+    source: feedbackObservedHeadMigrationSource,
+    up(db) {
+      addFeedbackObservedHeadProvenance(db);
     },
   },
 ];
