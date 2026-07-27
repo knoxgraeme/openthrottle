@@ -305,14 +305,13 @@ rm -f "${OT_DIR}/run-result.json"
 rm -f "$TASK_LOG"
 install -o "$AGENT_USER" -g "$AGENT_USER" -m 0600 /dev/null "$TASK_LOG"
 
-# Everything from here on (our own log() calls, and anything the agent
-# writes to stdout/stderr through runner/normalize.mjs) is tee'd into
-# task.log so handle_exit() has something to summarize on failure.
+# Everything from here on (our own log() calls, and anything the agent writes to
+# stdout/stderr) is tee'd into task.log so handle_exit() has something to
+# summarize on failure.
 exec > >(tee -a "$TASK_LOG") 2>&1
 
 # A root-owned executor pulse covers quiet bootstrap and long commands. It is a
-# liveness signal only; unlike normalize.mjs progress, it is never published as
-# semantic activity.
+# liveness signal only; it is never published as semantic activity.
 RUN_ID="$RUN_ID" OT_HEARTBEAT_FILE="${HEARTBEAT_DIR}/heartbeat.json" \
   node "${OPT_DIR}/runner/heartbeat.mjs" &
 HEARTBEAT_PID=$!

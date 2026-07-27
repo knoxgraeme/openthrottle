@@ -84,8 +84,8 @@ export interface SandboxActivityEvent {
   created_at: string;
   type: "thought" | "action" | "elicitation" | "response" | "error";
   body: string;
-  // Ephemeral thoughts/actions self-replace in Linear. It is used for the live
-  // progress heartbeat emitted by runner/normalize.mjs.
+  // Ephemeral thoughts/actions self-replace in Linear. It is used for live
+  // progress updates emitted by sandbox activity tooling.
   ephemeral?: boolean;
   // Structured fields for `action` events: verb + parameter, plus an optional
   // result once the step completes.
