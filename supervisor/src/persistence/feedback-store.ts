@@ -239,12 +239,12 @@ export function createFeedbackStore(
     workItemId: string
   ): FeedbackSnapshot | undefined => {
     const snapshot = getSnapshot.get(snapshotId) as FeedbackSnapshot | undefined;
-    if (!snapshot || !["collecting", "claimed"].includes(snapshot.status)) return undefined;
+    if (!snapshot || snapshot.status !== "collecting") return undefined;
     if (snapshot.head_sha === headSha) return snapshot;
     const target = db.prepare(`
       SELECT * FROM feedback_snapshots
       WHERE linear_issue_id = ? AND linear_session_id = ? AND generation = ?
-        AND head_sha = ? AND status IN ('collecting', 'claimed')
+        AND head_sha = ? AND status = 'collecting'
       ORDER BY created_at, id LIMIT 1
     `).get(
       snapshot.linear_issue_id,
@@ -262,12 +262,16 @@ export function createFeedbackStore(
       db.prepare(`
         UPDATE provider_events
         SET snapshot_id = ?
-        WHERE snapshot_id = ?
+        WHERE (provider, provider_event_id) IN (
+          SELECT provider, provider_event_id
+          FROM feedback_snapshot_events
+          WHERE snapshot_id = ?
+        )
       `).run(target.id, snapshot.id);
       db.prepare(`
         UPDATE feedback_snapshots
         SET status = 'stale'
-        WHERE id = ? AND status IN ('collecting', 'claimed')
+        WHERE id = ? AND status = 'collecting'
       `).run(snapshot.id);
       return getSnapshot.get(target.id) as FeedbackSnapshot;
     }
@@ -275,7 +279,7 @@ export function createFeedbackStore(
     const update = db.prepare(`
       UPDATE feedback_snapshots
       SET head_sha = ?, work_item_id = ?
-      WHERE id = ? AND status IN ('collecting', 'claimed')
+      WHERE id = ? AND status = 'collecting'
     `).run(headSha, effectiveWorkItemId(workItemId, snapshot.id, snapshot.id), snapshot.id);
     if (update.changes !== 1) return undefined;
     return getSnapshot.get(snapshot.id) as FeedbackSnapshot;

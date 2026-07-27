@@ -48,29 +48,9 @@ export function routePipelineProviderEvent(params: {
   }
   if (pipelineIsTerminal(instance)) return true;
   const authoritativeHead = params.store.getSetting(`github-head:${params.ticket.linear_issue_id}`);
-  if (params.headSha === undefined || params.headSha !== authoritativeHead) return true;
+  if (params.headSha === undefined) return true;
   const canReceive = providerStageCanReceive(params.pipelines, instance);
   const revisionMatches = instance.published_commit !== null && params.headSha === instance.published_commit;
-  if (canReceive && !revisionMatches) {
-    processProviderEvidence(params.pipelines, {
-      id: params.eventId,
-      instanceId: instance.id,
-      outcome: "needs_human",
-      summary: "GitHub's current pull-request head does not match the executor-verified published commit.",
-      evidence: params.evidence,
-      findings: params.findings,
-      providerPayload: {
-        ...params.payload,
-        expected_published_commit: instance.published_commit,
-        observed_head_sha: params.headSha,
-      },
-    });
-    return true;
-  }
-  // A synchronize webhook for the exact commit sealed by the publish stage is
-  // expected and carries no gate decision. Only drift from that revision (the
-  // branch above) is a human-required safety event.
-  if (params.outcome === "needs_human") return true;
   if (params.outcome === "semantic_repair_required" || !canReceive) {
     const snapshot = recordPipelineProviderEvent({
       store: params.store,
@@ -97,6 +77,27 @@ export function routePipelineProviderEvent(params: {
     }
     return true;
   }
+  if (params.headSha !== authoritativeHead) return true;
+  if (canReceive && !revisionMatches) {
+    processProviderEvidence(params.pipelines, {
+      id: params.eventId,
+      instanceId: instance.id,
+      outcome: "needs_human",
+      summary: "GitHub's current pull-request head does not match the executor-verified published commit.",
+      evidence: params.evidence,
+      findings: params.findings,
+      providerPayload: {
+        ...params.payload,
+        expected_published_commit: instance.published_commit,
+        observed_head_sha: params.headSha,
+      },
+    });
+    return true;
+  }
+  // A synchronize webhook for the exact commit sealed by the publish stage is
+  // expected and carries no gate decision. Only drift from that revision (the
+  // branch above) is a human-required safety event.
+  if (params.outcome === "needs_human") return true;
   if (canReceive) {
     processProviderEvidence(params.pipelines, {
       id: params.eventId,

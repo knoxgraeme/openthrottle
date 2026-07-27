@@ -38,6 +38,7 @@ const PROVIDER_OUTCOME_PRIORITY: readonly PipelineProviderOutcome[] = [
   "success",
   "no_change",
 ];
+const GIT_COMMIT = /^[a-f0-9]{40}$/;
 
 export type PipelineProvider = "github" | "linear";
 
@@ -189,13 +190,59 @@ function providerFindings(payload: string): ProviderFinding[] {
   }
 }
 
-function publicationSubject(payload: string): string | undefined {
+function commitString(value: unknown): string | undefined {
+  return typeof value === "string" && GIT_COMMIT.test(value) ? value : undefined;
+}
+
+function providerRevisionsFromArtifacts(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((artifact) => {
+    if (!artifact || typeof artifact !== "object" || Array.isArray(artifact)) return [];
+    const payload = (artifact as { payload?: unknown }).payload;
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) return [];
+    const details = (payload as { details?: unknown }).details;
+    if (!details || typeof details !== "object" || Array.isArray(details)) return [];
+    return [
+      commitString((details as { published_commit?: unknown }).published_commit),
+      commitString((details as { provider_revision?: unknown }).provider_revision),
+    ].filter((subject): subject is string => subject !== undefined);
+  });
+}
+
+function publicationSubjects(payload: string): string[] {
   try {
-    const parsed = JSON.parse(payload) as { decision?: { subject?: unknown } };
-    return typeof parsed.decision?.subject === "string" ? parsed.decision.subject : undefined;
+    const parsed = JSON.parse(payload) as {
+      decision?: { subject?: unknown };
+      artifact_inline?: unknown;
+      attachment?: { content?: unknown };
+    };
+    const subjects = new Set<string>();
+    const subject = commitString(parsed.decision?.subject);
+    if (subject) subjects.add(subject);
+    for (const artifacts of [parsed.artifact_inline, parsed.attachment?.content]) {
+      if (typeof artifacts !== "string") continue;
+      try {
+        for (const revision of providerRevisionsFromArtifacts(JSON.parse(artifacts) as unknown)) {
+          subjects.add(revision);
+        }
+      } catch {
+        // Older or malformed publication payloads simply cannot carry feedback.
+      }
+    }
+    return [...subjects];
   } catch {
-    return undefined;
+    return [];
   }
+}
+
+function snapshotBelongsToInstance(
+  snapshot: FeedbackSnapshot,
+  instance: PipelineInstance
+): boolean {
+  return snapshot.linear_issue_id === instance.linear_issue_id &&
+    snapshot.linear_session_id === instance.linear_session_id &&
+    snapshot.generation === instance.generation &&
+    snapshot.work_item_id?.startsWith(`pipeline-feedback:${instance.id}:`) === true;
 }
 
 function snapshotCanCarryForward(
@@ -203,10 +250,7 @@ function snapshotCanCarryForward(
   snapshot: FeedbackSnapshot,
   instance: PipelineInstance
 ): boolean {
-  return snapshot.linear_issue_id === instance.linear_issue_id &&
-    snapshot.linear_session_id === instance.linear_session_id &&
-    snapshot.generation === instance.generation &&
-    snapshot.work_item_id?.startsWith(`pipeline-feedback:${instance.id}:`) === true &&
+  return snapshotBelongsToInstance(snapshot, instance) &&
     instance.published_commit !== null &&
     snapshot.head_sha !== instance.published_commit &&
     !snapshot.head_sha.startsWith("conversation:") &&
@@ -216,8 +260,7 @@ function snapshotCanCarryForward(
 function acknowledgedPublicationSubjects(pipelines: PipelineStore, instanceId: string): ReadonlySet<string> {
   return new Set(pipelines.listPublications(instanceId)
     .filter((publication) => publication.status === "acknowledged")
-    .map((publication) => publicationSubject(publication.payload))
-    .filter((subject): subject is string => subject !== undefined));
+    .flatMap((publication) => publicationSubjects(publication.payload)));
 }
 
 function staleFeedbackNotice(params: {
@@ -268,6 +311,15 @@ export function processPipelineFeedbackSnapshot(params: {
       `pipeline-feedback:${params.instance.id}:${params.instance.published_commit}`
     ) ?? params.snapshot
     : params.snapshot;
+  if (!snapshotBelongsToInstance(currentSnapshot, params.instance)) {
+    markStaleFeedbackWithNotice({
+      store: params.store,
+      instance: params.instance,
+      snapshot: currentSnapshot,
+      eventCount: 1,
+    });
+    return false;
+  }
   const claim = params.store.claimFeedbackSnapshot(currentSnapshot.id, UNBOUNDED_SNAPSHOT_CLAIM);
   if (claim.status !== "claimed") {
     if (claim.status === "stale") {
@@ -330,8 +382,10 @@ export function drainPipelineFeedbackSnapshots(
   let processed = 0;
   for (const instance of pipelines.listProviderReadyInstances(limit)) {
     if (!providerStageCanReceive(pipelines, instance)) continue;
+    const snapshots = store.listPendingFeedbackSnapshots(instance.linear_session_id, limit);
+    if (snapshots.length === 0) continue;
     const publicationSubjects = acknowledgedPublicationSubjects(pipelines, instance.id);
-    for (const snapshot of store.listPendingFeedbackSnapshots(instance.linear_session_id, limit)) {
+    for (const snapshot of snapshots) {
       if (processPipelineFeedbackSnapshot({
         pipelines,
         store,
