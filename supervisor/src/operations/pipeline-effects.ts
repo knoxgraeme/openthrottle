@@ -191,6 +191,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       if (existing.status !== "active") {
         throw new Error(`pipeline runtime ${existing.provider_resource_id} is ${existing.status} and cannot dispatch`);
       }
+      await deps.runtime.setActive(existing.provider_resource_id);
       return { providerResourceId: existing.provider_resource_id };
     }
     const resource = await deps.runtime.provision({
@@ -282,6 +283,9 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     if (control.reason === "provider wait") return current.status === "waiting_provider";
     return current.status === "waiting_human" || current.status === "completion_pending_publication";
   };
+
+  const idleAcknowledgementResult = (effectId: string): RuntimeEffectHandlerResult =>
+    deps.store.getEffect(effectId)?.status === "dead" ? "skip_acknowledgement" : "acknowledge";
 
   const handleStageDispatchEffect = async (
     effect: PipelineEffectIntent,
@@ -466,7 +470,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     } catch (error) {
       console.error("[pipeline-effects] failed to idle sandbox:",
         sanitizeText(String(error)).slice(-500));
-      return "acknowledge";
+      return idleAcknowledgementResult(effect.id);
     }
     if (!isCurrentIdleWait(instance.id, control) &&
         deps.store.getRuntimeResource(instance.id)?.status === "active") {
@@ -477,7 +481,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
           sanitizeText(String(error)).slice(-500));
       }
     }
-    return deps.store.getEffect(effect.id)?.status === "dead" ? "skip_acknowledgement" : "acknowledge";
+    return idleAcknowledgementResult(effect.id);
   };
 
   const runtimeHandlers: Partial<Record<PipelineEffectIntent["kind"], (

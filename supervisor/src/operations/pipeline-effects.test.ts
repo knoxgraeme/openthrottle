@@ -369,6 +369,113 @@ describe("pipeline effect processor", () => {
       .toMatchObject({ status: "acknowledged", attempts: 1 });
   });
 
+  it.each([
+    ["waiting_human"],
+    ["completion_pending_publication"],
+  ] as const)("idles an active bound sandbox during %s", async (status) => {
+    const { pipelines, runtime, processor, instance, attempt } = harness(
+      `issue-${status}`,
+      `session-${status}`
+    );
+
+    await processor.drain();
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET status = ?, active_stage_id = ?
+      WHERE id = ?
+    `).run(status, attempt.stage_id, instance.id);
+    enqueueIdleEffect({
+      id: `idle-${status}`,
+      instance,
+      attempt,
+      reason: "human wait",
+    });
+
+    await processor.drain();
+
+    expect(runtime.setIdle).toHaveBeenCalledWith(`sandbox-issue-${status}`);
+    expect(pipelines.getEffect(`idle-${status}`))
+      .toMatchObject({ status: "acknowledged", attempts: 1 });
+  });
+
+  it("restores active autostop before dispatching after an idled wait", async () => {
+    const { pipelines, runtime, processor, instance, attempt } = harness(
+      "issue-repair-reactivate",
+      "session-repair-reactivate"
+    );
+
+    await processor.drain();
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'waiting_provider', active_stage_id = ?
+      WHERE id = ?
+    `).run(attempt.stage_id, instance.id);
+    enqueueIdleEffect({ id: "idle-before-repair-dispatch", instance, attempt });
+    await processor.drain();
+    expect(runtime.setIdle).toHaveBeenCalledWith("sandbox-issue-repair-reactivate");
+
+    runtime.setActive.mockClear();
+    runtime.dispatchStage.mockClear();
+    const payload = canonicalJson(pipelines.getStageRequest(attempt.id));
+    db!.prepare("UPDATE pipeline_instances SET status = 'dispatchable' WHERE id = ?")
+      .run(instance.id);
+    db!.prepare(`
+      INSERT INTO pipeline_effect_intents (
+        id, pipeline_instance_id, transition_version, kind, idempotency_key,
+        payload, payload_hash, status, next_attempt_at, created_at
+      ) VALUES (?, ?, 3, 'dispatch_stage', ?, ?, ?, 'pending', ?, ?)
+    `).run(
+      "dispatch-after-idle",
+      instance.id,
+      "dispatch-after-idle",
+      payload,
+      digestNormalized(payload),
+      "2099-07-22T12:00:00.000Z",
+      "2099-07-22T12:00:00.000Z"
+    );
+
+    await processor.drain();
+
+    expect(runtime.setActive).toHaveBeenCalledWith("sandbox-issue-repair-reactivate");
+    expect(runtime.dispatchStage).toHaveBeenCalledTimes(1);
+    expect(runtime.setActive.mock.invocationCallOrder[0])
+      .toBeLessThan(runtime.dispatchStage.mock.invocationCallOrder[0]);
+    expect(pipelines.getEffect("dispatch-after-idle"))
+      .toMatchObject({ status: "acknowledged", attempts: 1 });
+  });
+
+  it("does not acknowledge a failed idle effect canceled by terminal control", async () => {
+    const { pipelines, runtime, processor, instance, attempt } = harness("issue-failed-dead-idle", "session-failed-dead-idle");
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await processor.drain();
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'waiting_provider', active_stage_id = ?
+      WHERE id = ?
+    `).run(attempt.stage_id, instance.id);
+    enqueueIdleEffect({ id: "idle-provider-wait-failed-after-dead", instance, attempt });
+    runtime.setIdle.mockImplementationOnce(async () => {
+      db!.prepare(`
+        UPDATE pipeline_effect_intents
+        SET status = 'dead', last_error = 'canceled by terminal control'
+        WHERE id = ?
+      `).run("idle-provider-wait-failed-after-dead");
+      throw new Error("provider timeout");
+    });
+
+    await processor.drain();
+
+    expect(runtime.setIdle).toHaveBeenCalledWith("sandbox-issue-failed-dead-idle");
+    expect(consoleError).toHaveBeenCalledWith(
+      "[pipeline-effects] failed to idle sandbox:",
+      expect.stringContaining("provider timeout")
+    );
+    expect(pipelines.getEffect("idle-provider-wait-failed-after-dead"))
+      .toMatchObject({ status: "dead", attempts: 1, last_error: "canceled by terminal control" });
+    expect(pipelines.listEffects(instance.id).filter((effect) => effect.kind === "stop")).toHaveLength(0);
+  });
+
   it("settles a pre-provision PR-close stop without creating a runtime resource", async () => {
     db = openDb(":memory:");
     const pipelines = createPipelineStore(db);
