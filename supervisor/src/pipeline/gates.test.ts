@@ -963,7 +963,7 @@ describe("deterministic supervisor stage gates", () => {
       fixture.pipelines
     );
 
-    const providerEventId = `github-pull-closed:1:${SUBJECT}`;
+    const providerEventId = `github-pull-closed:owner/repo:1:${SUBJECT}`;
     expect(fixture.pipelines.getInboxEvent(providerEventId)?.status).toBe("pending");
     expect(fixture.pipelines.getAttempt(fixture.attempt.id)?.status).toBe("pending");
     expect(fixture.pipelines.getInstance(fixture.instance.id)?.terminal_outcome).toBeNull();
@@ -975,6 +975,64 @@ describe("deterministic supervisor stage gates", () => {
       status: "completion_pending_publication",
       terminal_outcome: terminalOutcome,
     });
+  });
+
+  it("scopes merged pull request journal idempotency keys by repository", async () => {
+    const recordJournalEntry = vi.fn();
+    const ticket = {
+      linear_issue_id: "issue-1",
+      linear_issue_identifier: "ISSUE-1",
+      linear_session_id: "session-1",
+      branch: "ot/issue-1",
+      repo: "owner/repo",
+      pr_url: null,
+    };
+    const instance = {
+      id: "instance-1",
+      repository: "owner/repo",
+      status: "shipped",
+      terminal_outcome: "shipped",
+    } as PipelineInstance;
+    const store = {
+      getByBranch: vi.fn(() => ticket),
+      setPrUrl: vi.fn(),
+      setSetting: vi.fn(),
+      getSetting: vi.fn(() => SUBJECT),
+      setState: vi.fn(),
+      markSessionState: vi.fn(),
+      cancelPendingInbox: vi.fn(),
+    } as unknown as SupervisorStore;
+    const pipelines = {
+      getInstanceForSession: vi.fn(() => instance),
+      getInboxEvent: vi.fn(() => undefined),
+      recordJournalEntry,
+    } as unknown as PipelineStore;
+
+    await handleGithubEvent(
+      {} as never,
+      store,
+      {} as never,
+      {
+        kind: "pull_request",
+        action: "closed",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 1,
+          html_url: "https://github.com/owner/repo/pull/1",
+          merged: true,
+          head: { ref: "ot/issue-1", sha: SUBJECT },
+          base: { ref: "main" },
+        },
+      },
+      pipelines
+    );
+
+    expect(recordJournalEntry).toHaveBeenCalledWith(expect.objectContaining({
+      id: `journal-github-merged-owner/repo-1-${SUBJECT}`,
+    }));
+    expect(pipelines.getInboxEvent).toHaveBeenCalledWith(
+      `github-pull-closed:owner/repo:1:${SUBJECT}`
+    );
   });
 
   it("treats unmarked feedback as human and marker-bearing bodies as the pipeline's own, regardless of author", async () => {
@@ -1714,7 +1772,7 @@ describe("deterministic supervisor stage gates", () => {
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       ticket: fixture.tickets.getByIssueId("issue-1")!,
-      eventId: `github-pull-closed:1:${SUBJECT}`,
+      eventId: `github-pull-closed:owner/repo:1:${SUBJECT}`,
       outcome: "success",
       summary: "GitHub reports the pull request merged.",
       evidence: ["https://github.com/owner/repo/pull/1"],

@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import { canonicalJson, digestNormalized } from "../../pipeline/manifest.js";
+import { canonicalJson, digestNormalized, type PipelineManifest } from "../../pipeline/manifest.js";
 import type {
   CoordinatorTransitionWrite,
   PipelineInboxEventRecord,
@@ -12,6 +12,7 @@ import {
   deterministicId,
   validatePinnedInstance,
 } from "./helpers.js";
+import { createJournalStore } from "./journal-store.js";
 
 function attemptStatusForOutcome(
   outcome: CoordinatorTransitionWrite["outcome"]
@@ -29,6 +30,79 @@ export function createTransitionStore(db: Database.Database, now: () => string):
   const getInstanceStmt = db.prepare("SELECT * FROM pipeline_instances WHERE id = ?");
   const getAttemptStmt = db.prepare("SELECT * FROM pipeline_stage_attempts WHERE id = ?");
   const persistPublication = createPipelinePublicationWriter(db);
+  const journal = createJournalStore(db, now);
+
+  const maybeRecordRunNote = (
+    instance: PipelineInstance,
+    attempt: PipelineStageAttempt,
+    write: CoordinatorTransitionWrite
+  ): void => {
+    const manifest = JSON.parse(instance.normalized_manifest) as PipelineManifest;
+    const stage = manifest.stages.find((candidate) => candidate.id === attempt.stage_id);
+    if (stage?.executor.kind !== "agent") return;
+    const stageResult = write.artifacts?.find((artifact) => artifact.kind === "stage_result");
+    if (!stageResult) return;
+    let payload: {
+      summary?: unknown;
+      evidence?: unknown;
+      findings?: unknown;
+      uncertainty?: unknown;
+    };
+    try {
+      payload = JSON.parse(stageResult.payload) as typeof payload;
+    } catch {
+      return;
+    }
+    const summary = typeof payload.summary === "string" ? payload.summary : "";
+    const evidence = Array.isArray(payload.evidence)
+      ? payload.evidence.filter((item): item is string => typeof item === "string").slice(0, 10)
+      : [];
+    const findings = Array.isArray(payload.findings)
+      ? payload.findings.filter((item): item is Record<string, unknown> =>
+          typeof item === "object" && item !== null
+        ).slice(0, 10)
+      : [];
+    const uncertainty = Array.isArray(payload.uncertainty)
+      ? payload.uncertainty.filter((item): item is string => typeof item === "string").slice(0, 10)
+      : [];
+    const notable = attempt.stage_id.startsWith("repair_") ||
+      uncertainty.length > 0 ||
+      write.outcome === "no_change";
+    if (!notable) return;
+    const note = [
+      summary,
+      uncertainty.length > 0 ? `Uncertainty: ${uncertainty.join(" ")}` : "",
+      findings.length > 0
+        ? `Findings: ${findings.map((finding) => String(finding.summary ?? "")).filter(Boolean).join(" ")}`
+        : "",
+    ].filter(Boolean).join("\n\n");
+    if (!note.trim()) return;
+    journal.recordJournalEntry({
+      id: deterministicId("journal", [attempt.id, stageResult.hash, "run_note"]),
+      issueId: instance.linear_issue_id,
+      instanceId: instance.id,
+      runId: attempt.run_id,
+      actor: "stage_agent",
+      kind: "run_note",
+      trigger: `${attempt.stage_id} proposal projection`,
+      action: "Projected notable stage proposal fields into the orchestration journal.",
+      outcome: write.outcome,
+      refs: {
+        stage: attempt.stage_id,
+        attempt_id: attempt.id,
+        run_id: attempt.run_id,
+        result_hash: write.resultHash,
+        evidence_count: evidence.length,
+        finding_count: findings.length,
+      },
+      note,
+      structured: {
+        suggested_outcome: write.outcome,
+        uncertainty,
+        evidence_refs: evidence,
+      },
+    });
+  };
 
   const enqueueInboxEvent = db.transaction((input: {
     id: string;
@@ -157,6 +231,8 @@ export function createTransitionStore(db: Database.Database, now: () => string):
       );
       wrote();
     }
+    maybeRecordRunNote(instance, attempt, write);
+    wrote();
     db.prepare(`
       UPDATE pipeline_instance_stages
       SET status = ?,
@@ -269,6 +345,67 @@ export function createTransitionStore(db: Database.Database, now: () => string):
         effect.payload, payloadHash, publicationKind ? "acknowledged" : "pending",
         timestamp, timestamp, publicationKind ? timestamp : null
       );
+      wrote();
+    }
+    if (write.nextStageId?.startsWith("repair_")) {
+      journal.recordJournalEntry({
+        id: deterministicId("journal", [instance.id, attempt.id, write.nextStageId, "relayed_finding"]),
+        issueId: instance.linear_issue_id,
+        instanceId: instance.id,
+        runId: attempt.run_id,
+        actor: "supervisor",
+        kind: "relayed_finding",
+        trigger: `${attempt.stage_id} produced ${write.outcome}`,
+        action: `Scheduled ${write.nextStageId} for repair.`,
+        outcome: write.outcome,
+        refs: {
+          stage: attempt.stage_id,
+          attempt_id: attempt.id,
+          next_stage: write.nextStageId,
+          next_attempt: write.nextAttempt?.id ?? null,
+          result_hash: write.resultHash,
+        },
+      });
+      wrote();
+    }
+    if (attempt.stage_id === "publish" && write.outcome === "success") {
+      journal.recordJournalEntry({
+        id: deterministicId("journal", [instance.id, attempt.id, "published"]),
+        issueId: instance.linear_issue_id,
+        instanceId: instance.id,
+        runId: attempt.run_id,
+        actor: "supervisor",
+        kind: "published",
+        trigger: "Publish stage settled",
+        action: "Recorded executor-verified publication output.",
+        outcome: write.outcome,
+        refs: {
+          stage: attempt.stage_id,
+          attempt_id: attempt.id,
+          commit: write.publishedCommit ?? write.immutableSubject ?? null,
+          result_hash: write.resultHash,
+        },
+      });
+      wrote();
+    }
+    if (write.terminalOutcome) {
+      journal.recordJournalEntry({
+        id: deterministicId("journal", [instance.id, attempt.id, write.terminalOutcome, "terminal_observed"]),
+        issueId: instance.linear_issue_id,
+        instanceId: instance.id,
+        runId: attempt.run_id,
+        actor: "supervisor",
+        kind: "terminal_observed",
+        trigger: `${attempt.stage_id} transition settled`,
+        action: "Observed a terminal pipeline outcome.",
+        outcome: write.terminalOutcome,
+        refs: {
+          stage: attempt.stage_id,
+          attempt_id: attempt.id,
+          result_hash: write.resultHash,
+          subject: write.publishedCommit ?? write.immutableSubject ?? null,
+        },
+      });
       wrote();
     }
     const consumed = db.prepare(`

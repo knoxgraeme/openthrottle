@@ -48,6 +48,7 @@ describe("database migrations", () => {
       "5a368da3f7ec165fef42cdb27545534372e6344c3283f185e65e5c447a671dee",
       "927f4e9a8a9583b52fed3f537a364ba4a57c47ea9afa4b9475286e2ec8605b71",
       "e9a57fd85fbca09daeb1b87dbeab27d9cf696da3cb6e00a4a0ee7652bb72d6e2",
+      "f8bdad88455442e46d1951f7fe48050f9367d83273ed94c8eaf7f610666fb809",
     ]);
   });
 
@@ -67,6 +68,25 @@ describe("database migrations", () => {
     expect(db.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'work_deliveries'"
     ).get()).toEqual({ name: "work_deliveries" });
+    expect(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'orchestration_journal'"
+    ).get()).toEqual({ name: "orchestration_journal" });
+    expect(db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'index' AND name = 'orchestration_journal_issue_recorded_idx'
+    `).get()).toEqual({ name: "orchestration_journal_issue_recorded_idx" });
+    expect(db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'index' AND name = 'orchestration_journal_issue_lower_recorded_idx'
+    `).get()).toEqual({ name: "orchestration_journal_issue_lower_recorded_idx" });
+    expect(db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'index' AND name = 'orchestration_journal_repository_recorded_idx'
+    `).get()).toEqual({ name: "orchestration_journal_repository_recorded_idx" });
+    expect(db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'index' AND name = 'orchestration_journal_repository_lower_recorded_idx'
+    `).get()).toEqual({ name: "orchestration_journal_repository_lower_recorded_idx" });
   });
 
   it("fails closed on a checksum mismatch or unknown newer version", () => {

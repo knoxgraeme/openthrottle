@@ -792,6 +792,47 @@ contraction-contract:runtime resource identity lives on pipeline_instances/v1
 contraction-contract:run actor liveness lives on runs and pipeline_stage_attempts/v1
 historical session_executions and pipeline_runtime_resources tables remain retained history`;
 
+const orchestrationJournalSchema = `
+CREATE TABLE orchestration_journal (
+  id TEXT PRIMARY KEY,
+  recorded_at TEXT NOT NULL,
+  team TEXT NOT NULL,
+  repository TEXT NOT NULL,
+  issue TEXT NOT NULL,
+  instance_id TEXT,
+  run_id TEXT,
+  actor TEXT NOT NULL CHECK(actor IN ('supervisor', 'stage_agent', 'orchestrator', 'human')),
+  kind TEXT NOT NULL CHECK(kind IN (
+    'delegated', 'published', 'merged', 'relayed_finding', 'dispatched_fix',
+    'detected_stall', 'capacity_refused', 'escalated_human',
+    'terminal_observed', 'run_note'
+  )),
+  trigger TEXT NOT NULL,
+  action TEXT NOT NULL,
+  outcome TEXT,
+  refs TEXT NOT NULL,
+  note TEXT,
+  structured TEXT,
+  CHECK(json_valid(refs)),
+  CHECK(structured IS NULL OR json_valid(structured)),
+  CHECK(note IS NULL OR length(note) <= 8000)
+);
+CREATE INDEX orchestration_journal_issue_recorded_idx
+  ON orchestration_journal(issue, recorded_at);
+CREATE INDEX orchestration_journal_repository_recorded_idx
+  ON orchestration_journal(repository, recorded_at);
+CREATE INDEX orchestration_journal_issue_lower_recorded_idx
+  ON orchestration_journal(lower(issue), recorded_at);
+CREATE INDEX orchestration_journal_repository_lower_recorded_idx
+  ON orchestration_journal(lower(repository), recorded_at);
+`;
+
+const orchestrationJournalMigrationSource = `${orchestrationJournalSchema}
+journal-contract:append-only cross-run orchestration decisions and stage-agent notes keyed by team, repository, and issue/v1
+actor-contract:supervisor deterministic events are objective facts; stage_agent run_notes are sanitized evidence only
+read-contract:query by issue or repository over recorded_at without feeding coordinator control flow/v1
+read-index-contract:case-insensitive read filters use lower-expression indexes while preserving pinned plain indexes/v1`;
+
 function contractSatelliteTables(db: Database.Database): void {
   if (hasTable(db, "agent_sessions")) {
     if (!hasColumns(db, "agent_sessions", ["execution_mode"])) {
@@ -1170,6 +1211,14 @@ const definitions: DatabaseMigrationDefinition[] = [
     source: satelliteTableContractionSource,
     up(db) {
       contractSatelliteTables(db);
+    },
+  },
+  {
+    version: 15,
+    name: "orchestration-journal",
+    source: orchestrationJournalMigrationSource,
+    up(db) {
+      if (!hasTable(db, "orchestration_journal")) db.exec(orchestrationJournalSchema);
     },
   },
 ];

@@ -171,6 +171,66 @@ export interface PipelineInboxEventRecord {
   status: "pending" | "consumed" | "stale" | "dead";
 }
 
+export type OrchestrationJournalActor =
+  | "supervisor"
+  | "stage_agent"
+  | "orchestrator"
+  | "human";
+
+export type OrchestrationJournalKind =
+  | "delegated"
+  | "published"
+  | "merged"
+  | "relayed_finding"
+  | "dispatched_fix"
+  | "detected_stall"
+  | "capacity_refused"
+  | "escalated_human"
+  | "terminal_observed"
+  | "run_note";
+
+export interface OrchestrationJournalEntry {
+  id: string;
+  recorded_at: string;
+  team: string;
+  repository: string;
+  issue: string;
+  instance_id: string | null;
+  run_id: string | null;
+  actor: OrchestrationJournalActor;
+  kind: OrchestrationJournalKind;
+  trigger: string;
+  action: string;
+  outcome: string | null;
+  refs: string;
+  note: string | null;
+  structured: string | null;
+}
+
+export interface OrchestrationJournalWrite {
+  id?: string;
+  issueId: string;
+  instanceId?: string | null;
+  runId?: string | null;
+  actor: OrchestrationJournalActor;
+  kind: OrchestrationJournalKind;
+  trigger: string;
+  action: string;
+  outcome?: string | null;
+  refs?: Record<string, unknown>;
+  note?: string | null;
+  structured?: Record<string, unknown> | null;
+}
+
+export interface OrchestrationJournalQuery {
+  issueId?: string;
+  issue?: string;
+  repository?: string;
+  from?: string;
+  to?: string;
+  limit?: number;
+}
+
 export interface PipelineStatusProjection {
   execution_mode: "pipeline";
   instance_id: string;
@@ -373,4 +433,6 @@ export interface PipelineStore {
     subject?: string | null;
   }): "pending" | "stale" | "consumed";
   applyTransition(write: CoordinatorTransitionWrite, faultAfterWrite?: (writeCount: number) => void): PipelineInstance;
+  recordJournalEntry(input: OrchestrationJournalWrite): void;
+  listJournalEntries(query: OrchestrationJournalQuery): OrchestrationJournalEntry[];
 }

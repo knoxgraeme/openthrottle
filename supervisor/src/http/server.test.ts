@@ -144,6 +144,38 @@ describe("coordinator-only server", () => {
     });
   });
 
+  it("serves the orchestration journal through an explicit read path", async () => {
+    seedPipelineTicket();
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    pipelines.recordJournalEntry({
+      id: "journal-test-row",
+      issueId: "issue-1",
+      instanceId: instance.id,
+      actor: "supervisor",
+      kind: "terminal_observed",
+      trigger: "test",
+      action: "Observed a terminal outcome.",
+      outcome: "no_change",
+      refs: { stage: "command" },
+    });
+
+    const response = await app().request("/tickets/OT-1/journal", {
+      headers: { Authorization: "Bearer status-token" },
+    });
+
+    expect(response.status).toBe(200);
+    const body = await response.json() as {
+      journal: Array<{ id: string; issue: string; repository: string; kind: string }>;
+    };
+    const row = body.journal.find((entry) => entry.kind === "terminal_observed");
+    expect(row?.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(row).toMatchObject({
+      issue: "OT-1",
+      repository: "owner/repo",
+      kind: "terminal_observed",
+    });
+  });
+
   it("includes repeated sandbox ingestion failures in pipeline status", async () => {
     seedPipelineTicket();
     // Diagnostics are instance-scoped through the run/attempt binding, so the

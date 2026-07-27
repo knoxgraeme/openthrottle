@@ -121,6 +121,15 @@ function setAuthoritativeGithubHead(store: SupervisorStore, issueId: string, hea
   store.setSetting(`github-head-source:${issueId}`, "authoritative");
 }
 
+function githubPullEventId(
+  action: "closed" | "closed-stop" | "synchronize",
+  repository: string,
+  pullNumber: number,
+  headSha: string
+): string {
+  return `github-pull-${action}:${repository}:${pullNumber}:${headSha}`;
+}
+
 export function considerCiGithubHead(
   store: SupervisorStore,
   issueId: string,
@@ -277,7 +286,12 @@ export async function handleGithubEvent(
         pipelines,
         store,
         ticket,
-        eventId: `github-pull-synchronize:${event.pull_request.number}:${event.pull_request.head.sha}`,
+        eventId: githubPullEventId(
+          "synchronize",
+          event.repository.full_name,
+          event.pull_request.number,
+          event.pull_request.head.sha
+        ),
         outcome: "needs_human",
         summary: "The pull-request head changed after the pipeline entered provider wait.",
         evidence: [event.pull_request.html_url],
@@ -287,8 +301,12 @@ export async function handleGithubEvent(
       });
     }
     if (event.action === "closed") {
-      const providerEventId =
-        `github-pull-closed:${event.pull_request.number}:${event.pull_request.head.sha ?? "unknown"}`;
+      const providerEventId = githubPullEventId(
+        "closed",
+        event.repository.full_name,
+        event.pull_request.number,
+        event.pull_request.head.sha ?? "unknown"
+      );
       if (event.pull_request.head.sha) {
         setAuthoritativeGithubHead(store, ticket.linear_issue_id, event.pull_request.head.sha);
       }
@@ -314,11 +332,34 @@ export async function handleGithubEvent(
         requestPipelineStop({
           store: pipelines,
           sessionId: ticket.linear_session_id,
-          eventId: `github-pull-closed-stop:${event.pull_request.number}:${event.pull_request.head.sha ?? "unknown"}`,
+          eventId: githubPullEventId(
+            "closed-stop",
+            event.repository.full_name,
+            event.pull_request.number,
+            event.pull_request.head.sha ?? "unknown"
+          ),
           reason: event.pull_request.merged
             ? "Pull request merged while a pipeline stage was active."
             : "Pull request closed while a pipeline stage was active.",
           ticketState: "closed",
+        });
+      }
+      if (event.pull_request.merged) {
+        const observed = currentPipeline ?? pipelineInstance;
+        pipelines.recordJournalEntry({
+          id: `journal-github-merged-${observed.repository}-${event.pull_request.number}-${event.pull_request.head.sha ?? "unknown"}`,
+          issueId: ticket.linear_issue_id,
+          instanceId: observed.id,
+          actor: "supervisor",
+          kind: "merged",
+          trigger: "GitHub pull_request closed webhook",
+          action: "Observed the pull request merged.",
+          outcome: "merged",
+          refs: {
+            pr: event.pull_request.html_url,
+            commit: event.pull_request.head.sha ?? null,
+            pull_number: event.pull_request.number,
+          },
         });
       }
       // GitHub close is authoritative even when a stage already settled and

@@ -26,6 +26,7 @@ import {
   SAFE_BRANCH,
   validatePinnedInstance,
 } from "./helpers.js";
+import { createJournalStore } from "./journal-store.js";
 
 interface ValidatedInstanceSeed {
   authorized: string[];
@@ -60,6 +61,7 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
   const getInstanceStmt = db.prepare("SELECT * FROM pipeline_instances WHERE id = ?");
   const getAttemptStmt = db.prepare("SELECT * FROM pipeline_stage_attempts WHERE id = ?");
   const persistPublication = createPipelinePublicationWriter(db);
+  const journal = createJournalStore(db, now);
   const runtimeResourceForInstance = (
     instance: PipelineInstance | undefined
   ): PipelineRuntimeResource | undefined => {
@@ -408,6 +410,23 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
     const result = getInstanceStmt.get(validated.instanceId) as PipelineInstance;
     validatePinnedInstance(db, result);
     persistSelectionPublications({ db, instance: result, timestamp });
+    journal.recordJournalEntry({
+      id: deterministicId("journal", [result.id, "delegated"]),
+      issueId: result.linear_issue_id,
+      instanceId: result.id,
+      actor: "supervisor",
+      kind: "delegated",
+      trigger: "Linear delegation admitted",
+      action: `Pinned ${result.pipeline_id}@${result.pipeline_version} and queued the entry stage.`,
+      outcome: result.status,
+      refs: {
+        stage: result.active_stage_id,
+        attempt_count: result.attempt_count,
+        base_commit: result.base_commit,
+        base_branch: result.base_branch,
+        manifest_digest: result.manifest_digest,
+      },
+    });
     return result;
   });
 
@@ -499,6 +518,27 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
           UPDATE pipeline_instance_stages SET status = 'running', updated_at = ?
           WHERE pipeline_instance_id = ? AND stage_id = ? AND status IN ('pending', 'dispatchable', 'running')
         `).run(timestamp, attempt.pipeline_instance_id, attempt.stage_id);
+        if (attempt.stage_id.startsWith("repair_")) {
+          const instance = getInstanceStmt.get(attempt.pipeline_instance_id) as PipelineInstance;
+          journal.recordJournalEntry({
+            id: deterministicId("journal", [attempt.id, "dispatched_fix"]),
+            issueId: instance.linear_issue_id,
+            instanceId: instance.id,
+            runId: attempt.run_id,
+            actor: "supervisor",
+            kind: "dispatched_fix",
+            trigger: "Repair stage dispatched",
+            action: `Dispatched ${attempt.stage_id} after prior feedback or gate failure.`,
+            outcome: "running",
+            refs: {
+              stage: attempt.stage_id,
+              attempt_id: attempt.id,
+              run_id: attempt.run_id,
+              attempt_count: instance.attempt_count,
+              reentry_count: instance.reentry_count,
+            },
+          });
+        }
       })();
     },
     bindRuntimeResource(instanceId, provider, providerResourceId) {

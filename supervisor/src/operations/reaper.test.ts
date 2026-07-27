@@ -380,16 +380,27 @@ describe("reapStalledRuns", () => {
     );
     const setRuntimeResourceStatus = vi.fn();
     const getActiveAttempt = vi.fn();
+    const recordJournalEntry = vi.fn(() => {
+      throw new Error("journal unavailable");
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const pipelines = {
       getAttemptForRun: vi.fn(() => ({ pipeline_instance_id: "pipeline-1" })),
       getInstance: vi.fn(() => ({ id: "pipeline-1" })),
       getRuntimeResource: vi.fn(() => ({ provider_resource_id: "sandbox-1" })),
       setRuntimeResourceStatus,
       getActiveAttempt,
+      recordJournalEntry,
     } as unknown as PipelineStore;
 
     await reapStalledRuns({ runtime, store, activityPublisher: makeActivityPublisher(store, linearOutbox), cfg, pipelines });
 
+    expect(recordJournalEntry).toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(
+      "[reaper] failed to record orchestration journal entry:",
+      "Error: journal unavailable"
+    );
+    warn.mockRestore();
     expect(setRuntimeResourceStatus).toHaveBeenCalledWith("pipeline-1", "quarantined");
     expect(getActiveAttempt).not.toHaveBeenCalled();
     expect(store.getRun("run-pipeline-wedged")?.status).toBe("quarantined");
