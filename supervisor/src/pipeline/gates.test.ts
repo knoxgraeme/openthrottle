@@ -1718,4 +1718,88 @@ describe("deterministic supervisor stage gates", () => {
       reentry_ordinal: 1,
     });
   });
+
+  function driveCoreImplementToSimplification(fixture: Fixture, priorSubject: string): void {
+    // implementation writes the tree; the read-only review leaves it untouched,
+    // parking the run at the conditional simplification stage.
+    let instance = settleCurrentStage(fixture, "success", {
+      id: "impl-1",
+      subject: priorSubject,
+      preSubject: fixture.instance.base_commit,
+    });
+    expect(instance.active_stage_id).toBe("semantic_review");
+    instance = settleCurrentStage(fixture, "success", {
+      id: "review-1",
+      subject: priorSubject,
+      preSubject: priorSubject,
+    });
+    expect(instance).toMatchObject({ status: "dispatchable", active_stage_id: "simplification" });
+  }
+
+  it("reclassifies a self-reported simplification no_change into a reviewed success when the sealed tree changed", () => {
+    const fixture = setup("core/implement@3");
+    const priorSubject = "d".repeat(40);
+    const simplifiedSubject = "e".repeat(40);
+    driveCoreImplementToSimplification(fixture, priorSubject);
+
+    // The simplify agent self-reports no_change, but the sealed post_subject
+    // differs from pre_subject: the tree actually moved. The gate must trust the
+    // sealed subjects over the agent's claim and route the changed tree through
+    // post_simplify_review rather than skipping straight to the command gates.
+    const running = startAttempt(fixture);
+    const contradicted = event(running, "no_change", {
+      id: "simplify-changed-tree",
+      subject: simplifiedSubject,
+      preSubject: priorSubject,
+    });
+    const evaluated = evaluateStageGate(running.pipelines, contradicted, {
+      observedSubject: simplifiedSubject,
+    });
+    expect(evaluated.event.outcome).toBe("success");
+    expect(evaluated.receipt.result).toBe("passed");
+    expect(JSON.parse(evaluated.receipt.payload)).toMatchObject({
+      proposed_result: "no_change",
+      outcome: "success",
+      reason: "no_change_contradicted_by_tree_delta",
+    });
+
+    const advanced = completeStageAttemptActor(running.pipelines, running.tickets, contradicted, {
+      observedSubject: simplifiedSubject,
+    });
+    expect(advanced).toMatchObject({
+      status: "dispatchable",
+      active_stage_id: "post_simplify_review",
+      immutable_subject: simplifiedSubject,
+    });
+  });
+
+  it("keeps a genuine simplification no_change on the fast path to test when the sealed tree is unchanged", () => {
+    const fixture = setup("core/implement@3");
+    const priorSubject = "d".repeat(40);
+    driveCoreImplementToSimplification(fixture, priorSubject);
+
+    // pre_subject == post_subject: the simplify agent genuinely changed nothing,
+    // so honoring no_change and skipping post_simplify_review is correct.
+    const running = startAttempt(fixture);
+    const genuine = event(running, "no_change", {
+      id: "simplify-no-change",
+      subject: priorSubject,
+      preSubject: priorSubject,
+    });
+    const evaluated = evaluateStageGate(running.pipelines, genuine, { observedSubject: priorSubject });
+    expect(evaluated.event.outcome).toBe("no_change");
+    expect(JSON.parse(evaluated.receipt.payload)).toMatchObject({
+      proposed_result: "no_change",
+      outcome: "no_change",
+      reason: "typed_semantic_result",
+    });
+
+    const advanced = completeStageAttemptActor(running.pipelines, running.tickets, genuine, {
+      observedSubject: priorSubject,
+    });
+    expect(advanced).toMatchObject({
+      status: "dispatchable",
+      active_stage_id: "test",
+    });
+  });
 });
