@@ -236,6 +236,9 @@ describe("pipeline publication", () => {
   function successfulLinearFetch() {
     return vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       const request = JSON.parse(String(init?.body)) as { query?: string };
+      if (request.query?.includes("query Comment")) {
+        return Response.json({ data: { comment: null } });
+      }
       if (request.query?.includes("IssueComments")) {
         return Response.json({ data: { issue: { comments: { nodes: [] } } } });
       }
@@ -280,15 +283,15 @@ describe("pipeline publication", () => {
     };
   }
 
-  function expectReceiptShape(body: string, stageLine: string, turnLine: RegExp | string) {
-    expect(body).toContain(stageLine);
+  function expectReceiptShape(body: string, turnLine: RegExp | string) {
     expect(body).not.toContain("coordinator_pinned");
     expect(body).not.toContain("not_evaluated");
     expect(body).not.toContain("semantic_attested");
     expect(body).not.toContain("Residual uncertainty: None declared");
-    expect((body.match(/^Stage \d+ of \d+:/gm) ?? [])).toHaveLength(1);
-    expect((body.match(/^Your move:/gm) ?? []))
-      .toHaveLength(1);
+    expect((body.match(/^Stage \d+ of \d+:/gm) ?? [])).toHaveLength(0);
+    expect((body.match(/^\*\*Your move:/gm) ?? [])).toHaveLength(1);
+    const arrowRows = body.match(/^→ /gm) ?? [];
+    expect(arrowRows.length).toBeLessThanOrEqual(1);
     if (typeof turnLine === "string") expect(body).toContain(turnLine);
     else expect(body).toMatch(turnLine);
   }
@@ -325,8 +328,7 @@ describe("pipeline publication", () => {
     expect(parsePipelinePublication(canonical)).toEqual(publication);
     expectReceiptShape(
       publication.body,
-      "Stage 1 of 1: command — the job shipped.",
-      /^Your move: nothing - this run is finished\. The job shipped\./m
+      /^\*\*Your move: nothing — this run is finished\. The job shipped\./m
     );
     expect(publication.body).toContain("exit code and tree subject were executor verified");
     expect(canonical).not.toContain("ghp_");
@@ -461,8 +463,8 @@ describe("pipeline publication", () => {
       "Fourth repeated block line.",
       "Fifth repeated block line.",
       "Sixth repeated block line.",
-      "Still uncertain: Alpha uncertainty.",
-      "Still uncertain: Beta uncertainty.",
+      "- Alpha uncertainty.",
+      "- Beta uncertainty.",
     ]) {
       expect(publication.body.match(new RegExp(`^${line.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "gm")))
         .toHaveLength(1);
@@ -495,22 +497,22 @@ describe("pipeline publication", () => {
 
     expect(renderLinearStatusComment(publication, "https://github.com/owner/repo/pull/10").split("\n").slice(0, 5))
       .toEqual([
-        "<!-- openthrottle:pipeline-status:issue-1 -->",
-        "### Run status",
+        "**Your move: nothing — waiting on GitHub: GitHub checks are still running (stage 2 of 3).**",
         "- [x] fresh",
-        "- [...] resume - GitHub checks are still running",
-        "- [ ] review",
+        "→ **resume** — in progress — GitHub checks are still running",
+        "- [ ] code review",
+        "**Assumptions & decisions**",
       ]);
     expect(renderGithubPipelineSummary(publication, "https://github.com/owner/repo/pull/10").split("\n").slice(0, 8))
       .toEqual([
         "<!-- openthrottle:pipeline-summary:issue-1 -->",
         "## OpenThrottle pipeline summary",
         "",
-        "### Run status",
+        "**Your move: nothing — waiting on GitHub: GitHub checks are still running (stage 2 of 3).**",
         "- [x] fresh",
-        "- [...] resume - GitHub checks are still running",
-        "- [ ] review",
-        "Your move: nothing - merge when CI is green. Waiting on GitHub: GitHub checks are still running.",
+        "→ **resume** — in progress — GitHub checks are still running",
+        "- [ ] code review",
+        "**Assumptions & decisions**",
       ]);
   });
 
@@ -546,7 +548,7 @@ describe("pipeline publication", () => {
       gateReceipt: input.receipt,
     });
 
-    expect(publication.body).toContain("### Findings");
+    expect(publication.body).toContain("**Findings**");
     expect(publication.body).toContain("[P1] provider-snapshot-bounding — snapshot payload unbounded → fixed in-stage");
     expect(publication.body).toContain("[P3] status-copy — receipt copy needs clarity → remaining/accepted");
     expect(renderLinearStatusComment(publication)).toContain("[P1] provider-snapshot-bounding");
@@ -658,8 +660,8 @@ describe("pipeline publication", () => {
       gateReceipt: input.receipt,
     });
 
-    expect(publication.body).not.toContain("### Findings");
-    expect(renderGithubPipelineSummary(publication)).not.toContain("### Findings");
+    expect(publication.body).not.toContain("**Findings**");
+    expect(renderGithubPipelineSummary(publication)).not.toContain("**Findings**");
   });
 
   it("truncates long finding lists with an explicit remainder marker", () => {
@@ -826,8 +828,9 @@ describe("pipeline publication", () => {
     expect(afterReview.active_stage_id).toBe("resume");
     const reviewPublication = parsePipelinePublication(pipelines.listPublications(instance.id)
       .find((row) => row.kind === "linear_ledger" && row.attempt_id === reviewAttempt.id)!.payload);
-    // Findings duplicated across stage_result and review artifacts render once.
-    expect(reviewPublication.body.match(/provider-snapshot-bounding/g)).toHaveLength(1);
+    // Findings duplicated across stage_result and review artifacts render once
+    // in the dispositions list; the repair banner may repeat the lead finding.
+    expect(reviewPublication.body.match(/^\[P1\] provider-snapshot-bounding/gm)).toHaveLength(1);
     expect(reviewPublication.body)
       .toContain("[P1] provider-snapshot-bounding — snapshot payload unbounded → carried to repair");
     expect(reviewPublication.body)
@@ -957,7 +960,7 @@ describe("pipeline publication", () => {
     const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       const request = JSON.parse(String(init?.body)) as {
         query?: string;
-        variables?: { id?: string; input?: { content?: { body?: string }; body?: string } };
+        variables?: { id?: string; input?: { id?: string; content?: { body?: string }; body?: string } };
       };
       if (request.query?.includes("IssueComments")) {
         calls.push("list");
@@ -967,10 +970,22 @@ describe("pipeline publication", () => {
         } } } });
       }
       if (request.query?.includes("CommentCreate")) {
-        calls.push(`create:${request.variables?.input?.body ?? ""}`);
+        calls.push(`create:${request.variables?.input?.id ?? ""}:${request.variables?.input?.body ?? ""}`);
         return Response.json({ data: { commentCreate: {
           success: true,
           comment: { id: "status-comment", url: "https://linear.test/comment/status" },
+        } } });
+      }
+      if (request.query?.includes("query Comment")) {
+        calls.push(`get:${request.variables?.id}`);
+        if (request.variables?.id !== "status-comment") {
+          return Response.json({ data: { comment: null } });
+        }
+        return Response.json({ data: { comment: {
+          id: request.variables?.id,
+          body: "stale status body",
+          url: "https://linear.test/comment/status",
+          user: { id: "app-user", app: true, isMe: true },
         } } });
       }
       if (request.query?.includes("CommentUpdate")) {
@@ -997,7 +1012,8 @@ describe("pipeline publication", () => {
 
     await processor.process(status.id);
     expect(calls.filter((call) => call.startsWith("create:"))).toHaveLength(1);
-    expect(calls.find((call) => call.startsWith("create:"))).toContain("<!-- openthrottle:pipeline-status:issue-1 -->");
+    expect(calls.find((call) => call.startsWith("create:"))).toContain(`create:${status.id}:`);
+    expect(calls.find((call) => call.startsWith("create:"))).not.toContain("<!-- openthrottle:pipeline-status:issue-1 -->");
     expect(tickets.getLinearOutbox(status.id)).toMatchObject({
       status: "processed",
       external_id: "status-comment",
@@ -1016,7 +1032,7 @@ describe("pipeline publication", () => {
     const updates = calls.filter((call) => call.startsWith("update:"));
     expect(updates).toHaveLength(1);
     expect(updates[0]).toContain("update:status-comment:");
-    expect(updates[0]).toContain("Your move: nothing - OpenThrottle is working on resume.");
+    expect(updates[0]).toContain("**Your move: nothing — resume (stage 2 of 3).**");
     expect(calls.filter((call) => call.startsWith("create:"))).toHaveLength(1);
     expect(tickets.getLinearOutbox(status.id)).toMatchObject({
       status: "processed",
@@ -1025,24 +1041,71 @@ describe("pipeline publication", () => {
     });
   });
 
-  it("reuses an already-current Linear status comment without another write", async () => {
+  it("rediscovers a markerless Linear status comment by deterministic outbox id", async () => {
     const { tickets } = setup("fixture/agent@1");
     const status = tickets.listLinearOutbox().find((row) => row.kind === "pipeline_status")!;
     const body = (JSON.parse(status.payload) as { publication: { body: string } }).publication.body;
     const calls: string[] = [];
     const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
-      const request = JSON.parse(String(init?.body)) as { query?: string };
-      if (request.query?.includes("IssueComments")) {
-        calls.push("list");
-        return Response.json({ data: { issue: { comments: {
-          nodes: [{
+      const request = JSON.parse(String(init?.body)) as {
+        query?: string;
+        variables?: { id?: string; input?: { body?: string } };
+      };
+      if (request.query?.includes("query Comment")) {
+        calls.push(`get:${request.variables?.id}`);
+        return Response.json({ data: { comment: {
+          id: status.id,
+          body: "stale markerless status body",
+          url: "https://linear.test/comment/status",
+          user: { id: "app-user", app: true, isMe: true },
+        } } });
+      }
+      if (request.query?.includes("CommentUpdate")) {
+        calls.push(`update:${request.variables?.id}:${request.variables?.input?.body ?? ""}`);
+        return Response.json({ data: { commentUpdate: {
+          success: true,
+          comment: { id: status.id, url: "https://linear.test/comment/status-updated" },
+        } } });
+      }
+      if (request.query?.includes("IssueComments")) calls.push("list");
+      if (request.query?.includes("CommentCreate")) calls.push("create");
+      throw new Error("unexpected Linear request");
+    }) as unknown as typeof fetch;
+    const processor = createLinearOutboxProcessor({
+      store: tickets,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: fetchMock }),
+    });
+
+    await processor.process(status.id);
+
+    expect(calls).toEqual([
+      `get:${status.id}`,
+      `update:${status.id}:${body}`,
+    ]);
+    expect(tickets.getLinearOutbox(status.id)).toMatchObject({
+      status: "processed",
+      external_id: status.id,
+      external_url: "https://linear.test/comment/status-updated",
+    });
+  });
+
+  it("reuses an already-current Linear status comment without another write", async () => {
+    const { tickets } = setup("fixture/agent@1");
+    const status = tickets.listLinearOutbox().find((row) => row.kind === "pipeline_status")!;
+    const body = (JSON.parse(status.payload) as { publication: { body: string } }).publication.body;
+    db!.prepare("UPDATE linear_outbox SET external_id = ?, external_url = ? WHERE id = ?")
+      .run("status-comment", "https://linear.test/comment/status", status.id);
+    const calls: string[] = [];
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as { query?: string; variables?: { id?: string } };
+      if (request.query?.includes("query Comment")) {
+        calls.push("get");
+        return Response.json({ data: { comment: {
             id: "status-comment",
             body,
             url: "https://linear.test/comment/status",
             user: { id: "app-user", app: true, isMe: true },
-          }],
-          pageInfo: { hasNextPage: false, endCursor: null },
-        } } } });
+        } } });
       }
       if (request.query?.includes("CommentUpdate")) calls.push("update");
       if (request.query?.includes("CommentCreate")) calls.push("create");
@@ -1055,7 +1118,7 @@ describe("pipeline publication", () => {
 
     await processor.process(status.id);
 
-    expect(calls).toEqual(["list"]);
+    expect(calls).toEqual(["get"]);
     expect(tickets.getLinearOutbox(status.id)).toMatchObject({
       status: "processed",
       external_id: "status-comment",
@@ -1091,8 +1154,8 @@ describe("pipeline publication", () => {
         query?: string;
         variables?: { id?: string; input?: { body?: string } };
       };
-      if (request.query?.includes("CommentUpdate")) {
-        calls.push(`update:${request.variables?.id}`);
+      if (request.query?.includes("query Comment")) {
+        calls.push(`get:${request.variables?.id}`);
         return Response.json(
           { errors: [{ message: "Comment not found", extensions: { code: "NOT_FOUND" } }] },
           { status: 200 }
@@ -1114,8 +1177,9 @@ describe("pipeline publication", () => {
 
     await recovered.process(status.id);
 
-    expect(calls[0]).toBe("update:status-comment");
-    expect(calls[1]).toContain("create:<!-- openthrottle:pipeline-status:issue-1 -->");
+    expect(calls[0]).toBe("get:status-comment");
+    expect(calls[1]).toContain("create:");
+    expect(calls[1]).not.toContain("<!-- openthrottle:pipeline-status:issue-1 -->");
     expect(tickets.getLinearOutbox(status.id)).toMatchObject({
       status: "processed",
       external_id: "replacement-status-comment",
@@ -1147,6 +1211,15 @@ describe("pipeline publication", () => {
         query?: string;
         variables?: { id?: string };
       };
+      if (request.query?.includes("query Comment")) {
+        calls.push(`get:${request.variables?.id}`);
+        return Response.json({ data: { comment: {
+          id: request.variables?.id,
+          body: "stale status body",
+          url: "https://linear.test/comment/status",
+          user: { id: "app-user", app: true, isMe: true },
+        } } });
+      }
       if (request.query?.includes("CommentUpdate")) {
         calls.push(`update:${request.variables?.id}`);
         if (outage) {
@@ -1177,13 +1250,18 @@ describe("pipeline publication", () => {
     expect(failed).toMatchObject({ status: "failed", external_id: "status-comment" });
     expect(failed.last_error).toContain("temporary outage");
     expect(failed.next_attempt_at).toBeTruthy();
-    expect(calls).toEqual(["update:status-comment"]);
+    expect(calls).toEqual(["get:status-comment", "update:status-comment"]);
 
     outage = false;
     db!.prepare("UPDATE linear_outbox SET next_attempt_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
       .run(status.id);
     await processor.process(status.id);
-    expect(calls).toEqual(["update:status-comment", "update:status-comment"]);
+    expect(calls).toEqual([
+      "get:status-comment",
+      "update:status-comment",
+      "get:status-comment",
+      "update:status-comment",
+    ]);
     expect(tickets.getLinearOutbox(status.id)).toMatchObject({
       status: "processed",
       external_id: "status-comment",
@@ -1208,8 +1286,7 @@ describe("pipeline publication", () => {
     const selection = buildSelectionPublication(instance);
     expectReceiptShape(
       selection.body,
-      "Stage 0 of 3: selection — the supervisor selected the pinned pipeline for this ticket.",
-      "Your move: nothing - OpenThrottle is working on fresh."
+      "**Your move: nothing — fresh (stage 1 of 3).**"
     );
 
     const gate = buildStagePublication({
@@ -1225,8 +1302,7 @@ describe("pipeline publication", () => {
     });
     expectReceiptShape(
       gate.body,
-      "Stage 1 of 3: fresh — the stage completed successfully.",
-      "Your move: nothing - OpenThrottle is working on resume."
+      "**Your move: nothing — resume (stage 2 of 3).**"
     );
 
     const repair = buildStagePublication({
@@ -1245,8 +1321,7 @@ describe("pipeline publication", () => {
     expect(repair.body).toContain("scheduled repair round 1 of 1 at the fresh stage");
     expectReceiptShape(
       repair.body,
-      "Stage 1 of 3: fresh — the stage completed and asked for a repair pass.",
-      "Your move: nothing - OpenThrottle is working on fresh."
+      "**Your move: nothing — fresh (stage 1 of 3).**"
     );
 
     // A backward repair edge (review -> resume) at the final allowed round:
@@ -1272,8 +1347,7 @@ describe("pipeline publication", () => {
     }
     expectReceiptShape(
       finalRepair.body,
-      "Stage 3 of 3: review — the stage completed and asked for a repair pass.",
-      "Your move: nothing - OpenThrottle is working on resume."
+      "**Your move: nothing — resume (stage 2 of 3).**"
     );
 
     // An infrastructure self-retry is not a semantic repair pass and must not
@@ -1296,8 +1370,7 @@ describe("pipeline publication", () => {
     expect(infraRetry.body).not.toMatch(/repair/i);
     expectReceiptShape(
       infraRetry.body,
-      "Stage 1 of 3: fresh — the stage could not complete because infrastructure failed.",
-      "Your move: nothing - OpenThrottle is working on fresh."
+      "**Your move: nothing — fresh (stage 1 of 3).**"
     );
 
     const needsHuman = buildStagePublication({
@@ -1315,8 +1388,7 @@ describe("pipeline publication", () => {
     });
     expectReceiptShape(
       needsHuman.body,
-      "Stage 1 of 3: fresh — the run needs a human decision before it can continue.",
-      "Your move: decision required: Choose whether to continue in the Linear session."
+      "**Your move: decision required — Choose whether to continue in the Linear session. (stage 1 of 3).**"
     );
 
     const providerWait = buildStagePublication({
@@ -1333,8 +1405,7 @@ describe("pipeline publication", () => {
     });
     expectReceiptShape(
       providerWait.body,
-      "Stage 1 of 3: fresh — the stage completed successfully.",
-      "Your move: nothing - merge when CI is green. Waiting on GitHub: GitHub checks are still running."
+      "**Your move: nothing — waiting on GitHub: GitHub checks are still running (stage 2 of 3).**"
     );
   });
 
@@ -1342,40 +1413,34 @@ describe("pipeline publication", () => {
     [
       "shipped",
       "The job shipped.",
-      "Stage 1 of 1: command — the job shipped.",
-      "Your move: nothing - this run is finished. The job shipped.",
+      /^\*\*Your move: nothing — this run is finished\. The job shipped\./m,
     ],
     [
       "no_change",
       "The job finished because no code change was needed; no pull request was created.",
-      "Stage 1 of 1: command — the stage completed and reported that no change was needed.",
-      "Your move: nothing - this run is finished. The job finished because no code change was needed; no pull request was created.",
+      "**Your move: nothing — this run is finished. The job finished because no code change was needed; no pull request was created.**",
     ],
     [
       "needs_human",
       "The job needs a human decision before it can finish: Pick a deployment target. The workspace is preserved.",
-      "Stage 1 of 1: command — the run needs a human decision before it can continue.",
-      "Your move: decision required: Pick a deployment target.",
+      "**Your move: decision required — Pick a deployment target (stage 1 of 1).**",
     ],
     [
       "failed",
       "The job failed: Daytona could not provision the sandbox.",
-      "Stage 1 of 1: command — the run failed.",
-      "Your move: nothing - this run is finished. The job failed: Daytona could not provision the sandbox.",
+      "**Your move: nothing — this run is finished. The job failed: Daytona could not provision the sandbox.**",
     ],
     [
       "canceled",
       "The job was canceled before it could finish.",
-      "Stage 1 of 1: command — the run was canceled.",
-      "Your move: nothing - this run is finished. The job was canceled before it could finish.",
+      "**Your move: nothing — this run is finished. The job was canceled before it could finish.**",
     ],
     [
       "superseded",
       "The job was superseded by a newer run.",
-      "Stage 1 of 1: command — the run was replaced by a newer session.",
-      "Your move: nothing - this run is finished. The job was superseded by a newer run.",
+      "**Your move: nothing — this run is finished. The job was superseded by a newer run.**",
     ],
-  ] as const)("renders the %s terminal job outcome honestly", (outcome, sentence, stageLine, turnLine) => {
+  ] as const)("renders the %s terminal job outcome honestly", (outcome, sentence, turnLine) => {
     const { instance, attempt } = setup();
     const publication = buildLifecyclePublication({
       instance: {
@@ -1392,7 +1457,7 @@ describe("pipeline publication", () => {
           ? "Daytona could not provision the sandbox"
           : sentence,
     });
-    expectReceiptShape(publication.body, stageLine, turnLine);
+    expectReceiptShape(publication.body, turnLine);
     expect(publication.body).toContain(sentence);
   });
 
