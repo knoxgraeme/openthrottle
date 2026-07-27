@@ -143,7 +143,7 @@ describe("pipeline catalog store", () => {
     expect(() => recovered.acceptRuntimeDescriptor(changedV1Runtime))
       .toThrow(/runtime release openthrottle-snapshot\/v1 was already accepted with a different digest/);
 
-    const shippedRuntime = loadRuntimeCapabilityDescriptor(runtimeDescriptorPath, "openthrottle-snapshot/v2");
+    const shippedRuntime = loadRuntimeCapabilityDescriptor(runtimeDescriptorPath, "openthrottle-snapshot/v3");
     const shippedCatalog = loadPipelineCatalog(shippedCatalogPath, shippedRuntime.descriptor);
     recovered.acceptRuntimeDescriptor(shippedRuntime);
     recovered.acceptCatalog(shippedCatalog);
@@ -152,7 +152,7 @@ describe("pipeline catalog store", () => {
       SELECT runtime_release, digest FROM runtime_capability_descriptors ORDER BY runtime_release
     `).all()).toEqual([
       { runtime_release: "openthrottle-snapshot/v1", digest: historical.runtime.digest },
-      { runtime_release: "openthrottle-snapshot/v2", digest: shippedRuntime.digest },
+      { runtime_release: "openthrottle-snapshot/v3", digest: shippedRuntime.digest },
     ]);
     expect(db.prepare(`
       SELECT pipeline_id, version, digest FROM pipeline_catalog_entries
