@@ -54,7 +54,7 @@ export interface LinearOutboxRecord {
   linear_issue_id: string | null;
   run_id: string | null;
   sequence: number;
-  kind: "activity" | "session_update" | "pipeline_receipt" | "pipeline_status";
+  kind: "activity" | "session_update" | "pipeline_receipt" | "pipeline_status" | "issue_state";
   payload: string;
   payload_hash: string;
   status: "pending" | "processing" | "failed" | "processed" | "dead";
@@ -170,13 +170,13 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
     SELECT * FROM linear_outbox candidate
     WHERE ((candidate.status IN ('pending', 'failed') AND candidate.next_attempt_at <= ?)
       OR (candidate.status = 'processing' AND candidate.next_attempt_at <= ?))
-      AND NOT EXISTS (
+      AND (candidate.kind = 'issue_state' OR NOT EXISTS (
         SELECT 1 FROM linear_outbox earlier
         WHERE earlier.linear_session_id IS candidate.linear_session_id
           AND earlier.sequence < candidate.sequence
-          AND earlier.kind <> 'pipeline_status'
+          AND earlier.kind NOT IN ('pipeline_status', 'issue_state')
           AND earlier.status IN ('pending', 'processing', 'failed')
-      )
+      ))
     ORDER BY candidate.created_at, candidate.sequence
     LIMIT ?
   `);
@@ -286,9 +286,17 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
       return claimLinearOutboxRows(listClaimableLinearOutboxRows(nowIso, limit), nowIso, leaseUntilIso);
     },
     claimLinearOutboxForId(id, nowIso, leaseUntilIso, limit) {
+      const target = getLinearOutboxStmt.get(id) as LinearOutboxRecord | undefined;
+      if (!target) return [];
       const rows = listClaimableLinearOutboxRows(nowIso, limit);
       if (!rows.some((row) => row.id === id)) return [];
-      return claimLinearOutboxRows(rows, nowIso, leaseUntilIso);
+      return claimLinearOutboxRows(
+        rows.filter((row) =>
+          row.linear_session_id === target.linear_session_id && row.sequence <= target.sequence
+        ),
+        nowIso,
+        leaseUntilIso
+      );
     },
     markLinearOutboxProcessed(id, receipt, expectedPayloadHash) {
       db.transaction(() => {

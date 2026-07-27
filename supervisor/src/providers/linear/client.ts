@@ -8,6 +8,18 @@ export interface LinearClient {
   fetch?: typeof fetch;
 }
 
+type LinearWorkflowStateType = "backlog" | "unstarted" | "started" | "completed" | "canceled";
+
+interface LinearWorkflowState {
+  id: string;
+  name: string;
+  type: LinearWorkflowStateType | string;
+}
+
+export type LinearIssueStateSignal = "started" | "review" | "completed";
+
+const teamStateCache = new WeakMap<LinearClient, Map<string, LinearWorkflowState[]>>();
+
 export async function linearGraphQL<T>(
   client: LinearClient,
   query: string,
@@ -273,6 +285,145 @@ export async function agentSessionUpdate(
     throw new Error("Linear agentSessionUpdate returned success: false");
   }
   return data.agentSessionUpdate;
+}
+
+function workflowCacheFor(client: LinearClient): Map<string, LinearWorkflowState[]> {
+  let cache = teamStateCache.get(client);
+  if (!cache) {
+    cache = new Map();
+    teamStateCache.set(client, cache);
+  }
+  return cache;
+}
+
+function stateRank(type: string): number {
+  if (type === "backlog") return 0;
+  if (type === "unstarted") return 1;
+  if (type === "started") return 2;
+  if (type === "completed") return 3;
+  if (type === "canceled") return 4;
+  return Number.POSITIVE_INFINITY;
+}
+
+async function issueWorkflowSnapshot(
+  client: LinearClient,
+  issueId: string
+): Promise<{
+  issue: { id: string; state?: LinearWorkflowState | null; team?: { id?: string | null } | null };
+  states: LinearWorkflowState[];
+}> {
+  const issueData = await linearGraphQL<{
+    issue?: {
+      id: string;
+      state?: LinearWorkflowState | null;
+      team?: { id?: string | null } | null;
+    } | null;
+  }>(
+    client,
+    `query IssueWorkflowState($id: String!) {
+      issue(id: $id) {
+        id
+        state { id name type }
+        team { id }
+      }
+    }`,
+    { id: issueId }
+  );
+  const issue = issueData.issue;
+  const teamId = issue?.team?.id;
+  if (!issue || !teamId) throw new Error("Linear issue workflow snapshot is incomplete");
+  const cache = workflowCacheFor(client);
+  const cached = cache.get(teamId);
+  if (cached) return { issue, states: cached };
+  const teamData = await linearGraphQL<{
+    team?: {
+      states?: { nodes?: LinearWorkflowState[] };
+    } | null;
+  }>(
+    client,
+    `query TeamWorkflowStates($id: String!) {
+      team(id: $id) {
+        states { nodes { id name type } }
+      }
+    }`,
+    { id: teamId }
+  );
+  const states = teamData.team?.states?.nodes ?? [];
+  cache.set(teamId, states);
+  return { issue, states };
+}
+
+function targetStateFor(
+  signal: LinearIssueStateSignal,
+  states: LinearWorkflowState[]
+): LinearWorkflowState | undefined {
+  if (signal === "started") return states.find((state) => state.type === "started");
+  if (signal === "review") {
+    return states.find((state) =>
+      state.type === "started" && state.name.trim().toLowerCase() === "in review"
+    ) ?? states.find((state) => state.type === "started");
+  }
+  return states.find((state) => state.type === "completed");
+}
+
+function shouldMoveIssueState(
+  signal: LinearIssueStateSignal,
+  current: LinearWorkflowState,
+  target: LinearWorkflowState,
+  states: LinearWorkflowState[]
+): boolean {
+  if (current.id === target.id) return false;
+  if (current.type === "canceled" || current.type === "completed") return false;
+  if (signal === "started") return current.type === "backlog" || current.type === "unstarted";
+  const currentRank = stateRank(current.type);
+  const targetRank = stateRank(target.type);
+  if (currentRank > targetRank) return false;
+  if (currentRank < targetRank) return true;
+  if (current.type !== "started" || target.type !== "started") return false;
+  const currentIndex = states.findIndex((state) => state.id === current.id);
+  const targetIndex = states.findIndex((state) => state.id === target.id);
+  if (currentIndex < 0 || targetIndex < 0) return false;
+  return currentIndex < targetIndex;
+}
+
+export async function issueStateUpdate(
+  client: LinearClient,
+  params: { issueId: string; signal: LinearIssueStateSignal }
+): Promise<{ success: boolean; skipped?: boolean; state?: { id: string; name: string } }> {
+  const snapshot = await issueWorkflowSnapshot(client, params.issueId);
+  const current = snapshot.issue.state;
+  const target = targetStateFor(params.signal, snapshot.states);
+  if (!current || !target || !shouldMoveIssueState(params.signal, current, target, snapshot.states)) {
+    return {
+      success: true,
+      skipped: true,
+      state: current ? { id: current.id, name: current.name } : undefined,
+    };
+  }
+  const data = await linearGraphQL<{
+    issueUpdate: {
+      success: boolean;
+      issue?: { id: string; state?: { id: string; name: string } | null };
+    };
+  }>(
+    client,
+    `mutation IssueStateUpdate($id: String!, $stateId: String!) {
+      issueUpdate(id: $id, input: { stateId: $stateId }) {
+        success
+        issue { id state { id name } }
+      }
+    }`,
+    { id: params.issueId, stateId: target.id }
+  );
+  if (!data.issueUpdate.success) {
+    throw new Error("Linear issueUpdate returned success: false");
+  }
+  return {
+    success: true,
+    state: data.issueUpdate.issue?.state
+      ? { id: data.issueUpdate.issue.state.id, name: data.issueUpdate.issue.state.name }
+      : { id: target.id, name: target.name },
+  };
 }
 
 export async function commentCreate(

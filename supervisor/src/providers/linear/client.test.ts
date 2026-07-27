@@ -5,6 +5,7 @@ import {
   agentSessionUpdate,
   buildLinearInstallUrl,
   findIssueCommentByMarker,
+  issueStateUpdate,
   linearFileUpload,
 } from "./client.js";
 import {
@@ -106,7 +107,7 @@ describe("Linear contracts", () => {
   });
 
   it("sends exact activity and session-update GraphQL variables", async () => {
-    const requests: Array<Record<string, unknown>> = [];
+    const requests: Array<{ query?: string; variables?: { id?: string; stateId?: string } }> = [];
     const signals: Array<AbortSignal | null | undefined> = [];
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
@@ -158,7 +159,7 @@ describe("Linear contracts", () => {
   });
 
   it("fetches issue labels with their parent group", async () => {
-    const requests: Array<Record<string, unknown>> = [];
+    const requests: Array<{ query?: string }> = [];
     const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
       return Response.json({
@@ -183,6 +184,106 @@ describe("Linear contracts", () => {
       { name: "bad", parentName: undefined },
     ]);
     expect(requests[0]).toMatchObject({ variables: { id: "issue-1" } });
+  });
+
+  it("moves issues forward by workflow state type and caches team states", async () => {
+    const requests: Array<{ query?: string; variables?: { id?: string; stateId?: string } }> = [];
+    let currentState = { id: "backlog", name: "Backlog", type: "backlog" };
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as {
+        query?: string;
+        variables?: { id?: string; stateId?: string };
+      };
+      requests.push(request);
+      if (request.query?.includes("IssueWorkflowState")) {
+        return Response.json({
+          data: {
+            issue: {
+              id: request.variables?.id,
+              state: currentState,
+              team: { id: "team-1" },
+            },
+          },
+        });
+      }
+      if (request.query?.includes("TeamWorkflowStates")) {
+        return Response.json({
+          data: {
+            team: {
+              states: {
+                nodes: [
+                  { id: "backlog", name: "Backlog", type: "backlog" },
+                  { id: "todo", name: "Todo", type: "unstarted" },
+                  { id: "progress", name: "In Progress", type: "started" },
+                  { id: "review", name: "In Review", type: "started" },
+                  { id: "done", name: "Done", type: "completed" },
+                  { id: "canceled", name: "Canceled", type: "canceled" },
+                ],
+              },
+            },
+          },
+        });
+      }
+      if (request.query?.includes("IssueStateUpdate")) {
+        currentState = request.variables?.stateId === "done"
+          ? { id: "done", name: "Done", type: "completed" }
+          : request.variables?.stateId === "review"
+            ? { id: "review", name: "In Review", type: "started" }
+            : { id: "progress", name: "In Progress", type: "started" };
+        return Response.json({
+          data: {
+            issueUpdate: {
+              success: true,
+              issue: { id: "issue-1", state: currentState },
+            },
+          },
+        });
+      }
+      throw new Error("unexpected Linear request");
+    }) as unknown as typeof fetch;
+    const client = { accessToken: "oauth", fetch: fetchMock };
+
+    await issueStateUpdate(client, { issueId: "issue-1", signal: "started" });
+    await issueStateUpdate(client, { issueId: "issue-1", signal: "review" });
+    await issueStateUpdate(client, { issueId: "issue-1", signal: "completed" });
+
+    expect(requests.filter((request) => request.query?.includes("TeamWorkflowStates"))).toHaveLength(1);
+    expect(requests.filter((request) => request.query?.includes("IssueStateUpdate"))
+      .map((request) => request.variables?.stateId)).toEqual(["progress", "review", "done"]);
+  });
+
+  it("does not clobber terminal or already-at-review issue states", async () => {
+    const states = [
+      { id: "progress", name: "In Progress", type: "started" },
+      { id: "review", name: "In Review", type: "started" },
+      { id: "done", name: "Done", type: "completed" },
+      { id: "canceled", name: "Canceled", type: "canceled" },
+    ];
+    const requests: Array<{ query?: string }> = [];
+    let currentState = states[1]!;
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as { query?: string };
+      requests.push(request);
+      if (request.query?.includes("IssueWorkflowState")) {
+        return Response.json({
+          data: { issue: { id: "issue-1", state: currentState, team: { id: "team-1" } } },
+        });
+      }
+      if (request.query?.includes("TeamWorkflowStates")) {
+        return Response.json({ data: { team: { states: { nodes: states } } } });
+      }
+      if (request.query?.includes("IssueStateUpdate")) throw new Error("should not update");
+      throw new Error("unexpected Linear request");
+    }) as unknown as typeof fetch;
+    const client = { accessToken: "oauth", fetch: fetchMock };
+
+    await expect(issueStateUpdate(client, { issueId: "issue-1", signal: "review" }))
+      .resolves.toMatchObject({ skipped: true });
+    currentState = states[3]!;
+    await expect(issueStateUpdate(client, { issueId: "issue-1", signal: "started" }))
+      .resolves.toMatchObject({ skipped: true });
+
+    expect(requests.filter((request) => request.query?.includes("IssueStateUpdate"))).toHaveLength(0);
   });
 
   it("paginates issue comments until it finds a marker", async () => {

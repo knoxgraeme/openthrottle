@@ -97,6 +97,38 @@ describe("delivery store", () => {
     expect(store.getLinearOutbox(second.id)?.status).toBe("pending");
   });
 
+  it("does not let issue-state projections block later Linear outbox rows", () => {
+    const state = store.enqueueLinearOutbox({
+      id: "issue-state",
+      linearSessionId: "session-1",
+      issueId: "issue-1",
+      kind: "issue_state",
+      payload: '{"type":"issue_state","issueId":"issue-1","signal":"started"}',
+    });
+    const activity = store.enqueueLinearOutbox({
+      id: "linear-activity",
+      linearSessionId: "session-1",
+      issueId: "issue-1",
+      kind: "activity",
+      payload: '{"type":"activity","activity":{"sessionId":"session-1","type":"response","body":"after projection"}}',
+    });
+    db.prepare(`
+      UPDATE linear_outbox
+      SET status = 'failed', next_attempt_at = '2101-01-01T00:00:00.000Z'
+      WHERE id = ?
+    `).run(state.id);
+
+    const claimed = store.claimLinearOutbox(
+      "2100-01-01T00:00:00.000Z",
+      "2100-01-01T00:01:00.000Z",
+      50
+    );
+
+    expect(claimed.map((row) => row.id)).toEqual([activity.id]);
+    expect(store.getLinearOutbox(state.id)?.status).toBe("failed");
+    expect(store.getLinearOutbox(activity.id)?.status).toBe("processing");
+  });
+
   it("deduplicates accepted webhooks", () => {
     const claim = { deliveryId: "delivery-1", source: "linear" as const, action: "created" };
     expect(store.claimDelivery(claim)).toBe(true);
