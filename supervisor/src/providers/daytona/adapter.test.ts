@@ -171,4 +171,60 @@ describe("Daytona stage execution", () => {
     )).rejects.toThrow(/forbidden sandbox variable/);
     expect(sandbox.updateEnv).not.toHaveBeenCalled();
   });
+
+  it("passes bounded cleanup deadlines to Daytona stop, quarantine, and delete calls", async () => {
+    const sandbox = {
+      id: "provider-cleanup-bound",
+      state: "started",
+      labels: { openthrottle: "true" },
+      stop: vi.fn(async () => undefined),
+      delete: vi.fn(async () => undefined),
+      setLabels: vi.fn(async () => ({})),
+    } as unknown as Sandbox;
+    const runtime = createDaytonaSandboxRuntime({ get: vi.fn(async () => sandbox) } as never, {
+      snapshot: "snapshot-v1",
+      materializeCredentialEnv: vi.fn(async () => ({ env: {} })),
+    });
+    const resource = { providerResourceId: "provider-cleanup-bound" };
+
+    await expect(runtime.stop(resource, "test stop")).resolves.toEqual({ confirmed: true });
+    await expect(runtime.quarantine(resource, "test quarantine")).resolves.toBeUndefined();
+    await expect(runtime.cleanup(resource)).resolves.toBeUndefined();
+    await expect(runtime.stopResource("provider-cleanup-bound", "test reap")).resolves.toBeUndefined();
+    await expect(runtime.deleteResource("provider-cleanup-bound")).resolves.toBeUndefined();
+
+    expect(sandbox.stop).toHaveBeenNthCalledWith(1, 60, true);
+    expect(sandbox.stop).toHaveBeenNthCalledWith(2, 60, true);
+    expect(sandbox.stop).toHaveBeenNthCalledWith(3, 60, true);
+    expect(sandbox.delete).toHaveBeenNthCalledWith(1, 60, false);
+    expect(sandbox.delete).toHaveBeenNthCalledWith(2, 60, false);
+  });
+
+  it("treats not-found cleanup as already cleaned but propagates other cleanup errors", async () => {
+    const notFound = {
+      id: "provider-not-found",
+      state: "stopped",
+      delete: vi.fn(async () => {
+        throw new Error("not found");
+      }),
+    } as unknown as Sandbox;
+    const broken = {
+      id: "provider-delete-timeout",
+      state: "stopped",
+      delete: vi.fn(async () => {
+        throw new Error("delete timed out");
+      }),
+    } as unknown as Sandbox;
+    const runtime = createDaytonaSandboxRuntime({
+      get: vi.fn(async (id: string) => id === "provider-not-found" ? notFound : broken),
+    } as never, {
+      snapshot: "snapshot-v1",
+      materializeCredentialEnv: vi.fn(async () => ({ env: {} })),
+    });
+
+    await expect(runtime.cleanup({ providerResourceId: "provider-not-found" }))
+      .resolves.toBeUndefined();
+    await expect(runtime.cleanup({ providerResourceId: "provider-delete-timeout" }))
+      .rejects.toThrow(/delete timed out/);
+  });
 });

@@ -58,7 +58,44 @@ describe("deterministic supervisor stage gates", () => {
     return coordinatePipelineEvent(store, evaluated.event, options.faultAfterWrite, evaluated.receipt);
   }
 
-  function setup(manifestKey = "core/investigate@1", options: { maxAttempts?: number } = {}): Fixture {
+  function overrideManifest(
+    catalog: ReturnType<typeof loadPipelineCatalog>,
+    manifestKey: string,
+    overrides: Partial<Pick<PipelineManifest, "max_attempts">>
+  ): void {
+    if (Object.keys(overrides).length === 0) return;
+    const selected = catalog.manifests.get(manifestKey)!;
+    const manifest = { ...selected.manifest, ...overrides };
+    const normalized = canonicalJson(manifest);
+    (catalog.manifests as Map<string, typeof selected>).set(manifestKey, {
+      manifest,
+      normalized,
+      digest: digestNormalized(normalized),
+    });
+    const catalogNormalized = canonicalJson({
+      aliases: catalog.aliases,
+      manifests: [...catalog.manifests.values()].map((entry) => ({
+        id: entry.manifest.id,
+        version: entry.manifest.version,
+        digest: entry.digest,
+      })).sort((left, right) =>
+        `${left.id}@${left.version}`.localeCompare(`${right.id}@${right.version}`)
+      ),
+    });
+    (catalog as {
+      normalized: string;
+      digest: string;
+    }).normalized = catalogNormalized;
+    (catalog as {
+      normalized: string;
+      digest: string;
+    }).digest = digestNormalized(catalogNormalized);
+  }
+
+  function setup(
+    manifestKey = "core/investigate@1",
+    options: { maxAttempts?: number } = {}
+  ): Fixture {
     database = openDb(":memory:");
     const pipelines = createPipelineStore(database);
     const tickets = createSupervisorStore(database, pipelines);
@@ -66,34 +103,9 @@ describe("deterministic supervisor stage gates", () => {
       manifestKey.startsWith("fixture/") ? catalogPath : shippedCatalogPath,
       runtime.descriptor
     );
-    if (options.maxAttempts !== undefined) {
-      const selected = catalog.manifests.get(manifestKey)!;
-      const manifest = { ...selected.manifest, max_attempts: options.maxAttempts };
-      const normalized = canonicalJson(manifest);
-      (catalog.manifests as Map<string, typeof selected>).set(manifestKey, {
-        manifest,
-        normalized,
-        digest: digestNormalized(normalized),
-      });
-      const catalogNormalized = canonicalJson({
-        aliases: catalog.aliases,
-        manifests: [...catalog.manifests.values()].map((entry) => ({
-          id: entry.manifest.id,
-          version: entry.manifest.version,
-          digest: entry.digest,
-        })).sort((left, right) =>
-          `${left.id}@${left.version}`.localeCompare(`${right.id}@${right.version}`)
-        ),
-      });
-      (catalog as {
-        normalized: string;
-        digest: string;
-      }).normalized = catalogNormalized;
-      (catalog as {
-        normalized: string;
-        digest: string;
-      }).digest = digestNormalized(catalogNormalized);
-    }
+    overrideManifest(catalog, manifestKey, {
+      ...(options.maxAttempts === undefined ? {} : { max_attempts: options.maxAttempts }),
+    });
     pipelines.acceptRuntimeDescriptor(runtime);
     pipelines.acceptCatalog(catalog);
     const config = parseRepositoryConfig("pipelines: { investigate: core/investigate@1 }\ntest: npm test\n");
@@ -739,6 +751,57 @@ describe("deterministic supervisor stage gates", () => {
       WHERE pipeline_instance_id = ? AND evaluator_kind = 'publish_subject'
     `).get(fixture.instance.id)).toEqual({ count: 3 });
     expect(fixture.pipelines.getInstance(fixture.instance.id)?.attempt_count).toBeGreaterThan(20);
+  });
+
+  it("exhausts the whole-run attempt budget only at a provider repair round boundary", () => {
+    const fixture = setup("core/implement@4", { maxAttempts: 20 });
+
+    const thirdPublishedRound = settleRepairRoundPublishes(fixture, 3);
+
+    expect(thirdPublishedRound).toMatchObject({
+      status: "waiting_provider",
+      active_stage_id: "provider",
+      immutable_subject: "3".repeat(40),
+      published_commit: "c".repeat(40),
+    });
+    expect(fixture.pipelines.getInstance(fixture.instance.id)?.attempt_count).toBeGreaterThan(20);
+    expect(fixture.db.prepare(`
+      SELECT COUNT(*) FROM pipeline_publication_receipts
+      WHERE pipeline_instance_id = ? AND kind = 'github_summary'
+    `).pluck().get(fixture.instance.id)).toBe(1);
+    expect(fixture.db.prepare(`
+      SELECT COUNT(*) FROM pipeline_gate_receipts
+      WHERE pipeline_instance_id = ? AND evaluator_kind = 'publish_subject'
+    `).pluck().get(fixture.instance.id)).toBe(3);
+
+    expect(routePipelineProviderEvent({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      ticket: fixture.tickets.getByIssueId("issue-1")!,
+      eventId: "provider-repair-exhausted",
+      outcome: "semantic_repair_required",
+      summary: "Provider feedback after the final allowed repair publish.",
+      evidence: ["https://github.com/owner/repo/pull/1#round-exhausted"],
+      payload: { round: "exhausted", head_sha: "c".repeat(40) },
+      headSha: "c".repeat(40),
+      pullRequestUrl: "https://github.com/owner/repo/pull/1",
+    })).toBe(true);
+
+    const exhausted = fixture.pipelines.getInstance(fixture.instance.id)!;
+    expect(exhausted).toMatchObject({
+      status: "completion_pending_publication",
+      terminal_outcome: "failed",
+      immutable_subject: "3".repeat(40),
+      published_commit: "c".repeat(40),
+      wait_reason: "pipeline attempt limit 20 exhausted",
+    });
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toBeUndefined();
+    expect(fixture.pipelines.listEffects(fixture.instance.id).map((effect) => effect.kind))
+      .toEqual(expect.arrayContaining(["stop", "cleanup"]));
+    expect(fixture.db.prepare(`
+      SELECT COUNT(*) FROM pipeline_inbox_events
+      WHERE id IN ('publish-1', 'publish-2', 'publish-3') AND status = 'consumed'
+    `).pluck().get()).toBe(3);
   });
 
   it("keeps non-blocking publication diagnostics on the bounded publish retry", () => {
@@ -1601,6 +1664,8 @@ describe("deterministic supervisor stage gates", () => {
     });
     expect(claimed.status === "claimed" && claimed.events.map((event) => event.provider_event_id).sort())
       .toEqual(["ci-during-repair-2", "review-during-repair-1"]);
+    expect(fixture.tickets.getSetting(`feedback-snapshot-drained-at:${snapshot.id}`)).toBeUndefined();
+    expect(fixture.tickets.getSetting(`feedback-snapshot-drain-source:${snapshot.id}`)).toBeUndefined();
 
     fixture.db.prepare(`
       UPDATE pipeline_stage_attempts
@@ -1624,6 +1689,10 @@ describe("deterministic supervisor stage gates", () => {
     expect(drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(1);
     expect(fixture.db.prepare("SELECT status FROM feedback_snapshots WHERE id = ?").get(snapshot.id))
       .toEqual({ status: "consumed" });
+    expect(fixture.tickets.getSetting(`feedback-snapshot-drained-at:${snapshot.id}`))
+      .toEqual(expect.any(String));
+    expect(fixture.tickets.getSetting(`feedback-snapshot-drain-source:${snapshot.id}`))
+      .toBe("periodic-feedback-drain");
     expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
       stage_id: "repair_implementation",
       reentry_ordinal: 1,
