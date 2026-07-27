@@ -39,6 +39,7 @@ const PROVIDER_OUTCOME_PRIORITY: readonly PipelineProviderOutcome[] = [
   "no_change",
 ];
 const GIT_COMMIT = /^[a-f0-9]{40}$/;
+const PIPELINE_FEEDBACK_WORK_ITEM_PREFIX = "pipeline-feedback:";
 
 export type PipelineProvider = "github" | "linear";
 
@@ -105,6 +106,14 @@ function pullNumber(
   return Number((url ?? ticket.pr_url)?.match(/\/pull\/(\d+)$/)?.[1] ?? 0);
 }
 
+function pipelineFeedbackWorkItemId(instanceId: string, headSha: string): string {
+  return `${PIPELINE_FEEDBACK_WORK_ITEM_PREFIX}${instanceId}:${headSha}`;
+}
+
+function pipelineFeedbackWorkItemBelongsToInstance(workItemId: string | null, instanceId: string): boolean {
+  return workItemId?.startsWith(`${PIPELINE_FEEDBACK_WORK_ITEM_PREFIX}${instanceId}:`) === true;
+}
+
 export function recordPipelineProviderEvent(params: {
   store: SupervisorStore;
   instance: PipelineInstance;
@@ -141,7 +150,7 @@ export function recordPipelineProviderEvent(params: {
     headSha: params.headSha,
     kind: "pipeline_provider_event",
     payload: stored,
-    workItemId: `pipeline-feedback:${params.instance.id}:${params.headSha}`,
+    workItemId: pipelineFeedbackWorkItemId(params.instance.id, params.headSha),
   }).snapshot;
 }
 
@@ -242,7 +251,17 @@ function snapshotBelongsToInstance(
   return snapshot.linear_issue_id === instance.linear_issue_id &&
     snapshot.linear_session_id === instance.linear_session_id &&
     snapshot.generation === instance.generation &&
-    snapshot.work_item_id?.startsWith(`pipeline-feedback:${instance.id}:`) === true;
+    pipelineFeedbackWorkItemBelongsToInstance(snapshot.work_item_id, instance.id);
+}
+
+function snapshotCouldCarryForward(
+  snapshot: FeedbackSnapshot,
+  instance: PipelineInstance
+): boolean {
+  return snapshotBelongsToInstance(snapshot, instance) &&
+    instance.published_commit !== null &&
+    snapshot.head_sha !== instance.published_commit &&
+    !snapshot.head_sha.startsWith("conversation:");
 }
 
 function snapshotCanCarryForward(
@@ -250,10 +269,7 @@ function snapshotCanCarryForward(
   snapshot: FeedbackSnapshot,
   instance: PipelineInstance
 ): boolean {
-  return snapshotBelongsToInstance(snapshot, instance) &&
-    instance.published_commit !== null &&
-    snapshot.head_sha !== instance.published_commit &&
-    !snapshot.head_sha.startsWith("conversation:") &&
+  return snapshotCouldCarryForward(snapshot, instance) &&
     acknowledgedPublicationSubjects.has(snapshot.head_sha);
 }
 
@@ -302,13 +318,15 @@ export function processPipelineFeedbackSnapshot(params: {
   acknowledgedPublicationSubjects?: ReadonlySet<string>;
   drainSource?: FeedbackSnapshotDrainSource;
 }): boolean {
-  const subjects = params.acknowledgedPublicationSubjects ??
-    acknowledgedPublicationSubjects(params.pipelines, params.instance.id);
-  const currentSnapshot = snapshotCanCarryForward(subjects, params.snapshot, params.instance)
+  const canCheckCarryForward = snapshotCouldCarryForward(params.snapshot, params.instance);
+  const subjects = canCheckCarryForward
+    ? params.acknowledgedPublicationSubjects ?? acknowledgedPublicationSubjects(params.pipelines, params.instance.id)
+    : undefined;
+  const currentSnapshot = subjects && snapshotCanCarryForward(subjects, params.snapshot, params.instance)
     ? params.store.carryForwardFeedbackSnapshot(
       params.snapshot.id,
       params.instance.published_commit!,
-      `pipeline-feedback:${params.instance.id}:${params.instance.published_commit}`
+      pipelineFeedbackWorkItemId(params.instance.id, params.instance.published_commit!)
     ) ?? params.snapshot
     : params.snapshot;
   if (!snapshotBelongsToInstance(currentSnapshot, params.instance)) {
