@@ -283,6 +283,54 @@ describe("pipeline publication", () => {
     };
   }
 
+  function collidingReviewLabelsManifest(): string {
+    const baseTerminalTransitions = {
+      no_change: { terminal: "no_change" },
+      semantic_repair_required: { terminal: "needs_human" },
+      retryable_infrastructure_failure: { terminal: "failed" },
+      needs_human: { terminal: "needs_human" },
+      canceled: { terminal: "canceled" },
+      superseded: { terminal: "superseded" },
+      failure: { terminal: "failed" },
+    };
+    const reviewStage = (id: "semantic_review" | "review", success: { to: string } | { terminal: "shipped" }) => ({
+      id,
+      executor: { kind: "agent", capability: "agent/semantic@1" },
+      evaluator: { kind: "semantic", assurance: "semantic_attested", required_artifacts: ["review"] },
+      context: "fresh_review",
+      live_steering: false,
+      credentials: ["model.invoke", "repo.read"],
+      produces: ["review", "stage_result"],
+      transitions: { success, ...baseTerminalTransitions },
+    });
+    return canonicalJson({
+      schema: "openthrottle.pipeline/v1",
+      id: "fixture/colliding-review-labels",
+      version: 1,
+      description: "Fixture with two review stages sharing the same display label.",
+      entry_stage: "implementation",
+      max_attempts: 4,
+      requires: {
+        protocol: "stage-executor@1",
+        capabilities: ["agent/semantic@1"],
+      },
+      stages: [
+        {
+          id: "implementation",
+          executor: { kind: "agent", capability: "agent/semantic@1" },
+          evaluator: { kind: "semantic", assurance: "semantic_attested", required_artifacts: ["stage_result"] },
+          context: "fresh",
+          live_steering: true,
+          credentials: ["model.invoke", "repo.read", "repo.write"],
+          produces: ["stage_result"],
+          transitions: { success: { to: "semantic_review" }, ...baseTerminalTransitions },
+        },
+        reviewStage("semantic_review", { to: "review" }),
+        reviewStage("review", { terminal: "shipped" }),
+      ],
+    });
+  }
+
   function expectReceiptShape(body: string, turnLine: RegExp | string) {
     expect(body).not.toContain("coordinator_pinned");
     expect(body).not.toContain("not_evaluated");
@@ -685,77 +733,7 @@ describe("pipeline publication", () => {
 
   it("does not deduplicate distinct checklist rows with the same display label", () => {
     const { instance } = setup("fixture/agent@1");
-    const normalizedManifest = canonicalJson({
-      schema: "openthrottle.pipeline/v1",
-      id: "fixture/colliding-review-labels",
-      version: 1,
-      description: "Fixture with two review stages sharing the same display label.",
-      entry_stage: "implementation",
-      max_attempts: 4,
-      requires: {
-        protocol: "stage-executor@1",
-        capabilities: ["agent/semantic@1"],
-      },
-      stages: [
-        {
-          id: "implementation",
-          executor: { kind: "agent", capability: "agent/semantic@1" },
-          evaluator: { kind: "semantic", assurance: "semantic_attested", required_artifacts: ["stage_result"] },
-          context: "fresh",
-          live_steering: true,
-          credentials: ["model.invoke", "repo.read", "repo.write"],
-          produces: ["stage_result"],
-          transitions: {
-            success: { to: "semantic_review" },
-            no_change: { terminal: "no_change" },
-            semantic_repair_required: { terminal: "needs_human" },
-            retryable_infrastructure_failure: { terminal: "failed" },
-            needs_human: { terminal: "needs_human" },
-            canceled: { terminal: "canceled" },
-            superseded: { terminal: "superseded" },
-            failure: { terminal: "failed" },
-          },
-        },
-        {
-          id: "semantic_review",
-          executor: { kind: "agent", capability: "agent/semantic@1" },
-          evaluator: { kind: "semantic", assurance: "semantic_attested", required_artifacts: ["review"] },
-          context: "fresh_review",
-          live_steering: false,
-          credentials: ["model.invoke", "repo.read"],
-          produces: ["review", "stage_result"],
-          transitions: {
-            success: { to: "review" },
-            no_change: { terminal: "no_change" },
-            semantic_repair_required: { terminal: "needs_human" },
-            retryable_infrastructure_failure: { terminal: "failed" },
-            needs_human: { terminal: "needs_human" },
-            canceled: { terminal: "canceled" },
-            superseded: { terminal: "superseded" },
-            failure: { terminal: "failed" },
-          },
-        },
-        {
-          id: "review",
-          executor: { kind: "agent", capability: "agent/semantic@1" },
-          evaluator: { kind: "semantic", assurance: "semantic_attested", required_artifacts: ["review"] },
-          context: "fresh_review",
-          live_steering: false,
-          credentials: ["model.invoke", "repo.read"],
-          produces: ["review", "stage_result"],
-          transitions: {
-            success: { terminal: "shipped" },
-            no_change: { terminal: "no_change" },
-            semantic_repair_required: { terminal: "needs_human" },
-            retryable_infrastructure_failure: { terminal: "failed" },
-            needs_human: { terminal: "needs_human" },
-            canceled: { terminal: "canceled" },
-            superseded: { terminal: "superseded" },
-            failure: { terminal: "failed" },
-          },
-        },
-      ],
-    });
+    const normalizedManifest = collidingReviewLabelsManifest();
     const publication = buildSelectionPublication({
       ...instance,
       pipeline_id: "fixture/colliding-review-labels",
