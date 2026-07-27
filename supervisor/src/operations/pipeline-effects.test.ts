@@ -282,6 +282,11 @@ describe("pipeline effect processor", () => {
       terminal_outcome: "canceled",
     });
     expect(pipelines.getRuntimeResource(instance.id)?.status).toBe("cleaned");
+    expect(db.prepare(`
+      SELECT COUNT(*) FROM pipeline_instances
+      WHERE terminal_outcome IS NOT NULL
+        AND runtime_resource_status IN ('active', 'quarantined')
+    `).pluck().get()).toBe(0);
     expect(tickets.getRun(attempt.planned_run_id!)).toMatchObject({ status: "stopped" });
     expect(tickets.getByIssueId("issue-1")).toMatchObject({
       state: "stopped",

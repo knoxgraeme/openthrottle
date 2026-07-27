@@ -172,4 +172,40 @@ describe("pipeline catalog store", () => {
       { alias: "investigate", pipeline_id: "core/investigate", version: 1 },
     ]);
   });
+
+  it("fails closed on boot when a prior runtime release row has a different digest", () => {
+    db = openDb(":memory:");
+    const pipelines = createPipelineStore(db);
+    const currentV2 = buildInstalledRuntimeDescriptor("openthrottle-snapshot/v2");
+    const priorNormalized = canonicalJson({
+      ...currentV2.descriptor,
+      adapters: { ...currentV2.descriptor.adapters, codex: "prior-snapshot" },
+    });
+    const priorDigest = digestNormalized(priorNormalized);
+    expect(priorDigest).not.toBe(currentV2.digest);
+    db.prepare(`
+      INSERT INTO runtime_capability_descriptors (
+        runtime_release, digest, protocol, normalized_descriptor, accepted_at
+      ) VALUES (?, ?, ?, ?, ?)
+    `).run(
+      currentV2.descriptor.release,
+      priorDigest,
+      currentV2.descriptor.protocol,
+      priorNormalized,
+      "2026-07-27T00:00:00.000Z"
+    );
+
+    expect(() => pipelines.acceptRuntimeDescriptor(currentV2))
+      .toThrow(/runtime release openthrottle-snapshot\/v2 was already accepted with a different digest/);
+
+    const bumped = buildInstalledRuntimeDescriptor("openthrottle-snapshot/v3");
+    pipelines.acceptRuntimeDescriptor(bumped);
+
+    expect(db.prepare(`
+      SELECT runtime_release, digest FROM runtime_capability_descriptors ORDER BY runtime_release
+    `).all()).toEqual([
+      { runtime_release: "openthrottle-snapshot/v2", digest: priorDigest },
+      { runtime_release: "openthrottle-snapshot/v3", digest: bumped.digest },
+    ]);
+  });
 });
