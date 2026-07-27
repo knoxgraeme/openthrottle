@@ -128,7 +128,13 @@ export interface FeedbackCapability {
   claimFeedbackSnapshot(snapshotId: string, maxRounds: number):
     | { status: "claimed"; snapshot: FeedbackSnapshot; events: FeedbackSnapshotEvent[] }
     | { status: "exhausted"; completedRounds: number }
-    | { status: "stale" };
+    | { status: "stale"; snapshot?: FeedbackSnapshot; eventCount?: number };
+  carryForwardFeedbackSnapshot(snapshotId: string, headSha: string, workItemId: string): FeedbackSnapshot | undefined;
+  markFeedbackSnapshotStaleWithNotice(params: {
+    snapshotId: string;
+    noticeId: string;
+    payload: string;
+  }): boolean;
   consumeFeedbackSnapshot(snapshotId: string): boolean;
 }
 
@@ -160,9 +166,33 @@ export function createSupervisorStore(
 ): SupervisorStore {
   const workStore = createWorkStore(db);
   const settingsStore = createSettingsStore(db);
+  const deliveryStore = createDeliveryStore(db);
   const feedbackStore = createFeedbackStore(db, (issueId) =>
     settingsStore.getSetting(`github-head:${issueId}`)
   );
+  const markFeedbackSnapshotStaleWithNotice = db.transaction((params: {
+    snapshotId: string;
+    noticeId: string;
+    payload: string;
+  }): boolean => {
+    const snapshot = db.prepare("SELECT * FROM feedback_snapshots WHERE id = ?")
+      .get(params.snapshotId) as FeedbackSnapshot | undefined;
+    if (!snapshot) return false;
+    const update = db.prepare(`
+      UPDATE feedback_snapshots
+      SET status = 'stale'
+      WHERE id = ? AND status IN ('collecting', 'claimed', 'stale')
+    `).run(params.snapshotId);
+    if (update.changes !== 1) return false;
+    deliveryStore.enqueueLinearOutbox({
+      id: params.noticeId,
+      linearSessionId: snapshot.linear_session_id,
+      issueId: snapshot.linear_issue_id,
+      kind: "activity",
+      payload: params.payload,
+    });
+    return true;
+  });
   const feedbackCapability: FeedbackCapability = {
     recordProviderFeedback(params) {
       return feedbackStore.record(params);
@@ -177,6 +207,12 @@ export function createSupervisorStore(
     claimFeedbackSnapshot(snapshotId, maxRounds) {
       return feedbackStore.claimWithEvents(snapshotId, maxRounds);
     },
+    carryForwardFeedbackSnapshot(snapshotId, headSha, workItemId) {
+      return feedbackStore.carryForward(snapshotId, headSha, workItemId);
+    },
+    markFeedbackSnapshotStaleWithNotice(params) {
+      return markFeedbackSnapshotStaleWithNotice.immediate(params);
+    },
     consumeFeedbackSnapshot(snapshotId) {
       return feedbackStore.consume(snapshotId);
     },
@@ -184,7 +220,7 @@ export function createSupervisorStore(
   return {
     ...createAdmissionStore(db, pipelineAdmission),
     ...createRunStore(db, workStore),
-    ...createDeliveryStore(db),
+    ...deliveryStore,
     ...createSteeringStore(db, workStore),
     ...settingsStore,
     ...feedbackCapability,

@@ -156,6 +156,28 @@ describe("deterministic supervisor stage gates", () => {
     fixture.tickets.setSetting("github-head:issue-1", headSha);
   }
 
+  function recordAcknowledgedPublication(fixture: Fixture, subject: string, id = `publication-${subject.slice(0, 8)}`): void {
+    const payload = canonicalJson({ decision: { subject } });
+    fixture.db.prepare(`
+      INSERT INTO pipeline_publication_receipts (
+        id, pipeline_instance_id, attempt_id, kind, idempotency_key,
+        payload, payload_hash, status, attempts, next_attempt_at,
+        created_at, updated_at, acknowledged_at
+      ) VALUES (?, ?, ?, 'linear_ledger', ?, ?, ?, 'acknowledged', 0, ?, ?, ?, ?)
+    `).run(
+      id,
+      fixture.instance.id,
+      fixture.attempt.id,
+      `publication:${id}`,
+      payload,
+      digestNormalized(payload),
+      "2026-01-01T00:00:00.000Z",
+      "2026-01-01T00:00:00.000Z",
+      "2026-01-01T00:00:00.000Z",
+      "2026-01-01T00:00:00.000Z"
+    );
+  }
+
   function firstProviderStagePayload(fixture: Fixture): string | undefined {
     const payloads = fixture.db.prepare("SELECT payload FROM pipeline_artifacts WHERE kind = 'stage_result'")
       .all() as Array<{ payload: string }>;
@@ -1648,6 +1670,43 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
+  it("carries same-run feedback from a superseded published head into the current provider wait", () => {
+    const fixture = setup("ce/implement@2");
+    const oldHead = "d".repeat(40);
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    fixture.tickets.setSetting("github-head:issue-1", oldHead);
+    fixture.db.prepare(`
+      UPDATE pipeline_instances SET status = 'running', published_commit = ? WHERE id = ?
+    `).run(oldHead, fixture.instance.id);
+    recordAcknowledgedPublication(fixture, oldHead);
+
+    expect(routePipelineProviderEvent({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      ticket: fixture.tickets.getByIssueId("issue-1")!,
+      eventId: "github-review:superseded-same-run",
+      outcome: "semantic_repair_required",
+      summary: "Feedback against the previous same-run head.",
+      evidence: ["https://github.com/owner/repo/pull/1#pullrequestreview-1"],
+      payload: { kind: "review", id: "superseded-same-run" },
+      headSha: oldHead,
+      pullRequestUrl: "https://github.com/owner/repo/pull/1",
+    })).toBe(true);
+
+    const snapshot = fixture.db.prepare("SELECT * FROM feedback_snapshots").get() as { id: string };
+    moveFixtureToProviderWait(fixture, SUBJECT);
+
+    expect(drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(1);
+    expect(fixture.db.prepare("SELECT status, head_sha FROM feedback_snapshots WHERE id = ?").get(snapshot.id))
+      .toEqual({ status: "consumed", head_sha: SUBJECT });
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "implementation",
+      reentry_ordinal: 1,
+    });
+    expect(fixture.db.prepare("SELECT COUNT(*) FROM linear_outbox WHERE id LIKE 'feedback-snapshot-stale:%'")
+      .pluck().get()).toBe(0);
+  });
+
   it("continues draining when the oldest same-session feedback snapshot is stale", () => {
     const fixture = setup("ce/implement@2");
     const staleHead = "d".repeat(40);
@@ -1713,10 +1772,142 @@ describe("deterministic supervisor stage gates", () => {
       .toEqual({ status: "stale" });
     expect(fixture.db.prepare("SELECT status FROM feedback_snapshots WHERE id = ?").get(fresh.id))
       .toEqual({ status: "consumed" });
+    const staleNotice = fixture.db.prepare("SELECT payload FROM linear_outbox WHERE id = ?")
+      .get(`feedback-snapshot-stale:${stale.id}`) as { payload: string };
+    expect(JSON.parse(staleNotice.payload)).toMatchObject({
+      type: "activity",
+      activity: {
+        sessionId: "session-1",
+        type: "error",
+        body: "1 feedback item(s) arrived against a superseded head and were not applied; re-comment on the current PR head.",
+      },
+    });
     expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
       stage_id: "implementation",
       reentry_ordinal: 1,
     });
+  });
+
+  it("keeps generation and instance fences when deciding whether to carry stale feedback forward", () => {
+    const fixture = setup("ce/implement@2");
+    const oldHead = "e".repeat(40);
+    const cases = [
+      { id: "other-generation", generation: fixture.instance.generation + 1, workItemId: `pipeline-feedback:${fixture.instance.id}:${oldHead}` },
+      { id: "other-instance", generation: fixture.instance.generation, workItemId: `pipeline-feedback:other-instance:${oldHead}` },
+    ];
+    fixture.tickets.setSetting("github-head:issue-1", SUBJECT);
+    recordAcknowledgedPublication(fixture, oldHead);
+    moveFixtureToProviderWait(fixture, SUBJECT);
+    const eventPayload = (summary: string) => canonicalJson({
+      outcome: "semantic_repair_required",
+      summary,
+      evidence: [summary],
+      payload: "{}",
+    });
+
+    for (const item of cases) {
+      const snapshot = fixture.tickets.recordProviderFeedback({
+        provider: "github",
+        providerEventId: `github-review:${item.id}`,
+        issueId: fixture.instance.linear_issue_id,
+        sessionId: fixture.instance.linear_session_id,
+        generation: item.generation,
+        repository: fixture.instance.repository,
+        pullNumber: 1,
+        headSha: oldHead,
+        kind: "pipeline_provider_event",
+        payload: eventPayload(item.id),
+        workItemId: item.workItemId,
+      }).snapshot;
+
+      expect(processPipelineFeedbackSnapshot({
+        pipelines: fixture.pipelines,
+        store: fixture.tickets,
+        instance: fixture.pipelines.getInstance(fixture.instance.id)!,
+        snapshot,
+      })).toBe(false);
+      expect(fixture.db.prepare("SELECT status, head_sha FROM feedback_snapshots WHERE id = ?").get(snapshot.id))
+        .toEqual({ status: "stale", head_sha: oldHead });
+    }
+  });
+
+  it("keeps unrelated heads stale even when the snapshot matches the current instance", () => {
+    const fixture = setup("ce/implement@2");
+    const unrelatedHead = "f".repeat(40);
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    moveFixtureToProviderWait(fixture, SUBJECT);
+    const payload = canonicalJson({
+      outcome: "semantic_repair_required",
+      summary: "unrelated head feedback",
+      evidence: ["unrelated head feedback"],
+      payload: "{}",
+    });
+    const snapshot = fixture.tickets.recordProviderFeedback({
+      provider: "github",
+      providerEventId: "github-review:unrelated-head",
+      issueId: fixture.instance.linear_issue_id,
+      sessionId: fixture.instance.linear_session_id,
+      generation: fixture.instance.generation,
+      repository: fixture.instance.repository,
+      pullNumber: 1,
+      headSha: unrelatedHead,
+      kind: "pipeline_provider_event",
+      payload,
+      workItemId: `pipeline-feedback:${fixture.instance.id}:${unrelatedHead}`,
+    }).snapshot;
+
+    expect(processPipelineFeedbackSnapshot({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      instance: fixture.pipelines.getInstance(fixture.instance.id)!,
+      snapshot,
+    })).toBe(false);
+    expect(fixture.db.prepare("SELECT status, head_sha FROM feedback_snapshots WHERE id = ?").get(snapshot.id))
+      .toEqual({ status: "stale", head_sha: unrelatedHead });
+    expect(fixture.db.prepare("SELECT payload FROM linear_outbox WHERE id = ?")
+      .get(`feedback-snapshot-stale:${snapshot.id}`)).toBeDefined();
+  });
+
+  it("does not stale a feedback snapshot when its stale notice cannot be enqueued", () => {
+    const fixture = setup("ce/implement@2");
+    const staleHead = "1".repeat(40);
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    moveFixtureToProviderWait(fixture, SUBJECT);
+    const payload = canonicalJson({
+      outcome: "semantic_repair_required",
+      summary: "stale feedback",
+      evidence: ["stale feedback"],
+      payload: "{}",
+    });
+    const snapshot = fixture.tickets.recordProviderFeedback({
+      provider: "github",
+      providerEventId: "github-review:notice-failure",
+      issueId: fixture.instance.linear_issue_id,
+      sessionId: fixture.instance.linear_session_id,
+      generation: fixture.instance.generation,
+      repository: fixture.instance.repository,
+      pullNumber: 1,
+      headSha: staleHead,
+      kind: "pipeline_provider_event",
+      payload,
+      workItemId: `pipeline-feedback:${fixture.instance.id}:${staleHead}`,
+    }).snapshot;
+    fixture.tickets.enqueueLinearOutbox({
+      id: `feedback-snapshot-stale:${snapshot.id}`,
+      linearSessionId: "session-1",
+      issueId: "issue-1",
+      kind: "activity",
+      payload: canonicalJson({ incompatible: true }),
+    });
+
+    expect(() => processPipelineFeedbackSnapshot({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      instance: fixture.pipelines.getInstance(fixture.instance.id)!,
+      snapshot,
+    })).toThrow(/different intent/);
+    expect(fixture.db.prepare("SELECT status, head_sha FROM feedback_snapshots WHERE id = ?").get(snapshot.id))
+      .toEqual({ status: "collecting", head_sha: staleHead });
   });
 
   function driveCoreImplementToSimplification(fixture: Fixture, priorSubject: string): void {

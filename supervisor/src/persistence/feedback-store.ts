@@ -51,7 +51,8 @@ export interface FeedbackStore {
   claimWithEvents(snapshotId: string, maxRounds: number):
     | { status: "claimed"; snapshot: FeedbackSnapshot; events: FeedbackSnapshotEvent[] }
     | { status: "exhausted"; completedRounds: number }
-    | { status: "stale" };
+    | { status: "stale"; snapshot?: FeedbackSnapshot; eventCount?: number };
+  carryForward(snapshotId: string, headSha: string, workItemId: string): FeedbackSnapshot | undefined;
   consume(snapshotId: string): boolean;
   get(snapshotId: string): FeedbackSnapshot | undefined;
   listEvents(snapshotId: string): FeedbackSnapshotEvent[];
@@ -62,6 +63,16 @@ export function createFeedbackStore(
   getCurrentHead: (issueId: string) => string | undefined = () => undefined
 ): FeedbackStore {
   const getSnapshot = db.prepare("SELECT * FROM feedback_snapshots WHERE id = ?");
+  const effectiveWorkItemId = (workItemId: string, suffixId: string, excludeSnapshotId?: string): string => {
+    const existing = excludeSnapshotId
+      ? db.prepare(`
+        SELECT 1 FROM feedback_snapshots
+        WHERE work_item_id = ? AND id <> ?
+      `).get(workItemId, excludeSnapshotId)
+      : db.prepare("SELECT 1 FROM feedback_snapshots WHERE work_item_id = ?")
+        .get(workItemId);
+    return existing ? `${workItemId}:snapshot:${suffixId}` : workItemId;
+  };
   const recordTransaction = db.transaction((params: Parameters<FeedbackStore["record"]>[0]) => {
     const receivedAt = params.receivedAt ?? new Date().toISOString();
     const payloadHash = createHash("sha256").update(params.payload).digest("hex");
@@ -124,12 +135,6 @@ export function createFeedbackStore(
     let snapshotCreated = false;
     if (!snapshot) {
       const id = randomUUID();
-      const workItemExists = db.prepare(
-        "SELECT 1 FROM feedback_snapshots WHERE work_item_id = ?"
-      ).get(params.workItemId);
-      const workItemId = workItemExists
-        ? `${params.workItemId}:snapshot:${id}`
-        : params.workItemId;
       db.prepare(`
         INSERT INTO feedback_snapshots (
           id, linear_issue_id, linear_session_id, generation, head_sha,
@@ -142,7 +147,7 @@ export function createFeedbackStore(
         params.generation,
         snapshotHeadSha,
         `${receivedAt}:${params.provider}:${params.providerEventId}`,
-        workItemId,
+        effectiveWorkItemId(params.workItemId, id),
         receivedAt
       );
       snapshot = getSnapshot.get(id) as FeedbackSnapshot;
@@ -228,6 +233,53 @@ export function createFeedbackStore(
       WHERE fse.snapshot_id = ?
       ORDER BY pe.received_at, pe.provider, pe.provider_event_id
     `).all(snapshotId) as FeedbackSnapshotEvent[];
+  const carryForwardTransaction = db.transaction((
+    snapshotId: string,
+    headSha: string,
+    workItemId: string
+  ): FeedbackSnapshot | undefined => {
+    const snapshot = getSnapshot.get(snapshotId) as FeedbackSnapshot | undefined;
+    if (!snapshot || !["collecting", "claimed"].includes(snapshot.status)) return undefined;
+    if (snapshot.head_sha === headSha) return snapshot;
+    const target = db.prepare(`
+      SELECT * FROM feedback_snapshots
+      WHERE linear_issue_id = ? AND linear_session_id = ? AND generation = ?
+        AND head_sha = ? AND status IN ('collecting', 'claimed')
+      ORDER BY created_at, id LIMIT 1
+    `).get(
+      snapshot.linear_issue_id,
+      snapshot.linear_session_id,
+      snapshot.generation,
+      headSha
+    ) as FeedbackSnapshot | undefined;
+    if (target) {
+      db.prepare(`
+        INSERT OR IGNORE INTO feedback_snapshot_events(snapshot_id, provider, provider_event_id)
+        SELECT ?, provider, provider_event_id
+        FROM feedback_snapshot_events
+        WHERE snapshot_id = ?
+      `).run(target.id, snapshot.id);
+      db.prepare(`
+        UPDATE provider_events
+        SET snapshot_id = ?
+        WHERE snapshot_id = ?
+      `).run(target.id, snapshot.id);
+      db.prepare(`
+        UPDATE feedback_snapshots
+        SET status = 'stale'
+        WHERE id = ? AND status IN ('collecting', 'claimed')
+      `).run(snapshot.id);
+      return getSnapshot.get(target.id) as FeedbackSnapshot;
+    }
+
+    const update = db.prepare(`
+      UPDATE feedback_snapshots
+      SET head_sha = ?, work_item_id = ?
+      WHERE id = ? AND status IN ('collecting', 'claimed')
+    `).run(headSha, effectiveWorkItemId(workItemId, snapshot.id, snapshot.id), snapshot.id);
+    if (update.changes !== 1) return undefined;
+    return getSnapshot.get(snapshot.id) as FeedbackSnapshot;
+  });
 
   return {
     record(params) {
@@ -240,18 +292,20 @@ export function createFeedbackStore(
       const snapshot = getSnapshot.get(snapshotId) as FeedbackSnapshot | undefined;
       if (!snapshot) return { status: "stale" as const };
       const events = listEvents(snapshot.id);
+      if (snapshot.status === "stale") {
+        return { status: "stale" as const, snapshot, eventCount: events.length };
+      }
       const isConversationSnapshot = events.length > 0 &&
         events.every((event) => event.kind === "issue_comment");
       const currentHead = getCurrentHead(snapshot.linear_issue_id);
       if (!isConversationSnapshot && currentHead && currentHead !== snapshot.head_sha) {
-        db.prepare(`
-          UPDATE feedback_snapshots SET status = 'stale'
-          WHERE id = ? AND status IN ('collecting', 'claimed')
-        `).run(snapshot.id);
-        return { status: "stale" as const };
+        return { status: "stale" as const, snapshot, eventCount: events.length };
       }
       const claim = claimTransaction.immediate(snapshot.id, maxRounds);
       return claim.status === "claimed" ? { ...claim, events } : claim;
+    },
+    carryForward(snapshotId, headSha, workItemId) {
+      return carryForwardTransaction.immediate(snapshotId, headSha, workItemId);
     },
     consume(snapshotId) {
       const timestamp = new Date().toISOString();

@@ -189,15 +189,97 @@ function providerFindings(payload: string): ProviderFinding[] {
   }
 }
 
+function publicationSubject(payload: string): string | undefined {
+  try {
+    const parsed = JSON.parse(payload) as { decision?: { subject?: unknown } };
+    return typeof parsed.decision?.subject === "string" ? parsed.decision.subject : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function snapshotCanCarryForward(
+  acknowledgedPublicationSubjects: ReadonlySet<string>,
+  snapshot: FeedbackSnapshot,
+  instance: PipelineInstance
+): boolean {
+  return snapshot.linear_issue_id === instance.linear_issue_id &&
+    snapshot.linear_session_id === instance.linear_session_id &&
+    snapshot.generation === instance.generation &&
+    snapshot.work_item_id?.startsWith(`pipeline-feedback:${instance.id}:`) === true &&
+    instance.published_commit !== null &&
+    snapshot.head_sha !== instance.published_commit &&
+    !snapshot.head_sha.startsWith("conversation:") &&
+    acknowledgedPublicationSubjects.has(snapshot.head_sha);
+}
+
+function acknowledgedPublicationSubjects(pipelines: PipelineStore, instanceId: string): ReadonlySet<string> {
+  return new Set(pipelines.listPublications(instanceId)
+    .filter((publication) => publication.status === "acknowledged")
+    .map((publication) => publicationSubject(publication.payload))
+    .filter((subject): subject is string => subject !== undefined));
+}
+
+function staleFeedbackNotice(params: {
+  sessionId: string;
+  eventCount: number;
+}): string {
+  const count = Math.max(1, params.eventCount);
+  return JSON.stringify({
+    type: "activity",
+    activity: {
+      sessionId: params.sessionId,
+      type: "error",
+      body: `${count} feedback item(s) arrived against a superseded head and were not applied; re-comment on the current PR head.`,
+    },
+  });
+}
+
+function markStaleFeedbackWithNotice(params: {
+  store: SupervisorStore;
+  instance: PipelineInstance;
+  snapshot: FeedbackSnapshot;
+  eventCount: number;
+}): void {
+  params.store.markFeedbackSnapshotStaleWithNotice({
+    snapshotId: params.snapshot.id,
+    noticeId: `feedback-snapshot-stale:${params.snapshot.id}`,
+    payload: staleFeedbackNotice({
+      sessionId: params.instance.linear_session_id,
+      eventCount: params.eventCount,
+    }),
+  });
+}
+
 export function processPipelineFeedbackSnapshot(params: {
   pipelines: PipelineStore;
   store: SupervisorStore;
   instance: PipelineInstance;
   snapshot: FeedbackSnapshot;
+  acknowledgedPublicationSubjects?: ReadonlySet<string>;
   drainSource?: FeedbackSnapshotDrainSource;
 }): boolean {
-  const claim = params.store.claimFeedbackSnapshot(params.snapshot.id, UNBOUNDED_SNAPSHOT_CLAIM);
-  if (claim.status !== "claimed") return false;
+  const subjects = params.acknowledgedPublicationSubjects ??
+    acknowledgedPublicationSubjects(params.pipelines, params.instance.id);
+  const currentSnapshot = snapshotCanCarryForward(subjects, params.snapshot, params.instance)
+    ? params.store.carryForwardFeedbackSnapshot(
+      params.snapshot.id,
+      params.instance.published_commit!,
+      `pipeline-feedback:${params.instance.id}:${params.instance.published_commit}`
+    ) ?? params.snapshot
+    : params.snapshot;
+  const claim = params.store.claimFeedbackSnapshot(currentSnapshot.id, UNBOUNDED_SNAPSHOT_CLAIM);
+  if (claim.status !== "claimed") {
+    if (claim.status === "stale") {
+      markStaleFeedbackWithNotice({
+        store: params.store,
+        instance: params.instance,
+        snapshot: claim.snapshot ?? currentSnapshot,
+        eventCount: claim.eventCount ?? 0,
+      });
+    }
+    return false;
+  }
   const events = claim.events.map((event) => ({ event, parsed: parseStoredPipelineEvent(event) }));
   const revisionMatches = params.instance.published_commit !== null &&
     claim.snapshot.head_sha === params.instance.published_commit;
@@ -248,12 +330,14 @@ export function drainPipelineFeedbackSnapshots(
   let processed = 0;
   for (const instance of pipelines.listProviderReadyInstances(limit)) {
     if (!providerStageCanReceive(pipelines, instance)) continue;
+    const publicationSubjects = acknowledgedPublicationSubjects(pipelines, instance.id);
     for (const snapshot of store.listPendingFeedbackSnapshots(instance.linear_session_id, limit)) {
       if (processPipelineFeedbackSnapshot({
         pipelines,
         store,
         instance,
         snapshot,
+        acknowledgedPublicationSubjects: publicationSubjects,
         drainSource: "periodic-feedback-drain",
       })) {
         processed += 1;
