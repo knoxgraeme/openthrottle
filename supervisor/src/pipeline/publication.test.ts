@@ -638,6 +638,18 @@ describe("pipeline publication", () => {
     expect(publication.body).not.toContain(
       "Repair round 2 of 2 — [P1] provider-snapshot-bounding: snapshot payload unbounded"
     );
+    expect(renderLinearStatusComment(publication)).toContain(
+      "Repair round 2 of 2 — [P2] review-label-checklist: second review checklist row hidden"
+    );
+    expect(renderLinearStatusComment(publication)).not.toContain(
+      "Repair round 2 of 2 — [P1] provider-snapshot-bounding: snapshot payload unbounded"
+    );
+    expect(renderGithubPipelineSummary(publication)).toContain(
+      "Repair round 2 of 2 — [P2] review-label-checklist: second review checklist row hidden"
+    );
+    expect(renderGithubPipelineSummary(publication)).not.toContain(
+      "Repair round 2 of 2 — [P1] provider-snapshot-bounding: snapshot payload unbounded"
+    );
   });
 
   it("renders both semantic review rows for a two-review-stage manifest", () => {
