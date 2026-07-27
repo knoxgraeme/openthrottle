@@ -283,6 +283,54 @@ describe("pipeline publication", () => {
     };
   }
 
+  function collidingReviewLabelsManifest(): string {
+    const baseTerminalTransitions = {
+      no_change: { terminal: "no_change" },
+      semantic_repair_required: { terminal: "needs_human" },
+      retryable_infrastructure_failure: { terminal: "failed" },
+      needs_human: { terminal: "needs_human" },
+      canceled: { terminal: "canceled" },
+      superseded: { terminal: "superseded" },
+      failure: { terminal: "failed" },
+    };
+    const reviewStage = (id: "semantic_review" | "review", success: { to: string } | { terminal: "shipped" }) => ({
+      id,
+      executor: { kind: "agent", capability: "agent/semantic@1" },
+      evaluator: { kind: "semantic", assurance: "semantic_attested", required_artifacts: ["review"] },
+      context: "fresh_review",
+      live_steering: false,
+      credentials: ["model.invoke", "repo.read"],
+      produces: ["review", "stage_result"],
+      transitions: { success, ...baseTerminalTransitions },
+    });
+    return canonicalJson({
+      schema: "openthrottle.pipeline/v1",
+      id: "fixture/colliding-review-labels",
+      version: 1,
+      description: "Fixture with two review stages sharing the same display label.",
+      entry_stage: "implementation",
+      max_attempts: 4,
+      requires: {
+        protocol: "stage-executor@1",
+        capabilities: ["agent/semantic@1"],
+      },
+      stages: [
+        {
+          id: "implementation",
+          executor: { kind: "agent", capability: "agent/semantic@1" },
+          evaluator: { kind: "semantic", assurance: "semantic_attested", required_artifacts: ["stage_result"] },
+          context: "fresh",
+          live_steering: true,
+          credentials: ["model.invoke", "repo.read", "repo.write"],
+          produces: ["stage_result"],
+          transitions: { success: { to: "semantic_review" }, ...baseTerminalTransitions },
+        },
+        reviewStage("semantic_review", { to: "review" }),
+        reviewStage("review", { terminal: "shipped" }),
+      ],
+    });
+  }
+
   function expectReceiptShape(body: string, turnLine: RegExp | string) {
     expect(body).not.toContain("coordinator_pinned");
     expect(body).not.toContain("not_evaluated");
@@ -591,6 +639,112 @@ describe("pipeline publication", () => {
     expect(publication.body).toContain("scheduled repair round 2 of 2 at the resume stage");
     expect(publication.body)
       .toContain("[P0] provider-snapshot-bounding — snapshot payload unbounded → carried to repair");
+  });
+
+  it("names the current repair-triggering finding in the repair banner when older findings are carried forward", () => {
+    const { instance, attempt } = setup("fixture/agent@1");
+    const input = event(instance, attempt);
+    replaceStagePayload(input, {
+      summary: "Semantic review found a new blocking issue after an earlier repair.",
+      evidence: ["Review found a checklist rendering issue."],
+      findings: [
+        { severity: "P2", code: "review-label-checklist", summary: "second review checklist row hidden" },
+      ],
+      actions: [],
+      uncertainty: [],
+    });
+    const publication = buildStagePublication({
+      instance,
+      attempt: { ...attempt, stage_id: "review" },
+      event: { ...input.event, outcome: "semantic_repair_required" },
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: attempt.id,
+        outcome: "semantic_repair_required",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        reentryIncrement: 1,
+        nextAttempt: nextAttemptStub("resume", 2),
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+      priorFindings: [{
+        severity: "P1",
+        code: "provider-snapshot-bounding",
+        summary: "snapshot payload unbounded",
+        disposition: "fixed in-stage",
+      }],
+    });
+
+    expect(publication.body).toContain(
+      "Repair round 2 of 2 — [P2] review-label-checklist: second review checklist row hidden"
+    );
+    expect(publication.body).not.toContain(
+      "Repair round 2 of 2 — [P1] provider-snapshot-bounding: snapshot payload unbounded"
+    );
+    expect(renderLinearStatusComment(publication)).toContain(
+      "Repair round 2 of 2 — [P2] review-label-checklist: second review checklist row hidden"
+    );
+    expect(renderLinearStatusComment(publication)).not.toContain(
+      "Repair round 2 of 2 — [P1] provider-snapshot-bounding: snapshot payload unbounded"
+    );
+    expect(renderGithubPipelineSummary(publication)).toContain(
+      "Repair round 2 of 2 — [P2] review-label-checklist: second review checklist row hidden"
+    );
+    expect(renderGithubPipelineSummary(publication)).not.toContain(
+      "Repair round 2 of 2 — [P1] provider-snapshot-bounding: snapshot payload unbounded"
+    );
+  });
+
+  it("renders both semantic review rows for a two-review-stage manifest", () => {
+    const { instance, attempt } = setup("fixture/dual-review@1");
+    const input = event(instance, attempt);
+    const publication = buildStagePublication({
+      instance,
+      attempt,
+      event: input.event,
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: attempt.id,
+        outcome: "success",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+    });
+
+    expect(publication.body.split("\n").slice(1, 6)).toEqual([
+      "- [x] implementing",
+      "→ **code review** — in progress",
+      "- [ ] simplifying",
+      "- [ ] re-review",
+      "- [ ] publishing",
+    ]);
+  });
+
+  it("does not deduplicate distinct checklist rows with the same display label", () => {
+    const { instance } = setup("fixture/agent@1");
+    const normalizedManifest = collidingReviewLabelsManifest();
+    const publication = buildSelectionPublication({
+      ...instance,
+      pipeline_id: "fixture/colliding-review-labels",
+      pipeline_version: 1,
+      normalized_manifest: normalizedManifest,
+      manifest_digest: digestNormalized(normalizedManifest),
+    });
+
+    expect(publication.body.match(/^- \[ \] code review$/gm)).toHaveLength(2);
+    expect(renderLinearStatusComment(publication).match(/^- \[ \] code review$/gm)).toHaveLength(2);
+    expect(renderGithubPipelineSummary(publication).match(/^- \[ \] code review$/gm)).toHaveLength(2);
   });
 
   it("renders post-repair findings with per-item resolution status", () => {

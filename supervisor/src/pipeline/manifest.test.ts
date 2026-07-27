@@ -322,6 +322,7 @@ describe("pipeline manifest validation", () => {
       "fixture/command@1",
       "fixture/command@2",
       "fixture/agent@1",
+      "fixture/dual-review@1",
     ]);
     expect(resolvePipelineReference(catalog, "fixture/command@1").manifest.id).toBe("fixture/command");
     expect(resolvePipelineReference(catalog, "fixture-command").manifest.version).toBe(2);

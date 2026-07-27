@@ -211,6 +211,7 @@ interface RenderContext {
 
 interface RenderExtras {
   scheduledReentryOrdinal?: number;
+  repairBannerFinding?: PublicationFinding;
 }
 
 const STAGE_LABELS: Readonly<Record<string, { display: string; action?: string }>> = {
@@ -221,6 +222,7 @@ const STAGE_LABELS: Readonly<Record<string, { display: string; action?: string }
   planning: { display: "planning" },
   provider: { display: "waiting on GitHub" },
   publish: { display: "publishing" },
+  post_simplify_review: { display: "re-review", action: "reviewing simplified changes" },
   review: { display: "code review", action: "reviewing changes" },
   semantic_review: { display: "code review", action: "reviewing changes" },
   simplification: { display: "simplifying", action: "simplifying changes" },
@@ -372,7 +374,13 @@ function terminalSentence(envelope: PipelinePublicationBodyInput): string {
 }
 
 function dedupeLines(lines: string[]): string[] {
-  return Array.from(new Set(lines));
+  const seen = new Set<string>();
+  return lines.filter((line) => {
+    if (/^(?:- \[[ x]\]|→ )/.test(line)) return true;
+    if (seen.has(line)) return false;
+    seen.add(line);
+    return true;
+  });
 }
 
 function activeChecklistIndex(envelope: PipelinePublicationBodyInput, context: RenderContext): number {
@@ -492,6 +500,17 @@ function dedupeFindings(findings: readonly PublicationFinding[]): PublicationFin
   return [...unique.values()];
 }
 
+function findingsWithDisposition(
+  findings: readonly PublicationFinding[],
+  actions: readonly string[],
+  context: FindingDispositionContext
+): PublicationFinding[] {
+  return dedupeFindings(findings).map((finding) => ({
+    ...finding,
+    disposition: dispositionForFinding(finding, actions, context),
+  }));
+}
+
 /**
  * Accumulates the run's finding state: prior findings keep their persisted
  * disposition unless this stage's recorded actions resolve them, and findings
@@ -499,9 +518,8 @@ function dedupeFindings(findings: readonly PublicationFinding[]): PublicationFin
  */
 function mergeRunFindings(
   prior: readonly PublicationFinding[],
-  current: readonly PublicationFinding[],
-  actions: readonly string[],
-  context: FindingDispositionContext
+  currentWithDisposition: readonly PublicationFinding[],
+  actions: readonly string[]
 ): PublicationFinding[] {
   const merged = new Map<string, PublicationFinding>();
   for (const finding of dedupeFindings(prior)) {
@@ -511,11 +529,8 @@ function mergeRunFindings(
       ? { ...finding, disposition: "fixed in-stage" }
       : finding);
   }
-  for (const finding of dedupeFindings(current)) {
-    merged.set(findingIdentity(finding), {
-      ...finding,
-      disposition: dispositionForFinding(finding, actions, context),
-    });
+  for (const finding of currentWithDisposition) {
+    merged.set(findingIdentity(finding), finding);
   }
   return [...merged.values()].slice(0, 50);
 }
@@ -611,7 +626,10 @@ function repairBannerLines(
       envelope.decision.outcome !== "semantic_repair_required") {
     return [];
   }
-  const finding = dedupeFindings(envelope.evidence.findings ?? [])[0];
+  const findings = dedupeFindings(envelope.evidence.findings ?? []);
+  const finding = extras?.repairBannerFinding ??
+    findings.find((item) => item.disposition === "carried to repair") ??
+    findings[0];
   const suffix = finding
     ? `[${finding.severity}] ${finding.code}: ${finding.summary}`
     : `scheduled at ${stageDisplayName(nextStageName(envelope, context))}`;
@@ -768,11 +786,16 @@ export function buildStagePublication(input: {
   const template = chooseTemplate(input.write, resumeStatus);
   const outcome = input.write.terminalOutcome ?? input.write.outcome;
   const actions = evidence.flatMap((item) => item.actions).slice(0, 50);
-  const findings = mergeRunFindings(
-    input.priorFindings ?? [],
-    evidence.flatMap((item) => item.findings),
+  const currentFindings = evidence.flatMap((item) => item.findings);
+  const currentFindingsWithDisposition = findingsWithDisposition(
+    currentFindings,
     actions,
     { outcome, template }
+  );
+  const findings = mergeRunFindings(
+    input.priorFindings ?? [],
+    currentFindingsWithDisposition,
+    actions
   );
   const partial: PipelinePublicationBodyInput = {
     schema: PIPELINE_PUBLICATION_SCHEMA,
@@ -814,6 +837,8 @@ export function buildStagePublication(input: {
   };
   const body = renderBody(partial, input.instance.normalized_manifest, {
     scheduledReentryOrdinal: input.write.nextAttempt?.reentryOrdinal,
+    repairBannerFinding: currentFindingsWithDisposition
+      .find((finding) => finding.disposition === "carried to repair"),
   });
   return artifactBytes <= INLINE_ARTIFACT_LIMIT_BYTES
     ? {
