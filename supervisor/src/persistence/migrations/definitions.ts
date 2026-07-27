@@ -897,7 +897,53 @@ function contractSatelliteTables(db: Database.Database): void {
           actor_updated_at = ${runUpdatedFallback}
       WHERE actor_state IS NULL
     `);
+    // Prefer the authoritative attempt actor over stale run_liveness. Once a
+    // pipeline_attempt_actors row exists for a pipeline-backed run, the previous
+    // run store wrote every lifecycle transition (reaping/quarantine/settlement)
+    // there and left run_liveness lagging. Folding run_liveness for such a run
+    // would overwrite the current status/attempt-derived owner state with a
+    // stale value, leaving runs.actor_state inconsistent with the
+    // pipeline_stage_attempts owner row folded below (which reads the same
+    // authoritative pipeline_attempt_actors row) and causing conditional
+    // settlement updates on runs.actor_state to miss. Fold from
+    // pipeline_attempt_actors when it owns the run, and fall back to run_liveness
+    // only for legacy runs that never gained an attempt actor.
+    if (hasTable(db, "pipeline_attempt_actors")) {
+      db.exec(`
+        UPDATE runs
+        SET actor_state = COALESCE((
+              SELECT actor_state FROM pipeline_attempt_actors WHERE pipeline_attempt_actors.run_id = runs.id
+            ), actor_state),
+            last_heartbeat_at = (
+              SELECT last_heartbeat_at FROM pipeline_attempt_actors WHERE pipeline_attempt_actors.run_id = runs.id
+            ),
+            settlement_owner = (
+              SELECT settlement_owner FROM pipeline_attempt_actors WHERE pipeline_attempt_actors.run_id = runs.id
+            ),
+            settlement_reason = (
+              SELECT settlement_reason FROM pipeline_attempt_actors WHERE pipeline_attempt_actors.run_id = runs.id
+            ),
+            termination_confirmed_at = (
+              SELECT termination_confirmed_at FROM pipeline_attempt_actors WHERE pipeline_attempt_actors.run_id = runs.id
+            ),
+            quarantine_reason = (
+              SELECT quarantine_reason FROM pipeline_attempt_actors WHERE pipeline_attempt_actors.run_id = runs.id
+            ),
+            actor_created_at = COALESCE((
+              SELECT created_at FROM pipeline_attempt_actors WHERE pipeline_attempt_actors.run_id = runs.id
+            ), actor_created_at, started_at),
+            actor_updated_at = COALESCE((
+              SELECT updated_at FROM pipeline_attempt_actors WHERE pipeline_attempt_actors.run_id = runs.id
+            ), actor_updated_at)
+        WHERE EXISTS (
+          SELECT 1 FROM pipeline_attempt_actors WHERE pipeline_attempt_actors.run_id = runs.id
+        )
+      `);
+    }
     if (hasTable(db, "run_liveness")) {
+      const legacyRunsOnly = hasTable(db, "pipeline_attempt_actors")
+        ? "AND NOT EXISTS (SELECT 1 FROM pipeline_attempt_actors WHERE pipeline_attempt_actors.run_id = runs.id)"
+        : "";
       db.exec(`
         UPDATE runs
         SET actor_state = COALESCE((
@@ -923,6 +969,7 @@ function contractSatelliteTables(db: Database.Database): void {
               SELECT updated_at FROM run_liveness WHERE run_liveness.run_id = runs.id
             ), actor_updated_at)
         WHERE EXISTS (SELECT 1 FROM run_liveness WHERE run_liveness.run_id = runs.id)
+          ${legacyRunsOnly}
       `);
     }
   }

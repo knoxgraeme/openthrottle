@@ -542,4 +542,156 @@ describe("database migrations", () => {
       runtime_resource_status: "active",
     });
   });
+
+  it("folds the authoritative attempt actor onto runs when run_liveness is stale", () => {
+    db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
+    // Mark everything up to (and excluding) the satellite-table contraction as
+    // applied so applyDatabaseMigrations runs only migration 14 against the
+    // hand-built pre-contraction fixture below.
+    for (const migration of databaseMigrations.slice(0, 13)) {
+      db.prepare(`
+        INSERT INTO schema_migrations(version, name, checksum, applied_at)
+        VALUES (?, ?, ?, '2026-01-01T00:00:00.000Z')
+      `).run(migration.version, migration.name, migration.checksum);
+    }
+    db.exec(`
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY, status TEXT NOT NULL, started_at TEXT NOT NULL,
+        completed_at TEXT
+      );
+      CREATE TABLE run_liveness (
+        run_id TEXT PRIMARY KEY, actor_state TEXT NOT NULL,
+        last_heartbeat_at TEXT, settlement_owner TEXT, settlement_reason TEXT,
+        termination_confirmed_at TEXT, quarantine_reason TEXT, updated_at TEXT NOT NULL
+      );
+      CREATE TABLE pipeline_stage_attempts (
+        id TEXT PRIMARY KEY, run_id TEXT, planned_run_id TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE TABLE pipeline_attempt_actors (
+        attempt_id TEXT PRIMARY KEY, run_id TEXT NOT NULL UNIQUE, actor_state TEXT NOT NULL,
+        last_heartbeat_at TEXT, settlement_owner TEXT, settlement_reason TEXT,
+        termination_confirmed_at TEXT, quarantine_reason TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+
+      -- Two pipeline-backed runs that existed when migration 9 ran and were
+      -- later reaped / settled: the run store wrote those transitions to
+      -- pipeline_attempt_actors and left run_liveness lagging at 'running'.
+      INSERT INTO runs VALUES ('run-reaping', 'reaping', '2026-01-01T00:00:00.000Z', NULL);
+      INSERT INTO runs VALUES (
+        'run-settled', 'stopped', '2026-01-01T00:00:01.000Z', '2026-01-01T00:00:20.000Z'
+      );
+      -- A legacy run with no attempt actor: run_liveness is still authoritative.
+      INSERT INTO runs VALUES ('run-legacy', 'quarantined', '2026-01-01T00:00:02.000Z', NULL);
+
+      INSERT INTO run_liveness VALUES (
+        'run-reaping', 'running', '2026-01-01T00:00:05.000Z', NULL, NULL, NULL, NULL,
+        '2026-01-01T00:00:05.000Z'
+      );
+      INSERT INTO run_liveness VALUES (
+        'run-settled', 'running', '2026-01-01T00:00:06.000Z', NULL, NULL, NULL, NULL,
+        '2026-01-01T00:00:06.000Z'
+      );
+      INSERT INTO run_liveness VALUES (
+        'run-legacy', 'quarantined', '2026-01-01T00:00:07.000Z', 'legacy-owner',
+        'legacy stall', NULL, 'legacy quarantine', '2026-01-01T00:00:08.000Z'
+      );
+
+      INSERT INTO pipeline_stage_attempts VALUES (
+        'attempt-reaping', 'run-reaping', 'run-reaping',
+        '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+      );
+      INSERT INTO pipeline_stage_attempts VALUES (
+        'attempt-settled', 'run-settled', 'run-settled',
+        '2026-01-01T00:00:01.000Z', '2026-01-01T00:00:01.000Z'
+      );
+
+      INSERT INTO pipeline_attempt_actors (
+        attempt_id, run_id, actor_state, last_heartbeat_at, settlement_owner,
+        settlement_reason, termination_confirmed_at, quarantine_reason, created_at, updated_at
+      ) VALUES (
+        'attempt-reaping', 'run-reaping', 'reaping', '2026-01-01T00:00:12.000Z', 'reaper-1',
+        'stalled heartbeat', NULL, NULL, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:12.000Z'
+      );
+      INSERT INTO pipeline_attempt_actors (
+        attempt_id, run_id, actor_state, last_heartbeat_at, settlement_owner,
+        settlement_reason, termination_confirmed_at, quarantine_reason, created_at, updated_at
+      ) VALUES (
+        'attempt-settled', 'run-settled', 'settled', '2026-01-01T00:00:13.000Z', 'reaper-2',
+        'operator stop', '2026-01-01T00:00:14.000Z', NULL,
+        '2026-01-01T00:00:01.000Z', '2026-01-01T00:00:14.000Z'
+      );
+    `);
+
+    applyDatabaseMigrations(db);
+
+    const ownerColumns = `actor_state, last_heartbeat_at, settlement_owner, settlement_reason,
+      termination_confirmed_at, quarantine_reason, actor_created_at, actor_updated_at`;
+    const runOwner = (runId: string) =>
+      db!.prepare(`SELECT ${ownerColumns} FROM runs WHERE id = ?`).get(runId);
+    const attemptOwner = (attemptId: string) =>
+      db!.prepare(`SELECT ${ownerColumns} FROM pipeline_stage_attempts WHERE id = ?`).get(attemptId);
+
+    // The reaping run folds from the authoritative attempt actor, NOT the stale
+    // 'running' run_liveness row, and matches its own attempt owner row exactly.
+    const reapingRunOwner = {
+      actor_state: "reaping",
+      last_heartbeat_at: "2026-01-01T00:00:12.000Z",
+      settlement_owner: "reaper-1",
+      settlement_reason: "stalled heartbeat",
+      termination_confirmed_at: null,
+      quarantine_reason: null,
+      actor_created_at: "2026-01-01T00:00:00.000Z",
+      actor_updated_at: "2026-01-01T00:00:12.000Z",
+    };
+    expect(runOwner("run-reaping")).toEqual(reapingRunOwner);
+    expect(attemptOwner("attempt-reaping")).toEqual(reapingRunOwner);
+
+    // The settled run likewise folds the current settled/terminated state.
+    const settledRunOwner = {
+      actor_state: "settled",
+      last_heartbeat_at: "2026-01-01T00:00:13.000Z",
+      settlement_owner: "reaper-2",
+      settlement_reason: "operator stop",
+      termination_confirmed_at: "2026-01-01T00:00:14.000Z",
+      quarantine_reason: null,
+      actor_created_at: "2026-01-01T00:00:01.000Z",
+      actor_updated_at: "2026-01-01T00:00:14.000Z",
+    };
+    expect(runOwner("run-settled")).toEqual(settledRunOwner);
+    expect(attemptOwner("attempt-settled")).toEqual(settledRunOwner);
+
+    // The legacy run keeps folding from run_liveness (fallback path intact).
+    expect(runOwner("run-legacy")).toEqual({
+      actor_state: "quarantined",
+      last_heartbeat_at: "2026-01-01T00:00:07.000Z",
+      settlement_owner: "legacy-owner",
+      settlement_reason: "legacy stall",
+      termination_confirmed_at: null,
+      quarantine_reason: "legacy quarantine",
+      actor_created_at: "2026-01-01T00:00:02.000Z",
+      actor_updated_at: "2026-01-01T00:00:08.000Z",
+    });
+
+    // A conditional finish-reaping settlement update on the folded actor_state
+    // now matches, where the stale run_liveness fold would have made it miss.
+    const settlement = db.prepare(`
+      UPDATE runs
+      SET actor_state = 'settled', termination_confirmed_at = ?, actor_updated_at = ?
+      WHERE id = ? AND actor_state = 'reaping' AND settlement_owner = ?
+    `).run("2026-01-01T00:00:30.000Z", "2026-01-01T00:00:30.000Z", "run-reaping", "reaper-1");
+    expect(settlement.changes).toBe(1);
+    expect(
+      db.prepare("SELECT actor_state FROM runs WHERE id = 'run-reaping'").get()
+    ).toEqual({ actor_state: "settled" });
+  });
 });
