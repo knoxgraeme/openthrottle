@@ -617,6 +617,23 @@ function assumptionsSectionLines(envelope: PipelinePublicationBodyInput): string
   ];
 }
 
+function addressedFindingsLines(envelope: PipelinePublicationBodyInput): string[] {
+  if (envelope.template.name !== "provider_wait" || !envelope.decision.subject) return [];
+  const actions = envelope.evidence.actions ?? [];
+  const addressed = dedupeFindings(envelope.evidence.findings ?? [])
+    .filter((finding) =>
+      finding.disposition === "fixed in-stage" &&
+      actions.some((action) => actionAddressesFinding(action, finding))
+    )
+    .slice(0, MAX_RENDERED_FINDINGS);
+  if (addressed.length === 0) return [];
+  const shortSubject = envelope.decision.subject.slice(0, 12);
+  return [
+    `Addressed in \`${shortSubject}\`:`,
+    ...addressed.map((finding) => `- [${finding.severity}] ${finding.code}: ${finding.summary}`),
+  ];
+}
+
 function repairBannerLines(
   envelope: PipelinePublicationBodyInput,
   context: RenderContext,
@@ -959,6 +976,8 @@ export function renderGithubPipelineSummary(envelope: PipelinePublicationEnvelop
     "## OpenThrottle pipeline summary",
     "",
     ...linearStatusCommentLines(envelope, prUrl),
+    "",
+    ...addressedFindingsLines(envelope),
     "",
     ...detailLines,
     "",
