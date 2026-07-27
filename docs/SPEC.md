@@ -150,7 +150,12 @@ heuristics over untrusted comment bodies, so substantive automated review
 feedback is still recorded as provider evidence. Human PR comments,
 reviews requesting changes, Linear replies during provider waits, and failed
 workflow/check-suite completions for the exact published commit remain
-provider evidence and may start a bounded repair round.
+provider evidence and may start a bounded repair round. Feedback filed against a
+superseded commit from the same pipeline instance, Linear session, and generation
+may be carried forward only when that commit appears in acknowledged publication
+history for the instance; unrelated heads and cross-instance or cross-generation
+feedback remain stale and must produce an operator-visible activity instead of
+being dropped silently.
 
 ## Effect and runtime-resource contract
 
@@ -248,10 +253,15 @@ Reviews, PR comments, workflow runs, and check suites are stored as typed
 provider evidence for the pipeline generation.
 
 Provider evidence advances only an active provider-wait stage and only when its
-head SHA equals the executor-verified published commit. Mismatched heads require
-human attention; evidence for a future stage remains pending. A feedback
-snapshot is immutable once claimed and is consumed only after the coordinator
-commits the provider event.
+head SHA equals the executor-verified published commit. The one same-run
+exception is feedback captured against an earlier acknowledged publication from
+the same pipeline instance, Linear session, generation, and pipeline-feedback
+work item lineage; before claim, the snapshot is retargeted to the current
+executor-verified published commit and then drained normally. Mismatched heads
+outside that exception require human attention and enqueue a visible operator
+activity before the snapshot is marked stale; evidence for a future stage remains
+pending. A feedback snapshot is immutable once claimed and is consumed only after
+the coordinator commits the provider event.
 
 Linear replies sent while the current pipeline instance is in `waiting_provider`
 are recorded on the same provider-feedback channel as GitHub evidence, with
@@ -432,7 +442,9 @@ The CLI never creates per-project snapshots or configures routing fallbacks.
   sanitized before logging or publication, including a Codex auth file rotated
   during the active stage.
 - All external events are signature checked, durably deduplicated, and fenced
-  to the current generation and subject before they can affect state.
+  to the current generation and subject before they can affect state; the only
+  subject retargeting allowed is provider feedback from the same instance/session
+  and generation against an acknowledged prior publication head.
 
 ## Verification contract
 
