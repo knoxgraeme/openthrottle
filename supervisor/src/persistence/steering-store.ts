@@ -72,6 +72,9 @@ export function createSteeringStore(db: Database.Database, workStore: WorkStore)
   const cancelInboxStmt = db.prepare(
     "UPDATE session_inbox SET status = 'canceled' WHERE id = ? AND status IN ('pending', 'dispatched')"
   );
+  const bindInboxRunStmt = db.prepare(
+    "UPDATE session_inbox SET run_id = ? WHERE id = ? AND run_id IS NULL AND status IN ('pending', 'dispatched')"
+  );
   const getInboxStmt = db.prepare(`
     SELECT si.*, wi.active_delivery_id AS delivery_id, wi.request_hash,
       wi.generation, wi.context_revision, wi.native_session_id,
@@ -96,8 +99,10 @@ export function createSteeringStore(db: Database.Database, workStore: WorkStore)
           timestamp
         );
         const session = getSessionStmt.get(params.sessionId) as AgentSession | undefined;
-        const ticket = getByIssueIdStmt.get(params.issueId) as Ticket | undefined;
-        const runId = params.runId ?? ticket?.run_id;
+        const ticket = params.runId === null
+          ? undefined
+          : getByIssueIdStmt.get(params.issueId) as Ticket | undefined;
+        const runId = params.runId !== undefined ? params.runId : ticket?.run_id;
         let item = workStore.get(id);
         if (!item) {
           item = workStore.enqueue({
@@ -138,15 +143,17 @@ export function createSteeringStore(db: Database.Database, workStore: WorkStore)
       const timestamp = now();
       const records = listPendingInboxStmt.all(issueId, timestamp) as SteerInboxRecord[];
       const deliverable: SteerInboxRecord[] = [];
+      const activeRunId =
+        (getByIssueIdStmt.get(issueId) as Ticket | undefined)?.run_id;
       for (const record of records) {
         const item = workStore.get(record.id);
-        const activeRunId =
-          (getByIssueIdStmt.get(record.linear_issue_id) as Ticket | undefined)?.run_id;
         if (!item || !activeRunId) continue;
         const activeDelivery = record.delivery_id
           ? workStore.getDelivery(record.delivery_id)
           : undefined;
-        if (record.run_id !== activeRunId || (activeDelivery && activeDelivery.run_id !== activeRunId)) {
+        const inboxBelongsToEndedRun = Boolean(record.run_id && record.run_id !== activeRunId);
+        const deliveryBelongsToEndedRun = Boolean(activeDelivery && activeDelivery.run_id !== activeRunId);
+        if (inboxBelongsToEndedRun || deliveryBelongsToEndedRun) {
           db.transaction(() => {
             if (activeDelivery) {
               workStore.expireUnacknowledged(
@@ -156,25 +163,31 @@ export function createSteeringStore(db: Database.Database, workStore: WorkStore)
               );
             }
             cancelInboxStmt.run(record.id);
-            workStore.cancel(record.id, `steering was fenced to ended run ${record.run_id ?? "unknown"}`);
+            workStore.cancel(
+              record.id,
+              `steering was fenced to ended run ${record.run_id ?? "unknown"}`
+            );
           })();
           continue;
         }
         if (record.status === "pending" && record.delivery_id) {
-          deliverable.push(getInboxStmt.get(record.id) as SteerInboxRecord);
+          deliverable.push(record);
           continue;
         }
-        workStore.lease({
-          workItemId: record.id,
-          issueId: record.linear_issue_id,
-          sessionId: record.linear_session_id,
-          runId: activeRunId,
-          nativeSessionId: item.native_session_id,
-          generation: item.generation,
-          contextRevision: item.context_revision,
-          now: timestamp,
-          leaseUntil: new Date(Date.now() + 30_000).toISOString(),
-        });
+        db.transaction(() => {
+          bindInboxRunStmt.run(activeRunId, record.id);
+          workStore.lease({
+            workItemId: record.id,
+            issueId: record.linear_issue_id,
+            sessionId: record.linear_session_id,
+            runId: activeRunId,
+            nativeSessionId: item.native_session_id,
+            generation: item.generation,
+            contextRevision: item.context_revision,
+            now: timestamp,
+            leaseUntil: new Date(Date.now() + 30_000).toISOString(),
+          });
+        })();
         deliverable.push(getInboxStmt.get(record.id) as SteerInboxRecord);
       }
       return deliverable;

@@ -46,4 +46,58 @@ describe("steering store", () => {
     expect(store.cancelPendingInbox("issue-1")).toBe(1);
     expect(store.listPendingInbox("issue-1")).toHaveLength(0);
   });
+
+  it("binds buffered steering to the active run when it becomes deliverable", () => {
+    const steer = store.enqueueInbox({
+      id: "steer-buffered",
+      issueId: "issue-1",
+      sessionId: "session-1",
+      runId: null,
+      source: "human",
+      body: "Please apply this in the next implementation stage.",
+    });
+    expect(steer).toMatchObject({ id: "steer-buffered", run_id: null, status: "pending" });
+    expect(store.beginRun({
+      issueId: "issue-1",
+      runId: "run-next",
+      taskType: "implement",
+      tokenHash: "steering-token-hash",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    })).toBe(true);
+
+    const [pending] = store.listPendingInbox("issue-1");
+
+    expect(pending).toMatchObject({
+      id: "steer-buffered",
+      run_id: "run-next",
+      status: "pending",
+    });
+    expect(pending?.delivery_id).toEqual(expect.any(String));
+  });
+
+  it("does not lease explicitly buffered steering to the current non-steerable run", () => {
+    expect(store.beginRun({
+      issueId: "issue-1",
+      runId: "run-non-steerable",
+      taskType: "implement",
+      tokenHash: "steering-token-hash",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    })).toBe(true);
+
+    const steer = store.enqueueInbox({
+      id: "steer-during-review",
+      issueId: "issue-1",
+      sessionId: "session-1",
+      runId: null,
+      source: "human",
+      body: "Please apply this in the next implementation stage.",
+    });
+
+    expect(steer).toMatchObject({
+      id: "steer-during-review",
+      run_id: null,
+      status: "pending",
+      delivery_id: null,
+    });
+  });
 });

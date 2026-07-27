@@ -24,6 +24,7 @@ import { createPipelineEffectProcessor } from "./operations/pipeline-effects.js"
 import { drainPipelineFeedbackSnapshots } from "./app/provider-feedback.js";
 import { createGithubWebhookReconciler } from "./operations/github-webhook-reconciliation.js";
 import { reconcileRepositoryWebhook } from "./providers/github/client.js";
+import { canSteerPipelineRun } from "./pipeline/control.js";
 
 const SWEEP_INTERVAL_MS = 15 * 60 * 1000; // run every 15 min while awake; SPEC only requires "on every boot" + periodic while awake
 const DELIVERY_DRAIN_INTERVAL_MS = 30 * 1000;
@@ -165,7 +166,16 @@ async function main() {
       });
       // Deliver any queued mid-run steering into running sandboxes on the same
       // fast cadence, so a steer reaches the agent within one poll interval.
-      await deliverPendingInbox({ runtime, store });
+      await deliverPendingInbox({
+        runtime,
+        store,
+        canReceiveSteering: (ticket) => canSteerPipelineRun({
+          store: pipelineStore,
+          sessionId: ticket.linear_session_id,
+          runId: ticket.run_id,
+          agent: ticket.agent,
+        }),
+      });
     } finally {
       sandboxPollRunning = false;
     }

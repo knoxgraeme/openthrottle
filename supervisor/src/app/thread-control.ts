@@ -102,6 +102,23 @@ export async function handlePrompted(
     await publishMissingPipeline(providers, sessionId, ticket.linear_issue_id);
     return;
   }
+  if (command.kind === "reply" && workId && pipelineInstance.status === "running" && ticket.run_id) {
+    store.enqueueInbox({
+      id: workId,
+      issueId: ticket.linear_issue_id,
+      sessionId,
+      runId: null,
+      source: "human",
+      body: sanitizeText(promptBody),
+    });
+    await providers.activityPublisher.publishActivity({
+      sessionId,
+      type: "thought",
+      body: "Captured your message — it is retained for the next implementation or repair stage.",
+      ephemeral: true,
+    }, ticket.linear_issue_id);
+    return;
+  }
   if (command.kind === "reply" && workId && pipelineInstance.status === "waiting_provider") {
     const sanitizedReply = sanitizeText(promptBody).slice(0, 2_000);
     if (

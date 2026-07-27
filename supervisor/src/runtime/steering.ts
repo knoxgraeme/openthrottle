@@ -4,7 +4,7 @@
 // and injects them into the agent at the next tool/stop boundary.
 
 import type { RuntimeWorkspace, RuntimeWorkspaceAccess } from "./contracts.js";
-import type { SupervisorStore } from "../persistence/store.js";
+import type { SupervisorStore, Ticket } from "../persistence/store.js";
 
 const INBOX_DIR = "/home/agent/.ot/inbox";
 const INBOX_ACK_DIR = "/home/agent/.ot/inbox-processed";
@@ -94,6 +94,7 @@ async function collectAcknowledgements(
 export async function deliverPendingInbox(params: {
   runtime: RuntimeWorkspaceAccess;
   store: SupervisorStore;
+  canReceiveSteering?: (ticket: Ticket) => boolean;
 }): Promise<void> {
   for (const ticket of params.store.listRunning()) {
     if (!ticket.sandbox_id) continue;
@@ -106,6 +107,9 @@ export async function deliverPendingInbox(params: {
       const sandbox = await params.runtime.getWorkspace(ticket.sandbox_id);
       if (sandbox.state !== "started") await sandbox.start?.(60);
       await collectAcknowledgements(sandbox, params.store);
+      if (params.canReceiveSteering && !params.canReceiveSteering(ticket)) {
+        continue;
+      }
       const pending = params.store.listPendingInbox(ticket.linear_issue_id);
       if (pending.length === 0) continue;
       // Best-effort dir creation; the entrypoint also mkdir's this on startup,
