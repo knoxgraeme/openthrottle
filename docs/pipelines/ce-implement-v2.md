@@ -82,8 +82,8 @@ flowchart TD
 
 - Rectangle = agent stage, parallelogram = command gate, hexagon = provider wait.
 - Solid arrow = forward transition; dashed arrow = re-entry (the target is the
-  stage itself or sits at/before it in the declared stage order, matching
-  `supervisor/src/pipeline/coordinator.ts`); thick arrow = terminal outcome.
+  stage itself or sits at/before it in the declared stage order, matching the
+  shared `isPipelineReentry` manifest helper); thick arrow = terminal outcome.
 - `(≤N → outcome)` on an edge is `max_reentries` and its `on_exhausted` terminal.
 - Outcomes identical across every stage are suppressed and listed in the
   trailing `%%` comment inside the diagram.

@@ -1,11 +1,11 @@
 import {
   canonicalJson,
+  isPipelineReentry,
   PIPELINE_OUTCOMES,
   STAGE_OUTCOMES,
   type ExecutorKind,
   type PipelineManifest,
   type PipelineOutcome,
-  type PipelineStage,
   type PipelineTransition,
   type StageOutcome,
 } from "./manifest.js";
@@ -93,20 +93,6 @@ function allocateNodeIds(manifest: PipelineManifest): {
 }
 
 /**
- * Mirrors the coordinator's re-entry test exactly
- * (supervisor/src/pipeline/coordinator.ts:355-357): a transition re-enters when
- * the target is the stage itself, or when the target sits at or before the
- * stage in the declared `manifest.stages` order. The renderer must never invent
- * its own notion of "backwards", or the diagram will disagree with the runtime
- * that enforces `max_reentries`.
- */
-function isReentry(manifest: PipelineManifest, stage: PipelineStage, target: PipelineStage): boolean {
-  return target.id === stage.id ||
-    manifest.stages.findIndex((candidate) => candidate.id === target.id) <=
-      manifest.stages.findIndex((candidate) => candidate.id === stage.id);
-}
-
-/**
  * An outcome collapses only when every stage declares it and every declaration
  * is byte-identical under the manifest's own canonical JSON. Nothing here is
  * keyed on outcome names, so a manifest that varies `canceled` per stage keeps
@@ -179,7 +165,7 @@ export function renderManifestMermaid(manifest: PipelineManifest, options: Rende
       }
       const target = manifest.stages.find((candidate) => candidate.id === transition.to);
       if (!target) throw new Error(`stage ${stage.id} transitions to unknown stage ${String(transition.to)}`);
-      const arrow = isReentry(manifest, stage, target) ? "-.->" : "-->";
+      const arrow = isPipelineReentry(manifest, stage.id, target.id) ? "-.->" : "-->";
       edgeLines.push(`${INDENT}${from} ${arrow}|"${label}"| ${ids.stage.get(target.id)!}`);
     }
   }
@@ -236,6 +222,7 @@ export function renderPipelineDocPage(manifest: PipelineManifest): string {
     `- **Pipeline:** \`${identity}\``,
     `- **Entry stage:** \`${manifest.entry_stage}\``,
     `- **Max attempts:** ${manifest.max_attempts}`,
+    ...(manifest.max_repair_rounds === undefined ? [] : [`- **Max repair rounds:** ${manifest.max_repair_rounds}`]),
     "",
     manifest.description,
     "",
@@ -249,8 +236,8 @@ export function renderPipelineDocPage(manifest: PipelineManifest): string {
     "",
     "- Rectangle = agent stage, parallelogram = command gate, hexagon = provider wait.",
     "- Solid arrow = forward transition; dashed arrow = re-entry (the target is the",
-    "  stage itself or sits at/before it in the declared stage order, matching",
-    "  `supervisor/src/pipeline/coordinator.ts`); thick arrow = terminal outcome.",
+    "  stage itself or sits at/before it in the declared stage order, matching the",
+    "  shared `isPipelineReentry` manifest helper); thick arrow = terminal outcome.",
     "- `(≤N → outcome)` on an edge is `max_reentries` and its `on_exhausted` terminal.",
     "- Outcomes identical across every stage are suppressed and listed in the",
     "  trailing `%%` comment inside the diagram.",
