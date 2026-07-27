@@ -163,13 +163,23 @@ function looksLikeSupervisorSummary(body: string | undefined): boolean {
   return body?.startsWith(SUMMARY_MARKER_PREFIX) === true;
 }
 
+// Known Linear↔GitHub bridge identities whose PR comments are linkage
+// artifacts, never human repair requests.
+const LINEAR_BRIDGE_BOT_LOGINS = new Set(["linear-code[bot]", "linear[bot]"]);
+
+// Unambiguous machine linkback marker for bridge deployments that comment
+// under a different app identity. Comment bodies are untrusted data, so the
+// filter accepts only this exact self-identifying prefix — never keyword
+// heuristics, which would silently drop substantive automated review feedback
+// (e.g. an app comment that merely says "linear issue" in prose) before it is
+// recorded as provider evidence.
+const LINEAR_LINKBACK_MARKER = "<!-- linear-linkback -->";
+
 function isGithubBotLinkback(author: string, body: string | undefined): boolean {
   const normalizedAuthor = author.toLowerCase();
-  if (normalizedAuthor === "linear-code[bot]" || normalizedAuthor === "linear[bot]") return true;
+  if (LINEAR_BRIDGE_BOT_LOGINS.has(normalizedAuthor)) return true;
   if (!normalizedAuthor.endsWith("[bot]")) return false;
-  const normalizedBody = (body ?? "").toLowerCase();
-  return normalizedBody.includes("linear") &&
-    (normalizedBody.includes("linked") || normalizedBody.includes("mentioned") || normalizedBody.includes("issue"));
+  return (body ?? "").startsWith(LINEAR_LINKBACK_MARKER);
 }
 
 function boundedSanitized(value: string, maxChars: number): string {

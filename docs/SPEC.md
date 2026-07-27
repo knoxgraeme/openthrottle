@@ -141,8 +141,12 @@ returns to implementation within manifest bounds. The investigate v2 graph is
 investigate → conditional publish.
 
 Provider feedback excludes supervisor-authored GitHub summary comments and
-known GitHub bot bridge/linkback comments such as `linear-code[bot]`; those are
-publication/linkage artifacts, not human repair requests. Human PR comments,
+Linear bridge linkback comments; those are publication/linkage artifacts, not
+human repair requests. A linkback is recognized only by the exact bridge bot
+identity (`linear[bot]`, `linear-code[bot]`) or by a bot comment whose body
+starts with the explicit `<!-- linear-linkback -->` marker — never by keyword
+heuristics over untrusted comment bodies, so substantive automated review
+feedback is still recorded as provider evidence. Human PR comments,
 reviews requesting changes, Linear replies during provider waits, and failed
 workflow/check-suite completions for the exact published commit remain
 provider evidence and may start a bounded repair round.
