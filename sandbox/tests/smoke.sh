@@ -510,9 +510,26 @@ run_stage_smoke() {
   fi
 }
 
+# The per-stage task.log lives in the agent home; read it through the image so
+# the root-only ~/.ot permissions never have to be weakened for the host.
+assert_claude_stage_log() {
+  local pattern="$1"
+  if ! docker run --rm --entrypoint grep -v "$CLAUDE_HOME:/home/agent" "$IMAGE" \
+      -F -q "$pattern" /home/agent/.ot/task.log; then
+    echo "expected claude stage log to contain: $pattern" >&2
+    exit 1
+  fi
+}
+
 run_stage_smoke claude "$CLAUDE_HOME"
+# First stage in a fresh sandbox pays the bake-once bootstrap and seals the
+# digest-fenced completion marker.
+assert_claude_stage_log "bake-once bootstrap complete (config digest"
 run_stage_smoke claude "$CLAUDE_HOME" fresh_review
+# Second stage in the same sandbox must skip the bootstrap (and say so).
+assert_claude_stage_log "bake-once bootstrap already complete (config digest"
 run_stage_smoke claude "$CLAUDE_HOME" post_review
+assert_claude_stage_log "bake-once bootstrap already complete (config digest"
 run_stage_smoke claude "$CLAUDE_HOME" fresh_review_failure
 run_stage_smoke claude "$CLAUDE_HOME" post_failure
 run_stage_smoke codex "$CODEX_HOME"
