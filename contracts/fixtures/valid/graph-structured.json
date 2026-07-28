@@ -7,21 +7,25 @@
     {
       "id": "implementer",
       "engine": "agent",
-      "skill": "builtin://implement-unit@1",
       "session_scope": "attempt",
       "credentials": [
-        "repo",
-        "model"
+        "repo.read",
+        "model.invoke"
+      ],
+      "skills": [
+        "builtin://implement-unit@1"
       ]
     },
     {
       "id": "reviewer",
       "engine": "agent",
-      "skill": "builtin://semantic-review@1",
       "session_scope": "fresh",
       "credentials": [
-        "repo",
-        "model"
+        "repo.read",
+        "model.invoke"
+      ],
+      "skills": [
+        "builtin://semantic-review@1"
       ]
     }
   ],
@@ -31,8 +35,10 @@
       "worker": "implementer",
       "input_scope": "unit",
       "receipt": "unit_completion",
-      "max_parallel": 3,
-      "max_rounds": 4
+      "max_parallel": 1,
+      "max_rounds": 4,
+      "skill": "builtin://implement-unit@1",
+      "timeout_seconds": 3600
     },
     {
       "id": "review_loop",
@@ -40,7 +46,9 @@
       "input_scope": "diff",
       "receipt": "semantic_review",
       "max_parallel": 1,
-      "max_rounds": 2
+      "max_rounds": 2,
+      "skill": "builtin://semantic-review@1",
+      "timeout_seconds": 3600
     }
   ],
   "nodes": [

@@ -34,6 +34,11 @@ export function integerAt(value: unknown, path: string, min: number, max: number
   return value as number;
 }
 
+export function booleanAt(value: unknown, path: string): boolean {
+  if (typeof value !== "boolean") fail(path, "must be a boolean");
+  return value;
+}
+
 export function enumAt<T extends string>(value: unknown, path: string, allowed: readonly T[]): T {
   if (typeof value !== "string" || !allowed.includes(value as T)) {
     fail(path, `must be one of: ${allowed.join(", ")}`);
@@ -61,6 +66,25 @@ export function unique<T extends string>(values: readonly T[], path: string): T[
 
 export function optional<T>(value: unknown, parse: (entry: unknown) => T): T | undefined {
   return value === undefined ? undefined : parse(value);
+}
+
+export function recordAt<T>(
+  value: unknown,
+  path: string,
+  parse: (entry: unknown, path: string, key: string) => T,
+  options: { max: number; keyPattern?: RegExp } = { max: 64 }
+): Record<string, T> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) fail(path, "must be an object");
+  const input = value as Record<string, unknown>;
+  const output: Record<string, T> = {};
+  let count = 0;
+  for (const [key, entry] of Object.entries(input)) {
+    count += 1;
+    if (count > options.max) fail(path, `must contain at most ${options.max} entries`);
+    if (options.keyPattern && !options.keyPattern.test(key)) fail(`${path}.${key}`, "has an invalid key");
+    output[key] = parse(entry, `${path}.${key}`, key);
+  }
+  return output;
 }
 
 export function normalizedContract<T>(value: T): ValidatedContract<T> {

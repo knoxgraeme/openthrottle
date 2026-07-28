@@ -44,13 +44,32 @@ export {
 } from "./execution-plan.js";
 export {
   ASSURANCE_CLASSES,
-  RECEIPT_RESULTS,
+  RECEIPT_RESULTS_BY_TYPE,
   RECEIPT_SCHEMA,
   parseStandardReceipt,
   validateStandardReceipt,
+  type CandidateEvidenceReceipt,
+  type CommandResultPayload,
+  type CommandResultReceipt,
+  type ContextRecord,
+  type HumanApprovalPayload,
+  type HumanApprovalReceipt,
+  type IntegrationEvidenceReceipt,
+  type PublishSubjectPayload,
+  type PublishSubjectReceipt,
+  type ProviderEvidencePayload,
+  type ProviderEvidenceReceipt,
   type ReceiptFence,
   type ReceiptProducer,
+  type ReviewFinding,
   type StandardReceipt,
+  type SubjectEvidencePayload,
+  type SemanticReviewPayload,
+  type SemanticReviewReceipt,
+  type UnitCompletionPayload,
+  type UnitCompletionReceipt,
+  type UnitDecisionPayload,
+  type UnitDecisionReceipt,
 } from "./receipts.js";
 export { COMMAND_NAME_PATTERN, SKILL_REFERENCE } from "./validation.js";
 export type { ValidatedContract } from "./validation.js";

@@ -1,11 +1,11 @@
 {
   "schema": "openthrottle.receipt/v1",
-  "type": "unit_completion",
+  "type": "unit_decision",
   "assurance": "semantic_attested",
-  "result": "success",
+  "result": "accept",
   "producer": {
-    "worker_id": "implementer",
-    "skill": "inline prompt text",
+    "worker_id": "lead",
+    "skill": "builtin://accept-unit@1",
     "capability_digest": "1111111111111111111111111111111111111111111111111111111111111111"
   },
   "subject": {
@@ -21,22 +21,12 @@
     "request_hash": "3333333333333333333333333333333333333333333333333333333333333333"
   },
   "evidence": [
-    "npm test --prefix contracts passed"
+    "lead accepted the unit scope"
   ],
-  "issued_at": "2026-07-28T00:00:00.000Z",
   "payload": {
-    "summary": "Implemented the assigned unit.",
-    "assumptions": [
-      "No runtime default changed."
-    ],
-    "decisions": [
-      "Kept the contract additive."
-    ],
-    "issues": [],
-    "verification": [
-      "npm test --prefix contracts passed"
-    ],
-    "downstream_context": [],
-    "requested_human_input": []
-  }
+    "rationale": "The unit matches the assigned plan slice.",
+    "context_updates": [],
+    "accepted_subject": "cccccccccccccccccccccccccccccccccccccccc"
+  },
+  "issued_at": "2026-07-28T00:00:00.000Z"
 }

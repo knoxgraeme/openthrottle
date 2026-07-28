@@ -1,18 +1,19 @@
 {
   "schema": "openthrottle.graph/v1",
-  "id": "structured",
+  "id": "loop_skill_not_allowed",
   "version": 1,
   "entry_node": "implement",
   "workers": [
     {
       "id": "implementer",
       "engine": "agent",
-      "session_scope": "attempt",
-      "credentials": [
-        "repo.read"
-      ],
       "skills": [
         "builtin://implement-unit@1"
+      ],
+      "session_scope": "attempt",
+      "credentials": [
+        "repo.read",
+        "model.invoke"
       ]
     }
   ],
@@ -20,45 +21,23 @@
     {
       "id": "unit_loop",
       "worker": "implementer",
+      "skill": "builtin://semantic-review@1",
       "input_scope": "unit",
       "receipt": "unit_completion",
       "max_parallel": 1,
       "max_rounds": 2,
-      "skill": "builtin://implement-unit@1",
       "timeout_seconds": 3600
     }
   ],
   "nodes": [
     {
       "id": "implement",
-      "kind": "for_each_unit",
+      "kind": "run",
       "loop": "unit_loop",
       "depends_on": [],
       "transitions": {
         "success": {
           "terminal": "completed"
-        }
-      }
-    },
-    {
-      "id": "repair_a",
-      "kind": "run",
-      "loop": "unit_loop",
-      "depends_on": [],
-      "transitions": {
-        "success": {
-          "to": "repair_b"
-        }
-      }
-    },
-    {
-      "id": "repair_b",
-      "kind": "run",
-      "loop": "unit_loop",
-      "depends_on": [],
-      "transitions": {
-        "success": {
-          "to": "repair_a"
         }
       }
     }

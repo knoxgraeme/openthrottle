@@ -7,10 +7,12 @@
     {
       "id": "implementer",
       "engine": "agent",
-      "skill": "builtin://implement-unit@1",
       "session_scope": "attempt",
       "credentials": [
-        "repo"
+        "repo.read"
+      ],
+      "skills": [
+        "builtin://implement-unit@1"
       ]
     }
   ],
@@ -20,8 +22,10 @@
       "worker": "implementer",
       "input_scope": "unit",
       "receipt": "unit_completion",
-      "max_parallel": 99,
-      "max_rounds": 2
+      "max_parallel": 2,
+      "max_rounds": 2,
+      "skill": "builtin://implement-unit@1",
+      "timeout_seconds": 3600
     }
   ],
   "nodes": [

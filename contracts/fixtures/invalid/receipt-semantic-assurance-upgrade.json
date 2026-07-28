@@ -23,5 +23,9 @@
   "evidence": [
     "review passed"
   ],
-  "issued_at": "2026-07-28T00:00:00.000Z"
+  "issued_at": "2026-07-28T00:00:00.000Z",
+  "payload": {
+    "summary": "Semantic review passed.",
+    "findings": []
+  }
 }

@@ -7,12 +7,14 @@
     {
       "id": "implementer",
       "engine": "agent",
-      "skill": "builtin://implement-unit@1",
       "session_scope": "attempt",
       "credentials": [
-        "repo"
+        "repo.read"
       ],
-      "prompt": "inline prompts are not part of the closed schema"
+      "prompt": "inline prompts are not part of the closed schema",
+      "skills": [
+        "builtin://implement-unit@1"
+      ]
     }
   ],
   "loops": [
@@ -22,7 +24,9 @@
       "input_scope": "unit",
       "receipt": "unit_completion",
       "max_parallel": 1,
-      "max_rounds": 2
+      "max_rounds": 2,
+      "skill": "builtin://implement-unit@1",
+      "timeout_seconds": 3600
     }
   ],
   "nodes": [

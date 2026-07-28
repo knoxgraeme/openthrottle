@@ -39,7 +39,7 @@ export const GRAPH_OUTCOMES = [
   "retryable_failure",
   "failure",
 ] as const;
-export const LOGICAL_CREDENTIALS = ["repo", "github", "linear", "model", "mcp"] as const;
+export const LOGICAL_CREDENTIALS = ["model.invoke", "provider.read", "repo.read", "repo.write", "mcp"] as const;
 
 export type SessionScope = (typeof SESSION_SCOPES)[number];
 export type InputScope = (typeof INPUT_SCOPES)[number];
@@ -52,7 +52,7 @@ export type LogicalCredential = (typeof LOGICAL_CREDENTIALS)[number];
 export interface GraphWorker {
   id: string;
   engine: WorkerEngine;
-  skill: string;
+  skills: string[];
   session_scope: SessionScope;
   credentials: LogicalCredential[];
 }
@@ -60,10 +60,12 @@ export interface GraphWorker {
 export interface GraphLoop {
   id: string;
   worker: string;
+  skill: string;
   input_scope: InputScope;
   receipt: ReceiptType;
   max_parallel: number;
   max_rounds: number;
+  timeout_seconds: number;
 }
 
 export interface GraphTransition {
@@ -93,11 +95,13 @@ export interface GraphContract {
 }
 
 function parseWorker(value: unknown, path: string): GraphWorker {
-  const input = objectAt(value, path, ["id", "engine", "skill", "session_scope", "credentials"]);
+  const input = objectAt(value, path, ["id", "engine", "skills", "session_scope", "credentials"]);
   return {
     id: stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER }),
     engine: enumAt(input.engine, `${path}.engine`, WORKER_ENGINES),
-    skill: stringAt(input.skill, `${path}.skill`, { max: 240, pattern: SKILL_REFERENCE }),
+    skills: unique(arrayAt(input.skills, `${path}.skills`, (entry, entryPath) => {
+      return stringAt(entry, entryPath, { max: 240, pattern: SKILL_REFERENCE });
+    }, { min: 1, max: 16 }), `${path}.skills`),
     session_scope: enumAt(input.session_scope, `${path}.session_scope`, SESSION_SCOPES),
     credentials: unique(arrayAt(input.credentials, `${path}.credentials`, (entry, entryPath) => {
       return enumAt(entry, entryPath, LOGICAL_CREDENTIALS);
@@ -106,14 +110,18 @@ function parseWorker(value: unknown, path: string): GraphWorker {
 }
 
 function parseLoop(value: unknown, path: string): GraphLoop {
-  const input = objectAt(value, path, ["id", "worker", "input_scope", "receipt", "max_parallel", "max_rounds"]);
+  const input = objectAt(value, path, [
+    "id", "worker", "skill", "input_scope", "receipt", "max_parallel", "max_rounds", "timeout_seconds",
+  ]);
   return {
     id: stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER }),
     worker: stringAt(input.worker, `${path}.worker`, { pattern: IDENTIFIER }),
+    skill: stringAt(input.skill, `${path}.skill`, { max: 240, pattern: SKILL_REFERENCE }),
     input_scope: enumAt(input.input_scope, `${path}.input_scope`, INPUT_SCOPES),
     receipt: enumAt(input.receipt, `${path}.receipt`, RECEIPT_TYPES),
-    max_parallel: integerAt(input.max_parallel, `${path}.max_parallel`, 1, 8),
+    max_parallel: integerAt(input.max_parallel, `${path}.max_parallel`, 1, 1),
     max_rounds: integerAt(input.max_rounds, `${path}.max_rounds`, 1, 20),
+    timeout_seconds: integerAt(input.timeout_seconds, `${path}.timeout_seconds`, 1, 86_400),
   };
 }
 
@@ -171,7 +179,11 @@ function validateGraph(graph: GraphContract, source: string): void {
   if (nodes.size !== graph.nodes.length) fail(`${source}.nodes`, "must not contain duplicate IDs");
   if (!nodes.has(graph.entry_node)) fail(`${source}.entry_node`, "references an unknown node");
   for (const loop of graph.loops) {
-    if (!workers.has(loop.worker)) fail(`${source}.loops.${loop.id}.worker`, "references an unknown worker");
+    const worker = workers.get(loop.worker);
+    if (!worker) fail(`${source}.loops.${loop.id}.worker`, "references an unknown worker");
+    if (!worker.skills.includes(loop.skill)) {
+      fail(`${source}.loops.${loop.id}.skill`, "is not allowed by the worker");
+    }
   }
   for (const node of graph.nodes) {
     if (node.loop && !loops.has(node.loop)) fail(`${source}.nodes.${node.id}.loop`, "references an unknown loop");
@@ -196,6 +208,20 @@ function validateGraph(graph: GraphContract, source: string): void {
   markReachable(graph.entry_node);
   const unreachable = graph.nodes.find((node) => !reachable.has(node.id));
   if (unreachable) fail(`${source}.nodes.${unreachable.id}`, "is unreachable from entry_node");
+
+  const dependencyVisiting = new Set<string>();
+  const dependencyVisited = new Set<string>();
+  const visitDependency = (id: string): void => {
+    if (dependencyVisited.has(id)) return;
+    if (dependencyVisiting.has(id)) fail(`${source}.nodes.${id}.depends_on`, "creates a cycle");
+    dependencyVisiting.add(id);
+    const node = nodes.get(id);
+    if (!node) fail(`${source}.nodes.${id}`, "references an unknown node");
+    for (const dependency of node.depends_on) visitDependency(dependency);
+    dependencyVisiting.delete(id);
+    dependencyVisited.add(id);
+  };
+  for (const node of graph.nodes) visitDependency(node.id);
 
   const visiting = new Set<string>();
   const stack: Array<{ id: string; bounded: boolean }> = [];

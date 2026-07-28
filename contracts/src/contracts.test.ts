@@ -31,13 +31,15 @@ const invalidCases = [
   ["config-path-traversal.json", /ref: has an invalid format/],
   ["config-unknown-field.json", /unexpected: unknown field/],
   ["execution-plan-unknown-field.json", /inline_prompt: unknown field/],
+  ["graph-dependency-cycle.json", /depends_on: creates a cycle/],
   ["graph-duplicate-node.json", /nodes: must not contain duplicate IDs/],
   ["graph-disconnected-cycle.json", /nodes\.repair_a: is unreachable from entry_node/],
   ["graph-unknown-loop.json", /nodes\.implement\.loop: references an unknown loop/],
   ["graph-unbounded-cycle.json", /transitions\.success: creates an unbounded cycle/],
-  ["graph-excess-bounds.json", /max_parallel: must be an integer between 1 and 8/],
+  ["graph-excess-bounds.json", /max_parallel: must be an integer between 1 and 1/],
   ["graph-internal-node-kind.json", /nodes\[0\]\.kind: must be one of/],
-  ["graph-skill-traversal.json", /workers\[0\]\.skill: has an invalid format/],
+  ["graph-loop-skill-not-allowed.json", /loops\.unit_loop\.skill: is not allowed by the worker/],
+  ["graph-skill-traversal.json", /workers\[0\]\.skills\[0\]: has an invalid format/],
   ["graph-unreachable-node.json", /nodes\.dead_command: is unreachable from entry_node/],
   ["graph-unknown-field.json", /prompt: unknown field/],
   ["execution-plan-duplicate-unit.json", /units: must not contain duplicate IDs/],
@@ -48,6 +50,8 @@ const invalidCases = [
   ["receipt-skill-traversal.json", /producer\.skill: has an invalid format/],
   ["receipt-semantic-assurance-upgrade.json", /assurance: semantic receipts cannot claim/],
   ["receipt-missing-fence.json", /fence\.request_hash: must be a non-empty string/],
+  ["receipt-unit-completion-missing-payload-field.json", /payload\.requested_human_input: must be an array/],
+  ["receipt-unit-decision-bad-result.json", /result: must be one of: accept, revise, context_update, needs_human/],
   ["receipt-unknown-field.json", /executor_verified: unknown field/],
 ] as const;
 
@@ -58,6 +62,7 @@ describe("Stage C contract fixtures", () => {
       "graph-structured.json",
       "execution-plan.json",
       "receipt-unit-completion.json",
+      "receipt-unit-decision.json",
     ];
 
     for (const fixture of fixtures) {

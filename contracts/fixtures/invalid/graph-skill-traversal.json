@@ -7,10 +7,12 @@
     {
       "id": "implementer",
       "engine": "agent",
-      "skill": "repo://owner/repo@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#../../.github/workflows/ci.yml",
       "session_scope": "attempt",
       "credentials": [
-        "repo"
+        "repo.read"
+      ],
+      "skills": [
+        "repo://owner/repo@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#../../.github/workflows/ci.yml"
       ]
     }
   ],
@@ -21,7 +23,9 @@
       "input_scope": "unit",
       "receipt": "unit_completion",
       "max_parallel": 1,
-      "max_rounds": 2
+      "max_rounds": 2,
+      "skill": "repo://owner/repo@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#../../.github/workflows/ci.yml",
+      "timeout_seconds": 3600
     }
   ],
   "nodes": [
