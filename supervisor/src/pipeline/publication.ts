@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import {
   canonicalJson,
   digestNormalized,
+  PIPELINE_OUTCOMES,
   type PipelineManifest,
   type PipelineOutcome,
   type StageOutcome,
@@ -14,13 +15,6 @@ import type {
   PipelineStageAttempt,
 } from "./store.js";
 import type { PipelineCoordinatorEvent } from "./coordinator.js";
-import {
-  displayStatusText,
-  isRepairStage,
-  renderStatusHeaderLines,
-  stageDisplayName,
-  type RenderExtras as StatusRenderExtras,
-} from "./publication-status.js";
 import { sanitizeText } from "../shared/sanitize.js";
 
 export const PIPELINE_PUBLICATION_SCHEMA = "openthrottle.pipeline-publication/v1";
@@ -33,6 +27,7 @@ const INLINE_ARTIFACT_LIMIT_BYTES = 4 * 1024;
 const PUBLICATION_BODY_LIMIT = 12_000;
 const ATTACHMENT_LIMIT_BYTES = 256 * 1024;
 const MAX_RENDERED_FINDINGS = 10;
+const TERMINAL_STATUSES = new Set<string>(PIPELINE_OUTCOMES);
 
 export type PipelinePublicationTemplate =
   | "selection"
@@ -214,8 +209,36 @@ interface RenderContext {
   transition: PipelineManifest["stages"][number]["transitions"][StageOutcome] | undefined;
 }
 
-interface RenderExtras extends StatusRenderExtras {
+interface RenderExtras {
+  scheduledReentryOrdinal?: number;
   repairBannerFinding?: PublicationFinding;
+  completedStageIds?: readonly string[];
+}
+
+const STAGE_LABELS: Readonly<Record<string, { display: string; action?: string }>> = {
+  build: { display: "building" },
+  command: { display: "running command" },
+  implementation: { display: "implementing" },
+  lint: { display: "linting" },
+  planning: { display: "planning" },
+  provider: { display: "waiting on GitHub" },
+  publish: { display: "publishing" },
+  post_simplify_review: { display: "re-review", action: "reviewing simplified changes" },
+  repair_implementation: { display: "repair implementation", action: "repairing implementation" },
+  repair_semantic_review: { display: "repair code review", action: "reviewing repaired changes" },
+  review: { display: "code review", action: "reviewing changes" },
+  semantic_review: { display: "code review", action: "reviewing changes" },
+  simplification: { display: "simplifying", action: "simplifying changes" },
+  test: { display: "testing" },
+};
+
+function stageDisplayName(stageId: string): string {
+  return STAGE_LABELS[stageId]?.display ?? stageId.replaceAll("_", " ");
+}
+
+function stageActionName(stageId: string): string {
+  const label = STAGE_LABELS[stageId];
+  return label?.action ?? label?.display ?? stageDisplayName(stageId);
 }
 
 function renderContext(envelope: PipelinePublicationBodyInput, normalizedManifest: string): RenderContext {
@@ -231,10 +254,89 @@ function renderContext(envelope: PipelinePublicationBodyInput, normalizedManifes
   };
 }
 
+function stagePosition(envelope: PipelinePublicationBodyInput, context: RenderContext): {
+  ordinal: number;
+  total: number;
+  stage: string;
+} {
+  const manifest = context.manifest;
+  if (!envelope.stage) {
+    return { ordinal: 0, total: manifest.stages.length, stage: envelope.template.name.replaceAll("_", " ") };
+  }
+  return {
+    ordinal: context.stageIndex >= 0 ? context.stageIndex + 1 : envelope.stage.attempt_ordinal,
+    total: manifest.stages.length,
+    stage: envelope.stage.id,
+  };
+}
+
 function nextStageName(envelope: PipelinePublicationBodyInput, context: RenderContext): string {
   if (context.transition?.to) return context.transition.to;
   if (envelope.stage) return envelope.stage.id;
   return context.manifest.entry_stage;
+}
+
+function forwardTransitionTarget(
+  manifest: PipelineManifest,
+  stageId: string
+): string | undefined {
+  const stage = manifest.stages.find((entry) => entry.id === stageId);
+  return stage?.transitions.success?.to ?? stage?.transitions.no_change?.to;
+}
+
+function stagePathFrom(manifest: PipelineManifest, stageId: string): string[] {
+  const path: string[] = [];
+  const visited = new Set<string>();
+  let current: string | undefined = stageId;
+  while (current && !visited.has(current) && manifest.stages.some((stage) => stage.id === current)) {
+    path.push(current);
+    visited.add(current);
+    current = forwardTransitionTarget(manifest, current);
+  }
+  return path;
+}
+
+function uniqueKnownStageIds(manifest: PipelineManifest, stageIds: readonly string[]): string[] {
+  const known = new Set(manifest.stages.map((stage) => stage.id));
+  const seen = new Set<string>();
+  return stageIds.filter((stageId) => {
+    if (!known.has(stageId) || seen.has(stageId)) return false;
+    seen.add(stageId);
+    return true;
+  });
+}
+
+function isTerminalPublication(envelope: PipelinePublicationBodyInput): boolean {
+  return envelope.template.name === "terminal" ||
+    TERMINAL_STATUSES.has(envelope.decision.next_status) ||
+    Boolean(envelope.resume_status && TERMINAL_STATUSES.has(envelope.resume_status));
+}
+
+function checklistStageIds(
+  envelope: PipelinePublicationBodyInput,
+  context: RenderContext,
+  extras?: RenderExtras
+): string[] {
+  const manifest = context.manifest;
+  const terminal = isTerminalPublication(envelope);
+  const hasCompletedHistory = extras?.completedStageIds !== undefined;
+  const completed = uniqueKnownStageIds(manifest, [
+    ...(extras?.completedStageIds ?? []),
+    ...(envelope.stage ? [envelope.stage.id] : []),
+  ]);
+  if (terminal && hasCompletedHistory) return completed;
+  if (terminal || !hasCompletedHistory) {
+    const fallback = stagePathFrom(manifest, manifest.entry_stage);
+    const active = !terminal && envelope.stage ? nextStageName(envelope, context) : null;
+    return active && !fallback.includes(active)
+      ? uniqueKnownStageIds(manifest, [...fallback, active, ...stagePathFrom(manifest, active)])
+      : fallback;
+  }
+
+  const active = envelope.stage ? nextStageName(envelope, context) : manifest.entry_stage;
+  const prefix = uniqueKnownStageIds(manifest, [...completed, active]);
+  const tail = stagePathFrom(manifest, active).filter((stageId) => !prefix.includes(stageId));
+  return [...prefix, ...tail];
 }
 
 function reentryRound(
@@ -258,8 +360,8 @@ function reentrySentence(
   const round = reentryRound(envelope, context, extras);
   const target = nextStageName(envelope, context);
   return envelope.decision.outcome === "retryable_infrastructure_failure"
-    ? `The supervisor is retrying the ${stageDisplayName(target)} stage after an infrastructure failure (attempt ${round}).`
-    : `The supervisor accepted the stage result and scheduled repair round ${round} at the ${stageDisplayName(target)} stage.`;
+    ? `The supervisor is retrying the ${target} stage after an infrastructure failure (attempt ${round}).`
+    : `The supervisor accepted the stage result and scheduled repair round ${round} at the ${target} stage.`;
 }
 
 function sentenceForOutcome(outcome: StageOutcome | PipelineOutcome | "selected"): string {
@@ -313,7 +415,7 @@ function eventSentence(
 
 function terminalSentence(envelope: PipelinePublicationBodyInput): string {
   const reason = envelope.decision.wait_reason
-    ? displayStatusText(envelope.decision.wait_reason, 1_000)
+    ? boundedPublicationLine(envelope.decision.wait_reason, 1_000)
     : null;
   const providerLink = envelope.links[0]
     ? ` Provider link: [${boundedPublicationLine(envelope.links[0].label, 100)}](${envelope.links[0].url}).`
@@ -345,6 +447,112 @@ function dedupeLines(lines: string[]): string[] {
     seen.add(line);
     return true;
   });
+}
+
+function activeChecklistIndex(
+  envelope: PipelinePublicationBodyInput,
+  context: RenderContext,
+  stageIds: readonly string[]
+): number {
+  if (isTerminalPublication(envelope)) {
+    return stageIds.length;
+  }
+  const next = nextStageName(envelope, context);
+  const nextIndex = stageIds.findIndex((stageId) => stageId === next);
+  if (nextIndex >= 0 && next !== envelope.stage?.id) return nextIndex;
+  const currentIndex = envelope.stage ? stageIds.findIndex((stageId) => stageId === envelope.stage?.id) : -1;
+  return currentIndex >= 0 ? currentIndex : 0;
+}
+
+function activeStagePosition(
+  envelope: PipelinePublicationBodyInput,
+  context: RenderContext,
+  stageIds: readonly string[]
+): {
+  ordinal: number;
+  total: number;
+  stageId: string;
+} {
+  const activeIndex = activeChecklistIndex(envelope, context, stageIds);
+  const total = stageIds.length;
+  if (activeIndex >= 0 && activeIndex < total) {
+    return { ordinal: activeIndex + 1, total, stageId: stageIds[activeIndex]! };
+  }
+  const position = stagePosition(envelope, context);
+  return { ordinal: Math.min(position.ordinal, total), total, stageId: position.stage };
+}
+
+function whoseMoveLine(
+  envelope: PipelinePublicationBodyInput,
+  context: RenderContext,
+  stageIds: readonly string[]
+): string {
+  const waitReason = envelope.decision.wait_reason
+    ? boundedPublicationLine(envelope.decision.wait_reason, 1_000)
+    : "the published receipt in this Linear session";
+  const active = activeStagePosition(envelope, context, stageIds);
+  const suffix = `(stage ${active.ordinal} of ${active.total}).`;
+  if (envelope.decision.next_status === "waiting_human" || envelope.template.name === "needs_human") {
+    return `**Your move: decision required — ${waitReason} ${suffix}**`;
+  }
+  if (envelope.decision.next_status === "waiting_provider" || envelope.template.name === "provider_wait") {
+    return `**Your move: nothing — waiting on GitHub: ${waitReason} ${suffix}**`;
+  }
+  if (envelope.template.name === "terminal" ||
+      envelope.decision.next_status === envelope.decision.outcome &&
+      TERMINAL_STATUSES.has(envelope.decision.next_status)) {
+    return `**Your move: nothing — this run is finished. ${terminalSentence(envelope)}**`;
+  }
+  return `**Your move: nothing — ${stageActionName(active.stageId)} ${suffix}**`;
+}
+
+function decisionContextLines(envelope: PipelinePublicationBodyInput): string[] {
+  const reason = envelope.decision.wait_reason
+    ? boundedPublicationLine(envelope.decision.wait_reason, 1_000)
+    : terminalSentence(envelope);
+  if (envelope.decision.next_status === "waiting_human" || envelope.template.name === "needs_human") {
+    return [
+      `why: ${reason}`,
+      "asked: Decide how OpenThrottle should proceed for this run.",
+    ];
+  }
+  if (envelope.template.name === "terminal" && envelope.decision.outcome !== "shipped") {
+    return [`why: ${reason}`];
+  }
+  return [];
+}
+
+function stageChecklistLines(
+  envelope: PipelinePublicationBodyInput,
+  context: RenderContext,
+  stageIds: readonly string[]
+): string[] {
+  const activeIndex = activeChecklistIndex(envelope, context, stageIds);
+  return stageIds.map((stageId, index) => {
+    if (index < activeIndex || activeIndex >= stageIds.length) {
+      return `- [x] ${stageDisplayName(stageId)}`;
+    }
+    if (index === activeIndex) {
+      const wait = envelope.decision.wait_reason
+        ? ` — ${boundedPublicationLine(envelope.decision.wait_reason, 500)}`
+        : "";
+      return `→ **${stageDisplayName(stageId)}** — in progress${wait}`;
+    }
+    return `- [ ] ${stageDisplayName(stageId)}`;
+  });
+}
+
+function summaryHeaderLines(
+  envelope: PipelinePublicationBodyInput,
+  context: RenderContext,
+  extras?: RenderExtras
+): string[] {
+  const stageIds = checklistStageIds(envelope, context, extras);
+  return [
+    whoseMoveLine(envelope, context, stageIds),
+    ...decisionContextLines(envelope),
+    ...stageChecklistLines(envelope, context, stageIds),
+  ];
 }
 
 function normalizedFindingToken(value: string): string {
@@ -457,11 +665,17 @@ function safeStoredFinding(value: unknown): PublicationFinding | null {
 }
 
 /**
- * Extracts the accumulated finding state from persisted publication payloads,
- * later payloads overriding earlier dispositions for the same finding.
+ * Extracts accumulated display state from persisted publication payloads. Later
+ * payloads override earlier finding dispositions for the same finding, while
+ * stage IDs keep first-seen execution order.
  */
-export function accumulatedPublicationFindings(payloads: readonly string[]): PublicationFinding[] {
+export function accumulatedPublicationState(payloads: readonly string[]): {
+  findings: PublicationFinding[];
+  stageIds: string[];
+} {
   const merged = new Map<string, PublicationFinding>();
+  const seenStageIds = new Set<string>();
+  const stageIds: string[] = [];
   for (const payload of payloads) {
     let parsed: unknown;
     try {
@@ -470,17 +684,41 @@ export function accumulatedPublicationFindings(payloads: readonly string[]): Pub
       continue;
     }
     if (!parsed || typeof parsed !== "object") continue;
-    const envelope = parsed as { schema?: unknown; evidence?: { findings?: unknown } };
-    if (envelope.schema !== PIPELINE_PUBLICATION_SCHEMA ||
-        !Array.isArray(envelope.evidence?.findings)) {
+    const envelope = parsed as {
+      schema?: unknown;
+      evidence?: { findings?: unknown };
+      stage?: { id?: unknown } | null;
+    };
+    if (envelope.schema !== PIPELINE_PUBLICATION_SCHEMA) {
       continue;
     }
-    for (const value of envelope.evidence.findings.slice(0, 50)) {
-      const finding = safeStoredFinding(value);
-      if (finding) merged.set(findingIdentity(finding), finding);
+    if (typeof envelope.stage?.id === "string" && !seenStageIds.has(envelope.stage.id)) {
+      seenStageIds.add(envelope.stage.id);
+      stageIds.push(envelope.stage.id);
+    }
+    if (Array.isArray(envelope.evidence?.findings)) {
+      for (const value of envelope.evidence.findings.slice(0, 50)) {
+        const finding = safeStoredFinding(value);
+        if (finding) merged.set(findingIdentity(finding), finding);
+      }
     }
   }
-  return [...merged.values()].slice(0, 50);
+  return {
+    findings: [...merged.values()].slice(0, 50),
+    stageIds,
+  };
+}
+
+/**
+ * Extracts the accumulated finding state from persisted publication payloads,
+ * later payloads overriding earlier dispositions for the same finding.
+ */
+export function accumulatedPublicationFindings(payloads: readonly string[]): PublicationFinding[] {
+  return accumulatedPublicationState(payloads).findings;
+}
+
+export function accumulatedPublicationStageIds(payloads: readonly string[]): string[] {
+  return accumulatedPublicationState(payloads).stageIds;
 }
 
 function findingsSectionLines(envelope: PipelinePublicationBodyInput): string[] {
@@ -512,6 +750,23 @@ function assumptionsSectionLines(envelope: PipelinePublicationBodyInput): string
   ];
 }
 
+function addressedFindingsLines(envelope: PipelinePublicationBodyInput): string[] {
+  if (envelope.template.name !== "provider_wait" || !envelope.decision.subject) return [];
+  const actions = envelope.evidence.actions ?? [];
+  const addressed = dedupeFindings(envelope.evidence.findings ?? [])
+    .filter((finding) =>
+      finding.disposition === "fixed in-stage" &&
+      actions.some((action) => actionAddressesFinding(action, finding))
+    )
+    .slice(0, MAX_RENDERED_FINDINGS);
+  if (addressed.length === 0) return [];
+  const shortSubject = envelope.decision.subject.slice(0, 12);
+  return [
+    `Addressed in \`${shortSubject}\`:`,
+    ...addressed.map((finding) => `- [${finding.severity}] ${finding.code}: ${finding.summary}`),
+  ];
+}
+
 function repairBannerLines(
   envelope: PipelinePublicationBodyInput,
   context: RenderContext,
@@ -538,7 +793,7 @@ function renderBody(
 ): string {
   const context = renderContext(envelope, normalizedManifest);
   const lines = [
-    ...renderStatusHeaderLines(envelope, normalizedManifest, extras),
+    ...summaryHeaderLines(envelope, context, extras),
     ...repairBannerLines(envelope, context, extras),
     ...findingsSectionLines(envelope),
     ...assumptionsSectionLines(envelope),
@@ -610,7 +865,6 @@ export function buildLifecyclePublication(input: {
   attempt?: PipelineStageAttempt;
   outcome: PipelineOutcome;
   reason: string;
-  enteredStageIds?: readonly string[];
 }): PipelinePublicationEnvelope {
   const partial: PipelinePublicationBodyInput = {
     schema: PIPELINE_PUBLICATION_SCHEMA,
@@ -653,13 +907,7 @@ export function buildLifecyclePublication(input: {
     links: githubLinks(input.instance, input.instance.immutable_subject),
     resume_status: null,
   };
-  return {
-    ...partial,
-    body: renderBody(partial, input.instance.normalized_manifest, {
-      hasRepairHistory: input.enteredStageIds?.some(isRepairStage) ?? false,
-      enteredStageIds: input.enteredStageIds,
-    }),
-  };
+  return { ...partial, body: renderBody(partial, input.instance.normalized_manifest) };
 }
 
 export function buildStagePublication(input: {
@@ -671,8 +919,8 @@ export function buildStagePublication(input: {
   resumeStatus?: PipelineInstanceStatus | null;
   /** Findings accumulated from the run's earlier publications. */
   priorFindings?: readonly PublicationFinding[];
-  /** Stage IDs whose state rows show that they were attempted in this run. */
-  enteredStageIds?: readonly string[];
+  /** Completed stages accumulated from earlier publication receipts, in execution order. */
+  completedStageIds?: readonly string[];
 }): PipelinePublicationEnvelope {
   const resumeStatus = input.resumeStatus ?? input.write.resumeStatus ?? null;
   const evidence = (input.event.artifacts ?? []).map((artifact) => safeEvidence(artifact.payload));
@@ -743,8 +991,7 @@ export function buildStagePublication(input: {
     scheduledReentryOrdinal: input.write.nextAttempt?.reentryOrdinal,
     repairBannerFinding: currentFindingsWithDisposition
       .find((finding) => finding.disposition === "carried to repair"),
-    hasRepairHistory: input.enteredStageIds?.some(isRepairStage) ?? false,
-    enteredStageIds: input.enteredStageIds,
+    completedStageIds: input.completedStageIds,
   });
   return artifactBytes <= INLINE_ARTIFACT_LIMIT_BYTES
     ? {
@@ -865,6 +1112,8 @@ export function renderGithubPipelineSummary(envelope: PipelinePublicationEnvelop
     "## OpenThrottle pipeline summary",
     "",
     ...linearStatusCommentLines(envelope, prUrl),
+    "",
+    ...addressedFindingsLines(envelope),
     "",
     ...detailLines,
     "",

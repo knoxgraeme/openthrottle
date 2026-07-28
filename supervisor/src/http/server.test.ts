@@ -429,6 +429,43 @@ describe("coordinator-only server", () => {
     expect(await steer.json()).toEqual({ error: "pipeline not found" });
   });
 
+  it("captures operator steering during a non-steerable running stage", async () => {
+    seedPipelineTicket();
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    const request = pipelines.getStageRequest(attempt.id);
+    expect(store.beginRun({
+      issueId: "issue-1",
+      runId: request.runId,
+      taskType: "implement",
+      tokenHash: "token-hash",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    })).toBe(true);
+    pipelines.bindStageRun(attempt.id, request.runId);
+    pipelines.markStageDispatched(attempt.id);
+
+    const response = await app().request("/tickets/OT-1/steer", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer status-token",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ message: "carry this forward" }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      ok: true,
+      status: "captured",
+      message: "captured — retained for the next implementation or repair stage",
+    });
+    expect(db.prepare("SELECT run_id, source, body FROM session_inbox").get()).toEqual({
+      run_id: null,
+      source: "operator",
+      body: "carry this forward",
+    });
+  });
+
   it("distinguishes an accepted stop request from confirmed durable settlement", async () => {
     seedPipelineTicket();
     const pending = await app().request("/tickets/OT-1/stop", {

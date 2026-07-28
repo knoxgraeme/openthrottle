@@ -543,24 +543,33 @@ export function createServer(deps: ServerDeps): Hono {
     }
     const pipeline = deps.pipelineCoordinator.store.getInstanceForSession(ticket.linear_session_id);
     if (!pipeline) return context.json({ error: "pipeline not found" }, 409);
-    if (!canSteerPipelineRun({
+    const canSteerNow = canSteerPipelineRun({
       store: deps.pipelineCoordinator.store,
       sessionId: ticket.linear_session_id,
       runId: ticket.run_id,
       agent: ticket.agent,
-    })) {
+    });
+    if (!canSteerNow && pipeline.status !== "running") {
       return context.json({ error: "the current pipeline stage does not accept live steering" }, 409);
     }
-    // The message reaches only the exact active run accepted by the stage's
-    // sealed steering policy. It is untrusted data and is never executed.
+    // The message is untrusted data and is never executed. When the current
+    // stage accepts steering, fence it to that exact run; otherwise leave it
+    // unbound until a later steerable stage can lease it.
     const record = store.enqueueInbox({
       issueId: ticket.linear_issue_id,
       sessionId: ticket.linear_session_id,
-      runId: ticket.run_id,
+      runId: canSteerNow ? ticket.run_id : null,
       source: "operator",
       body: message,
     });
-    return context.json({ ok: true, id: record.id });
+    return context.json({
+      ok: true,
+      id: record.id,
+      status: canSteerNow ? "queued" : "captured",
+      ...(canSteerNow
+        ? {}
+        : { message: "captured — retained for the next implementation or repair stage" }),
+    });
   });
 
   app.get("/tickets/:identifier/logs", async (context) => {

@@ -92,16 +92,6 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
         ORDER BY attempt_ordinal DESC, reentry_ordinal DESC LIMIT 1
       `).get(instanceId) as PipelineStageAttempt | undefined;
 
-  const listEnteredStageIds = (instanceId: string): string[] =>
-    (db.prepare(`
-        SELECT stage_id FROM pipeline_instance_stages
-        WHERE pipeline_instance_id = ?
-          AND attempt_count > 0
-          AND status NOT IN ('pending', 'dispatchable')
-        ORDER BY ordinal
-      `).all(instanceId) as Array<{ stage_id: string }>)
-      .map((stage) => stage.stage_id);
-
   const markInstanceSuperseded = (instance: PipelineInstance, nextVersion: number, timestamp: string): void => {
     db.prepare(`
         UPDATE pipeline_stage_attempts
@@ -136,15 +126,13 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
     instance: PipelineInstance,
     activeAttempt: PipelineStageAttempt | undefined,
     nextVersion: number,
-    timestamp: string,
-    enteredStageIds: readonly string[]
+    timestamp: string
   ): void => {
     const terminalPublication = buildTerminalPublicationPayload({
       instance,
       attempt: activeAttempt,
       outcome: "superseded",
       reason: "A newer delegated Linear session superseded this pipeline generation.",
-      enteredStageIds,
     });
     persistPublication({
       instance,
@@ -197,9 +185,8 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
   const supersedeInstance = (instance: PipelineInstance, currentSessionId: string, timestamp: string): void => {
     const nextVersion = instance.state_version + 1;
     const activeAttempt = getSupersedableAttempt(instance.id);
-    const enteredStageIds = listEnteredStageIds(instance.id);
     markInstanceSuperseded(instance, nextVersion, timestamp);
-    publishSupersededInstance(instance, activeAttempt, nextVersion, timestamp, enteredStageIds);
+    publishSupersededInstance(instance, activeAttempt, nextVersion, timestamp);
     enqueueSupersedeStop(instance, activeAttempt, nextVersion, currentSessionId, timestamp);
   };
 

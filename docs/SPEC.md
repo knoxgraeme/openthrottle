@@ -237,13 +237,18 @@ attempt before processing; late events from older actors are discarded.
 
 ### Live steering
 
-Exact Linear prompt text that is not `/stop` or `/merge` may be queued only when
-the active manifest stage declares `live_steering`, the active run is fenced to
-that attempt, and the selected agent supports injection. Deliveries use the
-durable work store, bind to the pipeline instance/attempt/run/context revision,
-and require an exact sandbox acknowledgement before consumption. Actor exit
-expires and cancels unacknowledged deliveries. Steering is sealed to its owning
-run and attempt and never crosses that boundary into a later actor.
+Exact Linear prompt text that is not `/stop` or `/merge` is retained while a
+pipeline is running. When the active manifest stage declares `live_steering`, the
+active run is fenced to that attempt, and the selected agent supports injection,
+the retained message is leased and delivered as live steering. Messages captured
+during a running non-steerable stage remain pending and unbound until a later
+steerable stage can lease them, or until terminal cleanup cancels them.
+Deliveries use the durable work store, bind to the pipeline
+instance/attempt/run/context revision, and require an exact sandbox
+acknowledgement before consumption. Actor exit expires and cancels
+unacknowledged deliveries. Once steering has been leased to a run, it is sealed
+to that owning run and attempt and never crosses that boundary into a later
+actor.
 
 Native session continuation is not steering and is not a task type. It is
 selected solely by the next stage’s context policy and sealed native session id.
@@ -317,7 +322,7 @@ untrusted webhook bodies are never automatically attached to Linear or a PR.
 | `GET` | `/repositories` | `OT_STATUS_TOKEN` bearer | registered routes |
 | `POST` | `/repositories/register` | `OT_STATUS_TOKEN` bearer | verify and upsert route/webhook |
 | `POST` | `/tickets/:id/stop` | `OT_STATUS_TOKEN` bearer | coordinator stop |
-| `POST` | `/tickets/:id/steer` | `OT_STATUS_TOKEN` bearer | queue eligible live steering |
+| `POST` | `/tickets/:id/steer` | `OT_STATUS_TOKEN` bearer | capture or queue steering |
 | `GET` | `/tickets/:id/logs` | `OT_STATUS_TOKEN` bearer | sanitized live or durable bounded logs |
 | `POST` | `/tickets/:id/publications/:publicationId/retry` | `OT_STATUS_TOKEN` bearer | reopen a failed receipt |
 

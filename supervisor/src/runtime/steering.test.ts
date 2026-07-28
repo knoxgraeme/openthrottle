@@ -236,6 +236,47 @@ describe("deliverPendingInbox", () => {
     expect(sandbox.fs.uploadFile).not.toHaveBeenCalled();
   });
 
+  it("does not upload pending inbox items until the active stage can receive steering", async () => {
+    const store = seedRunningTicket();
+    const record = store.enqueueInbox({
+      issueId: "issue-1",
+      sessionId: "session-1",
+      runId: null,
+      source: "human",
+      body: "hold this for the next steerable stage",
+    });
+    const sandbox = makeSandbox();
+    const get = vi.fn(async () => sandbox);
+
+    await deliverPendingInbox({
+      runtime: { getWorkspace: get },
+      store,
+      canReceiveSteering: () => false,
+    });
+
+    expect(get).toHaveBeenCalledOnce();
+    expect(sandbox.fs.listFiles).toHaveBeenCalledWith("/home/agent/.ot/inbox-processed");
+    expect(sandbox.fs.uploadFile).not.toHaveBeenCalled();
+    expect(store.getInbox(record.id)).toMatchObject({ status: "pending", run_id: null });
+
+    store.finishRun({ runId: "run-1", status: "completed", ticketState: "active" });
+    store.beginRun({
+      issueId: "issue-1",
+      runId: "run-2",
+      taskType: "implement",
+      tokenHash: "next-run-hash",
+      expiresAt: "2999-01-01T00:00:00.000Z",
+    });
+    await deliverPendingInbox({
+      runtime: { getWorkspace: get },
+      store,
+      canReceiveSteering: () => true,
+    });
+
+    expect(sandbox.fs.uploadFile).toHaveBeenCalledOnce();
+    expect(store.getInbox(record.id)).toMatchObject({ status: "dispatched", run_id: "run-2" });
+  });
+
   it("starts a stopped sandbox before writing", async () => {
     const store = seedRunningTicket();
     store.enqueueInbox({
