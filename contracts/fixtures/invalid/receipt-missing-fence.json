@@ -1,0 +1,41 @@
+{
+  "schema": "openthrottle.receipt/v1",
+  "type": "unit_completion",
+  "assurance": "semantic_attested",
+  "result": "success",
+  "producer": {
+    "worker_id": "implementer",
+    "skill": "builtin://implement-unit@1",
+    "capability_digest": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "subject": {
+    "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "pre": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "post": "cccccccccccccccccccccccccccccccccccccccc"
+  },
+  "fence": {
+    "pipeline_instance_id": "instance-1",
+    "graph_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+    "unit_id": "contracts",
+    "attempt_id": "attempt-1"
+  },
+  "evidence": [
+    "npm test --prefix contracts passed"
+  ],
+  "issued_at": "2026-07-28T00:00:00.000Z",
+  "payload": {
+    "summary": "Implemented the assigned unit.",
+    "assumptions": [
+      "No runtime default changed."
+    ],
+    "decisions": [
+      "Kept the contract additive."
+    ],
+    "issues": [],
+    "verification": [
+      "npm test --prefix contracts passed"
+    ],
+    "downstream_context": [],
+    "requested_human_input": []
+  }
+}

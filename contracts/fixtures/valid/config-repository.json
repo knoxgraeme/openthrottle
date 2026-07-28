@@ -1,0 +1,49 @@
+{
+  "schema": "openthrottle.config/v1",
+  "default_graph": "structured",
+  "graphs": [
+    {
+      "id": "simple",
+      "kind": "builtin",
+      "ref": "core/simple@1"
+    },
+    {
+      "id": "structured",
+      "kind": "repository",
+      "ref": ".openthrottle/graphs/structured.json"
+    }
+  ],
+  "agent": "codex",
+  "test": "npm test --prefix supervisor && npm test --prefix cli && npm test --prefix sandbox",
+  "lint": "npm run typecheck --prefix supervisor && npm run typecheck --prefix cli",
+  "build": "npm run build --prefix supervisor && npm run build --prefix cli",
+  "post_bootstrap": [
+    "npm ci --prefix supervisor",
+    "npm ci --prefix cli",
+    "npm ci --prefix sandbox"
+  ],
+  "limits": {
+    "max_turns": 200,
+    "task_timeout": 7200
+  },
+  "mcp_servers": {},
+  "pipelines": {
+    "implement": "implement",
+    "investigate": "investigate"
+  },
+  "intents": {
+    "implement": {
+      "default_graph": "simple",
+      "allowed_graphs": [
+        "simple",
+        "structured"
+      ]
+    },
+    "investigate": {
+      "default_graph": "simple",
+      "allowed_graphs": [
+        "simple"
+      ]
+    }
+  }
+}

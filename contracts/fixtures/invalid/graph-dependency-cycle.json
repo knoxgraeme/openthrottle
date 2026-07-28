@@ -1,0 +1,60 @@
+{
+  "schema": "openthrottle.graph/v1",
+  "id": "dependency_cycle",
+  "version": 1,
+  "entry_node": "a",
+  "workers": [
+    {
+      "id": "implementer",
+      "engine": "agent",
+      "skills": [
+        "builtin://implement-unit@1"
+      ],
+      "session_scope": "attempt",
+      "credentials": [
+        "repo.read",
+        "model.invoke"
+      ]
+    }
+  ],
+  "loops": [
+    {
+      "id": "unit_loop",
+      "worker": "implementer",
+      "skill": "builtin://implement-unit@1",
+      "input_scope": "unit",
+      "receipt": "unit_completion",
+      "max_parallel": 1,
+      "max_rounds": 2,
+      "timeout_seconds": 3600
+    }
+  ],
+  "nodes": [
+    {
+      "id": "a",
+      "kind": "run",
+      "loop": "unit_loop",
+      "depends_on": [
+        "b"
+      ],
+      "transitions": {
+        "success": {
+          "terminal": "completed"
+        }
+      }
+    },
+    {
+      "id": "b",
+      "kind": "run",
+      "loop": "unit_loop",
+      "depends_on": [
+        "a"
+      ],
+      "transitions": {
+        "success": {
+          "terminal": "completed"
+        }
+      }
+    }
+  ]
+}
