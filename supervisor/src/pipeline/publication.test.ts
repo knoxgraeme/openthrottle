@@ -14,6 +14,7 @@ import {
 } from "./manifest.js";
 import { coordinatePipelineEvent, type PipelineCoordinatorEvent } from "./coordinator.js";
 import {
+  accumulatedPublicationRepairSource,
   buildLifecyclePublication,
   buildSelectionPublication,
   buildStagePublication,
@@ -1026,6 +1027,200 @@ describe("pipeline publication", () => {
       "- [ ] publishing",
       "- [ ] waiting on GitHub",
     ]);
+  });
+
+  it("anchors provider repair reentry after the provider stage that requested repair", () => {
+    const { instance, attempt } = setup("fixture/agent@1");
+    const manifest = coreImplementManifest();
+    const input = event(instance, attempt);
+    const publication = buildStagePublication({
+      instance: {
+        ...instance,
+        pipeline_id: manifest.manifest.id,
+        pipeline_version: manifest.manifest.version,
+        normalized_manifest: manifest.normalized,
+        manifest_digest: manifest.digest,
+      },
+      attempt: { ...attempt, stage_id: "provider" },
+      event: { ...input.event, outcome: "semantic_repair_required" },
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: attempt.id,
+        outcome: "semantic_repair_required",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        reentryIncrement: 1,
+        nextAttempt: nextAttemptStub("repair_implementation", 1),
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+    });
+
+    expect(publication.body.split("\n").slice(1, 13)).toEqual([
+      "- [x] implementing",
+      "- [x] code review",
+      "- [x] simplifying",
+      "- [x] re-review",
+      "- [x] testing",
+      "- [x] linting",
+      "- [x] building",
+      "- [x] publishing",
+      "- [x] waiting on GitHub",
+      "→ **repair implementing** — in progress",
+      "- [ ] repair code review",
+      "- [ ] testing",
+    ]);
+  });
+
+  it("keeps provider-triggered repair rows anchored after provider while the repair path is active", () => {
+    const { instance, attempt } = setup("fixture/agent@1");
+    const manifest = coreImplementManifest();
+    const input = event(instance, attempt);
+    const publication = buildStagePublication({
+      instance: {
+        ...instance,
+        pipeline_id: manifest.manifest.id,
+        pipeline_version: manifest.manifest.version,
+        normalized_manifest: manifest.normalized,
+        manifest_digest: manifest.digest,
+      },
+      attempt: {
+        ...attempt,
+        stage_id: "repair_implementation",
+        reentry_ordinal: 1,
+        request_payload: canonicalJson({
+          transitionContext: canonicalJson({
+            from_stage: "provider",
+            event_kind: "provider_snapshot",
+            outcome: "semantic_repair_required",
+          }),
+        }),
+      },
+      event: input.event,
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: attempt.id,
+        outcome: "success",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+    });
+
+    expect(publication.body.split("\n").slice(1, 13)).toEqual([
+      "- [x] implementing",
+      "- [x] code review",
+      "- [x] simplifying",
+      "- [x] re-review",
+      "- [x] testing",
+      "- [x] linting",
+      "- [x] building",
+      "- [x] publishing",
+      "- [x] waiting on GitHub",
+      "- [x] repair implementing",
+      "→ **repair code review** — in progress",
+      "- [ ] testing",
+    ]);
+  });
+
+  it("keeps provider-triggered repair rows anchored after provider during repair code review", () => {
+    const { instance, attempt } = setup("fixture/agent@1");
+    const manifest = coreImplementManifest();
+    const input = event(instance, attempt);
+    const publication = buildStagePublication({
+      instance: {
+        ...instance,
+        pipeline_id: manifest.manifest.id,
+        pipeline_version: manifest.manifest.version,
+        normalized_manifest: manifest.normalized,
+        manifest_digest: manifest.digest,
+      },
+      attempt: {
+        ...attempt,
+        stage_id: "repair_semantic_review",
+        reentry_ordinal: 1,
+        request_payload: canonicalJson({
+          transitionContext: canonicalJson({
+            from_stage: "repair_implementation",
+            event_kind: "stage_result",
+            outcome: "success",
+          }),
+        }),
+      },
+      event: input.event,
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: attempt.id,
+        outcome: "success",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+      priorRepairSourceStageId: "provider",
+    });
+
+    expect(publication.body.split("\n").slice(1, 13)).toEqual([
+      "- [x] implementing",
+      "- [x] code review",
+      "- [x] simplifying",
+      "- [x] re-review",
+      "- [x] testing",
+      "- [x] linting",
+      "- [x] building",
+      "- [x] publishing",
+      "- [x] waiting on GitHub",
+      "- [x] repair implementing",
+      "- [x] repair code review",
+      "→ **testing** — in progress",
+    ]);
+  });
+
+  it("accumulates the latest non-repair stage that scheduled repair", () => {
+    const { instance, attempt } = setup("fixture/agent@1");
+    const manifest = coreImplementManifest();
+    const input = event(instance, attempt);
+    const publication = buildStagePublication({
+      instance: {
+        ...instance,
+        pipeline_id: manifest.manifest.id,
+        pipeline_version: manifest.manifest.version,
+        normalized_manifest: manifest.normalized,
+        manifest_digest: manifest.digest,
+      },
+      attempt: { ...attempt, stage_id: "provider" },
+      event: { ...input.event, outcome: "semantic_repair_required" },
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: attempt.id,
+        outcome: "semantic_repair_required",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        reentryIncrement: 1,
+        nextAttempt: nextAttemptStub("repair_implementation", 1),
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+    });
+
+    expect(accumulatedPublicationRepairSource([canonicalJson(publication)])).toBe("provider");
   });
 
   it("does not infer core repair rows from implementation self-reentry", () => {

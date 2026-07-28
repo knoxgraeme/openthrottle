@@ -208,11 +208,13 @@ interface RenderContext {
   stagesById: Map<string, PipelineManifest["stages"][number]>;
   stageIndex: number;
   transition: PipelineManifest["stages"][number]["transitions"][StageOutcome] | undefined;
+  repairSourceStageId?: string;
 }
 
 interface RenderExtras {
   scheduledReentryOrdinal?: number;
   repairBannerFinding?: PublicationFinding;
+  repairSourceStageId?: string;
 }
 
 const STAGE_LABELS: Readonly<Record<string, { display: string; action?: string }>> = {
@@ -264,9 +266,36 @@ interface RepairBranch {
   start: string;
 }
 
+function repairBranchFromSource(
+  source: string | undefined,
+  context: RenderContext,
+  current: string | undefined,
+  next: string
+): RepairBranch | undefined {
+  if (!source || source.startsWith("repair_")) return undefined;
+  const stage = context.stagesById.get(source);
+  const start = stage?.transitions.semantic_repair_required?.to;
+  if (start?.startsWith("repair_")) {
+    const path = followSuccessPath(context.stagesById, start);
+    if (path.includes(next) || Boolean(current && path.includes(current))) {
+      return { source, start };
+    }
+  }
+  return undefined;
+}
+
 function repairBranch(envelope: PipelinePublicationBodyInput, context: RenderContext): RepairBranch | undefined {
   const current = envelope.stage?.id;
   const next = nextStageName(envelope, context);
+  const currentRepairSource = repairBranchFromSource(
+    context.transition?.to?.startsWith("repair_") ? current : undefined,
+    context,
+    current,
+    next
+  );
+  if (currentRepairSource) return currentRepairSource;
+  const persistedRepairSource = repairBranchFromSource(context.repairSourceStageId, context, current, next);
+  if (persistedRepairSource) return persistedRepairSource;
   for (const stage of context.manifest.stages) {
     if (stage.id.startsWith("repair_")) continue;
     const start = stage.transitions.semantic_repair_required?.to;
@@ -305,7 +334,11 @@ function checklistStageIds(envelope: PipelinePublicationBodyInput, context: Rend
   return current && !path.includes(current) ? [...path, current] : path;
 }
 
-function renderContext(envelope: PipelinePublicationBodyInput, normalizedManifest: string): RenderContext {
+function renderContext(
+  envelope: PipelinePublicationBodyInput,
+  normalizedManifest: string,
+  extras?: RenderExtras
+): RenderContext {
   const manifest = JSON.parse(normalizedManifest) as PipelineManifest;
   const stagesById = stageById(manifest);
   const stageIndex = envelope.stage
@@ -317,7 +350,20 @@ function renderContext(envelope: PipelinePublicationBodyInput, normalizedManifes
     stagesById,
     stageIndex,
     transition: stage?.transitions[envelope.decision.outcome as StageOutcome],
+    repairSourceStageId: extras?.repairSourceStageId,
   };
+}
+
+function repairSourceStageIdFromRequestPayload(payload: string | null): string | undefined {
+  if (!payload) return undefined;
+  try {
+    const request = JSON.parse(payload) as { transitionContext?: unknown };
+    if (typeof request.transitionContext !== "string") return undefined;
+    const context = JSON.parse(request.transitionContext) as { from_stage?: unknown };
+    return typeof context.from_stage === "string" ? context.from_stage : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function nextStageName(envelope: PipelinePublicationBodyInput, context: RenderContext): string {
@@ -447,9 +493,11 @@ function activeChecklistIndex(
     return checklist.length;
   }
   const next = nextStageName(envelope, context);
-  const nextIndex = checklist.indexOf(next);
-  if (nextIndex >= 0 && next !== envelope.stage?.id) return nextIndex;
   const currentIndex = envelope.stage ? checklist.indexOf(envelope.stage.id) : -1;
+  const nextIndex = checklist.indexOf(next, currentIndex >= 0 ? currentIndex + 1 : 0);
+  if (nextIndex >= 0 && next !== envelope.stage?.id) return nextIndex;
+  const fallbackNextIndex = checklist.indexOf(next);
+  if (fallbackNextIndex >= 0 && next !== envelope.stage?.id) return fallbackNextIndex;
   return currentIndex >= 0 ? currentIndex : 0;
 }
 
@@ -675,6 +723,39 @@ export function accumulatedPublicationFindings(payloads: readonly string[]): Pub
   return [...merged.values()].slice(0, 50);
 }
 
+/**
+ * Reads the latest non-repair stage that scheduled a repair branch from prior
+ * publication envelopes, so later repair-stage summaries keep the original
+ * branch anchor even after the sealed attempt context has advanced.
+ */
+export function accumulatedPublicationRepairSource(payloads: readonly string[]): string | undefined {
+  let source: string | undefined;
+  for (const payload of payloads) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object") continue;
+    const envelope = parsed as {
+      schema?: unknown;
+      template?: { name?: unknown };
+      decision?: { outcome?: unknown };
+      stage?: { id?: unknown } | null;
+    };
+    const stageId = envelope.stage?.id;
+    if (envelope.schema === PIPELINE_PUBLICATION_SCHEMA &&
+        envelope.template?.name === "repair_reentry" &&
+        envelope.decision?.outcome === "semantic_repair_required" &&
+        typeof stageId === "string" &&
+        !stageId.startsWith("repair_")) {
+      source = stageId;
+    }
+  }
+  return source;
+}
+
 function findingsSectionLines(envelope: PipelinePublicationBodyInput): string[] {
   const findings = dedupeFindings(envelope.evidence.findings ?? []);
   if (findings.length === 0) return [];
@@ -748,7 +829,7 @@ function renderBody(
   normalizedManifest: string,
   extras?: RenderExtras
 ): string {
-  const context = renderContext(envelope, normalizedManifest);
+  const context = renderContext(envelope, normalizedManifest, extras);
   const lines = [
     ...summaryHeaderLines(envelope, context),
     ...repairBannerLines(envelope, context, extras),
@@ -876,6 +957,8 @@ export function buildStagePublication(input: {
   resumeStatus?: PipelineInstanceStatus | null;
   /** Findings accumulated from the run's earlier publications. */
   priorFindings?: readonly PublicationFinding[];
+  /** Latest non-repair stage that scheduled the active repair branch. */
+  priorRepairSourceStageId?: string;
 }): PipelinePublicationEnvelope {
   const resumeStatus = input.resumeStatus ?? input.write.resumeStatus ?? null;
   const evidence = (input.event.artifacts ?? []).map((artifact) => safeEvidence(artifact.payload));
@@ -904,6 +987,10 @@ export function buildStagePublication(input: {
     currentFindingsWithDisposition,
     actions
   );
+  const requestRepairSource = repairSourceStageIdFromRequestPayload(input.attempt.request_payload);
+  const repairSourceStageId = requestRepairSource?.startsWith("repair_")
+    ? input.priorRepairSourceStageId
+    : requestRepairSource ?? input.priorRepairSourceStageId;
   const partial: PipelinePublicationBodyInput = {
     schema: PIPELINE_PUBLICATION_SCHEMA,
     template: { name: template, version: PIPELINE_PUBLICATION_TEMPLATE_VERSION },
@@ -946,6 +1033,7 @@ export function buildStagePublication(input: {
     scheduledReentryOrdinal: input.write.nextAttempt?.reentryOrdinal,
     repairBannerFinding: currentFindingsWithDisposition
       .find((finding) => finding.disposition === "carried to repair"),
+    repairSourceStageId,
   });
   return artifactBytes <= INLINE_ARTIFACT_LIMIT_BYTES
     ? {

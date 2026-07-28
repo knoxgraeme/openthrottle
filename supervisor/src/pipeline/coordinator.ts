@@ -20,7 +20,11 @@ import type {
   PipelineStore,
 } from "./store.js";
 import { buildStageRequest, plannedStageRunId } from "./stage-request.js";
-import { accumulatedPublicationFindings, buildStagePublication } from "./publication.js";
+import {
+  accumulatedPublicationFindings,
+  accumulatedPublicationRepairSource,
+  buildStagePublication,
+} from "./publication.js";
 
 export interface PipelineEventArtifact {
   id?: string;
@@ -628,9 +632,9 @@ export function coordinatePipelineEvent(
   const summaryPayloads = receipts
     .filter((receipt) => receipt.kind === "github_summary")
     .map((receipt) => receipt.payload);
-  const priorFindings = accumulatedPublicationFindings(
-    summaryPayloads.length > 0 ? summaryPayloads : receipts.map((receipt) => receipt.payload)
-  );
+  const priorPayloads = summaryPayloads.length > 0 ? summaryPayloads : receipts.map((receipt) => receipt.payload);
+  const priorFindings = accumulatedPublicationFindings(priorPayloads);
+  const priorRepairSourceStageId = accumulatedPublicationRepairSource(priorPayloads);
   const publication = canonicalJson(buildStagePublication({
     instance,
     attempt,
@@ -639,6 +643,7 @@ export function coordinatePipelineEvent(
     gateReceipt,
     resumeStatus: write.resumeStatus ?? null,
     priorFindings,
+    priorRepairSourceStageId,
   }));
   attachPublicationEffects({
     write,
