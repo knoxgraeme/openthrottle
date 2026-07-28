@@ -1975,6 +1975,97 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
+  it("resolves the claimed repair-driving snapshot after a repaired republish", () => {
+    const fixture = setup("core/implement@4");
+    const previousHead = "d".repeat(40);
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    fixture.tickets.setSetting("github-head:issue-1", previousHead);
+    fixture.db.prepare(`
+      UPDATE pipeline_instances SET status = 'running', published_commit = ? WHERE id = ?
+    `).run(previousHead, fixture.instance.id);
+    recordAcknowledgedPublication(fixture, "b".repeat(40), { publishedCommit: previousHead }, "publication-previous");
+
+    const payload = canonicalJson({
+      outcome: "semantic_repair_required",
+      summary: "Feedback that already drove the completed repair.",
+      evidence: ["https://github.com/owner/repo/pull/1#pullrequestreview-3"],
+      payload: "{}",
+    });
+    const snapshot = fixture.tickets.recordProviderFeedback({
+      provider: "github",
+      providerEventId: "github-review:repair-driving-snapshot",
+      issueId: fixture.instance.linear_issue_id,
+      sessionId: fixture.instance.linear_session_id,
+      generation: fixture.instance.generation,
+      repository: fixture.instance.repository,
+      pullNumber: 1,
+      headSha: previousHead,
+      kind: "pipeline_provider_event",
+      payload,
+      workItemId: `pipeline-feedback:${fixture.instance.id}:${previousHead}`,
+      receivedAt: "2025-12-31T23:59:59.000Z",
+    }).snapshot;
+    expect(fixture.tickets.claimFeedbackSnapshot(snapshot.id, Number.MAX_SAFE_INTEGER))
+      .toMatchObject({ status: "claimed", snapshot: { repair_round: 1 } });
+
+    recordAcknowledgedPublication(fixture, SUBJECT, {}, "publication-current");
+    moveFixtureToProviderWait(fixture, SUBJECT);
+    fixture.db.prepare("UPDATE pipeline_instances SET reentry_count = 1 WHERE id = ?")
+      .run(fixture.instance.id);
+
+    expect(processPipelineFeedbackSnapshot({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      instance: fixture.pipelines.getInstance(fixture.instance.id)!,
+      snapshot: fixture.db.prepare("SELECT * FROM feedback_snapshots WHERE id = ?").get(snapshot.id) as FeedbackSnapshot,
+    })).toBe(false);
+
+    expect(fixture.db.prepare("SELECT status, head_sha FROM feedback_snapshots WHERE id = ?").get(snapshot.id))
+      .toEqual({ status: "consumed", head_sha: previousHead });
+    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+      status: "waiting_provider",
+      terminal_outcome: null,
+    });
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "provider",
+      reentry_ordinal: 0,
+    });
+  });
+
+  it("still acts on new provider findings anchored to the repaired head", () => {
+    const fixture = setup("core/implement@4");
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    fixture.tickets.setSetting("github-head:issue-1", SUBJECT);
+    recordAcknowledgedPublication(fixture, SUBJECT, {}, "publication-current");
+    moveFixtureToProviderWait(fixture, SUBJECT);
+    fixture.db.prepare("UPDATE pipeline_instances SET reentry_count = 1 WHERE id = ?")
+      .run(fixture.instance.id);
+
+    expect(routePipelineProviderEvent({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      ticket: fixture.tickets.getByIssueId("issue-1")!,
+      eventId: "github-review:new-current-head-finding",
+      outcome: "semantic_repair_required",
+      summary: "New review feedback against the repaired head.",
+      evidence: ["https://github.com/owner/repo/pull/1#discussion_r4"],
+      payload: { kind: "pull_request_review", id: "new-current-head-finding" },
+      headSha: SUBJECT,
+      pullRequestUrl: "https://github.com/owner/repo/pull/1",
+    })).toBe(true);
+
+    expect(fixture.db.prepare("SELECT status, head_sha FROM feedback_snapshots").get())
+      .toEqual({ status: "consumed", head_sha: SUBJECT });
+    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+      status: "dispatchable",
+      terminal_outcome: null,
+    });
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "repair_implementation",
+      reentry_ordinal: 1,
+    });
+  });
+
   it("does not carry an old snapshot after a post-publication event joins it", () => {
     const fixture = setup("core/implement@4");
     const previousHead = "d".repeat(40);

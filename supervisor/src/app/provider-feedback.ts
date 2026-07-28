@@ -300,6 +300,19 @@ function snapshotFeedbackPredatesCurrentPublication(
   return acknowledgedAt !== undefined && snapshot.provider_watermark < acknowledgedAt;
 }
 
+function snapshotCompletedRepairBeforeCurrentPublication(
+  pipelines: PipelineStore,
+  acknowledgedPublicationSubjects: ReadonlySet<string>,
+  snapshot: FeedbackSnapshot,
+  instance: PipelineInstance
+): boolean {
+  return snapshot.status === "claimed" &&
+    snapshot.repair_round !== null &&
+    instance.reentry_count >= snapshot.repair_round &&
+    snapshotCanCarryForward(acknowledgedPublicationSubjects, snapshot, instance) &&
+    snapshotFeedbackPredatesCurrentPublication(pipelines, snapshot, instance);
+}
+
 function staleFeedbackNotice(params: {
   sessionId: string;
   eventCount: number;
@@ -343,6 +356,15 @@ export function processPipelineFeedbackSnapshot(params: {
   const subjects = canCheckCarryForward
     ? params.acknowledgedPublicationSubjects ?? acknowledgedPublicationSubjects(params.pipelines, params.instance.id)
     : undefined;
+  if (subjects && snapshotCompletedRepairBeforeCurrentPublication(
+    params.pipelines,
+    subjects,
+    params.snapshot,
+    params.instance
+  )) {
+    params.store.consumeFeedbackSnapshot(params.snapshot.id);
+    return false;
+  }
   // Feedback observed before the current head was published may still be the
   // repair request that caused this republish. The provider watermark tracks
   // the latest event in the snapshot, so delayed post-publication stale anchors
