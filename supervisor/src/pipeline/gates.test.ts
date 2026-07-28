@@ -2007,6 +2007,21 @@ describe("deterministic supervisor stage gates", () => {
     }).snapshot;
     expect(fixture.tickets.claimFeedbackSnapshot(snapshot.id, Number.MAX_SAFE_INTEGER))
       .toMatchObject({ status: "claimed", snapshot: { repair_round: 1 } });
+    const providerEventPayload = canonicalJson({ snapshot_id: snapshot.id });
+    fixture.db.prepare(`
+      INSERT INTO pipeline_inbox_events (
+        id, pipeline_instance_id, generation, kind, payload, payload_hash,
+        status, created_at, consumed_at
+      ) VALUES (?, ?, ?, 'provider_snapshot', ?, ?, 'consumed', ?, ?)
+    `).run(
+      `provider-feedback-snapshot:${snapshot.id}`,
+      fixture.instance.id,
+      fixture.instance.generation,
+      providerEventPayload,
+      digestNormalized(providerEventPayload),
+      "2026-01-01T00:00:00.000Z",
+      "2026-01-01T00:00:00.000Z"
+    );
 
     recordAcknowledgedPublication(fixture, SUBJECT, {}, "publication-current");
     moveFixtureToProviderWait(fixture, SUBJECT);
@@ -2030,6 +2045,57 @@ describe("deterministic supervisor stage gates", () => {
       stage_id: "provider",
       reentry_ordinal: 0,
     });
+  });
+
+  it("does not resolve a claimed superseded snapshot without durable provider proof", () => {
+    const fixture = setup("core/implement@4");
+    const previousHead = "d".repeat(40);
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    fixture.tickets.setSetting("github-head:issue-1", previousHead);
+    fixture.db.prepare(`
+      UPDATE pipeline_instances SET status = 'running', published_commit = ? WHERE id = ?
+    `).run(previousHead, fixture.instance.id);
+    recordAcknowledgedPublication(fixture, "b".repeat(40), { publishedCommit: previousHead }, "publication-previous");
+
+    const payload = canonicalJson({
+      outcome: "semantic_repair_required",
+      summary: "Feedback claimed before provider evidence was committed.",
+      evidence: ["https://github.com/owner/repo/pull/1#pullrequestreview-4"],
+      payload: "{}",
+    });
+    const snapshot = fixture.tickets.recordProviderFeedback({
+      provider: "github",
+      providerEventId: "github-review:claimed-without-provider-proof",
+      issueId: fixture.instance.linear_issue_id,
+      sessionId: fixture.instance.linear_session_id,
+      generation: fixture.instance.generation,
+      repository: fixture.instance.repository,
+      pullNumber: 1,
+      headSha: previousHead,
+      kind: "pipeline_provider_event",
+      payload,
+      workItemId: `pipeline-feedback:${fixture.instance.id}:${previousHead}`,
+      receivedAt: "2025-12-31T23:59:59.000Z",
+    }).snapshot;
+    expect(fixture.tickets.claimFeedbackSnapshot(snapshot.id, Number.MAX_SAFE_INTEGER))
+      .toMatchObject({ status: "claimed", snapshot: { repair_round: 1 } });
+
+    recordAcknowledgedPublication(fixture, SUBJECT, {}, "publication-current");
+    moveFixtureToProviderWait(fixture, SUBJECT);
+    fixture.db.prepare("UPDATE pipeline_instances SET reentry_count = 1 WHERE id = ?")
+      .run(fixture.instance.id);
+
+    expect(processPipelineFeedbackSnapshot({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      instance: fixture.pipelines.getInstance(fixture.instance.id)!,
+      snapshot: fixture.db.prepare("SELECT * FROM feedback_snapshots WHERE id = ?").get(snapshot.id) as FeedbackSnapshot,
+    })).toBe(false);
+
+    expect(fixture.db.prepare("SELECT status, head_sha FROM feedback_snapshots WHERE id = ?").get(snapshot.id))
+      .toEqual({ status: "stale", head_sha: previousHead });
+    expect(fixture.db.prepare("SELECT payload FROM linear_outbox WHERE id = ?")
+      .get(`feedback-snapshot-stale:${snapshot.id}`)).toBeDefined();
   });
 
   it("still acts on new provider findings anchored to the repaired head", () => {

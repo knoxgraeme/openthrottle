@@ -306,9 +306,14 @@ function snapshotCompletedRepairBeforeCurrentPublication(
   snapshot: FeedbackSnapshot,
   instance: PipelineInstance
 ): boolean {
+  const providerSnapshot = pipelines.getInboxEvent(`provider-feedback-snapshot:${snapshot.id}`);
   return snapshot.status === "claimed" &&
     snapshot.repair_round !== null &&
     instance.reentry_count >= snapshot.repair_round &&
+    providerSnapshot?.pipeline_instance_id === instance.id &&
+    providerSnapshot.generation === instance.generation &&
+    providerSnapshot.kind === "provider_snapshot" &&
+    providerSnapshot.status === "consumed" &&
     snapshotCanCarryForward(acknowledgedPublicationSubjects, snapshot, instance) &&
     snapshotFeedbackPredatesCurrentPublication(pipelines, snapshot, instance);
 }
