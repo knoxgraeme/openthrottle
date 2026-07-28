@@ -1873,6 +1873,144 @@ describe("deterministic supervisor stage gates", () => {
       .toEqual({ status: "consumed" });
   });
 
+  it("preserves an unstructured repair request mixed with non-blocking diagnostics", () => {
+    const fixture = setup("core/implement@4");
+    moveFixtureToProviderWait(fixture, SUBJECT);
+    const workItemId = `pipeline-feedback:${fixture.instance.id}:${SUBJECT}`;
+    const eventPayload = (
+      summary: string,
+      findings?: Array<{ severity: "P2"; code: string; summary: string }>
+    ) => canonicalJson({
+      outcome: "semantic_repair_required",
+      summary,
+      evidence: [summary],
+      ...(findings ? { findings } : {}),
+      payload: "{}",
+    });
+    fixture.tickets.recordProviderFeedback({
+      provider: "github",
+      providerEventId: "github-review:p2-mixed",
+      issueId: fixture.instance.linear_issue_id,
+      sessionId: fixture.instance.linear_session_id,
+      generation: fixture.instance.generation,
+      repository: fixture.instance.repository,
+      pullNumber: 1,
+      headSha: SUBJECT,
+      kind: "pipeline_provider_event",
+      payload: eventPayload("p2 mixed", [{
+        severity: "P2",
+        code: "publication-copy",
+        summary: "The status copy could be clearer.",
+      }]),
+      workItemId,
+      receivedAt: "2026-01-01T00:00:00.000Z",
+    });
+    const snapshot = fixture.tickets.recordProviderFeedback({
+      provider: "linear",
+      providerEventId: "linear-reply:mixed-unstructured",
+      issueId: fixture.instance.linear_issue_id,
+      sessionId: fixture.instance.linear_session_id,
+      generation: fixture.instance.generation,
+      repository: fixture.instance.repository,
+      pullNumber: 1,
+      headSha: SUBJECT,
+      kind: "pipeline_provider_event",
+      payload: eventPayload("unstructured human feedback"),
+      workItemId,
+      receivedAt: "2026-01-01T00:00:01.000Z",
+    }).snapshot;
+
+    expect(processPipelineFeedbackSnapshot({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      instance: fixture.pipelines.getInstance(fixture.instance.id)!,
+      snapshot,
+    })).toBe(true);
+
+    expect(fixture.pipelines.getInstance(fixture.instance.id)!.terminal_outcome).toBeNull();
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "repair_implementation",
+      reentry_ordinal: 1,
+    });
+  });
+
+  it("checks blocking findings before applying the provider artifact cap", () => {
+    const fixture = setup("core/implement@4");
+    moveFixtureToProviderWait(fixture, SUBJECT);
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    const workItemId = `pipeline-feedback:${fixture.instance.id}:${SUBJECT}`;
+    const payload = (
+      providerEventId: string,
+      findings: Array<{ severity: "P1" | "P2"; code: string; summary: string }>
+    ) => canonicalJson({
+      outcome: "semantic_repair_required",
+      summary: providerEventId,
+      evidence: [providerEventId],
+      findings,
+      payload: "{}",
+    });
+    let snapshot: FeedbackSnapshot | undefined;
+    for (let batch = 0; batch < 3; batch += 1) {
+      snapshot = fixture.tickets.recordProviderFeedback({
+        provider: "github",
+        providerEventId: `github-review:p2-batch-${batch}`,
+        issueId: fixture.instance.linear_issue_id,
+        sessionId: fixture.instance.linear_session_id,
+        generation: fixture.instance.generation,
+        repository: fixture.instance.repository,
+        pullNumber: 1,
+        headSha: SUBJECT,
+        kind: "pipeline_provider_event",
+        payload: payload(`p2 batch ${batch}`, Array.from({ length: 20 }, (_, index) => ({
+          severity: "P2",
+          code: `p2-${batch}-${index}`,
+          summary: `non-blocking diagnostic ${batch}-${index}`,
+        }))),
+        workItemId,
+        receivedAt: `2026-01-01T00:00:0${batch}.000Z`,
+      }).snapshot;
+    }
+    snapshot = fixture.tickets.recordProviderFeedback({
+      provider: "github",
+      providerEventId: "github-review:z-p1-after-cap",
+      issueId: fixture.instance.linear_issue_id,
+      sessionId: fixture.instance.linear_session_id,
+      generation: fixture.instance.generation,
+      repository: fixture.instance.repository,
+      pullNumber: 1,
+      headSha: SUBJECT,
+      kind: "pipeline_provider_event",
+      payload: payload("p1 after cap", [{
+        severity: "P1",
+        code: "blocking-after-cap",
+        summary: "blocking diagnostic after artifact cap",
+      }]),
+      workItemId,
+      receivedAt: "2026-01-01T00:00:03.000Z",
+    }).snapshot;
+
+    expect(processPipelineFeedbackSnapshot({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      instance: fixture.pipelines.getInstance(fixture.instance.id)!,
+      snapshot,
+    })).toBe(true);
+
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "repair_implementation",
+      reentry_ordinal: 1,
+    });
+    const sealed = fixture.db.prepare("SELECT payload FROM pipeline_artifacts WHERE kind = 'stage_result'")
+      .all()
+      .map((row) => JSON.parse((row as { payload: string }).payload) as { findings?: unknown[] })
+      .find((artifact) => Array.isArray(artifact.findings) && artifact.findings.length === 50);
+    expect(sealed?.findings?.some((finding) =>
+      typeof finding === "object" &&
+      finding !== null &&
+      (finding as { code?: unknown }).code === "blocking-after-cap"
+    )).toBe(false);
+  });
+
   it("still escalates live P1 provider feedback when repair re-entry is exhausted", () => {
     const fixture = setup("core/implement@4");
     moveFixtureToProviderWait(fixture, SUBJECT);
