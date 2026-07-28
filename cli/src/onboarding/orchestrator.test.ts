@@ -150,8 +150,16 @@ describe("setup orchestrator", () => {
       providerId: "fake-runtime-a",
       configuration: { snapshot: "fake-runtime-a-snapshot" },
     });
+    expect(Object.keys(hosting.bundles.at(-1)?.secrets ?? {}).sort()).toEqual([
+      "GITHUB_WEBHOOK_SECRET",
+      "LINEAR_WEBHOOK_SECRET",
+      "OT_INSTALL_SECRET",
+      "OT_STATUS_TOKEN",
+    ]);
     expect(JSON.stringify(store.profile)).not.toContain("daytona_api_key");
-    expect(JSON.stringify(store.profile)).not.toContain("install_token");
+    expect(JSON.stringify(store.profile)).not.toContain("install_secret");
+    expect(JSON.stringify(store.profile)).not.toContain("linear_webhook_secret");
+    expect(JSON.stringify(store.profile)).not.toContain("github_webhook_secret");
   });
 
   it("reuses matching live evidence on resume and does not repeat ensure operations", async () => {

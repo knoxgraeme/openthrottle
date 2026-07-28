@@ -147,8 +147,9 @@ export class SetupOrchestrator {
       runtime,
       secrets: {
         OT_STATUS_TOKEN: { owner: "cli", name: "status_token" },
-        OT_INSTALL_TOKEN: { owner: "provisioning", name: "install_token" },
-        OT_WEBHOOK_SECRET: { owner: "provisioning", name: "webhook_secret" },
+        OT_INSTALL_SECRET: { owner: "provisioning", name: "install_secret" },
+        LINEAR_WEBHOOK_SECRET: { owner: "provisioning", name: "linear_webhook_secret" },
+        GITHUB_WEBHOOK_SECRET: { owner: "provisioning", name: "github_webhook_secret" },
       },
     };
   }
