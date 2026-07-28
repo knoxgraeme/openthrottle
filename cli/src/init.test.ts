@@ -58,7 +58,20 @@ describe("init project detection", () => {
       directory
     );
     const contents = readFileSync(join(directory, ".openthrottle.yml"), "utf8");
-    expect(parse(contents)).toMatchObject({ agent: "claude", test: "npm test" });
+    expect(parse(contents)).toMatchObject({
+      schema: "openthrottle.config/v1",
+      default_graph: "simple",
+      agent: "claude",
+      test: "npm test",
+      graphs: [
+        { id: "simple", kind: "builtin", ref: "core/simple@1" },
+        { id: "structured", kind: "builtin", ref: "core/structured@1" },
+      ],
+      intents: {
+        implement: { default_graph: "simple", allowed_graphs: ["simple", "structured"] },
+        investigate: { default_graph: "simple", allowed_graphs: ["simple"] },
+      },
+    });
     expect(contents).not.toContain("base_branch");
     expect(contents).not.toContain("build:");
   });

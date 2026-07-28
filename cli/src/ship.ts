@@ -8,6 +8,7 @@
 
 import { readFileSync, existsSync } from 'node:fs';
 import * as p from '@clack/prompts';
+import { validatePlanFileForGraph } from './plan.js';
 import { getErrorMessage, readEnv, requireEnv, linearGraphQL } from './util.js';
 
 interface ParsedMarkdown {
@@ -27,6 +28,22 @@ export function parseMarkdown(content: string): ParsedMarkdown {
     .join('\n')
     .trim();
   return { title, body };
+}
+
+export function parseShipArgs(args: string[]): { file?: string; graphId?: string } {
+  const parsed: { file?: string; graphId?: string } = {};
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if (arg === "--graph") {
+      parsed.graphId = args[++index];
+      if (!parsed.graphId) throw new Error("--graph requires a graph ID");
+    } else if (!parsed.file) {
+      parsed.file = arg;
+    } else {
+      throw new Error(`Unexpected argument: ${arg}`);
+    }
+  }
+  return parsed;
 }
 
 interface Team {
@@ -108,9 +125,11 @@ export async function delegateIssue(
   }
 }
 
-export default async function ship(file: string | undefined): Promise<void> {
+export default async function ship(args: string[] | string | undefined): Promise<void> {
+  const parsed = parseShipArgs(Array.isArray(args) ? args : args ? [args] : []);
+  const file = parsed.file;
   if (!file) {
-    console.error('Usage: openthrottle ship <file.md>');
+    console.error('Usage: openthrottle ship <file.md> [--graph <id>]');
     process.exit(1);
   }
   if (!existsSync(file)) {
@@ -133,6 +152,19 @@ export default async function ship(file: string | undefined): Promise<void> {
   }
 
   p.log.info(`Title: ${title}`);
+  try {
+    const validation = validatePlanFileForGraph(file, { graphId: parsed.graphId });
+    if (validation.graph.consumesUnits) {
+      p.log.success(
+        `Validated execution plan for graph ${validation.graph.graphId} (${validation.plan!.plan.digest})`
+      );
+    } else {
+      p.log.info(`Graph ${validation.graph.graphId} does not require an execution-plan block.`);
+    }
+  } catch (err: unknown) {
+    p.log.error(getErrorMessage(err));
+    process.exit(1);
+  }
 
   const s = p.spinner();
   s.start('Resolving Linear team');

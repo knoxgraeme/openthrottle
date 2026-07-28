@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { delegateIssue, parseMarkdown } from "./ship.js";
+import { delegateIssue, parseMarkdown, parseShipArgs } from "./ship.js";
 
 describe("ship", () => {
   it("uses the first level-one heading as title", () => {
@@ -8,6 +8,15 @@ describe("ship", () => {
       body: "Plan body",
     });
     expect(() => parseMarkdown("## Not enough")).toThrow(/Heading/);
+  });
+
+  it("parses the optional graph selection without changing the file argument", () => {
+    expect(parseShipArgs(["plan.md", "--graph", "structured"])).toEqual({
+      file: "plan.md",
+      graphId: "structured",
+    });
+    expect(parseShipArgs(["plan.md"])).toEqual({ file: "plan.md" });
+    expect(() => parseShipArgs(["plan.md", "--graph"])).toThrow(/requires/);
   });
 
   it("delegates with IssueUpdateInput.delegateId", async () => {

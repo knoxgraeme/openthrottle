@@ -7,15 +7,20 @@ the capability named in its sealed stage request.
 
 ```text
 skills/
+  planning/<name>/SKILL.md          # planning-time authoring skills
+  planning/<name>/agents/openai.yaml
   tasks/<name>/SKILL.md             # canonical adapter, single source of truth
   tasks/<name>/agents/openai.yaml   # Codex admin-scope policy
   codex/AGENTS-fragment.md          # standing Codex runtime instructions
 ```
 
-There is no task-name registry and no shell-owned end-to-end task loop. Pipeline
-manifests in `supervisor/pipelines/` own stage order, retries, gates, and
-terminal outcomes. `sandbox/runner/execute-stage.mjs` executes exactly one
-sealed stage and writes exactly one typed result.
+Planning skills run before delegation and help authors produce validated
+artifacts such as `openthrottle.execution-plan/v1`. Task skills run inside a
+sealed sandbox stage as adapters over native Compound Engineering. There is no
+task-name registry and no shell-owned end-to-end task loop. Pipeline manifests
+in `supervisor/pipelines/` own stage order, retries, gates, and terminal
+outcomes. `sandbox/runner/execute-stage.mjs` executes exactly one sealed stage
+and writes exactly one typed result.
 
 ## Delivery per agent
 
@@ -26,6 +31,11 @@ The canonical `SKILL.md` is maintained once:
 | Claude | `sandbox/entrypoint.sh` copies the canonical task skills to `~/.claude/skills/`; the stage prompt invokes `/<skill-name>`. |
 | Codex | `sandbox/Dockerfile` bakes the same directories into `/etc/codex/skills/`; `agents/openai.yaml` disables implicit invocation and the prompt explicitly invokes `$<skill-name>`. |
 | OpenCode | The entrypoint strips YAML frontmatter from the same canonical file and renders it into the stage prompt because the pinned CLI cannot safely discover only sandbox-owned external skills. |
+
+Planning skills use the same one-body-per-skill layout, but they are packaged
+for local authoring tools instead of sealed stage execution. A planning skill
+may call local CLI validators; it must not mutate Linear, publish branches, or
+claim runtime gate authority.
 
 The runtime chooses fresh, read-only fresh, required-resume, or preferred-resume
 context from the pinned manifest. When continuation is allowed, the sealed
