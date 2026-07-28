@@ -44,6 +44,8 @@ Compound Engineering. There is no second execution architecture.
 
 - `supervisor/`: Hono control plane, SQLite state, webhook inbox, coordinator,
   Daytona effects, GitHub provider handling, Linear outbox, sweep/recovery.
+- `contracts/`: shared deterministic Node library for cross-project contracts,
+  currently canonical JSON bytes and SHA-256 digests.
 - `sandbox/`: sealed single-stage executor and agent runtime boundary.
 - `skills/`: thin OpenThrottle adapters over the pinned native CE plugin.
 - `cli/`: target-repository onboarding and operator commands.
@@ -463,11 +465,11 @@ The CLI never creates per-project snapshots or configures routing fallbacks.
 
 ## Verification contract
 
-CI installs all three npm projects, typechecks/builds supervisor and CLI, runs
-all Vitest suites and Bats runtime tests, builds the sandbox image, and executes
-the sealed multi-agent/command-stage Docker smoke. The smoke uses deterministic
-stub agents and a local bare repository; it does not consume operator
-credentials.
+CI installs all four npm projects, typechecks/builds contracts, supervisor, and
+CLI, runs all Vitest suites and Bats runtime tests, builds the sandbox image,
+and executes the sealed multi-agent/command-stage Docker smoke. The smoke uses
+deterministic stub agents and a local bare repository; it does not consume
+operator credentials.
 
 A credentialed Linear/Daytona/GitHub exercise is a separate explicitly
 authorized acceptance step. If skipped, it is reported as a verification gap;
