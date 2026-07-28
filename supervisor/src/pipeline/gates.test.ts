@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSupervisorStore, type SupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
-import { drainDeferredProviderEvidence, evaluateStageGate } from "./gates.js";
+import { drainDeferredProviderEvidence, evaluateStageGate, processProviderEvidence } from "./gates.js";
 import {
   canonicalJson,
   digestNormalized,
@@ -1831,6 +1831,255 @@ describe("deterministic supervisor stage gates", () => {
       stage_id: "repair_implementation",
       reentry_ordinal: 1,
     });
+  });
+
+  it("ships provider feedback with only live P2 findings after repair budget is exhausted", () => {
+    const fixture = setup("core/implement@4");
+    moveFixtureToProviderWait(fixture, SUBJECT);
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    fixture.db.prepare(`
+      UPDATE pipeline_instance_stages SET reentry_count = 5
+      WHERE pipeline_instance_id = ? AND stage_id = 'repair_implementation'
+    `).run(fixture.instance.id);
+
+    expect(routePipelineProviderEvent({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      ticket: fixture.tickets.getByIssueId("issue-1")!,
+      eventId: "github-review:p2-after-repair",
+      outcome: "semantic_repair_required",
+      summary: "Provider found a non-blocking publication diagnostic.",
+      evidence: ["https://github.com/owner/repo/pull/1#discussion_r2"],
+      findings: [{
+        severity: "P2",
+        code: "publication-copy",
+        summary: "The status copy could be clearer.",
+      }],
+      payload: {
+        kind: "pull_request_review",
+      },
+      headSha: SUBJECT,
+      pullRequestUrl: "https://github.com/owner/repo/pull/1",
+    })).toBe(true);
+
+    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+      status: "completion_pending_publication",
+      terminal_outcome: "shipped",
+    });
+    expect(fixture.db.prepare(
+      "SELECT result FROM pipeline_gate_receipts WHERE evaluator_kind = 'provider'"
+    ).get()).toEqual({ result: "passed" });
+    expect(fixture.db.prepare("SELECT status FROM feedback_snapshots").get())
+      .toEqual({ status: "consumed" });
+  });
+
+  it("preserves an unstructured repair request mixed with non-blocking diagnostics", () => {
+    const fixture = setup("core/implement@4");
+    moveFixtureToProviderWait(fixture, SUBJECT);
+    const workItemId = `pipeline-feedback:${fixture.instance.id}:${SUBJECT}`;
+    const eventPayload = (
+      summary: string,
+      findings?: Array<{ severity: "P2"; code: string; summary: string }>
+    ) => canonicalJson({
+      outcome: "semantic_repair_required",
+      summary,
+      evidence: [summary],
+      ...(findings ? { findings } : {}),
+      payload: "{}",
+    });
+    fixture.tickets.recordProviderFeedback({
+      provider: "github",
+      providerEventId: "github-review:p2-mixed",
+      issueId: fixture.instance.linear_issue_id,
+      sessionId: fixture.instance.linear_session_id,
+      generation: fixture.instance.generation,
+      repository: fixture.instance.repository,
+      pullNumber: 1,
+      headSha: SUBJECT,
+      kind: "pipeline_provider_event",
+      payload: eventPayload("p2 mixed", [{
+        severity: "P2",
+        code: "publication-copy",
+        summary: "The status copy could be clearer.",
+      }]),
+      workItemId,
+      receivedAt: "2026-01-01T00:00:00.000Z",
+    });
+    const snapshot = fixture.tickets.recordProviderFeedback({
+      provider: "linear",
+      providerEventId: "linear-reply:mixed-unstructured",
+      issueId: fixture.instance.linear_issue_id,
+      sessionId: fixture.instance.linear_session_id,
+      generation: fixture.instance.generation,
+      repository: fixture.instance.repository,
+      pullNumber: 1,
+      headSha: SUBJECT,
+      kind: "pipeline_provider_event",
+      payload: eventPayload("unstructured human feedback"),
+      workItemId,
+      receivedAt: "2026-01-01T00:00:01.000Z",
+    }).snapshot;
+
+    expect(processPipelineFeedbackSnapshot({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      instance: fixture.pipelines.getInstance(fixture.instance.id)!,
+      snapshot,
+    })).toBe(true);
+
+    expect(fixture.pipelines.getInstance(fixture.instance.id)!.terminal_outcome).toBeNull();
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "repair_implementation",
+      reentry_ordinal: 1,
+    });
+  });
+
+  it("checks blocking findings before applying the provider artifact cap", () => {
+    const fixture = setup("core/implement@4");
+    moveFixtureToProviderWait(fixture, SUBJECT);
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    const workItemId = `pipeline-feedback:${fixture.instance.id}:${SUBJECT}`;
+    const payload = (
+      providerEventId: string,
+      findings: Array<{ severity: "P1" | "P2"; code: string; summary: string }>
+    ) => canonicalJson({
+      outcome: "semantic_repair_required",
+      summary: providerEventId,
+      evidence: [providerEventId],
+      findings,
+      payload: "{}",
+    });
+    let snapshot: FeedbackSnapshot | undefined;
+    for (let batch = 0; batch < 3; batch += 1) {
+      snapshot = fixture.tickets.recordProviderFeedback({
+        provider: "github",
+        providerEventId: `github-review:p2-batch-${batch}`,
+        issueId: fixture.instance.linear_issue_id,
+        sessionId: fixture.instance.linear_session_id,
+        generation: fixture.instance.generation,
+        repository: fixture.instance.repository,
+        pullNumber: 1,
+        headSha: SUBJECT,
+        kind: "pipeline_provider_event",
+        payload: payload(`p2 batch ${batch}`, Array.from({ length: 20 }, (_, index) => ({
+          severity: "P2",
+          code: `p2-${batch}-${index}`,
+          summary: `non-blocking diagnostic ${batch}-${index}`,
+        }))),
+        workItemId,
+        receivedAt: `2026-01-01T00:00:0${batch}.000Z`,
+      }).snapshot;
+    }
+    snapshot = fixture.tickets.recordProviderFeedback({
+      provider: "github",
+      providerEventId: "github-review:z-p1-after-cap",
+      issueId: fixture.instance.linear_issue_id,
+      sessionId: fixture.instance.linear_session_id,
+      generation: fixture.instance.generation,
+      repository: fixture.instance.repository,
+      pullNumber: 1,
+      headSha: SUBJECT,
+      kind: "pipeline_provider_event",
+      payload: payload("p1 after cap", [{
+        severity: "P1",
+        code: "blocking-after-cap",
+        summary: "blocking diagnostic after artifact cap",
+      }]),
+      workItemId,
+      receivedAt: "2026-01-01T00:00:03.000Z",
+    }).snapshot;
+
+    expect(processPipelineFeedbackSnapshot({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      instance: fixture.pipelines.getInstance(fixture.instance.id)!,
+      snapshot,
+    })).toBe(true);
+
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "repair_implementation",
+      reentry_ordinal: 1,
+    });
+    const sealed = fixture.db.prepare("SELECT payload FROM pipeline_artifacts WHERE kind = 'stage_result'")
+      .all()
+      .map((row) => JSON.parse((row as { payload: string }).payload) as { findings?: unknown[] })
+      .find((artifact) => Array.isArray(artifact.findings) && artifact.findings.length === 50);
+    expect(sealed?.findings?.some((finding) =>
+      typeof finding === "object" &&
+      finding !== null &&
+      (finding as { code?: unknown }).code === "blocking-after-cap"
+    )).toBe(false);
+  });
+
+  it("still escalates live P1 provider feedback when repair re-entry is exhausted", () => {
+    const fixture = setup("core/implement@4");
+    moveFixtureToProviderWait(fixture, SUBJECT);
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    fixture.db.prepare(`
+      UPDATE pipeline_instance_stages SET reentry_count = 5
+      WHERE pipeline_instance_id = ? AND stage_id = 'repair_implementation'
+    `).run(fixture.instance.id);
+
+    expect(routePipelineProviderEvent({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      ticket: fixture.tickets.getByIssueId("issue-1")!,
+      eventId: "github-review:p1-after-repair",
+      outcome: "semantic_repair_required",
+      summary: "Provider found a blocking defect on the published head.",
+      evidence: ["https://github.com/owner/repo/pull/1#discussion_r1"],
+      findings: [{
+        severity: "P1",
+        code: "unsafe-publication",
+        summary: "The published change can corrupt pipeline state.",
+      }],
+      payload: {
+        kind: "pull_request_review",
+      },
+      headSha: SUBJECT,
+      pullRequestUrl: "https://github.com/owner/repo/pull/1",
+    })).toBe(true);
+
+    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+      status: "completion_pending_publication",
+      terminal_outcome: "needs_human",
+      wait_reason: "re-entry exhausted at provider",
+    });
+    expect(fixture.db.prepare(
+      "SELECT result FROM pipeline_gate_receipts WHERE evaluator_kind = 'provider'"
+    ).get()).toEqual({ result: "failed" });
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toBeUndefined();
+  });
+
+  it("keeps provider head drift human-required even when drift evidence has only P2 findings", () => {
+    const fixture = setup("core/implement@4");
+    moveFixtureToProviderWait(fixture, SUBJECT);
+    const driftHead = "d".repeat(40);
+
+    processProviderEvidence(fixture.pipelines, {
+      id: "provider-head-drift-with-p2",
+      instanceId: fixture.instance.id,
+      outcome: "needs_human",
+      summary: "The current provider head does not match the executor-verified published commit.",
+      evidence: ["https://github.com/owner/repo/pull/1"],
+      findings: [{
+        severity: "P2",
+        code: "publication-copy",
+        summary: "The status copy could be clearer.",
+      }],
+      providerPayload: {
+        expected_published_commit: SUBJECT,
+        observed_head_sha: driftHead,
+      },
+    });
+
+    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+      status: "completion_pending_publication",
+      terminal_outcome: "needs_human",
+    });
+    expect(fixture.db.prepare(
+      "SELECT result FROM pipeline_gate_receipts WHERE evaluator_kind = 'provider'"
+    ).get()).toEqual({ result: "failed" });
   });
 
   it.each([

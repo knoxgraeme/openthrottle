@@ -23,8 +23,8 @@ import {
 import { sanitizeText } from "../../shared/sanitize.js";
 
 type ProviderFinding = {
-  severity: "P1";
-  code: "ci-check-failed";
+  severity: "P0" | "P1" | "P2" | "P3";
+  code: string;
   summary: string;
 };
 
