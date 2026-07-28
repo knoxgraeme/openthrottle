@@ -96,6 +96,11 @@ describe("pipeline publication", () => {
     return { tickets, pipelines, instance, attempt: pipelines.getActiveAttempt(instance.id)! };
   }
 
+  function coreImplementManifest() {
+    const path = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
+    return loadPipelineCatalog(path, runtime.descriptor).manifests.get("core/implement@4")!;
+  }
+
   function event(
     instance: PipelineInstance,
     attempt: PipelineStageAttempt,
@@ -723,6 +728,44 @@ describe("pipeline publication", () => {
     expect(renderGithubPipelineSummary(publication)).toContain("[P3] status-copy");
   });
 
+  it("renders assumptions under one header and strips duplicated leading labels", () => {
+    const { instance, attempt } = setup("fixture/agent@1");
+    const input = event(instance, attempt);
+    replaceStagePayload(input, {
+      summary: "Implementation completed.",
+      evidence: ["Verified the status renderer."],
+      findings: [],
+      actions: [],
+      uncertainty: [
+        "Assumptions & decisions: Treated the status change as display-only.",
+        "Assumptions \\& decisions: Kept manifest stage IDs stable.",
+      ],
+    });
+    const publication = buildStagePublication({
+      instance,
+      attempt,
+      event: input.event,
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: attempt.id,
+        outcome: "success",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+    });
+
+    expect(publication.body.match(/^\*\*Assumptions & decisions\*\*$/gm)).toHaveLength(1);
+    expect(publication.body).toContain("- Treated the status change as display-only.");
+    expect(publication.body).toContain("- Kept manifest stage IDs stable.");
+    expect(publication.body).not.toContain("- Assumptions & decisions:");
+  });
+
   it("renders repair reentry findings as carried into the scheduled repair round", () => {
     const { instance, attempt } = setup("fixture/agent@1");
     const input = event(instance, attempt);
@@ -849,6 +892,186 @@ describe("pipeline publication", () => {
       "- [ ] re-review",
       "- [ ] publishing",
     ]);
+  });
+
+  it("renders the core implementation checklist in happy-path execution order without unentered repair rows", () => {
+    const { instance, attempt } = setup("fixture/agent@1");
+    const manifest = coreImplementManifest();
+    const input = event(instance, attempt);
+    const publication = buildStagePublication({
+      instance: {
+        ...instance,
+        pipeline_id: manifest.manifest.id,
+        pipeline_version: manifest.manifest.version,
+        normalized_manifest: manifest.normalized,
+        manifest_digest: manifest.digest,
+      },
+      attempt: { ...attempt, stage_id: "publish" },
+      event: input.event,
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: attempt.id,
+        outcome: "success",
+        resultHash: input.event.resultHash,
+        nextStatus: "waiting_provider",
+        waitReason: "GitHub checks are still running",
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+    });
+
+    expect(publication.body.split("\n").slice(1, 10)).toEqual([
+      "- [x] implementing",
+      "- [x] code review",
+      "- [x] simplifying",
+      "- [x] re-review",
+      "- [x] testing",
+      "- [x] linting",
+      "- [x] building",
+      "- [x] publishing",
+      "→ **waiting on GitHub** — in progress — GitHub checks are still running",
+    ]);
+    expect(publication.body).not.toContain("repair implementing");
+    expect(publication.body).not.toContain("repair code review");
+    expect(publication.body).not.toContain("semantic review");
+  });
+
+  it("inserts entered core repair stages before their command-gate rejoin", () => {
+    const { instance, attempt } = setup("fixture/agent@1");
+    const manifest = coreImplementManifest();
+    const input = event(instance, attempt);
+    const publication = buildStagePublication({
+      instance: {
+        ...instance,
+        pipeline_id: manifest.manifest.id,
+        pipeline_version: manifest.manifest.version,
+        normalized_manifest: manifest.normalized,
+        manifest_digest: manifest.digest,
+      },
+      attempt: { ...attempt, stage_id: "semantic_review" },
+      event: { ...input.event, outcome: "semantic_repair_required" },
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: attempt.id,
+        outcome: "semantic_repair_required",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        reentryIncrement: 1,
+        nextAttempt: nextAttemptStub("repair_implementation", 1),
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+    });
+
+    expect(publication.body.split("\n").slice(1, 10)).toEqual([
+      "- [x] implementing",
+      "- [x] code review",
+      "→ **repair implementing** — in progress",
+      "- [ ] repair code review",
+      "- [ ] testing",
+      "- [ ] linting",
+      "- [ ] building",
+      "- [ ] publishing",
+      "- [ ] waiting on GitHub",
+    ]);
+    expect(publication.body).not.toContain("repair semantic review");
+    expect(publication.body).not.toContain("semantic review");
+  });
+
+  it("keeps core repair implementation before repair code review while the repair path is active", () => {
+    const { instance, attempt } = setup("fixture/agent@1");
+    const manifest = coreImplementManifest();
+    const input = event(instance, attempt);
+    const publication = buildStagePublication({
+      instance: {
+        ...instance,
+        pipeline_id: manifest.manifest.id,
+        pipeline_version: manifest.manifest.version,
+        normalized_manifest: manifest.normalized,
+        manifest_digest: manifest.digest,
+      },
+      attempt: { ...attempt, stage_id: "repair_implementation", reentry_ordinal: 1 },
+      event: input.event,
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: attempt.id,
+        outcome: "success",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+    });
+
+    expect(publication.body.split("\n").slice(1, 10)).toEqual([
+      "- [x] implementing",
+      "- [x] code review",
+      "- [x] repair implementing",
+      "→ **repair code review** — in progress",
+      "- [ ] testing",
+      "- [ ] linting",
+      "- [ ] building",
+      "- [ ] publishing",
+      "- [ ] waiting on GitHub",
+    ]);
+  });
+
+  it("does not infer core repair rows from implementation self-reentry", () => {
+    const { instance, attempt } = setup("fixture/agent@1");
+    const manifest = coreImplementManifest();
+    const input = event(instance, attempt);
+    const publication = buildStagePublication({
+      instance: {
+        ...instance,
+        pipeline_id: manifest.manifest.id,
+        pipeline_version: manifest.manifest.version,
+        normalized_manifest: manifest.normalized,
+        manifest_digest: manifest.digest,
+      },
+      attempt: { ...attempt, stage_id: "implementation", reentry_ordinal: 1 },
+      event: { ...input.event, outcome: "semantic_repair_required" },
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: attempt.id,
+        outcome: "semantic_repair_required",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        reentryIncrement: 1,
+        nextAttempt: nextAttemptStub("implementation", 2),
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+    });
+
+    expect(publication.body.split("\n").slice(1, 10)).toEqual([
+      "→ **implementing** — in progress",
+      "- [ ] code review",
+      "- [ ] simplifying",
+      "- [ ] re-review",
+      "- [ ] testing",
+      "- [ ] linting",
+      "- [ ] building",
+      "- [ ] publishing",
+      "- [ ] waiting on GitHub",
+    ]);
+    expect(publication.body).not.toContain("repair implementing");
+    expect(publication.body).not.toContain("repair code review");
   });
 
   it("does not deduplicate distinct checklist rows with the same display label", () => {
@@ -1756,6 +1979,8 @@ describe("pipeline publication", () => {
       needsHuman.body,
       "**Your move: decision required — Choose whether to continue in the Linear session. (stage 1 of 3).**"
     );
+    expect(needsHuman.body).toContain("**Why:** Choose whether to continue in the Linear session.");
+    expect(needsHuman.body).toContain("**Asked:** Choose whether to continue in the Linear session.");
 
     const providerWait = buildStagePublication({
       instance,

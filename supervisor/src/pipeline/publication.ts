@@ -205,6 +205,7 @@ function chooseTemplate(
 
 interface RenderContext {
   manifest: PipelineManifest;
+  stagesById: Map<string, PipelineManifest["stages"][number]>;
   stageIndex: number;
   transition: PipelineManifest["stages"][number]["transitions"][StageOutcome] | undefined;
 }
@@ -223,6 +224,8 @@ const STAGE_LABELS: Readonly<Record<string, { display: string; action?: string }
   provider: { display: "waiting on GitHub" },
   publish: { display: "publishing" },
   post_simplify_review: { display: "re-review", action: "reviewing simplified changes" },
+  repair_implementation: { display: "repair implementing", action: "repairing changes" },
+  repair_semantic_review: { display: "repair code review", action: "reviewing repaired changes" },
   review: { display: "code review", action: "reviewing changes" },
   semantic_review: { display: "code review", action: "reviewing changes" },
   simplification: { display: "simplifying", action: "simplifying changes" },
@@ -238,32 +241,82 @@ function stageActionName(stageId: string): string {
   return label?.action ?? label?.display ?? stageDisplayName(stageId);
 }
 
+function stageById(manifest: PipelineManifest): Map<string, PipelineManifest["stages"][number]> {
+  return new Map(manifest.stages.map((stage) => [stage.id, stage]));
+}
+
+function followSuccessPath(stages: ReadonlyMap<string, PipelineManifest["stages"][number]>, start: string): string[] {
+  const visited = new Set<string>();
+  const path: string[] = [];
+  let current: string | undefined = start;
+  while (current && !visited.has(current)) {
+    const stage = stages.get(current);
+    if (!stage) break;
+    visited.add(current);
+    path.push(current);
+    current = stage.transitions.success?.to;
+  }
+  return path;
+}
+
+interface RepairBranch {
+  source: string;
+  start: string;
+}
+
+function repairBranch(envelope: PipelinePublicationBodyInput, context: RenderContext): RepairBranch | undefined {
+  const current = envelope.stage?.id;
+  const next = nextStageName(envelope, context);
+  for (const stage of context.manifest.stages) {
+    if (stage.id.startsWith("repair_")) continue;
+    const start = stage.transitions.semantic_repair_required?.to;
+    if (!start?.startsWith("repair_")) continue;
+    const path = followSuccessPath(context.stagesById, start);
+    if (path.includes(next) || Boolean(current && path.includes(current))) {
+      return { source: stage.id, start };
+    }
+  }
+  return undefined;
+}
+
+function hasRepairStageEvidence(envelope: PipelinePublicationBodyInput, context: RenderContext): boolean {
+  const current = envelope.stage?.id;
+  const next = nextStageName(envelope, context);
+  return Boolean(
+    current?.startsWith("repair_") ||
+      next.startsWith("repair_")
+  );
+}
+
+function checklistStageIds(envelope: PipelinePublicationBodyInput, context: RenderContext): string[] {
+  const happyPath = followSuccessPath(context.stagesById, context.manifest.entry_stage);
+  const current = envelope.stage?.id;
+  if (!hasRepairStageEvidence(envelope, context)) {
+    return current && !happyPath.includes(current) ? [...happyPath, current] : happyPath;
+  }
+  const repair = repairBranch(envelope, context);
+  if (!repair) {
+    return current && !happyPath.includes(current) ? [...happyPath, current] : happyPath;
+  }
+  const repairPath = followSuccessPath(context.stagesById, repair.start);
+  const sourceIndex = happyPath.indexOf(repair.source);
+  const prefix = sourceIndex >= 0 ? happyPath.slice(0, sourceIndex + 1) : [];
+  const path = [...prefix, ...repairPath];
+  return current && !path.includes(current) ? [...path, current] : path;
+}
+
 function renderContext(envelope: PipelinePublicationBodyInput, normalizedManifest: string): RenderContext {
   const manifest = JSON.parse(normalizedManifest) as PipelineManifest;
+  const stagesById = stageById(manifest);
   const stageIndex = envelope.stage
     ? manifest.stages.findIndex((stage) => stage.id === envelope.stage?.id)
     : -1;
   const stage = stageIndex >= 0 ? manifest.stages[stageIndex] : undefined;
   return {
     manifest,
+    stagesById,
     stageIndex,
     transition: stage?.transitions[envelope.decision.outcome as StageOutcome],
-  };
-}
-
-function stagePosition(envelope: PipelinePublicationBodyInput, context: RenderContext): {
-  ordinal: number;
-  total: number;
-  stage: string;
-} {
-  const manifest = context.manifest;
-  if (!envelope.stage) {
-    return { ordinal: 0, total: manifest.stages.length, stage: envelope.template.name.replaceAll("_", " ") };
-  }
-  return {
-    ordinal: context.stageIndex >= 0 ? context.stageIndex + 1 : envelope.stage.attempt_ordinal,
-    total: manifest.stages.length,
-    stage: envelope.stage.id,
   };
 }
 
@@ -383,38 +436,53 @@ function dedupeLines(lines: string[]): string[] {
   });
 }
 
-function activeChecklistIndex(envelope: PipelinePublicationBodyInput, context: RenderContext): number {
+function activeChecklistIndex(
+  envelope: PipelinePublicationBodyInput,
+  context: RenderContext,
+  checklist: readonly string[]
+): number {
   if (envelope.template.name === "terminal" ||
       TERMINAL_STATUSES.has(envelope.decision.next_status) ||
       (envelope.resume_status && TERMINAL_STATUSES.has(envelope.resume_status))) {
-    return context.manifest.stages.length;
+    return checklist.length;
   }
   const next = nextStageName(envelope, context);
-  const nextIndex = context.manifest.stages.findIndex((stage) => stage.id === next);
+  const nextIndex = checklist.indexOf(next);
   if (nextIndex >= 0 && next !== envelope.stage?.id) return nextIndex;
-  return context.stageIndex >= 0 ? context.stageIndex : 0;
+  const currentIndex = envelope.stage ? checklist.indexOf(envelope.stage.id) : -1;
+  return currentIndex >= 0 ? currentIndex : 0;
 }
 
-function activeStagePosition(envelope: PipelinePublicationBodyInput, context: RenderContext): {
+interface ChecklistProjection {
+  stageIds: string[];
+  activeIndex: number;
   ordinal: number;
   total: number;
   stageId: string;
-} {
-  const activeIndex = activeChecklistIndex(envelope, context);
-  const total = context.manifest.stages.length;
-  if (activeIndex >= 0 && activeIndex < total) {
-    return { ordinal: activeIndex + 1, total, stageId: context.manifest.stages[activeIndex]!.id };
-  }
-  const position = stagePosition(envelope, context);
-  return { ordinal: Math.min(position.ordinal, total), total, stageId: position.stage };
 }
 
-function whoseMoveLine(envelope: PipelinePublicationBodyInput, context: RenderContext): string {
+function checklistProjection(envelope: PipelinePublicationBodyInput, context: RenderContext): ChecklistProjection {
+  const stageIds = checklistStageIds(envelope, context);
+  const activeIndex = activeChecklistIndex(envelope, context, stageIds);
+  const total = stageIds.length;
+  if (activeIndex >= 0 && activeIndex < total) {
+    return { stageIds, activeIndex, ordinal: activeIndex + 1, total, stageId: stageIds[activeIndex]! };
+  }
+  const ordinal = envelope.stage
+    ? context.stageIndex >= 0 ? context.stageIndex + 1 : envelope.stage.attempt_ordinal
+    : 0;
+  const stageId = envelope.stage?.id ?? envelope.template.name.replaceAll("_", " ");
+  return { stageIds, activeIndex, ordinal: Math.min(ordinal, total), total, stageId };
+}
+
+function whoseMoveLine(
+  envelope: PipelinePublicationBodyInput,
+  checklist: ChecklistProjection
+): string {
   const waitReason = envelope.decision.wait_reason
     ? boundedPublicationLine(envelope.decision.wait_reason, 1_000)
     : "the published receipt in this Linear session";
-  const active = activeStagePosition(envelope, context);
-  const suffix = `(stage ${active.ordinal} of ${active.total}).`;
+  const suffix = `(stage ${checklist.ordinal} of ${checklist.total}).`;
   if (envelope.decision.next_status === "waiting_human" || envelope.template.name === "needs_human") {
     return `**Your move: decision required — ${waitReason} ${suffix}**`;
   }
@@ -426,29 +494,48 @@ function whoseMoveLine(envelope: PipelinePublicationBodyInput, context: RenderCo
       TERMINAL_STATUSES.has(envelope.decision.next_status)) {
     return `**Your move: nothing — this run is finished. ${terminalSentence(envelope)}**`;
   }
-  return `**Your move: nothing — ${stageActionName(active.stageId)} ${suffix}**`;
+  return `**Your move: nothing — ${stageActionName(checklist.stageId)} ${suffix}**`;
 }
 
-function stageChecklistLines(envelope: PipelinePublicationBodyInput, context: RenderContext): string[] {
-  const activeIndex = activeChecklistIndex(envelope, context);
-  return context.manifest.stages.map((stage, index) => {
-    if (index < activeIndex || activeIndex >= context.manifest.stages.length) {
-      return `- [x] ${stageDisplayName(stage.id)}`;
+function stageChecklistLines(envelope: PipelinePublicationBodyInput, checklist: ChecklistProjection): string[] {
+  return checklist.stageIds.map((stageId, index) => {
+    if (index < checklist.activeIndex || checklist.activeIndex >= checklist.stageIds.length) {
+      return `- [x] ${stageDisplayName(stageId)}`;
     }
-    if (index === activeIndex) {
+    if (index === checklist.activeIndex) {
       const wait = envelope.decision.wait_reason
         ? ` — ${boundedPublicationLine(envelope.decision.wait_reason, 500)}`
         : "";
-      return `→ **${stageDisplayName(stage.id)}** — in progress${wait}`;
+      return `→ **${stageDisplayName(stageId)}** — in progress${wait}`;
     }
-    return `- [ ] ${stageDisplayName(stage.id)}`;
+    return `- [ ] ${stageDisplayName(stageId)}`;
   });
 }
 
 function summaryHeaderLines(envelope: PipelinePublicationBodyInput, context: RenderContext): string[] {
+  const checklist = checklistProjection(envelope, context);
   return [
-    whoseMoveLine(envelope, context),
-    ...stageChecklistLines(envelope, context),
+    whoseMoveLine(envelope, checklist),
+    ...stageChecklistLines(envelope, checklist),
+    ...terminalDecisionContextLines(envelope),
+  ];
+}
+
+function terminalDecisionContextLines(envelope: PipelinePublicationBodyInput): string[] {
+  if (envelope.decision.outcome === "shipped" ||
+      envelope.template.name !== "terminal" && envelope.template.name !== "needs_human" &&
+        envelope.decision.next_status !== "waiting_human") {
+    return [];
+  }
+  const reason = envelope.decision.wait_reason
+    ? boundedPublicationLine(envelope.decision.wait_reason, 1_000)
+    : terminalSentence(envelope);
+  const asked = envelope.decision.outcome === "needs_human"
+    ? reason
+    : "No decision is required; review the terminal outcome.";
+  return [
+    `**Why:** ${reason}`,
+    `**Asked:** ${asked}`,
   ];
 }
 
@@ -610,10 +697,13 @@ function findingsSectionLines(envelope: PipelinePublicationBodyInput): string[] 
 }
 
 function assumptionsSectionLines(envelope: PipelinePublicationBodyInput): string[] {
-  if (envelope.evidence.uncertainty.length === 0) return [];
+  const items = envelope.evidence.uncertainty
+    .map((item) => item.replace(/^Assumptions\s+\\*&\s+decisions:? */i, "").trim())
+    .filter(Boolean);
+  if (items.length === 0) return [];
   return [
     "**Assumptions & decisions**",
-    ...envelope.evidence.uncertainty.map((item) => `- ${item}`),
+    ...items.map((item) => `- ${item}`),
   ];
 }
 
