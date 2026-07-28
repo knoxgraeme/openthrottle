@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { delegateIssue, parseMarkdown, parseShipArgs } from "./ship.js";
+import { delegateIssue, parseMarkdown, parseShipArgs, validateGraphSelectionForShip } from "./ship.js";
 
 describe("ship", () => {
   it("uses the first level-one heading as title", () => {
@@ -17,6 +17,12 @@ describe("ship", () => {
     });
     expect(parseShipArgs(["plan.md"])).toEqual({ file: "plan.md" });
     expect(() => parseShipArgs(["plan.md", "--graph"])).toThrow(/requires/);
+  });
+
+  it("does not accept structured graph selections until ship can persist them", () => {
+    expect(() => validateGraphSelectionForShip()).not.toThrow();
+    expect(() => validateGraphSelectionForShip("simple")).not.toThrow();
+    expect(() => validateGraphSelectionForShip("structured")).toThrow(/not persisted through admission/);
   });
 
   it("delegates with IssueUpdateInput.delegateId", async () => {

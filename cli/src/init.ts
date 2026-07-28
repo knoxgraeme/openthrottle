@@ -200,23 +200,7 @@ async function promptConfig(detected: Detected, target: RepositoryTarget): Promi
 
 export function writeProjectConfig(config: ProjectConfig, directory = process.cwd()): void {
   const document: Record<string, unknown> = {
-    schema: "openthrottle.config/v1",
-    default_graph: "simple",
-    graphs: [
-      { id: "simple", kind: "builtin", ref: "core/simple@1" },
-      { id: "structured", kind: "builtin", ref: "core/structured@1" },
-    ],
     ...config,
-    intents: {
-      implement: {
-        default_graph: "simple",
-        allowed_graphs: ["simple", "structured"],
-      },
-      investigate: {
-        default_graph: "simple",
-        allowed_graphs: ["simple"],
-      },
-    },
   };
   for (const key of ["test", "build", "lint"] as const) {
     if (!config[key]) delete document[key];

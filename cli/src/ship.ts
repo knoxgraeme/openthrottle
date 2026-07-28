@@ -8,7 +8,6 @@
 
 import { readFileSync, existsSync } from 'node:fs';
 import * as p from '@clack/prompts';
-import { validatePlanFileForGraph } from './plan.js';
 import { getErrorMessage, readEnv, requireEnv, linearGraphQL } from './util.js';
 
 interface ParsedMarkdown {
@@ -44,6 +43,14 @@ export function parseShipArgs(args: string[]): { file?: string; graphId?: string
     }
   }
   return parsed;
+}
+
+export function validateGraphSelectionForShip(graphId?: string): void {
+  if (!graphId || graphId === "simple") return;
+  throw new Error(
+    `ship --graph ${graphId} cannot delegate correctly yet because graph selection is not persisted through admission; ` +
+      "omit --graph or use --graph simple."
+  );
 }
 
 interface Team {
@@ -146,25 +153,13 @@ export default async function ship(args: string[] | string | undefined): Promise
   let body: string;
   try {
     ({ title, body } = parseMarkdown(content));
+    validateGraphSelectionForShip(parsed.graphId);
   } catch (err: unknown) {
     p.log.error(getErrorMessage(err));
     process.exit(1);
   }
 
   p.log.info(`Title: ${title}`);
-  try {
-    const validation = validatePlanFileForGraph(file, { graphId: parsed.graphId });
-    if (validation.graph.consumesUnits) {
-      p.log.success(
-        `Validated execution plan for graph ${validation.graph.graphId} (${validation.plan!.plan.digest})`
-      );
-    } else {
-      p.log.info(`Graph ${validation.graph.graphId} does not require an execution-plan block.`);
-    }
-  } catch (err: unknown) {
-    p.log.error(getErrorMessage(err));
-    process.exit(1);
-  }
 
   const s = p.spinner();
   s.start('Resolving Linear team');

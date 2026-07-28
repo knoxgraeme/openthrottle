@@ -16,7 +16,7 @@ Usage:
   openthrottle plan validate <file.md>
                                     Validate the plan's execution-plan block.
   openthrottle plan prepare <file.md>
-                                    Prepare or update the execution-plan block.
+                                    Explain agent-backed execution-plan preparation.
   openthrottle validate <file.md>   Alias for plan validate.
   openthrottle ship <file.md>      Create a Linear issue from a markdown
                                     file and delegate it to the agent.

@@ -5,9 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { stringify } from "yaml";
 import {
   extractExecutionPlanBlocks,
-  prepareExecutionPlanBlock,
   readExecutionPlanFromMarkdown,
-  upsertExecutionPlanBlock,
   validateLocalGraphSelection,
   validatePlanFileForGraph,
 } from "./plan.js";
@@ -48,29 +46,32 @@ const cePlan = `# Stage C Contracts
 **Verification:** npm test --prefix cli
 `;
 
+function executionPlanBlock(graphId = "structured"): string {
+  const contract = JSON.parse(
+    readFileSync(new URL("../../contracts/fixtures/valid/execution-plan.json", import.meta.url), "utf8")
+  ) as Record<string, unknown>;
+  contract.graph_id = graphId;
+  return `\`\`\`json openthrottle.execution-plan/v1\n${JSON.stringify(contract, null, 2)}\n\`\`\``;
+}
+
+function planWithBlock(graphId = "structured"): string {
+  return `${cePlan}\n## Execution Plan\n\n${executionPlanBlock(graphId)}\n`;
+}
+
 describe("plan validation", () => {
-  it("prepares one valid execution-plan block from CE implementation units", () => {
-    const block = prepareExecutionPlanBlock(cePlan);
-    const updated = upsertExecutionPlanBlock(cePlan, block);
+  it("validates one execution-plan block prepared by the planning skill", () => {
+    const updated = planWithBlock();
     const result = readExecutionPlanFromMarkdown(updated, "sample.md");
 
     expect(extractExecutionPlanBlocks(updated)).toHaveLength(1);
-    expect(result.plan.value.units.map((unit) => unit.id)).toEqual(["u1", "u2"]);
-    expect(result.plan.value.units[1]!.depends_on).toEqual(["u1"]);
+    expect(result.plan.value.units.map((unit) => unit.id)).toEqual(["contracts", "corpora"]);
+    expect(result.plan.value.units[1]!.depends_on).toEqual(["contracts"]);
     expect(result.coverage).toMatchObject({ units: 2, instruction_refs: 2, acceptance_refs: 2 });
-  });
-
-  it("updates the existing block instead of duplicating it", () => {
-    const first = upsertExecutionPlanBlock(cePlan, prepareExecutionPlanBlock(cePlan));
-    const second = upsertExecutionPlanBlock(first, prepareExecutionPlanBlock(cePlan));
-
-    expect(extractExecutionPlanBlocks(second)).toHaveLength(1);
-    expect(readExecutionPlanFromMarkdown(second).plan.value.units).toHaveLength(2);
   });
 
   it("rejects missing, duplicated, and invalid execution-plan blocks", () => {
     expect(() => readExecutionPlanFromMarkdown(cePlan, "missing.md")).toThrow(/expected exactly one/);
-    const block = prepareExecutionPlanBlock(cePlan);
+    const block = executionPlanBlock();
     expect(() => readExecutionPlanFromMarkdown(`${cePlan}\n${block}\n${block}`, "duplicate.md")).toThrow(/found 2/);
     expect(() =>
       readExecutionPlanFromMarkdown(
@@ -78,6 +79,33 @@ describe("plan validation", () => {
         "invalid.md"
       )
     ).toThrow(/graph_id/);
+  });
+
+  it("does not guess an execution plan without an agent-backed preparation runner", async () => {
+    const directory = temporaryProject();
+    const planPath = join(directory, "plan.md");
+    writeFileSync(planPath, cePlan);
+    const exit = process.exit;
+    const log = console.log;
+    const output: string[] = [];
+    process.exit = ((code?: string | number | null) => {
+      throw new Error(`exit ${code}`);
+    }) as typeof process.exit;
+    console.log = (message?: unknown) => {
+      output.push(String(message));
+    };
+    try {
+      const { plan } = await import("./plan.js");
+      await expect(plan(["prepare", planPath, "--json"])).rejects.toThrow(/exit 1/);
+      expect(JSON.parse(output[0]!)).toMatchObject({
+        ok: false,
+        error: expect.stringContaining("agent-backed prepare-execution-plan runner"),
+      });
+      expect(readFileSync(planPath, "utf8")).toBe(cePlan);
+    } finally {
+      process.exit = exit;
+      console.log = log;
+    }
   });
 
   it("rejects malformed prepare arguments", async () => {
@@ -93,6 +121,49 @@ describe("plan validation", () => {
     } finally {
       process.exit = exit;
       console.error = error;
+    }
+  });
+
+  it("checks graph selection when validating through the CLI", async () => {
+    const directory = temporaryProject();
+    const planPath = join(directory, "plan.md");
+    writeFileSync(
+      join(directory, ".openthrottle.yml"),
+      stringify({
+        schema: "openthrottle.config/v1",
+        default_graph: "simple",
+        graphs: [
+          { id: "simple", kind: "builtin", ref: "core/simple@1" },
+          { id: "structured", kind: "builtin", ref: "core/structured@1" },
+        ],
+        intents: {
+          implement: { default_graph: "simple", allowed_graphs: ["simple", "structured"] },
+        },
+      })
+    );
+    writeFileSync(planPath, planWithBlock("other"));
+    const exit = process.exit;
+    const log = console.log;
+    const output: string[] = [];
+    process.exit = ((code?: string | number | null) => {
+      throw new Error(`exit ${code}`);
+    }) as typeof process.exit;
+    console.log = (message?: unknown) => {
+      output.push(String(message));
+    };
+    const previousCwd = process.cwd();
+    try {
+      process.chdir(directory);
+      const { plan } = await import("./plan.js");
+      await expect(plan(["validate", planPath, "--graph", "structured", "--json"])).rejects.toThrow(/exit 1/);
+      expect(JSON.parse(output[0]!)).toMatchObject({
+        ok: false,
+        error: expect.stringContaining("graph_id must match selected graph structured"),
+      });
+    } finally {
+      process.chdir(previousCwd);
+      process.exit = exit;
+      console.log = log;
     }
   });
 
@@ -141,7 +212,7 @@ describe("plan validation", () => {
         },
       })
     );
-    writeFileSync(planPath, upsertExecutionPlanBlock(cePlan, prepareExecutionPlanBlock(cePlan, "other")));
+    writeFileSync(planPath, planWithBlock("other"));
 
     expect(() => validatePlanFileForGraph(planPath, { directory, graphId: "structured" })).toThrow(
       /graph_id must match/
