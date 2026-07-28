@@ -55,6 +55,7 @@ interface StoredPipelineProviderEvent {
 
 type ProviderFinding = Pick<Finding, "severity" | "code" | "summary">;
 const PROVIDER_FINDING_SEVERITIES = new Set<Finding["severity"]>(["P0", "P1", "P2", "P3"]);
+const BLOCKING_PROVIDER_FINDING_SEVERITIES = new Set<Finding["severity"]>(["P0", "P1"]);
 
 function boundedProviderPayload(payload: Record<string, unknown>): string {
   const serialized = sanitizeText(canonicalJson(payload));
@@ -197,6 +198,26 @@ function providerFindings(payload: string): ProviderFinding[] {
   } catch {
     return [];
   }
+}
+
+function hasBlockingProviderFinding(findings: readonly ProviderFinding[]): boolean {
+  return findings.some((finding) => BLOCKING_PROVIDER_FINDING_SEVERITIES.has(finding.severity));
+}
+
+function snapshotProviderOutcome(input: {
+  revisionMatches: boolean;
+  outcomes: ReadonlySet<PipelineProviderOutcome>;
+  findings: readonly ProviderFinding[];
+}): PipelineProviderOutcome {
+  if (!input.revisionMatches) return "needs_human";
+  const hasNonBlockingOnlyRepairFindings =
+    input.outcomes.has("semantic_repair_required") &&
+    input.findings.length > 0 &&
+    !hasBlockingProviderFinding(input.findings);
+  const outcomes = hasNonBlockingOnlyRepairFindings
+    ? new Set([...input.outcomes].filter((outcome) => outcome !== "semantic_repair_required"))
+    : input.outcomes;
+  return PROVIDER_OUTCOME_PRIORITY.find((candidate) => outcomes.has(candidate)) ?? "success";
 }
 
 function commitString(value: unknown): string | undefined {
@@ -409,9 +430,11 @@ export function processPipelineFeedbackSnapshot(params: {
   const revisionMatches = params.instance.published_commit !== null &&
     claim.snapshot.head_sha === params.instance.published_commit;
   const outcomes = new Set(events.map(({ parsed }) => parsed.outcome));
-  const outcome: PipelineProviderOutcome = revisionMatches
-    ? PROVIDER_OUTCOME_PRIORITY.find((candidate) => outcomes.has(candidate))!
-    : "needs_human";
+  const findings = events.flatMap(({ parsed }) => parsed.findings.length > 0
+    ? parsed.findings
+    : providerFindings(parsed.payload)
+  ).slice(0, 50);
+  const outcome = snapshotProviderOutcome({ revisionMatches, outcomes, findings });
   const drainedAt = new Date().toISOString();
   params.store.setSetting(`feedback-snapshot-drained-at:${claim.snapshot.id}`, drainedAt);
   params.store.setSetting(
@@ -426,10 +449,7 @@ export function processPipelineFeedbackSnapshot(params: {
       ? `Immutable provider snapshot contains ${events.length} event(s) for the published commit.`
       : "The current provider head does not match the executor-verified published commit.",
     evidence: events.flatMap(({ parsed }) => parsed.evidence).slice(0, 50),
-    findings: events.flatMap(({ parsed }) => parsed.findings.length > 0
-      ? parsed.findings
-      : providerFindings(parsed.payload)
-    ).slice(0, 50),
+    findings,
     providerPayload: {
       snapshot_id: claim.snapshot.id,
       repair_round: claim.snapshot.repair_round,

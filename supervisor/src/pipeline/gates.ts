@@ -486,6 +486,19 @@ function providerGateReceipt(
   };
 }
 
+function hasBlockingProviderFinding(findings: readonly Finding[]): boolean {
+  return findings.some((finding) => finding.severity === "P0" || finding.severity === "P1");
+}
+
+function providerOutcomeForFindings(input: {
+  outcome: "success" | "no_change" | "semantic_repair_required" | "retryable_infrastructure_failure" | "needs_human" | "failure";
+  findings?: readonly Finding[];
+}): "success" | "no_change" | "semantic_repair_required" | "retryable_infrastructure_failure" | "needs_human" | "failure" {
+  const findings = input.findings ?? [];
+  if (findings.length === 0 || hasBlockingProviderFinding(findings)) return input.outcome;
+  return input.outcome === "semantic_repair_required" ? "success" : input.outcome;
+}
+
 export function processProviderEvidence(
   store: PipelineStore,
   input: {
@@ -500,6 +513,7 @@ export function processProviderEvidence(
 ): PipelineInstance {
   const instance = store.getInstance(input.instanceId);
   if (!instance) throw new Error(`unknown pipeline instance ${input.instanceId}`);
+  const outcome = providerOutcomeForFindings(input);
   const existing = store.getInboxEvent(input.id);
   if (existing?.status === "consumed") {
     if (existing.pipeline_instance_id !== instance.id || existing.generation !== instance.generation) {
@@ -510,7 +524,7 @@ export function processProviderEvidence(
     const priorPayload = priorStageResult
       ? JSON.parse(priorStageResult.payload) as { summary?: unknown; evidence?: unknown; details?: unknown }
       : undefined;
-    if (prior.outcome !== input.outcome || priorPayload?.summary !== input.summary ||
+    if (prior.outcome !== outcome || priorPayload?.summary !== input.summary ||
         canonicalJson(priorPayload?.evidence) !== canonicalJson(input.evidence) ||
         canonicalJson(priorPayload?.details) !== canonicalJson(input.providerPayload)) {
       throw new Error(`provider event ${input.id} conflicts with its consumed payload`);
@@ -563,7 +577,7 @@ export function processProviderEvidence(
         post_subject: subject,
       },
       assurance: "provider_verified",
-      result: input.outcome,
+      result: outcome,
       summary: input.summary,
       evidence: input.evidence,
       findings: input.findings ?? [],
@@ -590,7 +604,7 @@ export function processProviderEvidence(
     generation: instance.generation,
     attemptId: attempt.id,
     requestHash: attempt.request_hash,
-    outcome: input.outcome,
+    outcome,
     resultHash: artifacts[0]!.hash,
     subject,
     nativeSessionId: attempt.native_session_id,
