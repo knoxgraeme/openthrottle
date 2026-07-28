@@ -218,6 +218,9 @@ function findArchitectureViolations(modules: SourceModule[]): string[] {
         if (specifier === "better-sqlite3" && !rel.startsWith("persistence/")) {
           violations.push(`${rel}: better-sqlite3 is confined to persistence`);
         }
+        if (specifier === "@openthrottle/contracts" && rel !== "pipeline/manifest.ts") {
+          violations.push(`${rel}: @openthrottle/contracts is mediated through pipeline/manifest.ts`);
+        }
         if ((specifier === "hono" || specifier === "@hono/node-server") && !rel.startsWith("http/")) {
           violations.push(`${rel}: ${specifier} is confined to http`);
         }
@@ -249,6 +252,7 @@ describe("supervisor source architecture", () => {
       { file: path.join(sourceRoot, "shared", "bad-domain.ts"), source: "import '../pipeline/store.js';" },
       { file: path.join(sourceRoot, "providers", "linear", "bad-sibling.ts"), source: "import '../github/client.js';" },
       { file: path.join(sourceRoot, "operations", "bad-sql.ts"), source: "export const sql = 'SELECT * FROM runs';" },
+      { file: path.join(sourceRoot, "runtime", "bad-contracts.ts"), source: "import '@openthrottle/contracts';" },
       { file: path.join(sourceRoot, "__fixtures__", "helper.ts"), source: "export const fixture = true;" },
       { file: path.join(sourceRoot, "app", "bad-fixture.ts"), source: "import '../__fixtures__/helper.js';" },
     ];
@@ -263,6 +267,7 @@ describe("supervisor source architecture", () => {
         "shared/bad-domain.ts: shared may not import pipeline module pipeline/store.ts",
         "providers/linear/bad-sibling.ts: provider linear may not import provider github module providers/github/client.ts",
         "operations/bad-sql.ts: runs/run_liveness SQL is confined to persistence",
+        "runtime/bad-contracts.ts: @openthrottle/contracts is mediated through pipeline/manifest.ts",
         "app/bad-fixture.ts: production module imports test fixture __fixtures__/helper.ts",
       ])
     );

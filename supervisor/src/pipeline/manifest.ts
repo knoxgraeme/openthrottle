@@ -1,7 +1,9 @@
-import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { canonicalJson, digestNormalized } from "@openthrottle/contracts";
 import { parseDocument } from "yaml";
+
+export { canonicalJson, digestNormalized } from "@openthrottle/contracts";
 
 export const STAGE_OUTCOMES = [
   "success",
@@ -226,26 +228,6 @@ function parseYaml(raw: string, source: string): unknown {
   if (document.errors.length > 0) fail(source, document.errors[0]!.message);
   if (document.warnings.length > 0) fail(source, document.warnings[0]!.message);
   return document.toJS({ maxAliasCount: 0 });
-}
-
-function canonicalValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonicalValue);
-  if (value && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>)
-        .sort(([left], [right]) => left.localeCompare(right))
-        .map(([key, child]) => [key, canonicalValue(child)])
-    );
-  }
-  return value;
-}
-
-export function canonicalJson(value: unknown): string {
-  return JSON.stringify(canonicalValue(value));
-}
-
-export function digestNormalized(normalized: string): string {
-  return createHash("sha256").update(normalized).digest("hex");
 }
 
 export function isPipelineReentry(manifest: PipelineManifest, stageId: string, targetId: string): boolean {

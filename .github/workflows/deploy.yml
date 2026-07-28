@@ -57,6 +57,7 @@ jobs:
               - 'supervisor/pipelines/runtime-capabilities-v1.json'
             supervisor:
               - 'supervisor/**'
+              - 'contracts/**'
 
   snapshot:
     needs: changes
@@ -136,5 +137,4 @@ jobs:
         if: needs.snapshot.result == 'success'
         run: flyctl secrets set --stage --app "$FLY_APP" DAYTONA_SNAPSHOT="${{ needs.snapshot.outputs.name }}"
       - name: Deploy the supervisor
-        working-directory: supervisor
-        run: flyctl deploy --remote-only --app "$FLY_APP"
+        run: flyctl deploy --remote-only --app "$FLY_APP" --config supervisor/fly.toml --dockerfile supervisor/Dockerfile

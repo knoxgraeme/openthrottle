@@ -16,7 +16,7 @@
   "scripts": {
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
     "dev": "tsc --watch",
-    "prepack": "npm run build",
+    "prepack": "node scripts/prepare-contracts-bundle.mjs && npm run build",
     "typecheck": "tsc --noEmit",
     "start": "node dist/index.js",
     "test": "vitest run",
@@ -25,6 +25,7 @@
   "dependencies": {
     "@clack/prompts": "^0.10.0",
     "@daytona/sdk": "^0.199.0",
+    "@openthrottle/contracts": "file:../contracts",
     "yaml": "^2.6.1"
   },
   "devDependencies": {
@@ -32,5 +33,11 @@
     "@vitest/coverage-v8": "^3.2.4",
     "typescript": "^5.9.3",
     "vitest": "^3.2.4"
-  }
+  },
+  "bundleDependencies": [
+    "@openthrottle/contracts"
+  ],
+  "main": "index.js",
+  "keywords": [],
+  "author": ""
 }

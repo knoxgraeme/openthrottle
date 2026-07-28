@@ -87,8 +87,10 @@ receive `GITHUB_TOKEN`.
 - The deploy job first ensures the Fly app and its `openthrottle_data` volume
   exist (idempotent — created only when missing), so a fresh account bootstraps
   itself instead of failing with `Could not find App`.
-- Changes under `supervisor/` (or a freshly built snapshot, whose staged
-  secret applies on release) run `flyctl deploy --remote-only`.
+- Changes under `supervisor/` or the shared `contracts/` library (or a freshly
+  built snapshot, whose staged secret applies on release) run `flyctl deploy
+  --remote-only` against the same supervisor Fly app. `contracts/` is built as
+  an input library, not deployed as a separate service.
 - `workflow_dispatch` inputs force either half manually.
 
 It needs the repository secrets `DAYTONA_API_KEY` and `FLY_API_TOKEN` (org-scoped

@@ -25,19 +25,24 @@ jobs:
             supervisor/package-lock.json
             cli/package-lock.json
             sandbox/package-lock.json
+            contracts/package-lock.json
       - name: Install shell test dependencies
         run: sudo apt-get update && sudo apt-get install -y bats jq
       - name: Install Node dependencies
         run: |
+          npm ci --prefix contracts
           npm ci --prefix supervisor
           npm ci --prefix cli
           npm ci --prefix sandbox
       - name: Typecheck
         run: |
+          npm run typecheck --prefix contracts
+          npm run build --prefix contracts
           npm run typecheck --prefix supervisor
           npm run typecheck --prefix cli
       - name: Build production artifacts
         run: |
+          npm run build --prefix contracts
           npm run build --prefix supervisor
           npm run build --prefix cli
       - name: Verify pipeline docs are regenerated
@@ -54,6 +59,7 @@ jobs:
           npm test --prefix supervisor
           npm test --prefix cli
           npm test --prefix sandbox
+          npm test --prefix contracts
           bats sandbox/tests/runtime.bats
           bats sandbox/tests/inbox-drain.bats
 

@@ -23,20 +23,21 @@ Linear ticket ──> Fly supervisor ──> Daytona sandbox ──> ot/* branch
 phases, sanitization); `docs/PLAN.md` is the delivery/acceptance plan. When a
 change touches a contract, SPEC.md is the source of truth — read it first.
 
-## Repository is three separate npm projects
+## Repository is four separate npm projects
 
-There is **no root `package.json`**. `supervisor/`, `cli/`, and `sandbox/` each
-have their own. Always target one with `--prefix`:
+There is **no root `package.json`**. `contracts/`, `supervisor/`, `cli/`, and
+`sandbox/` each have their own. Always target one with `--prefix`:
 
 ```bash
 # install
-npm ci --prefix supervisor && npm ci --prefix cli && npm ci --prefix sandbox
+npm ci --prefix contracts && npm ci --prefix supervisor && npm ci --prefix cli && npm ci --prefix sandbox
 
-# typecheck / build (supervisor + cli only; sandbox is JS)
-npm run typecheck --prefix supervisor && npm run typecheck --prefix cli
-npm run build --prefix supervisor && npm run build --prefix cli   # tsc -> dist/
+# typecheck / build (contracts + supervisor + cli only; sandbox is JS)
+npm run typecheck --prefix contracts && npm run build --prefix contracts && npm run typecheck --prefix supervisor && npm run typecheck --prefix cli
+npm run build --prefix contracts && npm run build --prefix supervisor && npm run build --prefix cli   # tsc -> dist/
 
 # test
+npm test --prefix contracts
 npm test --prefix supervisor             # vitest run
 npm test --prefix cli
 npm test --prefix sandbox                 # vitest over runner/bin/tests *.test.mjs
@@ -59,9 +60,10 @@ so **relative imports carry a `.js` extension even when the source is `.ts`**
 ### Full contract suite (what CI runs)
 
 ```bash
-npm ci --prefix supervisor && npm ci --prefix cli && npm ci --prefix sandbox
-npm run typecheck --prefix supervisor && npm run typecheck --prefix cli
-npm run build --prefix supervisor && npm run build --prefix cli
+npm ci --prefix contracts && npm ci --prefix supervisor && npm ci --prefix cli && npm ci --prefix sandbox
+npm run typecheck --prefix contracts && npm run build --prefix contracts && npm run typecheck --prefix supervisor && npm run typecheck --prefix cli
+npm run build --prefix contracts && npm run build --prefix supervisor && npm run build --prefix cli
+npm test --prefix contracts
 npm test --prefix supervisor
 npm test --prefix cli
 npm test --prefix sandbox
@@ -108,6 +110,12 @@ Engineering / "CE")**. Keep new logic on the correct side:
     `providers/daytona`, SQLite only under `persistence`, no provider siblings,
     no production fixture imports, and no root production module except
     `index.ts`.
+
+- **`contracts/`** — shared Node 22 ESM TypeScript library for deterministic
+  cross-package contracts such as canonical JSON bytes and SHA-256 digests. It
+  is consumed by other projects via local package dependencies and has no Fly
+  service or deployment target of its own; supervisor deployment remains the
+  same Fly app/process, with `contracts/` built as an input library.
 
 - **`sandbox/`** — the Daytona image and its runtime boundary.
   `entrypoint.sh` is Fly-launched (the image's own entrypoint is an inert no-op

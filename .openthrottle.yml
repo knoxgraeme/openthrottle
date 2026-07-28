@@ -1,10 +1,11 @@
 # .openthrottle.yml — project config for OpenThrottle
 # Commit this file so delegated runs use the same repository-level gates.
 agent: codex
-test: npm test --prefix supervisor && npm test --prefix cli && npm test --prefix sandbox
-lint: npm run typecheck --prefix supervisor && npm run typecheck --prefix cli
-build: npm run build --prefix supervisor && npm run build --prefix cli
+test: npm test --prefix contracts && npm test --prefix supervisor && npm test --prefix cli && npm test --prefix sandbox
+lint: npm run typecheck --prefix contracts && npm run build --prefix contracts && npm run typecheck --prefix supervisor && npm run typecheck --prefix cli
+build: npm run build --prefix contracts && npm run build --prefix supervisor && npm run build --prefix cli
 post_bootstrap:
+  - npm ci --prefix contracts
   - npm ci --prefix supervisor
   - npm ci --prefix cli
   - npm ci --prefix sandbox
