@@ -1,0 +1,91 @@
+{
+  "schema": "openthrottle.graph/v1",
+  "id": "structured",
+  "version": 1,
+  "entry_node": "implement",
+  "workers": [
+    {
+      "id": "implementer",
+      "engine": "agent",
+      "skill": "builtin://implement-unit@1",
+      "session_scope": "attempt",
+      "credentials": [
+        "repo",
+        "model"
+      ]
+    },
+    {
+      "id": "reviewer",
+      "engine": "agent",
+      "skill": "builtin://semantic-review@1",
+      "session_scope": "fresh",
+      "credentials": [
+        "repo",
+        "model"
+      ]
+    }
+  ],
+  "loops": [
+    {
+      "id": "unit_loop",
+      "worker": "implementer",
+      "input_scope": "unit",
+      "receipt": "unit_completion",
+      "max_parallel": 3,
+      "max_rounds": 4
+    },
+    {
+      "id": "review_loop",
+      "worker": "reviewer",
+      "input_scope": "diff",
+      "receipt": "semantic_review",
+      "max_parallel": 1,
+      "max_rounds": 2
+    }
+  ],
+  "nodes": [
+    {
+      "id": "implement",
+      "kind": "for_each_unit",
+      "loop": "unit_loop",
+      "depends_on": [],
+      "transitions": {
+        "success": {
+          "to": "review"
+        },
+        "repair_required": {
+          "to": "implement",
+          "max_reentries": 3,
+          "on_exhausted": "needs_human"
+        },
+        "failure": {
+          "terminal": "failed"
+        }
+      }
+    },
+    {
+      "id": "review",
+      "kind": "run",
+      "loop": "review_loop",
+      "depends_on": [
+        "implement"
+      ],
+      "transitions": {
+        "success": {
+          "terminal": "completed"
+        },
+        "repair_required": {
+          "to": "implement",
+          "max_reentries": 2,
+          "on_exhausted": "needs_human"
+        },
+        "needs_human": {
+          "terminal": "needs_human"
+        },
+        "failure": {
+          "terminal": "failed"
+        }
+      }
+    }
+  ]
+}

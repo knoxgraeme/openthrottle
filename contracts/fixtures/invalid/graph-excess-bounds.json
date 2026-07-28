@@ -1,0 +1,40 @@
+{
+  "schema": "openthrottle.graph/v1",
+  "id": "structured",
+  "version": 1,
+  "entry_node": "implement",
+  "workers": [
+    {
+      "id": "implementer",
+      "engine": "agent",
+      "skill": "builtin://implement-unit@1",
+      "session_scope": "attempt",
+      "credentials": [
+        "repo"
+      ]
+    }
+  ],
+  "loops": [
+    {
+      "id": "unit_loop",
+      "worker": "implementer",
+      "input_scope": "unit",
+      "receipt": "unit_completion",
+      "max_parallel": 99,
+      "max_rounds": 2
+    }
+  ],
+  "nodes": [
+    {
+      "id": "implement",
+      "kind": "for_each_unit",
+      "loop": "unit_loop",
+      "depends_on": [],
+      "transitions": {
+        "success": {
+          "terminal": "completed"
+        }
+      }
+    }
+  ]
+}

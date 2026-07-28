@@ -1,0 +1,48 @@
+{
+  "schema": "openthrottle.execution-plan/v1",
+  "graph_id": "structured",
+  "plan_id": "stage-c-contracts",
+  "instructions": {
+    "freeze_schemas": "Freeze closed public schemas with strict unknown-field rejection.",
+    "add_corpora": "Add valid and invalid fixture corpora for deterministic validation."
+  },
+  "acceptance": {
+    "schemas_exported": "Contracts package exports parser and validator entry points.",
+    "fixtures_reject": "Invalid corpora reject with stable diagnostic paths."
+  },
+  "units": [
+    {
+      "id": "contracts",
+      "title": "Freeze contracts",
+      "depends_on": [],
+      "instructions": [
+        "freeze_schemas"
+      ],
+      "acceptance": [
+        "schemas_exported"
+      ]
+    },
+    {
+      "id": "corpora",
+      "title": "Add corpora",
+      "depends_on": [
+        "contracts"
+      ],
+      "instructions": [
+        "add_corpora"
+      ],
+      "acceptance": [
+        "fixtures_reject"
+      ]
+    }
+  ],
+  "commands": [
+    {
+      "name": "docs-check"
+    },
+    {
+      "name": "build",
+      "unit": "contracts"
+    }
+  ]
+}
