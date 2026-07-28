@@ -17,9 +17,10 @@ import {
   parsePullRequestUrl,
 } from "../providers/github/client.js";
 import { enqueueActivity, tryPostError } from "../providers/linear/outbox.js";
-import { canonicalJson, loadPipelineCatalog } from "../pipeline/manifest.js";
+import { canonicalJson, digestNormalized, loadPipelineCatalog } from "../pipeline/manifest.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
+import { coordinatePipelineEvent } from "../pipeline/coordinator.js";
 
 const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
 const fixtureCatalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
@@ -132,6 +133,40 @@ describe("pipeline admission", () => {
       kind: string;
       payload: string;
     }>;
+  }
+
+  function completeActiveStage(
+    pipelines: ReturnType<typeof createPipelineStore>,
+    summary = "Implementation completed."
+  ) {
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    const payload = JSON.stringify({
+      schema: "openthrottle.stage-proposal/v1",
+      suggested_outcome: "success",
+      summary,
+      evidence: [],
+      findings: [],
+      actions: [],
+      uncertainty: [],
+    });
+    return coordinatePipelineEvent(pipelines, {
+      id: `stage-result:${attempt.id}`,
+      kind: "stage_result",
+      instanceId: instance.id,
+      generation: instance.generation,
+      attemptId: attempt.id,
+      requestHash: attempt.request_hash,
+      outcome: "success",
+      resultHash: digestNormalized(payload),
+      artifacts: [{
+        kind: "stage_result",
+        schemaVersion: 1,
+        assurance: "semantic_attested",
+        payload,
+        hash: digestNormalized(payload),
+      }],
+    });
   }
 
   async function run(
@@ -501,6 +536,36 @@ mcp_servers: {}
       id: "activity-steer",
       body: "please adjust the current stage",
     });
+  });
+
+  it("buffers a reply during a non-steerable running stage instead of rejecting it", async () => {
+    const { tickets, pipelines, invoke } = await run("pipelines: { implement: implement }\n");
+    completeActiveStage(pipelines);
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    expect(attempt.stage_id).toBe("semantic_review");
+    const request = pipelines.getStageRequest(attempt.id);
+    expect(tickets.beginRun({
+      issueId: "issue-1",
+      runId: request.runId,
+      taskType: "implement",
+      tokenHash: "token-hash",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    })).toBe(true);
+    pipelines.bindStageRun(attempt.id, request.runId);
+    pipelines.markStageDispatched(attempt.id);
+
+    await invoke({}, promptedReply("please carry this into the repair", "activity-buffered"));
+
+    expect(providerEvents()).toHaveLength(0);
+    expect(db!.prepare("SELECT id, run_id, body FROM session_inbox").get()).toEqual({
+      id: "activity-buffered",
+      run_id: null,
+      body: "please carry this into the repair",
+    });
+    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(payloads.some((entry) => entry.includes("Captured your message"))).toBe(true);
+    expect(payloads.some((entry) => entry.includes("does not accept live steering"))).toBe(false);
   });
 
   it("rejects a waiting-provider reply for a just-terminal instance without feedback", async () => {
