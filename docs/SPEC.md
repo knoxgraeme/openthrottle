@@ -463,7 +463,7 @@ The CLI never creates per-project snapshots or configures routing fallbacks.
 
 ## Verification contract
 
-CI installs all three npm projects, typechecks/builds supervisor and CLI, runs
+CI installs all four npm projects, typechecks/builds contracts, supervisor, and CLI, runs
 all Vitest suites and Bats runtime tests, builds the sandbox image, and executes
 the sealed multi-agent/command-stage Docker smoke. The smoke uses deterministic
 stub agents and a local bare repository; it does not consume operator
