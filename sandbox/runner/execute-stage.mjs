@@ -46,10 +46,7 @@ const REQUEST_KEYS = new Set([
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 const DIGEST = /^[a-f0-9]{64}$/;
 const COMMIT = /^[a-f0-9]{40}$/;
-const ARTIFACT_KINDS = new Set([
-  "stage_result", "review", "command_result", "provider_check",
-  "human_approval", "publish_subject",
-]);
+const ARTIFACT_KINDS = new Set(RUNTIME_DESCRIPTOR.artifacts);
 const CONTEXT_POLICIES = new Set([
   "none", "fresh", "resume_required", "prefer_resume",
 ]);

@@ -49,6 +49,7 @@ describe("database migrations", () => {
       "927f4e9a8a9583b52fed3f537a364ba4a57c47ea9afa4b9475286e2ec8605b71",
       "e9a57fd85fbca09daeb1b87dbeab27d9cf696da3cb6e00a4a0ee7652bb72d6e2",
       "f8bdad88455442e46d1951f7fe48050f9367d83273ed94c8eaf7f610666fb809",
+      "5327e028894aeac2334d4fd63da3937cdb3470419d9cde8aa7f20832280aa6ad",
     ]);
   });
 
@@ -87,6 +88,76 @@ describe("database migrations", () => {
       SELECT name FROM sqlite_master
       WHERE type = 'index' AND name = 'orchestration_journal_repository_lower_recorded_idx'
     `).get()).toEqual({ name: "orchestration_journal_repository_lower_recorded_idx" });
+    expect(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'execution_units'"
+    ).get()).toEqual({ name: "execution_units" });
+    expect(db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'index' AND name = 'execution_work_one_active_idx'
+    `).get()).toEqual({ name: "execution_work_one_active_idx" });
+  });
+
+  it("persists execution graph result artifacts after the child reducer migration", () => {
+    db = openDb(":memory:");
+    const now = "2026-07-29T00:00:00.000Z";
+    db.exec(`
+      INSERT INTO tickets (
+        linear_issue_id, linear_issue_identifier, linear_session_id, branch, agent,
+        repo, base_branch, created_at, updated_at
+      ) VALUES ('issue-1', 'OPE-1', 'session-1', 'ot/ope-1', 'codex', 'owner/repo', 'main', '${now}', '${now}');
+      INSERT INTO agent_sessions (
+        id, linear_issue_id, generation, state, created_at, updated_at
+      ) VALUES ('session-1', 'issue-1', 1, 'current', '${now}', '${now}');
+      INSERT INTO runs (
+        id, linear_issue_id, linear_session_id, session_generation, task_type,
+        token_hash, status, started_at, expires_at
+      ) VALUES (
+        'run-parent', 'issue-1', 'session-1', 1, 'implement', 'request-hash',
+        'running', '${now}', '2026-07-29T01:00:00.000Z'
+      );
+      INSERT INTO repository_config_snapshots (
+        id, repository, base_commit, blob_sha, digest, normalized_config, created_at
+      ) VALUES ('config-1', 'owner/repo', '${"a".repeat(40)}', '${"b".repeat(40)}', '${"c".repeat(64)}', '{}', '${now}');
+      INSERT INTO runtime_capability_descriptors (
+        runtime_release, digest, protocol, normalized_descriptor, accepted_at
+      ) VALUES ('runtime/v1', '${"d".repeat(64)}', 'stage-executor@1', '{}', '${now}');
+      INSERT INTO pipeline_catalog_entries (
+        pipeline_id, version, digest, normalized_manifest, accepted_at
+      ) VALUES ('structured', 1, '${"e".repeat(64)}', '{}', '${now}');
+      INSERT INTO pipeline_instances (
+        id, linear_issue_id, linear_session_id, generation, pipeline_id, pipeline_version,
+        manifest_digest, normalized_manifest, repository, base_commit, branch,
+        repository_config_snapshot_id, repository_config_digest, runtime_release, capability_digest,
+        executor_protocol, authorized_capabilities, status, active_stage_id, state_version,
+        attempt_count, created_at, updated_at
+      ) VALUES (
+        'instance-1', 'issue-1', 'session-1', 1, 'structured', 1, '${"e".repeat(64)}',
+        '{}', 'owner/repo', '${"a".repeat(40)}', 'ot/ope-1', 'config-1', '${"c".repeat(64)}',
+        'runtime/v1', '${"d".repeat(64)}', 'stage-executor@1', '[]', 'running',
+        'units', 1, 1, '${now}', '${now}'
+      );
+      INSERT INTO pipeline_instance_stages (
+        pipeline_instance_id, stage_id, ordinal, status, attempt_count, created_at, updated_at
+      ) VALUES ('instance-1', 'units', 1, 'running', 1, '${now}', '${now}');
+      INSERT INTO pipeline_stage_attempts (
+        id, pipeline_instance_id, stage_id, attempt_ordinal, reentry_ordinal,
+        request_hash, idempotency_key, context_revision, native_context_policy,
+        planned_run_id, run_id, status, created_at, updated_at
+      ) VALUES (
+        'attempt-parent', 'instance-1', 'units', 1, 0, '${"f".repeat(64)}',
+        'attempt-key', 0, 'none', 'run-parent', 'run-parent', 'running', '${now}', '${now}'
+      );
+    `);
+
+    expect(() => db!.prepare(`
+      INSERT INTO pipeline_artifacts (
+        id, pipeline_instance_id, attempt_id, kind, schema_version,
+        assurance, subject, payload, artifact_hash, created_at
+      ) VALUES (
+        'artifact-graph-result', 'instance-1', 'attempt-parent', 'execution_graph_result',
+        1, 'executor_verified', '${"a".repeat(40)}', '{}', '${"b".repeat(64)}', '${now}'
+      )
+    `).run()).not.toThrow();
   });
 
   it("fails closed on a checksum mismatch or unknown newer version", () => {
