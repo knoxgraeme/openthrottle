@@ -21,6 +21,8 @@ export interface ExecutionUnitGraph {
   integration_subject: string | null;
   aggregate_artifact_hash: string | null;
   aggregate_emitted_at: string | null;
+  stopped_at: string | null;
+  stop_reason: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -251,7 +253,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     input: Parameters<ExecutionUnitStore["leaseNextUnitAction"]>[0]
   ): ExecutionWorkAttempt | undefined => {
     const graph = graphStmt.get(input.parentAttemptId) as ExecutionUnitGraph | undefined;
-    if (!graph || graph.aggregate_emitted_at) return undefined;
+    if (!graph || graph.aggregate_emitted_at || graph.stopped_at) return undefined;
     db.prepare(`
       UPDATE execution_units
       SET status = 'pending', active_work_attempt_id = NULL, updated_at = ?
@@ -504,22 +506,31 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     input: Parameters<ExecutionUnitStore["stopActiveWork"]>[0]
   ): "stopped" | "already_stopped" => {
     const timestamp = now();
+    const graph = graphStmt.get(input.parentAttemptId) as ExecutionUnitGraph | undefined;
+    if (!graph) return "already_stopped";
+    if (graph.aggregate_emitted_at || graph.stopped_at) return "already_stopped";
     const activeActionIds = (db.prepare(`
       SELECT id FROM execution_work_attempts
       WHERE parent_attempt_id = ? AND status IN ('leased', 'dispatched', 'running')
       ORDER BY created_at, id
     `).all(input.parentAttemptId) as Array<{ id: string }>).map((action) => action.id);
-    if (activeActionIds.length === 0) return "already_stopped";
     db.prepare(`
-      UPDATE execution_work_attempts
-      SET status = 'dead', lease_until = NULL, last_error = ?, updated_at = ?, completed_at = COALESCE(completed_at, ?)
-      WHERE parent_attempt_id = ? AND status IN ('leased', 'dispatched', 'running')
-    `).run(input.reason, timestamp, timestamp, input.parentAttemptId);
-    db.prepare(`
-      UPDATE execution_units
-      SET status = 'pending', active_work_attempt_id = NULL, updated_at = ?
-      WHERE parent_attempt_id = ? AND active_work_attempt_id IN (${activeActionIds.map(() => "?").join(",")})
-    `).run(timestamp, input.parentAttemptId, ...activeActionIds);
+      UPDATE execution_graphs
+      SET stopped_at = ?, stop_reason = ?, updated_at = ?
+      WHERE parent_attempt_id = ? AND stopped_at IS NULL
+    `).run(timestamp, input.reason, timestamp, input.parentAttemptId);
+    if (activeActionIds.length > 0) {
+      db.prepare(`
+        UPDATE execution_work_attempts
+        SET status = 'dead', lease_until = NULL, last_error = ?, updated_at = ?, completed_at = COALESCE(completed_at, ?)
+        WHERE parent_attempt_id = ? AND status IN ('leased', 'dispatched', 'running')
+      `).run(input.reason, timestamp, timestamp, input.parentAttemptId);
+      db.prepare(`
+        UPDATE execution_units
+        SET status = 'pending', active_work_attempt_id = NULL, updated_at = ?
+        WHERE parent_attempt_id = ? AND active_work_attempt_id IN (${activeActionIds.map(() => "?").join(",")})
+      `).run(timestamp, input.parentAttemptId, ...activeActionIds);
+    }
     return "stopped";
   });
 

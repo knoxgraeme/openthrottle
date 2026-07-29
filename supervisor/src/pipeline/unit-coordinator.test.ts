@@ -72,7 +72,7 @@ describe("unit coordinator", () => {
     expect(decideChildGate({
       gateKind: "unit_acceptance",
       evaluatorKind: "semantic",
-      expected: childGateFence({ currentSubject: "2".repeat(40) }),
+      expected: childGateFence({ inputSubject: "1".repeat(40), currentSubject: "2".repeat(40) }),
       evidence,
     })).toMatchObject({
       outcome: "success",
@@ -86,6 +86,12 @@ describe("unit coordinator", () => {
       expected: childGateFence({ producerCapability: "graph/for-each-unit@1" }),
       evidence,
     })).toThrow(/producer fence mismatch/);
+    expect(() => decideChildGate({
+      gateKind: "unit_acceptance",
+      evaluatorKind: "semantic",
+      expected: childGateFence({ inputSubject: "3".repeat(40), currentSubject: "2".repeat(40) }),
+      evidence,
+    })).toThrow(/subject fence mismatch/);
     expect(() => decideChildGate({
       gateKind: "unit_acceptance",
       evaluatorKind: "semantic",
@@ -113,7 +119,7 @@ describe("unit coordinator", () => {
     expect(() => decideChildGate({
       gateKind: "unit_acceptance",
       evaluatorKind: "human",
-      expected: childGateFence({ currentSubject: "2".repeat(40) }),
+      expected: childGateFence({ inputSubject: "1".repeat(40), currentSubject: "2".repeat(40) }),
       evidence,
     })).toThrow(/evaluator human is not supported/);
   });
@@ -322,6 +328,7 @@ function childGateFence(overrides: Partial<Parameters<typeof decideChildGate>[0]
     runtimeRelease: "runtime/v1",
     capabilityDigest: "c".repeat(64),
     generation: 1,
+    inputSubject: "2".repeat(40),
     currentSubject: "2".repeat(40),
     nativeSessionId: "native-1",
     ...overrides,

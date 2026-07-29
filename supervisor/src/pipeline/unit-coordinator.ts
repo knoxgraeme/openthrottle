@@ -92,6 +92,7 @@ export interface ChildGateFence {
   runtimeRelease: string;
   capabilityDigest: string;
   generation: number;
+  inputSubject: string;
   currentSubject: string;
   nativeSessionId?: string | null;
 }
@@ -182,6 +183,7 @@ function assertChildGateFence(evidence: ChildGateEvidence, expected: ChildGateFe
     throw new Error("child gate evidence freshness fence mismatch");
   }
   if (
+    evidence.repository.pre_subject !== expected.inputSubject ||
     evidence.repository.subject !== expected.currentSubject ||
     evidence.repository.post_subject !== expected.currentSubject
   ) throw new Error("child gate evidence subject fence mismatch");
@@ -227,6 +229,7 @@ export function decideChildGate(input: {
     action_id: input.expected.actionId,
     gate_kind: input.gateKind,
     evaluator_kind: input.evaluatorKind,
+    input_subject: input.expected.inputSubject,
     subject: input.expected.currentSubject,
     proposed_result: input.evidence.result,
     decision: decision.result,

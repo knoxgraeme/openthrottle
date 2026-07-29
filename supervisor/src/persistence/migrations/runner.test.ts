@@ -50,7 +50,7 @@ describe("database migrations", () => {
       "e9a57fd85fbca09daeb1b87dbeab27d9cf696da3cb6e00a4a0ee7652bb72d6e2",
       "f8bdad88455442e46d1951f7fe48050f9367d83273ed94c8eaf7f610666fb809",
       "5327e028894aeac2334d4fd63da3937cdb3470419d9cde8aa7f20832280aa6ad",
-      "a14cc5c82b57051fd48c6fe152f6e5ea21f4adbb08107ef4df2ceb8629bd2070",
+      "438e4388d9f50e29233a33c86065e97e0e958b9c1e39a04e0c6be74c279c805f",
     ]);
   });
 
@@ -99,6 +99,12 @@ describe("database migrations", () => {
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'execution_downstream_context'"
     ).get()).toEqual({ name: "execution_downstream_context" });
     expect(db.prepare(`
+      SELECT name FROM pragma_table_info('execution_graphs') WHERE name = 'stopped_at'
+    `).get()).toEqual({ name: "stopped_at" });
+    expect(db.prepare(`
+      SELECT name FROM pragma_table_info('execution_graphs') WHERE name = 'stop_reason'
+    `).get()).toEqual({ name: "stop_reason" });
+    expect(db.prepare(`
       SELECT name FROM sqlite_master
       WHERE type = 'index' AND name = 'execution_work_one_active_idx'
     `).get()).toEqual({ name: "execution_work_one_active_idx" });
@@ -130,6 +136,9 @@ describe("database migrations", () => {
     expect(db.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'execution_gate_receipts'"
     ).get()).toEqual({ name: "execution_gate_receipts" });
+    expect(db.prepare(`
+      SELECT name FROM pragma_table_info('execution_graphs') WHERE name = 'stopped_at'
+    `).get()).toEqual({ name: "stopped_at" });
     expect(db.prepare(
       "SELECT version, checksum FROM schema_migrations WHERE version = 17"
     ).get()).toEqual({ version: 17, checksum: databaseMigrations[16]!.checksum });

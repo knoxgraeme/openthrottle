@@ -958,6 +958,11 @@ binding-contract:parent attempt and run fences live on execution_units and execu
 lease-contract:one active child action per parent attempt is enforced transactionally/v1
 aggregate-contract:one execution_graph_result hash settles the parent composite stage once/v1`;
 
+const executionGraphStopFenceSchema = `
+ALTER TABLE execution_graphs ADD COLUMN stopped_at TEXT;
+ALTER TABLE execution_graphs ADD COLUMN stop_reason TEXT;
+`;
+
 const executionChildGateSchema = `
 CREATE TABLE IF NOT EXISTS execution_gate_receipts (
   id TEXT PRIMARY KEY,
@@ -1013,8 +1018,19 @@ CREATE INDEX IF NOT EXISTS execution_downstream_context_target_idx
   ON execution_downstream_context(parent_attempt_id, to_unit_id, created_at);
 `;
 
-const executionChildGateMigrationSource = `${executionChildGateSchema}
-child-gate-contract:deterministic gate receipts and downstream context live on child execution records/v1`;
+const executionChildGateMigrationSource = `${executionGraphStopFenceSchema}
+${executionChildGateSchema}
+child-gate-contract:deterministic gate receipts and downstream context live on child execution records/v1
+stop-contract:stopped child graphs remain durable and are not eligible for redispatch/v1`;
+
+function addExecutionGraphStopFence(db: Database.Database): void {
+  if (!hasColumns(db, "execution_graphs", ["stopped_at"])) {
+    db.exec("ALTER TABLE execution_graphs ADD COLUMN stopped_at TEXT");
+  }
+  if (!hasColumns(db, "execution_graphs", ["stop_reason"])) {
+    db.exec("ALTER TABLE execution_graphs ADD COLUMN stop_reason TEXT");
+  }
+}
 
 function widenPipelineArtifactKindsForExecutionGraphResult(db: Database.Database): void {
   if (!hasTable(db, "pipeline_artifacts")) return;
@@ -1427,6 +1443,7 @@ const definitions: DatabaseMigrationDefinition[] = [
     name: "execution-child-gates-and-context",
     source: executionChildGateMigrationSource,
     up(db) {
+      addExecutionGraphStopFence(db);
       db.exec(executionChildGateSchema);
     },
   },

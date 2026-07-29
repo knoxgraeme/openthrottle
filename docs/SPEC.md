@@ -365,7 +365,8 @@ SQLite is the authority. Core tables include:
 - evidence/effects: `pipeline_artifacts`, `pipeline_gate_receipts`,
   `pipeline_publication_receipts`, `pipeline_effect_intents`;
 - structured child execution: `execution_graphs`, `execution_units`,
-  `execution_work_attempts`;
+  `execution_work_attempts`, `execution_gate_receipts`,
+  `execution_downstream_context`;
 - cross-run orchestration history: `orchestration_journal`;
 - operations: `repository_registrations`, `supervisor_leases`, `settings`,
   `schema_migrations`, `migration_reconciliation`.
@@ -400,11 +401,30 @@ key, runtime request/session hashes, lease owner/window, payload, result hash,
 output subject, and terminal/error state. The child reducer may lease at most
 one active child action per parent attempt. It expires only pre-dispatch claims
 by lease time; dispatched or running child actions remain the active action and
-are recovered/collected by idempotency rather than duplicated. When all serial
-units are integrated, the reducer emits one `execution_graph_result` artifact
-and one aggregate `stage_result` for the parent attempt; the aggregate hash is
-compare-and-set on `execution_graphs` so the parent can settle once through the
-ordinary stage-result path.
+are recovered/collected by idempotency rather than duplicated. A stopped child
+graph records `stopped_at` and `stop_reason` on `execution_graphs`; leasing must
+fail closed while that stop fence is present, including when stop was requested
+before any child action was active.
+
+`execution_gate_receipts` records deterministic child gate decisions by work
+attempt and gate kind. A receipt is accepted only after the typed child evidence
+matches the expected producer, parent attempt/run/request, unit/action,
+generation/native-session, input subject, and current output subject fences;
+exact replay is idempotent and conflicting replay is rejected. The receipt
+stores the shared gate result/outcome/reason, sorted artifact hashes, canonical
+payload, and receipt hash.
+
+`execution_downstream_context` records immutable context emitted by an already
+integrated/completed unit for existing pending units in the same execution
+graph. Context records are addressed by source unit, target unit, and payload
+hash; duplicate exact records are idempotent, unknown targets, non-pending
+targets, non-integrated sources, and topology changes are rejected rather than
+mutating the graph.
+
+When all serial units are integrated, the reducer emits one
+`execution_graph_result` artifact and one aggregate `stage_result` for the
+parent attempt; the aggregate hash is compare-and-set on `execution_graphs` so
+the parent can settle once through the ordinary stage-result path.
 
 `pipeline_artifacts.kind` includes `execution_graph_result` for the child
 aggregate artifact in addition to the existing stage, review, command,

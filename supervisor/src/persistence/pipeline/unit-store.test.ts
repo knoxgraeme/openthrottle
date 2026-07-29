@@ -252,6 +252,10 @@ describe("execution unit store", () => {
       artifactHash: "hash-2",
       integrationSubject: "222",
     })).toThrow(/different aggregate/);
+    expect(store.stopActiveWork({
+      parentAttemptId: "attempt-parent",
+      reason: "superseded",
+    })).toBe("already_stopped");
   });
 
   it("records child gate receipts idempotently and rejects conflicting replay", () => {
@@ -381,6 +385,12 @@ describe("execution unit store", () => {
       parentAttemptId: "attempt-parent",
       reason: "needs_human",
     })).toBe("stopped");
+    expect(store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-2",
+      nowIso: timestamp,
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })).toBeUndefined();
     expect(store.stopActiveWork({
       parentAttemptId: "attempt-parent",
       reason: "needs_human",
@@ -406,6 +416,41 @@ describe("execution unit store", () => {
       status: "dead",
       last_error: "needs_human",
     });
-    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ parent_attempt_id: "attempt-parent" });
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({
+      parent_attempt_id: "attempt-parent",
+      stopped_at: timestamp,
+      stop_reason: "needs_human",
+    });
+  });
+
+  it("records a graph stop fence before any child action is active", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+    });
+
+    expect(store.stopActiveWork({
+      parentAttemptId: "attempt-parent",
+      reason: "superseded",
+    })).toBe("stopped");
+    expect(store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: timestamp,
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })).toBeUndefined();
+    expect(store.listUnits("attempt-parent")).toEqual([
+      expect.objectContaining({ unitId: "a", status: "pending", activeActionId: null }),
+    ]);
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({
+      stopped_at: timestamp,
+      stop_reason: "superseded",
+    });
   });
 });
