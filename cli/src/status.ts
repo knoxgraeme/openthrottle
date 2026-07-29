@@ -40,6 +40,13 @@ interface TicketRow {
     sandbox_event_id: string | null;
     sandbox_event_attempts: number | null;
     sandbox_ingestion_error: string | null;
+    structured_units?: Array<{
+      unit_id: string;
+      status: string;
+      terminal_level: string | null;
+      alarm: boolean;
+      integration_subject: string | null;
+    }>;
   } | null;
 }
 
@@ -79,6 +86,14 @@ function renderTicket(ticket: TicketRow): void {
   console.log(`  gate: ${value(p.gate_result)} context: ${value(p.context_policy)}`);
   console.log(`  publication: ${p.publication_state}${p.publication_id ? ` (${p.publication_id})` : ''}`);
   console.log(`  effect: ${p.effect_kind ? `${p.effect_kind}:${p.effect_status ?? p.effect_state}` : p.effect_state}`);
+  if (p.structured_units && p.structured_units.length > 0) {
+    console.log('  units:');
+    for (const unit of p.structured_units) {
+      const level = unit.terminal_level ?? 'active';
+      const alarm = unit.alarm ? 'alarm' : 'no alarm';
+      console.log(`    ${unit.unit_id}: ${level} (${alarm}) ${unit.status} ${shortSha(unit.integration_subject)}`);
+    }
+  }
   console.log(`  recovery: ${value(p.recovery_action)}`);
   console.log(`  last state change: ${p.last_state_change_at}`);
 }

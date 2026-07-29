@@ -460,6 +460,70 @@ describe("pipeline publication", () => {
     expect(publication.body).not.toContain("\n- Result: forged");
   });
 
+  it("includes a structured unit and gate ledger in Linear and GitHub publication bodies", () => {
+    const { instance, attempt } = setup();
+    const input = event(instance, attempt);
+    const publication = buildStagePublication({
+      instance,
+      attempt,
+      event: input.event,
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: attempt.id,
+        outcome: "success",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        nextStageId: "publish",
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+      structuredExecution: {
+        graph: {
+          id: "graph-1",
+          parent_attempt_id: attempt.id,
+          parent_stage_id: attempt.stage_id,
+          integration_subject: SUBJECT,
+          aggregate_artifact_hash: "aggregate-hash",
+          aggregate_emitted_at: "2026-07-29T00:03:00.000Z",
+          stopped_at: null,
+          stop_reason: null,
+        },
+        units: [{
+          unit_id: "U1",
+          ordinal: 0,
+          dependencies: [],
+          status: "completed",
+          terminal_level: "completed",
+          alarm: false,
+          active_action_id: null,
+          integration_subject: SUBJECT,
+          attempts: [],
+          gates: [{
+            kind: "unit_acceptance",
+            evaluator: "human",
+            result: "passed",
+            outcome: "success",
+            subject: SUBJECT,
+            reason: "Lead accepted scope match.",
+            artifact_hashes: ["artifact-hash"],
+            receipt_hash: "receipt-hash",
+          }],
+          downstream_context: [],
+        }],
+      },
+    });
+
+    expect(publication.body).toContain("**Structured Unit Ledger**");
+    expect(publication.body).toContain("- U1: completed (no alarm); state=completed");
+    expect(publication.body).toContain("unit_acceptance: passed/success by human");
+    expect(renderGithubPipelineSummary(publication)).toContain("**Structured Unit Ledger**");
+    expect(parsePipelinePublication(canonicalJson(publication)).structured_execution?.units[0]?.unit_id).toBe("U1");
+  });
+
   it("keeps persisted v1 publication envelopes parseable after the template bump", () => {
     const { instance } = setup();
     const publication = buildSelectionPublication(instance);

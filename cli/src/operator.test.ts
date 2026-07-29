@@ -70,6 +70,13 @@ describe('operator commands', () => {
               effect_status: 'dead',
               effect_attempts: 8,
               effect_error: 'termination was not confirmed',
+              structured_units: [{
+                unit_id: 'U1',
+                status: 'completed',
+                terminal_level: 'completed',
+                alarm: false,
+                integration_subject: 'fedcba9876543210',
+              }],
             },
           },
         ],
@@ -89,16 +96,18 @@ describe('operator commands', () => {
     );
     const headers = fetchMock.mock.calls[0]![1]!.headers as Headers;
     expect(headers.get('Authorization')).toBe('Bearer operator-token');
-    expect(output.mock.calls.flat().join('\n')).toContain('OT-1');
-    expect(output.mock.calls.flat().join('\n')).toContain('ce/implement@1');
-    expect(output.mock.calls.flat().join('\n')).toContain('publication_blocked');
-    expect(output.mock.calls.flat().join('\n')).toContain('whose move: waiting on you');
-    expect(output.mock.calls.flat().join('\n')).toContain('fresh');
-    expect(output.mock.calls.flat().join('\n')).toContain('implement');
-    expect(output.mock.calls.flat().join('\n')).toContain('0123456789ab');
-    expect(output.mock.calls.flat().join('\n')).toContain('stop:dead');
-    expect(output.mock.calls.flat().join('\n')).toContain('termination was not confirmed');
-    expect(output.mock.calls.flat().join('\n')).not.toContain('legacy=');
+    const printed = output.mock.calls.flat().join('\n');
+    expect(printed).toContain('OT-1');
+    expect(printed).toContain('ce/implement@1');
+    expect(printed).toContain('publication_blocked');
+    expect(printed).toContain('whose move: waiting on you');
+    expect(printed).toContain('fresh');
+    expect(printed).toContain('implement');
+    expect(printed).toContain('0123456789ab');
+    expect(printed).toContain('U1: completed (no alarm) completed fedcba987654');
+    expect(printed).toContain('stop:dead');
+    expect(printed).toContain('termination was not confirmed');
+    expect(printed).not.toContain('legacy=');
   });
 
   it('filters status output to one ticket', async () => {

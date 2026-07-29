@@ -19,6 +19,7 @@ import {
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import type { PipelineInstance, PipelineInstanceStage, PipelineStageAttempt } from "./store.js";
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
+import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
 const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
@@ -371,6 +372,40 @@ describe("pipeline coordinator", () => {
     expect(result.active_stage_id).toBe("semantic_review");
     expect(pipelines.listJournalEntries({ issueId: instance.linear_issue_id })
       .filter((entry) => entry.kind === "run_note")).toEqual([]);
+  });
+
+  it("attributes structured ledger publication projections to the supervisor", () => {
+    const { pipelines, instance, attempt } = setup("core/implement@4");
+    const unitStore = pipelines as typeof pipelines & ExecutionUnitStore;
+    unitStore.createGraph({
+      pipelineInstanceId: instance.id,
+      parentAttemptId: attempt.id,
+      parentStageId: attempt.stage_id,
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "U1" }],
+    });
+
+    coordinatePipelineEvent(pipelines, stageResultEvent({
+      instance,
+      attempt,
+      id: "structured-ledger-result",
+      summary: "Implemented the planned change.",
+    }));
+
+    const notes = pipelines.listJournalEntries({ issueId: instance.linear_issue_id })
+      .filter((entry) => entry.trigger === `${attempt.stage_id} structured publication`);
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toMatchObject({
+      actor: "supervisor",
+      kind: "run_note",
+      outcome: "success",
+    });
+    expect(JSON.parse(notes[0].structured!)).toMatchObject({
+      unit_count: 1,
+      aggregate_artifact_hash: null,
+    });
   });
 
   it("projects Codex model credential failures into run notes", () => {

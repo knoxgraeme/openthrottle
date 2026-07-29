@@ -27,6 +27,7 @@ import {
   validatePinnedInstance,
 } from "./helpers.js";
 import { createJournalStore } from "./journal-store.js";
+import { getStructuredExecutionPublicationForAttempt } from "./unit-store.js";
 
 interface ValidatedInstanceSeed {
   authorized: string[];
@@ -128,11 +129,15 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
     nextVersion: number,
     timestamp: string
   ): void => {
+    const structuredExecution = activeAttempt
+      ? getStructuredExecutionPublicationForAttempt(db, activeAttempt.id)
+      : undefined;
     const terminalPublication = buildTerminalPublicationPayload({
       instance,
       attempt: activeAttempt,
       outcome: "superseded",
       reason: "A newer delegated Linear session superseded this pipeline generation.",
+      structuredExecution,
     });
     persistPublication({
       instance,

@@ -8,6 +8,8 @@ import { openDb } from "../database.js";
 import { createSupervisorStore } from "../store.js";
 import { createPipelineStore } from "./create-store.js";
 import { catalogPath, runtime, setupPipelineStore, shippedCatalogPath, ticket } from "../../__fixtures__/pipeline-store.js";
+import { parsePipelinePublication } from "../../pipeline/publication.js";
+import type { ExecutionUnitStore } from "./unit-store.js";
 
 describe("pipeline instance store", () => {
   let db: Database.Database | undefined;
@@ -73,6 +75,44 @@ describe("pipeline instance store", () => {
     expect(pipelines.listEffects(oldInstance.id).map((effect) => [effect.kind, effect.status]))
       .toEqual([["provision", "dead"], ["stop", "pending"]]);
     expect(pipelines.getInstanceForSession("session-new")?.status).toBe("dispatchable");
+  });
+
+  it("preserves the active structured ledger in superseded terminal publications", () => {
+    const setup = setupPipelineStore();
+    db = setup.db;
+    const { tickets, pipelines, catalog, snapshot } = setup;
+    const manifest = catalog.manifests.get("fixture/command@1")!;
+    const pipeline = {
+      repository: "owner/repo",
+      baseCommit: "a".repeat(40),
+      manifest,
+      repositoryConfig: snapshot,
+      runtime,
+      authorizedCapabilities: manifest.manifest.requires.capabilities,
+      taskType: "implement" as const,
+    };
+    tickets.upsert({ ...ticket("session-old", "shared-issue"), pipeline });
+    const oldInstance = pipelines.getInstanceForSession("session-old")!;
+    const oldAttempt = pipelines.getActiveAttempt(oldInstance.id)!;
+    const unitStore = pipelines as typeof pipelines & ExecutionUnitStore;
+    unitStore.createGraph({
+      pipelineInstanceId: oldInstance.id,
+      parentAttemptId: oldAttempt.id,
+      parentStageId: oldAttempt.stage_id,
+      parentRunId: "run-old",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "U1" }],
+    });
+
+    tickets.upsert({ ...ticket("session-new", "shared-issue"), pipeline });
+
+    const publication = pipelines.listPublications(oldInstance.id)
+      .find((item) => item.kind === "linear_ledger" && item.idempotency_key.includes(":superseded:"))!;
+    const envelope = parsePipelinePublication(publication.payload);
+    expect(envelope.structured_execution?.units[0]?.unit_id).toBe("U1");
+    expect(envelope.body).toContain("**Structured Unit Ledger**");
+    expect(envelope.body).toContain("- U1: active (no alarm); state=pending");
   });
 
   it("rolls back supersession when a replacement generation cannot be pinned", () => {

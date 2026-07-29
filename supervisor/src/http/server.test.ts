@@ -5,6 +5,7 @@ import type { Config } from "../app/config.js";
 import { createSupervisorStore, type SupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
+import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 import type { PipelineStore } from "../pipeline/store.js";
 import { loadPipelineCatalog, parseRepositoryConfig } from "../pipeline/manifest.js";
 import { buildInstalledRuntimeDescriptor, type RuntimeInventory, type RuntimeLogs, type RuntimeSnapshotReadiness } from "../__fixtures__/runtime.js";
@@ -289,6 +290,43 @@ describe("coordinator-only server", () => {
         'sandbox failed with Bearer ghp_secretvalue'
       )
     `).run(instance.id);
+    const unitStore = pipelines as PipelineStore & ExecutionUnitStore;
+    unitStore.createGraph({
+      pipelineInstanceId: instance.id,
+      parentAttemptId: attempt.id,
+      parentStageId: "units",
+      parentRunId: "run-old",
+      graphDigest: "graph-old",
+      planDigest: "plan-old",
+      units: [{ id: "old-unit" }],
+    });
+    db.prepare(`
+      INSERT INTO pipeline_instance_stages (
+        pipeline_instance_id, stage_id, ordinal, status, attempt_count,
+        created_at, updated_at
+      ) VALUES (?, 'units', 99, 'passed', 1, '2026-07-26T00:00:00.000Z', '2026-07-26T00:00:00.000Z')
+      ON CONFLICT(pipeline_instance_id, stage_id) DO NOTHING
+    `).run(instance.id);
+    db.prepare(`
+      INSERT INTO pipeline_stage_attempts (
+        id, pipeline_instance_id, stage_id, attempt_ordinal, reentry_ordinal,
+        request_hash, idempotency_key, context_revision, native_context_policy,
+        planned_run_id, status, created_at, updated_at
+      ) VALUES (
+        'attempt-latest-units', ?, 'units', 1, 0, ?, 'attempt-latest-units',
+        0, 'fresh', NULL, 'completed',
+        '2026-07-26T00:12:00.000Z', '2026-07-26T00:12:00.000Z'
+      )
+    `).run(instance.id, "f".repeat(64));
+    unitStore.createGraph({
+      pipelineInstanceId: instance.id,
+      parentAttemptId: "attempt-latest-units",
+      parentStageId: "units",
+      parentRunId: "run-latest",
+      graphDigest: "graph-latest",
+      planDigest: "plan-latest",
+      units: [{ id: "latest-unit" }],
+    });
 
     const repairResponse = await app().request("/status", {
       headers: { Authorization: "Bearer status-token" },
@@ -310,7 +348,9 @@ describe("coordinator-only server", () => {
       whose_move: "working",
       last_error: "sandbox failed with [REDACTED]",
       last_state_change_at: "2026-07-26T00:10:00.000Z",
+      structured_units: [expect.objectContaining({ unit_id: "latest-unit" })],
     });
+    expect(JSON.stringify(repairBody.tickets[0]?.pipeline)).not.toContain("old-unit");
 
     db.prepare(`
       INSERT INTO pipeline_gate_receipts (
