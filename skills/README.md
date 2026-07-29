@@ -22,6 +22,23 @@ in `supervisor/pipelines/` own stage order, retries, gates, and terminal
 outcomes. `sandbox/runner/execute-stage.mjs` executes exactly one sealed stage
 and writes exactly one typed result.
 
+Structured graphs also use loop-level task adapters:
+
+- `implement-unit`, `simplify-unit`, and `repair-unit` adapt CE worker loops to
+  one execution-plan unit and return `unit_completion` receipts.
+- `accept-unit` is the minimal lead scope-match decision and returns
+  `unit_decision`; it is explicitly not a `ce-code-review` wrapper.
+- `final-review` is the only code-review adapter in the structured path and
+  returns `semantic_review` for the integrated whole.
+- `final-repair` repairs the integrated whole in an executor-owned exact-base
+  worktree.
+- `publish` adapts CE publication after deterministic gates accept the exact
+  subject.
+
+Non-CE skills may replace these loops when they emit the same
+`openthrottle.receipt/v1` contracts. The coordinator evaluates the receipt and
+executor-derived Git/command evidence, not CE-specific implementation details.
+
 ## Delivery per agent
 
 The canonical `SKILL.md` is maintained once:
@@ -48,7 +65,8 @@ The current catalog aliases `implement` and `investigate` to immutable `core/`
 manifests:
 
 - `core/implement@4`: implementation → semantic review → simplification →
-  test → lint → build → exact-subject publication → provider verification.
+  post-simplify review → test → lint → build → exact-subject publication →
+  provider verification.
   Repair transitions use the manifest's scoped repair stages and round budget.
 - `core/investigate@1`: investigation → conditional exact-subject publication.
   Convergent fixes may ship; divergent decisions terminate as `needs_human`.

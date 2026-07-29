@@ -7,10 +7,12 @@ import {
   createLoopRequestHash,
   executeLoopAction,
   loopAgentCommand,
+  parseLoopReceipt,
   loopPrompt,
   resolveLoopInvocation,
   validateLoopRequest,
 } from "./execute-loop.mjs";
+import { computeWorkspaceTreeOid } from "./repository-control.mjs";
 
 const directories = [];
 
@@ -40,7 +42,7 @@ function request(overrides = {}) {
     role: "worker",
     loop: "implement",
     agent: "codex",
-    skill: "ce-work",
+    skill: "implement-unit",
     worktree: { id: "unit-1", path: repository() },
     nativeSessionId: null,
     contextPolicy: "prefer_resume",
@@ -48,10 +50,48 @@ function request(overrides = {}) {
     transitionContext: "Implement the unit.",
     allowedMcpServers: ["github"],
     credentialScopes: ["model.invoke", "repo.read", "repo.write"],
-    receiptSchema: "openthrottle.loop-receipt@1",
+    receiptSchema: "openthrottle.receipt/v1",
     ...overrides,
   };
   return { ...withoutFence, ...createLoopRequestHash(withoutFence) };
+}
+
+function standardReceipt(loopRequest, overrides = {}) {
+  return {
+    schema: "openthrottle.receipt/v1",
+    type: "unit_completion",
+    assurance: "semantic_attested",
+    result: "success",
+    producer: {
+      worker_id: "worker-1",
+      skill: "builtin://implement-unit@1",
+      capability_digest: "c".repeat(64),
+    },
+    subject: {
+      base: "1".repeat(40),
+      pre: "1".repeat(40),
+      post: computeWorkspaceTreeOid(loopRequest.worktree.path),
+    },
+    fence: {
+      pipeline_instance_id: "instance-1",
+      graph_digest: "a".repeat(64),
+      unit_id: loopRequest.unitId,
+      attempt_id: loopRequest.attemptId,
+      request_hash: loopRequest.requestHash,
+    },
+    evidence: ["implemented unit"],
+    payload: {
+      summary: "Implemented the unit.",
+      assumptions: [],
+      decisions: [],
+      issues: [],
+      verification: ["focused test passed"],
+      downstream_context: [],
+      requested_human_input: [],
+    },
+    issued_at: "2026-07-29T00:00:00.000Z",
+    ...overrides,
+  };
 }
 
 describe("loop action request validation", () => {
@@ -102,11 +142,12 @@ describe("loop action request validation", () => {
 describe("executeLoopAction", () => {
   it("writes a typed result with worker receipt, native session, and subject", () => {
     const valid = request();
+    const receipt = standardReceipt(valid);
     const runLoopAgent = vi.fn(() => ({
       status: 0,
       signal: null,
       timedOut: false,
-      stdout: "{\"receipt\":\"ok\"}",
+      stdout: JSON.stringify(receipt),
       stderr: "",
       nativeSessionId: "thread-1",
     }));
@@ -121,9 +162,39 @@ describe("executeLoopAction", () => {
       action_id: "action-1",
       outcome: "success",
       native_session_id: "thread-1",
-      receipt: "{\"receipt\":\"ok\"}",
       created_at: "2026-07-29T00:00:00.000Z",
     });
+    expect(JSON.parse(result.receipt)).toMatchObject({ type: "unit_completion", result: "success" });
     expect(result.subject).toMatch(/^[a-f0-9]{40}$/);
+  });
+
+  it("rejects successful loop exits without a valid standard receipt", () => {
+    const result = executeLoopAction({
+      request: request(),
+      runLoopAgent: () => ({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "{\"receipt\":\"ok\"}",
+        stderr: "",
+        nativeSessionId: "thread-1",
+      }),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("failure");
+    expect(result.receipt).toMatch(/invalid standard receipt/);
+  });
+
+  it("extracts a standard receipt from JSONL agent output", () => {
+    const valid = request();
+    const receipt = standardReceipt(valid, { result: "needs_human" });
+    expect(parseLoopReceipt([
+      JSON.stringify({ type: "event", message: "working" }),
+      JSON.stringify({ type: "result", receipt }),
+    ].join("\n"), {})).toMatchObject({
+      type: "unit_completion",
+      result: "needs_human",
+    });
   });
 });

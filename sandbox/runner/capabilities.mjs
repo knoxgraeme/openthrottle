@@ -81,13 +81,13 @@ export const CAPABILITY_CONTRACTS = Object.freeze({
 
 export const RUNTIME_DESCRIPTOR = Object.freeze({
   schema: "openthrottle.runtime-capabilities/v1",
-  release: "openthrottle-snapshot/v5",
+  release: "openthrottle-snapshot/v6",
   generatedBy: "sandbox-runtime-build",
   protocol: STAGE_EXECUTOR_PROTOCOL,
   capabilities: Object.keys(CAPABILITY_CONTRACTS).sort(),
   executors: ["agent", "command", "loop_action", "provider_wait"],
   evaluators: ["command", "human", "provider", "publish_subject", "semantic"],
-  artifacts: ["command_result", "execution_graph_result", "human_approval", "provider_check", "publish_subject", "review", "stage_result"],
+  artifacts: ["candidate_evidence", "command_result", "execution_graph_result", "human_approval", "integration_evidence", "provider_check", "publish_subject", "review", "stage_result", "standard_receipt"],
   contextPolicies: ["fresh", "none", "prefer_resume", "resume_required"],
   credentialScopes: ["model.invoke", "provider.read", "repo.read", "repo.write"],
   adapters: {

@@ -5,7 +5,7 @@ import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "n
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { canonicalJson } from "./capabilities.mjs";
-import { digest, sanitizeArtifactText } from "./artifacts.mjs";
+import { digest, sanitizeArtifactText, validateStandardReceipt } from "./artifacts.mjs";
 import { computeWorkspaceTreeOid } from "./repository-control.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
 import { worktreePath } from "./worktrees.mjs";
@@ -14,9 +14,23 @@ export const LOOP_ACTION_PROTOCOL = "loop-action@1";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 const AGENTS = new Set(["claude", "codex", "opencode"]);
-const ROLES = new Set(["worker", "lead", "reviewer"]);
-const LOOPS = new Set(["implement", "simplify", "command", "repair", "lead", "review"]);
-const SKILLS = new Set(["implement-plan", "investigate", "ce-work", "ce-simplify-code", "ce-code-review"]);
+const ROLES = new Set(["worker", "lead", "reviewer", "publisher"]);
+const LOOPS = new Set(["implement", "simplify", "command", "repair", "lead", "review", "publish"]);
+const SKILLS = new Set([
+  "implement-plan",
+  "investigate",
+  "implement-unit",
+  "simplify-unit",
+  "repair-unit",
+  "accept-unit",
+  "final-review",
+  "final-repair",
+  "publish",
+  "ce-work",
+  "ce-simplify-code",
+  "ce-code-review",
+  "ce-commit-push-pr",
+]);
 const CONTEXTS = new Set(["fresh", "resume_required", "prefer_resume"]);
 
 function record(value, label) {
@@ -155,6 +169,57 @@ function defaultRunLoopAgent({ request, invocation }) {
   });
 }
 
+function receiptCandidatesFromJson(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  const candidates = [];
+  for (const key of ["receipt", "output", "content", "message"]) {
+    if (value[key] !== undefined) candidates.push(value[key]);
+  }
+  if (value.type === "result" && value.result !== undefined) candidates.push(value.result);
+  return candidates;
+}
+
+export function parseLoopReceipt(raw, env = process.env) {
+  const sanitized = sanitizeArtifactText(raw, env).trim();
+  if (!sanitized) throw new Error("loop action did not emit a receipt");
+  const candidates = [sanitized, ...sanitized.split("\n").map((line) => line.trim()).filter(Boolean).reverse()];
+  for (const candidate of candidates) {
+    try {
+      const parsed = typeof candidate === "string" ? JSON.parse(candidate) : candidate;
+      try {
+        return validateStandardReceipt(parsed, env);
+      } catch {
+        for (const nested of receiptCandidatesFromJson(parsed)) {
+          try {
+            const normalized = typeof nested === "string" ? JSON.parse(nested) : nested;
+            return validateStandardReceipt(normalized, env);
+          } catch {
+            // Try the next nested field.
+          }
+        }
+      }
+    } catch {
+      // Continue searching bounded agent output for the structured receipt.
+    }
+  }
+  throw new Error("loop action emitted invalid standard receipt");
+}
+
+function assertLoopReceiptFence(receipt, request, subject) {
+  if (receipt.fence.attempt_id !== request.attemptId || receipt.fence.request_hash !== request.requestHash) {
+    throw new Error("loop receipt request fence mismatch");
+  }
+  if (request.unitId !== null && receipt.fence.unit_id !== request.unitId) {
+    throw new Error("loop receipt unit fence mismatch");
+  }
+  if (subject !== null && receipt.subject.post !== subject) {
+    throw new Error("loop receipt subject fence mismatch");
+  }
+  if (receipt.producer.skill !== `builtin://${request.skill}@1`) {
+    throw new Error("loop receipt producer skill mismatch");
+  }
+}
+
 export function executeLoopAction({
   request: rawRequest,
   runLoopAgent = defaultRunLoopAgent,
@@ -168,9 +233,19 @@ export function executeLoopAction({
   } catch (error) {
     execution = { status: null, signal: null, timedOut: false, stdout: "", stderr: String(error), nativeSessionId: request.nativeSessionId };
   }
-  const failed = execution.timedOut || execution.signal || execution.status !== 0;
   const worktreeDir = loopWorktreeDirectory(request);
   const subject = worktreeDir ? computeWorkspaceTreeOid(worktreeDir) : null;
+  let parsedReceipt = null;
+  let receiptError = null;
+  if (!execution.timedOut && !execution.signal && execution.status === 0 && request.receiptSchema === "openthrottle.receipt/v1") {
+    try {
+      parsedReceipt = parseLoopReceipt(execution.stdout, process.env);
+      assertLoopReceiptFence(parsedReceipt, request, subject);
+    } catch (error) {
+      receiptError = error instanceof Error ? error.message : String(error);
+    }
+  }
+  const failed = execution.timedOut || execution.signal || execution.status !== 0 || Boolean(receiptError);
   return {
     version: 1,
     kind: "loop_action_result",
@@ -181,7 +256,9 @@ export function executeLoopAction({
     outcome: failed ? "failure" : "success",
     native_session_id: execution.nativeSessionId ?? request.nativeSessionId ?? null,
     subject,
-    receipt: sanitizeArtifactText(execution.stdout || execution.stderr || (failed ? "loop action failed" : "loop action completed")).slice(0, 128_000),
+    receipt: parsedReceipt
+      ? canonicalJson(parsedReceipt)
+      : sanitizeArtifactText(receiptError || execution.stdout || execution.stderr || (failed ? "loop action failed" : "loop action completed")).slice(0, 128_000),
     created_at: now(),
   };
 }
