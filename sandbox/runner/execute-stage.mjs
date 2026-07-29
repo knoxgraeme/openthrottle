@@ -401,6 +401,7 @@ export function classifyAgentExecutionFailure({ agent, termination, diagnostic, 
   if (isCodexModelCredentialExpired(agent, diagnostic)) {
     return {
       suggestedOutcome: "retryable_infrastructure_failure",
+      credentialFailure: true,
       summary:
         `Model credential expired - refresh CODEX_AUTH_JSON. Agent stage failed (${termination}).` +
         (diagnostic ? ` Executor diagnostic: ${diagnostic}` : ""),
@@ -408,11 +409,29 @@ export function classifyAgentExecutionFailure({ agent, termination, diagnostic, 
   }
   return {
     suggestedOutcome: terminated ? "retryable_infrastructure_failure" : "failure",
+    credentialFailure: false,
     summary:
       `${missingProposal ? "Agent exited without the required terminal stage proposal" : "Agent stage failed"} ` +
       `(${termination}).` +
       (diagnostic ? ` Executor diagnostic: ${diagnostic}` : ""),
   };
+}
+
+function classifyIncompleteAgentExecution({ execution, request, proposal, redactionEnv }) {
+  const terminated = execution.timedOut || execution.signal || execution.exitCode === 137;
+  const diagnostic = sanitizeArtifactText(execution.stderr ?? "", redactionEnv).trim().slice(-1_000);
+  const termination = [
+    `exit=${execution.exitCode ?? "none"}`,
+    execution.signal ? `signal=${execution.signal}` : null,
+    execution.timedOut ? "timed_out=true" : null,
+  ].filter(Boolean).join(", ");
+  return classifyAgentExecutionFailure({
+    agent: request.agent,
+    termination,
+    diagnostic,
+    terminated,
+    missingProposal: !proposal,
+  });
 }
 
 function reconcilePublication({ repoDir, request, gatedSubject, execution, proposal, redactionEnv }) {
@@ -628,7 +647,14 @@ export function executeStage({
     const gatedSubject = computeWorkspaceTreeOid(repoDir);
     let proposal = execution.proposal;
     let publishedCommit;
-    if (request.capability === "ce/publish@1") {
+    const incompleteAgentExecution = !execution.executorFailure &&
+      (execution.timedOut || execution.exitCode !== 0 || !proposal);
+    const classifiedFailure = incompleteAgentExecution
+      ? classifyIncompleteAgentExecution({ execution, request, proposal, redactionEnv })
+      : null;
+    if (request.capability === "ce/publish@1" && classifiedFailure?.credentialFailure) {
+      proposal = failureProposal(classifiedFailure.summary, classifiedFailure.suggestedOutcome);
+    } else if (request.capability === "ce/publish@1") {
       ({ proposal, publishedCommit } = reconcilePublication({
         repoDir,
         request,
@@ -637,22 +663,8 @@ export function executeStage({
         proposal,
         redactionEnv,
       }));
-    } else if (!execution.executorFailure && (execution.timedOut || execution.exitCode !== 0 || !proposal)) {
-      const terminated = execution.timedOut || execution.signal || execution.exitCode === 137;
-      const diagnostic = sanitizeArtifactText(execution.stderr ?? "", redactionEnv).trim().slice(-1_000);
-      const termination = [
-        `exit=${execution.exitCode ?? "none"}`,
-        execution.signal ? `signal=${execution.signal}` : null,
-        execution.timedOut ? "timed_out=true" : null,
-      ].filter(Boolean).join(", ");
-      const classified = classifyAgentExecutionFailure({
-        agent: request.agent,
-        termination,
-        diagnostic,
-        terminated,
-        missingProposal: !proposal,
-      });
-      proposal = failureProposal(classified.summary, classified.suggestedOutcome);
+    } else if (classifiedFailure) {
+      proposal = failureProposal(classifiedFailure.summary, classifiedFailure.suggestedOutcome);
     }
     const completedAt = now();
     const fence = {
