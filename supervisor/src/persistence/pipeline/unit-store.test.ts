@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
+import { digestNormalized } from "../../pipeline/manifest.js";
 import { openDb } from "../database.js";
 import { createExecutionUnitStore } from "./unit-store.js";
 
@@ -251,5 +252,205 @@ describe("execution unit store", () => {
       artifactHash: "hash-2",
       integrationSubject: "222",
     })).toThrow(/different aggregate/);
+    expect(store.stopActiveWork({
+      parentAttemptId: "attempt-parent",
+      reason: "superseded",
+    })).toBe("already_stopped");
+  });
+
+  it("records child gate receipts idempotently and rejects conflicting replay", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+    });
+    const action = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: timestamp,
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })!;
+
+    const payload = "{\"ok\":true}";
+    const receipt = {
+      actionId: action.id,
+      gateKind: "unit_acceptance" as const,
+      evaluatorKind: "semantic" as const,
+      subject: "1".repeat(40),
+      result: "passed" as const,
+      outcome: "success" as const,
+      reason: "typed_semantic_result",
+      artifactHashes: ["a".repeat(64)],
+      payload,
+      hash: digestNormalized(payload),
+    };
+
+    expect(store.recordGateReceipt(receipt)).toBe("recorded");
+    expect(store.recordGateReceipt(receipt)).toBe("already_recorded");
+    const conflictingPayload = "{\"ok\":false}";
+    expect(() => store.recordGateReceipt({
+      ...receipt,
+      payload: conflictingPayload,
+      hash: digestNormalized(conflictingPayload),
+    }))
+      .toThrow(/already recorded a different gate receipt/);
+    expect(store.listGateReceipts("attempt-parent")).toEqual([
+      expect.objectContaining({
+        gate_kind: "unit_acceptance",
+        unit_id: "a",
+        result: "passed",
+        outcome: "success",
+      }),
+    ]);
+  });
+
+  it("appends downstream context immutably for pending units only", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b", dependencies: ["a"] }],
+    });
+    const action = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: timestamp,
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })!;
+    expect(() => store.appendDownstreamContext({
+      parentAttemptId: "attempt-parent",
+      fromUnitId: "a",
+      records: [{ toUnitId: "b", payload: { summary: "not sealed yet" } }],
+    })).toThrow(/source a is not integrated/);
+    store.completeUnitAction({
+      actionId: action.id,
+      resultHash: "result-hash",
+      outputSubject: "1".repeat(40),
+    });
+
+    const records = store.appendDownstreamContext({
+      parentAttemptId: "attempt-parent",
+      fromUnitId: "a",
+      records: [{ toUnitId: "b", payload: { summary: "use parser shape from unit a" } }],
+    });
+
+    expect(records).toEqual([
+      expect.objectContaining({
+        from_unit_id: "a",
+        to_unit_id: "b",
+        payload: "{\"summary\":\"use parser shape from unit a\"}",
+      }),
+    ]);
+    expect(store.listDownstreamContext("attempt-parent", "b")).toEqual(records);
+    expect(() => store.appendDownstreamContext({
+      parentAttemptId: "attempt-parent",
+      fromUnitId: "a",
+      records: [{ toUnitId: "missing", payload: { summary: "not in graph" } }],
+    })).toThrow(/unknown downstream context target/);
+    expect(() => store.appendDownstreamContext({
+      parentAttemptId: "attempt-parent",
+      fromUnitId: "a",
+      records: [{ toUnitId: "a", payload: { summary: "already integrated" } }],
+    })).toThrow(/is not pending/);
+  });
+
+  it("stops active unit work without deleting child graph state", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b" }],
+    });
+    const action = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: timestamp,
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })!;
+
+    expect(store.stopActiveWork({
+      parentAttemptId: "attempt-parent",
+      reason: "needs_human",
+    })).toBe("stopped");
+    expect(store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-2",
+      nowIso: timestamp,
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })).toBeUndefined();
+    expect(store.stopActiveWork({
+      parentAttemptId: "attempt-parent",
+      reason: "needs_human",
+    })).toBe("already_stopped");
+    const payload = "{\"ok\":true}";
+    expect(() => store.recordGateReceipt({
+      actionId: action.id,
+      gateKind: "unit_acceptance",
+      evaluatorKind: "semantic",
+      subject: "1".repeat(40),
+      result: "passed",
+      outcome: "success",
+      reason: "typed_semantic_result",
+      artifactHashes: ["a".repeat(64)],
+      payload,
+      hash: digestNormalized(payload),
+    })).toThrow(/is not receivable/);
+    expect(store.listUnits("attempt-parent")).toEqual([
+      expect.objectContaining({ unitId: "a", status: "pending", activeActionId: null }),
+      expect.objectContaining({ unitId: "b", status: "pending", activeActionId: null }),
+    ]);
+    expect(db!.prepare("SELECT status, last_error FROM execution_work_attempts WHERE id = ?").get(action.id)).toEqual({
+      status: "dead",
+      last_error: "needs_human",
+    });
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({
+      parent_attempt_id: "attempt-parent",
+      stopped_at: timestamp,
+      stop_reason: "needs_human",
+    });
+  });
+
+  it("records a graph stop fence before any child action is active", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+    });
+
+    expect(store.stopActiveWork({
+      parentAttemptId: "attempt-parent",
+      reason: "superseded",
+    })).toBe("stopped");
+    expect(store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: timestamp,
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })).toBeUndefined();
+    expect(store.listUnits("attempt-parent")).toEqual([
+      expect.objectContaining({ unitId: "a", status: "pending", activeActionId: null }),
+    ]);
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({
+      stopped_at: timestamp,
+      stop_reason: "superseded",
+    });
   });
 });

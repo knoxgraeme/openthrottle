@@ -958,6 +958,80 @@ binding-contract:parent attempt and run fences live on execution_units and execu
 lease-contract:one active child action per parent attempt is enforced transactionally/v1
 aggregate-contract:one execution_graph_result hash settles the parent composite stage once/v1`;
 
+const executionGraphStopFenceSchema = `
+ALTER TABLE execution_graphs ADD COLUMN stopped_at TEXT;
+ALTER TABLE execution_graphs ADD COLUMN stop_reason TEXT;
+`;
+
+const executionChildGateSchema = `
+CREATE TABLE IF NOT EXISTS execution_gate_receipts (
+  id TEXT PRIMARY KEY,
+  execution_graph_id TEXT NOT NULL,
+  execution_unit_id TEXT NOT NULL,
+  execution_work_attempt_id TEXT NOT NULL,
+  parent_attempt_id TEXT NOT NULL,
+  unit_id TEXT NOT NULL,
+  gate_kind TEXT NOT NULL CHECK(gate_kind IN (
+    'unit_completion', 'unit_command', 'unit_acceptance', 'final_semantic'
+  )),
+  evaluator_kind TEXT NOT NULL CHECK(evaluator_kind IN ('semantic', 'command', 'human', 'publish_subject')),
+  subject TEXT,
+  result TEXT NOT NULL CHECK(result IN ('passed', 'failed', 'indeterminate', 'not_configured')),
+  outcome TEXT NOT NULL CHECK(outcome IN (
+    'success', 'no_change', 'semantic_repair_required', 'retryable_infrastructure_failure',
+    'needs_human', 'canceled', 'superseded', 'failure'
+  )),
+  reason TEXT NOT NULL,
+  artifact_hashes TEXT NOT NULL CHECK(json_valid(artifact_hashes)),
+  payload TEXT NOT NULL CHECK(json_valid(payload)),
+  receipt_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(execution_graph_id) REFERENCES execution_graphs(id) ON DELETE RESTRICT,
+  FOREIGN KEY(execution_unit_id) REFERENCES execution_units(id) ON DELETE RESTRICT,
+  FOREIGN KEY(execution_work_attempt_id) REFERENCES execution_work_attempts(id) ON DELETE RESTRICT,
+  FOREIGN KEY(parent_attempt_id) REFERENCES pipeline_stage_attempts(id) ON DELETE RESTRICT,
+  UNIQUE(execution_work_attempt_id, gate_kind)
+);
+CREATE INDEX IF NOT EXISTS execution_gate_receipts_parent_idx
+  ON execution_gate_receipts(parent_attempt_id, unit_id, created_at);
+
+CREATE TABLE IF NOT EXISTS execution_downstream_context (
+  id TEXT PRIMARY KEY,
+  execution_graph_id TEXT NOT NULL,
+  pipeline_instance_id TEXT NOT NULL,
+  parent_attempt_id TEXT NOT NULL,
+  from_execution_unit_id TEXT NOT NULL,
+  to_execution_unit_id TEXT NOT NULL,
+  from_unit_id TEXT NOT NULL,
+  to_unit_id TEXT NOT NULL,
+  payload TEXT NOT NULL CHECK(json_valid(payload)),
+  payload_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(execution_graph_id) REFERENCES execution_graphs(id) ON DELETE RESTRICT,
+  FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
+  FOREIGN KEY(parent_attempt_id) REFERENCES pipeline_stage_attempts(id) ON DELETE RESTRICT,
+  FOREIGN KEY(from_execution_unit_id) REFERENCES execution_units(id) ON DELETE RESTRICT,
+  FOREIGN KEY(to_execution_unit_id) REFERENCES execution_units(id) ON DELETE RESTRICT,
+  UNIQUE(parent_attempt_id, from_unit_id, to_unit_id, payload_hash)
+);
+CREATE INDEX IF NOT EXISTS execution_downstream_context_target_idx
+  ON execution_downstream_context(parent_attempt_id, to_unit_id, created_at);
+`;
+
+const executionChildGateMigrationSource = `${executionGraphStopFenceSchema}
+${executionChildGateSchema}
+child-gate-contract:deterministic gate receipts and downstream context live on child execution records/v1
+stop-contract:stopped child graphs remain durable and are not eligible for redispatch/v1`;
+
+function addExecutionGraphStopFence(db: Database.Database): void {
+  if (!hasColumns(db, "execution_graphs", ["stopped_at"])) {
+    db.exec("ALTER TABLE execution_graphs ADD COLUMN stopped_at TEXT");
+  }
+  if (!hasColumns(db, "execution_graphs", ["stop_reason"])) {
+    db.exec("ALTER TABLE execution_graphs ADD COLUMN stop_reason TEXT");
+  }
+}
+
 function widenPipelineArtifactKindsForExecutionGraphResult(db: Database.Database): void {
   if (!hasTable(db, "pipeline_artifacts")) return;
   const table = db.prepare(`
@@ -1362,6 +1436,15 @@ const definitions: DatabaseMigrationDefinition[] = [
     up(db) {
       if (!hasTable(db, "execution_graphs")) db.exec(executionUnitSchema);
       widenPipelineArtifactKindsForExecutionGraphResult(db);
+    },
+  },
+  {
+    version: 17,
+    name: "execution-child-gates-and-context",
+    source: executionChildGateMigrationSource,
+    up(db) {
+      addExecutionGraphStopFence(db);
+      db.exec(executionChildGateSchema);
     },
   },
 ];

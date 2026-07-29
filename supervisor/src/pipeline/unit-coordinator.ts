@@ -1,4 +1,5 @@
 import {
+  STAGE_OUTCOMES,
   canonicalJson,
   digestNormalized,
   type AssuranceClass,
@@ -7,6 +8,11 @@ import {
   type StageOutcome,
 } from "./manifest.js";
 import type { PipelineCoordinatorEvent, PipelineEventArtifact } from "./coordinator.js";
+import {
+  commandDecisionForEvidence,
+  semanticDecisionForEvidence,
+  type GateResult,
+} from "./gates.js";
 import type { PipelineInstance, PipelineStageAttempt } from "./store.js";
 
 export interface ExecutionPlanUnit {
@@ -38,6 +44,93 @@ export type UnitBudgetDecision =
   | { allowed: true }
   | { allowed: false; exhausted: "repair_rounds" | "reentries" | "attempts"; terminal: "failed" | "needs_human"; reason: string };
 
+type ArtifactResult = StageOutcome | "not_configured";
+type ChildGateKind = "unit_completion" | "unit_command" | "unit_acceptance" | "final_semantic";
+export type ChildGateEvaluatorKind = "semantic" | "command" | "human" | "publish_subject";
+const SHA256 = /^[a-f0-9]{64}$/;
+const GIT_SUBJECT = /^[a-f0-9]{40,64}$/;
+const FINDING_SEVERITIES = new Set(["P0", "P1", "P2", "P3"]);
+
+export interface ChildGateEvidence {
+  schema: "openthrottle.child-gate-evidence/v1";
+  producer: {
+    capability: string;
+    runtime_release: string;
+    capability_digest: string;
+    version: number;
+  };
+  pipeline: { instance_id: string; manifest_digest: string };
+  parent: { attempt_id: string; run_id: string; request_hash: string };
+  unit: { id: string; action_id: string };
+  run: { generation: number; native_session_id: string | null };
+  repository: {
+    subject: string;
+    pre_subject: string;
+    post_subject: string;
+  };
+  result: ArtifactResult;
+  findings: Array<{ severity: string }>;
+  command?: {
+    not_configured: boolean;
+    timed_out: boolean;
+    exit_code: number | null;
+    signal: string | null;
+  };
+  artifact_hashes: string[];
+  completed_at: string;
+}
+
+export interface ChildGateFence {
+  pipelineInstanceId: string;
+  manifestDigest: string;
+  parentAttemptId: string;
+  parentRunId: string;
+  requestHash: string;
+  unitId: string;
+  actionId: string;
+  producerCapability: string;
+  runtimeRelease: string;
+  capabilityDigest: string;
+  generation: number;
+  inputSubject: string;
+  currentSubject: string;
+  nativeSessionId?: string | null;
+}
+
+export interface ChildGateDecision {
+  gateKind: ChildGateKind;
+  evaluatorKind: ChildGateEvaluatorKind;
+  subject: string;
+  result: GateResult;
+  outcome: StageOutcome;
+  reason: string;
+  artifactHashes: string[];
+  payload: string;
+  hash: string;
+}
+
+export interface DownstreamContextRecordInput {
+  toUnitId: string;
+  payload: Record<string, unknown>;
+}
+
+export type DownstreamContextDecision =
+  | {
+      outcome: "success";
+      reason: "accepted_downstream_context";
+      records: Array<DownstreamContextRecordInput & { fromUnitId: string; payloadHash: string }>;
+    }
+  | {
+      outcome: "needs_human";
+      reason:
+        | "topology_change_rejected"
+        | "downstream_context_source_unknown"
+        | "downstream_context_source_not_integrated"
+        | "downstream_context_target_unknown"
+        | "downstream_context_target_not_pending";
+      records: [];
+    };
+
 export function selectNextReadyUnit(units: readonly ExecutionUnitState[]): ExecutionUnitState | undefined {
   if (units.some((unit) => unit.activeActionId || unit.status === "running")) return undefined;
   const completed = new Set(
@@ -53,6 +146,142 @@ export function selectNextReadyUnit(units: readonly ExecutionUnitState[]): Execu
     }
   }
   return ready;
+}
+
+function assertChildGateFence(evidence: ChildGateEvidence, expected: ChildGateFence): void {
+  if (evidence.schema !== "openthrottle.child-gate-evidence/v1") throw new Error("child gate evidence schema mismatch");
+  if (![...STAGE_OUTCOMES, "not_configured"].includes(evidence.result)) {
+    throw new Error("child gate evidence result is invalid");
+  }
+  if (!Array.isArray(evidence.findings) || evidence.findings.length > 50 ||
+      evidence.findings.some((finding) => !finding || typeof finding !== "object" || !FINDING_SEVERITIES.has(finding.severity))) {
+    throw new Error("child gate evidence findings are invalid");
+  }
+  if (!Array.isArray(evidence.artifact_hashes) || evidence.artifact_hashes.some((hash) => !SHA256.test(hash))) {
+    throw new Error("child gate evidence artifact hashes are invalid");
+  }
+  if (!GIT_SUBJECT.test(evidence.repository.subject) ||
+      !GIT_SUBJECT.test(evidence.repository.pre_subject) ||
+      !GIT_SUBJECT.test(evidence.repository.post_subject)) {
+    throw new Error("child gate evidence repository subject is invalid");
+  }
+  if (
+    evidence.producer.capability !== expected.producerCapability ||
+    evidence.producer.runtime_release !== expected.runtimeRelease ||
+    evidence.producer.capability_digest !== expected.capabilityDigest ||
+    evidence.producer.version !== 1 ||
+    evidence.pipeline.instance_id !== expected.pipelineInstanceId ||
+    evidence.pipeline.manifest_digest !== expected.manifestDigest ||
+    evidence.parent.attempt_id !== expected.parentAttemptId ||
+    evidence.parent.run_id !== expected.parentRunId ||
+    evidence.unit.id !== expected.unitId ||
+    evidence.unit.action_id !== expected.actionId ||
+    evidence.run.generation !== expected.generation ||
+    evidence.run.native_session_id !== (expected.nativeSessionId ?? null)
+  ) throw new Error("child gate evidence producer fence mismatch");
+  if (evidence.parent.request_hash !== expected.requestHash) {
+    throw new Error("child gate evidence freshness fence mismatch");
+  }
+  if (
+    evidence.repository.pre_subject !== expected.inputSubject ||
+    evidence.repository.subject !== expected.currentSubject ||
+    evidence.repository.post_subject !== expected.currentSubject
+  ) throw new Error("child gate evidence subject fence mismatch");
+  if (Number.isNaN(Date.parse(evidence.completed_at))) throw new Error("child gate evidence completed_at is invalid");
+}
+
+export function decideChildGate(input: {
+  gateKind: ChildGateKind;
+  evaluatorKind: ChildGateEvaluatorKind;
+  expected: ChildGateFence;
+  evidence: ChildGateEvidence;
+}): ChildGateDecision {
+  assertChildGateFence(input.evidence, input.expected);
+  if (input.evaluatorKind === "command" && !input.evidence.command) {
+    throw new Error("child command gate is missing command evidence");
+  }
+  if (input.evaluatorKind !== "command" && input.evaluatorKind !== "semantic") {
+    throw new Error(`child gate evaluator ${input.evaluatorKind} is not supported`);
+  }
+  if (input.evaluatorKind === "command") {
+    const command = input.evidence.command!;
+    if (
+      typeof command.not_configured !== "boolean" ||
+      typeof command.timed_out !== "boolean" ||
+      (command.exit_code !== null && !Number.isInteger(command.exit_code)) ||
+      (command.signal !== null && typeof command.signal !== "string")
+    ) throw new Error("child command gate has invalid command evidence");
+  }
+  const decision = input.evaluatorKind === "command"
+    ? commandDecisionForEvidence(input.evidence.command!)
+    : semanticDecisionForEvidence({
+        result: input.evidence.result,
+        findings: input.evidence.findings,
+        repository: input.evidence.repository,
+      });
+  const artifactHashes = [...input.evidence.artifact_hashes].sort();
+  const payload = canonicalJson({
+    schema: "openthrottle.child-gate-receipt/v1",
+    parent_attempt_id: input.expected.parentAttemptId,
+    parent_run_id: input.expected.parentRunId,
+    request_hash: input.expected.requestHash,
+    unit_id: input.expected.unitId,
+    action_id: input.expected.actionId,
+    gate_kind: input.gateKind,
+    evaluator_kind: input.evaluatorKind,
+    input_subject: input.expected.inputSubject,
+    subject: input.expected.currentSubject,
+    proposed_result: input.evidence.result,
+    decision: decision.result,
+    outcome: decision.outcome,
+    reason: decision.reason,
+    artifact_hashes: artifactHashes,
+  });
+  return {
+    gateKind: input.gateKind,
+    evaluatorKind: input.evaluatorKind,
+    subject: input.expected.currentSubject,
+    result: decision.result,
+    outcome: decision.outcome,
+    reason: decision.reason,
+    artifactHashes,
+    payload,
+    hash: digestNormalized(payload),
+  };
+}
+
+export function decideDownstreamContext(input: {
+  units: readonly ExecutionUnitState[];
+  fromUnitId: string;
+  records: readonly DownstreamContextRecordInput[];
+  topologyChange?: { kind: string; summary: string };
+}): DownstreamContextDecision {
+  if (input.topologyChange) return { outcome: "needs_human", reason: "topology_change_rejected", records: [] };
+  const unitById = new Map(input.units.map((unit) => [unit.unitId, unit]));
+  const source = unitById.get(input.fromUnitId);
+  if (!source) {
+    return { outcome: "needs_human", reason: "downstream_context_source_unknown", records: [] };
+  }
+  if (source.status !== "integrated" && source.status !== "completed") {
+    return { outcome: "needs_human", reason: "downstream_context_source_not_integrated", records: [] };
+  }
+  for (const record of input.records) {
+    const target = unitById.get(record.toUnitId);
+    if (!target) return { outcome: "needs_human", reason: "downstream_context_target_unknown", records: [] };
+    if (target.status !== "pending") {
+      return { outcome: "needs_human", reason: "downstream_context_target_not_pending", records: [] };
+    }
+  }
+  return {
+    outcome: "success",
+    reason: "accepted_downstream_context",
+    records: input.records.map((record) => ({
+      fromUnitId: input.fromUnitId,
+      toUnitId: record.toUnitId,
+      payload: record.payload,
+      payloadHash: digestNormalized(canonicalJson(record.payload)),
+    })),
+  };
 }
 
 export function unitBudgetDecision(input: UnitBudgetState): UnitBudgetDecision {

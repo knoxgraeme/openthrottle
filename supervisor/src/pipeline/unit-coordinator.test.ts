@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { canonicalJson, digestNormalized, type PipelineManifest } from "./manifest.js";
-import { buildAggregateStageEvent, selectNextReadyUnit, unitBudgetDecision, type ExecutionUnitState } from "./unit-coordinator.js";
+import {
+  buildAggregateStageEvent,
+  decideChildGate,
+  decideDownstreamContext,
+  selectNextReadyUnit,
+  unitBudgetDecision,
+  type ChildGateEvidence,
+  type ExecutionUnitState,
+} from "./unit-coordinator.js";
 import type { PipelineInstance, PipelineStageAttempt } from "./store.js";
 
 function unit(overrides: Partial<ExecutionUnitState> & { unitId: string; ordinal: number }): ExecutionUnitState {
@@ -49,6 +57,145 @@ describe("unit coordinator", () => {
       manifestMaxAttempts: 2,
       instanceAttemptCount: 2,
     })).toMatchObject({ allowed: false, exhausted: "attempts" });
+  });
+
+  it("deterministically validates child semantic receipts against producer, subject, and freshness fences", () => {
+    const evidence = childGateEvidence({
+      result: "no_change",
+      repository: {
+        subject: "2".repeat(40),
+        pre_subject: "1".repeat(40),
+        post_subject: "2".repeat(40),
+      },
+    });
+
+    expect(decideChildGate({
+      gateKind: "unit_acceptance",
+      evaluatorKind: "semantic",
+      expected: childGateFence({ inputSubject: "1".repeat(40), currentSubject: "2".repeat(40) }),
+      evidence,
+    })).toMatchObject({
+      outcome: "success",
+      result: "passed",
+      reason: "no_change_contradicted_by_tree_delta",
+    });
+
+    expect(() => decideChildGate({
+      gateKind: "unit_acceptance",
+      evaluatorKind: "semantic",
+      expected: childGateFence({ producerCapability: "graph/for-each-unit@1" }),
+      evidence,
+    })).toThrow(/producer fence mismatch/);
+    expect(() => decideChildGate({
+      gateKind: "unit_acceptance",
+      evaluatorKind: "semantic",
+      expected: childGateFence({ inputSubject: "3".repeat(40), currentSubject: "2".repeat(40) }),
+      evidence,
+    })).toThrow(/subject fence mismatch/);
+    expect(() => decideChildGate({
+      gateKind: "unit_acceptance",
+      evaluatorKind: "semantic",
+      expected: childGateFence({ currentSubject: "3".repeat(40) }),
+      evidence,
+    })).toThrow(/subject fence mismatch/);
+    expect(() => decideChildGate({
+      gateKind: "unit_acceptance",
+      evaluatorKind: "semantic",
+      expected: childGateFence({ requestHash: "0".repeat(64) }),
+      evidence,
+    })).toThrow(/freshness fence mismatch/);
+    expect(() => decideChildGate({
+      gateKind: "unit_acceptance",
+      evaluatorKind: "semantic",
+      expected: childGateFence({ currentSubject: "2".repeat(40) }),
+      evidence: childGateEvidence({ findings: [{ severity: "P4" }] }),
+    })).toThrow(/findings are invalid/);
+    expect(() => decideChildGate({
+      gateKind: "unit_acceptance",
+      evaluatorKind: "semantic",
+      expected: childGateFence({ currentSubject: "2".repeat(40) }),
+      evidence: childGateEvidence({ artifact_hashes: ["not-a-sha"] }),
+    })).toThrow(/artifact hashes are invalid/);
+    expect(() => decideChildGate({
+      gateKind: "unit_acceptance",
+      evaluatorKind: "human",
+      expected: childGateFence({ inputSubject: "1".repeat(40), currentSubject: "2".repeat(40) }),
+      evidence,
+    })).toThrow(/evaluator human is not supported/);
+  });
+
+  it("maps child command receipts through the command gate contract", () => {
+    expect(decideChildGate({
+      gateKind: "unit_command",
+      evaluatorKind: "command",
+      expected: childGateFence({}),
+      evidence: childGateEvidence({
+        result: "success",
+        command: { not_configured: true, timed_out: false, exit_code: null, signal: null },
+      }),
+    })).toMatchObject({
+      outcome: "no_change",
+      result: "not_configured",
+      reason: "command_not_configured",
+    });
+    expect(decideChildGate({
+      gateKind: "unit_command",
+      evaluatorKind: "command",
+      expected: childGateFence({}),
+      evidence: childGateEvidence({
+        result: "failure",
+        command: { not_configured: false, timed_out: false, exit_code: 1, signal: null },
+      }),
+    })).toMatchObject({
+      outcome: "failure",
+      result: "failed",
+      reason: "command_exit_nonzero",
+    });
+  });
+
+  it("accepts immutable downstream context only for existing pending units", () => {
+    const units = [
+      unit({ unitId: "done", ordinal: 0, status: "integrated" }),
+      unit({ unitId: "next", ordinal: 1 }),
+      unit({ unitId: "later", ordinal: 2, dependencies: ["next"] }),
+    ];
+
+    expect(decideDownstreamContext({
+      units,
+      fromUnitId: "done",
+      records: [
+        { toUnitId: "next", payload: { note: "carry this exact decision" } },
+        { toUnitId: "later", payload: { note: "same graph only" } },
+      ],
+    })).toMatchObject({
+      outcome: "success",
+      reason: "accepted_downstream_context",
+    });
+    expect(decideDownstreamContext({
+      units,
+      fromUnitId: "done",
+      records: [{ toUnitId: "done", payload: { note: "too late" } }],
+    })).toMatchObject({
+      outcome: "needs_human",
+      reason: "downstream_context_target_not_pending",
+    });
+    expect(decideDownstreamContext({
+      units,
+      fromUnitId: "done",
+      records: [],
+      topologyChange: { kind: "split", summary: "split next" },
+    })).toMatchObject({
+      outcome: "needs_human",
+      reason: "topology_change_rejected",
+    });
+    expect(decideDownstreamContext({
+      units,
+      fromUnitId: "next",
+      records: [{ toUnitId: "later", payload: { note: "not sealed yet" } }],
+    })).toMatchObject({
+      outcome: "needs_human",
+      reason: "downstream_context_source_not_integrated",
+    });
   });
 
   it("builds one aggregate event that can settle the parent through the stage-result path", () => {
@@ -167,3 +314,49 @@ describe("unit coordinator", () => {
     })).toThrow(/requires a parent run binding/);
   });
 });
+
+function childGateFence(overrides: Partial<Parameters<typeof decideChildGate>[0]["expected"]>): Parameters<typeof decideChildGate>[0]["expected"] {
+  return {
+    pipelineInstanceId: "instance-1",
+    manifestDigest: "a".repeat(64),
+    parentAttemptId: "attempt-parent",
+    parentRunId: "run-parent",
+    requestHash: "b".repeat(64),
+    unitId: "unit-a",
+    actionId: "action-a",
+    producerCapability: "unit/implement@1",
+    runtimeRelease: "runtime/v1",
+    capabilityDigest: "c".repeat(64),
+    generation: 1,
+    inputSubject: "2".repeat(40),
+    currentSubject: "2".repeat(40),
+    nativeSessionId: "native-1",
+    ...overrides,
+  };
+}
+
+function childGateEvidence(overrides: Partial<ChildGateEvidence>): ChildGateEvidence {
+  return {
+    schema: "openthrottle.child-gate-evidence/v1",
+    producer: {
+      capability: "unit/implement@1",
+      runtime_release: "runtime/v1",
+      capability_digest: "c".repeat(64),
+      version: 1,
+    },
+    pipeline: { instance_id: "instance-1", manifest_digest: "a".repeat(64) },
+    parent: { attempt_id: "attempt-parent", run_id: "run-parent", request_hash: "b".repeat(64) },
+    unit: { id: "unit-a", action_id: "action-a" },
+    run: { generation: 1, native_session_id: "native-1" },
+    repository: {
+      subject: "2".repeat(40),
+      pre_subject: "2".repeat(40),
+      post_subject: "2".repeat(40),
+    },
+    result: "success",
+    findings: [],
+    artifact_hashes: ["d".repeat(64)],
+    completed_at: "2026-07-29T00:00:00.000Z",
+    ...overrides,
+  };
+}

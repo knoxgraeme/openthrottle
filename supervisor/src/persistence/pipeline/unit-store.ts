@@ -1,7 +1,10 @@
 import type Database from "better-sqlite3";
-import { canonicalJson } from "../../pipeline/manifest.js";
+import { canonicalJson, digestNormalized, type StageOutcome } from "../../pipeline/manifest.js";
 import {
+  decideDownstreamContext,
   selectNextReadyUnit,
+  type ChildGateDecision,
+  type ChildGateEvaluatorKind,
   type ExecutionPlanUnit,
   type ExecutionUnitState,
 } from "../../pipeline/unit-coordinator.js";
@@ -18,6 +21,8 @@ export interface ExecutionUnitGraph {
   integration_subject: string | null;
   aggregate_artifact_hash: string | null;
   aggregate_emitted_at: string | null;
+  stopped_at: string | null;
+  stop_reason: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -45,6 +50,39 @@ export interface ExecutionWorkAttempt {
   updated_at: string;
   completed_at: string | null;
   last_error: string | null;
+}
+
+export interface ExecutionGateReceipt {
+  id: string;
+  execution_graph_id: string;
+  execution_unit_id: string;
+  execution_work_attempt_id: string;
+  parent_attempt_id: string;
+  unit_id: string;
+  gate_kind: ChildGateDecision["gateKind"];
+  evaluator_kind: ChildGateEvaluatorKind;
+  subject: string | null;
+  result: ChildGateDecision["result"];
+  outcome: StageOutcome;
+  reason: string;
+  artifact_hashes: string;
+  payload: string;
+  receipt_hash: string;
+  created_at: string;
+}
+
+export interface ExecutionDownstreamContext {
+  id: string;
+  execution_graph_id: string;
+  pipeline_instance_id: string;
+  parent_attempt_id: string;
+  from_execution_unit_id: string;
+  to_execution_unit_id: string;
+  from_unit_id: string;
+  to_unit_id: string;
+  payload: string;
+  payload_hash: string;
+  created_at: string;
 }
 
 export interface ExecutionUnitStore {
@@ -77,6 +115,29 @@ export interface ExecutionUnitStore {
     artifactHash: string;
     integrationSubject: string | null;
   }): "emitted" | "already_emitted";
+  recordGateReceipt(input: {
+    actionId: string;
+    gateKind: ChildGateDecision["gateKind"];
+    evaluatorKind: ChildGateEvaluatorKind;
+    subject: string | null;
+    result: ChildGateDecision["result"];
+    outcome: StageOutcome;
+    reason: string;
+    artifactHashes: readonly string[];
+    payload: string;
+    hash: string;
+  }): "recorded" | "already_recorded";
+  listGateReceipts(parentAttemptId: string): ExecutionGateReceipt[];
+  appendDownstreamContext(input: {
+    parentAttemptId: string;
+    fromUnitId: string;
+    records: readonly { toUnitId: string; payload: Record<string, unknown> }[];
+  }): ExecutionDownstreamContext[];
+  listDownstreamContext(parentAttemptId: string, toUnitId?: string): ExecutionDownstreamContext[];
+  stopActiveWork(input: {
+    parentAttemptId: string;
+    reason: string;
+  }): "stopped" | "already_stopped";
 }
 
 type ExecutionUnitRow = {
@@ -192,7 +253,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     input: Parameters<ExecutionUnitStore["leaseNextUnitAction"]>[0]
   ): ExecutionWorkAttempt | undefined => {
     const graph = graphStmt.get(input.parentAttemptId) as ExecutionUnitGraph | undefined;
-    if (!graph || graph.aggregate_emitted_at) return undefined;
+    if (!graph || graph.aggregate_emitted_at || graph.stopped_at) return undefined;
     db.prepare(`
       UPDATE execution_units
       SET status = 'pending', active_work_attempt_id = NULL, updated_at = ?
@@ -328,6 +389,151 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     return "emitted";
   });
 
+  const recordGateReceipt = db.transaction((
+    input: Parameters<ExecutionUnitStore["recordGateReceipt"]>[0]
+  ): "recorded" | "already_recorded" => {
+    if (digestNormalized(input.payload) !== input.hash) throw new Error("execution gate receipt hash mismatch");
+    const action = db.prepare("SELECT * FROM execution_work_attempts WHERE id = ?")
+      .get(input.actionId) as ExecutionWorkAttempt | undefined;
+    if (!action) throw new Error(`unknown execution work attempt ${input.actionId}`);
+    const existing = db.prepare(`
+      SELECT * FROM execution_gate_receipts
+      WHERE execution_work_attempt_id = ? AND gate_kind = ?
+    `).get(input.actionId, input.gateKind) as ExecutionGateReceipt | undefined;
+    if (existing) {
+      if (
+        existing.evaluator_kind !== input.evaluatorKind ||
+        existing.subject !== input.subject ||
+        existing.result !== input.result ||
+        existing.outcome !== input.outcome ||
+        existing.reason !== input.reason ||
+        existing.artifact_hashes !== canonicalJson([...input.artifactHashes].sort()) ||
+        existing.payload !== input.payload ||
+        existing.receipt_hash !== input.hash
+      ) throw new Error(`execution work attempt ${input.actionId} already recorded a different gate receipt`);
+      return "already_recorded";
+    }
+    if (!["leased", "dispatched", "running", "completed"].includes(action.status)) {
+      throw new Error(`execution work attempt ${input.actionId} is not receivable`);
+    }
+    const timestamp = now();
+    db.prepare(`
+      INSERT INTO execution_gate_receipts (
+        id, execution_graph_id, execution_unit_id, execution_work_attempt_id,
+        parent_attempt_id, unit_id, gate_kind, evaluator_kind, subject, result,
+        outcome, reason, artifact_hashes, payload, receipt_hash, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      deterministicId("execution-gate", [action.id, input.gateKind]),
+      action.execution_graph_id,
+      action.execution_unit_id,
+      action.id,
+      action.parent_attempt_id,
+      action.unit_id,
+      input.gateKind,
+      input.evaluatorKind,
+      input.subject,
+      input.result,
+      input.outcome,
+      input.reason,
+      canonicalJson([...input.artifactHashes].sort()),
+      input.payload,
+      input.hash,
+      timestamp
+    );
+    return "recorded";
+  });
+
+  const appendDownstreamContext = db.transaction((
+    input: Parameters<ExecutionUnitStore["appendDownstreamContext"]>[0]
+  ): ExecutionDownstreamContext[] => {
+    const graph = graphStmt.get(input.parentAttemptId) as ExecutionUnitGraph | undefined;
+    if (!graph) throw new Error(`execution graph for parent attempt ${input.parentAttemptId} is missing`);
+    const rows = listUnitRows(input.parentAttemptId);
+    const decision = decideDownstreamContext({
+      units: rows.map(unitState),
+      fromUnitId: input.fromUnitId,
+      records: input.records,
+    });
+    if (decision.outcome !== "success") {
+      const target = input.records[0]?.toUnitId ?? "<none>";
+      if (decision.reason === "downstream_context_target_unknown") {
+        throw new Error(`unknown downstream context target ${target}`);
+      }
+      if (decision.reason === "downstream_context_target_not_pending") {
+        throw new Error(`downstream context target ${target} is not pending`);
+      }
+      if (decision.reason === "downstream_context_source_not_integrated") {
+        throw new Error(`downstream context source ${input.fromUnitId} is not integrated`);
+      }
+      throw new Error(decision.reason);
+    }
+    const unitRowsById = new Map(rows.map((row) => [row.unit_id, row]));
+    const from = unitRowsById.get(input.fromUnitId)!;
+    const timestamp = now();
+    const output: ExecutionDownstreamContext[] = [];
+    for (const record of decision.records) {
+      const to = unitRowsById.get(record.toUnitId)!;
+      const payload = canonicalJson(record.payload);
+      const id = deterministicId("execution-context", [input.parentAttemptId, input.fromUnitId, record.toUnitId, record.payloadHash]);
+      db.prepare(`
+        INSERT INTO execution_downstream_context (
+          id, execution_graph_id, pipeline_instance_id, parent_attempt_id,
+          from_execution_unit_id, to_execution_unit_id, from_unit_id, to_unit_id,
+          payload, payload_hash, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(parent_attempt_id, from_unit_id, to_unit_id, payload_hash) DO NOTHING
+      `).run(
+        id,
+        graph.id,
+        graph.pipeline_instance_id,
+        input.parentAttemptId,
+        from.id,
+        to.id,
+        input.fromUnitId,
+        record.toUnitId,
+        payload,
+        record.payloadHash,
+        timestamp
+      );
+      output.push(db.prepare("SELECT * FROM execution_downstream_context WHERE id = ?")
+        .get(id) as ExecutionDownstreamContext);
+    }
+    return output;
+  });
+
+  const stopActiveWork = db.transaction((
+    input: Parameters<ExecutionUnitStore["stopActiveWork"]>[0]
+  ): "stopped" | "already_stopped" => {
+    const timestamp = now();
+    const graph = graphStmt.get(input.parentAttemptId) as ExecutionUnitGraph | undefined;
+    if (!graph) return "already_stopped";
+    if (graph.aggregate_emitted_at || graph.stopped_at) return "already_stopped";
+    const activeActionIds = (db.prepare(`
+      SELECT id FROM execution_work_attempts
+      WHERE parent_attempt_id = ? AND status IN ('leased', 'dispatched', 'running')
+      ORDER BY created_at, id
+    `).all(input.parentAttemptId) as Array<{ id: string }>).map((action) => action.id);
+    db.prepare(`
+      UPDATE execution_graphs
+      SET stopped_at = ?, stop_reason = ?, updated_at = ?
+      WHERE parent_attempt_id = ? AND stopped_at IS NULL
+    `).run(timestamp, input.reason, timestamp, input.parentAttemptId);
+    if (activeActionIds.length > 0) {
+      db.prepare(`
+        UPDATE execution_work_attempts
+        SET status = 'dead', lease_until = NULL, last_error = ?, updated_at = ?, completed_at = COALESCE(completed_at, ?)
+        WHERE parent_attempt_id = ? AND status IN ('leased', 'dispatched', 'running')
+      `).run(input.reason, timestamp, timestamp, input.parentAttemptId);
+      db.prepare(`
+        UPDATE execution_units
+        SET status = 'pending', active_work_attempt_id = NULL, updated_at = ?
+        WHERE parent_attempt_id = ? AND active_work_attempt_id IN (${activeActionIds.map(() => "?").join(",")})
+      `).run(timestamp, input.parentAttemptId, ...activeActionIds);
+    }
+    return "stopped";
+  });
+
   return {
     createGraph,
     getGraphForAttempt(parentAttemptId) {
@@ -357,5 +563,29 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     },
     completeUnitAction,
     emitAggregateOnce,
+    recordGateReceipt,
+    listGateReceipts(parentAttemptId) {
+      return db.prepare(`
+        SELECT * FROM execution_gate_receipts
+        WHERE parent_attempt_id = ?
+        ORDER BY created_at, id
+      `).all(parentAttemptId) as ExecutionGateReceipt[];
+    },
+    appendDownstreamContext,
+    listDownstreamContext(parentAttemptId, toUnitId) {
+      if (toUnitId != null) {
+        return db.prepare(`
+          SELECT * FROM execution_downstream_context
+          WHERE parent_attempt_id = ? AND to_unit_id = ?
+          ORDER BY created_at, id
+        `).all(parentAttemptId, toUnitId) as ExecutionDownstreamContext[];
+      }
+      return db.prepare(`
+        SELECT * FROM execution_downstream_context
+        WHERE parent_attempt_id = ?
+        ORDER BY created_at, id
+      `).all(parentAttemptId) as ExecutionDownstreamContext[];
+    },
+    stopActiveWork,
   };
 }
