@@ -66,6 +66,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Build supervisor image
+        # Repo-root context so the supervisor's file:../contracts dependency
+        # resolves; guards the Fly deploy build (deploy.yml) which CI would
+        # otherwise never exercise.
+        run: docker build -f supervisor/Dockerfile -t openthrottle-supervisor:test .
       - name: Build sandbox image
         run: docker build -f sandbox/Dockerfile -t openthrottle:test .
       - name: Exercise sandbox lifecycle with stub agent
