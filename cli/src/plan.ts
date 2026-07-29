@@ -225,7 +225,7 @@ export const defaultPrepareRunner: PrepareRunner = ({ agent, model, prompt, dire
   let input: string | undefined;
   if (agent === "codex") {
     command = "codex";
-    args = ["exec", "--json", "--skip-git-repo-check", "-C", directory, ...(model ? ["-m", model] : []), "-"];
+    args = ["exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", "-C", directory, ...(model ? ["-m", model] : []), "-"];
     input = prompt;
   } else if (agent === "claude") {
     command = "claude";
