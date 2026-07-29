@@ -264,7 +264,31 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         timestamp: input.nowIso,
       });
     }
+    settleStructurallyBlockedDependents(input.parentAttemptId, input.nowIso);
     return stale.map((action) => ({ actionId: action.id, unitId: action.unit_id }));
+  }
+
+  function settleStructurallyBlockedDependents(parentAttemptId: string, timestamp: string): void {
+    for (;;) {
+      const rows = listUnitRows(parentAttemptId);
+      const blockingTerminals = new Set(
+        rows
+          .filter((row) => row.terminal_level === "exited" || row.terminal_level === "failed")
+          .map((row) => row.unit_id)
+      );
+      const blocked = rows.find((row) =>
+        row.status === "pending" &&
+        row.terminal_level === null &&
+        dependenciesFor(row).some((dependency) => blockingTerminals.has(dependency))
+      );
+      if (!blocked) return;
+      settleUnitRow({
+        parentAttemptId,
+        unitId: blocked.unit_id,
+        reason: "structural_exit",
+        timestamp,
+      });
+    }
   }
 
   function assertGraphReplayMatches(input: Parameters<ExecutionUnitStore["createGraph"]>[0], existing: ExecutionUnitGraph): void {
@@ -371,12 +395,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       LIMIT 1
     `).get(input.parentAttemptId) as ExecutionWorkAttempt | undefined;
     if (dispatched) {
-      db.prepare(`
-        UPDATE execution_work_attempts
-        SET lease_owner = ?, lease_until = ?, updated_at = ?
-        WHERE id = ? AND status IN ('dispatched', 'running')
-      `).run(input.leaseOwner, input.leaseUntilIso, input.nowIso, dispatched.id);
-      return db.prepare("SELECT * FROM execution_work_attempts WHERE id = ?").get(dispatched.id) as ExecutionWorkAttempt;
+      return dispatched;
     }
     const active = db.prepare(`
       SELECT 1 FROM execution_work_attempts
@@ -638,14 +657,17 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
 
   const settleUnitTerminal = db.transaction((
     input: Parameters<ExecutionUnitStore["settleUnitTerminal"]>[0]
-  ): "settled" | "already_settled" =>
-    settleUnitRow({
+  ): "settled" | "already_settled" => {
+    const timestamp = now();
+    const result = settleUnitRow({
       parentAttemptId: input.parentAttemptId,
       unitId: input.unitId,
       reason: input.reason,
-      timestamp: now(),
-    })
-  );
+      timestamp,
+    });
+    if (input.reason === "structural_exit") settleStructurallyBlockedDependents(input.parentAttemptId, timestamp);
+    return result;
+  });
 
   const healStaleChildActions = db.transaction((
     input: Parameters<ExecutionUnitStore["healStaleChildActions"]>[0]

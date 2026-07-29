@@ -326,6 +326,87 @@ describe("execution unit store", () => {
     })?.unit_id).toBe("b");
   });
 
+  it("does not renew child action liveness from dispatcher polling", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b" }],
+    });
+
+    const active = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: "2026-07-29T00:00:00.000Z",
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })!;
+    store.markActionDispatched(active.id, "request-hash", "native-session");
+
+    const polled = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-2",
+      nowIso: "2026-07-29T00:00:30.000Z",
+      leaseUntilIso: "2026-07-29T00:02:00.000Z",
+    });
+    expect(polled?.id).toBe(active.id);
+    expect(db!.prepare("SELECT lease_owner, lease_until FROM execution_work_attempts WHERE id = ?").get(active.id)).toEqual({
+      lease_owner: "worker-1",
+      lease_until: "2026-07-29T00:01:00.000Z",
+    });
+
+    const next = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-2",
+      nowIso: "2026-07-29T00:01:01.000Z",
+      leaseUntilIso: "2026-07-29T00:02:00.000Z",
+    });
+    expect(next?.unit_id).toBe("b");
+    expect(db!.prepare("SELECT status FROM execution_work_attempts WHERE id = ?").get(active.id)).toEqual({
+      status: "dead",
+    });
+  });
+
+  it("cascades structural exit to dependents blocked by a healed prerequisite", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b", dependencies: ["a"] }],
+    });
+
+    const stale = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: "2026-07-29T00:00:00.000Z",
+      leaseUntilIso: "2026-07-29T00:00:01.000Z",
+    })!;
+    store.markActionDispatched(stale.id, "request-hash", "native-session");
+
+    expect(store.healStaleChildActions({
+      parentAttemptId: "attempt-parent",
+      nowIso: "2026-07-29T00:00:02.000Z",
+      reason: "child action missed heartbeat fence",
+    })).toEqual([{ actionId: stale.id, unitId: "a" }]);
+    expect(store.listUnits("attempt-parent")).toEqual([
+      expect.objectContaining({ unitId: "a", status: "exited", terminalLevel: "exited", alarm: false }),
+      expect.objectContaining({ unitId: "b", status: "exited", terminalLevel: "exited", alarm: false }),
+    ]);
+    expect(store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-2",
+      nowIso: "2026-07-29T00:00:02.000Z",
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })).toBeUndefined();
+  });
+
   it("distinguishes slow alive child actions from frozen child actions", () => {
     const store = setup();
     store.createGraph({
