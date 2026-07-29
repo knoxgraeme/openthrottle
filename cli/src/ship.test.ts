@@ -25,7 +25,7 @@ function executionPlanBlock(graphId = "structured"): string {
   return `\`\`\`json openthrottle.execution-plan/v1\n${JSON.stringify(contract, null, 2)}\n\`\`\``;
 }
 
-function writeStructuredConfig(directory: string): void {
+function writeStructuredConfig(directory: string, allowedGraphs = ["simple", "structured"]): void {
   writeFileSync(
     join(directory, ".openthrottle.yml"),
     stringify({
@@ -36,7 +36,7 @@ function writeStructuredConfig(directory: string): void {
         { id: "structured", kind: "builtin", ref: "core/structured@1" },
       ],
       intents: {
-        implement: { default_graph: "simple", allowed_graphs: ["simple", "structured"] },
+        implement: { default_graph: "simple", allowed_graphs: allowedGraphs },
       },
     })
   );
@@ -115,6 +115,9 @@ describe("ship", () => {
       process.chdir(directory);
       await expect(ship([planPath, "--graph", "structured"])).rejects.toThrow(/exit 1/);
       writeFileSync(planPath, `# Ship it\n\n${executionPlanBlock("structured")}`);
+      await expect(ship([planPath, "--graph", "simple"])).rejects.toThrow(/exit 1/);
+      writeStructuredConfig(directory, ["structured"]);
+      writeFileSync(planPath, "# Ship it\n\nPlan body");
       await expect(ship([planPath, "--graph", "simple"])).rejects.toThrow(/exit 1/);
       expect(fetchMock).not.toHaveBeenCalled();
     } finally {
