@@ -100,13 +100,16 @@ function extractExecutionPlanGraphId(context: string): string | undefined {
   return parseExecutionPlanContract(blocks[0]!, { source: "issue.execution_plan" }).value.graph_id;
 }
 
-function extractRequestedGraphId(context: string): string | undefined {
+function extractRequestedGraph(context: string): {
+  graphId?: string;
+  hasExecutionPlan: boolean;
+} {
   const selected = extractShipSelectionGraphId(context);
   const planned = extractExecutionPlanGraphId(context);
   if (selected && planned && selected !== planned) {
     throw new Error(`ship selection graph_id ${selected} does not match execution_plan.graph_id ${planned}`);
   }
-  return selected ?? planned;
+  return { graphId: selected ?? planned, hasExecutionPlan: planned !== undefined };
 }
 
 function resolvePipelineSelection(
@@ -116,16 +119,21 @@ function resolvePipelineSelection(
 ): string {
   if (taskType !== "implement") return repositoryConfig.config.pipelines?.[taskType] ?? taskType;
   const intent = repositoryConfig.config.intents?.implement;
-  const graphId = extractRequestedGraphId(context) ?? intent?.default_graph ?? repositoryConfig.config.default_graph;
+  const requested = extractRequestedGraph(context);
+  const graphId = requested.graphId ?? intent?.default_graph ?? repositoryConfig.config.default_graph;
   const allowedGraphs = intent?.allowed_graphs ?? [repositoryConfig.config.default_graph];
   if (!allowedGraphs.includes(graphId)) {
     throw new Error(`graph ${graphId} is not allowed for implement; allowed: ${allowedGraphs.join(", ")}`);
   }
   const source = repositoryConfig.config.graphs.find((entry) => entry.id === graphId);
   if (!source) throw new Error(`graph ${graphId} is not declared in repository config`);
+  const isBuiltinSimple = source.kind === "builtin" && source.ref === "core/simple@1";
+  if (!isBuiltinSimple && !requested.hasExecutionPlan) {
+    throw new Error(`graph ${graphId} requires a canonical ${EXECUTION_PLAN_FENCE} block`);
+  }
   const graphOverride = repositoryConfig.config.pipelines?.[graphId];
   if (graphOverride) return graphOverride;
-  if (source.kind === "builtin" && source.ref === "core/simple@1") {
+  if (isBuiltinSimple) {
     return repositoryConfig.config.pipelines?.[taskType] ?? taskType;
   }
   return source.ref;
