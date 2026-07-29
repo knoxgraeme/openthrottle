@@ -14,6 +14,8 @@ import type {
   PipelineInstanceStatus,
   PipelineStageAttempt,
 } from "./store.js";
+import type { ExecutionPublicationSnapshot } from "./execution-publication.js";
+import { executionLedgerLines } from "./execution-publication.js";
 import type { PipelineCoordinatorEvent } from "./coordinator.js";
 import { sanitizeText } from "../shared/sanitize.js";
 
@@ -82,6 +84,7 @@ export interface PipelinePublicationEnvelope {
     uncertainty: string[];
   };
   links: Array<{ label: string; url: string }>;
+  structured_execution?: ExecutionPublicationSnapshot;
   resume_status: PipelineInstanceStatus | null;
   body: string;
   artifact_inline?: string;
@@ -833,6 +836,7 @@ function renderBody(
   const lines = [
     ...summaryHeaderLines(envelope, context),
     ...repairBannerLines(envelope, context, extras),
+    ...executionLedgerLines(envelope.structured_execution),
     ...findingsSectionLines(envelope),
     ...assumptionsSectionLines(envelope),
     "",
@@ -903,6 +907,7 @@ export function buildLifecyclePublication(input: {
   attempt?: PipelineStageAttempt;
   outcome: PipelineOutcome;
   reason: string;
+  structuredExecution?: ExecutionPublicationSnapshot;
 }): PipelinePublicationEnvelope {
   const partial: PipelinePublicationBodyInput = {
     schema: PIPELINE_PUBLICATION_SCHEMA,
@@ -943,6 +948,7 @@ export function buildLifecyclePublication(input: {
       uncertainty: [],
     },
     links: githubLinks(input.instance, input.instance.immutable_subject),
+    ...(input.structuredExecution ? { structured_execution: input.structuredExecution } : {}),
     resume_status: null,
   };
   return { ...partial, body: renderBody(partial, input.instance.normalized_manifest) };
@@ -959,6 +965,7 @@ export function buildStagePublication(input: {
   priorFindings?: readonly PublicationFinding[];
   /** Latest non-repair stage that scheduled the active repair branch. */
   priorRepairSourceStageId?: string;
+  structuredExecution?: ExecutionPublicationSnapshot;
 }): PipelinePublicationEnvelope {
   const resumeStatus = input.resumeStatus ?? input.write.resumeStatus ?? null;
   const evidence = (input.event.artifacts ?? []).map((artifact) => safeEvidence(artifact.payload));
@@ -1027,6 +1034,7 @@ export function buildStagePublication(input: {
       uncertainty: evidence.flatMap((item) => item.uncertainty).slice(0, 20),
     },
     links: githubLinks(input.instance, subject ?? null),
+    ...(input.structuredExecution ? { structured_execution: input.structuredExecution } : {}),
     resume_status: resumeStatus,
   };
   const body = renderBody(partial, input.instance.normalized_manifest, {

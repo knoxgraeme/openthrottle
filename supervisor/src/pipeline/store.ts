@@ -10,6 +10,7 @@ import type {
   ValidatedRuntimeCapabilityDescriptor,
 } from "../runtime/contracts.js";
 import type { StageRequestEnvelope } from "./stage-request.js";
+import type { ExecutionPublicationSnapshot } from "./execution-publication.js";
 
 export type PipelineInstanceStatus =
   | "pending"
@@ -278,6 +279,13 @@ export interface PipelineStatusProjection {
   sandbox_event_id: string | null;
   sandbox_event_attempts: number | null;
   sandbox_ingestion_error: string | null;
+  structured_units: Array<{
+    unit_id: string;
+    status: string;
+    terminal_level: string | null;
+    alarm: boolean;
+    integration_subject: string | null;
+  }>;
 }
 
 export interface PipelineInstanceSeed {
@@ -383,6 +391,7 @@ export interface PipelineStore extends ChildActionLivenessPort {
   getAttemptForRun(runId: string): PipelineStageAttempt | undefined;
   getRepositoryConfigSnapshot(id: string): RepositoryConfigSnapshot | undefined;
   getStageRequest(attemptId: string): StageRequestEnvelope;
+  getStructuredExecutionPublication(parentAttemptId: string): ExecutionPublicationSnapshot | undefined;
   bindStageRun(attemptId: string, runId: string): void;
   markStageDispatched(attemptId: string): void;
   bindRuntimeResource(instanceId: string, provider: string, providerResourceId: string): PipelineRuntimeResource;

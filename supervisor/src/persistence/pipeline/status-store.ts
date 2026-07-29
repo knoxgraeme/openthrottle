@@ -140,6 +140,7 @@ export function createStatusStore(db: Database.Database): Pick<PipelineStore, "g
       const pendingPublication = publications.find((item) =>
         item.status === "pending" || item.status === "processing"
       );
+      const relevantPublication = blockedPublication ?? failedPublication ?? pendingPublication ?? latest;
       const publicationState = publicationStateFor(publications, instance.status);
       const effects = db.prepare(`
         SELECT *,
@@ -177,6 +178,24 @@ export function createStatusStore(db: Database.Database): Pick<PipelineStore, "g
       const failedOrDeadEffects = effects.filter((item) => item.status === "failed" || item.status === "dead");
       const newestEffect = failedOrDeadEffects[0];
       const lastError = newestStatusError(newestEffect, failedGate, gateError);
+      const structuredUnits = db.prepare(`
+        SELECT eu.unit_id, eu.status, eu.terminal_level, eu.alarm, eu.integration_subject
+        FROM execution_units eu
+        JOIN execution_graphs eg ON eg.id = eu.execution_graph_id
+        WHERE eg.id = (
+          SELECT id FROM execution_graphs
+          WHERE pipeline_instance_id = ?
+          ORDER BY updated_at DESC, created_at DESC, id DESC
+          LIMIT 1
+        )
+        ORDER BY eu.authored_order, eu.unit_id
+      `).all(instance.id) as Array<{
+        unit_id: string;
+        status: string;
+        terminal_level: string | null;
+        alarm: number;
+        integration_subject: string | null;
+      }>;
       return {
         execution_mode: "pipeline",
         instance_id: instance.id,
@@ -208,9 +227,8 @@ export function createStatusStore(db: Database.Database): Pick<PipelineStore, "g
         policy_digest: gate?.policy_digest ?? null,
         context_policy: attempt?.native_context_policy ?? null,
         publication_state: publicationState,
-        publication_id: (blockedPublication ?? failedPublication ?? pendingPublication ?? latest)?.id ?? null,
-        publication_external_id:
-          (blockedPublication ?? failedPublication ?? pendingPublication ?? latest)?.external_id ?? null,
+        publication_id: relevantPublication?.id ?? null,
+        publication_external_id: relevantPublication?.external_id ?? null,
         publication_error:
           boundedStatusError((blockedPublication ?? failedPublication ?? publications.find((item) => item.last_error))?.last_error),
         recovery_action: publicationState === "blocked" && blockedPublication
@@ -224,6 +242,13 @@ export function createStatusStore(db: Database.Database): Pick<PipelineStore, "g
         sandbox_event_id: sandboxEvent?.event_id ?? null,
         sandbox_event_attempts: sandboxEvent?.attempts ?? null,
         sandbox_ingestion_error: boundedStatusError(sandboxEvent?.last_error),
+        structured_units: structuredUnits.map((unit) => ({
+          unit_id: unit.unit_id,
+          status: unit.status,
+          terminal_level: unit.terminal_level,
+          alarm: unit.alarm === 1,
+          integration_subject: unit.integration_subject,
+        })),
       };
     },
   };

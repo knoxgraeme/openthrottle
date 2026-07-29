@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import { canonicalJson, digestNormalized, type PipelineManifest } from "../../pipeline/manifest.js";
+import { parsePipelinePublication } from "../../pipeline/publication.js";
 import type {
   CoordinatorTransitionWrite,
   PipelineInboxEventRecord,
@@ -336,6 +337,38 @@ export function createTransitionStore(db: Database.Database, now: () => string):
           payload: effect.payload,
           timestamp,
         });
+        if (publicationKind === "linear_ledger" && effect.payload.includes("\"structured_execution\"")) {
+          try {
+            const envelope = parsePipelinePublication(effect.payload);
+            if (envelope.structured_execution) {
+              journal.recordJournalEntry({
+                id: deterministicId("journal", [instance.id, attempt.id, write.resultHash, "structured-ledger"]),
+                issueId: instance.linear_issue_id,
+                instanceId: instance.id,
+                runId: attempt.run_id,
+                actor: "orchestrator",
+                kind: "run_note",
+                trigger: `${attempt.stage_id} structured publication`,
+                action: "Projected the structured unit and gate ledger through the durable publication path.",
+                outcome: write.outcome,
+                refs: {
+                  stage: attempt.stage_id,
+                  attempt_id: attempt.id,
+                  publication_kind: publicationKind,
+                  result_hash: write.resultHash,
+                },
+                structured: {
+                  unit_count: envelope.structured_execution.units.length,
+                  aggregate_artifact_hash: envelope.structured_execution.graph?.aggregate_artifact_hash ?? null,
+                },
+              });
+              wrote();
+            }
+          } catch {
+            // The publication writer already validates payload shape; this
+            // journal projection is audit-only and must not block transition.
+          }
+        }
         wrote();
       }
       db.prepare(`

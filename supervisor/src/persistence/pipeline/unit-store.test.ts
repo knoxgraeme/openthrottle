@@ -673,6 +673,75 @@ describe("execution unit store", () => {
     })).toThrow(/is not pending/);
   });
 
+  it("builds a structured publication snapshot from durable child state", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b", dependencies: ["a"] }],
+    });
+    const action = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: timestamp,
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })!;
+    store.markActionDispatched(action.id, "request-hash", "native-session");
+    store.completeUnitAction({
+      actionId: action.id,
+      resultHash: "result-hash",
+      outputSubject: "1".repeat(40),
+    });
+    const payload = "{\"accepted\":true}";
+    store.recordGateReceipt({
+      actionId: action.id,
+      gateKind: "unit_acceptance",
+      evaluatorKind: "human",
+      subject: "1".repeat(40),
+      result: "passed",
+      outcome: "success",
+      reason: "Lead accepted the scoped unit.",
+      artifactHashes: ["artifact-hash"],
+      payload,
+      hash: digestNormalized(payload),
+    });
+    store.appendDownstreamContext({
+      parentAttemptId: "attempt-parent",
+      fromUnitId: "a",
+      records: [{ toUnitId: "b", payload: { summary: "Use the accepted parser." } }],
+    });
+    store.settleUnitTerminal({
+      parentAttemptId: "attempt-parent",
+      unitId: "a",
+      reason: "acceptance_passed",
+    });
+
+    expect(store.getStructuredExecutionPublication("attempt-parent")).toMatchObject({
+      graph: { parent_attempt_id: "attempt-parent", parent_stage_id: "units" },
+      units: [
+        {
+          unit_id: "a",
+          terminal_level: "completed",
+          alarm: false,
+          gates: [expect.objectContaining({
+            kind: "unit_acceptance",
+            evaluator: "human",
+            reason: "Lead accepted the scoped unit.",
+          })],
+          downstream_context: [expect.objectContaining({
+            to_unit_id: "b",
+            summary: "Use the accepted parser.",
+          })],
+        },
+        expect.objectContaining({ unit_id: "b", dependencies: ["a"] }),
+      ],
+    });
+  });
+
   it("stops active unit work without deleting child graph state", () => {
     const store = setup();
     store.createGraph({

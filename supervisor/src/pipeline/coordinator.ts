@@ -635,6 +635,7 @@ export function coordinatePipelineEvent(
   const priorPayloads = summaryPayloads.length > 0 ? summaryPayloads : receipts.map((receipt) => receipt.payload);
   const priorFindings = accumulatedPublicationFindings(priorPayloads);
   const priorRepairSourceStageId = accumulatedPublicationRepairSource(priorPayloads);
+  const structuredExecution = store.getStructuredExecutionPublication(attempt.id);
   const publication = canonicalJson(buildStagePublication({
     instance,
     attempt,
@@ -644,6 +645,7 @@ export function coordinatePipelineEvent(
     resumeStatus: write.resumeStatus ?? null,
     priorFindings,
     priorRepairSourceStageId,
+    structuredExecution,
   }));
   attachPublicationEffects({
     write,

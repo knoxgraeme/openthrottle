@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import { canonicalJson, digestNormalized, type StageOutcome } from "../../pipeline/manifest.js";
+import { buildExecutionPublicationSnapshot } from "../../pipeline/execution-publication.js";
 import {
   decideDownstreamContext,
   deriveUnitTerminalState,
@@ -156,6 +157,7 @@ export interface ExecutionUnitStore {
     heartbeatAtIso: string;
     leaseUntilIso: string;
   }): boolean;
+  getStructuredExecutionPublication(parentAttemptId: string): ReturnType<typeof buildExecutionPublicationSnapshot>;
 }
 
 type ExecutionUnitRow = {
@@ -709,6 +711,48 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         WHERE parent_attempt_id = ?
         ORDER BY created_at, id
       `).all(parentAttemptId) as ExecutionGateReceipt[];
+    },
+    getStructuredExecutionPublication(parentAttemptId) {
+      const graph = graphStmt.get(parentAttemptId) as ExecutionUnitGraph | undefined;
+      if (!graph) return undefined;
+      const attempts = db.prepare(`
+        SELECT * FROM (
+          SELECT *,
+            ROW_NUMBER() OVER (
+              PARTITION BY unit_id
+              ORDER BY attempt_ordinal, created_at, id
+            ) AS row_number
+          FROM execution_work_attempts
+          WHERE parent_attempt_id = ?
+        )
+        WHERE row_number <= 3
+        ORDER BY unit_id, attempt_ordinal, created_at, id
+      `).all(parentAttemptId) as ExecutionWorkAttempt[];
+      const gates = db.prepare(`
+        SELECT * FROM execution_gate_receipts
+        WHERE parent_attempt_id = ?
+        ORDER BY unit_id, created_at, id
+      `).all(parentAttemptId) as ExecutionGateReceipt[];
+      const downstreamContext = db.prepare(`
+        SELECT * FROM (
+          SELECT *,
+            ROW_NUMBER() OVER (
+              PARTITION BY from_unit_id
+              ORDER BY created_at, id
+            ) AS row_number
+          FROM execution_downstream_context
+          WHERE parent_attempt_id = ?
+        )
+        WHERE row_number <= 3
+        ORDER BY from_unit_id, created_at, id
+      `).all(parentAttemptId) as ExecutionDownstreamContext[];
+      return buildExecutionPublicationSnapshot({
+        graph,
+        units: listUnitRows(parentAttemptId).map(unitState),
+        attempts,
+        gates,
+        downstreamContext,
+      });
     },
     appendDownstreamContext,
     listDownstreamContext(parentAttemptId, toUnitId) {
