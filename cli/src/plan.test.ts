@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { stringify } from "yaml";
 import {
+  defaultPrepareRunner,
   extractExecutionPlanBlocks,
   prepareExecutionPlanFile,
   readExecutionPlanFromMarkdown,
@@ -196,6 +197,43 @@ describe("plan validation", () => {
     } finally {
       if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
       else process.env.OPENAI_API_KEY = previousOpenAiKey;
+    }
+  });
+
+  it("allows only automatic Read/Edit tools for noninteractive Claude preparation", () => {
+    const directory = temporaryProject();
+    const bin = join(directory, "bin");
+    const argsPath = join(directory, "claude-args.json");
+    const fakeClaude = join(bin, "claude");
+    mkdirSync(bin);
+    writeFileSync(
+      fakeClaude,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        "fs.writeFileSync(process.env.OT_TEST_CLAUDE_ARGS, JSON.stringify(process.argv.slice(2)));",
+      ].join("\n")
+    );
+    chmodSync(fakeClaude, 0o755);
+
+    const previousPath = process.env.PATH;
+    const previousArgsPath = process.env.OT_TEST_CLAUDE_ARGS;
+    process.env.PATH = `${bin}:${previousPath ?? ""}`;
+    process.env.OT_TEST_CLAUDE_ARGS = argsPath;
+    try {
+      defaultPrepareRunner({ agent: "claude", prompt: "prepare", directory });
+      const args = JSON.parse(readFileSync(argsPath, "utf8")) as string[];
+      const permissionIndex = args.indexOf("--permission-mode");
+      const toolsIndex = args.indexOf("--tools");
+      expect(args.slice(permissionIndex, permissionIndex + 2)).toEqual(["--permission-mode", "acceptEdits"]);
+      expect(args.slice(toolsIndex, toolsIndex + 2)).toEqual(["--tools", "Read,Edit"]);
+      expect(args).not.toContain("--dangerously-skip-permissions");
+      expect(args).not.toContain("--allow-dangerously-skip-permissions");
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      if (previousArgsPath === undefined) delete process.env.OT_TEST_CLAUDE_ARGS;
+      else process.env.OT_TEST_CLAUDE_ARGS = previousArgsPath;
     }
   });
 
