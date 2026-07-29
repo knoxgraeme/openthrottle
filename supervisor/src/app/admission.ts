@@ -18,7 +18,7 @@ import type { PipelineCoordinatorContext, SessionServicePorts } from "./session-
 
 const EXECUTION_PLAN_FENCE = "openthrottle.execution-plan/v1";
 const SHIP_SELECTION_FENCE = "openthrottle.ship-selection/v1";
-const FENCE_PATTERN = /```[^\n`]*\n([\s\S]*?)```/g;
+const FENCE_PATTERN = /```([^\n`]*)\n([\s\S]*?)```/g;
 
 function linearContext(
   payload: LinearAgentSessionEvent,
@@ -68,9 +68,9 @@ function agentDisplayName(agent: Agent): string {
 function extractJsonBlocks(markdown: string, schema: string): string[] {
   const blocks: string[] = [];
   for (const match of markdown.matchAll(FENCE_PATTERN)) {
-    const json = match[1]?.trim();
-    if (!json?.includes(`"schema"`) || !json.includes(schema)) continue;
-    blocks.push(json);
+    const marker = match[1]?.trim().split(/\s+/) ?? [];
+    if (!marker.includes(schema)) continue;
+    blocks.push(match[2]?.trim() ?? "");
   }
   return blocks;
 }
@@ -115,10 +115,8 @@ function resolvePipelineSelection(
   context: string
 ): string {
   if (taskType !== "implement") return repositoryConfig.config.pipelines?.[taskType] ?? taskType;
-  const graphId = extractRequestedGraphId(context);
-  if (!graphId) return repositoryConfig.config.pipelines?.[taskType] ?? taskType;
-
   const intent = repositoryConfig.config.intents?.implement;
+  const graphId = extractRequestedGraphId(context) ?? intent?.default_graph ?? repositoryConfig.config.default_graph;
   const allowedGraphs = intent?.allowed_graphs ?? [repositoryConfig.config.default_graph];
   if (!allowedGraphs.includes(graphId)) {
     throw new Error(`graph ${graphId} is not allowed for implement; allowed: ${allowedGraphs.join(", ")}`);
