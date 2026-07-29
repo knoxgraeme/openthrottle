@@ -1,7 +1,8 @@
 import { Hono } from "hono";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { Config } from "../app/config.js";
-import type { Ticket, SupervisorStore, WebhookDelivery } from "../persistence/store.js";
+import type { WebhookDelivery } from "../persistence/delivery-store.js";
+import type { Ticket, SupervisorStore } from "../persistence/store.js";
 import {
   buildLinearInstallUrl,
   exchangeLinearOAuthCode,
@@ -282,6 +283,53 @@ export function createServer(deps: ServerDeps): Hono {
     return context.json({ repositories: store.listRepositoryRegistrations() });
   });
 
+  app.get("/status/journal", (context) => {
+    if (!requireStatusAuth(context.req.header("Authorization"))) {
+      return context.json({ error: "unauthorized" }, 401);
+    }
+    const issue = context.req.query("issue");
+    const repository = context.req.query("repository");
+    const from = context.req.query("from");
+    const to = context.req.query("to");
+    const limit = context.req.query("limit");
+    if (!issue && !repository) {
+      return context.json({ error: "issue or repository is required" }, 400);
+    }
+    try {
+      return context.json({
+        journal: deps.pipelineCoordinator.store.listJournalEntries({
+          issue,
+          repository,
+          from,
+          to,
+          limit: limit ? Number(limit) : undefined,
+        }),
+      });
+    } catch (error) {
+      return context.json({ error: sanitizeText(String(error)) }, 400);
+    }
+  });
+
+  app.get("/tickets/:identifier/journal", (context) => {
+    if (!requireStatusAuth(context.req.header("Authorization"))) {
+      return context.json({ error: "unauthorized" }, 401);
+    }
+    const ticket = findTicket(store, context.req.param("identifier"));
+    if (!ticket) return context.json({ error: "ticket not found" }, 404);
+    try {
+      return context.json({
+        journal: deps.pipelineCoordinator.store.listJournalEntries({
+          issueId: ticket.linear_issue_id,
+          from: context.req.query("from"),
+          to: context.req.query("to"),
+          limit: context.req.query("limit") ? Number(context.req.query("limit")) : undefined,
+        }),
+      });
+    } catch (error) {
+      return context.json({ error: sanitizeText(String(error)) }, 400);
+    }
+  });
+
   app.post("/repositories/register", async (context) => {
     if (!requireStatusAuth(context.req.header("Authorization"))) {
       return context.json({ error: "unauthorized" }, 401);
@@ -495,24 +543,33 @@ export function createServer(deps: ServerDeps): Hono {
     }
     const pipeline = deps.pipelineCoordinator.store.getInstanceForSession(ticket.linear_session_id);
     if (!pipeline) return context.json({ error: "pipeline not found" }, 409);
-    if (!canSteerPipelineRun({
+    const canSteerNow = canSteerPipelineRun({
       store: deps.pipelineCoordinator.store,
       sessionId: ticket.linear_session_id,
       runId: ticket.run_id,
       agent: ticket.agent,
-    })) {
+    });
+    if (!canSteerNow && pipeline.status !== "running") {
       return context.json({ error: "the current pipeline stage does not accept live steering" }, 409);
     }
-    // The message reaches only the exact active run accepted by the stage's
-    // sealed steering policy. It is untrusted data and is never executed.
+    // The message is untrusted data and is never executed. When the current
+    // stage accepts steering, fence it to that exact run; otherwise leave it
+    // unbound until a later steerable stage can lease it.
     const record = store.enqueueInbox({
       issueId: ticket.linear_issue_id,
       sessionId: ticket.linear_session_id,
-      runId: ticket.run_id,
+      runId: canSteerNow ? ticket.run_id : null,
       source: "operator",
       body: message,
     });
-    return context.json({ ok: true, id: record.id });
+    return context.json({
+      ok: true,
+      id: record.id,
+      status: canSteerNow ? "queued" : "captured",
+      ...(canSteerNow
+        ? {}
+        : { message: "captured — retained for the next implementation or repair stage" }),
+    });
   });
 
   app.get("/tickets/:identifier/logs", async (context) => {

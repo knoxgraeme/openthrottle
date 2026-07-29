@@ -31,25 +31,27 @@ make no dependent change. Record the decision needed and propose
 
 ## Stage capabilities
 
-- `planning` / `ce/plan@1`: inspect the approved ticket context and repository
-  only as needed to decide whether the work is executable. Invoke the native
-  `ce-plan` workflow only if the supplied plan needs normalization. Make no
-  repository changes. Missing or materially ambiguous acceptance criteria is
-  `needs_human`; an executable plan is `success`.
-
-- `implementation` / `ce/implement@1`: invoke native Compound Engineering
-  `ce-work mode:return-to-caller /home/agent/.ot/linear-context.md`. Implement
-  and locally verify only the plan-covered change. Do not perform the semantic
-  review, simplification, configured command gates, commit, push, or open a PR.
-  A clear implementation is `success`; unresolved semantic work is
+- `implementation` or `repair_implementation` / `ce/implement@1`: invoke
+  native Compound Engineering
+  `ce-work mode:return-to-caller /home/agent/.ot/linear-context.md`. For
+  `implementation`, implement and locally verify only the plan-covered change.
+  For `repair_implementation`, use the sealed transition context as the repair
+  brief and make only the targeted repair needed to address provider, command,
+  or review feedback. Do not perform the semantic review, simplification,
+  configured command gates, commit, push, or open a PR. A clear implementation
+  or repair is `success`; unresolved semantic work is
   `semantic_repair_required`.
 
-- `semantic_review` / `ce/review@1`: invoke `ce-code-review apply:local
-  base:origin/$BASE_BRANCH`. Review the complete current diff, fix verified
-  findings that are safe and in scope, and include the bounded findings and
-  evidence in both the stage proposal and required `review` artifact. Any
-  remaining P0/P1 finding is `semantic_repair_required`; a clean result is
-  `success` or `no_change`.
+- `semantic_review`, `repair_semantic_review`, or `post_simplify_review` /
+  `ce/review@1`: invoke `ce-code-review apply:local base:origin/$BASE_BRANCH`.
+  Review the complete current diff, fix verified findings that are safe and in
+  scope, and include the bounded findings and evidence in both the stage
+  proposal and required `review` artifact. For `repair_semantic_review`, focus
+  on the repair delta and remember the manifest routes a clean repair review
+  directly to command gates, not simplification. For `post_simplify_review`,
+  use the transition context to focus on the simplification delta when
+  available. Any remaining P0/P1 finding is `semantic_repair_required`; a clean
+  result is `success` or `no_change`.
 
 - `simplification` / `ce/simplify@1`: invoke `ce-simplify-code` only when the
   current diff is large or structurally complex (roughly more than 300 changed

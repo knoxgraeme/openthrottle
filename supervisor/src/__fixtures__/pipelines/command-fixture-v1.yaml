@@ -10,6 +10,7 @@ requires:
 stages:
   - id: command
     executor: { kind: command, capability: command/run@1 }
+    commandName: test
     evaluator:
       kind: command
       assurance: executor_verified

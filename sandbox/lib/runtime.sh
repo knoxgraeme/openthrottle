@@ -72,6 +72,47 @@ is_supported_task_type() {
   esac
 }
 
+# evaluate_bootstrap_marker MARKER_FILE SENTINEL_FILE STAGE_CONFIG_DIGEST FRESH_CLONE
+#
+# Gate for the bake-once sandbox bootstrap (post_bootstrap installs and
+# image-derived engine probes run once per sandbox lifetime). Decides, from the
+# root-owned marker state, whether this stage must run the bootstrap, may skip
+# it, or must fail closed because the sandbox no longer matches its sealed
+# repository config. There is never a silent re-bootstrap or a silent skip.
+#
+# stdout on success (exit 0):
+#   "run"       — fresh sandbox: the bake-once bootstrap must execute now
+#   "skip <0|1>" — marker matches the sealed digest; <0|1> is the recorded
+#                  codexHookTrust probe result
+# stdout on failure (exit 1): the exact fail-closed diagnostic to log; the
+# sandbox is stale and the supervisor must reprovision it.
+evaluate_bootstrap_marker() {
+  local marker="$1" sentinel="$2" stage_digest="$3" fresh_clone="$4"
+  local marker_digest hook_trust
+  if [[ -f "$marker" ]]; then
+    if ! marker_digest="$(jq -er '.repositoryConfigDigest' "$marker" 2>/dev/null)"; then
+      printf '%s\n' "FATAL: sandbox bootstrap marker is unreadable; the sandbox is stale — the supervisor must reprovision it"
+      return 1
+    fi
+    if [[ "$marker_digest" != "$stage_digest" ]]; then
+      printf '%s\n' "FATAL: sandbox bootstrap marker records repository config digest ${marker_digest} but the sealed stage request requires ${stage_digest}; the sandbox is stale — the supervisor must reprovision it"
+      return 1
+    fi
+    if [[ "$fresh_clone" == "1" ]]; then
+      printf '%s\n' "FATAL: sandbox bootstrap marker is present but the repository checkout was recreated; the sandbox is stale — the supervisor must reprovision it"
+      return 1
+    fi
+    hook_trust="$(jq -r 'if .codexHookTrust == true then "1" else "0" end' "$marker" 2>/dev/null || printf '0')"
+    printf 'skip %s\n' "$hook_trust"
+    return 0
+  fi
+  if [[ -e "$sentinel" ]]; then
+    printf '%s\n' "FATAL: sandbox bootstrap started but never completed; the sandbox is stale — the supervisor must reprovision it"
+    return 1
+  fi
+  printf 'run\n'
+}
+
 # Extract a string field from a Codex auth.json blob; empty on absent/invalid.
 codex_auth_field() {
   # $1 = json blob, $2 = jq path (e.g. '.last_refresh')

@@ -1,0 +1,2 @@
+implicit: false
+description: Prepare a validated OpenThrottle execution-plan block from a completed CE unified plan.

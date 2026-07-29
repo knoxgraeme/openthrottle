@@ -31,12 +31,16 @@ export interface RunStore {
 
 export function createRunStore(db: Database.Database, workStore: WorkStore): RunStore {
   const now = () => new Date().toISOString();
+  const ticketFailureTail = (params: FinishRunParams): string | null =>
+    params.ticketFailureTail === undefined
+      ? params.failureTail ?? null
+      : params.ticketFailureTail;
   const getByIssueIdStmt = db.prepare("SELECT * FROM tickets WHERE linear_issue_id = ?");
   const getCurrentSessionStmt = db.prepare(
     "SELECT * FROM agent_sessions WHERE linear_issue_id = ? AND state = 'current'"
   );
   const getRunStmt = db.prepare("SELECT * FROM runs WHERE id = ?");
-  const getAttemptActorStmt = db.prepare("SELECT * FROM pipeline_attempt_actors WHERE run_id = ?");
+  const getAttemptActorStmt = db.prepare("SELECT * FROM pipeline_stage_attempts WHERE run_id = ? OR planned_run_id = ? ORDER BY CASE WHEN run_id = ? THEN 0 ELSE 1 END LIMIT 1");
   const getLatestRunWithLogStmt = db.prepare(
     `SELECT * FROM runs
      WHERE linear_issue_id = ? AND log_tail IS NOT NULL
@@ -52,117 +56,64 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
     "SELECT * FROM runs WHERE status = 'running' AND expires_at <= ? ORDER BY expires_at"
   );
   const listStalledRunsStmt = db.prepare(`
-    SELECT * FROM (
-      SELECT r.* FROM runs r
-      JOIN pipeline_attempt_actors a ON a.run_id = r.id
-      WHERE r.status = 'running'
-        AND a.actor_state = 'running'
-        AND COALESCE(a.last_heartbeat_at, r.started_at) <= ?
-      UNION ALL
-      SELECT r.* FROM runs r
-      JOIN run_liveness l ON l.run_id = r.id
-      WHERE r.status = 'running'
-        AND l.actor_state = 'running'
-        AND COALESCE(l.last_heartbeat_at, r.started_at) <= ?
-        AND NOT EXISTS (
-          SELECT 1 FROM pipeline_attempt_actors a WHERE a.run_id = r.id
-        )
-    )
+    SELECT r.* FROM runs r
+    LEFT JOIN pipeline_stage_attempts a
+      ON a.run_id = r.id OR (a.run_id IS NULL AND a.planned_run_id = r.id)
+    WHERE r.status = 'running'
+      AND COALESCE(a.actor_state, r.actor_state) = 'running'
+      AND COALESCE(a.last_heartbeat_at, r.last_heartbeat_at, r.started_at) <= ?
     ORDER BY started_at
   `);
   const ownedReapingActorPredicate = `
     EXISTS (
-      SELECT 1 FROM pipeline_attempt_actors a
-      WHERE a.run_id = runs.id AND a.actor_state = 'reaping' AND a.settlement_owner = ?
+      SELECT 1 FROM pipeline_stage_attempts a
+      WHERE (a.run_id = runs.id OR (a.run_id IS NULL AND a.planned_run_id = runs.id))
+        AND a.actor_state = 'reaping'
+        AND a.settlement_owner = ?
     )
-    OR (
-      NOT EXISTS (SELECT 1 FROM pipeline_attempt_actors a WHERE a.run_id = runs.id)
-      AND EXISTS (
-        SELECT 1 FROM run_liveness l
-        WHERE l.run_id = runs.id AND l.actor_state = 'reaping' AND l.settlement_owner = ?
-      )
-    )
+    OR (runs.actor_state = 'reaping' AND runs.settlement_owner = ?)
   `;
-  const insertAttemptActorStmt = db.prepare(`
-    INSERT OR IGNORE INTO pipeline_attempt_actors (
-      attempt_id, run_id, actor_state, created_at, updated_at
-    )
-    SELECT id, ?, 'running', ?, ? FROM pipeline_stage_attempts
+  const beginAttemptActorStmt = db.prepare(`
+    UPDATE pipeline_stage_attempts
+    SET actor_state = 'running',
+        actor_created_at = COALESCE(actor_created_at, ?),
+        actor_updated_at = ?
     WHERE planned_run_id = ?
   `);
-  const insertRunLivenessStmt = db.prepare(`
-    INSERT INTO run_liveness (run_id, actor_state, updated_at)
-    VALUES (?, 'running', ?)
-  `);
   const settleRunningAttemptActorStmt = db.prepare(`
-    UPDATE pipeline_attempt_actors
-    SET actor_state = 'settled', settlement_reason = ?, updated_at = ?
-    WHERE run_id = ? AND actor_state = 'running'
-  `);
-  const settleRunningLivenessStmt = db.prepare(`
-    UPDATE run_liveness
-    SET actor_state = 'settled', settlement_reason = ?, updated_at = ?
-    WHERE run_id = ? AND actor_state = 'running'
+    UPDATE pipeline_stage_attempts
+    SET actor_state = 'settled', settlement_reason = ?, actor_updated_at = ?
+    WHERE (run_id = ? OR (run_id IS NULL AND planned_run_id = ?)) AND actor_state = 'running'
   `);
   const claimAttemptActorForReapingStmt = db.prepare(`
-    UPDATE pipeline_attempt_actors
-    SET actor_state = 'reaping', settlement_owner = ?, settlement_reason = ?, updated_at = ?
-    WHERE run_id = ? AND actor_state = 'running'
-  `);
-  const claimRunLivenessForReapingStmt = db.prepare(`
-    UPDATE run_liveness
-    SET actor_state = 'reaping', settlement_owner = ?, settlement_reason = ?, updated_at = ?
-    WHERE run_id = ? AND actor_state = 'running'
+    UPDATE pipeline_stage_attempts
+    SET actor_state = 'reaping', settlement_owner = ?, settlement_reason = ?, actor_updated_at = ?
+    WHERE (run_id = ? OR (run_id IS NULL AND planned_run_id = ?)) AND actor_state = 'running'
   `);
   const finishReapingAttemptActorStmt = db.prepare(`
-    UPDATE pipeline_attempt_actors
-    SET actor_state = 'settled', termination_confirmed_at = ?, updated_at = ?
-    WHERE run_id = ? AND actor_state = 'reaping' AND settlement_owner = ?
-  `);
-  const finishReapingRunLivenessStmt = db.prepare(`
-    UPDATE run_liveness
-    SET actor_state = 'settled', termination_confirmed_at = ?, updated_at = ?
-    WHERE run_id = ? AND actor_state = 'reaping' AND settlement_owner = ?
+    UPDATE pipeline_stage_attempts
+    SET actor_state = 'settled', termination_confirmed_at = ?, actor_updated_at = ?
+    WHERE (run_id = ? OR (run_id IS NULL AND planned_run_id = ?))
+      AND actor_state = 'reaping' AND settlement_owner = ?
   `);
   const quarantineAttemptActorStmt = db.prepare(`
-    UPDATE pipeline_attempt_actors
-    SET actor_state = 'quarantined', quarantine_reason = ?, updated_at = ?
-    WHERE run_id = ? AND settlement_owner = ?
-  `);
-  const quarantineRunLivenessStmt = db.prepare(`
-    UPDATE run_liveness
-    SET actor_state = 'quarantined', quarantine_reason = ?, updated_at = ?
-    WHERE run_id = ? AND settlement_owner = ?
+    UPDATE pipeline_stage_attempts
+    SET actor_state = 'quarantined', quarantine_reason = ?, actor_updated_at = ?
+    WHERE (run_id = ? OR (run_id IS NULL AND planned_run_id = ?)) AND settlement_owner = ?
   `);
   const settleQuarantinedAttemptActorStmt = db.prepare(`
-    UPDATE pipeline_attempt_actors SET actor_state = 'settled', termination_confirmed_at = ?, updated_at = ?
-    WHERE run_id = ? AND actor_state = 'quarantined'
-  `);
-  const settleQuarantinedRunLivenessStmt = db.prepare(`
-    UPDATE run_liveness SET actor_state = 'settled', termination_confirmed_at = ?, updated_at = ?
-    WHERE run_id = ? AND actor_state = 'quarantined'
+    UPDATE pipeline_stage_attempts SET actor_state = 'settled', termination_confirmed_at = ?, actor_updated_at = ?
+    WHERE (run_id = ? OR (run_id IS NULL AND planned_run_id = ?)) AND actor_state = 'quarantined'
   `);
   const renewAttemptActorStmt = db.prepare(`
-    UPDATE pipeline_attempt_actors
+    UPDATE pipeline_stage_attempts
     SET last_heartbeat_at = CASE
           WHEN last_heartbeat_at IS NULL OR last_heartbeat_at < ? THEN ?
           ELSE last_heartbeat_at
         END,
-        updated_at = ?
-    WHERE run_id = ? AND actor_state = 'running'
+        actor_updated_at = ?
+    WHERE (run_id = ? OR (run_id IS NULL AND planned_run_id = ?)) AND actor_state = 'running'
   `);
-  const renewRunLivenessStmt = db.prepare(`
-    UPDATE run_liveness
-    SET last_heartbeat_at = CASE
-          WHEN last_heartbeat_at IS NULL OR last_heartbeat_at < ? THEN ?
-          ELSE last_heartbeat_at
-        END,
-        updated_at = ?
-    WHERE run_id = ? AND actor_state = 'running'
-  `);
-  const runLegacyWhenNoActor = (actor: { changes: number }, legacy: () => void): void => {
-    if (actor.changes !== 1) legacy();
-  };
   const beginRunTransaction = db.transaction(
     (params: {
       issueId: string;
@@ -186,8 +137,9 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
       db.prepare(`
         INSERT INTO runs (
           id, linear_issue_id, linear_session_id, session_generation,
-          task_type, token_hash, status, started_at, expires_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?)
+          task_type, token_hash, status, started_at, expires_at,
+          actor_state, actor_created_at, actor_updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, 'running', ?, ?)
       `).run(
         params.runId,
         params.issueId,
@@ -196,12 +148,11 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
         params.taskType,
         params.tokenHash,
         startedAt,
-        params.expiresAt
+        params.expiresAt,
+        startedAt,
+        startedAt
       );
-      runLegacyWhenNoActor(
-        insertAttemptActorStmt.run(params.runId, startedAt, startedAt, params.runId),
-        () => { insertRunLivenessStmt.run(params.runId, startedAt); }
-      );
+      beginAttemptActorStmt.run(startedAt, startedAt, params.runId);
       return true;
     }
   );
@@ -243,15 +194,17 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
       params.ticketState ?? null,
       params.prUrl ?? null,
       params.costUsd ?? null,
-      params.failureTail ?? null,
+      ticketFailureTail(params),
       completedAt,
       existing.linear_issue_id,
       params.runId
     );
-    runLegacyWhenNoActor(
-      settleRunningAttemptActorStmt.run(params.status, completedAt, params.runId),
-      () => { settleRunningLivenessStmt.run(params.status, completedAt, params.runId); }
-    );
+    settleRunningAttemptActorStmt.run(params.status, completedAt, params.runId, params.runId);
+    db.prepare(`
+      UPDATE runs
+      SET actor_state = 'settled', settlement_reason = ?, actor_updated_at = ?
+      WHERE id = ? AND actor_state = 'running'
+    `).run(params.status, completedAt, params.runId);
     workStore.consumeAcknowledgedForRun(params.runId, params.runId);
     workStore.releaseUnacknowledgedForRun(
       params.runId,
@@ -264,22 +217,21 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
       const timestamp = now();
       const existing = getRunStmt.get(runId) as Run | undefined;
       if (existing?.status === "reaping") {
-        const actor = getAttemptActorStmt.get(runId) as { settlement_owner: string | null } | undefined;
+        const actor = getAttemptActorStmt.get(runId, runId, runId) as { settlement_owner: string | null } | undefined;
         if (actor) return actor.settlement_owner === owner ? existing : undefined;
-        const liveness = db.prepare(`
-          SELECT settlement_owner FROM run_liveness
-          WHERE run_id = ? AND actor_state = 'reaping'
-        `).get(runId) as { settlement_owner: string | null } | undefined;
-        return liveness?.settlement_owner === owner ? existing : undefined;
+        return existing.settlement_owner === owner ? existing : undefined;
       }
       const update = db.prepare(
         "UPDATE runs SET status = 'reaping' WHERE id = ? AND status = 'running'"
       ).run(runId);
       if (update.changes !== 1) return undefined;
-      const actor = claimAttemptActorForReapingStmt.run(owner, reason, timestamp, runId);
-      if (actor.changes === 1) return getRunStmt.get(runId) as Run;
-      const liveness = claimRunLivenessForReapingStmt.run(owner, reason, timestamp, runId);
-      if (liveness.changes !== 1) throw new Error(`run ${runId} has inconsistent actor/liveness state`);
+      claimAttemptActorForReapingStmt.run(owner, reason, timestamp, runId, runId);
+      const liveness = db.prepare(`
+        UPDATE runs
+        SET actor_state = 'reaping', settlement_owner = ?, settlement_reason = ?, actor_updated_at = ?
+        WHERE id = ? AND actor_state = 'running'
+      `).run(owner, reason, timestamp, runId);
+      if (liveness.changes !== 1) throw new Error(`run ${runId} has inconsistent actor state`);
       return getRunStmt.get(runId) as Run;
     }
   );
@@ -325,16 +277,18 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
           params.ticketState ?? null,
           params.prUrl ?? null,
           params.costUsd ?? null,
-          params.failureTail ?? null,
+          ticketFailureTail(params),
           completedAt,
           existing.linear_issue_id,
           params.runId
         );
       }
-      runLegacyWhenNoActor(
-        finishReapingAttemptActorStmt.run(completedAt, completedAt, params.runId, params.owner),
-        () => { finishReapingRunLivenessStmt.run(completedAt, completedAt, params.runId, params.owner); }
-      );
+      finishReapingAttemptActorStmt.run(completedAt, completedAt, params.runId, params.runId, params.owner);
+      db.prepare(`
+        UPDATE runs
+        SET actor_state = 'settled', termination_confirmed_at = ?, actor_updated_at = ?
+        WHERE id = ? AND actor_state = 'reaping' AND settlement_owner = ?
+      `).run(completedAt, completedAt, params.runId, params.owner);
       workStore.consumeAcknowledgedForRun(params.runId, params.runId);
       workStore.releaseUnacknowledgedForRun(
         params.runId,
@@ -348,13 +302,9 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
       const timestamp = now();
       const existing = getRunStmt.get(runId) as Run | undefined;
       if (existing?.status === "quarantined") {
-        const actor = getAttemptActorStmt.get(runId) as { settlement_owner: string | null } | undefined;
+        const actor = getAttemptActorStmt.get(runId, runId, runId) as { settlement_owner: string | null } | undefined;
         if (actor) return actor.settlement_owner === owner ? existing : undefined;
-        const liveness = db.prepare(`
-          SELECT settlement_owner FROM run_liveness
-          WHERE run_id = ? AND actor_state = 'quarantined'
-        `).get(runId) as { settlement_owner: string | null } | undefined;
-        return liveness?.settlement_owner === owner ? existing : undefined;
+        return existing.settlement_owner === owner ? existing : undefined;
       }
       const update = db.prepare(`
         UPDATE runs SET status = 'quarantined', failure_tail = ?
@@ -362,10 +312,12 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
           AND (${ownedReapingActorPredicate})
       `).run(reason, runId, owner, owner);
       if (update.changes !== 1) return undefined;
-      runLegacyWhenNoActor(
-        quarantineAttemptActorStmt.run(reason, timestamp, runId, owner),
-        () => { quarantineRunLivenessStmt.run(reason, timestamp, runId, owner); }
-      );
+      quarantineAttemptActorStmt.run(reason, timestamp, runId, runId, owner);
+      db.prepare(`
+        UPDATE runs
+        SET actor_state = 'quarantined', quarantine_reason = ?, actor_updated_at = ?
+        WHERE id = ? AND settlement_owner = ?
+      `).run(reason, timestamp, runId, owner);
       const run = getRunStmt.get(runId) as Run;
       const ticket = getByIssueIdStmt.get(run.linear_issue_id) as Ticket | undefined;
       if (!run.linear_session_id || ticket?.linear_session_id === run.linear_session_id) {
@@ -400,16 +352,18 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
       `).run(
         params.ticketState ?? null,
         params.prUrl ?? null,
-        params.failureTail ?? null,
+        ticketFailureTail(params),
         completedAt,
         existing.linear_issue_id,
         params.runId
       );
     }
-    runLegacyWhenNoActor(
-      settleQuarantinedAttemptActorStmt.run(completedAt, completedAt, params.runId),
-      () => { settleQuarantinedRunLivenessStmt.run(completedAt, completedAt, params.runId); }
-    );
+    settleQuarantinedAttemptActorStmt.run(completedAt, completedAt, params.runId, params.runId);
+    db.prepare(`
+      UPDATE runs
+      SET actor_state = 'settled', termination_confirmed_at = ?, actor_updated_at = ?
+      WHERE id = ? AND actor_state = 'quarantined'
+    `).run(completedAt, completedAt, params.runId);
     workStore.consumeAcknowledgedForRun(params.runId, params.runId);
     workStore.releaseUnacknowledgedForRun(
       params.runId,
@@ -463,15 +417,22 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
     },
     renewRunLiveness(runId, heartbeatAt) {
       const updatedAt = now();
-      const actor = renewAttemptActorStmt.run(heartbeatAt, heartbeatAt, updatedAt, runId);
-      if (actor.changes === 1) return true;
-      return renewRunLivenessStmt.run(heartbeatAt, heartbeatAt, now(), runId).changes === 1;
+      renewAttemptActorStmt.run(heartbeatAt, heartbeatAt, updatedAt, runId, runId);
+      return db.prepare(`
+        UPDATE runs
+        SET last_heartbeat_at = CASE
+              WHEN last_heartbeat_at IS NULL OR last_heartbeat_at < ? THEN ?
+              ELSE last_heartbeat_at
+            END,
+            actor_updated_at = ?
+        WHERE id = ? AND actor_state = 'running'
+      `).run(heartbeatAt, heartbeatAt, updatedAt, runId).changes === 1;
     },
     listExpiredRuns(nowIso) {
       return listExpiredRunsStmt.all(nowIso) as Run[];
     },
     listStalledRuns(cutoffIso) {
-      return listStalledRunsStmt.all(cutoffIso, cutoffIso) as Run[];
+      return listStalledRunsStmt.all(cutoffIso) as Run[];
     },
   };
 }

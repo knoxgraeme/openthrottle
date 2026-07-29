@@ -32,13 +32,8 @@ setup() {
   [ "$status" -ne 0 ]
 }
 
-@test "sealed stage push policy blocks fresh review and fails closed" {
+@test "sealed stage push policy allows known policies and fails closed" {
   policy="${BATS_TEST_TMPDIR}/stage-push-policy"
-  printf '%s\n' fresh_review > "$policy"
-  run "${BATS_TEST_DIRNAME}/../safety/enforce-stage-push-policy" "$policy"
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"pushes are forbidden during a fresh-review stage"* ]]
-
   printf '%s\n' prefer_resume > "$policy"
   run "${BATS_TEST_DIRNAME}/../safety/enforce-stage-push-policy" "$policy"
   [ "$status" -eq 0 ]
@@ -47,6 +42,29 @@ setup() {
   run "${BATS_TEST_DIRNAME}/../safety/enforce-stage-push-policy" "$policy"
   [ "$status" -ne 0 ]
   [[ "$output" == *"absent or invalid"* ]]
+}
+
+@test "pre-push blocks internal unit refs" {
+  if ! install -d -m 0755 /run/openthrottle 2>/dev/null; then
+    skip "cannot install default root-owned push policy in this test environment"
+  fi
+  printf '%s\n' prefer_resume > /run/openthrottle/stage-push-policy
+  chmod 0444 /run/openthrottle/stage-push-policy
+
+  repo="${BATS_TEST_TMPDIR}/repo"
+  mkdir "$repo"
+  git -C "$repo" init -q -b main
+  git -C "$repo" config user.name Test
+  git -C "$repo" config user.email test@example.com
+  printf '%s\n' initial > "$repo/file.txt"
+  git -C "$repo" add .
+  git -C "$repo" commit -qm initial
+
+  run env -C "$repo" "${BATS_TEST_DIRNAME}/../safety/pre-push" <<EOF
+refs/heads/main $(git -C "$repo" rev-parse HEAD) refs/heads/unit/attempt-1 0000000000000000000000000000000000000000
+EOF
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"internal OpenThrottle worktree ref"* ]]
 }
 
 @test "resolve_git_identity uses GitHub noreply, then a placeholder" {
@@ -91,6 +109,75 @@ setup() {
   # A seed from a different account is rejected, not silently trusted.
   run codex_reconcile_auth "$newer" "$other"
   [ "$output" = "incompatible" ]
+}
+
+@test "bake-once bootstrap gate: fresh sandbox runs, completed marker skips" {
+  marker="${BATS_TEST_TMPDIR}/bootstrap.json"
+  sentinel="${BATS_TEST_TMPDIR}/bootstrap.started"
+  digest_a="$(printf 'a%.0s' {1..64})"
+
+  # Fresh sandbox (no marker, no sentinel): the bake-once bootstrap must run,
+  # whether or not this stage performed the initial clone.
+  run evaluate_bootstrap_marker "$marker" "$sentinel" "$digest_a" 1
+  [ "$status" -eq 0 ]
+  [ "$output" = "run" ]
+  run evaluate_bootstrap_marker "$marker" "$sentinel" "$digest_a" 0
+  [ "$status" -eq 0 ]
+  [ "$output" = "run" ]
+
+  # Second stage: a completed marker for the same sealed digest skips the
+  # bootstrap and replays the recorded codex hook-trust probe.
+  printf '{"schema":"openthrottle.sandbox-bootstrap/v1","repositoryConfigDigest":"%s","codexHookTrust":true,"completedAt":"2026-07-26T00:00:00Z"}\n' \
+    "$digest_a" > "$marker"
+  run evaluate_bootstrap_marker "$marker" "$sentinel" "$digest_a" 0
+  [ "$status" -eq 0 ]
+  [ "$output" = "skip 1" ]
+
+  printf '{"schema":"openthrottle.sandbox-bootstrap/v1","repositoryConfigDigest":"%s","codexHookTrust":false,"completedAt":"2026-07-26T00:00:00Z"}\n' \
+    "$digest_a" > "$marker"
+  run evaluate_bootstrap_marker "$marker" "$sentinel" "$digest_a" 0
+  [ "$status" -eq 0 ]
+  [ "$output" = "skip 0" ]
+}
+
+@test "bake-once bootstrap gate fails closed on digest mismatch with the exact error" {
+  marker="${BATS_TEST_TMPDIR}/bootstrap.json"
+  sentinel="${BATS_TEST_TMPDIR}/bootstrap.started"
+  digest_a="$(printf 'a%.0s' {1..64})"
+  digest_b="$(printf 'b%.0s' {1..64})"
+  printf '{"schema":"openthrottle.sandbox-bootstrap/v1","repositoryConfigDigest":"%s","codexHookTrust":true,"completedAt":"2026-07-26T00:00:00Z"}\n' \
+    "$digest_a" > "$marker"
+
+  run evaluate_bootstrap_marker "$marker" "$sentinel" "$digest_b" 0
+  [ "$status" -eq 1 ]
+  [ "$output" = "FATAL: sandbox bootstrap marker records repository config digest ${digest_a} but the sealed stage request requires ${digest_b}; the sandbox is stale — the supervisor must reprovision it" ]
+}
+
+@test "bake-once bootstrap gate fails closed on torn or inconsistent state" {
+  marker="${BATS_TEST_TMPDIR}/bootstrap.json"
+  sentinel="${BATS_TEST_TMPDIR}/bootstrap.started"
+  digest_a="$(printf 'a%.0s' {1..64})"
+
+  # Sentinel without a completion marker: a previous bootstrap died mid-run.
+  printf '%s\n' "$digest_a" > "$sentinel"
+  run evaluate_bootstrap_marker "$marker" "$sentinel" "$digest_a" 0
+  [ "$status" -eq 1 ]
+  [ "$output" = "FATAL: sandbox bootstrap started but never completed; the sandbox is stale — the supervisor must reprovision it" ]
+  rm -f "$sentinel"
+
+  # Matching marker but the checkout was recreated this stage: the baked
+  # dependency state is gone, so skipping would be a silent lie.
+  printf '{"schema":"openthrottle.sandbox-bootstrap/v1","repositoryConfigDigest":"%s","codexHookTrust":true,"completedAt":"2026-07-26T00:00:00Z"}\n' \
+    "$digest_a" > "$marker"
+  run evaluate_bootstrap_marker "$marker" "$sentinel" "$digest_a" 1
+  [ "$status" -eq 1 ]
+  [ "$output" = "FATAL: sandbox bootstrap marker is present but the repository checkout was recreated; the sandbox is stale — the supervisor must reprovision it" ]
+
+  # Corrupt marker JSON is never trusted.
+  printf 'not json\n' > "$marker"
+  run evaluate_bootstrap_marker "$marker" "$sentinel" "$digest_a" 0
+  [ "$status" -eq 1 ]
+  [ "$output" = "FATAL: sandbox bootstrap marker is unreadable; the sandbox is stale — the supervisor must reprovision it" ]
 }
 
 @test "codex_reconcile_auth orders ISO-8601 offsets and fractional seconds by instant" {

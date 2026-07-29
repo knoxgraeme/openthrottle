@@ -9,7 +9,7 @@ import {
   resolvePipelineReference,
   validatePipelineManifest,
 } from "./manifest.js";
-import { buildInstalledRuntimeDescriptor } from "../runtime/contracts.js";
+import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 
 function transitions(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   const output: Record<string, unknown> = {
@@ -55,16 +55,23 @@ function manifest(): Record<string, unknown> {
   };
 }
 
-function withoutIdentity(value: unknown): unknown {
-  const copy = { ...(value as Record<string, unknown>) };
-  delete copy.id;
-  delete copy.version;
-  return copy;
-}
-
 function firstStage(value: Record<string, unknown>): Record<string, unknown> {
   return (value.stages as Array<Record<string, unknown>>)[0]!;
 }
+
+const CORE_IMPLEMENT_V4_STAGE_IDS = [
+  "implementation",
+  "repair_implementation",
+  "repair_semantic_review",
+  "semantic_review",
+  "simplification",
+  "post_simplify_review",
+  "test",
+  "lint",
+  "build",
+  "publish",
+  "provider",
+];
 
 describe("pipeline manifest validation", () => {
   it("loads the shipped catalog deterministically against independent runtime evidence", () => {
@@ -75,33 +82,21 @@ describe("pipeline manifest validation", () => {
 
     expect(first.digest).toBe(second.digest);
     expect([...first.manifests.keys()]).toEqual([
-      "core/implement@1",
+      "core/implement@4",
       "core/investigate@1",
-      "ce/implement@2",
-      "ce/implement@3",
-      "ce/investigate@2",
     ]);
-    expect(resolvePipelineReference(first, "implement").manifest.id).toBe("core/implement");
-    expect(resolvePipelineReference(first, "implement").manifest.version).toBe(1);
-    expect(resolvePipelineReference(first, "ce/implement@3").manifest.id).toBe("ce/implement");
-    expect(() => resolvePipelineReference(first, "ce/implement@1"))
+    const implementManifest = resolvePipelineReference(first, "implement").manifest;
+    expect(implementManifest.id).toBe("core/implement");
+    expect(implementManifest.version).toBe(4);
+    expect(() => resolvePipelineReference(first, "core/implement@3"))
       .toThrow(/unknown pipeline selection/);
-    expect(() => resolvePipelineReference(first, "ce/investigate@1"))
+    expect(() => resolvePipelineReference(first, "core/implement@1"))
       .toThrow(/unknown pipeline selection/);
     expect(() => resolvePipelineReference(first, "fixture/command@1"))
       .toThrow(/unknown pipeline selection/);
     expect(() => resolvePipelineReference(first, "fixture-command"))
       .toThrow(/unknown pipeline selection/);
-    expect(resolvePipelineReference(first, "implement").manifest.stages.map((stage) => stage.id)).toEqual([
-      "implementation",
-      "semantic_review",
-      "simplification",
-      "test",
-      "lint",
-      "build",
-      "publish",
-      "provider",
-    ]);
+    expect(implementManifest.stages.map((stage) => stage.id)).toEqual(CORE_IMPLEMENT_V4_STAGE_IDS);
     expect(resolvePipelineReference(first, "investigate").manifest.stages.map((stage) => stage.id)).toEqual([
       "investigate",
       "publish",
@@ -184,6 +179,22 @@ describe("pipeline manifest validation", () => {
       .toEqual({ to: "stage", max_reentries: 5, on_exhausted: "failed" });
   });
 
+  it("accepts manifest-set raw attempt and repair round budgets", () => {
+    const value = manifest();
+    value.max_attempts = 200;
+    value.max_repair_rounds = 5;
+
+    expect(validatePipelineManifest(value).manifest).toMatchObject({
+      max_attempts: 200,
+      max_repair_rounds: 5,
+    });
+
+    expect(() => validatePipelineManifest({ ...value, max_attempts: 201 }))
+      .toThrow(/pipeline\.max_attempts: must be an integer between 1 and 200/);
+    expect(() => validatePipelineManifest({ ...value, max_repair_rounds: 21 }))
+      .toThrow(/pipeline\.max_repair_rounds: must be an integer between 1 and 20/);
+  });
+
   it("rejects invalid defaults before reducers can observe them", () => {
     expect(() => validatePipelineManifest({
       ...manifest(),
@@ -220,48 +231,37 @@ describe("pipeline manifest validation", () => {
       .toThrow(/pipeline\.stages\[0\]\.retry\.to: unknown field/);
   });
 
-  it("keeps neutral core manifests topology-equivalent to their immutable ce twins", () => {
+  it("ships core/implement@4 with round-based repair budget and scoped repair re-entry", () => {
     const path = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
     const catalog = loadPipelineCatalog(path, buildInstalledRuntimeDescriptor("test-runtime/v1").descriptor);
+    const v4 = resolvePipelineReference(catalog, "core/implement@4").manifest;
 
-    expect(withoutIdentity(resolvePipelineReference(catalog, "core/implement@1").manifest))
-      .toEqual(withoutIdentity(resolvePipelineReference(catalog, "ce/implement@3").manifest));
-    expect(withoutIdentity(resolvePipelineReference(catalog, "core/investigate@1").manifest))
-      .toEqual(withoutIdentity(resolvePipelineReference(catalog, "ce/investigate@2").manifest));
-  });
+    expect(v4.version).toBe(4);
+    expect(v4.max_attempts).toBe(200);
+    expect(v4.max_repair_rounds).toBe(5);
+    expect(v4.stages.map((stage) => stage.id)).toEqual(CORE_IMPLEMENT_V4_STAGE_IDS);
 
-  it("ships ce/implement@3 as a plan-in pipeline while keeping ce/implement@2 pinned-instance immutable", () => {
-    const path = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
-    const runtime = buildInstalledRuntimeDescriptor("test-runtime/v1");
-    const catalog = loadPipelineCatalog(path, runtime.descriptor);
+    const implementation = v4.stages.find((stage) => stage.id === "implementation")!;
+    const repairImplementation = v4.stages.find((stage) => stage.id === "repair_implementation")!;
+    const semanticReview = v4.stages.find((stage) => stage.id === "semantic_review")!;
+    const repairSemanticReview = v4.stages.find((stage) => stage.id === "repair_semantic_review")!;
 
-    // v2 stays registered so pinned instances keep resolving to an identical manifest.
-    const v2 = resolvePipelineReference(catalog, "ce/implement@2").manifest;
-    expect(v2.version).toBe(2);
-    expect(v2.entry_stage).toBe("planning");
-    expect(v2.requires.capabilities).toContain("ce/plan@1");
+    expect(implementation.transitions.success).toEqual({ to: "semantic_review" });
+    expect(semanticReview.transitions.success).toEqual({ to: "simplification" });
+    expect(semanticReview.transitions.no_change).toEqual({ to: "simplification" });
+    expect(semanticReview.transitions.semantic_repair_required).toEqual({
+      to: "repair_implementation",
+      max_reentries: 5,
+      on_exhausted: "needs_human",
+    });
 
-    // v3 removes planning: the shipped plan is already approved, implementation enters directly.
-    const v3 = resolvePipelineReference(catalog, "ce/implement@3").manifest;
-    expect(v3.version).toBe(3);
-    expect(v3.entry_stage).toBe("implementation");
-    expect(v3.stages.some((stage) => stage.id === "planning")).toBe(false);
-    expect(v3.requires.capabilities).not.toContain("ce/plan@1");
-
-    // With no prior native session, the entry stage must start fresh, not resume.
-    const implementation = v3.stages.find((stage) => stage.id === "implementation")!;
-    expect(implementation.context).toBe("fresh");
-    expect(implementation.live_steering).toBe(true);
-
-    // Downstream stages still resume implementation's session, and nothing references planning.
-    for (const id of ["semantic_review", "simplification", "publish"]) {
-      expect(v3.stages.find((stage) => stage.id === id)?.context).toBe("resume_required");
-    }
-    for (const stage of v3.stages) {
-      for (const transition of Object.values(stage.transitions)) {
-        expect(transition.to).not.toBe("planning");
-      }
-    }
+    expect(repairImplementation.executor).toEqual(implementation.executor);
+    expect(repairImplementation.context).toBe("resume_required");
+    expect(repairImplementation.transitions.success).toEqual({ to: "repair_semantic_review" });
+    expect(repairImplementation.transitions.no_change).toEqual({ to: "repair_semantic_review" });
+    expect(repairSemanticReview.executor).toEqual(semanticReview.executor);
+    expect(repairSemanticReview.transitions.success).toEqual({ to: "test" });
+    expect(repairSemanticReview.transitions.no_change).toEqual({ to: "test" });
   });
 
   it("keeps multi-version and provider-neutral manifests in a test-only catalog", () => {
@@ -273,6 +273,7 @@ describe("pipeline manifest validation", () => {
       "fixture/command@1",
       "fixture/command@2",
       "fixture/agent@1",
+      "fixture/dual-review@1",
     ]);
     expect(resolvePipelineReference(catalog, "fixture/command@1").manifest.id).toBe("fixture/command");
     expect(resolvePipelineReference(catalog, "fixture-command").manifest.version).toBe(2);
@@ -291,7 +292,20 @@ describe("pipeline manifest validation", () => {
     (unbounded.stages as Array<Record<string, unknown>>)[0]!.transitions = transitions({
       semantic_repair_required: { to: "stage" },
     });
-    expect(() => validatePipelineManifest(unbounded)).toThrow(/unbounded cycle/);
+    expect(() => validatePipelineManifest(unbounded)).toThrow(/re-entering transitions must declare max_reentries/);
+
+    const boundedForwardOnly = manifest();
+    const later = structuredClone(firstStage(boundedForwardOnly));
+    later.id = "later";
+    firstStage(boundedForwardOnly).transitions = transitions({
+      success: { to: "later", max_reentries: 1, on_exhausted: "failed" },
+    });
+    later.transitions = transitions({
+      success: { to: "stage" },
+    });
+    (boundedForwardOnly.stages as Array<Record<string, unknown>>).push(later);
+    expect(() => validatePipelineManifest(boundedForwardOnly))
+      .toThrow(/pipeline\.stages\.later\.transitions\.success: re-entering transitions must declare max_reentries/);
 
     const unreachable = manifest();
     (unreachable.stages as unknown[]).push({
@@ -323,17 +337,41 @@ describe("pipeline manifest validation", () => {
     expect(() => validatePipelineManifest(undeclared)).toThrow(/not declared in requires.capabilities/);
   });
 
+  it("requires command executors to declare an allowlisted repository command", () => {
+    const command = manifest();
+    command.requires = { protocol: "stage-executor@1", capabilities: ["command/run@1"] };
+    const stage = firstStage(command);
+    stage.executor = { kind: "command", capability: "command/run@1" };
+    stage.commandName = "test";
+    stage.evaluator = { kind: "command", assurance: "executor_verified", required_artifacts: ["command_result"] };
+    stage.live_steering = false;
+    stage.credentials = ["repo.read"];
+    stage.produces = ["stage_result", "command_result"];
+
+    expect(validatePipelineManifest(command).manifest.stages[0]).toMatchObject({ commandName: "test" });
+
+    delete stage.commandName;
+    expect(() => validatePipelineManifest(command)).toThrow(/commandName: is required for command executors/);
+
+    stage.commandName = "deploy";
+    expect(() => validatePipelineManifest(command)).toThrow(/commandName: must be one of/);
+
+    const agent = manifest();
+    firstStage(agent).commandName = "test";
+    expect(() => validatePipelineManifest(agent)).toThrow(/commandName: is allowed only for command executors/);
+  });
+
   it("accepts only bounded repository settings and canonical pipeline selections", () => {
     const parsed = parseRepositoryConfig(`
 agent: codex
 test: npm test --prefix supervisor
 limits: { max_turns: 20, task_timeout: 300 }
-pipelines: { implement: implement, investigate: ce/investigate@2 }
+pipelines: { implement: implement, investigate: core/investigate@2 }
 mcp_servers: {}
 `);
     expect(parsed.config.pipelines).toEqual({
       implement: "implement",
-      investigate: "ce/investigate@2",
+      investigate: "core/investigate@2",
     });
     expect(parseRepositoryConfig(parsed.normalized.replace(/^/, "")).digest).toBe(parsed.digest);
     expect(() => parseRepositoryConfig("pipeline_logic: !!js/function evil")).toThrow();

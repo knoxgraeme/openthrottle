@@ -17,11 +17,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: |
+            contracts/package-lock.json
             supervisor/package-lock.json
             cli/package-lock.json
             sandbox/package-lock.json
@@ -29,11 +32,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y bats jq
       - name: Install Node dependencies
         run: |
+          npm ci --prefix contracts
           npm ci --prefix supervisor
           npm ci --prefix cli
           npm ci --prefix sandbox
       - name: Typecheck
         run: |
+          npm run typecheck --prefix contracts
+          npm run build --prefix contracts
           npm run typecheck --prefix supervisor
           npm run typecheck --prefix cli
       - name: Build production artifacts
@@ -51,6 +57,7 @@ jobs:
           npm test --prefix sandbox -- runner/capabilities.test.mjs tests/ce-adapters.test.mjs
       - name: Test
         run: |
+          npm test --prefix contracts
           npm test --prefix supervisor
           npm test --prefix cli
           npm test --prefix sandbox
@@ -61,6 +68,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Build supervisor image
+        # Repo-root context so the supervisor's file:../contracts dependency
+        # resolves; guards the Fly deploy build (deploy.yml) which CI would
+        # otherwise never exercise.
+        run: docker build -f supervisor/Dockerfile -t openthrottle-supervisor:test .
       - name: Build sandbox image
         run: docker build -f sandbox/Dockerfile -t openthrottle:test .
       - name: Exercise sandbox lifecycle with stub agent

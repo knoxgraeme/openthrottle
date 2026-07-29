@@ -4,6 +4,7 @@ import type {
   SandboxAutostopRuntime,
 } from "./contracts.js";
 import type { Ticket, SupervisorStore } from "../persistence/store.js";
+import type { ChildActionLivenessPort } from "../pipeline/store.js";
 import { reconcileSandboxAutostop } from "./lifecycle.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import {
@@ -25,6 +26,7 @@ const WORKSPACE_SUBJECT_COMMAND = "node /opt/openthrottle/runner/execute-stage.m
 const MAX_EVENT_BYTES = 32 * 1024;
 const MAX_STAGE_EVENT_BYTES = 64 * 1024;
 const INGESTION_DIAGNOSTIC_ATTEMPTS = 5;
+const CHILD_ACTION_HEARTBEAT_LEASE_MS = 60_000;
 
 interface SandboxEventFile {
   name: string;
@@ -109,6 +111,7 @@ interface SandboxEventPollerParams {
   // from the sandbox after a stage completes. Failures are logged and ignored.
   captureAgentAuth?: (sandbox: RuntimeWorkspace, ticket: Ticket) => Promise<void>;
   postStageResult?: (event: SandboxStageResultEvent, observedSubject: string) => Promise<unknown>;
+  childActions?: ChildActionLivenessPort;
 }
 
 interface ProgressEventTarget {
@@ -253,8 +256,20 @@ async function pollTicketEvents(
       if (event.kind === "heartbeat") {
         // Supervisor receipt time is authoritative; a skewed sandbox clock
         // cannot extend a lease into the future.
-        if (!params.store.renewRunLiveness(event.run_id, new Date().toISOString())) {
+        const heartbeatAt = new Date();
+        if (!params.store.renewRunLiveness(event.run_id, heartbeatAt.toISOString())) {
           throw new Error(`heartbeat rejected for inactive run ${event.run_id}`);
+        }
+        if (event.child_action_id && params.childActions) {
+          const renewed = params.childActions.renewChildActionLiveness({
+            parentRunId: event.run_id,
+            actionId: event.child_action_id,
+            heartbeatAtIso: heartbeatAt.toISOString(),
+            leaseUntilIso: new Date(heartbeatAt.getTime() + CHILD_ACTION_HEARTBEAT_LEASE_MS).toISOString(),
+          });
+          if (!renewed) {
+            console.warn(`[sandbox-events] child heartbeat ignored for inactive action ${event.child_action_id}`);
+          }
         }
       } else if (event.kind === "activity") {
         const target = resolveProgressEventTarget(params, ticket, event);

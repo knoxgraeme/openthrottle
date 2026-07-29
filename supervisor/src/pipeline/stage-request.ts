@@ -1,6 +1,8 @@
 import {
   type ArtifactKind,
   canonicalJson,
+  COMMAND_NAMES,
+  type CommandName,
   digestNormalized,
   type ContextPolicy,
   type PipelineStage,
@@ -39,7 +41,8 @@ export interface StageRequestEnvelope {
   requiredArtifacts: ArtifactKind[];
   credentialScopes: string[];
   liveSteering: boolean;
-  commandName?: "test" | "lint" | "build" | "format";
+  commandName?: CommandName;
+  childActionId?: string;
 }
 
 export function createStageRequestHash(
@@ -58,6 +61,11 @@ function deterministicId(prefix: string, input: unknown): string {
 
 export function plannedStageRunId(attemptId: string): string {
   return deterministicId("run", [attemptId, "stage-execution"]);
+}
+
+function legacyImplicitCommandName(stage: PipelineStage): CommandName | undefined {
+  if (stage.executor.kind !== "command") return undefined;
+  return COMMAND_NAMES.find((commandName) => commandName === stage.id);
 }
 
 export function buildStageRequest(input: {
@@ -83,8 +91,9 @@ export function buildStageRequest(input: {
   contextRevision: number;
   expectedSubject: string | null;
   nativeSessionId: string | null;
+  childActionId?: string | null;
 }): StageRequestEnvelope {
-  const commandNames = new Set(["test", "lint", "build", "format"] as const);
+  const commandName = input.stage.commandName ?? legacyImplicitCommandName(input.stage);
   const withoutFence: Omit<StageRequestEnvelope, "requestHash" | "idempotencyKey"> = {
     protocol: STAGE_EXECUTOR_PROTOCOL,
     pipelineInstanceId: input.instanceId,
@@ -114,9 +123,8 @@ export function buildStageRequest(input: {
     requiredArtifacts: [...new Set(["stage_result" as const, ...input.stage.evaluator.required_artifacts])].sort(),
     credentialScopes: [...input.stage.credentials].sort(),
     liveSteering: input.stage.live_steering,
-    ...(input.stage.executor.kind === "command" && commandNames.has(input.stage.id as never)
-      ? { commandName: input.stage.id as "test" | "lint" | "build" | "format" }
-      : {}),
+    ...(commandName ? { commandName } : {}),
+    ...(input.childActionId ? { childActionId: input.childActionId } : {}),
   };
   return { ...withoutFence, ...createStageRequestHash(withoutFence) };
 }

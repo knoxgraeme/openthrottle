@@ -1,15 +1,7 @@
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
-import {
-  backfillLegacySessionExecutions,
-  backfillLegacyWork,
-  backfillPipelineAttemptActors,
-  backfillPipelineExecutionIdentity,
-  backfillPipelinePublicationState,
-  backfillRunLiveness,
-  hasColumns,
-  hasTable,
-} from "./reconciliation.js";
+import type { PipelineInstance } from "../../pipeline/store.js";
+import { persistSelectionPublications } from "../pipeline/helpers.js";
 
 interface DatabaseMigrationDefinition {
   version: number;
@@ -20,6 +12,95 @@ interface DatabaseMigrationDefinition {
 
 export interface DatabaseMigration extends DatabaseMigrationDefinition {
   checksum: string;
+}
+
+function hasTable(db: Database.Database, name: string): boolean {
+  return Boolean(
+    db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name)
+  );
+}
+
+function hasColumns(db: Database.Database, table: string, columns: string[]): boolean {
+  if (!hasTable(db, table)) return false;
+  const present = new Set(
+    (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(
+      (column) => column.name
+    )
+  );
+  return columns.every((column) => present.has(column));
+}
+
+function backfillPipelinePublicationState(db: Database.Database): void {
+  if (!hasTable(db, "pipeline_publication_receipts")) return;
+  const timestamp = new Date().toISOString();
+  db.prepare(`
+    UPDATE pipeline_publication_receipts
+    SET payload = COALESCE(payload, '{}'),
+        next_attempt_at = COALESCE(next_attempt_at, created_at, ?),
+        updated_at = COALESCE(updated_at, created_at, ?)
+  `).run(timestamp, timestamp);
+}
+
+function backfillPipelineExecutionIdentity(db: Database.Database): void {
+  if (!hasColumns(db, "tickets", ["linear_issue_id", "branch", "agent"])) return;
+  db.exec(`
+    UPDATE pipeline_instances
+    SET branch = (SELECT branch FROM tickets WHERE tickets.linear_issue_id = pipeline_instances.linear_issue_id),
+        agent = (SELECT agent FROM tickets WHERE tickets.linear_issue_id = pipeline_instances.linear_issue_id)
+  `);
+}
+
+function backfillLegacySessionExecutions(db: Database.Database): void {
+  if (!hasColumns(db, "agent_sessions", ["id", "linear_issue_id", "generation"])) return;
+  const timestamp = new Date().toISOString();
+  db.prepare(`
+    INSERT OR IGNORE INTO session_executions (
+      linear_session_id, linear_issue_id, generation, execution_mode,
+      pipeline_instance_id, pinned_at
+    )
+    SELECT id, linear_issue_id, generation, 'legacy', NULL, ?
+    FROM agent_sessions
+  `).run(timestamp);
+}
+
+function backfillRunLiveness(db: Database.Database): void {
+  if (!hasColumns(db, "runs", ["id", "status", "started_at"])) return;
+  db.prepare(`
+    INSERT OR IGNORE INTO run_liveness(run_id, actor_state, updated_at)
+    SELECT id, 'running', started_at FROM runs WHERE status = 'running'
+  `).run();
+}
+
+function backfillPipelineAttemptActors(db: Database.Database): void {
+  if (
+    !hasColumns(db, "pipeline_stage_attempts", ["id", "run_id", "planned_run_id", "created_at", "updated_at"]) ||
+    !hasColumns(db, "runs", ["id", "status", "started_at"])
+  ) return;
+  const timestamp = new Date().toISOString();
+  db.prepare(`
+    INSERT OR IGNORE INTO pipeline_attempt_actors (
+      attempt_id, run_id, actor_state, last_heartbeat_at, settlement_owner,
+      settlement_reason, termination_confirmed_at, quarantine_reason, created_at, updated_at
+    )
+    SELECT
+      psa.id,
+      r.id,
+      CASE
+        WHEN l.actor_state IN ('running', 'reaping', 'quarantined', 'settled') THEN l.actor_state
+        WHEN r.status IN ('running', 'reaping', 'quarantined') THEN r.status
+        ELSE 'settled'
+      END,
+      l.last_heartbeat_at,
+      l.settlement_owner,
+      l.settlement_reason,
+      l.termination_confirmed_at,
+      l.quarantine_reason,
+      COALESCE(r.started_at, psa.created_at, ?),
+      COALESCE(l.updated_at, r.started_at, psa.updated_at, ?)
+    FROM pipeline_stage_attempts psa
+    JOIN runs r ON r.id = COALESCE(psa.run_id, psa.planned_run_id)
+    LEFT JOIN run_liveness l ON l.run_id = r.id
+  `).run(timestamp, timestamp);
 }
 
 const durableWorkSchema = `
@@ -584,6 +665,624 @@ ALTER TABLE sandbox_events ADD COLUMN ingestion_diagnosed_at TEXT;
 const sandboxEventDiagnosticsMigrationSource = `${sandboxEventDiagnosticsSchema}
 sandbox-event-diagnostics:repeated ingestion failures retain a one-time surfaced diagnostic/v1`;
 
+const pipelineIdleEffectSchema = `
+    CREATE TABLE pipeline_effect_intents_next (
+      id TEXT PRIMARY KEY,
+      pipeline_instance_id TEXT NOT NULL,
+      transition_version INTEGER NOT NULL CHECK(transition_version >= 1),
+      kind TEXT NOT NULL CHECK(kind IN (
+        'provision', 'bootstrap', 'dispatch_stage', 'idle', 'stop', 'quarantine', 'cleanup',
+        'publish_linear', 'publish_github', 'publish_pr'
+      )),
+      idempotency_key TEXT NOT NULL UNIQUE,
+      payload TEXT NOT NULL,
+      payload_hash TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('pending', 'processing', 'acknowledged', 'failed', 'dead')),
+      attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+      next_attempt_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      acknowledged_at TEXT,
+      last_error TEXT,
+      FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
+      UNIQUE(pipeline_instance_id, transition_version, kind, idempotency_key)
+    );
+    INSERT INTO pipeline_effect_intents_next (
+      id, pipeline_instance_id, transition_version, kind, idempotency_key,
+      payload, payload_hash, status, attempts, next_attempt_at, created_at,
+      acknowledged_at, last_error
+    )
+    SELECT
+      id, pipeline_instance_id, transition_version, kind, idempotency_key,
+      payload, payload_hash, status, attempts, next_attempt_at, created_at,
+      acknowledged_at, last_error
+    FROM pipeline_effect_intents;
+    DROP TABLE pipeline_effect_intents;
+    ALTER TABLE pipeline_effect_intents_next RENAME TO pipeline_effect_intents;
+    CREATE INDEX pipeline_effects_pending_idx ON pipeline_effect_intents(status, next_attempt_at);
+`;
+
+const pipelineIdleEffectMigrationSource = `${pipelineIdleEffectSchema}
+effect-kind-contract:provider wait can idle an active sandbox without changing coordinator authority/v1`;
+
+function widenPipelineEffectIntentsForIdle(db: Database.Database): void {
+  if (!hasTable(db, "pipeline_effect_intents")) return;
+  db.exec(pipelineIdleEffectSchema);
+}
+
+const feedbackObservedHeadSchema = `
+ALTER TABLE feedback_snapshots ADD COLUMN observed_head_sha TEXT;
+UPDATE feedback_snapshots SET observed_head_sha = head_sha WHERE observed_head_sha IS NULL;
+`;
+
+const feedbackObservedHeadMigrationSource = `${feedbackObservedHeadSchema}
+observed-head-provenance:carried feedback keeps the head each provider event was observed against, distinct from the drainable head, for the exact-subject audit seal/v1`;
+
+function addFeedbackObservedHeadProvenance(db: Database.Database): void {
+  if (!hasTable(db, "feedback_snapshots")) return;
+  if (hasColumns(db, "feedback_snapshots", ["observed_head_sha"])) return;
+  db.exec(feedbackObservedHeadSchema);
+}
+
+const selectionPublicationBackfillSource = `
+backfill-contract:active pipeline instances carry selection ledger and github summary publications/v1
+seed missing linear_ledger and github_summary selection receipts once, using the normal publication writer identity and payload rules`;
+
+function backfillSelectionPublications(db: Database.Database): void {
+  if (
+    !hasTable(db, "pipeline_instances") ||
+    !hasTable(db, "pipeline_publication_receipts") ||
+    !hasTable(db, "linear_outbox")
+  ) return;
+  const timestamp = new Date().toISOString();
+  const instances = db.prepare(`
+    SELECT * FROM pipeline_instances pi
+    WHERE pi.status NOT IN (
+      'shipped', 'no_change', 'needs_human', 'canceled', 'superseded', 'failed',
+      'publication_blocked'
+    )
+      AND NOT EXISTS (
+        SELECT 1 FROM pipeline_publication_receipts ppr
+        WHERE ppr.pipeline_instance_id = pi.id AND ppr.kind = 'linear_ledger'
+      )
+  `).all() as PipelineInstance[];
+  for (const instance of instances) {
+    persistSelectionPublications({ db, instance, timestamp });
+  }
+}
+
+const satelliteTableContractionSchema = `
+ALTER TABLE agent_sessions ADD COLUMN execution_mode TEXT CHECK(execution_mode IS NULL OR execution_mode IN ('legacy', 'pipeline'));
+ALTER TABLE agent_sessions ADD COLUMN pipeline_instance_id TEXT;
+CREATE UNIQUE INDEX agent_sessions_pipeline_instance_unique
+  ON agent_sessions(pipeline_instance_id) WHERE pipeline_instance_id IS NOT NULL;
+ALTER TABLE pipeline_instances ADD COLUMN runtime_provider TEXT;
+ALTER TABLE pipeline_instances ADD COLUMN runtime_provider_resource_id TEXT;
+ALTER TABLE pipeline_instances ADD COLUMN runtime_resource_status TEXT
+  CHECK(runtime_resource_status IS NULL OR runtime_resource_status IN ('active', 'stopped', 'quarantined', 'cleaned'));
+ALTER TABLE pipeline_instances ADD COLUMN runtime_resource_created_at TEXT;
+ALTER TABLE pipeline_instances ADD COLUMN runtime_resource_updated_at TEXT;
+CREATE UNIQUE INDEX pipeline_instances_runtime_resource_unique
+  ON pipeline_instances(runtime_provider_resource_id) WHERE runtime_provider_resource_id IS NOT NULL;
+ALTER TABLE runs ADD COLUMN actor_state TEXT
+  CHECK(actor_state IS NULL OR actor_state IN ('running', 'reaping', 'quarantined', 'settled'));
+ALTER TABLE runs ADD COLUMN last_heartbeat_at TEXT;
+ALTER TABLE runs ADD COLUMN settlement_owner TEXT;
+ALTER TABLE runs ADD COLUMN settlement_reason TEXT;
+ALTER TABLE runs ADD COLUMN termination_confirmed_at TEXT;
+ALTER TABLE runs ADD COLUMN quarantine_reason TEXT;
+ALTER TABLE runs ADD COLUMN actor_created_at TEXT;
+ALTER TABLE runs ADD COLUMN actor_updated_at TEXT;
+CREATE INDEX runs_actor_state_idx ON runs(actor_state, last_heartbeat_at);
+ALTER TABLE pipeline_stage_attempts ADD COLUMN actor_state TEXT
+  CHECK(actor_state IS NULL OR actor_state IN ('running', 'reaping', 'quarantined', 'settled'));
+ALTER TABLE pipeline_stage_attempts ADD COLUMN last_heartbeat_at TEXT;
+ALTER TABLE pipeline_stage_attempts ADD COLUMN settlement_owner TEXT;
+ALTER TABLE pipeline_stage_attempts ADD COLUMN settlement_reason TEXT;
+ALTER TABLE pipeline_stage_attempts ADD COLUMN termination_confirmed_at TEXT;
+ALTER TABLE pipeline_stage_attempts ADD COLUMN quarantine_reason TEXT;
+ALTER TABLE pipeline_stage_attempts ADD COLUMN actor_created_at TEXT;
+ALTER TABLE pipeline_stage_attempts ADD COLUMN actor_updated_at TEXT;
+CREATE INDEX pipeline_stage_attempts_actor_state_idx
+  ON pipeline_stage_attempts(actor_state, last_heartbeat_at);
+`;
+
+const satelliteTableContractionSource = `${satelliteTableContractionSchema}
+contraction-contract:session execution identity lives on agent_sessions/v1
+contraction-contract:runtime resource identity lives on pipeline_instances/v1
+contraction-contract:run actor liveness lives on runs and pipeline_stage_attempts/v1
+historical session_executions and pipeline_runtime_resources tables remain retained history`;
+
+const orchestrationJournalSchema = `
+CREATE TABLE orchestration_journal (
+  id TEXT PRIMARY KEY,
+  recorded_at TEXT NOT NULL,
+  team TEXT NOT NULL,
+  repository TEXT NOT NULL,
+  issue TEXT NOT NULL,
+  instance_id TEXT,
+  run_id TEXT,
+  actor TEXT NOT NULL CHECK(actor IN ('supervisor', 'stage_agent', 'orchestrator', 'human')),
+  kind TEXT NOT NULL CHECK(kind IN (
+    'delegated', 'published', 'merged', 'relayed_finding', 'dispatched_fix',
+    'detected_stall', 'capacity_refused', 'escalated_human',
+    'terminal_observed', 'run_note'
+  )),
+  trigger TEXT NOT NULL,
+  action TEXT NOT NULL,
+  outcome TEXT,
+  refs TEXT NOT NULL,
+  note TEXT,
+  structured TEXT,
+  CHECK(json_valid(refs)),
+  CHECK(structured IS NULL OR json_valid(structured)),
+  CHECK(note IS NULL OR length(note) <= 8000)
+);
+CREATE INDEX orchestration_journal_issue_recorded_idx
+  ON orchestration_journal(issue, recorded_at);
+CREATE INDEX orchestration_journal_repository_recorded_idx
+  ON orchestration_journal(repository, recorded_at);
+CREATE INDEX orchestration_journal_issue_lower_recorded_idx
+  ON orchestration_journal(lower(issue), recorded_at);
+CREATE INDEX orchestration_journal_repository_lower_recorded_idx
+  ON orchestration_journal(lower(repository), recorded_at);
+`;
+
+const orchestrationJournalMigrationSource = `${orchestrationJournalSchema}
+journal-contract:append-only cross-run orchestration decisions and stage-agent notes keyed by team, repository, and issue/v1
+actor-contract:supervisor deterministic events are objective facts; stage_agent run_notes are sanitized evidence only
+read-contract:query by issue or repository over recorded_at without feeding coordinator control flow/v1
+read-index-contract:case-insensitive read filters use lower-expression indexes while preserving pinned plain indexes/v1`;
+
+const pipelineArtifactsExecutionGraphResultSchema = `
+CREATE TABLE pipeline_artifacts_next (
+  id TEXT PRIMARY KEY,
+  pipeline_instance_id TEXT NOT NULL,
+  attempt_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN (
+    'stage_result', 'execution_graph_result', 'review', 'command_result',
+    'provider_check', 'human_approval', 'publish_subject'
+  )),
+  schema_version INTEGER NOT NULL CHECK(schema_version >= 1),
+  assurance TEXT NOT NULL CHECK(assurance IN (
+    'semantic_attested', 'semantic_corroborated', 'executor_verified',
+    'provider_verified', 'human_approved'
+  )),
+  subject TEXT,
+  payload TEXT NOT NULL,
+  artifact_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
+  FOREIGN KEY(attempt_id, pipeline_instance_id)
+    REFERENCES pipeline_stage_attempts(id, pipeline_instance_id) ON DELETE RESTRICT
+);
+INSERT INTO pipeline_artifacts_next (
+  id, pipeline_instance_id, attempt_id, kind, schema_version,
+  assurance, subject, payload, artifact_hash, created_at
+)
+SELECT
+  id, pipeline_instance_id, attempt_id, kind, schema_version,
+  assurance, subject, payload, artifact_hash, created_at
+FROM pipeline_artifacts;
+DROP TABLE pipeline_artifacts;
+ALTER TABLE pipeline_artifacts_next RENAME TO pipeline_artifacts;
+`;
+
+const executionUnitSchema = `
+CREATE TABLE execution_graphs (
+  id TEXT PRIMARY KEY,
+  pipeline_instance_id TEXT NOT NULL,
+  parent_attempt_id TEXT NOT NULL UNIQUE,
+  parent_stage_id TEXT NOT NULL,
+  parent_run_id TEXT NOT NULL,
+  graph_digest TEXT NOT NULL,
+  plan_digest TEXT NOT NULL,
+  integration_subject TEXT,
+  aggregate_artifact_hash TEXT,
+  aggregate_emitted_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
+  FOREIGN KEY(parent_attempt_id) REFERENCES pipeline_stage_attempts(id) ON DELETE RESTRICT
+);
+CREATE INDEX execution_graphs_instance_idx ON execution_graphs(pipeline_instance_id, created_at);
+
+CREATE TABLE execution_units (
+  id TEXT PRIMARY KEY,
+  execution_graph_id TEXT NOT NULL,
+  pipeline_instance_id TEXT NOT NULL,
+  parent_attempt_id TEXT NOT NULL,
+  unit_id TEXT NOT NULL,
+  authored_order INTEGER NOT NULL CHECK(authored_order >= 0),
+  dependency_unit_ids TEXT NOT NULL CHECK(json_valid(dependency_unit_ids)),
+  status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'integrated', 'completed', 'exited', 'failed')),
+  active_work_attempt_id TEXT,
+  accepted_candidate_subject TEXT,
+  integration_subject TEXT,
+  terminal_level TEXT CHECK(terminal_level IS NULL OR terminal_level IN ('completed', 'exited', 'failed')),
+  alarm INTEGER NOT NULL DEFAULT 0 CHECK(alarm IN (0, 1)),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(execution_graph_id) REFERENCES execution_graphs(id) ON DELETE RESTRICT,
+  FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
+  FOREIGN KEY(parent_attempt_id) REFERENCES pipeline_stage_attempts(id) ON DELETE RESTRICT,
+  UNIQUE(parent_attempt_id, unit_id),
+  UNIQUE(active_work_attempt_id)
+);
+CREATE UNIQUE INDEX execution_units_one_running_idx
+  ON execution_units(parent_attempt_id) WHERE status = 'running';
+CREATE INDEX execution_units_ready_idx
+  ON execution_units(parent_attempt_id, status, authored_order, unit_id);
+
+CREATE TABLE execution_work_attempts (
+  id TEXT PRIMARY KEY,
+  execution_graph_id TEXT NOT NULL,
+  execution_unit_id TEXT NOT NULL,
+  pipeline_instance_id TEXT NOT NULL,
+  parent_attempt_id TEXT NOT NULL,
+  parent_run_id TEXT NOT NULL,
+  unit_id TEXT NOT NULL,
+  attempt_ordinal INTEGER NOT NULL CHECK(attempt_ordinal >= 1),
+  action_kind TEXT NOT NULL CHECK(action_kind IN (
+    'implement', 'simplify', 'command', 'candidate', 'integrate', 'aggregate', 'stop', 'cleanup'
+  )),
+  idempotency_key TEXT NOT NULL UNIQUE,
+  request_hash TEXT,
+  result_hash TEXT,
+  native_session_id TEXT,
+  status TEXT NOT NULL CHECK(status IN ('pending', 'leased', 'dispatched', 'running', 'completed', 'failed', 'dead')),
+  lease_owner TEXT,
+  lease_until TEXT,
+  output_subject TEXT,
+  payload TEXT NOT NULL CHECK(json_valid(payload)),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT,
+  last_error TEXT,
+  FOREIGN KEY(execution_graph_id) REFERENCES execution_graphs(id) ON DELETE RESTRICT,
+  FOREIGN KEY(execution_unit_id) REFERENCES execution_units(id) ON DELETE RESTRICT,
+  FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
+  FOREIGN KEY(parent_attempt_id) REFERENCES pipeline_stage_attempts(id) ON DELETE RESTRICT,
+  UNIQUE(execution_unit_id, attempt_ordinal, action_kind)
+);
+CREATE UNIQUE INDEX execution_work_one_active_idx
+  ON execution_work_attempts(parent_attempt_id)
+  WHERE status IN ('leased', 'dispatched', 'running');
+CREATE INDEX execution_work_claim_idx
+  ON execution_work_attempts(parent_attempt_id, status, lease_until, created_at);
+`;
+
+const executionUnitMigrationSource = `${executionUnitSchema}
+${pipelineArtifactsExecutionGraphResultSchema}
+unit-reducer-contract:serial child state is owned by execution graph and unit records/v1
+binding-contract:parent attempt and run fences live on execution_units and execution_work_attempts/v1
+lease-contract:one active child action per parent attempt is enforced transactionally/v1
+aggregate-contract:one execution_graph_result hash settles the parent composite stage once/v1`;
+
+const executionGraphStopFenceSchema = `
+ALTER TABLE execution_graphs ADD COLUMN stopped_at TEXT;
+ALTER TABLE execution_graphs ADD COLUMN stop_reason TEXT;
+`;
+
+const executionChildGateSchema = `
+CREATE TABLE IF NOT EXISTS execution_gate_receipts (
+  id TEXT PRIMARY KEY,
+  execution_graph_id TEXT NOT NULL,
+  execution_unit_id TEXT NOT NULL,
+  execution_work_attempt_id TEXT NOT NULL,
+  parent_attempt_id TEXT NOT NULL,
+  unit_id TEXT NOT NULL,
+  gate_kind TEXT NOT NULL CHECK(gate_kind IN (
+    'unit_completion', 'unit_command', 'unit_acceptance', 'final_semantic'
+  )),
+  evaluator_kind TEXT NOT NULL CHECK(evaluator_kind IN ('semantic', 'command', 'human', 'publish_subject')),
+  subject TEXT,
+  result TEXT NOT NULL CHECK(result IN ('passed', 'failed', 'indeterminate', 'not_configured')),
+  outcome TEXT NOT NULL CHECK(outcome IN (
+    'success', 'no_change', 'semantic_repair_required', 'retryable_infrastructure_failure',
+    'needs_human', 'canceled', 'superseded', 'failure'
+  )),
+  reason TEXT NOT NULL,
+  artifact_hashes TEXT NOT NULL CHECK(json_valid(artifact_hashes)),
+  payload TEXT NOT NULL CHECK(json_valid(payload)),
+  receipt_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(execution_graph_id) REFERENCES execution_graphs(id) ON DELETE RESTRICT,
+  FOREIGN KEY(execution_unit_id) REFERENCES execution_units(id) ON DELETE RESTRICT,
+  FOREIGN KEY(execution_work_attempt_id) REFERENCES execution_work_attempts(id) ON DELETE RESTRICT,
+  FOREIGN KEY(parent_attempt_id) REFERENCES pipeline_stage_attempts(id) ON DELETE RESTRICT,
+  UNIQUE(execution_work_attempt_id, gate_kind)
+);
+CREATE INDEX IF NOT EXISTS execution_gate_receipts_parent_idx
+  ON execution_gate_receipts(parent_attempt_id, unit_id, created_at);
+
+CREATE TABLE IF NOT EXISTS execution_downstream_context (
+  id TEXT PRIMARY KEY,
+  execution_graph_id TEXT NOT NULL,
+  pipeline_instance_id TEXT NOT NULL,
+  parent_attempt_id TEXT NOT NULL,
+  from_execution_unit_id TEXT NOT NULL,
+  to_execution_unit_id TEXT NOT NULL,
+  from_unit_id TEXT NOT NULL,
+  to_unit_id TEXT NOT NULL,
+  payload TEXT NOT NULL CHECK(json_valid(payload)),
+  payload_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(execution_graph_id) REFERENCES execution_graphs(id) ON DELETE RESTRICT,
+  FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
+  FOREIGN KEY(parent_attempt_id) REFERENCES pipeline_stage_attempts(id) ON DELETE RESTRICT,
+  FOREIGN KEY(from_execution_unit_id) REFERENCES execution_units(id) ON DELETE RESTRICT,
+  FOREIGN KEY(to_execution_unit_id) REFERENCES execution_units(id) ON DELETE RESTRICT,
+  UNIQUE(parent_attempt_id, from_unit_id, to_unit_id, payload_hash)
+);
+CREATE INDEX IF NOT EXISTS execution_downstream_context_target_idx
+  ON execution_downstream_context(parent_attempt_id, to_unit_id, created_at);
+`;
+
+const executionChildGateMigrationSource = `${executionGraphStopFenceSchema}
+${executionChildGateSchema}
+child-gate-contract:deterministic gate receipts and downstream context live on child execution records/v1
+stop-contract:stopped child graphs remain durable and are not eligible for redispatch/v1`;
+
+function addExecutionGraphStopFence(db: Database.Database): void {
+  if (!hasColumns(db, "execution_graphs", ["stopped_at"])) {
+    db.exec("ALTER TABLE execution_graphs ADD COLUMN stopped_at TEXT");
+  }
+  if (!hasColumns(db, "execution_graphs", ["stop_reason"])) {
+    db.exec("ALTER TABLE execution_graphs ADD COLUMN stop_reason TEXT");
+  }
+}
+
+function widenPipelineArtifactKindsForExecutionGraphResult(db: Database.Database): void {
+  if (!hasTable(db, "pipeline_artifacts")) return;
+  const table = db.prepare(`
+    SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_artifacts'
+  `).get() as { sql: string } | undefined;
+  if (table?.sql.includes("'execution_graph_result'")) return;
+  db.exec(pipelineArtifactsExecutionGraphResultSchema);
+}
+
+function contractSatelliteTables(db: Database.Database): void {
+  if (hasTable(db, "agent_sessions")) {
+    if (!hasColumns(db, "agent_sessions", ["execution_mode"])) {
+      db.exec("ALTER TABLE agent_sessions ADD COLUMN execution_mode TEXT CHECK(execution_mode IS NULL OR execution_mode IN ('legacy', 'pipeline'))");
+    }
+    if (!hasColumns(db, "agent_sessions", ["pipeline_instance_id"])) {
+      db.exec("ALTER TABLE agent_sessions ADD COLUMN pipeline_instance_id TEXT");
+    }
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS agent_sessions_pipeline_instance_unique
+        ON agent_sessions(pipeline_instance_id) WHERE pipeline_instance_id IS NOT NULL
+    `);
+    if (hasTable(db, "session_executions")) {
+      db.exec(`
+        UPDATE agent_sessions
+        SET execution_mode = (
+              SELECT execution_mode FROM session_executions
+              WHERE session_executions.linear_session_id = agent_sessions.id
+            ),
+            pipeline_instance_id = (
+              SELECT pipeline_instance_id FROM session_executions
+              WHERE session_executions.linear_session_id = agent_sessions.id
+            )
+        WHERE EXISTS (
+          SELECT 1 FROM session_executions
+          WHERE session_executions.linear_session_id = agent_sessions.id
+        )
+      `);
+    }
+  }
+  if (hasTable(db, "pipeline_instances")) {
+    for (const [column, sql] of [
+      ["runtime_provider", "ALTER TABLE pipeline_instances ADD COLUMN runtime_provider TEXT"],
+      ["runtime_provider_resource_id", "ALTER TABLE pipeline_instances ADD COLUMN runtime_provider_resource_id TEXT"],
+      [
+        "runtime_resource_status",
+        "ALTER TABLE pipeline_instances ADD COLUMN runtime_resource_status TEXT CHECK(runtime_resource_status IS NULL OR runtime_resource_status IN ('active', 'stopped', 'quarantined', 'cleaned'))",
+      ],
+      ["runtime_resource_created_at", "ALTER TABLE pipeline_instances ADD COLUMN runtime_resource_created_at TEXT"],
+      ["runtime_resource_updated_at", "ALTER TABLE pipeline_instances ADD COLUMN runtime_resource_updated_at TEXT"],
+    ] as const) {
+      if (!hasColumns(db, "pipeline_instances", [column])) db.exec(sql);
+    }
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS pipeline_instances_runtime_resource_unique
+        ON pipeline_instances(runtime_provider_resource_id) WHERE runtime_provider_resource_id IS NOT NULL
+    `);
+    if (hasTable(db, "pipeline_runtime_resources")) {
+      db.exec(`
+        UPDATE pipeline_instances
+        SET runtime_provider = (
+              SELECT provider FROM pipeline_runtime_resources
+              WHERE pipeline_runtime_resources.pipeline_instance_id = pipeline_instances.id
+            ),
+            runtime_provider_resource_id = (
+              SELECT provider_resource_id FROM pipeline_runtime_resources
+              WHERE pipeline_runtime_resources.pipeline_instance_id = pipeline_instances.id
+            ),
+            runtime_resource_status = (
+              SELECT status FROM pipeline_runtime_resources
+              WHERE pipeline_runtime_resources.pipeline_instance_id = pipeline_instances.id
+            ),
+            runtime_resource_created_at = (
+              SELECT created_at FROM pipeline_runtime_resources
+              WHERE pipeline_runtime_resources.pipeline_instance_id = pipeline_instances.id
+            ),
+            runtime_resource_updated_at = (
+              SELECT updated_at FROM pipeline_runtime_resources
+              WHERE pipeline_runtime_resources.pipeline_instance_id = pipeline_instances.id
+            )
+        WHERE EXISTS (
+          SELECT 1 FROM pipeline_runtime_resources
+          WHERE pipeline_runtime_resources.pipeline_instance_id = pipeline_instances.id
+        )
+      `);
+    }
+  }
+  if (hasTable(db, "runs")) {
+    for (const [column, sql] of [
+      ["actor_state", "ALTER TABLE runs ADD COLUMN actor_state TEXT CHECK(actor_state IS NULL OR actor_state IN ('running', 'reaping', 'quarantined', 'settled'))"],
+      ["last_heartbeat_at", "ALTER TABLE runs ADD COLUMN last_heartbeat_at TEXT"],
+      ["settlement_owner", "ALTER TABLE runs ADD COLUMN settlement_owner TEXT"],
+      ["settlement_reason", "ALTER TABLE runs ADD COLUMN settlement_reason TEXT"],
+      ["termination_confirmed_at", "ALTER TABLE runs ADD COLUMN termination_confirmed_at TEXT"],
+      ["quarantine_reason", "ALTER TABLE runs ADD COLUMN quarantine_reason TEXT"],
+      ["actor_created_at", "ALTER TABLE runs ADD COLUMN actor_created_at TEXT"],
+      ["actor_updated_at", "ALTER TABLE runs ADD COLUMN actor_updated_at TEXT"],
+    ] as const) {
+      if (!hasColumns(db, "runs", [column])) db.exec(sql);
+    }
+    db.exec("CREATE INDEX IF NOT EXISTS runs_actor_state_idx ON runs(actor_state, last_heartbeat_at)");
+    const runUpdatedFallback = hasColumns(db, "runs", ["completed_at"])
+      ? "COALESCE(actor_updated_at, completed_at, started_at)"
+      : "COALESCE(actor_updated_at, started_at)";
+    db.exec(`
+      UPDATE runs
+      SET actor_state = CASE
+            WHEN status IN ('running', 'reaping', 'quarantined') THEN status
+            WHEN status IN ('completed', 'failed', 'timed_out', 'stopped') THEN 'settled'
+            ELSE actor_state
+          END,
+          actor_created_at = COALESCE(actor_created_at, started_at),
+          actor_updated_at = ${runUpdatedFallback}
+      WHERE actor_state IS NULL
+    `);
+    // Prefer the authoritative attempt actor over stale run_liveness. Once a
+    // pipeline_attempt_actors row exists for a pipeline-backed run, the previous
+    // run store wrote every lifecycle transition (reaping/quarantine/settlement)
+    // there and left run_liveness lagging. Folding run_liveness for such a run
+    // would overwrite the current status/attempt-derived owner state with a
+    // stale value, leaving runs.actor_state inconsistent with the
+    // pipeline_stage_attempts owner row folded below (which reads the same
+    // authoritative pipeline_attempt_actors row) and causing conditional
+    // settlement updates on runs.actor_state to miss. Fold from
+    // pipeline_attempt_actors when it owns the run, and fall back to run_liveness
+    // only for legacy runs that never gained an attempt actor.
+    if (hasTable(db, "pipeline_attempt_actors")) {
+      db.exec(`
+        UPDATE runs
+        SET actor_state = COALESCE((
+              SELECT actor_state FROM pipeline_attempt_actors WHERE pipeline_attempt_actors.run_id = runs.id
+            ), actor_state),
+            last_heartbeat_at = (
+              SELECT last_heartbeat_at FROM pipeline_attempt_actors WHERE pipeline_attempt_actors.run_id = runs.id
+            ),
+            settlement_owner = (
+              SELECT settlement_owner FROM pipeline_attempt_actors WHERE pipeline_attempt_actors.run_id = runs.id
+            ),
+            settlement_reason = (
+              SELECT settlement_reason FROM pipeline_attempt_actors WHERE pipeline_attempt_actors.run_id = runs.id
+            ),
+            termination_confirmed_at = (
+              SELECT termination_confirmed_at FROM pipeline_attempt_actors WHERE pipeline_attempt_actors.run_id = runs.id
+            ),
+            quarantine_reason = (
+              SELECT quarantine_reason FROM pipeline_attempt_actors WHERE pipeline_attempt_actors.run_id = runs.id
+            ),
+            actor_created_at = COALESCE((
+              SELECT created_at FROM pipeline_attempt_actors WHERE pipeline_attempt_actors.run_id = runs.id
+            ), actor_created_at, started_at),
+            actor_updated_at = COALESCE((
+              SELECT updated_at FROM pipeline_attempt_actors WHERE pipeline_attempt_actors.run_id = runs.id
+            ), actor_updated_at)
+        WHERE EXISTS (
+          SELECT 1 FROM pipeline_attempt_actors WHERE pipeline_attempt_actors.run_id = runs.id
+        )
+      `);
+    }
+    if (hasTable(db, "run_liveness")) {
+      const legacyRunsOnly = hasTable(db, "pipeline_attempt_actors")
+        ? "AND NOT EXISTS (SELECT 1 FROM pipeline_attempt_actors WHERE pipeline_attempt_actors.run_id = runs.id)"
+        : "";
+      db.exec(`
+        UPDATE runs
+        SET actor_state = COALESCE((
+              SELECT actor_state FROM run_liveness WHERE run_liveness.run_id = runs.id
+            ), actor_state),
+            last_heartbeat_at = (
+              SELECT last_heartbeat_at FROM run_liveness WHERE run_liveness.run_id = runs.id
+            ),
+            settlement_owner = (
+              SELECT settlement_owner FROM run_liveness WHERE run_liveness.run_id = runs.id
+            ),
+            settlement_reason = (
+              SELECT settlement_reason FROM run_liveness WHERE run_liveness.run_id = runs.id
+            ),
+            termination_confirmed_at = (
+              SELECT termination_confirmed_at FROM run_liveness WHERE run_liveness.run_id = runs.id
+            ),
+            quarantine_reason = (
+              SELECT quarantine_reason FROM run_liveness WHERE run_liveness.run_id = runs.id
+            ),
+            actor_created_at = COALESCE(actor_created_at, started_at),
+            actor_updated_at = COALESCE((
+              SELECT updated_at FROM run_liveness WHERE run_liveness.run_id = runs.id
+            ), actor_updated_at)
+        WHERE EXISTS (SELECT 1 FROM run_liveness WHERE run_liveness.run_id = runs.id)
+          ${legacyRunsOnly}
+      `);
+    }
+  }
+  if (hasTable(db, "pipeline_stage_attempts")) {
+    for (const [column, sql] of [
+      ["actor_state", "ALTER TABLE pipeline_stage_attempts ADD COLUMN actor_state TEXT CHECK(actor_state IS NULL OR actor_state IN ('running', 'reaping', 'quarantined', 'settled'))"],
+      ["last_heartbeat_at", "ALTER TABLE pipeline_stage_attempts ADD COLUMN last_heartbeat_at TEXT"],
+      ["settlement_owner", "ALTER TABLE pipeline_stage_attempts ADD COLUMN settlement_owner TEXT"],
+      ["settlement_reason", "ALTER TABLE pipeline_stage_attempts ADD COLUMN settlement_reason TEXT"],
+      ["termination_confirmed_at", "ALTER TABLE pipeline_stage_attempts ADD COLUMN termination_confirmed_at TEXT"],
+      ["quarantine_reason", "ALTER TABLE pipeline_stage_attempts ADD COLUMN quarantine_reason TEXT"],
+      ["actor_created_at", "ALTER TABLE pipeline_stage_attempts ADD COLUMN actor_created_at TEXT"],
+      ["actor_updated_at", "ALTER TABLE pipeline_stage_attempts ADD COLUMN actor_updated_at TEXT"],
+    ] as const) {
+      if (!hasColumns(db, "pipeline_stage_attempts", [column])) db.exec(sql);
+    }
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS pipeline_stage_attempts_actor_state_idx
+        ON pipeline_stage_attempts(actor_state, last_heartbeat_at)
+    `);
+    if (hasTable(db, "pipeline_attempt_actors")) {
+      db.exec(`
+        UPDATE pipeline_stage_attempts
+        SET actor_state = (
+              SELECT actor_state FROM pipeline_attempt_actors
+              WHERE pipeline_attempt_actors.attempt_id = pipeline_stage_attempts.id
+            ),
+            last_heartbeat_at = (
+              SELECT last_heartbeat_at FROM pipeline_attempt_actors
+              WHERE pipeline_attempt_actors.attempt_id = pipeline_stage_attempts.id
+            ),
+            settlement_owner = (
+              SELECT settlement_owner FROM pipeline_attempt_actors
+              WHERE pipeline_attempt_actors.attempt_id = pipeline_stage_attempts.id
+            ),
+            settlement_reason = (
+              SELECT settlement_reason FROM pipeline_attempt_actors
+              WHERE pipeline_attempt_actors.attempt_id = pipeline_stage_attempts.id
+            ),
+            termination_confirmed_at = (
+              SELECT termination_confirmed_at FROM pipeline_attempt_actors
+              WHERE pipeline_attempt_actors.attempt_id = pipeline_stage_attempts.id
+            ),
+            quarantine_reason = (
+              SELECT quarantine_reason FROM pipeline_attempt_actors
+              WHERE pipeline_attempt_actors.attempt_id = pipeline_stage_attempts.id
+            ),
+            actor_created_at = (
+              SELECT created_at FROM pipeline_attempt_actors
+              WHERE pipeline_attempt_actors.attempt_id = pipeline_stage_attempts.id
+            ),
+            actor_updated_at = (
+              SELECT updated_at FROM pipeline_attempt_actors
+              WHERE pipeline_attempt_actors.attempt_id = pipeline_stage_attempts.id
+            )
+        WHERE EXISTS (
+          SELECT 1 FROM pipeline_attempt_actors
+          WHERE pipeline_attempt_actors.attempt_id = pipeline_stage_attempts.id
+        )
+      `);
+    }
+  }
+}
+
 const definitions: DatabaseMigrationDefinition[] = [
   {
     version: 1,
@@ -591,7 +1290,6 @@ const definitions: DatabaseMigrationDefinition[] = [
     source: durableWorkMigrationSource,
     up(db) {
       db.exec(durableWorkSchema);
-      backfillLegacyWork(db);
     },
   },
   {
@@ -689,6 +1387,64 @@ const definitions: DatabaseMigrationDefinition[] = [
       if (hasTable(db, "sandbox_events") && !hasColumns(db, "sandbox_events", ["ingestion_diagnosed_at"])) {
         db.exec(sandboxEventDiagnosticsSchema);
       }
+    },
+  },
+  {
+    version: 11,
+    name: "pipeline-idle-runtime-effect",
+    source: pipelineIdleEffectMigrationSource,
+    up(db) {
+      widenPipelineEffectIntentsForIdle(db);
+    },
+  },
+  {
+    version: 12,
+    name: "feedback-observed-head-provenance",
+    source: feedbackObservedHeadMigrationSource,
+    up(db) {
+      addFeedbackObservedHeadProvenance(db);
+    },
+  },
+  {
+    version: 13,
+    name: "selection-publication-backfill",
+    source: selectionPublicationBackfillSource,
+    up(db) {
+      backfillSelectionPublications(db);
+    },
+  },
+  {
+    version: 14,
+    name: "satellite-table-contraction",
+    source: satelliteTableContractionSource,
+    up(db) {
+      contractSatelliteTables(db);
+    },
+  },
+  {
+    version: 15,
+    name: "orchestration-journal",
+    source: orchestrationJournalMigrationSource,
+    up(db) {
+      if (!hasTable(db, "orchestration_journal")) db.exec(orchestrationJournalSchema);
+    },
+  },
+  {
+    version: 16,
+    name: "execution-unit-child-reducer",
+    source: executionUnitMigrationSource,
+    up(db) {
+      if (!hasTable(db, "execution_graphs")) db.exec(executionUnitSchema);
+      widenPipelineArtifactKindsForExecutionGraphResult(db);
+    },
+  },
+  {
+    version: 17,
+    name: "execution-child-gates-and-context",
+    source: executionChildGateMigrationSource,
+    up(db) {
+      addExecutionGraphStopFence(db);
+      db.exec(executionChildGateSchema);
     },
   },
 ];

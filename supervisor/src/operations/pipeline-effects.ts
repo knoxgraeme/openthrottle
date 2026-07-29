@@ -2,10 +2,16 @@ import type { Ticket, SupervisorStore } from "../persistence/store.js";
 import { canonicalJson } from "../pipeline/manifest.js";
 import { digestNormalized } from "../pipeline/manifest.js";
 import { coordinatePipelineEvent } from "../pipeline/coordinator.js";
-import type { PipelineEffectIntent, PipelineInstance, PipelineStore } from "../pipeline/store.js";
+import type {
+  PipelineEffectIntent,
+  PipelineInstance,
+  PipelineRuntimeResource,
+  PipelineStore,
+} from "../pipeline/store.js";
 import type { StageRequestEnvelope } from "../pipeline/stage-request.js";
-import type { RuntimeResource, SandboxRuntime } from "../runtime/contracts.js";
+import type { RuntimeResource, SandboxAutostopRuntime, SandboxRuntime } from "../runtime/contracts.js";
 import { sanitizeText } from "../shared/sanitize.js";
+import { terminateAndSettleActor } from "./actor-settlement.js";
 
 const EFFECT_LEASE_MS = 60_000;
 const RETRY_BASE_MS = 5_000;
@@ -35,6 +41,7 @@ const CAPACITY_ERROR_PATTERNS: RegExp[] = [
 ];
 
 type EffectErrorClass = "auth" | "capacity" | "transient";
+type RuntimeEffectHandlerResult = "acknowledge" | "skip_acknowledgement";
 
 function classifyEffectError(message: string): EffectErrorClass {
   const text = message.toLowerCase();
@@ -53,7 +60,7 @@ export interface PipelineEffectProcessor {
 interface PipelineEffectProcessorDeps {
   store: PipelineStore;
   tickets: SupervisorStore;
-  runtime: SandboxRuntime;
+  runtime: SandboxRuntime & SandboxAutostopRuntime;
   taskTimeoutSeconds: number;
   now?: () => Date;
 }
@@ -61,6 +68,17 @@ interface PipelineEffectProcessorDeps {
 interface StopEffectControl {
   runId: string | null | undefined;
   ticketState: unknown;
+}
+
+interface EffectRuntimeBinding {
+  resource: RuntimeResource | undefined;
+  status: PipelineRuntimeResource["status"] | undefined;
+}
+
+interface IdleEffectControl {
+  stageId: string;
+  attemptId: string;
+  reason: "provider wait" | "human wait";
 }
 
 function parseStopEffectControl(effect: PipelineEffectIntent): StopEffectControl {
@@ -76,6 +94,21 @@ function parseStopEffectControl(effect: PipelineEffectIntent): StopEffectControl
     // the original run id or an explicit null.
     runId: hasRunId ? (parsed.runId as string | null) : undefined,
     ticketState: parsed.ticketState,
+  };
+}
+
+function parseIdleEffectControl(effect: PipelineEffectIntent): IdleEffectControl {
+  const parsed = JSON.parse(effect.payload) as Record<string, unknown>;
+  if (typeof parsed.stageId !== "string" || typeof parsed.attemptId !== "string") {
+    throw new Error(`pipeline idle effect ${effect.id} has no wait fence`);
+  }
+  if (parsed.reason !== "provider wait" && parsed.reason !== "human wait") {
+    throw new Error(`pipeline idle effect ${effect.id} has an invalid wait reason`);
+  }
+  return {
+    stageId: parsed.stageId,
+    attemptId: parsed.attemptId,
+    reason: parsed.reason,
   };
 }
 
@@ -158,6 +191,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       if (existing.status !== "active") {
         throw new Error(`pipeline runtime ${existing.provider_resource_id} is ${existing.status} and cannot dispatch`);
       }
+      await deps.runtime.setActive(existing.provider_resource_id);
       return { providerResourceId: existing.provider_resource_id };
     }
     const resource = await deps.runtime.provision({
@@ -224,168 +258,268 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     return dispatched;
   };
 
+  const acknowledgeEffect = (effect: PipelineEffectIntent, eventId: string, payload: unknown): void => {
+    deps.store.recordEffectAcknowledgement({
+      effectId: effect.id,
+      eventId,
+      payload: canonicalJson(payload),
+    });
+  };
+
+  const runtimeBindingFor = (instance: PipelineInstance): EffectRuntimeBinding => {
+    const binding = deps.store.getRuntimeResource(instance.id);
+    return {
+      resource: binding ? { providerResourceId: binding.provider_resource_id } : undefined,
+      status: binding?.status,
+    };
+  };
+
+  const isCurrentIdleWait = (instanceId: string, control: IdleEffectControl): boolean => {
+    const current = deps.store.getInstance(instanceId);
+    const activeAttempt = deps.store.getActiveAttempt(instanceId);
+    if (!current || current.active_stage_id !== control.stageId || activeAttempt?.id !== control.attemptId) {
+      return false;
+    }
+    if (control.reason === "provider wait") return current.status === "waiting_provider";
+    return current.status === "waiting_human" || current.status === "completion_pending_publication";
+  };
+
+  const idleAcknowledgementResult = (effectId: string): RuntimeEffectHandlerResult =>
+    deps.store.getEffect(effectId)?.status === "dead" ? "skip_acknowledgement" : "acknowledge";
+
+  const handleStageDispatchEffect = async (
+    effect: PipelineEffectIntent,
+    instance: PipelineInstance,
+    eventId: string
+  ): Promise<void> => {
+    const resource = await resourceFor(instance);
+    await bootstrap(instance, resource);
+    const request = effect.kind === "dispatch_stage"
+      ? parseRequest(effect, deps.store)
+      : parseProvisionRequest(effect, deps.store);
+    const requestedAttempt = deps.store.getAttempt(request.attemptId);
+    if (effect.kind === "provision" && requestedAttempt &&
+        ["completed", "canceled", "superseded", "failed"].includes(requestedAttempt.status)) {
+      acknowledgeEffect(effect, eventId, {
+        providerResourceId: resource.providerResourceId,
+        providerDispatchId: `already-transitioned:${request.attemptId}`,
+      });
+      return;
+    }
+    const dispatched = await dispatch(instance, resource, request);
+    acknowledgeEffect(effect, eventId, { providerResourceId: resource.providerResourceId, ...dispatched });
+  };
+
+  const handleStopEffect = async (
+    effect: PipelineEffectIntent,
+    instance: PipelineInstance,
+    binding: EffectRuntimeBinding
+  ): Promise<void> => {
+    const control = parseStopEffectControl(effect);
+    const ticketState = control.ticketState === "closed"
+      ? "closed"
+      : control.ticketState === "error"
+        ? "error"
+        : "stopped";
+    const settlementReason = ticketState === "closed"
+      ? "Pull request closed."
+      : ticketState === "error"
+        ? "Pipeline infrastructure failed."
+        : "Pipeline stopped.";
+    const ticket = deps.tickets.getByIssueId(instance.linear_issue_id);
+    const owner = `pipeline-stop:${effect.id}`;
+    const currentSession = ticket?.linear_session_id === instance.linear_session_id;
+    const activeRunId = resolveStopRunId(effect, instance, ticket, control, true);
+    const boundRun = activeRunId ? deps.tickets.getRun(activeRunId) : undefined;
+    if (!binding.resource && (boundRun?.status === "running" || boundRun?.status === "reaping")) {
+      throw new Error(`pipeline instance ${instance.id} has an active actor without a runtime resource`);
+    }
+    if (activeRunId && (boundRun?.status === "running" || boundRun?.status === "reaping")) {
+      const settlement = await terminateAndSettleActor({
+        runtime: {
+          async stopResource(sandboxId, reason) {
+            const termination = await deps.runtime.stop({ providerResourceId: sandboxId }, reason);
+            if (!termination.confirmed) {
+              throw new Error(`pipeline runtime ${sandboxId} did not confirm termination`);
+            }
+          },
+        },
+        store: deps.tickets,
+        runId: activeRunId,
+        sandboxId: binding.resource && binding.status !== "stopped" && binding.status !== "cleaned"
+          ? binding.resource.providerResourceId
+          : null,
+        owner,
+        reason: "pipeline stop",
+        status: "stopped",
+        ticketState: currentSession ? ticketState : undefined,
+        failureTail: settlementReason,
+        ticketFailureTail: settlementReason,
+        prUrl: currentSession ? ticket?.pr_url ?? undefined : undefined,
+        quarantineOnStopFailure: false,
+        onTerminated: () => {
+          deps.store.setRuntimeResourceStatus(instance.id, "stopped");
+        },
+      });
+      const refreshedRun = deps.tickets.getRun(activeRunId);
+      if (settlement.kind === "lost" && (refreshedRun?.status === "running" || refreshedRun?.status === "reaping")) {
+        throw new Error(`pipeline actor ${activeRunId} lost its stop settlement claim`);
+      }
+    } else if (binding.resource && binding.status !== "stopped" && binding.status !== "cleaned") {
+      const termination = await deps.runtime.stop(binding.resource, "pipeline stop");
+      if (!termination.confirmed) {
+        throw new Error(`pipeline runtime ${binding.resource.providerResourceId} did not confirm termination`);
+      }
+      deps.store.setRuntimeResourceStatus(instance.id, "stopped");
+    }
+    const projectionTicket = deps.tickets.getByIssueId(instance.linear_issue_id);
+    if (projectionTicket?.linear_session_id === instance.linear_session_id) {
+      // The sealed run may already have completed before this terminal stop
+      // drains. Project the terminal ticket state independently from actor
+      // settlement so completed actors cannot leave a failed pipeline active.
+      // Refresh after the provider call so a concurrent replacement session
+      // cannot receive its predecessor's terminal projection.
+      deps.tickets.setState(
+        projectionTicket.linear_issue_id,
+        ticketState,
+        settlementReason
+      );
+      deps.tickets.markSessionState(instance.linear_session_id, "stopped");
+      deps.tickets.cancelPendingInbox(instance.linear_issue_id);
+    }
+    if (binding.resource && binding.status !== "cleaned") {
+      await deps.runtime.cleanup(binding.resource);
+      deps.store.setRuntimeResourceStatus(instance.id, "cleaned");
+    }
+    const cleanupTicket = deps.tickets.getByIssueId(instance.linear_issue_id);
+    if (cleanupTicket?.linear_session_id === instance.linear_session_id &&
+        (!binding.resource || cleanupTicket.sandbox_id === binding.resource.providerResourceId)) {
+      deps.tickets.setSandboxId(instance.linear_issue_id, null);
+    }
+  };
+
+  const handleQuarantineEffect = async (
+    effect: PipelineEffectIntent,
+    instance: PipelineInstance,
+    binding: EffectRuntimeBinding
+  ): Promise<void> => {
+    const control = JSON.parse(effect.payload) as { runId?: unknown; owner?: unknown; reason?: unknown };
+    const runId = typeof control.runId === "string" ? control.runId : null;
+    const owner = typeof control.owner === "string" ? control.owner : `pipeline-quarantine:${effect.id}`;
+    const reason = typeof control.reason === "string" ? control.reason : "pipeline stop attempts exhausted";
+    if (runId && !runMatchesInstance(runId, instance)) {
+      throw new Error(`pipeline quarantine effect ${effect.id} run binding mismatch`);
+    }
+    if (binding.resource && binding.status !== "cleaned" && binding.status !== "stopped") {
+      await deps.runtime.quarantine(binding.resource, reason);
+      deps.store.setRuntimeResourceStatus(instance.id, "quarantined");
+    }
+    if (runId) {
+      const quarantined = deps.tickets.quarantineRun(runId, owner, reason);
+      const refreshed = deps.tickets.getByIssueId(instance.linear_issue_id);
+      if (!quarantined && refreshed?.run_id === runId) {
+        throw new Error(`pipeline actor ${runId} could not be quarantined by ${owner}`);
+      }
+    } else {
+      const refreshed = deps.tickets.getByIssueId(instance.linear_issue_id);
+      if (refreshed?.linear_session_id === instance.linear_session_id) {
+        // A stage actor can complete before its terminal runtime stop. If
+        // provider termination then exhausts there is no live run to
+        // quarantine, but the current ticket must still expose the
+        // infrastructure failure.
+        deps.tickets.setState(instance.linear_issue_id, "error", reason);
+      }
+    }
+  };
+
+  const handleCleanupEffect = async (
+    effect: PipelineEffectIntent,
+    instance: PipelineInstance,
+    binding: EffectRuntimeBinding
+  ): Promise<void> => {
+    // preserve stops the sandbox instead of deleting it: memory is released
+    // while the workspace (and any unpushed work) survives for the human a
+    // needs_human terminal is waiting on. The ticket keeps its sandbox link
+    // so the workspace stays findable and the orphan sweep retains it.
+    const preserve = (JSON.parse(effect.payload) as { preserve?: boolean }).preserve === true;
+    if (binding.resource && binding.status !== "cleaned") {
+      if (preserve) {
+        await deps.runtime.stop(binding.resource, "pipeline needs a human decision; the workspace is preserved");
+        deps.store.setRuntimeResourceStatus(instance.id, "stopped");
+      } else {
+        await deps.runtime.cleanup(binding.resource);
+        deps.store.setRuntimeResourceStatus(instance.id, "cleaned");
+      }
+    }
+    const ticket = deps.tickets.getByIssueId(instance.linear_issue_id);
+    if (!preserve && ticket?.linear_session_id === instance.linear_session_id &&
+        (!binding.resource || ticket.sandbox_id === binding.resource.providerResourceId)) {
+      deps.tickets.setSandboxId(instance.linear_issue_id, null);
+    }
+  };
+
+  const handleIdleEffect = async (
+    effect: PipelineEffectIntent,
+    instance: PipelineInstance,
+    binding: EffectRuntimeBinding
+  ): Promise<RuntimeEffectHandlerResult> => {
+    const control = parseIdleEffectControl(effect);
+    if (!binding.resource || binding.status !== "active" || !isCurrentIdleWait(instance.id, control)) return "acknowledge";
+    try {
+      await deps.runtime.setIdle(binding.resource.providerResourceId);
+    } catch (error) {
+      console.error("[pipeline-effects] failed to idle sandbox:",
+        sanitizeText(String(error)).slice(-500));
+      return idleAcknowledgementResult(effect.id);
+    }
+    if (!isCurrentIdleWait(instance.id, control) &&
+        deps.store.getRuntimeResource(instance.id)?.status === "active") {
+      try {
+        await deps.runtime.setActive(binding.resource.providerResourceId);
+      } catch (error) {
+        console.error("[pipeline-effects] failed to restore active sandbox:",
+          sanitizeText(String(error)).slice(-500));
+      }
+    }
+    return idleAcknowledgementResult(effect.id);
+  };
+
+  const runtimeHandlers: Partial<Record<PipelineEffectIntent["kind"], (
+    effect: PipelineEffectIntent,
+    instance: PipelineInstance,
+    binding: EffectRuntimeBinding
+  ) => Promise<RuntimeEffectHandlerResult>>> = {
+    idle: handleIdleEffect,
+    stop: async (...args) => {
+      await handleStopEffect(...args);
+      return "acknowledge";
+    },
+    quarantine: async (...args) => {
+      await handleQuarantineEffect(...args);
+      return "acknowledge";
+    },
+    cleanup: async (...args) => {
+      await handleCleanupEffect(...args);
+      return "acknowledge";
+    },
+  };
+
   const handle = async (effect: PipelineEffectIntent): Promise<void> => {
     const instance = deps.store.getInstance(effect.pipeline_instance_id);
     if (!instance) throw new Error(`pipeline effect ${effect.id} has no instance`);
     const eventId = `effect-ack-${effect.id}`;
     if (effect.kind === "provision" || effect.kind === "dispatch_stage") {
-      const resource = await resourceFor(instance);
-      await bootstrap(instance, resource);
-      const request = effect.kind === "dispatch_stage"
-        ? parseRequest(effect, deps.store)
-        : parseProvisionRequest(effect, deps.store);
-      const requestedAttempt = deps.store.getAttempt(request.attemptId);
-      if (effect.kind === "provision" && requestedAttempt &&
-          ["completed", "canceled", "superseded", "failed"].includes(requestedAttempt.status)) {
-        deps.store.recordEffectAcknowledgement({
-          effectId: effect.id,
-          eventId,
-          payload: canonicalJson({
-            providerResourceId: resource.providerResourceId,
-            providerDispatchId: `already-transitioned:${request.attemptId}`,
-          }),
-        });
-        return;
-      }
-      const dispatched = await dispatch(instance, resource, request);
-      deps.store.recordEffectAcknowledgement({
-        effectId: effect.id,
-        eventId,
-        payload: canonicalJson({ providerResourceId: resource.providerResourceId, ...dispatched }),
-      });
+      await handleStageDispatchEffect(effect, instance, eventId);
       return;
     }
-    const binding = deps.store.getRuntimeResource(instance.id);
-    const resource = binding ? { providerResourceId: binding.provider_resource_id } : undefined;
-    if (effect.kind === "stop") {
-      const control = parseStopEffectControl(effect);
-      const ticketState = control.ticketState === "closed"
-        ? "closed"
-        : control.ticketState === "error"
-          ? "error"
-          : "stopped";
-      const settlementReason = ticketState === "closed"
-        ? "Pull request closed."
-        : ticketState === "error"
-          ? "Pipeline infrastructure failed."
-          : "Pipeline stopped.";
-      const ticket = deps.tickets.getByIssueId(instance.linear_issue_id);
-      const owner = `pipeline-stop:${effect.id}`;
-      const currentSession = ticket?.linear_session_id === instance.linear_session_id;
-      const activeRunId = resolveStopRunId(effect, instance, ticket, control, true);
-      if (activeRunId) {
-        const claimed = deps.tickets.claimRunForReaping(activeRunId, owner, "pipeline stop");
-        if (!claimed) {
-          const refreshedRun = deps.tickets.getRun(activeRunId);
-          if (refreshedRun?.status === "running" || refreshedRun?.status === "reaping") {
-            throw new Error(`pipeline actor ${activeRunId} is owned by another settlement worker`);
-          }
-        }
-      }
-      const boundRun = activeRunId ? deps.tickets.getRun(activeRunId) : undefined;
-      if (!resource && (boundRun?.status === "running" || boundRun?.status === "reaping")) {
-        throw new Error(`pipeline instance ${instance.id} has an active actor without a runtime resource`);
-      }
-      if (resource && binding?.status !== "stopped" && binding?.status !== "cleaned") {
-        const termination = await deps.runtime.stop(resource, "pipeline stop");
-        if (!termination.confirmed) {
-          throw new Error(`pipeline runtime ${resource.providerResourceId} did not confirm termination`);
-        }
-        deps.store.setRuntimeResourceStatus(instance.id, "stopped");
-      }
-      if (activeRunId) {
-        const settled = deps.tickets.finishReapingRun({
-          runId: activeRunId,
-          owner,
-          status: "stopped",
-          ticketState: currentSession ? ticketState : undefined,
-          failureTail: settlementReason,
-          prUrl: currentSession ? ticket?.pr_url ?? undefined : undefined,
-        });
-        const refreshedRun = deps.tickets.getRun(activeRunId);
-        if (!settled && (refreshedRun?.status === "running" || refreshedRun?.status === "reaping")) {
-          throw new Error(`pipeline actor ${activeRunId} lost its stop settlement claim`);
-        }
-      }
-      const projectionTicket = deps.tickets.getByIssueId(instance.linear_issue_id);
-      if (projectionTicket?.linear_session_id === instance.linear_session_id) {
-        // The sealed run may already have completed before this terminal stop
-        // drains. Project the terminal ticket state independently from actor
-        // settlement so completed actors cannot leave a failed pipeline active.
-        // Refresh after the provider call so a concurrent replacement session
-        // cannot receive its predecessor's terminal projection.
-        deps.tickets.setState(
-          projectionTicket.linear_issue_id,
-          ticketState,
-          settlementReason
-        );
-        deps.tickets.markSessionState(instance.linear_session_id, "stopped");
-        deps.tickets.cancelPendingInbox(instance.linear_issue_id);
-      }
-      if (resource && binding?.status !== "cleaned") {
-        await deps.runtime.cleanup(resource);
-        deps.store.setRuntimeResourceStatus(instance.id, "cleaned");
-      }
-      const cleanupTicket = deps.tickets.getByIssueId(instance.linear_issue_id);
-      if (cleanupTicket?.linear_session_id === instance.linear_session_id &&
-          (!resource || cleanupTicket.sandbox_id === resource.providerResourceId)) {
-        deps.tickets.setSandboxId(instance.linear_issue_id, null);
-      }
-    } else if (effect.kind === "quarantine") {
-      const control = JSON.parse(effect.payload) as { runId?: unknown; owner?: unknown; reason?: unknown };
-      const runId = typeof control.runId === "string" ? control.runId : null;
-      const owner = typeof control.owner === "string" ? control.owner : `pipeline-quarantine:${effect.id}`;
-      const reason = typeof control.reason === "string" ? control.reason : "pipeline stop attempts exhausted";
-      if (runId && !runMatchesInstance(runId, instance)) {
-        throw new Error(`pipeline quarantine effect ${effect.id} run binding mismatch`);
-      }
-      if (resource && binding?.status !== "cleaned" && binding?.status !== "stopped") {
-        await deps.runtime.quarantine(resource, reason);
-        deps.store.setRuntimeResourceStatus(instance.id, "quarantined");
-      }
-      if (runId) {
-        const quarantined = deps.tickets.quarantineRun(runId, owner, reason);
-        const refreshed = deps.tickets.getByIssueId(instance.linear_issue_id);
-        if (!quarantined && refreshed?.run_id === runId) {
-          throw new Error(`pipeline actor ${runId} could not be quarantined by ${owner}`);
-        }
-      } else {
-        const refreshed = deps.tickets.getByIssueId(instance.linear_issue_id);
-        if (refreshed?.linear_session_id === instance.linear_session_id) {
-          // A stage actor can complete before its terminal runtime stop. If
-          // provider termination then exhausts there is no live run to
-          // quarantine, but the current ticket must still expose the
-          // infrastructure failure.
-          deps.tickets.setState(instance.linear_issue_id, "error", reason);
-        }
-      }
-    } else if (effect.kind === "cleanup") {
-      // preserve stops the sandbox instead of deleting it: memory is released
-      // while the workspace (and any unpushed work) survives for the human a
-      // needs_human terminal is waiting on. The ticket keeps its sandbox link
-      // so the workspace stays findable and the orphan sweep retains it.
-      const preserve = (JSON.parse(effect.payload) as { preserve?: boolean }).preserve === true;
-      if (resource && binding?.status !== "cleaned") {
-        if (preserve) {
-          await deps.runtime.stop(resource, "pipeline needs a human decision; the workspace is preserved");
-          deps.store.setRuntimeResourceStatus(instance.id, "stopped");
-        } else {
-          await deps.runtime.cleanup(resource);
-          deps.store.setRuntimeResourceStatus(instance.id, "cleaned");
-        }
-      }
-      const ticket = deps.tickets.getByIssueId(instance.linear_issue_id);
-      if (!preserve && ticket?.linear_session_id === instance.linear_session_id &&
-          (!resource || ticket.sandbox_id === resource.providerResourceId)) {
-        deps.tickets.setSandboxId(instance.linear_issue_id, null);
-      }
-    } else {
-      throw new Error(`pipeline effect kind ${effect.kind} has no runtime handler`);
-    }
-    deps.store.recordEffectAcknowledgement({
-      effectId: effect.id,
-      eventId,
-      payload: canonicalJson({ providerResourceId: resource?.providerResourceId ?? null, confirmed: true }),
+    const handler = runtimeHandlers[effect.kind];
+    if (!handler) throw new Error(`pipeline effect kind ${effect.kind} has no runtime handler`);
+    const binding = runtimeBindingFor(instance);
+    const result = await handler(effect, instance, binding);
+    if (result === "skip_acknowledgement") return;
+    acknowledgeEffect(effect, eventId, {
+      providerResourceId: binding.resource?.providerResourceId ?? null,
+      confirmed: true,
     });
   };
 

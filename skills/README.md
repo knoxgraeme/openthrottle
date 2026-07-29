@@ -7,15 +7,37 @@ the capability named in its sealed stage request.
 
 ```text
 skills/
+  planning/<name>/SKILL.md          # planning-time authoring skills
+  planning/<name>/agents/openai.yaml
   tasks/<name>/SKILL.md             # canonical adapter, single source of truth
   tasks/<name>/agents/openai.yaml   # Codex admin-scope policy
   codex/AGENTS-fragment.md          # standing Codex runtime instructions
 ```
 
-There is no task-name registry and no shell-owned end-to-end task loop. Pipeline
-manifests in `supervisor/pipelines/` own stage order, retries, gates, and
-terminal outcomes. `sandbox/runner/execute-stage.mjs` executes exactly one
-sealed stage and writes exactly one typed result.
+Planning skills run before delegation and help authors produce validated
+artifacts such as `openthrottle.execution-plan/v1`. Task skills run inside a
+sealed sandbox stage as adapters over native Compound Engineering. There is no
+task-name registry and no shell-owned end-to-end task loop. Pipeline manifests
+in `supervisor/pipelines/` own stage order, retries, gates, and terminal
+outcomes. `sandbox/runner/execute-stage.mjs` executes exactly one sealed stage
+and writes exactly one typed result.
+
+Structured graphs also use loop-level task adapters:
+
+- `implement-unit`, `simplify-unit`, and `repair-unit` adapt CE worker loops to
+  one execution-plan unit and return `unit_completion` receipts.
+- `accept-unit` is the minimal lead scope-match decision and returns
+  `unit_decision`; it is explicitly not a `ce-code-review` wrapper.
+- `final-review` is the only code-review adapter in the structured path and
+  returns `semantic_review` for the integrated whole.
+- `final-repair` repairs the integrated whole in an executor-owned exact-base
+  worktree.
+- `publish` adapts CE publication after deterministic gates accept the exact
+  subject.
+
+Non-CE skills may replace these loops when they emit the same
+`openthrottle.receipt/v1` contracts. The coordinator evaluates the receipt and
+executor-derived Git/command evidence, not CE-specific implementation details.
 
 ## Delivery per agent
 
@@ -27,6 +49,11 @@ The canonical `SKILL.md` is maintained once:
 | Codex | `sandbox/Dockerfile` bakes the same directories into `/etc/codex/skills/`; `agents/openai.yaml` disables implicit invocation and the prompt explicitly invokes `$<skill-name>`. |
 | OpenCode | The entrypoint strips YAML frontmatter from the same canonical file and renders it into the stage prompt because the pinned CLI cannot safely discover only sandbox-owned external skills. |
 
+Planning skills use the same one-body-per-skill layout, but they are packaged
+for local authoring tools instead of sealed stage execution. A planning skill
+may call local CLI validators; it must not mutate Linear, publish branches, or
+claim runtime gate authority.
+
 The runtime chooses fresh, read-only fresh, required-resume, or preferred-resume
 context from the pinned manifest. When continuation is allowed, the sealed
 request carries the prior native Claude session, Codex thread, or OpenCode
@@ -34,14 +61,14 @@ session identifier. Continuation is a context policy, not a separate task type.
 
 ## Coordinator-owned composition
 
-The current catalog aliases `implement` and `investigate` to immutable v2
+The current catalog aliases `implement` and `investigate` to immutable `core/`
 manifests:
 
-- `ce/implement@2`: planning → implementation → semantic review →
-  simplification → test → lint → build → exact-subject publication → provider
-  verification. Repair transitions return to implementation within manifest
-  bounds.
-- `ce/investigate@2`: investigation → conditional exact-subject publication.
+- `core/implement@4`: implementation → semantic review → simplification →
+  post-simplify review → test → lint → build → exact-subject publication →
+  provider verification.
+  Repair transitions use the manifest's scoped repair stages and round budget.
+- `core/investigate@1`: investigation → conditional exact-subject publication.
   Convergent fixes may ship; divergent decisions terminate as `needs_human`.
 
 Agent stages emit semantic proposals. Command stages produce

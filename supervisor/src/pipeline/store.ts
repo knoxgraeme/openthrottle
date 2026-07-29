@@ -10,6 +10,7 @@ import type {
   ValidatedRuntimeCapabilityDescriptor,
 } from "../runtime/contracts.js";
 import type { StageRequestEnvelope } from "./stage-request.js";
+import type { ExecutionPublicationSnapshot } from "./execution-publication.js";
 
 export type PipelineInstanceStatus =
   | "pending"
@@ -53,6 +54,11 @@ export interface PipelineInstance {
   capability_digest: string;
   executor_protocol: string;
   authorized_capabilities: string;
+  runtime_provider: string | null;
+  runtime_provider_resource_id: string | null;
+  runtime_resource_status: PipelineRuntimeResource["status"] | null;
+  runtime_resource_created_at: string | null;
+  runtime_resource_updated_at: string | null;
   status: PipelineInstanceStatus;
   active_stage_id: string | null;
   wait_reason: string | null;
@@ -85,6 +91,14 @@ export interface PipelineStageAttempt {
   result_hash: string | null;
   started_at: string | null;
   completed_at: string | null;
+  actor_state: "running" | "reaping" | "quarantined" | "settled" | null;
+  last_heartbeat_at: string | null;
+  settlement_owner: string | null;
+  settlement_reason: string | null;
+  termination_confirmed_at: string | null;
+  quarantine_reason: string | null;
+  actor_created_at: string | null;
+  actor_updated_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -104,7 +118,7 @@ export interface PipelineEffectIntent {
   id: string;
   pipeline_instance_id: string;
   transition_version: number;
-  kind: "provision" | "bootstrap" | "dispatch_stage" | "stop" | "quarantine" | "cleanup" | "publish_linear" | "publish_github" | "publish_pr";
+  kind: "provision" | "dispatch_stage" | "idle" | "stop" | "quarantine" | "cleanup" | "publish_linear" | "publish_github";
   idempotency_key: string;
   payload: string;
   payload_hash: string;
@@ -158,20 +172,96 @@ export interface PipelineInboxEventRecord {
   status: "pending" | "consumed" | "stale" | "dead";
 }
 
+export type OrchestrationJournalActor =
+  | "supervisor"
+  | "stage_agent"
+  | "orchestrator"
+  | "human";
+
+export type OrchestrationJournalKind =
+  | "delegated"
+  | "published"
+  | "merged"
+  | "relayed_finding"
+  | "dispatched_fix"
+  | "detected_stall"
+  | "capacity_refused"
+  | "escalated_human"
+  | "terminal_observed"
+  | "run_note";
+
+export interface OrchestrationJournalEntry {
+  id: string;
+  recorded_at: string;
+  team: string;
+  repository: string;
+  issue: string;
+  instance_id: string | null;
+  run_id: string | null;
+  actor: OrchestrationJournalActor;
+  kind: OrchestrationJournalKind;
+  trigger: string;
+  action: string;
+  outcome: string | null;
+  refs: string;
+  note: string | null;
+  structured: string | null;
+}
+
+export interface OrchestrationJournalWrite {
+  id?: string;
+  issueId: string;
+  instanceId?: string | null;
+  runId?: string | null;
+  actor: OrchestrationJournalActor;
+  kind: OrchestrationJournalKind;
+  trigger: string;
+  action: string;
+  outcome?: string | null;
+  refs?: Record<string, unknown>;
+  note?: string | null;
+  structured?: Record<string, unknown> | null;
+}
+
+export interface OrchestrationJournalQuery {
+  issueId?: string;
+  issue?: string;
+  repository?: string;
+  from?: string;
+  to?: string;
+  limit?: number;
+}
+
+export interface ChildActionLivenessPort {
+  renewChildActionLiveness(input: {
+    parentRunId: string;
+    actionId: string;
+    heartbeatAtIso: string;
+    leaseUntilIso: string;
+  }): boolean;
+}
+
 export interface PipelineStatusProjection {
   execution_mode: "pipeline";
   instance_id: string;
   pipeline_id: string;
   pipeline_version: number;
+  generation: number;
   task_type: "implement" | "investigate";
   status: PipelineInstanceStatus;
+  terminal_outcome: PipelineInstance["terminal_outcome"];
   stage_id: string | null;
   attempt_ordinal: number | null;
+  reentry_ordinal: number | null;
   retry_count: number;
   reentry_count: number;
   wait_reason: string | null;
+  whose_move: "waiting on you" | "waiting on GitHub" | "working" | "finished";
+  last_error: string | null;
+  last_state_change_at: string;
   subject: string | null;
   published_commit: string | null;
+  published_pr_url: string | null;
   gate_result: string | null;
   assurance: string | null;
   policy_digest: string | null;
@@ -189,6 +279,13 @@ export interface PipelineStatusProjection {
   sandbox_event_id: string | null;
   sandbox_event_attempts: number | null;
   sandbox_ingestion_error: string | null;
+  structured_units: Array<{
+    unit_id: string;
+    status: string;
+    terminal_level: string | null;
+    alarm: boolean;
+    integration_subject: string | null;
+  }>;
 }
 
 export interface PipelineInstanceSeed {
@@ -228,10 +325,10 @@ export interface CoordinatorEffectWrite {
 
 export interface CoordinatorGateReceiptWrite {
   id?: string;
-  evaluatorKind: "result" | "semantic" | "command" | "provider" | "human" | "publish_subject";
+  evaluatorKind: "semantic" | "command" | "provider" | "human" | "publish_subject";
   policyDigest: string;
   subject?: string | null;
-  result: "passed" | "failed" | "indeterminate" | "skipped" | "not_configured";
+  result: "passed" | "failed" | "indeterminate" | "not_configured";
   artifactHashes: string[];
   payload: string;
   hash: string;
@@ -247,6 +344,7 @@ export interface CoordinatorTransitionWrite {
   outcome: StageOutcome;
   resultHash: string;
   nextStatus: PipelineInstanceStatus;
+  resumeStatus?: PipelineInstanceStatus | null;
   nextStageId?: string | null;
   nextStageStatus?: "dispatchable" | "waiting";
   terminalOutcome?: PipelineOutcome | null;
@@ -275,7 +373,7 @@ export interface CoordinatorTransitionWrite {
   exhaustedEffectError?: string;
 }
 
-export interface PipelineStore {
+export interface PipelineStore extends ChildActionLivenessPort {
   acceptCatalog(catalog: ValidatedPipelineCatalog): void;
   acceptRuntimeDescriptor(runtime: ValidatedRuntimeCapabilityDescriptor): void;
   saveRepositoryConfigSnapshot(input: {
@@ -293,6 +391,7 @@ export interface PipelineStore {
   getAttemptForRun(runId: string): PipelineStageAttempt | undefined;
   getRepositoryConfigSnapshot(id: string): RepositoryConfigSnapshot | undefined;
   getStageRequest(attemptId: string): StageRequestEnvelope;
+  getStructuredExecutionPublication(parentAttemptId: string): ExecutionPublicationSnapshot | undefined;
   bindStageRun(attemptId: string, runId: string): void;
   markStageDispatched(attemptId: string): void;
   bindRuntimeResource(instanceId: string, provider: string, providerResourceId: string): PipelineRuntimeResource;
@@ -301,6 +400,7 @@ export interface PipelineStore {
   getActiveAttempt(instanceId: string): PipelineStageAttempt | undefined;
   listProviderReadyInstances(limit?: number): PipelineInstance[];
   listStages(instanceId: string): PipelineInstanceStage[];
+  getEffect(id: string): PipelineEffectIntent | undefined;
   listEffects(instanceId: string): PipelineEffectIntent[];
   listPublications(instanceId: string): PipelinePublicationReceipt[];
   getPublication(id: string): PipelinePublicationReceipt | undefined;
@@ -351,4 +451,6 @@ export interface PipelineStore {
     subject?: string | null;
   }): "pending" | "stale" | "consumed";
   applyTransition(write: CoordinatorTransitionWrite, faultAfterWrite?: (writeCount: number) => void): PipelineInstance;
+  recordJournalEntry(input: OrchestrationJournalWrite): void;
+  listJournalEntries(query: OrchestrationJournalQuery): OrchestrationJournalEntry[];
 }

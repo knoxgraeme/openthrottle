@@ -1,0 +1,40 @@
+{
+  "schema": "openthrottle.execution-plan/v1",
+  "graph_id": "structured",
+  "plan_id": "stage-c-contracts",
+  "instructions": {
+    "freeze_schemas": "Freeze schemas."
+  },
+  "acceptance": {
+    "schemas_exported": "Schemas are exported."
+  },
+  "units": [
+    {
+      "id": "a",
+      "title": "A",
+      "depends_on": [
+        "b"
+      ],
+      "instructions": [
+        "freeze_schemas"
+      ],
+      "acceptance": [
+        "schemas_exported"
+      ]
+    },
+    {
+      "id": "b",
+      "title": "B",
+      "depends_on": [
+        "a"
+      ],
+      "instructions": [
+        "freeze_schemas"
+      ],
+      "acceptance": [
+        "schemas_exported"
+      ]
+    }
+  ],
+  "commands": []
+}

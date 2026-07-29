@@ -1,0 +1,52 @@
+{
+  "schema": "openthrottle.graph/v1",
+  "id": "builtin/investigate",
+  "version": 1,
+  "entry_node": "investigate",
+  "workers": [
+    {
+      "id": "investigator",
+      "engine": "agent",
+      "skills": ["builtin://ce/investigate@1"],
+      "session_scope": "graph",
+      "credentials": ["model.invoke", "repo.read", "repo.write", "provider.read"]
+    }
+  ],
+  "loops": [
+    {
+      "id": "investigate-loop",
+      "worker": "investigator",
+      "skill": "builtin://ce/investigate@1",
+      "input_scope": "graph",
+      "receipt": "semantic_review",
+      "max_parallel": 1,
+      "max_rounds": 3,
+      "timeout_seconds": 86400
+    }
+  ],
+  "nodes": [
+    {
+      "id": "investigate",
+      "kind": "run",
+      "loop": "investigate-loop",
+      "depends_on": [],
+      "transitions": {
+        "success": { "to": "publish" },
+        "repair_required": { "to": "investigate", "max_reentries": 3, "on_exhausted": "needs_human" },
+        "retryable_failure": { "to": "investigate", "max_reentries": 3, "on_exhausted": "failed" },
+        "failure": { "terminal": "failed" }
+      }
+    },
+    {
+      "id": "publish",
+      "kind": "publish",
+      "depends_on": [],
+      "transitions": {
+        "success": { "terminal": "completed" },
+        "repair_required": { "to": "investigate", "max_reentries": 2, "on_exhausted": "needs_human" },
+        "retryable_failure": { "to": "publish", "max_reentries": 2, "on_exhausted": "failed" },
+        "failure": { "terminal": "failed" }
+      }
+    }
+  ]
+}

@@ -74,6 +74,7 @@ export interface SandboxHeartbeatEvent {
   event_id: string;
   run_id: string;
   created_at: string;
+  child_action_id?: string;
 }
 
 export interface SandboxActivityEvent {
@@ -84,8 +85,8 @@ export interface SandboxActivityEvent {
   created_at: string;
   type: "thought" | "action" | "elicitation" | "response" | "error";
   body: string;
-  // Ephemeral thoughts/actions self-replace in Linear. It is used for the live
-  // progress heartbeat emitted by runner/normalize.mjs.
+  // Ephemeral thoughts/actions self-replace in Linear. It is used for live
+  // progress updates emitted by sandbox activity tooling.
   ephemeral?: boolean;
   // Structured fields for `action` events: verb + parameter, plus an optional
   // result once the step completes.
@@ -146,12 +147,17 @@ export function parseSandboxEvent(raw: string): SandboxEvent {
   }
 
   if (value.kind === "heartbeat") {
+    if (value.child_action_id !== undefined &&
+        (typeof value.child_action_id !== "string" || !RUN_ID_PATTERN.test(value.child_action_id))) {
+      throw new Error("sandbox heartbeat has an invalid child_action_id");
+    }
     return {
       version: 1,
       kind: "heartbeat",
       event_id: value.event_id,
       run_id: value.run_id,
       created_at: value.created_at,
+      ...(value.child_action_id ? { child_action_id: value.child_action_id } : {}),
     };
   }
   if (value.kind === "stage_result") {

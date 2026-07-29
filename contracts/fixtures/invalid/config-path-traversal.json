@@ -1,0 +1,11 @@
+{
+  "schema": "openthrottle.config/v1",
+  "default_graph": "structured",
+  "graphs": [
+    {
+      "id": "structured",
+      "kind": "repository",
+      "ref": "../graphs/structured.json"
+    }
+  ]
+}

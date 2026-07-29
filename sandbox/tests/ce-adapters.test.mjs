@@ -6,7 +6,17 @@ import { describe, expect, it } from "vitest";
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const skillsRoot = resolve(repoRoot, "skills");
 
-const tasks = ["implement-plan", "investigate"];
+const stageTasks = ["implement-plan", "investigate"];
+const loopTasks = [
+  "implement-unit",
+  "simplify-unit",
+  "repair-unit",
+  "accept-unit",
+  "final-review",
+  "final-repair",
+  "publish",
+];
+const tasks = [...stageTasks, ...loopTasks];
 
 function skillBody(task) {
   return readFileSync(resolve(skillsRoot, "tasks", task, "SKILL.md"), "utf8");
@@ -49,12 +59,9 @@ describe("OpenThrottle canonical task skills", () => {
     expect(existsSync(resolve(repoRoot, "supervisor/src/scheduler.ts"))).toBe(false);
   });
 
-  it("keeps CE v2 execution policies aligned with installed stage contracts", () => {
-    const implement = readFileSync(resolve(repoRoot, "supervisor/pipelines/ce-implement-v2.yaml"), "utf8");
-    const investigate = readFileSync(resolve(repoRoot, "supervisor/pipelines/ce-investigate-v2.yaml"), "utf8");
-    expect(implement).toMatch(
-      /id: planning[\s\S]*?executor: \{ kind: agent, capability: ce\/plan@1 \}[\s\S]*?context: fresh_review/
-    );
+  it("keeps core execution policies aligned with installed stage contracts", () => {
+    const implement = readFileSync(resolve(repoRoot, "supervisor/pipelines/core-implement-v4.yaml"), "utf8");
+    const investigate = readFileSync(resolve(repoRoot, "supervisor/pipelines/core-investigate-v1.yaml"), "utf8");
     expect(implement).toMatch(
       /id: implementation[\s\S]*?credentials: \[model\.invoke, provider\.read, repo\.read, repo\.write\]/
     );
@@ -69,6 +76,27 @@ describe("OpenThrottle canonical task skills", () => {
       expect(body.startsWith("---\n")).toBe(true);
       expect(body).toContain(`name: ${task}`);
       expect(body).toMatch(/\ndescription: .+\n---\n/);
+    }
+  });
+
+  it("structured loop adapters share standard receipts and keep review whole-change only", () => {
+    expect(skillBody("implement-unit")).toContain("unit_completion");
+    expect(skillBody("simplify-unit")).toContain("unit_completion");
+    expect(skillBody("repair-unit")).toContain("unit_completion");
+    expect(skillBody("accept-unit")).toContain("unit_decision");
+    expect(skillBody("accept-unit")).toContain("not a code review");
+    expect(skillBody("accept-unit")).toContain("Do not invoke `ce-code-review`");
+    expect(skillBody("final-review")).toContain("ce-code-review");
+    expect(skillBody("final-review")).toContain("integrated whole");
+    expect(skillBody("final-repair")).toContain("exact-base repair worktree");
+  });
+
+  it("ships non-CE fixture skills for the same standard receipt contracts", () => {
+    const fixtureRoot = resolve(repoRoot, "sandbox", "tests", "fixtures", "skills");
+    for (const task of ["non-ce-unit", "non-ce-lead", "non-ce-review"]) {
+      const body = readFileSync(resolve(fixtureRoot, task, "SKILL.md"), "utf8");
+      expect(body.startsWith("---\n")).toBe(true);
+      expect(body).toContain("openthrottle.receipt/v1");
     }
   });
 
@@ -134,7 +162,7 @@ describe("OpenThrottle canonical task skills", () => {
 
   it("implement-plan keeps the plan gate, decision gate, and assumptions ledger", () => {
     const body = skillBody("implement-plan");
-    expect(body).toContain("Missing or materially ambiguous acceptance criteria");
+    expect(body).toContain("approved plan does not settle");
     expect(body).toContain("needs_human");
     expect(body).toContain("Assumptions & decisions");
     expect(body).toContain(
@@ -154,9 +182,10 @@ describe("OpenThrottle canonical task skills", () => {
 
   it("documents every CE manifest stage and the sealed command/provider boundaries", () => {
     const body = skillBody("implement-plan");
-    for (const stage of ["planning", "implementation", "semantic_review", "simplification", "publish"]) {
+    for (const stage of ["implementation", "semantic_review", "simplification", "post_simplify_review", "publish"]) {
       expect(body).toContain(stage);
     }
+    expect(body).not.toContain("`planning` / `ce/plan@1`");
     expect(body).toMatch(/separate sealed command\s+stages/);
     expect(body).toContain("supervisor-owned stage");
   });
@@ -190,8 +219,8 @@ describe("OpenThrottle canonical task skills", () => {
     expect(skillBody("investigate")).toContain("targets `$BASE_BRANCH`");
   });
 
-  it("both skills reference activity and remain single-stage adapters", () => {
-    for (const task of tasks) {
+  it("both stage skills reference activity and remain single-stage adapters", () => {
+    for (const task of stageTasks) {
       const body = skillBody(task);
       expect(body).toContain("ot-activity");
       expect(body).toContain("Execute only");
@@ -199,8 +228,8 @@ describe("OpenThrottle canonical task skills", () => {
     }
   });
 
-  it("both skills leave remote CI to the provider stage and keep a PR gate checklist", () => {
-    for (const task of tasks) {
+  it("both stage skills leave remote CI to the provider stage and keep a PR gate checklist", () => {
+    for (const task of stageTasks) {
       const body = skillBody(task);
       expect(body).toContain("Do not poll or wait");
       expect(body).not.toContain("--watch");

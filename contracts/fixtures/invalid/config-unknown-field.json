@@ -1,0 +1,12 @@
+{
+  "schema": "openthrottle.config/v1",
+  "default_graph": "simple",
+  "graphs": [
+    {
+      "id": "simple",
+      "kind": "builtin",
+      "ref": "core/simple@1"
+    }
+  ],
+  "unexpected": true
+}

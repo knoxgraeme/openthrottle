@@ -26,11 +26,7 @@ import {
   validateSemanticProposal,
 } from "./artifacts.mjs";
 import {
-  captureRepositoryControl,
   computeWorkspaceTreeOid,
-  computeWorkspaceTreeOidFromTree,
-  repositoryControlMatches,
-  restoreReadOnlyRepository,
   runGitAsRepositoryOwner,
 } from "./repository-control.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
@@ -46,16 +42,14 @@ const REQUEST_KEYS = new Set([
   "agent",
   "expectedSubject", "contextPolicy", "nativeSessionId", "capability",
   "requiredArtifacts", "credentialScopes", "liveSteering", "commandName",
+  "childActionId",
 ]);
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 const DIGEST = /^[a-f0-9]{64}$/;
 const COMMIT = /^[a-f0-9]{40}$/;
-const ARTIFACT_KINDS = new Set([
-  "stage_result", "review", "command_result", "provider_check",
-  "human_approval", "publish_subject",
-]);
+const ARTIFACT_KINDS = new Set(RUNTIME_DESCRIPTOR.artifacts);
 const CONTEXT_POLICIES = new Set([
-  "none", "fresh", "resume_required", "prefer_resume", "fresh_review",
+  "none", "fresh", "resume_required", "prefer_resume",
 ]);
 const COMMAND_NAMES = new Set(["test", "lint", "build", "format"]);
 const REMOTE_GIT_TIMEOUT_MS = 15_000;
@@ -139,6 +133,7 @@ export function validateStageRequest(value) {
     credentialScopes: stringList(input.credentialScopes, "credentialScopes"),
     liveSteering: input.liveSteering,
     ...(input.commandName === undefined ? {} : { commandName: input.commandName }),
+    ...(input.childActionId === undefined ? {} : { childActionId: string(input.childActionId, "childActionId") }),
   };
   if (!Number.isSafeInteger(request.generation) || request.generation < 1) throw new Error("generation is invalid");
   if (!["claude", "codex", "opencode"].includes(request.agent)) throw new Error("agent is invalid");
@@ -200,7 +195,6 @@ export function validateSealedInputs({ request, configRaw, manifestRaw }) {
 export function resolveContextInvocation(request) {
   if (request.contextPolicy === "none") return { mode: "none", nativeSessionId: null, reconstructed: false, readOnly: false };
   if (request.contextPolicy === "fresh") return { mode: "fresh", nativeSessionId: null, reconstructed: false, readOnly: false };
-  if (request.contextPolicy === "fresh_review") return { mode: "fresh", nativeSessionId: null, reconstructed: false, readOnly: true };
   if (request.contextPolicy === "resume_required") {
     if (!request.nativeSessionId) throw new Error("resume-required context is missing its native session");
     return { mode: "resume", nativeSessionId: request.nativeSessionId, reconstructed: false, readOnly: false };
@@ -389,6 +383,56 @@ function failureProposal(summary, suggestedOutcome = "retryable_infrastructure_f
   };
 }
 
+function isCodexModelCredentialExpired(agent, diagnostic) {
+  if (agent !== "codex") return false;
+  const normalized = String(diagnostic ?? "").toLowerCase();
+  if (!/\b401\b/.test(normalized)) return false;
+  const hasAuthFailure = normalized.includes("unauthorized") ||
+    normalized.includes("refresh_token_invalidated") ||
+    normalized.includes("your session has ended");
+  const hasCodexRefreshSignal = normalized.includes("refresh_token_invalidated") ||
+    normalized.includes("your session has ended") ||
+    normalized.includes("/backend-api/codex/responses");
+  return hasAuthFailure && hasCodexRefreshSignal;
+}
+
+export function classifyAgentExecutionFailure({ agent, termination, diagnostic, terminated, missingProposal = false }) {
+  if (isCodexModelCredentialExpired(agent, diagnostic)) {
+    return {
+      suggestedOutcome: "retryable_infrastructure_failure",
+      credentialFailure: true,
+      summary:
+        `Model credential expired - refresh CODEX_AUTH_JSON. Agent stage failed (${termination}).` +
+        (diagnostic ? ` Executor diagnostic: ${diagnostic}` : ""),
+    };
+  }
+  return {
+    suggestedOutcome: terminated ? "retryable_infrastructure_failure" : "failure",
+    credentialFailure: false,
+    summary:
+      `${missingProposal ? "Agent exited without the required terminal stage proposal" : "Agent stage failed"} ` +
+      `(${termination}).` +
+      (diagnostic ? ` Executor diagnostic: ${diagnostic}` : ""),
+  };
+}
+
+function classifyIncompleteAgentExecution({ execution, request, proposal, redactionEnv }) {
+  const terminated = execution.timedOut || execution.signal || execution.exitCode === 137;
+  const diagnostic = sanitizeArtifactText(execution.stderr ?? "", redactionEnv).trim().slice(-1_000);
+  const termination = [
+    `exit=${execution.exitCode ?? "none"}`,
+    execution.signal ? `signal=${execution.signal}` : null,
+    execution.timedOut ? "timed_out=true" : null,
+  ].filter(Boolean).join(", ");
+  return classifyAgentExecutionFailure({
+    agent: request.agent,
+    termination,
+    diagnostic,
+    terminated,
+    missingProposal: !proposal,
+  });
+}
+
 function reconcilePublication({ repoDir, request, gatedSubject, execution, proposal, redactionEnv }) {
   const incompleteExecution = execution.executorFailure || execution.timedOut || execution.exitCode !== 0 || !proposal;
   let normalizedProposal;
@@ -515,9 +559,6 @@ export function executeStage({
   if (request.expectedSubject && request.expectedSubject !== preSubject) {
     throw new Error("workspace subject does not match the fenced expected subject");
   }
-  const preControl = request.contextPolicy === "fresh_review"
-    ? captureRepositoryControl(repoDir)
-    : null;
   let nativeSessionId = request.nativeSessionId;
   let artifacts;
   if (contract.kind === "command") {
@@ -602,21 +643,16 @@ export function executeStage({
         };
       }
     }
-    const observedPostSubject = invocation.readOnly
-      ? computeWorkspaceTreeOidFromTree(repoDir, preSubject)
-      : computeWorkspaceTreeOid(repoDir);
-    const readOnlyMutation = invocation.readOnly &&
-      (observedPostSubject !== preSubject || !preControl || !repositoryControlMatches(repoDir, preControl));
-    const gatedSubject = readOnlyMutation
-      ? restoreReadOnlyRepository(repoDir, observedPostSubject, preSubject, preControl)
-      : observedPostSubject;
+    const gatedSubject = computeWorkspaceTreeOid(repoDir);
     let proposal = execution.proposal;
     let publishedCommit;
-    if (readOnlyMutation) {
-      proposal = {
-        ...failureProposal("A fresh-review stage mutated the workspace.", "semantic_repair_required"),
-        findings: [{ severity: "P1", code: "review-mutated-workspace", summary: "Read-only review changed the gated tree." }],
-      };
+    const incompleteAgentExecution = !execution.executorFailure &&
+      (execution.timedOut || execution.exitCode !== 0 || !proposal);
+    const classifiedFailure = incompleteAgentExecution
+      ? classifyIncompleteAgentExecution({ execution, request, proposal, redactionEnv })
+      : null;
+    if (request.capability === "ce/publish@1" && classifiedFailure?.credentialFailure) {
+      proposal = failureProposal(classifiedFailure.summary, classifiedFailure.suggestedOutcome);
     } else if (request.capability === "ce/publish@1") {
       ({ proposal, publishedCommit } = reconcilePublication({
         repoDir,
@@ -626,19 +662,8 @@ export function executeStage({
         proposal,
         redactionEnv,
       }));
-    } else if (!execution.executorFailure && (execution.timedOut || execution.exitCode !== 0 || !proposal)) {
-      const terminated = execution.timedOut || execution.signal || execution.exitCode === 137;
-      const diagnostic = sanitizeArtifactText(execution.stderr ?? "", redactionEnv).trim().slice(-1_000);
-      const termination = [
-        `exit=${execution.exitCode ?? "none"}`,
-        execution.signal ? `signal=${execution.signal}` : null,
-        execution.timedOut ? "timed_out=true" : null,
-      ].filter(Boolean).join(", ");
-      proposal = failureProposal(
-        `${!proposal ? "Agent exited without the required terminal stage proposal" : "Agent stage failed"} (${termination}).` +
-          (diagnostic ? ` Executor diagnostic: ${diagnostic}` : ""),
-        terminated ? "retryable_infrastructure_failure" : "failure",
-      );
+    } else if (classifiedFailure) {
+      proposal = failureProposal(classifiedFailure.summary, classifiedFailure.suggestedOutcome);
     }
     const completedAt = now();
     const fence = {

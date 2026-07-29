@@ -53,8 +53,8 @@ RUN set -eux; \
 # pnpm + yarn via corepack (bundled with Node 22)
 RUN corepack enable
 
-# Coding agent CLIs. Pin the versions whose flags/JSONL contracts are covered
-# by the smoke and normalizer tests; upgrade deliberately with those tests.
+# Coding agent CLIs. Pin the versions whose flags and stage contracts are
+# covered by the smoke and runner tests; upgrade deliberately with those tests.
 ARG CLAUDE_CODE_VERSION=2.1.201
 ARG CODEX_VERSION=0.143.0
 ARG OPENCODE_VERSION=1.18.3

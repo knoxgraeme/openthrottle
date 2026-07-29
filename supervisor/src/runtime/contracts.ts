@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import {
   ARTIFACT_KINDS,
@@ -9,9 +8,6 @@ import {
   digestNormalized,
   type ArtifactKind,
   type AssuranceClass,
-  type ContextPolicy,
-  type EvaluatorKind,
-  type ExecutorKind,
   type RuntimeCapabilityInventory,
   type StageOutcome,
 } from "../pipeline/manifest.js";
@@ -50,6 +46,43 @@ export interface StageExecutionResult {
   completedAt: string;
 }
 
+export interface RuntimeWorktreeHandle {
+  id: string;
+}
+
+export interface LoopActionRequest {
+  protocol: "loop-action@1";
+  actionId: string;
+  attemptId: string;
+  graphId: string;
+  unitId: string | null;
+  role: "worker" | "lead" | "reviewer" | "publisher";
+  loop: "implement" | "simplify" | "command" | "repair" | "lead" | "review" | "publish";
+  agent: "claude" | "codex" | "opencode";
+  skill: string;
+  worktree: RuntimeWorktreeHandle | null;
+  nativeSessionId: string | null;
+  contextPolicy: "fresh" | "resume_required" | "prefer_resume";
+  timeoutMs: number;
+  transitionContext: string;
+  allowedMcpServers: readonly string[];
+  credentialScopes: readonly string[];
+  receiptSchema: string;
+  requestHash: string;
+  idempotencyKey: string;
+}
+
+export interface LoopActionResult {
+  actionId: string;
+  attemptId: string;
+  requestHash: string;
+  outcome: "success" | "failure" | "needs_human" | "retryable_infrastructure_failure";
+  nativeSessionId: string | null;
+  subject: string | null;
+  receipt: string;
+  completedAt: string;
+}
+
 export interface RuntimeResource {
   providerResourceId: string;
 }
@@ -69,6 +102,14 @@ export interface SandboxRuntime {
   }): Promise<void>;
   dispatchStage(resource: RuntimeResource, request: StageRequestEnvelope): Promise<{ providerDispatchId: string }>;
   collectStageResult(resource: RuntimeResource, attemptId: string): Promise<StageExecutionResult | null>;
+  createWorktree(resource: RuntimeResource, input: {
+    idempotencyKey: string;
+    attemptId: string;
+    baseCommit: string;
+  }): Promise<RuntimeWorktreeHandle>;
+  dispatchLoopAction(resource: RuntimeResource, request: LoopActionRequest): Promise<{ providerDispatchId: string }>;
+  collectLoopActionResult(resource: RuntimeResource, actionId: string): Promise<LoopActionResult | null>;
+  cleanupWorktree(resource: RuntimeResource, handle: RuntimeWorktreeHandle): Promise<void>;
   renewLiveness(resource: RuntimeResource, attemptId: string): Promise<{ observedAt: string }>;
   stop(resource: RuntimeResource, reason: string): Promise<{ confirmed: boolean }>;
   quarantine(resource: RuntimeResource, reason: string): Promise<void>;
@@ -149,7 +190,7 @@ export interface RuntimeControl
     RuntimeInventory,
     RuntimeSnapshotReadiness {}
 
-function sortedUnique(values: readonly string[]): string[] {
+function sortedUnique<T extends string>(values: readonly T[]): T[] {
   return [...new Set(values)].sort();
 }
 
@@ -232,51 +273,4 @@ export function loadRuntimeCapabilityDescriptor(
   const raw = readFileSync(path, "utf8");
   if (Buffer.byteLength(raw, "utf8") > 256 * 1024) throw new Error("runtime capability descriptor exceeds 256 KiB");
   return validateRuntimeCapabilityDescriptor(JSON.parse(raw) as unknown, expectedRelease);
-}
-
-export function buildInstalledRuntimeDescriptor(
-  release: string,
-  overrides: Partial<Pick<RuntimeCapabilityDescriptor,
-    "capabilities" | "executors" | "evaluators" | "artifacts" | "contextPolicies" | "credentialScopes" | "adapters">> = {}
-): ValidatedRuntimeCapabilityDescriptor {
-  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}$/.test(release)) {
-    throw new Error("runtime release has an invalid format");
-  }
-  const descriptor = {
-    schema: "openthrottle.runtime-capabilities/v1",
-    release,
-    generatedBy: "sandbox-runtime-build",
-    protocol: STAGE_EXECUTOR_PROTOCOL,
-    capabilities: sortedUnique(overrides.capabilities ?? [
-      "agent/semantic@1",
-      "ce/plan@1",
-      "ce/implement@1",
-      "ce/investigate@1",
-      "ce/publish@1",
-      "ce/review@1",
-      "ce/simplify@1",
-      "command/run@1",
-      "provider/wait@1",
-    ]),
-    executors: sortedUnique(overrides.executors ?? EXECUTOR_KINDS) as ExecutorKind[],
-    evaluators: sortedUnique(overrides.evaluators ?? EVALUATOR_KINDS) as EvaluatorKind[],
-    artifacts: sortedUnique(overrides.artifacts ?? ARTIFACT_KINDS) as ArtifactKind[],
-    contextPolicies: sortedUnique(overrides.contextPolicies ?? CONTEXT_POLICIES) as ContextPolicy[],
-    credentialScopes: sortedUnique(overrides.credentialScopes ?? [
-      "model.invoke",
-      "provider.read",
-      "repo.read",
-      "repo.write",
-    ]),
-    adapters: Object.fromEntries(Object.entries(overrides.adapters ?? {
-      claude: "claude-jsonl@1",
-      codex: "codex-jsonl@1",
-      opencode: "opencode-jsonl@1",
-    }).sort(([left], [right]) => left.localeCompare(right))),
-  } satisfies RuntimeCapabilityDescriptor;
-  return validateRuntimeCapabilityDescriptor(descriptor, release);
-}
-
-export function newOpaqueResourceId(): string {
-  return randomUUID();
 }

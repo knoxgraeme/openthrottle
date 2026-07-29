@@ -13,7 +13,9 @@ import {
   parseRepositoryConfig,
 } from "../pipeline/manifest.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
-import { buildInstalledRuntimeDescriptor, type SandboxRuntime } from "../runtime/contracts.js";
+import { buildInstalledRuntimeDescriptor, type SandboxAutostopRuntime, type SandboxRuntime } from "../__fixtures__/runtime.js";
+import type { PipelineInstance, PipelineStageAttempt } from "../pipeline/store.js";
+import type { LinearOutboxRecord } from "../persistence/delivery-store.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
 
@@ -23,6 +25,30 @@ describe("pipeline effect processor", () => {
     db?.close();
     vi.restoreAllMocks();
   });
+
+  const listLinearOutbox = (): LinearOutboxRecord[] =>
+    db!.prepare("SELECT * FROM linear_outbox ORDER BY created_at, sequence").all() as LinearOutboxRecord[];
+
+  function sandboxRuntimeMock(ids: { issueId?: string; providerDispatchId?: string } = {}) {
+    const issueId = ids.issueId ?? "1";
+    return {
+      provision: vi.fn(async () => ({ providerResourceId: `sandbox-${issueId}` })),
+      bootstrap: vi.fn(async () => undefined),
+      materializeCredentials: vi.fn(async () => undefined),
+      dispatchStage: vi.fn(async () => ({ providerDispatchId: ids.providerDispatchId ?? `dispatch-${issueId}` })),
+      collectStageResult: vi.fn(async () => null),
+      createWorktree: vi.fn(async () => ({ id: `worktree-${issueId}` })),
+      dispatchLoopAction: vi.fn(async () => ({ providerDispatchId: `loop-${issueId}` })),
+      collectLoopActionResult: vi.fn(async () => null),
+      cleanupWorktree: vi.fn(async () => undefined),
+      renewLiveness: vi.fn(async () => ({ observedAt: new Date().toISOString() })),
+      stop: vi.fn(async () => ({ confirmed: true })),
+      quarantine: vi.fn(async () => undefined),
+      cleanup: vi.fn(async () => undefined),
+      setActive: vi.fn(async () => undefined),
+      setIdle: vi.fn(async () => undefined),
+    } satisfies SandboxRuntime & SandboxAutostopRuntime;
+  }
 
   function harness(issueId: string, sessionId: string) {
     db = openDb(":memory:");
@@ -59,17 +85,7 @@ describe("pipeline effect processor", () => {
         taskType: "investigate",
       },
     });
-    const runtime = {
-      provision: vi.fn(async () => ({ providerResourceId: `sandbox-${issueId}` })),
-      bootstrap: vi.fn(async () => undefined),
-      materializeCredentials: vi.fn(async () => undefined),
-      dispatchStage: vi.fn(async () => ({ providerDispatchId: `dispatch-${issueId}` })),
-      collectStageResult: vi.fn(async () => null),
-      renewLiveness: vi.fn(async () => ({ observedAt: new Date().toISOString() })),
-      stop: vi.fn(async () => ({ confirmed: true })),
-      quarantine: vi.fn(async () => undefined),
-      cleanup: vi.fn(async () => undefined),
-    } satisfies SandboxRuntime;
+    const runtime = sandboxRuntimeMock({ issueId });
     const processor = createPipelineEffectProcessor({
       store: pipelines,
       tickets,
@@ -96,6 +112,38 @@ describe("pipeline effect processor", () => {
     db!.prepare(`
       UPDATE pipeline_effect_intents SET payload = ?, payload_hash = ? WHERE id = ?
     `).run(payload, digestNormalized(payload), effectId);
+  }
+
+  function enqueueIdleEffect(input: {
+    id: string;
+    instance: PipelineInstance;
+    attempt: PipelineStageAttempt;
+    reason?: "provider wait" | "human wait";
+    transitionVersion?: number;
+  }): void {
+    const reason = input.reason ?? "provider wait";
+    const timestamp = "2099-07-22T12:00:00.000Z";
+    const payload = canonicalJson({
+      pipelineInstanceId: input.instance.id,
+      stageId: input.attempt.stage_id,
+      attemptId: input.attempt.id,
+      reason,
+    });
+    db!.prepare(`
+      INSERT INTO pipeline_effect_intents (
+        id, pipeline_instance_id, transition_version, kind, idempotency_key,
+        payload, payload_hash, status, next_attempt_at, created_at
+      ) VALUES (?, ?, ?, 'idle', ?, ?, ?, 'pending', ?, ?)
+    `).run(
+      input.id,
+      input.instance.id,
+      input.transitionVersion ?? 2,
+      `idle:${input.instance.id}:${input.attempt.stage_id}:${input.attempt.id}`,
+      payload,
+      digestNormalized(payload),
+      timestamp,
+      timestamp
+    );
   }
 
   it("provisions, seals, credentials, and dispatches the first stage exactly through the durable intent", async () => {
@@ -135,17 +183,7 @@ describe("pipeline effect processor", () => {
     });
     const instance = pipelines.getInstanceForSession("session-1")!;
     const attempt = pipelines.getActiveAttempt(instance.id)!;
-    const runtime = {
-      provision: vi.fn(async () => ({ providerResourceId: "sandbox-1" })),
-      bootstrap: vi.fn(async () => undefined),
-      materializeCredentials: vi.fn(async () => undefined),
-      dispatchStage: vi.fn(async () => ({ providerDispatchId: "command-1" })),
-      collectStageResult: vi.fn(async () => null),
-      renewLiveness: vi.fn(async () => ({ observedAt: new Date().toISOString() })),
-      stop: vi.fn(async () => ({ confirmed: true })),
-      quarantine: vi.fn(async () => undefined),
-      cleanup: vi.fn(async () => undefined),
-    } satisfies SandboxRuntime;
+    const runtime = sandboxRuntimeMock({ providerDispatchId: "command-1" });
     const processor = createPipelineEffectProcessor({
       store: pipelines,
       tickets,
@@ -241,6 +279,11 @@ describe("pipeline effect processor", () => {
       terminal_outcome: "canceled",
     });
     expect(pipelines.getRuntimeResource(instance.id)?.status).toBe("cleaned");
+    expect(db.prepare(`
+      SELECT COUNT(*) FROM pipeline_instances
+      WHERE terminal_outcome IS NOT NULL
+        AND runtime_resource_status IN ('active', 'quarantined')
+    `).pluck().get()).toBe(0);
     expect(tickets.getRun(attempt.planned_run_id!)).toMatchObject({ status: "stopped" });
     expect(tickets.getByIssueId("issue-1")).toMatchObject({
       state: "stopped",
@@ -280,6 +323,165 @@ describe("pipeline effect processor", () => {
     expect(tickets.getByIssueId("issue-1")?.sandbox_id).toBe("sandbox-new-generation");
   });
 
+  it("idles an active bound sandbox through a best-effort runtime effect", async () => {
+    const { pipelines, runtime, processor, instance, attempt } = harness("issue-idle", "session-idle");
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    runtime.setIdle.mockRejectedValueOnce(new Error("provider timeout"));
+
+    await processor.drain();
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'waiting_provider', active_stage_id = ?
+      WHERE id = ?
+    `).run(attempt.stage_id, instance.id);
+    enqueueIdleEffect({ id: "idle-provider-wait", instance, attempt });
+
+    await processor.drain();
+
+    expect(runtime.setIdle).toHaveBeenCalledWith("sandbox-issue-idle");
+    expect(consoleError).toHaveBeenCalledWith(
+      "[pipeline-effects] failed to idle sandbox:",
+      expect.stringContaining("provider timeout")
+    );
+    expect(runtime.cleanup).not.toHaveBeenCalled();
+    expect(pipelines.getRuntimeResource(instance.id)).toMatchObject({
+      provider_resource_id: "sandbox-issue-idle",
+      status: "active",
+    });
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.id === "idle-provider-wait"))
+      .toMatchObject({ status: "acknowledged", attempts: 1 });
+  });
+
+  it("does not let a stale idle completion undo a repair dispatch reactivation", async () => {
+    const { pipelines, runtime, processor, instance, attempt } = harness("issue-stale-idle", "session-stale-idle");
+
+    await processor.drain();
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'waiting_provider', active_stage_id = ?
+      WHERE id = ?
+    `).run(attempt.stage_id, instance.id);
+    enqueueIdleEffect({ id: "idle-provider-wait-stale-after-call", instance, attempt });
+    runtime.setIdle.mockImplementationOnce(async () => {
+      db!.prepare("UPDATE pipeline_instances SET status = 'dispatchable' WHERE id = ?")
+        .run(instance.id);
+    });
+
+    await processor.drain();
+
+    expect(runtime.setIdle).toHaveBeenCalledWith("sandbox-issue-stale-idle");
+    expect(runtime.setActive).toHaveBeenCalledWith("sandbox-issue-stale-idle");
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.id === "idle-provider-wait-stale-after-call"))
+      .toMatchObject({ status: "acknowledged", attempts: 1 });
+  });
+
+  it.each([
+    ["waiting_human"],
+    ["completion_pending_publication"],
+  ] as const)("idles an active bound sandbox during %s", async (status) => {
+    const { pipelines, runtime, processor, instance, attempt } = harness(
+      `issue-${status}`,
+      `session-${status}`
+    );
+
+    await processor.drain();
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET status = ?, active_stage_id = ?
+      WHERE id = ?
+    `).run(status, attempt.stage_id, instance.id);
+    enqueueIdleEffect({
+      id: `idle-${status}`,
+      instance,
+      attempt,
+      reason: "human wait",
+    });
+
+    await processor.drain();
+
+    expect(runtime.setIdle).toHaveBeenCalledWith(`sandbox-issue-${status}`);
+    expect(pipelines.getEffect(`idle-${status}`))
+      .toMatchObject({ status: "acknowledged", attempts: 1 });
+  });
+
+  it("restores active autostop before dispatching after an idled wait", async () => {
+    const { pipelines, runtime, processor, instance, attempt } = harness(
+      "issue-repair-reactivate",
+      "session-repair-reactivate"
+    );
+
+    await processor.drain();
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'waiting_provider', active_stage_id = ?
+      WHERE id = ?
+    `).run(attempt.stage_id, instance.id);
+    enqueueIdleEffect({ id: "idle-before-repair-dispatch", instance, attempt });
+    await processor.drain();
+    expect(runtime.setIdle).toHaveBeenCalledWith("sandbox-issue-repair-reactivate");
+
+    runtime.setActive.mockClear();
+    runtime.dispatchStage.mockClear();
+    const payload = canonicalJson(pipelines.getStageRequest(attempt.id));
+    db!.prepare("UPDATE pipeline_instances SET status = 'dispatchable' WHERE id = ?")
+      .run(instance.id);
+    db!.prepare(`
+      INSERT INTO pipeline_effect_intents (
+        id, pipeline_instance_id, transition_version, kind, idempotency_key,
+        payload, payload_hash, status, next_attempt_at, created_at
+      ) VALUES (?, ?, 3, 'dispatch_stage', ?, ?, ?, 'pending', ?, ?)
+    `).run(
+      "dispatch-after-idle",
+      instance.id,
+      "dispatch-after-idle",
+      payload,
+      digestNormalized(payload),
+      "2099-07-22T12:00:00.000Z",
+      "2099-07-22T12:00:00.000Z"
+    );
+
+    await processor.drain();
+
+    expect(runtime.setActive).toHaveBeenCalledWith("sandbox-issue-repair-reactivate");
+    expect(runtime.dispatchStage).toHaveBeenCalledTimes(1);
+    expect(runtime.setActive.mock.invocationCallOrder[0])
+      .toBeLessThan(runtime.dispatchStage.mock.invocationCallOrder[0]);
+    expect(pipelines.getEffect("dispatch-after-idle"))
+      .toMatchObject({ status: "acknowledged", attempts: 1 });
+  });
+
+  it("does not acknowledge a failed idle effect canceled by terminal control", async () => {
+    const { pipelines, runtime, processor, instance, attempt } = harness("issue-failed-dead-idle", "session-failed-dead-idle");
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await processor.drain();
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'waiting_provider', active_stage_id = ?
+      WHERE id = ?
+    `).run(attempt.stage_id, instance.id);
+    enqueueIdleEffect({ id: "idle-provider-wait-failed-after-dead", instance, attempt });
+    runtime.setIdle.mockImplementationOnce(async () => {
+      db!.prepare(`
+        UPDATE pipeline_effect_intents
+        SET status = 'dead', last_error = 'canceled by terminal control'
+        WHERE id = ?
+      `).run("idle-provider-wait-failed-after-dead");
+      throw new Error("provider timeout");
+    });
+
+    await processor.drain();
+
+    expect(runtime.setIdle).toHaveBeenCalledWith("sandbox-issue-failed-dead-idle");
+    expect(consoleError).toHaveBeenCalledWith(
+      "[pipeline-effects] failed to idle sandbox:",
+      expect.stringContaining("provider timeout")
+    );
+    expect(pipelines.getEffect("idle-provider-wait-failed-after-dead"))
+      .toMatchObject({ status: "dead", attempts: 1, last_error: "canceled by terminal control" });
+    expect(pipelines.listEffects(instance.id).filter((effect) => effect.kind === "stop")).toHaveLength(0);
+  });
+
   it("settles a pre-provision PR-close stop without creating a runtime resource", async () => {
     db = openDb(":memory:");
     const pipelines = createPipelineStore(db);
@@ -316,17 +518,7 @@ describe("pipeline effect processor", () => {
       },
     });
     const instance = pipelines.getInstanceForSession("session-2")!;
-    const runtime = {
-      provision: vi.fn(async () => ({ providerResourceId: "unexpected" })),
-      bootstrap: vi.fn(async () => undefined),
-      materializeCredentials: vi.fn(async () => undefined),
-      dispatchStage: vi.fn(async () => ({ providerDispatchId: "unexpected" })),
-      collectStageResult: vi.fn(async () => null),
-      renewLiveness: vi.fn(async () => ({ observedAt: new Date().toISOString() })),
-      stop: vi.fn(async () => ({ confirmed: true })),
-      quarantine: vi.fn(async () => undefined),
-      cleanup: vi.fn(async () => undefined),
-    } satisfies SandboxRuntime;
+    const runtime = sandboxRuntimeMock({ issueId: "unexpected", providerDispatchId: "unexpected" });
     const processor = createPipelineEffectProcessor({
       store: pipelines,
       tickets,
@@ -394,7 +586,7 @@ describe("pipeline effect processor", () => {
     );
     expect(tickets.getRun(runId)).toMatchObject({ status: "stopped" });
     expect(db!.prepare(
-      "SELECT actor_state FROM pipeline_attempt_actors WHERE run_id = ?"
+      "SELECT actor_state FROM pipeline_stage_attempts WHERE run_id = ?"
     ).pluck().get(runId)).toBe("settled");
     expect(tickets.getByIssueId("issue-superseded")).toMatchObject({
       linear_session_id: "session-replacement",
@@ -414,7 +606,6 @@ describe("pipeline effect processor", () => {
     const runId = attempt.planned_run_id!;
 
     db!.transaction(() => {
-      db!.prepare("DELETE FROM run_stage_bindings WHERE run_id = ?").run(runId);
       db!.prepare("UPDATE pipeline_stage_attempts SET run_id = NULL WHERE id = ?").run(attempt.id);
     })();
     expect(tickets.getByIssueId("issue-planned-run-stop")?.run_id).toBe(runId);
@@ -452,7 +643,6 @@ describe("pipeline effect processor", () => {
     const runId = attempt.planned_run_id!;
 
     db!.transaction(() => {
-      db!.prepare("DELETE FROM run_stage_bindings WHERE run_id = ?").run(runId);
       db!.prepare("UPDATE pipeline_stage_attempts SET run_id = NULL WHERE id = ?").run(attempt.id);
     })();
     tickets.upsertUnpinned({
@@ -514,7 +704,7 @@ describe("pipeline effect processor", () => {
     expect(runtime.stop).toHaveBeenCalledOnce();
     expect(tickets.getRun(runId)).toMatchObject({ status: "stopped" });
     expect(db!.prepare(
-      "SELECT actor_state FROM pipeline_attempt_actors WHERE run_id = ?"
+      "SELECT actor_state FROM pipeline_stage_attempts WHERE run_id = ?"
     ).pluck().get(runId)).toBe("settled");
     expect(tickets.getByIssueId("issue-legacy-superseded")).toMatchObject({
       linear_session_id: "session-legacy-replacement",
@@ -649,7 +839,7 @@ describe("pipeline effect processor", () => {
   });
 
   it("retries a capacity-exhausted provision on a patient fixed interval", async () => {
-    const { tickets, pipelines, runtime, processor, instance } = harness("issue-capacity", "session-capacity");
+    const { pipelines, runtime, processor, instance } = harness("issue-capacity", "session-capacity");
     runtime.provision.mockRejectedValue(new Error("Total memory limit exceeded"));
     const provision = pipelines.listEffects(instance.id).find((effect) => effect.kind === "provision")!;
     const makeRetryEligible = () => {
@@ -672,7 +862,7 @@ describe("pipeline effect processor", () => {
         last_error: expect.stringContaining("Total memory limit exceeded"),
       });
     expect(pipelines.getInstance(instance.id)).toMatchObject({ terminal_outcome: null });
-    const activities = tickets.listLinearOutbox().filter((row) => row.id === `capacity-wait:${provision.id}`);
+    const activities = listLinearOutbox().filter((row) => row.id === `capacity-wait:${provision.id}`);
     expect(activities).toHaveLength(1);
     expect(activities[0]).toMatchObject({
       kind: "activity",
@@ -722,7 +912,7 @@ describe("pipeline effect processor", () => {
         next_attempt_at: "2099-07-22T12:05:00.000Z",
         last_error: expect.stringContaining("Total memory limit exceeded"),
       });
-    expect(tickets.listLinearOutbox().filter((row) => row.id.startsWith("capacity-wait:"))).toEqual([]);
+    expect(listLinearOutbox().filter((row) => row.id.startsWith("capacity-wait:"))).toEqual([]);
     expect(consoleError).toHaveBeenCalledWith(
       "[pipeline-effects] failed to enqueue capacity wait activity:",
       expect.stringContaining("outbox unavailable")
@@ -730,7 +920,7 @@ describe("pipeline effect processor", () => {
   });
 
   it("keeps exponential backoff for transient provision failures", async () => {
-    const { tickets, pipelines, runtime, processor, instance } = harness("issue-transient", "session-transient");
+    const { pipelines, runtime, processor, instance } = harness("issue-transient", "session-transient");
     runtime.provision.mockRejectedValue(new Error("connect ETIMEDOUT 10.20.30.40:8443"));
 
     await processor.drain();
@@ -742,7 +932,7 @@ describe("pipeline effect processor", () => {
         next_attempt_at: "2099-07-22T12:00:05.000Z",
         last_error: expect.stringContaining("ETIMEDOUT"),
       });
-    expect(tickets.listLinearOutbox().filter((row) => row.id.startsWith("capacity-wait:"))).toEqual([]);
+    expect(listLinearOutbox().filter((row) => row.id.startsWith("capacity-wait:"))).toEqual([]);
   });
 
   it("preserves the stopped workspace on a needs_human terminal", async () => {

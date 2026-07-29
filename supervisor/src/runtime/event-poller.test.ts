@@ -195,11 +195,94 @@ describe("sandbox event contracts", () => {
 
     expect(postActivity).not.toHaveBeenCalled();
     expect(db!.prepare(
-      "SELECT actor_state, last_heartbeat_at FROM run_liveness WHERE run_id = 'run-1'"
+      "SELECT actor_state, last_heartbeat_at FROM runs WHERE id = 'run-1'"
     ).get()).toEqual({ actor_state: "running", last_heartbeat_at: expect.any(String) });
     expect(store.getSandboxEvent("77777777-7777-4777-8777-777777777777")?.status)
       .toBe("processed");
     expect(files.size).toBe(0);
+  });
+
+  it("renews child action liveness from a sealed parent heartbeat", async () => {
+    const store = seedRunningTicket();
+    const heartbeat = Buffer.from(JSON.stringify({
+      version: 1,
+      kind: "heartbeat",
+      event_id: "88888888-8888-4888-8888-888888888888",
+      run_id: "run-1",
+      created_at: "2026-07-22T16:00:00.000Z",
+      child_action_id: "action-1",
+    }));
+    const files = new Map([["/var/lib/openthrottle/heartbeat/heartbeat.json", heartbeat]]);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      fs: {
+        listFiles: vi.fn(async (directory: string) => [...files.entries()]
+          .filter(([path]) => path.startsWith(`${directory}/`))
+          .map(([path, value]) => ({
+            name: path.split("/").at(-1), path, size: value.length, isDir: false,
+          }))),
+        downloadFile: vi.fn(async (path: string) => files.get(path)!),
+        deleteFile: vi.fn(async (path: string) => files.delete(path)),
+      },
+    };
+    const childActions = { renewChildActionLiveness: vi.fn(() => true) };
+
+    await pollSandboxEvents({
+      runtime: { getWorkspace: vi.fn(async () => sandbox), setActive: vi.fn(async () => undefined), setIdle: vi.fn(async () => undefined) },
+      store,
+      childActions,
+      postActivity: vi.fn(async () => undefined),
+    });
+
+    expect(childActions.renewChildActionLiveness).toHaveBeenCalledWith(expect.objectContaining({
+      parentRunId: "run-1",
+      actionId: "action-1",
+      heartbeatAtIso: expect.any(String),
+      leaseUntilIso: expect.any(String),
+    }));
+    expect(store.getSandboxEvent("88888888-8888-4888-8888-888888888888")?.status)
+      .toBe("processed");
+  });
+
+  it("does not poll child heartbeats for inactive parent runs", async () => {
+    const store = seedRunningTicket();
+    db!.prepare("UPDATE runs SET status = 'failed', actor_state = 'settled' WHERE id = 'run-1'").run();
+    const heartbeat = Buffer.from(JSON.stringify({
+      version: 1,
+      kind: "heartbeat",
+      event_id: "99999999-9999-4999-8999-999999999999",
+      run_id: "run-1",
+      created_at: "2026-07-22T16:00:00.000Z",
+      child_action_id: "action-1",
+    }));
+    const files = new Map([["/var/lib/openthrottle/heartbeat/heartbeat.json", heartbeat]]);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      fs: {
+        listFiles: vi.fn(async (directory: string) => [...files.entries()]
+          .filter(([path]) => path.startsWith(`${directory}/`))
+          .map(([path, value]) => ({
+            name: path.split("/").at(-1), path, size: value.length, isDir: false,
+          }))),
+        downloadFile: vi.fn(async (path: string) => files.get(path)!),
+        deleteFile: vi.fn(async () => undefined),
+      },
+    };
+    const childActions = { renewChildActionLiveness: vi.fn(() => true) };
+
+    await pollSandboxEvents({
+      runtime: { getWorkspace: vi.fn(async () => sandbox), setActive: vi.fn(async () => undefined), setIdle: vi.fn(async () => undefined) },
+      store,
+      childActions,
+      postActivity: vi.fn(async () => undefined),
+    });
+
+    expect(childActions.renewChildActionLiveness).not.toHaveBeenCalled();
+    expect(store.getSandboxEvent("99999999-9999-4999-8999-999999999999")).toBeUndefined();
   });
 
   it("rejects an agent-writable outbox event that impersonates the executor heartbeat", async () => {
@@ -235,7 +318,7 @@ describe("sandbox event contracts", () => {
 
     expect(store.getSandboxEvent("66666666-6666-4666-8666-666666666666")).toBeUndefined();
     expect(db!.prepare(
-      "SELECT last_heartbeat_at FROM run_liveness WHERE run_id = 'run-1'"
+      "SELECT last_heartbeat_at FROM runs WHERE id = 'run-1'"
     ).get()).toEqual({ last_heartbeat_at: null });
     expect(files.size).toBe(0);
     error.mockRestore();

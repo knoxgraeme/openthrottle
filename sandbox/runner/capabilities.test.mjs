@@ -14,6 +14,8 @@ describe("installed stage capabilities", () => {
     expect(canonicalJson(RUNTIME_DESCRIPTOR)).not.toContain("ce-implement-v1.yaml");
     expect(RUNTIME_DESCRIPTOR.capabilities).not.toContain("repository/publish@1");
     expect(RUNTIME_DESCRIPTOR.executors).not.toContain("publish");
+    expect(RUNTIME_DESCRIPTOR.capabilities).toContain("loop-action@1");
+    expect(RUNTIME_DESCRIPTOR.executors).toContain("loop_action");
     expect(capabilityContract("command/run@1").kind).toBe("command");
     const supervisorDescriptor = JSON.parse(readFileSync(
       new URL("../../supervisor/pipelines/runtime-capabilities-v1.json", import.meta.url),
@@ -49,10 +51,16 @@ describe("installed stage capabilities", () => {
     }).kind).toBe("agent");
     expect(authorizeCapability({
       capability: "ce/plan@1",
-      contextPolicy: "fresh_review",
+      contextPolicy: "fresh",
       credentialScopes: ["model.invoke", "repo.read"],
       requiredArtifacts: ["stage_result"],
     }).kind).toBe("agent");
+    expect(authorizeCapability({
+      capability: "loop-action@1",
+      contextPolicy: "prefer_resume",
+      credentialScopes: ["model.invoke", "repo.read", "repo.write"],
+      requiredArtifacts: ["stage_result"],
+    }).kind).toBe("loop_action");
   });
 
   it("rejects unknown capabilities, contexts, and artifacts", () => {

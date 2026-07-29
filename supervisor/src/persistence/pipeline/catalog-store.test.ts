@@ -9,7 +9,7 @@ import {
   loadPipelineCatalog,
   validatePipelineManifest,
 } from "../../pipeline/manifest.js";
-import { buildInstalledRuntimeDescriptor, loadRuntimeCapabilityDescriptor } from "../../runtime/contracts.js";
+import { buildInstalledRuntimeDescriptor, loadRuntimeCapabilityDescriptor } from "../../__fixtures__/runtime.js";
 import { openDb } from "../database.js";
 import { createPipelineStore } from "./create-store.js";
 import {
@@ -143,7 +143,7 @@ describe("pipeline catalog store", () => {
     expect(() => recovered.acceptRuntimeDescriptor(changedV1Runtime))
       .toThrow(/runtime release openthrottle-snapshot\/v1 was already accepted with a different digest/);
 
-    const shippedRuntime = loadRuntimeCapabilityDescriptor(runtimeDescriptorPath, "openthrottle-snapshot/v2");
+    const shippedRuntime = loadRuntimeCapabilityDescriptor(runtimeDescriptorPath, "openthrottle-snapshot/v6");
     const shippedCatalog = loadPipelineCatalog(shippedCatalogPath, shippedRuntime.descriptor);
     recovered.acceptRuntimeDescriptor(shippedRuntime);
     recovered.acceptCatalog(shippedCatalog);
@@ -152,7 +152,7 @@ describe("pipeline catalog store", () => {
       SELECT runtime_release, digest FROM runtime_capability_descriptors ORDER BY runtime_release
     `).all()).toEqual([
       { runtime_release: "openthrottle-snapshot/v1", digest: historical.runtime.digest },
-      { runtime_release: "openthrottle-snapshot/v2", digest: shippedRuntime.digest },
+      { runtime_release: "openthrottle-snapshot/v6", digest: shippedRuntime.digest },
     ]);
     expect(db.prepare(`
       SELECT pipeline_id, version, digest FROM pipeline_catalog_entries
@@ -160,19 +160,52 @@ describe("pipeline catalog store", () => {
       ORDER BY pipeline_id, version
     `).all()).toEqual([
       { pipeline_id: "ce/implement", version: 1, digest: historical.manifests.get("ce/implement@1")!.digest },
-      { pipeline_id: "ce/implement", version: 2, digest: shippedCatalog.manifests.get("ce/implement@2")!.digest },
-      { pipeline_id: "ce/implement", version: 3, digest: shippedCatalog.manifests.get("ce/implement@3")!.digest },
       { pipeline_id: "ce/investigate", version: 1, digest: historical.manifests.get("ce/investigate@1")!.digest },
-      { pipeline_id: "ce/investigate", version: 2, digest: shippedCatalog.manifests.get("ce/investigate@2")!.digest },
-      { pipeline_id: "core/implement", version: 1, digest: shippedCatalog.manifests.get("core/implement@1")!.digest },
+      { pipeline_id: "core/implement", version: 4, digest: shippedCatalog.manifests.get("core/implement@4")!.digest },
       { pipeline_id: "core/investigate", version: 1, digest: shippedCatalog.manifests.get("core/investigate@1")!.digest },
     ]);
     expect(db.prepare(`
       SELECT alias, pipeline_id, version FROM pipeline_catalog_aliases
       WHERE alias IN ('implement', 'investigate') ORDER BY alias
     `).all()).toEqual([
-      { alias: "implement", pipeline_id: "core/implement", version: 1 },
+      { alias: "implement", pipeline_id: "core/implement", version: 4 },
       { alias: "investigate", pipeline_id: "core/investigate", version: 1 },
+    ]);
+  });
+
+  it("fails closed on boot when a prior runtime release row has a different digest", () => {
+    db = openDb(":memory:");
+    const pipelines = createPipelineStore(db);
+    const currentV2 = buildInstalledRuntimeDescriptor("openthrottle-snapshot/v2");
+    const priorNormalized = canonicalJson({
+      ...currentV2.descriptor,
+      adapters: { ...currentV2.descriptor.adapters, codex: "prior-snapshot" },
+    });
+    const priorDigest = digestNormalized(priorNormalized);
+    expect(priorDigest).not.toBe(currentV2.digest);
+    db.prepare(`
+      INSERT INTO runtime_capability_descriptors (
+        runtime_release, digest, protocol, normalized_descriptor, accepted_at
+      ) VALUES (?, ?, ?, ?, ?)
+    `).run(
+      currentV2.descriptor.release,
+      priorDigest,
+      currentV2.descriptor.protocol,
+      priorNormalized,
+      "2026-07-27T00:00:00.000Z"
+    );
+
+    expect(() => pipelines.acceptRuntimeDescriptor(currentV2))
+      .toThrow(/runtime release openthrottle-snapshot\/v2 was already accepted with a different digest/);
+
+    const bumped = buildInstalledRuntimeDescriptor("openthrottle-snapshot/v6");
+    pipelines.acceptRuntimeDescriptor(bumped);
+
+    expect(db.prepare(`
+      SELECT runtime_release, digest FROM runtime_capability_descriptors ORDER BY runtime_release
+    `).all()).toEqual([
+      { runtime_release: "openthrottle-snapshot/v2", digest: priorDigest },
+      { runtime_release: "openthrottle-snapshot/v6", digest: bumped.digest },
     ]);
   });
 });

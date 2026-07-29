@@ -30,7 +30,6 @@ export const CONTEXT_POLICIES = [
   "fresh",
   "resume_required",
   "prefer_resume",
-  "fresh_review",
 ] as const;
 export type ContextPolicy = (typeof CONTEXT_POLICIES)[number];
 
@@ -43,10 +42,11 @@ export const ASSURANCE_CLASSES = [
 ] as const;
 export type AssuranceClass = (typeof ASSURANCE_CLASSES)[number];
 
-export const EXECUTOR_KINDS = ["agent", "command", "provider_wait"] as const;
+export const EXECUTOR_KINDS = ["agent", "command", "loop_action", "provider_wait"] as const;
 export type ExecutorKind = (typeof EXECUTOR_KINDS)[number];
+export const COMMAND_NAMES = ["test", "lint", "build", "format"] as const;
+export type CommandName = (typeof COMMAND_NAMES)[number];
 export const EVALUATOR_KINDS = [
-  "result",
   "semantic",
   "command",
   "provider",
@@ -56,8 +56,12 @@ export const EVALUATOR_KINDS = [
 export type EvaluatorKind = (typeof EVALUATOR_KINDS)[number];
 export const ARTIFACT_KINDS = [
   "stage_result",
+  "standard_receipt",
+  "execution_graph_result",
   "review",
   "command_result",
+  "candidate_evidence",
+  "integration_evidence",
   "provider_check",
   "human_approval",
   "publish_subject",
@@ -84,6 +88,7 @@ export interface PipelineTransition {
 export interface PipelineStage {
   id: string;
   executor: { kind: ExecutorKind; capability: string };
+  commandName?: CommandName;
   evaluator: { kind: EvaluatorKind; assurance: AssuranceClass; required_artifacts: ArtifactKind[] };
   context: ContextPolicy;
   live_steering: boolean;
@@ -99,6 +104,7 @@ export interface PipelineManifest {
   description: string;
   entry_stage: string;
   max_attempts: number;
+  max_repair_rounds?: number;
   requires: {
     protocol: string;
     capabilities: string[];
@@ -246,6 +252,14 @@ export function digestNormalized(normalized: string): string {
   return createHash("sha256").update(normalized).digest("hex");
 }
 
+export function isPipelineReentry(manifest: PipelineManifest, stageId: string, targetId: string): boolean {
+  const stageIndex = manifest.stages.findIndex((stage) => stage.id === stageId);
+  const targetIndex = manifest.stages.findIndex((stage) => stage.id === targetId);
+  if (stageIndex < 0) throw new Error(`stage ${stageId} is absent from ${manifest.id}@${manifest.version}`);
+  if (targetIndex < 0) throw new Error(`stage ${targetId} is absent from ${manifest.id}@${manifest.version}`);
+  return targetId === stageId || targetIndex <= stageIndex;
+}
+
 function parseTransition(value: unknown, path: string): PipelineTransition {
   const input = objectAt(value, path, ["to", "terminal", "max_reentries", "on_exhausted"]);
   const to = input.to === undefined ? undefined : stringAt(input.to, `${path}.to`, { pattern: IDENTIFIER });
@@ -303,9 +317,14 @@ function parseManifestDefaults(value: unknown, path: string): ManifestDefaults {
   };
 }
 
-function parseStage(value: unknown, path: string, defaults: ManifestDefaults): PipelineStage {
+function parseStage(
+  value: unknown,
+  path: string,
+  defaults: ManifestDefaults,
+  options: { allowLegacyImplicitCommandName?: boolean } = {}
+): PipelineStage {
   const input = objectAt(value, path, [
-    "id", "executor", "evaluator", "context", "live_steering", "credentials", "produces", "transitions", "retry",
+    "id", "executor", "commandName", "evaluator", "context", "live_steering", "credentials", "produces", "transitions", "retry",
   ]);
   const id = stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER });
   const executorInput = objectAt(input.executor, `${path}.executor`, ["kind", "capability"]);
@@ -343,6 +362,9 @@ function parseStage(value: unknown, path: string, defaults: ManifestDefaults): P
   const stage: PipelineStage = {
     id,
     executor,
+    ...(input.commandName === undefined ? {} : {
+      commandName: enumAt(input.commandName, `${path}.commandName`, COMMAND_NAMES),
+    }),
     evaluator,
     context: enumAt(input.context, `${path}.context`, CONTEXT_POLICIES),
     live_steering: booleanAt(input.live_steering, `${path}.live_steering`),
@@ -363,6 +385,13 @@ function parseStage(value: unknown, path: string, defaults: ManifestDefaults): P
   if (stage.live_steering && stage.executor.kind !== "agent") {
     fail(`${path}.live_steering`, "is allowed only for agent executors");
   }
+  if (stage.executor.kind === "command") {
+    if (!stage.commandName && !options.allowLegacyImplicitCommandName) {
+      fail(`${path}.commandName`, "is required for command executors");
+    }
+  } else if (stage.commandName) {
+    fail(`${path}.commandName`, "is allowed only for command executors");
+  }
   for (const required of stage.evaluator.required_artifacts) {
     if (!stage.produces.includes(required)) fail(`${path}.evaluator.required_artifacts`, `${required} is not produced by the stage`);
   }
@@ -370,6 +399,13 @@ function parseStage(value: unknown, path: string, defaults: ManifestDefaults): P
     fail(`${path}.produces`, "must include the typed stage_result artifact");
   }
   return stage;
+}
+
+function allowsLegacyImplicitCommandName(id: string, version: number): boolean {
+  return (
+    (id === "core/implement" && version === 1) ||
+    (id === "ce/implement" && (version === 2 || version === 3))
+  );
 }
 
 function validateGraph(manifest: PipelineManifest, source: string): void {
@@ -380,6 +416,11 @@ function validateGraph(manifest: PipelineManifest, source: string): void {
     for (const [outcome, transition] of Object.entries(stage.transitions)) {
       if (transition.to && !stageById.has(transition.to)) {
         fail(`${source}.stages.${stage.id}.transitions.${outcome}.to`, "references an unknown stage");
+      }
+      if (transition.to) {
+        if (isPipelineReentry(manifest, stage.id, transition.to) && transition.max_reentries === undefined) {
+          fail(`${source}.stages.${stage.id}.transitions.${outcome}`, "re-entering transitions must declare max_reentries");
+        }
       }
     }
   }
@@ -397,17 +438,25 @@ function validateGraph(manifest: PipelineManifest, source: string): void {
   if (unreachable) fail(`${source}.stages.${unreachable.id}`, "is unreachable from entry_stage");
 
   const visiting = new Set<string>();
+  const stack: Array<{ stageId: string; incomingBounded: boolean }> = [];
   const visited = new Set<string>();
-  const detectCycle = (stageId: string) => {
+  const detectCycle = (stageId: string, incomingBounded = false) => {
     if (visited.has(stageId)) return;
     visiting.add(stageId);
+    stack.push({ stageId, incomingBounded });
     for (const [outcome, transition] of Object.entries(stageById.get(stageId)!.transitions)) {
       if (!transition.to) continue;
-      if (visiting.has(transition.to) && !transition.max_reentries) {
-        fail(`${source}.stages.${stageId}.transitions.${outcome}`, "creates an unbounded cycle");
+      if (visiting.has(transition.to)) {
+        const targetIndex = stack.findIndex((entry) => entry.stageId === transition.to);
+        let cycleHasBound = transition.max_reentries !== undefined;
+        for (let index = targetIndex + 1; !cycleHasBound && index < stack.length; index += 1) {
+          cycleHasBound = stack[index]!.incomingBounded;
+        }
+        if (!cycleHasBound) fail(`${source}.stages.${stageId}.transitions.${outcome}`, "creates an unbounded cycle");
       }
-      if (!visiting.has(transition.to)) detectCycle(transition.to);
+      if (!visiting.has(transition.to)) detectCycle(transition.to, transition.max_reentries !== undefined);
     }
+    stack.pop();
     visiting.delete(stageId);
     visited.add(stageId);
   };
@@ -420,18 +469,25 @@ export function validatePipelineManifest(
 ): ValidatedPipelineManifest {
   const source = options.source ?? "pipeline";
   const input = objectAt(value, source, [
-    "schema", "id", "version", "description", "entry_stage", "max_attempts", "requires", "defaults", "stages",
+    "schema", "id", "version", "description", "entry_stage", "max_attempts", "max_repair_rounds",
+    "requires", "defaults", "stages",
   ]);
   if (input.schema !== "openthrottle.pipeline/v1") fail(`${source}.schema`, "must be openthrottle.pipeline/v1");
   const requiresInput = objectAt(input.requires, `${source}.requires`, ["protocol", "capabilities"]);
   const defaults = parseManifestDefaults(input.defaults, `${source}.defaults`);
+  const id = stringAt(input.id, `${source}.id`, { max: 120, pattern: IDENTIFIER });
+  const version = integerAt(input.version, `${source}.version`, 1, 1_000_000);
+  const allowLegacyImplicitCommandName = allowsLegacyImplicitCommandName(id, version);
   const manifest: PipelineManifest = {
     schema: "openthrottle.pipeline/v1",
-    id: stringAt(input.id, `${source}.id`, { max: 120, pattern: IDENTIFIER }),
-    version: integerAt(input.version, `${source}.version`, 1, 1_000_000),
+    id,
+    version,
     description: stringAt(input.description, `${source}.description`, { max: 500 }),
     entry_stage: stringAt(input.entry_stage, `${source}.entry_stage`, { pattern: IDENTIFIER }),
-    max_attempts: integerAt(input.max_attempts, `${source}.max_attempts`, 1, 20),
+    max_attempts: integerAt(input.max_attempts, `${source}.max_attempts`, 1, 200),
+    ...(input.max_repair_rounds === undefined ? {} : {
+      max_repair_rounds: integerAt(input.max_repair_rounds, `${source}.max_repair_rounds`, 1, 20),
+    }),
     requires: {
       protocol: stringAt(requiresInput.protocol, `${source}.requires.protocol`, { max: 80, pattern: CAPABILITY }),
       capabilities: unique(arrayAt(
@@ -441,7 +497,14 @@ export function validatePipelineManifest(
         { min: 1, max: 32 }
       ), `${source}.requires.capabilities`),
     },
-    stages: arrayAt(input.stages, `${source}.stages`, (stage, path) => parseStage(stage, path, defaults), { min: 1, max: 32 }),
+    stages: arrayAt(
+      input.stages,
+      `${source}.stages`,
+      (stage, path) => parseStage(stage, path, defaults, {
+        allowLegacyImplicitCommandName,
+      }),
+      { min: 1, max: 32 }
+    ),
   };
   validateGraph(manifest, source);
   for (const stage of manifest.stages) {

@@ -3,6 +3,7 @@ title: "Repository-configurable execution graphs - Plan"
 type: feat
 date: 2026-07-22
 deepened: 2026-07-22
+regrounded: 2026-07-28
 artifact_contract: ce-unified-plan/v1
 artifact_readiness: implementation-ready
 product_contract_source: ce-plan-bootstrap
@@ -11,35 +12,51 @@ execution: code
 
 # Repository-configurable execution graphs - Plan
 
-> **Re-grounded 2026-07-26 against the post-refactor boundaries (PRs #49–#53).** The 2026-07-25 module-boundaries refactor moved supervisor responsibilities under `app/`, `http/`, `pipeline/`, `persistence/`, `providers/`, `runtime/`, `operations/`, and `shared/`, leaving only `index.ts` at the source root. Every `Files` list, verification command, and path reference now targets that layout, and new files are placed in the boundary the architecture test (`supervisor/src/__tests__/architecture.test.ts`) requires: graph/gate/publication contracts under `pipeline/`, SQLite stores under `persistence/pipeline/`, retryable effect draining under `operations/`, admission orchestration under `app/`, and provider fetch/delivery under `providers/`. Requirements, KTDs, flows, and acceptance examples remain the authoritative contract.
+> **Re-grounded 2026-07-28 against current `origin/main` and the trajectory audit of the same date.** The 2026-07-25 module-boundaries refactor put supervisor responsibilities under `app/`, `http/`, `pipeline/`, `persistence/`, `providers/`, `runtime/`, `operations/`, and `shared/`, leaving only `index.ts` at the source root; the architecture test (`supervisor/src/__tests__/architecture.test.ts`) enforces that map, so new files land under `pipeline/` (graph/gate/publication contracts), `persistence/pipeline/` (SQLite stores), `operations/` (retryable effect draining), `app/` (admission orchestration), and `providers/` (fetch/delivery). The earlier 2026-07-26 re-grounding only corrected file paths; this pass corrects the **behavioral** baseline, which had drifted, and applies the trajectory-audit adjustments (behavioral parity, U4 de-scope, deferral of the autonomy layer, and reconciliation with shipped infra):
+>
+> - **The default implement pipeline is `core/implement@4`, and its true shape is 11 stages, not the 9 the prior draft named.** `supervisor/pipelines/catalog.yaml` aliases `implement → core/implement@4`. The **forward path** in `supervisor/pipelines/core-implement-v4.yaml` is `implementation → semantic_review → simplification → post_simplify_review → test → lint → build → publish → provider`; `post_simplify_review` is **conditional** (a `no_change` simplification skips straight to `test`). `implementation` **self-loops** on `semantic_repair_required` (max_reentries 8) and **terminates `failed`** on `failure` — it does **not** flow into `repair_implementation`. The two `repair_*` stages are a **conditional side-loop**: a **downstream** stage — `semantic_review`, `simplification`, `post_simplify_review`, `test`, `lint`, `build`, or `provider` — returning `failure`/`semantic_repair_required` routes to `repair_implementation` (max_reentries 5, via manifest defaults), which runs `repair_implementation → repair_semantic_review` and **rejoins the forward path at `test`** (skipping simplification, which the initial forward pass already ran). Repair is bounded by **three real, first-class manifest fields**: the top-level **`max_repair_rounds: 5`** (a global whole-run cap via `instance.reentry_count`), the **scoped per-transition `max_reentries`** (`targetState.reentry_count`), and the **whole-run net attempt cap `max_attempts: 200`** (`instance.attempt_count`). Every "current simple manifest = `core/implement@1/2`", "8-stage flow", or "whole-plan `ce-work mode:return-to-caller`" baseline reference has been retargeted to this shape.
+> - **`post_simplify_review` already closes the "later simplifying change is not covered by review" gap** in the whole-plan pipeline (OPE-25). It is reframed here as the whole-change-gate ordering invariant Stage C must preserve (simplify-before-review), not a gap to close.
+> - **Two more hardening waves shipped since the plan was written and this pass reflects them.** (1) **Repair-resolution provider fix** (`supervisor/src/app/provider-feedback.ts`): the provider now discounts stale-anchored review comments (a snapshot whose `provider_watermark` predates the current publication acknowledgement — `snapshotFeedbackPredatesCurrentPublication`) and marks repair-driving feedback snapshots resolved after republish (`snapshotCompletedRepairBeforeCurrentPublication`, keyed on `repair_round`). Stage C's R37/R38 slice-continuation work overlaps this machinery, so it lands **last**. (2) **Steering buffer** (`session_inbox` in `supervisor/src/persistence/steering-store.ts`, statuses `pending → dispatched → acknowledged → canceled`, fenced by session/generation/native-session/request-hash): mid-run steering arriving during a non-steerable stage is **buffered and fenced, not hard-rejected**, then delivered against the exact fenced delivery. R28 routes through this shipped buffer rather than a bespoke parent→child path.
+> - **`gates.ts` is the reuse basis** for Stage C gates: `semanticDecision` (incl. the AE6 tree-delta reclassify, `no_change_contradicted_by_tree_delta`), `commandDecision` (incl. R32 `not_configured`), and `validateFence` (provenance/subject/freshness/native-session/assurance) already exist and are the deterministic idioms the unit/whole-change gates specialize.
+> - **`session-service.ts` was decomposed**: it is now a thin dispatcher; pin/compile/admission logic lives in `app/admission.ts` (`handleCreated`) and thread/human-reply routing in `app/thread-control.ts` (`handlePrompted`). All "modify `session-service.ts`" references are retargeted accordingly.
+> - **`sandbox/runner/normalize.mjs` was deleted**; result normalization now lives in `sandbox/runner/artifacts.mjs`. Retargeted.
+> - **Parent↔child bind state lives on the new execution unit/work records, not on `pipeline_work_bindings`.** `docs/SPEC.md` §persistence retires `pipeline_work_bindings` (with the other historical satellite tables) to immutable migration history and requires Stage C child-unit work to add any live binding state to the **owning unit/work records** rather than reviving the empty table. The pipeline-attempt/unit fence columns therefore land on `execution_units`/`execution_work_attempts`, never on the retired junction.
+> - **The v15 `orchestration_journal` is the shipped append-only decision ledger** (`supervisor/src/persistence/migrations/definitions.ts`; actors `supervisor`/`stage_agent`/`orchestrator`/`human`, kinds `dispatched_fix`/`detected_stall`/`escalated_human`/`terminal_observed`/`run_note`, read-contract: queried for audit, **never feeds coordinator control flow**). Stage C journals its orchestration decisions here (actor `orchestrator`) rather than standing up a parallel effect/decision journal; the transactional idempotent effect-intent records remain the control-flow substrate.
+> - **Net-new schema, not existing:** the `exited` terminal level (R39) does not exist yet (runs are `completed`/`canceled`/`superseded`/`failed`; actors `running`/`reaping`/`quarantined`/`settled`), there is no budget-reserve mechanism (R40's `budget_reserve_fraction` is genuinely new), and `COMMAND_NAMES` is a **closed enum** `[test, lint, build, format]` in `manifest.ts` — so R32/KTD12's arbitrary bounded command names is a real enum→named-map schema change. The latest merged migration is **v15** (`orchestration-journal`), so Stage C child tables land as **additive migration v16**.
+> - **OPE-15 has landed** (migration **v14** `satellite-table-contraction`; `persistence/migrations/reconciliation.ts` removed; `createInstance` decomposed across `persistence/pipeline/create-store.ts` and `instance-store.ts`; `core/implement@1/2/3` and the surplus `ce/*` manifests pruned so only `core-implement-v4.yaml` and `core-investigate-v1.yaml` remain). This plan targets that post-OPE-15 tree, which is now current `main`; the earlier "depends on OPE-15 merging first" gate is discharged.
+>
+> Requirements (R1–R40), KTDs, flows (F1–F8), and acceptance examples (AE1–AE17) remain the authoritative eventual contract; **but this pass narrows V1 scope** — the autonomy layer (R35 lead scheduling, R36 splits, R37/R38 slice continuation, R40 budget wind-down) is **deferred past V1**, and the durable serial child reducer (former U4) is split into U4a/U4b/U4c. The prose, Problem Frame, operator decisions, unit breakdown, sequencing, and file/manifest references are what this pass updates.
 
 ## Goal Capsule
 
 | Field | Contract |
 |---|---|
-| Objective | Add a small public graph → loop → worker authoring model and an opt-in serial unit workflow without replacing the deterministic pipeline coordinator delivered in PR #36. |
-| Baseline | The current `openthrottle.pipeline/v1` manifest, coordinator, effect, artifact, gate, session, publication, and sandbox-stage contracts in `docs/SPEC.md`. |
-| Public model | A repository selects a named graph. A graph contains closed node kinds. Agent nodes invoke loops. Each loop binds one skill, worker, input scope, receipt type, and bounded retry behavior. |
+| Objective | Add a small public graph → loop → worker authoring model and a **required** serial unit workflow — the serial integration spine of Stage C, with the autonomy layer (lead scheduling R35, splits R36, slice continuation R37/R38, budget wind-down R40) **deferred past V1** — without replacing the deterministic pipeline coordinator delivered in PR #36 and hardened since (round-based repair budget, scoped re-entries, conditional `post_simplify_review`). |
+| Baseline | The current `openthrottle.pipeline/v1` manifest, `core/implement@4` default (11 stages, conditional `repair_*`/`post_simplify_review`, round-based repair), coordinator, effect, artifact, gate (`gates.ts`), session, publication, steering-buffer, provider-continuation, and sandbox-stage contracts in `docs/SPEC.md` — as of the **post-OPE-15 tree through migration v15**, which is now current `main`. |
+| Public model | A repository selects a named graph. A graph contains closed node kinds. Agent nodes invoke loops. Each loop binds one skill, worker, input scope, receipt type, and bounded retry behavior. The public graph is **kept and multi-codebase**: the operator runs it across several repositories via per-repo `.openthrottle.yml` intents. |
 | Runtime model | The public graph compiles into the existing immutable `PipelineManifest`. Structured unit execution is one new composite stage capability whose child state remains supervisor-owned. |
-| Default | The built-in `simple` graph remains the default and preserves the current whole-plan CE pipeline. The built-in `structured` graph is opt-in. Both use the same public graph schema users can copy and edit. |
+| Default | The built-in `simple` graph remains the default and must compile to a manifest **behaviorally equivalent to `core/implement@4`** — same stage order (including the conditional `repair_*` and `post_simplify_review` stages), context policies, round-based repair transitions, gates, publication, and provider tail — re-pinned to a **new digest**. Behavioral equivalence, not byte-identity, is the compile-safety oracle. The built-in `structured` graph is the required integration workflow, selected per-intent. Both use the same public graph schema users can copy and edit. |
+| Integration model | A unit is a work-**chunk**, not an independently shippable increment (a standalone increment is an ordinary one-shot ticket; a plan = units that are pieces of one whole). Each unit builds + simplifies in its own worktree, then **integrates onto one branch**. **Code review runs exactly once, on the integrated whole** — the **whole-change review (R23)** — with the whole-change final-repair loop (R25) as the main self-heal. The per-unit acceptance gate (R22) is a **lead plan/feature/scope-match acceptance judgment, not a per-unit code review**. One PR out (R37 slices deferred past V1). |
 | Unit behavior | A prepared plan supplies immutable units and dependencies. V1 executes units serially. One unit attempt keeps one worktree and worker native session across implementation, simplification, command verification, and bounded repair. |
-| Lead behavior | One graph-scoped lead session reviews verified unit receipts, accepts or requests revision, records downstream context, or asks for a human. It also selects which ready unit dispatches next (R35), may propose a scope-preserving split of a pending unit (R36), and may propose publishing the integrated units as a releasable slice whose remainder becomes a typed continuation frontier (R37) — without these first-class moves, agents express ordering, granularity, and partial-completion needs by overloading repair/continuation outcomes or stranding remainder work in PR prose. It does not create worktrees, integrate Git, pass gates, or create work items: continuation across slices is supervisor-owned (R38). |
+| Lead behavior | In V1 the graph-scoped lead session is **minimal**: it reviews verified unit receipts and returns `accept` (a plan/feature/scope-match acceptance judgment, **not** a code review), `revise`, `context_update`, or `needs_human`. Ready-unit selection (R35), scope-preserving splits (R36), and slice publication / continuation frontiers (R37/R38) are **deferred past V1**; until they land, several ready units dispatch in deterministic plan order and partial-completion remainder returns `needs_human`. The lead never creates worktrees, integrates Git, passes gates, or creates work items. |
 | Gate rule | Every gate decision is deterministic. Semantic skills may supply attestations, but only the supervisor can pass a gate after validating the receipt schema, producer, fences, exact Git subject, freshness, required corroborating evidence, and configured outcome. |
 | Human source of truth | SQLite remains the transactional authority; the parent Linear issue and its AgentSession receive the sanitized unit/gate ledger, and the PR receives final exact-subject evidence. |
-| Stop conditions | Do not add parallel unit execution, custom evaluator languages, worker Linear sessions, arbitrary base prompts, or token budgets in V1. The only runtime structural move is the R36 scope-preserving unit split; any other dynamic graph patch remains prohibited. Do not provision a structured run until its plan, graph, loops, workers, skills, commands, runtime capabilities, and digests validate. |
+| Stop conditions | Do not add parallel unit execution, lead scheduling (R35), unit splits (R36), slice continuation (R37/R38), budget wind-down (R40), custom evaluator languages, worker Linear sessions, arbitrary base prompts, or token budgets in V1. In V1 graph topology and execution-plan units are **immutable for the whole run** — there is no runtime structural move; any dynamic graph patch is prohibited. Do not provision a structured run until its plan, graph, loops, workers, skills, commands, runtime capabilities, and digests validate. |
 
 ---
 
 ## Product Contract
 
-**Product Contract changed:** R1–R34 and AE1–AE16 were rewritten at the user's direction to replace the earlier over-scoped draft. The preserved U1–U8 implementation IDs now target a serial V1. Public graph/loop/worker configuration replaces the earlier pipeline/workflow/execution-profile/role layers; parallel waves, graph mutation, custom gate composition, and worker-specific Linear sessions move out of active scope.
+**Product Contract changed:** R1–R40 and AE1–AE17 remain the authoritative eventual contract, but **V1 ships only the serial integration spine**; the autonomy layer (R35 scheduling, R36 splits, R37/R38 slice continuation, R40 budget wind-down) is deferred past V1. The preserved implementation IDs target that serial V1, with the former U4 split into **U4a/U4b/U4c**. Public graph/loop/worker configuration replaces the earlier pipeline/workflow/execution-profile/role layers; parallel waves, graph mutation, custom gate composition, worker-specific Linear sessions, and the autonomy layer remain deferred.
+
+**Operator design decisions are settled (no longer open):** (1) **Stage C ships in phases** — V1 is the serial integration spine (schema+compile, serial child reducer, deterministic child gates, integration, whole-change gate, publication, status-leveling, Linear/PR ledger); the autonomy layer (R35/R36/R37/R38/R40) is deferred past V1 and is not a gate on shipping the spine. (2) **The integration model is required** — units are chunks of one whole that build+simplify per-unit then integrate onto one branch, with the whole-change gate (R23) as the single code reviewer of the integrated whole; the per-unit acceptance gate (R22) is a lead scope-match judgment, not a code review. (3) **The configurable public graph is kept and multi-codebase** — R1–R6 stay, the DSL is not deferrable, and it compiles to the immutable `PipelineManifest` (KTD1/F2) with per-repo selection via `.openthrottle.yml intents`. (4) **Deterministic-supervisor doctrine holds at every layer, and the lead/orchestrator is the last semantic layer added** — build the deterministic spine first (schema+compile, then child-reducer+integration+whole-change gate against STUB workers), then real workers, then the minimal lead (`accept`/`revise`/`context_update`/`needs_human`); scheduling, splits, slices, remediation, and budget wind-down come **after V1**. (5) **The remediation-unit is a post-V1 fast-follow, not a requirement** — R25 whole-change final-repair is the correctness backstop (nothing ships defective); a lead-proposed remediation-unit (validated as `remediation ⊆ already-integrated-unit scope`, dispatched over the deferred R36 split plumbing) is a worthwhile reuse of R36 that lands with the autonomy layer, not a gate on shipping Stage C V1.
 
 ### Summary
 
 OpenThrottle will offer two implementation graphs through one execution architecture:
 
-1. `simple` passes the complete approved plan through the existing staged CE flow in one continuing agent context.
-2. `structured` requires a validated execution-plan artifact, iterates its units serially in executor-owned worktrees, uses a persistent lead for semantic acceptance, runs whole-change gates, and publishes one branch and PR.
+1. `simple` passes the complete approved plan through the existing staged CE flow (`core/implement@4` forward path `implementation → semantic_review → simplification → post_simplify_review → test → lint → build → publish → provider`, with a conditional `post_simplify_review`, `implementation` self-looping/terminating on repair-required/failure, and a conditional `repair_implementation → repair_semantic_review` side-loop entered from downstream failures and rejoining at `test`; repair bounded by the first-class top-level `max_repair_rounds` global cap plus the scoped `max_reentries` and `max_attempts` fields) in one continuing agent context. Its compiled manifest must be **behaviorally equivalent to `core/implement@4`**, re-pinned to a new digest.
+2. `structured` requires a validated execution-plan artifact, iterates its units serially in executor-owned worktrees, integrates each accepted unit onto one branch, uses a persistent lead for a per-unit **scope-match acceptance judgment** (not a code review), runs the whole-change gate as the **single code review of the integrated whole**, and publishes one branch and PR.
 
 Repositories can add more named graphs as configuration. A graph may compose only installed, closed node kinds. A `run` node invokes a configured loop; deterministic nodes run named commands, iterate prepared units, publish an exact subject, wait for provider evidence, or pause for a human. Graph configuration cannot define supervisor code, arbitrary expressions, runtime-generated topology, new credential authority, or a new artifact assurance class.
 
@@ -47,16 +64,19 @@ The graph is the public config-as-code surface. `PipelineManifest` remains the i
 
 ### Problem Frame
 
-PR #36 made the outer loop explicit and durable, but its current implementation still hands the full plan to `ce-work mode:return-to-caller`. CE may decide how to split work or create worktrees, yet those choices remain inside one model context and are opaque to the supervisor. The current `simple` manifest also runs semantic review before simplification, so a later simplifying change is not covered by that review.
+PR #36 made the outer loop explicit and durable, and the hardening wave since (round-based repair budget, scoped re-entries, and OPE-25's `post_simplify_review`) closed the two gaps the earlier draft cited. The default `core/implement@4` pipeline now runs simplification **before** the review meant to cover it and bounds repair with a three-tier budget the coordinator already enforces. Two structural limits remain, and they are what Stage C addresses:
 
-The first structured release should improve plan-wide control without building a general workflow platform:
+- **Whole-plan opacity.** `core/implement@4` still hands the full plan to one continuing `ce/implement@1` context (the `implement-plan` adapter invokes `ce-work mode:return-to-caller` for the whole stage). How that context splits work, creates worktrees, and orders sub-tasks stays inside one model and is opaque to the supervisor. A plan of several chunks cannot be reduced, integrated, or audited chunk-by-chunk.
+- **No durable partial-completion state.** When a run self-scopes to a coherent slice, the remainder lives only in PR prose with no typed next action. V1 handles this conservatively: a run that cannot complete every unit pauses `needs_human`. The typed continuation frontier that turns the remainder into an auto-chained next generation (R37/R38) is **deferred past V1**, and it overlaps the shipped repair-resolution/provider-continuation machinery, so it lands last.
+
+The structured release should improve plan-wide control without building a general workflow platform:
 
 - A planning skill should transform an authored CE plan into uniform unit JSON while preserving semantic judgment at authoring time.
 - A deterministic validator should prove shape, references, dependency validity, bounds, and digests before execution.
-- The supervisor should select and reduce one ready unit at a time.
+- The supervisor should select and reduce one ready unit at a time, **parametrizing the three-tier repair budget the coordinator already implements** (global `max_repair_rounds` / per-transition `max_reentries` / whole-run `max_attempts`) rather than inventing a new one.
 - The sandbox executor should create the correct worktree, invoke the correct native session, derive Git evidence, and integrate an accepted candidate.
-- The lead should preserve semantic continuity without becoming the scheduler.
-- Full test/lint/build and CE code review should cover the final integrated subject before publication.
+- The lead should preserve semantic continuity without becoming the scheduler, and is the **last** semantic layer added.
+- The **whole-change gate (R23)** — reusing the same `post_simplify_review` ordering invariant already proven in `core/implement@4`, simplify-before-review — is the **single code review**, run once over the integrated subject. The per-unit acceptance gate (R22) is a lead plan/feature/scope-match judgment, not a per-unit code review.
 - Linear should show how each unit and gate passed, not only a terminal status.
 
 ### Actors
@@ -95,7 +115,7 @@ The first structured release should improve plan-wide control without building a
 - R12. `for_each_unit` must compile to one installed composite stage capability. Its parent stage remains active while a supervisor-owned child reducer advances unit and loop attempts.
 - R13. The child reducer must durably own unit status, action attempts, effect intents, worker/lead session bindings, worktree handles, candidate/integration subjects, receipts, gate decisions, and terminal aggregate.
 - R14. V1 must execute at most one unit action process and one writable unit worktree at a time. Independent dependencies may establish readiness but must not cause parallel dispatch.
-- R15. Graph topology and execution-plan units must be immutable during a run, with exactly one sanctioned structural move: the supervisor-validated scope-preserving unit split (R36). Agents may return downstream context for existing pending units; new units, changed external dependencies, or scope expansion must return `needs_human`.
+- R15. Graph topology and execution-plan units must be immutable during a run. **In V1 the immutability is total — there is no sanctioned structural move**, because the scope-preserving unit split (R36) is deferred past V1. Agents may return downstream context for existing pending units; new units, changed external dependencies, scope expansion, or a split proposal must return `needs_human`. *(Eventual contract: once R36 lands with the autonomy layer, the supervisor-validated scope-preserving split becomes the single sanctioned structural move under the same scope-immutability invariant.)*
 
 #### Worker, lead, worktree, and integration behavior
 
@@ -108,34 +128,36 @@ The first structured release should improve plan-wide control without building a
 #### Deterministic gates and autonomous repair
 
 - R21. Gate evaluation must be a deterministic function over pinned configuration and typed current evidence. Process exit zero or schema validity alone must never pass a gate.
-- R22. The unit-acceptance gate must require a current worker completion receipt, executor-verified candidate subject, all configured unit commands passed or explicitly not configured, and a lead decision bound to that candidate.
-- R23. The structured final gate sequence must run configured whole-change commands before a fresh semantic review over the exact integrated subject. Simplification must precede the review it is meant to cover.
+- R22. The unit-acceptance gate must require a current worker completion receipt, executor-verified candidate subject, all configured unit commands passed or explicitly not configured, and a lead decision bound to that candidate. The lead decision is a **plan/feature/scope-match acceptance judgment** — does this chunk match its assigned plan slice — **not a per-unit code review**; it must not be implemented as a per-unit `ce-code-review`. Code review of the change happens exactly once, at R23.
+- R23. The structured final gate sequence must run configured whole-change commands before a fresh semantic review over the exact integrated subject. This whole-change review is the **single code review of the change**. Simplification must precede the review it is meant to cover (the same `post_simplify_review` ordering `core/implement@4` already enforces).
 - R24. A unit command failure or lead revision must resume the same current unit session by default. Exhaustion, stale context, or a foundational decision must pause for a human instead of silently widening scope.
-- R25. A final command or review failure must enter a bounded whole-change repair loop owned by a dedicated repair worker in an executor-owned exact-base worktree. A current completion receipt and executor Git evidence permit only an internal candidate commit and fast-forward; that subject must rerun the configured commands and obtain a fresh semantic review before publication.
+- R25. A final command or review failure must enter a bounded whole-change repair loop owned by a dedicated repair worker in an executor-owned exact-base worktree. A current completion receipt and executor Git evidence permit only an internal candidate commit and fast-forward; that subject must rerun the configured commands and obtain a fresh semantic review before publication. This loop's round budget must be **generous** relative to per-unit repair — a whole-change repair has a large blast radius — before it exhausts to `needs_human`.
 - R26. New evaluator mechanics, artifact schemas, assurance classes, side effects, or gate expression languages require reviewed runtime support. V1 repository configuration can compose existing node kinds, loops, commands, and standard receipts only.
 
 #### Visibility, credentials, and portability
 
 - R27. Every unit transition and gate receipt must be stored transactionally and queued as a sanitized, ordered activity on the parent Linear AgentSession; final receipts must also be rendered into the PR gate ledger.
-- R28. V1 must not create Linear subissues or auxiliary worker AgentSessions. Human steering enters through the parent session and is routed by the supervisor to the active lead or unit action under exact fences.
+- R28. V1 must not create Linear subissues or auxiliary worker AgentSessions. Human steering enters through the parent session and is routed by the supervisor to the active lead or unit action under exact fences **using the shipped steering buffer** (`session_inbox`, statuses `pending → dispatched → acknowledged → canceled`, fenced by session/generation/native-session/request-hash): steering that arrives while the active stage is non-steerable is buffered and delivered against the exact fenced delivery, never hard-rejected and never carried on a bespoke parent→child path.
 - R29. SQLite remains coordinator authority, but a human must be able to understand unit status, assumptions, revision requests, gate rationale, exact subjects, and evidence links from Linear and GitHub.
 - R30. Workers, lead, reviewer, repair, and publisher processes must receive only their configured logical credentials. Daytona secret names must not appear in graph, loop, or worker schemas.
 - R31. `mcp_servers` must remain a repository-declared, validated inventory. A worker may receive only names in its allowlist; OpenThrottle must not import arbitrary personal Claude/Codex configuration.
 - R32. Repository commands must be arbitrary bounded names mapped to exact command strings and execution policy. Graph nodes and execution-plan units reference names rather than hard-coded `test`/`lint`/`build` executor branches.
 - R33. Repository and graph limits must bound units, dependencies, unit attempts, loop reentries, final repair rounds, command output, and wall time. A graph may lower but not raise platform/runtime limits.
-- R34. Token/spend budgets, parallel isolation, dynamic graph changes beyond the R36 split, custom gate languages, and per-worker Linear sessions are deferred without weakening existing turn, timeout, credential, branch, subject, or publication fences.
+- R34. Token/spend budgets, parallel isolation, **all dynamic graph changes (including the R36 scope-preserving split, which is itself deferred past V1)**, custom gate languages, and per-worker Linear sessions are deferred without weakening existing turn, timeout, credential, branch, subject, or publication fences.
 
-#### Lead scheduling, splits, and slice continuation
+#### Lead scheduling, splits, and slice continuation (deferred past V1)
 
-- R35. When more than one unit is ready, the lead selects which ready unit dispatches next; the choice is recorded on the dispatch receipt. Absent a lead selection (timeout, missing decision, or recovery), the supervisor falls back to the deterministic plan order. Selection never overrides dependency readiness, and in V1 it changes order only, never concurrency.
-- R36. The lead may propose splitting one pending, never-attempted unit into two or more child units via a typed `openthrottle.unit-split/v1` artifact carrying, per child, instructions, acceptance criteria, owned scope, and intra-split ordering. The supervisor validates deterministically — the union of child scopes and acceptance criteria must equal the parent's (no expansion, no loss), children inherit the parent's external dependency edges, and total attempt/budget limits are partitioned rather than multiplied — then applies the split as a recorded graph revision with its own digest, closing the parent unit as `split`. A proposal failing validation returns to the lead once; a second failure or any scope change returns `needs_human`. Splitting an in-progress unit is not permitted — continuation slices remain the mechanism inside an attempted unit.
-- R37. When at least one unit has integrated and at least one pending unit remains, the lead may propose publishing the integrated units as a coherent releasable slice. The full final gate sequence (R23) runs over the exact integrated subject; the run then terminates `shipped` carrying a typed, digested **continuation frontier**: the remaining execution-plan units by stable ID (byte-identical to the pinned plan — the supervisor rejects any edit), the accepted downstream context records, and the published head. The frontier is durable state and is rendered in the terminal Linear receipt and PR body as the explicit remaining work.
-- R38. Continuation is supervisor-owned, never agent-owned: when provider evidence confirms the slice PR **merged**, the supervisor admits a new generation on the same ticket seeded from the frontier — base resolved from the merge result, execution plan equal to the frontier units revalidated by the R9 validator, prior accepted context carried forward, fresh session lineage. Bounded by a configured maximum auto-continuation count per ticket. A PR closed without merging, a frontier that fails revalidation against the new base, or an exhausted continuation bound returns `needs_human` instead of chaining. No new Linear issue is created and no agent gains work-item creation authority: the human approved the full plan at ship time, and PR merge remains the recurring human gate (a repository with auto-merge policy thereby opts into a fully autonomous chain).
+> **R35–R38 are the autonomy layer and are deferred past V1.** They remain the authoritative eventual contract but are not built in the serial spine. In V1: several ready units dispatch in **deterministic plan order** (no lead selection); graph topology and units are **immutable for the whole run** (no splits); and partial completion **pauses `needs_human`** rather than publishing a slice or auto-chaining. R37/R38 overlap the shipped repair-resolution/provider-continuation machinery (`provider-feedback.ts`), so when they are built they land **last**.
 
-#### Unit status leveling and budget wind-down
+- R35. *(Deferred past V1.)* When more than one unit is ready, the lead selects which ready unit dispatches next; the choice is recorded on the dispatch receipt. Absent a lead selection (timeout, missing decision, or recovery), the supervisor falls back to the deterministic plan order. Selection never overrides dependency readiness, and it changes order only, never concurrency. **In V1 the deterministic plan order is the only order.**
+- R36. *(Deferred past V1.)* The lead may propose splitting one pending, never-attempted unit into two or more child units via a typed `openthrottle.unit-split/v1` artifact carrying, per child, instructions, acceptance criteria, owned scope, and intra-split ordering. The supervisor validates deterministically — the union of child scopes and acceptance criteria must equal the parent's (no expansion, no loss), children inherit the parent's external dependency edges, and total attempt/budget limits are partitioned rather than multiplied — then applies the split as a recorded graph revision with its own digest, closing the parent unit as `split`. A proposal failing validation returns to the lead once; a second failure or any scope change returns `needs_human`. Splitting an in-progress unit is not permitted — continuation slices remain the mechanism inside an attempted unit. **In V1 no split is permitted; a unit too large for one attempt returns `needs_human`.**
+- R37. *(Deferred past V1; lands last, overlapping the shipped repair-resolution/provider work.)* When at least one unit has integrated and at least one pending unit remains, the lead may propose publishing the integrated units as a coherent releasable slice. The full final gate sequence (R23) runs over the exact integrated subject; the run then terminates `shipped` carrying a typed, digested **continuation frontier**: the remaining execution-plan units by stable ID (byte-identical to the pinned plan — the supervisor rejects any edit), the accepted downstream context records, and the published head. The frontier is durable state and is rendered in the terminal Linear receipt and PR body as the explicit remaining work.
+- R38. *(Deferred past V1; lands last, overlapping the shipped repair-resolution/provider work.)* Continuation is supervisor-owned, never agent-owned: when provider evidence confirms the slice PR **merged**, the supervisor admits a new generation on the same ticket seeded from the frontier — base resolved from the merge result, execution plan equal to the frontier units revalidated by the R9 validator, prior accepted context carried forward, fresh session lineage. Bounded by a configured maximum auto-continuation count per ticket. A PR closed without merging, a frontier that fails revalidation against the new base, or an exhausted continuation bound returns `needs_human` instead of chaining. No new Linear issue is created and no agent gains work-item creation authority: the human approved the full plan at ship time, and PR merge remains the recurring human gate (a repository with auto-merge policy thereby opts into a fully autonomous chain).
 
-- R39. A unit's terminal state must be leveled into exactly one of `completed` (its acceptance gate passed under R22), `exited` (it ended for a structural reason — superseded by a validated R36 split, a stop/supersede fence, or a drained budget reserve under R40), or `failed` (a defect — an executor/gate boundary violation, a malformed or unbindable receipt, or an unrecoverable effect error). The child reducer must derive one binary `alarm` bit from that level for operator surfaces (`failed` sets the alarm; `completed` and `exited` clear it) so Linear, the PR ledger, and `openthrottle status` distinguish "needs attention" from "ended cleanly" without re-deriving the taxonomy. When a leased unit action loses liveness past its heartbeat fence and cannot be reconciled to a current attempt, the supervisor must heal that unit to `exited` (never `failed`) and release its worktree/action so serial dispatch resumes deterministically rather than the unit lingering silently `running`. Terminal levels and the alarm bit are supervisor-derived from durable evidence only; no agent receipt may assert either.
-- R40. Each unit attempt and each final-repair attempt must reserve a configured tail (default ~10%, a `budget_reserve_fraction` bound governed by R33) of its remaining budget across attempts, loop reentries, and wall-clock. When any of those axes drains into the reserve, the supervisor must instruct the active worker to stop starting new work and instead land committed, coherent state and hand off — the executor derives a candidate over its owned worktree, and the worker returns a bounded downstream-context record plus a wind-down receipt — so budget exhaustion yields resumable state rather than a stranded worktree. A wind-down that reaches a coherent handoff terminates the attempt as `exited` (R39) and settles by state. When the R37 preconditions hold — at least one unit integrated and at least one pending unit remaining — the handoff carries its downstream context into the continuation frontier (R37). When no unit has yet integrated there is no publishable slice: the attempt still terminates `exited` with its bounded downstream-context record preserved as durable evidence on the ticket, and the run pauses `needs_human` — a human chooses between re-delegation with a larger budget and abandonment. When the reserve drains during a final-repair attempt, every unit has already integrated but the whole-change gates are incomplete, so neither publication nor a frontier is valid: the attempt terminates `exited` with its candidate state committed and its context recorded, and the run pauses `needs_human`. A wind-down that cannot reach coherence returns `needs_human`. The reserve is bounded by R33 and never raises platform or runtime limits.
+#### Unit status leveling (V1) and budget wind-down (deferred past V1)
+
+- R39. *(V1.)* A unit's terminal state must be leveled into exactly one of `completed` (its acceptance gate passed under R22), `exited` (it ended for a structural reason — a stop/supersede fence, or, once the autonomy layer lands, a validated R36 split or a drained R40 budget reserve), or `failed` (a defect — an executor/gate boundary violation, a malformed or unbindable receipt, or an unrecoverable effect error). The child reducer must derive one binary `alarm` bit from that level for operator surfaces (`failed` sets the alarm; `completed` and `exited` clear it) so Linear, the PR ledger, and `openthrottle status` distinguish "needs attention" from "ended cleanly" without re-deriving the taxonomy. When a leased **child unit action** loses liveness past its heartbeat fence and cannot be reconciled to a current attempt, the supervisor must heal that unit to `exited` (never `failed`) and release its worktree/action so serial dispatch resumes deterministically rather than the unit lingering silently `running`. Terminal levels and the alarm bit are supervisor-derived from durable evidence only; no agent receipt may assert either.
+- R40. *(Deferred past V1.)* Each unit attempt and each final-repair attempt must reserve a configured tail (default ~10%, a `budget_reserve_fraction` bound governed by R33) of its remaining budget across attempts, loop reentries, and wall-clock. When any of those axes drains into the reserve, the supervisor must instruct the active worker to stop starting new work and instead land committed, coherent state and hand off — the executor derives a candidate over its owned worktree, and the worker returns a bounded downstream-context record plus a wind-down receipt — so budget exhaustion yields resumable state rather than a stranded worktree. A wind-down that reaches a coherent handoff terminates the attempt as `exited` (R39) and settles by state. When the R37 preconditions hold — at least one unit integrated and at least one pending unit remaining — the handoff carries its downstream context into the continuation frontier (R37). When no unit has yet integrated there is no publishable slice: the attempt still terminates `exited` with its bounded downstream-context record preserved as durable evidence on the ticket, and the run pauses `needs_human` — a human chooses between re-delegation with a larger budget and abandonment. When the reserve drains during a final-repair attempt, every unit has already integrated but the whole-change gates are incomplete, so neither publication nor a frontier is valid: the attempt terminates `exited` with its candidate state committed and its context recorded, and the run pauses `needs_human`. A wind-down that cannot reach coherence returns `needs_human`. The reserve is bounded by R33 and never raises platform or runtime limits. **In V1, budget exhaustion instead pauses `needs_human` directly (see R40 deferral); the reserve wind-down machinery arrives with the autonomy layer.**
 
 ### Key Flows
 
@@ -169,24 +191,26 @@ The first structured release should improve plan-wide control without building a
 3. The supervisor deterministically evaluates the unit gate.
 4. On pass, the executor fast-forwards the integration branch to the accepted candidate, records the new head, removes the unit worktree, and unlocks the next unit.
 
-#### F5. Carry downstream context and re-partition pending work without expanding scope
+#### F5. Carry downstream context without expanding scope
 
 1. A unit receipt or lead decision identifies an assumption relevant to existing pending units.
 2. The supervisor stores a bounded immutable context record tied to the source unit and integration head.
 3. Later unit envelopes include applicable context records.
-4. When several units are ready, the lead's recorded selection (R35) decides which dispatches next; the deterministic plan order is the fallback.
-5. When a pending unit is too large for one attempt, the lead proposes an `openthrottle.unit-split/v1`; the supervisor validates scope preservation and applies it as a recorded graph revision (R36) instead of the agent cramming the unit into overloaded repair/continuation outcomes.
+4. When several units are ready, V1 dispatches in **deterministic plan order**. (Lead-recorded ready-unit selection, R35, is deferred past V1.)
+5. A pending unit too large for one attempt returns `needs_human`. (Lead-proposed scope-preserving splits, R36, are deferred past V1.)
 6. A requested new unit, external dependency change, or scope expansion pauses for a human and requires a newly validated run rather than an in-place graph patch.
 
 #### F6. Complete whole-change gates and publish
 
-1. When every unit integrates — or a validated R37 slice proposal selects the currently integrated units — the child stage emits one aggregate artifact bound to the exact integration head.
-2. The graph runs full named commands, then fresh whole-change semantic review.
+1. When every unit integrates, the child stage emits one aggregate artifact bound to the exact integration head. (In V1 the run completes only when every unit integrates; the R37 partial-slice path is deferred past V1.)
+2. The graph runs full named commands, then the fresh whole-change semantic review — the single code review of the change.
 3. Failures enter the bounded final-repair loop and repeat the affected gates.
 4. The publish loop alone receives provider write authority and publishes the exact gated tree to one `ot/*` branch and PR.
 5. Provider evidence advances only for the exact published head.
 
-#### F8. Publish a slice and continue autonomously
+#### F8. Publish a slice and continue autonomously (deferred past V1)
+
+> Deferred past V1 with R37/R38, and lands last because it overlaps the shipped repair-resolution/provider-continuation machinery (`provider-feedback.ts`).
 
 1. The lead proposes a slice publication naming the integrated units; the supervisor validates that every named unit is integrated and every remaining unit is byte-identical to the pinned plan.
 2. The F6 final gates run over the integrated subject; the run terminates `shipped` with the typed continuation frontier rendered in the terminal receipt and PR body.
@@ -196,7 +220,7 @@ The first structured release should improve plan-wide control without building a
 #### F7. Human steering, stop, and recovery
 
 1. A `needs_human` decision publishes the question and evidence to the parent Linear session and pauses dispatch.
-2. The supervisor binds the reply to the current unit/final-repair fence and invokes the lead or worker through a typed continuation.
+2. The reply enters the shipped steering buffer (`session_inbox`); the supervisor binds it to the current unit/final-repair fence (session/generation/native-session/request-hash) and invokes the lead or worker through a typed continuation. A reply arriving while the active stage is non-steerable is buffered, not rejected, and delivered against the exact fenced delivery.
 3. Stop fences new child effects, terminates the active process, and cleans only validated graph-owned worktrees.
 4. Restart reconciles persisted effects, candidate/integration subjects, and native sessions without duplicate agent invocation or integration.
 
@@ -218,12 +242,12 @@ The first structured release should improve plan-wide control without building a
 - AE14. Given commands `unit`, `docs-check`, and `package`, a graph or unit may reference any of them; an undefined command fails admission rather than falling through to a stage name.
 - AE15. Given a semantic review skill returns a passing standard review receipt for the wrong commit, deterministic evaluation rejects it. A current receipt with required evidence passes even when the skill is non-CE.
 - AE16. Given the Daytona runtime supplies one outer sandbox but no sibling-process isolation, structured V1 still runs safely because only one writable unit action exists at a time.
-- AE17. Given a validated slice publication with three units remaining, when the slice PR merges, a new generation on the same ticket adopts exactly those three units against the merged base without human action; when the PR is instead closed unmerged, the run pauses `needs_human` with the frontier preserved.
+- AE17. *(Deferred past V1 with R37/R38.)* Given a validated slice publication with three units remaining, when the slice PR merges, a new generation on the same ticket adopts exactly those three units against the merged base without human action; when the PR is instead closed unmerged, the run pauses `needs_human` with the frontier preserved.
 
 ### Success Criteria
 
-- The built-in `simple` graph compiles to behaviorally equivalent stage order, context policies, repair transitions, gates, publication, and provider tail as the current implement/investigate manifests.
-- The same graph and execution-plan fixtures normalize and hash identically in the contract package, packed CLI, and supervisor.
+- The built-in `simple` graph compiles to a manifest **behaviorally equivalent to `core/implement@4`** (and `investigate` to `core/investigate@1`), re-pinned to a **new digest** — same 11 stages and transition topology (including `implementation`'s self-loop/terminate transitions, the conditional `repair_implementation`/`repair_semantic_review` side-loop and `post_simplify_review`, and the rejoin-at-`test` behavior), context policies, all three first-class repair bounds (global `max_repair_rounds`, scoped `max_reentries`, `max_attempts`), gates, publication, and provider tail. Behavioral equivalence (not byte-identity) is the compile-safety oracle and the first operator checkpoint.
+- The same graph and execution-plan fixtures normalize and hash **identically across environments** — the contract package source, the packed CLI, and the built supervisor all produce the same canonical digest (the U1 cross-environment digest-determinism oracle).
 - A repository can copy a built-in graph, change compatible loops/workers/skills/commands, validate it, and select it without an OpenThrottle deployment.
 - Structured serial execution survives crashes before/after worktree creation, agent completion, candidate commit, lead decision, integration, and publication acknowledgement without duplicate work or integration.
 - Each unit gate has worker, executor, command, and lead evidence bound to one candidate subject; every final gate is bound to the final integrated/published subject.
@@ -241,14 +265,17 @@ The first structured release should improve plan-wide control without building a
 - User-defined loops, workers, named commands, skill references, MCP allowlists, and bounded limits.
 - The `prepare-execution-plan` skill and shared local/admission validator.
 - One serial `for_each_unit` composite stage with durable unit state.
-- One persistent lead, one session/worktree per unit attempt, bounded final repair, and one integration branch/PR.
+- One **minimal** persistent lead (`accept`/`revise`/`context_update`/`needs_human`, where `accept` is a scope-match judgment, not a code review), one session/worktree per unit attempt, bounded final repair, and one integration branch/PR.
+- Unit terminal-state leveling (`completed`/`exited`/`failed`) with the derived operator alarm bit and missing-liveness heal-to-`exited` (R39).
 - Deterministic gate receipts and parent Linear/PR evidence.
 
 **Deferred to follow-up work**
 
+- **The autonomy layer (deferred past V1):** lead ready-unit scheduling (R35), scope-preserving unit splits (R36), slice publication + typed continuation frontier (R37), supervisor-owned merge-evidence continuation (R38), and budget-reserve wind-down (R40). In V1: deterministic plan order, whole-run-immutable topology, partial completion pauses `needs_human`, and budget exhaustion pauses `needs_human`. R37/R38 overlap the shipped repair-resolution/provider-continuation machinery (`provider-feedback.ts`) and land **last**.
 - Parallel unit dispatch, sibling worktree/process isolation, resource claims, conflict groups, and deterministic waves.
-- Dynamic graph patches beyond the R36 scope-preserving split; runtime-created units with new scope.
-- Stacked continuation (admitting a follow-up generation off an unmerged slice PR); V1 chains only on merge evidence.
+- **Remediation-unit as a post-V1 fast-follow.** R25 whole-change final-repair is the correctness backstop (nothing ships defective); a lead-proposed remediation-unit — the supervisor validates it as `remediation ⊆ already-integrated-unit scope`, then dispatches it over the deferred R36 split plumbing — is a worthwhile reuse that lands with the autonomy layer, not a requirement for Stage C V1.
+- Any dynamic graph patch; runtime-created units with new scope (in V1 topology is immutable for the whole run — the R36 scope-preserving split is itself deferred).
+- Stacked continuation (admitting a follow-up generation off an unmerged slice PR); slice continuation chains only on merge evidence when R37/R38 land.
 - Custom gate DSLs, custom receipt schemas, and repository-defined evaluator mechanics.
 - Worker-specific Linear AgentSessions or a subissue per unit.
 - Arbitrary worker base prompts/personas; a future pinned policy-skill field can cover a proven need.
@@ -271,7 +298,7 @@ The first structured release should improve plan-wide control without building a
 - KTD1. **Compile public graphs into the PR #36 manifest.** A graph is authoring input; `PipelineManifest` remains the sole runtime sequence and gate authority. `for_each_unit` compiles to one new capability rather than a second top-level coordinator. (session-settled: user-directed — chosen over replacing the existing coordinator: PR #36 already supplies the durable deterministic outer loop.)
 - KTD2. **Use graph → loop → worker as the public vocabulary.** Do not expose separate pipeline, workflow, execution-profile, role, action, and gate-DSL layers in V1. Internal code may retain pipeline terminology where it names the existing runtime contract. (session-settled: user-directed — chosen over the prior multi-layer schema: the first release should stay understandable and configurable.)
 - KTD3. **Make the execution plan uniform, not every source plan.** The preparation skill may reason over CE prose, but the structured runner consumes only validated `openthrottle.execution-plan/v1` JSON. (session-settled: user-directed — chosen over runtime dependency inference: dependency creation is semantic while validation is deterministic.)
-- KTD4. **Keep graph scope immutable; give the lead ordering and re-partitioning authority.** The lead may add typed context to existing pending units, select which ready unit dispatches next (R35), and propose supervisor-validated scope-preserving splits of pending units (R36) — but cannot add units, change external dependencies, or expand scope in V1; material scope change returns to the human and a new validated generation. (session-settled: user-directed 2026-07-24 — revised from full topology immutability after the OPE-6 live run showed agents forced to express granularity and ordering needs through overloaded repair/continuation outcomes; the invariant is now scope immutability, not shape immutability.)
+- KTD4. **Keep graph scope immutable; the lead's ordering and re-partitioning authority is deferred past V1.** In V1 the lead may only add typed context to existing pending units (`context_update`); ready-unit selection (R35) and scope-preserving splits (R36) are deferred, so topology and units stay immutable for the whole run and any material scope change returns to the human and a new validated generation. When the autonomy layer lands post-V1, the lead gains R35 ordering and R36 re-partitioning under the same scope-immutability invariant. (session-settled: user-directed 2026-07-24 — the OPE-6 live run showed agents forced to express granularity and ordering needs through overloaded repair/continuation outcomes, motivating R35/R36; the 2026-07-28 trajectory audit deferred them past the serial spine to keep V1 shippable, so the invariant is scope immutability, not shape immutability, and V1 realizes only the "no in-place shape change" half.)
 - KTD5. **Keep one lead session and one session per unit attempt.** Implement, simplify, command repair, and lead revision stay in the unit session by default; review is fresh at the end. (session-settled: user-directed — chosen over fresh worker sessions for every loop: local context is valuable within one bounded attempt.)
 - KTD6. **Make Git mechanics executor-owned.** The worker edits but does not commit or push. The executor creates a candidate commit, verifies it, and advances the integration branch only after the deterministic acceptance gate passes. (session-settled: user-directed — chosen over agent-created worktrees/branches: handoff and recovery must survive unrelated native sessions.)
 - KTD7. **Treat semantic output as evidence, never authority.** A lead or CE reviewer returns a typed attestation. The supervisor deterministically checks schema, provenance, fences, subject, freshness, outcome, and corroborating executor/command evidence before passing the gate. (session-settled: user-directed — chosen over model-invoked “if X then pass” instructions: the outer loop must own advancement.)
@@ -281,9 +308,9 @@ The first structured release should improve plan-wide control without building a
 - KTD11. **Ship serial execution first.** Dependencies determine readiness and ordering, but V1 permits only one writable unit action at once. This removes sibling isolation, merge-order, and race complexity while preserving the future seam. (session-settled: user-directed — chosen over automatic safe parallelism: parallel orchestration made the initial design too large.)
 - KTD12. **Keep commands repository-defined.** The executor implements one bounded named-command protocol; `test`, `lint`, and `build` are default config names rather than hard-coded executor mechanics. (session-settled: user-directed — chosen over fixed command enums: platform defaults should use the same surface as repository graphs.)
 - KTD13. **Bound structure and time before cost.** Enforce graph/unit/attempt/reentry/output/time limits and defer token budgets until provider usage is trustworthy and comparable. (session-settled: user-directed — chosen over V1 token accounting: portable usage data is not yet a reliable control input.)
-- KTD14. **Make partial completion a managed handoff, not prose.** The 2026-07-24 gen-7 run self-scoped its PR to a coherent slice — the right instinct — but the remainder existed only in the PR body with no durable next action. Because execution-plan units are validated schema (R8-R9), the remainder needs no new authoring or approval: R37 captures it as a typed frontier and R38 lets the supervisor chain a continuation generation on merge evidence. Human authority is preserved at its two existing gates — plan approval and PR merge — and the agent never gains work-item creation authority. (session-settled: user-directed 2026-07-24.)
-- KTD15. **Level unit terminal states and heal missing liveness to `exited`.** Distinguish `completed`/`exited`/`failed` and derive one operator alarm bit (R39), so a unit that ends for a structural reason (split, stop, drained reserve) or loses liveness is never conflated with a defect and never lingers as silently `running`. (session-settled: user-directed 2026-07-25 — adopted from the reviewed Fractal comparison's completed/exited/failed status leveling; the OPE-6/2026-07-24 incident window showed stuck-`running` actors were the dominant failure signature, so heal-to-`exited` is a first-class unit-level invariant rather than an incidental reaper side effect.)
-- KTD16. **Spend a budget reserve on handoff, not new work.** When a unit or final-repair attempt drains into its ~10% reserve, wind down to committed coherent state plus a downstream-context record and a receipt instead of starting new work (R40), so exhaustion produces durable, resumable state — a continuation frontier whenever a publishable slice exists — rather than a stranded worktree. (session-settled: user-directed 2026-07-25 — adopted from the reviewed Fractal comparison's reserve wind-down budget; it wires to R33 bounds and the R37 frontier so the existing continuation machinery absorbs budget-limited runs whenever R37's preconditions hold, while a drain with nothing yet integrated or during final repair pauses `needs_human` with the context preserved.)
+- KTD14. **Make partial completion a managed handoff, not prose — deferred past V1.** The 2026-07-24 gen-7 run self-scoped its PR to a coherent slice — the right instinct — but the remainder existed only in the PR body with no durable next action. Because execution-plan units are validated schema (R8-R9), the remainder needs no new authoring or approval: R37 captures it as a typed frontier and R38 lets the supervisor chain a continuation generation on merge evidence. Human authority is preserved at its two existing gates — plan approval and PR merge — and the agent never gains work-item creation authority. **In V1 partial completion simply pauses `needs_human`; R37/R38 realize the managed handoff post-V1, and they land last because they overlap the shipped repair-resolution/provider-continuation machinery (`provider-feedback.ts`, which already discounts stale-anchored feedback and resolves repair-driving snapshots after republish).** (session-settled: user-directed 2026-07-24; V1 deferral per the 2026-07-28 trajectory audit.)
+- KTD15. **Level unit terminal states and heal missing liveness to `exited` — V1.** Distinguish `completed`/`exited`/`failed` and derive one operator alarm bit (R39), so a unit that ends for a structural reason (in V1: a stop/supersede fence; once the autonomy layer lands: also an R36 split or a drained R40 reserve) or loses liveness is never conflated with a defect and never lingers as silently `running`. The liveness heal fires on a stale **child unit action** past its heartbeat fence. (session-settled: user-directed 2026-07-25 — adopted from the reviewed Fractal comparison's completed/exited/failed status leveling; the OPE-6/2026-07-24 incident window showed stuck-`running` actors were the dominant failure signature, so heal-to-`exited` is a first-class unit-level invariant rather than an incidental reaper side effect, and it stays in the V1 spine.)
+- KTD16. **Spend a budget reserve on handoff, not new work — deferred past V1.** When a unit or final-repair attempt drains into its ~10% reserve, wind down to committed coherent state plus a downstream-context record and a receipt instead of starting new work (R40), so exhaustion produces durable, resumable state — a continuation frontier whenever a publishable slice exists — rather than a stranded worktree. **In V1 budget exhaustion pauses `needs_human` directly; the reserve wind-down machinery arrives with the autonomy layer (it depends on the R37 frontier).** (session-settled: user-directed 2026-07-25 — adopted from the reviewed Fractal comparison's reserve wind-down budget; it wires to R33 bounds and the R37 frontier so the existing continuation machinery absorbs budget-limited runs whenever R37's preconditions hold; V1 deferral per the 2026-07-28 trajectory audit.)
 
 ### High-Level Technical Design
 
@@ -350,7 +377,7 @@ limits:
   max_units: 24
   max_unit_attempts: 3
   max_final_repairs: 2
-  budget_reserve_fraction: 0.1
+  # budget_reserve_fraction: 0.1   # deferred past V1 (R40 budget wind-down)
 ```
 
 Directional graph bundle:
@@ -497,15 +524,15 @@ The evaluator is deterministic even when one input is a semantic judgment. It do
 
 ### Durable State and Effects
 
-The existing pipeline instance and stage attempt remain the parent. New child records should be focused rather than adding unit-specific columns throughout `pipeline_stage_attempts`:
+The existing pipeline instance and stage attempt remain the parent. New child records land as **additive migration v16** (the latest merged migration is **v15** `orchestration-journal`; all Stage C tables are new, checksum-pinned, and never rewrite historical rows) rather than adding unit-specific columns throughout `pipeline_stage_attempts`. Per `docs/SPEC.md` §persistence, the historical **`pipeline_work_bindings`** and `run_stage_bindings` satellite tables **remain in immutable migrations only** and Stage C must **not** revive them: the parent↔child bind state (each durable unit delivery bound to its fenced pipeline attempt and unit) is stored as **fence columns on the owning `execution_units`/`execution_work_attempts` rows**, so unit-level inbox/result handling is auditable on the owning records themselves.
 
 - `execution_graph_instances` — parent stage attempt, plan/graph digests, status, integration head, lead session binding, limits, and aggregate artifact.
-- `execution_units` — immutable unit definition digest, dependency projection, stable order, current status, accepted subject, and downstream context cursor.
-- `execution_work_attempts` — unit or final-repair scope, optional unit ID, ordinal, workspace, worker session, current loop, base/candidate subjects, fence, and retry lineage.
+- `execution_units` — immutable unit definition digest, dependency projection, stable order, current status, terminal level (`completed`/`exited`/`failed`) and derived alarm bit (R39, **net-new** — `exited` does not exist in the current run/actor enums), accepted subject, and downstream context cursor.
+- `execution_work_attempts` — unit or final-repair scope, optional unit ID, ordinal, workspace, worker session, current loop, base/candidate subjects, fence, and retry lineage. *(The reserve budget cursor for R40 is deferred past V1 and added with the autonomy layer — no reserve mechanism exists today.)*
 - `execution_loop_attempts` — one sealed loop invocation, request/result hashes, native session binding, outcome, and liveness.
 - `execution_context_records` — immutable bounded lead/worker context updates for existing pending units.
-- `execution_gate_receipts` — deterministic unit/final child decisions and linked artifact hashes.
-- `execution_effect_intents` — idempotent worktree, loop dispatch, command, candidate, integration, stop, and cleanup actions.
+- `execution_gate_receipts` — deterministic unit/final child decisions and linked artifact hashes, produced by evaluators that **reuse the `gates.ts` idioms** (`semanticDecision` incl. the AE6 tree-delta reclassify, `commandDecision` incl. R32 `not_configured`, and `validateFence`) rather than reimplementing fence/provenance/subject/freshness checks.
+- `execution_effect_intents` — idempotent worktree, loop dispatch, command, candidate, integration, stop, and cleanup actions. This is the **transactional control-flow substrate** (persist-intent-then-act), not a journal. Stage C must **not** stand up a parallel append-only effect/decision journal: the human-and-cross-run narrative of orchestration decisions (dispatch, stall detection, human escalation, terminal observation, run notes) rides the **shipped v15 `orchestration_journal`** with actor `orchestrator`, honoring its read-contract (audit only, never feeding coordinator control flow).
 
 The supervisor persists an intent before touching Daytona, a process, Git, Linear, or GitHub. Every acknowledgement includes the expected child version and fence. The child reducer emits exactly one `execution_graph_result` aggregate artifact to settle the parent `for_each_unit` stage.
 
@@ -524,22 +551,42 @@ The supervisor persists an intent before touching Daytona, a process, Git, Linea
 
 ```mermaid
 flowchart TB
-  U1[U1 Contracts and compiler] --> U2[U2 Plan preparation and CLI]
-  U1 --> U3[U3 Graph resolution and admission]
-  U3 --> U4[U4 Durable serial unit reducer]
+  U1a[U1a Contracts project + CI/deploy + canonical digest + cross-env fixture] --> U1b[U1b Freeze schemas + corpora]
+  U1b --> U2[U2 Plan preparation and CLI]
+  U1b --> U3[U3 Graph resolution and admission]
+  U3 --> U4a[U4a Serial reducer + child store + one-active lease + aggregate-settles-once]
+  U4a --> U4b[U4b Child gates + downstream context + stop/recovery]
+  U4b --> U4c[U4c R39 status leveling + child-action liveness heal-to-exited]
   U3 --> U5[U5 Worktrees and loop runtime]
-  U4 --> U6[U6 Workers, lead, receipts, gates, integration]
+  U4c --> U6[U6 Workers, lead, receipts, gates, integration]
   U5 --> U6
   U6 --> U7[U7 Linear and PR ledger]
   U2 --> U8[U8 Built-ins, dogfood, rollout]
   U3 --> U8
-  U4 --> U8
+  U4c --> U8
   U5 --> U8
   U6 --> U8
   U7 --> U8
 ```
 
-U4 and U5 may proceed independently only after U1/U3 freeze their shared protocols. U6 is the integration point. U8 retains `simple` as the default until the structured serial live gate passes.
+**OPE-15 has landed.** Stage C builds on the post-OPE-15 tree, which is now current `main`: migration **v14** `satellite-table-contraction` folded the six satellite tables, `persistence/migrations/reconciliation.ts` is gone, `createInstance` is decomposed across `persistence/pipeline/create-store.ts` and `instance-store.ts`, and `core/implement@1/2/3` + the surplus `ce/*` manifests are pruned (only `core-implement-v4.yaml` and `core-investigate-v1.yaml` remain). The earlier "do not start U3/U4 until OPE-15 merges" gate is discharged; all units build on current shapes.
+
+**Serial spine, parallel workers.** U1 (contracts) and U3 (graph compile + admission pin) are **serial and foundational**: U3's compiler is the seam in `app/admission.ts` between `parseRepositoryConfig` and `resolvePipelineReference` (`reference = config.pipelines?.[taskType] ?? taskType; resolvePipelineReference(catalog, reference)`). U2 (planning skill/CLI) parallels U1 and depends only on it. **U4** is split into **U4a** (durable serial child reducer + child schema/store via additive migration v16 + one-active-action lease + aggregate-settles-parent-once), **U4b** (deterministic child gates + downstream-context records + stop/recovery), and **U4c** (R39 terminal-state leveling + child-action liveness heal-to-`exited`); **U5** (executor-owned worktrees + `loop-action@1` runtime) runs **in parallel** with the U4* chain once U3 freezes its protocols. U6 is the integration point that joins U4c+U5, real CE unit loops, unit acceptance, integration, and final repair as a thin `gates.ts` specialization. U7 (Linear/PR ledger) reuses the existing findings-with-dispositions + consolidated-status rendering. U8 (built-ins/dogfood/rollout) retains `simple` as the default until the structured serial live gate passes. The autonomy layer (R35/R36/R37/R38/R40) is **not built in V1** and is not a dependency of U6–U8.
+
+**Build order within the spine — the lead is last, the autonomy layer is out of V1.** Per the deterministic-supervisor doctrine: build schema+compile, then the child-reducer + integration + whole-change gate driven by **STUB (non-CE) workers**, then real workers, then the **minimal lead** (`accept` / `revise` / `context_update` / `needs_human`; ready-unit dispatch is deterministic plan order, since R35 selection is deferred). Splits (R36), slices/continuation (R37/R38), remediation-unit, and budget wind-down (R40) are **deferred past V1** — the autonomy follow-up, with R37/R38 landing last because they overlap the shipped repair-resolution/provider work.
+
+**First ticket = the thinnest slice: a U1a-subset + U3 `simple`-parity check, with zero runtime/reducer code.** The single acceptance criterion is that the built-in `simple` graph compiles to a manifest **behaviorally equivalent to `core/implement@4`**, re-pinned to a **new digest** (proven against the current manifest fixtures), and that the canonical digest is **identical across environments** (contract source, packed CLI, built supervisor — the U1a cross-env determinism oracle). That equivalence is the compile-safety oracle for the whole feature and must be green before any child-state code is written.
+
+**Then a walking skeleton before real workers:** a 2-unit `for_each_unit` driven by STUB (non-CE) loops proving compile → serial-integrate → whole-change review → one PR, so the deterministic path is exercised end-to-end before any real CE loop is wired in.
+
+**Four operator checkpoints:**
+
+1. **After U3** — behavioral equivalence of `simple` to `core/implement@4` (re-pinned to a new digest) plus cross-environment digest determinism (the compile-safety oracle).
+2. **After U4c** — crash-convergence, one-active-action lease, and R39 heal-to-`exited` matrices pass. (The budget wind-down matrix moves to the autonomy follow-up with R40.)
+3. **After U6** — the Docker smoke integrates two STUB units into one final subject through the whole-change gate.
+4. **After U8** — a single credentialed live acceptance run.
+
+The U4a→U4b→U4c chain and U5 may proceed independently only after U1/U3 freeze their shared protocols.
 
 ### Risks and Dependencies
 
@@ -559,12 +606,19 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 - `docs/PLAN.md` — completed coordinator cutover and current POC boundary.
 - `docs/plans/2026-07-21-001-feat-configurable-agentic-pipeline-coordinator-plan.md` — implemented predecessor and explicit no-fan-out boundary.
 - `docs/AGENTIC-LOOP-REVIEW.md` — original findings and current cutover re-audit.
-- `supervisor/src/pipeline/manifest.ts` — strict manifest/config schema, installed executor/evaluator/artifact vocabulary, and normalized digests.
-- `supervisor/src/pipeline/coordinator.ts`, `supervisor/src/pipeline/store.ts`, the SQLite implementations under `supervisor/src/persistence/pipeline/`, and `supervisor/src/operations/pipeline-effects.ts` — pure reduction, durable attempts/effects, one runtime resource, and current single-stage dispatch seam.
-- `supervisor/src/pipeline/gates.ts` — current canonical artifact parsing, fence validation, exact-subject checks, and deterministic gate receipt creation.
+- `supervisor/pipelines/catalog.yaml` and `supervisor/pipelines/core-implement-v4.yaml` — the current default (`implement → core/implement@4`), whose true shape is 11 stages: a forward path `implementation → semantic_review → simplification → post_simplify_review → test → lint → build → publish → provider` (with `implementation` self-looping on `semantic_repair_required` and terminating `failed` on `failure`, and a conditional `post_simplify_review`), plus a conditional `repair_implementation → repair_semantic_review` side-loop entered when a downstream stage (`semantic_review`, `simplification`, `post_simplify_review`, `test`, `lint`, `build`, `provider`) returns `failure`/`semantic_repair_required`, rejoining at `test`. The `simple` graph must reproduce this **behaviorally** (re-pinned to a new digest, not byte-for-byte), emitting all three first-class repair-budget fields: top-level `max_repair_rounds: 5` (global), per-transition `max_reentries` (scoped), and `max_attempts: 200`.
+- `supervisor/src/pipeline/manifest.ts` — strict manifest/config schema, installed executor/evaluator/artifact vocabulary, normalized digests, and the closed `COMMAND_NAMES = [test, lint, build, format]` enum that R32/KTD12 turns into a named map.
+- `supervisor/src/pipeline/coordinator.ts`, `supervisor/src/pipeline/store.ts`, the SQLite implementations under `supervisor/src/persistence/pipeline/`, and `supervisor/src/operations/pipeline-effects.ts` — pure reduction, durable attempts/effects, one runtime resource, the current single-stage dispatch seam, and the three-tier repair budget (`instance.reentry_count` vs `manifest.max_repair_rounds`; `targetState.reentry_count` vs transition `max_reentries`; `instance.attempt_count` vs `manifest.max_attempts`) the child reducer parametrizes.
+- `supervisor/src/pipeline/gates.ts` — the canonical `semanticDecision` (incl. AE6 tree-delta reclassify), `commandDecision` (incl. R32 `not_configured`), and `validateFence` idioms the Stage C unit/whole-change gates specialize.
+- `supervisor/src/app/admission.ts` (`handleCreated`) and `supervisor/src/app/thread-control.ts` (`handlePrompted`) — the decomposed admission and human-reply routing that replace the former monolithic `session-service.ts`; the compile seam is between `parseRepositoryConfig` and `resolvePipelineReference` in `admission.ts`.
+- `docs/SPEC.md` §persistence — the requirement that Stage C child-unit work add live binding state to the **owning unit/work records** (the historical `pipeline_work_bindings`/`run_stage_bindings` tables stay in immutable migrations only and are never revived), and the migration model Stage C extends as additive v16 (latest merged is v15).
+- `supervisor/src/persistence/migrations/definitions.ts` — the migration ledger through **v15** (`orchestration-journal`, the shipped append-only decision journal keyed by team/repository/issue with actor `orchestrator` and an audit-only read-contract that never feeds coordinator control flow) and **v14** (`satellite-table-contraction`, the OPE-15 fold). Stage C child tables land as additive v16 and journal orchestration decisions onto the v15 table rather than a parallel journal.
+- `supervisor/src/app/provider-feedback.ts` — the shipped repair-resolution provider fix: `snapshotFeedbackPredatesCurrentPublication` discounts stale-anchored review comments (watermark predates publication acknowledgement) and `snapshotCompletedRepairBeforeCurrentPublication` marks repair-driving feedback snapshots resolved after republish (keyed on `repair_round`). R37/R38 slice continuation overlaps this and lands last.
+- `supervisor/src/persistence/steering-store.ts` and `supervisor/src/runtime/steering.ts` — the shipped steering buffer (`session_inbox`, statuses `pending → dispatched → acknowledged → canceled`, fenced by session/generation/native-session/request-hash) that R28 routes through: mid-run steering during a non-steerable stage is buffered and fenced, not hard-rejected.
 - `supervisor/src/runtime/contracts.ts` — current `stage-executor@1` request and one-native-session-per-stage contract.
-- `sandbox/runner/execute-stage.mjs` — current 64 KiB task context, context policy handling, fixed command names, CE capability dispatch, and one typed result.
-- `skills/tasks/implement-plan/SKILL.md` and `skills/README.md` — current full-plan `ce-work mode:return-to-caller`, separate review/simplify/publish stages, and single-source CE adapter rules.
+- `sandbox/runner/execute-stage.mjs` and `sandbox/runner/artifacts.mjs` — current 64 KiB task context, context policy handling, fixed command names, CE capability dispatch, one typed result, and the result normalization that moved from the now-deleted `normalize.mjs` into `artifacts.mjs`.
+- `skills/tasks/implement-plan/SKILL.md` and `skills/README.md` — the per-stage `ce-work mode:return-to-caller` adapter (now one sealed stage, sequenced by `core/implement@4`, not a whole-plan hand-off) and single-source CE adapter rules.
+- **OPE-15 (landed):** removal of `supervisor/src/persistence/migrations/reconciliation.ts`, the six-table fold (migration v14 `satellite-table-contraction`), `createInstance` decomposition (`persistence/pipeline/create-store.ts`, `instance-store.ts`), and pruning of `core/implement@1/2/3` + surplus `ce/*`. This plan targets the post-OPE-15 tree, which is now current `main`; the earlier "do not start file-moving units until it lands" gate is discharged.
 - No `STRATEGY.md`, `CONCEPTS.md`, or `docs/solutions/` corpus exists in this repository, so no additional institutional learning changed the plan.
 
 ---
@@ -573,11 +627,18 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 
 ### U1. Freeze the graph, loop, worker, execution-plan, and receipt contracts
 
-**Goal:** Define the smallest public authoring model and shared deterministic contract package before changing runtime state.
+**Goal:** Define the smallest public authoring model and shared deterministic contract package before changing runtime state, reusing the `manifest.ts` canonical-JSON/bounds/diagnostics idioms and the `gates.ts` receipt/fence idioms rather than inventing parallel machinery.
 
 **Requirements:** R1–R9, R11, R18–R23, R26, R31–R34; AE1–AE4, AE13–AE16; KTD1–KTD3, KTD7, KTD11–KTD13.
 
-**Dependencies:** None.
+**Dependencies:** None (builds on current `main`; OPE-15 has landed, and U1 adds a package rather than moving existing code).
+
+**Slices (build in this order):**
+
+- **U1a — contracts project + CI/deploy wiring + canonical-digest + cross-env fixture.** Stand up the `contracts/` project, wire it into CI/deploy and the supervisor/CLI builds, define the canonical-JSON/digest routine, and add the cross-environment fixture that proves the same digest in contract source, packed CLI, and built supervisor. This carries the thinnest-slice `simple`-parity oracle below.
+- **U1b — freeze schemas + corpora.** Freeze the `openthrottle.config/v1`, `openthrottle.graph/v1`, `openthrottle.execution-plan/v1`, and standard-receipt schemas with strict bounds, and add the valid/invalid fixture corpora.
+
+**First ticket (thinnest slice):** a U1a-subset + U3 `simple`-parity check with **zero runtime/reducer code** — the built-in `simple` graph compiles to a manifest **behaviorally equivalent to `core/implement@4`** (re-pinned to a new digest) and the canonical digest is **identical across environments**. Ship that oracle green before writing any child-state code.
 
 **Files:**
 
@@ -663,10 +724,10 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 **Files:**
 
 - Add `supervisor/src/pipeline/execution-graph.ts` and `supervisor/src/pipeline/execution-graph.test.ts` — compile resolved graph bundles to validated manifests (the compiler is a pure `pipeline` module importing only `pipeline`/`shared` plus the external `contracts` package; byte fetch and pinning stay in `app`/`providers`).
-- Modify `supervisor/src/pipeline/manifest.ts` and `supervisor/src/pipeline/manifest.test.ts` — consume canonical config/commands and add only installed composite capability/artifact vocabulary.
-- Add `supervisor/graphs/simple-v1.yaml`, `supervisor/graphs/investigate-v1.yaml`, and `supervisor/graphs/structured-v1.yaml`; modify `supervisor/pipelines/catalog.yaml` to expose compiled immutable identities.
+- Modify `supervisor/src/pipeline/manifest.ts` and `supervisor/src/pipeline/manifest.test.ts` — consume canonical config/commands and add only installed composite capability/artifact vocabulary. **Turn `COMMAND_NAMES` from the current closed enum `[test, lint, build, format]` into a repository-defined named map** (R32/KTD12): stages and units reference names, and the fixed `commandName: CommandName` field becomes a lookup into the pinned command inventory. This is a real schema change, not just config.
+- Add `supervisor/graphs/simple-v1.yaml`, `supervisor/graphs/investigate-v1.yaml`, and `supervisor/graphs/structured-v1.yaml`; modify `supervisor/pipelines/catalog.yaml` to expose compiled immutable identities. `simple-v1.yaml` must compile to a manifest **behaviorally equivalent to `core/implement@4`** — same 11 stages and transition topology (the forward path, `implementation`'s self-loop/terminate transitions, the conditional `post_simplify_review`, and the conditional `repair_*` side-loop rejoining at `test`), context policies, all three first-class repair-budget fields (global `max_repair_rounds`, scoped per-transition `max_reentries`, and `max_attempts`), gates, publication, and provider tail — **re-pinned to a new digest** (byte-identity is neither achievable nor required once the graph is the source; the compiled manifest is proven equivalent to the current `core/implement@4` fixture and the graph, config, and skills carry their own new pinned digests). This behavioral equivalence is the U3 compile-safety oracle and the first operator checkpoint.
 - Modify `supervisor/src/providers/github/client.ts` and tests — fetch bounded repository graph/skill closures at the exact base commit.
-- Modify `supervisor/src/app/session-service.ts` and `supervisor/src/app/session-service.test.ts` — resolve graph selection, validate the execution plan, pin sources/digests, compile through the `pipeline` compiler, and reject before provisioning (provider fetch flows through an application port, since `app` may not import `providers`).
+- Modify `supervisor/src/app/admission.ts` (`handleCreated`) — resolve graph selection, validate the execution plan, pin sources/digests, and compile through the `pipeline` compiler at the seam **between `parseRepositoryConfig` and `resolvePipelineReference`**, rejecting before provisioning (provider fetch flows through an application port, since `app` may not import `providers`). `session-service.ts` is now a thin dispatcher, so this is admission-flow work, covered by `supervisor/src/app/session-service.test.ts` and `supervisor/src/app/admission-preflight.test.ts`.
 - Add `cli/src/graph.ts` and `cli/src/graph.test.ts`; modify `cli/src/index.ts` — inspect, copy, validate, and explain built-in/repository graph bundles.
 
 **Approach:**
@@ -674,7 +735,7 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 1. Resolve the repository default or an allowed `graph › <name>` ticket selection. Ticket text cannot name arbitrary sources.
 2. Fetch graph/config/skill bytes from the exact base commit, reject symlink/path escape and size excess, and pin every blob/tree plus normalized digest.
 3. Compile ordinary `run`/`command`/publish/provider/human nodes to existing stages. Compile `for_each_unit` to one installed `graph/for-each-unit@1` stage that produces an aggregate artifact.
-4. Make the built-in simple graph compile to current implement behavior, including its existing context and repair rules. Do not silently reorder simple review/simplification in this unit.
+4. Make the built-in simple graph compile to current implement behavior, including its existing context and repair rules, preserving the forward path, `implementation`'s self-loop/terminate transitions, the conditional `post_simplify_review`, and the conditional `repair_implementation → repair_semantic_review` side-loop rejoining at `test`. **Emit all three of `core/implement@4`'s first-class repair-budget fields** — the top-level **`max_repair_rounds: 5`** (a real manifest field: the global whole-run cap tracked as `instance.reentry_count`), the **scoped per-transition `max_reentries`** (`targetState.reentry_count`), and **`max_attempts: 200`** (`instance.attempt_count`). The compiler must **carry the manifest-level `max_repair_rounds` global cap directly** — do not drop it or "emulate" it with scoped `max_reentries` alone; behavioral parity requires the compiled built-in to keep the global 5-round cap alongside the scoped per-transition reentries. Do not silently reorder simple review/simplification in this unit.
 5. Require a runtime capability descriptor that actually advertises every compiled executor/evaluator/artifact. Use test descriptors until U5/U6 ship; production remains fail-closed.
 
 **Test Scenarios:**
@@ -687,57 +748,113 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 
 **Verification:**
 
-- `npm test --prefix supervisor -- src/pipeline/execution-graph.test.ts src/pipeline/manifest.test.ts src/app/session-service.test.ts src/providers/github/client.test.ts`
+- `npm test --prefix supervisor -- src/pipeline/execution-graph.test.ts src/pipeline/manifest.test.ts src/app/session-service.test.ts src/app/admission-preflight.test.ts src/providers/github/client.test.ts`
 - `npm test --prefix cli -- src/graph.test.ts`
 - `npm run typecheck --prefix supervisor`
 - `npm run build --prefix supervisor`
 
-### U4. Add the durable serial unit reducer and deterministic child gates
+> **U4 is split into U4a/U4b/U4c** (2026-07-28 trajectory audit). The former single unit conflated three separable slices and pulled in the deferred autonomy layer (R35–R37, R40). V1 builds the three sub-units below; R35 scheduling, R36 splits, R37/R38 slice continuation, and R40 budget wind-down are **not built in V1**.
 
-**Goal:** Keep one parent composite stage active while the supervisor durably advances one unit/loop/effect at a time, including ready-unit selection and validated split revisions.
+### U4a. Durable serial unit reducer, child schema/store, one-active-action lease, and aggregate
 
-**Requirements:** R12–R15, R21–R26, R33–R37, R39–R40; F3–F8; AE3–AE4, AE6–AE11, AE17; KTD4, KTD7, KTD11, KTD13–KTD16.
+**Goal:** Create child state atomically with the parent `for_each_unit` attempt and durably advance one unit/loop/effect at a time under a single active lease, dispatching in deterministic plan order and settling the parent exactly once.
+
+**Requirements:** R12–R15 (R15's V1 reading is **total** topology/unit immutability — no split; R36 deferred), R33–R34; F3; AE3–AE4; KTD4 (V1 half — no in-place shape change), KTD7, KTD11, KTD13.
 
 **Dependencies:** U3.
 
 **Files:**
 
-- Modify `supervisor/src/persistence/migrations/definitions.ts`, `supervisor/src/persistence/schema.ts`, and `supervisor/src/persistence/migrations/runner.test.ts` — add child graph/unit/session/context/gate/effect records with checksum-pinned immutable migrations.
+- Modify `supervisor/src/persistence/migrations/definitions.ts`, `supervisor/src/persistence/schema.ts`, and `supervisor/src/persistence/migrations/runner.test.ts` — add child graph/unit/session/context/gate/effect records as **additive migration v16** (v15 `orchestration-journal` is the latest merged; all new tables are checksum-pinned and never rewrite history). Reserve the net-new `exited` terminal level + alarm bit column on `execution_units` (R39, realized in U4c). *(The R40 reserve budget cursor on `execution_work_attempts` is deferred with the autonomy layer.)* Put the parent↔child bind state (pipeline-attempt/unit fence columns) **on the owning `execution_units`/`execution_work_attempts` records** — per `docs/SPEC.md` §persistence, Stage C must not revive the retired `pipeline_work_bindings`/`run_stage_bindings` tables.
 - Add `supervisor/src/persistence/pipeline/unit-store.ts` and `supervisor/src/persistence/pipeline/unit-store.test.ts` — the SQLite child store (only `persistence` may touch `better-sqlite3`).
-- Add `supervisor/src/pipeline/unit-coordinator.ts` and `supervisor/src/pipeline/unit-coordinator.test.ts` — pure reducer and stable serial readiness (imports only `pipeline`/`shared`).
+- Add `supervisor/src/pipeline/unit-coordinator.ts` and `supervisor/src/pipeline/unit-coordinator.test.ts` — pure reducer and stable **deterministic-plan-order** serial readiness (imports only `pipeline`/`shared`). **Parametrize the three-tier repair budget the parent coordinator already implements** — global `manifest.max_repair_rounds` (tracked as `instance.reentry_count`), per-transition `max_reentries` (`targetState.reentry_count`), and whole-run `max_attempts` (`instance.attempt_count`) — rather than inventing a child budget model.
 - Add `supervisor/src/operations/unit-effects.ts` and `supervisor/src/operations/unit-effects.test.ts` — idempotent worktree, loop, command, candidate, integration, stop, and cleanup effects; intent creation stays in the pipeline reducer while draining/runtime invocation is `operations` orchestration.
 - Modify `supervisor/src/pipeline/coordinator.ts`, `supervisor/src/pipeline/store.ts`, `supervisor/src/operations/pipeline-effects.ts`, and focused tests only at the composite-stage/aggregate seams.
 - Modify `supervisor/src/runtime/events.ts`, `supervisor/src/runtime/event-poller.ts`, and tests — accept child liveness/results only under parent and child fences.
 
 **Approach:**
 
-1. Create child state atomically with the parent `for_each_unit` attempt. Sort ready units by dependency completion, authored order, then U-ID; lease only one active action.
+1. Create child state atomically with the parent `for_each_unit` attempt. Sort ready units by dependency completion, authored order, then U-ID; **dispatch in deterministic plan order** (no lead selection — R35 deferred) and lease only one active action.
 2. Keep the parent composite stage's planned/current `run_id` as the one ticket actor for the child lifecycle. Model each loop invocation as a fenced child action under that run with its own request/result hash and native-session binding. Do not call `beginRun` per loop or overload the parent stage's single native session field.
-3. Persist child effects before execution and reconcile provider/Git success by idempotency key and exact subject after crashes.
-4. Enforce one-active-action, one-current-attempt-per-unit, accepted-candidate uniqueness, and integration-head compare-and-swap in the same transaction that records a gate and plans the next effect.
-5. Evaluate unit gates deterministically from current standard receipts. Persist the full decision payload/hash and publish it before advancing when publication policy requires.
-6. Treat downstream context as immutable records addressed to existing pending U-IDs. Reject every topology change except a validated R36 scope-preserving split of a pending, never-attempted unit, which the reducer applies as a recorded, digested graph revision (parent unit closed as `split`); anything else returns `needs_human`.
-7. Roll all integrated units into one aggregate artifact that settles the parent stage exactly once.
-8. Parent stop/supersede fences new child effects, terminates the active action, cleans known worktrees, and settles once.
-9. Level each unit terminal into `completed`/`exited`/`failed`, derive the operator alarm bit, and heal a unit that loses liveness past its heartbeat fence to `exited` with action release (R39). Reserve a configured budget tail per attempt; on drain, transition the active worker to wind-down — a committed candidate plus a downstream-context record terminates the attempt `exited` and routes by state (into the R37 frontier when at least one unit has integrated and one remains pending; pausing the run `needs_human` with the record preserved when nothing has integrated or during final repair), and an incoherent wind-down returns `needs_human` (R40).
+3. Persist child effects before execution and reconcile provider/Git success by idempotency key and exact subject after crashes. Journal orchestration decisions onto the **shipped v15 `orchestration_journal`** (actor `orchestrator`), not a parallel effect/decision journal.
+4. Enforce one-active-action, one-current-attempt-per-unit, accepted-candidate uniqueness, and integration-head compare-and-swap in the same transaction that plans the next effect.
+5. Roll all integrated units into one aggregate artifact (`execution_graph_result`) that settles the parent stage exactly once.
 
 **Test Scenarios:**
 
-- Independent units become logically ready but only one action leases; replay selects the same unit regardless of row order.
+- Independent units become logically ready but only one action leases; replay selects the same unit regardless of row order (deterministic plan order).
 - Two supervisor workers race for a unit action and exactly one lease succeeds.
 - Child loop actions share the exact composite parent run binding; no action can replace `tickets.run_id`, bind another pipeline attempt, or consume a sibling action's event.
 - Crashes around every effect boundary converge without duplicate loop calls, candidate commits, integration, aggregate, or terminal publication.
-- Concurrent gate/integration reducers cannot accept two candidates or advance from a stale integration head.
-- Stale unit/loop/session/subject/context receipts cannot advance state.
-- A context update reaches only named pending units; any unit/dependency mutation proposal returns `needs_human`.
-- Stop during implement, command, lead review, or integration prevents later dispatch and cleans only bound resources.
-- A unit whose lease loses liveness past its heartbeat fence heals to `exited` (not `failed`), releases its action, and lets serial dispatch resume; terminal levels and the derived alarm bit are supervisor-derived and no agent receipt can assert either.
-- An attempt draining into its configured reserve winds down to a committed candidate plus a downstream-context record and terminates `exited`; context carries into the continuation frontier when the R37 preconditions hold, while a first-unit drain (nothing integrated) or a final-repair drain (nothing pending) pauses the run `needs_human` with the record preserved; a wind-down that cannot reach coherence returns `needs_human`.
+- Concurrent integration reducers cannot accept two candidates or advance from a stale integration head.
 - Simple stages execute without creating child records.
 
 **Verification:**
 
 - `npm test --prefix supervisor -- src/persistence/migrations/runner.test.ts src/persistence/pipeline/unit-store.test.ts src/pipeline/unit-coordinator.test.ts src/operations/unit-effects.test.ts src/pipeline/coordinator.test.ts src/operations/pipeline-effects.test.ts src/runtime/events.test.ts`
+- `npm run typecheck --prefix supervisor`
+- `npm run build --prefix supervisor`
+
+### U4b. Deterministic child gates, downstream context, and stop/recovery
+
+**Goal:** Evaluate unit and final child gates deterministically over current typed evidence, carry immutable downstream context to pending units, and make stop/restart converge without duplicate work.
+
+**Requirements:** R21–R26, R33–R34; F4–F7; AE6–AE11; KTD4 (V1 half — context only), KTD7.
+
+**Dependencies:** U4a.
+
+**Files:**
+
+- Extend `supervisor/src/pipeline/unit-coordinator.ts` and `unit-coordinator.test.ts` — deterministic unit/final gate **decisions** over current standard receipts, reusing the `gates.ts` idioms (`semanticDecision` incl. the AE6 tree-delta reclassify, `commandDecision` incl. R32 `not_configured`, `validateFence`); immutable downstream-context records addressed to existing pending U-IDs; and topology-change rejection. (The extracted `execution-gates.ts` templates and real CE/non-CE loops land in U6; U4b proves the decision logic against fixtures.)
+- Extend `supervisor/src/operations/unit-effects.ts` and `unit-effects.test.ts` — stop/supersede fencing and restart reconciliation of persisted effects/subjects/sessions.
+- Extend `supervisor/src/persistence/pipeline/unit-store.ts` gate-receipt and context read/write paths (over the U4a store) and tests.
+
+**Approach:**
+
+1. Evaluate unit gates deterministically from current standard receipts. Persist the full decision payload/hash and publish it before advancing when publication policy requires.
+2. Treat downstream context as immutable records addressed to existing pending U-IDs. **Reject every topology change — new units, dependency changes, scope expansion, and (in V1) any split — with `needs_human`.** R36 splits are deferred, so there is no sanctioned in-place structural move in V1.
+3. Parent stop/supersede fences new child effects, terminates the active action, cleans known worktrees, and settles once.
+4. Restart reconciles persisted effects, candidate/integration subjects, and native sessions without duplicate agent invocation or integration.
+
+**Test Scenarios:**
+
+- Stale unit/loop/session/subject/context receipts cannot advance state.
+- A context update reaches only named pending units; any unit/dependency/split/scope-change proposal returns `needs_human`.
+- Stop during implement, command, lead review, or integration prevents later dispatch and cleans only bound resources.
+- Restart after a persisted effect reconciles without duplicate loop calls or double integration.
+
+**Verification:**
+
+- `npm test --prefix supervisor -- src/pipeline/unit-coordinator.test.ts src/operations/unit-effects.test.ts src/persistence/pipeline/unit-store.test.ts`
+- `npm run typecheck --prefix supervisor`
+- `npm run build --prefix supervisor`
+
+### U4c. Unit terminal-state leveling and child-action liveness heal-to-`exited`
+
+**Goal:** Level every unit terminal into `completed`/`exited`/`failed` with one derived operator alarm bit, and heal a child unit action that loses liveness to `exited` so serial dispatch resumes deterministically.
+
+**Requirements:** R39; KTD15. *(R40 budget wind-down is deferred with the autonomy layer.)*
+
+**Dependencies:** U4b.
+
+**Files:**
+
+- Extend `supervisor/src/pipeline/unit-coordinator.ts`, `supervisor/src/persistence/pipeline/unit-store.ts`, and tests — terminal-level derivation, the binary alarm bit, and heartbeat-fenced liveness heal with action release.
+- Modify `supervisor/src/runtime/events.ts`, `supervisor/src/runtime/event-poller.ts`, and tests — detect a stale **child unit action** past its heartbeat fence.
+
+**Approach:**
+
+1. Level each unit terminal into `completed` (R22 acceptance passed), `exited` (a structural end — in V1, a stop/supersede fence or a healed lost-liveness action), or `failed` (a defect — an executor/gate boundary violation, a malformed or unbindable receipt, or an unrecoverable effect error). Derive one binary alarm bit (`failed` sets it; `completed`/`exited` clear it). Terminal levels and the alarm bit are supervisor-derived from durable evidence only; no agent receipt may assert either.
+2. When a leased **child unit action** loses liveness past its heartbeat fence and cannot be reconciled to a current attempt, heal that unit to `exited` (never `failed`) and release its worktree/action so serial dispatch resumes deterministically rather than the unit lingering silently `running`.
+
+**Test Scenarios:**
+
+- A unit whose lease loses liveness past its heartbeat fence heals to `exited` (not `failed`), releases its action, and lets serial dispatch resume; terminal levels and the derived alarm bit are supervisor-derived and no agent receipt can assert either.
+- Each terminal path maps to exactly one of `completed`/`exited`/`failed` and one alarm value.
+
+**Verification:**
+
+- `npm test --prefix supervisor -- src/pipeline/unit-coordinator.test.ts src/persistence/pipeline/unit-store.test.ts src/runtime/events.test.ts`
 - `npm run typecheck --prefix supervisor`
 - `npm run build --prefix supervisor`
 
@@ -747,7 +864,7 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 
 **Requirements:** R14, R16–R19, R30–R31; F3–F4, F7; AE5, AE8, AE11–AE12, AE16; KTD5–KTD6, KTD10–KTD11.
 
-**Dependencies:** U3. May proceed beside U4 against frozen U1/U3 contracts.
+**Dependencies:** U3. May proceed beside the U4a→U4b→U4c chain against frozen U1/U3 contracts.
 
 **Files:**
 
@@ -761,7 +878,7 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 
 **Approach:**
 
-1. Keep one root/executor-controlled integration checkout. Create one writable unit or final-repair worktree from the exact integration head and expose only the working files needed by the unprivileged agent.
+1. Keep one root/executor-controlled integration checkout. Worktrees run **inside the one Daytona sandbox via exec**, not in a sibling sandbox. Serial execution means exactly **one writable worktree at a time**; create it from the exact integration head, expose only the working files the unprivileged agent needs, and **remove it on integration** so retained worktrees cannot accumulate against the 30 GiB org disk cap (the MCP-289 disk-quota outage is the standing constraint here).
 2. Let the worker edit and run tools but not commit or push. After each unit or final-repair cycle, the executor derives status/diff/tree and creates an internal candidate commit.
 3. Add `loop-action@1` requests containing graph/unit/attempt/loop/worker identities, exact digests/subjects, input scope, allowed skills/MCPs/credentials, receipt schema, context records, timeout, and native session id.
 4. Namespace all logs, result spools, activities, steering, and native-session metadata by child attempt. Atomic result writes prevent cross-attempt confusion.
@@ -789,11 +906,11 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 
 ### U6. Implement standard loops, receipts, unit acceptance, integration, and final repair
 
-**Goal:** Connect CE and replaceable skills to deterministic unit/final gates; the lead gains recorded ready-unit selection and split proposals, but never Git or gate authority.
+**Goal:** Connect CE and replaceable skills to deterministic unit/final gates. The V1 lead is **minimal** (`accept`/`revise`/`context_update`/`needs_human`, where `accept` is a plan/feature/scope-match judgment, **not** a code review) and never holds Git or gate authority. Ready-unit selection (R35) and split proposals (R36) are deferred past V1.
 
-**Requirements:** R5–R6, R16–R26, R32–R37, R40; F3–F6, F8; AE5–AE9, AE12–AE15, AE17; KTD5–KTD8, KTD12–KTD14, KTD16.
+**Requirements:** R5–R6, R16–R26, R32–R34; F3–F6; AE5–AE9, AE12–AE15; KTD5–KTD8, KTD12–KTD13.
 
-**Dependencies:** U4, U5.
+**Dependencies:** U4c, U5.
 
 **Files:**
 
@@ -802,17 +919,17 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 - Modify `skills/README.md` and `sandbox/tests/ce-adapters.test.mjs` — document and test loop boundaries and single-source delivery.
 - Add `sandbox/runner/unit-evidence.mjs` and `sandbox/runner/unit-evidence.test.mjs` — derive candidate Git facts and bind command receipts.
 - Add `sandbox/runner/integrate-unit.mjs` and `sandbox/runner/integrate-unit.test.mjs` — executor commit/fast-forward and idempotent replay.
-- Modify `sandbox/runner/artifacts.mjs`, `sandbox/bin/ot-stage-result.mjs`, and tests — support standard child receipts without assurance upgrades.
-- Add `supervisor/src/pipeline/execution-gates.ts` and `supervisor/src/pipeline/execution-gates.test.ts` — deterministic unit/final gate templates (pure `pipeline` evaluators alongside `pipeline/gates.ts`).
+- Modify `sandbox/runner/artifacts.mjs` (result normalization now lives here — `normalize.mjs` was deleted), `sandbox/bin/ot-stage-result.mjs`, and tests — support standard child receipts without assurance upgrades.
+- Add `supervisor/src/pipeline/execution-gates.ts` and `supervisor/src/pipeline/execution-gates.test.ts` — deterministic unit/final gate templates that **specialize the existing `gates.ts` idioms**: reuse `semanticDecision` (incl. the AE6 `no_change_contradicted_by_tree_delta` reclassify), `commandDecision` (incl. R32 `not_configured`), and `validateFence` (provenance/subject/freshness/native-session/assurance) rather than reimplementing them. The **whole-change gate (R23) is the single code review**, run once over the integrated subject, reusing `core/implement@4`'s simplify-before-review (`post_simplify_review`) ordering. The **per-unit acceptance gate (R22) is a lead plan/feature/scope-match acceptance judgment, not a code review** — its lead loop binds the `accept-unit` skill and **must not be implemented as a per-unit `ce-code-review`**; it checks that the chunk matches its assigned plan slice plus the executor/command evidence, nothing more.
 - Complete `supervisor/src/operations/unit-effects.ts` integration with the U5 runtime.
 
 **Approach:**
 
-1. The CE implement adapter invokes `ce-work mode:return-to-caller` for one unit and explicitly leaves simplification, review, commit, publish, and provider work to configured later nodes.
-2. The simplification adapter invokes `ce-simplify-code` in the same unit session. Repair adapters receive only current failures/decisions plus the existing unit or whole-change scope.
-3. The lead adapter returns one standard decision and bounded context. It cannot call worker tools, write code, mutate the graph, commit, or integrate.
+1. The CE implement adapter invokes `ce-work mode:return-to-caller` **scoped to one unit** (the same capability `core/implement@4`'s `ce/implement@1` stage uses for the whole plan today, now bounded to a chunk) and explicitly leaves simplification, review, commit, publish, and provider work to configured later nodes.
+2. The simplification adapter invokes `ce-simplify-code` in the same unit session. Repair adapters receive only current failures/decisions plus the existing unit or whole-change scope. The lead is added **last** and stays minimal: `accept` / `revise` / `context_update` / `needs_human`. V1 dispatches ready units in **deterministic plan order** (recorded ready-unit selection, R35, is deferred).
+3. The lead adapter returns one standard decision and bounded context — an `accept` is a plan/feature/scope-match acceptance judgment, **not** a `ce-code-review`. It cannot call worker tools, write code, mutate the graph, commit, or integrate.
 4. The executor derives the candidate commit and all command facts. The unit evaluator passes only when every required current artifact targets that candidate and the lead allows acceptance.
-5. After all units, run full commands and a fresh `ce-code-review`-backed default review. On failure, invoke the dedicated final-repair path in an exact-base worktree. A current completion receipt plus executor Git evidence may create and fast-forward only the internal integration candidate; then rerun the configured commands and a new fresh review on that new head within bounds.
+5. After all units, run full commands and a fresh `ce-code-review`-backed default review — **this whole-change review is the one and only code review of the change**. On failure, invoke the dedicated final-repair path in an exact-base worktree. A current completion receipt plus executor Git evidence may create and fast-forward only the internal integration candidate; then rerun the configured commands and a new fresh review on that new head within bounds. **Keep the final-repair budget generous** — a whole-change repair has a large blast radius, so its bounded loop should allow more rounds than a per-unit repair before it exhausts to `needs_human`.
 6. Keep skill references generic. A non-CE fixture must implement each relevant standard receipt without coordinator changes.
 
 **Test Scenarios:**
@@ -821,8 +938,9 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 - Worker claims conflicting file/test facts; executor evidence wins and the deterministic gate fails visibly.
 - Unit command failure resumes the same worker, simplifies again, and reruns the command before lead acceptance.
 - Lead accept/revise/context-update/needs-human each maps to exactly one durable transition.
+- The per-unit acceptance loop invokes the `accept-unit` scope-match skill, never `ce-code-review`; code review runs exactly once, at the whole-change gate.
 - Candidate/integration replay recognizes an already-applied exact tree and never commits/integrates twice.
-- Full commands precede final review in structured mode; any final repair invalidates prior review and requires a fresh current-subject review.
+- Full commands precede final review in structured mode; any final repair invalidates prior review and requires a fresh current-subject review, and the whole-change repair loop allows a generous (larger-than-per-unit) round budget before exhausting to `needs_human`.
 - Final repair cannot mutate the integration checkout directly; its candidate fast-forward is executor-owned, and any failure before rerun leaves publication fenced.
 - A valid review receipt for the wrong subject, stale attempt, wrong skill digest, or missing command evidence fails.
 - The current simple graph remains behaviorally unchanged, including its existing review/simplification order.
@@ -838,7 +956,7 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 
 **Goal:** Make the parent Linear issue and final PR sufficient to understand how the structured run advanced.
 
-**Requirements:** R19–R20, R27–R29, R37–R39; F4–F8; AE6–AE12, AE15, AE17; KTD7, KTD9, KTD14–KTD15.
+**Requirements:** R19–R20, R27–R29, R39; F4–F7; AE6–AE12, AE15; KTD7, KTD9, KTD15. *(R37/R38 slice-continuation rendering and KTD14 are deferred with the autonomy layer.)*
 
 **Dependencies:** U6.
 
@@ -846,7 +964,7 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 
 - Add `supervisor/src/pipeline/execution-publication.ts` and `supervisor/src/pipeline/execution-publication.test.ts` — render unit status, receipts, decisions, context, gate rationale, subjects, and evidence links as neutral publication envelopes.
 - Modify `supervisor/src/providers/linear/outbox.ts`, `supervisor/src/providers/linear/client.ts`, and tests — queue ordered parent activities and full-plan replacements where supported.
-- Modify `supervisor/src/app/session-service.ts` and tests — route parent human replies to exact current child fences.
+- Modify `supervisor/src/app/thread-control.ts` (`handlePrompted`, where prompt/human-reply routing now lives after the `session-service.ts` decomposition) and its coverage in `supervisor/src/app/session-service.test.ts` — route parent human replies to exact current child fences **through the shipped steering buffer** (`session_inbox` in `persistence/steering-store.ts`; buffered + fenced when the active stage is non-steerable, not a bespoke parent→child path).
 - Modify `supervisor/src/pipeline/publication.ts` and tests — include aggregate and final gate receipts.
 - Modify `supervisor/src/providers/github/pipeline-publication.ts`, `supervisor/src/providers/github/events.ts`, and tests — render the final unit/gate ledger in the PR and retain exact-head feedback behavior.
 - Modify `supervisor/src/shared/sanitize.ts`, `supervisor/src/http/server.ts`, and `cli/src/status.ts` with focused tests — bound/redact new fields and expose unit state/publication debt.
@@ -856,7 +974,7 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 1. Render stable U-ID, state, attempt, concise worker assumptions/issues, lead rationale, command result, candidate/integration subject, and gate outcome as sanitized ordered parent activities.
 2. Publish the deterministic gate payload in human-readable form, including why it passed/failed and which artifact hashes/commit links supported it.
 3. Keep full transactional state in SQLite but never require SQLite inspection for ordinary review. Large/raw logs remain private and bounded; Linear receives the reviewable artifact.
-4. Route a parent answer only to the currently paused unit/final repair. Stale answers remain audit context but cannot advance state.
+4. Route a parent answer through the shipped steering buffer only to the currently paused unit/final repair (fenced by session/generation/native-session/request-hash). A reply arriving during a non-steerable stage is buffered, not rejected; a stale answer remains audit context but cannot advance state.
 5. Update the PR gate section only from durable acknowledged receipts bound to the exact published head.
 
 **Test Scenarios:**
@@ -870,7 +988,7 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 
 **Verification:**
 
-- `npm test --prefix supervisor -- src/pipeline/execution-publication.test.ts src/pipeline/publication.test.ts src/providers/linear/outbox.test.ts src/providers/linear/client.test.ts src/app/session-service.test.ts src/shared/sanitize.test.ts src/providers/github/pipeline-publication.test.ts src/providers/github/client.test.ts`
+- `npm test --prefix supervisor -- src/pipeline/execution-publication.test.ts src/pipeline/publication.test.ts src/providers/linear/outbox.test.ts src/providers/linear/client.test.ts src/app/session-service.test.ts src/shared/sanitize.test.ts src/providers/github/pipeline-publication.test.ts src/providers/github/client.test.ts` (the `thread-control.ts` routing is exercised through `session-service.test.ts`)
 - `npm test --prefix cli -- src/operator.test.ts`
 - Fault-injection publication test completes a serial graph during a Linear outage, restarts, restores delivery, and proves ordered convergence.
 
@@ -878,9 +996,9 @@ U4 and U5 may proceed independently only after U1/U3 freeze their shared protoco
 
 **Goal:** Migrate this repository to the public config, keep simple as default, prove structured serial execution end to end, and reassess the original autonomy audit.
 
-**Requirements:** All requirements and acceptance examples.
+**Requirements:** All **V1** requirements and acceptance examples (the deferred autonomy layer — R35–R38, R40, AE17, F8 — is explicitly out of V1 scope).
 
-**Dependencies:** U2–U7.
+**Dependencies:** U2, U3, U4a–U4c, U5, U6, U7.
 
 **Files:**
 
@@ -946,13 +1064,13 @@ bats sandbox/tests/runtime.bats
 
 1. **Config/compiler:** built-in and repository sources, simple parity, all node kinds, unknown fields, missing refs, unsupported capabilities, canonical digests, and exact-commit skill closures.
 2. **Execution plan:** valid CE plan, missing/multiple blocks, duplicate IDs, cycles, unknown refs, bounds, structured-required versus simple-optional behavior, and CLI/supervisor parity.
-3. **Serial reducer:** stable readiness order, recorded lead unit selection with deterministic fallback order, one action lease, loop retries, same/fresh session rules, downstream context, validated split application and split-rejection paths, human pause, stop, exhaustion, and exact-once aggregate.
+3. **Serial reducer:** stable deterministic-plan-order readiness, one action lease, loop retries, same/fresh session rules, downstream context, topology-change rejection to `needs_human` (no split in V1), human pause, stop, exhaustion, and exact-once aggregate.
 4. **Worktree/Git:** exact integration base, sealed state, worker no-commit/no-push, unit and final-repair candidate creation, lead-bound unit subjects, executor-owned integration, cleanup, and wrong-subject rejection.
 5. **Gates:** semantic pass/fail, executor discrepancy, command pass/fail/missing, freshness/provenance/fence checks, final repair invalidating prior review, publish subject, and provider head.
 6. **Publication:** parent Linear ledger, sanitization, ordered retry, stale answer, final PR gate section, and visible publication debt.
 7. **Skill portability:** CE defaults and non-CE fixtures for unit, lead, review, repair, and publish receipt contracts.
-8. **Slice continuation:** lead slice-proposal validation, frontier byte-identity and digesting, terminal rendering of remaining work, merge-evidence continuation admission on the same ticket, and the needs_human paths for closed-unmerged PRs, stale frontiers, and exhausted continuation bounds.
-9. **Unit status and budget wind-down:** terminal leveling into `completed`/`exited`/`failed`, the derived operator alarm bit, missing-liveness heal-to-`exited` with action release, reserve-triggered wind-down to a committed candidate plus downstream context and receipt, exited-into-frontier carry when the R37 preconditions hold, the needs_human pauses for a first-unit drain (nothing integrated) and a final-repair drain (nothing pending) with the context record preserved, and the needs_human path when wind-down cannot reach coherence.
+8. **Slice continuation (deferred past V1 with R37/R38; lands last, overlapping the shipped repair-resolution/provider work):** lead slice-proposal validation, frontier byte-identity and digesting, terminal rendering of remaining work, merge-evidence continuation admission on the same ticket, and the needs_human paths for closed-unmerged PRs, stale frontiers, and exhausted continuation bounds.
+9. **Unit status leveling (V1):** terminal leveling into `completed`/`exited`/`failed`, the derived operator alarm bit, and missing-liveness heal-to-`exited` with action release. *(Reserve-triggered budget wind-down and the exited-into-frontier carry are deferred with R40; in V1 budget exhaustion pauses `needs_human`.)*
 
 ### Image and lifecycle gate
 
@@ -996,10 +1114,10 @@ This gate consumes operator credentials and must never be reported as locally pa
 
 ### Global completion
 
-- R1–R40 and AE1–AE17 are traceable to code, tests, and durable artifacts.
-- Lead ready-unit selection is recorded on dispatch receipts, a validated scope-preserving split lands as a digested graph revision, and a merged slice PR admits a continuation generation from the typed frontier without human action — each proven by the R35–R38 matrices.
-- Unit terminal states are leveled `completed`/`exited`/`failed` with a supervisor-derived operator alarm bit, and a unit that loses liveness heals to `exited` and releases its action rather than lingering `running` — proven by the R39 matrix.
-- A unit or final-repair attempt that drains into its configured reserve winds down to committed, resumable state and downstream context instead of starting new work, so budget exhaustion feeds the continuation frontier when a publishable slice exists and otherwise pauses `needs_human` with the context preserved, rather than stranding a worktree — proven by the R40 matrix.
+- All **V1** requirements and acceptance examples (R1–R34, R39; AE1–AE16) are traceable to code, tests, and durable artifacts. The deferred autonomy layer (R35–R38, R40; AE17; F8) is tracked as explicit follow-up, not V1 done-ness.
+- The V1 lead is **minimal** (`accept`/`revise`/`context_update`/`needs_human`, where `accept` is a plan/feature/scope-match acceptance judgment, not a code review) and holds no Git or gate authority; ready-units dispatch in deterministic plan order. Lead ready-unit scheduling (R35), scope-preserving splits (R36), and slice publication / merge-evidence continuation (R37/R38) are **deferred past V1** — R37/R38 land last because they overlap the shipped repair-resolution/provider-continuation machinery.
+- Unit terminal states are leveled `completed`/`exited`/`failed` with a supervisor-derived operator alarm bit, and a unit whose child action loses liveness heals to `exited` and releases its action rather than lingering `running` — proven by the R39 matrix.
+- **Deferred past V1:** budget-reserve wind-down (R40). In V1, budget exhaustion pauses `needs_human` with state preserved rather than stranding a worktree; the reserve wind-down to committed resumable state and a continuation frontier lands with the autonomy layer.
 - Repositories select among multiple named graphs and can copy/edit a built-in using graph/loop/worker/command/skill/MCP/limit configuration only.
 - `simple` continues to accept a complete plan and preserves current whole-plan behavior.
 - `structured` requires validator-clean unit JSON and executes one serial unit at a time.
@@ -1016,7 +1134,9 @@ This gate consumes operator credentials and must never be reported as locally pa
 - U1. Shared contracts, compiler inputs, standard receipts, canonical digests, fixtures, and normative vocabulary are frozen.
 - U2. The preparation skill and CLI create/validate one execution-plan block and fail early for structured selection.
 - U3. Built-in/repository graphs compile and pin through one admission path while simple behavior remains equivalent.
-- U4. The serial child reducer, leases, effects, gates, context, stop, and recovery settle exactly once.
+- U4a. The serial child reducer, one-active-action lease, effects, and aggregate settle the parent exactly once under deterministic plan order.
+- U4b. Deterministic child gates, immutable downstream context, topology-change rejection to `needs_human`, and stop/recovery converge without duplicate work.
+- U4c. Unit terminals are leveled `completed`/`exited`/`failed` with the derived alarm bit, and a child action that loses liveness heals to `exited` and releases its action.
 - U5. Worktrees and loop actions are exact-base, session-correct, sealed, provider-neutral, and serial.
 - U6. CE/non-CE loops, executor evidence, lead decisions, unit integration, whole-change commands/review, and final repair satisfy deterministic gates.
 - U7. Linear and GitHub ledgers converge through sanitized durable publication and safe human steering.
@@ -1032,15 +1152,15 @@ This gate consumes operator credentials and must never be reported as locally pa
 |---|---|---|
 | Config, graphs, loops, workers | R1–R6 | U1, U3, U8 |
 | Plan preparation and admission | R7–R10 | U1, U2, U3 |
-| Compilation and serial child state | R11–R15 | U3, U4 |
-| Sessions, worktrees, receipts, lead | R16–R20 | U4, U5, U6 |
-| Deterministic gates and repair | R21–R26 | U4, U6 |
+| Compilation and serial child state | R11–R15 | U3, U4a |
+| Sessions, worktrees, receipts, lead | R16–R20 | U4a, U4b, U5, U6 |
+| Deterministic gates and repair | R21–R26 | U4b, U6 |
 | Linear, PR, credentials, MCP | R27–R31 | U5, U7, U8 |
-| Commands and bounds | R32–R34 | U1, U3, U4, U6, U8 |
-| Lead scheduling, splits, slice continuation | R35–R38 | U3, U4, U6, U7 |
-| Unit status leveling and liveness heal | R39 | U4, U7 |
-| Budget reserve wind-down | R40 | U4, U6 |
+| Commands and bounds | R32–R34 | U1, U3, U4a, U6, U8 |
+| Unit status leveling and liveness heal | R39 | U4c, U7 |
+| Lead scheduling, splits, slice continuation *(deferred past V1; R37/R38 land last)* | R35–R38 | — (autonomy follow-up) |
+| Budget reserve wind-down *(deferred past V1)* | R40 | — (autonomy follow-up) |
 
 ### Execution contract for this plan
 
-When this plan is itself prepared for structured execution, preserve U1–U8 IDs and the dependency graph in `Sequencing and Dependencies`. U4 and U5 are intentionally independent after U1/U3 freeze their interfaces, so V1 may execute either first while still dispatching only one unit at a time; U6 integrates them.
+When this plan is itself prepared for structured execution, preserve the U1(a/b)–U8 IDs — including the U4a/U4b/U4c split — and the dependency graph in `Sequencing and Dependencies`. The U4a→U4b→U4c chain and U5 are intentionally independent after U1/U3 freeze their interfaces, so V1 may advance the U4* chain and U5 in either order while still dispatching only one unit at a time; U6 integrates them. The autonomy layer (R35–R38, R40) is deferred past V1 and is not part of this dependency graph.

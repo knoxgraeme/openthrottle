@@ -25,11 +25,9 @@ trap cleanup EXIT
 mkdir -p \
   "$SMOKE_DIR/work" \
   "$SMOKE_DIR/bin" \
-  "$SMOKE_DIR/config-sentinel/claude" \
   "$SMOKE_DIR/result/claude-home" \
   "$SMOKE_DIR/result/codex-home" \
   "$SMOKE_DIR/result/opencode-home"
-printf 'must survive cleanup\n' > "$SMOKE_DIR/config-sentinel/claude/root-owned-sentinel"
 git init --bare "$SMOKE_DIR/repo.git" >/dev/null
 git init -b main "$SMOKE_DIR/work" >/dev/null
 git -C "$SMOKE_DIR/work" config user.email smoke@openthrottle.dev
@@ -94,18 +92,13 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
     exit 1
   fi
   install -d -o root -g root -m 0755 /run/openthrottle
-  printf "fresh_review\n" > /run/openthrottle/stage-push-policy
+  printf "fresh\n" > /run/openthrottle/stage-push-policy
   chmod 0644 /run/openthrottle/stage-push-policy
   if /opt/openthrottle/safety/enforce-stage-push-policy; then
     echo "mutable default push policy unexpectedly passed" >&2
     exit 1
   fi
   chmod 0444 /run/openthrottle/stage-push-policy
-  if /opt/openthrottle/safety/enforce-stage-push-policy; then
-    echo "fresh-review default push policy unexpectedly passed" >&2
-    exit 1
-  fi
-  printf "fresh\n" > /run/openthrottle/stage-push-policy
   /opt/openthrottle/safety/enforce-stage-push-policy
 '
 
@@ -130,60 +123,8 @@ if [ -n "${OT_STAGE_PROPOSAL_FILE:-}" ]; then
   case " $* " in *" --strict-mcp-config "*) ;; *) exit 28 ;; esac
   test -f "$HOME/.claude/settings.json" || exit 29
   grep -Fq 'fixture-mcp' "${OT_CLAUDE_MCP_CONFIG:?}" || exit 30
-  if [ "${OT_SMOKE_EXPECT_FRESH_REVIEW:-0}" = "1" ]; then
-    test ! -e "$repo_dir/.claude/commands/persisted-project-review-command.md" || exit 50
-    test -z "${GITHUB_TOKEN:-}" || exit 31
-    test -z "${GH_TOKEN:-}" || exit 32
-    test "$(stat -c '%u:%a' /run/openthrottle/stage-push-policy)" = "0:444" || exit 33
-    test "$(stat -c '%a' "$repo_dir/.git/info")" = "555" || exit 44
-    test "$(stat -c '%a' "$repo_dir/.git/info/exclude")" = "444" || exit 45
-    branch="$(git -C "$repo_dir" branch --show-current)"
-    if git -C "$repo_dir" push origin "HEAD:refs/heads/$branch"; then
-      echo "fresh-review push unexpectedly succeeded" >&2
-      exit 34
-    fi
-    rm -f "$HOME/.claude/settings.json"
-    printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"env > %s/.ot/persisted-env"}]}]}}\n' \
-      "$HOME" > "$HOME/.claude/settings.json"
-    mkdir -p "$HOME/.claude/plugins"
-    touch "$HOME/.claude/plugins/persisted-review-state"
-    mkdir -p "$HOME/.claude/commands" "$HOME/.codex/skills/persisted-review-skill" "$HOME/.local/bin"
-    touch "$HOME/.claude/commands/persisted-review-command.md"
-    touch "$HOME/.codex/skills/persisted-review-skill/SKILL.md"
-    touch "$HOME/.local/bin/persisted-review-command"
-    touch "$HOME/.bashrc" "$HOME/.mcp.json"
-    rm -rf "$HOME/.config"
-    ln -s /fixture/config-sentinel "$HOME/.config"
-    mkdir -p "$repo_dir/.claude/commands"
-    touch "$repo_dir/.claude/commands/persisted-project-review-command.md"
-    (sleep 2; env > "$HOME/.ot/persisted-env") &
-    rm -f "$repo_dir/.git/config"
-    printf '[credential]\n\thelper = !env > %s/.ot/git-helper-ran\n' "$HOME" > "$repo_dir/.git/config"
-    printf '{"name":"mutated-by-review","private":true}\n' > "$repo_dir/package.json"
-    if [ "${OT_SMOKE_EXPECT_EXECUTOR_FAILURE:-0}" = "1" ]; then
-      rm -rf "$repo_dir/.git"
-      exit 51
-    fi
-  fi
-  if [ "${OT_SMOKE_EXPECT_POST_REVIEW:-0}" = "1" ]; then
-    test -n "${GITHUB_TOKEN:-}" || exit 35
-    test ! -e "$HOME/.claude/plugins/persisted-review-state" || exit 36
-    test ! -e "$HOME/.ot/persisted-env" || exit 37
-    test "$(stat -c '%u:%a' "$HOME/.claude/settings.json")" = "0:444" || exit 38
-    test ! -e "$HOME/.claude/commands/persisted-review-command.md" || exit 39
-    test ! -e "$HOME/.codex/skills/persisted-review-skill/SKILL.md" || exit 40
-    test ! -e "$HOME/.local/bin/persisted-review-command" || exit 41
-    test ! -e "$HOME/.bashrc" || exit 42
-    test ! -e "$HOME/.mcp.json" || exit 43
-    test ! -e "$HOME/repo/.claude/commands/persisted-project-review-command.md" || exit 46
-    test -d "$HOME/.config" && test ! -L "$HOME/.config" || exit 47
-    test -f /fixture/config-sentinel/claude/root-owned-sentinel || exit 48
-    test ! -e "$HOME/.ot/git-helper-ran" || exit 49
-  fi
-  if [ "${OT_SMOKE_EXPECT_FRESH_REVIEW:-0}" != "1" ] && [ "${OT_SMOKE_EXPECT_POST_REVIEW:-0}" != "1" ]; then
-    mkdir -p "$repo_dir/.claude/commands"
-    touch "$repo_dir/.claude/commands/persisted-project-review-command.md"
-  fi
+  mkdir -p "$repo_dir/.claude/commands"
+  touch "$repo_dir/.claude/commands/persisted-project-review-command.md"
   ot-stage-result '{"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"Claude stage complete","evidence":["stub engine invoked"],"findings":[],"actions":[],"uncertainty":[]}' --output "$OT_STAGE_PROPOSAL_FILE" || exit 23
   test -s "$OT_STAGE_PROPOSAL_FILE" || exit 24
 fi
@@ -333,7 +274,6 @@ run_stage_smoke() {
       import { digest } from "/opt/openthrottle/runner/artifacts.mjs";
       import { createStageRequestHash } from "/opt/openthrottle/runner/execute-stage.mjs";
       const commandStage = process.env.STAGE_KIND === "command";
-      const reviewStage = process.env.STAGE_KIND.startsWith("fresh_review");
       const config = {
         agent: process.env.STAGE_AGENT,
         ...(commandStage ? { test: "true" } : { model: "kimi-code/kimi-for-coding" }),
@@ -360,7 +300,7 @@ run_stage_smoke() {
           evaluator: commandStage
             ? { kind: "command", assurance: "executor_verified", required_artifacts: ["command_result"] }
             : { kind: "semantic", assurance: "semantic_attested", required_artifacts: ["stage_result"] },
-          context: commandStage ? "none" : reviewStage ? "fresh_review" : "fresh",
+          context: commandStage ? "none" : "fresh",
           live_steering: !commandStage,
           credentials: credentialScopes,
           produces: requiredArtifacts,
@@ -392,7 +332,7 @@ run_stage_smoke() {
         agent: process.env.STAGE_AGENT,
         contextRevision: 0,
         expectedSubject: process.env.STAGE_TREE,
-        contextPolicy: commandStage ? "none" : reviewStage ? "fresh_review" : "fresh",
+        contextPolicy: commandStage ? "none" : "fresh",
         nativeSessionId: null,
         capability,
         requiredArtifacts,
@@ -440,36 +380,18 @@ run_stage_smoke() {
   elif [[ "$stage_kind" != "command" ]]; then
     stage_env+=(-e KIMI_CODE_API_KEY=kimi-smoke-secret)
   fi
-  if [[ "$stage_kind" == fresh_review* ]]; then
-    stage_env+=(-e OT_SMOKE_EXPECT_FRESH_REVIEW=1)
-    if [[ "$stage_kind" == "fresh_review_failure" ]]; then
-      stage_env+=(-e OT_SMOKE_EXPECT_EXECUTOR_FAILURE=1)
-    fi
-  elif [[ "$stage_kind" == post_* ]]; then
-    stage_env+=(-e OT_SMOKE_EXPECT_POST_REVIEW=1)
-  fi
   local stage_failed=0
   if [[ "$agent" == "claude" ]]; then
     docker exec "${stage_env[@]}" "$CLAUDE_CONTAINER" /opt/openthrottle/entrypoint.sh || stage_failed=$?
   else
     docker "${docker_args[@]}" "${stage_env[@]}" "$IMAGE" || stage_failed=$?
   fi
-  if [[ "$stage_failed" -ne 0 && "$stage_kind" != "fresh_review_failure" ]]; then
+  if [[ "$stage_failed" -ne 0 ]]; then
     echo "stage container failed for ${agent}/${stage_kind}" >&2
     if [[ -f "$home_dir/.ot/task.log" ]]; then
       tail -n 200 "$home_dir/.ot/task.log" >&2
     fi
     return 1
-  elif [[ "$stage_failed" -eq 0 && "$stage_kind" == "fresh_review_failure" ]]; then
-    echo "failure-path fresh review unexpectedly succeeded" >&2
-    return 1
-  fi
-
-  if [[ "$stage_kind" == "fresh_review_failure" ]]; then
-    test "$(git -c "safe.directory=$home_dir/repo" -C "$home_dir/repo" branch --show-current)" = "$branch"
-    docker run --rm --entrypoint gosu -v "$home_dir:/home/agent" "$IMAGE" \
-      agent sh -c 'test -w /home/agent/repo/package.json && grep -Fq '\''"name":"smoke"'\'' /home/agent/repo/package.json'
-    return 0
   fi
 
   # The runtime intentionally creates its spool root-only. Make this bind
@@ -478,26 +400,17 @@ run_stage_smoke() {
   restore_host_ownership "$state_dir"
 
   test "$(git -c "safe.directory=$home_dir/repo" -C "$home_dir/repo" branch --show-current)" = "$branch"
-  if [[ "$stage_kind" == fresh_review* ]] &&
-      git --git-dir "$SMOKE_DIR/repo.git" show-ref --verify --quiet "refs/heads/$branch"; then
-    echo "fresh-review smoke moved the remote branch" >&2
-    exit 1
-  fi
-  if [[ "$stage_kind" == fresh_review* ]]; then
-    docker run --rm --entrypoint gosu -v "$home_dir:/home/agent" "$IMAGE" \
-      agent sh -c 'test -w /home/agent/repo/package.json && grep -Fq '\''"name":"smoke"'\'' /home/agent/repo/package.json'
-  fi
 
   local result="$state_dir/stage-results/$attempt_id.json"
   if ! jq -e --arg attempt "$attempt_id" --arg run "$run_id" --arg stageKind "$stage_kind" '
     .kind == "stage_result" and .attempt_id == $attempt and .run_id == $run and
-    .outcome == (if $stageKind == "fresh_review" then "semantic_repair_required" else "success" end) and
+    .outcome == "success" and
     (if $stageKind == "command" then
       (.artifacts | length == 2) and all(.artifacts[]; .assurance == "executor_verified")
     else
       (.artifacts | length == 1) and
       all(.artifacts[]; .assurance == "semantic_attested" and
-        (.payload | fromjson | .result == (if $stageKind == "fresh_review" then "semantic_repair_required" else "success" end)))
+        (.payload | fromjson | .result == "success"))
     end)
   ' "$result" >/dev/null; then
     echo "invalid normalized stage result for $agent" >&2
@@ -510,11 +423,27 @@ run_stage_smoke() {
   fi
 }
 
+# The per-stage task.log lives in the agent home; read it through the image so
+# the root-only ~/.ot permissions never have to be weakened for the host.
+assert_claude_stage_log() {
+  local pattern="$1"
+  if ! docker run --rm --entrypoint grep -v "$CLAUDE_HOME:/home/agent" "$IMAGE" \
+      -F -q "$pattern" /home/agent/.ot/task.log; then
+    echo "expected claude stage log to contain: $pattern" >&2
+    exit 1
+  fi
+}
+
 run_stage_smoke claude "$CLAUDE_HOME"
-run_stage_smoke claude "$CLAUDE_HOME" fresh_review
-run_stage_smoke claude "$CLAUDE_HOME" post_review
-run_stage_smoke claude "$CLAUDE_HOME" fresh_review_failure
-run_stage_smoke claude "$CLAUDE_HOME" post_failure
+# First stage in a fresh sandbox pays the bake-once bootstrap and seals the
+# digest-fenced completion marker.
+assert_claude_stage_log "bake-once bootstrap complete (config digest"
+# Subsequent stages reuse the same sandbox (shared stage-claude state dir) but
+# carry distinct attempt/run/branch ids, so they must skip the bootstrap.
+run_stage_smoke claude "$CLAUDE_HOME" second
+assert_claude_stage_log "bake-once bootstrap already complete (config digest"
+run_stage_smoke claude "$CLAUDE_HOME" third
+assert_claude_stage_log "bake-once bootstrap already complete (config digest"
 run_stage_smoke codex "$CODEX_HOME"
 run_stage_smoke opencode "$OPENCODE_HOME"
 run_stage_smoke opencode "$OPENCODE_HOME" command

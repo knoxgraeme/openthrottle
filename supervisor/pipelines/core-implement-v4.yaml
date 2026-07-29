@@ -1,0 +1,146 @@
+schema: openthrottle.pipeline/v1
+id: core/implement
+version: 4
+description: Staged CE implementation from a pre-approved plan with round-based repair budgeting, scoped repair re-entry, sealed repository gates, exact-tree publication, and bounded provider repair. The initial forward pass may simplify; repair passes re-run semantic review and command gates without re-running simplification.
+entry_stage: implementation
+max_attempts: 200
+max_repair_rounds: 5
+requires:
+  protocol: stage-executor@1
+  capabilities:
+    - ce/implement@1
+    - ce/review@1
+    - ce/simplify@1
+    - ce/publish@1
+    - command/run@1
+    - provider/wait@1
+defaults:
+  transitions:
+    semantic_repair_required: { to: repair_implementation, max_reentries: 5, on_exhausted: needs_human }
+    needs_human: { terminal: needs_human }
+    canceled: { terminal: canceled }
+    superseded: { terminal: superseded }
+    failure: { to: repair_implementation, max_reentries: 5, on_exhausted: needs_human }
+  retry: { max_reentries: 2, on_exhausted: failed }
+stages:
+  - id: implementation
+    executor: { kind: agent, capability: ce/implement@1 }
+    evaluator: { kind: semantic, assurance: semantic_attested, required_artifacts: [stage_result] }
+    context: fresh
+    live_steering: true
+    credentials: [model.invoke, provider.read, repo.read, repo.write]
+    produces: [stage_result]
+    retry: { max_reentries: 3, on_exhausted: failed }
+    transitions:
+      success: { to: semantic_review }
+      no_change: { terminal: no_change }
+      semantic_repair_required: { to: implementation, max_reentries: 8, on_exhausted: needs_human }
+      failure: { terminal: failed }
+  - id: repair_implementation
+    executor: { kind: agent, capability: ce/implement@1 }
+    evaluator: { kind: semantic, assurance: semantic_attested, required_artifacts: [stage_result] }
+    context: resume_required
+    live_steering: true
+    credentials: [model.invoke, provider.read, repo.read, repo.write]
+    produces: [stage_result]
+    retry: { max_reentries: 3, on_exhausted: failed }
+    transitions:
+      success: { to: repair_semantic_review }
+      no_change: { to: repair_semantic_review }
+      semantic_repair_required: { to: repair_implementation, max_reentries: 8, on_exhausted: needs_human }
+      failure: { terminal: failed }
+  - id: repair_semantic_review
+    executor: { kind: agent, capability: ce/review@1 }
+    evaluator: { kind: semantic, assurance: semantic_attested, required_artifacts: [stage_result, review] }
+    context: resume_required
+    live_steering: false
+    credentials: [model.invoke, repo.read, repo.write]
+    produces: [stage_result, review]
+    transitions:
+      success: { to: test }
+      no_change: { to: test }
+  - id: semantic_review
+    executor: { kind: agent, capability: ce/review@1 }
+    evaluator: { kind: semantic, assurance: semantic_attested, required_artifacts: [stage_result, review] }
+    context: resume_required
+    live_steering: false
+    credentials: [model.invoke, repo.read, repo.write]
+    produces: [stage_result, review]
+    transitions:
+      success: { to: simplification }
+      no_change: { to: simplification }
+  - id: simplification
+    executor: { kind: agent, capability: ce/simplify@1 }
+    evaluator: { kind: semantic, assurance: semantic_attested, required_artifacts: [stage_result] }
+    context: resume_required
+    live_steering: false
+    credentials: [model.invoke, repo.read, repo.write]
+    produces: [stage_result]
+    transitions:
+      success: { to: post_simplify_review }
+      no_change: { to: test }
+  - id: post_simplify_review
+    executor: { kind: agent, capability: ce/review@1 }
+    evaluator: { kind: semantic, assurance: semantic_attested, required_artifacts: [stage_result, review] }
+    context: resume_required
+    live_steering: false
+    credentials: [model.invoke, repo.read, repo.write]
+    produces: [stage_result, review]
+    transitions:
+      success: { to: test }
+      no_change: { to: test }
+  - id: test
+    executor: { kind: command, capability: command/run@1 }
+    commandName: test
+    evaluator: { kind: command, assurance: executor_verified, required_artifacts: [command_result] }
+    context: none
+    live_steering: false
+    credentials: [repo.read]
+    produces: [stage_result, command_result]
+    transitions:
+      success: { to: lint }
+      no_change: { to: lint }
+  - id: lint
+    executor: { kind: command, capability: command/run@1 }
+    commandName: lint
+    evaluator: { kind: command, assurance: executor_verified, required_artifacts: [command_result] }
+    context: none
+    live_steering: false
+    credentials: [repo.read]
+    produces: [stage_result, command_result]
+    transitions:
+      success: { to: build }
+      no_change: { to: build }
+  - id: build
+    executor: { kind: command, capability: command/run@1 }
+    commandName: build
+    evaluator: { kind: command, assurance: executor_verified, required_artifacts: [command_result] }
+    context: none
+    live_steering: false
+    credentials: [repo.read]
+    produces: [stage_result, command_result]
+    transitions:
+      success: { to: publish }
+      no_change: { to: publish }
+  - id: publish
+    executor: { kind: agent, capability: ce/publish@1 }
+    evaluator: { kind: publish_subject, assurance: semantic_attested, required_artifacts: [publish_subject] }
+    context: resume_required
+    live_steering: false
+    credentials: [model.invoke, repo.read, repo.write, provider.read]
+    produces: [stage_result, publish_subject]
+    transitions:
+      success: { to: provider }
+      no_change: { terminal: no_change }
+      failure: { terminal: failed }
+  - id: provider
+    executor: { kind: provider_wait, capability: provider/wait@1 }
+    evaluator: { kind: provider, assurance: provider_verified, required_artifacts: [provider_check] }
+    context: none
+    live_steering: false
+    credentials: [provider.read]
+    produces: [stage_result, provider_check]
+    transitions:
+      success: { terminal: shipped }
+      no_change: { terminal: no_change }
+      failure: { terminal: failed }

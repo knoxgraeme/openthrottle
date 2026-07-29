@@ -1,4 +1,6 @@
-import type { SupervisorStore, WebhookDelivery } from "../persistence/store.js";
+import type { WebhookDelivery } from "../persistence/delivery-store.js";
+import type { SupervisorStore } from "../persistence/store.js";
+import { exponentialBackoffDelayMs } from "../shared/backoff.js";
 import { sanitizeText } from "../shared/sanitize.js";
 
 const DEFAULT_MAX_ATTEMPTS = 5;
@@ -39,7 +41,12 @@ export function createWebhookDeliveryProcessor(params: {
       const retryAt =
         delivery.attempts >= maxAttempts
           ? null
-          : new Date(Date.now() + baseDelayMs * 2 ** (delivery.attempts - 1)).toISOString();
+          : new Date(
+            Date.now() + exponentialBackoffDelayMs(
+              delivery.attempts,
+              { baseDelayMs, maxDelayMs: Number.POSITIVE_INFINITY }
+            )
+          ).toISOString();
       params.store.markDeliveryFailed(delivery.id, message, retryAt);
       if (!retryAt && params.onDead) {
         try {

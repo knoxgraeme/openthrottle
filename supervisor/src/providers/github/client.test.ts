@@ -4,14 +4,17 @@ import { createSupervisorStore } from "../../persistence/store.js";
 import { openDb } from "../../persistence/database.js";
 import { considerCiGithubHead } from "./events.js";
 import {
+  OPENTHROTTLE_WEBHOOK_EVENTS,
   branchExists,
   getRepositoryConfigAtCommit,
+  getFailingGithubCheckDetails,
   getMergeReadiness,
   isGithubPullRequestUrl,
   isOpenthrottleBranch,
   parseGithubWebhook,
   parsePullRequestUrl,
   prepareRepository,
+  reconcileRepositoryWebhook,
   upsertPullRequestComment,
   verifyGithubSignature,
 } from "./client.js";
@@ -57,6 +60,27 @@ describe("GitHub contracts", () => {
       },
     });
     expect(parseGithubWebhook("pull_request", raw).kind).toBe("pull_request");
+    const review = JSON.stringify({
+      action: "submitted",
+      repository: { full_name: "o/r" },
+      pull_request: {
+        number: 1,
+        html_url: "https://github.com/o/r/pull/1",
+        merged_at: null,
+        head: { ref: "ot/test" },
+        base: { ref: "main" },
+      },
+      review: {
+        id: 9,
+        state: "commented",
+        html_url: "https://github.com/o/r/pull/1#pullrequestreview-9",
+        user: { login: "reviewer" },
+      },
+    });
+    expect(parseGithubWebhook("pull_request_review", review)).toMatchObject({
+      kind: "pull_request_review",
+      review: { id: 9 },
+    });
     const comment = JSON.stringify({
       action: "created",
       repository: { full_name: "o/r" },
@@ -121,6 +145,120 @@ describe("GitHub contracts", () => {
     });
     expect(signals).toHaveLength(2);
     expect(signals.every((signal) => signal instanceof AbortSignal)).toBe(true);
+  });
+
+  it("fetches bounded failed workflow job details and log tails", async () => {
+    const longLog = `${"x".repeat(2_100)}\n[REDACTED-ME]`;
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/actions/runs/20/jobs?filter=latest&per_page=100")) {
+        return Response.json({
+          jobs: [
+            {
+              id: 101,
+              name: "test",
+              workflow_name: "CI",
+              html_url: "https://github.com/o/r/actions/runs/20/job/101",
+              conclusion: "failure",
+              steps: [
+                { name: "install", conclusion: "success" },
+                { name: "unit tests", conclusion: "failure" },
+              ],
+            },
+            { id: 102, name: "lint", conclusion: "success", steps: [] },
+          ],
+        });
+      }
+      if (url.endsWith("/actions/jobs/101/logs")) return new Response(longLog);
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    }) as unknown as typeof fetch;
+
+    const details = await getFailingGithubCheckDetails(
+      { token: "github", fetch: fetchMock },
+      "o/r",
+      { headSha: "c".repeat(40), workflowRunId: 20, workflowName: "CI" }
+    );
+
+    expect(details).toEqual([{
+      workflowName: "CI",
+      jobName: "test",
+      stepNames: ["unit tests"],
+      logTail: expect.stringContaining("[REDACTED-ME]"),
+      htmlUrl: "https://github.com/o/r/actions/runs/20/job/101",
+    }]);
+    expect(details[0]!.logTail).toHaveLength(2_000);
+  });
+
+  it("streams failed job logs while keeping only the bounded tail", async () => {
+    const encoder = new TextEncoder();
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/actions/runs/20/jobs?filter=latest&per_page=100")) {
+        return Response.json({
+          jobs: [{ id: 101, name: "test", workflow_name: "CI", conclusion: "failure", steps: [] }],
+        });
+      }
+      if (url.endsWith("/actions/jobs/101/logs")) {
+        return new Response(new ReadableStream({
+          start(controller) {
+            controller.enqueue(encoder.encode("a".repeat(100_000)));
+            controller.enqueue(encoder.encode("final failure"));
+            controller.close();
+          },
+        }));
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    }) as unknown as typeof fetch;
+
+    const details = await getFailingGithubCheckDetails(
+      { token: "github", fetch: fetchMock },
+      "o/r",
+      { headSha: "c".repeat(40), workflowRunId: 20, workflowName: "CI" }
+    );
+
+    expect(details[0]!.logTail).toHaveLength(2_000);
+    expect(details[0]!.logTail).toContain("final failure");
+  });
+
+  it("fetches failed check-suite jobs from commit check runs", async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith(`/commits/${"c".repeat(40)}/check-runs?per_page=100`)) {
+        return Response.json({
+          check_runs: [{
+            id: 501,
+            name: "build",
+            conclusion: "failure",
+            details_url: "https://github.com/o/r/actions/runs/20/job/101",
+            html_url: "https://github.com/o/r/runs/501",
+          }],
+        });
+      }
+      if (url.endsWith("/actions/jobs/101")) {
+        return Response.json({
+          id: 101,
+          name: "build",
+          workflow_name: "CI",
+          html_url: "https://github.com/o/r/actions/runs/20/job/101",
+          conclusion: "failure",
+          steps: [{ name: "compile", conclusion: "failure" }],
+        });
+      }
+      if (url.endsWith("/actions/jobs/101/logs")) return new Response("compile failed");
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    }) as unknown as typeof fetch;
+
+    await expect(getFailingGithubCheckDetails(
+      { token: "github", fetch: fetchMock },
+      "o/r",
+      { headSha: "c".repeat(40), workflowName: "GitHub check suite" }
+    )).resolves.toEqual([{
+      workflowName: "CI",
+      jobName: "build",
+      stepNames: ["compile"],
+      logTail: "compile failed",
+      htmlUrl: "https://github.com/o/r/actions/runs/20/job/101",
+    }]);
   });
 
   it("resolves branch existence and distinguishes 404 from other errors", async () => {
@@ -246,6 +384,123 @@ describe("GitHub contracts", () => {
       }
     );
     expect(result).toMatchObject({ webhookId: 7, webhookAction: "updated" });
+  });
+
+  it("reconciles a persisted webhook whose subscribed event list drifted", async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/repos/acme/widget/hooks/7") && !init?.method) {
+        return Response.json({
+          id: 7,
+          active: true,
+          events: ["pull_request", "pull_request_review", "workflow_run", "check_suite"],
+          config: { url: "https://ot.test/webhooks/github" },
+        });
+      }
+      if (url.endsWith("/repos/acme/widget/hooks/7") && init?.method === "PATCH") {
+        expect(JSON.parse(String(init.body))).toMatchObject({
+          active: true,
+          events: OPENTHROTTLE_WEBHOOK_EVENTS,
+          config: { url: "https://ot.test/webhooks/github" },
+        });
+        return Response.json({ id: 7 });
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    }) as unknown as typeof fetch;
+
+    await expect(reconcileRepositoryWebhook(
+      { token: "github", fetch: fetchMock },
+      {
+        repo: "acme/widget",
+        webhookId: 7,
+        webhookUrl: "https://ot.test/webhooks/github",
+        webhookSecret: "webhook-secret",
+      }
+    )).resolves.toEqual({
+      repo: "acme/widget",
+      webhookId: 7,
+      webhookAction: "updated",
+      missingEvents: ["issue_comment"],
+    });
+  });
+
+  it("reconciles a deleted persisted webhook by adopting an existing hook with the configured URL", async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/repos/acme/widget/hooks/7") && !init?.method) {
+        return new Response("missing", { status: 404 });
+      }
+      if (url.endsWith("/repos/acme/widget/hooks?per_page=100")) {
+        return Response.json([{
+          id: 8,
+          active: true,
+          events: ["pull_request"],
+          config: { url: "https://ot.test/webhooks/github" },
+        }]);
+      }
+      if (url.endsWith("/repos/acme/widget/hooks/8") && init?.method === "PATCH") {
+        expect(JSON.parse(String(init.body))).toMatchObject({
+          active: true,
+          events: OPENTHROTTLE_WEBHOOK_EVENTS,
+        });
+        return Response.json({ id: 8 });
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    }) as unknown as typeof fetch;
+
+    await expect(reconcileRepositoryWebhook(
+      { token: "github", fetch: fetchMock },
+      {
+        repo: "acme/widget",
+        webhookId: 7,
+        webhookUrl: "https://ot.test/webhooks/github",
+        webhookSecret: "webhook-secret",
+      }
+    )).resolves.toEqual({
+      repo: "acme/widget",
+      webhookId: 8,
+      webhookAction: "updated",
+      missingEvents: ["pull_request_review", "issue_comment", "workflow_run", "check_suite"],
+    });
+  });
+
+  it("recreates a deleted persisted webhook when no matching URL remains", async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/repos/acme/widget/hooks/7") && !init?.method) {
+        return new Response("missing", { status: 404 });
+      }
+      if (url.endsWith("/repos/acme/widget/hooks?per_page=100")) {
+        return Response.json([{ id: 2, active: true, events: [], config: { url: "https://other.test/hook" } }]);
+      }
+      if (url.endsWith("/repos/acme/widget/hooks") && init?.method === "POST") {
+        expect(JSON.parse(String(init.body))).toMatchObject({
+          name: "web",
+          active: true,
+          events: OPENTHROTTLE_WEBHOOK_EVENTS,
+          config: { url: "https://ot.test/webhooks/github" },
+        });
+        return Response.json({ id: 9 });
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    }) as unknown as typeof fetch;
+
+    await expect(reconcileRepositoryWebhook(
+      { token: "github", fetch: fetchMock },
+      {
+        repo: "acme/widget",
+        webhookId: 7,
+        webhookUrl: "https://ot.test/webhooks/github",
+        webhookSecret: "webhook-secret",
+      }
+    )).resolves.toEqual({
+      repo: "acme/widget",
+      webhookId: 9,
+      webhookAction: "created",
+      missingEvents: [
+        ...OPENTHROTTLE_WEBHOOK_EVENTS,
+      ],
+    });
   });
 
   it("creates then updates one stable neutral PR summary without using the reviews API", async () => {

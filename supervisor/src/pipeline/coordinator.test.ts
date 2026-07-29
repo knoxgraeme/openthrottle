@@ -14,10 +14,12 @@ import {
   digestNormalized,
   loadPipelineCatalog,
   parseRepositoryConfig,
+  type PipelineManifest,
 } from "./manifest.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
-import type { PipelineInstance, PipelineStageAttempt } from "./store.js";
-import { buildInstalledRuntimeDescriptor } from "../runtime/contracts.js";
+import type { PipelineInstance, PipelineInstanceStage, PipelineStageAttempt } from "./store.js";
+import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
+import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
 const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
@@ -76,7 +78,8 @@ describe("pipeline coordinator", () => {
     instance: PipelineInstance,
     attempt: PipelineStageAttempt,
     outcome: PipelineCoordinatorEvent["outcome"] = "success",
-    id = `event-${outcome}`
+    id = `event-${outcome}`,
+    artifacts: Array<"stage_result" | "review"> = ["stage_result"]
   ): PipelineCoordinatorEvent {
     const stageResultPayload = JSON.stringify({ id, outcome });
     const resultHash = digestNormalized(stageResultPayload);
@@ -91,13 +94,18 @@ describe("pipeline coordinator", () => {
       outcome,
       resultHash,
       artifacts: [
-        {
-          kind: "stage_result",
-          schemaVersion: 1,
-          assurance: command ? "executor_verified" : "semantic_attested",
-          payload: stageResultPayload,
-          hash: resultHash,
-        },
+        ...artifacts.map((kind) => {
+          const payload = kind === "stage_result"
+            ? stageResultPayload
+            : JSON.stringify({ id: `${id}-review`, findings: [] });
+          return {
+            kind,
+            schemaVersion: 1,
+            assurance: command ? "executor_verified" as const : "semantic_attested" as const,
+            payload,
+            hash: kind === "stage_result" ? resultHash : digestNormalized(payload),
+          };
+        }),
         ...(command ? [{
           kind: "command_result",
           schemaVersion: 1,
@@ -107,6 +115,133 @@ describe("pipeline coordinator", () => {
         }] : []),
       ],
     };
+  }
+
+  function stageResultEvent(input: {
+    instance: PipelineInstance;
+    attempt: PipelineStageAttempt;
+    outcome?: PipelineCoordinatorEvent["outcome"];
+    id: string;
+    summary: string;
+    evidence?: string[];
+    uncertainty?: string[];
+  }): PipelineCoordinatorEvent {
+    const payload = JSON.stringify({
+      schema: "openthrottle.stage-proposal/v1",
+      suggested_outcome: input.outcome ?? "success",
+      summary: input.summary,
+      evidence: input.evidence ?? [],
+      findings: [],
+      actions: [],
+      uncertainty: input.uncertainty ?? [],
+    });
+    return {
+      id: input.id,
+      kind: "stage_result",
+      instanceId: input.instance.id,
+      generation: input.instance.generation,
+      attemptId: input.attempt.id,
+      requestHash: input.attempt.request_hash,
+      outcome: input.outcome ?? "success",
+      resultHash: digestNormalized(payload),
+      artifacts: [{
+        kind: "stage_result",
+        schemaVersion: 1,
+        assurance: "semantic_attested",
+        payload,
+        hash: digestNormalized(payload),
+      }],
+    };
+  }
+
+  function providerFeedbackEvent(
+    instance: PipelineInstance,
+    attempt: PipelineStageAttempt,
+    outcome: PipelineCoordinatorEvent["outcome"],
+    id: string
+  ): PipelineCoordinatorEvent {
+    const stageResultPayload = JSON.stringify({ id, outcome });
+    const providerCheckPayload = JSON.stringify({ id: `${id}-provider-check`, outcome });
+    const subject = instance.immutable_subject ?? "f".repeat(40);
+    return {
+      id,
+      kind: "provider_snapshot",
+      instanceId: instance.id,
+      generation: instance.generation,
+      attemptId: attempt.id,
+      requestHash: attempt.request_hash,
+      outcome,
+      resultHash: digestNormalized(stageResultPayload),
+      subject,
+      artifacts: [
+        {
+          kind: "stage_result",
+          schemaVersion: 1,
+          assurance: "provider_verified",
+          subject,
+          payload: stageResultPayload,
+          hash: digestNormalized(stageResultPayload),
+        },
+        {
+          kind: "provider_check",
+          schemaVersion: 1,
+          assurance: "provider_verified",
+          subject,
+          payload: providerCheckPayload,
+          hash: digestNormalized(providerCheckPayload),
+        },
+      ],
+    };
+  }
+
+  function activeAgentAttempt(
+    attempt: PipelineStageAttempt,
+    stageId: string
+  ): PipelineStageAttempt {
+    return {
+      ...attempt,
+      id: `${stageId}-attempt`,
+      stage_id: stageId,
+      request_hash: digestNormalized(`${stageId}-request`),
+      native_context_policy: "resume_required",
+    };
+  }
+
+  function providerWaitStages(
+    stages: PipelineInstanceStage[],
+    repairReentryCount: number
+  ): PipelineInstanceStage[] {
+    return stages.map((stage) => stage.stage_id === "repair_implementation"
+      ? { ...stage, reentry_count: repairReentryCount }
+      : stage.stage_id === "provider"
+        ? { ...stage, status: "waiting" }
+        : stage);
+  }
+
+  function reduceActiveAgentStage(input: {
+    manifest: PipelineManifest;
+    instance: PipelineInstance;
+    attempt: PipelineStageAttempt;
+    stages: PipelineInstanceStage[];
+    stageId: string;
+    outcome: PipelineCoordinatorEvent["outcome"];
+    id: string;
+    artifacts?: Array<"stage_result" | "review">;
+  }) {
+    const attempt = activeAgentAttempt(input.attempt, input.stageId);
+    return reducePipelineEvent({
+      manifest: input.manifest,
+      instance: {
+        ...input.instance,
+        status: "running",
+        active_stage_id: input.stageId,
+      },
+      attempt,
+      stages: input.stages.map((stage) => stage.stage_id === input.stageId
+        ? { ...stage, status: "running" }
+        : stage),
+      event: event(input.instance, attempt, input.outcome, input.id, input.artifacts),
+    });
   }
 
   it("has one deterministic policy for every declared stage outcome", () => {
@@ -167,13 +302,134 @@ describe("pipeline coordinator", () => {
     expect(pipelines.listEffects(instance.id).map((effect) => effect.kind)).toEqual([
       "provision",
       "publish_linear",
-      "cleanup",
       "publish_github",
+      "cleanup",
     ]);
 
     const replay = coordinatePipelineEvent(pipelines, input);
     expect(replay.state_version).toBe(1);
     expect(pipelines.listEffects(instance.id)).toHaveLength(4);
+  });
+
+  it("projects notable repair stages into run notes without changing transitions", () => {
+    const { pipelines, instance, attempt } = setup("core/implement@4");
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'running', active_stage_id = 'repair_implementation'
+      WHERE id = ?
+    `).run(instance.id);
+    db!.prepare(`
+      UPDATE pipeline_instance_stages
+      SET status = CASE WHEN stage_id = 'repair_implementation' THEN 'running' ELSE status END
+      WHERE pipeline_instance_id = ?
+    `).run(instance.id);
+    db!.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET stage_id = 'repair_implementation', status = 'running'
+      WHERE id = ?
+    `).run(attempt.id);
+    const active = pipelines.getAttempt(attempt.id)!;
+    const result = coordinatePipelineEvent(pipelines, stageResultEvent({
+      instance: { ...instance, status: "running", active_stage_id: "repair_implementation" },
+      attempt: active,
+      id: "repair-result",
+      summary: "Fixed the provider feedback and left no remaining code changes.",
+      evidence: ["Provider response included Bearer provider-token-123."],
+      uncertainty: ["Provider checks have not rerun yet. sk-test-123456"],
+    }));
+
+    expect(result.active_stage_id).not.toBe("repair_implementation");
+    const notes = pipelines.listJournalEntries({ issueId: instance.linear_issue_id })
+      .filter((entry) => entry.kind === "run_note");
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toMatchObject({
+      actor: "stage_agent",
+      issue: "ISSUE-1",
+      repository: "owner/repo",
+      instance_id: instance.id,
+      outcome: "success",
+    });
+    expect(notes[0].note).toContain("Fixed the provider feedback");
+    expect(notes[0].note).not.toContain("sk-test-123456");
+    expect(notes[0].structured).not.toContain("provider-token-123");
+    expect(notes[0].structured).not.toContain("sk-test-123456");
+    expect(JSON.parse(notes[0].structured!)).toMatchObject({
+      suggested_outcome: "success",
+      uncertainty: ["Provider checks have not rerun yet. [REDACTED]"],
+      evidence_refs: ["Provider response included [REDACTED]"],
+    });
+  });
+
+  it("does not write run notes for clean forward agent stages", () => {
+    const { pipelines, instance, attempt } = setup("core/implement@4");
+    const result = coordinatePipelineEvent(pipelines, stageResultEvent({
+      instance,
+      attempt,
+      id: "clean-implementation",
+      summary: "Implemented the planned change.",
+    }));
+
+    expect(result.active_stage_id).toBe("semantic_review");
+    expect(pipelines.listJournalEntries({ issueId: instance.linear_issue_id })
+      .filter((entry) => entry.kind === "run_note")).toEqual([]);
+  });
+
+  it("attributes structured ledger publication projections to the supervisor", () => {
+    const { pipelines, instance, attempt } = setup("core/implement@4");
+    const unitStore = pipelines as typeof pipelines & ExecutionUnitStore;
+    unitStore.createGraph({
+      pipelineInstanceId: instance.id,
+      parentAttemptId: attempt.id,
+      parentStageId: attempt.stage_id,
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "U1" }],
+    });
+
+    coordinatePipelineEvent(pipelines, stageResultEvent({
+      instance,
+      attempt,
+      id: "structured-ledger-result",
+      summary: "Implemented the planned change.",
+    }));
+
+    const notes = pipelines.listJournalEntries({ issueId: instance.linear_issue_id })
+      .filter((entry) => entry.trigger === `${attempt.stage_id} structured publication`);
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toMatchObject({
+      actor: "supervisor",
+      kind: "run_note",
+      outcome: "success",
+    });
+    expect(JSON.parse(notes[0].structured!)).toMatchObject({
+      unit_count: 1,
+      aggregate_artifact_hash: null,
+    });
+  });
+
+  it("projects Codex model credential failures into run notes", () => {
+    const { pipelines, instance, attempt } = setup("core/implement@4");
+    const result = coordinatePipelineEvent(pipelines, stageResultEvent({
+      instance,
+      attempt,
+      id: "codex-model-auth-expired",
+      outcome: "retryable_infrastructure_failure",
+      summary: "Model credential expired - refresh CODEX_AUTH_JSON. Agent stage failed (exit=1).",
+    }));
+
+    expect(result.active_stage_id).toBe("implementation");
+    const notes = pipelines.listJournalEntries({ issueId: instance.linear_issue_id })
+      .filter((entry) => entry.kind === "run_note");
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toMatchObject({
+      actor: "stage_agent",
+      outcome: "retryable_infrastructure_failure",
+    });
+    expect(notes[0].note).toContain("Model credential expired - refresh CODEX_AUTH_JSON");
+    expect(JSON.parse(notes[0].structured!)).toMatchObject({
+      suggested_outcome: "retryable_infrastructure_failure",
+    });
   });
 
   it("rolls back every transition write boundary and recovers one complete intent set", () => {
@@ -194,34 +450,32 @@ describe("pipeline coordinator", () => {
   });
 
   it("enforces bounded repair and uses explicit on_exhausted policy", () => {
-    const { manifest, instance, attempt, stages } = setup("ce/implement@2");
+    const { manifest, instance, attempt, stages } = setup("core/implement@4");
     const repair = event(instance, attempt, "semantic_repair_required", "repair-event");
     const allowed = reducePipelineEvent({
       manifest,
       instance: { ...instance, reentry_count: 2 },
       attempt,
-      stages: stages.map((stage) => ({ ...stage, reentry_count: stage.stage_id === "planning" ? 2 : stage.reentry_count })),
+      stages: stages.map((stage) => ({ ...stage, reentry_count: stage.stage_id === "implementation" ? 2 : stage.reentry_count })),
       event: repair,
     });
-    expect(allowed.nextStageId).toBe("planning");
+    expect(allowed.nextStageId).toBe("implementation");
     expect(allowed.nextAttempt?.reentryOrdinal).toBe(3);
 
     const exhausted = reducePipelineEvent({
       manifest,
-      instance: { ...instance, reentry_count: 3 },
+      instance: { ...instance, reentry_count: 8 },
       attempt,
-      stages: stages.map((stage) => ({ ...stage, reentry_count: stage.stage_id === "planning" ? 3 : stage.reentry_count })),
+      stages: stages.map((stage) => ({ ...stage, reentry_count: stage.stage_id === "implementation" ? 8 : stage.reentry_count })),
       event: repair,
     });
     expect(exhausted.nextStatus).toBe("completion_pending_publication");
-    expect(exhausted.terminalOutcome).toBe("needs_human");
+    expect(exhausted.terminalOutcome).toBe("failed");
     expect(exhausted.nextAttempt).toBeUndefined();
-    expect(exhausted.effects.map((effect) => effect.kind)).toEqual(["publish_linear", "cleanup"]);
-    expect(exhausted.effects[1]).toMatchObject({
-      idempotencyKey: `cleanup:${instance.id}:needs_human`,
+    expect(exhausted.effects.map((effect) => effect.kind)).toEqual(["publish_linear", "stop", "cleanup"]);
+    expect(exhausted.effects[2]).toMatchObject({
+      idempotencyKey: `cleanup:${instance.id}:failed`,
     });
-    expect(JSON.parse(exhausted.effects[1].payload).preserve).toBe(true);
-
     const attemptsExhausted = reducePipelineEvent({
       manifest,
       instance: { ...instance, attempt_count: manifest.max_attempts },
@@ -236,8 +490,182 @@ describe("pipeline coordinator", () => {
       .toEqual(["publish_linear", "stop", "cleanup"]);
   });
 
+  it("does not exhaust the raw attempt budget in the middle of a forward repair round", () => {
+    const { manifest, instance, attempt, stages } = setup("core/implement@4");
+    const repairedImplementation = reducePipelineEvent({
+      manifest,
+      instance: {
+        ...instance,
+        status: "running",
+        active_stage_id: "implementation",
+        attempt_count: manifest.max_attempts,
+      },
+      attempt: {
+        ...attempt,
+        stage_id: "implementation",
+        request_hash: "d".repeat(64),
+        native_context_policy: "resume_required",
+        reentry_ordinal: 2,
+      },
+      stages: stages.map((stage) => stage.stage_id === "implementation"
+        ? { ...stage, status: "running", reentry_count: 2 }
+        : stage),
+      event: {
+        ...event(instance, attempt, "success", "repair-forward"),
+        attemptId: attempt.id,
+        requestHash: "d".repeat(64),
+      },
+    });
+
+    expect(repairedImplementation.nextStageId).toBe("semantic_review");
+    expect(repairedImplementation.nextAttempt).toMatchObject({
+      stageId: "semantic_review",
+      reentryOrdinal: 0,
+    });
+    expect(repairedImplementation.terminalOutcome).toBeUndefined();
+  });
+
+  it("skips post-simplify review when simplification reports no change", () => {
+    const { manifest, instance, attempt, stages } = setup("core/implement@4");
+    const write = reduceActiveAgentStage({
+      manifest,
+      instance,
+      attempt,
+      stages,
+      stageId: "simplification",
+      outcome: "no_change",
+      id: "simplify-no-change",
+    });
+
+    expect(write.nextStageId).toBe("test");
+    expect(write.nextAttempt).toMatchObject({
+      stageId: "test",
+      reentryOrdinal: 0,
+    });
+    expect(write.effects).toHaveLength(1);
+    expect(write.effects[0]).toMatchObject({ kind: "dispatch_stage" });
+  });
+
+  it("runs post-simplify review after simplification changes and routes repairs to implementation", () => {
+    const { manifest, instance, attempt, stages } = setup("core/implement@4");
+    const afterSimplify = reduceActiveAgentStage({
+      manifest,
+      instance,
+      attempt,
+      stages,
+      stageId: "simplification",
+      outcome: "success",
+      id: "simplify-changed",
+    });
+
+    expect(afterSimplify.nextStageId).toBe("post_simplify_review");
+    expect(afterSimplify.nextAttempt).toMatchObject({
+      stageId: "post_simplify_review",
+      reentryOrdinal: 0,
+      contextPolicy: "resume_required",
+    });
+
+    const repair = reduceActiveAgentStage({
+      manifest,
+      instance,
+      attempt,
+      stages,
+      stageId: "post_simplify_review",
+      outcome: "semantic_repair_required",
+      id: "post-simplify-repair",
+      artifacts: ["stage_result", "review"],
+    });
+
+    expect(repair.nextStageId).toBe("repair_implementation");
+    expect(repair.reentryIncrement).toBe(1);
+    expect(repair.nextAttempt).toMatchObject({
+      stageId: "repair_implementation",
+      reentryOrdinal: 1,
+    });
+  });
+
+  it("routes core/implement@4 repair re-entry around simplification and back through command gates", () => {
+    const { manifest, instance, attempt, stages } = setup("core/implement@4");
+    const providerAttempt = activeAgentAttempt(attempt, "provider");
+    const providerInstance = {
+      ...instance,
+      status: "waiting_provider" as const,
+      active_stage_id: "provider",
+      reentry_count: 3,
+      immutable_subject: "f".repeat(40),
+    };
+    const providerRepair = reducePipelineEvent({
+      manifest,
+      instance: providerInstance,
+      attempt: providerAttempt,
+      stages: providerWaitStages(stages, 3),
+      event: providerFeedbackEvent(providerInstance, providerAttempt, "semantic_repair_required", "provider-repair"),
+    });
+
+    expect(providerRepair.nextStageId).toBe("repair_implementation");
+    expect(providerRepair.nextAttempt).toMatchObject({
+      stageId: "repair_implementation",
+      reentryOrdinal: 4,
+      contextPolicy: "resume_required",
+    });
+
+    const implementedRepair = reduceActiveAgentStage({
+      manifest,
+      instance,
+      attempt,
+      stages,
+      stageId: "repair_implementation",
+      outcome: "success",
+      id: "repair-implemented",
+    });
+    expect(implementedRepair.nextStageId).toBe("repair_semantic_review");
+
+    const reviewedRepair = reduceActiveAgentStage({
+      manifest,
+      instance,
+      attempt,
+      stages,
+      stageId: "repair_semantic_review",
+      outcome: "success",
+      id: "repair-reviewed",
+      artifacts: ["stage_result", "review"],
+    });
+    expect(reviewedRepair.nextStageId).toBe("test");
+    expect(reviewedRepair.nextAttempt).toMatchObject({
+      stageId: "test",
+      reentryOrdinal: 0,
+    });
+  });
+
+  it("exhausts core/implement@4 on repair rounds before the raw attempt safety net", () => {
+    const { manifest, instance, attempt, stages } = setup("core/implement@4");
+    const providerAttempt = activeAgentAttempt(attempt, "provider");
+    const providerInstance = {
+      ...instance,
+      status: "waiting_provider" as const,
+      active_stage_id: "provider",
+      reentry_count: manifest.max_repair_rounds!,
+      attempt_count: 25,
+      immutable_subject: "f".repeat(40),
+    };
+
+    const exhausted = reducePipelineEvent({
+      manifest,
+      instance: providerInstance,
+      attempt: providerAttempt,
+      stages: providerWaitStages(stages, manifest.max_repair_rounds!),
+      event: providerFeedbackEvent(providerInstance, providerAttempt, "semantic_repair_required", "round-limit"),
+    });
+
+    expect(exhausted.nextStatus).toBe("completion_pending_publication");
+    expect(exhausted.terminalOutcome).toBe("failed");
+    expect(exhausted.waitReason).toBe("pipeline repair round limit 5 exhausted");
+    expect(exhausted.nextAttempt).toBeUndefined();
+    expect(exhausted.effects.map((effect) => effect.kind)).toEqual(["publish_linear", "stop", "cleanup"]);
+  });
+
   it("persists a complete immutable request for a repair attempt", () => {
-    const { pipelines, instance, attempt } = setup("ce/implement@2");
+    const { pipelines, instance, attempt } = setup("core/implement@4");
     const input = event(instance, attempt, "semantic_repair_required", "repair-request");
     const payload = JSON.stringify({
       id: "repair-request",
@@ -258,7 +686,7 @@ describe("pipeline coordinator", () => {
     const request = pipelines.getStageRequest(next.id);
     expect(request).toMatchObject({
       pipelineInstanceId: instance.id,
-      stageId: "planning",
+      stageId: "implementation",
       attemptId: next.id,
       runId: next.planned_run_id,
       requestHash: next.request_hash,
@@ -280,7 +708,7 @@ describe("pipeline coordinator", () => {
   });
 
   it("cannot enter provider wait until the publishing stage establishes an exact subject", () => {
-    const { manifest, instance, attempt, stages } = setup("ce/implement@2");
+    const { manifest, instance, attempt, stages } = setup("core/implement@4");
     const publishAttempt = {
       ...attempt,
       id: "publish-attempt",
@@ -324,8 +752,67 @@ describe("pipeline coordinator", () => {
     })).toThrow(/provider wait without an exact subject/);
   });
 
+  it("idles the sandbox when a publish transition enters provider wait", () => {
+    const { manifest, instance, attempt, stages } = setup("core/implement@4");
+    const publishAttempt = {
+      ...attempt,
+      id: "publish-attempt",
+      stage_id: "publish",
+      request_hash: "f".repeat(64),
+      native_context_policy: "resume_required",
+    };
+    const subject = "c".repeat(40);
+    const payload = JSON.stringify({ outcome: "success" });
+    const publishPayload = JSON.stringify({
+      details: { published_commit: subject },
+    });
+    const write = reducePipelineEvent({
+      manifest,
+      instance: { ...instance, active_stage_id: "publish", status: "running" },
+      attempt: publishAttempt,
+      stages: stages.map((stage) => stage.stage_id === "publish" ? { ...stage, status: "running" } : stage),
+      event: {
+        id: "publish-with-subject",
+        kind: "stage_result",
+        instanceId: instance.id,
+        generation: instance.generation,
+        attemptId: publishAttempt.id,
+        requestHash: publishAttempt.request_hash,
+        outcome: "success",
+        resultHash: digestNormalized(payload),
+        subject,
+        providerRevision: subject,
+        artifacts: [
+          {
+            kind: "stage_result",
+            schemaVersion: 1,
+            assurance: "semantic_attested",
+            payload,
+            hash: digestNormalized(payload),
+            subject,
+          },
+          {
+            kind: "publish_subject",
+            schemaVersion: 1,
+            assurance: "semantic_attested",
+            payload: publishPayload,
+            hash: digestNormalized(publishPayload),
+            subject,
+          },
+        ],
+      },
+    });
+
+    expect(write.nextStatus).toBe("waiting_provider");
+    expect(write.nextStageId).toBe("provider");
+    expect(write.effects.map((effect) => effect.kind)).toEqual(["publish_linear", "idle"]);
+    expect(write.effects.find((effect) => effect.kind === "idle")).toMatchObject({
+      idempotencyKey: `idle:${instance.id}:provider:${write.nextAttempt!.id}`,
+    });
+  });
+
   it("turns a current-head provider snapshot into a bounded typed repair re-entry", () => {
-    const { manifest, instance, attempt, stages } = setup("ce/implement@2");
+    const { manifest, instance, attempt, stages } = setup("core/implement@4");
     const providerAttempt = {
       ...attempt,
       id: "provider-attempt",
@@ -376,7 +863,7 @@ describe("pipeline coordinator", () => {
         ],
       },
     });
-    expect(write.nextStageId).toBe("implementation");
+    expect(write.nextStageId).toBe("repair_implementation");
     expect(write.nextStatus).toBe("dispatchable");
     expect(write.reentryIncrement).toBe(1);
   });
@@ -472,6 +959,62 @@ describe("pipeline coordinator", () => {
       stages,
       event: { ...event(instance, attempt, "canceled"), kind: "supersede" },
     })).toThrow(/supersede must use outcome superseded/);
+  });
+
+  it("publishes control stop and supersede terminals without racing cleanup", () => {
+    for (const [kind, outcome, terminal] of [
+      ["stop", "canceled", "canceled"],
+      ["supersede", "superseded", "superseded"],
+    ] as const) {
+      const { pipelines, manifest, instance, attempt, stages } = setup();
+      const idlePayload = JSON.stringify({
+        pipelineInstanceId: instance.id,
+        stageId: attempt.stage_id,
+        attemptId: attempt.id,
+        reason: "provider wait",
+      });
+      db!.prepare(`
+        INSERT INTO pipeline_effect_intents (
+          id, pipeline_instance_id, transition_version, kind, idempotency_key,
+          payload, payload_hash, status, next_attempt_at, created_at
+        ) VALUES (?, ?, ?, 'idle', ?, ?, ?, 'pending', ?, ?)
+      `).run(
+        `idle-before-${kind}`,
+        instance.id,
+        1,
+        `idle-before-${kind}`,
+        idlePayload,
+        digestNormalized(idlePayload),
+        "2026-01-01T00:00:00.000Z",
+        "2026-01-01T00:00:00.000Z"
+      );
+      const input = { ...event(instance, attempt, outcome, `${kind}-event`), kind };
+      const write = reducePipelineEvent({ manifest, instance, attempt, stages, event: input });
+
+      expect(write).toMatchObject({
+        terminalOutcome: terminal,
+        resumeStatus: terminal,
+        nextStatus: "completion_pending_publication",
+      });
+      expect(write.effects.map((effect) => effect.kind)).toEqual(["publish_linear", "stop"]);
+      expect(write.effects.find((effect) => effect.kind === "cleanup")).toBeUndefined();
+      expect(write.effects.find((effect) => effect.kind === "publish_linear")?.payload)
+        .toBe(JSON.stringify({ publication: "deferred_to_coordinator" }));
+
+      coordinatePipelineEvent(pipelines, input);
+
+      const effects = pipelines.listEffects(instance.id);
+      expect(effects.filter((effect) => effect.kind === "publish_linear")).toHaveLength(1);
+      expect(effects.filter((effect) => effect.kind === "publish_github")).toHaveLength(1);
+      expect(effects.filter((effect) => effect.kind === "stop")).toHaveLength(1);
+      expect(effects.find((effect) => effect.id === `idle-before-${kind}`)).toMatchObject({
+        status: "dead",
+        last_error: "canceled by a terminal pipeline control event",
+      });
+      expect(effects.find((effect) => effect.kind === "cleanup")).toBeUndefined();
+      expect(effects.find((effect) => effect.kind === "publish_linear")?.payload)
+        .toContain("\"schema\":\"openthrottle.pipeline-publication/v1\"");
+    }
   });
 
   it("contains no CE-specific coordinator branch", () => {

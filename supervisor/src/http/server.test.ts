@@ -5,9 +5,10 @@ import type { Config } from "../app/config.js";
 import { createSupervisorStore, type SupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
+import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 import type { PipelineStore } from "../pipeline/store.js";
 import { loadPipelineCatalog, parseRepositoryConfig } from "../pipeline/manifest.js";
-import { buildInstalledRuntimeDescriptor, type RuntimeInventory, type RuntimeLogs, type RuntimeSnapshotReadiness } from "../runtime/contracts.js";
+import { buildInstalledRuntimeDescriptor, type RuntimeInventory, type RuntimeLogs, type RuntimeSnapshotReadiness } from "../__fixtures__/runtime.js";
 import { createServer, createServerWebhookDeliveryProcessor } from "./server.js";
 
 const cfg: Config = {
@@ -144,6 +145,38 @@ describe("coordinator-only server", () => {
     });
   });
 
+  it("serves the orchestration journal through an explicit read path", async () => {
+    seedPipelineTicket();
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    pipelines.recordJournalEntry({
+      id: "journal-test-row",
+      issueId: "issue-1",
+      instanceId: instance.id,
+      actor: "supervisor",
+      kind: "terminal_observed",
+      trigger: "test",
+      action: "Observed a terminal outcome.",
+      outcome: "no_change",
+      refs: { stage: "command" },
+    });
+
+    const response = await app().request("/tickets/OT-1/journal", {
+      headers: { Authorization: "Bearer status-token" },
+    });
+
+    expect(response.status).toBe(200);
+    const body = await response.json() as {
+      journal: Array<{ id: string; issue: string; repository: string; kind: string }>;
+    };
+    const row = body.journal.find((entry) => entry.kind === "terminal_observed");
+    expect(row?.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(row).toMatchObject({
+      issue: "OT-1",
+      repository: "owner/repo",
+      kind: "terminal_observed",
+    });
+  });
+
   it("includes repeated sandbox ingestion failures in pipeline status", async () => {
     seedPipelineTicket();
     // Diagnostics are instance-scoped through the run/attempt binding, so the
@@ -231,6 +264,190 @@ describe("coordinator-only server", () => {
     });
   });
 
+  it("exposes deep pipeline status fields for active repair and provider wait", async () => {
+    seedPipelineTicket();
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    db.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET attempt_ordinal = 2, reentry_ordinal = 1
+      WHERE id = ?
+    `).run(attempt.id);
+    db.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'running', active_stage_id = 'command', wait_reason = NULL,
+          updated_at = '2026-07-26T00:10:00.000Z'
+      WHERE id = ?
+    `).run(instance.id);
+    db.prepare(`
+      INSERT INTO pipeline_effect_intents (
+        id, pipeline_instance_id, transition_version, kind, idempotency_key,
+        payload, payload_hash, status, attempts, next_attempt_at, created_at, last_error
+      ) VALUES (
+        'failed-dispatch', ?, 2, 'dispatch_stage', 'failed-dispatch',
+        '{}', '44136fa355b3678a1146ad16f7e8649e94fb4f35495fb8a8e07a41149dc82ca4',
+        'failed', 3, '2026-07-26T00:00:00.000Z', '2026-07-26T00:00:00.000Z',
+        'sandbox failed with Bearer ghp_secretvalue'
+      )
+    `).run(instance.id);
+    const unitStore = pipelines as PipelineStore & ExecutionUnitStore;
+    unitStore.createGraph({
+      pipelineInstanceId: instance.id,
+      parentAttemptId: attempt.id,
+      parentStageId: "units",
+      parentRunId: "run-old",
+      graphDigest: "graph-old",
+      planDigest: "plan-old",
+      units: [{ id: "old-unit" }],
+    });
+    db.prepare(`
+      INSERT INTO pipeline_instance_stages (
+        pipeline_instance_id, stage_id, ordinal, status, attempt_count,
+        created_at, updated_at
+      ) VALUES (?, 'units', 99, 'passed', 1, '2026-07-26T00:00:00.000Z', '2026-07-26T00:00:00.000Z')
+      ON CONFLICT(pipeline_instance_id, stage_id) DO NOTHING
+    `).run(instance.id);
+    db.prepare(`
+      INSERT INTO pipeline_stage_attempts (
+        id, pipeline_instance_id, stage_id, attempt_ordinal, reentry_ordinal,
+        request_hash, idempotency_key, context_revision, native_context_policy,
+        planned_run_id, status, created_at, updated_at
+      ) VALUES (
+        'attempt-latest-units', ?, 'units', 1, 0, ?, 'attempt-latest-units',
+        0, 'fresh', NULL, 'completed',
+        '2026-07-26T00:12:00.000Z', '2026-07-26T00:12:00.000Z'
+      )
+    `).run(instance.id, "f".repeat(64));
+    unitStore.createGraph({
+      pipelineInstanceId: instance.id,
+      parentAttemptId: "attempt-latest-units",
+      parentStageId: "units",
+      parentRunId: "run-latest",
+      graphDigest: "graph-latest",
+      planDigest: "plan-latest",
+      units: [{ id: "latest-unit" }],
+    });
+
+    const repairResponse = await app().request("/status", {
+      headers: { Authorization: "Bearer status-token" },
+    });
+    expect(repairResponse.status).toBe(200);
+    const repairBody = await repairResponse.json() as {
+      tickets: Array<{ pipeline: Record<string, unknown> | null }>;
+    };
+    expect(repairBody.tickets[0]?.pipeline).toMatchObject({
+      pipeline_id: "fixture/command",
+      pipeline_version: 1,
+      generation: 1,
+      status: "running",
+      terminal_outcome: null,
+      stage_id: "command",
+      attempt_ordinal: 2,
+      reentry_ordinal: 1,
+      wait_reason: null,
+      whose_move: "working",
+      last_error: "sandbox failed with [REDACTED]",
+      last_state_change_at: "2026-07-26T00:10:00.000Z",
+      structured_units: [expect.objectContaining({ unit_id: "latest-unit" })],
+    });
+    expect(JSON.stringify(repairBody.tickets[0]?.pipeline)).not.toContain("old-unit");
+
+    db.prepare(`
+      INSERT INTO pipeline_gate_receipts (
+        id, pipeline_instance_id, attempt_id, evaluator_kind, policy_digest,
+        subject, result, artifact_hashes, receipt_hash, payload, created_at
+      ) VALUES (
+        'failed-gate', ?, ?, 'semantic',
+        'a000000000000000000000000000000000000000000000000000000000000000',
+        NULL, 'failed', '[]',
+        'b000000000000000000000000000000000000000000000000000000000000000',
+        '{"summary":"newer gate failure"}', '2026-07-26T00:11:00.000Z'
+      )
+    `).run(instance.id, attempt.id);
+    const gateResponse = await app().request("/status", {
+      headers: { Authorization: "Bearer status-token" },
+    });
+    const gateBody = await gateResponse.json() as {
+      tickets: Array<{ pipeline: Record<string, unknown> | null }>;
+    };
+    expect(gateBody.tickets[0]?.pipeline).toMatchObject({
+      last_error: "newer gate failure",
+    });
+
+    db.prepare(`
+      UPDATE pipeline_effect_intents
+      SET next_attempt_at = '2026-07-26T00:12:00.000Z',
+          last_error = 'newer effect failure'
+      WHERE id = 'failed-dispatch'
+    `).run();
+    const newerEffectResponse = await app().request("/status", {
+      headers: { Authorization: "Bearer status-token" },
+    });
+    const newerEffectBody = await newerEffectResponse.json() as {
+      tickets: Array<{ pipeline: Record<string, unknown> | null }>;
+    };
+    expect(newerEffectBody.tickets[0]?.pipeline).toMatchObject({
+      last_error: "newer effect failure",
+    });
+
+    db.prepare(`
+      INSERT INTO pipeline_instance_stages (
+        pipeline_instance_id, stage_id, ordinal, status, attempt_count, reentry_count, created_at, updated_at
+      ) VALUES (?, 'provider', 2, 'waiting', 1, 0, '2026-07-26T00:20:00.000Z', '2026-07-26T00:20:00.000Z')
+    `).run(instance.id);
+    db.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET stage_id = 'provider'
+      WHERE id = ?
+    `).run(attempt.id);
+    db.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'waiting_provider', active_stage_id = 'provider',
+          published_commit = ?, updated_at = '2026-07-26T00:20:00.000Z'
+      WHERE id = ?
+    `).run("c".repeat(40), instance.id);
+    // Production transitions never persist a pull_request receipt, so the
+    // ticket projection (populated by the pull-request webhook) must back
+    // published_pr_url on its own.
+    store.setPrUrl("issue-1", "https://github.com/owner/repo/pull/11");
+    const ticketFallbackResponse = await app().request("/status", {
+      headers: { Authorization: "Bearer status-token" },
+    });
+    expect(ticketFallbackResponse.status).toBe(200);
+    const ticketFallbackBody = await ticketFallbackResponse.json() as {
+      tickets: Array<{ pipeline: Record<string, unknown> | null }>;
+    };
+    expect(ticketFallbackBody.tickets[0]?.pipeline).toMatchObject({
+      published_pr_url: "https://github.com/owner/repo/pull/11",
+    });
+
+    db.prepare(`
+      INSERT INTO pipeline_publication_receipts (
+        id, pipeline_instance_id, kind, idempotency_key, payload, payload_hash,
+        status, external_url, attempts, next_attempt_at, created_at, updated_at
+      ) VALUES (
+        'published-pr', ?, 'pull_request', 'published-pr', '{}',
+        '44136fa355b3678a1146ad16f7e8649e94fb4f35495fb8a8e07a41149dc82ca4',
+        'acknowledged', 'https://github.com/owner/repo/pull/12', 1,
+        '2026-07-26T00:20:00.000Z', '2026-07-26T00:20:00.000Z',
+        '2026-07-26T00:20:00.000Z'
+      )
+    `).run(instance.id);
+
+    const providerResponse = await app().request("/status", {
+      headers: { Authorization: "Bearer status-token" },
+    });
+    expect(providerResponse.status).toBe(200);
+    const providerBody = await providerResponse.json() as {
+      tickets: Array<{ pipeline: Record<string, unknown> | null }>;
+    };
+    expect(providerBody.tickets[0]?.pipeline).toMatchObject({
+      status: "waiting_provider",
+      whose_move: "waiting on GitHub",
+      published_pr_url: "https://github.com/owner/repo/pull/12",
+    });
+  });
+
   it("does not fall back to direct stop or steering for an unpinned ticket", async () => {
     seedTicket();
     const stop = await app().request("/tickets/OT-1/stop", {
@@ -250,6 +467,43 @@ describe("coordinator-only server", () => {
     });
     expect(steer.status).toBe(409);
     expect(await steer.json()).toEqual({ error: "pipeline not found" });
+  });
+
+  it("captures operator steering during a non-steerable running stage", async () => {
+    seedPipelineTicket();
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    const request = pipelines.getStageRequest(attempt.id);
+    expect(store.beginRun({
+      issueId: "issue-1",
+      runId: request.runId,
+      taskType: "implement",
+      tokenHash: "token-hash",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    })).toBe(true);
+    pipelines.bindStageRun(attempt.id, request.runId);
+    pipelines.markStageDispatched(attempt.id);
+
+    const response = await app().request("/tickets/OT-1/steer", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer status-token",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ message: "carry this forward" }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      ok: true,
+      status: "captured",
+      message: "captured — retained for the next implementation or repair stage",
+    });
+    expect(db.prepare("SELECT run_id, source, body FROM session_inbox").get()).toEqual({
+      run_id: null,
+      source: "operator",
+      body: "carry this forward",
+    });
   });
 
   it("distinguishes an accepted stop request from confirmed durable settlement", async () => {

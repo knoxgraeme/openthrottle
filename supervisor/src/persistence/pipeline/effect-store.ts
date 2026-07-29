@@ -1,10 +1,11 @@
 import type Database from "better-sqlite3";
 import { canonicalJson, digestNormalized } from "../../pipeline/manifest.js";
 import type { PipelineEffectIntent, PipelineInstance, PipelineStore } from "../../pipeline/store.js";
+import { claimLeasable, markQueueFailed } from "./helpers.js";
 
 export function createEffectStore(db: Database.Database, now: () => string): Pick<
   PipelineStore,
-  "claimEffects" | "recordEffectAcknowledgement" | "markEffectFailed" | "markStopEffectExhausted"
+  "getEffect" | "claimEffects" | "recordEffectAcknowledgement" | "markEffectFailed" | "markStopEffectExhausted"
 > {
   const claimEffects = db.transaction((
     nowIso: string,
@@ -28,20 +29,20 @@ export function createEffectStore(db: Database.Database, now: () => string): Pic
         )
       ORDER BY current.next_attempt_at, current.created_at, current.id LIMIT ?
     `).all(nowIso, nowIso, limit) as Array<{ id: string }>;
-    const claimed: PipelineEffectIntent[] = [];
-    for (const candidate of candidates) {
-      const updated = db.prepare(`
+    return claimLeasable({
+      rows: candidates,
+      nowIso,
+      leaseUntilIso,
+      update: (id, lease, nowValue) => db.prepare(`
         UPDATE pipeline_effect_intents
         SET status = 'processing', attempts = attempts + 1,
             next_attempt_at = ?, last_error = NULL
         WHERE id = ? AND ((status IN ('pending', 'failed') AND next_attempt_at <= ?)
           OR (status = 'processing' AND next_attempt_at <= ?))
-      `).run(leaseUntilIso, candidate.id, nowIso, nowIso);
-      if (updated.changes === 1) {
-        claimed.push(db.prepare("SELECT * FROM pipeline_effect_intents WHERE id = ?").get(candidate.id) as PipelineEffectIntent);
-      }
-    }
-    return claimed;
+      `).run(lease, id, nowValue, nowValue).changes,
+      get: (id) => db.prepare("SELECT * FROM pipeline_effect_intents WHERE id = ?")
+        .get(id) as PipelineEffectIntent,
+    });
   });
 
   const recordEffectAcknowledgement = db.transaction((input: {
@@ -124,16 +125,26 @@ export function createEffectStore(db: Database.Database, now: () => string): Pic
   });
 
   return {
+    getEffect(id) {
+      return db.prepare("SELECT * FROM pipeline_effect_intents WHERE id = ?")
+        .get(id) as PipelineEffectIntent | undefined;
+    },
     claimEffects,
     recordEffectAcknowledgement,
     markStopEffectExhausted,
     markEffectFailed(effectId, error, retryAt) {
-      const update = db.prepare(`
+      const timestamp = now();
+      const status = markQueueFailed({
+        error,
+        retryAt,
+        timestamp,
+        update: (statusValue, nextAttemptAt, errorValue) => db.prepare(`
         UPDATE pipeline_effect_intents
-        SET status = ?, next_attempt_at = COALESCE(?, next_attempt_at), last_error = ?
+        SET status = ?, next_attempt_at = COALESCE(?, ?), last_error = ?
         WHERE id = ? AND status = 'processing'
-      `).run(retryAt ? "failed" : "dead", retryAt, error, effectId);
-      if (update.changes !== 1) throw new Error(`pipeline effect ${effectId} is not processing`);
+      `).run(statusValue, nextAttemptAt, timestamp, errorValue, effectId).changes,
+      });
+      if (!status) throw new Error(`pipeline effect ${effectId} is not processing`);
     },
   };
 }

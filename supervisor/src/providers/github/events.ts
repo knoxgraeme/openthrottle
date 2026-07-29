@@ -4,164 +4,29 @@
 import type { Config } from "../../app/config.js";
 import type { SupervisorStore } from "../../persistence/store.js";
 import {
+  getFailingGithubCheckDetails,
   OPENTHROTTLE_COMMENT_MARKER_PREFIX,
   isOpenthrottleBranch,
   type GithubWebhookEvent,
 } from "./client.js";
 import type { ActivityPublicationPort } from "../../app/ports.js";
-import { sanitizeText } from "../../shared/sanitize.js";
-import type { FeedbackSnapshot, FeedbackSnapshotEvent } from "../../persistence/feedback-store.js";
-import type { PipelineInstance, PipelineStore } from "../../pipeline/store.js";
+import type { PipelineStore } from "../../pipeline/store.js";
 import { processProviderEvidence } from "../../pipeline/gates.js";
-import { canonicalJson, type PipelineManifest } from "../../pipeline/manifest.js";
 import { requestPipelineStop } from "../../pipeline/control.js";
+import {
+  pipelineIsTerminal,
+  processPipelineFeedbackSnapshot,
+  providerStageCanReceive,
+  recordPipelineProviderEvent,
+  type PipelineProviderOutcome,
+} from "../../app/provider-feedback.js";
+import { sanitizeText } from "../../shared/sanitize.js";
 
-const UNBOUNDED_SNAPSHOT_CLAIM = Number.MAX_SAFE_INTEGER;
-const TERMINAL_PIPELINE_STATUSES = new Set([
-  "shipped",
-  "no_change",
-  "needs_human",
-  "canceled",
-  "superseded",
-  "failed",
-]);
-const PROVIDER_OUTCOME_PRIORITY: readonly PipelineProviderOutcome[] = [
-  "success",
-  "no_change",
-  "failure",
-  "needs_human",
-  "semantic_repair_required",
-];
-
-type PipelineProviderOutcome =
-  | "success"
-  | "no_change"
-  | "semantic_repair_required"
-  | "needs_human"
-  | "failure";
-
-interface StoredPipelineProviderEvent {
-  outcome: PipelineProviderOutcome;
+type ProviderFinding = {
+  severity: "P0" | "P1" | "P2" | "P3";
+  code: string;
   summary: string;
-  evidence: string[];
-  payload: string;
-}
-
-function providerStageCanReceive(pipelines: PipelineStore, instance: PipelineInstance): boolean {
-  if (!["completion_pending_publication", "publication_blocked", "waiting_provider"].includes(instance.status)) {
-    return false;
-  }
-  const manifest = JSON.parse(instance.normalized_manifest) as PipelineManifest;
-  const activeStage = manifest.stages.find((stage) => stage.id === instance.active_stage_id);
-  const activeAttempt = pipelines.getActiveAttempt(instance.id);
-  return activeStage?.executor.kind === "provider_wait" && activeAttempt?.stage_id === activeStage.id;
-}
-
-function pipelineIsTerminal(instance: PipelineInstance): boolean {
-  return instance.terminal_outcome != null || TERMINAL_PIPELINE_STATUSES.has(instance.status);
-}
-
-function pullNumber(ticket: NonNullable<ReturnType<SupervisorStore["getByIssueId"]>>, url?: string): number {
-  return Number((url ?? ticket.pr_url)?.match(/\/pull\/(\d+)$/)?.[1] ?? 0);
-}
-
-function recordPipelineProviderEvent(params: {
-  store: SupervisorStore;
-  instance: PipelineInstance;
-  ticket: NonNullable<ReturnType<SupervisorStore["getByIssueId"]>>;
-  eventId: string;
-  outcome: PipelineProviderOutcome;
-  summary: string;
-  evidence: string[];
-  payload: Record<string, unknown>;
-  headSha: string;
-  pullRequestUrl?: string;
-}): FeedbackSnapshot {
-  const stored = canonicalJson({
-    outcome: params.outcome,
-    summary: sanitizeText(params.summary).slice(0, 2_000),
-    evidence: params.evidence.slice(0, 20).map((item) => sanitizeText(item).slice(0, 1_000)),
-    payload: sanitizeText(canonicalJson(params.payload)).slice(0, 8_000),
-  } satisfies StoredPipelineProviderEvent);
-  return params.store.recordProviderFeedback({
-    provider: "github",
-    providerEventId: params.eventId,
-    issueId: params.instance.linear_issue_id,
-    sessionId: params.instance.linear_session_id,
-    generation: params.instance.generation,
-    repository: params.instance.repository,
-    pullNumber: pullNumber(params.ticket, params.pullRequestUrl),
-    headSha: params.headSha,
-    kind: "pipeline_provider_event",
-    payload: stored,
-    workItemId: `pipeline-feedback:${params.instance.id}:${params.headSha}`,
-  }).snapshot;
-}
-
-function parseStoredPipelineEvent(event: FeedbackSnapshotEvent): StoredPipelineProviderEvent {
-  const parsed = JSON.parse(event.payload) as StoredPipelineProviderEvent;
-  if (!["success", "no_change", "semantic_repair_required", "needs_human", "failure"].includes(parsed.outcome) ||
-      typeof parsed.summary !== "string" || !Array.isArray(parsed.evidence) ||
-      parsed.evidence.some((item) => typeof item !== "string") || typeof parsed.payload !== "string") {
-    throw new Error(`pipeline provider event ${event.provider}:${event.provider_event_id} is malformed`);
-  }
-  return parsed;
-}
-
-function processPipelineFeedbackSnapshot(params: {
-  pipelines: PipelineStore;
-  store: SupervisorStore;
-  instance: PipelineInstance;
-  snapshot: FeedbackSnapshot;
-}): boolean {
-  const claim = params.store.claimFeedbackSnapshot(params.snapshot.id, UNBOUNDED_SNAPSHOT_CLAIM);
-  if (claim.status !== "claimed") return false;
-  const events = claim.events.map((event) => ({ event, parsed: parseStoredPipelineEvent(event) }));
-  const revisionMatches = params.instance.published_commit !== null &&
-    claim.snapshot.head_sha === params.instance.published_commit;
-  const outcomes = new Set(events.map(({ parsed }) => parsed.outcome));
-  const outcome: PipelineProviderOutcome = revisionMatches
-    ? PROVIDER_OUTCOME_PRIORITY.find((candidate) => outcomes.has(candidate))!
-    : "needs_human";
-  processProviderEvidence(params.pipelines, {
-    id: `github-feedback-snapshot:${claim.snapshot.id}`,
-    instanceId: params.instance.id,
-    outcome,
-    summary: revisionMatches
-      ? `Immutable GitHub provider snapshot contains ${events.length} event(s) for the published commit.`
-      : "GitHub's current pull-request head does not match the executor-verified published commit.",
-    evidence: events.flatMap(({ parsed }) => parsed.evidence).slice(0, 50),
-    providerPayload: {
-      snapshot_id: claim.snapshot.id,
-      repair_round: claim.snapshot.repair_round,
-      expected_published_commit: params.instance.published_commit,
-      observed_head_sha: claim.snapshot.head_sha,
-      events: events.map(({ event, parsed }) => ({
-        provider: event.provider,
-        provider_event_id: event.provider_event_id,
-        summary: parsed.summary,
-        payload: parsed.payload,
-      })),
-    },
-  });
-  params.store.consumeFeedbackSnapshot(claim.snapshot.id);
-  return true;
-}
-
-export function drainPipelineFeedbackSnapshots(
-  pipelines: PipelineStore,
-  store: SupervisorStore,
-  limit = 50
-): number {
-  let processed = 0;
-  for (const instance of pipelines.listProviderReadyInstances(limit)) {
-    if (!providerStageCanReceive(pipelines, instance)) continue;
-    const [snapshot] = store.listPendingFeedbackSnapshots(instance.linear_session_id, 1);
-    if (!snapshot) continue;
-    if (processPipelineFeedbackSnapshot({ pipelines, store, instance, snapshot })) processed += 1;
-  }
-  return processed;
-}
+};
 
 export function routePipelineProviderEvent(params: {
   pipelines: PipelineStore;
@@ -171,6 +36,7 @@ export function routePipelineProviderEvent(params: {
   outcome: PipelineProviderOutcome;
   summary: string;
   evidence: string[];
+  findings?: ProviderFinding[];
   payload: Record<string, unknown>;
   headSha: string | undefined;
   pullRequestUrl?: string;
@@ -182,9 +48,36 @@ export function routePipelineProviderEvent(params: {
   }
   if (pipelineIsTerminal(instance)) return true;
   const authoritativeHead = params.store.getSetting(`github-head:${params.ticket.linear_issue_id}`);
-  if (params.headSha === undefined || params.headSha !== authoritativeHead) return true;
+  if (params.headSha === undefined) return true;
   const canReceive = providerStageCanReceive(params.pipelines, instance);
   const revisionMatches = instance.published_commit !== null && params.headSha === instance.published_commit;
+  if (params.outcome === "semantic_repair_required" || !canReceive) {
+    const snapshot = recordPipelineProviderEvent({
+      store: params.store,
+      instance,
+      ticket: params.ticket,
+      provider: "github",
+      eventId: params.eventId,
+      outcome: params.outcome,
+      summary: params.summary,
+      evidence: params.evidence,
+      findings: params.findings,
+      payload: params.payload,
+      headSha: params.headSha,
+      pullRequestUrl: params.pullRequestUrl,
+    });
+    if (canReceive) {
+      processPipelineFeedbackSnapshot({
+        pipelines: params.pipelines,
+        store: params.store,
+        instance,
+        snapshot,
+        drainSource: "github-webhook",
+      });
+    }
+    return true;
+  }
+  if (params.headSha !== authoritativeHead) return true;
   if (canReceive && !revisionMatches) {
     processProviderEvidence(params.pipelines, {
       id: params.eventId,
@@ -192,6 +85,7 @@ export function routePipelineProviderEvent(params: {
       outcome: "needs_human",
       summary: "GitHub's current pull-request head does not match the executor-verified published commit.",
       evidence: params.evidence,
+      findings: params.findings,
       providerPayload: {
         ...params.payload,
         expected_published_commit: instance.published_commit,
@@ -204,24 +98,6 @@ export function routePipelineProviderEvent(params: {
   // expected and carries no gate decision. Only drift from that revision (the
   // branch above) is a human-required safety event.
   if (params.outcome === "needs_human") return true;
-  if (params.outcome === "semantic_repair_required" || !canReceive) {
-    const snapshot = recordPipelineProviderEvent({
-      store: params.store,
-      instance,
-      ticket: params.ticket,
-      eventId: params.eventId,
-      outcome: params.outcome,
-      summary: params.summary,
-      evidence: params.evidence,
-      payload: params.payload,
-      headSha: params.headSha,
-      pullRequestUrl: params.pullRequestUrl,
-    });
-    if (canReceive) {
-      processPipelineFeedbackSnapshot({ pipelines: params.pipelines, store: params.store, instance, snapshot });
-    }
-    return true;
-  }
   if (canReceive) {
     processProviderEvidence(params.pipelines, {
       id: params.eventId,
@@ -229,6 +105,7 @@ export function routePipelineProviderEvent(params: {
       outcome: params.outcome,
       summary: params.summary,
       evidence: params.evidence,
+      findings: params.findings,
       providerPayload: {
         ...params.payload,
         expected_published_commit: instance.published_commit,
@@ -242,6 +119,15 @@ export function routePipelineProviderEvent(params: {
 function setAuthoritativeGithubHead(store: SupervisorStore, issueId: string, headSha: string): void {
   store.setSetting(`github-head:${issueId}`, headSha);
   store.setSetting(`github-head-source:${issueId}`, "authoritative");
+}
+
+function githubPullEventId(
+  action: "closed" | "closed-stop" | "synchronize",
+  repository: string,
+  pullNumber: number,
+  headSha: string
+): string {
+  return `github-pull-${action}:${repository}:${pullNumber}:${headSha}`;
 }
 
 export function considerCiGithubHead(
@@ -287,6 +173,91 @@ function looksLikeSupervisorSummary(body: string | undefined): boolean {
   return body?.startsWith(SUMMARY_MARKER_PREFIX) === true;
 }
 
+// Known Linear↔GitHub bridge identities whose PR comments are linkage
+// artifacts, never human repair requests.
+const LINEAR_BRIDGE_BOT_LOGINS = new Set(["linear-code[bot]", "linear[bot]"]);
+
+// Unambiguous machine linkback marker for bridge deployments that comment
+// under a different app identity. Comment bodies are untrusted data, so the
+// filter accepts only this exact self-identifying prefix — never keyword
+// heuristics, which would silently drop substantive automated review feedback
+// (e.g. an app comment that merely says "linear issue" in prose) before it is
+// recorded as provider evidence.
+const LINEAR_LINKBACK_MARKER = "<!-- linear-linkback -->";
+
+function isGithubBotLinkback(author: string, body: string | undefined): boolean {
+  const normalizedAuthor = author.toLowerCase();
+  if (LINEAR_BRIDGE_BOT_LOGINS.has(normalizedAuthor)) return true;
+  if (!normalizedAuthor.endsWith("[bot]")) return false;
+  return (body ?? "").startsWith(LINEAR_LINKBACK_MARKER);
+}
+
+function boundedSanitized(value: string, maxChars: number): string {
+  return sanitizeText(value).slice(0, maxChars);
+}
+
+async function enrichCiFailure(input: {
+  cfg: Config;
+  repository: string;
+  headSha: string;
+  workflowRunId?: number;
+  workflowName: string;
+}): Promise<{
+  failures: Array<{
+    workflow_name: string;
+    job_name: string;
+    step_names: string[];
+    log_tail: string | null;
+    html_url: string | null;
+  }>;
+  findings: ProviderFinding[];
+  note: string | null;
+}> {
+  try {
+    const details = await getFailingGithubCheckDetails(
+      { token: input.cfg.githubReadToken },
+      input.repository,
+      {
+        headSha: input.headSha,
+        workflowRunId: input.workflowRunId,
+        workflowName: input.workflowName,
+      }
+    );
+    const failures = details.map((detail) => {
+      const stepNames = detail.stepNames.map((name) => boundedSanitized(name, 200));
+      return {
+        workflow_name: boundedSanitized(detail.workflowName, 200),
+        job_name: boundedSanitized(detail.jobName, 200),
+        step_names: stepNames,
+        log_tail: detail.logTail === null ? null : sanitizeText(detail.logTail).slice(-2_000),
+        html_url: detail.htmlUrl === null ? null : boundedSanitized(detail.htmlUrl, 1_000),
+      };
+    }).slice(0, 3);
+    return {
+      failures,
+      findings: failures.map((failure) => {
+        const step = failure.step_names.length > 0 ? failure.step_names.join(", ") : "unknown failing step";
+        return {
+          severity: "P1",
+          code: "ci-check-failed",
+          summary: `${failure.workflow_name} / ${failure.job_name} failed at ${step}.`,
+        };
+      }),
+      note: null,
+    };
+  } catch (error) {
+    // Enrichment stays non-fatal, but its absence must be legible: a 403 here
+    // almost always means GITHUB_READ_TOKEN lacks the Actions read permission
+    // that the jobs/job-log endpoints require on fine-grained PATs.
+    const message = error instanceof Error ? error.message : String(error);
+    const note = message.includes("(403)")
+      ? "CI failure details are unavailable: GitHub returned 403 for the Actions jobs/logs lookup. " +
+        "Grant the fine-grained GITHUB_READ_TOKEN Actions read permission to restore failing-job and log-tail enrichment."
+      : `CI failure details are unavailable: ${boundedSanitized(message, 300)}`;
+    return { failures: [], findings: [], note };
+  }
+}
+
 export async function handleGithubEvent(
   // Retained for signature stability at the composition/HTTP call sites; the
   // solo-mode feedback filter no longer needs a token-account lookup.
@@ -315,7 +286,12 @@ export async function handleGithubEvent(
         pipelines,
         store,
         ticket,
-        eventId: `github-pull-synchronize:${event.pull_request.number}:${event.pull_request.head.sha}`,
+        eventId: githubPullEventId(
+          "synchronize",
+          event.repository.full_name,
+          event.pull_request.number,
+          event.pull_request.head.sha
+        ),
         outcome: "needs_human",
         summary: "The pull-request head changed after the pipeline entered provider wait.",
         evidence: [event.pull_request.html_url],
@@ -325,8 +301,12 @@ export async function handleGithubEvent(
       });
     }
     if (event.action === "closed") {
-      const providerEventId =
-        `github-pull-closed:${event.pull_request.number}:${event.pull_request.head.sha ?? "unknown"}`;
+      const providerEventId = githubPullEventId(
+        "closed",
+        event.repository.full_name,
+        event.pull_request.number,
+        event.pull_request.head.sha ?? "unknown"
+      );
       if (event.pull_request.head.sha) {
         setAuthoritativeGithubHead(store, ticket.linear_issue_id, event.pull_request.head.sha);
       }
@@ -352,11 +332,34 @@ export async function handleGithubEvent(
         requestPipelineStop({
           store: pipelines,
           sessionId: ticket.linear_session_id,
-          eventId: `github-pull-closed-stop:${event.pull_request.number}:${event.pull_request.head.sha ?? "unknown"}`,
+          eventId: githubPullEventId(
+            "closed-stop",
+            event.repository.full_name,
+            event.pull_request.number,
+            event.pull_request.head.sha ?? "unknown"
+          ),
           reason: event.pull_request.merged
             ? "Pull request merged while a pipeline stage was active."
             : "Pull request closed while a pipeline stage was active.",
           ticketState: "closed",
+        });
+      }
+      if (event.pull_request.merged) {
+        const observed = currentPipeline ?? pipelineInstance;
+        pipelines.recordJournalEntry({
+          id: `journal-github-merged-${observed.repository}-${event.pull_request.number}-${event.pull_request.head.sha ?? "unknown"}`,
+          issueId: ticket.linear_issue_id,
+          instanceId: observed.id,
+          actor: "supervisor",
+          kind: "merged",
+          trigger: "GitHub pull_request closed webhook",
+          action: "Observed the pull request merged.",
+          outcome: "merged",
+          refs: {
+            pr: event.pull_request.html_url,
+            commit: event.pull_request.head.sha ?? null,
+            pull_number: event.pull_request.number,
+          },
         });
       }
       // GitHub close is authoritative even when a stage already settled and
@@ -380,7 +383,6 @@ export async function handleGithubEvent(
     }, ticket.linear_issue_id);
     const reviewState = event.review.state.toLowerCase();
     if (reviewState !== "changes_requested" && reviewState !== "commented") return;
-    if (ticket.state !== "active") return;
     const author = event.review.user?.login;
     // A review without an attested author cannot be trusted feedback. The
     // supervisor never authors pull-request reviews, so no machine-output
@@ -415,7 +417,7 @@ export async function handleGithubEvent(
       event.repository.full_name,
       `https://github.com/${event.repository.full_name}/pull/${event.issue.number}`
     );
-    if (!ticket || ticket.state !== "active") return;
+    if (!ticket) return;
     const author = event.comment.user?.login;
     if (!author) return;
     // Provenance first: comment IDs the supervisor's summary upsert persisted
@@ -423,6 +425,7 @@ export async function handleGithubEvent(
     // where this webhook races the receipt acknowledgement.
     if (pipelines.isSupervisorGithubComment(String(event.comment.id))) return;
     if (looksLikeSupervisorSummary(event.comment.body)) return;
+    if (isGithubBotLinkback(author, event.comment.body)) return;
     await activityPublisher.publishActivity({
       sessionId: ticket.linear_session_id,
       type: "action",
@@ -458,6 +461,7 @@ export async function handleGithubEvent(
         sequence: event.workflow_run.id,
         eventId: `github-workflow:${event.workflow_run.id}`,
         name: event.workflow_run.name,
+        workflowRunId: event.workflow_run.id,
       }
     : {
         branch: event.check_suite.head_branch,
@@ -467,6 +471,7 @@ export async function handleGithubEvent(
         sequence: event.check_suite.id,
         eventId: `github-check-suite:${event.check_suite.id}`,
         name: "GitHub check suite",
+        workflowRunId: undefined,
       };
   if (!isOpenthrottleBranch(ci.branch) || event.action !== "completed") return;
   const ticket = store.getByBranch(event.repository.full_name, ci.branch);
@@ -493,15 +498,38 @@ export async function handleGithubEvent(
   // out of the deterministic coordinator.
   if (!pipelines.getInstanceForSession(ticket.linear_session_id)) return;
   if (ci.conclusion === "failure" || ci.conclusion === "timed_out") {
+    const enrichment = await enrichCiFailure({
+      cfg: _cfg,
+      repository: event.repository.full_name,
+      headSha: ci.headSha,
+      workflowRunId: ci.workflowRunId,
+      workflowName: ci.name,
+    });
     routePipelineProviderEvent({
       pipelines,
       store,
       ticket,
       eventId: ci.eventId,
       outcome: "semantic_repair_required",
-      summary: `${ci.name} concluded ${ci.conclusion}.`,
-      evidence: [ci.url],
-      payload: { kind: event.kind, conclusion: ci.conclusion, head_sha: ci.headSha, url: ci.url },
+      summary: enrichment.note === null
+        ? `${ci.name} concluded ${ci.conclusion}.`
+        : `${ci.name} concluded ${ci.conclusion}. ${enrichment.note}`,
+      evidence: [
+        ci.url,
+        ...enrichment.failures
+          .map((failure) => failure.html_url)
+          .filter((url): url is string => typeof url === "string" && url.length > 0),
+      ],
+      findings: enrichment.findings,
+      payload: {
+        kind: event.kind,
+        conclusion: ci.conclusion,
+        head_sha: ci.headSha,
+        url: ci.url,
+        failures: enrichment.failures,
+        findings: enrichment.findings,
+        ...(enrichment.note === null ? {} : { enrichment_note: enrichment.note }),
+      },
       headSha: ci.headSha,
     });
   }

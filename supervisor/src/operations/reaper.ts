@@ -17,9 +17,69 @@ import type { Config } from "../app/config.js";
 import type { ActivityPublicationPort } from "../app/ports.js";
 import type { SupervisorStore } from "../persistence/store.js";
 import { terminateAndSettleActor } from "./actor-settlement.js";
-import type { PipelineStore } from "../pipeline/store.js";
+import type { PipelineInstanceStatus, PipelineStageAttempt, PipelineStore } from "../pipeline/store.js";
 import { processPipelineInfrastructureFailure } from "../pipeline/control.js";
+import { PIPELINE_OUTCOMES } from "../pipeline/manifest.js";
 import type { RuntimeStopper } from "../runtime/contracts.js";
+import { sanitizeText } from "../shared/sanitize.js";
+
+const TERMINAL_PIPELINE_STATUSES = new Set<PipelineInstanceStatus>(PIPELINE_OUTCOMES);
+const ACTIVE_ATTEMPT_STATUSES = new Set<PipelineStageAttempt["status"]>([
+  "pending",
+  "leased",
+  "dispatched",
+  "acknowledged",
+  "running",
+]);
+
+function pipelineRemainsHealthyAfterRunReap(params: {
+  pipeline: ReturnType<PipelineStore["getInstance"]> | undefined;
+  pipelineAttempt: ReturnType<PipelineStore["getAttemptForRun"]> | undefined;
+}): boolean {
+  if (!params.pipeline || !params.pipelineAttempt) return false;
+  if (params.pipeline.terminal_outcome !== null || TERMINAL_PIPELINE_STATUSES.has(params.pipeline.status)) {
+    return false;
+  }
+  return !ACTIVE_ATTEMPT_STATUSES.has(params.pipelineAttempt.status);
+}
+
+function recordReapJournalEntry(params: {
+  pipelines: PipelineStore | undefined;
+  issueId: string;
+  runId: string;
+  pipeline: ReturnType<PipelineStore["getInstance"]> | undefined;
+  attempt: ReturnType<PipelineStore["getAttemptForRun"]> | undefined;
+  settlementKind: string;
+  trigger: string;
+  action: string;
+  outcome: string;
+  stallTimeoutSeconds?: number;
+}): void {
+  if (!params.pipelines?.recordJournalEntry || !params.pipeline) return;
+  const refs: Record<string, unknown> = {
+    stage: params.attempt?.stage_id ?? null,
+    attempt_id: params.attempt?.id ?? null,
+  };
+  if (params.stallTimeoutSeconds !== undefined) {
+    refs.stall_timeout_seconds = params.stallTimeoutSeconds;
+  }
+  try {
+    params.pipelines.recordJournalEntry({
+      id: `journal-stall-${params.runId}-${params.settlementKind}`,
+      issueId: params.issueId,
+      instanceId: params.pipeline.id,
+      runId: params.runId,
+      actor: "supervisor",
+      kind: "detected_stall",
+      trigger: params.trigger,
+      action: params.action,
+      outcome: params.outcome,
+      refs,
+    });
+  } catch (error) {
+    console.warn("[reaper] failed to record orchestration journal entry:", sanitizeText(String(error)));
+  }
+}
 
 export async function reapStalledRuns(params: {
   runtime: RuntimeStopper;
@@ -59,6 +119,7 @@ export async function reapStalledRuns(params: {
         const pipeline = pipelineAttempt
           ? params.pipelines?.getInstance(pipelineAttempt.pipeline_instance_id)
           : undefined;
+        const pipelineStillHealthy = pipelineRemainsHealthyAfterRunReap({ pipeline, pipelineAttempt });
         const settlement = await terminateAndSettleActor({
           runtime,
           store,
@@ -67,12 +128,25 @@ export async function reapStalledRuns(params: {
           owner,
           reason: message,
           status: "timed_out",
-          ticketState: "error",
+          ticketState: pipelineStillHealthy ? "active" : "error",
+          ticketFailureTail: pipelineStillHealthy ? null : message,
           onSettled: pipeline
             ? () => processPipelineInfrastructureFailure({ store: params.pipelines!, runId: run.id })
             : undefined,
         });
         if (settlement.kind === "quarantined") {
+          recordReapJournalEntry({
+            pipelines: params.pipelines,
+            issueId: run.linear_issue_id,
+            runId: run.id,
+            pipeline,
+            attempt: pipelineAttempt,
+            settlementKind: settlement.kind,
+            trigger: "Stalled-run reaper",
+            action: "Detected a stalled run and quarantined the actor after termination could not be confirmed.",
+            outcome: "quarantined",
+            stallTimeoutSeconds: cfg.stallTimeoutSeconds,
+          });
           if (pipeline && params.pipelines?.getRuntimeResource(pipeline.id)) {
             params.pipelines.setRuntimeResourceStatus(pipeline.id, "quarantined");
           }
@@ -81,7 +155,19 @@ export async function reapStalledRuns(params: {
             ticket.linear_issue_id,
             settlement.message
           );
-        } else if (settlement.kind === "settled") {
+        } else if (settlement.kind === "settled" && !pipelineStillHealthy) {
+          recordReapJournalEntry({
+            pipelines: params.pipelines,
+            issueId: run.linear_issue_id,
+            runId: run.id,
+            pipeline,
+            attempt: pipelineAttempt,
+            settlementKind: settlement.kind,
+            trigger: "Stalled-run reaper",
+            action: "Detected a stalled run and settled it as timed out.",
+            outcome: "timed_out",
+            stallTimeoutSeconds: cfg.stallTimeoutSeconds,
+          });
           await activityPublisher.publishError(
             run.linear_session_id ?? ticket.linear_session_id,
             ticket.linear_issue_id,
@@ -112,6 +198,10 @@ export async function reapExpiredRuns(params: {
     const pipeline = params.pipelines.getInstance(attempt.pipeline_instance_id);
     if (!pipeline) continue;
     const message = `OpenThrottle ${run.task_type} stage exceeded its hard execution timeout.`;
+    const pipelineStillHealthy = pipelineRemainsHealthyAfterRunReap({
+      pipeline,
+      pipelineAttempt: attempt,
+    });
     try {
       const settlement = await terminateAndSettleActor({
         runtime: params.runtime,
@@ -121,13 +211,25 @@ export async function reapExpiredRuns(params: {
         owner,
         reason: message,
         status: "timed_out",
-        ticketState: "error",
+        ticketState: pipelineStillHealthy ? "active" : "error",
+        ticketFailureTail: pipelineStillHealthy ? null : message,
         onSettled: () => processPipelineInfrastructureFailure({
           store: params.pipelines,
           runId: run.id,
         }),
       });
       if (settlement.kind === "quarantined") {
+        recordReapJournalEntry({
+          pipelines: params.pipelines,
+          issueId: run.linear_issue_id,
+          runId: run.id,
+          pipeline,
+          attempt,
+          settlementKind: settlement.kind,
+          trigger: "Expired-run reaper",
+          action: "Detected a timed-out run and quarantined the actor after termination could not be confirmed.",
+          outcome: "quarantined",
+        });
         if (params.pipelines.getRuntimeResource(pipeline.id)) {
           params.pipelines.setRuntimeResourceStatus(pipeline.id, "quarantined");
         }
@@ -136,7 +238,18 @@ export async function reapExpiredRuns(params: {
           ticket.linear_issue_id,
           settlement.message
         );
-      } else if (settlement.kind === "settled") {
+      } else if (settlement.kind === "settled" && !pipelineStillHealthy) {
+        recordReapJournalEntry({
+          pipelines: params.pipelines,
+          issueId: run.linear_issue_id,
+          runId: run.id,
+          pipeline,
+          attempt,
+          settlementKind: settlement.kind,
+          trigger: "Expired-run reaper",
+          action: "Detected a timed-out run and settled it.",
+          outcome: "timed_out",
+        });
         await params.activityPublisher.publishError(
           run.linear_session_id ?? ticket.linear_session_id,
           ticket.linear_issue_id,

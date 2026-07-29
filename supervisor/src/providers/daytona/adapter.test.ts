@@ -31,6 +31,7 @@ describe("Daytona stage execution", () => {
         }),
       },
       process: {
+        executeCommand: vi.fn(async () => ({ exitCode: 0, result: "{}" })),
         createSession: vi.fn(async () => undefined),
         executeSessionCommand: vi.fn(async () => ({ cmdId: "dispatch-opaque-1" })),
       },
@@ -110,7 +111,23 @@ describe("Daytona stage execution", () => {
     expect(sandbox.updateEnv).toHaveBeenLastCalledWith(expect.objectContaining({
       RUN_ID: "run-1",
       BASE_BRANCH: "release/2.0",
-    }));
+    }), { unset: ["OT_CHILD_ACTION_ID"] });
+
+    const childWithoutFence: Omit<StageRequestEnvelope, "requestHash" | "idempotencyKey"> = {
+      ...withoutFence,
+      stageId: "child-implementation",
+      attemptId: "attempt-child",
+      runId: "run-parent",
+      childActionId: "action-1",
+    };
+    const childRequest = { ...childWithoutFence, ...createStageRequestHash(childWithoutFence) };
+    await expect(runtime.dispatchStage(resource, childRequest)).resolves.toEqual({
+      providerDispatchId: "dispatch-opaque-1",
+    });
+    expect(sandbox.updateEnv).toHaveBeenLastCalledWith(expect.objectContaining({
+      RUN_ID: "run-parent",
+      OT_CHILD_ACTION_ID: "action-1",
+    }), { unset: [] });
     expect(sandbox.process.executeSessionCommand).toHaveBeenCalledWith(
       "stage-attempt-1",
       expect.objectContaining({
@@ -119,6 +136,61 @@ describe("Daytona stage execution", () => {
       expect.any(Number)
     );
     expect(JSON.stringify(updateEnv.mock.calls.at(-1))).not.toContain("secret-token");
+
+    const worktree = await runtime.createWorktree(resource, {
+      idempotencyKey: "worktree:attempt-child",
+      attemptId: "attempt-child",
+      baseCommit: "a".repeat(40),
+    });
+    expect(worktree).toEqual({ id: expect.stringMatching(/^[a-f0-9]{32}$/) });
+    expect(sandbox.process.executeCommand).toHaveBeenCalledWith(
+      expect.stringContaining("/opt/openthrottle/runner/worktrees.mjs create"),
+      "/home/agent/repo",
+      {},
+      120
+    );
+
+    const loopWithoutFence = {
+      protocol: "loop-action@1" as const,
+      actionId: "loop-1",
+      attemptId: "attempt-child",
+      graphId: "graph-1",
+      unitId: "unit-1",
+      role: "worker" as const,
+      loop: "implement" as const,
+      agent: "codex" as const,
+      skill: "ce-work",
+      worktree,
+      nativeSessionId: null,
+      contextPolicy: "prefer_resume" as const,
+      timeoutMs: 30_000,
+      transitionContext: "implement unit",
+      allowedMcpServers: ["github"],
+      credentialScopes: ["model.invoke", "repo.read", "repo.write"],
+      receiptSchema: "openthrottle.loop-receipt@1",
+      requestHash: "",
+      idempotencyKey: "",
+    };
+    const loopHash = digestNormalized(canonicalJson({
+      ...loopWithoutFence,
+      requestHash: undefined,
+      idempotencyKey: undefined,
+    }));
+    const loopRequest = {
+      ...loopWithoutFence,
+      requestHash: loopHash,
+      idempotencyKey: `loop:attempt-child:loop-1:${loopHash}`,
+    };
+    await expect(runtime.dispatchLoopAction(resource, loopRequest)).resolves.toEqual({
+      providerDispatchId: "dispatch-opaque-1",
+    });
+    expect(sandbox.process.executeSessionCommand).toHaveBeenCalledWith(
+      "loop-loop-1",
+      expect.objectContaining({
+        command: expect.stringContaining("/opt/openthrottle/runner/execute-loop.mjs"),
+      }),
+      30
+    );
 
     const artifactPayload = canonicalJson({ result: "success" });
     remoteFiles.set("/var/lib/openthrottle/stage-results/attempt-1.json", Buffer.from(JSON.stringify({
@@ -144,6 +216,30 @@ describe("Daytona stage execution", () => {
       requestHash: request.requestHash,
       outcome: "success",
     });
+    remoteFiles.set("/var/lib/openthrottle/loop-results/loop-1.json", Buffer.from(JSON.stringify({
+      version: 1,
+      kind: "loop_action_result",
+      action_id: "loop-1",
+      attempt_id: "attempt-child",
+      request_hash: loopRequest.requestHash,
+      outcome: "success",
+      native_session_id: "thread-1",
+      subject: "d".repeat(40),
+      receipt: "done",
+      created_at: "2026-07-22T00:00:00.000Z",
+    })));
+    await expect(runtime.collectLoopActionResult(resource, "loop-1")).resolves.toMatchObject({
+      actionId: "loop-1",
+      attemptId: "attempt-child",
+      outcome: "success",
+    });
+    await runtime.cleanupWorktree(resource, worktree);
+    expect(sandbox.process.executeCommand).toHaveBeenLastCalledWith(
+      expect.stringContaining("/opt/openthrottle/runner/worktrees.mjs remove"),
+      "/home/agent/repo",
+      {},
+      120
+    );
     await expect(runtime.renewLiveness(resource, "attempt-1")).resolves.toEqual({
       observedAt: expect.any(String),
     });
@@ -170,5 +266,61 @@ describe("Daytona stage execution", () => {
       ["repo.read"]
     )).rejects.toThrow(/forbidden sandbox variable/);
     expect(sandbox.updateEnv).not.toHaveBeenCalled();
+  });
+
+  it("passes bounded cleanup deadlines to Daytona stop, quarantine, and delete calls", async () => {
+    const sandbox = {
+      id: "provider-cleanup-bound",
+      state: "started",
+      labels: { openthrottle: "true" },
+      stop: vi.fn(async () => undefined),
+      delete: vi.fn(async () => undefined),
+      setLabels: vi.fn(async () => ({})),
+    } as unknown as Sandbox;
+    const runtime = createDaytonaSandboxRuntime({ get: vi.fn(async () => sandbox) } as never, {
+      snapshot: "snapshot-v1",
+      materializeCredentialEnv: vi.fn(async () => ({ env: {} })),
+    });
+    const resource = { providerResourceId: "provider-cleanup-bound" };
+
+    await expect(runtime.stop(resource, "test stop")).resolves.toEqual({ confirmed: true });
+    await expect(runtime.quarantine(resource, "test quarantine")).resolves.toBeUndefined();
+    await expect(runtime.cleanup(resource)).resolves.toBeUndefined();
+    await expect(runtime.stopResource("provider-cleanup-bound", "test reap")).resolves.toBeUndefined();
+    await expect(runtime.deleteResource("provider-cleanup-bound")).resolves.toBeUndefined();
+
+    expect(sandbox.stop).toHaveBeenNthCalledWith(1, 60, true);
+    expect(sandbox.stop).toHaveBeenNthCalledWith(2, 60, true);
+    expect(sandbox.stop).toHaveBeenNthCalledWith(3, 60, true);
+    expect(sandbox.delete).toHaveBeenNthCalledWith(1, 60, false);
+    expect(sandbox.delete).toHaveBeenNthCalledWith(2, 60, false);
+  });
+
+  it("treats not-found cleanup as already cleaned but propagates other cleanup errors", async () => {
+    const notFound = {
+      id: "provider-not-found",
+      state: "stopped",
+      delete: vi.fn(async () => {
+        throw new Error("not found");
+      }),
+    } as unknown as Sandbox;
+    const broken = {
+      id: "provider-delete-timeout",
+      state: "stopped",
+      delete: vi.fn(async () => {
+        throw new Error("delete timed out");
+      }),
+    } as unknown as Sandbox;
+    const runtime = createDaytonaSandboxRuntime({
+      get: vi.fn(async (id: string) => id === "provider-not-found" ? notFound : broken),
+    } as never, {
+      snapshot: "snapshot-v1",
+      materializeCredentialEnv: vi.fn(async () => ({ env: {} })),
+    });
+
+    await expect(runtime.cleanup({ providerResourceId: "provider-not-found" }))
+      .resolves.toBeUndefined();
+    await expect(runtime.cleanup({ providerResourceId: "provider-delete-timeout" }))
+      .rejects.toThrow(/delete timed out/);
   });
 });

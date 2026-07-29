@@ -8,16 +8,22 @@ import {
   buildLifecyclePublication,
   buildSelectionPublication,
   deterministicPublicationId,
+  issueStateSignalForPublication,
   parsePipelinePublication,
+  type PipelinePublicationEnvelope,
   pipelinePublicationOutboxPayload,
+  pipelineStatusOutboxPayload,
   publicationPayloadHash,
+  shouldPostLinearEventComment,
 } from "../../pipeline/publication.js";
 import type {
   PipelineInstance,
+  PipelineInstanceStatus,
   PipelinePublicationReceipt,
   PipelineStageAttempt,
   RepositoryConfigSnapshot,
 } from "../../pipeline/store.js";
+import type { ExecutionPublicationSnapshot } from "../../pipeline/execution-publication.js";
 
 export const SAFE_BRANCH = /^(?!.*\.\.)(?!\/)(?!.*\/$)[A-Za-z0-9._/-]{1,200}$/;
 
@@ -27,6 +33,184 @@ export function assertDigest(label: string, normalized: string, digest: string):
 
 export function deterministicId(prefix: string, input: unknown): string {
   return `${prefix}-${digestNormalized(canonicalJson(input)).slice(0, 32)}`;
+}
+
+export function claimLeasable<T>(input: {
+  rows: Array<{ id: string }>;
+  leaseUntilIso: string;
+  nowIso: string;
+  update: (id: string, leaseUntilIso: string, nowIso: string) => number;
+  get: (id: string) => T;
+}): T[] {
+  const claimed: T[] = [];
+  for (const row of input.rows) {
+    if (input.update(row.id, input.leaseUntilIso, input.nowIso) === 1) {
+      claimed.push(input.get(row.id));
+    }
+  }
+  return claimed;
+}
+
+export function markQueueFailed(input: {
+  update: (status: "failed" | "dead", nextAttemptAt: string | null, error: string) => number;
+  error: string;
+  retryAt: string | null;
+  timestamp: string;
+  deadNextAttemptAt?: string | null;
+}): "failed" | "dead" | undefined {
+  const status = input.retryAt ? "failed" : "dead";
+  let nextAttemptAt: string | null = input.timestamp;
+  if (input.retryAt) {
+    nextAttemptAt = input.retryAt;
+  } else if (Object.prototype.hasOwnProperty.call(input, "deadNextAttemptAt")) {
+    nextAttemptAt = input.deadNextAttemptAt ?? null;
+  }
+  const updated = input.update(status, nextAttemptAt, input.error);
+  return updated === 1 ? status : undefined;
+}
+
+export interface PublicationReceiptFields {
+  externalId?: string | null;
+  externalUrl?: string | null;
+  attachmentUrl?: string | null;
+}
+
+const TERMINAL_OR_BLOCKED_STATUSES = [
+  "shipped",
+  "no_change",
+  "needs_human",
+  "canceled",
+  "superseded",
+  "failed",
+  "publication_blocked",
+] as const;
+
+export function acknowledgePublicationReceipt(input: {
+  db: Database.Database;
+  id: string;
+  timestamp: string;
+  receipt?: PublicationReceiptFields;
+}): void {
+  const publication = input.db.prepare(`
+    SELECT pipeline_instance_id, resume_status FROM pipeline_publication_receipts WHERE id = ?
+  `).get(input.id) as {
+    pipeline_instance_id: string;
+    resume_status: PipelineInstanceStatus | null;
+  } | undefined;
+  if (!publication) return;
+  input.db.prepare(`
+    UPDATE pipeline_publication_receipts
+    SET status = 'acknowledged', external_id = COALESCE(?, external_id),
+        external_url = COALESCE(?, external_url),
+        attachment_url = COALESCE(?, attachment_url), acknowledged_at = ?,
+        last_error = NULL, updated_at = ?
+    WHERE id = ?
+  `).run(
+    input.receipt?.externalId ?? null,
+    input.receipt?.externalUrl ?? null,
+    input.receipt?.attachmentUrl ?? null,
+    input.timestamp,
+    input.timestamp,
+    input.id
+  );
+  if (publication.resume_status) {
+    input.db.prepare(`
+      UPDATE pipeline_instances
+      SET status = ?, state_version = state_version + 1,
+          wait_reason = CASE WHEN ? = 'waiting_human' THEN wait_reason ELSE NULL END,
+          updated_at = ?
+      WHERE id = ? AND status = 'completion_pending_publication'
+    `).run(
+      publication.resume_status,
+      publication.resume_status,
+      input.timestamp,
+      publication.pipeline_instance_id
+    );
+  }
+}
+
+export function failPublicationReceipt(input: {
+  db: Database.Database;
+  id: string;
+  status: "failed" | "dead";
+  nextAttemptAt: string;
+  error: string;
+  timestamp: string;
+  attempts?: number;
+  instanceStatus?: PipelineInstanceStatus | string | null;
+  instanceVersion?: number;
+}): void {
+  const publication = input.db.prepare(`
+    SELECT pipeline_instance_id FROM pipeline_publication_receipts WHERE id = ?
+  `).get(input.id) as { pipeline_instance_id: string } | undefined;
+  if (!publication) return;
+  const instance = input.db.prepare("SELECT status, state_version FROM pipeline_instances WHERE id = ?")
+    .get(publication.pipeline_instance_id) as
+    | { status: PipelineInstanceStatus; state_version: number }
+    | undefined;
+  const blockedFromStatus = input.instanceStatus ?? instance?.status ?? null;
+  input.db.prepare(`
+    UPDATE pipeline_publication_receipts
+    SET status = ?,
+        attempts = COALESCE(?, attempts),
+        next_attempt_at = ?, last_error = ?, updated_at = ?,
+        blocked_from_status = CASE WHEN ? = 'dead' THEN COALESCE(blocked_from_status, ?) ELSE blocked_from_status END
+    WHERE id = ?
+  `).run(
+    input.status,
+    input.attempts ?? null,
+    input.nextAttemptAt,
+    input.error,
+    input.timestamp,
+    input.status,
+    blockedFromStatus,
+    input.id
+  );
+  blockPublicationInstanceOnDead({
+    db: input.db,
+    id: input.id,
+    status: input.status,
+    timestamp: input.timestamp,
+    instanceVersion: input.instanceVersion,
+  });
+}
+
+export function blockPublicationInstanceOnDead(input: {
+  db: Database.Database;
+  id: string;
+  status: "failed" | "dead";
+  timestamp: string;
+  instanceVersion?: number;
+}): void {
+  const publication = input.db.prepare(`
+    SELECT pipeline_instance_id FROM pipeline_publication_receipts WHERE id = ?
+  `).get(input.id) as { pipeline_instance_id: string } | undefined;
+  if (!publication) return;
+  const instance = input.db.prepare("SELECT status, state_version FROM pipeline_instances WHERE id = ?")
+    .get(publication.pipeline_instance_id) as
+    | { status: PipelineInstanceStatus; state_version: number }
+    | undefined;
+  if (
+    input.status === "dead" &&
+    instance &&
+    !TERMINAL_OR_BLOCKED_STATUSES.includes(instance.status as typeof TERMINAL_OR_BLOCKED_STATUSES[number])
+  ) {
+    const versionPredicate = input.instanceVersion === undefined ? "" : " AND state_version = ?";
+    const statement = input.db.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'publication_blocked', state_version = state_version + 1,
+          wait_reason = 'permanent publication failure', updated_at = ?
+      WHERE id = ? AND status NOT IN (
+        'shipped', 'no_change', 'needs_human', 'canceled', 'superseded', 'failed',
+        'publication_blocked'
+      )${versionPredicate}
+    `);
+    if (input.instanceVersion === undefined) {
+      statement.run(input.timestamp, publication.pipeline_instance_id);
+    } else {
+      statement.run(input.timestamp, publication.pipeline_instance_id, input.instanceVersion);
+    }
+  }
 }
 
 export function validatePinnedInstance(
@@ -88,6 +272,75 @@ export function validatePinnedInstance(
   return manifest;
 }
 
+function nextLinearOutboxSequence(db: Database.Database, linearSessionId: string): number {
+  return (db.prepare(`
+    SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence
+    FROM linear_outbox WHERE linear_session_id IS ?
+  `).get(linearSessionId) as { sequence: number }).sequence;
+}
+
+function insertPendingLinearOutbox(input: {
+  db: Database.Database;
+  id: string;
+  linearSessionId: string;
+  linearIssueId: string;
+  kind: "pipeline_receipt" | "issue_state";
+  payload: string;
+  timestamp: string;
+}): void {
+  input.db.prepare(`
+    INSERT INTO linear_outbox (
+      id, linear_session_id, linear_issue_id, run_id, sequence, kind,
+      payload, payload_hash, status, attempts, next_attempt_at, created_at
+    ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, 'pending', 0, ?, ?)
+  `).run(
+    input.id,
+    input.linearSessionId,
+    input.linearIssueId,
+    nextLinearOutboxSequence(input.db, input.linearSessionId),
+    input.kind,
+    input.payload,
+    digestNormalized(input.payload),
+    input.timestamp,
+    input.timestamp
+  );
+}
+
+function persistIssueStateProjection(input: {
+  db: Database.Database;
+  instance: PipelineInstance;
+  envelope: PipelinePublicationEnvelope;
+  timestamp: string;
+}): void {
+  const signal = issueStateSignalForPublication(input.envelope);
+  if (!signal) return;
+  const id = deterministicPublicationId(`linear-issue-state:${input.instance.id}:${signal}`);
+  const payload = JSON.stringify({
+    type: "issue_state",
+    issueId: input.instance.linear_issue_id,
+    signal,
+  });
+  const payloadHash = digestNormalized(payload);
+  const existing = input.db.prepare("SELECT payload_hash FROM linear_outbox WHERE id = ?").get(id) as
+    | { payload_hash: string }
+    | undefined;
+  if (existing) {
+    if (existing.payload_hash !== payloadHash) {
+      throw new Error(`linear issue-state outbox ${id} already exists with different intent`);
+    }
+    return;
+  }
+  insertPendingLinearOutbox({
+    db: input.db,
+    id,
+    linearSessionId: input.instance.linear_session_id,
+    linearIssueId: input.instance.linear_issue_id,
+    kind: "issue_state",
+    payload,
+    timestamp: input.timestamp,
+  });
+}
+
 export function createPipelinePublicationWriter(db: Database.Database) {
   return (input: {
     instance: PipelineInstance;
@@ -136,26 +389,55 @@ export function createPipelinePublicationWriter(db: Database.Database) {
         input.timestamp,
         input.timestamp
       );
-      const outboxPayload = pipelinePublicationOutboxPayload(envelope);
-      const sequence = (db.prepare(`
-        SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence
-        FROM linear_outbox WHERE linear_session_id IS ?
-      `).get(input.instance.linear_session_id) as { sequence: number }).sequence;
+      const statusId = deterministicPublicationId(`linear-status:${input.instance.id}`);
+      const statusPayload = pipelineStatusOutboxPayload(envelope);
       db.prepare(`
         INSERT INTO linear_outbox (
           id, linear_session_id, linear_issue_id, run_id, sequence, kind,
           payload, payload_hash, status, attempts, next_attempt_at, created_at
-        ) VALUES (?, ?, ?, NULL, ?, 'pipeline_receipt', ?, ?, 'pending', 0, ?, ?)
+        ) VALUES (?, ?, ?, NULL, ?, 'pipeline_status', ?, ?, 'pending', 0, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          payload = excluded.payload,
+          payload_hash = excluded.payload_hash,
+          status = 'pending',
+          attempts = 0,
+          next_attempt_at = excluded.next_attempt_at,
+          last_error = NULL,
+          processed_at = NULL
       `).run(
-        id,
+        statusId,
         input.instance.linear_session_id,
         input.instance.linear_issue_id,
-        sequence,
-        outboxPayload,
-        digestNormalized(outboxPayload),
+        nextLinearOutboxSequence(db, input.instance.linear_session_id),
+        statusPayload,
+        digestNormalized(statusPayload),
         input.timestamp,
         input.timestamp
       );
+      if (shouldPostLinearEventComment(envelope)) {
+        const outboxPayload = pipelinePublicationOutboxPayload(envelope);
+        insertPendingLinearOutbox({
+          db,
+          id,
+          linearSessionId: input.instance.linear_session_id,
+          linearIssueId: input.instance.linear_issue_id,
+          kind: "pipeline_receipt",
+          payload: outboxPayload,
+          timestamp: input.timestamp,
+        });
+      } else {
+        db.prepare(`
+          UPDATE pipeline_publication_receipts
+          SET status = 'acknowledged', acknowledged_at = ?, updated_at = ?
+          WHERE id = ?
+        `).run(input.timestamp, input.timestamp, id);
+      }
+      persistIssueStateProjection({
+        db,
+        instance: input.instance,
+        envelope,
+        timestamp: input.timestamp,
+      });
     } else {
       const stableKey = `github-summary:${input.instance.linear_issue_id}`;
       const stableId = deterministicPublicationId(stableKey);
@@ -228,6 +510,7 @@ export function buildTerminalPublicationPayload(input: {
   attempt: PipelineStageAttempt | undefined;
   outcome: "superseded";
   reason: string;
+  structuredExecution?: ExecutionPublicationSnapshot;
 }): string {
   return canonicalJson(buildLifecyclePublication(input));
 }

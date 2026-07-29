@@ -15,7 +15,6 @@ interface Detected {
   test: string;
   build: string;
   lint: string;
-  dev: string;
 }
 
 export interface ProjectConfig {
@@ -24,7 +23,6 @@ export interface ProjectConfig {
   test: string;
   build: string;
   lint: string;
-  dev: string;
   post_bootstrap: string[];
   limits: { max_turns: number; task_timeout: number };
   mcp_servers: Record<string, unknown>;
@@ -59,7 +57,7 @@ export function detectPackageManager(
 export function detectProject(directory = process.cwd()): Detected {
   const packagePath = join(directory, "package.json");
   if (!existsSync(packagePath)) {
-    return { pm: null, test: "", build: "", lint: "", dev: "" };
+    return { pm: null, test: "", build: "", lint: "" };
   }
   const pkg = JSON.parse(readFileSync(packagePath, "utf8")) as PackageJson;
   const scripts = pkg.scripts ?? {};
@@ -70,7 +68,6 @@ export function detectProject(directory = process.cwd()): Detected {
     test: run("test"),
     build: run("build"),
     lint: run("lint"),
-    dev: scripts.dev ? `${pm} run dev -- --port 3000 --hostname 0.0.0.0` : "",
   };
 }
 
@@ -160,10 +157,24 @@ async function promptConfig(detected: Detected, target: RepositoryTarget): Promi
           ],
           initialValue: "codex",
         }),
+      model: ({ results }) => {
+        const agent = results.agent as ProjectConfig["agent"] | undefined;
+        return p.text({
+          message: "Model (blank uses the agent default; required for OpenCode)",
+          initialValue: agent === "opencode" ? "kimi-code/kimi-for-coding" : "",
+          validate: (value) => {
+            const trimmed = value.trim();
+            if (agent === "opencode" && !trimmed) return "OpenCode requires a model";
+            if (trimmed && !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(trimmed)) {
+              return "Model may contain letters, digits, and . _ / - only";
+            }
+            return undefined;
+          },
+        });
+      },
       test: () => p.text({ message: "Test command (blank to skip)", initialValue: detected.test }),
       build: () => p.text({ message: "Build command (blank to skip)", initialValue: detected.build }),
       lint: () => p.text({ message: "Lint command (blank to skip)", initialValue: detected.lint }),
-      dev: () => p.text({ message: "Dev command (blank to skip)", initialValue: detected.dev }),
       post_bootstrap: () =>
         p.text({
           message: "Post-bootstrap command (blank to skip)",
@@ -182,11 +193,10 @@ async function promptConfig(detected: Detected, target: RepositoryTarget): Promi
   return {
     project: {
       agent: result.agent as "claude" | "codex" | "opencode",
-      model: result.agent === "opencode" ? "kimi-code/kimi-for-coding" : undefined,
+      model: typeof result.model === "string" && result.model.trim() ? result.model.trim() : undefined,
       test: result.test,
       build: result.build,
       lint: result.lint,
-      dev: result.dev,
       post_bootstrap: result.post_bootstrap ? [result.post_bootstrap] : [],
       limits: {
         max_turns: Number(result.max_turns) || 200,
@@ -204,8 +214,10 @@ async function promptConfig(detected: Detected, target: RepositoryTarget): Promi
 }
 
 export function writeProjectConfig(config: ProjectConfig, directory = process.cwd()): void {
-  const document: Record<string, unknown> = { ...config };
-  for (const key of ["test", "build", "lint", "dev"] as const) {
+  const document: Record<string, unknown> = {
+    ...config,
+  };
+  for (const key of ["test", "build", "lint", "model"] as const) {
     if (!config[key]) delete document[key];
   }
   const header = [

@@ -3,10 +3,14 @@ manifests:
   - command-fixture-v1.yaml
   - command-fixture-v2.yaml
   - agent-fixture-v1.yaml
+  - dual-review-fixture-v1.yaml
 aliases:
   fixture-command:
     id: fixture/command
     version: 2
   fixture-agent:
     id: fixture/agent
+    version: 1
+  fixture-dual-review:
+    id: fixture/dual-review
     version: 1

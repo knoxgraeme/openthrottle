@@ -38,9 +38,25 @@ const ARTIFACT_KEYS = new Set([
 ]);
 
 type ArtifactResult = StageOutcome | "not_configured";
-type GateResult = CoordinatorGateReceiptWrite["result"];
+export type GateResult = CoordinatorGateReceiptWrite["result"];
 
-interface Finding {
+export interface SemanticDecisionEvidence {
+  result: ArtifactResult;
+  findings: Array<{ severity: string }>;
+  repository: {
+    pre_subject: string;
+    post_subject: string;
+  };
+}
+
+export interface CommandDecisionEvidence {
+  not_configured: boolean;
+  timed_out: boolean;
+  exit_code: number | null;
+  signal: string | null;
+}
+
+export interface Finding {
   severity: "P0" | "P1" | "P2" | "P3";
   code: string;
   summary: string;
@@ -294,27 +310,55 @@ function validateFence(
   }
 }
 
-function gateResultForOutcome(outcome: StageOutcome): GateResult {
+export function gateResultForOutcome(outcome: StageOutcome): GateResult {
   if (outcome === "success" || outcome === "no_change") return "passed";
   if (outcome === "retryable_infrastructure_failure" || outcome === "needs_human") return "indeterminate";
   return "failed";
 }
 
-function semanticDecision(payloads: TypedArtifactPayload[]): { outcome: StageOutcome; result: GateResult; reason: string } {
-  const stageResult = payloads.find((payload) => payload.kind === "stage_result")!;
-  if (stageResult.result === "not_configured" || stageResult.result === "canceled" || stageResult.result === "superseded") {
-    throw new Error(`semantic stage proposed forbidden result ${stageResult.result}`);
+export function semanticDecisionForEvidence(input: SemanticDecisionEvidence): { outcome: StageOutcome; result: GateResult; reason: string } {
+  if (input.result === "not_configured" || input.result === "canceled" || input.result === "superseded") {
+    throw new Error(`semantic stage proposed forbidden result ${input.result}`);
   }
-  const blocking = payloads.flatMap((payload) => payload.findings)
+  const blocking = input.findings
     .filter((finding) => finding.severity === "P0" || finding.severity === "P1");
   if (blocking.length > 0) {
     return { outcome: "semantic_repair_required", result: "failed", reason: "blocking_findings" };
   }
+  // A no_change outcome is honored only when the sealed tree is genuinely
+  // unchanged. The agent's self-reported result is advisory; the sealed
+  // pre/post subjects are authoritative. If the workspace tree actually moved
+  // (pre_subject != post_subject) the agent misclassified a real edit, so
+  // reclassify to success. Otherwise a modified tree could take a stage's
+  // no_change shortcut (e.g. simplification skipping post_simplify_review) and
+  // reach the command gates unreviewed on the agent's word alone.
+  if (input.result === "no_change" &&
+      input.repository.pre_subject !== input.repository.post_subject) {
+    return { outcome: "success", result: gateResultForOutcome("success"), reason: "no_change_contradicted_by_tree_delta" };
+  }
   return {
-    outcome: stageResult.result,
-    result: gateResultForOutcome(stageResult.result),
+    outcome: input.result,
+    result: gateResultForOutcome(input.result),
     reason: "typed_semantic_result",
   };
+}
+
+function semanticDecision(payloads: TypedArtifactPayload[]): { outcome: StageOutcome; result: GateResult; reason: string } {
+  const stageResult = payloads.find((payload) => payload.kind === "stage_result")!;
+  return semanticDecisionForEvidence({
+    result: stageResult.result,
+    findings: payloads.flatMap((payload) => payload.findings),
+    repository: stageResult.repository,
+  });
+}
+
+export function commandDecisionForEvidence(input: CommandDecisionEvidence): { outcome: StageOutcome; result: GateResult; reason: string } {
+  if (input.not_configured) return { outcome: "no_change", result: "not_configured", reason: "command_not_configured" };
+  if (input.timed_out || input.signal !== null || input.exit_code === 137) {
+    return { outcome: "retryable_infrastructure_failure", result: "indeterminate", reason: "command_terminated" };
+  }
+  if (input.exit_code === 0) return { outcome: "success", result: "passed", reason: "command_exit_zero" };
+  return { outcome: "failure", result: "failed", reason: "command_exit_nonzero" };
 }
 
 function commandDecision(payloads: TypedArtifactPayload[]): { outcome: StageOutcome; result: GateResult; reason: string } {
@@ -330,12 +374,12 @@ function commandDecision(payloads: TypedArtifactPayload[]): { outcome: StageOutc
       (signal !== null && typeof signal !== "string")) {
     throw new Error("command_result has invalid executor evidence");
   }
-  if (notConfigured) return { outcome: "no_change", result: "not_configured", reason: "command_not_configured" };
-  if (timedOut || signal !== null || exitCode === 137) {
-    return { outcome: "retryable_infrastructure_failure", result: "indeterminate", reason: "command_terminated" };
-  }
-  if (exitCode === 0) return { outcome: "success", result: "passed", reason: "command_exit_zero" };
-  return { outcome: "failure", result: "failed", reason: "command_exit_nonzero" };
+  return commandDecisionForEvidence({
+    not_configured: notConfigured,
+    timed_out: timedOut,
+    exit_code: exitCode as number | null,
+    signal: signal as string | null,
+  });
 }
 
 export function evaluateStageGate(
@@ -444,15 +488,6 @@ export function evaluateStageGate(
   };
 }
 
-export function processStageEvidence(
-  store: PipelineStore,
-  event: PipelineCoordinatorEvent,
-  options: { observedSubject?: string; faultAfterWrite?: (writeCount: number) => void } = {}
-): PipelineInstance {
-  const evaluated = evaluateStageGate(store, event, options);
-  return coordinatePipelineEvent(store, evaluated.event, options.faultAfterWrite, evaluated.receipt);
-}
-
 function providerGateReceipt(
   instance: PipelineInstance,
   attempt: PipelineStageAttempt,
@@ -492,6 +527,7 @@ export function processProviderEvidence(
     outcome: "success" | "no_change" | "semantic_repair_required" | "retryable_infrastructure_failure" | "needs_human" | "failure";
     summary: string;
     evidence: string[];
+    findings?: Finding[];
     providerPayload: Record<string, unknown>;
   }
 ): PipelineInstance {
@@ -563,7 +599,7 @@ export function processProviderEvidence(
       result: input.outcome,
       summary: input.summary,
       evidence: input.evidence,
-      findings: [],
+      findings: input.findings ?? [],
       actions: [],
       uncertainty: [],
       started_at: timestamp,

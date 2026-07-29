@@ -19,9 +19,15 @@ export async function runSweep(
   store: SupervisorStore,
   cfg: Config,
   pipelines: PipelineStore,
-  activityPublisher: Pick<ActivityPublicationPort, "publishError">
+  activityPublisher: Pick<ActivityPublicationPort, "publishError">,
+  reconcileWebhooks?: () => Promise<void>
 ): Promise<void> {
   await reapExpiredRuns({ runtime, store, activityPublisher, pipelines });
+  try {
+    await reconcileWebhooks?.();
+  } catch (error) {
+    console.error("[sweep] webhook reconciliation failed:", error);
+  }
   await deleteOrphanSandboxes(runtime, store, cfg);
   const retentionCutoff = new Date(Date.now() - 7 * DAY_MS).toISOString();
   store.pruneDeliveries(retentionCutoff);

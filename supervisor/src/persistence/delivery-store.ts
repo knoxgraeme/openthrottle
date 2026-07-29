@@ -1,11 +1,72 @@
 import type Database from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
-import type {
-  DeliveryClaim,
-  LinearOutboxRecord,
-  SandboxEventRecord,
-  WebhookDelivery,
-} from "./store.js";
+import {
+  acknowledgePublicationReceipt,
+  claimLeasable,
+  failPublicationReceipt,
+  markQueueFailed,
+} from "./pipeline/helpers.js";
+
+export interface DeliveryClaim {
+  deliveryId: string;
+  source: "linear" | "github";
+  sessionId?: string;
+  action: string;
+  activityId?: string;
+  eventName?: string;
+  payload?: string;
+}
+
+export interface WebhookDelivery {
+  id: string;
+  source: "linear" | "github";
+  session_id: string | null;
+  action: string;
+  activity_id: string | null;
+  event_name: string | null;
+  payload: string | null;
+  status: "pending" | "processing" | "failed" | "processed" | "dead";
+  attempts: number;
+  next_attempt_at: string | null;
+  processed_at: string | null;
+  last_error: string | null;
+  received_at: string;
+}
+
+export interface SandboxEventRecord {
+  event_id: string;
+  run_id: string;
+  sandbox_id: string;
+  kind: "activity" | "plan" | "heartbeat" | "stage_result";
+  payload: string;
+  status: "pending" | "processing" | "failed" | "processed";
+  attempts: number;
+  next_attempt_at: string;
+  processed_at: string | null;
+  last_error: string | null;
+  ingestion_diagnosed_at: string | null;
+  created_at: string;
+}
+
+export interface LinearOutboxRecord {
+  id: string;
+  linear_session_id: string | null;
+  linear_issue_id: string | null;
+  run_id: string | null;
+  sequence: number;
+  kind: "activity" | "session_update" | "pipeline_receipt" | "pipeline_status" | "issue_state";
+  payload: string;
+  payload_hash: string;
+  status: "pending" | "processing" | "failed" | "processed" | "dead";
+  attempts: number;
+  next_attempt_at: string;
+  processed_at: string | null;
+  last_error: string | null;
+  external_id: string | null;
+  external_url: string | null;
+  attachment_url: string | null;
+  created_at: string;
+}
 
 export interface DeliveryStore {
   enqueueLinearOutbox(params: {
@@ -17,15 +78,14 @@ export interface DeliveryStore {
     payload: string;
   }): LinearOutboxRecord;
   claimLinearOutbox(nowIso: string, leaseUntilIso: string, limit: number): LinearOutboxRecord[];
+  claimLinearOutboxForId(id: string, nowIso: string, leaseUntilIso: string, limit: number): LinearOutboxRecord[];
   markLinearOutboxProcessed(id: string, receipt?: {
     externalId?: string | null;
     externalUrl?: string | null;
     attachmentUrl?: string | null;
-  }): void;
-  markLinearOutboxFailed(id: string, error: string, retryAt: string | null): void;
+  }, expectedPayloadHash?: string): void;
+  markLinearOutboxFailed(id: string, error: string, retryAt: string | null, expectedPayloadHash?: string): void;
   recordLinearOutboxAttachment(id: string, attachmentUrl: string): void;
-  getLinearOutbox(id: string): LinearOutboxRecord | undefined;
-  listLinearOutbox(): LinearOutboxRecord[];
   claimDelivery(claim: DeliveryClaim): boolean;
   claimDeliveryForProcessing(params: {
     deliveryId: string;
@@ -65,7 +125,6 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
   `);
   const getLinearOutboxStmt = db.prepare("SELECT * FROM linear_outbox WHERE id = ?");
-  const listLinearOutboxStmt = db.prepare("SELECT * FROM linear_outbox ORDER BY created_at, sequence");
   const claimDeliveryStmt = db.prepare(`
     INSERT OR IGNORE INTO webhook_deliveries (
       delivery_id, source, session_id, action, activity_id, event_name,
@@ -103,6 +162,28 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
     WHERE status = 'processed' AND processed_at < ?
       AND kind = 'activity'
       AND json_extract(payload, '$.activity.ephemeral') IS 1
+  `);
+  const listClaimableLinearOutboxRowsStmt = db.prepare(`
+    SELECT * FROM linear_outbox candidate
+    WHERE ((candidate.status IN ('pending', 'failed') AND candidate.next_attempt_at <= ?)
+      OR (candidate.status = 'processing' AND candidate.next_attempt_at <= ?))
+      AND (candidate.kind = 'issue_state' OR NOT EXISTS (
+        SELECT 1 FROM linear_outbox earlier
+        WHERE earlier.linear_session_id IS candidate.linear_session_id
+          AND earlier.sequence < candidate.sequence
+          AND earlier.kind NOT IN ('pipeline_status', 'issue_state')
+          AND earlier.status IN ('pending', 'processing', 'failed')
+      ))
+    ORDER BY candidate.created_at, candidate.sequence
+    LIMIT ?
+  `);
+  const claimLinearOutboxRowStmt = db.prepare(`
+    UPDATE linear_outbox
+    SET status = 'processing', attempts = attempts + 1,
+        next_attempt_at = ?, last_error = NULL
+    WHERE id = ?
+      AND ((status IN ('pending', 'failed') AND next_attempt_at <= ?)
+        OR (status = 'processing' AND next_attempt_at <= ?))
   `);
   const enqueueLinearOutboxTransaction = db.transaction(
     (params: {
@@ -179,133 +260,98 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
       return getSandboxEventStmt.get(eventId) as SandboxEventRecord;
     }
   );
+  const listClaimableLinearOutboxRows = (nowIso: string, limit: number): LinearOutboxRecord[] =>
+    listClaimableLinearOutboxRowsStmt.all(nowIso, nowIso, limit) as LinearOutboxRecord[];
+  const claimLinearOutboxRows = (
+    rows: LinearOutboxRecord[],
+    nowIso: string,
+    leaseUntilIso: string
+  ): LinearOutboxRecord[] =>
+    claimLeasable({
+      rows,
+      nowIso,
+      leaseUntilIso,
+      update: (id, lease, nowValue) =>
+        claimLinearOutboxRowStmt.run(lease, id, nowValue, nowValue).changes,
+      get: (id) => getLinearOutboxStmt.get(id) as LinearOutboxRecord,
+    });
   return {
     enqueueLinearOutbox(params) {
       return enqueueLinearOutboxTransaction(params);
     },
     claimLinearOutbox(nowIso, leaseUntilIso, limit) {
-      const rows = db.prepare(`
-        SELECT * FROM linear_outbox candidate
-        WHERE ((candidate.status IN ('pending', 'failed') AND candidate.next_attempt_at <= ?)
-          OR (candidate.status = 'processing' AND candidate.next_attempt_at <= ?))
-          AND NOT EXISTS (
-            SELECT 1 FROM linear_outbox earlier
-            WHERE earlier.linear_session_id IS candidate.linear_session_id
-              AND earlier.sequence < candidate.sequence
-              AND earlier.status IN ('pending', 'processing', 'failed')
-          )
-        ORDER BY candidate.created_at, candidate.sequence
-        LIMIT ?
-      `).all(nowIso, nowIso, limit) as LinearOutboxRecord[];
-      const claimed: LinearOutboxRecord[] = [];
-      for (const row of rows) {
-        const update = db.prepare(`
-          UPDATE linear_outbox
-          SET status = 'processing', attempts = attempts + 1,
-              next_attempt_at = ?, last_error = NULL
-          WHERE id = ?
-            AND ((status IN ('pending', 'failed') AND next_attempt_at <= ?)
-              OR (status = 'processing' AND next_attempt_at <= ?))
-        `).run(leaseUntilIso, row.id, nowIso, nowIso);
-        if (update.changes === 1) claimed.push(getLinearOutboxStmt.get(row.id) as LinearOutboxRecord);
-      }
-      return claimed;
+      return claimLinearOutboxRows(listClaimableLinearOutboxRows(nowIso, limit), nowIso, leaseUntilIso);
     },
-    markLinearOutboxProcessed(id, receipt) {
+    claimLinearOutboxForId(id, nowIso, leaseUntilIso, limit) {
+      const rows = listClaimableLinearOutboxRows(nowIso, limit);
+      const target = rows.find((row) => row.id === id);
+      if (!target) return [];
+      return claimLinearOutboxRows(
+        rows.filter((row) =>
+          row.linear_session_id === target.linear_session_id && row.sequence <= target.sequence
+        ),
+        nowIso,
+        leaseUntilIso
+      );
+    },
+    markLinearOutboxProcessed(id, receipt, expectedPayloadHash) {
       db.transaction(() => {
         const processedAt = now();
-        db.prepare(`
+        const update = db.prepare(`
           UPDATE linear_outbox
           SET status = 'processed', processed_at = ?, next_attempt_at = ?, last_error = NULL,
               external_id = COALESCE(?, external_id),
               external_url = COALESCE(?, external_url),
               attachment_url = COALESCE(?, attachment_url)
           WHERE id = ?
+            AND (? IS NULL OR payload_hash = ?)
         `).run(
           processedAt,
           processedAt,
           receipt?.externalId ?? null,
           receipt?.externalUrl ?? null,
           receipt?.attachmentUrl ?? null,
-          id
+          id,
+          expectedPayloadHash ?? null,
+          expectedPayloadHash ?? null
         );
-        const publication = db.prepare(`
-          SELECT * FROM pipeline_publication_receipts WHERE id = ?
-        `).get(id) as {
-          pipeline_instance_id: string;
-          resume_status: string | null;
-          status: string;
-        } | undefined;
-        if (!publication) return;
-        db.prepare(`
-          UPDATE pipeline_publication_receipts
-          SET status = 'acknowledged', external_id = COALESCE(?, external_id),
-              external_url = COALESCE(?, external_url),
-              attachment_url = COALESCE(?, attachment_url), acknowledged_at = ?,
-              last_error = NULL, updated_at = ?
-          WHERE id = ?
-        `).run(
-          receipt?.externalId ?? null,
-          receipt?.externalUrl ?? null,
-          receipt?.attachmentUrl ?? null,
-          processedAt,
-          processedAt,
-          id
-        );
-        if (publication.resume_status) {
-          db.prepare(`
-            UPDATE pipeline_instances
-            SET status = ?, state_version = state_version + 1,
-                wait_reason = CASE WHEN ? = 'waiting_human' THEN wait_reason ELSE NULL END,
-                updated_at = ?
-            WHERE id = ? AND status = 'completion_pending_publication'
-          `).run(
-            publication.resume_status,
-            publication.resume_status,
-            processedAt,
-            publication.pipeline_instance_id
-          );
-        }
+        if (update.changes !== 1) return;
+        acknowledgePublicationReceipt({ db, id, timestamp: processedAt, receipt });
       })();
     },
-    markLinearOutboxFailed(id, error, retryAt) {
+    markLinearOutboxFailed(id, error, retryAt, expectedPayloadHash) {
       db.transaction(() => {
         const timestamp = now();
-        const status = retryAt ? "failed" : "dead";
-        db.prepare(`
+        const attempts = (db.prepare("SELECT attempts FROM linear_outbox WHERE id = ?")
+          .get(id) as { attempts: number } | undefined)?.attempts;
+        const status = markQueueFailed({
+          error,
+          retryAt,
+          timestamp,
+          update: (statusValue, nextAttemptAt, errorValue) => db.prepare(`
           UPDATE linear_outbox
           SET status = ?, next_attempt_at = ?, last_error = ?
           WHERE id = ?
-        `).run(status, retryAt ?? timestamp, error, id);
-        const publication = db.prepare(`
-          SELECT pipeline_instance_id FROM pipeline_publication_receipts WHERE id = ?
-        `).get(id) as { pipeline_instance_id: string } | undefined;
-        if (!publication) return;
-        const instanceStatus = db.prepare(
-          "SELECT status FROM pipeline_instances WHERE id = ?"
-        ).pluck().get(publication.pipeline_instance_id) as string | undefined;
-        db.prepare(`
-          UPDATE pipeline_publication_receipts
-          SET status = ?, attempts = (
-                SELECT attempts FROM linear_outbox WHERE linear_outbox.id = pipeline_publication_receipts.id
-              ),
-              next_attempt_at = ?, last_error = ?, updated_at = ?,
-              blocked_from_status = CASE WHEN ? = 'dead' THEN COALESCE(
-                blocked_from_status, ?
-              ) ELSE blocked_from_status END
-          WHERE id = ?
-        `).run(status, retryAt ?? timestamp, error, timestamp, status, instanceStatus ?? null, id);
-        if (status === "dead") {
-          db.prepare(`
-            UPDATE pipeline_instances
-            SET status = 'publication_blocked', state_version = state_version + 1,
-                wait_reason = 'permanent publication failure', updated_at = ?
-            WHERE id = ? AND status NOT IN (
-              'shipped', 'no_change', 'needs_human', 'canceled', 'superseded', 'failed',
-              'publication_blocked'
-            )
-          `).run(timestamp, publication.pipeline_instance_id);
-        }
+            AND (? IS NULL OR payload_hash = ?)
+        `).run(
+            statusValue,
+            nextAttemptAt,
+            errorValue,
+            id,
+            expectedPayloadHash ?? null,
+            expectedPayloadHash ?? null
+          ).changes,
+        });
+        if (!status) return;
+        failPublicationReceipt({
+          db,
+          id,
+          status,
+          nextAttemptAt: retryAt ?? timestamp,
+          error,
+          timestamp,
+          attempts,
+        });
       })();
     },
     recordLinearOutboxAttachment(id, attachmentUrl) {
@@ -314,12 +360,6 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
         WHERE id = ? AND status = 'processing'
       `).run(attachmentUrl, id);
       if (updated.changes !== 1) throw new Error(`linear outbox ${id} is not processing`);
-    },
-    getLinearOutbox(id) {
-      return getLinearOutboxStmt.get(id) as LinearOutboxRecord | undefined;
-    },
-    listLinearOutbox() {
-      return listLinearOutboxStmt.all() as LinearOutboxRecord[];
     },
     claimDelivery(claim) {
       const receivedAt = now();
@@ -349,11 +389,18 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
       `).run(processedAt, deliveryId);
     },
     markDeliveryFailed(deliveryId, error, retryAt) {
-      db.prepare(`
+      const timestamp = now();
+      markQueueFailed({
+        error,
+        retryAt,
+        timestamp,
+        deadNextAttemptAt: null,
+        update: (status, nextAttemptAt, errorValue) => db.prepare(`
         UPDATE webhook_deliveries
         SET status = ?, next_attempt_at = ?, last_error = ?
         WHERE delivery_id = ?
-      `).run(retryAt ? "failed" : "dead", retryAt, error, deliveryId);
+      `).run(status, nextAttemptAt, errorValue, deliveryId).changes,
+      });
     },
     listProcessableDeliveries(nowIso, limit) {
       return listProcessableDeliveriesStmt.all(nowIso, nowIso, limit) as WebhookDelivery[];
@@ -389,11 +436,16 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
       `).run(processedAt, processedAt, eventId);
     },
     markSandboxEventFailed(eventId, error, retryAt) {
-      db.prepare(`
+      markQueueFailed({
+        error,
+        retryAt,
+        timestamp: retryAt,
+        update: (_status, nextAttemptAt, errorValue) => db.prepare(`
         UPDATE sandbox_events
         SET status = 'failed', next_attempt_at = ?, last_error = ?
         WHERE event_id = ?
-      `).run(retryAt, error, eventId);
+      `).run(nextAttemptAt, errorValue, eventId).changes,
+      });
     },
     markSandboxEventDiagnosed(eventId, diagnosedAt) {
       return db.prepare(`
