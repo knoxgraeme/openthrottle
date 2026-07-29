@@ -55,6 +55,8 @@ function executorShape(kind: ExecutorKind): ExecutorShape {
       return { display: "agent", node: (id, label) => `${id}["${label}"]` };
     case "command":
       return { display: "command gate", node: (id, label) => `${id}[/"${label}"/]` };
+    case "loop_action":
+      return { display: "loop action", node: (id, label) => `${id}[("${label}")]` };
     case "provider_wait":
       return { display: "provider wait", node: (id, label) => `${id}{{"${label}"}}` };
     default: {

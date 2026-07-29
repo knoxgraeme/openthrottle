@@ -46,6 +46,43 @@ export interface StageExecutionResult {
   completedAt: string;
 }
 
+export interface RuntimeWorktreeHandle {
+  id: string;
+}
+
+export interface LoopActionRequest {
+  protocol: "loop-action@1";
+  actionId: string;
+  attemptId: string;
+  graphId: string;
+  unitId: string | null;
+  role: "worker" | "lead" | "reviewer";
+  loop: "implement" | "simplify" | "command" | "repair" | "lead" | "review";
+  agent: "claude" | "codex" | "opencode";
+  skill: string;
+  worktree: RuntimeWorktreeHandle | null;
+  nativeSessionId: string | null;
+  contextPolicy: "fresh" | "resume_required" | "prefer_resume";
+  timeoutMs: number;
+  transitionContext: string;
+  allowedMcpServers: readonly string[];
+  credentialScopes: readonly string[];
+  receiptSchema: string;
+  requestHash: string;
+  idempotencyKey: string;
+}
+
+export interface LoopActionResult {
+  actionId: string;
+  attemptId: string;
+  requestHash: string;
+  outcome: "success" | "failure" | "needs_human" | "retryable_infrastructure_failure";
+  nativeSessionId: string | null;
+  subject: string | null;
+  receipt: string;
+  completedAt: string;
+}
+
 export interface RuntimeResource {
   providerResourceId: string;
 }
@@ -65,6 +102,14 @@ export interface SandboxRuntime {
   }): Promise<void>;
   dispatchStage(resource: RuntimeResource, request: StageRequestEnvelope): Promise<{ providerDispatchId: string }>;
   collectStageResult(resource: RuntimeResource, attemptId: string): Promise<StageExecutionResult | null>;
+  createWorktree(resource: RuntimeResource, input: {
+    idempotencyKey: string;
+    attemptId: string;
+    baseCommit: string;
+  }): Promise<RuntimeWorktreeHandle>;
+  dispatchLoopAction(resource: RuntimeResource, request: LoopActionRequest): Promise<{ providerDispatchId: string }>;
+  collectLoopActionResult(resource: RuntimeResource, actionId: string): Promise<LoopActionResult | null>;
+  cleanupWorktree(resource: RuntimeResource, handle: RuntimeWorktreeHandle): Promise<void>;
   renewLiveness(resource: RuntimeResource, attemptId: string): Promise<{ observedAt: string }>;
   stop(resource: RuntimeResource, reason: string): Promise<{ confirmed: boolean }>;
   quarantine(resource: RuntimeResource, reason: string): Promise<void>;

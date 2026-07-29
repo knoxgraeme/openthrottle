@@ -31,6 +31,7 @@ describe("Daytona stage execution", () => {
         }),
       },
       process: {
+        executeCommand: vi.fn(async () => ({ exitCode: 0, result: "{}" })),
         createSession: vi.fn(async () => undefined),
         executeSessionCommand: vi.fn(async () => ({ cmdId: "dispatch-opaque-1" })),
       },
@@ -136,6 +137,61 @@ describe("Daytona stage execution", () => {
     );
     expect(JSON.stringify(updateEnv.mock.calls.at(-1))).not.toContain("secret-token");
 
+    const worktree = await runtime.createWorktree(resource, {
+      idempotencyKey: "worktree:attempt-child",
+      attemptId: "attempt-child",
+      baseCommit: "a".repeat(40),
+    });
+    expect(worktree).toEqual({ id: expect.stringMatching(/^[a-f0-9]{32}$/) });
+    expect(sandbox.process.executeCommand).toHaveBeenCalledWith(
+      expect.stringContaining("/opt/openthrottle/runner/worktrees.mjs create"),
+      "/home/agent/repo",
+      {},
+      120
+    );
+
+    const loopWithoutFence = {
+      protocol: "loop-action@1" as const,
+      actionId: "loop-1",
+      attemptId: "attempt-child",
+      graphId: "graph-1",
+      unitId: "unit-1",
+      role: "worker" as const,
+      loop: "implement" as const,
+      agent: "codex" as const,
+      skill: "ce-work",
+      worktree,
+      nativeSessionId: null,
+      contextPolicy: "prefer_resume" as const,
+      timeoutMs: 30_000,
+      transitionContext: "implement unit",
+      allowedMcpServers: ["github"],
+      credentialScopes: ["model.invoke", "repo.read", "repo.write"],
+      receiptSchema: "openthrottle.loop-receipt@1",
+      requestHash: "",
+      idempotencyKey: "",
+    };
+    const loopHash = digestNormalized(canonicalJson({
+      ...loopWithoutFence,
+      requestHash: undefined,
+      idempotencyKey: undefined,
+    }));
+    const loopRequest = {
+      ...loopWithoutFence,
+      requestHash: loopHash,
+      idempotencyKey: `loop:attempt-child:loop-1:${loopHash}`,
+    };
+    await expect(runtime.dispatchLoopAction(resource, loopRequest)).resolves.toEqual({
+      providerDispatchId: "dispatch-opaque-1",
+    });
+    expect(sandbox.process.executeSessionCommand).toHaveBeenCalledWith(
+      "loop-loop-1",
+      expect.objectContaining({
+        command: expect.stringContaining("/opt/openthrottle/runner/execute-loop.mjs"),
+      }),
+      30
+    );
+
     const artifactPayload = canonicalJson({ result: "success" });
     remoteFiles.set("/var/lib/openthrottle/stage-results/attempt-1.json", Buffer.from(JSON.stringify({
       version: 1,
@@ -160,6 +216,30 @@ describe("Daytona stage execution", () => {
       requestHash: request.requestHash,
       outcome: "success",
     });
+    remoteFiles.set("/var/lib/openthrottle/loop-results/loop-1.json", Buffer.from(JSON.stringify({
+      version: 1,
+      kind: "loop_action_result",
+      action_id: "loop-1",
+      attempt_id: "attempt-child",
+      request_hash: loopRequest.requestHash,
+      outcome: "success",
+      native_session_id: "thread-1",
+      subject: "d".repeat(40),
+      receipt: "done",
+      created_at: "2026-07-22T00:00:00.000Z",
+    })));
+    await expect(runtime.collectLoopActionResult(resource, "loop-1")).resolves.toMatchObject({
+      actionId: "loop-1",
+      attemptId: "attempt-child",
+      outcome: "success",
+    });
+    await runtime.cleanupWorktree(resource, worktree);
+    expect(sandbox.process.executeCommand).toHaveBeenLastCalledWith(
+      expect.stringContaining("/opt/openthrottle/runner/worktrees.mjs remove"),
+      "/home/agent/repo",
+      {},
+      120
+    );
     await expect(runtime.renewLiveness(resource, "attempt-1")).resolves.toEqual({
       observedAt: expect.any(String),
     });

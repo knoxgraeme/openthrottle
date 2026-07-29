@@ -29,6 +29,27 @@ describe("pipeline effect processor", () => {
   const listLinearOutbox = (): LinearOutboxRecord[] =>
     db!.prepare("SELECT * FROM linear_outbox ORDER BY created_at, sequence").all() as LinearOutboxRecord[];
 
+  function sandboxRuntimeMock(ids: { issueId?: string; providerDispatchId?: string } = {}) {
+    const issueId = ids.issueId ?? "1";
+    return {
+      provision: vi.fn(async () => ({ providerResourceId: `sandbox-${issueId}` })),
+      bootstrap: vi.fn(async () => undefined),
+      materializeCredentials: vi.fn(async () => undefined),
+      dispatchStage: vi.fn(async () => ({ providerDispatchId: ids.providerDispatchId ?? `dispatch-${issueId}` })),
+      collectStageResult: vi.fn(async () => null),
+      createWorktree: vi.fn(async () => ({ id: `worktree-${issueId}` })),
+      dispatchLoopAction: vi.fn(async () => ({ providerDispatchId: `loop-${issueId}` })),
+      collectLoopActionResult: vi.fn(async () => null),
+      cleanupWorktree: vi.fn(async () => undefined),
+      renewLiveness: vi.fn(async () => ({ observedAt: new Date().toISOString() })),
+      stop: vi.fn(async () => ({ confirmed: true })),
+      quarantine: vi.fn(async () => undefined),
+      cleanup: vi.fn(async () => undefined),
+      setActive: vi.fn(async () => undefined),
+      setIdle: vi.fn(async () => undefined),
+    } satisfies SandboxRuntime & SandboxAutostopRuntime;
+  }
+
   function harness(issueId: string, sessionId: string) {
     db = openDb(":memory:");
     const pipelines = createPipelineStore(db);
@@ -64,19 +85,7 @@ describe("pipeline effect processor", () => {
         taskType: "investigate",
       },
     });
-    const runtime = {
-      provision: vi.fn(async () => ({ providerResourceId: `sandbox-${issueId}` })),
-      bootstrap: vi.fn(async () => undefined),
-      materializeCredentials: vi.fn(async () => undefined),
-      dispatchStage: vi.fn(async () => ({ providerDispatchId: `dispatch-${issueId}` })),
-      collectStageResult: vi.fn(async () => null),
-      renewLiveness: vi.fn(async () => ({ observedAt: new Date().toISOString() })),
-      stop: vi.fn(async () => ({ confirmed: true })),
-      quarantine: vi.fn(async () => undefined),
-      cleanup: vi.fn(async () => undefined),
-      setActive: vi.fn(async () => undefined),
-      setIdle: vi.fn(async () => undefined),
-    } satisfies SandboxRuntime & SandboxAutostopRuntime;
+    const runtime = sandboxRuntimeMock({ issueId });
     const processor = createPipelineEffectProcessor({
       store: pipelines,
       tickets,
@@ -174,19 +183,7 @@ describe("pipeline effect processor", () => {
     });
     const instance = pipelines.getInstanceForSession("session-1")!;
     const attempt = pipelines.getActiveAttempt(instance.id)!;
-    const runtime = {
-      provision: vi.fn(async () => ({ providerResourceId: "sandbox-1" })),
-      bootstrap: vi.fn(async () => undefined),
-      materializeCredentials: vi.fn(async () => undefined),
-      dispatchStage: vi.fn(async () => ({ providerDispatchId: "command-1" })),
-      collectStageResult: vi.fn(async () => null),
-      renewLiveness: vi.fn(async () => ({ observedAt: new Date().toISOString() })),
-      stop: vi.fn(async () => ({ confirmed: true })),
-      quarantine: vi.fn(async () => undefined),
-      cleanup: vi.fn(async () => undefined),
-      setActive: vi.fn(async () => undefined),
-      setIdle: vi.fn(async () => undefined),
-    } satisfies SandboxRuntime & SandboxAutostopRuntime;
+    const runtime = sandboxRuntimeMock({ providerDispatchId: "command-1" });
     const processor = createPipelineEffectProcessor({
       store: pipelines,
       tickets,
@@ -521,19 +518,7 @@ describe("pipeline effect processor", () => {
       },
     });
     const instance = pipelines.getInstanceForSession("session-2")!;
-    const runtime = {
-      provision: vi.fn(async () => ({ providerResourceId: "unexpected" })),
-      bootstrap: vi.fn(async () => undefined),
-      materializeCredentials: vi.fn(async () => undefined),
-      dispatchStage: vi.fn(async () => ({ providerDispatchId: "unexpected" })),
-      collectStageResult: vi.fn(async () => null),
-      renewLiveness: vi.fn(async () => ({ observedAt: new Date().toISOString() })),
-      stop: vi.fn(async () => ({ confirmed: true })),
-      quarantine: vi.fn(async () => undefined),
-      cleanup: vi.fn(async () => undefined),
-      setActive: vi.fn(async () => undefined),
-      setIdle: vi.fn(async () => undefined),
-    } satisfies SandboxRuntime & SandboxAutostopRuntime;
+    const runtime = sandboxRuntimeMock({ issueId: "unexpected", providerDispatchId: "unexpected" });
     const processor = createPipelineEffectProcessor({
       store: pipelines,
       tickets,

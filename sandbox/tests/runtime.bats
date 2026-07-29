@@ -44,6 +44,29 @@ setup() {
   [[ "$output" == *"absent or invalid"* ]]
 }
 
+@test "pre-push blocks internal unit refs" {
+  if ! install -d -m 0755 /run/openthrottle 2>/dev/null; then
+    skip "cannot install default root-owned push policy in this test environment"
+  fi
+  printf '%s\n' prefer_resume > /run/openthrottle/stage-push-policy
+  chmod 0444 /run/openthrottle/stage-push-policy
+
+  repo="${BATS_TEST_TMPDIR}/repo"
+  mkdir "$repo"
+  git -C "$repo" init -q -b main
+  git -C "$repo" config user.name Test
+  git -C "$repo" config user.email test@example.com
+  printf '%s\n' initial > "$repo/file.txt"
+  git -C "$repo" add .
+  git -C "$repo" commit -qm initial
+
+  run env -C "$repo" "${BATS_TEST_DIRNAME}/../safety/pre-push" <<EOF
+refs/heads/main $(git -C "$repo" rev-parse HEAD) refs/heads/unit/attempt-1 0000000000000000000000000000000000000000
+EOF
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"internal OpenThrottle worktree ref"* ]]
+}
+
 @test "resolve_git_identity uses GitHub noreply, then a placeholder" {
   run resolve_git_identity "knoxgraeme" "42"
   [ "$output" = $'knoxgraeme\t42+knoxgraeme@users.noreply.github.com' ]

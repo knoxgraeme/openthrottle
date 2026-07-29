@@ -143,7 +143,7 @@ describe("pipeline catalog store", () => {
     expect(() => recovered.acceptRuntimeDescriptor(changedV1Runtime))
       .toThrow(/runtime release openthrottle-snapshot\/v1 was already accepted with a different digest/);
 
-    const shippedRuntime = loadRuntimeCapabilityDescriptor(runtimeDescriptorPath, "openthrottle-snapshot/v4");
+    const shippedRuntime = loadRuntimeCapabilityDescriptor(runtimeDescriptorPath, "openthrottle-snapshot/v5");
     const shippedCatalog = loadPipelineCatalog(shippedCatalogPath, shippedRuntime.descriptor);
     recovered.acceptRuntimeDescriptor(shippedRuntime);
     recovered.acceptCatalog(shippedCatalog);
@@ -152,7 +152,7 @@ describe("pipeline catalog store", () => {
       SELECT runtime_release, digest FROM runtime_capability_descriptors ORDER BY runtime_release
     `).all()).toEqual([
       { runtime_release: "openthrottle-snapshot/v1", digest: historical.runtime.digest },
-      { runtime_release: "openthrottle-snapshot/v4", digest: shippedRuntime.digest },
+      { runtime_release: "openthrottle-snapshot/v5", digest: shippedRuntime.digest },
     ]);
     expect(db.prepare(`
       SELECT pipeline_id, version, digest FROM pipeline_catalog_entries
@@ -198,14 +198,14 @@ describe("pipeline catalog store", () => {
     expect(() => pipelines.acceptRuntimeDescriptor(currentV2))
       .toThrow(/runtime release openthrottle-snapshot\/v2 was already accepted with a different digest/);
 
-    const bumped = buildInstalledRuntimeDescriptor("openthrottle-snapshot/v4");
+    const bumped = buildInstalledRuntimeDescriptor("openthrottle-snapshot/v5");
     pipelines.acceptRuntimeDescriptor(bumped);
 
     expect(db.prepare(`
       SELECT runtime_release, digest FROM runtime_capability_descriptors ORDER BY runtime_release
     `).all()).toEqual([
       { runtime_release: "openthrottle-snapshot/v2", digest: priorDigest },
-      { runtime_release: "openthrottle-snapshot/v4", digest: bumped.digest },
+      { runtime_release: "openthrottle-snapshot/v5", digest: bumped.digest },
     ]);
   });
 });
