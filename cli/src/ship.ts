@@ -11,6 +11,8 @@ import * as p from '@clack/prompts';
 import { validatePlanFileForGraph } from './plan.js';
 import { getErrorMessage, readEnv, requireEnv, linearGraphQL } from './util.js';
 
+export const SHIP_SELECTION_FENCE = "openthrottle.ship-selection/v1";
+
 interface ParsedMarkdown {
   title: string;
   body: string;
@@ -49,6 +51,19 @@ export function parseShipArgs(args: string[]): { file?: string; graphId?: string
 export function validateGraphSelectionForShip(file: string, graphId?: string): void {
   if (!graphId || graphId === "simple") return;
   validatePlanFileForGraph(file, { graphId });
+}
+
+function buildShipSelectionBlock(graphId: string): string {
+  return [
+    `\`\`\`json ${SHIP_SELECTION_FENCE}`,
+    JSON.stringify({ schema: SHIP_SELECTION_FENCE, graph_id: graphId }, null, 2),
+    "```",
+  ].join("\n");
+}
+
+export function buildShipDescription(body: string, graphId?: string): string {
+  if (!graphId || graphId === "simple") return body;
+  return `${body.trim()}\n\n${buildShipSelectionBlock(graphId)}`;
 }
 
 interface Team {
@@ -151,6 +166,7 @@ export default async function ship(args: string[] | string | undefined): Promise
   try {
     ({ title, body } = parseMarkdown(content));
     validateGraphSelectionForShip(file, parsed.graphId);
+    body = buildShipDescription(body, parsed.graphId);
   } catch (err: unknown) {
     p.log.error(getErrorMessage(err));
     process.exit(1);

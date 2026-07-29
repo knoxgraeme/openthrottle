@@ -1,5 +1,16 @@
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -185,6 +196,42 @@ function authFileExists(path: string): boolean {
   }
 }
 
+function assertRegularCodexAuthPath(path: string): void {
+  try {
+    if (!lstatSync(path).isFile()) {
+      throw new Error("not a regular file");
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw new Error(`refusing to materialize CODEX_AUTH_JSON at ${path}: auth.json must be a regular file`);
+  }
+}
+
+function readNoFollow(path: string): Buffer {
+  const fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    return readFileSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function writeNoFollow(path: string, contents: string | Buffer, mode = 0o600, exclusive = false): void {
+  const flags =
+    fsConstants.O_WRONLY |
+    fsConstants.O_CREAT |
+    fsConstants.O_TRUNC |
+    fsConstants.O_NOFOLLOW |
+    (exclusive ? fsConstants.O_EXCL : 0);
+  const fd = openSync(path, flags, mode);
+  try {
+    writeFileSync(fd, contents);
+  } finally {
+    closeSync(fd);
+  }
+  chmodSync(path, mode);
+}
+
 function assertPrepareEngineUsable(agent: PrepareRunnerInput["agent"], model?: string): void {
   if (agent === "codex") {
     if (!process.env.OPENAI_API_KEY && !process.env.CODEX_AUTH_JSON && !authFileExists(join(homedir(), ".codex", "auth.json"))) {
@@ -219,6 +266,29 @@ function assertPrepareRunnerSucceeded(result: SpawnSyncReturns<Buffer>): void {
   }
 }
 
+function withCodexAuthJsonFile<T>(run: (env?: NodeJS.ProcessEnv) => T): T {
+  if (!process.env.CODEX_AUTH_JSON) return run();
+  const codexDirectory = join(homedir(), ".codex");
+  const authPath = join(codexDirectory, "auth.json");
+  assertRegularCodexAuthPath(authPath);
+  const existed = authFileExists(authPath);
+  const previousAuth = existed ? readNoFollow(authPath) : undefined;
+  const previousMode = existed ? lstatSync(authPath).mode & 0o777 : undefined;
+  const env = { ...process.env };
+  delete env.CODEX_AUTH_JSON;
+  mkdirSync(codexDirectory, { recursive: true, mode: 0o700 });
+  writeNoFollow(authPath, process.env.CODEX_AUTH_JSON.replace(/\n$/, ""), 0o600, !existed);
+  try {
+    return run(env);
+  } finally {
+    if (existed && previousAuth !== undefined) {
+      writeNoFollow(authPath, previousAuth, previousMode ?? 0o600);
+    } else {
+      rmSync(authPath, { force: true });
+    }
+  }
+}
+
 export const defaultPrepareRunner: PrepareRunner = ({ agent, model, prompt, directory }) => {
   let command: string;
   let args: string[];
@@ -234,12 +304,15 @@ export const defaultPrepareRunner: PrepareRunner = ({ agent, model, prompt, dire
     command = "opencode";
     args = ["run", "--format", "json", "--model", model ?? "", "--dir", directory, "--auto", prompt];
   }
-  const result = spawnSync(command, args, {
-    cwd: directory,
-    input,
-    maxBuffer: PREPARE_RUNNER_MAX_BUFFER_BYTES,
-    timeout: 30 * 60 * 1000,
-  });
+  const spawn = (env?: NodeJS.ProcessEnv) =>
+    spawnSync(command, args, {
+      cwd: directory,
+      env,
+      input,
+      maxBuffer: PREPARE_RUNNER_MAX_BUFFER_BYTES,
+      timeout: 30 * 60 * 1000,
+    });
+  const result = agent === "codex" ? withCodexAuthJsonFile(spawn) : spawn();
   if (result.error && (result.error as NodeJS.ErrnoException).code === "ENOENT") {
     throw new Error(`openthrottle plan prepare could not find ${command} on PATH; install the configured local engine or change agent in .openthrottle.yml.`);
   }

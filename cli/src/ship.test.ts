@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { stringify } from "yaml";
-import ship, { delegateIssue, parseMarkdown, parseShipArgs, validateGraphSelectionForShip } from "./ship.js";
+import ship, { SHIP_SELECTION_FENCE, delegateIssue, parseMarkdown, parseShipArgs, validateGraphSelectionForShip } from "./ship.js";
 
 const directories: string[] = [];
 
@@ -40,6 +40,12 @@ function writeStructuredConfig(directory: string): void {
       },
     })
   );
+}
+
+function readShipSelection(description: string): unknown {
+  const match = description.match(/```json openthrottle\.ship-selection\/v1\n([\s\S]*?)```/);
+  if (!match) throw new Error("missing ship selection block");
+  return JSON.parse(match[1]!.trim());
 }
 
 describe("ship", () => {
@@ -187,8 +193,12 @@ describe("ship", () => {
       await ship([planPath, "--graph", "structured"]);
       expect(fetchMock).toHaveBeenCalledTimes(1);
       const payload = JSON.parse(String(fetchMock.mock.calls[0]![1]!.body));
-      expect(payload.variables.input.description).toContain("openthrottle.execution-plan/v1");
-      expect(payload.variables.input.description).toContain('"graph_id": "structured"');
+      const description = String(payload.variables.input.description);
+      expect(description).toContain("openthrottle.execution-plan/v1");
+      expect(readShipSelection(description)).toEqual({
+        schema: SHIP_SELECTION_FENCE,
+        graph_id: "structured",
+      });
     } finally {
       process.chdir(previousCwd);
       globalThis.fetch = originalFetch;

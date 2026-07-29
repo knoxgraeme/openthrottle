@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -217,6 +217,7 @@ describe("plan validation", () => {
 
   it("prepares through the CLI and tolerates verbose local engine output", async () => {
     const directory = temporaryProject();
+    const home = temporaryProject();
     const bin = join(directory, "bin");
     const planPath = join(directory, "plan.md");
     const preparedPlan = planWithBlock("structured");
@@ -224,11 +225,20 @@ describe("plan validation", () => {
     writeConfig(directory);
     writeFileSync(planPath, cePlan);
     const fakeCodex = join(bin, "codex");
+    const codexDirectory = join(home, ".codex");
+    const authPath = join(codexDirectory, "auth.json");
+    mkdirSync(codexDirectory);
+    writeFileSync(authPath, '{"tokens":{"access_token":"old"}}');
     writeFileSync(
       fakeCodex,
       [
         "#!/usr/bin/env node",
         "const fs = require('node:fs');",
+        "const os = require('node:os');",
+        "const path = require('node:path');",
+        "const authPath = path.join(os.homedir(), '.codex', 'auth.json');",
+        "if (process.env.CODEX_AUTH_JSON) process.exit(6);",
+        "if (fs.readFileSync(authPath, 'utf8') !== process.env.OT_TEST_EXPECTED_AUTH) process.exit(7);",
         "process.stdin.resume();",
         "process.stdin.on('end', () => {",
         "  fs.writeFileSync(process.env.OT_TEST_PLAN_PATH, process.env.OT_TEST_PLAN_BODY);",
@@ -239,14 +249,20 @@ describe("plan validation", () => {
     chmodSync(fakeCodex, 0o755);
 
     const previousCwd = process.cwd();
+    const previousHome = process.env.HOME;
     const previousPath = process.env.PATH;
     const previousOpenAiKey = process.env.OPENAI_API_KEY;
+    const previousCodexAuth = process.env.CODEX_AUTH_JSON;
+    const previousExpectedAuth = process.env.OT_TEST_EXPECTED_AUTH;
     const previousPlanPath = process.env.OT_TEST_PLAN_PATH;
     const previousPlanBody = process.env.OT_TEST_PLAN_BODY;
     const log = console.log;
     const output: string[] = [];
+    process.env.HOME = home;
     process.env.PATH = `${bin}:${previousPath ?? ""}`;
-    process.env.OPENAI_API_KEY = "test-key";
+    delete process.env.OPENAI_API_KEY;
+    process.env.CODEX_AUTH_JSON = '{"tokens":{"access_token":"test"}}';
+    process.env.OT_TEST_EXPECTED_AUTH = process.env.CODEX_AUTH_JSON;
     process.env.OT_TEST_PLAN_PATH = planPath;
     process.env.OT_TEST_PLAN_BODY = preparedPlan;
     console.log = (message?: unknown) => {
@@ -263,17 +279,78 @@ describe("plan validation", () => {
       expect(readExecutionPlanFromMarkdown(readFileSync(planPath, "utf8"), planPath).plan.value.graph_id).toBe(
         "structured"
       );
+      expect(readFileSync(authPath, "utf8")).toBe('{"tokens":{"access_token":"old"}}');
     } finally {
       process.chdir(previousCwd);
       console.log = log;
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
       if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
       else process.env.OPENAI_API_KEY = previousOpenAiKey;
+      if (previousCodexAuth === undefined) delete process.env.CODEX_AUTH_JSON;
+      else process.env.CODEX_AUTH_JSON = previousCodexAuth;
+      if (previousExpectedAuth === undefined) delete process.env.OT_TEST_EXPECTED_AUTH;
+      else process.env.OT_TEST_EXPECTED_AUTH = previousExpectedAuth;
       if (previousPlanPath === undefined) delete process.env.OT_TEST_PLAN_PATH;
       else process.env.OT_TEST_PLAN_PATH = previousPlanPath;
       if (previousPlanBody === undefined) delete process.env.OT_TEST_PLAN_BODY;
       else process.env.OT_TEST_PLAN_BODY = previousPlanBody;
+    }
+  });
+
+  it("refuses to materialize CODEX_AUTH_JSON through an auth.json symlink", async () => {
+    const directory = temporaryProject();
+    const home = temporaryProject();
+    const bin = join(directory, "bin");
+    const planPath = join(directory, "plan.md");
+    mkdirSync(bin);
+    mkdirSync(join(home, ".codex"));
+    symlinkSync(join(home, "target-auth.json"), join(home, ".codex", "auth.json"));
+    writeConfig(directory);
+    writeFileSync(planPath, cePlan);
+    writeFileSync(
+      join(bin, "codex"),
+      [
+        "#!/usr/bin/env node",
+        "process.exit(9);",
+      ].join("\n")
+    );
+    chmodSync(join(bin, "codex"), 0o755);
+
+    const previousCwd = process.cwd();
+    const previousHome = process.env.HOME;
+    const previousPath = process.env.PATH;
+    const previousOpenAiKey = process.env.OPENAI_API_KEY;
+    const previousCodexAuth = process.env.CODEX_AUTH_JSON;
+    const exit = process.exit;
+    const error = console.error;
+    process.env.HOME = home;
+    process.env.PATH = `${bin}:${previousPath ?? ""}`;
+    delete process.env.OPENAI_API_KEY;
+    process.env.CODEX_AUTH_JSON = '{"tokens":{"access_token":"test"}}';
+    process.exit = ((code?: string | number | null) => {
+      throw new Error(`exit ${code}`);
+    }) as typeof process.exit;
+    console.error = () => undefined;
+    try {
+      process.chdir(directory);
+      const { plan } = await import("./plan.js");
+      await expect(plan(["prepare", planPath, "--graph", "structured"])).rejects.toThrow(/exit 1/);
+      expect(existsSync(join(home, "target-auth.json"))).toBe(false);
+    } finally {
+      process.chdir(previousCwd);
+      process.exit = exit;
+      console.error = error;
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previousOpenAiKey;
+      if (previousCodexAuth === undefined) delete process.env.CODEX_AUTH_JSON;
+      else process.env.CODEX_AUTH_JSON = previousCodexAuth;
     }
   });
 
