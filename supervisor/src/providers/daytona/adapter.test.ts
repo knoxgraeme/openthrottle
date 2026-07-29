@@ -110,7 +110,23 @@ describe("Daytona stage execution", () => {
     expect(sandbox.updateEnv).toHaveBeenLastCalledWith(expect.objectContaining({
       RUN_ID: "run-1",
       BASE_BRANCH: "release/2.0",
-    }));
+    }), { unset: ["OT_CHILD_ACTION_ID"] });
+
+    const childWithoutFence: Omit<StageRequestEnvelope, "requestHash" | "idempotencyKey"> = {
+      ...withoutFence,
+      stageId: "child-implementation",
+      attemptId: "attempt-child",
+      runId: "run-parent",
+      childActionId: "action-1",
+    };
+    const childRequest = { ...childWithoutFence, ...createStageRequestHash(childWithoutFence) };
+    await expect(runtime.dispatchStage(resource, childRequest)).resolves.toEqual({
+      providerDispatchId: "dispatch-opaque-1",
+    });
+    expect(sandbox.updateEnv).toHaveBeenLastCalledWith(expect.objectContaining({
+      RUN_ID: "run-parent",
+      OT_CHILD_ACTION_ID: "action-1",
+    }), { unset: [] });
     expect(sandbox.process.executeSessionCommand).toHaveBeenCalledWith(
       "stage-attempt-1",
       expect.objectContaining({

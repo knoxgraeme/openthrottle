@@ -231,6 +231,15 @@ export interface OrchestrationJournalQuery {
   limit?: number;
 }
 
+export interface ChildActionLivenessPort {
+  renewChildActionLiveness(input: {
+    parentRunId: string;
+    actionId: string;
+    heartbeatAtIso: string;
+    leaseUntilIso: string;
+  }): boolean;
+}
+
 export interface PipelineStatusProjection {
   execution_mode: "pipeline";
   instance_id: string;
@@ -356,7 +365,7 @@ export interface CoordinatorTransitionWrite {
   exhaustedEffectError?: string;
 }
 
-export interface PipelineStore {
+export interface PipelineStore extends ChildActionLivenessPort {
   acceptCatalog(catalog: ValidatedPipelineCatalog): void;
   acceptRuntimeDescriptor(runtime: ValidatedRuntimeCapabilityDescriptor): void;
   saveRepositoryConfigSnapshot(input: {

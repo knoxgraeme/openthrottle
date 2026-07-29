@@ -53,6 +53,32 @@ describe("runtime event contracts", () => {
       created_at: "2026-07-18T00:00:00.000Z",
     }))).toThrow(/event_id/);
 
+    expect(parseSandboxEvent(JSON.stringify({
+      version: 1,
+      kind: "heartbeat",
+      event_id: "44444444-4444-4444-8444-444444444444",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:00.000Z",
+      child_action_id: "action-1",
+      ignored: "dropped",
+    }))).toEqual({
+      version: 1,
+      kind: "heartbeat",
+      event_id: "44444444-4444-4444-8444-444444444444",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:00.000Z",
+      child_action_id: "action-1",
+    });
+
+    expect(() => parseSandboxEvent(JSON.stringify({
+      version: 1,
+      kind: "heartbeat",
+      event_id: "44444444-4444-4444-8444-444444444444",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:00.000Z",
+      child_action_id: "../bad",
+    }))).toThrow(/child_action_id/);
+
     expect(() => parseSandboxEvent(JSON.stringify({
       version: 1,
       kind: "plan",

@@ -121,6 +121,7 @@ async function main() {
       await pollSandboxEvents({
         runtime,
         store,
+        childActions: pipelineStore,
         postActivity: async (activity, event) => {
           const row = store.enqueueLinearOutbox({
             id: event.event_id,

@@ -174,7 +174,7 @@ describe("execution unit store", () => {
     ]);
   });
 
-  it("recovers an expired dispatched action without duplicating work", () => {
+  it("heals an expired dispatched action instead of duplicating work", () => {
     const store = setup();
     store.createGraph({
       pipelineInstanceId: "instance-1",
@@ -194,21 +194,325 @@ describe("execution unit store", () => {
     })!;
     store.markActionDispatched(first.id, "request-hash", "native-session");
 
-    const recovered = store.leaseNextUnitAction({
+    const next = store.leaseNextUnitAction({
       parentAttemptId: "attempt-parent",
       leaseOwner: "worker-2",
       nowIso: "2026-07-29T00:00:02.000Z",
       leaseUntilIso: "2026-07-29T00:01:00.000Z",
     });
 
-    expect(recovered?.id).toBe(first.id);
-    expect(recovered?.unit_id).toBe("a");
+    expect(next?.id).not.toBe(first.id);
+    expect(next?.unit_id).toBe("b");
     expect(db!.prepare(`
-      SELECT COUNT(*) AS count FROM execution_work_attempts WHERE parent_attempt_id = ?
-    `).get("attempt-parent")).toEqual({ count: 1 });
+      SELECT status, completed_at, last_error FROM execution_work_attempts WHERE id = ?
+    `).get(first.id)).toEqual({
+      status: "dead",
+      completed_at: "2026-07-29T00:00:02.000Z",
+      last_error: "child action missed heartbeat fence",
+    });
     expect(store.listUnits("attempt-parent")).toEqual([
-      expect.objectContaining({ unitId: "a", status: "running", activeActionId: first.id }),
+      expect.objectContaining({
+        unitId: "a",
+        status: "exited",
+        activeActionId: null,
+        terminalLevel: "exited",
+        alarm: false,
+      }),
+      expect.objectContaining({ unitId: "b", status: "running", activeActionId: next!.id }),
+    ]);
+  });
+
+  it("heals stale dispatched child actions to exited and releases serial dispatch", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b" }],
+    });
+
+    const stale = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: "2026-07-29T00:00:00.000Z",
+      leaseUntilIso: "2026-07-29T00:00:01.000Z",
+    })!;
+    store.markActionDispatched(stale.id, "request-hash", "native-session");
+
+    const healed = store.healStaleChildActions({
+      parentAttemptId: "attempt-parent",
+      nowIso: "2026-07-29T00:00:02.000Z",
+      reason: "child action missed heartbeat fence",
+    });
+    expect(healed).toEqual([{ actionId: stale.id, unitId: "a" }]);
+    expect(db!.prepare(`
+      SELECT status, completed_at, last_error FROM execution_work_attempts WHERE id = ?
+    `).get(stale.id)).toEqual({
+      status: "dead",
+      completed_at: "2026-07-29T00:00:02.000Z",
+      last_error: "child action missed heartbeat fence",
+    });
+    expect(store.listUnits("attempt-parent")).toEqual([
+      expect.objectContaining({
+        unitId: "a",
+        status: "exited",
+        activeActionId: null,
+        terminalLevel: "exited",
+        alarm: false,
+      }),
       expect.objectContaining({ unitId: "b", status: "pending", activeActionId: null }),
+    ]);
+
+    const next = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-2",
+      nowIso: "2026-07-29T00:00:02.000Z",
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    });
+    expect(next?.unit_id).toBe("b");
+  });
+
+  it("heals stale running child actions to exited and releases serial dispatch", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b" }],
+    });
+
+    const stale = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: "2026-07-29T00:00:00.000Z",
+      leaseUntilIso: "2026-07-29T00:00:01.000Z",
+    })!;
+    store.markActionDispatched(stale.id, "request-hash", "native-session");
+    db!.prepare("UPDATE execution_work_attempts SET status = 'running' WHERE id = ?").run(stale.id);
+
+    expect(store.healStaleChildActions({
+      parentAttemptId: "attempt-parent",
+      nowIso: "2026-07-29T00:00:02.000Z",
+      reason: "child action missed heartbeat fence",
+    })).toEqual([{ actionId: stale.id, unitId: "a" }]);
+    expect(db!.prepare(`
+      SELECT status, completed_at, last_error FROM execution_work_attempts WHERE id = ?
+    `).get(stale.id)).toEqual({
+      status: "dead",
+      completed_at: "2026-07-29T00:00:02.000Z",
+      last_error: "child action missed heartbeat fence",
+    });
+    expect(store.listUnits("attempt-parent")).toEqual([
+      expect.objectContaining({
+        unitId: "a",
+        status: "exited",
+        activeActionId: null,
+        terminalLevel: "exited",
+        alarm: false,
+      }),
+      expect.objectContaining({ unitId: "b", status: "pending", activeActionId: null }),
+    ]);
+    expect(store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-2",
+      nowIso: "2026-07-29T00:00:02.000Z",
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })?.unit_id).toBe("b");
+  });
+
+  it("does not renew child action liveness from dispatcher polling", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b" }],
+    });
+
+    const active = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: "2026-07-29T00:00:00.000Z",
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })!;
+    store.markActionDispatched(active.id, "request-hash", "native-session");
+
+    const polled = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-2",
+      nowIso: "2026-07-29T00:00:30.000Z",
+      leaseUntilIso: "2026-07-29T00:02:00.000Z",
+    });
+    expect(polled?.id).toBe(active.id);
+    expect(db!.prepare("SELECT lease_owner, lease_until FROM execution_work_attempts WHERE id = ?").get(active.id)).toEqual({
+      lease_owner: "worker-1",
+      lease_until: "2026-07-29T00:01:00.000Z",
+    });
+
+    const next = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-2",
+      nowIso: "2026-07-29T00:01:01.000Z",
+      leaseUntilIso: "2026-07-29T00:02:00.000Z",
+    });
+    expect(next?.unit_id).toBe("b");
+    expect(db!.prepare("SELECT status FROM execution_work_attempts WHERE id = ?").get(active.id)).toEqual({
+      status: "dead",
+    });
+  });
+
+  it("cascades structural exit to dependents blocked by a healed prerequisite", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b", dependencies: ["a"] }],
+    });
+
+    const stale = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: "2026-07-29T00:00:00.000Z",
+      leaseUntilIso: "2026-07-29T00:00:01.000Z",
+    })!;
+    store.markActionDispatched(stale.id, "request-hash", "native-session");
+
+    expect(store.healStaleChildActions({
+      parentAttemptId: "attempt-parent",
+      nowIso: "2026-07-29T00:00:02.000Z",
+      reason: "child action missed heartbeat fence",
+    })).toEqual([{ actionId: stale.id, unitId: "a" }]);
+    expect(store.listUnits("attempt-parent")).toEqual([
+      expect.objectContaining({ unitId: "a", status: "exited", terminalLevel: "exited", alarm: false }),
+      expect.objectContaining({ unitId: "b", status: "exited", terminalLevel: "exited", alarm: false }),
+    ]);
+    expect(store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-2",
+      nowIso: "2026-07-29T00:00:02.000Z",
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })).toBeUndefined();
+  });
+
+  it("distinguishes slow alive child actions from frozen child actions", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+    });
+
+    const active = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: "2026-07-29T00:00:00.000Z",
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })!;
+    store.markActionDispatched(active.id, "request-hash", "native-session");
+
+    expect(store.healStaleChildActions({
+      parentAttemptId: "attempt-parent",
+      nowIso: "2026-07-29T00:00:30.000Z",
+      reason: "child action missed heartbeat fence",
+    })).toEqual([]);
+    expect(store.listUnits("attempt-parent")).toEqual([
+      expect.objectContaining({
+        unitId: "a",
+        status: "running",
+        activeActionId: active.id,
+        terminalLevel: null,
+        alarm: false,
+      }),
+    ]);
+  });
+
+  it("renews child action liveness only under its parent run fence", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+    });
+
+    const active = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: "2026-07-29T00:00:00.000Z",
+      leaseUntilIso: "2026-07-29T00:00:10.000Z",
+    })!;
+    store.markActionDispatched(active.id, "request-hash", "native-session");
+
+    expect(store.renewChildActionLiveness({
+      parentRunId: "wrong-run",
+      actionId: active.id,
+      heartbeatAtIso: "2026-07-29T00:00:05.000Z",
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })).toBe(false);
+    expect(store.renewChildActionLiveness({
+      parentRunId: "run-parent",
+      actionId: active.id,
+      heartbeatAtIso: "2026-07-29T00:00:05.000Z",
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })).toBe(true);
+    expect(db!.prepare("SELECT lease_until FROM execution_work_attempts WHERE id = ?").get(active.id)).toEqual({
+      lease_until: "2026-07-29T00:01:00.000Z",
+    });
+    expect(store.renewChildActionLiveness({
+      parentRunId: "run-parent",
+      actionId: active.id,
+      heartbeatAtIso: "2026-07-29T00:00:06.000Z",
+      leaseUntilIso: "2026-07-29T00:00:30.000Z",
+    })).toBe(true);
+    expect(db!.prepare("SELECT lease_until FROM execution_work_attempts WHERE id = ?").get(active.id)).toEqual({
+      lease_until: "2026-07-29T00:01:00.000Z",
+    });
+  });
+
+  it("levels failed unit terminals with the operator alarm set", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+    });
+
+    expect(store.settleUnitTerminal({
+      parentAttemptId: "attempt-parent",
+      unitId: "a",
+      reason: "defect",
+    })).toBe("settled");
+    expect(store.listUnits("attempt-parent")).toEqual([
+      expect.objectContaining({
+        unitId: "a",
+        status: "failed",
+        terminalLevel: "failed",
+        alarm: true,
+      }),
     ]);
   });
 
@@ -236,6 +540,12 @@ describe("execution unit store", () => {
       leaseUntilIso: "2026-07-29T00:01:00.000Z",
     });
     store.completeUnitAction({ actionId: action!.id, resultHash: "result-hash", outputSubject: "111" });
+
+    store.settleUnitTerminal({
+      parentAttemptId: "attempt-parent",
+      unitId: "a",
+      reason: "acceptance_passed",
+    });
 
     expect(store.emitAggregateOnce({
       parentAttemptId: "attempt-parent",
@@ -409,8 +719,20 @@ describe("execution unit store", () => {
       hash: digestNormalized(payload),
     })).toThrow(/is not receivable/);
     expect(store.listUnits("attempt-parent")).toEqual([
-      expect.objectContaining({ unitId: "a", status: "pending", activeActionId: null }),
-      expect.objectContaining({ unitId: "b", status: "pending", activeActionId: null }),
+      expect.objectContaining({
+        unitId: "a",
+        status: "exited",
+        activeActionId: null,
+        terminalLevel: "exited",
+        alarm: false,
+      }),
+      expect.objectContaining({
+        unitId: "b",
+        status: "exited",
+        activeActionId: null,
+        terminalLevel: "exited",
+        alarm: false,
+      }),
     ]);
     expect(db!.prepare("SELECT status, last_error FROM execution_work_attempts WHERE id = ?").get(action.id)).toEqual({
       status: "dead",
@@ -446,7 +768,13 @@ describe("execution unit store", () => {
       leaseUntilIso: "2026-07-29T00:01:00.000Z",
     })).toBeUndefined();
     expect(store.listUnits("attempt-parent")).toEqual([
-      expect.objectContaining({ unitId: "a", status: "pending", activeActionId: null }),
+      expect.objectContaining({
+        unitId: "a",
+        status: "exited",
+        activeActionId: null,
+        terminalLevel: "exited",
+        alarm: false,
+      }),
     ]);
     expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({
       stopped_at: timestamp,

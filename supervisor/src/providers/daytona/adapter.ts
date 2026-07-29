@@ -236,9 +236,10 @@ export function createDaytonaSandboxRuntime(
         BRANCH_NAME: request.branch,
         AGENT: request.agent,
         RUN_ID: request.runId,
+        ...(request.childActionId ? { OT_CHILD_ACTION_ID: request.childActionId } : {}),
         LINEAR_ISSUE_ID: request.issueId,
         LINEAR_ISSUE_IDENTIFIER: request.issueId,
-      });
+      }, { unset: request.childActionId ? [] : ["OT_CHILD_ACTION_ID"] });
       const sessionId = `stage-${request.attemptId}`;
       await sandbox.process.createSession(sessionId).catch(() => undefined);
       const dispatched = await sandbox.process.executeSessionCommand(sessionId, {

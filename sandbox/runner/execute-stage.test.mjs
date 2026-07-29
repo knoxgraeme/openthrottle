@@ -183,6 +183,12 @@ describe("one-stage executor", () => {
       taskContext: "Implement the approved fixture change.",
       transitionContext: "",
     });
+    const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...withoutFence } = request;
+    const childRequest = { ...withoutFence, childActionId: "action-1" };
+    const sealedChildRequest = { ...childRequest, ...createStageRequestHash(childRequest) };
+    expect(validateStageRequest(sealedChildRequest)).toMatchObject({ childActionId: "action-1" });
+    expect(() => validateStageRequest({ ...sealedChildRequest, childActionId: "../bad" }))
+      .toThrow(/childActionId/);
     expect(stagePrompt(request, "/tmp/proposal.json")).toContain("Implement the approved fixture change.");
     expect(stagePrompt({ ...request, taskType: "investigate", capability: "ce/publish@1" }, "/tmp/proposal.json"))
       .toMatch(/^\$investigate/);

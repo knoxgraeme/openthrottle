@@ -103,4 +103,53 @@ describe("stage request construction", () => {
       idempotencyKey: `stage:pipeline-1:quality-gate:attempt-1:${request.requestHash}`,
     });
   });
+
+  it("includes an optional child action id in the immutable request fence", () => {
+    const stage: PipelineStage = {
+      id: "implementation",
+      executor: { kind: "agent", capability: "ce/implement@1" },
+      evaluator: {
+        kind: "semantic",
+        assurance: "semantic_attested",
+        required_artifacts: [],
+      },
+      context: "fresh",
+      live_steering: true,
+      credentials: ["repo.read"],
+      produces: ["stage_result"],
+      transitions: {} as PipelineStage["transitions"],
+    };
+    const request = buildStageRequest({
+      instanceId: "pipeline-1",
+      manifestDigest: "a".repeat(64),
+      runtimeRelease: "snapshot/v1",
+      capabilityDigest: "b".repeat(64),
+      repositoryConfigDigest: "d".repeat(64),
+      stage,
+      attemptId: "attempt-child",
+      runId: "run-parent",
+      issueId: "issue-1",
+      sessionId: "session-1",
+      generation: 1,
+      taskType: "implement",
+      taskContext: "Implement the approved plan.",
+      transitionContext: "",
+      repository: "owner/repo",
+      baseCommit: "c".repeat(40),
+      baseBranch: "release/2.0",
+      branch: "ot/issue-1",
+      agent: "codex",
+      contextRevision: 0,
+      expectedSubject: null,
+      nativeSessionId: null,
+      childActionId: "action-1",
+    });
+
+    expect(request.childActionId).toBe("action-1");
+    expect(request.idempotencyKey).toBe(`stage:pipeline-1:implementation:attempt-child:${request.requestHash}`);
+    const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...withoutFence } = request;
+    const { childActionId: _childActionId, ...withoutChildAction } = withoutFence;
+    expect(createStageRequestHash(withoutFence))
+      .not.toEqual(createStageRequestHash(withoutChildAction));
+  });
 });
