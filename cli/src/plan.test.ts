@@ -142,8 +142,10 @@ describe("plan validation", () => {
     const previousHome = process.env.HOME;
     const previousOpenAiKey = process.env.OPENAI_API_KEY;
     const previousCodexAuth = process.env.CODEX_AUTH_JSON;
+    const previousCodexHome = process.env.CODEX_HOME;
     process.env.HOME = home;
     delete process.env.OPENAI_API_KEY;
+    delete process.env.CODEX_HOME;
     delete process.env.CODEX_AUTH_JSON;
     const runner: PrepareRunner = () => {
       throw new Error("runner should not be invoked");
@@ -159,6 +161,39 @@ describe("plan validation", () => {
       else process.env.OPENAI_API_KEY = previousOpenAiKey;
       if (previousCodexAuth === undefined) delete process.env.CODEX_AUTH_JSON;
       else process.env.CODEX_AUTH_JSON = previousCodexAuth;
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+    }
+  });
+
+  it("honors CODEX_HOME when checking local Codex auth", () => {
+    const directory = temporaryProject();
+    const codexHome = temporaryProject();
+    const planPath = join(directory, "plan.md");
+    writeConfig(directory);
+    writeFileSync(planPath, cePlan);
+    writeFileSync(join(codexHome, "auth.json"), "{}");
+    const previousOpenAiKey = process.env.OPENAI_API_KEY;
+    const previousCodexAuth = process.env.CODEX_AUTH_JSON;
+    const previousCodexHome = process.env.CODEX_HOME;
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.CODEX_AUTH_JSON;
+    process.env.CODEX_HOME = codexHome;
+    const runner: PrepareRunner = () => {
+      writeFileSync(planPath, planWithBlock("structured"));
+      return { status: 0, signal: null, output: [], pid: 123, stdout: Buffer.from(""), stderr: Buffer.from("") };
+    };
+    try {
+      expect(prepareExecutionPlanFile(planPath, { directory, graphId: "structured", runner }).plan.value.graph_id).toBe(
+        "structured"
+      );
+    } finally {
+      if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previousOpenAiKey;
+      if (previousCodexAuth === undefined) delete process.env.CODEX_AUTH_JSON;
+      else process.env.CODEX_AUTH_JSON = previousCodexAuth;
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
     }
   });
 
@@ -332,8 +367,10 @@ describe("plan validation", () => {
     const previousHome = process.env.HOME;
     const previousOpenAiKey = process.env.OPENAI_API_KEY;
     const previousCodexAuth = process.env.CODEX_AUTH_JSON;
+    const previousCodexHome = process.env.CODEX_HOME;
     process.env.HOME = home;
     delete process.env.OPENAI_API_KEY;
+    delete process.env.CODEX_HOME;
     process.env.CODEX_AUTH_JSON = '{"tokens":{"access_token":"test"}}';
     const runner: PrepareRunner = () => {
       throw new Error("runner should not be invoked");
@@ -349,6 +386,8 @@ describe("plan validation", () => {
       else process.env.OPENAI_API_KEY = previousOpenAiKey;
       if (previousCodexAuth === undefined) delete process.env.CODEX_AUTH_JSON;
       else process.env.CODEX_AUTH_JSON = previousCodexAuth;
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
     }
   });
 
