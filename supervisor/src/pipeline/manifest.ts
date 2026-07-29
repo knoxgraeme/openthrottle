@@ -56,9 +56,12 @@ export const EVALUATOR_KINDS = [
 export type EvaluatorKind = (typeof EVALUATOR_KINDS)[number];
 export const ARTIFACT_KINDS = [
   "stage_result",
+  "standard_receipt",
   "execution_graph_result",
   "review",
   "command_result",
+  "candidate_evidence",
+  "integration_evidence",
   "provider_check",
   "human_approval",
   "publish_subject",

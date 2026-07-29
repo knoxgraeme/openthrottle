@@ -56,8 +56,8 @@ export interface LoopActionRequest {
   attemptId: string;
   graphId: string;
   unitId: string | null;
-  role: "worker" | "lead" | "reviewer";
-  loop: "implement" | "simplify" | "command" | "repair" | "lead" | "review";
+  role: "worker" | "lead" | "reviewer" | "publisher";
+  loop: "implement" | "simplify" | "command" | "repair" | "lead" | "review" | "publish";
   agent: "claude" | "codex" | "opencode";
   skill: string;
   worktree: RuntimeWorktreeHandle | null;
