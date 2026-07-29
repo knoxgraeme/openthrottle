@@ -114,6 +114,12 @@ describe("ship", () => {
     try {
       process.chdir(directory);
       await expect(ship([planPath, "--graph", "structured"])).rejects.toThrow(/exit 1/);
+      const nonCanonical = executionPlanBlock("structured").replace(
+        "json openthrottle.execution-plan/v1",
+        "json"
+      );
+      writeFileSync(planPath, `# Ship it\n\n${nonCanonical}`);
+      await expect(ship([planPath, "--graph", "structured"])).rejects.toThrow(/exit 1/);
       writeFileSync(planPath, `# Ship it\n\n${executionPlanBlock("structured")}`);
       await expect(ship([planPath, "--graph", "simple"])).rejects.toThrow(/exit 1/);
       writeStructuredConfig(directory, ["structured"]);
