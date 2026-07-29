@@ -363,19 +363,43 @@ describe("pipeline manifest validation", () => {
 
   it("accepts only bounded repository settings and canonical pipeline selections", () => {
     const parsed = parseRepositoryConfig(`
+schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - { id: simple, kind: builtin, ref: core/simple@1 }
+  - { id: structured, kind: repository, ref: .openthrottle/graphs/structured-canary.json }
 agent: codex
 test: npm test --prefix supervisor
 limits: { max_turns: 20, task_timeout: 300 }
 pipelines: { implement: implement, investigate: core/investigate@2 }
 mcp_servers: {}
+intents:
+  implement: { default_graph: simple, allowed_graphs: [simple, structured] }
 `);
     expect(parsed.config.pipelines).toEqual({
       implement: "implement",
       investigate: "core/investigate@2",
     });
+    expect(parsed.config.default_graph).toBe("simple");
+    expect(parsed.config.graphs).toHaveLength(2);
+    expect(parsed.config.intents?.implement?.allowed_graphs).toEqual(["simple", "structured"]);
     expect(parseRepositoryConfig(parsed.normalized.replace(/^/, "")).digest).toBe(parsed.digest);
     expect(() => parseRepositoryConfig("pipeline_logic: !!js/function evil")).toThrow();
     expect(() => parseRepositoryConfig("limits: { task_timeout: 999999 }")).toThrow(/between 1 and 86400/);
     expect(() => parseRepositoryConfig("mcp_servers: { local: { command: node, surprise: true } }")).toThrow(/unknown field/);
+    expect(() => parseRepositoryConfig(`
+schema: openthrottle.config/v1
+default_graph: structured
+graphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]
+`)).toThrow(/default_graph: references an unknown graph/);
+    expect(() => parseRepositoryConfig(`
+schema: openthrottle.config/v1
+default_graph: simple
+graphs: [{ id: structured, kind: repository, ref: ../structured.json }]
+`)).toThrow(/ref: has an invalid format/);
+    expect(() => parseRepositoryConfig(`
+schema: openthrottle.config/v1
+agent: codex
+`)).toThrow(/default_graph: is required/);
   });
 });

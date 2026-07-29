@@ -225,12 +225,14 @@ No finding is dispositioned **verified obsolete**: every original finding maps
 to a prerequisite fix, a unit that will resolve it, or explicit open follow-up
 work.
 
-## U8 cutover re-audit — 2026-07-22
+## U8 cutover re-audit — 2026-07-29
 
 This is the required line-by-line U8 re-audit of the original findings and the
 four pre-existing issues. “Resolved” means the named repository evidence is
 implemented and covered locally; it does not claim the credentialed deployment
-acceptance reserved for the rollout gate.
+acceptance reserved for the rollout gate. The structured graph is an opt-in
+canary in `.openthrottle.yml`; `simple` remains the repository default. Flipping
+the default to structured requires Graeme's separate explicit approval.
 
 | Finding | U8 status | Repository evidence |
 |---|---|---|
@@ -265,12 +267,11 @@ acceptance reserved for the rollout gate.
 
 ### U8 verdict
 
-> **Verdict:** Locally complete for the pre-production POC; credentialed acceptance is deferred.
+> **Verdict:** Locally ready for opt-in structured dogfood; credentialed acceptance is still required before any default migration.
 >
 > The original autonomy-breaking delivery, liveness, fencing, typed-result,
 > and false-authority findings are resolved in repository code. #20 remains an
 > explicit deferred verification item and #21 remains an orthogonal
-> credential-trust decision. Because this is a POC with no installed consumer
-> population, new generations use the coordinator unconditionally and there is
-> no canary cohort, legacy-drain period, or production soak gate. Destructive
-> schema contraction remains separate.
+> credential-trust decision. New generations continue to use the current
+> default unless structured is explicitly selected. The default flip, production
+> soak, and destructive schema contraction remain separate decisions.

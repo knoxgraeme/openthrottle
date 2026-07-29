@@ -139,12 +139,35 @@ describe("execution graph compiler", () => {
     });
   });
 
+  it("compiles for_each_unit to the installed serial loop-action capability", () => {
+    const compiled = validateAndCompileExecutionGraph(minimalGraph({
+      node: {
+        kind: "for_each_unit",
+        transitions: {
+          success: { terminal: "completed" },
+          repair_required: { to: "stage", max_reentries: 3, on_exhausted: "needs_human" },
+        },
+      },
+      loop: { input_scope: "unit" },
+    })).manifest.manifest;
+
+    expect(compiled.requires.capabilities).toEqual(["loop-action@1"]);
+    expect(compiled.stages[0]).toMatchObject({
+      id: "stage",
+      executor: { kind: "loop_action", capability: "loop-action@1" },
+      evaluator: {
+        kind: "semantic",
+        assurance: "executor_verified",
+        required_artifacts: ["execution_graph_result"],
+      },
+      context: "fresh",
+      live_steering: false,
+      credentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+      produces: ["stage_result", "execution_graph_result"],
+    });
+  });
+
   it.each([
-    [
-      "for_each_unit nodes",
-      minimalGraph({ node: { kind: "for_each_unit" } }),
-      /graph\.nodes\.stage\.kind: cannot compile for_each_unit yet/,
-    ],
     [
       "human nodes",
       minimalGraph({

@@ -134,6 +134,10 @@ Run `openthrottle init` in each target checkout with `OT_SUPERVISOR_URL` and
 access and requested base branch, creates or refreshes a JSON webhook at
 `https://<app>.fly.dev/webhooks/github`, verifies that `DAYTONA_SNAPSHOT` is
 active, and stores the Linear-team route in SQLite.
+Repositories may declare public execution graphs in `.openthrottle.yml`, with
+intent-level defaults and allowlists. The current OpenThrottle repository keeps
+`simple` as the implement default and exposes `structured` as an explicit canary;
+flipping that default is a separate operator-approved migration.
 
 The PAT needs repository administration/webhooks read-write, contents and
 pull requests read-write, and checks/actions read on every registered target.

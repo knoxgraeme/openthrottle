@@ -19,7 +19,7 @@ import {
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import type { PipelineInstance, PipelineInstanceStage, PipelineStageAttempt } from "./store.js";
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
-import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
+import type { ExecutionUnitStore } from "./store.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
 const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));

@@ -1,164 +1,21 @@
 import type Database from "better-sqlite3";
-import { canonicalJson, digestNormalized, type StageOutcome } from "../../pipeline/manifest.js";
+import { canonicalJson, digestNormalized } from "../../pipeline/manifest.js";
 import { buildExecutionPublicationSnapshot } from "../../pipeline/execution-publication.js";
+import type {
+  ExecutionDownstreamContext,
+  ExecutionGateReceipt,
+  ExecutionUnitGraph,
+  ExecutionUnitStore,
+  ExecutionWorkAttempt,
+} from "../../pipeline/store.js";
 import {
   decideDownstreamContext,
   deriveUnitTerminalState,
   selectNextReadyUnit,
-  type ChildGateDecision,
-  type ChildGateEvaluatorKind,
-  type ExecutionPlanUnit,
   type ExecutionUnitState,
   type UnitTerminalReason,
 } from "../../pipeline/unit-coordinator.js";
 import { deterministicId } from "./helpers.js";
-
-export interface ExecutionUnitGraph {
-  id: string;
-  pipeline_instance_id: string;
-  parent_attempt_id: string;
-  parent_stage_id: string;
-  parent_run_id: string;
-  graph_digest: string;
-  plan_digest: string;
-  integration_subject: string | null;
-  aggregate_artifact_hash: string | null;
-  aggregate_emitted_at: string | null;
-  stopped_at: string | null;
-  stop_reason: string | null;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface ExecutionWorkAttempt {
-  id: string;
-  execution_graph_id: string;
-  execution_unit_id: string;
-  pipeline_instance_id: string;
-  parent_attempt_id: string;
-  parent_run_id: string;
-  unit_id: string;
-  attempt_ordinal: number;
-  action_kind: "implement" | "simplify" | "command" | "candidate" | "integrate" | "aggregate" | "stop" | "cleanup";
-  idempotency_key: string;
-  request_hash: string | null;
-  result_hash: string | null;
-  native_session_id: string | null;
-  status: "pending" | "leased" | "dispatched" | "running" | "completed" | "failed" | "dead";
-  lease_owner: string | null;
-  lease_until: string | null;
-  output_subject: string | null;
-  payload: string;
-  created_at: string;
-  updated_at: string;
-  completed_at: string | null;
-  last_error: string | null;
-}
-
-export interface ExecutionGateReceipt {
-  id: string;
-  execution_graph_id: string;
-  execution_unit_id: string;
-  execution_work_attempt_id: string;
-  parent_attempt_id: string;
-  unit_id: string;
-  gate_kind: ChildGateDecision["gateKind"];
-  evaluator_kind: ChildGateEvaluatorKind;
-  subject: string | null;
-  result: ChildGateDecision["result"];
-  outcome: StageOutcome;
-  reason: string;
-  artifact_hashes: string;
-  payload: string;
-  receipt_hash: string;
-  created_at: string;
-}
-
-export interface ExecutionDownstreamContext {
-  id: string;
-  execution_graph_id: string;
-  pipeline_instance_id: string;
-  parent_attempt_id: string;
-  from_execution_unit_id: string;
-  to_execution_unit_id: string;
-  from_unit_id: string;
-  to_unit_id: string;
-  payload: string;
-  payload_hash: string;
-  created_at: string;
-}
-
-export interface ExecutionUnitStore {
-  createGraph(input: {
-    pipelineInstanceId: string;
-    parentAttemptId: string;
-    parentStageId: string;
-    parentRunId: string;
-    graphDigest: string;
-    planDigest: string;
-    units: readonly ExecutionPlanUnit[];
-  }): ExecutionUnitGraph;
-  getGraphForAttempt(parentAttemptId: string): ExecutionUnitGraph | undefined;
-  listUnits(parentAttemptId: string): ExecutionUnitState[];
-  leaseNextUnitAction(input: {
-    parentAttemptId: string;
-    leaseOwner: string;
-    nowIso: string;
-    leaseUntilIso: string;
-  }): ExecutionWorkAttempt | undefined;
-  markActionDispatching(actionId: string): void;
-  markActionDispatched(actionId: string, requestHash: string, nativeSessionId?: string | null): void;
-  completeUnitAction(input: {
-    actionId: string;
-    resultHash: string;
-    outputSubject: string;
-  }): ExecutionWorkAttempt;
-  emitAggregateOnce(input: {
-    parentAttemptId: string;
-    artifactHash: string;
-    integrationSubject: string | null;
-  }): "emitted" | "already_emitted";
-  recordGateReceipt(input: {
-    actionId: string;
-    gateKind: ChildGateDecision["gateKind"];
-    evaluatorKind: ChildGateEvaluatorKind;
-    subject: string | null;
-    result: ChildGateDecision["result"];
-    outcome: StageOutcome;
-    reason: string;
-    artifactHashes: readonly string[];
-    payload: string;
-    hash: string;
-  }): "recorded" | "already_recorded";
-  listGateReceipts(parentAttemptId: string): ExecutionGateReceipt[];
-  appendDownstreamContext(input: {
-    parentAttemptId: string;
-    fromUnitId: string;
-    records: readonly { toUnitId: string; payload: Record<string, unknown> }[];
-  }): ExecutionDownstreamContext[];
-  listDownstreamContext(parentAttemptId: string, toUnitId?: string): ExecutionDownstreamContext[];
-  stopActiveWork(input: {
-    parentAttemptId: string;
-    reason: string;
-  }): "stopped" | "already_stopped";
-  settleUnitTerminal(input: {
-    parentAttemptId: string;
-    unitId: string;
-    reason: UnitTerminalReason;
-  }): "settled" | "already_settled";
-  healStaleChildActions(input: {
-    parentAttemptId: string;
-    nowIso: string;
-    reason: string;
-  }): Array<{ actionId: string; unitId: string }>;
-  renewChildActionLiveness(input: {
-    parentRunId: string;
-    actionId: string;
-    heartbeatAtIso: string;
-    leaseUntilIso: string;
-  }): boolean;
-  getStructuredExecutionPublication(parentAttemptId: string): ReturnType<typeof buildExecutionPublicationSnapshot>;
-}
 
 type ExecutionUnitRow = {
   id: string;

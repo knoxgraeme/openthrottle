@@ -6,6 +6,7 @@ OpenThrottle supervisor.
 ```text
 openthrottle setup
 openthrottle init
+openthrottle plan validate <plan.md> [--graph <id>]
 openthrottle ship <plan.md>
 openthrottle status
 openthrottle stop <ticket>
@@ -21,6 +22,9 @@ openthrottle logs <ticket>
   manually entered commands.
 - `ship` creates a Linear issue from the first `# Heading` and delegates it
   with `IssueUpdateInput.delegateId` when `OT_AGENT_APP_ID` is configured.
+- `plan validate --graph structured` checks that a plan contains exactly one
+  execution-plan block for the selected local graph. `ship --graph` is reserved
+  until graph selection is persisted through admission.
 - `status`, `stop`, and `logs` call authenticated supervisor endpoints using
   `OT_SUPERVISOR_URL` and `OT_STATUS_TOKEN`.
 

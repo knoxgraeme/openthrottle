@@ -141,6 +141,9 @@ export interface ValidatedPipelineCatalog {
 }
 
 export interface RepositoryPipelineConfig {
+  schema?: "openthrottle.config/v1";
+  default_graph?: string;
+  graphs?: Array<{ id: string; kind: "builtin" | "repository"; ref: string }>;
   agent?: "claude" | "codex" | "opencode";
   model?: string;
   test?: string;
@@ -152,6 +155,7 @@ export interface RepositoryPipelineConfig {
   limits?: { max_turns?: number; task_timeout?: number };
   mcp_servers?: Record<string, unknown>;
   pipelines?: { implement?: string; investigate?: string };
+  intents?: Record<string, { default_graph: string; allowed_graphs: string[] }>;
 }
 
 export interface ValidatedRepositoryConfig {
@@ -163,6 +167,8 @@ export interface ValidatedRepositoryConfig {
 const IDENTIFIER = /^[a-z][a-z0-9]*(?:[._/-][a-z0-9]+)*$/;
 const CAPABILITY = /^[a-z][a-z0-9]*(?:[._:/-][a-z0-9]+)*@\d+$/;
 const SHA256 = /^[a-f0-9]{64}$/;
+const BUILTIN_GRAPH_REFERENCE = /^[a-z][a-z0-9]*(?:[._/-][a-z0-9]+)*@\d+$/;
+const REPOSITORY_GRAPH_PATH = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\/\/)[A-Za-z0-9._/-]+\.json$/;
 
 function fail(path: string, message: string): never {
   throw new Error(`${path}: ${message}`);
@@ -656,12 +662,66 @@ function mcpServersAt(value: unknown, path: string): Record<string, unknown> {
   return output;
 }
 
+function graphSourcesAt(value: unknown, path: string): Array<{ id: string; kind: "builtin" | "repository"; ref: string }> {
+  const sources = arrayAt(
+    value,
+    path,
+    (entry, sourcePath) => {
+      const input = objectAt(entry, sourcePath, ["id", "kind", "ref"]);
+      const kind = enumAt(input.kind, `${sourcePath}.kind`, ["builtin", "repository"] as const);
+      return {
+        id: stringAt(input.id, `${sourcePath}.id`, { pattern: IDENTIFIER }),
+        kind,
+        ref: stringAt(input.ref, `${sourcePath}.ref`, {
+          max: 240,
+          pattern: kind === "builtin" ? BUILTIN_GRAPH_REFERENCE : REPOSITORY_GRAPH_PATH,
+        }),
+      };
+    },
+    { min: 1, max: 16 }
+  );
+  unique(sources.map((source) => source.id), path);
+  return sources;
+}
+
+function graphIntentsAt(value: unknown, path: string): Record<string, { default_graph: string; allowed_graphs: string[] }> {
+  const input = objectAt(value, path);
+  if (Object.keys(input).length > 16) fail(path, "must contain at most 16 intents");
+  const output: Record<string, { default_graph: string; allowed_graphs: string[] }> = {};
+  for (const [intent, raw] of Object.entries(input)) {
+    if (!IDENTIFIER.test(intent)) fail(`${path}.${intent}`, "has an invalid intent name");
+    const intentInput = objectAt(raw, `${path}.${intent}`, ["default_graph", "allowed_graphs"]);
+    const allowed_graphs = unique(arrayAt(
+      intentInput.allowed_graphs,
+      `${path}.${intent}.allowed_graphs`,
+      (entry, entryPath) => stringAt(entry, entryPath, { pattern: IDENTIFIER }),
+      { min: 1, max: 16 }
+    ), `${path}.${intent}.allowed_graphs`);
+    const default_graph = stringAt(intentInput.default_graph, `${path}.${intent}.default_graph`, { pattern: IDENTIFIER });
+    if (!allowed_graphs.includes(default_graph)) {
+      fail(`${path}.${intent}.default_graph`, "must be included in allowed_graphs");
+    }
+    output[intent] = { default_graph, allowed_graphs };
+  }
+  return output;
+}
+
 export function parseRepositoryConfig(raw: string, source = ".openthrottle.yml"): ValidatedRepositoryConfig {
   const input = objectAt(parseYaml(raw, source), source, [
-    "agent", "model", "test", "lint", "build", "dev", "format",
-    "post_bootstrap", "limits", "mcp_servers", "pipelines",
+    "schema", "default_graph", "graphs", "agent", "model", "test", "lint", "build", "dev", "format",
+    "post_bootstrap", "limits", "mcp_servers", "pipelines", "intents",
   ]);
   const config: RepositoryPipelineConfig = {};
+  if (input.schema !== undefined) {
+    if (input.schema !== "openthrottle.config/v1") fail(`${source}.schema`, "must be openthrottle.config/v1");
+    config.schema = "openthrottle.config/v1";
+  }
+  if (input.default_graph !== undefined) {
+    config.default_graph = stringAt(input.default_graph, `${source}.default_graph`, { pattern: IDENTIFIER });
+  }
+  if (input.graphs !== undefined) {
+    config.graphs = graphSourcesAt(input.graphs, `${source}.graphs`);
+  }
   if (input.agent !== undefined) config.agent = enumAt(input.agent, `${source}.agent`, ["claude", "codex", "opencode"] as const);
   if (input.model !== undefined) {
     config.model = stringAt(input.model, `${source}.model`, {
@@ -692,6 +752,33 @@ export function parseRepositoryConfig(raw: string, source = ".openthrottle.yml")
         config.pipelines[intent] = stringAt(pipelines[intent], `${source}.pipelines.${intent}`, { max: 120, pattern: /^[a-z][a-z0-9]*(?:[._/@-][a-z0-9]+)*$/ });
       }
     }
+  }
+  if (input.intents !== undefined) {
+    config.intents = graphIntentsAt(input.intents, `${source}.intents`);
+  }
+  if (config.schema !== undefined && config.default_graph === undefined) {
+    fail(`${source}.default_graph`, "is required when schema is openthrottle.config/v1");
+  }
+  if (config.schema !== undefined && config.graphs === undefined) {
+    fail(`${source}.graphs`, "is required when schema is openthrottle.config/v1");
+  }
+  if (config.graphs !== undefined) {
+    const graphIds = new Set(config.graphs.map((graph) => graph.id));
+    if (config.default_graph !== undefined && !graphIds.has(config.default_graph)) {
+      fail(`${source}.default_graph`, "references an unknown graph");
+    }
+    for (const [intentName, intent] of Object.entries(config.intents ?? {})) {
+      if (!graphIds.has(intent.default_graph)) {
+        fail(`${source}.intents.${intentName}.default_graph`, "references an unknown graph");
+      }
+      for (const graphId of intent.allowed_graphs) {
+        if (!graphIds.has(graphId)) {
+          fail(`${source}.intents.${intentName}.allowed_graphs`, "references an unknown graph");
+        }
+      }
+    }
+  } else if (config.default_graph !== undefined || config.intents !== undefined) {
+    fail(`${source}.graphs`, "is required when graph defaults or intents are declared");
   }
   const normalized = canonicalJson(config);
   const digest = digestNormalized(normalized);

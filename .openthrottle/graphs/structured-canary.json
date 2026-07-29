@@ -1,0 +1,94 @@
+{
+  "schema": "openthrottle.graph/v1",
+  "id": "openthrottle/structured-canary",
+  "version": 1,
+  "entry_node": "implement_units",
+  "workers": [
+    {
+      "id": "unit_worker",
+      "engine": "agent",
+      "session_scope": "attempt",
+      "credentials": ["repo.read", "repo.write", "model.invoke"],
+      "skills": ["builtin://implement-unit@1", "builtin://repair-unit@1", "builtin://simplify-unit@1"]
+    }
+  ],
+  "loops": [
+    {
+      "id": "unit_loop",
+      "worker": "unit_worker",
+      "skill": "builtin://implement-unit@1",
+      "input_scope": "unit",
+      "receipt": "unit_completion",
+      "max_parallel": 1,
+      "max_rounds": 4,
+      "timeout_seconds": 86400
+    }
+  ],
+  "nodes": [
+    {
+      "id": "implement_units",
+      "kind": "for_each_unit",
+      "loop": "unit_loop",
+      "depends_on": [],
+      "transitions": {
+        "success": { "to": "test" },
+        "repair_required": { "to": "implement_units", "max_reentries": 4, "on_exhausted": "needs_human" },
+        "needs_human": { "terminal": "needs_human" },
+        "failure": { "terminal": "failed" }
+      }
+    },
+    {
+      "id": "test",
+      "kind": "command",
+      "command": "test",
+      "depends_on": [],
+      "transitions": {
+        "success": { "to": "lint" },
+        "repair_required": { "to": "implement_units", "max_reentries": 3, "on_exhausted": "needs_human" },
+        "failure": { "to": "implement_units", "max_reentries": 3, "on_exhausted": "needs_human" }
+      }
+    },
+    {
+      "id": "lint",
+      "kind": "command",
+      "command": "lint",
+      "depends_on": [],
+      "transitions": {
+        "success": { "to": "build" },
+        "repair_required": { "to": "implement_units", "max_reentries": 3, "on_exhausted": "needs_human" },
+        "failure": { "to": "implement_units", "max_reentries": 3, "on_exhausted": "needs_human" }
+      }
+    },
+    {
+      "id": "build",
+      "kind": "command",
+      "command": "build",
+      "depends_on": [],
+      "transitions": {
+        "success": { "to": "publish" },
+        "repair_required": { "to": "implement_units", "max_reentries": 3, "on_exhausted": "needs_human" },
+        "failure": { "to": "implement_units", "max_reentries": 3, "on_exhausted": "needs_human" }
+      }
+    },
+    {
+      "id": "publish",
+      "kind": "publish",
+      "depends_on": [],
+      "transitions": {
+        "success": { "to": "provider" },
+        "repair_required": { "to": "implement_units", "max_reentries": 5, "on_exhausted": "needs_human" },
+        "failure": { "terminal": "failed" }
+      }
+    },
+    {
+      "id": "provider",
+      "kind": "wait_for_provider",
+      "depends_on": [],
+      "transitions": {
+        "success": { "terminal": "completed" },
+        "repair_required": { "to": "implement_units", "max_reentries": 5, "on_exhausted": "needs_human" },
+        "failure": { "terminal": "failed" }
+      }
+    }
+  ]
+}

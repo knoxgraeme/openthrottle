@@ -68,7 +68,7 @@ export const CAPABILITY_CONTRACTS = Object.freeze({
     minimumCredentials: ["model.invoke", "repo.read"],
     allowedCredentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
     contexts: ["fresh", "resume_required", "prefer_resume"],
-    artifacts: ["stage_result"],
+    artifacts: ["stage_result", "execution_graph_result"],
   },
   "provider/wait@1": {
     kind: "provider_wait",

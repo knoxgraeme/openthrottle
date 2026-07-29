@@ -56,6 +56,9 @@ materialized for the selected engine. Claude uses slash-command skill entry;
 Codex uses native `$skill` discovery and its sandbox-owned instructions;
 OpenCode receives the canonical adapter body in its fenced prompt. Eligible
 Claude/Codex stages install only the sandbox-owned live-steering hooks.
+The config snapshot may include public graph declarations and intent defaults;
+the sandbox treats them as sealed repository data. Stage dispatch still follows
+the supervisor-pinned immutable manifest for the selected run.
 
 `~/.ot` holds private logs, native session metadata, task context, activities,
 and live-steering inbox files. `/var/lib/openthrottle/stage-results` is the

@@ -20,16 +20,19 @@ import {
 } from "./capabilities.mjs";
 import {
   buildCommandArtifacts,
+  buildLoopActionArtifacts,
   buildSemanticArtifacts,
   digest,
   sanitizeArtifactText,
   validateSemanticProposal,
+  validateStandardReceipt,
 } from "./artifacts.mjs";
 import {
   computeWorkspaceTreeOid,
   runGitAsRepositoryOwner,
 } from "./repository-control.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
+import { createLoopRequestHash, executeLoopAction } from "./execute-loop.mjs";
 
 export { computeWorkspaceTreeOid } from "./repository-control.mjs";
 export { runCapturedProcess } from "./bounded-process.mjs";
@@ -53,6 +56,8 @@ const CONTEXT_POLICIES = new Set([
 ]);
 const COMMAND_NAMES = new Set(["test", "lint", "build", "format"]);
 const REMOTE_GIT_TIMEOUT_MS = 15_000;
+const EXECUTION_PLAN_FENCE = "openthrottle.execution-plan/v1";
+const EXECUTION_PLAN_BLOCK = /```[^\n`]*\n([\s\S]*?)```/g;
 
 function record(value, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -84,6 +89,86 @@ function stringList(value, label, allowed) {
   }
   if (allowed && value.some((entry) => !allowed.has(entry))) throw new Error(`${label} has an unknown value`);
   return [...value];
+}
+
+function executionPlanFromTaskContext(taskContext) {
+  const blocks = [];
+  for (const match of taskContext.matchAll(EXECUTION_PLAN_BLOCK)) {
+    const json = match[1]?.trim();
+    if (!json?.includes(`"schema"`) || !json.includes(EXECUTION_PLAN_FENCE)) continue;
+    blocks.push(json);
+  }
+  if (blocks.length !== 1) {
+    throw new Error(`loop-action stage expected exactly one ${EXECUTION_PLAN_FENCE} block, found ${blocks.length}`);
+  }
+  const plan = JSON.parse(blocks[0]);
+  if (plan.schema !== EXECUTION_PLAN_FENCE) throw new Error("execution plan schema is unsupported");
+  if (!Array.isArray(plan.units) || plan.units.length < 1 || plan.units.length > 64) {
+    throw new Error("execution plan units must be a non-empty bounded array");
+  }
+  return plan;
+}
+
+function unitTransitionContext({ request, plan, unit }) {
+  const instructions = (unit.instructions ?? []).map((id) => `- ${id}: ${plan.instructions?.[id] ?? ""}`).join("\n");
+  const acceptance = (unit.acceptance ?? []).map((id) => `- ${id}: ${plan.acceptance?.[id] ?? ""}`).join("\n");
+  return [
+    request.taskContext,
+    "",
+    `Structured execution unit: ${unit.id} - ${unit.title}`,
+    `Dependencies: ${(unit.depends_on ?? []).join(", ") || "none"}`,
+    "",
+    "Instructions:",
+    instructions || "- none",
+    "",
+    "Acceptance:",
+    acceptance || "- none",
+    "",
+    request.transitionContext,
+  ].join("\n").slice(0, 64_000);
+}
+
+function loopRequestForUnit({ request, repoDir, plan, unit, nativeSessionId, timeoutMs }) {
+  const actionId = `${request.attemptId}:${unit.id}`;
+  const contextPolicy = request.contextPolicy === "none"
+    ? "fresh"
+    : request.contextPolicy === "resume_required" && !nativeSessionId
+      ? "fresh"
+      : request.contextPolicy;
+  const withoutFence = {
+    protocol: "loop-action@1",
+    actionId,
+    attemptId: actionId,
+    graphId: plan.graph_id ?? request.manifestDigest,
+    unitId: unit.id,
+    role: "worker",
+    loop: "implement",
+    agent: request.agent,
+    skill: "implement-unit",
+    worktree: { id: unit.id, path: repoDir },
+    nativeSessionId,
+    contextPolicy,
+    timeoutMs,
+    transitionContext: unitTransitionContext({ request, plan, unit }),
+    allowedMcpServers: [],
+    credentialScopes: request.credentialScopes,
+    receiptSchema: "openthrottle.receipt/v1",
+  };
+  return { ...withoutFence, ...createLoopRequestHash(withoutFence) };
+}
+
+function stageOutcomeFromLoopResult(result) {
+  if (result.outcome !== "success") return result.outcome;
+  const receipt = validateStandardReceipt(JSON.parse(result.receipt));
+  if (receipt.type === "unit_completion") {
+    if (receipt.result === "success") return "success";
+    if (receipt.result === "needs_human" || receipt.result === "exited") return "needs_human";
+    return "failure";
+  }
+  if (receipt.type === "semantic_review") return receipt.result;
+  if (receipt.result === "success" || receipt.result === "not_configured") return "success";
+  if (receipt.result === "needs_human") return "needs_human";
+  return "failure";
 }
 
 export function runtimeCapabilityDigest() {
@@ -545,6 +630,7 @@ export function executeStage({
   manifestRaw,
   repoDir,
   runAgent = defaultRunAgent,
+  executeLoopActionRunner = executeLoopAction,
   executeCommand = defaultExecuteCommand,
   now = () => new Date().toISOString(),
   timeoutMs = 7_200_000,
@@ -603,6 +689,48 @@ export function executeStage({
         requiredArtifacts: request.requiredArtifacts,
       });
     }
+  } else if (contract.kind === "loop_action") {
+    const plan = executionPlanFromTaskContext(request.taskContext);
+    const unitResults = [];
+    let currentNativeSessionId = nativeSessionId;
+    for (const unit of plan.units) {
+      const loopRequest = loopRequestForUnit({
+        request,
+        repoDir,
+        plan,
+        unit,
+        nativeSessionId: currentNativeSessionId,
+        timeoutMs,
+      });
+      const result = executeLoopActionRunner({ request: loopRequest, now });
+      const outcome = stageOutcomeFromLoopResult(result);
+      unitResults.push({
+        id: unit.id,
+        title: unit.title,
+        actionId: result.action_id,
+        outcome,
+        subject: result.subject,
+        receiptHash: digest(result.receipt),
+      });
+      currentNativeSessionId = result.native_session_id ?? currentNativeSessionId;
+      nativeSessionId = currentNativeSessionId;
+      if (outcome !== "success") break;
+    }
+    const postSubject = computeWorkspaceTreeOid(repoDir);
+    const completedAt = now();
+    artifacts = buildLoopActionArtifacts({
+      fence: {
+        ...request,
+        nativeSessionId,
+        subject: postSubject,
+        preSubject,
+        postSubject,
+        startedAt,
+        completedAt,
+      },
+      units: unitResults,
+      requiredArtifacts: request.requiredArtifacts,
+    });
   } else {
     let invocation = { mode: "none", nativeSessionId: null, reconstructed: false, readOnly: false };
     let execution;

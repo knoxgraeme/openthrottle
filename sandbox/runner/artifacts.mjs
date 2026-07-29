@@ -372,6 +372,7 @@ function assuranceForCapability(capability) {
   const contract = CAPABILITY_CONTRACTS[capability];
   if (!contract) throw new Error(`unknown artifact producer capability ${capability}`);
   if (contract.kind === "command") return "executor_verified";
+  if (contract.kind === "loop_action") return "executor_verified";
   if (contract.kind === "provider_wait") return "provider_verified";
   return "semantic_attested";
 }
@@ -504,6 +505,36 @@ export function buildCommandArtifacts({ fence, command, commandName, execution, 
     actions: [],
     uncertainty: [],
     details,
+  })));
+}
+
+export function buildLoopActionArtifacts({ fence, units, requiredArtifacts, env = process.env }) {
+  const normalizedUnits = units.map((unit) => ({
+    id: boundedText(unit.id, "loop action unit id", 120, env),
+    title: boundedText(unit.title, "loop action unit title", 200, env),
+    action_id: boundedText(unit.actionId, "loop action action id", 200, env),
+    outcome: boundedText(unit.outcome, "loop action outcome", 80, env),
+    subject: unit.subject ?? null,
+    receipt_hash: patternedText(unit.receiptHash, "loop action receipt hash", SHA256, env, 64),
+  }));
+  const failed = normalizedUnits.find((unit) => unit.outcome !== "success");
+  const result = failed ? failed.outcome : "success";
+  const kinds = [...new Set(["stage_result", ...requiredArtifacts])];
+  return kinds.map((kind) => sealArtifact(artifactPayload({
+    kind,
+    fence,
+    assurance: "executor_verified",
+    result,
+    summary: failed
+      ? `Structured unit ${failed.id} returned ${failed.outcome}.`
+      : `Structured execution completed ${normalizedUnits.length} unit${normalizedUnits.length === 1 ? "" : "s"}.`,
+    evidence: normalizedUnits.map((unit) => unit.receipt_hash),
+    findings: [],
+    actions: [],
+    uncertainty: [],
+    details: {
+      units: normalizedUnits,
+    },
   })));
 }
 

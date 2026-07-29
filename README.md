@@ -26,6 +26,9 @@ simplification, command gates, exact-subject publication, and provider
 verification. Investigate uses its own immutable graph. GitHub reviews and CI
 are deduplicated as evidence for the published commit; bounded repair
 transitions may continue the native agent session when the manifest permits.
+Repository config now also declares public execution graphs. This repository
+keeps `simple` as the default graph and exposes `structured` only as an explicit
+canary until a separate operator decision approves any default migration.
 
 See [docs/SPEC.md](docs/SPEC.md) for the normative contracts and
 [docs/PLAN.md](docs/PLAN.md) for the delivery/acceptance plan.
@@ -72,6 +75,7 @@ verifies the canonical Daytona snapshot:
 
 ```bash
 npx openthrottle init
+npx openthrottle plan validate docs/plans/my-change.md --graph structured
 npx openthrottle ship docs/plans/my-change.md
 npx openthrottle status
 ```

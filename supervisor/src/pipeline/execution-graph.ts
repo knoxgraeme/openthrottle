@@ -69,6 +69,12 @@ const CAPABILITY_CREDENTIALS: Record<string, {
   contexts: readonly ContextPolicy[];
   artifacts: readonly ArtifactKind[];
 }> = {
+  "loop-action@1": {
+    minimum: ["model.invoke", "repo.read"],
+    allowed: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+    contexts: ["fresh", "resume_required", "prefer_resume"],
+    artifacts: ["stage_result", "execution_graph_result"],
+  },
   "ce/implement@1": {
     minimum: ["model.invoke", "provider.read", "repo.read", "repo.write"],
     allowed: ["model.invoke", "provider.read", "repo.read", "repo.write"],
@@ -220,6 +226,33 @@ function loopTemplate(graph: GraphContract, node: GraphNode): StageTemplate {
   return template;
 }
 
+function forEachUnitTemplate(graph: GraphContract, node: GraphNode): StageTemplate {
+  const loop = graph.loops.find((candidate) => candidate.id === node.loop);
+  if (!loop) fail(`graph.nodes.${node.id}.loop`, "references an unknown loop");
+  const worker = graph.workers.find((candidate) => candidate.id === loop.worker);
+  if (!worker) fail(`graph.loops.${loop.id}.worker`, "references an unknown worker");
+  if (loop.input_scope !== "unit") {
+    fail(`graph.loops.${loop.id}.input_scope`, "for_each_unit loops must use unit input");
+  }
+  if (loop.max_parallel !== 1) {
+    fail(`graph.loops.${loop.id}.max_parallel`, "for_each_unit is serial in V1");
+  }
+  const template: StageTemplate = {
+    executor: { kind: "loop_action", capability: "loop-action@1" },
+    evaluator: {
+      kind: "semantic",
+      assurance: "executor_verified",
+      required_artifacts: ["execution_graph_result"],
+    },
+    context: contextFromSessionScope(worker),
+    live_steering: false,
+    credentials: worker.credentials,
+    produces: ["stage_result", "execution_graph_result"],
+  };
+  assertCapabilityAuthorized(template, `graph.nodes.${node.id}`);
+  return template;
+}
+
 function capabilityOrder(capability: string): number {
   return [
     "ce/implement@1",
@@ -228,6 +261,7 @@ function capabilityOrder(capability: string): number {
     "ce/simplify@1",
     "ce/publish@1",
     "command/run@1",
+    "loop-action@1",
     "provider/wait@1",
     "agent/semantic@1",
   ].indexOf(capability);
@@ -236,7 +270,7 @@ function capabilityOrder(capability: string): number {
 function nodeTemplate(graph: GraphContract, node: GraphNode): StageTemplate {
   assertNoDependencies(node);
   if (node.kind === "run") return loopTemplate(graph, node);
-  if (node.kind === "for_each_unit") fail(`graph.nodes.${node.id}.kind`, "cannot compile for_each_unit yet");
+  if (node.kind === "for_each_unit") return forEachUnitTemplate(graph, node);
   if (node.kind === "command") {
     return {
       executor: { kind: "command", capability: "command/run@1" },

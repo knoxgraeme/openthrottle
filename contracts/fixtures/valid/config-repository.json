@@ -1,6 +1,6 @@
 {
   "schema": "openthrottle.config/v1",
-  "default_graph": "structured",
+  "default_graph": "simple",
   "graphs": [
     {
       "id": "simple",

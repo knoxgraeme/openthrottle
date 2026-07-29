@@ -9,7 +9,7 @@ import { createSupervisorStore } from "../store.js";
 import { createPipelineStore } from "./create-store.js";
 import { catalogPath, runtime, setupPipelineStore, shippedCatalogPath, ticket } from "../../__fixtures__/pipeline-store.js";
 import { parsePipelinePublication } from "../../pipeline/publication.js";
-import type { ExecutionUnitStore } from "./unit-store.js";
+import type { ExecutionUnitStore } from "../../pipeline/store.js";
 
 describe("pipeline instance store", () => {
   let db: Database.Database | undefined;

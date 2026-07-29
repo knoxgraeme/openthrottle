@@ -13,9 +13,10 @@ Usage:
   openthrottle init                Register the current GitHub repository and
                                     Linear team, verify readiness, and write
                                     .openthrottle.yml.
-  openthrottle plan validate <file.md>
-                                    Validate the plan's execution-plan block.
-  openthrottle plan prepare <file.md>
+  openthrottle plan validate <file.md> [--graph <id>]
+                                    Validate the plan's execution-plan block
+                                    against the selected local graph.
+  openthrottle plan prepare <file.md> [--graph <id>]
                                     Explain agent-backed execution-plan preparation.
   openthrottle validate <file.md>   Alias for plan validate.
   openthrottle ship <file.md>      Create a Linear issue from a markdown

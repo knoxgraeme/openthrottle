@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { createUnitEffectProcessor, type UnitEffectRuntime } from "./unit-effects.js";
-import type { ExecutionUnitStore, ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
+import type { ExecutionUnitStore, ExecutionWorkAttempt } from "../pipeline/store.js";
 
 function action(overrides: Partial<ExecutionWorkAttempt> = {}): ExecutionWorkAttempt {
   return {

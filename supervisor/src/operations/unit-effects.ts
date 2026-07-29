@@ -1,4 +1,4 @@
-import type { ExecutionUnitStore, ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
+import type { ExecutionUnitStore, ExecutionWorkAttempt } from "../pipeline/store.js";
 
 export interface UnitEffectRuntime {
   dispatchUnitAction(action: ExecutionWorkAttempt): Promise<{

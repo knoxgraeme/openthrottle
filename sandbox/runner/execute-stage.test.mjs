@@ -75,6 +75,7 @@ function repository() {
 
 function fixture({
   capability = "agent/semantic@1",
+  executorKind,
   contextPolicy = "fresh",
   nativeSessionId = null,
   requiredArtifacts = ["stage_result"],
@@ -85,9 +86,10 @@ function fixture({
 } = {}) {
   const repoDir = repository();
   const config = commandName && configuredCommand ? { [commandName]: "test-command" } : {};
+  const kind = executorKind ?? (commandName ? "command" : "agent");
   const stage = {
     id: commandName ? "command" : "review",
-    executor: { kind: commandName ? "command" : "agent", capability },
+    executor: { kind, capability },
     evaluator: { required_artifacts: requiredArtifacts.filter((kind) => kind !== "stage_result") },
     context: contextPolicy,
     live_steering: liveSteering,
@@ -141,6 +143,39 @@ function successProposal() {
     actions: [],
     uncertainty: [],
   };
+}
+
+function loopReceipt(loopRequest, subject, result = "success") {
+  return JSON.stringify({
+    schema: "openthrottle.receipt/v1",
+    type: "unit_completion",
+    assurance: "semantic_attested",
+    result,
+    producer: {
+      worker_id: "worker-1",
+      skill: "builtin://implement-unit@1",
+      capability_digest: "c".repeat(64),
+    },
+    subject: { base: subject, pre: subject, post: subject },
+    fence: {
+      pipeline_instance_id: "pipeline-1",
+      graph_digest: "a".repeat(64),
+      unit_id: loopRequest.unitId,
+      attempt_id: loopRequest.attemptId,
+      request_hash: loopRequest.requestHash,
+    },
+    evidence: ["unit completed"],
+    payload: {
+      summary: "Unit completed.",
+      assumptions: [],
+      decisions: [],
+      issues: [],
+      verification: ["verified"],
+      downstream_context: [],
+      requested_human_input: [],
+    },
+    issued_at: "2026-07-22T00:00:01.000Z",
+  });
 }
 
 function publishFixture() {
@@ -252,6 +287,173 @@ describe("one-stage executor", () => {
     const runAgent = vi.fn(() => ({ exitCode: 0, proposal: successProposal(), nativeSessionId: "native-1" }));
     executeStage({ ...input, agent: "claude", runAgent, now: clock() });
     expect(runAgent).toHaveBeenCalledWith(expect.objectContaining({ agent: "codex" }));
+  });
+
+  it("executes loop-action stages with the loop runner and seals aggregate graph evidence", () => {
+    const plan = {
+      schema: "openthrottle.execution-plan/v1",
+      graph_id: "structured",
+      plan_id: "plan-1",
+      units: [
+        { id: "u1", title: "First unit", depends_on: [], instructions: ["i1"], acceptance: ["a1"] },
+      ],
+      instructions: { i1: "Implement the first unit." },
+      acceptance: { a1: "The first unit is complete." },
+      commands: [],
+    };
+    const input = fixture({
+      capability: "loop-action@1",
+      executorKind: "loop_action",
+      requiredArtifacts: ["stage_result", "execution_graph_result"],
+      credentialScopes: ["model.invoke", "repo.read", "repo.write"],
+      liveSteering: false,
+    });
+    const taskContext = `# Plan\n\n\`\`\`json openthrottle.execution-plan/v1\n${JSON.stringify(plan)}\n\`\`\``;
+    const withoutFence = { ...input.request, taskContext };
+    delete withoutFence.requestHash;
+    delete withoutFence.idempotencyKey;
+    const request = { ...withoutFence, ...createStageRequestHash(withoutFence) };
+    const subject = computeWorkspaceTreeOid(input.repoDir);
+    const runAgent = vi.fn();
+    const executeLoopActionRunner = vi.fn(({ request: loopRequest }) => ({
+      version: 1,
+      kind: "loop_action_result",
+      action_id: loopRequest.actionId,
+      attempt_id: loopRequest.attemptId,
+      request_hash: loopRequest.requestHash,
+      outcome: "success",
+      native_session_id: "unit-native-1",
+      subject,
+      receipt: loopReceipt(loopRequest, subject),
+      created_at: "2026-07-22T00:00:01.000Z",
+    }));
+
+    const result = executeStage({
+      ...input,
+      request,
+      runAgent,
+      executeLoopActionRunner,
+      now: clock(),
+    });
+
+    expect(runAgent).not.toHaveBeenCalled();
+    expect(executeLoopActionRunner).toHaveBeenCalledWith(expect.objectContaining({
+      request: expect.objectContaining({
+        protocol: "loop-action@1",
+        unitId: "u1",
+        skill: "implement-unit",
+        worktree: { id: "u1", path: input.repoDir },
+      }),
+    }));
+    expect(result).toMatchObject({
+      outcome: "success",
+      nativeSessionId: "unit-native-1",
+      subject,
+    });
+    const graph = result.artifacts.find((artifact) => artifact.kind === "execution_graph_result");
+    expect(graph).toMatchObject({ assurance: "executor_verified", subject });
+    expect(JSON.parse(graph.payload)).toMatchObject({
+      result: "success",
+      details: { units: [expect.objectContaining({ id: "u1", outcome: "success" })] },
+    });
+  });
+
+  it("maps clean loop exits to the standard receipt outcome", () => {
+    const plan = {
+      schema: "openthrottle.execution-plan/v1",
+      graph_id: "structured",
+      plan_id: "plan-1",
+      units: [
+        { id: "u1", title: "First unit", depends_on: [], instructions: ["i1"], acceptance: ["a1"] },
+      ],
+      instructions: { i1: "Implement the first unit." },
+      acceptance: { a1: "The first unit is complete." },
+      commands: [],
+    };
+    const input = fixture({
+      capability: "loop-action@1",
+      executorKind: "loop_action",
+      requiredArtifacts: ["stage_result", "execution_graph_result"],
+      credentialScopes: ["model.invoke", "repo.read", "repo.write"],
+      liveSteering: false,
+    });
+    const taskContext = `# Plan\n\n\`\`\`json openthrottle.execution-plan/v1\n${JSON.stringify(plan)}\n\`\`\``;
+    const withoutFence = { ...input.request, taskContext };
+    delete withoutFence.requestHash;
+    delete withoutFence.idempotencyKey;
+    const request = { ...withoutFence, ...createStageRequestHash(withoutFence) };
+    const subject = computeWorkspaceTreeOid(input.repoDir);
+    const executeLoopActionRunner = vi.fn(({ request: loopRequest }) => ({
+      version: 1,
+      kind: "loop_action_result",
+      action_id: loopRequest.actionId,
+      attempt_id: loopRequest.attemptId,
+      request_hash: loopRequest.requestHash,
+      outcome: "success",
+      native_session_id: "unit-native-1",
+      subject,
+      receipt: loopReceipt(loopRequest, subject, "needs_human"),
+      created_at: "2026-07-22T00:00:01.000Z",
+    }));
+
+    const result = executeStage({ ...input, request, executeLoopActionRunner, now: clock() });
+
+    expect(result.outcome).toBe("needs_human");
+    const graph = result.artifacts.find((artifact) => artifact.kind === "execution_graph_result");
+    expect(JSON.parse(graph.payload)).toMatchObject({
+      result: "needs_human",
+      details: { units: [expect.objectContaining({ id: "u1", outcome: "needs_human" })] },
+    });
+  });
+
+  it("starts a resume-required loop-action stage fresh when no child session exists yet", () => {
+    const plan = {
+      schema: "openthrottle.execution-plan/v1",
+      graph_id: "structured",
+      plan_id: "plan-1",
+      units: [
+        { id: "u1", title: "First unit", depends_on: [], instructions: ["i1"], acceptance: ["a1"] },
+      ],
+      instructions: { i1: "Implement the first unit." },
+      acceptance: { a1: "The first unit is complete." },
+      commands: [],
+    };
+    const input = fixture({
+      capability: "loop-action@1",
+      executorKind: "loop_action",
+      contextPolicy: "resume_required",
+      nativeSessionId: null,
+      requiredArtifacts: ["stage_result", "execution_graph_result"],
+      credentialScopes: ["model.invoke", "repo.read", "repo.write"],
+      liveSteering: false,
+    });
+    const taskContext = `# Plan\n\n\`\`\`json openthrottle.execution-plan/v1\n${JSON.stringify(plan)}\n\`\`\``;
+    const withoutFence = { ...input.request, taskContext };
+    delete withoutFence.requestHash;
+    delete withoutFence.idempotencyKey;
+    const request = { ...withoutFence, ...createStageRequestHash(withoutFence) };
+    const subject = computeWorkspaceTreeOid(input.repoDir);
+    const executeLoopActionRunner = vi.fn(({ request: loopRequest }) => ({
+      version: 1,
+      kind: "loop_action_result",
+      action_id: loopRequest.actionId,
+      attempt_id: loopRequest.attemptId,
+      request_hash: loopRequest.requestHash,
+      outcome: "success",
+      native_session_id: "unit-native-1",
+      subject,
+      receipt: loopReceipt(loopRequest, subject),
+      created_at: "2026-07-22T00:00:01.000Z",
+    }));
+
+    executeStage({ ...input, request, executeLoopActionRunner, now: clock() });
+
+    expect(executeLoopActionRunner).toHaveBeenCalledWith(expect.objectContaining({
+      request: expect.objectContaining({
+        contextPolicy: "fresh",
+        nativeSessionId: null,
+      }),
+    }));
   });
 
   it("records a missing required native session as explicit failed evidence", () => {

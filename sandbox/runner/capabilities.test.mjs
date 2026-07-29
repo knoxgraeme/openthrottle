@@ -59,7 +59,7 @@ describe("installed stage capabilities", () => {
       capability: "loop-action@1",
       contextPolicy: "prefer_resume",
       credentialScopes: ["model.invoke", "repo.read", "repo.write"],
-      requiredArtifacts: ["stage_result"],
+      requiredArtifacts: ["stage_result", "execution_graph_result"],
     }).kind).toBe("loop_action");
   });
 
