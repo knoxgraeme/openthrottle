@@ -742,6 +742,52 @@ describe("execution unit store", () => {
     });
   });
 
+  it("retains the newest child attempts when capping publication snapshots", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+    });
+    for (let ordinal = 1; ordinal <= 4; ordinal += 1) {
+      timestamp = `2026-07-29T00:0${ordinal}:00.000Z`;
+      const action = store.leaseNextUnitAction({
+        parentAttemptId: "attempt-parent",
+        leaseOwner: "worker-1",
+        nowIso: timestamp,
+        leaseUntilIso: `2026-07-29T00:0${ordinal}:30.000Z`,
+      })!;
+      store.markActionDispatched(action.id, `request-${ordinal}`);
+      if (ordinal < 4) {
+        db!.prepare(`
+          UPDATE execution_work_attempts
+          SET status = 'failed', completed_at = ?, updated_at = ?, last_error = ?
+          WHERE id = ?
+        `).run(timestamp, timestamp, `failed attempt ${ordinal}`, action.id);
+        db!.prepare(`
+          UPDATE execution_units
+          SET status = 'pending', active_work_attempt_id = NULL, updated_at = ?
+          WHERE parent_attempt_id = 'attempt-parent' AND unit_id = 'a'
+        `).run(timestamp);
+      } else {
+        store.completeUnitAction({
+          actionId: action.id,
+          resultHash: "result-hash",
+          outputSubject: "1".repeat(40),
+        });
+      }
+    }
+
+    const attempts = store.getStructuredExecutionPublication("attempt-parent")?.units[0]?.attempts ?? [];
+    expect(attempts.map((attempt) => attempt.attempt_ordinal)).toEqual([2, 3, 4]);
+    expect(attempts.map((attempt) => attempt.status)).toEqual(["failed", "failed", "completed"]);
+    expect(attempts.map((attempt) => attempt.request_hash)).not.toContain("request-1");
+  });
+
   it("stops active unit work without deleting child graph state", () => {
     const store = setup();
     store.createGraph({

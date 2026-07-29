@@ -346,7 +346,7 @@ export function createTransitionStore(db: Database.Database, now: () => string):
                 issueId: instance.linear_issue_id,
                 instanceId: instance.id,
                 runId: attempt.run_id,
-                actor: "orchestrator",
+                actor: "supervisor",
                 kind: "run_note",
                 trigger: `${attempt.stage_id} structured publication`,
                 action: "Projected the structured unit and gate ledger through the durable publication path.",

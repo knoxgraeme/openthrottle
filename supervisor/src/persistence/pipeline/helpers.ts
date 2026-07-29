@@ -23,6 +23,7 @@ import type {
   PipelineStageAttempt,
   RepositoryConfigSnapshot,
 } from "../../pipeline/store.js";
+import type { ExecutionPublicationSnapshot } from "../../pipeline/execution-publication.js";
 
 export const SAFE_BRANCH = /^(?!.*\.\.)(?!\/)(?!.*\/$)[A-Za-z0-9._/-]{1,200}$/;
 
@@ -509,6 +510,7 @@ export function buildTerminalPublicationPayload(input: {
   attempt: PipelineStageAttempt | undefined;
   outcome: "superseded";
   reason: string;
+  structuredExecution?: ExecutionPublicationSnapshot;
 }): string {
   return canonicalJson(buildLifecyclePublication(input));
 }
