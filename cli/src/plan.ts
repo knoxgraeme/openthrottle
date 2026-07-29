@@ -229,7 +229,7 @@ export const defaultPrepareRunner: PrepareRunner = ({ agent, model, prompt, dire
     input = prompt;
   } else if (agent === "claude") {
     command = "claude";
-    args = ["-p", prompt, "--output-format", "stream-json", "--verbose", ...(model ? ["--model", model] : [])];
+    args = ["-p", prompt, "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--tools", "Read,Edit", ...(model ? ["--model", model] : [])];
   } else {
     command = "opencode";
     args = ["run", "--format", "json", "--model", model ?? "", "--dir", directory, "--auto", prompt];
