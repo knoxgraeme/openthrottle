@@ -185,9 +185,14 @@ function authFileExists(path: string): boolean {
   }
 }
 
+function codexAuthFilePath(): string {
+  const codexHome = process.env.CODEX_HOME?.trim();
+  return codexHome ? join(codexHome, "auth.json") : join(homedir(), ".codex", "auth.json");
+}
+
 function assertPrepareEngineUsable(agent: PrepareRunnerInput["agent"], model?: string): void {
   if (agent === "codex") {
-    if (!process.env.OPENAI_API_KEY && !authFileExists(join(homedir(), ".codex", "auth.json"))) {
+    if (!process.env.OPENAI_API_KEY && !authFileExists(codexAuthFilePath())) {
       throw new Error(
         "openthrottle plan prepare is configured for codex, but no Codex/OpenAI auth was found. " +
           "Run `codex login` or set OPENAI_API_KEY."
