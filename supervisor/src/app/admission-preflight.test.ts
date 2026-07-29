@@ -218,7 +218,14 @@ describe("admission preflight wired into Linear admission", () => {
     const catalog = loadPipelineCatalog(shippedCatalogPath, runtime.descriptor);
     pipelines.acceptRuntimeDescriptor(runtime);
     pipelines.acceptCatalog(catalog);
-    const repositoryConfig = "pipelines: { implement: implement }\n";
+    const repositoryConfig = `schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+pipelines: { implement: implement }
+`;
     const githubFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/repos/owner/repo/commits/main")) {

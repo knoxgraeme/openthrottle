@@ -98,7 +98,7 @@ describe("coordinator-only server", () => {
       repository: "owner/repo",
       baseCommit: "a".repeat(40),
       blobSha: "b".repeat(40),
-      config: parseRepositoryConfig("pipelines: { implement: fixture-command }\n"),
+      config: parseRepositoryConfig("schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]\npipelines: { implement: fixture-command }\n"),
     });
     const manifest = catalog.manifests.get("fixture/command@1")!;
     store.upsert({

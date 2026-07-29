@@ -13,6 +13,7 @@ import {
   unique,
   type ValidatedContract,
 } from "./validation.js";
+import type { RepositoryConfigContract } from "./config.js";
 
 export const GRAPH_SCHEMA = "openthrottle.graph/v1" as const;
 export const SESSION_SCOPES = ["graph", "attempt", "fresh"] as const;
@@ -40,11 +41,14 @@ export const GRAPH_OUTCOMES = [
   "failure",
 ] as const;
 export const LOGICAL_CREDENTIALS = ["model.invoke", "provider.read", "repo.read", "repo.write", "mcp"] as const;
+export const AGENT_INHERITANCE = ["inherit", "claude", "codex", "opencode"] as const;
+const MODEL_REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 
 export type SessionScope = (typeof SESSION_SCOPES)[number];
 export type InputScope = (typeof INPUT_SCOPES)[number];
 export type ReceiptType = (typeof RECEIPT_TYPES)[number];
 export type WorkerEngine = (typeof WORKER_ENGINES)[number];
+export type AgentInheritance = (typeof AGENT_INHERITANCE)[number];
 export type NodeKind = (typeof NODE_KINDS)[number];
 export type GraphOutcome = (typeof GRAPH_OUTCOMES)[number];
 export type LogicalCredential = (typeof LOGICAL_CREDENTIALS)[number];
@@ -52,7 +56,10 @@ export type LogicalCredential = (typeof LOGICAL_CREDENTIALS)[number];
 export interface GraphWorker {
   id: string;
   engine: WorkerEngine;
+  agent?: AgentInheritance;
+  model?: string;
   skills: string[];
+  allowed_mcp_servers: string[];
   session_scope: SessionScope;
   credentials: LogicalCredential[];
 }
@@ -95,18 +102,32 @@ export interface GraphContract {
 }
 
 function parseWorker(value: unknown, path: string): GraphWorker {
-  const input = objectAt(value, path, ["id", "engine", "skills", "session_scope", "credentials"]);
-  return {
+  const input = objectAt(value, path, [
+    "id", "engine", "agent", "model", "skills", "allowed_mcp_servers", "session_scope", "credentials",
+  ]);
+  const worker: GraphWorker = {
     id: stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER }),
     engine: enumAt(input.engine, `${path}.engine`, WORKER_ENGINES),
+    ...(input.agent === undefined ? {} : { agent: enumAt(input.agent, `${path}.agent`, AGENT_INHERITANCE) }),
+    ...(input.model === undefined ? {} : { model: stringAt(input.model, `${path}.model`, { max: 240, pattern: MODEL_REFERENCE }) }),
     skills: unique(arrayAt(input.skills, `${path}.skills`, (entry, entryPath) => {
       return stringAt(entry, entryPath, { max: 240, pattern: SKILL_REFERENCE });
     }, { min: 1, max: 16 }), `${path}.skills`),
+    allowed_mcp_servers: input.allowed_mcp_servers === undefined ? [] : unique(arrayAt(
+      input.allowed_mcp_servers,
+      `${path}.allowed_mcp_servers`,
+      (entry, entryPath) => stringAt(entry, entryPath, { pattern: IDENTIFIER }),
+      { max: 16 }
+    ), `${path}.allowed_mcp_servers`),
     session_scope: enumAt(input.session_scope, `${path}.session_scope`, SESSION_SCOPES),
     credentials: unique(arrayAt(input.credentials, `${path}.credentials`, (entry, entryPath) => {
       return enumAt(entry, entryPath, LOGICAL_CREDENTIALS);
     }, { max: 8 }), `${path}.credentials`),
   };
+  if (worker.engine !== "agent" && (worker.agent !== undefined || worker.model !== undefined)) {
+    fail(path, "agent and model inheritance are allowed only for agent workers");
+  }
+  return worker;
 }
 
 function parseLoop(value: unknown, path: string): GraphLoop {
@@ -170,7 +191,7 @@ function parseNode(value: unknown, path: string): GraphNode {
   return node;
 }
 
-function validateGraph(graph: GraphContract, source: string): void {
+function validateGraph(graph: GraphContract, source: string, config?: RepositoryConfigContract): void {
   const workers = new Map(graph.workers.map((worker) => [worker.id, worker]));
   const loops = new Map(graph.loops.map((loop) => [loop.id, loop]));
   const nodes = new Map(graph.nodes.map((node) => [node.id, node]));
@@ -187,6 +208,12 @@ function validateGraph(graph: GraphContract, source: string): void {
   }
   for (const node of graph.nodes) {
     if (node.loop && !loops.has(node.loop)) fail(`${source}.nodes.${node.id}.loop`, "references an unknown loop");
+    if (node.command && config) {
+      const configuredCommands = new Set(Object.keys(config.commands ?? {}));
+      if (!configuredCommands.has(node.command)) {
+        fail(`${source}.nodes.${node.id}.command`, "references an unknown repository command");
+      }
+    }
     for (const dependency of node.depends_on) {
       if (!nodes.has(dependency)) fail(`${source}.nodes.${node.id}.depends_on`, "references an unknown node");
     }
@@ -254,9 +281,26 @@ function validateGraph(graph: GraphContract, source: string): void {
     visited.add(id);
   };
   for (const node of graph.nodes) visit(node.id);
+
+  if (config) {
+    const mcpServers = new Set(Object.keys(config.mcp_servers ?? {}));
+    for (const worker of graph.workers) {
+      if (worker.allowed_mcp_servers.length > 0 && !worker.credentials.includes("mcp")) {
+        fail(`${source}.workers.${worker.id}.allowed_mcp_servers`, "requires the mcp credential scope");
+      }
+      for (const server of worker.allowed_mcp_servers) {
+        if (!mcpServers.has(server)) {
+          fail(`${source}.workers.${worker.id}.allowed_mcp_servers`, "references an unknown MCP server");
+        }
+      }
+    }
+  }
 }
 
-export function validateGraphContract(value: unknown, options: { source?: string } = {}): ValidatedContract<GraphContract> {
+export function validateGraphContract(
+  value: unknown,
+  options: { source?: string; config?: RepositoryConfigContract } = {}
+): ValidatedContract<GraphContract> {
   const source = options.source ?? "graph";
   const input = objectAt(value, source, ["schema", "id", "version", "entry_node", "workers", "loops", "nodes"]);
   if (input.schema !== GRAPH_SCHEMA) fail(`${source}.schema`, `must be ${GRAPH_SCHEMA}`);
@@ -269,11 +313,14 @@ export function validateGraphContract(value: unknown, options: { source?: string
     loops: arrayAt(input.loops, `${source}.loops`, parseLoop, { min: 1, max: 32 }),
     nodes: arrayAt(input.nodes, `${source}.nodes`, parseNode, { min: 1, max: 64 }),
   };
-  validateGraph(graph, source);
+  validateGraph(graph, source, options.config);
   return normalizedContract(graph);
 }
 
-export function parseGraphContract(raw: string, options: { source?: string } = {}): ValidatedContract<GraphContract> {
+export function parseGraphContract(
+  raw: string,
+  options: { source?: string; config?: RepositoryConfigContract } = {}
+): ValidatedContract<GraphContract> {
   if (Buffer.byteLength(raw, "utf8") > 256 * 1024) fail(options.source ?? "graph", "JSON exceeds 256 KiB");
   return validateGraphContract(JSON.parse(raw) as unknown, options);
 }

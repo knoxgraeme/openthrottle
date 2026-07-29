@@ -62,7 +62,7 @@ describe("pipeline effect processor", () => {
       repository: "owner/repo",
       baseCommit: "a".repeat(40),
       blobSha: "b".repeat(40),
-      config: parseRepositoryConfig("pipelines: { implement: fixture-command }\ntest: npm test\n"),
+      config: parseRepositoryConfig("schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]\npipelines: { implement: fixture-command }\ntest: npm test\n"),
     });
     const manifest = catalog.manifests.get("fixture/command@2")!;
     tickets.upsert({
@@ -158,7 +158,7 @@ describe("pipeline effect processor", () => {
       repository: "owner/repo",
       baseCommit: "a".repeat(40),
       blobSha: "b".repeat(40),
-      config: parseRepositoryConfig("pipelines: { implement: fixture-command }\ntest: npm test\n"),
+      config: parseRepositoryConfig("schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]\npipelines: { implement: fixture-command }\ntest: npm test\n"),
     });
     const manifest = catalog.manifests.get("fixture/command@2")!;
     tickets.upsert({
@@ -494,7 +494,7 @@ describe("pipeline effect processor", () => {
       repository: "owner/repo",
       baseCommit: "a".repeat(40),
       blobSha: "b".repeat(40),
-      config: parseRepositoryConfig("pipelines: { implement: fixture-command }\ntest: npm test\n"),
+      config: parseRepositoryConfig("schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]\npipelines: { implement: fixture-command }\ntest: npm test\n"),
     });
     const manifest = catalog.manifests.get("fixture/command@2")!;
     tickets.upsert({

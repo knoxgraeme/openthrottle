@@ -7,11 +7,14 @@
     {
       "id": "implementer",
       "engine": "agent",
+      "agent": "inherit",
+      "model": "gpt-5-codex",
       "session_scope": "attempt",
       "credentials": [
         "repo.read",
         "model.invoke"
       ],
+      "allowed_mcp_servers": [],
       "skills": [
         "builtin://implement-unit@1"
       ]
@@ -24,6 +27,7 @@
         "repo.read",
         "model.invoke"
       ],
+      "allowed_mcp_servers": [],
       "skills": [
         "builtin://semantic-review@1"
       ]

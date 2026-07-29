@@ -108,7 +108,7 @@ describe("deterministic supervisor stage gates", () => {
     });
     pipelines.acceptRuntimeDescriptor(runtime);
     pipelines.acceptCatalog(catalog);
-    const config = parseRepositoryConfig("pipelines: { investigate: core/investigate@1 }\ntest: npm test\n");
+    const config = parseRepositoryConfig("schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]\npipelines: { investigate: core/investigate@1 }\ntest: npm test\n");
     const snapshot = pipelines.saveRepositoryConfigSnapshot({
       repository: "owner/repo",
       baseCommit: "a".repeat(40),

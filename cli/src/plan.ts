@@ -41,6 +41,7 @@ const FENCE_PATTERN = /```[^\n`]*\n([\s\S]*?)```/g;
 const PREPARE_UNAVAILABLE =
   "openthrottle plan prepare requires an agent-backed prepare-execution-plan runner; " +
   "run the packaged prepare-execution-plan skill, then validate the resulting block with openthrottle plan validate <file.md>.";
+const CURRENT_COMPILER_COMMANDS = new Set(["test", "lint", "build", "format"]);
 
 export function extractExecutionPlanBlocks(markdown: string): ExecutionPlanBlock[] {
   const blocks: ExecutionPlanBlock[] = [];
@@ -92,7 +93,12 @@ export function validateLocalGraphSelection(
     return { config, graphId, consumesUnits: graphId === "structured" || source.ref.includes("structured") };
   }
   const graphPath = join(directory, source.ref);
-  const graph = parseGraphContract(readFileSync(graphPath, "utf8"), { source: source.ref });
+  const graph = parseGraphContract(readFileSync(graphPath, "utf8"), { source: source.ref, config: config.value });
+  for (const node of graph.value.nodes) {
+    if (node.command && !CURRENT_COMPILER_COMMANDS.has(node.command)) {
+      throw new Error(`${source.ref}.nodes.${node.id}.command must be one of: ${[...CURRENT_COMPILER_COMMANDS].join(", ")}`);
+    }
+  }
   const consumesUnits =
     graph.value.nodes.some((node) => node.kind === "for_each_unit") ||
     graph.value.loops.some((loop) => loop.input_scope === "unit");

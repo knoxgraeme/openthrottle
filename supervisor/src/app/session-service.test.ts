@@ -75,6 +75,17 @@ function payload(sessionId = "session-1", issueId = "issue-1", identifier = "OT-
   }));
 }
 
+function repositoryConfigYaml(pipelines: string, extra = ""): string {
+  return `schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+pipelines: ${pipelines}
+${extra}`;
+}
+
 describe("pipeline admission", () => {
   let db: Database.Database | undefined;
   afterEach(() => {
@@ -265,6 +276,12 @@ describe("pipeline admission", () => {
 
   it("pins a new generation without a direct task run or sandbox", async () => {
     const { tickets, pipelines, githubFetch } = await run(`
+schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
 agent: codex
 pipelines: { implement: implement }
 limits: { max_turns: 20, task_timeout: 300 }
@@ -285,7 +302,7 @@ mcp_servers: {}
   });
 
   it("publishes a durable actionable failure and creates no stage for an unknown selection", async () => {
-    const { tickets } = await run("pipelines: { implement: unknown/pipeline@9 }\n");
+    const { tickets } = await run(repositoryConfigYaml("{ implement: unknown/pipeline@9 }"));
     expect(tickets.getByIssueId("issue-1")).toMatchObject({
       state: "error",
       sandbox_id: null,
@@ -300,7 +317,7 @@ mcp_servers: {}
 
   it("admits a command-only fixture without requiring a model subscription", async () => {
     const { tickets, pipelines } = await run(
-      "pipelines: { implement: fixture-command }\n",
+      repositoryConfigYaml("{ implement: fixture-command }"),
       { codexAuthJson: undefined, claudeCodeOauthToken: undefined, kimiCodeApiKey: undefined },
       fixtureCatalogPath
     );
@@ -317,7 +334,7 @@ mcp_servers: {}
   });
 
   it("keeps an existing coordinator session pinned on a duplicate delegation", async () => {
-    const { pipelines, githubFetch, invoke } = await run("pipelines: { implement: implement }\n");
+    const { pipelines, githubFetch, invoke } = await run(repositoryConfigYaml("{ implement: implement }"));
     const before = pipelines.getInstanceForSession("session-1")!;
     expect(pipelines.getInstanceForSession("session-1")).toEqual(before);
 
@@ -329,7 +346,7 @@ mcp_servers: {}
   });
 
   it("routes a prompted stop through the pinned pipeline", async () => {
-    const { tickets, pipelines, invoke } = await run("pipelines: { implement: implement }\n");
+    const { tickets, pipelines, invoke } = await run(repositoryConfigYaml("{ implement: implement }"));
     const instance = pipelines.getInstanceForSession("session-1")!;
     const prompted = parseLinearWebhook(JSON.stringify({
       action: "prompted",
@@ -357,7 +374,7 @@ mcp_servers: {}
   });
 
   it("rejects an idle pipeline reply instead of starting another task", async () => {
-    const { pipelines, invoke } = await run("pipelines: { implement: implement }\n");
+    const { pipelines, invoke } = await run(repositoryConfigYaml("{ implement: implement }"));
     const instance = pipelines.getInstanceForSession("session-1")!;
     const prompted = promptedReply("keep going");
 
@@ -372,7 +389,7 @@ mcp_servers: {}
   });
 
   it("records a waiting-provider Linear reply as feedback and acknowledges the wakeup", async () => {
-    const { pipelines, invoke } = await run("pipelines: { implement: implement }\n");
+    const { pipelines, invoke } = await run(repositoryConfigYaml("{ implement: implement }"));
     const head = "c".repeat(40);
     moveToProviderWait(pipelines, head);
 
@@ -404,7 +421,7 @@ mcp_servers: {}
   });
 
   it("sanitizes and bounds waiting-provider Linear reply feedback", async () => {
-    const { pipelines, invoke } = await run("pipelines: { implement: implement }\n");
+    const { pipelines, invoke } = await run(repositoryConfigYaml("{ implement: implement }"));
     moveToProviderWait(pipelines);
     const body = `please inspect sk-${"a".repeat(24)} ${"x".repeat(2_500)}`;
 
@@ -422,7 +439,7 @@ mcp_servers: {}
   });
 
   it("processes the Linear reply snapshot even when another provider-ready instance is older", async () => {
-    const { tickets, pipelines, invoke } = await run("pipelines: { implement: implement }\n");
+    const { tickets, pipelines, invoke } = await run(repositoryConfigYaml("{ implement: implement }"));
     const oldHead = "a".repeat(40);
     const newHead = "b".repeat(40);
     const oldInstance = moveToProviderWait(pipelines, oldHead);
@@ -463,7 +480,7 @@ mcp_servers: {}
   });
 
   it("deduplicates a redelivered waiting-provider Linear reply by activity id", async () => {
-    const { pipelines, invoke } = await run("pipelines: { implement: implement }\n");
+    const { pipelines, invoke } = await run(repositoryConfigYaml("{ implement: implement }"));
     moveToProviderWait(pipelines);
     const prompted = promptedReply("same delivery", "activity-redelivered");
 
@@ -476,7 +493,7 @@ mcp_servers: {}
   });
 
   it("coalesces pending GitHub feedback and a waiting-provider Linear reply into one repair snapshot", async () => {
-    const { tickets, pipelines, invoke } = await run("pipelines: { implement: implement }\n");
+    const { tickets, pipelines, invoke } = await run(repositoryConfigYaml("{ implement: implement }"));
     const head = "d".repeat(40);
     const instance = pipelines.getInstanceForSession("session-1")!;
     tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
@@ -515,7 +532,7 @@ mcp_servers: {}
   });
 
   it("keeps a steerable running stage on the live-steer inbox path", async () => {
-    const { tickets, pipelines, invoke } = await run("pipelines: { implement: implement }\n");
+    const { tickets, pipelines, invoke } = await run(repositoryConfigYaml("{ implement: implement }"));
     const instance = pipelines.getInstanceForSession("session-1")!;
     const attempt = pipelines.getActiveAttempt(instance.id)!;
     const request = pipelines.getStageRequest(attempt.id);
@@ -539,7 +556,7 @@ mcp_servers: {}
   });
 
   it("buffers a reply during a non-steerable running stage instead of rejecting it", async () => {
-    const { tickets, pipelines, invoke } = await run("pipelines: { implement: implement }\n");
+    const { tickets, pipelines, invoke } = await run(repositoryConfigYaml("{ implement: implement }"));
     completeActiveStage(pipelines);
     const instance = pipelines.getInstanceForSession("session-1")!;
     const attempt = pipelines.getActiveAttempt(instance.id)!;
@@ -569,7 +586,7 @@ mcp_servers: {}
   });
 
   it("rejects a waiting-provider reply for a just-terminal instance without feedback", async () => {
-    const { pipelines, invoke } = await run("pipelines: { implement: implement }\n");
+    const { pipelines, invoke } = await run(repositoryConfigYaml("{ implement: implement }"));
     const instance = moveToProviderWait(pipelines);
     db!.prepare(`
       UPDATE pipeline_instances
@@ -585,7 +602,7 @@ mcp_servers: {}
   });
 
   it("rejects a superseded-session reply without feedback", async () => {
-    const { tickets, pipelines, invoke } = await run("pipelines: { implement: implement }\n");
+    const { tickets, pipelines, invoke } = await run(repositoryConfigYaml("{ implement: implement }"));
     const previous = moveToProviderWait(pipelines);
     tickets.setSandboxId("issue-1", "sandbox-old");
     await invoke({}, payload("session-2"));
@@ -602,7 +619,7 @@ mcp_servers: {}
   });
 
   it("supersedes an earlier pipeline generation on re-delegation", async () => {
-    const { tickets, pipelines, invoke } = await run("pipelines: { implement: implement }\n");
+    const { tickets, pipelines, invoke } = await run(repositoryConfigYaml("{ implement: implement }"));
     const previous = pipelines.getInstanceForSession("session-1")!;
     tickets.setSandboxId("issue-1", "sandbox-old");
 
@@ -627,10 +644,10 @@ mcp_servers: {}
 
   it("does not retire the current generation when re-delegation selects an invalid pipeline", async () => {
     const { tickets, pipelines, invoke, setRepositoryConfig } =
-      await run("pipelines: { implement: implement }\n");
+      await run(repositoryConfigYaml("{ implement: implement }"));
     const previous = pipelines.getInstanceForSession("session-1")!;
     tickets.setSandboxId("issue-1", "sandbox-old");
-    setRepositoryConfig("pipelines: { implement: unknown/pipeline@9 }\n");
+    setRepositoryConfig(repositoryConfigYaml("{ implement: unknown/pipeline@9 }"));
 
     await invoke({}, payload("session-2"));
 
