@@ -400,11 +400,15 @@ action attempt with parent attempt/run fences, unit id, action kind, idempotency
 key, runtime request/session hashes, lease owner/window, payload, result hash,
 output subject, and terminal/error state. The child reducer may lease at most
 one active child action per parent attempt. It expires only pre-dispatch claims
-by lease time; dispatched or running child actions remain the active action and
-are recovered/collected by idempotency rather than duplicated. A stopped child
-graph records `stopped_at` and `stop_reason` on `execution_graphs`; leasing must
-fail closed while that stop fence is present, including when stop was requested
-before any child action was active.
+by lease time. Dispatched or running child actions remain the active action while
+their parent-run-fenced child liveness is fresh, and are recovered/collected by
+idempotency rather than duplicated. When a dispatched or running child action
+misses its heartbeat fence, the supervisor marks the work attempt dead, levels
+the unit to `exited` with `alarm = 0`, clears the active action pointer, and
+allows serial dispatch to continue with the next ready unit. A stopped child
+graph records `stopped_at` and `stop_reason` on `execution_graphs`, levels
+unfinished units to `exited`, and makes leasing fail closed while that stop fence
+is present, including when stop was requested before any child action was active.
 
 `execution_gate_receipts` records deterministic child gate decisions by work
 attempt and gate kind. A receipt is accepted only after the typed child evidence

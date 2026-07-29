@@ -42,6 +42,7 @@ export interface StageRequestEnvelope {
   credentialScopes: string[];
   liveSteering: boolean;
   commandName?: CommandName;
+  childActionId?: string;
 }
 
 export function createStageRequestHash(
@@ -90,6 +91,7 @@ export function buildStageRequest(input: {
   contextRevision: number;
   expectedSubject: string | null;
   nativeSessionId: string | null;
+  childActionId?: string | null;
 }): StageRequestEnvelope {
   const commandName = input.stage.commandName ?? legacyImplicitCommandName(input.stage);
   const withoutFence: Omit<StageRequestEnvelope, "requestHash" | "idempotencyKey"> = {
@@ -122,6 +124,7 @@ export function buildStageRequest(input: {
     credentialScopes: [...input.stage.credentials].sort(),
     liveSteering: input.stage.live_steering,
     ...(commandName ? { commandName } : {}),
+    ...(input.childActionId ? { childActionId: input.childActionId } : {}),
   };
   return { ...withoutFence, ...createStageRequestHash(withoutFence) };
 }

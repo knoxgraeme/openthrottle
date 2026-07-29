@@ -74,6 +74,7 @@ export interface SandboxHeartbeatEvent {
   event_id: string;
   run_id: string;
   created_at: string;
+  child_action_id?: string;
 }
 
 export interface SandboxActivityEvent {
@@ -146,12 +147,17 @@ export function parseSandboxEvent(raw: string): SandboxEvent {
   }
 
   if (value.kind === "heartbeat") {
+    if (value.child_action_id !== undefined &&
+        (typeof value.child_action_id !== "string" || !RUN_ID_PATTERN.test(value.child_action_id))) {
+      throw new Error("sandbox heartbeat has an invalid child_action_id");
+    }
     return {
       version: 1,
       kind: "heartbeat",
       event_id: value.event_id,
       run_id: value.run_id,
       created_at: value.created_at,
+      ...(value.child_action_id ? { child_action_id: value.child_action_id } : {}),
     };
   }
   if (value.kind === "stage_result") {

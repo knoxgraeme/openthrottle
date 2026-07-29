@@ -28,6 +28,17 @@ export interface ExecutionUnitState {
   status: "pending" | "running" | "integrated" | "completed" | "exited" | "failed";
   activeActionId: string | null;
   integrationSubject: string | null;
+  terminalLevel: UnitTerminalLevel | null;
+  alarm: boolean;
+}
+
+export type UnitTerminalReason = "acceptance_passed" | "structural_exit" | "defect";
+export type UnitTerminalLevel = "completed" | "exited" | "failed";
+
+export interface UnitTerminalState {
+  status: Extract<ExecutionUnitState["status"], UnitTerminalLevel>;
+  terminalLevel: UnitTerminalLevel;
+  alarm: boolean;
 }
 
 export interface UnitBudgetState {
@@ -146,6 +157,16 @@ export function selectNextReadyUnit(units: readonly ExecutionUnitState[]): Execu
     }
   }
   return ready;
+}
+
+export function deriveUnitTerminalState(reason: UnitTerminalReason): UnitTerminalState {
+  if (reason === "acceptance_passed") {
+    return { status: "completed", terminalLevel: "completed", alarm: false };
+  }
+  if (reason === "structural_exit") {
+    return { status: "exited", terminalLevel: "exited", alarm: false };
+  }
+  return { status: "failed", terminalLevel: "failed", alarm: true };
 }
 
 function assertChildGateFence(evidence: ChildGateEvidence, expected: ChildGateFence): void {
@@ -346,6 +367,8 @@ export function buildExecutionGraphResultArtifact(input: {
       units: ordered.map((unit) => ({
         id: unit.unitId,
         status: unit.status,
+        terminal_level: unit.terminalLevel,
+        alarm: unit.alarm,
         integration_subject: unit.integrationSubject,
       })),
     },

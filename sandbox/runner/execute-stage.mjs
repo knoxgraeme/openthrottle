@@ -42,6 +42,7 @@ const REQUEST_KEYS = new Set([
   "agent",
   "expectedSubject", "contextPolicy", "nativeSessionId", "capability",
   "requiredArtifacts", "credentialScopes", "liveSteering", "commandName",
+  "childActionId",
 ]);
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 const DIGEST = /^[a-f0-9]{64}$/;
@@ -132,6 +133,7 @@ export function validateStageRequest(value) {
     credentialScopes: stringList(input.credentialScopes, "credentialScopes"),
     liveSteering: input.liveSteering,
     ...(input.commandName === undefined ? {} : { commandName: input.commandName }),
+    ...(input.childActionId === undefined ? {} : { childActionId: string(input.childActionId, "childActionId") }),
   };
   if (!Number.isSafeInteger(request.generation) || request.generation < 1) throw new Error("generation is invalid");
   if (!["claude", "codex", "opencode"].includes(request.agent)) throw new Error("agent is invalid");

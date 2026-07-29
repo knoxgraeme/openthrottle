@@ -2,11 +2,13 @@ import type Database from "better-sqlite3";
 import { canonicalJson, digestNormalized, type StageOutcome } from "../../pipeline/manifest.js";
 import {
   decideDownstreamContext,
+  deriveUnitTerminalState,
   selectNextReadyUnit,
   type ChildGateDecision,
   type ChildGateEvaluatorKind,
   type ExecutionPlanUnit,
   type ExecutionUnitState,
+  type UnitTerminalReason,
 } from "../../pipeline/unit-coordinator.js";
 import { deterministicId } from "./helpers.js";
 
@@ -138,6 +140,22 @@ export interface ExecutionUnitStore {
     parentAttemptId: string;
     reason: string;
   }): "stopped" | "already_stopped";
+  settleUnitTerminal(input: {
+    parentAttemptId: string;
+    unitId: string;
+    reason: UnitTerminalReason;
+  }): "settled" | "already_settled";
+  healStaleChildActions(input: {
+    parentAttemptId: string;
+    nowIso: string;
+    reason: string;
+  }): Array<{ actionId: string; unitId: string }>;
+  renewChildActionLiveness(input: {
+    parentRunId: string;
+    actionId: string;
+    heartbeatAtIso: string;
+    leaseUntilIso: string;
+  }): boolean;
 }
 
 type ExecutionUnitRow = {
@@ -148,6 +166,8 @@ type ExecutionUnitRow = {
   status: ExecutionUnitState["status"];
   active_work_attempt_id: string | null;
   integration_subject: string | null;
+  terminal_level: ExecutionUnitState["terminalLevel"];
+  alarm: number;
 };
 
 function dependenciesFor(row: { dependency_unit_ids: string }): string[] {
@@ -164,6 +184,8 @@ function unitState(row: ExecutionUnitRow): ExecutionUnitState {
     status: row.status,
     activeActionId: row.active_work_attempt_id,
     integrationSubject: row.integration_subject,
+    terminalLevel: row.terminal_level,
+    alarm: row.alarm === 1,
   };
 }
 
@@ -172,10 +194,78 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
   const listUnitRows = (parentAttemptId: string): ExecutionUnitRow[] =>
     db.prepare(`
       SELECT id, unit_id, authored_order, dependency_unit_ids, status,
-        active_work_attempt_id, integration_subject
+        active_work_attempt_id, integration_subject, terminal_level, alarm
       FROM execution_units WHERE parent_attempt_id = ?
       ORDER BY authored_order, unit_id
     `).all(parentAttemptId) as ExecutionUnitRow[];
+
+  function settleUnitRow(input: {
+    parentAttemptId: string;
+    unitId: string;
+    reason: UnitTerminalReason;
+    timestamp: string;
+  }): "settled" | "already_settled" {
+    const terminal = deriveUnitTerminalState(input.reason);
+    const existing = db.prepare(`
+      SELECT status, terminal_level, alarm FROM execution_units
+      WHERE parent_attempt_id = ? AND unit_id = ?
+    `).get(input.parentAttemptId, input.unitId) as
+      | { status: ExecutionUnitState["status"]; terminal_level: ExecutionUnitState["terminalLevel"]; alarm: number }
+      | undefined;
+    if (!existing) throw new Error(`unknown execution unit ${input.unitId}`);
+    if (existing.terminal_level) {
+      if (
+        existing.status !== terminal.status ||
+        existing.terminal_level !== terminal.terminalLevel ||
+        (existing.alarm === 1) !== terminal.alarm
+      ) {
+        throw new Error(`execution unit ${input.unitId} already has a different terminal level`);
+      }
+      return "already_settled";
+    }
+    const update = db.prepare(`
+      UPDATE execution_units
+      SET status = ?, terminal_level = ?, alarm = ?, active_work_attempt_id = NULL, updated_at = ?
+      WHERE parent_attempt_id = ? AND unit_id = ? AND terminal_level IS NULL
+    `).run(
+      terminal.status,
+      terminal.terminalLevel,
+      terminal.alarm ? 1 : 0,
+      input.timestamp,
+      input.parentAttemptId,
+      input.unitId
+    );
+    if (update.changes !== 1) throw new Error(`execution unit ${input.unitId} terminal compare-and-set failed`);
+    return "settled";
+  }
+
+  function healStaleChildActionRows(input: {
+    parentAttemptId: string;
+    nowIso: string;
+    reason: string;
+  }): Array<{ actionId: string; unitId: string }> {
+    const stale = db.prepare(`
+      SELECT id, unit_id FROM execution_work_attempts
+      WHERE parent_attempt_id = ? AND status IN ('dispatched', 'running')
+        AND lease_until IS NOT NULL AND lease_until <= ?
+      ORDER BY created_at, id
+    `).all(input.parentAttemptId, input.nowIso) as Array<{ id: string; unit_id: string }>;
+    for (const action of stale) {
+      db.prepare(`
+        UPDATE execution_work_attempts
+        SET status = 'dead', lease_until = NULL, completed_at = COALESCE(completed_at, ?),
+            last_error = ?, updated_at = ?
+        WHERE id = ? AND status IN ('dispatched', 'running')
+      `).run(input.nowIso, input.reason, input.nowIso, action.id);
+      settleUnitRow({
+        parentAttemptId: input.parentAttemptId,
+        unitId: action.unit_id,
+        reason: "structural_exit",
+        timestamp: input.nowIso,
+      });
+    }
+    return stale.map((action) => ({ actionId: action.id, unitId: action.unit_id }));
+  }
 
   function assertGraphReplayMatches(input: Parameters<ExecutionUnitStore["createGraph"]>[0], existing: ExecutionUnitGraph): void {
     if (
@@ -269,6 +359,11 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       WHERE parent_attempt_id = ? AND status = 'leased'
         AND lease_until IS NOT NULL AND lease_until <= ?
     `).run(input.nowIso, input.parentAttemptId, input.nowIso);
+    healStaleChildActionRows({
+      parentAttemptId: input.parentAttemptId,
+      nowIso: input.nowIso,
+      reason: "child action missed heartbeat fence",
+    });
     const dispatched = db.prepare(`
       SELECT * FROM execution_work_attempts
       WHERE parent_attempt_id = ? AND status IN ('dispatched', 'running')
@@ -374,7 +469,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     }
     const unfinished = db.prepare(`
       SELECT 1 FROM execution_units
-      WHERE parent_attempt_id = ? AND status NOT IN ('integrated', 'completed')
+      WHERE parent_attempt_id = ? AND status NOT IN ('integrated', 'completed', 'exited')
       LIMIT 1
     `).get(input.parentAttemptId);
     if (unfinished) throw new Error(`execution graph ${graph.id} has unfinished units`);
@@ -527,12 +622,34 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       `).run(input.reason, timestamp, timestamp, input.parentAttemptId);
       db.prepare(`
         UPDATE execution_units
-        SET status = 'pending', active_work_attempt_id = NULL, updated_at = ?
+        SET status = 'exited', terminal_level = 'exited', alarm = 0,
+            active_work_attempt_id = NULL, updated_at = ?
         WHERE parent_attempt_id = ? AND active_work_attempt_id IN (${activeActionIds.map(() => "?").join(",")})
       `).run(timestamp, input.parentAttemptId, ...activeActionIds);
     }
+    db.prepare(`
+      UPDATE execution_units
+      SET status = 'exited', terminal_level = 'exited', alarm = 0,
+          active_work_attempt_id = NULL, updated_at = ?
+      WHERE parent_attempt_id = ? AND terminal_level IS NULL
+    `).run(timestamp, input.parentAttemptId);
     return "stopped";
   });
+
+  const settleUnitTerminal = db.transaction((
+    input: Parameters<ExecutionUnitStore["settleUnitTerminal"]>[0]
+  ): "settled" | "already_settled" =>
+    settleUnitRow({
+      parentAttemptId: input.parentAttemptId,
+      unitId: input.unitId,
+      reason: input.reason,
+      timestamp: now(),
+    })
+  );
+
+  const healStaleChildActions = db.transaction((
+    input: Parameters<ExecutionUnitStore["healStaleChildActions"]>[0]
+  ): Array<{ actionId: string; unitId: string }> => healStaleChildActionRows(input));
 
   return {
     createGraph,
@@ -587,5 +704,26 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       `).all(parentAttemptId) as ExecutionDownstreamContext[];
     },
     stopActiveWork,
+    settleUnitTerminal,
+    healStaleChildActions,
+    renewChildActionLiveness(input) {
+      const timestamp = now();
+      return db.prepare(`
+        UPDATE execution_work_attempts
+        SET lease_until = CASE
+              WHEN lease_until IS NULL OR lease_until < ? THEN ?
+              ELSE lease_until
+            END,
+            updated_at = ?
+        WHERE id = ? AND parent_run_id = ?
+          AND status IN ('leased', 'dispatched', 'running')
+      `).run(
+        input.leaseUntilIso,
+        input.leaseUntilIso,
+        timestamp,
+        input.actionId,
+        input.parentRunId
+      ).changes === 1;
+    },
   };
 }

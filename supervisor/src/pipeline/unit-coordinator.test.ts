@@ -4,6 +4,7 @@ import {
   buildAggregateStageEvent,
   decideChildGate,
   decideDownstreamContext,
+  deriveUnitTerminalState,
   selectNextReadyUnit,
   unitBudgetDecision,
   type ChildGateEvidence,
@@ -18,6 +19,8 @@ function unit(overrides: Partial<ExecutionUnitState> & { unitId: string; ordinal
     status: "pending",
     activeActionId: null,
     integrationSubject: null,
+    terminalLevel: null,
+    alarm: false,
     ...overrides,
   };
 }
@@ -57,6 +60,24 @@ describe("unit coordinator", () => {
       manifestMaxAttempts: 2,
       instanceAttemptCount: 2,
     })).toMatchObject({ allowed: false, exhausted: "attempts" });
+  });
+
+  it("levels unit terminals into one supervisor-derived operator alarm value", () => {
+    expect(deriveUnitTerminalState("acceptance_passed")).toEqual({
+      status: "completed",
+      terminalLevel: "completed",
+      alarm: false,
+    });
+    expect(deriveUnitTerminalState("structural_exit")).toEqual({
+      status: "exited",
+      terminalLevel: "exited",
+      alarm: false,
+    });
+    expect(deriveUnitTerminalState("defect")).toEqual({
+      status: "failed",
+      terminalLevel: "failed",
+      alarm: true,
+    });
   });
 
   it("deterministically validates child semantic receipts against producer, subject, and freshness fences", () => {
@@ -262,7 +283,11 @@ describe("unit coordinator", () => {
       parentAttempt,
       subject,
       completedAt: "2026-07-29T00:00:02.000Z",
-      units: [unit({ unitId: "a", ordinal: 0, status: "integrated", integrationSubject: subject })],
+      units: [
+        unit({ unitId: "a", ordinal: 0, status: "completed", terminalLevel: "completed", integrationSubject: subject }),
+        unit({ unitId: "b", ordinal: 1, status: "exited", terminalLevel: "exited", alarm: false }),
+        unit({ unitId: "c", ordinal: 2, status: "failed", terminalLevel: "failed", alarm: true }),
+      ],
     });
 
     expect(event).toMatchObject({
@@ -282,7 +307,15 @@ describe("unit coordinator", () => {
     };
     const graphPayload = JSON.parse(graphResult!.payload) as {
       schema: string;
-      details: { units: Array<{ id: string; status: string; integration_subject: string }> };
+      details: {
+        units: Array<{
+          id: string;
+          status: string;
+          terminal_level: string | null;
+          alarm: boolean;
+          integration_subject: string | null;
+        }>;
+      };
       repository: { subject: string };
     };
     expect(stagePayload).toMatchObject({
@@ -293,7 +326,31 @@ describe("unit coordinator", () => {
     });
     expect(graphPayload).toMatchObject({
       schema: "openthrottle.artifact/execution_graph_result@1",
-      details: { units: [{ id: "a", status: "integrated", integration_subject: subject }] },
+      details: {
+        units: [
+          {
+            id: "a",
+            status: "completed",
+            terminal_level: "completed",
+            alarm: false,
+            integration_subject: subject,
+          },
+          {
+            id: "b",
+            status: "exited",
+            terminal_level: "exited",
+            alarm: false,
+            integration_subject: null,
+          },
+          {
+            id: "c",
+            status: "failed",
+            terminal_level: "failed",
+            alarm: true,
+            integration_subject: null,
+          },
+        ],
+      },
       repository: { subject },
     });
     expect(() => buildAggregateStageEvent({

@@ -10,12 +10,13 @@ import { dirname } from "node:path";
 const runId = process.env.RUN_ID;
 const heartbeatFile = process.env.OT_HEARTBEAT_FILE ||
   "/var/lib/openthrottle/heartbeat/heartbeat.json";
+const childActionId = process.env.OT_CHILD_ACTION_ID;
 const parsedInterval = Number(process.env.OT_EXECUTOR_HEARTBEAT_INTERVAL_MS);
 const intervalMs = Number.isFinite(parsedInterval) && parsedInterval >= 1_000
   ? parsedInterval
   : 15_000;
 
-export function buildExecutorHeartbeat(id, createdAt, targetRunId = runId) {
+export function buildExecutorHeartbeat(id, createdAt, targetRunId = runId, targetChildActionId = childActionId) {
   if (!targetRunId) throw new Error("RUN_ID is required for executor heartbeat");
   return {
     version: 1,
@@ -23,6 +24,7 @@ export function buildExecutorHeartbeat(id, createdAt, targetRunId = runId) {
     event_id: id,
     run_id: targetRunId,
     created_at: createdAt,
+    ...(targetChildActionId ? { child_action_id: targetChildActionId } : {}),
   };
 }
 
