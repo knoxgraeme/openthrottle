@@ -4,7 +4,9 @@
 #
 #   1. Block every push from a sealed fresh-review stage.
 #   2. Block any push whose remote ref is refs/heads/main or refs/heads/master.
-#   3. Refuse force / non-fast-forward pushes on any branch (history must
+#   3. Block internal unit/final-repair refs; executor-owned candidate refs are
+#      local evidence and must never be provider publication.
+#   4. Refuse force / non-fast-forward pushes on any branch (history must
 #      only move forward on agent branches — the pushed branch is the human
 #      escape hatch, so it must never silently lose commits).
 #
@@ -23,6 +25,12 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   if [[ "$remote_ref" =~ ^refs/heads/(main|master)$ ]]; then
     echo "BLOCKED: direct push to '${remote_ref#refs/heads/}' is not allowed." >&2
     echo "Push your feature branch (git push origin HEAD) and open a PR instead." >&2
+    exit 1
+  fi
+
+  if [[ "$remote_ref" =~ ^refs/heads/(unit|ot-unit|openthrottle/unit|openthrottle/final-repair)(/|$) ]]; then
+    echo "BLOCKED: internal OpenThrottle worktree ref '${remote_ref}' cannot be pushed." >&2
+    echo "Only the executor-integrated stage branch may be published." >&2
     exit 1
   fi
 

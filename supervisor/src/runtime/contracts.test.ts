@@ -77,8 +77,9 @@ describe("sandbox runtime port", () => {
 
   it("loads the shipped descriptor and rejects a mismatched configured release", () => {
     const path = fileURLToPath(new URL("../../pipelines/runtime-capabilities-v1.json", import.meta.url));
-    const runtime = loadRuntimeCapabilityDescriptor(path, "openthrottle-snapshot/v4");
+    const runtime = loadRuntimeCapabilityDescriptor(path, "openthrottle-snapshot/v5");
     expect(runtime.descriptor.capabilities).toContain("ce/implement@1");
+    expect(runtime.descriptor.capabilities).toContain("loop-action@1");
     expect(() => loadRuntimeCapabilityDescriptor(path, "different-release/v1"))
       .toThrow(/does not match configured/);
   });

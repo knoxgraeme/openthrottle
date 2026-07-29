@@ -3,6 +3,9 @@ import {
   type RuntimeResource,
   type RuntimeControl,
   type RuntimeInventoryResource,
+  type RuntimeWorktreeHandle,
+  type LoopActionRequest,
+  type LoopActionResult,
   type StageExecutionResult,
 } from "../../runtime/contracts.js";
 import { canonicalJson, digestNormalized, STAGE_OUTCOMES } from "../../pipeline/manifest.js";
@@ -15,6 +18,8 @@ const ACTIVE_SANDBOX_AUTOSTOP_MINUTES = 60;
 const IDLE_SANDBOX_AUTOSTOP_MINUTES = 5;
 const STAGE_INPUT_DIR = "/var/lib/openthrottle/stage-input";
 const STAGE_RESULT_DIR = "/var/lib/openthrottle/stage-results";
+const LOOP_INPUT_DIR = "/var/lib/openthrottle/loop-input";
+const LOOP_RESULT_DIR = "/var/lib/openthrottle/loop-results";
 const STAGE_CREDENTIAL_ENV = new Set([
   "GITHUB_TOKEN",
   "CLAUDE_CODE_OAUTH_TOKEN",
@@ -69,6 +74,20 @@ function assertStageRequestFence(request: StageRequestEnvelope): void {
   safeStagePathId(request.runId, "stage run ID");
 }
 
+function assertLoopRequestFence(request: LoopActionRequest): void {
+  safeStagePathId(request.actionId, "loop action ID");
+  safeStagePathId(request.attemptId, "loop attempt ID");
+  const expectedHash = digestNormalized(canonicalJson({
+    ...request,
+    requestHash: undefined,
+    idempotencyKey: undefined,
+  }));
+  const expectedKey = `loop:${request.attemptId}:${request.actionId}:${expectedHash}`;
+  if (request.requestHash !== expectedHash || request.idempotencyKey !== expectedKey) {
+    throw new Error(`loop action ${request.actionId} has a stale hash or idempotency key`);
+  }
+}
+
 function parseCollectedStageResult(raw: string, attemptId: string): StageExecutionResult {
   if (Buffer.byteLength(raw, "utf8") > 64 * 1024) throw new Error("sealed stage result exceeds 64 KiB");
   const event = JSON.parse(raw) as Record<string, unknown>;
@@ -113,6 +132,31 @@ function parseCollectedStageResult(raw: string, attemptId: string): StageExecuti
   };
 }
 
+function parseCollectedLoopResult(raw: string, actionId: string): LoopActionResult {
+  if (Buffer.byteLength(raw, "utf8") > 256 * 1024) throw new Error("sealed loop result exceeds 256 KiB");
+  const event = JSON.parse(raw) as Record<string, unknown>;
+  if (event.kind !== "loop_action_result" || event.version !== 1 || event.action_id !== actionId ||
+      typeof event.attempt_id !== "string" || typeof event.request_hash !== "string" ||
+      !/^[a-f0-9]{64}$/.test(event.request_hash) ||
+      !["success", "failure", "needs_human", "retryable_infrastructure_failure"].includes(String(event.outcome)) ||
+      typeof event.created_at !== "string" || Number.isNaN(Date.parse(event.created_at)) ||
+      (event.subject !== null && (typeof event.subject !== "string" || !/^[a-f0-9]{40,64}$/.test(event.subject))) ||
+      (event.native_session_id !== null && typeof event.native_session_id !== "string") ||
+      typeof event.receipt !== "string") {
+    throw new Error(`sealed loop result ${actionId} has an invalid envelope`);
+  }
+  return {
+    actionId,
+    attemptId: event.attempt_id as string,
+    requestHash: event.request_hash as string,
+    outcome: event.outcome as LoopActionResult["outcome"],
+    nativeSessionId: event.native_session_id as string | null,
+    subject: event.subject as string | null,
+    receipt: event.receipt as string,
+    completedAt: event.created_at as string,
+  };
+}
+
 /**
  * Provider-specific implementation of the stage runtime boundary. Pipeline
  * state sees only RuntimeResource opaque IDs; all Daytona IDs, sessions,
@@ -134,6 +178,14 @@ export function createDaytonaSandboxRuntime(
   const prepareRootFolder = async (sandbox: Sandbox, path: string) => {
     await sandbox.fs.createFolder(path, "700").catch(() => undefined);
     await sandbox.fs.setFilePermissions(path, { owner: "root", group: "root", mode: "700" });
+  };
+  const executeSandboxCommand = async (sandbox: Sandbox, command: string, timeoutSeconds: number) => {
+    if (!sandbox.process?.executeCommand) throw new Error("Daytona runtime does not expose process command execution");
+    const result = await sandbox.process.executeCommand(command, "/home/agent/repo", {}, timeoutSeconds);
+    if (result.exitCode !== undefined && result.exitCode !== 0) {
+      throw new Error(`sandbox command failed with exit ${result.exitCode}`);
+    }
+    return result;
   };
 
   return {
@@ -266,6 +318,69 @@ export function createDaytonaSandboxRuntime(
         if (String(error).toLowerCase().includes("not found")) return null;
         throw error;
       }
+    },
+
+    async createWorktree(resource, input) {
+      safeStagePathId(input.attemptId, "loop attempt ID");
+      if (!/^[a-f0-9]{40}$/.test(input.baseCommit)) throw new Error("worktree base commit is invalid");
+      const sandbox = await ensureStarted(resource);
+      const handle: RuntimeWorktreeHandle = {
+        id: digestNormalized(canonicalJson({
+          idempotencyKey: input.idempotencyKey,
+          attemptId: input.attemptId,
+          baseCommit: input.baseCommit,
+        })).slice(0, 32),
+      };
+      await executeSandboxCommand(
+        sandbox,
+        `/opt/openthrottle/runner/worktrees.mjs create --handle '${handle.id}' --base '${input.baseCommit}'`,
+        120
+      );
+      return handle;
+    },
+
+    async dispatchLoopAction(resource, request) {
+      assertLoopRequestFence(request);
+      const sandbox = await ensureStarted(resource);
+      await prepareRootFolder(sandbox, LOOP_INPUT_DIR);
+      await prepareRootFolder(sandbox, LOOP_RESULT_DIR);
+      const requestPath = `${LOOP_INPUT_DIR}/${request.actionId}.json`;
+      await sandbox.fs.uploadFile(Buffer.from(canonicalJson(request)), requestPath);
+      await sandbox.fs.setFilePermissions(requestPath, { owner: "root", group: "root", mode: "400" });
+      const sessionId = `loop-${request.actionId}`;
+      if (!sandbox.process?.executeSessionCommand) {
+        throw new Error("Daytona runtime does not expose session command execution");
+      }
+      await sandbox.process?.createSession?.(sessionId).catch(() => undefined);
+      const dispatched = await sandbox.process.executeSessionCommand(sessionId, {
+        command: `flock --nonblock ${LOOP_RESULT_DIR}/${request.actionId}.lock sh -c ` +
+          `'test -f ${LOOP_RESULT_DIR}/${request.actionId}.json || exec /opt/openthrottle/runner/execute-loop.mjs --request ${requestPath}'`,
+        runAsync: true,
+        suppressInputEcho: true,
+      }, Math.ceil(request.timeoutMs / 1000));
+      return { providerDispatchId: dispatched.cmdId ?? sessionId };
+    },
+
+    async collectLoopActionResult(resource, actionId) {
+      safeStagePathId(actionId, "loop action ID");
+      const sandbox = await getSandbox(resource);
+      try {
+        const raw = (await sandbox.fs.downloadFile(`${LOOP_RESULT_DIR}/${actionId}.json`)).toString("utf8");
+        return parseCollectedLoopResult(raw, actionId);
+      } catch (error) {
+        if (String(error).toLowerCase().includes("not found")) return null;
+        throw error;
+      }
+    },
+
+    async cleanupWorktree(resource, handle) {
+      safeStagePathId(handle.id, "worktree handle ID");
+      const sandbox = await ensureStarted(resource);
+      await executeSandboxCommand(
+        sandbox,
+        `/opt/openthrottle/runner/worktrees.mjs remove --handle '${handle.id}'`,
+        120
+      );
     },
 
     async renewLiveness(resource) {
