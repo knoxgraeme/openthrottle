@@ -119,15 +119,18 @@ function resolvePipelineSelection(
   if (!graphId) return repositoryConfig.config.pipelines?.[taskType] ?? taskType;
 
   const intent = repositoryConfig.config.intents?.implement;
-  const defaultGraph = intent?.default_graph ?? repositoryConfig.config.default_graph;
   const allowedGraphs = intent?.allowed_graphs ?? [repositoryConfig.config.default_graph];
   if (!allowedGraphs.includes(graphId)) {
     throw new Error(`graph ${graphId} is not allowed for implement; allowed: ${allowedGraphs.join(", ")}`);
   }
   const source = repositoryConfig.config.graphs.find((entry) => entry.id === graphId);
   if (!source) throw new Error(`graph ${graphId} is not declared in repository config`);
-  if (graphId === defaultGraph) return repositoryConfig.config.pipelines?.[taskType] ?? taskType;
-  return repositoryConfig.config.pipelines?.[graphId] ?? source.ref;
+  const graphOverride = repositoryConfig.config.pipelines?.[graphId];
+  if (graphOverride) return graphOverride;
+  if (source.kind === "builtin" && source.ref === "core/simple@1") {
+    return repositoryConfig.config.pipelines?.[taskType] ?? taskType;
+  }
+  return source.ref;
 }
 
 // A `branch › <name>` label (also `branch >`, `branch:`, `branch/`) targets a
