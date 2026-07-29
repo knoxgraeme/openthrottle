@@ -209,12 +209,7 @@ function validateGraph(graph: GraphContract, source: string, config?: Repository
   for (const node of graph.nodes) {
     if (node.loop && !loops.has(node.loop)) fail(`${source}.nodes.${node.id}.loop`, "references an unknown loop");
     if (node.command && config) {
-      const configuredCommands = new Set([
-        ...Object.keys(config.commands ?? {}),
-        ...["test", "lint", "build", "dev", "format"].filter((name) =>
-          config[name as "test" | "lint" | "build" | "dev" | "format"] !== undefined
-        ),
-      ]);
+      const configuredCommands = new Set(Object.keys(config.commands ?? {}));
       if (!configuredCommands.has(node.command)) {
         fail(`${source}.nodes.${node.id}.command`, "references an unknown repository command");
       }

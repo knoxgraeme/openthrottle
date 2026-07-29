@@ -406,4 +406,43 @@ graphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]
 mcp_servers: { local: { command: node, surprise: true } }
 `)).toThrow(/unknown field/);
   });
+
+  it("keeps canonical commands and sandbox compatibility aliases in sync", () => {
+    const commandsOnly = parseRepositoryConfig(`
+schema: openthrottle.config/v1
+default_graph: simple
+graphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]
+commands:
+  test: npm test
+intents:
+  implement: { default_graph: simple, allowed_graphs: [simple] }
+  investigate: { default_graph: simple, allowed_graphs: [simple] }
+`);
+    expect(commandsOnly.config.commands).toEqual({ test: "npm test" });
+    expect(commandsOnly.config.test).toBe("npm test");
+
+    const legacyOnly = parseRepositoryConfig(`
+schema: openthrottle.config/v1
+default_graph: simple
+graphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]
+test: npm test
+intents:
+  implement: { default_graph: simple, allowed_graphs: [simple] }
+  investigate: { default_graph: simple, allowed_graphs: [simple] }
+`);
+    expect(legacyOnly.config.commands).toEqual({ test: "npm test" });
+    expect(legacyOnly.config.test).toBe("npm test");
+
+    expect(() => parseRepositoryConfig(`
+schema: openthrottle.config/v1
+default_graph: simple
+graphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]
+commands:
+  test: npm test
+test: npm run different
+intents:
+  implement: { default_graph: simple, allowed_graphs: [simple] }
+  investigate: { default_graph: simple, allowed_graphs: [simple] }
+`)).toThrow(/test: must match commands\.test/);
+  });
 });

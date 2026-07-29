@@ -44,6 +44,8 @@ interface InitSelection {
   registration: RepositoryRegistrationInput;
 }
 
+const COMMAND_ALIAS_NAMES = ["test", "build", "lint"] as const;
+
 export function detectPackageManager(
   pkg: PackageJson,
   directory = process.cwd()
@@ -220,11 +222,24 @@ async function promptConfig(detected: Detected, target: RepositoryTarget): Promi
 }
 
 export function writeProjectConfig(config: ProjectConfig, directory = process.cwd()): void {
-  const commands = config.commands ?? {
+  const commands = { ...(config.commands ?? {
     ...(config.test ? { test: config.test } : {}),
     ...(config.lint ? { lint: config.lint } : {}),
     ...(config.build ? { build: config.build } : {}),
-  };
+  }) };
+  const aliases: Partial<Record<(typeof COMMAND_ALIAS_NAMES)[number], string>> = {};
+  for (const name of COMMAND_ALIAS_NAMES) {
+    const alias = config[name];
+    const command = commands[name];
+    if (alias && command && alias !== command) {
+      throw new Error(`${name} must match commands.${name}`);
+    }
+    const normalized = command || alias;
+    if (normalized) {
+      commands[name] = normalized;
+      aliases[name] = normalized;
+    }
+  }
   const document: Record<string, unknown> = {
     schema: "openthrottle.config/v1",
     default_graph: "simple",
@@ -233,13 +248,18 @@ export function writeProjectConfig(config: ProjectConfig, directory = process.cw
     ],
     ...config,
     commands,
+    ...aliases,
     intents: {
       implement: { default_graph: "simple", allowed_graphs: ["simple"] },
       investigate: { default_graph: "simple", allowed_graphs: ["simple"] },
     },
   };
   for (const key of ["test", "build", "lint", "model"] as const) {
-    if (!config[key]) delete document[key];
+    if (key === "model") {
+      if (!config.model) delete document.model;
+    } else if (!aliases[key]) {
+      delete document[key];
+    }
   }
   if (Object.keys(commands).length === 0) delete document.commands;
   const header = [

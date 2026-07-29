@@ -74,6 +74,68 @@ describe("init project detection", () => {
     expect(contents).not.toContain("build:");
   });
 
+  it("writes sandbox command aliases from explicit canonical commands", () => {
+    const directory = temporaryProject();
+    writeProjectConfig(
+      {
+        agent: "codex",
+        commands: { test: "npm test" },
+        test: "",
+        build: "",
+        lint: "",
+        post_bootstrap: [],
+        limits: { max_turns: 20, task_timeout: 60 },
+        mcp_servers: {},
+      },
+      directory
+    );
+
+    expect(parse(readFileSync(join(directory, ".openthrottle.yml"), "utf8"))).toMatchObject({
+      commands: { test: "npm test" },
+      test: "npm test",
+    });
+  });
+
+  it("synthesizes canonical commands from generated config aliases", () => {
+    const directory = temporaryProject();
+    writeProjectConfig(
+      {
+        agent: "codex",
+        commands: { test: "npm test" },
+        test: "",
+        build: "npm run build",
+        lint: "",
+        post_bootstrap: [],
+        limits: { max_turns: 20, task_timeout: 60 },
+        mcp_servers: {},
+      },
+      directory
+    );
+
+    expect(parse(readFileSync(join(directory, ".openthrottle.yml"), "utf8"))).toMatchObject({
+      commands: { test: "npm test", build: "npm run build" },
+      test: "npm test",
+      build: "npm run build",
+    });
+  });
+
+  it("rejects generated config command alias mismatches", () => {
+    const directory = temporaryProject();
+    expect(() => writeProjectConfig(
+      {
+        agent: "codex",
+        commands: { test: "npm test" },
+        test: "npm run different",
+        build: "",
+        lint: "",
+        post_bootstrap: [],
+        limits: { max_turns: 20, task_timeout: 60 },
+        mcp_servers: {},
+      },
+      directory
+    )).toThrow(/test must match commands\.test/);
+  });
+
   it("writes the model for any agent when set and omits it when blank", () => {
     const codexDir = temporaryProject();
     writeProjectConfig(

@@ -59,6 +59,9 @@ export interface RepositoryConfigContract {
   }>;
 }
 
+const COMMAND_ALIAS_NAMES = ["test", "lint", "build", "dev", "format"] as const;
+type CommandAliasName = (typeof COMMAND_ALIAS_NAMES)[number];
+
 const BUILTIN_GRAPH = /^[a-z][a-z0-9]*(?:[._/-][a-z0-9]+)*@\d+$/;
 const REPOSITORY_PATH = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\/\/)[A-Za-z0-9._/-]+\.json$/;
 const PIPELINE_REFERENCE = /^[a-z][a-z0-9]*(?:[._/-][a-z0-9]+)*(?:@\d+)?$/;
@@ -191,6 +194,30 @@ function parseCommandMap(value: unknown, path: string): Record<string, string> {
   });
 }
 
+function parseCommandAliases(input: Record<string, unknown>, source: string): {
+  commands?: Record<string, string>;
+  aliases: Partial<Record<CommandAliasName, string>>;
+} {
+  const commands = input.commands === undefined ? {} : parseCommandMap(input.commands, `${source}.commands`);
+  const aliases: Partial<Record<CommandAliasName, string>> = {};
+  for (const name of COMMAND_ALIAS_NAMES) {
+    const alias = input[name] === undefined ? undefined : stringAt(input[name], `${source}.${name}`, { max: 4_000 });
+    const command = commands[name];
+    if (alias !== undefined && command !== undefined && alias !== command) {
+      fail(`${source}.${name}`, `must match commands.${name}`);
+    }
+    const normalized = command ?? alias;
+    if (normalized !== undefined) {
+      commands[name] = normalized;
+      aliases[name] = normalized;
+    }
+  }
+  return {
+    ...(Object.keys(commands).length === 0 ? {} : { commands }),
+    aliases,
+  };
+}
+
 function parseIntent(value: unknown, path: string): { default_graph: string; allowed_graphs: string[] } {
   const input = objectAt(value, path, ["default_graph", "allowed_graphs"]);
   return {
@@ -211,18 +238,19 @@ export function validateRepositoryConfigContract(
     "post_bootstrap", "limits", "mcp_servers", "pipelines", "intents",
   ]);
   if (input.schema !== CONFIG_SCHEMA) fail(`${source}.schema`, `must be ${CONFIG_SCHEMA}`);
+  const commandAliases = parseCommandAliases(input, source);
   const config: RepositoryConfigContract = {
     schema: CONFIG_SCHEMA,
     default_graph: stringAt(input.default_graph, `${source}.default_graph`, { pattern: IDENTIFIER }),
     graphs: arrayAt(input.graphs, `${source}.graphs`, parseSource, { min: 1, max: 16 }),
     ...(input.agent === undefined ? {} : { agent: stringAt(input.agent, `${source}.agent`, { pattern: IDENTIFIER }) }),
     ...(input.model === undefined ? {} : { model: stringAt(input.model, `${source}.model`, { max: 240, pattern: MODEL_REFERENCE }) }),
-    ...(input.commands === undefined ? {} : { commands: parseCommandMap(input.commands, `${source}.commands`) }),
-    ...(input.test === undefined ? {} : { test: stringAt(input.test, `${source}.test`, { max: 4_000 }) }),
-    ...(input.lint === undefined ? {} : { lint: stringAt(input.lint, `${source}.lint`, { max: 4_000 }) }),
-    ...(input.build === undefined ? {} : { build: stringAt(input.build, `${source}.build`, { max: 4_000 }) }),
-    ...(input.dev === undefined ? {} : { dev: stringAt(input.dev, `${source}.dev`, { max: 4_000 }) }),
-    ...(input.format === undefined ? {} : { format: stringAt(input.format, `${source}.format`, { max: 4_000 }) }),
+    ...(commandAliases.commands === undefined ? {} : { commands: commandAliases.commands }),
+    ...(commandAliases.aliases.test === undefined ? {} : { test: commandAliases.aliases.test }),
+    ...(commandAliases.aliases.lint === undefined ? {} : { lint: commandAliases.aliases.lint }),
+    ...(commandAliases.aliases.build === undefined ? {} : { build: commandAliases.aliases.build }),
+    ...(commandAliases.aliases.dev === undefined ? {} : { dev: commandAliases.aliases.dev }),
+    ...(commandAliases.aliases.format === undefined ? {} : { format: commandAliases.aliases.format }),
     ...(input.post_bootstrap === undefined ? {} : { post_bootstrap: parseStringList(input.post_bootstrap, `${source}.post_bootstrap`, 32) }),
     ...(input.limits === undefined ? {} : { limits: parseLimits(input.limits, `${source}.limits`) }),
     ...(input.mcp_servers === undefined ? {} : {

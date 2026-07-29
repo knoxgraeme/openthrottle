@@ -175,4 +175,59 @@ describe("Stage C contract fixtures", () => {
     expect(() => parseRepositoryConfigContract(JSON.stringify(config), { source: "config" }))
       .toThrow(/mcp_servers\.local\.headers\.Authorization: must not name a provider-secret identifier/);
   });
+
+  it("normalizes repository command aliases from the canonical commands map", () => {
+    const config = JSON.parse(readFixture("valid", "config-repository.json")) as {
+      commands: Record<string, string>;
+      test?: string;
+      lint?: string;
+      build?: string;
+    };
+    delete config.test;
+    delete config.lint;
+    delete config.build;
+
+    const parsed = parseRepositoryConfigContract(JSON.stringify(config), { source: "config" });
+
+    expect(parsed.value.commands).toMatchObject({
+      test: config.commands.test,
+      lint: config.commands.lint,
+      build: config.commands.build,
+    });
+    expect(parsed.value.test).toBe(config.commands.test);
+    expect(parsed.value.lint).toBe(config.commands.lint);
+    expect(parsed.value.build).toBe(config.commands.build);
+    expect(JSON.parse(parsed.normalized)).toMatchObject({
+      commands: config.commands,
+      test: config.commands.test,
+      lint: config.commands.lint,
+      build: config.commands.build,
+    });
+  });
+
+  it("synthesizes canonical commands from legacy aliases and rejects mismatches", () => {
+    const config = JSON.parse(readFixture("valid", "config-repository.json")) as {
+      commands?: Record<string, string>;
+      test: string;
+      lint: string;
+      build: string;
+    };
+    delete config.commands;
+
+    const parsed = parseRepositoryConfigContract(JSON.stringify(config), { source: "config" });
+
+    expect(parsed.value.commands).toMatchObject({
+      test: config.test,
+      lint: config.lint,
+      build: config.build,
+    });
+
+    const conflicting = JSON.parse(readFixture("valid", "config-repository.json")) as {
+      commands: Record<string, string>;
+      test: string;
+    };
+    conflicting.test = "npm run different";
+    expect(() => parseRepositoryConfigContract(JSON.stringify(conflicting), { source: "config" }))
+      .toThrow(/config\.test: must match commands\.test/);
+  });
 });
