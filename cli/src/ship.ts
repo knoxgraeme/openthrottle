@@ -8,6 +8,7 @@
 
 import { readFileSync, existsSync } from 'node:fs';
 import * as p from '@clack/prompts';
+import { validatePlanFileForGraph } from './plan.js';
 import { getErrorMessage, readEnv, requireEnv, linearGraphQL } from './util.js';
 
 interface ParsedMarkdown {
@@ -45,12 +46,9 @@ export function parseShipArgs(args: string[]): { file?: string; graphId?: string
   return parsed;
 }
 
-export function validateGraphSelectionForShip(graphId?: string): void {
+export function validateGraphSelectionForShip(file: string, graphId?: string): void {
   if (!graphId || graphId === "simple") return;
-  throw new Error(
-    `ship --graph ${graphId} cannot delegate correctly yet because graph selection is not persisted through admission; ` +
-      "omit --graph or use --graph simple."
-  );
+  validatePlanFileForGraph(file, { graphId });
 }
 
 interface Team {
@@ -146,18 +144,19 @@ export default async function ship(args: string[] | string | undefined): Promise
 
   p.intro('openthrottle ship');
 
-  const apiKey = requireEnv('LINEAR_API_KEY', 'a plain Linear API key with issue-create access');
   const content = readFileSync(file, 'utf8');
 
   let title: string;
   let body: string;
   try {
     ({ title, body } = parseMarkdown(content));
-    validateGraphSelectionForShip(parsed.graphId);
+    validateGraphSelectionForShip(file, parsed.graphId);
   } catch (err: unknown) {
     p.log.error(getErrorMessage(err));
     process.exit(1);
   }
+
+  const apiKey = requireEnv('LINEAR_API_KEY', 'a plain Linear API key with issue-create access');
 
   p.log.info(`Title: ${title}`);
 

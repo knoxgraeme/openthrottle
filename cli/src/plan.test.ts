@@ -1,13 +1,17 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { stringify } from "yaml";
 import {
   extractExecutionPlanBlocks,
+  prepareExecutionPlanFile,
   readExecutionPlanFromMarkdown,
+  resolvePrepareSkillPath,
   validateLocalGraphSelection,
   validatePlanFileForGraph,
+  type PrepareRunner,
 } from "./plan.js";
 
 const directories: string[] = [];
@@ -58,6 +62,24 @@ function planWithBlock(graphId = "structured"): string {
   return `${cePlan}\n## Execution Plan\n\n${executionPlanBlock(graphId)}\n`;
 }
 
+function writeConfig(directory: string, allowedGraphs = ["simple", "structured"]): void {
+  writeFileSync(
+    join(directory, ".openthrottle.yml"),
+    stringify({
+      schema: "openthrottle.config/v1",
+      default_graph: "simple",
+      graphs: [
+        { id: "simple", kind: "builtin", ref: "core/simple@1" },
+        { id: "structured", kind: "builtin", ref: "core/structured@1" },
+      ],
+      agent: "codex",
+      intents: {
+        implement: { default_graph: "simple", allowed_graphs: allowedGraphs },
+      },
+    })
+  );
+}
+
 describe("plan validation", () => {
   it("validates one execution-plan block prepared by the planning skill", () => {
     const updated = planWithBlock();
@@ -81,30 +103,99 @@ describe("plan validation", () => {
     ).toThrow(/graph_id/);
   });
 
-  it("does not guess an execution plan without an agent-backed preparation runner", async () => {
+  it("prepares a plan by invoking the configured local engine with the canonical skill", () => {
     const directory = temporaryProject();
     const planPath = join(directory, "plan.md");
-    writeFileSync(planPath, cePlan);
-    const exit = process.exit;
-    const log = console.log;
-    const output: string[] = [];
-    process.exit = ((code?: string | number | null) => {
-      throw new Error(`exit ${code}`);
-    }) as typeof process.exit;
-    console.log = (message?: unknown) => {
-      output.push(String(message));
+    writeConfig(directory);
+    writeFileSync(planPath, `${cePlan}\n## Execution Plan\n\n${executionPlanBlock("structured")}\n`);
+    const previousOpenAiKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "test-key";
+    const calls: Array<{ agent: string; prompt: string }> = [];
+    const runner: PrepareRunner = (input) => {
+      calls.push({ agent: input.agent, prompt: input.prompt });
+      writeFileSync(planPath, planWithBlock("structured"));
+      return { status: 0, signal: null, output: [], pid: 123, stdout: Buffer.from(""), stderr: Buffer.from("") };
     };
     try {
-      const { plan } = await import("./plan.js");
-      await expect(plan(["prepare", planPath, "--json"])).rejects.toThrow(/exit 1/);
-      expect(JSON.parse(output[0]!)).toMatchObject({
-        ok: false,
-        error: expect.stringContaining("agent-backed prepare-execution-plan runner"),
-      });
-      expect(readFileSync(planPath, "utf8")).toBe(cePlan);
+      const result = prepareExecutionPlanFile(planPath, { directory, graphId: "structured", runner });
+      expect(result.plan.value.graph_id).toBe("structured");
+      expect(extractExecutionPlanBlocks(readFileSync(planPath, "utf8"))).toHaveLength(1);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toMatchObject({ agent: "codex" });
+      expect(calls[0]!.prompt).toContain("name: prepare-execution-plan");
+      expect(calls[0]!.prompt).toContain("Execution Plan Reference");
+      expect(calls[0]!.prompt).toContain("Dependencies may reference only known units");
+      expect(calls[0]!.prompt).toContain(`Target plan file: ${planPath}`);
     } finally {
-      process.exit = exit;
-      console.log = log;
+      if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previousOpenAiKey;
+    }
+  });
+
+  it("reports missing local engine auth before invoking prepare", () => {
+    const directory = temporaryProject();
+    const home = temporaryProject();
+    const planPath = join(directory, "plan.md");
+    writeConfig(directory);
+    writeFileSync(planPath, cePlan);
+    const previousHome = process.env.HOME;
+    const previousOpenAiKey = process.env.OPENAI_API_KEY;
+    const previousCodexAuth = process.env.CODEX_AUTH_JSON;
+    process.env.HOME = home;
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.CODEX_AUTH_JSON;
+    const runner: PrepareRunner = () => {
+      throw new Error("runner should not be invoked");
+    };
+    try {
+      expect(() => prepareExecutionPlanFile(planPath, { directory, graphId: "structured", runner })).toThrow(
+        /codex.*auth/i
+      );
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previousOpenAiKey;
+      if (previousCodexAuth === undefined) delete process.env.CODEX_AUTH_JSON;
+      else process.env.CODEX_AUTH_JSON = previousCodexAuth;
+    }
+  });
+
+  it("resolves the packaged prepare skill next to the built plan module", () => {
+    const directory = temporaryProject();
+    const dist = join(directory, "dist");
+    const skill = join(dist, "skills", "planning", "prepare-execution-plan", "SKILL.md");
+    mkdirSync(join(dist, "skills", "planning", "prepare-execution-plan"), { recursive: true });
+    writeFileSync(skill, "---\nname: prepare-execution-plan\n---\n");
+
+    expect(resolvePrepareSkillPath(pathToFileURL(join(dist, "plan.js")).href)).toBe(skill);
+  });
+
+  it("rejects a failed prepare runner even if it wrote a valid block", () => {
+    const directory = temporaryProject();
+    const planPath = join(directory, "plan.md");
+    writeConfig(directory);
+    writeFileSync(planPath, cePlan);
+    const previousOpenAiKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "test-key";
+    const runner: PrepareRunner = () => {
+      writeFileSync(planPath, planWithBlock("structured"));
+      return {
+        status: 1,
+        signal: null,
+        output: [],
+        pid: 123,
+        stdout: Buffer.from(""),
+        stderr: Buffer.from("engine failed"),
+      };
+    };
+    try {
+      expect(() => prepareExecutionPlanFile(planPath, { directory, graphId: "structured", runner })).toThrow(
+        /engine failed/
+      );
+    } finally {
+      if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previousOpenAiKey;
     }
   });
 
@@ -124,23 +215,72 @@ describe("plan validation", () => {
     }
   });
 
+  it("prepares through the CLI and tolerates verbose local engine output", async () => {
+    const directory = temporaryProject();
+    const bin = join(directory, "bin");
+    const planPath = join(directory, "plan.md");
+    const preparedPlan = planWithBlock("structured");
+    mkdirSync(bin);
+    writeConfig(directory);
+    writeFileSync(planPath, cePlan);
+    const fakeCodex = join(bin, "codex");
+    writeFileSync(
+      fakeCodex,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        "process.stdin.resume();",
+        "process.stdin.on('end', () => {",
+        "  fs.writeFileSync(process.env.OT_TEST_PLAN_PATH, process.env.OT_TEST_PLAN_BODY);",
+        "  process.stdout.write('x'.repeat(2 * 1024 * 1024));",
+        "});",
+      ].join("\n")
+    );
+    chmodSync(fakeCodex, 0o755);
+
+    const previousCwd = process.cwd();
+    const previousPath = process.env.PATH;
+    const previousOpenAiKey = process.env.OPENAI_API_KEY;
+    const previousPlanPath = process.env.OT_TEST_PLAN_PATH;
+    const previousPlanBody = process.env.OT_TEST_PLAN_BODY;
+    const log = console.log;
+    const output: string[] = [];
+    process.env.PATH = `${bin}:${previousPath ?? ""}`;
+    process.env.OPENAI_API_KEY = "test-key";
+    process.env.OT_TEST_PLAN_PATH = planPath;
+    process.env.OT_TEST_PLAN_BODY = preparedPlan;
+    console.log = (message?: unknown) => {
+      output.push(String(message));
+    };
+    try {
+      process.chdir(directory);
+      const { plan } = await import("./plan.js");
+      await plan(["prepare", planPath, "--graph", "structured", "--json"]);
+      expect(JSON.parse(output[0]!)).toMatchObject({
+        ok: true,
+        coverage: { units: 2, instruction_refs: 2, acceptance_refs: 2 },
+      });
+      expect(readExecutionPlanFromMarkdown(readFileSync(planPath, "utf8"), planPath).plan.value.graph_id).toBe(
+        "structured"
+      );
+    } finally {
+      process.chdir(previousCwd);
+      console.log = log;
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previousOpenAiKey;
+      if (previousPlanPath === undefined) delete process.env.OT_TEST_PLAN_PATH;
+      else process.env.OT_TEST_PLAN_PATH = previousPlanPath;
+      if (previousPlanBody === undefined) delete process.env.OT_TEST_PLAN_BODY;
+      else process.env.OT_TEST_PLAN_BODY = previousPlanBody;
+    }
+  });
+
   it("checks graph selection when validating through the CLI", async () => {
     const directory = temporaryProject();
     const planPath = join(directory, "plan.md");
-    writeFileSync(
-      join(directory, ".openthrottle.yml"),
-      stringify({
-        schema: "openthrottle.config/v1",
-        default_graph: "simple",
-        graphs: [
-          { id: "simple", kind: "builtin", ref: "core/simple@1" },
-          { id: "structured", kind: "builtin", ref: "core/structured@1" },
-        ],
-        intents: {
-          implement: { default_graph: "simple", allowed_graphs: ["simple", "structured"] },
-        },
-      })
-    );
+    writeConfig(directory);
     writeFileSync(planPath, planWithBlock("other"));
     const exit = process.exit;
     const log = console.log;
@@ -256,20 +396,7 @@ describe("plan validation", () => {
   it("requires the execution block to match the selected graph", () => {
     const directory = temporaryProject();
     const planPath = join(directory, "plan.md");
-    writeFileSync(
-      join(directory, ".openthrottle.yml"),
-      stringify({
-        schema: "openthrottle.config/v1",
-        default_graph: "simple",
-        graphs: [
-          { id: "simple", kind: "builtin", ref: "core/simple@1" },
-          { id: "structured", kind: "builtin", ref: "core/structured@1" },
-        ],
-        intents: {
-          implement: { default_graph: "simple", allowed_graphs: ["simple", "structured"] },
-        },
-      })
-    );
+    writeConfig(directory);
     writeFileSync(planPath, planWithBlock("other"));
 
     expect(() => validatePlanFileForGraph(planPath, { directory, graphId: "structured" })).toThrow(

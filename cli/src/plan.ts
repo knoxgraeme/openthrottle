@@ -1,5 +1,8 @@
+import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import {
   parseExecutionPlanContract,
@@ -37,11 +40,36 @@ export interface LocalGraphSelection {
   consumesUnits: boolean;
 }
 
+export interface PrepareRunnerInput {
+  agent: "claude" | "codex" | "opencode";
+  model?: string;
+  prompt: string;
+  directory: string;
+}
+
+export type PrepareRunner = (input: PrepareRunnerInput) => SpawnSyncReturns<Buffer>;
+
 const FENCE_PATTERN = /```[^\n`]*\n([\s\S]*?)```/g;
-const PREPARE_UNAVAILABLE =
-  "openthrottle plan prepare requires an agent-backed prepare-execution-plan runner; " +
-  "run the packaged prepare-execution-plan skill, then validate the resulting block with openthrottle plan validate <file.md>.";
 const CURRENT_COMPILER_COMMANDS = new Set(["test", "lint", "build", "format"]);
+const PREPARE_RUNNER_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
+
+export function resolvePrepareSkillPath(moduleUrl = import.meta.url): string {
+  const moduleDirectory = dirname(fileURLToPath(moduleUrl));
+  const packaged = join(moduleDirectory, "skills", "planning", "prepare-execution-plan", "SKILL.md");
+  if (existsSync(packaged)) return packaged;
+  return resolve(moduleDirectory, "..", "..", "skills", "planning", "prepare-execution-plan", "SKILL.md");
+}
+
+function prepareSkillReferencePath(skillPath: string): string {
+  return join(dirname(skillPath), "references", "execution-plan.md");
+}
+
+function redactCommand(command: string, args: string[], prompt?: string): string {
+  return [command, ...args]
+    .map((part) => (prompt && part === prompt ? "<prompt>" : part))
+    .map((part) => (/\s/.test(part) ? JSON.stringify(part) : part))
+    .join(" ");
+}
 
 export function extractExecutionPlanBlocks(markdown: string): ExecutionPlanBlock[] {
   const blocks: ExecutionPlanBlock[] = [];
@@ -118,6 +146,143 @@ export function validatePlanFileForGraph(
   return { graph, plan };
 }
 
+function readPrepareSkillBundle(): string {
+  const path = resolvePrepareSkillPath();
+  if (!existsSync(path)) {
+    throw new Error("prepare-execution-plan skill is missing from the CLI package; reinstall or rebuild openthrottle.");
+  }
+  const referencePath = prepareSkillReferencePath(path);
+  if (!existsSync(referencePath)) {
+    throw new Error("prepare-execution-plan reference material is missing from the CLI package; reinstall or rebuild openthrottle.");
+  }
+  return [
+    readFileSync(path, "utf8"),
+    "",
+    "## Canonical reference: references/execution-plan.md",
+    "",
+    readFileSync(referencePath, "utf8"),
+  ].join("\n");
+}
+
+function buildPreparePrompt(file: string, graphId: string, skillBody: string): string {
+  return [
+    "$prepare-execution-plan",
+    "",
+    "Use the canonical OpenThrottle planning skill below to update the target plan file.",
+    "Do not edit any other file. Preserve the human-authored prose.",
+    `Target plan file: ${file}`,
+    `Selected graph: ${graphId}`,
+    "",
+    skillBody,
+  ].join("\n");
+}
+
+function authFileExists(path: string): boolean {
+  try {
+    return existsSync(path);
+  } catch {
+    return false;
+  }
+}
+
+function assertPrepareEngineUsable(agent: PrepareRunnerInput["agent"], model?: string): void {
+  if (agent === "codex") {
+    if (!process.env.OPENAI_API_KEY && !process.env.CODEX_AUTH_JSON && !authFileExists(join(homedir(), ".codex", "auth.json"))) {
+      throw new Error(
+        "openthrottle plan prepare is configured for codex, but no Codex/OpenAI auth was found. " +
+          "Run `codex login`, set CODEX_AUTH_JSON, or set OPENAI_API_KEY."
+      );
+    }
+  } else if (agent === "claude") {
+    if (!process.env.CLAUDE_CODE_OAUTH_TOKEN && !authFileExists(join(homedir(), ".claude.json"))) {
+      throw new Error(
+        "openthrottle plan prepare is configured for claude, but no Claude auth was found. " +
+          "Run `claude login` or set CLAUDE_CODE_OAUTH_TOKEN."
+      );
+    }
+  } else if (agent === "opencode") {
+    if (!model) throw new Error("openthrottle plan prepare is configured for opencode, but .openthrottle.yml has no model.");
+    if (!process.env.KIMI_CODE_API_KEY) {
+      throw new Error("openthrottle plan prepare is configured for opencode, but KIMI_CODE_API_KEY is not set.");
+    }
+  }
+}
+
+function assertPrepareRunnerSucceeded(result: SpawnSyncReturns<Buffer>): void {
+  if (result.error) {
+    throw new Error(`prepare-execution-plan failed: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    const stderr = result.stderr?.toString("utf8").trim();
+    const stdout = result.stdout?.toString("utf8").trim();
+    throw new Error(`prepare-execution-plan failed${stderr ? `: ${stderr}` : stdout ? `: ${stdout}` : ""}`);
+  }
+}
+
+export const defaultPrepareRunner: PrepareRunner = ({ agent, model, prompt, directory }) => {
+  let command: string;
+  let args: string[];
+  let input: string | undefined;
+  if (agent === "codex") {
+    command = "codex";
+    args = ["exec", "--json", "--skip-git-repo-check", "-C", directory, ...(model ? ["-m", model] : []), "-"];
+    input = prompt;
+  } else if (agent === "claude") {
+    command = "claude";
+    args = ["-p", prompt, "--output-format", "stream-json", "--verbose", ...(model ? ["--model", model] : [])];
+  } else {
+    command = "opencode";
+    args = ["run", "--format", "json", "--model", model ?? "", "--dir", directory, "--auto", prompt];
+  }
+  const result = spawnSync(command, args, {
+    cwd: directory,
+    input,
+    maxBuffer: PREPARE_RUNNER_MAX_BUFFER_BYTES,
+    timeout: 30 * 60 * 1000,
+  });
+  if (result.error && (result.error as NodeJS.ErrnoException).code === "ENOENT") {
+    throw new Error(`openthrottle plan prepare could not find ${command} on PATH; install the configured local engine or change agent in .openthrottle.yml.`);
+  }
+  try {
+    assertPrepareRunnerSucceeded(result);
+  } catch {
+    const stderr = result.stderr?.toString("utf8").trim();
+    const stdout = result.stdout?.toString("utf8").trim();
+    throw new Error(
+      `prepare-execution-plan failed via ${redactCommand(command, args, prompt)}${stderr ? `: ${stderr}` : stdout ? `: ${stdout}` : ""}`
+    );
+  }
+  return result;
+};
+
+export function prepareExecutionPlanFile(
+  file: string,
+  options: { graphId?: string; directory?: string; runner?: PrepareRunner } = {}
+): ValidationResult {
+  const directory = options.directory ?? process.cwd();
+  const graph = validateLocalGraphSelection({ graphId: options.graphId, directory });
+  if (!graph.consumesUnits) {
+    throw new Error(`graph ${graph.graphId} does not consume execution units; select a structured graph with --graph.`);
+  }
+  const agent = graph.config.value.agent;
+  if (agent !== "claude" && agent !== "codex" && agent !== "opencode") {
+    throw new Error(".openthrottle.yml must set agent to codex, claude, or opencode for plan prepare.");
+  }
+  assertPrepareEngineUsable(agent, graph.config.value.model);
+  const runner = options.runner ?? defaultPrepareRunner;
+  const before = extractExecutionPlanBlocks(readFileSync(file, "utf8"));
+  if (before.length > 1) {
+    throw new Error(`${file}: expected at most one ${EXECUTION_PLAN_FENCE} block before prepare, found ${before.length}`);
+  }
+  const prompt = buildPreparePrompt(file, graph.graphId, readPrepareSkillBundle());
+  assertPrepareRunnerSucceeded(runner({ agent, model: graph.config.value.model, prompt, directory }));
+  const result = readExecutionPlanFromMarkdown(readFileSync(file, "utf8"), file);
+  if (result.plan.value.graph_id !== graph.graphId) {
+    throw new Error(`${file}: execution_plan.graph_id must match selected graph ${graph.graphId}`);
+  }
+  return result;
+}
+
 function validateSelectedGraph(result: ValidationResult, graphId: string): void {
   const graph = validateLocalGraphSelection({ graphId });
   if (graph.consumesUnits && result.plan.value.graph_id !== graph.graphId) {
@@ -146,16 +311,15 @@ function exitWithError(message: string, json: boolean): never {
   process.exit(1);
 }
 
-function parseArgs(args: string[]): { command?: string; file?: string; graphId?: string; json: boolean; write: boolean } {
-  const parsed: { command?: string; file?: string; graphId?: string; json: boolean; write: boolean } = {
+function parseArgs(args: string[]): { command?: string; file?: string; graphId?: string; json: boolean } {
+  const parsed: { command?: string; file?: string; graphId?: string; json: boolean } = {
     command: args[0],
     json: false,
-    write: false,
   };
   for (let index = 1; index < args.length; index += 1) {
     const arg = args[index]!;
     if (arg === "--json") parsed.json = true;
-    else if (arg === "--write") parsed.write = true;
+    else if (arg === "--write") continue;
     else if (arg === "--graph") {
       parsed.graphId = args[++index];
       if (!parsed.graphId) throw new Error("--graph requires a graph ID");
@@ -173,12 +337,10 @@ export async function plan(args: string[]): Promise<void> {
     if (!parsed.command || !["prepare", "validate"].includes(parsed.command) || !parsed.file) {
       throw new Error("Usage: openthrottle plan <prepare|validate> <file.md> [--graph <id>] [--json] [--write]");
     }
-    if (parsed.command === "prepare") {
-      throw new Error(PREPARE_UNAVAILABLE);
-    }
-    const content = readFileSync(parsed.file, "utf8");
-    const result = readExecutionPlanFromMarkdown(content, parsed.file);
-    if (parsed.graphId) validateSelectedGraph(result, parsed.graphId);
+    const result = parsed.command === "prepare"
+      ? prepareExecutionPlanFile(parsed.file, { graphId: parsed.graphId })
+      : readExecutionPlanFromMarkdown(readFileSync(parsed.file, "utf8"), parsed.file);
+    if (parsed.command === "validate" && parsed.graphId) validateSelectedGraph(result, parsed.graphId);
     printValidation(result, parsed.json);
   } catch (error) {
     exitWithError(getErrorMessage(error), args.includes("--json"));

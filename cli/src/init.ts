@@ -245,12 +245,13 @@ export function writeProjectConfig(config: ProjectConfig, directory = process.cw
     default_graph: "simple",
     graphs: [
       { id: "simple", kind: "builtin", ref: "core/simple@1" },
+      { id: "structured", kind: "builtin", ref: "core/structured@1" },
     ],
     ...config,
     commands,
     ...aliases,
     intents: {
-      implement: { default_graph: "simple", allowed_graphs: ["simple"] },
+      implement: { default_graph: "simple", allowed_graphs: ["simple", "structured"] },
       investigate: { default_graph: "simple", allowed_graphs: ["simple"] },
     },
   };
