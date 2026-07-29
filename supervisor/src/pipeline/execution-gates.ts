@@ -19,13 +19,23 @@ import {
 
 const SEMANTIC_REVIEW_SKILL = /(?:^|\/)ce-code-review(?:@|$)/;
 
+export interface ExpectedReceiptProducer {
+  workerId: string;
+  skill: string;
+  capabilityDigest: string;
+  assurance: UnitCompletionReceipt["assurance"];
+}
+
 export interface StandardReceiptFence {
   pipelineInstanceId: string;
   graphDigest: string;
   unitId: string;
   attemptId: string;
   requestHash: string;
+  baseSubject: string;
+  preSubject: string;
   subject: string;
+  producers?: Partial<Record<"completion" | "candidate" | "command" | "lead" | "integration" | "review", ExpectedReceiptProducer>>;
 }
 
 export interface ExecutionGateDecision {
@@ -51,10 +61,29 @@ function assertReceiptFence(
     receipt.fence.attempt_id !== expected.attemptId ||
     receipt.fence.request_hash !== expected.requestHash
   ) throw new Error(`${label} receipt fence mismatch`);
+  if (receipt.subject.base !== expected.baseSubject || receipt.subject.pre !== expected.preSubject) {
+    throw new Error(`${label} receipt input subject mismatch`);
+  }
   if (receipt.subject.post !== expected.subject) throw new Error(`${label} receipt subject mismatch`);
+  const producer = expected.producers?.[label as keyof NonNullable<StandardReceiptFence["producers"]>];
+  if (!producer) return;
+  if (
+    receipt.producer.worker_id !== producer.workerId ||
+    receipt.producer.skill !== producer.skill ||
+    receipt.producer.capability_digest !== producer.capabilityDigest ||
+    receipt.assurance !== producer.assurance
+  ) throw new Error(`${label} receipt producer mismatch`);
 }
 
-function commandOutcome(receipts: readonly CommandResultReceipt[]): { outcome: StageOutcome; result: GateResult; reason: string } {
+function commandOutcome(
+  receipts: readonly CommandResultReceipt[],
+  expectedCommandNames: readonly string[]
+): { outcome: StageOutcome; result: GateResult; reason: string } {
+  const expectedNames = [...new Set(expectedCommandNames)].sort();
+  const actualNames = receipts.map((receipt) => receipt.payload.command).sort();
+  if (canonicalJson(actualNames) !== canonicalJson(expectedNames)) {
+    return { outcome: "failure", result: "failed", reason: "command_receipts_missing_or_unexpected" };
+  }
   for (const receipt of receipts) {
     const decision = commandDecisionForEvidence({
       not_configured: receipt.result === "not_configured",
@@ -116,6 +145,7 @@ export function evaluateUnitAcceptanceGate(input: {
   completion: UnitCompletionReceipt;
   candidate: CandidateEvidenceReceipt;
   commands: readonly CommandResultReceipt[];
+  expectedCommandNames: readonly string[];
   lead: UnitDecisionReceipt;
 }): ExecutionGateDecision {
   assertReceiptFence(input.completion, input.expected, "completion");
@@ -149,7 +179,7 @@ export function evaluateUnitAcceptanceGate(input: {
       artifactHashes,
     });
   }
-  const commands = commandOutcome(input.commands);
+  const commands = commandOutcome(input.commands, input.expectedCommandNames);
   if (commands.outcome !== "success" && commands.outcome !== "no_change") {
     return seal("unit_acceptance", { expected: input.expected, ...commands, artifactHashes });
   }
@@ -200,6 +230,7 @@ export function evaluateIntegrationGate(input: {
 export function evaluateFinalReviewGate(input: {
   expected: StandardReceiptFence;
   commands: readonly CommandResultReceipt[];
+  expectedCommandNames: readonly string[];
   review: SemanticReviewReceipt;
 }): ExecutionGateDecision {
   for (const command of input.commands) assertReceiptFence(command, input.expected, "command");
@@ -210,7 +241,7 @@ export function evaluateFinalReviewGate(input: {
       throw new Error("final review receipt predates whole-change command evidence");
     }
   }
-  const commands = commandOutcome(input.commands);
+  const commands = commandOutcome(input.commands, input.expectedCommandNames);
   const artifactHashes = [...input.commands, input.review].map(receiptHash);
   if (commands.outcome !== "success" && commands.outcome !== "no_change") {
     return seal("final_review", { expected: input.expected, ...commands, artifactHashes });

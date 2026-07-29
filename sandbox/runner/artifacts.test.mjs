@@ -147,6 +147,12 @@ describe("normalized stage artifacts", () => {
     });
     expect(() => validateStandardReceipt({ ...receipt, assurance: "executor_verified" }, {}))
       .toThrow(/semantic standard receipt cannot claim/);
+    expect(() => validateStandardReceipt({
+      ...receipt,
+      producer: { ...receipt.producer, skill: "accept-unit" },
+    }, {})).toThrow(/producer skill/);
+    expect(() => validateStandardReceipt({ ...receipt, payload: {} }, {}))
+      .toThrow(/payload rationale/);
 
     const artifacts = buildStandardReceiptArtifacts({
       receipt,
@@ -195,5 +201,33 @@ describe("normalized stage artifacts", () => {
     });
 
     expect(JSON.parse(stageResult.payload).result).toBe("failure");
+  });
+
+  it("allows semantic review findings without paths", () => {
+    expect(validateStandardReceipt({
+      schema: "openthrottle.receipt/v1",
+      type: "semantic_review",
+      assurance: "semantic_attested",
+      result: "semantic_repair_required",
+      producer: {
+        worker_id: "reviewer-1",
+        skill: "builtin://final-review@1",
+        capability_digest: "e".repeat(64),
+      },
+      subject: { base: "1".repeat(40), pre: "1".repeat(40), post: "2".repeat(40) },
+      fence: {
+        pipeline_instance_id: "pipeline-1",
+        graph_digest: "f".repeat(64),
+        unit_id: "whole-change",
+        attempt_id: "attempt-1",
+        request_hash: "a".repeat(64),
+      },
+      evidence: ["review"],
+      payload: {
+        summary: "One finding.",
+        findings: [{ severity: "P1", message: "Missing receipt." }],
+      },
+      issued_at: "2026-07-29T00:00:00.000Z",
+    }, {}).payload.findings[0]).toEqual({ severity: "P1", message: "Missing receipt." });
   });
 });

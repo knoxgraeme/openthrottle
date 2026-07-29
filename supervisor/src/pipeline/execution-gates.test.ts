@@ -12,7 +12,23 @@ const expected: StandardReceiptFence = {
   unitId: "unit-1",
   attemptId: "attempt-1",
   requestHash: "b".repeat(64),
+  baseSubject: "0".repeat(40),
+  preSubject: "0".repeat(40),
   subject: "1".repeat(40),
+  producers: {
+    completion: {
+      workerId: "worker-1",
+      skill: "builtin://unit_completion@1",
+      capabilityDigest: "c".repeat(64),
+      assurance: "semantic_attested",
+    },
+    command: {
+      workerId: "worker-1",
+      skill: "builtin://command_result@1",
+      capabilityDigest: "c".repeat(64),
+      assurance: "executor_verified",
+    },
+  },
 };
 
 function receipt(type: string, result: string, overrides: Record<string, unknown> = {}) {
@@ -45,8 +61,8 @@ function receipt(type: string, result: string, overrides: Record<string, unknown
   };
 }
 
-const command = (result: "success" | "failure" | "not_configured", exitCode: number | null) => receipt("command_result", result, {
-  payload: { command: "test", exit_code: exitCode, summary: "command done" },
+const command = (result: "success" | "failure" | "not_configured", exitCode: number, name = "test") => receipt("command_result", result, {
+  payload: { command: name, exit_code: exitCode, summary: "command done" },
 });
 
 describe("structured execution gates", () => {
@@ -55,7 +71,8 @@ describe("structured execution gates", () => {
       expected,
       completion: receipt("unit_completion", "success") as never,
       candidate: receipt("candidate_evidence", "success") as never,
-      commands: [command("success", 0) as never, command("not_configured", null) as never],
+      commands: [command("success", 0) as never, command("not_configured", 0, "lint") as never],
+      expectedCommandNames: ["test", "lint"],
       lead: receipt("unit_decision", "accept", {
         payload: {
           rationale: "Matches assigned scope.",
@@ -76,6 +93,7 @@ describe("structured execution gates", () => {
       completion: receipt("unit_completion", "success") as never,
       candidate: receipt("candidate_evidence", "success") as never,
       commands: [],
+      expectedCommandNames: [],
       lead: receipt("unit_decision", "accept", {
         producer: {
           worker_id: "lead-1",
@@ -97,6 +115,7 @@ describe("structured execution gates", () => {
       completion: receipt("unit_completion", "success") as never,
       candidate: receipt("candidate_evidence", "success") as never,
       commands: [],
+      expectedCommandNames: [],
       lead: receipt("unit_decision", "revise", {
         payload: { rationale: "Missing scoped behavior.", revision_request: "Add the required case.", context_updates: [] },
       }) as never,
@@ -107,6 +126,7 @@ describe("structured execution gates", () => {
       completion: receipt("unit_completion", "success") as never,
       candidate: receipt("candidate_evidence", "success") as never,
       commands: [command("failure", 1) as never],
+      expectedCommandNames: ["test"],
       lead: receipt("unit_decision", "accept", {
         payload: { rationale: "Matches.", context_updates: [], accepted_subject: expected.subject },
       }) as never,
@@ -122,6 +142,7 @@ describe("structured execution gates", () => {
     expect(() => evaluateFinalReviewGate({
       expected,
       commands: [command("success", 0) as never],
+      expectedCommandNames: ["test"],
       review: receipt("semantic_review", "success", {
         subject: { base: "0".repeat(40), pre: "0".repeat(40), post: "2".repeat(40) },
         payload: { summary: "clean", findings: [] },
@@ -133,6 +154,7 @@ describe("structured execution gates", () => {
     expect(evaluateFinalReviewGate({
       expected,
       commands: [command("success", 0) as never],
+      expectedCommandNames: ["test"],
       review: receipt("semantic_review", "success", {
         payload: { summary: "clean", findings: [] },
       }) as never,
@@ -141,6 +163,7 @@ describe("structured execution gates", () => {
     expect(evaluateFinalReviewGate({
       expected,
       commands: [command("failure", 1) as never],
+      expectedCommandNames: ["test"],
       review: receipt("semantic_review", "success", {
         payload: { summary: "clean", findings: [] },
       }) as never,
@@ -152,10 +175,52 @@ describe("structured execution gates", () => {
         issued_at: "2026-07-29T00:00:02.000Z",
         payload: { command: "test", exit_code: 0, summary: "command done" },
       }) as never],
+      expectedCommandNames: ["test"],
       review: receipt("semantic_review", "success", {
         issued_at: "2026-07-29T00:00:01.000Z",
         payload: { summary: "clean", findings: [] },
       }) as never,
     })).toThrow(/predates whole-change command evidence/);
+  });
+
+  it("rejects stale producer/input provenance and missing command receipts", () => {
+    expect(() => evaluateUnitAcceptanceGate({
+      expected,
+      completion: receipt("unit_completion", "success", {
+        producer: {
+          worker_id: "other-worker",
+          skill: "builtin://unit_completion@1",
+          capability_digest: "c".repeat(64),
+        },
+      }) as never,
+      candidate: receipt("candidate_evidence", "success") as never,
+      commands: [command("success", 0) as never],
+      expectedCommandNames: ["test"],
+      lead: receipt("unit_decision", "accept", {
+        payload: { rationale: "Matches.", context_updates: [], accepted_subject: expected.subject },
+      }) as never,
+    })).toThrow(/completion receipt producer mismatch/);
+
+    expect(() => evaluateFinalReviewGate({
+      expected,
+      commands: [command("success", 0) as never],
+      expectedCommandNames: ["test"],
+      review: receipt("semantic_review", "success", {
+        subject: { base: "2".repeat(40), pre: "0".repeat(40), post: expected.subject },
+        payload: { summary: "clean", findings: [] },
+      }) as never,
+    })).toThrow(/review receipt input subject mismatch/);
+
+    expect(evaluateFinalReviewGate({
+      expected,
+      commands: [],
+      expectedCommandNames: ["test"],
+      review: receipt("semantic_review", "success", {
+        payload: { summary: "clean", findings: [] },
+      }) as never,
+    })).toMatchObject({
+      outcome: "failure",
+      reason: "command_receipts_missing_or_unexpected",
+    });
   });
 });

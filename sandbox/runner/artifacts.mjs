@@ -65,6 +65,7 @@ const SEMANTIC_RECEIPTS = new Set(["unit_completion", "unit_decision", "semantic
 const SEVERITIES = new Set(["P0", "P1", "P2", "P3"]);
 const SHA256 = /^[a-f0-9]{64}$/;
 const GIT_SUBJECT = /^[a-f0-9]{40,64}$/;
+const SKILL_REFERENCE = /^(?:builtin:\/\/[a-z][a-z0-9]*(?:[._/@-][a-z0-9]+)*@\d+|repo:\/\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+@[a-f0-9]{40}#(?:(?!\.{1,2}(?:\/|$))[A-Za-z0-9._-]+\/)*(?!\.{1,2}$)[A-Za-z0-9._-]+)$/;
 const MAX_ARTIFACT_PAYLOAD_BYTES = 12 * 1024;
 const SECRET_PATTERNS = [
   /gh[opsu]_[A-Za-z0-9_]+/g,
@@ -115,6 +116,134 @@ function boundedStrings(value, label, maxItems, maxLength, env) {
     throw new Error(`${label} must contain at most ${maxItems} items`);
   }
   return value.map((item, index) => boundedText(item, `${label}[${index}]`, maxLength, env));
+}
+
+function objectWithKnownKeys(value, label, keys) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
+  const unknown = Object.keys(value).find((key) => !keys.has(key));
+  if (unknown) throw new Error(`${label} has unknown field ${unknown}`);
+  return value;
+}
+
+function exactPayload(value, label, keys, env) {
+  return boundedPlainObject(objectWithKnownKeys(value, label, keys), label, env);
+}
+
+function boundedContextRecords(value, label, env) {
+  if (!Array.isArray(value) || value.length > 32) throw new Error(`${label} must contain at most 32 items`);
+  return value.map((item, index) => {
+    const record = exactObject(item, `${label}[${index}]`, new Set(["unit_id", "summary"]));
+    return {
+      unit_id: boundedText(record.unit_id, `${label}[${index}].unit_id`, 120, env),
+      summary: boundedText(record.summary, `${label}[${index}].summary`, 2_000, env),
+    };
+  });
+}
+
+function boundedFindings(value, label, env) {
+  if (!Array.isArray(value) || value.length > 64) throw new Error(`${label} must contain at most 64 items`);
+  return value.map((item, index) => {
+    const finding = objectWithKnownKeys(item, `${label}[${index}]`, new Set(["severity", "message", "path"]));
+    if (!SEVERITIES.has(finding.severity)) throw new Error(`${label}[${index}].severity is invalid`);
+    return {
+      severity: finding.severity,
+      message: boundedText(finding.message, `${label}[${index}].message`, 2_000, env),
+      ...(finding.path === undefined ? {} : { path: boundedText(finding.path, `${label}[${index}].path`, 300, env) }),
+    };
+  });
+}
+
+function integer(value, label, min, max) {
+  if (!Number.isSafeInteger(value) || value < min || value > max) throw new Error(`${label} is invalid`);
+  return value;
+}
+
+function boolean(value, label) {
+  if (typeof value !== "boolean") throw new Error(`${label} is invalid`);
+  return value;
+}
+
+function patternedText(value, label, pattern, env, max = 1_000) {
+  const text = boundedText(value, label, max, env);
+  if (!pattern.test(text)) throw new Error(`${label} is invalid`);
+  return text;
+}
+
+function receiptPayload(type, value, env) {
+  if (type === "unit_completion") {
+    const payload = exactPayload(value, "standard receipt payload", new Set([
+      "summary", "assumptions", "decisions", "issues", "verification", "downstream_context", "requested_human_input",
+    ]), env);
+    return {
+      summary: boundedText(payload.summary, "standard receipt payload summary", 4_000, env),
+      assumptions: boundedStrings(payload.assumptions, "standard receipt payload assumptions", 32, 1_000, env),
+      decisions: boundedStrings(payload.decisions, "standard receipt payload decisions", 32, 1_000, env),
+      issues: boundedStrings(payload.issues, "standard receipt payload issues", 32, 1_000, env),
+      verification: boundedStrings(payload.verification, "standard receipt payload verification", 32, 1_000, env),
+      downstream_context: boundedContextRecords(payload.downstream_context, "standard receipt payload downstream_context", env),
+      requested_human_input: boundedStrings(payload.requested_human_input, "standard receipt payload requested_human_input", 16, 1_000, env),
+    };
+  }
+  if (type === "unit_decision") {
+    const payload = exactPayload(value, "standard receipt payload", new Set(["rationale", "revision_request", "context_updates", "accepted_subject"]), env);
+    return {
+      rationale: boundedText(payload.rationale, "standard receipt payload rationale", 4_000, env),
+      ...(payload.revision_request === undefined ? {} : {
+        revision_request: boundedText(payload.revision_request, "standard receipt payload revision_request", 4_000, env),
+      }),
+      context_updates: boundedContextRecords(payload.context_updates, "standard receipt payload context_updates", env),
+      ...(payload.accepted_subject === undefined ? {} : {
+        accepted_subject: patternedText(payload.accepted_subject, "standard receipt payload accepted_subject", GIT_SUBJECT, env, 64),
+      }),
+    };
+  }
+  if (type === "semantic_review") {
+    const payload = exactPayload(value, "standard receipt payload", new Set(["summary", "findings"]), env);
+    return {
+      summary: boundedText(payload.summary, "standard receipt payload summary", 4_000, env),
+      findings: boundedFindings(payload.findings, "standard receipt payload findings", env),
+    };
+  }
+  if (type === "command_result") {
+    const payload = exactPayload(value, "standard receipt payload", new Set(["command", "exit_code", "summary", "stdout_digest", "stderr_digest"]), env);
+    return {
+      command: boundedText(payload.command, "standard receipt payload command", 80, env),
+      exit_code: integer(payload.exit_code, "standard receipt payload exit_code", 0, 255),
+      summary: boundedText(payload.summary, "standard receipt payload summary", 4_000, env),
+      ...(payload.stdout_digest === undefined ? {} : { stdout_digest: patternedText(payload.stdout_digest, "standard receipt payload stdout_digest", SHA256, env, 64) }),
+      ...(payload.stderr_digest === undefined ? {} : { stderr_digest: patternedText(payload.stderr_digest, "standard receipt payload stderr_digest", SHA256, env, 64) }),
+    };
+  }
+  if (type === "candidate_evidence" || type === "integration_evidence") {
+    const payload = exactPayload(value, "standard receipt payload", new Set(["tree", "diff_digest", "changed_paths", "clean"]), env);
+    return {
+      tree: patternedText(payload.tree, "standard receipt payload tree", GIT_SUBJECT, env, 64),
+      diff_digest: patternedText(payload.diff_digest, "standard receipt payload diff_digest", SHA256, env, 64),
+      changed_paths: boundedStrings(payload.changed_paths, "standard receipt payload changed_paths", 512, 1_000, env),
+      clean: boolean(payload.clean, "standard receipt payload clean"),
+    };
+  }
+  if (type === "publish_subject") {
+    const payload = exactPayload(value, "standard receipt payload", new Set(["commit", "tree", "pr_url"]), env);
+    return {
+      commit: patternedText(payload.commit, "standard receipt payload commit", GIT_SUBJECT, env, 64),
+      tree: patternedText(payload.tree, "standard receipt payload tree", GIT_SUBJECT, env, 64),
+      pr_url: boundedText(payload.pr_url, "standard receipt payload pr_url", 2_000, env),
+    };
+  }
+  if (type === "provider_evidence") {
+    const payload = exactPayload(value, "standard receipt payload", new Set(["review_url", "check_run_url", "summary"]), env);
+    return {
+      ...(payload.review_url === undefined ? {} : { review_url: boundedText(payload.review_url, "standard receipt payload review_url", 2_000, env) }),
+      ...(payload.check_run_url === undefined ? {} : { check_run_url: boundedText(payload.check_run_url, "standard receipt payload check_run_url", 2_000, env) }),
+      summary: boundedText(payload.summary, "standard receipt payload summary", 4_000, env),
+    };
+  }
+  const payload = exactPayload(value, "standard receipt payload", new Set(["approver", "rationale"]), env);
+  return {
+    approver: boundedText(payload.approver, "standard receipt payload approver", 160, env),
+    rationale: boundedText(payload.rationale, "standard receipt payload rationale", 4_000, env),
+  };
 }
 
 export function validateSemanticProposal(value, env = process.env) {
@@ -222,7 +351,7 @@ export function validateStandardReceipt(value, env = process.env) {
     result: input.result,
     producer: {
       worker_id: boundedText(producer.worker_id, "standard receipt producer worker", 120, env),
-      skill: boundedText(producer.skill, "standard receipt producer skill", 240, env),
+      skill: patternedText(producer.skill, "standard receipt producer skill", SKILL_REFERENCE, env, 240),
       capability_digest: producer.capability_digest,
     },
     subject,
@@ -234,7 +363,7 @@ export function validateStandardReceipt(value, env = process.env) {
       request_hash: fence.request_hash,
     },
     evidence,
-    payload: boundedPlainObject(input.payload, "standard receipt payload", env),
+    payload: receiptPayload(input.type, input.payload, env),
     issued_at: issuedAt,
   };
 }
