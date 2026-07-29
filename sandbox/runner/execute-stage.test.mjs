@@ -15,6 +15,7 @@ import { RUNTIME_DESCRIPTOR, canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
 import {
   computeWorkspaceTreeOid,
+  classifyAgentExecutionFailure,
   createStageRequestHash,
   executeStage,
   extractNativeSessionId,
@@ -714,6 +715,32 @@ describe("one-stage executor", () => {
     });
   });
 
+  it("classifies publish-stage Codex model-auth 401 before publication reconciliation", () => {
+    const input = publishFixture();
+    addBareOrigin(input);
+    const diagnostic = "401 Unauthorized on wss://example.com/backend-api/codex/responses: " +
+      "refresh_token_invalidated - Your session has ended";
+
+    const result = executeStage({
+      ...input,
+      runAgent: () => ({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        stderr: diagnostic,
+        proposal: undefined,
+        nativeSessionId: "publish-session",
+      }),
+      now: clock(),
+    });
+    const payload = JSON.parse(result.artifacts[0].payload);
+
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+    expect(payload.summary).toContain("Model credential expired - refresh CODEX_AUTH_JSON");
+    expect(payload.summary).toContain("refresh_token_invalidated");
+    expect(payload.findings).toEqual([]);
+  });
+
   it("retries publication when a valid failure follows an exact branch push", () => {
     const input = publishFixture();
     addBareOrigin(input, { push: true });
@@ -770,6 +797,62 @@ describe("one-stage executor", () => {
 
     expect(result.outcome).toBe("retryable_infrastructure_failure");
     expect(JSON.parse(result.artifacts[0].payload).summary).toMatch(/agent cleanup failed/);
+  });
+
+  it("classifies Codex model-auth 401 exits as credential infrastructure failures", () => {
+    const diagnostic = "401 Unauthorized on wss://example.com/backend-api/codex/responses: " +
+      "refresh_token_invalidated - Your session has ended";
+    const classified = classifyAgentExecutionFailure({
+      agent: "codex",
+      termination: "exit=1",
+      diagnostic,
+      terminated: false,
+      missingProposal: true,
+    });
+
+    expect(classified.suggestedOutcome).toBe("retryable_infrastructure_failure");
+    expect(classified.summary).toContain("Model credential expired - refresh CODEX_AUTH_JSON");
+    expect(classifyAgentExecutionFailure({
+      agent: "claude",
+      termination: "exit=1",
+      diagnostic,
+      terminated: false,
+      missingProposal: true,
+    }).suggestedOutcome).toBe("failure");
+    expect(classifyAgentExecutionFailure({
+      agent: "codex",
+      termination: "exit=1",
+      diagnostic: "401 Unauthorized on an unrelated endpoint",
+      terminated: false,
+      missingProposal: true,
+    }).summary).toContain("Agent exited without the required terminal stage proposal");
+    expect(classifyAgentExecutionFailure({
+      agent: "codex",
+      termination: "exit=1",
+      diagnostic: "refresh_token_invalidated - Your session has ended",
+      terminated: false,
+      missingProposal: true,
+    }).suggestedOutcome).toBe("failure");
+
+    const input = fixture();
+    const result = executeStage({
+      ...input,
+      runAgent: () => ({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        stderr: diagnostic,
+        proposal: undefined,
+        nativeSessionId: "native-1",
+      }),
+      now: clock(),
+    });
+    const payload = JSON.parse(result.artifacts[0].payload);
+
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+    expect(payload.result).toBe("retryable_infrastructure_failure");
+    expect(payload.summary).toContain("Model credential expired - refresh CODEX_AUTH_JSON");
+    expect(payload.summary).toContain("refresh_token_invalidated");
   });
 
   it("rejects a valid proposal when agent execution exceeded its timeout", () => {
