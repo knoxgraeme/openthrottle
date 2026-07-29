@@ -96,6 +96,8 @@ describe("plan validation", () => {
     expect(() => readExecutionPlanFromMarkdown(cePlan, "missing.md")).toThrow(/expected exactly one/);
     const block = executionPlanBlock();
     expect(() => readExecutionPlanFromMarkdown(`${cePlan}\n${block}\n${block}`, "duplicate.md")).toThrow(/found 2/);
+    const nonCanonical = block.replace("json openthrottle.execution-plan/v1", "json");
+    expect(() => readExecutionPlanFromMarkdown(`${cePlan}\n${nonCanonical}`, "non-canonical.md")).toThrow(/found 0/);
     expect(() =>
       readExecutionPlanFromMarkdown(
         `# Invalid\n\n\`\`\`json openthrottle.execution-plan/v1\n{"schema":"openthrottle.execution-plan/v1","units":[]}\n\`\`\``,
