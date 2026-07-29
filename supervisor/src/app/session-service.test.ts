@@ -361,7 +361,16 @@ intents:
   });
 
 
-  it("resolves the configured structured default without an explicit graph marker", async () => {
+  it("resolves the configured structured default from a canonical plan without an explicit ship selection", async () => {
+    const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
+    executionPlan.graph_id = "structured";
+    const context = [
+      "# Structured work",
+      "",
+      "```json openthrottle.execution-plan/v1",
+      JSON.stringify(executionPlan, null, 2),
+      "```",
+    ].join("\n");
     const { pipelines } = await run(
       `schema: openthrottle.config/v1
 default_graph: structured
@@ -379,7 +388,8 @@ intents:
     allowed_graphs: [simple, structured]
 `,
       { codexAuthJson: undefined, claudeCodeOauthToken: undefined, kimiCodeApiKey: undefined },
-      fixtureCatalogPath
+      fixtureCatalogPath,
+      payload("session-1", "issue-1", "OT-1", context)
     );
 
     expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
@@ -387,7 +397,6 @@ intents:
       pipeline_version: 2,
     });
   });
-
   async function expectSelectionFailure(context: string, expectedMessage: string) {
     const { tickets } = await run(
       `schema: openthrottle.config/v1
@@ -421,6 +430,18 @@ intents:
     expect(payloads.some((entry) => entry.includes(expectedMessage))).toBe(true);
   }
 
+  it("fails closed before provisioning when a structured selection omits its execution plan", async () => {
+    await expectSelectionFailure(
+      [
+        "# Structured work",
+        "",
+        "```json openthrottle.ship-selection/v1",
+        JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }),
+        "```",
+      ].join("\n"),
+      "graph structured requires a canonical openthrottle.execution-plan/v1 block"
+    );
+  });
   it("fails closed before provisioning for malformed shipped graph selections", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "structured";
@@ -487,9 +508,14 @@ intents:
   });
 
   it("fails closed before provisioning when a shipped graph selection cannot resolve", async () => {
+    const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
+    executionPlan.graph_id = "structured";
     const context = [
       "# Structured work",
       "",
+      "```json openthrottle.execution-plan/v1",
+      JSON.stringify(executionPlan, null, 2),
+      "```",
       "```json openthrottle.ship-selection/v1",
       JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }, null, 2),
       "```",
