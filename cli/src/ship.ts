@@ -29,6 +29,30 @@ export function parseMarkdown(content: string): ParsedMarkdown {
   return { title, body };
 }
 
+export function parseShipArgs(args: string[]): { file?: string; graphId?: string } {
+  const parsed: { file?: string; graphId?: string } = {};
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if (arg === "--graph") {
+      parsed.graphId = args[++index];
+      if (!parsed.graphId) throw new Error("--graph requires a graph ID");
+    } else if (!parsed.file) {
+      parsed.file = arg;
+    } else {
+      throw new Error(`Unexpected argument: ${arg}`);
+    }
+  }
+  return parsed;
+}
+
+export function validateGraphSelectionForShip(graphId?: string): void {
+  if (!graphId || graphId === "simple") return;
+  throw new Error(
+    `ship --graph ${graphId} cannot delegate correctly yet because graph selection is not persisted through admission; ` +
+      "omit --graph or use --graph simple."
+  );
+}
+
 interface Team {
   id: string;
   key: string;
@@ -108,9 +132,11 @@ export async function delegateIssue(
   }
 }
 
-export default async function ship(file: string | undefined): Promise<void> {
+export default async function ship(args: string[] | string | undefined): Promise<void> {
+  const parsed = parseShipArgs(Array.isArray(args) ? args : args ? [args] : []);
+  const file = parsed.file;
   if (!file) {
-    console.error('Usage: openthrottle ship <file.md>');
+    console.error('Usage: openthrottle ship <file.md> [--graph <id>]');
     process.exit(1);
   }
   if (!existsSync(file)) {
@@ -127,6 +153,7 @@ export default async function ship(file: string | undefined): Promise<void> {
   let body: string;
   try {
     ({ title, body } = parseMarkdown(content));
+    validateGraphSelectionForShip(parsed.graphId);
   } catch (err: unknown) {
     p.log.error(getErrorMessage(err));
     process.exit(1);

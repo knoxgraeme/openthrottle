@@ -58,30 +58,71 @@ describe("init project detection", () => {
       directory
     );
     const contents = readFileSync(join(directory, ".openthrottle.yml"), "utf8");
-    expect(parse(contents)).toMatchObject({ agent: "claude", test: "npm test" });
+    expect(parse(contents)).toMatchObject({
+      agent: "claude",
+      test: "npm test",
+    });
     expect(contents).not.toContain("base_branch");
     expect(contents).not.toContain("build:");
+    expect(contents).not.toContain("schema:");
+    expect(contents).not.toContain("default_graph:");
+    expect(contents).not.toContain("graphs:");
+    expect(contents).not.toContain("intents:");
   });
 
-  it("writes the supported OpenCode model only for OpenCode projects", () => {
-    const directory = temporaryProject();
+  it("writes the model for any agent when set and omits it when blank", () => {
+    const codexDir = temporaryProject();
     writeProjectConfig(
       {
-        agent: "opencode",
+        agent: "codex",
+        model: "gpt-5-codex",
         test: "",
         build: "",
         lint: "",
         post_bootstrap: [],
         limits: { max_turns: 20, task_timeout: 60 },
         mcp_servers: {},
-        model: "kimi-code/kimi-for-coding",
       },
-      directory
+      codexDir
     );
-    expect(parse(readFileSync(join(directory, ".openthrottle.yml"), "utf8"))).toMatchObject({
+    expect(parse(readFileSync(join(codexDir, ".openthrottle.yml"), "utf8"))).toMatchObject({
+      agent: "codex",
+      model: "gpt-5-codex",
+    });
+
+    const opencodeDir = temporaryProject();
+    writeProjectConfig(
+      {
+        agent: "opencode",
+        model: "kimi-code/kimi-for-coding",
+        test: "",
+        build: "",
+        lint: "",
+        post_bootstrap: [],
+        limits: { max_turns: 20, task_timeout: 60 },
+        mcp_servers: {},
+      },
+      opencodeDir
+    );
+    expect(parse(readFileSync(join(opencodeDir, ".openthrottle.yml"), "utf8"))).toMatchObject({
       agent: "opencode",
       model: "kimi-code/kimi-for-coding",
     });
+
+    const claudeDir = temporaryProject();
+    writeProjectConfig(
+      {
+        agent: "claude",
+        test: "",
+        build: "",
+        lint: "",
+        post_bootstrap: [],
+        limits: { max_turns: 20, task_timeout: 60 },
+        mcp_servers: {},
+      },
+      claudeDir
+    );
+    expect(readFileSync(join(claudeDir, ".openthrottle.yml"), "utf8")).not.toContain("model:");
   });
 
   it("supports non-Node repositories with blank detected commands", () => {

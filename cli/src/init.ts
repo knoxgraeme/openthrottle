@@ -157,6 +157,21 @@ async function promptConfig(detected: Detected, target: RepositoryTarget): Promi
           ],
           initialValue: "codex",
         }),
+      model: ({ results }) => {
+        const agent = results.agent as ProjectConfig["agent"] | undefined;
+        return p.text({
+          message: "Model (blank uses the agent default; required for OpenCode)",
+          initialValue: agent === "opencode" ? "kimi-code/kimi-for-coding" : "",
+          validate: (value) => {
+            const trimmed = value.trim();
+            if (agent === "opencode" && !trimmed) return "OpenCode requires a model";
+            if (trimmed && !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(trimmed)) {
+              return "Model may contain letters, digits, and . _ / - only";
+            }
+            return undefined;
+          },
+        });
+      },
       test: () => p.text({ message: "Test command (blank to skip)", initialValue: detected.test }),
       build: () => p.text({ message: "Build command (blank to skip)", initialValue: detected.build }),
       lint: () => p.text({ message: "Lint command (blank to skip)", initialValue: detected.lint }),
@@ -178,7 +193,7 @@ async function promptConfig(detected: Detected, target: RepositoryTarget): Promi
   return {
     project: {
       agent: result.agent as "claude" | "codex" | "opencode",
-      model: result.agent === "opencode" ? "kimi-code/kimi-for-coding" : undefined,
+      model: typeof result.model === "string" && result.model.trim() ? result.model.trim() : undefined,
       test: result.test,
       build: result.build,
       lint: result.lint,
@@ -199,8 +214,10 @@ async function promptConfig(detected: Detected, target: RepositoryTarget): Promi
 }
 
 export function writeProjectConfig(config: ProjectConfig, directory = process.cwd()): void {
-  const document: Record<string, unknown> = { ...config };
-  for (const key of ["test", "build", "lint"] as const) {
+  const document: Record<string, unknown> = {
+    ...config,
+  };
+  for (const key of ["test", "build", "lint", "model"] as const) {
     if (!config[key]) delete document[key];
   }
   const header = [

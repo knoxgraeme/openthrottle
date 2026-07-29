@@ -37,6 +37,7 @@ export interface RepositoryConfigContract {
   default_graph: string;
   graphs: ConfigGraphSource[];
   agent?: string;
+  model?: string;
   test?: string;
   lint?: string;
   build?: string;
@@ -53,6 +54,7 @@ export interface RepositoryConfigContract {
 const BUILTIN_GRAPH = /^[a-z][a-z0-9]*(?:[._/-][a-z0-9]+)*@\d+$/;
 const REPOSITORY_PATH = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\/\/)[A-Za-z0-9._/-]+\.json$/;
 const PIPELINE_REFERENCE = /^[a-z][a-z0-9]*(?:[._/-][a-z0-9]+)*(?:@\d+)?$/;
+const MODEL_REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 
 function parseSource(value: unknown, path: string): ConfigGraphSource {
   const input = objectAt(value, path, ["id", "kind", "ref"]);
@@ -117,7 +119,7 @@ export function validateRepositoryConfigContract(
 ): ValidatedContract<RepositoryConfigContract> {
   const source = options.source ?? "config";
   const input = objectAt(value, source, [
-    "schema", "default_graph", "graphs", "agent", "test", "lint", "build", "post_bootstrap", "limits",
+    "schema", "default_graph", "graphs", "agent", "model", "test", "lint", "build", "post_bootstrap", "limits",
     "mcp_servers", "pipelines", "intents",
   ]);
   if (input.schema !== CONFIG_SCHEMA) fail(`${source}.schema`, `must be ${CONFIG_SCHEMA}`);
@@ -126,6 +128,7 @@ export function validateRepositoryConfigContract(
     default_graph: stringAt(input.default_graph, `${source}.default_graph`, { pattern: IDENTIFIER }),
     graphs: arrayAt(input.graphs, `${source}.graphs`, parseSource, { min: 1, max: 16 }),
     ...(input.agent === undefined ? {} : { agent: stringAt(input.agent, `${source}.agent`, { pattern: IDENTIFIER }) }),
+    ...(input.model === undefined ? {} : { model: stringAt(input.model, `${source}.model`, { max: 240, pattern: MODEL_REFERENCE }) }),
     ...(input.test === undefined ? {} : { test: stringAt(input.test, `${source}.test`, { max: 4_000 }) }),
     ...(input.lint === undefined ? {} : { lint: stringAt(input.lint, `${source}.lint`, { max: 4_000 }) }),
     ...(input.build === undefined ? {} : { build: stringAt(input.build, `${source}.build`, { max: 4_000 }) }),

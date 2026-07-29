@@ -2,7 +2,7 @@
 // =============================================================================
 // openthrottle CLI entrypoint — a plain argv router, no CLI framework.
 //
-// Usage: openthrottle <setup|init|ship|status|stop|logs> [args]
+// Usage: openthrottle <setup|init|plan|validate|ship|status|stop|logs> [args]
 // =============================================================================
 
 const USAGE = `openthrottle — plan-first autonomous coding pipeline CLI
@@ -13,6 +13,11 @@ Usage:
   openthrottle init                Register the current GitHub repository and
                                     Linear team, verify readiness, and write
                                     .openthrottle.yml.
+  openthrottle plan validate <file.md>
+                                    Validate the plan's execution-plan block.
+  openthrottle plan prepare <file.md>
+                                    Explain agent-backed execution-plan preparation.
+  openthrottle validate <file.md>   Alias for plan validate.
   openthrottle ship <file.md>      Create a Linear issue from a markdown
                                     file and delegate it to the agent.
   openthrottle status              Show ticket status from the supervisor.
@@ -39,7 +44,17 @@ async function main(): Promise<void> {
     }
     case 'ship': {
       const { default: ship } = await import('./ship.js');
-      await ship(rest[0]);
+      await ship(rest);
+      break;
+    }
+    case 'plan': {
+      const { plan } = await import('./plan.js');
+      await plan(rest);
+      break;
+    }
+    case 'validate': {
+      const { validate } = await import('./plan.js');
+      await validate(rest);
       break;
     }
     case 'status': {
