@@ -139,7 +139,10 @@ function loopRequestForUnit({ request, repoDir, plan, unit, nativeSessionId, tim
     protocol: "loop-action@1",
     actionId,
     attemptId: actionId,
+    runId: request.runId,
+    pipelineInstanceId: request.pipelineInstanceId,
     graphId: plan.graph_id ?? request.manifestDigest,
+    graphDigest: request.manifestDigest,
     unitId: unit.id,
     role: "worker",
     loop: "implement",
@@ -155,6 +158,22 @@ function loopRequestForUnit({ request, repoDir, plan, unit, nativeSessionId, tim
     receiptSchema: "openthrottle.receipt/v1",
   };
   return { ...withoutFence, ...createLoopRequestHash(withoutFence) };
+}
+
+function orderedReadyUnits(plan) {
+  const pending = new Map(plan.units.map((unit, index) => [unit.id, { unit, index }]));
+  const completed = new Set();
+  const ordered = [];
+  while (pending.size > 0) {
+    const ready = [...pending.values()]
+      .filter(({ unit }) => (unit.depends_on ?? []).every((dependency) => completed.has(dependency)))
+      .sort((left, right) => left.index - right.index || left.unit.id.localeCompare(right.unit.id))[0];
+    if (!ready) throw new Error("execution plan units have no dependency-ready candidate");
+    pending.delete(ready.unit.id);
+    completed.add(ready.unit.id);
+    ordered.push(ready.unit);
+  }
+  return ordered;
 }
 
 function stageOutcomeFromLoopResult(result) {
@@ -693,7 +712,7 @@ export function executeStage({
     const plan = executionPlanFromTaskContext(request.taskContext);
     const unitResults = [];
     let currentNativeSessionId = nativeSessionId;
-    for (const unit of plan.units) {
+    for (const unit of orderedReadyUnits(plan)) {
       const loopRequest = loopRequestForUnit({
         request,
         repoDir,

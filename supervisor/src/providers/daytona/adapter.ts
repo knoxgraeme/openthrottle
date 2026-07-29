@@ -77,6 +77,7 @@ function assertStageRequestFence(request: StageRequestEnvelope): void {
 function assertLoopRequestFence(request: LoopActionRequest): void {
   safeStagePathId(request.actionId, "loop action ID");
   safeStagePathId(request.attemptId, "loop attempt ID");
+  safeStagePathId(request.runId, "loop parent run ID");
   const expectedHash = digestNormalized(canonicalJson({
     ...request,
     requestHash: undefined,
@@ -347,6 +348,10 @@ export function createDaytonaSandboxRuntime(
       const requestPath = `${LOOP_INPUT_DIR}/${request.actionId}.json`;
       await sandbox.fs.uploadFile(Buffer.from(canonicalJson(request)), requestPath);
       await sandbox.fs.setFilePermissions(requestPath, { owner: "root", group: "root", mode: "400" });
+      await sandbox.updateEnv({
+        RUN_ID: request.runId,
+        OT_CHILD_ACTION_ID: request.actionId,
+      }, { unset: [] });
       const sessionId = `loop-${request.actionId}`;
       if (!sandbox.process?.executeSessionCommand) {
         throw new Error("Daytona runtime does not expose session command execution");
@@ -354,7 +359,10 @@ export function createDaytonaSandboxRuntime(
       await sandbox.process?.createSession?.(sessionId).catch(() => undefined);
       const dispatched = await sandbox.process.executeSessionCommand(sessionId, {
         command: `flock --nonblock ${LOOP_RESULT_DIR}/${request.actionId}.lock sh -c ` +
-          `'test -f ${LOOP_RESULT_DIR}/${request.actionId}.json || exec /opt/openthrottle/runner/execute-loop.mjs --request ${requestPath}'`,
+          `'test -f ${LOOP_RESULT_DIR}/${request.actionId}.json || ` +
+          `(node /opt/openthrottle/runner/heartbeat.mjs & heartbeat=$!; ` +
+          `trap "kill $heartbeat 2>/dev/null || true" EXIT; ` +
+          `/opt/openthrottle/runner/execute-loop.mjs --request ${requestPath})'`,
         runAsync: true,
         suppressInputEcho: true,
       }, Math.ceil(request.timeoutMs / 1000));

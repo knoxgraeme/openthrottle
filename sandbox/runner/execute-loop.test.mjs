@@ -37,7 +37,10 @@ function request(overrides = {}) {
     protocol: "loop-action@1",
     actionId: "action-1",
     attemptId: "attempt-1",
+    runId: "run-1",
+    pipelineInstanceId: "instance-1",
     graphId: "graph-1",
+    graphDigest: "a".repeat(64),
     unitId: "unit-1",
     role: "worker",
     loop: "implement",
@@ -74,7 +77,7 @@ function standardReceipt(loopRequest, overrides = {}) {
     },
     fence: {
       pipeline_instance_id: "instance-1",
-      graph_digest: "a".repeat(64),
+      graph_digest: loopRequest.graphDigest,
       unit_id: loopRequest.unitId,
       attempt_id: loopRequest.attemptId,
       request_hash: loopRequest.requestHash,
@@ -123,6 +126,16 @@ describe("loop action request validation", () => {
     const valid = validateLoopRequest(request({ skill: "ce-simplify-code", loop: "simplify" }));
     expect(loopPrompt(valid).split("\n")[0]).toBe("$ce-simplify-code");
     expect(loopPrompt(valid)).not.toContain("$ce-work");
+  });
+
+  it("shows the exact receipt fence to the child agent", () => {
+    const valid = validateLoopRequest(request());
+    const prompt = loopPrompt(valid);
+    expect(prompt).toContain("\"pipeline_instance_id\":\"instance-1\"");
+    expect(prompt).toContain(`"graph_digest":"${"a".repeat(64)}"`);
+    expect(prompt).toContain("\"unit_id\":\"unit-1\"");
+    expect(prompt).toContain("\"attempt_id\":\"attempt-1\"");
+    expect(prompt).toContain(`"request_hash":"${valid.requestHash}"`);
   });
 
   it("passes native session IDs to every resumable engine adapter", () => {

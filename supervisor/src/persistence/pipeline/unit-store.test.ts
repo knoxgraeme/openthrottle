@@ -134,6 +134,59 @@ describe("execution unit store", () => {
     expect(second?.unit_id).toBe("b");
   });
 
+  it("marks failed child actions terminal and structurally exits dependents", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b", dependencies: ["a"] }],
+    });
+    const first = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: timestamp,
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })!;
+    store.markActionDispatched(first.id, "request-hash", "native-session");
+
+    expect(store.failUnitAction({
+      actionId: first.id,
+      resultHash: "result-hash",
+      outputSubject: "1".repeat(40),
+      nativeSessionId: "native-after-failure",
+      reason: "child failed",
+    })).toMatchObject({
+      status: "failed",
+      output_subject: "1".repeat(40),
+      native_session_id: "native-after-failure",
+      last_error: "child failed",
+    });
+    expect(store.listUnits("attempt-parent")).toEqual([
+      expect.objectContaining({
+        unitId: "a",
+        status: "failed",
+        terminalLevel: "failed",
+        alarm: true,
+        integrationSubject: "1".repeat(40),
+      }),
+      expect.objectContaining({
+        unitId: "b",
+        status: "exited",
+        terminalLevel: "exited",
+        alarm: false,
+      }),
+    ]);
+    expect(store.emitAggregateOnce({
+      parentAttemptId: "attempt-parent",
+      artifactHash: "hash-1",
+      integrationSubject: "1".repeat(40),
+    })).toBe("emitted");
+  });
+
   it("expires stale leased work and returns the unit to the serial queue", () => {
     const store = setup();
     store.createGraph({

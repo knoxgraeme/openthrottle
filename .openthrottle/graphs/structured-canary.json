@@ -10,6 +10,13 @@
       "session_scope": "attempt",
       "credentials": ["repo.read", "repo.write", "model.invoke"],
       "skills": ["builtin://implement-unit@1", "builtin://repair-unit@1", "builtin://simplify-unit@1"]
+    },
+    {
+      "id": "reviewer",
+      "engine": "agent",
+      "session_scope": "attempt",
+      "credentials": ["repo.read", "model.invoke"],
+      "skills": ["builtin://final-review@1", "builtin://final-repair@1"]
     }
   ],
   "loops": [
@@ -21,6 +28,16 @@
       "receipt": "unit_completion",
       "max_parallel": 1,
       "max_rounds": 4,
+      "timeout_seconds": 86400
+    },
+    {
+      "id": "final_review_loop",
+      "worker": "reviewer",
+      "skill": "builtin://final-review@1",
+      "input_scope": "review",
+      "receipt": "semantic_review",
+      "max_parallel": 1,
+      "max_rounds": 2,
       "timeout_seconds": 86400
     }
   ],
@@ -65,9 +82,22 @@
       "command": "build",
       "depends_on": [],
       "transitions": {
-        "success": { "to": "publish" },
+        "success": { "to": "final_review" },
         "repair_required": { "to": "implement_units", "max_reentries": 3, "on_exhausted": "needs_human" },
         "failure": { "to": "implement_units", "max_reentries": 3, "on_exhausted": "needs_human" }
+      }
+    },
+    {
+      "id": "final_review",
+      "kind": "run",
+      "loop": "final_review_loop",
+      "depends_on": [],
+      "transitions": {
+        "success": { "to": "publish" },
+        "no_change": { "to": "publish" },
+        "repair_required": { "to": "implement_units", "max_reentries": 5, "on_exhausted": "needs_human" },
+        "needs_human": { "terminal": "needs_human" },
+        "failure": { "to": "implement_units", "max_reentries": 5, "on_exhausted": "needs_human" }
       }
     },
     {

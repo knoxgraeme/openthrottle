@@ -158,8 +158,8 @@ function loopReceipt(loopRequest, subject, result = "success") {
     },
     subject: { base: subject, pre: subject, post: subject },
     fence: {
-      pipeline_instance_id: "pipeline-1",
-      graph_digest: "a".repeat(64),
+      pipeline_instance_id: loopRequest.pipelineInstanceId,
+      graph_digest: loopRequest.graphDigest,
       unit_id: loopRequest.unitId,
       attempt_id: loopRequest.attemptId,
       request_hash: loopRequest.requestHash,
@@ -340,6 +340,9 @@ describe("one-stage executor", () => {
     expect(executeLoopActionRunner).toHaveBeenCalledWith(expect.objectContaining({
       request: expect.objectContaining({
         protocol: "loop-action@1",
+        runId: input.request.runId,
+        pipelineInstanceId: "pipeline-1",
+        graphDigest: input.request.manifestDigest,
         unitId: "u1",
         skill: "implement-unit",
         worktree: { id: "u1", path: input.repoDir },
@@ -355,6 +358,64 @@ describe("one-stage executor", () => {
     expect(JSON.parse(graph.payload)).toMatchObject({
       result: "success",
       details: { units: [expect.objectContaining({ id: "u1", outcome: "success" })] },
+    });
+  });
+
+  it("executes loop-action units only after their dependencies are complete", () => {
+    const plan = {
+      schema: "openthrottle.execution-plan/v1",
+      graph_id: "structured",
+      plan_id: "plan-1",
+      units: [
+        { id: "dependent", title: "Dependent unit", depends_on: ["prerequisite"], instructions: ["i2"], acceptance: ["a2"] },
+        { id: "prerequisite", title: "Prerequisite unit", depends_on: [], instructions: ["i1"], acceptance: ["a1"] },
+      ],
+      instructions: { i1: "Implement the prerequisite.", i2: "Implement the dependent unit." },
+      acceptance: { a1: "The prerequisite is complete.", a2: "The dependent unit is complete." },
+      commands: [],
+    };
+    const input = fixture({
+      capability: "loop-action@1",
+      executorKind: "loop_action",
+      requiredArtifacts: ["stage_result", "execution_graph_result"],
+      credentialScopes: ["model.invoke", "repo.read", "repo.write"],
+      liveSteering: false,
+    });
+    const taskContext = `# Plan\n\n\`\`\`json openthrottle.execution-plan/v1\n${JSON.stringify(plan)}\n\`\`\``;
+    const withoutFence = { ...input.request, taskContext };
+    delete withoutFence.requestHash;
+    delete withoutFence.idempotencyKey;
+    const request = { ...withoutFence, ...createStageRequestHash(withoutFence) };
+    const subject = computeWorkspaceTreeOid(input.repoDir);
+    const executed = [];
+    const executeLoopActionRunner = vi.fn(({ request: loopRequest }) => {
+      executed.push(loopRequest.unitId);
+      return {
+        version: 1,
+        kind: "loop_action_result",
+        action_id: loopRequest.actionId,
+        attempt_id: loopRequest.attemptId,
+        request_hash: loopRequest.requestHash,
+        outcome: "success",
+        native_session_id: `native-${loopRequest.unitId}`,
+        subject,
+        receipt: loopReceipt(loopRequest, subject),
+        created_at: "2026-07-22T00:00:01.000Z",
+      };
+    });
+
+    const result = executeStage({ ...input, request, executeLoopActionRunner, now: clock() });
+
+    expect(result.outcome).toBe("success");
+    expect(executed).toEqual(["prerequisite", "dependent"]);
+    const graph = result.artifacts.find((artifact) => artifact.kind === "execution_graph_result");
+    expect(JSON.parse(graph.payload)).toMatchObject({
+      details: {
+        units: [
+          expect.objectContaining({ id: "prerequisite", outcome: "success" }),
+          expect.objectContaining({ id: "dependent", outcome: "success" }),
+        ],
+      },
     });
   });
 

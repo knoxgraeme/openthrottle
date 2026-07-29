@@ -511,7 +511,7 @@ export function buildCommandArtifacts({ fence, command, commandName, execution, 
 export function buildLoopActionArtifacts({ fence, units, requiredArtifacts, env = process.env }) {
   const normalizedUnits = units.map((unit) => ({
     id: boundedText(unit.id, "loop action unit id", 120, env),
-    title: boundedText(unit.title, "loop action unit title", 200, env),
+    title: boundedText(unit.title ?? unit.id, "loop action unit title", 200, env),
     action_id: boundedText(unit.actionId, "loop action action id", 200, env),
     outcome: boundedText(unit.outcome, "loop action outcome", 80, env),
     subject: unit.subject ?? null,

@@ -154,7 +154,10 @@ describe("Daytona stage execution", () => {
       protocol: "loop-action@1" as const,
       actionId: "loop-1",
       attemptId: "attempt-child",
+      runId: "run-child-parent",
+      pipelineInstanceId: "instance-1",
       graphId: "graph-1",
+      graphDigest: "a".repeat(64),
       unitId: "unit-1",
       role: "worker" as const,
       loop: "implement" as const,
@@ -184,6 +187,17 @@ describe("Daytona stage execution", () => {
     await expect(runtime.dispatchLoopAction(resource, loopRequest)).resolves.toEqual({
       providerDispatchId: "dispatch-opaque-1",
     });
+    expect(sandbox.updateEnv).toHaveBeenCalledWith({
+      RUN_ID: "run-child-parent",
+      OT_CHILD_ACTION_ID: "loop-1",
+    }, { unset: [] });
+    expect(sandbox.process.executeSessionCommand).toHaveBeenCalledWith(
+      "loop-loop-1",
+      expect.objectContaining({
+        command: expect.stringContaining("/opt/openthrottle/runner/heartbeat.mjs"),
+      }),
+      30
+    );
     expect(sandbox.process.executeSessionCommand).toHaveBeenCalledWith(
       "loop-loop-1",
       expect.objectContaining({

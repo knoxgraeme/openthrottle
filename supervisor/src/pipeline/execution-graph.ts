@@ -100,6 +100,9 @@ const CAPABILITY_CREDENTIALS: Record<string, {
     artifacts: ["stage_result"],
   },
 };
+const BUILTIN_SKILL_CAPABILITY_ALIASES: Record<string, string> = {
+  "final-review@1": "ce/review@1",
+};
 
 function fail(path: string, message: string): never {
   throw new Error(`${path}: ${message}`);
@@ -109,7 +112,8 @@ function capabilityFromBuiltinSkill(skill: string, path: string): string {
   if (!skill.startsWith("builtin://")) {
     fail(path, "repository skills cannot compile to runtime capabilities yet");
   }
-  return skill.slice("builtin://".length);
+  const builtin = skill.slice("builtin://".length);
+  return BUILTIN_SKILL_CAPABILITY_ALIASES[builtin] ?? builtin;
 }
 
 function commandNameFromGraph(command: string, path: string): CommandName {

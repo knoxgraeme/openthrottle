@@ -11,6 +11,9 @@ import {
   digestNormalized,
   loadPipelineCatalog,
   parseRepositoryConfig,
+  type PipelineManifest,
+  type ValidatedPipelineCatalog,
+  type ValidatedPipelineManifest,
 } from "../pipeline/manifest.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { buildInstalledRuntimeDescriptor, type SandboxAutostopRuntime, type SandboxRuntime } from "../__fixtures__/runtime.js";
@@ -18,6 +21,25 @@ import type { PipelineInstance, PipelineStageAttempt } from "../pipeline/store.j
 import type { LinearOutboxRecord } from "../persistence/delivery-store.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
+
+function validatedManifest(manifest: PipelineManifest): ValidatedPipelineManifest {
+  const normalized = canonicalJson(manifest);
+  return { manifest, normalized, digest: digestNormalized(normalized) };
+}
+
+function catalogFor(manifest: ValidatedPipelineManifest, alias: string): ValidatedPipelineCatalog {
+  const manifests = new Map([[`${manifest.manifest.id}@${manifest.manifest.version}`, manifest]]);
+  const aliases = { [alias]: { id: manifest.manifest.id, version: manifest.manifest.version } };
+  const normalized = canonicalJson({
+    aliases,
+    manifests: [...manifests.values()].map((entry) => ({
+      id: entry.manifest.id,
+      version: entry.manifest.version,
+      digest: entry.digest,
+    })),
+  });
+  return { aliases, manifests, normalized, digest: digestNormalized(normalized) };
+}
 
 describe("pipeline effect processor", () => {
   let db: Database.Database | undefined;
@@ -38,8 +60,8 @@ describe("pipeline effect processor", () => {
       dispatchStage: vi.fn(async () => ({ providerDispatchId: ids.providerDispatchId ?? `dispatch-${issueId}` })),
       collectStageResult: vi.fn(async () => null),
       createWorktree: vi.fn(async () => ({ id: `worktree-${issueId}` })),
-      dispatchLoopAction: vi.fn(async () => ({ providerDispatchId: `loop-${issueId}` })),
-      collectLoopActionResult: vi.fn(async () => null),
+      dispatchLoopAction: vi.fn<SandboxRuntime["dispatchLoopAction"]>(async () => ({ providerDispatchId: `loop-${issueId}` })),
+      collectLoopActionResult: vi.fn<SandboxRuntime["collectLoopActionResult"]>(async () => null),
       cleanupWorktree: vi.fn(async () => undefined),
       renewLiveness: vi.fn(async () => ({ observedAt: new Date().toISOString() })),
       stop: vi.fn(async () => ({ confirmed: true })),
@@ -321,6 +343,267 @@ describe("pipeline effect processor", () => {
 
     expect(runtime.cleanup).toHaveBeenCalledOnce();
     expect(tickets.getByIssueId("issue-1")?.sandbox_id).toBe("sandbox-new-generation");
+  });
+
+  it("persists loop-action units before dispatching child actions and settles the aggregate", async () => {
+    db = openDb(":memory:");
+    const pipelines = createPipelineStore(db);
+    const tickets = createSupervisorStore(db, pipelines);
+    const runtimeDescriptor = buildInstalledRuntimeDescriptor("loop-effect-test/v1");
+    const manifest = validatedManifest({
+      schema: "openthrottle.pipeline/v1",
+      id: "fixture/loop-action",
+      version: 1,
+      description: "Loop action fixture.",
+      entry_stage: "implement_units",
+      max_attempts: 10,
+      requires: { protocol: "stage-executor@1", capabilities: ["loop-action@1"] },
+      stages: [{
+        id: "implement_units",
+        executor: { kind: "loop_action", capability: "loop-action@1" },
+        evaluator: { kind: "semantic", assurance: "executor_verified", required_artifacts: ["execution_graph_result"] },
+        context: "resume_required",
+        live_steering: false,
+        credentials: ["repo.read", "repo.write", "model.invoke"],
+        produces: ["stage_result", "execution_graph_result"],
+        transitions: {
+          success: { terminal: "shipped" },
+          no_change: { terminal: "no_change" },
+          semantic_repair_required: { terminal: "needs_human" },
+          retryable_infrastructure_failure: { terminal: "failed" },
+          needs_human: { terminal: "needs_human" },
+          canceled: { terminal: "canceled" },
+          superseded: { terminal: "superseded" },
+          failure: { terminal: "failed" },
+        },
+      }],
+    });
+    pipelines.acceptRuntimeDescriptor(runtimeDescriptor);
+    pipelines.acceptCatalog(catalogFor(manifest, "fixture-loop"));
+    const config = pipelines.saveRepositoryConfigSnapshot({
+      repository: "owner/repo",
+      baseCommit: "a".repeat(40),
+      blobSha: "b".repeat(40),
+      config: parseRepositoryConfig("pipelines: { implement: fixture-loop }\ntest: npm test\n"),
+    });
+    const plan = {
+      schema: "openthrottle.execution-plan/v1",
+      units: [
+        { id: "U1", title: "First unit", depends_on: [], instructions: ["I1"], acceptance: ["A1"] },
+      ],
+      instructions: { I1: "Change the repo." },
+      acceptance: { A1: "Receipt is valid." },
+    };
+    tickets.upsert({
+      linear_issue_id: "issue-loop",
+      linear_issue_identifier: "OT-LOOP",
+      linear_session_id: "session-loop",
+      sandbox_id: null,
+      branch: "ot/issue-loop",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+      pipeline: {
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        manifest,
+        repositoryConfig: config,
+        runtime: runtimeDescriptor,
+        authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
+        taskContext: `Implement this plan.\n\n\`\`\`json\n${JSON.stringify(plan)}\n\`\`\``,
+      },
+    });
+    const instance = pipelines.getInstanceForSession("session-loop")!;
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    let dispatchedRequestHash = "";
+    const runtime = sandboxRuntimeMock({ issueId: "loop" });
+    runtime.dispatchLoopAction.mockImplementation(async (_resource, request) => {
+      expect(pipelines.getGraphForAttempt(attempt.id)).toBeDefined();
+      expect(pipelines.listUnits(attempt.id)).toMatchObject([
+        { unitId: "U1", status: "running", activeActionId: request.actionId },
+      ]);
+      dispatchedRequestHash = request.requestHash;
+      return { providerDispatchId: "loop-dispatch-1" };
+    });
+    const processor = createPipelineEffectProcessor({
+      store: pipelines,
+      tickets,
+      runtime,
+      taskTimeoutSeconds: 300,
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+    });
+
+    await processor.drain();
+
+    expect(runtime.dispatchStage).not.toHaveBeenCalled();
+    expect(runtime.dispatchLoopAction).toHaveBeenCalledTimes(1);
+    const action = db.prepare("SELECT * FROM execution_work_attempts WHERE parent_attempt_id = ?")
+      .get(attempt.id) as { id: string; request_hash: string; status: string; native_session_id: string | null };
+    expect(action).toMatchObject({ request_hash: dispatchedRequestHash, status: "dispatched" });
+
+    runtime.collectLoopActionResult.mockResolvedValue({
+      actionId: action.id,
+      attemptId: action.id,
+      requestHash: dispatchedRequestHash,
+      outcome: "success",
+      nativeSessionId: "native-child-1",
+      subject: "c".repeat(40),
+      receipt: canonicalJson({ ok: true }),
+      completedAt: "2099-07-22T12:01:00.000Z",
+    });
+
+    await processor.drain();
+
+    expect(pipelines.listUnits(attempt.id)).toMatchObject([
+      { unitId: "U1", status: "integrated", integrationSubject: "c".repeat(40) },
+    ]);
+    expect(db.prepare("SELECT native_session_id FROM execution_work_attempts WHERE id = ?").pluck().get(action.id))
+      .toBe("native-child-1");
+    expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
+      aggregate_artifact_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      integration_subject: "c".repeat(40),
+    });
+    expect(pipelines.getAttempt(attempt.id)).toMatchObject({
+      status: "completed",
+      outcome: "success",
+    });
+    expect(tickets.getByIssueId("issue-loop")).toMatchObject({ run_id: null });
+  });
+
+  it("settles a loop-action stage as failed when a child action returns failure", async () => {
+    db = openDb(":memory:");
+    const pipelines = createPipelineStore(db);
+    const tickets = createSupervisorStore(db, pipelines);
+    const runtimeDescriptor = buildInstalledRuntimeDescriptor("loop-effect-failure-test/v1");
+    const manifest = validatedManifest({
+      schema: "openthrottle.pipeline/v1",
+      id: "fixture/loop-action",
+      version: 1,
+      description: "Loop action fixture.",
+      entry_stage: "implement_units",
+      max_attempts: 10,
+      requires: { protocol: "stage-executor@1", capabilities: ["loop-action@1"] },
+      stages: [{
+        id: "implement_units",
+        executor: { kind: "loop_action", capability: "loop-action@1" },
+        evaluator: { kind: "semantic", assurance: "executor_verified", required_artifacts: ["execution_graph_result"] },
+        context: "resume_required",
+        live_steering: false,
+        credentials: ["repo.read", "repo.write", "model.invoke"],
+        produces: ["stage_result", "execution_graph_result"],
+        transitions: {
+          success: { terminal: "shipped" },
+          no_change: { terminal: "no_change" },
+          semantic_repair_required: { terminal: "needs_human" },
+          retryable_infrastructure_failure: { terminal: "failed" },
+          needs_human: { terminal: "needs_human" },
+          canceled: { terminal: "canceled" },
+          superseded: { terminal: "superseded" },
+          failure: { terminal: "failed" },
+        },
+      }],
+    });
+    pipelines.acceptRuntimeDescriptor(runtimeDescriptor);
+    pipelines.acceptCatalog(catalogFor(manifest, "fixture-loop"));
+    const config = pipelines.saveRepositoryConfigSnapshot({
+      repository: "owner/repo",
+      baseCommit: "a".repeat(40),
+      blobSha: "b".repeat(40),
+      config: parseRepositoryConfig("pipelines: { implement: fixture-loop }\ntest: npm test\n"),
+    });
+    const plan = {
+      schema: "openthrottle.execution-plan/v1",
+      units: [
+        { id: "U1", title: "First unit", depends_on: [], instructions: ["I1"], acceptance: ["A1"] },
+      ],
+      instructions: { I1: "Change the repo." },
+      acceptance: { A1: "Receipt is valid." },
+    };
+    tickets.upsert({
+      linear_issue_id: "issue-loop-failure",
+      linear_issue_identifier: "OT-LOOP-FAILURE",
+      linear_session_id: "session-loop-failure",
+      sandbox_id: null,
+      branch: "ot/issue-loop-failure",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+      pipeline: {
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        manifest,
+        repositoryConfig: config,
+        runtime: runtimeDescriptor,
+        authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
+        taskContext: `Implement this plan.\n\n\`\`\`json\n${JSON.stringify(plan)}\n\`\`\``,
+      },
+    });
+    const instance = pipelines.getInstanceForSession("session-loop-failure")!;
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    let dispatchedRequestHash = "";
+    const runtime = sandboxRuntimeMock({ issueId: "loop-failure" });
+    runtime.dispatchLoopAction.mockImplementation(async (_resource, request) => {
+      dispatchedRequestHash = request.requestHash;
+      return { providerDispatchId: "loop-dispatch-1" };
+    });
+    const processor = createPipelineEffectProcessor({
+      store: pipelines,
+      tickets,
+      runtime,
+      taskTimeoutSeconds: 300,
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+    });
+
+    await processor.drain();
+    const action = db.prepare("SELECT * FROM execution_work_attempts WHERE parent_attempt_id = ?")
+      .get(attempt.id) as { id: string; request_hash: string; status: string };
+    runtime.collectLoopActionResult.mockResolvedValue({
+      actionId: action.id,
+      attemptId: action.id,
+      requestHash: dispatchedRequestHash,
+      outcome: "failure",
+      nativeSessionId: "native-child-1",
+      subject: "d".repeat(40),
+      receipt: canonicalJson({ ok: false }),
+      completedAt: "2099-07-22T12:01:00.000Z",
+    });
+
+    await processor.drain();
+    await processor.drain();
+
+    expect(runtime.dispatchLoopAction).toHaveBeenCalledTimes(1);
+    expect(pipelines.listUnits(attempt.id)).toMatchObject([
+      {
+        unitId: "U1",
+        status: "failed",
+        terminalLevel: "failed",
+        alarm: true,
+        integrationSubject: "d".repeat(40),
+      },
+    ]);
+    expect(db.prepare("SELECT status, last_error, native_session_id FROM execution_work_attempts WHERE id = ?")
+      .get(action.id)).toEqual({
+      status: "failed",
+      last_error: `loop action ${action.id} returned failure`,
+      native_session_id: "native-child-1",
+    });
+    expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
+      aggregate_artifact_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      integration_subject: "d".repeat(40),
+    });
+    expect(pipelines.getAttempt(attempt.id)).toMatchObject({
+      status: "failed",
+      outcome: "failure",
+    });
+    expect(pipelines.getInstance(instance.id)).toMatchObject({
+      status: "completion_pending_publication",
+      terminal_outcome: "failed",
+    });
+    expect(tickets.getByIssueId("issue-loop-failure")).toMatchObject({ run_id: null });
   });
 
   it("idles an active bound sandbox through a best-effort runtime effect", async () => {

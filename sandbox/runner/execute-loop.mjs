@@ -71,7 +71,7 @@ export function createLoopRequestHash(requestWithoutFence) {
 export function validateLoopRequest(value) {
   const input = record(value, "loop request");
   const allowed = new Set([
-    "protocol", "actionId", "attemptId", "graphId", "unitId", "role", "loop",
+    "protocol", "actionId", "attemptId", "runId", "pipelineInstanceId", "graphId", "graphDigest", "unitId", "role", "loop",
     "agent", "skill", "worktree", "nativeSessionId", "contextPolicy", "timeoutMs",
     "transitionContext", "allowedMcpServers", "credentialScopes", "receiptSchema",
     "requestHash", "idempotencyKey",
@@ -84,7 +84,10 @@ export function validateLoopRequest(value) {
     protocol: LOOP_ACTION_PROTOCOL,
     actionId: string(input.actionId, "actionId"),
     attemptId: string(input.attemptId, "attemptId"),
+    runId: string(input.runId, "runId"),
+    pipelineInstanceId: string(input.pipelineInstanceId, "pipelineInstanceId"),
     graphId: string(input.graphId, "graphId"),
+    graphDigest: string(input.graphDigest, "graphDigest", /^[a-f0-9]{64}$/),
     unitId: nullableString(input.unitId, "unitId"),
     role: string(input.role, "role"),
     loop: string(input.loop, "loop"),
@@ -137,10 +140,19 @@ export function resolveLoopInvocation(request) {
 
 export function loopPrompt(request) {
   const prefix = request.agent === "claude" ? "/" : "$";
+  const receiptFence = canonicalJson({
+    pipeline_instance_id: request.pipelineInstanceId,
+    graph_digest: request.graphDigest,
+    unit_id: request.unitId,
+    attempt_id: request.attemptId,
+    request_hash: request.requestHash,
+  });
   return `${prefix}${request.skill}\n\n` +
     `This is one fenced OpenThrottle loop action (${request.actionId}) for ${request.role}/${request.loop}. ` +
     `Edit only the provided worktree when one is present. Do not commit, push, or alter executor state. ` +
-    `Return one receipt matching ${request.receiptSchema}.\n\n${request.transitionContext}`;
+    `Return one receipt matching ${request.receiptSchema}.\n\n` +
+    `Receipt fence (copy these exact values into receipt.fence):\n${receiptFence}\n\n` +
+    `${request.transitionContext}`;
 }
 
 export function loopAgentCommand({ request, invocation }) {
@@ -208,6 +220,10 @@ export function parseLoopReceipt(raw, env = process.env) {
 function assertLoopReceiptFence(receipt, request, subject) {
   if (receipt.fence.attempt_id !== request.attemptId || receipt.fence.request_hash !== request.requestHash) {
     throw new Error("loop receipt request fence mismatch");
+  }
+  if (receipt.fence.pipeline_instance_id !== request.pipelineInstanceId ||
+      receipt.fence.graph_digest !== request.graphDigest) {
+    throw new Error("loop receipt graph fence mismatch");
   }
   if (request.unitId !== null && receipt.fence.unit_id !== request.unitId) {
     throw new Error("loop receipt unit fence mismatch");

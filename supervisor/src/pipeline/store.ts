@@ -347,6 +347,14 @@ export interface ExecutionUnitStore {
     actionId: string;
     resultHash: string;
     outputSubject: string;
+    nativeSessionId?: string | null;
+  }): ExecutionWorkAttempt;
+  failUnitAction(input: {
+    actionId: string;
+    resultHash: string;
+    outputSubject?: string | null;
+    nativeSessionId?: string | null;
+    reason: string;
   }): ExecutionWorkAttempt;
   emitAggregateOnce(input: {
     parentAttemptId: string;
@@ -551,6 +559,7 @@ export interface PipelineStore extends ChildActionLivenessPort, ExecutionUnitSto
   getRuntimeResource(instanceId: string): PipelineRuntimeResource | undefined;
   setRuntimeResourceStatus(instanceId: string, status: PipelineRuntimeResource["status"]): void;
   getActiveAttempt(instanceId: string): PipelineStageAttempt | undefined;
+  listActiveLoopActionAttempts(limit?: number): PipelineStageAttempt[];
   listProviderReadyInstances(limit?: number): PipelineInstance[];
   listStages(instanceId: string): PipelineInstanceStage[];
   getEffect(id: string): PipelineEffectIntent | undefined;

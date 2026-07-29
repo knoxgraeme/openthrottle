@@ -38,6 +38,7 @@ describe("unit effect processor", () => {
       markActionDispatching: vi.fn(),
       markActionDispatched: vi.fn(),
       completeUnitAction: vi.fn(),
+      failUnitAction: vi.fn(),
     } as unknown as ExecutionUnitStore;
     const runtime: UnitEffectRuntime = {
       collectUnitAction: vi.fn(async () => null),
@@ -67,6 +68,7 @@ describe("unit effect processor", () => {
       markActionDispatching: vi.fn(),
       markActionDispatched: vi.fn(),
       completeUnitAction: vi.fn(),
+      failUnitAction: vi.fn(),
     } as unknown as ExecutionUnitStore;
     const runtime: UnitEffectRuntime = {
       collectUnitAction: vi.fn(async () => ({ resultHash: "result-hash", outputSubject: "abc123" })),
@@ -86,6 +88,46 @@ describe("unit effect processor", () => {
       actionId: "action-1",
       resultHash: "result-hash",
       outputSubject: "abc123",
+      nativeSessionId: null,
+    });
+    expect(store.failUnitAction).not.toHaveBeenCalled();
+  });
+
+  it("fails recovered child actions without duplicate dispatch", async () => {
+    const leased = action({ status: "dispatched", request_hash: "request-hash" });
+    const store = {
+      leaseNextUnitAction: vi.fn(() => leased),
+      markActionDispatching: vi.fn(),
+      markActionDispatched: vi.fn(),
+      completeUnitAction: vi.fn(),
+      failUnitAction: vi.fn(),
+    } as unknown as ExecutionUnitStore;
+    const runtime: UnitEffectRuntime = {
+      collectUnitAction: vi.fn(async () => ({
+        resultHash: "result-hash",
+        outputSubject: "abc123",
+        nativeSessionId: "native-1",
+        outcome: "failure" as const,
+        reason: "child failed",
+      })),
+      dispatchUnitAction: vi.fn(),
+    };
+
+    await createUnitEffectProcessor({
+      store,
+      runtime,
+      leaseOwner: "owner",
+      now: () => new Date("2026-07-29T00:00:00.000Z"),
+    }).drain("attempt-parent");
+
+    expect(runtime.dispatchUnitAction).not.toHaveBeenCalled();
+    expect(store.completeUnitAction).not.toHaveBeenCalled();
+    expect(store.failUnitAction).toHaveBeenCalledWith({
+      actionId: "action-1",
+      resultHash: "result-hash",
+      outputSubject: "abc123",
+      nativeSessionId: "native-1",
+      reason: "child failed",
     });
   });
 
@@ -96,6 +138,7 @@ describe("unit effect processor", () => {
       markActionDispatching: vi.fn(),
       markActionDispatched: vi.fn(),
       completeUnitAction: vi.fn(),
+      failUnitAction: vi.fn(),
     } as unknown as ExecutionUnitStore;
     const runtime: UnitEffectRuntime = {
       collectUnitAction: vi.fn(async () => null),
@@ -122,6 +165,7 @@ describe("unit effect processor", () => {
       markActionDispatching: vi.fn(),
       markActionDispatched: vi.fn(),
       completeUnitAction: vi.fn(),
+      failUnitAction: vi.fn(),
     } as unknown as ExecutionUnitStore;
     const runtime: UnitEffectRuntime = {
       collectUnitAction: vi.fn(async () => {

@@ -1,22 +1,30 @@
 import type { Ticket, SupervisorStore } from "../persistence/store.js";
-import { canonicalJson } from "../pipeline/manifest.js";
+import { canonicalJson, type PipelineManifest, type PipelineStage } from "../pipeline/manifest.js";
 import { digestNormalized } from "../pipeline/manifest.js";
 import { coordinatePipelineEvent } from "../pipeline/coordinator.js";
 import type {
+  ExecutionWorkAttempt,
   PipelineEffectIntent,
   PipelineInstance,
   PipelineRuntimeResource,
   PipelineStore,
 } from "../pipeline/store.js";
 import type { StageRequestEnvelope } from "../pipeline/stage-request.js";
-import type { RuntimeResource, SandboxAutostopRuntime, SandboxRuntime } from "../runtime/contracts.js";
+import type { LoopActionRequest, RuntimeResource, SandboxAutostopRuntime, SandboxRuntime } from "../runtime/contracts.js";
+import { buildAggregateStageEvent } from "../pipeline/unit-coordinator.js";
+import { completeStageAttemptActor } from "../pipeline/settlement.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import { terminateAndSettleActor } from "./actor-settlement.js";
+import { createUnitEffectProcessor, type UnitEffectRuntime } from "./unit-effects.js";
 
 const EFFECT_LEASE_MS = 60_000;
 const RETRY_BASE_MS = 5_000;
 const MAX_EFFECT_ATTEMPTS = 8;
 const CAPACITY_RETRY_MS = 5 * 60_000;
+const UNIT_EFFECT_LEASE_MS = 60_000;
+const INTEGRATION_REPO_PATH = "/home/agent/repo";
+const EXECUTION_PLAN_FENCE = "openthrottle.execution-plan/v1";
+const EXECUTION_PLAN_BLOCK = /```[^\n`]*\n([\s\S]*?)```/g;
 
 // Deterministic provider failures must not burn the whole retry budget on hot
 // exponential backoff. Auth failures never self-heal, so they exhaust on the
@@ -42,6 +50,155 @@ const CAPACITY_ERROR_PATTERNS: RegExp[] = [
 
 type EffectErrorClass = "auth" | "capacity" | "transient";
 type RuntimeEffectHandlerResult = "acknowledge" | "skip_acknowledgement";
+
+interface ExecutionPlanUnitBlock {
+  id: string;
+  title?: string;
+  depends_on?: string[];
+  instructions?: string[];
+  acceptance?: string[];
+}
+
+interface ExecutionPlanBlock {
+  schema: typeof EXECUTION_PLAN_FENCE;
+  graph_id?: string;
+  units: ExecutionPlanUnitBlock[];
+  instructions?: Record<string, string>;
+  acceptance?: Record<string, string>;
+}
+
+function parseExecutionPlan(taskContext: string): ExecutionPlanBlock {
+  const blocks: string[] = [];
+  for (const match of taskContext.matchAll(EXECUTION_PLAN_BLOCK)) {
+    const json = match[1]?.trim();
+    if (!json?.includes("\"schema\"") || !json.includes(EXECUTION_PLAN_FENCE)) continue;
+    blocks.push(json);
+  }
+  if (blocks.length !== 1) {
+    throw new Error(`loop-action stage expected exactly one ${EXECUTION_PLAN_FENCE} block, found ${blocks.length}`);
+  }
+  const parsed = JSON.parse(blocks[0]) as Partial<ExecutionPlanBlock>;
+  if (parsed.schema !== EXECUTION_PLAN_FENCE ||
+      !Array.isArray(parsed.units) ||
+      parsed.units.length < 1 ||
+      parsed.units.length > 64) {
+    throw new Error("execution plan is invalid");
+  }
+  const seen = new Set<string>();
+  const units = parsed.units.map((unit) => {
+    if (!unit || typeof unit !== "object" || typeof unit.id !== "string" || unit.id.length > 120) {
+      throw new Error("execution plan unit is invalid");
+    }
+    if (seen.has(unit.id)) throw new Error(`execution plan has duplicate unit ${unit.id}`);
+    seen.add(unit.id);
+    const dependsOn = Array.isArray(unit.depends_on)
+      ? unit.depends_on.filter((dependency): dependency is string => typeof dependency === "string")
+      : [];
+    return {
+      id: unit.id,
+      ...(typeof unit.title === "string" ? { title: unit.title } : {}),
+      depends_on: dependsOn,
+      instructions: Array.isArray(unit.instructions)
+        ? unit.instructions.filter((entry): entry is string => typeof entry === "string")
+        : [],
+      acceptance: Array.isArray(unit.acceptance)
+        ? unit.acceptance.filter((entry): entry is string => typeof entry === "string")
+        : [],
+    };
+  });
+  for (const unit of units) {
+    for (const dependency of unit.depends_on) {
+      if (!seen.has(dependency)) throw new Error(`execution plan unit ${unit.id} depends on unknown unit ${dependency}`);
+    }
+  }
+  return {
+    schema: EXECUTION_PLAN_FENCE,
+    ...(typeof parsed.graph_id === "string" ? { graph_id: parsed.graph_id } : {}),
+    units,
+    instructions: parsed.instructions && typeof parsed.instructions === "object" ? parsed.instructions : {},
+    acceptance: parsed.acceptance && typeof parsed.acceptance === "object" ? parsed.acceptance : {},
+  };
+}
+
+function stageForAttempt(instance: PipelineInstance, stageId: string): PipelineStage {
+  const manifest = JSON.parse(instance.normalized_manifest) as PipelineManifest;
+  const stage = manifest.stages.find((candidate) => candidate.id === stageId);
+  if (!stage) throw new Error(`stage ${stageId} is absent from the pinned manifest`);
+  return stage;
+}
+
+function createLoopRequestHash(
+  request: Omit<LoopActionRequest, "requestHash" | "idempotencyKey">
+): Pick<LoopActionRequest, "requestHash" | "idempotencyKey"> {
+  const requestHash = digestNormalized(canonicalJson(request));
+  return {
+    requestHash,
+    idempotencyKey: `loop:${request.attemptId}:${request.actionId}:${requestHash}`,
+  };
+}
+
+function unitTransitionContext(input: {
+  request: StageRequestEnvelope;
+  plan: ExecutionPlanBlock;
+  unit: ExecutionPlanUnitBlock;
+}): string {
+  const instructions = (input.unit.instructions ?? [])
+    .map((id) => `- ${id}: ${input.plan.instructions?.[id] ?? ""}`)
+    .join("\n");
+  const acceptance = (input.unit.acceptance ?? [])
+    .map((id) => `- ${id}: ${input.plan.acceptance?.[id] ?? ""}`)
+    .join("\n");
+  return [
+    input.request.taskContext,
+    "",
+    `Structured execution unit: ${input.unit.id} - ${input.unit.title ?? ""}`.trim(),
+    `Dependencies: ${(input.unit.depends_on ?? []).join(", ") || "none"}`,
+    "",
+    "Instructions:",
+    instructions || "- none",
+    "",
+    "Acceptance:",
+    acceptance || "- none",
+    "",
+    input.request.transitionContext,
+  ].join("\n").slice(0, 64_000);
+}
+
+function loopRequestForAction(input: {
+  request: StageRequestEnvelope;
+  plan: ExecutionPlanBlock;
+  action: ExecutionWorkAttempt;
+  unit: ExecutionPlanUnitBlock;
+}): LoopActionRequest {
+  const contextPolicy = input.request.contextPolicy === "none"
+    ? "fresh"
+    : input.request.contextPolicy === "resume_required" && !input.action.native_session_id
+      ? "fresh"
+      : input.request.contextPolicy;
+  const withoutFence: Omit<LoopActionRequest, "requestHash" | "idempotencyKey"> = {
+    protocol: "loop-action@1",
+    actionId: input.action.id,
+    attemptId: input.action.id,
+    runId: input.request.runId,
+    pipelineInstanceId: input.request.pipelineInstanceId,
+    graphId: input.plan.graph_id ?? input.request.manifestDigest,
+    graphDigest: input.request.manifestDigest,
+    unitId: input.action.unit_id,
+    role: "worker",
+    loop: "implement",
+    agent: input.request.agent,
+    skill: "implement-unit",
+    worktree: { id: input.action.id, path: INTEGRATION_REPO_PATH },
+    nativeSessionId: input.action.native_session_id,
+    contextPolicy,
+    timeoutMs: 24 * 60 * 60 * 1_000,
+    transitionContext: unitTransitionContext({ request: input.request, plan: input.plan, unit: input.unit }),
+    allowedMcpServers: [],
+    credentialScopes: input.request.credentialScopes,
+    receiptSchema: "openthrottle.receipt/v1",
+  };
+  return { ...withoutFence, ...createLoopRequestHash(withoutFence) };
+}
 
 function classifyEffectError(message: string): EffectErrorClass {
   const text = message.toLowerCase();
@@ -258,6 +415,164 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     return dispatched;
   };
 
+  const unitRuntimeFor = (
+    resource: RuntimeResource,
+    request: StageRequestEnvelope,
+    plan: ExecutionPlanBlock
+  ): UnitEffectRuntime => ({
+    async dispatchUnitAction(action) {
+      const unit = plan.units.find((candidate) => candidate.id === action.unit_id);
+      if (!unit) throw new Error(`execution plan unit ${action.unit_id} is absent from the sealed plan`);
+      const loopRequest = loopRequestForAction({ request, plan, action, unit });
+      await deps.runtime.dispatchLoopAction(resource, loopRequest);
+      return {
+        requestHash: loopRequest.requestHash,
+        nativeSessionId: loopRequest.nativeSessionId,
+      };
+    },
+    async collectUnitAction(action) {
+      const result = await deps.runtime.collectLoopActionResult(resource, action.id);
+      if (!result) return null;
+      if (result.actionId !== action.id ||
+          result.attemptId !== action.id ||
+          result.requestHash !== action.request_hash) {
+        throw new Error(`loop action ${action.id} result fence mismatch`);
+      }
+      const resultHash = digestNormalized(canonicalJson(result));
+      if (result.outcome !== "success") {
+        return {
+          resultHash,
+          outputSubject: result.subject,
+          nativeSessionId: result.nativeSessionId,
+          outcome: result.outcome,
+          reason: `loop action ${action.id} returned ${result.outcome}`,
+        };
+      }
+      if (!result.subject) {
+        return {
+          resultHash,
+          outputSubject: null,
+          nativeSessionId: result.nativeSessionId,
+          outcome: "failure",
+          reason: `loop action ${action.id} completed without a subject`,
+        };
+      }
+      return {
+        resultHash,
+        outputSubject: result.subject,
+        nativeSessionId: result.nativeSessionId,
+        outcome: "success",
+      };
+    },
+  });
+
+  const createLoopGraph = (
+    instance: PipelineInstance,
+    request: StageRequestEnvelope,
+    plan: ExecutionPlanBlock
+  ): void => {
+    deps.store.createGraph({
+      pipelineInstanceId: instance.id,
+      parentAttemptId: request.attemptId,
+      parentStageId: request.stageId,
+      parentRunId: request.runId,
+      graphDigest: request.manifestDigest,
+      planDigest: digestNormalized(canonicalJson(plan)),
+      units: plan.units.map((unit) => ({
+        id: unit.id,
+        dependencies: unit.depends_on ?? [],
+      })),
+    });
+  };
+
+  const maybeEmitLoopAggregate = (
+    instance: PipelineInstance,
+    request: StageRequestEnvelope
+  ): boolean => {
+    const attempt = deps.store.getAttempt(request.attemptId);
+    if (!attempt || attempt.status !== "running" || !attempt.run_id) return false;
+    const units = deps.store.listUnits(attempt.id);
+    if (units.length === 0 ||
+        units.some((unit) => unit.status !== "integrated" &&
+          unit.status !== "completed" &&
+          unit.status !== "exited" &&
+          unit.status !== "failed")) return false;
+    const manifest = JSON.parse(instance.normalized_manifest) as PipelineManifest;
+    const outcome = units.some((unit) => unit.status === "failed")
+      ? "failure"
+      : units.some((unit) => unit.status === "exited")
+        ? "needs_human"
+        : "success";
+    const subject = [...units]
+      .sort((left, right) => left.ordinal - right.ordinal || left.unitId.localeCompare(right.unitId))
+      .map((unit) => unit.integrationSubject)
+      .filter((value): value is string => typeof value === "string")
+      .at(-1) ?? attempt.expected_subject ?? instance.immutable_subject;
+    if (!subject) throw new Error(`loop-action attempt ${attempt.id} has no integrated subject`);
+    const event = buildAggregateStageEvent({
+      id: `unit-aggregate-${digestNormalized(canonicalJson([instance.id, attempt.id, subject])).slice(0, 32)}`,
+      manifest,
+      instance,
+      parentAttempt: attempt,
+      outcome,
+      subject,
+      units,
+      completedAt: now().toISOString(),
+    });
+    const graphResult = event.artifacts?.find((artifact) => artifact.kind === "execution_graph_result");
+    if (!graphResult) throw new Error(`loop-action attempt ${attempt.id} aggregate has no execution graph result`);
+    const emitted = deps.store.emitAggregateOnce({
+      parentAttemptId: attempt.id,
+      artifactHash: graphResult.hash,
+      integrationSubject: subject,
+    });
+    completeStageAttemptActor(deps.store, deps.tickets, event, { observedSubject: subject });
+    return emitted === "emitted";
+  };
+
+  const drainLoopAttempt = async (
+    instance: PipelineInstance,
+    resource: RuntimeResource,
+    request: StageRequestEnvelope
+  ): Promise<{ providerDispatchId: string }> => {
+    if (request.pipelineInstanceId !== instance.id || request.generation !== instance.generation) {
+      throw new Error(`pipeline stage request ${request.attemptId} has a stale instance fence`);
+    }
+    assertActiveAttempt(instance, request);
+    const ticket = deps.tickets.getByIssueId(instance.linear_issue_id);
+    if (!ticket || ticket.linear_session_id !== instance.linear_session_id) {
+      throw new Error(`pipeline instance ${instance.id} has no current ticket binding`);
+    }
+    await deps.runtime.materializeCredentials(resource, request.credentialScopes);
+    assertActiveAttempt(instance, request);
+    if (ticket.run_id && ticket.run_id !== request.runId) {
+      throw new Error(`ticket ${ticket.linear_issue_identifier} already has active actor ${ticket.run_id}`);
+    }
+    if (!ticket.run_id) {
+      const started = deps.tickets.beginRun({
+        issueId: instance.linear_issue_id,
+        runId: request.runId,
+        taskType: instance.task_type,
+        tokenHash: request.requestHash,
+        expiresAt: new Date(now().getTime() + deps.taskTimeoutSeconds * 1_000).toISOString(),
+      });
+      if (!started) throw new Error(`pipeline stage ${request.attemptId} could not acquire the ticket actor`);
+    }
+    deps.store.bindStageRun(request.attemptId, request.runId);
+    const plan = parseExecutionPlan(request.taskContext);
+    createLoopGraph(instance, request, plan);
+    deps.store.markStageDispatched(request.attemptId);
+    await createUnitEffectProcessor({
+      store: deps.store,
+      runtime: unitRuntimeFor(resource, request, plan),
+      leaseOwner: `pipeline-loop:${request.attemptId}`,
+      now,
+      leaseMs: UNIT_EFFECT_LEASE_MS,
+    }).drain(request.attemptId);
+    maybeEmitLoopAggregate(instance, request);
+    return { providerDispatchId: `loop-action:${request.attemptId}` };
+  };
+
   const acknowledgeEffect = (effect: PipelineEffectIntent, eventId: string, payload: unknown): void => {
     deps.store.recordEffectAcknowledgement({
       effectId: effect.id,
@@ -306,8 +621,31 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       });
       return;
     }
-    const dispatched = await dispatch(instance, resource, request);
+    const stage = stageForAttempt(instance, request.stageId);
+    const dispatched = stage.executor.kind === "loop_action"
+      ? await drainLoopAttempt(instance, resource, request)
+      : await dispatch(instance, resource, request);
     acknowledgeEffect(effect, eventId, { providerResourceId: resource.providerResourceId, ...dispatched });
+  };
+
+  const drainActiveLoopAttempts = async (): Promise<void> => {
+    for (const attempt of deps.store.listActiveLoopActionAttempts()) {
+      const instance = deps.store.getInstance(attempt.pipeline_instance_id);
+      if (!instance) continue;
+      const binding = runtimeBindingFor(instance);
+      if (!binding.resource || binding.status !== "active") continue;
+      const request = deps.store.getStageRequest(attempt.id);
+      const plan = parseExecutionPlan(request.taskContext);
+      createLoopGraph(instance, request, plan);
+      await createUnitEffectProcessor({
+        store: deps.store,
+        runtime: unitRuntimeFor(binding.resource, request, plan),
+        leaseOwner: `pipeline-loop:${attempt.id}`,
+        now,
+        leaseMs: UNIT_EFFECT_LEASE_MS,
+      }).drain(attempt.id);
+      maybeEmitLoopAggregate(instance, request);
+    }
   };
 
   const handleStopEffect = async (
@@ -636,6 +974,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
           new Date(current.getTime() + EFFECT_LEASE_MS).toISOString()
         );
         await Promise.all(effects.map(processClaimed));
+        await drainActiveLoopAttempts();
       } finally {
         draining = false;
       }

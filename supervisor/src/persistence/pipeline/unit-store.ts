@@ -375,15 +375,54 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     db.prepare(`
       UPDATE execution_work_attempts
       SET status = 'completed', result_hash = ?, output_subject = ?,
+          native_session_id = COALESCE(?, native_session_id),
           completed_at = ?, updated_at = ?
       WHERE id = ? AND status IN ('leased', 'dispatched', 'running')
-    `).run(input.resultHash, input.outputSubject, timestamp, timestamp, input.actionId);
+    `).run(input.resultHash, input.outputSubject, input.nativeSessionId ?? null, timestamp, timestamp, input.actionId);
     db.prepare(`
       UPDATE execution_units
       SET status = 'integrated', active_work_attempt_id = NULL,
           accepted_candidate_subject = ?, integration_subject = ?, updated_at = ?
       WHERE id = ? AND active_work_attempt_id = ?
     `).run(input.outputSubject, input.outputSubject, timestamp, action.execution_unit_id, input.actionId);
+    return db.prepare("SELECT * FROM execution_work_attempts WHERE id = ?").get(input.actionId) as ExecutionWorkAttempt;
+  });
+
+  const failUnitAction = db.transaction((
+    input: Parameters<ExecutionUnitStore["failUnitAction"]>[0]
+  ): ExecutionWorkAttempt => {
+    const timestamp = now();
+    const action = db.prepare("SELECT * FROM execution_work_attempts WHERE id = ?")
+      .get(input.actionId) as ExecutionWorkAttempt | undefined;
+    if (!action) throw new Error(`unknown execution work attempt ${input.actionId}`);
+    if (action.status === "failed") return action;
+    if (!["leased", "dispatched", "running"].includes(action.status)) {
+      throw new Error(`execution work attempt ${input.actionId} is not active`);
+    }
+    db.prepare(`
+      UPDATE execution_work_attempts
+      SET status = 'failed', result_hash = ?, output_subject = ?,
+          native_session_id = COALESCE(?, native_session_id),
+          completed_at = ?, updated_at = ?, last_error = ?
+      WHERE id = ? AND status IN ('leased', 'dispatched', 'running')
+    `).run(
+      input.resultHash,
+      input.outputSubject ?? null,
+      input.nativeSessionId ?? null,
+      timestamp,
+      timestamp,
+      input.reason,
+      input.actionId
+    );
+    db.prepare(`
+      UPDATE execution_units
+      SET status = 'failed', terminal_level = 'failed', alarm = 1,
+          active_work_attempt_id = NULL,
+          integration_subject = COALESCE(?, integration_subject),
+          updated_at = ?
+      WHERE id = ? AND active_work_attempt_id = ?
+    `).run(input.outputSubject ?? null, timestamp, action.execution_unit_id, input.actionId);
+    settleStructurallyBlockedDependents(action.parent_attempt_id, timestamp);
     return db.prepare("SELECT * FROM execution_work_attempts WHERE id = ?").get(input.actionId) as ExecutionWorkAttempt;
   });
 
@@ -400,7 +439,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     }
     const unfinished = db.prepare(`
       SELECT 1 FROM execution_units
-      WHERE parent_attempt_id = ? AND status NOT IN ('integrated', 'completed', 'exited')
+      WHERE parent_attempt_id = ? AND status NOT IN ('integrated', 'completed', 'exited', 'failed')
       LIMIT 1
     `).get(input.parentAttemptId);
     if (unfinished) throw new Error(`execution graph ${graph.id} has unfinished units`);
@@ -613,6 +652,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       if (update.changes !== 1) throw new Error(`execution work attempt ${actionId} is not active`);
     },
     completeUnitAction,
+    failUnitAction,
     emitAggregateOnce,
     recordGateReceipt,
     listGateReceipts(parentAttemptId) {

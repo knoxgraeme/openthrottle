@@ -48,13 +48,17 @@ export interface StageExecutionResult {
 
 export interface RuntimeWorktreeHandle {
   id: string;
+  path?: string;
 }
 
 export interface LoopActionRequest {
   protocol: "loop-action@1";
   actionId: string;
   attemptId: string;
+  runId: string;
+  pipelineInstanceId: string;
   graphId: string;
+  graphDigest: string;
   unitId: string | null;
   role: "worker" | "lead" | "reviewer" | "publisher";
   loop: "implement" | "simplify" | "command" | "repair" | "lead" | "review" | "publish";

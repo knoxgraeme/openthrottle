@@ -7,7 +7,10 @@ export interface UnitEffectRuntime {
   }>;
   collectUnitAction(action: ExecutionWorkAttempt): Promise<{
     resultHash: string;
-    outputSubject: string;
+    outputSubject: string | null;
+    nativeSessionId?: string | null;
+    outcome?: "success" | "failure" | "needs_human" | "retryable_infrastructure_failure";
+    reason?: string;
   } | null>;
 }
 
@@ -38,11 +41,23 @@ export function createUnitEffectProcessor(input: {
       if (!requestlessDispatch) {
         const recovered = await input.runtime.collectUnitAction(action);
         if (recovered) {
-          input.store.completeUnitAction({
-            actionId: action.id,
-            resultHash: recovered.resultHash,
-            outputSubject: recovered.outputSubject,
-          });
+          if ((recovered.outcome ?? "success") === "success") {
+            if (!recovered.outputSubject) throw new Error(`unit action ${action.id} completed without an output subject`);
+            input.store.completeUnitAction({
+              actionId: action.id,
+              resultHash: recovered.resultHash,
+              outputSubject: recovered.outputSubject,
+              nativeSessionId: recovered.nativeSessionId ?? null,
+            });
+          } else {
+            input.store.failUnitAction({
+              actionId: action.id,
+              resultHash: recovered.resultHash,
+              outputSubject: recovered.outputSubject,
+              nativeSessionId: recovered.nativeSessionId ?? null,
+              reason: recovered.reason ?? `child action returned ${recovered.outcome}`,
+            });
+          }
           return action;
         }
       }

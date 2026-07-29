@@ -53,6 +53,7 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
   | "getRuntimeResource"
   | "setRuntimeResourceStatus"
   | "getActiveAttempt"
+  | "listActiveLoopActionAttempts"
   | "listProviderReadyInstances"
   | "listStages"
   | "listEffects"
@@ -588,6 +589,25 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
           AND psa.status IN ('pending', 'leased', 'dispatched', 'acknowledged', 'running')
         ORDER BY psa.reentry_ordinal DESC, psa.attempt_ordinal DESC LIMIT 1
       `).get(instanceId) as PipelineStageAttempt | undefined;
+    },
+    listActiveLoopActionAttempts(limit = 50) {
+      const rows = db.prepare(`
+        SELECT psa.*, pi.normalized_manifest
+        FROM pipeline_stage_attempts psa
+        JOIN pipeline_instances pi
+          ON pi.id = psa.pipeline_instance_id AND pi.active_stage_id = psa.stage_id
+        WHERE pi.status = 'running'
+          AND psa.status = 'running'
+        ORDER BY psa.updated_at, psa.id LIMIT ?
+      `).all(limit) as Array<PipelineStageAttempt & { normalized_manifest: string }>;
+      return rows.filter((row) => {
+        const manifest = JSON.parse(row.normalized_manifest) as {
+          stages?: Array<{ id?: unknown; executor?: { kind?: unknown } }>;
+        };
+        return manifest.stages?.some((stage) =>
+          stage.id === row.stage_id && stage.executor?.kind === "loop_action"
+        ) === true;
+      });
     },
     listProviderReadyInstances(limit = 50) {
       const instances = db.prepare(`
