@@ -29,6 +29,7 @@ function parseByName(name: string, raw: string): unknown {
 
 const invalidCases = [
   ["config-path-traversal.json", /ref: has an invalid format/],
+  ["config-provider-secret-env.json", /must not name a provider-secret identifier/],
   ["config-unknown-field.json", /unexpected: unknown field/],
   ["execution-plan-unknown-field.json", /inline_prompt: unknown field/],
   ["graph-dependency-cycle.json", /depends_on: creates a cycle/],
@@ -39,6 +40,7 @@ const invalidCases = [
   ["graph-excess-bounds.json", /max_parallel: must be an integer between 1 and 1/],
   ["graph-internal-node-kind.json", /nodes\[0\]\.kind: must be one of/],
   ["graph-loop-skill-not-allowed.json", /loops\.unit_loop\.skill: is not allowed by the worker/],
+  ["graph-provider-secret-credential.json", /credentials\[0\]: must be one of/],
   ["graph-skill-traversal.json", /workers\[0\]\.skills\[0\]: has an invalid format/],
   ["graph-unreachable-node.json", /nodes\.dead_command: is unreachable from entry_node/],
   ["graph-unknown-field.json", /prompt: unknown field/],
@@ -56,6 +58,13 @@ const invalidCases = [
 ] as const;
 
 describe("Stage C contract fixtures", () => {
+  it("keeps the committed repository bootstrap on all four npm projects", () => {
+    const config = readFileSync(new URL("../../.openthrottle.yml", import.meta.url), "utf8");
+    for (const project of ["contracts", "supervisor", "cli", "sandbox"]) {
+      expect(config).toContain(`npm ci --prefix ${project}`);
+    }
+  });
+
   it("accepts and normalizes the frozen valid corpora", () => {
     const fixtures = [
       "config-repository.json",
@@ -101,5 +110,69 @@ describe("Stage C contract fixtures", () => {
 
   it("routes every invalid corpus fixture through a parser", () => {
     expect(invalidFixtures()).toEqual(invalidCases.map(([fixture]) => fixture).sort());
+  });
+
+  it("validates graph command and MCP references against repository config", () => {
+    const config = parseRepositoryConfigContract(readFixture("valid", "config-repository.json"), { source: "config" });
+    config.value.mcp_servers = {
+      local: { command: "node", args: [], env: {} },
+    };
+    const graphRaw = readFixture("valid", "graph-structured.json");
+    const graph = JSON.parse(graphRaw) as {
+      workers: Array<Record<string, unknown>>;
+      loops: Array<Record<string, unknown>>;
+      nodes: Array<Record<string, unknown>>;
+    };
+    graph.nodes.push({
+      id: "test",
+      kind: "command",
+      command: "test",
+      depends_on: [],
+      transitions: { success: { terminal: "completed" } },
+    });
+    graph.nodes[0]!.transitions = {
+      ...(graph.nodes[0]!.transitions as Record<string, unknown>),
+      no_change: { to: "test" },
+    };
+    expect(() => parseGraphContract(JSON.stringify(graph), { source: "graph", config: config.value })).not.toThrow();
+
+    graph.nodes[2]!.command = "missing";
+    expect(() => parseGraphContract(JSON.stringify(graph), { source: "graph", config: config.value }))
+      .toThrow(/nodes\.test\.command: references an unknown repository command/);
+
+    graph.nodes[2]!.command = "test";
+    graph.workers[0]!.credentials = ["repo.read", "model.invoke", "mcp"];
+    graph.workers[0]!.allowed_mcp_servers = ["missing"];
+    expect(() => parseGraphContract(JSON.stringify(graph), { source: "graph", config: config.value }))
+      .toThrow(/workers\.implementer\.allowed_mcp_servers: references an unknown MCP server/);
+
+    graph.workers[0]!.credentials = ["repo.read", "model.invoke"];
+    graph.workers[0]!.allowed_mcp_servers = ["local"];
+    expect(() => parseGraphContract(JSON.stringify(graph), { source: "graph", config: config.value }))
+      .toThrow(/workers\.implementer\.allowed_mcp_servers: requires the mcp credential scope/);
+
+    graph.workers[0]!.allowed_mcp_servers = [];
+    graph.loops[0]!.worker = "missing";
+    expect(() => parseGraphContract(JSON.stringify(graph), { source: "graph", config: config.value }))
+      .toThrow(/loops\.unit_loop\.worker: references an unknown worker/);
+  });
+
+  it("rejects provider-secret identifiers in config values and headers", () => {
+    const config = JSON.parse(readFixture("valid", "config-repository.json")) as {
+      mcp_servers: Record<string, unknown>;
+    };
+    config.mcp_servers.local = {
+      command: "node",
+      env: { SAFE_ENV: "${GITHUB_TOKEN}" },
+    };
+    expect(() => parseRepositoryConfigContract(JSON.stringify(config), { source: "config" }))
+      .toThrow(/mcp_servers\.local\.env\.SAFE_ENV: must not name a provider-secret identifier/);
+
+    config.mcp_servers.local = {
+      url: "https://mcp.example.test",
+      headers: { Authorization: "Bearer ${OT_STATUS_TOKEN}" },
+    };
+    expect(() => parseRepositoryConfigContract(JSON.stringify(config), { source: "config" }))
+      .toThrow(/mcp_servers\.local\.headers\.Authorization: must not name a provider-secret identifier/);
   });
 });

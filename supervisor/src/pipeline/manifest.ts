@@ -1,6 +1,12 @@
-import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import {
+  canonicalJson as sharedCanonicalJson,
+  digestNormalized as sharedDigestNormalized,
+  validateRepositoryConfigContract,
+  type ConfigGraphSource,
+  type ConfigMcpServer,
+} from "@openthrottle/contracts";
 import { parseDocument } from "yaml";
 
 export const STAGE_OUTCOMES = [
@@ -141,8 +147,12 @@ export interface ValidatedPipelineCatalog {
 }
 
 export interface RepositoryPipelineConfig {
+  schema: "openthrottle.config/v1";
+  default_graph: string;
+  graphs: ConfigGraphSource[];
   agent?: "claude" | "codex" | "opencode";
   model?: string;
+  commands?: Record<string, string>;
   test?: string;
   lint?: string;
   build?: string;
@@ -150,8 +160,12 @@ export interface RepositoryPipelineConfig {
   format?: string;
   post_bootstrap?: string[];
   limits?: { max_turns?: number; task_timeout?: number };
-  mcp_servers?: Record<string, unknown>;
-  pipelines?: { implement?: string; investigate?: string };
+  mcp_servers?: Record<string, ConfigMcpServer>;
+  pipelines?: Record<string, string>;
+  intents?: Record<string, {
+    default_graph: string;
+    allowed_graphs: string[];
+  }>;
 }
 
 export interface ValidatedRepositoryConfig {
@@ -162,8 +176,6 @@ export interface ValidatedRepositoryConfig {
 
 const IDENTIFIER = /^[a-z][a-z0-9]*(?:[._/-][a-z0-9]+)*$/;
 const CAPABILITY = /^[a-z][a-z0-9]*(?:[._:/-][a-z0-9]+)*@\d+$/;
-const SHA256 = /^[a-f0-9]{64}$/;
-
 function fail(path: string, message: string): never {
   throw new Error(`${path}: ${message}`);
 }
@@ -232,24 +244,12 @@ function parseYaml(raw: string, source: string): unknown {
   return document.toJS({ maxAliasCount: 0 });
 }
 
-function canonicalValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonicalValue);
-  if (value && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>)
-        .sort(([left], [right]) => left.localeCompare(right))
-        .map(([key, child]) => [key, canonicalValue(child)])
-    );
-  }
-  return value;
-}
-
 export function canonicalJson(value: unknown): string {
-  return JSON.stringify(canonicalValue(value));
+  return sharedCanonicalJson(value);
 }
 
 export function digestNormalized(normalized: string): string {
-  return createHash("sha256").update(normalized).digest("hex");
+  return sharedDigestNormalized(normalized);
 }
 
 export function isPipelineReentry(manifest: PipelineManifest, stageId: string, targetId: string): boolean {
@@ -597,106 +597,28 @@ export function loadPipelineCatalog(
   return { aliases, manifests, normalized, digest: digestNormalized(normalized) };
 }
 
-function boundedCommand(value: unknown, path: string): string {
-  return stringAt(value, path, { max: 2_000 });
-}
-
-function boundedStringMap(value: unknown, path: string): Record<string, string> {
-  const input = objectAt(value, path);
-  if (Object.keys(input).length > 32) fail(path, "must contain at most 32 entries");
-  const output: Record<string, string> = {};
-  for (const [key, entry] of Object.entries(input)) {
-    if (!/^[A-Za-z_][A-Za-z0-9_.-]{0,79}$/.test(key)) fail(`${path}.${key}`, "has an invalid name");
-    output[key] = stringAt(entry, `${path}.${key}`, { max: 2_000 });
-  }
-  return output;
-}
-
-function mcpServersAt(value: unknown, path: string): Record<string, unknown> {
-  const input = objectAt(value, path);
-  if (Object.keys(input).length > 20) fail(path, "must contain at most 20 servers");
-  const output: Record<string, unknown> = {};
-  for (const [name, raw] of Object.entries(input)) {
-    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$/.test(name)) fail(`${path}.${name}`, "has an invalid server name");
-    const server = objectAt(raw, `${path}.${name}`, ["command", "args", "env", "url", "headers", "enabled"]);
-    const hasCommand = server.command !== undefined;
-    const hasUrl = server.url !== undefined;
-    if (hasCommand === hasUrl) fail(`${path}.${name}`, "must define exactly one of command or url");
-    const normalized: Record<string, unknown> = {};
-    if (hasCommand) {
-      normalized.command = boundedCommand(server.command, `${path}.${name}.command`);
-      normalized.args = server.args === undefined ? [] : arrayAt(
-        server.args,
-        `${path}.${name}.args`,
-        boundedCommand,
-        { max: 32 }
-      );
-      normalized.env = server.env === undefined ? {} : boundedStringMap(server.env, `${path}.${name}.env`);
-      if (server.headers !== undefined) fail(`${path}.${name}.headers`, "is valid only for a remote server");
-    } else {
-      const url = stringAt(server.url, `${path}.${name}.url`, { max: 2_000 });
-      try {
-        if (!/^https?:$/.test(new URL(url).protocol)) throw new Error("unsupported protocol");
-      } catch {
-        fail(`${path}.${name}.url`, "must be an absolute HTTP(S) URL");
-      }
-      normalized.url = url;
-      normalized.headers = server.headers === undefined
-        ? {}
-        : boundedStringMap(server.headers, `${path}.${name}.headers`);
-      if (server.args !== undefined || server.env !== undefined) {
-        fail(`${path}.${name}`, "args and env are valid only for a local server");
-      }
-    }
-    normalized.enabled = server.enabled === undefined
-      ? true
-      : booleanAt(server.enabled, `${path}.${name}.enabled`);
-    output[name] = normalized;
-  }
-  return output;
-}
-
 export function parseRepositoryConfig(raw: string, source = ".openthrottle.yml"): ValidatedRepositoryConfig {
-  const input = objectAt(parseYaml(raw, source), source, [
-    "agent", "model", "test", "lint", "build", "dev", "format",
-    "post_bootstrap", "limits", "mcp_servers", "pipelines",
-  ]);
-  const config: RepositoryPipelineConfig = {};
-  if (input.agent !== undefined) config.agent = enumAt(input.agent, `${source}.agent`, ["claude", "codex", "opencode"] as const);
-  if (input.model !== undefined) {
-    config.model = stringAt(input.model, `${source}.model`, {
-      max: 160,
-      pattern: /^[A-Za-z0-9][A-Za-z0-9._/-]*$/,
-    });
-  }
-  for (const key of ["test", "lint", "build", "dev", "format"] as const) {
-    if (input[key] !== undefined) config[key] = boundedCommand(input[key], `${source}.${key}`);
-  }
-  if (input.post_bootstrap !== undefined) {
-    config.post_bootstrap = arrayAt(input.post_bootstrap, `${source}.post_bootstrap`, boundedCommand, { max: 20 });
-  }
-  if (input.limits !== undefined) {
-    const limits = objectAt(input.limits, `${source}.limits`, ["max_turns", "task_timeout"]);
-    config.limits = {};
-    if (limits.max_turns !== undefined) config.limits.max_turns = integerAt(limits.max_turns, `${source}.limits.max_turns`, 1, 1_000);
-    if (limits.task_timeout !== undefined) config.limits.task_timeout = integerAt(limits.task_timeout, `${source}.limits.task_timeout`, 1, 86_400);
-  }
-  if (input.mcp_servers !== undefined) {
-    config.mcp_servers = mcpServersAt(input.mcp_servers, `${source}.mcp_servers`);
-  }
-  if (input.pipelines !== undefined) {
-    const pipelines = objectAt(input.pipelines, `${source}.pipelines`, ["implement", "investigate"]);
-    config.pipelines = {};
-    for (const intent of ["implement", "investigate"] as const) {
-      if (pipelines[intent] !== undefined) {
-        config.pipelines[intent] = stringAt(pipelines[intent], `${source}.pipelines.${intent}`, { max: 120, pattern: /^[a-z][a-z0-9]*(?:[._/@-][a-z0-9]+)*$/ });
-      }
-    }
-  }
-  const normalized = canonicalJson(config);
-  const digest = digestNormalized(normalized);
-  if (!SHA256.test(digest)) throw new Error("repository config digest invariant failed");
-  return { config, normalized, digest };
+  const validated = validateRepositoryConfigContract(parseYaml(raw, source), { source });
+  const value = validated.value;
+  const config: RepositoryPipelineConfig = {
+    schema: value.schema,
+    default_graph: value.default_graph,
+    graphs: value.graphs,
+    ...(value.agent === undefined ? {} : { agent: enumAt(value.agent, `${source}.agent`, ["claude", "codex", "opencode"] as const) }),
+    ...(value.model === undefined ? {} : { model: value.model }),
+    ...(value.commands === undefined ? {} : { commands: value.commands }),
+    ...(value.test === undefined ? {} : { test: value.test }),
+    ...(value.lint === undefined ? {} : { lint: value.lint }),
+    ...(value.build === undefined ? {} : { build: value.build }),
+    ...(value.dev === undefined ? {} : { dev: value.dev }),
+    ...(value.format === undefined ? {} : { format: value.format }),
+    ...(value.post_bootstrap === undefined ? {} : { post_bootstrap: value.post_bootstrap }),
+    ...(value.limits === undefined ? {} : { limits: value.limits }),
+    ...(value.mcp_servers === undefined ? {} : { mcp_servers: value.mcp_servers }),
+    ...(value.pipelines === undefined ? {} : { pipelines: value.pipelines }),
+    ...(value.intents === undefined ? {} : { intents: value.intents }),
+  };
+  return { config, normalized: validated.normalized, digest: validated.digest };
 }
 
 export function resolvePipelineReference(

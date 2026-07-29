@@ -85,7 +85,7 @@ export function createCatalogStore(db: Database.Database, now: () => string): Pi
     baseCommit: string;
     blobSha: string;
     config: ValidatedRepositoryConfig;
-  }): RepositoryConfigSnapshot => {
+    }): RepositoryConfigSnapshot => {
     assertDigest("repository config", input.config.normalized, input.config.digest);
     if (canonicalJson(input.config.config) !== input.config.normalized) {
       throw new Error("repository config normalized content mismatch");

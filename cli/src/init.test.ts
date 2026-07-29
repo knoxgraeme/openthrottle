@@ -59,15 +59,19 @@ describe("init project detection", () => {
     );
     const contents = readFileSync(join(directory, ".openthrottle.yml"), "utf8");
     expect(parse(contents)).toMatchObject({
+      schema: "openthrottle.config/v1",
+      default_graph: "simple",
+      graphs: [{ id: "simple", kind: "builtin", ref: "core/simple@1" }],
       agent: "claude",
+      commands: { test: "npm test" },
       test: "npm test",
+      intents: {
+        implement: { default_graph: "simple", allowed_graphs: ["simple"] },
+        investigate: { default_graph: "simple", allowed_graphs: ["simple"] },
+      },
     });
     expect(contents).not.toContain("base_branch");
     expect(contents).not.toContain("build:");
-    expect(contents).not.toContain("schema:");
-    expect(contents).not.toContain("default_graph:");
-    expect(contents).not.toContain("graphs:");
-    expect(contents).not.toContain("intents:");
   });
 
   it("writes the model for any agent when set and omits it when blank", () => {

@@ -8,9 +8,9 @@ import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 const catalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
 const simpleGraphPath = fileURLToPath(new URL("../../graphs/simple-v1.json", import.meta.url));
 const investigateGraphPath = fileURLToPath(new URL("../../graphs/investigate-v1.json", import.meta.url));
-const SIMPLE_GRAPH_DIGEST = "69c1bd8143b14bd590fbeaa9c9bf5ee1fbcf1e22ff1424ae24173b5947aceeb6";
+const SIMPLE_GRAPH_DIGEST = "2f25ae9b891405d0e73e5f3c0f103354183c8cb27ca923cbd06baa6c470b76d1";
 const SIMPLE_MANIFEST_DIGEST = "9b705c003313187cb2f7e219c99e1cbf795d966be0e1d257015462219833ac6a";
-const INVESTIGATE_GRAPH_DIGEST = "2b0cb5b2e54504808af4d39496fc9b130320146f903c40a84537d62ec7465223";
+const INVESTIGATE_GRAPH_DIGEST = "a76d3e1360d92f41bc7aa9ed2372e294555478d5854808bf0c2a5ed7febaf317";
 const INVESTIGATE_MANIFEST_DIGEST = "d159ef720f5dbc7216b8dd502e3961ac30ffb2c4d4ea44a5afdc71a78f84da4e";
 
 function shippedManifest(reference: string): PipelineManifest {

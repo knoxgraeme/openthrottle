@@ -363,19 +363,47 @@ describe("pipeline manifest validation", () => {
 
   it("accepts only bounded repository settings and canonical pipeline selections", () => {
     const parsed = parseRepositoryConfig(`
+schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
 agent: codex
+commands:
+  test: npm test --prefix supervisor
 test: npm test --prefix supervisor
 limits: { max_turns: 20, task_timeout: 300 }
 pipelines: { implement: implement, investigate: core/investigate@2 }
 mcp_servers: {}
+intents:
+  implement: { default_graph: simple, allowed_graphs: [simple] }
+  investigate: { default_graph: simple, allowed_graphs: [simple] }
 `);
     expect(parsed.config.pipelines).toEqual({
       implement: "implement",
       investigate: "core/investigate@2",
     });
     expect(parseRepositoryConfig(parsed.normalized.replace(/^/, "")).digest).toBe(parsed.digest);
-    expect(() => parseRepositoryConfig("pipeline_logic: !!js/function evil")).toThrow();
-    expect(() => parseRepositoryConfig("limits: { task_timeout: 999999 }")).toThrow(/between 1 and 86400/);
-    expect(() => parseRepositoryConfig("mcp_servers: { local: { command: node, surprise: true } }")).toThrow(/unknown field/);
+    expect(() => parseRepositoryConfig("pipelines: { implement: implement }\n"))
+      .toThrow(/schema: must be openthrottle\.config\/v1/);
+    expect(() => parseRepositoryConfig(`
+schema: openthrottle.config/v1
+default_graph: simple
+graphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]
+pipeline_logic: !!js/function evil
+`)).toThrow();
+    expect(() => parseRepositoryConfig(`
+schema: openthrottle.config/v1
+default_graph: simple
+graphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]
+limits: { task_timeout: 999999 }
+`)).toThrow(/between 1 and 86400/);
+    expect(() => parseRepositoryConfig(`
+schema: openthrottle.config/v1
+default_graph: simple
+graphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]
+mcp_servers: { local: { command: node, surprise: true } }
+`)).toThrow(/unknown field/);
   });
 });

@@ -195,6 +195,64 @@ describe("plan validation", () => {
     expect(() => validateLocalGraphSelection({ directory, graphId: "missing" })).toThrow(/not allowed/);
   });
 
+  it("rejects repository graphs that reference missing configured commands or MCP servers", () => {
+    const directory = temporaryProject();
+    mkdirSync(join(directory, ".openthrottle", "graphs"), { recursive: true });
+    const baseConfig: {
+      schema: string;
+      default_graph: string;
+      graphs: Array<{ id: string; kind: string; ref: string }>;
+      intents: Record<string, { default_graph: string; allowed_graphs: string[] }>;
+      commands: Record<string, string>;
+      mcp_servers: Record<string, unknown>;
+    } = {
+      schema: "openthrottle.config/v1",
+      default_graph: "structured",
+      graphs: [
+        { id: "structured", kind: "repository", ref: ".openthrottle/graphs/structured.json" },
+      ],
+      intents: {
+        implement: { default_graph: "structured", allowed_graphs: ["structured"] },
+      },
+      commands: { test: "npm test" },
+      mcp_servers: {},
+    };
+    writeFileSync(join(directory, ".openthrottle.yml"), stringify(baseConfig));
+    const graph = JSON.parse(
+      readFileSync(new URL("../../contracts/fixtures/valid/graph-structured.json", import.meta.url), "utf8")
+    ) as {
+      workers: Array<Record<string, unknown>>;
+      nodes: Array<Record<string, unknown>>;
+    };
+    graph.nodes.push({
+      id: "missing_command",
+      kind: "command",
+      command: "lint",
+      depends_on: [],
+      transitions: { success: { terminal: "completed" } },
+    });
+    graph.nodes[0]!.transitions = {
+      ...(graph.nodes[0]!.transitions as Record<string, unknown>),
+      no_change: { to: "missing_command" },
+    };
+    writeFileSync(join(directory, ".openthrottle", "graphs", "structured.json"), JSON.stringify(graph));
+    expect(() => validateLocalGraphSelection({ directory })).toThrow(/unknown repository command/);
+
+    graph.nodes[2]!.command = "test";
+    graph.workers[0]!.credentials = ["repo.read", "model.invoke", "mcp"];
+    graph.workers[0]!.allowed_mcp_servers = ["missing"];
+    writeFileSync(join(directory, ".openthrottle", "graphs", "structured.json"), JSON.stringify(graph));
+    expect(() => validateLocalGraphSelection({ directory })).toThrow(/unknown MCP server/);
+
+    baseConfig.commands = { deploy: "npm run deploy" };
+    graph.nodes[2]!.command = "deploy";
+    graph.workers[0]!.credentials = ["repo.read", "model.invoke"];
+    graph.workers[0]!.allowed_mcp_servers = [];
+    writeFileSync(join(directory, ".openthrottle.yml"), stringify(baseConfig));
+    writeFileSync(join(directory, ".openthrottle", "graphs", "structured.json"), JSON.stringify(graph));
+    expect(() => validateLocalGraphSelection({ directory })).toThrow(/must be one of: test, lint, build, format/);
+  });
+
   it("requires the execution block to match the selected graph", () => {
     const directory = temporaryProject();
     const planPath = join(directory, "plan.md");

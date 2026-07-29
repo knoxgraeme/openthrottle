@@ -15,9 +15,12 @@ export {
   parseRepositoryConfigContract,
   validateRepositoryConfigContract,
   type ConfigGraphSource,
+  type ConfigLimits,
+  type ConfigMcpServer,
   type RepositoryConfigContract,
 } from "./config.js";
 export {
+  AGENT_INHERITANCE,
   GRAPH_SCHEMA,
   GRAPH_OUTCOMES,
   INPUT_SCOPES,
@@ -33,6 +36,7 @@ export {
   type GraphNode,
   type GraphTransition,
   type GraphWorker,
+  type AgentInheritance,
 } from "./graph.js";
 export {
   EXECUTION_PLAN_SCHEMA,

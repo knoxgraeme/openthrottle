@@ -60,7 +60,7 @@ export function setupPipelineStore(dbPath = ":memory:", selectedCatalogPath = ca
   const catalog = loadPipelineCatalog(selectedCatalogPath, runtime.descriptor);
   pipelines.acceptRuntimeDescriptor(runtime);
   pipelines.acceptCatalog(catalog);
-  const config = parseRepositoryConfig("pipelines: { implement: implement }\n");
+  const config = parseRepositoryConfig("schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]\npipelines: { implement: implement }\n");
   const snapshot = pipelines.saveRepositoryConfigSnapshot({
     repository: "owner/repo",
     baseCommit: "a".repeat(40),
