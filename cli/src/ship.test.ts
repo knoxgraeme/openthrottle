@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { stringify } from "yaml";
-import ship, { SHIP_SELECTION_FENCE, delegateIssue, parseMarkdown, parseShipArgs, validateGraphSelectionForShip } from "./ship.js";
+import ship, { SHIP_SELECTION_FENCE, buildShipDescription, delegateIssue, parseMarkdown, parseShipArgs, validateGraphSelectionForShip } from "./ship.js";
 
 const directories: string[] = [];
 
@@ -68,16 +68,27 @@ describe("ship", () => {
     expect(() => parseShipArgs(["plan.md", "--graph"])).toThrow(/requires/);
   });
 
+  it("persists an explicit simple graph selection while leaving implicit simple unchanged", () => {
+    expect(buildShipDescription("Plan body")).toBe("Plan body");
+    expect(readShipSelection(buildShipDescription("Plan body", "simple"))).toEqual({
+      schema: SHIP_SELECTION_FENCE,
+      graph_id: "simple",
+    });
+  });
+
   it("validates structured graph selections and matching execution plans", () => {
     const directory = temporaryProject();
     writeStructuredConfig(directory);
     const planPath = join(directory, "plan.md");
-    writeFileSync(planPath, `# Ship it\n\n${executionPlanBlock("structured")}`);
+    writeFileSync(planPath, "# Ship it\n\nPlan body");
     const previousCwd = process.cwd();
     try {
       process.chdir(directory);
       expect(() => validateGraphSelectionForShip(planPath, undefined)).not.toThrow();
       expect(() => validateGraphSelectionForShip(planPath, "simple")).not.toThrow();
+
+      writeFileSync(planPath, `# Ship it\n\n${executionPlanBlock("structured")}`);
+      expect(() => validateGraphSelectionForShip(planPath, "simple")).toThrow(/graph_id must match/);
       expect(() => validateGraphSelectionForShip(planPath, "structured")).not.toThrow();
 
       writeFileSync(planPath, `# Ship it\n\n${executionPlanBlock("other")}`);
@@ -103,6 +114,8 @@ describe("ship", () => {
     try {
       process.chdir(directory);
       await expect(ship([planPath, "--graph", "structured"])).rejects.toThrow(/exit 1/);
+      writeFileSync(planPath, `# Ship it\n\n${executionPlanBlock("structured")}`);
+      await expect(ship([planPath, "--graph", "simple"])).rejects.toThrow(/exit 1/);
       expect(fetchMock).not.toHaveBeenCalled();
     } finally {
       process.chdir(previousCwd);
