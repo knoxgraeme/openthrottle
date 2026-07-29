@@ -360,6 +360,34 @@ intents:
     });
   });
 
+
+  it("resolves the configured structured default without an explicit graph marker", async () => {
+    const { pipelines } = await run(
+      `schema: openthrottle.config/v1
+default_graph: structured
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: structured
+    kind: builtin
+    ref: core/structured@1
+pipelines: { implement: implement, structured: fixture-command }
+intents:
+  implement:
+    default_graph: structured
+    allowed_graphs: [simple, structured]
+`,
+      { codexAuthJson: undefined, claudeCodeOauthToken: undefined, kimiCodeApiKey: undefined },
+      fixtureCatalogPath
+    );
+
+    expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
+      pipeline_id: "fixture/command",
+      pipeline_version: 2,
+    });
+  });
+
   async function expectSelectionFailure(context: string, expectedMessage: string) {
     const { tickets } = await run(
       `schema: openthrottle.config/v1
@@ -396,6 +424,17 @@ intents:
   it("fails closed before provisioning for malformed shipped graph selections", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "structured";
+    await expectSelectionFailure(
+      [
+        "# Structured work",
+        "",
+        "```json openthrottle.ship-selection/v1",
+        JSON.stringify({ graph_id: "structured" }),
+        "```",
+      ].join("\n"),
+      "openthrottle.ship-selection/v1.schema: must be openthrottle.ship-selection/v1"
+    );
+
     await expectSelectionFailure(
       [
         "# Structured work",
