@@ -193,7 +193,7 @@ async function promptConfig(detected: Detected, target: RepositoryTarget): Promi
   return {
     project: {
       agent: result.agent as "claude" | "codex" | "opencode",
-      model: result.model.trim() ? result.model.trim() : undefined,
+      model: typeof result.model === "string" && result.model.trim() ? result.model.trim() : undefined,
       test: result.test,
       build: result.build,
       lint: result.lint,
