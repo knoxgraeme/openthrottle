@@ -14,9 +14,23 @@ export const LOOP_ACTION_PROTOCOL = "loop-action@1";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 const AGENTS = new Set(["claude", "codex", "opencode"]);
-const ROLES = new Set(["worker", "lead", "reviewer"]);
-const LOOPS = new Set(["implement", "simplify", "command", "repair", "lead", "review"]);
-const SKILLS = new Set(["implement-plan", "investigate", "ce-work", "ce-simplify-code", "ce-code-review"]);
+const ROLES = new Set(["worker", "lead", "reviewer", "publisher"]);
+const LOOPS = new Set(["implement", "simplify", "command", "repair", "lead", "review", "publish"]);
+const SKILLS = new Set([
+  "implement-plan",
+  "investigate",
+  "implement-unit",
+  "simplify-unit",
+  "repair-unit",
+  "accept-unit",
+  "final-review",
+  "final-repair",
+  "publish",
+  "ce-work",
+  "ce-simplify-code",
+  "ce-code-review",
+  "ce-commit-push-pr",
+]);
 const CONTEXTS = new Set(["fresh", "resume_required", "prefer_resume"]);
 
 function record(value, label) {

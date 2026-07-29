@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import { RUNTIME_DESCRIPTOR } from "./capabilities.mjs";
 import {
   buildCommandArtifacts,
+  buildStandardReceiptArtifacts,
   buildSemanticArtifacts,
   digest,
+  validateStandardReceipt,
   validateSemanticProposal,
 } from "./artifacts.mjs";
 
@@ -108,5 +110,90 @@ describe("normalized stage artifacts", () => {
     expect(result.result).toBe("retryable_infrastructure_failure");
     expect(result.details.command_digest).toBe(digest("npm test"));
     expect(result.details.exit_code).toBe(137);
+  });
+
+  it("validates standard receipts without semantic assurance upgrades", () => {
+    const receipt = {
+      schema: "openthrottle.receipt/v1",
+      type: "unit_decision",
+      assurance: "semantic_attested",
+      result: "accept",
+      producer: {
+        worker_id: "lead-1",
+        skill: "builtin://accept-unit@1",
+        capability_digest: "e".repeat(64),
+      },
+      subject: { base: "1".repeat(40), pre: "1".repeat(40), post: "2".repeat(40) },
+      fence: {
+        pipeline_instance_id: "pipeline-1",
+        graph_digest: "f".repeat(64),
+        unit_id: "unit-1",
+        attempt_id: "attempt-1",
+        request_hash: "a".repeat(64),
+      },
+      evidence: ["candidate-evidence"],
+      payload: {
+        rationale: "Matches the assigned unit scope.",
+        context_updates: [],
+        accepted_subject: "2".repeat(40),
+      },
+      issued_at: "2026-07-29T00:00:00.000Z",
+    };
+
+    expect(validateStandardReceipt(receipt, {})).toMatchObject({
+      type: "unit_decision",
+      assurance: "semantic_attested",
+      result: "accept",
+    });
+    expect(() => validateStandardReceipt({ ...receipt, assurance: "executor_verified" }, {}))
+      .toThrow(/semantic standard receipt cannot claim/);
+
+    const artifacts = buildStandardReceiptArtifacts({
+      receipt,
+      fence: {
+        ...fence,
+        capability: "agent/semantic@1",
+        subject: "2".repeat(40),
+        preSubject: "1".repeat(40),
+        postSubject: "2".repeat(40),
+      },
+      env: {},
+    });
+    expect(artifacts.map((artifact) => artifact.kind)).toEqual(["stage_result", "standard_receipt"]);
+    expect(JSON.parse(artifacts[1].payload).details.receipt.result).toBe("accept");
+  });
+
+  it("maps every standard receipt result to a stage outcome", () => {
+    const baseReceipt = {
+      schema: "openthrottle.receipt/v1",
+      assurance: "human_approved",
+      producer: {
+        worker_id: "human-1",
+        skill: "builtin://human-approval@1",
+        capability_digest: "e".repeat(64),
+      },
+      subject: { base: "1".repeat(40), pre: "1".repeat(40), post: "1".repeat(40) },
+      fence: {
+        pipeline_instance_id: "pipeline-1",
+        graph_digest: "f".repeat(64),
+        unit_id: "unit-1",
+        attempt_id: "attempt-1",
+        request_hash: "a".repeat(64),
+      },
+      evidence: ["approval"],
+      payload: { approver: "person", rationale: "Rejected." },
+      issued_at: "2026-07-29T00:00:00.000Z",
+    };
+
+    const [stageResult] = buildStandardReceiptArtifacts({
+      receipt: { ...baseReceipt, type: "human_approval", result: "rejected" },
+      fence: {
+        ...fence,
+        capability: "agent/semantic@1",
+      },
+      env: {},
+    });
+
+    expect(JSON.parse(stageResult.payload).result).toBe("failure");
   });
 });
