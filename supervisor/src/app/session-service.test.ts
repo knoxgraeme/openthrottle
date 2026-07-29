@@ -319,7 +319,7 @@ mcp_servers: {}
     expect(payloads.some((entry) => entry.includes("unknown pipeline selection"))).toBe(true);
   });
 
-  it("uses a shipped structured graph selection to choose the graph-specific pipeline", async () => {
+  it("uses the graph-specific pipeline even when structured is the configured default", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "structured";
     const context = [
@@ -335,7 +335,7 @@ mcp_servers: {}
     ].join("\n");
     const { pipelines } = await run(
       `schema: openthrottle.config/v1
-default_graph: simple
+default_graph: structured
 graphs:
   - id: simple
     kind: builtin
@@ -346,7 +346,7 @@ graphs:
 pipelines: { implement: implement, structured: fixture-command }
 intents:
   implement:
-    default_graph: simple
+    default_graph: structured
     allowed_graphs: [simple, structured]
 `,
       { codexAuthJson: undefined, claudeCodeOauthToken: undefined, kimiCodeApiKey: undefined },
