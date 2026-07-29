@@ -384,6 +384,37 @@ function failureProposal(summary, suggestedOutcome = "retryable_infrastructure_f
   };
 }
 
+function isCodexModelCredentialExpired(agent, diagnostic) {
+  if (agent !== "codex") return false;
+  const normalized = String(diagnostic ?? "").toLowerCase();
+  if (!/\b401\b/.test(normalized)) return false;
+  const hasAuthFailure = normalized.includes("unauthorized") ||
+    normalized.includes("refresh_token_invalidated") ||
+    normalized.includes("your session has ended");
+  const hasCodexRefreshSignal = normalized.includes("refresh_token_invalidated") ||
+    normalized.includes("your session has ended") ||
+    normalized.includes("/backend-api/codex/responses");
+  return hasAuthFailure && hasCodexRefreshSignal;
+}
+
+export function classifyAgentExecutionFailure({ agent, termination, diagnostic, terminated, missingProposal = false }) {
+  if (isCodexModelCredentialExpired(agent, diagnostic)) {
+    return {
+      suggestedOutcome: "retryable_infrastructure_failure",
+      summary:
+        `Model credential expired - refresh CODEX_AUTH_JSON. Agent stage failed (${termination}).` +
+        (diagnostic ? ` Executor diagnostic: ${diagnostic}` : ""),
+    };
+  }
+  return {
+    suggestedOutcome: terminated ? "retryable_infrastructure_failure" : "failure",
+    summary:
+      `${missingProposal ? "Agent exited without the required terminal stage proposal" : "Agent stage failed"} ` +
+      `(${termination}).` +
+      (diagnostic ? ` Executor diagnostic: ${diagnostic}` : ""),
+  };
+}
+
 function reconcilePublication({ repoDir, request, gatedSubject, execution, proposal, redactionEnv }) {
   const incompleteExecution = execution.executorFailure || execution.timedOut || execution.exitCode !== 0 || !proposal;
   let normalizedProposal;
@@ -614,11 +645,14 @@ export function executeStage({
         execution.signal ? `signal=${execution.signal}` : null,
         execution.timedOut ? "timed_out=true" : null,
       ].filter(Boolean).join(", ");
-      proposal = failureProposal(
-        `${!proposal ? "Agent exited without the required terminal stage proposal" : "Agent stage failed"} (${termination}).` +
-          (diagnostic ? ` Executor diagnostic: ${diagnostic}` : ""),
-        terminated ? "retryable_infrastructure_failure" : "failure",
-      );
+      const classified = classifyAgentExecutionFailure({
+        agent: request.agent,
+        termination,
+        diagnostic,
+        terminated,
+        missingProposal: !proposal,
+      });
+      proposal = failureProposal(classified.summary, classified.suggestedOutcome);
     }
     const completedAt = now();
     const fence = {

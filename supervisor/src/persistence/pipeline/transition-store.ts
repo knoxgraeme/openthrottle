@@ -65,9 +65,13 @@ export function createTransitionStore(db: Database.Database, now: () => string):
     const uncertainty = Array.isArray(payload.uncertainty)
       ? payload.uncertainty.filter((item): item is string => typeof item === "string").slice(0, 10)
       : [];
+    const operatorCredentialSignal = write.outcome === "retryable_infrastructure_failure" &&
+      /model credential expired/i.test(summary) &&
+      /CODEX_AUTH_JSON/.test(summary);
     const notable = attempt.stage_id.startsWith("repair_") ||
       uncertainty.length > 0 ||
-      write.outcome === "no_change";
+      write.outcome === "no_change" ||
+      operatorCredentialSignal;
     if (!notable) return;
     const note = [
       summary,

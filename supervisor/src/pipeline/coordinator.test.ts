@@ -373,6 +373,30 @@ describe("pipeline coordinator", () => {
       .filter((entry) => entry.kind === "run_note")).toEqual([]);
   });
 
+  it("projects Codex model credential failures into run notes", () => {
+    const { pipelines, instance, attempt } = setup("core/implement@4");
+    const result = coordinatePipelineEvent(pipelines, stageResultEvent({
+      instance,
+      attempt,
+      id: "codex-model-auth-expired",
+      outcome: "retryable_infrastructure_failure",
+      summary: "Model credential expired - refresh CODEX_AUTH_JSON. Agent stage failed (exit=1).",
+    }));
+
+    expect(result.active_stage_id).toBe("implementation");
+    const notes = pipelines.listJournalEntries({ issueId: instance.linear_issue_id })
+      .filter((entry) => entry.kind === "run_note");
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toMatchObject({
+      actor: "stage_agent",
+      outcome: "retryable_infrastructure_failure",
+    });
+    expect(notes[0].note).toContain("Model credential expired - refresh CODEX_AUTH_JSON");
+    expect(JSON.parse(notes[0].structured!)).toMatchObject({
+      suggested_outcome: "retryable_infrastructure_failure",
+    });
+  });
+
   it("rolls back every transition write boundary and recovers one complete intent set", () => {
     const { pipelines, instance, attempt } = setup();
     const input = event(instance, attempt, "success", "fault-event");
