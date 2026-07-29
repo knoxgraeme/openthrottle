@@ -8,7 +8,7 @@
 
 import { readFileSync, existsSync } from 'node:fs';
 import * as p from '@clack/prompts';
-import { validatePlanFileForGraph } from './plan.js';
+import { extractExecutionPlanBlocks, readExecutionPlanFromMarkdown, validatePlanFileForGraph } from './plan.js';
 import { getErrorMessage, readEnv, requireEnv, linearGraphQL } from './util.js';
 
 export const SHIP_SELECTION_FENCE = "openthrottle.ship-selection/v1";
@@ -49,7 +49,16 @@ export function parseShipArgs(args: string[]): { file?: string; graphId?: string
 }
 
 export function validateGraphSelectionForShip(file: string, graphId?: string): void {
-  if (!graphId || graphId === "simple") return;
+  if (!graphId) return;
+  if (graphId === "simple") {
+    const content = readFileSync(file, "utf8");
+    if (extractExecutionPlanBlocks(content).length === 0) return;
+    const result = readExecutionPlanFromMarkdown(content, file);
+    if (result.plan.value.graph_id !== graphId) {
+      throw new Error(`${file}: execution_plan.graph_id must match selected graph ${graphId}`);
+    }
+    return;
+  }
   validatePlanFileForGraph(file, { graphId });
 }
 
@@ -62,7 +71,7 @@ function buildShipSelectionBlock(graphId: string): string {
 }
 
 export function buildShipDescription(body: string, graphId?: string): string {
-  if (!graphId || graphId === "simple") return body;
+  if (!graphId) return body;
   return `${body.trim()}\n\n${buildShipSelectionBlock(graphId)}`;
 }
 
