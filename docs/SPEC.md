@@ -364,6 +364,8 @@ SQLite is the authority. Core tables include:
 - fenced execution: `pipeline_stage_attempts`, `pipeline_inbox_events`;
 - evidence/effects: `pipeline_artifacts`, `pipeline_gate_receipts`,
   `pipeline_publication_receipts`, `pipeline_effect_intents`;
+- structured child execution: `execution_graphs`, `execution_units`,
+  `execution_work_attempts`;
 - cross-run orchestration history: `orchestration_journal`;
 - operations: `repository_registrations`, `supervisor_leases`, `settings`,
   `schema_migrations`, `migration_reconciliation`.
@@ -388,6 +390,25 @@ stored on the owning actor, session, instance, attempt, or work row.
 
 Stage C child-unit work must add any needed live binding state to the owning
 unit/work records rather than reviving empty historical binding tables.
+For the serial `for_each_unit` composite stage, `execution_graphs` binds one
+parent pipeline attempt/run to an immutable execution graph and plan digest;
+`execution_units` stores the immutable unit projection, dependency list,
+authored order, active work pointer, accepted/integration subjects, and reserved
+terminal level/alarm fields; and `execution_work_attempts` stores each child
+action attempt with parent attempt/run fences, unit id, action kind, idempotency
+key, runtime request/session hashes, lease owner/window, payload, result hash,
+output subject, and terminal/error state. The child reducer may lease at most
+one active child action per parent attempt. It expires only pre-dispatch claims
+by lease time; dispatched or running child actions remain the active action and
+are recovered/collected by idempotency rather than duplicated. When all serial
+units are integrated, the reducer emits one `execution_graph_result` artifact
+and one aggregate `stage_result` for the parent attempt; the aggregate hash is
+compare-and-set on `execution_graphs` so the parent can settle once through the
+ordinary stage-result path.
+
+`pipeline_artifacts.kind` includes `execution_graph_result` for the child
+aggregate artifact in addition to the existing stage, review, command,
+provider, human, and publish artifacts.
 
 ## Supervisor environment
 

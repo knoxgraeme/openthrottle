@@ -80,7 +80,7 @@ export const RUNTIME_DESCRIPTOR = Object.freeze({
   capabilities: Object.keys(CAPABILITY_CONTRACTS).sort(),
   executors: ["agent", "command", "provider_wait"],
   evaluators: ["command", "human", "provider", "publish_subject", "semantic"],
-  artifacts: ["command_result", "human_approval", "provider_check", "publish_subject", "review", "stage_result"],
+  artifacts: ["command_result", "execution_graph_result", "human_approval", "provider_check", "publish_subject", "review", "stage_result"],
   contextPolicies: ["fresh", "none", "prefer_resume", "resume_required"],
   credentialScopes: ["model.invoke", "provider.read", "repo.read", "repo.write"],
   adapters: {

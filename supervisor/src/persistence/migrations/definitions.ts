@@ -833,6 +833,140 @@ actor-contract:supervisor deterministic events are objective facts; stage_agent 
 read-contract:query by issue or repository over recorded_at without feeding coordinator control flow/v1
 read-index-contract:case-insensitive read filters use lower-expression indexes while preserving pinned plain indexes/v1`;
 
+const pipelineArtifactsExecutionGraphResultSchema = `
+CREATE TABLE pipeline_artifacts_next (
+  id TEXT PRIMARY KEY,
+  pipeline_instance_id TEXT NOT NULL,
+  attempt_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN (
+    'stage_result', 'execution_graph_result', 'review', 'command_result',
+    'provider_check', 'human_approval', 'publish_subject'
+  )),
+  schema_version INTEGER NOT NULL CHECK(schema_version >= 1),
+  assurance TEXT NOT NULL CHECK(assurance IN (
+    'semantic_attested', 'semantic_corroborated', 'executor_verified',
+    'provider_verified', 'human_approved'
+  )),
+  subject TEXT,
+  payload TEXT NOT NULL,
+  artifact_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
+  FOREIGN KEY(attempt_id, pipeline_instance_id)
+    REFERENCES pipeline_stage_attempts(id, pipeline_instance_id) ON DELETE RESTRICT
+);
+INSERT INTO pipeline_artifacts_next (
+  id, pipeline_instance_id, attempt_id, kind, schema_version,
+  assurance, subject, payload, artifact_hash, created_at
+)
+SELECT
+  id, pipeline_instance_id, attempt_id, kind, schema_version,
+  assurance, subject, payload, artifact_hash, created_at
+FROM pipeline_artifacts;
+DROP TABLE pipeline_artifacts;
+ALTER TABLE pipeline_artifacts_next RENAME TO pipeline_artifacts;
+`;
+
+const executionUnitSchema = `
+CREATE TABLE execution_graphs (
+  id TEXT PRIMARY KEY,
+  pipeline_instance_id TEXT NOT NULL,
+  parent_attempt_id TEXT NOT NULL UNIQUE,
+  parent_stage_id TEXT NOT NULL,
+  parent_run_id TEXT NOT NULL,
+  graph_digest TEXT NOT NULL,
+  plan_digest TEXT NOT NULL,
+  integration_subject TEXT,
+  aggregate_artifact_hash TEXT,
+  aggregate_emitted_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
+  FOREIGN KEY(parent_attempt_id) REFERENCES pipeline_stage_attempts(id) ON DELETE RESTRICT
+);
+CREATE INDEX execution_graphs_instance_idx ON execution_graphs(pipeline_instance_id, created_at);
+
+CREATE TABLE execution_units (
+  id TEXT PRIMARY KEY,
+  execution_graph_id TEXT NOT NULL,
+  pipeline_instance_id TEXT NOT NULL,
+  parent_attempt_id TEXT NOT NULL,
+  unit_id TEXT NOT NULL,
+  authored_order INTEGER NOT NULL CHECK(authored_order >= 0),
+  dependency_unit_ids TEXT NOT NULL CHECK(json_valid(dependency_unit_ids)),
+  status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'integrated', 'completed', 'exited', 'failed')),
+  active_work_attempt_id TEXT,
+  accepted_candidate_subject TEXT,
+  integration_subject TEXT,
+  terminal_level TEXT CHECK(terminal_level IS NULL OR terminal_level IN ('completed', 'exited', 'failed')),
+  alarm INTEGER NOT NULL DEFAULT 0 CHECK(alarm IN (0, 1)),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(execution_graph_id) REFERENCES execution_graphs(id) ON DELETE RESTRICT,
+  FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
+  FOREIGN KEY(parent_attempt_id) REFERENCES pipeline_stage_attempts(id) ON DELETE RESTRICT,
+  UNIQUE(parent_attempt_id, unit_id),
+  UNIQUE(active_work_attempt_id)
+);
+CREATE UNIQUE INDEX execution_units_one_running_idx
+  ON execution_units(parent_attempt_id) WHERE status = 'running';
+CREATE INDEX execution_units_ready_idx
+  ON execution_units(parent_attempt_id, status, authored_order, unit_id);
+
+CREATE TABLE execution_work_attempts (
+  id TEXT PRIMARY KEY,
+  execution_graph_id TEXT NOT NULL,
+  execution_unit_id TEXT NOT NULL,
+  pipeline_instance_id TEXT NOT NULL,
+  parent_attempt_id TEXT NOT NULL,
+  parent_run_id TEXT NOT NULL,
+  unit_id TEXT NOT NULL,
+  attempt_ordinal INTEGER NOT NULL CHECK(attempt_ordinal >= 1),
+  action_kind TEXT NOT NULL CHECK(action_kind IN (
+    'implement', 'simplify', 'command', 'candidate', 'integrate', 'aggregate', 'stop', 'cleanup'
+  )),
+  idempotency_key TEXT NOT NULL UNIQUE,
+  request_hash TEXT,
+  result_hash TEXT,
+  native_session_id TEXT,
+  status TEXT NOT NULL CHECK(status IN ('pending', 'leased', 'dispatched', 'running', 'completed', 'failed', 'dead')),
+  lease_owner TEXT,
+  lease_until TEXT,
+  output_subject TEXT,
+  payload TEXT NOT NULL CHECK(json_valid(payload)),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT,
+  last_error TEXT,
+  FOREIGN KEY(execution_graph_id) REFERENCES execution_graphs(id) ON DELETE RESTRICT,
+  FOREIGN KEY(execution_unit_id) REFERENCES execution_units(id) ON DELETE RESTRICT,
+  FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
+  FOREIGN KEY(parent_attempt_id) REFERENCES pipeline_stage_attempts(id) ON DELETE RESTRICT,
+  UNIQUE(execution_unit_id, attempt_ordinal, action_kind)
+);
+CREATE UNIQUE INDEX execution_work_one_active_idx
+  ON execution_work_attempts(parent_attempt_id)
+  WHERE status IN ('leased', 'dispatched', 'running');
+CREATE INDEX execution_work_claim_idx
+  ON execution_work_attempts(parent_attempt_id, status, lease_until, created_at);
+`;
+
+const executionUnitMigrationSource = `${executionUnitSchema}
+${pipelineArtifactsExecutionGraphResultSchema}
+unit-reducer-contract:serial child state is owned by execution graph and unit records/v1
+binding-contract:parent attempt and run fences live on execution_units and execution_work_attempts/v1
+lease-contract:one active child action per parent attempt is enforced transactionally/v1
+aggregate-contract:one execution_graph_result hash settles the parent composite stage once/v1`;
+
+function widenPipelineArtifactKindsForExecutionGraphResult(db: Database.Database): void {
+  if (!hasTable(db, "pipeline_artifacts")) return;
+  const table = db.prepare(`
+    SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_artifacts'
+  `).get() as { sql: string } | undefined;
+  if (table?.sql.includes("'execution_graph_result'")) return;
+  db.exec(pipelineArtifactsExecutionGraphResultSchema);
+}
+
 function contractSatelliteTables(db: Database.Database): void {
   if (hasTable(db, "agent_sessions")) {
     if (!hasColumns(db, "agent_sessions", ["execution_mode"])) {
@@ -1219,6 +1353,15 @@ const definitions: DatabaseMigrationDefinition[] = [
     source: orchestrationJournalMigrationSource,
     up(db) {
       if (!hasTable(db, "orchestration_journal")) db.exec(orchestrationJournalSchema);
+    },
+  },
+  {
+    version: 16,
+    name: "execution-unit-child-reducer",
+    source: executionUnitMigrationSource,
+    up(db) {
+      if (!hasTable(db, "execution_graphs")) db.exec(executionUnitSchema);
+      widenPipelineArtifactKindsForExecutionGraphResult(db);
     },
   },
 ];
