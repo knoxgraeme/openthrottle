@@ -114,4 +114,32 @@ describe("unit effect processor", () => {
     expect(store.markActionDispatching).not.toHaveBeenCalled();
     expect(store.markActionDispatched).not.toHaveBeenCalled();
   });
+
+  it("reissues a request-less dispatched action with the same idempotency key", async () => {
+    const leased = action({ status: "dispatched" });
+    const store = {
+      leaseNextUnitAction: vi.fn(() => leased),
+      markActionDispatching: vi.fn(),
+      markActionDispatched: vi.fn(),
+      completeUnitAction: vi.fn(),
+    } as unknown as ExecutionUnitStore;
+    const runtime: UnitEffectRuntime = {
+      collectUnitAction: vi.fn(async () => {
+        throw new Error("missing runtime request");
+      }),
+      dispatchUnitAction: vi.fn(async () => ({ requestHash: "request-hash", nativeSessionId: "native-1" })),
+    };
+
+    await createUnitEffectProcessor({
+      store,
+      runtime,
+      leaseOwner: "owner",
+      now: () => new Date("2026-07-29T00:00:00.000Z"),
+    }).drain("attempt-parent");
+
+    expect(store.markActionDispatching).not.toHaveBeenCalled();
+    expect(runtime.collectUnitAction).not.toHaveBeenCalled();
+    expect(runtime.dispatchUnitAction).toHaveBeenCalledWith(leased);
+    expect(store.markActionDispatched).toHaveBeenCalledWith("action-1", "request-hash", "native-1");
+  });
 });
