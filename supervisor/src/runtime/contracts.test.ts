@@ -28,6 +28,37 @@ function git(args: readonly string[]): string | null {
   }
 }
 
+function runtimeReleaseVersion(release: string): { prefix: string; version: number } | null {
+  const match = /^(.*\/v)(\d+)$/.exec(release);
+  if (!match) return null;
+  const version = Number(match[2]);
+  if (!Number.isSafeInteger(version)) return null;
+  return { prefix: match[1], version };
+}
+
+function isFreshRuntimeRelease(currentRelease: string, baseRelease: string): boolean {
+  const current = runtimeReleaseVersion(currentRelease);
+  const base = runtimeReleaseVersion(baseRelease);
+  return current !== null &&
+    base !== null &&
+    current.prefix === base.prefix &&
+    current.version > base.version;
+}
+
+function assertChangedRuntimeDescriptorReleaseIsFresh(
+  currentRuntime: ReturnType<typeof validateRuntimeCapabilityDescriptor>,
+  baseRuntime: ReturnType<typeof validateRuntimeCapabilityDescriptor>
+): void {
+  if (currentRuntime.normalized === baseRuntime.normalized) return;
+  if (isFreshRuntimeRelease(currentRuntime.descriptor.release, baseRuntime.descriptor.release)) return;
+  throw new Error(
+    `${runtimeDescriptorRepoPath} changed from runtime release ${baseRuntime.descriptor.release} ` +
+    `to ${currentRuntime.descriptor.release}; bump the descriptor release above ` +
+    `${baseRuntime.descriptor.release} when changing capabilities, executors, evaluators, artifacts, ` +
+    "context policies, credential scopes, adapters, or protocol"
+  );
+}
+
 describe("sandbox runtime port", () => {
   let db: Database.Database | undefined;
   afterEach(() => db?.close());
@@ -52,6 +83,31 @@ describe("sandbox runtime port", () => {
       .toThrow(/does not match configured/);
   });
 
+  it("rejects descriptor changes that reuse or rewind runtime release names", () => {
+    const baseRuntime = buildInstalledRuntimeDescriptor("openthrottle-snapshot/v4");
+    const changedArtifacts = baseRuntime.descriptor.artifacts
+      .filter((artifact) => artifact !== "execution_graph_result");
+
+    for (const release of [
+      "openthrottle-snapshot/v4",
+      "openthrottle-snapshot/v3",
+      "openthrottle-snapshot/latest",
+      "different-snapshot/v5",
+    ]) {
+      const changedRuntime = buildInstalledRuntimeDescriptor(release, { artifacts: changedArtifacts });
+      expect(() => assertChangedRuntimeDescriptorReleaseIsFresh(changedRuntime, baseRuntime))
+        .toThrow(/bump the descriptor release above openthrottle-snapshot\/v4/);
+    }
+
+    const bumpedRuntime = buildInstalledRuntimeDescriptor("openthrottle-snapshot/v5", {
+      artifacts: changedArtifacts,
+    });
+    expect(() => assertChangedRuntimeDescriptorReleaseIsFresh(bumpedRuntime, baseRuntime))
+      .not.toThrow();
+    expect(() => assertChangedRuntimeDescriptorReleaseIsFresh(baseRuntime, baseRuntime))
+      .not.toThrow();
+  });
+
   it("requires a release bump when shipped descriptor content changes from the base branch", () => {
     const baseBranch = process.env.GITHUB_BASE_REF || process.env.BASE_BRANCH || "main";
     const baseRef = `origin/${baseBranch}`;
@@ -72,16 +128,7 @@ describe("sandbox runtime port", () => {
     const baseRuntime = validateRuntimeCapabilityDescriptor(JSON.parse(baseRaw) as unknown);
     const currentRuntime = validateRuntimeCapabilityDescriptor(JSON.parse(currentRaw) as unknown);
 
-    if (
-      currentRuntime.normalized !== baseRuntime.normalized &&
-      currentRuntime.descriptor.release === baseRuntime.descriptor.release
-    ) {
-      throw new Error(
-        `${runtimeDescriptorRepoPath} changed for runtime release ${currentRuntime.descriptor.release}; ` +
-        "bump the descriptor release when changing capabilities, executors, evaluators, artifacts, " +
-        "context policies, credential scopes, adapters, or protocol"
-      );
-    }
+    assertChangedRuntimeDescriptorReleaseIsFresh(currentRuntime, baseRuntime);
   });
 
   it("reconciles lifecycle through opaque provider resource IDs", async () => {
