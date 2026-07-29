@@ -49,7 +49,7 @@ export interface PrepareRunnerInput {
 
 export type PrepareRunner = (input: PrepareRunnerInput) => SpawnSyncReturns<Buffer>;
 
-const FENCE_PATTERN = /```[^\n`]*\n([\s\S]*?)```/g;
+const FENCE_PATTERN = /```([^\n`]*)\n([\s\S]*?)```/g;
 const CURRENT_COMPILER_COMMANDS = new Set(["test", "lint", "build", "format"]);
 const PREPARE_RUNNER_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
 
@@ -74,8 +74,9 @@ function redactCommand(command: string, args: string[], prompt?: string): string
 export function extractExecutionPlanBlocks(markdown: string): ExecutionPlanBlock[] {
   const blocks: ExecutionPlanBlock[] = [];
   for (const match of markdown.matchAll(FENCE_PATTERN)) {
-    const json = match[1]?.trim();
-    if (!json?.includes(`"schema"`) || !json.includes(EXECUTION_PLAN_FENCE)) continue;
+    const marker = match[1]?.trim().split(/\s+/) ?? [];
+    if (!marker.includes(EXECUTION_PLAN_FENCE)) continue;
+    const json = match[2]?.trim() ?? "";
     blocks.push({ json, start: match.index ?? 0, end: (match.index ?? 0) + match[0].length });
   }
   return blocks;
