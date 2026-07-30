@@ -50,6 +50,9 @@ docker run --rm --entrypoint bash \
   "$IMAGE" /opt/openthrottle/tests/worktree-isolation-probe.sh
 
 docker run --rm --entrypoint bash "$IMAGE" -lc '
+  for runner in /opt/openthrottle/runner/*.mjs; do
+    test -x "$runner"
+  done &&
   claude --version | rg -q "^2\.1\.201" &&
   claude --help | rg -q -- "--setting-sources" &&
   claude --help | rg -q -- "--strict-mcp-config" &&

@@ -14,6 +14,7 @@ const ROOT_GID = 0;
 const ABSOLUTE_PATH = /^\/[^\u0000]{0,500}$/;
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 const PACKAGE_PATH_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
+const OPENCODE_SESSION_EVENT_TYPES = new Set(["message", "step_start", "step_finish"]);
 
 function string(value, label, pattern = ID) {
   if (typeof value !== "string" || !pattern.test(value)) throw new Error(`${label} is invalid`);
@@ -62,6 +63,39 @@ function relativePackagePath(root, path) {
   return relativePath;
 }
 
+function exactPathCarriesSessionId(relativePath, nativeSessionId) {
+  return relativePath.split("/")
+    .some((part) => part === nativeSessionId || part === `${nativeSessionId}.jsonl` || part === `${nativeSessionId}.json`);
+}
+
+function jsonEventCarriesSessionId(line, nativeSessionId, agent) {
+  try {
+    const event = JSON.parse(line);
+    return nativeSessionIdFromEvent(event, agent) === nativeSessionId;
+  } catch {
+    return false;
+  }
+}
+
+function nativeSessionIdFromEvent(event, agent) {
+  if (agent === "claude" && event.type === "system") {
+    return event.session_id ?? event.sessionId ?? null;
+  }
+  if (agent === "codex" && event.type === "thread.started") {
+    return event.thread_id ?? event.threadId ?? event.id ?? null;
+  }
+  if (agent === "opencode" && OPENCODE_SESSION_EVENT_TYPES.has(event.type)) {
+    return event.sessionID ?? event.sessionId ?? null;
+  }
+  return null;
+}
+
+function exactContentsCarrySessionId(bytes, nativeSessionId, agent) {
+  return bytes.toString("utf8")
+    .split(/\r?\n/)
+    .some((line) => line.trim() && jsonEventCarriesSessionId(line, nativeSessionId, agent));
+}
+
 function collectNativeSessionFiles(root, path = root, files = [], totals = { bytes: 0 }, sessionEvidence = null) {
   const metadata = lstatSync(path);
   if (metadata.isSymbolicLink()) throw new Error("native session package cannot contain symlinks");
@@ -81,7 +115,8 @@ function collectNativeSessionFiles(root, path = root, files = [], totals = { byt
   const relativePath = relativePackagePath(root, path);
   if (sessionEvidence &&
     !sessionEvidence.contains &&
-    (relativePath.includes(sessionEvidence.nativeSessionId) || bytes.toString("utf8").includes(sessionEvidence.nativeSessionId))) {
+    (exactPathCarriesSessionId(relativePath, sessionEvidence.nativeSessionId) ||
+      exactContentsCarrySessionId(bytes, sessionEvidence.nativeSessionId, sessionEvidence.agent))) {
     sessionEvidence.contains = true;
   }
   files.push({
@@ -92,8 +127,8 @@ function collectNativeSessionFiles(root, path = root, files = [], totals = { byt
   return files;
 }
 
-function collectNativeSessionPackage(root, nativeSessionId) {
-  const sessionEvidence = { nativeSessionId, contains: false };
+function collectNativeSessionPackage(root, nativeSessionId, agent) {
+  const sessionEvidence = { agent, nativeSessionId, contains: false };
   const files = collectNativeSessionFiles(root, root, [], { bytes: 0 }, sessionEvidence);
   return { files, containsSessionId: files.length > 0 && sessionEvidence.contains };
 }
@@ -138,7 +173,7 @@ function validateNativeSessionPackage({ source, request }) {
     files: manifest.files,
   };
   if (manifest.packageDigest !== digest(canonicalJson(unsigned))) throw new Error("native session package digest mismatch");
-  const { files: actualFiles, containsSessionId } = collectNativeSessionPackage(source, request.nativeSessionId);
+  const { files: actualFiles, containsSessionId } = collectNativeSessionPackage(source, request.nativeSessionId, request.agent);
   if (canonicalJson(actualFiles) !== canonicalJson(manifest.files)) {
     throw new Error("native session package file digest mismatch");
   }
@@ -165,7 +200,7 @@ export function sealNativeSessionPackage({
     mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
     mkdirSync(destination, { recursive: true, mode: 0o700 });
     copyTrustedTree(sessionsSource, resolve(destination, relativeSessionRoot));
-    const { files, containsSessionId } = collectNativeSessionPackage(destination, nativeSessionId);
+    const { files, containsSessionId } = collectNativeSessionPackage(destination, nativeSessionId, agent);
     if (!containsSessionId) {
       throw new Error("native session package does not contain the reported native session id");
     }
@@ -243,14 +278,7 @@ export function extractNativeSessionId(output, agent) {
     if (!line.trim()) continue;
     try {
       const event = JSON.parse(line);
-      let candidate;
-      if (agent === "claude") {
-        candidate = event.session_id;
-      } else if (agent === "codex" && event.type === "thread.started") {
-        candidate = event.thread_id ?? event.threadId ?? event.id;
-      } else if (agent === "opencode") {
-        candidate = event.sessionID;
-      }
+      const candidate = nativeSessionIdFromEvent(event, agent);
       if (typeof candidate === "string" && PACKAGE_PATH_ID.test(candidate)) return candidate;
     } catch {
       // Agent stderr/non-JSON diagnostics are not session evidence.

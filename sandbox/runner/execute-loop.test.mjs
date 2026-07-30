@@ -145,12 +145,12 @@ function repositorySkillRequest() {
   return { ...withoutFence, ...createLoopRequestHash(withoutFence) };
 }
 
-function sealSessionFixture({ agent, nativeSessionId = "native-1", sourceRoot }) {
+function sealSessionFixture({ agent, nativeSessionId = "native-1", sourceRoot, fileName = `${nativeSessionId}.jsonl`, contents = `current session ${nativeSessionId}\n` }) {
   const profileRoot = mkdtempSync(join(tmpdir(), `ot-loop-profile-${agent}-`));
   directories.push(profileRoot);
   const sessionStore = nativeSessionStoragePath(agent, profileRoot);
   mkdirSync(sessionStore, { recursive: true });
-  writeFileSync(join(sessionStore, `${nativeSessionId}.jsonl`), `current session ${nativeSessionId}\n`);
+  writeFileSync(join(sessionStore, fileName), contents);
   return sealNativeSessionPackage({ agent, nativeSessionId, profileRoot, sourceRoot });
 }
 
@@ -422,6 +422,11 @@ describe("loop action request validation", () => {
 
   it("runs non-worker loops in an action-scoped read-only repository view", () => {
     const integrationRepoDir = repository();
+    const unreachableBlob = execFileSync("git", ["hash-object", "-w", "--stdin"], {
+      cwd: integrationRepoDir,
+      input: "unreachable object\n",
+      encoding: "utf8",
+    }).trim();
     const valid = validateLoopRequest(request({
       role: "lead",
       loop: "lead",
@@ -463,6 +468,8 @@ describe("loop action request validation", () => {
           .toBe("");
         expect(execFileSync("git", ["-c", `safe.directory=${expectedView}`, "-C", expectedView, "show", "--stat", "--oneline", "HEAD"], { encoding: "utf8" }).trim())
           .toContain("initial");
+        expect(() => execFileSync("git", ["-c", `safe.directory=${expectedView}`, "-C", expectedView, "cat-file", "-p", unreachableBlob], { encoding: "utf8" }))
+          .toThrow();
         expect(execFileSync("git", ["-c", `safe.directory=${expectedView}`, "-C", expectedView, "config", "--get", "remote.origin.url"], { encoding: "utf8" }).trim())
           .toBe("DISABLED_BY_OPENTHROTTLE_READONLY_VIEW");
         expect(execFileSync("git", ["-c", `safe.directory=${expectedView}`, "-C", expectedView, "config", "--get", "remote.origin.pushurl"], { encoding: "utf8" }).trim())
@@ -615,6 +622,36 @@ describe("loop action request validation", () => {
     expect(statSync(sealed).mode & 0o777).toBe(0o500);
   });
 
+  it("rejects resume output that reports a different native session id", () => {
+    const valid = validateLoopRequest(request({
+      nativeSessionId: "thread-1",
+      contextPolicy: "resume_required",
+    }));
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+    const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
+    directories.push(actionRoot, sessionRoot);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+    process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sessionRoot;
+    sealSessionFixture({ agent: "codex", nativeSessionId: "thread-1", sourceRoot: sessionRoot });
+
+    expect(() => runLoopAgentInPreparedRepository({
+      request: valid,
+      invocation: resolveLoopInvocation(valid),
+      integrationRepoDir: "/tmp/integration",
+      lockIntegration: () => true,
+      lockPersistentProfiles: () => [],
+      restorePersistentProfiles: () => {},
+      processFence: (execute) => execute(),
+      runProcess: () => ({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "{\"type\":\"thread.started\",\"thread_id\":\"thread-2\"}\n",
+        stderr: "",
+      }),
+    })).toThrow(/reported native session id/);
+  });
+
   it("refuses reported loop native session ids when sealing cannot produce a package and surfaces cleanup failures", () => {
     const valid = validateLoopRequest(request());
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
@@ -704,6 +741,48 @@ describe("loop action request validation", () => {
     })).toThrow(/does not contain the reported native session id/);
   });
 
+  it("does not accept prose-only native session id mentions as ownership evidence", () => {
+    const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
+    const profileRoot = mkdtempSync(join(tmpdir(), "ot-loop-prose-profile-"));
+    directories.push(sessionRoot, profileRoot);
+    const sessionStore = nativeSessionStoragePath("codex", profileRoot);
+    mkdirSync(sessionStore, { recursive: true });
+    writeFileSync(join(sessionStore, "current.jsonl"), "plain text mentions native-prose but is not engine evidence\n");
+
+    expect(() => sealNativeSessionPackage({
+      agent: "codex",
+      nativeSessionId: "native-prose",
+      profileRoot,
+      sourceRoot: sessionRoot,
+    })).toThrow(/does not contain the reported native session id/);
+  });
+
+  it("does not accept unrelated JSON fields as native session ownership evidence", () => {
+    const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
+    const claudeProfile = mkdtempSync(join(tmpdir(), "ot-loop-claude-profile-"));
+    const opencodeProfile = mkdtempSync(join(tmpdir(), "ot-loop-opencode-profile-"));
+    directories.push(sessionRoot, claudeProfile, opencodeProfile);
+    const claudeStore = nativeSessionStoragePath("claude", claudeProfile);
+    const opencodeStore = nativeSessionStoragePath("opencode", opencodeProfile);
+    mkdirSync(claudeStore, { recursive: true });
+    mkdirSync(opencodeStore, { recursive: true });
+    writeFileSync(join(claudeStore, "current.jsonl"), "{\"type\":\"tool_result\",\"session_id\":\"native-claude\"}\n");
+    writeFileSync(join(opencodeStore, "current.jsonl"), "{\"type\":\"tool_result\",\"sessionID\":\"native-opencode\"}\n");
+
+    expect(() => sealNativeSessionPackage({
+      agent: "claude",
+      nativeSessionId: "native-claude",
+      profileRoot: claudeProfile,
+      sourceRoot: sessionRoot,
+    })).toThrow(/does not contain the reported native session id/);
+    expect(() => sealNativeSessionPackage({
+      agent: "opencode",
+      nativeSessionId: "native-opencode",
+      profileRoot: opencodeProfile,
+      sourceRoot: sessionRoot,
+    })).toThrow(/does not contain the reported native session id/);
+  });
+
   it("accepts native session packages tied by file path or contents", () => {
     const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
     const pathOnlyProfile = mkdtempSync(join(tmpdir(), "ot-loop-path-profile-"));
@@ -714,7 +793,7 @@ describe("loop action request validation", () => {
     mkdirSync(pathOnlyStore, { recursive: true });
     mkdirSync(contentOnlyStore, { recursive: true });
     writeFileSync(join(pathOnlyStore, "native-path-only.jsonl"), "thread state without identifier\n");
-    writeFileSync(join(contentOnlyStore, "current.jsonl"), "thread state for native-content-only\n");
+    writeFileSync(join(contentOnlyStore, "current.jsonl"), "{\"type\":\"thread.started\",\"thread_id\":\"native-content-only\"}\n");
 
     expect(sealNativeSessionPackage({
       agent: "codex",
@@ -950,6 +1029,42 @@ describe("loop action request validation", () => {
 
     expect(lstatSync(profileRoot).isSymbolicLink()).toBe(true);
     expect(statSync(join(replacementTarget, "target.txt")).mode & 0o777).toBe(targetMode);
+  });
+
+  it("deduplicates and restores nested profile boundary snapshots once", () => {
+    if (typeof process.getuid !== "function" || process.getuid() !== 0) return;
+    const parent = "/home/agent";
+    const local = join(parent, `.local-ot-opencode-${process.pid}-${Date.now()}`);
+    const share = join(local, "share");
+    const profileRoot = join(share, "opencode");
+    const replacementTarget = mkdtempSync(join(tmpdir(), "ot-opencode-replacement-"));
+    directories.push(local, replacementTarget);
+    mkdirSync(profileRoot, { recursive: true, mode: 0o700 });
+    writeFileSync(join(profileRoot, "state.txt"), "state\n", { mode: 0o600 });
+    chmodSync(local, 0o700);
+    chmodSync(share, 0o700);
+    chmodSync(profileRoot, 0o700);
+    const originalParentMode = statSync(parent).mode & 0o777;
+    const originalLocalMode = statSync(local).mode & 0o777;
+    const originalShareMode = statSync(share).mode & 0o777;
+
+    const snapshots = lockPersistentAgentPrivateRoots([profileRoot, profileRoot]);
+    const snapshotPaths = snapshots.flat().map((entry) => entry.path);
+    expect(snapshotPaths.filter((path) => path === parent)).toHaveLength(1);
+    expect(snapshotPaths.filter((path) => path === local)).toHaveLength(1);
+    expect(snapshotPaths.filter((path) => path === share)).toHaveLength(1);
+    expect(statSync(parent).mode & 0o777).toBe(0o711);
+    expect(statSync(local).mode & 0o777).toBe(0o711);
+    expect(statSync(share).mode & 0o777).toBe(0o711);
+    rmSync(profileRoot, { recursive: true, force: true });
+    symlinkSync(replacementTarget, profileRoot);
+
+    restorePersistentAgentPrivateRoots(snapshots);
+
+    expect(statSync(parent).mode & 0o777).toBe(originalParentMode);
+    expect(statSync(local).mode & 0o777).toBe(originalLocalMode);
+    expect(statSync(share).mode & 0o777).toBe(originalShareMode);
+    expect(lstatSync(profileRoot).isSymbolicLink()).toBe(true);
   });
 
   it("leaves the integration checkout locked when agent launch throws", () => {

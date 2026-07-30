@@ -11,6 +11,7 @@ const PERSISTENT_AGENT_PRIVATE_ROOTS = [
   "/home/agent/.local/share/opencode",
   "/home/agent/.ot",
 ];
+const PERSISTENT_PROFILE_PARENT = "/home/agent";
 
 export function pathInside(root, child, errorMessage) {
   const rootPath = resolve(root);
@@ -82,19 +83,24 @@ export function prepareAgentOwnedDirectory(path) {
 
 export function lockPersistentAgentPrivateRoots(paths = PERSISTENT_AGENT_PRIVATE_ROOTS) {
   if (!isRoot()) return [];
-  const locked = [];
+  const locked = new Map();
+  const seenPaths = new Set();
   for (const path of paths) {
+    const normalizedPath = resolve(path);
+    if (seenPaths.has(normalizedPath)) continue;
+    seenPaths.add(normalizedPath);
     if (!existsSync(path)) continue;
     const snapshot = [...snapshotProfileBoundaryPaths(path), ...snapshotPrivateTree(path)];
     try {
       lockProfileBoundaryPaths(path);
       lockPrivateTree(path);
-      locked.push(snapshot);
+      rememberSnapshots(locked, snapshot);
     } catch (error) {
-      throw withLockedPersistentProfiles(error, [...locked, snapshot]);
+      throw withLockedPersistentProfiles(error, [snapshotList(locked, snapshot)]);
     }
   }
-  return locked;
+  const snapshot = snapshotList(locked);
+  return snapshot.length === 0 ? [] : [snapshot];
 }
 
 export function withLockedPersistentProfiles(error, lockedPersistentProfiles) {
@@ -135,32 +141,54 @@ function snapshotOnePath(path, metadata = lstatSync(path)) {
 }
 
 function snapshotProfileBoundaryPaths(path) {
-  const parent = profileBoundaryPath(path);
-  if (!parent) return [];
-  try {
-    return [snapshotOnePath(parent)];
-  } catch (error) {
-    if (error?.code === "ENOENT") return [];
-    throw error;
+  const snapshots = [];
+  for (const parent of profileBoundaryPaths(path)) {
+    try {
+      snapshots.push(snapshotOnePath(parent));
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
   }
+  return snapshots;
 }
 
 function lockProfileBoundaryPaths(path) {
-  const parent = profileBoundaryPath(path);
-  if (!parent) return;
-  try {
-    chownSync(parent, ROOT_UID, ROOT_GID);
-    chmodSync(parent, 0o711);
-  } catch (error) {
-    if (error?.code === "ENOENT") return;
-    throw error;
+  for (const parent of profileBoundaryPaths(path)) {
+    try {
+      chownSync(parent, ROOT_UID, ROOT_GID);
+      chmodSync(parent, 0o711);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
   }
 }
 
-function profileBoundaryPath(path) {
-  const parent = dirname(path);
-  if (parent === path) return null;
-  return parent;
+function profileBoundaryPaths(path) {
+  const resolvedParent = resolve(PERSISTENT_PROFILE_PARENT);
+  const boundaries = [];
+  let current = dirname(resolve(path));
+  try {
+    pathInside(resolvedParent, current, "persistent profile path escapes its parent");
+  } catch {
+    return [];
+  }
+  while (current !== resolvedParent) {
+    boundaries.push(current);
+    current = dirname(current);
+  }
+  return [resolvedParent, ...boundaries.reverse()];
+}
+
+function rememberSnapshots(snapshotsByPath, entries) {
+  for (const entry of entries) {
+    if (!snapshotsByPath.has(entry.path)) snapshotsByPath.set(entry.path, entry);
+  }
+}
+
+function snapshotList(snapshotsByPath, additionalEntries = []) {
+  const copy = new Map(snapshotsByPath);
+  rememberSnapshots(copy, additionalEntries);
+  return [...copy.values()];
 }
 
 function sameSnapshotEntry(entry, metadata) {

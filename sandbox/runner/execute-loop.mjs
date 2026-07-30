@@ -523,9 +523,11 @@ function createReadOnlyRepositoryView(request, sourceRepoDir = "/home/agent/repo
   rmSync(destination, { recursive: true, force: true });
   lockNonCurrentActionDirectories(request, actionRoot);
   const head = runRootGit(sourceRepoDir, ["rev-parse", "HEAD"]);
-  runRootGit(sourceRepoDir, ["clone", "--quiet", "--no-hardlinks", sourceRepoDir, destination], {}, {
-    safeDirectories: gitdirFromFilesystem(sourceRepoDir),
-  });
+  mkdirSync(destination, { recursive: true, mode: 0o755 });
+  runRootGit(destination, ["init", "--quiet"]);
+  const packDir = pathInside(pathInside(destination, ".git"), "objects/pack");
+  mkdirSync(packDir, { recursive: true, mode: 0o755 });
+  packReachableBaseObjects(sourceRepoDir, join(packDir, "authorized"));
   runRootGit(destination, ["checkout", "--quiet", "--detach", head]);
   runRootGit(destination, ["config", "remote.origin.url", "DISABLED_BY_OPENTHROTTLE_READONLY_VIEW"]);
   runRootGit(destination, ["config", "remote.origin.pushurl", "DISABLED_BY_OPENTHROTTLE_READONLY_VIEW"]);
@@ -684,7 +686,11 @@ export function runLoopAgentInPreparedRepository({
       input: built.input,
       timeout: request.timeoutMs,
     }));
-    const nativeSessionId = request.nativeSessionId ?? extractNativeSessionId(result.stdout, request.agent);
+    const reportedNativeSessionId = extractNativeSessionId(result.stdout, request.agent);
+    if (request.nativeSessionId && reportedNativeSessionId && reportedNativeSessionId !== request.nativeSessionId) {
+      throw new Error("reported native session id does not match the sealed loop request");
+    }
+    const nativeSessionId = request.nativeSessionId ?? reportedNativeSessionId;
     const sealedNativeSessionPackage = sealNativeSessionPackage({
       agent: request.agent,
       nativeSessionId,

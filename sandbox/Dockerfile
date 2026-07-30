@@ -142,6 +142,7 @@ RUN mkdir -p /etc/codex/skills \
 
 RUN chmod 0755 /opt/openthrottle/entrypoint.sh \
     && chmod 0755 /opt/openthrottle/lib/runtime.sh \
+    && chmod 0755 /opt/openthrottle/runner/*.mjs \
     && chmod 0755 /usr/local/bin/ot-activity \
     && chmod 0755 /opt/openthrottle/bin/ot-stage-result.mjs \
     && ln -s /opt/openthrottle/bin/ot-stage-result.mjs /usr/local/bin/ot-stage-result \

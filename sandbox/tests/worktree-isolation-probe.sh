@@ -27,6 +27,8 @@ NATIVE_SESSION_ROOT="/var/lib/openthrottle/native-sessions"
 export OT_NATIVE_SESSION_SOURCE_ROOT="$NATIVE_SESSION_ROOT"
 PERSISTENT_CLAUDE_SECRET="/home/agent/.claude/ot-persistent-probe-secret.txt"
 PERSISTENT_CODEX_SECRET="/home/agent/.codex/ot-persistent-probe-secret.txt"
+PERSISTENT_OPENCODE_ROOT="/home/agent/.local/share/opencode"
+PERSISTENT_OPENCODE_SECRET="$PERSISTENT_OPENCODE_ROOT/ot-persistent-probe-secret.txt"
 PERSISTENT_OT_SECRET="/home/agent/.ot/ot-persistent-probe-secret.txt"
 PROFILE_REPLACEMENT_TARGET="$ACTION_ROOT/attempt-current/profile-replacement-target"
 
@@ -84,16 +86,17 @@ function sealFixture(nativeSessionId, fileName, contents) {
   sealNativeSessionPackage({ agent: "codex", nativeSessionId, profileRoot });
 }
 
-sealFixture("native-current", "current.jsonl", "current native session native-current\n");
-sealFixture("native-sibling", "sibling.jsonl", "sibling native session native-sibling\n");
+sealFixture("native-current", "native-current.jsonl", "current native session native-current\n");
+sealFixture("native-sibling", "native-sibling.jsonl", "sibling native session native-sibling\n");
 NODE
-install -d -o agent -g agent -m 0700 /home/agent/.claude /home/agent/.codex /home/agent/.ot
+install -d -o agent -g agent -m 0700 /home/agent/.claude /home/agent/.codex "$PERSISTENT_OPENCODE_ROOT" /home/agent/.ot
 install -d -o agent -g agent -m 0700 "$PROFILE_REPLACEMENT_TARGET"
 printf 'persistent claude secret\n' > "$PERSISTENT_CLAUDE_SECRET"
 printf 'persistent codex secret\n' > "$PERSISTENT_CODEX_SECRET"
+printf 'persistent opencode secret\n' > "$PERSISTENT_OPENCODE_SECRET"
 printf 'persistent ot secret\n' > "$PERSISTENT_OT_SECRET"
-chown agent:agent "$PERSISTENT_CLAUDE_SECRET" "$PERSISTENT_CODEX_SECRET" "$PERSISTENT_OT_SECRET"
-chmod 0600 "$PERSISTENT_CLAUDE_SECRET" "$PERSISTENT_CODEX_SECRET" "$PERSISTENT_OT_SECRET"
+chown agent:agent "$PERSISTENT_CLAUDE_SECRET" "$PERSISTENT_CODEX_SECRET" "$PERSISTENT_OPENCODE_SECRET" "$PERSISTENT_OT_SECRET"
+chmod 0600 "$PERSISTENT_CLAUDE_SECRET" "$PERSISTENT_CODEX_SECRET" "$PERSISTENT_OPENCODE_SECRET" "$PERSISTENT_OT_SECRET"
 
 mkdir -p "$INTEGRATION/.git/objects/info"
 {
@@ -129,6 +132,7 @@ if [ -n "${PROBE_READONLY_ACTION_DIR:-}" ]; then
   must_fail git add lead-write.txt
   must_fail git commit -m "lead direct commit"
   must_fail git update-ref refs/heads/lead-direct HEAD
+  must_fail git cat-file -p "$PROBE_SIBLING_ONLY_BLOB"
   must_fail sh -c "printf bad >> '$PROBE_INTEGRATION/file.txt'"
   must_fail cat "$PROBE_INTEGRATION/file.txt"
   printf '{"probe":"readonly-ok"}\n'
@@ -149,9 +153,9 @@ test "$HOME" = "$PROBE_CURRENT_ACTION_DIR/home"
 test "$CODEX_HOME" = "$PROBE_CURRENT_ACTION_DIR/codex"
 test -r "$CODEX_HOME/skills/repo_action/SKILL.md"
 grep -q "pinned package" "$CODEX_HOME/skills/repo_action/SKILL.md"
-test -r "$CODEX_HOME/sessions/current.jsonl"
-grep -q "current native session native-current" "$CODEX_HOME/sessions/current.jsonl"
-test ! -e "$CODEX_HOME/sessions/sibling.jsonl"
+test -r "$CODEX_HOME/sessions/native-current.jsonl"
+grep -q "current native session native-current" "$CODEX_HOME/sessions/native-current.jsonl"
+test ! -e "$CODEX_HOME/sessions/native-sibling.jsonl"
 git status --porcelain=v1 --untracked-files=all >/tmp/ot-probe-git-status
 node /opt/openthrottle/runner/execute-stage.mjs --print-subject --repo "$PWD" >/tmp/ot-probe-subject
 printf 'worker write\n' > "$PWD/worker-write.txt"
@@ -179,14 +183,20 @@ must_fail cat "$PROBE_PRIOR_ACTION_SECRET"
 must_fail cat "$PROBE_PRIOR_HOME_SECRET"
 must_fail cat "$PROBE_PERSISTENT_CLAUDE_SECRET"
 must_fail cat "$PROBE_PERSISTENT_CODEX_SECRET"
+must_fail cat "$PROBE_PERSISTENT_OPENCODE_SECRET"
 must_fail cat "$PROBE_PERSISTENT_OT_SECRET"
 must_fail sh -c "printf bad >> '$PROBE_PERSISTENT_CLAUDE_SECRET'"
 must_fail sh -c "printf bad >> '$PROBE_PERSISTENT_CODEX_SECRET'"
+must_fail sh -c "printf bad >> '$PROBE_PERSISTENT_OPENCODE_SECRET'"
 must_fail sh -c "printf bad >> '$PROBE_PERSISTENT_OT_SECRET'"
 must_fail mv "$PROBE_PERSISTENT_CLAUDE_ROOT" "$PROBE_PROFILE_REPLACEMENT_TARGET/claude"
 must_fail mv "$PROBE_PERSISTENT_CODEX_ROOT" "$PROBE_PROFILE_REPLACEMENT_TARGET/codex"
+must_fail mv "$PROBE_PERSISTENT_OPENCODE_LOCAL_ROOT" "$PROBE_PROFILE_REPLACEMENT_TARGET/local"
+must_fail mv "$PROBE_PERSISTENT_OPENCODE_SHARE_ROOT" "$PROBE_PROFILE_REPLACEMENT_TARGET/share"
+must_fail mv "$PROBE_PERSISTENT_OPENCODE_ROOT" "$PROBE_PROFILE_REPLACEMENT_TARGET/opencode"
 must_fail mv "$PROBE_PERSISTENT_OT_ROOT" "$PROBE_PROFILE_REPLACEMENT_TARGET/ot"
 must_fail sh -c "rm -rf '$PROBE_PERSISTENT_CODEX_ROOT' && ln -s '$PROBE_PROFILE_REPLACEMENT_TARGET/codex-link' '$PROBE_PERSISTENT_CODEX_ROOT'"
+must_fail sh -c "rm -rf '$PROBE_PERSISTENT_OPENCODE_ROOT' && ln -s '$PROBE_PROFILE_REPLACEMENT_TARGET/opencode-link' '$PROBE_PERSISTENT_OPENCODE_ROOT'"
 must_fail cat "$PROBE_INTEGRATION/.git/objects/info/alternates.probe"
 must_fail sh -c "printf bad >> '$PROBE_INTEGRATION/.git/objects/info/alternates.probe'"
 test ! -w /opt/openthrottle/safety/pre-push
@@ -365,9 +375,13 @@ PROBE_PRIOR_ACTION_SECRET="$ACTION_ROOT/attempt-prior/action-current/secret.txt"
 PROBE_PRIOR_HOME_SECRET="$ACTION_ROOT/attempt-prior/action-home/home/native-session.json" \
 PROBE_PERSISTENT_CLAUDE_SECRET="$PERSISTENT_CLAUDE_SECRET" \
 PROBE_PERSISTENT_CODEX_SECRET="$PERSISTENT_CODEX_SECRET" \
+PROBE_PERSISTENT_OPENCODE_SECRET="$PERSISTENT_OPENCODE_SECRET" \
 PROBE_PERSISTENT_OT_SECRET="$PERSISTENT_OT_SECRET" \
 PROBE_PERSISTENT_CLAUDE_ROOT="/home/agent/.claude" \
 PROBE_PERSISTENT_CODEX_ROOT="/home/agent/.codex" \
+PROBE_PERSISTENT_OPENCODE_LOCAL_ROOT="/home/agent/.local" \
+PROBE_PERSISTENT_OPENCODE_SHARE_ROOT="/home/agent/.local/share" \
+PROBE_PERSISTENT_OPENCODE_ROOT="$PERSISTENT_OPENCODE_ROOT" \
 PROBE_PERSISTENT_OT_ROOT="/home/agent/.ot" \
 PROBE_PROFILE_REPLACEMENT_TARGET="$PROFILE_REPLACEMENT_TARGET" \
 PROBE_CURRENT_ACTION_DIR="$ACTION_ROOT/attempt-current/action-current" \
@@ -400,6 +414,7 @@ OT_WORKTREE_ROOT="$WORKTREES" \
 OT_INTEGRATION_REPO_DIR="$INTEGRATION" \
 PROBE_INTEGRATION="$INTEGRATION" \
 PROBE_BASE="$BASE" \
+PROBE_SIBLING_ONLY_BLOB="$SIBLING_ONLY_BLOB" \
 PROBE_READONLY_ACTION_DIR="$ACTION_ROOT/attempt-current/action-lead" \
 /opt/openthrottle/runner/execute-loop.mjs --request "$LEAD_REQUEST" --output "$LEAD_RESULT"
 
@@ -421,6 +436,7 @@ OT_WORKTREE_ROOT="$WORKTREES" \
 OT_INTEGRATION_REPO_DIR="$INTEGRATION" \
 PROBE_INTEGRATION="$INTEGRATION" \
 PROBE_BASE="$BASE" \
+PROBE_SIBLING_ONLY_BLOB="$SIBLING_ONLY_BLOB" \
 PROBE_READONLY_ACTION_DIR="$ACTION_ROOT/attempt-current/action-reviewer" \
 /opt/openthrottle/runner/execute-loop.mjs --request "$REVIEWER_REQUEST" --output "$REVIEWER_RESULT"
 
@@ -470,6 +486,9 @@ gosu agent test ! -r "$ACTION_ROOT/attempt-prior/action-current/secret.txt"
 gosu agent test ! -r "$ACTION_ROOT/attempt-prior/action-home/home/native-session.json"
 test ! -L /home/agent/.claude
 test ! -L /home/agent/.codex
+test ! -L /home/agent/.local
+test ! -L /home/agent/.local/share
+test ! -L "$PERSISTENT_OPENCODE_ROOT"
 test ! -L /home/agent/.ot
 
 CANDIDATE_JSON="$(/opt/openthrottle/runner/worktrees.mjs candidate --repo "$INTEGRATION" --root "$WORKTREES" --handle current --base "$BASE" --message "candidate from executor")"

@@ -272,6 +272,8 @@ describe("one-stage executor", () => {
     expect(extractNativeSessionId('{"type":"thread.started","thread_id":"codex-1"}\n', "codex")).toBe("codex-1");
     expect(extractNativeSessionId('{"type":"step_start","sessionID":"opencode-1"}\n', "opencode")).toBe("opencode-1");
     expect(extractNativeSessionId("not-json\n", "codex")).toBeNull();
+    expect(extractNativeSessionId('{"type":"tool_result","session_id":"claude-forged"}\n', "claude")).toBeNull();
+    expect(extractNativeSessionId('{"type":"tool_result","sessionID":"opencode-forged"}\n', "opencode")).toBeNull();
   });
 
   it("takes engine selection from the sealed request", () => {
