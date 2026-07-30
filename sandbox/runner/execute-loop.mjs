@@ -8,6 +8,7 @@ import { canonicalJson } from "./capabilities.mjs";
 import { digest, sanitizeArtifactText, validateStandardReceipt } from "./artifacts.mjs";
 import { computeWorkspaceTreeOid } from "./repository-control.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
+import { runWithAgentProcessFence } from "./agent-process-fence.mjs";
 import { grantWorktreeToAgent, lockWorktree, worktreePath } from "./worktrees.mjs";
 import { chmodTree, chownTree, identityForUser, isRoot, pathInside as containedPath } from "./filesystem-isolation.mjs";
 import {
@@ -20,6 +21,7 @@ import {
 export const LOOP_ACTION_PROTOCOL = "loop-action@1";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
+const STAGE_PATH_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const AGENTS = new Set(["claude", "codex", "opencode"]);
 const ROLES = new Set(["worker", "lead", "reviewer", "publisher"]);
 const LOOPS = new Set(["implement", "simplify", "command", "repair", "lead", "review", "publish"]);
@@ -84,6 +86,10 @@ function nullableString(value, label, pattern = ID) {
   return value === null ? null : string(value, label, pattern);
 }
 
+function stagePathId(value, label) {
+  return string(value, label, STAGE_PATH_ID);
+}
+
 function boundedText(value, label, maxLength) {
   if (typeof value !== "string" || value.length > maxLength) throw new Error(`${label} is invalid`);
   return value;
@@ -125,11 +131,11 @@ function actionFilePath({ attemptId, actionId, rootDir = DEFAULT_ACTION_ROOT }, 
 }
 
 export function loopRequestPath({ attemptId, actionId, rootDir = DEFAULT_ACTION_ROOT }) {
-  return actionFilePath({ attemptId, actionId, rootDir }, "request.json");
+  return actionFilePath({ attemptId: stagePathId(attemptId, "attemptId"), actionId: stagePathId(actionId, "actionId"), rootDir }, "request.json");
 }
 
 export function loopResultPath({ attemptId, actionId, rootDir = DEFAULT_ACTION_ROOT }) {
-  return actionFilePath({ attemptId, actionId, rootDir }, "result.json");
+  return actionFilePath({ attemptId: stagePathId(attemptId, "attemptId"), actionId: stagePathId(actionId, "actionId"), rootDir }, "result.json");
 }
 
 function ensureTraverseOnly(path) {
@@ -153,9 +159,14 @@ function lockNonCurrentActionDirectories(request, rootDir = configuredActionRoot
   }
 }
 
-function runRootGit(repoDir, args) {
+function runRootGit(repoDir, args, env = {}) {
   const result = runCapturedProcess("git", ["-c", `safe.directory=${repoDir}`, ...args], {
     cwd: repoDir,
+    env: {
+      ...process.env,
+      GIT_TERMINAL_PROMPT: "0",
+      ...env,
+    },
     timeout: 120_000,
     captureBytes: 1024 * 1024,
   });
@@ -191,8 +202,8 @@ export function validateLoopRequest(value) {
   }
   const request = {
     protocol: LOOP_ACTION_PROTOCOL,
-    actionId: string(input.actionId, "actionId"),
-    attemptId: string(input.attemptId, "attemptId"),
+    actionId: stagePathId(input.actionId, "actionId"),
+    attemptId: stagePathId(input.attemptId, "attemptId"),
     graphId: string(input.graphId, "graphId"),
     unitId: nullableString(input.unitId, "unitId"),
     role: string(input.role, "role"),
@@ -272,6 +283,25 @@ function prepareAgentOwnedDirectory(path) {
   chmodTree(path, { fileMode: 0o600, directoryMode: 0o700 });
 }
 
+function prepareRootReadOnlyDirectory(path) {
+  mkdirSync(path, { recursive: true, mode: 0o555 });
+  if (isRoot()) chownTree(path, ROOT_UID, ROOT_GID);
+  chmodTree(path, { fileMode: 0o444, directoryMode: 0o555 });
+}
+
+function prepareActionHomeEnvironment(request) {
+  const currentActionDirectory = actionDirectory(request);
+  const home = pathInside(currentActionDirectory, "home");
+  prepareAgentOwnedDirectory(home);
+  const env = [`HOME=${home}`];
+  if (request.agent === "codex") {
+    const codexHome = pathInside(currentActionDirectory, "codex");
+    prepareAgentOwnedDirectory(codexHome);
+    env.push(`CODEX_HOME=${codexHome}`);
+  }
+  return env;
+}
+
 function prepareLoopTransportEnvironment(request) {
   const currentActionDirectory = actionDirectory(request);
   const outbox = pathInside(currentActionDirectory, "outbox");
@@ -299,21 +329,14 @@ function loopSkillDiscoveryRoot(request, actionRoot = configuredActionRoot()) {
 function prepareLoopAgentEnvironment(request, repoDir) {
   const gitObjectEnv = prepareLoopGitObjectEnvironment(request, repoDir);
   const transportEnv = prepareLoopTransportEnvironment(request);
+  const homeEnv = prepareActionHomeEnvironment(request);
+  const env = ["USER=agent", "GIT_OPTIONAL_LOCKS=0", ...gitObjectEnv.env, ...transportEnv, ...homeEnv];
   if (!request.repositorySkill) {
     return {
-      env: ["HOME=/home/agent", "USER=agent", "GIT_OPTIONAL_LOCKS=0", ...gitObjectEnv.env, ...transportEnv],
+      env,
       repositorySkillRoot: null,
       gitObjectEnv: gitObjectEnv.values,
     };
-  }
-  const currentActionDirectory = actionDirectory(request);
-  const home = pathInside(currentActionDirectory, "home");
-  prepareAgentOwnedDirectory(home);
-  const env = ["USER=agent", "GIT_OPTIONAL_LOCKS=0", ...gitObjectEnv.env, ...transportEnv, `HOME=${home}`];
-  if (request.agent === "codex") {
-    const codexHome = pathInside(currentActionDirectory, "codex");
-    prepareAgentOwnedDirectory(codexHome);
-    env.push(`CODEX_HOME=${codexHome}`);
   }
   const discoveryRoot = loopSkillDiscoveryRoot(request);
   const repositorySkillRoot = materializeRepositorySkillPackage({
@@ -348,20 +371,54 @@ function prepareLoopGitObjectEnvironment(request, repoDir) {
   const baseObjectDir = pathInside(objectRoot, "base");
   const basePackDir = pathInside(baseObjectDir, "pack");
   const writeObjectDir = pathInside(objectRoot, "write");
+  const gitAdminDir = pathInside(actionDirectory(request), "git-admin");
+  const gitIndexPath = pathInside(gitAdminDir, "index");
   rmSync(objectRoot, { recursive: true, force: true });
+  rmSync(gitAdminDir, { recursive: true, force: true });
   mkdirSync(basePackDir, { recursive: true, mode: 0o755 });
   packReachableBaseObjects(repoDir, join(basePackDir, "base"));
   chmodTree(baseObjectDir, { fileMode: 0o444, directoryMode: 0o555 });
   prepareAgentOwnedDirectory(writeObjectDir);
-  const values = {
+  mkdirSync(gitAdminDir, { recursive: true, mode: 0o755 });
+  const head = runRootGit(repoDir, ["rev-parse", "HEAD"]);
+  writeFileSync(pathInside(gitAdminDir, "HEAD"), `${head}\n`, { mode: 0o444 });
+  writeFileSync(pathInside(gitAdminDir, "config"), [
+    "[core]",
+    "\trepositoryformatversion = 0",
+    "\tfilemode = true",
+    "\tbare = false",
+    "\tlogallrefupdates = false",
+    "",
+  ].join("\n"), { mode: 0o444 });
+  mkdirSync(pathInside(gitAdminDir, "objects"), { recursive: true, mode: 0o755 });
+  mkdirSync(pathInside(pathInside(gitAdminDir, "refs"), "heads"), { recursive: true, mode: 0o755 });
+  mkdirSync(pathInside(pathInside(gitAdminDir, "refs"), "tags"), { recursive: true, mode: 0o755 });
+  runRootGit(repoDir, ["read-tree", head], {
+    GIT_DIR: gitAdminDir,
+    GIT_WORK_TREE: repoDir,
+    GIT_INDEX_FILE: gitIndexPath,
+    GIT_OBJECT_DIRECTORY: writeObjectDir,
+    GIT_ALTERNATE_OBJECT_DIRECTORIES: baseObjectDir,
+  });
+  prepareRootReadOnlyDirectory(gitAdminDir);
+  const objectValues = {
     GIT_OBJECT_DIRECTORY: writeObjectDir,
     GIT_ALTERNATE_OBJECT_DIRECTORIES: baseObjectDir,
   };
+  const agentValues = {
+    GIT_DIR: gitAdminDir,
+    GIT_WORK_TREE: repoDir,
+    GIT_INDEX_FILE: gitIndexPath,
+    ...objectValues,
+  };
   return {
-    values,
+    values: objectValues,
     env: [
-      `GIT_OBJECT_DIRECTORY=${values.GIT_OBJECT_DIRECTORY}`,
-      `GIT_ALTERNATE_OBJECT_DIRECTORIES=${values.GIT_ALTERNATE_OBJECT_DIRECTORIES}`,
+      `GIT_DIR=${agentValues.GIT_DIR}`,
+      `GIT_WORK_TREE=${agentValues.GIT_WORK_TREE}`,
+      `GIT_INDEX_FILE=${agentValues.GIT_INDEX_FILE}`,
+      `GIT_OBJECT_DIRECTORY=${agentValues.GIT_OBJECT_DIRECTORY}`,
+      `GIT_ALTERNATE_OBJECT_DIRECTORIES=${agentValues.GIT_ALTERNATE_OBJECT_DIRECTORIES}`,
     ],
   };
 }
@@ -423,16 +480,12 @@ function lockGitMetadata(gitDir, preservedLinkedGitDir) {
       for (const handle of readdirSync(child)) {
         const handleDir = resolve(child, handle);
         if (!lstatSync(handleDir).isDirectory()) continue;
-        if (preservedLinkedGitDir && handleDir === preservedLinkedGitDir) {
-          lockReadOnlyTree(handleDir);
-        } else {
-          lockPrivateTree(handleDir);
-        }
+        lockPrivateTree(handleDir);
       }
     } else if (entry === "objects") {
       lockObjectStore(child);
     } else if (entry === "refs" || entry === "packed-refs" || entry === "HEAD" || entry === "config") {
-      lockReadOnlyTree(child);
+      lockPrivateTree(child);
     } else {
       lockPrivateTree(child);
     }
@@ -482,6 +535,13 @@ function lockCurrentActionDirectory(request) {
   chmodTree(currentActionDirectory, { fileMode: 0o600, directoryMode: 0o700 });
 }
 
+function makeCurrentActionDirectoryTraverseOnly(request) {
+  const currentActionDirectory = actionDirectory(request);
+  mkdirSync(currentActionDirectory, { recursive: true, mode: 0o711 });
+  if (isRoot()) chownSync(currentActionDirectory, ROOT_UID, ROOT_GID);
+  chmodSync(currentActionDirectory, 0o711);
+}
+
 export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDirectory(request) ?? "/home/agent/repo", repositorySkillRoot = null }) {
   const prompt = loopPrompt(request, { repositorySkillRoot });
   const command = request.agent === "codex" ? "codex" : request.agent;
@@ -502,6 +562,7 @@ export function runLoopAgentInPreparedRepository({
   request,
   invocation,
   runProcess = runCapturedProcess,
+  processFence = runWithAgentProcessFence,
   integrationRepoDir = INTEGRATION_REPO_DIR,
   lockIntegration = lockIntegrationCheckout,
 }) {
@@ -510,14 +571,15 @@ export function runLoopAgentInPreparedRepository({
   const built = loopAgentCommand({ request, invocation, repoDir, repositorySkillRoot: preparedEnvironment.repositorySkillRoot });
   const preservedLinkedGitDir = request.worktree ? linkedWorktreeGitDir(repoDir) : null;
   lockIntegration(integrationRepoDir, { preservedLinkedGitDir });
+  makeCurrentActionDirectoryTraverseOnly(request);
   try {
-    const result = runProcess("gosu", [
-      "agent", "env", ...preparedEnvironment.env, built.command, ...built.args,
-    ], {
-      cwd: built.repoDir,
-      input: built.input,
-      timeout: request.timeoutMs,
-    });
+    const result = processFence(() => runProcess("gosu", [
+        "agent", "env", ...preparedEnvironment.env, built.command, ...built.args,
+      ], {
+        cwd: built.repoDir,
+        input: built.input,
+        timeout: request.timeoutMs,
+      }));
     return { ...result, gitObjectEnv: preparedEnvironment.gitObjectEnv };
   } finally {
     lockIntegration(integrationRepoDir, { preservedLinkedGitDir });
@@ -584,6 +646,7 @@ export function executeLoopAction({
   request: rawRequest,
   runLoopAgent = defaultRunLoopAgent,
   lockWorkerWorktree = lockCurrentWorkerWorktree,
+  lockActionDirectory = lockCurrentActionDirectory,
   now = () => new Date().toISOString(),
 }) {
   const request = validateLoopRequest(rawRequest);
@@ -625,7 +688,7 @@ export function executeLoopAction({
     };
   } finally {
     lockWorkerWorktree(request);
-    lockCurrentActionDirectory(request);
+    lockActionDirectory(request);
   }
 }
 

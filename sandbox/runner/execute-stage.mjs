@@ -3,6 +3,7 @@
 import { randomUUID } from "node:crypto";
 import {
   chmodSync,
+  chownSync,
   existsSync,
   lstatSync,
   readFileSync,
@@ -31,7 +32,8 @@ import {
   runGitAsRepositoryOwner,
 } from "./repository-control.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
-import { chmodTree, chownTree, identityForUser, pathInside as containedPath } from "./filesystem-isolation.mjs";
+import { runWithAgentProcessFence } from "./agent-process-fence.mjs";
+import { chmodTree, chownTree, identityForUser, isRoot, pathInside as containedPath } from "./filesystem-isolation.mjs";
 import {
   REPOSITORY_SKILL_CAPABILITY,
   materializeRepositorySkillPackage,
@@ -116,6 +118,17 @@ function stageActionDirectory(request, rootDir = process.env.OT_STAGE_ACTION_ROO
     if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error("stage action root must be a real directory");
   }
   return pathInside(root, request.attemptId, "stage action path");
+}
+
+function ensureStageActionParents(request, rootDir = process.env.OT_STAGE_ACTION_ROOT ?? DEFAULT_STAGE_ACTION_ROOT) {
+  const root = resolve(rootDir);
+  const actionDirectory = stageActionDirectory(request, root);
+  for (const directory of [root, actionDirectory]) {
+    mkdirSync(directory, { recursive: true, mode: 0o711 });
+    if (isRoot()) chownSync(directory, 0, 0);
+    chmodSync(directory, 0o711);
+  }
+  return actionDirectory;
 }
 
 export function runtimeCapabilityDigest() {
@@ -268,28 +281,7 @@ function defaultExecuteCommand({ command, repoDir, timeoutMs }) {
   };
 }
 
-function terminateAgentProcesses() {
-  if (typeof process.getuid !== "function" || process.getuid() !== 0) return;
-  const result = spawnSync("pkill", ["-KILL", "-u", "agent"], {
-    encoding: "utf8",
-    timeout: 10_000,
-  });
-  if (result.error?.code === "ETIMEDOUT") throw new Error("agent process cleanup timed out");
-  // pkill exits 1 when the agent has no remaining processes, which is the
-  // expected steady state after a well-behaved CLI exits.
-  if (result.error || (result.status !== 0 && result.status !== 1)) {
-    throw new Error(`agent process cleanup failed: ${sanitizeArtifactText(result.stderr ?? result.error?.message ?? "").slice(-800)}`);
-  }
-}
-
-export function runWithAgentProcessFence(execute, terminate = terminateAgentProcesses) {
-  try {
-    return execute();
-  } finally {
-    // executeStage cannot hash, restore, or publish until this wrapper returns.
-    terminate();
-  }
-}
+export { runWithAgentProcessFence } from "./agent-process-fence.mjs";
 
 export function materializeRepositorySkill({ request, repoDir, discoveryRoot }) {
   if (request.capability !== REPOSITORY_SKILL_CAPABILITY) return null;
@@ -304,7 +296,7 @@ export function repositorySkillStageEnvironment(request) {
       repositorySkillDiscoveryRoot: undefined,
     };
   }
-  const actionDirectory = stageActionDirectory(request);
+  const actionDirectory = ensureStageActionParents(request);
   const home = pathInside(actionDirectory, "home", "stage action home");
   prepareAgentOwnedDirectory(home);
   const env = [`HOME=${home}`, "USER=agent"];

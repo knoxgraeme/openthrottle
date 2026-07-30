@@ -15,7 +15,12 @@ ACTION_ROOT="$ROOT/loop-actions"
 BIN="$ROOT/bin"
 REQUEST="$ACTION_ROOT/attempt-current/action-current/request.json"
 RESULT="$ACTION_ROOT/attempt-current/action-current/result.json"
+LEAD_REQUEST="$ACTION_ROOT/attempt-current/action-lead/request.json"
+LEAD_RESULT="$ACTION_ROOT/attempt-current/action-lead/result.json"
+BUILTIN_REQUEST="$ACTION_ROOT/attempt-current/action-builtin/request.json"
+BUILTIN_RESULT="$ACTION_ROOT/attempt-current/action-builtin/result.json"
 SEALED="$ROOT/sealed-input.txt"
+BACKGROUND_PID="$ROOT/background.pid"
 
 install -d -o agent -g agent -m 0700 "$INTEGRATION"
 install -d -o root -g root -m 0711 "$WORKTREES" "$ACTION_ROOT"
@@ -48,18 +53,22 @@ install -d -o root -g root -m 0711 "$ACTION_ROOT/attempt-current"
 install -d -o root -g root -m 0700 "$ACTION_ROOT/attempt-current/action-current"
 install -d -o agent -g agent -m 0700 "$ACTION_ROOT/attempt-current/action-sibling"
 install -d -o agent -g agent -m 0700 "$ACTION_ROOT/attempt-prior/action-current"
+install -d -o agent -g agent -m 0700 "$ACTION_ROOT/attempt-prior/action-home/home"
 printf 'sibling secret\n' > "$ACTION_ROOT/attempt-current/action-sibling/secret.txt"
 printf 'prior secret\n' > "$ACTION_ROOT/attempt-prior/action-current/secret.txt"
+printf 'prior home secret\n' > "$ACTION_ROOT/attempt-prior/action-home/home/native-session.json"
 chown -R agent:agent "$ACTION_ROOT/attempt-current/action-sibling" "$ACTION_ROOT/attempt-prior"
 printf 'sealed secret\n' > "$SEALED"
 chown root:root "$SEALED"
 chmod 0400 "$SEALED"
 
 mkdir -p "$INTEGRATION/.git/objects/info"
+printf '# packed refs probe\n' > "$INTEGRATION/.git/packed-refs"
 printf 'alternate secret\n' > "$INTEGRATION/.git/objects/info/alternates.probe"
-chown root:root "$INTEGRATION/.git/objects/info" "$INTEGRATION/.git/objects/info/alternates.probe"
+chown root:root "$INTEGRATION/.git/objects/info" "$INTEGRATION/.git/objects/info/alternates.probe" "$INTEGRATION/.git/packed-refs"
 chmod 0500 "$INTEGRATION/.git/objects/info"
 chmod 0400 "$INTEGRATION/.git/objects/info/alternates.probe"
+chmod 0400 "$INTEGRATION/.git/packed-refs"
 
 ln -s "$INTEGRATION/file.txt" "$WORKTREES/current/integration-link"
 
@@ -75,16 +84,51 @@ must_fail() {
 }
 
 test "$(id -un)" = "agent"
+if [ -n "${PROBE_READONLY_ACTION_DIR:-}" ]; then
+  test "$(stat -c '%a' "$PROBE_READONLY_ACTION_DIR")" = "711"
+  test "$(git rev-parse HEAD)" = "$PROBE_BASE"
+  git status --porcelain=v1 --untracked-files=all >/tmp/ot-probe-lead-status
+  git show --stat --oneline HEAD >/tmp/ot-probe-lead-show
+  must_fail sh -c "printf bad > '$PWD/lead-write.txt'"
+  must_fail git add lead-write.txt
+  must_fail git commit -m "lead direct commit"
+  must_fail git update-ref refs/heads/lead-direct HEAD
+  must_fail sh -c "printf bad >> '$PROBE_INTEGRATION/file.txt'"
+  must_fail cat "$PROBE_INTEGRATION/file.txt"
+  printf '{"probe":"readonly-ok"}\n'
+  exit 0
+fi
+if [ -n "${PROBE_BUILTIN_ACTION_DIR:-}" ]; then
+  test "$(stat -c '%a' "$PROBE_BUILTIN_ACTION_DIR")" = "711"
+  test "$HOME" = "$PROBE_BUILTIN_ACTION_DIR/home"
+  test "$CODEX_HOME" = "$PROBE_BUILTIN_ACTION_DIR/codex"
+  test "$OT_NATIVE_SESSION_DIR" = "$PROBE_BUILTIN_ACTION_DIR/native-session"
+  printf 'builtin home write\n' > "$HOME/builtin.txt"
+  must_fail cat "$PROBE_PRIOR_HOME_SECRET"
+  printf '{"probe":"builtin-ok"}\n'
+  exit 0
+fi
+test "$(stat -c '%a' "$PROBE_CURRENT_ACTION_DIR")" = "711"
+test "$HOME" = "$PROBE_CURRENT_ACTION_DIR/home"
+test "$CODEX_HOME" = "$PROBE_CURRENT_ACTION_DIR/codex"
 test -r "$CODEX_HOME/skills/repo_action/SKILL.md"
 grep -q "pinned package" "$CODEX_HOME/skills/repo_action/SKILL.md"
 git status --porcelain=v1 --untracked-files=all >/tmp/ot-probe-git-status
 node /opt/openthrottle/runner/execute-stage.mjs --print-subject --repo "$PWD" >/tmp/ot-probe-subject
 printf 'worker write\n' > "$PWD/worker-write.txt"
+setsid sh -c 'while :; do sleep 30; done' >/dev/null 2>&1 &
+printf '%s\n' "$!" > "$PROBE_BACKGROUND_PID"
+test -r "$PWD/.git"
+must_fail sh -c "printf 'gitdir: /\n' > '$PWD/.git'"
+must_fail rm -f "$PWD/.git"
 must_fail git add worker-write.txt
 must_fail git commit -m "agent direct commit"
 must_fail git update-ref refs/heads/agent-direct HEAD
 must_fail sh -c "printf bad >> '$PROBE_INTEGRATION/file.txt'"
 must_fail cat "$PROBE_INTEGRATION/file.txt"
+must_fail cat "$PROBE_INTEGRATION/.git/HEAD"
+must_fail cat "$PROBE_INTEGRATION/.git/config"
+must_fail cat "$PROBE_INTEGRATION/.git/packed-refs"
 must_fail cat "$PWD/integration-link"
 must_fail cat "$PROBE_SEALED_INPUT"
 must_fail cat "$PROBE_SIBLING_WORKTREE/file.txt"
@@ -93,6 +137,7 @@ must_fail git cat-file -p "$PROBE_SIBLING_ONLY_BLOB"
 must_fail cat "$PROBE_INTEGRATION/.git/objects/${PROBE_SIBLING_ONLY_BLOB:0:2}/${PROBE_SIBLING_ONLY_BLOB:2}"
 must_fail cat "$PROBE_SIBLING_ACTION_SECRET"
 must_fail cat "$PROBE_PRIOR_ACTION_SECRET"
+must_fail cat "$PROBE_PRIOR_HOME_SECRET"
 must_fail cat "$PROBE_INTEGRATION/.git/objects/info/alternates.probe"
 must_fail sh -c "printf bad >> '$PROBE_INTEGRATION/.git/objects/info/alternates.probe'"
 test ! -w /opt/openthrottle/safety/pre-push
@@ -155,6 +200,74 @@ NODE
 chown root:root "$REQUEST"
 chmod 0400 "$REQUEST"
 
+install -d -o root -g root -m 0700 "$ACTION_ROOT/attempt-current/action-lead"
+PATH="$BIN:$PATH" node --input-type=module - "$LEAD_REQUEST" <<'NODE'
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { canonicalJson } from "/opt/openthrottle/runner/capabilities.mjs";
+import { createLoopRequestHash } from "/opt/openthrottle/runner/execute-loop.mjs";
+
+const requestPath = process.argv[2];
+const base = {
+  protocol: "loop-action@1",
+  actionId: "action-lead",
+  attemptId: "attempt-current",
+  graphId: "graph-1",
+  unitId: "unit-1",
+  role: "lead",
+  loop: "lead",
+  agent: "codex",
+  skill: "accept-unit",
+  worktree: null,
+  nativeSessionId: null,
+  contextPolicy: "fresh",
+  timeoutMs: 120000,
+  transitionContext: "Probe read-only repository view isolation.",
+  allowedMcpServers: [],
+  credentialScopes: [],
+  receiptSchema: "probe/no-receipt@1",
+};
+mkdirSync(dirname(requestPath), { recursive: true, mode: 0o700 });
+writeFileSync(requestPath, canonicalJson({ ...base, ...createLoopRequestHash(base) }), { mode: 0o400 });
+NODE
+chown root:root "$LEAD_REQUEST"
+chmod 0400 "$LEAD_REQUEST"
+
+install -d -o root -g root -m 0700 "$ACTION_ROOT/attempt-current/action-builtin"
+PATH="$BIN:$PATH" node --input-type=module - "$BUILTIN_REQUEST" <<'NODE'
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { canonicalJson } from "/opt/openthrottle/runner/capabilities.mjs";
+import { createLoopRequestHash } from "/opt/openthrottle/runner/execute-loop.mjs";
+
+const requestPath = process.argv[2];
+const base = {
+  protocol: "loop-action@1",
+  actionId: "action-builtin",
+  attemptId: "attempt-current",
+  graphId: "graph-1",
+  unitId: "unit-1",
+  role: "lead",
+  loop: "lead",
+  agent: "codex",
+  skill: "accept-unit",
+  worktree: null,
+  nativeSessionId: null,
+  contextPolicy: "fresh",
+  timeoutMs: 120000,
+  transitionContext: "Probe built-in loop action home isolation.",
+  allowedMcpServers: [],
+  credentialScopes: [],
+  receiptSchema: "probe/no-receipt@1",
+};
+mkdirSync(dirname(requestPath), { recursive: true, mode: 0o700 });
+writeFileSync(requestPath, canonicalJson({ ...base, ...createLoopRequestHash(base) }), { mode: 0o400 });
+NODE
+chown root:root "$BUILTIN_REQUEST"
+chmod 0400 "$BUILTIN_REQUEST"
+
+printf 'mutable worktree skill bytes\n' > "$WORKTREES/current/.agents/skills/current/SKILL.md"
+
 PATH="$BIN:$PATH" \
 OT_LOOP_ACTION_ROOT="$ACTION_ROOT" \
 OT_WORKTREE_ROOT="$WORKTREES" \
@@ -164,7 +277,15 @@ PROBE_SIBLING_WORKTREE="$WORKTREES/sibling" \
 PROBE_SIBLING_ONLY_BLOB="$SIBLING_ONLY_BLOB" \
 PROBE_SIBLING_ACTION_SECRET="$ACTION_ROOT/attempt-current/action-sibling/secret.txt" \
 PROBE_PRIOR_ACTION_SECRET="$ACTION_ROOT/attempt-prior/action-current/secret.txt" \
+PROBE_PRIOR_HOME_SECRET="$ACTION_ROOT/attempt-prior/action-home/home/native-session.json" \
+PROBE_CURRENT_ACTION_DIR="$ACTION_ROOT/attempt-current/action-current" \
+PROBE_BACKGROUND_PID="$BACKGROUND_PID" \
 /opt/openthrottle/runner/execute-loop.mjs --request "$REQUEST" --output "$RESULT"
+
+if [ -s "$BACKGROUND_PID" ] && kill -0 "$(cat "$BACKGROUND_PID")" >/dev/null 2>&1; then
+  echo "agent background process survived loop fence" >&2
+  exit 42
+fi
 
 node --input-type=module - "$RESULT" <<'NODE'
 import { readFileSync } from "node:fs";
@@ -178,10 +299,55 @@ if (result.kind !== "loop_action_result" ||
 }
 NODE
 
+PATH="$BIN:$PATH" \
+OT_LOOP_ACTION_ROOT="$ACTION_ROOT" \
+OT_WORKTREE_ROOT="$WORKTREES" \
+PROBE_INTEGRATION="$INTEGRATION" \
+PROBE_BASE="$BASE" \
+PROBE_READONLY_ACTION_DIR="$ACTION_ROOT/attempt-current/action-lead" \
+/opt/openthrottle/runner/execute-loop.mjs --request "$LEAD_REQUEST" --output "$LEAD_RESULT"
+
+node --input-type=module - "$LEAD_RESULT" <<'NODE'
+import { readFileSync } from "node:fs";
+const result = JSON.parse(readFileSync(process.argv[2], "utf8"));
+if (result.kind !== "loop_action_result" ||
+    result.attempt_id !== "attempt-current" ||
+    result.action_id !== "action-lead" ||
+    result.outcome !== "success" ||
+    result.subject !== null) {
+  throw new Error(`invalid lead probe result: ${JSON.stringify(result)}`);
+}
+NODE
+
+PATH="$BIN:$PATH" \
+OT_LOOP_ACTION_ROOT="$ACTION_ROOT" \
+OT_WORKTREE_ROOT="$WORKTREES" \
+PROBE_BUILTIN_ACTION_DIR="$ACTION_ROOT/attempt-current/action-builtin" \
+PROBE_PRIOR_HOME_SECRET="$ACTION_ROOT/attempt-prior/action-home/home/native-session.json" \
+/opt/openthrottle/runner/execute-loop.mjs --request "$BUILTIN_REQUEST" --output "$BUILTIN_RESULT"
+
+node --input-type=module - "$BUILTIN_RESULT" <<'NODE'
+import { readFileSync } from "node:fs";
+const result = JSON.parse(readFileSync(process.argv[2], "utf8"));
+if (result.kind !== "loop_action_result" ||
+    result.attempt_id !== "attempt-current" ||
+    result.action_id !== "action-builtin" ||
+    result.outcome !== "success" ||
+    result.subject !== null) {
+  throw new Error(`invalid built-in probe result: ${JSON.stringify(result)}`);
+}
+NODE
+
 gosu agent test ! -w "$WORKTREES/current"
+test "$(stat -c '%a' "$ACTION_ROOT/attempt-current/action-current")" = "700"
+test "$(stat -c '%a' "$ACTION_ROOT/attempt-current/action-lead")" = "700"
+test "$(stat -c '%a' "$ACTION_ROOT/attempt-current/action-builtin")" = "700"
 gosu agent test ! -r "$ACTION_ROOT/attempt-current/action-current/request.json"
+gosu agent test ! -r "$ACTION_ROOT/attempt-current/action-lead/request.json"
+gosu agent test ! -r "$ACTION_ROOT/attempt-current/action-builtin/request.json"
 gosu agent test ! -r "$ACTION_ROOT/attempt-current/action-sibling/secret.txt"
 gosu agent test ! -r "$ACTION_ROOT/attempt-prior/action-current/secret.txt"
+gosu agent test ! -r "$ACTION_ROOT/attempt-prior/action-home/home/native-session.json"
 
 CANDIDATE_JSON="$(/opt/openthrottle/runner/worktrees.mjs candidate --repo "$INTEGRATION" --root "$WORKTREES" --handle current --base "$BASE" --message "candidate from executor")"
 CANDIDATE="$(printf '%s' "$CANDIDATE_JSON" | jq -r '.candidateCommit')"

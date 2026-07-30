@@ -7,6 +7,7 @@ import {
   createLoopRequestHash,
   executeLoopAction,
   loopAgentCommand,
+  loopRequestPath,
   loopResultPath,
   loopWorktreeDirectory,
   parseLoopReceipt,
@@ -215,6 +216,15 @@ describe("loop action request validation", () => {
       .toBe("/var/ot/attempt-2/action-2/result.json");
   });
 
+  it("rejects slash-bearing action IDs before deriving action paths", () => {
+    expect(() => validateLoopRequest(request({ actionId: "unit/1" }))).toThrow(/actionId is invalid/);
+    expect(() => validateLoopRequest(request({ attemptId: "attempt/1" }))).toThrow(/attemptId is invalid/);
+    expect(() => loopResultPath({ attemptId: "attempt/1", actionId: "action", rootDir: "/var/ot" }))
+      .toThrow(/attemptId is invalid/);
+    expect(() => loopRequestPath({ attemptId: "attempt", actionId: "action/1", rootDir: "/var/ot" }))
+      .toThrow(/actionId is invalid/);
+  });
+
   it("enforces role/worktree and session reuse rules", () => {
     expect(() => validateLoopRequest(request({ role: "lead", loop: "lead", worktree: null }))).not.toThrow();
     expect(() => validateLoopRequest(request({ role: "lead", loop: "lead" }))).toThrow(/non-worker/);
@@ -299,13 +309,24 @@ describe("loop action request validation", () => {
       request: valid,
       invocation: resolveLoopInvocation(valid),
       integrationRepoDir,
+      processFence: (execute) => {
+        events.push("process-fence");
+        return execute();
+      },
       lockIntegration: (path, options) => {
         events.push(`lock-integration:${path}:${"preservedLinkedGitDir" in options}`);
         return true;
       },
       runProcess: (command, args, options) => {
         events.push(`run:${command}:${options.cwd}`);
+        const actionDirectory = join(actionRoot, valid.attemptId, valid.actionId);
+        expect(statSync(actionDirectory).mode & 0o777).toBe(0o711);
         expect(args).toContain("GIT_OPTIONAL_LOCKS=0");
+        expect(args).toContain(`HOME=${join(actionDirectory, "home")}`);
+        expect(args).toContain(`CODEX_HOME=${join(actionDirectory, "codex")}`);
+        expect(args.find((entry) => entry.startsWith("GIT_DIR="))).toMatch(/git-admin$/);
+        expect(args.find((entry) => entry.startsWith("GIT_INDEX_FILE="))).toMatch(/git-admin\/index$/);
+        expect(args).toContain(`GIT_WORK_TREE=${loopWorktreeDirectory(valid)}`);
         expect(args.find((entry) => entry.startsWith("GIT_OBJECT_DIRECTORY="))).toMatch(/git-objects\/write$/);
         expect(args.find((entry) => entry.startsWith("GIT_ALTERNATE_OBJECT_DIRECTORIES="))).toMatch(/git-objects\/base$/);
         expect(options.cwd).toBe(loopWorktreeDirectory(valid));
@@ -316,6 +337,7 @@ describe("loop action request validation", () => {
     expect(result.status).toBe(0);
     expect(events).toEqual([
       `lock-integration:${integrationRepoDir}:true`,
+      "process-fence",
       `run:gosu:${loopWorktreeDirectory(valid)}`,
       `lock-integration:${integrationRepoDir}:true`,
     ]);
@@ -338,6 +360,7 @@ describe("loop action request validation", () => {
       invocation: resolveLoopInvocation(valid),
       integrationRepoDir: "/tmp/integration",
       lockIntegration: () => true,
+      processFence: (execute) => execute(),
       runProcess: () => ({ status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" }),
     });
 
@@ -363,6 +386,7 @@ describe("loop action request validation", () => {
       invocation: resolveLoopInvocation(valid),
       integrationRepoDir,
       lockIntegration: () => true,
+      processFence: (execute) => execute(),
       runProcess: (command, args, options) => {
         expect(command).toBe("gosu");
         expect(options.cwd).toBe(expectedView);
@@ -403,6 +427,7 @@ describe("loop action request validation", () => {
       invocation: resolveLoopInvocation(valid),
       integrationRepoDir: "/tmp/integration",
       lockIntegration: () => true,
+      processFence: (execute) => execute(),
       runProcess: () => ({ status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" }),
     })).toThrow(/unsafe system directory/);
   });
@@ -418,6 +443,7 @@ describe("loop action request validation", () => {
       invocation: resolveLoopInvocation(valid),
       integrationRepoDir: "/tmp/integration",
       lockIntegration: () => true,
+      processFence: (execute) => execute(),
       runProcess: (command, args) => {
         expect(command).toBe("gosu");
         const actionDirectory = join(actionRoot, valid.attemptId, valid.actionId);
@@ -451,6 +477,7 @@ describe("loop action request validation", () => {
         events.push("lock-integration");
         return true;
       },
+      processFence: (execute) => execute(),
       runProcess: () => {
         events.push("run");
         throw new Error("agent launch failed");
@@ -466,6 +493,7 @@ describe("executeLoopAction", () => {
     const valid = request();
     const receipt = standardReceipt(valid);
     const lockWorkerWorktree = vi.fn();
+    const lockActionDirectory = vi.fn();
     const runLoopAgent = vi.fn(() => ({
       status: 0,
       signal: null,
@@ -479,6 +507,7 @@ describe("executeLoopAction", () => {
       request: valid,
       runLoopAgent,
       lockWorkerWorktree,
+      lockActionDirectory,
       now: () => "2026-07-29T00:00:00.000Z",
     });
 
@@ -495,13 +524,16 @@ describe("executeLoopAction", () => {
     expect(JSON.parse(result.receipt)).toMatchObject({ type: "unit_completion", result: "success" });
     expect(result.subject).toMatch(/^[a-f0-9]{40}$/);
     expect(lockWorkerWorktree).toHaveBeenCalledWith(expect.objectContaining({ worktree: { id: "unit-1" } }));
+    expect(lockActionDirectory).toHaveBeenCalledWith(expect.objectContaining({ actionId: "action-1" }));
   });
 
   it("rejects successful loop exits without a valid standard receipt", () => {
     const lockWorkerWorktree = vi.fn();
+    const lockActionDirectory = vi.fn();
     const result = executeLoopAction({
       request: request(),
       lockWorkerWorktree,
+      lockActionDirectory,
       runLoopAgent: () => ({
         status: 0,
         signal: null,
@@ -516,13 +548,16 @@ describe("executeLoopAction", () => {
     expect(result.outcome).toBe("failure");
     expect(result.receipt).toMatch(/invalid standard receipt/);
     expect(lockWorkerWorktree).toHaveBeenCalledOnce();
+    expect(lockActionDirectory).toHaveBeenCalledOnce();
   });
 
   it("relocks the worker worktree when the loop agent throws before evidence", () => {
     const lockWorkerWorktree = vi.fn();
+    const lockActionDirectory = vi.fn();
     const result = executeLoopAction({
       request: request(),
       lockWorkerWorktree,
+      lockActionDirectory,
       runLoopAgent: () => {
         throw new Error("agent launch failed");
       },
@@ -532,6 +567,7 @@ describe("executeLoopAction", () => {
     expect(result.outcome).toBe("failure");
     expect(result.receipt).toMatch(/agent launch failed/);
     expect(lockWorkerWorktree).toHaveBeenCalledOnce();
+    expect(lockActionDirectory).toHaveBeenCalledOnce();
   });
 
   it("extracts a standard receipt from JSONL agent output", () => {

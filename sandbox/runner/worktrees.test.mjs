@@ -111,11 +111,14 @@ describe("executor-owned worktrees", () => {
 
     expect(statSync(rootDir).mode & 0o777).toBe(0o711);
     expect(statSync(first.path).mode & 0o777).toBe(0o700);
+    expect(statSync(join(first.path, ".git")).mode & 0o777).toBe(0o444);
     expect(statSync(second.path).mode & 0o777).toBe(0o700);
+    expect(statSync(join(second.path, ".git")).mode & 0o777).toBe(0o444);
 
     grantWorktreeToAgent({ rootDir, handle: "unit-b" });
     expect(statSync(first.path).mode & 0o777).toBe(0o700);
     expect(statSync(second.path).mode & 0o777).toBe(0o700);
+    expect(statSync(join(second.path, ".git")).mode & 0o777).toBe(0o444);
 
     lockWorktree({ rootDir, handle: "unit-b" });
     expect(statSync(second.path).mode & 0o777).toBe(0o700);

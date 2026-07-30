@@ -1,4 +1,5 @@
-import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, relative, resolve, sep } from "node:path";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
@@ -25,6 +26,22 @@ function string(value, label, pattern) {
 
 function pathInside(root, child, label) {
   return containedPath(root, child, `${label} escapes its root`);
+}
+
+function gitBytes(repoDir, args) {
+  try {
+    return execFileSync("git", ["-c", `safe.directory=${repoDir}`, ...args], {
+      cwd: repoDir,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      maxBuffer: 1024 * 1024,
+    });
+  } catch (error) {
+    throw new Error(`git ${args.join(" ")} failed`);
+  }
+}
+
+function gitText(repoDir, args) {
+  return gitBytes(repoDir, args).toString("utf8").trim();
 }
 
 export function repositorySkillDiscoveryRoot(agent, env = process.env) {
@@ -94,11 +111,12 @@ export function materializeRepositorySkillPackage({ packageInfo: rawPackageInfo,
     if (sourceRelative.startsWith("..") || sourceRelative === "" || sourceRelative.split(sep).includes("..")) {
       throw new Error("repository skill file is outside the sealed package");
     }
-    const metadata = lstatSync(sourcePath);
-    if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error("repository skill source file is not a regular file");
-    const blobSha = runGitAsExecutor(repoDir, ["rev-parse", `${packageInfo.commit}:${file.path}`]);
+    const treeEntry = runGitAsExecutor(repoDir, ["ls-tree", packageInfo.commit, "--", file.path]);
+    const mode = treeEntry.split(/\s+/, 1)[0];
+    if (mode !== "100644" && mode !== "100755") throw new Error("repository skill source file is not a regular file");
+    const blobSha = gitText(repoDir, ["rev-parse", `${packageInfo.commit}:${file.path}`]);
     if (blobSha !== file.blobSha) throw new Error("repository skill blob fence mismatch");
-    const bytes = readFileSync(sourcePath);
+    const bytes = gitBytes(repoDir, ["cat-file", "-p", blobSha]);
     if (digest(bytes) !== file.digest) throw new Error("repository skill file digest mismatch");
     const destination = pathInside(targetRoot, sourceRelative, "repository skill destination");
     mkdirSync(dirname(destination), { recursive: true, mode: 0o755 });

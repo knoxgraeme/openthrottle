@@ -53,7 +53,7 @@ function commonGitDirForLinked(gitDir) {
 function lockLinkedGitDir(gitDir) {
   if (!isRoot()) return;
   chownTree(gitDir, ROOT_UID, ROOT_GID);
-  chmodTree(gitDir, { fileMode: 0o444, directoryMode: 0o555 });
+  chmodTree(gitDir, { fileMode: 0o600, directoryMode: 0o700 });
 }
 
 function lockReadOnlyTree(path) {
@@ -81,6 +81,24 @@ function prepareWorktreeRoot(rootDir) {
   chmodSync(rootDir, 0o711);
 }
 
+function lockGitIndirectionFile(target) {
+  const gitFile = resolve(target, ".git");
+  if (!existsSync(gitFile)) return;
+  const metadata = lstatSync(gitFile);
+  if (metadata.isDirectory() && !metadata.isSymbolicLink()) return;
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw new Error("worktree .git indirection must be a regular file");
+  }
+  if (isRoot()) chownSync(gitFile, ROOT_UID, ROOT_GID);
+  chmodSync(gitFile, 0o444);
+}
+
+function grantWritableWorktreeRoot(target, identity) {
+  if (!isRoot() || !identity) return;
+  chownSync(target, ROOT_UID, identity.gid);
+  chmodSync(target, 0o1770);
+}
+
 export function lockWorktree({ rootDir = DEFAULT_ROOT, handle, lockLinkedGitDir = true }) {
   const target = worktreePath({ rootDir, handle });
   if (!existsSync(target)) throw new Error("worktree handle does not exist");
@@ -88,6 +106,7 @@ export function lockWorktree({ rootDir = DEFAULT_ROOT, handle, lockLinkedGitDir 
   const gitDir = linkedGitDir(target);
   chownTree(target, ROOT_UID, ROOT_GID);
   chmodTree(target, { fileMode: 0o600, directoryMode: 0o700 });
+  lockGitIndirectionFile(target);
   if (lockLinkedGitDir && gitDir) {
     chownTree(gitDir, ROOT_UID, ROOT_GID);
     chmodTree(gitDir, { fileMode: 0o600, directoryMode: 0o700 });
@@ -106,6 +125,7 @@ export function grantWorktreeToAgent({ rootDir = DEFAULT_ROOT, handle, grantLink
       const siblingGitDir = linkedGitDir(sibling);
       chownTree(sibling, ROOT_UID, ROOT_GID);
       chmodTree(sibling, { fileMode: 0o600, directoryMode: 0o700 });
+      lockGitIndirectionFile(sibling);
       if (siblingGitDir) lockLinkedGitDir(siblingGitDir);
     }
   }
@@ -113,6 +133,8 @@ export function grantWorktreeToAgent({ rootDir = DEFAULT_ROOT, handle, grantLink
   const gitDir = linkedGitDir(target);
   if (identity) chownTree(target, identity.uid, identity.gid);
   chmodTree(target, { fileMode: 0o600, directoryMode: 0o700 });
+  lockGitIndirectionFile(target);
+  grantWritableWorktreeRoot(target, identity);
   if (identity && gitDir && grantLinkedGitDir) {
     chownTree(gitDir, identity.uid, identity.gid);
     chmodTree(gitDir, { fileMode: 0o600, directoryMode: 0o700 });
@@ -153,7 +175,7 @@ export function createWorktree({
     runGitAsRepositoryOwner(target, ["config", "--worktree", "remote.origin.pushurl", DISABLED_PUSH_URL]);
     const status = runGitAsRepositoryOwner(target, ["status", "--porcelain=v1", "--untracked-files=all"]);
     if (status) throw new Error("new worktree is dirty");
-    lockWorktree({ rootDir, handle, lockLinkedGitDir: false });
+    lockWorktree({ rootDir, handle });
     return { id: safeHandle(handle), path: target, baseCommit: safeBase };
   } catch (error) {
     rmSync(target, { recursive: true, force: true });

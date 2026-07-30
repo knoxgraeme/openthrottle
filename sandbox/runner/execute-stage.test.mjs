@@ -5,6 +5,7 @@ import {
   mkdirSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -575,6 +576,10 @@ describe("one-stage executor", () => {
     expect(readFileSync(join(materialized, "SKILL.md"), "utf8")).toContain("name: implement_unit");
     expect(readFileSync(join(materialized, "helper.txt"), "utf8")).toBe("helper\n");
     expect(existsSync(join(discoveryRoot, "other-skill"))).toBe(false);
+    unlockDiscoveryRoot();
+    writeFileSync(join(repoDir, skillDir, "helper.txt"), "mutated worktree bytes\n");
+    const rematerialized = materializeRepositorySkill({ request, repoDir });
+    expect(readFileSync(join(rematerialized, "helper.txt"), "utf8")).toBe("helper\n");
     expectMaterializeToThrow({ ...repositorySkill, packageDigest: "0".repeat(64) }, /package digest mismatch/);
     const outsidePath = ".agents/skills/other-skill/SKILL.md";
     const outsideBytes = readFileSync(join(repoDir, outsidePath));
@@ -609,6 +614,8 @@ describe("one-stage executor", () => {
 
     expect(scoped.env).toContain(`HOME=${join(stageActionRoot, "attempt-1", "home")}`);
     expect(scoped.env).toContain(`CODEX_HOME=${join(stageActionRoot, "attempt-1", "codex")}`);
+    expect(statSync(stageActionRoot).mode & 0o777).toBe(0o711);
+    expect(statSync(join(stageActionRoot, "attempt-1")).mode & 0o777).toBe(0o711);
     expect(scopedMaterialized).toBe(join(stageActionRoot, "attempt-1", "codex", "skills", "implement_unit"));
     expect(readFileSync(join(scopedMaterialized, "SKILL.md"), "utf8")).toContain("name: implement_unit");
     expect(existsSync(join(globalDiscoveryRoot, "implement_unit"))).toBe(false);
