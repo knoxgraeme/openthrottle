@@ -56,12 +56,6 @@ function lockLinkedGitDir(gitDir) {
   chmodTree(gitDir, { fileMode: 0o600, directoryMode: 0o700 });
 }
 
-function lockReadOnlyTree(path) {
-  if (!isRoot() || !existsSync(path)) return;
-  chownTree(path, ROOT_UID, ROOT_GID);
-  chmodTree(path, { fileMode: 0o444, directoryMode: 0o555 });
-}
-
 function lockObjectStore(path) {
   if (!isRoot() || !existsSync(path)) return;
   chownTree(path, ROOT_UID, ROOT_GID);
@@ -257,17 +251,7 @@ function main() {
     writeFileSync(1, `${JSON.stringify(result)}\n`);
     return;
   }
-  if (command === "grant") {
-    const result = grantWorktreeToAgent({ rootDir, handle });
-    writeFileSync(1, `${JSON.stringify(result)}\n`);
-    return;
-  }
-  if (command === "lock") {
-    const result = lockWorktree({ rootDir, handle });
-    writeFileSync(1, `${JSON.stringify(result)}\n`);
-    return;
-  }
-  throw new Error("Usage: worktrees.mjs create|candidate|remove|grant|lock --handle <id> [--repo <path>] [--root <path>] [--base <commit>]");
+  throw new Error("Usage: worktrees.mjs create|candidate|remove --handle <id> [--repo <path>] [--root <path>] [--base <commit>]");
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

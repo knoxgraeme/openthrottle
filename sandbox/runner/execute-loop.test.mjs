@@ -313,8 +313,8 @@ describe("loop action request validation", () => {
         events.push("process-fence");
         return execute();
       },
-      lockIntegration: (path, options) => {
-        events.push(`lock-integration:${path}:${"preservedLinkedGitDir" in options}`);
+      lockIntegration: (path) => {
+        events.push(`lock-integration:${path}`);
         return true;
       },
       runProcess: (command, args, options) => {
@@ -336,10 +336,10 @@ describe("loop action request validation", () => {
 
     expect(result.status).toBe(0);
     expect(events).toEqual([
-      `lock-integration:${integrationRepoDir}:true`,
+      `lock-integration:${integrationRepoDir}`,
       "process-fence",
       `run:gosu:${loopWorktreeDirectory(valid)}`,
-      `lock-integration:${integrationRepoDir}:true`,
+      `lock-integration:${integrationRepoDir}`,
     ]);
   });
 
@@ -566,6 +566,72 @@ describe("executeLoopAction", () => {
 
     expect(result.outcome).toBe("failure");
     expect(result.receipt).toMatch(/agent launch failed/);
+    expect(lockWorkerWorktree).toHaveBeenCalledOnce();
+    expect(lockActionDirectory).toHaveBeenCalledOnce();
+  });
+
+  it("returns a typed failure when launch failure leaves subject attestation unavailable", () => {
+    const lockWorkerWorktree = vi.fn();
+    const lockActionDirectory = vi.fn();
+    const valid = request();
+    chmodSync(join(loopWorktreeDirectory(valid), ".git"), 0o000);
+
+    const result = executeLoopAction({
+      request: valid,
+      lockWorkerWorktree,
+      lockActionDirectory,
+      runLoopAgent: () => {
+        throw new Error("agent launch failed");
+      },
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result).toMatchObject({
+      kind: "loop_action_result",
+      action_id: "action-1",
+      outcome: "failure",
+      subject: null,
+      created_at: "2026-07-29T00:00:00.000Z",
+    });
+    expect(result.receipt).toMatch(/workspace subject attestation failed/);
+    expect(lockWorkerWorktree).toHaveBeenCalledOnce();
+    expect(lockActionDirectory).toHaveBeenCalledOnce();
+  });
+
+  it("returns a typed infrastructure failure when relocking fails", () => {
+    const valid = request();
+    const receipt = standardReceipt(valid);
+    const lockWorkerWorktree = vi.fn(() => {
+      throw new Error("worktree relock failed");
+    });
+    const lockActionDirectory = vi.fn(() => {
+      throw new Error("action relock failed");
+    });
+
+    const result = executeLoopAction({
+      request: valid,
+      lockWorkerWorktree,
+      lockActionDirectory,
+      runLoopAgent: () => ({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: JSON.stringify(receipt),
+        stderr: "",
+        nativeSessionId: "thread-1",
+      }),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result).toMatchObject({
+      kind: "loop_action_result",
+      action_id: "action-1",
+      outcome: "retryable_infrastructure_failure",
+      native_session_id: "thread-1",
+      created_at: "2026-07-29T00:00:00.000Z",
+    });
+    expect(result.receipt).toContain("worktree relock failed");
+    expect(result.receipt).toContain("action relock failed");
     expect(lockWorkerWorktree).toHaveBeenCalledOnce();
     expect(lockActionDirectory).toHaveBeenCalledOnce();
   });

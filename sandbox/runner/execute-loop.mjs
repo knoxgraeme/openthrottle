@@ -412,7 +412,7 @@ function prepareLoopGitObjectEnvironment(request, repoDir) {
     ...objectValues,
   };
   return {
-    values: objectValues,
+    values: agentValues,
     env: [
       `GIT_DIR=${agentValues.GIT_DIR}`,
       `GIT_WORK_TREE=${agentValues.GIT_WORK_TREE}`,
@@ -453,11 +453,6 @@ function prepareLoopRepository(request, integrationRepoDir = INTEGRATION_REPO_DI
   return createReadOnlyRepositoryView(request, integrationRepoDir);
 }
 
-function lockReadOnlyTree(path) {
-  chownTree(path, ROOT_UID, ROOT_GID);
-  chmodTree(path, { fileMode: 0o444, directoryMode: 0o555 });
-}
-
 function lockObjectStore(path) {
   lockPrivateTree(path);
 }
@@ -467,7 +462,7 @@ function lockPrivateTree(path) {
   chmodTree(path, { fileMode: 0o600, directoryMode: 0o700 });
 }
 
-function lockGitMetadata(gitDir, preservedLinkedGitDir) {
+function lockGitMetadata(gitDir) {
   if (!existsSync(gitDir) || !lstatSync(gitDir).isDirectory()) return;
   chownSync(gitDir, ROOT_UID, ROOT_GID);
   chmodSync(gitDir, 0o711);
@@ -492,32 +487,20 @@ function lockGitMetadata(gitDir, preservedLinkedGitDir) {
   }
 }
 
-function lockIntegrationCheckout(path = INTEGRATION_REPO_DIR, { preservedLinkedGitDir = null } = {}) {
+function lockIntegrationCheckout(path = INTEGRATION_REPO_DIR) {
   if (!isRoot() || !existsSync(path)) return false;
   chownSync(path, ROOT_UID, ROOT_GID);
   chmodSync(path, 0o711);
   for (const entry of readdirSync(path)) {
     const child = resolve(path, entry);
     if (entry === ".git") {
-      lockGitMetadata(child, preservedLinkedGitDir);
+      lockGitMetadata(child);
       continue;
     }
     chownTree(child, ROOT_UID, ROOT_GID);
     chmodTree(child, { fileMode: 0o600, directoryMode: 0o700 });
   }
   return true;
-}
-
-function linkedWorktreeGitDir(repoDir) {
-  if (!repoDir || !existsSync(repoDir)) return null;
-  try {
-    const gitDir = runRootGit(repoDir, ["rev-parse", "--absolute-git-dir"]);
-    const commonDir = runRootGit(repoDir, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
-    if (commonDir === gitDir || !pathInside(commonDir, gitDir)) return null;
-    return gitDir;
-  } catch {
-    return null;
-  }
 }
 
 function lockCurrentWorkerWorktree(request) {
@@ -569,20 +552,19 @@ export function runLoopAgentInPreparedRepository({
   const repoDir = prepareLoopRepository(request, integrationRepoDir);
   const preparedEnvironment = prepareLoopAgentEnvironment(request, repoDir);
   const built = loopAgentCommand({ request, invocation, repoDir, repositorySkillRoot: preparedEnvironment.repositorySkillRoot });
-  const preservedLinkedGitDir = request.worktree ? linkedWorktreeGitDir(repoDir) : null;
-  lockIntegration(integrationRepoDir, { preservedLinkedGitDir });
+  lockIntegration(integrationRepoDir);
   makeCurrentActionDirectoryTraverseOnly(request);
   try {
     const result = processFence(() => runProcess("gosu", [
-        "agent", "env", ...preparedEnvironment.env, built.command, ...built.args,
-      ], {
-        cwd: built.repoDir,
-        input: built.input,
-        timeout: request.timeoutMs,
-      }));
+      "agent", "env", ...preparedEnvironment.env, built.command, ...built.args,
+    ], {
+      cwd: built.repoDir,
+      input: built.input,
+      timeout: request.timeoutMs,
+    }));
     return { ...result, gitObjectEnv: preparedEnvironment.gitObjectEnv };
   } finally {
-    lockIntegration(integrationRepoDir, { preservedLinkedGitDir });
+    lockIntegration(integrationRepoDir);
   }
 }
 
@@ -650,6 +632,8 @@ export function executeLoopAction({
   now = () => new Date().toISOString(),
 }) {
   const request = validateLoopRequest(rawRequest);
+  const cleanupErrors = [];
+  let result;
   try {
     const invocation = resolveLoopInvocation(request);
     let execution;
@@ -659,10 +643,18 @@ export function executeLoopAction({
       execution = { status: null, signal: null, timedOut: false, stdout: "", stderr: String(error), nativeSessionId: request.nativeSessionId };
     }
     const worktreeDir = loopWorktreeDirectory(request);
-    const subject = worktreeDir ? computeWorkspaceTreeOid(worktreeDir, execution.gitObjectEnv ?? undefined) : null;
+    let subject = null;
+    let subjectError = null;
+    if (worktreeDir) {
+      try {
+        subject = computeWorkspaceTreeOid(worktreeDir, execution.gitObjectEnv ?? undefined);
+      } catch (error) {
+        subjectError = `workspace subject attestation failed: ${error instanceof Error ? error.message : String(error)}`;
+      }
+    }
     let parsedReceipt = null;
     let receiptError = null;
-    if (!execution.timedOut && !execution.signal && execution.status === 0 && request.receiptSchema === "openthrottle.receipt/v1") {
+    if (!subjectError && !execution.timedOut && !execution.signal && execution.status === 0 && request.receiptSchema === "openthrottle.receipt/v1") {
       try {
         parsedReceipt = parseLoopReceipt(execution.stdout, process.env);
         assertLoopReceiptFence(parsedReceipt, request, subject);
@@ -670,8 +662,8 @@ export function executeLoopAction({
         receiptError = error instanceof Error ? error.message : String(error);
       }
     }
-    const failed = execution.timedOut || execution.signal || execution.status !== 0 || Boolean(receiptError);
-    return {
+    const failed = Boolean(subjectError) || execution.timedOut || execution.signal || execution.status !== 0 || Boolean(receiptError);
+    result = {
       version: 1,
       kind: "loop_action_result",
       event_id: randomUUID(),
@@ -683,13 +675,26 @@ export function executeLoopAction({
       subject,
       receipt: parsedReceipt
         ? canonicalJson(parsedReceipt)
-        : sanitizeArtifactText(receiptError || execution.stdout || execution.stderr || (failed ? "loop action failed" : "loop action completed")).slice(0, 128_000),
+        : sanitizeArtifactText(subjectError || receiptError || execution.stdout || execution.stderr || (failed ? "loop action failed" : "loop action completed")).slice(0, 128_000),
       created_at: now(),
     };
   } finally {
-    lockWorkerWorktree(request);
-    lockActionDirectory(request);
+    for (const cleanup of [lockWorkerWorktree, lockActionDirectory]) {
+      try {
+        cleanup(request);
+      } catch (error) {
+        cleanupErrors.push(error instanceof Error ? error.message : String(error));
+      }
+    }
   }
+  if (cleanupErrors.length > 0) {
+    return {
+      ...result,
+      outcome: "retryable_infrastructure_failure",
+      receipt: sanitizeArtifactText(`loop action cleanup failed: ${cleanupErrors.join("; ")}`).slice(0, 128_000),
+    };
+  }
+  return result;
 }
 
 function writeAtomic(path, value) {

@@ -63,7 +63,10 @@ chown root:root "$SEALED"
 chmod 0400 "$SEALED"
 
 mkdir -p "$INTEGRATION/.git/objects/info"
-printf '# packed refs probe\n' > "$INTEGRATION/.git/packed-refs"
+{
+  printf '# pack-refs with: peeled fully-peeled sorted\n'
+  printf '%s refs/tags/packed-probe\n' "$BASE"
+} > "$INTEGRATION/.git/packed-refs"
 printf 'alternate secret\n' > "$INTEGRATION/.git/objects/info/alternates.probe"
 chown root:root "$INTEGRATION/.git/objects/info" "$INTEGRATION/.git/objects/info/alternates.probe" "$INTEGRATION/.git/packed-refs"
 chmod 0500 "$INTEGRATION/.git/objects/info"

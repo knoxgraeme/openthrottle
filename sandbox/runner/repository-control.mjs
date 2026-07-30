@@ -134,13 +134,31 @@ function gitAlternateObjectDirectories(extraGitEnv) {
   return directories;
 }
 
+function inheritedGitEnvironment() {
+  return Object.fromEntries(
+    ["GIT_DIR", "GIT_WORK_TREE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"]
+      .filter((name) => typeof process.env[name] === "string" && process.env[name])
+      .map((name) => [name, process.env[name]])
+  );
+}
+
+function gitRepositoryEnvironment(extraGitEnv) {
+  if (!extraGitEnv || typeof extraGitEnv !== "object") return {};
+  return Object.fromEntries(
+    ["GIT_DIR", "GIT_WORK_TREE"]
+      .filter((name) => typeof extraGitEnv[name] === "string" && extraGitEnv[name])
+      .map((name) => [name, extraGitEnv[name]])
+  );
+}
+
 export function computeWorkspaceTreeOidFromTree(repoDir, baseTree, extraGitEnv = {}) {
   const temporary = mkdtempSync(join(tmpdir(), "ot-stage-index-"));
   const indexPath = join(temporary, "index");
   const objectPath = join(temporary, "objects");
   try {
     prepareRepositoryOwnerDirectory(temporary);
-    const extraAlternates = gitAlternateObjectDirectories(extraGitEnv);
+    const effectiveGitEnv = { ...inheritedGitEnvironment(), ...extraGitEnv };
+    const extraAlternates = gitAlternateObjectDirectories(effectiveGitEnv);
     const commonDir = extraAlternates.length === 0
       ? optionalRepositoryOwnerGit(repoDir, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
       : null;
@@ -154,6 +172,7 @@ export function computeWorkspaceTreeOidFromTree(repoDir, baseTree, extraGitEnv =
     }
     const alternates = extraAlternates.length > 0 ? extraAlternates : (commonObjects ? [commonObjects] : []);
     const env = {
+      ...gitRepositoryEnvironment(effectiveGitEnv),
       GIT_INDEX_FILE: indexPath,
       ...(isolateObjects ? {
         GIT_OBJECT_DIRECTORY: objectPath,
