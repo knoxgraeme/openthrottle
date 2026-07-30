@@ -54,10 +54,17 @@ export function validateGraphSelectionForShip(
   file: string,
   graphId?: string
 ): LocalGraphSelection | undefined {
-  if (!graphId && !existsSync(".openthrottle.yml")) return undefined;
   const content = readFileSync(file, "utf8");
   const blocks = extractExecutionPlanBlocks(content);
   const plan = blocks.length > 0 ? readExecutionPlanFromMarkdown(content, file) : undefined;
+  if (!graphId && !existsSync(".openthrottle.yml")) {
+    if (plan) {
+      throw new Error(
+        `${file}: cannot validate execution_plan.graph_id ${plan.plan.value.graph_id} without .openthrottle.yml; run openthrottle init first`
+      );
+    }
+    return undefined;
+  }
   const selectedGraphId = graphId ?? plan?.plan.value.graph_id;
   const graph = validateLocalGraphSelection({ graphId: selectedGraphId });
   if (graph.consumesUnits) {
