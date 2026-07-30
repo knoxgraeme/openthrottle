@@ -14,6 +14,7 @@ import {
   branchExists,
   getMergeReadiness,
   getRepositoryConfigAtCommit,
+  getRepositoryFileAtCommit,
   mergePullRequest,
   parsePullRequestUrl,
 } from "../providers/github/client.js";
@@ -187,7 +188,8 @@ describe("pipeline admission", () => {
     repositoryConfig: string,
     overrides: Partial<Config> = {},
     catalogPath = shippedCatalogPath,
-    event = payload()
+    event = payload(),
+    repositoryFiles: Record<string, string> = {}
   ) {
     db = openDb(":memory:");
     const pipelines = createPipelineStore(db);
@@ -219,6 +221,20 @@ describe("pipeline admission", () => {
           size: Buffer.byteLength(currentRepositoryConfig),
         });
       }
+      const fileMatch = url.match(/\/contents\/([^?]+)\?ref=/);
+      if (fileMatch) {
+        const path = fileMatch[1]!.split("/").map(decodeURIComponent).join("/");
+        const content = repositoryFiles[path];
+        if (content !== undefined) {
+          return Response.json({
+            type: "file",
+            sha: "c".repeat(40),
+            encoding: "base64",
+            content: Buffer.from(content).toString("base64"),
+            size: Buffer.byteLength(content),
+          });
+        }
+      }
       throw new Error(`unexpected GitHub request: ${url}`);
     });
     vi.stubGlobal("fetch", githubFetch);
@@ -247,6 +263,8 @@ describe("pipeline admission", () => {
           branchExists({ token: "github-token" }, repository, branch),
         getRepositoryConfigAtCommit: (repository: string, branch: string) =>
           getRepositoryConfigAtCommit({ token: "github-token" }, repository, branch),
+        getRepositoryFileAtCommit: (repository: string, commit: string, path: string) =>
+          getRepositoryFileAtCommit({ token: "github-token" }, repository, commit, path),
       },
       merger: {
         parsePullRequestUrl,
@@ -430,6 +448,75 @@ intents:
     expect(payloads.some((entry) => entry.includes(expectedMessage))).toBe(true);
   }
 
+  it("admits a pinned custom command-only graph without an execution plan", async () => {
+    const graphPath = ".openthrottle/graphs/docs.json";
+    const graph = JSON.stringify({
+      schema: "openthrottle.graph/v1",
+      id: "docs",
+      version: 1,
+      entry_node: "verify",
+      workers: [
+        {
+          id: "commands",
+          engine: "command",
+          session_scope: "attempt",
+          credentials: ["repo.read"],
+          skills: ["builtin://commands@1"],
+        },
+      ],
+      loops: [
+        {
+          id: "command_loop",
+          worker: "commands",
+          input_scope: "command",
+          receipt: "command_result",
+          max_parallel: 1,
+          max_rounds: 1,
+          skill: "builtin://commands@1",
+          timeout_seconds: 60,
+        },
+      ],
+      nodes: [
+        {
+          id: "verify",
+          kind: "command",
+          command: "test",
+          depends_on: [],
+          transitions: {
+            success: { terminal: "completed" },
+            failure: { terminal: "failed" },
+          },
+        },
+      ],
+    });
+    const { pipelines } = await run(
+      `schema: openthrottle.config/v1
+default_graph: docs
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: docs
+    kind: path
+    ref: ${graphPath}
+pipelines: { implement: implement, docs: fixture-command }
+intents:
+  implement:
+    default_graph: docs
+    allowed_graphs: [simple, docs]
+test: "true"
+`,
+      { codexAuthJson: undefined, claudeCodeOauthToken: undefined, kimiCodeApiKey: undefined },
+      fixtureCatalogPath,
+      payload(),
+      { [graphPath]: graph }
+    );
+
+    expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
+      pipeline_id: "fixture/command",
+      pipeline_version: 2,
+    });
+  });
   it("fails closed before provisioning when a structured selection omits its execution plan", async () => {
     await expectSelectionFailure(
       [
