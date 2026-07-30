@@ -1,5 +1,5 @@
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -225,6 +225,42 @@ function assertPrepareRunnerSucceeded(result: SpawnSyncReturns<Buffer>): void {
   }
 }
 
+const SAFE_PREPARE_ENV_KEYS = [
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "TMPDIR",
+  "LANG",
+  "LC_ALL",
+  "TERM",
+  "COLORTERM",
+  "NO_COLOR",
+  "FORCE_COLOR",
+  "TZ",
+  "XDG_CONFIG_HOME",
+  "XDG_CACHE_HOME",
+  "XDG_DATA_HOME",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  "NODE_EXTRA_CA_CERTS",
+] as const;
+
+const PREPARE_AUTH_ENV_KEYS: Record<PrepareRunnerInput["agent"], readonly string[]> = {
+  codex: ["OPENAI_API_KEY", "CODEX_HOME"],
+  claude: ["CLAUDE_CODE_OAUTH_TOKEN"],
+  opencode: ["KIMI_CODE_API_KEY"],
+};
+
+function prepareRunnerEnvironment(agent: PrepareRunnerInput["agent"]): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of [...SAFE_PREPARE_ENV_KEYS, ...PREPARE_AUTH_ENV_KEYS[agent]]) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
+  return env;
+}
 export const defaultPrepareRunner: PrepareRunner = ({ agent, model, prompt, directory }) => {
   let command: string;
   let args: string[];
@@ -240,8 +276,7 @@ export const defaultPrepareRunner: PrepareRunner = ({ agent, model, prompt, dire
     command = "opencode";
     args = ["run", "--format", "json", "--model", model ?? "", "--dir", directory, "--auto", prompt];
   }
-  const env = agent === "codex" ? { ...process.env } : undefined;
-  if (env) delete env.CODEX_AUTH_JSON;
+  const env = prepareRunnerEnvironment(agent);
   const result = spawnSync(command, args, {
     cwd: directory,
     env,
@@ -264,6 +299,25 @@ export const defaultPrepareRunner: PrepareRunner = ({ agent, model, prompt, dire
   return result;
 };
 
+function normalizedPlanProse(markdown: string): string {
+  let prose = markdown;
+  const blocks = extractExecutionPlanBlocks(markdown);
+  for (const block of [...blocks].reverse()) {
+    prose = prose.slice(0, block.start) + prose.slice(block.end);
+  }
+  return prose
+    .replace(/[ \t]+$/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function preservesPlanProse(before: string, after: string, hadPlan: boolean): boolean {
+  const expected = normalizedPlanProse(before);
+  const actual = normalizedPlanProse(after);
+  if (actual === expected) return true;
+  if (hadPlan) return false;
+  return actual.replace(/(?:^|\n)## Execution Plan\s*$/, "").trim() === expected;
+}
 export function prepareExecutionPlanFile(
   file: string,
   options: { graphId?: string; directory?: string; runner?: PrepareRunner } = {}
@@ -279,17 +333,27 @@ export function prepareExecutionPlanFile(
   }
   assertPrepareEngineUsable(agent, graph.config.value.model);
   const runner = options.runner ?? defaultPrepareRunner;
-  const before = extractExecutionPlanBlocks(readFileSync(file, "utf8"));
+  const original = readFileSync(file, "utf8");
+  const before = extractExecutionPlanBlocks(original);
   if (before.length > 1) {
     throw new Error(`${file}: expected at most one ${EXECUTION_PLAN_FENCE} block before prepare, found ${before.length}`);
   }
   const prompt = buildPreparePrompt(file, graph.graphId, readPrepareSkillBundle());
-  assertPrepareRunnerSucceeded(runner({ agent, model: graph.config.value.model, prompt, directory }));
-  const result = readExecutionPlanFromMarkdown(readFileSync(file, "utf8"), file);
-  if (result.plan.value.graph_id !== graph.graphId) {
-    throw new Error(`${file}: execution_plan.graph_id must match selected graph ${graph.graphId}`);
+  try {
+    assertPrepareRunnerSucceeded(runner({ agent, model: graph.config.value.model, prompt, directory }));
+    const prepared = readFileSync(file, "utf8");
+    if (!preservesPlanProse(original, prepared, before.length === 1)) {
+      throw new Error(`${file}: prepare modified content outside the execution-plan block`);
+    }
+    const result = readExecutionPlanFromMarkdown(prepared, file);
+    if (result.plan.value.graph_id !== graph.graphId) {
+      throw new Error(`${file}: execution_plan.graph_id must match selected graph ${graph.graphId}`);
+    }
+    return result;
+  } catch (error) {
+    writeFileSync(file, original);
+    throw error;
   }
-  return result;
 }
 
 function validateSelectedGraph(result: ValidationResult, graphId: string): void {
