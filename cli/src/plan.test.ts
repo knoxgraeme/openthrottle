@@ -231,12 +231,35 @@ describe("plan validation", () => {
       expect(() => prepareExecutionPlanFile(planPath, { directory, graphId: "structured", runner })).toThrow(
         /engine failed/
       );
+      expect(readFileSync(planPath, "utf8")).toBe(cePlan);
     } finally {
       if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
       else process.env.OPENAI_API_KEY = previousOpenAiKey;
     }
   });
 
+  it("restores the plan when prepare rewrites prose outside the execution-plan block", () => {
+    const directory = temporaryProject();
+    const planPath = join(directory, "plan.md");
+    const original = planWithBlock("structured");
+    writeConfig(directory);
+    writeFileSync(planPath, original);
+    const previousOpenAiKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "test-key";
+    const runner: PrepareRunner = () => {
+      writeFileSync(planPath, `# Rewritten requirements\n\n${executionPlanBlock("structured")}\n`);
+      return { status: 0, signal: null, output: [], pid: 123, stdout: Buffer.from(""), stderr: Buffer.from("") };
+    };
+    try {
+      expect(() => prepareExecutionPlanFile(planPath, { directory, graphId: "structured", runner })).toThrow(
+        /modified content outside/
+      );
+      expect(readFileSync(planPath, "utf8")).toBe(original);
+    } finally {
+      if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previousOpenAiKey;
+    }
+  });
   it("allows only automatic Read/Edit tools for noninteractive Claude preparation", () => {
     const directory = temporaryProject();
     const bin = join(directory, "bin");
@@ -248,15 +271,13 @@ describe("plan validation", () => {
       [
         "#!/usr/bin/env node",
         "const fs = require('node:fs');",
-        "fs.writeFileSync(process.env.OT_TEST_CLAUDE_ARGS, JSON.stringify(process.argv.slice(2)));",
+        `fs.writeFileSync(${JSON.stringify(argsPath)}, JSON.stringify(process.argv.slice(2)));`,
       ].join("\n")
     );
     chmodSync(fakeClaude, 0o755);
 
     const previousPath = process.env.PATH;
-    const previousArgsPath = process.env.OT_TEST_CLAUDE_ARGS;
     process.env.PATH = `${bin}:${previousPath ?? ""}`;
-    process.env.OT_TEST_CLAUDE_ARGS = argsPath;
     try {
       defaultPrepareRunner({ agent: "claude", prompt: "prepare", directory });
       const args = JSON.parse(readFileSync(argsPath, "utf8")) as string[];
@@ -269,11 +290,79 @@ describe("plan validation", () => {
     } finally {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
-      if (previousArgsPath === undefined) delete process.env.OT_TEST_CLAUDE_ARGS;
-      else process.env.OT_TEST_CLAUDE_ARGS = previousArgsPath;
     }
   });
 
+  it("passes only safe settings and the selected engine auth to prepare subprocesses", () => {
+    const directory = temporaryProject();
+    const bin = join(directory, "bin");
+    mkdirSync(bin);
+    for (const command of ["codex", "claude", "opencode"]) {
+      const executable = join(bin, command);
+      writeFileSync(
+        executable,
+        [
+          "#!/usr/bin/env node",
+          "const fs = require('node:fs');",
+          "const path = require('node:path');",
+          "const name = path.basename(process.argv[1]);",
+          "fs.writeFileSync(path.join(process.cwd(), `${name}-env.json`), JSON.stringify(process.env));",
+        ].join("\n")
+      );
+      chmodSync(executable, 0o755);
+    }
+
+    const keys = [
+      "PATH",
+      "OPENAI_API_KEY",
+      "CODEX_HOME",
+      "CLAUDE_CODE_OAUTH_TOKEN",
+      "KIMI_CODE_API_KEY",
+      "LINEAR_API_KEY",
+      "DAYTONA_API_KEY",
+      "OT_STATUS_TOKEN",
+      "GITHUB_TOKEN",
+    ] as const;
+    const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    process.env.PATH = `${bin}:${process.env.PATH ?? ""}`;
+    process.env.OPENAI_API_KEY = "openai-auth";
+    process.env.CODEX_HOME = join(directory, "codex-home");
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = "claude-auth";
+    process.env.KIMI_CODE_API_KEY = "kimi-auth";
+    process.env.LINEAR_API_KEY = "linear-secret";
+    process.env.DAYTONA_API_KEY = "daytona-secret";
+    process.env.OT_STATUS_TOKEN = "status-secret";
+    process.env.GITHUB_TOKEN = "github-secret";
+    try {
+      defaultPrepareRunner({ agent: "codex", prompt: "prepare", directory });
+      defaultPrepareRunner({ agent: "claude", prompt: "prepare", directory });
+      defaultPrepareRunner({ agent: "opencode", model: "kimi/test", prompt: "prepare", directory });
+      const codex = JSON.parse(readFileSync(join(directory, "codex-env.json"), "utf8")) as Record<string, string>;
+      const claude = JSON.parse(readFileSync(join(directory, "claude-env.json"), "utf8")) as Record<string, string>;
+      const opencode = JSON.parse(readFileSync(join(directory, "opencode-env.json"), "utf8")) as Record<string, string>;
+      expect(codex).toMatchObject({ OPENAI_API_KEY: "openai-auth", CODEX_HOME: join(directory, "codex-home") });
+      expect(claude).toMatchObject({ CLAUDE_CODE_OAUTH_TOKEN: "claude-auth" });
+      expect(opencode).toMatchObject({ KIMI_CODE_API_KEY: "kimi-auth" });
+      expect(codex).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
+      expect(codex).not.toHaveProperty("KIMI_CODE_API_KEY");
+      expect(claude).not.toHaveProperty("OPENAI_API_KEY");
+      expect(claude).not.toHaveProperty("KIMI_CODE_API_KEY");
+      expect(opencode).not.toHaveProperty("OPENAI_API_KEY");
+      expect(opencode).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
+      for (const env of [codex, claude, opencode]) {
+        expect(env).not.toHaveProperty("LINEAR_API_KEY");
+        expect(env).not.toHaveProperty("DAYTONA_API_KEY");
+        expect(env).not.toHaveProperty("OT_STATUS_TOKEN");
+        expect(env).not.toHaveProperty("GITHUB_TOKEN");
+      }
+    } finally {
+      for (const key of keys) {
+        const value = previous[key];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
   it("rejects malformed prepare arguments", async () => {
     const exit = process.exit;
     const error = console.error;
@@ -305,12 +394,13 @@ describe("plan validation", () => {
         "#!/usr/bin/env node",
         "const fs = require('node:fs');",
         "if (process.env.CODEX_AUTH_JSON) process.exit(6);",
+        "if (process.env.LINEAR_API_KEY || process.env.DAYTONA_API_KEY || process.env.OT_STATUS_TOKEN) process.exit(8);",
         "const args = process.argv.slice(2);",
         "const sandboxIndex = args.indexOf('--sandbox');",
         "if (sandboxIndex < 0 || args[sandboxIndex + 1] !== 'workspace-write') process.exit(7);",
         "process.stdin.resume();",
         "process.stdin.on('end', () => {",
-        "  fs.writeFileSync(process.env.OT_TEST_PLAN_PATH, process.env.OT_TEST_PLAN_BODY);",
+        `  fs.writeFileSync(${JSON.stringify(planPath)}, ${JSON.stringify(preparedPlan)});`,
         "  process.stdout.write('x'.repeat(2 * 1024 * 1024));",
         "});",
       ].join("\n")
@@ -321,15 +411,11 @@ describe("plan validation", () => {
     const previousPath = process.env.PATH;
     const previousOpenAiKey = process.env.OPENAI_API_KEY;
     const previousCodexAuth = process.env.CODEX_AUTH_JSON;
-    const previousPlanPath = process.env.OT_TEST_PLAN_PATH;
-    const previousPlanBody = process.env.OT_TEST_PLAN_BODY;
     const log = console.log;
     const output: string[] = [];
     process.env.PATH = `${bin}:${previousPath ?? ""}`;
     process.env.OPENAI_API_KEY = "test-key";
     process.env.CODEX_AUTH_JSON = '{"tokens":{"access_token":"must-not-reach-child"}}';
-    process.env.OT_TEST_PLAN_PATH = planPath;
-    process.env.OT_TEST_PLAN_BODY = preparedPlan;
     console.log = (message?: unknown) => {
       output.push(String(message));
     };
@@ -353,10 +439,6 @@ describe("plan validation", () => {
       else process.env.OPENAI_API_KEY = previousOpenAiKey;
       if (previousCodexAuth === undefined) delete process.env.CODEX_AUTH_JSON;
       else process.env.CODEX_AUTH_JSON = previousCodexAuth;
-      if (previousPlanPath === undefined) delete process.env.OT_TEST_PLAN_PATH;
-      else process.env.OT_TEST_PLAN_PATH = previousPlanPath;
-      if (previousPlanBody === undefined) delete process.env.OT_TEST_PLAN_BODY;
-      else process.env.OT_TEST_PLAN_BODY = previousPlanBody;
     }
   });
 
