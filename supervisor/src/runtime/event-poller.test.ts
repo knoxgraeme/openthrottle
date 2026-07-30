@@ -619,6 +619,59 @@ describe("sandbox event contracts", () => {
     );
   });
 
+  it("forwards activity from action-scoped loop outboxes", async () => {
+    const store = seedRunningTicket();
+    const action = JSON.stringify({
+      version: 1,
+      kind: "activity",
+      event_id: "55555555-5555-4555-8555-555555555555",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:04.000Z",
+      type: "thought",
+      body: "loop action progress",
+    });
+    const eventPath = "/var/lib/openthrottle/loop-actions/attempt-child/action-1/outbox/001.json";
+    const files = new Map([[eventPath, Buffer.from(action)]]);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      setAutostopInterval: vi.fn(async () => undefined),
+      fs: {
+        listFiles: vi.fn(async (path: string) => {
+          if (path === "/var/lib/openthrottle/loop-actions") {
+            return [{ name: "attempt-child", path: "/var/lib/openthrottle/loop-actions/attempt-child", size: 0, isDir: true }];
+          }
+          if (path === "/var/lib/openthrottle/loop-actions/attempt-child") {
+            return [{ name: "action-1", path: "/var/lib/openthrottle/loop-actions/attempt-child/action-1", size: 0, isDir: true }];
+          }
+          if (path === "/var/lib/openthrottle/loop-actions/attempt-child/action-1/outbox") {
+            return [{ name: "001.json", path: eventPath, size: action.length, isDir: false }];
+          }
+          return [];
+        }),
+        downloadFile: vi.fn(async (path: string) => files.get(path)!),
+        deleteFile: vi.fn(async (path: string) => {
+          files.delete(path);
+        }),
+      },
+    } ;
+    const runtime = { getWorkspace: vi.fn(async () => sandbox), setActive: vi.fn(async () => undefined), setIdle: vi.fn(async () => undefined) } ;
+    const postActivity = vi.fn(async () => undefined);
+
+    await pollSandboxEvents({
+      runtime,
+      store,
+      postActivity,
+    });
+
+    expect(postActivity).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "thought", body: "loop action progress" }),
+      expect.anything()
+    );
+    expect(files.size).toBe(0);
+  });
+
   it("forwards a plan event to the session-update handler", async () => {
     const store = seedRunningTicket();
     const planEvent = JSON.stringify({

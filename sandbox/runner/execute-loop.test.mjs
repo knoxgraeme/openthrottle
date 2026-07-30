@@ -345,6 +345,68 @@ describe("loop action request validation", () => {
     expect(statSync(siblingSecret).mode & 0o777).toBe(0o600);
   });
 
+  it("runs non-worker loops in an action-scoped read-only repository view", () => {
+    const integrationRepoDir = repository();
+    const valid = validateLoopRequest(request({
+      role: "lead",
+      loop: "lead",
+      worktree: null,
+      credentialScopes: ["repo.read"],
+    }));
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+    directories.push(actionRoot);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+    const expectedView = join(actionRoot, valid.attemptId, valid.actionId, "repo-view");
+
+    const result = runLoopAgentInPreparedRepository({
+      request: valid,
+      invocation: resolveLoopInvocation(valid),
+      integrationRepoDir,
+      lockIntegration: () => true,
+      runProcess: (command, args, options) => {
+        expect(command).toBe("gosu");
+        expect(options.cwd).toBe(expectedView);
+        const actionDirectory = join(actionRoot, valid.attemptId, valid.actionId);
+        expect(args).toContain(`OT_OUTBOX_DIR=${join(actionDirectory, "outbox")}`);
+        expect(args).toContain(`OT_INBOX_DIR=${join(actionDirectory, "inbox")}`);
+        expect(args).toContain(`OT_INBOX_PROCESSED_DIR=${join(actionDirectory, "inbox-processed")}`);
+        expect(args).toContain(`OT_NATIVE_SESSION_DIR=${join(actionDirectory, "native-session")}`);
+        for (const directory of ["outbox", "inbox", "inbox-processed", "native-session"]) {
+          expect(statSync(join(actionDirectory, directory)).mode & 0o777).toBe(0o700);
+        }
+        expect(execFileSync("git", ["-c", `safe.directory=${expectedView}`, "-C", expectedView, "rev-parse", "HEAD"], { encoding: "utf8" }).trim())
+          .toBe(execFileSync("git", ["-C", integrationRepoDir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim());
+        expect(execFileSync("git", ["-c", `safe.directory=${expectedView}`, "-C", expectedView, "status", "--porcelain"], { encoding: "utf8" }).trim())
+          .toBe("");
+        expect(execFileSync("git", ["-c", `safe.directory=${expectedView}`, "-C", expectedView, "diff", "--stat", "HEAD"], { encoding: "utf8" }).trim())
+          .toBe("");
+        expect(execFileSync("git", ["-c", `safe.directory=${expectedView}`, "-C", expectedView, "show", "--stat", "--oneline", "HEAD"], { encoding: "utf8" }).trim())
+          .toContain("initial");
+        expect(execFileSync("git", ["-c", `safe.directory=${expectedView}`, "-C", expectedView, "config", "--get", "remote.origin.url"], { encoding: "utf8" }).trim())
+          .toBe("DISABLED_BY_OPENTHROTTLE_READONLY_VIEW");
+        expect(execFileSync("git", ["-c", `safe.directory=${expectedView}`, "-C", expectedView, "config", "--get", "remote.origin.pushurl"], { encoding: "utf8" }).trim())
+          .toBe("DISABLED_BY_OPENTHROTTLE_READONLY_VIEW");
+        expect(statSync(expectedView).mode & 0o777).toBe(0o555);
+        return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+      },
+    });
+
+    expect(result.status).toBe(0);
+  });
+
+  it("rejects unsafe configured action roots before locking directories", () => {
+    const valid = validateLoopRequest(request());
+    process.env.OT_LOOP_ACTION_ROOT = "/";
+
+    expect(() => runLoopAgentInPreparedRepository({
+      request: valid,
+      invocation: resolveLoopInvocation(valid),
+      integrationRepoDir: "/tmp/integration",
+      lockIntegration: () => true,
+      runProcess: () => ({ status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" }),
+    })).toThrow(/unsafe system directory/);
+  });
+
   it("materializes only the current sealed repository skill under the action discovery root", () => {
     const valid = validateLoopRequest(repositorySkillRequest());
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
@@ -358,7 +420,12 @@ describe("loop action request validation", () => {
       lockIntegration: () => true,
       runProcess: (command, args) => {
         expect(command).toBe("gosu");
+        const actionDirectory = join(actionRoot, valid.attemptId, valid.actionId);
         const codexHome = join(actionRoot, valid.attemptId, valid.actionId, "codex");
+        expect(args).toContain(`OT_OUTBOX_DIR=${join(actionDirectory, "outbox")}`);
+        expect(args).toContain(`OT_INBOX_DIR=${join(actionDirectory, "inbox")}`);
+        expect(args).toContain(`OT_INBOX_PROCESSED_DIR=${join(actionDirectory, "inbox-processed")}`);
+        expect(args).toContain(`OT_NATIVE_SESSION_DIR=${join(actionDirectory, "native-session")}`);
         expect(args).toContain(`HOME=${join(actionRoot, valid.attemptId, valid.actionId, "home")}`);
         expect(args).toContain(`CODEX_HOME=${codexHome}`);
         const skillRoot = join(codexHome, "skills", valid.repositorySkill.invocation);

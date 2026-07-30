@@ -80,6 +80,9 @@ grep -q "pinned package" "$CODEX_HOME/skills/repo_action/SKILL.md"
 git status --porcelain=v1 --untracked-files=all >/tmp/ot-probe-git-status
 node /opt/openthrottle/runner/execute-stage.mjs --print-subject --repo "$PWD" >/tmp/ot-probe-subject
 printf 'worker write\n' > "$PWD/worker-write.txt"
+must_fail git add worker-write.txt
+must_fail git commit -m "agent direct commit"
+must_fail git update-ref refs/heads/agent-direct HEAD
 must_fail sh -c "printf bad >> '$PROBE_INTEGRATION/file.txt'"
 must_fail cat "$PROBE_INTEGRATION/file.txt"
 must_fail cat "$PWD/integration-link"
@@ -108,8 +111,11 @@ import { createLoopRequestHash } from "/opt/openthrottle/runner/execute-loop.mjs
 const requestPath = process.argv[2];
 const repoDir = process.argv[3];
 const skillPath = ".agents/skills/current/SKILL.md";
-const head = execFileSync("git", ["-C", repoDir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-const blobSha = execFileSync("git", ["-C", repoDir, "rev-parse", `${head}:${skillPath}`], { encoding: "utf8" }).trim();
+function git(args) {
+  return execFileSync("git", ["-c", `safe.directory=${repoDir}`, "-C", repoDir, ...args], { encoding: "utf8" }).trim();
+}
+const head = git(["rev-parse", "HEAD"]);
+const blobSha = git(["rev-parse", `${head}:${skillPath}`]);
 const unsignedPackage = {
   schema: "openthrottle.repository-skill-package/v1",
   reference: `repo://owner/repo@${head}#.agents/skills/current`,
@@ -177,6 +183,13 @@ gosu agent test ! -r "$ACTION_ROOT/attempt-current/action-current/request.json"
 gosu agent test ! -r "$ACTION_ROOT/attempt-current/action-sibling/secret.txt"
 gosu agent test ! -r "$ACTION_ROOT/attempt-prior/action-current/secret.txt"
 
-/opt/openthrottle/runner/worktrees.mjs create --repo "$INTEGRATION" --root "$WORKTREES" --handle after-loop --base "$BASE" >/dev/null
+CANDIDATE_JSON="$(/opt/openthrottle/runner/worktrees.mjs candidate --repo "$INTEGRATION" --root "$WORKTREES" --handle current --base "$BASE" --message "candidate from executor")"
+CANDIDATE="$(printf '%s' "$CANDIDATE_JSON" | jq -r '.candidateCommit')"
+test "$CANDIDATE" != "null"
+/opt/openthrottle/runner/integrate-unit.mjs --repo "$INTEGRATION" --expected-head "$BASE" --candidate "$CANDIDATE" >/tmp/ot-probe-integration.json
+jq -e --arg candidate "$CANDIDATE" '.candidate_commit == $candidate and .integrated == true' /tmp/ot-probe-integration.json >/dev/null
+INTEGRATED_HEAD="$(git -c "safe.directory=$INTEGRATION" -C "$INTEGRATION" rev-parse HEAD)"
+test "$INTEGRATED_HEAD" = "$CANDIDATE"
+/opt/openthrottle/runner/worktrees.mjs create --repo "$INTEGRATION" --root "$WORKTREES" --handle after-loop --base "$INTEGRATED_HEAD" >/dev/null
 
 echo "sandbox linked-worktree ownership isolation probe passed"

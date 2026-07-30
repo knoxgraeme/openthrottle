@@ -45,6 +45,30 @@ const INTEGRATION_REPO_DIR = "/home/agent/repo";
 const ROOT_UID = 0;
 const ROOT_GID = 0;
 const ABSOLUTE_PATH = /^\/[^\u0000]{0,500}$/;
+const UNSAFE_ACTION_ROOTS = new Set([
+  "/",
+  "/bin",
+  "/boot",
+  "/dev",
+  "/etc",
+  "/home",
+  "/home/agent",
+  "/home/agent/repo",
+  "/lib",
+  "/lib64",
+  "/opt",
+  "/opt/openthrottle",
+  "/proc",
+  "/root",
+  "/run",
+  "/sbin",
+  "/sys",
+  "/tmp",
+  "/usr",
+  "/var",
+  "/var/lib",
+  "/var/lib/openthrottle",
+]);
 
 function record(value, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
@@ -80,7 +104,13 @@ function pathInside(root, child) {
 function configuredActionRoot(env = process.env) {
   const root = env.OT_LOOP_ACTION_ROOT ?? DEFAULT_ACTION_ROOT;
   if (typeof root !== "string" || !ABSOLUTE_PATH.test(root)) throw new Error("loop action root is invalid");
-  return resolve(root);
+  const resolved = resolve(root);
+  if (UNSAFE_ACTION_ROOTS.has(resolved)) throw new Error("loop action root targets an unsafe system directory");
+  if (existsSync(resolved)) {
+    const metadata = lstatSync(resolved);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error("loop action root must be a real directory");
+  }
+  return resolved;
 }
 
 function actionDirectory(request, rootDir = configuredActionRoot()) {
@@ -242,6 +272,23 @@ function prepareAgentOwnedDirectory(path) {
   chmodTree(path, { fileMode: 0o600, directoryMode: 0o700 });
 }
 
+function prepareLoopTransportEnvironment(request) {
+  const currentActionDirectory = actionDirectory(request);
+  const outbox = pathInside(currentActionDirectory, "outbox");
+  const inbox = pathInside(currentActionDirectory, "inbox");
+  const processedInbox = pathInside(currentActionDirectory, "inbox-processed");
+  const nativeSessionRoot = pathInside(currentActionDirectory, "native-session");
+  for (const directory of [outbox, inbox, processedInbox, nativeSessionRoot]) {
+    prepareAgentOwnedDirectory(directory);
+  }
+  return [
+    `OT_OUTBOX_DIR=${outbox}`,
+    `OT_INBOX_DIR=${inbox}`,
+    `OT_INBOX_PROCESSED_DIR=${processedInbox}`,
+    `OT_NATIVE_SESSION_DIR=${nativeSessionRoot}`,
+  ];
+}
+
 function loopSkillDiscoveryRoot(request, actionRoot = configuredActionRoot()) {
   const currentActionDirectory = actionDirectory(request, actionRoot);
   if (request.agent === "codex") return pathInside(pathInside(currentActionDirectory, "codex"), "skills");
@@ -251,9 +298,10 @@ function loopSkillDiscoveryRoot(request, actionRoot = configuredActionRoot()) {
 
 function prepareLoopAgentEnvironment(request, repoDir) {
   const gitObjectEnv = prepareLoopGitObjectEnvironment(request, repoDir);
+  const transportEnv = prepareLoopTransportEnvironment(request);
   if (!request.repositorySkill) {
     return {
-      env: ["HOME=/home/agent", "USER=agent", "GIT_OPTIONAL_LOCKS=0", ...gitObjectEnv.env],
+      env: ["HOME=/home/agent", "USER=agent", "GIT_OPTIONAL_LOCKS=0", ...gitObjectEnv.env, ...transportEnv],
       repositorySkillRoot: null,
       gitObjectEnv: gitObjectEnv.values,
     };
@@ -261,7 +309,7 @@ function prepareLoopAgentEnvironment(request, repoDir) {
   const currentActionDirectory = actionDirectory(request);
   const home = pathInside(currentActionDirectory, "home");
   prepareAgentOwnedDirectory(home);
-  const env = ["USER=agent", "GIT_OPTIONAL_LOCKS=0", ...gitObjectEnv.env, `HOME=${home}`];
+  const env = ["USER=agent", "GIT_OPTIONAL_LOCKS=0", ...gitObjectEnv.env, ...transportEnv, `HOME=${home}`];
   if (request.agent === "codex") {
     const codexHome = pathInside(currentActionDirectory, "codex");
     prepareAgentOwnedDirectory(codexHome);
@@ -337,7 +385,7 @@ function createReadOnlyRepositoryView(request, sourceRepoDir = "/home/agent/repo
   return destination;
 }
 
-function prepareLoopRepository(request) {
+function prepareLoopRepository(request, integrationRepoDir = INTEGRATION_REPO_DIR) {
   if (request.worktree) {
     lockNonCurrentActionDirectories(request);
     return grantWorktreeToAgent({
@@ -345,7 +393,7 @@ function prepareLoopRepository(request) {
       handle: request.worktree.id,
     }).path;
   }
-  return createReadOnlyRepositoryView(request);
+  return createReadOnlyRepositoryView(request, integrationRepoDir);
 }
 
 function lockReadOnlyTree(path) {
@@ -457,7 +505,7 @@ export function runLoopAgentInPreparedRepository({
   integrationRepoDir = INTEGRATION_REPO_DIR,
   lockIntegration = lockIntegrationCheckout,
 }) {
-  const repoDir = prepareLoopRepository(request);
+  const repoDir = prepareLoopRepository(request, integrationRepoDir);
   const preparedEnvironment = prepareLoopAgentEnvironment(request, repoDir);
   const built = loopAgentCommand({ request, invocation, repoDir, repositorySkillRoot: preparedEnvironment.repositorySkillRoot });
   const preservedLinkedGitDir = request.worktree ? linkedWorktreeGitDir(repoDir) : null;

@@ -22,6 +22,7 @@ import {
   extractNativeSessionId,
   fallbackStageResultEvent,
   materializeRepositorySkill,
+  repositorySkillStageEnvironment,
   resolveContextInvocation,
   runCapturedProcess,
   runWithAgentProcessFence,
@@ -37,6 +38,7 @@ afterEach(() => {
     rmSync(directory, { recursive: true, force: true });
   }
   delete process.env.OT_REPOSITORY_SKILL_DISCOVERY_ROOT;
+  delete process.env.OT_STAGE_ACTION_ROOT;
 });
 
 function processGroupExists(pid) {
@@ -592,6 +594,24 @@ describe("one-stage executor", () => {
     expectMaterializeToThrow(signedPackage({
       files: [{ ...files[0], digest: "0".repeat(64) }],
     }), /file digest mismatch/);
+
+    const stageActionRoot = mkdtempSync(join(tmpdir(), "ot-stage-actions-"));
+    const globalDiscoveryRoot = mkdtempSync(join(tmpdir(), "ot-global-stage-skills-"));
+    directories.push(stageActionRoot, globalDiscoveryRoot);
+    process.env.OT_STAGE_ACTION_ROOT = stageActionRoot;
+    process.env.OT_REPOSITORY_SKILL_DISCOVERY_ROOT = globalDiscoveryRoot;
+    const scoped = repositorySkillStageEnvironment(request);
+    const scopedMaterialized = materializeRepositorySkill({
+      request,
+      repoDir,
+      discoveryRoot: scoped.repositorySkillDiscoveryRoot,
+    });
+
+    expect(scoped.env).toContain(`HOME=${join(stageActionRoot, "attempt-1", "home")}`);
+    expect(scoped.env).toContain(`CODEX_HOME=${join(stageActionRoot, "attempt-1", "codex")}`);
+    expect(scopedMaterialized).toBe(join(stageActionRoot, "attempt-1", "codex", "skills", "implement_unit"));
+    expect(readFileSync(join(scopedMaterialized, "SKILL.md"), "utf8")).toContain("name: implement_unit");
+    expect(existsSync(join(globalDiscoveryRoot, "implement_unit"))).toBe(false);
   });
 
   it("executes only the sealed allowlisted command and records tree mutation", () => {

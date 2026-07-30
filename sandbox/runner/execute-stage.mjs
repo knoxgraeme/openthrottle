@@ -3,6 +3,8 @@
 import { randomUUID } from "node:crypto";
 import {
   chmodSync,
+  existsSync,
+  lstatSync,
   readFileSync,
   writeFileSync,
   mkdirSync,
@@ -29,7 +31,7 @@ import {
   runGitAsRepositoryOwner,
 } from "./repository-control.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
-import { pathInside as containedPath } from "./filesystem-isolation.mjs";
+import { chmodTree, chownTree, identityForUser, pathInside as containedPath } from "./filesystem-isolation.mjs";
 import {
   REPOSITORY_SKILL_CAPABILITY,
   materializeRepositorySkillPackage,
@@ -59,6 +61,7 @@ const CONTEXT_POLICIES = new Set([
 ]);
 const COMMAND_NAME = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
 const REMOTE_GIT_TIMEOUT_MS = 15_000;
+const DEFAULT_STAGE_ACTION_ROOT = "/var/lib/openthrottle/stage-actions";
 
 function record(value, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -90,6 +93,29 @@ function stringList(value, label, allowed) {
   }
   if (allowed && value.some((entry) => !allowed.has(entry))) throw new Error(`${label} has an unknown value`);
   return [...value];
+}
+
+function pathInside(root, child, label = "path") {
+  return containedPath(root, child, `${label} escapes its root`);
+}
+
+function prepareAgentOwnedDirectory(path) {
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  const identity = identityForUser("agent");
+  if (identity) chownTree(path, identity.uid, identity.gid);
+  chmodTree(path, { fileMode: 0o600, directoryMode: 0o700 });
+}
+
+function stageActionDirectory(request, rootDir = process.env.OT_STAGE_ACTION_ROOT ?? DEFAULT_STAGE_ACTION_ROOT) {
+  const root = resolve(rootDir);
+  if (root === "/" || root === "/var/lib/openthrottle" || root === "/home/agent" || root === "/home/agent/repo") {
+    throw new Error("stage action root targets an unsafe system directory");
+  }
+  if (existsSync(root)) {
+    const metadata = lstatSync(root);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error("stage action root must be a real directory");
+  }
+  return pathInside(root, request.attemptId, "stage action path");
 }
 
 export function runtimeCapabilityDigest() {
@@ -265,10 +291,36 @@ export function runWithAgentProcessFence(execute, terminate = terminateAgentProc
   }
 }
 
-export function materializeRepositorySkill({ request, repoDir }) {
+export function materializeRepositorySkill({ request, repoDir, discoveryRoot }) {
   if (request.capability !== REPOSITORY_SKILL_CAPABILITY) return null;
   if (!request.repositorySkill) throw new Error("repository skill stage is missing its sealed package");
-  return materializeRepositorySkillPackage({ packageInfo: request.repositorySkill, repoDir, agent: request.agent });
+  return materializeRepositorySkillPackage({ packageInfo: request.repositorySkill, repoDir, agent: request.agent, discoveryRoot });
+}
+
+export function repositorySkillStageEnvironment(request) {
+  if (request.capability !== REPOSITORY_SKILL_CAPABILITY) {
+    return {
+      env: ["HOME=/home/agent", "USER=agent"],
+      repositorySkillDiscoveryRoot: undefined,
+    };
+  }
+  const actionDirectory = stageActionDirectory(request);
+  const home = pathInside(actionDirectory, "home", "stage action home");
+  prepareAgentOwnedDirectory(home);
+  const env = [`HOME=${home}`, "USER=agent"];
+  if (request.agent === "codex") {
+    const codexHome = pathInside(actionDirectory, "codex", "stage action codex home");
+    prepareAgentOwnedDirectory(codexHome);
+    env.push(`CODEX_HOME=${codexHome}`);
+    return { env, repositorySkillDiscoveryRoot: pathInside(codexHome, "skills", "stage repository skill discovery") };
+  }
+  if (request.agent === "claude") {
+    return {
+      env,
+      repositorySkillDiscoveryRoot: pathInside(pathInside(home, ".claude", "stage claude home"), "skills", "stage repository skill discovery"),
+    };
+  }
+  return { env, repositorySkillDiscoveryRoot: pathInside(actionDirectory, "opencode-skills", "stage repository skill discovery") };
 }
 
 export function stagePrompt(
@@ -324,11 +376,15 @@ export function extractNativeSessionId(output, agent) {
 }
 
 function defaultRunAgent({ request, invocation, repoDir, proposalPath, timeoutMs, model, agent = request.agent }) {
-  const repositorySkillRoot = materializeRepositorySkill({ request, repoDir });
+  const stageEnvironment = repositorySkillStageEnvironment(request);
+  const repositorySkillRoot = materializeRepositorySkill({
+    request,
+    repoDir,
+    discoveryRoot: stageEnvironment.repositorySkillDiscoveryRoot,
+  });
   const prompt = stagePrompt(request, proposalPath, { agent, repositorySkillRoot });
   const env = [
-    "HOME=/home/agent",
-    "USER=agent",
+    ...stageEnvironment.env,
     `OT_STAGE_PROPOSAL_FILE=${proposalPath}`,
   ];
   let command;

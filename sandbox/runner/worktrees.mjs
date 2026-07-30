@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
-import { chmodSync, chownSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { chmodSync, chownSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { runGitAsExecutor, runGitAsRepositoryOwner } from "./repository-control.mjs";
 import { chmodTree, chownTree, identityForUser, isRoot, pathInside as containedPath } from "./filesystem-isolation.mjs";
@@ -55,13 +56,6 @@ function lockLinkedGitDir(gitDir) {
   chmodTree(gitDir, { fileMode: 0o444, directoryMode: 0o555 });
 }
 
-function grantTreeToAgent(path) {
-  const identity = identityForUser("agent");
-  if (!identity) return;
-  chownTree(path, identity.uid, identity.gid);
-  chmodTree(path, { fileMode: 0o600, directoryMode: 0o700 });
-}
-
 function lockReadOnlyTree(path) {
   if (!isRoot() || !existsSync(path)) return;
   chownTree(path, ROOT_UID, ROOT_GID);
@@ -70,6 +64,12 @@ function lockReadOnlyTree(path) {
 
 function lockObjectStore(path) {
   if (!isRoot() || !existsSync(path)) return;
+  chownTree(path, ROOT_UID, ROOT_GID);
+  chmodTree(path, { fileMode: 0o600, directoryMode: 0o700 });
+}
+
+function lockCandidateReadableWorktree(path) {
+  if (!isRoot()) return;
   chownTree(path, ROOT_UID, ROOT_GID);
   chmodTree(path, { fileMode: 0o600, directoryMode: 0o700 });
 }
@@ -169,23 +169,28 @@ export function deriveCandidateCommit({
   const safeBase = commit(baseCommit, "candidate base commit");
   const gitDir = linkedGitDir(worktreeDir);
   const commonDir = gitDir ? commonGitDirForLinked(gitDir) : null;
+  const temporary = mkdtempSync(join(tmpdir(), "ot-candidate-index-"));
+  const indexPath = join(temporary, "index");
   try {
     if (isRoot()) {
-      grantTreeToAgent(worktreeDir);
-      if (gitDir) grantTreeToAgent(gitDir);
-      if (commonDir) grantTreeToAgent(resolve(commonDir, "objects"));
+      lockCandidateReadableWorktree(worktreeDir);
+      if (gitDir) lockLinkedGitDir(gitDir);
+      if (commonDir) lockObjectStore(resolve(commonDir, "objects"));
     }
-    const head = runGitAsRepositoryOwner(worktreeDir, ["rev-parse", "HEAD"]);
+    const head = runGitAsExecutor(worktreeDir, ["rev-parse", "HEAD"]);
     if (head !== safeBase) throw new Error("worker moved HEAD; executor refuses candidate creation");
-    runGitAsRepositoryOwner(worktreeDir, ["add", "-A", "--", "."]);
-    const tree = runGitAsRepositoryOwner(worktreeDir, ["write-tree"]);
-    const changedPaths = runGitAsRepositoryOwner(worktreeDir, ["diff", "--name-only", `${safeBase}^{tree}`, tree])
+    const env = { GIT_INDEX_FILE: indexPath };
+    runGitAsExecutor(worktreeDir, ["read-tree", "HEAD"], env);
+    runGitAsExecutor(worktreeDir, ["add", "-A", "--", "."], env);
+    const tree = runGitAsExecutor(worktreeDir, ["write-tree"], env);
+    const changedPaths = runGitAsExecutor(worktreeDir, ["diff", "--name-only", `${safeBase}^{tree}`, tree], env)
       .split("\n")
       .filter(Boolean);
     if (changedPaths.length === 0) return { candidateCommit: null, tree, changedPaths };
-    const candidateCommit = runGitAsRepositoryOwner(worktreeDir, ["commit-tree", tree, "-p", safeBase, "-m", message]);
+    const candidateCommit = runGitAsExecutor(worktreeDir, ["commit-tree", tree, "-p", safeBase, "-m", message], env);
     return { candidateCommit, tree, changedPaths };
   } finally {
+    rmSync(temporary, { recursive: true, force: true });
     if (isRoot()) {
       chownTree(worktreeDir, ROOT_UID, ROOT_GID);
       chmodTree(worktreeDir, { fileMode: 0o600, directoryMode: 0o700 });
