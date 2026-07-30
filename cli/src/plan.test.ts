@@ -307,6 +307,7 @@ describe("plan validation", () => {
           "const path = require('node:path');",
           "const name = path.basename(process.argv[1]);",
           "fs.writeFileSync(path.join(process.cwd(), `${name}-env.json`), JSON.stringify(process.env));",
+          "if (name === 'opencode') fs.writeFileSync(path.join(process.cwd(), 'opencode-config.json'), fs.readFileSync(path.join(process.env.OPENCODE_CONFIG_DIR, 'opencode.json')));",
         ].join("\n")
       );
       chmodSync(executable, 0o755);
@@ -318,6 +319,7 @@ describe("plan validation", () => {
       "CODEX_HOME",
       "CLAUDE_CODE_OAUTH_TOKEN",
       "KIMI_CODE_API_KEY",
+      "OPENCODE_CONFIG_DIR",
       "LINEAR_API_KEY",
       "DAYTONA_API_KEY",
       "OT_STATUS_TOKEN",
@@ -329,6 +331,7 @@ describe("plan validation", () => {
     process.env.CODEX_HOME = join(directory, "codex-home");
     process.env.CLAUDE_CODE_OAUTH_TOKEN = "claude-auth";
     process.env.KIMI_CODE_API_KEY = "kimi-auth";
+    process.env.OPENCODE_CONFIG_DIR = join(directory, "untrusted-opencode-config");
     process.env.LINEAR_API_KEY = "linear-secret";
     process.env.DAYTONA_API_KEY = "daytona-secret";
     process.env.OT_STATUS_TOKEN = "status-secret";
@@ -336,13 +339,30 @@ describe("plan validation", () => {
     try {
       defaultPrepareRunner({ agent: "codex", prompt: "prepare", directory });
       defaultPrepareRunner({ agent: "claude", prompt: "prepare", directory });
-      defaultPrepareRunner({ agent: "opencode", model: "kimi/test", prompt: "prepare", directory });
+      defaultPrepareRunner({ agent: "opencode", model: "kimi-code/kimi-for-coding", prompt: "prepare", directory });
       const codex = JSON.parse(readFileSync(join(directory, "codex-env.json"), "utf8")) as Record<string, string>;
       const claude = JSON.parse(readFileSync(join(directory, "claude-env.json"), "utf8")) as Record<string, string>;
       const opencode = JSON.parse(readFileSync(join(directory, "opencode-env.json"), "utf8")) as Record<string, string>;
       expect(codex).toMatchObject({ OPENAI_API_KEY: "openai-auth", CODEX_HOME: join(directory, "codex-home") });
       expect(claude).toMatchObject({ CLAUDE_CODE_OAUTH_TOKEN: "claude-auth" });
       expect(opencode).toMatchObject({ KIMI_CODE_API_KEY: "kimi-auth" });
+      expect(opencode.OPENCODE_CONFIG_DIR).toMatch(/openthrottle-opencode-/);
+      expect(opencode.OPENCODE_CONFIG_DIR).not.toBe(join(directory, "untrusted-opencode-config"));
+      const openCodeConfig = JSON.parse(readFileSync(join(directory, "opencode-config.json"), "utf8"));
+      expect(openCodeConfig).toMatchObject({
+        autoupdate: false,
+        share: "disabled",
+        permission: { edit: "allow", bash: "deny", webfetch: "deny" },
+        provider: {
+          "kimi-code": {
+            options: {
+              baseURL: "https://api.kimi.com/coding/v1",
+              apiKey: "{env:KIMI_CODE_API_KEY}",
+            },
+          },
+        },
+      });
+      expect(JSON.stringify(openCodeConfig)).not.toContain("kimi-auth");
       expect(codex).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
       expect(codex).not.toHaveProperty("KIMI_CODE_API_KEY");
       expect(claude).not.toHaveProperty("OPENAI_API_KEY");
