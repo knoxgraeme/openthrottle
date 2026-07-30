@@ -40,6 +40,16 @@ import {
   repositorySkillDiscoveryRoot,
   skillBody,
 } from "./repository-skills.mjs";
+import {
+  lockPersistentAgentPrivateRoots,
+  lockedPersistentProfilesFrom,
+  restorePersistentAgentPrivateRoots,
+} from "./execute-loop.mjs";
+import {
+  extractNativeSessionId,
+  materializeNativeSessionState,
+  sealNativeSessionPackage,
+} from "./native-session-package.mjs";
 
 export { computeWorkspaceTreeOid } from "./repository-control.mjs";
 export { runCapturedProcess } from "./bounded-process.mjs";
@@ -55,6 +65,8 @@ const REQUEST_KEYS = new Set([
   "repositorySkill", "childActionId",
 ]);
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
+const STAGE_PATH_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const NATIVE_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 const DIGEST = /^[a-f0-9]{64}$/;
 const COMMIT = /^[a-f0-9]{40}$/;
 const ARTIFACT_KINDS = new Set(RUNTIME_DESCRIPTOR.artifacts);
@@ -149,7 +161,7 @@ export function validateStageRequest(value) {
     capabilityDigest: string(input.capabilityDigest, "capabilityDigest", DIGEST),
     repositoryConfigDigest: string(input.repositoryConfigDigest, "repositoryConfigDigest", DIGEST),
     stageId: string(input.stageId, "stageId"),
-    attemptId: string(input.attemptId, "attemptId"),
+    attemptId: string(input.attemptId, "attemptId", STAGE_PATH_ID),
     runId: string(input.runId, "runId"),
     issueId: string(input.issueId, "issueId"),
     sessionId: string(input.sessionId, "sessionId"),
@@ -183,7 +195,7 @@ export function validateStageRequest(value) {
   }
   if (!CONTEXT_POLICIES.has(request.contextPolicy)) throw new Error("contextPolicy is invalid");
   if (request.nativeSessionId !== null &&
-      (typeof request.nativeSessionId !== "string" || !ID.test(request.nativeSessionId))) {
+      (typeof request.nativeSessionId !== "string" || !NATIVE_SESSION_ID.test(request.nativeSessionId))) {
     throw new Error("nativeSessionId is invalid");
   }
   if (typeof request.liveSteering !== "boolean") throw new Error("liveSteering is invalid");
@@ -284,9 +296,15 @@ export function materializeRepositorySkill({ request, repoDir, discoveryRoot }) 
 
 export function repositorySkillStageEnvironment(request) {
   if (request.capability !== REPOSITORY_SKILL_CAPABILITY) {
+    const home = "/home/agent";
     return {
-      env: ["HOME=/home/agent", "USER=agent"],
+      env: [`HOME=${home}`, "USER=agent"],
       repositorySkillDiscoveryRoot: undefined,
+      nativeSessionProfileRoot: request.agent === "codex"
+        ? join(home, ".codex")
+        : request.agent === "claude"
+          ? join(home, ".claude")
+          : home,
     };
   }
   const actionDirectory = ensureStageActionParents(request);
@@ -298,7 +316,11 @@ export function repositorySkillStageEnvironment(request) {
     prepareAgentOwnedDirectory(codexHome);
     materializeCodexProfileBaseline({ destinationHome: codexHome });
     env.push(`CODEX_HOME=${codexHome}`);
-    return { env, repositorySkillDiscoveryRoot: pathInside(codexHome, "skills", "stage repository skill discovery") };
+    return {
+      env,
+      repositorySkillDiscoveryRoot: pathInside(codexHome, "skills", "stage repository skill discovery"),
+      nativeSessionProfileRoot: codexHome,
+    };
   }
   if (request.agent === "claude") {
     const claudeHome = pathInside(home, ".claude", "stage claude home");
@@ -306,9 +328,14 @@ export function repositorySkillStageEnvironment(request) {
     return {
       env,
       repositorySkillDiscoveryRoot: pathInside(claudeHome, "skills", "stage repository skill discovery"),
+      nativeSessionProfileRoot: claudeHome,
     };
   }
-  return { env, repositorySkillDiscoveryRoot: pathInside(actionDirectory, "opencode-skills", "stage repository skill discovery") };
+  return {
+    env,
+    repositorySkillDiscoveryRoot: pathInside(actionDirectory, "opencode-skills", "stage repository skill discovery"),
+    nativeSessionProfileRoot: home,
+  };
 }
 
 export function lockRepositorySkillStageHome(request) {
@@ -318,6 +345,16 @@ export function lockRepositorySkillStageHome(request) {
   chownTree(actionDirectory, 0, 0);
   chmodTree(actionDirectory, { fileMode: 0o600, directoryMode: 0o700 });
   return true;
+}
+
+export function lockRepositorySkillStagePersistentProfiles(request, lockPersistentProfiles = lockPersistentAgentPrivateRoots) {
+  if (request.capability !== REPOSITORY_SKILL_CAPABILITY) return [];
+  return lockPersistentProfiles();
+}
+
+function repositorySkillProposalPath(request, fallback) {
+  if (request.capability !== REPOSITORY_SKILL_CAPABILITY) return fallback;
+  return pathInside(stageActionDirectory(request), "proposal.json", "stage proposal path");
 }
 
 export function stagePrompt(
@@ -352,72 +389,71 @@ export function stagePrompt(
     `## Transition context\n${request.transitionContext || "(initial stage)"}`;
 }
 
-export function extractNativeSessionId(output, agent) {
-  for (const line of String(output ?? "").split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    try {
-      const event = JSON.parse(line);
-      const candidate = agent === "claude"
-        ? event.session_id
-        : agent === "codex" && event.type === "thread.started"
-          ? event.thread_id ?? event.threadId ?? event.id
-          : agent === "opencode"
-            ? event.sessionID
-            : undefined;
-      if (typeof candidate === "string" && ID.test(candidate)) return candidate;
-    } catch {
-      // Agent stderr/non-JSON diagnostics are not session evidence.
-    }
-  }
-  return null;
-}
+export { extractNativeSessionId } from "./native-session-package.mjs";
 
-function defaultRunAgent({ request, invocation, repoDir, proposalPath, timeoutMs, model, agent = request.agent }) {
-  const stageEnvironment = repositorySkillStageEnvironment(request);
-  const repositorySkillRoot = materializeRepositorySkill({
-    request,
-    repoDir,
-    discoveryRoot: stageEnvironment.repositorySkillDiscoveryRoot,
-  });
-  const prompt = stagePrompt(request, proposalPath, { agent, repositorySkillRoot });
-  const env = [
-    ...stageEnvironment.env,
-    `OT_STAGE_PROPOSAL_FILE=${proposalPath}`,
-  ];
+export function defaultRunAgent({ request, invocation, repoDir, proposalPath, timeoutMs, model, agent = request.agent }) {
+  let stageEnvironment = null;
+  let repositorySkillRoot = null;
+  const actionProposalPath = repositorySkillProposalPath(request, proposalPath);
+  let prompt = null;
+  let env = null;
   let command;
   let args;
   let stdin;
-  if (agent === "claude") {
-    const maxTurns = process.env.MAX_TURNS?.trim();
-    const mcpConfig = process.env.OT_CLAUDE_MCP_CONFIG?.trim();
-    const common = [
-      "--output-format", "stream-json", "--verbose",
-      ...(maxTurns ? ["--max-turns", maxTurns] : []),
-      ...(model ? ["--model", model] : []),
-      "--dangerously-skip-permissions",
-      ...(mcpConfig ? ["--mcp-config", mcpConfig, "--strict-mcp-config"] : []),
-      "--plugin-dir", "/opt/openthrottle/compound-engineering-marketplace",
-      "--setting-sources", "user",
-    ];
-    command = "claude";
-    args = invocation.mode === "resume"
-      ? ["-p", "--resume", invocation.nativeSessionId, prompt, ...common]
-      : ["-p", prompt, ...common];
-  } else if (agent === "opencode") {
-    if (!model) throw new Error("OpenCode stage execution requires a sealed model selection");
-    command = "opencode";
-    args = ["run", "--format", "json", "--model", model, "--dir", repoDir, "--auto", ...(invocation.mode === "resume" ? ["--session", invocation.nativeSessionId] : []), prompt];
-  } else if (agent === "codex") {
-    command = "codex";
-    args = ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox",
-      ...(process.env.OT_CODEX_HOOK_TRUST_FLAG === "1" ? ["--dangerously-bypass-hook-trust"] : []),
-      "--skip-git-repo-check", "-C", repoDir, ...(model ? ["-m", model] : []),
-      ...(invocation.mode === "resume" ? ["resume", invocation.nativeSessionId, prompt] : ["-"])];
-    if (invocation.mode !== "resume") stdin = prompt;
-  } else {
-    throw new Error(`unsupported agent adapter ${agent}`);
-  }
+  let lockedPersistentProfiles = [];
+  const cleanupErrors = [];
+  let bodyError = null;
   try {
+    stageEnvironment = repositorySkillStageEnvironment(request);
+    repositorySkillRoot = materializeRepositorySkill({
+      request,
+      repoDir,
+      discoveryRoot: stageEnvironment.repositorySkillDiscoveryRoot,
+    });
+    if (request.capability === REPOSITORY_SKILL_CAPABILITY) {
+      materializeNativeSessionState({ request, profileRoot: stageEnvironment.nativeSessionProfileRoot });
+    }
+    prompt = stagePrompt(request, actionProposalPath, { agent, repositorySkillRoot });
+    env = [
+      ...stageEnvironment.env,
+      `OT_STAGE_PROPOSAL_FILE=${actionProposalPath}`,
+    ];
+    if (agent === "claude") {
+      const maxTurns = process.env.MAX_TURNS?.trim();
+      const mcpConfig = process.env.OT_CLAUDE_MCP_CONFIG?.trim();
+      const common = [
+        "--output-format", "stream-json", "--verbose",
+        ...(maxTurns ? ["--max-turns", maxTurns] : []),
+        ...(model ? ["--model", model] : []),
+        "--dangerously-skip-permissions",
+        ...(mcpConfig ? ["--mcp-config", mcpConfig, "--strict-mcp-config"] : []),
+        "--plugin-dir", "/opt/openthrottle/compound-engineering-marketplace",
+        "--setting-sources", "user",
+      ];
+      command = "claude";
+      args = invocation.mode === "resume"
+        ? ["-p", "--resume", invocation.nativeSessionId, prompt, ...common]
+        : ["-p", prompt, ...common];
+    } else if (agent === "opencode") {
+      if (!model) throw new Error("OpenCode stage execution requires a sealed model selection");
+      command = "opencode";
+      args = ["run", "--format", "json", "--model", model, "--dir", repoDir, "--auto", ...(invocation.mode === "resume" ? ["--session", invocation.nativeSessionId] : []), prompt];
+    } else if (agent === "codex") {
+      command = "codex";
+      args = ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox",
+        ...(process.env.OT_CODEX_HOOK_TRUST_FLAG === "1" ? ["--dangerously-bypass-hook-trust"] : []),
+        "--skip-git-repo-check", "-C", repoDir, ...(model ? ["-m", model] : []),
+        ...(invocation.mode === "resume" ? ["resume", invocation.nativeSessionId, prompt] : ["-"])];
+      if (invocation.mode !== "resume") stdin = prompt;
+    } else {
+      throw new Error(`unsupported agent adapter ${agent}`);
+    }
+    try {
+      lockedPersistentProfiles = lockRepositorySkillStagePersistentProfiles(request);
+    } catch (error) {
+      lockedPersistentProfiles = lockedPersistentProfilesFrom(error, lockedPersistentProfiles);
+      throw error;
+    }
     const result = runWithAgentProcessFence(
       () => runCapturedProcess("gosu", ["agent", "env", ...env, command, ...args], {
         cwd: repoDir,
@@ -432,7 +468,7 @@ function defaultRunAgent({ request, invocation, repoDir, proposalPath, timeoutMs
           maxBuffer: 262_144,
         })
       : undefined;
-    const proposalRead = spawnSync("gosu", ["agent", "head", "-c", "1048577", proposalPath], {
+    const proposalRead = spawnSync("gosu", ["agent", "head", "-c", "1048577", actionProposalPath], {
       encoding: "utf8",
       timeout: 2_000,
       maxBuffer: 1_048_577,
@@ -440,18 +476,39 @@ function defaultRunAgent({ request, invocation, repoDir, proposalPath, timeoutMs
     if (proposalRead.status === 0 && Buffer.byteLength(proposalRead.stdout) > 1_048_576) {
       throw new Error("stage proposal exceeds the 1 MiB limit");
     }
+    const nativeSessionId = request.nativeSessionId ?? extractNativeSessionId(result.stdout, agent);
+    sealNativeSessionPackage({
+      agent,
+      nativeSessionId,
+      profileRoot: stageEnvironment?.nativeSessionProfileRoot,
+    });
     return {
       exitCode: result.status,
       signal: result.signal,
       timedOut: result.timedOut,
       stdout: result.stdout ?? "",
       stderr: result.stderr ?? result.error?.message ?? "",
-      nativeSessionId: request.nativeSessionId ?? extractNativeSessionId(result.stdout, agent),
+      nativeSessionId,
       proposal: proposalRead.status === 0 ? JSON.parse(proposalRead.stdout) : undefined,
       authSnapshot: authRead?.status === 0 ? authRead.stdout : undefined,
     };
+  } catch (error) {
+    bodyError = error;
+    throw error;
   } finally {
-    lockRepositorySkillStageHome(request);
+    try {
+      lockRepositorySkillStageHome(request);
+    } catch (error) {
+      cleanupErrors.push(error instanceof Error ? error.message : String(error));
+    }
+    try {
+      restorePersistentAgentPrivateRoots(lockedPersistentProfiles);
+    } catch (error) {
+      cleanupErrors.push(error instanceof Error ? error.message : String(error));
+    }
+    if (cleanupErrors.length > 0 && !bodyError) {
+      throw new Error(`stage agent cleanup failed: ${cleanupErrors.join("; ")}`);
+    }
   }
 }
 

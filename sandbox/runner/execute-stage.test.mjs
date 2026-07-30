@@ -1,5 +1,6 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdtempSync,
   mkdirSync,
@@ -19,10 +20,12 @@ import {
   computeWorkspaceTreeOid,
   classifyAgentExecutionFailure,
   createStageRequestHash,
+  defaultRunAgent,
   executeStage,
   extractNativeSessionId,
   fallbackStageResultEvent,
   lockRepositorySkillStageHome,
+  lockRepositorySkillStagePersistentProfiles,
   materializeRepositorySkill,
   repositorySkillStageEnvironment,
   resolveContextInvocation,
@@ -32,6 +35,7 @@ import {
   stagePrompt,
   validateStageRequest,
 } from "./execute-stage.mjs";
+import { sealNativeSessionPackage } from "./native-session-package.mjs";
 
 const directories = [];
 afterEach(() => {
@@ -41,6 +45,7 @@ afterEach(() => {
   }
   delete process.env.OT_REPOSITORY_SKILL_DISCOVERY_ROOT;
   delete process.env.OT_STAGE_ACTION_ROOT;
+  delete process.env.OT_NATIVE_SESSION_SOURCE_ROOT;
 });
 
 function processGroupExists(pid) {
@@ -203,6 +208,13 @@ describe("one-stage executor", () => {
     expect(validateStageRequest(sealedChildRequest)).toMatchObject({ childActionId: "action-1" });
     expect(() => validateStageRequest({ ...sealedChildRequest, childActionId: "../bad" }))
       .toThrow(/childActionId/);
+    const { requestHash, idempotencyKey, ...unsealedRequest } = request;
+    const slashAttemptRequest = { ...unsealedRequest, attemptId: "parent/child" };
+    expect(() => validateStageRequest({ ...slashAttemptRequest, ...createStageRequestHash(slashAttemptRequest) }))
+      .toThrow(/attemptId/);
+    const slashNativeSessionRequest = { ...unsealedRequest, nativeSessionId: "native/../sibling" };
+    expect(() => validateStageRequest({ ...slashNativeSessionRequest, ...createStageRequestHash(slashNativeSessionRequest) }))
+      .toThrow(/nativeSessionId/);
     expect(stagePrompt(request, "/tmp/proposal.json")).toContain("Implement the approved fixture change.");
     expect(stagePrompt({ ...request, taskType: "investigate", capability: "ce/publish@1" }, "/tmp/proposal.json"))
       .toMatch(/^\$investigate/);
@@ -628,6 +640,163 @@ describe("one-stage executor", () => {
     expect(lockRepositorySkillStageHome(request)).toBe(true);
     expect(statSync(join(stageActionRoot, "attempt-1")).mode & 0o777).toBe(0o700);
     expect(statSync(join(stageActionRoot, "attempt-1", "codex")).mode & 0o777).toBe(0o700);
+  });
+
+  it("locks persistent agent profiles for repository-skill stages only", () => {
+    const repositorySkill = {
+      schema: "openthrottle.repository-skill-package/v1",
+      reference: `repo://owner/repo@${"a".repeat(40)}#.agents/skills/implement-unit`,
+      invocation: "implement_unit",
+      directory: ".agents/skills/implement-unit",
+      commit: "a".repeat(40),
+      packageDigest: "d".repeat(64),
+      files: [{
+        path: ".agents/skills/implement-unit/SKILL.md",
+        blobSha: "b".repeat(40),
+        digest: "c".repeat(64),
+      }],
+    };
+    const repositorySkillRequest = fixture({
+      capability: "agent/repository-skill@1",
+      repositorySkill,
+    }).request;
+    const semanticRequest = fixture().request;
+    const lock = vi.fn(() => ["/home/agent/.codex"]);
+
+    expect(lockRepositorySkillStagePersistentProfiles(repositorySkillRequest, lock)).toEqual(["/home/agent/.codex"]);
+    expect(lock).toHaveBeenCalledOnce();
+    expect(lockRepositorySkillStagePersistentProfiles(semanticRequest, lock)).toEqual([]);
+    expect(lock).toHaveBeenCalledOnce();
+  });
+
+  it("locks repository-skill stage homes when setup fails before agent launch", () => {
+    const repoDir = repository();
+    const skillDir = ".agents/skills/implement-unit";
+    mkdirSync(join(repoDir, skillDir), { recursive: true });
+    writeFileSync(join(repoDir, skillDir, "SKILL.md"), "---\nname: implement_unit\n---\n# Skill\n");
+    execFileSync("git", ["add", "."], { cwd: repoDir });
+    execFileSync("git", ["commit", "-qm", "skill"], { cwd: repoDir });
+    const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+    const skillPath = `${skillDir}/SKILL.md`;
+    const file = {
+      path: skillPath,
+      blobSha: execFileSync("git", ["rev-parse", `${commit}:${skillPath}`], { cwd: repoDir, encoding: "utf8" }).trim(),
+      digest: digest(readFileSync(join(repoDir, skillPath))),
+    };
+    const unsignedPackage = {
+      schema: "openthrottle.repository-skill-package/v1",
+      reference: `repo://owner/repo@${commit}#${skillDir}`,
+      invocation: "implement_unit",
+      directory: skillDir,
+      commit,
+      files: [file],
+    };
+    const repositorySkill = { ...unsignedPackage, packageDigest: digest(canonicalJson(unsignedPackage)) };
+    const input = fixture({
+      capability: "agent/repository-skill@1",
+      contextPolicy: "resume_required",
+      nativeSessionId: "missing-session",
+      repositorySkill,
+    });
+    input.repoDir = repoDir;
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-stage-actions-"));
+    const sourceRoot = mkdtempSync(join(tmpdir(), "ot-stage-native-sessions-"));
+    directories.push(actionRoot, sourceRoot);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sourceRoot;
+
+    expect(() => defaultRunAgent({
+      request: input.request,
+      invocation: resolveContextInvocation(input.request),
+      repoDir,
+      proposalPath: join(actionRoot, "proposal.json"),
+      timeoutMs: 1000,
+    })).toThrow(/authorized native session state is unavailable/);
+
+    expect(statSync(join(actionRoot, "attempt-1")).mode & 0o777).toBe(0o700);
+    expect(statSync(join(actionRoot, "attempt-1", "codex")).mode & 0o777).toBe(0o700);
+  });
+
+  it("materializes sealed native session packages before repository-skill resume", () => {
+    const repoDir = repository();
+    const skillDir = ".agents/skills/implement-unit";
+    mkdirSync(join(repoDir, ".agents", "skills", "implement-unit"), { recursive: true });
+    writeFileSync(join(repoDir, skillDir, "SKILL.md"), "---\nname: implement_unit\n---\n# Skill\n");
+    execFileSync("git", ["add", "."], { cwd: repoDir });
+    execFileSync("git", ["commit", "-qm", "skill"], { cwd: repoDir });
+    const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+    const skillPath = `${skillDir}/SKILL.md`;
+    const file = {
+      path: skillPath,
+      blobSha: execFileSync("git", ["rev-parse", `${commit}:${skillPath}`], { cwd: repoDir, encoding: "utf8" }).trim(),
+      digest: digest(readFileSync(join(repoDir, skillPath))),
+    };
+    const unsignedPackage = {
+      schema: "openthrottle.repository-skill-package/v1",
+      reference: `repo://owner/repo@${commit}#${skillDir}`,
+      invocation: "implement_unit",
+      directory: skillDir,
+      commit,
+      files: [file],
+    };
+    const repositorySkill = { ...unsignedPackage, packageDigest: digest(canonicalJson(unsignedPackage)) };
+    const input = fixture({
+      capability: "agent/repository-skill@1",
+      contextPolicy: "resume_required",
+      nativeSessionId: "native-1",
+      repositorySkill,
+    });
+    input.repoDir = repoDir;
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-stage-actions-"));
+    const sourceRoot = mkdtempSync(join(tmpdir(), "ot-stage-native-sessions-"));
+    const sourceProfile = mkdtempSync(join(tmpdir(), "ot-source-profile-"));
+    const binDir = mkdtempSync(join(tmpdir(), "ot-fake-bin-"));
+    directories.push(actionRoot, sourceRoot, sourceProfile, binDir);
+    mkdirSync(join(sourceProfile, "sessions"), { recursive: true });
+    writeFileSync(join(sourceProfile, "sessions", "native-1.json"), "{\"session\":true}\n");
+    sealNativeSessionPackage({
+      agent: "codex",
+      nativeSessionId: "native-1",
+      profileRoot: sourceProfile,
+      sourceRoot,
+    });
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sourceRoot;
+
+    const fakeGosu = join(binDir, "gosu");
+    writeFileSync(fakeGosu, `#!/usr/bin/env bash
+set -euo pipefail
+shift
+exec "$@"
+`);
+    chmodSync(fakeGosu, 0o755);
+    const fakeCodex = join(binDir, "codex");
+    writeFileSync(fakeCodex, `#!/usr/bin/env bash
+set -euo pipefail
+test -f "$CODEX_HOME/sessions/native-1.json"
+test "$OT_STAGE_PROPOSAL_FILE" = "$OT_STAGE_ACTION_ROOT/attempt-1/proposal.json"
+cat > "$OT_STAGE_PROPOSAL_FILE" <<'JSON'
+{"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"ok","evidence":["session materialized"],"findings":[],"actions":[],"uncertainty":[]}
+JSON
+printf '{"type":"thread.started","thread_id":"native-1"}\\n'
+`);
+    chmodSync(fakeCodex, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${binDir}:${previousPath}`;
+    try {
+      const result = defaultRunAgent({
+        request: input.request,
+        invocation: resolveContextInvocation(input.request),
+        repoDir: input.repoDir,
+        proposalPath: join(actionRoot, "persistent", "proposal.json"),
+        timeoutMs: 5_000,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.proposal).toMatchObject({ suggested_outcome: "success" });
+    } finally {
+      process.env.PATH = previousPath;
+    }
   });
 
   it("executes only the sealed allowlisted command and records tree mutation", () => {

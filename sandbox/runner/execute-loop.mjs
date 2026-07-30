@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import { chmodSync, chownSync, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, existsSync, lchownSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { canonicalJson } from "./capabilities.mjs";
@@ -19,11 +19,17 @@ import {
   skillBody,
   validateRepositorySkillPackage,
 } from "./repository-skills.mjs";
+import {
+  extractNativeSessionId,
+  materializeNativeSessionState,
+  sealNativeSessionPackage,
+} from "./native-session-package.mjs";
 
 export const LOOP_ACTION_PROTOCOL = "loop-action@1";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 const STAGE_PATH_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const NATIVE_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 const AGENTS = new Set(["claude", "codex", "opencode"]);
 const ROLES = new Set(["worker", "lead", "reviewer", "publisher"]);
 const LOOPS = new Set(["implement", "simplify", "command", "repair", "lead", "review", "publish"]);
@@ -45,7 +51,6 @@ const SKILLS = new Set([
 const CONTEXTS = new Set(["fresh", "resume_required", "prefer_resume"]);
 const DEFAULT_ACTION_ROOT = "/var/lib/openthrottle/loop-actions";
 const DEFAULT_WORKTREE_ROOT = "/var/lib/openthrottle/worktrees";
-const DEFAULT_NATIVE_SESSION_SOURCE_ROOT = "/home/agent/.ot/native-sessions";
 const INTEGRATION_REPO_DIR = "/home/agent/repo";
 const ROOT_UID = 0;
 const ROOT_GID = 0;
@@ -135,12 +140,6 @@ function configuredIntegrationRepoDir(env = process.env) {
   return resolved;
 }
 
-function configuredNativeSessionSourceRoot(env = process.env) {
-  const root = env.OT_NATIVE_SESSION_SOURCE_ROOT ?? DEFAULT_NATIVE_SESSION_SOURCE_ROOT;
-  if (typeof root !== "string" || !ABSOLUTE_PATH.test(root)) throw new Error("native session source root is invalid");
-  return resolve(root);
-}
-
 function actionDirectory(request, rootDir = configuredActionRoot()) {
   return pathInside(pathInside(rootDir, request.attemptId), request.actionId);
 }
@@ -191,8 +190,14 @@ function lockNonCurrentActionDirectories(request, rootDir = configuredActionRoot
   }
 }
 
-function runRootGit(repoDir, args, env = {}) {
-  const result = runCapturedProcess("git", ["-c", `safe.directory=${repoDir}`, ...args], {
+export function gitSafeDirectoryConfigArgs(repoDir, extraSafeDirectories = []) {
+  return [...new Set([repoDir, ...extraSafeDirectories])]
+    .filter((path) => typeof path === "string" && path.length > 0)
+    .flatMap((path) => ["-c", `safe.directory=${path}`]);
+}
+
+function runRootGit(repoDir, args, env = {}, { safeDirectories = [] } = {}) {
+  const result = runCapturedProcess("git", [...gitSafeDirectoryConfigArgs(repoDir, safeDirectories), ...args], {
     cwd: repoDir,
     env: {
       ...process.env,
@@ -245,7 +250,7 @@ export function validateLoopRequest(value) {
     worktree: worktree === null ? null : {
       id: string(worktree.id, "worktree.id", /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
     },
-    nativeSessionId: nullableString(input.nativeSessionId, "nativeSessionId"),
+    nativeSessionId: nullableString(input.nativeSessionId, "nativeSessionId", NATIVE_SESSION_ID),
     contextPolicy: string(input.contextPolicy, "contextPolicy"),
     timeoutMs: input.timeoutMs,
     transitionContext: boundedText(input.transitionContext, "transitionContext", 64_000),
@@ -314,56 +319,88 @@ function prepareRootReadOnlyDirectory(path) {
   chmodTree(path, { fileMode: 0o444, directoryMode: 0o555 });
 }
 
-function copyTrustedTree(source, destination) {
-  const metadata = lstatSync(source);
-  if (metadata.isSymbolicLink()) throw new Error("native session package cannot contain symlinks");
-  if (metadata.isDirectory()) {
-    mkdirSync(destination, { recursive: true, mode: 0o700 });
-    for (const entry of readdirSync(source)) {
-      copyTrustedTree(resolve(source, entry), resolve(destination, entry));
-    }
-    return;
-  }
-  if (!metadata.isFile()) throw new Error("native session package can contain only regular files");
-  mkdirSync(resolve(destination, ".."), { recursive: true, mode: 0o700 });
-  copyFileSync(source, destination);
-}
-
-function materializeNativeSessionState({ request, profileRoot }) {
-  if (!request.nativeSessionId || request.contextPolicy === "fresh") return null;
-  const sourceRoot = configuredNativeSessionSourceRoot();
-  const agentRoot = pathInside(sourceRoot, request.agent);
-  const source = pathInside(agentRoot, request.nativeSessionId);
-  if (!existsSync(source) || !lstatSync(source).isDirectory()) {
-    throw new Error("authorized native session state is unavailable");
-  }
-  copyTrustedTree(source, profileRoot);
-  prepareAgentOwnedDirectory(profileRoot);
-  return source;
-}
-
-function lockPersistentAgentPrivateRoots(paths = PERSISTENT_AGENT_PRIVATE_ROOTS) {
+export function lockPersistentAgentPrivateRoots(paths = PERSISTENT_AGENT_PRIVATE_ROOTS) {
   if (!isRoot()) return [];
   const locked = [];
   for (const path of paths) {
     if (!existsSync(path)) continue;
-    lockPrivateTree(path);
-    locked.push(path);
+    const snapshot = snapshotPrivateTree(path);
+    try {
+      lockPrivateTree(path);
+      locked.push(snapshot);
+    } catch (error) {
+      throw withLockedPersistentProfiles(error, [...locked, snapshot]);
+    }
   }
   return locked;
 }
 
-export function restorePersistentAgentPrivateRoots(paths = PERSISTENT_AGENT_PRIVATE_ROOTS) {
+export function withLockedPersistentProfiles(error, lockedPersistentProfiles) {
+  const wrapped = error instanceof Error ? error : new Error(String(error));
+  wrapped.lockedPersistentProfiles = [...lockedPersistentProfiles];
+  return wrapped;
+}
+
+export function lockedPersistentProfilesFrom(error, fallback = []) {
+  return Array.isArray(error?.lockedPersistentProfiles) ? error.lockedPersistentProfiles : fallback;
+}
+
+function snapshotPrivateTree(path, snapshots = []) {
+  const metadata = lstatSync(path);
+  snapshots.push({
+    path,
+    uid: metadata.uid,
+    gid: metadata.gid,
+    mode: metadata.mode & 0o7777,
+    symbolicLink: metadata.isSymbolicLink(),
+    directory: metadata.isDirectory(),
+  });
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) return snapshots;
+  for (const entry of readdirSync(path)) snapshotPrivateTree(resolve(path, entry), snapshots);
+  return snapshots;
+}
+
+function restoreProfileSnapshot(snapshot) {
+  const entries = [...snapshot].sort((left, right) => right.path.length - left.path.length);
+  for (const entry of entries) {
+    if (!existsSync(entry.path)) continue;
+    if (entry.symbolicLink) {
+      lchownSync(entry.path, entry.uid, entry.gid);
+      continue;
+    }
+    chownSync(entry.path, entry.uid, entry.gid);
+    chmodSync(entry.path, entry.mode);
+  }
+}
+
+function restoreLegacyProfilePath(path) {
   if (!isRoot()) return [];
+  if (!existsSync(path)) return [];
   const identity = identityForUser("agent");
   if (!identity) return [];
+  chownTree(path, identity.uid, identity.gid);
+  chmodTree(path, { fileMode: 0o600, directoryMode: 0o700 });
+  return [path];
+}
+
+export function restorePersistentAgentPrivateRoots(paths = PERSISTENT_AGENT_PRIVATE_ROOTS) {
+  if (!isRoot()) return [];
+  if (paths.length === 0) return [];
   const restored = [];
-  for (const path of paths) {
-    if (!existsSync(path)) continue;
-    chownTree(path, identity.uid, identity.gid);
-    chmodTree(path, { fileMode: 0o600, directoryMode: 0o700 });
-    restored.push(path);
+  const errors = [];
+  for (const entry of paths) {
+    try {
+      if (Array.isArray(entry)) {
+        restoreProfileSnapshot(entry);
+        if (entry[0]?.path) restored.push(entry[0].path);
+      } else {
+        restored.push(...restoreLegacyProfilePath(entry));
+      }
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
   }
+  if (errors.length > 0) throw new Error(`persistent profile restoration failed: ${errors.join("; ")}`);
   return restored;
 }
 
@@ -372,10 +409,12 @@ function prepareActionHomeEnvironment(request) {
   const home = pathInside(currentActionDirectory, "home");
   prepareAgentOwnedDirectory(home);
   const env = [`HOME=${home}`];
+  let nativeSessionProfileRoot = home;
   if (request.agent === "claude") {
     const profileRoot = pathInside(home, ".claude");
     materializeClaudeProfileBaseline({ destinationHome: profileRoot });
     materializeNativeSessionState({ request, profileRoot });
+    nativeSessionProfileRoot = profileRoot;
   }
   if (request.agent === "codex") {
     const codexHome = pathInside(currentActionDirectory, "codex");
@@ -383,11 +422,12 @@ function prepareActionHomeEnvironment(request) {
     materializeCodexProfileBaseline({ destinationHome: codexHome });
     materializeNativeSessionState({ request, profileRoot: codexHome });
     env.push(`CODEX_HOME=${codexHome}`);
+    nativeSessionProfileRoot = codexHome;
   }
   if (request.agent === "opencode") {
     materializeNativeSessionState({ request, profileRoot: home });
   }
-  return env;
+  return { env, nativeSessionProfileRoot };
 }
 
 function prepareLoopTransportEnvironment(request) {
@@ -418,12 +458,13 @@ function prepareLoopAgentEnvironment(request, repoDir) {
   const gitObjectEnv = prepareLoopGitObjectEnvironment(request, repoDir);
   const transportEnv = prepareLoopTransportEnvironment(request);
   const homeEnv = prepareActionHomeEnvironment(request);
-  const env = ["USER=agent", "GIT_OPTIONAL_LOCKS=0", ...gitObjectEnv.env, ...transportEnv, ...homeEnv];
+  const env = ["USER=agent", "GIT_OPTIONAL_LOCKS=0", ...gitObjectEnv.env, ...transportEnv, ...homeEnv.env];
   if (!request.repositorySkill) {
     return {
       env,
       repositorySkillRoot: null,
       gitObjectEnv: gitObjectEnv.values,
+      nativeSessionProfileRoot: homeEnv.nativeSessionProfileRoot,
     };
   }
   const discoveryRoot = loopSkillDiscoveryRoot(request);
@@ -433,11 +474,16 @@ function prepareLoopAgentEnvironment(request, repoDir) {
     agent: request.agent,
     discoveryRoot,
   });
-  return { env, repositorySkillRoot, gitObjectEnv: gitObjectEnv.values };
+  return {
+    env,
+    repositorySkillRoot,
+    gitObjectEnv: gitObjectEnv.values,
+    nativeSessionProfileRoot: homeEnv.nativeSessionProfileRoot,
+  };
 }
 
 function packReachableBaseObjects(repoDir, destinationPackBase) {
-  const result = runCapturedProcess("git", ["-c", `safe.directory=${repoDir}`, "pack-objects", "--revs", destinationPackBase], {
+  const result = runCapturedProcess("git", [...gitSafeDirectoryConfigArgs(repoDir), "pack-objects", "--revs", destinationPackBase], {
     cwd: repoDir,
     input: "HEAD\n",
     timeout: 120_000,
@@ -512,8 +558,12 @@ function createReadOnlyRepositoryView(request, sourceRepoDir = "/home/agent/repo
   const destination = pathInside(currentActionDirectory, "repo-view");
   rmSync(destination, { recursive: true, force: true });
   lockNonCurrentActionDirectories(request, actionRoot);
+  const sourceGitDir = join(sourceRepoDir, ".git");
+  const sourceSafeDirectories = existsSync(sourceGitDir) ? [sourceGitDir] : [];
   const head = runRootGit(sourceRepoDir, ["rev-parse", "HEAD"]);
-  runRootGit(sourceRepoDir, ["clone", "--quiet", "--no-hardlinks", sourceRepoDir, destination]);
+  runRootGit(sourceRepoDir, ["clone", "--quiet", "--no-hardlinks", sourceRepoDir, destination], {}, {
+    safeDirectories: sourceSafeDirectories,
+  });
   runRootGit(destination, ["checkout", "--quiet", "--detach", head]);
   runRootGit(destination, ["config", "remote.origin.url", "DISABLED_BY_OPENTHROTTLE_READONLY_VIEW"]);
   runRootGit(destination, ["config", "remote.origin.pushurl", "DISABLED_BY_OPENTHROTTLE_READONLY_VIEW"]);
@@ -641,10 +691,17 @@ export function runLoopAgentInPreparedRepository({
   const preparedEnvironment = prepareLoopAgentEnvironment(request, repoDir);
   const built = loopAgentCommand({ request, invocation, repoDir, repositorySkillRoot: preparedEnvironment.repositorySkillRoot });
   let lockedPersistentProfiles = [];
+  const cleanupErrors = [];
+  let bodyError = null;
   lockIntegration(integrationRepoDir);
-  lockedPersistentProfiles = lockPersistentProfiles();
-  makeCurrentActionDirectoryTraverseOnly(request);
   try {
+    try {
+      lockedPersistentProfiles = lockPersistentProfiles();
+    } catch (error) {
+      lockedPersistentProfiles = lockedPersistentProfilesFrom(error, lockedPersistentProfiles);
+      throw error;
+    }
+    makeCurrentActionDirectoryTraverseOnly(request);
     const result = processFence(() => runProcess("gosu", [
       "agent", "env", ...preparedEnvironment.env, built.command, ...built.args,
     ], {
@@ -652,10 +709,35 @@ export function runLoopAgentInPreparedRepository({
       input: built.input,
       timeout: request.timeoutMs,
     }));
-    return { ...result, gitObjectEnv: preparedEnvironment.gitObjectEnv, integrationRepoDir };
+    const nativeSessionId = request.nativeSessionId ?? extractNativeSessionId(result.stdout, request.agent);
+    sealNativeSessionPackage({
+      agent: request.agent,
+      nativeSessionId,
+      profileRoot: preparedEnvironment.nativeSessionProfileRoot,
+    });
+    return {
+      ...result,
+      nativeSessionId,
+      gitObjectEnv: preparedEnvironment.gitObjectEnv,
+      integrationRepoDir,
+    };
+  } catch (error) {
+    bodyError = error;
+    throw error;
   } finally {
-    lockIntegration(integrationRepoDir);
-    restorePersistentProfiles(lockedPersistentProfiles);
+    try {
+      lockIntegration(integrationRepoDir);
+    } catch (error) {
+      cleanupErrors.push(error instanceof Error ? error.message : String(error));
+    }
+    try {
+      restorePersistentProfiles(lockedPersistentProfiles);
+    } catch (error) {
+      cleanupErrors.push(error instanceof Error ? error.message : String(error));
+    }
+    if (cleanupErrors.length > 0 && !bodyError) {
+      throw new Error(`loop action cleanup failed: ${cleanupErrors.join("; ")}`);
+    }
   }
 }
 
@@ -725,10 +807,10 @@ export function executeLoopAction({
   lockWorkerWorktree = lockCurrentWorkerWorktree,
   lockActionDirectory = lockCurrentActionDirectory,
   restoreIntegration = restoreIntegrationCheckout,
+  integrationRepoDir = configuredIntegrationRepoDir(),
   now = () => new Date().toISOString(),
 }) {
   const request = validateLoopRequest(rawRequest);
-  const integrationRepoDir = configuredIntegrationRepoDir();
   const cleanupErrors = [];
   let result;
   let execution;

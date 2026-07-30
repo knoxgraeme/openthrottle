@@ -21,7 +21,8 @@ BUILTIN_REQUEST="$ACTION_ROOT/attempt-current/action-builtin/request.json"
 BUILTIN_RESULT="$ACTION_ROOT/attempt-current/action-builtin/result.json"
 SEALED="$ROOT/sealed-input.txt"
 BACKGROUND_PID="$ACTION_ROOT/attempt-current/action-current/home/background.pid"
-NATIVE_SESSION_ROOT="/home/agent/.ot/native-sessions"
+NATIVE_SESSION_ROOT="/var/lib/openthrottle/native-sessions"
+export OT_NATIVE_SESSION_SOURCE_ROOT="$NATIVE_SESSION_ROOT"
 PERSISTENT_CLAUDE_SECRET="/home/agent/.claude/ot-persistent-probe-secret.txt"
 PERSISTENT_CODEX_SECRET="/home/agent/.codex/ot-persistent-probe-secret.txt"
 PERSISTENT_OT_SECRET="/home/agent/.ot/ot-persistent-probe-secret.txt"
@@ -66,11 +67,23 @@ chown -R agent:agent "$ACTION_ROOT/attempt-current/action-sibling" "$ACTION_ROOT
 printf 'sealed secret\n' > "$SEALED"
 chown root:root "$SEALED"
 chmod 0400 "$SEALED"
-install -d -o agent -g agent -m 0700 "$NATIVE_SESSION_ROOT/codex/native-current/sessions"
-install -d -o agent -g agent -m 0700 "$NATIVE_SESSION_ROOT/codex/native-sibling/sessions"
-printf 'current native session\n' > "$NATIVE_SESSION_ROOT/codex/native-current/sessions/current.jsonl"
-printf 'sibling native session\n' > "$NATIVE_SESSION_ROOT/codex/native-sibling/sessions/sibling.jsonl"
-chown -R agent:agent "$NATIVE_SESSION_ROOT/codex"
+install -d -o root -g root -m 0700 "$NATIVE_SESSION_ROOT"
+OT_NATIVE_SESSION_SOURCE_ROOT="$NATIVE_SESSION_ROOT" node --input-type=module <<'NODE'
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { sealNativeSessionPackage } from "/opt/openthrottle/runner/native-session-package.mjs";
+
+function sealFixture(nativeSessionId, fileName, contents) {
+  const profileRoot = mkdtempSync(join(tmpdir(), `ot-native-${nativeSessionId}-`));
+  mkdirSync(join(profileRoot, "sessions"), { recursive: true });
+  writeFileSync(join(profileRoot, "sessions", fileName), contents);
+  sealNativeSessionPackage({ agent: "codex", nativeSessionId, profileRoot });
+}
+
+sealFixture("native-current", "current.jsonl", "current native session\n");
+sealFixture("native-sibling", "sibling.jsonl", "sibling native session\n");
+NODE
 install -d -o agent -g agent -m 0700 /home/agent/.claude /home/agent/.codex /home/agent/.ot
 printf 'persistent claude secret\n' > "$PERSISTENT_CLAUDE_SECRET"
 printf 'persistent codex secret\n' > "$PERSISTENT_CODEX_SECRET"
