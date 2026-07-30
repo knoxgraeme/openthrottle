@@ -968,7 +968,7 @@ printf '{"type":"system","subtype":"init","session_id":"unrelated-claude-session
 cat > "$OT_STAGE_PROPOSAL_FILE" <<'JSON'
 {"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"ok","evidence":["session reported"],"findings":[],"actions":[],"uncertainty":[]}
 JSON
-printf '{"type":"system","subtype":"init","session_id":"smoke-claude-session","model":"stub"}\\n'
+printf '{"type":"system","subtype":"init","session_id":"reported-but-unsealed-claude-session","model":"stub"}\\n'
 `);
     withPrependedPath(binDir, () => {
       expect(() => defaultRunAgent({

@@ -214,6 +214,10 @@ printf '%s\n' "$*" >> "$HOME/.ot/opencode-args.log"
 last=""
 for arg in "$@"; do last="$arg"; done
 printf '%s\n' "$last" >> "$HOME/.ot/opencode-prompt.log"
+mkdir -p "$HOME/.local/share/opencode"
+printf '%s\n' \
+  '{"type":"message","sessionID":"smoke-opencode-session","part":{"type":"text","text":"durable smoke session"}}' \
+  > "$HOME/.local/share/opencode/smoke-opencode-session.jsonl"
 printf '%s\n' \
   '{"type":"message","sessionID":"smoke-opencode-session","part":{"type":"text","text":"smoke complete"}}' \
   '{"type":"step_finish","sessionID":"smoke-opencode-session","part":{"cost":0.375}}'
