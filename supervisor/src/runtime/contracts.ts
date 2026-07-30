@@ -62,6 +62,7 @@ export interface LoopActionRequest {
   agent: "claude" | "codex" | "opencode";
   skill: string;
   worktree: RuntimeWorktreeHandle | null;
+  candidateSubject?: string | null;
   nativeSessionId: string | null;
   contextPolicy: "fresh" | "resume_required" | "prefer_resume";
   timeoutMs: number;

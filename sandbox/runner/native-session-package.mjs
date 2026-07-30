@@ -63,11 +63,6 @@ function relativePackagePath(root, path) {
   return relativePath;
 }
 
-function exactPathCarriesSessionId(relativePath, nativeSessionId) {
-  return relativePath.split("/")
-    .some((part) => part === nativeSessionId || part === `${nativeSessionId}.jsonl` || part === `${nativeSessionId}.json`);
-}
-
 function jsonEventCarriesSessionId(line, nativeSessionId, agent) {
   try {
     const event = JSON.parse(line);
@@ -115,8 +110,7 @@ function collectNativeSessionFiles(root, path = root, files = [], totals = { byt
   const relativePath = relativePackagePath(root, path);
   if (sessionEvidence &&
     !sessionEvidence.contains &&
-    (exactPathCarriesSessionId(relativePath, sessionEvidence.nativeSessionId) ||
-      exactContentsCarrySessionId(bytes, sessionEvidence.nativeSessionId, sessionEvidence.agent))) {
+    exactContentsCarrySessionId(bytes, sessionEvidence.nativeSessionId, sessionEvidence.agent)) {
     sessionEvidence.contains = true;
   }
   files.push({

@@ -133,6 +133,10 @@ if [ -n "${OT_STAGE_PROPOSAL_FILE:-}" ]; then
   grep -Fq 'fixture-mcp' "${OT_CLAUDE_MCP_CONFIG:?}" || exit 30
   mkdir -p "$repo_dir/.claude/commands"
   touch "$repo_dir/.claude/commands/persisted-project-review-command.md"
+  mkdir -p "$HOME/.claude/projects"
+  printf '%s\n' \
+    '{"type":"system","subtype":"init","session_id":"smoke-claude-session","model":"stub"}' \
+    > "$HOME/.claude/projects/smoke-claude-session.jsonl"
   ot-stage-result '{"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"Claude stage complete","evidence":["stub engine invoked"],"findings":[],"actions":[],"uncertainty":[]}' --output "$OT_STAGE_PROPOSAL_FILE" || exit 23
   test -s "$OT_STAGE_PROPOSAL_FILE" || exit 24
 fi

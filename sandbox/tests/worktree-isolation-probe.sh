@@ -260,13 +260,14 @@ chown root:root "$REQUEST"
 chmod 0400 "$REQUEST"
 
 install -d -o root -g root -m 0700 "$ACTION_ROOT/attempt-current/action-lead"
-PATH="$BIN:$PATH" node --input-type=module - "$LEAD_REQUEST" <<'NODE'
+PATH="$BIN:$PATH" node --input-type=module - "$LEAD_REQUEST" "$BASE" <<'NODE'
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { canonicalJson } from "/opt/openthrottle/runner/capabilities.mjs";
 import { createLoopRequestHash } from "/opt/openthrottle/runner/execute-loop.mjs";
 
 const requestPath = process.argv[2];
+const candidateSubject = process.argv[3];
 const base = {
   protocol: "loop-action@1",
   actionId: "action-lead",
@@ -278,6 +279,7 @@ const base = {
   agent: "codex",
   skill: "accept-unit",
   worktree: null,
+  candidateSubject,
   nativeSessionId: null,
   contextPolicy: "fresh",
   timeoutMs: 120000,
@@ -326,13 +328,14 @@ chown root:root "$REVIEWER_REQUEST"
 chmod 0400 "$REVIEWER_REQUEST"
 
 install -d -o root -g root -m 0700 "$ACTION_ROOT/attempt-current/action-builtin"
-PATH="$BIN:$PATH" node --input-type=module - "$BUILTIN_REQUEST" <<'NODE'
+PATH="$BIN:$PATH" node --input-type=module - "$BUILTIN_REQUEST" "$BASE" <<'NODE'
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { canonicalJson } from "/opt/openthrottle/runner/capabilities.mjs";
 import { createLoopRequestHash } from "/opt/openthrottle/runner/execute-loop.mjs";
 
 const requestPath = process.argv[2];
+const candidateSubject = process.argv[3];
 const base = {
   protocol: "loop-action@1",
   actionId: "action-builtin",
@@ -344,6 +347,7 @@ const base = {
   agent: "codex",
   skill: "accept-unit",
   worktree: null,
+  candidateSubject,
   nativeSessionId: null,
   contextPolicy: "fresh",
   timeoutMs: 120000,

@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 
-import { existsSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
 import { runGitAsExecutor } from "./repository-control.mjs";
-import { chmodOwnerPrivateTree, chownTree, identityForUser, isRoot } from "./filesystem-isolation.mjs";
+import { restoreIntegrationCheckout } from "./execute-loop.mjs";
 
 const COMMIT = /^[a-f0-9]{40}$/;
 
@@ -21,15 +21,6 @@ function clean(repoDir) {
 
 function treeOf(repoDir, subject) {
   return runGitAsExecutor(repoDir, ["rev-parse", `${subject}^{tree}`]);
-}
-
-function restoreRepositoryOwnerCheckout(repoDir) {
-  if (!isRoot() || !existsSync(repoDir)) return false;
-  const identity = identityForUser("agent");
-  if (!identity) return false;
-  chownTree(repoDir, identity.uid, identity.gid);
-  chmodOwnerPrivateTree(repoDir);
-  return true;
 }
 
 export function integrateCandidate({
@@ -53,7 +44,7 @@ export function integrateCandidate({
     runGitAsExecutor(repoDir, ["merge", "--ff-only", candidate]);
     return receipt({ repoDir, expected, candidate, integrated: true, reason: "fast_forwarded" });
   } finally {
-    restoreRepositoryOwnerCheckout(repoDir);
+    restoreIntegrationCheckout(repoDir);
   }
 }
 

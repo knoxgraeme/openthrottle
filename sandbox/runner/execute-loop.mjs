@@ -46,6 +46,7 @@ export {
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 const STAGE_PATH_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const NATIVE_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
+const GIT_OBJECT_ID = /^[a-f0-9]{40,64}$/;
 const AGENTS = new Set(["claude", "codex", "opencode"]);
 const ROLES = new Set(["worker", "lead", "reviewer", "publisher"]);
 const LOOPS = new Set(["implement", "simplify", "command", "repair", "lead", "review", "publish"]);
@@ -267,7 +268,7 @@ export function validateLoopRequest(value) {
   const input = record(value, "loop request");
   const allowed = new Set([
     "protocol", "actionId", "attemptId", "graphId", "unitId", "role", "loop",
-    "agent", "skill", "worktree", "nativeSessionId", "contextPolicy", "timeoutMs",
+    "agent", "skill", "worktree", "candidateSubject", "nativeSessionId", "contextPolicy", "timeoutMs",
     "transitionContext", "allowedMcpServers", "credentialScopes", "receiptSchema",
     "repositorySkill", "requestHash", "idempotencyKey",
   ]);
@@ -279,6 +280,9 @@ export function validateLoopRequest(value) {
     const worktreeUnknown = Object.keys(worktree).find((key) => key !== "id" && key !== "path");
     if (worktreeUnknown) throw new Error(`worktree has unknown field ${worktreeUnknown}`);
   }
+  const candidateSubject = input.candidateSubject === undefined
+    ? null
+    : nullableString(input.candidateSubject, "candidateSubject", GIT_OBJECT_ID);
   const request = {
     protocol: LOOP_ACTION_PROTOCOL,
     actionId: stagePathId(input.actionId, "actionId"),
@@ -320,8 +324,14 @@ export function validateLoopRequest(value) {
   }
   if (request.role === "worker" && !request.worktree) throw new Error("worker loop requires a worktree");
   if (request.role !== "worker" && request.worktree) throw new Error("non-worker loop cannot receive a writable worktree");
+  if (request.role === "lead" && !candidateSubject) throw new Error("lead loop requires a candidate subject");
+  if (request.role !== "lead" && candidateSubject) throw new Error("candidate subject is only valid for lead loops");
   if (worktree !== null && worktree.path !== undefined) throw new Error("loop request cannot carry an absolute worktree path");
-  const requestWithSkill = { ...request, ...(repositorySkill === undefined ? {} : { repositorySkill }) };
+  const requestWithSkill = {
+    ...request,
+    ...(candidateSubject === null ? {} : { candidateSubject }),
+    ...(repositorySkill === undefined ? {} : { repositorySkill }),
+  };
   const expected = createLoopRequestHash(requestWithSkill);
   if (input.requestHash !== expected.requestHash || input.idempotencyKey !== expected.idempotencyKey) {
     throw new Error("loop request hash or idempotency key is stale");
@@ -446,10 +456,10 @@ function prepareLoopAgentEnvironment(request, repoDir) {
   };
 }
 
-function packReachableBaseObjects(repoDir, destinationPackBase) {
+function packReachableBaseObjects(repoDir, destinationPackBase, subject = "HEAD") {
   const result = runCapturedProcess("git", [...gitSafeDirectoryConfigArgs(repoDir), "pack-objects", "--revs", destinationPackBase], {
     cwd: repoDir,
-    input: "HEAD\n",
+    input: `${subject}\n`,
     timeout: 120_000,
     captureBytes: 1024 * 1024,
   });
@@ -522,13 +532,22 @@ function createReadOnlyRepositoryView(request, sourceRepoDir = "/home/agent/repo
   const destination = pathInside(currentActionDirectory, "repo-view");
   rmSync(destination, { recursive: true, force: true });
   lockNonCurrentActionDirectories(request, actionRoot);
-  const head = runRootGit(sourceRepoDir, ["rev-parse", "HEAD"]);
+  const subject = request.role === "lead" ? request.candidateSubject : "HEAD";
+  const objectType = runRootGit(sourceRepoDir, ["cat-file", "-t", subject]);
+  if (objectType !== "commit" && objectType !== "tree") {
+    throw new Error("read-only repository subject must be a commit or tree");
+  }
   mkdirSync(destination, { recursive: true, mode: 0o755 });
   runRootGit(destination, ["init", "--quiet"]);
   const packDir = pathInside(pathInside(destination, ".git"), "objects/pack");
   mkdirSync(packDir, { recursive: true, mode: 0o755 });
-  packReachableBaseObjects(sourceRepoDir, join(packDir, "authorized"));
-  runRootGit(destination, ["checkout", "--quiet", "--detach", head]);
+  packReachableBaseObjects(sourceRepoDir, join(packDir, "authorized"), subject);
+  if (objectType === "commit") {
+    runRootGit(destination, ["checkout", "--quiet", "--detach", subject]);
+  } else {
+    runRootGit(destination, ["read-tree", subject]);
+    runRootGit(destination, ["checkout-index", "--all", "--force"]);
+  }
   runRootGit(destination, ["config", "remote.origin.url", "DISABLED_BY_OPENTHROTTLE_READONLY_VIEW"]);
   runRootGit(destination, ["config", "remote.origin.pushurl", "DISABLED_BY_OPENTHROTTLE_READONLY_VIEW"]);
   chmodTree(destination, { fileMode: 0o444, directoryMode: 0o555 });
@@ -545,10 +564,6 @@ function prepareLoopRepository(request, integrationRepoDir = INTEGRATION_REPO_DI
     }).path;
   }
   return createReadOnlyRepositoryView(request, integrationRepoDir);
-}
-
-function lockObjectStore(path) {
-  lockPrivateTree(path);
 }
 
 function lockPrivateTree(path) {
@@ -571,10 +586,6 @@ function lockGitMetadata(gitDir) {
         if (!lstatSync(handleDir).isDirectory()) continue;
         lockPrivateTree(handleDir);
       }
-    } else if (entry === "objects") {
-      lockObjectStore(child);
-    } else if (entry === "refs" || entry === "packed-refs" || entry === "HEAD" || entry === "config") {
-      lockPrivateTree(child);
     } else {
       lockPrivateTree(child);
     }
@@ -661,9 +672,6 @@ export function runLoopAgentInPreparedRepository({
   lockPersistentProfiles = lockPersistentAgentPrivateRoots,
   restorePersistentProfiles = restorePersistentAgentPrivateRoots,
 }) {
-  let repoDir = null;
-  let preparedEnvironment = null;
-  let built = null;
   let lockedPersistentProfiles = [];
   const cleanupErrors = [];
   let bodyError = null;
@@ -675,9 +683,9 @@ export function runLoopAgentInPreparedRepository({
       lockedPersistentProfiles = lockedPersistentProfilesFrom(error, lockedPersistentProfiles);
       throw error;
     }
-    repoDir = prepareLoopRepository(request, integrationRepoDir);
-    preparedEnvironment = prepareLoopAgentEnvironment(request, repoDir);
-    built = loopAgentCommand({ request, invocation, repoDir, repositorySkillRoot: preparedEnvironment.repositorySkillRoot });
+    const repoDir = prepareLoopRepository(request, integrationRepoDir);
+    const preparedEnvironment = prepareLoopAgentEnvironment(request, repoDir);
+    const built = loopAgentCommand({ request, invocation, repoDir, repositorySkillRoot: preparedEnvironment.repositorySkillRoot });
     makeCurrentActionDirectoryTraverseOnly(request);
     const result = processFence(() => runProcess("gosu", [
       "agent", "env", ...preparedEnvironment.env, built.command, ...built.args,

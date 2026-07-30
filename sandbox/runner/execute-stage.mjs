@@ -403,11 +403,7 @@ export function defaultRunAgent({
   restorePersistentProfiles = restorePersistentAgentPrivateRoots,
   lockStageHome = lockRepositorySkillStageHome,
 }) {
-  let stageEnvironment = null;
-  let repositorySkillRoot = null;
   const actionProposalPath = repositorySkillProposalPath(request, proposalPath);
-  let prompt = null;
-  let env = null;
   let command;
   let args;
   let stdin;
@@ -421,8 +417,8 @@ export function defaultRunAgent({
       lockedPersistentProfiles = lockedPersistentProfilesFrom(error, lockedPersistentProfiles);
       throw error;
     }
-    stageEnvironment = repositorySkillStageEnvironment(request);
-    repositorySkillRoot = materializeRepositorySkill({
+    const stageEnvironment = repositorySkillStageEnvironment(request);
+    const repositorySkillRoot = materializeRepositorySkill({
       request,
       repoDir,
       discoveryRoot: stageEnvironment.repositorySkillDiscoveryRoot,
@@ -430,8 +426,8 @@ export function defaultRunAgent({
     if (request.capability === REPOSITORY_SKILL_CAPABILITY) {
       materializeNativeSessionState({ request, profileRoot: stageEnvironment.nativeSessionProfileRoot });
     }
-    prompt = stagePrompt(request, actionProposalPath, { agent, repositorySkillRoot });
-    env = [
+    const prompt = stagePrompt(request, actionProposalPath, { agent, repositorySkillRoot });
+    const env = [
       ...stageEnvironment.env,
       `OT_STAGE_PROPOSAL_FILE=${actionProposalPath}`,
     ];
@@ -487,7 +483,11 @@ export function defaultRunAgent({
     if (proposalRead.status === 0 && Buffer.byteLength(proposalRead.stdout) > 1_048_576) {
       throw new Error("stage proposal exceeds the 1 MiB limit");
     }
-    const nativeSessionId = request.nativeSessionId ?? extractNativeSessionId(result.stdout, agent);
+    const reportedNativeSessionId = extractNativeSessionId(result.stdout, agent);
+    if (request.nativeSessionId && reportedNativeSessionId && reportedNativeSessionId !== request.nativeSessionId) {
+      throw new Error("reported native session id does not match the sealed stage request");
+    }
+    const nativeSessionId = request.nativeSessionId ?? reportedNativeSessionId;
     const sealedNativeSessionPackage = sealNativeSessionPackage({
       agent,
       nativeSessionId,

@@ -191,6 +191,29 @@ function clock() {
   return () => values.shift();
 }
 
+function writeExecutable(path, contents) {
+  writeFileSync(path, contents);
+  chmodSync(path, 0o755);
+}
+
+function installFakeGosu(binDir) {
+  writeExecutable(join(binDir, "gosu"), `#!/usr/bin/env bash
+set -euo pipefail
+shift
+exec "$@"
+`);
+}
+
+function withPrependedPath(binDir, run) {
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${previousPath}`;
+  try {
+    return run();
+  } finally {
+    process.env.PATH = previousPath;
+  }
+}
+
 describe("one-stage executor", () => {
   it("validates the complete immutable request fence", () => {
     const { request } = fixture();
@@ -813,7 +836,7 @@ describe("one-stage executor", () => {
     directories.push(actionRoot, sourceRoot, sourceProfile, binDir);
     const sourceSessionStore = nativeSessionStoragePath("codex", sourceProfile);
     mkdirSync(sourceSessionStore, { recursive: true });
-    writeFileSync(join(sourceSessionStore, "native-1.json"), "{\"session\":true}\n");
+    writeFileSync(join(sourceSessionStore, "native-1.json"), "{\"type\":\"thread.started\",\"thread_id\":\"native-1\"}\n");
     sealNativeSessionPackage({
       agent: "codex",
       nativeSessionId: "native-1",
@@ -823,15 +846,8 @@ describe("one-stage executor", () => {
     process.env.OT_STAGE_ACTION_ROOT = actionRoot;
     process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sourceRoot;
 
-    const fakeGosu = join(binDir, "gosu");
-    writeFileSync(fakeGosu, `#!/usr/bin/env bash
-set -euo pipefail
-shift
-exec "$@"
-`);
-    chmodSync(fakeGosu, 0o755);
-    const fakeCodex = join(binDir, "codex");
-    writeFileSync(fakeCodex, `#!/usr/bin/env bash
+    installFakeGosu(binDir);
+    writeExecutable(join(binDir, "codex"), `#!/usr/bin/env bash
 set -euo pipefail
 test -f "$CODEX_HOME/sessions/native-1.json"
 test "$OT_STAGE_PROPOSAL_FILE" = "$OT_STAGE_ACTION_ROOT/attempt-1/home/proposal.json"
@@ -840,10 +856,7 @@ cat > "$OT_STAGE_PROPOSAL_FILE" <<'JSON'
 JSON
 printf '{"type":"thread.started","thread_id":"native-1"}\\n'
 `);
-    chmodSync(fakeCodex, 0o755);
-    const previousPath = process.env.PATH;
-    process.env.PATH = `${binDir}:${previousPath}`;
-    try {
+    withPrependedPath(binDir, () => {
       const result = defaultRunAgent({
         request: input.request,
         invocation: resolveContextInvocation(input.request),
@@ -854,9 +867,129 @@ printf '{"type":"thread.started","thread_id":"native-1"}\\n'
 
       expect(result.exitCode).toBe(0);
       expect(result.proposal).toMatchObject({ suggested_outcome: "success" });
-    } finally {
-      process.env.PATH = previousPath;
-    }
+    });
+  });
+
+  it("seals Claude native session packages when the stub writes canonical continuation state", () => {
+    const repoDir = repository();
+    const skillDir = ".agents/skills/implement-unit";
+    mkdirSync(join(repoDir, skillDir), { recursive: true });
+    writeFileSync(join(repoDir, skillDir, "SKILL.md"), "---\nname: implement_unit\n---\n# Skill\n");
+    execFileSync("git", ["add", "."], { cwd: repoDir });
+    execFileSync("git", ["commit", "-qm", "skill"], { cwd: repoDir });
+    const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+    const skillPath = `${skillDir}/SKILL.md`;
+    const file = {
+      path: skillPath,
+      blobSha: execFileSync("git", ["rev-parse", `${commit}:${skillPath}`], { cwd: repoDir, encoding: "utf8" }).trim(),
+      digest: digest(readFileSync(join(repoDir, skillPath))),
+    };
+    const unsignedPackage = {
+      schema: "openthrottle.repository-skill-package/v1",
+      reference: `repo://owner/repo@${commit}#${skillDir}`,
+      invocation: "implement_unit",
+      directory: skillDir,
+      commit,
+      files: [file],
+    };
+    const input = fixture({
+      agent: "claude",
+      capability: "agent/repository-skill@1",
+      repositorySkill: { ...unsignedPackage, packageDigest: digest(canonicalJson(unsignedPackage)) },
+    });
+    input.repoDir = repoDir;
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-stage-actions-"));
+    const sourceRoot = mkdtempSync(join(tmpdir(), "ot-stage-native-sessions-"));
+    const binDir = mkdtempSync(join(tmpdir(), "ot-fake-bin-"));
+    directories.push(actionRoot, sourceRoot, binDir);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sourceRoot;
+
+    installFakeGosu(binDir);
+    writeExecutable(join(binDir, "claude"), `#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "$HOME/.claude/projects"
+printf '{"type":"system","subtype":"init","session_id":"smoke-claude-session","model":"stub"}\\n' > "$HOME/.claude/projects/smoke-claude-session.jsonl"
+cat > "$OT_STAGE_PROPOSAL_FILE" <<'JSON'
+{"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"ok","evidence":["session sealed"],"findings":[],"actions":[],"uncertainty":[]}
+JSON
+printf '{"type":"system","subtype":"init","session_id":"smoke-claude-session","model":"stub"}\\n'
+`);
+    withPrependedPath(binDir, () => {
+      const result = defaultRunAgent({
+        request: input.request,
+        invocation: resolveContextInvocation(input.request),
+        repoDir: input.repoDir,
+        proposalPath: join(actionRoot, "proposal.json"),
+        timeoutMs: 1000,
+      });
+
+      expect(result.nativeSessionId).toBe("smoke-claude-session");
+      expect(readFileSync(
+        join(sourceRoot, "claude", "smoke-claude-session", "projects", "smoke-claude-session.jsonl"),
+        "utf8",
+      )).toContain('"session_id":"smoke-claude-session"');
+    });
+  });
+
+  it("refuses Claude stage native session ids when no canonical continuation state exists", () => {
+    const input = fixture({ agent: "claude" });
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-stage-actions-"));
+    const sourceRoot = mkdtempSync(join(tmpdir(), "ot-stage-native-sessions-"));
+    const binDir = mkdtempSync(join(tmpdir(), "ot-fake-bin-"));
+    directories.push(actionRoot, sourceRoot, binDir);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sourceRoot;
+
+    installFakeGosu(binDir);
+    writeExecutable(join(binDir, "claude"), `#!/usr/bin/env bash
+set -euo pipefail
+cat > "$OT_STAGE_PROPOSAL_FILE" <<'JSON'
+{"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"ok","evidence":["session reported"],"findings":[],"actions":[],"uncertainty":[]}
+JSON
+printf '{"type":"system","subtype":"init","session_id":"smoke-claude-session","model":"stub"}\\n'
+`);
+    withPrependedPath(binDir, () => {
+      expect(() => defaultRunAgent({
+        request: input.request,
+        invocation: resolveContextInvocation(input.request),
+        repoDir: input.repoDir,
+        proposalPath: join(actionRoot, "proposal.json"),
+        timeoutMs: 1000,
+      })).toThrow(/native session id was reported without a sealed executor package/);
+    });
+  });
+
+  it("rejects resumed stage output that reports a different native session id", () => {
+    const input = fixture({
+      agent: "claude",
+      contextPolicy: "resume_required",
+      nativeSessionId: "requested-claude-session",
+    });
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-stage-actions-"));
+    const sourceRoot = mkdtempSync(join(tmpdir(), "ot-stage-native-sessions-"));
+    const binDir = mkdtempSync(join(tmpdir(), "ot-fake-bin-"));
+    directories.push(actionRoot, sourceRoot, binDir);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sourceRoot;
+
+    installFakeGosu(binDir);
+    writeExecutable(join(binDir, "claude"), `#!/usr/bin/env bash
+set -euo pipefail
+cat > "$OT_STAGE_PROPOSAL_FILE" <<'JSON'
+{"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"ok","evidence":["session reported"],"findings":[],"actions":[],"uncertainty":[]}
+JSON
+printf '{"type":"system","subtype":"init","session_id":"different-claude-session","model":"stub"}\\n'
+`);
+    withPrependedPath(binDir, () => {
+      expect(() => defaultRunAgent({
+        request: input.request,
+        invocation: resolveContextInvocation(input.request),
+        repoDir: input.repoDir,
+        proposalPath: join(actionRoot, "proposal.json"),
+        timeoutMs: 1000,
+      })).toThrow(/reported native session id does not match the sealed stage request/);
+    });
   });
 
   it("refuses reported stage native session ids when sealing cannot produce a package and surfaces cleanup failures", () => {
@@ -893,25 +1026,15 @@ printf '{"type":"thread.started","thread_id":"native-1"}\\n'
     process.env.OT_STAGE_ACTION_ROOT = actionRoot;
     process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sourceRoot;
 
-    const fakeGosu = join(binDir, "gosu");
-    writeFileSync(fakeGosu, `#!/usr/bin/env bash
-set -euo pipefail
-shift
-exec "$@"
-`);
-    chmodSync(fakeGosu, 0o755);
-    const fakeCodex = join(binDir, "codex");
-    writeFileSync(fakeCodex, `#!/usr/bin/env bash
+    installFakeGosu(binDir);
+    writeExecutable(join(binDir, "codex"), `#!/usr/bin/env bash
 set -euo pipefail
 cat > "$OT_STAGE_PROPOSAL_FILE" <<'JSON'
 {"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"ok","evidence":["session reported"],"findings":[],"actions":[],"uncertainty":[]}
 JSON
 printf '{"type":"thread.started","thread_id":"native-1"}\\n'
 `);
-    chmodSync(fakeCodex, 0o755);
-    const previousPath = process.env.PATH;
-    process.env.PATH = `${binDir}:${previousPath}`;
-    try {
+    withPrependedPath(binDir, () => {
       expect(() => defaultRunAgent({
         request: input.request,
         invocation: resolveContextInvocation(input.request),
@@ -924,9 +1047,7 @@ printf '{"type":"thread.started","thread_id":"native-1"}\\n'
         },
         lockStageHome: () => true,
       })).toThrow(/native session id was reported without a sealed executor package.*profile restore failed/s);
-    } finally {
-      process.env.PATH = previousPath;
-    }
+    });
   });
 
   it("executes only the sealed allowlisted command and records tree mutation", () => {
