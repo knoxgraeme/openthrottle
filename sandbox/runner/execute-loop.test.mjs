@@ -260,6 +260,32 @@ describe("loop action request validation", () => {
       .toThrow(/actionId is invalid/);
   });
 
+  it.each([
+    "probe/no-receipt@1",
+    "openthrottle.loop-receipt@1",
+    "vendor.example.receipt/v1",
+  ])("rejects unsupported receipt schema %s before loop execution", (receiptSchema) => {
+    expect(() => validateLoopRequest(request({ receiptSchema })))
+      .toThrow(/loop receipt schema is unsupported/);
+  });
+
+  it("does not invoke the loop agent for unsupported receipt schemas", () => {
+    const runLoopAgent = vi.fn(() => ({
+      status: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "opaque success",
+      stderr: "",
+      nativeSessionId: "thread-1",
+    }));
+
+    expect(() => executeLoopActionWithIntegration({
+      request: request({ receiptSchema: "vendor.example.receipt/v1" }),
+      runLoopAgent,
+    })).toThrow(/loop receipt schema is unsupported/);
+    expect(runLoopAgent).not.toHaveBeenCalled();
+  });
+
   it("enforces role/worktree and session reuse rules", () => {
     expect(() => validateLoopRequest(request({ role: "lead", loop: "lead", worktree: null, candidateSubject: "a".repeat(40) }))).not.toThrow();
     expect(() => validateLoopRequest(request({ role: "lead", loop: "lead", worktree: null }))).toThrow(/candidate subject/);
