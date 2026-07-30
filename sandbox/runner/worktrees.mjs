@@ -3,7 +3,7 @@
 import { chmodSync, chownSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { runGitAsRepositoryOwner } from "./repository-control.mjs";
+import { runGitAsExecutor, runGitAsRepositoryOwner } from "./repository-control.mjs";
 import { chmodTree, chownTree, identityForUser, isRoot, pathInside as containedPath } from "./filesystem-isolation.mjs";
 
 const HANDLE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -69,23 +69,9 @@ function lockReadOnlyTree(path) {
 }
 
 function lockObjectStore(path) {
-  lockReadOnlyTree(path);
-  const infoDir = resolve(path, "info");
-  if (!isRoot() || !existsSync(infoDir) || !lstatSync(infoDir).isDirectory()) return;
-  for (const entry of readdirSync(infoDir)) {
-    if (entry.startsWith("alternates")) chmodSync(resolve(infoDir, entry), 0o400);
-  }
-}
-
-function grantGitWorktreeAdminForExecutor(repoDir) {
-  if (!isRoot()) return;
-  const gitDir = resolve(repoDir, ".git");
-  const worktreesDir = resolve(repoDir, ".git/worktrees");
-  if (existsSync(worktreesDir)) {
-    grantTreeToAgent(worktreesDir);
-  } else if (existsSync(gitDir)) {
-    grantTreeToAgent(gitDir);
-  }
+  if (!isRoot() || !existsSync(path)) return;
+  chownTree(path, ROOT_UID, ROOT_GID);
+  chmodTree(path, { fileMode: 0o600, directoryMode: 0o700 });
 }
 
 function prepareWorktreeRoot(rootDir) {
@@ -137,7 +123,7 @@ export function grantWorktreeToAgent({ rootDir = DEFAULT_ROOT, handle, grantLink
 }
 
 function requireClean(repoDir) {
-  const status = runGitAsRepositoryOwner(repoDir, ["status", "--porcelain=v1", "--untracked-files=all"]);
+  const status = runGitAsExecutor(repoDir, ["status", "--porcelain=v1", "--untracked-files=all"]);
   if (status) throw new Error("integration checkout must be clean before creating a unit worktree");
 }
 
@@ -156,12 +142,12 @@ export function createWorktree({
   const target = worktreePath({ rootDir, handle });
   if (existsSync(target)) throw new Error("worktree handle already exists");
   requireClean(repoDir);
-  const head = runGitAsRepositoryOwner(repoDir, ["rev-parse", "HEAD"]);
+  const head = runGitAsExecutor(repoDir, ["rev-parse", "HEAD"]);
   if (head !== safeBase) throw new Error("integration checkout HEAD does not match requested worktree base");
   prepareWorktreeRoot(rootDir);
-  grantGitWorktreeAdminForExecutor(repoDir);
-  runGitAsRepositoryOwner(repoDir, ["worktree", "add", "--detach", target, safeBase]);
+  runGitAsExecutor(repoDir, ["worktree", "add", "--detach", target, safeBase]);
   try {
+    grantWorktreeToAgent({ rootDir, handle, grantLinkedGitDir: true });
     runGitAsRepositoryOwner(target, ["config", "extensions.worktreeConfig", "true"]);
     runGitAsRepositoryOwner(target, ["config", "--worktree", "core.hooksPath", hooksPath]);
     runGitAsRepositoryOwner(target, ["config", "--worktree", "remote.origin.pushurl", DISABLED_PUSH_URL]);
@@ -213,7 +199,7 @@ export function removeWorktree({ repoDir, rootDir = DEFAULT_ROOT, handle }) {
   const target = worktreePath({ rootDir, handle });
   if (!existsSync(target)) return { id: safeHandle(handle), removed: false };
   grantWorktreeToAgent({ rootDir, handle, grantLinkedGitDir: true });
-  runGitAsRepositoryOwner(repoDir, ["worktree", "remove", "--force", target]);
+  runGitAsExecutor(repoDir, ["worktree", "remove", "--force", target]);
   rmSync(target, { recursive: true, force: true });
   return { id: safeHandle(handle), removed: true };
 }

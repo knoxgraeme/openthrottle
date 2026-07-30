@@ -11,7 +11,7 @@ import {
   accessSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { canonicalJson } from "./capabilities.mjs";
@@ -85,6 +85,10 @@ export function runGitAsRepositoryOwner(repoDir, args, env = {}, { timeoutMs = L
   return gitOutput(result, args, timeoutMs);
 }
 
+export function runGitAsExecutor(repoDir, args, env = {}, { timeoutMs = LOCAL_GIT_TIMEOUT_MS } = {}) {
+  return runGit(repoDir, args, env, { timeoutMs });
+}
+
 function optionalRepositoryOwnerGit(repoDir, args) {
   try {
     return runGitAsRepositoryOwner(repoDir, args);
@@ -118,25 +122,42 @@ function canWriteDirectory(path) {
   }
 }
 
-export function computeWorkspaceTreeOidFromTree(repoDir, baseTree) {
+function gitAlternateObjectDirectories(extraGitEnv) {
+  if (!extraGitEnv || typeof extraGitEnv !== "object") return [];
+  const directories = [];
+  if (typeof extraGitEnv.GIT_OBJECT_DIRECTORY === "string" && extraGitEnv.GIT_OBJECT_DIRECTORY) {
+    directories.push(extraGitEnv.GIT_OBJECT_DIRECTORY);
+  }
+  if (typeof extraGitEnv.GIT_ALTERNATE_OBJECT_DIRECTORIES === "string" && extraGitEnv.GIT_ALTERNATE_OBJECT_DIRECTORIES) {
+    directories.push(...extraGitEnv.GIT_ALTERNATE_OBJECT_DIRECTORIES.split(delimiter).filter(Boolean));
+  }
+  return directories;
+}
+
+export function computeWorkspaceTreeOidFromTree(repoDir, baseTree, extraGitEnv = {}) {
   const temporary = mkdtempSync(join(tmpdir(), "ot-stage-index-"));
   const indexPath = join(temporary, "index");
   const objectPath = join(temporary, "objects");
   try {
     prepareRepositoryOwnerDirectory(temporary);
-    const commonDir = optionalRepositoryOwnerGit(repoDir, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    const extraAlternates = gitAlternateObjectDirectories(extraGitEnv);
+    const commonDir = extraAlternates.length === 0
+      ? optionalRepositoryOwnerGit(repoDir, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
+      : null;
     const commonObjects = commonDir ? join(commonDir, "objects") : null;
-    const isolateObjects = commonObjects &&
-      ((typeof process.getuid === "function" && process.getuid() === 0) || !canWriteDirectory(commonObjects));
+    const isolateObjects = extraAlternates.length > 0 || (commonObjects &&
+      ((typeof process.getuid === "function" && process.getuid() === 0) || !canWriteDirectory(commonObjects))
+    );
     if (isolateObjects) {
       mkdirSync(objectPath, { recursive: true, mode: 0o700 });
       prepareRepositoryOwnerDirectory(objectPath);
     }
+    const alternates = extraAlternates.length > 0 ? extraAlternates : (commonObjects ? [commonObjects] : []);
     const env = {
       GIT_INDEX_FILE: indexPath,
       ...(isolateObjects ? {
         GIT_OBJECT_DIRECTORY: objectPath,
-        GIT_ALTERNATE_OBJECT_DIRECTORIES: commonObjects,
+        GIT_ALTERNATE_OBJECT_DIRECTORIES: alternates.join(delimiter),
       } : {}),
     };
     runGitAsRepositoryOwner(repoDir, ["read-tree", baseTree], env);
@@ -150,8 +171,8 @@ export function computeWorkspaceTreeOidFromTree(repoDir, baseTree) {
 // Canonical workspace subject: tracked files plus non-ignored untracked files,
 // with Git's native blob/tree hashing and executable/symlink modes. A private
 // temporary index means the agent-controlled index is never consulted.
-export function computeWorkspaceTreeOid(repoDir) {
-  return computeWorkspaceTreeOidFromTree(repoDir, "HEAD");
+export function computeWorkspaceTreeOid(repoDir, extraGitEnv = {}) {
+  return computeWorkspaceTreeOidFromTree(repoDir, "HEAD", extraGitEnv);
 }
 
 function fileModeAt(path) {

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(mktemp -d)"
+chmod 0711 "$ROOT"
 cleanup() {
   chmod -R u+rwX "$ROOT" >/dev/null 2>&1 || true
   rm -rf "$ROOT"
@@ -25,9 +26,20 @@ gosu agent git -C "$INTEGRATION" config user.email probe@openthrottle.dev
 gosu agent git -C "$INTEGRATION" config user.name "OpenThrottle Probe"
 gosu agent git -C "$INTEGRATION" config gc.auto 0
 gosu agent sh -c "printf 'integration-owned\n' > '$INTEGRATION/file.txt'"
+gosu agent mkdir -p "$INTEGRATION/.agents/skills/current"
+gosu agent sh -c "cat > '$INTEGRATION/.agents/skills/current/SKILL.md' <<'SKILL'
+---
+name: repo_action
+description: Probe repository skill
+---
+
+Probe repository skill from the pinned package.
+SKILL"
 gosu agent git -C "$INTEGRATION" add file.txt
+gosu agent git -C "$INTEGRATION" add .agents/skills/current/SKILL.md
 gosu agent git -C "$INTEGRATION" commit -q -m "seed integration"
 BASE="$(gosu agent git -C "$INTEGRATION" rev-parse HEAD)"
+SIBLING_ONLY_BLOB="$(gosu agent sh -c "printf 'sibling object secret\n' | git -C '$INTEGRATION' hash-object -w --stdin")"
 
 /opt/openthrottle/runner/worktrees.mjs create --repo "$INTEGRATION" --root "$WORKTREES" --handle current --base "$BASE" >/dev/null
 /opt/openthrottle/runner/worktrees.mjs create --repo "$INTEGRATION" --root "$WORKTREES" --handle sibling --base "$BASE" >/dev/null
@@ -63,6 +75,8 @@ must_fail() {
 }
 
 test "$(id -un)" = "agent"
+test -r "$CODEX_HOME/skills/repo_action/SKILL.md"
+grep -q "pinned package" "$CODEX_HOME/skills/repo_action/SKILL.md"
 git status --porcelain=v1 --untracked-files=all >/tmp/ot-probe-git-status
 node /opt/openthrottle/runner/execute-stage.mjs --print-subject --repo "$PWD" >/tmp/ot-probe-subject
 printf 'worker write\n' > "$PWD/worker-write.txt"
@@ -72,6 +86,8 @@ must_fail cat "$PWD/integration-link"
 must_fail cat "$PROBE_SEALED_INPUT"
 must_fail cat "$PROBE_SIBLING_WORKTREE/file.txt"
 must_fail sh -c "printf bad > '$PROBE_SIBLING_WORKTREE/bad.txt'"
+must_fail git cat-file -p "$PROBE_SIBLING_ONLY_BLOB"
+must_fail cat "$PROBE_INTEGRATION/.git/objects/${PROBE_SIBLING_ONLY_BLOB:0:2}/${PROBE_SIBLING_ONLY_BLOB:2}"
 must_fail cat "$PROBE_SIBLING_ACTION_SECRET"
 must_fail cat "$PROBE_PRIOR_ACTION_SECRET"
 must_fail cat "$PROBE_INTEGRATION/.git/objects/info/alternates.probe"
@@ -81,13 +97,32 @@ printf '{"probe":"ok"}\n'
 STUB
 chmod 0755 "$BIN/codex"
 
-PATH="$BIN:$PATH" node --input-type=module - "$REQUEST" <<'NODE'
-import { mkdirSync, writeFileSync } from "node:fs";
+PATH="$BIN:$PATH" node --input-type=module - "$REQUEST" "$INTEGRATION" <<'NODE'
+import { execFileSync } from "node:child_process";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { canonicalJson } from "/opt/openthrottle/runner/capabilities.mjs";
+import { digest } from "/opt/openthrottle/runner/artifacts.mjs";
 import { createLoopRequestHash } from "/opt/openthrottle/runner/execute-loop.mjs";
 
 const requestPath = process.argv[2];
+const repoDir = process.argv[3];
+const skillPath = ".agents/skills/current/SKILL.md";
+const head = execFileSync("git", ["-C", repoDir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+const blobSha = execFileSync("git", ["-C", repoDir, "rev-parse", `${head}:${skillPath}`], { encoding: "utf8" }).trim();
+const unsignedPackage = {
+  schema: "openthrottle.repository-skill-package/v1",
+  reference: `repo://owner/repo@${head}#.agents/skills/current`,
+  invocation: "repo_action",
+  directory: ".agents/skills/current",
+  commit: head,
+  files: [{
+    path: skillPath,
+    blobSha,
+    digest: digest(readFileSync(`${repoDir}/${skillPath}`)),
+  }],
+};
+const repositorySkill = { ...unsignedPackage, packageDigest: digest(canonicalJson(unsignedPackage)) };
 const base = {
   protocol: "loop-action@1",
   actionId: "action-current",
@@ -97,7 +132,7 @@ const base = {
   role: "worker",
   loop: "implement",
   agent: "codex",
-  skill: "ce-work",
+  skill: repositorySkill.invocation,
   worktree: { id: "current" },
   nativeSessionId: null,
   contextPolicy: "fresh",
@@ -106,6 +141,7 @@ const base = {
   allowedMcpServers: [],
   credentialScopes: [],
   receiptSchema: "probe/no-receipt@1",
+  repositorySkill,
 };
 mkdirSync(dirname(requestPath), { recursive: true, mode: 0o700 });
 writeFileSync(requestPath, canonicalJson({ ...base, ...createLoopRequestHash(base) }), { mode: 0o400 });
@@ -114,10 +150,12 @@ chown root:root "$REQUEST"
 chmod 0400 "$REQUEST"
 
 PATH="$BIN:$PATH" \
+OT_LOOP_ACTION_ROOT="$ACTION_ROOT" \
 OT_WORKTREE_ROOT="$WORKTREES" \
 PROBE_INTEGRATION="$INTEGRATION" \
 PROBE_SEALED_INPUT="$SEALED" \
 PROBE_SIBLING_WORKTREE="$WORKTREES/sibling" \
+PROBE_SIBLING_ONLY_BLOB="$SIBLING_ONLY_BLOB" \
 PROBE_SIBLING_ACTION_SECRET="$ACTION_ROOT/attempt-current/action-sibling/secret.txt" \
 PROBE_PRIOR_ACTION_SECRET="$ACTION_ROOT/attempt-prior/action-current/secret.txt" \
 /opt/openthrottle/runner/execute-loop.mjs --request "$REQUEST" --output "$RESULT"
@@ -138,5 +176,7 @@ gosu agent test ! -w "$WORKTREES/current"
 gosu agent test ! -r "$ACTION_ROOT/attempt-current/action-current/request.json"
 gosu agent test ! -r "$ACTION_ROOT/attempt-current/action-sibling/secret.txt"
 gosu agent test ! -r "$ACTION_ROOT/attempt-prior/action-current/secret.txt"
+
+/opt/openthrottle/runner/worktrees.mjs create --repo "$INTEGRATION" --root "$WORKTREES" --handle after-loop --base "$BASE" >/dev/null
 
 echo "sandbox linked-worktree ownership isolation probe passed"

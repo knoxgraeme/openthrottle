@@ -15,6 +15,7 @@ import {
   STAGE_EXECUTOR_PROTOCOL,
   type StageRequestEnvelope,
 } from "../pipeline/stage-request.js";
+import type { RepositorySkillPackage } from "../pipeline/manifest.js";
 
 export interface RuntimeCapabilityDescriptor extends RuntimeCapabilityInventory {
   schema: "openthrottle.runtime-capabilities/v1";
@@ -68,6 +69,7 @@ export interface LoopActionRequest {
   allowedMcpServers: readonly string[];
   credentialScopes: readonly string[];
   receiptSchema: string;
+  repositorySkill?: RepositorySkillPackage;
   requestHash: string;
   idempotencyKey: string;
 }

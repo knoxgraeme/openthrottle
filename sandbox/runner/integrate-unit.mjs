@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
-import { runGitAsRepositoryOwner } from "./repository-control.mjs";
+import { runGitAsExecutor } from "./repository-control.mjs";
 
 const COMMIT = /^[a-f0-9]{40}$/;
 
@@ -15,11 +15,11 @@ function commit(value, label) {
 }
 
 function clean(repoDir) {
-  return runGitAsRepositoryOwner(repoDir, ["status", "--porcelain=v1", "--untracked-files=all"]) === "";
+  return runGitAsExecutor(repoDir, ["status", "--porcelain=v1", "--untracked-files=all"]) === "";
 }
 
 function treeOf(repoDir, subject) {
-  return runGitAsRepositoryOwner(repoDir, ["rev-parse", `${subject}^{tree}`]);
+  return runGitAsExecutor(repoDir, ["rev-parse", `${subject}^{tree}`]);
 }
 
 export function integrateCandidate({
@@ -30,21 +30,21 @@ export function integrateCandidate({
   const expected = commit(expectedHead, "expectedHead");
   const candidate = commit(candidateCommit, "candidateCommit");
   if (!clean(repoDir)) throw new Error("integration checkout must be clean");
-  const head = runGitAsRepositoryOwner(repoDir, ["rev-parse", "HEAD"]);
+  const head = runGitAsExecutor(repoDir, ["rev-parse", "HEAD"]);
   if (head !== expected) throw new Error("integration checkout HEAD does not match expected head");
   const currentTree = treeOf(repoDir, head);
   const candidateTree = treeOf(repoDir, candidate);
   if (currentTree === candidateTree) {
     return receipt({ repoDir, expected, candidate, integrated: false, reason: "already_applied_exact_tree" });
   }
-  const mergeBase = runGitAsRepositoryOwner(repoDir, ["merge-base", head, candidate]);
+  const mergeBase = runGitAsExecutor(repoDir, ["merge-base", head, candidate]);
   if (mergeBase !== head) throw new Error("candidate is not a fast-forward of the integration head");
-  runGitAsRepositoryOwner(repoDir, ["merge", "--ff-only", candidate]);
+  runGitAsExecutor(repoDir, ["merge", "--ff-only", candidate]);
   return receipt({ repoDir, expected, candidate, integrated: true, reason: "fast_forwarded" });
 }
 
 function receipt({ repoDir, expected, candidate, integrated, reason }) {
-  const head = runGitAsRepositoryOwner(repoDir, ["rev-parse", "HEAD"]);
+  const head = runGitAsExecutor(repoDir, ["rev-parse", "HEAD"]);
   const tree = treeOf(repoDir, head);
   const payload = {
     schema: "openthrottle.integration-evidence/v1",

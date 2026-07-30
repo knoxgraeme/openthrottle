@@ -2,14 +2,20 @@
 
 import { randomUUID } from "node:crypto";
 import { chmodSync, chownSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest, sanitizeArtifactText, validateStandardReceipt } from "./artifacts.mjs";
 import { computeWorkspaceTreeOid } from "./repository-control.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
 import { grantWorktreeToAgent, lockWorktree, worktreePath } from "./worktrees.mjs";
-import { chmodTree, chownTree, isRoot, pathInside as containedPath } from "./filesystem-isolation.mjs";
+import { chmodTree, chownTree, identityForUser, isRoot, pathInside as containedPath } from "./filesystem-isolation.mjs";
+import {
+  materializeRepositorySkillPackage,
+  repositorySkillDiscoveryRoot,
+  skillBody,
+  validateRepositorySkillPackage,
+} from "./repository-skills.mjs";
 
 export const LOOP_ACTION_PROTOCOL = "loop-action@1";
 
@@ -38,6 +44,7 @@ const DEFAULT_WORKTREE_ROOT = "/var/lib/openthrottle/worktrees";
 const INTEGRATION_REPO_DIR = "/home/agent/repo";
 const ROOT_UID = 0;
 const ROOT_GID = 0;
+const ABSOLUTE_PATH = /^\/[^\u0000]{0,500}$/;
 
 function record(value, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
@@ -70,7 +77,13 @@ function pathInside(root, child) {
   return containedPath(root, child, "loop action path escapes the executor root");
 }
 
-function actionDirectory(request, rootDir = DEFAULT_ACTION_ROOT) {
+function configuredActionRoot(env = process.env) {
+  const root = env.OT_LOOP_ACTION_ROOT ?? DEFAULT_ACTION_ROOT;
+  if (typeof root !== "string" || !ABSOLUTE_PATH.test(root)) throw new Error("loop action root is invalid");
+  return resolve(root);
+}
+
+function actionDirectory(request, rootDir = configuredActionRoot()) {
   return pathInside(pathInside(rootDir, request.attemptId), request.actionId);
 }
 
@@ -94,11 +107,11 @@ function ensureTraverseOnly(path) {
   chmodSync(path, 0o711);
 }
 
-function lockNonCurrentActionDirectories(request) {
-  if (!existsSync(DEFAULT_ACTION_ROOT)) return;
-  const currentActionDirectory = actionDirectory(request);
-  for (const attempt of readdirSync(DEFAULT_ACTION_ROOT)) {
-    const attemptDirectory = resolve(DEFAULT_ACTION_ROOT, attempt);
+function lockNonCurrentActionDirectories(request, rootDir = configuredActionRoot()) {
+  if (!existsSync(rootDir)) return;
+  const currentActionDirectory = actionDirectory(request, rootDir);
+  for (const attempt of readdirSync(rootDir)) {
+    const attemptDirectory = resolve(rootDir, attempt);
     if (!lstatSync(attemptDirectory).isDirectory()) continue;
     for (const action of readdirSync(attemptDirectory)) {
       const actionDirectoryPath = resolve(attemptDirectory, action);
@@ -136,7 +149,7 @@ export function validateLoopRequest(value) {
     "protocol", "actionId", "attemptId", "graphId", "unitId", "role", "loop",
     "agent", "skill", "worktree", "nativeSessionId", "contextPolicy", "timeoutMs",
     "transitionContext", "allowedMcpServers", "credentialScopes", "receiptSchema",
-    "requestHash", "idempotencyKey",
+    "repositorySkill", "requestHash", "idempotencyKey",
   ]);
   const unknown = Object.keys(input).find((key) => !allowed.has(key));
   if (unknown) throw new Error(`loop request has unknown field ${unknown}`);
@@ -155,7 +168,7 @@ export function validateLoopRequest(value) {
     role: string(input.role, "role"),
     loop: string(input.loop, "loop"),
     agent: string(input.agent, "agent"),
-    skill: string(input.skill, "skill", /^[a-z][a-z0-9-]{0,79}$/),
+    skill: string(input.skill, "skill", /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
     worktree: worktree === null ? null : {
       id: string(worktree.id, "worktree.id", /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
     },
@@ -170,7 +183,14 @@ export function validateLoopRequest(value) {
   if (!ROLES.has(request.role)) throw new Error("role is invalid");
   if (!LOOPS.has(request.loop)) throw new Error("loop is invalid");
   if (!AGENTS.has(request.agent)) throw new Error("agent is invalid");
-  if (!SKILLS.has(request.skill)) throw new Error("skill is not installed for loop dispatch");
+  const repositorySkill = input.repositorySkill === undefined
+    ? undefined
+    : validateRepositorySkillPackage(input.repositorySkill);
+  if (repositorySkill) {
+    if (request.skill !== repositorySkill.invocation) throw new Error("loop repository skill invocation mismatch");
+  } else if (!SKILLS.has(request.skill)) {
+    throw new Error("skill is not installed for loop dispatch");
+  }
   if (!CONTEXTS.has(request.contextPolicy)) throw new Error("contextPolicy is invalid");
   if (request.contextPolicy === "resume_required" && !request.nativeSessionId) {
     throw new Error("resume-required loop request is missing its native session");
@@ -181,11 +201,12 @@ export function validateLoopRequest(value) {
   if (request.role === "worker" && !request.worktree) throw new Error("worker loop requires a worktree");
   if (request.role !== "worker" && request.worktree) throw new Error("non-worker loop cannot receive a writable worktree");
   if (worktree !== null && worktree.path !== undefined) throw new Error("loop request cannot carry an absolute worktree path");
-  const expected = createLoopRequestHash(request);
+  const requestWithSkill = { ...request, ...(repositorySkill === undefined ? {} : { repositorySkill }) };
+  const expected = createLoopRequestHash(requestWithSkill);
   if (input.requestHash !== expected.requestHash || input.idempotencyKey !== expected.idempotencyKey) {
     throw new Error("loop request hash or idempotency key is stale");
   }
-  return { ...request, ...expected };
+  return { ...requestWithSkill, ...expected };
 }
 
 export function loopWorktreeDirectory(request) {
@@ -201,22 +222,111 @@ export function resolveLoopInvocation(request) {
     : { mode: "fresh", nativeSessionId: null };
 }
 
-export function loopPrompt(request) {
+export function loopPrompt(request, { repositorySkillRoot = null } = {}) {
   const prefix = request.agent === "claude" ? "/" : "$";
-  return `${prefix}${request.skill}\n\n` +
+  let entry = `${prefix}${request.skill}`;
+  if (request.repositorySkill && request.agent === "opencode") {
+    const root = repositorySkillRoot ?? join(repositorySkillDiscoveryRoot(request.agent), request.repositorySkill.invocation);
+    entry += `\n\n${skillBody(readFileSync(join(root, "SKILL.md"), "utf8"))}`;
+  }
+  return `${entry}\n\n` +
     `This is one fenced OpenThrottle loop action (${request.actionId}) for ${request.role}/${request.loop}. ` +
     `Edit only the provided worktree when one is present. Do not commit, push, or alter executor state. ` +
     `Return one receipt matching ${request.receiptSchema}.\n\n${request.transitionContext}`;
 }
 
-function createReadOnlyRepositoryView(request, sourceRepoDir = "/home/agent/repo") {
-  const attemptDirectory = pathInside(DEFAULT_ACTION_ROOT, request.attemptId);
+function prepareAgentOwnedDirectory(path) {
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  const identity = identityForUser("agent");
+  if (identity) chownTree(path, identity.uid, identity.gid);
+  chmodTree(path, { fileMode: 0o600, directoryMode: 0o700 });
+}
+
+function loopSkillDiscoveryRoot(request, actionRoot = configuredActionRoot()) {
+  const currentActionDirectory = actionDirectory(request, actionRoot);
+  if (request.agent === "codex") return pathInside(pathInside(currentActionDirectory, "codex"), "skills");
+  if (request.agent === "claude") return pathInside(pathInside(pathInside(currentActionDirectory, "home"), ".claude"), "skills");
+  return pathInside(currentActionDirectory, "opencode-skills");
+}
+
+function prepareLoopAgentEnvironment(request, repoDir) {
+  const gitObjectEnv = prepareLoopGitObjectEnvironment(request, repoDir);
+  if (!request.repositorySkill) {
+    return {
+      env: ["HOME=/home/agent", "USER=agent", "GIT_OPTIONAL_LOCKS=0", ...gitObjectEnv.env],
+      repositorySkillRoot: null,
+      gitObjectEnv: gitObjectEnv.values,
+    };
+  }
   const currentActionDirectory = actionDirectory(request);
+  const home = pathInside(currentActionDirectory, "home");
+  prepareAgentOwnedDirectory(home);
+  const env = ["USER=agent", "GIT_OPTIONAL_LOCKS=0", ...gitObjectEnv.env, `HOME=${home}`];
+  if (request.agent === "codex") {
+    const codexHome = pathInside(currentActionDirectory, "codex");
+    prepareAgentOwnedDirectory(codexHome);
+    env.push(`CODEX_HOME=${codexHome}`);
+  }
+  const discoveryRoot = loopSkillDiscoveryRoot(request);
+  const repositorySkillRoot = materializeRepositorySkillPackage({
+    packageInfo: request.repositorySkill,
+    repoDir,
+    agent: request.agent,
+    discoveryRoot,
+  });
+  return { env, repositorySkillRoot, gitObjectEnv: gitObjectEnv.values };
+}
+
+function packReachableBaseObjects(repoDir, destinationPackBase) {
+  const reachable = runRootGit(repoDir, ["rev-list", "--objects", "HEAD"])
+    .split("\n")
+    .map((line) => line.trim().split(/\s+/, 1)[0])
+    .filter(Boolean)
+    .join("\n");
+  const result = runCapturedProcess("git", ["-c", `safe.directory=${repoDir}`, "pack-objects", destinationPackBase], {
+    cwd: repoDir,
+    input: reachable ? `${reachable}\n` : "",
+    timeout: 120_000,
+    captureBytes: 1024 * 1024,
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error(`git pack-objects failed: ${sanitizeArtifactText(result.stderr || result.error?.message || "").slice(-800)}`);
+  }
+}
+
+function prepareLoopGitObjectEnvironment(request, repoDir) {
+  if (!request.worktree) return { env: [], values: null };
+  const objectRoot = pathInside(actionDirectory(request), "git-objects");
+  const baseObjectDir = pathInside(objectRoot, "base");
+  const basePackDir = pathInside(baseObjectDir, "pack");
+  const writeObjectDir = pathInside(objectRoot, "write");
+  rmSync(objectRoot, { recursive: true, force: true });
+  mkdirSync(basePackDir, { recursive: true, mode: 0o755 });
+  packReachableBaseObjects(repoDir, join(basePackDir, "base"));
+  chmodTree(baseObjectDir, { fileMode: 0o444, directoryMode: 0o555 });
+  prepareAgentOwnedDirectory(writeObjectDir);
+  const values = {
+    GIT_OBJECT_DIRECTORY: writeObjectDir,
+    GIT_ALTERNATE_OBJECT_DIRECTORIES: baseObjectDir,
+  };
+  return {
+    values,
+    env: [
+      `GIT_OBJECT_DIRECTORY=${values.GIT_OBJECT_DIRECTORY}`,
+      `GIT_ALTERNATE_OBJECT_DIRECTORIES=${values.GIT_ALTERNATE_OBJECT_DIRECTORIES}`,
+    ],
+  };
+}
+
+function createReadOnlyRepositoryView(request, sourceRepoDir = "/home/agent/repo") {
+  const actionRoot = configuredActionRoot();
+  const attemptDirectory = pathInside(actionRoot, request.attemptId);
+  const currentActionDirectory = actionDirectory(request, actionRoot);
   const destination = pathInside(currentActionDirectory, "repo-view");
   rmSync(destination, { recursive: true, force: true });
-  ensureTraverseOnly(DEFAULT_ACTION_ROOT);
+  ensureTraverseOnly(actionRoot);
   ensureTraverseOnly(attemptDirectory);
-  lockNonCurrentActionDirectories(request);
+  lockNonCurrentActionDirectories(request, actionRoot);
   ensureTraverseOnly(currentActionDirectory);
   const head = runRootGit(sourceRepoDir, ["rev-parse", "HEAD"]);
   runRootGit(sourceRepoDir, ["clone", "--quiet", "--no-hardlinks", sourceRepoDir, destination]);
@@ -244,12 +354,7 @@ function lockReadOnlyTree(path) {
 }
 
 function lockObjectStore(path) {
-  lockReadOnlyTree(path);
-  const infoDir = resolve(path, "info");
-  if (!existsSync(infoDir) || !lstatSync(infoDir).isDirectory()) return;
-  for (const entry of readdirSync(infoDir)) {
-    if (entry.startsWith("alternates")) chmodSync(resolve(infoDir, entry), 0o400);
-  }
+  lockPrivateTree(path);
 }
 
 function lockPrivateTree(path) {
@@ -322,8 +427,15 @@ function lockCurrentWorkerWorktree(request) {
   });
 }
 
-export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDirectory(request) ?? "/home/agent/repo" }) {
-  const prompt = loopPrompt(request);
+function lockCurrentActionDirectory(request) {
+  const currentActionDirectory = actionDirectory(request);
+  if (!existsSync(currentActionDirectory)) return;
+  chownTree(currentActionDirectory, ROOT_UID, ROOT_GID);
+  chmodTree(currentActionDirectory, { fileMode: 0o600, directoryMode: 0o700 });
+}
+
+export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDirectory(request) ?? "/home/agent/repo", repositorySkillRoot = null }) {
+  const prompt = loopPrompt(request, { repositorySkillRoot });
   const command = request.agent === "codex" ? "codex" : request.agent;
   const args = request.agent === "codex"
     ? ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-C", repoDir, ...(invocation.mode === "resume" ? ["resume", invocation.nativeSessionId, prompt] : ["-"])]
@@ -346,17 +458,19 @@ export function runLoopAgentInPreparedRepository({
   lockIntegration = lockIntegrationCheckout,
 }) {
   const repoDir = prepareLoopRepository(request);
-  const built = loopAgentCommand({ request, invocation, repoDir });
+  const preparedEnvironment = prepareLoopAgentEnvironment(request, repoDir);
+  const built = loopAgentCommand({ request, invocation, repoDir, repositorySkillRoot: preparedEnvironment.repositorySkillRoot });
   const preservedLinkedGitDir = request.worktree ? linkedWorktreeGitDir(repoDir) : null;
   lockIntegration(integrationRepoDir, { preservedLinkedGitDir });
   try {
-    return runProcess("gosu", [
-      "agent", "env", "HOME=/home/agent", "USER=agent", "GIT_OPTIONAL_LOCKS=0", built.command, ...built.args,
+    const result = runProcess("gosu", [
+      "agent", "env", ...preparedEnvironment.env, built.command, ...built.args,
     ], {
       cwd: built.repoDir,
       input: built.input,
       timeout: request.timeoutMs,
     });
+    return { ...result, gitObjectEnv: preparedEnvironment.gitObjectEnv };
   } finally {
     lockIntegration(integrationRepoDir, { preservedLinkedGitDir });
   }
@@ -412,7 +526,8 @@ function assertLoopReceiptFence(receipt, request, subject) {
   if (subject !== null && receipt.subject.post !== subject) {
     throw new Error("loop receipt subject fence mismatch");
   }
-  if (receipt.producer.skill !== `builtin://${request.skill}@1`) {
+  const expectedProducerSkill = request.repositorySkill?.reference ?? `builtin://${request.skill}@1`;
+  if (receipt.producer.skill !== expectedProducerSkill) {
     throw new Error("loop receipt producer skill mismatch");
   }
 }
@@ -433,7 +548,7 @@ export function executeLoopAction({
       execution = { status: null, signal: null, timedOut: false, stdout: "", stderr: String(error), nativeSessionId: request.nativeSessionId };
     }
     const worktreeDir = loopWorktreeDirectory(request);
-    const subject = worktreeDir ? computeWorkspaceTreeOid(worktreeDir) : null;
+    const subject = worktreeDir ? computeWorkspaceTreeOid(worktreeDir, execution.gitObjectEnv ?? undefined) : null;
     let parsedReceipt = null;
     let receiptError = null;
     if (!execution.timedOut && !execution.signal && execution.status === 0 && request.receiptSchema === "openthrottle.receipt/v1") {
@@ -462,6 +577,7 @@ export function executeLoopAction({
     };
   } finally {
     lockWorkerWorktree(request);
+    lockCurrentActionDirectory(request);
   }
 }
 
@@ -486,7 +602,11 @@ function main() {
     writeFileSync(1, `${canonicalJson(request)}\n`);
     return;
   }
-  const outputPath = resolve(arg("--output", process.env.OT_LOOP_RESULT_FILE ?? loopResultPath(request)));
+  const outputPath = resolve(arg("--output", process.env.OT_LOOP_RESULT_FILE ?? loopResultPath({
+    attemptId: request.attemptId,
+    actionId: request.actionId,
+    rootDir: configuredActionRoot(),
+  })));
   writeAtomic(outputPath, executeLoopAction({ request }));
 }
 
