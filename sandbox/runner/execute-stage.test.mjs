@@ -990,7 +990,7 @@ printf '{"type":"system","subtype":"init","session_id":"smoke-claude-session","m
 
     installFakeGosu(binDir);
     const emissionMarker = join(actionRoot, "reported-but-unsealed-claude-session.emitted");
-writeExecutable(join(binDir, "claude"), `#!/usr/bin/env bash
+    writeExecutable(join(binDir, "claude"), `#!/usr/bin/env bash
 set -euo pipefail
 mkdir -p "$HOME/.claude/projects"
 printf '{"type":"system","subtype":"init","session_id":"unrelated-claude-session","model":"stub"}\\n' > "$HOME/.claude/projects/unrelated-claude-session.jsonl"
