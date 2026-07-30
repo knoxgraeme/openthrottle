@@ -118,7 +118,13 @@ async function resolvePipelineSelection(
   context: string,
   readPinnedFile: (path: string) => Promise<string>
 ): Promise<string> {
-  if (taskType !== "implement") return repositoryConfig.config.pipelines?.[taskType] ?? taskType;
+  if (taskType !== "implement") {
+    const requested = extractRequestedGraph(context);
+    if (requested.graphId || repositoryConfig.config.intents?.[taskType]) {
+      throw new Error(`graph selection is not supported for ${taskType} tickets`);
+    }
+    return repositoryConfig.config.pipelines?.[taskType] ?? taskType;
+  }
   const intent = repositoryConfig.config.intents?.implement;
   const requested = extractRequestedGraph(context);
   const graphId = requested.graphId ?? intent?.default_graph ?? repositoryConfig.config.default_graph;
