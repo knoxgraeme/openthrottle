@@ -49,22 +49,19 @@ export function parseShipArgs(args: string[]): { file?: string; graphId?: string
 }
 
 export function validateGraphSelectionForShip(file: string, graphId?: string): void {
-  if (!graphId) return;
-  if (graphId === "simple") {
-    const graph = validateLocalGraphSelection({ graphId });
-    if (graph.consumesUnits) {
-      validatePlanFileForGraph(file, { graphId });
-      return;
-    }
-    const content = readFileSync(file, "utf8");
-    if (extractExecutionPlanBlocks(content).length === 0) return;
-    const result = readExecutionPlanFromMarkdown(content, file);
-    if (result.plan.value.graph_id !== graphId) {
-      throw new Error(`${file}: execution_plan.graph_id must match selected graph ${graphId}`);
-    }
+  if (!graphId && !existsSync(".openthrottle.yml")) return;
+  const content = readFileSync(file, "utf8");
+  const blocks = extractExecutionPlanBlocks(content);
+  const plan = blocks.length > 0 ? readExecutionPlanFromMarkdown(content, file) : undefined;
+  const selectedGraphId = graphId ?? plan?.plan.value.graph_id;
+  const graph = validateLocalGraphSelection({ graphId: selectedGraphId });
+  if (graph.consumesUnits) {
+    validatePlanFileForGraph(file, { graphId: graph.graphId });
     return;
   }
-  validatePlanFileForGraph(file, { graphId });
+  if (plan && plan.plan.value.graph_id !== graph.graphId) {
+    throw new Error(`${file}: execution_plan.graph_id must match selected graph ${graph.graphId}`);
+  }
 }
 
 function buildShipSelectionBlock(graphId: string): string {
