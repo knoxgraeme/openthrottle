@@ -62,13 +62,13 @@ function relativePackagePath(root, path) {
   return relativePath;
 }
 
-function collectNativeSessionFiles(root, path = root, files = [], totals = { bytes: 0 }) {
+function collectNativeSessionFiles(root, path = root, files = [], totals = { bytes: 0 }, sessionEvidence = null) {
   const metadata = lstatSync(path);
   if (metadata.isSymbolicLink()) throw new Error("native session package cannot contain symlinks");
   if (metadata.isDirectory()) {
     for (const entry of readdirSync(path).sort()) {
       if (path === root && entry === NATIVE_SESSION_PACKAGE_MANIFEST) continue;
-      collectNativeSessionFiles(root, resolve(path, entry), files, totals);
+      collectNativeSessionFiles(root, resolve(path, entry), files, totals, sessionEvidence);
     }
     return files;
   }
@@ -78,12 +78,24 @@ function collectNativeSessionFiles(root, path = root, files = [], totals = { byt
   const bytes = readFileSync(path);
   totals.bytes += bytes.length;
   if (totals.bytes > MAX_NATIVE_SESSION_BYTES) throw new Error("native session package is too large");
+  const relativePath = relativePackagePath(root, path);
+  if (sessionEvidence &&
+    !sessionEvidence.contains &&
+    (relativePath.includes(sessionEvidence.nativeSessionId) || bytes.toString("utf8").includes(sessionEvidence.nativeSessionId))) {
+    sessionEvidence.contains = true;
+  }
   files.push({
-    path: relativePackagePath(root, path),
+    path: relativePath,
     size: bytes.length,
     digest: digest(bytes),
   });
   return files;
+}
+
+function collectNativeSessionPackage(root, nativeSessionId) {
+  const sessionEvidence = { nativeSessionId, contains: false };
+  const files = collectNativeSessionFiles(root, root, [], { bytes: 0 }, sessionEvidence);
+  return { files, containsSessionId: files.length > 0 && sessionEvidence.contains };
 }
 
 function preflightNativeSessionSource(sessionsSource) {
@@ -126,9 +138,12 @@ function validateNativeSessionPackage({ source, request }) {
     files: manifest.files,
   };
   if (manifest.packageDigest !== digest(canonicalJson(unsigned))) throw new Error("native session package digest mismatch");
-  const actualFiles = collectNativeSessionFiles(source);
+  const { files: actualFiles, containsSessionId } = collectNativeSessionPackage(source, request.nativeSessionId);
   if (canonicalJson(actualFiles) !== canonicalJson(manifest.files)) {
     throw new Error("native session package file digest mismatch");
+  }
+  if (!containsSessionId) {
+    throw new Error("native session package does not contain the reported native session id");
   }
 }
 
@@ -150,7 +165,10 @@ export function sealNativeSessionPackage({
     mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
     mkdirSync(destination, { recursive: true, mode: 0o700 });
     copyTrustedTree(sessionsSource, resolve(destination, relativeSessionRoot));
-    const files = collectNativeSessionFiles(destination);
+    const { files, containsSessionId } = collectNativeSessionPackage(destination, nativeSessionId);
+    if (!containsSessionId) {
+      throw new Error("native session package does not contain the reported native session id");
+    }
     const unsigned = {
       schema: NATIVE_SESSION_PACKAGE_SCHEMA,
       agent,

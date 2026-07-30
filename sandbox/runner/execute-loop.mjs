@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import { chmodSync, chownSync, existsSync, lchownSync, lstatSync, mkdirSync, readFileSync, realpathSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { canonicalJson } from "./capabilities.mjs";
@@ -10,7 +10,18 @@ import { computeWorkspaceTreeOid } from "./repository-control.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
 import { runWithAgentProcessFence } from "./agent-process-fence.mjs";
 import { grantWorktreeToAgent, lockWorktree, worktreePath } from "./worktrees.mjs";
-import { chmodOwnerPrivateTree, chmodTree, chownTree, identityForUser, isRoot, pathInside as containedPath, prepareAgentOwnedDirectory } from "./filesystem-isolation.mjs";
+import {
+  chmodOwnerPrivateTree,
+  chmodTree,
+  chownTree,
+  identityForUser,
+  isRoot,
+  lockPersistentAgentPrivateRoots,
+  lockedPersistentProfilesFrom,
+  pathInside as containedPath,
+  prepareAgentOwnedDirectory,
+  restorePersistentAgentPrivateRoots,
+} from "./filesystem-isolation.mjs";
 import { materializeClaudeProfileBaseline, materializeCodexProfileBaseline } from "./action-home-baseline.mjs";
 import { writeJsonAtomic } from "./atomic-write.mjs";
 import {
@@ -26,6 +37,11 @@ import {
 } from "./native-session-package.mjs";
 
 export const LOOP_ACTION_PROTOCOL = "loop-action@1";
+export {
+  lockPersistentAgentPrivateRoots,
+  lockedPersistentProfilesFrom,
+  restorePersistentAgentPrivateRoots,
+} from "./filesystem-isolation.mjs";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 const STAGE_PATH_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -79,13 +95,6 @@ const UNSAFE_ACTION_ROOTS = new Set([
   "/var/lib",
   "/var/lib/openthrottle",
 ]);
-const PERSISTENT_AGENT_PRIVATE_ROOTS = [
-  "/home/agent/.claude",
-  "/home/agent/.codex",
-  "/home/agent/.local/share/opencode",
-  "/home/agent/.ot",
-];
-
 function record(value, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
   return value;
@@ -218,6 +227,17 @@ export function gitSafeDirectoryConfigArgs(repoDir, extraSafeDirectories = []) {
     .flatMap((path) => ["-c", `safe.directory=${path}`]);
 }
 
+function gitSafeDirectoryEnv(repoDir) {
+  const directories = [...new Set([repoDir, maybeRealPath(repoDir)])].filter((path) => typeof path === "string" && path.length > 0);
+  return [
+    `GIT_CONFIG_COUNT=${directories.length}`,
+    ...directories.flatMap((directory, index) => [
+      `GIT_CONFIG_KEY_${index}=safe.directory`,
+      `GIT_CONFIG_VALUE_${index}=${directory}`,
+    ]),
+  ];
+}
+
 function runRootGit(repoDir, args, env = {}, { safeDirectories = [] } = {}) {
   const result = runCapturedProcess("git", [...gitSafeDirectoryConfigArgs(repoDir, safeDirectories), ...args], {
     cwd: repoDir,
@@ -341,96 +361,10 @@ function prepareRootReadOnlyDirectory(path) {
   chmodTree(path, { fileMode: 0o444, directoryMode: 0o555 });
 }
 
-export function lockPersistentAgentPrivateRoots(paths = PERSISTENT_AGENT_PRIVATE_ROOTS) {
-  if (!isRoot()) return [];
-  const locked = [];
-  for (const path of paths) {
-    if (!existsSync(path)) continue;
-    const snapshot = snapshotPrivateTree(path);
-    try {
-      lockPrivateTree(path);
-      locked.push(snapshot);
-    } catch (error) {
-      throw withLockedPersistentProfiles(error, [...locked, snapshot]);
-    }
-  }
-  return locked;
-}
-
-export function withLockedPersistentProfiles(error, lockedPersistentProfiles) {
-  const wrapped = error instanceof Error ? error : new Error(String(error));
-  wrapped.lockedPersistentProfiles = [...lockedPersistentProfiles];
-  wrapped.retryableInfrastructureFailure = true;
-  return wrapped;
-}
-
-export function lockedPersistentProfilesFrom(error, fallback = []) {
-  return Array.isArray(error?.lockedPersistentProfiles) ? error.lockedPersistentProfiles : fallback;
-}
-
 function retryableInfrastructureError(message) {
   const error = new Error(message);
   error.retryableInfrastructureFailure = true;
   return error;
-}
-
-function snapshotPrivateTree(path, snapshots = []) {
-  const metadata = lstatSync(path);
-  snapshots.push({
-    path,
-    uid: metadata.uid,
-    gid: metadata.gid,
-    mode: metadata.mode & 0o7777,
-    symbolicLink: metadata.isSymbolicLink(),
-    directory: metadata.isDirectory(),
-  });
-  if (!metadata.isDirectory() || metadata.isSymbolicLink()) return snapshots;
-  for (const entry of readdirSync(path)) snapshotPrivateTree(resolve(path, entry), snapshots);
-  return snapshots;
-}
-
-function restoreProfileSnapshot(snapshot) {
-  const entries = [...snapshot].sort((left, right) => right.path.length - left.path.length);
-  for (const entry of entries) {
-    if (!existsSync(entry.path)) continue;
-    if (entry.symbolicLink) {
-      lchownSync(entry.path, entry.uid, entry.gid);
-      continue;
-    }
-    chownSync(entry.path, entry.uid, entry.gid);
-    chmodSync(entry.path, entry.mode);
-  }
-}
-
-function restoreLegacyProfilePath(path) {
-  if (!isRoot()) return [];
-  if (!existsSync(path)) return [];
-  const identity = identityForUser("agent");
-  if (!identity) return [];
-  chownTree(path, identity.uid, identity.gid);
-  chmodTree(path, { fileMode: 0o600, directoryMode: 0o700 });
-  return [path];
-}
-
-export function restorePersistentAgentPrivateRoots(paths = PERSISTENT_AGENT_PRIVATE_ROOTS) {
-  if (!isRoot()) return [];
-  if (paths.length === 0) return [];
-  const restored = [];
-  const errors = [];
-  for (const entry of paths) {
-    try {
-      if (Array.isArray(entry)) {
-        restoreProfileSnapshot(entry);
-        if (entry[0]?.path) restored.push(entry[0].path);
-      } else {
-        restored.push(...restoreLegacyProfilePath(entry));
-      }
-    } catch (error) {
-      errors.push(error instanceof Error ? error.message : String(error));
-    }
-  }
-  if (errors.length > 0) throw new Error(`persistent profile restoration failed: ${errors.join("; ")}`);
-  return restored;
 }
 
 function prepareActionHomeEnvironment(request) {
@@ -487,7 +421,8 @@ function prepareLoopAgentEnvironment(request, repoDir) {
   const gitObjectEnv = prepareLoopGitObjectEnvironment(request, repoDir);
   const transportEnv = prepareLoopTransportEnvironment(request);
   const homeEnv = prepareActionHomeEnvironment(request);
-  const env = ["USER=agent", "GIT_OPTIONAL_LOCKS=0", ...gitObjectEnv.env, ...transportEnv, ...homeEnv.env];
+  const repositoryViewGitEnv = request.worktree ? [] : gitSafeDirectoryEnv(repoDir);
+  const env = ["USER=agent", "GIT_OPTIONAL_LOCKS=0", ...repositoryViewGitEnv, ...gitObjectEnv.env, ...transportEnv, ...homeEnv.env];
   if (!request.repositorySkill) {
     return {
       env,

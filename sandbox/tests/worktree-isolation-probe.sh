@@ -28,6 +28,7 @@ export OT_NATIVE_SESSION_SOURCE_ROOT="$NATIVE_SESSION_ROOT"
 PERSISTENT_CLAUDE_SECRET="/home/agent/.claude/ot-persistent-probe-secret.txt"
 PERSISTENT_CODEX_SECRET="/home/agent/.codex/ot-persistent-probe-secret.txt"
 PERSISTENT_OT_SECRET="/home/agent/.ot/ot-persistent-probe-secret.txt"
+PROFILE_REPLACEMENT_TARGET="$ACTION_ROOT/attempt-current/profile-replacement-target"
 
 install -d -o agent -g agent -m 0700 "$INTEGRATION"
 install -d -o root -g root -m 0711 "$WORKTREES"
@@ -83,10 +84,11 @@ function sealFixture(nativeSessionId, fileName, contents) {
   sealNativeSessionPackage({ agent: "codex", nativeSessionId, profileRoot });
 }
 
-sealFixture("native-current", "current.jsonl", "current native session\n");
-sealFixture("native-sibling", "sibling.jsonl", "sibling native session\n");
+sealFixture("native-current", "current.jsonl", "current native session native-current\n");
+sealFixture("native-sibling", "sibling.jsonl", "sibling native session native-sibling\n");
 NODE
 install -d -o agent -g agent -m 0700 /home/agent/.claude /home/agent/.codex /home/agent/.ot
+install -d -o agent -g agent -m 0700 "$PROFILE_REPLACEMENT_TARGET"
 printf 'persistent claude secret\n' > "$PERSISTENT_CLAUDE_SECRET"
 printf 'persistent codex secret\n' > "$PERSISTENT_CODEX_SECRET"
 printf 'persistent ot secret\n' > "$PERSISTENT_OT_SECRET"
@@ -148,7 +150,7 @@ test "$CODEX_HOME" = "$PROBE_CURRENT_ACTION_DIR/codex"
 test -r "$CODEX_HOME/skills/repo_action/SKILL.md"
 grep -q "pinned package" "$CODEX_HOME/skills/repo_action/SKILL.md"
 test -r "$CODEX_HOME/sessions/current.jsonl"
-grep -q "current native session" "$CODEX_HOME/sessions/current.jsonl"
+grep -q "current native session native-current" "$CODEX_HOME/sessions/current.jsonl"
 test ! -e "$CODEX_HOME/sessions/sibling.jsonl"
 git status --porcelain=v1 --untracked-files=all >/tmp/ot-probe-git-status
 node /opt/openthrottle/runner/execute-stage.mjs --print-subject --repo "$PWD" >/tmp/ot-probe-subject
@@ -181,6 +183,10 @@ must_fail cat "$PROBE_PERSISTENT_OT_SECRET"
 must_fail sh -c "printf bad >> '$PROBE_PERSISTENT_CLAUDE_SECRET'"
 must_fail sh -c "printf bad >> '$PROBE_PERSISTENT_CODEX_SECRET'"
 must_fail sh -c "printf bad >> '$PROBE_PERSISTENT_OT_SECRET'"
+must_fail mv "$PROBE_PERSISTENT_CLAUDE_ROOT" "$PROBE_PROFILE_REPLACEMENT_TARGET/claude"
+must_fail mv "$PROBE_PERSISTENT_CODEX_ROOT" "$PROBE_PROFILE_REPLACEMENT_TARGET/codex"
+must_fail mv "$PROBE_PERSISTENT_OT_ROOT" "$PROBE_PROFILE_REPLACEMENT_TARGET/ot"
+must_fail sh -c "rm -rf '$PROBE_PERSISTENT_CODEX_ROOT' && ln -s '$PROBE_PROFILE_REPLACEMENT_TARGET/codex-link' '$PROBE_PERSISTENT_CODEX_ROOT'"
 must_fail cat "$PROBE_INTEGRATION/.git/objects/info/alternates.probe"
 must_fail sh -c "printf bad >> '$PROBE_INTEGRATION/.git/objects/info/alternates.probe'"
 test ! -w /opt/openthrottle/safety/pre-push
@@ -360,6 +366,10 @@ PROBE_PRIOR_HOME_SECRET="$ACTION_ROOT/attempt-prior/action-home/home/native-sess
 PROBE_PERSISTENT_CLAUDE_SECRET="$PERSISTENT_CLAUDE_SECRET" \
 PROBE_PERSISTENT_CODEX_SECRET="$PERSISTENT_CODEX_SECRET" \
 PROBE_PERSISTENT_OT_SECRET="$PERSISTENT_OT_SECRET" \
+PROBE_PERSISTENT_CLAUDE_ROOT="/home/agent/.claude" \
+PROBE_PERSISTENT_CODEX_ROOT="/home/agent/.codex" \
+PROBE_PERSISTENT_OT_ROOT="/home/agent/.ot" \
+PROBE_PROFILE_REPLACEMENT_TARGET="$PROFILE_REPLACEMENT_TARGET" \
 PROBE_CURRENT_ACTION_DIR="$ACTION_ROOT/attempt-current/action-current" \
 PROBE_BACKGROUND_PID="$BACKGROUND_PID" \
 /opt/openthrottle/runner/execute-loop.mjs --request "$REQUEST" --output "$RESULT"
@@ -458,6 +468,9 @@ gosu agent test ! -r "$ACTION_ROOT/attempt-current/action-builtin/request.json"
 gosu agent test ! -r "$ACTION_ROOT/attempt-current/action-sibling/secret.txt"
 gosu agent test ! -r "$ACTION_ROOT/attempt-prior/action-current/secret.txt"
 gosu agent test ! -r "$ACTION_ROOT/attempt-prior/action-home/home/native-session.json"
+test ! -L /home/agent/.claude
+test ! -L /home/agent/.codex
+test ! -L /home/agent/.ot
 
 CANDIDATE_JSON="$(/opt/openthrottle/runner/worktrees.mjs candidate --repo "$INTEGRATION" --root "$WORKTREES" --handle current --base "$BASE" --message "candidate from executor")"
 CANDIDATE="$(printf '%s' "$CANDIDATE_JSON" | jq -r '.candidateCommit')"
