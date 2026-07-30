@@ -1,7 +1,7 @@
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import {
@@ -45,6 +45,7 @@ export interface PrepareRunnerInput {
   model?: string;
   prompt: string;
   directory: string;
+  targetFile?: string;
 }
 
 export type PrepareRunner = (input: PrepareRunnerInput) => SpawnSyncReturns<Buffer>;
@@ -382,10 +383,21 @@ export function prepareExecutionPlanFile(
   if (before.length > 1) {
     throw new Error(`${file}: expected at most one ${EXECUTION_PLAN_FENCE} block before prepare, found ${before.length}`);
   }
-  const prompt = buildPreparePrompt(file, graph.graphId, readPrepareSkillBundle());
+  const isolatedDirectory = mkdtempSync(join(tmpdir(), "openthrottle-prepare-"));
+  const isolatedFile = join(isolatedDirectory, basename(file));
+  writeFileSync(isolatedFile, original, { mode: 0o600 });
+  const prompt = buildPreparePrompt(isolatedFile, graph.graphId, readPrepareSkillBundle());
   try {
-    assertPrepareRunnerSucceeded(runner({ agent, model: graph.config.value.model, prompt, directory }));
-    const prepared = readFileSync(file, "utf8");
+    assertPrepareRunnerSucceeded(
+      runner({
+        agent,
+        model: graph.config.value.model,
+        prompt,
+        directory: isolatedDirectory,
+        targetFile: isolatedFile,
+      })
+    );
+    const prepared = readFileSync(isolatedFile, "utf8");
     if (!preservesPlanProse(original, prepared, before.length === 1)) {
       throw new Error(`${file}: prepare modified content outside the execution-plan block`);
     }
@@ -393,10 +405,10 @@ export function prepareExecutionPlanFile(
     if (result.plan.value.graph_id !== graph.graphId) {
       throw new Error(`${file}: execution_plan.graph_id must match selected graph ${graph.graphId}`);
     }
+    writeFileSync(file, prepared);
     return result;
-  } catch (error) {
-    writeFileSync(file, original);
-    throw error;
+  } finally {
+    rmSync(isolatedDirectory, { recursive: true, force: true });
   }
 }
 
