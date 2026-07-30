@@ -671,7 +671,11 @@ intents:
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_stage_attempts").pluck().get()).toBe(0);
     const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
-    expect(payloads.some((entry) => entry.includes("unknown pipeline selection: core/structured@1"))).toBe(true);
+    expect(
+      payloads.some((entry) =>
+        entry.includes("graph structured requires unavailable runtime capability graph/for-each-unit@1")
+      )
+    ).toBe(true);
   });
 
   it("admits a command-only fixture without requiring a model subscription", async () => {
