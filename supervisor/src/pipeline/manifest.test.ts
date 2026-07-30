@@ -195,6 +195,30 @@ describe("pipeline manifest validation", () => {
       .toThrow(/pipeline\.max_repair_rounds: must be an integer between 1 and 20/);
   });
 
+  it("accepts repository command names while preserving command executor validation", () => {
+    const value = manifest();
+    value.requires = { protocol: "stage-executor@1", capabilities: ["command/run@1"] };
+    Object.assign(firstStage(value), {
+      executor: { kind: "command", capability: "command/run@1" },
+      commandName: "docs-check",
+      evaluator: {
+        kind: "command",
+        assurance: "executor_verified",
+        required_artifacts: ["command_result"],
+      },
+      context: "none",
+      live_steering: false,
+      credentials: ["repo.read"],
+      produces: ["stage_result", "command_result"],
+    });
+
+    expect(validatePipelineManifest(value).manifest.stages[0]?.commandName).toBe("docs-check");
+
+    firstStage(value).commandName = "Docs Check!";
+    expect(() => validatePipelineManifest(value))
+      .toThrow(/pipeline\.stages\[0\]\.commandName: has an invalid format/);
+  });
+
   it("rejects invalid defaults before reducers can observe them", () => {
     expect(() => validatePipelineManifest({
       ...manifest(),
@@ -337,7 +361,7 @@ describe("pipeline manifest validation", () => {
     expect(() => validatePipelineManifest(undeclared)).toThrow(/not declared in requires.capabilities/);
   });
 
-  it("requires command executors to declare an allowlisted repository command", () => {
+  it("requires command executors to declare a valid repository command name", () => {
     const command = manifest();
     command.requires = { protocol: "stage-executor@1", capabilities: ["command/run@1"] };
     const stage = firstStage(command);
@@ -354,7 +378,10 @@ describe("pipeline manifest validation", () => {
     expect(() => validatePipelineManifest(command)).toThrow(/commandName: is required for command executors/);
 
     stage.commandName = "deploy";
-    expect(() => validatePipelineManifest(command)).toThrow(/commandName: must be one of/);
+    expect(validatePipelineManifest(command).manifest.stages[0]).toMatchObject({ commandName: "deploy" });
+
+    stage.commandName = "Deploy!";
+    expect(() => validatePipelineManifest(command)).toThrow(/commandName: has an invalid format/);
 
     const agent = manifest();
     firstStage(agent).commandName = "test";

@@ -199,7 +199,11 @@ async function resolvePipelineSelection(
     rawGraph = snapshot.content;
     compileSource = `${snapshot.repository}@${snapshot.commit}:${snapshot.path}`;
     blobDescription = `${snapshot.path}@${snapshot.blobSha}`;
-    manifestId = `repository/${graphId}/${snapshot.blobSha}`;
+    manifestId = `repository/${digestNormalized(canonicalJson({
+      graphId,
+      blobSha: snapshot.blobSha,
+      path: snapshot.path,
+    }))}`;
   } else if (source.ref === "core/simple@1") {
     rawGraph = readFileSync(BUILTIN_SIMPLE_GRAPH, "utf8");
     compileSource = "builtin:core/simple@1";

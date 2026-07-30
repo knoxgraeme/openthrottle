@@ -606,7 +606,7 @@ intents:
         {
           id: "verify",
           kind: "command",
-          command: "test",
+          command: "docs-check",
           depends_on: [],
           transitions: {
             success: { terminal: "completed" },
@@ -625,12 +625,12 @@ graphs:
   - id: docs
     kind: repository
     ref: ${graphPath}
-pipelines: { implement: implement, docs: fixture-command }
 intents:
   implement:
     default_graph: docs
     allowed_graphs: [simple, docs]
-test: "true"
+commands:
+  docs-check: "npm run docs:check"
 `,
       { codexAuthJson: undefined, claudeCodeOauthToken: undefined, kimiCodeApiKey: undefined },
       fixtureCatalogPath,
@@ -639,10 +639,93 @@ test: "true"
     );
 
     expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
-      pipeline_id: `repository/docs/${"c".repeat(40)}`,
+      pipeline_id: `repository/${digestNormalized(canonicalJson({
+        graphId: "docs",
+        blobSha: "c".repeat(40),
+        path: graphPath,
+      }))}`,
       pipeline_version: 1,
       active_stage_id: "verify",
     });
+    const request = pipelines.getStageRequest(pipelines.getActiveAttempt(pipelines.getInstanceForSession("session-1")!.id)!.id);
+    expect(request.commandName).toBe("docs-check");
+  });
+
+  it("binds repository graph manifest identity to the pinned source path", async () => {
+    const graphA = ".openthrottle/graphs/docs-a.json";
+    const graphB = ".openthrottle/graphs/docs-b.json";
+    const graph = JSON.stringify({
+      schema: "openthrottle.graph/v1",
+      id: "raw-docs",
+      version: 1,
+      entry_node: "verify",
+      workers: [{
+        id: "commands",
+        engine: "command",
+        session_scope: "attempt",
+        credentials: ["repo.read"],
+        skills: ["builtin://commands@1"],
+      }],
+      loops: [{
+        id: "command_loop",
+        worker: "commands",
+        input_scope: "command",
+        receipt: "command_result",
+        max_parallel: 1,
+        max_rounds: 1,
+        skill: "builtin://commands@1",
+        timeout_seconds: 60,
+      }],
+      nodes: [{
+        id: "verify",
+        kind: "command",
+        command: "docs-check",
+        depends_on: [],
+        transitions: {
+          success: { terminal: "completed" },
+          failure: { terminal: "failed" },
+        },
+      }],
+    });
+    const configFor = (graphId: string, graphPath: string) => `schema: openthrottle.config/v1
+default_graph: ${graphId}
+graphs:
+  - id: ${graphId}
+    kind: repository
+    ref: ${graphPath}
+intents:
+  implement:
+    default_graph: ${graphId}
+    allowed_graphs: [${graphId}]
+commands:
+  docs-check: "npm run docs:check"
+`;
+    const { pipelines, invoke, setRepositoryConfig } = await run(
+      configFor("docs_a", graphA),
+      { codexAuthJson: undefined, claudeCodeOauthToken: undefined, kimiCodeApiKey: undefined },
+      fixtureCatalogPath,
+      payload(),
+      { [graphA]: graph, [graphB]: graph }
+    );
+    const first = pipelines.getInstanceForSession("session-1")!;
+    setRepositoryConfig(configFor("docs_b", graphB));
+    await invoke(
+      { codexAuthJson: undefined, claudeCodeOauthToken: undefined, kimiCodeApiKey: undefined },
+      payload("session-2", "issue-2", "OT-2")
+    );
+    const second = pipelines.getInstanceForSession("session-2")!;
+
+    expect(first.pipeline_id).toBe(`repository/${digestNormalized(canonicalJson({
+      graphId: "docs_a",
+      blobSha: "c".repeat(40),
+      path: graphA,
+    }))}`);
+    expect(second.pipeline_id).toBe(`repository/${digestNormalized(canonicalJson({
+      graphId: "docs_b",
+      blobSha: "c".repeat(40),
+      path: graphB,
+    }))}`);
+    expect(second.pipeline_id).not.toBe(first.pipeline_id);
   });
 
   it("pins repository skill packages and carries skill identity in the compiled request", async () => {
@@ -714,7 +797,11 @@ intents:
 
     const instance = pipelines.getInstanceForSession("session-1")!;
     expect(instance).toMatchObject({
-      pipeline_id: `repository/repo_skill/${"c".repeat(40)}`,
+      pipeline_id: `repository/${digestNormalized(canonicalJson({
+        graphId: "repo_skill",
+        blobSha: "c".repeat(40),
+        path: graphPath,
+      }))}`,
       active_stage_id: "implementation",
     });
     const request = pipelines.getStageRequest(pipelines.getActiveAttempt(instance.id)!.id);

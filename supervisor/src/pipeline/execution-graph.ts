@@ -1,4 +1,5 @@
 import {
+  COMMAND_NAME_PATTERN,
   parseGraphContract,
   validateGraphContract,
   type GraphContract,
@@ -148,11 +149,20 @@ function capabilityFromSkill(
   return { capability: REPOSITORY_SKILL_CAPABILITY, repositorySkill };
 }
 
-function commandNameFromGraph(command: string, path: string): CommandName {
-  if (!COMMAND_NAMES.includes(command as CommandName)) {
+function commandNameFromGraph(command: string, path: string, config?: RepositoryConfigContract): CommandName {
+  if (!COMMAND_NAME_PATTERN.test(command)) {
+    fail(path, "has an invalid command name");
+  }
+  if (config?.commands) {
+    if (!Object.hasOwn(config.commands, command)) {
+      fail(path, `must name a configured repository command`);
+    }
+    return command;
+  }
+  if (!COMMAND_NAMES.includes(command as (typeof COMMAND_NAMES)[number])) {
     fail(path, `must be one of: ${COMMAND_NAMES.join(", ")}`);
   }
-  return command as CommandName;
+  return command;
 }
 
 function contextFromSessionScope(worker: GraphWorker): ContextPolicy {
@@ -327,6 +337,7 @@ function capabilityOrder(capability: string): number {
 function nodeTemplate(
   graph: GraphContract,
   node: GraphNode,
+  config?: RepositoryConfigContract,
   repositorySkills?: ReadonlyMap<string, RepositorySkillPackage>
 ): StageTemplate {
   assertNoDependencies(node);
@@ -335,7 +346,7 @@ function nodeTemplate(
   if (node.kind === "command") {
     return {
       executor: { kind: "command", capability: "command/run@1" },
-      commandName: commandNameFromGraph(node.command!, `graph.nodes.${node.id}.command`),
+      commandName: commandNameFromGraph(node.command!, `graph.nodes.${node.id}.command`, config),
       evaluator: { kind: "command", assurance: "executor_verified", required_artifacts: ["command_result"] },
       context: "none",
       live_steering: false,
@@ -368,12 +379,7 @@ function nodeTemplate(
   return exhaustive;
 }
 
-function compileStage(
-  graph: GraphContract,
-  node: GraphNode,
-  repositorySkills?: ReadonlyMap<string, RepositorySkillPackage>
-): PipelineStage {
-  const template = nodeTemplate(graph, node, repositorySkills);
+function compileStage(node: GraphNode, template: StageTemplate): PipelineStage {
   return {
     id: node.id,
     executor: template.executor,
@@ -392,6 +398,7 @@ export function compileExecutionGraph(
   graph: GraphContract,
   options: CompileExecutionGraphOptions = {}
 ): ValidatedPipelineManifest {
+  const templates = graph.nodes.map((node) => nodeTemplate(graph, node, options.config, options.repositorySkills));
   const manifest: PipelineManifest = {
     schema: "openthrottle.pipeline/v1",
     id: options.id ?? graph.id,
@@ -402,7 +409,7 @@ export function compileExecutionGraph(
     ...(options.maxRepairRounds === undefined ? {} : { max_repair_rounds: options.maxRepairRounds }),
     requires: {
       protocol: "stage-executor@1",
-      capabilities: [...new Set(graph.nodes.map((node) => nodeTemplate(graph, node, options.repositorySkills).executor.capability))]
+      capabilities: [...new Set(templates.map((template) => template.executor.capability))]
         .sort((left, right) => {
           const leftOrder = capabilityOrder(left);
           const rightOrder = capabilityOrder(right);
@@ -412,7 +419,7 @@ export function compileExecutionGraph(
           return leftOrder - rightOrder;
         }),
     },
-    stages: graph.nodes.map((node) => compileStage(graph, node, options.repositorySkills)),
+    stages: graph.nodes.map((node, index) => compileStage(node, templates[index]!)),
   };
   return validatePipelineManifest(manifest, { runtime: options.runtime });
 }

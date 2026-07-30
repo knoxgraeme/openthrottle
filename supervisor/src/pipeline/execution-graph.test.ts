@@ -226,6 +226,29 @@ describe("execution graph compiler", () => {
     });
   });
 
+  it("compiles repository-defined command names from the pinned command inventory", () => {
+    const compiled = validateAndCompileExecutionGraph(minimalGraph({
+      node: {
+        kind: "command",
+        loop: undefined,
+        command: "docs-check",
+      },
+    }), {
+      config: {
+        schema: "openthrottle.config/v1",
+        default_graph: "docs",
+        graphs: [{ id: "docs", kind: "repository", ref: ".openthrottle/graphs/docs.json" }],
+        commands: { "docs-check": "npm run docs:check" },
+      },
+    }).manifest.manifest;
+
+    expect(compiled.stages[0]).toMatchObject({
+      id: "stage",
+      executor: { kind: "command", capability: "command/run@1" },
+      commandName: "docs-check",
+    });
+  });
+
   it("fails closed for unpinned repository skills and production runtimes without the repository-skill capability", () => {
     const graph = minimalGraph({
       worker: {
@@ -315,5 +338,22 @@ describe("execution graph compiler", () => {
     ],
   ])("fails closed for unsupported %s", (_label, graph, error) => {
     expect(() => validateAndCompileExecutionGraph(graph)).toThrow(error);
+  });
+
+  it("rejects repository command nodes absent from the pinned command inventory", () => {
+    expect(() => validateAndCompileExecutionGraph(minimalGraph({
+      node: {
+        kind: "command",
+        loop: undefined,
+        command: "docs-check",
+      },
+    }), {
+      config: {
+        schema: "openthrottle.config/v1",
+        default_graph: "docs",
+        graphs: [{ id: "docs", kind: "repository", ref: ".openthrottle/graphs/docs.json" }],
+        commands: { test: "npm test" },
+      },
+    })).toThrow(/graph\.nodes\.stage\.command: references an unknown repository command/);
   });
 });

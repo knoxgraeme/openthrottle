@@ -42,7 +42,7 @@ const REQUEST_KEYS = new Set([
   "agent",
   "expectedSubject", "contextPolicy", "nativeSessionId", "capability",
   "requiredArtifacts", "credentialScopes", "liveSteering", "commandName",
-  "childActionId",
+  "repositorySkill", "childActionId",
 ]);
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 const DIGEST = /^[a-f0-9]{64}$/;
@@ -51,7 +51,7 @@ const ARTIFACT_KINDS = new Set(RUNTIME_DESCRIPTOR.artifacts);
 const CONTEXT_POLICIES = new Set([
   "none", "fresh", "resume_required", "prefer_resume",
 ]);
-const COMMAND_NAMES = new Set(["test", "lint", "build", "format"]);
+const COMMAND_NAME = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
 const REMOTE_GIT_TIMEOUT_MS = 15_000;
 
 function record(value, label) {
@@ -133,6 +133,7 @@ export function validateStageRequest(value) {
     credentialScopes: stringList(input.credentialScopes, "credentialScopes"),
     liveSteering: input.liveSteering,
     ...(input.commandName === undefined ? {} : { commandName: input.commandName }),
+    ...(input.repositorySkill === undefined ? {} : { repositorySkill: record(input.repositorySkill, "repositorySkill") }),
     ...(input.childActionId === undefined ? {} : { childActionId: string(input.childActionId, "childActionId") }),
   };
   if (!Number.isSafeInteger(request.generation) || request.generation < 1) throw new Error("generation is invalid");
@@ -148,7 +149,7 @@ export function validateStageRequest(value) {
     throw new Error("nativeSessionId is invalid");
   }
   if (typeof request.liveSteering !== "boolean") throw new Error("liveSteering is invalid");
-  if (request.commandName !== undefined && !COMMAND_NAMES.has(request.commandName)) {
+  if (request.commandName !== undefined && !COMMAND_NAME.test(request.commandName)) {
     throw new Error("commandName is invalid");
   }
   if (request.runtimeRelease !== RUNTIME_DESCRIPTOR.release) {
@@ -189,7 +190,20 @@ export function validateSealedInputs({ request, configRaw, manifestRaw }) {
   if (canonicalJson([...request.credentialScopes].sort()) !== canonicalJson([...stage.credentials].sort())) {
     throw new Error("stage request credential scopes do not match the sealed manifest");
   }
+  const sealedCommandName = stage.commandName ?? (stage.executor?.kind === "command" ? stage.id : null);
+  if ((request.commandName ?? null) !== sealedCommandName) {
+    throw new Error("stage request command name does not match the sealed manifest");
+  }
+  if (canonicalJson(request.repositorySkill ?? null) !== canonicalJson(stage.repositorySkill ?? null)) {
+    throw new Error("stage request repository skill does not match the sealed manifest");
+  }
   return { config, manifest, stage };
+}
+
+function resolveCommand(config, commandName) {
+  if (typeof config.commands?.[commandName] === "string") return config.commands[commandName];
+  if (typeof config[commandName] === "string") return config[commandName];
+  return "";
 }
 
 export function resolveContextInvocation(request) {
@@ -563,8 +577,8 @@ export function executeStage({
   let artifacts;
   if (contract.kind === "command") {
     const commandName = request.commandName ?? request.stageId;
-    if (!COMMAND_NAMES.has(commandName)) throw new Error(`stage ${request.stageId} does not select an allowlisted repository command`);
-    const command = typeof config[commandName] === "string" ? config[commandName] : "";
+    if (!COMMAND_NAME.test(commandName)) throw new Error(`stage ${request.stageId} does not select a valid repository command`);
+    const command = resolveCommand(config, commandName);
     try {
       const execution = executeCommand({ command, commandName, repoDir, timeoutMs });
       const postSubject = computeWorkspaceTreeOid(repoDir);

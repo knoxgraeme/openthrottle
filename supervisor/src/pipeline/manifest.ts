@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import {
   canonicalJson as sharedCanonicalJson,
+  COMMAND_NAME_PATTERN,
   digestNormalized as sharedDigestNormalized,
   validateRepositoryConfigContract,
   type ConfigGraphSource,
@@ -52,7 +53,7 @@ export type AssuranceClass = (typeof ASSURANCE_CLASSES)[number];
 export const EXECUTOR_KINDS = ["agent", "command", "loop_action", "provider_wait"] as const;
 export type ExecutorKind = (typeof EXECUTOR_KINDS)[number];
 export const COMMAND_NAMES = ["test", "lint", "build", "format"] as const;
-export type CommandName = (typeof COMMAND_NAMES)[number];
+export type CommandName = string;
 export const EVALUATOR_KINDS = [
   "semantic",
   "command",
@@ -384,7 +385,7 @@ function parseStage(
     id,
     executor,
     ...(input.commandName === undefined ? {} : {
-      commandName: enumAt(input.commandName, `${path}.commandName`, COMMAND_NAMES),
+      commandName: stringAt(input.commandName, `${path}.commandName`, { max: 80, pattern: COMMAND_NAME_PATTERN }),
     }),
     ...(input.repositorySkill === undefined ? {} : {
       repositorySkill: parseRepositorySkillPackage(input.repositorySkill, `${path}.repositorySkill`),
