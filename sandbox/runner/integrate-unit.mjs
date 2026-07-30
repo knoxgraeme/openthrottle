@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 
-import { writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
 import { runGitAsExecutor } from "./repository-control.mjs";
+import { chmodOwnerPrivateTree, chownTree, identityForUser, isRoot } from "./filesystem-isolation.mjs";
 
 const COMMIT = /^[a-f0-9]{40}$/;
 
@@ -22,25 +23,38 @@ function treeOf(repoDir, subject) {
   return runGitAsExecutor(repoDir, ["rev-parse", `${subject}^{tree}`]);
 }
 
+function restoreRepositoryOwnerCheckout(repoDir) {
+  if (!isRoot() || !existsSync(repoDir)) return false;
+  const identity = identityForUser("agent");
+  if (!identity) return false;
+  chownTree(repoDir, identity.uid, identity.gid);
+  chmodOwnerPrivateTree(repoDir);
+  return true;
+}
+
 export function integrateCandidate({
   repoDir,
   expectedHead,
   candidateCommit,
 }) {
-  const expected = commit(expectedHead, "expectedHead");
-  const candidate = commit(candidateCommit, "candidateCommit");
-  if (!clean(repoDir)) throw new Error("integration checkout must be clean");
-  const head = runGitAsExecutor(repoDir, ["rev-parse", "HEAD"]);
-  if (head !== expected) throw new Error("integration checkout HEAD does not match expected head");
-  const currentTree = treeOf(repoDir, head);
-  const candidateTree = treeOf(repoDir, candidate);
-  if (currentTree === candidateTree) {
-    return receipt({ repoDir, expected, candidate, integrated: false, reason: "already_applied_exact_tree" });
+  try {
+    const expected = commit(expectedHead, "expectedHead");
+    const candidate = commit(candidateCommit, "candidateCommit");
+    if (!clean(repoDir)) throw new Error("integration checkout must be clean");
+    const head = runGitAsExecutor(repoDir, ["rev-parse", "HEAD"]);
+    if (head !== expected) throw new Error("integration checkout HEAD does not match expected head");
+    const currentTree = treeOf(repoDir, head);
+    const candidateTree = treeOf(repoDir, candidate);
+    if (currentTree === candidateTree) {
+      return receipt({ repoDir, expected, candidate, integrated: false, reason: "already_applied_exact_tree" });
+    }
+    const mergeBase = runGitAsExecutor(repoDir, ["merge-base", head, candidate]);
+    if (mergeBase !== head) throw new Error("candidate is not a fast-forward of the integration head");
+    runGitAsExecutor(repoDir, ["merge", "--ff-only", candidate]);
+    return receipt({ repoDir, expected, candidate, integrated: true, reason: "fast_forwarded" });
+  } finally {
+    restoreRepositoryOwnerCheckout(repoDir);
   }
-  const mergeBase = runGitAsExecutor(repoDir, ["merge-base", head, candidate]);
-  if (mergeBase !== head) throw new Error("candidate is not a fast-forward of the integration head");
-  runGitAsExecutor(repoDir, ["merge", "--ff-only", candidate]);
-  return receipt({ repoDir, expected, candidate, integrated: true, reason: "fast_forwarded" });
 }
 
 function receipt({ repoDir, expected, candidate, integrated, reason }) {

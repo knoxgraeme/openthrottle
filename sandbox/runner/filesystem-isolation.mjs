@@ -21,6 +21,15 @@ export function chmodTree(path, { fileMode, directoryMode = fileMode }) {
   for (const entry of readdirSync(path)) chmodTree(resolve(path, entry), { fileMode, directoryMode });
 }
 
+export function chmodOwnerPrivateTree(path) {
+  const metadata = lstatSync(path);
+  if (metadata.isSymbolicLink()) return;
+  const fileMode = (metadata.mode & 0o111) === 0 ? 0o600 : 0o700;
+  chmodSync(path, metadata.isDirectory() ? 0o700 : fileMode);
+  if (!metadata.isDirectory()) return;
+  for (const entry of readdirSync(path)) chmodOwnerPrivateTree(resolve(path, entry));
+}
+
 export function isRoot() {
   return typeof process.getuid === "function" && process.getuid() === 0;
 }

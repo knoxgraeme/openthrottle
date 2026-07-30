@@ -34,6 +34,8 @@ afterEach(() => {
   }
   delete process.env.OT_LOOP_ACTION_ROOT;
   delete process.env.OT_WORKTREE_ROOT;
+  delete process.env.OT_INTEGRATION_REPO_DIR;
+  delete process.env.OT_NATIVE_SESSION_SOURCE_ROOT;
 });
 
 function repository() {
@@ -317,6 +319,13 @@ describe("loop action request validation", () => {
         events.push(`lock-integration:${path}`);
         return true;
       },
+      lockPersistentProfiles: () => {
+        events.push("lock-persistent-profiles");
+        return ["/home/agent/.codex"];
+      },
+      restorePersistentProfiles: (paths) => {
+        events.push(`restore-persistent-profiles:${paths.join(",")}`);
+      },
       runProcess: (command, args, options) => {
         events.push(`run:${command}:${options.cwd}`);
         const actionDirectory = join(actionRoot, valid.attemptId, valid.actionId);
@@ -346,9 +355,11 @@ describe("loop action request validation", () => {
     }));
     expect(events).toEqual([
       `lock-integration:${integrationRepoDir}`,
+      "lock-persistent-profiles",
       "process-fence",
       `run:gosu:${loopWorktreeDirectory(valid)}`,
       `lock-integration:${integrationRepoDir}`,
+      "restore-persistent-profiles:/home/agent/.codex",
     ]);
   });
 
@@ -474,6 +485,70 @@ describe("loop action request validation", () => {
     });
   });
 
+  it("materializes only the authorized native session package into each isolated profile", () => {
+    for (const agent of ["claude", "codex", "opencode"]) {
+      const valid = validateLoopRequest(request({
+        agent,
+        nativeSessionId: "native-1",
+        contextPolicy: "resume_required",
+      }));
+      const actionRoot = mkdtempSync(join(tmpdir(), `ot-loop-actions-${agent}-`));
+      const sessionRoot = mkdtempSync(join(tmpdir(), `ot-loop-sessions-${agent}-`));
+      directories.push(actionRoot, sessionRoot);
+      process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+      process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sessionRoot;
+      mkdirSync(join(sessionRoot, agent, "native-1", "sessions"), { recursive: true });
+      mkdirSync(join(sessionRoot, agent, "native-sibling", "sessions"), { recursive: true });
+      writeFileSync(join(sessionRoot, agent, "native-1", "sessions", "current.jsonl"), "current session\n");
+      writeFileSync(join(sessionRoot, agent, "native-sibling", "sessions", "secret.jsonl"), "sibling session\n");
+
+      runLoopAgentInPreparedRepository({
+        request: valid,
+        invocation: resolveLoopInvocation(valid),
+        integrationRepoDir: "/tmp/integration",
+        lockIntegration: () => true,
+        lockPersistentProfiles: () => [],
+        restorePersistentProfiles: () => {},
+        processFence: (execute) => execute(),
+        runProcess: (command, args) => {
+          expect(command).toBe("gosu");
+          const actionDirectory = join(actionRoot, valid.attemptId, valid.actionId);
+          const profileRoot = agent === "codex"
+            ? join(actionDirectory, "codex")
+            : agent === "claude"
+              ? join(actionDirectory, "home", ".claude")
+              : join(actionDirectory, "home");
+          expect(readFileSync(join(profileRoot, "sessions", "current.jsonl"), "utf8")).toBe("current session\n");
+          expect(existsSync(join(profileRoot, "sessions", "secret.jsonl"))).toBe(false);
+          return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+        },
+      });
+    }
+  });
+
+  it("fails closed when resume is requested without sealed native session state", () => {
+    const valid = validateLoopRequest(request({
+      nativeSessionId: "native-missing",
+      contextPolicy: "resume_required",
+    }));
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+    const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
+    directories.push(actionRoot, sessionRoot);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+    process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sessionRoot;
+
+    expect(() => runLoopAgentInPreparedRepository({
+      request: valid,
+      invocation: resolveLoopInvocation(valid),
+      integrationRepoDir: "/tmp/integration",
+      lockIntegration: () => true,
+      lockPersistentProfiles: () => [],
+      restorePersistentProfiles: () => {},
+      processFence: (execute) => execute(),
+      runProcess: () => ({ status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" }),
+    })).toThrow(/authorized native session state is unavailable/);
+  });
+
   it("leaves the integration checkout locked when agent launch throws", () => {
     const valid = validateLoopRequest(request());
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
@@ -584,6 +659,30 @@ describe("executeLoopAction", () => {
     expect(result.receipt).toMatch(/agent launch failed/);
     expect(lockWorkerWorktree).toHaveBeenCalledOnce();
     expect(lockActionDirectory).toHaveBeenCalledOnce();
+  });
+
+  it("restores the configured integration checkout when the default loop launch throws", () => {
+    const configuredIntegration = mkdtempSync(join(tmpdir(), "ot-loop-integration-"));
+    directories.push(configuredIntegration);
+    process.env.OT_INTEGRATION_REPO_DIR = configuredIntegration;
+    const lockWorkerWorktree = vi.fn();
+    const lockActionDirectory = vi.fn();
+    const restoreIntegration = vi.fn();
+    const result = executeLoopAction({
+      request: request(),
+      lockWorkerWorktree,
+      lockActionDirectory,
+      restoreIntegration,
+      runLoopAgent: ({ integrationRepoDir }) => {
+        expect(integrationRepoDir).toBe(configuredIntegration);
+        throw new Error("agent launch failed");
+      },
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("failure");
+    expect(result.receipt).toMatch(/agent launch failed/);
+    expect(restoreIntegration).toHaveBeenCalledWith(configuredIntegration);
   });
 
   it("returns a typed failure when launch failure leaves subject attestation unavailable", () => {

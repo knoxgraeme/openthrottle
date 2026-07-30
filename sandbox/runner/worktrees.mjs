@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { runGitAsExecutor } from "./repository-control.mjs";
-import { chmodTree, chownTree, identityForUser, isRoot, pathInside as containedPath } from "./filesystem-isolation.mjs";
+import { chmodOwnerPrivateTree, chmodTree, chownTree, identityForUser, isRoot, pathInside as containedPath } from "./filesystem-isolation.mjs";
 
 const HANDLE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const COMMIT = /^[a-f0-9]{40}$/;
@@ -65,7 +65,7 @@ function lockObjectStore(path) {
 function lockCandidateReadableWorktree(path) {
   if (!isRoot()) return;
   chownTree(path, ROOT_UID, ROOT_GID);
-  chmodTree(path, { fileMode: 0o600, directoryMode: 0o700 });
+  chmodOwnerPrivateTree(path);
 }
 
 function prepareWorktreeRoot(rootDir) {
@@ -99,7 +99,7 @@ export function lockWorktree({ rootDir = DEFAULT_ROOT, handle, lockLinkedGitDir:
   assertDirectory(target, "worktree");
   const gitDir = linkedGitDir(target);
   chownTree(target, ROOT_UID, ROOT_GID);
-  chmodTree(target, { fileMode: 0o600, directoryMode: 0o700 });
+  chmodOwnerPrivateTree(target);
   lockGitIndirectionFile(target);
   if (shouldLockLinkedGitDir && gitDir) lockLinkedGitDir(gitDir);
   return { id: safeHandle(handle), path: target, writable: false };
@@ -115,7 +115,7 @@ export function grantWorktreeToAgent({ rootDir = DEFAULT_ROOT, handle, grantLink
     if (sibling !== target && lstatSync(sibling).isDirectory()) {
       const siblingGitDir = linkedGitDir(sibling);
       chownTree(sibling, ROOT_UID, ROOT_GID);
-      chmodTree(sibling, { fileMode: 0o600, directoryMode: 0o700 });
+      chmodOwnerPrivateTree(sibling);
       lockGitIndirectionFile(sibling);
       if (siblingGitDir) lockLinkedGitDir(siblingGitDir);
     }
@@ -123,7 +123,7 @@ export function grantWorktreeToAgent({ rootDir = DEFAULT_ROOT, handle, grantLink
   const identity = identityForUser("agent");
   const gitDir = linkedGitDir(target);
   if (identity) chownTree(target, identity.uid, identity.gid);
-  chmodTree(target, { fileMode: 0o600, directoryMode: 0o700 });
+  chmodOwnerPrivateTree(target);
   lockGitIndirectionFile(target);
   grantWritableWorktreeRoot(target, identity);
   if (identity && gitDir && grantLinkedGitDir) {
@@ -211,7 +211,7 @@ export function deriveCandidateCommit({
     rmSync(temporary, { recursive: true, force: true });
     if (isRoot()) {
       chownTree(worktreeDir, ROOT_UID, ROOT_GID);
-      chmodTree(worktreeDir, { fileMode: 0o600, directoryMode: 0o700 });
+      chmodOwnerPrivateTree(worktreeDir);
       if (gitDir) lockLinkedGitDir(gitDir);
       if (commonDir) lockObjectStore(resolve(commonDir, "objects"));
     }

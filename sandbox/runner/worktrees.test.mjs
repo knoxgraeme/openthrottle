@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -29,6 +29,8 @@ function repository() {
   git(directory, ["config", "user.name", "Test"]);
   git(directory, ["config", "user.email", "test@example.com"]);
   writeFileSync(join(directory, "file.txt"), "initial\n");
+  writeFileSync(join(directory, "run.sh"), "#!/bin/sh\n");
+  chmodSync(join(directory, "run.sh"), 0o755);
   git(directory, ["add", "."]);
   git(directory, ["commit", "-qm", "initial"]);
   return directory;
@@ -53,6 +55,7 @@ describe("executor-owned worktrees", () => {
     expect(git(created.path, ["status", "--porcelain"])).toBe("");
     expect(git(created.path, ["config", "--get", "core.hooksPath"])).toBe("/sealed/hooks");
     expect(git(created.path, ["config", "--get", "remote.origin.pushurl"])).toBe("DISABLED_BY_OPENTHROTTLE_LOOP_WORKTREE");
+    expect(statSync(join(created.path, "run.sh")).mode & 0o777).toBe(0o700);
   });
 
   it("refuses wrong-base and dirty integration checkouts", () => {
@@ -75,11 +78,14 @@ describe("executor-owned worktrees", () => {
     const baseCommit = git(repoDir, ["rev-parse", "HEAD"]);
     const created = createWorktree({ repoDir, rootDir, handle: "unit-2", baseCommit });
     writeFileSync(join(created.path, "file.txt"), "changed\n");
+    writeFileSync(join(created.path, "new-executable.sh"), "#!/bin/sh\n");
+    chmodSync(join(created.path, "new-executable.sh"), 0o755);
 
     const candidate = deriveCandidateCommit({ worktreeDir: created.path, baseCommit, message: "candidate" });
 
     expect(candidate.candidateCommit).toMatch(/^[a-f0-9]{40}$/);
-    expect(candidate.changedPaths).toEqual(["file.txt"]);
+    expect(candidate.changedPaths).toEqual(["file.txt", "new-executable.sh"]);
+    expect(git(repoDir, ["ls-tree", candidate.candidateCommit, "new-executable.sh"])).toContain("100755");
     expect(git(created.path, ["rev-parse", "HEAD"])).toBe(baseCommit);
   });
 

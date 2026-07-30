@@ -20,7 +20,11 @@ LEAD_RESULT="$ACTION_ROOT/attempt-current/action-lead/result.json"
 BUILTIN_REQUEST="$ACTION_ROOT/attempt-current/action-builtin/request.json"
 BUILTIN_RESULT="$ACTION_ROOT/attempt-current/action-builtin/result.json"
 SEALED="$ROOT/sealed-input.txt"
-BACKGROUND_PID="$ACTION_ROOT/attempt-current/action-current/background.pid"
+BACKGROUND_PID="$ACTION_ROOT/attempt-current/action-current/home/background.pid"
+NATIVE_SESSION_ROOT="/home/agent/.ot/native-sessions"
+PERSISTENT_CLAUDE_SECRET="/home/agent/.claude/ot-persistent-probe-secret.txt"
+PERSISTENT_CODEX_SECRET="/home/agent/.codex/ot-persistent-probe-secret.txt"
+PERSISTENT_OT_SECRET="/home/agent/.ot/ot-persistent-probe-secret.txt"
 
 install -d -o agent -g agent -m 0700 "$INTEGRATION"
 install -d -o root -g root -m 0711 "$WORKTREES"
@@ -62,6 +66,17 @@ chown -R agent:agent "$ACTION_ROOT/attempt-current/action-sibling" "$ACTION_ROOT
 printf 'sealed secret\n' > "$SEALED"
 chown root:root "$SEALED"
 chmod 0400 "$SEALED"
+install -d -o agent -g agent -m 0700 "$NATIVE_SESSION_ROOT/codex/native-current/sessions"
+install -d -o agent -g agent -m 0700 "$NATIVE_SESSION_ROOT/codex/native-sibling/sessions"
+printf 'current native session\n' > "$NATIVE_SESSION_ROOT/codex/native-current/sessions/current.jsonl"
+printf 'sibling native session\n' > "$NATIVE_SESSION_ROOT/codex/native-sibling/sessions/sibling.jsonl"
+chown -R agent:agent "$NATIVE_SESSION_ROOT/codex"
+install -d -o agent -g agent -m 0700 /home/agent/.claude /home/agent/.codex /home/agent/.ot
+printf 'persistent claude secret\n' > "$PERSISTENT_CLAUDE_SECRET"
+printf 'persistent codex secret\n' > "$PERSISTENT_CODEX_SECRET"
+printf 'persistent ot secret\n' > "$PERSISTENT_OT_SECRET"
+chown agent:agent "$PERSISTENT_CLAUDE_SECRET" "$PERSISTENT_CODEX_SECRET" "$PERSISTENT_OT_SECRET"
+chmod 0600 "$PERSISTENT_CLAUDE_SECRET" "$PERSISTENT_CODEX_SECRET" "$PERSISTENT_OT_SECRET"
 
 mkdir -p "$INTEGRATION/.git/objects/info"
 {
@@ -117,6 +132,9 @@ test "$HOME" = "$PROBE_CURRENT_ACTION_DIR/home"
 test "$CODEX_HOME" = "$PROBE_CURRENT_ACTION_DIR/codex"
 test -r "$CODEX_HOME/skills/repo_action/SKILL.md"
 grep -q "pinned package" "$CODEX_HOME/skills/repo_action/SKILL.md"
+test -r "$CODEX_HOME/sessions/current.jsonl"
+grep -q "current native session" "$CODEX_HOME/sessions/current.jsonl"
+test ! -e "$CODEX_HOME/sessions/sibling.jsonl"
 git status --porcelain=v1 --untracked-files=all >/tmp/ot-probe-git-status
 node /opt/openthrottle/runner/execute-stage.mjs --print-subject --repo "$PWD" >/tmp/ot-probe-subject
 printf 'worker write\n' > "$PWD/worker-write.txt"
@@ -142,6 +160,12 @@ must_fail cat "$PROBE_INTEGRATION/.git/objects/${PROBE_SIBLING_ONLY_BLOB:0:2}/${
 must_fail cat "$PROBE_SIBLING_ACTION_SECRET"
 must_fail cat "$PROBE_PRIOR_ACTION_SECRET"
 must_fail cat "$PROBE_PRIOR_HOME_SECRET"
+must_fail cat "$PROBE_PERSISTENT_CLAUDE_SECRET"
+must_fail cat "$PROBE_PERSISTENT_CODEX_SECRET"
+must_fail cat "$PROBE_PERSISTENT_OT_SECRET"
+must_fail sh -c "printf bad >> '$PROBE_PERSISTENT_CLAUDE_SECRET'"
+must_fail sh -c "printf bad >> '$PROBE_PERSISTENT_CODEX_SECRET'"
+must_fail sh -c "printf bad >> '$PROBE_PERSISTENT_OT_SECRET'"
 must_fail cat "$PROBE_INTEGRATION/.git/objects/info/alternates.probe"
 must_fail sh -c "printf bad >> '$PROBE_INTEGRATION/.git/objects/info/alternates.probe'"
 test ! -w /opt/openthrottle/safety/pre-push
@@ -189,8 +213,8 @@ const base = {
   agent: "codex",
   skill: repositorySkill.invocation,
   worktree: { id: "current" },
-  nativeSessionId: null,
-  contextPolicy: "fresh",
+  nativeSessionId: "native-current",
+  contextPolicy: "resume_required",
   timeoutMs: 120000,
   transitionContext: "Probe worktree isolation.",
   allowedMcpServers: [],
@@ -271,10 +295,13 @@ chown root:root "$BUILTIN_REQUEST"
 chmod 0400 "$BUILTIN_REQUEST"
 
 printf 'mutable worktree skill bytes\n' > "$WORKTREES/current/.agents/skills/current/SKILL.md"
+printf '#!/bin/sh\necho executable probe\n' > "$WORKTREES/current/executable-probe.sh"
+chmod 0755 "$WORKTREES/current/executable-probe.sh"
 
 PATH="$BIN:$PATH" \
 OT_LOOP_ACTION_ROOT="$ACTION_ROOT" \
 OT_WORKTREE_ROOT="$WORKTREES" \
+OT_INTEGRATION_REPO_DIR="$INTEGRATION" \
 PROBE_INTEGRATION="$INTEGRATION" \
 PROBE_SEALED_INPUT="$SEALED" \
 PROBE_SIBLING_WORKTREE="$WORKTREES/sibling" \
@@ -282,6 +309,9 @@ PROBE_SIBLING_ONLY_BLOB="$SIBLING_ONLY_BLOB" \
 PROBE_SIBLING_ACTION_SECRET="$ACTION_ROOT/attempt-current/action-sibling/secret.txt" \
 PROBE_PRIOR_ACTION_SECRET="$ACTION_ROOT/attempt-prior/action-current/secret.txt" \
 PROBE_PRIOR_HOME_SECRET="$ACTION_ROOT/attempt-prior/action-home/home/native-session.json" \
+PROBE_PERSISTENT_CLAUDE_SECRET="$PERSISTENT_CLAUDE_SECRET" \
+PROBE_PERSISTENT_CODEX_SECRET="$PERSISTENT_CODEX_SECRET" \
+PROBE_PERSISTENT_OT_SECRET="$PERSISTENT_OT_SECRET" \
 PROBE_CURRENT_ACTION_DIR="$ACTION_ROOT/attempt-current/action-current" \
 PROBE_BACKGROUND_PID="$BACKGROUND_PID" \
 /opt/openthrottle/runner/execute-loop.mjs --request "$REQUEST" --output "$RESULT"
@@ -309,6 +339,7 @@ test "$(cat /tmp/ot-probe-restored-head)" = "$BASE"
 PATH="$BIN:$PATH" \
 OT_LOOP_ACTION_ROOT="$ACTION_ROOT" \
 OT_WORKTREE_ROOT="$WORKTREES" \
+OT_INTEGRATION_REPO_DIR="$INTEGRATION" \
 PROBE_INTEGRATION="$INTEGRATION" \
 PROBE_BASE="$BASE" \
 PROBE_READONLY_ACTION_DIR="$ACTION_ROOT/attempt-current/action-lead" \
@@ -329,6 +360,7 @@ NODE
 PATH="$BIN:$PATH" \
 OT_LOOP_ACTION_ROOT="$ACTION_ROOT" \
 OT_WORKTREE_ROOT="$WORKTREES" \
+OT_INTEGRATION_REPO_DIR="$INTEGRATION" \
 PROBE_BUILTIN_ACTION_DIR="$ACTION_ROOT/attempt-current/action-builtin" \
 PROBE_PRIOR_HOME_SECRET="$ACTION_ROOT/attempt-prior/action-home/home/native-session.json" \
 /opt/openthrottle/runner/execute-loop.mjs --request "$BUILTIN_REQUEST" --output "$BUILTIN_RESULT"
@@ -363,6 +395,11 @@ test "$CANDIDATE" != "null"
 jq -e --arg candidate "$CANDIDATE" '.candidate_commit == $candidate and .integrated == true' /tmp/ot-probe-integration.json >/dev/null
 INTEGRATED_HEAD="$(git -c "safe.directory=$INTEGRATION" -C "$INTEGRATION" rev-parse HEAD)"
 test "$INTEGRATED_HEAD" = "$CANDIDATE"
+gosu agent sh -c "printf 'agent post-integrate write\n' > '$INTEGRATION/agent-after-integrate.txt'"
+gosu agent test -x "$INTEGRATION/executable-probe.sh"
+gosu agent git -C "$INTEGRATION" status --porcelain=v1 --untracked-files=all >/tmp/ot-probe-post-integrate-status
+grep -q 'agent-after-integrate.txt' /tmp/ot-probe-post-integrate-status
+rm -f "$INTEGRATION/agent-after-integrate.txt"
 /opt/openthrottle/runner/worktrees.mjs create --repo "$INTEGRATION" --root "$WORKTREES" --handle after-loop --base "$INTEGRATED_HEAD" >/dev/null
 
 echo "sandbox linked-worktree ownership isolation probe passed"

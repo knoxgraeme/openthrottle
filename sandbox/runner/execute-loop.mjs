@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import { chmodSync, chownSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { canonicalJson } from "./capabilities.mjs";
@@ -10,7 +10,7 @@ import { computeWorkspaceTreeOid } from "./repository-control.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
 import { runWithAgentProcessFence } from "./agent-process-fence.mjs";
 import { grantWorktreeToAgent, lockWorktree, worktreePath } from "./worktrees.mjs";
-import { chmodTree, chownTree, identityForUser, isRoot, pathInside as containedPath, prepareAgentOwnedDirectory } from "./filesystem-isolation.mjs";
+import { chmodOwnerPrivateTree, chmodTree, chownTree, identityForUser, isRoot, pathInside as containedPath, prepareAgentOwnedDirectory } from "./filesystem-isolation.mjs";
 import { materializeClaudeProfileBaseline, materializeCodexProfileBaseline } from "./action-home-baseline.mjs";
 import { writeJsonAtomic } from "./atomic-write.mjs";
 import {
@@ -45,6 +45,7 @@ const SKILLS = new Set([
 const CONTEXTS = new Set(["fresh", "resume_required", "prefer_resume"]);
 const DEFAULT_ACTION_ROOT = "/var/lib/openthrottle/loop-actions";
 const DEFAULT_WORKTREE_ROOT = "/var/lib/openthrottle/worktrees";
+const DEFAULT_NATIVE_SESSION_SOURCE_ROOT = "/home/agent/.ot/native-sessions";
 const INTEGRATION_REPO_DIR = "/home/agent/repo";
 const ROOT_UID = 0;
 const ROOT_GID = 0;
@@ -73,6 +74,11 @@ const UNSAFE_ACTION_ROOTS = new Set([
   "/var/lib",
   "/var/lib/openthrottle",
 ]);
+const PERSISTENT_AGENT_PRIVATE_ROOTS = [
+  "/home/agent/.claude",
+  "/home/agent/.codex",
+  "/home/agent/.ot",
+];
 
 function record(value, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
@@ -119,6 +125,20 @@ function configuredActionRoot(env = process.env) {
     if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error("loop action root must be a real directory");
   }
   return resolved;
+}
+
+function configuredIntegrationRepoDir(env = process.env) {
+  const repoDir = env.OT_INTEGRATION_REPO_DIR ?? INTEGRATION_REPO_DIR;
+  if (typeof repoDir !== "string" || !ABSOLUTE_PATH.test(repoDir)) throw new Error("integration repository path is invalid");
+  const resolved = resolve(repoDir);
+  if (!existsSync(resolved) || !lstatSync(resolved).isDirectory()) throw new Error("integration repository path must be a real directory");
+  return resolved;
+}
+
+function configuredNativeSessionSourceRoot(env = process.env) {
+  const root = env.OT_NATIVE_SESSION_SOURCE_ROOT ?? DEFAULT_NATIVE_SESSION_SOURCE_ROOT;
+  if (typeof root !== "string" || !ABSOLUTE_PATH.test(root)) throw new Error("native session source root is invalid");
+  return resolve(root);
 }
 
 function actionDirectory(request, rootDir = configuredActionRoot()) {
@@ -294,19 +314,78 @@ function prepareRootReadOnlyDirectory(path) {
   chmodTree(path, { fileMode: 0o444, directoryMode: 0o555 });
 }
 
+function copyTrustedTree(source, destination) {
+  const metadata = lstatSync(source);
+  if (metadata.isSymbolicLink()) throw new Error("native session package cannot contain symlinks");
+  if (metadata.isDirectory()) {
+    mkdirSync(destination, { recursive: true, mode: 0o700 });
+    for (const entry of readdirSync(source)) {
+      copyTrustedTree(resolve(source, entry), resolve(destination, entry));
+    }
+    return;
+  }
+  if (!metadata.isFile()) throw new Error("native session package can contain only regular files");
+  mkdirSync(resolve(destination, ".."), { recursive: true, mode: 0o700 });
+  copyFileSync(source, destination);
+}
+
+function materializeNativeSessionState({ request, profileRoot }) {
+  if (!request.nativeSessionId || request.contextPolicy === "fresh") return null;
+  const sourceRoot = configuredNativeSessionSourceRoot();
+  const agentRoot = pathInside(sourceRoot, request.agent);
+  const source = pathInside(agentRoot, request.nativeSessionId);
+  if (!existsSync(source) || !lstatSync(source).isDirectory()) {
+    throw new Error("authorized native session state is unavailable");
+  }
+  copyTrustedTree(source, profileRoot);
+  prepareAgentOwnedDirectory(profileRoot);
+  return source;
+}
+
+function lockPersistentAgentPrivateRoots(paths = PERSISTENT_AGENT_PRIVATE_ROOTS) {
+  if (!isRoot()) return [];
+  const locked = [];
+  for (const path of paths) {
+    if (!existsSync(path)) continue;
+    lockPrivateTree(path);
+    locked.push(path);
+  }
+  return locked;
+}
+
+export function restorePersistentAgentPrivateRoots(paths = PERSISTENT_AGENT_PRIVATE_ROOTS) {
+  if (!isRoot()) return [];
+  const identity = identityForUser("agent");
+  if (!identity) return [];
+  const restored = [];
+  for (const path of paths) {
+    if (!existsSync(path)) continue;
+    chownTree(path, identity.uid, identity.gid);
+    chmodTree(path, { fileMode: 0o600, directoryMode: 0o700 });
+    restored.push(path);
+  }
+  return restored;
+}
+
 function prepareActionHomeEnvironment(request) {
   const currentActionDirectory = actionDirectory(request);
   const home = pathInside(currentActionDirectory, "home");
   prepareAgentOwnedDirectory(home);
   const env = [`HOME=${home}`];
   if (request.agent === "claude") {
-    materializeClaudeProfileBaseline({ destinationHome: pathInside(home, ".claude") });
+    const profileRoot = pathInside(home, ".claude");
+    materializeClaudeProfileBaseline({ destinationHome: profileRoot });
+    materializeNativeSessionState({ request, profileRoot });
   }
   if (request.agent === "codex") {
     const codexHome = pathInside(currentActionDirectory, "codex");
     prepareAgentOwnedDirectory(codexHome);
     materializeCodexProfileBaseline({ destinationHome: codexHome });
+    materializeNativeSessionState({ request, profileRoot: codexHome });
     env.push(`CODEX_HOME=${codexHome}`);
+  }
+  if (request.agent === "opencode") {
+    materializeNativeSessionState({ request, profileRoot: home });
   }
   return env;
 }
@@ -499,7 +578,7 @@ function lockIntegrationCheckout(path = INTEGRATION_REPO_DIR) {
       continue;
     }
     chownTree(child, ROOT_UID, ROOT_GID);
-    chmodTree(child, { fileMode: 0o600, directoryMode: 0o700 });
+    chmodOwnerPrivateTree(child);
   }
   return true;
 }
@@ -509,7 +588,7 @@ export function restoreIntegrationCheckout(path = INTEGRATION_REPO_DIR) {
   const identity = identityForUser("agent");
   if (!identity) return false;
   chownTree(path, identity.uid, identity.gid);
-  chmodTree(path, { fileMode: 0o600, directoryMode: 0o700 });
+  chmodOwnerPrivateTree(path);
   return true;
 }
 
@@ -555,11 +634,15 @@ export function runLoopAgentInPreparedRepository({
   processFence = runWithAgentProcessFence,
   integrationRepoDir = INTEGRATION_REPO_DIR,
   lockIntegration = lockIntegrationCheckout,
+  lockPersistentProfiles = lockPersistentAgentPrivateRoots,
+  restorePersistentProfiles = restorePersistentAgentPrivateRoots,
 }) {
   const repoDir = prepareLoopRepository(request, integrationRepoDir);
   const preparedEnvironment = prepareLoopAgentEnvironment(request, repoDir);
   const built = loopAgentCommand({ request, invocation, repoDir, repositorySkillRoot: preparedEnvironment.repositorySkillRoot });
+  let lockedPersistentProfiles = [];
   lockIntegration(integrationRepoDir);
+  lockedPersistentProfiles = lockPersistentProfiles();
   makeCurrentActionDirectoryTraverseOnly(request);
   try {
     const result = processFence(() => runProcess("gosu", [
@@ -572,11 +655,16 @@ export function runLoopAgentInPreparedRepository({
     return { ...result, gitObjectEnv: preparedEnvironment.gitObjectEnv, integrationRepoDir };
   } finally {
     lockIntegration(integrationRepoDir);
+    restorePersistentProfiles(lockedPersistentProfiles);
   }
 }
 
-function defaultRunLoopAgent({ request, invocation }) {
-  return runLoopAgentInPreparedRepository({ request, invocation });
+function defaultRunLoopAgent({ request, invocation, integrationRepoDir = configuredIntegrationRepoDir() }) {
+  return runLoopAgentInPreparedRepository({
+    request,
+    invocation,
+    integrationRepoDir,
+  });
 }
 
 function receiptCandidatesFromJson(value) {
@@ -640,15 +728,24 @@ export function executeLoopAction({
   now = () => new Date().toISOString(),
 }) {
   const request = validateLoopRequest(rawRequest);
+  const integrationRepoDir = configuredIntegrationRepoDir();
   const cleanupErrors = [];
   let result;
   let execution;
   try {
     const invocation = resolveLoopInvocation(request);
     try {
-      execution = runLoopAgent({ request, invocation });
+      execution = runLoopAgent({ request, invocation, integrationRepoDir });
     } catch (error) {
-      execution = { status: null, signal: null, timedOut: false, stdout: "", stderr: String(error), nativeSessionId: request.nativeSessionId };
+      execution = {
+        status: null,
+        signal: null,
+        timedOut: false,
+        stdout: "",
+        stderr: String(error),
+        nativeSessionId: request.nativeSessionId,
+        integrationRepoDir,
+      };
     }
     const worktreeDir = loopWorktreeDirectory(request);
     let subject = null;
@@ -690,7 +787,7 @@ export function executeLoopAction({
     const cleanups = [
       () => lockWorkerWorktree(request),
       () => lockActionDirectory(request),
-      () => restoreIntegration(execution?.integrationRepoDir ?? INTEGRATION_REPO_DIR),
+      () => restoreIntegration(execution?.integrationRepoDir ?? integrationRepoDir),
     ];
     for (const cleanup of cleanups) {
       try {

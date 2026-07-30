@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -28,6 +28,9 @@ describe("unit integration", () => {
     const repoDir = repository();
     const expectedHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
     writeFileSync(join(repoDir, "file.txt"), "changed\n");
+    writeFileSync(join(repoDir, "candidate-executable.sh"), "#!/bin/sh\n");
+    chmodSync(join(repoDir, "candidate-executable.sh"), 0o755);
+    execFileSync("git", ["add", "."], { cwd: repoDir });
     execFileSync("git", ["commit", "-am", "candidate"], { cwd: repoDir });
     const candidateCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
     execFileSync("git", ["reset", "--hard", expectedHead], { cwd: repoDir });
@@ -36,6 +39,7 @@ describe("unit integration", () => {
 
     expect(result).toMatchObject({ integrated: true, reason: "fast_forwarded", integrated_head: candidateCommit });
     expect(execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim()).toBe(candidateCommit);
+    expect(statSync(join(repoDir, "candidate-executable.sh")).mode & 0o111).not.toBe(0);
   });
 
   it("recognizes exact-tree replay without integrating twice", () => {
