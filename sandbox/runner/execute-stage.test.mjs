@@ -963,6 +963,7 @@ printf '{"type":"system","subtype":"init","session_id":"smoke-claude-session","m
     installFakeGosu(binDir);
     writeExecutable(join(binDir, "claude"), `#!/usr/bin/env bash
 set -euo pipefail
+rm -rf "$HOME/.claude/projects"
 mkdir -p "$HOME/.claude/projects"
 printf '{"type":"system","subtype":"init","session_id":"unrelated-claude-session","model":"stub"}\\n' > "$HOME/.claude/projects/unrelated-claude-session.jsonl"
 cat > "$OT_STAGE_PROPOSAL_FILE" <<'JSON'
