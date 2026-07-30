@@ -113,10 +113,15 @@ describe("plan validation", () => {
     writeFileSync(planPath, `${cePlan}\n## Execution Plan\n\n${executionPlanBlock("structured")}\n`);
     const previousOpenAiKey = process.env.OPENAI_API_KEY;
     process.env.OPENAI_API_KEY = "test-key";
-    const calls: Array<{ agent: string; prompt: string }> = [];
+    const calls: Array<{ agent: string; prompt: string; directory: string; targetFile?: string }> = [];
     const runner: PrepareRunner = (input) => {
-      calls.push({ agent: input.agent, prompt: input.prompt });
-      writeFileSync(planPath, planWithBlock("structured"));
+      calls.push({
+        agent: input.agent,
+        prompt: input.prompt,
+        directory: input.directory,
+        targetFile: input.targetFile,
+      });
+      writeFileSync(input.targetFile!, planWithBlock("structured"));
       return { status: 0, signal: null, output: [], pid: 123, stdout: Buffer.from(""), stderr: Buffer.from("") };
     };
     try {
@@ -128,7 +133,9 @@ describe("plan validation", () => {
       expect(calls[0]!.prompt).toContain("name: prepare-execution-plan");
       expect(calls[0]!.prompt).toContain("Execution Plan Reference");
       expect(calls[0]!.prompt).toContain("Dependencies may reference only known units");
-      expect(calls[0]!.prompt).toContain(`Target plan file: ${planPath}`);
+      expect(calls[0]!.targetFile).not.toBe(planPath);
+      expect(calls[0]!.directory).not.toBe(directory);
+      expect(calls[0]!.prompt).toContain(`Target plan file: ${calls[0]!.targetFile}`);
     } finally {
       if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
       else process.env.OPENAI_API_KEY = previousOpenAiKey;
@@ -181,8 +188,8 @@ describe("plan validation", () => {
     delete process.env.OPENAI_API_KEY;
     delete process.env.CODEX_AUTH_JSON;
     process.env.CODEX_HOME = codexHome;
-    const runner: PrepareRunner = () => {
-      writeFileSync(planPath, planWithBlock("structured"));
+    const runner: PrepareRunner = (input) => {
+      writeFileSync(input.targetFile!, planWithBlock("structured"));
       return { status: 0, signal: null, output: [], pid: 123, stdout: Buffer.from(""), stderr: Buffer.from("") };
     };
     try {
@@ -216,8 +223,8 @@ describe("plan validation", () => {
     writeFileSync(planPath, cePlan);
     const previousOpenAiKey = process.env.OPENAI_API_KEY;
     process.env.OPENAI_API_KEY = "test-key";
-    const runner: PrepareRunner = () => {
-      writeFileSync(planPath, planWithBlock("structured"));
+    const runner: PrepareRunner = (input) => {
+      writeFileSync(input.targetFile!, planWithBlock("structured"));
       return {
         status: 1,
         signal: null,
@@ -246,8 +253,8 @@ describe("plan validation", () => {
     writeFileSync(planPath, original);
     const previousOpenAiKey = process.env.OPENAI_API_KEY;
     process.env.OPENAI_API_KEY = "test-key";
-    const runner: PrepareRunner = () => {
-      writeFileSync(planPath, `# Rewritten requirements\n\n${executionPlanBlock("structured")}\n`);
+    const runner: PrepareRunner = (input) => {
+      writeFileSync(input.targetFile!, `# Rewritten requirements\n\n${executionPlanBlock("structured")}\n`);
       return { status: 0, signal: null, output: [], pid: 123, stdout: Buffer.from(""), stderr: Buffer.from("") };
     };
     try {
@@ -413,6 +420,7 @@ describe("plan validation", () => {
       [
         "#!/usr/bin/env node",
         "const fs = require('node:fs');",
+        "const path = require('node:path');",
         "if (process.env.CODEX_AUTH_JSON) process.exit(6);",
         "if (process.env.LINEAR_API_KEY || process.env.DAYTONA_API_KEY || process.env.OT_STATUS_TOKEN) process.exit(8);",
         "const args = process.argv.slice(2);",
@@ -420,7 +428,7 @@ describe("plan validation", () => {
         "if (sandboxIndex < 0 || args[sandboxIndex + 1] !== 'workspace-write') process.exit(7);",
         "process.stdin.resume();",
         "process.stdin.on('end', () => {",
-        `  fs.writeFileSync(${JSON.stringify(planPath)}, ${JSON.stringify(preparedPlan)});`,
+        `  fs.writeFileSync(path.join(process.cwd(), ${JSON.stringify("plan.md")}), ${JSON.stringify(preparedPlan)});`,
         "  process.stdout.write('x'.repeat(2 * 1024 * 1024));",
         "});",
       ].join("\n")
