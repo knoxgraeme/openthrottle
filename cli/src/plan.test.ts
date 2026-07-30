@@ -133,6 +133,7 @@ describe("plan validation", () => {
       expect(calls[0]!.prompt).toContain("name: prepare-execution-plan");
       expect(calls[0]!.prompt).toContain("Execution Plan Reference");
       expect(calls[0]!.prompt).toContain("Dependencies may reference only known units");
+      expect(calls[0]!.prompt).toContain(cePlan);
       expect(calls[0]!.targetFile).not.toBe(planPath);
       expect(calls[0]!.directory).not.toBe(directory);
       expect(calls[0]!.prompt).toContain(`Target plan file: ${calls[0]!.targetFile}`);
@@ -291,7 +292,7 @@ describe("plan validation", () => {
       const permissionIndex = args.indexOf("--permission-mode");
       const toolsIndex = args.indexOf("--tools");
       expect(args.slice(permissionIndex, permissionIndex + 2)).toEqual(["--permission-mode", "acceptEdits"]);
-      expect(args.slice(toolsIndex, toolsIndex + 2)).toEqual(["--tools", "Read,Edit"]);
+      expect(args.slice(toolsIndex, toolsIndex + 2)).toEqual(["--tools", "Edit"]);
       expect(args).not.toContain("--dangerously-skip-permissions");
       expect(args).not.toContain("--allow-dangerously-skip-permissions");
     } finally {
@@ -350,7 +351,12 @@ describe("plan validation", () => {
       const codex = JSON.parse(readFileSync(join(directory, "codex-env.json"), "utf8")) as Record<string, string>;
       const claude = JSON.parse(readFileSync(join(directory, "claude-env.json"), "utf8")) as Record<string, string>;
       const opencode = JSON.parse(readFileSync(join(directory, "opencode-env.json"), "utf8")) as Record<string, string>;
-      expect(codex).toMatchObject({ OPENAI_API_KEY: "openai-auth", CODEX_HOME: join(directory, "codex-home") });
+      expect(codex.OPENAI_API_KEY).toBe("openai-auth");
+      expect(codex.CODEX_HOME).toMatch(/openthrottle-engine-home-/);
+      expect(codex.CODEX_HOME).not.toBe(join(directory, "codex-home"));
+      expect(codex.HOME).toMatch(/openthrottle-engine-home-/);
+      expect(claude.HOME).toMatch(/openthrottle-engine-home-/);
+      expect(opencode.HOME).toMatch(/openthrottle-engine-home-/);
       expect(claude).toMatchObject({ CLAUDE_CODE_OAUTH_TOKEN: "claude-auth" });
       expect(opencode).toMatchObject({ KIMI_CODE_API_KEY: "kimi-auth" });
       expect(opencode.OPENCODE_CONFIG_DIR).toMatch(/openthrottle-opencode-/);
@@ -359,7 +365,7 @@ describe("plan validation", () => {
       expect(openCodeConfig).toMatchObject({
         autoupdate: false,
         share: "disabled",
-        permission: { edit: "allow", bash: "deny", webfetch: "deny" },
+        permission: { "*": "deny", edit: "allow" },
         provider: {
           "kimi-code": {
             options: {
@@ -426,6 +432,11 @@ describe("plan validation", () => {
         "const args = process.argv.slice(2);",
         "const sandboxIndex = args.indexOf('--sandbox');",
         "if (sandboxIndex < 0 || args[sandboxIndex + 1] !== 'workspace-write') process.exit(7);",
+        "for (const feature of ['shell_tool', 'unified_exec', 'shell_snapshot']) {",
+        "  const index = args.indexOf(feature);",
+        "  if (index < 1 || args[index - 1] !== '--disable') process.exit(9);",
+        "}",
+        "if (!args.includes('--ignore-user-config') || !args.includes('--ignore-rules') || !args.includes('--ephemeral')) process.exit(10);",
         "process.stdin.resume();",
         "process.stdin.on('end', () => {",
         `  fs.writeFileSync(path.join(process.cwd(), ${JSON.stringify("plan.md")}), ${JSON.stringify(preparedPlan)});`,
