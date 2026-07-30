@@ -45,6 +45,19 @@ export function createUnitEffectProcessor(input: {
           });
           return action;
         }
+        if (
+          (action.status === "dispatched" || action.status === "running") &&
+          action.lease_until != null &&
+          action.lease_until <= nowIso
+        ) {
+          input.store.healExpiredCurrentChildAction({
+            parentAttemptId,
+            actionId: action.id,
+            nowIso,
+            reason: "child action missed heartbeat fence",
+          });
+          return action;
+        }
       }
       const shouldDispatch = action.status === "leased" || requestlessDispatch;
       if (!shouldDispatch) return action;

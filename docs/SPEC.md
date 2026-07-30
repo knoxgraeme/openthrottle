@@ -411,16 +411,25 @@ parent pipeline attempt/run to an immutable execution graph and plan digest;
 `execution_units` stores the immutable unit projection, dependency list,
 authored order, active work pointer, accepted/integration subjects, and reserved
 terminal level/alarm fields; and `execution_work_attempts` stores each child
-action attempt with parent attempt/run fences, unit id, action kind, idempotency
-key, runtime request/session hashes, lease owner/window, payload, result hash,
-output subject, and terminal/error state. The child reducer may lease at most
-one active child action per parent attempt. It expires only pre-dispatch claims
-by lease time. Dispatched or running child actions remain the active action while
+action attempt with parent instance/attempt/run/unit fences, unit id, action
+kind, idempotency key, runtime request/session hashes, lease owner/window,
+payload, result hash, output subject, and terminal/error state. Composite
+foreign keys bind every unit, action, receipt, and downstream context record to
+the same execution graph and parent attempt so cross-instance or mixed-attempt
+child identities are rejected durably. The child reducer may lease at most one
+active child action per parent attempt. It expires only pre-dispatch claims by
+lease time. Dispatched or running child actions remain the active action while
 their parent-run-fenced child liveness is fresh, and are recovered/collected by
 idempotency rather than duplicated. When a dispatched or running child action
-misses its heartbeat fence, the supervisor marks the work attempt dead, levels
-the unit to `exited` with `alarm = 0`, clears the active action pointer, and
-allows serial dispatch to continue with the next ready unit. A stopped child
+misses its heartbeat fence, the supervisor first identifies that exact expired
+current action and invokes idempotent runtime result collection outside the
+SQLite transaction. A recovered result completes only through a compare-and-set
+against the unit's current active action pointer. Only confirmed no-result
+collection may then mark the work attempt dead, level the unit to `exited` with
+`alarm = 0`, clear the active action pointer through a separate compare-and-set,
+and allow serial dispatch to continue with the next ready unit. Collection
+errors do not prove absence; they retain the active action for bounded retry. A
+stopped child
 graph records `stopped_at` and `stop_reason` on `execution_graphs`, levels
 unfinished units to `exited`, and makes leasing fail closed while that stop fence
 is present, including when stop was requested before any child action was active.

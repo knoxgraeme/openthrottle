@@ -95,6 +95,159 @@ describe("execution unit store", () => {
     })).toThrow(/replay unit set mismatch/);
   });
 
+  it("rejects cross-instance and mixed-attempt child identity inserts", () => {
+    const store = setup();
+    const graph = store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+    });
+    db!.exec(`
+      INSERT INTO tickets (
+        linear_issue_id, linear_issue_identifier, linear_session_id, branch, agent,
+        repo, base_branch, created_at, updated_at
+      ) VALUES ('issue-2', 'OPE-2', 'session-2', 'ot/ope-2', 'codex', 'owner/repo', 'main', '${timestamp}', '${timestamp}');
+      INSERT INTO agent_sessions (
+        id, linear_issue_id, generation, state, created_at, updated_at
+      ) VALUES ('session-2', 'issue-2', 1, 'current', '${timestamp}', '${timestamp}');
+      INSERT INTO runs (
+        id, linear_issue_id, linear_session_id, session_generation, task_type,
+        token_hash, status, started_at, expires_at
+      ) VALUES (
+        'run-other', 'issue-2', 'session-2', 1, 'implement', 'request-hash',
+        'running', '${timestamp}', '2026-07-29T01:00:00.000Z'
+      );
+      INSERT INTO pipeline_instances (
+        id, linear_issue_id, linear_session_id, generation, pipeline_id, pipeline_version,
+        manifest_digest, normalized_manifest, repository, base_commit, branch,
+        repository_config_snapshot_id, repository_config_digest, runtime_release, capability_digest,
+        executor_protocol, authorized_capabilities, status, active_stage_id, state_version,
+        attempt_count, created_at, updated_at
+      ) VALUES (
+        'instance-2', 'issue-2', 'session-2', 1, 'structured', 1, '${"e".repeat(64)}',
+        '{}', 'owner/repo', '${"a".repeat(40)}', 'ot/ope-2', 'config-1', '${"c".repeat(64)}',
+        'runtime/v1', '${"d".repeat(64)}', 'stage-executor@1', '[]', 'running',
+        'units', 1, 1, '${timestamp}', '${timestamp}'
+      );
+      INSERT INTO pipeline_instance_stages (
+        pipeline_instance_id, stage_id, ordinal, status, attempt_count, created_at, updated_at
+      ) VALUES ('instance-2', 'units', 1, 'running', 1, '${timestamp}', '${timestamp}');
+      INSERT INTO pipeline_stage_attempts (
+        id, pipeline_instance_id, stage_id, attempt_ordinal, reentry_ordinal,
+        request_hash, idempotency_key, context_revision, native_context_policy,
+        planned_run_id, run_id, status, created_at, updated_at
+      ) VALUES (
+        'attempt-other', 'instance-2', 'units', 1, 0, '${"1".repeat(64)}',
+        'attempt-key-other', 0, 'none', 'run-other', 'run-other', 'running', '${timestamp}', '${timestamp}'
+      );
+    `);
+
+    expect(() => db!.prepare(`
+      INSERT INTO execution_units (
+        id, execution_graph_id, pipeline_instance_id, parent_attempt_id, unit_id,
+        authored_order, dependency_unit_ids, status, created_at, updated_at
+      ) VALUES (
+        'mixed-unit', ?, 'instance-2', 'attempt-other',
+        'a', 0, '[]', 'pending', ?, ?
+      )
+    `).run(graph.id, timestamp, timestamp)).toThrow(/FOREIGN KEY/);
+
+    const unit = db!.prepare("SELECT * FROM execution_units WHERE unit_id = 'a'")
+      .get() as { id: string; execution_graph_id: string };
+    expect(() => db!.prepare(`
+      INSERT INTO execution_work_attempts (
+        id, execution_graph_id, execution_unit_id, pipeline_instance_id, parent_attempt_id,
+        parent_run_id, unit_id, attempt_ordinal, action_kind, idempotency_key,
+        status, payload, created_at, updated_at
+      ) VALUES (
+        'mixed-work', ?, ?, 'instance-2', 'attempt-other',
+        'run-other', 'a', 1, 'implement', 'mixed-key',
+        'leased', '{}', ?, ?
+      )
+    `).run(unit.execution_graph_id, unit.id, timestamp, timestamp)).toThrow(/FOREIGN KEY/);
+  });
+
+  it("rejects active action pointers from sibling units and parent attempts", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b" }],
+    });
+    const first = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: timestamp,
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })!;
+    expect(db!.prepare(`
+      SELECT active_work_attempt_id FROM execution_units
+      WHERE parent_attempt_id = 'attempt-parent' AND unit_id = 'a'
+    `).get()).toEqual({ active_work_attempt_id: first.id });
+
+    db!.prepare(`
+      UPDATE execution_units
+      SET active_work_attempt_id = NULL
+      WHERE parent_attempt_id = 'attempt-parent' AND unit_id = 'a'
+    `).run();
+    expect(() => db!.prepare(`
+      UPDATE execution_units
+      SET active_work_attempt_id = ?
+      WHERE parent_attempt_id = 'attempt-parent' AND unit_id = 'b'
+    `).run(first.id)).toThrow(/FOREIGN KEY/);
+
+    db!.exec(`
+      INSERT INTO runs (
+        id, linear_issue_id, linear_session_id, session_generation, task_type,
+        token_hash, status, started_at, expires_at
+      ) VALUES (
+        'run-other', 'issue-1', 'session-1', 1, 'implement', 'request-hash-other',
+        'running', '${timestamp}', '2026-07-29T01:00:00.000Z'
+      );
+      INSERT INTO pipeline_stage_attempts (
+        id, pipeline_instance_id, stage_id, attempt_ordinal, reentry_ordinal,
+        request_hash, idempotency_key, context_revision, native_context_policy,
+        planned_run_id, run_id, status, created_at, updated_at
+      ) VALUES (
+        'attempt-other', 'instance-1', 'units', 2, 0, '${"1".repeat(64)}',
+        'attempt-key-other', 0, 'none', 'run-other', 'run-other', 'running', '${timestamp}', '${timestamp}'
+      );
+    `);
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-other",
+      parentStageId: "units",
+      parentRunId: "run-other",
+      graphDigest: "graph-digest-other",
+      planDigest: "plan-digest-other",
+      units: [{ id: "a" }],
+    });
+    const other = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-other",
+      leaseOwner: "worker-2",
+      nowIso: timestamp,
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })!;
+    db!.prepare(`
+      UPDATE execution_units
+      SET active_work_attempt_id = NULL
+      WHERE parent_attempt_id = 'attempt-other' AND unit_id = 'a'
+    `).run();
+    expect(() => db!.prepare(`
+      UPDATE execution_units
+      SET active_work_attempt_id = ?
+      WHERE parent_attempt_id = 'attempt-parent' AND unit_id = 'a'
+    `).run(other.id)).toThrow(/FOREIGN KEY/);
+  });
+
   it("leases exactly one active child action and resumes after completion", () => {
     const store = setup();
     store.createGraph({
@@ -174,7 +327,7 @@ describe("execution unit store", () => {
     ]);
   });
 
-  it("heals an expired dispatched action instead of duplicating work", () => {
+  it("returns an expired dispatched action for reconciliation instead of healing in the lease transaction", () => {
     const store = setup();
     store.createGraph({
       pipelineInstanceId: "instance-1",
@@ -201,28 +354,28 @@ describe("execution unit store", () => {
       leaseUntilIso: "2026-07-29T00:01:00.000Z",
     });
 
-    expect(next?.id).not.toBe(first.id);
-    expect(next?.unit_id).toBe("b");
+    expect(next?.id).toBe(first.id);
+    expect(next?.unit_id).toBe("a");
     expect(db!.prepare(`
       SELECT status, completed_at, last_error FROM execution_work_attempts WHERE id = ?
     `).get(first.id)).toEqual({
-      status: "dead",
-      completed_at: "2026-07-29T00:00:02.000Z",
-      last_error: "child action missed heartbeat fence",
+      status: "dispatched",
+      completed_at: null,
+      last_error: null,
     });
     expect(store.listUnits("attempt-parent")).toEqual([
       expect.objectContaining({
         unitId: "a",
-        status: "exited",
-        activeActionId: null,
-        terminalLevel: "exited",
+        status: "running",
+        activeActionId: first.id,
+        terminalLevel: null,
         alarm: false,
       }),
-      expect.objectContaining({ unitId: "b", status: "running", activeActionId: next!.id }),
+      expect.objectContaining({ unitId: "b", status: "pending", activeActionId: null }),
     ]);
   });
 
-  it("heals stale dispatched child actions to exited and releases serial dispatch", () => {
+  it("heals the expired current dispatched child action after confirmed no-result collection", () => {
     const store = setup();
     store.createGraph({
       pipelineInstanceId: "instance-1",
@@ -242,12 +395,13 @@ describe("execution unit store", () => {
     })!;
     store.markActionDispatched(stale.id, "request-hash", "native-session");
 
-    const healed = store.healStaleChildActions({
+    const healed = store.healExpiredCurrentChildAction({
       parentAttemptId: "attempt-parent",
+      actionId: stale.id,
       nowIso: "2026-07-29T00:00:02.000Z",
       reason: "child action missed heartbeat fence",
     });
-    expect(healed).toEqual([{ actionId: stale.id, unitId: "a" }]);
+    expect(healed).toBe("healed");
     expect(db!.prepare(`
       SELECT status, completed_at, last_error FROM execution_work_attempts WHERE id = ?
     `).get(stale.id)).toEqual({
@@ -275,7 +429,99 @@ describe("execution unit store", () => {
     expect(next?.unit_id).toBe("b");
   });
 
-  it("heals stale running child actions to exited and releases serial dispatch", () => {
+  it("completes a recovered result through the current action pointer before any heal", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b" }],
+    });
+
+    const expired = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: "2026-07-29T00:00:00.000Z",
+      leaseUntilIso: "2026-07-29T00:00:01.000Z",
+    })!;
+    store.markActionDispatched(expired.id, "request-hash", "native-session");
+
+    expect(store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-2",
+      nowIso: "2026-07-29T00:00:02.000Z",
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })?.id).toBe(expired.id);
+
+    store.completeUnitAction({
+      actionId: expired.id,
+      resultHash: "result-hash",
+      outputSubject: "1".repeat(40),
+    });
+    expect(store.healExpiredCurrentChildAction({
+      parentAttemptId: "attempt-parent",
+      actionId: expired.id,
+      nowIso: "2026-07-29T00:00:02.000Z",
+      reason: "child action missed heartbeat fence",
+    })).toBe("not_current");
+    expect(store.listUnits("attempt-parent")).toEqual([
+      expect.objectContaining({
+        unitId: "a",
+        status: "integrated",
+        activeActionId: null,
+        integrationSubject: "1".repeat(40),
+        terminalLevel: null,
+      }),
+      expect.objectContaining({ unitId: "b", status: "pending", activeActionId: null }),
+    ]);
+  });
+
+  it("rejects a late recovered result after the current action was healed", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b" }],
+    });
+
+    const expired = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: "2026-07-29T00:00:00.000Z",
+      leaseUntilIso: "2026-07-29T00:00:01.000Z",
+    })!;
+    store.markActionDispatched(expired.id, "request-hash", "native-session");
+
+    expect(store.healExpiredCurrentChildAction({
+      parentAttemptId: "attempt-parent",
+      actionId: expired.id,
+      nowIso: "2026-07-29T00:00:02.000Z",
+      reason: "child action missed heartbeat fence",
+    })).toBe("healed");
+    expect(() => store.completeUnitAction({
+      actionId: expired.id,
+      resultHash: "result-hash",
+      outputSubject: "1".repeat(40),
+    })).toThrow(/not active/);
+    expect(store.listUnits("attempt-parent")).toEqual([
+      expect.objectContaining({
+        unitId: "a",
+        status: "exited",
+        activeActionId: null,
+        terminalLevel: "exited",
+      }),
+      expect.objectContaining({ unitId: "b", status: "pending", activeActionId: null }),
+    ]);
+  });
+
+  it("heals the expired current running child action after confirmed no-result collection", () => {
     const store = setup();
     store.createGraph({
       pipelineInstanceId: "instance-1",
@@ -296,11 +542,12 @@ describe("execution unit store", () => {
     store.markActionDispatched(stale.id, "request-hash", "native-session");
     db!.prepare("UPDATE execution_work_attempts SET status = 'running' WHERE id = ?").run(stale.id);
 
-    expect(store.healStaleChildActions({
+    expect(store.healExpiredCurrentChildAction({
       parentAttemptId: "attempt-parent",
+      actionId: stale.id,
       nowIso: "2026-07-29T00:00:02.000Z",
       reason: "child action missed heartbeat fence",
-    })).toEqual([{ actionId: stale.id, unitId: "a" }]);
+    })).toBe("healed");
     expect(db!.prepare(`
       SELECT status, completed_at, last_error FROM execution_work_attempts WHERE id = ?
     `).get(stale.id)).toEqual({
@@ -364,9 +611,10 @@ describe("execution unit store", () => {
       nowIso: "2026-07-29T00:01:01.000Z",
       leaseUntilIso: "2026-07-29T00:02:00.000Z",
     });
-    expect(next?.unit_id).toBe("b");
+    expect(next?.id).toBe(active.id);
+    expect(next?.unit_id).toBe("a");
     expect(db!.prepare("SELECT status FROM execution_work_attempts WHERE id = ?").get(active.id)).toEqual({
-      status: "dead",
+      status: "dispatched",
     });
   });
 
@@ -390,11 +638,12 @@ describe("execution unit store", () => {
     })!;
     store.markActionDispatched(stale.id, "request-hash", "native-session");
 
-    expect(store.healStaleChildActions({
+    expect(store.healExpiredCurrentChildAction({
       parentAttemptId: "attempt-parent",
+      actionId: stale.id,
       nowIso: "2026-07-29T00:00:02.000Z",
       reason: "child action missed heartbeat fence",
-    })).toEqual([{ actionId: stale.id, unitId: "a" }]);
+    })).toBe("healed");
     expect(store.listUnits("attempt-parent")).toEqual([
       expect.objectContaining({ unitId: "a", status: "exited", terminalLevel: "exited", alarm: false }),
       expect.objectContaining({ unitId: "b", status: "exited", terminalLevel: "exited", alarm: false }),
@@ -407,7 +656,7 @@ describe("execution unit store", () => {
     })).toBeUndefined();
   });
 
-  it("distinguishes slow alive child actions from frozen child actions", () => {
+  it("does not heal a slow alive current child action", () => {
     const store = setup();
     store.createGraph({
       pipelineInstanceId: "instance-1",
@@ -427,11 +676,12 @@ describe("execution unit store", () => {
     })!;
     store.markActionDispatched(active.id, "request-hash", "native-session");
 
-    expect(store.healStaleChildActions({
+    expect(store.healExpiredCurrentChildAction({
       parentAttemptId: "attempt-parent",
+      actionId: active.id,
       nowIso: "2026-07-29T00:00:30.000Z",
       reason: "child action missed heartbeat fence",
-    })).toEqual([]);
+    })).toBe("not_current");
     expect(store.listUnits("attempt-parent")).toEqual([
       expect.objectContaining({
         unitId: "a",

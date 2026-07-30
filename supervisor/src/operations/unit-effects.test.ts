@@ -30,15 +30,20 @@ function action(overrides: Partial<ExecutionWorkAttempt> = {}): ExecutionWorkAtt
   };
 }
 
+function storeFor(leased: ExecutionWorkAttempt): ExecutionUnitStore {
+  return {
+    leaseNextUnitAction: vi.fn(() => leased),
+    markActionDispatching: vi.fn(),
+    markActionDispatched: vi.fn(),
+    completeUnitAction: vi.fn(),
+    healExpiredCurrentChildAction: vi.fn(),
+  } as unknown as ExecutionUnitStore;
+}
+
 describe("unit effect processor", () => {
   it("dispatches one leased child action", async () => {
     const leased = action();
-    const store = {
-      leaseNextUnitAction: vi.fn(() => leased),
-      markActionDispatching: vi.fn(),
-      markActionDispatched: vi.fn(),
-      completeUnitAction: vi.fn(),
-    } as unknown as ExecutionUnitStore;
+    const store = storeFor(leased);
     const runtime: UnitEffectRuntime = {
       collectUnitAction: vi.fn(async () => null),
       dispatchUnitAction: vi.fn(async () => ({ requestHash: "request-hash", nativeSessionId: "native-1" })),
@@ -62,12 +67,7 @@ describe("unit effect processor", () => {
 
   it("acknowledges recovered child actions without duplicate dispatch", async () => {
     const leased = action();
-    const store = {
-      leaseNextUnitAction: vi.fn(() => leased),
-      markActionDispatching: vi.fn(),
-      markActionDispatched: vi.fn(),
-      completeUnitAction: vi.fn(),
-    } as unknown as ExecutionUnitStore;
+    const store = storeFor(leased);
     const runtime: UnitEffectRuntime = {
       collectUnitAction: vi.fn(async () => ({ resultHash: "result-hash", outputSubject: "abc123" })),
       dispatchUnitAction: vi.fn(),
@@ -91,12 +91,7 @@ describe("unit effect processor", () => {
 
   it("collects an already-dispatched child action without duplicate dispatch", async () => {
     const leased = action({ status: "dispatched", request_hash: "request-hash", native_session_id: "native-1" });
-    const store = {
-      leaseNextUnitAction: vi.fn(() => leased),
-      markActionDispatching: vi.fn(),
-      markActionDispatched: vi.fn(),
-      completeUnitAction: vi.fn(),
-    } as unknown as ExecutionUnitStore;
+    const store = storeFor(leased);
     const runtime: UnitEffectRuntime = {
       collectUnitAction: vi.fn(async () => null),
       dispatchUnitAction: vi.fn(),
@@ -117,12 +112,7 @@ describe("unit effect processor", () => {
 
   it("reissues a request-less dispatched action with the same idempotency key", async () => {
     const leased = action({ status: "dispatched" });
-    const store = {
-      leaseNextUnitAction: vi.fn(() => leased),
-      markActionDispatching: vi.fn(),
-      markActionDispatched: vi.fn(),
-      completeUnitAction: vi.fn(),
-    } as unknown as ExecutionUnitStore;
+    const store = storeFor(leased);
     const runtime: UnitEffectRuntime = {
       collectUnitAction: vi.fn(async () => {
         throw new Error("missing runtime request");
@@ -141,5 +131,63 @@ describe("unit effect processor", () => {
     expect(runtime.collectUnitAction).not.toHaveBeenCalled();
     expect(runtime.dispatchUnitAction).toHaveBeenCalledWith(leased);
     expect(store.markActionDispatched).toHaveBeenCalledWith("action-1", "request-hash", "native-1");
+  });
+
+  it("heals an expired dispatched action only after collection confirms no result", async () => {
+    const expired = action({
+      status: "dispatched",
+      request_hash: "request-hash",
+      native_session_id: "native-1",
+      lease_until: "2026-07-28T23:59:59.000Z",
+    });
+    const store = storeFor(expired);
+    const runtime: UnitEffectRuntime = {
+      collectUnitAction: vi.fn(async () => null),
+      dispatchUnitAction: vi.fn(),
+    };
+
+    await createUnitEffectProcessor({
+      store,
+      runtime,
+      leaseOwner: "owner",
+      now: () => new Date("2026-07-29T00:00:00.000Z"),
+    }).drain("attempt-parent");
+
+    expect(runtime.collectUnitAction).toHaveBeenCalledWith(expired);
+    expect(store.healExpiredCurrentChildAction).toHaveBeenCalledWith({
+      parentAttemptId: "attempt-parent",
+      actionId: "action-1",
+      nowIso: "2026-07-29T00:00:00.000Z",
+      reason: "child action missed heartbeat fence",
+    });
+    expect(store.completeUnitAction).not.toHaveBeenCalled();
+    expect(runtime.dispatchUnitAction).not.toHaveBeenCalled();
+  });
+
+  it("retains an expired action when collection errors", async () => {
+    const expired = action({
+      status: "running",
+      request_hash: "request-hash",
+      native_session_id: "native-1",
+      lease_until: "2026-07-28T23:59:59.000Z",
+    });
+    const store = storeFor(expired);
+    const runtime: UnitEffectRuntime = {
+      collectUnitAction: vi.fn(async () => {
+        throw new Error("runtime unavailable");
+      }),
+      dispatchUnitAction: vi.fn(),
+    };
+
+    await expect(createUnitEffectProcessor({
+      store,
+      runtime,
+      leaseOwner: "owner",
+      now: () => new Date("2026-07-29T00:00:00.000Z"),
+    }).drain("attempt-parent")).rejects.toThrow(/runtime unavailable/);
+
+    expect(store.healExpiredCurrentChildAction).not.toHaveBeenCalled();
+    expect(store.completeUnitAction).not.toHaveBeenCalled();
+    expect(runtime.dispatchUnitAction).not.toHaveBeenCalled();
   });
 });
