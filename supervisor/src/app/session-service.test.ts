@@ -59,7 +59,13 @@ function config(): Config {
   };
 }
 
-function payload(sessionId = "session-1", issueId = "issue-1", identifier = "OT-1", promptContext?: string) {
+function payload(
+  sessionId = "session-1",
+  issueId = "issue-1",
+  identifier = "OT-1",
+  promptContext?: string,
+  labels: string[] = []
+) {
   return parseLinearWebhook(JSON.stringify({
     action: "created",
     type: "AgentSessionEvent",
@@ -72,7 +78,7 @@ function payload(sessionId = "session-1", issueId = "issue-1", identifier = "OT-
         id: issueId,
         identifier,
         team: { id: "team-1", key: "OT" },
-        labels: [],
+        labels: labels.map((name) => ({ name })),
       },
     },
     ...(promptContext === undefined ? {} : { promptContext }),
@@ -448,6 +454,30 @@ intents:
     expect(payloads.some((entry) => entry.includes(expectedMessage))).toBe(true);
   }
 
+  it("rejects graph selections on investigate tickets before provisioning", async () => {
+    const context = [
+      "# Investigate structured behavior",
+      "",
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "simple" }),
+      "```",
+    ].join("\n");
+    const { tickets } = await run(
+      repositoryConfigYaml("{ implement: implement, investigate: fixture-command }"),
+      { codexAuthJson: undefined, claudeCodeOauthToken: undefined, kimiCodeApiKey: undefined },
+      fixtureCatalogPath,
+      payload("session-1", "issue-1", "OT-1", context, ["investigate"])
+    );
+
+    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+      state: "error",
+      sandbox_id: null,
+      run_id: null,
+    });
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
+    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(payloads.some((entry) => entry.includes("graph selection is not supported for investigate tickets"))).toBe(true);
+  });
   it("admits a pinned custom command-only graph without an execution plan", async () => {
     const graphPath = ".openthrottle/graphs/docs.json";
     const graph = JSON.stringify({
