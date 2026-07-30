@@ -18,6 +18,7 @@ import {
   branchExists,
   getMergeReadiness,
   getRepositoryConfigAtCommit,
+  getRepositoryDirectoryAtCommit,
   getRepositoryFileAtCommit,
   mergePullRequest,
   parseGithubWebhook,
@@ -173,6 +174,8 @@ export function createServerWebhookDeliveryProcessor(deps: {
         getRepositoryConfigAtCommit({ token: deps.cfg.githubToken }, repository, branch),
       getRepositoryFileAtCommit: (repository: string, commit: string, path: string) =>
         getRepositoryFileAtCommit({ token: deps.cfg.githubToken }, repository, commit, path),
+      getRepositoryDirectoryAtCommit: (repository: string, commit: string, path: string) =>
+        getRepositoryDirectoryAtCommit({ token: deps.cfg.githubToken }, repository, commit, path),
     },
     merger: {
       parsePullRequestUrl,

@@ -2,7 +2,11 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { loadPipelineCatalog, resolvePipelineReference, type PipelineManifest, type PipelineStage } from "./manifest.js";
-import { parseAndCompileExecutionGraph, validateAndCompileExecutionGraph } from "./execution-graph.js";
+import {
+  REPOSITORY_SKILL_CAPABILITY,
+  parseAndCompileExecutionGraph,
+  validateAndCompileExecutionGraph,
+} from "./execution-graph.js";
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 
 const catalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
@@ -85,6 +89,22 @@ function minimalGraph(overrides: {
       transitions: { success: { terminal: "completed" } },
       ...overrides.node,
     }, ...(overrides.extraNodes ?? [])],
+  };
+}
+
+function repositorySkillPackage() {
+  return {
+    schema: "openthrottle.repository-skill-package/v1" as const,
+    reference: `repo://owner/repo@${"a".repeat(40)}#.agents/skills/implement-unit`,
+    invocation: "implement_unit",
+    directory: ".agents/skills/implement-unit",
+    commit: "a".repeat(40),
+    packageDigest: "d".repeat(64),
+    files: [{
+      path: ".agents/skills/implement-unit/SKILL.md",
+      blobSha: "b".repeat(40),
+      digest: "c".repeat(64),
+    }],
   };
 }
 
@@ -175,6 +195,53 @@ describe("execution graph compiler", () => {
       source: structuredGraphPath,
       runtime: buildInstalledRuntimeDescriptor("production-like/v1").descriptor,
     })).toThrow(/runtime capability mismatch: capability:graph\/for-each-unit@1/);
+  });
+
+  it("compiles repository skills to the platform repository-skill capability with pinned package identity", () => {
+    const runtime = buildInstalledRuntimeDescriptor("repository-skill-test/v1", {
+      capabilities: [
+        ...buildInstalledRuntimeDescriptor("base-test/v1").descriptor.capabilities,
+        REPOSITORY_SKILL_CAPABILITY,
+      ],
+    });
+    const pkg = repositorySkillPackage();
+    const compiled = validateAndCompileExecutionGraph(minimalGraph({
+      worker: {
+        skills: ["repo://implement_unit"],
+        credentials: ["model.invoke", "repo.read", "repo.write"],
+      },
+      loop: {
+        skill: "repo://implement_unit",
+      },
+    }), {
+      runtime: runtime.descriptor,
+      repositorySkills: new Map([["implement_unit", pkg]]),
+    }).manifest.manifest;
+
+    expect(compiled.requires.capabilities).toEqual([REPOSITORY_SKILL_CAPABILITY]);
+    expect(compiled.stages[0]).toMatchObject({
+      executor: { kind: "agent", capability: REPOSITORY_SKILL_CAPABILITY },
+      repositorySkill: pkg,
+      credentials: ["model.invoke", "repo.read", "repo.write"],
+    });
+  });
+
+  it("fails closed for unpinned repository skills and production runtimes without the repository-skill capability", () => {
+    const graph = minimalGraph({
+      worker: {
+        skills: ["repo://implement_unit"],
+        credentials: ["model.invoke", "repo.read"],
+      },
+      loop: {
+        skill: "repo://implement_unit",
+      },
+    });
+    expect(() => validateAndCompileExecutionGraph(graph))
+      .toThrow(/repository skill implement_unit was not pinned by admission/);
+    expect(() => validateAndCompileExecutionGraph(graph, {
+      runtime: buildInstalledRuntimeDescriptor("production-like/v1").descriptor,
+      repositorySkills: new Map([["implement_unit", repositorySkillPackage()]]),
+    })).toThrow(/runtime capability mismatch: capability:agent\/repository-skill@1/);
   });
 
   it.each([

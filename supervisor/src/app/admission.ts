@@ -3,9 +3,10 @@ import { fileURLToPath } from "node:url";
 import type { Config } from "./config.js";
 import type { SupervisorStore } from "../persistence/store.js";
 import type { Agent, TaskType } from "../pipeline/types.js";
-import { parseExecutionPlanContract } from "@openthrottle/contracts";
+import { canonicalJson, digestNormalized, parseExecutionPlanContract, parseGraphContract } from "@openthrottle/contracts";
 import type {
   LinearAgentSessionEvent,
+  RepositoryDirectorySnapshot,
   RepositoryFileSnapshot,
   RepositoryConfigSnapshot,
   ResolvedLinearLabel,
@@ -19,6 +20,7 @@ import {
   type ValidatedRepositoryConfig,
 } from "../pipeline/manifest.js";
 import { FOR_EACH_UNIT_CAPABILITY, parseAndCompileExecutionGraph } from "../pipeline/execution-graph.js";
+import type { RepositorySkillPackage } from "../pipeline/manifest.js";
 import type { PipelineStore } from "../pipeline/store.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import type { AdmissionPreflight } from "./admission-preflight.js";
@@ -30,6 +32,7 @@ const FENCE_PATTERN = /```([^\n`]*)\n([\s\S]*?)```/g;
 const BUILTIN_SIMPLE_GRAPH = fileURLToPath(new URL("../../graphs/simple-v1.json", import.meta.url));
 const BUILTIN_STRUCTURED_GRAPH = fileURLToPath(new URL("../../graphs/structured-v1.json", import.meta.url));
 const SIMPLE_IMPLEMENT_DESCRIPTION = "Staged CE implementation from a pre-approved plan with round-based repair budgeting, scoped repair re-entry, sealed repository gates, exact-tree publication, and bounded provider repair. The initial forward pass may simplify; repair passes re-run semantic review and command gates without re-running simplification.";
+const REPOSITORY_SKILL_PACKAGE_SCHEMA = "openthrottle.repository-skill-package/v1";
 
 function linearContext(
   payload: LinearAgentSessionEvent,
@@ -123,10 +126,58 @@ function extractRequestedGraph(context: string): {
   return { graphId: selected ?? planned, hasExecutionPlan: planned !== undefined };
 }
 
+function repositorySkillIds(rawGraph: string, source: string, config: ValidatedRepositoryConfig["config"]): string[] {
+  const graph = parseGraphContract(rawGraph, { source, config }).value;
+  return [...new Set(graph.loops.flatMap((loop) => (
+    loop.skill.startsWith("repo://") ? [loop.skill.slice("repo://".length)] : []
+  )))].sort();
+}
+
+async function resolveRepositorySkillPackages(input: {
+  rawGraph: string;
+  source: string;
+  repositoryConfig: ValidatedRepositoryConfig;
+  readPinnedDirectory: (path: string) => Promise<RepositoryDirectorySnapshot>;
+}): Promise<ReadonlyMap<string, RepositorySkillPackage>> {
+  const ids = repositorySkillIds(input.rawGraph, input.source, input.repositoryConfig.config);
+  const configured = new Map((input.repositoryConfig.config.skills ?? []).map((skill) => [skill.id, skill]));
+  const packages = new Map<string, RepositorySkillPackage>();
+  for (const id of ids) {
+    const declaration = configured.get(id);
+    if (!declaration) throw new Error(`graph skill repo://${id} is not declared in repository config skills`);
+    const snapshot = await input.readPinnedDirectory(declaration.path);
+    if (snapshot.directory !== declaration.path) {
+      throw new Error(`repository skill ${id} resolved to unexpected directory ${snapshot.directory}`);
+    }
+    if (!snapshot.files.some((file) => file.path === `${declaration.path}/SKILL.md`)) {
+      throw new Error(`repository skill ${id} package is missing SKILL.md`);
+    }
+    const files = snapshot.files.map((file) => ({
+      path: file.path,
+      blobSha: file.blobSha,
+      digest: digestNormalized(file.content),
+    }));
+    const unsigned = {
+      schema: REPOSITORY_SKILL_PACKAGE_SCHEMA as "openthrottle.repository-skill-package/v1",
+      reference: `repo://${snapshot.repository}@${snapshot.commit}#${declaration.path}`,
+      invocation: id,
+      directory: declaration.path,
+      commit: snapshot.commit,
+      files,
+    };
+    packages.set(id, {
+      ...unsigned,
+      packageDigest: digestNormalized(canonicalJson(unsigned)),
+    });
+  }
+  return packages;
+}
+
 async function resolvePipelineSelection(
   repositoryConfig: ValidatedRepositoryConfig,
   context: string,
   readPinnedFile: (path: string) => Promise<RepositoryFileSnapshot>,
+  readPinnedDirectory: (path: string) => Promise<RepositoryDirectorySnapshot>,
   runtime: PipelineCoordinatorContext["runtime"],
   catalog: ValidatedPipelineCatalog
 ): Promise<ValidatedPipelineManifest> {
@@ -160,9 +211,18 @@ async function resolvePipelineSelection(
   } else {
     throw new Error(`unknown built-in graph reference ${source.ref}`);
   }
+  const repositorySkills = source.kind === "repository"
+    ? await resolveRepositorySkillPackages({
+      rawGraph,
+      source: compileSource,
+      repositoryConfig,
+      readPinnedDirectory,
+    })
+    : undefined;
   const compileOptions = {
     source: compileSource,
     ...(source.kind === "repository" ? { config: repositoryConfig.config } : {}),
+    ...(repositorySkills === undefined ? {} : { repositorySkills }),
     ...(source.ref === "core/simple@1" ? {
       id: "core/implement",
       version: 4,
@@ -381,6 +441,12 @@ export async function handleCreated(
             remote.baseCommit,
             path
         ),
+        (path) =>
+          providers.repositoryReader.getRepositoryDirectoryAtCommit(
+            selectedRepository.repo,
+            remote.baseCommit,
+            path
+          ),
         coordinator.runtime,
         coordinator.catalog
       )

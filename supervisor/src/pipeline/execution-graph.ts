@@ -20,6 +20,7 @@ import {
   type PipelineManifest,
   type PipelineStage,
   type PipelineTransition,
+  type RepositorySkillPackage,
   type RuntimeCapabilityInventory,
   type StageOutcome,
   type ValidatedPipelineManifest,
@@ -33,6 +34,7 @@ export interface CompileExecutionGraphOptions {
   maxRepairRounds?: number;
   runtime?: RuntimeCapabilityInventory;
   config?: RepositoryConfigContract;
+  repositorySkills?: ReadonlyMap<string, RepositorySkillPackage>;
 }
 
 export interface CompiledExecutionGraph {
@@ -42,6 +44,7 @@ export interface CompiledExecutionGraph {
 }
 
 export const FOR_EACH_UNIT_CAPABILITY = "graph/for-each-unit@1";
+export const REPOSITORY_SKILL_CAPABILITY = "agent/repository-skill@1";
 
 interface ResolvedUnitLoop {
   loop: GraphLoop;
@@ -50,6 +53,7 @@ interface ResolvedUnitLoop {
 
 type StageTemplate = {
   executor: { kind: ExecutorKind; capability: string };
+  repositorySkill?: RepositorySkillPackage;
   evaluator: { kind: EvaluatorKind; assurance: AssuranceClass; required_artifacts: ArtifactKind[] };
   context: ContextPolicy;
   live_steering: boolean;
@@ -111,17 +115,37 @@ const CAPABILITY_CREDENTIALS: Record<string, {
     contexts: ["none"],
     artifacts: ["stage_result", "execution_graph_result"],
   },
+  [REPOSITORY_SKILL_CAPABILITY]: {
+    minimum: ["model.invoke", "repo.read"],
+    allowed: ["model.invoke", "provider.read", "repo.read", "repo.write", "mcp"],
+    contexts: ["fresh", "resume_required", "prefer_resume"],
+    artifacts: ["stage_result", "review"],
+  },
 };
 
 function fail(path: string, message: string): never {
   throw new Error(`${path}: ${message}`);
 }
 
-function capabilityFromBuiltinSkill(skill: string, path: string): string {
-  if (!skill.startsWith("builtin://")) {
-    fail(path, "repository skills cannot compile to runtime capabilities yet");
+function repoSkillId(skill: string): string | undefined {
+  return skill.startsWith("repo://") ? skill.slice("repo://".length) : undefined;
+}
+
+function capabilityFromSkill(
+  skill: string,
+  path: string,
+  repositorySkills?: ReadonlyMap<string, RepositorySkillPackage>
+): { capability: string; repositorySkill?: RepositorySkillPackage } {
+  if (skill.startsWith("builtin://")) {
+    return { capability: skill.slice("builtin://".length) };
   }
-  return skill.slice("builtin://".length);
+  const id = repoSkillId(skill);
+  if (!id) fail(path, "must be a builtin or repository skill reference");
+  const repositorySkill = repositorySkills?.get(id);
+  if (!repositorySkill) {
+    fail(path, `repository skill ${id} was not pinned by admission`);
+  }
+  return { capability: REPOSITORY_SKILL_CAPABILITY, repositorySkill };
 }
 
 function commandNameFromGraph(command: string, path: string): CommandName {
@@ -211,7 +235,11 @@ function compileTransitions(node: GraphNode): Record<StageOutcome, PipelineTrans
   return transitions as Record<StageOutcome, PipelineTransition>;
 }
 
-function loopTemplate(graph: GraphContract, node: GraphNode): StageTemplate {
+function loopTemplate(
+  graph: GraphContract,
+  node: GraphNode,
+  repositorySkills?: ReadonlyMap<string, RepositorySkillPackage>
+): StageTemplate {
   const loop = graph.loops.find((candidate) => candidate.id === node.loop);
   if (!loop) fail(`graph.nodes.${node.id}.loop`, "references an unknown loop");
   const worker = graph.workers.find((candidate) => candidate.id === loop.worker);
@@ -220,11 +248,16 @@ function loopTemplate(graph: GraphContract, node: GraphNode): StageTemplate {
   if (loop.receipt !== "unit_completion" && loop.receipt !== "semantic_review") {
     fail(`graph.loops.${loop.id}.receipt`, "cannot compile this loop receipt yet");
   }
-  const capability = capabilityFromBuiltinSkill(loop.skill, `graph.loops.${loop.id}.skill`);
+  const { capability, repositorySkill } = capabilityFromSkill(
+    loop.skill,
+    `graph.loops.${loop.id}.skill`,
+    repositorySkills
+  );
   const isReview = loop.receipt === "semantic_review";
   const liveSteering = capability === "ce/implement@1" || capability === "ce/investigate@1";
   const template: StageTemplate = {
     executor: { kind: "agent", capability },
+    ...(repositorySkill === undefined ? {} : { repositorySkill }),
     evaluator: {
       kind: "semantic",
       assurance: "semantic_attested",
@@ -284,15 +317,20 @@ function capabilityOrder(capability: string): number {
     "ce/simplify@1",
     "ce/publish@1",
     FOR_EACH_UNIT_CAPABILITY,
+    REPOSITORY_SKILL_CAPABILITY,
     "command/run@1",
     "provider/wait@1",
     "agent/semantic@1",
   ].indexOf(capability);
 }
 
-function nodeTemplate(graph: GraphContract, node: GraphNode): StageTemplate {
+function nodeTemplate(
+  graph: GraphContract,
+  node: GraphNode,
+  repositorySkills?: ReadonlyMap<string, RepositorySkillPackage>
+): StageTemplate {
   assertNoDependencies(node);
-  if (node.kind === "run") return loopTemplate(graph, node);
+  if (node.kind === "run") return loopTemplate(graph, node, repositorySkills);
   if (node.kind === "for_each_unit") return forEachUnitTemplate(graph, node);
   if (node.kind === "command") {
     return {
@@ -330,12 +368,17 @@ function nodeTemplate(graph: GraphContract, node: GraphNode): StageTemplate {
   return exhaustive;
 }
 
-function compileStage(graph: GraphContract, node: GraphNode): PipelineStage {
-  const template = nodeTemplate(graph, node);
+function compileStage(
+  graph: GraphContract,
+  node: GraphNode,
+  repositorySkills?: ReadonlyMap<string, RepositorySkillPackage>
+): PipelineStage {
+  const template = nodeTemplate(graph, node, repositorySkills);
   return {
     id: node.id,
     executor: template.executor,
     ...(template.commandName === undefined ? {} : { commandName: template.commandName }),
+    ...(template.repositorySkill === undefined ? {} : { repositorySkill: template.repositorySkill }),
     evaluator: template.evaluator,
     context: template.context,
     live_steering: template.live_steering,
@@ -359,7 +402,7 @@ export function compileExecutionGraph(
     ...(options.maxRepairRounds === undefined ? {} : { max_repair_rounds: options.maxRepairRounds }),
     requires: {
       protocol: "stage-executor@1",
-      capabilities: [...new Set(graph.nodes.map((node) => nodeTemplate(graph, node).executor.capability))]
+      capabilities: [...new Set(graph.nodes.map((node) => nodeTemplate(graph, node, options.repositorySkills).executor.capability))]
         .sort((left, right) => {
           const leftOrder = capabilityOrder(left);
           const rightOrder = capabilityOrder(right);
@@ -369,7 +412,7 @@ export function compileExecutionGraph(
           return leftOrder - rightOrder;
         }),
     },
-    stages: graph.nodes.map((node) => compileStage(graph, node)),
+    stages: graph.nodes.map((node) => compileStage(graph, node, options.repositorySkills)),
   };
   return validatePipelineManifest(manifest, { runtime: options.runtime });
 }

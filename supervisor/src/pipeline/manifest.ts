@@ -6,6 +6,7 @@ import {
   validateRepositoryConfigContract,
   type ConfigGraphSource,
   type ConfigMcpServer,
+  type ConfigRepositorySkill,
 } from "@openthrottle/contracts";
 import { parseDocument } from "yaml";
 
@@ -91,10 +92,27 @@ export interface PipelineTransition {
   on_exhausted?: PipelineOutcome;
 }
 
+export interface RepositorySkillPackageFile {
+  path: string;
+  blobSha: string;
+  digest: string;
+}
+
+export interface RepositorySkillPackage {
+  schema: "openthrottle.repository-skill-package/v1";
+  reference: string;
+  invocation: string;
+  directory: string;
+  commit: string;
+  packageDigest: string;
+  files: RepositorySkillPackageFile[];
+}
+
 export interface PipelineStage {
   id: string;
   executor: { kind: ExecutorKind; capability: string };
   commandName?: CommandName;
+  repositorySkill?: RepositorySkillPackage;
   evaluator: { kind: EvaluatorKind; assurance: AssuranceClass; required_artifacts: ArtifactKind[] };
   context: ContextPolicy;
   live_steering: boolean;
@@ -150,6 +168,7 @@ export interface RepositoryPipelineConfig {
   schema: "openthrottle.config/v1";
   default_graph: string;
   graphs: ConfigGraphSource[];
+  skills?: ConfigRepositorySkill[];
   agent?: "claude" | "codex" | "opencode";
   model?: string;
   commands?: Record<string, string>;
@@ -176,6 +195,8 @@ export interface ValidatedRepositoryConfig {
 
 const IDENTIFIER = /^[a-z][a-z0-9]*(?:[._/-][a-z0-9]+)*$/;
 const CAPABILITY = /^[a-z][a-z0-9]*(?:[._:/-][a-z0-9]+)*@\d+$/;
+const SAFE_REPOSITORY_PATH = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\/\/)[A-Za-z0-9._/-]+$/;
+const REPOSITORY_SKILL_REFERENCE = /^repo:\/\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+@[a-f0-9]{40}#(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\/\/)[A-Za-z0-9._/-]+$/;
 function fail(path: string, message: string): never {
   throw new Error(`${path}: ${message}`);
 }
@@ -324,7 +345,7 @@ function parseStage(
   options: { allowLegacyImplicitCommandName?: boolean } = {}
 ): PipelineStage {
   const input = objectAt(value, path, [
-    "id", "executor", "commandName", "evaluator", "context", "live_steering", "credentials", "produces", "transitions", "retry",
+    "id", "executor", "commandName", "repositorySkill", "evaluator", "context", "live_steering", "credentials", "produces", "transitions", "retry",
   ]);
   const id = stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER });
   const executorInput = objectAt(input.executor, `${path}.executor`, ["kind", "capability"]);
@@ -365,6 +386,9 @@ function parseStage(
     ...(input.commandName === undefined ? {} : {
       commandName: enumAt(input.commandName, `${path}.commandName`, COMMAND_NAMES),
     }),
+    ...(input.repositorySkill === undefined ? {} : {
+      repositorySkill: parseRepositorySkillPackage(input.repositorySkill, `${path}.repositorySkill`),
+    }),
     evaluator,
     context: enumAt(input.context, `${path}.context`, CONTEXT_POLICIES),
     live_steering: booleanAt(input.live_steering, `${path}.live_steering`),
@@ -392,6 +416,11 @@ function parseStage(
   } else if (stage.commandName) {
     fail(`${path}.commandName`, "is allowed only for command executors");
   }
+  if (stage.repositorySkill) {
+    if (stage.executor.kind !== "agent" || stage.executor.capability !== "agent/repository-skill@1") {
+      fail(`${path}.repositorySkill`, "is allowed only for agent/repository-skill@1 stages");
+    }
+  }
   for (const required of stage.evaluator.required_artifacts) {
     if (!stage.produces.includes(required)) fail(`${path}.evaluator.required_artifacts`, `${required} is not produced by the stage`);
   }
@@ -399,6 +428,44 @@ function parseStage(
     fail(`${path}.produces`, "must include the typed stage_result artifact");
   }
   return stage;
+}
+
+function parseRepositorySkillPackage(value: unknown, path: string): RepositorySkillPackage {
+  const input = objectAt(value, path, ["schema", "reference", "invocation", "directory", "commit", "packageDigest", "files"]);
+  if (input.schema !== "openthrottle.repository-skill-package/v1") {
+    fail(`${path}.schema`, "must be openthrottle.repository-skill-package/v1");
+  }
+  const reference = stringAt(input.reference, `${path}.reference`, { max: 320, pattern: REPOSITORY_SKILL_REFERENCE });
+  const directory = stringAt(input.directory, `${path}.directory`, { max: 240, pattern: SAFE_REPOSITORY_PATH });
+  if (directory.endsWith("/")) fail(`${path}.directory`, "must not end with a slash");
+  if (!reference.endsWith(`#${directory}`)) {
+    fail(`${path}.reference`, "must name the same repository skill directory");
+  }
+  const files = arrayAt(input.files, `${path}.files`, (file, filePath) => {
+    const fileInput = objectAt(file, filePath, ["path", "blobSha", "digest"]);
+    const fileEntry = {
+      path: stringAt(fileInput.path, `${filePath}.path`, { max: 512, pattern: SAFE_REPOSITORY_PATH }),
+      blobSha: stringAt(fileInput.blobSha, `${filePath}.blobSha`, { pattern: /^[a-f0-9]{40}$/ }),
+      digest: stringAt(fileInput.digest, `${filePath}.digest`, { pattern: /^[a-f0-9]{64}$/ }),
+    };
+    if (!fileEntry.path.startsWith(`${directory}/`)) {
+      fail(`${filePath}.path`, "must stay inside the repository skill directory");
+    }
+    return fileEntry;
+  }, { min: 1, max: 64 });
+  unique(files.map((file) => file.path), `${path}.files.path`);
+  if (!files.some((file) => file.path === `${directory}/SKILL.md`)) {
+    fail(`${path}.files`, "must include SKILL.md at the repository skill directory root");
+  }
+  return {
+    schema: "openthrottle.repository-skill-package/v1",
+    reference,
+    invocation: stringAt(input.invocation, `${path}.invocation`, { pattern: IDENTIFIER }),
+    directory,
+    commit: stringAt(input.commit, `${path}.commit`, { pattern: /^[a-f0-9]{40}$/ }),
+    packageDigest: stringAt(input.packageDigest, `${path}.packageDigest`, { pattern: /^[a-f0-9]{64}$/ }),
+    files,
+  };
 }
 
 function allowsLegacyImplicitCommandName(id: string, version: number): boolean {
@@ -604,6 +671,7 @@ export function parseRepositoryConfig(raw: string, source = ".openthrottle.yml")
     schema: value.schema,
     default_graph: value.default_graph,
     graphs: value.graphs,
+    ...(value.skills === undefined ? {} : { skills: value.skills }),
     ...(value.agent === undefined ? {} : { agent: enumAt(value.agent, `${source}.agent`, ["claude", "codex", "opencode"] as const) }),
     ...(value.model === undefined ? {} : { model: value.model }),
     ...(value.commands === undefined ? {} : { commands: value.commands }),

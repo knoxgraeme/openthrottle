@@ -361,6 +361,51 @@ describe("pipeline manifest validation", () => {
     expect(() => validatePipelineManifest(agent)).toThrow(/commandName: is allowed only for command executors/);
   });
 
+  it("bounds repository skill package identity inside its declared directory", () => {
+    const value = manifest();
+    value.requires = { protocol: "stage-executor@1", capabilities: ["agent/repository-skill@1"] };
+    const stage = firstStage(value);
+    stage.executor = { kind: "agent", capability: "agent/repository-skill@1" };
+    stage.repositorySkill = {
+      schema: "openthrottle.repository-skill-package/v1",
+      reference: `repo://owner/repo@${"a".repeat(40)}#.agents/skills/implement-unit`,
+      invocation: "implement_unit",
+      directory: ".agents/skills/implement-unit",
+      commit: "a".repeat(40),
+      packageDigest: "b".repeat(64),
+      files: [{
+        path: ".agents/skills/implement-unit/SKILL.md",
+        blobSha: "c".repeat(40),
+        digest: "d".repeat(64),
+      }],
+    };
+
+    expect(validatePipelineManifest(value).manifest.stages[0]).toMatchObject({
+      repositorySkill: {
+        reference: `repo://owner/repo@${"a".repeat(40)}#.agents/skills/implement-unit`,
+        invocation: "implement_unit",
+      },
+    });
+
+    const escaped = structuredClone(value) as Record<string, unknown>;
+    ((firstStage(escaped).repositorySkill as Record<string, unknown>).files as Array<Record<string, unknown>>)[0]!.path =
+      ".agents/skills/other/SKILL.md";
+    expect(() => validatePipelineManifest(escaped))
+      .toThrow(/repositorySkill\.files\[0\]\.path: must stay inside/);
+
+    const missingSkill = structuredClone(value) as Record<string, unknown>;
+    ((firstStage(missingSkill).repositorySkill as Record<string, unknown>).files as Array<Record<string, unknown>>)[0]!.path =
+      ".agents/skills/implement-unit/helper.md";
+    expect(() => validatePipelineManifest(missingSkill))
+      .toThrow(/repositorySkill\.files: must include SKILL\.md/);
+
+    const mismatchedReference = structuredClone(value) as Record<string, unknown>;
+    (firstStage(mismatchedReference).repositorySkill as Record<string, unknown>).reference =
+      `repo://owner/repo@${"a".repeat(40)}#.agents/skills/other`;
+    expect(() => validatePipelineManifest(mismatchedReference))
+      .toThrow(/repositorySkill\.reference: must name the same/);
+  });
+
   it("accepts only bounded repository settings and canonical pipeline selections", () => {
     const parsed = parseRepositoryConfig(`
 schema: openthrottle.config/v1
