@@ -8,6 +8,7 @@ import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 const catalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
 const simpleGraphPath = fileURLToPath(new URL("../../graphs/simple-v1.json", import.meta.url));
 const investigateGraphPath = fileURLToPath(new URL("../../graphs/investigate-v1.json", import.meta.url));
+const structuredGraphPath = fileURLToPath(new URL("../../graphs/structured-v1.json", import.meta.url));
 const SIMPLE_GRAPH_DIGEST = "2f25ae9b891405d0e73e5f3c0f103354183c8cb27ca923cbd06baa6c470b76d1";
 const SIMPLE_MANIFEST_DIGEST = "9b705c003313187cb2f7e219c99e1cbf795d966be0e1d257015462219833ac6a";
 const INVESTIGATE_GRAPH_DIGEST = "a76d3e1360d92f41bc7aa9ed2372e294555478d5854808bf0c2a5ed7febaf317";
@@ -139,11 +140,48 @@ describe("execution graph compiler", () => {
     });
   });
 
+  it("compiles for_each_unit to the structured graph runtime capability with test descriptors", () => {
+    const runtime = buildInstalledRuntimeDescriptor("structured-test/v1", {
+      capabilities: [
+        ...buildInstalledRuntimeDescriptor("base-test/v1").descriptor.capabilities,
+        "graph/for-each-unit@1",
+      ],
+    });
+    const compiled = parseAndCompileExecutionGraph(readFileSync(structuredGraphPath, "utf8"), {
+      source: structuredGraphPath,
+      runtime: runtime.descriptor,
+    });
+
+    expect(compiled.manifest.manifest).toMatchObject({
+      id: "builtin/structured",
+      version: 1,
+      entry_stage: "units",
+      requires: { capabilities: ["graph/for-each-unit@1"] },
+      stages: [{
+        id: "units",
+        executor: { kind: "loop_action", capability: "graph/for-each-unit@1" },
+        evaluator: { kind: "semantic", assurance: "executor_verified", required_artifacts: ["execution_graph_result"] },
+        context: "none",
+        live_steering: false,
+        credentials: ["provider.read", "repo.read", "repo.write"],
+        produces: ["stage_result", "execution_graph_result"],
+      }],
+    });
+    expect(compiled.manifest.manifest.stages[0]?.transitions.no_change).toEqual({ terminal: "no_change" });
+  });
+
+  it("rejects the structured graph against the shipped production runtime descriptor until the composite runtime lands", () => {
+    expect(() => parseAndCompileExecutionGraph(readFileSync(structuredGraphPath, "utf8"), {
+      source: structuredGraphPath,
+      runtime: buildInstalledRuntimeDescriptor("production-like/v1").descriptor,
+    })).toThrow(/runtime capability mismatch: capability:graph\/for-each-unit@1/);
+  });
+
   it.each([
     [
       "for_each_unit nodes",
       minimalGraph({ node: { kind: "for_each_unit" } }),
-      /graph\.nodes\.stage\.kind: cannot compile for_each_unit yet/,
+      /graph\.loops\.loop\.input_scope: for_each_unit requires unit input scope/,
     ],
     [
       "human nodes",

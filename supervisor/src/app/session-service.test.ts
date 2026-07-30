@@ -195,7 +195,8 @@ describe("pipeline admission", () => {
     overrides: Partial<Config> = {},
     catalogPath = shippedCatalogPath,
     event = payload(),
-    repositoryFiles: Record<string, string> = {}
+    repositoryFiles: Record<string, string> = {},
+    runtimeOverrides: Parameters<typeof buildInstalledRuntimeDescriptor>[1] = {}
   ) {
     db = openDb(":memory:");
     const pipelines = createPipelineStore(db);
@@ -208,7 +209,7 @@ describe("pipeline admission", () => {
       webhookId: 1,
       snapshot: "snapshot",
     });
-    const runtime = buildInstalledRuntimeDescriptor("admission-test/v1");
+    const runtime = buildInstalledRuntimeDescriptor("admission-test/v1", runtimeOverrides);
     const catalog = loadPipelineCatalog(catalogPath, runtime.descriptor);
     pipelines.acceptRuntimeDescriptor(runtime);
     pipelines.acceptCatalog(catalog);
@@ -329,18 +330,19 @@ mcp_servers: {}
     expect(githubFetch).toHaveBeenCalledTimes(2);
   });
 
-  it("publishes a durable actionable failure and creates no stage for an unknown selection", async () => {
-    const { tickets } = await run(repositoryConfigYaml("{ implement: unknown/pipeline@9 }"));
+  it("ignores legacy implement pipeline overrides when the simple graph is selected", async () => {
+    const { tickets, pipelines } = await run(repositoryConfigYaml("{ implement: unknown/pipeline@9 }"));
     expect(tickets.getByIssueId("issue-1")).toMatchObject({
-      state: "error",
+      state: "active",
       sandbox_id: null,
       run_id: null,
     });
-    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
-    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_stage_attempts").pluck().get()).toBe(0);
-    expect(db!.prepare("SELECT execution_mode FROM agent_sessions WHERE id = 'session-1'").pluck().get()).toBeNull();
-    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
-    expect(payloads.some((entry) => entry.includes("unknown pipeline selection"))).toBe(true);
+    expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
+      pipeline_id: "core/implement",
+      pipeline_version: 4,
+      active_stage_id: "implementation",
+    });
+    expect(db!.prepare("SELECT execution_mode FROM agent_sessions WHERE id = 'session-1'").pluck().get()).toBe("pipeline");
   });
 
   it("rejects a graph-specific pipeline override for a unit-consuming selection", async () => {
@@ -459,6 +461,65 @@ intents:
       pipeline_version: 2,
     });
   });
+
+  it("compiles and pins a structured graph before provisioning when the runtime advertises the composite capability", async () => {
+    const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
+    executionPlan.graph_id = "structured";
+    const context = [
+      "# Structured work",
+      "",
+      "```json openthrottle.execution-plan/v1",
+      JSON.stringify(executionPlan, null, 2),
+      "```",
+      "",
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }, null, 2),
+      "```",
+    ].join("\n");
+
+    const { tickets, pipelines } = await run(
+      `schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: structured
+    kind: builtin
+    ref: core/structured@1
+pipelines: { implement: implement }
+intents:
+  implement:
+    default_graph: simple
+    allowed_graphs: [simple, structured]
+`,
+      {},
+      shippedCatalogPath,
+      payload("session-1", "issue-1", "OT-1", context),
+      {},
+      {
+        capabilities: [
+          ...buildInstalledRuntimeDescriptor("base-structured-test/v1").descriptor.capabilities,
+          "graph/for-each-unit@1",
+        ],
+      }
+    );
+
+    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+      state: "active",
+      sandbox_id: null,
+      run_id: null,
+    });
+    expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
+      pipeline_id: "builtin/structured",
+      pipeline_version: 1,
+      active_stage_id: "units",
+    });
+    const attempt = pipelines.getActiveAttempt(pipelines.getInstanceForSession("session-1")!.id)!;
+    const request = pipelines.getStageRequest(attempt.id);
+    expect(request.capability).toBe("graph/for-each-unit@1");
+    expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
+  });
   it("rejects graph selections on investigate tickets before provisioning", async () => {
     const context = [
       "# Investigate structured behavior",
@@ -487,7 +548,7 @@ intents:
     const graphPath = ".openthrottle/graphs/docs.json";
     const graph = JSON.stringify({
       schema: "openthrottle.graph/v1",
-      id: "docs",
+      id: "raw-docs",
       version: 1,
       entry_node: "verify",
       workers: [
@@ -548,8 +609,9 @@ test: "true"
     );
 
     expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
-      pipeline_id: "fixture/command",
-      pipeline_version: 2,
+      pipeline_id: `repository/docs/${"c".repeat(40)}`,
+      pipeline_version: 1,
+      active_stage_id: "verify",
     });
   });
   it("fails closed before provisioning when a structured selection omits its execution plan", async () => {
@@ -678,22 +740,19 @@ intents:
     ).toBe(true);
   });
 
-  it("admits a command-only fixture without requiring a model subscription", async () => {
-    const { tickets, pipelines } = await run(
+  it("requires a model subscription for the simple graph despite legacy command pipeline overrides", async () => {
+    const { tickets } = await run(
       repositoryConfigYaml("{ implement: fixture-command }"),
       { codexAuthJson: undefined, claudeCodeOauthToken: undefined, kimiCodeApiKey: undefined },
       fixtureCatalogPath
     );
 
     expect(tickets.getByIssueId("issue-1")).toMatchObject({
-      state: "active",
+      state: "error",
       sandbox_id: null,
       run_id: null,
     });
-    expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
-      pipeline_id: "fixture/command",
-      pipeline_version: 2,
-    });
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
   });
 
   it("keeps an existing coordinator session pinned on a duplicate delegation", async () => {
@@ -1005,12 +1064,19 @@ intents:
     expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
   });
 
-  it("does not retire the current generation when re-delegation selects an invalid pipeline", async () => {
+  it("does not retire the current generation when re-delegation selects an invalid graph", async () => {
     const { tickets, pipelines, invoke, setRepositoryConfig } =
       await run(repositoryConfigYaml("{ implement: implement }"));
     const previous = pipelines.getInstanceForSession("session-1")!;
     tickets.setSandboxId("issue-1", "sandbox-old");
-    setRepositoryConfig(repositoryConfigYaml("{ implement: unknown/pipeline@9 }"));
+    setRepositoryConfig(`schema: openthrottle.config/v1
+default_graph: missing
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+pipelines: { implement: implement }
+`);
 
     await invoke({}, payload("session-2"));
 

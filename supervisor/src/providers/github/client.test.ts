@@ -344,6 +344,46 @@ describe("GitHub contracts", () => {
     ).rejects.toThrow(/safe relative path/);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  it("rejects repository file snapshots that are symlinks, oversized, or blob-inconsistent", async () => {
+    const content = "{}\n";
+    for (const [response, error] of [
+      [{
+        type: "symlink",
+        sha: "c".repeat(40),
+        encoding: "base64",
+        content: Buffer.from(content).toString("base64"),
+        size: Buffer.byteLength(content),
+      }, /invalid repository file blob/],
+      [{
+        type: "file",
+        sha: "c".repeat(40),
+        encoding: "base64",
+        content: Buffer.from(content).toString("base64"),
+        size: 256 * 1024 + 1,
+      }, /exceeds the 256 KiB snapshot limit/],
+      [{
+        type: "file",
+        sha: "c".repeat(40),
+        encoding: "base64",
+        content: Buffer.from(content).toString("base64"),
+        size: Buffer.byteLength(content) + 1,
+      }, /content size does not match GitHub metadata/],
+    ] as const) {
+      const client = {
+        token: "github",
+        fetch: vi.fn(async () => Response.json(response)) as unknown as typeof fetch,
+      };
+      await expect(
+        getRepositoryFileAtCommit(
+          client,
+          "owner/repo",
+          "a".repeat(40),
+          ".openthrottle/graphs/docs.json"
+        )
+      ).rejects.toThrow(error);
+    }
+  });
   it("verifies a repository and creates its OpenThrottle webhook", async () => {
     const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);

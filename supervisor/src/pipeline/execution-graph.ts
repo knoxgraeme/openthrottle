@@ -2,9 +2,11 @@ import {
   parseGraphContract,
   validateGraphContract,
   type GraphContract,
+  type GraphLoop,
   type GraphNode,
   type GraphTransition,
   type GraphWorker,
+  type RepositoryConfigContract,
 } from "@openthrottle/contracts";
 import {
   COMMAND_NAMES,
@@ -18,6 +20,7 @@ import {
   type PipelineManifest,
   type PipelineStage,
   type PipelineTransition,
+  type RuntimeCapabilityInventory,
   type StageOutcome,
   type ValidatedPipelineManifest,
 } from "./manifest.js";
@@ -28,12 +31,21 @@ export interface CompileExecutionGraphOptions {
   description?: string;
   maxAttempts?: number;
   maxRepairRounds?: number;
+  runtime?: RuntimeCapabilityInventory;
+  config?: RepositoryConfigContract;
 }
 
 export interface CompiledExecutionGraph {
   graph: GraphContract;
   graphDigest: string;
   manifest: ValidatedPipelineManifest;
+}
+
+export const FOR_EACH_UNIT_CAPABILITY = "graph/for-each-unit@1";
+
+interface ResolvedUnitLoop {
+  loop: GraphLoop;
+  worker: GraphWorker;
 }
 
 type StageTemplate = {
@@ -92,6 +104,12 @@ const CAPABILITY_CREDENTIALS: Record<string, {
     allowed: ["model.invoke", "repo.read", "repo.write"],
     contexts: ["resume_required", "prefer_resume"],
     artifacts: ["stage_result"],
+  },
+  [FOR_EACH_UNIT_CAPABILITY]: {
+    minimum: ["repo.read", "repo.write"],
+    allowed: ["repo.read", "repo.write", "provider.read"],
+    contexts: ["none"],
+    artifacts: ["stage_result", "execution_graph_result"],
   },
 };
 
@@ -170,6 +188,7 @@ function compileTransitions(node: GraphNode): Record<StageOutcome, PipelineTrans
   const transitions: Partial<Record<StageOutcome, PipelineTransition>> = {
     ...DEFAULT_TERMINALS,
     no_change: { terminal: "no_change" },
+    semantic_repair_required: { terminal: "needs_human" },
     retryable_infrastructure_failure: { terminal: "failed" },
     failure: { terminal: "failed" },
   };
@@ -220,6 +239,43 @@ function loopTemplate(graph: GraphContract, node: GraphNode): StageTemplate {
   return template;
 }
 
+function unitLoop(graph: GraphContract, node: GraphNode): ResolvedUnitLoop {
+  const loop = graph.loops.find((candidate) => candidate.id === node.loop);
+  if (!loop) fail(`graph.nodes.${node.id}.loop`, "references an unknown loop");
+  if (loop.input_scope !== "unit") {
+    fail(`graph.loops.${loop.id}.input_scope`, "for_each_unit requires unit input scope");
+  }
+  if (loop.receipt !== "unit_completion") {
+    fail(`graph.loops.${loop.id}.receipt`, "for_each_unit requires unit_completion receipts");
+  }
+  const worker = graph.workers.find((candidate) => candidate.id === loop.worker);
+  if (!worker) fail(`graph.loops.${loop.id}.worker`, "references an unknown worker");
+  if (worker.engine !== "agent") fail(`graph.workers.${worker.id}.engine`, "for_each_unit requires an agent worker");
+  if (loop.skill !== "builtin://ce/implement@1") {
+    fail(`graph.loops.${loop.id}.skill`, "for_each_unit requires builtin://ce/implement@1");
+  }
+  return { loop, worker };
+}
+
+function forEachUnitTemplate(graph: GraphContract, node: GraphNode): StageTemplate {
+  const { worker } = unitLoop(graph, node);
+  const allowedCredentials = new Set(CAPABILITY_CREDENTIALS[FOR_EACH_UNIT_CAPABILITY].allowed);
+  const template: StageTemplate = {
+    executor: { kind: "loop_action", capability: FOR_EACH_UNIT_CAPABILITY },
+    evaluator: {
+      kind: "semantic",
+      assurance: "executor_verified",
+      required_artifacts: ["execution_graph_result"],
+    },
+    context: "none",
+    live_steering: false,
+    credentials: [...new Set(worker.credentials.filter((scope) => allowedCredentials.has(scope)))],
+    produces: ["stage_result", "execution_graph_result"],
+  };
+  assertCapabilityAuthorized(template, `graph.nodes.${node.id}`);
+  return template;
+}
+
 function capabilityOrder(capability: string): number {
   return [
     "ce/implement@1",
@@ -227,6 +283,7 @@ function capabilityOrder(capability: string): number {
     "ce/review@1",
     "ce/simplify@1",
     "ce/publish@1",
+    FOR_EACH_UNIT_CAPABILITY,
     "command/run@1",
     "provider/wait@1",
     "agent/semantic@1",
@@ -236,7 +293,7 @@ function capabilityOrder(capability: string): number {
 function nodeTemplate(graph: GraphContract, node: GraphNode): StageTemplate {
   assertNoDependencies(node);
   if (node.kind === "run") return loopTemplate(graph, node);
-  if (node.kind === "for_each_unit") fail(`graph.nodes.${node.id}.kind`, "cannot compile for_each_unit yet");
+  if (node.kind === "for_each_unit") return forEachUnitTemplate(graph, node);
   if (node.kind === "command") {
     return {
       executor: { kind: "command", capability: "command/run@1" },
@@ -314,14 +371,14 @@ export function compileExecutionGraph(
     },
     stages: graph.nodes.map((node) => compileStage(graph, node)),
   };
-  return validatePipelineManifest(manifest);
+  return validatePipelineManifest(manifest, { runtime: options.runtime });
 }
 
 export function parseAndCompileExecutionGraph(
   raw: string,
   options: CompileExecutionGraphOptions & { source?: string } = {}
 ): CompiledExecutionGraph {
-  const graph = parseGraphContract(raw, { source: options.source ?? "graph" });
+  const graph = parseGraphContract(raw, { source: options.source ?? "graph", config: options.config });
   return {
     graph: graph.value,
     graphDigest: graph.digest,
@@ -333,7 +390,7 @@ export function validateAndCompileExecutionGraph(
   value: unknown,
   options: CompileExecutionGraphOptions & { source?: string } = {}
 ): CompiledExecutionGraph {
-  const graph = validateGraphContract(value, { source: options.source ?? "graph" });
+  const graph = validateGraphContract(value, { source: options.source ?? "graph", config: options.config });
   return {
     graph: graph.value,
     graphDigest: graph.digest,
