@@ -497,7 +497,7 @@ graphs:
     kind: builtin
     ref: core/simple@1
   - id: docs
-    kind: path
+    kind: repository
     ref: ${graphPath}
 pipelines: { implement: implement, docs: fixture-command }
 intents:
