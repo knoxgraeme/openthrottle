@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -19,7 +19,7 @@ import {
   resolveLoopInvocation,
   validateLoopRequest,
 } from "./execute-loop.mjs";
-import { sealNativeSessionPackage } from "./native-session-package.mjs";
+import { materializeNativeSessionState, nativeSessionStoragePath, sealNativeSessionPackage } from "./native-session-package.mjs";
 import { computeWorkspaceTreeOid } from "./repository-control.mjs";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
@@ -148,8 +148,9 @@ function repositorySkillRequest() {
 function sealSessionFixture({ agent, nativeSessionId = "native-1", sourceRoot }) {
   const profileRoot = mkdtempSync(join(tmpdir(), `ot-loop-profile-${agent}-`));
   directories.push(profileRoot);
-  mkdirSync(join(profileRoot, "sessions"), { recursive: true });
-  writeFileSync(join(profileRoot, "sessions", "current.jsonl"), "current session\n");
+  const sessionStore = nativeSessionStoragePath(agent, profileRoot);
+  mkdirSync(sessionStore, { recursive: true });
+  writeFileSync(join(sessionStore, "current.jsonl"), "current session\n");
   return sealNativeSessionPackage({ agent, nativeSessionId, profileRoot, sourceRoot });
 }
 
@@ -307,16 +308,27 @@ describe("loop action request validation", () => {
   });
 
   it("passes native session IDs to every resumable engine adapter", () => {
-    for (const agent of ["claude", "opencode"]) {
+    for (const agent of ["claude", "codex", "opencode"]) {
       const valid = validateLoopRequest(request({
         agent,
         nativeSessionId: "native-1",
         contextPolicy: "resume_required",
       }));
       const built = loopAgentCommand({ request: valid, invocation: resolveLoopInvocation(valid) });
-      expect(built.args).toContain(agent === "claude" ? "--resume" : "--session");
+      expect(built.args).toContain(agent === "claude" ? "--resume" : agent === "codex" ? "resume" : "--session");
       expect(built.args).toContain("native-1");
+      if (agent === "codex") {
+        expect(built.args.at(-1)).toBe(loopPrompt(valid, { repositorySkillRoot: null }));
+        expect(built.input).toBeUndefined();
+      }
     }
+  });
+
+  it("passes fresh Codex prompts over stdin", () => {
+    const valid = validateLoopRequest(request({ agent: "codex" }));
+    const built = loopAgentCommand({ request: valid, invocation: resolveLoopInvocation(valid) });
+    expect(built.args.at(-1)).toBe("-");
+    expect(built.input).toBe(loopPrompt(valid, { repositorySkillRoot: null }));
   });
 
   it("keeps the integration checkout locked around worker execution", () => {
@@ -475,34 +487,52 @@ describe("loop action request validation", () => {
   });
 
   it("materializes only the current sealed repository skill under the action discovery root", () => {
-    const valid = validateLoopRequest(repositorySkillRequest());
-    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
-    directories.push(actionRoot);
-    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+    for (const agent of ["claude", "codex", "opencode"]) {
+      const baseRequest = repositorySkillRequest();
+      const withoutFence = {
+        ...baseRequest,
+        agent,
+        requestHash: undefined,
+        idempotencyKey: undefined,
+      };
+      delete withoutFence.requestHash;
+      delete withoutFence.idempotencyKey;
+      const valid = validateLoopRequest({ ...withoutFence, ...createLoopRequestHash(withoutFence) });
+      const actionRoot = mkdtempSync(join(tmpdir(), `ot-loop-actions-${agent}-`));
+      directories.push(actionRoot);
+      process.env.OT_LOOP_ACTION_ROOT = actionRoot;
 
-    runLoopAgentInPreparedRepository({
-      request: valid,
-      invocation: resolveLoopInvocation(valid),
-      integrationRepoDir: "/tmp/integration",
-      lockIntegration: () => true,
-      processFence: (execute) => execute(),
-      runProcess: (command, args) => {
-        expect(command).toBe("gosu");
-        const actionDirectory = join(actionRoot, valid.attemptId, valid.actionId);
-        const codexHome = join(actionRoot, valid.attemptId, valid.actionId, "codex");
-        expect(args).toContain(`OT_OUTBOX_DIR=${join(actionDirectory, "outbox")}`);
-        expect(args).toContain(`OT_INBOX_DIR=${join(actionDirectory, "inbox")}`);
-        expect(args).toContain(`OT_INBOX_PROCESSED_DIR=${join(actionDirectory, "inbox-processed")}`);
-        expect(args).toContain(`OT_NATIVE_SESSION_DIR=${join(actionDirectory, "native-session")}`);
-        expect(args).toContain(`HOME=${join(actionRoot, valid.attemptId, valid.actionId, "home")}`);
-        expect(args).toContain(`CODEX_HOME=${codexHome}`);
-        const skillRoot = join(codexHome, "skills", valid.repositorySkill.invocation);
-        expect(readFileSync(join(skillRoot, "SKILL.md"), "utf8")).toContain("pinned repository package");
-        expect(statSync(skillRoot).mode & 0o777).toBe(0o555);
-        expect(existsSync(join(codexHome, "auth.json"))).toBe(false);
-        return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
-      },
-    });
+      runLoopAgentInPreparedRepository({
+        request: valid,
+        invocation: resolveLoopInvocation(valid),
+        integrationRepoDir: "/tmp/integration",
+        lockIntegration: () => true,
+        processFence: (execute) => execute(),
+        runProcess: (command, args) => {
+          expect(command).toBe("gosu");
+          const actionDirectory = join(actionRoot, valid.attemptId, valid.actionId);
+          const home = join(actionDirectory, "home");
+          const codexHome = join(actionDirectory, "codex");
+          expect(args).toContain(`OT_OUTBOX_DIR=${join(actionDirectory, "outbox")}`);
+          expect(args).toContain(`OT_INBOX_DIR=${join(actionDirectory, "inbox")}`);
+          expect(args).toContain(`OT_INBOX_PROCESSED_DIR=${join(actionDirectory, "inbox-processed")}`);
+          expect(args).toContain(`OT_NATIVE_SESSION_DIR=${join(actionDirectory, "native-session")}`);
+          expect(args).toContain(`HOME=${home}`);
+          const skillRoot = agent === "claude"
+            ? join(home, ".claude", "skills", valid.repositorySkill.invocation)
+            : agent === "codex"
+              ? join(codexHome, "skills", valid.repositorySkill.invocation)
+              : join(actionDirectory, "opencode-skills", valid.repositorySkill.invocation);
+          if (agent === "codex") expect(args).toContain(`CODEX_HOME=${codexHome}`);
+          if (agent !== "codex") expect(args.some((entry) => entry.startsWith("CODEX_HOME="))).toBe(false);
+          expect(readFileSync(join(skillRoot, "SKILL.md"), "utf8")).toContain("pinned repository package");
+          expect(statSync(skillRoot).mode & 0o777).toBe(0o555);
+          expect(existsSync(join(codexHome, "auth.json"))).toBe(false);
+          if (agent === "opencode") expect(args.join("\n")).toContain("pinned repository package");
+          return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+        },
+      });
+    }
   });
 
   it("materializes only the authorized native session package into each isolated profile", () => {
@@ -536,8 +566,9 @@ describe("loop action request validation", () => {
             : agent === "claude"
               ? join(actionDirectory, "home", ".claude")
               : join(actionDirectory, "home");
-          expect(readFileSync(join(profileRoot, "sessions", "current.jsonl"), "utf8")).toBe("current session\n");
-          expect(existsSync(join(profileRoot, "sessions", "secret.jsonl"))).toBe(false);
+          const sessionStore = nativeSessionStoragePath(agent, profileRoot);
+          expect(readFileSync(join(sessionStore, "current.jsonl"), "utf8")).toBe("current session\n");
+          expect(existsSync(join(sessionStore, "secret.jsonl"))).toBe(false);
           return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
         },
       });
@@ -562,8 +593,9 @@ describe("loop action request validation", () => {
       processFence: (execute) => execute(),
       runProcess: (command, args) => {
         const codexHome = args.find((arg) => arg.startsWith("CODEX_HOME=")).slice("CODEX_HOME=".length);
-        mkdirSync(join(codexHome, "sessions"), { recursive: true });
-        writeFileSync(join(codexHome, "sessions", "thread.jsonl"), "thread state\n");
+        const sessionStore = nativeSessionStoragePath("codex", codexHome);
+        mkdirSync(sessionStore, { recursive: true });
+        writeFileSync(join(sessionStore, "thread.jsonl"), "thread state\n");
         return {
           status: 0,
           signal: null,
@@ -580,12 +612,41 @@ describe("loop action request validation", () => {
     expect(statSync(sealed).mode & 0o777).toBe(0o500);
   });
 
+  it("refuses reported loop native session ids when sealing cannot produce a package and surfaces cleanup failures", () => {
+    const valid = validateLoopRequest(request());
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+    const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
+    directories.push(actionRoot, sessionRoot);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+    process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sessionRoot;
+
+    expect(() => runLoopAgentInPreparedRepository({
+      request: valid,
+      invocation: resolveLoopInvocation(valid),
+      integrationRepoDir: "/tmp/integration",
+      lockIntegration: () => true,
+      lockPersistentProfiles: () => ["/home/agent/.codex"],
+      restorePersistentProfiles: () => {
+        throw new Error("profile restore failed");
+      },
+      processFence: (execute) => execute(),
+      runProcess: () => ({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "{\"type\":\"thread.started\",\"thread_id\":\"thread-1\"}\n",
+        stderr: "",
+      }),
+    })).toThrow(/native session id was reported without a sealed executor package.*profile restore failed/s);
+  });
+
   it("rejects path-like native session ids before package storage can collapse", () => {
     const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
     const profileRoot = mkdtempSync(join(tmpdir(), "ot-loop-profile-"));
     directories.push(sessionRoot, profileRoot);
-    mkdirSync(join(profileRoot, "sessions"), { recursive: true });
-    writeFileSync(join(profileRoot, "sessions", "current.jsonl"), "current\n");
+    const sessionStore = nativeSessionStoragePath("codex", profileRoot);
+    mkdirSync(sessionStore, { recursive: true });
+    writeFileSync(join(sessionStore, "current.jsonl"), "current\n");
     sealSessionFixture({ agent: "codex", nativeSessionId: "sibling", sourceRoot: sessionRoot });
 
     expect(() => sealNativeSessionPackage({
@@ -601,9 +662,10 @@ describe("loop action request validation", () => {
     const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
     const profileRoot = mkdtempSync(join(tmpdir(), "ot-loop-profile-"));
     directories.push(sessionRoot, profileRoot);
-    mkdirSync(join(profileRoot, "sessions"), { recursive: true });
+    const sessionStore = nativeSessionStoragePath("codex", profileRoot);
+    mkdirSync(sessionStore, { recursive: true });
     for (let index = 0; index < 129; index += 1) {
-      writeFileSync(join(profileRoot, "sessions", `${index}.jsonl`), "x\n");
+      writeFileSync(join(sessionStore, `${index}.jsonl`), "x\n");
     }
 
     expect(() => sealNativeSessionPackage({
@@ -636,6 +698,38 @@ describe("loop action request validation", () => {
       processFence: (execute) => execute(),
       runProcess: () => ({ status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" }),
     })).toThrow(/authorized native session state is unavailable/);
+  });
+
+  it("does not restore native sessions through stale profile symlinks", () => {
+    const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
+    const sourceProfile = mkdtempSync(join(tmpdir(), "ot-source-profile-"));
+    const destinationProfile = mkdtempSync(join(tmpdir(), "ot-destination-profile-"));
+    const leakedTarget = mkdtempSync(join(tmpdir(), "ot-leaked-session-target-"));
+    directories.push(sessionRoot, sourceProfile, destinationProfile, leakedTarget);
+    process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sessionRoot;
+    const sourceSessionStore = nativeSessionStoragePath("codex", sourceProfile);
+    mkdirSync(sourceSessionStore, { recursive: true });
+    writeFileSync(join(sourceSessionStore, "current.jsonl"), "sealed session\n");
+    sealNativeSessionPackage({
+      agent: "codex",
+      nativeSessionId: "native-1",
+      profileRoot: sourceProfile,
+      sourceRoot: sessionRoot,
+    });
+    symlinkSync(leakedTarget, nativeSessionStoragePath("codex", destinationProfile));
+
+    materializeNativeSessionState({
+      request: {
+        agent: "codex",
+        nativeSessionId: "native-1",
+        contextPolicy: "resume_required",
+      },
+      profileRoot: destinationProfile,
+    });
+
+    expect(readFileSync(join(nativeSessionStoragePath("codex", destinationProfile), "current.jsonl"), "utf8"))
+      .toBe("sealed session\n");
+    expect(existsSync(join(leakedTarget, "current.jsonl"))).toBe(false);
   });
 
   it("rejects forged or writable sealed native session packages", () => {
@@ -891,6 +985,27 @@ describe("executeLoopAction", () => {
 
     expect(result.outcome).toBe("failure");
     expect(result.receipt).toMatch(/agent launch failed/);
+    expect(lockWorkerWorktree).toHaveBeenCalledOnce();
+    expect(lockActionDirectory).toHaveBeenCalledOnce();
+  });
+
+  it("returns retryable infrastructure failure when loop cleanup fails", () => {
+    const lockWorkerWorktree = vi.fn();
+    const lockActionDirectory = vi.fn();
+    const error = new Error("loop action failed (agent launch failed) and cleanup failed: integration relock failed");
+    error.retryableInfrastructureFailure = true;
+    const result = executeLoopActionWithIntegration({
+      request: request(),
+      lockWorkerWorktree,
+      lockActionDirectory,
+      runLoopAgent: () => {
+        throw error;
+      },
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+    expect(result.receipt).toMatch(/cleanup failed/);
     expect(lockWorkerWorktree).toHaveBeenCalledOnce();
     expect(lockActionDirectory).toHaveBeenCalledOnce();
   });

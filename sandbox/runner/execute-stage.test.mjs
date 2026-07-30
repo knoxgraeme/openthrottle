@@ -35,7 +35,7 @@ import {
   stagePrompt,
   validateStageRequest,
 } from "./execute-stage.mjs";
-import { sealNativeSessionPackage } from "./native-session-package.mjs";
+import { nativeSessionStoragePath, sealNativeSessionPackage } from "./native-session-package.mjs";
 
 const directories = [];
 afterEach(() => {
@@ -89,6 +89,7 @@ function repository() {
 }
 
 function fixture({
+  agent = "codex",
   capability = "agent/semantic@1",
   contextPolicy = "fresh",
   nativeSessionId = null,
@@ -134,7 +135,7 @@ function fixture({
     baseCommit: execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim(),
     baseBranch: "main",
     branch: "ot/issue-1",
-    agent: "codex",
+    agent,
     contextRevision: 0,
     expectedSubject: computeWorkspaceTreeOid(repoDir),
     contextPolicy,
@@ -669,6 +670,62 @@ describe("one-stage executor", () => {
     expect(lock).toHaveBeenCalledOnce();
   });
 
+  it("materializes repository-skill stages under each engine discovery root", () => {
+    const repoDir = repository();
+    const skillDir = ".agents/skills/implement-unit";
+    mkdirSync(join(repoDir, skillDir), { recursive: true });
+    writeFileSync(join(repoDir, skillDir, "SKILL.md"), "---\nname: implement_unit\n---\n# Pinned repository package\n");
+    execFileSync("git", ["add", "."], { cwd: repoDir });
+    execFileSync("git", ["commit", "-qm", "skill"], { cwd: repoDir });
+    const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+    const skillPath = `${skillDir}/SKILL.md`;
+    const file = {
+      path: skillPath,
+      blobSha: execFileSync("git", ["rev-parse", `${commit}:${skillPath}`], { cwd: repoDir, encoding: "utf8" }).trim(),
+      digest: digest(readFileSync(join(repoDir, skillPath))),
+    };
+    const unsignedPackage = {
+      schema: "openthrottle.repository-skill-package/v1",
+      reference: `repo://owner/repo@${commit}#${skillDir}`,
+      invocation: "implement_unit",
+      directory: skillDir,
+      commit,
+      files: [file],
+    };
+    const repositorySkill = { ...unsignedPackage, packageDigest: digest(canonicalJson(unsignedPackage)) };
+
+    for (const agent of ["claude", "codex", "opencode"]) {
+      const input = fixture({
+        agent,
+        capability: "agent/repository-skill@1",
+        repositorySkill,
+      });
+      const actionRoot = mkdtempSync(join(tmpdir(), `ot-stage-actions-${agent}-`));
+      directories.push(actionRoot);
+      process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+      const environment = repositorySkillStageEnvironment(input.request);
+      const materialized = materializeRepositorySkill({
+        request: input.request,
+        repoDir,
+        discoveryRoot: environment.repositorySkillDiscoveryRoot,
+      });
+      const actionDirectory = join(actionRoot, "attempt-1");
+      const expectedRoot = agent === "claude"
+        ? join(actionDirectory, "home", ".claude", "skills", "implement_unit")
+        : agent === "codex"
+          ? join(actionDirectory, "codex", "skills", "implement_unit")
+          : join(actionDirectory, "opencode-skills", "implement_unit");
+
+      expect(materialized).toBe(expectedRoot);
+      expect(readFileSync(join(materialized, "SKILL.md"), "utf8")).toContain("Pinned repository package");
+      expect(existsSync(join(actionDirectory, "codex", "auth.json"))).toBe(false);
+      if (agent === "opencode") {
+        expect(stagePrompt(input.request, join(actionDirectory, "home", "proposal.json"), { agent, repositorySkillRoot: materialized }))
+          .toContain("Pinned repository package");
+      }
+    }
+  });
+
   it("locks repository-skill stage homes when setup fails before agent launch", () => {
     const repoDir = repository();
     const skillDir = ".agents/skills/implement-unit";
@@ -752,8 +809,9 @@ describe("one-stage executor", () => {
     const sourceProfile = mkdtempSync(join(tmpdir(), "ot-source-profile-"));
     const binDir = mkdtempSync(join(tmpdir(), "ot-fake-bin-"));
     directories.push(actionRoot, sourceRoot, sourceProfile, binDir);
-    mkdirSync(join(sourceProfile, "sessions"), { recursive: true });
-    writeFileSync(join(sourceProfile, "sessions", "native-1.json"), "{\"session\":true}\n");
+    const sourceSessionStore = nativeSessionStoragePath("codex", sourceProfile);
+    mkdirSync(sourceSessionStore, { recursive: true });
+    writeFileSync(join(sourceSessionStore, "native-1.json"), "{\"session\":true}\n");
     sealNativeSessionPackage({
       agent: "codex",
       nativeSessionId: "native-1",
@@ -774,7 +832,7 @@ exec "$@"
     writeFileSync(fakeCodex, `#!/usr/bin/env bash
 set -euo pipefail
 test -f "$CODEX_HOME/sessions/native-1.json"
-test "$OT_STAGE_PROPOSAL_FILE" = "$OT_STAGE_ACTION_ROOT/attempt-1/proposal.json"
+test "$OT_STAGE_PROPOSAL_FILE" = "$OT_STAGE_ACTION_ROOT/attempt-1/home/proposal.json"
 cat > "$OT_STAGE_PROPOSAL_FILE" <<'JSON'
 {"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"ok","evidence":["session materialized"],"findings":[],"actions":[],"uncertainty":[]}
 JSON
@@ -794,6 +852,76 @@ printf '{"type":"thread.started","thread_id":"native-1"}\\n'
 
       expect(result.exitCode).toBe(0);
       expect(result.proposal).toMatchObject({ suggested_outcome: "success" });
+    } finally {
+      process.env.PATH = previousPath;
+    }
+  });
+
+  it("refuses reported stage native session ids when sealing cannot produce a package and surfaces cleanup failures", () => {
+    const repoDir = repository();
+    const skillDir = ".agents/skills/implement-unit";
+    mkdirSync(join(repoDir, skillDir), { recursive: true });
+    writeFileSync(join(repoDir, skillDir, "SKILL.md"), "---\nname: implement_unit\n---\n# Skill\n");
+    execFileSync("git", ["add", "."], { cwd: repoDir });
+    execFileSync("git", ["commit", "-qm", "skill"], { cwd: repoDir });
+    const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+    const skillPath = `${skillDir}/SKILL.md`;
+    const file = {
+      path: skillPath,
+      blobSha: execFileSync("git", ["rev-parse", `${commit}:${skillPath}`], { cwd: repoDir, encoding: "utf8" }).trim(),
+      digest: digest(readFileSync(join(repoDir, skillPath))),
+    };
+    const unsignedPackage = {
+      schema: "openthrottle.repository-skill-package/v1",
+      reference: `repo://owner/repo@${commit}#${skillDir}`,
+      invocation: "implement_unit",
+      directory: skillDir,
+      commit,
+      files: [file],
+    };
+    const input = fixture({
+      capability: "agent/repository-skill@1",
+      repositorySkill: { ...unsignedPackage, packageDigest: digest(canonicalJson(unsignedPackage)) },
+    });
+    input.repoDir = repoDir;
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-stage-actions-"));
+    const sourceRoot = mkdtempSync(join(tmpdir(), "ot-stage-native-sessions-"));
+    const binDir = mkdtempSync(join(tmpdir(), "ot-fake-bin-"));
+    directories.push(actionRoot, sourceRoot, binDir);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sourceRoot;
+
+    const fakeGosu = join(binDir, "gosu");
+    writeFileSync(fakeGosu, `#!/usr/bin/env bash
+set -euo pipefail
+shift
+exec "$@"
+`);
+    chmodSync(fakeGosu, 0o755);
+    const fakeCodex = join(binDir, "codex");
+    writeFileSync(fakeCodex, `#!/usr/bin/env bash
+set -euo pipefail
+cat > "$OT_STAGE_PROPOSAL_FILE" <<'JSON'
+{"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"ok","evidence":["session reported"],"findings":[],"actions":[],"uncertainty":[]}
+JSON
+printf '{"type":"thread.started","thread_id":"native-1"}\\n'
+`);
+    chmodSync(fakeCodex, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${binDir}:${previousPath}`;
+    try {
+      expect(() => defaultRunAgent({
+        request: input.request,
+        invocation: resolveContextInvocation(input.request),
+        repoDir: input.repoDir,
+        proposalPath: join(actionRoot, "proposal.json"),
+        timeoutMs: 1000,
+        lockPersistentProfiles: () => ["locked-profile"],
+        restorePersistentProfiles: () => {
+          throw new Error("profile restore failed");
+        },
+        lockStageHome: () => true,
+      })).toThrow(/native session id was reported without a sealed executor package.*profile restore failed/s);
     } finally {
       process.env.PATH = previousPath;
     }

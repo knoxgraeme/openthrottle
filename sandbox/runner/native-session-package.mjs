@@ -48,12 +48,18 @@ function copyTrustedTree(source, destination, { skipManifest = false } = {}) {
   copyFileSync(source, destination);
 }
 
-function relativePackagePath(root, path) {
+function relativeContainedPath(root, path, errorMessage) {
   const relativePath = relative(root, path);
-  if (!relativePath || relativePath.startsWith("..") || relativePath.includes(`..${sep}`) || relativePath === NATIVE_SESSION_PACKAGE_MANIFEST) {
-    throw new Error("native session package path escapes its root");
+  if (!relativePath || relativePath.startsWith("..") || relativePath.includes(`..${sep}`)) {
+    throw new Error(errorMessage);
   }
   return relativePath.split(sep).join("/");
+}
+
+function relativePackagePath(root, path) {
+  const relativePath = relativeContainedPath(root, path, "native session package path escapes its root");
+  if (relativePath === NATIVE_SESSION_PACKAGE_MANIFEST) throw new Error("native session package path escapes its root");
+  return relativePath;
 }
 
 function collectNativeSessionFiles(root, path = root, files = [], totals = { bytes: 0 }) {
@@ -133,8 +139,9 @@ export function sealNativeSessionPackage({
   sourceRoot = configuredNativeSessionSourceRoot(),
 }) {
   if (!nativeSessionId || !profileRoot) return null;
-  const sessionsSource = resolve(profileRoot, "sessions");
+  const sessionsSource = nativeSessionStoragePath(agent, profileRoot);
   if (!existsSync(sessionsSource) || !lstatSync(sessionsSource).isDirectory()) return null;
+  const relativeSessionRoot = relativeContainedPath(profileRoot, sessionsSource, "native session storage path escapes its profile root");
   preflightNativeSessionSource(sessionsSource);
   const destination = nativeSessionPackageDirectory({ sourceRoot, agent, nativeSessionId });
   try {
@@ -142,7 +149,7 @@ export function sealNativeSessionPackage({
     rmSync(destination, { recursive: true, force: true });
     mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
     mkdirSync(destination, { recursive: true, mode: 0o700 });
-    copyTrustedTree(sessionsSource, resolve(destination, "sessions"));
+    copyTrustedTree(sessionsSource, resolve(destination, relativeSessionRoot));
     const files = collectNativeSessionFiles(destination);
     const unsigned = {
       schema: NATIVE_SESSION_PACKAGE_SCHEMA,
@@ -163,6 +170,38 @@ export function sealNativeSessionPackage({
   }
 }
 
+export function nativeSessionStoragePath(agent, profileRoot) {
+  return resolve(profileRoot, nativeSessionStorageRelativePath(agent));
+}
+
+function nativeSessionStorageRelativePath(agent) {
+  const safeAgent = string(agent, "agent", PACKAGE_PATH_ID);
+  if (safeAgent === "claude") return "projects";
+  if (safeAgent === "codex") return "sessions";
+  if (safeAgent === "opencode") return ".local/share/opencode";
+  throw new Error("agent is invalid");
+}
+
+function prepareNativeSessionDestination({ agent, profileRoot }) {
+  const relativeSessionRoot = nativeSessionStorageRelativePath(agent);
+  const parts = relativeSessionRoot.split("/");
+  let current = resolve(profileRoot);
+  for (const part of parts.slice(0, -1)) {
+    current = resolve(current, part);
+    if (existsSync(current)) {
+      const metadata = lstatSync(current);
+      if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+        throw new Error("native session destination path must contain only real directories");
+      }
+      continue;
+    }
+    mkdirSync(current, { recursive: false, mode: 0o700 });
+  }
+  const destination = resolve(profileRoot, relativeSessionRoot);
+  rmSync(destination, { recursive: true, force: true });
+  return destination;
+}
+
 export function materializeNativeSessionState({ request, profileRoot }) {
   if (!request.nativeSessionId || request.contextPolicy === "fresh") return null;
   const sourceRoot = configuredNativeSessionSourceRoot();
@@ -175,6 +214,7 @@ export function materializeNativeSessionState({ request, profileRoot }) {
     throw new Error("authorized native session state is unavailable");
   }
   validateNativeSessionPackage({ source, request });
+  prepareNativeSessionDestination({ agent: request.agent, profileRoot });
   copyTrustedTree(source, profileRoot, { skipManifest: true });
   prepareAgentOwnedDirectory(profileRoot);
   return source;
@@ -185,13 +225,14 @@ export function extractNativeSessionId(output, agent) {
     if (!line.trim()) continue;
     try {
       const event = JSON.parse(line);
-      const candidate = agent === "claude"
-        ? event.session_id
-        : agent === "codex" && event.type === "thread.started"
-          ? event.thread_id ?? event.threadId ?? event.id
-          : agent === "opencode"
-            ? event.sessionID
-            : undefined;
+      let candidate;
+      if (agent === "claude") {
+        candidate = event.session_id;
+      } else if (agent === "codex" && event.type === "thread.started") {
+        candidate = event.thread_id ?? event.threadId ?? event.id;
+      } else if (agent === "opencode") {
+        candidate = event.sessionID;
+      }
       if (typeof candidate === "string" && PACKAGE_PATH_ID.test(candidate)) return candidate;
     } catch {
       // Agent stderr/non-JSON diagnostics are not session evidence.

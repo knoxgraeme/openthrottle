@@ -17,6 +17,8 @@ REQUEST="$ACTION_ROOT/attempt-current/action-current/request.json"
 RESULT="$ACTION_ROOT/attempt-current/action-current/result.json"
 LEAD_REQUEST="$ACTION_ROOT/attempt-current/action-lead/request.json"
 LEAD_RESULT="$ACTION_ROOT/attempt-current/action-lead/result.json"
+REVIEWER_REQUEST="$ACTION_ROOT/attempt-current/action-reviewer/request.json"
+REVIEWER_RESULT="$ACTION_ROOT/attempt-current/action-reviewer/result.json"
 BUILTIN_REQUEST="$ACTION_ROOT/attempt-current/action-builtin/request.json"
 BUILTIN_RESULT="$ACTION_ROOT/attempt-current/action-builtin/result.json"
 SEALED="$ROOT/sealed-input.txt"
@@ -274,6 +276,39 @@ NODE
 chown root:root "$LEAD_REQUEST"
 chmod 0400 "$LEAD_REQUEST"
 
+install -d -o root -g root -m 0700 "$ACTION_ROOT/attempt-current/action-reviewer"
+PATH="$BIN:$PATH" node --input-type=module - "$REVIEWER_REQUEST" <<'NODE'
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { canonicalJson } from "/opt/openthrottle/runner/capabilities.mjs";
+import { createLoopRequestHash } from "/opt/openthrottle/runner/execute-loop.mjs";
+
+const requestPath = process.argv[2];
+const base = {
+  protocol: "loop-action@1",
+  actionId: "action-reviewer",
+  attemptId: "attempt-current",
+  graphId: "graph-1",
+  unitId: "unit-1",
+  role: "reviewer",
+  loop: "review",
+  agent: "codex",
+  skill: "final-review",
+  worktree: null,
+  nativeSessionId: null,
+  contextPolicy: "fresh",
+  timeoutMs: 120000,
+  transitionContext: "Probe reviewer read-only repository view isolation.",
+  allowedMcpServers: [],
+  credentialScopes: [],
+  receiptSchema: "probe/no-receipt@1",
+};
+mkdirSync(dirname(requestPath), { recursive: true, mode: 0o700 });
+writeFileSync(requestPath, canonicalJson({ ...base, ...createLoopRequestHash(base) }), { mode: 0o400 });
+NODE
+chown root:root "$REVIEWER_REQUEST"
+chmod 0400 "$REVIEWER_REQUEST"
+
 install -d -o root -g root -m 0700 "$ACTION_ROOT/attempt-current/action-builtin"
 PATH="$BIN:$PATH" node --input-type=module - "$BUILTIN_REQUEST" <<'NODE'
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -374,6 +409,27 @@ PATH="$BIN:$PATH" \
 OT_LOOP_ACTION_ROOT="$ACTION_ROOT" \
 OT_WORKTREE_ROOT="$WORKTREES" \
 OT_INTEGRATION_REPO_DIR="$INTEGRATION" \
+PROBE_INTEGRATION="$INTEGRATION" \
+PROBE_BASE="$BASE" \
+PROBE_READONLY_ACTION_DIR="$ACTION_ROOT/attempt-current/action-reviewer" \
+/opt/openthrottle/runner/execute-loop.mjs --request "$REVIEWER_REQUEST" --output "$REVIEWER_RESULT"
+
+node --input-type=module - "$REVIEWER_RESULT" <<'NODE'
+import { readFileSync } from "node:fs";
+const result = JSON.parse(readFileSync(process.argv[2], "utf8"));
+if (result.kind !== "loop_action_result" ||
+    result.attempt_id !== "attempt-current" ||
+    result.action_id !== "action-reviewer" ||
+    result.outcome !== "success" ||
+    result.subject !== null) {
+  throw new Error(`invalid reviewer probe result: ${JSON.stringify(result)}`);
+}
+NODE
+
+PATH="$BIN:$PATH" \
+OT_LOOP_ACTION_ROOT="$ACTION_ROOT" \
+OT_WORKTREE_ROOT="$WORKTREES" \
+OT_INTEGRATION_REPO_DIR="$INTEGRATION" \
 PROBE_BUILTIN_ACTION_DIR="$ACTION_ROOT/attempt-current/action-builtin" \
 PROBE_PRIOR_HOME_SECRET="$ACTION_ROOT/attempt-prior/action-home/home/native-session.json" \
 /opt/openthrottle/runner/execute-loop.mjs --request "$BUILTIN_REQUEST" --output "$BUILTIN_RESULT"
@@ -393,9 +449,11 @@ NODE
 gosu agent test ! -w "$WORKTREES/current"
 test "$(stat -c '%a' "$ACTION_ROOT/attempt-current/action-current")" = "700"
 test "$(stat -c '%a' "$ACTION_ROOT/attempt-current/action-lead")" = "700"
+test "$(stat -c '%a' "$ACTION_ROOT/attempt-current/action-reviewer")" = "700"
 test "$(stat -c '%a' "$ACTION_ROOT/attempt-current/action-builtin")" = "700"
 gosu agent test ! -r "$ACTION_ROOT/attempt-current/action-current/request.json"
 gosu agent test ! -r "$ACTION_ROOT/attempt-current/action-lead/request.json"
+gosu agent test ! -r "$ACTION_ROOT/attempt-current/action-reviewer/request.json"
 gosu agent test ! -r "$ACTION_ROOT/attempt-current/action-builtin/request.json"
 gosu agent test ! -r "$ACTION_ROOT/attempt-current/action-sibling/secret.txt"
 gosu agent test ! -r "$ACTION_ROOT/attempt-prior/action-current/secret.txt"

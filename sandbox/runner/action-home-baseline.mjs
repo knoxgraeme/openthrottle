@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync } from "node:fs";
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { prepareAgentOwnedDirectory } from "./filesystem-isolation.mjs";
 
@@ -38,7 +38,10 @@ function copyTrustedDirectory(source, destination) {
   if (!trustedBaselineEntry(metadata)) return false;
   mkdirSync(destination, { recursive: true, mode: 0o700 });
   for (const entry of readdirSync(source)) {
-    copyTrustedDirectory(join(source, entry), join(destination, entry));
+    if (!copyTrustedDirectory(join(source, entry), join(destination, entry))) {
+      rmSync(destination, { recursive: true, force: true });
+      return false;
+    }
   }
   return true;
 }

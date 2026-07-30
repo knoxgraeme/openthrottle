@@ -82,7 +82,6 @@ describe("action home baseline materialization", () => {
     const skillDir = join(source, "skills", "implement-unit");
     mkdirSync(skillDir, { recursive: true });
     writeFileSync(join(skillDir, "SKILL.md"), "# skill\n");
-    symlinkSync(join(source, "credentials.json"), join(skillDir, "credential-link"));
     chmodSync(join(source, "skills"), 0o555);
     chmodSync(skillDir, 0o555);
     chmodSync(join(skillDir, "SKILL.md"), 0o444);
@@ -102,9 +101,31 @@ describe("action home baseline materialization", () => {
         .toEqual([]);
       expect(existsSync(join(destination, "skills"))).toBe(false);
     }
-    expect(existsSync(join(destination, "skills", "implement-unit", "credential-link"))).toBe(false);
     expect(existsSync(join(destination, "credentials.json"))).toBe(false);
     expect(existsSync(join(destination, "settings.json"))).toBe(false);
+  });
+
+  it("does not report partial Claude skill discovery copies", () => {
+    if (typeof process.getuid !== "function" || process.getuid() !== 0) return;
+    const source = mkdtempSync(join(tmpdir(), "ot-claude-source-"));
+    const destination = mkdtempSync(join(tmpdir(), "ot-claude-destination-"));
+    directories.push(source, destination);
+    writeFileSync(join(source, "credentials.json"), "{\"token\":\"secret\"}\n");
+    const skillDir = join(source, "skills", "implement-unit");
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(join(skillDir, "SKILL.md"), "# skill\n");
+    symlinkSync(join(source, "credentials.json"), join(skillDir, "credential-link"));
+    chmodSync(join(source, "skills"), 0o555);
+    chmodSync(skillDir, 0o555);
+    chmodSync(join(skillDir, "SKILL.md"), 0o444);
+    chownSync(join(source, "skills"), 0, 0);
+    chownSync(skillDir, 0, 0);
+    chownSync(join(skillDir, "SKILL.md"), 0, 0);
+
+    expect(materializeClaudeProfileBaseline({ sourceHome: source, destinationHome: destination }))
+      .toEqual([]);
+
+    expect(existsSync(join(destination, "skills"))).toBe(false);
   });
 
   it("does not copy mutable Claude skill discovery trees", () => {

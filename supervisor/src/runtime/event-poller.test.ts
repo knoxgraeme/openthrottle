@@ -380,6 +380,18 @@ describe("sandbox event contracts", () => {
     expect(warn.mock.calls.flat().join(" ")).not.toContain("private-stage-token");
     const stored = store.getSandboxEvent("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")!;
     expect(stored.status).toBe("processed");
+    expect(JSON.parse(stored.payload)).toEqual({
+      version: 1,
+      kind: "stage_result",
+      event_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      run_id: "run-1",
+      pipeline_instance_id: "pipeline-1",
+      attempt_id: "attempt-1",
+      request_hash: "1".repeat(64),
+      result_hash: "2".repeat(64),
+    });
+    expect(stored.payload).not.toContain("artifacts");
+    expect(stored.payload).not.toContain("native_session_id");
     expect(stored.payload).not.toContain("private-stage-token");
     expect(files.size).toBe(0);
     warn.mockRestore();

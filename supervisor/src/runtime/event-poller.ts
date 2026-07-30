@@ -125,6 +125,34 @@ async function listEventFiles(sandbox: RuntimeWorkspace): Promise<SandboxEventFi
   return events.sort((left, right) => left.name.localeCompare(right.name));
 }
 
+function sandboxEventPayload(event: SandboxEvent): unknown {
+  if (event.kind === "stage_result") {
+    return {
+      version: event.version,
+      kind: event.kind,
+      event_id: event.event_id,
+      run_id: event.run_id,
+      pipeline_instance_id: event.pipeline_instance_id,
+      attempt_id: event.attempt_id,
+      request_hash: event.request_hash,
+      result_hash: event.result_hash,
+    };
+  }
+  if (event.kind === "activity") {
+    return {
+      ...event,
+      body: sanitizeText(event.body),
+      ...(event.action ? { action: sanitizeText(event.action) } : {}),
+      ...(event.parameter ? { parameter: sanitizeText(event.parameter) } : {}),
+      ...(event.result ? { result: sanitizeText(event.result) } : {}),
+    };
+  }
+  if (event.kind === "plan") {
+    return { ...event, plan: sanitizePlan(event.plan) };
+  }
+  return event;
+}
+
 async function readWorkspaceSubject(sandbox: RuntimeWorkspace): Promise<string> {
   if (!sandbox.process?.executeCommand) throw new Error("sandbox cannot attest the current workspace subject");
   const result = await sandbox.process.executeCommand(WORKSPACE_SUBJECT_COMMAND, undefined, undefined, 30);
@@ -249,30 +277,7 @@ async function pollTicketEvents(
       runId: event.run_id,
       sandboxId: ticket.sandbox_id,
       kind: event.kind,
-      payload: JSON.stringify(
-        event.kind === "stage_result"
-          ? {
-              version: event.version,
-              kind: event.kind,
-              event_id: event.event_id,
-              run_id: event.run_id,
-              pipeline_instance_id: event.pipeline_instance_id,
-              attempt_id: event.attempt_id,
-              request_hash: event.request_hash,
-              result_hash: event.result_hash,
-            }
-          : event.kind === "activity"
-          ? {
-              ...event,
-              body: sanitizeText(event.body),
-              ...(event.action ? { action: sanitizeText(event.action) } : {}),
-              ...(event.parameter ? { parameter: sanitizeText(event.parameter) } : {}),
-              ...(event.result ? { result: sanitizeText(event.result) } : {}),
-            }
-          : event.kind === "plan"
-            ? { ...event, plan: sanitizePlan(event.plan) }
-            : event
-      ),
+      payload: JSON.stringify(sandboxEventPayload(event)),
     });
     if (
       existing.run_id !== event.run_id ||

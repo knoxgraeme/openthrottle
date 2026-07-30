@@ -354,7 +354,7 @@ export function lockRepositorySkillStagePersistentProfiles(request, lockPersiste
 
 function repositorySkillProposalPath(request, fallback) {
   if (request.capability !== REPOSITORY_SKILL_CAPABILITY) return fallback;
-  return pathInside(stageActionDirectory(request), "proposal.json", "stage proposal path");
+  return pathInside(pathInside(stageActionDirectory(request), "home", "stage proposal directory"), "proposal.json", "stage proposal path");
 }
 
 export function stagePrompt(
@@ -391,7 +391,18 @@ export function stagePrompt(
 
 export { extractNativeSessionId } from "./native-session-package.mjs";
 
-export function defaultRunAgent({ request, invocation, repoDir, proposalPath, timeoutMs, model, agent = request.agent }) {
+export function defaultRunAgent({
+  request,
+  invocation,
+  repoDir,
+  proposalPath,
+  timeoutMs,
+  model,
+  agent = request.agent,
+  lockPersistentProfiles = lockRepositorySkillStagePersistentProfiles,
+  restorePersistentProfiles = restorePersistentAgentPrivateRoots,
+  lockStageHome = lockRepositorySkillStageHome,
+}) {
   let stageEnvironment = null;
   let repositorySkillRoot = null;
   const actionProposalPath = repositorySkillProposalPath(request, proposalPath);
@@ -404,6 +415,12 @@ export function defaultRunAgent({ request, invocation, repoDir, proposalPath, ti
   const cleanupErrors = [];
   let bodyError = null;
   try {
+    try {
+      lockedPersistentProfiles = lockPersistentProfiles(request);
+    } catch (error) {
+      lockedPersistentProfiles = lockedPersistentProfilesFrom(error, lockedPersistentProfiles);
+      throw error;
+    }
     stageEnvironment = repositorySkillStageEnvironment(request);
     repositorySkillRoot = materializeRepositorySkill({
       request,
@@ -448,12 +465,6 @@ export function defaultRunAgent({ request, invocation, repoDir, proposalPath, ti
     } else {
       throw new Error(`unsupported agent adapter ${agent}`);
     }
-    try {
-      lockedPersistentProfiles = lockRepositorySkillStagePersistentProfiles(request);
-    } catch (error) {
-      lockedPersistentProfiles = lockedPersistentProfilesFrom(error, lockedPersistentProfiles);
-      throw error;
-    }
     const result = runWithAgentProcessFence(
       () => runCapturedProcess("gosu", ["agent", "env", ...env, command, ...args], {
         cwd: repoDir,
@@ -477,11 +488,14 @@ export function defaultRunAgent({ request, invocation, repoDir, proposalPath, ti
       throw new Error("stage proposal exceeds the 1 MiB limit");
     }
     const nativeSessionId = request.nativeSessionId ?? extractNativeSessionId(result.stdout, agent);
-    sealNativeSessionPackage({
+    const sealedNativeSessionPackage = sealNativeSessionPackage({
       agent,
       nativeSessionId,
       profileRoot: stageEnvironment?.nativeSessionProfileRoot,
     });
+    if (nativeSessionId && !sealedNativeSessionPackage) {
+      throw new Error("native session id was reported without a sealed executor package");
+    }
     return {
       exitCode: result.status,
       signal: result.signal,
@@ -497,17 +511,20 @@ export function defaultRunAgent({ request, invocation, repoDir, proposalPath, ti
     throw error;
   } finally {
     try {
-      lockRepositorySkillStageHome(request);
+      lockStageHome(request);
     } catch (error) {
       cleanupErrors.push(error instanceof Error ? error.message : String(error));
     }
     try {
-      restorePersistentAgentPrivateRoots(lockedPersistentProfiles);
+      restorePersistentProfiles(lockedPersistentProfiles);
     } catch (error) {
       cleanupErrors.push(error instanceof Error ? error.message : String(error));
     }
-    if (cleanupErrors.length > 0 && !bodyError) {
-      throw new Error(`stage agent cleanup failed: ${cleanupErrors.join("; ")}`);
+    if (cleanupErrors.length > 0) {
+      const prefix = bodyError
+        ? `stage agent failed (${bodyError instanceof Error ? bodyError.message : String(bodyError)}) and cleanup failed`
+        : "stage agent cleanup failed";
+      throw new Error(`${prefix}: ${cleanupErrors.join("; ")}`);
     }
   }
 }

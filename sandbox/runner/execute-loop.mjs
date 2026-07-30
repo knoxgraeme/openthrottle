@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import { chmodSync, chownSync, existsSync, lchownSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, existsSync, lchownSync, lstatSync, mkdirSync, readFileSync, realpathSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { canonicalJson } from "./capabilities.mjs";
@@ -82,6 +82,7 @@ const UNSAFE_ACTION_ROOTS = new Set([
 const PERSISTENT_AGENT_PRIVATE_ROOTS = [
   "/home/agent/.claude",
   "/home/agent/.codex",
+  "/home/agent/.local/share/opencode",
   "/home/agent/.ot",
 ];
 
@@ -190,8 +191,29 @@ function lockNonCurrentActionDirectories(request, rootDir = configuredActionRoot
   }
 }
 
+function maybeRealPath(path) {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
+}
+
+function gitdirFromFilesystem(repoDir) {
+  const dotGit = join(repoDir, ".git");
+  if (!existsSync(dotGit)) return [];
+  const metadata = lstatSync(dotGit);
+  if (metadata.isDirectory()) return [dotGit, maybeRealPath(dotGit)];
+  if (!metadata.isFile()) return [dotGit];
+  const match = readFileSync(dotGit, "utf8").match(/^gitdir:\s*(.+?)\s*$/m);
+  if (!match) return [dotGit];
+  const gitdir = resolve(repoDir, match[1]);
+  return [dotGit, gitdir, maybeRealPath(gitdir)];
+}
+
 export function gitSafeDirectoryConfigArgs(repoDir, extraSafeDirectories = []) {
-  return [...new Set([repoDir, ...extraSafeDirectories])]
+  const resolvedRepo = maybeRealPath(repoDir);
+  return [...new Set([repoDir, resolvedRepo, ...gitdirFromFilesystem(resolvedRepo), ...extraSafeDirectories.flatMap((path) => [path, maybeRealPath(path)])])]
     .filter((path) => typeof path === "string" && path.length > 0)
     .flatMap((path) => ["-c", `safe.directory=${path}`]);
 }
@@ -338,11 +360,18 @@ export function lockPersistentAgentPrivateRoots(paths = PERSISTENT_AGENT_PRIVATE
 export function withLockedPersistentProfiles(error, lockedPersistentProfiles) {
   const wrapped = error instanceof Error ? error : new Error(String(error));
   wrapped.lockedPersistentProfiles = [...lockedPersistentProfiles];
+  wrapped.retryableInfrastructureFailure = true;
   return wrapped;
 }
 
 export function lockedPersistentProfilesFrom(error, fallback = []) {
   return Array.isArray(error?.lockedPersistentProfiles) ? error.lockedPersistentProfiles : fallback;
+}
+
+function retryableInfrastructureError(message) {
+  const error = new Error(message);
+  error.retryableInfrastructureFailure = true;
+  return error;
 }
 
 function snapshotPrivateTree(path, snapshots = []) {
@@ -558,11 +587,9 @@ function createReadOnlyRepositoryView(request, sourceRepoDir = "/home/agent/repo
   const destination = pathInside(currentActionDirectory, "repo-view");
   rmSync(destination, { recursive: true, force: true });
   lockNonCurrentActionDirectories(request, actionRoot);
-  const sourceGitDir = join(sourceRepoDir, ".git");
-  const sourceSafeDirectories = existsSync(sourceGitDir) ? [sourceGitDir] : [];
   const head = runRootGit(sourceRepoDir, ["rev-parse", "HEAD"]);
   runRootGit(sourceRepoDir, ["clone", "--quiet", "--no-hardlinks", sourceRepoDir, destination], {}, {
-    safeDirectories: sourceSafeDirectories,
+    safeDirectories: gitdirFromFilesystem(sourceRepoDir),
   });
   runRootGit(destination, ["checkout", "--quiet", "--detach", head]);
   runRootGit(destination, ["config", "remote.origin.url", "DISABLED_BY_OPENTHROTTLE_READONLY_VIEW"]);
@@ -663,17 +690,27 @@ function makeCurrentActionDirectoryTraverseOnly(request) {
 
 export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDirectory(request) ?? "/home/agent/repo", repositorySkillRoot = null }) {
   const prompt = loopPrompt(request, { repositorySkillRoot });
-  const command = request.agent === "codex" ? "codex" : request.agent;
-  const args = request.agent === "codex"
-    ? ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-C", repoDir, ...(invocation.mode === "resume" ? ["resume", invocation.nativeSessionId, prompt] : ["-"])]
-    : request.agent === "claude"
-      ? ["-p", ...(invocation.mode === "resume" ? ["--resume", invocation.nativeSessionId] : []), prompt, "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"]
-      : ["run", "--format", "json", "--dir", repoDir, "--auto", ...(invocation.mode === "resume" ? ["--session", invocation.nativeSessionId] : []), prompt];
+  if (request.agent === "codex") {
+    return {
+      repoDir,
+      command: "codex",
+      args: ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-C", repoDir, ...(invocation.mode === "resume" ? ["resume", invocation.nativeSessionId, prompt] : ["-"])],
+      input: invocation.mode !== "resume" ? prompt : undefined,
+    };
+  }
+  if (request.agent === "claude") {
+    return {
+      repoDir,
+      command: "claude",
+      args: ["-p", ...(invocation.mode === "resume" ? ["--resume", invocation.nativeSessionId] : []), prompt, "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"],
+      input: undefined,
+    };
+  }
   return {
     repoDir,
-    command,
-    args,
-    input: request.agent === "codex" && invocation.mode !== "resume" ? prompt : undefined,
+    command: "opencode",
+    args: ["run", "--format", "json", "--dir", repoDir, "--auto", ...(invocation.mode === "resume" ? ["--session", invocation.nativeSessionId] : []), prompt],
+    input: undefined,
   };
 }
 
@@ -687,20 +724,23 @@ export function runLoopAgentInPreparedRepository({
   lockPersistentProfiles = lockPersistentAgentPrivateRoots,
   restorePersistentProfiles = restorePersistentAgentPrivateRoots,
 }) {
-  const repoDir = prepareLoopRepository(request, integrationRepoDir);
-  const preparedEnvironment = prepareLoopAgentEnvironment(request, repoDir);
-  const built = loopAgentCommand({ request, invocation, repoDir, repositorySkillRoot: preparedEnvironment.repositorySkillRoot });
+  let repoDir = null;
+  let preparedEnvironment = null;
+  let built = null;
   let lockedPersistentProfiles = [];
   const cleanupErrors = [];
   let bodyError = null;
-  lockIntegration(integrationRepoDir);
   try {
+    lockIntegration(integrationRepoDir);
     try {
       lockedPersistentProfiles = lockPersistentProfiles();
     } catch (error) {
       lockedPersistentProfiles = lockedPersistentProfilesFrom(error, lockedPersistentProfiles);
       throw error;
     }
+    repoDir = prepareLoopRepository(request, integrationRepoDir);
+    preparedEnvironment = prepareLoopAgentEnvironment(request, repoDir);
+    built = loopAgentCommand({ request, invocation, repoDir, repositorySkillRoot: preparedEnvironment.repositorySkillRoot });
     makeCurrentActionDirectoryTraverseOnly(request);
     const result = processFence(() => runProcess("gosu", [
       "agent", "env", ...preparedEnvironment.env, built.command, ...built.args,
@@ -710,11 +750,14 @@ export function runLoopAgentInPreparedRepository({
       timeout: request.timeoutMs,
     }));
     const nativeSessionId = request.nativeSessionId ?? extractNativeSessionId(result.stdout, request.agent);
-    sealNativeSessionPackage({
+    const sealedNativeSessionPackage = sealNativeSessionPackage({
       agent: request.agent,
       nativeSessionId,
       profileRoot: preparedEnvironment.nativeSessionProfileRoot,
     });
+    if (nativeSessionId && !sealedNativeSessionPackage) {
+      throw new Error("native session id was reported without a sealed executor package");
+    }
     return {
       ...result,
       nativeSessionId,
@@ -735,8 +778,11 @@ export function runLoopAgentInPreparedRepository({
     } catch (error) {
       cleanupErrors.push(error instanceof Error ? error.message : String(error));
     }
-    if (cleanupErrors.length > 0 && !bodyError) {
-      throw new Error(`loop action cleanup failed: ${cleanupErrors.join("; ")}`);
+    if (cleanupErrors.length > 0) {
+      const prefix = bodyError
+        ? `loop action failed (${bodyError instanceof Error ? bodyError.message : String(bodyError)}) and cleanup failed`
+        : "loop action cleanup failed";
+      throw retryableInfrastructureError(`${prefix}: ${cleanupErrors.join("; ")}`);
     }
   }
 }
@@ -827,6 +873,7 @@ export function executeLoopAction({
         stderr: String(error),
         nativeSessionId: request.nativeSessionId,
         integrationRepoDir,
+        retryableInfrastructureFailure: Boolean(error?.retryableInfrastructureFailure),
       };
     }
     const worktreeDir = loopWorktreeDirectory(request);
@@ -849,6 +896,7 @@ export function executeLoopAction({
         receiptError = error instanceof Error ? error.message : String(error);
       }
     }
+    const retryableInfrastructureFailure = Boolean(execution.retryableInfrastructureFailure);
     const failed = Boolean(subjectError) || execution.timedOut || execution.signal || execution.status !== 0 || Boolean(receiptError);
     result = {
       version: 1,
@@ -857,12 +905,14 @@ export function executeLoopAction({
       action_id: request.actionId,
       attempt_id: request.attemptId,
       request_hash: request.requestHash,
-      outcome: failed ? "failure" : "success",
+      outcome: retryableInfrastructureFailure ? "retryable_infrastructure_failure" : failed ? "failure" : "success",
       native_session_id: execution.nativeSessionId ?? request.nativeSessionId ?? null,
       subject,
       receipt: parsedReceipt
         ? canonicalJson(parsedReceipt)
-        : sanitizeArtifactText(subjectError || receiptError || execution.stdout || execution.stderr || (failed ? "loop action failed" : "loop action completed")).slice(0, 128_000),
+        : sanitizeArtifactText(retryableInfrastructureFailure
+          ? execution.stderr || "loop action infrastructure failure"
+          : subjectError || receiptError || execution.stdout || execution.stderr || (failed ? "loop action failed" : "loop action completed")).slice(0, 128_000),
       created_at: now(),
     };
   } finally {
