@@ -8,10 +8,12 @@
 
 import { readFileSync, existsSync } from 'node:fs';
 import * as p from '@clack/prompts';
-import { extractExecutionPlanBlocks, readExecutionPlanFromMarkdown, validateLocalGraphSelection, validatePlanFileForGraph } from './plan.js';
+import { extractExecutionPlanBlocks, readExecutionPlanFromMarkdown, validateLocalGraphSelection, validatePlanFileForGraph, type LocalGraphSelection } from './plan.js';
 import { getErrorMessage, readEnv, requireEnv, linearGraphQL } from './util.js';
 
 export const SHIP_SELECTION_FENCE = "openthrottle.ship-selection/v1";
+export const STRUCTURED_SHIP_UNAVAILABLE =
+  "structured shipping is unavailable until graph/for-each-unit@1 is active on the configured supervisor";
 
 interface ParsedMarkdown {
   title: string;
@@ -48,8 +50,11 @@ export function parseShipArgs(args: string[]): { file?: string; graphId?: string
   return parsed;
 }
 
-export function validateGraphSelectionForShip(file: string, graphId?: string): void {
-  if (!graphId && !existsSync(".openthrottle.yml")) return;
+export function validateGraphSelectionForShip(
+  file: string,
+  graphId?: string
+): LocalGraphSelection | undefined {
+  if (!graphId && !existsSync(".openthrottle.yml")) return undefined;
   const content = readFileSync(file, "utf8");
   const blocks = extractExecutionPlanBlocks(content);
   const plan = blocks.length > 0 ? readExecutionPlanFromMarkdown(content, file) : undefined;
@@ -57,11 +62,19 @@ export function validateGraphSelectionForShip(file: string, graphId?: string): v
   const graph = validateLocalGraphSelection({ graphId: selectedGraphId });
   if (graph.consumesUnits) {
     validatePlanFileForGraph(file, { graphId: graph.graphId });
-    return;
+    return graph;
   }
   if (plan && plan.plan.value.graph_id !== graph.graphId) {
     throw new Error(`${file}: execution_plan.graph_id must match selected graph ${graph.graphId}`);
   }
+  return graph;
+}
+
+export function assertStructuredShipAvailable(
+  graph: LocalGraphSelection | undefined
+): void {
+  if (!graph?.consumesUnits) return;
+  throw new Error(`${STRUCTURED_SHIP_UNAVAILABLE}; selected graph ${graph.graphId} was validated but not shipped`);
 }
 
 function buildShipSelectionBlock(graphId: string): string {
@@ -176,7 +189,8 @@ export default async function ship(args: string[] | string | undefined): Promise
   let body: string;
   try {
     ({ title, body } = parseMarkdown(content));
-    validateGraphSelectionForShip(file, parsed.graphId);
+    const graph = validateGraphSelectionForShip(file, parsed.graphId);
+    assertStructuredShipAvailable(graph);
     body = buildShipDescription(body, parsed.graphId);
   } catch (err: unknown) {
     p.log.error(getErrorMessage(err));
