@@ -139,7 +139,7 @@ function repositorySkillRequest() {
     transitionContext: "Implement the unit.",
     allowedMcpServers: [],
     credentialScopes: ["model.invoke", "repo.read", "repo.write"],
-    receiptSchema: "probe/no-receipt@1",
+    receiptSchema: "openthrottle.receipt/v1",
     repositorySkill,
   };
   return { ...withoutFence, ...createLoopRequestHash(withoutFence) };
@@ -499,6 +499,42 @@ describe("loop action request validation", () => {
           .toBe("DISABLED_BY_OPENTHROTTLE_READONLY_VIEW");
         expect(execFileSync("git", ["-c", `safe.directory=${expectedView}`, "-C", expectedView, "config", "--get", "remote.origin.pushurl"], { encoding: "utf8" }).trim())
           .toBe("DISABLED_BY_OPENTHROTTLE_READONLY_VIEW");
+        expect(statSync(expectedView).mode & 0o777).toBe(0o555);
+        return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+      },
+    });
+
+    expect(result.status).toBe(0);
+  });
+
+  it("runs reviewer loops from the source repository HEAD in a detached read-only view", () => {
+    const integrationRepoDir = repository();
+    writeFileSync(join(integrationRepoDir, "review-subject.txt"), "review subject\n");
+    execFileSync("git", ["add", "review-subject.txt"], { cwd: integrationRepoDir });
+    execFileSync("git", ["commit", "-qm", "review subject"], { cwd: integrationRepoDir });
+    const valid = validateLoopRequest(request({
+      role: "reviewer",
+      loop: "review",
+      skill: "final-review",
+      worktree: null,
+      credentialScopes: ["repo.read"],
+    }));
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+    directories.push(actionRoot);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+    const expectedView = join(actionRoot, valid.attemptId, valid.actionId, "repo-view");
+
+    const result = runLoopAgentInPreparedRepository({
+      request: valid,
+      invocation: resolveLoopInvocation(valid),
+      integrationRepoDir,
+      lockIntegration: () => true,
+      processFence: (execute) => execute(),
+      runProcess: (_command, _args, options) => {
+        expect(options.cwd).toBe(expectedView);
+        expect(execFileSync("git", ["-c", `safe.directory=${expectedView}`, "-C", expectedView, "rev-parse", "HEAD"], { encoding: "utf8" }).trim())
+          .toMatch(/^[a-f0-9]{40}$/);
+        expect(readFileSync(join(expectedView, "review-subject.txt"), "utf8")).toBe("review subject\n");
         expect(statSync(expectedView).mode & 0o777).toBe(0o555);
         return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
       },

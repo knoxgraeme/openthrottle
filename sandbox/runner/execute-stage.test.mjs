@@ -945,10 +945,26 @@ printf '{"type":"system","subtype":"init","session_id":"smoke-claude-session","m
     directories.push(actionRoot, sourceRoot, binDir);
     process.env.OT_STAGE_ACTION_ROOT = actionRoot;
     process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sourceRoot;
+    const unrelatedProfileRoot = mkdtempSync(join(tmpdir(), "ot-stage-unrelated-claude-profile-"));
+    directories.push(unrelatedProfileRoot);
+    const unrelatedSessionStore = nativeSessionStoragePath("claude", unrelatedProfileRoot);
+    mkdirSync(unrelatedSessionStore, { recursive: true });
+    writeFileSync(
+      join(unrelatedSessionStore, "unrelated-claude-session.jsonl"),
+      '{"type":"system","subtype":"init","session_id":"unrelated-claude-session","model":"stub"}\n',
+    );
+    sealNativeSessionPackage({
+      agent: "claude",
+      nativeSessionId: "unrelated-claude-session",
+      profileRoot: unrelatedProfileRoot,
+      sourceRoot,
+    });
 
     installFakeGosu(binDir);
     writeExecutable(join(binDir, "claude"), `#!/usr/bin/env bash
 set -euo pipefail
+mkdir -p "$HOME/.claude/projects"
+printf '{"type":"system","subtype":"init","session_id":"unrelated-claude-session","model":"stub"}\\n' > "$HOME/.claude/projects/unrelated-claude-session.jsonl"
 cat > "$OT_STAGE_PROPOSAL_FILE" <<'JSON'
 {"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"ok","evidence":["session reported"],"findings":[],"actions":[],"uncertainty":[]}
 JSON
