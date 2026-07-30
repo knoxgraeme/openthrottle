@@ -51,6 +51,7 @@ describe("database migrations", () => {
       "f8bdad88455442e46d1951f7fe48050f9367d83273ed94c8eaf7f610666fb809",
       "5327e028894aeac2334d4fd63da3937cdb3470419d9cde8aa7f20832280aa6ad",
       "438e4388d9f50e29233a33c86065e97e0e958b9c1e39a04e0c6be74c279c805f",
+      "69dcd8b1c2bbd9cb83379809dc19ac8aa6dae441297d3a0f3a1d8723d94decae",
     ]);
   });
 
@@ -108,6 +109,48 @@ describe("database migrations", () => {
       SELECT name FROM sqlite_master
       WHERE type = 'index' AND name = 'execution_work_one_active_idx'
     `).get()).toEqual({ name: "execution_work_one_active_idx" });
+    expect(db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'index' AND name = 'execution_units_graph_status_idx'
+    `).get()).toEqual({ name: "execution_units_graph_status_idx" });
+    expect(db.prepare(`
+      SELECT COUNT(*) AS count FROM pragma_foreign_key_list('execution_units')
+      WHERE "table" = 'execution_graphs'
+    `).get()).toEqual({ count: 3 });
+    expect(db.prepare(`
+      SELECT COUNT(*) AS count FROM pragma_foreign_key_list('execution_work_attempts')
+      WHERE "table" = 'execution_units'
+    `).get()).toEqual({ count: 5 });
+  });
+
+  it("does not stamp v18 when the composite rebuild cannot run", () => {
+    db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+      CREATE TABLE pipeline_stage_attempts (
+        id TEXT PRIMARY KEY,
+        pipeline_instance_id TEXT NOT NULL
+      );
+      CREATE TABLE execution_graphs (id TEXT PRIMARY KEY);
+      CREATE TABLE execution_units (id TEXT PRIMARY KEY);
+      CREATE TABLE execution_work_attempts (id TEXT PRIMARY KEY);
+      CREATE TABLE execution_gate_receipts (id TEXT PRIMARY KEY);
+      CREATE TABLE execution_downstream_context (id TEXT PRIMARY KEY);
+    `);
+    for (const migration of databaseMigrations.filter((candidate) => candidate.version <= 17)) {
+      db.prepare(`
+        INSERT INTO schema_migrations(version, name, checksum, applied_at)
+        VALUES (?, ?, ?, '2026-07-29T00:00:00.000Z')
+      `).run(migration.version, migration.name, migration.checksum);
+    }
+
+    expect(() => applyDatabaseMigrations(db!)).toThrow();
+    expect(db.prepare("SELECT version FROM schema_migrations WHERE version = 18").get()).toBeUndefined();
   });
 
   it("upgrades databases already stamped with the immutable v16 checksum through v17", () => {

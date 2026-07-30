@@ -146,11 +146,12 @@ export interface ExecutionUnitStore {
     unitId: string;
     reason: UnitTerminalReason;
   }): "settled" | "already_settled";
-  healStaleChildActions(input: {
+  healExpiredCurrentChildAction(input: {
     parentAttemptId: string;
+    actionId: string;
     nowIso: string;
     reason: string;
-  }): Array<{ actionId: string; unitId: string }>;
+  }): "healed" | "not_current";
   renewChildActionLiveness(input: {
     parentRunId: string;
     actionId: string;
@@ -294,35 +295,6 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     return "settled";
   }
 
-  function healStaleChildActionRows(input: {
-    parentAttemptId: string;
-    nowIso: string;
-    reason: string;
-  }): Array<{ actionId: string; unitId: string }> {
-    const stale = db.prepare(`
-      SELECT id, unit_id FROM execution_work_attempts
-      WHERE parent_attempt_id = ? AND status IN ('dispatched', 'running')
-        AND lease_until IS NOT NULL AND lease_until <= ?
-      ORDER BY created_at, id
-    `).all(input.parentAttemptId, input.nowIso) as Array<{ id: string; unit_id: string }>;
-    for (const action of stale) {
-      db.prepare(`
-        UPDATE execution_work_attempts
-        SET status = 'dead', lease_until = NULL, completed_at = COALESCE(completed_at, ?),
-            last_error = ?, updated_at = ?
-        WHERE id = ? AND status IN ('dispatched', 'running')
-      `).run(input.nowIso, input.reason, input.nowIso, action.id);
-      settleUnitRow({
-        parentAttemptId: input.parentAttemptId,
-        unitId: action.unit_id,
-        reason: "structural_exit",
-        timestamp: input.nowIso,
-      });
-    }
-    settleStructurallyBlockedDependents(input.parentAttemptId, input.nowIso);
-    return stale.map((action) => ({ actionId: action.id, unitId: action.unit_id }));
-  }
-
   function settleStructurallyBlockedDependents(parentAttemptId: string, timestamp: string): void {
     for (;;) {
       const rows = listUnitRows(parentAttemptId);
@@ -438,11 +410,6 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       WHERE parent_attempt_id = ? AND status = 'leased'
         AND lease_until IS NOT NULL AND lease_until <= ?
     `).run(input.nowIso, input.parentAttemptId, input.nowIso);
-    healStaleChildActionRows({
-      parentAttemptId: input.parentAttemptId,
-      nowIso: input.nowIso,
-      reason: "child action missed heartbeat fence",
-    });
     const dispatched = db.prepare(`
       SELECT * FROM execution_work_attempts
       WHERE parent_attempt_id = ? AND status IN ('dispatched', 'running')
@@ -521,12 +488,15 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
           completed_at = ?, updated_at = ?
       WHERE id = ? AND status IN ('leased', 'dispatched', 'running')
     `).run(input.resultHash, input.outputSubject, timestamp, timestamp, input.actionId);
-    db.prepare(`
+    const unitUpdate = db.prepare(`
       UPDATE execution_units
       SET status = 'integrated', active_work_attempt_id = NULL,
           accepted_candidate_subject = ?, integration_subject = ?, updated_at = ?
       WHERE id = ? AND active_work_attempt_id = ?
     `).run(input.outputSubject, input.outputSubject, timestamp, action.execution_unit_id, input.actionId);
+    if (unitUpdate.changes !== 1) {
+      throw new Error(`execution work attempt ${input.actionId} is not the current active action`);
+    }
     return db.prepare("SELECT * FROM execution_work_attempts WHERE id = ?").get(input.actionId) as ExecutionWorkAttempt;
   });
 
@@ -724,9 +694,37 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     return result;
   });
 
-  const healStaleChildActions = db.transaction((
-    input: Parameters<ExecutionUnitStore["healStaleChildActions"]>[0]
-  ): Array<{ actionId: string; unitId: string }> => healStaleChildActionRows(input));
+  const healExpiredCurrentChildAction = db.transaction((
+    input: Parameters<ExecutionUnitStore["healExpiredCurrentChildAction"]>[0]
+  ): "healed" | "not_current" => {
+    const action = db.prepare(`
+      SELECT unit_id FROM execution_work_attempts
+      WHERE id = ? AND parent_attempt_id = ? AND status IN ('dispatched', 'running')
+        AND lease_until IS NOT NULL AND lease_until <= ?
+    `).get(input.actionId, input.parentAttemptId, input.nowIso) as { unit_id: string } | undefined;
+    if (!action) return "not_current";
+    const update = db.prepare(`
+      UPDATE execution_work_attempts
+      SET status = 'dead', lease_until = NULL, completed_at = COALESCE(completed_at, ?),
+          last_error = ?, updated_at = ?
+      WHERE id = ? AND parent_attempt_id = ? AND status IN ('dispatched', 'running')
+        AND lease_until IS NOT NULL AND lease_until <= ?
+        AND EXISTS (
+          SELECT 1 FROM execution_units
+          WHERE id = execution_work_attempts.execution_unit_id
+            AND active_work_attempt_id = execution_work_attempts.id
+        )
+    `).run(input.nowIso, input.reason, input.nowIso, input.actionId, input.parentAttemptId, input.nowIso);
+    if (update.changes !== 1) return "not_current";
+    settleUnitRow({
+      parentAttemptId: input.parentAttemptId,
+      unitId: action.unit_id,
+      reason: "structural_exit",
+      timestamp: input.nowIso,
+    });
+    settleStructurallyBlockedDependents(input.parentAttemptId, input.nowIso);
+    return "healed";
+  });
 
   return {
     createGraph,
@@ -785,7 +783,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     },
     stopActiveWork,
     settleUnitTerminal,
-    healStaleChildActions,
+    healExpiredCurrentChildAction,
     renewChildActionLiveness(input) {
       const timestamp = now();
       return db.prepare(`

@@ -178,24 +178,24 @@ export function createStatusStore(db: Database.Database): Pick<PipelineStore, "g
       const failedOrDeadEffects = effects.filter((item) => item.status === "failed" || item.status === "dead");
       const newestEffect = failedOrDeadEffects[0];
       const lastError = newestStatusError(newestEffect, failedGate, gateError);
-      const structuredUnits = db.prepare(`
+      const latestExecutionGraph = db.prepare(`
+        SELECT id FROM execution_graphs
+        WHERE pipeline_instance_id = ?
+        ORDER BY updated_at DESC, created_at DESC, id DESC
+        LIMIT 1
+      `).get(instance.id) as { id: string } | undefined;
+      const structuredUnits = latestExecutionGraph ? db.prepare(`
         SELECT eu.unit_id, eu.status, eu.terminal_level, eu.alarm, eu.integration_subject
         FROM execution_units eu
-        JOIN execution_graphs eg ON eg.id = eu.execution_graph_id
-        WHERE eg.id = (
-          SELECT id FROM execution_graphs
-          WHERE pipeline_instance_id = ?
-          ORDER BY updated_at DESC, created_at DESC, id DESC
-          LIMIT 1
-        )
+        WHERE eu.execution_graph_id = ?
         ORDER BY eu.authored_order, eu.unit_id
-      `).all(instance.id) as Array<{
+      `).all(latestExecutionGraph.id) as Array<{
         unit_id: string;
         status: string;
         terminal_level: string | null;
         alarm: number;
         integration_subject: string | null;
-      }>;
+      }> : [];
       return {
         execution_mode: "pipeline",
         instance_id: instance.id,

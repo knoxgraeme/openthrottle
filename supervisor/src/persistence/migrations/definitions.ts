@@ -1023,6 +1023,239 @@ ${executionChildGateSchema}
 child-gate-contract:deterministic gate receipts and downstream context live on child execution records/v1
 stop-contract:stopped child graphs remain durable and are not eligible for redispatch/v1`;
 
+const executionCompositeIdentitySchema = `
+ALTER TABLE execution_gate_receipts RENAME TO execution_gate_receipts_old;
+ALTER TABLE execution_downstream_context RENAME TO execution_downstream_context_old;
+ALTER TABLE execution_work_attempts RENAME TO execution_work_attempts_old;
+ALTER TABLE execution_units RENAME TO execution_units_old;
+ALTER TABLE execution_graphs RENAME TO execution_graphs_old;
+
+DROP INDEX IF EXISTS execution_graphs_instance_idx;
+DROP INDEX IF EXISTS execution_units_one_running_idx;
+DROP INDEX IF EXISTS execution_units_ready_idx;
+DROP INDEX IF EXISTS execution_units_graph_status_idx;
+DROP INDEX IF EXISTS execution_work_one_active_idx;
+DROP INDEX IF EXISTS execution_work_claim_idx;
+DROP INDEX IF EXISTS execution_gate_receipts_parent_idx;
+DROP INDEX IF EXISTS execution_downstream_context_target_idx;
+DROP TRIGGER IF EXISTS execution_graphs_parent_attempt_run_insert_fence;
+DROP TRIGGER IF EXISTS execution_graphs_parent_attempt_run_update_fence;
+
+CREATE TABLE execution_graphs (
+  id TEXT PRIMARY KEY,
+  pipeline_instance_id TEXT NOT NULL,
+  parent_attempt_id TEXT NOT NULL UNIQUE,
+  parent_stage_id TEXT NOT NULL,
+  parent_run_id TEXT NOT NULL,
+  graph_digest TEXT NOT NULL,
+  plan_digest TEXT NOT NULL,
+  integration_subject TEXT,
+  aggregate_artifact_hash TEXT,
+  aggregate_emitted_at TEXT,
+  stopped_at TEXT,
+  stop_reason TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
+  FOREIGN KEY(parent_attempt_id, pipeline_instance_id)
+    REFERENCES pipeline_stage_attempts(id, pipeline_instance_id) ON DELETE RESTRICT,
+  UNIQUE(id, pipeline_instance_id, parent_attempt_id),
+  UNIQUE(id, pipeline_instance_id, parent_attempt_id, parent_run_id)
+);
+CREATE INDEX execution_graphs_instance_idx
+  ON execution_graphs(pipeline_instance_id, updated_at DESC, created_at DESC, id DESC);
+CREATE TRIGGER execution_graphs_parent_attempt_run_insert_fence
+BEFORE INSERT ON execution_graphs
+FOR EACH ROW
+WHEN NOT EXISTS (
+  SELECT 1 FROM pipeline_stage_attempts
+  WHERE id = NEW.parent_attempt_id
+    AND pipeline_instance_id = NEW.pipeline_instance_id
+    AND planned_run_id = NEW.parent_run_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'execution graph parent attempt run fence mismatch');
+END;
+CREATE TRIGGER execution_graphs_parent_attempt_run_update_fence
+BEFORE UPDATE OF pipeline_instance_id, parent_attempt_id, parent_run_id ON execution_graphs
+FOR EACH ROW
+WHEN NOT EXISTS (
+  SELECT 1 FROM pipeline_stage_attempts
+  WHERE id = NEW.parent_attempt_id
+    AND pipeline_instance_id = NEW.pipeline_instance_id
+    AND planned_run_id = NEW.parent_run_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'execution graph parent attempt run fence mismatch');
+END;
+
+CREATE TABLE execution_units (
+  id TEXT PRIMARY KEY,
+  execution_graph_id TEXT NOT NULL,
+  pipeline_instance_id TEXT NOT NULL,
+  parent_attempt_id TEXT NOT NULL,
+  unit_id TEXT NOT NULL,
+  authored_order INTEGER NOT NULL CHECK(authored_order >= 0),
+  dependency_unit_ids TEXT NOT NULL CHECK(json_valid(dependency_unit_ids)),
+  status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'integrated', 'completed', 'exited', 'failed')),
+  active_work_attempt_id TEXT,
+  accepted_candidate_subject TEXT,
+  integration_subject TEXT,
+  terminal_level TEXT CHECK(terminal_level IS NULL OR terminal_level IN ('completed', 'exited', 'failed')),
+  alarm INTEGER NOT NULL DEFAULT 0 CHECK(alarm IN (0, 1)),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(execution_graph_id, pipeline_instance_id, parent_attempt_id)
+    REFERENCES execution_graphs(id, pipeline_instance_id, parent_attempt_id) ON DELETE RESTRICT,
+  UNIQUE(parent_attempt_id, unit_id),
+  UNIQUE(active_work_attempt_id),
+  UNIQUE(id, execution_graph_id, pipeline_instance_id, parent_attempt_id),
+  UNIQUE(id, execution_graph_id, pipeline_instance_id, parent_attempt_id, unit_id)
+);
+CREATE UNIQUE INDEX execution_units_one_running_idx
+  ON execution_units(parent_attempt_id) WHERE status = 'running';
+CREATE INDEX execution_units_ready_idx
+  ON execution_units(parent_attempt_id, status, authored_order, unit_id);
+CREATE INDEX execution_units_graph_status_idx
+  ON execution_units(execution_graph_id, authored_order, unit_id);
+
+CREATE TABLE execution_work_attempts (
+  id TEXT PRIMARY KEY,
+  execution_graph_id TEXT NOT NULL,
+  execution_unit_id TEXT NOT NULL,
+  pipeline_instance_id TEXT NOT NULL,
+  parent_attempt_id TEXT NOT NULL,
+  parent_run_id TEXT NOT NULL,
+  unit_id TEXT NOT NULL,
+  attempt_ordinal INTEGER NOT NULL CHECK(attempt_ordinal >= 1),
+  action_kind TEXT NOT NULL CHECK(action_kind IN (
+    'implement', 'simplify', 'command', 'candidate', 'integrate', 'aggregate', 'stop', 'cleanup'
+  )),
+  idempotency_key TEXT NOT NULL UNIQUE,
+  request_hash TEXT,
+  result_hash TEXT,
+  native_session_id TEXT,
+  status TEXT NOT NULL CHECK(status IN ('pending', 'leased', 'dispatched', 'running', 'completed', 'failed', 'dead')),
+  lease_owner TEXT,
+  lease_until TEXT,
+  output_subject TEXT,
+  payload TEXT NOT NULL CHECK(json_valid(payload)),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT,
+  last_error TEXT,
+  FOREIGN KEY(execution_graph_id, pipeline_instance_id, parent_attempt_id, parent_run_id)
+    REFERENCES execution_graphs(id, pipeline_instance_id, parent_attempt_id, parent_run_id) ON DELETE RESTRICT,
+  FOREIGN KEY(execution_unit_id, execution_graph_id, pipeline_instance_id, parent_attempt_id, unit_id)
+    REFERENCES execution_units(id, execution_graph_id, pipeline_instance_id, parent_attempt_id, unit_id) ON DELETE RESTRICT,
+  UNIQUE(execution_unit_id, attempt_ordinal, action_kind),
+  UNIQUE(execution_graph_id, execution_unit_id, id, parent_attempt_id, unit_id),
+  UNIQUE(id, execution_graph_id, execution_unit_id, pipeline_instance_id, parent_attempt_id, unit_id)
+);
+CREATE UNIQUE INDEX execution_work_one_active_idx
+  ON execution_work_attempts(parent_attempt_id)
+  WHERE status IN ('leased', 'dispatched', 'running');
+CREATE INDEX execution_work_claim_idx
+  ON execution_work_attempts(parent_attempt_id, status, lease_until, created_at);
+
+CREATE TABLE execution_gate_receipts (
+  id TEXT PRIMARY KEY,
+  execution_graph_id TEXT NOT NULL,
+  execution_unit_id TEXT NOT NULL,
+  execution_work_attempt_id TEXT NOT NULL,
+  parent_attempt_id TEXT NOT NULL,
+  unit_id TEXT NOT NULL,
+  gate_kind TEXT NOT NULL CHECK(gate_kind IN (
+    'unit_completion', 'unit_command', 'unit_acceptance', 'final_semantic'
+  )),
+  evaluator_kind TEXT NOT NULL CHECK(evaluator_kind IN ('semantic', 'command', 'human', 'publish_subject')),
+  subject TEXT,
+  result TEXT NOT NULL CHECK(result IN ('passed', 'failed', 'indeterminate', 'not_configured')),
+  outcome TEXT NOT NULL CHECK(outcome IN (
+    'success', 'no_change', 'semantic_repair_required', 'retryable_infrastructure_failure',
+    'needs_human', 'canceled', 'superseded', 'failure'
+  )),
+  reason TEXT NOT NULL,
+  artifact_hashes TEXT NOT NULL CHECK(json_valid(artifact_hashes)),
+  payload TEXT NOT NULL CHECK(json_valid(payload)),
+  receipt_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(execution_graph_id, execution_unit_id, execution_work_attempt_id, parent_attempt_id, unit_id)
+    REFERENCES execution_work_attempts(execution_graph_id, execution_unit_id, id, parent_attempt_id, unit_id) ON DELETE RESTRICT,
+  UNIQUE(execution_work_attempt_id, gate_kind)
+);
+CREATE INDEX execution_gate_receipts_parent_idx
+  ON execution_gate_receipts(parent_attempt_id, unit_id, created_at);
+
+CREATE TABLE execution_downstream_context (
+  id TEXT PRIMARY KEY,
+  execution_graph_id TEXT NOT NULL,
+  pipeline_instance_id TEXT NOT NULL,
+  parent_attempt_id TEXT NOT NULL,
+  from_execution_unit_id TEXT NOT NULL,
+  to_execution_unit_id TEXT NOT NULL,
+  from_unit_id TEXT NOT NULL,
+  to_unit_id TEXT NOT NULL,
+  payload TEXT NOT NULL CHECK(json_valid(payload)),
+  payload_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(from_execution_unit_id, execution_graph_id, pipeline_instance_id, parent_attempt_id, from_unit_id)
+    REFERENCES execution_units(id, execution_graph_id, pipeline_instance_id, parent_attempt_id, unit_id) ON DELETE RESTRICT,
+  FOREIGN KEY(to_execution_unit_id, execution_graph_id, pipeline_instance_id, parent_attempt_id, to_unit_id)
+    REFERENCES execution_units(id, execution_graph_id, pipeline_instance_id, parent_attempt_id, unit_id) ON DELETE RESTRICT,
+  UNIQUE(parent_attempt_id, from_unit_id, to_unit_id, payload_hash)
+);
+CREATE INDEX execution_downstream_context_target_idx
+  ON execution_downstream_context(parent_attempt_id, to_unit_id, created_at);
+
+INSERT INTO execution_graphs
+SELECT
+  id, pipeline_instance_id, parent_attempt_id, parent_stage_id, parent_run_id,
+  graph_digest, plan_digest, integration_subject, aggregate_artifact_hash,
+  aggregate_emitted_at, stopped_at, stop_reason, created_at, updated_at
+FROM execution_graphs_old;
+
+INSERT INTO execution_units
+SELECT
+  id, execution_graph_id, pipeline_instance_id, parent_attempt_id, unit_id,
+  authored_order, dependency_unit_ids, status, active_work_attempt_id,
+  accepted_candidate_subject, integration_subject, terminal_level, alarm,
+  created_at, updated_at
+FROM execution_units_old;
+
+INSERT INTO execution_work_attempts
+SELECT
+  id, execution_graph_id, execution_unit_id, pipeline_instance_id, parent_attempt_id,
+  parent_run_id, unit_id, attempt_ordinal, action_kind, idempotency_key,
+  request_hash, result_hash, native_session_id, status, lease_owner, lease_until,
+  output_subject, payload, created_at, updated_at, completed_at, last_error
+FROM execution_work_attempts_old;
+
+INSERT INTO execution_gate_receipts
+SELECT
+  id, execution_graph_id, execution_unit_id, execution_work_attempt_id,
+  parent_attempt_id, unit_id, gate_kind, evaluator_kind, subject, result,
+  outcome, reason, artifact_hashes, payload, receipt_hash, created_at
+FROM execution_gate_receipts_old;
+
+INSERT INTO execution_downstream_context
+SELECT
+  id, execution_graph_id, pipeline_instance_id, parent_attempt_id,
+  from_execution_unit_id, to_execution_unit_id, from_unit_id, to_unit_id,
+  payload, payload_hash, created_at
+FROM execution_downstream_context_old;
+
+DROP TABLE execution_gate_receipts_old;
+DROP TABLE execution_downstream_context_old;
+DROP TABLE execution_work_attempts_old;
+DROP TABLE execution_units_old;
+DROP TABLE execution_graphs_old;
+`;
+
+const executionCompositeIdentityMigrationSource = `${executionCompositeIdentitySchema}
+identity-contract:graph unit and work attempts carry composite parent instance attempt run and unit fences/v1
+status-contract:structured status lookup uses execution_graph_id leading unit index/v1`;
+
 function addExecutionGraphStopFence(db: Database.Database): void {
   if (!hasColumns(db, "execution_graphs", ["stopped_at"])) {
     db.exec("ALTER TABLE execution_graphs ADD COLUMN stopped_at TEXT");
@@ -1030,6 +1263,35 @@ function addExecutionGraphStopFence(db: Database.Database): void {
   if (!hasColumns(db, "execution_graphs", ["stop_reason"])) {
     db.exec("ALTER TABLE execution_graphs ADD COLUMN stop_reason TEXT");
   }
+}
+
+function canApplyExecutionCompositeIdentity(db: Database.Database): boolean {
+  if (
+    !hasTable(db, "execution_graphs") ||
+    !hasTable(db, "execution_units") ||
+    !hasTable(db, "execution_work_attempts") ||
+    !hasTable(db, "execution_gate_receipts") ||
+    !hasTable(db, "execution_downstream_context") ||
+    !hasColumns(db, "pipeline_stage_attempts", ["id", "pipeline_instance_id"])
+  ) {
+    return false;
+  }
+  const stageIndexes = db.prepare("PRAGMA index_list('pipeline_stage_attempts')").all() as Array<{
+    name: string;
+    unique: number;
+  }>;
+  const hasCompositeAttemptIdentity = stageIndexes.some((index) => {
+    if (index.unique !== 1) return false;
+    const columns = db.prepare(`PRAGMA index_info('${index.name}')`).all() as Array<{ name: string }>;
+    return columns.map((column) => column.name).join(",") === "id,pipeline_instance_id";
+  });
+  if (!hasCompositeAttemptIdentity) {
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS pipeline_stage_attempts_attempt_instance_unique
+        ON pipeline_stage_attempts(id, pipeline_instance_id)
+    `);
+  }
+  return true;
 }
 
 function widenPipelineArtifactKindsForExecutionGraphResult(db: Database.Database): void {
@@ -1445,6 +1707,14 @@ const definitions: DatabaseMigrationDefinition[] = [
     up(db) {
       addExecutionGraphStopFence(db);
       db.exec(executionChildGateSchema);
+    },
+  },
+  {
+    version: 18,
+    name: "execution-composite-child-identity",
+    source: executionCompositeIdentityMigrationSource,
+    up(db) {
+      if (canApplyExecutionCompositeIdentity(db)) db.exec(executionCompositeIdentitySchema);
     },
   },
 ];

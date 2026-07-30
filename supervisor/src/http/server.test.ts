@@ -295,7 +295,7 @@ describe("coordinator-only server", () => {
       pipelineInstanceId: instance.id,
       parentAttemptId: attempt.id,
       parentStageId: "units",
-      parentRunId: "run-old",
+      parentRunId: attempt.run_id ?? attempt.planned_run_id!,
       graphDigest: "graph-old",
       planDigest: "plan-old",
       units: [{ id: "old-unit" }],
@@ -308,13 +308,22 @@ describe("coordinator-only server", () => {
       ON CONFLICT(pipeline_instance_id, stage_id) DO NOTHING
     `).run(instance.id);
     db.prepare(`
+      INSERT INTO runs (
+        id, linear_issue_id, linear_session_id, session_generation, task_type,
+        token_hash, status, started_at, expires_at
+      ) VALUES (
+        'run-latest', ?, 'session-1', 1, 'implement', 'request-hash',
+        'completed', '2026-07-26T00:12:00.000Z', '2026-07-26T01:12:00.000Z'
+      )
+    `).run(instance.linear_issue_id);
+    db.prepare(`
       INSERT INTO pipeline_stage_attempts (
         id, pipeline_instance_id, stage_id, attempt_ordinal, reentry_ordinal,
         request_hash, idempotency_key, context_revision, native_context_policy,
-        planned_run_id, status, created_at, updated_at
+        planned_run_id, run_id, status, created_at, updated_at
       ) VALUES (
         'attempt-latest-units', ?, 'units', 1, 0, ?, 'attempt-latest-units',
-        0, 'fresh', NULL, 'completed',
+        0, 'fresh', 'run-latest', 'run-latest', 'completed',
         '2026-07-26T00:12:00.000Z', '2026-07-26T00:12:00.000Z'
       )
     `).run(instance.id, "f".repeat(64));
@@ -325,7 +334,7 @@ describe("coordinator-only server", () => {
       parentRunId: "run-latest",
       graphDigest: "graph-latest",
       planDigest: "plan-latest",
-      units: [{ id: "latest-unit" }],
+      units: [{ id: "latest-unit-z" }, { id: "latest-unit-a" }],
     });
 
     const repairResponse = await app().request("/status", {
@@ -348,9 +357,26 @@ describe("coordinator-only server", () => {
       whose_move: "working",
       last_error: "sandbox failed with [REDACTED]",
       last_state_change_at: "2026-07-26T00:10:00.000Z",
-      structured_units: [expect.objectContaining({ unit_id: "latest-unit" })],
+      structured_units: [
+        expect.objectContaining({ unit_id: "latest-unit-z" }),
+        expect.objectContaining({ unit_id: "latest-unit-a" }),
+      ],
     });
     expect(JSON.stringify(repairBody.tickets[0]?.pipeline)).not.toContain("old-unit");
+    const latestGraph = db.prepare(`
+      SELECT id FROM execution_graphs
+      WHERE pipeline_instance_id = ?
+      ORDER BY updated_at DESC, created_at DESC, id DESC
+      LIMIT 1
+    `).get(instance.id) as { id: string };
+    const statusPlan = db.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT eu.unit_id, eu.status, eu.terminal_level, eu.alarm, eu.integration_subject
+      FROM execution_units eu
+      WHERE eu.execution_graph_id = ?
+      ORDER BY eu.authored_order, eu.unit_id
+    `).all(latestGraph.id) as Array<{ detail: string }>;
+    expect(statusPlan.some((row) => row.detail.includes("execution_units_graph_status_idx"))).toBe(true);
 
     db.prepare(`
       INSERT INTO pipeline_gate_receipts (
