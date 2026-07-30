@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { stringify } from "yaml";
-import ship, { SHIP_SELECTION_FENCE, buildShipDescription, delegateIssue, parseMarkdown, parseShipArgs, validateGraphSelectionForShip } from "./ship.js";
+import ship, { SHIP_SELECTION_FENCE, STRUCTURED_SHIP_UNAVAILABLE, assertStructuredShipAvailable, buildShipDescription, delegateIssue, parseMarkdown, parseShipArgs, validateGraphSelectionForShip } from "./ship.js";
 
 const directories: string[] = [];
 
@@ -93,7 +93,9 @@ describe("ship", () => {
 
       writeFileSync(planPath, `# Ship it\n\n${executionPlanBlock("structured")}`);
       expect(() => validateGraphSelectionForShip(planPath, "simple")).toThrow(/graph_id must match/);
-      expect(() => validateGraphSelectionForShip(planPath, "structured")).not.toThrow();
+      const structured = validateGraphSelectionForShip(planPath, "structured");
+      expect(structured).toMatchObject({ graphId: "structured", consumesUnits: true });
+      expect(() => assertStructuredShipAvailable(structured)).toThrow(STRUCTURED_SHIP_UNAVAILABLE);
 
       writeFileSync(planPath, `# Ship it\n\n${executionPlanBlock("other")}`);
       expect(() => validateGraphSelectionForShip(planPath, "structured")).toThrow(/graph_id must match/);
@@ -188,7 +190,7 @@ describe("ship", () => {
     }
   });
 
-  it("ships valid structured input with the execution plan in the Linear body", async () => {
+  it("rejects valid structured input before any Linear call", async () => {
     const directory = temporaryProject();
     writeStructuredConfig(directory);
     const planPath = join(directory, "plan.md");
@@ -196,46 +198,23 @@ describe("ship", () => {
     const originalFetch = globalThis.fetch;
     const previousCwd = process.cwd();
     const previousLinearKey = process.env.LINEAR_API_KEY;
-    const previousTeamId = process.env.LINEAR_TEAM_ID;
-    const previousAgentAppId = process.env.OT_AGENT_APP_ID;
-    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
-      const body = JSON.parse(String(init?.body)) as { query: string };
-      if (body.query.includes("IssueCreate")) {
-        return Response.json({
-          data: {
-            issueCreate: {
-              success: true,
-              issue: { id: "issue-1", identifier: "OPE-1", url: "https://linear.test/OPE-1" },
-            },
-          },
-        });
-      }
-      throw new Error("unexpected Linear query");
-    });
+    const exit = process.exit;
+    const fetchMock = vi.fn();
+    process.exit = ((code?: string | number | null) => {
+      throw new Error(`exit ${code}`);
+    }) as typeof process.exit;
     globalThis.fetch = fetchMock as unknown as typeof fetch;
     process.env.LINEAR_API_KEY = "linear-key";
-    process.env.LINEAR_TEAM_ID = "team-1";
-    delete process.env.OT_AGENT_APP_ID;
     try {
       process.chdir(directory);
-      await ship([planPath, "--graph", "structured"]);
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      const payload = JSON.parse(String(fetchMock.mock.calls[0]![1]!.body));
-      const description = String(payload.variables.input.description);
-      expect(description).toContain("openthrottle.execution-plan/v1");
-      expect(readShipSelection(description)).toEqual({
-        schema: SHIP_SELECTION_FENCE,
-        graph_id: "structured",
-      });
+      await expect(ship([planPath, "--graph", "structured"])).rejects.toThrow(/exit 1/);
+      expect(fetchMock).not.toHaveBeenCalled();
     } finally {
       process.chdir(previousCwd);
+      process.exit = exit;
       globalThis.fetch = originalFetch;
       if (previousLinearKey === undefined) delete process.env.LINEAR_API_KEY;
       else process.env.LINEAR_API_KEY = previousLinearKey;
-      if (previousTeamId === undefined) delete process.env.LINEAR_TEAM_ID;
-      else process.env.LINEAR_TEAM_ID = previousTeamId;
-      if (previousAgentAppId === undefined) delete process.env.OT_AGENT_APP_ID;
-      else process.env.OT_AGENT_APP_ID = previousAgentAppId;
     }
   });
 
