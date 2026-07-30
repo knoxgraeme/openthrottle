@@ -101,6 +101,30 @@ function fixture({
   repositorySkill,
 } = {}) {
   const repoDir = repository();
+  let sealedRepositorySkill = repositorySkill;
+  if (repositorySkill === "fixture") {
+    const skillDir = ".agents/skills/implement-unit";
+    mkdirSync(join(repoDir, skillDir), { recursive: true });
+    writeFileSync(join(repoDir, skillDir, "SKILL.md"), "---\nname: implement_unit\n---\n# Fixture Skill\n");
+    execFileSync("git", ["add", "."], { cwd: repoDir });
+    execFileSync("git", ["commit", "-qm", "skill"], { cwd: repoDir });
+    const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+    const skillPath = `${skillDir}/SKILL.md`;
+    const file = {
+      path: skillPath,
+      blobSha: execFileSync("git", ["rev-parse", `${commit}:${skillPath}`], { cwd: repoDir, encoding: "utf8" }).trim(),
+      digest: digest(readFileSync(join(repoDir, skillPath))),
+    };
+    const unsignedPackage = {
+      schema: "openthrottle.repository-skill-package/v1",
+      reference: `repo://owner/repo@${commit}#${skillDir}`,
+      invocation: "implement_unit",
+      directory: skillDir,
+      commit,
+      files: [file],
+    };
+    sealedRepositorySkill = { ...unsignedPackage, packageDigest: digest(canonicalJson(unsignedPackage)) };
+  }
   const config = commandName && configuredCommand ? { commands: { [commandName]: "test-command" } } : {};
   const stage = {
     id: commandName ? "command" : "review",
@@ -110,7 +134,7 @@ function fixture({
     live_steering: liveSteering,
     credentials: credentialScopes,
     ...(commandName ? { commandName } : {}),
-    ...(repositorySkill ? { repositorySkill } : {}),
+    ...(sealedRepositorySkill ? { repositorySkill: sealedRepositorySkill } : {}),
   };
   const manifest = { id: "fixture/test", version: 1, stages: [stage] };
   const configRaw = canonicalJson(config);
@@ -145,7 +169,7 @@ function fixture({
     credentialScopes,
     liveSteering,
     ...(commandName ? { commandName } : {}),
-    ...(repositorySkill ? { repositorySkill } : {}),
+    ...(sealedRepositorySkill ? { repositorySkill: sealedRepositorySkill } : {}),
   };
   const request = { ...base, ...createStageRequestHash(base) };
   return { repoDir, configRaw, manifestRaw, request };
@@ -938,7 +962,11 @@ printf '{"type":"system","subtype":"init","session_id":"smoke-claude-session","m
   });
 
   it("refuses Claude stage native session ids when the sealed package lacks the reported id", () => {
-    const input = fixture({ agent: "claude" });
+    const input = fixture({
+      agent: "claude",
+      capability: "agent/repository-skill@1",
+      repositorySkill: "fixture",
+    });
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-stage-actions-"));
     const sourceRoot = mkdtempSync(join(tmpdir(), "ot-stage-native-sessions-"));
     const binDir = mkdtempSync(join(tmpdir(), "ot-fake-bin-"));
@@ -961,6 +989,7 @@ printf '{"type":"system","subtype":"init","session_id":"smoke-claude-session","m
     });
 
     installFakeGosu(binDir);
+    const emissionMarker = join(actionRoot, "reported-but-unsealed-claude-session.emitted");
     writeExecutable(join(binDir, "claude"), `#!/usr/bin/env bash
 set -euo pipefail
 mkdir -p "$HOME/.claude/projects"
@@ -968,7 +997,8 @@ printf '{"type":"system","subtype":"init","session_id":"unrelated-claude-session
 cat > "$OT_STAGE_PROPOSAL_FILE" <<'JSON'
 {"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"ok","evidence":["session reported"],"findings":[],"actions":[],"uncertainty":[]}
 JSON
-printf '{"type":"system","subtype":"init","session_id":"smoke-claude-session","model":"stub"}\\n'
+printf '{"type":"system","subtype":"init","session_id":"reported-but-unsealed-claude-session","model":"stub"}\\n'
+: > "${emissionMarker}"
 `);
     withPrependedPath(binDir, () => {
       expect(() => defaultRunAgent({
@@ -979,6 +1009,7 @@ printf '{"type":"system","subtype":"init","session_id":"smoke-claude-session","m
         timeoutMs: 1000,
       })).toThrow(/native session package does not contain the reported native session id/);
     });
+    expect(existsSync(emissionMarker)).toBe(true);
   });
 
   it("rejects resumed stage output that reports a different native session id", () => {
