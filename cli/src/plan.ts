@@ -1,6 +1,6 @@
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
@@ -261,6 +261,43 @@ function prepareRunnerEnvironment(agent: PrepareRunnerInput["agent"]): NodeJS.Pr
   }
   return env;
 }
+function createOpenCodeConfig(model?: string): string {
+  if (model !== "kimi-code/kimi-for-coding") {
+    throw new Error(
+      `Unsupported OpenCode model '${model ?? ""}'. Supported model: kimi-code/kimi-for-coding`
+    );
+  }
+  const configDir = mkdtempSync(join(tmpdir(), "openthrottle-opencode-"));
+  const config = {
+    $schema: "https://opencode.ai/config.json",
+    autoupdate: false,
+    share: "disabled",
+    permission: { edit: "allow", bash: "deny", webfetch: "deny" },
+    provider: {
+      "kimi-code": {
+        npm: "@ai-sdk/openai-compatible",
+        name: "Kimi Code",
+        options: {
+          baseURL: "https://api.kimi.com/coding/v1",
+          apiKey: "{env:KIMI_CODE_API_KEY}",
+        },
+        models: {
+          "kimi-for-coding": {
+            name: "kimi-for-coding",
+            limit: { context: 262_144, output: 65_536 },
+          },
+        },
+      },
+    },
+  };
+  try {
+    writeFileSync(join(configDir, "opencode.json"), `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+    return configDir;
+  } catch (error) {
+    rmSync(configDir, { recursive: true, force: true });
+    throw error;
+  }
+}
 export const defaultPrepareRunner: PrepareRunner = ({ agent, model, prompt, directory }) => {
   let command: string;
   let args: string[];
@@ -277,13 +314,20 @@ export const defaultPrepareRunner: PrepareRunner = ({ agent, model, prompt, dire
     args = ["run", "--format", "json", "--model", model ?? "", "--dir", directory, "--auto", prompt];
   }
   const env = prepareRunnerEnvironment(agent);
-  const result = spawnSync(command, args, {
-    cwd: directory,
-    env,
-    input,
-    maxBuffer: PREPARE_RUNNER_MAX_BUFFER_BYTES,
-    timeout: 30 * 60 * 1000,
-  });
+  const openCodeConfigDir = agent === "opencode" ? createOpenCodeConfig(model) : undefined;
+  if (openCodeConfigDir) env.OPENCODE_CONFIG_DIR = openCodeConfigDir;
+  let result: SpawnSyncReturns<Buffer>;
+  try {
+    result = spawnSync(command, args, {
+      cwd: directory,
+      env,
+      input,
+      maxBuffer: PREPARE_RUNNER_MAX_BUFFER_BYTES,
+      timeout: 30 * 60 * 1000,
+    });
+  } finally {
+    if (openCodeConfigDir) rmSync(openCodeConfigDir, { recursive: true, force: true });
+  }
   if (result.error && (result.error as NodeJS.ErrnoException).code === "ENOENT") {
     throw new Error(`openthrottle plan prepare could not find ${command} on PATH; install the configured local engine or change agent in .openthrottle.yml.`);
   }
