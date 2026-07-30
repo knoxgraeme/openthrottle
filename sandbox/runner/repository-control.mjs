@@ -13,10 +13,10 @@ import {
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest, sanitizeArtifactText } from "./artifacts.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
+import { identityForUser } from "./filesystem-isolation.mjs";
 
 const COMMIT = /^[a-f0-9]{40}$/;
 const LOCAL_GIT_TIMEOUT_MS = 120_000;
@@ -97,19 +97,15 @@ function optionalRepositoryOwnerGit(repoDir, args) {
   }
 }
 
-let installedAgentIdentity;
-
 function prepareRepositoryOwnerDirectory(path) {
   if (typeof process.getuid !== "function" || process.getuid() !== 0) return;
-  if (!installedAgentIdentity) {
-    const uid = spawnSync("id", ["-u", "agent"], { encoding: "utf8" });
-    const gid = spawnSync("id", ["-g", "agent"], { encoding: "utf8" });
-    if (uid.status !== 0 || gid.status !== 0 || !/^\d+\n?$/.test(uid.stdout) || !/^\d+\n?$/.test(gid.stdout)) {
-      throw new Error("repository control could not resolve the installed agent identity");
-    }
-    installedAgentIdentity = { uid: Number(uid.stdout.trim()), gid: Number(gid.stdout.trim()) };
+  let identity;
+  try {
+    identity = identityForUser("agent");
+  } catch {
+    throw new Error("repository control could not resolve the installed agent identity");
   }
-  chownSync(path, installedAgentIdentity.uid, installedAgentIdentity.gid);
+  chownSync(path, identity.uid, identity.gid);
   chmodSync(path, 0o700);
 }
 

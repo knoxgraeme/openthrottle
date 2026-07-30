@@ -66,6 +66,8 @@ const SKILLS = new Set([
   "ce-commit-push-pr",
 ]);
 const CONTEXTS = new Set(["fresh", "resume_required", "prefer_resume"]);
+const STANDARD_RECEIPT_SCHEMA = "openthrottle.receipt/v1";
+const RECEIPT_SCHEMAS = new Set([STANDARD_RECEIPT_SCHEMA, "probe/no-receipt@1"]);
 const DEFAULT_ACTION_ROOT = "/var/lib/openthrottle/loop-actions";
 const DEFAULT_WORKTREE_ROOT = "/var/lib/openthrottle/worktrees";
 const INTEGRATION_REPO_DIR = "/home/agent/repo";
@@ -304,6 +306,7 @@ export function validateLoopRequest(value) {
     credentialScopes: boundedArray(input.credentialScopes, "credentialScopes"),
     receiptSchema: string(input.receiptSchema, "receiptSchema", /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,159}$/),
   };
+  if (!RECEIPT_SCHEMAS.has(request.receiptSchema)) throw new Error("loop receipt schema is unsupported");
   if (!ROLES.has(request.role)) throw new Error("role is invalid");
   if (!LOOPS.has(request.loop)) throw new Error("loop is invalid");
   if (!AGENTS.has(request.agent)) throw new Error("agent is invalid");
@@ -837,7 +840,7 @@ export function executeLoopAction({
     }
     let parsedReceipt = null;
     let receiptError = null;
-    if (!subjectError && !execution.timedOut && !execution.signal && execution.status === 0 && request.receiptSchema === "openthrottle.receipt/v1") {
+    if (!subjectError && !execution.timedOut && !execution.signal && execution.status === 0 && request.receiptSchema === STANDARD_RECEIPT_SCHEMA) {
       try {
         parsedReceipt = parseLoopReceipt(execution.stdout, process.env);
         assertLoopReceiptFence(parsedReceipt, request, subject);

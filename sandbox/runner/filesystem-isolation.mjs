@@ -90,6 +90,13 @@ export function lockPersistentAgentPrivateRoots(paths = PERSISTENT_AGENT_PRIVATE
     if (seenPaths.has(normalizedPath)) continue;
     seenPaths.add(normalizedPath);
     if (!existsSync(path)) continue;
+    const metadata = lstatSync(path);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      throw withLockedPersistentProfiles(
+        new Error(`persistent profile root must be a directory: ${normalizedPath}`),
+        [snapshotList(locked)],
+      );
+    }
     const snapshot = [...snapshotProfileBoundaryPaths(path), ...snapshotPrivateTree(path)];
     try {
       lockProfileBoundaryPaths(path);

@@ -31,7 +31,16 @@ import {
 } from "./repository-control.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
 import { runWithAgentProcessFence } from "./agent-process-fence.mjs";
-import { chmodTree, chownTree, isRoot, pathInside as containedPath, prepareAgentOwnedDirectory } from "./filesystem-isolation.mjs";
+import {
+  chmodTree,
+  chownTree,
+  isRoot,
+  lockPersistentAgentPrivateRoots,
+  lockedPersistentProfilesFrom,
+  pathInside as containedPath,
+  prepareAgentOwnedDirectory,
+  restorePersistentAgentPrivateRoots,
+} from "./filesystem-isolation.mjs";
 import { materializeClaudeProfileBaseline, materializeCodexProfileBaseline } from "./action-home-baseline.mjs";
 import { writeJsonAtomic } from "./atomic-write.mjs";
 import {
@@ -40,11 +49,6 @@ import {
   repositorySkillDiscoveryRoot,
   skillBody,
 } from "./repository-skills.mjs";
-import {
-  lockPersistentAgentPrivateRoots,
-  lockedPersistentProfilesFrom,
-  restorePersistentAgentPrivateRoots,
-} from "./execute-loop.mjs";
 import {
   extractNativeSessionId,
   materializeNativeSessionState,

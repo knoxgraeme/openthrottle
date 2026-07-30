@@ -214,6 +214,10 @@ function withPrependedPath(binDir, run) {
   }
 }
 
+function codexSessionStorageRecord(nativeSessionId) {
+  return `{"type":"session_meta","payload":{"id":"${nativeSessionId}"}}\n`;
+}
+
 describe("one-stage executor", () => {
   it("validates the complete immutable request fence", () => {
     const { request } = fixture();
@@ -295,6 +299,7 @@ describe("one-stage executor", () => {
     expect(extractNativeSessionId('{"type":"thread.started","thread_id":"codex-1"}\n', "codex")).toBe("codex-1");
     expect(extractNativeSessionId('{"type":"step_start","sessionID":"opencode-1"}\n', "opencode")).toBe("opencode-1");
     expect(extractNativeSessionId("not-json\n", "codex")).toBeNull();
+    expect(extractNativeSessionId('{"type":"session_meta","payload":{"id":"codex-storage"}}\n', "codex")).toBeNull();
     expect(extractNativeSessionId('{"type":"tool_result","session_id":"claude-forged"}\n', "claude")).toBeNull();
     expect(extractNativeSessionId('{"type":"tool_result","sessionID":"opencode-forged"}\n', "opencode")).toBeNull();
   });
@@ -836,7 +841,7 @@ describe("one-stage executor", () => {
     directories.push(actionRoot, sourceRoot, sourceProfile, binDir);
     const sourceSessionStore = nativeSessionStoragePath("codex", sourceProfile);
     mkdirSync(sourceSessionStore, { recursive: true });
-    writeFileSync(join(sourceSessionStore, "native-1.json"), "{\"type\":\"thread.started\",\"thread_id\":\"native-1\"}\n");
+    writeFileSync(join(sourceSessionStore, "native-1.json"), codexSessionStorageRecord("native-1"));
     sealNativeSessionPackage({
       agent: "codex",
       nativeSessionId: "native-1",
@@ -932,7 +937,7 @@ printf '{"type":"system","subtype":"init","session_id":"smoke-claude-session","m
     });
   });
 
-  it("refuses Claude stage native session ids when no canonical continuation state exists", () => {
+  it("refuses Claude stage native session ids when the sealed package lacks the reported id", () => {
     const input = fixture({ agent: "claude" });
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-stage-actions-"));
     const sourceRoot = mkdtempSync(join(tmpdir(), "ot-stage-native-sessions-"));
@@ -956,7 +961,7 @@ printf '{"type":"system","subtype":"init","session_id":"smoke-claude-session","m
         repoDir: input.repoDir,
         proposalPath: join(actionRoot, "proposal.json"),
         timeoutMs: 1000,
-      })).toThrow(/native session id was reported without a sealed executor package/);
+      })).toThrow(/native session package does not contain the reported native session id/);
     });
   });
 

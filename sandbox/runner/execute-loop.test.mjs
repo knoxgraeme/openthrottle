@@ -151,7 +151,13 @@ function sessionEventFixture(agent, nativeSessionId) {
   return `{"type":"step_start","sessionID":"${nativeSessionId}"}\n`;
 }
 
-function sealSessionFixture({ agent, nativeSessionId = "native-1", sourceRoot, fileName = `${nativeSessionId}.jsonl`, contents = sessionEventFixture(agent, nativeSessionId) }) {
+function sessionStorageFixture(agent, nativeSessionId) {
+  if (agent === "claude") return `{"type":"system","session_id":"${nativeSessionId}"}\n`;
+  if (agent === "codex") return `{"type":"session_meta","payload":{"id":"${nativeSessionId}"}}\n`;
+  return `{"type":"step_start","sessionID":"${nativeSessionId}"}\n`;
+}
+
+function sealSessionFixture({ agent, nativeSessionId = "native-1", sourceRoot, fileName = `${nativeSessionId}.jsonl`, contents = sessionStorageFixture(agent, nativeSessionId) }) {
   const profileRoot = mkdtempSync(join(tmpdir(), `ot-loop-profile-${agent}-`));
   directories.push(profileRoot);
   const sessionStore = nativeSessionStoragePath(agent, profileRoot);
@@ -252,6 +258,11 @@ describe("loop action request validation", () => {
       .toThrow(/attemptId is invalid/);
     expect(() => loopRequestPath({ attemptId: "attempt", actionId: "action/1", rootDir: "/var/ot" }))
       .toThrow(/actionId is invalid/);
+  });
+
+  it("rejects unsupported receipt schemas before loop execution", () => {
+    expect(() => validateLoopRequest(request({ receiptSchema: "openthrottle.loop-receipt@1" })))
+      .toThrow(/loop receipt schema is unsupported/);
   });
 
   it("enforces role/worktree and session reuse rules", () => {
@@ -592,7 +603,7 @@ describe("loop action request validation", () => {
               : join(actionDirectory, "home");
           const sessionStore = nativeSessionStoragePath(agent, profileRoot);
           expect(readFileSync(join(sessionStore, `${valid.nativeSessionId}.jsonl`), "utf8"))
-            .toBe(sessionEventFixture(agent, valid.nativeSessionId));
+            .toBe(sessionStorageFixture(agent, valid.nativeSessionId));
           expect(existsSync(join(sessionStore, "secret.jsonl"))).toBe(false);
           return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
         },
@@ -620,7 +631,7 @@ describe("loop action request validation", () => {
         const codexHome = args.find((arg) => arg.startsWith("CODEX_HOME=")).slice("CODEX_HOME=".length);
         const sessionStore = nativeSessionStoragePath("codex", codexHome);
         mkdirSync(sessionStore, { recursive: true });
-        writeFileSync(join(sessionStore, "thread-1.jsonl"), sessionEventFixture("codex", "thread-1"));
+        writeFileSync(join(sessionStore, "thread-1.jsonl"), sessionStorageFixture("codex", "thread-1"));
         return {
           status: 0,
           signal: null,
@@ -633,7 +644,7 @@ describe("loop action request validation", () => {
 
     expect(result.nativeSessionId).toBe("thread-1");
     const sealed = join(sessionRoot, "codex", "thread-1");
-    expect(readFileSync(join(sealed, "sessions", "thread-1.jsonl"), "utf8")).toBe(sessionEventFixture("codex", "thread-1"));
+    expect(readFileSync(join(sealed, "sessions", "thread-1.jsonl"), "utf8")).toBe(sessionStorageFixture("codex", "thread-1"));
     expect(statSync(sealed).mode & 0o777).toBe(0o500);
   });
 
@@ -814,6 +825,22 @@ describe("loop action request validation", () => {
     })).toThrow(/does not contain the reported native session id/);
   });
 
+  it("rejects Codex output events stored as durable native session records", () => {
+    const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
+    const profileRoot = mkdtempSync(join(tmpdir(), "ot-loop-codex-output-profile-"));
+    directories.push(sessionRoot, profileRoot);
+    const sessionStore = nativeSessionStoragePath("codex", profileRoot);
+    mkdirSync(sessionStore, { recursive: true });
+    writeFileSync(join(sessionStore, "native-codex.jsonl"), sessionEventFixture("codex", "native-codex"));
+
+    expect(() => sealNativeSessionPackage({
+      agent: "codex",
+      nativeSessionId: "native-codex",
+      profileRoot,
+      sourceRoot: sessionRoot,
+    })).toThrow(/does not contain the reported native session id/);
+  });
+
   it("accepts engine-native session ownership events for every supported agent", () => {
     const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
     directories.push(sessionRoot);
@@ -826,7 +853,7 @@ describe("loop action request validation", () => {
       {
         agent: "codex",
         nativeSessionId: "native-codex",
-        event: "{\"type\":\"thread.started\",\"thread_id\":\"native-codex\"}\n",
+        event: "{\"type\":\"session_meta\",\"payload\":{\"id\":\"native-codex\"}}\n",
       },
       {
         agent: "opencode",
@@ -883,7 +910,7 @@ describe("loop action request validation", () => {
     process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sessionRoot;
     const sourceSessionStore = nativeSessionStoragePath("codex", sourceProfile);
     mkdirSync(sourceSessionStore, { recursive: true });
-    writeFileSync(join(sourceSessionStore, "native-1.jsonl"), sessionEventFixture("codex", "native-1"));
+    writeFileSync(join(sourceSessionStore, "native-1.jsonl"), sessionStorageFixture("codex", "native-1"));
     sealNativeSessionPackage({
       agent: "codex",
       nativeSessionId: "native-1",
@@ -902,7 +929,7 @@ describe("loop action request validation", () => {
     });
 
     expect(readFileSync(join(nativeSessionStoragePath("codex", destinationProfile), "native-1.jsonl"), "utf8"))
-      .toBe(sessionEventFixture("codex", "native-1"));
+      .toBe(sessionStorageFixture("codex", "native-1"));
     expect(existsSync(join(leakedTarget, "native-1.jsonl"))).toBe(false);
   });
 
@@ -1071,6 +1098,47 @@ describe("loop action request validation", () => {
 
     expect(lstatSync(profileRoot).isSymbolicLink()).toBe(true);
     expect(statSync(join(replacementTarget, "target.txt")).mode & 0o777).toBe(targetMode);
+  });
+
+  it("rejects persistent profile roots that are symlinks before locking", () => {
+    if (typeof process.getuid !== "function" || process.getuid() !== 0) return;
+    const parent = mkdtempSync(join(tmpdir(), "ot-profile-parent-"));
+    const profileRoot = join(parent, ".codex");
+    const replacementTarget = mkdtempSync(join(tmpdir(), "ot-profile-replacement-target-"));
+    directories.push(parent, replacementTarget);
+    writeFileSync(join(replacementTarget, "target.txt"), "target\n", { mode: 0o666 });
+    const targetMode = statSync(join(replacementTarget, "target.txt")).mode & 0o777;
+    symlinkSync(replacementTarget, profileRoot);
+
+    expect(() => lockPersistentAgentPrivateRoots([profileRoot])).toThrow(/persistent profile root must be a directory/);
+
+    expect(lstatSync(profileRoot).isSymbolicLink()).toBe(true);
+    expect(statSync(join(replacementTarget, "target.txt")).mode & 0o777).toBe(targetMode);
+  });
+
+  it("restores earlier locked profiles when a later profile root is a symlink", () => {
+    if (typeof process.getuid !== "function" || process.getuid() !== 0) return;
+    const parent = mkdtempSync(join(tmpdir(), "ot-profile-parent-"));
+    const validProfile = join(parent, ".claude");
+    const symlinkProfile = join(parent, ".codex");
+    const replacementTarget = mkdtempSync(join(tmpdir(), "ot-profile-replacement-target-"));
+    directories.push(parent, replacementTarget);
+    mkdirSync(validProfile, { recursive: true, mode: 0o700 });
+    writeFileSync(join(validProfile, "state.txt"), "state\n", { mode: 0o600 });
+    symlinkSync(replacementTarget, symlinkProfile);
+    const originalMode = statSync(join(validProfile, "state.txt")).mode & 0o777;
+
+    let error;
+    try {
+      lockPersistentAgentPrivateRoots([validProfile, symlinkProfile]);
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error?.lockedPersistentProfiles).toHaveLength(1);
+    restorePersistentAgentPrivateRoots(error.lockedPersistentProfiles);
+    expect(statSync(join(validProfile, "state.txt")).mode & 0o777).toBe(originalMode);
+    expect(lstatSync(symlinkProfile).isSymbolicLink()).toBe(true);
   });
 
   it("deduplicates and restores nested profile boundary snapshots once", () => {

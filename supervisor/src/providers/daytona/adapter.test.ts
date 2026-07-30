@@ -173,7 +173,7 @@ describe("Daytona stage execution", () => {
       transitionContext: "implement unit",
       allowedMcpServers: ["github"],
       credentialScopes: ["model.invoke", "repo.read", "repo.write"],
-      receiptSchema: "openthrottle.loop-receipt@1",
+      receiptSchema: "openthrottle.receipt/v1",
       requestHash: "",
       idempotencyKey: "",
     };
@@ -195,7 +195,7 @@ describe("Daytona stage execution", () => {
       expect.objectContaining({
         command: expect.stringMatching(/loop-actions\/attempt-child\/loop-1\/dispatch\.lock.*loop-actions\/attempt-child\/loop-1\/result\.json.*execute-loop\.mjs --request \/var\/lib\/openthrottle\/loop-actions\/attempt-child\/loop-1\/request\.json --output \/var\/lib\/openthrottle\/loop-actions\/attempt-child\/loop-1\/result\.json/),
       }),
-      30
+      60
     );
 
     const artifactPayload = canonicalJson({ result: "success" });

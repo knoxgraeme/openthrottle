@@ -16,6 +16,7 @@ import {
 
 const ACTIVE_SANDBOX_AUTOSTOP_MINUTES = 60;
 const IDLE_SANDBOX_AUTOSTOP_MINUTES = 5;
+const LOOP_ACTION_DISPATCH_GRACE_SECONDS = 30;
 const STAGE_INPUT_DIR = "/var/lib/openthrottle/stage-input";
 const STAGE_RESULT_DIR = "/var/lib/openthrottle/stage-results";
 const LOOP_ACTION_DIR = "/var/lib/openthrottle/loop-actions";
@@ -61,6 +62,10 @@ function ensureSandboxActive(sandbox: Sandbox): Promise<void> {
 function safeStagePathId(value: string, label: string): string {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value)) throw new Error(`${label} is not path-safe`);
   return value;
+}
+
+function loopActionDispatchTimeoutSeconds(timeoutMs: number): number {
+  return Math.ceil(timeoutMs / 1000) + LOOP_ACTION_DISPATCH_GRACE_SECONDS;
 }
 
 function assertStageRequestFence(request: StageRequestEnvelope): void {
@@ -365,7 +370,7 @@ export function createDaytonaSandboxRuntime(
           `'test -f ${resultPath} || exec /opt/openthrottle/runner/execute-loop.mjs --request ${requestPath} --output ${resultPath}'`,
         runAsync: true,
         suppressInputEcho: true,
-      }, Math.ceil(request.timeoutMs / 1000));
+      }, loopActionDispatchTimeoutSeconds(request.timeoutMs));
       return { providerDispatchId: dispatched.cmdId ?? sessionId };
     },
 

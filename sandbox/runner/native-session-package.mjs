@@ -65,8 +65,8 @@ function relativePackagePath(root, path) {
 
 function jsonEventCarriesSessionId(line, nativeSessionId, agent) {
   try {
-    const event = JSON.parse(line);
-    return nativeSessionIdFromEvent(event, agent) === nativeSessionId;
+    const record = JSON.parse(line);
+    return nativeSessionIdFromDurableRecord(record, agent) === nativeSessionId;
   } catch {
     return false;
   }
@@ -81,6 +81,19 @@ function nativeSessionIdFromEvent(event, agent) {
   }
   if (agent === "opencode" && OPENCODE_SESSION_EVENT_TYPES.has(event.type)) {
     return event.sessionID ?? event.sessionId ?? null;
+  }
+  return null;
+}
+
+function nativeSessionIdFromDurableRecord(record, agent) {
+  if (agent === "claude" && record.type === "system") {
+    return record.session_id ?? record.sessionId ?? null;
+  }
+  if (agent === "codex" && record.type === "session_meta") {
+    return record.payload?.id ?? null;
+  }
+  if (agent === "opencode" && OPENCODE_SESSION_EVENT_TYPES.has(record.type)) {
+    return record.sessionID ?? record.sessionId ?? null;
   }
   return null;
 }

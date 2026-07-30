@@ -74,20 +74,84 @@ chown root:root "$SEALED"
 chmod 0400 "$SEALED"
 install -d -o root -g root -m 0700 "$NATIVE_SESSION_ROOT"
 OT_NATIVE_SESSION_SOURCE_ROOT="$NATIVE_SESSION_ROOT" node --input-type=module <<'NODE'
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { sealNativeSessionPackage } from "/opt/openthrottle/runner/native-session-package.mjs";
+import {
+  materializeNativeSessionState,
+  nativeSessionStoragePath,
+  sealNativeSessionPackage,
+} from "/opt/openthrottle/runner/native-session-package.mjs";
 
-function sealFixture(nativeSessionId, fileName, contents) {
-  const profileRoot = mkdtempSync(join(tmpdir(), `ot-native-${nativeSessionId}-`));
-  mkdirSync(join(profileRoot, "sessions"), { recursive: true });
-  writeFileSync(join(profileRoot, "sessions", fileName), contents);
-  sealNativeSessionPackage({ agent: "codex", nativeSessionId, profileRoot });
+function sessionRecord(agent, nativeSessionId) {
+  if (agent === "claude") return `{"type":"system","session_id":"${nativeSessionId}"}\n`;
+  if (agent === "codex") return `{"type":"session_meta","payload":{"id":"${nativeSessionId}"}}\n`;
+  if (agent === "opencode") return `{"type":"step_start","sessionID":"${nativeSessionId}"}\n`;
+  throw new Error(`unsupported agent ${agent}`);
 }
 
-sealFixture("native-current", "native-current.jsonl", "current native session native-current\n");
-sealFixture("native-sibling", "native-sibling.jsonl", "sibling native session native-sibling\n");
+function writeSessionFile({ agent, nativeSessionId, contents = sessionRecord(agent, nativeSessionId), fileName = `${nativeSessionId}.jsonl` }) {
+  const profileRoot = mkdtempSync(join(tmpdir(), `ot-native-${agent}-${nativeSessionId}-`));
+  const sessionStore = nativeSessionStoragePath(agent, profileRoot);
+  mkdirSync(sessionStore, { recursive: true });
+  writeFileSync(join(sessionStore, fileName), contents);
+  return { profileRoot, sessionStore, fileName, contents };
+}
+
+function sealFixture(agent, nativeSessionId) {
+  const fixture = writeSessionFile({ agent, nativeSessionId });
+  sealNativeSessionPackage({ agent, nativeSessionId, profileRoot: fixture.profileRoot });
+  return fixture;
+}
+
+function assertMaterializesOnlySelectedPackage(agent) {
+  const currentId = `native-${agent}`;
+  const siblingId = `native-${agent}-sibling`;
+  const current = sealFixture(agent, currentId);
+  sealFixture(agent, siblingId);
+  const profileRoot = mkdtempSync(join(tmpdir(), `ot-materialized-${agent}-`));
+  materializeNativeSessionState({
+    request: { agent, nativeSessionId: currentId, contextPolicy: "resume_required" },
+    profileRoot,
+  });
+  const sessionStore = nativeSessionStoragePath(agent, profileRoot);
+  if (readFileSync(join(sessionStore, current.fileName), "utf8") !== current.contents) {
+    throw new Error(`${agent} canonical native session did not materialize`);
+  }
+  if (existsSync(join(sessionStore, `${siblingId}.jsonl`))) {
+    throw new Error(`${agent} sibling native session package materialized`);
+  }
+}
+
+function expectSealRejects(agent, nativeSessionId, contents, label) {
+  const fixture = writeSessionFile({ agent, nativeSessionId, contents });
+  let rejected = false;
+  try {
+    sealNativeSessionPackage({ agent, nativeSessionId, profileRoot: fixture.profileRoot });
+  } catch (error) {
+    if (!/does not contain the reported native session id/.test(error.message)) throw error;
+    rejected = true;
+  }
+  if (!rejected) throw new Error(`${label} native session fixture was accepted`);
+}
+
+for (const agent of ["claude", "codex", "opencode"]) {
+  assertMaterializesOnlySelectedPackage(agent);
+  expectSealRejects(agent, `native-${agent}-generic`, `generic native-${agent}-generic\n`, `${agent} generic exact-named`);
+  expectSealRejects(agent, `native-${agent}-substring`, sessionRecord(agent, `prefix-native-${agent}-substring-suffix`), `${agent} substring`);
+  expectSealRejects(agent, `native-${agent}-empty`, "", `${agent} empty`);
+  expectSealRejects(agent, `native-${agent}-unrelated`, sessionRecord(agent, `native-${agent}-other`), `${agent} unrelated`);
+}
+
+expectSealRejects(
+  "codex",
+  "native-codex-output",
+  '{"type":"thread.started","thread_id":"native-codex-output"}\n',
+  "codex output-event"
+);
+
+sealFixture("codex", "native-current");
+sealFixture("codex", "native-sibling");
 NODE
 install -d -o agent -g agent -m 0700 /home/agent/.claude /home/agent/.codex "$PERSISTENT_OPENCODE_ROOT" /home/agent/.ot
 install -d -o agent -g agent -m 0700 "$PROFILE_REPLACEMENT_TARGET"
@@ -154,7 +218,8 @@ test "$CODEX_HOME" = "$PROBE_CURRENT_ACTION_DIR/codex"
 test -r "$CODEX_HOME/skills/repo_action/SKILL.md"
 grep -q "pinned package" "$CODEX_HOME/skills/repo_action/SKILL.md"
 test -r "$CODEX_HOME/sessions/native-current.jsonl"
-grep -q "current native session native-current" "$CODEX_HOME/sessions/native-current.jsonl"
+grep -q '"type":"session_meta"' "$CODEX_HOME/sessions/native-current.jsonl"
+grep -q '"id":"native-current"' "$CODEX_HOME/sessions/native-current.jsonl"
 test ! -e "$CODEX_HOME/sessions/native-sibling.jsonl"
 git status --porcelain=v1 --untracked-files=all >/tmp/ot-probe-git-status
 node /opt/openthrottle/runner/execute-stage.mjs --print-subject --repo "$PWD" >/tmp/ot-probe-subject
