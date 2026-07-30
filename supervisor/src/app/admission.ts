@@ -120,7 +120,7 @@ async function resolvePipelineSelection(
 ): Promise<string> {
   if (taskType !== "implement") {
     const requested = extractRequestedGraph(context);
-    if (requested.graphId || repositoryConfig.config.intents?.[taskType]) {
+    if (requested.graphId) {
       throw new Error(`graph selection is not supported for ${taskType} tickets`);
     }
     return repositoryConfig.config.pipelines?.[taskType] ?? taskType;
