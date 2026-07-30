@@ -67,7 +67,6 @@ const SKILLS = new Set([
 ]);
 const CONTEXTS = new Set(["fresh", "resume_required", "prefer_resume"]);
 const STANDARD_RECEIPT_SCHEMA = "openthrottle.receipt/v1";
-const RECEIPT_SCHEMAS = new Set([STANDARD_RECEIPT_SCHEMA, "probe/no-receipt@1"]);
 const DEFAULT_ACTION_ROOT = "/var/lib/openthrottle/loop-actions";
 const DEFAULT_WORKTREE_ROOT = "/var/lib/openthrottle/worktrees";
 const INTEGRATION_REPO_DIR = "/home/agent/repo";
@@ -306,7 +305,7 @@ export function validateLoopRequest(value) {
     credentialScopes: boundedArray(input.credentialScopes, "credentialScopes"),
     receiptSchema: string(input.receiptSchema, "receiptSchema", /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,159}$/),
   };
-  if (!RECEIPT_SCHEMAS.has(request.receiptSchema)) throw new Error("loop receipt schema is unsupported");
+  if (request.receiptSchema !== STANDARD_RECEIPT_SCHEMA) throw new Error("loop receipt schema is unsupported");
   if (!ROLES.has(request.role)) throw new Error("role is invalid");
   if (!LOOPS.has(request.loop)) throw new Error("loop is invalid");
   if (!AGENTS.has(request.agent)) throw new Error("agent is invalid");
@@ -535,7 +534,8 @@ function createReadOnlyRepositoryView(request, sourceRepoDir = "/home/agent/repo
   const destination = pathInside(currentActionDirectory, "repo-view");
   rmSync(destination, { recursive: true, force: true });
   lockNonCurrentActionDirectories(request, actionRoot);
-  const subject = request.role === "lead" ? request.candidateSubject : "HEAD";
+  const sourceSubject = request.role === "lead" ? request.candidateSubject : "HEAD";
+  const subject = runRootGit(sourceRepoDir, ["rev-parse", sourceSubject]);
   const objectType = runRootGit(sourceRepoDir, ["cat-file", "-t", subject]);
   if (objectType !== "commit" && objectType !== "tree") {
     throw new Error("read-only repository subject must be a commit or tree");
@@ -546,7 +546,7 @@ function createReadOnlyRepositoryView(request, sourceRepoDir = "/home/agent/repo
   mkdirSync(packDir, { recursive: true, mode: 0o755 });
   packReachableBaseObjects(sourceRepoDir, join(packDir, "authorized"), subject);
   if (objectType === "commit") {
-    runRootGit(destination, ["checkout", "--quiet", "--detach", subject]);
+    runRootGit(destination, ["switch", "--quiet", "--detach", subject]);
   } else {
     runRootGit(destination, ["read-tree", subject]);
     runRootGit(destination, ["checkout-index", "--all", "--force"]);
@@ -840,7 +840,7 @@ export function executeLoopAction({
     }
     let parsedReceipt = null;
     let receiptError = null;
-    if (!subjectError && !execution.timedOut && !execution.signal && execution.status === 0 && request.receiptSchema === STANDARD_RECEIPT_SCHEMA) {
+    if (!subjectError && !execution.timedOut && !execution.signal && execution.status === 0) {
       try {
         parsedReceipt = parseLoopReceipt(execution.stdout, process.env);
         assertLoopReceiptFence(parsedReceipt, request, subject);

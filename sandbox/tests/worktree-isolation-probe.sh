@@ -186,6 +186,66 @@ must_fail() {
   fi
 }
 
+emit_receipt() {
+  node --input-type=module - "$2" <<'NODE'
+const subject = process.argv[2];
+const producerSkill = process.env.PROBE_RECEIPT_SKILL;
+let type = "unit_completion";
+let result = "success";
+let payload = {
+  summary: "Built-image isolation probe passed.",
+  assumptions: [],
+  decisions: [],
+  issues: [],
+  verification: ["sandbox/tests/worktree-isolation-probe.sh"],
+  downstream_context: [],
+  requested_human_input: [],
+};
+if (producerSkill === "builtin://accept-unit@1") {
+  type = "unit_decision";
+  result = "accept";
+  payload = {
+    rationale: "Built-image isolation probe accepted the candidate.",
+    context_updates: [],
+    accepted_subject: subject,
+  };
+} else if (producerSkill === "builtin://final-review@1") {
+  type = "semantic_review";
+  payload = {
+    summary: "Built-image isolation probe review passed.",
+    findings: [],
+  };
+}
+const receipt = {
+  schema: "openthrottle.receipt/v1",
+  type,
+  assurance: "semantic_attested",
+  result,
+  producer: {
+    worker_id: "probe",
+    skill: producerSkill,
+    capability_digest: "1".repeat(64),
+  },
+  subject: {
+    base: subject,
+    pre: subject,
+    post: subject,
+  },
+  fence: {
+    pipeline_instance_id: "probe-instance",
+    graph_digest: "2".repeat(64),
+    unit_id: process.env.PROBE_RECEIPT_UNIT_ID,
+    attempt_id: process.env.PROBE_RECEIPT_ATTEMPT_ID,
+    request_hash: process.env.PROBE_RECEIPT_REQUEST_HASH,
+  },
+  evidence: ["built-image isolation probe passed"],
+  payload,
+  issued_at: "2026-07-30T00:00:00.000Z",
+};
+console.log(JSON.stringify(receipt));
+NODE
+}
+
 test "$(id -un)" = "agent"
 if [ -n "${PROBE_READONLY_ACTION_DIR:-}" ]; then
   test "$(stat -c '%a' "$PROBE_READONLY_ACTION_DIR")" = "711"
@@ -199,7 +259,7 @@ if [ -n "${PROBE_READONLY_ACTION_DIR:-}" ]; then
   must_fail git cat-file -p "$PROBE_SIBLING_ONLY_BLOB"
   must_fail sh -c "printf bad >> '$PROBE_INTEGRATION/file.txt'"
   must_fail cat "$PROBE_INTEGRATION/file.txt"
-  printf '{"probe":"readonly-ok"}\n'
+  emit_receipt "$PROBE_READONLY_ACTION_DIR" "$(git rev-parse HEAD)"
   exit 0
 fi
 if [ -n "${PROBE_BUILTIN_ACTION_DIR:-}" ]; then
@@ -209,7 +269,7 @@ if [ -n "${PROBE_BUILTIN_ACTION_DIR:-}" ]; then
   test "$OT_NATIVE_SESSION_DIR" = "$PROBE_BUILTIN_ACTION_DIR/native-session"
   printf 'builtin home write\n' > "$HOME/builtin.txt"
   must_fail cat "$PROBE_PRIOR_HOME_SECRET"
-  printf '{"probe":"builtin-ok"}\n'
+  emit_receipt "$PROBE_BUILTIN_ACTION_DIR" "$(git rev-parse HEAD)"
   exit 0
 fi
 test "$(stat -c '%a' "$PROBE_CURRENT_ACTION_DIR")" = "711"
@@ -222,7 +282,6 @@ grep -q '"type":"session_meta"' "$CODEX_HOME/sessions/native-current.jsonl"
 grep -q '"id":"native-current"' "$CODEX_HOME/sessions/native-current.jsonl"
 test ! -e "$CODEX_HOME/sessions/native-sibling.jsonl"
 git status --porcelain=v1 --untracked-files=all >/tmp/ot-probe-git-status
-node /opt/openthrottle/runner/execute-stage.mjs --print-subject --repo "$PWD" >/tmp/ot-probe-subject
 printf 'worker write\n' > "$PWD/worker-write.txt"
 setsid sh -c 'while :; do sleep 30; done' >/dev/null 2>&1 &
 printf '%s\n' "$!" > "$PROBE_BACKGROUND_PID"
@@ -265,7 +324,8 @@ must_fail sh -c "rm -rf '$PROBE_PERSISTENT_OPENCODE_ROOT' && ln -s '$PROBE_PROFI
 must_fail cat "$PROBE_INTEGRATION/.git/objects/info/alternates.probe"
 must_fail sh -c "printf bad >> '$PROBE_INTEGRATION/.git/objects/info/alternates.probe'"
 test ! -w /opt/openthrottle/safety/pre-push
-printf '{"probe":"ok"}\n'
+node /opt/openthrottle/runner/execute-stage.mjs --print-subject --repo "$PWD" >/tmp/ot-probe-subject
+emit_receipt "$PROBE_CURRENT_ACTION_DIR" "$(cat /tmp/ot-probe-subject)"
 STUB
 chmod 0755 "$BIN/codex"
 
@@ -315,7 +375,7 @@ const base = {
   transitionContext: "Probe worktree isolation.",
   allowedMcpServers: [],
   credentialScopes: [],
-  receiptSchema: "probe/no-receipt@1",
+  receiptSchema: "openthrottle.receipt/v1",
   repositorySkill,
 };
 mkdirSync(dirname(requestPath), { recursive: true, mode: 0o700 });
@@ -351,7 +411,7 @@ const base = {
   transitionContext: "Probe read-only repository view isolation.",
   allowedMcpServers: [],
   credentialScopes: [],
-  receiptSchema: "probe/no-receipt@1",
+  receiptSchema: "openthrottle.receipt/v1",
 };
 mkdirSync(dirname(requestPath), { recursive: true, mode: 0o700 });
 writeFileSync(requestPath, canonicalJson({ ...base, ...createLoopRequestHash(base) }), { mode: 0o400 });
@@ -384,7 +444,7 @@ const base = {
   transitionContext: "Probe reviewer read-only repository view isolation.",
   allowedMcpServers: [],
   credentialScopes: [],
-  receiptSchema: "probe/no-receipt@1",
+  receiptSchema: "openthrottle.receipt/v1",
 };
 mkdirSync(dirname(requestPath), { recursive: true, mode: 0o700 });
 writeFileSync(requestPath, canonicalJson({ ...base, ...createLoopRequestHash(base) }), { mode: 0o400 });
@@ -419,13 +479,25 @@ const base = {
   transitionContext: "Probe built-in loop action home isolation.",
   allowedMcpServers: [],
   credentialScopes: [],
-  receiptSchema: "probe/no-receipt@1",
+  receiptSchema: "openthrottle.receipt/v1",
 };
 mkdirSync(dirname(requestPath), { recursive: true, mode: 0o700 });
 writeFileSync(requestPath, canonicalJson({ ...base, ...createLoopRequestHash(base) }), { mode: 0o400 });
 NODE
 chown root:root "$BUILTIN_REQUEST"
 chmod 0400 "$BUILTIN_REQUEST"
+
+request_hash() {
+  node --input-type=module - "$1" <<'NODE'
+import { readFileSync } from "node:fs";
+console.log(JSON.parse(readFileSync(process.argv[2], "utf8")).requestHash);
+NODE
+}
+
+CURRENT_REQUEST_HASH="$(request_hash "$REQUEST")"
+LEAD_REQUEST_HASH="$(request_hash "$LEAD_REQUEST")"
+REVIEWER_REQUEST_HASH="$(request_hash "$REVIEWER_REQUEST")"
+BUILTIN_REQUEST_HASH="$(request_hash "$BUILTIN_REQUEST")"
 
 printf 'mutable worktree skill bytes\n' > "$WORKTREES/current/.agents/skills/current/SKILL.md"
 printf '#!/bin/sh\necho executable probe\n' > "$WORKTREES/current/executable-probe.sh"
@@ -455,6 +527,10 @@ PROBE_PERSISTENT_OT_ROOT="/home/agent/.ot" \
 PROBE_PROFILE_REPLACEMENT_TARGET="$PROFILE_REPLACEMENT_TARGET" \
 PROBE_CURRENT_ACTION_DIR="$ACTION_ROOT/attempt-current/action-current" \
 PROBE_BACKGROUND_PID="$BACKGROUND_PID" \
+PROBE_RECEIPT_UNIT_ID="unit-1" \
+PROBE_RECEIPT_ATTEMPT_ID="attempt-current" \
+PROBE_RECEIPT_REQUEST_HASH="$CURRENT_REQUEST_HASH" \
+PROBE_RECEIPT_SKILL="repo://owner/repo@$BASE#.agents/skills/current" \
 /opt/openthrottle/runner/execute-loop.mjs --request "$REQUEST" --output "$RESULT"
 
 if [ -s "$BACKGROUND_PID" ] && kill -0 "$(cat "$BACKGROUND_PID")" >/dev/null 2>&1; then
@@ -485,6 +561,10 @@ PROBE_INTEGRATION="$INTEGRATION" \
 PROBE_BASE="$BASE" \
 PROBE_SIBLING_ONLY_BLOB="$SIBLING_ONLY_BLOB" \
 PROBE_READONLY_ACTION_DIR="$ACTION_ROOT/attempt-current/action-lead" \
+PROBE_RECEIPT_UNIT_ID="unit-1" \
+PROBE_RECEIPT_ATTEMPT_ID="attempt-current" \
+PROBE_RECEIPT_REQUEST_HASH="$LEAD_REQUEST_HASH" \
+PROBE_RECEIPT_SKILL="builtin://accept-unit@1" \
 /opt/openthrottle/runner/execute-loop.mjs --request "$LEAD_REQUEST" --output "$LEAD_RESULT"
 
 node --input-type=module - "$LEAD_RESULT" <<'NODE'
@@ -507,6 +587,10 @@ PROBE_INTEGRATION="$INTEGRATION" \
 PROBE_BASE="$BASE" \
 PROBE_SIBLING_ONLY_BLOB="$SIBLING_ONLY_BLOB" \
 PROBE_READONLY_ACTION_DIR="$ACTION_ROOT/attempt-current/action-reviewer" \
+PROBE_RECEIPT_UNIT_ID="unit-1" \
+PROBE_RECEIPT_ATTEMPT_ID="attempt-current" \
+PROBE_RECEIPT_REQUEST_HASH="$REVIEWER_REQUEST_HASH" \
+PROBE_RECEIPT_SKILL="builtin://final-review@1" \
 /opt/openthrottle/runner/execute-loop.mjs --request "$REVIEWER_REQUEST" --output "$REVIEWER_RESULT"
 
 node --input-type=module - "$REVIEWER_RESULT" <<'NODE'
@@ -527,6 +611,10 @@ OT_WORKTREE_ROOT="$WORKTREES" \
 OT_INTEGRATION_REPO_DIR="$INTEGRATION" \
 PROBE_BUILTIN_ACTION_DIR="$ACTION_ROOT/attempt-current/action-builtin" \
 PROBE_PRIOR_HOME_SECRET="$ACTION_ROOT/attempt-prior/action-home/home/native-session.json" \
+PROBE_RECEIPT_UNIT_ID="unit-1" \
+PROBE_RECEIPT_ATTEMPT_ID="attempt-current" \
+PROBE_RECEIPT_REQUEST_HASH="$BUILTIN_REQUEST_HASH" \
+PROBE_RECEIPT_SKILL="builtin://accept-unit@1" \
 /opt/openthrottle/runner/execute-loop.mjs --request "$BUILTIN_REQUEST" --output "$BUILTIN_RESULT"
 
 node --input-type=module - "$BUILTIN_RESULT" <<'NODE'
