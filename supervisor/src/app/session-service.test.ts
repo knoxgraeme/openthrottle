@@ -454,6 +454,22 @@ intents:
     expect(payloads.some((entry) => entry.includes(expectedMessage))).toBe(true);
   }
 
+  it("preserves the generated simple investigate intent when no graph is explicitly requested", async () => {
+    const { pipelines } = await run(
+      repositoryConfigYaml(
+        "{ implement: implement, investigate: fixture-command }",
+        "intents:\n  investigate:\n    default_graph: simple\n    allowed_graphs: [simple]\n"
+      ),
+      { codexAuthJson: undefined, claudeCodeOauthToken: undefined, kimiCodeApiKey: undefined },
+      fixtureCatalogPath,
+      payload("session-1", "issue-1", "OT-1", undefined, ["investigate"])
+    );
+
+    expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
+      pipeline_id: "fixture/command",
+      pipeline_version: 2,
+    });
+  });
   it("rejects graph selections on investigate tickets before provisioning", async () => {
     const context = [
       "# Investigate structured behavior",
