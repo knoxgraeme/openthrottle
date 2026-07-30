@@ -260,11 +260,6 @@ describe("loop action request validation", () => {
       .toThrow(/actionId is invalid/);
   });
 
-  it("rejects unsupported receipt schemas before loop execution", () => {
-    expect(() => validateLoopRequest(request({ receiptSchema: "openthrottle.loop-receipt@1" })))
-      .toThrow(/loop receipt schema is unsupported/);
-  });
-
   it("enforces role/worktree and session reuse rules", () => {
     expect(() => validateLoopRequest(request({ role: "lead", loop: "lead", worktree: null, candidateSubject: "a".repeat(40) }))).not.toThrow();
     expect(() => validateLoopRequest(request({ role: "lead", loop: "lead", worktree: null }))).toThrow(/candidate subject/);

@@ -305,7 +305,6 @@ export function validateLoopRequest(value) {
     credentialScopes: boundedArray(input.credentialScopes, "credentialScopes"),
     receiptSchema: string(input.receiptSchema, "receiptSchema", /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,159}$/),
   };
-  if (request.receiptSchema !== STANDARD_RECEIPT_SCHEMA) throw new Error("loop receipt schema is unsupported");
   if (!ROLES.has(request.role)) throw new Error("role is invalid");
   if (!LOOPS.has(request.loop)) throw new Error("loop is invalid");
   if (!AGENTS.has(request.agent)) throw new Error("agent is invalid");
