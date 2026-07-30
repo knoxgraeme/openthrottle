@@ -234,7 +234,11 @@ describe("Daytona stage execution", () => {
       receipt: "done",
       created_at: "2026-07-22T00:00:00.000Z",
     })));
-    await expect(runtime.collectLoopActionResult(resource, "loop-1")).resolves.toMatchObject({
+    await expect(runtime.collectLoopActionResult(resource, {
+      attemptId: "attempt-child",
+      actionId: "loop-1",
+      requestHash: loopRequest.requestHash,
+    })).resolves.toMatchObject({
       actionId: "loop-1",
       attemptId: "attempt-child",
       outcome: "success",
@@ -253,6 +257,51 @@ describe("Daytona stage execution", () => {
     await runtime.quarantine(resource, "stale subject");
     await runtime.cleanup(resource);
     expect(sandbox.delete).toHaveBeenCalledOnce();
+  });
+
+  it("collects loop results only from the exact attempt/action path", async () => {
+    const remoteFiles = new Map<string, Buffer>();
+    const sandbox = {
+      id: "provider-opaque-loop-fence",
+      state: "started",
+      fs: {
+        downloadFile: vi.fn(async (path: string) => {
+          const file = remoteFiles.get(path);
+          if (!file) throw new Error("not found");
+          return file;
+        }),
+      },
+    } as unknown as Sandbox;
+    const runtime = createDaytonaSandboxRuntime({ get: vi.fn(async () => sandbox) } as never, {
+      snapshot: "snapshot-v1",
+      materializeCredentialEnv: vi.fn(async () => ({ env: {} })),
+    });
+    const resource = { providerResourceId: "provider-opaque-loop-fence" };
+    const result = {
+      version: 1,
+      kind: "loop_action_result",
+      action_id: "loop-1",
+      attempt_id: "attempt-other",
+      request_hash: "a".repeat(64),
+      outcome: "success",
+      native_session_id: "thread-1",
+      subject: "d".repeat(40),
+      receipt: "done",
+      created_at: "2026-07-22T00:00:00.000Z",
+    };
+    remoteFiles.set("/var/lib/openthrottle/loop-actions/attempt-other/loop-1/result.json", Buffer.from(JSON.stringify(result)));
+    await expect(runtime.collectLoopActionResult(resource, {
+      attemptId: "attempt-child",
+      actionId: "loop-1",
+      requestHash: "a".repeat(64),
+    })).resolves.toBeNull();
+
+    remoteFiles.set("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/result.json", Buffer.from(JSON.stringify(result)));
+    await expect(runtime.collectLoopActionResult(resource, {
+      attemptId: "attempt-child",
+      actionId: "loop-1",
+      requestHash: "b".repeat(64),
+    })).rejects.toThrow(/invalid envelope/);
   });
 
   it("refuses credentials outside the sandbox allowlist", async () => {

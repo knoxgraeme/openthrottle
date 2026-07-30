@@ -43,6 +43,11 @@ git -C "$SMOKE_DIR/work" push -u origin main >/dev/null
 git --git-dir "$SMOKE_DIR/repo.git" symbolic-ref HEAD refs/heads/main
 
 test "$(docker image inspect --format '{{json .Config.Entrypoint}}' "$IMAGE")" = '["/bin/true"]'
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+docker run --rm --entrypoint bash \
+  -v "$SCRIPT_DIR/worktree-isolation-probe.sh:/opt/openthrottle/tests/worktree-isolation-probe.sh:ro" \
+  "$IMAGE" /opt/openthrottle/tests/worktree-isolation-probe.sh
 
 docker run --rm --entrypoint bash "$IMAGE" -lc '
   claude --version | rg -q "^2\.1\.201" &&

@@ -108,7 +108,11 @@ export interface SandboxRuntime {
     baseCommit: string;
   }): Promise<RuntimeWorktreeHandle>;
   dispatchLoopAction(resource: RuntimeResource, request: LoopActionRequest): Promise<{ providerDispatchId: string }>;
-  collectLoopActionResult(resource: RuntimeResource, actionId: string): Promise<LoopActionResult | null>;
+  collectLoopActionResult(resource: RuntimeResource, input: {
+    attemptId: string;
+    actionId: string;
+    requestHash: string;
+  }): Promise<LoopActionResult | null>;
   cleanupWorktree(resource: RuntimeResource, handle: RuntimeWorktreeHandle): Promise<void>;
   renewLiveness(resource: RuntimeResource, attemptId: string): Promise<{ observedAt: string }>;
   stop(resource: RuntimeResource, reason: string): Promise<{ confirmed: boolean }>;

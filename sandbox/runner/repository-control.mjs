@@ -1,11 +1,14 @@
 import {
   chownSync,
   chmodSync,
+  constants,
   existsSync,
   lstatSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  accessSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -106,12 +109,36 @@ function prepareRepositoryOwnerDirectory(path) {
   chmodSync(path, 0o700);
 }
 
+function canWriteDirectory(path) {
+  try {
+    accessSync(path, constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function computeWorkspaceTreeOidFromTree(repoDir, baseTree) {
   const temporary = mkdtempSync(join(tmpdir(), "ot-stage-index-"));
   const indexPath = join(temporary, "index");
+  const objectPath = join(temporary, "objects");
   try {
     prepareRepositoryOwnerDirectory(temporary);
-    const env = { GIT_INDEX_FILE: indexPath };
+    const commonDir = optionalRepositoryOwnerGit(repoDir, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    const commonObjects = commonDir ? join(commonDir, "objects") : null;
+    const isolateObjects = commonObjects &&
+      ((typeof process.getuid === "function" && process.getuid() === 0) || !canWriteDirectory(commonObjects));
+    if (isolateObjects) {
+      mkdirSync(objectPath, { recursive: true, mode: 0o700 });
+      prepareRepositoryOwnerDirectory(objectPath);
+    }
+    const env = {
+      GIT_INDEX_FILE: indexPath,
+      ...(isolateObjects ? {
+        GIT_OBJECT_DIRECTORY: objectPath,
+        GIT_ALTERNATE_OBJECT_DIRECTORIES: commonObjects,
+      } : {}),
+    };
     runGitAsRepositoryOwner(repoDir, ["read-tree", baseTree], env);
     runGitAsRepositoryOwner(repoDir, ["add", "-A", "--", "."], env);
     return commit(runGitAsRepositoryOwner(repoDir, ["write-tree"], env), "workspace tree");

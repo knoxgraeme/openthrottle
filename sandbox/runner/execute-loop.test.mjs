@@ -187,8 +187,8 @@ describe("loop action request validation", () => {
       request: valid,
       invocation: resolveLoopInvocation(valid),
       integrationRepoDir,
-      lockIntegration: (path) => {
-        events.push(`lock-integration:${path}`);
+      lockIntegration: (path, options) => {
+        events.push(`lock-integration:${path}:${"preservedLinkedGitDir" in options}`);
         return true;
       },
       runProcess: (command, args, options) => {
@@ -201,9 +201,9 @@ describe("loop action request validation", () => {
 
     expect(result.status).toBe(0);
     expect(events).toEqual([
-      `lock-integration:${integrationRepoDir}`,
+      `lock-integration:${integrationRepoDir}:true`,
       `run:gosu:${loopWorktreeDirectory(valid)}`,
-      `lock-integration:${integrationRepoDir}`,
+      `lock-integration:${integrationRepoDir}:true`,
     ]);
   });
 

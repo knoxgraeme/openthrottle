@@ -18,7 +18,6 @@ const ACTIVE_SANDBOX_AUTOSTOP_MINUTES = 60;
 const IDLE_SANDBOX_AUTOSTOP_MINUTES = 5;
 const STAGE_INPUT_DIR = "/var/lib/openthrottle/stage-input";
 const STAGE_RESULT_DIR = "/var/lib/openthrottle/stage-results";
-const LOOP_RESULT_DIR = "/var/lib/openthrottle/loop-results";
 const LOOP_ACTION_DIR = "/var/lib/openthrottle/loop-actions";
 const STAGE_CREDENTIAL_ENV = new Set([
   "GITHUB_TOKEN",
@@ -138,21 +137,20 @@ function parseCollectedStageResult(raw: string, attemptId: string): StageExecuti
   };
 }
 
-function parseCollectedLoopResult(raw: string, actionId: string): LoopActionResult {
+function parseCollectedLoopResult(raw: string, input: { attemptId: string; actionId: string; requestHash: string }): LoopActionResult {
   if (Buffer.byteLength(raw, "utf8") > 256 * 1024) throw new Error("sealed loop result exceeds 256 KiB");
   const event = JSON.parse(raw) as Record<string, unknown>;
-  if (event.kind !== "loop_action_result" || event.version !== 1 || event.action_id !== actionId ||
-      typeof event.attempt_id !== "string" || typeof event.request_hash !== "string" ||
-      !/^[a-f0-9]{64}$/.test(event.request_hash) ||
+  if (event.kind !== "loop_action_result" || event.version !== 1 || event.action_id !== input.actionId ||
+      event.attempt_id !== input.attemptId || event.request_hash !== input.requestHash ||
       !["success", "failure", "needs_human", "retryable_infrastructure_failure"].includes(String(event.outcome)) ||
       typeof event.created_at !== "string" || Number.isNaN(Date.parse(event.created_at)) ||
       (event.subject !== null && (typeof event.subject !== "string" || !/^[a-f0-9]{40,64}$/.test(event.subject))) ||
       (event.native_session_id !== null && typeof event.native_session_id !== "string") ||
       typeof event.receipt !== "string") {
-    throw new Error(`sealed loop result ${actionId} has an invalid envelope`);
+    throw new Error(`sealed loop result ${input.attemptId}/${input.actionId} has an invalid envelope`);
   }
   return {
-    actionId,
+    actionId: input.actionId,
     attemptId: event.attempt_id as string,
     requestHash: event.request_hash as string,
     outcome: event.outcome as LoopActionResult["outcome"],
@@ -371,23 +369,14 @@ export function createDaytonaSandboxRuntime(
       return { providerDispatchId: dispatched.cmdId ?? sessionId };
     },
 
-    async collectLoopActionResult(resource, actionId) {
-      safeStagePathId(actionId, "loop action ID");
+    async collectLoopActionResult(resource, input) {
+      safeStagePathId(input.attemptId, "loop attempt ID");
+      safeStagePathId(input.actionId, "loop action ID");
+      if (!/^[a-f0-9]{64}$/.test(input.requestHash)) throw new Error("loop request hash is invalid");
       const sandbox = await getSandbox(resource);
       try {
-        const files = await sandbox.fs.listFiles?.(LOOP_ACTION_DIR).catch(() => []);
-        const attempts = files?.filter((file) => file.isDir && typeof (file.path ?? file.name) === "string") ?? [];
-        for (const attempt of attempts) {
-          const attemptPath = attempt.path ?? `${LOOP_ACTION_DIR}/${attempt.name}`;
-          try {
-            const raw = (await sandbox.fs.downloadFile(`${attemptPath}/${actionId}/result.json`)).toString("utf8");
-            return parseCollectedLoopResult(raw, actionId);
-          } catch (error) {
-            if (!String(error).toLowerCase().includes("not found")) throw error;
-          }
-        }
-        const raw = (await sandbox.fs.downloadFile(`${LOOP_RESULT_DIR}/${actionId}.json`)).toString("utf8");
-        return parseCollectedLoopResult(raw, actionId);
+        const raw = (await sandbox.fs.downloadFile(loopActionPath(input.attemptId, input.actionId, "result.json"))).toString("utf8");
+        return parseCollectedLoopResult(raw, input);
       } catch (error) {
         if (String(error).toLowerCase().includes("not found")) return null;
         throw error;

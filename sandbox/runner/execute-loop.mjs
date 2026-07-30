@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { canonicalJson } from "./capabilities.mjs";
@@ -94,15 +94,18 @@ function ensureTraverseOnly(path) {
   chmodSync(path, 0o711);
 }
 
-function lockSiblingActionDirectories(request) {
-  const attemptDirectory = pathInside(DEFAULT_ACTION_ROOT, request.attemptId);
-  if (!existsSync(attemptDirectory)) return;
+function lockNonCurrentActionDirectories(request) {
+  if (!existsSync(DEFAULT_ACTION_ROOT)) return;
   const currentActionDirectory = actionDirectory(request);
-  for (const entry of readdirSync(attemptDirectory)) {
-    const sibling = resolve(attemptDirectory, entry);
-    if (sibling !== currentActionDirectory && lstatSync(sibling).isDirectory()) {
-      chownTree(sibling, ROOT_UID, ROOT_GID);
-      chmodTree(sibling, { fileMode: 0o600, directoryMode: 0o700 });
+  for (const attempt of readdirSync(DEFAULT_ACTION_ROOT)) {
+    const attemptDirectory = resolve(DEFAULT_ACTION_ROOT, attempt);
+    if (!lstatSync(attemptDirectory).isDirectory()) continue;
+    for (const action of readdirSync(attemptDirectory)) {
+      const actionDirectoryPath = resolve(attemptDirectory, action);
+      if (actionDirectoryPath !== currentActionDirectory && lstatSync(actionDirectoryPath).isDirectory()) {
+        chownTree(actionDirectoryPath, ROOT_UID, ROOT_GID);
+        chmodTree(actionDirectoryPath, { fileMode: 0o600, directoryMode: 0o700 });
+      }
     }
   }
 }
@@ -213,7 +216,7 @@ function createReadOnlyRepositoryView(request, sourceRepoDir = "/home/agent/repo
   rmSync(destination, { recursive: true, force: true });
   ensureTraverseOnly(DEFAULT_ACTION_ROOT);
   ensureTraverseOnly(attemptDirectory);
-  lockSiblingActionDirectories(request);
+  lockNonCurrentActionDirectories(request);
   ensureTraverseOnly(currentActionDirectory);
   const head = runRootGit(sourceRepoDir, ["rev-parse", "HEAD"]);
   runRootGit(sourceRepoDir, ["clone", "--quiet", "--no-hardlinks", sourceRepoDir, destination]);
@@ -226,7 +229,7 @@ function createReadOnlyRepositoryView(request, sourceRepoDir = "/home/agent/repo
 
 function prepareLoopRepository(request) {
   if (request.worktree) {
-    lockSiblingActionDirectories(request);
+    lockNonCurrentActionDirectories(request);
     return grantWorktreeToAgent({
       rootDir: process.env.OT_WORKTREE_ROOT ?? DEFAULT_WORKTREE_ROOT,
       handle: request.worktree.id,
@@ -235,11 +238,80 @@ function prepareLoopRepository(request) {
   return createReadOnlyRepositoryView(request);
 }
 
-function lockIntegrationCheckout(path = INTEGRATION_REPO_DIR) {
-  if (!isRoot() || !existsSync(path)) return false;
+function lockReadOnlyTree(path) {
+  chownTree(path, ROOT_UID, ROOT_GID);
+  chmodTree(path, { fileMode: 0o444, directoryMode: 0o555 });
+}
+
+function lockObjectStore(path) {
+  lockReadOnlyTree(path);
+  const infoDir = resolve(path, "info");
+  if (!existsSync(infoDir) || !lstatSync(infoDir).isDirectory()) return;
+  for (const entry of readdirSync(infoDir)) {
+    if (entry.startsWith("alternates")) chmodSync(resolve(infoDir, entry), 0o400);
+  }
+}
+
+function lockPrivateTree(path) {
   chownTree(path, ROOT_UID, ROOT_GID);
   chmodTree(path, { fileMode: 0o600, directoryMode: 0o700 });
+}
+
+function lockGitMetadata(gitDir, preservedLinkedGitDir) {
+  if (!existsSync(gitDir) || !lstatSync(gitDir).isDirectory()) return;
+  chownSync(gitDir, ROOT_UID, ROOT_GID);
+  chmodSync(gitDir, 0o711);
+  for (const entry of readdirSync(gitDir)) {
+    const child = resolve(gitDir, entry);
+    const metadata = lstatSync(child);
+    if (entry === "worktrees" && metadata.isDirectory()) {
+      chownSync(child, ROOT_UID, ROOT_GID);
+      chmodSync(child, 0o711);
+      for (const handle of readdirSync(child)) {
+        const handleDir = resolve(child, handle);
+        if (!lstatSync(handleDir).isDirectory()) continue;
+        if (preservedLinkedGitDir && handleDir === preservedLinkedGitDir) {
+          lockReadOnlyTree(handleDir);
+        } else {
+          lockPrivateTree(handleDir);
+        }
+      }
+    } else if (entry === "objects") {
+      lockObjectStore(child);
+    } else if (entry === "refs" || entry === "packed-refs" || entry === "HEAD" || entry === "config") {
+      lockReadOnlyTree(child);
+    } else {
+      lockPrivateTree(child);
+    }
+  }
+}
+
+function lockIntegrationCheckout(path = INTEGRATION_REPO_DIR, { preservedLinkedGitDir = null } = {}) {
+  if (!isRoot() || !existsSync(path)) return false;
+  chownSync(path, ROOT_UID, ROOT_GID);
+  chmodSync(path, 0o711);
+  for (const entry of readdirSync(path)) {
+    const child = resolve(path, entry);
+    if (entry === ".git") {
+      lockGitMetadata(child, preservedLinkedGitDir);
+      continue;
+    }
+    chownTree(child, ROOT_UID, ROOT_GID);
+    chmodTree(child, { fileMode: 0o600, directoryMode: 0o700 });
+  }
   return true;
+}
+
+function linkedWorktreeGitDir(repoDir) {
+  if (!repoDir || !existsSync(repoDir)) return null;
+  try {
+    const gitDir = runRootGit(repoDir, ["rev-parse", "--absolute-git-dir"]);
+    const commonDir = runRootGit(repoDir, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    if (commonDir === gitDir || !pathInside(commonDir, gitDir)) return null;
+    return gitDir;
+  } catch {
+    return null;
+  }
 }
 
 function lockCurrentWorkerWorktree(request) {
@@ -275,7 +347,8 @@ export function runLoopAgentInPreparedRepository({
 }) {
   const repoDir = prepareLoopRepository(request);
   const built = loopAgentCommand({ request, invocation, repoDir });
-  lockIntegration(integrationRepoDir);
+  const preservedLinkedGitDir = request.worktree ? linkedWorktreeGitDir(repoDir) : null;
+  lockIntegration(integrationRepoDir, { preservedLinkedGitDir });
   try {
     return runProcess("gosu", [
       "agent", "env", "HOME=/home/agent", "USER=agent", "GIT_OPTIONAL_LOCKS=0", built.command, ...built.args,
@@ -285,7 +358,7 @@ export function runLoopAgentInPreparedRepository({
       timeout: request.timeoutMs,
     });
   } finally {
-    lockIntegration(integrationRepoDir);
+    lockIntegration(integrationRepoDir, { preservedLinkedGitDir });
   }
 }
 

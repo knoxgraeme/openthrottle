@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
-import { chmodSync, chownSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { chmodSync, chownSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { runGitAsRepositoryOwner } from "./repository-control.mjs";
 import { chmodTree, chownTree, identityForUser, isRoot, pathInside as containedPath } from "./filesystem-isolation.mjs";
@@ -33,6 +33,61 @@ function assertDirectory(path, label) {
   if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error(`${label} must be a real directory`);
 }
 
+function linkedGitDir(target) {
+  const gitFile = resolve(target, ".git");
+  if (!existsSync(gitFile) || !lstatSync(gitFile).isFile()) return null;
+  const match = readFileSync(gitFile, "utf8").match(/^gitdir: (.+)\s*$/);
+  if (!match) return null;
+  const gitDir = resolve(dirname(gitFile), match[1]);
+  return existsSync(gitDir) && lstatSync(gitDir).isDirectory() ? gitDir : null;
+}
+
+function commonGitDirForLinked(gitDir) {
+  const commonDirFile = resolve(gitDir, "commondir");
+  if (!existsSync(commonDirFile) || !lstatSync(commonDirFile).isFile()) return null;
+  const commonDir = resolve(gitDir, readFileSync(commonDirFile, "utf8").trim());
+  return existsSync(commonDir) && lstatSync(commonDir).isDirectory() ? commonDir : null;
+}
+
+function lockLinkedGitDir(gitDir) {
+  if (!isRoot()) return;
+  chownTree(gitDir, ROOT_UID, ROOT_GID);
+  chmodTree(gitDir, { fileMode: 0o444, directoryMode: 0o555 });
+}
+
+function grantTreeToAgent(path) {
+  const identity = identityForUser("agent");
+  if (!identity) return;
+  chownTree(path, identity.uid, identity.gid);
+  chmodTree(path, { fileMode: 0o600, directoryMode: 0o700 });
+}
+
+function lockReadOnlyTree(path) {
+  if (!isRoot() || !existsSync(path)) return;
+  chownTree(path, ROOT_UID, ROOT_GID);
+  chmodTree(path, { fileMode: 0o444, directoryMode: 0o555 });
+}
+
+function lockObjectStore(path) {
+  lockReadOnlyTree(path);
+  const infoDir = resolve(path, "info");
+  if (!isRoot() || !existsSync(infoDir) || !lstatSync(infoDir).isDirectory()) return;
+  for (const entry of readdirSync(infoDir)) {
+    if (entry.startsWith("alternates")) chmodSync(resolve(infoDir, entry), 0o400);
+  }
+}
+
+function grantGitWorktreeAdminForExecutor(repoDir) {
+  if (!isRoot()) return;
+  const gitDir = resolve(repoDir, ".git");
+  const worktreesDir = resolve(repoDir, ".git/worktrees");
+  if (existsSync(worktreesDir)) {
+    grantTreeToAgent(worktreesDir);
+  } else if (existsSync(gitDir)) {
+    grantTreeToAgent(gitDir);
+  }
+}
+
 function prepareWorktreeRoot(rootDir) {
   mkdirSync(rootDir, { recursive: true, mode: 0o711 });
   assertDirectory(rootDir, "worktree root");
@@ -40,16 +95,21 @@ function prepareWorktreeRoot(rootDir) {
   chmodSync(rootDir, 0o711);
 }
 
-export function lockWorktree({ rootDir = DEFAULT_ROOT, handle }) {
+export function lockWorktree({ rootDir = DEFAULT_ROOT, handle, lockLinkedGitDir = true }) {
   const target = worktreePath({ rootDir, handle });
   if (!existsSync(target)) throw new Error("worktree handle does not exist");
   assertDirectory(target, "worktree");
+  const gitDir = linkedGitDir(target);
   chownTree(target, ROOT_UID, ROOT_GID);
   chmodTree(target, { fileMode: 0o600, directoryMode: 0o700 });
+  if (lockLinkedGitDir && gitDir) {
+    chownTree(gitDir, ROOT_UID, ROOT_GID);
+    chmodTree(gitDir, { fileMode: 0o600, directoryMode: 0o700 });
+  }
   return { id: safeHandle(handle), path: target, writable: false };
 }
 
-export function grantWorktreeToAgent({ rootDir = DEFAULT_ROOT, handle }) {
+export function grantWorktreeToAgent({ rootDir = DEFAULT_ROOT, handle, grantLinkedGitDir = false }) {
   prepareWorktreeRoot(rootDir);
   const target = worktreePath({ rootDir, handle });
   if (!existsSync(target)) throw new Error("worktree handle does not exist");
@@ -57,13 +117,22 @@ export function grantWorktreeToAgent({ rootDir = DEFAULT_ROOT, handle }) {
   for (const entry of readdirSync(rootDir)) {
     const sibling = resolve(rootDir, entry);
     if (sibling !== target && lstatSync(sibling).isDirectory()) {
+      const siblingGitDir = linkedGitDir(sibling);
       chownTree(sibling, ROOT_UID, ROOT_GID);
       chmodTree(sibling, { fileMode: 0o600, directoryMode: 0o700 });
+      if (siblingGitDir) lockLinkedGitDir(siblingGitDir);
     }
   }
   const identity = identityForUser("agent");
+  const gitDir = linkedGitDir(target);
   if (identity) chownTree(target, identity.uid, identity.gid);
   chmodTree(target, { fileMode: 0o600, directoryMode: 0o700 });
+  if (identity && gitDir && grantLinkedGitDir) {
+    chownTree(gitDir, identity.uid, identity.gid);
+    chmodTree(gitDir, { fileMode: 0o600, directoryMode: 0o700 });
+  } else if (gitDir) {
+    lockLinkedGitDir(gitDir);
+  }
   return { id: safeHandle(handle), path: target, writable: true };
 }
 
@@ -90,6 +159,7 @@ export function createWorktree({
   const head = runGitAsRepositoryOwner(repoDir, ["rev-parse", "HEAD"]);
   if (head !== safeBase) throw new Error("integration checkout HEAD does not match requested worktree base");
   prepareWorktreeRoot(rootDir);
+  grantGitWorktreeAdminForExecutor(repoDir);
   runGitAsRepositoryOwner(repoDir, ["worktree", "add", "--detach", target, safeBase]);
   try {
     runGitAsRepositoryOwner(target, ["config", "extensions.worktreeConfig", "true"]);
@@ -97,7 +167,7 @@ export function createWorktree({
     runGitAsRepositoryOwner(target, ["config", "--worktree", "remote.origin.pushurl", DISABLED_PUSH_URL]);
     const status = runGitAsRepositoryOwner(target, ["status", "--porcelain=v1", "--untracked-files=all"]);
     if (status) throw new Error("new worktree is dirty");
-    lockWorktree({ rootDir, handle });
+    lockWorktree({ rootDir, handle, lockLinkedGitDir: false });
     return { id: safeHandle(handle), path: target, baseCommit: safeBase };
   } catch (error) {
     rmSync(target, { recursive: true, force: true });
@@ -111,22 +181,38 @@ export function deriveCandidateCommit({
   message = "OpenThrottle internal candidate",
 }) {
   const safeBase = commit(baseCommit, "candidate base commit");
-  const head = runGitAsRepositoryOwner(worktreeDir, ["rev-parse", "HEAD"]);
-  if (head !== safeBase) throw new Error("worker moved HEAD; executor refuses candidate creation");
-  runGitAsRepositoryOwner(worktreeDir, ["add", "-A", "--", "."]);
-  const tree = runGitAsRepositoryOwner(worktreeDir, ["write-tree"]);
-  const changedPaths = runGitAsRepositoryOwner(worktreeDir, ["diff", "--name-only", `${safeBase}^{tree}`, tree])
-    .split("\n")
-    .filter(Boolean);
-  if (changedPaths.length === 0) return { candidateCommit: null, tree, changedPaths };
-  const candidateCommit = runGitAsRepositoryOwner(worktreeDir, ["commit-tree", tree, "-p", safeBase, "-m", message]);
-  return { candidateCommit, tree, changedPaths };
+  const gitDir = linkedGitDir(worktreeDir);
+  const commonDir = gitDir ? commonGitDirForLinked(gitDir) : null;
+  try {
+    if (isRoot()) {
+      grantTreeToAgent(worktreeDir);
+      if (gitDir) grantTreeToAgent(gitDir);
+      if (commonDir) grantTreeToAgent(resolve(commonDir, "objects"));
+    }
+    const head = runGitAsRepositoryOwner(worktreeDir, ["rev-parse", "HEAD"]);
+    if (head !== safeBase) throw new Error("worker moved HEAD; executor refuses candidate creation");
+    runGitAsRepositoryOwner(worktreeDir, ["add", "-A", "--", "."]);
+    const tree = runGitAsRepositoryOwner(worktreeDir, ["write-tree"]);
+    const changedPaths = runGitAsRepositoryOwner(worktreeDir, ["diff", "--name-only", `${safeBase}^{tree}`, tree])
+      .split("\n")
+      .filter(Boolean);
+    if (changedPaths.length === 0) return { candidateCommit: null, tree, changedPaths };
+    const candidateCommit = runGitAsRepositoryOwner(worktreeDir, ["commit-tree", tree, "-p", safeBase, "-m", message]);
+    return { candidateCommit, tree, changedPaths };
+  } finally {
+    if (isRoot()) {
+      chownTree(worktreeDir, ROOT_UID, ROOT_GID);
+      chmodTree(worktreeDir, { fileMode: 0o600, directoryMode: 0o700 });
+      if (gitDir) lockLinkedGitDir(gitDir);
+      if (commonDir) lockObjectStore(resolve(commonDir, "objects"));
+    }
+  }
 }
 
 export function removeWorktree({ repoDir, rootDir = DEFAULT_ROOT, handle }) {
   const target = worktreePath({ rootDir, handle });
   if (!existsSync(target)) return { id: safeHandle(handle), removed: false };
-  grantWorktreeToAgent({ rootDir, handle });
+  grantWorktreeToAgent({ rootDir, handle, grantLinkedGitDir: true });
   runGitAsRepositoryOwner(repoDir, ["worktree", "remove", "--force", target]);
   rmSync(target, { recursive: true, force: true });
   return { id: safeHandle(handle), removed: true };
