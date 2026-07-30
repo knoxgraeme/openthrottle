@@ -1,11 +1,13 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   createWorktree,
   deriveCandidateCommit,
+  grantWorktreeToAgent,
+  lockWorktree,
   removeWorktree,
   worktreePath,
 } from "./worktrees.mjs";
@@ -97,5 +99,25 @@ describe("executor-owned worktrees", () => {
       id: "unit-a",
       removed: false,
     });
+  });
+
+  it("locks retained worktrees and grants only the current handle", () => {
+    const repoDir = repository();
+    const rootDir = mkdtempSync(join(tmpdir(), "ot-worktrees-"));
+    directories.push(rootDir);
+    const baseCommit = git(repoDir, ["rev-parse", "HEAD"]);
+    const first = createWorktree({ repoDir, rootDir, handle: "unit-a", baseCommit });
+    const second = createWorktree({ repoDir, rootDir, handle: "unit-b", baseCommit });
+
+    expect(statSync(rootDir).mode & 0o777).toBe(0o711);
+    expect(statSync(first.path).mode & 0o777).toBe(0o700);
+    expect(statSync(second.path).mode & 0o777).toBe(0o700);
+
+    grantWorktreeToAgent({ rootDir, handle: "unit-b" });
+    expect(statSync(first.path).mode & 0o777).toBe(0o700);
+    expect(statSync(second.path).mode & 0o777).toBe(0o700);
+
+    lockWorktree({ rootDir, handle: "unit-b" });
+    expect(statSync(second.path).mode & 0o777).toBe(0o700);
   });
 });

@@ -18,8 +18,8 @@ const ACTIVE_SANDBOX_AUTOSTOP_MINUTES = 60;
 const IDLE_SANDBOX_AUTOSTOP_MINUTES = 5;
 const STAGE_INPUT_DIR = "/var/lib/openthrottle/stage-input";
 const STAGE_RESULT_DIR = "/var/lib/openthrottle/stage-results";
-const LOOP_INPUT_DIR = "/var/lib/openthrottle/loop-input";
 const LOOP_RESULT_DIR = "/var/lib/openthrottle/loop-results";
+const LOOP_ACTION_DIR = "/var/lib/openthrottle/loop-actions";
 const STAGE_CREDENTIAL_ENV = new Set([
   "GITHUB_TOKEN",
   "CLAUDE_CODE_OAUTH_TOKEN",
@@ -86,6 +86,12 @@ function assertLoopRequestFence(request: LoopActionRequest): void {
   if (request.requestHash !== expectedHash || request.idempotencyKey !== expectedKey) {
     throw new Error(`loop action ${request.actionId} has a stale hash or idempotency key`);
   }
+}
+
+function loopActionPath(attemptId: string, actionId: string, name: string): string {
+  safeStagePathId(attemptId, "loop attempt ID");
+  safeStagePathId(actionId, "loop action ID");
+  return `${LOOP_ACTION_DIR}/${attemptId}/${actionId}/${name}`;
 }
 
 function parseCollectedStageResult(raw: string, attemptId: string): StageExecutionResult {
@@ -342,9 +348,13 @@ export function createDaytonaSandboxRuntime(
     async dispatchLoopAction(resource, request) {
       assertLoopRequestFence(request);
       const sandbox = await ensureStarted(resource);
-      await prepareRootFolder(sandbox, LOOP_INPUT_DIR);
-      await prepareRootFolder(sandbox, LOOP_RESULT_DIR);
-      const requestPath = `${LOOP_INPUT_DIR}/${request.actionId}.json`;
+      await prepareRootFolder(sandbox, LOOP_ACTION_DIR);
+      await prepareRootFolder(sandbox, `${LOOP_ACTION_DIR}/${request.attemptId}`);
+      const actionDirectory = `${LOOP_ACTION_DIR}/${request.attemptId}/${request.actionId}`;
+      await prepareRootFolder(sandbox, actionDirectory);
+      const requestPath = loopActionPath(request.attemptId, request.actionId, "request.json");
+      const resultPath = loopActionPath(request.attemptId, request.actionId, "result.json");
+      const lockPath = loopActionPath(request.attemptId, request.actionId, "dispatch.lock");
       await sandbox.fs.uploadFile(Buffer.from(canonicalJson(request)), requestPath);
       await sandbox.fs.setFilePermissions(requestPath, { owner: "root", group: "root", mode: "400" });
       const sessionId = `loop-${request.actionId}`;
@@ -353,8 +363,8 @@ export function createDaytonaSandboxRuntime(
       }
       await sandbox.process?.createSession?.(sessionId).catch(() => undefined);
       const dispatched = await sandbox.process.executeSessionCommand(sessionId, {
-        command: `flock --nonblock ${LOOP_RESULT_DIR}/${request.actionId}.lock sh -c ` +
-          `'test -f ${LOOP_RESULT_DIR}/${request.actionId}.json || exec /opt/openthrottle/runner/execute-loop.mjs --request ${requestPath}'`,
+        command: `flock --nonblock ${lockPath} sh -c ` +
+          `'test -f ${resultPath} || exec /opt/openthrottle/runner/execute-loop.mjs --request ${requestPath} --output ${resultPath}'`,
         runAsync: true,
         suppressInputEcho: true,
       }, Math.ceil(request.timeoutMs / 1000));
@@ -365,6 +375,17 @@ export function createDaytonaSandboxRuntime(
       safeStagePathId(actionId, "loop action ID");
       const sandbox = await getSandbox(resource);
       try {
+        const files = await sandbox.fs.listFiles?.(LOOP_ACTION_DIR).catch(() => []);
+        const attempts = files?.filter((file) => file.isDir && typeof (file.path ?? file.name) === "string") ?? [];
+        for (const attempt of attempts) {
+          const attemptPath = attempt.path ?? `${LOOP_ACTION_DIR}/${attempt.name}`;
+          try {
+            const raw = (await sandbox.fs.downloadFile(`${attemptPath}/${actionId}/result.json`)).toString("utf8");
+            return parseCollectedLoopResult(raw, actionId);
+          } catch (error) {
+            if (!String(error).toLowerCase().includes("not found")) throw error;
+          }
+        }
         const raw = (await sandbox.fs.downloadFile(`${LOOP_RESULT_DIR}/${actionId}.json`)).toString("utf8");
         return parseCollectedLoopResult(raw, actionId);
       } catch (error) {

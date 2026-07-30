@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest, sanitizeArtifactText, validateStandardReceipt } from "./artifacts.mjs";
 import { computeWorkspaceTreeOid } from "./repository-control.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
-import { worktreePath } from "./worktrees.mjs";
+import { grantWorktreeToAgent, lockWorktree, worktreePath } from "./worktrees.mjs";
+import { chmodTree, chownTree, isRoot, pathInside as containedPath } from "./filesystem-isolation.mjs";
 
 export const LOOP_ACTION_PROTOCOL = "loop-action@1";
 
@@ -32,6 +33,11 @@ const SKILLS = new Set([
   "ce-commit-push-pr",
 ]);
 const CONTEXTS = new Set(["fresh", "resume_required", "prefer_resume"]);
+const DEFAULT_ACTION_ROOT = "/var/lib/openthrottle/loop-actions";
+const DEFAULT_WORKTREE_ROOT = "/var/lib/openthrottle/worktrees";
+const INTEGRATION_REPO_DIR = "/home/agent/repo";
+const ROOT_UID = 0;
+const ROOT_GID = 0;
 
 function record(value, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
@@ -60,6 +66,59 @@ function boundedArray(value, label, max = 32) {
   return [...value].sort();
 }
 
+function pathInside(root, child) {
+  return containedPath(root, child, "loop action path escapes the executor root");
+}
+
+function actionDirectory(request, rootDir = DEFAULT_ACTION_ROOT) {
+  return pathInside(pathInside(rootDir, request.attemptId), request.actionId);
+}
+
+function actionFilePath({ attemptId, actionId, rootDir = DEFAULT_ACTION_ROOT }, name) {
+  return pathInside(actionDirectory({
+    attemptId: string(attemptId, "attemptId"),
+    actionId: string(actionId, "actionId"),
+  }, rootDir), name);
+}
+
+export function loopRequestPath({ attemptId, actionId, rootDir = DEFAULT_ACTION_ROOT }) {
+  return actionFilePath({ attemptId, actionId, rootDir }, "request.json");
+}
+
+export function loopResultPath({ attemptId, actionId, rootDir = DEFAULT_ACTION_ROOT }) {
+  return actionFilePath({ attemptId, actionId, rootDir }, "result.json");
+}
+
+function ensureTraverseOnly(path) {
+  mkdirSync(path, { recursive: true, mode: 0o711 });
+  chmodSync(path, 0o711);
+}
+
+function lockSiblingActionDirectories(request) {
+  const attemptDirectory = pathInside(DEFAULT_ACTION_ROOT, request.attemptId);
+  if (!existsSync(attemptDirectory)) return;
+  const currentActionDirectory = actionDirectory(request);
+  for (const entry of readdirSync(attemptDirectory)) {
+    const sibling = resolve(attemptDirectory, entry);
+    if (sibling !== currentActionDirectory && lstatSync(sibling).isDirectory()) {
+      chownTree(sibling, ROOT_UID, ROOT_GID);
+      chmodTree(sibling, { fileMode: 0o600, directoryMode: 0o700 });
+    }
+  }
+}
+
+function runRootGit(repoDir, args) {
+  const result = runCapturedProcess("git", ["-c", `safe.directory=${repoDir}`, ...args], {
+    cwd: repoDir,
+    timeout: 120_000,
+    captureBytes: 1024 * 1024,
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${sanitizeArtifactText(result.stderr || result.error?.message || "").slice(-800)}`);
+  }
+  return result.stdout.trim();
+}
+
 export function createLoopRequestHash(requestWithoutFence) {
   const requestHash = digest(canonicalJson(requestWithoutFence));
   return {
@@ -80,6 +139,10 @@ export function validateLoopRequest(value) {
   if (unknown) throw new Error(`loop request has unknown field ${unknown}`);
   if (input.protocol !== LOOP_ACTION_PROTOCOL) throw new Error("loop request protocol is unsupported");
   const worktree = input.worktree === null ? null : record(input.worktree, "worktree");
+  if (worktree !== null) {
+    const worktreeUnknown = Object.keys(worktree).find((key) => key !== "id" && key !== "path");
+    if (worktreeUnknown) throw new Error(`worktree has unknown field ${worktreeUnknown}`);
+  }
   const request = {
     protocol: LOOP_ACTION_PROTOCOL,
     actionId: string(input.actionId, "actionId"),
@@ -92,7 +155,6 @@ export function validateLoopRequest(value) {
     skill: string(input.skill, "skill", /^[a-z][a-z0-9-]{0,79}$/),
     worktree: worktree === null ? null : {
       id: string(worktree.id, "worktree.id", /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
-      ...(worktree.path === undefined ? {} : { path: string(worktree.path, "worktree.path", /^\/[^\u0000]{1,500}$/) }),
     },
     nativeSessionId: nullableString(input.nativeSessionId, "nativeSessionId"),
     contextPolicy: string(input.contextPolicy, "contextPolicy"),
@@ -115,6 +177,7 @@ export function validateLoopRequest(value) {
   }
   if (request.role === "worker" && !request.worktree) throw new Error("worker loop requires a worktree");
   if (request.role !== "worker" && request.worktree) throw new Error("non-worker loop cannot receive a writable worktree");
+  if (worktree !== null && worktree.path !== undefined) throw new Error("loop request cannot carry an absolute worktree path");
   const expected = createLoopRequestHash(request);
   if (input.requestHash !== expected.requestHash || input.idempotencyKey !== expected.idempotencyKey) {
     throw new Error("loop request hash or idempotency key is stale");
@@ -124,7 +187,7 @@ export function validateLoopRequest(value) {
 
 export function loopWorktreeDirectory(request) {
   if (!request.worktree) return null;
-  return request.worktree.path ?? worktreePath({ handle: request.worktree.id });
+  return worktreePath({ rootDir: process.env.OT_WORKTREE_ROOT ?? DEFAULT_WORKTREE_ROOT, handle: request.worktree.id });
 }
 
 export function resolveLoopInvocation(request) {
@@ -143,8 +206,51 @@ export function loopPrompt(request) {
     `Return one receipt matching ${request.receiptSchema}.\n\n${request.transitionContext}`;
 }
 
-export function loopAgentCommand({ request, invocation }) {
-  const repoDir = loopWorktreeDirectory(request) ?? "/home/agent/repo";
+function createReadOnlyRepositoryView(request, sourceRepoDir = "/home/agent/repo") {
+  const attemptDirectory = pathInside(DEFAULT_ACTION_ROOT, request.attemptId);
+  const currentActionDirectory = actionDirectory(request);
+  const destination = pathInside(currentActionDirectory, "repo-view");
+  rmSync(destination, { recursive: true, force: true });
+  ensureTraverseOnly(DEFAULT_ACTION_ROOT);
+  ensureTraverseOnly(attemptDirectory);
+  lockSiblingActionDirectories(request);
+  ensureTraverseOnly(currentActionDirectory);
+  const head = runRootGit(sourceRepoDir, ["rev-parse", "HEAD"]);
+  runRootGit(sourceRepoDir, ["clone", "--quiet", "--no-hardlinks", sourceRepoDir, destination]);
+  runRootGit(destination, ["checkout", "--quiet", "--detach", head]);
+  runRootGit(destination, ["config", "remote.origin.url", "DISABLED_BY_OPENTHROTTLE_READONLY_VIEW"]);
+  runRootGit(destination, ["config", "remote.origin.pushurl", "DISABLED_BY_OPENTHROTTLE_READONLY_VIEW"]);
+  chmodTree(destination, { fileMode: 0o444, directoryMode: 0o555 });
+  return destination;
+}
+
+function prepareLoopRepository(request) {
+  if (request.worktree) {
+    lockSiblingActionDirectories(request);
+    return grantWorktreeToAgent({
+      rootDir: process.env.OT_WORKTREE_ROOT ?? DEFAULT_WORKTREE_ROOT,
+      handle: request.worktree.id,
+    }).path;
+  }
+  return createReadOnlyRepositoryView(request);
+}
+
+function lockIntegrationCheckout(path = INTEGRATION_REPO_DIR) {
+  if (!isRoot() || !existsSync(path)) return false;
+  chownTree(path, ROOT_UID, ROOT_GID);
+  chmodTree(path, { fileMode: 0o600, directoryMode: 0o700 });
+  return true;
+}
+
+function lockCurrentWorkerWorktree(request) {
+  if (!request.worktree) return;
+  lockWorktree({
+    rootDir: process.env.OT_WORKTREE_ROOT ?? DEFAULT_WORKTREE_ROOT,
+    handle: request.worktree.id,
+  });
+}
+
+export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDirectory(request) ?? "/home/agent/repo" }) {
   const prompt = loopPrompt(request);
   const command = request.agent === "codex" ? "codex" : request.agent;
   const args = request.agent === "codex"
@@ -160,13 +266,31 @@ export function loopAgentCommand({ request, invocation }) {
   };
 }
 
+export function runLoopAgentInPreparedRepository({
+  request,
+  invocation,
+  runProcess = runCapturedProcess,
+  integrationRepoDir = INTEGRATION_REPO_DIR,
+  lockIntegration = lockIntegrationCheckout,
+}) {
+  const repoDir = prepareLoopRepository(request);
+  const built = loopAgentCommand({ request, invocation, repoDir });
+  lockIntegration(integrationRepoDir);
+  try {
+    return runProcess("gosu", [
+      "agent", "env", "HOME=/home/agent", "USER=agent", "GIT_OPTIONAL_LOCKS=0", built.command, ...built.args,
+    ], {
+      cwd: built.repoDir,
+      input: built.input,
+      timeout: request.timeoutMs,
+    });
+  } finally {
+    lockIntegration(integrationRepoDir);
+  }
+}
+
 function defaultRunLoopAgent({ request, invocation }) {
-  const built = loopAgentCommand({ request, invocation });
-  return runCapturedProcess("gosu", ["agent", "env", "HOME=/home/agent", "USER=agent", built.command, ...built.args], {
-    cwd: built.repoDir,
-    input: built.input,
-    timeout: request.timeoutMs,
-  });
+  return runLoopAgentInPreparedRepository({ request, invocation });
 }
 
 function receiptCandidatesFromJson(value) {
@@ -223,44 +347,49 @@ function assertLoopReceiptFence(receipt, request, subject) {
 export function executeLoopAction({
   request: rawRequest,
   runLoopAgent = defaultRunLoopAgent,
+  lockWorkerWorktree = lockCurrentWorkerWorktree,
   now = () => new Date().toISOString(),
 }) {
   const request = validateLoopRequest(rawRequest);
-  const invocation = resolveLoopInvocation(request);
-  let execution;
   try {
-    execution = runLoopAgent({ request, invocation });
-  } catch (error) {
-    execution = { status: null, signal: null, timedOut: false, stdout: "", stderr: String(error), nativeSessionId: request.nativeSessionId };
-  }
-  const worktreeDir = loopWorktreeDirectory(request);
-  const subject = worktreeDir ? computeWorkspaceTreeOid(worktreeDir) : null;
-  let parsedReceipt = null;
-  let receiptError = null;
-  if (!execution.timedOut && !execution.signal && execution.status === 0 && request.receiptSchema === "openthrottle.receipt/v1") {
+    const invocation = resolveLoopInvocation(request);
+    let execution;
     try {
-      parsedReceipt = parseLoopReceipt(execution.stdout, process.env);
-      assertLoopReceiptFence(parsedReceipt, request, subject);
+      execution = runLoopAgent({ request, invocation });
     } catch (error) {
-      receiptError = error instanceof Error ? error.message : String(error);
+      execution = { status: null, signal: null, timedOut: false, stdout: "", stderr: String(error), nativeSessionId: request.nativeSessionId };
     }
+    const worktreeDir = loopWorktreeDirectory(request);
+    const subject = worktreeDir ? computeWorkspaceTreeOid(worktreeDir) : null;
+    let parsedReceipt = null;
+    let receiptError = null;
+    if (!execution.timedOut && !execution.signal && execution.status === 0 && request.receiptSchema === "openthrottle.receipt/v1") {
+      try {
+        parsedReceipt = parseLoopReceipt(execution.stdout, process.env);
+        assertLoopReceiptFence(parsedReceipt, request, subject);
+      } catch (error) {
+        receiptError = error instanceof Error ? error.message : String(error);
+      }
+    }
+    const failed = execution.timedOut || execution.signal || execution.status !== 0 || Boolean(receiptError);
+    return {
+      version: 1,
+      kind: "loop_action_result",
+      event_id: randomUUID(),
+      action_id: request.actionId,
+      attempt_id: request.attemptId,
+      request_hash: request.requestHash,
+      outcome: failed ? "failure" : "success",
+      native_session_id: execution.nativeSessionId ?? request.nativeSessionId ?? null,
+      subject,
+      receipt: parsedReceipt
+        ? canonicalJson(parsedReceipt)
+        : sanitizeArtifactText(receiptError || execution.stdout || execution.stderr || (failed ? "loop action failed" : "loop action completed")).slice(0, 128_000),
+      created_at: now(),
+    };
+  } finally {
+    lockWorkerWorktree(request);
   }
-  const failed = execution.timedOut || execution.signal || execution.status !== 0 || Boolean(receiptError);
-  return {
-    version: 1,
-    kind: "loop_action_result",
-    event_id: randomUUID(),
-    action_id: request.actionId,
-    attempt_id: request.attemptId,
-    request_hash: request.requestHash,
-    outcome: failed ? "failure" : "success",
-    native_session_id: execution.nativeSessionId ?? request.nativeSessionId ?? null,
-    subject,
-    receipt: parsedReceipt
-      ? canonicalJson(parsedReceipt)
-      : sanitizeArtifactText(receiptError || execution.stdout || execution.stderr || (failed ? "loop action failed" : "loop action completed")).slice(0, 128_000),
-    created_at: now(),
-  };
 }
 
 function writeAtomic(path, value) {
@@ -284,7 +413,7 @@ function main() {
     writeFileSync(1, `${canonicalJson(request)}\n`);
     return;
   }
-  const outputPath = resolve(arg("--output", process.env.OT_LOOP_RESULT_FILE ?? `/var/lib/openthrottle/loop-results/${request.actionId}.json`));
+  const outputPath = resolve(arg("--output", process.env.OT_LOOP_RESULT_FILE ?? loopResultPath(request)));
   writeAtomic(outputPath, executeLoopAction({ request }));
 }
 

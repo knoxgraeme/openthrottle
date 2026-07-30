@@ -4,12 +4,14 @@ import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   readFileSync,
+  rmSync,
   writeFileSync,
   mkdirSync,
   renameSync,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import {
@@ -30,6 +32,7 @@ import {
   runGitAsRepositoryOwner,
 } from "./repository-control.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
+import { chmodTree, pathInside as containedPath } from "./filesystem-isolation.mjs";
 
 export { computeWorkspaceTreeOid } from "./repository-control.mjs";
 export { runCapturedProcess } from "./bounded-process.mjs";
@@ -53,6 +56,7 @@ const CONTEXT_POLICIES = new Set([
 ]);
 const COMMAND_NAME = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
 const REMOTE_GIT_TIMEOUT_MS = 15_000;
+const REPOSITORY_SKILL_CAPABILITY = "agent/repository-skill@1";
 
 function record(value, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -266,13 +270,62 @@ function skillBody(raw) {
   return (end === -1 ? raw : lines.slice(end + 1).join("\n")).trim();
 }
 
+function pathInside(root, child, label) {
+  return containedPath(root, child, `${label} escapes its root`);
+}
+
+function stageSkillDiscoveryRoot(agent) {
+  if (process.env.OT_REPOSITORY_SKILL_DISCOVERY_ROOT) return process.env.OT_REPOSITORY_SKILL_DISCOVERY_ROOT;
+  if (agent === "claude") return "/home/agent/.claude/skills";
+  if (agent === "codex") return "/home/agent/.codex/skills";
+  return "/home/agent/.ot/stage/opencode-skills";
+}
+
+export function materializeRepositorySkill({ request, repoDir }) {
+  if (request.capability !== REPOSITORY_SKILL_CAPABILITY) return null;
+  if (!request.repositorySkill) throw new Error("repository skill stage is missing its sealed package");
+  const packageInfo = request.repositorySkill;
+  const { packageDigest, ...unsignedPackage } = packageInfo;
+  if (digest(canonicalJson(unsignedPackage)) !== packageDigest) throw new Error("repository skill package digest mismatch");
+  const sourceRoot = pathInside(repoDir, packageInfo.directory, "repository skill source");
+  const discoveryRoot = stageSkillDiscoveryRoot(request.agent);
+  const targetRoot = pathInside(discoveryRoot, packageInfo.invocation, "repository skill discovery");
+  rmSync(discoveryRoot, { recursive: true, force: true });
+  mkdirSync(targetRoot, { recursive: true, mode: 0o755 });
+  for (const file of packageInfo.files) {
+    const sourcePath = pathInside(repoDir, file.path, "repository skill file");
+    const sourceRelative = relative(sourceRoot, sourcePath);
+    if (sourceRelative.startsWith("..") || sourceRelative === "" || sourceRelative.split(sep).includes("..")) {
+      throw new Error("repository skill file is outside the sealed package");
+    }
+    const metadata = lstatSync(sourcePath);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error("repository skill source file is not a regular file");
+    const blobSha = runGitAsRepositoryOwner(repoDir, ["rev-parse", `${packageInfo.commit}:${file.path}`]);
+    if (blobSha !== file.blobSha) throw new Error("repository skill blob fence mismatch");
+    const bytes = readFileSync(sourcePath);
+    if (digest(bytes) !== file.digest) throw new Error("repository skill file digest mismatch");
+    const destination = pathInside(targetRoot, sourceRelative, "repository skill destination");
+    mkdirSync(dirname(destination), { recursive: true, mode: 0o755 });
+    writeFileSync(destination, bytes, { mode: 0o444 });
+  }
+  chmodTree(discoveryRoot, { fileMode: 0o444, directoryMode: 0o555 });
+  return targetRoot;
+}
+
 export function stagePrompt(
   request,
   proposalPath,
-  { agent = request.agent, skillRoot = "/opt/openthrottle/skills/tasks" } = {}
+  { agent = request.agent, skillRoot = "/opt/openthrottle/skills/tasks", repositorySkillRoot = null } = {}
 ) {
   let entry = "Review the requested repository state and produce bounded evidence.";
-  if (request.capability.startsWith("ce/")) {
+  if (request.capability === REPOSITORY_SKILL_CAPABILITY) {
+    if (!request.repositorySkill) throw new Error("repository skill stage is missing its sealed package");
+    entry = `${agent === "claude" ? "/" : "$"}${request.repositorySkill.invocation}`;
+    if (agent === "opencode") {
+      const root = repositorySkillRoot ?? join(stageSkillDiscoveryRoot(agent), request.repositorySkill.invocation);
+      entry += `\n\n${skillBody(readFileSync(join(root, "SKILL.md"), "utf8"))}`;
+    }
+  } else if (request.capability.startsWith("ce/")) {
     const skillName = request.taskType === "investigate" ? "investigate" : "implement-plan";
     entry = `${agent === "claude" ? "/" : "$"}${skillName}`;
     // OpenCode has no admin-scope skill discovery equivalent. Give it the
@@ -312,7 +365,8 @@ export function extractNativeSessionId(output, agent) {
 }
 
 function defaultRunAgent({ request, invocation, repoDir, proposalPath, timeoutMs, model, agent = request.agent }) {
-  const prompt = stagePrompt(request, proposalPath, { agent });
+  const repositorySkillRoot = materializeRepositorySkill({ request, repoDir });
+  const prompt = stagePrompt(request, proposalPath, { agent, repositorySkillRoot });
   const env = [
     "HOME=/home/agent",
     "USER=agent",

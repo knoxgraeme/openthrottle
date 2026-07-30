@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -7,8 +7,11 @@ import {
   createLoopRequestHash,
   executeLoopAction,
   loopAgentCommand,
+  loopResultPath,
+  loopWorktreeDirectory,
   parseLoopReceipt,
   loopPrompt,
+  runLoopAgentInPreparedRepository,
   resolveLoopInvocation,
   validateLoopRequest,
 } from "./execute-loop.mjs";
@@ -18,6 +21,7 @@ const directories = [];
 
 afterEach(() => {
   for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
+  delete process.env.OT_WORKTREE_ROOT;
 });
 
 function repository() {
@@ -33,6 +37,12 @@ function repository() {
 }
 
 function request(overrides = {}) {
+  const repoDir = repository();
+  const rootDir = mkdtempSync(join(tmpdir(), "ot-loop-worktrees-"));
+  directories.push(rootDir);
+  const handle = "unit-1";
+  renameSync(repoDir, join(rootDir, handle));
+  process.env.OT_WORKTREE_ROOT = rootDir;
   const withoutFence = {
     protocol: "loop-action@1",
     actionId: "action-1",
@@ -43,7 +53,7 @@ function request(overrides = {}) {
     loop: "implement",
     agent: "codex",
     skill: "implement-unit",
-    worktree: { id: "unit-1", path: repository() },
+    worktree: { id: handle },
     nativeSessionId: null,
     contextPolicy: "prefer_resume",
     timeoutMs: 30_000,
@@ -70,7 +80,7 @@ function standardReceipt(loopRequest, overrides = {}) {
     subject: {
       base: "1".repeat(40),
       pre: "1".repeat(40),
-      post: computeWorkspaceTreeOid(loopRequest.worktree.path),
+      post: computeWorkspaceTreeOid(loopWorktreeDirectory(loopRequest)),
     },
     fence: {
       pipeline_instance_id: "instance-1",
@@ -102,6 +112,35 @@ describe("loop action request validation", () => {
       worktree: { id: "unit-1" },
     });
     expect(() => validateLoopRequest({ ...valid, skill: "ce-code-review" })).toThrow(/stale/);
+  });
+
+  it("rejects absolute worktree paths and writes action-attempt scoped result paths", () => {
+    const withPath = {
+      protocol: "loop-action@1",
+      actionId: "action-2",
+      attemptId: "attempt-2",
+      graphId: "graph-1",
+      unitId: "unit-1",
+      role: "worker",
+      loop: "implement",
+      agent: "codex",
+      skill: "implement-unit",
+      worktree: { id: "unit-1", path: "/tmp/escape" },
+      nativeSessionId: null,
+      contextPolicy: "prefer_resume",
+      timeoutMs: 30_000,
+      transitionContext: "Implement the unit.",
+      allowedMcpServers: [],
+      credentialScopes: ["model.invoke", "repo.read"],
+      receiptSchema: "openthrottle.receipt/v1",
+    };
+    expect(() => validateLoopRequest({ ...withPath, ...createLoopRequestHash(withPath) }))
+      .toThrow(/absolute worktree path/);
+    const withUnknown = { ...withPath, worktree: { id: "unit-1", hidden: "/tmp/escape" } };
+    expect(() => validateLoopRequest({ ...withUnknown, ...createLoopRequestHash(withUnknown) }))
+      .toThrow(/worktree has unknown field/);
+    expect(loopResultPath({ attemptId: "attempt-2", actionId: "action-2", rootDir: "/var/ot" }))
+      .toBe("/var/ot/attempt-2/action-2/result.json");
   });
 
   it("enforces role/worktree and session reuse rules", () => {
@@ -137,12 +176,64 @@ describe("loop action request validation", () => {
       expect(built.args).toContain("native-1");
     }
   });
+
+  it("keeps the integration checkout locked around worker execution", () => {
+    const valid = validateLoopRequest(request());
+    const integrationRepoDir = mkdtempSync(join(tmpdir(), "ot-loop-integration-"));
+    directories.push(integrationRepoDir);
+    const events = [];
+
+    const result = runLoopAgentInPreparedRepository({
+      request: valid,
+      invocation: resolveLoopInvocation(valid),
+      integrationRepoDir,
+      lockIntegration: (path) => {
+        events.push(`lock-integration:${path}`);
+        return true;
+      },
+      runProcess: (command, args, options) => {
+        events.push(`run:${command}:${options.cwd}`);
+        expect(args).toContain("GIT_OPTIONAL_LOCKS=0");
+        expect(options.cwd).toBe(loopWorktreeDirectory(valid));
+        return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+      },
+    });
+
+    expect(result.status).toBe(0);
+    expect(events).toEqual([
+      `lock-integration:${integrationRepoDir}`,
+      `run:gosu:${loopWorktreeDirectory(valid)}`,
+      `lock-integration:${integrationRepoDir}`,
+    ]);
+  });
+
+  it("leaves the integration checkout locked when agent launch throws", () => {
+    const valid = validateLoopRequest(request());
+    const events = [];
+
+    expect(() => runLoopAgentInPreparedRepository({
+      request: valid,
+      invocation: resolveLoopInvocation(valid),
+      integrationRepoDir: "/tmp/integration",
+      lockIntegration: () => {
+        events.push("lock-integration");
+        return true;
+      },
+      runProcess: () => {
+        events.push("run");
+        throw new Error("agent launch failed");
+      },
+    })).toThrow(/agent launch failed/);
+
+    expect(events).toEqual(["lock-integration", "run", "lock-integration"]);
+  });
 });
 
 describe("executeLoopAction", () => {
   it("writes a typed result with worker receipt, native session, and subject", () => {
     const valid = request();
     const receipt = standardReceipt(valid);
+    const lockWorkerWorktree = vi.fn();
     const runLoopAgent = vi.fn(() => ({
       status: 0,
       signal: null,
@@ -152,7 +243,12 @@ describe("executeLoopAction", () => {
       nativeSessionId: "thread-1",
     }));
 
-    const result = executeLoopAction({ request: valid, runLoopAgent, now: () => "2026-07-29T00:00:00.000Z" });
+    const result = executeLoopAction({
+      request: valid,
+      runLoopAgent,
+      lockWorkerWorktree,
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
 
     expect(runLoopAgent).toHaveBeenCalledWith(expect.objectContaining({
       invocation: { mode: "fresh", nativeSessionId: null },
@@ -166,11 +262,14 @@ describe("executeLoopAction", () => {
     });
     expect(JSON.parse(result.receipt)).toMatchObject({ type: "unit_completion", result: "success" });
     expect(result.subject).toMatch(/^[a-f0-9]{40}$/);
+    expect(lockWorkerWorktree).toHaveBeenCalledWith(expect.objectContaining({ worktree: { id: "unit-1" } }));
   });
 
   it("rejects successful loop exits without a valid standard receipt", () => {
+    const lockWorkerWorktree = vi.fn();
     const result = executeLoopAction({
       request: request(),
+      lockWorkerWorktree,
       runLoopAgent: () => ({
         status: 0,
         signal: null,
@@ -184,6 +283,23 @@ describe("executeLoopAction", () => {
 
     expect(result.outcome).toBe("failure");
     expect(result.receipt).toMatch(/invalid standard receipt/);
+    expect(lockWorkerWorktree).toHaveBeenCalledOnce();
+  });
+
+  it("relocks the worker worktree when the loop agent throws before evidence", () => {
+    const lockWorkerWorktree = vi.fn();
+    const result = executeLoopAction({
+      request: request(),
+      lockWorkerWorktree,
+      runLoopAgent: () => {
+        throw new Error("agent launch failed");
+      },
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("failure");
+    expect(result.receipt).toMatch(/agent launch failed/);
+    expect(lockWorkerWorktree).toHaveBeenCalledOnce();
   });
 
   it("extracts a standard receipt from JSONL agent output", () => {

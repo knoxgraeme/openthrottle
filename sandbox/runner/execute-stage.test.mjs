@@ -5,6 +5,7 @@ import {
   mkdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -20,6 +21,7 @@ import {
   executeStage,
   extractNativeSessionId,
   fallbackStageResultEvent,
+  materializeRepositorySkill,
   resolveContextInvocation,
   runCapturedProcess,
   runWithAgentProcessFence,
@@ -30,7 +32,11 @@ import {
 
 const directories = [];
 afterEach(() => {
-  for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
+  for (const directory of directories.splice(0)) {
+    if (existsSync(directory)) execFileSync("chmod", ["-R", "u+w", directory]);
+    rmSync(directory, { recursive: true, force: true });
+  }
+  delete process.env.OT_REPOSITORY_SKILL_DISCOVERY_ROOT;
 });
 
 function processGroupExists(pid) {
@@ -481,6 +487,111 @@ describe("one-stage executor", () => {
 
     expect(validateStageRequest(input.request).repositorySkill).toEqual(repositorySkill);
     expect(result.outcome).toBe("success");
+  });
+
+  it("materializes only the sealed repository skill package into engine discovery", () => {
+    const repoDir = repository();
+    const skillDir = ".agents/skills/implement-unit";
+    mkdirSync(join(repoDir, ".agents", "skills", "implement-unit"), { recursive: true });
+    mkdirSync(join(repoDir, ".agents", "skills", "other-skill"), { recursive: true });
+    writeFileSync(join(repoDir, skillDir, "SKILL.md"), "---\nname: implement_unit\n---\n# Skill\n");
+    writeFileSync(join(repoDir, skillDir, "helper.txt"), "helper\n");
+    writeFileSync(join(repoDir, ".agents", "skills", "other-skill", "SKILL.md"), "---\nname: other\n---\n");
+    execFileSync("git", ["add", "."], { cwd: repoDir });
+    execFileSync("git", ["commit", "-qm", "skill"], { cwd: repoDir });
+    const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+    const files = ["SKILL.md", "helper.txt"].map((name) => {
+      const path = `${skillDir}/${name}`;
+      const bytes = readFileSync(join(repoDir, path));
+      return {
+        path,
+        blobSha: execFileSync("git", ["rev-parse", `${commit}:${path}`], { cwd: repoDir, encoding: "utf8" }).trim(),
+        digest: digest(bytes),
+      };
+    });
+    const unsignedPackage = {
+      schema: "openthrottle.repository-skill-package/v1",
+      reference: `repo://owner/repo@${commit}#${skillDir}`,
+      invocation: "implement_unit",
+      directory: skillDir,
+      commit,
+      files,
+    };
+    const repositorySkill = { ...unsignedPackage, packageDigest: digest(canonicalJson(unsignedPackage)) };
+    const signedPackage = (overrides = {}) => {
+      const unsigned = { ...unsignedPackage, ...overrides };
+      return { ...unsigned, packageDigest: digest(canonicalJson(unsigned)) };
+    };
+    const discoveryRoot = mkdtempSync(join(tmpdir(), "ot-stage-skills-"));
+    directories.push(discoveryRoot);
+    process.env.OT_REPOSITORY_SKILL_DISCOVERY_ROOT = discoveryRoot;
+    const unlockDiscoveryRoot = () => {
+      if (existsSync(discoveryRoot)) execFileSync("chmod", ["-R", "u+w", discoveryRoot]);
+    };
+    const expectMaterializeToThrow = (repositorySkillFixture, pattern) => {
+      unlockDiscoveryRoot();
+      expect(() => materializeRepositorySkill({
+        request: { ...request, repositorySkill: repositorySkillFixture },
+        repoDir,
+      })).toThrow(pattern);
+    };
+    const withoutFence = {
+      protocol: "stage-executor@1",
+      pipelineInstanceId: "pipeline-1",
+      manifestDigest: "a".repeat(64),
+      runtimeRelease: RUNTIME_DESCRIPTOR.release,
+      capabilityDigest: runtimeCapabilityDigest(),
+      repositoryConfigDigest: "b".repeat(64),
+      stageId: "repo-skill",
+      attemptId: "attempt-1",
+      runId: "run-1",
+      issueId: "issue-1",
+      sessionId: "session-1",
+      generation: 1,
+      taskType: "implement",
+      taskContext: "",
+      transitionContext: "",
+      repository: "owner/repo",
+      baseCommit: commit,
+      baseBranch: "main",
+      branch: "ot/issue-1",
+      agent: "codex",
+      contextRevision: 0,
+      expectedSubject: null,
+      contextPolicy: "fresh",
+      nativeSessionId: null,
+      capability: "agent/repository-skill@1",
+      requiredArtifacts: ["stage_result"],
+      credentialScopes: ["model.invoke", "repo.read"],
+      liveSteering: false,
+      repositorySkill,
+    };
+    const request = { ...withoutFence, ...createStageRequestHash(withoutFence) };
+
+    const materialized = materializeRepositorySkill({ request, repoDir });
+
+    expect(readFileSync(join(materialized, "SKILL.md"), "utf8")).toContain("name: implement_unit");
+    expect(readFileSync(join(materialized, "helper.txt"), "utf8")).toBe("helper\n");
+    expect(existsSync(join(discoveryRoot, "other-skill"))).toBe(false);
+    expectMaterializeToThrow({ ...repositorySkill, packageDigest: "0".repeat(64) }, /package digest mismatch/);
+    const outsidePath = ".agents/skills/other-skill/SKILL.md";
+    const outsideBytes = readFileSync(join(repoDir, outsidePath));
+    const outsideFile = {
+      path: outsidePath,
+      blobSha: execFileSync("git", ["rev-parse", `${commit}:${outsidePath}`], { cwd: repoDir, encoding: "utf8" }).trim(),
+      digest: digest(outsideBytes),
+    };
+    expectMaterializeToThrow(signedPackage({ files: [outsideFile] }), /outside the sealed package/);
+    symlinkSync("helper.txt", join(repoDir, skillDir, "link.txt"));
+    expectMaterializeToThrow(signedPackage({
+      files: [{ path: `${skillDir}/link.txt`, blobSha: "0".repeat(40), digest: "0".repeat(64) }],
+    }), /not a regular file/);
+    expectMaterializeToThrow(signedPackage({
+      files: [{ ...files[0], blobSha: "0".repeat(40) }],
+    }), /blob fence mismatch/);
+    expectMaterializeToThrow(signedPackage({
+      files: [{ ...files[0], digest: "0".repeat(64) }],
+    }), /file digest mismatch/);
   });
 
   it("executes only the sealed allowlisted command and records tree mutation", () => {

@@ -19,6 +19,12 @@ describe("Daytona stage execution", () => {
       stop: vi.fn(async () => undefined),
       delete: vi.fn(async () => undefined),
       fs: {
+        listFiles: vi.fn(async (path: string) => {
+          if (path === "/var/lib/openthrottle/loop-actions") {
+            return [{ name: "attempt-child", path: "/var/lib/openthrottle/loop-actions/attempt-child", size: 0, isDir: true }];
+          }
+          return [];
+        }),
         createFolder: vi.fn(async () => undefined),
         uploadFile: vi.fn(async (content: Buffer, path: string) => {
           remoteFiles.set(path, content);
@@ -187,7 +193,7 @@ describe("Daytona stage execution", () => {
     expect(sandbox.process.executeSessionCommand).toHaveBeenCalledWith(
       "loop-loop-1",
       expect.objectContaining({
-        command: expect.stringContaining("/opt/openthrottle/runner/execute-loop.mjs"),
+        command: expect.stringMatching(/loop-actions\/attempt-child\/loop-1\/dispatch\.lock.*loop-actions\/attempt-child\/loop-1\/result\.json.*execute-loop\.mjs --request \/var\/lib\/openthrottle\/loop-actions\/attempt-child\/loop-1\/request\.json --output \/var\/lib\/openthrottle\/loop-actions\/attempt-child\/loop-1\/result\.json/),
       }),
       30
     );
@@ -216,7 +222,7 @@ describe("Daytona stage execution", () => {
       requestHash: request.requestHash,
       outcome: "success",
     });
-    remoteFiles.set("/var/lib/openthrottle/loop-results/loop-1.json", Buffer.from(JSON.stringify({
+    remoteFiles.set("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/result.json", Buffer.from(JSON.stringify({
       version: 1,
       kind: "loop_action_result",
       action_id: "loop-1",

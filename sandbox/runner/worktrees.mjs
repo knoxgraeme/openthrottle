@@ -1,15 +1,18 @@
 #!/usr/bin/env node
 
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { resolve, sep } from "node:path";
+import { chmodSync, chownSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { runGitAsRepositoryOwner } from "./repository-control.mjs";
+import { chmodTree, chownTree, identityForUser, isRoot, pathInside as containedPath } from "./filesystem-isolation.mjs";
 
 const HANDLE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const COMMIT = /^[a-f0-9]{40}$/;
 const DEFAULT_ROOT = "/var/lib/openthrottle/worktrees";
 const HOOKS_PATH = "/opt/openthrottle/safety";
 const DISABLED_PUSH_URL = "DISABLED_BY_OPENTHROTTLE_LOOP_WORKTREE";
+const ROOT_UID = 0;
+const ROOT_GID = 0;
 
 function safeHandle(value) {
   if (typeof value !== "string" || !HANDLE.test(value)) throw new Error("worktree handle is invalid");
@@ -22,12 +25,46 @@ function commit(value, label) {
 }
 
 function pathInside(root, child) {
-  const rootPath = resolve(root);
-  const childPath = resolve(rootPath, child);
-  if (childPath !== rootPath && !childPath.startsWith(`${rootPath}${sep}`)) {
-    throw new Error("worktree path escapes the executor root");
+  return containedPath(root, child, "worktree path escapes the executor root");
+}
+
+function assertDirectory(path, label) {
+  const metadata = lstatSync(path);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error(`${label} must be a real directory`);
+}
+
+function prepareWorktreeRoot(rootDir) {
+  mkdirSync(rootDir, { recursive: true, mode: 0o711 });
+  assertDirectory(rootDir, "worktree root");
+  if (isRoot()) chownSync(rootDir, ROOT_UID, ROOT_GID);
+  chmodSync(rootDir, 0o711);
+}
+
+export function lockWorktree({ rootDir = DEFAULT_ROOT, handle }) {
+  const target = worktreePath({ rootDir, handle });
+  if (!existsSync(target)) throw new Error("worktree handle does not exist");
+  assertDirectory(target, "worktree");
+  chownTree(target, ROOT_UID, ROOT_GID);
+  chmodTree(target, { fileMode: 0o600, directoryMode: 0o700 });
+  return { id: safeHandle(handle), path: target, writable: false };
+}
+
+export function grantWorktreeToAgent({ rootDir = DEFAULT_ROOT, handle }) {
+  prepareWorktreeRoot(rootDir);
+  const target = worktreePath({ rootDir, handle });
+  if (!existsSync(target)) throw new Error("worktree handle does not exist");
+  assertDirectory(target, "worktree");
+  for (const entry of readdirSync(rootDir)) {
+    const sibling = resolve(rootDir, entry);
+    if (sibling !== target && lstatSync(sibling).isDirectory()) {
+      chownTree(sibling, ROOT_UID, ROOT_GID);
+      chmodTree(sibling, { fileMode: 0o600, directoryMode: 0o700 });
+    }
   }
-  return childPath;
+  const identity = identityForUser("agent");
+  if (identity) chownTree(target, identity.uid, identity.gid);
+  chmodTree(target, { fileMode: 0o600, directoryMode: 0o700 });
+  return { id: safeHandle(handle), path: target, writable: true };
 }
 
 function requireClean(repoDir) {
@@ -52,7 +89,7 @@ export function createWorktree({
   requireClean(repoDir);
   const head = runGitAsRepositoryOwner(repoDir, ["rev-parse", "HEAD"]);
   if (head !== safeBase) throw new Error("integration checkout HEAD does not match requested worktree base");
-  mkdirSync(rootDir, { recursive: true, mode: 0o700 });
+  prepareWorktreeRoot(rootDir);
   runGitAsRepositoryOwner(repoDir, ["worktree", "add", "--detach", target, safeBase]);
   try {
     runGitAsRepositoryOwner(target, ["config", "extensions.worktreeConfig", "true"]);
@@ -60,6 +97,7 @@ export function createWorktree({
     runGitAsRepositoryOwner(target, ["config", "--worktree", "remote.origin.pushurl", DISABLED_PUSH_URL]);
     const status = runGitAsRepositoryOwner(target, ["status", "--porcelain=v1", "--untracked-files=all"]);
     if (status) throw new Error("new worktree is dirty");
+    lockWorktree({ rootDir, handle });
     return { id: safeHandle(handle), path: target, baseCommit: safeBase };
   } catch (error) {
     rmSync(target, { recursive: true, force: true });
@@ -88,6 +126,7 @@ export function deriveCandidateCommit({
 export function removeWorktree({ repoDir, rootDir = DEFAULT_ROOT, handle }) {
   const target = worktreePath({ rootDir, handle });
   if (!existsSync(target)) return { id: safeHandle(handle), removed: false };
+  grantWorktreeToAgent({ rootDir, handle });
   runGitAsRepositoryOwner(repoDir, ["worktree", "remove", "--force", target]);
   rmSync(target, { recursive: true, force: true });
   return { id: safeHandle(handle), removed: true };
@@ -119,7 +158,17 @@ function main() {
     writeFileSync(1, `${JSON.stringify(result)}\n`);
     return;
   }
-  throw new Error("Usage: worktrees.mjs create|candidate|remove --handle <id> [--repo <path>] [--root <path>] [--base <commit>]");
+  if (command === "grant") {
+    const result = grantWorktreeToAgent({ rootDir, handle });
+    writeFileSync(1, `${JSON.stringify(result)}\n`);
+    return;
+  }
+  if (command === "lock") {
+    const result = lockWorktree({ rootDir, handle });
+    writeFileSync(1, `${JSON.stringify(result)}\n`);
+    return;
+  }
+  throw new Error("Usage: worktrees.mjs create|candidate|remove|grant|lock --handle <id> [--repo <path>] [--root <path>] [--base <commit>]");
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
