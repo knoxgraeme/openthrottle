@@ -7,6 +7,7 @@ import {
   OPENTHROTTLE_WEBHOOK_EVENTS,
   branchExists,
   getRepositoryConfigAtCommit,
+  getRepositoryDirectoryAtCommit,
   getRepositoryFileAtCommit,
   getFailingGithubCheckDetails,
   getMergeReadiness,
@@ -344,6 +345,133 @@ describe("GitHub contracts", () => {
     ).rejects.toThrow(/safe relative path/);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  it("rejects repository file snapshots that are symlinks, oversized, or blob-inconsistent", async () => {
+    const content = "{}\n";
+    for (const [response, error] of [
+      [{
+        type: "symlink",
+        sha: "c".repeat(40),
+        encoding: "base64",
+        content: Buffer.from(content).toString("base64"),
+        size: Buffer.byteLength(content),
+      }, /invalid repository file blob/],
+      [{
+        type: "file",
+        sha: "c".repeat(40),
+        encoding: "base64",
+        content: Buffer.from(content).toString("base64"),
+        size: 256 * 1024 + 1,
+      }, /exceeds the 256 KiB snapshot limit/],
+      [{
+        type: "file",
+        sha: "c".repeat(40),
+        encoding: "base64",
+        content: Buffer.from(content).toString("base64"),
+        size: Buffer.byteLength(content) + 1,
+      }, /content size does not match GitHub metadata/],
+    ] as const) {
+      const client = {
+        token: "github",
+        fetch: vi.fn(async () => Response.json(response)) as unknown as typeof fetch,
+      };
+      await expect(
+        getRepositoryFileAtCommit(
+          client,
+          "owner/repo",
+          "a".repeat(40),
+          ".openthrottle/graphs/docs.json"
+        )
+      ).rejects.toThrow(error);
+    }
+  });
+
+  it("reads a bounded repository directory package from a pinned commit", async () => {
+    const skill = "---\nname: implement-unit\n---\n# Implement Unit\n";
+    const helper = "extra: true\n";
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith(`/git/commits/${"a".repeat(40)}`)) {
+        return Response.json({ tree: { sha: "e".repeat(40) } });
+      }
+      if (url.endsWith(`/git/trees/${"e".repeat(40)}?recursive=1`)) {
+        return Response.json({
+          truncated: false,
+          tree: [
+            { path: ".agents/skills/implement-unit", mode: "040000", type: "tree", sha: "1".repeat(40) },
+            { path: ".agents/skills/implement-unit/SKILL.md", mode: "100644", type: "blob", sha: "d".repeat(40), size: Buffer.byteLength(skill) },
+            { path: ".agents/skills/implement-unit/references/helper.md", mode: "100644", type: "blob", sha: "f".repeat(40), size: Buffer.byteLength(helper) },
+            { path: ".agents/skills/other/SKILL.md", mode: "100644", type: "blob", sha: "f".repeat(40), size: 1 },
+          ],
+        });
+      }
+      if (url.endsWith(`/git/blobs/${"d".repeat(40)}`)) {
+        return Response.json({
+          sha: "d".repeat(40),
+          encoding: "base64",
+          content: Buffer.from(skill).toString("base64"),
+          size: Buffer.byteLength(skill),
+        });
+      }
+      if (url.endsWith(`/git/blobs/${"f".repeat(40)}`)) {
+        return Response.json({
+          sha: "f".repeat(40),
+          encoding: "base64",
+          content: Buffer.from(helper).toString("base64"),
+          size: Buffer.byteLength(helper),
+        });
+      }
+      throw new Error(`unexpected request ${url}`);
+    }) as unknown as typeof fetch;
+
+    await expect(getRepositoryDirectoryAtCommit(
+      { token: "github", fetch: fetchMock },
+      "owner/repo",
+      "a".repeat(40),
+      ".agents/skills/implement-unit"
+    )).resolves.toMatchObject({
+      repository: "owner/repo",
+      commit: "a".repeat(40),
+      directory: ".agents/skills/implement-unit",
+      files: [
+        { path: ".agents/skills/implement-unit/references/helper.md", blobSha: "f".repeat(40), content: helper },
+        { path: ".agents/skills/implement-unit/SKILL.md", blobSha: "d".repeat(40), content: skill },
+      ],
+    });
+  });
+
+  it("rejects repository directory packages with symlinks or traversal", async () => {
+    await expect(
+      getRepositoryDirectoryAtCommit(
+        { token: "github", fetch: vi.fn() as unknown as typeof fetch },
+        "owner/repo",
+        "a".repeat(40),
+        "../skills"
+      )
+    ).rejects.toThrow(/safe relative path/);
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith(`/git/commits/${"a".repeat(40)}`)) {
+        return Response.json({ tree: { sha: "e".repeat(40) } });
+      }
+      if (url.endsWith(`/git/trees/${"e".repeat(40)}?recursive=1`)) {
+        return Response.json({
+          truncated: false,
+          tree: [
+            { path: ".agents/skills/implement-unit/SKILL.md", mode: "120000", type: "blob", sha: "d".repeat(40), size: 10 },
+          ],
+        });
+      }
+      throw new Error(`unexpected request ${url}`);
+    }) as unknown as typeof fetch;
+    await expect(getRepositoryDirectoryAtCommit(
+      { token: "github", fetch: fetchMock },
+      "owner/repo",
+      "a".repeat(40),
+      ".agents/skills/implement-unit"
+    )).rejects.toThrow(/not a regular file/);
+  });
+
   it("verifies a repository and creates its OpenThrottle webhook", async () => {
     const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);

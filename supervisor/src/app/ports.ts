@@ -78,6 +78,17 @@ export interface RepositoryFileSnapshot {
   content: string;
 }
 
+export interface RepositoryPackageFileSnapshot extends RepositoryFileSnapshot {
+  size: number;
+}
+
+export interface RepositoryDirectorySnapshot {
+  repository: string;
+  commit: string;
+  directory: string;
+  files: RepositoryPackageFileSnapshot[];
+}
+
 export interface RepositoryReadPort {
   branchExists(repository: string, branch: string): Promise<boolean>;
   getRepositoryConfigAtCommit(repository: string, branch: string): Promise<RepositoryConfigSnapshot>;
@@ -86,6 +97,11 @@ export interface RepositoryReadPort {
     commit: string,
     path: string
   ): Promise<RepositoryFileSnapshot>;
+  getRepositoryDirectoryAtCommit(
+    repository: string,
+    commit: string,
+    directory: string
+  ): Promise<RepositoryDirectorySnapshot>;
 }
 
 export interface PullRequestRef {

@@ -1,16 +1,26 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import type { Config } from "./config.js";
 import type { SupervisorStore } from "../persistence/store.js";
 import type { Agent, TaskType } from "../pipeline/types.js";
-import { parseExecutionPlanContract, parseGraphContract } from "@openthrottle/contracts";
+import { canonicalJson, digestNormalized, parseExecutionPlanContract, parseGraphContract } from "@openthrottle/contracts";
 import type {
   LinearAgentSessionEvent,
+  RepositoryDirectorySnapshot,
+  RepositoryFileSnapshot,
   RepositoryConfigSnapshot,
   ResolvedLinearLabel,
 } from "./ports.js";
 import {
   parseRepositoryConfig,
   resolvePipelineReference,
+  validatePipelineManifest,
+  type ValidatedPipelineCatalog,
+  type ValidatedPipelineManifest,
+  type ValidatedRepositoryConfig,
 } from "../pipeline/manifest.js";
+import { FOR_EACH_UNIT_CAPABILITY, parseAndCompileExecutionGraph } from "../pipeline/execution-graph.js";
+import type { RepositorySkillPackage } from "../pipeline/manifest.js";
 import type { PipelineStore } from "../pipeline/store.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import type { AdmissionPreflight } from "./admission-preflight.js";
@@ -18,8 +28,11 @@ import type { PipelineCoordinatorContext, SessionServicePorts } from "./session-
 
 const EXECUTION_PLAN_FENCE = "openthrottle.execution-plan/v1";
 const SHIP_SELECTION_FENCE = "openthrottle.ship-selection/v1";
-const STRUCTURED_RUNTIME_CAPABILITY = "graph/for-each-unit@1";
 const FENCE_PATTERN = /```([^\n`]*)\n([\s\S]*?)```/g;
+const BUILTIN_SIMPLE_GRAPH = fileURLToPath(new URL("../../graphs/simple-v1.json", import.meta.url));
+const BUILTIN_STRUCTURED_GRAPH = fileURLToPath(new URL("../../graphs/structured-v1.json", import.meta.url));
+const SIMPLE_IMPLEMENT_DESCRIPTION = "Staged CE implementation from a pre-approved plan with round-based repair budgeting, scoped repair re-entry, sealed repository gates, exact-tree publication, and bounded provider repair. The initial forward pass may simplify; repair passes re-run semantic review and command gates without re-running simplification.";
+const REPOSITORY_SKILL_PACKAGE_SCHEMA = "openthrottle.repository-skill-package/v1";
 
 function linearContext(
   payload: LinearAgentSessionEvent,
@@ -113,19 +126,61 @@ function extractRequestedGraph(context: string): {
   return { graphId: selected ?? planned, hasExecutionPlan: planned !== undefined };
 }
 
-async function resolvePipelineSelection(
-  repositoryConfig: ReturnType<typeof parseRepositoryConfig>,
-  taskType: TaskType,
-  context: string,
-  readPinnedFile: (path: string) => Promise<string>
-): Promise<string> {
-  if (taskType !== "implement") {
-    const requested = extractRequestedGraph(context);
-    if (requested.graphId) {
-      throw new Error(`graph selection is not supported for ${taskType} tickets`);
+function repositorySkillIds(rawGraph: string, source: string, config: ValidatedRepositoryConfig["config"]): string[] {
+  const graph = parseGraphContract(rawGraph, { source, config }).value;
+  return [...new Set(graph.loops.flatMap((loop) => (
+    loop.skill.startsWith("repo://") ? [loop.skill.slice("repo://".length)] : []
+  )))].sort();
+}
+
+async function resolveRepositorySkillPackages(input: {
+  rawGraph: string;
+  source: string;
+  repositoryConfig: ValidatedRepositoryConfig;
+  readPinnedDirectory: (path: string) => Promise<RepositoryDirectorySnapshot>;
+}): Promise<ReadonlyMap<string, RepositorySkillPackage>> {
+  const ids = repositorySkillIds(input.rawGraph, input.source, input.repositoryConfig.config);
+  const configured = new Map((input.repositoryConfig.config.skills ?? []).map((skill) => [skill.id, skill]));
+  const packages = new Map<string, RepositorySkillPackage>();
+  for (const id of ids) {
+    const declaration = configured.get(id);
+    if (!declaration) throw new Error(`graph skill repo://${id} is not declared in repository config skills`);
+    const snapshot = await input.readPinnedDirectory(declaration.path);
+    if (snapshot.directory !== declaration.path) {
+      throw new Error(`repository skill ${id} resolved to unexpected directory ${snapshot.directory}`);
     }
-    return repositoryConfig.config.pipelines?.[taskType] ?? taskType;
+    if (!snapshot.files.some((file) => file.path === `${declaration.path}/SKILL.md`)) {
+      throw new Error(`repository skill ${id} package is missing SKILL.md`);
+    }
+    const files = snapshot.files.map((file) => ({
+      path: file.path,
+      blobSha: file.blobSha,
+      digest: digestNormalized(file.content),
+    }));
+    const unsigned = {
+      schema: REPOSITORY_SKILL_PACKAGE_SCHEMA as "openthrottle.repository-skill-package/v1",
+      reference: `repo://${snapshot.repository}@${snapshot.commit}#${declaration.path}`,
+      invocation: id,
+      directory: declaration.path,
+      commit: snapshot.commit,
+      files,
+    };
+    packages.set(id, {
+      ...unsigned,
+      packageDigest: digestNormalized(canonicalJson(unsigned)),
+    });
   }
+  return packages;
+}
+
+async function resolvePipelineSelection(
+  repositoryConfig: ValidatedRepositoryConfig,
+  context: string,
+  readPinnedFile: (path: string) => Promise<RepositoryFileSnapshot>,
+  readPinnedDirectory: (path: string) => Promise<RepositoryDirectorySnapshot>,
+  runtime: PipelineCoordinatorContext["runtime"],
+  catalog: ValidatedPipelineCatalog
+): Promise<ValidatedPipelineManifest> {
   const intent = repositoryConfig.config.intents?.implement;
   const requested = extractRequestedGraph(context);
   const graphId = requested.graphId ?? intent?.default_graph ?? repositoryConfig.config.default_graph;
@@ -135,32 +190,74 @@ async function resolvePipelineSelection(
   }
   const source = repositoryConfig.config.graphs.find((entry) => entry.id === graphId);
   if (!source) throw new Error(`graph ${graphId} is not declared in repository config`);
-  const isBuiltinSimple = source.kind === "builtin" && source.ref === "core/simple@1";
-  let consumesUnits = !isBuiltinSimple;
+  let rawGraph: string;
+  let compileSource: string;
+  let blobDescription: string;
+  let manifestId: string | undefined;
   if (source.kind === "repository") {
-    const raw = await readPinnedFile(source.ref);
-    const graph = parseGraphContract(raw, {
-      source: `repository graph ${source.ref}`,
-      config: repositoryConfig.config,
-    });
-    consumesUnits =
-      graph.value.nodes.some((node) => node.kind === "for_each_unit") ||
-      graph.value.loops.some((loop) => loop.input_scope === "unit");
+    const snapshot = await readPinnedFile(source.ref);
+    rawGraph = snapshot.content;
+    compileSource = `${snapshot.repository}@${snapshot.commit}:${snapshot.path}`;
+    blobDescription = `${snapshot.path}@${snapshot.blobSha}`;
+    manifestId = `repository/${digestNormalized(canonicalJson({
+      graphId,
+      blobSha: snapshot.blobSha,
+      path: snapshot.path,
+    }))}`;
+  } else if (source.ref === "core/simple@1") {
+    rawGraph = readFileSync(BUILTIN_SIMPLE_GRAPH, "utf8");
+    compileSource = "builtin:core/simple@1";
+    blobDescription = "builtin core/simple@1";
+  } else if (source.ref === "core/structured@1") {
+    rawGraph = readFileSync(BUILTIN_STRUCTURED_GRAPH, "utf8");
+    compileSource = "builtin:core/structured@1";
+    blobDescription = "builtin core/structured@1";
+  } else {
+    throw new Error(`unknown built-in graph reference ${source.ref}`);
   }
-  if (consumesUnits && !requested.hasExecutionPlan) {
+  const repositorySkills = source.kind === "repository"
+    ? await resolveRepositorySkillPackages({
+      rawGraph,
+      source: compileSource,
+      repositoryConfig,
+      readPinnedDirectory,
+    })
+    : undefined;
+  const compileOptions = {
+    source: compileSource,
+    ...(source.kind === "repository" ? { config: repositoryConfig.config } : {}),
+    ...(repositorySkills === undefined ? {} : { repositorySkills }),
+    ...(source.ref === "core/simple@1" ? {
+      id: "core/implement",
+      version: 4,
+      description: SIMPLE_IMPLEMENT_DESCRIPTION,
+      maxAttempts: 200,
+      maxRepairRounds: 5,
+    } : {
+      id: source.kind === "builtin" ? `builtin/${graphId}` : manifestId,
+      description: `Compiled execution graph ${graphId} from ${blobDescription}.`,
+      maxAttempts: 200,
+    }),
+  };
+  const compiled = parseAndCompileExecutionGraph(rawGraph, compileOptions);
+  if (compiled.manifest.manifest.requires.capabilities.includes(FOR_EACH_UNIT_CAPABILITY) && !requested.hasExecutionPlan) {
     throw new Error(`graph ${graphId} requires a canonical ${EXECUTION_PLAN_FENCE} block`);
   }
-  if (consumesUnits) {
-    throw new Error(
-      `graph ${graphId} requires unavailable runtime capability ${STRUCTURED_RUNTIME_CAPABILITY}`
-    );
+  try {
+    validatePipelineManifest(compiled.manifest.manifest, {
+      source: compileSource,
+      runtime: runtime.descriptor,
+    });
+  } catch (error) {
+    if (compiled.manifest.manifest.requires.capabilities.includes(FOR_EACH_UNIT_CAPABILITY)) {
+      throw new Error(`graph ${graphId} requires unavailable runtime capability ${FOR_EACH_UNIT_CAPABILITY}`);
+    }
+    throw error;
   }
-  const graphOverride = repositoryConfig.config.pipelines?.[graphId];
-  if (graphOverride) return graphOverride;
-  if (isBuiltinSimple) {
-    return repositoryConfig.config.pipelines?.[taskType] ?? taskType;
+  if (source.ref === "core/simple@1") {
+    return resolvePipelineReference(catalog, "core/implement@4");
   }
-  return source.ref;
+  return compiled.manifest;
 }
 // A `branch › <name>` label (also `branch >`, `branch:`, `branch/`) targets a
 // per-task base branch, overriding the route's default. The branch itself may
@@ -322,7 +419,7 @@ export async function handleCreated(
     failAdmission(`Pipeline selection failed before sandbox provisioning: ${String(error)}`);
   let pinned: {
     remote: RepositoryConfigSnapshot;
-    manifest: ReturnType<typeof resolvePipelineReference>;
+    manifest: ValidatedPipelineManifest;
     snapshot: ReturnType<PipelineStore["saveRepositoryConfigSnapshot"]>;
   };
   try {
@@ -334,20 +431,33 @@ export async function handleCreated(
       remote.content,
       `${selectedRepository.repo}@${remote.baseCommit}:.openthrottle.yml`
     );
-    const reference = await resolvePipelineSelection(
-      repositoryConfig,
-      taskType,
-      initialContext,
-      async (path) =>
-        (
-          await providers.repositoryReader.getRepositoryFileAtCommit(
+    const requested = extractRequestedGraph(initialContext);
+    if (taskType !== "implement" && requested.graphId) {
+      throw new Error(`graph selection is not supported for ${taskType} tickets`);
+    }
+    const manifest = taskType === "implement"
+      ? await resolvePipelineSelection(
+        repositoryConfig,
+        initialContext,
+        (path) =>
+          providers.repositoryReader.getRepositoryFileAtCommit(
             selectedRepository.repo,
             remote.baseCommit,
             path
-          )
-        ).content
-    );
-    const manifest = resolvePipelineReference(coordinator.catalog, reference);
+        ),
+        (path) =>
+          providers.repositoryReader.getRepositoryDirectoryAtCommit(
+            selectedRepository.repo,
+            remote.baseCommit,
+            path
+          ),
+        coordinator.runtime,
+        coordinator.catalog
+      )
+      : resolvePipelineReference(
+        coordinator.catalog,
+        repositoryConfig.config.pipelines?.[taskType] ?? taskType
+      );
     const needsModel = manifest.manifest.stages.some((stage) =>
       stage.credentials.includes("model.invoke")
     );
@@ -360,6 +470,7 @@ export async function handleCreated(
       blobSha: remote.blobSha,
       config: repositoryConfig,
     });
+    coordinator.store.acceptManifest(manifest);
     pinned = { remote, manifest, snapshot };
   } catch (error) {
     await failSelection(error);

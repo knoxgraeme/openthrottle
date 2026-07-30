@@ -157,6 +157,33 @@ describe("Stage C contract fixtures", () => {
       .toThrow(/loops\.unit_loop\.worker: references an unknown worker/);
   });
 
+  it("validates repository skill references against config allowlisted directories", () => {
+    const config = JSON.parse(readFixture("valid", "config-repository.json")) as {
+      skills?: Array<{ id: string; path: string }>;
+    };
+    config.skills = [{ id: "implement_unit", path: ".agents/skills/implement-unit" }];
+    const parsedConfig = parseRepositoryConfigContract(JSON.stringify(config), { source: "config" });
+    expect(parsedConfig.value.skills).toEqual(config.skills);
+
+    const graph = JSON.parse(readFixture("valid", "graph-structured.json")) as {
+      workers: Array<Record<string, unknown>>;
+      loops: Array<Record<string, unknown>>;
+    };
+    graph.workers[0]!.skills = ["repo://implement_unit"];
+    graph.loops[0]!.skill = "repo://implement_unit";
+    expect(() => parseGraphContract(JSON.stringify(graph), { source: "graph", config: parsedConfig.value }))
+      .not.toThrow();
+
+    graph.loops[0]!.skill = "repo://missing";
+    graph.workers[0]!.skills = ["repo://missing"];
+    expect(() => parseGraphContract(JSON.stringify(graph), { source: "graph", config: parsedConfig.value }))
+      .toThrow(/workers\.implementer\.skills: references an undeclared repository skill/);
+
+    config.skills = [{ id: "bad", path: "../skills/bad" }];
+    expect(() => parseRepositoryConfigContract(JSON.stringify(config), { source: "config" }))
+      .toThrow(/config\.skills\[0\]\.path: has an invalid format/);
+  });
+
   it("rejects provider-secret identifiers in config values and headers", () => {
     const config = JSON.parse(readFixture("valid", "config-repository.json")) as {
       mcp_servers: Record<string, unknown>;

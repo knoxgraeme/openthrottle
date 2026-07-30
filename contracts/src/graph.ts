@@ -195,15 +195,26 @@ function validateGraph(graph: GraphContract, source: string, config?: Repository
   const workers = new Map(graph.workers.map((worker) => [worker.id, worker]));
   const loops = new Map(graph.loops.map((loop) => [loop.id, loop]));
   const nodes = new Map(graph.nodes.map((node) => [node.id, node]));
+  const configuredSkills = new Set((config?.skills ?? []).map((skill) => skill.id));
   if (workers.size !== graph.workers.length) fail(`${source}.workers`, "must not contain duplicate IDs");
   if (loops.size !== graph.loops.length) fail(`${source}.loops`, "must not contain duplicate IDs");
   if (nodes.size !== graph.nodes.length) fail(`${source}.nodes`, "must not contain duplicate IDs");
   if (!nodes.has(graph.entry_node)) fail(`${source}.entry_node`, "references an unknown node");
+  for (const worker of graph.workers) {
+    for (const skill of worker.skills) {
+      if (skill.startsWith("repo://") && config && !configuredSkills.has(skill.slice("repo://".length))) {
+        fail(`${source}.workers.${worker.id}.skills`, "references an undeclared repository skill");
+      }
+    }
+  }
   for (const loop of graph.loops) {
     const worker = workers.get(loop.worker);
     if (!worker) fail(`${source}.loops.${loop.id}.worker`, "references an unknown worker");
     if (!worker.skills.includes(loop.skill)) {
       fail(`${source}.loops.${loop.id}.skill`, "is not allowed by the worker");
+    }
+    if (loop.skill.startsWith("repo://") && config && !configuredSkills.has(loop.skill.slice("repo://".length))) {
+      fail(`${source}.loops.${loop.id}.skill`, "references an undeclared repository skill");
     }
   }
   for (const node of graph.nodes) {

@@ -14,6 +14,7 @@ import {
   branchExists,
   getMergeReadiness,
   getRepositoryConfigAtCommit,
+  getRepositoryDirectoryAtCommit,
   getRepositoryFileAtCommit,
   mergePullRequest,
   parsePullRequestUrl,
@@ -195,7 +196,8 @@ describe("pipeline admission", () => {
     overrides: Partial<Config> = {},
     catalogPath = shippedCatalogPath,
     event = payload(),
-    repositoryFiles: Record<string, string> = {}
+    repositoryFiles: Record<string, string> = {},
+    runtimeOverrides: Parameters<typeof buildInstalledRuntimeDescriptor>[1] = {}
   ) {
     db = openDb(":memory:");
     const pipelines = createPipelineStore(db);
@@ -208,7 +210,7 @@ describe("pipeline admission", () => {
       webhookId: 1,
       snapshot: "snapshot",
     });
-    const runtime = buildInstalledRuntimeDescriptor("admission-test/v1");
+    const runtime = buildInstalledRuntimeDescriptor("admission-test/v1", runtimeOverrides);
     const catalog = loadPipelineCatalog(catalogPath, runtime.descriptor);
     pipelines.acceptRuntimeDescriptor(runtime);
     pipelines.acceptCatalog(catalog);
@@ -218,6 +220,9 @@ describe("pipeline admission", () => {
       if (url.endsWith("/repos/owner/repo/commits/main")) {
         return Response.json({ sha: "a".repeat(40) });
       }
+      if (url.endsWith(`/repos/owner/repo/git/commits/${"a".repeat(40)}`)) {
+        return Response.json({ tree: { sha: "e".repeat(40) } });
+      }
       if (url.includes("/contents/.openthrottle.yml?ref=")) {
         return Response.json({
           type: "file",
@@ -226,6 +231,30 @@ describe("pipeline admission", () => {
           content: Buffer.from(currentRepositoryConfig).toString("base64"),
           size: Buffer.byteLength(currentRepositoryConfig),
         });
+      }
+      if (url.includes(`/git/trees/${"e".repeat(40)}?recursive=1`)) {
+        return Response.json({
+          truncated: false,
+          tree: Object.keys(repositoryFiles).sort().map((path) => ({
+            path,
+            mode: "100644",
+            type: "blob",
+            sha: "c".repeat(40),
+            size: Buffer.byteLength(repositoryFiles[path]!),
+          })),
+        });
+      }
+      if (url.includes(`/git/blobs/${"c".repeat(40)}`)) {
+        const skillEntry = Object.entries(repositoryFiles).find(([path]) => path.endsWith("/SKILL.md"));
+        const content = skillEntry?.[1];
+        if (content !== undefined) {
+          return Response.json({
+            sha: "c".repeat(40),
+            encoding: "base64",
+            content: Buffer.from(content).toString("base64"),
+            size: Buffer.byteLength(content),
+          });
+        }
       }
       const fileMatch = url.match(/\/contents\/([^?]+)\?ref=/);
       if (fileMatch) {
@@ -271,6 +300,8 @@ describe("pipeline admission", () => {
           getRepositoryConfigAtCommit({ token: "github-token" }, repository, branch),
         getRepositoryFileAtCommit: (repository: string, commit: string, path: string) =>
           getRepositoryFileAtCommit({ token: "github-token" }, repository, commit, path),
+        getRepositoryDirectoryAtCommit: (repository: string, commit: string, path: string) =>
+          getRepositoryDirectoryAtCommit({ token: "github-token" }, repository, commit, path),
       },
       merger: {
         parsePullRequestUrl,
@@ -329,18 +360,19 @@ mcp_servers: {}
     expect(githubFetch).toHaveBeenCalledTimes(2);
   });
 
-  it("publishes a durable actionable failure and creates no stage for an unknown selection", async () => {
-    const { tickets } = await run(repositoryConfigYaml("{ implement: unknown/pipeline@9 }"));
+  it("ignores legacy implement pipeline overrides when the simple graph is selected", async () => {
+    const { tickets, pipelines } = await run(repositoryConfigYaml("{ implement: unknown/pipeline@9 }"));
     expect(tickets.getByIssueId("issue-1")).toMatchObject({
-      state: "error",
+      state: "active",
       sandbox_id: null,
       run_id: null,
     });
-    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
-    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_stage_attempts").pluck().get()).toBe(0);
-    expect(db!.prepare("SELECT execution_mode FROM agent_sessions WHERE id = 'session-1'").pluck().get()).toBeNull();
-    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
-    expect(payloads.some((entry) => entry.includes("unknown pipeline selection"))).toBe(true);
+    expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
+      pipeline_id: "core/implement",
+      pipeline_version: 4,
+      active_stage_id: "implementation",
+    });
+    expect(db!.prepare("SELECT execution_mode FROM agent_sessions WHERE id = 'session-1'").pluck().get()).toBe("pipeline");
   });
 
   it("rejects a graph-specific pipeline override for a unit-consuming selection", async () => {
@@ -459,6 +491,65 @@ intents:
       pipeline_version: 2,
     });
   });
+
+  it("compiles and pins a structured graph before provisioning when the runtime advertises the composite capability", async () => {
+    const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
+    executionPlan.graph_id = "structured";
+    const context = [
+      "# Structured work",
+      "",
+      "```json openthrottle.execution-plan/v1",
+      JSON.stringify(executionPlan, null, 2),
+      "```",
+      "",
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }, null, 2),
+      "```",
+    ].join("\n");
+
+    const { tickets, pipelines } = await run(
+      `schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: structured
+    kind: builtin
+    ref: core/structured@1
+pipelines: { implement: implement }
+intents:
+  implement:
+    default_graph: simple
+    allowed_graphs: [simple, structured]
+`,
+      {},
+      shippedCatalogPath,
+      payload("session-1", "issue-1", "OT-1", context),
+      {},
+      {
+        capabilities: [
+          ...buildInstalledRuntimeDescriptor("base-structured-test/v1").descriptor.capabilities,
+          "graph/for-each-unit@1",
+        ],
+      }
+    );
+
+    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+      state: "active",
+      sandbox_id: null,
+      run_id: null,
+    });
+    expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
+      pipeline_id: "builtin/structured",
+      pipeline_version: 1,
+      active_stage_id: "units",
+    });
+    const attempt = pipelines.getActiveAttempt(pipelines.getInstanceForSession("session-1")!.id)!;
+    const request = pipelines.getStageRequest(attempt.id);
+    expect(request.capability).toBe("graph/for-each-unit@1");
+    expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
+  });
   it("rejects graph selections on investigate tickets before provisioning", async () => {
     const context = [
       "# Investigate structured behavior",
@@ -487,7 +578,7 @@ intents:
     const graphPath = ".openthrottle/graphs/docs.json";
     const graph = JSON.stringify({
       schema: "openthrottle.graph/v1",
-      id: "docs",
+      id: "raw-docs",
       version: 1,
       entry_node: "verify",
       workers: [
@@ -515,7 +606,7 @@ intents:
         {
           id: "verify",
           kind: "command",
-          command: "test",
+          command: "docs-check",
           depends_on: [],
           transitions: {
             success: { terminal: "completed" },
@@ -534,12 +625,12 @@ graphs:
   - id: docs
     kind: repository
     ref: ${graphPath}
-pipelines: { implement: implement, docs: fixture-command }
 intents:
   implement:
     default_graph: docs
     allowed_graphs: [simple, docs]
-test: "true"
+commands:
+  docs-check: "npm run docs:check"
 `,
       { codexAuthJson: undefined, claudeCodeOauthToken: undefined, kimiCodeApiKey: undefined },
       fixtureCatalogPath,
@@ -548,9 +639,323 @@ test: "true"
     );
 
     expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
-      pipeline_id: "fixture/command",
-      pipeline_version: 2,
+      pipeline_id: `repository/${digestNormalized(canonicalJson({
+        graphId: "docs",
+        blobSha: "c".repeat(40),
+        path: graphPath,
+      }))}`,
+      pipeline_version: 1,
+      active_stage_id: "verify",
     });
+    const request = pipelines.getStageRequest(pipelines.getActiveAttempt(pipelines.getInstanceForSession("session-1")!.id)!.id);
+    expect(request.commandName).toBe("docs-check");
+  });
+
+  it("binds repository graph manifest identity to the pinned source path", async () => {
+    const graphA = ".openthrottle/graphs/docs-a.json";
+    const graphB = ".openthrottle/graphs/docs-b.json";
+    const graph = JSON.stringify({
+      schema: "openthrottle.graph/v1",
+      id: "raw-docs",
+      version: 1,
+      entry_node: "verify",
+      workers: [{
+        id: "commands",
+        engine: "command",
+        session_scope: "attempt",
+        credentials: ["repo.read"],
+        skills: ["builtin://commands@1"],
+      }],
+      loops: [{
+        id: "command_loop",
+        worker: "commands",
+        input_scope: "command",
+        receipt: "command_result",
+        max_parallel: 1,
+        max_rounds: 1,
+        skill: "builtin://commands@1",
+        timeout_seconds: 60,
+      }],
+      nodes: [{
+        id: "verify",
+        kind: "command",
+        command: "docs-check",
+        depends_on: [],
+        transitions: {
+          success: { terminal: "completed" },
+          failure: { terminal: "failed" },
+        },
+      }],
+    });
+    const configFor = (graphId: string, graphPath: string) => `schema: openthrottle.config/v1
+default_graph: ${graphId}
+graphs:
+  - id: ${graphId}
+    kind: repository
+    ref: ${graphPath}
+intents:
+  implement:
+    default_graph: ${graphId}
+    allowed_graphs: [${graphId}]
+commands:
+  docs-check: "npm run docs:check"
+`;
+    const { pipelines, invoke, setRepositoryConfig } = await run(
+      configFor("docs_a", graphA),
+      { codexAuthJson: undefined, claudeCodeOauthToken: undefined, kimiCodeApiKey: undefined },
+      fixtureCatalogPath,
+      payload(),
+      { [graphA]: graph, [graphB]: graph }
+    );
+    const first = pipelines.getInstanceForSession("session-1")!;
+    setRepositoryConfig(configFor("docs_b", graphB));
+    await invoke(
+      { codexAuthJson: undefined, claudeCodeOauthToken: undefined, kimiCodeApiKey: undefined },
+      payload("session-2", "issue-2", "OT-2")
+    );
+    const second = pipelines.getInstanceForSession("session-2")!;
+
+    expect(first.pipeline_id).toBe(`repository/${digestNormalized(canonicalJson({
+      graphId: "docs_a",
+      blobSha: "c".repeat(40),
+      path: graphA,
+    }))}`);
+    expect(second.pipeline_id).toBe(`repository/${digestNormalized(canonicalJson({
+      graphId: "docs_b",
+      blobSha: "c".repeat(40),
+      path: graphB,
+    }))}`);
+    expect(second.pipeline_id).not.toBe(first.pipeline_id);
+  });
+
+  it("pins repository skill packages and carries skill identity in the compiled request", async () => {
+    const graphPath = ".openthrottle/graphs/repo-skill.json";
+    const skillPath = ".agents/skills/implement-unit/SKILL.md";
+    const graph = JSON.stringify({
+      schema: "openthrottle.graph/v1",
+      id: "repo-skill-graph",
+      version: 1,
+      entry_node: "implementation",
+      workers: [{
+        id: "implementer",
+        engine: "agent",
+        session_scope: "fresh",
+        credentials: ["model.invoke", "repo.read", "repo.write"],
+        skills: ["repo://implement_unit"],
+      }],
+      loops: [{
+        id: "implement_loop",
+        worker: "implementer",
+        input_scope: "graph",
+        receipt: "unit_completion",
+        max_parallel: 1,
+        max_rounds: 1,
+        skill: "repo://implement_unit",
+        timeout_seconds: 60,
+      }],
+      nodes: [{
+        id: "implementation",
+        kind: "run",
+        loop: "implement_loop",
+        depends_on: [],
+        transitions: {
+          success: { terminal: "completed" },
+          failure: { terminal: "failed" },
+        },
+      }],
+    });
+    const { pipelines, githubFetch } = await run(
+      `schema: openthrottle.config/v1
+default_graph: repo_skill
+graphs:
+  - id: repo_skill
+    kind: repository
+    ref: ${graphPath}
+skills:
+  - id: implement_unit
+    path: .agents/skills/implement-unit
+pipelines: { implement: implement }
+intents:
+  implement:
+    default_graph: repo_skill
+    allowed_graphs: [repo_skill]
+`,
+      {},
+      shippedCatalogPath,
+      payload(),
+      {
+        [graphPath]: graph,
+        [skillPath]: "---\nname: implement-unit\n---\n# Implement Unit\n",
+      },
+      {
+        capabilities: [
+          ...buildInstalledRuntimeDescriptor("base-repository-skill-test/v1").descriptor.capabilities,
+          "agent/repository-skill@1",
+        ],
+      }
+    );
+
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    expect(instance).toMatchObject({
+      pipeline_id: `repository/${digestNormalized(canonicalJson({
+        graphId: "repo_skill",
+        blobSha: "c".repeat(40),
+        path: graphPath,
+      }))}`,
+      active_stage_id: "implementation",
+    });
+    const request = pipelines.getStageRequest(pipelines.getActiveAttempt(instance.id)!.id);
+    expect(request).toMatchObject({
+      capability: "agent/repository-skill@1",
+      repositorySkill: {
+        reference: `repo://owner/repo@${"a".repeat(40)}#.agents/skills/implement-unit`,
+        invocation: "implement_unit",
+        directory: ".agents/skills/implement-unit",
+        commit: "a".repeat(40),
+        files: [{
+          path: skillPath,
+          blobSha: "c".repeat(40),
+        }],
+      },
+    });
+    expect(request.repositorySkill?.packageDigest).toMatch(/^[a-f0-9]{64}$/);
+    expect(githubFetch).toHaveBeenCalledWith(
+      expect.stringContaining(`/git/trees/${"e".repeat(40)}?recursive=1`),
+      expect.anything()
+    );
+    expect(githubFetch).toHaveBeenCalledWith(
+      expect.stringContaining(`/git/blobs/${"c".repeat(40)}`),
+      expect.anything()
+    );
+  });
+
+  it("rejects repository skill graphs until production advertises agent/repository-skill@1", async () => {
+    const graphPath = ".openthrottle/graphs/repo-skill.json";
+    const skillPath = ".agents/skills/implement-unit/SKILL.md";
+    const graph = JSON.stringify({
+      schema: "openthrottle.graph/v1",
+      id: "repo-skill-graph",
+      version: 1,
+      entry_node: "implementation",
+      workers: [{
+        id: "implementer",
+        engine: "agent",
+        session_scope: "fresh",
+        credentials: ["model.invoke", "repo.read"],
+        skills: ["repo://implement_unit"],
+      }],
+      loops: [{
+        id: "implement_loop",
+        worker: "implementer",
+        input_scope: "graph",
+        receipt: "unit_completion",
+        max_parallel: 1,
+        max_rounds: 1,
+        skill: "repo://implement_unit",
+        timeout_seconds: 60,
+      }],
+      nodes: [{
+        id: "implementation",
+        kind: "run",
+        loop: "implement_loop",
+        depends_on: [],
+        transitions: {
+          success: { terminal: "completed" },
+          failure: { terminal: "failed" },
+        },
+      }],
+    });
+    const { tickets } = await run(
+      `schema: openthrottle.config/v1
+default_graph: repo_skill
+graphs:
+  - id: repo_skill
+    kind: repository
+    ref: ${graphPath}
+skills:
+  - id: implement_unit
+    path: .agents/skills/implement-unit
+pipelines: { implement: implement }
+intents:
+  implement:
+    default_graph: repo_skill
+    allowed_graphs: [repo_skill]
+`,
+      {},
+      shippedCatalogPath,
+      payload(),
+      {
+        [graphPath]: graph,
+        [skillPath]: "---\nname: implement-unit\n---\n# Implement Unit\n",
+      }
+    );
+
+    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+      state: "error",
+      sandbox_id: null,
+      run_id: null,
+    });
+    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(payloads.some((entry) => entry.includes("runtime capability mismatch: capability:agent/repository-skill@1"))).toBe(true);
+  });
+
+  it("rejects repository skill references that are not declared in repository config", async () => {
+    const graphPath = ".openthrottle/graphs/repo-skill.json";
+    const graph = JSON.stringify({
+      schema: "openthrottle.graph/v1",
+      id: "repo-skill-graph",
+      version: 1,
+      entry_node: "implementation",
+      workers: [{
+        id: "implementer",
+        engine: "agent",
+        session_scope: "fresh",
+        credentials: ["model.invoke", "repo.read"],
+        skills: ["repo://missing"],
+      }],
+      loops: [{
+        id: "implement_loop",
+        worker: "implementer",
+        input_scope: "graph",
+        receipt: "unit_completion",
+        max_parallel: 1,
+        max_rounds: 1,
+        skill: "repo://missing",
+        timeout_seconds: 60,
+      }],
+      nodes: [{
+        id: "implementation",
+        kind: "run",
+        loop: "implement_loop",
+        depends_on: [],
+        transitions: {
+          success: { terminal: "completed" },
+          failure: { terminal: "failed" },
+        },
+      }],
+    });
+    const { tickets } = await run(
+      `schema: openthrottle.config/v1
+default_graph: repo_skill
+graphs:
+  - id: repo_skill
+    kind: repository
+    ref: ${graphPath}
+pipelines: { implement: implement }
+intents:
+  implement:
+    default_graph: repo_skill
+    allowed_graphs: [repo_skill]
+`,
+      {},
+      shippedCatalogPath,
+      payload(),
+      { [graphPath]: graph }
+    );
+
+    expect(tickets.getByIssueId("issue-1")).toMatchObject({ state: "error" });
+    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(payloads.some((entry) => entry.includes("workers.implementer.skills: references an undeclared repository skill"))).toBe(true);
   });
   it("fails closed before provisioning when a structured selection omits its execution plan", async () => {
     await expectSelectionFailure(
@@ -678,22 +1083,19 @@ intents:
     ).toBe(true);
   });
 
-  it("admits a command-only fixture without requiring a model subscription", async () => {
-    const { tickets, pipelines } = await run(
+  it("requires a model subscription for the simple graph despite legacy command pipeline overrides", async () => {
+    const { tickets } = await run(
       repositoryConfigYaml("{ implement: fixture-command }"),
       { codexAuthJson: undefined, claudeCodeOauthToken: undefined, kimiCodeApiKey: undefined },
       fixtureCatalogPath
     );
 
     expect(tickets.getByIssueId("issue-1")).toMatchObject({
-      state: "active",
+      state: "error",
       sandbox_id: null,
       run_id: null,
     });
-    expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
-      pipeline_id: "fixture/command",
-      pipeline_version: 2,
-    });
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
   });
 
   it("keeps an existing coordinator session pinned on a duplicate delegation", async () => {
@@ -1005,12 +1407,19 @@ intents:
     expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
   });
 
-  it("does not retire the current generation when re-delegation selects an invalid pipeline", async () => {
+  it("does not retire the current generation when re-delegation selects an invalid graph", async () => {
     const { tickets, pipelines, invoke, setRepositoryConfig } =
       await run(repositoryConfigYaml("{ implement: implement }"));
     const previous = pipelines.getInstanceForSession("session-1")!;
     tickets.setSandboxId("issue-1", "sandbox-old");
-    setRepositoryConfig(repositoryConfigYaml("{ implement: unknown/pipeline@9 }"));
+    setRepositoryConfig(`schema: openthrottle.config/v1
+default_graph: missing
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+pipelines: { implement: implement }
+`);
 
     await invoke({}, payload("session-2"));
 

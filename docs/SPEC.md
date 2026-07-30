@@ -116,6 +116,19 @@ Platform-authored pipelines use the `core/` namespace. CE remains the default
 skill pack, but the `ce/` namespace is reserved for capability IDs such as
 `core/implement@4`, `ce/review@1`, and `ce/publish@1`.
 
+Repository-authored graphs may reference committed repository skills only
+through `repo://<skill-id>`. The repository config owns the allowlist that maps
+each skill id to a committed directory containing `SKILL.md`; ticket text cannot
+choose a skill path. Admission resolves that directory at the exact pinned base
+commit, fetches the bounded package closure as regular files, rejects traversal,
+path escape, symlinks, oversized or undeclared entries, and pins every accepted
+blob plus the package digest. Repository skill identity is separate from runtime
+execution authority: compiled stages use the platform-owned
+`agent/repository-skill@1` capability while carrying the canonical repository
+skill reference, invocation name, pinned package files, and package digest in
+the manifest and sealed request. Production remains fail closed until a later
+runtime activation installs that capability and dispatcher.
+
 Catalog aliases resolve to exact manifest id/version pairs. Repository config
 may override the implement or investigate alias, but cannot supply arbitrary
 manifest bodies. Runtime compatibility is verified before provisioning.
@@ -198,7 +211,9 @@ attempt, run, issue, session, and generation identities; ticket intent and
 bounded task/transition context; repository, exact base commit, base branch,
 working branch, and expected subject; agent and context policy; native session
 id where allowed; capability, required artifacts, credential scopes, and live
-steering permission; and a request hash/idempotency key covering the fence.
+steering permission; repository-skill package identity where the capability is
+`agent/repository-skill@1`; and a request hash/idempotency key covering the
+fence.
 
 The entrypoint ignores conflicting ambient identity values and derives runtime
 identity from the sealed request. It verifies input ownership/mode and all

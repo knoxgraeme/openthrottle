@@ -6,6 +6,7 @@ import {
   digestNormalized,
   type ContextPolicy,
   type PipelineStage,
+  type RepositorySkillPackage,
 } from "./manifest.js";
 
 export const STAGE_EXECUTOR_PROTOCOL = "stage-executor@1";
@@ -42,6 +43,7 @@ export interface StageRequestEnvelope {
   credentialScopes: string[];
   liveSteering: boolean;
   commandName?: CommandName;
+  repositorySkill?: RepositorySkillPackage;
   childActionId?: string;
 }
 
@@ -124,6 +126,7 @@ export function buildStageRequest(input: {
     credentialScopes: [...input.stage.credentials].sort(),
     liveSteering: input.stage.live_steering,
     ...(commandName ? { commandName } : {}),
+    ...(input.stage.repositorySkill ? { repositorySkill: input.stage.repositorySkill } : {}),
     ...(input.childActionId ? { childActionId: input.childActionId } : {}),
   };
   return { ...withoutFence, ...createStageRequestHash(withoutFence) };

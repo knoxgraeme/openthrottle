@@ -37,10 +37,16 @@ export interface ConfigMcpServer {
   enabled?: boolean;
 }
 
+export interface ConfigRepositorySkill {
+  id: string;
+  path: string;
+}
+
 export interface RepositoryConfigContract {
   schema: typeof CONFIG_SCHEMA;
   default_graph: string;
   graphs: ConfigGraphSource[];
+  skills?: ConfigRepositorySkill[];
   agent?: string;
   model?: string;
   commands?: Record<string, string>;
@@ -64,6 +70,7 @@ type CommandAliasName = (typeof COMMAND_ALIAS_NAMES)[number];
 
 const BUILTIN_GRAPH = /^[a-z][a-z0-9]*(?:[._/-][a-z0-9]+)*@\d+$/;
 const REPOSITORY_PATH = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\/\/)[A-Za-z0-9._/-]+\.json$/;
+const REPOSITORY_DIR = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\/\/)[A-Za-z0-9._/-]+$/;
 const PIPELINE_REFERENCE = /^[a-z][a-z0-9]*(?:[._/-][a-z0-9]+)*(?:@\d+)?$/;
 const MODEL_REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 const ENV_NAME = /^[A-Z_][A-Z0-9_]*$/;
@@ -119,6 +126,18 @@ function parseSource(value: unknown, path: string): ConfigGraphSource {
     id: stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER }),
     kind,
     ref,
+  };
+}
+
+function parseRepositorySkill(value: unknown, path: string): ConfigRepositorySkill {
+  const input = objectAt(value, path, ["id", "path"]);
+  const skillPath = stringAt(input.path, `${path}.path`, { max: 240, pattern: REPOSITORY_DIR });
+  if (skillPath.endsWith(".json") || skillPath.endsWith("/")) {
+    fail(`${path}.path`, "must be a repository skill directory");
+  }
+  return {
+    id: stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER }),
+    path: skillPath,
   };
 }
 
@@ -234,7 +253,7 @@ export function validateRepositoryConfigContract(
 ): ValidatedContract<RepositoryConfigContract> {
   const source = options.source ?? "config";
   const input = objectAt(value, source, [
-    "schema", "default_graph", "graphs", "agent", "model", "commands", "test", "lint", "build", "dev", "format",
+    "schema", "default_graph", "graphs", "skills", "agent", "model", "commands", "test", "lint", "build", "dev", "format",
     "post_bootstrap", "limits", "mcp_servers", "pipelines", "intents",
   ]);
   if (input.schema !== CONFIG_SCHEMA) fail(`${source}.schema`, `must be ${CONFIG_SCHEMA}`);
@@ -243,6 +262,9 @@ export function validateRepositoryConfigContract(
     schema: CONFIG_SCHEMA,
     default_graph: stringAt(input.default_graph, `${source}.default_graph`, { pattern: IDENTIFIER }),
     graphs: arrayAt(input.graphs, `${source}.graphs`, parseSource, { min: 1, max: 16 }),
+    ...(input.skills === undefined ? {} : {
+      skills: arrayAt(input.skills, `${source}.skills`, parseRepositorySkill, { max: 32 }),
+    }),
     ...(input.agent === undefined ? {} : { agent: stringAt(input.agent, `${source}.agent`, { pattern: IDENTIFIER }) }),
     ...(input.model === undefined ? {} : { model: stringAt(input.model, `${source}.model`, { max: 240, pattern: MODEL_REFERENCE }) }),
     ...(commandAliases.commands === undefined ? {} : { commands: commandAliases.commands }),
@@ -268,6 +290,7 @@ export function validateRepositoryConfigContract(
     }),
   };
   unique(config.graphs.map((graph) => graph.id), `${source}.graphs`);
+  unique((config.skills ?? []).map((skill) => skill.id), `${source}.skills`);
   const graphIds = new Set(config.graphs.map((graph) => graph.id));
   if (!graphIds.has(config.default_graph)) {
     fail(`${source}.default_graph`, "references an unknown graph");

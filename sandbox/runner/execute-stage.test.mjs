@@ -82,9 +82,10 @@ function fixture({
   liveSteering = true,
   commandName,
   configuredCommand = true,
+  repositorySkill,
 } = {}) {
   const repoDir = repository();
-  const config = commandName && configuredCommand ? { [commandName]: "test-command" } : {};
+  const config = commandName && configuredCommand ? { commands: { [commandName]: "test-command" } } : {};
   const stage = {
     id: commandName ? "command" : "review",
     executor: { kind: commandName ? "command" : "agent", capability },
@@ -92,6 +93,8 @@ function fixture({
     context: contextPolicy,
     live_steering: liveSteering,
     credentials: credentialScopes,
+    ...(commandName ? { commandName } : {}),
+    ...(repositorySkill ? { repositorySkill } : {}),
   };
   const manifest = { id: "fixture/test", version: 1, stages: [stage] };
   const configRaw = canonicalJson(config);
@@ -126,6 +129,7 @@ function fixture({
     credentialScopes,
     liveSteering,
     ...(commandName ? { commandName } : {}),
+    ...(repositorySkill ? { repositorySkill } : {}),
   };
   const request = { ...base, ...createStageRequestHash(base) };
   return { repoDir, configRaw, manifestRaw, request };
@@ -450,6 +454,35 @@ describe("one-stage executor", () => {
     expect(result.artifacts[0].payload).toContain("[REDACTED]");
   });
 
+  it("accepts repository skill identity when it matches the sealed manifest", () => {
+    const repositorySkill = {
+      schema: "openthrottle.repository-skill-package/v1",
+      reference: `repo://owner/repo@${"a".repeat(40)}#.agents/skills/implement-unit`,
+      invocation: "implement_unit",
+      directory: ".agents/skills/implement-unit",
+      commit: "a".repeat(40),
+      packageDigest: "d".repeat(64),
+      files: [{
+        path: ".agents/skills/implement-unit/SKILL.md",
+        blobSha: "b".repeat(40),
+        digest: "c".repeat(64),
+      }],
+    };
+    const input = fixture({ repositorySkill });
+    const result = executeStage({
+      ...input,
+      now: clock(),
+      runAgent: () => ({
+        exitCode: 0,
+        nativeSessionId: "native-1",
+        proposal: successProposal(),
+      }),
+    });
+
+    expect(validateStageRequest(input.request).repositorySkill).toEqual(repositorySkill);
+    expect(result.outcome).toBe("success");
+  });
+
   it("executes only the sealed allowlisted command and records tree mutation", () => {
     const input = fixture({
       capability: "command/run@1",
@@ -469,6 +502,26 @@ describe("one-stage executor", () => {
     const payload = JSON.parse(result.artifacts[0].payload);
     expect(payload.repository.post_subject).not.toBe(payload.repository.pre_subject);
     expect(payload.details.command_name).toBe("test");
+  });
+
+  it("executes repository-defined command names from the sealed command inventory", () => {
+    const input = fixture({
+      capability: "command/run@1",
+      contextPolicy: "none",
+      requiredArtifacts: ["stage_result", "command_result"],
+      credentialScopes: ["repo.read"],
+      liveSteering: false,
+      commandName: "docs-check",
+    });
+    const executeCommand = vi.fn(() => ({ exitCode: 0, signal: null, timedOut: false, stdout: "ok", stderr: "" }));
+    const result = executeStage({ ...input, executeCommand, now: clock() });
+
+    expect(executeCommand).toHaveBeenCalledWith(expect.objectContaining({
+      command: "test-command",
+      commandName: "docs-check",
+    }));
+    expect(result.outcome).toBe("success");
+    expect(JSON.parse(result.artifacts[0].payload).details.command_name).toBe("docs-check");
   });
 
   it("normalizes an unconfigured command to a valid no-change event outcome", () => {

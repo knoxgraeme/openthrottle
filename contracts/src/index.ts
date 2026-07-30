@@ -17,6 +17,7 @@ export {
   type ConfigGraphSource,
   type ConfigLimits,
   type ConfigMcpServer,
+  type ConfigRepositorySkill,
   type RepositoryConfigContract,
 } from "./config.js";
 export {

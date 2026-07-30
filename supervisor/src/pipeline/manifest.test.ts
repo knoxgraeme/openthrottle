@@ -195,6 +195,30 @@ describe("pipeline manifest validation", () => {
       .toThrow(/pipeline\.max_repair_rounds: must be an integer between 1 and 20/);
   });
 
+  it("accepts repository command names while preserving command executor validation", () => {
+    const value = manifest();
+    value.requires = { protocol: "stage-executor@1", capabilities: ["command/run@1"] };
+    Object.assign(firstStage(value), {
+      executor: { kind: "command", capability: "command/run@1" },
+      commandName: "docs-check",
+      evaluator: {
+        kind: "command",
+        assurance: "executor_verified",
+        required_artifacts: ["command_result"],
+      },
+      context: "none",
+      live_steering: false,
+      credentials: ["repo.read"],
+      produces: ["stage_result", "command_result"],
+    });
+
+    expect(validatePipelineManifest(value).manifest.stages[0]?.commandName).toBe("docs-check");
+
+    firstStage(value).commandName = "Docs Check!";
+    expect(() => validatePipelineManifest(value))
+      .toThrow(/pipeline\.stages\[0\]\.commandName: has an invalid format/);
+  });
+
   it("rejects invalid defaults before reducers can observe them", () => {
     expect(() => validatePipelineManifest({
       ...manifest(),
@@ -337,7 +361,7 @@ describe("pipeline manifest validation", () => {
     expect(() => validatePipelineManifest(undeclared)).toThrow(/not declared in requires.capabilities/);
   });
 
-  it("requires command executors to declare an allowlisted repository command", () => {
+  it("requires command executors to declare a valid repository command name", () => {
     const command = manifest();
     command.requires = { protocol: "stage-executor@1", capabilities: ["command/run@1"] };
     const stage = firstStage(command);
@@ -354,11 +378,59 @@ describe("pipeline manifest validation", () => {
     expect(() => validatePipelineManifest(command)).toThrow(/commandName: is required for command executors/);
 
     stage.commandName = "deploy";
-    expect(() => validatePipelineManifest(command)).toThrow(/commandName: must be one of/);
+    expect(validatePipelineManifest(command).manifest.stages[0]).toMatchObject({ commandName: "deploy" });
+
+    stage.commandName = "Deploy!";
+    expect(() => validatePipelineManifest(command)).toThrow(/commandName: has an invalid format/);
 
     const agent = manifest();
     firstStage(agent).commandName = "test";
     expect(() => validatePipelineManifest(agent)).toThrow(/commandName: is allowed only for command executors/);
+  });
+
+  it("bounds repository skill package identity inside its declared directory", () => {
+    const value = manifest();
+    value.requires = { protocol: "stage-executor@1", capabilities: ["agent/repository-skill@1"] };
+    const stage = firstStage(value);
+    stage.executor = { kind: "agent", capability: "agent/repository-skill@1" };
+    stage.repositorySkill = {
+      schema: "openthrottle.repository-skill-package/v1",
+      reference: `repo://owner/repo@${"a".repeat(40)}#.agents/skills/implement-unit`,
+      invocation: "implement_unit",
+      directory: ".agents/skills/implement-unit",
+      commit: "a".repeat(40),
+      packageDigest: "b".repeat(64),
+      files: [{
+        path: ".agents/skills/implement-unit/SKILL.md",
+        blobSha: "c".repeat(40),
+        digest: "d".repeat(64),
+      }],
+    };
+
+    expect(validatePipelineManifest(value).manifest.stages[0]).toMatchObject({
+      repositorySkill: {
+        reference: `repo://owner/repo@${"a".repeat(40)}#.agents/skills/implement-unit`,
+        invocation: "implement_unit",
+      },
+    });
+
+    const escaped = structuredClone(value) as Record<string, unknown>;
+    ((firstStage(escaped).repositorySkill as Record<string, unknown>).files as Array<Record<string, unknown>>)[0]!.path =
+      ".agents/skills/other/SKILL.md";
+    expect(() => validatePipelineManifest(escaped))
+      .toThrow(/repositorySkill\.files\[0\]\.path: must stay inside/);
+
+    const missingSkill = structuredClone(value) as Record<string, unknown>;
+    ((firstStage(missingSkill).repositorySkill as Record<string, unknown>).files as Array<Record<string, unknown>>)[0]!.path =
+      ".agents/skills/implement-unit/helper.md";
+    expect(() => validatePipelineManifest(missingSkill))
+      .toThrow(/repositorySkill\.files: must include SKILL\.md/);
+
+    const mismatchedReference = structuredClone(value) as Record<string, unknown>;
+    (firstStage(mismatchedReference).repositorySkill as Record<string, unknown>).reference =
+      `repo://owner/repo@${"a".repeat(40)}#.agents/skills/other`;
+    expect(() => validatePipelineManifest(mismatchedReference))
+      .toThrow(/repositorySkill\.reference: must name the same/);
   });
 
   it("accepts only bounded repository settings and canonical pipeline selections", () => {
