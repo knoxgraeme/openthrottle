@@ -5,6 +5,7 @@ import type { Config } from "../app/config.js";
 import { createSupervisorStore, type SupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
+import { STRUCTURED_STATUS_UNITS_SQL } from "../persistence/pipeline/status-store.js";
 import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 import type { PipelineStore } from "../pipeline/store.js";
 import { loadPipelineCatalog, parseRepositoryConfig } from "../pipeline/manifest.js";
@@ -336,6 +337,11 @@ describe("coordinator-only server", () => {
       planDigest: "plan-latest",
       units: [{ id: "latest-unit-z" }, { id: "latest-unit-a" }],
     });
+    db.prepare(`
+      UPDATE execution_graphs
+      SET updated_at = '2026-07-26T00:30:00.000Z'
+      WHERE graph_digest = 'graph-old'
+    `).run();
 
     const repairResponse = await app().request("/status", {
       headers: { Authorization: "Bearer status-token" },
@@ -366,16 +372,11 @@ describe("coordinator-only server", () => {
     const latestGraph = db.prepare(`
       SELECT id FROM execution_graphs
       WHERE pipeline_instance_id = ?
-      ORDER BY updated_at DESC, created_at DESC, id DESC
+        AND parent_attempt_id = 'attempt-latest-units'
       LIMIT 1
     `).get(instance.id) as { id: string };
-    const statusPlan = db.prepare(`
-      EXPLAIN QUERY PLAN
-      SELECT eu.unit_id, eu.status, eu.terminal_level, eu.alarm, eu.integration_subject
-      FROM execution_units eu
-      WHERE eu.execution_graph_id = ?
-      ORDER BY eu.authored_order, eu.unit_id
-    `).all(latestGraph.id) as Array<{ detail: string }>;
+    const statusPlan = db.prepare(`EXPLAIN QUERY PLAN ${STRUCTURED_STATUS_UNITS_SQL}`)
+      .all(latestGraph.id) as Array<{ detail: string }>;
     expect(statusPlan.some((row) => row.detail.includes("execution_units_graph_status_idx"))).toBe(true);
 
     db.prepare(`

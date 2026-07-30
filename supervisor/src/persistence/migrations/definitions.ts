@@ -1107,6 +1107,9 @@ CREATE TABLE execution_units (
   updated_at TEXT NOT NULL,
   FOREIGN KEY(execution_graph_id, pipeline_instance_id, parent_attempt_id)
     REFERENCES execution_graphs(id, pipeline_instance_id, parent_attempt_id) ON DELETE RESTRICT,
+  FOREIGN KEY(active_work_attempt_id, execution_graph_id, id, pipeline_instance_id, parent_attempt_id, unit_id)
+    REFERENCES execution_work_attempts(id, execution_graph_id, execution_unit_id, pipeline_instance_id, parent_attempt_id, unit_id)
+    ON DELETE RESTRICT,
   UNIQUE(parent_attempt_id, unit_id),
   UNIQUE(active_work_attempt_id),
   UNIQUE(id, execution_graph_id, pipeline_instance_id, parent_attempt_id),
@@ -1218,7 +1221,7 @@ FROM execution_graphs_old;
 INSERT INTO execution_units
 SELECT
   id, execution_graph_id, pipeline_instance_id, parent_attempt_id, unit_id,
-  authored_order, dependency_unit_ids, status, active_work_attempt_id,
+  authored_order, dependency_unit_ids, status, NULL,
   accepted_candidate_subject, integration_subject, terminal_level, alarm,
   created_at, updated_at
 FROM execution_units_old;
@@ -1230,6 +1233,19 @@ SELECT
   request_hash, result_hash, native_session_id, status, lease_owner, lease_until,
   output_subject, payload, created_at, updated_at, completed_at, last_error
 FROM execution_work_attempts_old;
+
+UPDATE execution_units
+SET active_work_attempt_id = (
+  SELECT old.active_work_attempt_id
+  FROM execution_units_old old
+  WHERE old.id = execution_units.id
+)
+WHERE EXISTS (
+  SELECT 1
+  FROM execution_units_old old
+  WHERE old.id = execution_units.id
+    AND old.active_work_attempt_id IS NOT NULL
+);
 
 INSERT INTO execution_gate_receipts
 SELECT
@@ -1266,15 +1282,27 @@ function addExecutionGraphStopFence(db: Database.Database): void {
 }
 
 function canApplyExecutionCompositeIdentity(db: Database.Database): boolean {
-  if (
-    !hasTable(db, "execution_graphs") ||
-    !hasTable(db, "execution_units") ||
-    !hasTable(db, "execution_work_attempts") ||
-    !hasTable(db, "execution_gate_receipts") ||
-    !hasTable(db, "execution_downstream_context") ||
-    !hasColumns(db, "pipeline_stage_attempts", ["id", "pipeline_instance_id"])
-  ) {
-    return false;
+  const requiredTables = [
+    "pipeline_instances",
+    "pipeline_stage_attempts",
+    "execution_graphs",
+    "execution_units",
+    "execution_work_attempts",
+    "execution_gate_receipts",
+    "execution_downstream_context",
+  ];
+  const missingTable = requiredTables.find((table) => !hasTable(db, table));
+  if (missingTable) {
+    throw new Error(`cannot apply execution composite identity migration: missing ${missingTable}`);
+  }
+  const requiredAttemptColumns = ["id", "pipeline_instance_id", "planned_run_id"];
+  const missingAttemptColumns = requiredAttemptColumns.filter(
+    (column) => !hasColumns(db, "pipeline_stage_attempts", [column])
+  );
+  if (missingAttemptColumns.length > 0) {
+    throw new Error(
+      `cannot apply execution composite identity migration: missing pipeline_stage_attempts.${missingAttemptColumns.join(",")}`
+    );
   }
   const stageIndexes = db.prepare("PRAGMA index_list('pipeline_stage_attempts')").all() as Array<{
     name: string;

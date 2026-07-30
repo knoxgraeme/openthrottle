@@ -171,6 +171,83 @@ describe("execution unit store", () => {
     `).run(unit.execution_graph_id, unit.id, timestamp, timestamp)).toThrow(/FOREIGN KEY/);
   });
 
+  it("rejects active action pointers from sibling units and parent attempts", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b" }],
+    });
+    const first = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: timestamp,
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })!;
+    expect(db!.prepare(`
+      SELECT active_work_attempt_id FROM execution_units
+      WHERE parent_attempt_id = 'attempt-parent' AND unit_id = 'a'
+    `).get()).toEqual({ active_work_attempt_id: first.id });
+
+    db!.prepare(`
+      UPDATE execution_units
+      SET active_work_attempt_id = NULL
+      WHERE parent_attempt_id = 'attempt-parent' AND unit_id = 'a'
+    `).run();
+    expect(() => db!.prepare(`
+      UPDATE execution_units
+      SET active_work_attempt_id = ?
+      WHERE parent_attempt_id = 'attempt-parent' AND unit_id = 'b'
+    `).run(first.id)).toThrow(/FOREIGN KEY/);
+
+    db!.exec(`
+      INSERT INTO runs (
+        id, linear_issue_id, linear_session_id, session_generation, task_type,
+        token_hash, status, started_at, expires_at
+      ) VALUES (
+        'run-other', 'issue-1', 'session-1', 1, 'implement', 'request-hash-other',
+        'running', '${timestamp}', '2026-07-29T01:00:00.000Z'
+      );
+      INSERT INTO pipeline_stage_attempts (
+        id, pipeline_instance_id, stage_id, attempt_ordinal, reentry_ordinal,
+        request_hash, idempotency_key, context_revision, native_context_policy,
+        planned_run_id, run_id, status, created_at, updated_at
+      ) VALUES (
+        'attempt-other', 'instance-1', 'units', 2, 0, '${"1".repeat(64)}',
+        'attempt-key-other', 0, 'none', 'run-other', 'run-other', 'running', '${timestamp}', '${timestamp}'
+      );
+    `);
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-other",
+      parentStageId: "units",
+      parentRunId: "run-other",
+      graphDigest: "graph-digest-other",
+      planDigest: "plan-digest-other",
+      units: [{ id: "a" }],
+    });
+    const other = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-other",
+      leaseOwner: "worker-2",
+      nowIso: timestamp,
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })!;
+    db!.prepare(`
+      UPDATE execution_units
+      SET active_work_attempt_id = NULL
+      WHERE parent_attempt_id = 'attempt-other' AND unit_id = 'a'
+    `).run();
+    expect(() => db!.prepare(`
+      UPDATE execution_units
+      SET active_work_attempt_id = ?
+      WHERE parent_attempt_id = 'attempt-parent' AND unit_id = 'a'
+    `).run(other.id)).toThrow(/FOREIGN KEY/);
+  });
+
   it("leases exactly one active child action and resumes after completion", () => {
     const store = setup();
     store.createGraph({
