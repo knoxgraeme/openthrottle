@@ -178,6 +178,10 @@ for arg in "$@"; do last="$arg"; done
 if [ "$last" = "-" ]; then
   cat > "$HOME/.ot/codex-stdin.log"
 fi
+mkdir -p "${CODEX_HOME:?}/sessions"
+printf '%s\n' \
+  '{"type":"session_meta","payload":{"id":"smoke-codex-thread"}}' \
+  > "$CODEX_HOME/sessions/smoke-codex-thread.jsonl"
 printf '%s\n' \
   '{"type":"thread.started","thread_id":"smoke-codex-thread"}' \
   '{"type":"turn.started"}' \
