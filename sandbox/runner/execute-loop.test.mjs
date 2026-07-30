@@ -320,6 +320,8 @@ describe("loop action request validation", () => {
       runProcess: (command, args, options) => {
         events.push(`run:${command}:${options.cwd}`);
         const actionDirectory = join(actionRoot, valid.attemptId, valid.actionId);
+        expect(statSync(actionRoot).mode & 0o777).toBe(0o711);
+        expect(statSync(join(actionRoot, valid.attemptId)).mode & 0o777).toBe(0o711);
         expect(statSync(actionDirectory).mode & 0o777).toBe(0o711);
         expect(args).toContain("GIT_OPTIONAL_LOCKS=0");
         expect(args).toContain(`HOME=${join(actionDirectory, "home")}`);
@@ -335,6 +337,13 @@ describe("loop action request validation", () => {
     });
 
     expect(result.status).toBe(0);
+    expect(result.gitObjectEnv).toEqual(expect.objectContaining({
+      GIT_DIR: expect.stringMatching(/git-admin$/),
+      GIT_WORK_TREE: loopWorktreeDirectory(valid),
+      GIT_INDEX_FILE: expect.stringMatching(/git-admin\/index$/),
+      GIT_OBJECT_DIRECTORY: expect.stringMatching(/git-objects\/write$/),
+      GIT_ALTERNATE_OBJECT_DIRECTORIES: expect.stringMatching(/git-objects\/base$/),
+    }));
     expect(events).toEqual([
       `lock-integration:${integrationRepoDir}`,
       "process-fence",
@@ -391,6 +400,8 @@ describe("loop action request validation", () => {
         expect(command).toBe("gosu");
         expect(options.cwd).toBe(expectedView);
         const actionDirectory = join(actionRoot, valid.attemptId, valid.actionId);
+        expect(statSync(actionRoot).mode & 0o777).toBe(0o711);
+        expect(statSync(join(actionRoot, valid.attemptId)).mode & 0o777).toBe(0o711);
         expect(args).toContain(`OT_OUTBOX_DIR=${join(actionDirectory, "outbox")}`);
         expect(args).toContain(`OT_INBOX_DIR=${join(actionDirectory, "inbox")}`);
         expect(args).toContain(`OT_INBOX_PROCESSED_DIR=${join(actionDirectory, "inbox-processed")}`);
@@ -457,6 +468,7 @@ describe("loop action request validation", () => {
         const skillRoot = join(codexHome, "skills", valid.repositorySkill.invocation);
         expect(readFileSync(join(skillRoot, "SKILL.md"), "utf8")).toContain("pinned repository package");
         expect(statSync(skillRoot).mode & 0o777).toBe(0o555);
+        expect(existsSync(join(codexHome, "auth.json"))).toBe(false);
         return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
       },
     });
@@ -494,6 +506,7 @@ describe("executeLoopAction", () => {
     const receipt = standardReceipt(valid);
     const lockWorkerWorktree = vi.fn();
     const lockActionDirectory = vi.fn();
+    const restoreIntegration = vi.fn();
     const runLoopAgent = vi.fn(() => ({
       status: 0,
       signal: null,
@@ -501,6 +514,7 @@ describe("executeLoopAction", () => {
       stdout: JSON.stringify(receipt),
       stderr: "",
       nativeSessionId: "thread-1",
+      integrationRepoDir: "/tmp/integration-current",
     }));
 
     const result = executeLoopAction({
@@ -508,6 +522,7 @@ describe("executeLoopAction", () => {
       runLoopAgent,
       lockWorkerWorktree,
       lockActionDirectory,
+      restoreIntegration,
       now: () => "2026-07-29T00:00:00.000Z",
     });
 
@@ -525,6 +540,7 @@ describe("executeLoopAction", () => {
     expect(result.subject).toMatch(/^[a-f0-9]{40}$/);
     expect(lockWorkerWorktree).toHaveBeenCalledWith(expect.objectContaining({ worktree: { id: "unit-1" } }));
     expect(lockActionDirectory).toHaveBeenCalledWith(expect.objectContaining({ actionId: "action-1" }));
+    expect(restoreIntegration).toHaveBeenCalledWith("/tmp/integration-current");
   });
 
   it("rejects successful loop exits without a valid standard receipt", () => {

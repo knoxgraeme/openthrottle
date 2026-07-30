@@ -20,10 +20,11 @@ LEAD_RESULT="$ACTION_ROOT/attempt-current/action-lead/result.json"
 BUILTIN_REQUEST="$ACTION_ROOT/attempt-current/action-builtin/request.json"
 BUILTIN_RESULT="$ACTION_ROOT/attempt-current/action-builtin/result.json"
 SEALED="$ROOT/sealed-input.txt"
-BACKGROUND_PID="$ROOT/background.pid"
+BACKGROUND_PID="$ACTION_ROOT/attempt-current/action-current/background.pid"
 
 install -d -o agent -g agent -m 0700 "$INTEGRATION"
-install -d -o root -g root -m 0711 "$WORKTREES" "$ACTION_ROOT"
+install -d -o root -g root -m 0711 "$WORKTREES"
+install -d -o root -g root -m 0700 "$ACTION_ROOT"
 install -d -m 0755 "$BIN"
 
 gosu agent git -C "$INTEGRATION" init -q -b main
@@ -49,7 +50,7 @@ SIBLING_ONLY_BLOB="$(gosu agent sh -c "printf 'sibling object secret\n' | git -C
 /opt/openthrottle/runner/worktrees.mjs create --repo "$INTEGRATION" --root "$WORKTREES" --handle current --base "$BASE" >/dev/null
 /opt/openthrottle/runner/worktrees.mjs create --repo "$INTEGRATION" --root "$WORKTREES" --handle sibling --base "$BASE" >/dev/null
 
-install -d -o root -g root -m 0711 "$ACTION_ROOT/attempt-current"
+install -d -o root -g root -m 0700 "$ACTION_ROOT/attempt-current"
 install -d -o root -g root -m 0700 "$ACTION_ROOT/attempt-current/action-current"
 install -d -o agent -g agent -m 0700 "$ACTION_ROOT/attempt-current/action-sibling"
 install -d -o agent -g agent -m 0700 "$ACTION_ROOT/attempt-prior/action-current"
@@ -301,6 +302,9 @@ if (result.kind !== "loop_action_result" ||
   throw new Error(`invalid probe result: ${JSON.stringify(result)}`);
 }
 NODE
+
+gosu agent git -C "$INTEGRATION" rev-parse HEAD >/tmp/ot-probe-restored-head
+test "$(cat /tmp/ot-probe-restored-head)" = "$BASE"
 
 PATH="$BIN:$PATH" \
 OT_LOOP_ACTION_ROOT="$ACTION_ROOT" \

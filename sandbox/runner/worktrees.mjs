@@ -4,7 +4,7 @@ import { chmodSync, chownSync, existsSync, lstatSync, mkdirSync, mkdtempSync, re
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { runGitAsExecutor, runGitAsRepositoryOwner } from "./repository-control.mjs";
+import { runGitAsExecutor } from "./repository-control.mjs";
 import { chmodTree, chownTree, identityForUser, isRoot, pathInside as containedPath } from "./filesystem-isolation.mjs";
 
 const HANDLE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -93,7 +93,7 @@ function grantWritableWorktreeRoot(target, identity) {
   chmodSync(target, 0o1770);
 }
 
-export function lockWorktree({ rootDir = DEFAULT_ROOT, handle, lockLinkedGitDir = true }) {
+export function lockWorktree({ rootDir = DEFAULT_ROOT, handle, lockLinkedGitDir: shouldLockLinkedGitDir = true }) {
   const target = worktreePath({ rootDir, handle });
   if (!existsSync(target)) throw new Error("worktree handle does not exist");
   assertDirectory(target, "worktree");
@@ -101,10 +101,7 @@ export function lockWorktree({ rootDir = DEFAULT_ROOT, handle, lockLinkedGitDir 
   chownTree(target, ROOT_UID, ROOT_GID);
   chmodTree(target, { fileMode: 0o600, directoryMode: 0o700 });
   lockGitIndirectionFile(target);
-  if (lockLinkedGitDir && gitDir) {
-    chownTree(gitDir, ROOT_UID, ROOT_GID);
-    chmodTree(gitDir, { fileMode: 0o600, directoryMode: 0o700 });
-  }
+  if (shouldLockLinkedGitDir && gitDir) lockLinkedGitDir(gitDir);
   return { id: safeHandle(handle), path: target, writable: false };
 }
 
@@ -161,17 +158,22 @@ export function createWorktree({
   const head = runGitAsExecutor(repoDir, ["rev-parse", "HEAD"]);
   if (head !== safeBase) throw new Error("integration checkout HEAD does not match requested worktree base");
   prepareWorktreeRoot(rootDir);
-  runGitAsExecutor(repoDir, ["worktree", "add", "--detach", target, safeBase]);
   try {
-    grantWorktreeToAgent({ rootDir, handle, grantLinkedGitDir: true });
-    runGitAsRepositoryOwner(target, ["config", "extensions.worktreeConfig", "true"]);
-    runGitAsRepositoryOwner(target, ["config", "--worktree", "core.hooksPath", hooksPath]);
-    runGitAsRepositoryOwner(target, ["config", "--worktree", "remote.origin.pushurl", DISABLED_PUSH_URL]);
-    const status = runGitAsRepositoryOwner(target, ["status", "--porcelain=v1", "--untracked-files=all"]);
+    runGitAsExecutor(repoDir, ["worktree", "add", "--detach", target, safeBase]);
+    runGitAsExecutor(target, ["config", "extensions.worktreeConfig", "true"]);
+    runGitAsExecutor(target, ["config", "--worktree", "core.hooksPath", hooksPath]);
+    runGitAsExecutor(target, ["config", "--worktree", "remote.origin.pushurl", DISABLED_PUSH_URL]);
+    const status = runGitAsExecutor(target, ["status", "--porcelain=v1", "--untracked-files=all"]);
     if (status) throw new Error("new worktree is dirty");
     lockWorktree({ rootDir, handle });
     return { id: safeHandle(handle), path: target, baseCommit: safeBase };
   } catch (error) {
+    try {
+      runGitAsExecutor(repoDir, ["worktree", "remove", "--force", target]);
+    } catch {
+      // A partially registered linked worktree is best-effort cleaned before
+      // the checkout directory is removed and the original failure is reported.
+    }
     rmSync(target, { recursive: true, force: true });
     throw error;
   }
@@ -219,7 +221,6 @@ export function deriveCandidateCommit({
 export function removeWorktree({ repoDir, rootDir = DEFAULT_ROOT, handle }) {
   const target = worktreePath({ rootDir, handle });
   if (!existsSync(target)) return { id: safeHandle(handle), removed: false };
-  grantWorktreeToAgent({ rootDir, handle, grantLinkedGitDir: true });
   runGitAsExecutor(repoDir, ["worktree", "remove", "--force", target]);
   rmSync(target, { recursive: true, force: true });
   return { id: safeHandle(handle), removed: true };

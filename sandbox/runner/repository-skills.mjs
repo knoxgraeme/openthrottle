@@ -1,10 +1,10 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, relative, resolve, sep } from "node:path";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
 import { runGitAsExecutor } from "./repository-control.mjs";
-import { chmodTree, pathInside as containedPath } from "./filesystem-isolation.mjs";
+import { pathInside as containedPath } from "./filesystem-isolation.mjs";
 
 export const REPOSITORY_SKILL_CAPABILITY = "agent/repository-skill@1";
 
@@ -40,8 +40,18 @@ function gitBytes(repoDir, args) {
   }
 }
 
-function gitText(repoDir, args) {
-  return gitBytes(repoDir, args).toString("utf8").trim();
+function chmodDirectories(path, directoryMode) {
+  const metadata = lstatSync(path);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) return;
+  chmodSync(path, directoryMode);
+  for (const entry of readdirSync(path)) chmodDirectories(resolve(path, entry), directoryMode);
+}
+
+function gitTreeFileEntry(repoDir, commit, path) {
+  const output = runGitAsExecutor(repoDir, ["ls-tree", commit, "--", path]);
+  const match = output.match(/^(\d{6}) blob ([a-f0-9]{40,64})\t/);
+  if (!match) throw new Error("repository skill source file is not a regular file");
+  return { mode: match[1], blobSha: match[2] };
 }
 
 export function repositorySkillDiscoveryRoot(agent, env = process.env) {
@@ -111,18 +121,16 @@ export function materializeRepositorySkillPackage({ packageInfo: rawPackageInfo,
     if (sourceRelative.startsWith("..") || sourceRelative === "" || sourceRelative.split(sep).includes("..")) {
       throw new Error("repository skill file is outside the sealed package");
     }
-    const treeEntry = runGitAsExecutor(repoDir, ["ls-tree", packageInfo.commit, "--", file.path]);
-    const mode = treeEntry.split(/\s+/, 1)[0];
+    const { mode, blobSha } = gitTreeFileEntry(repoDir, packageInfo.commit, file.path);
     if (mode !== "100644" && mode !== "100755") throw new Error("repository skill source file is not a regular file");
-    const blobSha = gitText(repoDir, ["rev-parse", `${packageInfo.commit}:${file.path}`]);
     if (blobSha !== file.blobSha) throw new Error("repository skill blob fence mismatch");
     const bytes = gitBytes(repoDir, ["cat-file", "-p", blobSha]);
     if (digest(bytes) !== file.digest) throw new Error("repository skill file digest mismatch");
     const destination = pathInside(targetRoot, sourceRelative, "repository skill destination");
     mkdirSync(dirname(destination), { recursive: true, mode: 0o755 });
-    writeFileSync(destination, bytes, { mode: 0o444 });
+    writeFileSync(destination, bytes, { mode: mode === "100755" ? 0o555 : 0o444 });
   }
   if (!existsSync(resolve(targetRoot, "SKILL.md"))) throw new Error("repository skill package is missing SKILL.md");
-  chmodTree(discoveryRoot, { fileMode: 0o444, directoryMode: 0o555 });
+  chmodDirectories(discoveryRoot, 0o555);
   return targetRoot;
 }

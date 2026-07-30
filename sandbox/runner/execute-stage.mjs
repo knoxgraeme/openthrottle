@@ -7,11 +7,9 @@ import {
   existsSync,
   lstatSync,
   readFileSync,
-  writeFileSync,
   mkdirSync,
-  renameSync,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import {
@@ -33,7 +31,9 @@ import {
 } from "./repository-control.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
 import { runWithAgentProcessFence } from "./agent-process-fence.mjs";
-import { chmodTree, chownTree, identityForUser, isRoot, pathInside as containedPath } from "./filesystem-isolation.mjs";
+import { chmodTree, chownTree, isRoot, pathInside as containedPath, prepareAgentOwnedDirectory } from "./filesystem-isolation.mjs";
+import { materializeClaudeProfileBaseline, materializeCodexProfileBaseline } from "./action-home-baseline.mjs";
+import { writeJsonAtomic } from "./atomic-write.mjs";
 import {
   REPOSITORY_SKILL_CAPABILITY,
   materializeRepositorySkillPackage,
@@ -99,13 +99,6 @@ function stringList(value, label, allowed) {
 
 function pathInside(root, child, label = "path") {
   return containedPath(root, child, `${label} escapes its root`);
-}
-
-function prepareAgentOwnedDirectory(path) {
-  mkdirSync(path, { recursive: true, mode: 0o700 });
-  const identity = identityForUser("agent");
-  if (identity) chownTree(path, identity.uid, identity.gid);
-  chmodTree(path, { fileMode: 0o600, directoryMode: 0o700 });
 }
 
 function stageActionDirectory(request, rootDir = process.env.OT_STAGE_ACTION_ROOT ?? DEFAULT_STAGE_ACTION_ROOT) {
@@ -303,16 +296,28 @@ export function repositorySkillStageEnvironment(request) {
   if (request.agent === "codex") {
     const codexHome = pathInside(actionDirectory, "codex", "stage action codex home");
     prepareAgentOwnedDirectory(codexHome);
+    materializeCodexProfileBaseline({ destinationHome: codexHome });
     env.push(`CODEX_HOME=${codexHome}`);
     return { env, repositorySkillDiscoveryRoot: pathInside(codexHome, "skills", "stage repository skill discovery") };
   }
   if (request.agent === "claude") {
+    const claudeHome = pathInside(home, ".claude", "stage claude home");
+    materializeClaudeProfileBaseline({ destinationHome: claudeHome });
     return {
       env,
-      repositorySkillDiscoveryRoot: pathInside(pathInside(home, ".claude", "stage claude home"), "skills", "stage repository skill discovery"),
+      repositorySkillDiscoveryRoot: pathInside(claudeHome, "skills", "stage repository skill discovery"),
     };
   }
   return { env, repositorySkillDiscoveryRoot: pathInside(actionDirectory, "opencode-skills", "stage repository skill discovery") };
+}
+
+export function lockRepositorySkillStageHome(request) {
+  if (request.capability !== REPOSITORY_SKILL_CAPABILITY) return false;
+  const actionDirectory = stageActionDirectory(request);
+  if (!existsSync(actionDirectory)) return false;
+  chownTree(actionDirectory, 0, 0);
+  chmodTree(actionDirectory, { fileMode: 0o600, directoryMode: 0o700 });
+  return true;
 }
 
 export function stagePrompt(
@@ -412,38 +417,42 @@ function defaultRunAgent({ request, invocation, repoDir, proposalPath, timeoutMs
   } else {
     throw new Error(`unsupported agent adapter ${agent}`);
   }
-  const result = runWithAgentProcessFence(
-    () => runCapturedProcess("gosu", ["agent", "env", ...env, command, ...args], {
-      cwd: repoDir,
-      input: stdin,
-      timeout: timeoutMs,
-    }),
-  );
-  const authRead = agent === "codex"
-    ? spawnSync("gosu", ["agent", "head", "-c", "262144", "/home/agent/.codex/auth.json"], {
-        encoding: "utf8",
-        timeout: 2_000,
-        maxBuffer: 262_144,
-      })
-    : undefined;
-  const proposalRead = spawnSync("gosu", ["agent", "head", "-c", "1048577", proposalPath], {
-    encoding: "utf8",
-    timeout: 2_000,
-    maxBuffer: 1_048_577,
-  });
-  if (proposalRead.status === 0 && Buffer.byteLength(proposalRead.stdout) > 1_048_576) {
-    throw new Error("stage proposal exceeds the 1 MiB limit");
+  try {
+    const result = runWithAgentProcessFence(
+      () => runCapturedProcess("gosu", ["agent", "env", ...env, command, ...args], {
+        cwd: repoDir,
+        input: stdin,
+        timeout: timeoutMs,
+      }),
+    );
+    const authRead = agent === "codex"
+      ? spawnSync("gosu", ["agent", "head", "-c", "262144", "/home/agent/.codex/auth.json"], {
+          encoding: "utf8",
+          timeout: 2_000,
+          maxBuffer: 262_144,
+        })
+      : undefined;
+    const proposalRead = spawnSync("gosu", ["agent", "head", "-c", "1048577", proposalPath], {
+      encoding: "utf8",
+      timeout: 2_000,
+      maxBuffer: 1_048_577,
+    });
+    if (proposalRead.status === 0 && Buffer.byteLength(proposalRead.stdout) > 1_048_576) {
+      throw new Error("stage proposal exceeds the 1 MiB limit");
+    }
+    return {
+      exitCode: result.status,
+      signal: result.signal,
+      timedOut: result.timedOut,
+      stdout: result.stdout ?? "",
+      stderr: result.stderr ?? result.error?.message ?? "",
+      nativeSessionId: request.nativeSessionId ?? extractNativeSessionId(result.stdout, agent),
+      proposal: proposalRead.status === 0 ? JSON.parse(proposalRead.stdout) : undefined,
+      authSnapshot: authRead?.status === 0 ? authRead.stdout : undefined,
+    };
+  } finally {
+    lockRepositorySkillStageHome(request);
   }
-  return {
-    exitCode: result.status,
-    signal: result.signal,
-    timedOut: result.timedOut,
-    stdout: result.stdout ?? "",
-    stderr: result.stderr ?? result.error?.message ?? "",
-    nativeSessionId: request.nativeSessionId ?? extractNativeSessionId(result.stdout, agent),
-    proposal: proposalRead.status === 0 ? JSON.parse(proposalRead.stdout) : undefined,
-    authSnapshot: authRead?.status === 0 ? authRead.stdout : undefined,
-  };
 }
 
 function failureProposal(summary, suggestedOutcome = "retryable_infrastructure_failure") {
@@ -871,14 +880,6 @@ export function fallbackStageResultEvent({ request, repoDir, error }) {
   });
 }
 
-function writeAtomic(path, value) {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const temporary = `${path}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(value)}\n`, { mode: 0o600 });
-  chmodSync(temporary, 0o600);
-  renameSync(temporary, path);
-}
-
 function arg(name, fallback) {
   const index = process.argv.indexOf(name);
   return index >= 0 ? process.argv[index + 1] : fallback;
@@ -917,13 +918,13 @@ function main() {
       repoDir,
       timeoutMs: Number(process.env.TASK_TIMEOUT ?? 7_200) * 1_000,
     });
-    writeAtomic(outputPath, buildStageResultEvent({ request: validatedRequest, result }));
+    writeJsonAtomic(outputPath, buildStageResultEvent({ request: validatedRequest, result }));
   } catch (error) {
     // Last-resort fence: the request is validated and the output path is
     // known, so even an executor crash must leave a sealed typed result the
     // supervisor can settle instead of a stall the reaper misreports.
     try {
-      writeAtomic(outputPath, fallbackStageResultEvent({ request: validatedRequest, repoDir, error }));
+      writeJsonAtomic(outputPath, fallbackStageResultEvent({ request: validatedRequest, repoDir, error }));
     } catch (fallbackError) {
       console.error(`execute-stage: fallback stage result was not written: ${
         fallbackError instanceof Error ? fallbackError.message : String(fallbackError)

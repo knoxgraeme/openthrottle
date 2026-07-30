@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import { chmodSync, chownSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { chmodSync, chownSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest, sanitizeArtifactText, validateStandardReceipt } from "./artifacts.mjs";
@@ -10,7 +10,9 @@ import { computeWorkspaceTreeOid } from "./repository-control.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
 import { runWithAgentProcessFence } from "./agent-process-fence.mjs";
 import { grantWorktreeToAgent, lockWorktree, worktreePath } from "./worktrees.mjs";
-import { chmodTree, chownTree, identityForUser, isRoot, pathInside as containedPath } from "./filesystem-isolation.mjs";
+import { chmodTree, chownTree, identityForUser, isRoot, pathInside as containedPath, prepareAgentOwnedDirectory } from "./filesystem-isolation.mjs";
+import { materializeClaudeProfileBaseline, materializeCodexProfileBaseline } from "./action-home-baseline.mjs";
+import { writeJsonAtomic } from "./atomic-write.mjs";
 import {
   materializeRepositorySkillPackage,
   repositorySkillDiscoveryRoot,
@@ -140,7 +142,17 @@ export function loopResultPath({ attemptId, actionId, rootDir = DEFAULT_ACTION_R
 
 function ensureTraverseOnly(path) {
   mkdirSync(path, { recursive: true, mode: 0o711 });
+  if (isRoot()) chownSync(path, ROOT_UID, ROOT_GID);
   chmodSync(path, 0o711);
+}
+
+function ensureCurrentActionTraversal(request, rootDir = configuredActionRoot()) {
+  const attemptDirectory = pathInside(rootDir, request.attemptId);
+  const currentActionDirectory = actionDirectory(request, rootDir);
+  ensureTraverseOnly(rootDir);
+  ensureTraverseOnly(attemptDirectory);
+  ensureTraverseOnly(currentActionDirectory);
+  return currentActionDirectory;
 }
 
 function lockNonCurrentActionDirectories(request, rootDir = configuredActionRoot()) {
@@ -276,13 +288,6 @@ export function loopPrompt(request, { repositorySkillRoot = null } = {}) {
     `Return one receipt matching ${request.receiptSchema}.\n\n${request.transitionContext}`;
 }
 
-function prepareAgentOwnedDirectory(path) {
-  mkdirSync(path, { recursive: true, mode: 0o700 });
-  const identity = identityForUser("agent");
-  if (identity) chownTree(path, identity.uid, identity.gid);
-  chmodTree(path, { fileMode: 0o600, directoryMode: 0o700 });
-}
-
 function prepareRootReadOnlyDirectory(path) {
   mkdirSync(path, { recursive: true, mode: 0o555 });
   if (isRoot()) chownTree(path, ROOT_UID, ROOT_GID);
@@ -294,9 +299,13 @@ function prepareActionHomeEnvironment(request) {
   const home = pathInside(currentActionDirectory, "home");
   prepareAgentOwnedDirectory(home);
   const env = [`HOME=${home}`];
+  if (request.agent === "claude") {
+    materializeClaudeProfileBaseline({ destinationHome: pathInside(home, ".claude") });
+  }
   if (request.agent === "codex") {
     const codexHome = pathInside(currentActionDirectory, "codex");
     prepareAgentOwnedDirectory(codexHome);
+    materializeCodexProfileBaseline({ destinationHome: codexHome });
     env.push(`CODEX_HOME=${codexHome}`);
   }
   return env;
@@ -349,14 +358,9 @@ function prepareLoopAgentEnvironment(request, repoDir) {
 }
 
 function packReachableBaseObjects(repoDir, destinationPackBase) {
-  const reachable = runRootGit(repoDir, ["rev-list", "--objects", "HEAD"])
-    .split("\n")
-    .map((line) => line.trim().split(/\s+/, 1)[0])
-    .filter(Boolean)
-    .join("\n");
-  const result = runCapturedProcess("git", ["-c", `safe.directory=${repoDir}`, "pack-objects", destinationPackBase], {
+  const result = runCapturedProcess("git", ["-c", `safe.directory=${repoDir}`, "pack-objects", "--revs", destinationPackBase], {
     cwd: repoDir,
-    input: reachable ? `${reachable}\n` : "",
+    input: "HEAD\n",
     timeout: 120_000,
     captureBytes: 1024 * 1024,
   });
@@ -425,14 +429,10 @@ function prepareLoopGitObjectEnvironment(request, repoDir) {
 
 function createReadOnlyRepositoryView(request, sourceRepoDir = "/home/agent/repo") {
   const actionRoot = configuredActionRoot();
-  const attemptDirectory = pathInside(actionRoot, request.attemptId);
-  const currentActionDirectory = actionDirectory(request, actionRoot);
+  const currentActionDirectory = ensureCurrentActionTraversal(request, actionRoot);
   const destination = pathInside(currentActionDirectory, "repo-view");
   rmSync(destination, { recursive: true, force: true });
-  ensureTraverseOnly(actionRoot);
-  ensureTraverseOnly(attemptDirectory);
   lockNonCurrentActionDirectories(request, actionRoot);
-  ensureTraverseOnly(currentActionDirectory);
   const head = runRootGit(sourceRepoDir, ["rev-parse", "HEAD"]);
   runRootGit(sourceRepoDir, ["clone", "--quiet", "--no-hardlinks", sourceRepoDir, destination]);
   runRootGit(destination, ["checkout", "--quiet", "--detach", head]);
@@ -443,6 +443,7 @@ function createReadOnlyRepositoryView(request, sourceRepoDir = "/home/agent/repo
 }
 
 function prepareLoopRepository(request, integrationRepoDir = INTEGRATION_REPO_DIR) {
+  ensureCurrentActionTraversal(request);
   if (request.worktree) {
     lockNonCurrentActionDirectories(request);
     return grantWorktreeToAgent({
@@ -503,6 +504,15 @@ function lockIntegrationCheckout(path = INTEGRATION_REPO_DIR) {
   return true;
 }
 
+export function restoreIntegrationCheckout(path = INTEGRATION_REPO_DIR) {
+  if (!isRoot() || !existsSync(path)) return false;
+  const identity = identityForUser("agent");
+  if (!identity) return false;
+  chownTree(path, identity.uid, identity.gid);
+  chmodTree(path, { fileMode: 0o600, directoryMode: 0o700 });
+  return true;
+}
+
 function lockCurrentWorkerWorktree(request) {
   if (!request.worktree) return;
   lockWorktree({
@@ -519,10 +529,7 @@ function lockCurrentActionDirectory(request) {
 }
 
 function makeCurrentActionDirectoryTraverseOnly(request) {
-  const currentActionDirectory = actionDirectory(request);
-  mkdirSync(currentActionDirectory, { recursive: true, mode: 0o711 });
-  if (isRoot()) chownSync(currentActionDirectory, ROOT_UID, ROOT_GID);
-  chmodSync(currentActionDirectory, 0o711);
+  ensureCurrentActionTraversal(request);
 }
 
 export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDirectory(request) ?? "/home/agent/repo", repositorySkillRoot = null }) {
@@ -562,7 +569,7 @@ export function runLoopAgentInPreparedRepository({
       input: built.input,
       timeout: request.timeoutMs,
     }));
-    return { ...result, gitObjectEnv: preparedEnvironment.gitObjectEnv };
+    return { ...result, gitObjectEnv: preparedEnvironment.gitObjectEnv, integrationRepoDir };
   } finally {
     lockIntegration(integrationRepoDir);
   }
@@ -629,14 +636,15 @@ export function executeLoopAction({
   runLoopAgent = defaultRunLoopAgent,
   lockWorkerWorktree = lockCurrentWorkerWorktree,
   lockActionDirectory = lockCurrentActionDirectory,
+  restoreIntegration = restoreIntegrationCheckout,
   now = () => new Date().toISOString(),
 }) {
   const request = validateLoopRequest(rawRequest);
   const cleanupErrors = [];
   let result;
+  let execution;
   try {
     const invocation = resolveLoopInvocation(request);
-    let execution;
     try {
       execution = runLoopAgent({ request, invocation });
     } catch (error) {
@@ -679,9 +687,14 @@ export function executeLoopAction({
       created_at: now(),
     };
   } finally {
-    for (const cleanup of [lockWorkerWorktree, lockActionDirectory]) {
+    const cleanups = [
+      () => lockWorkerWorktree(request),
+      () => lockActionDirectory(request),
+      () => restoreIntegration(execution?.integrationRepoDir ?? INTEGRATION_REPO_DIR),
+    ];
+    for (const cleanup of cleanups) {
       try {
-        cleanup(request);
+        cleanup();
       } catch (error) {
         cleanupErrors.push(error instanceof Error ? error.message : String(error));
       }
@@ -695,14 +708,6 @@ export function executeLoopAction({
     };
   }
   return result;
-}
-
-function writeAtomic(path, value) {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const temporary = `${path}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(value)}\n`, { mode: 0o600 });
-  chmodSync(temporary, 0o600);
-  renameSync(temporary, path);
 }
 
 function arg(name, fallback) {
@@ -723,7 +728,7 @@ function main() {
     actionId: request.actionId,
     rootDir: configuredActionRoot(),
   })));
-  writeAtomic(outputPath, executeLoopAction({ request }));
+  writeJsonAtomic(outputPath, executeLoopAction({ request }));
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

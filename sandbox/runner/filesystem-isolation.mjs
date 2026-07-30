@@ -1,4 +1,4 @@
-import { chmodSync, chownSync, lchownSync, lstatSync, readdirSync } from "node:fs";
+import { chmodSync, chownSync, lchownSync, lstatSync, mkdirSync, readdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { resolve, sep } from "node:path";
 
@@ -48,4 +48,11 @@ export function chownTree(path, uid, gid) {
   chownSync(path, uid, gid);
   if (!metadata.isDirectory()) return;
   for (const entry of readdirSync(path)) chownTree(resolve(path, entry), uid, gid);
+}
+
+export function prepareAgentOwnedDirectory(path) {
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  const identity = identityForUser("agent");
+  if (identity) chownTree(path, identity.uid, identity.gid);
+  chmodTree(path, { fileMode: 0o600, directoryMode: 0o700 });
 }

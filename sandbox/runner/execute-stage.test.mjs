@@ -22,6 +22,7 @@ import {
   executeStage,
   extractNativeSessionId,
   fallbackStageResultEvent,
+  lockRepositorySkillStageHome,
   materializeRepositorySkill,
   repositorySkillStageEnvironment,
   resolveContextInvocation,
@@ -499,11 +500,13 @@ describe("one-stage executor", () => {
     mkdirSync(join(repoDir, ".agents", "skills", "other-skill"), { recursive: true });
     writeFileSync(join(repoDir, skillDir, "SKILL.md"), "---\nname: implement_unit\n---\n# Skill\n");
     writeFileSync(join(repoDir, skillDir, "helper.txt"), "helper\n");
+    writeFileSync(join(repoDir, skillDir, "run.sh"), "#!/usr/bin/env sh\nexit 0\n");
     writeFileSync(join(repoDir, ".agents", "skills", "other-skill", "SKILL.md"), "---\nname: other\n---\n");
     execFileSync("git", ["add", "."], { cwd: repoDir });
+    execFileSync("git", ["update-index", "--chmod=+x", `${skillDir}/run.sh`], { cwd: repoDir });
     execFileSync("git", ["commit", "-qm", "skill"], { cwd: repoDir });
     const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
-    const files = ["SKILL.md", "helper.txt"].map((name) => {
+    const files = ["SKILL.md", "helper.txt", "run.sh"].map((name) => {
       const path = `${skillDir}/${name}`;
       const bytes = readFileSync(join(repoDir, path));
       return {
@@ -575,6 +578,8 @@ describe("one-stage executor", () => {
 
     expect(readFileSync(join(materialized, "SKILL.md"), "utf8")).toContain("name: implement_unit");
     expect(readFileSync(join(materialized, "helper.txt"), "utf8")).toBe("helper\n");
+    expect(statSync(join(materialized, "SKILL.md")).mode & 0o777).toBe(0o444);
+    expect(statSync(join(materialized, "run.sh")).mode & 0o777).toBe(0o555);
     expect(existsSync(join(discoveryRoot, "other-skill"))).toBe(false);
     unlockDiscoveryRoot();
     writeFileSync(join(repoDir, skillDir, "helper.txt"), "mutated worktree bytes\n");
@@ -619,6 +624,10 @@ describe("one-stage executor", () => {
     expect(scopedMaterialized).toBe(join(stageActionRoot, "attempt-1", "codex", "skills", "implement_unit"));
     expect(readFileSync(join(scopedMaterialized, "SKILL.md"), "utf8")).toContain("name: implement_unit");
     expect(existsSync(join(globalDiscoveryRoot, "implement_unit"))).toBe(false);
+    expect(existsSync(join(stageActionRoot, "attempt-1", "codex", "auth.json"))).toBe(false);
+    expect(lockRepositorySkillStageHome(request)).toBe(true);
+    expect(statSync(join(stageActionRoot, "attempt-1")).mode & 0o777).toBe(0o700);
+    expect(statSync(join(stageActionRoot, "attempt-1", "codex")).mode & 0o777).toBe(0o700);
   });
 
   it("executes only the sealed allowlisted command and records tree mutation", () => {
