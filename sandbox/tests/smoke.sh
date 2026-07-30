@@ -297,6 +297,7 @@ run_stage_smoke() {
         stages: [{
           id: "planning",
           executor: { kind: commandStage ? "command" : "agent", capability },
+          ...(commandStage ? { commandName: "test" } : {}),
           evaluator: commandStage
             ? { kind: "command", assurance: "executor_verified", required_artifacts: ["command_result"] }
             : { kind: "semantic", assurance: "semantic_attested", required_artifacts: ["stage_result"] },
