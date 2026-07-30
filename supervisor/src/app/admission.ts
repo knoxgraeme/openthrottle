@@ -18,6 +18,7 @@ import type { PipelineCoordinatorContext, SessionServicePorts } from "./session-
 
 const EXECUTION_PLAN_FENCE = "openthrottle.execution-plan/v1";
 const SHIP_SELECTION_FENCE = "openthrottle.ship-selection/v1";
+const STRUCTURED_RUNTIME_CAPABILITY = "graph/for-each-unit@1";
 const FENCE_PATTERN = /```([^\n`]*)\n([\s\S]*?)```/g;
 
 function linearContext(
@@ -148,6 +149,11 @@ async function resolvePipelineSelection(
   }
   if (consumesUnits && !requested.hasExecutionPlan) {
     throw new Error(`graph ${graphId} requires a canonical ${EXECUTION_PLAN_FENCE} block`);
+  }
+  if (consumesUnits) {
+    throw new Error(
+      `graph ${graphId} requires unavailable runtime capability ${STRUCTURED_RUNTIME_CAPABILITY}`
+    );
   }
   const graphOverride = repositoryConfig.config.pipelines?.[graphId];
   if (graphOverride) return graphOverride;
