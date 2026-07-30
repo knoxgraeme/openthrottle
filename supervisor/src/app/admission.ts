@@ -130,7 +130,7 @@ async function resolvePipelineSelection(
   if (!source) throw new Error(`graph ${graphId} is not declared in repository config`);
   const isBuiltinSimple = source.kind === "builtin" && source.ref === "core/simple@1";
   let consumesUnits = !isBuiltinSimple;
-  if (source.kind === "path") {
+  if (source.kind === "repository") {
     const raw = await readPinnedFile(source.ref);
     const graph = parseGraphContract(raw, {
       source: `repository graph ${source.ref}`,
