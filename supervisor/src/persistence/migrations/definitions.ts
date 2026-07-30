@@ -1109,7 +1109,7 @@ CREATE TABLE execution_units (
     REFERENCES execution_graphs(id, pipeline_instance_id, parent_attempt_id) ON DELETE RESTRICT,
   FOREIGN KEY(active_work_attempt_id, execution_graph_id, id, pipeline_instance_id, parent_attempt_id, unit_id)
     REFERENCES execution_work_attempts(id, execution_graph_id, execution_unit_id, pipeline_instance_id, parent_attempt_id, unit_id)
-    ON DELETE RESTRICT,
+    ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
   UNIQUE(parent_attempt_id, unit_id),
   UNIQUE(active_work_attempt_id),
   UNIQUE(id, execution_graph_id, pipeline_instance_id, parent_attempt_id),
@@ -1281,7 +1281,7 @@ function addExecutionGraphStopFence(db: Database.Database): void {
   }
 }
 
-function canApplyExecutionCompositeIdentity(db: Database.Database): boolean {
+function assertExecutionCompositeIdentityPrerequisites(db: Database.Database): void {
   const requiredTables = [
     "pipeline_instances",
     "pipeline_stage_attempts",
@@ -1319,7 +1319,6 @@ function canApplyExecutionCompositeIdentity(db: Database.Database): boolean {
         ON pipeline_stage_attempts(id, pipeline_instance_id)
     `);
   }
-  return true;
 }
 
 function widenPipelineArtifactKindsForExecutionGraphResult(db: Database.Database): void {
@@ -1742,7 +1741,8 @@ const definitions: DatabaseMigrationDefinition[] = [
     name: "execution-composite-child-identity",
     source: executionCompositeIdentityMigrationSource,
     up(db) {
-      if (canApplyExecutionCompositeIdentity(db)) db.exec(executionCompositeIdentitySchema);
+      assertExecutionCompositeIdentityPrerequisites(db);
+      db.exec(executionCompositeIdentitySchema);
     },
   },
 ];

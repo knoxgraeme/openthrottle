@@ -51,7 +51,7 @@ describe("database migrations", () => {
       "f8bdad88455442e46d1951f7fe48050f9367d83273ed94c8eaf7f610666fb809",
       "5327e028894aeac2334d4fd63da3937cdb3470419d9cde8aa7f20832280aa6ad",
       "438e4388d9f50e29233a33c86065e97e0e958b9c1e39a04e0c6be74c279c805f",
-      "304d6e41abd9b883171e09d18f471d3ce2b01bf6c99b73d369ebd35b2ffd5588",
+      "23f09c8fd9f001ea824f86a24edd3d496949594af5dfeb9ad835fc109942ac97",
     ]);
   });
 
@@ -188,6 +188,7 @@ describe("database migrations", () => {
 
   it("preserves valid active child pointers while rebuilding the composite identity", () => {
     db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
     db.exec(`
       CREATE TABLE schema_migrations (
         version INTEGER PRIMARY KEY,
@@ -317,6 +318,7 @@ describe("database migrations", () => {
     expect(db.prepare("SELECT version FROM schema_migrations WHERE version = 18").get()).toEqual({
       version: 18,
     });
+    expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
   });
 
   it("upgrades databases already stamped with the immutable v16 checksum through v17", () => {
