@@ -1,6 +1,7 @@
 import type { Config } from "./config.js";
 import type { SupervisorStore } from "../persistence/store.js";
 import type { Agent, TaskType } from "../pipeline/types.js";
+import { parseExecutionPlanContract, parseGraphContract } from "@openthrottle/contracts";
 import type {
   LinearAgentSessionEvent,
   RepositoryConfigSnapshot,
@@ -14,6 +15,11 @@ import type { PipelineStore } from "../pipeline/store.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import type { AdmissionPreflight } from "./admission-preflight.js";
 import type { PipelineCoordinatorContext, SessionServicePorts } from "./session-service.js";
+
+const EXECUTION_PLAN_FENCE = "openthrottle.execution-plan/v1";
+const SHIP_SELECTION_FENCE = "openthrottle.ship-selection/v1";
+const STRUCTURED_RUNTIME_CAPABILITY = "graph/for-each-unit@1";
+const FENCE_PATTERN = /```([^\n`]*)\n([\s\S]*?)```/g;
 
 function linearContext(
   payload: LinearAgentSessionEvent,
@@ -60,6 +66,102 @@ function agentDisplayName(agent: Agent): string {
   return "OpenCode";
 }
 
+function extractJsonBlocks(markdown: string, schema: string): string[] {
+  const blocks: string[] = [];
+  for (const match of markdown.matchAll(FENCE_PATTERN)) {
+    const marker = match[1]?.trim().split(/\s+/) ?? [];
+    if (!marker.includes(schema)) continue;
+    blocks.push(match[2]?.trim() ?? "");
+  }
+  return blocks;
+}
+
+function extractShipSelectionGraphId(context: string): string | undefined {
+  const blocks = extractJsonBlocks(context, SHIP_SELECTION_FENCE);
+  if (blocks.length === 0) return undefined;
+  if (blocks.length > 1) throw new Error(`expected at most one ${SHIP_SELECTION_FENCE} block, found ${blocks.length}`);
+  const parsed = JSON.parse(blocks[0]!) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`${SHIP_SELECTION_FENCE}: must be an object`);
+  }
+  const record = parsed as Record<string, unknown>;
+  if (record.schema !== SHIP_SELECTION_FENCE) {
+    throw new Error(`${SHIP_SELECTION_FENCE}.schema: must be ${SHIP_SELECTION_FENCE}`);
+  }
+  if (typeof record.graph_id !== "string" || record.graph_id.length === 0) {
+    throw new Error(`${SHIP_SELECTION_FENCE}.graph_id: must be a non-empty string`);
+  }
+  return record.graph_id;
+}
+
+function extractExecutionPlanGraphId(context: string): string | undefined {
+  const blocks = extractJsonBlocks(context, EXECUTION_PLAN_FENCE);
+  if (blocks.length === 0) return undefined;
+  if (blocks.length > 1) throw new Error(`expected at most one ${EXECUTION_PLAN_FENCE} block, found ${blocks.length}`);
+  return parseExecutionPlanContract(blocks[0]!, { source: "issue.execution_plan" }).value.graph_id;
+}
+
+function extractRequestedGraph(context: string): {
+  graphId?: string;
+  hasExecutionPlan: boolean;
+} {
+  const selected = extractShipSelectionGraphId(context);
+  const planned = extractExecutionPlanGraphId(context);
+  if (selected && planned && selected !== planned) {
+    throw new Error(`ship selection graph_id ${selected} does not match execution_plan.graph_id ${planned}`);
+  }
+  return { graphId: selected ?? planned, hasExecutionPlan: planned !== undefined };
+}
+
+async function resolvePipelineSelection(
+  repositoryConfig: ReturnType<typeof parseRepositoryConfig>,
+  taskType: TaskType,
+  context: string,
+  readPinnedFile: (path: string) => Promise<string>
+): Promise<string> {
+  if (taskType !== "implement") {
+    const requested = extractRequestedGraph(context);
+    if (requested.graphId) {
+      throw new Error(`graph selection is not supported for ${taskType} tickets`);
+    }
+    return repositoryConfig.config.pipelines?.[taskType] ?? taskType;
+  }
+  const intent = repositoryConfig.config.intents?.implement;
+  const requested = extractRequestedGraph(context);
+  const graphId = requested.graphId ?? intent?.default_graph ?? repositoryConfig.config.default_graph;
+  const allowedGraphs = intent?.allowed_graphs ?? [repositoryConfig.config.default_graph];
+  if (!allowedGraphs.includes(graphId)) {
+    throw new Error(`graph ${graphId} is not allowed for implement; allowed: ${allowedGraphs.join(", ")}`);
+  }
+  const source = repositoryConfig.config.graphs.find((entry) => entry.id === graphId);
+  if (!source) throw new Error(`graph ${graphId} is not declared in repository config`);
+  const isBuiltinSimple = source.kind === "builtin" && source.ref === "core/simple@1";
+  let consumesUnits = !isBuiltinSimple;
+  if (source.kind === "repository") {
+    const raw = await readPinnedFile(source.ref);
+    const graph = parseGraphContract(raw, {
+      source: `repository graph ${source.ref}`,
+      config: repositoryConfig.config,
+    });
+    consumesUnits =
+      graph.value.nodes.some((node) => node.kind === "for_each_unit") ||
+      graph.value.loops.some((loop) => loop.input_scope === "unit");
+  }
+  if (consumesUnits && !requested.hasExecutionPlan) {
+    throw new Error(`graph ${graphId} requires a canonical ${EXECUTION_PLAN_FENCE} block`);
+  }
+  if (consumesUnits) {
+    throw new Error(
+      `graph ${graphId} requires unavailable runtime capability ${STRUCTURED_RUNTIME_CAPABILITY}`
+    );
+  }
+  const graphOverride = repositoryConfig.config.pipelines?.[graphId];
+  if (graphOverride) return graphOverride;
+  if (isBuiltinSimple) {
+    return repositoryConfig.config.pipelines?.[taskType] ?? taskType;
+  }
+  return source.ref;
+}
 // A `branch › <name>` label (also `branch >`, `branch:`, `branch/`) targets a
 // per-task base branch, overriding the route's default. The branch itself may
 // contain slashes, so everything after the first separator is the branch name.
@@ -232,7 +334,19 @@ export async function handleCreated(
       remote.content,
       `${selectedRepository.repo}@${remote.baseCommit}:.openthrottle.yml`
     );
-    const reference = repositoryConfig.config.pipelines?.[taskType] ?? taskType;
+    const reference = await resolvePipelineSelection(
+      repositoryConfig,
+      taskType,
+      initialContext,
+      async (path) =>
+        (
+          await providers.repositoryReader.getRepositoryFileAtCommit(
+            selectedRepository.repo,
+            remote.baseCommit,
+            path
+          )
+        ).content
+    );
     const manifest = resolvePipelineReference(coordinator.catalog, reference);
     const needsModel = manifest.manifest.stages.some((stage) =>
       stage.credentials.includes("model.invoke")

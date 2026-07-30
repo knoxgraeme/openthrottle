@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "./config.js";
@@ -13,6 +14,7 @@ import {
   branchExists,
   getMergeReadiness,
   getRepositoryConfigAtCommit,
+  getRepositoryFileAtCommit,
   mergePullRequest,
   parsePullRequestUrl,
 } from "../providers/github/client.js";
@@ -24,6 +26,7 @@ import { coordinatePipelineEvent } from "../pipeline/coordinator.js";
 
 const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
 const fixtureCatalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
+const executionPlanFixturePath = fileURLToPath(new URL("../../../contracts/fixtures/valid/execution-plan.json", import.meta.url));
 
 function config(): Config {
   return {
@@ -56,7 +59,13 @@ function config(): Config {
   };
 }
 
-function payload(sessionId = "session-1", issueId = "issue-1", identifier = "OT-1") {
+function payload(
+  sessionId = "session-1",
+  issueId = "issue-1",
+  identifier = "OT-1",
+  promptContext?: string,
+  labels: string[] = []
+) {
   return parseLinearWebhook(JSON.stringify({
     action: "created",
     type: "AgentSessionEvent",
@@ -69,9 +78,10 @@ function payload(sessionId = "session-1", issueId = "issue-1", identifier = "OT-
         id: issueId,
         identifier,
         team: { id: "team-1", key: "OT" },
-        labels: [],
+        labels: labels.map((name) => ({ name })),
       },
     },
+    ...(promptContext === undefined ? {} : { promptContext }),
   }));
 }
 
@@ -183,7 +193,9 @@ describe("pipeline admission", () => {
   async function run(
     repositoryConfig: string,
     overrides: Partial<Config> = {},
-    catalogPath = shippedCatalogPath
+    catalogPath = shippedCatalogPath,
+    event = payload(),
+    repositoryFiles: Record<string, string> = {}
   ) {
     db = openDb(":memory:");
     const pipelines = createPipelineStore(db);
@@ -215,6 +227,20 @@ describe("pipeline admission", () => {
           size: Buffer.byteLength(currentRepositoryConfig),
         });
       }
+      const fileMatch = url.match(/\/contents\/([^?]+)\?ref=/);
+      if (fileMatch) {
+        const path = fileMatch[1]!.split("/").map(decodeURIComponent).join("/");
+        const content = repositoryFiles[path];
+        if (content !== undefined) {
+          return Response.json({
+            type: "file",
+            sha: "c".repeat(40),
+            encoding: "base64",
+            content: Buffer.from(content).toString("base64"),
+            size: Buffer.byteLength(content),
+          });
+        }
+      }
       throw new Error(`unexpected GitHub request: ${url}`);
     });
     vi.stubGlobal("fetch", githubFetch);
@@ -243,6 +269,8 @@ describe("pipeline admission", () => {
           branchExists({ token: "github-token" }, repository, branch),
         getRepositoryConfigAtCommit: (repository: string, branch: string) =>
           getRepositoryConfigAtCommit({ token: "github-token" }, repository, branch),
+        getRepositoryFileAtCommit: (repository: string, commit: string, path: string) =>
+          getRepositoryFileAtCommit({ token: "github-token" }, repository, commit, path),
       },
       merger: {
         parsePullRequestUrl,
@@ -262,7 +290,7 @@ describe("pipeline admission", () => {
       event,
       { catalog, runtime, store: pipelines }
     );
-    await invoke(overrides);
+    await invoke(overrides, event);
     return {
       tickets,
       pipelines,
@@ -313,6 +341,341 @@ mcp_servers: {}
     expect(db!.prepare("SELECT execution_mode FROM agent_sessions WHERE id = 'session-1'").pluck().get()).toBeNull();
     const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
     expect(payloads.some((entry) => entry.includes("unknown pipeline selection"))).toBe(true);
+  });
+
+  it("rejects a graph-specific pipeline override for a unit-consuming selection", async () => {
+    const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
+    executionPlan.graph_id = "structured";
+    const context = [
+      "# Structured work",
+      "",
+      "```json openthrottle.execution-plan/v1",
+      JSON.stringify(executionPlan, null, 2),
+      "```",
+      "",
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }, null, 2),
+      "```",
+    ].join("\n");
+
+    await expectSelectionFailure(
+      context,
+      "graph structured requires unavailable runtime capability graph/for-each-unit@1"
+    );
+  });
+
+  it("rejects the configured unit-consuming default even with a canonical plan", async () => {
+    const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
+    executionPlan.graph_id = "structured";
+    const context = [
+      "# Structured work",
+      "",
+      "```json openthrottle.execution-plan/v1",
+      JSON.stringify(executionPlan, null, 2),
+      "```",
+    ].join("\n");
+    const { tickets } = await run(
+      `schema: openthrottle.config/v1
+default_graph: structured
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: structured
+    kind: builtin
+    ref: core/structured@1
+pipelines: { implement: implement, structured: fixture-command }
+intents:
+  implement:
+    default_graph: structured
+    allowed_graphs: [simple, structured]
+`,
+      { codexAuthJson: undefined, claudeCodeOauthToken: undefined, kimiCodeApiKey: undefined },
+      fixtureCatalogPath,
+      payload("session-1", "issue-1", "OT-1", context)
+    );
+
+    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+      state: "error",
+      sandbox_id: null,
+      run_id: null,
+    });
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_stage_attempts").pluck().get()).toBe(0);
+    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(
+      payloads.some((entry) =>
+        entry.includes("graph structured requires unavailable runtime capability graph/for-each-unit@1")
+      )
+    ).toBe(true);
+  });
+
+  async function expectSelectionFailure(context: string, expectedMessage: string) {
+    const { tickets } = await run(
+      `schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: structured
+    kind: builtin
+    ref: core/structured@1
+pipelines: { implement: implement, structured: fixture-command }
+intents:
+  implement:
+    default_graph: simple
+    allowed_graphs: [simple, structured]
+`,
+      {},
+      fixtureCatalogPath,
+      payload("session-1", "issue-1", "OT-1", context)
+    );
+
+    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+      state: "error",
+      sandbox_id: null,
+      run_id: null,
+    });
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_stage_attempts").pluck().get()).toBe(0);
+    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(payloads.some((entry) => entry.includes(expectedMessage))).toBe(true);
+  }
+
+  it("preserves the generated simple investigate intent when no graph is explicitly requested", async () => {
+    const { pipelines } = await run(
+      repositoryConfigYaml(
+        "{ implement: implement, investigate: fixture-command }",
+        "intents:\n  investigate:\n    default_graph: simple\n    allowed_graphs: [simple]\n"
+      ),
+      { codexAuthJson: undefined, claudeCodeOauthToken: undefined, kimiCodeApiKey: undefined },
+      fixtureCatalogPath,
+      payload("session-1", "issue-1", "OT-1", undefined, ["investigate"])
+    );
+
+    expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
+      pipeline_id: "fixture/command",
+      pipeline_version: 2,
+    });
+  });
+  it("rejects graph selections on investigate tickets before provisioning", async () => {
+    const context = [
+      "# Investigate structured behavior",
+      "",
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "simple" }),
+      "```",
+    ].join("\n");
+    const { tickets } = await run(
+      repositoryConfigYaml("{ implement: implement, investigate: fixture-command }"),
+      { codexAuthJson: undefined, claudeCodeOauthToken: undefined, kimiCodeApiKey: undefined },
+      fixtureCatalogPath,
+      payload("session-1", "issue-1", "OT-1", context, ["investigate"])
+    );
+
+    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+      state: "error",
+      sandbox_id: null,
+      run_id: null,
+    });
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
+    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(payloads.some((entry) => entry.includes("graph selection is not supported for investigate tickets"))).toBe(true);
+  });
+  it("admits a pinned custom command-only graph without an execution plan", async () => {
+    const graphPath = ".openthrottle/graphs/docs.json";
+    const graph = JSON.stringify({
+      schema: "openthrottle.graph/v1",
+      id: "docs",
+      version: 1,
+      entry_node: "verify",
+      workers: [
+        {
+          id: "commands",
+          engine: "command",
+          session_scope: "attempt",
+          credentials: ["repo.read"],
+          skills: ["builtin://commands@1"],
+        },
+      ],
+      loops: [
+        {
+          id: "command_loop",
+          worker: "commands",
+          input_scope: "command",
+          receipt: "command_result",
+          max_parallel: 1,
+          max_rounds: 1,
+          skill: "builtin://commands@1",
+          timeout_seconds: 60,
+        },
+      ],
+      nodes: [
+        {
+          id: "verify",
+          kind: "command",
+          command: "test",
+          depends_on: [],
+          transitions: {
+            success: { terminal: "completed" },
+            failure: { terminal: "failed" },
+          },
+        },
+      ],
+    });
+    const { pipelines } = await run(
+      `schema: openthrottle.config/v1
+default_graph: docs
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: docs
+    kind: repository
+    ref: ${graphPath}
+pipelines: { implement: implement, docs: fixture-command }
+intents:
+  implement:
+    default_graph: docs
+    allowed_graphs: [simple, docs]
+test: "true"
+`,
+      { codexAuthJson: undefined, claudeCodeOauthToken: undefined, kimiCodeApiKey: undefined },
+      fixtureCatalogPath,
+      payload(),
+      { [graphPath]: graph }
+    );
+
+    expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
+      pipeline_id: "fixture/command",
+      pipeline_version: 2,
+    });
+  });
+  it("fails closed before provisioning when a structured selection omits its execution plan", async () => {
+    await expectSelectionFailure(
+      [
+        "# Structured work",
+        "",
+        "```json openthrottle.ship-selection/v1",
+        JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }),
+        "```",
+      ].join("\n"),
+      "graph structured requires a canonical openthrottle.execution-plan/v1 block"
+    );
+  });
+  it("fails closed before provisioning for malformed shipped graph selections", async () => {
+    const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
+    executionPlan.graph_id = "structured";
+    await expectSelectionFailure(
+      [
+        "# Structured work",
+        "",
+        "```json openthrottle.ship-selection/v1",
+        JSON.stringify({ graph_id: "structured" }),
+        "```",
+      ].join("\n"),
+      "openthrottle.ship-selection/v1.schema: must be openthrottle.ship-selection/v1"
+    );
+
+    await expectSelectionFailure(
+      [
+        "# Structured work",
+        "",
+        "```json openthrottle.ship-selection/v1",
+        "{\"schema\":\"openthrottle.ship-selection/v1\",",
+        "```",
+      ].join("\n"),
+      "SyntaxError"
+    );
+
+    await expectSelectionFailure(
+      [
+        "# Structured work",
+        "",
+        "```json openthrottle.ship-selection/v1",
+        JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }),
+        "```",
+        "```json openthrottle.ship-selection/v1",
+        JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }),
+        "```",
+      ].join("\n"),
+      "expected at most one openthrottle.ship-selection/v1 block"
+    );
+
+    await expectSelectionFailure(
+      [
+        "# Structured work",
+        "",
+        "```json openthrottle.execution-plan/v1",
+        JSON.stringify(executionPlan, null, 2),
+        "```",
+        "```json openthrottle.ship-selection/v1",
+        JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "simple" }),
+        "```",
+      ].join("\n"),
+      "ship selection graph_id simple does not match execution_plan.graph_id structured"
+    );
+
+    await expectSelectionFailure(
+      [
+        "# Structured work",
+        "",
+        "```json openthrottle.ship-selection/v1",
+        JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "unknown" }),
+        "```",
+      ].join("\n"),
+      "graph unknown is not allowed for implement"
+    );
+  });
+
+  it("fails closed before provisioning when a shipped graph selection cannot resolve", async () => {
+    const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
+    executionPlan.graph_id = "structured";
+    const context = [
+      "# Structured work",
+      "",
+      "```json openthrottle.execution-plan/v1",
+      JSON.stringify(executionPlan, null, 2),
+      "```",
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }, null, 2),
+      "```",
+    ].join("\n");
+    const { tickets } = await run(
+      `schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: structured
+    kind: builtin
+    ref: core/structured@1
+pipelines: { implement: implement }
+intents:
+  implement:
+    default_graph: simple
+    allowed_graphs: [simple, structured]
+`,
+      {},
+      shippedCatalogPath,
+      payload("session-1", "issue-1", "OT-1", context)
+    );
+
+    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+      state: "error",
+      sandbox_id: null,
+      run_id: null,
+    });
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_stage_attempts").pluck().get()).toBe(0);
+    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(
+      payloads.some((entry) =>
+        entry.includes("graph structured requires unavailable runtime capability graph/for-each-unit@1")
+      )
+    ).toBe(true);
   });
 
   it("admits a command-only fixture without requiring a model subscription", async () => {

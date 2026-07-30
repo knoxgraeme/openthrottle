@@ -510,6 +510,59 @@ export async function getRepositoryConfigAtCommit(
   };
 }
 
+export interface RepositoryFileAtCommit {
+  repository: string;
+  commit: string;
+  path: string;
+  blobSha: string;
+  content: string;
+}
+
+export async function getRepositoryFileAtCommit(
+  client: GithubClient,
+  repository: string,
+  commit: string,
+  path: string
+): Promise<RepositoryFileAtCommit> {
+  if (!/^[a-f0-9]{40}$/i.test(commit)) throw new Error("repository file read requires a full commit SHA");
+  if (
+    !path ||
+    path.length > 1_024 ||
+    path.startsWith("/") ||
+    path.includes("\\") ||
+    path.split("/").some((part) => !part || part === "." || part === "..")
+  ) {
+    throw new Error("repository file read requires a safe relative path");
+  }
+  const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+  const file = await githubRequest<{
+    type: string;
+    sha: string;
+    encoding: string;
+    content: string;
+    size: number;
+  }>(
+    client,
+    `/repos/${repository}/contents/${encodedPath}?ref=${encodeURIComponent(commit)}`
+  );
+  if (file.type !== "file" || file.encoding !== "base64" || !/^[a-f0-9]{40}$/i.test(file.sha)) {
+    throw new Error(`GitHub returned an invalid repository file blob for ${path}`);
+  }
+  if (!Number.isSafeInteger(file.size) || file.size < 0 || file.size > 256 * 1024) {
+    throw new Error(`${path} exceeds the 256 KiB snapshot limit`);
+  }
+  const content = Buffer.from(file.content.replace(/\s/g, ""), "base64").toString("utf8");
+  if (Buffer.byteLength(content, "utf8") !== file.size) {
+    throw new Error(`${path} content size does not match GitHub metadata`);
+  }
+  return {
+    repository,
+    commit: commit.toLowerCase(),
+    path,
+    blobSha: file.sha.toLowerCase(),
+    content,
+  };
+}
 // Every supervisor-authored PR comment starts with this prefix — enforced at
 // the single write path below — so the webhook filter can recognize the
 // pipeline's own comments without relying on account identity. That is what

@@ -70,9 +70,22 @@ export interface RepositoryConfigSnapshot {
   content: string;
 }
 
+export interface RepositoryFileSnapshot {
+  repository: string;
+  commit: string;
+  path: string;
+  blobSha: string;
+  content: string;
+}
+
 export interface RepositoryReadPort {
   branchExists(repository: string, branch: string): Promise<boolean>;
   getRepositoryConfigAtCommit(repository: string, branch: string): Promise<RepositoryConfigSnapshot>;
+  getRepositoryFileAtCommit(
+    repository: string,
+    commit: string,
+    path: string
+  ): Promise<RepositoryFileSnapshot>;
 }
 
 export interface PullRequestRef {

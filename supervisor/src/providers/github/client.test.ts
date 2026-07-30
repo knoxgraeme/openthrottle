@@ -7,6 +7,7 @@ import {
   OPENTHROTTLE_WEBHOOK_EVENTS,
   branchExists,
   getRepositoryConfigAtCommit,
+  getRepositoryFileAtCommit,
   getFailingGithubCheckDetails,
   getMergeReadiness,
   isGithubPullRequestUrl,
@@ -309,6 +310,40 @@ describe("GitHub contracts", () => {
     expect(requested[1]).toContain(`ref=${"a".repeat(40)}`);
   });
 
+  it("reads a bounded repository file only from a pinned commit and safe path", async () => {
+    const content = "{\"schema\":\"openthrottle.graph/v1\"}\n";
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      expect(url).toContain(`/contents/.openthrottle/graphs/docs.json?ref=${"a".repeat(40)}`);
+      return Response.json({
+        type: "file",
+        sha: "c".repeat(40),
+        encoding: "base64",
+        content: Buffer.from(content).toString("base64"),
+        size: Buffer.byteLength(content),
+      });
+    }) as unknown as typeof fetch;
+    const client = { token: "github", fetch: fetchMock };
+
+    await expect(
+      getRepositoryFileAtCommit(
+        client,
+        "owner/repo",
+        "a".repeat(40),
+        ".openthrottle/graphs/docs.json"
+      )
+    ).resolves.toEqual({
+      repository: "owner/repo",
+      commit: "a".repeat(40),
+      path: ".openthrottle/graphs/docs.json",
+      blobSha: "c".repeat(40),
+      content,
+    });
+    await expect(
+      getRepositoryFileAtCommit(client, "owner/repo", "a".repeat(40), "../secret")
+    ).rejects.toThrow(/safe relative path/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
   it("verifies a repository and creates its OpenThrottle webhook", async () => {
     const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
