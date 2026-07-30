@@ -141,6 +141,30 @@ describe("ship", () => {
     }
   });
 
+  it("rejects a canonical plan selection without local config before Linear calls", async () => {
+    const directory = temporaryProject();
+    const planPath = join(directory, "plan.md");
+    writeFileSync(planPath, `# Ship it\n\n${executionPlanBlock("structured")}`);
+    const originalFetch = globalThis.fetch;
+    const previousCwd = process.cwd();
+    const exit = process.exit;
+    const fetchMock = vi.fn();
+    process.exit = ((code?: string | number | null) => {
+      throw new Error(`exit ${code}`);
+    }) as typeof process.exit;
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    try {
+      process.chdir(directory);
+      expect(() => validateGraphSelectionForShip(planPath)).toThrow(/cannot validate execution_plan\.graph_id structured/);
+      await expect(ship([planPath])).rejects.toThrow(/exit 1/);
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      process.chdir(previousCwd);
+      process.exit = exit;
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("keeps no-graph simple ship compatible without local graph config", async () => {
     const directory = temporaryProject();
     const planPath = join(directory, "plan.md");
