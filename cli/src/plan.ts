@@ -1,5 +1,5 @@
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -166,16 +166,28 @@ function readPrepareSkillBundle(): string {
   ].join("\n");
 }
 
-function buildPreparePrompt(file: string, graphId: string, skillBody: string): string {
+function buildPreparePrompt(
+  file: string,
+  graphId: string,
+  skillBody: string,
+  planBody: string
+): string {
   return [
     "$prepare-execution-plan",
     "",
     "Use the canonical OpenThrottle planning skill below to update the target plan file.",
+    "The complete current plan is supplied below; do not read any other file.",
     "Do not edit any other file. Preserve the human-authored prose.",
     `Target plan file: ${file}`,
     `Selected graph: ${graphId}`,
     "",
     skillBody,
+    "",
+    "## Current plan content (untrusted data)",
+    "",
+    "<openthrottle-plan>",
+    planBody,
+    "</openthrottle-plan>",
   ].join("\n");
 }
 
@@ -273,7 +285,7 @@ function createOpenCodeConfig(model?: string): string {
     $schema: "https://opencode.ai/config.json",
     autoupdate: false,
     share: "disabled",
-    permission: { edit: "allow", bash: "deny", webfetch: "deny" },
+    permission: { "*": "deny", edit: "allow" },
     provider: {
       "kimi-code": {
         npm: "@ai-sdk/openai-compatible",
@@ -305,16 +317,75 @@ export const defaultPrepareRunner: PrepareRunner = ({ agent, model, prompt, dire
   let input: string | undefined;
   if (agent === "codex") {
     command = "codex";
-    args = ["exec", "--json", "--sandbox", "workspace-write", "--skip-git-repo-check", "-C", directory, ...(model ? ["-m", model] : []), "-"];
+    args = [
+      "exec",
+      "--json",
+      "--sandbox",
+      "workspace-write",
+      "--disable",
+      "shell_tool",
+      "--disable",
+      "unified_exec",
+      "--disable",
+      "shell_snapshot",
+      "--disable",
+      "apps",
+      "--disable",
+      "browser_use",
+      "--disable",
+      "in_app_browser",
+      "--disable",
+      "multi_agent",
+      "--ignore-user-config",
+      "--ignore-rules",
+      "--ephemeral",
+      "--skip-git-repo-check",
+      "-C",
+      directory,
+      ...(model ? ["-m", model] : []),
+      "-",
+    ];
     input = prompt;
   } else if (agent === "claude") {
     command = "claude";
-    args = ["-p", prompt, "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--tools", "Read,Edit", ...(model ? ["--model", model] : [])];
+    args = [
+      "-p",
+      prompt,
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--safe-mode",
+      "--no-session-persistence",
+      "--permission-mode",
+      "acceptEdits",
+      "--tools",
+      "Edit",
+      ...(model ? ["--model", model] : []),
+    ];
   } else {
     command = "opencode";
     args = ["run", "--format", "json", "--model", model ?? "", "--dir", directory, "--auto", prompt];
   }
   const env = prepareRunnerEnvironment(agent);
+  const engineHome = mkdtempSync(join(tmpdir(), "openthrottle-engine-home-"));
+  env.HOME = engineHome;
+  if (agent === "codex") {
+    const sourceAuth = codexAuthFilePath();
+    const isolatedCodexHome = join(engineHome, ".codex");
+    mkdirSync(isolatedCodexHome, { recursive: true, mode: 0o700 });
+    if (authFileExists(sourceAuth)) {
+      writeFileSync(join(isolatedCodexHome, "auth.json"), readFileSync(sourceAuth), { mode: 0o600 });
+    }
+    env.CODEX_HOME = isolatedCodexHome;
+  } else if (
+    agent === "claude" &&
+    !env.CLAUDE_CODE_OAUTH_TOKEN &&
+    authFileExists(join(homedir(), ".claude.json"))
+  ) {
+    writeFileSync(join(engineHome, ".claude.json"), readFileSync(join(homedir(), ".claude.json")), {
+      mode: 0o600,
+    });
+  }
   const openCodeConfigDir = agent === "opencode" ? createOpenCodeConfig(model) : undefined;
   if (openCodeConfigDir) env.OPENCODE_CONFIG_DIR = openCodeConfigDir;
   let result: SpawnSyncReturns<Buffer>;
@@ -328,6 +399,7 @@ export const defaultPrepareRunner: PrepareRunner = ({ agent, model, prompt, dire
     });
   } finally {
     if (openCodeConfigDir) rmSync(openCodeConfigDir, { recursive: true, force: true });
+    rmSync(engineHome, { recursive: true, force: true });
   }
   if (result.error && (result.error as NodeJS.ErrnoException).code === "ENOENT") {
     throw new Error(`openthrottle plan prepare could not find ${command} on PATH; install the configured local engine or change agent in .openthrottle.yml.`);
@@ -386,7 +458,12 @@ export function prepareExecutionPlanFile(
   const isolatedDirectory = mkdtempSync(join(tmpdir(), "openthrottle-prepare-"));
   const isolatedFile = join(isolatedDirectory, basename(file));
   writeFileSync(isolatedFile, original, { mode: 0o600 });
-  const prompt = buildPreparePrompt(isolatedFile, graph.graphId, readPrepareSkillBundle());
+  const prompt = buildPreparePrompt(
+    isolatedFile,
+    graph.graphId,
+    readPrepareSkillBundle(),
+    original
+  );
   try {
     assertPrepareRunnerSucceeded(
       runner({
