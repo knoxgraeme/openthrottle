@@ -1,7 +1,7 @@
 import type { Config } from "./config.js";
 import type { SupervisorStore } from "../persistence/store.js";
 import type { Agent, TaskType } from "../pipeline/types.js";
-import { parseExecutionPlanContract } from "@openthrottle/contracts";
+import { parseExecutionPlanContract, parseGraphContract } from "@openthrottle/contracts";
 import type {
   LinearAgentSessionEvent,
   RepositoryConfigSnapshot,
@@ -112,11 +112,12 @@ function extractRequestedGraph(context: string): {
   return { graphId: selected ?? planned, hasExecutionPlan: planned !== undefined };
 }
 
-function resolvePipelineSelection(
+async function resolvePipelineSelection(
   repositoryConfig: ReturnType<typeof parseRepositoryConfig>,
   taskType: TaskType,
-  context: string
-): string {
+  context: string,
+  readPinnedFile: (path: string) => Promise<string>
+): Promise<string> {
   if (taskType !== "implement") return repositoryConfig.config.pipelines?.[taskType] ?? taskType;
   const intent = repositoryConfig.config.intents?.implement;
   const requested = extractRequestedGraph(context);
@@ -128,7 +129,18 @@ function resolvePipelineSelection(
   const source = repositoryConfig.config.graphs.find((entry) => entry.id === graphId);
   if (!source) throw new Error(`graph ${graphId} is not declared in repository config`);
   const isBuiltinSimple = source.kind === "builtin" && source.ref === "core/simple@1";
-  if (!isBuiltinSimple && !requested.hasExecutionPlan) {
+  let consumesUnits = !isBuiltinSimple;
+  if (source.kind === "path") {
+    const raw = await readPinnedFile(source.ref);
+    const graph = parseGraphContract(raw, {
+      source: `repository graph ${source.ref}`,
+      config: repositoryConfig.config,
+    });
+    consumesUnits =
+      graph.value.nodes.some((node) => node.kind === "for_each_unit") ||
+      graph.value.loops.some((loop) => loop.input_scope === "unit");
+  }
+  if (consumesUnits && !requested.hasExecutionPlan) {
     throw new Error(`graph ${graphId} requires a canonical ${EXECUTION_PLAN_FENCE} block`);
   }
   const graphOverride = repositoryConfig.config.pipelines?.[graphId];
@@ -138,7 +150,6 @@ function resolvePipelineSelection(
   }
   return source.ref;
 }
-
 // A `branch › <name>` label (also `branch >`, `branch:`, `branch/`) targets a
 // per-task base branch, overriding the route's default. The branch itself may
 // contain slashes, so everything after the first separator is the branch name.
@@ -311,7 +322,19 @@ export async function handleCreated(
       remote.content,
       `${selectedRepository.repo}@${remote.baseCommit}:.openthrottle.yml`
     );
-    const reference = resolvePipelineSelection(repositoryConfig, taskType, initialContext);
+    const reference = await resolvePipelineSelection(
+      repositoryConfig,
+      taskType,
+      initialContext,
+      async (path) =>
+        (
+          await providers.repositoryReader.getRepositoryFileAtCommit(
+            selectedRepository.repo,
+            remote.baseCommit,
+            path
+          )
+        ).content
+    );
     const manifest = resolvePipelineReference(coordinator.catalog, reference);
     const needsModel = manifest.manifest.stages.some((stage) =>
       stage.credentials.includes("model.invoke")
