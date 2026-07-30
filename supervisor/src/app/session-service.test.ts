@@ -343,7 +343,7 @@ mcp_servers: {}
     expect(payloads.some((entry) => entry.includes("unknown pipeline selection"))).toBe(true);
   });
 
-  it("uses the graph-specific pipeline even when structured is the configured default", async () => {
+  it("rejects a graph-specific pipeline override for a unit-consuming selection", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "structured";
     const context = [
@@ -357,35 +357,14 @@ mcp_servers: {}
       JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }, null, 2),
       "```",
     ].join("\n");
-    const { pipelines } = await run(
-      `schema: openthrottle.config/v1
-default_graph: structured
-graphs:
-  - id: simple
-    kind: builtin
-    ref: core/simple@1
-  - id: structured
-    kind: builtin
-    ref: core/structured@1
-pipelines: { implement: implement, structured: fixture-command }
-intents:
-  implement:
-    default_graph: structured
-    allowed_graphs: [simple, structured]
-`,
-      { codexAuthJson: undefined, claudeCodeOauthToken: undefined, kimiCodeApiKey: undefined },
-      fixtureCatalogPath,
-      payload("session-1", "issue-1", "OT-1", context)
-    );
 
-    expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
-      pipeline_id: "fixture/command",
-      pipeline_version: 2,
-    });
+    await expectSelectionFailure(
+      context,
+      "graph structured requires unavailable runtime capability graph/for-each-unit@1"
+    );
   });
 
-
-  it("resolves the configured structured default from a canonical plan without an explicit ship selection", async () => {
+  it("rejects the configured unit-consuming default even with a canonical plan", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "structured";
     const context = [
@@ -395,7 +374,7 @@ intents:
       JSON.stringify(executionPlan, null, 2),
       "```",
     ].join("\n");
-    const { pipelines } = await run(
+    const { tickets } = await run(
       `schema: openthrottle.config/v1
 default_graph: structured
 graphs:
@@ -416,11 +395,21 @@ intents:
       payload("session-1", "issue-1", "OT-1", context)
     );
 
-    expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
-      pipeline_id: "fixture/command",
-      pipeline_version: 2,
+    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+      state: "error",
+      sandbox_id: null,
+      run_id: null,
     });
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_stage_attempts").pluck().get()).toBe(0);
+    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(
+      payloads.some((entry) =>
+        entry.includes("graph structured requires unavailable runtime capability graph/for-each-unit@1")
+      )
+    ).toBe(true);
   });
+
   async function expectSelectionFailure(context: string, expectedMessage: string) {
     const { tickets } = await run(
       `schema: openthrottle.config/v1
