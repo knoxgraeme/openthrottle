@@ -16,6 +16,7 @@ import {
   branchExists,
   getMergeReadiness,
   getRepositoryConfigAtCommit,
+  getRepositoryFileAtCommit,
   mergePullRequest,
   parsePullRequestUrl,
 } from "../providers/github/client.js";
@@ -270,6 +271,8 @@ pipelines: { implement: implement }
           branchExists({ token: "github-token" }, repository, branch),
         getRepositoryConfigAtCommit: (repository: string, branch: string) =>
           getRepositoryConfigAtCommit({ token: "github-token" }, repository, branch),
+        getRepositoryFileAtCommit: (repository: string, commit: string, path: string) =>
+          getRepositoryFileAtCommit({ token: "github-token" }, repository, commit, path),
       },
       merger: {
         parsePullRequestUrl,
