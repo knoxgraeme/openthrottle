@@ -180,6 +180,88 @@ EOF
   [ "$output" = "FATAL: sandbox bootstrap marker is unreadable; the sandbox is stale — the supervisor must reprovision it" ]
 }
 
+# Shared fixture for the initialize_stage_branch tests: a bare origin with
+# main at $BASE_SHA and ot/ope-58 published at $PUBLISHED_SHA, plus a fresh
+# clone at $CLONE (the sandbox's phase-2 checkout).
+make_stage_branch_fixture() {
+  ORIGIN="${BATS_TEST_TMPDIR}/origin.git"
+  SEED="${BATS_TEST_TMPDIR}/seed"
+  CLONE="${BATS_TEST_TMPDIR}/repo"
+  git init -q --bare "$ORIGIN"
+  git init -q -b main "$SEED"
+  git -C "$SEED" config user.name Test
+  git -C "$SEED" config user.email test@example.com
+  printf '%s\n' base > "$SEED/file.txt"
+  git -C "$SEED" add .
+  git -C "$SEED" commit -qm base
+  BASE_SHA="$(git -C "$SEED" rev-parse HEAD)"
+  git -C "$SEED" push -q "$ORIGIN" main
+  git -C "$SEED" checkout -qb ot/ope-58
+  printf '%s\n' published > "$SEED/file.txt"
+  git -C "$SEED" commit -qam published
+  PUBLISHED_SHA="$(git -C "$SEED" rev-parse HEAD)"
+  git -C "$SEED" push -q "$ORIGIN" ot/ope-58
+  git clone -q "$ORIGIN" "$CLONE"
+}
+
+@test "initialize_stage_branch checks out the exact published remote head for a reused ticket branch" {
+  make_stage_branch_fixture
+
+  # A repair generation's initial stage seals baseCommit at the base-branch
+  # head, but origin/ot/ope-58 already carries the reviewed work. The stage
+  # branch must start from exactly that published head, not the base commit.
+  run initialize_stage_branch "$CLONE" ot/ope-58 "$BASE_SHA"
+  [ "$status" -eq 0 ]
+  [ "$output" = "remote ${PUBLISHED_SHA}" ]
+  [ "$(git -C "$CLONE" rev-parse HEAD)" = "$PUBLISHED_SHA" ]
+  [ "$(git -C "$CLONE" rev-parse --abbrev-ref HEAD)" = "ot/ope-58" ]
+
+  # Even a stale local branch already parked at the base commit is reset to
+  # the published head, never silently kept.
+  git -C "$CLONE" checkout -qB ot/ope-58 "$BASE_SHA"
+  run initialize_stage_branch "$CLONE" ot/ope-58 "$BASE_SHA"
+  [ "$status" -eq 0 ]
+  [ "$output" = "remote ${PUBLISHED_SHA}" ]
+  [ "$(git -C "$CLONE" rev-parse HEAD)" = "$PUBLISHED_SHA" ]
+}
+
+@test "initialize_stage_branch creates an absent branch from the sealed base commit" {
+  make_stage_branch_fixture
+
+  run initialize_stage_branch "$CLONE" ot/ope-99 "$BASE_SHA"
+  [ "$status" -eq 0 ]
+  [ "$output" = "base ${BASE_SHA}" ]
+  [ "$(git -C "$CLONE" rev-parse HEAD)" = "$BASE_SHA" ]
+  [ "$(git -C "$CLONE" rev-parse --abbrev-ref HEAD)" = "ot/ope-99" ]
+}
+
+@test "initialize_stage_branch fails closed when the published head cannot be fetched" {
+  make_stage_branch_fixture
+
+  # Origin advertises a head whose object it cannot serve (stale/unreachable
+  # published head). The stage must fail with the typed diagnostic, not fall
+  # back to the base commit.
+  fake_sha="$(printf 'a%.0s' {1..40})"
+  printf '%s\n' "$fake_sha" > "$ORIGIN/refs/heads/ot/ope-58"
+  run initialize_stage_branch "$CLONE" ot/ope-58 "$BASE_SHA"
+  [ "$status" -eq 1 ]
+  [ "$output" = "FATAL: branch ot/ope-58 exists on origin but its published head ${fake_sha} could not be fetched; refusing to rebuild the branch from the sealed base commit — the supervisor must retry the stage" ]
+  # No silent fallback: the working branch was never created.
+  run git -C "$CLONE" show-ref --verify --quiet refs/heads/ot/ope-58
+  [ "$status" -ne 0 ]
+}
+
+@test "initialize_stage_branch fails closed when origin cannot be queried" {
+  make_stage_branch_fixture
+
+  git -C "$CLONE" remote set-url origin "${BATS_TEST_TMPDIR}/missing.git"
+  run initialize_stage_branch "$CLONE" ot/ope-58 "$BASE_SHA"
+  [ "$status" -eq 1 ]
+  [ "$output" = "FATAL: could not query origin for branch ot/ope-58; refusing to initialize the stage branch while the published head is unknown — the supervisor must retry the stage" ]
+  run git -C "$CLONE" show-ref --verify --quiet refs/heads/ot/ope-58
+  [ "$status" -ne 0 ]
+}
+
 @test "codex_reconcile_auth orders ISO-8601 offsets and fractional seconds by instant" {
   before='{"tokens":{"account_id":"acct"},"last_refresh":"2026-07-01T23:59:59.900Z"}'
   after_offset='{"tokens":{"account_id":"acct"},"last_refresh":"2026-07-02T02:00:00.100+02:00"}'

@@ -327,10 +327,19 @@ fi
 configure_git_identity
 
 if [[ -z "$STAGE_EXPECTED_SUBJECT" ]]; then
-  log "initializing stage branch from exact sealed base commit ${STAGE_BASE_COMMIT}"
-  as_agent "git -C '$REPO_DIR' cat-file -e '${STAGE_BASE_COMMIT}^{commit}'"
-  as_agent "git -C '$REPO_DIR' checkout --quiet -B '$BRANCH_NAME' '$STAGE_BASE_COMMIT'"
-  as_agent "git -C '$REPO_DIR' reset --hard --quiet '$STAGE_BASE_COMMIT' && git -C '$REPO_DIR' clean -fdq"
+  # An initial stage of a retriggered generation reuses the ticket branch, and
+  # earlier generations may already have published reviewed work to
+  # origin/<branch>. initialize_stage_branch checks out exactly that remote
+  # head when the branch exists on origin, creates the branch from the sealed
+  # base commit only when origin has no such branch, and fails closed — never
+  # silently falling back to the base commit — when the published head cannot
+  # be reached (OPE-77).
+  STAGE_BRANCH_START=""
+  if ! STAGE_BRANCH_START="$(as_agent "source '${OPT_DIR}/lib/runtime.sh' && initialize_stage_branch '$REPO_DIR' '$BRANCH_NAME' '$STAGE_BASE_COMMIT'")"; then
+    log "$STAGE_BRANCH_START"
+    exit 1
+  fi
+  log "initialized stage branch ${BRANCH_NAME} (${STAGE_BRANCH_START})"
 elif as_agent "git -C '$REPO_DIR' show-ref --verify --quiet 'refs/heads/${BRANCH_NAME}'"; then
   as_agent "git -C '$REPO_DIR' checkout --quiet '$BRANCH_NAME'"
 elif as_agent "git -C '$REPO_DIR' ls-remote --exit-code --heads origin '$BRANCH_NAME'" >/dev/null 2>&1; then
