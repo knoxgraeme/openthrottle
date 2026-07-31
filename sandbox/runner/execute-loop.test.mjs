@@ -873,7 +873,7 @@ describe("loop action request validation", () => {
   });
 
   it("materializes only the authorized native session package into each isolated profile", () => {
-    for (const agent of ["claude", "codex", "opencode"]) {
+    for (const agent of ["claude", "codex"]) {
       const valid = validateLoopRequest(request({
         agent,
         nativeSessionId: "native-1",

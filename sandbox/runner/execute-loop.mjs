@@ -394,9 +394,34 @@ function lockExecutorOwnedSkillTree(path) {
   chmodReadOnlyPreservingExecuteTree(path);
 }
 
-function profileRootIdentity(path) {
-  const metadata = lstatSync(path);
-  return { dev: metadata.dev, ino: metadata.ino };
+const PROFILE_ROOT_FENCE_FILE = ".ot-profile-fence";
+
+// Inode identity cannot detect replace-after-delete on filesystems that
+// recycle inode numbers (ext4). A root-owned nonce file works everywhere:
+// the agent UID cannot create a uid-0 regular file with the sealed content.
+function writeProfileRootFence(profileRoot) {
+  const nonce = randomUUID();
+  const fencePath = containedPath(profileRoot, PROFILE_ROOT_FENCE_FILE, "profile fence escapes its root");
+  writeFileSync(fencePath, nonce, { mode: 0o600 });
+  if (isRoot()) chownSync(fencePath, ROOT_UID, ROOT_GID);
+  return nonce;
+}
+
+function assertProfileRootFence(profileRoot, nonce) {
+  const replaced = new Error("native session profile root was replaced during the action");
+  let rootMetadata;
+  let fenceMetadata;
+  const fencePath = containedPath(profileRoot, PROFILE_ROOT_FENCE_FILE, "profile fence escapes its root");
+  try {
+    rootMetadata = lstatSync(profileRoot);
+    fenceMetadata = lstatSync(fencePath);
+  } catch {
+    throw replaced;
+  }
+  if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()) throw replaced;
+  if (!fenceMetadata.isFile() || fenceMetadata.isSymbolicLink()) throw replaced;
+  if (isRoot() && fenceMetadata.uid !== ROOT_UID) throw replaced;
+  if (readFileSync(fencePath, "utf8") !== nonce) throw replaced;
 }
 
 function prepareActionHomeEnvironment(request) {
@@ -427,7 +452,7 @@ function prepareActionHomeEnvironment(request) {
   return {
     env,
     nativeSessionProfileRoot,
-    nativeSessionProfileRootIdentity: profileRootIdentity(nativeSessionProfileRoot),
+    profileRootFenceNonce: writeProfileRootFence(nativeSessionProfileRoot),
   };
 }
 
@@ -472,7 +497,7 @@ function prepareLoopAgentEnvironment(request, repoDir) {
     env,
     gitObjectEnv: gitObjectEnv.values,
     nativeSessionProfileRoot: homeEnv.nativeSessionProfileRoot,
-    nativeSessionProfileRootIdentity: homeEnv.nativeSessionProfileRootIdentity,
+    profileRootFenceNonce: homeEnv.profileRootFenceNonce,
   };
 }
 
@@ -717,11 +742,7 @@ export function runLoopAgentInPreparedRepository({
       throw new Error("reported native session id does not match the sealed loop request");
     }
     const nativeSessionId = request.nativeSessionId ?? reportedNativeSessionId;
-    const currentProfileRootIdentity = profileRootIdentity(preparedEnvironment.nativeSessionProfileRoot);
-    if (currentProfileRootIdentity.dev !== preparedEnvironment.nativeSessionProfileRootIdentity.dev ||
-        currentProfileRootIdentity.ino !== preparedEnvironment.nativeSessionProfileRootIdentity.ino) {
-      throw new Error("native session profile root was replaced during the action");
-    }
+    assertProfileRootFence(preparedEnvironment.nativeSessionProfileRoot, preparedEnvironment.profileRootFenceNonce);
     const sealedNativeSessionPackage = sealNativeSessionPackage({
       agent: request.agent,
       nativeSessionId,
