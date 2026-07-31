@@ -20,6 +20,7 @@ const LOOP_ACTION_DISPATCH_GRACE_SECONDS = 30;
 const STAGE_INPUT_DIR = "/var/lib/openthrottle/stage-input";
 const STAGE_RESULT_DIR = "/var/lib/openthrottle/stage-results";
 const LOOP_ACTION_DIR = "/var/lib/openthrottle/loop-actions";
+const LOOP_DISPATCH_DIR = "/var/lib/openthrottle/loop-dispatch";
 const STAGE_CREDENTIAL_ENV = new Set([
   "GITHUB_TOKEN",
   "CLAUDE_CODE_OAUTH_TOKEN",
@@ -99,6 +100,10 @@ function loopActionPath(attemptId: string, actionId: string, name: string): stri
   safeStagePathId(attemptId, "loop attempt ID");
   safeStagePathId(actionId, "loop action ID");
   return `${LOOP_ACTION_DIR}/${attemptId}/${actionId}/${name}`;
+}
+
+function shellSingleQuoted(value: string): string {
+  return `'${value.replace(/'/g, "'\"'\"'")}'`;
 }
 
 function parseCollectedStageResult(raw: string, attemptId: string): StageExecutionResult {
@@ -354,15 +359,14 @@ export function createDaytonaSandboxRuntime(
     async dispatchLoopAction(resource, request) {
       assertLoopRequestFence(request);
       const sandbox = await ensureStarted(resource);
-      await prepareRootFolder(sandbox, LOOP_ACTION_DIR);
-      await prepareRootFolder(sandbox, `${LOOP_ACTION_DIR}/${request.attemptId}`);
       const actionDirectory = `${LOOP_ACTION_DIR}/${request.attemptId}/${request.actionId}`;
-      await prepareRootFolder(sandbox, actionDirectory);
       const requestPath = loopActionPath(request.attemptId, request.actionId, "request.json");
       const resultPath = loopActionPath(request.attemptId, request.actionId, "result.json");
-      const lockPath = loopActionPath(request.attemptId, request.actionId, "dispatch.lock");
-      await sandbox.fs.uploadFile(Buffer.from(canonicalJson(request)), requestPath);
-      await sandbox.fs.setFilePermissions(requestPath, { owner: "root", group: "root", mode: "400" });
+      await prepareRootFolder(sandbox, LOOP_DISPATCH_DIR);
+      const stagedRequestPath = `${LOOP_DISPATCH_DIR}/${request.attemptId}.${request.actionId}.request.json`;
+      const lockPath = `${LOOP_DISPATCH_DIR}/${request.attemptId}.${request.actionId}.lock`;
+      await sandbox.fs.uploadFile(Buffer.from(canonicalJson(request)), stagedRequestPath);
+      await sandbox.fs.setFilePermissions(stagedRequestPath, { owner: "root", group: "root", mode: "400" });
       const sessionId = `loop-${request.actionId}`;
       if (!sandbox.process?.executeSessionCommand) {
         throw new Error("Daytona runtime does not expose session command execution");
@@ -370,7 +374,14 @@ export function createDaytonaSandboxRuntime(
       await sandbox.process?.createSession?.(sessionId).catch(() => undefined);
       const dispatched = await sandbox.process.executeSessionCommand(sessionId, {
         command: `flock --nonblock ${lockPath} sh -c ` +
-          `'test -f ${resultPath} || exec /opt/openthrottle/runner/execute-loop.mjs --request ${requestPath} --output ${resultPath}'`,
+          shellSingleQuoted([
+            `if test -f ${shellSingleQuoted(resultPath)}; then exit 0; fi`,
+            `install -d -o root -g root -m 0711 ${shellSingleQuoted(LOOP_ACTION_DIR)} ${shellSingleQuoted(`${LOOP_ACTION_DIR}/${request.attemptId}`)} ${shellSingleQuoted(actionDirectory)}`,
+            `cp ${shellSingleQuoted(stagedRequestPath)} ${shellSingleQuoted(requestPath)}`,
+            `chown root:root ${shellSingleQuoted(requestPath)}`,
+            `chmod 400 ${shellSingleQuoted(requestPath)}`,
+            `exec /opt/openthrottle/runner/execute-loop.mjs --request ${shellSingleQuoted(requestPath)} --output ${shellSingleQuoted(resultPath)}`,
+          ].join(" && ")),
         runAsync: true,
         suppressInputEcho: true,
       }, loopActionDispatchTimeoutSeconds(request.timeoutMs));

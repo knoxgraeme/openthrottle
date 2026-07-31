@@ -72,7 +72,7 @@ function request(overrides = {}) {
   renameSync(repoDir, join(rootDir, handle));
   process.env.OT_WORKTREE_ROOT = rootDir;
   const withoutFence = {
-    protocol: "loop-action@1",
+    protocol: "loop-action@2",
     actionId: "action-1",
     attemptId: "attempt-1",
     graphId: "graph-1",
@@ -123,7 +123,7 @@ function repositorySkillRequest() {
   process.env.OT_WORKTREE_ROOT = rootDir;
   const repositorySkill = repositorySkillPackage(worktreeDir);
   const withoutFence = {
-    protocol: "loop-action@1",
+    protocol: "loop-action@2",
     actionId: "action-repo-skill",
     attemptId: "attempt-repo-skill",
     graphId: "graph-1",
@@ -231,7 +231,7 @@ describe("loop action request validation", () => {
 
   it("rejects absolute worktree paths and writes action-attempt scoped result paths", () => {
     const withPath = {
-      protocol: "loop-action@1",
+      protocol: "loop-action@2",
       actionId: "action-2",
       attemptId: "attempt-2",
       graphId: "graph-1",
@@ -353,6 +353,18 @@ describe("loop action request validation", () => {
       ...wrongDirectoryWithoutFence,
       ...createLoopRequestHash(wrongDirectoryWithoutFence),
     })).toThrow(/reference must match/);
+    const longReference = {
+      ...valid,
+      repositorySkill: {
+        ...valid.repositorySkill,
+        reference: `repo://${"o".repeat(140)}/${"r".repeat(140)}@${valid.repositorySkill.commit}#skills/implement-unit`,
+      },
+    };
+    const { requestHash: _longReferenceHash, idempotencyKey: _longReferenceKey, ...longReferenceWithoutFence } = longReference;
+    expect(() => validateLoopRequest({
+      ...longReferenceWithoutFence,
+      ...createLoopRequestHash(longReferenceWithoutFence),
+    })).toThrow(/repositorySkill\.reference is invalid/);
   });
 
   it("passes native session IDs to every resumable engine adapter", () => {
@@ -648,7 +660,7 @@ describe("loop action request validation", () => {
     })).toThrow(/frontmatter name/);
   });
 
-  it("accepts repository skill hyphen and underscore aliases for engine invocation", () => {
+  it("rejects repository skill aliases that do not exactly match the frontmatter name", () => {
     const baseRequest = repositorySkillRequest();
     const valid = withFreshLoopFence(baseRequest, {
       skill: "implement-unit",
@@ -665,7 +677,7 @@ describe("loop action request validation", () => {
       lockIntegration: () => true,
       processFence: (execute) => execute(),
       runProcess: () => ({ status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" }),
-    })).not.toThrow();
+    })).toThrow(/frontmatter name/);
   });
 
   it("materializes only the authorized native session package into each isolated profile", () => {
@@ -801,7 +813,7 @@ describe("loop action request validation", () => {
         stdout: "{\"type\":\"thread.started\",\"thread_id\":\"thread-1\"}\n",
         stderr: "",
       }),
-    })).toThrow(/native session id was reported without a sealed executor package.*profile restore failed/s);
+    })).toThrow(/native session package does not contain the reported native session id.*profile restore failed/s);
   });
 
   it("rejects path-like native session ids before package storage can collapse", () => {

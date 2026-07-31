@@ -157,7 +157,7 @@ describe("Daytona stage execution", () => {
     );
 
     const loopWithoutFence = {
-      protocol: "loop-action@1" as const,
+      protocol: "loop-action@2" as const,
       actionId: "loop-1",
       attemptId: "attempt-child",
       graphId: "graph-1",
@@ -190,9 +190,24 @@ describe("Daytona stage execution", () => {
     expect(sandbox.process.executeSessionCommand).toHaveBeenCalledWith(
       "loop-loop-1",
       expect.objectContaining({
-        command: expect.stringMatching(/loop-actions\/attempt-child\/loop-1\/dispatch\.lock.*loop-actions\/attempt-child\/loop-1\/result\.json.*execute-loop\.mjs --request \/var\/lib\/openthrottle\/loop-actions\/attempt-child\/loop-1\/request\.json --output \/var\/lib\/openthrottle\/loop-actions\/attempt-child\/loop-1\/result\.json/),
+        command: expect.stringMatching(/loop-dispatch\/attempt-child\.loop-1\.lock.*if test -f .*loop-actions\/attempt-child\/loop-1\/result\.json.*then exit 0; fi.*install -d .* -m 0711 .*loop-actions.*loop-actions\/attempt-child.*loop-actions\/attempt-child\/loop-1.*cp .*loop-dispatch\/attempt-child\.loop-1\.request\.json.*loop-actions\/attempt-child\/loop-1\/request\.json.*execute-loop\.mjs --request .*loop-actions\/attempt-child\/loop-1\/request\.json.*--output .*loop-actions\/attempt-child\/loop-1\/result\.json/),
       }),
       60
+    );
+    expect(sandbox.process.executeSessionCommand).not.toHaveBeenCalledWith(
+      "loop-loop-1",
+      expect.objectContaining({
+        command: expect.stringMatching(/test -f .*&& exit 0 && install/),
+      }),
+      60
+    );
+    expect(sandbox.fs.uploadFile).toHaveBeenCalledWith(
+      expect.any(Buffer),
+      "/var/lib/openthrottle/loop-dispatch/attempt-child.loop-1.request.json"
+    );
+    expect(sandbox.fs.setFilePermissions).not.toHaveBeenCalledWith(
+      "/var/lib/openthrottle/loop-actions/attempt-child/loop-1/request.json",
+      expect.anything()
     );
 
     const loopWithNullCandidateSubject = {

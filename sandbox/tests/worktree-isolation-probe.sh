@@ -4,6 +4,9 @@ set -euo pipefail
 ROOT="$(mktemp -d)"
 chmod 0711 "$ROOT"
 cleanup() {
+  if [ -s "${ROOT_HELPER_PID_FILE:-}" ]; then
+    kill "$(cat "$ROOT_HELPER_PID_FILE")" >/dev/null 2>&1 || true
+  fi
   chmod -R u+rwX "$ROOT" >/dev/null 2>&1 || true
   rm -rf "$ROOT"
 }
@@ -22,6 +25,8 @@ REVIEWER_RESULT="$ACTION_ROOT/attempt-current/action-reviewer/result.json"
 BUILTIN_REQUEST="$ACTION_ROOT/attempt-current/action-builtin/request.json"
 BUILTIN_RESULT="$ACTION_ROOT/attempt-current/action-builtin/result.json"
 SEALED="$ROOT/sealed-input.txt"
+ROOT_HELPER_SENTINEL="$ROOT/root-helper-sentinel.txt"
+ROOT_HELPER_PID_FILE="$ROOT/root-helper.pid"
 BACKGROUND_PID="$ACTION_ROOT/attempt-current/action-current/home/background.pid"
 NATIVE_SESSION_ROOT="/var/lib/openthrottle/native-sessions"
 export OT_NATIVE_SESSION_SOURCE_ROOT="$NATIVE_SESSION_ROOT"
@@ -72,6 +77,13 @@ chown -R agent:agent "$ACTION_ROOT/attempt-current/action-sibling" "$ACTION_ROOT
 printf 'sealed secret\n' > "$SEALED"
 chown root:root "$SEALED"
 chmod 0400 "$SEALED"
+printf 'root helper fd sentinel\n' > "$ROOT_HELPER_SENTINEL"
+chown root:root "$ROOT_HELPER_SENTINEL"
+chmod 0400 "$ROOT_HELPER_SENTINEL"
+env PROBE_ROOT_HELPER_ENV_SENTINEL="root-helper-env-sentinel" \
+  sh -c 'exec 3< "$1"; printf "%s\n" "$$" > "$2"; while :; do sleep 30; done' \
+  sh "$ROOT_HELPER_SENTINEL" "$ROOT_HELPER_PID_FILE" &
+while [ ! -s "$ROOT_HELPER_PID_FILE" ]; do sleep 0.1; done
 install -d -o root -g root -m 0700 "$NATIVE_SESSION_ROOT"
 OT_NATIVE_SESSION_SOURCE_ROOT="$NATIVE_SESSION_ROOT" node --input-type=module <<'NODE'
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -298,6 +310,8 @@ must_fail cat "$PROBE_INTEGRATION/.git/config"
 must_fail cat "$PROBE_INTEGRATION/.git/packed-refs"
 must_fail cat "$PWD/integration-link"
 must_fail cat "$PROBE_SEALED_INPUT"
+must_fail cat "/proc/$PROBE_ROOT_HELPER_PID/fd/3"
+must_fail sh -c "tr '\\000' '\\n' < '/proc/$PROBE_ROOT_HELPER_PID/environ' | grep -F root-helper-env-sentinel"
 must_fail cat "$PROBE_SIBLING_WORKTREE/file.txt"
 must_fail sh -c "printf bad > '$PROBE_SIBLING_WORKTREE/bad.txt'"
 must_fail git cat-file -p "$PROBE_SIBLING_ONLY_BLOB"
@@ -359,7 +373,7 @@ const unsignedPackage = {
 };
 const repositorySkill = { ...unsignedPackage, packageDigest: digest(canonicalJson(unsignedPackage)) };
 const base = {
-  protocol: "loop-action@1",
+  protocol: "loop-action@2",
   actionId: "action-current",
   attemptId: "attempt-current",
   graphId: "graph-1",
@@ -394,7 +408,7 @@ import { createLoopRequestHash } from "/opt/openthrottle/runner/execute-loop.mjs
 const requestPath = process.argv[2];
 const candidateSubject = process.argv[3];
 const base = {
-  protocol: "loop-action@1",
+  protocol: "loop-action@2",
   actionId: "action-lead",
   attemptId: "attempt-current",
   graphId: "graph-1",
@@ -428,7 +442,7 @@ import { createLoopRequestHash } from "/opt/openthrottle/runner/execute-loop.mjs
 
 const requestPath = process.argv[2];
 const base = {
-  protocol: "loop-action@1",
+  protocol: "loop-action@2",
   actionId: "action-reviewer",
   attemptId: "attempt-current",
   graphId: "graph-1",
@@ -462,7 +476,7 @@ import { createLoopRequestHash } from "/opt/openthrottle/runner/execute-loop.mjs
 const requestPath = process.argv[2];
 const candidateSubject = process.argv[3];
 const base = {
-  protocol: "loop-action@1",
+  protocol: "loop-action@2",
   actionId: "action-builtin",
   attemptId: "attempt-current",
   graphId: "graph-1",
@@ -509,6 +523,7 @@ OT_WORKTREE_ROOT="$WORKTREES" \
 OT_INTEGRATION_REPO_DIR="$INTEGRATION" \
 PROBE_INTEGRATION="$INTEGRATION" \
 PROBE_SEALED_INPUT="$SEALED" \
+PROBE_ROOT_HELPER_PID="$(cat "$ROOT_HELPER_PID_FILE")" \
 PROBE_SIBLING_WORKTREE="$WORKTREES/sibling" \
 PROBE_SIBLING_ONLY_BLOB="$SIBLING_ONLY_BLOB" \
 PROBE_SIBLING_ACTION_SECRET="$ACTION_ROOT/attempt-current/action-sibling/secret.txt" \

@@ -33,10 +33,11 @@ import {
 import {
   extractNativeSessionId,
   materializeNativeSessionState,
+  nativeSessionStoragePath,
   sealNativeSessionPackage,
 } from "./native-session-package.mjs";
 
-export const LOOP_ACTION_PROTOCOL = "loop-action@1";
+export const LOOP_ACTION_PROTOCOL = "loop-action@2";
 export {
   lockPersistentAgentPrivateRoots,
   lockedPersistentProfilesFrom,
@@ -373,6 +374,13 @@ function prepareRootReadOnlyDirectory(path) {
   chmodTree(path, { fileMode: 0o444, directoryMode: 0o555 });
 }
 
+function prepareExecutorOwnedProfileRoot(path) {
+  if (!isRoot()) return;
+  mkdirSync(path, { recursive: true, mode: 0o555 });
+  chownSync(path, ROOT_UID, ROOT_GID);
+  chmodSync(path, 0o555);
+}
+
 function retryableInfrastructureError(message) {
   const error = new Error(message);
   error.retryableInfrastructureFailure = true;
@@ -389,6 +397,8 @@ function prepareActionHomeEnvironment(request) {
     const profileRoot = pathInside(home, ".claude");
     materializeClaudeProfileBaseline({ destinationHome: profileRoot });
     materializeNativeSessionState({ request, profileRoot });
+    prepareAgentOwnedDirectory(nativeSessionStoragePath(request.agent, profileRoot));
+    prepareExecutorOwnedProfileRoot(profileRoot);
     nativeSessionProfileRoot = profileRoot;
   }
   if (request.agent === "codex") {
@@ -396,6 +406,8 @@ function prepareActionHomeEnvironment(request) {
     prepareAgentOwnedDirectory(codexHome);
     materializeCodexProfileBaseline({ destinationHome: codexHome });
     materializeNativeSessionState({ request, profileRoot: codexHome });
+    prepareAgentOwnedDirectory(nativeSessionStoragePath(request.agent, codexHome));
+    prepareExecutorOwnedProfileRoot(codexHome);
     env.push(`CODEX_HOME=${codexHome}`);
     nativeSessionProfileRoot = codexHome;
   }

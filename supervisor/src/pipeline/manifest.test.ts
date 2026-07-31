@@ -426,6 +426,12 @@ describe("pipeline manifest validation", () => {
     expect(() => validatePipelineManifest(missingSkill))
       .toThrow(/repositorySkill\.files: must include SKILL\.md/);
 
+    const oversizedPath = structuredClone(value) as Record<string, unknown>;
+    ((firstStage(oversizedPath).repositorySkill as Record<string, unknown>).files as Array<Record<string, unknown>>)[0]!.path =
+      `.agents/skills/implement-unit/${"a".repeat(300)}/SKILL.md`;
+    expect(() => validatePipelineManifest(oversizedPath))
+      .toThrow(/repositorySkill\.files\[0\]\.path: must be at most 320 characters/);
+
     const mismatchedReference = structuredClone(value) as Record<string, unknown>;
     (firstStage(mismatchedReference).repositorySkill as Record<string, unknown>).reference =
       `repo://owner/repo@${"a".repeat(40)}#.agents/skills/other`;

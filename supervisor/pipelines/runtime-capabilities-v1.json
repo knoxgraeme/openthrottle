@@ -1,6 +1,6 @@
 {
   "schema": "openthrottle.runtime-capabilities/v1",
-  "release": "openthrottle-snapshot/v6",
+  "release": "openthrottle-snapshot/v7",
   "generatedBy": "sandbox-runtime-build",
   "protocol": "stage-executor@1",
   "capabilities": [
@@ -12,7 +12,7 @@
     "ce/review@1",
     "ce/simplify@1",
     "command/run@1",
-    "loop-action@1",
+    "loop-action@2",
     "provider/wait@1"
   ],
   "executors": ["agent", "command", "loop_action", "provider_wait"],

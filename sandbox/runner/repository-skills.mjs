@@ -4,7 +4,7 @@ import { dirname, relative, resolve, sep } from "node:path";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
 import { runGitAsExecutor } from "./repository-control.mjs";
-import { pathInside as containedPath } from "./filesystem-isolation.mjs";
+import { chownTree, isRoot, pathInside as containedPath } from "./filesystem-isolation.mjs";
 
 export const REPOSITORY_SKILL_CAPABILITY = "agent/repository-skill@1";
 
@@ -22,6 +22,11 @@ function record(value, label) {
 function string(value, label, pattern) {
   if (typeof value !== "string" || !pattern.test(value)) throw new Error(`${label} is invalid`);
   return value;
+}
+
+function boundedString(value, label, pattern, max) {
+  if (typeof value !== "string" || value.length > max) throw new Error(`${label} is invalid`);
+  return string(value, label, pattern);
 }
 
 function pathInside(root, child, label) {
@@ -68,7 +73,7 @@ function assertSkillFrontmatterMatchesInvocation(targetRoot, invocation) {
 }
 
 export function repositorySkillNameMatchesInvocation(name, invocation) {
-  return name === invocation || name.replace(/-/g, "_") === invocation.replace(/-/g, "_");
+  return name === invocation;
 }
 
 function gitTreeFileEntry(repoDir, commit, path) {
@@ -102,7 +107,7 @@ export function validateRepositorySkillPackage(value, label = "repositorySkill")
   if (!Array.isArray(files) || files.length < 1 || files.length > 64) {
     throw new Error(`${label}.files must be a bounded non-empty array`);
   }
-  const reference = string(input.reference, `${label}.reference`, REPOSITORY_SKILL_REFERENCE);
+  const reference = boundedString(input.reference, `${label}.reference`, REPOSITORY_SKILL_REFERENCE, 320);
   const invocation = string(input.invocation, `${label}.invocation`, INVOCATION);
   const directory = string(input.directory, `${label}.directory`, /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\/\/)[A-Za-z0-9._/-]{1,240}$/);
   const commit = string(input.commit, `${label}.commit`, COMMIT);
@@ -156,6 +161,7 @@ export function materializeRepositorySkillPackage({ packageInfo: rawPackageInfo,
   }
   if (!existsSync(resolve(targetRoot, "SKILL.md"))) throw new Error("repository skill package is missing SKILL.md");
   assertSkillFrontmatterMatchesInvocation(targetRoot, packageInfo.invocation);
+  if (isRoot()) chownTree(discoveryRoot, 0, 0);
   chmodDirectories(discoveryRoot, 0o555);
   return targetRoot;
 }

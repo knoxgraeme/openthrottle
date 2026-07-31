@@ -8,6 +8,8 @@ const CODEX_BASELINE_FILES = [
   "installation_id",
   "models_cache.json",
 ];
+const TRUSTED_CODEX_BASELINE = "/opt/openthrottle/action-home-baseline/codex";
+const TRUSTED_CLAUDE_BASELINE = "/opt/openthrottle/action-home-baseline/claude";
 
 function copyBaselineFile(sourceRoot, destinationRoot, relativePath) {
   const source = resolve(sourceRoot, relativePath);
@@ -47,7 +49,7 @@ function copyTrustedDirectory(source, destination) {
 }
 
 export function materializeCodexProfileBaseline({
-  sourceHome = "/home/agent/.codex",
+  sourceHome = TRUSTED_CODEX_BASELINE,
   destinationHome,
 }) {
   prepareAgentOwnedDirectory(destinationHome);
@@ -60,7 +62,7 @@ export function materializeCodexProfileBaseline({
 }
 
 export function materializeClaudeProfileBaseline({
-  sourceHome = "/home/agent/.claude",
+  sourceHome = TRUSTED_CLAUDE_BASELINE,
   destinationHome,
 }) {
   prepareAgentOwnedDirectory(destinationHome);

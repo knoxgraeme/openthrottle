@@ -295,9 +295,9 @@ export function materializeNativeSessionState({ request, profileRoot }) {
     throw new Error("authorized native session state is unavailable");
   }
   validateNativeSessionPackage({ source, request });
-  prepareNativeSessionDestination({ agent: request.agent, profileRoot });
+  const sessionDestination = prepareNativeSessionDestination({ agent: request.agent, profileRoot });
   copyTrustedTree(source, profileRoot, { skipManifest: true });
-  prepareAgentOwnedDirectory(profileRoot);
+  prepareAgentOwnedDirectory(sessionDestination);
   return source;
 }
 

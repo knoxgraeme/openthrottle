@@ -52,7 +52,7 @@ export interface RuntimeWorktreeHandle {
 }
 
 export interface LoopActionRequest {
-  protocol: "loop-action@1";
+  protocol: "loop-action@2";
   actionId: string;
   attemptId: string;
   graphId: string;

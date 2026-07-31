@@ -146,7 +146,7 @@ function repositorySkillFrontmatterName(raw: string): string {
 }
 
 function repositorySkillNameMatchesInvocation(name: string, invocation: string): boolean {
-  return name === invocation || name.replace(/-/g, "_") === invocation.replace(/-/g, "_");
+  return name === invocation;
 }
 
 async function resolveRepositorySkillPackages(input: {

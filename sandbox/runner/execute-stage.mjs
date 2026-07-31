@@ -53,6 +53,7 @@ import {
 import {
   extractNativeSessionId,
   materializeNativeSessionState,
+  nativeSessionStoragePath,
   sealNativeSessionPackage,
 } from "./native-session-package.mjs";
 
@@ -299,6 +300,13 @@ export function materializeRepositorySkill({ request, repoDir, discoveryRoot }) 
   return materializeRepositorySkillPackage({ packageInfo: request.repositorySkill, repoDir, agent: request.agent, discoveryRoot });
 }
 
+function prepareExecutorOwnedProfileRoot(path) {
+  if (!isRoot()) return;
+  mkdirSync(path, { recursive: true, mode: 0o555 });
+  chownSync(path, 0, 0);
+  chmodSync(path, 0o555);
+}
+
 export function repositorySkillStageEnvironment(request) {
   if (request.capability !== REPOSITORY_SKILL_CAPABILITY) {
     const home = "/home/agent";
@@ -320,6 +328,8 @@ export function repositorySkillStageEnvironment(request) {
     const codexHome = pathInside(actionDirectory, "codex", "stage action codex home");
     prepareAgentOwnedDirectory(codexHome);
     materializeCodexProfileBaseline({ destinationHome: codexHome });
+    prepareAgentOwnedDirectory(nativeSessionStoragePath(request.agent, codexHome));
+    prepareExecutorOwnedProfileRoot(codexHome);
     env.push(`CODEX_HOME=${codexHome}`);
     return {
       env,
@@ -330,6 +340,8 @@ export function repositorySkillStageEnvironment(request) {
   if (request.agent === "claude") {
     const claudeHome = pathInside(home, ".claude", "stage claude home");
     materializeClaudeProfileBaseline({ destinationHome: claudeHome });
+    prepareAgentOwnedDirectory(nativeSessionStoragePath(request.agent, claudeHome));
+    prepareExecutorOwnedProfileRoot(claudeHome);
     return {
       env,
       repositorySkillDiscoveryRoot: pathInside(claudeHome, "skills", "stage repository skill discovery"),

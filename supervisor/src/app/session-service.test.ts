@@ -785,7 +785,7 @@ intents:
       payload(),
       {
         [graphPath]: graph,
-        [skillPath]: "---\nname: implement-unit\n---\n# Implement Unit\n",
+        [skillPath]: "---\nname: implement_unit\n---\n# Implement Unit\n",
       },
       {
         capabilities: [
@@ -886,7 +886,7 @@ intents:
       payload(),
       {
         [graphPath]: graph,
-        [skillPath]: "---\nname: implement-unit\n---\n# Implement Unit\n",
+        [skillPath]: "---\nname: implement_unit\n---\n# Implement Unit\n",
       }
     );
 

@@ -497,7 +497,7 @@ describe("one-stage executor", () => {
     events.push("repository-observed");
 
     expect(result).toBe("execution");
-    expect(events).toEqual(["agent-returned", "descendants-terminated", "repository-observed"]);
+    expect(events).toEqual(["descendants-terminated", "agent-returned", "descendants-terminated", "repository-observed"]);
   });
 
   it("treats exit zero without a proposal as a non-recoverable failure", () => {
@@ -1060,7 +1060,7 @@ printf '{"type":"thread.started","thread_id":"native-1"}\\n'
           throw new Error("profile restore failed");
         },
         lockStageHome: () => true,
-      })).toThrow(/native session id was reported without a sealed executor package.*profile restore failed/s);
+      })).toThrow(/native session package does not contain the reported native session id.*profile restore failed/s);
     });
   });
 

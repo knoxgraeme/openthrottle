@@ -49,7 +49,7 @@ export function buildInstalledRuntimeDescriptor(
       "ce/review@1",
       "ce/simplify@1",
       "command/run@1",
-      "loop-action@1",
+      "loop-action@2",
       "provider/wait@1",
     ]),
     executors: sortedUnique(overrides.executors ?? EXECUTOR_KINDS) as ExecutorKind[],
