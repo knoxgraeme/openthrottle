@@ -15,6 +15,7 @@ import {
   STAGE_EXECUTOR_PROTOCOL,
   type StageRequestEnvelope,
 } from "../pipeline/stage-request.js";
+import type { RepositorySkillPackage } from "../pipeline/manifest.js";
 
 export interface RuntimeCapabilityDescriptor extends RuntimeCapabilityInventory {
   schema: "openthrottle.runtime-capabilities/v1";
@@ -51,7 +52,7 @@ export interface RuntimeWorktreeHandle {
 }
 
 export interface LoopActionRequest {
-  protocol: "loop-action@1";
+  protocol: "loop-action@2";
   actionId: string;
   attemptId: string;
   graphId: string;
@@ -61,6 +62,7 @@ export interface LoopActionRequest {
   agent: "claude" | "codex" | "opencode";
   skill: string;
   worktree: RuntimeWorktreeHandle | null;
+  candidateSubject?: string | null;
   nativeSessionId: string | null;
   contextPolicy: "fresh" | "resume_required" | "prefer_resume";
   timeoutMs: number;
@@ -68,6 +70,7 @@ export interface LoopActionRequest {
   allowedMcpServers: readonly string[];
   credentialScopes: readonly string[];
   receiptSchema: string;
+  repositorySkill?: RepositorySkillPackage;
   requestHash: string;
   idempotencyKey: string;
 }
@@ -108,7 +111,11 @@ export interface SandboxRuntime {
     baseCommit: string;
   }): Promise<RuntimeWorktreeHandle>;
   dispatchLoopAction(resource: RuntimeResource, request: LoopActionRequest): Promise<{ providerDispatchId: string }>;
-  collectLoopActionResult(resource: RuntimeResource, actionId: string): Promise<LoopActionResult | null>;
+  collectLoopActionResult(resource: RuntimeResource, input: {
+    attemptId: string;
+    actionId: string;
+    requestHash: string;
+  }): Promise<LoopActionResult | null>;
   cleanupWorktree(resource: RuntimeResource, handle: RuntimeWorktreeHandle): Promise<void>;
   renewLiveness(resource: RuntimeResource, attemptId: string): Promise<{ observedAt: string }>;
   stop(resource: RuntimeResource, reason: string): Promise<{ confirmed: boolean }>;

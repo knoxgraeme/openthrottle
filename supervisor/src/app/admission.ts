@@ -133,6 +133,22 @@ function repositorySkillIds(rawGraph: string, source: string, config: ValidatedR
   )))].sort();
 }
 
+function repositorySkillFrontmatterName(raw: string): string {
+  const lines = raw.replace(/\r\n/g, "\n").split("\n");
+  if (lines[0] !== "---") throw new Error("repository skill SKILL.md is missing frontmatter");
+  const end = lines.indexOf("---", 1);
+  if (end === -1) throw new Error("repository skill SKILL.md frontmatter is unterminated");
+  for (const line of lines.slice(1, end)) {
+    const match = line.match(/^name:\s*["']?([A-Za-z0-9][A-Za-z0-9._-]{0,127})["']?\s*$/);
+    if (match) return match[1];
+  }
+  throw new Error("repository skill SKILL.md frontmatter is missing name");
+}
+
+function repositorySkillNameMatchesInvocation(name: string, invocation: string): boolean {
+  return name === invocation;
+}
+
 async function resolveRepositorySkillPackages(input: {
   rawGraph: string;
   source: string;
@@ -151,6 +167,11 @@ async function resolveRepositorySkillPackages(input: {
     }
     if (!snapshot.files.some((file) => file.path === `${declaration.path}/SKILL.md`)) {
       throw new Error(`repository skill ${id} package is missing SKILL.md`);
+    }
+    const skillFile = snapshot.files.find((file) => file.path === `${declaration.path}/SKILL.md`)!;
+    const frontmatterName = repositorySkillFrontmatterName(skillFile.content);
+    if (!repositorySkillNameMatchesInvocation(frontmatterName, id)) {
+      throw new Error(`repository skill ${id} SKILL.md name does not match the configured invocation`);
     }
     const files = snapshot.files.map((file) => ({
       path: file.path,

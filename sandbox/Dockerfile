@@ -126,6 +126,17 @@ COPY sandbox/bin/ot-stage-result.mjs /opt/openthrottle/bin/ot-stage-result.mjs
 COPY supervisor/pipelines/runtime-capabilities-v1.json /opt/openthrottle/runtime-capabilities.json
 COPY skills /opt/openthrottle/skills
 
+RUN set -eux; \
+    baseline="/opt/openthrottle/action-home-baseline"; \
+    install -d -m 0755 "$baseline/claude/skills" "$baseline/codex"; \
+    cp -r /opt/openthrottle/compound-engineering-marketplace/skills/. "$baseline/claude/skills/"; \
+    cp -r /opt/openthrottle/skills/tasks/. "$baseline/claude/skills/"; \
+    for file in config.toml AGENTS.md installation_id models_cache.json; do \
+      if [ -f "/home/agent/.codex/$file" ]; then cp "/home/agent/.codex/$file" "$baseline/codex/$file"; fi; \
+    done; \
+    chown -R root:root "$baseline"; \
+    chmod -R a-w "$baseline"
+
 # The canonical task skills (skills/tasks/<name>/SKILL.md, agents/openai.yaml)
 # are the single source of truth. Claude loads CE from the root-owned pinned
 # marketplace and gets only the OpenThrottle adapters copied into its runtime
@@ -142,6 +153,7 @@ RUN mkdir -p /etc/codex/skills \
 
 RUN chmod 0755 /opt/openthrottle/entrypoint.sh \
     && chmod 0755 /opt/openthrottle/lib/runtime.sh \
+    && chmod 0755 /opt/openthrottle/runner/*.mjs \
     && chmod 0755 /usr/local/bin/ot-activity \
     && chmod 0755 /opt/openthrottle/bin/ot-stage-result.mjs \
     && ln -s /opt/openthrottle/bin/ot-stage-result.mjs /usr/local/bin/ot-stage-result \

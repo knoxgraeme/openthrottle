@@ -19,6 +19,12 @@ describe("Daytona stage execution", () => {
       stop: vi.fn(async () => undefined),
       delete: vi.fn(async () => undefined),
       fs: {
+        listFiles: vi.fn(async (path: string) => {
+          if (path === "/var/lib/openthrottle/loop-actions") {
+            return [{ name: "attempt-child", path: "/var/lib/openthrottle/loop-actions/attempt-child", size: 0, isDir: true }];
+          }
+          return [];
+        }),
         createFolder: vi.fn(async () => undefined),
         uploadFile: vi.fn(async (content: Buffer, path: string) => {
           remoteFiles.set(path, content);
@@ -151,7 +157,7 @@ describe("Daytona stage execution", () => {
     );
 
     const loopWithoutFence = {
-      protocol: "loop-action@1" as const,
+      protocol: "loop-action@2" as const,
       actionId: "loop-1",
       attemptId: "attempt-child",
       graphId: "graph-1",
@@ -167,15 +173,12 @@ describe("Daytona stage execution", () => {
       transitionContext: "implement unit",
       allowedMcpServers: ["github"],
       credentialScopes: ["model.invoke", "repo.read", "repo.write"],
-      receiptSchema: "openthrottle.loop-receipt@1",
+      receiptSchema: "openthrottle.receipt/v1",
       requestHash: "",
       idempotencyKey: "",
     };
-    const loopHash = digestNormalized(canonicalJson({
-      ...loopWithoutFence,
-      requestHash: undefined,
-      idempotencyKey: undefined,
-    }));
+    const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...loopCanonicalFence } = loopWithoutFence;
+    const loopHash = digestNormalized(canonicalJson(loopCanonicalFence));
     const loopRequest = {
       ...loopWithoutFence,
       requestHash: loopHash,
@@ -187,10 +190,62 @@ describe("Daytona stage execution", () => {
     expect(sandbox.process.executeSessionCommand).toHaveBeenCalledWith(
       "loop-loop-1",
       expect.objectContaining({
-        command: expect.stringContaining("/opt/openthrottle/runner/execute-loop.mjs"),
+        command: expect.stringMatching(/loop-dispatch\/attempt-child\.loop-1\.lock.*if test -f .*loop-actions\/attempt-child\/loop-1\/result\.json.*then exit 0; fi.*install -d .* -m 0711 .*loop-actions.*loop-actions\/attempt-child.*loop-actions\/attempt-child\/loop-1.*cp .*loop-dispatch\/attempt-child\.loop-1\.request\.json.*loop-actions\/attempt-child\/loop-1\/request\.json.*execute-loop\.mjs --request .*loop-actions\/attempt-child\/loop-1\/request\.json.*--output .*loop-actions\/attempt-child\/loop-1\/result\.json/),
       }),
-      30
+      60
     );
+    expect(sandbox.process.executeSessionCommand).not.toHaveBeenCalledWith(
+      "loop-loop-1",
+      expect.objectContaining({
+        command: expect.stringMatching(/test -f .*&& exit 0 && install/),
+      }),
+      60
+    );
+    expect(sandbox.fs.uploadFile).toHaveBeenCalledWith(
+      expect.any(Buffer),
+      "/var/lib/openthrottle/loop-dispatch/attempt-child.loop-1.request.json"
+    );
+    expect(sandbox.fs.setFilePermissions).not.toHaveBeenCalledWith(
+      "/var/lib/openthrottle/loop-actions/attempt-child/loop-1/request.json",
+      expect.anything()
+    );
+
+    const loopWithOpencodeAgent = {
+      ...loopWithoutFence,
+      actionId: "loop-opencode",
+      agent: "opencode" as const,
+    };
+    const {
+      requestHash: _opencodeRequestHash,
+      idempotencyKey: _opencodeIdempotencyKey,
+      ...canonicalOpencode
+    } = loopWithOpencodeAgent;
+    const opencodeHash = digestNormalized(canonicalJson(canonicalOpencode));
+    await expect(runtime.dispatchLoopAction(resource, {
+      ...loopWithOpencodeAgent,
+      requestHash: opencodeHash,
+      idempotencyKey: `loop:attempt-child:loop-opencode:${opencodeHash}`,
+    })).rejects.toThrow(/opencode loop actions are not supported/);
+
+    const loopWithNullCandidateSubject = {
+      ...loopWithoutFence,
+      actionId: "loop-null-candidate",
+      candidateSubject: null,
+    };
+    const {
+      requestHash: _nullRequestHash,
+      idempotencyKey: _nullIdempotencyKey,
+      candidateSubject: _candidateSubject,
+      ...canonicalNullCandidate
+    } = loopWithNullCandidateSubject;
+    const nullCandidateHash = digestNormalized(canonicalJson(canonicalNullCandidate));
+    await expect(runtime.dispatchLoopAction(resource, {
+      ...loopWithNullCandidateSubject,
+      requestHash: nullCandidateHash,
+      idempotencyKey: `loop:attempt-child:loop-null-candidate:${nullCandidateHash}`,
+    })).resolves.toEqual({
+      providerDispatchId: "dispatch-opaque-1",
+    });
 
     const artifactPayload = canonicalJson({ result: "success" });
     remoteFiles.set("/var/lib/openthrottle/stage-results/attempt-1.json", Buffer.from(JSON.stringify({
@@ -216,7 +271,7 @@ describe("Daytona stage execution", () => {
       requestHash: request.requestHash,
       outcome: "success",
     });
-    remoteFiles.set("/var/lib/openthrottle/loop-results/loop-1.json", Buffer.from(JSON.stringify({
+    remoteFiles.set("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/result.json", Buffer.from(JSON.stringify({
       version: 1,
       kind: "loop_action_result",
       action_id: "loop-1",
@@ -228,7 +283,11 @@ describe("Daytona stage execution", () => {
       receipt: "done",
       created_at: "2026-07-22T00:00:00.000Z",
     })));
-    await expect(runtime.collectLoopActionResult(resource, "loop-1")).resolves.toMatchObject({
+    await expect(runtime.collectLoopActionResult(resource, {
+      attemptId: "attempt-child",
+      actionId: "loop-1",
+      requestHash: loopRequest.requestHash,
+    })).resolves.toMatchObject({
       actionId: "loop-1",
       attemptId: "attempt-child",
       outcome: "success",
@@ -247,6 +306,51 @@ describe("Daytona stage execution", () => {
     await runtime.quarantine(resource, "stale subject");
     await runtime.cleanup(resource);
     expect(sandbox.delete).toHaveBeenCalledOnce();
+  });
+
+  it("collects loop results only from the exact attempt/action path", async () => {
+    const remoteFiles = new Map<string, Buffer>();
+    const sandbox = {
+      id: "provider-opaque-loop-fence",
+      state: "started",
+      fs: {
+        downloadFile: vi.fn(async (path: string) => {
+          const file = remoteFiles.get(path);
+          if (!file) throw new Error("not found");
+          return file;
+        }),
+      },
+    } as unknown as Sandbox;
+    const runtime = createDaytonaSandboxRuntime({ get: vi.fn(async () => sandbox) } as never, {
+      snapshot: "snapshot-v1",
+      materializeCredentialEnv: vi.fn(async () => ({ env: {} })),
+    });
+    const resource = { providerResourceId: "provider-opaque-loop-fence" };
+    const result = {
+      version: 1,
+      kind: "loop_action_result",
+      action_id: "loop-1",
+      attempt_id: "attempt-other",
+      request_hash: "a".repeat(64),
+      outcome: "success",
+      native_session_id: "thread-1",
+      subject: "d".repeat(40),
+      receipt: "done",
+      created_at: "2026-07-22T00:00:00.000Z",
+    };
+    remoteFiles.set("/var/lib/openthrottle/loop-actions/attempt-other/loop-1/result.json", Buffer.from(JSON.stringify(result)));
+    await expect(runtime.collectLoopActionResult(resource, {
+      attemptId: "attempt-child",
+      actionId: "loop-1",
+      requestHash: "a".repeat(64),
+    })).resolves.toBeNull();
+
+    remoteFiles.set("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/result.json", Buffer.from(JSON.stringify(result)));
+    await expect(runtime.collectLoopActionResult(resource, {
+      attemptId: "attempt-child",
+      actionId: "loop-1",
+      requestHash: "b".repeat(64),
+    })).rejects.toThrow(/invalid envelope/);
   });
 
   it("refuses credentials outside the sandbox allowlist", async () => {

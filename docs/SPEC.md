@@ -246,6 +246,52 @@ normalizes output, verifies produced artifact declarations and Git subject, and
 writes one `stage_result` event to the supervisor-owned stage-result spool. It
 does not call a completion HTTP endpoint or emit a task completion marker.
 
+### Loop action runtime isolation
+
+Structured loop actions are executor-owned filesystem operations. The
+integration checkout, sealed inputs, Git hooks, executor Git metadata, stage
+spools, sibling action directories, prior action directories, and native-session
+packages are root-owned and not readable or writable by the agent UID. The only
+agent-writable repository path for a worker action is that action's selected
+unit or final-repair worktree. Lead and reviewer actions receive a detached
+read-only repository view: lead views are built from the sealed candidate
+subject, reviewer views are built from the current integration `HEAD`, tracked
+executable bits are preserved, and the view must remain Git-clean while being
+unwritable by the agent.
+
+Loop action inputs, logs, outbox, inbox, processed steering, native-session
+transport, repository-skill discovery, and action home/profile directories are
+namespaced by child action attempt. Before an action executes and after it
+finishes, executor cleanup must converge the agent-writable surfaces back to an
+empty/private state or return retryable infrastructure failure for quarantine;
+a live current action directory must not be made traversable without first
+holding that exact action's dispatch/replay lock. Exact replay removes any
+action-local repository-skill proposal before invoking the engine, so stale
+agent output cannot satisfy the receipt/proposal fence.
+
+Native session continuation is materialized only from the exact sealed
+executor-owned package selected by the request. Claude and Codex packages must
+contain engine-native durable records for the selected session id, must be
+bounded regular files with normalized digests, and are replaced through a
+validated sibling staging directory plus atomic swap so the last resumable
+package survives any failed replacement. OpenCode loop actions are not
+supported: OpenCode's database-backed session store and built-in adapter body
+delivery are deferred to a later slice, and both the supervisor loop dispatch
+and the sandbox loop validator reject `agent: opencode` fail-closed. OpenCode
+stage execution is unaffected.
+
+Repository skills remain sourced from committed repository paths selected by
+admission, not from ticket text. The sandbox materializes only the sealed
+package bytes into the current action's engine discovery directory, requires the
+`SKILL.md` frontmatter `name` to match the sealed invocation, invokes that
+invocation from the isolated action view, and removes the ephemeral copy before
+another action can observe sibling or prior packages.
+
+RU5 does not materialize action-scoped credentials or MCP servers, validate
+standard receipt authority, activate the structured reducer, or compose
+production child execution. Those contracts remain fail-closed until their
+owning RU6, RU7, RU8/RU9, and RU9/RU11 slices install them.
+
 The supervisor also accepts run-bound `activity`, `plan`, and `heartbeat`
 events. Every event is checked against the current ticket run and pipeline
 attempt before processing; late events from older actors are discarded.

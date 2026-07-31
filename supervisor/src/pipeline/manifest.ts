@@ -445,7 +445,7 @@ function parseRepositorySkillPackage(value: unknown, path: string): RepositorySk
   const files = arrayAt(input.files, `${path}.files`, (file, filePath) => {
     const fileInput = objectAt(file, filePath, ["path", "blobSha", "digest"]);
     const fileEntry = {
-      path: stringAt(fileInput.path, `${filePath}.path`, { max: 512, pattern: SAFE_REPOSITORY_PATH }),
+      path: stringAt(fileInput.path, `${filePath}.path`, { max: 320, pattern: SAFE_REPOSITORY_PATH }),
       blobSha: stringAt(fileInput.blobSha, `${filePath}.blobSha`, { pattern: /^[a-f0-9]{40}$/ }),
       digest: stringAt(fileInput.digest, `${filePath}.digest`, { pattern: /^[a-f0-9]{64}$/ }),
     };

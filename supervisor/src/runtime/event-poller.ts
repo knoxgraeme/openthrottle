@@ -20,6 +20,7 @@ import {
 } from "./events.js";
 
 const OUTBOX_DIR = "/home/agent/.ot/outbox";
+const LOOP_ACTION_DIR = "/var/lib/openthrottle/loop-actions";
 const SEALED_HEARTBEAT_FILE = "/var/lib/openthrottle/heartbeat/heartbeat.json";
 const SEALED_STAGE_RESULT_DIR = "/var/lib/openthrottle/stage-results";
 const WORKSPACE_SUBJECT_COMMAND = "node /opt/openthrottle/runner/execute-stage.mjs --print-subject --repo /home/agent/repo";
@@ -37,17 +38,60 @@ interface SandboxEventFile {
   prefetched?: Buffer;
 }
 
-async function listEventFiles(sandbox: RuntimeWorkspace): Promise<SandboxEventFile[]> {
-  const files = await sandbox.fs.listFiles!(OUTBOX_DIR);
-  const events: SandboxEventFile[] = files
+function safeRemoteName(name: string | undefined): string | null {
+  return typeof name === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(name) ? name : null;
+}
+
+async function listActivityEventFiles(
+  sandbox: RuntimeWorkspace,
+  directory: string,
+  options: { optional?: boolean } = {}
+): Promise<SandboxEventFile[]> {
+  let files;
+  try {
+    files = await sandbox.fs.listFiles!(directory);
+  } catch (error) {
+    if (options.optional) return [];
+    throw error;
+  }
+  return files
     .filter((file) => !file.isDir && typeof file.name === "string" && /^[A-Za-z0-9._-]+\.json$/.test(file.name))
     .map((file) => ({
       name: file.name!,
-      remotePath: `${OUTBOX_DIR}/${file.name}`,
+      remotePath: `${directory}/${file.name}`,
       size: file.size,
       sealedHeartbeat: false,
       sealedStageResult: false,
     }));
+}
+
+async function listLoopActionOutboxFiles(sandbox: RuntimeWorkspace): Promise<SandboxEventFile[]> {
+  const attempts = await sandbox.fs.listFiles!(LOOP_ACTION_DIR).catch(() => []);
+  const events: SandboxEventFile[] = [];
+  for (const attempt of attempts) {
+    const attemptName = safeRemoteName(attempt.name);
+    if (!attempt.isDir || !attemptName) continue;
+    const attemptPath = `${LOOP_ACTION_DIR}/${attemptName}`;
+    const actions = await sandbox.fs.listFiles!(attemptPath).catch(() => []);
+    for (const action of actions) {
+      const actionName = safeRemoteName(action.name);
+      if (!action.isDir || !actionName) continue;
+      const outboxDir = `${attemptPath}/${actionName}/outbox`;
+      const actionEvents = await listActivityEventFiles(sandbox, outboxDir, { optional: true });
+      events.push(...actionEvents.map((event) => ({
+        ...event,
+        name: `050-loop-${attemptName}-${actionName}-${event.name}`,
+      })));
+    }
+  }
+  return events;
+}
+
+async function listEventFiles(sandbox: RuntimeWorkspace): Promise<SandboxEventFile[]> {
+  const events: SandboxEventFile[] = [
+    ...(await listActivityEventFiles(sandbox, OUTBOX_DIR)),
+    ...(await listLoopActionOutboxFiles(sandbox)),
+  ];
   try {
     const heartbeat = await sandbox.fs.downloadFile!(SEALED_HEARTBEAT_FILE);
     if (Buffer.isBuffer(heartbeat) && heartbeat.length > 0) {
@@ -79,6 +123,34 @@ async function listEventFiles(sandbox: RuntimeWorkspace): Promise<SandboxEventFi
     // No sealed stage result has landed yet.
   }
   return events.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function sandboxEventPayload(event: SandboxEvent): unknown {
+  if (event.kind === "stage_result") {
+    return {
+      version: event.version,
+      kind: event.kind,
+      event_id: event.event_id,
+      run_id: event.run_id,
+      pipeline_instance_id: event.pipeline_instance_id,
+      attempt_id: event.attempt_id,
+      request_hash: event.request_hash,
+      result_hash: event.result_hash,
+    };
+  }
+  if (event.kind === "activity") {
+    return {
+      ...event,
+      body: sanitizeText(event.body),
+      ...(event.action ? { action: sanitizeText(event.action) } : {}),
+      ...(event.parameter ? { parameter: sanitizeText(event.parameter) } : {}),
+      ...(event.result ? { result: sanitizeText(event.result) } : {}),
+    };
+  }
+  if (event.kind === "plan") {
+    return { ...event, plan: sanitizePlan(event.plan) };
+  }
+  return event;
 }
 
 async function readWorkspaceSubject(sandbox: RuntimeWorkspace): Promise<string> {
@@ -205,30 +277,7 @@ async function pollTicketEvents(
       runId: event.run_id,
       sandboxId: ticket.sandbox_id,
       kind: event.kind,
-      payload: JSON.stringify(
-        event.kind === "stage_result"
-          ? {
-              version: event.version,
-              kind: event.kind,
-              event_id: event.event_id,
-              run_id: event.run_id,
-              pipeline_instance_id: event.pipeline_instance_id,
-              attempt_id: event.attempt_id,
-              request_hash: event.request_hash,
-              result_hash: event.result_hash,
-            }
-          : event.kind === "activity"
-          ? {
-              ...event,
-              body: sanitizeText(event.body),
-              ...(event.action ? { action: sanitizeText(event.action) } : {}),
-              ...(event.parameter ? { parameter: sanitizeText(event.parameter) } : {}),
-              ...(event.result ? { result: sanitizeText(event.result) } : {}),
-            }
-          : event.kind === "plan"
-            ? { ...event, plan: sanitizePlan(event.plan) }
-            : event
-      ),
+      payload: JSON.stringify(sandboxEventPayload(event)),
     });
     if (
       existing.run_id !== event.run_id ||

@@ -43,8 +43,16 @@ git -C "$SMOKE_DIR/work" push -u origin main >/dev/null
 git --git-dir "$SMOKE_DIR/repo.git" symbolic-ref HEAD refs/heads/main
 
 test "$(docker image inspect --format '{{json .Config.Entrypoint}}' "$IMAGE")" = '["/bin/true"]'
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+docker run --rm --entrypoint bash \
+  -v "$SCRIPT_DIR/worktree-isolation-probe.sh:/opt/openthrottle/tests/worktree-isolation-probe.sh:ro" \
+  "$IMAGE" /opt/openthrottle/tests/worktree-isolation-probe.sh
 
 docker run --rm --entrypoint bash "$IMAGE" -lc '
+  for runner in /opt/openthrottle/runner/*.mjs; do
+    test -x "$runner"
+  done &&
   claude --version | rg -q "^2\.1\.201" &&
   claude --help | rg -q -- "--setting-sources" &&
   claude --help | rg -q -- "--strict-mcp-config" &&
@@ -125,6 +133,10 @@ if [ -n "${OT_STAGE_PROPOSAL_FILE:-}" ]; then
   grep -Fq 'fixture-mcp' "${OT_CLAUDE_MCP_CONFIG:?}" || exit 30
   mkdir -p "$repo_dir/.claude/commands"
   touch "$repo_dir/.claude/commands/persisted-project-review-command.md"
+  mkdir -p "$HOME/.claude/projects"
+  printf '%s\n' \
+    '{"type":"system","subtype":"init","session_id":"smoke-claude-session","model":"stub"}' \
+    > "$HOME/.claude/projects/smoke-claude-session.jsonl"
   ot-stage-result '{"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"Claude stage complete","evidence":["stub engine invoked"],"findings":[],"actions":[],"uncertainty":[]}' --output "$OT_STAGE_PROPOSAL_FILE" || exit 23
   test -s "$OT_STAGE_PROPOSAL_FILE" || exit 24
 fi
@@ -166,6 +178,11 @@ for arg in "$@"; do last="$arg"; done
 if [ "$last" = "-" ]; then
   cat > "$HOME/.ot/codex-stdin.log"
 fi
+codex_home="${CODEX_HOME:-$HOME/.codex}"
+mkdir -p "$codex_home/sessions"
+printf '%s\n' \
+  '{"type":"session_meta","payload":{"id":"smoke-codex-thread"}}' \
+  > "$codex_home/sessions/smoke-codex-thread.jsonl"
 printf '%s\n' \
   '{"type":"thread.started","thread_id":"smoke-codex-thread"}' \
   '{"type":"turn.started"}' \
@@ -197,6 +214,10 @@ printf '%s\n' "$*" >> "$HOME/.ot/opencode-args.log"
 last=""
 for arg in "$@"; do last="$arg"; done
 printf '%s\n' "$last" >> "$HOME/.ot/opencode-prompt.log"
+mkdir -p "$HOME/.local/share/opencode"
+printf '%s\n' \
+  '{"type":"message","sessionID":"smoke-opencode-session","part":{"type":"text","text":"durable smoke session"}}' \
+  > "$HOME/.local/share/opencode/smoke-opencode-session.jsonl"
 printf '%s\n' \
   '{"type":"message","sessionID":"smoke-opencode-session","part":{"type":"text","text":"smoke complete"}}' \
   '{"type":"step_finish","sessionID":"smoke-opencode-session","part":{"cost":0.375}}'
