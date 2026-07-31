@@ -221,7 +221,19 @@ export function deriveCandidateCommit({
 export function removeWorktree({ repoDir, rootDir = DEFAULT_ROOT, handle }) {
   const target = worktreePath({ rootDir, handle });
   if (!existsSync(target)) return { id: safeHandle(handle), removed: false };
-  runGitAsExecutor(repoDir, ["worktree", "remove", "--force", target]);
+  try {
+    runGitAsExecutor(repoDir, ["worktree", "remove", "--force", target]);
+  } catch (error) {
+    rmSync(target, { recursive: true, force: true });
+    runGitAsExecutor(repoDir, ["worktree", "prune"]);
+    const registered = runGitAsExecutor(repoDir, ["worktree", "list", "--porcelain"])
+      .split(/\n(?=worktree )/)
+      .some((entry) => entry.split("\n")[0] === `worktree ${target}`);
+    if (registered || existsSync(target)) {
+      throw new Error(`stale worktree cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return { id: safeHandle(handle), removed: true, recovered: true };
+  }
   rmSync(target, { recursive: true, force: true });
   return { id: safeHandle(handle), removed: true };
 }

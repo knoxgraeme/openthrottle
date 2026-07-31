@@ -88,6 +88,38 @@ function repository() {
   return directory;
 }
 
+function sealedRepositorySkillPackage(repoDir, {
+  skillDir = ".agents/skills/implement-unit",
+  invocation = "implement_unit",
+  skillName = "implement_unit",
+  body = "# Skill\n",
+} = {}) {
+  mkdirSync(join(repoDir, skillDir), { recursive: true });
+  writeFileSync(join(repoDir, skillDir, "SKILL.md"), `---\nname: ${skillName}\n---\n${body}`);
+  execFileSync("git", ["add", "."], { cwd: repoDir });
+  execFileSync("git", ["commit", "-qm", "skill"], { cwd: repoDir });
+  const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+  const skillPath = `${skillDir}/SKILL.md`;
+  const file = {
+    path: skillPath,
+    blobSha: execFileSync("git", ["rev-parse", `${commit}:${skillPath}`], { cwd: repoDir, encoding: "utf8" }).trim(),
+    digest: digest(readFileSync(join(repoDir, skillPath))),
+  };
+  const unsignedPackage = {
+    schema: "openthrottle.repository-skill-package/v1",
+    reference: `repo://owner/repo@${commit}#${skillDir}`,
+    invocation,
+    directory: skillDir,
+    commit,
+    files: [file],
+  };
+  return {
+    repositorySkill: { ...unsignedPackage, packageDigest: digest(canonicalJson(unsignedPackage)) },
+    skillDir,
+    skillPath,
+  };
+}
+
 function fixture({
   agent = "codex",
   capability = "agent/semantic@1",
@@ -103,27 +135,7 @@ function fixture({
   const repoDir = repository();
   let sealedRepositorySkill = repositorySkill;
   if (repositorySkill === "fixture") {
-    const skillDir = ".agents/skills/implement-unit";
-    mkdirSync(join(repoDir, skillDir), { recursive: true });
-    writeFileSync(join(repoDir, skillDir, "SKILL.md"), "---\nname: implement_unit\n---\n# Fixture Skill\n");
-    execFileSync("git", ["add", "."], { cwd: repoDir });
-    execFileSync("git", ["commit", "-qm", "skill"], { cwd: repoDir });
-    const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
-    const skillPath = `${skillDir}/SKILL.md`;
-    const file = {
-      path: skillPath,
-      blobSha: execFileSync("git", ["rev-parse", `${commit}:${skillPath}`], { cwd: repoDir, encoding: "utf8" }).trim(),
-      digest: digest(readFileSync(join(repoDir, skillPath))),
-    };
-    const unsignedPackage = {
-      schema: "openthrottle.repository-skill-package/v1",
-      reference: `repo://owner/repo@${commit}#${skillDir}`,
-      invocation: "implement_unit",
-      directory: skillDir,
-      commit,
-      files: [file],
-    };
-    sealedRepositorySkill = { ...unsignedPackage, packageDigest: digest(canonicalJson(unsignedPackage)) };
+    sealedRepositorySkill = sealedRepositorySkillPackage(repoDir, { body: "# Fixture Skill\n" }).repositorySkill;
   }
   const config = commandName && configuredCommand ? { commands: { [commandName]: "test-command" } } : {};
   const stage = {
@@ -726,27 +738,7 @@ describe("one-stage executor", () => {
 
   it("materializes repository-skill stages under each engine discovery root", () => {
     const repoDir = repository();
-    const skillDir = ".agents/skills/implement-unit";
-    mkdirSync(join(repoDir, skillDir), { recursive: true });
-    writeFileSync(join(repoDir, skillDir, "SKILL.md"), "---\nname: implement_unit\n---\n# Pinned repository package\n");
-    execFileSync("git", ["add", "."], { cwd: repoDir });
-    execFileSync("git", ["commit", "-qm", "skill"], { cwd: repoDir });
-    const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
-    const skillPath = `${skillDir}/SKILL.md`;
-    const file = {
-      path: skillPath,
-      blobSha: execFileSync("git", ["rev-parse", `${commit}:${skillPath}`], { cwd: repoDir, encoding: "utf8" }).trim(),
-      digest: digest(readFileSync(join(repoDir, skillPath))),
-    };
-    const unsignedPackage = {
-      schema: "openthrottle.repository-skill-package/v1",
-      reference: `repo://owner/repo@${commit}#${skillDir}`,
-      invocation: "implement_unit",
-      directory: skillDir,
-      commit,
-      files: [file],
-    };
-    const repositorySkill = { ...unsignedPackage, packageDigest: digest(canonicalJson(unsignedPackage)) };
+    const { repositorySkill } = sealedRepositorySkillPackage(repoDir, { body: "# Pinned repository package\n" });
 
     for (const agent of ["claude", "codex", "opencode"]) {
       const input = fixture({
@@ -782,27 +774,7 @@ describe("one-stage executor", () => {
 
   it("locks repository-skill stage homes when setup fails before agent launch", () => {
     const repoDir = repository();
-    const skillDir = ".agents/skills/implement-unit";
-    mkdirSync(join(repoDir, skillDir), { recursive: true });
-    writeFileSync(join(repoDir, skillDir, "SKILL.md"), "---\nname: implement_unit\n---\n# Skill\n");
-    execFileSync("git", ["add", "."], { cwd: repoDir });
-    execFileSync("git", ["commit", "-qm", "skill"], { cwd: repoDir });
-    const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
-    const skillPath = `${skillDir}/SKILL.md`;
-    const file = {
-      path: skillPath,
-      blobSha: execFileSync("git", ["rev-parse", `${commit}:${skillPath}`], { cwd: repoDir, encoding: "utf8" }).trim(),
-      digest: digest(readFileSync(join(repoDir, skillPath))),
-    };
-    const unsignedPackage = {
-      schema: "openthrottle.repository-skill-package/v1",
-      reference: `repo://owner/repo@${commit}#${skillDir}`,
-      invocation: "implement_unit",
-      directory: skillDir,
-      commit,
-      files: [file],
-    };
-    const repositorySkill = { ...unsignedPackage, packageDigest: digest(canonicalJson(unsignedPackage)) };
+    const { repositorySkill } = sealedRepositorySkillPackage(repoDir);
     const input = fixture({
       capability: "agent/repository-skill@1",
       contextPolicy: "resume_required",
@@ -830,27 +802,7 @@ describe("one-stage executor", () => {
 
   it("materializes sealed native session packages before repository-skill resume", () => {
     const repoDir = repository();
-    const skillDir = ".agents/skills/implement-unit";
-    mkdirSync(join(repoDir, ".agents", "skills", "implement-unit"), { recursive: true });
-    writeFileSync(join(repoDir, skillDir, "SKILL.md"), "---\nname: implement_unit\n---\n# Skill\n");
-    execFileSync("git", ["add", "."], { cwd: repoDir });
-    execFileSync("git", ["commit", "-qm", "skill"], { cwd: repoDir });
-    const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
-    const skillPath = `${skillDir}/SKILL.md`;
-    const file = {
-      path: skillPath,
-      blobSha: execFileSync("git", ["rev-parse", `${commit}:${skillPath}`], { cwd: repoDir, encoding: "utf8" }).trim(),
-      digest: digest(readFileSync(join(repoDir, skillPath))),
-    };
-    const unsignedPackage = {
-      schema: "openthrottle.repository-skill-package/v1",
-      reference: `repo://owner/repo@${commit}#${skillDir}`,
-      invocation: "implement_unit",
-      directory: skillDir,
-      commit,
-      files: [file],
-    };
-    const repositorySkill = { ...unsignedPackage, packageDigest: digest(canonicalJson(unsignedPackage)) };
+    const { repositorySkill } = sealedRepositorySkillPackage(repoDir);
     const input = fixture({
       capability: "agent/repository-skill@1",
       contextPolicy: "resume_required",
@@ -899,32 +851,61 @@ printf '{"type":"thread.started","thread_id":"native-1"}\\n'
     });
   });
 
+  it("removes stale action-local repository-skill proposals before invocation", () => {
+    const repoDir = repository();
+    const { repositorySkill } = sealedRepositorySkillPackage(repoDir);
+    const input = fixture({
+      capability: "agent/repository-skill@1",
+      repositorySkill,
+    });
+    input.repoDir = repoDir;
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-stage-actions-"));
+    const binDir = mkdtempSync(join(tmpdir(), "ot-fake-bin-"));
+    directories.push(actionRoot, binDir);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    mkdirSync(join(actionRoot, "attempt-1", "home"), { recursive: true });
+    writeFileSync(join(actionRoot, "attempt-1", "home", "proposal.json"), JSON.stringify({
+      schema: "openthrottle.stage-proposal/v1",
+      suggested_outcome: "success",
+      summary: "stale",
+      evidence: ["stale"],
+      findings: [],
+      actions: [],
+      uncertainty: [],
+    }));
+
+    installFakeGosu(binDir);
+    writeExecutable(join(binDir, "codex"), `#!/usr/bin/env bash
+set -euo pipefail
+if [ -e "$OT_STAGE_PROPOSAL_FILE" ]; then
+  echo "stale proposal was not removed" >&2
+  exit 44
+fi
+cat > "$OT_STAGE_PROPOSAL_FILE" <<'JSON'
+{"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"fresh","evidence":["fresh"],"findings":[],"actions":[],"uncertainty":[]}
+JSON
+`);
+    withPrependedPath(binDir, () => {
+      const result = defaultRunAgent({
+        request: input.request,
+        invocation: resolveContextInvocation(input.request),
+        repoDir: input.repoDir,
+        proposalPath: join(actionRoot, "persistent", "proposal.json"),
+        timeoutMs: 5_000,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.proposal).toMatchObject({ summary: "fresh" });
+    });
+  });
+
   it("seals Claude native session packages when the stub writes canonical continuation state", () => {
     const repoDir = repository();
-    const skillDir = ".agents/skills/implement-unit";
-    mkdirSync(join(repoDir, skillDir), { recursive: true });
-    writeFileSync(join(repoDir, skillDir, "SKILL.md"), "---\nname: implement_unit\n---\n# Skill\n");
-    execFileSync("git", ["add", "."], { cwd: repoDir });
-    execFileSync("git", ["commit", "-qm", "skill"], { cwd: repoDir });
-    const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
-    const skillPath = `${skillDir}/SKILL.md`;
-    const file = {
-      path: skillPath,
-      blobSha: execFileSync("git", ["rev-parse", `${commit}:${skillPath}`], { cwd: repoDir, encoding: "utf8" }).trim(),
-      digest: digest(readFileSync(join(repoDir, skillPath))),
-    };
-    const unsignedPackage = {
-      schema: "openthrottle.repository-skill-package/v1",
-      reference: `repo://owner/repo@${commit}#${skillDir}`,
-      invocation: "implement_unit",
-      directory: skillDir,
-      commit,
-      files: [file],
-    };
+    const { repositorySkill } = sealedRepositorySkillPackage(repoDir);
     const input = fixture({
       agent: "claude",
       capability: "agent/repository-skill@1",
-      repositorySkill: { ...unsignedPackage, packageDigest: digest(canonicalJson(unsignedPackage)) },
+      repositorySkill,
     });
     input.repoDir = repoDir;
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-stage-actions-"));
@@ -1046,29 +1027,10 @@ printf '{"type":"system","subtype":"init","session_id":"different-claude-session
 
   it("refuses reported stage native session ids when sealing cannot produce a package and surfaces cleanup failures", () => {
     const repoDir = repository();
-    const skillDir = ".agents/skills/implement-unit";
-    mkdirSync(join(repoDir, skillDir), { recursive: true });
-    writeFileSync(join(repoDir, skillDir, "SKILL.md"), "---\nname: implement_unit\n---\n# Skill\n");
-    execFileSync("git", ["add", "."], { cwd: repoDir });
-    execFileSync("git", ["commit", "-qm", "skill"], { cwd: repoDir });
-    const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
-    const skillPath = `${skillDir}/SKILL.md`;
-    const file = {
-      path: skillPath,
-      blobSha: execFileSync("git", ["rev-parse", `${commit}:${skillPath}`], { cwd: repoDir, encoding: "utf8" }).trim(),
-      digest: digest(readFileSync(join(repoDir, skillPath))),
-    };
-    const unsignedPackage = {
-      schema: "openthrottle.repository-skill-package/v1",
-      reference: `repo://owner/repo@${commit}#${skillDir}`,
-      invocation: "implement_unit",
-      directory: skillDir,
-      commit,
-      files: [file],
-    };
+    const { repositorySkill } = sealedRepositorySkillPackage(repoDir);
     const input = fixture({
       capability: "agent/repository-skill@1",
-      repositorySkill: { ...unsignedPackage, packageDigest: digest(canonicalJson(unsignedPackage)) },
+      repositorySkill,
     });
     input.repoDir = repoDir;
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-stage-actions-"));

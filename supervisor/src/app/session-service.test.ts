@@ -899,6 +899,80 @@ intents:
     expect(payloads.some((entry) => entry.includes("runtime capability mismatch: capability:agent/repository-skill@1"))).toBe(true);
   });
 
+  it("rejects repository skill packages whose SKILL.md name does not match the configured invocation", async () => {
+    const graphPath = ".openthrottle/graphs/repo-skill.json";
+    const skillPath = ".agents/skills/implement-unit/SKILL.md";
+    const graph = JSON.stringify({
+      schema: "openthrottle.graph/v1",
+      id: "repo-skill-graph",
+      version: 1,
+      entry_node: "implementation",
+      workers: [{
+        id: "implementer",
+        engine: "agent",
+        session_scope: "fresh",
+        credentials: ["model.invoke", "repo.read", "repo.write"],
+        skills: ["repo://implement_unit"],
+      }],
+      loops: [{
+        id: "implement_loop",
+        worker: "implementer",
+        input_scope: "graph",
+        receipt: "unit_completion",
+        max_parallel: 1,
+        max_rounds: 1,
+        skill: "repo://implement_unit",
+        timeout_seconds: 60,
+      }],
+      nodes: [{
+        id: "implementation",
+        kind: "run",
+        loop: "implement_loop",
+        depends_on: [],
+        transitions: {
+          success: { terminal: "completed" },
+          failure: { terminal: "failed" },
+        },
+      }],
+    });
+
+    await run(
+      `schema: openthrottle.config/v1
+default_graph: repo_skill
+graphs:
+  - id: repo_skill
+    kind: repository
+    ref: ${graphPath}
+skills:
+  - id: implement_unit
+    path: .agents/skills/implement-unit
+pipelines: { implement: implement }
+intents:
+  implement:
+    default_graph: repo_skill
+    allowed_graphs: [repo_skill]
+`,
+      {},
+      shippedCatalogPath,
+      payload(),
+      {
+        [graphPath]: graph,
+        [skillPath]: "---\nname: other_skill\n---\n# Implement Unit\n",
+      },
+      {
+        capabilities: [
+          ...buildInstalledRuntimeDescriptor("base-repository-skill-test/v1").descriptor.capabilities,
+          "agent/repository-skill@1",
+        ],
+      }
+    );
+
+    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(payloads.some((entry) => entry.includes(
+      "repository skill implement_unit SKILL.md name does not match the configured invocation"
+    ))).toBe(true);
+  });
+
   it("rejects repository skill references that are not declared in repository config", async () => {
     const graphPath = ".openthrottle/graphs/repo-skill.json";
     const graph = JSON.stringify({

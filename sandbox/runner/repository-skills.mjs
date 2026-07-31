@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, relative, resolve, sep } from "node:path";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
@@ -45,6 +45,30 @@ function chmodDirectories(path, directoryMode) {
   if (!metadata.isDirectory() || metadata.isSymbolicLink()) return;
   chmodSync(path, directoryMode);
   for (const entry of readdirSync(path)) chmodDirectories(resolve(path, entry), directoryMode);
+}
+
+function skillFrontmatterName(raw) {
+  const lines = raw.replace(/\r\n/g, "\n").split("\n");
+  if (lines[0] !== "---") throw new Error("repository skill SKILL.md is missing frontmatter");
+  const end = lines.indexOf("---", 1);
+  if (end === -1) throw new Error("repository skill SKILL.md frontmatter is unterminated");
+  for (const line of lines.slice(1, end)) {
+    const match = line.match(/^name:\s*["']?([A-Za-z0-9][A-Za-z0-9._-]{0,127})["']?\s*$/);
+    if (match) return match[1];
+  }
+  throw new Error("repository skill SKILL.md frontmatter is missing name");
+}
+
+function assertSkillFrontmatterMatchesInvocation(targetRoot, invocation) {
+  const skillPath = resolve(targetRoot, "SKILL.md");
+  const name = skillFrontmatterName(readFileSync(skillPath, "utf8"));
+  if (!repositorySkillNameMatchesInvocation(name, invocation)) {
+    throw new Error("repository skill frontmatter name does not match invocation");
+  }
+}
+
+export function repositorySkillNameMatchesInvocation(name, invocation) {
+  return name === invocation || name.replace(/-/g, "_") === invocation.replace(/-/g, "_");
 }
 
 function gitTreeFileEntry(repoDir, commit, path) {
@@ -131,6 +155,7 @@ export function materializeRepositorySkillPackage({ packageInfo: rawPackageInfo,
     writeFileSync(destination, bytes, { mode: mode === "100755" ? 0o555 : 0o444 });
   }
   if (!existsSync(resolve(targetRoot, "SKILL.md"))) throw new Error("repository skill package is missing SKILL.md");
+  assertSkillFrontmatterMatchesInvocation(targetRoot, packageInfo.invocation);
   chmodDirectories(discoveryRoot, 0o555);
   return targetRoot;
 }

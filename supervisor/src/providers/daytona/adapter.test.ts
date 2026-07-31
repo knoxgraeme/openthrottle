@@ -177,11 +177,8 @@ describe("Daytona stage execution", () => {
       requestHash: "",
       idempotencyKey: "",
     };
-    const loopHash = digestNormalized(canonicalJson({
-      ...loopWithoutFence,
-      requestHash: undefined,
-      idempotencyKey: undefined,
-    }));
+    const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...loopCanonicalFence } = loopWithoutFence;
+    const loopHash = digestNormalized(canonicalJson(loopCanonicalFence));
     const loopRequest = {
       ...loopWithoutFence,
       requestHash: loopHash,
@@ -197,6 +194,26 @@ describe("Daytona stage execution", () => {
       }),
       60
     );
+
+    const loopWithNullCandidateSubject = {
+      ...loopWithoutFence,
+      actionId: "loop-null-candidate",
+      candidateSubject: null,
+    };
+    const {
+      requestHash: _nullRequestHash,
+      idempotencyKey: _nullIdempotencyKey,
+      candidateSubject: _candidateSubject,
+      ...canonicalNullCandidate
+    } = loopWithNullCandidateSubject;
+    const nullCandidateHash = digestNormalized(canonicalJson(canonicalNullCandidate));
+    await expect(runtime.dispatchLoopAction(resource, {
+      ...loopWithNullCandidateSubject,
+      requestHash: nullCandidateHash,
+      idempotencyKey: `loop:attempt-child:loop-null-candidate:${nullCandidateHash}`,
+    })).resolves.toEqual({
+      providerDispatchId: "dispatch-opaque-1",
+    });
 
     const artifactPayload = canonicalJson({ result: "success" });
     remoteFiles.set("/var/lib/openthrottle/stage-results/attempt-1.json", Buffer.from(JSON.stringify({

@@ -8,6 +8,7 @@ import {
   lstatSync,
   readFileSync,
   mkdirSync,
+  rmSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -429,6 +430,7 @@ export function defaultRunAgent({
     });
     if (request.capability === REPOSITORY_SKILL_CAPABILITY) {
       materializeNativeSessionState({ request, profileRoot: stageEnvironment.nativeSessionProfileRoot });
+      rmSync(actionProposalPath, { force: true });
     }
     const prompt = stagePrompt(request, actionProposalPath, { agent, repositorySkillRoot });
     const env = [

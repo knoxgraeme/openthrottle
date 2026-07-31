@@ -81,15 +81,18 @@ function assertStageRequestFence(request: StageRequestEnvelope): void {
 function assertLoopRequestFence(request: LoopActionRequest): void {
   safeStagePathId(request.actionId, "loop action ID");
   safeStagePathId(request.attemptId, "loop attempt ID");
-  const expectedHash = digestNormalized(canonicalJson({
-    ...request,
-    requestHash: undefined,
-    idempotencyKey: undefined,
-  }));
+  const expectedHash = digestNormalized(canonicalJson(normalizedLoopRequestForHash(request)));
   const expectedKey = `loop:${request.attemptId}:${request.actionId}:${expectedHash}`;
   if (request.requestHash !== expectedHash || request.idempotencyKey !== expectedKey) {
     throw new Error(`loop action ${request.actionId} has a stale hash or idempotency key`);
   }
+}
+
+function normalizedLoopRequestForHash(request: LoopActionRequest): Omit<LoopActionRequest, "requestHash" | "idempotencyKey"> {
+  const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, candidateSubject, ...withoutFence } = request;
+  return candidateSubject === null || candidateSubject === undefined
+    ? withoutFence
+    : { ...withoutFence, candidateSubject };
 }
 
 function loopActionPath(attemptId: string, actionId: string, name: string): string {

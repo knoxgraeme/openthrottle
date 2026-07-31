@@ -1,4 +1,5 @@
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, relative, resolve, sep } from "node:path";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
@@ -201,13 +202,15 @@ export function sealNativeSessionPackage({
   const relativeSessionRoot = relativeContainedPath(profileRoot, sessionsSource, "native session storage path escapes its profile root");
   preflightNativeSessionSource(sessionsSource);
   const destination = nativeSessionPackageDirectory({ sourceRoot, agent, nativeSessionId });
+  const staging = resolve(dirname(destination), `.${nativeSessionId}.staging-${process.pid}-${randomUUID()}`);
+  const rollback = resolve(dirname(destination), `.${nativeSessionId}.rollback-${process.pid}-${randomUUID()}`);
+  let movedDestination = false;
   try {
-    if (existsSync(destination)) chmodTree(destination, { fileMode: 0o600, directoryMode: 0o700 });
-    rmSync(destination, { recursive: true, force: true });
+    rmSync(staging, { recursive: true, force: true });
     mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
-    mkdirSync(destination, { recursive: true, mode: 0o700 });
-    copyTrustedTree(sessionsSource, resolve(destination, relativeSessionRoot));
-    const { files, containsSessionId } = collectNativeSessionPackage(destination, nativeSessionId, agent);
+    mkdirSync(staging, { recursive: true, mode: 0o700 });
+    copyTrustedTree(sessionsSource, resolve(staging, relativeSessionRoot));
+    const { files, containsSessionId } = collectNativeSessionPackage(staging, nativeSessionId, agent);
     if (!containsSessionId) {
       throw new Error("native session package does not contain the reported native session id");
     }
@@ -217,16 +220,34 @@ export function sealNativeSessionPackage({
       nativeSessionId,
       files,
     };
-    writeFileSync(resolve(destination, NATIVE_SESSION_PACKAGE_MANIFEST), canonicalJson({
+    writeFileSync(resolve(staging, NATIVE_SESSION_PACKAGE_MANIFEST), canonicalJson({
       ...unsigned,
       packageDigest: digest(canonicalJson(unsigned)),
     }), { mode: 0o600 });
-    if (isRoot()) chownTree(destination, ROOT_UID, ROOT_GID);
-    chmodTree(destination, { fileMode: 0o400, directoryMode: 0o500 });
+    if (isRoot()) chownTree(staging, ROOT_UID, ROOT_GID);
+    chmodTree(staging, { fileMode: 0o400, directoryMode: 0o500 });
+    validateNativeSessionPackage({
+      source: staging,
+      request: { agent, nativeSessionId },
+    });
+    if (existsSync(destination)) {
+      chmodTree(destination, { fileMode: 0o600, directoryMode: 0o700 });
+      renameSync(destination, rollback);
+      movedDestination = true;
+    }
+    renameSync(staging, destination);
+    movedDestination = false;
+    rmSync(rollback, { recursive: true, force: true });
     return destination;
   } catch (error) {
-    rmSync(destination, { recursive: true, force: true });
+    rmSync(staging, { recursive: true, force: true });
+    if (movedDestination && existsSync(rollback) && !existsSync(destination)) {
+      renameSync(rollback, destination);
+    }
     throw error;
+  } finally {
+    rmSync(staging, { recursive: true, force: true });
+    rmSync(rollback, { recursive: true, force: true });
   }
 }
 

@@ -107,6 +107,24 @@ describe("executor-owned worktrees", () => {
     });
   });
 
+  it("recovers a stale worktree registration when normal removal fails", () => {
+    const repoDir = repository();
+    const rootDir = mkdtempSync(join(tmpdir(), "ot-worktrees-"));
+    directories.push(rootDir);
+    const baseCommit = git(repoDir, ["rev-parse", "HEAD"]);
+    const created = createWorktree({ repoDir, rootDir, handle: "stale", baseCommit });
+    rmSync(join(created.path, ".git"), { force: true });
+
+    expect(removeWorktree({ repoDir, rootDir, handle: "stale" })).toEqual({
+      id: "stale",
+      removed: true,
+      recovered: true,
+    });
+    expect(existsSync(created.path)).toBe(false);
+    expect(git(repoDir, ["worktree", "list", "--porcelain"])).not.toContain(created.path);
+    expect(createWorktree({ repoDir, rootDir, handle: "stale", baseCommit }).id).toBe("stale");
+  });
+
   it("locks retained worktrees and grants only the current handle", () => {
     const repoDir = repository();
     const rootDir = mkdtempSync(join(tmpdir(), "ot-worktrees-"));
