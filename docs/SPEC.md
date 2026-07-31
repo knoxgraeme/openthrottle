@@ -217,9 +217,13 @@ fence.
 
 The entrypoint ignores conflicting ambient identity values and derives runtime
 identity from the sealed request. It verifies input ownership/mode and all
-digests before cloning. An initial stage starts from the exact sealed base
-commit; later stages reconstruct the exact expected subject. Git safety config
-is root-sealed.
+digests before cloning. An initial stage checks out the exact published
+`origin/<branch>` head when the working branch already exists on the remote
+(a retriggered generation reuses the ticket branch), starts from the exact
+sealed base commit only when the remote has no such branch, and fails closed —
+never silently proceeding from the base commit — when the published head
+cannot be queried or fetched; later stages reconstruct the exact expected
+subject. Git safety config is root-sealed.
 
 Sandbox setup is split between bake-once and per-run work. `post_bootstrap`
 commands and image-derived engine probes are bake-once: they execute exactly

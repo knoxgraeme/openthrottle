@@ -113,6 +113,58 @@ evaluate_bootstrap_marker() {
   printf 'run\n'
 }
 
+# initialize_stage_branch REPO_DIR BRANCH_NAME BASE_COMMIT
+#
+# Creates or resets the working branch for an initial stage (one whose sealed
+# request carries no expected subject). A retriggered (repair) generation
+# reuses the ticket branch, and earlier generations may already have pushed
+# reviewed work to origin/<branch>; starting from the sealed base commit would
+# hand the stage a branch missing that published head (OPE-77). Contract:
+#   - origin/<branch> exists  -> check out exactly that remote head
+#   - origin/<branch> absent  -> create the branch at BASE_COMMIT
+#   - origin unreachable, or the advertised head cannot be fetched -> fail
+#     closed with a FATAL diagnostic. The stage never silently proceeds on a
+#     branch that lacks the published work; the dead run is settled by the
+#     supervisor as a retryable infrastructure failure.
+#
+# stdout on success (exit 0): "remote <sha>" or "base <sha>" naming the exact
+# commit the branch was reset to.
+# stdout on failure (exit 1): the exact fail-closed diagnostic to log.
+initialize_stage_branch() {
+  local repo="$1" branch="$2" base_commit="$3"
+  local listing remote_head start_commit source_kind
+  if ! listing="$(git -C "$repo" ls-remote --heads origin "refs/heads/${branch}" 2>/dev/null)"; then
+    printf '%s\n' "FATAL: could not query origin for branch ${branch}; refusing to initialize the stage branch while the published head is unknown — the supervisor must retry the stage"
+    return 1
+  fi
+  listing="${listing%%$'\n'*}"
+  if [[ -n "$listing" ]]; then
+    remote_head="${listing%%[[:space:]]*}"
+    if [[ ! "$remote_head" =~ ^[0-9a-f]{40}$ ]] ||
+       ! git -C "$repo" fetch --quiet origin "refs/heads/${branch}" 2>/dev/null ||
+       ! git -C "$repo" cat-file -e "${remote_head}^{commit}" 2>/dev/null; then
+      printf '%s\n' "FATAL: branch ${branch} exists on origin but its published head ${remote_head:-<unknown>} could not be fetched; refusing to rebuild the branch from the sealed base commit — the supervisor must retry the stage"
+      return 1
+    fi
+    start_commit="$remote_head"
+    source_kind="remote"
+  else
+    if ! git -C "$repo" cat-file -e "${base_commit}^{commit}" 2>/dev/null; then
+      printf '%s\n' "FATAL: sealed base commit ${base_commit} is not present in the checkout; the supervisor must retry the stage"
+      return 1
+    fi
+    start_commit="$base_commit"
+    source_kind="base"
+  fi
+  if ! git -C "$repo" checkout --quiet -B "$branch" "$start_commit" ||
+     ! git -C "$repo" reset --hard --quiet "$start_commit" ||
+     ! git -C "$repo" clean -fdq; then
+    printf '%s\n' "FATAL: could not check out branch ${branch} at ${start_commit}; the supervisor must retry the stage"
+    return 1
+  fi
+  printf '%s %s\n' "$source_kind" "$start_commit"
+}
+
 # Extract a string field from a Codex auth.json blob; empty on absent/invalid.
 codex_auth_field() {
   # $1 = json blob, $2 = jq path (e.g. '.last_refresh')
