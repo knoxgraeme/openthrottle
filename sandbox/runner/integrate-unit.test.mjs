@@ -50,4 +50,35 @@ describe("unit integration", () => {
     expect(integrateCandidate({ repoDir, expectedHead, candidateCommit }))
       .toMatchObject({ integrated: false, reason: "already_applied_exact_tree" });
   });
+
+  it("accepts exact idempotent replay after the fast-forward already happened", () => {
+    const repoDir = repository();
+    const expectedHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+    writeFileSync(join(repoDir, "file.txt"), "integrated\n");
+    execFileSync("git", ["commit", "-aqm", "candidate"], { cwd: repoDir });
+    const candidateCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+
+    const result = integrateCandidate({ repoDir, expectedHead, candidateCommit });
+
+    expect(result).toMatchObject({
+      integrated: false,
+      reason: "already_integrated_exact_head",
+      integrated_head: candidateCommit,
+    });
+  });
+
+  it("rejects replay heads that do not descend from the expected head", () => {
+    const repoDir = repository();
+    const baseCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+    writeFileSync(join(repoDir, "file.txt"), "expected\n");
+    execFileSync("git", ["commit", "-aqm", "expected"], { cwd: repoDir });
+    const expectedHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+    execFileSync("git", ["checkout", "--quiet", "--detach", baseCommit], { cwd: repoDir });
+    writeFileSync(join(repoDir, "file.txt"), "unrelated\n");
+    execFileSync("git", ["commit", "-aqm", "unrelated"], { cwd: repoDir });
+    const candidateCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+
+    expect(() => integrateCandidate({ repoDir, expectedHead, candidateCommit }))
+      .toThrow(/not a descendant of the expected head/);
+  });
 });

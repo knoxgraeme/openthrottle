@@ -12,6 +12,7 @@ import { runWithAgentProcessFence } from "./agent-process-fence.mjs";
 import { grantWorktreeToAgent, lockWorktree, worktreePath } from "./worktrees.mjs";
 import {
   chmodOwnerPrivateTree,
+  chmodReadOnlyPreservingExecuteTree,
   chmodTree,
   chownTree,
   identityForUser,
@@ -20,14 +21,13 @@ import {
   lockedPersistentProfilesFrom,
   pathInside as containedPath,
   prepareAgentOwnedDirectory,
+  resetAgentOwnedDirectory,
   restorePersistentAgentPrivateRoots,
 } from "./filesystem-isolation.mjs";
 import { materializeClaudeProfileBaseline, materializeCodexProfileBaseline } from "./action-home-baseline.mjs";
 import { writeJsonAtomic } from "./atomic-write.mjs";
 import {
   materializeRepositorySkillPackage,
-  repositorySkillDiscoveryRoot,
-  skillBody,
   validateRepositorySkillPackage,
 } from "./repository-skills.mjs";
 import {
@@ -310,6 +310,11 @@ export function validateLoopRequest(value) {
   if (!ROLES.has(request.role)) throw new Error("role is invalid");
   if (!LOOPS.has(request.loop)) throw new Error("loop is invalid");
   if (!AGENTS.has(request.agent)) throw new Error("agent is invalid");
+  if (request.agent === "opencode") {
+    // OpenCode loop actions need database-backed session sealing and adapter
+    // body delivery that RU5 does not provide; fail closed until that unit.
+    throw new Error("opencode loop actions are not supported yet");
+  }
   const repositorySkill = input.repositorySkill === undefined
     ? undefined
     : validateRepositorySkillPackage(input.repositorySkill);
@@ -355,13 +360,9 @@ export function resolveLoopInvocation(request) {
     : { mode: "fresh", nativeSessionId: null };
 }
 
-export function loopPrompt(request, { repositorySkillRoot = null } = {}) {
+export function loopPrompt(request) {
   const prefix = request.agent === "claude" ? "/" : "$";
-  let entry = `${prefix}${request.skill}`;
-  if (request.repositorySkill && request.agent === "opencode") {
-    const root = repositorySkillRoot ?? join(repositorySkillDiscoveryRoot(request.agent), request.repositorySkill.invocation);
-    entry += `\n\n${skillBody(readFileSync(join(root, "SKILL.md"), "utf8"))}`;
-  }
+  const entry = `${prefix}${request.skill}`;
   return `${entry}\n\n` +
     `This is one fenced OpenThrottle loop action (${request.actionId}) for ${request.role}/${request.loop}. ` +
     `Edit only the provided worktree when one is present. Do not commit, push, or alter executor state. ` +
@@ -387,15 +388,27 @@ function retryableInfrastructureError(message) {
   return error;
 }
 
+function lockExecutorOwnedSkillTree(path) {
+  if (!existsSync(path)) return;
+  if (isRoot()) chownTree(path, ROOT_UID, ROOT_GID);
+  chmodReadOnlyPreservingExecuteTree(path);
+}
+
+function profileRootIdentity(path) {
+  const metadata = lstatSync(path);
+  return { dev: metadata.dev, ino: metadata.ino };
+}
+
 function prepareActionHomeEnvironment(request) {
   const currentActionDirectory = actionDirectory(request);
   const home = pathInside(currentActionDirectory, "home");
-  prepareAgentOwnedDirectory(home);
+  resetAgentOwnedDirectory(home);
   const env = [`HOME=${home}`];
   let nativeSessionProfileRoot = home;
   if (request.agent === "claude") {
     const profileRoot = pathInside(home, ".claude");
     materializeClaudeProfileBaseline({ destinationHome: profileRoot });
+    lockExecutorOwnedSkillTree(pathInside(profileRoot, "skills"));
     materializeNativeSessionState({ request, profileRoot });
     prepareAgentOwnedDirectory(nativeSessionStoragePath(request.agent, profileRoot));
     prepareExecutorOwnedProfileRoot(profileRoot);
@@ -403,7 +416,7 @@ function prepareActionHomeEnvironment(request) {
   }
   if (request.agent === "codex") {
     const codexHome = pathInside(currentActionDirectory, "codex");
-    prepareAgentOwnedDirectory(codexHome);
+    resetAgentOwnedDirectory(codexHome);
     materializeCodexProfileBaseline({ destinationHome: codexHome });
     materializeNativeSessionState({ request, profileRoot: codexHome });
     prepareAgentOwnedDirectory(nativeSessionStoragePath(request.agent, codexHome));
@@ -411,10 +424,11 @@ function prepareActionHomeEnvironment(request) {
     env.push(`CODEX_HOME=${codexHome}`);
     nativeSessionProfileRoot = codexHome;
   }
-  if (request.agent === "opencode") {
-    materializeNativeSessionState({ request, profileRoot: home });
-  }
-  return { env, nativeSessionProfileRoot };
+  return {
+    env,
+    nativeSessionProfileRoot,
+    nativeSessionProfileRootIdentity: profileRootIdentity(nativeSessionProfileRoot),
+  };
 }
 
 function prepareLoopTransportEnvironment(request) {
@@ -424,7 +438,7 @@ function prepareLoopTransportEnvironment(request) {
   const processedInbox = pathInside(currentActionDirectory, "inbox-processed");
   const nativeSessionRoot = pathInside(currentActionDirectory, "native-session");
   for (const directory of [outbox, inbox, processedInbox, nativeSessionRoot]) {
-    prepareAgentOwnedDirectory(directory);
+    resetAgentOwnedDirectory(directory);
   }
   return [
     `OT_OUTBOX_DIR=${outbox}`,
@@ -437,8 +451,7 @@ function prepareLoopTransportEnvironment(request) {
 function loopSkillDiscoveryRoot(request, actionRoot = configuredActionRoot()) {
   const currentActionDirectory = actionDirectory(request, actionRoot);
   if (request.agent === "codex") return pathInside(pathInside(currentActionDirectory, "codex"), "skills");
-  if (request.agent === "claude") return pathInside(pathInside(pathInside(currentActionDirectory, "home"), ".claude"), "skills");
-  return pathInside(currentActionDirectory, "opencode-skills");
+  return pathInside(pathInside(pathInside(currentActionDirectory, "home"), ".claude"), "skills");
 }
 
 function prepareLoopAgentEnvironment(request, repoDir) {
@@ -447,26 +460,19 @@ function prepareLoopAgentEnvironment(request, repoDir) {
   const homeEnv = prepareActionHomeEnvironment(request);
   const repositoryViewGitEnv = request.worktree ? [] : gitSafeDirectoryEnv(repoDir);
   const env = ["USER=agent", "GIT_OPTIONAL_LOCKS=0", ...repositoryViewGitEnv, ...gitObjectEnv.env, ...transportEnv, ...homeEnv.env];
-  if (!request.repositorySkill) {
-    return {
-      env,
-      repositorySkillRoot: null,
-      gitObjectEnv: gitObjectEnv.values,
-      nativeSessionProfileRoot: homeEnv.nativeSessionProfileRoot,
-    };
+  if (request.repositorySkill) {
+    materializeRepositorySkillPackage({
+      packageInfo: request.repositorySkill,
+      repoDir,
+      agent: request.agent,
+      discoveryRoot: loopSkillDiscoveryRoot(request),
+    });
   }
-  const discoveryRoot = loopSkillDiscoveryRoot(request);
-  const repositorySkillRoot = materializeRepositorySkillPackage({
-    packageInfo: request.repositorySkill,
-    repoDir,
-    agent: request.agent,
-    discoveryRoot,
-  });
   return {
     env,
-    repositorySkillRoot,
     gitObjectEnv: gitObjectEnv.values,
     nativeSessionProfileRoot: homeEnv.nativeSessionProfileRoot,
+    nativeSessionProfileRootIdentity: homeEnv.nativeSessionProfileRootIdentity,
   };
 }
 
@@ -565,7 +571,7 @@ function createReadOnlyRepositoryView(request, sourceRepoDir = "/home/agent/repo
   }
   runRootGit(destination, ["config", "remote.origin.url", "DISABLED_BY_OPENTHROTTLE_READONLY_VIEW"]);
   runRootGit(destination, ["config", "remote.origin.pushurl", "DISABLED_BY_OPENTHROTTLE_READONLY_VIEW"]);
-  chmodTree(destination, { fileMode: 0o444, directoryMode: 0o555 });
+  chmodReadOnlyPreservingExecuteTree(destination);
   return destination;
 }
 
@@ -651,8 +657,8 @@ function makeCurrentActionDirectoryTraverseOnly(request) {
   ensureCurrentActionTraversal(request);
 }
 
-export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDirectory(request) ?? "/home/agent/repo", repositorySkillRoot = null }) {
-  const prompt = loopPrompt(request, { repositorySkillRoot });
+export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDirectory(request) ?? "/home/agent/repo" }) {
+  const prompt = loopPrompt(request);
   if (request.agent === "codex") {
     return {
       repoDir,
@@ -661,18 +667,15 @@ export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDi
       input: invocation.mode !== "resume" ? prompt : undefined,
     };
   }
-  if (request.agent === "claude") {
-    return {
-      repoDir,
-      command: "claude",
-      args: ["-p", ...(invocation.mode === "resume" ? ["--resume", invocation.nativeSessionId] : []), prompt, "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"],
-      input: undefined,
-    };
-  }
   return {
     repoDir,
-    command: "opencode",
-    args: ["run", "--format", "json", "--dir", repoDir, "--auto", ...(invocation.mode === "resume" ? ["--session", invocation.nativeSessionId] : []), prompt],
+    command: "claude",
+    args: [
+      "-p", ...(invocation.mode === "resume" ? ["--resume", invocation.nativeSessionId] : []), prompt,
+      "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions",
+      "--plugin-dir", "/opt/openthrottle/compound-engineering-marketplace",
+      "--setting-sources", "user",
+    ],
     input: undefined,
   };
 }
@@ -700,7 +703,7 @@ export function runLoopAgentInPreparedRepository({
     }
     const repoDir = prepareLoopRepository(request, integrationRepoDir);
     const preparedEnvironment = prepareLoopAgentEnvironment(request, repoDir);
-    const built = loopAgentCommand({ request, invocation, repoDir, repositorySkillRoot: preparedEnvironment.repositorySkillRoot });
+    const built = loopAgentCommand({ request, invocation, repoDir });
     makeCurrentActionDirectoryTraverseOnly(request);
     const result = processFence(() => runProcess("gosu", [
       "agent", "env", ...preparedEnvironment.env, built.command, ...built.args,
@@ -714,6 +717,11 @@ export function runLoopAgentInPreparedRepository({
       throw new Error("reported native session id does not match the sealed loop request");
     }
     const nativeSessionId = request.nativeSessionId ?? reportedNativeSessionId;
+    const currentProfileRootIdentity = profileRootIdentity(preparedEnvironment.nativeSessionProfileRoot);
+    if (currentProfileRootIdentity.dev !== preparedEnvironment.nativeSessionProfileRootIdentity.dev ||
+        currentProfileRootIdentity.ino !== preparedEnvironment.nativeSessionProfileRootIdentity.ino) {
+      throw new Error("native session profile root was replaced during the action");
+    }
     const sealedNativeSessionPackage = sealNativeSessionPackage({
       agent: request.agent,
       nativeSessionId,
@@ -737,16 +745,24 @@ export function runLoopAgentInPreparedRepository({
     } catch (error) {
       cleanupErrors.push(error instanceof Error ? error.message : String(error));
     }
-    try {
-      restorePersistentProfiles(lockedPersistentProfiles);
-    } catch (error) {
-      cleanupErrors.push(error instanceof Error ? error.message : String(error));
+    // While agent process termination is unconfirmed, restoring profile access
+    // would hand executor-locked state back to processes that may still run.
+    if (!bodyError?.processTerminationUnconfirmed) {
+      try {
+        restorePersistentProfiles(lockedPersistentProfiles);
+      } catch (error) {
+        cleanupErrors.push(error instanceof Error ? error.message : String(error));
+      }
     }
     if (cleanupErrors.length > 0) {
       const prefix = bodyError
         ? `loop action failed (${bodyError instanceof Error ? bodyError.message : String(bodyError)}) and cleanup failed`
         : "loop action cleanup failed";
-      throw retryableInfrastructureError(`${prefix}: ${cleanupErrors.join("; ")}`);
+      const compounded = retryableInfrastructureError(`${prefix}: ${cleanupErrors.join("; ")}`);
+      // The compounded error must not launder an unconfirmed-termination body
+      // error into one that lets executeLoopAction restore agent access.
+      if (bodyError?.processTerminationUnconfirmed) compounded.processTerminationUnconfirmed = true;
+      throw compounded;
     }
   }
 }
@@ -838,6 +854,7 @@ export function executeLoopAction({
         nativeSessionId: request.nativeSessionId,
         integrationRepoDir,
         retryableInfrastructureFailure: Boolean(error?.retryableInfrastructureFailure),
+        processTerminationUnconfirmed: Boolean(error?.processTerminationUnconfirmed),
       };
     }
     const worktreeDir = loopWorktreeDirectory(request);
@@ -883,7 +900,11 @@ export function executeLoopAction({
     const cleanups = [
       () => lockWorkerWorktree(request),
       () => lockActionDirectory(request),
-      () => restoreIntegration(execution?.integrationRepoDir ?? integrationRepoDir),
+      // Restoring agent access to the integration checkout is unsafe while
+      // agent process termination is unconfirmed; keep it executor-locked.
+      ...(execution?.processTerminationUnconfirmed
+        ? []
+        : [() => restoreIntegration(execution?.integrationRepoDir ?? integrationRepoDir)]),
     ];
     for (const cleanup of cleanups) {
       try {

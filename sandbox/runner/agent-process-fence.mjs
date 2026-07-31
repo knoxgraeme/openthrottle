@@ -56,13 +56,28 @@ function convergeAgentProcessesToEmpty() {
   throw new Error("agent process cleanup did not converge to empty");
 }
 
+function unconfirmedTerminationError(error) {
+  const wrapped = error instanceof Error ? error : new Error(String(error));
+  wrapped.retryableInfrastructureFailure = true;
+  wrapped.processTerminationUnconfirmed = true;
+  return wrapped;
+}
+
 export function runWithAgentProcessFence(execute, terminate = convergeAgentProcessesToEmpty) {
-  terminate();
+  try {
+    terminate();
+  } catch (error) {
+    throw unconfirmedTerminationError(error);
+  }
   try {
     return execute();
   } finally {
     // Executor-owned evidence must not be collected while escaped agent
     // processes can still mutate the repository or action-local state.
-    terminate();
+    try {
+      terminate();
+    } catch (error) {
+      throw unconfirmedTerminationError(error);
+    }
   }
 }

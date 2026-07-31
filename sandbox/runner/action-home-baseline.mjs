@@ -11,6 +11,18 @@ const CODEX_BASELINE_FILES = [
 const TRUSTED_CODEX_BASELINE = "/opt/openthrottle/action-home-baseline/codex";
 const TRUSTED_CLAUDE_BASELINE = "/opt/openthrottle/action-home-baseline/claude";
 
+// A stale agent-created symlink at the destination would redirect the copy to
+// an external target; remove it instead of following it.
+function removeSymbolicDestination(destination) {
+  let metadata;
+  try {
+    metadata = lstatSync(destination);
+  } catch {
+    return;
+  }
+  if (metadata.isSymbolicLink()) rmSync(destination, { force: true });
+}
+
 function copyBaselineFile(sourceRoot, destinationRoot, relativePath) {
   const source = resolve(sourceRoot, relativePath);
   if (!existsSync(source)) return false;
@@ -18,7 +30,9 @@ function copyBaselineFile(sourceRoot, destinationRoot, relativePath) {
   if (!metadata.isFile() || metadata.isSymbolicLink()) return false;
   if (!trustedBaselineEntry(metadata)) return false;
   const destination = resolve(destinationRoot, relativePath);
+  removeSymbolicDestination(dirname(destination));
   mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
+  removeSymbolicDestination(destination);
   copyFileSync(source, destination);
   return true;
 }
@@ -32,12 +46,15 @@ function copyTrustedDirectory(source, destination) {
   if (metadata.isSymbolicLink()) return false;
   if (metadata.isFile()) {
     if (!trustedBaselineEntry(metadata)) return false;
+    removeSymbolicDestination(dirname(destination));
     mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
+    removeSymbolicDestination(destination);
     copyFileSync(source, destination);
     return true;
   }
   if (!metadata.isDirectory()) return false;
   if (!trustedBaselineEntry(metadata)) return false;
+  removeSymbolicDestination(destination);
   mkdirSync(destination, { recursive: true, mode: 0o700 });
   for (const entry of readdirSync(source)) {
     if (!copyTrustedDirectory(join(source, entry), join(destination, entry))) {

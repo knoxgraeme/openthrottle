@@ -368,19 +368,39 @@ describe("loop action request validation", () => {
   });
 
   it("passes native session IDs to every resumable engine adapter", () => {
-    for (const agent of ["claude", "codex", "opencode"]) {
+    for (const agent of ["claude", "codex"]) {
       const valid = validateLoopRequest(request({
         agent,
         nativeSessionId: "native-1",
         contextPolicy: "resume_required",
       }));
       const built = loopAgentCommand({ request: valid, invocation: resolveLoopInvocation(valid) });
-      expect(built.args).toContain(agent === "claude" ? "--resume" : agent === "codex" ? "resume" : "--session");
+      expect(built.args).toContain(agent === "claude" ? "--resume" : "resume");
       expect(built.args).toContain("native-1");
       if (agent === "codex") {
-        expect(built.args.at(-1)).toBe(loopPrompt(valid, { repositorySkillRoot: null }));
+        expect(built.args.at(-1)).toBe(loopPrompt(valid));
         expect(built.input).toBeUndefined();
       }
+    }
+  });
+
+  it("rejects opencode loop actions until their session-store contract lands", () => {
+    expect(() => validateLoopRequest(request({ agent: "opencode" })))
+      .toThrow(/opencode loop actions are not supported/);
+  });
+
+  it("delivers the pinned Compound Engineering plugin to Claude loop actions", () => {
+    const fresh = validateLoopRequest(request({ agent: "claude" }));
+    const resumed = validateLoopRequest(request({
+      agent: "claude",
+      nativeSessionId: "native-1",
+      contextPolicy: "resume_required",
+    }));
+    for (const valid of [fresh, resumed]) {
+      const built = loopAgentCommand({ request: valid, invocation: resolveLoopInvocation(valid) });
+      const args = built.args.join("\n");
+      expect(args).toContain("--plugin-dir\n/opt/openthrottle/compound-engineering-marketplace");
+      expect(args).toContain("--setting-sources\nuser");
     }
   });
 
@@ -388,7 +408,7 @@ describe("loop action request validation", () => {
     const valid = validateLoopRequest(request({ agent: "codex" }));
     const built = loopAgentCommand({ request: valid, invocation: resolveLoopInvocation(valid) });
     expect(built.args.at(-1)).toBe("-");
-    expect(built.input).toBe(loopPrompt(valid, { repositorySkillRoot: null }));
+    expect(built.input).toBe(loopPrompt(valid));
   });
 
   it("keeps the integration checkout locked around worker execution", () => {
@@ -453,6 +473,181 @@ describe("loop action request validation", () => {
       `lock-integration:${integrationRepoDir}`,
       "restore-persistent-profiles:/home/agent/.codex",
     ]);
+  });
+
+  it("resets stale replayed action surfaces before the agent runs", () => {
+    const valid = validateLoopRequest(request());
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+    directories.push(actionRoot);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+    const actionDirectory = join(actionRoot, valid.attemptId, valid.actionId);
+    const staleOutboxFile = join(actionDirectory, "outbox", "stale-receipt.json");
+    const staleHomeFile = join(actionDirectory, "home", "stale-profile.txt");
+    mkdirSync(join(actionDirectory, "outbox"), { recursive: true });
+    mkdirSync(join(actionDirectory, "home"), { recursive: true });
+    writeFileSync(staleOutboxFile, "stale\n");
+    writeFileSync(staleHomeFile, "stale\n");
+
+    runLoopAgentInPreparedRepository({
+      request: valid,
+      invocation: resolveLoopInvocation(valid),
+      integrationRepoDir: "/tmp/integration",
+      lockIntegration: () => true,
+      processFence: (execute) => execute(),
+      runProcess: () => {
+        expect(existsSync(staleOutboxFile)).toBe(false);
+        expect(existsSync(staleHomeFile)).toBe(false);
+        return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+      },
+    });
+  });
+
+  it("keeps executor locks in place while agent process termination is unconfirmed", () => {
+    const valid = validateLoopRequest(request());
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+    directories.push(actionRoot);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+    const events = [];
+
+    const result = executeLoopAction({
+      request: valid,
+      integrationRepoDir: "/tmp/integration",
+      runLoopAgent: () => {
+        const error = new Error("agent process cleanup did not converge to empty");
+        error.retryableInfrastructureFailure = true;
+        error.processTerminationUnconfirmed = true;
+        throw error;
+      },
+      lockWorkerWorktree: () => events.push("lock-worktree"),
+      lockActionDirectory: () => events.push("lock-action"),
+      restoreIntegration: () => events.push("restore-integration"),
+    });
+
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+    expect(events).toEqual(["lock-worktree", "lock-action"]);
+  });
+
+  it("does not restore persistent profiles while agent termination is unconfirmed", () => {
+    const valid = validateLoopRequest(request());
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+    directories.push(actionRoot);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+    const events = [];
+
+    expect(() => runLoopAgentInPreparedRepository({
+      request: valid,
+      invocation: resolveLoopInvocation(valid),
+      integrationRepoDir: "/tmp/integration",
+      lockIntegration: () => events.push("lock-integration"),
+      lockPersistentProfiles: () => {
+        events.push("lock-profiles");
+        return ["/home/agent/.codex"];
+      },
+      restorePersistentProfiles: () => events.push("restore-profiles"),
+      processFence: () => {
+        const error = new Error("agent process cleanup did not converge to empty");
+        error.retryableInfrastructureFailure = true;
+        error.processTerminationUnconfirmed = true;
+        throw error;
+      },
+      runProcess: () => ({ status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" }),
+    })).toThrow(/did not converge/);
+
+    expect(events).toEqual(["lock-integration", "lock-profiles", "lock-integration"]);
+  });
+
+  it("keeps unconfirmed termination marked when cleanup also fails", () => {
+    const valid = validateLoopRequest(request());
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+    directories.push(actionRoot);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+    let lockCalls = 0;
+    let error;
+
+    try {
+      runLoopAgentInPreparedRepository({
+        request: valid,
+        invocation: resolveLoopInvocation(valid),
+        integrationRepoDir: "/tmp/integration",
+        lockIntegration: () => {
+          lockCalls += 1;
+          if (lockCalls > 1) throw new Error("relock failed");
+          return true;
+        },
+        processFence: () => {
+          const fenceError = new Error("agent process cleanup did not converge to empty");
+          fenceError.retryableInfrastructureFailure = true;
+          fenceError.processTerminationUnconfirmed = true;
+          throw fenceError;
+        },
+        runProcess: () => ({ status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" }),
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error?.message).toMatch(/did not converge.*relock failed/s);
+    expect(error?.retryableInfrastructureFailure).toBe(true);
+    expect(error?.processTerminationUnconfirmed).toBe(true);
+  });
+
+  it("rejects sealing when the native session profile root was replaced during the action", () => {
+    const valid = validateLoopRequest(request({ agent: "claude" }));
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+    directories.push(actionRoot);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+    const profileRoot = join(actionRoot, valid.attemptId, valid.actionId, "home", ".claude");
+
+    expect(() => runLoopAgentInPreparedRepository({
+      request: valid,
+      invocation: resolveLoopInvocation(valid),
+      integrationRepoDir: "/tmp/integration",
+      lockIntegration: () => true,
+      processFence: (execute) => execute(),
+      runProcess: () => {
+        rmSync(profileRoot, { recursive: true, force: true });
+        mkdirSync(profileRoot, { recursive: true });
+        return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+      },
+    })).toThrow(/profile root was replaced/);
+  });
+
+  it("preserves tracked executable bits in read-only repository views", () => {
+    const integrationRepoDir = repository();
+    writeFileSync(join(integrationRepoDir, "run.sh"), "#!/bin/sh\n", { mode: 0o755 });
+    chmodSync(join(integrationRepoDir, "run.sh"), 0o755);
+    execFileSync("git", ["add", "run.sh"], { cwd: integrationRepoDir });
+    execFileSync("git", ["commit", "-qm", "executable"], { cwd: integrationRepoDir });
+    const candidateSubject = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: integrationRepoDir,
+      encoding: "utf8",
+    }).trim();
+    const valid = validateLoopRequest(request({
+      role: "lead",
+      loop: "lead",
+      worktree: null,
+      candidateSubject,
+      credentialScopes: ["repo.read"],
+    }));
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+    directories.push(actionRoot);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+
+    runLoopAgentInPreparedRepository({
+      request: valid,
+      invocation: resolveLoopInvocation(valid),
+      integrationRepoDir,
+      lockIntegration: () => true,
+      processFence: (execute) => execute(),
+      runProcess: (command, args, options) => {
+        const view = options.cwd;
+        expect(statSync(join(view, "run.sh")).mode & 0o111).not.toBe(0);
+        expect(statSync(join(view, "file.txt")).mode & 0o777).toBe(0o444);
+        const status = execFileSync("git", ["-c", `safe.directory=${view}`, "-C", view, "status", "--porcelain"], { encoding: "utf8" });
+        expect(status.trim()).toBe("");
+        return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+      },
+    });
   });
 
   it("locks sibling action directories under the configured action root", () => {
@@ -599,7 +794,7 @@ describe("loop action request validation", () => {
   });
 
   it("materializes only the current sealed repository skill under the action discovery root", () => {
-    for (const agent of ["claude", "codex", "opencode"]) {
+    for (const agent of ["claude", "codex"]) {
       const baseRequest = repositorySkillRequest();
       const valid = withFreshLoopFence(baseRequest, { agent });
       const actionRoot = mkdtempSync(join(tmpdir(), `ot-loop-actions-${agent}-`));
@@ -624,15 +819,12 @@ describe("loop action request validation", () => {
           expect(args).toContain(`HOME=${home}`);
           const skillRoot = agent === "claude"
             ? join(home, ".claude", "skills", valid.repositorySkill.invocation)
-            : agent === "codex"
-              ? join(codexHome, "skills", valid.repositorySkill.invocation)
-              : join(actionDirectory, "opencode-skills", valid.repositorySkill.invocation);
+            : join(codexHome, "skills", valid.repositorySkill.invocation);
           if (agent === "codex") expect(args).toContain(`CODEX_HOME=${codexHome}`);
           if (agent !== "codex") expect(args.some((entry) => entry.startsWith("CODEX_HOME="))).toBe(false);
           expect(readFileSync(join(skillRoot, "SKILL.md"), "utf8")).toContain("pinned repository package");
           expect(statSync(skillRoot).mode & 0o777).toBe(0o555);
           expect(existsSync(join(codexHome, "auth.json"))).toBe(false);
-          if (agent === "opencode") expect(args.join("\n")).toContain("pinned repository package");
           return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
         },
       });

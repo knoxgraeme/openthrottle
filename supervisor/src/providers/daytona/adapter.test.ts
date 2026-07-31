@@ -210,6 +210,23 @@ describe("Daytona stage execution", () => {
       expect.anything()
     );
 
+    const loopWithOpencodeAgent = {
+      ...loopWithoutFence,
+      actionId: "loop-opencode",
+      agent: "opencode" as const,
+    };
+    const {
+      requestHash: _opencodeRequestHash,
+      idempotencyKey: _opencodeIdempotencyKey,
+      ...canonicalOpencode
+    } = loopWithOpencodeAgent;
+    const opencodeHash = digestNormalized(canonicalJson(canonicalOpencode));
+    await expect(runtime.dispatchLoopAction(resource, {
+      ...loopWithOpencodeAgent,
+      requestHash: opencodeHash,
+      idempotencyKey: `loop:attempt-child:loop-opencode:${opencodeHash}`,
+    })).rejects.toThrow(/opencode loop actions are not supported/);
+
     const loopWithNullCandidateSubject = {
       ...loopWithoutFence,
       actionId: "loop-null-candidate",

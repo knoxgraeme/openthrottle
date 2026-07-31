@@ -82,6 +82,11 @@ function assertStageRequestFence(request: StageRequestEnvelope): void {
 function assertLoopRequestFence(request: LoopActionRequest): void {
   safeStagePathId(request.actionId, "loop action ID");
   safeStagePathId(request.attemptId, "loop attempt ID");
+  if (request.agent === "opencode") {
+    // The sandbox rejects OpenCode loop actions until database-backed session
+    // sealing lands; fail closed before dispatch rather than in-sandbox.
+    throw new Error("opencode loop actions are not supported yet");
+  }
   const expectedHash = digestNormalized(canonicalJson(normalizedLoopRequestForHash(request)));
   const expectedKey = `loop:${request.attemptId}:${request.actionId}:${expectedHash}`;
   if (request.requestHash !== expectedHash || request.idempotencyKey !== expectedKey) {

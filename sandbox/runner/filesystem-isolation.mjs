@@ -81,6 +81,26 @@ export function prepareAgentOwnedDirectory(path) {
   chmodTree(path, { fileMode: 0o600, directoryMode: 0o700 });
 }
 
+// Replayed actions must not inherit prior-attempt agent state: stale content
+// would be re-chowned to the agent by prepareAgentOwnedDirectory.
+export function resetAgentOwnedDirectory(path) {
+  rmSync(path, { recursive: true, force: true });
+  prepareAgentOwnedDirectory(path);
+}
+
+// Read-only views must keep tracked executable bits or the checkout shows
+// filemode modifications and stops being Git-clean.
+export function chmodReadOnlyPreservingExecuteTree(path) {
+  const metadata = lstatSync(path);
+  if (metadata.isSymbolicLink()) return;
+  if (metadata.isDirectory()) {
+    chmodSync(path, 0o555);
+    for (const entry of readdirSync(path)) chmodReadOnlyPreservingExecuteTree(resolve(path, entry));
+    return;
+  }
+  chmodSync(path, (metadata.mode & 0o111) === 0 ? 0o444 : 0o555);
+}
+
 export function lockPersistentAgentPrivateRoots(paths = PERSISTENT_AGENT_PRIVATE_ROOTS) {
   if (!isRoot()) return [];
   const locked = new Map();

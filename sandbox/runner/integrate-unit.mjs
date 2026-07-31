@@ -33,6 +33,14 @@ export function integrateCandidate({
     const candidate = commit(candidateCommit, "candidateCommit");
     if (!clean(repoDir)) throw new Error("integration checkout must be clean");
     const head = runGitAsExecutor(repoDir, ["rev-parse", "HEAD"]);
+    if (head === candidate && head !== expected) {
+      // Exact replay after the fast-forward already happened (for example a
+      // post-integration cleanup failure): accept only the exact candidate
+      // head that descends from the expected head; any other drift fails.
+      const replayBase = runGitAsExecutor(repoDir, ["merge-base", expected, candidate]);
+      if (replayBase !== expected) throw new Error("integrated head is not a descendant of the expected head");
+      return receipt({ repoDir, expected, candidate, integrated: false, reason: "already_integrated_exact_head" });
+    }
     if (head !== expected) throw new Error("integration checkout HEAD does not match expected head");
     const currentTree = treeOf(repoDir, head);
     const candidateTree = treeOf(repoDir, candidate);

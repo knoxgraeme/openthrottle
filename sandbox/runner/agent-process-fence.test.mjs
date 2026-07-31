@@ -29,4 +29,37 @@ describe("agent process fence", () => {
 
     expect(events).toEqual(["converge", "execute", "converge"]);
   });
+
+  it("marks pre-action convergence failures as retryable with unconfirmed termination", () => {
+    let error;
+    try {
+      runWithAgentProcessFence(() => "ok", () => {
+        throw new Error("convergence failed");
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error?.message).toMatch(/convergence failed/);
+    expect(error?.retryableInfrastructureFailure).toBe(true);
+    expect(error?.processTerminationUnconfirmed).toBe(true);
+  });
+
+  it("marks post-action convergence failures even when the body succeeded", () => {
+    let calls = 0;
+    let error;
+    try {
+      runWithAgentProcessFence(() => "ok", () => {
+        calls += 1;
+        if (calls > 1) throw new Error("post convergence failed");
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(calls).toBe(2);
+    expect(error?.message).toMatch(/post convergence failed/);
+    expect(error?.retryableInfrastructureFailure).toBe(true);
+    expect(error?.processTerminationUnconfirmed).toBe(true);
+  });
 });

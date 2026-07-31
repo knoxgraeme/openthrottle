@@ -270,13 +270,15 @@ action-local repository-skill proposal before invoking the engine, so stale
 agent output cannot satisfy the receipt/proposal fence.
 
 Native session continuation is materialized only from the exact sealed
-executor-owned package selected by the request. Claude, Codex, and OpenCode
-packages must contain engine-native durable records for the selected session id,
-must be bounded regular files with normalized digests, and are replaced through a
+executor-owned package selected by the request. Claude and Codex packages must
+contain engine-native durable records for the selected session id, must be
+bounded regular files with normalized digests, and are replaced through a
 validated sibling staging directory plus atomic swap so the last resumable
-package survives any failed replacement. The OpenCode store is the
-database-backed profile path selected by the installed OpenCode version, sealed
-and resumed through the same package contract.
+package survives any failed replacement. OpenCode loop actions are not
+supported: OpenCode's database-backed session store and built-in adapter body
+delivery are deferred to a later slice, and both the supervisor loop dispatch
+and the sandbox loop validator reject `agent: opencode` fail-closed. OpenCode
+stage execution is unaffected.
 
 Repository skills remain sourced from committed repository paths selected by
 admission, not from ticket text. The sandbox materializes only the sealed
