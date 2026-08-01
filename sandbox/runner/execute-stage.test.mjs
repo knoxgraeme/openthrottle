@@ -919,7 +919,7 @@ JSON
     writeExecutable(join(binDir, "claude"), `#!/usr/bin/env bash
 set -euo pipefail
 mkdir -p "$HOME/.claude/projects"
-printf '{"type":"system","subtype":"init","session_id":"smoke-claude-session","model":"stub"}\\n' > "$HOME/.claude/projects/smoke-claude-session.jsonl"
+printf '{"type":"user","sessionId":"smoke-claude-session","message":{"role":"user","content":"x"}}\\n' > "$HOME/.claude/projects/smoke-claude-session.jsonl"
 cat > "$OT_STAGE_PROPOSAL_FILE" <<'JSON'
 {"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"ok","evidence":["session sealed"],"findings":[],"actions":[],"uncertainty":[]}
 JSON
@@ -938,7 +938,7 @@ printf '{"type":"system","subtype":"init","session_id":"smoke-claude-session","m
       expect(readFileSync(
         join(sourceRoot, "claude", "smoke-claude-session", "projects", "smoke-claude-session.jsonl"),
         "utf8",
-      )).toContain('"session_id":"smoke-claude-session"');
+      )).toContain('"sessionId":"smoke-claude-session"');
     });
   });
 
@@ -960,7 +960,7 @@ printf '{"type":"system","subtype":"init","session_id":"smoke-claude-session","m
     mkdirSync(unrelatedSessionStore, { recursive: true });
     writeFileSync(
       join(unrelatedSessionStore, "unrelated-claude-session.jsonl"),
-      '{"type":"system","subtype":"init","session_id":"unrelated-claude-session","model":"stub"}\n',
+      '{"type":"user","sessionId":"unrelated-claude-session","message":{"role":"user","content":"x"}}\n',
     );
     sealNativeSessionPackage({
       agent: "claude",
@@ -974,7 +974,7 @@ printf '{"type":"system","subtype":"init","session_id":"smoke-claude-session","m
     writeExecutable(join(binDir, "claude"), `#!/usr/bin/env bash
 set -euo pipefail
 mkdir -p "$HOME/.claude/projects"
-printf '{"type":"system","subtype":"init","session_id":"unrelated-claude-session","model":"stub"}\\n' > "$HOME/.claude/projects/unrelated-claude-session.jsonl"
+printf '{"type":"user","sessionId":"unrelated-claude-session","message":{"role":"user","content":"x"}}\\n' > "$HOME/.claude/projects/unrelated-claude-session.jsonl"
 cat > "$OT_STAGE_PROPOSAL_FILE" <<'JSON'
 {"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"ok","evidence":["session reported"],"findings":[],"actions":[],"uncertainty":[]}
 JSON
