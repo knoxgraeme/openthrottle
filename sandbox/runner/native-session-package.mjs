@@ -87,8 +87,11 @@ function nativeSessionIdFromEvent(event, agent) {
 }
 
 function nativeSessionIdFromDurableRecord(record, agent) {
-  if (agent === "claude" && record.type === "system") {
-    return record.session_id ?? record.sessionId ?? null;
+  if (agent === "claude") {
+    // Claude durable transcripts (~/.claude/projects/<slug>/<id>.jsonl) carry
+    // no type:"system" records; every line carries a top-level camelCase
+    // sessionId regardless of record type. type:"system" is stdout-only.
+    return record.sessionId ?? record.session_id ?? null;
   }
   if (agent === "codex" && record.type === "session_meta") {
     return record.payload?.id ?? null;

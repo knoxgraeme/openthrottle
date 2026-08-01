@@ -160,7 +160,7 @@ function sessionEventFixture(agent, nativeSessionId) {
 }
 
 function sessionStorageFixture(agent, nativeSessionId) {
-  if (agent === "claude") return `{"type":"system","session_id":"${nativeSessionId}"}\n`;
+  if (agent === "claude") return `{"type":"user","sessionId":"${nativeSessionId}","message":{"role":"user","content":"x"}}\n`;
   if (agent === "codex") return `{"type":"session_meta","payload":{"id":"${nativeSessionId}"}}\n`;
   return `{"type":"step_start","sessionID":"${nativeSessionId}"}\n`;
 }
@@ -1094,7 +1094,7 @@ describe("loop action request validation", () => {
     const opencodeStore = nativeSessionStoragePath("opencode", opencodeProfile);
     mkdirSync(claudeStore, { recursive: true });
     mkdirSync(opencodeStore, { recursive: true });
-    writeFileSync(join(claudeStore, "current.jsonl"), "{\"type\":\"tool_result\",\"session_id\":\"native-claude\"}\n");
+    writeFileSync(join(claudeStore, "current.jsonl"), "{\"type\":\"tool_result\",\"details\":{\"sessionId\":\"native-claude\"}}\n");
     writeFileSync(join(opencodeStore, "current.jsonl"), "{\"type\":\"tool_result\",\"sessionID\":\"native-opencode\"}\n");
 
     expect(() => sealNativeSessionPackage({
@@ -1150,7 +1150,7 @@ describe("loop action request validation", () => {
       {
         agent: "claude",
         nativeSessionId: "native-claude",
-        event: "{\"type\":\"system\",\"session_id\":\"native-claude\"}\n",
+        event: "{\"type\":\"user\",\"sessionId\":\"native-claude\",\"message\":{\"role\":\"user\",\"content\":\"x\"}}\n",
       },
       {
         agent: "codex",
@@ -1178,6 +1178,56 @@ describe("loop action request validation", () => {
         sourceRoot: sessionRoot,
       })).toBe(join(sessionRoot, fixture.agent, fixture.nativeSessionId));
     }
+  });
+
+  it("seals real Claude durable transcripts that carry sessionId without any system records", () => {
+    const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
+    const profileRoot = mkdtempSync(join(tmpdir(), "ot-loop-claude-real-profile-"));
+    directories.push(sessionRoot, profileRoot);
+    const sessionStore = nativeSessionStoragePath("claude", profileRoot);
+    const projectDir = join(sessionStore, "-home-agent-repo");
+    mkdirSync(projectDir, { recursive: true });
+    // Observed Claude CLI 2.1.201 durable transcript shape: no type:"system"
+    // lines; every record carries a top-level camelCase sessionId.
+    writeFileSync(join(projectDir, "native-claude-real.jsonl"), [
+      "{\"type\":\"user\",\"sessionId\":\"native-claude-real\",\"message\":{\"role\":\"user\",\"content\":\"x\"}}",
+      "{\"type\":\"assistant\",\"sessionId\":\"native-claude-real\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}",
+      "{\"type\":\"attachment\",\"sessionId\":\"native-claude-real\",\"attachment\":{\"name\":\"a.txt\"}}",
+      "{\"type\":\"skill_listing\",\"sessionId\":\"native-claude-real\",\"skills\":[]}",
+      "",
+    ].join("\n"));
+
+    const sealed = sealNativeSessionPackage({
+      agent: "claude",
+      nativeSessionId: "native-claude-real",
+      profileRoot,
+      sourceRoot: sessionRoot,
+    });
+
+    expect(sealed).toBe(join(sessionRoot, "claude", "native-claude-real"));
+    const manifest = JSON.parse(readFileSync(join(sealed, "openthrottle-native-session.json"), "utf8"));
+    expect(manifest.agent).toBe("claude");
+    expect(manifest.nativeSessionId).toBe("native-claude-real");
+  });
+
+  it("rejects real-shaped Claude transcripts that carry only a different sessionId", () => {
+    const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
+    const profileRoot = mkdtempSync(join(tmpdir(), "ot-loop-claude-other-profile-"));
+    directories.push(sessionRoot, profileRoot);
+    const sessionStore = nativeSessionStoragePath("claude", profileRoot);
+    mkdirSync(sessionStore, { recursive: true });
+    writeFileSync(join(sessionStore, "native-claude-other.jsonl"), [
+      "{\"type\":\"user\",\"sessionId\":\"native-claude-other\",\"message\":{\"role\":\"user\",\"content\":\"x\"}}",
+      "{\"type\":\"assistant\",\"sessionId\":\"native-claude-other\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}",
+      "",
+    ].join("\n"));
+
+    expect(() => sealNativeSessionPackage({
+      agent: "claude",
+      nativeSessionId: "native-claude-expected",
+      profileRoot,
+      sourceRoot: sessionRoot,
+    })).toThrow(/does not contain the reported native session id/);
   });
 
   it("fails closed when resume is requested without sealed native session state", () => {

@@ -96,7 +96,7 @@ import {
 } from "/opt/openthrottle/runner/native-session-package.mjs";
 
 function sessionRecord(agent, nativeSessionId) {
-  if (agent === "claude") return `{"type":"system","session_id":"${nativeSessionId}"}\n`;
+  if (agent === "claude") return `{"type":"user","sessionId":"${nativeSessionId}","message":{"role":"user","content":"x"}}\n`;
   if (agent === "codex") return `{"type":"session_meta","payload":{"id":"${nativeSessionId}"}}\n`;
   if (agent === "opencode") return `{"type":"step_start","sessionID":"${nativeSessionId}"}\n`;
   throw new Error(`unsupported agent ${agent}`);
