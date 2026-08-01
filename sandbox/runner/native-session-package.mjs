@@ -8,8 +8,13 @@ import { chmodTree, chownTree, isRoot, pathInside, prepareAgentOwnedDirectory } 
 const DEFAULT_NATIVE_SESSION_SOURCE_ROOT = "/var/lib/openthrottle/native-sessions";
 const NATIVE_SESSION_PACKAGE_MANIFEST = "openthrottle-native-session.json";
 const NATIVE_SESSION_PACKAGE_SCHEMA = "openthrottle.native-session-package/v1";
-const MAX_NATIVE_SESSION_FILES = 128;
-const MAX_NATIVE_SESSION_BYTES = 4 * 1024 * 1024;
+// Real Claude Code durable transcripts embed full tool outputs, and a
+// multi-stage resumed session appends every stage into one JSONL, so packages
+// legitimately grow far past a few MiB. These bounds exist to keep packages
+// bounded against the 5 GiB sandbox disk, not to police typical size; the
+// byte cap applies both per file and to the whole package.
+export const MAX_NATIVE_SESSION_FILES = 1024;
+export const MAX_NATIVE_SESSION_BYTES = 256 * 1024 * 1024;
 const ROOT_UID = 0;
 const ROOT_GID = 0;
 const ABSOLUTE_PATH = /^\/[^\u0000]{0,500}$/;
