@@ -558,24 +558,34 @@ describe("loop action request validation", () => {
     const integrationRepoDir = mkdtempSync(join(tmpdir(), "ot-loop-integration-"));
     directories.push(actionRoot, integrationRepoDir);
     process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+    // A sentinel outside the safe passthrough set (PATH/LANG/LC_ALL/TZ):
+    // proves the child env is built from a closed baseline rather than
+    // merged with whatever this process's own env happens to carry, which
+    // expect.objectContaining alone cannot catch (it only checks presence,
+    // not absence).
+    process.env.OT_TEST_SHOULD_NOT_LEAK = "leak-marker-should-not-appear";
 
     let capturedArgs;
     let capturedOptions;
-    runLoopAgentInPreparedRepository({
-      request: valid,
-      invocation: resolveLoopInvocation(valid),
-      integrationRepoDir,
-      lockIntegration: () => true,
-      lockPersistentProfiles: () => [],
-      restorePersistentProfiles: () => {},
-      processFence: (execute) => execute(),
-      credentialEnv: { GITHUB_TOKEN: "gh-secret", CODEX_AUTH_JSON: '{"token":"codex-secret"}' },
-      runProcess: (command, args, options) => {
-        capturedArgs = args;
-        capturedOptions = options;
-        return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
-      },
-    });
+    try {
+      runLoopAgentInPreparedRepository({
+        request: valid,
+        invocation: resolveLoopInvocation(valid),
+        integrationRepoDir,
+        lockIntegration: () => true,
+        lockPersistentProfiles: () => [],
+        restorePersistentProfiles: () => {},
+        processFence: (execute) => execute(),
+        credentialEnv: { GITHUB_TOKEN: "gh-secret", CODEX_AUTH_JSON: '{"token":"codex-secret"}' },
+        runProcess: (command, args, options) => {
+          capturedArgs = args;
+          capturedOptions = options;
+          return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+        },
+      });
+    } finally {
+      delete process.env.OT_TEST_SHOULD_NOT_LEAK;
+    }
 
     expect(capturedArgs[0]).toBe("agent");
     expect(capturedArgs[1]).toBe("env");
@@ -592,6 +602,9 @@ describe("loop action request validation", () => {
     // ever materialized to a file, so its bytes never touch the child
     // process environment (visible via /proc/<pid>/environ) unnecessarily.
     expect(capturedOptions.env).not.toHaveProperty("CODEX_AUTH_JSON");
+    // The env is a replacing closed baseline, not process.env merged with
+    // extras: a sentinel this process's own env carries must not leak in.
+    expect(capturedOptions.env).not.toHaveProperty("OT_TEST_SHOULD_NOT_LEAK");
   });
 
   it("builds a filtered, read-only Claude MCP config from the sealed repository config and passes --mcp-config", () => {
