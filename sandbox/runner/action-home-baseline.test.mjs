@@ -23,6 +23,48 @@ afterEach(() => {
 });
 
 describe("action home baseline materialization", () => {
+  it("resolves default baselines from OT_ACTION_HOME_BASELINE_ROOT", () => {
+    const baselineRoot = mkdtempSync(join(tmpdir(), "ot-baseline-root-"));
+    const codexDestination = mkdtempSync(join(tmpdir(), "ot-codex-destination-"));
+    const claudeDestination = mkdtempSync(join(tmpdir(), "ot-claude-destination-"));
+    directories.push(baselineRoot, codexDestination, claudeDestination);
+    mkdirSync(join(baselineRoot, "codex"), { recursive: true });
+    writeFileSync(join(baselineRoot, "codex", "config.toml"), "model = \"overridden\"\n");
+    process.env.OT_ACTION_HOME_BASELINE_ROOT = baselineRoot;
+    try {
+      if (typeof process.getuid === "function" && process.getuid() === 0) {
+        // Root-created override entries pass the trusted baseline check, so the
+        // override content — not the root-baked /opt baseline — must copy.
+        expect(materializeCodexProfileBaseline({ destinationHome: codexDestination }))
+          .toEqual(["config.toml"]);
+        expect(readFileSync(join(codexDestination, "config.toml"), "utf8")).toContain("overridden");
+      } else {
+        // Unprivileged override entries fail the trusted baseline check and
+        // nothing copies — but the default path must resolve inside the
+        // override instead of throwing EACCES on the root-baked /opt baseline.
+        expect(materializeCodexProfileBaseline({ destinationHome: codexDestination })).toEqual([]);
+        expect(existsSync(join(codexDestination, "config.toml"))).toBe(false);
+      }
+      expect(materializeClaudeProfileBaseline({ destinationHome: claudeDestination })).toEqual([]);
+    } finally {
+      delete process.env.OT_ACTION_HOME_BASELINE_ROOT;
+    }
+  });
+
+  it("rejects a relative action home baseline root", () => {
+    const destination = mkdtempSync(join(tmpdir(), "ot-codex-destination-"));
+    directories.push(destination);
+    process.env.OT_ACTION_HOME_BASELINE_ROOT = "relative/baseline";
+    try {
+      expect(() => materializeCodexProfileBaseline({ destinationHome: destination }))
+        .toThrow("action home baseline root is invalid");
+      expect(() => materializeClaudeProfileBaseline({ destinationHome: destination }))
+        .toThrow("action home baseline root is invalid");
+    } finally {
+      delete process.env.OT_ACTION_HOME_BASELINE_ROOT;
+    }
+  });
+
   it("copies only non-secret Codex profile files into isolated homes", () => {
     const source = mkdtempSync(join(tmpdir(), "ot-codex-source-"));
     const destination = mkdtempSync(join(tmpdir(), "ot-codex-destination-"));
