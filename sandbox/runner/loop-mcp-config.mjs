@@ -80,8 +80,26 @@ export function writeClaudeMcpConfigFile(mcpServers, configDir) {
   return path;
 }
 
+// TOML basic-string escapes (https://toml.io/en/v1.0.0#string): backslash and
+// quote plus every control character except tab must be escaped, or a
+// repo-controlled command/args/env value containing e.g. a raw newline can
+// break out of the string and inject additional TOML content -- including
+// content outside this action's declared allowedMcpServers.
+const TOML_BASIC_ESCAPES = { "\b": "\\b", "\t": "\\t", "\n": "\\n", "\f": "\\f", "\r": "\\r", '"': '\\"', "\\": "\\\\" };
+
 function tomlString(value) {
-  return `"${String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  let escaped = "";
+  for (const char of String(value)) {
+    const codePoint = char.codePointAt(0);
+    if (TOML_BASIC_ESCAPES[char]) {
+      escaped += TOML_BASIC_ESCAPES[char];
+    } else if (codePoint < 0x20 || codePoint === 0x7f) {
+      escaped += `\\u${codePoint.toString(16).padStart(4, "0")}`;
+    } else {
+      escaped += char;
+    }
+  }
+  return `"${escaped}"`;
 }
 
 function tomlStringArray(values) {

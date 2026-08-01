@@ -113,6 +113,21 @@ describe("loop action MCP config materialization", () => {
     expect(toml).toContain('command = "c:\\\\\\"tool\\""');
   });
 
+  it("escapes control characters in TOML string values instead of breaking out of the quoted string", () => {
+    // A repo-controlled command/arg/env value containing a raw newline or
+    // other control character must not be able to terminate the TOML string
+    // early and inject content into a later table (e.g. an [mcp_servers.*]
+    // block outside this action's declared allowedMcpServers).
+    const toml = codexMcpServersToml({
+      tricky: { command: "tool", args: ["line1\nline2\ttabbed\x01ctrl"] },
+    });
+    expect(toml).toContain('args = ["line1\\nline2\\ttabbed\\u0001ctrl"]');
+    // The escaped value must not introduce a raw newline that would let it
+    // span multiple lines or terminate the string early.
+    const argsLine = toml.split("\n").find((line) => line.startsWith("args ="));
+    expect(argsLine).toBe('args = ["line1\\nline2\\ttabbed\\u0001ctrl"]');
+  });
+
   it("produces no TOML output when there is nothing to declare", () => {
     expect(codexMcpServersToml({})).toBe("");
   });
