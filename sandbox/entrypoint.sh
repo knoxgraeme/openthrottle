@@ -608,6 +608,19 @@ chmod -R a-w "${AGENT_HOME}/.claude/skills"
 LIVE_STEERING="$(jq -r '.liveSteering' "$OT_STAGE_REQUEST_FILE")"
 DRAIN_HOOK="${OPT_DIR}/hooks/ot-inbox-drain.sh"
 if [[ "$AGENT" == "claude" ]]; then
+  # A flaky snapshot bake or a mid-run Claude config-corruption recovery can
+  # leave ~/.claude.json missing while ~/.claude/backups holds the moved copy;
+  # the CLI then refuses every launch (OPE-87). Restore the newest backup — an
+  # absent config with no backups is the normal post-reset state the CLI
+  # regenerates from — and fail closed if no parseable config can be produced.
+  CLAUDE_CONFIG_DECISION=""
+  if ! CLAUDE_CONFIG_DECISION="$(as_agent "source '${OPT_DIR}/lib/runtime.sh' && heal_claude_config '${AGENT_HOME}/.claude.json' '${AGENT_HOME}/.claude/backups'")"; then
+    log "$CLAUDE_CONFIG_DECISION"
+    exit 1
+  fi
+  if [[ "$CLAUDE_CONFIG_DECISION" == restored\ * ]]; then
+    log "restored ${AGENT_HOME}/.claude.json from bake backup ${CLAUDE_CONFIG_DECISION#restored }"
+  fi
   CLAUDE_SETTINGS="${AGENT_HOME}/.claude/settings.json"
   if [[ "$LIVE_STEERING" == "true" ]]; then
     jq -n --arg cmd "$DRAIN_HOOK" '{ hooks: {
