@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createLoopRequestHash,
   executeLoopAction,
@@ -32,6 +32,16 @@ import { digest } from "./artifacts.mjs";
 
 const directories = [];
 
+beforeEach(() => {
+  // The sandbox image bakes a root-owned trusted baseline at the default root,
+  // which an unprivileged in-image test run cannot copy from; point tests at an
+  // empty hermetic root so the suite behaves identically on CI hosts, macOS,
+  // and inside the built image.
+  const baselineRoot = mkdtempSync(join(tmpdir(), "ot-baseline-root-"));
+  directories.push(baselineRoot);
+  process.env.OT_ACTION_HOME_BASELINE_ROOT = baselineRoot;
+});
+
 afterEach(() => {
   for (const directory of directories.splice(0)) {
     try {
@@ -42,6 +52,7 @@ afterEach(() => {
     }
     rmSync(directory, { recursive: true, force: true });
   }
+  delete process.env.OT_ACTION_HOME_BASELINE_ROOT;
   delete process.env.OT_LOOP_ACTION_ROOT;
   delete process.env.OT_WORKTREE_ROOT;
   delete process.env.OT_INTEGRATION_REPO_DIR;

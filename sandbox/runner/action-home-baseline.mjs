@@ -8,8 +8,14 @@ const CODEX_BASELINE_FILES = [
   "installation_id",
   "models_cache.json",
 ];
-const TRUSTED_CODEX_BASELINE = "/opt/openthrottle/action-home-baseline/codex";
-const TRUSTED_CLAUDE_BASELINE = "/opt/openthrottle/action-home-baseline/claude";
+const DEFAULT_ACTION_HOME_BASELINE_ROOT = "/opt/openthrottle/action-home-baseline";
+const ABSOLUTE_PATH = /^\/[^\u0000]{0,500}$/;
+
+function configuredActionHomeBaselineRoot(env = process.env) {
+  const root = env.OT_ACTION_HOME_BASELINE_ROOT ?? DEFAULT_ACTION_HOME_BASELINE_ROOT;
+  if (typeof root !== "string" || !ABSOLUTE_PATH.test(root)) throw new Error("action home baseline root is invalid");
+  return resolve(root);
+}
 
 // A stale agent-created symlink at the destination would redirect the copy to
 // an external target; remove it instead of following it.
@@ -66,7 +72,7 @@ function copyTrustedDirectory(source, destination) {
 }
 
 export function materializeCodexProfileBaseline({
-  sourceHome = TRUSTED_CODEX_BASELINE,
+  sourceHome = join(configuredActionHomeBaselineRoot(), "codex"),
   destinationHome,
 }) {
   prepareAgentOwnedDirectory(destinationHome);
@@ -79,7 +85,7 @@ export function materializeCodexProfileBaseline({
 }
 
 export function materializeClaudeProfileBaseline({
-  sourceHome = TRUSTED_CLAUDE_BASELINE,
+  sourceHome = join(configuredActionHomeBaselineRoot(), "claude"),
   destinationHome,
 }) {
   prepareAgentOwnedDirectory(destinationHome);

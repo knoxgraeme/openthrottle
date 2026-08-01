@@ -13,7 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RUNTIME_DESCRIPTOR, canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
 import {
@@ -38,11 +38,21 @@ import {
 import { nativeSessionStoragePath, sealNativeSessionPackage } from "./native-session-package.mjs";
 
 const directories = [];
+beforeEach(() => {
+  // The sandbox image bakes a root-owned trusted baseline at the default root,
+  // which an unprivileged in-image test run cannot copy from; point tests at an
+  // empty hermetic root so the suite behaves identically on CI hosts, macOS,
+  // and inside the built image.
+  const baselineRoot = mkdtempSync(join(tmpdir(), "ot-baseline-root-"));
+  directories.push(baselineRoot);
+  process.env.OT_ACTION_HOME_BASELINE_ROOT = baselineRoot;
+});
 afterEach(() => {
   for (const directory of directories.splice(0)) {
     if (existsSync(directory)) execFileSync("chmod", ["-R", "u+w", directory]);
     rmSync(directory, { recursive: true, force: true });
   }
+  delete process.env.OT_ACTION_HOME_BASELINE_ROOT;
   delete process.env.OT_REPOSITORY_SKILL_DISCOVERY_ROOT;
   delete process.env.OT_STAGE_ACTION_ROOT;
   delete process.env.OT_NATIVE_SESSION_SOURCE_ROOT;
