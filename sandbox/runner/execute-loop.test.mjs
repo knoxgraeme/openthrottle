@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -19,7 +19,13 @@ import {
   resolveLoopInvocation,
   validateLoopRequest,
 } from "./execute-loop.mjs";
-import { materializeNativeSessionState, nativeSessionStoragePath, sealNativeSessionPackage } from "./native-session-package.mjs";
+import {
+  MAX_NATIVE_SESSION_BYTES,
+  MAX_NATIVE_SESSION_FILES,
+  materializeNativeSessionState,
+  nativeSessionStoragePath,
+  sealNativeSessionPackage,
+} from "./native-session-package.mjs";
 import { computeWorkspaceTreeOid } from "./repository-control.mjs";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
@@ -1032,7 +1038,7 @@ describe("loop action request validation", () => {
     directories.push(sessionRoot, profileRoot);
     const sessionStore = nativeSessionStoragePath("codex", profileRoot);
     mkdirSync(sessionStore, { recursive: true });
-    for (let index = 0; index < 129; index += 1) {
+    for (let index = 0; index < MAX_NATIVE_SESSION_FILES + 1; index += 1) {
       writeFileSync(join(sessionStore, `${index}.jsonl`), "x\n");
     }
 
@@ -1043,6 +1049,26 @@ describe("loop action request validation", () => {
       sourceRoot: sessionRoot,
     })).toThrow(/too many files/);
     expect(existsSync(join(sessionRoot, "codex", "too-many"))).toBe(false);
+  });
+
+  it("bounds native session package bytes before copying into executor state", () => {
+    const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
+    const profileRoot = mkdtempSync(join(tmpdir(), "ot-loop-profile-"));
+    directories.push(sessionRoot, profileRoot);
+    const sessionStore = nativeSessionStoragePath("codex", profileRoot);
+    mkdirSync(sessionStore, { recursive: true });
+    const oversized = join(sessionStore, "oversized.jsonl");
+    writeFileSync(oversized, "");
+    // Sparse extension: the per-file lstat size check trips before any read.
+    truncateSync(oversized, MAX_NATIVE_SESSION_BYTES + 1);
+
+    expect(() => sealNativeSessionPackage({
+      agent: "codex",
+      nativeSessionId: "too-large",
+      profileRoot,
+      sourceRoot: sessionRoot,
+    })).toThrow(/file is too large/);
+    expect(existsSync(join(sessionRoot, "codex", "too-large"))).toBe(false);
   });
 
   it("rejects empty and unrelated native session packages", () => {
