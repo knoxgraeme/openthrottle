@@ -291,10 +291,62 @@ package bytes into the current action's engine discovery directory, requires the
 invocation from the isolated action view, and removes the ephemeral copy before
 another action can observe sibling or prior packages.
 
-RU5 does not materialize action-scoped credentials or MCP servers, validate
-standard receipt authority, activate the structured reducer, or compose
-production child execution. Those contracts remain fail-closed until their
-owning RU6, RU7, RU8/RU9, and RU9/RU11 slices install them.
+### Action-scoped credentials and MCP servers
+
+Each loop action materializes its own declared logical credentials
+(`model.invoke`, `provider.read`, `repo.read`, `repo.write`, `mcp`) and MCP
+servers from a clean trusted baseline, independent of whatever the whole
+attempt's stage-level credentials are. The Daytona adapter maps the action's
+exact declared scopes to the same minimal, closed sandbox credential-name
+allowlist as stage dispatch (`GITHUB_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
+`CODEX_AUTH_JSON`, `KIMI_CODE_API_KEY`) and rejects any operator-only Daytona,
+Fly, webhook, install, or supervisor credential the materializer might
+mistakenly return; provider secret identifiers never appear in repository
+schemas or sealed loop requests. The resulting envelope is uploaded to a
+root-owned, action-attempt-namespaced file next to the sealed request and
+named on the dispatch command line; it is never written into the persistent
+sandbox process environment.
+
+The sandbox reads, applies, and immediately deletes that envelope before
+invoking the engine: the agent process is launched with a cleared
+environment (not one inherited from the sandbox's own process, which could
+still carry the whole attempt's stage credentials) containing only the
+image's own fixed `PATH`/locale baseline plus the action's materialized
+credentials, passed as an explicit child-process environment rather than as
+command-line arguments (an argv vector is visible to any co-resident process
+via `/proc/<pid>/cmdline`, unlike an explicit env map). `CODEX_AUTH_JSON` is
+written to the action's isolated Codex home as `auth.json` rather than
+exported as a raw variable, so Codex's own token rotation stays confined to
+and is wiped with that action's directory. Cleanup is idempotent after a
+restart: a missing envelope (already consumed, or a role with no declared
+credential scopes) yields no credentials rather than an error, a retried
+dispatch re-uploads a fresh envelope regardless of what an earlier failed
+attempt already consumed, and a redispatch against an already-completed
+action removes its freshly re-uploaded envelope immediately rather than
+leaving it to be cleaned up by a script body that will never run again.
+
+MCP configuration is built the same way, scoped to the action's declared
+`allowedMcpServers` and filtered from the sealed repository config uploaded at
+bootstrap (never a real operator's personal MCP configuration or the whole
+attempt's unfiltered server list). Claude receives a private, read-only
+`--mcp-config` file when servers are declared, and `--strict-mcp-config` is
+always present so a zero-server action cannot fall back to a repo-committed
+`.mcp.json` or other ambient discovery outside its declared scope. Codex
+receives the equivalent `[mcp_servers.*]` blocks appended to its
+action-scoped `config.toml`; because the installed Codex CLI supports only
+local (stdio) servers, a remote-only server assigned to a codex-agent worker
+fails the action closed rather than silently granting Codex a smaller tool
+surface than an identically-scoped Claude worker. A subsequent action, a
+retained failed worktree, and lead/reviewer/publisher roles (which receive no
+worktree at all) cannot read a prior action's credential envelope, MCP
+config, or rotated Codex auth state: the same per-action-attempt namespacing,
+deletion, and tree relock that isolate worktrees and native sessions (above)
+cover this material too.
+
+RU5/RU6 do not validate standard receipt authority, activate the structured
+reducer, or compose production child execution. Those contracts remain
+fail-closed until their owning RU7, RU8/RU9, and RU9/RU11 slices install
+them.
 
 The supervisor also accepts run-bound `activity`, `plan`, and `heartbeat`
 events. Every event is checked against the current ticket run and pipeline
@@ -568,6 +620,10 @@ The CLI never creates per-project snapshots or configures routing fallbacks.
 - `repo.write` receives the write-capable GitHub token. `repo.read` and
   `provider.read` receive the separate read-only token unless the same stage
   explicitly declares `repo.write`.
+- The same applies per loop action, independent of the whole attempt's stage
+  credentials: each action's engine process launches with a cleared
+  environment carrying only its own declared, materialized credentials and
+  MCP servers (see Action-scoped credentials and MCP servers above).
 - Git credentials use a helper and clean origin URL; `.git/config` and the
   pre-push hook are root-sealed.
 - Pushes to main/master and non-fast-forward updates are rejected in the

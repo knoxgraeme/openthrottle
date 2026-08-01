@@ -7,6 +7,7 @@ import {
   type LoopActionRequest,
   type LoopActionResult,
   type StageExecutionResult,
+  assertLogicalCredentialScopes,
 } from "../../runtime/contracts.js";
 import { canonicalJson, digestNormalized, STAGE_OUTCOMES } from "../../pipeline/manifest.js";
 import {
@@ -99,6 +100,15 @@ function normalizedLoopRequestForHash(request: LoopActionRequest): Omit<LoopActi
   return candidateSubject === null || candidateSubject === undefined
     ? withoutFence
     : { ...withoutFence, candidateSubject };
+}
+
+// Shared with materializeCredentials below: the sandbox-eligible credential
+// allowlist. Provider-only secrets (Daytona, Fly, Linear, webhook, install)
+// are never members of this set, so a materializer bug or a compromised
+// credential provider can never leak them into a loop action either.
+function assertSandboxCredentialEnv(env: Record<string, string>, context: string): void {
+  const unknown = Object.keys(env).find((name) => !STAGE_CREDENTIAL_ENV.has(name));
+  if (unknown) throw new Error(`credential provider returned forbidden sandbox variable ${unknown} for ${context}`);
 }
 
 function loopActionPath(attemptId: string, actionId: string, name: string): string {
@@ -270,8 +280,7 @@ export function createDaytonaSandboxRuntime(
       if (canonicalScopes !== canonicalJson(scopes)) throw new Error("credential scopes are not canonical");
       const sandbox = await ensureStarted(resource);
       const materialization = await options.materializeCredentialEnv(resource, scopes);
-      const unknown = Object.keys(materialization.env).find((name) => !STAGE_CREDENTIAL_ENV.has(name));
-      if (unknown) throw new Error(`credential provider returned forbidden sandbox variable ${unknown}`);
+      assertSandboxCredentialEnv(materialization.env, "stage credentials");
       const invalidUnset = (materialization.unset ?? []).find((name) => !STAGE_CREDENTIAL_ENV.has(name));
       if (invalidUnset) throw new Error(`credential provider tried to unset forbidden variable ${invalidUnset}`);
       const conflicting = (materialization.unset ?? []).find((name) => name in materialization.env);
@@ -363,15 +372,29 @@ export function createDaytonaSandboxRuntime(
 
     async dispatchLoopAction(resource, request) {
       assertLoopRequestFence(request);
+      assertLogicalCredentialScopes(request.credentialScopes);
       const sandbox = await ensureStarted(resource);
+      // Each action materializes its own declared credentials from a clean
+      // baseline rather than inheriting whatever the whole-attempt stage
+      // credentials happen to be; the sandbox clears its inherited
+      // environment and applies only this sealed envelope (execute-loop.mjs).
+      const credentialMaterialization = await options.materializeCredentialEnv(resource, request.credentialScopes);
+      assertSandboxCredentialEnv(credentialMaterialization.env, `loop action ${request.actionId}`);
       const actionDirectory = `${LOOP_ACTION_DIR}/${request.attemptId}/${request.actionId}`;
       const requestPath = loopActionPath(request.attemptId, request.actionId, "request.json");
+      const credentialsPath = loopActionPath(request.attemptId, request.actionId, "credentials.json");
       const resultPath = loopActionPath(request.attemptId, request.actionId, "result.json");
       await prepareRootFolder(sandbox, LOOP_DISPATCH_DIR);
       const stagedRequestPath = `${LOOP_DISPATCH_DIR}/${request.attemptId}.${request.actionId}.request.json`;
+      const stagedCredentialsPath = `${LOOP_DISPATCH_DIR}/${request.attemptId}.${request.actionId}.credentials.json`;
       const lockPath = `${LOOP_DISPATCH_DIR}/${request.attemptId}.${request.actionId}.lock`;
       await sandbox.fs.uploadFile(Buffer.from(canonicalJson(request)), stagedRequestPath);
       await sandbox.fs.setFilePermissions(stagedRequestPath, { owner: "root", group: "root", mode: "400" });
+      await sandbox.fs.uploadFile(
+        Buffer.from(canonicalJson({ env: credentialMaterialization.env })),
+        stagedCredentialsPath
+      );
+      await sandbox.fs.setFilePermissions(stagedCredentialsPath, { owner: "root", group: "root", mode: "400" });
       const sessionId = `loop-${request.actionId}`;
       if (!sandbox.process?.executeSessionCommand) {
         throw new Error("Daytona runtime does not expose session command execution");
@@ -380,13 +403,26 @@ export function createDaytonaSandboxRuntime(
       const dispatched = await sandbox.process.executeSessionCommand(sessionId, {
         command: `flock --nonblock ${lockPath} sh -c ` +
           shellSingleQuoted([
-            `if test -f ${shellSingleQuoted(resultPath)}; then exit 0; fi`,
+            // A redispatch of an already-completed action must not orphan the
+            // credential envelope this call just uploaded fresh: no later
+            // invocation will ever reach the terminal `rm -f` below to clean
+            // it up, since none will run this script body again.
+            `if test -f ${shellSingleQuoted(resultPath)}; then rm -f ${shellSingleQuoted(stagedCredentialsPath)} ${shellSingleQuoted(stagedRequestPath)}; exit 0; fi`,
             `install -d -o root -g root -m 0711 ${shellSingleQuoted(LOOP_ACTION_DIR)} ${shellSingleQuoted(`${LOOP_ACTION_DIR}/${request.attemptId}`)} ${shellSingleQuoted(actionDirectory)}`,
             `cp ${shellSingleQuoted(stagedRequestPath)} ${shellSingleQuoted(requestPath)}`,
-            `chown root:root ${shellSingleQuoted(requestPath)}`,
-            `chmod 400 ${shellSingleQuoted(requestPath)}`,
-            `exec /opt/openthrottle/runner/execute-loop.mjs --request ${shellSingleQuoted(requestPath)} --output ${shellSingleQuoted(resultPath)}`,
-          ].join(" && ")),
+            `cp ${shellSingleQuoted(stagedCredentialsPath)} ${shellSingleQuoted(credentialsPath)}`,
+            `chown root:root ${shellSingleQuoted(requestPath)} ${shellSingleQuoted(credentialsPath)}`,
+            `chmod 400 ${shellSingleQuoted(requestPath)} ${shellSingleQuoted(credentialsPath)}`,
+            `rm -f ${shellSingleQuoted(stagedCredentialsPath)}`,
+            `exec /opt/openthrottle/runner/execute-loop.mjs --request ${shellSingleQuoted(requestPath)} --credentials ${shellSingleQuoted(credentialsPath)} --output ${shellSingleQuoted(resultPath)}`,
+          ].join(" && ")) +
+          // A losing `flock --nonblock` (another dispatch for this exact
+          // action already holds it) exits nonzero without ever running the
+          // body above, so this call's own freshly-uploaded staged files
+          // would otherwise never be cleaned up by anyone. Remove them here
+          // instead of leaving real credential material parked in
+          // LOOP_DISPATCH_DIR indefinitely.
+          ` || rm -f ${shellSingleQuoted(stagedCredentialsPath)} ${shellSingleQuoted(stagedRequestPath)}`,
         runAsync: true,
         suppressInputEcho: true,
       }, loopActionDispatchTimeoutSeconds(request.timeoutMs));

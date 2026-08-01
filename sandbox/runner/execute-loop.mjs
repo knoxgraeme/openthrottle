@@ -21,19 +21,14 @@ import {
   lockedPersistentProfilesFrom,
   pathInside as containedPath,
   prepareAgentOwnedDirectory,
-  resetAgentOwnedDirectory,
   restorePersistentAgentPrivateRoots,
 } from "./filesystem-isolation.mjs";
-import { materializeClaudeProfileBaseline, materializeCodexProfileBaseline } from "./action-home-baseline.mjs";
 import { writeJsonAtomic } from "./atomic-write.mjs";
-import {
-  materializeRepositorySkillPackage,
-  validateRepositorySkillPackage,
-} from "./repository-skills.mjs";
+import { validateRepositorySkillPackage } from "./repository-skills.mjs";
+import { readLoopActionCredentialEnv } from "./loop-credentials.mjs";
+import { prepareLoopAgentEnvironment } from "./loop-agent-environment.mjs";
 import {
   extractNativeSessionId,
-  materializeNativeSessionState,
-  nativeSessionStoragePath,
   sealNativeSessionPackage,
 } from "./native-session-package.mjs";
 
@@ -51,6 +46,11 @@ const GIT_OBJECT_ID = /^[a-f0-9]{40,64}$/;
 const AGENTS = new Set(["claude", "codex", "opencode"]);
 const ROLES = new Set(["worker", "lead", "reviewer", "publisher"]);
 const LOOPS = new Set(["implement", "simplify", "command", "repair", "lead", "review", "publish"]);
+// Mirrors contracts/src/graph.ts LOGICAL_CREDENTIALS: the closed logical scope
+// set a repository graph worker may declare. Enforced again here, independent
+// of the schema-level check upstream, so a stale or malformed sealed request
+// cannot hand a loop action an unrecognized scope name.
+const LOGICAL_CREDENTIAL_SCOPES = new Set(["model.invoke", "provider.read", "repo.read", "repo.write", "mcp"]);
 const SKILLS = new Set([
   "implement-plan",
   "investigate",
@@ -133,7 +133,7 @@ function pathInside(root, child) {
   return containedPath(root, child, "loop action path escapes the executor root");
 }
 
-function configuredActionRoot(env = process.env) {
+export function configuredActionRoot(env = process.env) {
   const root = env.OT_LOOP_ACTION_ROOT ?? DEFAULT_ACTION_ROOT;
   if (typeof root !== "string" || !ABSOLUTE_PATH.test(root)) throw new Error("loop action root is invalid");
   const resolved = resolve(root);
@@ -153,7 +153,7 @@ function configuredIntegrationRepoDir(env = process.env) {
   return resolved;
 }
 
-function actionDirectory(request, rootDir = configuredActionRoot()) {
+export function actionDirectory(request, rootDir = configuredActionRoot()) {
   return pathInside(pathInside(rootDir, request.attemptId), request.actionId);
 }
 
@@ -170,6 +170,10 @@ export function loopRequestPath({ attemptId, actionId, rootDir = DEFAULT_ACTION_
 
 export function loopResultPath({ attemptId, actionId, rootDir = DEFAULT_ACTION_ROOT }) {
   return actionFilePath({ attemptId: stagePathId(attemptId, "attemptId"), actionId: stagePathId(actionId, "actionId"), rootDir }, "result.json");
+}
+
+export function loopCredentialsPath({ attemptId, actionId, rootDir = DEFAULT_ACTION_ROOT }) {
+  return actionFilePath({ attemptId: stagePathId(attemptId, "attemptId"), actionId: stagePathId(actionId, "actionId"), rootDir }, "credentials.json");
 }
 
 function ensureTraverseOnly(path) {
@@ -230,7 +234,7 @@ export function gitSafeDirectoryConfigArgs(repoDir, extraSafeDirectories = []) {
     .flatMap((path) => ["-c", `safe.directory=${path}`]);
 }
 
-function gitSafeDirectoryEnv(repoDir) {
+export function gitSafeDirectoryEnv(repoDir) {
   const directories = [...new Set([repoDir, maybeRealPath(repoDir)])].filter((path) => typeof path === "string" && path.length > 0);
   return [
     `GIT_CONFIG_COUNT=${directories.length}`,
@@ -310,6 +314,8 @@ export function validateLoopRequest(value) {
   if (!ROLES.has(request.role)) throw new Error("role is invalid");
   if (!LOOPS.has(request.loop)) throw new Error("loop is invalid");
   if (!AGENTS.has(request.agent)) throw new Error("agent is invalid");
+  const unknownScope = request.credentialScopes.find((scope) => !LOGICAL_CREDENTIAL_SCOPES.has(scope));
+  if (unknownScope) throw new Error(`credential scope ${unknownScope} is not a recognized logical credential`);
   if (request.agent === "opencode") {
     // OpenCode loop actions need database-backed session sealing and adapter
     // body delivery that RU5 does not provide; fail closed until that unit.
@@ -369,17 +375,10 @@ export function loopPrompt(request) {
     `Return one receipt matching ${request.receiptSchema}.\n\n${request.transitionContext}`;
 }
 
-function prepareRootReadOnlyDirectory(path) {
+export function prepareRootReadOnlyDirectory(path) {
   mkdirSync(path, { recursive: true, mode: 0o555 });
   if (isRoot()) chownTree(path, ROOT_UID, ROOT_GID);
   chmodTree(path, { fileMode: 0o444, directoryMode: 0o555 });
-}
-
-function prepareExecutorOwnedProfileRoot(path) {
-  if (!isRoot()) return;
-  mkdirSync(path, { recursive: true, mode: 0o555 });
-  chownSync(path, ROOT_UID, ROOT_GID);
-  chmodSync(path, 0o555);
 }
 
 function retryableInfrastructureError(message) {
@@ -388,24 +387,7 @@ function retryableInfrastructureError(message) {
   return error;
 }
 
-function lockExecutorOwnedSkillTree(path) {
-  if (!existsSync(path)) return;
-  if (isRoot()) chownTree(path, ROOT_UID, ROOT_GID);
-  chmodReadOnlyPreservingExecuteTree(path);
-}
-
 const PROFILE_ROOT_FENCE_FILE = ".ot-profile-fence";
-
-// Inode identity cannot detect replace-after-delete on filesystems that
-// recycle inode numbers (ext4). A root-owned nonce file works everywhere:
-// the agent UID cannot create a uid-0 regular file with the sealed content.
-function writeProfileRootFence(profileRoot) {
-  const nonce = randomUUID();
-  const fencePath = containedPath(profileRoot, PROFILE_ROOT_FENCE_FILE, "profile fence escapes its root");
-  writeFileSync(fencePath, nonce, { mode: 0o600 });
-  if (isRoot()) chownSync(fencePath, ROOT_UID, ROOT_GID);
-  return nonce;
-}
 
 function assertProfileRootFence(profileRoot, nonce) {
   const replaced = new Error("native session profile root was replaced during the action");
@@ -424,83 +406,6 @@ function assertProfileRootFence(profileRoot, nonce) {
   if (readFileSync(fencePath, "utf8") !== nonce) throw replaced;
 }
 
-function prepareActionHomeEnvironment(request) {
-  const currentActionDirectory = actionDirectory(request);
-  const home = pathInside(currentActionDirectory, "home");
-  resetAgentOwnedDirectory(home);
-  const env = [`HOME=${home}`];
-  let nativeSessionProfileRoot = home;
-  if (request.agent === "claude") {
-    const profileRoot = pathInside(home, ".claude");
-    materializeClaudeProfileBaseline({ destinationHome: profileRoot });
-    lockExecutorOwnedSkillTree(pathInside(profileRoot, "skills"));
-    materializeNativeSessionState({ request, profileRoot });
-    prepareAgentOwnedDirectory(nativeSessionStoragePath(request.agent, profileRoot));
-    prepareExecutorOwnedProfileRoot(profileRoot);
-    nativeSessionProfileRoot = profileRoot;
-  }
-  if (request.agent === "codex") {
-    const codexHome = pathInside(currentActionDirectory, "codex");
-    resetAgentOwnedDirectory(codexHome);
-    materializeCodexProfileBaseline({ destinationHome: codexHome });
-    materializeNativeSessionState({ request, profileRoot: codexHome });
-    prepareAgentOwnedDirectory(nativeSessionStoragePath(request.agent, codexHome));
-    prepareExecutorOwnedProfileRoot(codexHome);
-    env.push(`CODEX_HOME=${codexHome}`);
-    nativeSessionProfileRoot = codexHome;
-  }
-  return {
-    env,
-    nativeSessionProfileRoot,
-    profileRootFenceNonce: writeProfileRootFence(nativeSessionProfileRoot),
-  };
-}
-
-function prepareLoopTransportEnvironment(request) {
-  const currentActionDirectory = actionDirectory(request);
-  const outbox = pathInside(currentActionDirectory, "outbox");
-  const inbox = pathInside(currentActionDirectory, "inbox");
-  const processedInbox = pathInside(currentActionDirectory, "inbox-processed");
-  const nativeSessionRoot = pathInside(currentActionDirectory, "native-session");
-  for (const directory of [outbox, inbox, processedInbox, nativeSessionRoot]) {
-    resetAgentOwnedDirectory(directory);
-  }
-  return [
-    `OT_OUTBOX_DIR=${outbox}`,
-    `OT_INBOX_DIR=${inbox}`,
-    `OT_INBOX_PROCESSED_DIR=${processedInbox}`,
-    `OT_NATIVE_SESSION_DIR=${nativeSessionRoot}`,
-  ];
-}
-
-function loopSkillDiscoveryRoot(request, actionRoot = configuredActionRoot()) {
-  const currentActionDirectory = actionDirectory(request, actionRoot);
-  if (request.agent === "codex") return pathInside(pathInside(currentActionDirectory, "codex"), "skills");
-  return pathInside(pathInside(pathInside(currentActionDirectory, "home"), ".claude"), "skills");
-}
-
-function prepareLoopAgentEnvironment(request, repoDir) {
-  const gitObjectEnv = prepareLoopGitObjectEnvironment(request, repoDir);
-  const transportEnv = prepareLoopTransportEnvironment(request);
-  const homeEnv = prepareActionHomeEnvironment(request);
-  const repositoryViewGitEnv = request.worktree ? [] : gitSafeDirectoryEnv(repoDir);
-  const env = ["USER=agent", "GIT_OPTIONAL_LOCKS=0", ...repositoryViewGitEnv, ...gitObjectEnv.env, ...transportEnv, ...homeEnv.env];
-  if (request.repositorySkill) {
-    materializeRepositorySkillPackage({
-      packageInfo: request.repositorySkill,
-      repoDir,
-      agent: request.agent,
-      discoveryRoot: loopSkillDiscoveryRoot(request),
-    });
-  }
-  return {
-    env,
-    gitObjectEnv: gitObjectEnv.values,
-    nativeSessionProfileRoot: homeEnv.nativeSessionProfileRoot,
-    profileRootFenceNonce: homeEnv.profileRootFenceNonce,
-  };
-}
-
 function packReachableBaseObjects(repoDir, destinationPackBase, subject = "HEAD") {
   const result = runCapturedProcess("git", [...gitSafeDirectoryConfigArgs(repoDir), "pack-objects", "--revs", destinationPackBase], {
     cwd: repoDir,
@@ -513,7 +418,7 @@ function packReachableBaseObjects(repoDir, destinationPackBase, subject = "HEAD"
   }
 }
 
-function prepareLoopGitObjectEnvironment(request, repoDir) {
+export function prepareLoopGitObjectEnvironment(request, repoDir) {
   if (!request.worktree) return { env: [], values: null };
   const objectRoot = pathInside(actionDirectory(request), "git-objects");
   const baseObjectDir = pathInside(objectRoot, "base");
@@ -682,7 +587,7 @@ function makeCurrentActionDirectoryTraverseOnly(request) {
   ensureCurrentActionTraversal(request);
 }
 
-export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDirectory(request) ?? "/home/agent/repo" }) {
+export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDirectory(request) ?? "/home/agent/repo", mcpConfigPath = null }) {
   const prompt = loopPrompt(request);
   if (request.agent === "codex") {
     return {
@@ -698,6 +603,11 @@ export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDi
     args: [
       "-p", ...(invocation.mode === "resume" ? ["--resume", invocation.nativeSessionId] : []), prompt,
       "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions",
+      // Unconditional: --strict-mcp-config closes MCP entirely to just the
+      // declared set (or to nothing, when no MCP servers were declared),
+      // rather than leaving a repo-committed .mcp.json or other ambient
+      // discovery reachable when this action declared zero MCP servers.
+      ...(mcpConfigPath ? ["--mcp-config", mcpConfigPath] : []), "--strict-mcp-config",
       "--plugin-dir", "/opt/openthrottle/compound-engineering-marketplace",
       "--setting-sources", "user",
     ],
@@ -714,6 +624,7 @@ export function runLoopAgentInPreparedRepository({
   lockIntegration = lockIntegrationCheckout,
   lockPersistentProfiles = lockPersistentAgentPrivateRoots,
   restorePersistentProfiles = restorePersistentAgentPrivateRoots,
+  credentialEnv = {},
 }) {
   let lockedPersistentProfiles = [];
   const cleanupErrors = [];
@@ -727,8 +638,8 @@ export function runLoopAgentInPreparedRepository({
       throw error;
     }
     const repoDir = prepareLoopRepository(request, integrationRepoDir);
-    const preparedEnvironment = prepareLoopAgentEnvironment(request, repoDir);
-    const built = loopAgentCommand({ request, invocation, repoDir });
+    const preparedEnvironment = prepareLoopAgentEnvironment(request, repoDir, credentialEnv);
+    const built = loopAgentCommand({ request, invocation, repoDir, mcpConfigPath: preparedEnvironment.mcpConfigPath });
     makeCurrentActionDirectoryTraverseOnly(request);
     const result = processFence(() => runProcess("gosu", [
       "agent", "env", ...preparedEnvironment.env, built.command, ...built.args,
@@ -736,6 +647,11 @@ export function runLoopAgentInPreparedRepository({
       cwd: built.repoDir,
       input: built.input,
       timeout: request.timeoutMs,
+      // Credentials never ride as argv strings (visible to any co-resident
+      // process via /proc/<pid>/cmdline); they travel only in this explicit
+      // child-process env, which replaces whatever the sandbox process
+      // itself inherited rather than merging with it.
+      env: preparedEnvironment.secretEnv,
     }));
     const reportedNativeSessionId = extractNativeSessionId(result.stdout, request.agent);
     if (request.nativeSessionId && reportedNativeSessionId && reportedNativeSessionId !== request.nativeSessionId) {
@@ -788,11 +704,12 @@ export function runLoopAgentInPreparedRepository({
   }
 }
 
-function defaultRunLoopAgent({ request, invocation, integrationRepoDir = configuredIntegrationRepoDir() }) {
+function defaultRunLoopAgent({ request, invocation, integrationRepoDir = configuredIntegrationRepoDir(), credentialEnv = {} }) {
   return runLoopAgentInPreparedRepository({
     request,
     invocation,
     integrationRepoDir,
+    credentialEnv,
   });
 }
 
@@ -855,16 +772,23 @@ export function executeLoopAction({
   lockActionDirectory = lockCurrentActionDirectory,
   restoreIntegration = restoreIntegrationCheckout,
   integrationRepoDir = configuredIntegrationRepoDir(),
+  credentialEnv = {},
   now = () => new Date().toISOString(),
 }) {
   const request = validateLoopRequest(rawRequest);
   const cleanupErrors = [];
+  // Merge the action's own materialized credentials into the redaction
+  // source: they never land in this process's own env (they are scoped to
+  // the spawned agent process only), so sanitizeArtifactText's default
+  // process.env lookup alone would miss them if a failure message ever
+  // echoed one -- including in the cleanup-failure path below.
+  const sanitizeEnv = { ...process.env, ...credentialEnv };
   let result;
   let execution;
   try {
     const invocation = resolveLoopInvocation(request);
     try {
-      execution = runLoopAgent({ request, invocation, integrationRepoDir });
+      execution = runLoopAgent({ request, invocation, integrationRepoDir, credentialEnv });
     } catch (error) {
       execution = {
         status: null,
@@ -892,7 +816,7 @@ export function executeLoopAction({
     let receiptError = null;
     if (!subjectError && !execution.timedOut && !execution.signal && execution.status === 0) {
       try {
-        parsedReceipt = parseLoopReceipt(execution.stdout, process.env);
+        parsedReceipt = parseLoopReceipt(execution.stdout, sanitizeEnv);
         assertLoopReceiptFence(parsedReceipt, request, subject);
       } catch (error) {
         receiptError = error instanceof Error ? error.message : String(error);
@@ -914,7 +838,7 @@ export function executeLoopAction({
         ? canonicalJson(parsedReceipt)
         : sanitizeArtifactText(retryableInfrastructureFailure
           ? execution.stderr || "loop action infrastructure failure"
-          : subjectError || receiptError || execution.stdout || execution.stderr || (failed ? "loop action failed" : "loop action completed")).slice(0, 128_000),
+          : subjectError || receiptError || execution.stdout || execution.stderr || (failed ? "loop action failed" : "loop action completed"), sanitizeEnv).slice(0, 128_000),
       created_at: now(),
     };
   } finally {
@@ -939,7 +863,7 @@ export function executeLoopAction({
     return {
       ...result,
       outcome: "retryable_infrastructure_failure",
-      receipt: sanitizeArtifactText(`loop action cleanup failed: ${cleanupErrors.join("; ")}`).slice(0, 128_000),
+      receipt: sanitizeArtifactText(`loop action cleanup failed: ${cleanupErrors.join("; ")}`, sanitizeEnv).slice(0, 128_000),
     };
   }
   return result;
@@ -958,12 +882,18 @@ function main() {
     writeFileSync(1, `${canonicalJson(request)}\n`);
     return;
   }
+  const credentialsPath = resolve(arg("--credentials", process.env.OT_LOOP_CREDENTIALS_FILE ?? loopCredentialsPath({
+    attemptId: request.attemptId,
+    actionId: request.actionId,
+    rootDir: configuredActionRoot(),
+  })));
+  const credentialEnv = readLoopActionCredentialEnv(credentialsPath);
   const outputPath = resolve(arg("--output", process.env.OT_LOOP_RESULT_FILE ?? loopResultPath({
     attemptId: request.attemptId,
     actionId: request.actionId,
     rootDir: configuredActionRoot(),
   })));
-  writeJsonAtomic(outputPath, executeLoopAction({ request }));
+  writeJsonAtomic(outputPath, executeLoopAction({ request, credentialEnv }));
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

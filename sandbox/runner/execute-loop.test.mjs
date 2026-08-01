@@ -9,6 +9,7 @@ import {
   gitSafeDirectoryConfigArgs,
   lockPersistentAgentPrivateRoots,
   loopAgentCommand,
+  loopCredentialsPath,
   loopRequestPath,
   loopResultPath,
   loopWorktreeDirectory,
@@ -57,6 +58,7 @@ afterEach(() => {
   delete process.env.OT_WORKTREE_ROOT;
   delete process.env.OT_INTEGRATION_REPO_DIR;
   delete process.env.OT_NATIVE_SESSION_SOURCE_ROOT;
+  delete process.env.OT_STAGE_CONFIG_FILE;
 });
 
 function repository() {
@@ -273,6 +275,8 @@ describe("loop action request validation", () => {
       .toThrow(/worktree has unknown field/);
     expect(loopResultPath({ attemptId: "attempt-2", actionId: "action-2", rootDir: "/var/ot" }))
       .toBe("/var/ot/attempt-2/action-2/result.json");
+    expect(loopCredentialsPath({ attemptId: "attempt-2", actionId: "action-2", rootDir: "/var/ot" }))
+      .toBe("/var/ot/attempt-2/action-2/credentials.json");
   });
 
   it("rejects slash-bearing action IDs before deriving action paths", () => {
@@ -283,6 +287,8 @@ describe("loop action request validation", () => {
       .toThrow(/attemptId is invalid/);
     expect(() => loopRequestPath({ attemptId: "attempt", actionId: "action/1", rootDir: "/var/ot" }))
       .toThrow(/actionId is invalid/);
+    expect(() => loopCredentialsPath({ attemptId: "attempt/1", actionId: "action", rootDir: "/var/ot" }))
+      .toThrow(/attemptId is invalid/);
   });
 
   it.each([
@@ -406,6 +412,56 @@ describe("loop action request validation", () => {
       .toThrow(/opencode loop actions are not supported/);
   });
 
+  it("rejects a loop request declaring a credential scope outside the closed logical set", () => {
+    expect(() => validateLoopRequest(request({ credentialScopes: ["daytona.admin"] })))
+      .toThrow(/credential scope daytona\.admin is not a recognized logical credential/);
+  });
+
+  it("accepts every closed logical credential scope, including mcp", () => {
+    expect(() => validateLoopRequest(request({
+      credentialScopes: ["mcp", "model.invoke", "provider.read", "repo.read", "repo.write"],
+    }))).not.toThrow();
+  });
+
+  it("keeps the sandbox-side logical credential scope set aligned with contracts' LOGICAL_CREDENTIALS", () => {
+    // execute-loop.mjs cannot import @openthrottle/contracts (sandbox is a
+    // separate deployable with no TS build step), so its LOGICAL_CREDENTIAL_SCOPES
+    // is a hand-mirrored copy of contracts/src/graph.ts's LOGICAL_CREDENTIALS.
+    // Cross-check the two source texts so a future change to one is caught
+    // if the other isn't updated to match.
+    const sandboxSource = readFileSync(new URL("./execute-loop.mjs", import.meta.url), "utf8");
+    const sandboxMatch = sandboxSource.match(/const LOGICAL_CREDENTIAL_SCOPES = new Set\(\[([^\]]+)\]\);/);
+    expect(sandboxMatch).not.toBeNull();
+    const sandboxScopes = JSON.parse(`[${sandboxMatch[1]}]`).sort();
+
+    const contractsSource = readFileSync(new URL("../../contracts/src/graph.ts", import.meta.url), "utf8");
+    const contractsMatch = contractsSource.match(/export const LOGICAL_CREDENTIALS = \[([^\]]+)\] as const;/);
+    expect(contractsMatch).not.toBeNull();
+    const contractsScopes = JSON.parse(`[${contractsMatch[1]}]`).sort();
+
+    expect(sandboxScopes).toEqual(contractsScopes);
+  });
+
+  it("always closes Claude MCP discovery with --strict-mcp-config, adding --mcp-config only when a path is supplied", () => {
+    const valid = validateLoopRequest(request({ agent: "claude" }));
+    const withoutMcp = loopAgentCommand({ request: valid, invocation: resolveLoopInvocation(valid) });
+    expect(withoutMcp.args).not.toContain("--mcp-config");
+    // Even with zero declared MCP servers, --strict-mcp-config must still be
+    // present so this action cannot fall back to a repo-committed .mcp.json
+    // or other ambient MCP discovery outside its declared scope.
+    expect(withoutMcp.args).toContain("--strict-mcp-config");
+
+    const withMcp = loopAgentCommand({
+      request: valid,
+      invocation: resolveLoopInvocation(valid),
+      mcpConfigPath: "/tmp/action/mcp/mcp-config.json",
+    });
+    const index = withMcp.args.indexOf("--mcp-config");
+    expect(index).toBeGreaterThan(-1);
+    expect(withMcp.args[index + 1]).toBe("/tmp/action/mcp/mcp-config.json");
+    expect(withMcp.args).toContain("--strict-mcp-config");
+  });
+
   it("delivers the pinned Compound Engineering plugin to Claude loop actions", () => {
     const fresh = validateLoopRequest(request({ agent: "claude" }));
     const resumed = validateLoopRequest(request({
@@ -490,6 +546,99 @@ describe("loop action request validation", () => {
       `lock-integration:${integrationRepoDir}`,
       "restore-persistent-profiles:/home/agent/.codex",
     ]);
+  });
+
+  it("materializes a clean, action-scoped environment: credentials never ride as argv, only in an explicit replacing child env", () => {
+    const valid = validateLoopRequest(request({
+      agent: "claude",
+      allowedMcpServers: [],
+      credentialScopes: ["model.invoke", "repo.read", "repo.write"],
+    }));
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+    const integrationRepoDir = mkdtempSync(join(tmpdir(), "ot-loop-integration-"));
+    directories.push(actionRoot, integrationRepoDir);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+
+    let capturedArgs;
+    let capturedOptions;
+    runLoopAgentInPreparedRepository({
+      request: valid,
+      invocation: resolveLoopInvocation(valid),
+      integrationRepoDir,
+      lockIntegration: () => true,
+      lockPersistentProfiles: () => [],
+      restorePersistentProfiles: () => {},
+      processFence: (execute) => execute(),
+      credentialEnv: { GITHUB_TOKEN: "gh-secret", CODEX_AUTH_JSON: '{"token":"codex-secret"}' },
+      runProcess: (command, args, options) => {
+        capturedArgs = args;
+        capturedOptions = options;
+        return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+      },
+    });
+
+    expect(capturedArgs[0]).toBe("agent");
+    expect(capturedArgs[1]).toBe("env");
+    // Credentials never appear as argv strings: an execve() argument vector
+    // is visible to any co-resident process via /proc/<pid>/cmdline, unlike
+    // the explicit child-process env below.
+    expect(capturedArgs.join(" ")).not.toContain("gh-secret");
+    expect(capturedArgs.join(" ")).not.toContain("codex-secret");
+    expect(capturedOptions.env).toEqual(expect.objectContaining({
+      PATH: process.env.PATH,
+      GITHUB_TOKEN: "gh-secret",
+    }));
+    // CODEX_AUTH_JSON never appears as a raw env var either — it is only
+    // ever materialized to a file, so its bytes never touch the child
+    // process environment (visible via /proc/<pid>/environ) unnecessarily.
+    expect(capturedOptions.env).not.toHaveProperty("CODEX_AUTH_JSON");
+  });
+
+  it("builds a filtered, read-only Claude MCP config from the sealed repository config and passes --mcp-config", () => {
+    const configDir = mkdtempSync(join(tmpdir(), "ot-loop-config-"));
+    directories.push(configDir);
+    const repositoryConfigPath = join(configDir, "repository-config.json");
+    writeFileSync(repositoryConfigPath, JSON.stringify({
+      mcp_servers: {
+        github: { command: "mcp-github", args: ["--stdio"] },
+        unused: { command: "mcp-unused" },
+      },
+    }));
+    process.env.OT_STAGE_CONFIG_FILE = repositoryConfigPath;
+
+    const valid = validateLoopRequest(request({
+      agent: "claude",
+      allowedMcpServers: ["github"],
+      credentialScopes: ["mcp", "model.invoke", "repo.read", "repo.write"],
+    }));
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+    const integrationRepoDir = mkdtempSync(join(tmpdir(), "ot-loop-integration-"));
+    directories.push(actionRoot, integrationRepoDir);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+
+    let capturedArgs;
+    runLoopAgentInPreparedRepository({
+      request: valid,
+      invocation: resolveLoopInvocation(valid),
+      integrationRepoDir,
+      lockIntegration: () => true,
+      lockPersistentProfiles: () => [],
+      restorePersistentProfiles: () => {},
+      processFence: (execute) => execute(),
+      runProcess: (command, args) => {
+        capturedArgs = args;
+        return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+      },
+    });
+
+    const mcpConfigIndex = capturedArgs.indexOf("--mcp-config");
+    expect(mcpConfigIndex).toBeGreaterThan(-1);
+    const mcpConfigPath = capturedArgs[mcpConfigIndex + 1];
+    expect(mcpConfigPath).toMatch(/\/mcp\/mcp-config\.json$/);
+    expect(capturedArgs).toContain("--strict-mcp-config");
+    const written = JSON.parse(readFileSync(mcpConfigPath, "utf8"));
+    expect(written).toEqual({ mcpServers: { github: { type: "stdio", command: "mcp-github", args: ["--stdio"], env: {} } } });
+    expect(statSync(mcpConfigPath).mode & 0o777).toBe(0o444);
   });
 
   it("resets stale replayed action surfaces before the agent runs", () => {
@@ -1676,6 +1825,29 @@ describe("executeLoopAction", () => {
     expect(restoreIntegration).toHaveBeenCalledWith("/tmp/integration-current");
   });
 
+  it("redacts a materialized credential from the failure receipt even when it never touched this process's own env", () => {
+    const lockWorkerWorktree = vi.fn();
+    const lockActionDirectory = vi.fn();
+    const result = executeLoopActionWithIntegration({
+      request: request(),
+      credentialEnv: { GITHUB_TOKEN: "gh-leaked-secret-value" },
+      lockWorkerWorktree,
+      lockActionDirectory,
+      runLoopAgent: () => ({
+        status: 1,
+        signal: null,
+        timedOut: false,
+        stdout: "",
+        stderr: "fatal: authentication failed with token gh-leaked-secret-value",
+        nativeSessionId: null,
+        integrationRepoDir: "/tmp/integration-current",
+      }),
+    });
+    expect(result.outcome).toBe("failure");
+    expect(result.receipt).not.toContain("gh-leaked-secret-value");
+    expect(result.receipt).toContain("[REDACTED]");
+  });
+
   it("rejects successful loop exits without a valid standard receipt", () => {
     const lockWorkerWorktree = vi.fn();
     const lockActionDirectory = vi.fn();
@@ -1799,11 +1971,12 @@ describe("executeLoopAction", () => {
       throw new Error("worktree relock failed");
     });
     const lockActionDirectory = vi.fn(() => {
-      throw new Error("action relock failed");
+      throw new Error("action relock failed with token gh-leaked-secret-value");
     });
 
     const result = executeLoopActionWithIntegration({
       request: valid,
+      credentialEnv: { GITHUB_TOKEN: "gh-leaked-secret-value" },
       lockWorkerWorktree,
       lockActionDirectory,
       runLoopAgent: () => ({
@@ -1826,6 +1999,11 @@ describe("executeLoopAction", () => {
     });
     expect(result.receipt).toContain("worktree relock failed");
     expect(result.receipt).toContain("action relock failed");
+    // The cleanup-failure receipt path redacts materialized credentials the
+    // same way the main receipt path does, even though they never touch
+    // this process's own env.
+    expect(result.receipt).not.toContain("gh-leaked-secret-value");
+    expect(result.receipt).toContain("[REDACTED]");
     expect(lockWorkerWorktree).toHaveBeenCalledOnce();
     expect(lockActionDirectory).toHaveBeenCalledOnce();
   });

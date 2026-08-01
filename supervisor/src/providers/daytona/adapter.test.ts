@@ -172,7 +172,7 @@ describe("Daytona stage execution", () => {
       timeoutMs: 30_000,
       transitionContext: "implement unit",
       allowedMcpServers: ["github"],
-      credentialScopes: ["model.invoke", "repo.read", "repo.write"],
+      credentialScopes: ["model.invoke", "repo.read", "repo.write"] as const,
       receiptSchema: "openthrottle.receipt/v1",
       requestHash: "",
       idempotencyKey: "",
@@ -190,7 +190,7 @@ describe("Daytona stage execution", () => {
     expect(sandbox.process.executeSessionCommand).toHaveBeenCalledWith(
       "loop-loop-1",
       expect.objectContaining({
-        command: expect.stringMatching(/loop-dispatch\/attempt-child\.loop-1\.lock.*if test -f .*loop-actions\/attempt-child\/loop-1\/result\.json.*then exit 0; fi.*install -d .* -m 0711 .*loop-actions.*loop-actions\/attempt-child.*loop-actions\/attempt-child\/loop-1.*cp .*loop-dispatch\/attempt-child\.loop-1\.request\.json.*loop-actions\/attempt-child\/loop-1\/request\.json.*execute-loop\.mjs --request .*loop-actions\/attempt-child\/loop-1\/request\.json.*--output .*loop-actions\/attempt-child\/loop-1\/result\.json/),
+        command: expect.stringMatching(/loop-dispatch\/attempt-child\.loop-1\.lock.*if test -f .*loop-actions\/attempt-child\/loop-1\/result\.json.*then rm -f .*loop-dispatch\/attempt-child\.loop-1\.credentials\.json.*exit 0; fi.*install -d .* -m 0711 .*loop-actions.*loop-actions\/attempt-child.*loop-actions\/attempt-child\/loop-1.*cp .*loop-dispatch\/attempt-child\.loop-1\.request\.json.*loop-actions\/attempt-child\/loop-1\/request\.json.*execute-loop\.mjs --request .*loop-actions\/attempt-child\/loop-1\/request\.json.*--output .*loop-actions\/attempt-child\/loop-1\/result\.json/),
       }),
       60
     );
@@ -208,6 +208,39 @@ describe("Daytona stage execution", () => {
     expect(sandbox.fs.setFilePermissions).not.toHaveBeenCalledWith(
       "/var/lib/openthrottle/loop-actions/attempt-child/loop-1/request.json",
       expect.anything()
+    );
+
+    // Each loop action materializes its own credential envelope from the
+    // exact scopes it declared, distinct from the whole-attempt stage
+    // credentials materialized earlier in this test.
+    expect(credentialProvider).toHaveBeenLastCalledWith(resource, ["model.invoke", "repo.read", "repo.write"]);
+    const uploadedCredentialsCall = (sandbox.fs.uploadFile as ReturnType<typeof vi.fn>).mock.calls.find(
+      ([, path]) => path === "/var/lib/openthrottle/loop-dispatch/attempt-child.loop-1.credentials.json"
+    );
+    expect(uploadedCredentialsCall).toBeDefined();
+    expect(JSON.parse((uploadedCredentialsCall![0] as Buffer).toString("utf8"))).toEqual({
+      env: { GITHUB_TOKEN: "secret-token" },
+    });
+    expect(sandbox.fs.setFilePermissions).toHaveBeenCalledWith(
+      "/var/lib/openthrottle/loop-dispatch/attempt-child.loop-1.credentials.json",
+      { owner: "root", group: "root", mode: "400" }
+    );
+    const dispatchLoopActionCommand = (sandbox.process.executeSessionCommand as ReturnType<typeof vi.fn>).mock.calls
+      .find(([sessionId]) => sessionId === "loop-loop-1")?.[1].command as string;
+    expect(dispatchLoopActionCommand).toMatch(
+      /cp .*loop-dispatch\/attempt-child\.loop-1\.credentials\.json.*loop-actions\/attempt-child\/loop-1\/credentials\.json.*rm -f .*loop-dispatch\/attempt-child\.loop-1\.credentials\.json.*execute-loop\.mjs --request .*request\.json.*--credentials .*loop-actions\/attempt-child\/loop-1\/credentials\.json.*--output/
+    );
+    // A losing `flock --nonblock` (another dispatch for this exact action
+    // already holds it) must still clean up the staged files this call just
+    // uploaded, since the script body above never runs in that case.
+    expect(dispatchLoopActionCommand).toMatch(
+      /\|\| rm -f .*loop-dispatch\/attempt-child\.loop-1\.credentials\.json.*loop-dispatch\/attempt-child\.loop-1\.request\.json/
+    );
+    // A redispatch of an already-completed action must clean up both staged
+    // uploads, not just the credentials file -- the request file is not
+    // secret, but it is otherwise never removed on this fast-exit path.
+    expect(dispatchLoopActionCommand).toMatch(
+      /then rm -f .*loop-dispatch\/attempt-child\.loop-1\.credentials\.json.*loop-dispatch\/attempt-child\.loop-1\.request\.json.*; exit 0; fi/
     );
 
     const loopWithOpencodeAgent = {
@@ -370,6 +403,83 @@ describe("Daytona stage execution", () => {
       ["repo.read"]
     )).rejects.toThrow(/forbidden sandbox variable/);
     expect(sandbox.updateEnv).not.toHaveBeenCalled();
+  });
+
+  it("refuses to dispatch a loop action whose credentials fall outside the sandbox allowlist", async () => {
+    const sandbox = {
+      id: "provider-opaque-loop-forbidden",
+      state: "started",
+      autoStopInterval: 60,
+      setAutostopInterval: vi.fn(async () => undefined),
+      fs: { createFolder: vi.fn(async () => undefined), uploadFile: vi.fn(async () => undefined), setFilePermissions: vi.fn(async () => undefined) },
+      process: { executeSessionCommand: vi.fn(async () => ({ cmdId: "dispatch" })), createSession: vi.fn(async () => undefined) },
+    } as unknown as Sandbox;
+    const runtime = createDaytonaSandboxRuntime({ get: vi.fn(async () => sandbox) } as never, {
+      snapshot: "snapshot-v1",
+      materializeCredentialEnv: vi.fn(async () => ({ env: { DAYTONA_API_KEY: "forbidden" } })),
+    });
+    const withoutFence = {
+      protocol: "loop-action@2" as const,
+      actionId: "loop-forbidden",
+      attemptId: "attempt-forbidden",
+      graphId: "graph-1",
+      unitId: null,
+      role: "lead" as const,
+      loop: "lead" as const,
+      agent: "codex" as const,
+      skill: "accept-unit",
+      worktree: null,
+      nativeSessionId: null,
+      contextPolicy: "fresh" as const,
+      timeoutMs: 30_000,
+      transitionContext: "",
+      allowedMcpServers: [],
+      credentialScopes: ["repo.read"] as const,
+      receiptSchema: "openthrottle.receipt/v1",
+      candidateSubject: "a".repeat(40),
+      requestHash: "",
+      idempotencyKey: "",
+    };
+    const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...canonicalFence } = withoutFence;
+    const hash = digestNormalized(canonicalJson(canonicalFence));
+    const request = { ...withoutFence, requestHash: hash, idempotencyKey: `loop:attempt-forbidden:loop-forbidden:${hash}` };
+    await expect(runtime.dispatchLoopAction({ providerResourceId: "provider-opaque-loop-forbidden" }, request))
+      .rejects.toThrow(/forbidden sandbox variable DAYTONA_API_KEY for loop action loop-forbidden/);
+    expect(sandbox.fs.uploadFile).not.toHaveBeenCalled();
+  });
+
+  it("refuses to dispatch a loop action outside the closed logical credential scope set", async () => {
+    const sandbox = { id: "provider-opaque-loop-scope", state: "started" } as unknown as Sandbox;
+    const runtime = createDaytonaSandboxRuntime({ get: vi.fn(async () => sandbox) } as never, {
+      snapshot: "snapshot-v1",
+      materializeCredentialEnv: vi.fn(async () => ({ env: {} })),
+    });
+    const withoutFence = {
+      protocol: "loop-action@2" as const,
+      actionId: "loop-scope",
+      attemptId: "attempt-scope",
+      graphId: "graph-1",
+      unitId: null,
+      role: "reviewer" as const,
+      loop: "review" as const,
+      agent: "codex" as const,
+      skill: "final-review",
+      worktree: null,
+      nativeSessionId: null,
+      contextPolicy: "fresh" as const,
+      timeoutMs: 30_000,
+      transitionContext: "",
+      allowedMcpServers: [],
+      credentialScopes: ["daytona.admin"],
+      receiptSchema: "openthrottle.receipt/v1",
+      requestHash: "",
+      idempotencyKey: "",
+    };
+    const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...canonicalFence } = withoutFence;
+    const hash = digestNormalized(canonicalJson(canonicalFence));
+    const request = { ...withoutFence, requestHash: hash, idempotencyKey: `loop:attempt-scope:loop-scope:${hash}` };
+    await expect(runtime.dispatchLoopAction({ providerResourceId: "provider-opaque-loop-scope" }, request as never))
+      .rejects.toThrow(/credential scope daytona\.admin is not a recognized logical credential/);
   });
 
   it("passes bounded cleanup deadlines to Daytona stop, quarantine, and delete calls", async () => {
