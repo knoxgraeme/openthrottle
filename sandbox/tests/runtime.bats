@@ -262,6 +262,65 @@ make_stage_branch_fixture() {
   [ "$status" -ne 0 ]
 }
 
+@test "heal_claude_config restores the newest bake backup when the config is missing" {
+  config="${BATS_TEST_TMPDIR}/.claude.json"
+  backups="${BATS_TEST_TMPDIR}/backups"
+  mkdir -p "$backups"
+  printf '{"generation":"older"}\n' > "$backups/.claude.json.backup.1753900000000"
+  printf '{"generation":"newest"}\n' > "$backups/.claude.json.backup.1753900000001"
+
+  run heal_claude_config "$config" "$backups"
+  [ "$status" -eq 0 ]
+  [ "$output" = "restored ${backups}/.claude.json.backup.1753900000001" ]
+  [ "$(jq -r '.generation' "$config")" = "newest" ]
+}
+
+@test "heal_claude_config leaves an existing valid config alone" {
+  config="${BATS_TEST_TMPDIR}/.claude.json"
+  backups="${BATS_TEST_TMPDIR}/backups"
+  mkdir -p "$backups"
+  printf '{"generation":"live"}\n' > "$config"
+  printf '{"generation":"stale"}\n' > "$backups/.claude.json.backup.1753900000000"
+
+  run heal_claude_config "$config" "$backups"
+  [ "$status" -eq 0 ]
+  [ "$output" = "ok" ]
+  [ "$(jq -r '.generation' "$config")" = "live" ]
+}
+
+@test "heal_claude_config reports an absent config with no backups for CLI regeneration" {
+  # Not a failure: reset_agent_execution_state removes ~/.claude.json at every
+  # stage boundary, and the Claude CLI regenerates a fresh config on launch
+  # whenever no corruption-recovery backups exist. Only the
+  # missing-config-WITH-backups state blocks the launch (OPE-87).
+  config="${BATS_TEST_TMPDIR}/.claude.json"
+  run heal_claude_config "$config" "${BATS_TEST_TMPDIR}/backups"
+  [ "$status" -eq 0 ]
+  [ "$output" = "absent" ]
+  [ ! -e "$config" ]
+}
+
+@test "heal_claude_config fails closed when the restored backup is not valid JSON" {
+  config="${BATS_TEST_TMPDIR}/.claude.json"
+  backups="${BATS_TEST_TMPDIR}/backups"
+  mkdir -p "$backups"
+  printf '{"generation":"older-valid"}\n' > "$backups/.claude.json.backup.1753900000000"
+  printf 'not json\n' > "$backups/.claude.json.backup.1753900000001"
+
+  run heal_claude_config "$config" "$backups"
+  [ "$status" -eq 1 ]
+  [ "$output" = "FATAL: ${config} restored from bake backup ${backups}/.claude.json.backup.1753900000001 is not valid JSON; the supervisor must retry the stage" ]
+}
+
+@test "heal_claude_config fails closed on an existing corrupt config" {
+  config="${BATS_TEST_TMPDIR}/.claude.json"
+  printf 'not json\n' > "$config"
+
+  run heal_claude_config "$config" "${BATS_TEST_TMPDIR}/backups"
+  [ "$status" -eq 1 ]
+  [ "$output" = "FATAL: ${config} is present but not valid JSON; the supervisor must retry the stage" ]
+}
+
 @test "codex_reconcile_auth orders ISO-8601 offsets and fractional seconds by instant" {
   before='{"tokens":{"account_id":"acct"},"last_refresh":"2026-07-01T23:59:59.900Z"}'
   after_offset='{"tokens":{"account_id":"acct"},"last_refresh":"2026-07-02T02:00:00.100+02:00"}'

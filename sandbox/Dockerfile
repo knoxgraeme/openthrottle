@@ -110,6 +110,31 @@ RUN set -eux; \
       codex plugin list --json | jq -r '.installed[] | select(.pluginId == "compound-engineering@compound-engineering-plugin") | .version')" \
       = "$COMPOUND_ENGINEERING_VERSION"
 
+# The Claude CLI's config-corruption recovery can move /home/agent/.claude.json
+# into /home/agent/.claude/backups/.claude.json.backup.<ms> WITHOUT recreating
+# it during the plugin bake above. A bake that flakes this way ships a snapshot
+# where every `claude` launch fails at startup ("Claude configuration file not
+# found ... A backup file exists at: ..."), which killed OPE-83 generation 3
+# (OPE-87). Heal from the newest backup if the config is missing, then
+# hard-assert a parseable config so a broken bake fails this build loudly
+# instead of shipping. Finally clear the backup debris: entrypoint.sh removes
+# ~/.claude.json at every stage boundary, and the CLI only regenerates a fresh
+# config when no backups are present, so a baked-in backup file poisons every
+# runtime launch even when the config itself survived the bake.
+RUN set -eux; \
+    claude_config="/home/agent/.claude.json"; \
+    claude_backups="/home/agent/.claude/backups"; \
+    if [ ! -f "$claude_config" ]; then \
+      newest_backup="$(ls -1 "$claude_backups/.claude.json.backup."* 2>/dev/null | sort | tail -n 1)"; \
+      if [ -n "$newest_backup" ]; then \
+        cp "$newest_backup" "$claude_config"; \
+        chown agent:agent "$claude_config"; \
+      fi; \
+    fi; \
+    test -f "$claude_config"; \
+    jq empty "$claude_config"; \
+    rm -f "$claude_backups/.claude.json.backup."*
+
 # ---------------------------------------------------------------------------
 # OpenThrottle payload. Build context is the repo root:
 #   - entrypoint.sh, runner/, safety/ live under sandbox/
