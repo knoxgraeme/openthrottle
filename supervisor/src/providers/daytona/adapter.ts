@@ -406,18 +406,19 @@ export function createDaytonaSandboxRuntime(
       const stagedRequestPath = `${LOOP_DISPATCH_DIR}/${request.attemptId}.${request.actionId}.${dispatchNonce}.request.json`;
       const stagedCredentialsPath = `${LOOP_DISPATCH_DIR}/${request.attemptId}.${request.actionId}.${dispatchNonce}.credentials.json`;
       const lockPath = `${LOOP_DISPATCH_DIR}/${request.attemptId}.${request.actionId}.lock`;
-      // The request and credentials files are staged at independent paths
-      // with no ordering dependency on each other (each is upload-then-lock
-      // its own file), so the two pairs run concurrently instead of as four
-      // sequential round trips to the sandbox provider.
-      await Promise.all([
-        sandbox.fs
-          .uploadFile(Buffer.from(canonicalJson(request)), stagedRequestPath)
-          .then(() => sandbox.fs.setFilePermissions(stagedRequestPath, { owner: "root", group: "root", mode: "400" })),
-        sandbox.fs
-          .uploadFile(Buffer.from(canonicalJson({ env: credentialMaterialization.env })), stagedCredentialsPath)
-          .then(() => sandbox.fs.setFilePermissions(stagedCredentialsPath, { owner: "root", group: "root", mode: "400" })),
-      ]);
+      // Upload-then-chmod each file immediately, one at a time: a request
+      // upload/chmod failure must leave the credentials file never staged at
+      // all, not merely unreadable. Parallelizing these would let the
+      // credentials leg finish (fully uploaded and chmod 400) even when the
+      // request leg fails, and would widen each file's window between
+      // upload and chmod while the other file's round trip is in flight.
+      await sandbox.fs.uploadFile(Buffer.from(canonicalJson(request)), stagedRequestPath);
+      await sandbox.fs.setFilePermissions(stagedRequestPath, { owner: "root", group: "root", mode: "400" });
+      await sandbox.fs.uploadFile(
+        Buffer.from(canonicalJson({ env: credentialMaterialization.env })),
+        stagedCredentialsPath
+      );
+      await sandbox.fs.setFilePermissions(stagedCredentialsPath, { owner: "root", group: "root", mode: "400" });
       const sessionId = `loop-${request.actionId}`;
       if (!sandbox.process?.executeSessionCommand) {
         throw new Error("Daytona runtime does not expose session command execution");
