@@ -256,6 +256,9 @@ const receipt = {
     worker_id: "probe",
     skill: producerSkill,
     capability_digest: "1".repeat(64),
+    // Repository-skill producers pin their exact package digest; builtin
+    // producers have no repository package, so the contract requires null.
+    skill_package_digest: producerSkill.startsWith("repo://") ? "3".repeat(64) : null,
   },
   subject: {
     base: subject,
@@ -267,6 +270,10 @@ const receipt = {
     graph_digest: "2".repeat(64),
     unit_id: process.env.PROBE_RECEIPT_UNIT_ID,
     attempt_id: process.env.PROBE_RECEIPT_ATTEMPT_ID,
+    parent_run_id: process.env.PROBE_RECEIPT_PARENT_RUN_ID,
+    action_attempt_id: process.env.PROBE_RECEIPT_ACTION_ATTEMPT_ID,
+    generation: Number(process.env.PROBE_RECEIPT_GENERATION),
+    native_session_id: process.env.PROBE_RECEIPT_NATIVE_SESSION_ID || null,
     request_hash: process.env.PROBE_RECEIPT_REQUEST_HASH,
   },
   evidence: ["built-image isolation probe passed"],
@@ -561,6 +568,10 @@ write_probe_env \
   PROBE_RECEIPT_UNIT_ID "unit-1" \
   PROBE_RECEIPT_ATTEMPT_ID "attempt-current" \
   PROBE_RECEIPT_REQUEST_HASH "$CURRENT_REQUEST_HASH" \
+  PROBE_RECEIPT_PARENT_RUN_ID "run-parent" \
+  PROBE_RECEIPT_ACTION_ATTEMPT_ID "action-attempt-1" \
+  PROBE_RECEIPT_GENERATION "1" \
+  PROBE_RECEIPT_NATIVE_SESSION_ID "" \
   PROBE_RECEIPT_SKILL "repo://owner/repo@$BASE#.agents/skills/current"
 PATH="$BIN:$PATH" \
 OT_LOOP_ACTION_ROOT="$ACTION_ROOT" \
@@ -596,6 +607,10 @@ write_probe_env \
   PROBE_RECEIPT_UNIT_ID "unit-1" \
   PROBE_RECEIPT_ATTEMPT_ID "attempt-current" \
   PROBE_RECEIPT_REQUEST_HASH "$LEAD_REQUEST_HASH" \
+  PROBE_RECEIPT_PARENT_RUN_ID "run-parent" \
+  PROBE_RECEIPT_ACTION_ATTEMPT_ID "action-attempt-1" \
+  PROBE_RECEIPT_GENERATION "1" \
+  PROBE_RECEIPT_NATIVE_SESSION_ID "" \
   PROBE_RECEIPT_SKILL "builtin://accept-unit@1"
 PATH="$BIN:$PATH" \
 OT_LOOP_ACTION_ROOT="$ACTION_ROOT" \
@@ -623,6 +638,10 @@ write_probe_env \
   PROBE_RECEIPT_UNIT_ID "unit-1" \
   PROBE_RECEIPT_ATTEMPT_ID "attempt-current" \
   PROBE_RECEIPT_REQUEST_HASH "$REVIEWER_REQUEST_HASH" \
+  PROBE_RECEIPT_PARENT_RUN_ID "run-parent" \
+  PROBE_RECEIPT_ACTION_ATTEMPT_ID "action-attempt-1" \
+  PROBE_RECEIPT_GENERATION "1" \
+  PROBE_RECEIPT_NATIVE_SESSION_ID "" \
   PROBE_RECEIPT_SKILL "builtin://final-review@1"
 PATH="$BIN:$PATH" \
 OT_LOOP_ACTION_ROOT="$ACTION_ROOT" \
@@ -648,6 +667,10 @@ write_probe_env \
   PROBE_RECEIPT_UNIT_ID "unit-1" \
   PROBE_RECEIPT_ATTEMPT_ID "attempt-current" \
   PROBE_RECEIPT_REQUEST_HASH "$BUILTIN_REQUEST_HASH" \
+  PROBE_RECEIPT_PARENT_RUN_ID "run-parent" \
+  PROBE_RECEIPT_ACTION_ATTEMPT_ID "action-attempt-1" \
+  PROBE_RECEIPT_GENERATION "1" \
+  PROBE_RECEIPT_NATIVE_SESSION_ID "" \
   PROBE_RECEIPT_SKILL "builtin://accept-unit@1"
 PATH="$BIN:$PATH" \
 OT_LOOP_ACTION_ROOT="$ACTION_ROOT" \
