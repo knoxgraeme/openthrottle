@@ -127,14 +127,20 @@ export function codexMcpServersToml(mcpServers) {
       // fail closed instead so the mismatch is caught rather than hidden.
       throw new Error(`mcp_servers.${name} has no local (stdio) command; Codex loop actions cannot use a remote-only MCP server`);
     }
-    const lines = [`[mcp_servers.${name}]`, `command = ${tomlString(server.command)}`];
+    // `name` is a bare interpolation target, so it must be a quoted TOML key
+    // segment (tomlString), never a raw bareword: IDENTIFIER (and therefore
+    // this server's own admitted name) allows '.' and '/', and an unquoted
+    // '.' is TOML's own nested-table separator while '/' is not a valid
+    // bareword character at all -- either would corrupt or misparse this
+    // table header for a validly admitted server name.
+    const lines = [`[mcp_servers.${tomlString(name)}]`, `command = ${tomlString(server.command)}`];
     if (Array.isArray(server.args) && server.args.length > 0) {
       lines.push(`args = ${tomlStringArray(server.args)}`);
     }
     const env = server.env && typeof server.env === "object" ? server.env : {};
     const envEntries = Object.entries(env);
     if (envEntries.length > 0) {
-      lines.push(`[mcp_servers.${name}.env]`);
+      lines.push(`[mcp_servers.${tomlString(name)}.env]`);
       for (const [key, value] of envEntries) {
         if (!MCP_ENV_NAME.test(key)) throw new Error(`mcp_servers.${name}.env key ${key} is invalid`);
         lines.push(`${key} = ${tomlString(value)}`);

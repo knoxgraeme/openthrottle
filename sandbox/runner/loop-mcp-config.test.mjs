@@ -128,11 +128,30 @@ describe("loop action MCP config materialization", () => {
 
   it("serializes local (stdio) servers to Codex config.toml", () => {
     const toml = codexMcpServersToml(selectAllowedMcpServers(["github"], repositoryConfig));
-    expect(toml).toContain('[mcp_servers.github]');
+    expect(toml).toContain('[mcp_servers."github"]');
     expect(toml).toContain('command = "mcp-github"');
     expect(toml).toContain('args = ["--stdio"]');
-    expect(toml).toContain('[mcp_servers.github.env]');
+    expect(toml).toContain('[mcp_servers."github".env]');
     expect(toml).toContain('GITHUB_MCP_MODE = "mcp-github"'.replace("mcp-github", "readonly"));
+  });
+
+  it("quotes the server-name table header so a name using the IDENTIFIER contract's '/' or a second '.' segment cannot corrupt or misparse the TOML structure", () => {
+    // An unquoted `.` in a TOML table header is its own nested-table
+    // separator, and `/` is not a valid bareword character at all -- both
+    // are permitted by the shared IDENTIFIER contract this name is
+    // validated against (see the MCP_SERVER_NAME/IDENTIFIER cross-check
+    // test), so the header must always be a quoted key, never a bareword.
+    const slashName = codexMcpServersToml({ "team/github": { command: "mcp-github" } });
+    expect(slashName).toContain('[mcp_servers."team/github"]');
+    expect(slashName).not.toMatch(/\[mcp_servers\.team\/github\]/);
+
+    const dottedName = codexMcpServersToml({ "team.github": { command: "mcp-github", env: { X: "y" } } });
+    expect(dottedName).toContain('[mcp_servers."team.github"]');
+    expect(dottedName).toContain('[mcp_servers."team.github".env]');
+    // Must not produce a *nested* [mcp_servers.team.github] table, which
+    // parses to a different structure than the single flat entry admission
+    // validated ("team.github" as one server name, not team -> github).
+    expect(dottedName).not.toMatch(/\[mcp_servers\.team\.github\]/);
   });
 
   it("fails closed on a remote-only MCP server instead of silently dropping it", () => {
@@ -172,7 +191,7 @@ describe("loop action MCP config materialization", () => {
     expect(appended).toBe(true);
     const content = readFileSync(configPath, "utf8");
     expect(content).toContain("# baseline config");
-    expect(content).toContain("[mcp_servers.github]");
+    expect(content).toContain('[mcp_servers."github"]');
   });
 
   it("is a no-op append when no MCP servers are declared", () => {
