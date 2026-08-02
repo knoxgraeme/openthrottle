@@ -14,13 +14,10 @@ import { materializeNativeSessionState, nativeSessionStoragePath } from "./nativ
 import { materializeRepositorySkillPackage } from "./repository-skills.mjs";
 import { appendCodexMcpConfig, selectAllowedMcpServers, writeClaudeMcpConfigFile } from "./loop-mcp-config.mjs";
 import { actionDirectory, configuredActionRoot, gitSafeDirectoryEnv, prepareLoopGitObjectEnvironment, prepareRootReadOnlyDirectory } from "./execute-loop.mjs";
+import { pathInside, PROFILE_ROOT_FENCE_FILE } from "./loop-paths.mjs";
 
 const ROOT_UID = 0;
 const ROOT_GID = 0;
-
-function pathInside(root, child) {
-  return containedPath(root, child, "loop action path escapes the executor root");
-}
 
 function prepareExecutorOwnedProfileRoot(path) {
   if (!isRoot()) return;
@@ -34,10 +31,6 @@ function lockExecutorOwnedSkillTree(path) {
   if (isRoot()) chownTree(path, ROOT_UID, ROOT_GID);
   chmodReadOnlyPreservingExecuteTree(path);
 }
-
-// Same filename convention as assertProfileRootFence in execute-loop.mjs
-// (duplicated rather than exported/imported back: a plain literal, not logic).
-const PROFILE_ROOT_FENCE_FILE = ".ot-profile-fence";
 
 // Inode identity cannot detect replace-after-delete on filesystems that
 // recycle inode numbers (ext4). A root-owned nonce file works everywhere:

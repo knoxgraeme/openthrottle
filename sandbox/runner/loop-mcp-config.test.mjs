@@ -76,6 +76,22 @@ describe("loop action MCP config materialization", () => {
     expect(sandboxMatch[1]).toBe(contractsMatch[1]);
   });
 
+  it("keeps the sandbox-side MCP env-key pattern aligned with contracts' ENV_NAME", () => {
+    // Same hand-mirrored-copy constraint as MCP_SERVER_NAME/IDENTIFIER above.
+    const sandboxSource = readFileSync(new URL("./loop-mcp-config.mjs", import.meta.url), "utf8");
+    const sandboxMatch = sandboxSource.match(/const MCP_ENV_NAME = (\/\^.*\$\/);/);
+    expect(sandboxMatch).not.toBeNull();
+
+    const contractsSource = readFileSync(
+      new URL("../../contracts/src/config.ts", import.meta.url),
+      "utf8"
+    );
+    const contractsMatch = contractsSource.match(/const ENV_NAME = (\/\^.*\$\/);/);
+    expect(contractsMatch).not.toBeNull();
+
+    expect(sandboxMatch[1]).toBe(contractsMatch[1]);
+  });
+
   it("rejects a repository-declared server entry that is not an object", () => {
     expect(() => selectAllowedMcpServers(["weird"], { mcp_servers: { weird: "not-an-object" } }))
       .toThrow(/mcp_servers\.weird must be an object/);

@@ -14,6 +14,8 @@ const MAX_REPOSITORY_CONFIG_BYTES = 64 * 1024;
 // validator drift between the two layers.
 const MCP_SERVER_NAME = /^[a-z][a-z0-9]*(?:[._/-][a-z0-9]+)*$/;
 const MCP_SERVER_NAME_MAX_LENGTH = 512;
+// Hand-mirrors contracts/src/config.ts's (unexported) ENV_NAME, cross-checked
+// by source text below for the same reason as MCP_SERVER_NAME above.
 const MCP_ENV_NAME = /^[A-Z_][A-Z0-9_]*$/;
 
 function assertObject(value, label) {
@@ -40,11 +42,16 @@ export function readSealedRepositoryConfig(
   return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
 }
 
-export function selectAllowedMcpServers(allowedMcpServers, repositoryConfig = readSealedRepositoryConfig()) {
-  const servers = repositoryConfig.mcp_servers && typeof repositoryConfig.mcp_servers === "object"
-    ? repositoryConfig.mcp_servers
-    : {};
+export function selectAllowedMcpServers(allowedMcpServers, repositoryConfig = null) {
   const selected = {};
+  // Most loop actions declare no MCP servers at all; skip the sealed-config
+  // disk read and parse entirely for that common case rather than paying it
+  // on every dispatch only to discard the result in the loop below.
+  if (allowedMcpServers.length === 0) return selected;
+  const resolvedConfig = repositoryConfig ?? readSealedRepositoryConfig();
+  const servers = resolvedConfig.mcp_servers && typeof resolvedConfig.mcp_servers === "object"
+    ? resolvedConfig.mcp_servers
+    : {};
   for (const name of allowedMcpServers) {
     if (name.length > MCP_SERVER_NAME_MAX_LENGTH || !MCP_SERVER_NAME.test(name)) {
       throw new Error(`allowed MCP server name ${name} is invalid`);

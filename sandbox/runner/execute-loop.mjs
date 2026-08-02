@@ -27,6 +27,7 @@ import { writeJsonAtomic } from "./atomic-write.mjs";
 import { validateRepositorySkillPackage } from "./repository-skills.mjs";
 import { readLoopActionCredentialEnv } from "./loop-credentials.mjs";
 import { prepareLoopAgentEnvironment } from "./loop-agent-environment.mjs";
+import { pathInside, PROFILE_ROOT_FENCE_FILE } from "./loop-paths.mjs";
 import {
   extractNativeSessionId,
   sealNativeSessionPackage,
@@ -127,10 +128,6 @@ function boundedArray(value, label, max = 32) {
     throw new Error(`${label} must be a bounded unique string array`);
   }
   return [...value].sort();
-}
-
-function pathInside(root, child) {
-  return containedPath(root, child, "loop action path escapes the executor root");
 }
 
 export function configuredActionRoot(env = process.env) {
@@ -386,8 +383,6 @@ function retryableInfrastructureError(message) {
   error.retryableInfrastructureFailure = true;
   return error;
 }
-
-const PROFILE_ROOT_FENCE_FILE = ".ot-profile-fence";
 
 function assertProfileRootFence(profileRoot, nonce) {
   const replaced = new Error("native session profile root was replaced during the action");
