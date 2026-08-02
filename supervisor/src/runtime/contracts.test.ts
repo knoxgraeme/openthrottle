@@ -8,6 +8,7 @@ import { createSupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
 import { reconcileSandboxAutostop } from "./lifecycle.js";
 import {
+  assertLogicalCredentialScopes,
   loadRuntimeCapabilityDescriptor,
   validateRuntimeCapabilityDescriptor,
 } from "./contracts.js";
@@ -161,5 +162,12 @@ describe("sandbox runtime port", () => {
     const source = readFileSync(fileURLToPath(new URL("./contracts.ts", import.meta.url)), "utf8");
     expect(source).not.toContain("@daytona/sdk");
     expect(source).not.toMatch(/Daytona/);
+  });
+
+  it("accepts only the closed logical credential scope set for loop actions", () => {
+    expect(() => assertLogicalCredentialScopes(["model.invoke", "repo.read", "mcp"])).not.toThrow();
+    expect(() => assertLogicalCredentialScopes([])).not.toThrow();
+    expect(() => assertLogicalCredentialScopes(["daytona.admin"]))
+      .toThrow(/credential scope daytona\.admin is not a recognized logical credential/);
   });
 });

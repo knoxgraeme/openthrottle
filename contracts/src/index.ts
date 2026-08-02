@@ -38,6 +38,7 @@ export {
   type GraphTransition,
   type GraphWorker,
   type AgentInheritance,
+  type LogicalCredential,
 } from "./graph.js";
 export {
   EXECUTION_PLAN_SCHEMA,

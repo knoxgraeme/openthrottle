@@ -2,6 +2,7 @@ import type { Config } from "../../app/config.js";
 import type { Ticket } from "../../persistence/store.js";
 import type { SupervisorStore } from "../../persistence/store.js";
 import type { RuntimeWorkspace } from "../../runtime/contracts.js";
+import type { Agent } from "../../pipeline/types.js";
 import { sanitizeText } from "../../shared/sanitize.js";
 
 /**
@@ -290,10 +291,16 @@ export async function getCodexAuthForSeed(
 export function createCredentialMaterializer(cfg: Config, store: SupervisorStore) {
   return async (
     resource: { providerResourceId: string },
-    scopes: readonly string[]
+    scopes: readonly string[],
+    agentOverride?: Agent
   ): Promise<{ env: Record<string, string> }> => {
     const ticket = store.getBySandboxId(resource.providerResourceId);
     if (!ticket) throw new Error(`runtime resource ${resource.providerResourceId} has no ticket binding`);
+    // A loop action may declare its own engine independent of the ticket's
+    // default (e.g. a Codex action inside a Claude ticket); the caller passes
+    // that action-scoped agent explicitly so the right concrete secret is
+    // selected instead of always defaulting to the ticket's own agent.
+    const agent = agentOverride ?? ticket.agent;
     const requested = new Set(scopes);
     const env: Record<string, string> = {};
     if (requested.has("repo.write")) {
@@ -304,16 +311,16 @@ export function createCredentialMaterializer(cfg: Config, store: SupervisorStore
     if (requested.has("model.invoke")) {
       const claudeCredential = cfg.claudeCodeOauthToken;
       const openCodeCredential = cfg.kimiCodeApiKey;
-      if (ticket.agent === "claude" && claudeCredential) {
+      if (agent === "claude" && claudeCredential) {
         env.CLAUDE_CODE_OAUTH_TOKEN = claudeCredential;
-      } else if (ticket.agent === "codex") {
+      } else if (agent === "codex") {
         const codexCredential = await getCodexAuthForSeed(cfg, store);
         if (!codexCredential) throw new Error("model credential for codex is unavailable");
         env.CODEX_AUTH_JSON = codexCredential;
-      } else if (ticket.agent === "opencode" && openCodeCredential) {
+      } else if (agent === "opencode" && openCodeCredential) {
         env.KIMI_CODE_API_KEY = openCodeCredential;
       } else {
-        throw new Error(`model credential for ${ticket.agent} is unavailable`);
+        throw new Error(`model credential for ${agent} is unavailable`);
       }
     }
     return { env };

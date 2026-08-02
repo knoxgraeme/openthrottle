@@ -36,6 +36,20 @@ PERSISTENT_OPENCODE_ROOT="/home/agent/.local/share/opencode"
 PERSISTENT_OPENCODE_SECRET="$PERSISTENT_OPENCODE_ROOT/ot-persistent-probe-secret.txt"
 PERSISTENT_OT_SECRET="/home/agent/.ot/ot-persistent-probe-secret.txt"
 PROFILE_REPLACEMENT_TARGET="$ACTION_ROOT/attempt-current/profile-replacement-target"
+# RU6 replaces (not merges) the loop-action child env, so PROBE_* test
+# coordination variables no longer reach the agent stub via inheritance. Seal
+# each invocation's PROBE_* values into this fixed, world-readable file that
+# the stub sources for itself instead -- the same pattern this script already
+# uses for other cross-process probe artifacts (/tmp/ot-probe-*).
+PROBE_ENV_FILE="/tmp/ot-probe-env.sh"
+write_probe_env() {
+  : > "$PROBE_ENV_FILE"
+  while [ "$#" -ge 2 ]; do
+    printf 'export %s=%q\n' "$1" "$2" >> "$PROBE_ENV_FILE"
+    shift 2
+  done
+  chmod 0644 "$PROBE_ENV_FILE"
+}
 
 install -d -o agent -g agent -m 0700 "$INTEGRATION"
 install -d -o root -g root -m 0711 "$WORKTREES"
@@ -190,6 +204,11 @@ ln -s "$INTEGRATION/file.txt" "$WORKTREES/current/integration-link"
 cat > "$BIN/codex" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
+
+# RU6's action-scoped child env no longer carries this script's own
+# inherited environment, so the outer probe seals this invocation's PROBE_*
+# coordination variables here instead of relying on inheritance.
+. /tmp/ot-probe-env.sh
 
 must_fail() {
   if "$@" >/dev/null 2>&1; then
@@ -517,35 +536,36 @@ printf 'mutable worktree skill bytes\n' > "$WORKTREES/current/.agents/skills/cur
 printf '#!/bin/sh\necho executable probe\n' > "$WORKTREES/current/executable-probe.sh"
 chmod 0755 "$WORKTREES/current/executable-probe.sh"
 
+write_probe_env \
+  PROBE_INTEGRATION "$INTEGRATION" \
+  PROBE_SEALED_INPUT "$SEALED" \
+  PROBE_ROOT_HELPER_PID "$(cat "$ROOT_HELPER_PID_FILE")" \
+  PROBE_SIBLING_WORKTREE "$WORKTREES/sibling" \
+  PROBE_SIBLING_ONLY_BLOB "$SIBLING_ONLY_BLOB" \
+  PROBE_SIBLING_ACTION_SECRET "$ACTION_ROOT/attempt-current/action-sibling/secret.txt" \
+  PROBE_PRIOR_ACTION_SECRET "$ACTION_ROOT/attempt-prior/action-current/secret.txt" \
+  PROBE_PRIOR_HOME_SECRET "$ACTION_ROOT/attempt-prior/action-home/home/native-session.json" \
+  PROBE_PERSISTENT_CLAUDE_SECRET "$PERSISTENT_CLAUDE_SECRET" \
+  PROBE_PERSISTENT_CODEX_SECRET "$PERSISTENT_CODEX_SECRET" \
+  PROBE_PERSISTENT_OPENCODE_SECRET "$PERSISTENT_OPENCODE_SECRET" \
+  PROBE_PERSISTENT_OT_SECRET "$PERSISTENT_OT_SECRET" \
+  PROBE_PERSISTENT_CLAUDE_ROOT "/home/agent/.claude" \
+  PROBE_PERSISTENT_CODEX_ROOT "/home/agent/.codex" \
+  PROBE_PERSISTENT_OPENCODE_LOCAL_ROOT "/home/agent/.local" \
+  PROBE_PERSISTENT_OPENCODE_SHARE_ROOT "/home/agent/.local/share" \
+  PROBE_PERSISTENT_OPENCODE_ROOT "$PERSISTENT_OPENCODE_ROOT" \
+  PROBE_PERSISTENT_OT_ROOT "/home/agent/.ot" \
+  PROBE_PROFILE_REPLACEMENT_TARGET "$PROFILE_REPLACEMENT_TARGET" \
+  PROBE_CURRENT_ACTION_DIR "$ACTION_ROOT/attempt-current/action-current" \
+  PROBE_BACKGROUND_PID "$BACKGROUND_PID" \
+  PROBE_RECEIPT_UNIT_ID "unit-1" \
+  PROBE_RECEIPT_ATTEMPT_ID "attempt-current" \
+  PROBE_RECEIPT_REQUEST_HASH "$CURRENT_REQUEST_HASH" \
+  PROBE_RECEIPT_SKILL "repo://owner/repo@$BASE#.agents/skills/current"
 PATH="$BIN:$PATH" \
 OT_LOOP_ACTION_ROOT="$ACTION_ROOT" \
 OT_WORKTREE_ROOT="$WORKTREES" \
 OT_INTEGRATION_REPO_DIR="$INTEGRATION" \
-PROBE_INTEGRATION="$INTEGRATION" \
-PROBE_SEALED_INPUT="$SEALED" \
-PROBE_ROOT_HELPER_PID="$(cat "$ROOT_HELPER_PID_FILE")" \
-PROBE_SIBLING_WORKTREE="$WORKTREES/sibling" \
-PROBE_SIBLING_ONLY_BLOB="$SIBLING_ONLY_BLOB" \
-PROBE_SIBLING_ACTION_SECRET="$ACTION_ROOT/attempt-current/action-sibling/secret.txt" \
-PROBE_PRIOR_ACTION_SECRET="$ACTION_ROOT/attempt-prior/action-current/secret.txt" \
-PROBE_PRIOR_HOME_SECRET="$ACTION_ROOT/attempt-prior/action-home/home/native-session.json" \
-PROBE_PERSISTENT_CLAUDE_SECRET="$PERSISTENT_CLAUDE_SECRET" \
-PROBE_PERSISTENT_CODEX_SECRET="$PERSISTENT_CODEX_SECRET" \
-PROBE_PERSISTENT_OPENCODE_SECRET="$PERSISTENT_OPENCODE_SECRET" \
-PROBE_PERSISTENT_OT_SECRET="$PERSISTENT_OT_SECRET" \
-PROBE_PERSISTENT_CLAUDE_ROOT="/home/agent/.claude" \
-PROBE_PERSISTENT_CODEX_ROOT="/home/agent/.codex" \
-PROBE_PERSISTENT_OPENCODE_LOCAL_ROOT="/home/agent/.local" \
-PROBE_PERSISTENT_OPENCODE_SHARE_ROOT="/home/agent/.local/share" \
-PROBE_PERSISTENT_OPENCODE_ROOT="$PERSISTENT_OPENCODE_ROOT" \
-PROBE_PERSISTENT_OT_ROOT="/home/agent/.ot" \
-PROBE_PROFILE_REPLACEMENT_TARGET="$PROFILE_REPLACEMENT_TARGET" \
-PROBE_CURRENT_ACTION_DIR="$ACTION_ROOT/attempt-current/action-current" \
-PROBE_BACKGROUND_PID="$BACKGROUND_PID" \
-PROBE_RECEIPT_UNIT_ID="unit-1" \
-PROBE_RECEIPT_ATTEMPT_ID="attempt-current" \
-PROBE_RECEIPT_REQUEST_HASH="$CURRENT_REQUEST_HASH" \
-PROBE_RECEIPT_SKILL="repo://owner/repo@$BASE#.agents/skills/current" \
 /opt/openthrottle/runner/execute-loop.mjs --request "$REQUEST" --output "$RESULT"
 
 if [ -s "$BACKGROUND_PID" ] && kill -0 "$(cat "$BACKGROUND_PID")" >/dev/null 2>&1; then
@@ -568,18 +588,19 @@ NODE
 gosu agent git -C "$INTEGRATION" rev-parse HEAD >/tmp/ot-probe-restored-head
 test "$(cat /tmp/ot-probe-restored-head)" = "$BASE"
 
+write_probe_env \
+  PROBE_INTEGRATION "$INTEGRATION" \
+  PROBE_BASE "$BASE" \
+  PROBE_SIBLING_ONLY_BLOB "$SIBLING_ONLY_BLOB" \
+  PROBE_READONLY_ACTION_DIR "$ACTION_ROOT/attempt-current/action-lead" \
+  PROBE_RECEIPT_UNIT_ID "unit-1" \
+  PROBE_RECEIPT_ATTEMPT_ID "attempt-current" \
+  PROBE_RECEIPT_REQUEST_HASH "$LEAD_REQUEST_HASH" \
+  PROBE_RECEIPT_SKILL "builtin://accept-unit@1"
 PATH="$BIN:$PATH" \
 OT_LOOP_ACTION_ROOT="$ACTION_ROOT" \
 OT_WORKTREE_ROOT="$WORKTREES" \
 OT_INTEGRATION_REPO_DIR="$INTEGRATION" \
-PROBE_INTEGRATION="$INTEGRATION" \
-PROBE_BASE="$BASE" \
-PROBE_SIBLING_ONLY_BLOB="$SIBLING_ONLY_BLOB" \
-PROBE_READONLY_ACTION_DIR="$ACTION_ROOT/attempt-current/action-lead" \
-PROBE_RECEIPT_UNIT_ID="unit-1" \
-PROBE_RECEIPT_ATTEMPT_ID="attempt-current" \
-PROBE_RECEIPT_REQUEST_HASH="$LEAD_REQUEST_HASH" \
-PROBE_RECEIPT_SKILL="builtin://accept-unit@1" \
 /opt/openthrottle/runner/execute-loop.mjs --request "$LEAD_REQUEST" --output "$LEAD_RESULT"
 
 node --input-type=module - "$LEAD_RESULT" <<'NODE'
@@ -594,18 +615,19 @@ if (result.kind !== "loop_action_result" ||
 }
 NODE
 
+write_probe_env \
+  PROBE_INTEGRATION "$INTEGRATION" \
+  PROBE_BASE "$BASE" \
+  PROBE_SIBLING_ONLY_BLOB "$SIBLING_ONLY_BLOB" \
+  PROBE_READONLY_ACTION_DIR "$ACTION_ROOT/attempt-current/action-reviewer" \
+  PROBE_RECEIPT_UNIT_ID "unit-1" \
+  PROBE_RECEIPT_ATTEMPT_ID "attempt-current" \
+  PROBE_RECEIPT_REQUEST_HASH "$REVIEWER_REQUEST_HASH" \
+  PROBE_RECEIPT_SKILL "builtin://final-review@1"
 PATH="$BIN:$PATH" \
 OT_LOOP_ACTION_ROOT="$ACTION_ROOT" \
 OT_WORKTREE_ROOT="$WORKTREES" \
 OT_INTEGRATION_REPO_DIR="$INTEGRATION" \
-PROBE_INTEGRATION="$INTEGRATION" \
-PROBE_BASE="$BASE" \
-PROBE_SIBLING_ONLY_BLOB="$SIBLING_ONLY_BLOB" \
-PROBE_READONLY_ACTION_DIR="$ACTION_ROOT/attempt-current/action-reviewer" \
-PROBE_RECEIPT_UNIT_ID="unit-1" \
-PROBE_RECEIPT_ATTEMPT_ID="attempt-current" \
-PROBE_RECEIPT_REQUEST_HASH="$REVIEWER_REQUEST_HASH" \
-PROBE_RECEIPT_SKILL="builtin://final-review@1" \
 /opt/openthrottle/runner/execute-loop.mjs --request "$REVIEWER_REQUEST" --output "$REVIEWER_RESULT"
 
 node --input-type=module - "$REVIEWER_RESULT" <<'NODE'
@@ -620,16 +642,17 @@ if (result.kind !== "loop_action_result" ||
 }
 NODE
 
+write_probe_env \
+  PROBE_BUILTIN_ACTION_DIR "$ACTION_ROOT/attempt-current/action-builtin" \
+  PROBE_PRIOR_HOME_SECRET "$ACTION_ROOT/attempt-prior/action-home/home/native-session.json" \
+  PROBE_RECEIPT_UNIT_ID "unit-1" \
+  PROBE_RECEIPT_ATTEMPT_ID "attempt-current" \
+  PROBE_RECEIPT_REQUEST_HASH "$BUILTIN_REQUEST_HASH" \
+  PROBE_RECEIPT_SKILL "builtin://accept-unit@1"
 PATH="$BIN:$PATH" \
 OT_LOOP_ACTION_ROOT="$ACTION_ROOT" \
 OT_WORKTREE_ROOT="$WORKTREES" \
 OT_INTEGRATION_REPO_DIR="$INTEGRATION" \
-PROBE_BUILTIN_ACTION_DIR="$ACTION_ROOT/attempt-current/action-builtin" \
-PROBE_PRIOR_HOME_SECRET="$ACTION_ROOT/attempt-prior/action-home/home/native-session.json" \
-PROBE_RECEIPT_UNIT_ID="unit-1" \
-PROBE_RECEIPT_ATTEMPT_ID="attempt-current" \
-PROBE_RECEIPT_REQUEST_HASH="$BUILTIN_REQUEST_HASH" \
-PROBE_RECEIPT_SKILL="builtin://accept-unit@1" \
 /opt/openthrottle/runner/execute-loop.mjs --request "$BUILTIN_REQUEST" --output "$BUILTIN_RESULT"
 
 node --input-type=module - "$BUILTIN_RESULT" <<'NODE'

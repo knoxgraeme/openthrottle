@@ -16,6 +16,18 @@ import {
   type StageRequestEnvelope,
 } from "../pipeline/stage-request.js";
 import type { RepositorySkillPackage } from "../pipeline/manifest.js";
+import { LOGICAL_CREDENTIALS, type LogicalCredential } from "@openthrottle/contracts";
+
+// The closed logical-scope set a loop action may declare (contracts/src/graph.ts
+// LOGICAL_CREDENTIALS). Enforced again here at the runtime boundary so a loop
+// action request can never carry an unrecognized scope, independent of the
+// schema-level check upstream in graph compilation.
+export function assertLogicalCredentialScopes(
+  scopes: readonly string[]
+): asserts scopes is readonly LogicalCredential[] {
+  const invalid = scopes.find((scope) => !LOGICAL_CREDENTIALS.includes(scope as LogicalCredential));
+  if (invalid) throw new Error(`credential scope ${invalid} is not a recognized logical credential`);
+}
 
 export interface RuntimeCapabilityDescriptor extends RuntimeCapabilityInventory {
   schema: "openthrottle.runtime-capabilities/v1";
@@ -68,7 +80,7 @@ export interface LoopActionRequest {
   timeoutMs: number;
   transitionContext: string;
   allowedMcpServers: readonly string[];
-  credentialScopes: readonly string[];
+  credentialScopes: readonly LogicalCredential[];
   receiptSchema: string;
   repositorySkill?: RepositorySkillPackage;
   requestHash: string;
