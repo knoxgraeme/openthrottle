@@ -44,6 +44,38 @@ describe("loop action MCP config materialization", () => {
     expect(() => selectAllowedMcpServers(["../escape"], repositoryConfig)).toThrow(/is invalid/);
   });
 
+  it("accepts every MCP server name shape the shared IDENTIFIER contract admits, including a '/' segment", () => {
+    // contracts/src/validation.ts's IDENTIFIER (used to validate
+    // worker.allowed_mcp_servers and config.mcp_servers keys at admission)
+    // permits '/' as a segment separator, e.g. a team-namespaced server name.
+    // This runtime check must not be stricter than what admission already
+    // accepted, or an admitted action fails solely on validator drift.
+    const namespaced = { mcp_servers: { "team/github": { command: "mcp-github" } } };
+    expect(selectAllowedMcpServers(["team/github"], namespaced)).toEqual({
+      "team/github": namespaced.mcp_servers["team/github"],
+    });
+  });
+
+  it("keeps the sandbox-side MCP server name pattern aligned with contracts' IDENTIFIER", () => {
+    // The sandbox cannot import @openthrottle/contracts (see the
+    // LOGICAL_CREDENTIAL_SCOPES cross-check in execute-loop.test.mjs for the
+    // same constraint), so this is a hand-mirrored copy. Cross-check the two
+    // source texts so a future change to one is caught if the other isn't
+    // updated to match.
+    const sandboxSource = readFileSync(new URL("./loop-mcp-config.mjs", import.meta.url), "utf8");
+    const sandboxMatch = sandboxSource.match(/const MCP_SERVER_NAME = (\/\^.*\$\/);/);
+    expect(sandboxMatch).not.toBeNull();
+
+    const contractsSource = readFileSync(
+      new URL("../../contracts/src/validation.ts", import.meta.url),
+      "utf8"
+    );
+    const contractsMatch = contractsSource.match(/export const IDENTIFIER = (\/\^.*\$\/);/);
+    expect(contractsMatch).not.toBeNull();
+
+    expect(sandboxMatch[1]).toBe(contractsMatch[1]);
+  });
+
   it("rejects a repository-declared server entry that is not an object", () => {
     expect(() => selectAllowedMcpServers(["weird"], { mcp_servers: { weird: "not-an-object" } }))
       .toThrow(/mcp_servers\.weird must be an object/);

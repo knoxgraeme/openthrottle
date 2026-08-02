@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { Daytona, type Sandbox } from "@daytona/sdk";
 import {
   type RuntimeResource,
@@ -38,7 +39,8 @@ export interface DaytonaSandboxRuntimeOptions {
   snapshot: string;
   materializeCredentialEnv: (
     resource: RuntimeResource,
-    scopes: readonly string[]
+    scopes: readonly string[],
+    agent?: LoopActionRequest["agent"]
   ) => Promise<DaytonaStageCredentialMaterialization>;
   taskTimeoutSeconds?: number;
 }
@@ -378,15 +380,31 @@ export function createDaytonaSandboxRuntime(
       // baseline rather than inheriting whatever the whole-attempt stage
       // credentials happen to be; the sandbox clears its inherited
       // environment and applies only this sealed envelope (execute-loop.mjs).
-      const credentialMaterialization = await options.materializeCredentialEnv(resource, request.credentialScopes);
+      // Pass the action's own agent explicitly: a graph worker can override
+      // the ticket's default engine (e.g. a Codex action in a Claude
+      // ticket), and the materializer must select that action's credential,
+      // not whatever the ticket-level default happens to be.
+      const credentialMaterialization = await options.materializeCredentialEnv(
+        resource,
+        request.credentialScopes,
+        request.agent
+      );
       assertSandboxCredentialEnv(credentialMaterialization.env, `loop action ${request.actionId}`);
       const actionDirectory = `${LOOP_ACTION_DIR}/${request.attemptId}/${request.actionId}`;
       const requestPath = loopActionPath(request.attemptId, request.actionId, "request.json");
       const credentialsPath = loopActionPath(request.attemptId, request.actionId, "credentials.json");
       const resultPath = loopActionPath(request.attemptId, request.actionId, "result.json");
       await prepareRootFolder(sandbox, LOOP_DISPATCH_DIR);
-      const stagedRequestPath = `${LOOP_DISPATCH_DIR}/${request.attemptId}.${request.actionId}.request.json`;
-      const stagedCredentialsPath = `${LOOP_DISPATCH_DIR}/${request.attemptId}.${request.actionId}.credentials.json`;
+      // Dispatch-unique (not just action-unique) staging paths: a concurrent
+      // redispatch of the same action must never stage over, or clean up,
+      // another in-flight dispatch's uploads. Two calls that lose the race
+      // for `lockPath` only ever touch their own nonce'd files, so the
+      // winner's in-progress `cp` below can never be deleted out from under
+      // it. `lockPath` itself stays action-scoped (no nonce) so it still
+      // serializes concurrent dispatches of the exact same action.
+      const dispatchNonce = randomUUID();
+      const stagedRequestPath = `${LOOP_DISPATCH_DIR}/${request.attemptId}.${request.actionId}.${dispatchNonce}.request.json`;
+      const stagedCredentialsPath = `${LOOP_DISPATCH_DIR}/${request.attemptId}.${request.actionId}.${dispatchNonce}.credentials.json`;
       const lockPath = `${LOOP_DISPATCH_DIR}/${request.attemptId}.${request.actionId}.lock`;
       await sandbox.fs.uploadFile(Buffer.from(canonicalJson(request)), stagedRequestPath);
       await sandbox.fs.setFilePermissions(stagedRequestPath, { owner: "root", group: "root", mode: "400" });

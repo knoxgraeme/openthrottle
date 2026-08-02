@@ -5,7 +5,15 @@ import { join } from "node:path";
 
 export const DEFAULT_REPOSITORY_CONFIG_PATH = "/var/lib/openthrottle/stage-input/repository-config.json";
 const MAX_REPOSITORY_CONFIG_BYTES = 64 * 1024;
-const MCP_SERVER_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+// Sandbox cannot import @openthrottle/contracts (separate deployable, no TS
+// build step -- see execute-loop.test.mjs's LOGICAL_CREDENTIAL_SCOPES
+// cross-check for the same constraint), so this hand-mirrors contracts/src/
+// validation.ts's IDENTIFIER pattern exactly, including its allowed `/`
+// separator. A stricter local regex here would reject an MCP server name
+// that admission already accepted, failing an admitted action solely on
+// validator drift between the two layers.
+const MCP_SERVER_NAME = /^[a-z][a-z0-9]*(?:[._/-][a-z0-9]+)*$/;
+const MCP_SERVER_NAME_MAX_LENGTH = 512;
 const MCP_ENV_NAME = /^[A-Z_][A-Z0-9_]*$/;
 
 function assertObject(value, label) {
@@ -38,7 +46,9 @@ export function selectAllowedMcpServers(allowedMcpServers, repositoryConfig = re
     : {};
   const selected = {};
   for (const name of allowedMcpServers) {
-    if (!MCP_SERVER_NAME.test(name)) throw new Error(`allowed MCP server name ${name} is invalid`);
+    if (name.length > MCP_SERVER_NAME_MAX_LENGTH || !MCP_SERVER_NAME.test(name)) {
+      throw new Error(`allowed MCP server name ${name} is invalid`);
+    }
     const server = servers[name];
     if (!server || server.enabled === false) continue;
     selected[name] = assertObject(server, `mcp_servers.${name}`);
