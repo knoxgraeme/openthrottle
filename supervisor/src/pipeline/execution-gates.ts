@@ -23,6 +23,10 @@ export interface ExpectedReceiptProducer {
   workerId: string;
   skill: string;
   capabilityDigest: string;
+  // Exact repository skill package digest this producer must have invoked,
+  // separate from capabilityDigest (the runtime executor capability).
+  // Undefined skips the check; null asserts a builtin (no-package) producer.
+  skillPackageDigest?: string | null;
   assurance: UnitCompletionReceipt["assurance"];
 }
 
@@ -31,6 +35,10 @@ export interface StandardReceiptFence {
   graphDigest: string;
   unitId: string;
   attemptId: string;
+  parentRunId: string;
+  actionAttemptId: string;
+  generation: number;
+  nativeSessionId: string | null;
   requestHash: string;
   baseSubject: string;
   preSubject: string;
@@ -59,6 +67,10 @@ function assertReceiptFence(
     receipt.fence.graph_digest !== expected.graphDigest ||
     receipt.fence.unit_id !== expected.unitId ||
     receipt.fence.attempt_id !== expected.attemptId ||
+    receipt.fence.parent_run_id !== expected.parentRunId ||
+    receipt.fence.action_attempt_id !== expected.actionAttemptId ||
+    receipt.fence.generation !== expected.generation ||
+    receipt.fence.native_session_id !== expected.nativeSessionId ||
     receipt.fence.request_hash !== expected.requestHash
   ) throw new Error(`${label} receipt fence mismatch`);
   if (receipt.subject.base !== expected.baseSubject || receipt.subject.pre !== expected.preSubject) {
@@ -71,7 +83,8 @@ function assertReceiptFence(
     receipt.producer.worker_id !== producer.workerId ||
     receipt.producer.skill !== producer.skill ||
     receipt.producer.capability_digest !== producer.capabilityDigest ||
-    receipt.assurance !== producer.assurance
+    receipt.assurance !== producer.assurance ||
+    (producer.skillPackageDigest !== undefined && receipt.producer.skill_package_digest !== producer.skillPackageDigest)
   ) throw new Error(`${label} receipt producer mismatch`);
 }
 
@@ -111,6 +124,10 @@ function seal(kind: ExecutionGateDecision["gateKind"], input: {
     graph_digest: input.expected.graphDigest,
     unit_id: input.expected.unitId,
     attempt_id: input.expected.attemptId,
+    parent_run_id: input.expected.parentRunId,
+    action_attempt_id: input.expected.actionAttemptId,
+    generation: input.expected.generation,
+    native_session_id: input.expected.nativeSessionId,
     request_hash: input.expected.requestHash,
     subject: input.expected.subject,
     outcome: input.outcome,

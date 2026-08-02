@@ -1,13 +1,13 @@
 {
   "schema": "openthrottle.receipt/v1",
-  "type": "unit_decision",
+  "type": "unit_completion",
   "assurance": "semantic_attested",
-  "result": "accept",
+  "result": "success",
   "producer": {
-    "worker_id": "lead",
-    "skill": "builtin://accept-unit@1",
+    "worker_id": "implementer",
+    "skill": "repo://acme/openthrottle-graphs@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#.agents/skills/implement-unit",
     "capability_digest": "1111111111111111111111111111111111111111111111111111111111111111",
-    "skill_package_digest": null
+    "skill_package_digest": "4444444444444444444444444444444444444444444444444444444444444444"
   },
   "subject": {
     "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -22,16 +22,22 @@
     "parent_run_id": "run-1",
     "action_attempt_id": "action-1",
     "generation": 1,
-    "native_session_id": null,
+    "native_session_id": "session-1",
     "request_hash": "3333333333333333333333333333333333333333333333333333333333333333"
   },
   "evidence": [
-    "lead accepted the unit scope"
+    "npm test --prefix contracts passed"
   ],
+  "issued_at": "2026-07-28T00:00:00.000Z",
   "payload": {
-    "rationale": "The unit matches the assigned plan slice.",
-    "context_updates": [],
-    "accepted_subject": "cccccccccccccccccccccccccccccccccccccccc"
-  },
-  "issued_at": "2026-07-28T00:00:00.000Z"
+    "summary": "Implemented the assigned unit using a repository skill.",
+    "assumptions": [],
+    "decisions": [],
+    "issues": [],
+    "verification": [
+      "npm test --prefix contracts passed"
+    ],
+    "downstream_context": [],
+    "requested_human_input": []
+  }
 }

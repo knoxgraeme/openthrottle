@@ -55,6 +55,9 @@ const invalidCases = [
   ["receipt-unit-completion-missing-payload-field.json", /payload\.requested_human_input: must be an array/],
   ["receipt-unit-decision-bad-result.json", /result: must be one of: accept, revise, context_update, needs_human/],
   ["receipt-unknown-field.json", /executor_verified: unknown field/],
+  ["receipt-invalid-generation.json", /fence\.generation: must be an integer between 1 and 1000000/],
+  ["receipt-invalid-skill-package-digest.json", /producer\.skill_package_digest: has an invalid format/],
+  ["receipt-invalid-native-session-id.json", /fence\.native_session_id: has an invalid format/],
 ] as const;
 
 describe("Stage C contract fixtures", () => {
@@ -72,6 +75,7 @@ describe("Stage C contract fixtures", () => {
       "execution-plan.json",
       "receipt-unit-completion.json",
       "receipt-unit-decision.json",
+      "receipt-repository-skill.json",
     ];
 
     for (const fixture of fixtures) {

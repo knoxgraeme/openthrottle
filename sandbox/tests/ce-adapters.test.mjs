@@ -91,6 +91,14 @@ describe("OpenThrottle canonical task skills", () => {
     expect(skillBody("final-repair")).toContain("exact-base repair worktree");
   });
 
+  it("keeps final review report-only and routes edits through final-repair", () => {
+    const body = skillBody("final-review");
+    expect(body).toContain("mode:agent");
+    expect(body).not.toContain("apply:local");
+    expect(body).toContain("report-only");
+    expect(body).toContain("final-repair");
+  });
+
   it("ships non-CE fixture skills for the same standard receipt contracts", () => {
     const fixtureRoot = resolve(repoRoot, "sandbox", "tests", "fixtures", "skills");
     for (const task of ["non-ce-unit", "non-ce-lead", "non-ce-review"]) {

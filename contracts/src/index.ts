@@ -77,5 +77,5 @@ export {
   type UnitDecisionPayload,
   type UnitDecisionReceipt,
 } from "./receipts.js";
-export { COMMAND_NAME_PATTERN, SKILL_REFERENCE } from "./validation.js";
+export { COMMAND_NAME_PATTERN, PRODUCER_SKILL_REFERENCE, SKILL_REFERENCE } from "./validation.js";
 export type { ValidatedContract } from "./validation.js";

@@ -11,6 +11,10 @@ const expected: StandardReceiptFence = {
   graphDigest: "a".repeat(64),
   unitId: "unit-1",
   attemptId: "attempt-1",
+  parentRunId: "run-1",
+  actionAttemptId: "action-1",
+  generation: 1,
+  nativeSessionId: "session-1",
   requestHash: "b".repeat(64),
   baseSubject: "0".repeat(40),
   preSubject: "0".repeat(40),
@@ -20,6 +24,7 @@ const expected: StandardReceiptFence = {
       workerId: "worker-1",
       skill: "builtin://unit_completion@1",
       capabilityDigest: "c".repeat(64),
+      skillPackageDigest: null,
       assurance: "semantic_attested",
     },
     command: {
@@ -41,6 +46,7 @@ function receipt(type: string, result: string, overrides: Record<string, unknown
       worker_id: "worker-1",
       skill: `builtin://${type}@1`,
       capability_digest: "c".repeat(64),
+      skill_package_digest: null,
     },
     subject: {
       base: "0".repeat(40),
@@ -52,6 +58,10 @@ function receipt(type: string, result: string, overrides: Record<string, unknown
       graph_digest: expected.graphDigest,
       unit_id: expected.unitId,
       attempt_id: expected.attemptId,
+      parent_run_id: expected.parentRunId,
+      action_attempt_id: expected.actionAttemptId,
+      generation: expected.generation,
+      native_session_id: expected.nativeSessionId,
       request_hash: expected.requestHash,
     },
     evidence: ["evidence"],
@@ -191,6 +201,7 @@ describe("structured execution gates", () => {
           worker_id: "other-worker",
           skill: "builtin://unit_completion@1",
           capability_digest: "c".repeat(64),
+          skill_package_digest: null,
         },
       }) as never,
       candidate: receipt("candidate_evidence", "success") as never,
@@ -222,5 +233,76 @@ describe("structured execution gates", () => {
       outcome: "failure",
       reason: "command_receipts_missing_or_unexpected",
     });
+  });
+
+  it("rejects a candidate receipt bound to the wrong graph, attempt, run, action, generation, session, or request", () => {
+    const overrides: Array<[Record<string, unknown>, string]> = [
+      [{ graph_digest: "d".repeat(64) }, "fence mismatch"],
+      [{ attempt_id: "attempt-2" }, "fence mismatch"],
+      [{ parent_run_id: "run-2" }, "fence mismatch"],
+      [{ action_attempt_id: "action-2" }, "fence mismatch"],
+      [{ generation: 2 }, "fence mismatch"],
+      [{ native_session_id: "session-2" }, "fence mismatch"],
+      [{ unit_id: "unit-2" }, "fence mismatch"],
+      [{ request_hash: "e".repeat(64) }, "fence mismatch"],
+    ];
+    for (const [fenceOverride, message] of overrides) {
+      expect(() => evaluateUnitAcceptanceGate({
+        expected,
+        completion: receipt("unit_completion", "success") as never,
+        candidate: receipt("candidate_evidence", "success", {
+          fence: {
+            pipeline_instance_id: expected.pipelineInstanceId,
+            graph_digest: expected.graphDigest,
+            unit_id: expected.unitId,
+            attempt_id: expected.attemptId,
+            parent_run_id: expected.parentRunId,
+            action_attempt_id: expected.actionAttemptId,
+            generation: expected.generation,
+            native_session_id: expected.nativeSessionId,
+            request_hash: expected.requestHash,
+            ...fenceOverride,
+          },
+        }) as never,
+        commands: [],
+        expectedCommandNames: [],
+        lead: receipt("unit_decision", "accept", {
+          payload: { rationale: "Matches.", context_updates: [], accepted_subject: expected.subject },
+        }) as never,
+      })).toThrow(new RegExp(`candidate receipt ${message}`));
+    }
+  });
+
+  it("rejects a completion receipt claiming the wrong repository skill package digest", () => {
+    expect(() => evaluateUnitAcceptanceGate({
+      expected,
+      completion: receipt("unit_completion", "success", {
+        producer: {
+          worker_id: "worker-1",
+          skill: "builtin://unit_completion@1",
+          capability_digest: "c".repeat(64),
+          skill_package_digest: "f".repeat(64),
+        },
+      }) as never,
+      candidate: receipt("candidate_evidence", "success") as never,
+      commands: [],
+      expectedCommandNames: [],
+      lead: receipt("unit_decision", "accept", {
+        payload: { rationale: "Matches.", context_updates: [], accepted_subject: expected.subject },
+      }) as never,
+    })).toThrow(/completion receipt producer mismatch/);
+  });
+
+  it("evaluates identically for an exact receipt replay and rejects a conflicting replay", () => {
+    const first = evaluateIntegrationGate({ expected, integration: receipt("integration_evidence", "success") as never });
+    const second = evaluateIntegrationGate({ expected, integration: receipt("integration_evidence", "success") as never });
+    expect(second).toEqual(first);
+
+    expect(() => evaluateIntegrationGate({
+      expected,
+      integration: receipt("integration_evidence", "success", {
+        subject: { base: "0".repeat(40), pre: "0".repeat(40), post: "9".repeat(40) },
+      }) as never,
+    })).toThrow(/integration receipt subject mismatch/);
   });
 });

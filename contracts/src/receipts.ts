@@ -1,13 +1,15 @@
 import {
   GIT_SUBJECT,
+  NATIVE_SESSION_ID,
+  PRODUCER_SKILL_REFERENCE,
   SHA256,
-  SKILL_REFERENCE,
   arrayAt,
   booleanAt,
   enumAt,
   fail,
   integerAt,
   normalizedContract,
+  nullable,
   objectAt,
   stringAt,
   type ValidatedContract,
@@ -38,6 +40,11 @@ export interface ReceiptProducer {
   worker_id: string;
   skill: string;
   capability_digest: string;
+  // Exact package digest of the pinned repository skill this producer
+  // invoked, separate from capability_digest (the runtime executor
+  // capability, e.g. agent/repository-skill@1). Null for builtin skills,
+  // which have no repository package to pin.
+  skill_package_digest: string | null;
 }
 
 export interface ReceiptFence {
@@ -45,6 +52,10 @@ export interface ReceiptFence {
   graph_digest: string;
   unit_id: string;
   attempt_id: string;
+  parent_run_id: string;
+  action_attempt_id: string;
+  generation: number;
+  native_session_id: string | null;
   request_hash: string;
 }
 
@@ -181,23 +192,31 @@ export type StandardReceipt =
 const SEMANTIC_RECEIPTS = new Set<ReceiptType>(["unit_completion", "semantic_review", "unit_decision"]);
 
 function parseProducer(value: unknown, path: string): ReceiptProducer {
-  const input = objectAt(value, path, ["worker_id", "skill", "capability_digest"]);
+  const input = objectAt(value, path, ["worker_id", "skill", "capability_digest", "skill_package_digest"]);
   return {
     worker_id: stringAt(input.worker_id, `${path}.worker_id`, { max: 120 }),
-    skill: stringAt(input.skill, `${path}.skill`, { max: 240, pattern: SKILL_REFERENCE }),
+    skill: stringAt(input.skill, `${path}.skill`, { max: 320, pattern: PRODUCER_SKILL_REFERENCE }),
     capability_digest: stringAt(input.capability_digest, `${path}.capability_digest`, { pattern: SHA256 }),
+    skill_package_digest: nullable(input.skill_package_digest, (entry) =>
+      stringAt(entry, `${path}.skill_package_digest`, { pattern: SHA256 })),
   };
 }
 
 function parseFence(value: unknown, path: string): ReceiptFence {
   const input = objectAt(value, path, [
-    "pipeline_instance_id", "graph_digest", "unit_id", "attempt_id", "request_hash",
+    "pipeline_instance_id", "graph_digest", "unit_id", "attempt_id",
+    "parent_run_id", "action_attempt_id", "generation", "native_session_id", "request_hash",
   ]);
   return {
     pipeline_instance_id: stringAt(input.pipeline_instance_id, `${path}.pipeline_instance_id`, { max: 160 }),
     graph_digest: stringAt(input.graph_digest, `${path}.graph_digest`, { pattern: SHA256 }),
     unit_id: stringAt(input.unit_id, `${path}.unit_id`, { max: 120 }),
     attempt_id: stringAt(input.attempt_id, `${path}.attempt_id`, { max: 160 }),
+    parent_run_id: stringAt(input.parent_run_id, `${path}.parent_run_id`, { max: 160 }),
+    action_attempt_id: stringAt(input.action_attempt_id, `${path}.action_attempt_id`, { max: 160 }),
+    generation: integerAt(input.generation, `${path}.generation`, 1, 1_000_000),
+    native_session_id: nullable(input.native_session_id, (entry) =>
+      stringAt(entry, `${path}.native_session_id`, { max: 200, pattern: NATIVE_SESSION_ID })),
     request_hash: stringAt(input.request_hash, `${path}.request_hash`, { pattern: SHA256 }),
   };
 }
