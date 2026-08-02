@@ -203,6 +203,7 @@ function standardReceipt(loopRequest, overrides = {}) {
       worker_id: "worker-1",
       skill: "builtin://implement-unit@1",
       capability_digest: "c".repeat(64),
+      skill_package_digest: null,
     },
     subject: {
       base: "1".repeat(40),
@@ -214,6 +215,10 @@ function standardReceipt(loopRequest, overrides = {}) {
       graph_digest: "a".repeat(64),
       unit_id: loopRequest.unitId,
       attempt_id: loopRequest.attemptId,
+      parent_run_id: "run-1",
+      action_attempt_id: "action-1",
+      generation: 1,
+      native_session_id: loopRequest.nativeSessionId,
       request_hash: loopRequest.requestHash,
     },
     evidence: ["implemented unit"],

@@ -122,6 +122,7 @@ describe("normalized stage artifacts", () => {
         worker_id: "lead-1",
         skill: "builtin://accept-unit@1",
         capability_digest: "e".repeat(64),
+        skill_package_digest: null,
       },
       subject: { base: "1".repeat(40), pre: "1".repeat(40), post: "2".repeat(40) },
       fence: {
@@ -129,6 +130,10 @@ describe("normalized stage artifacts", () => {
         graph_digest: "f".repeat(64),
         unit_id: "unit-1",
         attempt_id: "attempt-1",
+        parent_run_id: "run-1",
+        action_attempt_id: "action-1",
+        generation: 1,
+        native_session_id: null,
         request_hash: "a".repeat(64),
       },
       evidence: ["candidate-evidence"],
@@ -177,6 +182,7 @@ describe("normalized stage artifacts", () => {
         worker_id: "human-1",
         skill: "builtin://human-approval@1",
         capability_digest: "e".repeat(64),
+        skill_package_digest: null,
       },
       subject: { base: "1".repeat(40), pre: "1".repeat(40), post: "1".repeat(40) },
       fence: {
@@ -184,6 +190,10 @@ describe("normalized stage artifacts", () => {
         graph_digest: "f".repeat(64),
         unit_id: "unit-1",
         attempt_id: "attempt-1",
+        parent_run_id: "run-1",
+        action_attempt_id: "action-1",
+        generation: 1,
+        native_session_id: null,
         request_hash: "a".repeat(64),
       },
       evidence: ["approval"],
@@ -213,6 +223,7 @@ describe("normalized stage artifacts", () => {
         worker_id: "reviewer-1",
         skill: "builtin://final-review@1",
         capability_digest: "e".repeat(64),
+        skill_package_digest: null,
       },
       subject: { base: "1".repeat(40), pre: "1".repeat(40), post: "2".repeat(40) },
       fence: {
@@ -220,6 +231,10 @@ describe("normalized stage artifacts", () => {
         graph_digest: "f".repeat(64),
         unit_id: "whole-change",
         attempt_id: "attempt-1",
+        parent_run_id: "run-1",
+        action_attempt_id: "action-1",
+        generation: 1,
+        native_session_id: null,
         request_hash: "a".repeat(64),
       },
       evidence: ["review"],
@@ -229,5 +244,77 @@ describe("normalized stage artifacts", () => {
       },
       issued_at: "2026-07-29T00:00:00.000Z",
     }, {}).payload.findings[0]).toEqual({ severity: "P1", message: "Missing receipt." });
+  });
+
+  it("binds full provenance and rejects a wrong graph, run, action, generation, session, or skill digest", () => {
+    const receipt = {
+      schema: "openthrottle.receipt/v1",
+      type: "candidate_evidence",
+      assurance: "executor_verified",
+      result: "success",
+      producer: {
+        worker_id: "worker-1",
+        skill: "repo://acme/graphs@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#.agents/skills/implement-unit",
+        capability_digest: "e".repeat(64),
+        skill_package_digest: "d".repeat(64),
+      },
+      subject: { base: "1".repeat(40), pre: "1".repeat(40), post: "2".repeat(40) },
+      fence: {
+        pipeline_instance_id: "pipeline-1",
+        graph_digest: "f".repeat(64),
+        unit_id: "unit-1",
+        attempt_id: "attempt-1",
+        parent_run_id: "run-1",
+        action_attempt_id: "action-1",
+        generation: 1,
+        native_session_id: "session-1",
+        request_hash: "a".repeat(64),
+      },
+      evidence: ["tree observed"],
+      payload: { tree: "2".repeat(40), diff_digest: "b".repeat(64), changed_paths: [], clean: true },
+      issued_at: "2026-07-29T00:00:00.000Z",
+    };
+
+    expect(validateStandardReceipt(receipt, {})).toMatchObject({
+      producer: { skill_package_digest: "d".repeat(64) },
+      fence: {
+        parent_run_id: "run-1",
+        action_attempt_id: "action-1",
+        generation: 1,
+        native_session_id: "session-1",
+      },
+    });
+
+    expect(() => validateStandardReceipt({
+      ...receipt,
+      fence: { ...receipt.fence, generation: 0 },
+    }, {})).toThrow(/generation/);
+    expect(() => validateStandardReceipt({
+      ...receipt,
+      producer: { ...receipt.producer, skill_package_digest: "not-a-digest" },
+    }, {})).toThrow(/skill package digest/);
+    expect(() => validateStandardReceipt({
+      ...receipt,
+      producer: {
+        ...receipt.producer,
+        skill: "repo://acme/graphs@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#../../etc/passwd",
+      },
+    }, {})).toThrow(/producer skill/);
+    expect(() => validateStandardReceipt({
+      ...receipt,
+      fence: { ...receipt.fence, native_session_id: "" },
+    }, {})).toThrow(/native session/);
+    expect(() => validateStandardReceipt({
+      ...receipt,
+      fence: { ...receipt.fence, graph_digest: "not-a-digest" },
+    }, {})).toThrow(/fence digest is invalid/);
+    expect(() => validateStandardReceipt({
+      ...receipt,
+      fence: { ...receipt.fence, parent_run_id: "" },
+    }, {})).toThrow(/parent run/);
+    expect(() => validateStandardReceipt({
+      ...receipt,
+      fence: { ...receipt.fence, action_attempt_id: "" },
+    }, {})).toThrow(/action attempt/);
   });
 });
