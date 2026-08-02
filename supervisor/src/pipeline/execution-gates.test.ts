@@ -5,6 +5,7 @@ import {
   evaluateUnitAcceptanceGate,
   type StandardReceiptFence,
 } from "./execution-gates.js";
+import { canonicalJson, digestNormalized } from "./manifest.js";
 
 const expected: StandardReceiptFence = {
   pipelineInstanceId: "instance-1",
@@ -27,11 +28,40 @@ const expected: StandardReceiptFence = {
       skillPackageDigest: null,
       assurance: "semantic_attested",
     },
+    candidate: {
+      workerId: "worker-1",
+      skill: "builtin://candidate_evidence@1",
+      capabilityDigest: "c".repeat(64),
+      skillPackageDigest: null,
+      assurance: "executor_verified",
+    },
     command: {
       workerId: "worker-1",
       skill: "builtin://command_result@1",
       capabilityDigest: "c".repeat(64),
+      skillPackageDigest: null,
       assurance: "executor_verified",
+    },
+    lead: {
+      workerId: "worker-1",
+      skill: "builtin://unit_decision@1",
+      capabilityDigest: "c".repeat(64),
+      skillPackageDigest: null,
+      assurance: "semantic_attested",
+    },
+    integration: {
+      workerId: "worker-1",
+      skill: "builtin://integration_evidence@1",
+      capabilityDigest: "c".repeat(64),
+      skillPackageDigest: null,
+      assurance: "executor_verified",
+    },
+    review: {
+      workerId: "worker-1",
+      skill: "builtin://semantic_review@1",
+      capabilityDigest: "c".repeat(64),
+      skillPackageDigest: null,
+      assurance: "semantic_attested",
     },
   },
 };
@@ -71,17 +101,25 @@ function receipt(type: string, result: string, overrides: Record<string, unknown
   };
 }
 
+// Mirrors execution-gates.ts's own receiptHash so tests can bind a lead or
+// review receipt's evidence to the exact prior receipts it attests to.
+function hashOf(value: unknown): string {
+  return digestNormalized(canonicalJson(value));
+}
+
 const command = (result: "success" | "failure" | "not_configured", exitCode: number, name = "test") => receipt("command_result", result, {
   payload: { command: name, exit_code: exitCode, summary: "command done" },
 });
 
 describe("structured execution gates", () => {
   it("accepts a unit only from worker success, executor candidate evidence, commands, and a lead scope decision", () => {
+    const candidate = receipt("candidate_evidence", "success");
+    const commands = [command("success", 0), command("not_configured", 0, "lint")];
     expect(evaluateUnitAcceptanceGate({
       expected,
       completion: receipt("unit_completion", "success") as never,
-      candidate: receipt("candidate_evidence", "success") as never,
-      commands: [command("success", 0) as never, command("not_configured", 0, "lint") as never],
+      candidate: candidate as never,
+      commands: commands as never,
       expectedCommandNames: ["test", "lint"],
       lead: receipt("unit_decision", "accept", {
         payload: {
@@ -89,6 +127,7 @@ describe("structured execution gates", () => {
           context_updates: [],
           accepted_subject: expected.subject,
         },
+        evidence: [hashOf(candidate), ...commands.map(hashOf)],
       }) as never,
     })).toMatchObject({
       outcome: "success",
@@ -120,25 +159,30 @@ describe("structured execution gates", () => {
   });
 
   it("maps lead revision and command failure to repair-required/failure deterministically", () => {
+    const revisionCandidate = receipt("candidate_evidence", "success");
     expect(evaluateUnitAcceptanceGate({
       expected,
       completion: receipt("unit_completion", "success") as never,
-      candidate: receipt("candidate_evidence", "success") as never,
+      candidate: revisionCandidate as never,
       commands: [],
       expectedCommandNames: [],
       lead: receipt("unit_decision", "revise", {
         payload: { rationale: "Missing scoped behavior.", revision_request: "Add the required case.", context_updates: [] },
+        evidence: [hashOf(revisionCandidate)],
       }) as never,
     })).toMatchObject({ outcome: "semantic_repair_required", reason: "lead_requested_revision" });
 
+    const failingCandidate = receipt("candidate_evidence", "success");
+    const failingCommand = command("failure", 1);
     expect(evaluateUnitAcceptanceGate({
       expected,
       completion: receipt("unit_completion", "success") as never,
-      candidate: receipt("candidate_evidence", "success") as never,
-      commands: [command("failure", 1) as never],
+      candidate: failingCandidate as never,
+      commands: [failingCommand] as never,
       expectedCommandNames: ["test"],
       lead: receipt("unit_decision", "accept", {
         payload: { rationale: "Matches.", context_updates: [], accepted_subject: expected.subject },
+        evidence: [hashOf(failingCandidate), hashOf(failingCommand)],
       }) as never,
     })).toMatchObject({ outcome: "failure", reason: "command_exit_nonzero" });
   });
@@ -161,21 +205,25 @@ describe("structured execution gates", () => {
   });
 
   it("runs whole-change commands before accepting the final semantic review", () => {
+    const successCommand = command("success", 0);
     expect(evaluateFinalReviewGate({
       expected,
-      commands: [command("success", 0) as never],
+      commands: [successCommand] as never,
       expectedCommandNames: ["test"],
       review: receipt("semantic_review", "success", {
         payload: { summary: "clean", findings: [] },
+        evidence: [hashOf(successCommand)],
       }) as never,
     })).toMatchObject({ outcome: "success", reason: "typed_semantic_result" });
 
+    const failingCommand = command("failure", 1);
     expect(evaluateFinalReviewGate({
       expected,
-      commands: [command("failure", 1) as never],
+      commands: [failingCommand] as never,
       expectedCommandNames: ["test"],
       review: receipt("semantic_review", "success", {
         payload: { summary: "clean", findings: [] },
+        evidence: [hashOf(failingCommand)],
       }) as never,
     })).toMatchObject({ outcome: "failure", reason: "command_exit_nonzero" });
 
@@ -291,6 +339,142 @@ describe("structured execution gates", () => {
         payload: { rationale: "Matches.", context_updates: [], accepted_subject: expected.subject },
       }) as never,
     })).toThrow(/completion receipt producer mismatch/);
+  });
+
+  it("rejects a receipt claiming the wrong producer for the candidate, command, lead, integration, or review role", () => {
+    const impersonator = {
+      worker_id: "impersonator",
+      skill: "builtin://impersonator@1",
+      capability_digest: "d".repeat(64),
+      skill_package_digest: null,
+    };
+
+    const badCandidate = receipt("candidate_evidence", "success", { producer: impersonator });
+    expect(() => evaluateUnitAcceptanceGate({
+      expected,
+      completion: receipt("unit_completion", "success") as never,
+      candidate: badCandidate as never,
+      commands: [],
+      expectedCommandNames: [],
+      lead: receipt("unit_decision", "accept", {
+        payload: { rationale: "Matches.", context_updates: [], accepted_subject: expected.subject },
+        evidence: [hashOf(badCandidate)],
+      }) as never,
+    })).toThrow(/candidate receipt producer mismatch/);
+
+    const goodCandidate = receipt("candidate_evidence", "success");
+    expect(() => evaluateUnitAcceptanceGate({
+      expected,
+      completion: receipt("unit_completion", "success") as never,
+      candidate: goodCandidate as never,
+      commands: [],
+      expectedCommandNames: [],
+      lead: receipt("unit_decision", "accept", {
+        producer: impersonator,
+        payload: { rationale: "Matches.", context_updates: [], accepted_subject: expected.subject },
+        evidence: [hashOf(goodCandidate)],
+      }) as never,
+    })).toThrow(/lead receipt producer mismatch/);
+
+    const badCommand = receipt("command_result", "success", {
+      producer: impersonator,
+      payload: { command: "test", exit_code: 0, summary: "command done" },
+    });
+    const goodCandidateForCommand = receipt("candidate_evidence", "success");
+    expect(() => evaluateUnitAcceptanceGate({
+      expected,
+      completion: receipt("unit_completion", "success") as never,
+      candidate: goodCandidateForCommand as never,
+      commands: [badCommand] as never,
+      expectedCommandNames: ["test"],
+      lead: receipt("unit_decision", "accept", {
+        payload: { rationale: "Matches.", context_updates: [], accepted_subject: expected.subject },
+        evidence: [hashOf(goodCandidateForCommand), hashOf(badCommand)],
+      }) as never,
+    })).toThrow(/command receipt producer mismatch/);
+
+    expect(() => evaluateFinalReviewGate({
+      expected,
+      commands: [badCommand] as never,
+      expectedCommandNames: ["test"],
+      review: receipt("semantic_review", "success", {
+        payload: { summary: "clean", findings: [] },
+        evidence: [hashOf(badCommand)],
+      }) as never,
+    })).toThrow(/command receipt producer mismatch/);
+
+    expect(() => evaluateIntegrationGate({
+      expected,
+      integration: receipt("integration_evidence", "success", { producer: impersonator }) as never,
+    })).toThrow(/integration receipt producer mismatch/);
+
+    const reviewCommand = command("success", 0);
+    expect(() => evaluateFinalReviewGate({
+      expected,
+      commands: [reviewCommand] as never,
+      expectedCommandNames: ["test"],
+      review: receipt("semantic_review", "success", {
+        producer: impersonator,
+        payload: { summary: "clean", findings: [] },
+        evidence: [hashOf(reviewCommand)],
+      }) as never,
+    })).toThrow(/review receipt producer mismatch/);
+  });
+
+  it("binds the lead decision to the exact candidate and command evidence receipts", () => {
+    const candidate = receipt("candidate_evidence", "success");
+    const testCommand = command("success", 0);
+
+    expect(() => evaluateUnitAcceptanceGate({
+      expected,
+      completion: receipt("unit_completion", "success") as never,
+      candidate: candidate as never,
+      commands: [testCommand] as never,
+      expectedCommandNames: ["test"],
+      lead: receipt("unit_decision", "accept", {
+        payload: { rationale: "Matches.", context_updates: [], accepted_subject: expected.subject },
+        evidence: [],
+      }) as never,
+    })).toThrow(/lead receipt evidence missing required artifact hash/);
+
+    const unrelatedCandidate = receipt("candidate_evidence", "success", { issued_at: "2026-07-29T00:00:05.000Z" });
+    const unrelatedCommand = command("success", 0, "unrelated");
+    expect(() => evaluateUnitAcceptanceGate({
+      expected,
+      completion: receipt("unit_completion", "success") as never,
+      candidate: candidate as never,
+      commands: [testCommand] as never,
+      expectedCommandNames: ["test"],
+      lead: receipt("unit_decision", "accept", {
+        payload: { rationale: "Matches.", context_updates: [], accepted_subject: expected.subject },
+        evidence: [hashOf(unrelatedCandidate), hashOf(unrelatedCommand)],
+      }) as never,
+    })).toThrow(/lead receipt evidence missing required artifact hash/);
+  });
+
+  it("binds the final review to the exact whole-change command evidence receipts", () => {
+    const testCommand = command("success", 0);
+
+    expect(() => evaluateFinalReviewGate({
+      expected,
+      commands: [testCommand] as never,
+      expectedCommandNames: ["test"],
+      review: receipt("semantic_review", "success", {
+        payload: { summary: "clean", findings: [] },
+        evidence: [],
+      }) as never,
+    })).toThrow(/review receipt evidence missing required artifact hash/);
+
+    const unrelatedCommand = command("success", 0, "unrelated");
+    expect(() => evaluateFinalReviewGate({
+      expected,
+      commands: [testCommand] as never,
+      expectedCommandNames: ["test"],
+      review: receipt("semantic_review", "success", {
+        payload: { summary: "clean", findings: [] },
+        evidence: [hashOf(unrelatedCommand)],
+      }) as never,
+    })).toThrow(/review receipt evidence missing required artifact hash/);
   });
 
   it("evaluates identically for an exact receipt replay and rejects a conflicting replay", () => {

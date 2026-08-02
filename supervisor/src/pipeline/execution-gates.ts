@@ -19,14 +19,17 @@ import {
 
 const SEMANTIC_REVIEW_SKILL = /(?:^|\/)ce-code-review(?:@|$)/;
 
+export type ReceiptProducerRole = "completion" | "candidate" | "command" | "lead" | "integration" | "review";
+
 export interface ExpectedReceiptProducer {
   workerId: string;
   skill: string;
   capabilityDigest: string;
   // Exact repository skill package digest this producer must have invoked,
   // separate from capabilityDigest (the runtime executor capability).
-  // Undefined skips the check; null asserts a builtin (no-package) producer.
-  skillPackageDigest?: string | null;
+  // Must be set explicitly: null asserts a builtin (no-package) producer.
+  // There is no opt-out — every role's producer binding is checked.
+  skillPackageDigest: string | null;
   assurance: UnitCompletionReceipt["assurance"];
 }
 
@@ -43,7 +46,7 @@ export interface StandardReceiptFence {
   baseSubject: string;
   preSubject: string;
   subject: string;
-  producers?: Partial<Record<"completion" | "candidate" | "command" | "lead" | "integration" | "review", ExpectedReceiptProducer>>;
+  producers: Record<ReceiptProducerRole, ExpectedReceiptProducer>;
 }
 
 export interface ExecutionGateDecision {
@@ -60,7 +63,7 @@ export interface ExecutionGateDecision {
 function assertReceiptFence(
   receipt: UnitCompletionReceipt | UnitDecisionReceipt | CommandResultReceipt | CandidateEvidenceReceipt | IntegrationEvidenceReceipt | SemanticReviewReceipt,
   expected: StandardReceiptFence,
-  label: string
+  label: ReceiptProducerRole
 ): void {
   if (
     receipt.fence.pipeline_instance_id !== expected.pipelineInstanceId ||
@@ -77,15 +80,30 @@ function assertReceiptFence(
     throw new Error(`${label} receipt input subject mismatch`);
   }
   if (receipt.subject.post !== expected.subject) throw new Error(`${label} receipt subject mismatch`);
-  const producer = expected.producers?.[label as keyof NonNullable<StandardReceiptFence["producers"]>];
-  if (!producer) return;
+  const producer = expected.producers[label];
   if (
     receipt.producer.worker_id !== producer.workerId ||
     receipt.producer.skill !== producer.skill ||
     receipt.producer.capability_digest !== producer.capabilityDigest ||
     receipt.assurance !== producer.assurance ||
-    (producer.skillPackageDigest !== undefined && receipt.producer.skill_package_digest !== producer.skillPackageDigest)
+    receipt.producer.skill_package_digest !== producer.skillPackageDigest
   ) throw new Error(`${label} receipt producer mismatch`);
+}
+
+// A lead or final-review receipt attests to a decision made from exact prior
+// evidence. Binding its `evidence` field to the receipt hashes of that prior
+// evidence stops an attestation with a correct identity/subject envelope but
+// empty or unrelated evidence from being paired with receipts it was never
+// actually based on.
+function assertEvidenceBinding(
+  receipt: { evidence: readonly string[] },
+  requiredHashes: readonly string[],
+  label: string
+): void {
+  const evidenceSet = new Set(receipt.evidence);
+  for (const hash of requiredHashes) {
+    if (!evidenceSet.has(hash)) throw new Error(`${label} receipt evidence missing required artifact hash`);
+  }
 }
 
 function commandOutcome(
@@ -165,13 +183,16 @@ export function evaluateUnitAcceptanceGate(input: {
   expectedCommandNames: readonly string[];
   lead: UnitDecisionReceipt;
 }): ExecutionGateDecision {
+  if (SEMANTIC_REVIEW_SKILL.test(input.lead.producer.skill)) {
+    throw new Error("unit acceptance must not be produced by ce-code-review");
+  }
   assertReceiptFence(input.completion, input.expected, "completion");
   assertReceiptFence(input.candidate, input.expected, "candidate");
   assertReceiptFence(input.lead, input.expected, "lead");
   for (const command of input.commands) assertReceiptFence(command, input.expected, "command");
-  if (SEMANTIC_REVIEW_SKILL.test(input.lead.producer.skill)) {
-    throw new Error("unit acceptance must not be produced by ce-code-review");
-  }
+  const candidateHash = receiptHash(input.candidate);
+  const commandHashes = input.commands.map(receiptHash);
+  assertEvidenceBinding(input.lead, [candidateHash, ...commandHashes], "lead");
   const artifactHashes = [
     input.completion,
     input.candidate,
@@ -258,6 +279,8 @@ export function evaluateFinalReviewGate(input: {
       throw new Error("final review receipt predates whole-change command evidence");
     }
   }
+  const commandHashes = input.commands.map(receiptHash);
+  assertEvidenceBinding(input.review, commandHashes, "review");
   const commands = commandOutcome(input.commands, input.expectedCommandNames);
   const artifactHashes = [...input.commands, input.review].map(receiptHash);
   if (commands.outcome !== "success" && commands.outcome !== "no_change") {
