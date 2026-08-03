@@ -33,6 +33,11 @@ import {
 import { runCapturedProcess } from "./bounded-process.mjs";
 import { runWithAgentProcessFence } from "./agent-process-fence.mjs";
 import {
+  classifyLaunchFailure,
+  engineCredentialPresent,
+  launchDiagnosticTail,
+} from "./launch-failure.mjs";
+import {
   chmodTree,
   chownTree,
   isRoot,
@@ -572,29 +577,57 @@ function isCodexModelCredentialExpired(agent, diagnostic) {
   return hasAuthFailure && hasCodexRefreshSignal;
 }
 
-export function classifyAgentExecutionFailure({ agent, termination, diagnostic, terminated, missingProposal = false }) {
+export function classifyAgentExecutionFailure({
+  agent,
+  termination,
+  diagnostic,
+  terminated,
+  missingProposal = false,
+  stdout = "",
+  stderr,
+  credentialPresent,
+}) {
   if (isCodexModelCredentialExpired(agent, diagnostic)) {
     return {
       suggestedOutcome: "retryable_infrastructure_failure",
+      reason: "credential_rejected",
       credentialFailure: true,
       summary:
         `Model credential expired - refresh CODEX_AUTH_JSON. Agent stage failed (${termination}).` +
         (diagnostic ? ` Executor diagnostic: ${diagnostic}` : ""),
     };
   }
+  // Every launch failure used to look identical here. Classify it so a missing
+  // credential, a rejected credential, and a provider usage limit are legible
+  // (and infrastructure-shaped) instead of burning a semantic repair round.
+  const classified = classifyLaunchFailure({
+    agent,
+    stdout,
+    stderr: stderr ?? diagnostic ?? "",
+    credentialPresent,
+  });
   return {
-    suggestedOutcome: terminated ? "retryable_infrastructure_failure" : "failure",
-    credentialFailure: false,
+    suggestedOutcome: classified.retryable || terminated ? "retryable_infrastructure_failure" : "failure",
+    reason: classified.reason,
+    credentialFailure: classified.credentialFailure,
     summary:
       `${missingProposal ? "Agent exited without the required terminal stage proposal" : "Agent stage failed"} ` +
-      `(${termination}).` +
+      `(${termination}, reason=${classified.reason}).` +
+      (classified.remediation ? ` ${classified.remediation}` : "") +
       (diagnostic ? ` Executor diagnostic: ${diagnostic}` : ""),
   };
 }
 
 function classifyIncompleteAgentExecution({ execution, request, proposal, redactionEnv }) {
   const terminated = execution.timedOut || execution.signal || execution.exitCode === 137;
-  const diagnostic = sanitizeArtifactText(execution.stderr ?? "", redactionEnv).trim().slice(-1_000);
+  // Both streams: Claude reports launch refusals as stream-json on stdout and
+  // Codex prints its refusal there too, so a stderr-only tail is empty for
+  // exactly the failures that most need evidence.
+  const diagnostic = launchDiagnosticTail({
+    stdout: execution.stdout ?? "",
+    stderr: execution.stderr ?? "",
+    env: redactionEnv,
+  });
   const termination = [
     `exit=${execution.exitCode ?? "none"}`,
     execution.signal ? `signal=${execution.signal}` : null,
@@ -606,6 +639,15 @@ function classifyIncompleteAgentExecution({ execution, request, proposal, redact
     diagnostic,
     terminated,
     missingProposal: !proposal,
+    stdout: execution.stdout ?? "",
+    stderr: execution.stderr ?? "",
+    // A readable ~/.codex/auth.json is the concrete Codex credential even when
+    // the seed variable is no longer in this process's environment.
+    credentialPresent: engineCredentialPresent(
+      request.agent,
+      request.credentialScopes.includes("model.invoke") ? process.env : undefined,
+      Boolean(execution.authSnapshot),
+    ),
   });
 }
 

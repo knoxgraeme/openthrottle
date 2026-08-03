@@ -79,6 +79,26 @@ function agentDisplayName(agent: Agent): string {
   return "OpenCode";
 }
 
+// The configuration NAME only. A credential value must never reach a Linear-
+// visible admission error.
+function agentCredentialVariable(agent: Agent): string {
+  if (agent === "codex") return "CODEX_AUTH_JSON";
+  if (agent === "claude") return "CLAUDE_CODE_OAUTH_TOKEN";
+  return "KIMI_CODE_API_KEY";
+}
+
+// A stage that hosts loop actions (`for_each_unit`) never carries
+// `model.invoke` itself: the scope is materialized per child action instead.
+// Reading only the stage scopes therefore made every structured graph -- whose
+// single compiled stage is that loop host -- look like it needed no model at
+// all, so a pipeline with no engine credential was admitted, provisioned a
+// Daytona sandbox, and only failed once the engine died inside it (OPE-59).
+function pipelineInvokesModel(manifest: ValidatedPipelineManifest): boolean {
+  return manifest.manifest.stages.some((stage) =>
+    stage.credentials.includes("model.invoke") || stage.executor.kind === "loop_action"
+  );
+}
+
 function extractJsonBlocks(markdown: string, schema: string): string[] {
   const blocks: string[] = [];
   for (const match of markdown.matchAll(FENCE_PATTERN)) {
@@ -479,11 +499,14 @@ export async function handleCreated(
         coordinator.catalog,
         repositoryConfig.config.pipelines?.[taskType] ?? taskType
       );
-    const needsModel = manifest.manifest.stages.some((stage) =>
-      stage.credentials.includes("model.invoke")
-    );
-    if (needsModel && !hasAgentSubscription(cfg, selectedAgent)) {
-      throw new Error(`${agentDisplayName(selectedAgent)} subscription login is not configured for this pipeline`);
+    // Fail closed here, before the repository snapshot, the capacity preflight,
+    // the ticket row, and any Daytona provisioning: a generation whose engine
+    // has no credential can only end as an opaque in-sandbox launch failure.
+    if (pipelineInvokesModel(manifest) && !hasAgentSubscription(cfg, selectedAgent)) {
+      throw new Error(
+        `${agentDisplayName(selectedAgent)} is selected for this pipeline but its credential is not configured on the supervisor ` +
+        `(set ${agentCredentialVariable(selectedAgent)}). No sandbox was provisioned.`
+      );
     }
     const snapshot = coordinator.store.saveRepositoryConfigSnapshot({
       repository: selectedRepository.repo,

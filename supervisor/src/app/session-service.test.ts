@@ -550,6 +550,142 @@ intents:
     expect(request.capability).toBe("graph/for-each-unit@1");
     expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
   });
+  it.each([
+    ["claude", "CLAUDE_CODE_OAUTH_TOKEN", "Claude"],
+    ["codex", "CODEX_AUTH_JSON", "Codex"],
+    ["opencode", "KIMI_CODE_API_KEY", "OpenCode"],
+  ])(
+    "refuses a %s generation before provisioning when its credential is not configured",
+    async (agent, variable, displayName) => {
+      const { tickets } = await run(
+        repositoryConfigYaml("{ implement: implement }"),
+        { claudeCodeOauthToken: undefined, codexAuthJson: undefined, kimiCodeApiKey: undefined },
+        shippedCatalogPath,
+        payload("session-1", "issue-1", "OT-1", undefined, [`agent:${agent}`])
+      );
+
+      expect(tickets.getByIssueId("issue-1")).toMatchObject({
+        state: "error",
+        sandbox_id: null,
+        run_id: null,
+      });
+      expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
+      expect(db!.prepare("SELECT COUNT(*) FROM pipeline_stage_attempts").pluck().get()).toBe(0);
+      expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
+      const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+      const refusal = payloads.find((entry) => entry.includes("its credential is not configured on the supervisor"));
+      expect(refusal).toBeDefined();
+      expect(refusal).toContain(displayName);
+      expect(refusal).toContain(`set ${variable}`);
+      expect(refusal).toContain("No sandbox was provisioned.");
+    }
+  );
+
+  it("refuses a unit-consuming graph whose only stage hosts loop actions when the engine credential is absent", async () => {
+    // Regression (OPE-59): the compiled `for_each_unit` stage carries no
+    // `model.invoke` scope of its own -- the model credential is materialized
+    // per child action -- so a stage-scope-only check admitted this pipeline,
+    // provisioned a sandbox, and only failed once the engine died inside it.
+    const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
+    executionPlan.graph_id = "structured";
+    const context = [
+      "# Structured work",
+      "",
+      "```json openthrottle.execution-plan/v1",
+      JSON.stringify(executionPlan, null, 2),
+      "```",
+      "",
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }, null, 2),
+      "```",
+    ].join("\n");
+    const { tickets } = await run(
+      `schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: structured
+    kind: builtin
+    ref: core/structured@1
+pipelines: { implement: implement }
+intents:
+  implement:
+    default_graph: simple
+    allowed_graphs: [simple, structured]
+`,
+      { claudeCodeOauthToken: undefined, codexAuthJson: undefined, kimiCodeApiKey: undefined },
+      shippedCatalogPath,
+      payload("session-1", "issue-1", "OT-1", context, ["agent:claude"]),
+      {},
+      {
+        capabilities: [
+          ...buildInstalledRuntimeDescriptor("base-structured-credential-test/v1").descriptor.capabilities,
+          "graph/for-each-unit@1",
+        ],
+      }
+    );
+
+    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+      state: "error",
+      sandbox_id: null,
+      run_id: null,
+    });
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
+    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(payloads.some((entry) => entry.includes("set CLAUDE_CODE_OAUTH_TOKEN"))).toBe(true);
+  });
+
+  it("admits a unit-consuming graph once the selected engine credential is configured", async () => {
+    const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
+    executionPlan.graph_id = "structured";
+    const context = [
+      "# Structured work",
+      "",
+      "```json openthrottle.execution-plan/v1",
+      JSON.stringify(executionPlan, null, 2),
+      "```",
+      "",
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }, null, 2),
+      "```",
+    ].join("\n");
+    const { pipelines } = await run(
+      `schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: structured
+    kind: builtin
+    ref: core/structured@1
+pipelines: { implement: implement }
+intents:
+  implement:
+    default_graph: simple
+    allowed_graphs: [simple, structured]
+`,
+      { claudeCodeOauthToken: "claude-oauth", codexAuthJson: undefined, kimiCodeApiKey: undefined },
+      shippedCatalogPath,
+      payload("session-1", "issue-1", "OT-1", context, ["agent:claude"]),
+      {},
+      {
+        capabilities: [
+          ...buildInstalledRuntimeDescriptor("base-structured-credential-test/v1").descriptor.capabilities,
+          "graph/for-each-unit@1",
+        ],
+      }
+    );
+
+    expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
+      pipeline_id: "builtin/structured",
+      active_stage_id: "units",
+    });
+  });
+
   it("rejects graph selections on investigate tickets before provisioning", async () => {
     const context = [
       "# Investigate structured behavior",
