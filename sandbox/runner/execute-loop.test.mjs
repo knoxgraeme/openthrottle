@@ -1848,7 +1848,12 @@ describe("executeLoopAction", () => {
     const lockActionDirectory = vi.fn();
     const result = executeLoopActionWithIntegration({
       request: request(),
-      credentialEnv: { GITHUB_TOKEN: "gh-leaked-secret-value" },
+      credentialEnv: {
+        GITHUB_TOKEN: "gh-leaked-secret-value",
+        // A model.invoke action always receives its engine credential; an
+        // empty one is classified as a missing credential instead of a crash.
+        CODEX_AUTH_JSON: "{\"tokens\":{\"access_token\":\"fixture-codex-credential\"}}",
+      },
       lockWorkerWorktree,
       lockActionDirectory,
       runLoopAgent: () => ({
@@ -1863,6 +1868,60 @@ describe("executeLoopAction", () => {
     });
     expect(result.outcome).toBe("failure");
     expect(result.receipt).not.toContain("gh-leaked-secret-value");
+    expect(result.receipt).toContain("[REDACTED]");
+  });
+
+  it("classifies a loop action that launched without its engine credential", () => {
+    const result = executeLoopActionWithIntegration({
+      request: request(),
+      credentialEnv: { GITHUB_TOKEN: "gh-token" },
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      runLoopAgent: () => ({
+        status: 1,
+        signal: null,
+        timedOut: false,
+        stdout: "",
+        stderr: "",
+        nativeSessionId: null,
+        integrationRepoDir: "/tmp/integration-current",
+      }),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    // Not the agent's fault: it must not consume a semantic repair round.
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+    expect(result.receipt).toContain("reason=credential_missing");
+    expect(result.receipt).toContain("CODEX_AUTH_JSON");
+  });
+
+  it("classifies a rate-limited loop action and carries a sanitized stdout tail", () => {
+    const rateLimited = JSON.stringify({
+      type: "system",
+      subtype: "rate_limit_event",
+      rate_limit: { status: "rejected", resets_at: 1_754_006_400 },
+    });
+    const result = executeLoopActionWithIntegration({
+      request: request({ agent: "claude" }),
+      credentialEnv: { CLAUDE_CODE_OAUTH_TOKEN: "claude-oauth-secret-value" },
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      runLoopAgent: () => ({
+        status: 1,
+        signal: null,
+        timedOut: false,
+        stdout: `${rateLimited}\nrefused: token claude-oauth-secret-value`,
+        stderr: "",
+        nativeSessionId: null,
+        integrationRepoDir: "/tmp/integration-current",
+      }),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+    expect(result.receipt).toContain("reason=rate_limited");
+    expect(result.receipt).toContain("stdout: ");
+    expect(result.receipt).not.toContain("claude-oauth-secret-value");
     expect(result.receipt).toContain("[REDACTED]");
   });
 

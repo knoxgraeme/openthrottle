@@ -26,6 +26,11 @@ import {
 import { writeJsonAtomic } from "./atomic-write.mjs";
 import { validateRepositorySkillPackage } from "./repository-skills.mjs";
 import { readLoopActionCredentialEnv } from "./loop-credentials.mjs";
+import {
+  classifyLaunchFailure,
+  engineCredentialPresent,
+  launchDiagnosticTail,
+} from "./launch-failure.mjs";
 import { prepareLoopAgentEnvironment } from "./loop-agent-environment.mjs";
 import { pathInside, PROFILE_ROOT_FENCE_FILE } from "./loop-paths.mjs";
 import {
@@ -793,6 +798,9 @@ export function executeLoopAction({
         stderr: String(error),
         nativeSessionId: request.nativeSessionId,
         integrationRepoDir,
+        // The executor itself failed before (or around) the engine, so its
+        // message is the evidence; there is no engine output to classify.
+        executorFailure: true,
         retryableInfrastructureFailure: Boolean(error?.retryableInfrastructureFailure),
         processTerminationUnconfirmed: Boolean(error?.processTerminationUnconfirmed),
       };
@@ -819,6 +827,36 @@ export function executeLoopAction({
     }
     const retryableInfrastructureFailure = Boolean(execution.retryableInfrastructureFailure);
     const failed = Boolean(subjectError) || execution.timedOut || execution.signal || execution.status !== 0 || Boolean(receiptError);
+    // The agent process itself died: classify why (missing credential, rejected
+    // credential, provider usage limit, or a genuine crash) and carry a
+    // bounded, sanitized tail of both streams into the receipt. Without this
+    // every launch failure reaches the ledger as one indistinguishable line.
+    const engineFailed = !retryableInfrastructureFailure && !execution.executorFailure &&
+      (execution.timedOut || Boolean(execution.signal) || execution.status !== 0);
+    const launchFailure = engineFailed
+      ? classifyLaunchFailure({
+        agent: request.agent,
+        stdout: execution.stdout,
+        stderr: execution.stderr,
+        credentialPresent: engineCredentialPresent(
+          request.agent,
+          request.credentialScopes.includes("model.invoke") ? credentialEnv : undefined,
+        ),
+      })
+      : null;
+    const diagnosticTail = engineFailed
+      ? launchDiagnosticTail({ stdout: execution.stdout, stderr: execution.stderr, env: sanitizeEnv })
+      : "";
+    const failureNarrative = launchFailure
+      ? [
+        `loop action failed (reason=${launchFailure.reason})`,
+        launchFailure.remediation,
+        subjectError,
+        receiptError,
+        diagnosticTail,
+      ].filter(Boolean).join(" ")
+      : subjectError || receiptError || execution.stdout || execution.stderr ||
+        (failed ? "loop action failed" : "loop action completed");
     result = {
       version: 1,
       kind: "loop_action_result",
@@ -826,14 +864,16 @@ export function executeLoopAction({
       action_id: request.actionId,
       attempt_id: request.attemptId,
       request_hash: request.requestHash,
-      outcome: retryableInfrastructureFailure ? "retryable_infrastructure_failure" : failed ? "failure" : "success",
+      outcome: retryableInfrastructureFailure || launchFailure?.retryable
+        ? "retryable_infrastructure_failure"
+        : failed ? "failure" : "success",
       native_session_id: execution.nativeSessionId ?? request.nativeSessionId ?? null,
       subject,
       receipt: parsedReceipt
         ? canonicalJson(parsedReceipt)
         : sanitizeArtifactText(retryableInfrastructureFailure
           ? execution.stderr || "loop action infrastructure failure"
-          : subjectError || receiptError || execution.stdout || execution.stderr || (failed ? "loop action failed" : "loop action completed"), sanitizeEnv).slice(0, 128_000),
+          : failureNarrative, sanitizeEnv).slice(0, 128_000),
       created_at: now(),
     };
   } finally {

@@ -37,6 +37,12 @@ import {
 } from "./execute-stage.mjs";
 import { nativeSessionStoragePath, sealNativeSessionPackage } from "./native-session-package.mjs";
 
+const STAGE_CREDENTIAL_FIXTURE_ENV = {
+  CLAUDE_CODE_OAUTH_TOKEN: "fixture-claude-oauth-credential",
+  CODEX_AUTH_JSON: "{\"tokens\":{\"access_token\":\"fixture-codex-access-credential\"}}",
+  KIMI_CODE_API_KEY: "fixture-kimi-api-credential",
+};
+
 const directories = [];
 beforeEach(() => {
   // The sandbox image bakes a root-owned trusted baseline at the default root,
@@ -46,6 +52,11 @@ beforeEach(() => {
   const baselineRoot = mkdtempSync(join(tmpdir(), "ot-baseline-root-"));
   directories.push(baselineRoot);
   process.env.OT_ACTION_HOME_BASELINE_ROOT = baselineRoot;
+  // A real sandbox always has the selected engine's credential exported before
+  // a model.invoke stage runs; an empty one is classified as a missing
+  // credential. Give the stubbed stages a credentialed environment so their
+  // failures stay attributable to what each test is actually exercising.
+  for (const [name, value] of Object.entries(STAGE_CREDENTIAL_FIXTURE_ENV)) process.env[name] = value;
 });
 afterEach(() => {
   for (const directory of directories.splice(0)) {
@@ -56,6 +67,7 @@ afterEach(() => {
   delete process.env.OT_REPOSITORY_SKILL_DISCOVERY_ROOT;
   delete process.env.OT_STAGE_ACTION_ROOT;
   delete process.env.OT_NATIVE_SESSION_SOURCE_ROOT;
+  for (const name of Object.keys(STAGE_CREDENTIAL_FIXTURE_ENV)) delete process.env[name];
 });
 
 function processGroupExists(pid) {
@@ -1462,13 +1474,20 @@ printf '{"type":"thread.started","thread_id":"native-1"}\\n'
 
     expect(classified.suggestedOutcome).toBe("retryable_infrastructure_failure");
     expect(classified.summary).toContain("Model credential expired - refresh CODEX_AUTH_JSON");
-    expect(classifyAgentExecutionFailure({
+    // The Codex-specific remediation stays Codex-only, but every engine's
+    // rejected credential is now typed and infrastructure-shaped instead of
+    // burning a semantic repair round.
+    const claudeRejection = classifyAgentExecutionFailure({
       agent: "claude",
       termination: "exit=1",
       diagnostic,
       terminated: false,
       missingProposal: true,
-    }).suggestedOutcome).toBe("failure");
+    });
+    expect(claudeRejection.reason).toBe("credential_rejected");
+    expect(claudeRejection.credentialFailure).toBe(true);
+    expect(claudeRejection.suggestedOutcome).toBe("retryable_infrastructure_failure");
+    expect(claudeRejection.summary).not.toContain("refresh CODEX_AUTH_JSON");
     expect(classifyAgentExecutionFailure({
       agent: "codex",
       termination: "exit=1",
@@ -1482,7 +1501,10 @@ printf '{"type":"thread.started","thread_id":"native-1"}\\n'
       diagnostic: "refresh_token_invalidated - Your session has ended",
       terminated: false,
       missingProposal: true,
-    }).suggestedOutcome).toBe("failure");
+    })).toMatchObject({
+      reason: "credential_rejected",
+      suggestedOutcome: "retryable_infrastructure_failure",
+    });
 
     const input = fixture();
     const result = executeStage({
@@ -1503,6 +1525,58 @@ printf '{"type":"thread.started","thread_id":"native-1"}\\n'
     expect(payload.result).toBe("retryable_infrastructure_failure");
     expect(payload.summary).toContain("Model credential expired - refresh CODEX_AUTH_JSON");
     expect(payload.summary).toContain("refresh_token_invalidated");
+  });
+
+  it("carries the stdout tail into the summary when the engine refuses with an empty stderr", () => {
+    // The OPE-59/OPE-60 signature: exit=1, empty stderr, and everything the
+    // operator needed sitting unread on stdout.
+    const rateLimited = JSON.stringify({
+      type: "system",
+      subtype: "rate_limit_event",
+      rate_limit: { status: "rejected", resets_at: 1_754_006_400 },
+    });
+    const input = fixture({ agent: "claude" });
+    const result = executeStage({
+      ...input,
+      now: clock(),
+      runAgent: () => ({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        stdout: `${rateLimited}\nClaude usage limit reached (token fixture-claude-oauth-credential)`,
+        stderr: "",
+        nativeSessionId: null,
+      }),
+    });
+    const payload = JSON.parse(result.artifacts[0].payload);
+
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+    expect(payload.summary).toContain("reason=rate_limited");
+    expect(payload.summary).toContain("Executor diagnostic: stdout: ");
+    expect(payload.summary).toContain("usage limit reached");
+    expect(payload.summary).not.toContain("fixture-claude-oauth-credential");
+  });
+
+  it("classifies an agent stage launched without its engine credential", () => {
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    const input = fixture({ agent: "claude" });
+    const result = executeStage({
+      ...input,
+      now: clock(),
+      runAgent: () => ({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        stdout: "",
+        stderr: "",
+        nativeSessionId: null,
+      }),
+    });
+    const payload = JSON.parse(result.artifacts[0].payload);
+
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+    expect(payload.summary).toContain("reason=credential_missing");
+    expect(payload.summary).toContain("CLAUDE_CODE_OAUTH_TOKEN");
   });
 
   it("rejects a valid proposal when agent execution exceeded its timeout", () => {
