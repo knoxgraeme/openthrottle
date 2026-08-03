@@ -509,32 +509,54 @@ stored on the owning actor, session, instance, attempt, or work row.
 Stage C child-unit work must add any needed live binding state to the owning
 unit/work records rather than reviving empty historical binding tables.
 For the serial `for_each_unit` composite stage, `execution_graphs` binds one
-parent pipeline attempt/run to an immutable execution graph and plan digest;
-`execution_units` stores the immutable unit projection, dependency list,
-authored order, active work pointer, accepted/integration subjects, and reserved
-terminal level/alarm fields; and `execution_work_attempts` stores each child
-action attempt with parent instance/attempt/run/unit fences, unit id, action
-kind, idempotency key, runtime request/session hashes, lease owner/window,
-payload, result hash, output subject, and terminal/error state. Composite
-foreign keys bind every unit, action, receipt, and downstream context record to
-the same execution graph and parent attempt so cross-instance or mixed-attempt
-child identities are rejected durably. The child reducer may lease at most one
-active child action per parent attempt. It expires only pre-dispatch claims by
-lease time. Dispatched or running child actions remain the active action while
-their parent-run-fenced child liveness is fresh, and are recovered/collected by
-idempotency rather than duplicated. When a dispatched or running child action
-misses its heartbeat fence, the supervisor first identifies that exact expired
-current action and invokes idempotent runtime result collection outside the
-SQLite transaction. A recovered result completes only through a compare-and-set
-against the unit's current active action pointer. Only confirmed no-result
-collection may then mark the work attempt dead, level the unit to `exited` with
-`alarm = 0`, clear the active action pointer through a separate compare-and-set,
-and allow serial dispatch to continue with the next ready unit. Collection
-errors do not prove absence; they retain the active action for bounded retry. A
-stopped child
-graph records `stopped_at` and `stop_reason` on `execution_graphs`, levels
-unfinished units to `exited`, and makes leasing fail closed while that stop fence
-is present, including when stop was requested before any child action was active.
+parent pipeline attempt/run to an immutable execution graph and plan digest,
+plus the pinned configured command names, the bounded max repair rounds, and
+the whole-change final phase (`command`/`review`/`repair`/`done`, `NULL` before
+the first unit integrates); `execution_units` stores the immutable unit
+projection, dependency list, authored order, active work pointer, current
+phase (`implement`/`simplify`/`command`/`candidate`/`lead`/`integrate`), current
+repair cycle, repair round count, command index, accepted/integration subjects,
+and terminal level/alarm fields; and `execution_work_attempts` stores each
+child action attempt with parent instance/attempt/run/unit fences, unit id
+(`NULL` for a whole-change final action), action kind, repair cycle, command
+name, idempotency key, runtime request/session hashes, lease owner/window,
+payload, result hash, output subject, receipt, and terminal/error state.
+Composite foreign keys bind every unit, action, receipt, and downstream
+context record to the same execution graph and parent attempt so cross-instance
+or mixed-attempt child identities are rejected durably. The durable unit
+reducer advances a unit through implement (or repair on re-entry), simplify,
+every configured command, executor candidate derivation, lead acceptance bound
+to that exact candidate subject and its command receipts, and only then
+integration; a `semantic_repair_required` lead decision returns the unit to a
+fresh implement/simplify/command cycle, bounded by the graph's max repair
+rounds, after which the unit settles as `failed`. Once every unit has settled,
+and at least one unit reached `completed`, the same fenced-action mechanics
+rerun the full configured commands and one fresh, report-only final review
+against the final integrated subject; a `semantic_repair_required` final
+review routes through a dedicated final-repair action and a fresh command/review
+cycle, invalidating the prior review's authority. The reducer may lease at most
+one active action -- unit-scoped or whole-change -- per parent attempt at a
+time. It expires only pre-dispatch claims by lease time. Dispatched or running
+child actions remain the active action while their parent-run-fenced child
+liveness is fresh, and are recovered/collected by idempotency rather than
+duplicated. When a dispatched or running child action misses its heartbeat
+fence, the supervisor first identifies that exact expired current action and
+invokes idempotent runtime result collection outside the SQLite transaction. A
+recovered result completes only through a compare-and-set against the unit's
+(or graph's) current active action pointer. Only confirmed no-result collection
+may then mark the work attempt dead, level the unit to `exited` with
+`alarm = 0` (or stop the whole graph for a lost whole-change final action),
+clear the active action pointer through a separate compare-and-set, and allow
+serial dispatch to continue with the next ready unit. Collection errors do not
+prove absence; they retain the active action for bounded retry. A stopped
+child graph records `stopped_at` and `stop_reason` on `execution_graphs`,
+levels unfinished units to `exited`, and makes leasing fail closed while that
+stop fence is present, including when stop was requested before any child
+action was active. A gate decision (`unit_acceptance`, `integration`, or
+`final_review`) is supplied by the caller already evaluated against the pinned
+receipt fence and producer bindings; the reducer only persists it once and
+applies its routing exactly once, so a replayed identical decision is a no-op
+rather than a duplicate repair round.
 
 `execution_gate_receipts` records deterministic child gate decisions by work
 attempt and gate kind. A receipt is accepted only after the typed child evidence
@@ -551,10 +573,13 @@ hash; duplicate exact records are idempotent, unknown targets, non-pending
 targets, non-integrated sources, and topology changes are rejected rather than
 mutating the graph.
 
-When all serial units are integrated, the reducer emits one
-`execution_graph_result` artifact and one aggregate `stage_result` for the
-parent attempt; the aggregate hash is compare-and-set on `execution_graphs` so
-the parent can settle once through the ordinary stage-result path.
+Once every unit has settled and, when at least one unit completed, the
+whole-change final review has passed (`execution_graphs.final_phase = 'done'`),
+the reducer emits one `execution_graph_result` artifact and one aggregate
+`stage_result` for the parent attempt; the aggregate hash is compare-and-set on
+`execution_graphs` so the parent can settle once through the ordinary
+stage-result path. A graph with no completed unit (all units exited or failed)
+never claims structured success.
 
 `pipeline_artifacts.kind` includes `execution_graph_result` for the child
 aggregate artifact in addition to the existing stage, review, command,

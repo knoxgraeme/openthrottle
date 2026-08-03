@@ -1,11 +1,17 @@
 import { describe, expect, it } from "vitest";
 import { canonicalJson, digestNormalized, type PipelineManifest } from "./manifest.js";
 import {
+  actionKindForUnitPhase,
   buildAggregateStageEvent,
   decideChildGate,
   decideDownstreamContext,
   deriveUnitTerminalState,
+  nextUnitPhase,
+  routeFinalReviewDecision,
+  routeIntegrationDecision,
+  routeUnitAcceptanceDecision,
   selectNextReadyUnit,
+  UNIT_PHASES,
   unitBudgetDecision,
   type ChildGateEvidence,
   type ExecutionUnitState,
@@ -18,6 +24,11 @@ function unit(overrides: Partial<ExecutionUnitState> & { unitId: string; ordinal
     dependencies: [],
     status: "pending",
     activeActionId: null,
+    phase: "implement",
+    currentCycle: 1,
+    repairRounds: 0,
+    commandIndex: 0,
+    acceptedCandidateSubject: null,
     integrationSubject: null,
     terminalLevel: null,
     alarm: false,
@@ -369,6 +380,64 @@ describe("unit coordinator", () => {
       subject,
       units: [unit({ unitId: "a", ordinal: 0, status: "integrated", integrationSubject: subject })],
     })).toThrow(/requires a parent run binding/);
+  });
+
+  it("advances the durable unit phase sequence and derives the action kind for repair cycles", () => {
+    expect(UNIT_PHASES).toEqual(["implement", "simplify", "command", "candidate", "lead", "integrate"]);
+    expect(nextUnitPhase("implement")).toBe("simplify");
+    expect(nextUnitPhase("simplify")).toBe("command");
+    expect(nextUnitPhase("command")).toBe("candidate");
+    expect(nextUnitPhase("candidate")).toBe("lead");
+    expect(nextUnitPhase("lead")).toBe("integrate");
+    expect(nextUnitPhase("integrate")).toBeUndefined();
+
+    expect(actionKindForUnitPhase("implement", 1)).toBe("implement");
+    expect(actionKindForUnitPhase("implement", 2)).toBe("repair");
+    expect(actionKindForUnitPhase("simplify", 2)).toBe("simplify");
+    expect(actionKindForUnitPhase("command", 1)).toBe("command");
+    expect(actionKindForUnitPhase("candidate", 1)).toBe("candidate");
+    expect(actionKindForUnitPhase("lead", 1)).toBe("lead");
+    expect(actionKindForUnitPhase("integrate", 1)).toBe("integrate");
+  });
+
+  it("routes a unit acceptance decision to integrate, bounded repair, or escalation", () => {
+    expect(routeUnitAcceptanceDecision({
+      outcome: "success", reason: "lead_scope_match_accept", repairRounds: 0, maxRepairRounds: 3,
+    })).toEqual({ action: "integrate" });
+    expect(routeUnitAcceptanceDecision({
+      outcome: "semantic_repair_required", reason: "command_exit_nonzero", repairRounds: 0, maxRepairRounds: 3,
+    })).toEqual({ action: "repair", repairRounds: 1 });
+    expect(routeUnitAcceptanceDecision({
+      outcome: "semantic_repair_required", reason: "command_exit_nonzero", repairRounds: 3, maxRepairRounds: 3,
+    })).toEqual({ action: "settle", reason: "defect" });
+    expect(routeUnitAcceptanceDecision({
+      outcome: "needs_human", reason: "lead_needs_human", repairRounds: 0, maxRepairRounds: 3,
+    })).toEqual({ action: "escalate", reason: "lead_needs_human" });
+  });
+
+  it("routes an integration decision to settlement or escalation", () => {
+    expect(routeIntegrationDecision({ outcome: "success", reason: "executor_integrated_candidate" }))
+      .toEqual({ action: "settle_completed" });
+    expect(routeIntegrationDecision({ outcome: "failure", reason: "integration_evidence_failed" }))
+      .toEqual({ action: "escalate", reason: "integration_evidence_failed" });
+  });
+
+  it("routes a final review decision to done, bounded repair, or escalation", () => {
+    expect(routeFinalReviewDecision({
+      outcome: "success", reason: "typed_semantic_result", repairRounds: 0, maxRepairRounds: 3,
+    })).toEqual({ action: "done" });
+    expect(routeFinalReviewDecision({
+      outcome: "no_change", reason: "no_findings", repairRounds: 0, maxRepairRounds: 3,
+    })).toEqual({ action: "done" });
+    expect(routeFinalReviewDecision({
+      outcome: "semantic_repair_required", reason: "unresolved_review_finding", repairRounds: 0, maxRepairRounds: 3,
+    })).toEqual({ action: "repair", repairRounds: 1 });
+    expect(routeFinalReviewDecision({
+      outcome: "semantic_repair_required", reason: "unresolved_review_finding", repairRounds: 3, maxRepairRounds: 3,
+    })).toEqual({ action: "escalate", reason: "final_review_repair_rounds_exhausted" });
+    expect(routeFinalReviewDecision({
+      outcome: "needs_human", reason: "review_needs_human", repairRounds: 0, maxRepairRounds: 3,
+    })).toEqual({ action: "escalate", reason: "review_needs_human" });
   });
 });
 
