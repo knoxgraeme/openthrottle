@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
 import { childActionFailureResult, executeChildAction } from "./execute-child-action.mjs";
@@ -93,6 +93,68 @@ describe("child executor action", () => {
       worktree: null,
     });
     expect(() => executeChildAction({ request: unitScopedFinalCommand })).toThrow(/final command must be graph-scoped/);
+  });
+
+  it("grants and relocks configured unit command worktrees around execution and subject collection", () => {
+    const configDir = mkdtempSync(join(tmpdir(), "ot-child-action-config-"));
+    directories.push(configDir);
+    const configPath = join(configDir, "repository-config.json");
+    writeFileSync(configPath, JSON.stringify({ commands: { test: "npm test" } }));
+    process.env.OT_STAGE_CONFIG_FILE = configPath;
+
+    const events = [];
+    const request = childExecutorRequest({ commandName: "test" });
+    const result = executeChildAction({
+      request,
+      grantWorktree: ({ handle }) => {
+        events.push(`grant:${handle}`);
+        return { id: handle, path: `/tmp/${handle}`, writable: true };
+      },
+      executeCommand: ({ command, repoDir }) => {
+        events.push(`command:${command}:${repoDir}`);
+        return { exitCode: 0, signal: null, timedOut: false, stdout: "ok", stderr: "" };
+      },
+      computeSubject: (repoDir) => {
+        events.push(`subject:${repoDir}`);
+        return "3".repeat(40);
+      },
+      lockWorktreeHandle: ({ handle }) => {
+        events.push(`lock:${handle}`);
+      },
+    });
+
+    expect(events).toEqual([
+      "grant:worktree-1",
+      "command:npm test:/tmp/worktree-1",
+      "subject:/tmp/worktree-1",
+      "lock:worktree-1",
+    ]);
+    expect(result).toMatchObject({
+      outcome: "success",
+      subject: "3".repeat(40),
+    });
+  });
+
+  it("relocks configured unit command worktrees when command execution throws", () => {
+    const configDir = mkdtempSync(join(tmpdir(), "ot-child-action-config-"));
+    directories.push(configDir);
+    const configPath = join(configDir, "repository-config.json");
+    writeFileSync(configPath, JSON.stringify({ commands: { test: "npm test" } }));
+    process.env.OT_STAGE_CONFIG_FILE = configPath;
+
+    const lockWorktreeHandle = vi.fn();
+    const request = childExecutorRequest({ commandName: "test" });
+
+    expect(() => executeChildAction({
+      request,
+      grantWorktree: ({ handle }) => ({ id: handle, path: `/tmp/${handle}`, writable: true }),
+      executeCommand: () => {
+        throw new Error("command launch failed");
+      },
+      lockWorktreeHandle,
+      computeSubject: () => "3".repeat(40),
+    })).toThrow(/command launch failed/);
+    expect(lockWorktreeHandle).toHaveBeenCalledWith({ rootDir: "/var/lib/openthrottle/worktrees", handle: "worktree-1" });
   });
 
   it("builds retryable failure envelopes that preserve child executor errors", () => {

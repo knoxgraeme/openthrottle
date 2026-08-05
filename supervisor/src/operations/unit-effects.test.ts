@@ -40,6 +40,7 @@ function storeFor(leased: ExecutionWorkAttempt): ExecutionUnitStore {
     markActionDispatching: vi.fn(),
     markActionDispatched: vi.fn(),
     completeUnitAction: vi.fn(),
+    failUnitAction: vi.fn(),
     healExpiredCurrentChildAction: vi.fn(),
   } as unknown as ExecutionUnitStore;
 }
@@ -73,7 +74,7 @@ describe("unit effect processor", () => {
     const leased = action();
     const store = storeFor(leased);
     const runtime: UnitEffectRuntime = {
-      collectUnitAction: vi.fn(async () => ({ resultHash: "result-hash", outputSubject: "abc123" })),
+      collectUnitAction: vi.fn(async () => ({ resultHash: "result-hash", outputSubject: "abc123", nativeSessionId: "native-1" })),
       dispatchUnitAction: vi.fn(),
     };
 
@@ -90,7 +91,40 @@ describe("unit effect processor", () => {
       actionId: "action-1",
       resultHash: "result-hash",
       outputSubject: "abc123",
+      nativeSessionId: "native-1",
     });
+  });
+
+  it("persists collected terminal child failures without duplicate dispatch", async () => {
+    const leased = action({ status: "running", request_hash: "request-hash" });
+    const store = storeFor(leased);
+    const runtime: UnitEffectRuntime = {
+      collectUnitAction: vi.fn(async () => ({
+        terminal: true as const,
+        outcome: "retryable_infrastructure_failure" as const,
+        resultHash: "result-hash",
+        lastError: "child action failed",
+        nativeSessionId: null,
+      })),
+      dispatchUnitAction: vi.fn(),
+    };
+
+    await createUnitEffectProcessor({
+      store,
+      runtime,
+      leaseOwner: "owner",
+      now: () => new Date("2026-07-29T00:00:00.000Z"),
+    }).drain("attempt-parent");
+
+    expect(store.failUnitAction).toHaveBeenCalledWith({
+      actionId: "action-1",
+      resultHash: "result-hash",
+      outcome: "retryable_infrastructure_failure",
+      lastError: "child action failed",
+      nativeSessionId: null,
+    });
+    expect(store.completeUnitAction).not.toHaveBeenCalled();
+    expect(runtime.dispatchUnitAction).not.toHaveBeenCalled();
   });
 
   it("collects an already-dispatched child action without duplicate dispatch", async () => {

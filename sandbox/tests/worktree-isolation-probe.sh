@@ -403,6 +403,7 @@ const base = {
   actionId: "action-current",
   attemptId: "attempt-current",
   graphId: "graph-1",
+  parentRunId: "run-parent",
   unitId: "unit-1",
   role: "worker",
   loop: "implement",
@@ -438,6 +439,7 @@ const base = {
   actionId: "action-lead",
   attemptId: "attempt-current",
   graphId: "graph-1",
+  parentRunId: "run-parent",
   unitId: "unit-1",
   role: "lead",
   loop: "lead",
@@ -472,6 +474,7 @@ const base = {
   actionId: "action-reviewer",
   attemptId: "attempt-current",
   graphId: "graph-1",
+  parentRunId: "run-parent",
   unitId: "unit-1",
   role: "reviewer",
   loop: "review",
@@ -506,6 +509,7 @@ const base = {
   actionId: "action-builtin",
   attemptId: "attempt-current",
   graphId: "graph-1",
+  parentRunId: "run-parent",
   unitId: "unit-1",
   role: "lead",
   loop: "lead",
@@ -625,7 +629,7 @@ if (result.kind !== "loop_action_result" ||
     result.attempt_id !== "attempt-current" ||
     result.action_id !== "action-lead" ||
     result.outcome !== "success" ||
-    result.subject !== null) {
+    !/^[a-f0-9]{40}$/.test(result.subject)) {
   throw new Error(`invalid lead probe result: ${JSON.stringify(result)}`);
 }
 NODE
@@ -656,7 +660,7 @@ if (result.kind !== "loop_action_result" ||
     result.attempt_id !== "attempt-current" ||
     result.action_id !== "action-reviewer" ||
     result.outcome !== "success" ||
-    result.subject !== null) {
+    !/^[a-f0-9]{40}$/.test(result.subject)) {
   throw new Error(`invalid reviewer probe result: ${JSON.stringify(result)}`);
 }
 NODE
@@ -685,7 +689,7 @@ if (result.kind !== "loop_action_result" ||
     result.attempt_id !== "attempt-current" ||
     result.action_id !== "action-builtin" ||
     result.outcome !== "success" ||
-    result.subject !== null) {
+    !/^[a-f0-9]{40}$/.test(result.subject)) {
   throw new Error(`invalid built-in probe result: ${JSON.stringify(result)}`);
 }
 NODE

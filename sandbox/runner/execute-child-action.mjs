@@ -9,7 +9,7 @@ import { writeJsonAtomic } from "./atomic-write.mjs";
 import { computeWorkspaceTreeOid } from "./repository-control.mjs";
 import { defaultExecuteCommand, resolveCommand } from "./execute-stage.mjs";
 import { integrateCandidate } from "./integrate-unit.mjs";
-import { deriveCandidateCommit, worktreePath } from "./worktrees.mjs";
+import { deriveCandidateCommit, grantWorktreeToAgent, lockWorktree, worktreePath } from "./worktrees.mjs";
 
 function configPath() {
   return process.env.OT_STAGE_CONFIG_FILE ?? "/var/lib/openthrottle/stage-input/repository-config.json";
@@ -112,13 +112,45 @@ function receiptBase({ request, type, result, post, evidence = [], payload }) {
   };
 }
 
-function commandReceipt(request) {
+function commandReceipt(request, {
+  executeCommand = defaultExecuteCommand,
+  grantWorktree = grantWorktreeToAgent,
+  lockWorktreeHandle = lockWorktree,
+  computeSubject = computeWorkspaceTreeOid,
+} = {}) {
   const commandName = request.commandName;
   const config = JSON.parse(readFileSync(configPath(), "utf8"));
   const command = resolveCommand(config, commandName);
-  const repoDir = repoDirFor(request);
-  const execution = defaultExecuteCommand({ command, repoDir, timeoutMs: 7_200_000 });
-  const post = execution.notConfigured ? request.inputSubject : computeWorkspaceTreeOid(repoDir);
+  if (!command) {
+    return receiptBase({
+      request,
+      type: "command_result",
+      result: "not_configured",
+      post: request.inputSubject,
+      payload: {
+        command: commandName,
+        exit_code: 1,
+        summary: `Repository command ${commandName} is not configured.`,
+        stdout_digest: digest(""),
+        stderr_digest: digest(""),
+      },
+    });
+  }
+  let repoDir = repoDirFor(request);
+  let relockWorktree = null;
+  if (request.actionKind === "command") {
+    const granted = grantWorktree({ rootDir: WORKTREE_ROOT, handle: request.worktree.id });
+    repoDir = granted.path;
+    relockWorktree = () => lockWorktreeHandle({ rootDir: WORKTREE_ROOT, handle: request.worktree.id });
+  }
+  let execution;
+  let post;
+  try {
+    execution = executeCommand({ command, repoDir, timeoutMs: 7_200_000 });
+    post = computeSubject(repoDir);
+  } finally {
+    if (relockWorktree) relockWorktree();
+  }
   const result = execution.notConfigured
     ? "not_configured"
     : execution.exitCode === 0 && !execution.timedOut && !execution.signal
@@ -184,10 +216,16 @@ function integrationReceipt(request) {
   });
 }
 
-export function executeChildAction({ request: rawRequest }) {
+export function executeChildAction({
+  request: rawRequest,
+  executeCommand = defaultExecuteCommand,
+  grantWorktree = grantWorktreeToAgent,
+  lockWorktreeHandle = lockWorktree,
+  computeSubject = computeWorkspaceTreeOid,
+} = {}) {
   const request = validateRequest(rawRequest);
   const receipt = request.actionKind === "command" || request.actionKind === "final_command"
-    ? commandReceipt(request)
+    ? commandReceipt(request, { executeCommand, grantWorktree, lockWorktreeHandle, computeSubject })
     : request.actionKind === "candidate"
       ? candidateReceipt(request)
       : integrationReceipt(request);

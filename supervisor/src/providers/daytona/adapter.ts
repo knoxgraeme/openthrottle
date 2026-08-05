@@ -184,6 +184,14 @@ function childExecutorEnv(request: ChildExecutorActionRequest): string {
   ].join(" ");
 }
 
+function loopActionHeartbeatEnv(request: LoopActionRequest): string {
+  return [
+    "env",
+    `RUN_ID=${shellSingleQuoted(request.parentRunId)}`,
+    `OT_CHILD_ACTION_ID=${shellSingleQuoted(request.actionId)}`,
+  ].join(" ");
+}
+
 function parseCollectedStageResult(raw: string, attemptId: string): StageExecutionResult {
   if (Buffer.byteLength(raw, "utf8") > 64 * 1024) throw new Error("sealed stage result exceeds 64 KiB");
   const event = JSON.parse(raw) as Record<string, unknown>;
@@ -510,6 +518,7 @@ export function createDaytonaSandboxRuntime(
         throw new Error("Daytona runtime does not expose session command execution");
       }
       await sandbox.process?.createSession?.(sessionId).catch(() => undefined);
+      const heartbeatEnv = loopActionHeartbeatEnv(request);
       const dispatched = await sandbox.process.executeSessionCommand(sessionId, {
         command: `flock --nonblock ${lockPath} sh -c ` +
           shellSingleQuoted([
@@ -524,7 +533,9 @@ export function createDaytonaSandboxRuntime(
             `chown root:root ${shellSingleQuoted(requestPath)} ${shellSingleQuoted(credentialsPath)}`,
             `chmod 400 ${shellSingleQuoted(requestPath)} ${shellSingleQuoted(credentialsPath)}`,
             `rm -f ${shellSingleQuoted(stagedCredentialsPath)}`,
-            `exec /opt/openthrottle/runner/execute-loop.mjs --request ${shellSingleQuoted(requestPath)} --credentials ${shellSingleQuoted(credentialsPath)} --output ${shellSingleQuoted(resultPath)}`,
+            `${heartbeatEnv} /opt/openthrottle/runner/heartbeat.mjs & heartbeat_pid=$!`,
+            `trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT INT TERM`,
+            `set +e; /opt/openthrottle/runner/execute-loop.mjs --request ${shellSingleQuoted(requestPath)} --credentials ${shellSingleQuoted(credentialsPath)} --output ${shellSingleQuoted(resultPath)}; status=$?; kill "$heartbeat_pid" 2>/dev/null || true; wait "$heartbeat_pid" 2>/dev/null || true; exit "$status"`,
           ].join(" && ")) +
           // A losing `flock --nonblock` (another dispatch for this exact
           // action already holds it) exits nonzero without ever running the

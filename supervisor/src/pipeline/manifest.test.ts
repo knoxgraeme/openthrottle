@@ -526,6 +526,11 @@ describe("pipeline manifest validation", () => {
     expect(() => validatePipelineManifest(simplifyBeforeImplement))
       .toThrow(/pipeline\.stages\[0\]\.unitPhases: simplify must not precede implement/);
 
+    const commandBeforeImplement = structuredClone(value) as Record<string, unknown>;
+    firstStage(commandBeforeImplement).unitPhases = ["command", "implement", "candidate", "lead", "integrate"];
+    expect(() => validatePipelineManifest(commandBeforeImplement))
+      .toThrow(/pipeline\.stages\[0\]\.unitPhases: command must not precede implement/);
+
     const agent = manifest();
     Object.assign(firstStage(agent), {
       unitPhases: ["implement", "candidate", "lead", "integrate"],

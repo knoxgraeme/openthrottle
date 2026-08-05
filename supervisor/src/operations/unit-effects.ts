@@ -7,10 +7,18 @@ export interface UnitEffectRuntime {
     nativeSessionId?: string | null;
   }>;
   collectUnitAction(action: ExecutionWorkAttempt): Promise<{
+    terminal?: false;
     resultHash: string;
     outputSubject: string;
     receipt?: string;
+    nativeSessionId?: string | null;
     decision?: ExecutionGateDecision;
+  } | {
+    terminal: true;
+    resultHash: string;
+    outcome: "failure" | "needs_human" | "retryable_infrastructure_failure";
+    lastError: string;
+    nativeSessionId?: string | null;
   } | null>;
 }
 
@@ -41,12 +49,23 @@ export function createUnitEffectProcessor(input: {
       if (!requestlessDispatch) {
         const recovered = await input.runtime.collectUnitAction(action);
         if (recovered) {
+          if (recovered.terminal) {
+            input.store.failUnitAction({
+              actionId: action.id,
+              resultHash: recovered.resultHash,
+              outcome: recovered.outcome,
+              lastError: recovered.lastError,
+              nativeSessionId: recovered.nativeSessionId,
+            });
+            return action;
+          }
           if (recovered.decision) {
             input.store.completeGatedAction({
               actionId: action.id,
               resultHash: recovered.resultHash,
               outputSubject: recovered.outputSubject,
               receipt: recovered.receipt,
+              nativeSessionId: recovered.nativeSessionId,
               decision: recovered.decision,
             });
           } else {
@@ -55,6 +74,7 @@ export function createUnitEffectProcessor(input: {
               resultHash: recovered.resultHash,
               outputSubject: recovered.outputSubject,
               receipt: recovered.receipt,
+              nativeSessionId: recovered.nativeSessionId,
             });
           }
           return action;

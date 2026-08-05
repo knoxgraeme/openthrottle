@@ -176,13 +176,22 @@ export interface ExecutionUnitStore {
     resultHash: string;
     outputSubject: string;
     receipt?: string;
+    nativeSessionId?: string | null;
   }): ExecutionWorkAttempt;
   completeGatedAction(input: {
     actionId: string;
     resultHash: string;
     outputSubject: string;
     receipt?: string;
+    nativeSessionId?: string | null;
     decision: ExecutionGateDecision;
+  }): ExecutionWorkAttempt;
+  failUnitAction(input: {
+    actionId: string;
+    resultHash: string;
+    outcome: "failure" | "needs_human" | "retryable_infrastructure_failure";
+    lastError: string;
+    nativeSessionId?: string | null;
   }): ExecutionWorkAttempt;
   emitAggregateOnce(input: {
     parentAttemptId: string;
@@ -586,7 +595,14 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     if (GATED_ACTION_KINDS.has(action.action_kind)) {
       throw new Error(`execution work attempt ${input.actionId} requires a gate decision to complete`);
     }
-    markActionCompleted(db, { action, resultHash: input.resultHash, outputSubject: input.outputSubject, receipt: input.receipt, timestamp });
+    markActionCompleted(db, {
+      action,
+      resultHash: input.resultHash,
+      outputSubject: input.outputSubject,
+      receipt: input.receipt,
+      nativeSessionId: input.nativeSessionId,
+      timestamp,
+    });
 
     if (action.execution_unit_id) {
       const unitUpdate = db.prepare(`
@@ -648,7 +664,14 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       if (!["leased", "dispatched", "running"].includes(action.status)) {
         throw new Error(`execution work attempt ${input.actionId} is not active`);
       }
-      markActionCompleted(db, { action, resultHash: input.resultHash, outputSubject: input.outputSubject, receipt: input.receipt, timestamp });
+      markActionCompleted(db, {
+        action,
+        resultHash: input.resultHash,
+        outputSubject: input.outputSubject,
+        receipt: input.receipt,
+        nativeSessionId: input.nativeSessionId,
+        timestamp,
+      });
     }
     const completedAction = loadActiveAction(db, input.actionId);
     assertGateMatchesAction(completedAction, input.decision.gateKind);
@@ -765,6 +788,44 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       } else {
         stopActiveWork({ parentAttemptId: completedAction.parent_attempt_id, reason: routing.reason });
       }
+    }
+    return loadActiveAction(db, input.actionId);
+  });
+
+  const failUnitAction = db.transaction((
+    input: Parameters<ExecutionUnitStore["failUnitAction"]>[0]
+  ): ExecutionWorkAttempt => {
+    const timestamp = now();
+    const action = loadActiveAction(db, input.actionId);
+    if (action.status === "failed" || action.status === "dead") return action;
+    if (!["leased", "dispatched", "running"].includes(action.status)) {
+      throw new Error(`execution work attempt ${input.actionId} is not active`);
+    }
+    const lastError = input.lastError.slice(0, 2_000);
+    const update = db.prepare(`
+      UPDATE execution_work_attempts
+      SET status = 'failed', result_hash = ?, native_session_id = COALESCE(?, native_session_id),
+          lease_until = NULL, last_error = ?, completed_at = ?, updated_at = ?
+      WHERE id = ? AND status IN ('leased', 'dispatched', 'running')
+    `).run(input.resultHash, input.nativeSessionId ?? null, lastError, timestamp, timestamp, input.actionId);
+    if (update.changes !== 1) throw new Error(`execution work attempt ${input.actionId} failure compare-and-set failed`);
+    if (action.execution_unit_id && action.unit_id) {
+      const unitUpdate = db.prepare(`
+        UPDATE execution_units SET active_work_attempt_id = NULL, updated_at = ?
+        WHERE id = ? AND active_work_attempt_id = ?
+      `).run(timestamp, action.execution_unit_id, action.id);
+      if (unitUpdate.changes !== 1) {
+        throw new Error(`execution work attempt ${input.actionId} is not the current active action`);
+      }
+      settleUnitRow({
+        parentAttemptId: action.parent_attempt_id,
+        unitId: action.unit_id,
+        reason: input.outcome === "needs_human" ? "structural_exit" : "defect",
+        timestamp,
+      });
+      settleStructurallyBlockedDependents(action.parent_attempt_id, timestamp);
+    } else {
+      stopActiveWork({ parentAttemptId: action.parent_attempt_id, reason: lastError });
     }
     return loadActiveAction(db, input.actionId);
   });
@@ -1012,6 +1073,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     },
     completeUnitAction,
     completeGatedAction,
+    failUnitAction,
     emitAggregateOnce,
     recordGateReceipt,
     listGateReceipts(parentAttemptId) {

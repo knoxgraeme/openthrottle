@@ -68,6 +68,7 @@ export interface LoopActionRequest {
   actionId: string;
   attemptId: string;
   graphId: string;
+  parentRunId: string;
   unitId: string | null;
   role: "worker" | "lead" | "reviewer" | "publisher";
   loop: "implement" | "simplify" | "command" | "repair" | "lead" | "review" | "publish";

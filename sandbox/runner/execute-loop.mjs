@@ -275,7 +275,7 @@ export function createLoopRequestHash(requestWithoutFence) {
 export function validateLoopRequest(value) {
   const input = record(value, "loop request");
   const allowed = new Set([
-    "protocol", "actionId", "attemptId", "graphId", "unitId", "role", "loop",
+    "protocol", "actionId", "attemptId", "graphId", "parentRunId", "unitId", "role", "loop",
     "agent", "skill", "worktree", "candidateSubject", "nativeSessionId", "contextPolicy", "timeoutMs",
     "transitionContext", "allowedMcpServers", "credentialScopes", "receiptSchema",
     "repositorySkill", "requestHash", "idempotencyKey",
@@ -296,6 +296,7 @@ export function validateLoopRequest(value) {
     actionId: stagePathId(input.actionId, "actionId"),
     attemptId: stagePathId(input.attemptId, "attemptId"),
     graphId: string(input.graphId, "graphId"),
+    parentRunId: stagePathId(input.parentRunId, "parentRunId"),
     unitId: nullableString(input.unitId, "unitId"),
     role: string(input.role, "role"),
     loop: string(input.loop, "loop"),

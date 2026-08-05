@@ -1249,6 +1249,64 @@ describe("execution unit store", () => {
     expect(next?.unit_id).toBe("b");
   });
 
+  it("durably fails a collected child action and structurally exits dependents", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b", dependencies: ["a"] }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+
+    const failed = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: "2026-07-29T00:00:00.000Z",
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })!;
+    store.markActionDispatched(failed.id, "request-hash", "native-session");
+
+    expect(store.failUnitAction({
+      actionId: failed.id,
+      resultHash: "result-hash",
+      outcome: "failure",
+      lastError: "child action returned failure",
+      nativeSessionId: "native-session-2",
+    })).toMatchObject({
+      id: failed.id,
+      status: "failed",
+      result_hash: "result-hash",
+      native_session_id: "native-session-2",
+      last_error: "child action returned failure",
+    });
+    expect(store.listUnits("attempt-parent")).toEqual([
+      expect.objectContaining({
+        unitId: "a",
+        status: "failed",
+        activeActionId: null,
+        terminalLevel: "failed",
+        alarm: true,
+      }),
+      expect.objectContaining({
+        unitId: "b",
+        status: "exited",
+        activeActionId: null,
+        terminalLevel: "exited",
+        alarm: false,
+      }),
+    ]);
+    expect(store.failUnitAction({
+      actionId: failed.id,
+      resultHash: "result-hash",
+      outcome: "failure",
+      lastError: "child action returned failure",
+    })).toMatchObject({ id: failed.id, status: "failed" });
+  });
+
   it("completes a recovered result through the current action pointer before any heal", () => {
     const store = setup();
     store.createGraph({

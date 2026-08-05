@@ -281,8 +281,8 @@ export function insertWorkAttempt(
     INSERT INTO execution_work_attempts (
       id, execution_graph_id, execution_unit_id, pipeline_instance_id, parent_attempt_id,
       parent_run_id, unit_id, attempt_ordinal, action_kind, cycle, command_name, idempotency_key,
-      status, lease_owner, lease_until, payload, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'leased', ?, ?, ?, ?, ?)
+      native_session_id, status, lease_owner, lease_until, payload, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'leased', ?, ?, ?, ?, ?)
   `).run(
     actionId,
     input.graph.id,
@@ -296,6 +296,7 @@ export function insertWorkAttempt(
     input.cycle,
     input.commandName,
     idempotencyKey,
+    input.resumeNativeSessionId,
     input.leaseOwner,
     input.leaseUntilIso,
     payload,
@@ -343,7 +344,9 @@ export function createOrResumeUnitAction(
     const commandName = unitRow.phase === "command" ? commandNames[unitRow.command_index]! : null;
     const resumeNativeSessionId = actionKind === "repair"
       ? priorSessionId(db, { unitRowId: unitRow.id, graphId: input.graph.id, kinds: ["implement", "repair"] })
-      : null;
+      : actionKind === "simplify"
+        ? priorSessionId(db, { unitRowId: unitRow.id, graphId: input.graph.id, kinds: ["implement", "repair", "simplify"] })
+        : null;
     return insertWorkAttempt(db, {
       unitRow,
       graph: input.graph,
@@ -478,6 +481,7 @@ export function markActionCompleted(
     resultHash: string;
     outputSubject: string;
     receipt?: string;
+    nativeSessionId?: string | null;
     timestamp: string;
   }
 ): void {
@@ -502,9 +506,19 @@ export function markActionCompleted(
   db.prepare(`
     UPDATE execution_work_attempts
     SET status = 'completed', result_hash = ?, output_subject = ?, receipt = ?, receipt_hash = ?,
+        native_session_id = COALESCE(?, native_session_id),
         completed_at = ?, updated_at = ?
     WHERE id = ? AND status IN ('leased', 'dispatched', 'running')
-  `).run(input.resultHash, input.outputSubject, receiptJson, receiptHash, input.timestamp, input.timestamp, input.action.id);
+  `).run(
+    input.resultHash,
+    input.outputSubject,
+    receiptJson,
+    receiptHash,
+    input.nativeSessionId ?? null,
+    input.timestamp,
+    input.timestamp,
+    input.action.id
+  );
 }
 
 export function insertGateReceipt(

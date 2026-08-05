@@ -181,8 +181,58 @@ describe("pipeline effect processor", () => {
     preSubject?: string;
     result?: string;
     commandName?: string | null;
+    nativeSessionId?: string | null;
+    evidence?: string[];
   }): string {
     const executorVerified = input.type === "command_result" || input.type.endsWith("_evidence");
+    const producer = (() => {
+      if (executorVerified) {
+        return {
+          worker_id: "executor",
+          skill: `builtin://${input.type}@1`,
+          capability_digest: input.instance.capability_digest,
+          skill_package_digest: null,
+        };
+      }
+      if (input.action.action_kind === "implement" || input.action.action_kind === "repair") {
+        return {
+          worker_id: "unit-worker",
+          skill: "builtin://ce/implement@1",
+          capability_digest: input.instance.capability_digest,
+          skill_package_digest: null,
+        };
+      }
+      if (input.action.action_kind === "simplify") {
+        return {
+          worker_id: "simplify-worker",
+          skill: "builtin://ce/simplify@1",
+          capability_digest: input.instance.capability_digest,
+          skill_package_digest: null,
+        };
+      }
+      if (input.action.action_kind === "lead") {
+        return {
+          worker_id: "lead-worker",
+          skill: "builtin://accept-unit@1",
+          capability_digest: input.instance.capability_digest,
+          skill_package_digest: null,
+        };
+      }
+      if (input.action.action_kind === "final_review") {
+        return {
+          worker_id: "reviewer",
+          skill: "builtin://final-review@1",
+          capability_digest: input.instance.capability_digest,
+          skill_package_digest: null,
+        };
+      }
+      return {
+        worker_id: "worker",
+        skill: `builtin://${input.type}@1`,
+        capability_digest: input.instance.capability_digest,
+        skill_package_digest: null,
+      };
+    })();
     const payload = input.type === "unit_completion"
       ? {
           summary: "done",
@@ -205,12 +255,7 @@ describe("pipeline effect processor", () => {
       type: input.type,
       assurance: executorVerified ? "executor_verified" : "semantic_attested",
       result: input.result ?? (input.type === "unit_decision" ? "accept" : "success"),
-      producer: {
-        worker_id: executorVerified ? "executor" : "worker",
-        skill: `builtin://${input.type}@1`,
-        capability_digest: input.instance.capability_digest,
-        skill_package_digest: null,
-      },
+      producer,
       subject: {
         base: input.baseSubject ?? input.instance.base_commit,
         pre: input.preSubject ?? input.instance.base_commit,
@@ -224,10 +269,10 @@ describe("pipeline effect processor", () => {
         parent_run_id: input.action.parent_run_id,
         action_attempt_id: input.action.id,
         generation: input.instance.generation,
-        native_session_id: input.action.native_session_id,
+        native_session_id: input.nativeSessionId ?? input.action.native_session_id,
         request_hash: input.action.request_hash ?? "b".repeat(64),
       },
-      evidence: ["e".repeat(64)],
+      evidence: input.evidence ?? ["e".repeat(64)],
       payload,
       issued_at: "2099-07-22T12:00:00.000Z",
     });
@@ -640,17 +685,24 @@ describe("pipeline effect processor", () => {
       expect(action).toMatchObject({ action_kind: kind });
       return action!;
     };
-    const completeUnitAction = (kind: ExecutionWorkAttempt["action_kind"], subject: string, receiptType?: Parameters<typeof receiptJson>[0]["type"]) => {
+    const completeUnitAction = (
+      kind: ExecutionWorkAttempt["action_kind"],
+      subject: string,
+      receiptType?: Parameters<typeof receiptJson>[0]["type"],
+      receiptFence: Pick<Parameters<typeof receiptJson>[0], "baseSubject" | "preSubject" | "nativeSessionId"> = {}
+    ) => {
       const action = latestAction(kind);
       pipelines.completeUnitAction({
         actionId: action.id,
         resultHash: `result-${kind}`,
         outputSubject: subject,
-        ...(receiptType ? { receipt: receiptJson({ instance, action, type: receiptType, subject, commandName: action.command_name }) } : {}),
+        ...(receiptType
+          ? { receipt: receiptJson({ instance, action, type: receiptType, subject, commandName: action.command_name, ...receiptFence }) }
+          : {}),
       });
       return action;
     };
-    const drainCommandActions = async (actionKind: "command" | "final_command", subject: string) => {
+    const drainCommandActions = async (actionKind: "command" | "final_command", subject: string, baseSubject = subject) => {
       for (const commandName of ["test", "lint", "build"]) {
         await processor.drain();
         expect(runtime.dispatchChildExecutorAction).toHaveBeenLastCalledWith(
@@ -662,7 +714,7 @@ describe("pipeline effect processor", () => {
             inputSubject: subject,
           })
         );
-        completeUnitAction(actionKind, subject, "command_result");
+        completeUnitAction(actionKind, subject, "command_result", { baseSubject, preSubject: subject });
       }
     };
 
@@ -682,26 +734,55 @@ describe("pipeline effect processor", () => {
         { providerResourceId: "sandbox-child-drain" },
         expect.objectContaining({
           protocol: "loop-action@2",
+          contextPolicy: "prefer_resume",
+          nativeSessionId: null,
           role: "worker",
           skill: "implement-unit",
           unitId: input.unitId,
         })
       );
-      completeUnitAction("implement", input.completed, "unit_completion");
+      const implement = latestAction("implement");
+      runtime.collectLoopActionResult.mockResolvedValueOnce({
+        actionId: implement.id,
+        attemptId: implement.parent_attempt_id,
+        requestHash: implement.request_hash!,
+        outcome: "success",
+        nativeSessionId: `thread-${input.unitId}`,
+        subject: input.completed,
+        receipt: receiptJson({
+          instance,
+          action: implement,
+          type: "unit_completion",
+          subject: input.completed,
+          baseSubject: input.baseSubject,
+          preSubject: input.baseSubject,
+          nativeSessionId: `thread-${input.unitId}`,
+        }),
+        completedAt: "2099-07-22T12:00:00.000Z",
+      });
+      await processor.drain();
+      expect(pipelines.listWorkAttempts(attempt.id).find((attempt) => attempt.id === implement.id))
+        .toMatchObject({ status: "completed", native_session_id: `thread-${input.unitId}` });
 
       await processor.drain();
       expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
         { providerResourceId: "sandbox-child-drain" },
         expect.objectContaining({
           protocol: "loop-action@2",
+          contextPolicy: "resume_required",
+          nativeSessionId: `thread-${input.unitId}`,
           role: "worker",
           skill: "simplify-unit",
           unitId: input.unitId,
         })
       );
-      completeUnitAction("simplify", input.completed);
+      completeUnitAction("simplify", input.completed, "unit_completion", {
+        baseSubject: input.baseSubject,
+        preSubject: input.completed,
+        nativeSessionId: `thread-${input.unitId}`,
+      });
 
-      await drainCommandActions("command", input.completed);
+      await drainCommandActions("command", input.completed, input.baseSubject);
 
       await processor.drain();
       expect(runtime.dispatchChildExecutorAction).toHaveBeenLastCalledWith(
@@ -713,7 +794,10 @@ describe("pipeline effect processor", () => {
           unitId: input.unitId,
         })
       );
-      completeUnitAction("candidate", input.candidate, "candidate_evidence");
+      completeUnitAction("candidate", input.candidate, "candidate_evidence", {
+        baseSubject: input.baseSubject,
+        preSubject: input.completed,
+      });
 
       await processor.drain();
       expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
@@ -727,13 +811,34 @@ describe("pipeline effect processor", () => {
         })
       );
       const lead = latestAction("lead");
-      pipelines.completeGatedAction({
+      const leadEvidence = pipelines.listWorkAttempts(attempt.id)
+        .filter((attempt) =>
+          attempt.unit_id === input.unitId &&
+          attempt.cycle === lead.cycle &&
+          (attempt.action_kind === "candidate" || attempt.action_kind === "command") &&
+          attempt.receipt)
+        .map((attempt) => digestNormalized(attempt.receipt!));
+      runtime.collectLoopActionResult.mockResolvedValueOnce({
         actionId: lead.id,
-        resultHash: `result-lead-${input.unitId}`,
-        outputSubject: input.candidate,
-        receipt: receiptJson({ instance, action: lead, type: "unit_decision", subject: input.candidate }),
-        decision: gateDecision({ gateKind: "unit_acceptance", subject: input.candidate }),
+        attemptId: lead.parent_attempt_id,
+        requestHash: lead.request_hash!,
+        outcome: "success",
+        nativeSessionId: null,
+        subject: input.candidate,
+        receipt: receiptJson({
+          instance,
+          action: lead,
+          type: "unit_decision",
+          subject: input.candidate,
+          baseSubject: input.baseSubject,
+          preSubject: input.candidate,
+          evidence: leadEvidence,
+        }),
+        completedAt: "2099-07-22T12:00:00.000Z",
       });
+      await processor.drain();
+      expect(pipelines.listWorkAttempts(attempt.id).find((attempt) => attempt.id === lead.id))
+        .toMatchObject({ status: "completed", output_subject: input.candidate });
 
       await processor.drain();
       expect(runtime.dispatchChildExecutorAction).toHaveBeenLastCalledWith(
@@ -886,6 +991,16 @@ describe("pipeline effect processor", () => {
       decision: gateDecision({ gateKind: "final_review", subject: finalIntegratedSubject }),
     });
 
+    const beforeAggregateStatus = pipelines.getInstance(instance.id)!.status;
+    db!.prepare("UPDATE pipeline_instances SET status = 'publication_blocked' WHERE id = ?").run(instance.id);
+    await expect(processor.drain()).rejects.toThrow(/pipeline publication is blocked/);
+    expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
+      aggregate_emitted_at: expect.any(String),
+      aggregate_artifact_hash: expect.any(String),
+    });
+    expect(pipelines.getAttempt(attempt.id)).toMatchObject({ status: "running" });
+    db!.prepare("UPDATE pipeline_instances SET status = ? WHERE id = ?").run(beforeAggregateStatus, instance.id);
+
     await processor.drain();
     const aggregate = pipelines.getGraphForAttempt(attempt.id);
     expect(aggregate).toMatchObject({
@@ -897,7 +1012,7 @@ describe("pipeline effect processor", () => {
     expect(runtime.setActive).toHaveBeenCalledTimes(activationsAfterAggregate);
   });
 
-  it("preserves retryable child loop errors instead of parsing them as receipts", async () => {
+  it("persists retryable child loop errors instead of parsing them as receipts", async () => {
     db = openDb(":memory:");
     const pipelines = createPipelineStore(db);
     const tickets = createSupervisorStore(db, pipelines);
@@ -996,11 +1111,185 @@ describe("pipeline effect processor", () => {
       completedAt: "2099-07-22T12:00:00.000Z",
     });
 
-    await expect(processor.drain()).rejects.toThrow(/model credential unavailable/);
+    await processor.drain();
     expect(pipelines.listWorkAttempts(attempt.id)[0]).toMatchObject({
-      status: "dispatched",
-      result_hash: null,
+      status: "failed",
+      result_hash: expect.any(String),
+      last_error: expect.stringContaining("model credential unavailable"),
     });
+    expect(pipelines.listUnits(attempt.id)).toEqual([
+      expect.objectContaining({
+        unitId: "unit_a",
+        status: "failed",
+        terminalLevel: "failed",
+        alarm: true,
+      }),
+    ]);
+  });
+
+  it("preserves valid failed command receipts for reducer handling", async () => {
+    db = openDb(":memory:");
+    const pipelines = createPipelineStore(db);
+    const tickets = createSupervisorStore(db, pipelines);
+    const runtimeDescriptor = buildInstalledRuntimeDescriptor("structured-command-failure-test/v1");
+    const catalog = loadPipelineCatalog(catalogPath, runtimeDescriptor.descriptor);
+    pipelines.acceptRuntimeDescriptor(runtimeDescriptor);
+    pipelines.acceptCatalog(catalog);
+    const repositoryConfig = parseRepositoryConfig([
+      "schema: openthrottle.config/v1",
+      "default_graph: simple",
+      "graphs:",
+      "  - id: simple",
+      "    kind: builtin",
+      "    ref: core/simple@1",
+      "  - id: structured",
+      "    kind: builtin",
+      "    ref: core/structured@1",
+      "commands: { test: npm test, lint: npm run lint, build: npm run build }",
+      "pipelines: { implement: implement }",
+    ].join("\n"));
+    const config = pipelines.saveRepositoryConfigSnapshot({
+      repository: "owner/repo",
+      baseCommit: "a".repeat(40),
+      blobSha: "b".repeat(40),
+      config: repositoryConfig,
+    });
+    const manifest = parseAndCompileExecutionGraph(readFileSync(structuredGraphPath, "utf8"), {
+      id: "builtin/structured",
+      runtime: runtimeDescriptor.descriptor,
+      config: repositoryConfig.config,
+    }).manifest;
+    pipelines.acceptManifest(manifest);
+    const executionPlan = {
+      schema: "openthrottle.execution-plan/v1",
+      graph_id: "structured",
+      plan_id: "structured-command-failure",
+      instructions: { implement_a: "Implement unit A." },
+      acceptance: { unit_a_done: "Unit A is complete." },
+      units: [{
+        id: "unit_a",
+        title: "Unit A",
+        depends_on: [],
+        instructions: ["implement_a"],
+        acceptance: ["unit_a_done"],
+      }],
+      commands: [],
+    };
+    tickets.upsert({
+      linear_issue_id: "issue-command-failure",
+      linear_issue_identifier: "OT-COMMAND-FAILURE",
+      linear_session_id: "session-command-failure",
+      sandbox_id: null,
+      branch: "ot/command-failure",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+      pipeline: {
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        manifest,
+        repositoryConfig: config,
+        runtime: runtimeDescriptor,
+        authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
+        taskContext: [
+          "Approved structured plan.",
+          "",
+          "```json openthrottle.execution-plan/v1",
+          JSON.stringify(executionPlan, null, 2),
+          "```",
+        ].join("\n"),
+      },
+    });
+    const instance = pipelines.getInstanceForSession("session-command-failure")!;
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    const runtime = sandboxRuntimeMock({ issueId: "command-failure" });
+    const processor = createPipelineEffectProcessor({
+      store: pipelines,
+      tickets,
+      runtime,
+      taskTimeoutSeconds: 300,
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+    });
+    const latestAction = () => [...pipelines.listWorkAttempts(attempt.id)].reverse()
+      .find((workAttempt) => workAttempt.status !== "completed")!;
+    const completedSubject = "1".repeat(40);
+
+    await processor.drain();
+    const implement = latestAction();
+    runtime.collectLoopActionResult.mockResolvedValueOnce({
+      actionId: implement.id,
+      attemptId: attempt.id,
+      requestHash: implement.request_hash!,
+      outcome: "success",
+      nativeSessionId: "thread-unit-a",
+      subject: completedSubject,
+      receipt: receiptJson({
+        instance,
+        action: implement,
+        type: "unit_completion",
+        subject: completedSubject,
+        baseSubject: instance.base_commit,
+        preSubject: instance.base_commit,
+        nativeSessionId: "thread-unit-a",
+      }),
+      completedAt: "2099-07-22T12:00:00.000Z",
+    });
+    await processor.drain();
+
+    await processor.drain();
+    const simplify = latestAction();
+    runtime.collectLoopActionResult.mockResolvedValueOnce({
+      actionId: simplify.id,
+      attemptId: attempt.id,
+      requestHash: simplify.request_hash!,
+      outcome: "success",
+      nativeSessionId: "thread-unit-a",
+      subject: completedSubject,
+      receipt: receiptJson({
+        instance,
+        action: simplify,
+        type: "unit_completion",
+        subject: completedSubject,
+        baseSubject: instance.base_commit,
+        preSubject: completedSubject,
+        nativeSessionId: "thread-unit-a",
+      }),
+      completedAt: "2099-07-22T12:00:00.000Z",
+    });
+    await processor.drain();
+
+    await processor.drain();
+    const command = latestAction();
+    expect(command).toMatchObject({ action_kind: "command", command_name: "test" });
+    runtime.collectChildExecutorActionResult.mockResolvedValueOnce({
+      actionId: command.id,
+      attemptId: attempt.id,
+      requestHash: command.request_hash!,
+      outcome: "failure",
+      subject: completedSubject,
+      receipt: receiptJson({
+        instance,
+        action: command,
+        type: "command_result",
+        subject: completedSubject,
+        baseSubject: instance.base_commit,
+        preSubject: completedSubject,
+        result: "failure",
+        commandName: "test",
+      }),
+      completedAt: "2099-07-22T12:00:00.000Z",
+    });
+
+    await processor.drain();
+
+    expect(pipelines.listWorkAttempts(attempt.id).find((workAttempt) => workAttempt.id === command.id))
+      .toMatchObject({ status: "completed", last_error: null, output_subject: completedSubject });
+    expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({ stopped_at: null });
+    expect(pipelines.listUnits(attempt.id)).toEqual([
+      expect.objectContaining({ unitId: "unit_a", terminalLevel: null, alarm: false }),
+    ]);
   });
 
   it("idles an active bound sandbox through a best-effort runtime effect", async () => {

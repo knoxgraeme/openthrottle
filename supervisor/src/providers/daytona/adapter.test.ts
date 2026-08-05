@@ -11,6 +11,7 @@ function fencedLoopRequest(overrides: Partial<Omit<LoopActionRequest, "requestHa
     actionId: "loop-1",
     attemptId: "attempt-child",
     graphId: "graph-1",
+    parentRunId: "run-parent",
     unitId: "unit-1",
     role: "worker" as const,
     loop: "implement" as const,
@@ -260,6 +261,7 @@ describe("Daytona stage execution", () => {
           `then rm -f .*${escapeForRegExp(stagedCredentialsPath)}.*exit 0; fi.*install -d .* -m 0711 .*loop-actions.*` +
           `loop-actions/attempt-child.*loop-actions/attempt-child/loop-1.*` +
           `cp .*${escapeForRegExp(stagedRequestPath)}.*loop-actions/attempt-child/loop-1/request\\.json.*` +
+          `RUN_ID=.*run-parent.*OT_CHILD_ACTION_ID=.*loop-1.*heartbeat\\.mjs.*` +
           `execute-loop\\.mjs --request .*loop-actions/attempt-child/loop-1/request\\.json.*` +
           `--output .*loop-actions/attempt-child/loop-1/result\\.json`
         )),
@@ -476,6 +478,7 @@ describe("Daytona stage execution", () => {
       actionId: "loop-forbidden",
       attemptId: "attempt-forbidden",
       graphId: "graph-1",
+      parentRunId: "run-parent",
       unitId: null,
       role: "lead" as const,
       loop: "lead" as const,
@@ -696,6 +699,7 @@ describe("Daytona stage execution", () => {
       actionId: "loop-redispatch",
       attemptId: "attempt-redispatch",
       graphId: "graph-1",
+      parentRunId: "run-parent",
       unitId: null,
       role: "worker" as const,
       loop: "implement" as const,
@@ -765,6 +769,7 @@ describe("Daytona stage execution", () => {
       actionId: "loop-scope",
       attemptId: "attempt-scope",
       graphId: "graph-1",
+      parentRunId: "run-parent",
       unitId: null,
       role: "reviewer" as const,
       loop: "review" as const,
