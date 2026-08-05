@@ -215,7 +215,7 @@ describe("Daytona stage execution", () => {
     });
     expect(worktree).toEqual({ id: expect.stringMatching(/^[a-f0-9]{32}$/) });
     expect(sandbox.process.executeCommand).toHaveBeenCalledWith(
-      expect.stringContaining("/opt/openthrottle/runner/worktrees.mjs create"),
+      expect.stringContaining("/opt/openthrottle/runner/worktrees.mjs create --idempotent"),
       "/home/agent/repo",
       {},
       120
@@ -545,7 +545,7 @@ describe("Daytona stage execution", () => {
     expect(command).toMatch(/OT_CHILD_ACTION_ID=.*child-command/);
     expect(command).toContain("/opt/openthrottle/runner/heartbeat.mjs");
     expect(command).toContain("/opt/openthrottle/runner/execute-child-action.mjs");
-    expect(command).toContain('GITHUB_TOKEN="${GITHUB_TOKEN-}"');
+    expect(command).not.toContain("GITHUB_TOKEN");
     expect(command).not.toContain("secret-token");
     expect(command).not.toContain("CODEX_AUTH_JSON");
     expect(uploadedPaths).toContainEqual(expect.stringMatching(

@@ -719,6 +719,52 @@ intents:
     });
   });
 
+  it("refuses OpenCode unit-consuming graphs before provisioning even when its credential is configured", async () => {
+    const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
+    executionPlan.graph_id = "structured";
+    const context = [
+      "# Structured work",
+      "",
+      "```json openthrottle.execution-plan/v1",
+      JSON.stringify(executionPlan, null, 2),
+      "```",
+      "",
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }, null, 2),
+      "```",
+    ].join("\n");
+    const { tickets } = await run(
+      `schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: structured
+    kind: builtin
+    ref: core/structured@1
+pipelines: { implement: implement }
+intents:
+  implement:
+    default_graph: simple
+    allowed_graphs: [simple, structured]
+`,
+      { codexAuthJson: undefined, kimiCodeApiKey: "kimi-key" },
+      shippedCatalogPath,
+      payload("session-1", "issue-1", "OT-1", context, ["agent:opencode"])
+    );
+
+    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+      state: "error",
+      sandbox_id: null,
+      run_id: null,
+    });
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
+    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(payloads.some((entry) => entry.includes("OpenCode structured loop actions are not supported yet"))).toBe(true);
+  });
+
   it("rejects graph selections on investigate tickets before provisioning", async () => {
     const context = [
       "# Investigate structured behavior",

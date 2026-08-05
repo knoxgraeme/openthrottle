@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import {
   canonicalJson,
+  digestNormalized,
   type PipelineUnitPhaseBinding,
   type StageOutcome,
   unitPhaseBindingCommandNames,
@@ -430,6 +431,25 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     }
   }
 
+  function assertCompletedActionReplayMatches(input: {
+    action: ExecutionWorkAttempt;
+    resultHash: string;
+    outputSubject: string;
+    receipt?: string;
+    nativeSessionId?: string | null;
+  }): void {
+    const receiptHash = input.receipt === undefined ? null : digestNormalized(input.receipt);
+    if (
+      input.action.result_hash !== input.resultHash ||
+      input.action.output_subject !== input.outputSubject ||
+      input.action.receipt_hash !== receiptHash ||
+      (input.receipt !== undefined && input.action.receipt !== input.receipt) ||
+      (input.nativeSessionId !== undefined && input.action.native_session_id !== input.nativeSessionId)
+    ) {
+      throw new Error(`execution work attempt ${input.action.id} already completed with a different result`);
+    }
+  }
+
   type UnitPhaseProjection = {
     commandNames: string[];
     unitPhases: UnitPhase[];
@@ -588,7 +608,10 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
   ): ExecutionWorkAttempt => {
     const timestamp = now();
     const action = loadActiveAction(db, input.actionId);
-    if (action.status === "completed") return action;
+    if (action.status === "completed") {
+      assertCompletedActionReplayMatches({ action, ...input });
+      return action;
+    }
     if (!["leased", "dispatched", "running"].includes(action.status)) {
       throw new Error(`execution work attempt ${input.actionId} is not active`);
     }
@@ -659,6 +682,9 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     const action = loadActiveAction(db, input.actionId);
     if (!GATED_ACTION_KINDS.has(action.action_kind)) {
       throw new Error(`execution work attempt ${input.actionId} is not a gated action`);
+    }
+    if (action.status === "completed") {
+      assertCompletedActionReplayMatches({ action, ...input });
     }
     if (action.status !== "completed") {
       if (!["leased", "dispatched", "running"].includes(action.status)) {
@@ -1064,9 +1090,18 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     },
     markActionDispatched(actionId, requestHash, nativeSessionId = null) {
       const timestamp = now();
+      const action = db.prepare("SELECT * FROM execution_work_attempts WHERE id = ?")
+        .get(actionId) as ExecutionWorkAttempt | undefined;
+      if (!action) throw new Error(`unknown execution work attempt ${actionId}`);
+      if (action.request_hash !== null && action.request_hash !== requestHash) {
+        throw new Error(`execution work attempt ${actionId} already dispatched with a different request`);
+      }
+      if (action.native_session_id !== null && nativeSessionId !== null && action.native_session_id !== nativeSessionId) {
+        throw new Error(`execution work attempt ${actionId} already dispatched with a different native session`);
+      }
       const update = db.prepare(`
         UPDATE execution_work_attempts
-        SET status = 'dispatched', request_hash = ?, native_session_id = ?, updated_at = ?
+        SET status = 'dispatched', request_hash = ?, native_session_id = COALESCE(?, native_session_id), updated_at = ?
         WHERE id = ? AND status IN ('leased', 'dispatched', 'running')
       `).run(requestHash, nativeSessionId, timestamp, actionId);
       if (update.changes !== 1) throw new Error(`execution work attempt ${actionId} is not active`);

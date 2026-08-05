@@ -177,7 +177,6 @@ function childExecutorEnv(request: ChildExecutorActionRequest): string {
     "LOGNAME=agent",
     "SHELL=/bin/bash",
     "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-    `GITHUB_TOKEN="\${GITHUB_TOKEN-}"`,
     `OT_STAGE_CONFIG_FILE=${shellSingleQuoted(`${STAGE_INPUT_DIR}/repository-config.json`)}`,
     `RUN_ID=${shellSingleQuoted(request.parentRunId)}`,
     `OT_CHILD_ACTION_ID=${shellSingleQuoted(request.actionId)}`,
@@ -460,7 +459,7 @@ export function createDaytonaSandboxRuntime(
       };
       await executeSandboxCommand(
         sandbox,
-        `/opt/openthrottle/runner/worktrees.mjs create --handle '${handle.id}' --base '${input.baseCommit}'`,
+        `/opt/openthrottle/runner/worktrees.mjs create --idempotent --handle ${shellSingleQuoted(handle.id)} --base ${shellSingleQuoted(input.baseCommit)}`,
         120
       );
       return handle;

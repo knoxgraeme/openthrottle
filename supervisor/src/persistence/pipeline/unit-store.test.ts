@@ -1834,6 +1834,65 @@ describe("execution unit store", () => {
     ]);
   });
 
+  it("rejects conflicting dispatch and completion replays for the same child action", () => {
+    const store = setup();
+    const subject = "1".repeat(40);
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+
+    const implement = lease(store);
+    store.markActionDispatched(implement.id, "request-hash", "native-session");
+    expect(() => store.markActionDispatched(implement.id, "different-request", "native-session"))
+      .toThrow(/different request/);
+    expect(() => store.markActionDispatched(implement.id, "request-hash", "different-native"))
+      .toThrow(/different native session/);
+
+    const receipt = receiptJson("unit_completion");
+    store.completeUnitAction({
+      actionId: implement.id,
+      resultHash: "result-hash",
+      outputSubject: subject,
+      receipt,
+      nativeSessionId: "native-session",
+    });
+    expect(store.completeUnitAction({
+      actionId: implement.id,
+      resultHash: "result-hash",
+      outputSubject: subject,
+      receipt,
+      nativeSessionId: "native-session",
+    })).toMatchObject({ id: implement.id, status: "completed" });
+    expect(() => store.completeUnitAction({
+      actionId: implement.id,
+      resultHash: "different-result",
+      outputSubject: subject,
+      receipt,
+      nativeSessionId: "native-session",
+    })).toThrow(/different result/);
+    expect(() => store.completeUnitAction({
+      actionId: implement.id,
+      resultHash: "result-hash",
+      outputSubject: "2".repeat(40),
+      receipt,
+      nativeSessionId: "native-session",
+    })).toThrow(/different result/);
+    expect(() => store.completeUnitAction({
+      actionId: implement.id,
+      resultHash: "result-hash",
+      outputSubject: subject,
+      receipt: receiptJson("candidate_evidence"),
+      nativeSessionId: "native-session",
+    })).toThrow(/different result/);
+  });
+
   it("appends downstream context immutably for pending units only", () => {
     const store = setup();
     store.createGraph({
@@ -2214,6 +2273,12 @@ describe("execution unit store", () => {
     // Replaying the exact same decision for the same (already-completed) action must be a no-op.
     store.completeGatedAction({ actionId: lead.id, resultHash: "r4", outputSubject: subject, decision });
     expect(store.listUnits("attempt-parent")[0]).toMatchObject({ repairRounds: 1, currentCycle: 2 });
+    expect(() => store.completeGatedAction({
+      actionId: lead.id,
+      resultHash: "different-result",
+      outputSubject: subject,
+      decision,
+    })).toThrow(/different result/);
 
     // A conflicting replay for the same action is rejected outright.
     expect(() => store.completeGatedAction({

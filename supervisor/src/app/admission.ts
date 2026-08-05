@@ -99,6 +99,10 @@ function pipelineInvokesModel(manifest: ValidatedPipelineManifest): boolean {
   );
 }
 
+function pipelineUsesLoopActions(manifest: ValidatedPipelineManifest): boolean {
+  return manifest.manifest.stages.some((stage) => stage.executor.kind === "loop_action");
+}
+
 function extractShipSelectionGraphId(context: string): string | undefined {
   const blocks = extractJsonBlocks(context, SHIP_SELECTION_FENCE);
   if (blocks.length === 0) return undefined;
@@ -497,6 +501,9 @@ export async function handleCreated(
         `${agentDisplayName(selectedAgent)} is selected for this pipeline but its credential is not configured on the supervisor ` +
         `(set ${agentCredentialVariable(selectedAgent)}). No sandbox was provisioned.`
       );
+    }
+    if (selectedAgent === "opencode" && pipelineUsesLoopActions(manifest)) {
+      throw new Error("OpenCode structured loop actions are not supported yet. No sandbox was provisioned.");
     }
     const snapshot = coordinator.store.saveRepositoryConfigSnapshot({
       repository: selectedRepository.repo,

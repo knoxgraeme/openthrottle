@@ -140,6 +140,19 @@ function requireClean(repoDir) {
   if (status) throw new Error("integration checkout must be clean before creating a unit worktree");
 }
 
+function existingWorktree({ rootDir, target, handle, baseCommit, hooksPath }) {
+  assertDirectory(target, "worktree");
+  const head = runGitAsExecutor(target, ["rev-parse", "HEAD"]);
+  if (head !== baseCommit) throw new Error("existing worktree handle points at a different base commit");
+  const status = runGitAsExecutor(target, ["status", "--porcelain=v1", "--untracked-files=all"]);
+  if (status) throw new Error("existing worktree is dirty");
+  runGitAsExecutor(target, ["config", "extensions.worktreeConfig", "true"]);
+  runGitAsExecutor(target, ["config", "--worktree", "core.hooksPath", hooksPath]);
+  runGitAsExecutor(target, ["config", "--worktree", "remote.origin.pushurl", DISABLED_PUSH_URL]);
+  lockWorktree({ rootDir, handle });
+  return { id: safeHandle(handle), path: target, baseCommit };
+}
+
 export function worktreePath({ rootDir = DEFAULT_ROOT, handle }) {
   return pathInside(rootDir, safeHandle(handle));
 }
@@ -150,10 +163,14 @@ export function createWorktree({
   handle,
   baseCommit,
   hooksPath = HOOKS_PATH,
+  idempotent = false,
 }) {
   const safeBase = commit(baseCommit, "worktree base commit");
   const target = worktreePath({ rootDir, handle });
-  if (existsSync(target)) throw new Error("worktree handle already exists");
+  if (existsSync(target)) {
+    if (idempotent) return existingWorktree({ rootDir, target, handle, baseCommit: safeBase, hooksPath });
+    throw new Error("worktree handle already exists");
+  }
   requireClean(repoDir);
   const head = runGitAsExecutor(repoDir, ["rev-parse", "HEAD"]);
   if (head !== safeBase) throw new Error("integration checkout HEAD does not match requested worktree base");
@@ -249,7 +266,13 @@ function main() {
   const rootDir = resolve(arg("--root", DEFAULT_ROOT));
   const handle = arg("--handle");
   if (command === "create") {
-    const result = createWorktree({ repoDir, rootDir, handle, baseCommit: arg("--base") });
+    const result = createWorktree({
+      repoDir,
+      rootDir,
+      handle,
+      baseCommit: arg("--base"),
+      idempotent: process.argv.includes("--idempotent"),
+    });
     writeFileSync(1, `${JSON.stringify(result)}\n`);
     return;
   }

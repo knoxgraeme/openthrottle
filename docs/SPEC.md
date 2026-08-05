@@ -621,9 +621,10 @@ the reducer emits one `execution_graph_result` artifact and one aggregate
 `stage_result` for the parent attempt; the aggregate hash is compare-and-set on
 `execution_graphs` so the parent can settle once through the ordinary
 stage-result path. Structured success requires every authored unit to have a
-`completed` terminal level and accepted integration evidence for the exact
-aggregate subject. A stopped, exited, failed, or partially integrated graph
-never claims structured success.
+`completed` terminal level plus accepted integration evidence for that unit's
+exact integration subject. The aggregate subject is the final integrated graph
+head after all unit and whole-change integration phases complete. A stopped,
+exited, failed, or partially integrated graph never claims structured success.
 
 `pipeline_artifacts.kind` includes `execution_graph_result` for the child
 aggregate artifact in addition to the existing stage, review, command,

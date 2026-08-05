@@ -31,7 +31,7 @@ import {
 } from "../pipeline/execution-gates.js";
 import type { PipelineInstance, PipelineStore } from "../pipeline/store.js";
 import type { StageRequestEnvelope } from "../pipeline/stage-request.js";
-import type { ExecutionUnitStore, ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
+import type { ExecutionGateReceipt, ExecutionUnitStore, ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
 import type { ChildExecutorActionRequest, LoopActionRequest, RuntimeResource, SandboxRuntime } from "../runtime/contracts.js";
 import { extractJsonBlocks } from "../shared/markdown.js";
 import { sanitizeText } from "../shared/sanitize.js";
@@ -81,9 +81,30 @@ export interface StructuredChildRuntime {
   compositeGraphNeedsDrain(parentAttemptId: string): boolean;
 }
 
-function aggregateOutcomeFor(units: readonly ExecutionUnitState[]): StageOutcome | undefined {
+export function aggregateOutcomeFor(
+  units: readonly ExecutionUnitState[],
+  gates: readonly ExecutionGateReceipt[] = []
+): StageOutcome | undefined {
   if (units.length === 0 || units.some((unit) => unit.terminalLevel === null)) return undefined;
-  if (units.every((unit) => unit.terminalLevel === "completed" && unit.integrationSubject !== null)) {
+  const acceptedIntegrationSubjects = new Map<string, Set<string>>();
+  for (const gate of gates) {
+    if (
+      gate.gate_kind !== "integration" ||
+      gate.outcome !== "success" ||
+      gate.result !== "passed" ||
+      gate.unit_id === null ||
+      gate.subject === null
+    ) continue;
+    const subjects = acceptedIntegrationSubjects.get(gate.unit_id) ?? new Set<string>();
+    subjects.add(gate.subject);
+    acceptedIntegrationSubjects.set(gate.unit_id, subjects);
+  }
+  const allAcceptedIntegrated = units.every((unit) =>
+    unit.terminalLevel === "completed" &&
+    unit.integrationSubject !== null &&
+    acceptedIntegrationSubjects.get(unit.unitId)?.has(unit.integrationSubject) === true
+  );
+  if (allAcceptedIntegrated) {
     return "success";
   }
   return units.some((unit) => unit.terminalLevel === "failed" || unit.alarm) ? "failure" : "needs_human";
@@ -573,7 +594,8 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
               latestAttemptReceipt<CandidateEvidenceReceipt>(
                 completedAttemptReceiptsFor(action.parent_attempt_id),
                 "candidate_evidence",
-                action.unit_id
+                action.unit_id,
+                action.cycle
               ).receipt.subject.post,
           }
         : {}),
@@ -657,7 +679,12 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       }
       const receiptEntries = completedAttemptReceiptsFor(action.parent_attempt_id);
       const completion = unitCompletionAttemptReceipt(receiptEntries, action.unit_id, action.cycle);
-      const candidate = latestAttemptReceipt<CandidateEvidenceReceipt>(receiptEntries, "candidate_evidence", action.unit_id);
+      const candidate = latestAttemptReceipt<CandidateEvidenceReceipt>(
+        receiptEntries,
+        "candidate_evidence",
+        action.unit_id,
+        action.cycle
+      );
       const commands = commandAttemptReceipts(receiptEntries, action.unit_id, action.cycle);
       const acceptedSubject = candidate.receipt.subject.post;
       const decision = evaluateUnitAcceptanceGate({
@@ -769,9 +796,10 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       ) return;
       const units = deps.store.listUnits(parentAttemptId);
       const attempts = deps.store.listWorkAttempts(parentAttemptId);
+      const gates = deps.store.listGateReceipts(parentAttemptId);
       const outcome = graph.stopped_at
         ? stoppedAggregateOutcome(graph.stop_reason, attempts)
-        : aggregateOutcomeFor(units);
+        : aggregateOutcomeFor(units, gates);
       if (!outcome) return;
       if (outcome === "success" && graph.final_phase !== "done") return;
       const aggregateSubject = graph.integration_subject ?? parentAttempt.expected_subject ?? instance.immutable_subject ?? instance.base_commit;

@@ -149,7 +149,7 @@ describe("unit effect processor", () => {
   });
 
   it("reissues a request-less dispatched action with the same idempotency key", async () => {
-    const leased = action({ status: "dispatched" });
+    const leased = action({ status: "dispatched", native_session_id: "native-before-request" });
     const store = storeFor(leased);
     const runtime: UnitEffectRuntime = {
       collectUnitAction: vi.fn(async () => {

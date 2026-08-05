@@ -45,7 +45,7 @@ export function createUnitEffectProcessor(input: {
         leaseUntilIso: new Date(leasedAt.getTime() + leaseMs).toISOString(),
       });
       if (!action) return undefined;
-      const requestlessDispatch = action.status === "dispatched" && !action.request_hash && !action.native_session_id;
+      const requestlessDispatch = action.status === "dispatched" && !action.request_hash;
       if (!requestlessDispatch) {
         const recovered = await input.runtime.collectUnitAction(action);
         if (recovered) {

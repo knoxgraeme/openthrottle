@@ -71,6 +71,33 @@ describe("executor-owned worktrees", () => {
       .toThrow(/must be clean/);
   });
 
+  it("reuses an existing clean exact-base worktree only in idempotent mode", () => {
+    const repoDir = repository();
+    const rootDir = mkdtempSync(join(tmpdir(), "ot-worktrees-"));
+    directories.push(rootDir);
+    const baseCommit = git(repoDir, ["rev-parse", "HEAD"]);
+    const created = createWorktree({ repoDir, rootDir, handle: "unit-repeat", baseCommit, hooksPath: "/sealed/hooks" });
+
+    expect(() => createWorktree({ repoDir, rootDir, handle: "unit-repeat", baseCommit }))
+      .toThrow(/already exists/);
+    writeFileSync(join(repoDir, "next.txt"), "next\n");
+    git(repoDir, ["add", "next.txt"]);
+    git(repoDir, ["commit", "-qm", "next"]);
+    const nextCommit = git(repoDir, ["rev-parse", "HEAD"]);
+    expect(() => createWorktree({ repoDir, rootDir, handle: "unit-repeat", baseCommit: nextCommit, idempotent: true }))
+      .toThrow(/different base commit/);
+    git(created.path, ["config", "--worktree", "core.hooksPath", "/tmp/unsealed-hooks"]);
+    git(created.path, ["config", "--worktree", "remote.origin.pushurl", "https://example.invalid/push.git"]);
+    expect(createWorktree({ repoDir, rootDir, handle: "unit-repeat", baseCommit, hooksPath: "/sealed/hooks", idempotent: true }))
+      .toEqual({ id: "unit-repeat", path: created.path, baseCommit });
+    expect(git(created.path, ["config", "--get", "core.hooksPath"])).toBe("/sealed/hooks");
+    expect(git(created.path, ["config", "--get", "remote.origin.pushurl"])).toBe("DISABLED_BY_OPENTHROTTLE_LOOP_WORKTREE");
+
+    writeFileSync(join(created.path, "dirty.txt"), "dirty\n");
+    expect(() => createWorktree({ repoDir, rootDir, handle: "unit-repeat", baseCommit, idempotent: true }))
+      .toThrow(/existing worktree is dirty/);
+  });
+
   it("derives an internal candidate commit without moving worker HEAD", () => {
     const repoDir = repository();
     const rootDir = mkdtempSync(join(tmpdir(), "ot-worktrees-"));
