@@ -113,9 +113,12 @@ function assertChildExecutorRequestFence(request: ChildExecutorActionRequest): v
   if (!["command", "final_command", "candidate", "integrate"].includes(request.actionKind)) {
     throw new Error(`child executor action ${request.actionId} has an invalid kind`);
   }
-  if ((request.actionKind === "command" || request.actionKind === "candidate") &&
+  if (request.actionKind === "command" &&
       (!request.unitId || !request.worktree?.id)) {
     throw new Error(`child executor action ${request.actionId} requires a unit worktree`);
+  }
+  if (request.actionKind === "candidate" && !request.worktree?.id) {
+    throw new Error(`child executor action ${request.actionId} requires a worktree`);
   }
   if (request.actionKind === "final_command" && request.unitId !== null) {
     throw new Error(`child executor action ${request.actionId} final command must be graph-scoped`);

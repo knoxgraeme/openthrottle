@@ -361,6 +361,21 @@ describe("execution graph compiler", () => {
     }))).toThrow(/graph\.nodes\.units\.phases\.2\.skill: ce\/implement@1 requires repo\.write and cannot be used for gate phases/);
   });
 
+  it("allows implement unit workers to request declared MCP access", () => {
+    const compiled = validateAndCompileExecutionGraph(minimalUnitGraph({
+      worker: {
+        allowed_mcp_servers: ["github"],
+        credentials: ["model.invoke", "mcp", "provider.read", "repo.read", "repo.write"],
+      },
+    }));
+
+    expect(compiled.manifest.manifest.stages[0]?.unitPhaseBindings?.[0]).toMatchObject({
+      id: "implement",
+      credentials: ["model.invoke", "mcp", "provider.read", "repo.read", "repo.write"],
+      worker: { allowed_mcp_servers: ["github"] },
+    });
+  });
+
   it("rejects accept-unit gate phases that violate the shared credential contract", () => {
     expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
       leadWorker: {

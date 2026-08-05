@@ -41,9 +41,12 @@ function validateRequest(value) {
   if (!["command", "final_command", "candidate", "integrate"].includes(value.actionKind)) {
     throw new Error("child executor action kind is invalid");
   }
-  if ((value.actionKind === "command" || value.actionKind === "candidate") &&
+  if (value.actionKind === "command" &&
       (!value.unitId || !value.worktree?.id)) {
     throw new Error("child executor unit action requires a worktree");
+  }
+  if (value.actionKind === "candidate" && !value.worktree?.id) {
+    throw new Error("child executor candidate action requires a worktree");
   }
   if (value.actionKind === "final_command" && value.unitId !== null) {
     throw new Error("child executor final command must be graph-scoped");
@@ -201,12 +204,37 @@ export function executeChildAction({ request: rawRequest }) {
   };
 }
 
+export function childActionFailureResult(rawRequest, error) {
+  const message = error instanceof Error ? error.message : String(error);
+  const actionId = typeof rawRequest?.actionId === "string" ? rawRequest.actionId : "unknown";
+  const attemptId = typeof rawRequest?.attemptId === "string" ? rawRequest.attemptId : "unknown";
+  const requestHash = typeof rawRequest?.requestHash === "string" ? rawRequest.requestHash : "";
+  const subject = typeof rawRequest?.inputSubject === "string" && GIT_OBJECT_ID.test(rawRequest.inputSubject)
+    ? rawRequest.inputSubject
+    : null;
+  return {
+    version: 1,
+    kind: "child_executor_action_result",
+    action_id: actionId,
+    attempt_id: attemptId,
+    request_hash: requestHash,
+    outcome: "retryable_infrastructure_failure",
+    subject,
+    receipt: message,
+    created_at: new Date().toISOString(),
+  };
+}
+
 function main() {
   const requestPath = resolve(arg("--request", process.env.OT_CHILD_EXECUTOR_REQUEST_FILE));
   const outputPath = resolve(arg("--output", process.env.OT_CHILD_EXECUTOR_RESULT_FILE));
-  writeJsonAtomic(outputPath, executeChildAction({
-    request: JSON.parse(readFileSync(requestPath, "utf8")),
-  }));
+  const request = JSON.parse(readFileSync(requestPath, "utf8"));
+  try {
+    writeJsonAtomic(outputPath, executeChildAction({ request }));
+  } catch (error) {
+    writeJsonAtomic(outputPath, childActionFailureResult(request, error));
+    throw error;
+  }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

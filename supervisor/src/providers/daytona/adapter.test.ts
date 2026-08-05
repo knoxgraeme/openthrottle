@@ -564,6 +564,72 @@ describe("Daytona stage execution", () => {
     await expect(runtime.dispatchChildExecutorAction(resource, wrongProtocol))
       .rejects.toThrow(/invalid protocol/);
     expect(sandbox.process.executeSessionCommand).toHaveBeenCalledTimes(1);
+
+    const graphCandidate = fencedChildExecutorRequest({
+      actionId: "child-final-candidate",
+      actionKind: "candidate",
+      commandName: undefined,
+      unitId: null,
+      worktree: { id: "worktree-final-repair" },
+    });
+    await expect(runtime.dispatchChildExecutorAction(resource, graphCandidate)).resolves.toEqual({
+      providerDispatchId: "dispatch-child",
+    });
+    expect(sandbox.process.executeSessionCommand).toHaveBeenCalledTimes(2);
+  });
+
+  it("collects child executor results only from the exact attempt/action path", async () => {
+    const remoteFiles = new Map<string, Buffer>();
+    const sandbox = {
+      id: "provider-child-collect",
+      state: "started",
+      fs: {
+        downloadFile: vi.fn(async (path: string) => {
+          const file = remoteFiles.get(path);
+          if (!file) throw new Error("not found");
+          return file;
+        }),
+      },
+    } as unknown as Sandbox;
+    const runtime = createDaytonaSandboxRuntime({ get: vi.fn(async () => sandbox) } as never, {
+      snapshot: "snapshot-v1",
+      materializeCredentialEnv: vi.fn(async () => ({ env: {} })),
+    });
+    const result = {
+      version: 1,
+      kind: "child_executor_action_result",
+      action_id: "child-1",
+      attempt_id: "attempt-child",
+      request_hash: "a".repeat(64),
+      outcome: "success",
+      subject: "b".repeat(40),
+      receipt: "done",
+      created_at: "2026-07-22T00:00:00.000Z",
+    };
+
+    await expect(runtime.collectChildExecutorActionResult(
+      { providerResourceId: "provider-child-collect" },
+      { attemptId: "attempt-child", actionId: "child-1", requestHash: "a".repeat(64) }
+    )).resolves.toBeNull();
+
+    remoteFiles.set(
+      "/var/lib/openthrottle/child-executor-actions/attempt-child/child-1/result.json",
+      Buffer.from(JSON.stringify(result))
+    );
+    await expect(runtime.collectChildExecutorActionResult(
+      { providerResourceId: "provider-child-collect" },
+      { attemptId: "attempt-child", actionId: "child-1", requestHash: "a".repeat(64) }
+    )).resolves.toMatchObject({
+      actionId: "child-1",
+      attemptId: "attempt-child",
+      outcome: "success",
+      subject: "b".repeat(40),
+    });
+
+    await expect(runtime.collectChildExecutorActionResult(
+      { providerResourceId: "provider-child-collect" },
+      { attemptId: "attempt-child", actionId: "child-1", requestHash: "c".repeat(64) }
+    )).rejects.toThrow(/invalid envelope/);
   });
 
   it("refuses lead loop write credentials before materializing credentials", async () => {

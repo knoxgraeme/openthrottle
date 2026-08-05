@@ -44,7 +44,7 @@ describe("pipeline effect processor", () => {
       collectStageResult: vi.fn(async () => null),
       createWorktree: vi.fn(async () => ({ id: `worktree-${issueId}` })),
       dispatchLoopAction: vi.fn(async () => ({ providerDispatchId: `loop-${issueId}` })),
-      collectLoopActionResult: vi.fn(async () => null),
+      collectLoopActionResult: vi.fn<SandboxRuntime["collectLoopActionResult"]>(async () => null),
       dispatchChildExecutorAction: vi.fn(async () => ({ providerDispatchId: `child-executor-${issueId}` })),
       collectChildExecutorActionResult: vi.fn<SandboxRuntime["collectChildExecutorActionResult"]>(async () => null),
       cleanupWorktree: vi.fn(async () => undefined),
@@ -895,6 +895,112 @@ describe("pipeline effect processor", () => {
     const activationsAfterAggregate = runtime.setActive.mock.calls.length;
     await processor.drain();
     expect(runtime.setActive).toHaveBeenCalledTimes(activationsAfterAggregate);
+  });
+
+  it("preserves retryable child loop errors instead of parsing them as receipts", async () => {
+    db = openDb(":memory:");
+    const pipelines = createPipelineStore(db);
+    const tickets = createSupervisorStore(db, pipelines);
+    const runtimeDescriptor = buildInstalledRuntimeDescriptor("structured-retryable-loop-test/v1");
+    const catalog = loadPipelineCatalog(catalogPath, runtimeDescriptor.descriptor);
+    pipelines.acceptRuntimeDescriptor(runtimeDescriptor);
+    pipelines.acceptCatalog(catalog);
+    const repositoryConfig = parseRepositoryConfig([
+      "schema: openthrottle.config/v1",
+      "default_graph: simple",
+      "graphs:",
+      "  - id: simple",
+      "    kind: builtin",
+      "    ref: core/simple@1",
+      "  - id: structured",
+      "    kind: builtin",
+      "    ref: core/structured@1",
+      "commands: { test: npm test, lint: npm run lint, build: npm run build }",
+      "pipelines: { implement: implement }",
+    ].join("\n"));
+    const config = pipelines.saveRepositoryConfigSnapshot({
+      repository: "owner/repo",
+      baseCommit: "a".repeat(40),
+      blobSha: "b".repeat(40),
+      config: repositoryConfig,
+    });
+    const manifest = parseAndCompileExecutionGraph(readFileSync(structuredGraphPath, "utf8"), {
+      id: "builtin/structured",
+      runtime: runtimeDescriptor.descriptor,
+      config: repositoryConfig.config,
+    }).manifest;
+    pipelines.acceptManifest(manifest);
+    const executionPlan = {
+      schema: "openthrottle.execution-plan/v1",
+      graph_id: "structured",
+      plan_id: "structured-retryable-loop",
+      instructions: { implement_a: "Implement unit A." },
+      acceptance: { unit_a_done: "Unit A is complete." },
+      units: [{
+        id: "unit_a",
+        title: "Unit A",
+        depends_on: [],
+        instructions: ["implement_a"],
+        acceptance: ["unit_a_done"],
+      }],
+      commands: [],
+    };
+    tickets.upsert({
+      linear_issue_id: "issue-retryable-loop",
+      linear_issue_identifier: "OT-RETRYABLE-LOOP",
+      linear_session_id: "session-retryable-loop",
+      sandbox_id: null,
+      branch: "ot/retryable-loop",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+      pipeline: {
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        manifest,
+        repositoryConfig: config,
+        runtime: runtimeDescriptor,
+        authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
+        taskContext: [
+          "Approved structured plan.",
+          "",
+          "```json openthrottle.execution-plan/v1",
+          JSON.stringify(executionPlan, null, 2),
+          "```",
+        ].join("\n"),
+      },
+    });
+    const instance = pipelines.getInstanceForSession("session-retryable-loop")!;
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    const runtime = sandboxRuntimeMock({ issueId: "retryable-loop" });
+    const processor = createPipelineEffectProcessor({
+      store: pipelines,
+      tickets,
+      runtime,
+      taskTimeoutSeconds: 300,
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+    });
+
+    await processor.drain();
+    const action = pipelines.listWorkAttempts(attempt.id)[0]!;
+    runtime.collectLoopActionResult.mockResolvedValueOnce({
+      actionId: action.id,
+      attemptId: attempt.id,
+      requestHash: action.request_hash!,
+      outcome: "retryable_infrastructure_failure",
+      nativeSessionId: null,
+      subject: null,
+      receipt: "model credential unavailable",
+      completedAt: "2099-07-22T12:00:00.000Z",
+    });
+
+    await expect(processor.drain()).rejects.toThrow(/model credential unavailable/);
+    expect(pipelines.listWorkAttempts(attempt.id)[0]).toMatchObject({
+      status: "dispatched",
+      result_hash: null,
+    });
   });
 
   it("idles an active bound sandbox through a best-effort runtime effect", async () => {

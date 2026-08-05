@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
-import { executeChildAction } from "./execute-child-action.mjs";
+import { childActionFailureResult, executeChildAction } from "./execute-child-action.mjs";
 
 const directories = [];
 
@@ -93,5 +93,23 @@ describe("child executor action", () => {
       worktree: null,
     });
     expect(() => executeChildAction({ request: unitScopedFinalCommand })).toThrow(/final command must be graph-scoped/);
+  });
+
+  it("builds retryable failure envelopes that preserve child executor errors", () => {
+    const request = childExecutorRequest({
+      actionId: "action-failure",
+      inputSubject: "3".repeat(40),
+    });
+    const result = childActionFailureResult(request, new Error("worktree is unavailable"));
+
+    expect(result).toMatchObject({
+      kind: "child_executor_action_result",
+      action_id: "action-failure",
+      attempt_id: "attempt-1",
+      request_hash: request.requestHash,
+      outcome: "retryable_infrastructure_failure",
+      subject: request.inputSubject,
+      receipt: "worktree is unavailable",
+    });
   });
 });

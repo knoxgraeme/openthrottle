@@ -735,9 +735,17 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
           attemptId: action.parent_attempt_id,
           actionId: action.id,
           requestHash: action.request_hash,
-        });
+    });
     if (!result) return null;
-    const receipt = parseStandardReceipt(result.receipt, { source: `child_action.${action.id}.receipt` }).value;
+    let receipt: StandardReceipt;
+    try {
+      receipt = parseStandardReceipt(result.receipt, { source: `child_action.${action.id}.receipt` }).value;
+    } catch (error) {
+      if (result.outcome === "retryable_infrastructure_failure" || result.outcome === "failure") {
+        throw new Error(`child action ${action.id} returned ${result.outcome}: ${sanitizeText(result.receipt).slice(-500)}`);
+      }
+      throw error;
+    }
     const resultSubject = result.subject ?? receipt.subject.post;
     if (!GIT_SUBJECT.test(resultSubject)) {
       throw new Error(`child action ${action.id} completed without an exact subject`);
