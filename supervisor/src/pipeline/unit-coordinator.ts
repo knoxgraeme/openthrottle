@@ -67,16 +67,38 @@ export function nextUnitPhase(phase: UnitPhase, phases: readonly UnitPhase[] = B
   return phases[phases.indexOf(phase) + 1];
 }
 
+export function repairCyclePhaseSequence(phases: readonly UnitPhase[] = BUILTIN_UNIT_PHASES): UnitPhase[] {
+  const implementIndex = phases.indexOf("implement");
+  if (implementIndex < 0) return [...phases];
+  return [
+    "implement",
+    ...phases.slice(0, implementIndex),
+    ...phases.slice(implementIndex + 1),
+  ];
+}
+
+export function nextUnitPhaseForCycle(
+  phase: UnitPhase,
+  currentCycle: number,
+  phases: readonly UnitPhase[] = BUILTIN_UNIT_PHASES
+): UnitPhase | undefined {
+  return nextUnitPhase(phase, currentCycle > 1 ? repairCyclePhaseSequence(phases) : phases);
+}
+
 export function assertValidUnitPhaseSequence(phases: readonly UnitPhase[]): void {
   if (phases.length === 0) throw new Error("execution graph unit phases must not be empty");
   const seen = new Set<UnitPhase>();
   let integrateIndex = -1;
   let leadIndex = -1;
   let candidateIndex = -1;
+  let implementIndex = -1;
+  let simplifyIndex = -1;
   for (const [index, phase] of phases.entries()) {
     if (!BUILTIN_UNIT_PHASES.includes(phase)) throw new Error(`execution graph unit phase ${phase} is not recognized`);
     if (seen.has(phase)) throw new Error("execution graph unit phases must not contain duplicate phases");
     seen.add(phase);
+    if (phase === "implement") implementIndex = index;
+    if (phase === "simplify") simplifyIndex = index;
     if (phase === "integrate") integrateIndex = index;
     if (phase === "lead") leadIndex = index;
     if (phase === "candidate") candidateIndex = index;
@@ -85,6 +107,9 @@ export function assertValidUnitPhaseSequence(phases: readonly UnitPhase[]): void
     if (!seen.has(required)) throw new Error(`execution graph unit phases must include ${required}`);
   }
   if (integrateIndex !== phases.length - 1) throw new Error("execution graph integrate phase must be last");
+  if (simplifyIndex !== -1 && simplifyIndex < implementIndex) {
+    throw new Error("execution graph simplify phase must not precede implement");
+  }
   if (leadIndex !== integrateIndex - 1) throw new Error("execution graph lead phase must immediately precede integrate");
   if (candidateIndex !== leadIndex - 1) throw new Error("execution graph candidate phase must immediately precede lead");
 }
@@ -95,10 +120,10 @@ export type UnitAcceptanceRouting =
   | { action: "settle"; reason: "defect" }
   | { action: "escalate"; reason: string };
 
-// Command failure (or any other non-accept lead result) repairs the unit --
-// back to a fresh implement/repair session, then re-simplify, then rerun
-// every configured command -- bounded by maxRepairRounds so a unit that
-// cannot converge settles as failed rather than looping forever.
+// Command failure (or any other non-accept lead result) repairs the unit back
+// to implement, then traverses the graph-declared repair-cycle sequence with
+// fresh evidence until candidate/lead/integrate. The max repair bound makes a
+// unit that cannot converge settle as failed instead of looping forever.
 export function routeUnitAcceptanceDecision(input: {
   outcome: StageOutcome;
   reason: string;

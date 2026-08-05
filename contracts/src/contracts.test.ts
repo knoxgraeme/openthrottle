@@ -45,6 +45,7 @@ const invalidCases = [
   ["graph-loop-skill-not-allowed.json", /loops\.unit_loop\.skill: is not allowed by the worker/],
   ["graph-missing-integrate-phase.json", /nodes\.implement\.phases: must include exactly one integrate phase/],
   ["graph-provider-secret-credential.json", /credentials\[0\]: must be one of/],
+  ["graph-simplify-before-implement-phase.json", /nodes\.implement\.phases\[0\]: simplify must not precede implement/],
   ["graph-skill-traversal.json", /workers\[0\]\.skills\[0\]: has an invalid format/],
   ["graph-unreachable-node.json", /nodes\.dead_command: is unreachable from entry_node/],
   ["graph-unknown-field.json", /prompt: unknown field/],

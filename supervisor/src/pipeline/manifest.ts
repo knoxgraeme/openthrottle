@@ -316,7 +316,11 @@ function validateUnitPhaseSequence(phases: readonly GraphUnitPhaseId[], path: st
   let integrateIndex = -1;
   let leadIndex = -1;
   let candidateIndex = -1;
+  let implementIndex = -1;
+  let simplifyIndex = -1;
   for (const [index, phase] of phases.entries()) {
+    if (phase === "implement") implementIndex = index;
+    if (phase === "simplify") simplifyIndex = index;
     if (phase === "integrate") integrateIndex = index;
     if (phase === "lead") leadIndex = index;
     if (phase === "candidate") candidateIndex = index;
@@ -325,6 +329,7 @@ function validateUnitPhaseSequence(phases: readonly GraphUnitPhaseId[], path: st
     if (!phaseIds.has(required)) fail(path, `must include ${required}`);
   }
   if (integrateIndex !== phases.length - 1) fail(path, "integrate must be last");
+  if (simplifyIndex !== -1 && simplifyIndex < implementIndex) fail(path, "simplify must not precede implement");
   if (leadIndex !== integrateIndex - 1) fail(path, "lead must immediately precede integrate");
   if (candidateIndex !== leadIndex - 1) fail(path, "candidate must immediately precede lead");
 }
@@ -794,18 +799,31 @@ export function validatePipelineManifest(
 
   if (options.runtime) {
     const runtime = options.runtime;
+    const runtimeCapabilities = new Set(runtime.capabilities);
+    const runtimeExecutors = new Set(runtime.executors);
+    const runtimeEvaluators = new Set(runtime.evaluators);
+    const runtimeContextPolicies = new Set(runtime.contextPolicies);
+    const runtimeArtifacts = new Set(runtime.artifacts);
+    const runtimeCredentialScopes = new Set(runtime.credentialScopes);
     const missing: string[] = [];
     if (runtime.protocol !== manifest.requires.protocol) missing.push(`protocol:${manifest.requires.protocol}`);
     for (const capability of manifest.requires.capabilities) {
-      if (!runtime.capabilities.includes(capability)) missing.push(`capability:${capability}`);
+      if (!runtimeCapabilities.has(capability)) missing.push(`capability:${capability}`);
     }
     for (const stage of manifest.stages) {
-      if (!runtime.executors.includes(stage.executor.kind)) missing.push(`executor:${stage.executor.kind}`);
-      if (!runtime.capabilities.includes(stage.executor.capability)) missing.push(`capability:${stage.executor.capability}`);
-      if (!runtime.evaluators.includes(stage.evaluator.kind)) missing.push(`evaluator:${stage.evaluator.kind}`);
-      if (!runtime.contextPolicies.includes(stage.context)) missing.push(`context:${stage.context}`);
-      for (const artifact of stage.produces) if (!runtime.artifacts.includes(artifact)) missing.push(`artifact:${artifact}`);
-      for (const scope of stage.credentials) if (!runtime.credentialScopes.includes(scope)) missing.push(`credential:${scope}`);
+      if (!runtimeExecutors.has(stage.executor.kind)) missing.push(`executor:${stage.executor.kind}`);
+      if (!runtimeCapabilities.has(stage.executor.capability)) missing.push(`capability:${stage.executor.capability}`);
+      if (!runtimeEvaluators.has(stage.evaluator.kind)) missing.push(`evaluator:${stage.evaluator.kind}`);
+      if (!runtimeContextPolicies.has(stage.context)) missing.push(`context:${stage.context}`);
+      for (const artifact of stage.produces) if (!runtimeArtifacts.has(artifact)) missing.push(`artifact:${artifact}`);
+      for (const scope of stage.credentials) if (!runtimeCredentialScopes.has(scope)) missing.push(`credential:${scope}`);
+      for (const binding of stage.unitPhaseBindings ?? []) {
+        if (binding.kind !== "agent" && binding.kind !== "gate") continue;
+        if (!runtimeExecutors.has(binding.executor.kind)) missing.push(`executor:${binding.executor.kind}`);
+        if (!runtimeCapabilities.has(binding.executor.capability)) missing.push(`capability:${binding.executor.capability}`);
+        if (!runtimeContextPolicies.has(binding.context)) missing.push(`context:${binding.context}`);
+        for (const scope of binding.credentials) if (!runtimeCredentialScopes.has(scope)) missing.push(`credential:${scope}`);
+      }
     }
     const uniqueMissing = [...new Set(missing)].sort();
     if (uniqueMissing.length > 0) fail(source, `runtime capability mismatch: ${uniqueMissing.join(", ")}`);

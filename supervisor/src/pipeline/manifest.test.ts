@@ -481,6 +481,11 @@ describe("pipeline manifest validation", () => {
     expect(() => validatePipelineManifest(commandAfterCandidate))
       .toThrow(/pipeline\.stages\[0\]\.unitPhases: candidate must immediately precede lead/);
 
+    const simplifyBeforeImplement = structuredClone(value) as Record<string, unknown>;
+    firstStage(simplifyBeforeImplement).unitPhases = ["simplify", "implement", "candidate", "lead", "integrate"];
+    expect(() => validatePipelineManifest(simplifyBeforeImplement))
+      .toThrow(/pipeline\.stages\[0\]\.unitPhases: simplify must not precede implement/);
+
     const agent = manifest();
     Object.assign(firstStage(agent), {
       unitPhases: ["implement", "candidate", "lead", "integrate"],
@@ -489,6 +494,43 @@ describe("pipeline manifest validation", () => {
     });
     expect(() => validatePipelineManifest(agent))
       .toThrow(/pipeline\.stages\[0\]\.unitPhases: unit phase metadata is allowed only for graph\/for-each-unit@1 stages/);
+  });
+
+  it("fails closed when nested unit phase bindings exceed runtime support", () => {
+    const value = manifest();
+    value.requires = { protocol: "stage-executor@1", capabilities: ["ce/implement@1", "graph/for-each-unit@1"] };
+    Object.assign(firstStage(value), {
+      executor: { kind: "loop_action", capability: "graph/for-each-unit@1" },
+      evaluator: { kind: "semantic", assurance: "executor_verified", required_artifacts: ["execution_graph_result"] },
+      context: "none",
+      live_steering: false,
+      credentials: ["repo.read", "repo.write"],
+      produces: ["stage_result", "execution_graph_result"],
+      unitPhases: ["implement", "candidate", "lead", "integrate"],
+      unitCommandNames: [],
+      unitPhaseBindings: unitPhaseBindings(),
+    });
+
+    const withoutAgentExecutor = buildInstalledRuntimeDescriptor("limited/v1", {
+      capabilities: ["ce/implement@1", "graph/for-each-unit@1"],
+      executors: ["loop_action"],
+    });
+    expect(() => validatePipelineManifest(value, { runtime: withoutAgentExecutor.descriptor }))
+      .toThrow(/runtime capability mismatch.*executor:agent/);
+
+    const withoutFreshContext = buildInstalledRuntimeDescriptor("limited/v1", {
+      capabilities: ["ce/implement@1", "graph/for-each-unit@1"],
+      contextPolicies: ["none"],
+    });
+    expect(() => validatePipelineManifest(value, { runtime: withoutFreshContext.descriptor }))
+      .toThrow(/runtime capability mismatch.*context:fresh/);
+
+    const withoutModelCredential = buildInstalledRuntimeDescriptor("limited/v1", {
+      capabilities: ["ce/implement@1", "graph/for-each-unit@1"],
+      credentialScopes: ["repo.read", "repo.write"],
+    });
+    expect(() => validatePipelineManifest(value, { runtime: withoutModelCredential.descriptor }))
+      .toThrow(/runtime capability mismatch.*credential:model\.invoke/);
   });
 
   it("bounds repository skill package identity inside its declared directory", () => {

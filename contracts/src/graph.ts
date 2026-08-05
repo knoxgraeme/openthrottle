@@ -286,9 +286,13 @@ function validateGraph(graph: GraphContract, source: string, config?: Repository
       let integrateIndex = -1;
       let leadIndex = -1;
       let candidateIndex = -1;
+      let implementIndex = -1;
+      let simplifyIndex = -1;
       for (const [index, phase] of node.phases.entries()) {
         if (phaseIds.has(phase.id)) fail(`${source}.nodes.${node.id}.phases`, "must not contain duplicate phase IDs");
         phaseIds.add(phase.id);
+        if (phase.id === "implement") implementIndex = index;
+        if (phase.id === "simplify") simplifyIndex = index;
         if (phase.id === "integrate") integrateIndex = index;
         if (phase.id === "lead") leadIndex = index;
         if (phase.id === "candidate") candidateIndex = index;
@@ -309,6 +313,9 @@ function validateGraph(graph: GraphContract, source: string, config?: Repository
       if (integrateIndex === -1) fail(`${source}.nodes.${node.id}.phases`, "must include exactly one integrate phase");
       if (integrateIndex !== node.phases.length - 1) {
         fail(`${source}.nodes.${node.id}.phases[${integrateIndex}]`, "integrate must be the last unit phase");
+      }
+      if (simplifyIndex !== -1 && simplifyIndex < implementIndex) {
+        fail(`${source}.nodes.${node.id}.phases[${simplifyIndex}]`, "simplify must not precede implement");
       }
       if (leadIndex !== integrateIndex - 1) fail(`${source}.nodes.${node.id}.phases`, "lead must immediately precede integrate");
       if (candidateIndex !== leadIndex - 1) fail(`${source}.nodes.${node.id}.phases`, "candidate must immediately precede lead");

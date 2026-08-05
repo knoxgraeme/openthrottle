@@ -13,6 +13,7 @@ import {
   deriveUnitTerminalState,
   assertValidUnitPhaseSequence,
   nextUnitPhase,
+  nextUnitPhaseForCycle,
   routeFinalReviewDecision,
   routeIntegrationDecision,
   routeUnitAcceptanceDecision,
@@ -336,16 +337,24 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     }
   }
 
-  function assertGraphReplayMatches(input: Parameters<ExecutionUnitStore["createGraph"]>[0], existing: ExecutionUnitGraph): void {
-    const expectedCommandNames = canonicalJson([...(input.commandNames ?? [])]);
+  function assertGraphReplayMatches(
+    input: Parameters<ExecutionUnitStore["createGraph"]>[0],
+    existing: ExecutionUnitGraph,
+    phaseProjection: UnitPhaseProjection
+  ): void {
+    const expectedCommandNames = canonicalJson(phaseProjection.commandNames);
     const persistedUnitPhases = unitPhasesOf(existing);
-    const requestedUnitPhases = [...(input.unitPhases ?? persistedUnitPhases)];
+    const requestedUnitPhases = phaseProjection.unitPhases.length > 0 ? phaseProjection.unitPhases : persistedUnitPhases;
     const expectedUnitPhases = canonicalJson(requestedUnitPhases);
-    const expectedUnitPhaseBindings = canonicalJson([...(input.unitPhaseBindings ?? [])]);
+    const expectedUnitPhaseBindings = canonicalJson([...phaseProjection.unitPhaseBindings]);
     const legacyBuiltinUnitPhasesReplay =
       persistedUnitPhases.length === 0 &&
-      input.unitPhases !== undefined &&
       expectedUnitPhases === canonicalJson(phaseSequenceOf(existing));
+    const legacyUnboundPhaseReplay =
+      existing.unit_phase_bindings === "[]" &&
+      phaseProjection.unitPhaseBindings.length > 0 &&
+      (existing.unit_phases === expectedUnitPhases || legacyBuiltinUnitPhasesReplay) &&
+      existing.command_names === expectedCommandNames;
     const expectedMaxRepairRounds = input.maxRepairRounds ?? DEFAULT_MAX_REPAIR_ROUNDS;
     if (
       existing.pipeline_instance_id !== input.pipelineInstanceId ||
@@ -355,7 +364,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       existing.plan_digest !== input.planDigest ||
       existing.command_names !== expectedCommandNames ||
       (existing.unit_phases !== expectedUnitPhases && !legacyBuiltinUnitPhasesReplay) ||
-      existing.unit_phase_bindings !== expectedUnitPhaseBindings ||
+      (existing.unit_phase_bindings !== expectedUnitPhaseBindings && !legacyUnboundPhaseReplay) ||
       existing.max_repair_rounds !== expectedMaxRepairRounds
     ) {
       throw new Error(`execution graph ${existing.id} replay fence mismatch`);
@@ -376,7 +385,12 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
   }
 
   function assertUnitPhaseBindingsMatch(input: Parameters<ExecutionUnitStore["createGraph"]>[0]): void {
-    if (!input.unitPhaseBindings) return;
+    if (!input.unitPhaseBindings) {
+      if (input.unitPhases || input.commandNames) {
+        throw new Error("execution graph unitPhaseBindings are required when unit phase projections are supplied");
+      }
+      return;
+    }
     if (
       input.unitPhases &&
       canonicalJson(unitPhaseBindingIds(input.unitPhaseBindings)) !== canonicalJson([...input.unitPhases])
@@ -392,20 +406,38 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     }
   }
 
+  type UnitPhaseProjection = {
+    commandNames: string[];
+    unitPhases: UnitPhase[];
+    unitPhaseBindings: readonly PipelineUnitPhaseBinding[];
+  };
+
+  function unitPhaseProjection(input: Parameters<ExecutionUnitStore["createGraph"]>[0]): UnitPhaseProjection {
+    assertUnitPhaseBindingsMatch(input);
+    if (!input.unitPhaseBindings) {
+      return { commandNames: [], unitPhases: [], unitPhaseBindings: [] };
+    }
+    return {
+      commandNames: unitPhaseBindingCommandNames(input.unitPhaseBindings),
+      unitPhases: unitPhaseBindingIds(input.unitPhaseBindings),
+      unitPhaseBindings: input.unitPhaseBindings,
+    };
+  }
+
   const createGraph = db.transaction((input: Parameters<ExecutionUnitStore["createGraph"]>[0]): ExecutionUnitGraph => {
     const timestamp = now();
     const graphId = deterministicId("execution-graph", [input.pipelineInstanceId, input.parentAttemptId]);
-    if (input.unitPhases && input.unitPhases.length > 0) assertValidUnitPhaseSequence(input.unitPhases);
-    assertUnitPhaseBindingsMatch(input);
+    const phaseProjection = unitPhaseProjection(input);
+    if (phaseProjection.unitPhases.length > 0) assertValidUnitPhaseSequence(phaseProjection.unitPhases);
     const existing = graphStmt.get(input.parentAttemptId) as ExecutionUnitGraph | undefined;
     if (existing) {
-      assertGraphReplayMatches(input, existing);
+      assertGraphReplayMatches(input, existing, phaseProjection);
       return existing;
     }
-    const commandNames = canonicalJson([...(input.commandNames ?? [])]);
-    const unitPhases = canonicalJson([...(input.unitPhases ?? [])]);
-    const unitPhaseBindings = canonicalJson([...(input.unitPhaseBindings ?? [])]);
-    const initialUnitPhase = input.unitPhases?.[0] ?? "implement";
+    const commandNames = canonicalJson(phaseProjection.commandNames);
+    const unitPhases = canonicalJson(phaseProjection.unitPhases);
+    const unitPhaseBindings = canonicalJson([...phaseProjection.unitPhaseBindings]);
+    const initialUnitPhase = phaseProjection.unitPhases[0] ?? "implement";
     const maxRepairRounds = input.maxRepairRounds ?? DEFAULT_MAX_REPAIR_ROUNDS;
     if (!Number.isInteger(maxRepairRounds) || maxRepairRounds < 0) {
       throw new Error("execution graph maxRepairRounds must be a non-negative integer");
@@ -558,7 +590,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       } else if (PHASE_FOR_COMPLETING_ACTION_KIND[action.action_kind]) {
         const currentPhase = PHASE_FOR_COMPLETING_ACTION_KIND[action.action_kind]!;
         const graph = graphStmt.get(action.parent_attempt_id) as ExecutionUnitGraph;
-        const next = nextUnitPhase(currentPhase, phaseSequenceOf(graph));
+        const next = nextUnitPhaseForCycle(currentPhase, action.cycle, phaseSequenceOf(graph));
         if (!next) throw new Error(`execution unit phase ${currentPhase} has no successor`);
         db.prepare(`UPDATE execution_units SET phase = ?, updated_at = ? WHERE id = ?`)
           .run(next, timestamp, action.execution_unit_id);

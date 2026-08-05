@@ -81,6 +81,43 @@ function unitPhaseBindings(model = "gpt-5"): PipelineUnitPhaseBinding[] {
   ];
 }
 
+function commandFirstUnitPhaseBindings(commands: string[]): PipelineUnitPhaseBinding[] {
+  return [
+    { id: "command", kind: "command", commands },
+    ...unitPhaseBindings(),
+  ];
+}
+
+function builtinUnitPhaseBindings(commands: string[]): PipelineUnitPhaseBinding[] {
+  const [implement, candidate, lead, integrate] = unitPhaseBindings();
+  if (implement?.kind !== "agent") throw new Error("expected implement agent binding");
+  const simplify: PipelineUnitPhaseBinding = {
+    id: "simplify",
+    kind: "agent",
+    loop: {
+      id: "simplify-loop",
+      skill: "builtin://ce/simplify@1",
+      input_scope: "unit",
+      receipt: "unit_completion",
+      max_parallel: 1,
+      max_rounds: 1,
+      timeout_seconds: 60,
+    },
+    worker: implement.worker,
+    executor: { kind: "agent", capability: "ce/simplify@1" },
+    context: "fresh",
+    credentials: implement.credentials,
+  };
+  return [
+    implement,
+    simplify,
+    { id: "command", kind: "command", commands },
+    candidate!,
+    lead!,
+    integrate!,
+  ];
+}
+
 function lease(store: ExecutionUnitStore, leaseOwner = "worker-1", leaseUntilIso = "2026-07-29T00:01:00.000Z") {
   return store.leaseNextUnitAction({
     parentAttemptId: "attempt-parent",
@@ -222,6 +259,54 @@ describe("execution unit store", () => {
       ...input,
       units: [{ id: "a" }, { id: "c", dependencies: ["a"] }],
     })).toThrow(/replay unit set mismatch/);
+  });
+
+  it("replays pre-binding execution graphs when durable projections still match", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+    });
+    db!.prepare(`
+      UPDATE execution_graphs
+      SET unit_phases = ?, command_names = ?, unit_phase_bindings = ?
+      WHERE parent_attempt_id = ?
+    `).run(
+      canonicalJson(["implement", "candidate", "lead", "integrate"]),
+      canonicalJson([]),
+      canonicalJson([]),
+      "attempt-parent"
+    );
+
+    expect(store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: unitPhaseBindings(),
+    })).toMatchObject({
+      parent_attempt_id: "attempt-parent",
+      unit_phase_bindings: canonicalJson([]),
+    });
+
+    expect(() => store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: commandFirstUnitPhaseBindings(["test"]),
+    })).toThrow(/replay fence mismatch/);
   });
 
   it("rejects cross-instance and mixed-attempt child identity inserts", () => {
@@ -438,7 +523,7 @@ describe("execution unit store", () => {
       graphDigest: "graph-digest",
       planDigest: "plan-digest",
       units: [{ id: "a" }, { id: "b" }],
-      commandNames: ["test", "lint"],
+      unitPhaseBindings: builtinUnitPhaseBindings(["test", "lint"]),
     });
 
     const implement = lease(store);
@@ -515,8 +600,7 @@ describe("execution unit store", () => {
       graphDigest: "graph-digest",
       planDigest: "plan-digest",
       units: [{ id: "a" }],
-      commandNames: ["test"],
-      unitPhases: ["command", "implement", "candidate", "lead", "integrate"],
+      unitPhaseBindings: commandFirstUnitPhaseBindings(["test"]),
     });
 
     const command = lease(store);
@@ -553,6 +637,7 @@ describe("execution unit store", () => {
   it("repairs command-first graphs back to implement without evaluating stale command evidence", () => {
     const store = setup();
     const subject = "1".repeat(40);
+    const repairedSubject = "2".repeat(40);
     store.createGraph({
       pipelineInstanceId: "instance-1",
       parentAttemptId: "attempt-parent",
@@ -561,8 +646,7 @@ describe("execution unit store", () => {
       graphDigest: "graph-digest",
       planDigest: "plan-digest",
       units: [{ id: "a" }],
-      commandNames: ["test"],
-      unitPhases: ["command", "implement", "candidate", "lead", "integrate"],
+      unitPhaseBindings: commandFirstUnitPhaseBindings(["test"]),
     });
 
     const firstCommand = lease(store);
@@ -595,6 +679,48 @@ describe("execution unit store", () => {
     expect(store.listUnits("attempt-parent")[0]).toMatchObject({
       phase: "implement", currentCycle: 2, repairRounds: 1, commandIndex: 0,
     });
+    store.completeUnitAction({
+      actionId: repair.id, resultHash: "r-repair", outputSubject: repairedSubject, receipt: receiptJson("unit_completion"),
+    });
+
+    const freshCommand = lease(store);
+    expect(freshCommand).toMatchObject({ action_kind: "command", command_name: "test", cycle: 2 });
+    store.completeUnitAction({
+      actionId: freshCommand.id, resultHash: "r-command-2", outputSubject: repairedSubject,
+      receipt: receiptJson("command_result", { payload: { command: "test" } }),
+    });
+
+    const freshCandidate = lease(store);
+    expect(freshCandidate).toMatchObject({ action_kind: "candidate", command_name: null, cycle: 2 });
+    store.completeUnitAction({
+      actionId: freshCandidate.id, resultHash: "r-candidate-2", outputSubject: repairedSubject,
+      receipt: receiptJson("candidate_evidence"),
+    });
+    const freshLead = lease(store);
+    expect(freshLead).toMatchObject({ action_kind: "lead", cycle: 2 });
+    store.completeGatedAction({
+      actionId: freshLead.id,
+      resultHash: "r-lead-2",
+      outputSubject: repairedSubject,
+      receipt: receiptJson("unit_decision"),
+      decision: gateDecision({ gateKind: "unit_acceptance", outcome: "success", subject: repairedSubject }),
+    });
+
+    expect(store.listUnits("attempt-parent")[0]).toMatchObject({
+      phase: "integrate",
+      acceptedCandidateSubject: repairedSubject,
+      commandIndex: 1,
+    });
+    const attempts = db!.prepare(`
+      SELECT action_kind, cycle, command_name, output_subject FROM execution_work_attempts
+      WHERE parent_attempt_id = ? AND unit_id = ?
+      ORDER BY created_at, id
+    `).all("attempt-parent", "a");
+    expect(attempts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ action_kind: "command", cycle: 1, command_name: "test", output_subject: subject }),
+      expect.objectContaining({ action_kind: "command", cycle: 2, command_name: "test", output_subject: repairedSubject }),
+      expect.objectContaining({ action_kind: "candidate", cycle: 2, output_subject: repairedSubject }),
+    ]));
   });
 
   it("fails closed on malformed persisted unit phase sequences", () => {
@@ -607,12 +733,30 @@ describe("execution unit store", () => {
       graphDigest: "graph-digest",
       planDigest: "plan-digest",
       units: [{ id: "a" }],
-      unitPhases: ["implement", "candidate", "lead", "integrate"],
+      unitPhaseBindings: unitPhaseBindings(),
     });
     db!.prepare("UPDATE execution_graphs SET unit_phases = ? WHERE parent_attempt_id = ?")
       .run(JSON.stringify(["implement", "unknown", "candidate", "lead", "integrate"]), "attempt-parent");
 
     expect(() => lease(store)).toThrow(/unit phase unknown is not recognized/);
+  });
+
+  it("fails closed when persisted unit phases put simplify before implement", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: unitPhaseBindings(),
+    });
+    db!.prepare("UPDATE execution_graphs SET unit_phases = ? WHERE parent_attempt_id = ?")
+      .run(JSON.stringify(["simplify", "implement", "candidate", "lead", "integrate"]), "attempt-parent");
+
+    expect(() => lease(store)).toThrow(/simplify phase must not precede implement/);
   });
 
   it("rejects caller-provided unit phase sequences that would bypass required gates", () => {
@@ -625,7 +769,7 @@ describe("execution unit store", () => {
       graphDigest: "graph-digest",
       planDigest: "plan-digest",
       units: [{ id: "a" }],
-      unitPhases: ["integrate"],
+      unitPhaseBindings: [{ id: "integrate", kind: "integrate" }],
     })).toThrow(/unit phases must include implement/);
   });
 
@@ -1501,7 +1645,7 @@ describe("execution unit store", () => {
       graphDigest: "graph-digest",
       planDigest: "plan-digest",
       units: [{ id: "a" }],
-      commandNames: ["test"],
+      unitPhaseBindings: builtinUnitPhaseBindings(["test"]),
     });
 
     const implement = lease(store);
@@ -1691,7 +1835,7 @@ describe("execution unit store", () => {
       graphDigest: "graph-digest",
       planDigest: "plan-digest",
       units: [{ id: "a" }],
-      commandNames: ["test"],
+      unitPhaseBindings: builtinUnitPhaseBindings(["test"]),
     });
     completeUnitToTerminal(store, subject, ["test"]);
 
@@ -1856,7 +2000,7 @@ describe("execution unit store", () => {
       graphDigest: "graph-digest",
       planDigest: "plan-digest",
       units: [{ id: "a" }],
-      commandNames: ["test"],
+      unitPhaseBindings: builtinUnitPhaseBindings(["test"]),
     });
 
     const implement = lease(store);

@@ -452,6 +452,56 @@ describe("structured execution gates", () => {
     })).toThrow(/lead receipt evidence missing required artifact hash/);
   });
 
+  it("rejects a command receipt from a prior unit repair cycle", () => {
+    const repairedExpected: StandardReceiptFence = {
+      ...expected,
+      actionAttemptId: "action-2",
+      requestHash: "d".repeat(64),
+      baseSubject: expected.subject,
+      preSubject: expected.subject,
+      subject: "2".repeat(40),
+    };
+    const repairedFence = {
+      pipeline_instance_id: repairedExpected.pipelineInstanceId,
+      graph_digest: repairedExpected.graphDigest,
+      unit_id: repairedExpected.unitId,
+      attempt_id: repairedExpected.attemptId,
+      parent_run_id: repairedExpected.parentRunId,
+      action_attempt_id: repairedExpected.actionAttemptId,
+      generation: repairedExpected.generation,
+      native_session_id: repairedExpected.nativeSessionId,
+      request_hash: repairedExpected.requestHash,
+    };
+    const repairedSubject = {
+      base: repairedExpected.baseSubject,
+      pre: repairedExpected.preSubject,
+      post: repairedExpected.subject,
+    };
+    const completion = receipt("unit_completion", "success", {
+      subject: repairedSubject,
+      fence: repairedFence,
+    });
+    const candidate = receipt("candidate_evidence", "success", {
+      subject: repairedSubject,
+      fence: repairedFence,
+    });
+    const priorCycleCommand = command("success", 0);
+
+    expect(() => evaluateUnitAcceptanceGate({
+      expected: repairedExpected,
+      completion: completion as never,
+      candidate: candidate as never,
+      commands: [priorCycleCommand] as never,
+      expectedCommandNames: ["test"],
+      lead: receipt("unit_decision", "accept", {
+        subject: repairedSubject,
+        fence: repairedFence,
+        payload: { rationale: "Matches.", context_updates: [], accepted_subject: repairedExpected.subject },
+        evidence: [hashOf(candidate), hashOf(priorCycleCommand)],
+      }) as never,
+    })).toThrow(/command receipt fence mismatch/);
+  });
+
   it("binds the final review to the exact whole-change command evidence receipts", () => {
     const testCommand = command("success", 0);
 
