@@ -965,7 +965,7 @@ intents:
     );
   });
 
-  it("rejects repository skill graphs until production advertises agent/repository-skill@1", async () => {
+  it("admits repository skill graphs now that production advertises agent/repository-skill@1", async () => {
     const graphPath = ".openthrottle/graphs/repo-skill.json";
     const skillPath = ".agents/skills/implement-unit/SKILL.md";
     const graph = JSON.stringify({
@@ -1023,16 +1023,20 @@ intents:
       {
         [graphPath]: graph,
         [skillPath]: "---\nname: implement_unit\n---\n# Implement Unit\n",
+      },
+      {
+        capabilities: [
+          ...buildInstalledRuntimeDescriptor("base-repository-skill-flip-test/v1").descriptor.capabilities,
+          "agent/repository-skill@1",
+        ],
       }
     );
 
     expect(tickets.getByIssueId("issue-1")).toMatchObject({
-      state: "error",
+      state: "active",
       sandbox_id: null,
       run_id: null,
     });
-    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
-    expect(payloads.some((entry) => entry.includes("runtime capability mismatch: capability:agent/repository-skill@1"))).toBe(true);
   });
 
   it("rejects repository skill packages whose SKILL.md name does not match the configured invocation", async () => {

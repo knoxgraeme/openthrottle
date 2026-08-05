@@ -9,9 +9,10 @@
 import { readFileSync, existsSync } from 'node:fs';
 import * as p from '@clack/prompts';
 import { extractExecutionPlanBlocks, readExecutionPlanFromMarkdown, validateLocalGraphSelection, validatePlanFileForGraph, type LocalGraphSelection } from './plan.js';
-import { getErrorMessage, readEnv, requireEnv, linearGraphQL } from './util.js';
+import { getErrorMessage, readEnv, requireEnv, linearGraphQL, supervisorRequest } from './util.js';
 
 export const SHIP_SELECTION_FENCE = "openthrottle.ship-selection/v1";
+export const STRUCTURED_SHIP_CAPABILITY = "graph/for-each-unit@1";
 export const STRUCTURED_SHIP_UNAVAILABLE =
   "structured shipping is unavailable until graph/for-each-unit@1 is active on the configured supervisor";
 
@@ -77,11 +78,52 @@ export function validateGraphSelectionForShip(
   return graph;
 }
 
-export function assertStructuredShipAvailable(
-  graph: LocalGraphSelection | undefined
-): void {
+interface SupervisorCapabilityResponse {
+  release?: unknown;
+  capabilityDigest?: unknown;
+  capabilities?: unknown;
+}
+
+// The pre-mutation capability check RU9 installs: an explicit structured
+// selection must reach out to the configured supervisor and see the exact
+// `graph/for-each-unit@1` capability advertised before any Linear access.
+// Unreachable, unauthenticated, missing, or malformed ("stale"/mismatched)
+// evidence fails closed here -- it must never silently fall back to `simple`.
+export async function assertStructuredShipAvailable(
+  graph: LocalGraphSelection | undefined,
+  request: typeof supervisorRequest = supervisorRequest
+): Promise<void> {
   if (!graph?.consumesUnits) return;
-  throw new Error(`${STRUCTURED_SHIP_UNAVAILABLE}; selected graph ${graph.graphId} was validated but not shipped`);
+  let response: Response;
+  try {
+    response = await request('/capabilities');
+  } catch (err: unknown) {
+    throw new Error(
+      `${STRUCTURED_SHIP_UNAVAILABLE}; the configured supervisor was unreachable (${getErrorMessage(err)})`
+    );
+  }
+  if (!response.ok) {
+    throw new Error(
+      `${STRUCTURED_SHIP_UNAVAILABLE}; the configured supervisor rejected the capability check (HTTP ${response.status})`
+    );
+  }
+  let body: SupervisorCapabilityResponse;
+  try {
+    body = (await response.json()) as SupervisorCapabilityResponse;
+  } catch {
+    throw new Error(`${STRUCTURED_SHIP_UNAVAILABLE}; the configured supervisor returned a malformed capability response`);
+  }
+  const capabilities = body.capabilities;
+  if (
+    typeof body.release !== "string" || !body.release ||
+    typeof body.capabilityDigest !== "string" || !body.capabilityDigest ||
+    !Array.isArray(capabilities) || !capabilities.every((entry) => typeof entry === "string")
+  ) {
+    throw new Error(`${STRUCTURED_SHIP_UNAVAILABLE}; the configured supervisor returned a stale or malformed capability response`);
+  }
+  if (!capabilities.includes(STRUCTURED_SHIP_CAPABILITY)) {
+    throw new Error(`${STRUCTURED_SHIP_UNAVAILABLE}; selected graph ${graph.graphId} was validated but not shipped`);
+  }
 }
 
 function buildShipSelectionBlock(graphId: string): string {
@@ -197,7 +239,7 @@ export default async function ship(args: string[] | string | undefined): Promise
   try {
     ({ title, body } = parseMarkdown(content));
     const graph = validateGraphSelectionForShip(file, parsed.graphId);
-    assertStructuredShipAvailable(graph);
+    await assertStructuredShipAvailable(graph);
     body = buildShipDescription(body, parsed.graphId);
   } catch (err: unknown) {
     p.log.error(getErrorMessage(err));

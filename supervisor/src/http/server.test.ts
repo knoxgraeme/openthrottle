@@ -129,6 +129,23 @@ describe("coordinator-only server", () => {
     expect(response.status).toBe(404);
   });
 
+  it("exposes authenticated bounded capability evidence for the CLI pre-mutation gate", async () => {
+    const runtime = buildInstalledRuntimeDescriptor("capabilities-endpoint-test/v1");
+    const unauthorized = await app({ pipelineCoordinator: { catalog: {} as never, runtime, store: pipelines } })
+      .request("/capabilities");
+    expect(unauthorized.status).toBe(401);
+
+    const response = await app({ pipelineCoordinator: { catalog: {} as never, runtime, store: pipelines } })
+      .request("/capabilities", { headers: { Authorization: "Bearer status-token" } });
+    expect(response.status).toBe(200);
+    const body = await response.json() as { release: string; capabilityDigest: string; capabilities: string[] };
+    expect(body).toEqual({
+      release: runtime.descriptor.release,
+      capabilityDigest: runtime.digest,
+      capabilities: runtime.descriptor.capabilities,
+    });
+  });
+
   it("reports coordinator status without execution-mode compatibility fields", async () => {
     seedTicket();
     const response = await app().request("/status", {
@@ -571,6 +588,7 @@ describe("coordinator-only server", () => {
     seedTicket();
     for (const [path, method] of [
       ["/status", "GET"],
+      ["/capabilities", "GET"],
       ["/repositories", "GET"],
       ["/repositories/register", "POST"],
       ["/tickets/OT-1/stop", "POST"],
