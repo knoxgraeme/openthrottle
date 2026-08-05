@@ -298,7 +298,18 @@ function validateFence(
   if (attempt.expected_subject !== null && payload.repository.pre_subject !== attempt.expected_subject) {
     throw new Error(`artifact ${artifact.kind} input subject fence mismatch`);
   }
-  if (attempt.native_session_id !== null && payload.run.native_session_id !== attempt.native_session_id) {
+  // A contextless attempt may retain lineage that is intentionally absent
+  // from its request and result. During a rolling deploy, an already-sealed
+  // legacy request may still carry that session, so accept a reported value
+  // only when it is bound to the sealed request. Resumable policies continue
+  // to fence against the attempt's durable session identity.
+  const sealedRequestNativeSessionId = stage.context === "none" && attempt.request_payload !== null
+    ? (JSON.parse(attempt.request_payload) as { nativeSessionId?: unknown }).nativeSessionId
+    : null;
+  if ((stage.context === "none" && payload.run.native_session_id !== null &&
+        payload.run.native_session_id !== sealedRequestNativeSessionId) ||
+      (stage.context !== "none" && attempt.native_session_id !== null &&
+        payload.run.native_session_id !== attempt.native_session_id)) {
     throw new Error(`artifact ${artifact.kind} native session fence mismatch`);
   }
   if (payload.assurance !== stage.evaluator.assurance || artifact.assurance !== payload.assurance) {
@@ -586,7 +597,7 @@ export function processProviderEvidence(
         ticket_id: instance.linear_issue_id,
         session_id: instance.linear_session_id,
         generation: instance.generation,
-        native_session_id: attempt.native_session_id,
+        native_session_id: stage.context === "none" ? null : attempt.native_session_id,
       },
       repository: {
         name: instance.repository,
@@ -626,7 +637,7 @@ export function processProviderEvidence(
     outcome: input.outcome,
     resultHash: artifacts[0]!.hash,
     subject,
-    nativeSessionId: attempt.native_session_id,
+    nativeSessionId: stage.context === "none" ? null : attempt.native_session_id,
     artifacts,
   };
   if (instance.status === "completion_pending_publication" || instance.status === "publication_blocked") {

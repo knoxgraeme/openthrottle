@@ -20,6 +20,7 @@ import type { PipelineInstance, PipelineStageAttempt, PipelineStore } from "./st
 import type { FeedbackSnapshot } from "../persistence/feedback-store.js";
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 import { processPipelineInfrastructureFailure } from "./control.js";
+import { createStageRequestHash, type StageRequestEnvelope } from "./stage-request.js";
 import {
   drainPipelineFeedbackSnapshots,
   processPipelineFeedbackSnapshot,
@@ -321,6 +322,50 @@ describe("deterministic supervisor stage gates", () => {
       subject: options.subject ?? SUBJECT,
       artifacts,
     };
+  }
+
+  function withNativeSession(
+    input: PipelineCoordinatorEvent,
+    nativeSessionId: string
+  ): PipelineCoordinatorEvent {
+    const artifacts = input.artifacts!.map((artifact) => {
+      const payload = JSON.parse(artifact.payload) as { run: { native_session_id: string | null } };
+      payload.run.native_session_id = nativeSessionId;
+      const serialized = canonicalJson(payload);
+      return { ...artifact, payload: serialized, hash: digestNormalized(serialized) };
+    });
+    return {
+      ...input,
+      nativeSessionId,
+      artifacts,
+      resultHash: artifacts.find((artifact) => artifact.kind === "stage_result")!.hash,
+    };
+  }
+
+  function sealLegacyContextlessRequest(fixture: Fixture, nativeSessionId: string): Fixture {
+    const request = fixture.pipelines.getStageRequest(fixture.attempt.id);
+    const {
+      requestHash: _requestHash,
+      idempotencyKey: _idempotencyKey,
+      ...withoutFence
+    } = request;
+    const legacyWithoutFence = { ...withoutFence, nativeSessionId };
+    const legacyRequest: StageRequestEnvelope = {
+      ...legacyWithoutFence,
+      ...createStageRequestHash(legacyWithoutFence),
+    };
+    fixture.db.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET native_session_id = ?, request_payload = ?, request_hash = ?, idempotency_key = ?
+      WHERE id = ?
+    `).run(
+      nativeSessionId,
+      canonicalJson(legacyRequest),
+      legacyRequest.requestHash,
+      legacyRequest.idempotencyKey,
+      fixture.attempt.id
+    );
+    return currentStageFixture(fixture);
   }
 
   function currentStageFixture(fixture: Fixture): Fixture {
@@ -647,6 +692,78 @@ describe("deterministic supervisor stage gates", () => {
       store: fixture.pipelines,
       runId: fixture.attempt.planned_run_id!,
     })).toMatchObject({ state_version: transitioned!.state_version });
+  });
+
+  it("accepts contextless stage evidence while retaining durable native session lineage", () => {
+    const fixture = setup("fixture/command@1");
+    fixture.db.prepare(`
+      UPDATE pipeline_stage_attempts SET native_session_id = ? WHERE id = ?
+    `).run("native-session-lineage", fixture.attempt.id);
+    const contextlessFixture = currentStageFixture(fixture);
+    const input = event(contextlessFixture, "success", {
+      details: { not_configured: false, timed_out: false, exit_code: 0, signal: null },
+    });
+
+    const evaluated = evaluateStageGate(contextlessFixture.pipelines, input);
+    expect(evaluated.event).toMatchObject({ attemptId: contextlessFixture.attempt.id });
+    expect(evaluated.event.nativeSessionId).toBeUndefined();
+    expect(() => evaluateStageGate(
+      contextlessFixture.pipelines,
+      withNativeSession(input, "native-session-lineage")
+    )).toThrow(/native session fence/);
+  });
+
+  it("accepts a matching native session from a legacy contextless sealed request", () => {
+    const fixture = sealLegacyContextlessRequest(
+      setup("fixture/command@1"),
+      "legacy-native-session"
+    );
+    const input = withNativeSession(event(fixture, "success", {
+      details: { not_configured: false, timed_out: false, exit_code: 0, signal: null },
+    }), "legacy-native-session");
+
+    const evaluated = evaluateStageGate(fixture.pipelines, input);
+    expect(evaluated.event).toMatchObject({
+      attemptId: fixture.attempt.id,
+      nativeSessionId: "legacy-native-session",
+    });
+  });
+
+  it("rejects a mismatching native session from a legacy contextless sealed request", () => {
+    const fixture = sealLegacyContextlessRequest(
+      setup("fixture/command@1"),
+      "legacy-native-session"
+    );
+    const input = withNativeSession(event(fixture, "success", {
+      details: { not_configured: false, timed_out: false, exit_code: 0, signal: null },
+    }), "wrong-native-session");
+
+    expect(() => evaluateStageGate(fixture.pipelines, input)).toThrow(/native session fence/);
+  });
+
+  it("does not carry a prior native session into a fresh-stage infrastructure retry", () => {
+    const fixture = setup("core/implement@4");
+    fixture.db.prepare(`
+      UPDATE pipeline_stage_attempts SET native_session_id = ? WHERE id = ?
+    `).run("native-session-before-retry", fixture.attempt.id);
+
+    const transitioned = processPipelineInfrastructureFailure({
+      store: fixture.pipelines,
+      runId: fixture.attempt.planned_run_id!,
+    });
+
+    expect(transitioned).toMatchObject({ status: "dispatchable", active_stage_id: "implementation" });
+    const nextAttempt = fixture.pipelines.getActiveAttempt(fixture.instance.id)!;
+    expect(nextAttempt).toMatchObject({
+      stage_id: "implementation",
+      native_context_policy: "fresh",
+      native_session_id: null,
+      reentry_ordinal: 1,
+    });
+    expect(fixture.pipelines.getStageRequest(nextAttempt.id)).toMatchObject({
+      contextPolicy: "fresh",
+      nativeSessionId: null,
+    });
   });
 
   it("pins the exact provider commit when the agent-backed publish gate passes", () => {
