@@ -362,6 +362,14 @@ function validateUnitPhaseBindings(
     if (binding.context !== canonicalContext) {
       fail(`${path}[${index}].context`, "must match worker.session_scope");
     }
+    if (binding.kind === "gate") {
+      if (binding.credentials.includes("repo.write")) {
+        fail(`${path}[${index}].credentials`, "gate phase bindings cannot request repo.write");
+      }
+      if (binding.worker.credentials.includes("repo.write")) {
+        fail(`${path}[${index}].worker.credentials`, "gate phase bindings cannot request repo.write");
+      }
+    }
     if (canonicalJson(binding.credentials) !== canonicalJson(binding.worker.credentials)) {
       fail(`${path}[${index}].credentials`, "must match worker.credentials");
     }

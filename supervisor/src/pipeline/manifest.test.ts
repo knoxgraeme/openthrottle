@@ -11,6 +11,8 @@ import {
 } from "./manifest.js";
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 
+const UNIT_PHASE_RUNTIME_CAPABILITIES = ["ce/implement@1", "ce/review@1", "graph/for-each-unit@1"];
+
 function transitions(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   const output: Record<string, unknown> = {
     success: { terminal: "shipped" },
@@ -76,7 +78,8 @@ function unitPhaseBindings(): unknown[] {
     max_rounds: 1,
     timeout_seconds: 60,
   };
-  const leadLoop = { ...loop, id: "lead_loop", receipt: "unit_decision" };
+  const leadWorker = { ...worker, credentials: ["model.invoke", "repo.read"] };
+  const leadLoop = { ...loop, id: "lead_loop", skill: "builtin://ce/review@1", receipt: "unit_decision" };
   return [
     {
       id: "implement",
@@ -92,10 +95,10 @@ function unitPhaseBindings(): unknown[] {
       id: "lead",
       kind: "gate",
       loop: leadLoop,
-      worker,
-      executor: { kind: "agent", capability: "ce/implement@1" },
+      worker: leadWorker,
+      executor: { kind: "agent", capability: "ce/review@1" },
       context: "fresh",
-      credentials: ["model.invoke", "repo.read", "repo.write"],
+      credentials: ["model.invoke", "repo.read"],
     },
     { id: "integrate", kind: "integrate" },
   ];
@@ -432,7 +435,7 @@ describe("pipeline manifest validation", () => {
 
   it("pins unit phase metadata only on graph for-each-unit stages", () => {
     const value = manifest();
-    value.requires = { protocol: "stage-executor@1", capabilities: ["ce/implement@1", "graph/for-each-unit@1"] };
+    value.requires = { protocol: "stage-executor@1", capabilities: UNIT_PHASE_RUNTIME_CAPABILITIES };
     Object.assign(firstStage(value), {
       executor: { kind: "loop_action", capability: "graph/for-each-unit@1" },
       evaluator: { kind: "semantic", assurance: "executor_verified", required_artifacts: ["execution_graph_result"] },
@@ -498,7 +501,7 @@ describe("pipeline manifest validation", () => {
 
   it("fails closed when nested unit phase bindings exceed runtime support", () => {
     const value = manifest();
-    value.requires = { protocol: "stage-executor@1", capabilities: ["ce/implement@1", "graph/for-each-unit@1"] };
+    value.requires = { protocol: "stage-executor@1", capabilities: UNIT_PHASE_RUNTIME_CAPABILITIES };
     Object.assign(firstStage(value), {
       executor: { kind: "loop_action", capability: "graph/for-each-unit@1" },
       evaluator: { kind: "semantic", assurance: "executor_verified", required_artifacts: ["execution_graph_result"] },
@@ -512,21 +515,21 @@ describe("pipeline manifest validation", () => {
     });
 
     const withoutAgentExecutor = buildInstalledRuntimeDescriptor("limited/v1", {
-      capabilities: ["ce/implement@1", "graph/for-each-unit@1"],
+      capabilities: UNIT_PHASE_RUNTIME_CAPABILITIES,
       executors: ["loop_action"],
     });
     expect(() => validatePipelineManifest(value, { runtime: withoutAgentExecutor.descriptor }))
       .toThrow(/runtime capability mismatch.*executor:agent/);
 
     const withoutFreshContext = buildInstalledRuntimeDescriptor("limited/v1", {
-      capabilities: ["ce/implement@1", "graph/for-each-unit@1"],
+      capabilities: UNIT_PHASE_RUNTIME_CAPABILITIES,
       contextPolicies: ["none"],
     });
     expect(() => validatePipelineManifest(value, { runtime: withoutFreshContext.descriptor }))
       .toThrow(/runtime capability mismatch.*context:fresh/);
 
     const withoutModelCredential = buildInstalledRuntimeDescriptor("limited/v1", {
-      capabilities: ["ce/implement@1", "graph/for-each-unit@1"],
+      capabilities: UNIT_PHASE_RUNTIME_CAPABILITIES,
       credentialScopes: ["repo.read", "repo.write"],
     });
     expect(() => validatePipelineManifest(value, { runtime: withoutModelCredential.descriptor }))
@@ -545,6 +548,20 @@ describe("pipeline manifest validation", () => {
     credentialBinding.credentials = ["repo.read"];
     expect(() => validatePipelineManifest(mismatchedCredentials))
       .toThrow(/unitPhaseBindings\[0\]\.credentials: must match worker\.credentials/);
+
+    const writeGateCredentials = structuredClone(value) as Record<string, unknown>;
+    const writeGateBinding =
+      (firstStage(writeGateCredentials).unitPhaseBindings as Array<Record<string, unknown>>)[2]!;
+    writeGateBinding.credentials = ["model.invoke", "repo.read", "repo.write"];
+    expect(() => validatePipelineManifest(writeGateCredentials))
+      .toThrow(/unitPhaseBindings\[2\]\.credentials: gate phase bindings cannot request repo\.write/);
+
+    const writeGateWorker = structuredClone(value) as Record<string, unknown>;
+    const writeGateWorkerBinding =
+      (firstStage(writeGateWorker).unitPhaseBindings as Array<Record<string, unknown>>)[2]!;
+    (writeGateWorkerBinding.worker as Record<string, unknown>).credentials = ["model.invoke", "repo.read", "repo.write"];
+    expect(() => validatePipelineManifest(writeGateWorker))
+      .toThrow(/unitPhaseBindings\[2\]\.worker\.credentials: gate phase bindings cannot request repo\.write/);
   });
 
   it("bounds repository skill package identity inside its declared directory", () => {

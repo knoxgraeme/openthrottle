@@ -224,6 +224,22 @@ function assertCapabilityAuthorized(template: StageTemplate, path: string): void
   }
 }
 
+function assertGateReadOnly(
+  phase: GraphUnitPhase,
+  worker: GraphWorker,
+  capability: string,
+  path: string
+): void {
+  if (phase.kind !== "gate") return;
+  if (worker.credentials.includes("repo.write")) {
+    fail(`${path}.worker.credentials`, "gate phases cannot request repo.write");
+  }
+  const contract = CAPABILITY_CREDENTIALS[capability];
+  if (contract?.minimum.includes("repo.write")) {
+    fail(`${path}.skill`, `${capability} requires repo.write and cannot be used for gate phases`);
+  }
+}
+
 function compileTransitions(node: GraphNode): Record<StageOutcome, PipelineTransition> {
   const transitions: Partial<Record<StageOutcome, PipelineTransition>> = {
     ...DEFAULT_TERMINALS,
@@ -312,6 +328,7 @@ function unitPhaseLoop(
   const { capability, repositorySkill } = capabilityFromSkill(loop.skill, `graph.loops.${loop.id}.skill`, repositorySkills);
   const context = contextFromSessionScope(worker);
   const kind = phase.kind as "agent" | "gate";
+  assertGateReadOnly(phase, worker, capability, `graph.nodes.${node.id}.phases.${index}`);
   assertCapabilityAuthorized({
     executor: { kind: "agent", capability },
     evaluator: {

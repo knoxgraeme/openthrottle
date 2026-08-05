@@ -131,10 +131,10 @@ function minimalUnitGraph(overrides: {
     }, {
       id: "lead-worker",
       engine: "agent",
-      skills: ["builtin://ce/implement@1"],
+      skills: ["builtin://ce/review@1"],
       allowed_mcp_servers: [],
       session_scope: "fresh",
-      credentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+      credentials: ["model.invoke", "repo.read"],
       ...overrides.leadWorker,
     }],
     loops: [{
@@ -150,7 +150,7 @@ function minimalUnitGraph(overrides: {
     }, {
       id: "lead-loop",
       worker: "lead-worker",
-      skill: "builtin://ce/implement@1",
+      skill: "builtin://ce/review@1",
       input_scope: "unit",
       receipt: "unit_decision",
       max_parallel: 1,
@@ -320,7 +320,7 @@ describe("execution graph compiler", () => {
     });
 
     expect(compiled.manifest.manifest.requires.capabilities).toEqual([
-      "ce/implement@1",
+      "ce/review@1",
       "graph/for-each-unit@1",
       REPOSITORY_SKILL_CAPABILITY,
     ]);
@@ -334,6 +334,30 @@ describe("execution graph compiler", () => {
       id: "implement",
       repositorySkill: pkg,
     });
+  });
+
+  it("rejects gate phases whose worker requests write credentials", () => {
+    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+      leadWorker: { credentials: ["model.invoke", "repo.read", "repo.write"] },
+    }))).toThrow(/graph\.nodes\.units\.phases\.2\.worker\.credentials: gate phases cannot request repo\.write/);
+  });
+
+  it("rejects gate phases whose capability requires write credentials", () => {
+    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+      leadWorker: {
+        skills: ["builtin://ce/implement@1"],
+        credentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+      },
+      leadLoop: { skill: "builtin://ce/implement@1" },
+    }))).toThrow(/graph\.nodes\.units\.phases\.2\.worker\.credentials: gate phases cannot request repo\.write/);
+
+    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+      leadWorker: {
+        skills: ["builtin://ce/implement@1"],
+        credentials: ["model.invoke", "provider.read", "repo.read"],
+      },
+      leadLoop: { skill: "builtin://ce/implement@1" },
+    }))).toThrow(/graph\.nodes\.units\.phases\.2\.skill: ce\/implement@1 requires repo\.write and cannot be used for gate phases/);
   });
 
   it("compiles repository skills to the platform repository-skill capability with pinned package identity", () => {
