@@ -59,6 +59,48 @@ function firstStage(value: Record<string, unknown>): Record<string, unknown> {
   return (value.stages as Array<Record<string, unknown>>)[0]!;
 }
 
+function unitPhaseBindings(): unknown[] {
+  const worker = {
+    id: "worker",
+    engine: "agent",
+    allowed_mcp_servers: [],
+    session_scope: "fresh",
+    credentials: ["model.invoke", "repo.read", "repo.write"],
+  };
+  const loop = {
+    id: "loop",
+    skill: "builtin://ce/implement@1",
+    input_scope: "unit",
+    receipt: "unit_completion",
+    max_parallel: 1,
+    max_rounds: 1,
+    timeout_seconds: 60,
+  };
+  const leadLoop = { ...loop, id: "lead_loop", receipt: "unit_decision" };
+  return [
+    {
+      id: "implement",
+      kind: "agent",
+      loop,
+      worker,
+      executor: { kind: "agent", capability: "ce/implement@1" },
+      context: "fresh",
+      credentials: ["model.invoke", "repo.read", "repo.write"],
+    },
+    { id: "candidate", kind: "evidence" },
+    {
+      id: "lead",
+      kind: "gate",
+      loop: leadLoop,
+      worker,
+      executor: { kind: "agent", capability: "ce/implement@1" },
+      context: "fresh",
+      credentials: ["model.invoke", "repo.read", "repo.write"],
+    },
+    { id: "integrate", kind: "integrate" },
+  ];
+}
+
 const CORE_IMPLEMENT_V4_STAGE_IDS = [
   "implementation",
   "repair_implementation",
@@ -390,7 +432,7 @@ describe("pipeline manifest validation", () => {
 
   it("pins unit phase metadata only on graph for-each-unit stages", () => {
     const value = manifest();
-    value.requires = { protocol: "stage-executor@1", capabilities: ["graph/for-each-unit@1"] };
+    value.requires = { protocol: "stage-executor@1", capabilities: ["ce/implement@1", "graph/for-each-unit@1"] };
     Object.assign(firstStage(value), {
       executor: { kind: "loop_action", capability: "graph/for-each-unit@1" },
       evaluator: { kind: "semantic", assurance: "executor_verified", required_artifacts: ["execution_graph_result"] },
@@ -400,17 +442,24 @@ describe("pipeline manifest validation", () => {
       produces: ["stage_result", "execution_graph_result"],
       unitPhases: ["implement", "candidate", "lead", "integrate"],
       unitCommandNames: [],
+      unitPhaseBindings: unitPhaseBindings(),
     });
 
     expect(validatePipelineManifest(value).manifest.stages[0]).toMatchObject({
       unitPhases: ["implement", "candidate", "lead", "integrate"],
       unitCommandNames: [],
+      unitPhaseBindings: unitPhaseBindings(),
     });
 
     const missingPhases = structuredClone(value) as Record<string, unknown>;
     delete firstStage(missingPhases).unitPhases;
     expect(() => validatePipelineManifest(missingPhases))
       .toThrow(/pipeline\.stages\[0\]\.unitPhases: is required for graph\/for-each-unit@1 stages/);
+
+    const missingBindings = structuredClone(value) as Record<string, unknown>;
+    delete firstStage(missingBindings).unitPhaseBindings;
+    expect(() => validatePipelineManifest(missingBindings))
+      .toThrow(/pipeline\.stages\[0\]\.unitPhaseBindings: is required for graph\/for-each-unit@1 stages/);
 
     const duplicatePhases = structuredClone(value) as Record<string, unknown>;
     firstStage(duplicatePhases).unitPhases = ["implement", "implement", "candidate", "lead", "integrate"];
@@ -436,6 +485,7 @@ describe("pipeline manifest validation", () => {
     Object.assign(firstStage(agent), {
       unitPhases: ["implement", "candidate", "lead", "integrate"],
       unitCommandNames: [],
+      unitPhaseBindings: unitPhaseBindings(),
     });
     expect(() => validatePipelineManifest(agent))
       .toThrow(/pipeline\.stages\[0\]\.unitPhases: unit phase metadata is allowed only for graph\/for-each-unit@1 stages/);

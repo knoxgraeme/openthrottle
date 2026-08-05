@@ -111,12 +111,64 @@ export interface RepositorySkillPackage {
   files: RepositorySkillPackageFile[];
 }
 
+export interface PipelineUnitAgentPhaseBinding {
+  id: GraphUnitPhaseId;
+  kind: "agent" | "gate";
+  loop: {
+    id: string;
+    skill: string;
+    input_scope: "unit";
+    receipt: string;
+    max_parallel: number;
+    max_rounds: number;
+    timeout_seconds: number;
+  };
+  worker: {
+    id: string;
+    engine: "agent";
+    agent?: "inherit" | "claude" | "codex" | "opencode";
+    model?: string;
+    allowed_mcp_servers: string[];
+    session_scope: "graph" | "attempt" | "fresh";
+    credentials: string[];
+  };
+  executor: { kind: "agent"; capability: string };
+  context: ContextPolicy;
+  credentials: string[];
+  repositorySkill?: RepositorySkillPackage;
+}
+
+export interface PipelineUnitCommandPhaseBinding {
+  id: GraphUnitPhaseId;
+  kind: "command";
+  commands: CommandName[];
+}
+
+export interface PipelineUnitExecutorPhaseBinding {
+  id: GraphUnitPhaseId;
+  kind: "evidence" | "integrate";
+}
+
+export type PipelineUnitPhaseBinding =
+  | PipelineUnitAgentPhaseBinding
+  | PipelineUnitCommandPhaseBinding
+  | PipelineUnitExecutorPhaseBinding;
+
+export function unitPhaseBindingIds(bindings: readonly PipelineUnitPhaseBinding[]): GraphUnitPhaseId[] {
+  return bindings.map((binding) => binding.id);
+}
+
+export function unitPhaseBindingCommandNames(bindings: readonly PipelineUnitPhaseBinding[]): CommandName[] {
+  return bindings.flatMap((binding) => binding.kind === "command" ? binding.commands : []);
+}
+
 export interface PipelineStage {
   id: string;
   executor: { kind: ExecutorKind; capability: string };
   commandName?: CommandName;
   unitPhases?: GraphUnitPhaseId[];
   unitCommandNames?: CommandName[];
+  unitPhaseBindings?: PipelineUnitPhaseBinding[];
   repositorySkill?: RepositorySkillPackage;
   evaluator: { kind: EvaluatorKind; assurance: AssuranceClass; required_artifacts: ArtifactKind[] };
   context: ContextPolicy;
@@ -277,6 +329,22 @@ function validateUnitPhaseSequence(phases: readonly GraphUnitPhaseId[], path: st
   if (candidateIndex !== leadIndex - 1) fail(path, "candidate must immediately precede lead");
 }
 
+function validateUnitPhaseBindings(
+  bindings: readonly PipelineUnitPhaseBinding[],
+  stage: { unitPhases?: readonly GraphUnitPhaseId[]; unitCommandNames?: readonly CommandName[] },
+  path: string
+): void {
+  const phaseIds = unitPhaseBindingIds(bindings);
+  validateUnitPhaseSequence(phaseIds, path);
+  if (stage.unitPhases && canonicalJson(phaseIds) !== canonicalJson(stage.unitPhases)) {
+    fail(path, "must match unitPhases order");
+  }
+  const commandNames = unitPhaseBindingCommandNames(bindings);
+  if (stage.unitCommandNames && canonicalJson(commandNames) !== canonicalJson(stage.unitCommandNames)) {
+    fail(path, "command phase bindings must match unitCommandNames");
+  }
+}
+
 function parseYaml(raw: string, source: string): unknown {
   if (Buffer.byteLength(raw, "utf8") > 256 * 1024) fail(source, "YAML exceeds 256 KiB");
   const document = parseDocument(raw, {
@@ -368,7 +436,7 @@ function parseStage(
   options: { allowLegacyImplicitCommandName?: boolean } = {}
 ): PipelineStage {
   const input = objectAt(value, path, [
-    "id", "executor", "commandName", "unitPhases", "unitCommandNames", "repositorySkill", "evaluator", "context", "live_steering", "credentials", "produces", "transitions", "retry",
+    "id", "executor", "commandName", "unitPhases", "unitCommandNames", "unitPhaseBindings", "repositorySkill", "evaluator", "context", "live_steering", "credentials", "produces", "transitions", "retry",
   ]);
   const id = stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER });
   const executorInput = objectAt(input.executor, `${path}.executor`, ["kind", "capability"]);
@@ -419,6 +487,9 @@ function parseStage(
         return stringAt(entry, entryPath, { max: 80, pattern: COMMAND_NAME_PATTERN });
       }, { max: 16 }), `${path}.unitCommandNames`),
     }),
+    ...(input.unitPhaseBindings === undefined ? {} : {
+      unitPhaseBindings: arrayAt(input.unitPhaseBindings, `${path}.unitPhaseBindings`, parseUnitPhaseBinding, { min: 1, max: 16 }),
+    }),
     ...(input.repositorySkill === undefined ? {} : {
       repositorySkill: parseRepositorySkillPackage(input.repositorySkill, `${path}.repositorySkill`),
     }),
@@ -455,13 +526,15 @@ function parseStage(
     }
   }
   const isForEachUnitStage = stage.executor.kind === "loop_action" && stage.executor.capability === "graph/for-each-unit@1";
-  if (stage.unitPhases || stage.unitCommandNames) {
+  if (stage.unitPhases || stage.unitCommandNames || stage.unitPhaseBindings) {
     if (!isForEachUnitStage) fail(`${path}.unitPhases`, "unit phase metadata is allowed only for graph/for-each-unit@1 stages");
   }
   if (isForEachUnitStage) {
     if (!stage.unitPhases) fail(`${path}.unitPhases`, "is required for graph/for-each-unit@1 stages");
     if (!stage.unitCommandNames) fail(`${path}.unitCommandNames`, "is required for graph/for-each-unit@1 stages");
+    if (!stage.unitPhaseBindings) fail(`${path}.unitPhaseBindings`, "is required for graph/for-each-unit@1 stages");
     validateUnitPhaseSequence(stage.unitPhases, `${path}.unitPhases`);
+    validateUnitPhaseBindings(stage.unitPhaseBindings, stage, `${path}.unitPhaseBindings`);
   }
   for (const required of stage.evaluator.required_artifacts) {
     if (!stage.produces.includes(required)) fail(`${path}.evaluator.required_artifacts`, `${required} is not produced by the stage`);
@@ -470,6 +543,88 @@ function parseStage(
     fail(`${path}.produces`, "must include the typed stage_result artifact");
   }
   return stage;
+}
+
+function parseUnitPhaseBinding(value: unknown, path: string): PipelineUnitPhaseBinding {
+  const input = objectAt(value, path, ["id", "kind", "loop", "worker", "executor", "context", "credentials", "repositorySkill", "commands"]);
+  const id = enumAt(input.id, `${path}.id`, UNIT_PHASE_IDS);
+  const kind = enumAt(input.kind, `${path}.kind`, ["agent", "command", "evidence", "integrate", "gate"] as const);
+  const expectedKindById: Record<GraphUnitPhaseId, PipelineUnitPhaseBinding["kind"]> = {
+    implement: "agent",
+    simplify: "agent",
+    command: "command",
+    candidate: "evidence",
+    lead: "gate",
+    integrate: "integrate",
+  };
+  if (kind !== expectedKindById[id]) fail(`${path}.kind`, `must be ${expectedKindById[id]} for ${id}`);
+  if (kind === "command") {
+    for (const field of ["loop", "worker", "executor", "context", "credentials", "repositorySkill"] as const) {
+      if (input[field] !== undefined) fail(`${path}.${field}`, "is not allowed for command phase bindings");
+    }
+    if (input.commands === undefined) fail(`${path}.commands`, "is required for command phase bindings");
+    return {
+      id,
+      kind,
+      commands: unique(arrayAt(input.commands, `${path}.commands`, (entry, entryPath) => {
+        return stringAt(entry, entryPath, { max: 80, pattern: COMMAND_NAME_PATTERN });
+      }, { min: 1, max: 16 }), `${path}.commands`),
+    };
+  }
+  if (kind === "evidence" || kind === "integrate") {
+    for (const field of ["loop", "worker", "executor", "context", "credentials", "repositorySkill", "commands"] as const) {
+      if (input[field] !== undefined) fail(`${path}.${field}`, `is not allowed for ${kind} phase bindings`);
+    }
+    return { id, kind };
+  }
+  if (input.commands !== undefined) fail(`${path}.commands`, "is allowed only for command phase bindings");
+  const loopInput = objectAt(input.loop, `${path}.loop`, [
+    "id", "skill", "input_scope", "receipt", "max_parallel", "max_rounds", "timeout_seconds",
+  ]);
+  const workerInput = objectAt(input.worker, `${path}.worker`, [
+    "id", "engine", "agent", "model", "allowed_mcp_servers", "session_scope", "credentials",
+  ]);
+  const executorInput = objectAt(input.executor, `${path}.executor`, ["kind", "capability"]);
+  const repositorySkill = input.repositorySkill === undefined
+    ? undefined
+    : parseRepositorySkillPackage(input.repositorySkill, `${path}.repositorySkill`);
+  return {
+    id,
+    kind,
+    loop: {
+      id: stringAt(loopInput.id, `${path}.loop.id`, { pattern: IDENTIFIER }),
+      skill: stringAt(loopInput.skill, `${path}.loop.skill`, { max: 240 }),
+      input_scope: enumAt(loopInput.input_scope, `${path}.loop.input_scope`, ["unit"] as const),
+      receipt: stringAt(loopInput.receipt, `${path}.loop.receipt`, { pattern: IDENTIFIER }),
+      max_parallel: integerAt(loopInput.max_parallel, `${path}.loop.max_parallel`, 1, 1),
+      max_rounds: integerAt(loopInput.max_rounds, `${path}.loop.max_rounds`, 1, 20),
+      timeout_seconds: integerAt(loopInput.timeout_seconds, `${path}.loop.timeout_seconds`, 1, 86_400),
+    },
+    worker: {
+      id: stringAt(workerInput.id, `${path}.worker.id`, { pattern: IDENTIFIER }),
+      engine: enumAt(workerInput.engine, `${path}.worker.engine`, ["agent"] as const),
+      ...(workerInput.agent === undefined ? {} : {
+        agent: enumAt(workerInput.agent, `${path}.worker.agent`, ["inherit", "claude", "codex", "opencode"] as const),
+      }),
+      ...(workerInput.model === undefined ? {} : { model: stringAt(workerInput.model, `${path}.worker.model`, { max: 240 }) }),
+      allowed_mcp_servers: unique(arrayAt(workerInput.allowed_mcp_servers, `${path}.worker.allowed_mcp_servers`, (entry, entryPath) => {
+        return stringAt(entry, entryPath, { pattern: IDENTIFIER });
+      }, { max: 16 }), `${path}.worker.allowed_mcp_servers`),
+      session_scope: enumAt(workerInput.session_scope, `${path}.worker.session_scope`, ["graph", "attempt", "fresh"] as const),
+      credentials: unique(arrayAt(workerInput.credentials, `${path}.worker.credentials`, (entry, entryPath) => {
+        return stringAt(entry, entryPath, { max: 80, pattern: IDENTIFIER });
+      }, { max: 8 }), `${path}.worker.credentials`),
+    },
+    executor: {
+      kind: enumAt(executorInput.kind, `${path}.executor.kind`, ["agent"] as const),
+      capability: stringAt(executorInput.capability, `${path}.executor.capability`, { pattern: CAPABILITY }),
+    },
+    context: enumAt(input.context, `${path}.context`, CONTEXT_POLICIES),
+    credentials: unique(arrayAt(input.credentials, `${path}.credentials`, (entry, entryPath) => {
+      return stringAt(entry, entryPath, { max: 80, pattern: IDENTIFIER });
+    }, { max: 16 }), `${path}.credentials`),
+    ...(repositorySkill === undefined ? {} : { repositorySkill }),
+  };
 }
 
 function parseRepositorySkillPackage(value: unknown, path: string): RepositorySkillPackage {
@@ -616,12 +771,24 @@ export function validatePipelineManifest(
     ),
   };
   validateGraph(manifest, source);
+  const requiredCapabilities = new Set(manifest.requires.capabilities);
   for (const stage of manifest.stages) {
-    if (!manifest.requires.capabilities.includes(stage.executor.capability)) {
+    if (!requiredCapabilities.has(stage.executor.capability)) {
       fail(
         `${source}.stages.${stage.id}.executor.capability`,
         `${stage.executor.capability} is not declared in requires.capabilities`
       );
+    }
+    for (const [index, binding] of (stage.unitPhaseBindings ?? []).entries()) {
+      if (
+        (binding.kind === "agent" || binding.kind === "gate") &&
+        !requiredCapabilities.has(binding.executor.capability)
+      ) {
+        fail(
+          `${source}.stages.${stage.id}.unitPhaseBindings[${index}].executor.capability`,
+          `${binding.executor.capability} is not declared in requires.capabilities`
+        );
+      }
     }
   }
 

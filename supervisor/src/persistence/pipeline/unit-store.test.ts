@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { canonicalJson, digestNormalized, type StageOutcome } from "../../pipeline/manifest.js";
+import type { PipelineUnitPhaseBinding } from "../../pipeline/manifest.js";
 import type { ExecutionGateDecision } from "../../pipeline/execution-gates.js";
 import { openDb } from "../database.js";
 import { createExecutionUnitStore, type ExecutionUnitStore } from "./unit-store.js";
@@ -29,6 +30,55 @@ function gateDecision(overrides: {
 
 function receiptJson(type: string, overrides: Record<string, unknown> = {}): string {
   return JSON.stringify({ type, payload: {}, ...overrides });
+}
+
+function unitPhaseBindings(model = "gpt-5"): PipelineUnitPhaseBinding[] {
+  const worker = {
+    id: "worker",
+    engine: "agent" as const,
+    model,
+    allowed_mcp_servers: [],
+    session_scope: "fresh" as const,
+    credentials: ["model.invoke", "repo.read", "repo.write"],
+  };
+  return [
+    {
+      id: "implement",
+      kind: "agent",
+      loop: {
+        id: "loop",
+        skill: "builtin://ce/implement@1",
+        input_scope: "unit",
+        receipt: "unit_completion",
+        max_parallel: 1,
+        max_rounds: 1,
+        timeout_seconds: 60,
+      },
+      worker,
+      executor: { kind: "agent", capability: "ce/implement@1" },
+      context: "fresh",
+      credentials: ["model.invoke", "repo.read", "repo.write"],
+    },
+    { id: "candidate", kind: "evidence" },
+    {
+      id: "lead",
+      kind: "gate",
+      loop: {
+        id: "lead-loop",
+        skill: "builtin://ce/implement@1",
+        input_scope: "unit",
+        receipt: "unit_decision",
+        max_parallel: 1,
+        max_rounds: 1,
+        timeout_seconds: 60,
+      },
+      worker,
+      executor: { kind: "agent", capability: "ce/implement@1" },
+      context: "fresh",
+      credentials: ["model.invoke", "repo.read", "repo.write"],
+    },
+    { id: "integrate", kind: "integrate" },
+  ];
 }
 
 function lease(store: ExecutionUnitStore, leaseOwner = "worker-1", leaseUntilIso = "2026-07-29T00:01:00.000Z") {
@@ -138,9 +188,14 @@ describe("execution unit store", () => {
       graphDigest: "graph-digest",
       planDigest: "plan-digest",
       units: [{ id: "a" }, { id: "b", dependencies: ["a"] }],
+      unitPhases: ["implement", "candidate", "lead", "integrate"] as const,
+      unitPhaseBindings: unitPhaseBindings(),
     };
 
-    expect(store.createGraph(input)).toMatchObject({ parent_attempt_id: "attempt-parent" });
+    expect(store.createGraph(input)).toMatchObject({
+      parent_attempt_id: "attempt-parent",
+      unit_phase_bindings: canonicalJson(unitPhaseBindings()),
+    });
     expect(store.createGraph(input)).toMatchObject({ parent_attempt_id: "attempt-parent" });
     expect(store.listUnits("attempt-parent").map((unit) => [unit.unitId, unit.dependencies])).toEqual([
       ["a", []],
@@ -153,10 +208,15 @@ describe("execution unit store", () => {
     expect(() => store.createGraph({
       ...input,
       unitPhases: ["command", "implement", "candidate", "lead", "integrate"],
+    })).toThrow(/unitPhaseBindings must match unitPhases/);
+    expect(() => store.createGraph({
+      ...input,
+      unitPhaseBindings: unitPhaseBindings("gpt-5-mini"),
     })).toThrow(/replay fence mismatch/);
     expect(store.createGraph({
       ...input,
-      unitPhases: ["implement", "simplify", "command", "candidate", "lead", "integrate"],
+      unitPhases: ["implement", "candidate", "lead", "integrate"],
+      unitPhaseBindings: unitPhaseBindings(),
     })).toMatchObject({ parent_attempt_id: "attempt-parent" });
     expect(() => store.createGraph({
       ...input,
@@ -315,6 +375,31 @@ describe("execution unit store", () => {
       SET active_work_attempt_id = ?
       WHERE parent_attempt_id = 'attempt-parent' AND unit_id = 'a'
     `).run(other.id)).toThrow(/FOREIGN KEY/);
+  });
+
+  it("rejects caller-provided unit phase bindings that disagree with projected execution data", () => {
+    const store = setup();
+    const input = {
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhases: ["implement", "candidate", "lead", "integrate"] as const,
+      unitPhaseBindings: unitPhaseBindings(),
+    };
+
+    expect(() => store.createGraph({
+      ...input,
+      unitPhases: ["command", "implement", "candidate", "lead", "integrate"],
+    })).toThrow(/unitPhaseBindings must match unitPhases/);
+
+    expect(() => store.createGraph({
+      ...input,
+      commandNames: ["test"],
+    })).toThrow(/unitPhaseBindings command phases must match commandNames/);
   });
 
   it("leases exactly one active child action at a time", () => {

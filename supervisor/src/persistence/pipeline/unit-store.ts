@@ -1,5 +1,11 @@
 import type Database from "better-sqlite3";
-import { canonicalJson, type StageOutcome } from "../../pipeline/manifest.js";
+import {
+  canonicalJson,
+  type PipelineUnitPhaseBinding,
+  type StageOutcome,
+  unitPhaseBindingCommandNames,
+  unitPhaseBindingIds,
+} from "../../pipeline/manifest.js";
 import { buildExecutionPublicationSnapshot } from "../../pipeline/execution-publication.js";
 import type { ExecutionGateDecision } from "../../pipeline/execution-gates.js";
 import {
@@ -50,6 +56,7 @@ export interface ExecutionUnitGraph {
   plan_digest: string;
   command_names: string;
   unit_phases: string;
+  unit_phase_bindings: string;
   max_repair_rounds: number;
   final_phase: FinalPhase | null;
   final_command_index: number;
@@ -138,6 +145,7 @@ export interface ExecutionUnitStore {
     units: readonly ExecutionPlanUnit[];
     commandNames?: readonly string[];
     unitPhases?: readonly UnitPhase[];
+    unitPhaseBindings?: readonly PipelineUnitPhaseBinding[];
     maxRepairRounds?: number;
   }): ExecutionUnitGraph;
   getGraphForAttempt(parentAttemptId: string): ExecutionUnitGraph | undefined;
@@ -333,6 +341,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     const persistedUnitPhases = unitPhasesOf(existing);
     const requestedUnitPhases = [...(input.unitPhases ?? persistedUnitPhases)];
     const expectedUnitPhases = canonicalJson(requestedUnitPhases);
+    const expectedUnitPhaseBindings = canonicalJson([...(input.unitPhaseBindings ?? [])]);
     const legacyBuiltinUnitPhasesReplay =
       persistedUnitPhases.length === 0 &&
       input.unitPhases !== undefined &&
@@ -346,6 +355,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       existing.plan_digest !== input.planDigest ||
       existing.command_names !== expectedCommandNames ||
       (existing.unit_phases !== expectedUnitPhases && !legacyBuiltinUnitPhasesReplay) ||
+      existing.unit_phase_bindings !== expectedUnitPhaseBindings ||
       existing.max_repair_rounds !== expectedMaxRepairRounds
     ) {
       throw new Error(`execution graph ${existing.id} replay fence mismatch`);
@@ -365,10 +375,28 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     }
   }
 
+  function assertUnitPhaseBindingsMatch(input: Parameters<ExecutionUnitStore["createGraph"]>[0]): void {
+    if (!input.unitPhaseBindings) return;
+    if (
+      input.unitPhases &&
+      canonicalJson(unitPhaseBindingIds(input.unitPhaseBindings)) !== canonicalJson([...input.unitPhases])
+    ) {
+      throw new Error("execution graph unitPhaseBindings must match unitPhases");
+    }
+    const boundCommandNames = unitPhaseBindingCommandNames(input.unitPhaseBindings);
+    if (
+      input.commandNames &&
+      canonicalJson(boundCommandNames) !== canonicalJson([...input.commandNames])
+    ) {
+      throw new Error("execution graph unitPhaseBindings command phases must match commandNames");
+    }
+  }
+
   const createGraph = db.transaction((input: Parameters<ExecutionUnitStore["createGraph"]>[0]): ExecutionUnitGraph => {
     const timestamp = now();
     const graphId = deterministicId("execution-graph", [input.pipelineInstanceId, input.parentAttemptId]);
     if (input.unitPhases && input.unitPhases.length > 0) assertValidUnitPhaseSequence(input.unitPhases);
+    assertUnitPhaseBindingsMatch(input);
     const existing = graphStmt.get(input.parentAttemptId) as ExecutionUnitGraph | undefined;
     if (existing) {
       assertGraphReplayMatches(input, existing);
@@ -376,6 +404,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     }
     const commandNames = canonicalJson([...(input.commandNames ?? [])]);
     const unitPhases = canonicalJson([...(input.unitPhases ?? [])]);
+    const unitPhaseBindings = canonicalJson([...(input.unitPhaseBindings ?? [])]);
     const initialUnitPhase = input.unitPhases?.[0] ?? "implement";
     const maxRepairRounds = input.maxRepairRounds ?? DEFAULT_MAX_REPAIR_ROUNDS;
     if (!Number.isInteger(maxRepairRounds) || maxRepairRounds < 0) {
@@ -384,8 +413,9 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     db.prepare(`
       INSERT INTO execution_graphs (
         id, pipeline_instance_id, parent_attempt_id, parent_stage_id, parent_run_id,
-        graph_digest, plan_digest, command_names, unit_phases, max_repair_rounds, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        graph_digest, plan_digest, command_names, unit_phases, unit_phase_bindings,
+        max_repair_rounds, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(parent_attempt_id) DO NOTHING
     `).run(
       graphId,
@@ -397,6 +427,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       input.planDigest,
       commandNames,
       unitPhases,
+      unitPhaseBindings,
       maxRepairRounds,
       timestamp,
       timestamp

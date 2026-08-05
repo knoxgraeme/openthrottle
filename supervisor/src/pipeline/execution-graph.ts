@@ -22,10 +22,13 @@ import {
   type PipelineManifest,
   type PipelineStage,
   type PipelineTransition,
+  type PipelineUnitPhaseBinding,
   type RepositorySkillPackage,
   type RuntimeCapabilityInventory,
   type StageOutcome,
   type ValidatedPipelineManifest,
+  unitPhaseBindingCommandNames,
+  unitPhaseBindingIds,
 } from "./manifest.js";
 
 export interface CompileExecutionGraphOptions {
@@ -44,6 +47,7 @@ export interface CompiledExecutionGraph {
   graphDigest: string;
   unitPhases: readonly GraphUnitPhaseId[];
   unitCommandNames: readonly CommandName[];
+  unitPhaseBindings: readonly PipelineUnitPhaseBinding[];
   manifest: ValidatedPipelineManifest;
 }
 
@@ -58,9 +62,11 @@ type StageTemplate = {
   live_steering: boolean;
   credentials: string[];
   produces: ArtifactKind[];
+  requiredCapabilities?: readonly string[];
   commandName?: CommandName;
   unitPhases?: readonly GraphUnitPhaseId[];
   unitCommandNames?: readonly CommandName[];
+  unitPhaseBindings?: readonly PipelineUnitPhaseBinding[];
 };
 
 type PublicGraphOutcome = "success" | "no_change" | "repair_required" | "needs_human" | "retryable_failure" | "failure";
@@ -288,7 +294,7 @@ function unitPhaseLoop(
   phase: GraphUnitPhase,
   index: number,
   repositorySkills?: ReadonlyMap<string, RepositorySkillPackage>
-): GraphWorker {
+): PipelineUnitPhaseBinding {
   const loop = graph.loops.find((candidate) => candidate.id === phase.loop);
   if (!loop) fail(`graph.nodes.${node.id}.phases.${index}.loop`, "references an unknown loop");
   if (loop.input_scope !== "unit") {
@@ -303,7 +309,9 @@ function unitPhaseLoop(
   const worker = graph.workers.find((candidate) => candidate.id === loop.worker);
   if (!worker) fail(`graph.loops.${loop.id}.worker`, "references an unknown worker");
   if (worker.engine !== "agent") fail(`graph.workers.${worker.id}.engine`, "for_each_unit phases require an agent worker");
-  const { capability } = capabilityFromSkill(loop.skill, `graph.loops.${loop.id}.skill`, repositorySkills);
+  const { capability, repositorySkill } = capabilityFromSkill(loop.skill, `graph.loops.${loop.id}.skill`, repositorySkills);
+  const context = contextFromSessionScope(worker);
+  const kind = phase.kind as "agent" | "gate";
   assertCapabilityAuthorized({
     executor: { kind: "agent", capability },
     evaluator: {
@@ -311,12 +319,37 @@ function unitPhaseLoop(
       assurance: "semantic_attested",
       required_artifacts: ["stage_result"],
     },
-    context: contextFromSessionScope(worker),
+    context,
     live_steering: false,
     credentials: worker.credentials,
     produces: ["stage_result"],
   }, `graph.loops.${loop.id}`);
-  return worker;
+  return {
+    id: phase.id,
+    kind,
+    loop: {
+      id: loop.id,
+      skill: loop.skill,
+      input_scope: "unit",
+      receipt: loop.receipt,
+      max_parallel: loop.max_parallel,
+      max_rounds: loop.max_rounds,
+      timeout_seconds: loop.timeout_seconds,
+    },
+    worker: {
+      id: worker.id,
+      engine: "agent",
+      ...(worker.agent === undefined ? {} : { agent: worker.agent }),
+      ...(worker.model === undefined ? {} : { model: worker.model }),
+      allowed_mcp_servers: [...worker.allowed_mcp_servers],
+      session_scope: worker.session_scope,
+      credentials: [...worker.credentials],
+    },
+    executor: { kind: "agent", capability },
+    context,
+    credentials: [...worker.credentials],
+    ...(repositorySkill === undefined ? {} : { repositorySkill }),
+  };
 }
 
 function forEachUnitTemplate(
@@ -326,14 +359,22 @@ function forEachUnitTemplate(
   repositorySkills?: ReadonlyMap<string, RepositorySkillPackage>
 ): StageTemplate {
   if (!node.phases) fail(`graph.nodes.${node.id}.phases`, "is required for for_each_unit nodes");
-  const workers = node.phases
-    .map((phase, index) => phase.kind === "agent" || phase.kind === "gate"
-      ? unitPhaseLoop(graph, node, phase, index, repositorySkills)
-      : undefined)
-    .filter((worker): worker is GraphWorker => worker !== undefined);
-  const credentialScopes = workers.flatMap((worker) => worker.credentials);
+  const unitPhaseBindings = node.phases.map((phase, index): PipelineUnitPhaseBinding => {
+    if (phase.kind === "agent" || phase.kind === "gate") return unitPhaseLoop(graph, node, phase, index, repositorySkills);
+    if (phase.kind === "command") {
+      return {
+        id: phase.id,
+        kind: phase.kind,
+        commands: (phase.commands ?? []).map((command) =>
+          commandNameFromGraph(command, `graph.nodes.${node.id}.phases.${index}.commands`, config)),
+      };
+    }
+    return { id: phase.id, kind: phase.kind };
+  });
+  const credentialScopes = unitPhaseBindings.flatMap((binding) =>
+    binding.kind === "agent" || binding.kind === "gate" ? binding.worker.credentials : []);
   const allowedCredentials = new Set(CAPABILITY_CREDENTIALS[FOR_EACH_UNIT_CAPABILITY].allowed);
-  const unitCommandNames = unitCommandNamesFromNode(node, config);
+  const unitCommandNames = unitPhaseBindingCommandNames(unitPhaseBindings);
   const template: StageTemplate = {
     executor: { kind: "loop_action", capability: FOR_EACH_UNIT_CAPABILITY },
     evaluator: {
@@ -345,8 +386,14 @@ function forEachUnitTemplate(
     live_steering: false,
     credentials: [...new Set(credentialScopes.filter((scope) => allowedCredentials.has(scope)))],
     produces: ["stage_result", "execution_graph_result"],
-    unitPhases: node.phases.map((phase) => phase.id),
+    requiredCapabilities: [
+      FOR_EACH_UNIT_CAPABILITY,
+      ...unitPhaseBindings.flatMap((binding) =>
+        binding.kind === "agent" || binding.kind === "gate" ? [binding.executor.capability] : []),
+    ],
+    unitPhases: unitPhaseBindingIds(unitPhaseBindings),
     unitCommandNames,
+    unitPhaseBindings,
   };
   assertCapabilityAuthorized(template, `graph.nodes.${node.id}`);
   return template;
@@ -419,6 +466,7 @@ function compileStage(node: GraphNode, template: StageTemplate): PipelineStage {
     ...(template.commandName === undefined ? {} : { commandName: template.commandName }),
     ...(template.unitPhases === undefined ? {} : { unitPhases: [...template.unitPhases] }),
     ...(template.unitCommandNames === undefined ? {} : { unitCommandNames: [...template.unitCommandNames] }),
+    ...(template.unitPhaseBindings === undefined ? {} : { unitPhaseBindings: [...template.unitPhaseBindings] }),
     ...(template.repositorySkill === undefined ? {} : { repositorySkill: template.repositorySkill }),
     evaluator: template.evaluator,
     context: template.context,
@@ -429,24 +477,19 @@ function compileStage(node: GraphNode, template: StageTemplate): PipelineStage {
   };
 }
 
-function forEachUnitNode(graph: GraphContract): GraphNode | undefined {
-  return graph.nodes.find((node) => node.kind === "for_each_unit");
-}
-
-function unitPhaseIdsFromGraph(graph: GraphContract): readonly GraphUnitPhaseId[] {
-  return forEachUnitNode(graph)?.phases?.map((phase) => phase.id) ?? [];
-}
-
-function unitCommandNamesFromNode(node: GraphNode, config?: RepositoryConfigContract): readonly CommandName[] {
-  if (!node?.phases) return [];
-  return node.phases.flatMap((phase, index) => phase.kind === "command"
-    ? (phase.commands ?? []).map((command) => commandNameFromGraph(command, `graph.nodes.${node.id}.phases.${index}.commands`, config))
-    : []);
-}
-
-function unitCommandNamesFromGraph(graph: GraphContract, config?: RepositoryConfigContract): readonly CommandName[] {
-  const node = forEachUnitNode(graph);
-  return node ? unitCommandNamesFromNode(node, config) : [];
+function unitPhaseProjectionFromManifest(manifest: PipelineManifest): Pick<
+  CompiledExecutionGraph,
+  "unitPhases" | "unitCommandNames" | "unitPhaseBindings"
+> {
+  const unitStage = manifest.stages.find((stage) =>
+    stage.executor.kind === "loop_action" && stage.executor.capability === FOR_EACH_UNIT_CAPABILITY
+  );
+  const unitPhaseBindings = unitStage?.unitPhaseBindings ?? [];
+  return {
+    unitPhases: unitPhaseBindingIds(unitPhaseBindings),
+    unitCommandNames: unitPhaseBindingCommandNames(unitPhaseBindings),
+    unitPhaseBindings,
+  };
 }
 
 export function compileExecutionGraph(
@@ -464,7 +507,8 @@ export function compileExecutionGraph(
     ...(options.maxRepairRounds === undefined ? {} : { max_repair_rounds: options.maxRepairRounds }),
     requires: {
       protocol: "stage-executor@1",
-      capabilities: [...new Set(templates.map((template) => template.executor.capability))]
+      capabilities: [...new Set(templates.flatMap((template) =>
+        template.requiredCapabilities ?? [template.executor.capability]))]
         .sort((left, right) => {
           const leftOrder = capabilityOrder(left);
           const rightOrder = capabilityOrder(right);
@@ -484,12 +528,13 @@ export function parseAndCompileExecutionGraph(
   options: CompileExecutionGraphOptions & { source?: string } = {}
 ): CompiledExecutionGraph {
   const graph = parseGraphContract(raw, { source: options.source ?? "graph", config: options.config });
+  const compiledManifest = compileExecutionGraph(graph.value, options);
+  const unitPhaseProjection = unitPhaseProjectionFromManifest(compiledManifest.manifest);
   return {
     graph: graph.value,
     graphDigest: graph.digest,
-    unitPhases: unitPhaseIdsFromGraph(graph.value),
-    unitCommandNames: unitCommandNamesFromGraph(graph.value, options.config),
-    manifest: compileExecutionGraph(graph.value, options),
+    ...unitPhaseProjection,
+    manifest: compiledManifest,
   };
 }
 
@@ -498,11 +543,12 @@ export function validateAndCompileExecutionGraph(
   options: CompileExecutionGraphOptions & { source?: string } = {}
 ): CompiledExecutionGraph {
   const graph = validateGraphContract(value, { source: options.source ?? "graph", config: options.config });
+  const compiledManifest = compileExecutionGraph(graph.value, options);
+  const unitPhaseProjection = unitPhaseProjectionFromManifest(compiledManifest.manifest);
   return {
     graph: graph.value,
     graphDigest: graph.digest,
-    unitPhases: unitPhaseIdsFromGraph(graph.value),
-    unitCommandNames: unitCommandNamesFromGraph(graph.value, options.config),
-    manifest: compileExecutionGraph(graph.value, options),
+    ...unitPhaseProjection,
+    manifest: compiledManifest,
   };
 }

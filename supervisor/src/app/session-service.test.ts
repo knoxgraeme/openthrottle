@@ -530,6 +530,8 @@ intents:
       {
         capabilities: [
           ...buildInstalledRuntimeDescriptor("base-structured-test/v1").descriptor.capabilities,
+          "accept-unit@1",
+          "ce/simplify@1",
           "graph/for-each-unit@1",
         ],
       }
@@ -622,6 +624,8 @@ intents:
       {
         capabilities: [
           ...buildInstalledRuntimeDescriptor("base-structured-credential-test/v1").descriptor.capabilities,
+          "accept-unit@1",
+          "ce/simplify@1",
           "graph/for-each-unit@1",
         ],
       }
@@ -675,6 +679,8 @@ intents:
       {
         capabilities: [
           ...buildInstalledRuntimeDescriptor("base-structured-credential-test/v1").descriptor.capabilities,
+          "accept-unit@1",
+          "ce/simplify@1",
           "graph/for-each-unit@1",
         ],
       }
