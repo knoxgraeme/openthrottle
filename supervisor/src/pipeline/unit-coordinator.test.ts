@@ -2,16 +2,17 @@ import { describe, expect, it } from "vitest";
 import { canonicalJson, digestNormalized, type PipelineManifest } from "./manifest.js";
 import {
   actionKindForUnitPhase,
+  BUILTIN_UNIT_PHASES,
   buildAggregateStageEvent,
   decideChildGate,
   decideDownstreamContext,
   deriveUnitTerminalState,
   nextUnitPhase,
+  repairCyclePhaseSequence,
   routeFinalReviewDecision,
   routeIntegrationDecision,
   routeUnitAcceptanceDecision,
   selectNextReadyUnit,
-  UNIT_PHASES,
   unitBudgetDecision,
   type ChildGateEvidence,
   type ExecutionUnitState,
@@ -383,7 +384,7 @@ describe("unit coordinator", () => {
   });
 
   it("advances the durable unit phase sequence and derives the action kind for repair cycles", () => {
-    expect(UNIT_PHASES).toEqual(["implement", "simplify", "command", "candidate", "lead", "integrate"]);
+    expect(BUILTIN_UNIT_PHASES).toEqual(["implement", "simplify", "command", "candidate", "lead", "integrate"]);
     expect(nextUnitPhase("implement")).toBe("simplify");
     expect(nextUnitPhase("simplify")).toBe("command");
     expect(nextUnitPhase("command")).toBe("candidate");
@@ -398,6 +399,8 @@ describe("unit coordinator", () => {
     expect(actionKindForUnitPhase("candidate", 1)).toBe("candidate");
     expect(actionKindForUnitPhase("lead", 1)).toBe("lead");
     expect(actionKindForUnitPhase("integrate", 1)).toBe("integrate");
+    expect(repairCyclePhaseSequence(["command", "implement", "simplify", "candidate", "lead", "integrate"]))
+      .toEqual(["implement", "simplify", "command", "candidate", "lead", "integrate"]);
   });
 
   it("routes a unit acceptance decision to integrate, bounded repair, or escalation", () => {

@@ -15,6 +15,7 @@ import {
   loadPipelineCatalog,
   parseRepositoryConfig,
   type PipelineManifest,
+  type PipelineUnitPhaseBinding,
 } from "./manifest.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import type { PipelineInstance, PipelineInstanceStage, PipelineStageAttempt } from "./store.js";
@@ -24,6 +25,54 @@ import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
 const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
 const runtime = buildInstalledRuntimeDescriptor("coordinator-test/v1");
+
+function unitPhaseBindings(): PipelineUnitPhaseBinding[] {
+  const worker = {
+    id: "worker",
+    engine: "agent" as const,
+    allowed_mcp_servers: [],
+    session_scope: "fresh" as const,
+    credentials: ["model.invoke", "repo.read", "repo.write"],
+  };
+  return [
+    {
+      id: "implement",
+      kind: "agent",
+      loop: {
+        id: "loop",
+        skill: "builtin://ce/implement@1",
+        input_scope: "unit",
+        receipt: "unit_completion",
+        max_parallel: 1,
+        max_rounds: 1,
+        timeout_seconds: 60,
+      },
+      worker,
+      executor: { kind: "agent", capability: "ce/implement@1" },
+      context: "fresh",
+      credentials: worker.credentials,
+    },
+    { id: "candidate", kind: "evidence" },
+    {
+      id: "lead",
+      kind: "gate",
+      loop: {
+        id: "lead-loop",
+        skill: "builtin://ce/implement@1",
+        input_scope: "unit",
+        receipt: "unit_decision",
+        max_parallel: 1,
+        max_rounds: 1,
+        timeout_seconds: 60,
+      },
+      worker,
+      executor: { kind: "agent", capability: "ce/implement@1" },
+      context: "fresh",
+      credentials: worker.credentials,
+    },
+    { id: "integrate", kind: "integrate" },
+  ];
+}
 
 describe("pipeline coordinator", () => {
   let db: Database.Database | undefined;
@@ -388,6 +437,7 @@ describe("pipeline coordinator", () => {
       graphDigest: "graph-digest",
       planDigest: "plan-digest",
       units: [{ id: "U1" }],
+      unitPhaseBindings: unitPhaseBindings(),
     });
 
     coordinatePipelineEvent(pipelines, stageResultEvent({

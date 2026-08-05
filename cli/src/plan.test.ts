@@ -560,6 +560,7 @@ describe("plan validation", () => {
           implement: { default_graph: "simple", allowed_graphs: ["simple", "structured"] },
           investigate: { default_graph: "simple", allowed_graphs: ["simple"] },
         },
+        commands: { test: "npm test" },
       })
     );
     writeFileSync(
@@ -621,13 +622,20 @@ describe("plan validation", () => {
     writeFileSync(join(directory, ".openthrottle", "graphs", "structured.json"), JSON.stringify(graph));
     expect(() => validateLocalGraphSelection({ directory })).toThrow(/unknown MCP server/);
 
-    baseConfig.commands = { deploy: "npm run deploy" };
+    baseConfig.commands = { test: "npm test", deploy: "npm run deploy" };
     graph.nodes[2]!.command = "deploy";
     graph.workers[0]!.credentials = ["repo.read", "model.invoke"];
     graph.workers[0]!.allowed_mcp_servers = [];
     writeFileSync(join(directory, ".openthrottle.yml"), stringify(baseConfig));
     writeFileSync(join(directory, ".openthrottle", "graphs", "structured.json"), JSON.stringify(graph));
     expect(() => validateLocalGraphSelection({ directory })).toThrow(/must be one of: test, lint, build, format/);
+
+    baseConfig.commands = { test: "npm test" };
+    graph.nodes[2]!.command = "test";
+    graph.workers[1]!.credentials = ["repo.read", "repo.write", "model.invoke"];
+    writeFileSync(join(directory, ".openthrottle.yml"), stringify(baseConfig));
+    writeFileSync(join(directory, ".openthrottle", "graphs", "structured.json"), JSON.stringify(graph));
+    expect(() => validateLocalGraphSelection({ directory })).toThrow(/gate phases cannot request repo\.write/);
   });
 
   it("requires the execution block to match the selected graph", () => {

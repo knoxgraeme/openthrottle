@@ -19,8 +19,18 @@ function agentUid() {
   return result.stdout.trim();
 }
 
+export function liveAgentPidsFromPs(stdout) {
+  return String(stdout ?? "").split("\n").flatMap((line) => {
+    const match = line.trim().match(/^([1-9][0-9]*)\s+(\S+)/);
+    if (!match) return [];
+    // Zombies are already dead and cannot mutate executor-owned state. They
+    // may remain until their parent reaps them, and SIGKILL cannot remove them.
+    return match[2].includes("Z") ? [] : [match[1]];
+  });
+}
+
 function agentPids(uid) {
-  const result = spawnSync("pgrep", ["-u", uid], {
+  const result = spawnSync("ps", ["-o", "pid=,stat=", "-u", uid], {
     encoding: "utf8",
     timeout: 2_000,
   });
@@ -29,7 +39,7 @@ function agentPids(uid) {
   if (result.error || result.status !== 0) {
     throw new Error(`agent process enumeration failed: ${sanitizeArtifactText(result.stderr ?? result.error?.message ?? "").slice(-800)}`);
   }
-  return result.stdout.split(/\s+/).filter((pid) => /^[1-9][0-9]*$/.test(pid));
+  return liveAgentPidsFromPs(result.stdout);
 }
 
 function convergeAgentProcessesToEmpty() {

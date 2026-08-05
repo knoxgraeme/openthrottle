@@ -27,6 +27,7 @@
       "session_scope": "fresh",
       "credentials": [
         "repo.read",
+        "repo.write",
         "model.invoke"
       ],
       "allowed_mcp_servers": [],

@@ -1,7 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { runWithAgentProcessFence } from "./agent-process-fence.mjs";
+import { liveAgentPidsFromPs, runWithAgentProcessFence } from "./agent-process-fence.mjs";
 
 describe("agent process fence", () => {
+  it("ignores zombie agent processes during convergence", () => {
+    expect(liveAgentPidsFromPs(`
+        11 S
+        12 Z
+        13 Z+
+        14 Sl
+    `)).toEqual(["11", "14"]);
+  });
+
   it("converges before and after action execution", () => {
     const events = [];
     const result = runWithAgentProcessFence(

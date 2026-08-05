@@ -4,11 +4,79 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { openDb } from "../database.js";
-import { parsePipelineManifest } from "../../pipeline/manifest.js";
+import { canonicalJson, parsePipelineManifest, type PipelineUnitPhaseBinding } from "../../pipeline/manifest.js";
+import { createExecutionUnitStore } from "../pipeline/unit-store.js";
 import { applyDatabaseMigrations, databaseMigrations } from "./runner.js";
 
 let db: Database.Database | undefined;
 const temporaryDirectories: string[] = [];
+
+function builtinUnitPhaseBindings(): PipelineUnitPhaseBinding[] {
+  const worker = {
+    id: "worker",
+    engine: "agent" as const,
+    allowed_mcp_servers: [],
+    session_scope: "fresh" as const,
+    credentials: ["model.invoke", "repo.read", "repo.write"],
+  };
+  const implement: PipelineUnitPhaseBinding = {
+    id: "implement",
+    kind: "agent",
+    loop: {
+      id: "implement-loop",
+      skill: "builtin://ce/implement@1",
+      input_scope: "unit",
+      receipt: "unit_completion",
+      max_parallel: 1,
+      max_rounds: 1,
+      timeout_seconds: 60,
+    },
+    worker,
+    executor: { kind: "agent", capability: "ce/implement@1" },
+    context: "fresh",
+    credentials: worker.credentials,
+  };
+  return [
+    implement,
+    {
+      id: "simplify",
+      kind: "agent",
+      loop: {
+        id: "simplify-loop",
+        skill: "builtin://ce/simplify@1",
+        input_scope: "unit",
+        receipt: "unit_completion",
+        max_parallel: 1,
+        max_rounds: 1,
+        timeout_seconds: 60,
+      },
+      worker,
+      executor: { kind: "agent", capability: "ce/simplify@1" },
+      context: "fresh",
+      credentials: worker.credentials,
+    },
+    { id: "command", kind: "command", commands: [] },
+    { id: "candidate", kind: "evidence" },
+    {
+      id: "lead",
+      kind: "gate",
+      loop: {
+        id: "lead-loop",
+        skill: "builtin://ce/implement@1",
+        input_scope: "unit",
+        receipt: "unit_decision",
+        max_parallel: 1,
+        max_rounds: 1,
+        timeout_seconds: 60,
+      },
+      worker,
+      executor: { kind: "agent", capability: "ce/implement@1" },
+      context: "fresh",
+      credentials: worker.credentials,
+    },
+    { id: "integrate", kind: "integrate" },
+  ];
+}
 
 afterEach(() => {
   db?.close();
@@ -53,6 +121,8 @@ describe("database migrations", () => {
       "438e4388d9f50e29233a33c86065e97e0e958b9c1e39a04e0c6be74c279c805f",
       "23f09c8fd9f001ea824f86a24edd3d496949594af5dfeb9ad835fc109942ac97",
       "5cf580fcb6d73b2b4ff4fdaa5cf4e1a7c14b2f84b945fcdf313caf36ca4cf662",
+      "a4b0a5723dfa7953ca199dcb5e84da498771882bb19ecfde2e98f0e20cb4f825",
+      "60d16031c8c20060780fa6e5517d0b7b4bd39484b63c5e972d19ab43ba1828b8",
     ]);
   });
 
@@ -320,6 +390,31 @@ describe("database migrations", () => {
       version: 18,
     });
     expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+
+    const store = createExecutionUnitStore(db, () => now);
+    expect(store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings(),
+    })).toMatchObject({
+      unit_phases: canonicalJson([]),
+      unit_phase_bindings: canonicalJson([]),
+    });
+    expect(() => store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings().filter((binding) => binding.id !== "simplify"),
+    })).toThrow(/replay fence mismatch/);
   });
 
   it("upgrades databases already stamped with the immutable v16 checksum through v17", () => {

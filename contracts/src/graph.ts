@@ -31,7 +31,9 @@ export const RECEIPT_TYPES = [
 ] as const;
 export const WORKER_ENGINES = ["agent", "command", "provider", "human"] as const;
 export const NODE_KINDS = ["run", "for_each_unit", "command", "publish", "wait_for_provider", "human"] as const;
-const LOOP_BACKED_NODE_KINDS = new Set<NodeKind>(["run", "for_each_unit"]);
+const LOOP_BACKED_NODE_KINDS = new Set<NodeKind>(["run"]);
+export const UNIT_PHASE_IDS = ["implement", "simplify", "command", "candidate", "lead", "integrate"] as const;
+export const UNIT_PHASE_KINDS = ["agent", "command", "evidence", "integrate", "gate"] as const;
 export const GRAPH_OUTCOMES = [
   "success",
   "no_change",
@@ -50,6 +52,8 @@ export type ReceiptType = (typeof RECEIPT_TYPES)[number];
 export type WorkerEngine = (typeof WORKER_ENGINES)[number];
 export type AgentInheritance = (typeof AGENT_INHERITANCE)[number];
 export type NodeKind = (typeof NODE_KINDS)[number];
+export type GraphUnitPhaseId = (typeof UNIT_PHASE_IDS)[number];
+export type GraphUnitPhaseKind = (typeof UNIT_PHASE_KINDS)[number];
 export type GraphOutcome = (typeof GRAPH_OUTCOMES)[number];
 export type LogicalCredential = (typeof LOGICAL_CREDENTIALS)[number];
 
@@ -82,11 +86,19 @@ export interface GraphTransition {
   on_exhausted?: "needs_human" | "failed";
 }
 
+export interface GraphUnitPhase {
+  id: GraphUnitPhaseId;
+  kind: GraphUnitPhaseKind;
+  loop?: string;
+  commands?: string[];
+}
+
 export interface GraphNode {
   id: string;
   kind: NodeKind;
   loop?: string;
   command?: string;
+  phases?: GraphUnitPhase[];
   depends_on: string[];
   transitions: Partial<Record<GraphOutcome, GraphTransition>>;
 }
@@ -171,14 +183,56 @@ function parseTransitionMap(value: unknown, path: string): Partial<Record<GraphO
   return transitions;
 }
 
+function parseUnitPhase(value: unknown, path: string): GraphUnitPhase {
+  const input = objectAt(value, path, ["id", "kind", "loop", "commands"]);
+  const kind = enumAt(input.kind, `${path}.kind`, UNIT_PHASE_KINDS);
+  const phase: GraphUnitPhase = {
+    id: enumAt(input.id, `${path}.id`, UNIT_PHASE_IDS),
+    kind,
+    ...(input.loop === undefined ? {} : { loop: stringAt(input.loop, `${path}.loop`, { pattern: IDENTIFIER }) }),
+    ...(input.commands === undefined ? {} : {
+      commands: unique(arrayAt(input.commands, `${path}.commands`, (entry, entryPath) => {
+        return stringAt(entry, entryPath, { max: 80, pattern: COMMAND_NAME_PATTERN });
+      }, { min: 1, max: 16 }), `${path}.commands`),
+    }),
+  };
+  if ((kind === "agent" || kind === "gate") && !phase.loop) {
+    fail(`${path}.loop`, "is required for agent and gate phases");
+  }
+  if (kind !== "agent" && kind !== "gate" && phase.loop) {
+    fail(`${path}.loop`, "is allowed only for agent and gate phases");
+  }
+  if (kind === "command" && !phase.commands) {
+    fail(`${path}.commands`, "is required for command phases");
+  }
+  if (kind !== "command" && phase.commands) {
+    fail(`${path}.commands`, "is allowed only for command phases");
+  }
+  const expectedKindById: Record<GraphUnitPhaseId, GraphUnitPhaseKind> = {
+    implement: "agent",
+    simplify: "agent",
+    command: "command",
+    candidate: "evidence",
+    lead: "gate",
+    integrate: "integrate",
+  };
+  if (kind !== expectedKindById[phase.id]) {
+    fail(`${path}.kind`, `must be ${expectedKindById[phase.id]} for ${phase.id}`);
+  }
+  return phase;
+}
+
 function parseNode(value: unknown, path: string): GraphNode {
-  const input = objectAt(value, path, ["id", "kind", "loop", "command", "depends_on", "transitions"]);
+  const input = objectAt(value, path, ["id", "kind", "loop", "command", "phases", "depends_on", "transitions"]);
   const kind = enumAt(input.kind, `${path}.kind`, NODE_KINDS);
   const node: GraphNode = {
     id: stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER }),
     kind,
     ...(input.loop === undefined ? {} : { loop: stringAt(input.loop, `${path}.loop`, { pattern: IDENTIFIER }) }),
     ...(input.command === undefined ? {} : { command: stringAt(input.command, `${path}.command`, { max: 80, pattern: COMMAND_NAME_PATTERN }) }),
+    ...(input.phases === undefined ? {} : {
+      phases: arrayAt(input.phases, `${path}.phases`, parseUnitPhase, { min: 1, max: 16 }),
+    }),
     depends_on: unique(arrayAt(input.depends_on, `${path}.depends_on`, (entry, entryPath) => {
       return stringAt(entry, entryPath, { pattern: IDENTIFIER });
     }, { max: 16 }), `${path}.depends_on`),
@@ -188,6 +242,8 @@ function parseNode(value: unknown, path: string): GraphNode {
   if (kind === "command" && !node.command) fail(`${path}.command`, "is required for command nodes");
   if (kind !== "command" && node.command) fail(`${path}.command`, "is only allowed for command nodes");
   if (!LOOP_BACKED_NODE_KINDS.has(kind) && node.loop) fail(`${path}.loop`, "is allowed only for loop-backed nodes");
+  if (kind === "for_each_unit" && !node.phases) fail(`${path}.phases`, "is required for for_each_unit nodes");
+  if (kind !== "for_each_unit" && node.phases) fail(`${path}.phases`, "is allowed only for for_each_unit nodes");
   return node;
 }
 
@@ -196,6 +252,7 @@ function validateGraph(graph: GraphContract, source: string, config?: Repository
   const loops = new Map(graph.loops.map((loop) => [loop.id, loop]));
   const nodes = new Map(graph.nodes.map((node) => [node.id, node]));
   const configuredSkills = new Set((config?.skills ?? []).map((skill) => skill.id));
+  const configuredCommands = config ? new Set(Object.keys(config.commands ?? {})) : undefined;
   if (workers.size !== graph.workers.length) fail(`${source}.workers`, "must not contain duplicate IDs");
   if (loops.size !== graph.loops.length) fail(`${source}.loops`, "must not contain duplicate IDs");
   if (nodes.size !== graph.nodes.length) fail(`${source}.nodes`, "must not contain duplicate IDs");
@@ -219,11 +276,56 @@ function validateGraph(graph: GraphContract, source: string, config?: Repository
   }
   for (const node of graph.nodes) {
     if (node.loop && !loops.has(node.loop)) fail(`${source}.nodes.${node.id}.loop`, "references an unknown loop");
-    if (node.command && config) {
-      const configuredCommands = new Set(Object.keys(config.commands ?? {}));
+    if (node.command && configuredCommands) {
       if (!configuredCommands.has(node.command)) {
         fail(`${source}.nodes.${node.id}.command`, "references an unknown repository command");
       }
+    }
+    if (node.phases) {
+      const phaseIds = new Set<string>();
+      let integrateIndex = -1;
+      let leadIndex = -1;
+      let candidateIndex = -1;
+      let implementIndex = -1;
+      let simplifyIndex = -1;
+      for (const [index, phase] of node.phases.entries()) {
+        if (phaseIds.has(phase.id)) fail(`${source}.nodes.${node.id}.phases`, "must not contain duplicate phase IDs");
+        phaseIds.add(phase.id);
+        if (phase.id === "implement") implementIndex = index;
+        if (phase.id === "simplify") simplifyIndex = index;
+        if (phase.id === "integrate") integrateIndex = index;
+        if (phase.id === "lead") leadIndex = index;
+        if (phase.id === "candidate") candidateIndex = index;
+        if ((phase.kind === "agent" || phase.kind === "gate") && phase.loop && !loops.has(phase.loop)) {
+          fail(`${source}.nodes.${node.id}.phases[${index}].loop`, "references an unknown loop");
+        }
+        if (phase.kind === "gate" && phase.loop) {
+          const loop = loops.get(phase.loop);
+          const worker = loop ? workers.get(loop.worker) : undefined;
+          if (worker?.credentials.includes("repo.write")) {
+            fail(`${source}.nodes.${node.id}.phases[${index}].worker.credentials`, "gate phases cannot request repo.write");
+          }
+        }
+        if (phase.kind === "command" && phase.commands && configuredCommands) {
+          for (const command of phase.commands) {
+            if (!configuredCommands.has(command)) {
+              fail(`${source}.nodes.${node.id}.phases[${index}].commands`, "references an unknown repository command");
+            }
+          }
+        }
+      }
+      for (const required of ["implement", "candidate", "lead"] as const) {
+        if (!phaseIds.has(required)) fail(`${source}.nodes.${node.id}.phases`, `must include the ${required} phase`);
+      }
+      if (integrateIndex === -1) fail(`${source}.nodes.${node.id}.phases`, "must include exactly one integrate phase");
+      if (integrateIndex !== node.phases.length - 1) {
+        fail(`${source}.nodes.${node.id}.phases[${integrateIndex}]`, "integrate must be the last unit phase");
+      }
+      if (simplifyIndex !== -1 && simplifyIndex < implementIndex) {
+        fail(`${source}.nodes.${node.id}.phases[${simplifyIndex}]`, "simplify must not precede implement");
+      }
+      if (leadIndex !== integrateIndex - 1) fail(`${source}.nodes.${node.id}.phases`, "lead must immediately precede integrate");
+      if (candidateIndex !== leadIndex - 1) fail(`${source}.nodes.${node.id}.phases`, "candidate must immediately precede lead");
     }
     for (const dependency of node.depends_on) {
       if (!nodes.has(dependency)) fail(`${source}.nodes.${node.id}.depends_on`, "references an unknown node");

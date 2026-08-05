@@ -107,8 +107,14 @@ function hashOf(value: unknown): string {
   return digestNormalized(canonicalJson(value));
 }
 
-const command = (result: "success" | "failure" | "not_configured", exitCode: number, name = "test") => receipt("command_result", result, {
+const command = (
+  result: "success" | "failure" | "not_configured",
+  exitCode: number,
+  name = "test",
+  overrides: Record<string, unknown> = {}
+) => receipt("command_result", result, {
   payload: { command: name, exit_code: exitCode, summary: "command done" },
+  ...overrides,
 });
 
 describe("structured execution gates", () => {
@@ -450,6 +456,44 @@ describe("structured execution gates", () => {
         evidence: [hashOf(unrelatedCandidate), hashOf(unrelatedCommand)],
       }) as never,
     })).toThrow(/lead receipt evidence missing required artifact hash/);
+  });
+
+  it("rejects a command receipt from a prior unit repair cycle", () => {
+    const repairedExpected: StandardReceiptFence = {
+      ...expected,
+      baseSubject: expected.subject,
+      preSubject: expected.subject,
+      subject: "2".repeat(40),
+    };
+    const repairedSubject = {
+      base: repairedExpected.baseSubject,
+      pre: repairedExpected.preSubject,
+      post: repairedExpected.subject,
+    };
+    const completion = receipt("unit_completion", "success", {
+      subject: repairedSubject,
+    });
+    const candidate = receipt("candidate_evidence", "success", {
+      subject: repairedSubject,
+    });
+    const staleCommandSubject = {
+      ...repairedSubject,
+      post: expected.subject,
+    };
+    const priorCycleCommand = command("success", 0, "test", { subject: staleCommandSubject });
+
+    expect(() => evaluateUnitAcceptanceGate({
+      expected: repairedExpected,
+      completion: completion as never,
+      candidate: candidate as never,
+      commands: [priorCycleCommand] as never,
+      expectedCommandNames: ["test"],
+      lead: receipt("unit_decision", "accept", {
+        subject: repairedSubject,
+        payload: { rationale: "Matches.", context_updates: [], accepted_subject: repairedExpected.subject },
+        evidence: [hashOf(candidate), hashOf(priorCycleCommand)],
+      }) as never,
+    })).toThrow(/command receipt subject mismatch/);
   });
 
   it("binds the final review to the exact whole-change command evidence receipts", () => {

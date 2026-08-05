@@ -108,6 +108,71 @@ function repositorySkillPackage() {
   };
 }
 
+function minimalUnitGraph(overrides: {
+  worker?: Record<string, unknown>;
+  loop?: Record<string, unknown>;
+  leadWorker?: Record<string, unknown>;
+  leadLoop?: Record<string, unknown>;
+  phases?: unknown[];
+} = {}): Record<string, unknown> {
+  return {
+    schema: "openthrottle.graph/v1",
+    id: "fixture/units",
+    version: 1,
+    entry_node: "units",
+    workers: [{
+      id: "worker",
+      engine: "agent",
+      skills: ["builtin://ce/implement@1"],
+      allowed_mcp_servers: [],
+      session_scope: "fresh",
+      credentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+      ...overrides.worker,
+    }, {
+      id: "lead-worker",
+      engine: "agent",
+      skills: ["builtin://ce/review@1"],
+      allowed_mcp_servers: [],
+      session_scope: "fresh",
+      credentials: ["model.invoke", "repo.read"],
+      ...overrides.leadWorker,
+    }],
+    loops: [{
+      id: "loop",
+      worker: "worker",
+      skill: "builtin://ce/implement@1",
+      input_scope: "unit",
+      receipt: "unit_completion",
+      max_parallel: 1,
+      max_rounds: 1,
+      timeout_seconds: 60,
+      ...overrides.loop,
+    }, {
+      id: "lead-loop",
+      worker: "lead-worker",
+      skill: "builtin://ce/review@1",
+      input_scope: "unit",
+      receipt: "unit_decision",
+      max_parallel: 1,
+      max_rounds: 1,
+      timeout_seconds: 60,
+      ...overrides.leadLoop,
+    }],
+    nodes: [{
+      id: "units",
+      kind: "for_each_unit",
+      phases: overrides.phases ?? [
+        { id: "implement", kind: "agent", loop: "loop" },
+        { id: "candidate", kind: "evidence" },
+        { id: "lead", kind: "gate", loop: "lead-loop" },
+        { id: "integrate", kind: "integrate" },
+      ],
+      depends_on: [],
+      transitions: { success: { terminal: "completed" } },
+    }],
+  };
+}
+
 describe("execution graph compiler", () => {
   it("compiles the built-in simple graph behaviorally equivalent to core/implement@4 with a new digest", () => {
     const compiled = parseAndCompileExecutionGraph(readFileSync(simpleGraphPath, "utf8"), {
@@ -164,6 +229,8 @@ describe("execution graph compiler", () => {
     const runtime = buildInstalledRuntimeDescriptor("structured-test/v1", {
       capabilities: [
         ...buildInstalledRuntimeDescriptor("base-test/v1").descriptor.capabilities,
+        "accept-unit@1",
+        "ce/simplify@1",
         "graph/for-each-unit@1",
       ],
     });
@@ -176,7 +243,7 @@ describe("execution graph compiler", () => {
       id: "builtin/structured",
       version: 1,
       entry_stage: "units",
-      requires: { capabilities: ["graph/for-each-unit@1"] },
+      requires: { capabilities: ["ce/implement@1", "ce/simplify@1", "graph/for-each-unit@1", "accept-unit@1"] },
       stages: [{
         id: "units",
         executor: { kind: "loop_action", capability: "graph/for-each-unit@1" },
@@ -185,8 +252,30 @@ describe("execution graph compiler", () => {
         live_steering: false,
         credentials: ["provider.read", "repo.read", "repo.write"],
         produces: ["stage_result", "execution_graph_result"],
+        unitPhases: ["implement", "simplify", "command", "candidate", "lead", "integrate"],
+        unitCommandNames: ["test", "lint", "build"],
       }],
     });
+    const phaseAction = (phase: NonNullable<PipelineStage["unitPhaseBindings"]>[number]): string => {
+      if (phase.kind === "command") return "command";
+      if (phase.kind === "agent" || phase.kind === "gate") return phase.executor.capability;
+      return phase.kind;
+    };
+    expect(compiled.manifest.manifest.stages[0]?.unitPhaseBindings?.map((phase) => ({
+      id: phase.id,
+      kind: phase.kind,
+      action: phaseAction(phase),
+      receipt: phase.kind === "agent" || phase.kind === "gate" ? phase.loop.receipt : undefined,
+    }))).toEqual([
+      { id: "implement", kind: "agent", action: "ce/implement@1", receipt: "unit_completion" },
+      { id: "simplify", kind: "agent", action: "ce/simplify@1", receipt: "unit_completion" },
+      { id: "command", kind: "command", action: "command", receipt: undefined },
+      { id: "candidate", kind: "evidence", action: "evidence", receipt: undefined },
+      { id: "lead", kind: "gate", action: "accept-unit@1", receipt: "unit_decision" },
+      { id: "integrate", kind: "integrate", action: "integrate", receipt: undefined },
+    ]);
+    expect(compiled.unitPhases).toEqual(["implement", "simplify", "command", "candidate", "lead", "integrate"]);
+    expect(compiled.unitCommandNames).toEqual(["test", "lint", "build"]);
     expect(compiled.manifest.manifest.stages[0]?.transitions.no_change).toEqual({ terminal: "no_change" });
   });
 
@@ -194,7 +283,99 @@ describe("execution graph compiler", () => {
     expect(() => parseAndCompileExecutionGraph(readFileSync(structuredGraphPath, "utf8"), {
       source: structuredGraphPath,
       runtime: buildInstalledRuntimeDescriptor("production-like/v1").descriptor,
-    })).toThrow(/runtime capability mismatch: capability:graph\/for-each-unit@1/);
+    })).toThrow(/runtime capability mismatch: .*capability:graph\/for-each-unit@1/);
+  });
+
+  it("changes the pinned manifest digest when only a unit phase worker binding changes", () => {
+    const base = validateAndCompileExecutionGraph(minimalUnitGraph({
+      worker: { model: "gpt-5" },
+    }));
+    const changed = validateAndCompileExecutionGraph(minimalUnitGraph({
+      worker: { model: "gpt-5-mini" },
+    }));
+
+    expect(base.manifest.manifest.stages[0]?.unitPhases).toEqual(changed.manifest.manifest.stages[0]?.unitPhases);
+    expect(base.manifest.manifest.stages[0]?.unitCommandNames).toEqual(changed.manifest.manifest.stages[0]?.unitCommandNames);
+    expect(base.manifest.manifest.stages[0]?.unitPhaseBindings?.[0]).toMatchObject({
+      id: "implement",
+      worker: { model: "gpt-5" },
+    });
+    expect(changed.manifest.manifest.stages[0]?.unitPhaseBindings?.[0]).toMatchObject({
+      id: "implement",
+      worker: { model: "gpt-5-mini" },
+    });
+    expect(base.manifest.digest).not.toEqual(changed.manifest.digest);
+  });
+
+  it("pins repository skill package identity inside unit phase bindings", () => {
+    const pkg = repositorySkillPackage();
+    const compiled = validateAndCompileExecutionGraph(minimalUnitGraph({
+      worker: {
+        skills: ["repo://implement_unit"],
+        credentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+      },
+      loop: { skill: "repo://implement_unit" },
+    }), {
+      repositorySkills: new Map([["implement_unit", pkg]]),
+    });
+
+    expect(compiled.manifest.manifest.requires.capabilities).toEqual([
+      "ce/review@1",
+      "graph/for-each-unit@1",
+      REPOSITORY_SKILL_CAPABILITY,
+    ]);
+    expect(compiled.manifest.manifest.stages[0]?.unitPhaseBindings?.[0]).toMatchObject({
+      id: "implement",
+      kind: "agent",
+      executor: { kind: "agent", capability: REPOSITORY_SKILL_CAPABILITY },
+      repositorySkill: pkg,
+    });
+    expect(compiled.unitPhaseBindings[0]).toMatchObject({
+      id: "implement",
+      repositorySkill: pkg,
+    });
+  });
+
+  it("rejects gate phases whose worker requests write credentials", () => {
+    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+      leadWorker: { credentials: ["model.invoke", "repo.read", "repo.write"] },
+    }))).toThrow(/graph\.nodes\.units\.phases\[2\]\.worker\.credentials: gate phases cannot request repo\.write/);
+  });
+
+  it("rejects gate phases whose capability requires write credentials", () => {
+    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+      leadWorker: {
+        skills: ["builtin://ce/implement@1"],
+        credentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+      },
+      leadLoop: { skill: "builtin://ce/implement@1" },
+    }))).toThrow(/graph\.nodes\.units\.phases\[2\]\.worker\.credentials: gate phases cannot request repo\.write/);
+
+    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+      leadWorker: {
+        skills: ["builtin://ce/implement@1"],
+        credentials: ["model.invoke", "provider.read", "repo.read"],
+      },
+      leadLoop: { skill: "builtin://ce/implement@1" },
+    }))).toThrow(/graph\.nodes\.units\.phases\.2\.skill: ce\/implement@1 requires repo\.write and cannot be used for gate phases/);
+  });
+
+  it("rejects accept-unit gate phases that violate the shared credential contract", () => {
+    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+      leadWorker: {
+        skills: ["builtin://accept-unit@1"],
+        credentials: ["repo.read"],
+      },
+      leadLoop: { skill: "builtin://accept-unit@1" },
+    }))).toThrow(/graph\.loops\.lead-loop: accept-unit@1 requires credential scope model\.invoke/);
+
+    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+      leadWorker: {
+        skills: ["builtin://accept-unit@1"],
+        credentials: ["model.invoke", "repo.read", "provider.read"],
+      },
+      leadLoop: { skill: "builtin://accept-unit@1" },
+    }))).toThrow(/graph\.loops\.lead-loop: accept-unit@1 is not authorized for credential scope provider\.read/);
   });
 
   it("compiles repository skills to the platform repository-skill capability with pinned package identity", () => {
@@ -270,8 +451,22 @@ describe("execution graph compiler", () => {
   it.each([
     [
       "for_each_unit nodes",
-      minimalGraph({ node: { kind: "for_each_unit" } }),
-      /graph\.loops\.loop\.input_scope: for_each_unit requires unit input scope/,
+      minimalGraph({
+        worker: {
+          credentials: ["model.invoke", "repo.read"],
+        },
+        node: {
+          kind: "for_each_unit",
+          loop: undefined,
+          phases: [
+            { id: "implement", kind: "agent", loop: "loop" },
+            { id: "candidate", kind: "evidence" },
+            { id: "lead", kind: "gate", loop: "loop" },
+            { id: "integrate", kind: "integrate" },
+          ],
+        },
+      }),
+      /graph\.loops\.loop\.input_scope: for_each_unit phases require unit input scope/,
     ],
     [
       "human nodes",
@@ -324,6 +519,20 @@ describe("execution graph compiler", () => {
         },
       }),
       /graph\.loops\.loop: ce\/review@1 requires credential scope model\.invoke/,
+    ],
+    [
+      "unsupported loop artifacts",
+      minimalGraph({
+        worker: {
+          skills: ["builtin://ce/plan@1"],
+          credentials: ["model.invoke", "repo.read"],
+        },
+        loop: {
+          skill: "builtin://ce/plan@1",
+          receipt: "semantic_review",
+        },
+      }),
+      /graph\.loops\.loop: ce\/plan@1 cannot produce required artifact review/,
     ],
     [
       "unknown command inventory names",

@@ -3,6 +3,41 @@ import { describe, expect, it, vi } from "vitest";
 import { createDaytonaSandboxRuntime } from "./adapter.js";
 import { canonicalJson, digestNormalized } from "../../pipeline/manifest.js";
 import { STAGE_EXECUTOR_PROTOCOL, createStageRequestHash, type StageRequestEnvelope } from "../../pipeline/stage-request.js";
+import type { LoopActionRequest } from "../../runtime/contracts.js";
+
+function fencedLoopRequest(overrides: Partial<Omit<LoopActionRequest, "requestHash" | "idempotencyKey">> = {}): LoopActionRequest {
+  const withoutFence = {
+    protocol: "loop-action@2" as const,
+    actionId: "loop-1",
+    attemptId: "attempt-child",
+    graphId: "graph-1",
+    unitId: "unit-1",
+    role: "worker" as const,
+    loop: "implement" as const,
+    agent: "codex" as const,
+    skill: "ce-work",
+    worktree: { id: "worktree-1" },
+    candidateSubject: null,
+    nativeSessionId: null,
+    contextPolicy: "prefer_resume" as const,
+    timeoutMs: 30_000,
+    transitionContext: "implement unit",
+    allowedMcpServers: ["github"],
+    credentialScopes: ["model.invoke", "repo.read", "repo.write"] as const,
+    receiptSchema: "openthrottle.receipt/v1",
+    ...overrides,
+  } as Omit<LoopActionRequest, "requestHash" | "idempotencyKey">;
+  const { candidateSubject, ...withoutCandidateSubject } = withoutFence;
+  const hashInput = candidateSubject === null || candidateSubject === undefined
+    ? withoutCandidateSubject
+    : withoutFence;
+  const requestHash = digestNormalized(canonicalJson(hashInput));
+  return {
+    ...withoutFence,
+    requestHash,
+    idempotencyKey: `loop:${withoutFence.attemptId}:${withoutFence.actionId}:${requestHash}`,
+  };
+}
 
 describe("Daytona stage execution", () => {
   it("implements the opaque, fenced one-stage lifecycle without leaking provider details", async () => {
@@ -156,34 +191,9 @@ describe("Daytona stage execution", () => {
       120
     );
 
-    const loopWithoutFence = {
-      protocol: "loop-action@2" as const,
-      actionId: "loop-1",
-      attemptId: "attempt-child",
-      graphId: "graph-1",
-      unitId: "unit-1",
-      role: "worker" as const,
-      loop: "implement" as const,
-      agent: "codex" as const,
-      skill: "ce-work",
+    const loopRequest = fencedLoopRequest({
       worktree,
-      nativeSessionId: null,
-      contextPolicy: "prefer_resume" as const,
-      timeoutMs: 30_000,
-      transitionContext: "implement unit",
-      allowedMcpServers: ["github"],
-      credentialScopes: ["model.invoke", "repo.read", "repo.write"] as const,
-      receiptSchema: "openthrottle.receipt/v1",
-      requestHash: "",
-      idempotencyKey: "",
-    };
-    const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...loopCanonicalFence } = loopWithoutFence;
-    const loopHash = digestNormalized(canonicalJson(loopCanonicalFence));
-    const loopRequest = {
-      ...loopWithoutFence,
-      requestHash: loopHash,
-      idempotencyKey: `loop:attempt-child:loop-1:${loopHash}`,
-    };
+    });
     await expect(runtime.dispatchLoopAction(resource, loopRequest)).resolves.toEqual({
       providerDispatchId: "dispatch-opaque-1",
     });
@@ -277,40 +287,20 @@ describe("Daytona stage execution", () => {
       `then rm -f .*${escapeForRegExp(stagedCredentialsPath)}.*${escapeForRegExp(stagedRequestPath)}.*; exit 0; fi`
     ));
 
-    const loopWithOpencodeAgent = {
-      ...loopWithoutFence,
+    const loopWithOpencodeAgent = fencedLoopRequest({
       actionId: "loop-opencode",
       agent: "opencode" as const,
-    };
-    const {
-      requestHash: _opencodeRequestHash,
-      idempotencyKey: _opencodeIdempotencyKey,
-      ...canonicalOpencode
-    } = loopWithOpencodeAgent;
-    const opencodeHash = digestNormalized(canonicalJson(canonicalOpencode));
-    await expect(runtime.dispatchLoopAction(resource, {
-      ...loopWithOpencodeAgent,
-      requestHash: opencodeHash,
-      idempotencyKey: `loop:attempt-child:loop-opencode:${opencodeHash}`,
-    })).rejects.toThrow(/opencode loop actions are not supported/);
+      worktree,
+    });
+    await expect(runtime.dispatchLoopAction(resource, loopWithOpencodeAgent))
+      .rejects.toThrow(/opencode loop actions are not supported/);
 
-    const loopWithNullCandidateSubject = {
-      ...loopWithoutFence,
+    const loopWithNullCandidateSubject = fencedLoopRequest({
       actionId: "loop-null-candidate",
+      worktree,
       candidateSubject: null,
-    };
-    const {
-      requestHash: _nullRequestHash,
-      idempotencyKey: _nullIdempotencyKey,
-      candidateSubject: _candidateSubject,
-      ...canonicalNullCandidate
-    } = loopWithNullCandidateSubject;
-    const nullCandidateHash = digestNormalized(canonicalJson(canonicalNullCandidate));
-    await expect(runtime.dispatchLoopAction(resource, {
-      ...loopWithNullCandidateSubject,
-      requestHash: nullCandidateHash,
-      idempotencyKey: `loop:attempt-child:loop-null-candidate:${nullCandidateHash}`,
-    })).resolves.toEqual({
+    });
+    await expect(runtime.dispatchLoopAction(resource, loopWithNullCandidateSubject)).resolves.toEqual({
       providerDispatchId: "dispatch-opaque-1",
     });
 
@@ -479,6 +469,40 @@ describe("Daytona stage execution", () => {
     const request = { ...withoutFence, requestHash: hash, idempotencyKey: `loop:attempt-forbidden:loop-forbidden:${hash}` };
     await expect(runtime.dispatchLoopAction({ providerResourceId: "provider-opaque-loop-forbidden" }, request))
       .rejects.toThrow(/forbidden sandbox variable DAYTONA_API_KEY for loop action loop-forbidden/);
+    expect(sandbox.fs.uploadFile).not.toHaveBeenCalled();
+  });
+
+  it("refuses lead loop write credentials before materializing credentials", async () => {
+    const sandbox = {
+      id: "provider-opaque-lead-write",
+      state: "started",
+      autoStopInterval: 60,
+      setAutostopInterval: vi.fn(async () => undefined),
+      fs: { createFolder: vi.fn(async () => undefined), uploadFile: vi.fn(async () => undefined), setFilePermissions: vi.fn(async () => undefined) },
+      process: { executeSessionCommand: vi.fn(async () => ({ cmdId: "dispatch" })), createSession: vi.fn(async () => undefined) },
+    } as unknown as Sandbox;
+    const materializeCredentialEnv = vi.fn(async () => ({ env: { GITHUB_TOKEN: "secret-token" } }));
+    const runtime = createDaytonaSandboxRuntime({ get: vi.fn(async () => sandbox) } as never, {
+      snapshot: "snapshot-v1",
+      materializeCredentialEnv,
+    });
+    const request = fencedLoopRequest({
+      actionId: "loop-lead-write",
+      attemptId: "attempt-lead-write",
+      role: "lead" as const,
+      loop: "lead" as const,
+      skill: "accept-unit",
+      worktree: null,
+      candidateSubject: "a".repeat(40),
+      contextPolicy: "fresh" as const,
+      transitionContext: "",
+      allowedMcpServers: [],
+      credentialScopes: ["model.invoke", "repo.read", "repo.write"],
+    });
+
+    await expect(runtime.dispatchLoopAction({ providerResourceId: "provider-opaque-lead-write" }, request))
+      .rejects.toThrow(/lead loop actions cannot request repo\.write/);
+    expect(materializeCredentialEnv).not.toHaveBeenCalled();
     expect(sandbox.fs.uploadFile).not.toHaveBeenCalled();
   });
 

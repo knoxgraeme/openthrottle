@@ -1,10 +1,17 @@
 import type Database from "better-sqlite3";
-import { canonicalJson, type StageOutcome } from "../../pipeline/manifest.js";
+import {
+  canonicalJson,
+  type PipelineUnitPhaseBinding,
+  type StageOutcome,
+  unitPhaseBindingCommandNames,
+  unitPhaseBindingIds,
+} from "../../pipeline/manifest.js";
 import { buildExecutionPublicationSnapshot } from "../../pipeline/execution-publication.js";
 import type { ExecutionGateDecision } from "../../pipeline/execution-gates.js";
 import {
   decideDownstreamContext,
   deriveUnitTerminalState,
+  assertValidUnitPhaseSequence,
   nextUnitPhase,
   routeFinalReviewDecision,
   routeIntegrationDecision,
@@ -16,6 +23,7 @@ import {
   type ExecutionUnitState,
   type FinalPhase,
   type UnitActionKind,
+  type UnitPhase,
   type UnitTerminalReason,
 } from "../../pipeline/unit-coordinator.js";
 import { deterministicId } from "./helpers.js";
@@ -29,7 +37,10 @@ import {
   listUnitRowsForParentAttempt,
   loadActiveAction,
   markActionCompleted,
+  nextUnitPhaseAfterCompletion,
   PHASE_FOR_COMPLETING_ACTION_KIND,
+  phaseSequenceOf,
+  unitPhasesOf,
   unitState,
   type ExecutionUnitRow,
 } from "./unit-store-phase-reducer.js";
@@ -45,6 +56,8 @@ export interface ExecutionUnitGraph {
   graph_digest: string;
   plan_digest: string;
   command_names: string;
+  unit_phases: string;
+  unit_phase_bindings: string;
   max_repair_rounds: number;
   final_phase: FinalPhase | null;
   final_command_index: number;
@@ -132,6 +145,8 @@ export interface ExecutionUnitStore {
     planDigest: string;
     units: readonly ExecutionPlanUnit[];
     commandNames?: readonly string[];
+    unitPhases?: readonly UnitPhase[];
+    unitPhaseBindings?: readonly PipelineUnitPhaseBinding[];
     maxRepairRounds?: number;
   }): ExecutionUnitGraph;
   getGraphForAttempt(parentAttemptId: string): ExecutionUnitGraph | undefined;
@@ -322,8 +337,29 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     }
   }
 
-  function assertGraphReplayMatches(input: Parameters<ExecutionUnitStore["createGraph"]>[0], existing: ExecutionUnitGraph): void {
-    const expectedCommandNames = canonicalJson([...(input.commandNames ?? [])]);
+  function assertGraphReplayMatches(
+    input: Parameters<ExecutionUnitStore["createGraph"]>[0],
+    existing: ExecutionUnitGraph,
+    phaseProjection: UnitPhaseProjection
+  ): void {
+    const expectedCommandNames = canonicalJson(phaseProjection.commandNames);
+    const persistedUnitPhases = unitPhasesOf(existing);
+    const requestedUnitPhases = phaseProjection.unitPhases.length > 0 ? phaseProjection.unitPhases : persistedUnitPhases;
+    const expectedUnitPhases = canonicalJson(requestedUnitPhases);
+    const expectedUnitPhaseBindings = canonicalJson([...phaseProjection.unitPhaseBindings]);
+    const legacyBuiltinUnitPhasesReplay =
+      persistedUnitPhases.length === 0 &&
+      expectedUnitPhases === canonicalJson(phaseSequenceOf(existing));
+    const unitPhaseBindingsMigratedAt = (db.prepare(
+      "SELECT applied_at FROM schema_migrations WHERE version = 21"
+    ).get() as { applied_at: string } | undefined)?.applied_at;
+    const legacyUnboundPhaseReplay =
+      existing.unit_phase_bindings === "[]" &&
+      unitPhaseBindingsMigratedAt !== undefined &&
+      existing.created_at < unitPhaseBindingsMigratedAt &&
+      phaseProjection.unitPhaseBindings.length > 0 &&
+      (existing.unit_phases === expectedUnitPhases || legacyBuiltinUnitPhasesReplay) &&
+      existing.command_names === expectedCommandNames;
     const expectedMaxRepairRounds = input.maxRepairRounds ?? DEFAULT_MAX_REPAIR_ROUNDS;
     if (
       existing.pipeline_instance_id !== input.pipelineInstanceId ||
@@ -332,6 +368,8 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       existing.graph_digest !== input.graphDigest ||
       existing.plan_digest !== input.planDigest ||
       existing.command_names !== expectedCommandNames ||
+      (existing.unit_phases !== expectedUnitPhases && !legacyBuiltinUnitPhasesReplay) ||
+      (existing.unit_phase_bindings !== expectedUnitPhaseBindings && !legacyUnboundPhaseReplay) ||
       existing.max_repair_rounds !== expectedMaxRepairRounds
     ) {
       throw new Error(`execution graph ${existing.id} replay fence mismatch`);
@@ -351,15 +389,55 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     }
   }
 
+  function assertUnitPhaseBindingsMatch(input: Parameters<ExecutionUnitStore["createGraph"]>[0]): void {
+    if (!input.unitPhaseBindings || input.unitPhaseBindings.length === 0) {
+      throw new Error("execution graph unitPhaseBindings are required");
+    }
+    if (
+      input.unitPhases &&
+      canonicalJson(unitPhaseBindingIds(input.unitPhaseBindings)) !== canonicalJson([...input.unitPhases])
+    ) {
+      throw new Error("execution graph unitPhaseBindings must match unitPhases");
+    }
+    const boundCommandNames = unitPhaseBindingCommandNames(input.unitPhaseBindings);
+    if (
+      input.commandNames &&
+      canonicalJson(boundCommandNames) !== canonicalJson([...input.commandNames])
+    ) {
+      throw new Error("execution graph unitPhaseBindings command phases must match commandNames");
+    }
+  }
+
+  type UnitPhaseProjection = {
+    commandNames: string[];
+    unitPhases: UnitPhase[];
+    unitPhaseBindings: readonly PipelineUnitPhaseBinding[];
+  };
+
+  function unitPhaseProjection(input: Parameters<ExecutionUnitStore["createGraph"]>[0]): UnitPhaseProjection {
+    assertUnitPhaseBindingsMatch(input);
+    const unitPhaseBindings = input.unitPhaseBindings!;
+    return {
+      commandNames: unitPhaseBindingCommandNames(unitPhaseBindings),
+      unitPhases: unitPhaseBindingIds(unitPhaseBindings),
+      unitPhaseBindings,
+    };
+  }
+
   const createGraph = db.transaction((input: Parameters<ExecutionUnitStore["createGraph"]>[0]): ExecutionUnitGraph => {
     const timestamp = now();
     const graphId = deterministicId("execution-graph", [input.pipelineInstanceId, input.parentAttemptId]);
+    const phaseProjection = unitPhaseProjection(input);
+    assertValidUnitPhaseSequence(phaseProjection.unitPhases);
     const existing = graphStmt.get(input.parentAttemptId) as ExecutionUnitGraph | undefined;
     if (existing) {
-      assertGraphReplayMatches(input, existing);
+      assertGraphReplayMatches(input, existing, phaseProjection);
       return existing;
     }
-    const commandNames = canonicalJson([...(input.commandNames ?? [])]);
+    const commandNames = canonicalJson(phaseProjection.commandNames);
+    const unitPhases = canonicalJson(phaseProjection.unitPhases);
+    const unitPhaseBindings = canonicalJson([...phaseProjection.unitPhaseBindings]);
+    const initialUnitPhase = phaseProjection.unitPhases[0] ?? "implement";
     const maxRepairRounds = input.maxRepairRounds ?? DEFAULT_MAX_REPAIR_ROUNDS;
     if (!Number.isInteger(maxRepairRounds) || maxRepairRounds < 0) {
       throw new Error("execution graph maxRepairRounds must be a non-negative integer");
@@ -367,8 +445,9 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     db.prepare(`
       INSERT INTO execution_graphs (
         id, pipeline_instance_id, parent_attempt_id, parent_stage_id, parent_run_id,
-        graph_digest, plan_digest, command_names, max_repair_rounds, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        graph_digest, plan_digest, command_names, unit_phases, unit_phase_bindings,
+        max_repair_rounds, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(parent_attempt_id) DO NOTHING
     `).run(
       graphId,
@@ -379,6 +458,8 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       input.graphDigest,
       input.planDigest,
       commandNames,
+      unitPhases,
+      unitPhaseBindings,
       maxRepairRounds,
       timestamp,
       timestamp
@@ -387,8 +468,8 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       db.prepare(`
         INSERT INTO execution_units (
           id, execution_graph_id, pipeline_instance_id, parent_attempt_id, unit_id,
-          authored_order, dependency_unit_ids, status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+          authored_order, dependency_unit_ids, status, phase, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
         ON CONFLICT(parent_attempt_id, unit_id) DO NOTHING
       `).run(
         deterministicId("execution-unit", [input.parentAttemptId, unit.id]),
@@ -398,6 +479,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         unit.id,
         index,
         canonicalJson([...(unit.dependencies ?? [])].sort()),
+        initialUnitPhase,
         timestamp,
         timestamp
       );
@@ -507,10 +589,20 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
           .run(timestamp, action.execution_unit_id);
       } else if (PHASE_FOR_COMPLETING_ACTION_KIND[action.action_kind]) {
         const currentPhase = PHASE_FOR_COMPLETING_ACTION_KIND[action.action_kind]!;
-        const next = nextUnitPhase(currentPhase);
+        const graph = graphStmt.get(action.parent_attempt_id) as ExecutionUnitGraph;
+        const nextPhase = nextUnitPhaseAfterCompletion(db, {
+          unitRowId: action.execution_unit_id,
+          currentPhase,
+          currentCycle: action.cycle,
+          phases: phaseSequenceOf(graph),
+        });
+        const next = nextPhase.phase;
         if (!next) throw new Error(`execution unit phase ${currentPhase} has no successor`);
-        db.prepare(`UPDATE execution_units SET phase = ?, updated_at = ? WHERE id = ?`)
-          .run(next, timestamp, action.execution_unit_id);
+        db.prepare(`
+          UPDATE execution_units
+          SET phase = ?, command_index = CASE WHEN ? = 1 THEN 0 ELSE command_index END, updated_at = ?
+          WHERE id = ?
+        `).run(next, nextPhase.resetCommandIndex ? 1 : 0, timestamp, action.execution_unit_id);
       } else {
         throw new Error(`execution work attempt ${input.actionId} action kind is not handled by completeUnitAction`);
       }
@@ -583,6 +675,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       }
 
       const graph = graphStmt.get(completedAction.parent_attempt_id) as ExecutionUnitGraph;
+      const phases = phaseSequenceOf(graph);
       if (input.decision.gateKind === "unit_acceptance") {
         const routing = routeUnitAcceptanceDecision({
           outcome: input.decision.outcome,
@@ -591,16 +684,18 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
           maxRepairRounds: graph.max_repair_rounds,
         });
         if (routing.action === "integrate") {
+          const next = nextUnitPhase("lead", phases);
+          if (next !== "integrate") throw new Error(`execution graph ${graph.id} lead phase does not route to integrate`);
           db.prepare(`
-            UPDATE execution_units SET phase = 'integrate', accepted_candidate_subject = ?, updated_at = ?
+            UPDATE execution_units SET phase = ?, accepted_candidate_subject = ?, updated_at = ?
             WHERE id = ?
-          `).run(input.decision.subject, timestamp, unitRow.id);
+          `).run(next, input.decision.subject, timestamp, unitRow.id);
         } else if (routing.action === "repair") {
           db.prepare(`
             UPDATE execution_units
-            SET phase = 'implement', current_cycle = current_cycle + 1, command_index = 0, repair_rounds = ?, updated_at = ?
+            SET phase = ?, current_cycle = current_cycle + 1, command_index = 0, repair_rounds = ?, updated_at = ?
             WHERE id = ?
-          `).run(routing.repairRounds, timestamp, unitRow.id);
+          `).run("implement", routing.repairRounds, timestamp, unitRow.id);
         } else if (routing.action === "settle") {
           settleUnitRow({ parentAttemptId: completedAction.parent_attempt_id, unitId: unitRow.unit_id, reason: "defect", timestamp });
           settleStructurallyBlockedDependents(completedAction.parent_attempt_id, timestamp);

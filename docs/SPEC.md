@@ -134,6 +134,28 @@ execution) remains fail closed in production: the descriptor omits it until
 the composition root that constructs and drains the child unit runtime is
 installed, so admission and the CLI's pre-mutation ship check (below) both
 continue to reject an explicit structured selection before any Linear access.
+For a `for_each_unit` node, the repository graph owns the ordered `phases`
+array. The platform owns the closed mechanism vocabulary and the security
+contract behind each mechanism:
+
+- `agent`: one sealed `loop-action@2` invocation in the unit worktree, using a
+  declared unit loop and its pinned worker/skill/MCP/credential/session scope.
+- `command`: one or more repository-configured command names, run by the
+  executor without model credentials.
+- `evidence`: executor-derived typed evidence such as candidate evidence.
+- `gate`: a read-only decision phase evaluated against required receipts by
+  the supervisor gate code; graph configuration cannot waive receipt checks.
+- `integrate`: executor-only Git integration authority; this phase is never
+  agent-writable.
+
+The phase list is non-empty, bounded, and limited to the platform vocabulary.
+Agent and gate phases reference declared loops; command phases name configured
+repository commands. `implement`, `candidate`, `lead`, and `integrate` are
+required, `lead` immediately precedes `integrate`, `candidate` precedes `lead`,
+and `integrate` is the last unit phase. Repositories may remove optional phases
+such as `simplify` or move command phases earlier, but they cannot configure
+their way around candidate evidence, lead acceptance, or executor-only
+integration.
 
 Catalog aliases resolve to exact manifest id/version pairs. Repository config
 may override the implement or investigate alias, but cannot supply arbitrary
@@ -526,11 +548,12 @@ Stage C child-unit work must add any needed live binding state to the owning
 unit/work records rather than reviving empty historical binding tables.
 For the serial `for_each_unit` composite stage, `execution_graphs` binds one
 parent pipeline attempt/run to an immutable execution graph and plan digest,
-plus the pinned configured command names, the bounded max repair rounds, and
-the whole-change final phase (`command`/`review`/`repair`/`done`, `NULL` before
-the first unit integrates); `execution_units` stores the immutable unit
-projection, dependency list, authored order, active work pointer, current
-phase (`implement`/`simplify`/`command`/`candidate`/`lead`/`integrate`), current
+plus the graph-declared unit phase sequence, the pinned configured command
+names, the bounded max repair rounds, and the whole-change final phase
+(`command`/`review`/`repair`/`done`, `NULL` before the first unit integrates);
+`execution_units` stores the immutable unit projection, dependency list,
+authored order, active work pointer, current phase
+(`implement`/`simplify`/`command`/`candidate`/`lead`/`integrate`), current
 repair cycle, repair round count, command index, accepted/integration subjects,
 and terminal level/alarm fields; and `execution_work_attempts` stores each
 child action attempt with parent instance/attempt/run/unit fences, unit id
@@ -540,12 +563,13 @@ payload, result hash, output subject, receipt, and terminal/error state.
 Composite foreign keys bind every unit, action, receipt, and downstream
 context record to the same execution graph and parent attempt so cross-instance
 or mixed-attempt child identities are rejected durably. The durable unit
-reducer advances a unit through implement (or repair on re-entry), simplify,
-every configured command, executor candidate derivation, lead acceptance bound
-to that exact candidate subject and its command receipts, and only then
-integration; a `semantic_repair_required` lead decision returns the unit to a
-fresh implement/simplify/command cycle, bounded by the graph's max repair
-rounds, after which the unit settles as `failed`. Once every unit has settled,
+reducer advances a unit through the persisted graph-declared phase order:
+implement (or repair on re-entry), optional simplify, declared command slots,
+executor candidate derivation, lead acceptance bound to that exact candidate
+subject and its command receipts, and only then integration. A
+`semantic_repair_required` lead decision returns the unit to a fresh implement
+cycle with command index reset, bounded by the graph's max repair rounds, after
+which the unit settles as `failed`. Once every unit has settled,
 and at least one unit reached `completed`, the same fenced-action mechanics
 rerun the full configured commands and one fresh, report-only final review
 against the final integrated subject; a `semantic_repair_required` final

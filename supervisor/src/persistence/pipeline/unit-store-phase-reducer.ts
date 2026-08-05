@@ -1,8 +1,12 @@
 import type Database from "better-sqlite3";
 import { canonicalJson, digestNormalized, type StageOutcome } from "../../pipeline/manifest.js";
 import {
+  assertValidUnitPhaseSequence,
   actionKindForUnitPhase,
-  UNIT_PHASES,
+  BUILTIN_UNIT_PHASES,
+  nextUnitPhase,
+  nextUnitPhaseForCycle,
+  repairCyclePhaseSequence,
   type ChildGateDecision,
   type ChildGateEvaluatorKind,
   type ExecutionUnitState,
@@ -98,6 +102,91 @@ export function unitState(row: ExecutionUnitRow): ExecutionUnitState {
 
 export function commandNamesOf(graph: { command_names: string }): string[] {
   return parseJsonStringArray(graph.command_names);
+}
+
+export function unitPhasesOf(graph: { unit_phases?: string }): UnitPhase[] {
+  const value = graph.unit_phases ? JSON.parse(graph.unit_phases) as unknown : [];
+  if (!Array.isArray(value)) throw new Error("execution graph unit phases must be a JSON array");
+  const parsed = value.map((entry) => {
+    if (typeof entry !== "string") throw new Error("execution graph unit phases must contain only strings");
+    return entry;
+  });
+  const invalid = parsed.find((entry) => !BUILTIN_UNIT_PHASES.includes(entry as UnitPhase));
+  if (invalid) throw new Error(`execution graph unit phase ${invalid} is not recognized`);
+  const phases = parsed as UnitPhase[];
+  if (phases.length > 0) assertValidUnitPhaseSequence(phases);
+  return phases;
+}
+
+export function phaseSequenceOf(graph: { unit_phases?: string }): UnitPhase[] {
+  const phases = unitPhasesOf(graph);
+  return phases.length > 0 ? phases : [...BUILTIN_UNIT_PHASES];
+}
+
+function lastMutatingPhase(phases: readonly UnitPhase[]): UnitPhase {
+  return phases.includes("simplify") ? "simplify" : "implement";
+}
+
+function commandPrecedesFinalMutation(phases: readonly UnitPhase[]): boolean {
+  const commandIndex = phases.indexOf("command");
+  const finalMutationIndex = phases.indexOf(lastMutatingPhase(phases));
+  return commandIndex >= 0 && finalMutationIndex >= 0 && commandIndex < finalMutationIndex;
+}
+
+function completedFinalMutationExistsInCycle(
+  db: Database.Database,
+  input: { unitRowId: string; cycle: number; phase: UnitPhase }
+): boolean {
+  const actionKind = actionKindForUnitPhase(input.phase, input.cycle);
+  return Boolean(db.prepare(`
+    SELECT 1 FROM execution_work_attempts
+    WHERE execution_unit_id = ?
+      AND cycle = ?
+      AND action_kind = ?
+      AND status = 'completed'
+    LIMIT 1
+  `).get(input.unitRowId, input.cycle, actionKind));
+}
+
+export function nextUnitPhaseAfterCompletion(
+  db: Database.Database,
+  input: {
+    unitRowId: string;
+    currentPhase: UnitPhase;
+    currentCycle: number;
+    phases: readonly UnitPhase[];
+  }
+): { phase: UnitPhase | undefined; resetCommandIndex: boolean } {
+  const finalMutation = lastMutatingPhase(input.phases);
+  const commandRefreshRequired = commandPrecedesFinalMutation(input.phases);
+  if (input.currentPhase === "command" && commandRefreshRequired) {
+    if (completedFinalMutationExistsInCycle(db, {
+      unitRowId: input.unitRowId,
+      cycle: input.currentCycle,
+      phase: finalMutation,
+    })) {
+      return {
+        phase: nextUnitPhase("command", repairCyclePhaseSequence(input.phases)),
+        resetCommandIndex: false,
+      };
+    }
+    return {
+      phase: nextUnitPhase("command", input.phases),
+      resetCommandIndex: false,
+    };
+  }
+
+  if (
+    commandRefreshRequired &&
+    input.currentPhase === finalMutation
+  ) {
+    return { phase: "command", resetCommandIndex: true };
+  }
+
+  return {
+    phase: nextUnitPhaseForCycle(input.currentPhase, input.currentCycle, input.phases),
+    resetCommandIndex: false,
+  };
 }
 
 export function listUnitRowsForParentAttempt(db: Database.Database, parentAttemptId: string): ExecutionUnitRow[] {
@@ -220,11 +309,19 @@ export function createOrResumeUnitAction(
 ): ExecutionWorkAttempt {
   let unitRow = input.unitRow;
   const commandNames = commandNamesOf(input.graph);
-  for (let guard = 0; guard < UNIT_PHASES.length + commandNames.length + 1; guard += 1) {
+  const phases = phaseSequenceOf(input.graph);
+  for (let guard = 0; guard < phases.length + commandNames.length + 1; guard += 1) {
     if (unitRow.phase === "command" && unitRow.command_index >= commandNames.length) {
-      db.prepare(`UPDATE execution_units SET phase = 'candidate', updated_at = ? WHERE id = ?`)
-        .run(input.nowIso, unitRow.id);
-      unitRow = { ...unitRow, phase: "candidate" };
+      const next = nextUnitPhaseAfterCompletion(db, {
+        unitRowId: unitRow.id,
+        currentPhase: "command",
+        currentCycle: unitRow.current_cycle,
+        phases,
+      }).phase;
+      if (!next) throw new Error(`execution unit ${unitRow.unit_id} command phase has no successor`);
+      db.prepare(`UPDATE execution_units SET phase = ?, updated_at = ? WHERE id = ?`)
+        .run(next, input.nowIso, unitRow.id);
+      unitRow = { ...unitRow, phase: next };
       continue;
     }
     const actionKind = actionKindForUnitPhase(unitRow.phase, unitRow.current_cycle);

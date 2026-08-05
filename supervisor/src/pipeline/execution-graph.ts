@@ -3,8 +3,9 @@ import {
   parseGraphContract,
   validateGraphContract,
   type GraphContract,
-  type GraphLoop,
   type GraphNode,
+  type GraphUnitPhase,
+  type GraphUnitPhaseId,
   type GraphTransition,
   type GraphWorker,
   type RepositoryConfigContract,
@@ -21,11 +22,23 @@ import {
   type PipelineManifest,
   type PipelineStage,
   type PipelineTransition,
+  type PipelineUnitPhaseBinding,
   type RepositorySkillPackage,
   type RuntimeCapabilityInventory,
   type StageOutcome,
   type ValidatedPipelineManifest,
+  unitPhaseBindingCommandNames,
+  unitPhaseBindingIds,
 } from "./manifest.js";
+import {
+  FOR_EACH_UNIT_CAPABILITY,
+  REPOSITORY_SKILL_CAPABILITY,
+  capabilityCredentialContract,
+  capabilityCredentialContractViolations,
+  capabilityRequiresCredential,
+} from "./capability-contracts.js";
+
+export { FOR_EACH_UNIT_CAPABILITY, REPOSITORY_SKILL_CAPABILITY } from "./capability-contracts.js";
 
 export interface CompileExecutionGraphOptions {
   id?: string;
@@ -41,15 +54,10 @@ export interface CompileExecutionGraphOptions {
 export interface CompiledExecutionGraph {
   graph: GraphContract;
   graphDigest: string;
+  unitPhases: readonly GraphUnitPhaseId[];
+  unitCommandNames: readonly CommandName[];
+  unitPhaseBindings: readonly PipelineUnitPhaseBinding[];
   manifest: ValidatedPipelineManifest;
-}
-
-export const FOR_EACH_UNIT_CAPABILITY = "graph/for-each-unit@1";
-export const REPOSITORY_SKILL_CAPABILITY = "agent/repository-skill@1";
-
-interface ResolvedUnitLoop {
-  loop: GraphLoop;
-  worker: GraphWorker;
 }
 
 type StageTemplate = {
@@ -60,7 +68,11 @@ type StageTemplate = {
   live_steering: boolean;
   credentials: string[];
   produces: ArtifactKind[];
+  requiredCapabilities?: readonly string[];
   commandName?: CommandName;
+  unitPhases?: readonly GraphUnitPhaseId[];
+  unitCommandNames?: readonly CommandName[];
+  unitPhaseBindings?: readonly PipelineUnitPhaseBinding[];
 };
 
 type PublicGraphOutcome = "success" | "no_change" | "repair_required" | "needs_human" | "retryable_failure" | "failure";
@@ -78,50 +90,6 @@ const DEFAULT_TERMINALS: Pick<Record<StageOutcome, PipelineTransition>, "needs_h
   needs_human: { terminal: "needs_human" },
   canceled: { terminal: "canceled" },
   superseded: { terminal: "superseded" },
-};
-
-const CAPABILITY_CREDENTIALS: Record<string, {
-  minimum: readonly string[];
-  allowed: readonly string[];
-  contexts: readonly ContextPolicy[];
-  artifacts: readonly ArtifactKind[];
-}> = {
-  "ce/implement@1": {
-    minimum: ["model.invoke", "provider.read", "repo.read", "repo.write"],
-    allowed: ["model.invoke", "provider.read", "repo.read", "repo.write"],
-    contexts: ["fresh", "resume_required", "prefer_resume"],
-    artifacts: ["stage_result", "review"],
-  },
-  "ce/investigate@1": {
-    minimum: ["model.invoke", "provider.read", "repo.read", "repo.write"],
-    allowed: ["model.invoke", "provider.read", "repo.read", "repo.write"],
-    contexts: ["fresh", "resume_required", "prefer_resume"],
-    artifacts: ["stage_result", "review"],
-  },
-  "ce/review@1": {
-    minimum: ["model.invoke", "repo.read"],
-    allowed: ["model.invoke", "repo.read", "repo.write"],
-    contexts: ["fresh", "resume_required", "prefer_resume"],
-    artifacts: ["stage_result", "review"],
-  },
-  "ce/simplify@1": {
-    minimum: ["model.invoke", "repo.read"],
-    allowed: ["model.invoke", "repo.read", "repo.write"],
-    contexts: ["resume_required", "prefer_resume"],
-    artifacts: ["stage_result"],
-  },
-  [FOR_EACH_UNIT_CAPABILITY]: {
-    minimum: ["repo.read", "repo.write"],
-    allowed: ["repo.read", "repo.write", "provider.read"],
-    contexts: ["none"],
-    artifacts: ["stage_result", "execution_graph_result"],
-  },
-  [REPOSITORY_SKILL_CAPABILITY]: {
-    minimum: ["model.invoke", "repo.read"],
-    allowed: ["model.invoke", "provider.read", "repo.read", "repo.write", "mcp"],
-    contexts: ["fresh", "resume_required", "prefer_resume"],
-    artifacts: ["stage_result", "review"],
-  },
 };
 
 function fail(path: string, message: string): never {
@@ -196,25 +164,28 @@ function assertNoDependencies(node: GraphNode): void {
 }
 
 function assertCapabilityAuthorized(template: StageTemplate, path: string): void {
-  const contract = CAPABILITY_CREDENTIALS[template.executor.capability];
-  if (!contract) return;
-  if (!contract.contexts.includes(template.context)) {
-    fail(path, `${template.executor.capability} does not support context policy ${template.context}`);
+  for (const violation of capabilityCredentialContractViolations({
+    capability: template.executor.capability,
+    context: template.context,
+    credentials: template.credentials,
+    requiredArtifacts: template.evaluator.required_artifacts,
+  })) {
+    fail(path, violation.message);
   }
-  for (const credential of contract.minimum) {
-    if (!template.credentials.includes(credential)) {
-      fail(path, `${template.executor.capability} requires credential scope ${credential}`);
-    }
+}
+
+function assertGateReadOnly(
+  phase: GraphUnitPhase,
+  worker: GraphWorker,
+  capability: string,
+  path: string
+): void {
+  if (phase.kind !== "gate") return;
+  if (worker.credentials.includes("repo.write")) {
+    fail(`${path}.worker.credentials`, "gate phases cannot request repo.write");
   }
-  for (const credential of template.credentials) {
-    if (!contract.allowed.includes(credential)) {
-      fail(path, `${template.executor.capability} is not authorized for credential scope ${credential}`);
-    }
-  }
-  for (const artifact of template.evaluator.required_artifacts) {
-    if (!contract.artifacts.includes(artifact)) {
-      fail(path, `${template.executor.capability} cannot produce required artifact ${artifact}`);
-    }
+  if (capabilityRequiresCredential(capability, "repo.write")) {
+    fail(`${path}.skill`, `${capability} requires repo.write and cannot be used for gate phases`);
   }
 }
 
@@ -282,27 +253,94 @@ function loopTemplate(
   return template;
 }
 
-function unitLoop(graph: GraphContract, node: GraphNode): ResolvedUnitLoop {
-  const loop = graph.loops.find((candidate) => candidate.id === node.loop);
-  if (!loop) fail(`graph.nodes.${node.id}.loop`, "references an unknown loop");
+function unitPhaseLoop(
+  graph: GraphContract,
+  node: GraphNode,
+  phase: GraphUnitPhase,
+  index: number,
+  repositorySkills?: ReadonlyMap<string, RepositorySkillPackage>
+): PipelineUnitPhaseBinding {
+  const loop = graph.loops.find((candidate) => candidate.id === phase.loop);
+  if (!loop) fail(`graph.nodes.${node.id}.phases.${index}.loop`, "references an unknown loop");
   if (loop.input_scope !== "unit") {
-    fail(`graph.loops.${loop.id}.input_scope`, "for_each_unit requires unit input scope");
+    fail(`graph.loops.${loop.id}.input_scope`, "for_each_unit phases require unit input scope");
   }
-  if (loop.receipt !== "unit_completion") {
-    fail(`graph.loops.${loop.id}.receipt`, "for_each_unit requires unit_completion receipts");
+  if (phase.kind === "agent" && loop.receipt !== "unit_completion") {
+    fail(`graph.loops.${loop.id}.receipt`, "for_each_unit agent phases require unit_completion receipts");
+  }
+  if (phase.kind === "gate" && loop.receipt !== "unit_decision") {
+    fail(`graph.loops.${loop.id}.receipt`, "for_each_unit gate phases require unit_decision receipts");
   }
   const worker = graph.workers.find((candidate) => candidate.id === loop.worker);
   if (!worker) fail(`graph.loops.${loop.id}.worker`, "references an unknown worker");
-  if (worker.engine !== "agent") fail(`graph.workers.${worker.id}.engine`, "for_each_unit requires an agent worker");
-  if (loop.skill !== "builtin://ce/implement@1") {
-    fail(`graph.loops.${loop.id}.skill`, "for_each_unit requires builtin://ce/implement@1");
-  }
-  return { loop, worker };
+  if (worker.engine !== "agent") fail(`graph.workers.${worker.id}.engine`, "for_each_unit phases require an agent worker");
+  const { capability, repositorySkill } = capabilityFromSkill(loop.skill, `graph.loops.${loop.id}.skill`, repositorySkills);
+  const context = contextFromSessionScope(worker);
+  const kind = phase.kind as "agent" | "gate";
+  assertGateReadOnly(phase, worker, capability, `graph.nodes.${node.id}.phases.${index}`);
+  assertCapabilityAuthorized({
+    executor: { kind: "agent", capability },
+    evaluator: {
+      kind: "semantic",
+      assurance: "semantic_attested",
+      required_artifacts: ["stage_result"],
+    },
+    context,
+    live_steering: false,
+    credentials: worker.credentials,
+    produces: ["stage_result"],
+  }, `graph.loops.${loop.id}`);
+  return {
+    id: phase.id,
+    kind,
+    loop: {
+      id: loop.id,
+      skill: loop.skill,
+      input_scope: "unit",
+      receipt: loop.receipt,
+      max_parallel: loop.max_parallel,
+      max_rounds: loop.max_rounds,
+      timeout_seconds: loop.timeout_seconds,
+    },
+    worker: {
+      id: worker.id,
+      engine: "agent",
+      ...(worker.agent === undefined ? {} : { agent: worker.agent }),
+      ...(worker.model === undefined ? {} : { model: worker.model }),
+      allowed_mcp_servers: [...worker.allowed_mcp_servers],
+      session_scope: worker.session_scope,
+      credentials: [...worker.credentials],
+    },
+    executor: { kind: "agent", capability },
+    context,
+    credentials: [...worker.credentials],
+    ...(repositorySkill === undefined ? {} : { repositorySkill }),
+  };
 }
 
-function forEachUnitTemplate(graph: GraphContract, node: GraphNode): StageTemplate {
-  const { worker } = unitLoop(graph, node);
-  const allowedCredentials = new Set(CAPABILITY_CREDENTIALS[FOR_EACH_UNIT_CAPABILITY].allowed);
+function forEachUnitTemplate(
+  graph: GraphContract,
+  node: GraphNode,
+  config?: RepositoryConfigContract,
+  repositorySkills?: ReadonlyMap<string, RepositorySkillPackage>
+): StageTemplate {
+  if (!node.phases) fail(`graph.nodes.${node.id}.phases`, "is required for for_each_unit nodes");
+  const unitPhaseBindings = node.phases.map((phase, index): PipelineUnitPhaseBinding => {
+    if (phase.kind === "agent" || phase.kind === "gate") return unitPhaseLoop(graph, node, phase, index, repositorySkills);
+    if (phase.kind === "command") {
+      return {
+        id: phase.id,
+        kind: phase.kind,
+        commands: (phase.commands ?? []).map((command) =>
+          commandNameFromGraph(command, `graph.nodes.${node.id}.phases.${index}.commands`, config)),
+      };
+    }
+    return { id: phase.id, kind: phase.kind };
+  });
+  const credentialScopes = unitPhaseBindings.flatMap((binding) =>
+    binding.kind === "agent" || binding.kind === "gate" ? binding.worker.credentials : []);
+  const allowedCredentials = new Set(capabilityCredentialContract(FOR_EACH_UNIT_CAPABILITY)!.allowed);
+  const unitCommandNames = unitPhaseBindingCommandNames(unitPhaseBindings);
   const template: StageTemplate = {
     executor: { kind: "loop_action", capability: FOR_EACH_UNIT_CAPABILITY },
     evaluator: {
@@ -312,8 +350,16 @@ function forEachUnitTemplate(graph: GraphContract, node: GraphNode): StageTempla
     },
     context: "none",
     live_steering: false,
-    credentials: [...new Set(worker.credentials.filter((scope) => allowedCredentials.has(scope)))],
+    credentials: [...new Set(credentialScopes.filter((scope) => allowedCredentials.has(scope)))],
     produces: ["stage_result", "execution_graph_result"],
+    requiredCapabilities: [
+      FOR_EACH_UNIT_CAPABILITY,
+      ...unitPhaseBindings.flatMap((binding) =>
+        binding.kind === "agent" || binding.kind === "gate" ? [binding.executor.capability] : []),
+    ],
+    unitPhases: unitPhaseBindingIds(unitPhaseBindings),
+    unitCommandNames,
+    unitPhaseBindings,
   };
   assertCapabilityAuthorized(template, `graph.nodes.${node.id}`);
   return template;
@@ -342,7 +388,7 @@ function nodeTemplate(
 ): StageTemplate {
   assertNoDependencies(node);
   if (node.kind === "run") return loopTemplate(graph, node, repositorySkills);
-  if (node.kind === "for_each_unit") return forEachUnitTemplate(graph, node);
+  if (node.kind === "for_each_unit") return forEachUnitTemplate(graph, node, config, repositorySkills);
   if (node.kind === "command") {
     return {
       executor: { kind: "command", capability: "command/run@1" },
@@ -384,6 +430,9 @@ function compileStage(node: GraphNode, template: StageTemplate): PipelineStage {
     id: node.id,
     executor: template.executor,
     ...(template.commandName === undefined ? {} : { commandName: template.commandName }),
+    ...(template.unitPhases === undefined ? {} : { unitPhases: [...template.unitPhases] }),
+    ...(template.unitCommandNames === undefined ? {} : { unitCommandNames: [...template.unitCommandNames] }),
+    ...(template.unitPhaseBindings === undefined ? {} : { unitPhaseBindings: [...template.unitPhaseBindings] }),
     ...(template.repositorySkill === undefined ? {} : { repositorySkill: template.repositorySkill }),
     evaluator: template.evaluator,
     context: template.context,
@@ -391,6 +440,21 @@ function compileStage(node: GraphNode, template: StageTemplate): PipelineStage {
     credentials: template.credentials,
     produces: template.produces,
     transitions: compileTransitions(node),
+  };
+}
+
+function unitPhaseProjectionFromManifest(manifest: PipelineManifest): Pick<
+  CompiledExecutionGraph,
+  "unitPhases" | "unitCommandNames" | "unitPhaseBindings"
+> {
+  const unitStage = manifest.stages.find((stage) =>
+    stage.executor.kind === "loop_action" && stage.executor.capability === FOR_EACH_UNIT_CAPABILITY
+  );
+  const unitPhaseBindings = unitStage?.unitPhaseBindings ?? [];
+  return {
+    unitPhases: unitPhaseBindingIds(unitPhaseBindings),
+    unitCommandNames: unitPhaseBindingCommandNames(unitPhaseBindings),
+    unitPhaseBindings,
   };
 }
 
@@ -409,7 +473,8 @@ export function compileExecutionGraph(
     ...(options.maxRepairRounds === undefined ? {} : { max_repair_rounds: options.maxRepairRounds }),
     requires: {
       protocol: "stage-executor@1",
-      capabilities: [...new Set(templates.map((template) => template.executor.capability))]
+      capabilities: [...new Set(templates.flatMap((template) =>
+        template.requiredCapabilities ?? [template.executor.capability]))]
         .sort((left, right) => {
           const leftOrder = capabilityOrder(left);
           const rightOrder = capabilityOrder(right);
@@ -429,10 +494,13 @@ export function parseAndCompileExecutionGraph(
   options: CompileExecutionGraphOptions & { source?: string } = {}
 ): CompiledExecutionGraph {
   const graph = parseGraphContract(raw, { source: options.source ?? "graph", config: options.config });
+  const compiledManifest = compileExecutionGraph(graph.value, options);
+  const unitPhaseProjection = unitPhaseProjectionFromManifest(compiledManifest.manifest);
   return {
     graph: graph.value,
     graphDigest: graph.digest,
-    manifest: compileExecutionGraph(graph.value, options),
+    ...unitPhaseProjection,
+    manifest: compiledManifest,
   };
 }
 
@@ -441,9 +509,12 @@ export function validateAndCompileExecutionGraph(
   options: CompileExecutionGraphOptions & { source?: string } = {}
 ): CompiledExecutionGraph {
   const graph = validateGraphContract(value, { source: options.source ?? "graph", config: options.config });
+  const compiledManifest = compileExecutionGraph(graph.value, options);
+  const unitPhaseProjection = unitPhaseProjectionFromManifest(compiledManifest.manifest);
   return {
     graph: graph.value,
     graphDigest: graph.digest,
-    manifest: compileExecutionGraph(graph.value, options),
+    ...unitPhaseProjection,
+    manifest: compiledManifest,
   };
 }

@@ -7,6 +7,7 @@ import {
   type PipelineStage,
   type StageOutcome,
 } from "./manifest.js";
+import { UNIT_PHASE_IDS, type GraphUnitPhaseId } from "@openthrottle/contracts";
 import type { PipelineCoordinatorEvent, PipelineEventArtifact } from "./coordinator.js";
 import {
   commandDecisionForEvidence,
@@ -25,8 +26,8 @@ export interface ExecutionPlanUnit {
 // candidate captures executor-verified subject evidence, lead binds a
 // scope-match decision to that exact candidate and its command receipts, and
 // only then may integrate run. See RR15/RAE10.
-export const UNIT_PHASES = ["implement", "simplify", "command", "candidate", "lead", "integrate"] as const;
-export type UnitPhase = (typeof UNIT_PHASES)[number];
+export const BUILTIN_UNIT_PHASES = UNIT_PHASE_IDS;
+export type UnitPhase = GraphUnitPhaseId;
 
 export const UNIT_ACTION_KINDS = [
   "implement", "repair", "simplify", "command", "candidate", "lead", "integrate",
@@ -62,8 +63,50 @@ export function actionKindForUnitPhase(phase: UnitPhase, currentCycle: number): 
   return phase;
 }
 
-export function nextUnitPhase(phase: UnitPhase): UnitPhase | undefined {
-  return UNIT_PHASES[UNIT_PHASES.indexOf(phase) + 1];
+export function nextUnitPhase(phase: UnitPhase, phases: readonly UnitPhase[] = BUILTIN_UNIT_PHASES): UnitPhase | undefined {
+  return phases[phases.indexOf(phase) + 1];
+}
+
+export function repairCyclePhaseSequence(phases: readonly UnitPhase[] = BUILTIN_UNIT_PHASES): UnitPhase[] {
+  const repairOrder: readonly UnitPhase[] = ["implement", "simplify", "command", "candidate", "lead", "integrate"];
+  return repairOrder.filter((phase) => phases.includes(phase));
+}
+
+export function nextUnitPhaseForCycle(
+  phase: UnitPhase,
+  currentCycle: number,
+  phases: readonly UnitPhase[] = BUILTIN_UNIT_PHASES
+): UnitPhase | undefined {
+  return nextUnitPhase(phase, currentCycle > 1 ? repairCyclePhaseSequence(phases) : phases);
+}
+
+export function assertValidUnitPhaseSequence(phases: readonly UnitPhase[]): void {
+  if (phases.length === 0) throw new Error("execution graph unit phases must not be empty");
+  const seen = new Set<UnitPhase>();
+  let integrateIndex = -1;
+  let leadIndex = -1;
+  let candidateIndex = -1;
+  let implementIndex = -1;
+  let simplifyIndex = -1;
+  for (const [index, phase] of phases.entries()) {
+    if (!BUILTIN_UNIT_PHASES.includes(phase)) throw new Error(`execution graph unit phase ${phase} is not recognized`);
+    if (seen.has(phase)) throw new Error("execution graph unit phases must not contain duplicate phases");
+    seen.add(phase);
+    if (phase === "implement") implementIndex = index;
+    if (phase === "simplify") simplifyIndex = index;
+    if (phase === "integrate") integrateIndex = index;
+    if (phase === "lead") leadIndex = index;
+    if (phase === "candidate") candidateIndex = index;
+  }
+  for (const required of ["implement", "candidate", "lead", "integrate"] as const) {
+    if (!seen.has(required)) throw new Error(`execution graph unit phases must include ${required}`);
+  }
+  if (integrateIndex !== phases.length - 1) throw new Error("execution graph integrate phase must be last");
+  if (simplifyIndex !== -1 && simplifyIndex < implementIndex) {
+    throw new Error("execution graph simplify phase must not precede implement");
+  }
+  if (leadIndex !== integrateIndex - 1) throw new Error("execution graph lead phase must immediately precede integrate");
+  if (candidateIndex !== leadIndex - 1) throw new Error("execution graph candidate phase must immediately precede lead");
 }
 
 export type UnitAcceptanceRouting =
@@ -72,10 +115,10 @@ export type UnitAcceptanceRouting =
   | { action: "settle"; reason: "defect" }
   | { action: "escalate"; reason: string };
 
-// Command failure (or any other non-accept lead result) repairs the unit --
-// back to a fresh implement/repair session, then re-simplify, then rerun
-// every configured command -- bounded by maxRepairRounds so a unit that
-// cannot converge settles as failed rather than looping forever.
+// Command failure (or any other non-accept lead result) repairs the unit back
+// to implement, then traverses the graph-declared repair-cycle sequence with
+// fresh evidence until candidate/lead/integrate. The max repair bound makes a
+// unit that cannot converge settle as failed instead of looping forever.
 export function routeUnitAcceptanceDecision(input: {
   outcome: StageOutcome;
   reason: string;

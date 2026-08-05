@@ -113,6 +113,17 @@ function request(overrides = {}) {
   return { ...withoutFence, ...createLoopRequestHash(withoutFence) };
 }
 
+function leadRequest(overrides = {}) {
+  return request({
+    role: "lead",
+    loop: "lead",
+    worktree: null,
+    candidateSubject: "a".repeat(40),
+    credentialScopes: ["model.invoke", "repo.read"],
+    ...overrides,
+  });
+}
+
 function repositorySkillPackage(repoDir, invocation = "implement_unit") {
   const skillPath = "skills/implement-unit/SKILL.md";
   const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
@@ -323,10 +334,10 @@ describe("loop action request validation", () => {
   });
 
   it("enforces role/worktree and session reuse rules", () => {
-    expect(() => validateLoopRequest(request({ role: "lead", loop: "lead", worktree: null, candidateSubject: "a".repeat(40) }))).not.toThrow();
-    expect(() => validateLoopRequest(request({ role: "lead", loop: "lead", worktree: null }))).toThrow(/candidate subject/);
+    expect(() => validateLoopRequest(leadRequest())).not.toThrow();
+    expect(() => validateLoopRequest(leadRequest({ candidateSubject: undefined }))).toThrow(/candidate subject/);
     expect(() => validateLoopRequest(request({ candidateSubject: "a".repeat(40) }))).toThrow(/candidate subject/);
-    expect(() => validateLoopRequest(request({ role: "lead", loop: "lead" }))).toThrow(/non-worker/);
+    expect(() => validateLoopRequest(leadRequest({ worktree: { id: "unit-1" } }))).toThrow(/non-worker/);
     expect(() => validateLoopRequest(request({ contextPolicy: "resume_required", nativeSessionId: null })))
       .toThrow(/missing its native session/);
     expect(() => validateLoopRequest(request({ transitionContext: undefined })))
@@ -420,6 +431,18 @@ describe("loop action request validation", () => {
   it("rejects a loop request declaring a credential scope outside the closed logical set", () => {
     expect(() => validateLoopRequest(request({ credentialScopes: ["daytona.admin"] })))
       .toThrow(/credential scope daytona\.admin is not a recognized logical credential/);
+  });
+
+  it("rejects lead loop requests carrying write credentials while preserving worker writes", () => {
+    expect(() => validateLoopRequest(leadRequest({
+      credentialScopes: ["model.invoke", "repo.read", "repo.write"],
+    }))).toThrow(/lead loop cannot request repo\.write/);
+
+    expect(() => validateLoopRequest(request({
+      role: "worker",
+      loop: "implement",
+      credentialScopes: ["model.invoke", "repo.read", "repo.write"],
+    }))).not.toThrow();
   });
 
   it("accepts every closed logical credential scope, including mcp", () => {

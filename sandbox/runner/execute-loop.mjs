@@ -318,6 +318,9 @@ export function validateLoopRequest(value) {
   if (!AGENTS.has(request.agent)) throw new Error("agent is invalid");
   const unknownScope = request.credentialScopes.find((scope) => !LOGICAL_CREDENTIAL_SCOPES.has(scope));
   if (unknownScope) throw new Error(`credential scope ${unknownScope} is not a recognized logical credential`);
+  if (request.role === "lead" && request.credentialScopes.includes("repo.write")) {
+    throw new Error("lead loop cannot request repo.write");
+  }
   if (request.agent === "opencode") {
     // OpenCode loop actions need database-backed session sealing and adapter
     // body delivery that RU5 does not provide; fail closed until that unit.

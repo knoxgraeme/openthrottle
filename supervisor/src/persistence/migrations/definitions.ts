@@ -1557,6 +1557,20 @@ const executionUnitPhaseMachineMigrationSource = `${executionUnitPhaseMachineSch
 phase-contract:each execution unit persists implement, simplify, command, candidate, lead, and integrate as fenced sequential phases/v1
 final-phase-contract:the whole-change final command, final review, and final repair phases persist on the execution graph and gate the aggregate/v1`;
 
+const executionGraphDeclaredUnitPhasesSchema = `
+ALTER TABLE execution_graphs ADD COLUMN unit_phases TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(unit_phases));
+`;
+
+const executionGraphDeclaredUnitPhasesMigrationSource = `${executionGraphDeclaredUnitPhasesSchema}
+unit-phase-sequence-contract:execution graphs persist their graph-declared ordered unit phase sequence independently of configured commands/v1`;
+
+const executionGraphUnitPhaseBindingsSchema = `
+ALTER TABLE execution_graphs ADD COLUMN unit_phase_bindings TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(unit_phase_bindings));
+`;
+
+const executionGraphUnitPhaseBindingsMigrationSource = `${executionGraphUnitPhaseBindingsSchema}
+unit-phase-binding-contract:execution graphs persist the full compiled ordered unit phase binding without rereading mutable graph data/v1`;
+
 function addExecutionGraphStopFence(db: Database.Database): void {
   if (!hasColumns(db, "execution_graphs", ["stopped_at"])) {
     db.exec("ALTER TABLE execution_graphs ADD COLUMN stopped_at TEXT");
@@ -2036,6 +2050,26 @@ const definitions: DatabaseMigrationDefinition[] = [
     source: executionUnitPhaseMachineMigrationSource,
     up(db) {
       db.exec(executionUnitPhaseMachineSchema);
+    },
+  },
+  {
+    version: 20,
+    name: "execution-graph-declared-unit-phases",
+    source: executionGraphDeclaredUnitPhasesMigrationSource,
+    up(db) {
+      if (hasTable(db, "execution_graphs") && !hasColumns(db, "execution_graphs", ["unit_phases"])) {
+        db.exec(executionGraphDeclaredUnitPhasesSchema);
+      }
+    },
+  },
+  {
+    version: 21,
+    name: "execution-graph-unit-phase-bindings",
+    source: executionGraphUnitPhaseBindingsMigrationSource,
+    up(db) {
+      if (hasTable(db, "execution_graphs") && !hasColumns(db, "execution_graphs", ["unit_phase_bindings"])) {
+        db.exec(executionGraphUnitPhaseBindingsSchema);
+      }
     },
   },
 ];

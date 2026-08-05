@@ -8,12 +8,8 @@
       "id": "implementer",
       "engine": "agent",
       "session_scope": "attempt",
-      "credentials": [
-        "repo.read"
-      ],
-      "skills": [
-        "builtin://implement-unit@1"
-      ]
+      "credentials": ["repo.read"],
+      "skills": ["builtin://implement-unit@1"]
     }
   ],
   "loops": [
@@ -36,30 +32,11 @@
         { "id": "implement", "kind": "agent", "loop": "unit_loop" },
         { "id": "candidate", "kind": "evidence" },
         { "id": "lead", "kind": "gate", "loop": "unit_loop" },
+        { "id": "integrate", "kind": "integrate" },
         { "id": "integrate", "kind": "integrate" }
       ],
       "depends_on": [],
-      "transitions": {
-        "success": {
-          "terminal": "completed"
-        }
-      }
-    },
-    {
-      "id": "implement",
-      "kind": "for_each_unit",
-      "phases": [
-        { "id": "implement", "kind": "agent", "loop": "unit_loop" },
-        { "id": "candidate", "kind": "evidence" },
-        { "id": "lead", "kind": "gate", "loop": "unit_loop" },
-        { "id": "integrate", "kind": "integrate" }
-      ],
-      "depends_on": [],
-      "transitions": {
-        "success": {
-          "terminal": "completed"
-        }
-      }
+      "transitions": { "success": { "terminal": "completed" } }
     }
   ]
 }
