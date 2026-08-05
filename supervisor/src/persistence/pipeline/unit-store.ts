@@ -619,7 +619,8 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
             WHERE id = ?
           `).run(next, input.decision.subject, timestamp, unitRow.id);
         } else if (routing.action === "repair") {
-          const repairPhase = phases[0] ?? "implement";
+          const repairPhase = phases.find((phase) => phase === "implement");
+          if (!repairPhase) throw new Error(`execution graph ${graph.id} repair phase is missing implement`);
           db.prepare(`
             UPDATE execution_units
             SET phase = ?, current_cycle = current_cycle + 1, command_index = 0, repair_rounds = ?, updated_at = ?

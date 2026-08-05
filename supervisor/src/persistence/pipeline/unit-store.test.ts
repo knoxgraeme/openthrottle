@@ -465,7 +465,7 @@ describe("execution unit store", () => {
     expect(integrate.action_kind).toBe("integrate");
   });
 
-  it("repairs back to the first graph-declared unit phase", () => {
+  it("repairs command-first graphs back to implement without evaluating stale command evidence", () => {
     const store = setup();
     const subject = "1".repeat(40);
     store.createGraph({
@@ -503,10 +503,13 @@ describe("execution unit store", () => {
     });
 
     expect(store.listUnits("attempt-parent")[0]).toMatchObject({
-      phase: "command", currentCycle: 2, repairRounds: 1, commandIndex: 0,
+      phase: "implement", currentCycle: 2, repairRounds: 1, commandIndex: 0,
     });
-    const repairCommand = lease(store);
-    expect(repairCommand).toMatchObject({ action_kind: "command", command_name: "test", cycle: 2 });
+    const repair = lease(store);
+    expect(repair).toMatchObject({ action_kind: "repair", command_name: null, cycle: 2 });
+    expect(store.listUnits("attempt-parent")[0]).toMatchObject({
+      phase: "implement", currentCycle: 2, repairRounds: 1, commandIndex: 0,
+    });
   });
 
   it("fails closed on malformed persisted unit phase sequences", () => {
