@@ -175,7 +175,7 @@ describe("pipeline effect processor", () => {
   function receiptJson(input: {
     instance: PipelineInstance;
     action: ExecutionWorkAttempt;
-    type: "unit_completion" | "command_result" | "candidate_evidence" | "unit_decision" | "integration_evidence";
+    type: "unit_completion" | "command_result" | "candidate_evidence" | "unit_decision" | "integration_evidence" | "semantic_review";
     subject: string;
     result?: string;
     commandName?: string | null;
@@ -193,6 +193,8 @@ describe("pipeline effect processor", () => {
         }
       : input.type === "command_result"
         ? { command: input.commandName ?? "test", exit_code: 0, summary: "command passed" }
+        : input.type === "semantic_review"
+          ? { summary: "no findings", findings: [], verification: [] }
         : input.type === "unit_decision"
           ? { rationale: "candidate matches the unit scope", context_updates: [], accepted_subject: input.subject }
           : { tree: input.subject, diff_digest: "d".repeat(64), changed_paths: [], clean: true };
@@ -618,30 +620,6 @@ describe("pipeline effect processor", () => {
       expect(action).toMatchObject({ action_kind: kind });
       return action!;
     };
-    let compositeDrainReplay = 0;
-    const enqueueCompositeDrain = () => {
-      const source = db!.prepare(`
-        SELECT payload, payload_hash FROM pipeline_effect_intents
-        WHERE pipeline_instance_id = ? AND kind IN ('provision', 'dispatch_stage')
-        ORDER BY transition_version, created_at, id LIMIT 1
-      `).get(instance.id) as { payload: string; payload_hash: string };
-      compositeDrainReplay += 1;
-      db!.prepare(`
-        INSERT INTO pipeline_effect_intents (
-          id, pipeline_instance_id, transition_version, kind, idempotency_key,
-          payload, payload_hash, status, next_attempt_at, created_at
-        ) VALUES (?, ?, ?, 'provision', ?, ?, ?, 'pending', ?, ?)
-      `).run(
-        `structured-child-drain-${compositeDrainReplay}`,
-        instance.id,
-        10 + compositeDrainReplay,
-        `structured-child-drain:${compositeDrainReplay}`,
-        source.payload,
-        source.payload_hash,
-        "2099-07-22T12:00:00.000Z",
-        "2099-07-22T12:00:00.000Z"
-      );
-    };
     const completeUnitAction = (kind: ExecutionWorkAttempt["action_kind"], subject: string, receiptType?: Parameters<typeof receiptJson>[0]["type"]) => {
       const action = latestAction(kind);
       pipelines.completeUnitAction({
@@ -652,30 +630,38 @@ describe("pipeline effect processor", () => {
       });
       return action;
     };
+    const drainCommandActions = async (actionKind: "command" | "final_command", subject: string) => {
+      for (const commandName of ["test", "lint", "build"]) {
+        await processor.drain();
+        expect(runtime.dispatchChildExecutorAction).toHaveBeenLastCalledWith(
+          { providerResourceId: "sandbox-child-drain" },
+          expect.objectContaining({
+            protocol: "child-executor-action@1",
+            actionKind,
+            commandName,
+            inputSubject: subject,
+          })
+        );
+        completeUnitAction(actionKind, subject, "command_result");
+      }
+    };
 
     await processor.drain();
     completeUnitAction("implement", completedSubject, "unit_completion");
 
-    enqueueCompositeDrain();
     await processor.drain();
+    expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
+      { providerResourceId: "sandbox-child-drain" },
+      expect.objectContaining({
+        protocol: "loop-action@2",
+        role: "worker",
+        skill: "simplify-unit",
+      })
+    );
     completeUnitAction("simplify", completedSubject);
 
-    for (const commandName of ["test", "lint", "build"]) {
-      enqueueCompositeDrain();
-      await processor.drain();
-      expect(runtime.dispatchChildExecutorAction).toHaveBeenLastCalledWith(
-        { providerResourceId: "sandbox-child-drain" },
-        expect.objectContaining({
-          protocol: "child-executor-action@1",
-          actionKind: "command",
-          commandName,
-          inputSubject: completedSubject,
-        })
-      );
-      completeUnitAction("command", completedSubject, "command_result");
-    }
+    await drainCommandActions("command", completedSubject);
 
-    enqueueCompositeDrain();
     await processor.drain();
     expect(runtime.dispatchChildExecutorAction).toHaveBeenLastCalledWith(
       { providerResourceId: "sandbox-child-drain" },
@@ -687,15 +673,7 @@ describe("pipeline effect processor", () => {
     );
     completeUnitAction("candidate", candidateSubject, "candidate_evidence");
 
-    enqueueCompositeDrain();
     await processor.drain();
-    expect(db!.prepare(`
-      SELECT status, last_error FROM pipeline_effect_intents
-      WHERE id = ?
-    `).get(`structured-child-drain-${compositeDrainReplay}`)).toEqual({
-      status: "acknowledged",
-      last_error: null,
-    });
     expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
       { providerResourceId: "sandbox-child-drain" },
       expect.objectContaining({
@@ -714,7 +692,6 @@ describe("pipeline effect processor", () => {
       decision: gateDecision({ gateKind: "unit_acceptance", subject: candidateSubject }),
     });
 
-    enqueueCompositeDrain();
     await processor.drain();
     expect(runtime.dispatchChildExecutorAction).toHaveBeenLastCalledWith(
       { providerResourceId: "sandbox-child-drain" },
@@ -734,17 +711,65 @@ describe("pipeline effect processor", () => {
       decision: gateDecision({ gateKind: "integration", subject: integratedSubject }),
     });
 
-    enqueueCompositeDrain();
+    await drainCommandActions("final_command", integratedSubject);
+
     await processor.drain();
-    expect(runtime.dispatchChildExecutorAction).toHaveBeenLastCalledWith(
+    expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
       { providerResourceId: "sandbox-child-drain" },
       expect.objectContaining({
-        protocol: "child-executor-action@1",
-        actionKind: "final_command",
-        commandName: "test",
-        inputSubject: integratedSubject,
+        protocol: "loop-action@2",
+        role: "reviewer",
+        skill: "final-review",
+        worktree: null,
       })
     );
+    const review = latestAction("final_review");
+    pipelines.completeGatedAction({
+      actionId: review.id,
+      resultHash: "result-review",
+      outputSubject: integratedSubject,
+      receipt: receiptJson({ instance, action: review, type: "semantic_review", subject: integratedSubject }),
+      decision: gateDecision({
+        gateKind: "final_review",
+        subject: integratedSubject,
+        outcome: "semantic_repair_required",
+        result: "failed",
+        reason: "review found a repairable issue",
+      }),
+    });
+
+    await processor.drain();
+    expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
+      { providerResourceId: "sandbox-child-drain" },
+      expect.objectContaining({
+        protocol: "loop-action@2",
+        role: "worker",
+        skill: "final-repair",
+      })
+    );
+    completeUnitAction("final_repair", integratedSubject, "unit_completion");
+
+    await drainCommandActions("final_command", integratedSubject);
+
+    await processor.drain();
+    const freshReview = latestAction("final_review");
+    pipelines.completeGatedAction({
+      actionId: freshReview.id,
+      resultHash: "result-review-fresh",
+      outputSubject: integratedSubject,
+      receipt: receiptJson({ instance, action: freshReview, type: "semantic_review", subject: integratedSubject }),
+      decision: gateDecision({ gateKind: "final_review", subject: integratedSubject }),
+    });
+
+    await processor.drain();
+    const aggregate = pipelines.getGraphForAttempt(attempt.id);
+    expect(aggregate).toMatchObject({
+      aggregate_emitted_at: expect.any(String),
+      integration_subject: integratedSubject,
+    });
+    const activationsAfterAggregate = runtime.setActive.mock.calls.length;
+    await processor.drain();
+    expect(runtime.setActive).toHaveBeenCalledTimes(activationsAfterAggregate);
   });
 
   it("idles an active bound sandbox through a best-effort runtime effect", async () => {

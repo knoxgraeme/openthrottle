@@ -35,8 +35,24 @@ function validateRequest(value) {
       idempotencyKey !== `child-executor:${value.attemptId}:${value.actionId}:${expectedHash}`) {
     throw new Error("child executor request hash or idempotency key is stale");
   }
+  if (value.protocol !== "child-executor-action@1") {
+    throw new Error("child executor protocol is invalid");
+  }
   if (!["command", "final_command", "candidate", "integrate"].includes(value.actionKind)) {
     throw new Error("child executor action kind is invalid");
+  }
+  if ((value.actionKind === "command" || value.actionKind === "candidate") &&
+      (!value.unitId || !value.worktree?.id)) {
+    throw new Error("child executor unit action requires a worktree");
+  }
+  if (value.actionKind === "final_command" && value.unitId !== null) {
+    throw new Error("child executor final command must be graph-scoped");
+  }
+  if ((value.actionKind === "command" || value.actionKind === "final_command") && !value.commandName) {
+    throw new Error("child executor command action requires a command name");
+  }
+  if (value.actionKind === "integrate" && !value.candidateSubject) {
+    throw new Error("child executor integration action requires a candidate subject");
   }
   return value;
 }

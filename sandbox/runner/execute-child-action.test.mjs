@@ -31,6 +31,7 @@ function childExecutorRequest(overrides = {}) {
     unitId: "unit-1",
     actionKind: "command",
     commandName: "missing",
+    worktree: { id: "worktree-1" },
     baseSubject: "1".repeat(40),
     inputSubject: "2".repeat(40),
     ...overrides,
@@ -72,5 +73,25 @@ describe("child executor action", () => {
         exit_code: 1,
       },
     });
+  });
+
+  it("rejects malformed child executor requests before selecting a repository", async () => {
+    const staleProtocol = childExecutorRequest({ protocol: "stage-executor@1" });
+    expect(() => executeChildAction({ request: staleProtocol })).toThrow(/protocol is invalid/);
+
+    const missingWorktree = childExecutorRequest({
+      actionId: "action-missing-worktree",
+      worktree: null,
+    });
+    expect(() => executeChildAction({ request: missingWorktree })).toThrow(/requires a worktree/);
+
+    const unitScopedFinalCommand = childExecutorRequest({
+      actionId: "action-unit-final-command",
+      actionKind: "final_command",
+      commandName: "test",
+      unitId: "unit-1",
+      worktree: null,
+    });
+    expect(() => executeChildAction({ request: unitScopedFinalCommand })).toThrow(/final command must be graph-scoped/);
   });
 });

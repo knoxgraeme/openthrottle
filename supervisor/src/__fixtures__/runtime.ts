@@ -59,6 +59,7 @@ export function buildInstalledRuntimeDescriptor(
     artifacts: sortedUnique(overrides.artifacts ?? ARTIFACT_KINDS) as ArtifactKind[],
     contextPolicies: sortedUnique(overrides.contextPolicies ?? CONTEXT_POLICIES) as ContextPolicy[],
     credentialScopes: sortedUnique(overrides.credentialScopes ?? [
+      "mcp",
       "model.invoke",
       "provider.read",
       "repo.read",

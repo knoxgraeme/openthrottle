@@ -105,10 +105,20 @@ function assertLoopRequestFence(request: LoopActionRequest): void {
 }
 
 function assertChildExecutorRequestFence(request: ChildExecutorActionRequest): void {
+  if (request.protocol !== "child-executor-action@1") {
+    throw new Error(`child executor action ${request.actionId} has an invalid protocol`);
+  }
   safeStagePathId(request.actionId, "child executor action ID");
   safeStagePathId(request.attemptId, "child executor attempt ID");
   if (!["command", "final_command", "candidate", "integrate"].includes(request.actionKind)) {
     throw new Error(`child executor action ${request.actionId} has an invalid kind`);
+  }
+  if ((request.actionKind === "command" || request.actionKind === "candidate") &&
+      (!request.unitId || !request.worktree?.id)) {
+    throw new Error(`child executor action ${request.actionId} requires a unit worktree`);
+  }
+  if (request.actionKind === "final_command" && request.unitId !== null) {
+    throw new Error(`child executor action ${request.actionId} final command must be graph-scoped`);
   }
   if ((request.actionKind === "command" || request.actionKind === "final_command") && !request.commandName) {
     throw new Error(`child executor action ${request.actionId} is missing its command name`);
@@ -154,6 +164,20 @@ function childExecutorActionPath(attemptId: string, actionId: string, name: stri
 
 function shellSingleQuoted(value: string): string {
   return `'${value.replace(/'/g, "'\"'\"'")}'`;
+}
+
+function childExecutorEnv(request: ChildExecutorActionRequest): string {
+  return [
+    "env -i",
+    "HOME=/home/agent",
+    "USER=agent",
+    "LOGNAME=agent",
+    "SHELL=/bin/bash",
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    `OT_STAGE_CONFIG_FILE=${shellSingleQuoted(`${STAGE_INPUT_DIR}/repository-config.json`)}`,
+    `RUN_ID=${shellSingleQuoted(request.parentRunId)}`,
+    `OT_CHILD_ACTION_ID=${shellSingleQuoted(request.actionId)}`,
+  ].join(" ");
 }
 
 function parseCollectedStageResult(raw: string, attemptId: string): StageExecutionResult {
@@ -543,6 +567,7 @@ export function createDaytonaSandboxRuntime(
         throw new Error("Daytona runtime does not expose session command execution");
       }
       await sandbox.process?.createSession?.(sessionId).catch(() => undefined);
+      const cleanEnv = childExecutorEnv(request);
       const dispatched = await sandbox.process.executeSessionCommand(sessionId, {
         command: `flock --nonblock ${lockPath} sh -c ` +
           shellSingleQuoted([
@@ -552,7 +577,9 @@ export function createDaytonaSandboxRuntime(
             `chown root:root ${shellSingleQuoted(requestPath)}`,
             `chmod 400 ${shellSingleQuoted(requestPath)}`,
             `rm -f ${shellSingleQuoted(stagedRequestPath)}`,
-            `exec /opt/openthrottle/runner/execute-child-action.mjs --request ${shellSingleQuoted(requestPath)} --output ${shellSingleQuoted(resultPath)}`,
+            `${cleanEnv} /opt/openthrottle/runner/heartbeat.mjs & heartbeat_pid=$!`,
+            `trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT INT TERM`,
+            `set +e; ${cleanEnv} /opt/openthrottle/runner/execute-child-action.mjs --request ${shellSingleQuoted(requestPath)} --output ${shellSingleQuoted(resultPath)}; status=$?; kill "$heartbeat_pid" 2>/dev/null || true; wait "$heartbeat_pid" 2>/dev/null || true; exit "$status"`,
           ].join(" && ")) +
           ` || rm -f ${shellSingleQuoted(stagedRequestPath)}`,
         runAsync: true,

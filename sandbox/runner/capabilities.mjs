@@ -10,7 +10,7 @@ export const CAPABILITY_CONTRACTS = Object.freeze({
   "agent/repository-skill@1": {
     kind: "agent",
     minimumCredentials: ["model.invoke", "repo.read"],
-    allowedCredentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+    allowedCredentials: ["model.invoke", "mcp", "provider.read", "repo.read", "repo.write"],
     contexts: ["fresh", "resume_required", "prefer_resume"],
     artifacts: ["stage_result", "review"],
   },
@@ -31,7 +31,7 @@ export const CAPABILITY_CONTRACTS = Object.freeze({
   "ce/implement@1": {
     kind: "agent",
     minimumCredentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
-    allowedCredentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+    allowedCredentials: ["model.invoke", "mcp", "provider.read", "repo.read", "repo.write"],
     contexts: ["fresh", "resume_required", "prefer_resume"],
     artifacts: ["stage_result", "review"],
   },
@@ -110,7 +110,7 @@ export const RUNTIME_DESCRIPTOR = Object.freeze({
   evaluators: ["command", "human", "provider", "publish_subject", "semantic"],
   artifacts: ["candidate_evidence", "command_result", "execution_graph_result", "human_approval", "integration_evidence", "provider_check", "publish_subject", "review", "stage_result", "standard_receipt"],
   contextPolicies: ["fresh", "none", "prefer_resume", "resume_required"],
-  credentialScopes: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+  credentialScopes: ["mcp", "model.invoke", "provider.read", "repo.read", "repo.write"],
   adapters: {
     claude: "claude-jsonl@1",
     codex: "codex-jsonl@1",

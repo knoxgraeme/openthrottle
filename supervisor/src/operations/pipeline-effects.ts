@@ -71,6 +71,18 @@ const CAPACITY_ERROR_PATTERNS: RegExp[] = [
 
 type EffectErrorClass = "auth" | "capacity" | "transient";
 type RuntimeEffectHandlerResult = "acknowledge" | "skip_acknowledgement";
+type LoopDispatchBinding = {
+  kind: "agent" | "gate";
+  loop: { skill: string; timeout_seconds?: number };
+  worker: {
+    id: string;
+    agent?: "inherit" | "claude" | "codex" | "opencode";
+    allowed_mcp_servers: string[];
+  };
+  credentials: LoopActionRequest["credentialScopes"];
+  context: LoopActionRequest["contextPolicy"] | "none";
+  repositorySkill?: LoopActionRequest["repositorySkill"];
+};
 
 function classifyEffectError(message: string): EffectErrorClass {
   const text = message.toLowerCase();
@@ -96,6 +108,42 @@ interface PipelineEffectProcessorDeps {
 
 const FENCE_PATTERN = /```([^\n`]*)\n([\s\S]*?)```/g;
 const GIT_SUBJECT = /^[a-f0-9]{40,64}$/;
+
+function builtinLoopBinding(input: {
+  kind: LoopDispatchBinding["kind"];
+  workerId: string;
+  skill: string;
+  credentials: LoopActionRequest["credentialScopes"];
+}): LoopDispatchBinding {
+  return Object.freeze({
+    kind: input.kind,
+    worker: {
+      id: input.workerId,
+      agent: "inherit" as const,
+      allowed_mcp_servers: [],
+    },
+    loop: {
+      skill: input.skill,
+      timeout_seconds: undefined,
+    },
+    credentials: input.credentials,
+    context: "fresh",
+    repositorySkill: undefined,
+  });
+}
+
+const FINAL_REVIEW_BINDING = builtinLoopBinding({
+  kind: "gate",
+  workerId: "reviewer",
+  skill: "final-review",
+  credentials: ["model.invoke", "repo.read"],
+});
+const FINAL_REPAIR_BINDING = builtinLoopBinding({
+  kind: "agent",
+  workerId: "final-repair",
+  skill: "final-repair",
+  credentials: ["model.invoke", "repo.read", "repo.write"],
+});
 
 function extractExecutionPlan(context: string): ExecutionPlanContract {
   const blocks: string[] = [];
@@ -436,14 +484,19 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     return base;
   };
 
-  const actionBinding = (instance: PipelineInstance, action: ExecutionWorkAttempt) => {
+  const actionBinding = (instance: PipelineInstance, action: ExecutionWorkAttempt): LoopDispatchBinding | undefined => {
+    if (action.action_kind === "final_review") return FINAL_REVIEW_BINDING;
+    if (action.action_kind === "final_repair") return FINAL_REPAIR_BINDING;
     const stage = activeStageFor(instance);
     if (!stage?.unitPhaseBindings) throw new Error(`child action ${action.id} has no graph-declared phase bindings`);
     const phaseId = action.action_kind === "repair" ? "implement"
-      : action.action_kind === "final_review" || action.action_kind === "final_repair" || action.action_kind === "final_command"
+      : action.action_kind === "final_command"
         ? undefined
         : action.action_kind;
-    return phaseId ? stage.unitPhaseBindings.find((binding) => binding.id === phaseId) : undefined;
+    const binding = phaseId ? stage.unitPhaseBindings.find((binding) => binding.id === phaseId) : undefined;
+    return binding && (binding.kind === "agent" || binding.kind === "gate")
+      ? { ...binding, credentials: binding.credentials as LoopActionRequest["credentialScopes"] }
+      : undefined;
   };
 
   const agentProducerFor = (
@@ -469,7 +522,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       skill: binding.repositorySkill?.reference ?? `builtin://${binding.loop.skill}@1`,
       capabilityDigest: instance.capability_digest,
       skillPackageDigest: binding.repositorySkill?.packageDigest ?? null,
-      assurance: binding.kind === "gate" ? "semantic_attested" : "semantic_attested",
+      assurance: "semantic_attested",
     };
   };
 
@@ -792,6 +845,17 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     }) === "emitted") {
       coordinatePipelineEvent(deps.store, event);
     }
+  };
+
+  const compositeGraphNeedsDrain = (parentAttemptId: string): boolean => {
+    const activeWork = deps.store.listWorkAttempts(parentAttemptId).some((action) =>
+      action.status === "pending" ||
+      action.status === "leased" ||
+      action.status === "dispatched" ||
+      action.status === "running");
+    if (activeWork) return true;
+    const graph = deps.store.getGraphForAttempt(parentAttemptId);
+    return Boolean(graph && !graph.aggregate_emitted_at && !graph.stopped_at);
   };
 
   const resourceFor = async (instance: PipelineInstance): Promise<RuntimeResource> => {
@@ -1145,6 +1209,23 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     });
   };
 
+  const drainActiveCompositeGraphs = async (): Promise<void> => {
+    const tickets = deps.tickets.listRunning();
+    for (const ticket of tickets) {
+      const instance = deps.store.getInstanceForSession(ticket.linear_session_id);
+      if (!instance || ticket.run_id === null) continue;
+      const attempt = deps.store.getActiveAttempt(instance.id);
+      if (!attempt || attempt.run_id !== ticket.run_id || attempt.status === "completed") continue;
+      const stage = activeStageFor(instance);
+      if (!stage || stage.executor.capability !== FOR_EACH_UNIT_CAPABILITY) continue;
+      const binding = runtimeBindingFor(instance);
+      if (!binding.resource || binding.status !== "active") continue;
+      if (!compositeGraphNeedsDrain(attempt.id)) continue;
+      await deps.runtime.setActive(binding.resource.providerResourceId);
+      await drainCompositeChildren(binding.resource, instance, attempt.id);
+    }
+  };
+
   const enqueueCapacityWaitActivity = (effect: PipelineEffectIntent, message: string): void => {
     try {
       const id = `capacity-wait:${effect.id}`;
@@ -1258,6 +1339,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
           new Date(current.getTime() + EFFECT_LEASE_MS).toISOString()
         );
         await Promise.all(effects.map(processClaimed));
+        await drainActiveCompositeGraphs();
       } finally {
         draining = false;
       }
