@@ -7,6 +7,7 @@ import {
   type PipelineStage,
   type StageOutcome,
 } from "./manifest.js";
+import { UNIT_PHASE_IDS, type GraphUnitPhaseId } from "@openthrottle/contracts";
 import type { PipelineCoordinatorEvent, PipelineEventArtifact } from "./coordinator.js";
 import {
   commandDecisionForEvidence,
@@ -25,8 +26,8 @@ export interface ExecutionPlanUnit {
 // candidate captures executor-verified subject evidence, lead binds a
 // scope-match decision to that exact candidate and its command receipts, and
 // only then may integrate run. See RR15/RAE10.
-export const UNIT_PHASES = ["implement", "simplify", "command", "candidate", "lead", "integrate"] as const;
-export type UnitPhase = (typeof UNIT_PHASES)[number];
+export const BUILTIN_UNIT_PHASES = UNIT_PHASE_IDS;
+export type UnitPhase = GraphUnitPhaseId;
 
 export const UNIT_ACTION_KINDS = [
   "implement", "repair", "simplify", "command", "candidate", "lead", "integrate",
@@ -62,8 +63,30 @@ export function actionKindForUnitPhase(phase: UnitPhase, currentCycle: number): 
   return phase;
 }
 
-export function nextUnitPhase(phase: UnitPhase): UnitPhase | undefined {
-  return UNIT_PHASES[UNIT_PHASES.indexOf(phase) + 1];
+export function nextUnitPhase(phase: UnitPhase, phases: readonly UnitPhase[] = BUILTIN_UNIT_PHASES): UnitPhase | undefined {
+  return phases[phases.indexOf(phase) + 1];
+}
+
+export function assertValidUnitPhaseSequence(phases: readonly UnitPhase[]): void {
+  if (phases.length === 0) throw new Error("execution graph unit phases must not be empty");
+  const seen = new Set<UnitPhase>();
+  let integrateIndex = -1;
+  let leadIndex = -1;
+  let candidateIndex = -1;
+  for (const [index, phase] of phases.entries()) {
+    if (!BUILTIN_UNIT_PHASES.includes(phase)) throw new Error(`execution graph unit phase ${phase} is not recognized`);
+    if (seen.has(phase)) throw new Error("execution graph unit phases must not contain duplicate phases");
+    seen.add(phase);
+    if (phase === "integrate") integrateIndex = index;
+    if (phase === "lead") leadIndex = index;
+    if (phase === "candidate") candidateIndex = index;
+  }
+  for (const required of ["implement", "candidate", "lead", "integrate"] as const) {
+    if (!seen.has(required)) throw new Error(`execution graph unit phases must include ${required}`);
+  }
+  if (integrateIndex !== phases.length - 1) throw new Error("execution graph integrate phase must be last");
+  if (leadIndex !== integrateIndex - 1) throw new Error("execution graph lead phase must immediately precede integrate");
+  if (candidateIndex !== leadIndex - 1) throw new Error("execution graph candidate phase must immediately precede lead");
 }
 
 export type UnitAcceptanceRouting =

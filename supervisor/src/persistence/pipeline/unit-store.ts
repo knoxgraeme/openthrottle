@@ -5,6 +5,7 @@ import type { ExecutionGateDecision } from "../../pipeline/execution-gates.js";
 import {
   decideDownstreamContext,
   deriveUnitTerminalState,
+  assertValidUnitPhaseSequence,
   nextUnitPhase,
   routeFinalReviewDecision,
   routeIntegrationDecision,
@@ -16,6 +17,7 @@ import {
   type ExecutionUnitState,
   type FinalPhase,
   type UnitActionKind,
+  type UnitPhase,
   type UnitTerminalReason,
 } from "../../pipeline/unit-coordinator.js";
 import { deterministicId } from "./helpers.js";
@@ -30,6 +32,8 @@ import {
   loadActiveAction,
   markActionCompleted,
   PHASE_FOR_COMPLETING_ACTION_KIND,
+  phaseSequenceOf,
+  unitPhasesOf,
   unitState,
   type ExecutionUnitRow,
 } from "./unit-store-phase-reducer.js";
@@ -45,6 +49,7 @@ export interface ExecutionUnitGraph {
   graph_digest: string;
   plan_digest: string;
   command_names: string;
+  unit_phases: string;
   max_repair_rounds: number;
   final_phase: FinalPhase | null;
   final_command_index: number;
@@ -132,6 +137,7 @@ export interface ExecutionUnitStore {
     planDigest: string;
     units: readonly ExecutionPlanUnit[];
     commandNames?: readonly string[];
+    unitPhases?: readonly UnitPhase[];
     maxRepairRounds?: number;
   }): ExecutionUnitGraph;
   getGraphForAttempt(parentAttemptId: string): ExecutionUnitGraph | undefined;
@@ -324,6 +330,13 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
 
   function assertGraphReplayMatches(input: Parameters<ExecutionUnitStore["createGraph"]>[0], existing: ExecutionUnitGraph): void {
     const expectedCommandNames = canonicalJson([...(input.commandNames ?? [])]);
+    const persistedUnitPhases = unitPhasesOf(existing);
+    const requestedUnitPhases = [...(input.unitPhases ?? persistedUnitPhases)];
+    const expectedUnitPhases = canonicalJson(requestedUnitPhases);
+    const legacyBuiltinUnitPhasesReplay =
+      persistedUnitPhases.length === 0 &&
+      input.unitPhases !== undefined &&
+      expectedUnitPhases === canonicalJson(phaseSequenceOf(existing));
     const expectedMaxRepairRounds = input.maxRepairRounds ?? DEFAULT_MAX_REPAIR_ROUNDS;
     if (
       existing.pipeline_instance_id !== input.pipelineInstanceId ||
@@ -332,6 +345,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       existing.graph_digest !== input.graphDigest ||
       existing.plan_digest !== input.planDigest ||
       existing.command_names !== expectedCommandNames ||
+      (existing.unit_phases !== expectedUnitPhases && !legacyBuiltinUnitPhasesReplay) ||
       existing.max_repair_rounds !== expectedMaxRepairRounds
     ) {
       throw new Error(`execution graph ${existing.id} replay fence mismatch`);
@@ -354,12 +368,15 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
   const createGraph = db.transaction((input: Parameters<ExecutionUnitStore["createGraph"]>[0]): ExecutionUnitGraph => {
     const timestamp = now();
     const graphId = deterministicId("execution-graph", [input.pipelineInstanceId, input.parentAttemptId]);
+    if (input.unitPhases && input.unitPhases.length > 0) assertValidUnitPhaseSequence(input.unitPhases);
     const existing = graphStmt.get(input.parentAttemptId) as ExecutionUnitGraph | undefined;
     if (existing) {
       assertGraphReplayMatches(input, existing);
       return existing;
     }
     const commandNames = canonicalJson([...(input.commandNames ?? [])]);
+    const unitPhases = canonicalJson([...(input.unitPhases ?? [])]);
+    const initialUnitPhase = input.unitPhases?.[0] ?? "implement";
     const maxRepairRounds = input.maxRepairRounds ?? DEFAULT_MAX_REPAIR_ROUNDS;
     if (!Number.isInteger(maxRepairRounds) || maxRepairRounds < 0) {
       throw new Error("execution graph maxRepairRounds must be a non-negative integer");
@@ -367,8 +384,8 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     db.prepare(`
       INSERT INTO execution_graphs (
         id, pipeline_instance_id, parent_attempt_id, parent_stage_id, parent_run_id,
-        graph_digest, plan_digest, command_names, max_repair_rounds, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        graph_digest, plan_digest, command_names, unit_phases, max_repair_rounds, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(parent_attempt_id) DO NOTHING
     `).run(
       graphId,
@@ -379,6 +396,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       input.graphDigest,
       input.planDigest,
       commandNames,
+      unitPhases,
       maxRepairRounds,
       timestamp,
       timestamp
@@ -387,8 +405,8 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       db.prepare(`
         INSERT INTO execution_units (
           id, execution_graph_id, pipeline_instance_id, parent_attempt_id, unit_id,
-          authored_order, dependency_unit_ids, status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+          authored_order, dependency_unit_ids, status, phase, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
         ON CONFLICT(parent_attempt_id, unit_id) DO NOTHING
       `).run(
         deterministicId("execution-unit", [input.parentAttemptId, unit.id]),
@@ -398,6 +416,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         unit.id,
         index,
         canonicalJson([...(unit.dependencies ?? [])].sort()),
+        initialUnitPhase,
         timestamp,
         timestamp
       );
@@ -507,7 +526,8 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
           .run(timestamp, action.execution_unit_id);
       } else if (PHASE_FOR_COMPLETING_ACTION_KIND[action.action_kind]) {
         const currentPhase = PHASE_FOR_COMPLETING_ACTION_KIND[action.action_kind]!;
-        const next = nextUnitPhase(currentPhase);
+        const graph = graphStmt.get(action.parent_attempt_id) as ExecutionUnitGraph;
+        const next = nextUnitPhase(currentPhase, phaseSequenceOf(graph));
         if (!next) throw new Error(`execution unit phase ${currentPhase} has no successor`);
         db.prepare(`UPDATE execution_units SET phase = ?, updated_at = ? WHERE id = ?`)
           .run(next, timestamp, action.execution_unit_id);
@@ -583,6 +603,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       }
 
       const graph = graphStmt.get(completedAction.parent_attempt_id) as ExecutionUnitGraph;
+      const phases = phaseSequenceOf(graph);
       if (input.decision.gateKind === "unit_acceptance") {
         const routing = routeUnitAcceptanceDecision({
           outcome: input.decision.outcome,
@@ -591,16 +612,19 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
           maxRepairRounds: graph.max_repair_rounds,
         });
         if (routing.action === "integrate") {
+          const next = nextUnitPhase("lead", phases);
+          if (next !== "integrate") throw new Error(`execution graph ${graph.id} lead phase does not route to integrate`);
           db.prepare(`
-            UPDATE execution_units SET phase = 'integrate', accepted_candidate_subject = ?, updated_at = ?
+            UPDATE execution_units SET phase = ?, accepted_candidate_subject = ?, updated_at = ?
             WHERE id = ?
-          `).run(input.decision.subject, timestamp, unitRow.id);
+          `).run(next, input.decision.subject, timestamp, unitRow.id);
         } else if (routing.action === "repair") {
+          const repairPhase = phases[0] ?? "implement";
           db.prepare(`
             UPDATE execution_units
-            SET phase = 'implement', current_cycle = current_cycle + 1, command_index = 0, repair_rounds = ?, updated_at = ?
+            SET phase = ?, current_cycle = current_cycle + 1, command_index = 0, repair_rounds = ?, updated_at = ?
             WHERE id = ?
-          `).run(routing.repairRounds, timestamp, unitRow.id);
+          `).run(repairPhase, routing.repairRounds, timestamp, unitRow.id);
         } else if (routing.action === "settle") {
           settleUnitRow({ parentAttemptId: completedAction.parent_attempt_id, unitId: unitRow.unit_id, reason: "defect", timestamp });
           settleStructurallyBlockedDependents(completedAction.parent_attempt_id, timestamp);

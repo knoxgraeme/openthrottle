@@ -20,6 +20,21 @@
       ]
     },
     {
+      "id": "lead",
+      "engine": "agent",
+      "agent": "inherit",
+      "model": "gpt-5-codex",
+      "session_scope": "fresh",
+      "credentials": [
+        "repo.read",
+        "model.invoke"
+      ],
+      "allowed_mcp_servers": [],
+      "skills": [
+        "builtin://accept-unit@1"
+      ]
+    },
+    {
       "id": "reviewer",
       "engine": "agent",
       "session_scope": "fresh",
@@ -45,6 +60,16 @@
       "timeout_seconds": 3600
     },
     {
+      "id": "lead_loop",
+      "worker": "lead",
+      "input_scope": "unit",
+      "receipt": "unit_decision",
+      "max_parallel": 1,
+      "max_rounds": 1,
+      "skill": "builtin://accept-unit@1",
+      "timeout_seconds": 3600
+    },
+    {
       "id": "review_loop",
       "worker": "reviewer",
       "input_scope": "diff",
@@ -59,7 +84,13 @@
     {
       "id": "implement",
       "kind": "for_each_unit",
-      "loop": "unit_loop",
+      "phases": [
+        { "id": "implement", "kind": "agent", "loop": "unit_loop" },
+        { "id": "command", "kind": "command", "commands": ["test"] },
+        { "id": "candidate", "kind": "evidence" },
+        { "id": "lead", "kind": "gate", "loop": "lead_loop" },
+        { "id": "integrate", "kind": "integrate" }
+      ],
       "depends_on": [],
       "transitions": {
         "success": {

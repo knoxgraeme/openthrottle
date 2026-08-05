@@ -185,8 +185,12 @@ describe("execution graph compiler", () => {
         live_steering: false,
         credentials: ["provider.read", "repo.read", "repo.write"],
         produces: ["stage_result", "execution_graph_result"],
+        unitPhases: ["implement", "simplify", "command", "candidate", "lead", "integrate"],
+        unitCommandNames: ["test", "lint", "build"],
       }],
     });
+    expect(compiled.unitPhases).toEqual(["implement", "simplify", "command", "candidate", "lead", "integrate"]);
+    expect(compiled.unitCommandNames).toEqual(["test", "lint", "build"]);
     expect(compiled.manifest.manifest.stages[0]?.transitions.no_change).toEqual({ terminal: "no_change" });
   });
 
@@ -270,8 +274,19 @@ describe("execution graph compiler", () => {
   it.each([
     [
       "for_each_unit nodes",
-      minimalGraph({ node: { kind: "for_each_unit" } }),
-      /graph\.loops\.loop\.input_scope: for_each_unit requires unit input scope/,
+      minimalGraph({
+        node: {
+          kind: "for_each_unit",
+          loop: undefined,
+          phases: [
+            { id: "implement", kind: "agent", loop: "loop" },
+            { id: "candidate", kind: "evidence" },
+            { id: "lead", kind: "gate", loop: "loop" },
+            { id: "integrate", kind: "integrate" },
+          ],
+        },
+      }),
+      /graph\.loops\.loop\.input_scope: for_each_unit phases require unit input scope/,
     ],
     [
       "human nodes",

@@ -388,6 +388,59 @@ describe("pipeline manifest validation", () => {
     expect(() => validatePipelineManifest(agent)).toThrow(/commandName: is allowed only for command executors/);
   });
 
+  it("pins unit phase metadata only on graph for-each-unit stages", () => {
+    const value = manifest();
+    value.requires = { protocol: "stage-executor@1", capabilities: ["graph/for-each-unit@1"] };
+    Object.assign(firstStage(value), {
+      executor: { kind: "loop_action", capability: "graph/for-each-unit@1" },
+      evaluator: { kind: "semantic", assurance: "executor_verified", required_artifacts: ["execution_graph_result"] },
+      context: "none",
+      live_steering: false,
+      credentials: ["repo.read", "repo.write"],
+      produces: ["stage_result", "execution_graph_result"],
+      unitPhases: ["implement", "candidate", "lead", "integrate"],
+      unitCommandNames: [],
+    });
+
+    expect(validatePipelineManifest(value).manifest.stages[0]).toMatchObject({
+      unitPhases: ["implement", "candidate", "lead", "integrate"],
+      unitCommandNames: [],
+    });
+
+    const missingPhases = structuredClone(value) as Record<string, unknown>;
+    delete firstStage(missingPhases).unitPhases;
+    expect(() => validatePipelineManifest(missingPhases))
+      .toThrow(/pipeline\.stages\[0\]\.unitPhases: is required for graph\/for-each-unit@1 stages/);
+
+    const duplicatePhases = structuredClone(value) as Record<string, unknown>;
+    firstStage(duplicatePhases).unitPhases = ["implement", "implement", "candidate", "lead", "integrate"];
+    expect(() => validatePipelineManifest(duplicatePhases))
+      .toThrow(/pipeline\.stages\[0\]\.unitPhases: must not contain duplicates/);
+
+    const missingRequired = structuredClone(value) as Record<string, unknown>;
+    firstStage(missingRequired).unitPhases = ["integrate"];
+    expect(() => validatePipelineManifest(missingRequired))
+      .toThrow(/pipeline\.stages\[0\]\.unitPhases: must include implement/);
+
+    const outOfOrder = structuredClone(value) as Record<string, unknown>;
+    firstStage(outOfOrder).unitPhases = ["implement", "candidate", "integrate", "lead"];
+    expect(() => validatePipelineManifest(outOfOrder))
+      .toThrow(/pipeline\.stages\[0\]\.unitPhases: integrate must be last/);
+
+    const commandAfterCandidate = structuredClone(value) as Record<string, unknown>;
+    firstStage(commandAfterCandidate).unitPhases = ["implement", "candidate", "command", "lead", "integrate"];
+    expect(() => validatePipelineManifest(commandAfterCandidate))
+      .toThrow(/pipeline\.stages\[0\]\.unitPhases: candidate must immediately precede lead/);
+
+    const agent = manifest();
+    Object.assign(firstStage(agent), {
+      unitPhases: ["implement", "candidate", "lead", "integrate"],
+      unitCommandNames: [],
+    });
+    expect(() => validatePipelineManifest(agent))
+      .toThrow(/pipeline\.stages\[0\]\.unitPhases: unit phase metadata is allowed only for graph\/for-each-unit@1 stages/);
+  });
+
   it("bounds repository skill package identity inside its declared directory", () => {
     const value = manifest();
     value.requires = { protocol: "stage-executor@1", capabilities: ["agent/repository-skill@1"] };

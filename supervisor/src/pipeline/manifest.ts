@@ -4,10 +4,12 @@ import {
   canonicalJson as sharedCanonicalJson,
   COMMAND_NAME_PATTERN,
   digestNormalized as sharedDigestNormalized,
+  UNIT_PHASE_IDS,
   validateRepositoryConfigContract,
   type ConfigGraphSource,
   type ConfigMcpServer,
   type ConfigRepositorySkill,
+  type GraphUnitPhaseId,
 } from "@openthrottle/contracts";
 import { parseDocument } from "yaml";
 
@@ -113,6 +115,8 @@ export interface PipelineStage {
   id: string;
   executor: { kind: ExecutorKind; capability: string };
   commandName?: CommandName;
+  unitPhases?: GraphUnitPhaseId[];
+  unitCommandNames?: CommandName[];
   repositorySkill?: RepositorySkillPackage;
   evaluator: { kind: EvaluatorKind; assurance: AssuranceClass; required_artifacts: ArtifactKind[] };
   context: ContextPolicy;
@@ -255,6 +259,24 @@ function unique<T extends string>(values: T[], path: string): T[] {
   return values;
 }
 
+function validateUnitPhaseSequence(phases: readonly GraphUnitPhaseId[], path: string): void {
+  const phaseIds = new Set(phases);
+  let integrateIndex = -1;
+  let leadIndex = -1;
+  let candidateIndex = -1;
+  for (const [index, phase] of phases.entries()) {
+    if (phase === "integrate") integrateIndex = index;
+    if (phase === "lead") leadIndex = index;
+    if (phase === "candidate") candidateIndex = index;
+  }
+  for (const required of ["implement", "candidate", "lead", "integrate"] as const) {
+    if (!phaseIds.has(required)) fail(path, `must include ${required}`);
+  }
+  if (integrateIndex !== phases.length - 1) fail(path, "integrate must be last");
+  if (leadIndex !== integrateIndex - 1) fail(path, "lead must immediately precede integrate");
+  if (candidateIndex !== leadIndex - 1) fail(path, "candidate must immediately precede lead");
+}
+
 function parseYaml(raw: string, source: string): unknown {
   if (Buffer.byteLength(raw, "utf8") > 256 * 1024) fail(source, "YAML exceeds 256 KiB");
   const document = parseDocument(raw, {
@@ -346,7 +368,7 @@ function parseStage(
   options: { allowLegacyImplicitCommandName?: boolean } = {}
 ): PipelineStage {
   const input = objectAt(value, path, [
-    "id", "executor", "commandName", "repositorySkill", "evaluator", "context", "live_steering", "credentials", "produces", "transitions", "retry",
+    "id", "executor", "commandName", "unitPhases", "unitCommandNames", "repositorySkill", "evaluator", "context", "live_steering", "credentials", "produces", "transitions", "retry",
   ]);
   const id = stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER });
   const executorInput = objectAt(input.executor, `${path}.executor`, ["kind", "capability"]);
@@ -387,6 +409,16 @@ function parseStage(
     ...(input.commandName === undefined ? {} : {
       commandName: stringAt(input.commandName, `${path}.commandName`, { max: 80, pattern: COMMAND_NAME_PATTERN }),
     }),
+    ...(input.unitPhases === undefined ? {} : {
+      unitPhases: unique(arrayAt(input.unitPhases, `${path}.unitPhases`, (entry, entryPath) => {
+        return enumAt(entry, entryPath, UNIT_PHASE_IDS);
+      }, { min: 1, max: 16 }), `${path}.unitPhases`),
+    }),
+    ...(input.unitCommandNames === undefined ? {} : {
+      unitCommandNames: unique(arrayAt(input.unitCommandNames, `${path}.unitCommandNames`, (entry, entryPath) => {
+        return stringAt(entry, entryPath, { max: 80, pattern: COMMAND_NAME_PATTERN });
+      }, { max: 16 }), `${path}.unitCommandNames`),
+    }),
     ...(input.repositorySkill === undefined ? {} : {
       repositorySkill: parseRepositorySkillPackage(input.repositorySkill, `${path}.repositorySkill`),
     }),
@@ -421,6 +453,15 @@ function parseStage(
     if (stage.executor.kind !== "agent" || stage.executor.capability !== "agent/repository-skill@1") {
       fail(`${path}.repositorySkill`, "is allowed only for agent/repository-skill@1 stages");
     }
+  }
+  const isForEachUnitStage = stage.executor.kind === "loop_action" && stage.executor.capability === "graph/for-each-unit@1";
+  if (stage.unitPhases || stage.unitCommandNames) {
+    if (!isForEachUnitStage) fail(`${path}.unitPhases`, "unit phase metadata is allowed only for graph/for-each-unit@1 stages");
+  }
+  if (isForEachUnitStage) {
+    if (!stage.unitPhases) fail(`${path}.unitPhases`, "is required for graph/for-each-unit@1 stages");
+    if (!stage.unitCommandNames) fail(`${path}.unitCommandNames`, "is required for graph/for-each-unit@1 stages");
+    validateUnitPhaseSequence(stage.unitPhases, `${path}.unitPhases`);
   }
   for (const required of stage.evaluator.required_artifacts) {
     if (!stage.produces.includes(required)) fail(`${path}.evaluator.required_artifacts`, `${required} is not produced by the stage`);

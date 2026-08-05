@@ -152,6 +152,14 @@ describe("execution unit store", () => {
     })).toThrow(/replay fence mismatch/);
     expect(() => store.createGraph({
       ...input,
+      unitPhases: ["command", "implement", "candidate", "lead", "integrate"],
+    })).toThrow(/replay fence mismatch/);
+    expect(store.createGraph({
+      ...input,
+      unitPhases: ["implement", "simplify", "command", "candidate", "lead", "integrate"],
+    })).toMatchObject({ parent_attempt_id: "attempt-parent" });
+    expect(() => store.createGraph({
+      ...input,
       units: [{ id: "a" }, { id: "c", dependencies: ["a"] }],
     })).toThrow(/replay unit set mismatch/);
   });
@@ -409,6 +417,128 @@ describe("execution unit store", () => {
     // The second unit only starts once the first has fully settled.
     const second = lease(store);
     expect(second).toMatchObject({ unit_id: "b", action_kind: "implement" });
+  });
+
+  it("traverses a graph-declared unit phase order", () => {
+    const store = setup();
+    const subject = "1".repeat(40);
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      commandNames: ["test"],
+      unitPhases: ["command", "implement", "candidate", "lead", "integrate"],
+    });
+
+    const command = lease(store);
+    expect(command).toMatchObject({ unit_id: "a", action_kind: "command", command_name: "test" });
+    store.completeUnitAction({
+      actionId: command.id, resultHash: "r-command", outputSubject: subject,
+      receipt: receiptJson("command_result", { payload: { command: "test" } }),
+    });
+
+    const implement = lease(store);
+    expect(implement).toMatchObject({ action_kind: "implement", cycle: 1 });
+    store.completeUnitAction({
+      actionId: implement.id, resultHash: "r-implement", outputSubject: subject, receipt: receiptJson("unit_completion"),
+    });
+
+    const candidate = lease(store);
+    expect(candidate.action_kind).toBe("candidate");
+    store.completeUnitAction({
+      actionId: candidate.id, resultHash: "r-candidate", outputSubject: subject, receipt: receiptJson("candidate_evidence"),
+    });
+    const lead = lease(store);
+    expect(lead.action_kind).toBe("lead");
+    store.completeGatedAction({
+      actionId: lead.id,
+      resultHash: "r-lead",
+      outputSubject: subject,
+      receipt: receiptJson("unit_decision"),
+      decision: gateDecision({ gateKind: "unit_acceptance", outcome: "success", subject }),
+    });
+    const integrate = lease(store);
+    expect(integrate.action_kind).toBe("integrate");
+  });
+
+  it("repairs back to the first graph-declared unit phase", () => {
+    const store = setup();
+    const subject = "1".repeat(40);
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      commandNames: ["test"],
+      unitPhases: ["command", "implement", "candidate", "lead", "integrate"],
+    });
+
+    const firstCommand = lease(store);
+    store.completeUnitAction({
+      actionId: firstCommand.id, resultHash: "r-command", outputSubject: subject,
+      receipt: receiptJson("command_result", { payload: { command: "test" } }),
+    });
+    const implement = lease(store);
+    store.completeUnitAction({
+      actionId: implement.id, resultHash: "r-implement", outputSubject: subject, receipt: receiptJson("unit_completion"),
+    });
+    const candidate = lease(store);
+    store.completeUnitAction({
+      actionId: candidate.id, resultHash: "r-candidate", outputSubject: subject, receipt: receiptJson("candidate_evidence"),
+    });
+    const lead = lease(store);
+    store.completeGatedAction({
+      actionId: lead.id,
+      resultHash: "r-lead",
+      outputSubject: subject,
+      receipt: receiptJson("unit_decision"),
+      decision: gateDecision({ gateKind: "unit_acceptance", outcome: "semantic_repair_required", subject }),
+    });
+
+    expect(store.listUnits("attempt-parent")[0]).toMatchObject({
+      phase: "command", currentCycle: 2, repairRounds: 1, commandIndex: 0,
+    });
+    const repairCommand = lease(store);
+    expect(repairCommand).toMatchObject({ action_kind: "command", command_name: "test", cycle: 2 });
+  });
+
+  it("fails closed on malformed persisted unit phase sequences", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhases: ["implement", "candidate", "lead", "integrate"],
+    });
+    db!.prepare("UPDATE execution_graphs SET unit_phases = ? WHERE parent_attempt_id = ?")
+      .run(JSON.stringify(["implement", "unknown", "candidate", "lead", "integrate"]), "attempt-parent");
+
+    expect(() => lease(store)).toThrow(/unit phase unknown is not recognized/);
+  });
+
+  it("rejects caller-provided unit phase sequences that would bypass required gates", () => {
+    const store = setup();
+    expect(() => store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhases: ["integrate"],
+    })).toThrow(/unit phases must include implement/);
   });
 
   it("expires stale leased work and returns the unit to the serial queue", () => {

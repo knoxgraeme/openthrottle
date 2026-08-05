@@ -10,6 +10,20 @@
       "skills": ["builtin://ce/implement@1"],
       "session_scope": "attempt",
       "credentials": ["model.invoke", "provider.read", "repo.read", "repo.write"]
+    },
+    {
+      "id": "simplify-worker",
+      "engine": "agent",
+      "skills": ["builtin://ce/simplify@1"],
+      "session_scope": "attempt",
+      "credentials": ["model.invoke", "repo.read", "repo.write"]
+    },
+    {
+      "id": "lead-worker",
+      "engine": "agent",
+      "skills": ["builtin://accept-unit@1"],
+      "session_scope": "fresh",
+      "credentials": ["model.invoke", "repo.read"]
     }
   ],
   "loops": [
@@ -22,13 +36,40 @@
       "max_parallel": 1,
       "max_rounds": 8,
       "timeout_seconds": 86400
+    },
+    {
+      "id": "simplify-loop",
+      "worker": "simplify-worker",
+      "skill": "builtin://ce/simplify@1",
+      "input_scope": "unit",
+      "receipt": "unit_completion",
+      "max_parallel": 1,
+      "max_rounds": 3,
+      "timeout_seconds": 86400
+    },
+    {
+      "id": "lead-loop",
+      "worker": "lead-worker",
+      "skill": "builtin://accept-unit@1",
+      "input_scope": "unit",
+      "receipt": "unit_decision",
+      "max_parallel": 1,
+      "max_rounds": 1,
+      "timeout_seconds": 86400
     }
   ],
   "nodes": [
     {
       "id": "units",
       "kind": "for_each_unit",
-      "loop": "unit-loop",
+      "phases": [
+        { "id": "implement", "kind": "agent", "loop": "unit-loop" },
+        { "id": "simplify", "kind": "agent", "loop": "simplify-loop" },
+        { "id": "command", "kind": "command", "commands": ["test", "lint", "build"] },
+        { "id": "candidate", "kind": "evidence" },
+        { "id": "lead", "kind": "gate", "loop": "lead-loop" },
+        { "id": "integrate", "kind": "integrate" }
+      ],
       "depends_on": [],
       "transitions": {
         "success": { "terminal": "completed" },

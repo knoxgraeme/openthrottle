@@ -560,6 +560,7 @@ describe("plan validation", () => {
           implement: { default_graph: "simple", allowed_graphs: ["simple", "structured"] },
           investigate: { default_graph: "simple", allowed_graphs: ["simple"] },
         },
+        commands: { test: "npm test" },
       })
     );
     writeFileSync(
@@ -621,7 +622,7 @@ describe("plan validation", () => {
     writeFileSync(join(directory, ".openthrottle", "graphs", "structured.json"), JSON.stringify(graph));
     expect(() => validateLocalGraphSelection({ directory })).toThrow(/unknown MCP server/);
 
-    baseConfig.commands = { deploy: "npm run deploy" };
+    baseConfig.commands = { test: "npm test", deploy: "npm run deploy" };
     graph.nodes[2]!.command = "deploy";
     graph.workers[0]!.credentials = ["repo.read", "model.invoke"];
     graph.workers[0]!.allowed_mcp_servers = [];

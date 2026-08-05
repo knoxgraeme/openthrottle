@@ -33,13 +33,17 @@ const invalidCases = [
   ["config-unknown-field.json", /unexpected: unknown field/],
   ["execution-plan-unknown-field.json", /inline_prompt: unknown field/],
   ["graph-dependency-cycle.json", /depends_on: creates a cycle/],
+  ["graph-command-after-candidate-phase.json", /nodes\.implement\.phases: candidate must immediately precede lead/],
   ["graph-duplicate-node.json", /nodes: must not contain duplicate IDs/],
   ["graph-disconnected-cycle.json", /nodes\.repair_a: is unreachable from entry_node/],
-  ["graph-unknown-loop.json", /nodes\.implement\.loop: references an unknown loop/],
+  ["graph-unknown-loop.json", /nodes\.implement\.phases\[0\]\.loop: references an unknown loop/],
   ["graph-unbounded-cycle.json", /transitions\.success: creates an unbounded cycle/],
   ["graph-excess-bounds.json", /max_parallel: must be an integer between 1 and 1/],
   ["graph-internal-node-kind.json", /nodes\[0\]\.kind: must be one of/],
+  ["graph-duplicate-integrate-phase.json", /nodes\.implement\.phases: must not contain duplicate phase IDs/],
+  ["graph-integrate-not-last-phase.json", /nodes\.implement\.phases\[3\]: integrate must be the last unit phase/],
   ["graph-loop-skill-not-allowed.json", /loops\.unit_loop\.skill: is not allowed by the worker/],
+  ["graph-missing-integrate-phase.json", /nodes\.implement\.phases: must include exactly one integrate phase/],
   ["graph-provider-secret-credential.json", /credentials\[0\]: must be one of/],
   ["graph-skill-traversal.json", /workers\[0\]\.skills\[0\]: has an invalid format/],
   ["graph-unreachable-node.json", /nodes\.dead_command: is unreachable from entry_node/],
@@ -145,6 +149,14 @@ describe("Stage C contract fixtures", () => {
       .toThrow(/nodes\.test\.command: references an unknown repository command/);
 
     graph.nodes[2]!.command = "test";
+    (graph.nodes[0]!.phases as Array<{ id: string; kind: string; commands?: string[] }>).splice(1, 0, {
+      id: "command",
+      kind: "command",
+      commands: ["missing"],
+    });
+    expect(() => parseGraphContract(JSON.stringify(graph), { source: "graph", config: config.value }))
+      .toThrow(/nodes\.implement\.phases\[1\]\.commands: references an unknown repository command/);
+    (graph.nodes[0]!.phases as unknown[]).splice(1, 1);
     graph.workers[0]!.credentials = ["repo.read", "model.invoke", "mcp"];
     graph.workers[0]!.allowed_mcp_servers = ["missing"];
     expect(() => parseGraphContract(JSON.stringify(graph), { source: "graph", config: config.value }))

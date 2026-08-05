@@ -33,7 +33,12 @@
     {
       "id": "implement",
       "kind": "for_each_unit",
-      "loop": "unit_loop",
+      "phases": [
+        { "id": "implement", "kind": "agent", "loop": "unit_loop" },
+        { "id": "candidate", "kind": "evidence" },
+        { "id": "lead", "kind": "gate", "loop": "unit_loop" },
+        { "id": "integrate", "kind": "integrate" }
+      ],
       "depends_on": [],
       "transitions": {
         "success": {
