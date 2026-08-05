@@ -360,6 +360,24 @@ describe("execution graph compiler", () => {
     }))).toThrow(/graph\.nodes\.units\.phases\.2\.skill: ce\/implement@1 requires repo\.write and cannot be used for gate phases/);
   });
 
+  it("rejects accept-unit gate phases that violate the shared credential contract", () => {
+    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+      leadWorker: {
+        skills: ["builtin://accept-unit@1"],
+        credentials: ["repo.read"],
+      },
+      leadLoop: { skill: "builtin://accept-unit@1" },
+    }))).toThrow(/graph\.loops\.lead-loop: accept-unit@1 requires credential scope model\.invoke/);
+
+    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+      leadWorker: {
+        skills: ["builtin://accept-unit@1"],
+        credentials: ["model.invoke", "repo.read", "provider.read"],
+      },
+      leadLoop: { skill: "builtin://accept-unit@1" },
+    }))).toThrow(/graph\.loops\.lead-loop: accept-unit@1 is not authorized for credential scope provider\.read/);
+  });
+
   it("compiles repository skills to the platform repository-skill capability with pinned package identity", () => {
     const runtime = buildInstalledRuntimeDescriptor("repository-skill-test/v1", {
       capabilities: [
@@ -501,6 +519,20 @@ describe("execution graph compiler", () => {
         },
       }),
       /graph\.loops\.loop: ce\/review@1 requires credential scope model\.invoke/,
+    ],
+    [
+      "unsupported loop artifacts",
+      minimalGraph({
+        worker: {
+          skills: ["builtin://ce/plan@1"],
+          credentials: ["model.invoke", "repo.read"],
+        },
+        loop: {
+          skill: "builtin://ce/plan@1",
+          receipt: "semantic_review",
+        },
+      }),
+      /graph\.loops\.loop: ce\/plan@1 cannot produce required artifact review/,
     ],
     [
       "unknown command inventory names",

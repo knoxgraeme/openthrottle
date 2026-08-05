@@ -34,6 +34,7 @@ import {
   FOR_EACH_UNIT_CAPABILITY,
   REPOSITORY_SKILL_CAPABILITY,
   capabilityCredentialContract,
+  capabilityCredentialContractViolations,
   capabilityRequiresCredential,
 } from "./capability-contracts.js";
 
@@ -163,25 +164,13 @@ function assertNoDependencies(node: GraphNode): void {
 }
 
 function assertCapabilityAuthorized(template: StageTemplate, path: string): void {
-  const contract = capabilityCredentialContract(template.executor.capability);
-  if (!contract) return;
-  if (!contract.contexts.includes(template.context)) {
-    fail(path, `${template.executor.capability} does not support context policy ${template.context}`);
-  }
-  for (const credential of contract.minimum) {
-    if (!template.credentials.includes(credential)) {
-      fail(path, `${template.executor.capability} requires credential scope ${credential}`);
-    }
-  }
-  for (const credential of template.credentials) {
-    if (!contract.allowed.includes(credential)) {
-      fail(path, `${template.executor.capability} is not authorized for credential scope ${credential}`);
-    }
-  }
-  for (const artifact of template.evaluator.required_artifacts) {
-    if (!contract.artifacts.includes(artifact)) {
-      fail(path, `${template.executor.capability} cannot produce required artifact ${artifact}`);
-    }
+  for (const violation of capabilityCredentialContractViolations({
+    capability: template.executor.capability,
+    context: template.context,
+    credentials: template.credentials,
+    requiredArtifacts: template.evaluator.required_artifacts,
+  })) {
+    fail(path, violation.message);
   }
 }
 

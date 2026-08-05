@@ -10,6 +10,18 @@ export interface CapabilityCredentialContract {
   artifacts: readonly ArtifactKind[];
 }
 
+export interface CapabilityCredentialContractInput {
+  capability: string;
+  context: ContextPolicy;
+  credentials: readonly string[];
+  requiredArtifacts?: readonly ArtifactKind[];
+}
+
+export interface CapabilityCredentialContractViolation {
+  field: "context" | "credentials" | "artifacts";
+  message: string;
+}
+
 const CAPABILITY_CREDENTIALS: Readonly<Record<string, CapabilityCredentialContract>> = {
   "agent/semantic@1": {
     minimum: ["model.invoke", "repo.read"],
@@ -53,6 +65,12 @@ const CAPABILITY_CREDENTIALS: Readonly<Record<string, CapabilityCredentialContra
     contexts: ["resume_required", "prefer_resume"],
     artifacts: ["stage_result"],
   },
+  "accept-unit@1": {
+    minimum: ["model.invoke", "repo.read"],
+    allowed: ["model.invoke", "repo.read"],
+    contexts: ["fresh", "resume_required", "prefer_resume"],
+    artifacts: ["stage_result"],
+  },
   [FOR_EACH_UNIT_CAPABILITY]: {
     minimum: ["repo.read", "repo.write"],
     allowed: ["repo.read", "repo.write", "provider.read"],
@@ -87,6 +105,36 @@ const CAPABILITY_CREDENTIALS: Readonly<Record<string, CapabilityCredentialContra
 
 export function capabilityCredentialContract(capability: string): CapabilityCredentialContract | undefined {
   return CAPABILITY_CREDENTIALS[capability];
+}
+
+export function capabilityCredentialContractViolations({
+  capability,
+  context,
+  credentials,
+  requiredArtifacts = [],
+}: CapabilityCredentialContractInput): CapabilityCredentialContractViolation[] {
+  const contract = capabilityCredentialContract(capability);
+  if (!contract) return [];
+  const violations: CapabilityCredentialContractViolation[] = [];
+  if (!contract.contexts.includes(context)) {
+    violations.push({ field: "context", message: `${capability} does not support context policy ${context}` });
+  }
+  for (const credential of contract.minimum) {
+    if (!credentials.includes(credential)) {
+      violations.push({ field: "credentials", message: `${capability} requires credential scope ${credential}` });
+    }
+  }
+  for (const credential of credentials) {
+    if (!contract.allowed.includes(credential)) {
+      violations.push({ field: "credentials", message: `${capability} is not authorized for credential scope ${credential}` });
+    }
+  }
+  for (const artifact of requiredArtifacts) {
+    if (!contract.artifacts.includes(artifact)) {
+      violations.push({ field: "artifacts", message: `${capability} cannot produce required artifact ${artifact}` });
+    }
+  }
+  return violations;
 }
 
 export function capabilityRequiresCredential(capability: string, credential: string): boolean {

@@ -15,6 +15,7 @@ import { parseDocument } from "yaml";
 import {
   FOR_EACH_UNIT_CAPABILITY,
   REPOSITORY_SKILL_CAPABILITY,
+  capabilityCredentialContractViolations,
   capabilityRequiresCredential,
 } from "./capability-contracts.js";
 
@@ -388,6 +389,20 @@ function validateUnitPhaseBindings(
     if (canonicalJson(binding.credentials) !== canonicalJson(binding.worker.credentials)) {
       fail(`${path}[${index}].credentials`, "must match worker.credentials");
     }
+    validateUnitPhaseBindingCapabilityContract(binding, `${path}[${index}]`);
+  }
+}
+
+function validateUnitPhaseBindingCapabilityContract(
+  binding: PipelineUnitAgentPhaseBinding,
+  path: string
+): void {
+  for (const violation of capabilityCredentialContractViolations({
+    capability: binding.executor.capability,
+    context: binding.context,
+    credentials: binding.credentials,
+  })) {
+    fail(`${path}.${violation.field}`, violation.message);
   }
 }
 

@@ -61,13 +61,34 @@ function firstStage(value: Record<string, unknown>): Record<string, unknown> {
   return (value.stages as Array<Record<string, unknown>>)[0]!;
 }
 
+function manifestWithUnitBindingCapability(
+  value: Record<string, unknown>,
+  index: number,
+  capability: string,
+  credentials?: string[],
+): Record<string, unknown> {
+  const output = structuredClone(value) as Record<string, unknown>;
+  const requires = output.requires as { capabilities: string[] };
+  if (!requires.capabilities.includes(capability)) {
+    requires.capabilities = [...requires.capabilities, capability];
+  }
+  const binding = (firstStage(output).unitPhaseBindings as Array<Record<string, unknown>>)[index]!;
+  (binding.loop as Record<string, unknown>).skill = `builtin://${capability}`;
+  binding.executor = { kind: "agent", capability };
+  if (credentials) {
+    binding.credentials = credentials;
+    (binding.worker as Record<string, unknown>).credentials = credentials;
+  }
+  return output;
+}
+
 function unitPhaseBindings(): unknown[] {
   const worker = {
     id: "worker",
     engine: "agent",
     allowed_mcp_servers: [],
     session_scope: "fresh",
-    credentials: ["model.invoke", "repo.read", "repo.write"],
+    credentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
   };
   const loop = {
     id: "loop",
@@ -88,7 +109,7 @@ function unitPhaseBindings(): unknown[] {
       worker,
       executor: { kind: "agent", capability: "ce/implement@1" },
       context: "fresh",
-      credentials: ["model.invoke", "repo.read", "repo.write"],
+      credentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
     },
     { id: "candidate", kind: "evidence" },
     {
@@ -550,6 +571,41 @@ describe("pipeline manifest validation", () => {
     });
     expect(() => validatePipelineManifest(value, { runtime: withoutModelCredential.descriptor }))
       .toThrow(/runtime capability mismatch.*credential:model\.invoke/);
+
+    expect(() => validatePipelineManifest(manifestWithUnitBindingCapability(
+      value,
+      0,
+      "ce/plan@1",
+      ["model.invoke", "repo.read", "repo.write"],
+    )))
+      .toThrow(/unitPhaseBindings\[0\]\.credentials: ce\/plan@1 is not authorized for credential scope repo\.write/);
+
+    expect(() => validatePipelineManifest(manifestWithUnitBindingCapability(
+      value,
+      0,
+      "ce/implement@1",
+      ["model.invoke", "provider.read", "repo.read"],
+    )))
+      .toThrow(/unitPhaseBindings\[0\]\.credentials: ce\/implement@1 requires credential scope repo\.write/);
+
+    expect(() => validatePipelineManifest(manifestWithUnitBindingCapability(value, 0, "ce/publish@1")))
+      .toThrow(/unitPhaseBindings\[0\]\.context: ce\/publish@1 does not support context policy fresh/);
+
+    expect(() => validatePipelineManifest(manifestWithUnitBindingCapability(
+      value,
+      2,
+      "accept-unit@1",
+      ["repo.read"],
+    )))
+      .toThrow(/unitPhaseBindings\[2\]\.credentials: accept-unit@1 requires credential scope model\.invoke/);
+
+    const validAcceptUnitGate = manifestWithUnitBindingCapability(value, 2, "accept-unit@1");
+    expect(validatePipelineManifest(validAcceptUnitGate).manifest.stages[0]?.unitPhaseBindings?.[2])
+      .toMatchObject({
+        kind: "gate",
+        executor: { kind: "agent", capability: "accept-unit@1" },
+        credentials: ["model.invoke", "repo.read"],
+      });
 
     const mismatchedContext = structuredClone(value) as Record<string, unknown>;
     const contextBinding =
