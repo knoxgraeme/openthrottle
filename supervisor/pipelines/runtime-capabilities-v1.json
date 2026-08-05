@@ -1,9 +1,10 @@
 {
   "schema": "openthrottle.runtime-capabilities/v1",
-  "release": "openthrottle-snapshot/v7",
+  "release": "openthrottle-snapshot/v8",
   "generatedBy": "sandbox-runtime-build",
   "protocol": "stage-executor@1",
   "capabilities": [
+    "agent/repository-skill@1",
     "agent/semantic@1",
     "ce/implement@1",
     "ce/investigate@1",

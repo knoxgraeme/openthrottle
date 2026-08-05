@@ -255,6 +255,22 @@ export function createServer(deps: ServerDeps): Hono {
 
   app.get("/healthz", (context) => context.json({ ok: true }));
 
+  // Authenticated, bounded evidence of the active runtime release: the CLI's
+  // pre-mutation structured-ship gate (RR5/RR9) reads this before any Linear
+  // access and must never activate structured mutation on an assumed or
+  // cached capability set.
+  app.get("/capabilities", (context) => {
+    if (!requireStatusAuth(context.req.header("Authorization"))) {
+      return context.json({ error: "unauthorized" }, 401);
+    }
+    const runtime = deps.pipelineCoordinator.runtime;
+    return context.json({
+      release: runtime.descriptor.release,
+      capabilityDigest: runtime.digest,
+      capabilities: runtime.descriptor.capabilities,
+    });
+  });
+
   app.get("/status", (context) => {
     if (!requireStatusAuth(context.req.header("Authorization"))) {
       return context.json({ error: "unauthorized" }, 401);

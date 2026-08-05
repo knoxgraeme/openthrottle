@@ -126,8 +126,14 @@ blob plus the package digest. Repository skill identity is separate from runtime
 execution authority: compiled stages use the platform-owned
 `agent/repository-skill@1` capability while carrying the canonical repository
 skill reference, invocation name, pinned package files, and package digest in
-the manifest and sealed request. Production remains fail closed until a later
-runtime activation installs that capability and dispatcher.
+the manifest and sealed request. Production advertises `agent/repository-skill@1`
+in its installed runtime capability descriptor, so a `run` node backed by a
+repository skill is reachable through the existing whole-attempt dispatch path.
+The composite `graph/for-each-unit@1` capability (structured multi-unit
+execution) remains fail closed in production: the descriptor omits it until
+the composition root that constructs and drains the child unit runtime is
+installed, so admission and the CLI's pre-mutation ship check (below) both
+continue to reject an explicit structured selection before any Linear access.
 
 Catalog aliases resolve to exact manifest id/version pairs. Repository config
 may override the implement or investigate alias, but cannot supply arbitrary
@@ -436,6 +442,7 @@ untrusted webhook bodies are never automatically attached to Linear or a PR.
 | `GET` | `/oauth/install` | `OT_INSTALL_SECRET` bearer | begin Linear OAuth |
 | `GET` | `/oauth/callback` | one-time OAuth state | exchange and store installation |
 | `GET` | `/status` | `OT_STATUS_TOKEN` bearer | tickets and pipeline/effect/publication state |
+| `GET` | `/capabilities` | `OT_STATUS_TOKEN` bearer | active runtime release, capability digest, and capability IDs |
 | `GET` | `/repositories` | `OT_STATUS_TOKEN` bearer | registered routes |
 | `POST` | `/repositories/register` | `OT_STATUS_TOKEN` bearer | verify and upsert route/webhook |
 | `POST` | `/tickets/:id/stop` | `OT_STATUS_TOKEN` bearer | coordinator stop |
@@ -465,6 +472,15 @@ instance, the nested `pipeline` object includes:
 | `published_pr_url` | published pull request URL when known |
 | `last_error` | newest failed/dead effect or failed gate summary, sanitized and capped at 500 chars |
 | `last_state_change_at` | pipeline instance state-change timestamp |
+
+`GET /capabilities` returns the installed runtime capability descriptor's
+`release`, `capabilityDigest`, and `capabilities` array, read directly off the
+same `ValidatedRuntimeCapabilityDescriptor` admission validates every pipeline
+against. The CLI's structured `ship` command queries this endpoint as a
+pre-mutation activation check (see "CLI contract" below): explicit structured
+selection never proceeds to any Linear call, let alone mutation, when the
+endpoint is unreachable, unauthenticated, or its response is missing,
+malformed, or does not list the exact structured capability.
 
 ## Persistence contract
 
@@ -633,6 +649,14 @@ secret checklist. `openthrottle init` detects the GitHub origin/default branch,
 writes `.openthrottle.yml`, and idempotently registers the Linear-team route and
 GitHub webhook. `openthrottle ship <plan.md>` creates and delegates a Linear
 issue. `status`, `stop`, and `logs` call authenticated supervisor endpoints.
+
+An explicit structured (unit-consuming) graph selection adds one pre-mutation
+step to `ship`: before any Linear call, the CLI calls the configured
+supervisor's `GET /capabilities` and requires the exact `graph/for-each-unit@1`
+capability in the response. Unreachable, unauthenticated, missing, or
+malformed/stale evidence fails closed with a stable error and never falls back
+to `simple`; only a matching, well-formed response permits the ship to
+proceed to team resolution and issue creation.
 
 The CLI never creates per-project snapshots or configures routing fallbacks.
 
