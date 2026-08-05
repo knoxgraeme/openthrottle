@@ -17,6 +17,7 @@ function configPath() {
 const INTEGRATION_REPO_DIR = "/home/agent/repo";
 const WORKTREE_ROOT = "/var/lib/openthrottle/worktrees";
 const GIT_OBJECT_ID = /^[a-f0-9]{40,64}$/;
+const GIT_SHA1_OBJECT_ID = /^[a-f0-9]{40}$/;
 
 function arg(name, fallback) {
   const index = process.argv.indexOf(name);
@@ -62,6 +63,13 @@ function validateRequest(value) {
 
 function subject(value, label) {
   if (typeof value !== "string" || !GIT_OBJECT_ID.test(value)) throw new Error(`${label} is invalid`);
+  return value;
+}
+
+function sha1Subject(value, label) {
+  if (typeof value !== "string" || !GIT_SHA1_OBJECT_ID.test(value)) {
+    throw new Error(`${label} must be a 40-character Git object ID`);
+  }
   return value;
 }
 
@@ -164,7 +172,7 @@ function commandReceipt(request, {
     payload: {
       command: commandName,
       exit_code: execution.exitCode ?? 1,
-      summary: command ? `Repository command ${commandName} exited with ${execution.exitCode}.` : `Repository command ${commandName} is not configured.`,
+      summary: `Repository command ${commandName} exited with ${execution.exitCode}.`,
       stdout_digest: digest(execution.stdout ?? ""),
       stderr_digest: digest(execution.stderr ?? ""),
     },
@@ -172,12 +180,13 @@ function commandReceipt(request, {
 }
 
 function candidateReceipt(request) {
+  const baseSubject = sha1Subject(request.baseSubject, "baseSubject");
   const candidate = deriveCandidateCommit({
     worktreeDir: repoDirFor(request),
-    baseCommit: request.baseSubject.slice(0, 40),
+    baseCommit: baseSubject,
     message: `OpenThrottle candidate ${request.actionId}`,
   });
-  const candidateSubject = candidate.candidateCommit ?? request.baseSubject.slice(0, 40);
+  const candidateSubject = candidate.candidateCommit ?? baseSubject;
   return receiptBase({
     request,
     type: "candidate_evidence",
@@ -186,7 +195,7 @@ function candidateReceipt(request) {
     payload: {
       tree: candidate.tree,
       diff_digest: digest(canonicalJson({
-        base: request.baseSubject.slice(0, 40),
+        base: baseSubject,
         tree: candidate.tree,
         changed_paths: candidate.changedPaths,
       })),
@@ -197,10 +206,12 @@ function candidateReceipt(request) {
 }
 
 function integrationReceipt(request) {
+  const inputSubject = sha1Subject(request.inputSubject, "inputSubject");
+  const candidateSubject = sha1Subject(request.candidateSubject, "candidateSubject");
   const evidence = integrateCandidate({
     repoDir: INTEGRATION_REPO_DIR,
-    expectedHead: request.inputSubject.slice(0, 40),
-    candidateCommit: request.candidateSubject,
+    expectedHead: inputSubject,
+    candidateCommit: candidateSubject,
   });
   return receiptBase({
     request,

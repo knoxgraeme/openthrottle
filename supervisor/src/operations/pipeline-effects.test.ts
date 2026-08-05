@@ -278,6 +278,22 @@ describe("pipeline effect processor", () => {
     });
   }
 
+  function repositorySkillPackage() {
+    return {
+      schema: "openthrottle.repository-skill-package/v1" as const,
+      reference: `repo://owner/repo@${"a".repeat(40)}#.agents/skills/implement-unit`,
+      invocation: "implement_unit",
+      directory: ".agents/skills/implement-unit",
+      commit: "a".repeat(40),
+      packageDigest: "d".repeat(64),
+      files: [{
+        path: ".agents/skills/implement-unit/SKILL.md",
+        blobSha: "b".repeat(40),
+        digest: "c".repeat(64),
+      }],
+    };
+  }
+
   it("provisions, seals, credentials, and dispatches the first stage exactly through the durable intent", async () => {
     db = openDb(":memory:");
     const pipelines = createPipelineStore(db);
@@ -570,6 +586,189 @@ describe("pipeline effect processor", () => {
     expect(pipelines.listUnits(attempt.id)).toEqual([
       expect.objectContaining({ unitId: "unit_a", status: "running" }),
     ]);
+
+    const dispatchedAction = pipelines.listWorkAttempts(attempt.id)[0]!;
+    db!.prepare(`
+      UPDATE execution_work_attempts
+      SET request_hash = NULL, native_session_id = NULL
+      WHERE id = ?
+    `).run(dispatchedAction.id);
+    runtime.createWorktree.mockClear();
+    runtime.dispatchLoopAction.mockClear();
+
+    await processor.drain();
+
+    expect(runtime.createWorktree).not.toHaveBeenCalled();
+    expect(runtime.dispatchLoopAction).toHaveBeenCalledWith(
+      { providerResourceId: "sandbox-structured" },
+      expect.objectContaining({
+        actionId: dispatchedAction.id,
+        worktree: { id: expect.any(String) },
+      })
+    );
+  });
+
+  it("dispatches repository-skill unit phases with the pinned invocation name", async () => {
+    db = openDb(":memory:");
+    const pipelines = createPipelineStore(db);
+    const tickets = createSupervisorStore(db, pipelines);
+    const baseRuntimeDescriptor = buildInstalledRuntimeDescriptor("structured-repo-skill-base/v1");
+    const runtimeDescriptor = buildInstalledRuntimeDescriptor("structured-repo-skill-test/v1", {
+      capabilities: [
+        ...baseRuntimeDescriptor.descriptor.capabilities,
+        "agent/repository-skill@1",
+      ],
+    });
+    const catalog = loadPipelineCatalog(catalogPath, runtimeDescriptor.descriptor);
+    pipelines.acceptRuntimeDescriptor(runtimeDescriptor);
+    pipelines.acceptCatalog(catalog);
+    const repositoryConfig = parseRepositoryConfig([
+      "schema: openthrottle.config/v1",
+      "default_graph: simple",
+      "graphs:",
+      "  - id: simple",
+      "    kind: builtin",
+      "    ref: core/simple@1",
+      "  - id: structured",
+      "    kind: builtin",
+      "    ref: core/structured@1",
+      "commands: { test: npm test, lint: npm run lint, build: npm run build }",
+      "pipelines: { implement: implement }",
+    ].join("\n"));
+    const config = pipelines.saveRepositoryConfigSnapshot({
+      repository: "owner/repo",
+      baseCommit: "a".repeat(40),
+      blobSha: "b".repeat(40),
+      config: repositoryConfig,
+    });
+    const repoSkill = repositorySkillPackage();
+    const graph = {
+      schema: "openthrottle.graph/v1",
+      id: "fixture/repo-skill-units",
+      version: 1,
+      entry_node: "units",
+      workers: [{
+        id: "repo-worker",
+        engine: "agent",
+        skills: ["repo://implement_unit"],
+        allowed_mcp_servers: [],
+        session_scope: "fresh",
+        credentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+      }, {
+        id: "lead-worker",
+        engine: "agent",
+        skills: ["builtin://accept-unit@1"],
+        allowed_mcp_servers: [],
+        session_scope: "fresh",
+        credentials: ["model.invoke", "repo.read"],
+      }],
+      loops: [{
+        id: "repo-loop",
+        worker: "repo-worker",
+        skill: "repo://implement_unit",
+        input_scope: "unit",
+        receipt: "unit_completion",
+        max_parallel: 1,
+        max_rounds: 1,
+        timeout_seconds: 60,
+      }, {
+        id: "lead-loop",
+        worker: "lead-worker",
+        skill: "builtin://accept-unit@1",
+        input_scope: "unit",
+        receipt: "unit_decision",
+        max_parallel: 1,
+        max_rounds: 1,
+        timeout_seconds: 60,
+      }],
+      nodes: [{
+        id: "units",
+        kind: "for_each_unit",
+        phases: [
+          { id: "implement", kind: "agent", loop: "repo-loop" },
+          { id: "candidate", kind: "evidence" },
+          { id: "lead", kind: "gate", loop: "lead-loop" },
+          { id: "integrate", kind: "integrate" },
+        ],
+        depends_on: [],
+        transitions: {
+          success: { terminal: "completed" },
+          repair_required: { terminal: "needs_human" },
+          retryable_failure: { terminal: "failed" },
+          failure: { terminal: "failed" },
+        },
+      }],
+    };
+    const manifest = parseAndCompileExecutionGraph(JSON.stringify(graph), {
+      id: "fixture/repo-skill-units",
+      runtime: runtimeDescriptor.descriptor,
+      repositorySkills: new Map([["implement_unit", repoSkill]]),
+    }).manifest;
+    pipelines.acceptManifest(manifest);
+    const executionPlan = {
+      schema: "openthrottle.execution-plan/v1",
+      graph_id: "structured",
+      plan_id: "structured-repo-skill",
+      instructions: { implement_a: "Implement unit A." },
+      acceptance: { unit_a_done: "Unit A is complete." },
+      units: [{
+        id: "unit_a",
+        title: "Unit A",
+        depends_on: [],
+        instructions: ["implement_a"],
+        acceptance: ["unit_a_done"],
+      }],
+      commands: [],
+    };
+    tickets.upsert({
+      linear_issue_id: "issue-repo-skill",
+      linear_issue_identifier: "OT-REPO-SKILL",
+      linear_session_id: "session-repo-skill",
+      sandbox_id: null,
+      branch: "ot/repo-skill",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+      pipeline: {
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        manifest,
+        repositoryConfig: config,
+        runtime: runtimeDescriptor,
+        authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
+        taskContext: [
+          "Approved structured plan.",
+          "",
+          "```json openthrottle.execution-plan/v1",
+          JSON.stringify(executionPlan, null, 2),
+          "```",
+        ].join("\n"),
+      },
+    });
+    const instance = pipelines.getInstanceForSession("session-repo-skill")!;
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    const runtime = sandboxRuntimeMock({ issueId: "repo-skill" });
+    const processor = createPipelineEffectProcessor({
+      store: pipelines,
+      tickets,
+      runtime,
+      taskTimeoutSeconds: 300,
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+    });
+
+    await processor.drain();
+
+    expect(runtime.dispatchLoopAction).toHaveBeenCalledWith(
+      { providerResourceId: "sandbox-repo-skill" },
+      expect.objectContaining({
+        protocol: "loop-action@2",
+        attemptId: attempt.id,
+        skill: "implement_unit",
+        repositorySkill: repoSkill,
+      })
+    );
   });
 
   it("drains graph-declared child executor actions and lead candidate receipts through the composite host", async () => {
@@ -674,9 +873,11 @@ describe("pipeline effect processor", () => {
       now: () => new Date("2099-07-22T12:00:00.000Z"),
     });
     const completedSubject = "1".repeat(40);
+    const simplifiedSubject = "7".repeat(40);
     const candidateSubject = "2".repeat(40);
     const integratedSubject = "3".repeat(40);
     const completedSubjectB = "4".repeat(40);
+    const simplifiedSubjectB = "8".repeat(40);
     const candidateSubjectB = "5".repeat(40);
     const integratedSubjectB = "6".repeat(40);
     const latestAction = (kind: ExecutionWorkAttempt["action_kind"]) => {
@@ -722,6 +923,7 @@ describe("pipeline effect processor", () => {
       unitId: string;
       baseSubject: string;
       completed: string;
+      simplified: string;
       candidate: string;
       integrated: string;
     }) => {
@@ -776,13 +978,22 @@ describe("pipeline effect processor", () => {
           unitId: input.unitId,
         })
       );
-      completeUnitAction("simplify", input.completed, "unit_completion", {
+      const simplify = completeUnitAction("simplify", input.simplified, "unit_completion", {
         baseSubject: input.baseSubject,
         preSubject: input.completed,
         nativeSessionId: `thread-${input.unitId}`,
       });
+      db!.prepare(`
+        UPDATE execution_work_attempts
+        SET created_at = CASE id
+          WHEN ? THEN '2100-01-01T00:00:00.000Z'
+          WHEN ? THEN '2099-01-01T00:00:00.000Z'
+          ELSE created_at
+        END
+        WHERE id IN (?, ?)
+      `).run(implement.id, simplify.id, implement.id, simplify.id);
 
-      await drainCommandActions("command", input.completed, input.baseSubject);
+      await drainCommandActions("command", input.simplified, input.baseSubject);
 
       await processor.drain();
       expect(runtime.dispatchChildExecutorAction).toHaveBeenLastCalledWith(
@@ -790,13 +1001,13 @@ describe("pipeline effect processor", () => {
         expect.objectContaining({
           protocol: "child-executor-action@1",
           actionKind: "candidate",
-          inputSubject: input.completed,
+          inputSubject: input.simplified,
           unitId: input.unitId,
         })
       );
       completeUnitAction("candidate", input.candidate, "candidate_evidence", {
         baseSubject: input.baseSubject,
-        preSubject: input.completed,
+        preSubject: input.simplified,
       });
 
       await processor.drain();
@@ -866,6 +1077,7 @@ describe("pipeline effect processor", () => {
       unitId: "unit_a",
       baseSubject: "a".repeat(40),
       completed: completedSubject,
+      simplified: simplifiedSubject,
       candidate: candidateSubject,
       integrated: integratedSubject,
     });
@@ -873,6 +1085,7 @@ describe("pipeline effect processor", () => {
       unitId: "unit_b",
       baseSubject: integratedSubject,
       completed: completedSubjectB,
+      simplified: simplifiedSubjectB,
       candidate: candidateSubjectB,
       integrated: integratedSubjectB,
     });
@@ -990,6 +1203,30 @@ describe("pipeline effect processor", () => {
       receipt: receiptJson({ instance, action: freshReview, type: "semantic_review", subject: finalIntegratedSubject }),
       decision: gateDecision({ gateKind: "final_review", subject: finalIntegratedSubject }),
     });
+
+    const mismatchedReviewSubject = "f".repeat(40);
+    db!.prepare(`
+      UPDATE execution_work_attempts
+      SET output_subject = ?, receipt = ?, updated_at = ?
+      WHERE id = ?
+    `).run(
+      mismatchedReviewSubject,
+      receiptJson({ instance, action: freshReview, type: "semantic_review", subject: mismatchedReviewSubject }),
+      "2099-07-22T12:00:00.000Z",
+      freshReview.id
+    );
+    await expect(processor.drain()).rejects.toThrow(/final review subject to match the integrated subject/);
+    db!.prepare(`
+      UPDATE execution_work_attempts
+      SET output_subject = ?, receipt = ?, result_hash = ?, updated_at = ?
+      WHERE id = ?
+    `).run(
+      finalIntegratedSubject,
+      receiptJson({ instance, action: freshReview, type: "semantic_review", subject: finalIntegratedSubject }),
+      "result-review-fresh-restored",
+      "2099-07-22T12:00:00.000Z",
+      freshReview.id
+    );
 
     const beforeAggregateStatus = pipelines.getInstance(instance.id)!.status;
     db!.prepare("UPDATE pipeline_instances SET status = 'publication_blocked' WHERE id = ?").run(instance.id);

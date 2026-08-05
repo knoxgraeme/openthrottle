@@ -44,13 +44,17 @@ function childExecutorRequest(overrides = {}) {
   };
 }
 
+function useRepositoryConfig(commands) {
+  const configDir = mkdtempSync(join(tmpdir(), "ot-child-action-config-"));
+  directories.push(configDir);
+  const configPath = join(configDir, "repository-config.json");
+  writeFileSync(configPath, JSON.stringify({ commands }));
+  process.env.OT_STAGE_CONFIG_FILE = configPath;
+}
+
 describe("child executor action", () => {
   it("binds unconfigured command receipts to the sealed input subject without reading the tree", async () => {
-    const configDir = mkdtempSync(join(tmpdir(), "ot-child-action-config-"));
-    directories.push(configDir);
-    const configPath = join(configDir, "repository-config.json");
-    writeFileSync(configPath, JSON.stringify({ commands: {} }));
-    process.env.OT_STAGE_CONFIG_FILE = configPath;
+    useRepositoryConfig({});
 
     const request = childExecutorRequest();
     const result = executeChildAction({ request });
@@ -93,14 +97,60 @@ describe("child executor action", () => {
       worktree: null,
     });
     expect(() => executeChildAction({ request: unitScopedFinalCommand })).toThrow(/final command must be graph-scoped/);
+
+    const missingCandidateWorktree = childExecutorRequest({
+      actionId: "action-candidate-missing-worktree",
+      actionKind: "candidate",
+      commandName: undefined,
+      worktree: null,
+    });
+    expect(() => executeChildAction({ request: missingCandidateWorktree })).toThrow(/candidate action requires a worktree/);
+
+    const missingIntegrationCandidate = childExecutorRequest({
+      actionId: "action-integrate-missing-candidate",
+      actionKind: "integrate",
+      commandName: undefined,
+      worktree: null,
+    });
+    expect(() => executeChildAction({ request: missingIntegrationCandidate })).toThrow(/integration action requires a candidate subject/);
+  });
+
+  it("fails closed instead of truncating unsupported child git operation subjects", () => {
+    const candidate = childExecutorRequest({
+      actionId: "action-candidate-sha256",
+      actionKind: "candidate",
+      commandName: undefined,
+      baseSubject: "1".repeat(64),
+      inputSubject: "2".repeat(64),
+    });
+    expect(() => executeChildAction({
+      request: candidate,
+      computeSubject: () => "3".repeat(64),
+    })).toThrow(/baseSubject must be a 40-character Git object ID/);
+
+    const integrate = childExecutorRequest({
+      actionId: "action-integrate-sha256",
+      actionKind: "integrate",
+      commandName: undefined,
+      worktree: null,
+      baseSubject: "1".repeat(64),
+      inputSubject: "2".repeat(64),
+      candidateSubject: "3".repeat(64),
+    });
+    expect(() => executeChildAction({ request: integrate })).toThrow(/inputSubject must be a 40-character Git object ID/);
+
+    const invalidCandidate = childExecutorRequest({
+      actionId: "action-integrate-candidate-sha256",
+      actionKind: "integrate",
+      commandName: undefined,
+      worktree: null,
+      candidateSubject: "3".repeat(64),
+    });
+    expect(() => executeChildAction({ request: invalidCandidate })).toThrow(/candidateSubject must be a 40-character Git object ID/);
   });
 
   it("grants and relocks configured unit command worktrees around execution and subject collection", () => {
-    const configDir = mkdtempSync(join(tmpdir(), "ot-child-action-config-"));
-    directories.push(configDir);
-    const configPath = join(configDir, "repository-config.json");
-    writeFileSync(configPath, JSON.stringify({ commands: { test: "npm test" } }));
-    process.env.OT_STAGE_CONFIG_FILE = configPath;
+    useRepositoryConfig({ test: "npm test" });
 
     const events = [];
     const request = childExecutorRequest({ commandName: "test" });
@@ -136,11 +186,7 @@ describe("child executor action", () => {
   });
 
   it("relocks configured unit command worktrees when command execution throws", () => {
-    const configDir = mkdtempSync(join(tmpdir(), "ot-child-action-config-"));
-    directories.push(configDir);
-    const configPath = join(configDir, "repository-config.json");
-    writeFileSync(configPath, JSON.stringify({ commands: { test: "npm test" } }));
-    process.env.OT_STAGE_CONFIG_FILE = configPath;
+    useRepositoryConfig({ test: "npm test" });
 
     const lockWorktreeHandle = vi.fn();
     const request = childExecutorRequest({ commandName: "test" });

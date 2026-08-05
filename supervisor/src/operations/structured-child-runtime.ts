@@ -38,6 +38,22 @@ import { sanitizeText } from "../shared/sanitize.js";
 import { createUnitEffectProcessor } from "./unit-effects.js";
 
 const GIT_SUBJECT = /^[a-f0-9]{40,64}$/;
+const GIT_SHA1_SUBJECT = /^[a-f0-9]{40}$/;
+const ACTION_OUTPUT_ORDER: Record<UnitActionKind, number> = {
+  implement: 10,
+  repair: 10,
+  simplify: 20,
+  command: 30,
+  candidate: 40,
+  lead: 50,
+  integrate: 60,
+  final_repair: 10,
+  final_command: 20,
+  final_review: 30,
+  aggregate: 40,
+  stop: 40,
+  cleanup: 40,
+};
 
 type StructuredChildRuntimeDeps = {
   store: PipelineStore & ExecutionUnitStore;
@@ -220,6 +236,20 @@ function worktreeHandleFor(action: ExecutionWorkAttempt, baseCommit: string): { 
   };
 }
 
+function compareAttemptOrder(left: ExecutionWorkAttempt, right: ExecutionWorkAttempt): number {
+  return ACTION_OUTPUT_ORDER[left.action_kind] - ACTION_OUTPUT_ORDER[right.action_kind] ||
+    left.attempt_ordinal - right.attempt_ordinal ||
+    left.created_at.localeCompare(right.created_at) ||
+    left.id.localeCompare(right.id);
+}
+
+function sha1SubjectForGitOperation(subject: string, label: string): string {
+  if (!GIT_SHA1_SUBJECT.test(subject)) {
+    throw new Error(`${label} must be a 40-character Git object ID for child Git operations`);
+  }
+  return subject;
+}
+
 function finalRepairWorktreeHandleFor(
   action: ExecutionWorkAttempt,
   baseCommit: string,
@@ -255,16 +285,22 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
   const latestPriorOutputSubject = (
     action: ExecutionWorkAttempt,
     kinds: readonly UnitActionKind[]
-  ): string | undefined =>
-    [...deps.store.listWorkAttempts(action.parent_attempt_id)]
-      .filter((attempt) =>
+  ): string | undefined => {
+    const attempts = deps.store.listWorkAttempts(action.parent_attempt_id);
+    let latest: ExecutionWorkAttempt | undefined;
+    for (const attempt of attempts) {
+      if (
         attempt.status === "completed" &&
         attempt.output_subject &&
         attempt.unit_id === action.unit_id &&
         attempt.cycle === action.cycle &&
         kinds.includes(attempt.action_kind)
-      )
-      .reverse()[0]?.output_subject ?? undefined;
+      ) {
+        latest = latest && compareAttemptOrder(latest, attempt) > 0 ? latest : attempt;
+      }
+    }
+    return latest?.output_subject ?? undefined;
+  };
 
   const actionInputSubjectFor = (instance: PipelineInstance, action: ExecutionWorkAttempt): string => {
     const base = worktreeBaseFor(instance, action);
@@ -378,8 +414,13 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
   const completedAttemptReceiptsFor = (parentAttemptId: string): Array<{
     attempt: ExecutionWorkAttempt;
     receipt: StandardReceipt;
+  }> => completedAttemptReceiptsFrom(deps.store.listWorkAttempts(parentAttemptId));
+
+  const completedAttemptReceiptsFrom = (attempts: readonly ExecutionWorkAttempt[]): Array<{
+    attempt: ExecutionWorkAttempt;
+    receipt: StandardReceipt;
   }> =>
-    deps.store.listWorkAttempts(parentAttemptId)
+    attempts
       .filter((attempt) => attempt.status === "completed" && attempt.receipt)
       .map((attempt) => ({
         attempt,
@@ -392,16 +433,17 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     unitId: string | null,
     cycle?: number
   ): { attempt: ExecutionWorkAttempt; receipt: T } => {
-    for (let index = receipts.length - 1; index >= 0; index -= 1) {
-      const entry = receipts[index]!;
+    let latest: { attempt: ExecutionWorkAttempt; receipt: StandardReceipt } | undefined;
+    for (const entry of receipts) {
       if (
         entry.receipt.type === type &&
         entry.receipt.fence.unit_id === (unitId ?? "__final__") &&
         (cycle === undefined || entry.attempt.cycle === cycle)
       ) {
-        return { attempt: entry.attempt, receipt: entry.receipt as T };
+        latest = latest && compareAttemptOrder(latest.attempt, entry.attempt) > 0 ? latest : entry;
       }
     }
+    if (latest) return { attempt: latest.attempt, receipt: latest.receipt as T };
     throw new Error(`missing ${type} receipt for ${unitId ?? "final"}`);
   };
 
@@ -441,7 +483,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     action: ExecutionWorkAttempt
   ): Promise<{ requestHash: string; nativeSessionId?: string | null }> => {
     if (isChildExecutorActionKind(action.action_kind)) {
-      const baseSubject = worktreeBaseFor(instance, action).slice(0, 40);
+      const baseSubject = sha1SubjectForGitOperation(worktreeBaseFor(instance, action), "child action base subject");
       const candidateSubject = action.action_kind === "integrate"
         ? action.unit_id === null
           ? latestAttemptReceipt<CandidateEvidenceReceipt>(
@@ -455,6 +497,9 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       if (action.action_kind === "integrate" && !candidateSubject) {
         throw new Error(`child integration action ${action.id} has no accepted candidate subject`);
       }
+      const integrationCandidateSubject = candidateSubject
+        ? sha1SubjectForGitOperation(candidateSubject, "child integration candidate subject")
+        : undefined;
       const request = buildChildExecutorActionRequest({
         protocol: "child-executor-action@1",
         actionId: action.id,
@@ -475,7 +520,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
             : {}),
         baseSubject,
         inputSubject: actionInputSubjectFor(instance, action),
-        ...(candidateSubject ? { candidateSubject } : {}),
+        ...(integrationCandidateSubject ? { candidateSubject: integrationCandidateSubject } : {}),
       });
       await deps.runtime.dispatchChildExecutorAction(resource, request);
       return { requestHash: request.requestHash, nativeSessionId: null };
@@ -485,19 +530,19 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     if (!workerBinding) {
       throw new Error(`child action kind ${action.action_kind} is executor-owned and cannot dispatch as a loop agent`);
     }
-    const baseCommit = worktreeBaseFor(instance, action).slice(0, 40);
+    const baseCommit = sha1SubjectForGitOperation(worktreeBaseFor(instance, action), "child action base subject");
     const createNewWorktree = action.action_kind === "implement" ||
       action.action_kind === "repair" ||
       action.action_kind === "final_repair";
-    const worktree = roleFor(action.action_kind) === "worker"
-      ? createNewWorktree
-        ? await deps.runtime.createWorktree(resource, {
-          idempotencyKey: worktreeIdempotencyKey(action),
-          attemptId: action.parent_attempt_id,
-          baseCommit,
-        })
-        : worktreeHandleFor(action, baseCommit)
-      : null;
+    const worktree = await (async (): Promise<LoopActionRequest["worktree"]> => {
+      if (roleFor(action.action_kind) !== "worker") return null;
+      if (!createNewWorktree || action.status === "dispatched") return worktreeHandleFor(action, baseCommit);
+      return deps.runtime.createWorktree(resource, {
+        idempotencyKey: worktreeIdempotencyKey(action),
+        attemptId: action.parent_attempt_id,
+        baseCommit,
+      });
+    })();
     const contextPolicy = workerBinding.context === "none"
       ? "fresh"
       : workerBinding.context === "resume_required" && !action.native_session_id
@@ -515,7 +560,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       agent: workerBinding?.worker.agent && workerBinding.worker.agent !== "inherit"
         ? workerBinding.worker.agent
         : instance.agent,
-      skill: adapterSkillFor(action.action_kind),
+      skill: workerBinding.repositorySkill?.invocation ?? adapterSkillFor(action.action_kind),
       worktree,
       nativeSessionId: action.native_session_id,
       contextPolicy,
@@ -575,6 +620,17 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     const nativeSessionId: string | null = "nativeSessionId" in result
       ? (result as { nativeSessionId: string | null }).nativeSessionId
       : null;
+    const collected = (
+      outputSubject: string,
+      receipt: StandardReceipt,
+      decision?: ReturnType<typeof evaluateUnitAcceptanceGate>
+    ) => ({
+      resultHash: digestNormalized(canonicalJson(result)),
+      outputSubject,
+      receipt: canonicalJson(receipt),
+      nativeSessionId,
+      ...(decision ? { decision } : {}),
+    });
     let receipt: StandardReceipt;
     try {
       receipt = parseStandardReceipt(result.receipt, { source: `child_action.${action.id}.receipt` }).value;
@@ -621,13 +677,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         })(),
         lead: receipt as UnitDecisionReceipt,
       });
-      return {
-        resultHash: digestNormalized(canonicalJson(result)),
-        outputSubject: acceptedSubject,
-        receipt: canonicalJson(receipt),
-        nativeSessionId,
-        decision,
-      };
+      return collected(acceptedSubject, receipt, decision);
     }
     if (action.action_kind === "integrate") {
       if (receipt.type !== "integration_evidence") {
@@ -638,13 +688,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         expected: standardFenceFor(instance, action, integrationSubject),
         integration: receipt as IntegrationEvidenceReceipt,
       });
-      return {
-        resultHash: digestNormalized(canonicalJson(result)),
-        outputSubject: integrationSubject,
-        receipt: canonicalJson(receipt),
-        nativeSessionId,
-        decision,
-      };
+      return collected(integrationSubject, receipt, decision);
     }
     if (action.action_kind === "final_review") {
       if (receipt.type !== "semantic_review") {
@@ -664,13 +708,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         expectedCommandNames: graph ? JSON.parse(graph.command_names) as string[] : [],
         review: receipt as SemanticReviewReceipt,
       });
-      return {
-        resultHash: digestNormalized(canonicalJson(result)),
-        outputSubject: reviewSubject,
-        receipt: canonicalJson(receipt),
-        nativeSessionId,
-        decision,
-      };
+      return collected(reviewSubject, receipt, decision);
     }
     const expectedType = action.action_kind === "command" || action.action_kind === "final_command"
       ? "command_result"
@@ -686,12 +724,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         candidate: receipt as CandidateEvidenceReceipt,
       });
     }
-    return {
-      resultHash: digestNormalized(canonicalJson(result)),
-      outputSubject: resultSubject,
-      receipt: canonicalJson(receipt),
-      nativeSessionId,
-    };
+    return collected(resultSubject, receipt);
   };
 
   return {
@@ -744,6 +777,16 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       const aggregateSubject = graph.integration_subject ?? parentAttempt.expected_subject ?? instance.immutable_subject ?? instance.base_commit;
       if (!aggregateSubject || !GIT_SUBJECT.test(aggregateSubject)) {
         throw new Error(`structured aggregate ${parentAttemptId} has no exact subject`);
+      }
+      if (outcome === "success") {
+        const finalReviewSubject = latestAttemptReceipt<SemanticReviewReceipt>(
+          completedAttemptReceiptsFrom(attempts),
+          "semantic_review",
+          null
+        ).receipt.subject.post;
+        if (finalReviewSubject !== aggregateSubject) {
+          throw new Error("structured aggregate success requires the fresh final review subject to match the integrated subject");
+        }
       }
       const event = buildAggregateStageEvent({
         id: `execution-aggregate:${parentAttemptId}:${aggregateSubject}:${outcome}`,
