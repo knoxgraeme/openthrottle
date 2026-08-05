@@ -871,7 +871,7 @@ export function executeLoopAction({
         ? "retryable_infrastructure_failure"
         : failed ? "failure" : "success",
       native_session_id: execution.nativeSessionId ?? request.nativeSessionId ?? null,
-      subject,
+      subject: subject ?? parsedReceipt?.subject?.post ?? null,
       receipt: parsedReceipt
         ? canonicalJson(parsedReceipt)
         : sanitizeArtifactText(retryableInfrastructureFailure

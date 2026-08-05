@@ -21,6 +21,13 @@ export const CAPABILITY_CONTRACTS = Object.freeze({
     contexts: ["fresh", "resume_required", "prefer_resume"],
     artifacts: ["stage_result", "review"],
   },
+  "accept-unit@1": {
+    kind: "agent",
+    minimumCredentials: ["model.invoke", "repo.read"],
+    allowedCredentials: ["model.invoke", "repo.read"],
+    contexts: ["fresh", "resume_required", "prefer_resume"],
+    artifacts: ["stage_result"],
+  },
   "ce/implement@1": {
     kind: "agent",
     minimumCredentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
@@ -70,6 +77,13 @@ export const CAPABILITY_CONTRACTS = Object.freeze({
     contexts: ["none"],
     artifacts: ["stage_result", "command_result"],
   },
+  "graph/for-each-unit@1": {
+    kind: "loop_action",
+    minimumCredentials: ["repo.read", "repo.write"],
+    allowedCredentials: ["provider.read", "repo.read", "repo.write"],
+    contexts: ["none"],
+    artifacts: ["stage_result", "execution_graph_result"],
+  },
   "loop-action@2": {
     kind: "loop_action",
     minimumCredentials: ["model.invoke", "repo.read"],
@@ -88,7 +102,7 @@ export const CAPABILITY_CONTRACTS = Object.freeze({
 
 export const RUNTIME_DESCRIPTOR = Object.freeze({
   schema: "openthrottle.runtime-capabilities/v1",
-  release: "openthrottle-snapshot/v8",
+  release: "openthrottle-snapshot/v9",
   generatedBy: "sandbox-runtime-build",
   protocol: STAGE_EXECUTOR_PROTOCOL,
   capabilities: Object.keys(CAPABILITY_CONTRACTS).sort(),

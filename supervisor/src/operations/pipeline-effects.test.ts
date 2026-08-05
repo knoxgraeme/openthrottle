@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSupervisorStore } from "../persistence/store.js";
@@ -12,12 +13,16 @@ import {
   loadPipelineCatalog,
   parseRepositoryConfig,
 } from "../pipeline/manifest.js";
+import { parseAndCompileExecutionGraph } from "../pipeline/execution-graph.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { buildInstalledRuntimeDescriptor, type SandboxAutostopRuntime, type SandboxRuntime } from "../__fixtures__/runtime.js";
+import type { ExecutionGateDecision } from "../pipeline/execution-gates.js";
+import type { ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
 import type { PipelineInstance, PipelineStageAttempt } from "../pipeline/store.js";
 import type { LinearOutboxRecord } from "../persistence/delivery-store.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
+const structuredGraphPath = fileURLToPath(new URL("../../graphs/structured-v1.json", import.meta.url));
 
 describe("pipeline effect processor", () => {
   let db: Database.Database | undefined;
@@ -40,6 +45,8 @@ describe("pipeline effect processor", () => {
       createWorktree: vi.fn(async () => ({ id: `worktree-${issueId}` })),
       dispatchLoopAction: vi.fn(async () => ({ providerDispatchId: `loop-${issueId}` })),
       collectLoopActionResult: vi.fn(async () => null),
+      dispatchChildExecutorAction: vi.fn(async () => ({ providerDispatchId: `child-executor-${issueId}` })),
+      collectChildExecutorActionResult: vi.fn(async () => null),
       cleanupWorktree: vi.fn(async () => undefined),
       renewLiveness: vi.fn(async () => ({ observedAt: new Date().toISOString() })),
       stop: vi.fn(async () => ({ confirmed: true })),
@@ -144,6 +151,82 @@ describe("pipeline effect processor", () => {
       timestamp,
       timestamp
     );
+  }
+
+  function gateDecision(input: {
+    gateKind: ExecutionGateDecision["gateKind"];
+    subject: string;
+    outcome?: ExecutionGateDecision["outcome"];
+    result?: ExecutionGateDecision["result"];
+    reason?: string;
+  }): ExecutionGateDecision {
+    const base = {
+      gateKind: input.gateKind,
+      outcome: input.outcome ?? "success",
+      result: input.result ?? "passed",
+      reason: input.reason ?? "test_reason",
+      subject: input.subject,
+      artifactHashes: ["a".repeat(64)],
+    };
+    const payload = canonicalJson({ schema: "test.gate-decision/v1", ...base });
+    return { ...base, payload, hash: digestNormalized(payload) };
+  }
+
+  function receiptJson(input: {
+    instance: PipelineInstance;
+    action: ExecutionWorkAttempt;
+    type: "unit_completion" | "command_result" | "candidate_evidence" | "unit_decision" | "integration_evidence";
+    subject: string;
+    result?: string;
+    commandName?: string | null;
+  }): string {
+    const executorVerified = input.type === "command_result" || input.type.endsWith("_evidence");
+    const payload = input.type === "unit_completion"
+      ? {
+          summary: "done",
+          assumptions: [],
+          decisions: [],
+          issues: [],
+          verification: [],
+          downstream_context: [],
+          requested_human_input: [],
+        }
+      : input.type === "command_result"
+        ? { command: input.commandName ?? "test", exit_code: 0, summary: "command passed" }
+        : input.type === "unit_decision"
+          ? { rationale: "candidate matches the unit scope", context_updates: [], accepted_subject: input.subject }
+          : { tree: input.subject, diff_digest: "d".repeat(64), changed_paths: [], clean: true };
+    return canonicalJson({
+      schema: "openthrottle.receipt/v1",
+      type: input.type,
+      assurance: executorVerified ? "executor_verified" : "semantic_attested",
+      result: input.result ?? (input.type === "unit_decision" ? "accept" : "success"),
+      producer: {
+        worker_id: executorVerified ? "executor" : "worker",
+        skill: `builtin://${input.type}@1`,
+        capability_digest: input.instance.capability_digest,
+        skill_package_digest: null,
+      },
+      subject: {
+        base: input.instance.base_commit,
+        pre: input.instance.base_commit,
+        post: input.subject,
+      },
+      fence: {
+        pipeline_instance_id: input.instance.id,
+        graph_digest: input.instance.manifest_digest,
+        unit_id: input.action.unit_id ?? "__final__",
+        attempt_id: input.action.parent_attempt_id,
+        parent_run_id: input.action.parent_run_id,
+        action_attempt_id: input.action.id,
+        generation: input.instance.generation,
+        native_session_id: input.action.native_session_id,
+        request_hash: input.action.request_hash ?? "b".repeat(64),
+      },
+      evidence: ["e".repeat(64)],
+      payload,
+      issued_at: "2099-07-22T12:00:00.000Z",
+    });
   }
 
   it("provisions, seals, credentials, and dispatches the first stage exactly through the durable intent", async () => {
@@ -321,6 +404,347 @@ describe("pipeline effect processor", () => {
 
     expect(runtime.cleanup).toHaveBeenCalledOnce();
     expect(tickets.getByIssueId("issue-1")?.sandbox_id).toBe("sandbox-new-generation");
+  });
+
+  it("seeds and drains a structured composite host without dispatching a sandbox stage", async () => {
+    db = openDb(":memory:");
+    const pipelines = createPipelineStore(db);
+    const tickets = createSupervisorStore(db, pipelines);
+    const runtimeDescriptor = buildInstalledRuntimeDescriptor("structured-effect-test/v1");
+    const catalog = loadPipelineCatalog(catalogPath, runtimeDescriptor.descriptor);
+    pipelines.acceptRuntimeDescriptor(runtimeDescriptor);
+    pipelines.acceptCatalog(catalog);
+    const repositoryConfig = parseRepositoryConfig([
+      "schema: openthrottle.config/v1",
+      "default_graph: simple",
+      "graphs:",
+      "  - id: simple",
+      "    kind: builtin",
+      "    ref: core/simple@1",
+      "  - id: structured",
+      "    kind: builtin",
+      "    ref: core/structured@1",
+      "commands: { test: npm test, lint: npm run lint, build: npm run build }",
+      "pipelines: { implement: implement }",
+    ].join("\n"));
+    const config = pipelines.saveRepositoryConfigSnapshot({
+      repository: "owner/repo",
+      baseCommit: "a".repeat(40),
+      blobSha: "b".repeat(40),
+      config: repositoryConfig,
+    });
+    const manifest = parseAndCompileExecutionGraph(readFileSync(structuredGraphPath, "utf8"), {
+      id: "builtin/structured",
+      runtime: runtimeDescriptor.descriptor,
+      config: repositoryConfig.config,
+    }).manifest;
+    pipelines.acceptManifest(manifest);
+    const executionPlan = {
+      schema: "openthrottle.execution-plan/v1",
+      graph_id: "structured",
+      plan_id: "structured-effect",
+      instructions: { implement_a: "Implement unit A." },
+      acceptance: { unit_a_done: "Unit A is complete." },
+      units: [{
+        id: "unit_a",
+        title: "Unit A",
+        depends_on: [],
+        instructions: ["implement_a"],
+        acceptance: ["unit_a_done"],
+      }],
+      commands: [],
+    };
+    const taskContext = [
+      "Approved structured plan.",
+      "",
+      "```json openthrottle.execution-plan/v1",
+      JSON.stringify(executionPlan, null, 2),
+      "```",
+    ].join("\n");
+    tickets.upsert({
+      linear_issue_id: "issue-structured",
+      linear_issue_identifier: "OT-STRUCTURED",
+      linear_session_id: "session-structured",
+      sandbox_id: null,
+      branch: "ot/structured",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+      pipeline: {
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        manifest,
+        repositoryConfig: config,
+        runtime: runtimeDescriptor,
+        authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
+        taskContext,
+      },
+    });
+    const instance = pipelines.getInstanceForSession("session-structured")!;
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    const runtime = sandboxRuntimeMock({ issueId: "structured" });
+    const processor = createPipelineEffectProcessor({
+      store: pipelines,
+      tickets,
+      runtime,
+      taskTimeoutSeconds: 300,
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+    });
+
+    await processor.drain();
+
+    expect(runtime.dispatchStage).not.toHaveBeenCalled();
+    expect(runtime.createWorktree).toHaveBeenCalledWith(
+      { providerResourceId: "sandbox-structured" },
+      expect.objectContaining({
+        attemptId: attempt.id,
+        baseCommit: "a".repeat(40),
+      })
+    );
+    expect(runtime.dispatchLoopAction).toHaveBeenCalledWith(
+      { providerResourceId: "sandbox-structured" },
+      expect.objectContaining({
+        protocol: "loop-action@2",
+        attemptId: attempt.id,
+        unitId: "unit_a",
+        role: "worker",
+        loop: "implement",
+        skill: "implement-unit",
+      })
+    );
+    expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
+      parent_attempt_id: attempt.id,
+      parent_run_id: attempt.planned_run_id,
+    });
+    expect(pipelines.listUnits(attempt.id)).toEqual([
+      expect.objectContaining({ unitId: "unit_a", status: "running" }),
+    ]);
+  });
+
+  it("drains graph-declared child executor actions and lead candidate receipts through the composite host", async () => {
+    db = openDb(":memory:");
+    const pipelines = createPipelineStore(db);
+    const tickets = createSupervisorStore(db, pipelines);
+    const runtimeDescriptor = buildInstalledRuntimeDescriptor("structured-child-drain-test/v1");
+    const catalog = loadPipelineCatalog(catalogPath, runtimeDescriptor.descriptor);
+    pipelines.acceptRuntimeDescriptor(runtimeDescriptor);
+    pipelines.acceptCatalog(catalog);
+    const repositoryConfig = parseRepositoryConfig([
+      "schema: openthrottle.config/v1",
+      "default_graph: simple",
+      "graphs:",
+      "  - id: simple",
+      "    kind: builtin",
+      "    ref: core/simple@1",
+      "  - id: structured",
+      "    kind: builtin",
+      "    ref: core/structured@1",
+      "commands: { test: npm test, lint: npm run lint, build: npm run build }",
+      "pipelines: { implement: implement }",
+    ].join("\n"));
+    const config = pipelines.saveRepositoryConfigSnapshot({
+      repository: "owner/repo",
+      baseCommit: "a".repeat(40),
+      blobSha: "b".repeat(40),
+      config: repositoryConfig,
+    });
+    const manifest = parseAndCompileExecutionGraph(readFileSync(structuredGraphPath, "utf8"), {
+      id: "builtin/structured",
+      runtime: runtimeDescriptor.descriptor,
+      config: repositoryConfig.config,
+    }).manifest;
+    pipelines.acceptManifest(manifest);
+    const executionPlan = {
+      schema: "openthrottle.execution-plan/v1",
+      graph_id: "structured",
+      plan_id: "structured-child-drain",
+      instructions: { implement_a: "Implement unit A." },
+      acceptance: { unit_a_done: "Unit A is complete." },
+      units: [{
+        id: "unit_a",
+        title: "Unit A",
+        depends_on: [],
+        instructions: ["implement_a"],
+        acceptance: ["unit_a_done"],
+      }],
+      commands: [],
+    };
+    const taskContext = [
+      "Approved structured plan.",
+      "",
+      "```json openthrottle.execution-plan/v1",
+      JSON.stringify(executionPlan, null, 2),
+      "```",
+    ].join("\n");
+    tickets.upsert({
+      linear_issue_id: "issue-child-drain",
+      linear_issue_identifier: "OT-CHILD-DRAIN",
+      linear_session_id: "session-child-drain",
+      sandbox_id: null,
+      branch: "ot/child-drain",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+      pipeline: {
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        manifest,
+        repositoryConfig: config,
+        runtime: runtimeDescriptor,
+        authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
+        taskContext,
+      },
+    });
+    const instance = pipelines.getInstanceForSession("session-child-drain")!;
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    const runtime = sandboxRuntimeMock({ issueId: "child-drain" });
+    const processor = createPipelineEffectProcessor({
+      store: pipelines,
+      tickets,
+      runtime,
+      taskTimeoutSeconds: 300,
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+    });
+    const completedSubject = "1".repeat(40);
+    const candidateSubject = "2".repeat(40);
+    const integratedSubject = "3".repeat(40);
+    const latestAction = (kind: ExecutionWorkAttempt["action_kind"]) => {
+      const action = [...pipelines.listWorkAttempts(attempt.id)].reverse()
+        .find((attempt) => attempt.status !== "completed");
+      expect(action).toMatchObject({ action_kind: kind });
+      return action!;
+    };
+    let compositeDrainReplay = 0;
+    const enqueueCompositeDrain = () => {
+      const source = db!.prepare(`
+        SELECT payload, payload_hash FROM pipeline_effect_intents
+        WHERE pipeline_instance_id = ? AND kind IN ('provision', 'dispatch_stage')
+        ORDER BY transition_version, created_at, id LIMIT 1
+      `).get(instance.id) as { payload: string; payload_hash: string };
+      compositeDrainReplay += 1;
+      db!.prepare(`
+        INSERT INTO pipeline_effect_intents (
+          id, pipeline_instance_id, transition_version, kind, idempotency_key,
+          payload, payload_hash, status, next_attempt_at, created_at
+        ) VALUES (?, ?, ?, 'provision', ?, ?, ?, 'pending', ?, ?)
+      `).run(
+        `structured-child-drain-${compositeDrainReplay}`,
+        instance.id,
+        10 + compositeDrainReplay,
+        `structured-child-drain:${compositeDrainReplay}`,
+        source.payload,
+        source.payload_hash,
+        "2099-07-22T12:00:00.000Z",
+        "2099-07-22T12:00:00.000Z"
+      );
+    };
+    const completeUnitAction = (kind: ExecutionWorkAttempt["action_kind"], subject: string, receiptType?: Parameters<typeof receiptJson>[0]["type"]) => {
+      const action = latestAction(kind);
+      pipelines.completeUnitAction({
+        actionId: action.id,
+        resultHash: `result-${kind}`,
+        outputSubject: subject,
+        ...(receiptType ? { receipt: receiptJson({ instance, action, type: receiptType, subject, commandName: action.command_name }) } : {}),
+      });
+      return action;
+    };
+
+    await processor.drain();
+    completeUnitAction("implement", completedSubject, "unit_completion");
+
+    enqueueCompositeDrain();
+    await processor.drain();
+    completeUnitAction("simplify", completedSubject);
+
+    for (const commandName of ["test", "lint", "build"]) {
+      enqueueCompositeDrain();
+      await processor.drain();
+      expect(runtime.dispatchChildExecutorAction).toHaveBeenLastCalledWith(
+        { providerResourceId: "sandbox-child-drain" },
+        expect.objectContaining({
+          protocol: "child-executor-action@1",
+          actionKind: "command",
+          commandName,
+          inputSubject: completedSubject,
+        })
+      );
+      completeUnitAction("command", completedSubject, "command_result");
+    }
+
+    enqueueCompositeDrain();
+    await processor.drain();
+    expect(runtime.dispatchChildExecutorAction).toHaveBeenLastCalledWith(
+      { providerResourceId: "sandbox-child-drain" },
+      expect.objectContaining({
+        protocol: "child-executor-action@1",
+        actionKind: "candidate",
+        inputSubject: completedSubject,
+      })
+    );
+    completeUnitAction("candidate", candidateSubject, "candidate_evidence");
+
+    enqueueCompositeDrain();
+    await processor.drain();
+    expect(db!.prepare(`
+      SELECT status, last_error FROM pipeline_effect_intents
+      WHERE id = ?
+    `).get(`structured-child-drain-${compositeDrainReplay}`)).toEqual({
+      status: "acknowledged",
+      last_error: null,
+    });
+    expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
+      { providerResourceId: "sandbox-child-drain" },
+      expect.objectContaining({
+        protocol: "loop-action@2",
+        role: "lead",
+        skill: "accept-unit",
+        candidateSubject,
+      })
+    );
+    const lead = latestAction("lead");
+    pipelines.completeGatedAction({
+      actionId: lead.id,
+      resultHash: "result-lead",
+      outputSubject: candidateSubject,
+      receipt: receiptJson({ instance, action: lead, type: "unit_decision", subject: candidateSubject }),
+      decision: gateDecision({ gateKind: "unit_acceptance", subject: candidateSubject }),
+    });
+
+    enqueueCompositeDrain();
+    await processor.drain();
+    expect(runtime.dispatchChildExecutorAction).toHaveBeenLastCalledWith(
+      { providerResourceId: "sandbox-child-drain" },
+      expect.objectContaining({
+        protocol: "child-executor-action@1",
+        actionKind: "integrate",
+        candidateSubject,
+        inputSubject: "a".repeat(40),
+      })
+    );
+    const integrate = latestAction("integrate");
+    pipelines.completeGatedAction({
+      actionId: integrate.id,
+      resultHash: "result-integrate",
+      outputSubject: integratedSubject,
+      receipt: receiptJson({ instance, action: integrate, type: "integration_evidence", subject: integratedSubject }),
+      decision: gateDecision({ gateKind: "integration", subject: integratedSubject }),
+    });
+
+    enqueueCompositeDrain();
+    await processor.drain();
+    expect(runtime.dispatchChildExecutorAction).toHaveBeenLastCalledWith(
+      { providerResourceId: "sandbox-child-drain" },
+      expect.objectContaining({
+        protocol: "child-executor-action@1",
+        actionKind: "final_command",
+        commandName: "test",
+        inputSubject: integratedSubject,
+      })
+    );
   });
 
   it("idles an active bound sandbox through a best-effort runtime effect", async () => {

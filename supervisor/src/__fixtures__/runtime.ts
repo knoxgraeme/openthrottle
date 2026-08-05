@@ -42,6 +42,7 @@ export function buildInstalledRuntimeDescriptor(
     protocol: STAGE_EXECUTOR_PROTOCOL,
     capabilities: sortedUnique(overrides.capabilities ?? [
       "agent/semantic@1",
+      "accept-unit@1",
       "ce/plan@1",
       "ce/implement@1",
       "ce/investigate@1",
@@ -49,6 +50,7 @@ export function buildInstalledRuntimeDescriptor(
       "ce/review@1",
       "ce/simplify@1",
       "command/run@1",
+      "graph/for-each-unit@1",
       "loop-action@2",
       "provider/wait@1",
     ]),

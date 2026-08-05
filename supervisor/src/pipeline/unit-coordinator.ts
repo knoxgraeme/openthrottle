@@ -527,6 +527,18 @@ export function buildAggregateStageEvent(input: {
 }): PipelineCoordinatorEvent {
   const stage = input.manifest.stages.find((candidate) => candidate.id === input.parentAttempt.stage_id);
   if (!stage) throw new Error(`parent stage ${input.parentAttempt.stage_id} is absent from the pinned manifest`);
+  if (!input.subject) throw new Error("artifact stage_result requires a gated subject");
+  const ordered = [...input.units].sort((left, right) =>
+    left.ordinal - right.ordinal || left.unitId.localeCompare(right.unitId)
+  );
+  const allIntegrated = ordered.length > 0 && ordered.every((unit) =>
+    unit.terminalLevel === "completed" &&
+    unit.integrationSubject !== null &&
+    unit.integrationSubject === input.subject
+  );
+  if ((input.outcome ?? "success") === "success" && !allIntegrated) {
+    throw new Error("structured aggregate success requires every unit to have accepted exact-subject integration evidence");
+  }
   const graphResult = buildExecutionGraphResultArtifact({
     instance: input.instance,
     parentAttempt: input.parentAttempt,

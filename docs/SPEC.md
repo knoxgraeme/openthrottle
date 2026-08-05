@@ -130,10 +130,12 @@ the manifest and sealed request. Production advertises `agent/repository-skill@1
 in its installed runtime capability descriptor, so a `run` node backed by a
 repository skill is reachable through the existing whole-attempt dispatch path.
 The composite `graph/for-each-unit@1` capability (structured multi-unit
-execution) remains fail closed in production: the descriptor omits it until
-the composition root that constructs and drains the child unit runtime is
-installed, so admission and the CLI's pre-mutation ship check (below) both
-continue to reject an explicit structured selection before any Linear access.
+execution) is installed only with the composition root that constructs and
+drains the child unit runtime. A composite host stage dispatches no
+whole-stage sandbox request; entering it provisions/bootstrap the runtime,
+binds the parent actor, seeds one child execution graph from the sealed
+execution-plan block and graph-declared phase sequence, and drains child work
+actions through the provider-neutral unit effect port.
 For a `for_each_unit` node, the repository graph owns the ordered `phases`
 array. The platform owns the closed mechanism vocabulary and the security
 contract behind each mechanism:
@@ -618,7 +620,9 @@ whole-change final review has passed (`execution_graphs.final_phase = 'done'`),
 the reducer emits one `execution_graph_result` artifact and one aggregate
 `stage_result` for the parent attempt; the aggregate hash is compare-and-set on
 `execution_graphs` so the parent can settle once through the ordinary
-stage-result path. A graph with no completed unit (all units exited or failed)
+stage-result path. Structured success requires every authored unit to have a
+`completed` terminal level and accepted integration evidence for the exact
+aggregate subject. A stopped, exited, failed, or partially integrated graph
 never claims structured success.
 
 `pipeline_artifacts.kind` includes `execution_graph_result` for the child

@@ -98,6 +98,37 @@ export interface LoopActionResult {
   completedAt: string;
 }
 
+export interface ChildExecutorActionRequest {
+  protocol: "child-executor-action@1";
+  actionId: string;
+  attemptId: string;
+  graphId: string;
+  pipelineInstanceId: string;
+  graphDigest: string;
+  parentRunId: string;
+  generation: number;
+  capabilityDigest: string;
+  unitId: string | null;
+  actionKind: "command" | "final_command" | "candidate" | "integrate";
+  commandName?: string;
+  worktree?: RuntimeWorktreeHandle | null;
+  baseSubject: string;
+  inputSubject: string;
+  candidateSubject?: string;
+  requestHash: string;
+  idempotencyKey: string;
+}
+
+export interface ChildExecutorActionResult {
+  actionId: string;
+  attemptId: string;
+  requestHash: string;
+  outcome: "success" | "failure" | "needs_human" | "retryable_infrastructure_failure";
+  subject: string | null;
+  receipt: string;
+  completedAt: string;
+}
+
 export interface RuntimeResource {
   providerResourceId: string;
 }
@@ -128,6 +159,12 @@ export interface SandboxRuntime {
     actionId: string;
     requestHash: string;
   }): Promise<LoopActionResult | null>;
+  dispatchChildExecutorAction(resource: RuntimeResource, request: ChildExecutorActionRequest): Promise<{ providerDispatchId: string }>;
+  collectChildExecutorActionResult(resource: RuntimeResource, input: {
+    attemptId: string;
+    actionId: string;
+    requestHash: string;
+  }): Promise<ChildExecutorActionResult | null>;
   cleanupWorktree(resource: RuntimeResource, handle: RuntimeWorktreeHandle): Promise<void>;
   renewLiveness(resource: RuntimeResource, attemptId: string): Promise<{ observedAt: string }>;
   stop(resource: RuntimeResource, reason: string): Promise<{ confirmed: boolean }>;

@@ -1866,6 +1866,80 @@ describe("executeLoopAction", () => {
     expect(restoreIntegration).toHaveBeenCalledWith("/tmp/integration-current");
   });
 
+  it("uses the standard receipt subject for read-only lead loop results", () => {
+    const integrationRepoDir = repository();
+    writeFileSync(join(integrationRepoDir, "candidate.txt"), "candidate\n");
+    execFileSync("git", ["add", "candidate.txt"], { cwd: integrationRepoDir });
+    execFileSync("git", ["commit", "-qm", "candidate"], { cwd: integrationRepoDir });
+    const candidateSubject = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: integrationRepoDir,
+      encoding: "utf8",
+    }).trim();
+    const valid = validateLoopRequest(leadRequest({ candidateSubject, skill: "accept-unit" }));
+    const receipt = {
+      schema: "openthrottle.receipt/v1",
+      type: "unit_decision",
+      assurance: "semantic_attested",
+      result: "accept",
+      producer: {
+        worker_id: "worker-1",
+        skill: "builtin://accept-unit@1",
+        capability_digest: "c".repeat(64),
+        skill_package_digest: null,
+      },
+      subject: {
+        base: candidateSubject,
+        pre: candidateSubject,
+        post: candidateSubject,
+      },
+      fence: {
+        pipeline_instance_id: "instance-1",
+        graph_digest: "a".repeat(64),
+        unit_id: valid.unitId,
+        attempt_id: valid.attemptId,
+        parent_run_id: "run-1",
+        action_attempt_id: valid.actionId,
+        generation: 1,
+        native_session_id: valid.nativeSessionId,
+        request_hash: valid.requestHash,
+      },
+      evidence: ["accepted exact candidate"],
+      payload: {
+        rationale: "Candidate matches the unit.",
+        context_updates: [],
+        accepted_subject: candidateSubject,
+      },
+      issued_at: "2026-07-29T00:00:00.000Z",
+    };
+
+    const result = executeLoopAction({
+      request: valid,
+      integrationRepoDir,
+      runLoopAgent: () => ({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: canonicalJson(receipt),
+        stderr: "",
+        nativeSessionId: null,
+        integrationRepoDir,
+      }),
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result).toMatchObject({
+      outcome: "success",
+      subject: candidateSubject,
+    });
+    expect(JSON.parse(result.receipt)).toMatchObject({
+      type: "unit_decision",
+      result: "accept",
+    });
+  });
+
   it("redacts a materialized credential from the failure receipt even when it never touched this process's own env", () => {
     const lockWorkerWorktree = vi.fn();
     const lockActionDirectory = vi.fn();

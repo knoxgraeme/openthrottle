@@ -375,7 +375,7 @@ mcp_servers: {}
     expect(db!.prepare("SELECT execution_mode FROM agent_sessions WHERE id = 'session-1'").pluck().get()).toBe("pipeline");
   });
 
-  it("rejects a graph-specific pipeline override for a unit-consuming selection", async () => {
+  it("ignores graph-specific pipeline overrides for a unit-consuming selection", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "structured";
     const context = [
@@ -390,10 +390,37 @@ mcp_servers: {}
       "```",
     ].join("\n");
 
-    await expectSelectionFailure(
-      context,
-      "graph structured requires unavailable runtime capability graph/for-each-unit@1"
+    const { tickets, pipelines } = await run(
+      `schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: structured
+    kind: builtin
+    ref: core/structured@1
+pipelines: { implement: implement, structured: fixture-command }
+intents:
+  implement:
+    default_graph: simple
+    allowed_graphs: [simple, structured]
+`,
+      {},
+      fixtureCatalogPath,
+      payload("session-1", "issue-1", "OT-1", context)
     );
+
+    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+      state: "active",
+      sandbox_id: null,
+      run_id: null,
+    });
+    expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
+      pipeline_id: "builtin/structured",
+      pipeline_version: 1,
+      active_stage_id: "units",
+    });
   });
 
   it("rejects the configured unit-consuming default even with a canonical plan", async () => {
@@ -435,11 +462,11 @@ intents:
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_stage_attempts").pluck().get()).toBe(0);
     const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
-    expect(
-      payloads.some((entry) =>
-        entry.includes("graph structured requires unavailable runtime capability graph/for-each-unit@1")
-      )
-    ).toBe(true);
+    const refusal = payloads.find((entry) => entry.includes("its credential is not configured on the supervisor"));
+    expect(refusal).toBeDefined();
+    expect(refusal).toContain("Codex");
+    expect(refusal).toContain("set CODEX_AUTH_JSON");
+    expect(refusal).toContain("No sandbox was provisioned.");
   });
 
   async function expectSelectionFailure(context: string, expectedMessage: string) {
@@ -1254,7 +1281,7 @@ intents:
     );
   });
 
-  it("fails closed before provisioning when a shipped graph selection cannot resolve", async () => {
+  it("admits a shipped structured graph selection against the production descriptor", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "structured";
     const context = [
@@ -1289,18 +1316,12 @@ intents:
     );
 
     expect(tickets.getByIssueId("issue-1")).toMatchObject({
-      state: "error",
+      state: "active",
       sandbox_id: null,
       run_id: null,
     });
-    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
-    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_stage_attempts").pluck().get()).toBe(0);
-    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
-    expect(
-      payloads.some((entry) =>
-        entry.includes("graph structured requires unavailable runtime capability graph/for-each-unit@1")
-      )
-    ).toBe(true);
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(1);
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_stage_attempts").pluck().get()).toBe(1);
   });
 
   it("requires a model subscription for the simple graph despite legacy command pipeline overrides", async () => {

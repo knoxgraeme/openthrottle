@@ -1,7 +1,35 @@
+import {
+  EXECUTION_PLAN_SCHEMA,
+  parseExecutionPlanContract,
+  parseStandardReceipt,
+  RECEIPT_SCHEMA,
+  type CandidateEvidenceReceipt,
+  type CommandResultReceipt,
+  type ExecutionPlanContract,
+  type IntegrationEvidenceReceipt,
+  type SemanticReviewReceipt,
+  type StandardReceipt,
+  type UnitCompletionReceipt,
+  type UnitDecisionReceipt,
+} from "@openthrottle/contracts";
 import type { Ticket, SupervisorStore } from "../persistence/store.js";
-import { canonicalJson } from "../pipeline/manifest.js";
+import type { ExecutionUnitStore, ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
+import { canonicalJson, type PipelineStage } from "../pipeline/manifest.js";
 import { digestNormalized } from "../pipeline/manifest.js";
+import { FOR_EACH_UNIT_CAPABILITY } from "../pipeline/capability-contracts.js";
 import { coordinatePipelineEvent } from "../pipeline/coordinator.js";
+import {
+  buildAggregateStageEvent,
+  type UnitActionKind,
+} from "../pipeline/unit-coordinator.js";
+import {
+  evaluateFinalReviewGate,
+  evaluateIntegrationGate,
+  evaluateUnitAcceptanceGate,
+  type ExpectedReceiptProducer,
+  type ReceiptProducerRole,
+  type StandardReceiptFence,
+} from "../pipeline/execution-gates.js";
 import type {
   PipelineEffectIntent,
   PipelineInstance,
@@ -9,9 +37,10 @@ import type {
   PipelineStore,
 } from "../pipeline/store.js";
 import type { StageRequestEnvelope } from "../pipeline/stage-request.js";
-import type { RuntimeResource, SandboxAutostopRuntime, SandboxRuntime } from "../runtime/contracts.js";
+import type { ChildExecutorActionRequest, LoopActionRequest, RuntimeResource, SandboxAutostopRuntime, SandboxRuntime } from "../runtime/contracts.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import { terminateAndSettleActor } from "./actor-settlement.js";
+import { createUnitEffectProcessor } from "./unit-effects.js";
 
 const EFFECT_LEASE_MS = 60_000;
 const RETRY_BASE_MS = 5_000;
@@ -58,11 +87,117 @@ export interface PipelineEffectProcessor {
 }
 
 interface PipelineEffectProcessorDeps {
-  store: PipelineStore;
+  store: PipelineStore & ExecutionUnitStore;
   tickets: SupervisorStore;
   runtime: SandboxRuntime & SandboxAutostopRuntime;
   taskTimeoutSeconds: number;
   now?: () => Date;
+}
+
+const FENCE_PATTERN = /```([^\n`]*)\n([\s\S]*?)```/g;
+const GIT_SUBJECT = /^[a-f0-9]{40,64}$/;
+
+function extractExecutionPlan(context: string): ExecutionPlanContract {
+  const blocks: string[] = [];
+  for (const match of context.matchAll(FENCE_PATTERN)) {
+    const marker = match[1]?.trim().split(/\s+/) ?? [];
+    if (marker.includes(EXECUTION_PLAN_SCHEMA)) blocks.push(match[2]?.trim() ?? "");
+  }
+  if (blocks.length !== 1) {
+    throw new Error(`structured composite stage requires exactly one ${EXECUTION_PLAN_SCHEMA} block`);
+  }
+  return parseExecutionPlanContract(blocks[0]!, { source: "sealed.execution_plan" }).value;
+}
+
+function normalizedLoopRequestForHash(
+  request: Omit<LoopActionRequest, "requestHash" | "idempotencyKey">
+): Omit<LoopActionRequest, "requestHash" | "idempotencyKey"> {
+  const { candidateSubject, ...withoutCandidate } = request;
+  return candidateSubject === null || candidateSubject === undefined
+    ? withoutCandidate
+    : { ...withoutCandidate, candidateSubject };
+}
+
+function buildLoopActionRequest(
+  request: Omit<LoopActionRequest, "requestHash" | "idempotencyKey">
+): LoopActionRequest {
+  const normalized = normalizedLoopRequestForHash(request);
+  const requestHash = digestNormalized(canonicalJson(normalized));
+  return {
+    ...normalized,
+    requestHash,
+    idempotencyKey: `loop:${request.attemptId}:${request.actionId}:${requestHash}`,
+  };
+}
+
+function buildChildExecutorActionRequest(
+  request: Omit<ChildExecutorActionRequest, "requestHash" | "idempotencyKey">
+): ChildExecutorActionRequest {
+  const requestHash = digestNormalized(canonicalJson(request));
+  return {
+    ...request,
+    requestHash,
+    idempotencyKey: `child-executor:${request.attemptId}:${request.actionId}:${requestHash}`,
+  };
+}
+
+function isChildExecutorActionKind(actionKind: UnitActionKind): actionKind is ChildExecutorActionRequest["actionKind"] {
+  return actionKind === "command" ||
+    actionKind === "final_command" ||
+    actionKind === "candidate" ||
+    actionKind === "integrate";
+}
+
+function adapterSkillFor(actionKind: UnitActionKind): LoopActionRequest["skill"] {
+  if (actionKind === "implement") return "implement-unit";
+  if (actionKind === "repair") return "repair-unit";
+  if (actionKind === "simplify") return "simplify-unit";
+  if (actionKind === "lead") return "accept-unit";
+  if (actionKind === "final_review") return "final-review";
+  if (actionKind === "final_repair") return "final-repair";
+  throw new Error(`child action kind ${actionKind} is executor-owned and cannot dispatch as a loop agent`);
+}
+
+function builtinProducer(
+  skill: "command_result" | "candidate_evidence" | "integration_evidence" | "final-review",
+  capabilityDigest: string,
+  assurance: ExpectedReceiptProducer["assurance"] = "executor_verified"
+): ExpectedReceiptProducer {
+  return {
+    workerId: "executor",
+    skill: `builtin://${skill}@1`,
+    capabilityDigest,
+    skillPackageDigest: null,
+    assurance,
+  };
+}
+
+function loopKindFor(actionKind: UnitActionKind): LoopActionRequest["loop"] {
+  if (actionKind === "repair" || actionKind === "final_repair") return "repair";
+  if (actionKind === "final_review") return "review";
+  if (actionKind === "lead") return "lead";
+  if (actionKind === "implement" || actionKind === "simplify" || actionKind === "command") return actionKind;
+  throw new Error(`child action kind ${actionKind} has no loop kind`);
+}
+
+function roleFor(actionKind: UnitActionKind): LoopActionRequest["role"] {
+  if (actionKind === "lead") return "lead";
+  if (actionKind === "final_review") return "reviewer";
+  return "worker";
+}
+
+function worktreeIdempotencyKey(action: ExecutionWorkAttempt): string {
+  return `worktree:${action.parent_attempt_id}:${action.unit_id ?? "final"}:${action.cycle}`;
+}
+
+function worktreeHandleFor(action: ExecutionWorkAttempt, baseCommit: string): { id: string } {
+  return {
+    id: digestNormalized(canonicalJson({
+      idempotencyKey: worktreeIdempotencyKey(action),
+      attemptId: action.parent_attempt_id,
+      baseCommit,
+    })).slice(0, 32),
+  };
 }
 
 interface StopEffectControl {
@@ -185,6 +320,480 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     }
   };
 
+  const activeStageFor = (instance: PipelineInstance) => {
+    const manifest = JSON.parse(instance.normalized_manifest) as { stages?: unknown };
+    const stages = Array.isArray(manifest.stages) ? manifest.stages : [];
+    return stages.find((stage) =>
+      typeof stage === "object" && stage !== null &&
+      (stage as { id?: unknown }).id === instance.active_stage_id
+    ) as PipelineStage | undefined;
+  };
+
+  const bindCompositeParentRun = (instance: PipelineInstance, request: StageRequestEnvelope): void => {
+    assertActiveAttempt(instance, request);
+    const ticket = deps.tickets.getByIssueId(instance.linear_issue_id);
+    if (!ticket || ticket.linear_session_id !== instance.linear_session_id) {
+      throw new Error(`pipeline instance ${instance.id} has no current ticket binding`);
+    }
+    if (ticket.run_id && ticket.run_id !== request.runId) {
+      throw new Error(`ticket ${ticket.linear_issue_identifier} already has active actor ${ticket.run_id}`);
+    }
+    if (!ticket.run_id) {
+      const started = deps.tickets.beginRun({
+        issueId: instance.linear_issue_id,
+        runId: request.runId,
+        taskType: instance.task_type,
+        tokenHash: request.requestHash,
+        expiresAt: new Date(now().getTime() + deps.taskTimeoutSeconds * 1_000).toISOString(),
+      });
+      if (!started) throw new Error(`pipeline composite stage ${request.attemptId} could not acquire the ticket actor`);
+    }
+    deps.store.bindStageRun(request.attemptId, request.runId);
+    deps.store.markStageDispatched(request.attemptId);
+  };
+
+  const seedCompositeGraph = (instance: PipelineInstance, request: StageRequestEnvelope): void => {
+    const stage = activeStageFor(instance);
+    if (!stage || stage.executor.capability !== FOR_EACH_UNIT_CAPABILITY) {
+      throw new Error(`pipeline composite stage ${request.stageId} is not active`);
+    }
+    const plan = extractExecutionPlan(request.taskContext);
+    deps.store.createGraph({
+      pipelineInstanceId: instance.id,
+      parentAttemptId: request.attemptId,
+      parentStageId: request.stageId,
+      parentRunId: request.runId,
+      graphDigest: instance.manifest_digest,
+      planDigest: digestNormalized(canonicalJson(plan)),
+      units: plan.units.map((unit) => ({ id: unit.id, dependencies: unit.depends_on })),
+      commandNames: stage.unitCommandNames ?? [],
+      unitPhases: stage.unitPhases,
+      unitPhaseBindings: stage.unitPhaseBindings,
+    });
+  };
+
+  const worktreeBaseFor = (instance: PipelineInstance, action: ExecutionWorkAttempt): string => {
+    const graph = deps.store.getGraphForAttempt(action.parent_attempt_id);
+    const finalIntegratedSubject = !action.unit_id && (
+      action.action_kind === "final_command" ||
+      action.action_kind === "final_review" ||
+      action.action_kind === "final_repair"
+    )
+      ? (() => {
+          const units = deps.store.listUnits(action.parent_attempt_id);
+          const subjects = [...new Set(units
+            .filter((unit) => unit.terminalLevel === "completed" && unit.integrationSubject)
+            .map((unit) => unit.integrationSubject!))];
+          return subjects.length === 1 && units.every((unit) => unit.terminalLevel === "completed")
+            ? subjects[0]
+            : undefined;
+        })()
+      : undefined;
+    const base = graph?.integration_subject ?? finalIntegratedSubject ?? instance.immutable_subject ?? instance.base_commit;
+    if (!GIT_SUBJECT.test(base)) throw new Error(`child action ${action.id} has no exact worktree base`);
+    return base;
+  };
+
+  const latestPriorOutputSubject = (
+    action: ExecutionWorkAttempt,
+    kinds: readonly UnitActionKind[]
+  ): string | undefined =>
+    [...deps.store.listWorkAttempts(action.parent_attempt_id)]
+      .filter((attempt) =>
+        attempt.status === "completed" &&
+        attempt.output_subject &&
+        attempt.unit_id === action.unit_id &&
+        attempt.cycle === action.cycle &&
+        kinds.includes(attempt.action_kind)
+      )
+      .reverse()[0]?.output_subject ?? undefined;
+
+  const actionInputSubjectFor = (instance: PipelineInstance, action: ExecutionWorkAttempt): string => {
+    const base = worktreeBaseFor(instance, action);
+    if (action.action_kind === "command") {
+      return latestPriorOutputSubject(action, ["implement", "repair", "simplify", "command"]) ?? base;
+    }
+    if (action.action_kind === "candidate") {
+      return latestPriorOutputSubject(action, ["implement", "repair", "simplify", "command"]) ?? base;
+    }
+    if (action.action_kind === "lead") {
+      return latestPriorOutputSubject(action, ["candidate"]) ?? base;
+    }
+    if (action.action_kind === "final_command") {
+      return latestPriorOutputSubject({ ...action, unit_id: null }, ["final_command"]) ??
+        deps.store.getGraphForAttempt(action.parent_attempt_id)?.integration_subject ?? base;
+    }
+    if (action.action_kind === "final_review") {
+      return latestPriorOutputSubject({ ...action, unit_id: null }, ["final_command", "final_repair"]) ??
+        deps.store.getGraphForAttempt(action.parent_attempt_id)?.integration_subject ?? base;
+    }
+    if (action.action_kind === "integrate") {
+      return deps.store.getGraphForAttempt(action.parent_attempt_id)?.integration_subject ?? base;
+    }
+    if (action.action_kind === "simplify") {
+      return latestPriorOutputSubject(action, ["implement", "repair"]) ?? base;
+    }
+    return base;
+  };
+
+  const actionBinding = (instance: PipelineInstance, action: ExecutionWorkAttempt) => {
+    const stage = activeStageFor(instance);
+    if (!stage?.unitPhaseBindings) throw new Error(`child action ${action.id} has no graph-declared phase bindings`);
+    const phaseId = action.action_kind === "repair" ? "implement"
+      : action.action_kind === "final_review" || action.action_kind === "final_repair" || action.action_kind === "final_command"
+        ? undefined
+        : action.action_kind;
+    return phaseId ? stage.unitPhaseBindings.find((binding) => binding.id === phaseId) : undefined;
+  };
+
+  const agentProducerFor = (
+    instance: PipelineInstance,
+    action: ExecutionWorkAttempt,
+    role: ReceiptProducerRole
+  ): ExpectedReceiptProducer => {
+    const binding = actionBinding(instance, action);
+    if (!binding || (binding.kind !== "agent" && binding.kind !== "gate")) {
+      if (role === "review") {
+        return {
+          workerId: "reviewer",
+          skill: "builtin://final-review@1",
+          capabilityDigest: instance.capability_digest,
+          skillPackageDigest: null,
+          assurance: "semantic_attested",
+        };
+      }
+      throw new Error(`child action ${action.id} has no ${role} producer binding`);
+    }
+    return {
+      workerId: binding.worker.id,
+      skill: binding.repositorySkill?.reference ?? `builtin://${binding.loop.skill}@1`,
+      capabilityDigest: instance.capability_digest,
+      skillPackageDigest: binding.repositorySkill?.packageDigest ?? null,
+      assurance: binding.kind === "gate" ? "semantic_attested" : "semantic_attested",
+    };
+  };
+
+  const expectedProducersFor = (
+    instance: PipelineInstance,
+    action: ExecutionWorkAttempt
+  ): Record<ReceiptProducerRole, ExpectedReceiptProducer> => {
+    const implementationProbe = { ...action, action_kind: action.cycle > 1 ? "repair" as const : "implement" as const };
+    const leadProbe = { ...action, action_kind: "lead" as const };
+    return {
+      completion: agentProducerFor(instance, implementationProbe, "completion"),
+      candidate: builtinProducer("candidate_evidence", instance.capability_digest),
+      command: builtinProducer("command_result", instance.capability_digest),
+      lead: agentProducerFor(instance, leadProbe, "lead"),
+      integration: builtinProducer("integration_evidence", instance.capability_digest),
+      review: agentProducerFor(instance, { ...action, action_kind: "final_review" as const }, "review"),
+    };
+  };
+
+  const standardFenceFor = (
+    instance: PipelineInstance,
+    action: ExecutionWorkAttempt,
+    subject: string
+  ): StandardReceiptFence => ({
+    pipelineInstanceId: instance.id,
+    graphDigest: instance.manifest_digest,
+    unitId: action.unit_id ?? "__final__",
+    attemptId: action.parent_attempt_id,
+    parentRunId: action.parent_run_id,
+    actionAttemptId: action.id,
+    generation: instance.generation,
+    nativeSessionId: action.native_session_id,
+    requestHash: action.request_hash ?? "",
+    baseSubject: worktreeBaseFor(instance, action),
+    preSubject: actionInputSubjectFor(instance, action),
+    subject,
+    producers: expectedProducersFor(instance, action),
+  });
+
+  const completedAttemptReceiptsFor = (parentAttemptId: string): Array<{
+    attempt: ExecutionWorkAttempt;
+    receipt: StandardReceipt;
+  }> =>
+    deps.store.listWorkAttempts(parentAttemptId)
+      .filter((attempt) => attempt.status === "completed" && attempt.receipt)
+      .map((attempt) => ({
+        attempt,
+        receipt: parseStandardReceipt(attempt.receipt!, { source: `child_action.${attempt.id}.receipt` }).value,
+      }));
+
+  const latestAttemptReceipt = <T extends StandardReceipt>(
+    receipts: readonly { attempt: ExecutionWorkAttempt; receipt: StandardReceipt }[],
+    type: T["type"],
+    unitId: string | null
+  ): { attempt: ExecutionWorkAttempt; receipt: T } => {
+    const match = [...receipts].reverse().find((entry) =>
+      entry.receipt.type === type && entry.receipt.fence.unit_id === (unitId ?? "__final__")
+    );
+    if (!match) throw new Error(`missing ${type} receipt for ${unitId ?? "final"}`);
+    return { attempt: match.attempt, receipt: match.receipt as T };
+  };
+
+  const commandAttemptReceipts = (
+    receipts: readonly { attempt: ExecutionWorkAttempt; receipt: StandardReceipt }[],
+    unitId: string | null
+  ): Array<{ attempt: ExecutionWorkAttempt; receipt: CommandResultReceipt }> =>
+    receipts
+      .filter((entry): entry is { attempt: ExecutionWorkAttempt; receipt: CommandResultReceipt } =>
+        entry.receipt.type === "command_result" && entry.receipt.fence.unit_id === (unitId ?? "__final__"));
+
+  const dispatchChildAction = async (
+    resource: RuntimeResource,
+    instance: PipelineInstance,
+    action: ExecutionWorkAttempt
+  ): Promise<{ requestHash: string; nativeSessionId?: string | null }> => {
+    if (isChildExecutorActionKind(action.action_kind)) {
+      const baseSubject = worktreeBaseFor(instance, action).slice(0, 40);
+      const candidateSubject = action.action_kind === "integrate"
+        ? deps.store.listUnits(action.parent_attempt_id).find((unit) => unit.unitId === action.unit_id)?.acceptedCandidateSubject ?? undefined
+        : undefined;
+      if (action.action_kind === "integrate" && !candidateSubject) {
+        throw new Error(`child integration action ${action.id} has no accepted candidate subject`);
+      }
+      const request = buildChildExecutorActionRequest({
+        protocol: "child-executor-action@1",
+        actionId: action.id,
+        attemptId: action.parent_attempt_id,
+        graphId: action.execution_graph_id,
+        pipelineInstanceId: instance.id,
+        graphDigest: instance.manifest_digest,
+        parentRunId: action.parent_run_id,
+        generation: instance.generation,
+        capabilityDigest: instance.capability_digest,
+        unitId: action.unit_id,
+        actionKind: action.action_kind,
+        ...(action.command_name ? { commandName: action.command_name } : {}),
+        ...(action.unit_id && (action.action_kind === "command" || action.action_kind === "candidate")
+          ? { worktree: worktreeHandleFor(action, baseSubject) }
+          : {}),
+        baseSubject,
+        inputSubject: actionInputSubjectFor(instance, action),
+        ...(candidateSubject ? { candidateSubject } : {}),
+      });
+      await deps.runtime.dispatchChildExecutorAction(resource, request);
+      return { requestHash: request.requestHash, nativeSessionId: null };
+    }
+    const binding = actionBinding(instance, action);
+    const workerBinding = binding && (binding.kind === "agent" || binding.kind === "gate") ? binding : undefined;
+    if (!workerBinding) {
+      throw new Error(`child action kind ${action.action_kind} is executor-owned and cannot dispatch as a loop agent`);
+    }
+    const baseCommit = worktreeBaseFor(instance, action).slice(0, 40);
+    const createNewWorktree = action.action_kind === "implement" ||
+      action.action_kind === "repair" ||
+      action.action_kind === "final_repair";
+    const worktree = roleFor(action.action_kind) === "worker"
+      ? createNewWorktree
+        ? await deps.runtime.createWorktree(resource, {
+          idempotencyKey: worktreeIdempotencyKey(action),
+          attemptId: action.parent_attempt_id,
+          baseCommit,
+        })
+        : worktreeHandleFor(action, baseCommit)
+      : null;
+    const loopRequest = buildLoopActionRequest({
+      protocol: "loop-action@2",
+      actionId: action.id,
+      attemptId: action.parent_attempt_id,
+      graphId: action.execution_graph_id,
+      unitId: action.unit_id,
+      role: roleFor(action.action_kind),
+      loop: loopKindFor(action.action_kind),
+      agent: workerBinding?.worker.agent && workerBinding.worker.agent !== "inherit"
+        ? workerBinding.worker.agent
+        : instance.agent,
+      skill: adapterSkillFor(action.action_kind),
+      worktree,
+      nativeSessionId: action.native_session_id,
+      contextPolicy: workerBinding.context === "none"
+        ? "fresh"
+        : workerBinding.context,
+      timeoutMs: (workerBinding?.loop.timeout_seconds ?? deps.taskTimeoutSeconds) * 1_000,
+      transitionContext: action.payload,
+      ...(action.action_kind === "lead"
+        ? {
+            candidateSubject: deps.store.listUnits(action.parent_attempt_id)
+              .find((unit) => unit.unitId === action.unit_id)?.acceptedCandidateSubject ??
+              latestAttemptReceipt<CandidateEvidenceReceipt>(
+                completedAttemptReceiptsFor(action.parent_attempt_id),
+                "candidate_evidence",
+                action.unit_id
+              ).receipt.subject.post,
+          }
+        : {}),
+      allowedMcpServers: workerBinding?.worker.allowed_mcp_servers ?? [],
+      credentialScopes: workerBinding.credentials as LoopActionRequest["credentialScopes"],
+      receiptSchema: RECEIPT_SCHEMA,
+      ...(workerBinding?.repositorySkill ? { repositorySkill: workerBinding.repositorySkill } : {}),
+    });
+    await deps.runtime.dispatchLoopAction(resource, loopRequest);
+    return { requestHash: loopRequest.requestHash, nativeSessionId: action.native_session_id ?? null };
+  };
+
+  const collectChildAction = async (
+    resource: RuntimeResource,
+    instance: PipelineInstance,
+    action: ExecutionWorkAttempt
+  ): Promise<{
+    resultHash: string;
+    outputSubject: string;
+    receipt?: string;
+    decision?: ReturnType<typeof evaluateUnitAcceptanceGate>;
+  } | null> => {
+    if (!action.request_hash) return null;
+    const result = isChildExecutorActionKind(action.action_kind)
+      ? await deps.runtime.collectChildExecutorActionResult(resource, {
+          attemptId: action.parent_attempt_id,
+          actionId: action.id,
+          requestHash: action.request_hash,
+        })
+      : await deps.runtime.collectLoopActionResult(resource, {
+          attemptId: action.parent_attempt_id,
+          actionId: action.id,
+          requestHash: action.request_hash,
+        });
+    if (!result) return null;
+    const receipt = parseStandardReceipt(result.receipt, { source: `child_action.${action.id}.receipt` }).value;
+    const resultSubject = result.subject ?? receipt.subject.post;
+    if (!GIT_SUBJECT.test(resultSubject)) {
+      throw new Error(`child action ${action.id} completed without an exact subject`);
+    }
+    if (action.action_kind === "lead") {
+      if (receipt.type !== "unit_decision") {
+        throw new Error(`child action ${action.id} returned ${receipt.type}, expected unit_decision`);
+      }
+      const receiptEntries = completedAttemptReceiptsFor(action.parent_attempt_id);
+      const completion = latestAttemptReceipt<UnitCompletionReceipt>(receiptEntries, "unit_completion", action.unit_id);
+      const candidate = latestAttemptReceipt<CandidateEvidenceReceipt>(receiptEntries, "candidate_evidence", action.unit_id);
+      const commands = commandAttemptReceipts(receiptEntries, action.unit_id);
+      const acceptedSubject = candidate.receipt.subject.post;
+      const decision = evaluateUnitAcceptanceGate({
+        expected: standardFenceFor(instance, action, acceptedSubject),
+        expectedReceipts: {
+          completion: standardFenceFor(instance, completion.attempt, completion.receipt.subject.post),
+          candidate: standardFenceFor(instance, candidate.attempt, candidate.receipt.subject.post),
+          commands: commands.map((command) => standardFenceFor(instance, command.attempt, command.receipt.subject.post)),
+          lead: standardFenceFor(instance, action, acceptedSubject),
+        },
+        completion: completion.receipt,
+        candidate: candidate.receipt,
+        commands: commands.map((command) => command.receipt),
+        expectedCommandNames: (() => {
+          const graph = deps.store.getGraphForAttempt(action.parent_attempt_id);
+          return graph ? JSON.parse(graph.command_names) as string[] : [];
+        })(),
+        lead: receipt as UnitDecisionReceipt,
+      });
+      return {
+        resultHash: digestNormalized(canonicalJson(result)),
+        outputSubject: acceptedSubject,
+        receipt: canonicalJson(receipt),
+        decision,
+      };
+    }
+    if (action.action_kind === "integrate") {
+      if (receipt.type !== "integration_evidence") {
+        throw new Error(`child action ${action.id} returned ${receipt.type}, expected integration_evidence`);
+      }
+      const integrationSubject = receipt.subject.post;
+      const decision = evaluateIntegrationGate({
+        expected: standardFenceFor(instance, action, integrationSubject),
+        integration: receipt as IntegrationEvidenceReceipt,
+      });
+      return {
+        resultHash: digestNormalized(canonicalJson(result)),
+        outputSubject: integrationSubject,
+        receipt: canonicalJson(receipt),
+        decision,
+      };
+    }
+    if (action.action_kind === "final_review") {
+      if (receipt.type !== "semantic_review") {
+        throw new Error(`child action ${action.id} returned ${receipt.type}, expected semantic_review`);
+      }
+      const receipts = completedAttemptReceiptsFor(action.parent_attempt_id);
+      const graph = deps.store.getGraphForAttempt(action.parent_attempt_id);
+      const commands = commandAttemptReceipts(receipts, null);
+      const reviewSubject = actionInputSubjectFor(instance, action);
+      const decision = evaluateFinalReviewGate({
+        expected: standardFenceFor(instance, action, reviewSubject),
+        expectedReceipts: {
+          commands: commands.map((command) => standardFenceFor(instance, command.attempt, command.receipt.subject.post)),
+          review: standardFenceFor(instance, action, reviewSubject),
+        },
+        commands: commands.map((command) => command.receipt),
+        expectedCommandNames: graph ? JSON.parse(graph.command_names) as string[] : [],
+        review: receipt as SemanticReviewReceipt,
+      });
+      return {
+        resultHash: digestNormalized(canonicalJson(result)),
+        outputSubject: reviewSubject,
+        receipt: canonicalJson(receipt),
+        decision,
+      };
+    }
+    const expectedType = action.action_kind === "command" || action.action_kind === "final_command"
+      ? "command_result"
+      : action.action_kind === "candidate"
+        ? "candidate_evidence"
+        : "unit_completion";
+    if (receipt.type !== expectedType) {
+      throw new Error(`child action ${action.id} returned ${receipt.type}, expected ${expectedType}`);
+    }
+    return {
+      resultHash: digestNormalized(canonicalJson(result)),
+      outputSubject: resultSubject,
+      receipt: canonicalJson(receipt),
+    };
+  };
+
+  const drainCompositeChildren = async (
+    resource: RuntimeResource,
+    instance: PipelineInstance,
+    parentAttemptId: string
+  ): Promise<void> => {
+    const action = await createUnitEffectProcessor({
+      store: deps.store,
+      runtime: {
+        dispatchUnitAction: (action) => dispatchChildAction(resource, instance, action),
+        collectUnitAction: (action) => collectChildAction(resource, instance, action),
+      },
+      leaseOwner: `pipeline-effects:${instance.id}`,
+      now,
+    }).drain(parentAttemptId);
+    if (action) return;
+    const graph = deps.store.getGraphForAttempt(parentAttemptId);
+    if (!graph || graph.aggregate_emitted_at || graph.stopped_at || graph.final_phase !== "done") return;
+    const units = deps.store.listUnits(parentAttemptId);
+    const integratedSubjects = [...new Set(units
+      .filter((unit) => unit.terminalLevel === "completed" && unit.integrationSubject)
+      .map((unit) => unit.integrationSubject!))];
+    if (integratedSubjects.length !== 1 || units.some((unit) => unit.terminalLevel !== "completed")) return;
+    const parentAttempt = deps.store.getAttempt(parentAttemptId);
+    if (!parentAttempt) throw new Error(`structured parent attempt ${parentAttemptId} is missing`);
+    const event = buildAggregateStageEvent({
+      id: `execution-aggregate:${parentAttemptId}:${integratedSubjects[0]}`,
+      manifest: JSON.parse(instance.normalized_manifest),
+      instance,
+      parentAttempt,
+      subject: integratedSubjects[0]!,
+      units,
+      completedAt: now().toISOString(),
+    });
+    const graphResult = event.artifacts?.find((artifact) => artifact.kind === "execution_graph_result");
+    if (!graphResult) throw new Error(`structured aggregate ${event.id} did not include execution_graph_result`);
+    if (deps.store.emitAggregateOnce({
+      parentAttemptId,
+      artifactHash: graphResult.hash,
+      integrationSubject: integratedSubjects[0]!,
+    }) === "emitted") {
+      coordinatePipelineEvent(deps.store, event);
+    }
+  };
+
   const resourceFor = async (instance: PipelineInstance): Promise<RuntimeResource> => {
     const existing = deps.store.getRuntimeResource(instance.id);
     if (existing) {
@@ -297,6 +906,19 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     const request = effect.kind === "dispatch_stage"
       ? parseRequest(effect, deps.store)
       : parseProvisionRequest(effect, deps.store);
+    if (request.capability === FOR_EACH_UNIT_CAPABILITY) {
+      if (request.pipelineInstanceId !== instance.id || request.generation !== instance.generation) {
+        throw new Error(`pipeline composite request ${request.attemptId} has a stale instance fence`);
+      }
+      bindCompositeParentRun(instance, request);
+      seedCompositeGraph(instance, request);
+      await drainCompositeChildren(resource, instance, request.attemptId);
+      acknowledgeEffect(effect, eventId, {
+        providerResourceId: resource.providerResourceId,
+        compositeGraphId: deps.store.getGraphForAttempt(request.attemptId)?.id ?? null,
+      });
+      return;
+    }
     const requestedAttempt = deps.store.getAttempt(request.attemptId);
     if (effect.kind === "provision" && requestedAttempt &&
         ["completed", "canceled", "superseded", "failed"].includes(requestedAttempt.status)) {

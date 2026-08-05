@@ -1,9 +1,10 @@
 {
   "schema": "openthrottle.runtime-capabilities/v1",
-  "release": "openthrottle-snapshot/v8",
+  "release": "openthrottle-snapshot/v9",
   "generatedBy": "sandbox-runtime-build",
   "protocol": "stage-executor@1",
   "capabilities": [
+    "accept-unit@1",
     "agent/repository-skill@1",
     "agent/semantic@1",
     "ce/implement@1",
@@ -13,6 +14,7 @@
     "ce/review@1",
     "ce/simplify@1",
     "command/run@1",
+    "graph/for-each-unit@1",
     "loop-action@2",
     "provider/wait@1"
   ],

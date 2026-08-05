@@ -151,6 +151,7 @@ export interface ExecutionUnitStore {
   }): ExecutionUnitGraph;
   getGraphForAttempt(parentAttemptId: string): ExecutionUnitGraph | undefined;
   listUnits(parentAttemptId: string): ExecutionUnitState[];
+  listWorkAttempts(parentAttemptId: string): ExecutionWorkAttempt[];
   leaseNextUnitAction(input: {
     parentAttemptId: string;
     leaseOwner: string;
@@ -954,6 +955,13 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     },
     listUnits(parentAttemptId) {
       return listUnitRows(parentAttemptId).map(unitState);
+    },
+    listWorkAttempts(parentAttemptId) {
+      return db.prepare(`
+        SELECT * FROM execution_work_attempts
+        WHERE parent_attempt_id = ?
+        ORDER BY created_at, id
+      `).all(parentAttemptId) as ExecutionWorkAttempt[];
     },
     leaseNextUnitAction,
     markActionDispatching(actionId) {

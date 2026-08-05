@@ -1,4 +1,5 @@
 import type { ExecutionUnitStore, ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
+import type { ExecutionGateDecision } from "../pipeline/execution-gates.js";
 
 export interface UnitEffectRuntime {
   dispatchUnitAction(action: ExecutionWorkAttempt): Promise<{
@@ -8,6 +9,8 @@ export interface UnitEffectRuntime {
   collectUnitAction(action: ExecutionWorkAttempt): Promise<{
     resultHash: string;
     outputSubject: string;
+    receipt?: string;
+    decision?: ExecutionGateDecision;
   } | null>;
 }
 
@@ -38,11 +41,22 @@ export function createUnitEffectProcessor(input: {
       if (!requestlessDispatch) {
         const recovered = await input.runtime.collectUnitAction(action);
         if (recovered) {
-          input.store.completeUnitAction({
-            actionId: action.id,
-            resultHash: recovered.resultHash,
-            outputSubject: recovered.outputSubject,
-          });
+          if (recovered.decision) {
+            input.store.completeGatedAction({
+              actionId: action.id,
+              resultHash: recovered.resultHash,
+              outputSubject: recovered.outputSubject,
+              receipt: recovered.receipt,
+              decision: recovered.decision,
+            });
+          } else {
+            input.store.completeUnitAction({
+              actionId: action.id,
+              resultHash: recovered.resultHash,
+              outputSubject: recovered.outputSubject,
+              receipt: recovered.receipt,
+            });
+          }
           return action;
         }
         if (

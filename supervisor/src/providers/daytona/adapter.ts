@@ -5,6 +5,8 @@ import {
   type RuntimeControl,
   type RuntimeInventoryResource,
   type RuntimeWorktreeHandle,
+  type ChildExecutorActionRequest,
+  type ChildExecutorActionResult,
   type LoopActionRequest,
   type LoopActionResult,
   type StageExecutionResult,
@@ -23,6 +25,8 @@ const STAGE_INPUT_DIR = "/var/lib/openthrottle/stage-input";
 const STAGE_RESULT_DIR = "/var/lib/openthrottle/stage-results";
 const LOOP_ACTION_DIR = "/var/lib/openthrottle/loop-actions";
 const LOOP_DISPATCH_DIR = "/var/lib/openthrottle/loop-dispatch";
+const CHILD_EXECUTOR_DIR = "/var/lib/openthrottle/child-executor-actions";
+const CHILD_EXECUTOR_DISPATCH_DIR = "/var/lib/openthrottle/child-executor-dispatch";
 const STAGE_CREDENTIAL_ENV = new Set([
   "GITHUB_TOKEN",
   "CLAUDE_CODE_OAUTH_TOKEN",
@@ -100,6 +104,26 @@ function assertLoopRequestFence(request: LoopActionRequest): void {
   }
 }
 
+function assertChildExecutorRequestFence(request: ChildExecutorActionRequest): void {
+  safeStagePathId(request.actionId, "child executor action ID");
+  safeStagePathId(request.attemptId, "child executor attempt ID");
+  if (!["command", "final_command", "candidate", "integrate"].includes(request.actionKind)) {
+    throw new Error(`child executor action ${request.actionId} has an invalid kind`);
+  }
+  if ((request.actionKind === "command" || request.actionKind === "final_command") && !request.commandName) {
+    throw new Error(`child executor action ${request.actionId} is missing its command name`);
+  }
+  if (request.actionKind === "integrate" && !request.candidateSubject) {
+    throw new Error(`child executor action ${request.actionId} is missing its candidate subject`);
+  }
+  const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...withoutFence } = request;
+  const expectedHash = digestNormalized(canonicalJson(withoutFence));
+  const expectedKey = `child-executor:${request.attemptId}:${request.actionId}:${expectedHash}`;
+  if (request.requestHash !== expectedHash || request.idempotencyKey !== expectedKey) {
+    throw new Error(`child executor action ${request.actionId} has a stale hash or idempotency key`);
+  }
+}
+
 function normalizedLoopRequestForHash(request: LoopActionRequest): Omit<LoopActionRequest, "requestHash" | "idempotencyKey"> {
   const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, candidateSubject, ...withoutFence } = request;
   return candidateSubject === null || candidateSubject === undefined
@@ -120,6 +144,12 @@ function loopActionPath(attemptId: string, actionId: string, name: string): stri
   safeStagePathId(attemptId, "loop attempt ID");
   safeStagePathId(actionId, "loop action ID");
   return `${LOOP_ACTION_DIR}/${attemptId}/${actionId}/${name}`;
+}
+
+function childExecutorActionPath(attemptId: string, actionId: string, name: string): string {
+  safeStagePathId(attemptId, "child executor attempt ID");
+  safeStagePathId(actionId, "child executor action ID");
+  return `${CHILD_EXECUTOR_DIR}/${attemptId}/${actionId}/${name}`;
 }
 
 function shellSingleQuoted(value: string): string {
@@ -188,6 +218,31 @@ function parseCollectedLoopResult(raw: string, input: { attemptId: string; actio
     requestHash: event.request_hash as string,
     outcome: event.outcome as LoopActionResult["outcome"],
     nativeSessionId: event.native_session_id as string | null,
+    subject: event.subject as string | null,
+    receipt: event.receipt as string,
+    completedAt: event.created_at as string,
+  };
+}
+
+function parseCollectedChildExecutorResult(
+  raw: string,
+  input: { attemptId: string; actionId: string; requestHash: string }
+): ChildExecutorActionResult {
+  if (Buffer.byteLength(raw, "utf8") > 256 * 1024) throw new Error("sealed child executor result exceeds 256 KiB");
+  const event = JSON.parse(raw) as Record<string, unknown>;
+  if (event.kind !== "child_executor_action_result" || event.version !== 1 || event.action_id !== input.actionId ||
+      event.attempt_id !== input.attemptId || event.request_hash !== input.requestHash ||
+      !["success", "failure", "needs_human", "retryable_infrastructure_failure"].includes(String(event.outcome)) ||
+      typeof event.created_at !== "string" || Number.isNaN(Date.parse(event.created_at)) ||
+      (event.subject !== null && (typeof event.subject !== "string" || !/^[a-f0-9]{40,64}$/.test(event.subject))) ||
+      typeof event.receipt !== "string") {
+    throw new Error(`sealed child executor result ${input.attemptId}/${input.actionId} has an invalid envelope`);
+  }
+  return {
+    actionId: input.actionId,
+    attemptId: event.attempt_id as string,
+    requestHash: event.request_hash as string,
+    outcome: event.outcome as ChildExecutorActionResult["outcome"],
     subject: event.subject as string | null,
     receipt: event.receipt as string,
     completedAt: event.created_at as string,
@@ -464,6 +519,56 @@ export function createDaytonaSandboxRuntime(
       try {
         const raw = (await sandbox.fs.downloadFile(loopActionPath(input.attemptId, input.actionId, "result.json"))).toString("utf8");
         return parseCollectedLoopResult(raw, input);
+      } catch (error) {
+        if (String(error).toLowerCase().includes("not found")) return null;
+        throw error;
+      }
+    },
+
+    async dispatchChildExecutorAction(resource, request) {
+      assertChildExecutorRequestFence(request);
+      const sandbox = await ensureStarted(resource);
+      const actionDirectory = `${CHILD_EXECUTOR_DIR}/${request.attemptId}/${request.actionId}`;
+      const requestPath = childExecutorActionPath(request.attemptId, request.actionId, "request.json");
+      const resultPath = childExecutorActionPath(request.attemptId, request.actionId, "result.json");
+      await prepareRootFolder(sandbox, CHILD_EXECUTOR_DISPATCH_DIR);
+      const dispatchNonce = randomUUID();
+      const stagedRequestPath =
+        `${CHILD_EXECUTOR_DISPATCH_DIR}/${request.attemptId}.${request.actionId}.${dispatchNonce}.request.json`;
+      const lockPath = `${CHILD_EXECUTOR_DISPATCH_DIR}/${request.attemptId}.${request.actionId}.lock`;
+      await sandbox.fs.uploadFile(Buffer.from(canonicalJson(request)), stagedRequestPath);
+      await sandbox.fs.setFilePermissions(stagedRequestPath, { owner: "root", group: "root", mode: "400" });
+      const sessionId = `child-executor-${request.actionId}`;
+      if (!sandbox.process?.executeSessionCommand) {
+        throw new Error("Daytona runtime does not expose session command execution");
+      }
+      await sandbox.process?.createSession?.(sessionId).catch(() => undefined);
+      const dispatched = await sandbox.process.executeSessionCommand(sessionId, {
+        command: `flock --nonblock ${lockPath} sh -c ` +
+          shellSingleQuoted([
+            `if test -f ${shellSingleQuoted(resultPath)}; then rm -f ${shellSingleQuoted(stagedRequestPath)}; exit 0; fi`,
+            `install -d -o root -g root -m 0711 ${shellSingleQuoted(CHILD_EXECUTOR_DIR)} ${shellSingleQuoted(`${CHILD_EXECUTOR_DIR}/${request.attemptId}`)} ${shellSingleQuoted(actionDirectory)}`,
+            `cp ${shellSingleQuoted(stagedRequestPath)} ${shellSingleQuoted(requestPath)}`,
+            `chown root:root ${shellSingleQuoted(requestPath)}`,
+            `chmod 400 ${shellSingleQuoted(requestPath)}`,
+            `rm -f ${shellSingleQuoted(stagedRequestPath)}`,
+            `exec /opt/openthrottle/runner/execute-child-action.mjs --request ${shellSingleQuoted(requestPath)} --output ${shellSingleQuoted(resultPath)}`,
+          ].join(" && ")) +
+          ` || rm -f ${shellSingleQuoted(stagedRequestPath)}`,
+        runAsync: true,
+        suppressInputEcho: true,
+      }, options.taskTimeoutSeconds ?? 7_200);
+      return { providerDispatchId: dispatched.cmdId ?? sessionId };
+    },
+
+    async collectChildExecutorActionResult(resource, input) {
+      safeStagePathId(input.attemptId, "child executor attempt ID");
+      safeStagePathId(input.actionId, "child executor action ID");
+      if (!/^[a-f0-9]{64}$/.test(input.requestHash)) throw new Error("child executor request hash is invalid");
+      const sandbox = await getSandbox(resource);
+      try {
+        const raw = (await sandbox.fs.downloadFile(childExecutorActionPath(input.attemptId, input.actionId, "result.json"))).toString("utf8");
+        return parseCollectedChildExecutorResult(raw, input);
       } catch (error) {
         if (String(error).toLowerCase().includes("not found")) return null;
         throw error;

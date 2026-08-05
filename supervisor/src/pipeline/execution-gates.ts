@@ -60,6 +60,18 @@ export interface ExecutionGateDecision {
   hash: string;
 }
 
+export interface UnitAcceptanceReceiptFences {
+  completion: StandardReceiptFence;
+  candidate: StandardReceiptFence;
+  commands: readonly StandardReceiptFence[];
+  lead: StandardReceiptFence;
+}
+
+export interface FinalReviewReceiptFences {
+  commands: readonly StandardReceiptFence[];
+  review: StandardReceiptFence;
+}
+
 function assertReceiptFence(
   receipt: UnitCompletionReceipt | UnitDecisionReceipt | CommandResultReceipt | CandidateEvidenceReceipt | IntegrationEvidenceReceipt | SemanticReviewReceipt,
   expected: StandardReceiptFence,
@@ -177,6 +189,7 @@ function issuedAt(receipt: { issued_at: string }, label: string): number {
 
 export function evaluateUnitAcceptanceGate(input: {
   expected: StandardReceiptFence;
+  expectedReceipts?: UnitAcceptanceReceiptFences;
   completion: UnitCompletionReceipt;
   candidate: CandidateEvidenceReceipt;
   commands: readonly CommandResultReceipt[];
@@ -186,10 +199,16 @@ export function evaluateUnitAcceptanceGate(input: {
   if (SEMANTIC_REVIEW_SKILL.test(input.lead.producer.skill)) {
     throw new Error("unit acceptance must not be produced by ce-code-review");
   }
-  assertReceiptFence(input.completion, input.expected, "completion");
-  assertReceiptFence(input.candidate, input.expected, "candidate");
-  assertReceiptFence(input.lead, input.expected, "lead");
-  for (const command of input.commands) assertReceiptFence(command, input.expected, "command");
+  const fences = input.expectedReceipts ?? {
+    completion: input.expected,
+    candidate: input.expected,
+    commands: input.commands.map(() => input.expected),
+    lead: input.expected,
+  };
+  assertReceiptFence(input.completion, fences.completion, "completion");
+  assertReceiptFence(input.candidate, fences.candidate, "candidate");
+  assertReceiptFence(input.lead, fences.lead, "lead");
+  input.commands.forEach((command, index) => assertReceiptFence(command, fences.commands[index] ?? input.expected, "command"));
   const candidateHash = receiptHash(input.candidate);
   const commandHashes = input.commands.map(receiptHash);
   assertEvidenceBinding(input.lead, [candidateHash, ...commandHashes], "lead");
@@ -267,12 +286,17 @@ export function evaluateIntegrationGate(input: {
 
 export function evaluateFinalReviewGate(input: {
   expected: StandardReceiptFence;
+  expectedReceipts?: FinalReviewReceiptFences;
   commands: readonly CommandResultReceipt[];
   expectedCommandNames: readonly string[];
   review: SemanticReviewReceipt;
 }): ExecutionGateDecision {
-  for (const command of input.commands) assertReceiptFence(command, input.expected, "command");
-  assertReceiptFence(input.review, input.expected, "review");
+  const fences = input.expectedReceipts ?? {
+    commands: input.commands.map(() => input.expected),
+    review: input.expected,
+  };
+  input.commands.forEach((command, index) => assertReceiptFence(command, fences.commands[index] ?? input.expected, "command"));
+  assertReceiptFence(input.review, fences.review, "review");
   const reviewIssuedAt = issuedAt(input.review, "review");
   for (const command of input.commands) {
     if (issuedAt(command, "command") > reviewIssuedAt) {

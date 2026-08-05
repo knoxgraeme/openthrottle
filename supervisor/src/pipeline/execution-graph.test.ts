@@ -279,11 +279,12 @@ describe("execution graph compiler", () => {
     expect(compiled.manifest.manifest.stages[0]?.transitions.no_change).toEqual({ terminal: "no_change" });
   });
 
-  it("rejects the structured graph against the shipped production runtime descriptor until the composite runtime lands", () => {
-    expect(() => parseAndCompileExecutionGraph(readFileSync(structuredGraphPath, "utf8"), {
+  it("compiles the structured graph against the shipped production runtime descriptor", () => {
+    const compiled = parseAndCompileExecutionGraph(readFileSync(structuredGraphPath, "utf8"), {
       source: structuredGraphPath,
       runtime: buildInstalledRuntimeDescriptor("production-like/v1").descriptor,
-    })).toThrow(/runtime capability mismatch: .*capability:graph\/for-each-unit@1/);
+    });
+    expect(compiled.manifest.manifest.requires.capabilities).toContain("graph/for-each-unit@1");
   });
 
   it("changes the pinned manifest digest when only a unit phase worker binding changes", () => {
