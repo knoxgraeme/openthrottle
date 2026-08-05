@@ -1662,6 +1662,68 @@ describe("execution unit store", () => {
     })).toBe("already_stopped");
   });
 
+  it("advances the graph integration head after each serial integration", () => {
+    const store = setup();
+    const firstSubject = "1".repeat(40);
+    const secondSubject = "2".repeat(40);
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b", dependencies: ["a"] }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+
+    completeUnitToTerminal(store, firstSubject);
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ integration_subject: firstSubject });
+    completeUnitToTerminal(store, secondSubject);
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ integration_subject: secondSubject });
+
+    const finalReview = lease(store);
+    expect(finalReview).toMatchObject({ action_kind: "final_review", unit_id: null });
+    store.completeGatedAction({
+      actionId: finalReview.id,
+      resultHash: "fr-hash",
+      outputSubject: secondSubject,
+      decision: gateDecision({ gateKind: "final_review", outcome: "success", subject: secondSubject }),
+    });
+
+    expect(store.emitAggregateOnce({
+      parentAttemptId: "attempt-parent",
+      artifactHash: "hash-serial",
+      integrationSubject: secondSubject,
+    })).toBe("emitted");
+  });
+
+  it("emits a non-success aggregate for a terminal unintegrated graph without final review", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+    store.settleUnitTerminal({
+      parentAttemptId: "attempt-parent",
+      unitId: "a",
+      reason: "structural_exit",
+    });
+
+    expect(store.emitAggregateOnce({
+      parentAttemptId: "attempt-parent",
+      artifactHash: "hash-unintegrated",
+      integrationSubject: null,
+      requireFinalReview: false,
+    })).toBe("emitted");
+  });
+
   it("records child gate receipts idempotently and rejects conflicting replay", () => {
     const store = setup();
     store.createGraph({
@@ -2211,13 +2273,40 @@ describe("execution unit store", () => {
     const finalRepair = lease(store);
     expect(finalRepair.action_kind).toBe("final_repair");
     store.markActionDispatched(finalRepair.id, "request-hash", "native-session-final-repair-1");
-    store.completeUnitAction({ actionId: finalRepair.id, resultHash: "frp", outputSubject: subject });
-    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ final_phase: "command", final_command_index: 0, final_cycle: 2 });
+    const repairedSubject = "2".repeat(40);
+    const repairedCandidate = "3".repeat(40);
+    const repairedIntegratedSubject = "4".repeat(40);
+    store.completeUnitAction({ actionId: finalRepair.id, resultHash: "frp", outputSubject: repairedSubject });
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ final_phase: "repair", final_cycle: 1 });
+
+    const finalCandidate = lease(store);
+    expect(finalCandidate).toMatchObject({ action_kind: "candidate", unit_id: null, cycle: 1 });
+    store.completeUnitAction({
+      actionId: finalCandidate.id, resultHash: "fcandidate", outputSubject: repairedCandidate,
+      receipt: receiptJson("candidate_evidence"),
+    });
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ final_phase: "repair", final_cycle: 1 });
+
+    const finalIntegrate = lease(store);
+    expect(finalIntegrate).toMatchObject({ action_kind: "integrate", unit_id: null, cycle: 1 });
+    store.completeGatedAction({
+      actionId: finalIntegrate.id,
+      resultHash: "fintegrate",
+      outputSubject: repairedIntegratedSubject,
+      receipt: receiptJson("integration_evidence"),
+      decision: gateDecision({ gateKind: "integration", subject: repairedIntegratedSubject }),
+    });
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({
+      final_phase: "command",
+      final_command_index: 0,
+      final_cycle: 2,
+      integration_subject: repairedIntegratedSubject,
+    });
 
     const finalCommand2 = lease(store);
     expect(finalCommand2).toMatchObject({ action_kind: "final_command", command_name: "test", cycle: 2 });
     store.completeUnitAction({
-      actionId: finalCommand2.id, resultHash: "fc2", outputSubject: subject,
+      actionId: finalCommand2.id, resultHash: "fc2", outputSubject: repairedIntegratedSubject,
       receipt: receiptJson("command_result", { payload: { command: "test" } }),
     });
     const finalReview2 = lease(store);
@@ -2225,15 +2314,37 @@ describe("execution unit store", () => {
     store.completeGatedAction({
       actionId: finalReview2.id,
       resultHash: "fr2",
-      outputSubject: subject,
-      decision: gateDecision({ gateKind: "final_review", outcome: "semantic_repair_required", subject, reason: "unresolved_review_finding" }),
+      outputSubject: repairedIntegratedSubject,
+      decision: gateDecision({
+        gateKind: "final_review",
+        outcome: "semantic_repair_required",
+        subject: repairedIntegratedSubject,
+        reason: "unresolved_review_finding",
+      }),
     });
     expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ final_phase: "repair", final_repair_rounds: 2 });
 
     const finalRepair2 = lease(store);
     expect(finalRepair2.action_kind).toBe("final_repair");
     expect(JSON.parse(finalRepair2.payload)).toMatchObject({ resume_native_session_id: "native-session-final-repair-1" });
-    store.completeUnitAction({ actionId: finalRepair2.id, resultHash: "frp2", outputSubject: subject });
+    store.completeUnitAction({ actionId: finalRepair2.id, resultHash: "frp2", outputSubject: repairedIntegratedSubject });
+
+    const finalCandidate2 = lease(store);
+    expect(finalCandidate2).toMatchObject({ action_kind: "candidate", unit_id: null, cycle: 2 });
+    store.completeUnitAction({
+      actionId: finalCandidate2.id, resultHash: "fcandidate2", outputSubject: repairedIntegratedSubject,
+      receipt: receiptJson("candidate_evidence"),
+    });
+
+    const finalIntegrate2 = lease(store);
+    expect(finalIntegrate2).toMatchObject({ action_kind: "integrate", unit_id: null, cycle: 2 });
+    store.completeGatedAction({
+      actionId: finalIntegrate2.id,
+      resultHash: "fintegrate2",
+      outputSubject: repairedIntegratedSubject,
+      receipt: receiptJson("integration_evidence"),
+      decision: gateDecision({ gateKind: "integration", subject: repairedIntegratedSubject }),
+    });
 
     const finalCommand3 = lease(store);
     expect(finalCommand3).toMatchObject({ action_kind: "final_command", command_name: "test", cycle: 3 });
@@ -2281,6 +2392,12 @@ describe("execution unit store", () => {
     expect(() => store.completeUnitAction({
       actionId: lead.id, resultHash: "r4", outputSubject: subject,
     })).toThrow(/requires a gate decision to complete/);
+    expect(() => store.completeGatedAction({
+      actionId: lead.id,
+      resultHash: "r4",
+      outputSubject: subject,
+      decision: gateDecision({ gateKind: "integration", outcome: "success", subject }),
+    })).toThrow(/action lead cannot complete integration gate/);
 
     // A non-gated action that already reached 'completed' via completeUnitAction
     // (e.g. the earlier implement action) must still be rejected by

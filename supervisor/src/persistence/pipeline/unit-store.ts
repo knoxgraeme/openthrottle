@@ -47,6 +47,17 @@ import {
 
 export type ExecutionGateKind = ChildGateDecision["gateKind"] | "integration" | "final_review";
 
+function assertGateMatchesAction(action: ExecutionWorkAttempt, gateKind: ExecutionGateKind): void {
+  const expectedAction = gateKind === "unit_acceptance"
+    ? "lead"
+    : gateKind === "integration"
+      ? "integrate"
+      : "final_review";
+  if (action.action_kind !== expectedAction) {
+    throw new Error(`execution work attempt ${action.id} action ${action.action_kind} cannot complete ${gateKind} gate`);
+  }
+}
+
 export interface ExecutionUnitGraph {
   id: string;
   pipeline_instance_id: string;
@@ -177,6 +188,7 @@ export interface ExecutionUnitStore {
     parentAttemptId: string;
     artifactHash: string;
     integrationSubject: string | null;
+    requireFinalReview?: boolean;
   }): "emitted" | "already_emitted";
   recordGateReceipt(input: {
     actionId: string;
@@ -612,11 +624,11 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         db.prepare(`UPDATE execution_graphs SET final_command_index = final_command_index + 1, updated_at = ? WHERE id = ?`)
           .run(timestamp, action.execution_graph_id);
       } else if (action.action_kind === "final_repair") {
-        db.prepare(`
-          UPDATE execution_graphs
-          SET final_phase = 'command', final_command_index = 0, final_cycle = final_cycle + 1, updated_at = ?
-          WHERE id = ?
-        `).run(timestamp, action.execution_graph_id);
+        db.prepare(`UPDATE execution_graphs SET updated_at = ? WHERE id = ?`)
+          .run(timestamp, action.execution_graph_id);
+      } else if (action.action_kind === "candidate") {
+        db.prepare(`UPDATE execution_graphs SET updated_at = ? WHERE id = ?`)
+          .run(timestamp, action.execution_graph_id);
       } else {
         throw new Error(`execution work attempt ${input.actionId} action kind is not handled by completeUnitAction`);
       }
@@ -639,6 +651,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       markActionCompleted(db, { action, resultHash: input.resultHash, outputSubject: input.outputSubject, receipt: input.receipt, timestamp });
     }
     const completedAction = loadActiveAction(db, input.actionId);
+    assertGateMatchesAction(completedAction, input.decision.gateKind);
 
     const evaluatorKind: ChildGateEvaluatorKind = input.decision.gateKind === "unit_acceptance"
       ? "human"
@@ -708,6 +721,8 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         if (routing.action === "settle_completed") {
           db.prepare(`UPDATE execution_units SET integration_subject = ?, updated_at = ? WHERE id = ?`)
             .run(input.decision.subject, timestamp, unitRow.id);
+          db.prepare(`UPDATE execution_graphs SET integration_subject = ?, updated_at = ? WHERE parent_attempt_id = ?`)
+            .run(input.decision.subject, timestamp, completedAction.parent_attempt_id);
           settleUnitRow({ parentAttemptId: completedAction.parent_attempt_id, unitId: unitRow.unit_id, reason: "acceptance_passed", timestamp });
         } else {
           stopActiveWork({ parentAttemptId: completedAction.parent_attempt_id, reason: routing.reason });
@@ -716,10 +731,23 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         throw new Error(`execution work attempt ${input.actionId} gate kind ${input.decision.gateKind} is not valid for a unit action`);
       }
     } else {
+      const graph = graphStmt.get(completedAction.parent_attempt_id) as ExecutionUnitGraph;
+      if (input.decision.gateKind === "integration") {
+        const routing = routeIntegrationDecision({ outcome: input.decision.outcome, reason: input.decision.reason });
+        if (routing.action === "settle_completed") {
+          db.prepare(`
+            UPDATE execution_graphs SET integration_subject = ?, final_phase = 'command',
+              final_command_index = 0, final_cycle = final_cycle + 1, updated_at = ?
+            WHERE id = ?
+          `).run(input.decision.subject, timestamp, graph.id);
+        } else {
+          stopActiveWork({ parentAttemptId: completedAction.parent_attempt_id, reason: routing.reason });
+        }
+        return loadActiveAction(db, input.actionId);
+      }
       if (input.decision.gateKind !== "final_review") {
         throw new Error(`execution work attempt ${input.actionId} gate kind ${input.decision.gateKind} is not valid for a final action`);
       }
-      const graph = graphStmt.get(completedAction.parent_attempt_id) as ExecutionUnitGraph;
       const routing = routeFinalReviewDecision({
         outcome: input.decision.outcome,
         reason: input.decision.reason,
@@ -761,7 +789,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     const hasCompletedUnit = db.prepare(`
       SELECT 1 FROM execution_units WHERE parent_attempt_id = ? AND terminal_level = 'completed' LIMIT 1
     `).get(input.parentAttemptId);
-    if (hasCompletedUnit && graph.final_phase !== "done") {
+    if ((input.requireFinalReview ?? true) && hasCompletedUnit && graph.final_phase !== "done") {
       throw new Error(`execution graph ${graph.id} whole-change final review has not passed`);
     }
     const timestamp = now();

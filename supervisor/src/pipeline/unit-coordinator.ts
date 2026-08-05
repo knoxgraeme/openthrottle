@@ -35,6 +35,12 @@ export const UNIT_ACTION_KINDS = [
 ] as const;
 export type UnitActionKind = (typeof UNIT_ACTION_KINDS)[number];
 
+function structuredAggregateSummary(result: StageOutcome): string {
+  return result === "success"
+    ? "Structured execution units completed."
+    : "Structured execution did not integrate every unit.";
+}
+
 // Whole-change final phases run once every unit has settled: full commands
 // rerun against the final integrated subject, then one fresh report-only
 // review, with bounded repair looping back to a clean command rerun.
@@ -478,6 +484,7 @@ export function buildExecutionGraphResultArtifact(input: {
 }): PipelineEventArtifact {
   const ordered = [...input.units].sort((left, right) => left.ordinal - right.ordinal || left.unitId.localeCompare(right.unitId));
   const completedAt = input.completedAt ?? input.parentAttempt.completed_at ?? input.parentAttempt.updated_at;
+  const result = input.result ?? "success";
   const payload = canonicalJson({
     ...typedArtifactBase({
       kind: "execution_graph_result",
@@ -486,10 +493,10 @@ export function buildExecutionGraphResultArtifact(input: {
       stage: input.stage,
       subject: input.subject,
       assurance: input.assurance ?? input.stage.evaluator.assurance,
-      result: input.result ?? "success",
+      result,
       completedAt,
     }),
-    summary: "Structured execution units completed.",
+    summary: structuredAggregateSummary(result),
     evidence: [],
     findings: [],
     actions: [],
@@ -533,10 +540,10 @@ export function buildAggregateStageEvent(input: {
   );
   const allIntegrated = ordered.length > 0 && ordered.every((unit) =>
     unit.terminalLevel === "completed" &&
-    unit.integrationSubject !== null &&
-    unit.integrationSubject === input.subject
+    unit.integrationSubject !== null
   );
-  if ((input.outcome ?? "success") === "success" && !allIntegrated) {
+  const outcome = input.outcome ?? "success";
+  if (outcome === "success" && !allIntegrated) {
     throw new Error("structured aggregate success requires every unit to have accepted exact-subject integration evidence");
   }
   const graphResult = buildExecutionGraphResultArtifact({
@@ -545,7 +552,7 @@ export function buildAggregateStageEvent(input: {
     stage,
     units: input.units,
     subject: input.subject,
-    result: input.outcome ?? "success",
+    result: outcome,
     completedAt: input.completedAt,
   });
   const completedAt = input.completedAt ?? input.parentAttempt.completed_at ?? input.parentAttempt.updated_at;
@@ -557,10 +564,10 @@ export function buildAggregateStageEvent(input: {
       stage,
       subject: input.subject,
       assurance: stage.evaluator.assurance,
-      result: input.outcome ?? "success",
+      result: outcome,
       completedAt,
     }),
-    summary: "Structured execution units completed.",
+    summary: structuredAggregateSummary(outcome),
     evidence: [graphResult.hash],
     findings: [],
     actions: [],
@@ -586,7 +593,7 @@ export function buildAggregateStageEvent(input: {
     stageId: input.parentAttempt.stage_id,
     attemptId: input.parentAttempt.id,
     requestHash: input.parentAttempt.request_hash,
-    outcome: input.outcome ?? "success",
+    outcome,
     resultHash: stageResult.hash,
     subject: input.subject,
     nativeSessionId: input.nativeSessionId ?? input.parentAttempt.native_session_id,

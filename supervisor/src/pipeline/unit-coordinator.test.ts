@@ -287,13 +287,14 @@ describe("unit coordinator", () => {
       created_at: "2026-07-29T00:00:00.000Z",
       updated_at: "2026-07-29T00:00:01.000Z",
     } as PipelineStageAttempt;
+    const finalSubject = "5".repeat(40);
 
     const event = buildAggregateStageEvent({
       id: "aggregate-1",
       manifest,
       instance,
       parentAttempt,
-      subject,
+      subject: finalSubject,
       completedAt: "2026-07-29T00:00:02.000Z",
       units: [
         unit({ unitId: "a", ordinal: 0, status: "completed", terminalLevel: "completed", integrationSubject: subject }),
@@ -333,7 +334,7 @@ describe("unit coordinator", () => {
       schema: "openthrottle.artifact/stage_result@1",
       evidence: [graphResult!.hash],
       details: { execution_graph_result_hash: graphResult!.hash },
-      repository: { subject },
+      repository: { subject: finalSubject },
     });
     expect(graphPayload).toMatchObject({
       schema: "openthrottle.artifact/execution_graph_result@1",
@@ -355,7 +356,7 @@ describe("unit coordinator", () => {
           },
         ],
       },
-      repository: { subject },
+      repository: { subject: finalSubject },
     });
     expect(() => buildAggregateStageEvent({
       id: "aggregate-exited",

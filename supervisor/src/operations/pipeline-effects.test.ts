@@ -46,7 +46,7 @@ describe("pipeline effect processor", () => {
       dispatchLoopAction: vi.fn(async () => ({ providerDispatchId: `loop-${issueId}` })),
       collectLoopActionResult: vi.fn(async () => null),
       dispatchChildExecutorAction: vi.fn(async () => ({ providerDispatchId: `child-executor-${issueId}` })),
-      collectChildExecutorActionResult: vi.fn(async () => null),
+      collectChildExecutorActionResult: vi.fn<SandboxRuntime["collectChildExecutorActionResult"]>(async () => null),
       cleanupWorktree: vi.fn(async () => undefined),
       renewLiveness: vi.fn(async () => ({ observedAt: new Date().toISOString() })),
       stop: vi.fn(async () => ({ confirmed: true })),
@@ -177,6 +177,8 @@ describe("pipeline effect processor", () => {
     action: ExecutionWorkAttempt;
     type: "unit_completion" | "command_result" | "candidate_evidence" | "unit_decision" | "integration_evidence" | "semantic_review";
     subject: string;
+    baseSubject?: string;
+    preSubject?: string;
     result?: string;
     commandName?: string | null;
   }): string {
@@ -194,7 +196,7 @@ describe("pipeline effect processor", () => {
       : input.type === "command_result"
         ? { command: input.commandName ?? "test", exit_code: 0, summary: "command passed" }
         : input.type === "semantic_review"
-          ? { summary: "no findings", findings: [], verification: [] }
+          ? { summary: "no findings", findings: [] }
         : input.type === "unit_decision"
           ? { rationale: "candidate matches the unit scope", context_updates: [], accepted_subject: input.subject }
           : { tree: input.subject, diff_digest: "d".repeat(64), changed_paths: [], clean: true };
@@ -210,8 +212,8 @@ describe("pipeline effect processor", () => {
         skill_package_digest: null,
       },
       subject: {
-        base: input.instance.base_commit,
-        pre: input.instance.base_commit,
+        base: input.baseSubject ?? input.instance.base_commit,
+        pre: input.preSubject ?? input.instance.base_commit,
         post: input.subject,
       },
       fence: {
@@ -562,15 +564,30 @@ describe("pipeline effect processor", () => {
       schema: "openthrottle.execution-plan/v1",
       graph_id: "structured",
       plan_id: "structured-child-drain",
-      instructions: { implement_a: "Implement unit A." },
-      acceptance: { unit_a_done: "Unit A is complete." },
-      units: [{
-        id: "unit_a",
-        title: "Unit A",
-        depends_on: [],
-        instructions: ["implement_a"],
-        acceptance: ["unit_a_done"],
-      }],
+      instructions: {
+        implement_a: "Implement unit A.",
+        implement_b: "Implement unit B.",
+      },
+      acceptance: {
+        unit_a_done: "Unit A is complete.",
+        unit_b_done: "Unit B is complete.",
+      },
+      units: [
+        {
+          id: "unit_a",
+          title: "Unit A",
+          depends_on: [],
+          instructions: ["implement_a"],
+          acceptance: ["unit_a_done"],
+        },
+        {
+          id: "unit_b",
+          title: "Unit B",
+          depends_on: ["unit_a"],
+          instructions: ["implement_b"],
+          acceptance: ["unit_b_done"],
+        },
+      ],
       commands: [],
     };
     const taskContext = [
@@ -614,6 +631,9 @@ describe("pipeline effect processor", () => {
     const completedSubject = "1".repeat(40);
     const candidateSubject = "2".repeat(40);
     const integratedSubject = "3".repeat(40);
+    const completedSubjectB = "4".repeat(40);
+    const candidateSubjectB = "5".repeat(40);
+    const integratedSubjectB = "6".repeat(40);
     const latestAction = (kind: ExecutionWorkAttempt["action_kind"]) => {
       const action = [...pipelines.listWorkAttempts(attempt.id)].reverse()
         .find((attempt) => attempt.status !== "completed");
@@ -646,72 +666,113 @@ describe("pipeline effect processor", () => {
       }
     };
 
-    await processor.drain();
-    completeUnitAction("implement", completedSubject, "unit_completion");
+    const drainUnit = async (input: {
+      unitId: string;
+      baseSubject: string;
+      completed: string;
+      candidate: string;
+      integrated: string;
+    }) => {
+      await processor.drain();
+      expect(runtime.createWorktree).toHaveBeenLastCalledWith(
+        { providerResourceId: "sandbox-child-drain" },
+        expect.objectContaining({ baseCommit: input.baseSubject })
+      );
+      expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
+        { providerResourceId: "sandbox-child-drain" },
+        expect.objectContaining({
+          protocol: "loop-action@2",
+          role: "worker",
+          skill: "implement-unit",
+          unitId: input.unitId,
+        })
+      );
+      completeUnitAction("implement", input.completed, "unit_completion");
 
-    await processor.drain();
-    expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
-      { providerResourceId: "sandbox-child-drain" },
-      expect.objectContaining({
-        protocol: "loop-action@2",
-        role: "worker",
-        skill: "simplify-unit",
-      })
-    );
-    completeUnitAction("simplify", completedSubject);
+      await processor.drain();
+      expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
+        { providerResourceId: "sandbox-child-drain" },
+        expect.objectContaining({
+          protocol: "loop-action@2",
+          role: "worker",
+          skill: "simplify-unit",
+          unitId: input.unitId,
+        })
+      );
+      completeUnitAction("simplify", input.completed);
 
-    await drainCommandActions("command", completedSubject);
+      await drainCommandActions("command", input.completed);
 
-    await processor.drain();
-    expect(runtime.dispatchChildExecutorAction).toHaveBeenLastCalledWith(
-      { providerResourceId: "sandbox-child-drain" },
-      expect.objectContaining({
-        protocol: "child-executor-action@1",
-        actionKind: "candidate",
-        inputSubject: completedSubject,
-      })
-    );
-    completeUnitAction("candidate", candidateSubject, "candidate_evidence");
+      await processor.drain();
+      expect(runtime.dispatchChildExecutorAction).toHaveBeenLastCalledWith(
+        { providerResourceId: "sandbox-child-drain" },
+        expect.objectContaining({
+          protocol: "child-executor-action@1",
+          actionKind: "candidate",
+          inputSubject: input.completed,
+          unitId: input.unitId,
+        })
+      );
+      completeUnitAction("candidate", input.candidate, "candidate_evidence");
 
-    await processor.drain();
-    expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
-      { providerResourceId: "sandbox-child-drain" },
-      expect.objectContaining({
-        protocol: "loop-action@2",
-        role: "lead",
-        skill: "accept-unit",
-        candidateSubject,
-      })
-    );
-    const lead = latestAction("lead");
-    pipelines.completeGatedAction({
-      actionId: lead.id,
-      resultHash: "result-lead",
-      outputSubject: candidateSubject,
-      receipt: receiptJson({ instance, action: lead, type: "unit_decision", subject: candidateSubject }),
-      decision: gateDecision({ gateKind: "unit_acceptance", subject: candidateSubject }),
+      await processor.drain();
+      expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
+        { providerResourceId: "sandbox-child-drain" },
+        expect.objectContaining({
+          protocol: "loop-action@2",
+          role: "lead",
+          skill: "accept-unit",
+          candidateSubject: input.candidate,
+          unitId: input.unitId,
+        })
+      );
+      const lead = latestAction("lead");
+      pipelines.completeGatedAction({
+        actionId: lead.id,
+        resultHash: `result-lead-${input.unitId}`,
+        outputSubject: input.candidate,
+        receipt: receiptJson({ instance, action: lead, type: "unit_decision", subject: input.candidate }),
+        decision: gateDecision({ gateKind: "unit_acceptance", subject: input.candidate }),
+      });
+
+      await processor.drain();
+      expect(runtime.dispatchChildExecutorAction).toHaveBeenLastCalledWith(
+        { providerResourceId: "sandbox-child-drain" },
+        expect.objectContaining({
+          protocol: "child-executor-action@1",
+          actionKind: "integrate",
+          candidateSubject: input.candidate,
+          inputSubject: input.baseSubject,
+          unitId: input.unitId,
+        })
+      );
+      const integrate = latestAction("integrate");
+      pipelines.completeGatedAction({
+        actionId: integrate.id,
+        resultHash: `result-integrate-${input.unitId}`,
+        outputSubject: input.integrated,
+        receipt: receiptJson({ instance, action: integrate, type: "integration_evidence", subject: input.integrated }),
+        decision: gateDecision({ gateKind: "integration", subject: input.integrated }),
+      });
+      expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({ integration_subject: input.integrated });
+    };
+
+    await drainUnit({
+      unitId: "unit_a",
+      baseSubject: "a".repeat(40),
+      completed: completedSubject,
+      candidate: candidateSubject,
+      integrated: integratedSubject,
+    });
+    await drainUnit({
+      unitId: "unit_b",
+      baseSubject: integratedSubject,
+      completed: completedSubjectB,
+      candidate: candidateSubjectB,
+      integrated: integratedSubjectB,
     });
 
-    await processor.drain();
-    expect(runtime.dispatchChildExecutorAction).toHaveBeenLastCalledWith(
-      { providerResourceId: "sandbox-child-drain" },
-      expect.objectContaining({
-        protocol: "child-executor-action@1",
-        actionKind: "integrate",
-        candidateSubject,
-        inputSubject: "a".repeat(40),
-      })
-    );
-    const integrate = latestAction("integrate");
-    pipelines.completeGatedAction({
-      actionId: integrate.id,
-      resultHash: "result-integrate",
-      outputSubject: integratedSubject,
-      receipt: receiptJson({ instance, action: integrate, type: "integration_evidence", subject: integratedSubject }),
-      decision: gateDecision({ gateKind: "integration", subject: integratedSubject }),
-    });
-
-    await drainCommandActions("final_command", integratedSubject);
+    await drainCommandActions("final_command", integratedSubjectB);
 
     await processor.drain();
     expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
@@ -727,11 +788,11 @@ describe("pipeline effect processor", () => {
     pipelines.completeGatedAction({
       actionId: review.id,
       resultHash: "result-review",
-      outputSubject: integratedSubject,
-      receipt: receiptJson({ instance, action: review, type: "semantic_review", subject: integratedSubject }),
+      outputSubject: integratedSubjectB,
+      receipt: receiptJson({ instance, action: review, type: "semantic_review", subject: integratedSubjectB }),
       decision: gateDecision({
         gateKind: "final_review",
-        subject: integratedSubject,
+        subject: integratedSubjectB,
         outcome: "semantic_repair_required",
         result: "failed",
         reason: "review found a repairable issue",
@@ -747,25 +808,89 @@ describe("pipeline effect processor", () => {
         skill: "final-repair",
       })
     );
-    completeUnitAction("final_repair", integratedSubject, "unit_completion");
+    const repairedSubject = "c".repeat(40);
+    const finalCandidateSubject = "d".repeat(40);
+    const finalIntegratedSubject = "e".repeat(40);
+    completeUnitAction("final_repair", repairedSubject, "unit_completion");
 
-    await drainCommandActions("final_command", integratedSubject);
+    await processor.drain();
+    expect(runtime.dispatchChildExecutorAction).toHaveBeenLastCalledWith(
+      { providerResourceId: "sandbox-child-drain" },
+      expect.objectContaining({
+        protocol: "child-executor-action@1",
+        actionKind: "candidate",
+        inputSubject: repairedSubject,
+        unitId: null,
+        worktree: expect.any(Object),
+      })
+    );
+    const finalCandidate = latestAction("candidate");
+    runtime.collectChildExecutorActionResult.mockResolvedValueOnce({
+      actionId: finalCandidate.id,
+      attemptId: finalCandidate.parent_attempt_id,
+      requestHash: finalCandidate.request_hash!,
+      outcome: "success",
+      subject: finalCandidateSubject,
+      receipt: receiptJson({ instance, action: finalCandidate, type: "candidate_evidence", subject: finalCandidateSubject }),
+      completedAt: "2099-07-22T12:00:00.000Z",
+    });
+    await expect(processor.drain()).rejects.toThrow(/candidate receipt input subject mismatch/);
+    runtime.collectChildExecutorActionResult.mockResolvedValueOnce({
+      actionId: finalCandidate.id,
+      attemptId: finalCandidate.parent_attempt_id,
+      requestHash: finalCandidate.request_hash!,
+      outcome: "success",
+      subject: finalCandidateSubject,
+      receipt: receiptJson({
+        instance,
+        action: finalCandidate,
+        type: "candidate_evidence",
+        subject: finalCandidateSubject,
+        baseSubject: integratedSubjectB,
+        preSubject: repairedSubject,
+      }),
+      completedAt: "2099-07-22T12:00:00.000Z",
+    });
+    await processor.drain();
+
+    await processor.drain();
+    expect(runtime.dispatchChildExecutorAction).toHaveBeenLastCalledWith(
+      { providerResourceId: "sandbox-child-drain" },
+      expect.objectContaining({
+        protocol: "child-executor-action@1",
+        actionKind: "integrate",
+        candidateSubject: finalCandidateSubject,
+        inputSubject: integratedSubjectB,
+        unitId: null,
+      })
+    );
+    const finalIntegrate = latestAction("integrate");
+    pipelines.completeGatedAction({
+      actionId: finalIntegrate.id,
+      resultHash: "result-final-integrate",
+      outputSubject: finalIntegratedSubject,
+      receipt: receiptJson({ instance, action: finalIntegrate, type: "integration_evidence", subject: finalIntegratedSubject }),
+      decision: gateDecision({ gateKind: "integration", subject: finalIntegratedSubject }),
+    });
+    expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({ integration_subject: finalIntegratedSubject });
+
+    await drainCommandActions("final_command", finalIntegratedSubject);
 
     await processor.drain();
     const freshReview = latestAction("final_review");
     pipelines.completeGatedAction({
       actionId: freshReview.id,
       resultHash: "result-review-fresh",
-      outputSubject: integratedSubject,
-      receipt: receiptJson({ instance, action: freshReview, type: "semantic_review", subject: integratedSubject }),
-      decision: gateDecision({ gateKind: "final_review", subject: integratedSubject }),
+      outputSubject: finalIntegratedSubject,
+      receipt: receiptJson({ instance, action: freshReview, type: "semantic_review", subject: finalIntegratedSubject }),
+      decision: gateDecision({ gateKind: "final_review", subject: finalIntegratedSubject }),
     });
 
     await processor.drain();
     const aggregate = pipelines.getGraphForAttempt(attempt.id);
     expect(aggregate).toMatchObject({
       aggregate_emitted_at: expect.any(String),
-      integration_subject: integratedSubject,
+      integration_subject: finalIntegratedSubject,
     });
     const activationsAfterAggregate = runtime.setActive.mock.calls.length;
     await processor.drain();

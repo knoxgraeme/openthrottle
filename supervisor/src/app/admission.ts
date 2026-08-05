@@ -22,13 +22,13 @@ import {
 import { FOR_EACH_UNIT_CAPABILITY, parseAndCompileExecutionGraph } from "../pipeline/execution-graph.js";
 import type { RepositorySkillPackage } from "../pipeline/manifest.js";
 import type { PipelineStore } from "../pipeline/store.js";
+import { extractJsonBlocks } from "../shared/markdown.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import type { AdmissionPreflight } from "./admission-preflight.js";
 import type { PipelineCoordinatorContext, SessionServicePorts } from "./session-service.js";
 
 const EXECUTION_PLAN_FENCE = "openthrottle.execution-plan/v1";
 const SHIP_SELECTION_FENCE = "openthrottle.ship-selection/v1";
-const FENCE_PATTERN = /```([^\n`]*)\n([\s\S]*?)```/g;
 const BUILTIN_SIMPLE_GRAPH = fileURLToPath(new URL("../../graphs/simple-v1.json", import.meta.url));
 const BUILTIN_STRUCTURED_GRAPH = fileURLToPath(new URL("../../graphs/structured-v1.json", import.meta.url));
 const SIMPLE_IMPLEMENT_DESCRIPTION = "Staged CE implementation from a pre-approved plan with round-based repair budgeting, scoped repair re-entry, sealed repository gates, exact-tree publication, and bounded provider repair. The initial forward pass may simplify; repair passes re-run semantic review and command gates without re-running simplification.";
@@ -97,16 +97,6 @@ function pipelineInvokesModel(manifest: ValidatedPipelineManifest): boolean {
   return manifest.manifest.stages.some((stage) =>
     stage.credentials.includes("model.invoke") || stage.executor.kind === "loop_action"
   );
-}
-
-function extractJsonBlocks(markdown: string, schema: string): string[] {
-  const blocks: string[] = [];
-  for (const match of markdown.matchAll(FENCE_PATTERN)) {
-    const marker = match[1]?.trim().split(/\s+/) ?? [];
-    if (!marker.includes(schema)) continue;
-    blocks.push(match[2]?.trim() ?? "");
-  }
-  return blocks;
 }
 
 function extractShipSelectionGraphId(context: string): string | undefined {

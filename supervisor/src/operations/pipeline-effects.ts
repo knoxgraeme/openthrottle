@@ -14,15 +14,17 @@ import {
 } from "@openthrottle/contracts";
 import type { Ticket, SupervisorStore } from "../persistence/store.js";
 import type { ExecutionUnitStore, ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
-import { canonicalJson, type PipelineStage } from "../pipeline/manifest.js";
+import { canonicalJson, type PipelineStage, type StageOutcome } from "../pipeline/manifest.js";
 import { digestNormalized } from "../pipeline/manifest.js";
 import { FOR_EACH_UNIT_CAPABILITY } from "../pipeline/capability-contracts.js";
 import { coordinatePipelineEvent } from "../pipeline/coordinator.js";
 import {
   buildAggregateStageEvent,
+  type ExecutionUnitState,
   type UnitActionKind,
 } from "../pipeline/unit-coordinator.js";
 import {
+  assertCandidateEvidenceFence,
   evaluateFinalReviewGate,
   evaluateIntegrationGate,
   evaluateUnitAcceptanceGate,
@@ -38,6 +40,7 @@ import type {
 } from "../pipeline/store.js";
 import type { StageRequestEnvelope } from "../pipeline/stage-request.js";
 import type { ChildExecutorActionRequest, LoopActionRequest, RuntimeResource, SandboxAutostopRuntime, SandboxRuntime } from "../runtime/contracts.js";
+import { extractJsonBlocks } from "../shared/markdown.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import { terminateAndSettleActor } from "./actor-settlement.js";
 import { createUnitEffectProcessor } from "./unit-effects.js";
@@ -106,8 +109,15 @@ interface PipelineEffectProcessorDeps {
   now?: () => Date;
 }
 
-const FENCE_PATTERN = /```([^\n`]*)\n([\s\S]*?)```/g;
 const GIT_SUBJECT = /^[a-f0-9]{40,64}$/;
+
+function aggregateOutcomeFor(units: readonly ExecutionUnitState[]): StageOutcome | undefined {
+  if (units.length === 0 || units.some((unit) => unit.terminalLevel === null)) return undefined;
+  if (units.every((unit) => unit.terminalLevel === "completed" && unit.integrationSubject !== null)) {
+    return "success";
+  }
+  return units.some((unit) => unit.terminalLevel === "failed" || unit.alarm) ? "failure" : "needs_human";
+}
 
 function builtinLoopBinding(input: {
   kind: LoopDispatchBinding["kind"];
@@ -146,11 +156,7 @@ const FINAL_REPAIR_BINDING = builtinLoopBinding({
 });
 
 function extractExecutionPlan(context: string): ExecutionPlanContract {
-  const blocks: string[] = [];
-  for (const match of context.matchAll(FENCE_PATTERN)) {
-    const marker = match[1]?.trim().split(/\s+/) ?? [];
-    if (marker.includes(EXECUTION_PLAN_SCHEMA)) blocks.push(match[2]?.trim() ?? "");
-  }
+  const blocks = extractJsonBlocks(context, EXECUTION_PLAN_SCHEMA);
   if (blocks.length !== 1) {
     throw new Error(`structured composite stage requires exactly one ${EXECUTION_PLAN_SCHEMA} block`);
   }
@@ -246,6 +252,21 @@ function worktreeHandleFor(action: ExecutionWorkAttempt, baseCommit: string): { 
       baseCommit,
     })).slice(0, 32),
   };
+}
+
+function finalRepairWorktreeHandleFor(
+  action: ExecutionWorkAttempt,
+  baseCommit: string,
+  attempts: readonly ExecutionWorkAttempt[]
+): { id: string } {
+  const finalRepair = attempts.find((attempt) =>
+    attempt.unit_id === null &&
+    attempt.action_kind === "final_repair" &&
+    attempt.cycle === action.cycle &&
+    attempt.status === "completed"
+  );
+  if (!finalRepair) throw new Error(`child final candidate action ${action.id} has no completed final repair worktree`);
+  return worktreeHandleFor(finalRepair, baseCommit);
 }
 
 interface StopEffectControl {
@@ -422,22 +443,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
 
   const worktreeBaseFor = (instance: PipelineInstance, action: ExecutionWorkAttempt): string => {
     const graph = deps.store.getGraphForAttempt(action.parent_attempt_id);
-    const finalIntegratedSubject = !action.unit_id && (
-      action.action_kind === "final_command" ||
-      action.action_kind === "final_review" ||
-      action.action_kind === "final_repair"
-    )
-      ? (() => {
-          const units = deps.store.listUnits(action.parent_attempt_id);
-          const subjects = [...new Set(units
-            .filter((unit) => unit.terminalLevel === "completed" && unit.integrationSubject)
-            .map((unit) => unit.integrationSubject!))];
-          return subjects.length === 1 && units.every((unit) => unit.terminalLevel === "completed")
-            ? subjects[0]
-            : undefined;
-        })()
-      : undefined;
-    const base = graph?.integration_subject ?? finalIntegratedSubject ?? instance.immutable_subject ?? instance.base_commit;
+    const base = graph?.integration_subject ?? instance.immutable_subject ?? instance.base_commit;
     if (!GIT_SUBJECT.test(base)) throw new Error(`child action ${action.id} has no exact worktree base`);
     return base;
   };
@@ -462,6 +468,9 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       return latestPriorOutputSubject(action, ["implement", "repair", "simplify", "command"]) ?? base;
     }
     if (action.action_kind === "candidate") {
+      if (action.unit_id === null) {
+        return latestPriorOutputSubject(action, ["final_repair"]) ?? base;
+      }
       return latestPriorOutputSubject(action, ["implement", "repair", "simplify", "command"]) ?? base;
     }
     if (action.action_kind === "lead") {
@@ -576,22 +585,32 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
   const latestAttemptReceipt = <T extends StandardReceipt>(
     receipts: readonly { attempt: ExecutionWorkAttempt; receipt: StandardReceipt }[],
     type: T["type"],
-    unitId: string | null
+    unitId: string | null,
+    cycle?: number
   ): { attempt: ExecutionWorkAttempt; receipt: T } => {
-    const match = [...receipts].reverse().find((entry) =>
-      entry.receipt.type === type && entry.receipt.fence.unit_id === (unitId ?? "__final__")
-    );
-    if (!match) throw new Error(`missing ${type} receipt for ${unitId ?? "final"}`);
-    return { attempt: match.attempt, receipt: match.receipt as T };
+    for (let index = receipts.length - 1; index >= 0; index -= 1) {
+      const entry = receipts[index]!;
+      if (
+        entry.receipt.type === type &&
+        entry.receipt.fence.unit_id === (unitId ?? "__final__") &&
+        (cycle === undefined || entry.attempt.cycle === cycle)
+      ) {
+        return { attempt: entry.attempt, receipt: entry.receipt as T };
+      }
+    }
+    throw new Error(`missing ${type} receipt for ${unitId ?? "final"}`);
   };
 
   const commandAttemptReceipts = (
     receipts: readonly { attempt: ExecutionWorkAttempt; receipt: StandardReceipt }[],
-    unitId: string | null
+    unitId: string | null,
+    cycle?: number
   ): Array<{ attempt: ExecutionWorkAttempt; receipt: CommandResultReceipt }> =>
     receipts
       .filter((entry): entry is { attempt: ExecutionWorkAttempt; receipt: CommandResultReceipt } =>
-        entry.receipt.type === "command_result" && entry.receipt.fence.unit_id === (unitId ?? "__final__"));
+        entry.receipt.type === "command_result" &&
+        entry.receipt.fence.unit_id === (unitId ?? "__final__") &&
+        (cycle === undefined || entry.attempt.cycle === cycle));
 
   const dispatchChildAction = async (
     resource: RuntimeResource,
@@ -601,7 +620,14 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     if (isChildExecutorActionKind(action.action_kind)) {
       const baseSubject = worktreeBaseFor(instance, action).slice(0, 40);
       const candidateSubject = action.action_kind === "integrate"
-        ? deps.store.listUnits(action.parent_attempt_id).find((unit) => unit.unitId === action.unit_id)?.acceptedCandidateSubject ?? undefined
+        ? action.unit_id === null
+          ? latestAttemptReceipt<CandidateEvidenceReceipt>(
+            completedAttemptReceiptsFor(action.parent_attempt_id),
+            "candidate_evidence",
+            null,
+            action.cycle
+          ).receipt.subject.post
+          : deps.store.listUnits(action.parent_attempt_id).find((unit) => unit.unitId === action.unit_id)?.acceptedCandidateSubject ?? undefined
         : undefined;
       if (action.action_kind === "integrate" && !candidateSubject) {
         throw new Error(`child integration action ${action.id} has no accepted candidate subject`);
@@ -621,7 +647,9 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         ...(action.command_name ? { commandName: action.command_name } : {}),
         ...(action.unit_id && (action.action_kind === "command" || action.action_kind === "candidate")
           ? { worktree: worktreeHandleFor(action, baseSubject) }
-          : {}),
+          : action.unit_id === null && action.action_kind === "candidate"
+            ? { worktree: finalRepairWorktreeHandleFor(action, baseSubject, deps.store.listWorkAttempts(action.parent_attempt_id)) }
+            : {}),
         baseSubject,
         inputSubject: actionInputSubjectFor(instance, action),
         ...(candidateSubject ? { candidateSubject } : {}),
@@ -721,7 +749,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       const receiptEntries = completedAttemptReceiptsFor(action.parent_attempt_id);
       const completion = latestAttemptReceipt<UnitCompletionReceipt>(receiptEntries, "unit_completion", action.unit_id);
       const candidate = latestAttemptReceipt<CandidateEvidenceReceipt>(receiptEntries, "candidate_evidence", action.unit_id);
-      const commands = commandAttemptReceipts(receiptEntries, action.unit_id);
+      const commands = commandAttemptReceipts(receiptEntries, action.unit_id, action.cycle);
       const acceptedSubject = candidate.receipt.subject.post;
       const decision = evaluateUnitAcceptanceGate({
         expected: standardFenceFor(instance, action, acceptedSubject),
@@ -769,7 +797,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       }
       const receipts = completedAttemptReceiptsFor(action.parent_attempt_id);
       const graph = deps.store.getGraphForAttempt(action.parent_attempt_id);
-      const commands = commandAttemptReceipts(receipts, null);
+      const commands = commandAttemptReceipts(receipts, null, action.cycle);
       const reviewSubject = actionInputSubjectFor(instance, action);
       const decision = evaluateFinalReviewGate({
         expected: standardFenceFor(instance, action, reviewSubject),
@@ -796,6 +824,12 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     if (receipt.type !== expectedType) {
       throw new Error(`child action ${action.id} returned ${receipt.type}, expected ${expectedType}`);
     }
+    if (action.action_kind === "candidate" && action.unit_id === null) {
+      assertCandidateEvidenceFence({
+        expected: standardFenceFor(instance, action, receipt.subject.post),
+        candidate: receipt as CandidateEvidenceReceipt,
+      });
+    }
     return {
       resultHash: digestNormalized(canonicalJson(result)),
       outputSubject: resultSubject,
@@ -819,20 +853,24 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     }).drain(parentAttemptId);
     if (action) return;
     const graph = deps.store.getGraphForAttempt(parentAttemptId);
-    if (!graph || graph.aggregate_emitted_at || graph.stopped_at || graph.final_phase !== "done") return;
+    if (!graph || graph.aggregate_emitted_at || graph.stopped_at) return;
     const units = deps.store.listUnits(parentAttemptId);
-    const integratedSubjects = [...new Set(units
-      .filter((unit) => unit.terminalLevel === "completed" && unit.integrationSubject)
-      .map((unit) => unit.integrationSubject!))];
-    if (integratedSubjects.length !== 1 || units.some((unit) => unit.terminalLevel !== "completed")) return;
+    const outcome = aggregateOutcomeFor(units);
+    if (!outcome) return;
     const parentAttempt = deps.store.getAttempt(parentAttemptId);
     if (!parentAttempt) throw new Error(`structured parent attempt ${parentAttemptId} is missing`);
+    if (outcome === "success" && graph.final_phase !== "done") return;
+    const aggregateSubject = graph.integration_subject ?? parentAttempt.expected_subject ?? instance.immutable_subject ?? instance.base_commit;
+    if (!aggregateSubject || !GIT_SUBJECT.test(aggregateSubject)) {
+      throw new Error(`structured aggregate ${parentAttemptId} has no exact subject`);
+    }
     const event = buildAggregateStageEvent({
-      id: `execution-aggregate:${parentAttemptId}:${integratedSubjects[0]}`,
+      id: `execution-aggregate:${parentAttemptId}:${aggregateSubject}:${outcome}`,
       manifest: JSON.parse(instance.normalized_manifest),
       instance,
       parentAttempt,
-      subject: integratedSubjects[0]!,
+      outcome,
+      subject: aggregateSubject,
       units,
       completedAt: now().toISOString(),
     });
@@ -841,7 +879,8 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     if (deps.store.emitAggregateOnce({
       parentAttemptId,
       artifactHash: graphResult.hash,
-      integrationSubject: integratedSubjects[0]!,
+      integrationSubject: graph.integration_subject,
+      requireFinalReview: outcome === "success",
     }) === "emitted") {
       coordinatePipelineEvent(deps.store, event);
     }
@@ -974,6 +1013,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       if (request.pipelineInstanceId !== instance.id || request.generation !== instance.generation) {
         throw new Error(`pipeline composite request ${request.attemptId} has a stale instance fence`);
       }
+      await deps.runtime.materializeCredentials(resource, request.credentialScopes);
       bindCompositeParentRun(instance, request);
       seedCompositeGraph(instance, request);
       await drainCompositeChildren(resource, instance, request.attemptId);

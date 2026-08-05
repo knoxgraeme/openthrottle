@@ -542,7 +542,8 @@ describe("Daytona stage execution", () => {
     expect(command).toMatch(/OT_CHILD_ACTION_ID=.*child-command/);
     expect(command).toContain("/opt/openthrottle/runner/heartbeat.mjs");
     expect(command).toContain("/opt/openthrottle/runner/execute-child-action.mjs");
-    expect(command).not.toContain("GITHUB_TOKEN");
+    expect(command).toContain('GITHUB_TOKEN="${GITHUB_TOKEN-}"');
+    expect(command).not.toContain("secret-token");
     expect(command).not.toContain("CODEX_AUTH_JSON");
     expect(uploadedPaths).toContainEqual(expect.stringMatching(
       /^\/var\/lib\/openthrottle\/child-executor-dispatch\/attempt-child-executor\.child-command\..*\.request\.json$/

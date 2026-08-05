@@ -284,6 +284,13 @@ export function evaluateIntegrationGate(input: {
   });
 }
 
+export function assertCandidateEvidenceFence(input: {
+  expected: StandardReceiptFence;
+  candidate: CandidateEvidenceReceipt;
+}): void {
+  assertReceiptFence(input.candidate, input.expected, "candidate");
+}
+
 export function evaluateFinalReviewGate(input: {
   expected: StandardReceiptFence;
   expectedReceipts?: FinalReviewReceiptFences;

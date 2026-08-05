@@ -174,6 +174,7 @@ function childExecutorEnv(request: ChildExecutorActionRequest): string {
     "LOGNAME=agent",
     "SHELL=/bin/bash",
     "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    `GITHUB_TOKEN="\${GITHUB_TOKEN-}"`,
     `OT_STAGE_CONFIG_FILE=${shellSingleQuoted(`${STAGE_INPUT_DIR}/repository-config.json`)}`,
     `RUN_ID=${shellSingleQuoted(request.parentRunId)}`,
     `OT_CHILD_ACTION_ID=${shellSingleQuoted(request.actionId)}`,

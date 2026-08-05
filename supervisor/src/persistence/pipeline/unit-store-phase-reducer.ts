@@ -148,6 +148,21 @@ function completedFinalMutationExistsInCycle(
   `).get(input.unitRowId, input.cycle, actionKind));
 }
 
+function completedGraphActionExistsInCycle(
+  db: Database.Database,
+  input: { graphId: string; cycle: number; actionKind: UnitActionKind }
+): boolean {
+  return Boolean(db.prepare(`
+    SELECT 1 FROM execution_work_attempts
+    WHERE execution_graph_id = ?
+      AND execution_unit_id IS NULL
+      AND cycle = ?
+      AND action_kind = ?
+      AND status = 'completed'
+    LIMIT 1
+  `).get(input.graphId, input.cycle, input.actionKind));
+}
+
 export function nextUnitPhaseAfterCompletion(
   db: Database.Database,
   input: {
@@ -355,7 +370,7 @@ export function createOrResumeFinalAction(
 ): ExecutionWorkAttempt | undefined {
   let graph = input.graph;
   const commandNames = commandNamesOf(graph);
-  for (let guard = 0; guard < commandNames.length + 3; guard += 1) {
+  for (let guard = 0; guard < commandNames.length + 5; guard += 1) {
     const phase: FinalPhase = graph.final_phase ?? "command";
     if (phase === "done") return undefined;
     if (phase === "command" && graph.final_command_index >= commandNames.length) {
@@ -391,7 +406,44 @@ export function createOrResumeFinalAction(
         leaseUntilIso: input.leaseUntilIso,
       });
     }
-    // phase === "repair"
+    // phase === "repair": a final repair edits a worktree. Before final
+    // commands/review rerun, the executor must turn that tree into candidate
+    // evidence and integrate it into the authoritative integration checkout.
+    if (completedGraphActionExistsInCycle(db, { graphId: graph.id, cycle: graph.final_cycle, actionKind: "final_repair" })) {
+      if (!completedGraphActionExistsInCycle(db, { graphId: graph.id, cycle: graph.final_cycle, actionKind: "candidate" })) {
+        return insertWorkAttempt(db, {
+          unitRow: null,
+          graph,
+          actionKind: "candidate",
+          cycle: graph.final_cycle,
+          commandName: null,
+          resumeNativeSessionId: null,
+          leaseOwner: input.leaseOwner,
+          nowIso: input.nowIso,
+          leaseUntilIso: input.leaseUntilIso,
+        });
+      }
+      if (!completedGraphActionExistsInCycle(db, { graphId: graph.id, cycle: graph.final_cycle, actionKind: "integrate" })) {
+        return insertWorkAttempt(db, {
+          unitRow: null,
+          graph,
+          actionKind: "integrate",
+          cycle: graph.final_cycle,
+          commandName: null,
+          resumeNativeSessionId: null,
+          leaseOwner: input.leaseOwner,
+          nowIso: input.nowIso,
+          leaseUntilIso: input.leaseUntilIso,
+        });
+      }
+      db.prepare(`
+        UPDATE execution_graphs
+        SET final_phase = 'command', final_command_index = 0, final_cycle = final_cycle + 1, updated_at = ?
+        WHERE id = ?
+      `).run(input.nowIso, graph.id);
+      graph = { ...graph, final_phase: "command", final_command_index: 0, final_cycle: graph.final_cycle + 1 };
+      continue;
+    }
     const resumeNativeSessionId = priorSessionId(db, {
       unitRowId: null,
       graphId: graph.id,
