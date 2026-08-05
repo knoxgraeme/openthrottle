@@ -41,6 +41,7 @@ function storeFor(leased: ExecutionWorkAttempt): ExecutionUnitStore {
     markActionDispatched: vi.fn(),
     completeUnitAction: vi.fn(),
     failUnitAction: vi.fn(),
+    stopRetryableUnitAction: vi.fn(),
     healExpiredCurrentChildAction: vi.fn(),
   } as unknown as ExecutionUnitStore;
 }
@@ -127,7 +128,7 @@ describe("unit effect processor", () => {
     expect(runtime.dispatchUnitAction).not.toHaveBeenCalled();
   });
 
-  it("leaves retryable terminal child failures active for the outer effect retry budget", async () => {
+  it("persists retryable terminal child failures through the graph stop path", async () => {
     const leased = action({ status: "running", request_hash: "request-hash" });
     const store = storeFor(leased);
     const runtime: UnitEffectRuntime = {
@@ -141,13 +142,19 @@ describe("unit effect processor", () => {
       dispatchUnitAction: vi.fn(),
     };
 
-    await expect(createUnitEffectProcessor({
+    await createUnitEffectProcessor({
       store,
       runtime,
       leaseOwner: "owner",
       now: () => new Date("2026-07-29T00:00:00.000Z"),
-    }).drain("attempt-parent")).rejects.toThrow(/sandbox result collection failed/);
+    }).drain("attempt-parent");
 
+    expect(store.stopRetryableUnitAction).toHaveBeenCalledWith({
+      actionId: "action-1",
+      resultHash: "result-hash",
+      lastError: "sandbox result collection failed",
+      nativeSessionId: null,
+    });
     expect(store.failUnitAction).not.toHaveBeenCalled();
     expect(store.completeUnitAction).not.toHaveBeenCalled();
     expect(runtime.dispatchUnitAction).not.toHaveBeenCalled();

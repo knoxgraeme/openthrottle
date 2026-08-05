@@ -1353,18 +1353,38 @@ describe("pipeline effect processor", () => {
 
     await processor.drain();
     expect(pipelines.listWorkAttempts(attempt.id)[0]).toMatchObject({
-      status: "dispatched",
-      result_hash: null,
-      last_error: null,
+      status: "dead",
+      result_hash: expect.any(String),
+      last_error: expect.stringContaining("retryable_infrastructure_failure"),
     });
     expect(pipelines.listUnits(attempt.id)).toEqual([
       expect.objectContaining({
         unitId: "unit_a",
-        status: "running",
-        terminalLevel: null,
+        status: "exited",
+        terminalLevel: "exited",
         alarm: false,
       }),
     ]);
+    expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
+      stopped_at: expect.any(String),
+      stop_reason: expect.stringContaining("retryable_infrastructure_failure"),
+      aggregate_emitted_at: null,
+    });
+
+    await processor.drain();
+    expect(pipelines.getAttempt(attempt.id)).toMatchObject({
+      status: "failed",
+      outcome: "retryable_infrastructure_failure",
+    });
+    expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
+      aggregate_emitted_at: expect.any(String),
+    });
+    const aggregateEmittedAt = pipelines.getGraphForAttempt(attempt.id)!.aggregate_emitted_at;
+    const collectionCalls = runtime.collectLoopActionResult.mock.calls.length;
+
+    await processor.drain();
+    expect(runtime.collectLoopActionResult).toHaveBeenCalledTimes(collectionCalls);
+    expect(pipelines.getGraphForAttempt(attempt.id)!.aggregate_emitted_at).toBe(aggregateEmittedAt);
   });
 
   it("preserves valid failed command receipts for reducer handling", async () => {

@@ -592,13 +592,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       if (!binding.resource || binding.status !== "active") continue;
       if (!structuredChildren.compositeGraphNeedsDrain(attempt.id)) continue;
       await deps.runtime.setActive(binding.resource.providerResourceId);
-      try {
-        await structuredChildren.drainCompositeChildren(binding.resource, instance, attempt.id);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (!message.includes("returned retryable_infrastructure_failure")) throw error;
-        console.error("[pipeline-effects] composite child drain failed:", sanitizeText(message));
-      }
+      await structuredChildren.drainCompositeChildren(binding.resource, instance, attempt.id);
     }
   };
 

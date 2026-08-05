@@ -1307,6 +1307,61 @@ describe("execution unit store", () => {
     })).toMatchObject({ id: failed.id, status: "failed" });
   });
 
+  it("stops the graph from retryable child infrastructure evidence without marking a unit defect", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b", dependencies: ["a"] }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+
+    const retryable = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: "2026-07-29T00:00:00.000Z",
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })!;
+    store.markActionDispatched(retryable.id, "request-hash", "native-session");
+
+    expect(store.stopRetryableUnitAction({
+      actionId: retryable.id,
+      resultHash: "result-hash",
+      lastError: "model credential unavailable",
+      nativeSessionId: "native-session-2",
+    })).toMatchObject({
+      id: retryable.id,
+      status: "dead",
+      result_hash: "result-hash",
+      native_session_id: "native-session-2",
+      last_error: expect.stringContaining("retryable_infrastructure_failure"),
+    });
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({
+      stopped_at: expect.any(String),
+      stop_reason: expect.stringContaining("retryable_infrastructure_failure"),
+    });
+    expect(store.listUnits("attempt-parent")).toEqual([
+      expect.objectContaining({
+        unitId: "a",
+        status: "exited",
+        activeActionId: null,
+        terminalLevel: "exited",
+        alarm: false,
+      }),
+      expect.objectContaining({
+        unitId: "b",
+        status: "exited",
+        activeActionId: null,
+        terminalLevel: "exited",
+        alarm: false,
+      }),
+    ]);
+  });
+
   it("completes a recovered result through the current action pointer before any heal", () => {
     const store = setup();
     store.createGraph({

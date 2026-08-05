@@ -194,6 +194,12 @@ export interface ExecutionUnitStore {
     lastError: string;
     nativeSessionId?: string | null;
   }): ExecutionWorkAttempt;
+  stopRetryableUnitAction(input: {
+    actionId: string;
+    resultHash: string;
+    lastError: string;
+    nativeSessionId?: string | null;
+  }): ExecutionWorkAttempt;
   emitAggregateOnce(input: {
     parentAttemptId: string;
     artifactHash: string;
@@ -856,6 +862,40 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     return loadActiveAction(db, input.actionId);
   });
 
+  const stopRetryableUnitAction = db.transaction((
+    input: Parameters<ExecutionUnitStore["stopRetryableUnitAction"]>[0]
+  ): ExecutionWorkAttempt => {
+    const timestamp = now();
+    const action = loadActiveAction(db, input.actionId);
+    if (action.status === "dead") return action;
+    if (!["leased", "dispatched", "running"].includes(action.status)) {
+      throw new Error(`execution work attempt ${input.actionId} is not active`);
+    }
+    const lastError = `retryable_infrastructure_failure: ${input.lastError}`.slice(0, 2_000);
+    const update = db.prepare(`
+      UPDATE execution_work_attempts
+      SET status = 'dead', result_hash = ?, native_session_id = COALESCE(?, native_session_id),
+          lease_until = NULL, last_error = ?, completed_at = ?, updated_at = ?
+      WHERE id = ? AND status IN ('leased', 'dispatched', 'running')
+    `).run(input.resultHash, input.nativeSessionId ?? null, lastError, timestamp, timestamp, input.actionId);
+    if (update.changes !== 1) throw new Error(`execution work attempt ${input.actionId} retryable stop compare-and-set failed`);
+    const graph = graphStmt.get(action.parent_attempt_id) as ExecutionUnitGraph | undefined;
+    if (graph && !graph.aggregate_emitted_at && !graph.stopped_at) {
+      db.prepare(`
+        UPDATE execution_graphs
+        SET stopped_at = ?, stop_reason = ?, updated_at = ?
+        WHERE parent_attempt_id = ? AND stopped_at IS NULL
+      `).run(timestamp, lastError, timestamp, action.parent_attempt_id);
+    }
+    db.prepare(`
+      UPDATE execution_units
+      SET status = 'exited', terminal_level = 'exited', alarm = 0,
+          active_work_attempt_id = NULL, updated_at = ?
+      WHERE parent_attempt_id = ? AND terminal_level IS NULL
+    `).run(timestamp, action.parent_attempt_id);
+    return loadActiveAction(db, input.actionId);
+  });
+
   const emitAggregateOnce = db.transaction((
     input: Parameters<ExecutionUnitStore["emitAggregateOnce"]>[0]
   ): "emitted" | "already_emitted" => {
@@ -1109,6 +1149,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     completeUnitAction,
     completeGatedAction,
     failUnitAction,
+    stopRetryableUnitAction,
     emitAggregateOnce,
     recordGateReceipt,
     listGateReceipts(parentAttemptId) {

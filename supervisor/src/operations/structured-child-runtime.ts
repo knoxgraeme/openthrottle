@@ -111,6 +111,9 @@ export function aggregateOutcomeFor(
 }
 
 function stoppedAggregateOutcome(stopReason: string | null, attempts: readonly ExecutionWorkAttempt[]): StageOutcome {
+  if (/\bretryable_infrastructure_failure\b/i.test(stopReason ?? "")) {
+    return "retryable_infrastructure_failure";
+  }
   if (attempts.some((attempt) => attempt.status === "failed") ||
       /\b(fail(?:ed|ure)?|error|timed out|missed heartbeat)\b/i.test(stopReason ?? "")) {
     return "failure";

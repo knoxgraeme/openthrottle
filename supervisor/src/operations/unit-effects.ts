@@ -51,7 +51,13 @@ export function createUnitEffectProcessor(input: {
         if (recovered) {
           if (recovered.terminal) {
             if (recovered.outcome === "retryable_infrastructure_failure") {
-              throw new Error(recovered.lastError);
+              input.store.stopRetryableUnitAction({
+                actionId: action.id,
+                resultHash: recovered.resultHash,
+                lastError: recovered.lastError,
+                nativeSessionId: recovered.nativeSessionId,
+              });
+              return action;
             }
             input.store.failUnitAction({
               actionId: action.id,
