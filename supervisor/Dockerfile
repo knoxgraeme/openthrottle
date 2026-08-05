@@ -33,6 +33,7 @@ COPY supervisor/package.json supervisor/package-lock.json* ./
 RUN npm ci --install-links
 COPY supervisor/tsconfig.json supervisor/tsconfig.build.json ./
 COPY supervisor/src ./src
+COPY supervisor/graphs ./graphs
 COPY supervisor/pipelines ./pipelines
 RUN npm run build
 # Strip devDependencies (typescript, tsx, @types/*) from node_modules,
@@ -45,6 +46,7 @@ ENV NODE_ENV=production
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
+COPY --from=build /app/graphs ./graphs
 COPY --from=build /app/pipelines ./pipelines
 
 # /data is where the SQLite DB lives (see fly.toml [mounts] and DATABASE_PATH default).

@@ -5,6 +5,7 @@ import type { Config } from "../app/config.js";
 import { createSupervisorStore, type SupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
+import { STRUCTURED_STATUS_UNITS_SQL } from "../persistence/pipeline/status-store.js";
 import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 import type { PipelineStore } from "../pipeline/store.js";
 import { loadPipelineCatalog, parseRepositoryConfig } from "../pipeline/manifest.js";
@@ -98,7 +99,7 @@ describe("coordinator-only server", () => {
       repository: "owner/repo",
       baseCommit: "a".repeat(40),
       blobSha: "b".repeat(40),
-      config: parseRepositoryConfig("pipelines: { implement: fixture-command }\n"),
+      config: parseRepositoryConfig("schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]\npipelines: { implement: fixture-command }\n"),
     });
     const manifest = catalog.manifests.get("fixture/command@1")!;
     store.upsert({
@@ -126,6 +127,23 @@ describe("coordinator-only server", () => {
   it("has no task completion callback route", async () => {
     const response = await app().request("/runs/run-1/complete", { method: "POST" });
     expect(response.status).toBe(404);
+  });
+
+  it("exposes authenticated bounded capability evidence for the CLI pre-mutation gate", async () => {
+    const runtime = buildInstalledRuntimeDescriptor("capabilities-endpoint-test/v1");
+    const unauthorized = await app({ pipelineCoordinator: { catalog: {} as never, runtime, store: pipelines } })
+      .request("/capabilities");
+    expect(unauthorized.status).toBe(401);
+
+    const response = await app({ pipelineCoordinator: { catalog: {} as never, runtime, store: pipelines } })
+      .request("/capabilities", { headers: { Authorization: "Bearer status-token" } });
+    expect(response.status).toBe(200);
+    const body = await response.json() as { release: string; capabilityDigest: string; capabilities: string[] };
+    expect(body).toEqual({
+      release: runtime.descriptor.release,
+      capabilityDigest: runtime.digest,
+      capabilities: runtime.descriptor.capabilities,
+    });
   });
 
   it("reports coordinator status without execution-mode compatibility fields", async () => {
@@ -295,7 +313,7 @@ describe("coordinator-only server", () => {
       pipelineInstanceId: instance.id,
       parentAttemptId: attempt.id,
       parentStageId: "units",
-      parentRunId: "run-old",
+      parentRunId: attempt.run_id ?? attempt.planned_run_id!,
       graphDigest: "graph-old",
       planDigest: "plan-old",
       units: [{ id: "old-unit" }],
@@ -308,13 +326,22 @@ describe("coordinator-only server", () => {
       ON CONFLICT(pipeline_instance_id, stage_id) DO NOTHING
     `).run(instance.id);
     db.prepare(`
+      INSERT INTO runs (
+        id, linear_issue_id, linear_session_id, session_generation, task_type,
+        token_hash, status, started_at, expires_at
+      ) VALUES (
+        'run-latest', ?, 'session-1', 1, 'implement', 'request-hash',
+        'completed', '2026-07-26T00:12:00.000Z', '2026-07-26T01:12:00.000Z'
+      )
+    `).run(instance.linear_issue_id);
+    db.prepare(`
       INSERT INTO pipeline_stage_attempts (
         id, pipeline_instance_id, stage_id, attempt_ordinal, reentry_ordinal,
         request_hash, idempotency_key, context_revision, native_context_policy,
-        planned_run_id, status, created_at, updated_at
+        planned_run_id, run_id, status, created_at, updated_at
       ) VALUES (
         'attempt-latest-units', ?, 'units', 1, 0, ?, 'attempt-latest-units',
-        0, 'fresh', NULL, 'completed',
+        0, 'fresh', 'run-latest', 'run-latest', 'completed',
         '2026-07-26T00:12:00.000Z', '2026-07-26T00:12:00.000Z'
       )
     `).run(instance.id, "f".repeat(64));
@@ -325,8 +352,13 @@ describe("coordinator-only server", () => {
       parentRunId: "run-latest",
       graphDigest: "graph-latest",
       planDigest: "plan-latest",
-      units: [{ id: "latest-unit" }],
+      units: [{ id: "latest-unit-z" }, { id: "latest-unit-a" }],
     });
+    db.prepare(`
+      UPDATE execution_graphs
+      SET updated_at = '2026-07-26T00:30:00.000Z'
+      WHERE graph_digest = 'graph-old'
+    `).run();
 
     const repairResponse = await app().request("/status", {
       headers: { Authorization: "Bearer status-token" },
@@ -348,9 +380,21 @@ describe("coordinator-only server", () => {
       whose_move: "working",
       last_error: "sandbox failed with [REDACTED]",
       last_state_change_at: "2026-07-26T00:10:00.000Z",
-      structured_units: [expect.objectContaining({ unit_id: "latest-unit" })],
+      structured_units: [
+        expect.objectContaining({ unit_id: "latest-unit-z" }),
+        expect.objectContaining({ unit_id: "latest-unit-a" }),
+      ],
     });
     expect(JSON.stringify(repairBody.tickets[0]?.pipeline)).not.toContain("old-unit");
+    const latestGraph = db.prepare(`
+      SELECT id FROM execution_graphs
+      WHERE pipeline_instance_id = ?
+        AND parent_attempt_id = 'attempt-latest-units'
+      LIMIT 1
+    `).get(instance.id) as { id: string };
+    const statusPlan = db.prepare(`EXPLAIN QUERY PLAN ${STRUCTURED_STATUS_UNITS_SQL}`)
+      .all(latestGraph.id) as Array<{ detail: string }>;
+    expect(statusPlan.some((row) => row.detail.includes("execution_units_graph_status_idx"))).toBe(true);
 
     db.prepare(`
       INSERT INTO pipeline_gate_receipts (
@@ -544,6 +588,7 @@ describe("coordinator-only server", () => {
     seedTicket();
     for (const [path, method] of [
       ["/status", "GET"],
+      ["/capabilities", "GET"],
       ["/repositories", "GET"],
       ["/repositories/register", "POST"],
       ["/tickets/OT-1/stop", "POST"],

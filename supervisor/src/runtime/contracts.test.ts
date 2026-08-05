@@ -8,6 +8,7 @@ import { createSupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
 import { reconcileSandboxAutostop } from "./lifecycle.js";
 import {
+  assertLogicalCredentialScopes,
   loadRuntimeCapabilityDescriptor,
   validateRuntimeCapabilityDescriptor,
 } from "./contracts.js";
@@ -77,9 +78,9 @@ describe("sandbox runtime port", () => {
 
   it("loads the shipped descriptor and rejects a mismatched configured release", () => {
     const path = fileURLToPath(new URL("../../pipelines/runtime-capabilities-v1.json", import.meta.url));
-    const runtime = loadRuntimeCapabilityDescriptor(path, "openthrottle-snapshot/v6");
+    const runtime = loadRuntimeCapabilityDescriptor(path, "openthrottle-snapshot/v8");
     expect(runtime.descriptor.capabilities).toContain("ce/implement@1");
-    expect(runtime.descriptor.capabilities).toContain("loop-action@1");
+    expect(runtime.descriptor.capabilities).toContain("loop-action@2");
     expect(() => loadRuntimeCapabilityDescriptor(path, "different-release/v1"))
       .toThrow(/does not match configured/);
   });
@@ -161,5 +162,12 @@ describe("sandbox runtime port", () => {
     const source = readFileSync(fileURLToPath(new URL("./contracts.ts", import.meta.url)), "utf8");
     expect(source).not.toContain("@daytona/sdk");
     expect(source).not.toMatch(/Daytona/);
+  });
+
+  it("accepts only the closed logical credential scope set for loop actions", () => {
+    expect(() => assertLogicalCredentialScopes(["model.invoke", "repo.read", "mcp"])).not.toThrow();
+    expect(() => assertLogicalCredentialScopes([])).not.toThrow();
+    expect(() => assertLogicalCredentialScopes(["daytona.admin"]))
+      .toThrow(/credential scope daytona\.admin is not a recognized logical credential/);
   });
 });

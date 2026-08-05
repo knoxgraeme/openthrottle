@@ -29,6 +29,7 @@ function parseByName(name: string, raw: string): unknown {
 
 const invalidCases = [
   ["config-path-traversal.json", /ref: has an invalid format/],
+  ["config-provider-secret-env.json", /must not name a provider-secret identifier/],
   ["config-unknown-field.json", /unexpected: unknown field/],
   ["execution-plan-unknown-field.json", /inline_prompt: unknown field/],
   ["graph-dependency-cycle.json", /depends_on: creates a cycle/],
@@ -39,6 +40,7 @@ const invalidCases = [
   ["graph-excess-bounds.json", /max_parallel: must be an integer between 1 and 1/],
   ["graph-internal-node-kind.json", /nodes\[0\]\.kind: must be one of/],
   ["graph-loop-skill-not-allowed.json", /loops\.unit_loop\.skill: is not allowed by the worker/],
+  ["graph-provider-secret-credential.json", /credentials\[0\]: must be one of/],
   ["graph-skill-traversal.json", /workers\[0\]\.skills\[0\]: has an invalid format/],
   ["graph-unreachable-node.json", /nodes\.dead_command: is unreachable from entry_node/],
   ["graph-unknown-field.json", /prompt: unknown field/],
@@ -53,9 +55,19 @@ const invalidCases = [
   ["receipt-unit-completion-missing-payload-field.json", /payload\.requested_human_input: must be an array/],
   ["receipt-unit-decision-bad-result.json", /result: must be one of: accept, revise, context_update, needs_human/],
   ["receipt-unknown-field.json", /executor_verified: unknown field/],
+  ["receipt-invalid-generation.json", /fence\.generation: must be an integer between 1 and 1000000/],
+  ["receipt-invalid-skill-package-digest.json", /producer\.skill_package_digest: has an invalid format/],
+  ["receipt-invalid-native-session-id.json", /fence\.native_session_id: has an invalid format/],
 ] as const;
 
 describe("Stage C contract fixtures", () => {
+  it("keeps the committed repository bootstrap on all four npm projects", () => {
+    const config = readFileSync(new URL("../../.openthrottle.yml", import.meta.url), "utf8");
+    for (const project of ["contracts", "supervisor", "cli", "sandbox"]) {
+      expect(config).toContain(`npm ci --prefix ${project}`);
+    }
+  });
+
   it("accepts and normalizes the frozen valid corpora", () => {
     const fixtures = [
       "config-repository.json",
@@ -63,6 +75,7 @@ describe("Stage C contract fixtures", () => {
       "execution-plan.json",
       "receipt-unit-completion.json",
       "receipt-unit-decision.json",
+      "receipt-repository-skill.json",
     ];
 
     for (const fixture of fixtures) {
@@ -101,5 +114,151 @@ describe("Stage C contract fixtures", () => {
 
   it("routes every invalid corpus fixture through a parser", () => {
     expect(invalidFixtures()).toEqual(invalidCases.map(([fixture]) => fixture).sort());
+  });
+
+  it("validates graph command and MCP references against repository config", () => {
+    const config = parseRepositoryConfigContract(readFixture("valid", "config-repository.json"), { source: "config" });
+    config.value.mcp_servers = {
+      local: { command: "node", args: [], env: {} },
+    };
+    const graphRaw = readFixture("valid", "graph-structured.json");
+    const graph = JSON.parse(graphRaw) as {
+      workers: Array<Record<string, unknown>>;
+      loops: Array<Record<string, unknown>>;
+      nodes: Array<Record<string, unknown>>;
+    };
+    graph.nodes.push({
+      id: "test",
+      kind: "command",
+      command: "test",
+      depends_on: [],
+      transitions: { success: { terminal: "completed" } },
+    });
+    graph.nodes[0]!.transitions = {
+      ...(graph.nodes[0]!.transitions as Record<string, unknown>),
+      no_change: { to: "test" },
+    };
+    expect(() => parseGraphContract(JSON.stringify(graph), { source: "graph", config: config.value })).not.toThrow();
+
+    graph.nodes[2]!.command = "missing";
+    expect(() => parseGraphContract(JSON.stringify(graph), { source: "graph", config: config.value }))
+      .toThrow(/nodes\.test\.command: references an unknown repository command/);
+
+    graph.nodes[2]!.command = "test";
+    graph.workers[0]!.credentials = ["repo.read", "model.invoke", "mcp"];
+    graph.workers[0]!.allowed_mcp_servers = ["missing"];
+    expect(() => parseGraphContract(JSON.stringify(graph), { source: "graph", config: config.value }))
+      .toThrow(/workers\.implementer\.allowed_mcp_servers: references an unknown MCP server/);
+
+    graph.workers[0]!.credentials = ["repo.read", "model.invoke"];
+    graph.workers[0]!.allowed_mcp_servers = ["local"];
+    expect(() => parseGraphContract(JSON.stringify(graph), { source: "graph", config: config.value }))
+      .toThrow(/workers\.implementer\.allowed_mcp_servers: requires the mcp credential scope/);
+
+    graph.workers[0]!.allowed_mcp_servers = [];
+    graph.loops[0]!.worker = "missing";
+    expect(() => parseGraphContract(JSON.stringify(graph), { source: "graph", config: config.value }))
+      .toThrow(/loops\.unit_loop\.worker: references an unknown worker/);
+  });
+
+  it("validates repository skill references against config allowlisted directories", () => {
+    const config = JSON.parse(readFixture("valid", "config-repository.json")) as {
+      skills?: Array<{ id: string; path: string }>;
+    };
+    config.skills = [{ id: "implement_unit", path: ".agents/skills/implement-unit" }];
+    const parsedConfig = parseRepositoryConfigContract(JSON.stringify(config), { source: "config" });
+    expect(parsedConfig.value.skills).toEqual(config.skills);
+
+    const graph = JSON.parse(readFixture("valid", "graph-structured.json")) as {
+      workers: Array<Record<string, unknown>>;
+      loops: Array<Record<string, unknown>>;
+    };
+    graph.workers[0]!.skills = ["repo://implement_unit"];
+    graph.loops[0]!.skill = "repo://implement_unit";
+    expect(() => parseGraphContract(JSON.stringify(graph), { source: "graph", config: parsedConfig.value }))
+      .not.toThrow();
+
+    graph.loops[0]!.skill = "repo://missing";
+    graph.workers[0]!.skills = ["repo://missing"];
+    expect(() => parseGraphContract(JSON.stringify(graph), { source: "graph", config: parsedConfig.value }))
+      .toThrow(/workers\.implementer\.skills: references an undeclared repository skill/);
+
+    config.skills = [{ id: "bad", path: "../skills/bad" }];
+    expect(() => parseRepositoryConfigContract(JSON.stringify(config), { source: "config" }))
+      .toThrow(/config\.skills\[0\]\.path: has an invalid format/);
+  });
+
+  it("rejects provider-secret identifiers in config values and headers", () => {
+    const config = JSON.parse(readFixture("valid", "config-repository.json")) as {
+      mcp_servers: Record<string, unknown>;
+    };
+    config.mcp_servers.local = {
+      command: "node",
+      env: { SAFE_ENV: "${GITHUB_TOKEN}" },
+    };
+    expect(() => parseRepositoryConfigContract(JSON.stringify(config), { source: "config" }))
+      .toThrow(/mcp_servers\.local\.env\.SAFE_ENV: must not name a provider-secret identifier/);
+
+    config.mcp_servers.local = {
+      url: "https://mcp.example.test",
+      headers: { Authorization: "Bearer ${OT_STATUS_TOKEN}" },
+    };
+    expect(() => parseRepositoryConfigContract(JSON.stringify(config), { source: "config" }))
+      .toThrow(/mcp_servers\.local\.headers\.Authorization: must not name a provider-secret identifier/);
+  });
+
+  it("normalizes repository command aliases from the canonical commands map", () => {
+    const config = JSON.parse(readFixture("valid", "config-repository.json")) as {
+      commands: Record<string, string>;
+      test?: string;
+      lint?: string;
+      build?: string;
+    };
+    delete config.test;
+    delete config.lint;
+    delete config.build;
+
+    const parsed = parseRepositoryConfigContract(JSON.stringify(config), { source: "config" });
+
+    expect(parsed.value.commands).toMatchObject({
+      test: config.commands.test,
+      lint: config.commands.lint,
+      build: config.commands.build,
+    });
+    expect(parsed.value.test).toBe(config.commands.test);
+    expect(parsed.value.lint).toBe(config.commands.lint);
+    expect(parsed.value.build).toBe(config.commands.build);
+    expect(JSON.parse(parsed.normalized)).toMatchObject({
+      commands: config.commands,
+      test: config.commands.test,
+      lint: config.commands.lint,
+      build: config.commands.build,
+    });
+  });
+
+  it("synthesizes canonical commands from legacy aliases and rejects mismatches", () => {
+    const config = JSON.parse(readFixture("valid", "config-repository.json")) as {
+      commands?: Record<string, string>;
+      test: string;
+      lint: string;
+      build: string;
+    };
+    delete config.commands;
+
+    const parsed = parseRepositoryConfigContract(JSON.stringify(config), { source: "config" });
+
+    expect(parsed.value.commands).toMatchObject({
+      test: config.test,
+      lint: config.lint,
+      build: config.build,
+    });
+
+    const conflicting = JSON.parse(readFixture("valid", "config-repository.json")) as {
+      commands: Record<string, string>;
+      test: string;
+    };
+    conflicting.test = "npm run different";
+    expect(() => parseRepositoryConfigContract(JSON.stringify(conflicting), { source: "config" }))
+      .toThrow(/config\.test: must match commands\.test/);
   });
 });

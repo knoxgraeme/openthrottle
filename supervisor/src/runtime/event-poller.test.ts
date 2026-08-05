@@ -380,6 +380,18 @@ describe("sandbox event contracts", () => {
     expect(warn.mock.calls.flat().join(" ")).not.toContain("private-stage-token");
     const stored = store.getSandboxEvent("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")!;
     expect(stored.status).toBe("processed");
+    expect(JSON.parse(stored.payload)).toEqual({
+      version: 1,
+      kind: "stage_result",
+      event_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      run_id: "run-1",
+      pipeline_instance_id: "pipeline-1",
+      attempt_id: "attempt-1",
+      request_hash: "1".repeat(64),
+      result_hash: "2".repeat(64),
+    });
+    expect(stored.payload).not.toContain("artifacts");
+    expect(stored.payload).not.toContain("native_session_id");
     expect(stored.payload).not.toContain("private-stage-token");
     expect(files.size).toBe(0);
     warn.mockRestore();
@@ -617,6 +629,120 @@ describe("sandbox event contracts", () => {
       }),
       expect.anything()
     );
+  });
+
+  it("forwards activity from action-scoped loop outboxes", async () => {
+    const store = seedRunningTicket();
+    const action = JSON.stringify({
+      version: 1,
+      kind: "activity",
+      event_id: "55555555-5555-4555-8555-555555555555",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:04.000Z",
+      type: "thought",
+      body: "loop action progress",
+    });
+    const eventPath = "/var/lib/openthrottle/loop-actions/attempt-child/action-1/outbox/001.json";
+    const files = new Map([[eventPath, Buffer.from(action)]]);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      setAutostopInterval: vi.fn(async () => undefined),
+      fs: {
+        listFiles: vi.fn(async (path: string) => {
+          if (path === "/var/lib/openthrottle/loop-actions") {
+            return [{ name: "attempt-child", path: "/var/lib/openthrottle/loop-actions/attempt-child", size: 0, isDir: true }];
+          }
+          if (path === "/var/lib/openthrottle/loop-actions/attempt-child") {
+            return [{ name: "action-1", path: "/var/lib/openthrottle/loop-actions/attempt-child/action-1", size: 0, isDir: true }];
+          }
+          if (path === "/var/lib/openthrottle/loop-actions/attempt-child/action-1/outbox") {
+            return [{ name: "001.json", path: eventPath, size: action.length, isDir: false }];
+          }
+          return [];
+        }),
+        downloadFile: vi.fn(async (path: string) => files.get(path)!),
+        deleteFile: vi.fn(async (path: string) => {
+          files.delete(path);
+        }),
+      },
+    } ;
+    const runtime = { getWorkspace: vi.fn(async () => sandbox), setActive: vi.fn(async () => undefined), setIdle: vi.fn(async () => undefined) } ;
+    const postActivity = vi.fn(async () => undefined);
+
+    await pollSandboxEvents({
+      runtime,
+      store,
+      postActivity,
+    });
+
+    expect(postActivity).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "thought", body: "loop action progress" }),
+      expect.anything()
+    );
+    expect(files.size).toBe(0);
+  });
+
+  it("skips unsafe action-scoped loop outbox names", async () => {
+    const store = seedRunningTicket();
+    const action = JSON.stringify({
+      version: 1,
+      kind: "activity",
+      event_id: "66666666-6666-4666-8666-666666666666",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:05.000Z",
+      type: "thought",
+      body: "valid loop action progress",
+    });
+    const eventPath = "/var/lib/openthrottle/loop-actions/attempt-child/action-1/outbox/001.json";
+    const files = new Map([[eventPath, Buffer.from(action)]]);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      setAutostopInterval: vi.fn(async () => undefined),
+      fs: {
+        listFiles: vi.fn(async (path: string) => {
+          if (path === "/var/lib/openthrottle/loop-actions") {
+            return [
+              { name: "../escape", path: "/var/lib/openthrottle/loop-actions/../escape", size: 0, isDir: true },
+              { name: "attempt-child", path: "/var/lib/openthrottle/loop-actions/attempt-child", size: 0, isDir: true },
+            ];
+          }
+          if (path === "/var/lib/openthrottle/loop-actions/attempt-child") {
+            return [
+              { name: "action/escape", path: "/var/lib/openthrottle/loop-actions/attempt-child/action/escape", size: 0, isDir: true },
+              { name: "action-1", path: "/var/lib/openthrottle/loop-actions/attempt-child/action-1", size: 0, isDir: true },
+            ];
+          }
+          if (path === "/var/lib/openthrottle/loop-actions/attempt-child/action-1/outbox") {
+            return [{ name: "001.json", path: eventPath, size: action.length, isDir: false }];
+          }
+          return [];
+        }),
+        downloadFile: vi.fn(async (path: string) => files.get(path)!),
+        deleteFile: vi.fn(async (path: string) => {
+          files.delete(path);
+        }),
+      },
+    } ;
+    const runtime = { getWorkspace: vi.fn(async () => sandbox), setActive: vi.fn(async () => undefined), setIdle: vi.fn(async () => undefined) } ;
+    const postActivity = vi.fn(async () => undefined);
+
+    await pollSandboxEvents({
+      runtime,
+      store,
+      postActivity,
+    });
+
+    expect(sandbox.fs.listFiles).not.toHaveBeenCalledWith("/var/lib/openthrottle/loop-actions/../escape");
+    expect(sandbox.fs.listFiles).not.toHaveBeenCalledWith("/var/lib/openthrottle/loop-actions/attempt-child/action/escape/outbox");
+    expect(postActivity).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "thought", body: "valid loop action progress" }),
+      expect.anything()
+    );
+    expect(files.size).toBe(0);
   });
 
   it("forwards a plan event to the session-update handler", async () => {

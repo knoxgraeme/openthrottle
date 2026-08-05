@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { Daytona, type Sandbox } from "@daytona/sdk";
 import {
   type RuntimeResource,
@@ -7,6 +8,7 @@ import {
   type LoopActionRequest,
   type LoopActionResult,
   type StageExecutionResult,
+  assertLogicalCredentialScopes,
 } from "../../runtime/contracts.js";
 import { canonicalJson, digestNormalized, STAGE_OUTCOMES } from "../../pipeline/manifest.js";
 import {
@@ -16,10 +18,11 @@ import {
 
 const ACTIVE_SANDBOX_AUTOSTOP_MINUTES = 60;
 const IDLE_SANDBOX_AUTOSTOP_MINUTES = 5;
+const LOOP_ACTION_DISPATCH_GRACE_SECONDS = 30;
 const STAGE_INPUT_DIR = "/var/lib/openthrottle/stage-input";
 const STAGE_RESULT_DIR = "/var/lib/openthrottle/stage-results";
-const LOOP_INPUT_DIR = "/var/lib/openthrottle/loop-input";
-const LOOP_RESULT_DIR = "/var/lib/openthrottle/loop-results";
+const LOOP_ACTION_DIR = "/var/lib/openthrottle/loop-actions";
+const LOOP_DISPATCH_DIR = "/var/lib/openthrottle/loop-dispatch";
 const STAGE_CREDENTIAL_ENV = new Set([
   "GITHUB_TOKEN",
   "CLAUDE_CODE_OAUTH_TOKEN",
@@ -36,7 +39,8 @@ export interface DaytonaSandboxRuntimeOptions {
   snapshot: string;
   materializeCredentialEnv: (
     resource: RuntimeResource,
-    scopes: readonly string[]
+    scopes: readonly string[],
+    agent?: LoopActionRequest["agent"]
   ) => Promise<DaytonaStageCredentialMaterialization>;
   taskTimeoutSeconds?: number;
 }
@@ -64,6 +68,10 @@ function safeStagePathId(value: string, label: string): string {
   return value;
 }
 
+function loopActionDispatchTimeoutSeconds(timeoutMs: number): number {
+  return Math.ceil(timeoutMs / 1000) + LOOP_ACTION_DISPATCH_GRACE_SECONDS;
+}
+
 function assertStageRequestFence(request: StageRequestEnvelope): void {
   const { requestHash, idempotencyKey, ...withoutFence } = request;
   const expected = createStageRequestHash(withoutFence);
@@ -77,15 +85,42 @@ function assertStageRequestFence(request: StageRequestEnvelope): void {
 function assertLoopRequestFence(request: LoopActionRequest): void {
   safeStagePathId(request.actionId, "loop action ID");
   safeStagePathId(request.attemptId, "loop attempt ID");
-  const expectedHash = digestNormalized(canonicalJson({
-    ...request,
-    requestHash: undefined,
-    idempotencyKey: undefined,
-  }));
+  if (request.agent === "opencode") {
+    // The sandbox rejects OpenCode loop actions until database-backed session
+    // sealing lands; fail closed before dispatch rather than in-sandbox.
+    throw new Error("opencode loop actions are not supported yet");
+  }
+  const expectedHash = digestNormalized(canonicalJson(normalizedLoopRequestForHash(request)));
   const expectedKey = `loop:${request.attemptId}:${request.actionId}:${expectedHash}`;
   if (request.requestHash !== expectedHash || request.idempotencyKey !== expectedKey) {
     throw new Error(`loop action ${request.actionId} has a stale hash or idempotency key`);
   }
+}
+
+function normalizedLoopRequestForHash(request: LoopActionRequest): Omit<LoopActionRequest, "requestHash" | "idempotencyKey"> {
+  const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, candidateSubject, ...withoutFence } = request;
+  return candidateSubject === null || candidateSubject === undefined
+    ? withoutFence
+    : { ...withoutFence, candidateSubject };
+}
+
+// Shared with materializeCredentials below: the sandbox-eligible credential
+// allowlist. Provider-only secrets (Daytona, Fly, Linear, webhook, install)
+// are never members of this set, so a materializer bug or a compromised
+// credential provider can never leak them into a loop action either.
+function assertSandboxCredentialEnv(env: Record<string, string>, context: string): void {
+  const unknown = Object.keys(env).find((name) => !STAGE_CREDENTIAL_ENV.has(name));
+  if (unknown) throw new Error(`credential provider returned forbidden sandbox variable ${unknown} for ${context}`);
+}
+
+function loopActionPath(attemptId: string, actionId: string, name: string): string {
+  safeStagePathId(attemptId, "loop attempt ID");
+  safeStagePathId(actionId, "loop action ID");
+  return `${LOOP_ACTION_DIR}/${attemptId}/${actionId}/${name}`;
+}
+
+function shellSingleQuoted(value: string): string {
+  return `'${value.replace(/'/g, "'\"'\"'")}'`;
 }
 
 function parseCollectedStageResult(raw: string, attemptId: string): StageExecutionResult {
@@ -132,21 +167,20 @@ function parseCollectedStageResult(raw: string, attemptId: string): StageExecuti
   };
 }
 
-function parseCollectedLoopResult(raw: string, actionId: string): LoopActionResult {
+function parseCollectedLoopResult(raw: string, input: { attemptId: string; actionId: string; requestHash: string }): LoopActionResult {
   if (Buffer.byteLength(raw, "utf8") > 256 * 1024) throw new Error("sealed loop result exceeds 256 KiB");
   const event = JSON.parse(raw) as Record<string, unknown>;
-  if (event.kind !== "loop_action_result" || event.version !== 1 || event.action_id !== actionId ||
-      typeof event.attempt_id !== "string" || typeof event.request_hash !== "string" ||
-      !/^[a-f0-9]{64}$/.test(event.request_hash) ||
+  if (event.kind !== "loop_action_result" || event.version !== 1 || event.action_id !== input.actionId ||
+      event.attempt_id !== input.attemptId || event.request_hash !== input.requestHash ||
       !["success", "failure", "needs_human", "retryable_infrastructure_failure"].includes(String(event.outcome)) ||
       typeof event.created_at !== "string" || Number.isNaN(Date.parse(event.created_at)) ||
       (event.subject !== null && (typeof event.subject !== "string" || !/^[a-f0-9]{40,64}$/.test(event.subject))) ||
       (event.native_session_id !== null && typeof event.native_session_id !== "string") ||
       typeof event.receipt !== "string") {
-    throw new Error(`sealed loop result ${actionId} has an invalid envelope`);
+    throw new Error(`sealed loop result ${input.attemptId}/${input.actionId} has an invalid envelope`);
   }
   return {
-    actionId,
+    actionId: input.actionId,
     attemptId: event.attempt_id as string,
     requestHash: event.request_hash as string,
     outcome: event.outcome as LoopActionResult["outcome"],
@@ -248,8 +282,7 @@ export function createDaytonaSandboxRuntime(
       if (canonicalScopes !== canonicalJson(scopes)) throw new Error("credential scopes are not canonical");
       const sandbox = await ensureStarted(resource);
       const materialization = await options.materializeCredentialEnv(resource, scopes);
-      const unknown = Object.keys(materialization.env).find((name) => !STAGE_CREDENTIAL_ENV.has(name));
-      if (unknown) throw new Error(`credential provider returned forbidden sandbox variable ${unknown}`);
+      assertSandboxCredentialEnv(materialization.env, "stage credentials");
       const invalidUnset = (materialization.unset ?? []).find((name) => !STAGE_CREDENTIAL_ENV.has(name));
       if (invalidUnset) throw new Error(`credential provider tried to unset forbidden variable ${invalidUnset}`);
       const conflicting = (materialization.unset ?? []).find((name) => name in materialization.env);
@@ -341,32 +374,93 @@ export function createDaytonaSandboxRuntime(
 
     async dispatchLoopAction(resource, request) {
       assertLoopRequestFence(request);
+      assertLogicalCredentialScopes(request.credentialScopes);
       const sandbox = await ensureStarted(resource);
-      await prepareRootFolder(sandbox, LOOP_INPUT_DIR);
-      await prepareRootFolder(sandbox, LOOP_RESULT_DIR);
-      const requestPath = `${LOOP_INPUT_DIR}/${request.actionId}.json`;
-      await sandbox.fs.uploadFile(Buffer.from(canonicalJson(request)), requestPath);
-      await sandbox.fs.setFilePermissions(requestPath, { owner: "root", group: "root", mode: "400" });
+      // Each action materializes its own declared credentials from a clean
+      // baseline rather than inheriting whatever the whole-attempt stage
+      // credentials happen to be; the sandbox clears its inherited
+      // environment and applies only this sealed envelope (execute-loop.mjs).
+      // Pass the action's own agent explicitly: a graph worker can override
+      // the ticket's default engine (e.g. a Codex action in a Claude
+      // ticket), and the materializer must select that action's credential,
+      // not whatever the ticket-level default happens to be.
+      const credentialMaterialization = await options.materializeCredentialEnv(
+        resource,
+        request.credentialScopes,
+        request.agent
+      );
+      assertSandboxCredentialEnv(credentialMaterialization.env, `loop action ${request.actionId}`);
+      const actionDirectory = `${LOOP_ACTION_DIR}/${request.attemptId}/${request.actionId}`;
+      const requestPath = loopActionPath(request.attemptId, request.actionId, "request.json");
+      const credentialsPath = loopActionPath(request.attemptId, request.actionId, "credentials.json");
+      const resultPath = loopActionPath(request.attemptId, request.actionId, "result.json");
+      await prepareRootFolder(sandbox, LOOP_DISPATCH_DIR);
+      // Dispatch-unique (not just action-unique) staging paths: a concurrent
+      // redispatch of the same action must never stage over, or clean up,
+      // another in-flight dispatch's uploads. Two calls that lose the race
+      // for `lockPath` only ever touch their own nonce'd files, so the
+      // winner's in-progress `cp` below can never be deleted out from under
+      // it. `lockPath` itself stays action-scoped (no nonce) so it still
+      // serializes concurrent dispatches of the exact same action.
+      const dispatchNonce = randomUUID();
+      const stagedRequestPath = `${LOOP_DISPATCH_DIR}/${request.attemptId}.${request.actionId}.${dispatchNonce}.request.json`;
+      const stagedCredentialsPath = `${LOOP_DISPATCH_DIR}/${request.attemptId}.${request.actionId}.${dispatchNonce}.credentials.json`;
+      const lockPath = `${LOOP_DISPATCH_DIR}/${request.attemptId}.${request.actionId}.lock`;
+      // Upload-then-chmod each file immediately, one at a time: a request
+      // upload/chmod failure must leave the credentials file never staged at
+      // all, not merely unreadable. Parallelizing these would let the
+      // credentials leg finish (fully uploaded and chmod 400) even when the
+      // request leg fails, and would widen each file's window between
+      // upload and chmod while the other file's round trip is in flight.
+      await sandbox.fs.uploadFile(Buffer.from(canonicalJson(request)), stagedRequestPath);
+      await sandbox.fs.setFilePermissions(stagedRequestPath, { owner: "root", group: "root", mode: "400" });
+      await sandbox.fs.uploadFile(
+        Buffer.from(canonicalJson({ env: credentialMaterialization.env })),
+        stagedCredentialsPath
+      );
+      await sandbox.fs.setFilePermissions(stagedCredentialsPath, { owner: "root", group: "root", mode: "400" });
       const sessionId = `loop-${request.actionId}`;
       if (!sandbox.process?.executeSessionCommand) {
         throw new Error("Daytona runtime does not expose session command execution");
       }
       await sandbox.process?.createSession?.(sessionId).catch(() => undefined);
       const dispatched = await sandbox.process.executeSessionCommand(sessionId, {
-        command: `flock --nonblock ${LOOP_RESULT_DIR}/${request.actionId}.lock sh -c ` +
-          `'test -f ${LOOP_RESULT_DIR}/${request.actionId}.json || exec /opt/openthrottle/runner/execute-loop.mjs --request ${requestPath}'`,
+        command: `flock --nonblock ${lockPath} sh -c ` +
+          shellSingleQuoted([
+            // A redispatch of an already-completed action must not orphan the
+            // credential envelope this call just uploaded fresh: no later
+            // invocation will ever reach the terminal `rm -f` below to clean
+            // it up, since none will run this script body again.
+            `if test -f ${shellSingleQuoted(resultPath)}; then rm -f ${shellSingleQuoted(stagedCredentialsPath)} ${shellSingleQuoted(stagedRequestPath)}; exit 0; fi`,
+            `install -d -o root -g root -m 0711 ${shellSingleQuoted(LOOP_ACTION_DIR)} ${shellSingleQuoted(`${LOOP_ACTION_DIR}/${request.attemptId}`)} ${shellSingleQuoted(actionDirectory)}`,
+            `cp ${shellSingleQuoted(stagedRequestPath)} ${shellSingleQuoted(requestPath)}`,
+            `cp ${shellSingleQuoted(stagedCredentialsPath)} ${shellSingleQuoted(credentialsPath)}`,
+            `chown root:root ${shellSingleQuoted(requestPath)} ${shellSingleQuoted(credentialsPath)}`,
+            `chmod 400 ${shellSingleQuoted(requestPath)} ${shellSingleQuoted(credentialsPath)}`,
+            `rm -f ${shellSingleQuoted(stagedCredentialsPath)}`,
+            `exec /opt/openthrottle/runner/execute-loop.mjs --request ${shellSingleQuoted(requestPath)} --credentials ${shellSingleQuoted(credentialsPath)} --output ${shellSingleQuoted(resultPath)}`,
+          ].join(" && ")) +
+          // A losing `flock --nonblock` (another dispatch for this exact
+          // action already holds it) exits nonzero without ever running the
+          // body above, so this call's own freshly-uploaded staged files
+          // would otherwise never be cleaned up by anyone. Remove them here
+          // instead of leaving real credential material parked in
+          // LOOP_DISPATCH_DIR indefinitely.
+          ` || rm -f ${shellSingleQuoted(stagedCredentialsPath)} ${shellSingleQuoted(stagedRequestPath)}`,
         runAsync: true,
         suppressInputEcho: true,
-      }, Math.ceil(request.timeoutMs / 1000));
+      }, loopActionDispatchTimeoutSeconds(request.timeoutMs));
       return { providerDispatchId: dispatched.cmdId ?? sessionId };
     },
 
-    async collectLoopActionResult(resource, actionId) {
-      safeStagePathId(actionId, "loop action ID");
+    async collectLoopActionResult(resource, input) {
+      safeStagePathId(input.attemptId, "loop attempt ID");
+      safeStagePathId(input.actionId, "loop action ID");
+      if (!/^[a-f0-9]{64}$/.test(input.requestHash)) throw new Error("loop request hash is invalid");
       const sandbox = await getSandbox(resource);
       try {
-        const raw = (await sandbox.fs.downloadFile(`${LOOP_RESULT_DIR}/${actionId}.json`)).toString("utf8");
-        return parseCollectedLoopResult(raw, actionId);
+        const raw = (await sandbox.fs.downloadFile(loopActionPath(input.attemptId, input.actionId, "result.json"))).toString("utf8");
+        return parseCollectedLoopResult(raw, input);
       } catch (error) {
         if (String(error).toLowerCase().includes("not found")) return null;
         throw error;

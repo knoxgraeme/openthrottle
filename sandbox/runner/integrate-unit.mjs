@@ -5,7 +5,8 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
-import { runGitAsRepositoryOwner } from "./repository-control.mjs";
+import { runGitAsExecutor } from "./repository-control.mjs";
+import { restoreIntegrationCheckout } from "./execute-loop.mjs";
 
 const COMMIT = /^[a-f0-9]{40}$/;
 
@@ -15,11 +16,11 @@ function commit(value, label) {
 }
 
 function clean(repoDir) {
-  return runGitAsRepositoryOwner(repoDir, ["status", "--porcelain=v1", "--untracked-files=all"]) === "";
+  return runGitAsExecutor(repoDir, ["status", "--porcelain=v1", "--untracked-files=all"]) === "";
 }
 
 function treeOf(repoDir, subject) {
-  return runGitAsRepositoryOwner(repoDir, ["rev-parse", `${subject}^{tree}`]);
+  return runGitAsExecutor(repoDir, ["rev-parse", `${subject}^{tree}`]);
 }
 
 export function integrateCandidate({
@@ -27,24 +28,36 @@ export function integrateCandidate({
   expectedHead,
   candidateCommit,
 }) {
-  const expected = commit(expectedHead, "expectedHead");
-  const candidate = commit(candidateCommit, "candidateCommit");
-  if (!clean(repoDir)) throw new Error("integration checkout must be clean");
-  const head = runGitAsRepositoryOwner(repoDir, ["rev-parse", "HEAD"]);
-  if (head !== expected) throw new Error("integration checkout HEAD does not match expected head");
-  const currentTree = treeOf(repoDir, head);
-  const candidateTree = treeOf(repoDir, candidate);
-  if (currentTree === candidateTree) {
-    return receipt({ repoDir, expected, candidate, integrated: false, reason: "already_applied_exact_tree" });
+  try {
+    const expected = commit(expectedHead, "expectedHead");
+    const candidate = commit(candidateCommit, "candidateCommit");
+    if (!clean(repoDir)) throw new Error("integration checkout must be clean");
+    const head = runGitAsExecutor(repoDir, ["rev-parse", "HEAD"]);
+    if (head === candidate && head !== expected) {
+      // Exact replay after the fast-forward already happened (for example a
+      // post-integration cleanup failure): accept only the exact candidate
+      // head that descends from the expected head; any other drift fails.
+      const replayBase = runGitAsExecutor(repoDir, ["merge-base", expected, candidate]);
+      if (replayBase !== expected) throw new Error("integrated head is not a descendant of the expected head");
+      return receipt({ repoDir, expected, candidate, integrated: false, reason: "already_integrated_exact_head" });
+    }
+    if (head !== expected) throw new Error("integration checkout HEAD does not match expected head");
+    const currentTree = treeOf(repoDir, head);
+    const candidateTree = treeOf(repoDir, candidate);
+    if (currentTree === candidateTree) {
+      return receipt({ repoDir, expected, candidate, integrated: false, reason: "already_applied_exact_tree" });
+    }
+    const mergeBase = runGitAsExecutor(repoDir, ["merge-base", head, candidate]);
+    if (mergeBase !== head) throw new Error("candidate is not a fast-forward of the integration head");
+    runGitAsExecutor(repoDir, ["merge", "--ff-only", candidate]);
+    return receipt({ repoDir, expected, candidate, integrated: true, reason: "fast_forwarded" });
+  } finally {
+    restoreIntegrationCheckout(repoDir);
   }
-  const mergeBase = runGitAsRepositoryOwner(repoDir, ["merge-base", head, candidate]);
-  if (mergeBase !== head) throw new Error("candidate is not a fast-forward of the integration head");
-  runGitAsRepositoryOwner(repoDir, ["merge", "--ff-only", candidate]);
-  return receipt({ repoDir, expected, candidate, integrated: true, reason: "fast_forwarded" });
 }
 
 function receipt({ repoDir, expected, candidate, integrated, reason }) {
-  const head = runGitAsRepositoryOwner(repoDir, ["rev-parse", "HEAD"]);
+  const head = runGitAsExecutor(repoDir, ["rev-parse", "HEAD"]);
   const tree = treeOf(repoDir, head);
   const payload = {
     schema: "openthrottle.integration-evidence/v1",

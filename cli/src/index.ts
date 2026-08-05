@@ -15,8 +15,9 @@ Usage:
                                     .openthrottle.yml.
   openthrottle plan validate <file.md>
                                     Validate the plan's execution-plan block.
-  openthrottle plan prepare <file.md>
-                                    Explain agent-backed execution-plan preparation.
+  openthrottle plan prepare <file.md> [--graph <id>]
+                                    Prepare the execution plan using the configured
+                                    local engine and canonical planning skill.
   openthrottle validate <file.md>   Alias for plan validate.
   openthrottle ship <file.md>      Create a Linear issue from a markdown
                                     file and delegate it to the agent.

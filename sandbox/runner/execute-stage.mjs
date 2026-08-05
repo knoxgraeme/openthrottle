@@ -3,13 +3,14 @@
 import { randomUUID } from "node:crypto";
 import {
   chmodSync,
+  chownSync,
   existsSync,
+  lstatSync,
   readFileSync,
-  writeFileSync,
   mkdirSync,
-  renameSync,
+  rmSync,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import {
@@ -30,6 +31,36 @@ import {
   runGitAsRepositoryOwner,
 } from "./repository-control.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
+import { runWithAgentProcessFence } from "./agent-process-fence.mjs";
+import {
+  classifyLaunchFailure,
+  engineCredentialPresent,
+  launchDiagnosticTail,
+} from "./launch-failure.mjs";
+import {
+  chmodTree,
+  chownTree,
+  isRoot,
+  lockPersistentAgentPrivateRoots,
+  lockedPersistentProfilesFrom,
+  pathInside as containedPath,
+  prepareAgentOwnedDirectory,
+  restorePersistentAgentPrivateRoots,
+} from "./filesystem-isolation.mjs";
+import { materializeClaudeProfileBaseline, materializeCodexProfileBaseline } from "./action-home-baseline.mjs";
+import { writeJsonAtomic } from "./atomic-write.mjs";
+import {
+  REPOSITORY_SKILL_CAPABILITY,
+  materializeRepositorySkillPackage,
+  repositorySkillDiscoveryRoot,
+  skillBody,
+} from "./repository-skills.mjs";
+import {
+  extractNativeSessionId,
+  materializeNativeSessionState,
+  nativeSessionStoragePath,
+  sealNativeSessionPackage,
+} from "./native-session-package.mjs";
 
 export { computeWorkspaceTreeOid } from "./repository-control.mjs";
 export { runCapturedProcess } from "./bounded-process.mjs";
@@ -42,17 +73,20 @@ const REQUEST_KEYS = new Set([
   "agent",
   "expectedSubject", "contextPolicy", "nativeSessionId", "capability",
   "requiredArtifacts", "credentialScopes", "liveSteering", "commandName",
-  "childActionId",
+  "repositorySkill", "childActionId",
 ]);
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
+const STAGE_PATH_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const NATIVE_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 const DIGEST = /^[a-f0-9]{64}$/;
 const COMMIT = /^[a-f0-9]{40}$/;
 const ARTIFACT_KINDS = new Set(RUNTIME_DESCRIPTOR.artifacts);
 const CONTEXT_POLICIES = new Set([
   "none", "fresh", "resume_required", "prefer_resume",
 ]);
-const COMMAND_NAMES = new Set(["test", "lint", "build", "format"]);
+const COMMAND_NAME = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
 const REMOTE_GIT_TIMEOUT_MS = 15_000;
+const DEFAULT_STAGE_ACTION_ROOT = "/var/lib/openthrottle/stage-actions";
 
 function record(value, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -86,6 +120,33 @@ function stringList(value, label, allowed) {
   return [...value];
 }
 
+function pathInside(root, child, label = "path") {
+  return containedPath(root, child, `${label} escapes its root`);
+}
+
+function stageActionDirectory(request, rootDir = process.env.OT_STAGE_ACTION_ROOT ?? DEFAULT_STAGE_ACTION_ROOT) {
+  const root = resolve(rootDir);
+  if (root === "/" || root === "/var/lib/openthrottle" || root === "/home/agent" || root === "/home/agent/repo") {
+    throw new Error("stage action root targets an unsafe system directory");
+  }
+  if (existsSync(root)) {
+    const metadata = lstatSync(root);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error("stage action root must be a real directory");
+  }
+  return pathInside(root, request.attemptId, "stage action path");
+}
+
+function ensureStageActionParents(request, rootDir = process.env.OT_STAGE_ACTION_ROOT ?? DEFAULT_STAGE_ACTION_ROOT) {
+  const root = resolve(rootDir);
+  const actionDirectory = stageActionDirectory(request, root);
+  for (const directory of [root, actionDirectory]) {
+    mkdirSync(directory, { recursive: true, mode: 0o711 });
+    if (isRoot()) chownSync(directory, 0, 0);
+    chmodSync(directory, 0o711);
+  }
+  return actionDirectory;
+}
+
 export function runtimeCapabilityDigest() {
   return digest(canonicalJson(RUNTIME_DESCRIPTOR));
 }
@@ -111,7 +172,7 @@ export function validateStageRequest(value) {
     capabilityDigest: string(input.capabilityDigest, "capabilityDigest", DIGEST),
     repositoryConfigDigest: string(input.repositoryConfigDigest, "repositoryConfigDigest", DIGEST),
     stageId: string(input.stageId, "stageId"),
-    attemptId: string(input.attemptId, "attemptId"),
+    attemptId: string(input.attemptId, "attemptId", STAGE_PATH_ID),
     runId: string(input.runId, "runId"),
     issueId: string(input.issueId, "issueId"),
     sessionId: string(input.sessionId, "sessionId"),
@@ -133,6 +194,7 @@ export function validateStageRequest(value) {
     credentialScopes: stringList(input.credentialScopes, "credentialScopes"),
     liveSteering: input.liveSteering,
     ...(input.commandName === undefined ? {} : { commandName: input.commandName }),
+    ...(input.repositorySkill === undefined ? {} : { repositorySkill: record(input.repositorySkill, "repositorySkill") }),
     ...(input.childActionId === undefined ? {} : { childActionId: string(input.childActionId, "childActionId") }),
   };
   if (!Number.isSafeInteger(request.generation) || request.generation < 1) throw new Error("generation is invalid");
@@ -144,11 +206,11 @@ export function validateStageRequest(value) {
   }
   if (!CONTEXT_POLICIES.has(request.contextPolicy)) throw new Error("contextPolicy is invalid");
   if (request.nativeSessionId !== null &&
-      (typeof request.nativeSessionId !== "string" || !ID.test(request.nativeSessionId))) {
+      (typeof request.nativeSessionId !== "string" || !NATIVE_SESSION_ID.test(request.nativeSessionId))) {
     throw new Error("nativeSessionId is invalid");
   }
   if (typeof request.liveSteering !== "boolean") throw new Error("liveSteering is invalid");
-  if (request.commandName !== undefined && !COMMAND_NAMES.has(request.commandName)) {
+  if (request.commandName !== undefined && !COMMAND_NAME.test(request.commandName)) {
     throw new Error("commandName is invalid");
   }
   if (request.runtimeRelease !== RUNTIME_DESCRIPTOR.release) {
@@ -189,7 +251,20 @@ export function validateSealedInputs({ request, configRaw, manifestRaw }) {
   if (canonicalJson([...request.credentialScopes].sort()) !== canonicalJson([...stage.credentials].sort())) {
     throw new Error("stage request credential scopes do not match the sealed manifest");
   }
+  const sealedCommandName = stage.commandName ?? (stage.executor?.kind === "command" ? stage.id : null);
+  if ((request.commandName ?? null) !== sealedCommandName) {
+    throw new Error("stage request command name does not match the sealed manifest");
+  }
+  if (canonicalJson(request.repositorySkill ?? null) !== canonicalJson(stage.repositorySkill ?? null)) {
+    throw new Error("stage request repository skill does not match the sealed manifest");
+  }
   return { config, manifest, stage };
+}
+
+function resolveCommand(config, commandName) {
+  if (typeof config.commands?.[commandName] === "string") return config.commands[commandName];
+  if (typeof config[commandName] === "string") return config[commandName];
+  return "";
 }
 
 export function resolveContextInvocation(request) {
@@ -222,43 +297,102 @@ function defaultExecuteCommand({ command, repoDir, timeoutMs }) {
   };
 }
 
-function terminateAgentProcesses() {
-  if (typeof process.getuid !== "function" || process.getuid() !== 0) return;
-  const result = spawnSync("pkill", ["-KILL", "-u", "agent"], {
-    encoding: "utf8",
-    timeout: 10_000,
-  });
-  if (result.error?.code === "ETIMEDOUT") throw new Error("agent process cleanup timed out");
-  // pkill exits 1 when the agent has no remaining processes, which is the
-  // expected steady state after a well-behaved CLI exits.
-  if (result.error || (result.status !== 0 && result.status !== 1)) {
-    throw new Error(`agent process cleanup failed: ${sanitizeArtifactText(result.stderr ?? result.error?.message ?? "").slice(-800)}`);
-  }
+export { runWithAgentProcessFence } from "./agent-process-fence.mjs";
+
+export function materializeRepositorySkill({ request, repoDir, discoveryRoot }) {
+  if (request.capability !== REPOSITORY_SKILL_CAPABILITY) return null;
+  if (!request.repositorySkill) throw new Error("repository skill stage is missing its sealed package");
+  return materializeRepositorySkillPackage({ packageInfo: request.repositorySkill, repoDir, agent: request.agent, discoveryRoot });
 }
 
-export function runWithAgentProcessFence(execute, terminate = terminateAgentProcesses) {
-  try {
-    return execute();
-  } finally {
-    // executeStage cannot hash, restore, or publish until this wrapper returns.
-    terminate();
-  }
+function prepareExecutorOwnedProfileRoot(path) {
+  if (!isRoot()) return;
+  mkdirSync(path, { recursive: true, mode: 0o555 });
+  chownSync(path, 0, 0);
+  chmodSync(path, 0o555);
 }
 
-function skillBody(raw) {
-  const lines = raw.replace(/\r\n/g, "\n").split("\n");
-  if (lines[0] !== "---") return raw.trim();
-  const end = lines.indexOf("---", 1);
-  return (end === -1 ? raw : lines.slice(end + 1).join("\n")).trim();
+export function repositorySkillStageEnvironment(request) {
+  if (request.capability !== REPOSITORY_SKILL_CAPABILITY) {
+    const home = "/home/agent";
+    return {
+      env: [`HOME=${home}`, "USER=agent"],
+      repositorySkillDiscoveryRoot: undefined,
+      nativeSessionProfileRoot: request.agent === "codex"
+        ? join(home, ".codex")
+        : request.agent === "claude"
+          ? join(home, ".claude")
+          : home,
+    };
+  }
+  const actionDirectory = ensureStageActionParents(request);
+  const home = pathInside(actionDirectory, "home", "stage action home");
+  prepareAgentOwnedDirectory(home);
+  const env = [`HOME=${home}`, "USER=agent"];
+  if (request.agent === "codex") {
+    const codexHome = pathInside(actionDirectory, "codex", "stage action codex home");
+    prepareAgentOwnedDirectory(codexHome);
+    materializeCodexProfileBaseline({ destinationHome: codexHome });
+    prepareAgentOwnedDirectory(nativeSessionStoragePath(request.agent, codexHome));
+    prepareExecutorOwnedProfileRoot(codexHome);
+    env.push(`CODEX_HOME=${codexHome}`);
+    return {
+      env,
+      repositorySkillDiscoveryRoot: pathInside(codexHome, "skills", "stage repository skill discovery"),
+      nativeSessionProfileRoot: codexHome,
+    };
+  }
+  if (request.agent === "claude") {
+    const claudeHome = pathInside(home, ".claude", "stage claude home");
+    materializeClaudeProfileBaseline({ destinationHome: claudeHome });
+    prepareAgentOwnedDirectory(nativeSessionStoragePath(request.agent, claudeHome));
+    prepareExecutorOwnedProfileRoot(claudeHome);
+    return {
+      env,
+      repositorySkillDiscoveryRoot: pathInside(claudeHome, "skills", "stage repository skill discovery"),
+      nativeSessionProfileRoot: claudeHome,
+    };
+  }
+  return {
+    env,
+    repositorySkillDiscoveryRoot: pathInside(actionDirectory, "opencode-skills", "stage repository skill discovery"),
+    nativeSessionProfileRoot: home,
+  };
+}
+
+export function lockRepositorySkillStageHome(request) {
+  if (request.capability !== REPOSITORY_SKILL_CAPABILITY) return false;
+  const actionDirectory = stageActionDirectory(request);
+  if (!existsSync(actionDirectory)) return false;
+  chownTree(actionDirectory, 0, 0);
+  chmodTree(actionDirectory, { fileMode: 0o600, directoryMode: 0o700 });
+  return true;
+}
+
+export function lockRepositorySkillStagePersistentProfiles(request, lockPersistentProfiles = lockPersistentAgentPrivateRoots) {
+  if (request.capability !== REPOSITORY_SKILL_CAPABILITY) return [];
+  return lockPersistentProfiles();
+}
+
+function repositorySkillProposalPath(request, fallback) {
+  if (request.capability !== REPOSITORY_SKILL_CAPABILITY) return fallback;
+  return pathInside(pathInside(stageActionDirectory(request), "home", "stage proposal directory"), "proposal.json", "stage proposal path");
 }
 
 export function stagePrompt(
   request,
   proposalPath,
-  { agent = request.agent, skillRoot = "/opt/openthrottle/skills/tasks" } = {}
+  { agent = request.agent, skillRoot = "/opt/openthrottle/skills/tasks", repositorySkillRoot = null } = {}
 ) {
   let entry = "Review the requested repository state and produce bounded evidence.";
-  if (request.capability.startsWith("ce/")) {
+  if (request.capability === REPOSITORY_SKILL_CAPABILITY) {
+    if (!request.repositorySkill) throw new Error("repository skill stage is missing its sealed package");
+    entry = `${agent === "claude" ? "/" : "$"}${request.repositorySkill.invocation}`;
+    if (agent === "opencode") {
+      const root = repositorySkillRoot ?? join(repositorySkillDiscoveryRoot(agent), request.repositorySkill.invocation);
+      entry += `\n\n${skillBody(readFileSync(join(root, "SKILL.md"), "utf8"))}`;
+    }
+  } else if (request.capability.startsWith("ce/")) {
     const skillName = request.taskType === "investigate" ? "investigate" : "implement-plan";
     entry = `${agent === "claude" ? "/" : "$"}${skillName}`;
     // OpenCode has no admin-scope skill discovery equivalent. Give it the
@@ -277,98 +411,145 @@ export function stagePrompt(
     `## Transition context\n${request.transitionContext || "(initial stage)"}`;
 }
 
-export function extractNativeSessionId(output, agent) {
-  for (const line of String(output ?? "").split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    try {
-      const event = JSON.parse(line);
-      const candidate = agent === "claude"
-        ? event.session_id
-        : agent === "codex" && event.type === "thread.started"
-          ? event.thread_id ?? event.threadId ?? event.id
-          : agent === "opencode"
-            ? event.sessionID
-            : undefined;
-      if (typeof candidate === "string" && ID.test(candidate)) return candidate;
-    } catch {
-      // Agent stderr/non-JSON diagnostics are not session evidence.
-    }
-  }
-  return null;
-}
+export { extractNativeSessionId } from "./native-session-package.mjs";
 
-function defaultRunAgent({ request, invocation, repoDir, proposalPath, timeoutMs, model, agent = request.agent }) {
-  const prompt = stagePrompt(request, proposalPath, { agent });
-  const env = [
-    "HOME=/home/agent",
-    "USER=agent",
-    `OT_STAGE_PROPOSAL_FILE=${proposalPath}`,
-  ];
+export function defaultRunAgent({
+  request,
+  invocation,
+  repoDir,
+  proposalPath,
+  timeoutMs,
+  model,
+  agent = request.agent,
+  lockPersistentProfiles = lockRepositorySkillStagePersistentProfiles,
+  restorePersistentProfiles = restorePersistentAgentPrivateRoots,
+  lockStageHome = lockRepositorySkillStageHome,
+}) {
+  const actionProposalPath = repositorySkillProposalPath(request, proposalPath);
   let command;
   let args;
   let stdin;
-  if (agent === "claude") {
-    const maxTurns = process.env.MAX_TURNS?.trim();
-    const mcpConfig = process.env.OT_CLAUDE_MCP_CONFIG?.trim();
-    const common = [
-      "--output-format", "stream-json", "--verbose",
-      ...(maxTurns ? ["--max-turns", maxTurns] : []),
-      ...(model ? ["--model", model] : []),
-      "--dangerously-skip-permissions",
-      ...(mcpConfig ? ["--mcp-config", mcpConfig, "--strict-mcp-config"] : []),
-      "--plugin-dir", "/opt/openthrottle/compound-engineering-marketplace",
-      "--setting-sources", "user",
+  let lockedPersistentProfiles = [];
+  const cleanupErrors = [];
+  let bodyError = null;
+  try {
+    try {
+      lockedPersistentProfiles = lockPersistentProfiles(request);
+    } catch (error) {
+      lockedPersistentProfiles = lockedPersistentProfilesFrom(error, lockedPersistentProfiles);
+      throw error;
+    }
+    const stageEnvironment = repositorySkillStageEnvironment(request);
+    const repositorySkillRoot = materializeRepositorySkill({
+      request,
+      repoDir,
+      discoveryRoot: stageEnvironment.repositorySkillDiscoveryRoot,
+    });
+    if (request.capability === REPOSITORY_SKILL_CAPABILITY) {
+      materializeNativeSessionState({ request, profileRoot: stageEnvironment.nativeSessionProfileRoot });
+      rmSync(actionProposalPath, { force: true });
+    }
+    const prompt = stagePrompt(request, actionProposalPath, { agent, repositorySkillRoot });
+    const env = [
+      ...stageEnvironment.env,
+      `OT_STAGE_PROPOSAL_FILE=${actionProposalPath}`,
     ];
-    command = "claude";
-    args = invocation.mode === "resume"
-      ? ["-p", "--resume", invocation.nativeSessionId, prompt, ...common]
-      : ["-p", prompt, ...common];
-  } else if (agent === "opencode") {
-    if (!model) throw new Error("OpenCode stage execution requires a sealed model selection");
-    command = "opencode";
-    args = ["run", "--format", "json", "--model", model, "--dir", repoDir, "--auto", ...(invocation.mode === "resume" ? ["--session", invocation.nativeSessionId] : []), prompt];
-  } else if (agent === "codex") {
-    command = "codex";
-    args = ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox",
-      ...(process.env.OT_CODEX_HOOK_TRUST_FLAG === "1" ? ["--dangerously-bypass-hook-trust"] : []),
-      "--skip-git-repo-check", "-C", repoDir, ...(model ? ["-m", model] : []),
-      ...(invocation.mode === "resume" ? ["resume", invocation.nativeSessionId, prompt] : ["-"])];
-    if (invocation.mode !== "resume") stdin = prompt;
-  } else {
-    throw new Error(`unsupported agent adapter ${agent}`);
+    if (agent === "claude") {
+      const maxTurns = process.env.MAX_TURNS?.trim();
+      const mcpConfig = process.env.OT_CLAUDE_MCP_CONFIG?.trim();
+      const common = [
+        "--output-format", "stream-json", "--verbose",
+        ...(maxTurns ? ["--max-turns", maxTurns] : []),
+        ...(model ? ["--model", model] : []),
+        "--dangerously-skip-permissions",
+        ...(mcpConfig ? ["--mcp-config", mcpConfig, "--strict-mcp-config"] : []),
+        "--plugin-dir", "/opt/openthrottle/compound-engineering-marketplace",
+        "--setting-sources", "user",
+      ];
+      command = "claude";
+      args = invocation.mode === "resume"
+        ? ["-p", "--resume", invocation.nativeSessionId, prompt, ...common]
+        : ["-p", prompt, ...common];
+    } else if (agent === "opencode") {
+      if (!model) throw new Error("OpenCode stage execution requires a sealed model selection");
+      command = "opencode";
+      args = ["run", "--format", "json", "--model", model, "--dir", repoDir, "--auto", ...(invocation.mode === "resume" ? ["--session", invocation.nativeSessionId] : []), prompt];
+    } else if (agent === "codex") {
+      command = "codex";
+      args = ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox",
+        ...(process.env.OT_CODEX_HOOK_TRUST_FLAG === "1" ? ["--dangerously-bypass-hook-trust"] : []),
+        "--skip-git-repo-check", "-C", repoDir, ...(model ? ["-m", model] : []),
+        ...(invocation.mode === "resume" ? ["resume", invocation.nativeSessionId, prompt] : ["-"])];
+      if (invocation.mode !== "resume") stdin = prompt;
+    } else {
+      throw new Error(`unsupported agent adapter ${agent}`);
+    }
+    const result = runWithAgentProcessFence(
+      () => runCapturedProcess("gosu", ["agent", "env", ...env, command, ...args], {
+        cwd: repoDir,
+        input: stdin,
+        timeout: timeoutMs,
+      }),
+    );
+    const authRead = agent === "codex"
+      ? spawnSync("gosu", ["agent", "head", "-c", "262144", "/home/agent/.codex/auth.json"], {
+          encoding: "utf8",
+          timeout: 2_000,
+          maxBuffer: 262_144,
+        })
+      : undefined;
+    const proposalRead = spawnSync("gosu", ["agent", "head", "-c", "1048577", actionProposalPath], {
+      encoding: "utf8",
+      timeout: 2_000,
+      maxBuffer: 1_048_577,
+    });
+    if (proposalRead.status === 0 && Buffer.byteLength(proposalRead.stdout) > 1_048_576) {
+      throw new Error("stage proposal exceeds the 1 MiB limit");
+    }
+    const reportedNativeSessionId = extractNativeSessionId(result.stdout, agent);
+    if (request.nativeSessionId && reportedNativeSessionId && reportedNativeSessionId !== request.nativeSessionId) {
+      throw new Error("reported native session id does not match the sealed stage request");
+    }
+    const nativeSessionId = request.nativeSessionId ?? reportedNativeSessionId;
+    const sealedNativeSessionPackage = sealNativeSessionPackage({
+      agent,
+      nativeSessionId,
+      profileRoot: stageEnvironment?.nativeSessionProfileRoot,
+    });
+    if (nativeSessionId && !sealedNativeSessionPackage) {
+      throw new Error("native session id was reported without a sealed executor package");
+    }
+    return {
+      exitCode: result.status,
+      signal: result.signal,
+      timedOut: result.timedOut,
+      stdout: result.stdout ?? "",
+      stderr: result.stderr ?? result.error?.message ?? "",
+      nativeSessionId,
+      proposal: proposalRead.status === 0 ? JSON.parse(proposalRead.stdout) : undefined,
+      authSnapshot: authRead?.status === 0 ? authRead.stdout : undefined,
+    };
+  } catch (error) {
+    bodyError = error;
+    throw error;
+  } finally {
+    try {
+      lockStageHome(request);
+    } catch (error) {
+      cleanupErrors.push(error instanceof Error ? error.message : String(error));
+    }
+    try {
+      restorePersistentProfiles(lockedPersistentProfiles);
+    } catch (error) {
+      cleanupErrors.push(error instanceof Error ? error.message : String(error));
+    }
+    if (cleanupErrors.length > 0) {
+      const prefix = bodyError
+        ? `stage agent failed (${bodyError instanceof Error ? bodyError.message : String(bodyError)}) and cleanup failed`
+        : "stage agent cleanup failed";
+      throw new Error(`${prefix}: ${cleanupErrors.join("; ")}`);
+    }
   }
-  const result = runWithAgentProcessFence(
-    () => runCapturedProcess("gosu", ["agent", "env", ...env, command, ...args], {
-      cwd: repoDir,
-      input: stdin,
-      timeout: timeoutMs,
-    }),
-  );
-  const authRead = agent === "codex"
-    ? spawnSync("gosu", ["agent", "head", "-c", "262144", "/home/agent/.codex/auth.json"], {
-        encoding: "utf8",
-        timeout: 2_000,
-        maxBuffer: 262_144,
-      })
-    : undefined;
-  const proposalRead = spawnSync("gosu", ["agent", "head", "-c", "1048577", proposalPath], {
-    encoding: "utf8",
-    timeout: 2_000,
-    maxBuffer: 1_048_577,
-  });
-  if (proposalRead.status === 0 && Buffer.byteLength(proposalRead.stdout) > 1_048_576) {
-    throw new Error("stage proposal exceeds the 1 MiB limit");
-  }
-  return {
-    exitCode: result.status,
-    signal: result.signal,
-    timedOut: result.timedOut,
-    stdout: result.stdout ?? "",
-    stderr: result.stderr ?? result.error?.message ?? "",
-    nativeSessionId: request.nativeSessionId ?? extractNativeSessionId(result.stdout, agent),
-    proposal: proposalRead.status === 0 ? JSON.parse(proposalRead.stdout) : undefined,
-    authSnapshot: authRead?.status === 0 ? authRead.stdout : undefined,
-  };
 }
 
 function failureProposal(summary, suggestedOutcome = "retryable_infrastructure_failure") {
@@ -396,29 +577,57 @@ function isCodexModelCredentialExpired(agent, diagnostic) {
   return hasAuthFailure && hasCodexRefreshSignal;
 }
 
-export function classifyAgentExecutionFailure({ agent, termination, diagnostic, terminated, missingProposal = false }) {
+export function classifyAgentExecutionFailure({
+  agent,
+  termination,
+  diagnostic,
+  terminated,
+  missingProposal = false,
+  stdout = "",
+  stderr,
+  credentialPresent,
+}) {
   if (isCodexModelCredentialExpired(agent, diagnostic)) {
     return {
       suggestedOutcome: "retryable_infrastructure_failure",
+      reason: "credential_rejected",
       credentialFailure: true,
       summary:
         `Model credential expired - refresh CODEX_AUTH_JSON. Agent stage failed (${termination}).` +
         (diagnostic ? ` Executor diagnostic: ${diagnostic}` : ""),
     };
   }
+  // Every launch failure used to look identical here. Classify it so a missing
+  // credential, a rejected credential, and a provider usage limit are legible
+  // (and infrastructure-shaped) instead of burning a semantic repair round.
+  const classified = classifyLaunchFailure({
+    agent,
+    stdout,
+    stderr: stderr ?? diagnostic ?? "",
+    credentialPresent,
+  });
   return {
-    suggestedOutcome: terminated ? "retryable_infrastructure_failure" : "failure",
-    credentialFailure: false,
+    suggestedOutcome: classified.retryable || terminated ? "retryable_infrastructure_failure" : "failure",
+    reason: classified.reason,
+    credentialFailure: classified.credentialFailure,
     summary:
       `${missingProposal ? "Agent exited without the required terminal stage proposal" : "Agent stage failed"} ` +
-      `(${termination}).` +
+      `(${termination}, reason=${classified.reason}).` +
+      (classified.remediation ? ` ${classified.remediation}` : "") +
       (diagnostic ? ` Executor diagnostic: ${diagnostic}` : ""),
   };
 }
 
 function classifyIncompleteAgentExecution({ execution, request, proposal, redactionEnv }) {
   const terminated = execution.timedOut || execution.signal || execution.exitCode === 137;
-  const diagnostic = sanitizeArtifactText(execution.stderr ?? "", redactionEnv).trim().slice(-1_000);
+  // Both streams: Claude reports launch refusals as stream-json on stdout and
+  // Codex prints its refusal there too, so a stderr-only tail is empty for
+  // exactly the failures that most need evidence.
+  const diagnostic = launchDiagnosticTail({
+    stdout: execution.stdout ?? "",
+    stderr: execution.stderr ?? "",
+    env: redactionEnv,
+  });
   const termination = [
     `exit=${execution.exitCode ?? "none"}`,
     execution.signal ? `signal=${execution.signal}` : null,
@@ -430,6 +639,15 @@ function classifyIncompleteAgentExecution({ execution, request, proposal, redact
     diagnostic,
     terminated,
     missingProposal: !proposal,
+    stdout: execution.stdout ?? "",
+    stderr: execution.stderr ?? "",
+    // A readable ~/.codex/auth.json is the concrete Codex credential even when
+    // the seed variable is no longer in this process's environment.
+    credentialPresent: engineCredentialPresent(
+      request.agent,
+      request.credentialScopes.includes("model.invoke") ? process.env : undefined,
+      Boolean(execution.authSnapshot),
+    ),
   });
 }
 
@@ -563,8 +781,8 @@ export function executeStage({
   let artifacts;
   if (contract.kind === "command") {
     const commandName = request.commandName ?? request.stageId;
-    if (!COMMAND_NAMES.has(commandName)) throw new Error(`stage ${request.stageId} does not select an allowlisted repository command`);
-    const command = typeof config[commandName] === "string" ? config[commandName] : "";
+    if (!COMMAND_NAME.test(commandName)) throw new Error(`stage ${request.stageId} does not select a valid repository command`);
+    const command = resolveCommand(config, commandName);
     try {
       const execution = executeCommand({ command, commandName, repoDir, timeoutMs });
       const postSubject = computeWorkspaceTreeOid(repoDir);
@@ -796,14 +1014,6 @@ export function fallbackStageResultEvent({ request, repoDir, error }) {
   });
 }
 
-function writeAtomic(path, value) {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const temporary = `${path}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(value)}\n`, { mode: 0o600 });
-  chmodSync(temporary, 0o600);
-  renameSync(temporary, path);
-}
-
 function arg(name, fallback) {
   const index = process.argv.indexOf(name);
   return index >= 0 ? process.argv[index + 1] : fallback;
@@ -842,13 +1052,13 @@ function main() {
       repoDir,
       timeoutMs: Number(process.env.TASK_TIMEOUT ?? 7_200) * 1_000,
     });
-    writeAtomic(outputPath, buildStageResultEvent({ request: validatedRequest, result }));
+    writeJsonAtomic(outputPath, buildStageResultEvent({ request: validatedRequest, result }));
   } catch (error) {
     // Last-resort fence: the request is validated and the output path is
     // known, so even an executor crash must leave a sealed typed result the
     // supervisor can settle instead of a stall the reaper misreports.
     try {
-      writeAtomic(outputPath, fallbackStageResultEvent({ request: validatedRequest, repoDir, error }));
+      writeJsonAtomic(outputPath, fallbackStageResultEvent({ request: validatedRequest, repoDir, error }));
     } catch (fallbackError) {
       console.error(`execute-stage: fallback stage result was not written: ${
         fallbackError instanceof Error ? fallbackError.message : String(fallbackError)

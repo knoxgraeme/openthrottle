@@ -1,16 +1,25 @@
 import { execFileSync } from "node:child_process";
-import { cpSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   captureRepositoryControl,
+  computeWorkspaceTreeOid,
   repositoryControlMatches,
 } from "./repository-control.mjs";
 
 const directories = [];
 afterEach(() => {
-  for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
+  for (const directory of directories.splice(0)) {
+    try {
+      chmodSync(directory, 0o700);
+      execFileSync("chmod", ["-R", "u+rwX", directory]);
+    } catch {
+      // Tests may deliberately hide repository metadata from the agent user.
+    }
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 function repository() {
@@ -81,5 +90,84 @@ describe("repositoryControlMatches", () => {
     execFileSync("git", ["add", "file.txt"], { cwd: repoDir });
     execFileSync("git", ["commit", "-qm", "mutation"], { cwd: repoDir });
     expect(repositoryControlMatches(repoDir, control)).toBe(false);
+  });
+});
+
+describe("computeWorkspaceTreeOid", () => {
+  function withGitEnvironment(env, callback) {
+    const names = ["GIT_DIR", "GIT_WORK_TREE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"];
+    const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    try {
+      for (const name of names) {
+        if (env[name]) {
+          process.env[name] = env[name];
+        } else {
+          delete process.env[name];
+        }
+      }
+      return callback();
+    } finally {
+      for (const name of names) {
+        if (previous[name] === undefined) {
+          delete process.env[name];
+        } else {
+          process.env[name] = previous[name];
+        }
+      }
+    }
+  }
+
+  it("uses a supplied Git directory when linked worktree metadata is locked", () => {
+    const repoDir = repository();
+    const gitDir = mkdtempSync(join(tmpdir(), "ot-control-git-dir-"));
+    const baseObjects = mkdtempSync(join(tmpdir(), "ot-control-base-objects-"));
+    const writeObjects = mkdtempSync(join(tmpdir(), "ot-control-objects-"));
+    directories.push(gitDir, baseObjects, writeObjects);
+    const head = execFileSync("git", ["-C", repoDir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const expectedTree = execFileSync("git", ["-C", repoDir, "rev-parse", "HEAD^{tree}"], { encoding: "utf8" }).trim();
+    cpSync(join(repoDir, ".git", "objects"), baseObjects, { recursive: true });
+    mkdirSync(join(gitDir, "refs", "heads"), { recursive: true });
+    mkdirSync(join(gitDir, "objects"), { recursive: true });
+    writeFileSync(join(gitDir, "HEAD"), `${head}\n`);
+    writeFileSync(join(gitDir, "config"), "[core]\n\trepositoryformatversion = 0\n\tbare = false\n");
+
+    chmodSync(join(repoDir, ".git"), 0o000);
+    try {
+      expect(computeWorkspaceTreeOid(repoDir, {
+        GIT_DIR: gitDir,
+        GIT_WORK_TREE: repoDir,
+        GIT_OBJECT_DIRECTORY: writeObjects,
+        GIT_ALTERNATE_OBJECT_DIRECTORIES: baseObjects,
+      })).toBe(expectedTree);
+    } finally {
+      chmodSync(join(repoDir, ".git"), 0o700);
+    }
+  });
+
+  it("preserves inherited action-local Git object directories", () => {
+    const repoDir = repository();
+    const gitDir = mkdtempSync(join(tmpdir(), "ot-control-inherited-git-dir-"));
+    const baseObjects = mkdtempSync(join(tmpdir(), "ot-control-inherited-base-objects-"));
+    const writeObjects = mkdtempSync(join(tmpdir(), "ot-control-inherited-objects-"));
+    directories.push(gitDir, baseObjects, writeObjects);
+    const head = execFileSync("git", ["-C", repoDir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const expectedTree = execFileSync("git", ["-C", repoDir, "rev-parse", "HEAD^{tree}"], { encoding: "utf8" }).trim();
+    cpSync(join(repoDir, ".git", "objects"), baseObjects, { recursive: true });
+    mkdirSync(join(gitDir, "refs", "heads"), { recursive: true });
+    mkdirSync(join(gitDir, "objects"), { recursive: true });
+    writeFileSync(join(gitDir, "HEAD"), `${head}\n`);
+    writeFileSync(join(gitDir, "config"), "[core]\n\trepositoryformatversion = 0\n\tbare = false\n");
+
+    chmodSync(join(repoDir, ".git"), 0o000);
+    try {
+      expect(withGitEnvironment({
+        GIT_DIR: gitDir,
+        GIT_WORK_TREE: repoDir,
+        GIT_OBJECT_DIRECTORY: writeObjects,
+        GIT_ALTERNATE_OBJECT_DIRECTORIES: baseObjects,
+      }, () => computeWorkspaceTreeOid(repoDir))).toBe(expectedTree);
+    } finally {
+      chmodSync(join(repoDir, ".git"), 0o700);
+    }
   });
 });

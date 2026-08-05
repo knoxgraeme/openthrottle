@@ -510,6 +510,167 @@ export async function getRepositoryConfigAtCommit(
   };
 }
 
+export interface RepositoryFileAtCommit {
+  repository: string;
+  commit: string;
+  path: string;
+  blobSha: string;
+  content: string;
+}
+
+export interface RepositoryPackageFileAtCommit extends RepositoryFileAtCommit {
+  size: number;
+}
+
+export interface RepositoryDirectoryAtCommit {
+  repository: string;
+  commit: string;
+  directory: string;
+  files: RepositoryPackageFileAtCommit[];
+}
+
+function assertSafeRepositoryPath(path: string, kind: "file" | "directory"): void {
+  if (
+    !path ||
+    path.length > 1_024 ||
+    path.startsWith("/") ||
+    path.includes("\\") ||
+    path.split("/").some((part) => !part || part === "." || part === "..")
+  ) {
+    throw new Error(`repository ${kind} read requires a safe relative path`);
+  }
+}
+
+async function readRepositoryBlob(
+  client: GithubClient,
+  repository: string,
+  blobSha: string,
+  path: string,
+  maxSize: number
+): Promise<{ content: string; size: number }> {
+  if (!/^[a-f0-9]{40}$/i.test(blobSha)) throw new Error(`GitHub returned an invalid repository blob SHA for ${path}`);
+  const blob = await githubRequest<{
+    sha: string;
+    encoding: string;
+    content: string;
+    size: number;
+  }>(
+    client,
+    `/repos/${repository}/git/blobs/${blobSha}`
+  );
+  if (blob.sha.toLowerCase() !== blobSha.toLowerCase() || blob.encoding !== "base64") {
+    throw new Error(`GitHub returned an invalid repository file blob for ${path}`);
+  }
+  if (!Number.isSafeInteger(blob.size) || blob.size < 0 || blob.size > maxSize) {
+    throw new Error(`${path} exceeds the ${maxSize} byte snapshot limit`);
+  }
+  const content = Buffer.from(blob.content.replace(/\s/g, ""), "base64").toString("utf8");
+  if (Buffer.byteLength(content, "utf8") !== blob.size) {
+    throw new Error(`${path} content size does not match GitHub metadata`);
+  }
+  return { content, size: blob.size };
+}
+
+export async function getRepositoryFileAtCommit(
+  client: GithubClient,
+  repository: string,
+  commit: string,
+  path: string
+): Promise<RepositoryFileAtCommit> {
+  if (!/^[a-f0-9]{40}$/i.test(commit)) throw new Error("repository file read requires a full commit SHA");
+  assertSafeRepositoryPath(path, "file");
+  const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+  const file = await githubRequest<{
+    type: string;
+    sha: string;
+    encoding: string;
+    content: string;
+    size: number;
+  }>(
+    client,
+    `/repos/${repository}/contents/${encodedPath}?ref=${encodeURIComponent(commit)}`
+  );
+  if (file.type !== "file" || file.encoding !== "base64" || !/^[a-f0-9]{40}$/i.test(file.sha)) {
+    throw new Error(`GitHub returned an invalid repository file blob for ${path}`);
+  }
+  if (!Number.isSafeInteger(file.size) || file.size < 0 || file.size > 256 * 1024) {
+    throw new Error(`${path} exceeds the 256 KiB snapshot limit`);
+  }
+  const content = Buffer.from(file.content.replace(/\s/g, ""), "base64").toString("utf8");
+  if (Buffer.byteLength(content, "utf8") !== file.size) {
+    throw new Error(`${path} content size does not match GitHub metadata`);
+  }
+  return {
+    repository,
+    commit: commit.toLowerCase(),
+    path,
+    blobSha: file.sha.toLowerCase(),
+    content,
+  };
+}
+
+export async function getRepositoryDirectoryAtCommit(
+  client: GithubClient,
+  repository: string,
+  commit: string,
+  directory: string
+): Promise<RepositoryDirectoryAtCommit> {
+  if (!/^[a-f0-9]{40}$/i.test(commit)) throw new Error("repository directory read requires a full commit SHA");
+  assertSafeRepositoryPath(directory, "directory");
+  if (directory.endsWith("/")) throw new Error("repository directory read requires a safe relative path");
+  const commitObject = await githubRequest<{ tree: { sha: string } }>(
+    client,
+    `/repos/${repository}/git/commits/${commit}`
+  );
+  if (!/^[a-f0-9]{40}$/i.test(commitObject.tree.sha)) {
+    throw new Error("GitHub returned an invalid repository tree SHA");
+  }
+  const tree = await githubRequest<{
+    truncated?: boolean;
+    tree: Array<{
+      path: string;
+      mode: string;
+      type: string;
+      sha: string;
+      size?: number;
+    }>;
+  }>(
+    client,
+    `/repos/${repository}/git/trees/${commitObject.tree.sha}?recursive=1`
+  );
+  if (tree.truncated) throw new Error(`${directory} package tree exceeds the GitHub recursive tree limit`);
+  const prefix = `${directory}/`;
+  const entries = tree.tree
+    .filter((entry) => entry.path === directory || entry.path.startsWith(prefix))
+    .sort((left, right) => left.path.localeCompare(right.path));
+  const files: RepositoryPackageFileAtCommit[] = [];
+  let totalBytes = 0;
+  for (const entry of entries) {
+    if (entry.path === directory || entry.type === "tree") continue;
+    assertSafeRepositoryPath(entry.path, "file");
+    if (!entry.path.startsWith(prefix)) throw new Error(`${entry.path} escapes repository package ${directory}`);
+    if (entry.type !== "blob" || (entry.mode !== "100644" && entry.mode !== "100755")) {
+      throw new Error(`${entry.path} is not a regular file in repository package ${directory}`);
+    }
+    if (files.length >= 64) throw new Error(`${directory} package exceeds the 64 file limit`);
+    const blob = await readRepositoryBlob(client, repository, entry.sha, entry.path, 256 * 1024);
+    if (entry.size !== undefined && entry.size !== blob.size) {
+      throw new Error(`${entry.path} content size does not match GitHub tree metadata`);
+    }
+    totalBytes += blob.size;
+    if (totalBytes > 256 * 1024) throw new Error(`${directory} package exceeds the 256 KiB snapshot limit`);
+    files.push({
+      repository,
+      commit: commit.toLowerCase(),
+      path: entry.path,
+      blobSha: entry.sha.toLowerCase(),
+      content: blob.content,
+      size: blob.size,
+    });
+  }
+  if (files.length === 0) throw new Error(`${directory} package contains no regular files`);
+  return { repository, commit: commit.toLowerCase(), directory, files };
+}
 // Every supervisor-authored PR comment starts with this prefix — enforced at
 // the single write path below — so the webhook filter can recognize the
 // pipeline's own comments without relying on account identity. That is what

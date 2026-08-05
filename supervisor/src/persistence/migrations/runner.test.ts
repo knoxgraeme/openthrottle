@@ -51,6 +51,8 @@ describe("database migrations", () => {
       "f8bdad88455442e46d1951f7fe48050f9367d83273ed94c8eaf7f610666fb809",
       "5327e028894aeac2334d4fd63da3937cdb3470419d9cde8aa7f20832280aa6ad",
       "438e4388d9f50e29233a33c86065e97e0e958b9c1e39a04e0c6be74c279c805f",
+      "23f09c8fd9f001ea824f86a24edd3d496949594af5dfeb9ad835fc109942ac97",
+      "5cf580fcb6d73b2b4ff4fdaa5cf4e1a7c14b2f84b945fcdf313caf36ca4cf662",
     ]);
   });
 
@@ -108,6 +110,216 @@ describe("database migrations", () => {
       SELECT name FROM sqlite_master
       WHERE type = 'index' AND name = 'execution_work_one_active_idx'
     `).get()).toEqual({ name: "execution_work_one_active_idx" });
+    expect(db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'index' AND name = 'execution_units_graph_status_idx'
+    `).get()).toEqual({ name: "execution_units_graph_status_idx" });
+    expect(db.prepare(`
+      SELECT COUNT(*) AS count FROM pragma_foreign_key_list('execution_units')
+      WHERE "table" = 'execution_graphs'
+    `).get()).toEqual({ count: 3 });
+    expect(db.prepare(`
+      SELECT COUNT(*) AS count FROM pragma_foreign_key_list('execution_work_attempts')
+      WHERE "table" = 'execution_units'
+    `).get()).toEqual({ count: 5 });
+    expect(db.prepare(`
+      SELECT COUNT(*) AS count FROM pragma_foreign_key_list('execution_units')
+      WHERE "table" = 'execution_work_attempts'
+    `).get()).toEqual({ count: 6 });
+  });
+
+  it("does not stamp v18 when composite identity prerequisites are missing", () => {
+    const scenarios = [
+      {
+        schema: `
+          CREATE TABLE pipeline_instances (id TEXT PRIMARY KEY);
+          CREATE TABLE pipeline_stage_attempts (
+            id TEXT PRIMARY KEY,
+            pipeline_instance_id TEXT NOT NULL,
+            planned_run_id TEXT
+          );
+          CREATE TABLE execution_graphs (id TEXT PRIMARY KEY);
+          CREATE TABLE execution_work_attempts (id TEXT PRIMARY KEY);
+          CREATE TABLE execution_gate_receipts (id TEXT PRIMARY KEY);
+          CREATE TABLE execution_downstream_context (id TEXT PRIMARY KEY);
+        `,
+        error: /missing execution_units/,
+      },
+      {
+        schema: `
+          CREATE TABLE pipeline_instances (id TEXT PRIMARY KEY);
+          CREATE TABLE pipeline_stage_attempts (
+            id TEXT PRIMARY KEY,
+            pipeline_instance_id TEXT NOT NULL
+          );
+          CREATE TABLE execution_graphs (id TEXT PRIMARY KEY);
+          CREATE TABLE execution_units (id TEXT PRIMARY KEY);
+          CREATE TABLE execution_work_attempts (id TEXT PRIMARY KEY);
+          CREATE TABLE execution_gate_receipts (id TEXT PRIMARY KEY);
+          CREATE TABLE execution_downstream_context (id TEXT PRIMARY KEY);
+        `,
+        error: /missing pipeline_stage_attempts\.planned_run_id/,
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      db = new Database(":memory:");
+      db.exec(`
+        CREATE TABLE schema_migrations (
+          version INTEGER PRIMARY KEY,
+          name TEXT NOT NULL,
+          checksum TEXT NOT NULL,
+          applied_at TEXT NOT NULL
+        );
+        ${scenario.schema}
+      `);
+      for (const migration of databaseMigrations.filter((candidate) => candidate.version <= 17)) {
+        db.prepare(`
+          INSERT INTO schema_migrations(version, name, checksum, applied_at)
+          VALUES (?, ?, ?, '2026-07-29T00:00:00.000Z')
+        `).run(migration.version, migration.name, migration.checksum);
+      }
+
+      expect(() => applyDatabaseMigrations(db!)).toThrow(scenario.error);
+      expect(db.prepare("SELECT version FROM schema_migrations WHERE version = 18").get()).toBeUndefined();
+      db.close();
+      db = undefined;
+    }
+  });
+
+  it("preserves valid active child pointers while rebuilding the composite identity", () => {
+    db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    db.exec(`
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      )
+    `);
+    for (const migration of databaseMigrations.filter((candidate) => candidate.version <= 17)) {
+      migration.up(db);
+      db.prepare(`
+        INSERT INTO schema_migrations(version, name, checksum, applied_at)
+        VALUES (?, ?, ?, '2026-07-29T00:00:00.000Z')
+      `).run(migration.version, migration.name, migration.checksum);
+    }
+    const now = "2026-07-29T00:00:00.000Z";
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS tickets (
+        linear_issue_id TEXT PRIMARY KEY,
+        linear_issue_identifier TEXT NOT NULL,
+        linear_session_id TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        agent TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        base_branch TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS agent_sessions (
+        id TEXT PRIMARY KEY,
+        linear_issue_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        state TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(id, linear_issue_id, generation)
+      );
+      CREATE TABLE IF NOT EXISTS runs (
+        id TEXT PRIMARY KEY,
+        linear_issue_id TEXT NOT NULL,
+        linear_session_id TEXT NOT NULL,
+        session_generation INTEGER NOT NULL,
+        task_type TEXT NOT NULL,
+        token_hash TEXT NOT NULL,
+        status TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        expires_at TEXT
+      );
+      INSERT INTO tickets (
+        linear_issue_id, linear_issue_identifier, linear_session_id, branch, agent,
+        repo, base_branch, created_at, updated_at
+      ) VALUES ('issue-1', 'OPE-1', 'session-1', 'ot/ope-1', 'codex', 'owner/repo', 'main', '${now}', '${now}');
+      INSERT INTO agent_sessions (
+        id, linear_issue_id, generation, state, created_at, updated_at
+      ) VALUES ('session-1', 'issue-1', 1, 'current', '${now}', '${now}');
+      INSERT INTO runs (
+        id, linear_issue_id, linear_session_id, session_generation, task_type,
+        token_hash, status, started_at, expires_at
+      ) VALUES (
+        'run-parent', 'issue-1', 'session-1', 1, 'implement', 'request-hash',
+        'running', '${now}', '2026-07-29T01:00:00.000Z'
+      );
+      INSERT INTO repository_config_snapshots (
+        id, repository, base_commit, blob_sha, digest, normalized_config, created_at
+      ) VALUES ('config-1', 'owner/repo', '${"a".repeat(40)}', '${"b".repeat(40)}', '${"c".repeat(64)}', '{}', '${now}');
+      INSERT INTO runtime_capability_descriptors (
+        runtime_release, digest, protocol, normalized_descriptor, accepted_at
+      ) VALUES ('runtime/v1', '${"d".repeat(64)}', 'stage-executor@1', '{}', '${now}');
+      INSERT INTO pipeline_catalog_entries (
+        pipeline_id, version, digest, normalized_manifest, accepted_at
+      ) VALUES ('structured', 1, '${"e".repeat(64)}', '{}', '${now}');
+      INSERT INTO pipeline_instances (
+        id, linear_issue_id, linear_session_id, generation, pipeline_id, pipeline_version,
+        manifest_digest, normalized_manifest, repository, base_commit, branch,
+        repository_config_snapshot_id, repository_config_digest, runtime_release, capability_digest,
+        executor_protocol, authorized_capabilities, status, active_stage_id, state_version,
+        attempt_count, created_at, updated_at
+      ) VALUES (
+        'instance-1', 'issue-1', 'session-1', 1, 'structured', 1, '${"e".repeat(64)}',
+        '{}', 'owner/repo', '${"a".repeat(40)}', 'ot/ope-1', 'config-1', '${"c".repeat(64)}',
+        'runtime/v1', '${"d".repeat(64)}', 'stage-executor@1', '[]', 'running',
+        'units', 1, 1, '${now}', '${now}'
+      );
+      INSERT INTO pipeline_instance_stages (
+        pipeline_instance_id, stage_id, ordinal, status, attempt_count, created_at, updated_at
+      ) VALUES ('instance-1', 'units', 1, 'running', 1, '${now}', '${now}');
+      INSERT INTO pipeline_stage_attempts (
+        id, pipeline_instance_id, stage_id, attempt_ordinal, reentry_ordinal,
+        request_hash, idempotency_key, context_revision, native_context_policy,
+        planned_run_id, run_id, status, created_at, updated_at
+      ) VALUES (
+        'attempt-parent', 'instance-1', 'units', 1, 0, '${"f".repeat(64)}',
+        'attempt-key', 0, 'none', 'run-parent', 'run-parent', 'running', '${now}', '${now}'
+      );
+      INSERT INTO execution_graphs (
+        id, pipeline_instance_id, parent_attempt_id, parent_stage_id, parent_run_id,
+        graph_digest, plan_digest, created_at, updated_at
+      ) VALUES (
+        'graph-1', 'instance-1', 'attempt-parent', 'units', 'run-parent',
+        'graph-digest', 'plan-digest', '${now}', '${now}'
+      );
+      INSERT INTO execution_units (
+        id, execution_graph_id, pipeline_instance_id, parent_attempt_id, unit_id,
+        authored_order, dependency_unit_ids, status, active_work_attempt_id,
+        created_at, updated_at
+      ) VALUES (
+        'unit-1', 'graph-1', 'instance-1', 'attempt-parent', 'a',
+        0, '[]', 'running', 'action-1', '${now}', '${now}'
+      );
+      INSERT INTO execution_work_attempts (
+        id, execution_graph_id, execution_unit_id, pipeline_instance_id, parent_attempt_id,
+        parent_run_id, unit_id, attempt_ordinal, action_kind, idempotency_key,
+        status, payload, created_at, updated_at
+      ) VALUES (
+        'action-1', 'graph-1', 'unit-1', 'instance-1', 'attempt-parent',
+        'run-parent', 'a', 1, 'implement', 'action-key-1',
+        'leased', '{}', '${now}', '${now}'
+      );
+    `);
+
+    applyDatabaseMigrations(db);
+
+    expect(db.prepare(`
+      SELECT active_work_attempt_id FROM execution_units
+      WHERE id = 'unit-1'
+    `).get()).toEqual({ active_work_attempt_id: "action-1" });
+    expect(db.prepare("SELECT version FROM schema_migrations WHERE version = 18").get()).toEqual({
+      version: 18,
+    });
+    expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
   });
 
   it("upgrades databases already stamped with the immutable v16 checksum through v17", () => {
@@ -241,6 +453,11 @@ describe("database migrations", () => {
     db.exec(`
       CREATE TABLE pipeline_instances (id TEXT PRIMARY KEY);
       INSERT INTO pipeline_instances VALUES ('instance-1');
+      CREATE TABLE pipeline_stage_attempts (
+        id TEXT PRIMARY KEY,
+        pipeline_instance_id TEXT,
+        planned_run_id TEXT
+      );
       CREATE TABLE pipeline_effect_intents (
         id TEXT PRIMARY KEY,
         pipeline_instance_id TEXT NOT NULL,
@@ -375,13 +592,14 @@ describe("database migrations", () => {
         id TEXT PRIMARY KEY, status TEXT NOT NULL, started_at TEXT NOT NULL,
         completed_at TEXT
       );
+      CREATE TABLE pipeline_instances (id TEXT PRIMARY KEY);
       CREATE TABLE run_liveness (
         run_id TEXT PRIMARY KEY, actor_state TEXT NOT NULL,
         last_heartbeat_at TEXT, settlement_owner TEXT, settlement_reason TEXT,
         termination_confirmed_at TEXT, quarantine_reason TEXT, updated_at TEXT NOT NULL
       );
       CREATE TABLE pipeline_stage_attempts (
-        id TEXT PRIMARY KEY, run_id TEXT, planned_run_id TEXT,
+        id TEXT PRIMARY KEY, pipeline_instance_id TEXT, run_id TEXT, planned_run_id TEXT,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       );
       INSERT INTO runs VALUES ('run-bound', 'running', '2026-01-01T00:00:00.000Z', NULL);
@@ -407,19 +625,19 @@ describe("database migrations", () => {
         'completed', '2026-01-01T00:00:09.000Z', NULL, '2026-01-01T00:00:09.000Z'
       );
       INSERT INTO pipeline_stage_attempts VALUES (
-        'attempt-bound', 'run-bound', 'run-bound',
+        'attempt-bound', NULL, 'run-bound', 'run-bound',
         '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
       );
       INSERT INTO pipeline_stage_attempts VALUES (
-        'attempt-planned', NULL, 'run-planned',
+        'attempt-planned', NULL, NULL, 'run-planned',
         '2026-01-01T00:00:01.000Z', '2026-01-01T00:00:01.000Z'
       );
       INSERT INTO pipeline_stage_attempts VALUES (
-        'attempt-quarantined', 'run-quarantined', 'run-quarantined',
+        'attempt-quarantined', NULL, 'run-quarantined', 'run-quarantined',
         '2026-01-01T00:00:02.000Z', '2026-01-01T00:00:02.000Z'
       );
       INSERT INTO pipeline_stage_attempts VALUES (
-        'attempt-settled', 'run-settled', 'run-settled',
+        'attempt-settled', NULL, 'run-settled', 'run-settled',
         '2026-01-01T00:00:03.000Z', '2026-01-01T00:00:03.000Z'
       );
     `);
@@ -705,13 +923,14 @@ describe("database migrations", () => {
         id TEXT PRIMARY KEY, status TEXT NOT NULL, started_at TEXT NOT NULL,
         completed_at TEXT
       );
+      CREATE TABLE pipeline_instances (id TEXT PRIMARY KEY);
       CREATE TABLE run_liveness (
         run_id TEXT PRIMARY KEY, actor_state TEXT NOT NULL,
         last_heartbeat_at TEXT, settlement_owner TEXT, settlement_reason TEXT,
         termination_confirmed_at TEXT, quarantine_reason TEXT, updated_at TEXT NOT NULL
       );
       CREATE TABLE pipeline_stage_attempts (
-        id TEXT PRIMARY KEY, run_id TEXT, planned_run_id TEXT,
+        id TEXT PRIMARY KEY, pipeline_instance_id TEXT, run_id TEXT, planned_run_id TEXT,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       );
       CREATE TABLE pipeline_attempt_actors (
@@ -745,11 +964,11 @@ describe("database migrations", () => {
       );
 
       INSERT INTO pipeline_stage_attempts VALUES (
-        'attempt-reaping', 'run-reaping', 'run-reaping',
+        'attempt-reaping', NULL, 'run-reaping', 'run-reaping',
         '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
       );
       INSERT INTO pipeline_stage_attempts VALUES (
-        'attempt-settled', 'run-settled', 'run-settled',
+        'attempt-settled', NULL, 'run-settled', 'run-settled',
         '2026-01-01T00:00:01.000Z', '2026-01-01T00:00:01.000Z'
       );
 

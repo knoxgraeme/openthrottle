@@ -1,10 +1,21 @@
 # .openthrottle.yml — project config for OpenThrottle
 # Commit this file so delegated runs use the same repository-level gates.
+schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
 agent: codex
-test: npm test --prefix supervisor && npm test --prefix cli && npm test --prefix sandbox
-lint: npm run typecheck --prefix supervisor && npm run typecheck --prefix cli
-build: npm run build --prefix supervisor && npm run build --prefix cli
+commands:
+  test: npm run typecheck --prefix contracts && npm run build --prefix contracts && npm run typecheck --prefix supervisor && npm run typecheck --prefix cli && npm run build --prefix supervisor && npm run build --prefix cli && npm test --prefix contracts && npm test --prefix supervisor && npm test --prefix cli && npm test --prefix sandbox
+  lint: npm run typecheck --prefix contracts && npm run build --prefix contracts && npm run typecheck --prefix supervisor && npm run typecheck --prefix cli
+  build: npm run build --prefix contracts && npm run build --prefix supervisor && npm run build --prefix cli
+test: npm run typecheck --prefix contracts && npm run build --prefix contracts && npm run typecheck --prefix supervisor && npm run typecheck --prefix cli && npm run build --prefix supervisor && npm run build --prefix cli && npm test --prefix contracts && npm test --prefix supervisor && npm test --prefix cli && npm test --prefix sandbox
+lint: npm run typecheck --prefix contracts && npm run build --prefix contracts && npm run typecheck --prefix supervisor && npm run typecheck --prefix cli
+build: npm run build --prefix contracts && npm run build --prefix supervisor && npm run build --prefix cli
 post_bootstrap:
+  - npm ci --prefix contracts
   - npm ci --prefix supervisor
   - npm ci --prefix cli
   - npm ci --prefix sandbox
@@ -15,3 +26,12 @@ mcp_servers: {}
 pipelines:
   implement: implement
   investigate: investigate
+intents:
+  implement:
+    default_graph: simple
+    allowed_graphs:
+      - simple
+  investigate:
+    default_graph: simple
+    allowed_graphs:
+      - simple

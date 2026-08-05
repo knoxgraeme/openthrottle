@@ -2,15 +2,20 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { loadPipelineCatalog, resolvePipelineReference, type PipelineManifest, type PipelineStage } from "./manifest.js";
-import { parseAndCompileExecutionGraph, validateAndCompileExecutionGraph } from "./execution-graph.js";
+import {
+  REPOSITORY_SKILL_CAPABILITY,
+  parseAndCompileExecutionGraph,
+  validateAndCompileExecutionGraph,
+} from "./execution-graph.js";
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 
 const catalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
 const simpleGraphPath = fileURLToPath(new URL("../../graphs/simple-v1.json", import.meta.url));
 const investigateGraphPath = fileURLToPath(new URL("../../graphs/investigate-v1.json", import.meta.url));
-const SIMPLE_GRAPH_DIGEST = "69c1bd8143b14bd590fbeaa9c9bf5ee1fbcf1e22ff1424ae24173b5947aceeb6";
+const structuredGraphPath = fileURLToPath(new URL("../../graphs/structured-v1.json", import.meta.url));
+const SIMPLE_GRAPH_DIGEST = "2f25ae9b891405d0e73e5f3c0f103354183c8cb27ca923cbd06baa6c470b76d1";
 const SIMPLE_MANIFEST_DIGEST = "9b705c003313187cb2f7e219c99e1cbf795d966be0e1d257015462219833ac6a";
-const INVESTIGATE_GRAPH_DIGEST = "2b0cb5b2e54504808af4d39496fc9b130320146f903c40a84537d62ec7465223";
+const INVESTIGATE_GRAPH_DIGEST = "a76d3e1360d92f41bc7aa9ed2372e294555478d5854808bf0c2a5ed7febaf317";
 const INVESTIGATE_MANIFEST_DIGEST = "d159ef720f5dbc7216b8dd502e3961ac30ffb2c4d4ea44a5afdc71a78f84da4e";
 
 function shippedManifest(reference: string): PipelineManifest {
@@ -87,6 +92,22 @@ function minimalGraph(overrides: {
   };
 }
 
+function repositorySkillPackage() {
+  return {
+    schema: "openthrottle.repository-skill-package/v1" as const,
+    reference: `repo://owner/repo@${"a".repeat(40)}#.agents/skills/implement-unit`,
+    invocation: "implement_unit",
+    directory: ".agents/skills/implement-unit",
+    commit: "a".repeat(40),
+    packageDigest: "d".repeat(64),
+    files: [{
+      path: ".agents/skills/implement-unit/SKILL.md",
+      blobSha: "b".repeat(40),
+      digest: "c".repeat(64),
+    }],
+  };
+}
+
 describe("execution graph compiler", () => {
   it("compiles the built-in simple graph behaviorally equivalent to core/implement@4 with a new digest", () => {
     const compiled = parseAndCompileExecutionGraph(readFileSync(simpleGraphPath, "utf8"), {
@@ -139,11 +160,118 @@ describe("execution graph compiler", () => {
     });
   });
 
+  it("compiles for_each_unit to the structured graph runtime capability with test descriptors", () => {
+    const runtime = buildInstalledRuntimeDescriptor("structured-test/v1", {
+      capabilities: [
+        ...buildInstalledRuntimeDescriptor("base-test/v1").descriptor.capabilities,
+        "graph/for-each-unit@1",
+      ],
+    });
+    const compiled = parseAndCompileExecutionGraph(readFileSync(structuredGraphPath, "utf8"), {
+      source: structuredGraphPath,
+      runtime: runtime.descriptor,
+    });
+
+    expect(compiled.manifest.manifest).toMatchObject({
+      id: "builtin/structured",
+      version: 1,
+      entry_stage: "units",
+      requires: { capabilities: ["graph/for-each-unit@1"] },
+      stages: [{
+        id: "units",
+        executor: { kind: "loop_action", capability: "graph/for-each-unit@1" },
+        evaluator: { kind: "semantic", assurance: "executor_verified", required_artifacts: ["execution_graph_result"] },
+        context: "none",
+        live_steering: false,
+        credentials: ["provider.read", "repo.read", "repo.write"],
+        produces: ["stage_result", "execution_graph_result"],
+      }],
+    });
+    expect(compiled.manifest.manifest.stages[0]?.transitions.no_change).toEqual({ terminal: "no_change" });
+  });
+
+  it("rejects the structured graph against the shipped production runtime descriptor until the composite runtime lands", () => {
+    expect(() => parseAndCompileExecutionGraph(readFileSync(structuredGraphPath, "utf8"), {
+      source: structuredGraphPath,
+      runtime: buildInstalledRuntimeDescriptor("production-like/v1").descriptor,
+    })).toThrow(/runtime capability mismatch: capability:graph\/for-each-unit@1/);
+  });
+
+  it("compiles repository skills to the platform repository-skill capability with pinned package identity", () => {
+    const runtime = buildInstalledRuntimeDescriptor("repository-skill-test/v1", {
+      capabilities: [
+        ...buildInstalledRuntimeDescriptor("base-test/v1").descriptor.capabilities,
+        REPOSITORY_SKILL_CAPABILITY,
+      ],
+    });
+    const pkg = repositorySkillPackage();
+    const compiled = validateAndCompileExecutionGraph(minimalGraph({
+      worker: {
+        skills: ["repo://implement_unit"],
+        credentials: ["model.invoke", "repo.read", "repo.write"],
+      },
+      loop: {
+        skill: "repo://implement_unit",
+      },
+    }), {
+      runtime: runtime.descriptor,
+      repositorySkills: new Map([["implement_unit", pkg]]),
+    }).manifest.manifest;
+
+    expect(compiled.requires.capabilities).toEqual([REPOSITORY_SKILL_CAPABILITY]);
+    expect(compiled.stages[0]).toMatchObject({
+      executor: { kind: "agent", capability: REPOSITORY_SKILL_CAPABILITY },
+      repositorySkill: pkg,
+      credentials: ["model.invoke", "repo.read", "repo.write"],
+    });
+  });
+
+  it("compiles repository-defined command names from the pinned command inventory", () => {
+    const compiled = validateAndCompileExecutionGraph(minimalGraph({
+      node: {
+        kind: "command",
+        loop: undefined,
+        command: "docs-check",
+      },
+    }), {
+      config: {
+        schema: "openthrottle.config/v1",
+        default_graph: "docs",
+        graphs: [{ id: "docs", kind: "repository", ref: ".openthrottle/graphs/docs.json" }],
+        commands: { "docs-check": "npm run docs:check" },
+      },
+    }).manifest.manifest;
+
+    expect(compiled.stages[0]).toMatchObject({
+      id: "stage",
+      executor: { kind: "command", capability: "command/run@1" },
+      commandName: "docs-check",
+    });
+  });
+
+  it("fails closed for unpinned repository skills and production runtimes without the repository-skill capability", () => {
+    const graph = minimalGraph({
+      worker: {
+        skills: ["repo://implement_unit"],
+        credentials: ["model.invoke", "repo.read"],
+      },
+      loop: {
+        skill: "repo://implement_unit",
+      },
+    });
+    expect(() => validateAndCompileExecutionGraph(graph))
+      .toThrow(/repository skill implement_unit was not pinned by admission/);
+    expect(() => validateAndCompileExecutionGraph(graph, {
+      runtime: buildInstalledRuntimeDescriptor("production-like/v1").descriptor,
+      repositorySkills: new Map([["implement_unit", repositorySkillPackage()]]),
+    })).toThrow(/runtime capability mismatch: capability:agent\/repository-skill@1/);
+  });
+
   it.each([
     [
       "for_each_unit nodes",
       minimalGraph({ node: { kind: "for_each_unit" } }),
-      /graph\.nodes\.stage\.kind: cannot compile for_each_unit yet/,
+      /graph\.loops\.loop\.input_scope: for_each_unit requires unit input scope/,
     ],
     [
       "human nodes",
@@ -210,5 +338,22 @@ describe("execution graph compiler", () => {
     ],
   ])("fails closed for unsupported %s", (_label, graph, error) => {
     expect(() => validateAndCompileExecutionGraph(graph)).toThrow(error);
+  });
+
+  it("rejects repository command nodes absent from the pinned command inventory", () => {
+    expect(() => validateAndCompileExecutionGraph(minimalGraph({
+      node: {
+        kind: "command",
+        loop: undefined,
+        command: "docs-check",
+      },
+    }), {
+      config: {
+        schema: "openthrottle.config/v1",
+        default_graph: "docs",
+        graphs: [{ id: "docs", kind: "repository", ref: ".openthrottle/graphs/docs.json" }],
+        commands: { test: "npm test" },
+      },
+    })).toThrow(/graph\.nodes\.stage\.command: references an unknown repository command/);
   });
 });

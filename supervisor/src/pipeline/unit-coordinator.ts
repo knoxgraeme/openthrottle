@@ -20,6 +20,26 @@ export interface ExecutionPlanUnit {
   dependencies?: readonly string[];
 }
 
+// The durable per-unit sequence: implement/repair produces a unit_completion
+// receipt, simplify tidies the diff, command runs each configured command,
+// candidate captures executor-verified subject evidence, lead binds a
+// scope-match decision to that exact candidate and its command receipts, and
+// only then may integrate run. See RR15/RAE10.
+export const UNIT_PHASES = ["implement", "simplify", "command", "candidate", "lead", "integrate"] as const;
+export type UnitPhase = (typeof UNIT_PHASES)[number];
+
+export const UNIT_ACTION_KINDS = [
+  "implement", "repair", "simplify", "command", "candidate", "lead", "integrate",
+  "final_command", "final_review", "final_repair", "aggregate", "stop", "cleanup",
+] as const;
+export type UnitActionKind = (typeof UNIT_ACTION_KINDS)[number];
+
+// Whole-change final phases run once every unit has settled: full commands
+// rerun against the final integrated subject, then one fresh report-only
+// review, with bounded repair looping back to a clean command rerun.
+export const FINAL_PHASES = ["command", "review", "repair", "done"] as const;
+export type FinalPhase = (typeof FINAL_PHASES)[number];
+
 export interface ExecutionUnitState {
   id: string;
   unitId: string;
@@ -27,9 +47,77 @@ export interface ExecutionUnitState {
   dependencies: readonly string[];
   status: "pending" | "running" | "integrated" | "completed" | "exited" | "failed";
   activeActionId: string | null;
+  phase: UnitPhase;
+  currentCycle: number;
+  repairRounds: number;
+  commandIndex: number;
+  acceptedCandidateSubject: string | null;
   integrationSubject: string | null;
   terminalLevel: UnitTerminalLevel | null;
   alarm: boolean;
+}
+
+export function actionKindForUnitPhase(phase: UnitPhase, currentCycle: number): UnitActionKind {
+  if (phase === "implement") return currentCycle > 1 ? "repair" : "implement";
+  return phase;
+}
+
+export function nextUnitPhase(phase: UnitPhase): UnitPhase | undefined {
+  return UNIT_PHASES[UNIT_PHASES.indexOf(phase) + 1];
+}
+
+export type UnitAcceptanceRouting =
+  | { action: "integrate" }
+  | { action: "repair"; repairRounds: number }
+  | { action: "settle"; reason: "defect" }
+  | { action: "escalate"; reason: string };
+
+// Command failure (or any other non-accept lead result) repairs the unit --
+// back to a fresh implement/repair session, then re-simplify, then rerun
+// every configured command -- bounded by maxRepairRounds so a unit that
+// cannot converge settles as failed rather than looping forever.
+export function routeUnitAcceptanceDecision(input: {
+  outcome: StageOutcome;
+  reason: string;
+  repairRounds: number;
+  maxRepairRounds: number;
+}): UnitAcceptanceRouting {
+  if (input.outcome === "success") return { action: "integrate" };
+  if (input.outcome === "semantic_repair_required") {
+    if (input.repairRounds + 1 > input.maxRepairRounds) return { action: "settle", reason: "defect" };
+    return { action: "repair", repairRounds: input.repairRounds + 1 };
+  }
+  return { action: "escalate", reason: input.reason };
+}
+
+export type IntegrationRouting =
+  | { action: "settle_completed" }
+  | { action: "escalate"; reason: string };
+
+export function routeIntegrationDecision(input: { outcome: StageOutcome; reason: string }): IntegrationRouting {
+  if (input.outcome === "success") return { action: "settle_completed" };
+  return { action: "escalate", reason: input.reason };
+}
+
+export type FinalReviewRouting =
+  | { action: "done" }
+  | { action: "repair"; repairRounds: number }
+  | { action: "escalate"; reason: string };
+
+export function routeFinalReviewDecision(input: {
+  outcome: StageOutcome;
+  reason: string;
+  repairRounds: number;
+  maxRepairRounds: number;
+}): FinalReviewRouting {
+  if (input.outcome === "success" || input.outcome === "no_change") return { action: "done" };
+  if (input.outcome === "semantic_repair_required") {
+    if (input.repairRounds + 1 > input.maxRepairRounds) {
+      return { action: "escalate", reason: "final_review_repair_rounds_exhausted" };
+    }
+    return { action: "repair", repairRounds: input.repairRounds + 1 };
+  }
+  return { action: "escalate", reason: input.reason };
 }
 
 export type UnitTerminalReason = "acceptance_passed" | "structural_exit" | "defect";

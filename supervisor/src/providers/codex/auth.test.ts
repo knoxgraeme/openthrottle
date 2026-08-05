@@ -7,6 +7,7 @@ import {
   SETTINGS_CODEX_AUTH_JSON,
   captureCodexAuthJson,
   codexRefreshToken,
+  createCredentialMaterializer,
   getCodexAuthForSeed,
   refreshCodexAuthJson,
   resolveStoredCodexAuthJson,
@@ -318,6 +319,71 @@ describe("Codex durable auth", () => {
       const logged = warn.mock.calls.map((c) => c.join(" ")).join("\n");
       expect(logged).not.toContain("rt-secret-2");
       expect(logged).toContain("Codex token refresh request failed");
+    });
+  });
+
+  describe("createCredentialMaterializer", () => {
+    function fullCfg(overrides: Partial<Config> = {}): Config {
+      return {
+        githubToken: "gh-write-token",
+        githubReadToken: "gh-read-token",
+        claudeCodeOauthToken: "claude-token",
+        kimiCodeApiKey: "kimi-key",
+        codexAuthJson: undefined,
+        ...overrides,
+      } as unknown as Config;
+    }
+
+    function seedTicket(agent: "claude" | "codex" | "opencode") {
+      store.upsert({
+        linear_issue_id: "issue-1",
+        linear_issue_identifier: "OT-1",
+        linear_session_id: "session-1",
+        sandbox_id: "sandbox-1",
+        branch: "ot/ot-1",
+        agent,
+        repo: "owner/repo",
+        pr_url: null,
+        state: "active",
+      });
+    }
+
+    it("uses the ticket's own agent when no per-action override is passed", async () => {
+      seedTicket("claude");
+      const materialize = createCredentialMaterializer(fullCfg(), store);
+
+      const { env } = await materialize({ providerResourceId: "sandbox-1" }, ["model.invoke"]);
+      expect(env).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: "claude-token" });
+    });
+
+    it("selects the requesting action's own agent credential when it overrides the ticket's default agent", async () => {
+      // A graph worker can run a Codex action inside an otherwise-Claude
+      // ticket. Without the override, the materializer would hand this
+      // action CLAUDE_CODE_OAUTH_TOKEN -- a credential it cannot authenticate
+      // with, and one it has no business receiving.
+      seedTicket("claude");
+      const codexAuth = authBlob("rt-0", "2026-07-01T00:00:00Z");
+      store.setSetting(SETTINGS_CODEX_AUTH_JSON, codexAuth);
+      const materialize = createCredentialMaterializer(fullCfg(), store);
+
+      const ticketAgentEnv = await materialize({ providerResourceId: "sandbox-1" }, ["model.invoke"]);
+      expect(ticketAgentEnv.env).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: "claude-token" });
+
+      const actionAgentEnv = await materialize(
+        { providerResourceId: "sandbox-1" },
+        ["model.invoke"],
+        "codex"
+      );
+      expect(actionAgentEnv.env).toEqual({ CODEX_AUTH_JSON: codexAuth });
+    });
+
+    it("throws when the overriding agent has no available credential, rather than silently falling back", async () => {
+      seedTicket("claude");
+      const materialize = createCredentialMaterializer(fullCfg({ kimiCodeApiKey: undefined }), store);
+
+      await expect(
+        materialize({ providerResourceId: "sandbox-1" }, ["model.invoke"], "opencode")
+      ).rejects.toThrow(/model credential for opencode is unavailable/);
     });
   });
 });

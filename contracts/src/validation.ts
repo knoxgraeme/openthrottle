@@ -68,6 +68,10 @@ export function optional<T>(value: unknown, parse: (entry: unknown) => T): T | u
   return value === undefined ? undefined : parse(value);
 }
 
+export function nullable<T>(value: unknown, parse: (entry: unknown) => T): T | null {
+  return value === null ? null : parse(value);
+}
+
 export function recordAt<T>(
   value: unknown,
   path: string,
@@ -94,6 +98,16 @@ export function normalizedContract<T>(value: T): ValidatedContract<T> {
 
 export const IDENTIFIER = /^[a-z][a-z0-9]*(?:[._/-][a-z0-9]+)*$/;
 export const COMMAND_NAME_PATTERN = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
-export const SKILL_REFERENCE = /^(?:builtin:\/\/[a-z][a-z0-9]*(?:[._/@-][a-z0-9]+)*@\d+|repo:\/\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+@[a-f0-9]{40}#(?:(?!\.{1,2}(?:\/|$))[A-Za-z0-9._-]+\/)*(?!\.{1,2}$)[A-Za-z0-9._-]+)$/;
+export const SKILL_REFERENCE = /^(?:builtin:\/\/[a-z][a-z0-9]*(?:[._/@-][a-z0-9]+)*@\d+|repo:\/\/[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*)$/;
+// Producer evidence binds the exact pinned repository skill (owner/repo@commit#path)
+// admission resolved, not the authoring-time short name graph.ts validates with
+// SKILL_REFERENCE above. Path segments reject "." and ".." to match the
+// traversal-safe pinning contract enforced at admission (manifest.ts) and by the
+// sandbox executor (sandbox/runner/artifacts.mjs).
+export const PRODUCER_SKILL_REFERENCE = /^(?:builtin:\/\/[a-z][a-z0-9]*(?:[._/@-][a-z0-9]+)*@\d+|repo:\/\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+@[a-f0-9]{40}#(?:(?!\.{1,2}(?:\/|$))[A-Za-z0-9._-]+\/)*(?!\.{1,2}$)[A-Za-z0-9._-]+)$/;
 export const SHA256 = /^[a-f0-9]{64}$/;
 export const GIT_SUBJECT = /^[a-f0-9]{40,64}$/;
+// Matches sandbox/runner/artifacts.mjs's NATIVE_SESSION_ID and
+// native-session-package.mjs's PACKAGE_PATH_ID, since a native session id
+// is later used to build a filesystem path.
+export const NATIVE_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;

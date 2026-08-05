@@ -15,9 +15,13 @@ export {
   parseRepositoryConfigContract,
   validateRepositoryConfigContract,
   type ConfigGraphSource,
+  type ConfigLimits,
+  type ConfigMcpServer,
+  type ConfigRepositorySkill,
   type RepositoryConfigContract,
 } from "./config.js";
 export {
+  AGENT_INHERITANCE,
   GRAPH_SCHEMA,
   GRAPH_OUTCOMES,
   INPUT_SCOPES,
@@ -33,6 +37,8 @@ export {
   type GraphNode,
   type GraphTransition,
   type GraphWorker,
+  type AgentInheritance,
+  type LogicalCredential,
 } from "./graph.js";
 export {
   EXECUTION_PLAN_SCHEMA,
@@ -71,5 +77,5 @@ export {
   type UnitDecisionPayload,
   type UnitDecisionReceipt,
 } from "./receipts.js";
-export { COMMAND_NAME_PATTERN, SKILL_REFERENCE } from "./validation.js";
+export { COMMAND_NAME_PATTERN, PRODUCER_SKILL_REFERENCE, SKILL_REFERENCE } from "./validation.js";
 export type { ValidatedContract } from "./validation.js";

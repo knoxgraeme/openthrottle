@@ -6,7 +6,8 @@
   "producer": {
     "worker_id": "lead",
     "skill": "builtin://accept-unit@1",
-    "capability_digest": "1111111111111111111111111111111111111111111111111111111111111111"
+    "capability_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+    "skill_package_digest": null
   },
   "subject": {
     "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -18,6 +19,10 @@
     "graph_digest": "2222222222222222222222222222222222222222222222222222222222222222",
     "unit_id": "contracts",
     "attempt_id": "attempt-1",
+    "parent_run_id": "run-1",
+    "action_attempt_id": "action-1",
+    "generation": 1,
+    "native_session_id": null,
     "request_hash": "3333333333333333333333333333333333333333333333333333333333333333"
   },
   "evidence": [

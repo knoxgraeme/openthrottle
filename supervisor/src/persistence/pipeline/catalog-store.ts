@@ -2,6 +2,7 @@ import type Database from "better-sqlite3";
 import {
   canonicalJson,
   type ValidatedPipelineCatalog,
+  type ValidatedPipelineManifest,
   type ValidatedRepositoryConfig,
 } from "../../pipeline/manifest.js";
 import type { ValidatedRuntimeCapabilityDescriptor } from "../../runtime/contracts.js";
@@ -10,8 +11,30 @@ import { assertDigest, deterministicId } from "./helpers.js";
 
 export function createCatalogStore(db: Database.Database, now: () => string): Pick<
   PipelineStore,
-  "acceptCatalog" | "acceptRuntimeDescriptor" | "saveRepositoryConfigSnapshot"
+  "acceptCatalog" | "acceptManifest" | "acceptRuntimeDescriptor" | "saveRepositoryConfigSnapshot"
 > {
+  const selectPipelineCatalogEntry = db.prepare(
+    "SELECT digest, normalized_manifest FROM pipeline_catalog_entries WHERE pipeline_id = ? AND version = ?"
+  );
+  const insertPipelineCatalogEntry = db.prepare(`
+    INSERT OR IGNORE INTO pipeline_catalog_entries (
+      pipeline_id, version, digest, normalized_manifest, accepted_at
+    ) VALUES (?, ?, ?, ?, ?)
+  `);
+  const acceptManifest = (validated: ValidatedPipelineManifest): void => {
+    assertDigest(`${validated.manifest.id}@${validated.manifest.version}`, validated.normalized, validated.digest);
+    if (canonicalJson(validated.manifest) !== validated.normalized) {
+      throw new Error(`pipeline ${validated.manifest.id}@${validated.manifest.version} normalized content mismatch`);
+    }
+    const existing = selectPipelineCatalogEntry.get(validated.manifest.id, validated.manifest.version) as
+      | { digest: string; normalized_manifest: string }
+      | undefined;
+    if (existing && (existing.digest !== validated.digest || existing.normalized_manifest !== validated.normalized)) {
+      throw new Error(`pipeline ${validated.manifest.id}@${validated.manifest.version} was already accepted with a different digest`);
+    }
+    insertPipelineCatalogEntry.run(validated.manifest.id, validated.manifest.version, validated.digest, validated.normalized, now());
+  };
+
   const acceptCatalog = db.transaction((catalog: ValidatedPipelineCatalog) => {
     assertDigest("pipeline catalog", catalog.normalized, catalog.digest);
     const expectedCatalog = canonicalJson({
@@ -28,23 +51,7 @@ export function createCatalogStore(db: Database.Database, now: () => string): Pi
       throw new Error("pipeline catalog normalized content mismatch");
     }
     for (const validated of catalog.manifests.values()) {
-      assertDigest(`${validated.manifest.id}@${validated.manifest.version}`, validated.normalized, validated.digest);
-      if (canonicalJson(validated.manifest) !== validated.normalized) {
-        throw new Error(`pipeline ${validated.manifest.id}@${validated.manifest.version} normalized content mismatch`);
-      }
-      const existing = db.prepare(
-        "SELECT digest, normalized_manifest FROM pipeline_catalog_entries WHERE pipeline_id = ? AND version = ?"
-      ).get(validated.manifest.id, validated.manifest.version) as
-        | { digest: string; normalized_manifest: string }
-        | undefined;
-      if (existing && (existing.digest !== validated.digest || existing.normalized_manifest !== validated.normalized)) {
-        throw new Error(`pipeline ${validated.manifest.id}@${validated.manifest.version} was already accepted with a different digest`);
-      }
-      db.prepare(`
-        INSERT OR IGNORE INTO pipeline_catalog_entries (
-          pipeline_id, version, digest, normalized_manifest, accepted_at
-        ) VALUES (?, ?, ?, ?, ?)
-      `).run(validated.manifest.id, validated.manifest.version, validated.digest, validated.normalized, now());
+      acceptManifest(validated);
     }
     for (const [alias, reference] of Object.entries(catalog.aliases)) {
       const validated = catalog.manifests.get(`${reference.id}@${reference.version}`);
@@ -85,7 +92,7 @@ export function createCatalogStore(db: Database.Database, now: () => string): Pi
     baseCommit: string;
     blobSha: string;
     config: ValidatedRepositoryConfig;
-  }): RepositoryConfigSnapshot => {
+    }): RepositoryConfigSnapshot => {
     assertDigest("repository config", input.config.normalized, input.config.digest);
     if (canonicalJson(input.config.config) !== input.config.normalized) {
       throw new Error("repository config normalized content mismatch");
@@ -110,5 +117,5 @@ export function createCatalogStore(db: Database.Database, now: () => string): Pi
     return db.prepare("SELECT * FROM repository_config_snapshots WHERE id = ?").get(id) as RepositoryConfigSnapshot;
   });
 
-  return { acceptCatalog, acceptRuntimeDescriptor, saveRepositoryConfigSnapshot };
+  return { acceptCatalog, acceptManifest, acceptRuntimeDescriptor, saveRepositoryConfigSnapshot };
 }

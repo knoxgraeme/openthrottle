@@ -1,19 +1,22 @@
 import {
   chownSync,
   chmodSync,
+  constants,
   existsSync,
   lstatSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  accessSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest, sanitizeArtifactText } from "./artifacts.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
+import { identityForUser } from "./filesystem-isolation.mjs";
 
 const COMMIT = /^[a-f0-9]{40}$/;
 const LOCAL_GIT_TIMEOUT_MS = 120_000;
@@ -82,6 +85,10 @@ export function runGitAsRepositoryOwner(repoDir, args, env = {}, { timeoutMs = L
   return gitOutput(result, args, timeoutMs);
 }
 
+export function runGitAsExecutor(repoDir, args, env = {}, { timeoutMs = LOCAL_GIT_TIMEOUT_MS } = {}) {
+  return runGit(repoDir, args, env, { timeoutMs });
+}
+
 function optionalRepositoryOwnerGit(repoDir, args) {
   try {
     return runGitAsRepositoryOwner(repoDir, args);
@@ -90,28 +97,84 @@ function optionalRepositoryOwnerGit(repoDir, args) {
   }
 }
 
-let installedAgentIdentity;
-
 function prepareRepositoryOwnerDirectory(path) {
   if (typeof process.getuid !== "function" || process.getuid() !== 0) return;
-  if (!installedAgentIdentity) {
-    const uid = spawnSync("id", ["-u", "agent"], { encoding: "utf8" });
-    const gid = spawnSync("id", ["-g", "agent"], { encoding: "utf8" });
-    if (uid.status !== 0 || gid.status !== 0 || !/^\d+\n?$/.test(uid.stdout) || !/^\d+\n?$/.test(gid.stdout)) {
-      throw new Error("repository control could not resolve the installed agent identity");
-    }
-    installedAgentIdentity = { uid: Number(uid.stdout.trim()), gid: Number(gid.stdout.trim()) };
+  let identity;
+  try {
+    identity = identityForUser("agent");
+  } catch {
+    throw new Error("repository control could not resolve the installed agent identity");
   }
-  chownSync(path, installedAgentIdentity.uid, installedAgentIdentity.gid);
+  chownSync(path, identity.uid, identity.gid);
   chmodSync(path, 0o700);
 }
 
-export function computeWorkspaceTreeOidFromTree(repoDir, baseTree) {
+function canWriteDirectory(path) {
+  try {
+    accessSync(path, constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function gitAlternateObjectDirectories(extraGitEnv) {
+  if (!extraGitEnv || typeof extraGitEnv !== "object") return [];
+  const directories = [];
+  if (typeof extraGitEnv.GIT_OBJECT_DIRECTORY === "string" && extraGitEnv.GIT_OBJECT_DIRECTORY) {
+    directories.push(extraGitEnv.GIT_OBJECT_DIRECTORY);
+  }
+  if (typeof extraGitEnv.GIT_ALTERNATE_OBJECT_DIRECTORIES === "string" && extraGitEnv.GIT_ALTERNATE_OBJECT_DIRECTORIES) {
+    directories.push(...extraGitEnv.GIT_ALTERNATE_OBJECT_DIRECTORIES.split(delimiter).filter(Boolean));
+  }
+  return directories;
+}
+
+function inheritedGitEnvironment() {
+  return Object.fromEntries(
+    ["GIT_DIR", "GIT_WORK_TREE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"]
+      .filter((name) => typeof process.env[name] === "string" && process.env[name])
+      .map((name) => [name, process.env[name]])
+  );
+}
+
+function gitRepositoryEnvironment(extraGitEnv) {
+  if (!extraGitEnv || typeof extraGitEnv !== "object") return {};
+  return Object.fromEntries(
+    ["GIT_DIR", "GIT_WORK_TREE"]
+      .filter((name) => typeof extraGitEnv[name] === "string" && extraGitEnv[name])
+      .map((name) => [name, extraGitEnv[name]])
+  );
+}
+
+export function computeWorkspaceTreeOidFromTree(repoDir, baseTree, extraGitEnv = {}) {
   const temporary = mkdtempSync(join(tmpdir(), "ot-stage-index-"));
   const indexPath = join(temporary, "index");
+  const objectPath = join(temporary, "objects");
   try {
     prepareRepositoryOwnerDirectory(temporary);
-    const env = { GIT_INDEX_FILE: indexPath };
+    const effectiveGitEnv = { ...inheritedGitEnvironment(), ...extraGitEnv };
+    const extraAlternates = gitAlternateObjectDirectories(effectiveGitEnv);
+    const commonDir = extraAlternates.length === 0
+      ? optionalRepositoryOwnerGit(repoDir, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
+      : null;
+    const commonObjects = commonDir ? join(commonDir, "objects") : null;
+    const isolateObjects = extraAlternates.length > 0 || (commonObjects &&
+      ((typeof process.getuid === "function" && process.getuid() === 0) || !canWriteDirectory(commonObjects))
+    );
+    if (isolateObjects) {
+      mkdirSync(objectPath, { recursive: true, mode: 0o700 });
+      prepareRepositoryOwnerDirectory(objectPath);
+    }
+    const alternates = extraAlternates.length > 0 ? extraAlternates : (commonObjects ? [commonObjects] : []);
+    const env = {
+      ...gitRepositoryEnvironment(effectiveGitEnv),
+      GIT_INDEX_FILE: indexPath,
+      ...(isolateObjects ? {
+        GIT_OBJECT_DIRECTORY: objectPath,
+        GIT_ALTERNATE_OBJECT_DIRECTORIES: alternates.join(delimiter),
+      } : {}),
+    };
     runGitAsRepositoryOwner(repoDir, ["read-tree", baseTree], env);
     runGitAsRepositoryOwner(repoDir, ["add", "-A", "--", "."], env);
     return commit(runGitAsRepositoryOwner(repoDir, ["write-tree"], env), "workspace tree");
@@ -123,8 +186,8 @@ export function computeWorkspaceTreeOidFromTree(repoDir, baseTree) {
 // Canonical workspace subject: tracked files plus non-ignored untracked files,
 // with Git's native blob/tree hashing and executable/symlink modes. A private
 // temporary index means the agent-controlled index is never consulted.
-export function computeWorkspaceTreeOid(repoDir) {
-  return computeWorkspaceTreeOidFromTree(repoDir, "HEAD");
+export function computeWorkspaceTreeOid(repoDir, extraGitEnv = {}) {
+  return computeWorkspaceTreeOidFromTree(repoDir, "HEAD", extraGitEnv);
 }
 
 function fileModeAt(path) {

@@ -49,16 +49,38 @@ export function deriveCandidateEvidence({
   return { ...payload, hash: digest(canonicalJson(payload)) };
 }
 
+// Every fence field a command receipt must bind to the executor's current
+// identity envelope before its evidence is trusted by a gate. Checked ahead
+// of (and independent from) contracts/artifacts.mjs schema validation, which
+// only proves the receipt is well-formed, not that it describes *this* run.
+const COMMAND_RECEIPT_FENCE_FIELDS = [
+  ["pipelineInstanceId", "pipeline_instance_id", "pipeline"],
+  ["graphDigest", "graph_digest", "graph"],
+  ["unitId", "unit_id", "unit"],
+  ["attemptId", "attempt_id", "attempt"],
+  ["parentRunId", "parent_run_id", "run"],
+  ["actionAttemptId", "action_attempt_id", "action"],
+  ["generation", "generation", "generation"],
+  ["nativeSessionId", "native_session_id", "session"],
+];
+
 export function bindCommandReceipt({
   receipt,
   commandName,
   expectedSubject,
   requestHash,
+  expectedFence,
 }) {
   const subject = string(expectedSubject, "expectedSubject", COMMIT);
   string(requestHash, "requestHash", SHA256);
   if (!receipt || typeof receipt !== "object") throw new Error("command receipt must be an object");
   if (receipt.type !== "command_result") throw new Error("receipt is not a command_result");
+  if (!expectedFence || typeof expectedFence !== "object") throw new Error("expectedFence must be an object");
+  for (const [key, fenceKey, label] of COMMAND_RECEIPT_FENCE_FIELDS) {
+    if (receipt.fence?.[fenceKey] !== expectedFence[key]) {
+      throw new Error(`command receipt ${label} fence mismatch`);
+    }
+  }
   if (receipt.fence?.request_hash !== requestHash) throw new Error("command receipt request fence mismatch");
   if (receipt.subject?.post !== subject) throw new Error("command receipt subject fence mismatch");
   if (receipt.payload?.command !== commandName) throw new Error("command receipt command mismatch");

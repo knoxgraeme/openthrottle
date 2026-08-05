@@ -1,0 +1,41 @@
+{
+  "schema": "openthrottle.graph/v1",
+  "id": "builtin/structured",
+  "version": 1,
+  "entry_node": "units",
+  "workers": [
+    {
+      "id": "unit-worker",
+      "engine": "agent",
+      "skills": ["builtin://ce/implement@1"],
+      "session_scope": "attempt",
+      "credentials": ["model.invoke", "provider.read", "repo.read", "repo.write"]
+    }
+  ],
+  "loops": [
+    {
+      "id": "unit-loop",
+      "worker": "unit-worker",
+      "skill": "builtin://ce/implement@1",
+      "input_scope": "unit",
+      "receipt": "unit_completion",
+      "max_parallel": 1,
+      "max_rounds": 8,
+      "timeout_seconds": 86400
+    }
+  ],
+  "nodes": [
+    {
+      "id": "units",
+      "kind": "for_each_unit",
+      "loop": "unit-loop",
+      "depends_on": [],
+      "transitions": {
+        "success": { "terminal": "completed" },
+        "repair_required": { "terminal": "needs_human" },
+        "retryable_failure": { "terminal": "failed" },
+        "failure": { "terminal": "failed" }
+      }
+    }
+  ]
+}

@@ -1,17 +1,40 @@
 import type Database from "better-sqlite3";
-import { canonicalJson, digestNormalized, type StageOutcome } from "../../pipeline/manifest.js";
+import { canonicalJson, type StageOutcome } from "../../pipeline/manifest.js";
 import { buildExecutionPublicationSnapshot } from "../../pipeline/execution-publication.js";
+import type { ExecutionGateDecision } from "../../pipeline/execution-gates.js";
 import {
   decideDownstreamContext,
   deriveUnitTerminalState,
+  nextUnitPhase,
+  routeFinalReviewDecision,
+  routeIntegrationDecision,
+  routeUnitAcceptanceDecision,
   selectNextReadyUnit,
   type ChildGateDecision,
   type ChildGateEvaluatorKind,
   type ExecutionPlanUnit,
   type ExecutionUnitState,
+  type FinalPhase,
+  type UnitActionKind,
   type UnitTerminalReason,
 } from "../../pipeline/unit-coordinator.js";
 import { deterministicId } from "./helpers.js";
+import {
+  createOrResumeFinalAction,
+  createOrResumeUnitAction,
+  DEFAULT_MAX_REPAIR_ROUNDS,
+  dependenciesFor,
+  GATED_ACTION_KINDS,
+  insertGateReceipt,
+  listUnitRowsForParentAttempt,
+  loadActiveAction,
+  markActionCompleted,
+  PHASE_FOR_COMPLETING_ACTION_KIND,
+  unitState,
+  type ExecutionUnitRow,
+} from "./unit-store-phase-reducer.js";
+
+export type ExecutionGateKind = ChildGateDecision["gateKind"] | "integration" | "final_review";
 
 export interface ExecutionUnitGraph {
   id: string;
@@ -21,6 +44,13 @@ export interface ExecutionUnitGraph {
   parent_run_id: string;
   graph_digest: string;
   plan_digest: string;
+  command_names: string;
+  max_repair_rounds: number;
+  final_phase: FinalPhase | null;
+  final_command_index: number;
+  final_cycle: number;
+  final_repair_rounds: number;
+  final_review_passed_at: string | null;
   integration_subject: string | null;
   aggregate_artifact_hash: string | null;
   aggregate_emitted_at: string | null;
@@ -33,16 +63,20 @@ export interface ExecutionUnitGraph {
 export interface ExecutionWorkAttempt {
   id: string;
   execution_graph_id: string;
-  execution_unit_id: string;
+  execution_unit_id: string | null;
   pipeline_instance_id: string;
   parent_attempt_id: string;
   parent_run_id: string;
-  unit_id: string;
+  unit_id: string | null;
   attempt_ordinal: number;
-  action_kind: "implement" | "simplify" | "command" | "candidate" | "integrate" | "aggregate" | "stop" | "cleanup";
+  action_kind: UnitActionKind;
+  cycle: number;
+  command_name: string | null;
   idempotency_key: string;
   request_hash: string | null;
   result_hash: string | null;
+  receipt: string | null;
+  receipt_hash: string | null;
   native_session_id: string | null;
   status: "pending" | "leased" | "dispatched" | "running" | "completed" | "failed" | "dead";
   lease_owner: string | null;
@@ -58,11 +92,11 @@ export interface ExecutionWorkAttempt {
 export interface ExecutionGateReceipt {
   id: string;
   execution_graph_id: string;
-  execution_unit_id: string;
+  execution_unit_id: string | null;
   execution_work_attempt_id: string;
   parent_attempt_id: string;
-  unit_id: string;
-  gate_kind: ChildGateDecision["gateKind"];
+  unit_id: string | null;
+  gate_kind: ExecutionGateKind;
   evaluator_kind: ChildGateEvaluatorKind;
   subject: string | null;
   result: ChildGateDecision["result"];
@@ -97,6 +131,8 @@ export interface ExecutionUnitStore {
     graphDigest: string;
     planDigest: string;
     units: readonly ExecutionPlanUnit[];
+    commandNames?: readonly string[];
+    maxRepairRounds?: number;
   }): ExecutionUnitGraph;
   getGraphForAttempt(parentAttemptId: string): ExecutionUnitGraph | undefined;
   listUnits(parentAttemptId: string): ExecutionUnitState[];
@@ -112,6 +148,14 @@ export interface ExecutionUnitStore {
     actionId: string;
     resultHash: string;
     outputSubject: string;
+    receipt?: string;
+  }): ExecutionWorkAttempt;
+  completeGatedAction(input: {
+    actionId: string;
+    resultHash: string;
+    outputSubject: string;
+    receipt?: string;
+    decision: ExecutionGateDecision;
   }): ExecutionWorkAttempt;
   emitAggregateOnce(input: {
     parentAttemptId: string;
@@ -120,7 +164,7 @@ export interface ExecutionUnitStore {
   }): "emitted" | "already_emitted";
   recordGateReceipt(input: {
     actionId: string;
-    gateKind: ChildGateDecision["gateKind"];
+    gateKind: ExecutionGateKind;
     evaluatorKind: ChildGateEvaluatorKind;
     subject: string | null;
     result: ChildGateDecision["result"];
@@ -146,11 +190,12 @@ export interface ExecutionUnitStore {
     unitId: string;
     reason: UnitTerminalReason;
   }): "settled" | "already_settled";
-  healStaleChildActions(input: {
+  healExpiredCurrentChildAction(input: {
     parentAttemptId: string;
+    actionId: string;
     nowIso: string;
     reason: string;
-  }): Array<{ actionId: string; unitId: string }>;
+  }): "healed" | "not_current";
   renewChildActionLiveness(input: {
     parentRunId: string;
     actionId: string;
@@ -158,46 +203,6 @@ export interface ExecutionUnitStore {
     leaseUntilIso: string;
   }): boolean;
   getStructuredExecutionPublication(parentAttemptId: string): ReturnType<typeof buildExecutionPublicationSnapshot>;
-}
-
-type ExecutionUnitRow = {
-  id: string;
-  unit_id: string;
-  authored_order: number;
-  dependency_unit_ids: string;
-  status: ExecutionUnitState["status"];
-  active_work_attempt_id: string | null;
-  integration_subject: string | null;
-  terminal_level: ExecutionUnitState["terminalLevel"];
-  alarm: number;
-};
-
-function dependenciesFor(row: { dependency_unit_ids: string }): string[] {
-  const parsed = JSON.parse(row.dependency_unit_ids) as unknown;
-  return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === "string") : [];
-}
-
-function unitState(row: ExecutionUnitRow): ExecutionUnitState {
-  return {
-    id: row.id,
-    unitId: row.unit_id,
-    ordinal: row.authored_order,
-    dependencies: dependenciesFor(row),
-    status: row.status,
-    activeActionId: row.active_work_attempt_id,
-    integrationSubject: row.integration_subject,
-    terminalLevel: row.terminal_level,
-    alarm: row.alarm === 1,
-  };
-}
-
-function listUnitRowsForParentAttempt(db: Database.Database, parentAttemptId: string): ExecutionUnitRow[] {
-  return db.prepare(`
-    SELECT id, unit_id, authored_order, dependency_unit_ids, status,
-      active_work_attempt_id, integration_subject, terminal_level, alarm
-    FROM execution_units WHERE parent_attempt_id = ?
-    ORDER BY authored_order, unit_id
-  `).all(parentAttemptId) as ExecutionUnitRow[];
 }
 
 export function getStructuredExecutionPublicationForAttempt(
@@ -216,7 +221,7 @@ export function getStructuredExecutionPublicationForAttempt(
             ORDER BY attempt_ordinal DESC, created_at DESC, id DESC
           ) AS row_number
         FROM execution_work_attempts
-        WHERE parent_attempt_id = ?
+        WHERE parent_attempt_id = ? AND unit_id IS NOT NULL
       )
       WHERE row_number <= 3
     )
@@ -224,7 +229,7 @@ export function getStructuredExecutionPublicationForAttempt(
   `).all(parentAttemptId) as ExecutionWorkAttempt[];
   const gates = db.prepare(`
     SELECT * FROM execution_gate_receipts
-    WHERE parent_attempt_id = ?
+    WHERE parent_attempt_id = ? AND unit_id IS NOT NULL
     ORDER BY unit_id, created_at, id
   `).all(parentAttemptId) as ExecutionGateReceipt[];
   const downstreamContext = db.prepare(`
@@ -243,8 +248,8 @@ export function getStructuredExecutionPublicationForAttempt(
   return buildExecutionPublicationSnapshot({
     graph,
     units: listUnitRowsForParentAttempt(db, parentAttemptId).map(unitState),
-    attempts,
-    gates,
+    attempts: attempts as Array<ExecutionWorkAttempt & { unit_id: string }>,
+    gates: gates as Array<ExecutionGateReceipt & { unit_id: string }>,
     downstreamContext,
   });
 }
@@ -294,35 +299,6 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     return "settled";
   }
 
-  function healStaleChildActionRows(input: {
-    parentAttemptId: string;
-    nowIso: string;
-    reason: string;
-  }): Array<{ actionId: string; unitId: string }> {
-    const stale = db.prepare(`
-      SELECT id, unit_id FROM execution_work_attempts
-      WHERE parent_attempt_id = ? AND status IN ('dispatched', 'running')
-        AND lease_until IS NOT NULL AND lease_until <= ?
-      ORDER BY created_at, id
-    `).all(input.parentAttemptId, input.nowIso) as Array<{ id: string; unit_id: string }>;
-    for (const action of stale) {
-      db.prepare(`
-        UPDATE execution_work_attempts
-        SET status = 'dead', lease_until = NULL, completed_at = COALESCE(completed_at, ?),
-            last_error = ?, updated_at = ?
-        WHERE id = ? AND status IN ('dispatched', 'running')
-      `).run(input.nowIso, input.reason, input.nowIso, action.id);
-      settleUnitRow({
-        parentAttemptId: input.parentAttemptId,
-        unitId: action.unit_id,
-        reason: "structural_exit",
-        timestamp: input.nowIso,
-      });
-    }
-    settleStructurallyBlockedDependents(input.parentAttemptId, input.nowIso);
-    return stale.map((action) => ({ actionId: action.id, unitId: action.unit_id }));
-  }
-
   function settleStructurallyBlockedDependents(parentAttemptId: string, timestamp: string): void {
     for (;;) {
       const rows = listUnitRows(parentAttemptId);
@@ -347,12 +323,16 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
   }
 
   function assertGraphReplayMatches(input: Parameters<ExecutionUnitStore["createGraph"]>[0], existing: ExecutionUnitGraph): void {
+    const expectedCommandNames = canonicalJson([...(input.commandNames ?? [])]);
+    const expectedMaxRepairRounds = input.maxRepairRounds ?? DEFAULT_MAX_REPAIR_ROUNDS;
     if (
       existing.pipeline_instance_id !== input.pipelineInstanceId ||
       existing.parent_stage_id !== input.parentStageId ||
       existing.parent_run_id !== input.parentRunId ||
       existing.graph_digest !== input.graphDigest ||
-      existing.plan_digest !== input.planDigest
+      existing.plan_digest !== input.planDigest ||
+      existing.command_names !== expectedCommandNames ||
+      existing.max_repair_rounds !== expectedMaxRepairRounds
     ) {
       throw new Error(`execution graph ${existing.id} replay fence mismatch`);
     }
@@ -379,11 +359,16 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       assertGraphReplayMatches(input, existing);
       return existing;
     }
+    const commandNames = canonicalJson([...(input.commandNames ?? [])]);
+    const maxRepairRounds = input.maxRepairRounds ?? DEFAULT_MAX_REPAIR_ROUNDS;
+    if (!Number.isInteger(maxRepairRounds) || maxRepairRounds < 0) {
+      throw new Error("execution graph maxRepairRounds must be a non-negative integer");
+    }
     db.prepare(`
       INSERT INTO execution_graphs (
         id, pipeline_instance_id, parent_attempt_id, parent_stage_id, parent_run_id,
-        graph_digest, plan_digest, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        graph_digest, plan_digest, command_names, max_repair_rounds, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(parent_attempt_id) DO NOTHING
     `).run(
       graphId,
@@ -393,6 +378,8 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       input.parentRunId,
       input.graphDigest,
       input.planDigest,
+      commandNames,
+      maxRepairRounds,
       timestamp,
       timestamp
     );
@@ -418,6 +405,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     return graphStmt.get(input.parentAttemptId) as ExecutionUnitGraph;
   });
 
+
   const leaseNextUnitAction = db.transaction((
     input: Parameters<ExecutionUnitStore["leaseNextUnitAction"]>[0]
   ): ExecutionWorkAttempt | undefined => {
@@ -438,11 +426,6 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       WHERE parent_attempt_id = ? AND status = 'leased'
         AND lease_until IS NOT NULL AND lease_until <= ?
     `).run(input.nowIso, input.parentAttemptId, input.nowIso);
-    healStaleChildActionRows({
-      parentAttemptId: input.parentAttemptId,
-      nowIso: input.nowIso,
-      reason: "child action missed heartbeat fence",
-    });
     const dispatched = db.prepare(`
       SELECT * FROM execution_work_attempts
       WHERE parent_attempt_id = ? AND status IN ('dispatched', 'running')
@@ -458,76 +441,208 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         AND (lease_until IS NULL OR lease_until > ?)
     `).get(input.parentAttemptId, input.nowIso);
     if (active) return undefined;
+
     const rows = listUnitRows(input.parentAttemptId);
-    const selection = selectNextReadyUnit(rows.map(unitState));
-    if (!selection) return undefined;
-    const next = rows.find((row) => row.id === selection.id)!;
-    const ordinal = (db.prepare(`
-      SELECT COALESCE(MAX(attempt_ordinal), 0) + 1 AS ordinal
-      FROM execution_work_attempts WHERE execution_unit_id = ? AND action_kind = 'implement'
-    `).get(next.id) as { ordinal: number }).ordinal;
-    const idempotencyKey = `unit-action:${input.parentAttemptId}:${next.unit_id}:${ordinal}`;
-    const actionId = deterministicId("execution-work", [input.parentAttemptId, next.unit_id, ordinal, "implement"]);
-    const payload = canonicalJson({
-      parent_attempt_id: input.parentAttemptId,
-      parent_run_id: graph.parent_run_id,
-      unit_id: next.unit_id,
-      action_kind: "implement",
+    const allSettled = rows.length > 0 && rows.every((row) => row.terminal_level !== null);
+    if (!allSettled) {
+      const resumable = rows.find((row) =>
+        row.status === "running" && row.active_work_attempt_id === null && row.terminal_level === null
+      );
+      if (resumable) {
+        return createOrResumeUnitAction(db, {
+          unitRow: resumable,
+          graph,
+          leaseOwner: input.leaseOwner,
+          nowIso: input.nowIso,
+          leaseUntilIso: input.leaseUntilIso,
+        });
+      }
+      const selection = selectNextReadyUnit(rows.map(unitState));
+      if (!selection) return undefined;
+      const next = rows.find((row) => row.id === selection.id)!;
+      return createOrResumeUnitAction(db, {
+        unitRow: next,
+        graph,
+        leaseOwner: input.leaseOwner,
+        nowIso: input.nowIso,
+        leaseUntilIso: input.leaseUntilIso,
+      });
+    }
+
+    const hasCompletedUnit = rows.some((row) => row.terminal_level === "completed");
+    if (!hasCompletedUnit) return undefined;
+    return createOrResumeFinalAction(db, {
+      graph,
+      leaseOwner: input.leaseOwner,
+      nowIso: input.nowIso,
+      leaseUntilIso: input.leaseUntilIso,
     });
-    db.prepare(`
-      INSERT INTO execution_work_attempts (
-        id, execution_graph_id, execution_unit_id, pipeline_instance_id, parent_attempt_id,
-        parent_run_id, unit_id, attempt_ordinal, action_kind, idempotency_key,
-        status, lease_owner, lease_until, payload, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'implement', ?, 'leased', ?, ?, ?, ?, ?)
-    `).run(
-      actionId,
-      graph.id,
-      next.id,
-      graph.pipeline_instance_id,
-      input.parentAttemptId,
-      graph.parent_run_id,
-      next.unit_id,
-      ordinal,
-      idempotencyKey,
-      input.leaseOwner,
-      input.leaseUntilIso,
-      payload,
-      input.nowIso,
-      input.nowIso
-    );
-    db.prepare(`
-      UPDATE execution_units
-      SET status = 'running', active_work_attempt_id = ?, updated_at = ?
-      WHERE id = ? AND status = 'pending'
-    `).run(actionId, input.nowIso, next.id);
-    return db.prepare("SELECT * FROM execution_work_attempts WHERE id = ?").get(actionId) as ExecutionWorkAttempt;
   });
 
   const completeUnitAction = db.transaction((
     input: Parameters<ExecutionUnitStore["completeUnitAction"]>[0]
   ): ExecutionWorkAttempt => {
     const timestamp = now();
-    const action = db.prepare("SELECT * FROM execution_work_attempts WHERE id = ?")
-      .get(input.actionId) as ExecutionWorkAttempt | undefined;
-    if (!action) throw new Error(`unknown execution work attempt ${input.actionId}`);
+    const action = loadActiveAction(db, input.actionId);
     if (action.status === "completed") return action;
     if (!["leased", "dispatched", "running"].includes(action.status)) {
       throw new Error(`execution work attempt ${input.actionId} is not active`);
     }
-    db.prepare(`
-      UPDATE execution_work_attempts
-      SET status = 'completed', result_hash = ?, output_subject = ?,
-          completed_at = ?, updated_at = ?
-      WHERE id = ? AND status IN ('leased', 'dispatched', 'running')
-    `).run(input.resultHash, input.outputSubject, timestamp, timestamp, input.actionId);
-    db.prepare(`
-      UPDATE execution_units
-      SET status = 'integrated', active_work_attempt_id = NULL,
-          accepted_candidate_subject = ?, integration_subject = ?, updated_at = ?
-      WHERE id = ? AND active_work_attempt_id = ?
-    `).run(input.outputSubject, input.outputSubject, timestamp, action.execution_unit_id, input.actionId);
-    return db.prepare("SELECT * FROM execution_work_attempts WHERE id = ?").get(input.actionId) as ExecutionWorkAttempt;
+    if (GATED_ACTION_KINDS.has(action.action_kind)) {
+      throw new Error(`execution work attempt ${input.actionId} requires a gate decision to complete`);
+    }
+    markActionCompleted(db, { action, resultHash: input.resultHash, outputSubject: input.outputSubject, receipt: input.receipt, timestamp });
+
+    if (action.execution_unit_id) {
+      const unitUpdate = db.prepare(`
+        UPDATE execution_units
+        SET active_work_attempt_id = NULL, updated_at = ?
+        WHERE id = ? AND active_work_attempt_id = ?
+      `).run(timestamp, action.execution_unit_id, action.id);
+      if (unitUpdate.changes !== 1) {
+        throw new Error(`execution work attempt ${input.actionId} is not the current active action`);
+      }
+      if (action.action_kind === "command") {
+        db.prepare(`UPDATE execution_units SET command_index = command_index + 1, updated_at = ? WHERE id = ?`)
+          .run(timestamp, action.execution_unit_id);
+      } else if (PHASE_FOR_COMPLETING_ACTION_KIND[action.action_kind]) {
+        const currentPhase = PHASE_FOR_COMPLETING_ACTION_KIND[action.action_kind]!;
+        const next = nextUnitPhase(currentPhase);
+        if (!next) throw new Error(`execution unit phase ${currentPhase} has no successor`);
+        db.prepare(`UPDATE execution_units SET phase = ?, updated_at = ? WHERE id = ?`)
+          .run(next, timestamp, action.execution_unit_id);
+      } else {
+        throw new Error(`execution work attempt ${input.actionId} action kind is not handled by completeUnitAction`);
+      }
+    } else {
+      if (action.action_kind === "final_command") {
+        db.prepare(`UPDATE execution_graphs SET final_command_index = final_command_index + 1, updated_at = ? WHERE id = ?`)
+          .run(timestamp, action.execution_graph_id);
+      } else if (action.action_kind === "final_repair") {
+        db.prepare(`
+          UPDATE execution_graphs
+          SET final_phase = 'command', final_command_index = 0, final_cycle = final_cycle + 1, updated_at = ?
+          WHERE id = ?
+        `).run(timestamp, action.execution_graph_id);
+      } else {
+        throw new Error(`execution work attempt ${input.actionId} action kind is not handled by completeUnitAction`);
+      }
+    }
+    return loadActiveAction(db, input.actionId);
+  });
+
+  const completeGatedAction = db.transaction((
+    input: Parameters<ExecutionUnitStore["completeGatedAction"]>[0]
+  ): ExecutionWorkAttempt => {
+    const timestamp = now();
+    const action = loadActiveAction(db, input.actionId);
+    if (!GATED_ACTION_KINDS.has(action.action_kind)) {
+      throw new Error(`execution work attempt ${input.actionId} is not a gated action`);
+    }
+    if (action.status !== "completed") {
+      if (!["leased", "dispatched", "running"].includes(action.status)) {
+        throw new Error(`execution work attempt ${input.actionId} is not active`);
+      }
+      markActionCompleted(db, { action, resultHash: input.resultHash, outputSubject: input.outputSubject, receipt: input.receipt, timestamp });
+    }
+    const completedAction = loadActiveAction(db, input.actionId);
+
+    const evaluatorKind: ChildGateEvaluatorKind = input.decision.gateKind === "unit_acceptance"
+      ? "human"
+      : input.decision.gateKind === "integration"
+        ? "publish_subject"
+        : "semantic";
+    const receiptOutcome = insertGateReceipt(db, now, {
+      action: completedAction,
+      gateKind: input.decision.gateKind,
+      evaluatorKind,
+      subject: input.decision.subject,
+      result: input.decision.result,
+      outcome: input.decision.outcome,
+      reason: input.decision.reason,
+      artifactHashes: input.decision.artifactHashes,
+      payload: input.decision.payload,
+      hash: input.decision.hash,
+    });
+    // A replayed gate decision (same action, same decision) must not re-apply
+    // routing -- otherwise a repeated repair decision would double-increment
+    // repair_rounds/current_cycle instead of being a no-op.
+    if (receiptOutcome === "already_recorded") return completedAction;
+
+    if (completedAction.execution_unit_id) {
+      const unitRow = db.prepare(`
+        SELECT id, unit_id, repair_rounds FROM execution_units WHERE id = ?
+      `).get(completedAction.execution_unit_id) as { id: string; unit_id: string; repair_rounds: number } | undefined;
+      if (!unitRow) throw new Error(`execution unit for work attempt ${input.actionId} is missing`);
+      const unitClear = db.prepare(`
+        UPDATE execution_units SET active_work_attempt_id = NULL, updated_at = ?
+        WHERE id = ? AND active_work_attempt_id = ?
+      `).run(timestamp, unitRow.id, completedAction.id);
+      if (unitClear.changes !== 1) {
+        throw new Error(`execution work attempt ${input.actionId} is not the current active action`);
+      }
+
+      const graph = graphStmt.get(completedAction.parent_attempt_id) as ExecutionUnitGraph;
+      if (input.decision.gateKind === "unit_acceptance") {
+        const routing = routeUnitAcceptanceDecision({
+          outcome: input.decision.outcome,
+          reason: input.decision.reason,
+          repairRounds: unitRow.repair_rounds,
+          maxRepairRounds: graph.max_repair_rounds,
+        });
+        if (routing.action === "integrate") {
+          db.prepare(`
+            UPDATE execution_units SET phase = 'integrate', accepted_candidate_subject = ?, updated_at = ?
+            WHERE id = ?
+          `).run(input.decision.subject, timestamp, unitRow.id);
+        } else if (routing.action === "repair") {
+          db.prepare(`
+            UPDATE execution_units
+            SET phase = 'implement', current_cycle = current_cycle + 1, command_index = 0, repair_rounds = ?, updated_at = ?
+            WHERE id = ?
+          `).run(routing.repairRounds, timestamp, unitRow.id);
+        } else if (routing.action === "settle") {
+          settleUnitRow({ parentAttemptId: completedAction.parent_attempt_id, unitId: unitRow.unit_id, reason: "defect", timestamp });
+          settleStructurallyBlockedDependents(completedAction.parent_attempt_id, timestamp);
+        } else {
+          stopActiveWork({ parentAttemptId: completedAction.parent_attempt_id, reason: routing.reason });
+        }
+      } else if (input.decision.gateKind === "integration") {
+        const routing = routeIntegrationDecision({ outcome: input.decision.outcome, reason: input.decision.reason });
+        if (routing.action === "settle_completed") {
+          db.prepare(`UPDATE execution_units SET integration_subject = ?, updated_at = ? WHERE id = ?`)
+            .run(input.decision.subject, timestamp, unitRow.id);
+          settleUnitRow({ parentAttemptId: completedAction.parent_attempt_id, unitId: unitRow.unit_id, reason: "acceptance_passed", timestamp });
+        } else {
+          stopActiveWork({ parentAttemptId: completedAction.parent_attempt_id, reason: routing.reason });
+        }
+      } else {
+        throw new Error(`execution work attempt ${input.actionId} gate kind ${input.decision.gateKind} is not valid for a unit action`);
+      }
+    } else {
+      if (input.decision.gateKind !== "final_review") {
+        throw new Error(`execution work attempt ${input.actionId} gate kind ${input.decision.gateKind} is not valid for a final action`);
+      }
+      const graph = graphStmt.get(completedAction.parent_attempt_id) as ExecutionUnitGraph;
+      const routing = routeFinalReviewDecision({
+        outcome: input.decision.outcome,
+        reason: input.decision.reason,
+        repairRounds: graph.final_repair_rounds,
+        maxRepairRounds: graph.max_repair_rounds,
+      });
+      if (routing.action === "done") {
+        db.prepare(`
+          UPDATE execution_graphs SET final_phase = 'done', final_review_passed_at = ?, updated_at = ? WHERE id = ?
+        `).run(timestamp, timestamp, graph.id);
+      } else if (routing.action === "repair") {
+        db.prepare(`
+          UPDATE execution_graphs SET final_phase = 'repair', final_repair_rounds = ?, updated_at = ? WHERE id = ?
+        `).run(routing.repairRounds, timestamp, graph.id);
+      } else {
+        stopActiveWork({ parentAttemptId: completedAction.parent_attempt_id, reason: routing.reason });
+      }
+    }
+    return loadActiveAction(db, input.actionId);
   });
 
   const emitAggregateOnce = db.transaction((
@@ -543,10 +658,16 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     }
     const unfinished = db.prepare(`
       SELECT 1 FROM execution_units
-      WHERE parent_attempt_id = ? AND status NOT IN ('integrated', 'completed', 'exited')
+      WHERE parent_attempt_id = ? AND status NOT IN ('integrated', 'completed', 'exited', 'failed')
       LIMIT 1
     `).get(input.parentAttemptId);
     if (unfinished) throw new Error(`execution graph ${graph.id} has unfinished units`);
+    const hasCompletedUnit = db.prepare(`
+      SELECT 1 FROM execution_units WHERE parent_attempt_id = ? AND terminal_level = 'completed' LIMIT 1
+    `).get(input.parentAttemptId);
+    if (hasCompletedUnit && graph.final_phase !== "done") {
+      throw new Error(`execution graph ${graph.id} whole-change final review has not passed`);
+    }
     const timestamp = now();
     const update = db.prepare(`
       UPDATE execution_graphs
@@ -561,56 +682,24 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
   const recordGateReceipt = db.transaction((
     input: Parameters<ExecutionUnitStore["recordGateReceipt"]>[0]
   ): "recorded" | "already_recorded" => {
-    if (digestNormalized(input.payload) !== input.hash) throw new Error("execution gate receipt hash mismatch");
     const action = db.prepare("SELECT * FROM execution_work_attempts WHERE id = ?")
       .get(input.actionId) as ExecutionWorkAttempt | undefined;
     if (!action) throw new Error(`unknown execution work attempt ${input.actionId}`);
-    const existing = db.prepare(`
-      SELECT * FROM execution_gate_receipts
-      WHERE execution_work_attempt_id = ? AND gate_kind = ?
-    `).get(input.actionId, input.gateKind) as ExecutionGateReceipt | undefined;
-    if (existing) {
-      if (
-        existing.evaluator_kind !== input.evaluatorKind ||
-        existing.subject !== input.subject ||
-        existing.result !== input.result ||
-        existing.outcome !== input.outcome ||
-        existing.reason !== input.reason ||
-        existing.artifact_hashes !== canonicalJson([...input.artifactHashes].sort()) ||
-        existing.payload !== input.payload ||
-        existing.receipt_hash !== input.hash
-      ) throw new Error(`execution work attempt ${input.actionId} already recorded a different gate receipt`);
-      return "already_recorded";
-    }
     if (!["leased", "dispatched", "running", "completed"].includes(action.status)) {
       throw new Error(`execution work attempt ${input.actionId} is not receivable`);
     }
-    const timestamp = now();
-    db.prepare(`
-      INSERT INTO execution_gate_receipts (
-        id, execution_graph_id, execution_unit_id, execution_work_attempt_id,
-        parent_attempt_id, unit_id, gate_kind, evaluator_kind, subject, result,
-        outcome, reason, artifact_hashes, payload, receipt_hash, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      deterministicId("execution-gate", [action.id, input.gateKind]),
-      action.execution_graph_id,
-      action.execution_unit_id,
-      action.id,
-      action.parent_attempt_id,
-      action.unit_id,
-      input.gateKind,
-      input.evaluatorKind,
-      input.subject,
-      input.result,
-      input.outcome,
-      input.reason,
-      canonicalJson([...input.artifactHashes].sort()),
-      input.payload,
-      input.hash,
-      timestamp
-    );
-    return "recorded";
+    return insertGateReceipt(db, now, {
+      action,
+      gateKind: input.gateKind,
+      evaluatorKind: input.evaluatorKind,
+      subject: input.subject,
+      result: input.result,
+      outcome: input.outcome,
+      reason: input.reason,
+      artifactHashes: input.artifactHashes,
+      payload: input.payload,
+      hash: input.hash,
+    });
   });
 
   const appendDownstreamContext = db.transaction((
@@ -724,9 +813,44 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     return result;
   });
 
-  const healStaleChildActions = db.transaction((
-    input: Parameters<ExecutionUnitStore["healStaleChildActions"]>[0]
-  ): Array<{ actionId: string; unitId: string }> => healStaleChildActionRows(input));
+  const healExpiredCurrentChildAction = db.transaction((
+    input: Parameters<ExecutionUnitStore["healExpiredCurrentChildAction"]>[0]
+  ): "healed" | "not_current" => {
+    const action = db.prepare(`
+      SELECT unit_id FROM execution_work_attempts
+      WHERE id = ? AND parent_attempt_id = ? AND status IN ('dispatched', 'running')
+        AND lease_until IS NOT NULL AND lease_until <= ?
+    `).get(input.actionId, input.parentAttemptId, input.nowIso) as { unit_id: string | null } | undefined;
+    if (!action) return "not_current";
+    const update = db.prepare(`
+      UPDATE execution_work_attempts
+      SET status = 'dead', lease_until = NULL, completed_at = COALESCE(completed_at, ?),
+          last_error = ?, updated_at = ?
+      WHERE id = ? AND parent_attempt_id = ? AND status IN ('dispatched', 'running')
+        AND lease_until IS NOT NULL AND lease_until <= ?
+        AND (
+          unit_id IS NULL
+          OR EXISTS (
+            SELECT 1 FROM execution_units
+            WHERE id = execution_work_attempts.execution_unit_id
+              AND active_work_attempt_id = execution_work_attempts.id
+          )
+        )
+    `).run(input.nowIso, input.reason, input.nowIso, input.actionId, input.parentAttemptId, input.nowIso);
+    if (update.changes !== 1) return "not_current";
+    if (action.unit_id) {
+      settleUnitRow({
+        parentAttemptId: input.parentAttemptId,
+        unitId: action.unit_id,
+        reason: "structural_exit",
+        timestamp: input.nowIso,
+      });
+      settleStructurallyBlockedDependents(input.parentAttemptId, input.nowIso);
+    } else {
+      stopActiveWork({ parentAttemptId: input.parentAttemptId, reason: input.reason });
+    }
+    return "healed";
+  });
 
   return {
     createGraph,
@@ -756,6 +880,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       if (update.changes !== 1) throw new Error(`execution work attempt ${actionId} is not active`);
     },
     completeUnitAction,
+    completeGatedAction,
     emitAggregateOnce,
     recordGateReceipt,
     listGateReceipts(parentAttemptId) {
@@ -785,7 +910,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     },
     stopActiveWork,
     settleUnitTerminal,
-    healStaleChildActions,
+    healExpiredCurrentChildAction,
     renewChildActionLiveness(input) {
       const timestamp = now();
       return db.prepare(`

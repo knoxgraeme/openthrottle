@@ -195,6 +195,30 @@ describe("pipeline manifest validation", () => {
       .toThrow(/pipeline\.max_repair_rounds: must be an integer between 1 and 20/);
   });
 
+  it("accepts repository command names while preserving command executor validation", () => {
+    const value = manifest();
+    value.requires = { protocol: "stage-executor@1", capabilities: ["command/run@1"] };
+    Object.assign(firstStage(value), {
+      executor: { kind: "command", capability: "command/run@1" },
+      commandName: "docs-check",
+      evaluator: {
+        kind: "command",
+        assurance: "executor_verified",
+        required_artifacts: ["command_result"],
+      },
+      context: "none",
+      live_steering: false,
+      credentials: ["repo.read"],
+      produces: ["stage_result", "command_result"],
+    });
+
+    expect(validatePipelineManifest(value).manifest.stages[0]?.commandName).toBe("docs-check");
+
+    firstStage(value).commandName = "Docs Check!";
+    expect(() => validatePipelineManifest(value))
+      .toThrow(/pipeline\.stages\[0\]\.commandName: has an invalid format/);
+  });
+
   it("rejects invalid defaults before reducers can observe them", () => {
     expect(() => validatePipelineManifest({
       ...manifest(),
@@ -337,7 +361,7 @@ describe("pipeline manifest validation", () => {
     expect(() => validatePipelineManifest(undeclared)).toThrow(/not declared in requires.capabilities/);
   });
 
-  it("requires command executors to declare an allowlisted repository command", () => {
+  it("requires command executors to declare a valid repository command name", () => {
     const command = manifest();
     command.requires = { protocol: "stage-executor@1", capabilities: ["command/run@1"] };
     const stage = firstStage(command);
@@ -354,28 +378,149 @@ describe("pipeline manifest validation", () => {
     expect(() => validatePipelineManifest(command)).toThrow(/commandName: is required for command executors/);
 
     stage.commandName = "deploy";
-    expect(() => validatePipelineManifest(command)).toThrow(/commandName: must be one of/);
+    expect(validatePipelineManifest(command).manifest.stages[0]).toMatchObject({ commandName: "deploy" });
+
+    stage.commandName = "Deploy!";
+    expect(() => validatePipelineManifest(command)).toThrow(/commandName: has an invalid format/);
 
     const agent = manifest();
     firstStage(agent).commandName = "test";
     expect(() => validatePipelineManifest(agent)).toThrow(/commandName: is allowed only for command executors/);
   });
 
+  it("bounds repository skill package identity inside its declared directory", () => {
+    const value = manifest();
+    value.requires = { protocol: "stage-executor@1", capabilities: ["agent/repository-skill@1"] };
+    const stage = firstStage(value);
+    stage.executor = { kind: "agent", capability: "agent/repository-skill@1" };
+    stage.repositorySkill = {
+      schema: "openthrottle.repository-skill-package/v1",
+      reference: `repo://owner/repo@${"a".repeat(40)}#.agents/skills/implement-unit`,
+      invocation: "implement_unit",
+      directory: ".agents/skills/implement-unit",
+      commit: "a".repeat(40),
+      packageDigest: "b".repeat(64),
+      files: [{
+        path: ".agents/skills/implement-unit/SKILL.md",
+        blobSha: "c".repeat(40),
+        digest: "d".repeat(64),
+      }],
+    };
+
+    expect(validatePipelineManifest(value).manifest.stages[0]).toMatchObject({
+      repositorySkill: {
+        reference: `repo://owner/repo@${"a".repeat(40)}#.agents/skills/implement-unit`,
+        invocation: "implement_unit",
+      },
+    });
+
+    const escaped = structuredClone(value) as Record<string, unknown>;
+    ((firstStage(escaped).repositorySkill as Record<string, unknown>).files as Array<Record<string, unknown>>)[0]!.path =
+      ".agents/skills/other/SKILL.md";
+    expect(() => validatePipelineManifest(escaped))
+      .toThrow(/repositorySkill\.files\[0\]\.path: must stay inside/);
+
+    const missingSkill = structuredClone(value) as Record<string, unknown>;
+    ((firstStage(missingSkill).repositorySkill as Record<string, unknown>).files as Array<Record<string, unknown>>)[0]!.path =
+      ".agents/skills/implement-unit/helper.md";
+    expect(() => validatePipelineManifest(missingSkill))
+      .toThrow(/repositorySkill\.files: must include SKILL\.md/);
+
+    const oversizedPath = structuredClone(value) as Record<string, unknown>;
+    ((firstStage(oversizedPath).repositorySkill as Record<string, unknown>).files as Array<Record<string, unknown>>)[0]!.path =
+      `.agents/skills/implement-unit/${"a".repeat(300)}/SKILL.md`;
+    expect(() => validatePipelineManifest(oversizedPath))
+      .toThrow(/repositorySkill\.files\[0\]\.path: must be at most 320 characters/);
+
+    const mismatchedReference = structuredClone(value) as Record<string, unknown>;
+    (firstStage(mismatchedReference).repositorySkill as Record<string, unknown>).reference =
+      `repo://owner/repo@${"a".repeat(40)}#.agents/skills/other`;
+    expect(() => validatePipelineManifest(mismatchedReference))
+      .toThrow(/repositorySkill\.reference: must name the same/);
+  });
+
   it("accepts only bounded repository settings and canonical pipeline selections", () => {
     const parsed = parseRepositoryConfig(`
+schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
 agent: codex
+commands:
+  test: npm test --prefix supervisor
 test: npm test --prefix supervisor
 limits: { max_turns: 20, task_timeout: 300 }
 pipelines: { implement: implement, investigate: core/investigate@2 }
 mcp_servers: {}
+intents:
+  implement: { default_graph: simple, allowed_graphs: [simple] }
+  investigate: { default_graph: simple, allowed_graphs: [simple] }
 `);
     expect(parsed.config.pipelines).toEqual({
       implement: "implement",
       investigate: "core/investigate@2",
     });
     expect(parseRepositoryConfig(parsed.normalized.replace(/^/, "")).digest).toBe(parsed.digest);
-    expect(() => parseRepositoryConfig("pipeline_logic: !!js/function evil")).toThrow();
-    expect(() => parseRepositoryConfig("limits: { task_timeout: 999999 }")).toThrow(/between 1 and 86400/);
-    expect(() => parseRepositoryConfig("mcp_servers: { local: { command: node, surprise: true } }")).toThrow(/unknown field/);
+    expect(() => parseRepositoryConfig("pipelines: { implement: implement }\n"))
+      .toThrow(/schema: must be openthrottle\.config\/v1/);
+    expect(() => parseRepositoryConfig(`
+schema: openthrottle.config/v1
+default_graph: simple
+graphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]
+pipeline_logic: !!js/function evil
+`)).toThrow();
+    expect(() => parseRepositoryConfig(`
+schema: openthrottle.config/v1
+default_graph: simple
+graphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]
+limits: { task_timeout: 999999 }
+`)).toThrow(/between 1 and 86400/);
+    expect(() => parseRepositoryConfig(`
+schema: openthrottle.config/v1
+default_graph: simple
+graphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]
+mcp_servers: { local: { command: node, surprise: true } }
+`)).toThrow(/unknown field/);
+  });
+
+  it("keeps canonical commands and sandbox compatibility aliases in sync", () => {
+    const commandsOnly = parseRepositoryConfig(`
+schema: openthrottle.config/v1
+default_graph: simple
+graphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]
+commands:
+  test: npm test
+intents:
+  implement: { default_graph: simple, allowed_graphs: [simple] }
+  investigate: { default_graph: simple, allowed_graphs: [simple] }
+`);
+    expect(commandsOnly.config.commands).toEqual({ test: "npm test" });
+    expect(commandsOnly.config.test).toBe("npm test");
+
+    const legacyOnly = parseRepositoryConfig(`
+schema: openthrottle.config/v1
+default_graph: simple
+graphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]
+test: npm test
+intents:
+  implement: { default_graph: simple, allowed_graphs: [simple] }
+  investigate: { default_graph: simple, allowed_graphs: [simple] }
+`);
+    expect(legacyOnly.config.commands).toEqual({ test: "npm test" });
+    expect(legacyOnly.config.test).toBe("npm test");
+
+    expect(() => parseRepositoryConfig(`
+schema: openthrottle.config/v1
+default_graph: simple
+graphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]
+commands:
+  test: npm test
+test: npm run different
+intents:
+  implement: { default_graph: simple, allowed_graphs: [simple] }
+  investigate: { default_graph: simple, allowed_graphs: [simple] }
+`)).toThrow(/test: must match commands\.test/);
   });
 });

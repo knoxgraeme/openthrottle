@@ -66,6 +66,7 @@ const SEVERITIES = new Set(["P0", "P1", "P2", "P3"]);
 const SHA256 = /^[a-f0-9]{64}$/;
 const GIT_SUBJECT = /^[a-f0-9]{40,64}$/;
 const SKILL_REFERENCE = /^(?:builtin:\/\/[a-z][a-z0-9]*(?:[._/@-][a-z0-9]+)*@\d+|repo:\/\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+@[a-f0-9]{40}#(?:(?!\.{1,2}(?:\/|$))[A-Za-z0-9._-]+\/)*(?!\.{1,2}$)[A-Za-z0-9._-]+)$/;
+const NATIVE_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 const MAX_ARTIFACT_PAYLOAD_BYTES = 12 * 1024;
 const SECRET_PATTERNS = [
   /gh[opsu]_[A-Za-z0-9_]+/g,
@@ -317,6 +318,10 @@ function boundedPlainObject(value, label, env) {
   return JSON.parse(sanitized);
 }
 
+function nullable(value, parse) {
+  return value === null ? null : parse(value);
+}
+
 export function validateStandardReceipt(value, env = process.env) {
   const input = exactObject(value, "standard receipt", STANDARD_RECEIPT_KEYS);
   if (input.schema !== "openthrottle.receipt/v1") throw new Error("standard receipt has an invalid schema");
@@ -329,18 +334,28 @@ export function validateStandardReceipt(value, env = process.env) {
     throw new Error("semantic standard receipt cannot claim executor, provider, or human assurance");
   }
   if (!results.includes(input.result)) throw new Error("standard receipt has an invalid result");
-  const producer = exactObject(input.producer, "standard receipt producer", new Set(["worker_id", "skill", "capability_digest"]));
+  const producer = exactObject(input.producer, "standard receipt producer", new Set([
+    "worker_id", "skill", "capability_digest", "skill_package_digest",
+  ]));
   const subject = exactObject(input.subject, "standard receipt subject", new Set(["base", "pre", "post"]));
   const fence = exactObject(input.fence, "standard receipt fence", new Set([
-    "pipeline_instance_id", "graph_digest", "unit_id", "attempt_id", "request_hash",
+    "pipeline_instance_id", "graph_digest", "unit_id", "attempt_id",
+    "parent_run_id", "action_attempt_id", "generation", "native_session_id", "request_hash",
   ]));
   if (!SHA256.test(producer.capability_digest)) throw new Error("standard receipt capability digest is invalid");
+  const skillPackageDigest = nullable(producer.skill_package_digest, (entry) => {
+    if (typeof entry !== "string" || !SHA256.test(entry)) throw new Error("standard receipt skill package digest is invalid");
+    return entry;
+  });
   if (![subject.base, subject.pre, subject.post].every((entry) => typeof entry === "string" && GIT_SUBJECT.test(entry))) {
     throw new Error("standard receipt subject is invalid");
   }
   if (![fence.graph_digest, fence.request_hash].every((entry) => typeof entry === "string" && SHA256.test(entry))) {
     throw new Error("standard receipt fence digest is invalid");
   }
+  integer(fence.generation, "standard receipt fence generation", 1, 1_000_000);
+  const nativeSessionId = nullable(fence.native_session_id, (entry) =>
+    patternedText(entry, "standard receipt fence native session", NATIVE_SESSION_ID, env, 200));
   const evidence = boundedStrings(input.evidence, "standard receipt evidence", 32, 1_000, env);
   const issuedAt = boundedText(input.issued_at, "standard receipt issued_at", 64, env);
   if (Number.isNaN(Date.parse(issuedAt))) throw new Error("standard receipt issued_at is invalid");
@@ -351,8 +366,9 @@ export function validateStandardReceipt(value, env = process.env) {
     result: input.result,
     producer: {
       worker_id: boundedText(producer.worker_id, "standard receipt producer worker", 120, env),
-      skill: patternedText(producer.skill, "standard receipt producer skill", SKILL_REFERENCE, env, 240),
+      skill: patternedText(producer.skill, "standard receipt producer skill", SKILL_REFERENCE, env, 320),
       capability_digest: producer.capability_digest,
+      skill_package_digest: skillPackageDigest,
     },
     subject,
     fence: {
@@ -360,6 +376,10 @@ export function validateStandardReceipt(value, env = process.env) {
       graph_digest: fence.graph_digest,
       unit_id: boundedText(fence.unit_id, "standard receipt unit", 120, env),
       attempt_id: boundedText(fence.attempt_id, "standard receipt attempt", 160, env),
+      parent_run_id: boundedText(fence.parent_run_id, "standard receipt parent run", 160, env),
+      action_attempt_id: boundedText(fence.action_attempt_id, "standard receipt action attempt", 160, env),
+      generation: fence.generation,
+      native_session_id: nativeSessionId,
       request_hash: fence.request_hash,
     },
     evidence,

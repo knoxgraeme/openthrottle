@@ -8,7 +8,13 @@
 
 import { readFileSync, existsSync } from 'node:fs';
 import * as p from '@clack/prompts';
-import { getErrorMessage, readEnv, requireEnv, linearGraphQL } from './util.js';
+import { extractExecutionPlanBlocks, readExecutionPlanFromMarkdown, validateLocalGraphSelection, validatePlanFileForGraph, type LocalGraphSelection } from './plan.js';
+import { getErrorMessage, readEnv, requireEnv, linearGraphQL, supervisorRequest } from './util.js';
+
+export const SHIP_SELECTION_FENCE = "openthrottle.ship-selection/v1";
+export const STRUCTURED_SHIP_CAPABILITY = "graph/for-each-unit@1";
+export const STRUCTURED_SHIP_UNAVAILABLE =
+  "structured shipping is unavailable until graph/for-each-unit@1 is active on the configured supervisor";
 
 interface ParsedMarkdown {
   title: string;
@@ -45,12 +51,92 @@ export function parseShipArgs(args: string[]): { file?: string; graphId?: string
   return parsed;
 }
 
-export function validateGraphSelectionForShip(graphId?: string): void {
-  if (!graphId || graphId === "simple") return;
-  throw new Error(
-    `ship --graph ${graphId} cannot delegate correctly yet because graph selection is not persisted through admission; ` +
-      "omit --graph or use --graph simple."
-  );
+export function validateGraphSelectionForShip(
+  file: string,
+  graphId?: string
+): LocalGraphSelection | undefined {
+  const content = readFileSync(file, "utf8");
+  const blocks = extractExecutionPlanBlocks(content);
+  const plan = blocks.length > 0 ? readExecutionPlanFromMarkdown(content, file) : undefined;
+  if (!graphId && !existsSync(".openthrottle.yml")) {
+    if (plan) {
+      throw new Error(
+        `${file}: cannot validate execution_plan.graph_id ${plan.plan.value.graph_id} without .openthrottle.yml; run openthrottle init first`
+      );
+    }
+    return undefined;
+  }
+  const selectedGraphId = graphId ?? plan?.plan.value.graph_id;
+  const graph = validateLocalGraphSelection({ graphId: selectedGraphId });
+  if (graph.consumesUnits) {
+    validatePlanFileForGraph(file, { graphId: graph.graphId });
+    return graph;
+  }
+  if (plan && plan.plan.value.graph_id !== graph.graphId) {
+    throw new Error(`${file}: execution_plan.graph_id must match selected graph ${graph.graphId}`);
+  }
+  return graph;
+}
+
+interface SupervisorCapabilityResponse {
+  release?: unknown;
+  capabilityDigest?: unknown;
+  capabilities?: unknown;
+}
+
+// The pre-mutation capability check RU9 installs: an explicit structured
+// selection must reach out to the configured supervisor and see the exact
+// `graph/for-each-unit@1` capability advertised before any Linear access.
+// Unreachable, unauthenticated, missing, or malformed ("stale"/mismatched)
+// evidence fails closed here -- it must never silently fall back to `simple`.
+export async function assertStructuredShipAvailable(
+  graph: LocalGraphSelection | undefined,
+  request: typeof supervisorRequest = supervisorRequest
+): Promise<void> {
+  if (!graph?.consumesUnits) return;
+  let response: Response;
+  try {
+    response = await request('/capabilities');
+  } catch (err: unknown) {
+    throw new Error(
+      `${STRUCTURED_SHIP_UNAVAILABLE}; the configured supervisor was unreachable (${getErrorMessage(err)})`
+    );
+  }
+  if (!response.ok) {
+    throw new Error(
+      `${STRUCTURED_SHIP_UNAVAILABLE}; the configured supervisor rejected the capability check (HTTP ${response.status})`
+    );
+  }
+  let body: SupervisorCapabilityResponse;
+  try {
+    body = (await response.json()) as SupervisorCapabilityResponse;
+  } catch {
+    throw new Error(`${STRUCTURED_SHIP_UNAVAILABLE}; the configured supervisor returned a malformed capability response`);
+  }
+  const capabilities = body.capabilities;
+  if (
+    typeof body.release !== "string" || !body.release ||
+    typeof body.capabilityDigest !== "string" || !body.capabilityDigest ||
+    !Array.isArray(capabilities) || !capabilities.every((entry) => typeof entry === "string")
+  ) {
+    throw new Error(`${STRUCTURED_SHIP_UNAVAILABLE}; the configured supervisor returned a stale or malformed capability response`);
+  }
+  if (!capabilities.includes(STRUCTURED_SHIP_CAPABILITY)) {
+    throw new Error(`${STRUCTURED_SHIP_UNAVAILABLE}; selected graph ${graph.graphId} was validated but not shipped`);
+  }
+}
+
+function buildShipSelectionBlock(graphId: string): string {
+  return [
+    `\`\`\`json ${SHIP_SELECTION_FENCE}`,
+    JSON.stringify({ schema: SHIP_SELECTION_FENCE, graph_id: graphId }, null, 2),
+    "```",
+  ].join("\n");
+}
+
+export function buildShipDescription(body: string, graphId?: string): string {
+  if (!graphId) return body;
+  return `${body.trim()}\n\n${buildShipSelectionBlock(graphId)}`;
 }
 
 interface Team {
@@ -146,18 +232,21 @@ export default async function ship(args: string[] | string | undefined): Promise
 
   p.intro('openthrottle ship');
 
-  const apiKey = requireEnv('LINEAR_API_KEY', 'a plain Linear API key with issue-create access');
   const content = readFileSync(file, 'utf8');
 
   let title: string;
   let body: string;
   try {
     ({ title, body } = parseMarkdown(content));
-    validateGraphSelectionForShip(parsed.graphId);
+    const graph = validateGraphSelectionForShip(file, parsed.graphId);
+    await assertStructuredShipAvailable(graph);
+    body = buildShipDescription(body, parsed.graphId);
   } catch (err: unknown) {
     p.log.error(getErrorMessage(err));
     process.exit(1);
   }
+
+  const apiKey = requireEnv('LINEAR_API_KEY', 'a plain Linear API key with issue-create access');
 
   p.log.info(`Title: ${title}`);
 

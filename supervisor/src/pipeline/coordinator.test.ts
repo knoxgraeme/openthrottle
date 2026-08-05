@@ -39,7 +39,7 @@ describe("pipeline coordinator", () => {
     );
     pipelines.acceptRuntimeDescriptor(runtime);
     pipelines.acceptCatalog(catalog);
-    const config = parseRepositoryConfig("pipelines: { implement: fixture-command }\n");
+    const config = parseRepositoryConfig("schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]\npipelines: { implement: fixture-command }\n");
     const snapshot = pipelines.saveRepositoryConfigSnapshot({
       repository: "owner/repo",
       baseCommit: "a".repeat(40),
@@ -376,12 +376,15 @@ describe("pipeline coordinator", () => {
 
   it("attributes structured ledger publication projections to the supervisor", () => {
     const { pipelines, instance, attempt } = setup("core/implement@4");
+    if (!attempt.planned_run_id) {
+      throw new Error("expected active attempt to have a planned run id");
+    }
     const unitStore = pipelines as typeof pipelines & ExecutionUnitStore;
     unitStore.createGraph({
       pipelineInstanceId: instance.id,
       parentAttemptId: attempt.id,
       parentStageId: attempt.stage_id,
-      parentRunId: "run-parent",
+      parentRunId: attempt.planned_run_id,
       graphDigest: "graph-digest",
       planDigest: "plan-digest",
       units: [{ id: "U1" }],

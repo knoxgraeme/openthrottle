@@ -7,6 +7,13 @@ import { pathToFileURL } from "node:url";
 export const STAGE_EXECUTOR_PROTOCOL = "stage-executor@1";
 
 export const CAPABILITY_CONTRACTS = Object.freeze({
+  "agent/repository-skill@1": {
+    kind: "agent",
+    minimumCredentials: ["model.invoke", "repo.read"],
+    allowedCredentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+    contexts: ["fresh", "resume_required", "prefer_resume"],
+    artifacts: ["stage_result", "review"],
+  },
   "agent/semantic@1": {
     kind: "agent",
     minimumCredentials: ["model.invoke", "repo.read"],
@@ -63,7 +70,7 @@ export const CAPABILITY_CONTRACTS = Object.freeze({
     contexts: ["none"],
     artifacts: ["stage_result", "command_result"],
   },
-  "loop-action@1": {
+  "loop-action@2": {
     kind: "loop_action",
     minimumCredentials: ["model.invoke", "repo.read"],
     allowedCredentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
@@ -81,7 +88,7 @@ export const CAPABILITY_CONTRACTS = Object.freeze({
 
 export const RUNTIME_DESCRIPTOR = Object.freeze({
   schema: "openthrottle.runtime-capabilities/v1",
-  release: "openthrottle-snapshot/v6",
+  release: "openthrottle-snapshot/v8",
   generatedBy: "sandbox-runtime-build",
   protocol: STAGE_EXECUTOR_PROTOCOL,
   capabilities: Object.keys(CAPABILITY_CONTRACTS).sort(),

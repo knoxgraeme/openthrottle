@@ -94,12 +94,15 @@ describe("pipeline instance store", () => {
     tickets.upsert({ ...ticket("session-old", "shared-issue"), pipeline });
     const oldInstance = pipelines.getInstanceForSession("session-old")!;
     const oldAttempt = pipelines.getActiveAttempt(oldInstance.id)!;
+    if (!oldAttempt.planned_run_id) {
+      throw new Error("expected active attempt to have a planned run id");
+    }
     const unitStore = pipelines as typeof pipelines & ExecutionUnitStore;
     unitStore.createGraph({
       pipelineInstanceId: oldInstance.id,
       parentAttemptId: oldAttempt.id,
       parentStageId: oldAttempt.stage_id,
-      parentRunId: "run-old",
+      parentRunId: oldAttempt.planned_run_id,
       graphDigest: "graph-digest",
       planDigest: "plan-digest",
       units: [{ id: "U1" }],
@@ -253,7 +256,7 @@ describe("pipeline instance store", () => {
     const catalog = loadPipelineCatalog(catalogPath, runtime.descriptor);
     pipelines.acceptRuntimeDescriptor(runtime);
     pipelines.acceptCatalog(catalog);
-    const config = parseRepositoryConfig("pipelines: { implement: fixture-command }\n");
+    const config = parseRepositoryConfig("schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]\npipelines: { implement: fixture-command }\n");
     const snapshot = pipelines.saveRepositoryConfigSnapshot({
       repository: "owner/repo",
       baseCommit: "a".repeat(40),
