@@ -263,6 +263,17 @@ function nextAttemptFor(input: PipelineReductionInput, stage: PipelineStage, ree
     input.instance.id, stage.id, attemptOrdinal, reentryOrdinal,
   ])).slice(0, 32)}`;
   const plannedRunId = plannedStageRunId(id);
+  // Contextless results cannot mint a native session. Their attempt retains
+  // the prior lineage for a later resumable stage without exposing it.
+  const carriedNativeSessionId = input.attempt.native_context_policy === "none"
+    ? input.attempt.native_session_id
+    : input.event.nativeSessionId ?? input.attempt.native_session_id;
+  const nativeSessionId = stage.context === "fresh"
+    ? null
+    : carriedNativeSessionId;
+  const requestNativeSessionId = stage.context === "resume_required" || stage.context === "prefer_resume"
+    ? nativeSessionId
+    : null;
   if (!input.attempt.request_payload) throw new Error(`pipeline attempt ${input.attempt.id} has no sealed request`);
   const priorRequest = JSON.parse(input.attempt.request_payload) as { taskContext?: unknown };
   const taskContext = typeof priorRequest.taskContext === "string" ? priorRequest.taskContext : "";
@@ -288,7 +299,7 @@ function nextAttemptFor(input: PipelineReductionInput, stage: PipelineStage, ree
     agent: input.instance.agent,
     contextRevision: input.attempt.context_revision + 1,
     expectedSubject: input.event.subject ?? null,
-    nativeSessionId: input.event.nativeSessionId ?? null,
+    nativeSessionId: requestNativeSessionId,
   });
   return {
     id,
@@ -301,7 +312,7 @@ function nextAttemptFor(input: PipelineReductionInput, stage: PipelineStage, ree
     contextPolicy: stage.context,
     plannedRunId,
     expectedSubject: input.event.subject ?? null,
-    nativeSessionId: input.event.nativeSessionId ?? null,
+    nativeSessionId,
     requestPayload: canonicalJson(request),
   };
 }

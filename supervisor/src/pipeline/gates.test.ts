@@ -649,6 +649,46 @@ describe("deterministic supervisor stage gates", () => {
     })).toMatchObject({ state_version: transitioned!.state_version });
   });
 
+  it("accepts contextless stage evidence while retaining durable native session lineage", () => {
+    const fixture = setup("fixture/command@1");
+    fixture.db.prepare(`
+      UPDATE pipeline_stage_attempts SET native_session_id = ? WHERE id = ?
+    `).run("native-session-lineage", fixture.attempt.id);
+    const contextlessFixture = currentStageFixture(fixture);
+    const input = event(contextlessFixture, "success", {
+      details: { not_configured: false, timed_out: false, exit_code: 0, signal: null },
+    });
+
+    const evaluated = evaluateStageGate(contextlessFixture.pipelines, input);
+    expect(evaluated.event).toMatchObject({ attemptId: contextlessFixture.attempt.id });
+    expect(evaluated.event.nativeSessionId).toBeUndefined();
+  });
+
+  it("does not carry a prior native session into a fresh-stage infrastructure retry", () => {
+    const fixture = setup("core/implement@4");
+    fixture.db.prepare(`
+      UPDATE pipeline_stage_attempts SET native_session_id = ? WHERE id = ?
+    `).run("native-session-before-retry", fixture.attempt.id);
+
+    const transitioned = processPipelineInfrastructureFailure({
+      store: fixture.pipelines,
+      runId: fixture.attempt.planned_run_id!,
+    });
+
+    expect(transitioned).toMatchObject({ status: "dispatchable", active_stage_id: "implementation" });
+    const nextAttempt = fixture.pipelines.getActiveAttempt(fixture.instance.id)!;
+    expect(nextAttempt).toMatchObject({
+      stage_id: "implementation",
+      native_context_policy: "fresh",
+      native_session_id: null,
+      reentry_ordinal: 1,
+    });
+    expect(fixture.pipelines.getStageRequest(nextAttempt.id)).toMatchObject({
+      contextPolicy: "fresh",
+      nativeSessionId: null,
+    });
+  });
+
   it("pins the exact provider commit when the agent-backed publish gate passes", () => {
     const fixture = setup("core/implement@4");
     const stage = fixture.manifest.stages.find((candidate) => candidate.id === "publish")!;

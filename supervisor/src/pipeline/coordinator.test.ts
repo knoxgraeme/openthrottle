@@ -435,6 +435,135 @@ describe("pipeline coordinator", () => {
     });
   });
 
+  it.each([
+    ["fixture/agent@1", "success", "resume", "resume_required", "native-session-before-transition", "native-session-before-transition"],
+    ["core/investigate@1", "retryable_infrastructure_failure", "investigate", "prefer_resume", "native-session-before-transition", "native-session-before-transition"],
+    ["core/implement@4", "retryable_infrastructure_failure", "implementation", "fresh", null, null],
+    ["fixture/command@1", "retryable_infrastructure_failure", "command", "none", "native-session-before-transition", null],
+  ] as const)(
+    "applies the target context policy for %s when carrying a native session",
+    (manifestKey, outcome, expectedStageId, expectedPolicy, expectedLineageId, expectedRequestSessionId) => {
+      const { manifest, instance, attempt, stages } = setup(manifestKey);
+      const currentAttempt = expectedPolicy === "none"
+        ? { ...attempt, native_session_id: "native-session-before-transition" }
+        : attempt;
+      const write = reducePipelineEvent({
+        manifest,
+        instance,
+        attempt: currentAttempt,
+        stages,
+        event: {
+          ...event(
+            instance,
+            currentAttempt,
+            outcome,
+            `session-policy-${expectedPolicy}`,
+            manifestKey === "core/investigate@1" ? ["stage_result", "review"] : ["stage_result"]
+          ),
+          nativeSessionId: expectedPolicy === "none" ? null : "native-session-before-transition",
+        },
+      });
+
+      expect(write.nextAttempt).toMatchObject({
+        stageId: expectedStageId,
+        contextPolicy: expectedPolicy,
+        nativeSessionId: expectedLineageId,
+      });
+      expect(JSON.parse(write.nextAttempt!.requestPayload)).toMatchObject({
+        contextPolicy: expectedPolicy,
+        nativeSessionId: expectedRequestSessionId,
+      });
+    }
+  );
+
+  it("preserves agent session lineage through command stages into resume-required publish", () => {
+    const { manifest, instance, attempt, stages } = setup("core/implement@4");
+    const nativeSessionId = "native-session-before-commands";
+    let currentInstance: PipelineInstance = {
+      ...instance,
+      status: "running",
+      active_stage_id: "post_simplify_review",
+    };
+    let currentAttempt: PipelineStageAttempt = {
+      ...attempt,
+      stage_id: "post_simplify_review",
+      native_context_policy: "resume_required",
+      native_session_id: nativeSessionId,
+      request_hash: digestNormalized("post-simplify-review-request"),
+    };
+
+    for (const expectedStageId of ["test", "lint", "build", "publish"]) {
+      const currentStage = manifest.stages.find((stage) => stage.id === currentAttempt.stage_id)!;
+      const artifactKinds = [...new Set(["stage_result", ...currentStage.evaluator.required_artifacts])];
+      const artifacts = artifactKinds.map((kind) => {
+        const payload = JSON.stringify({ stage: currentStage.id, kind, outcome: "success" });
+        return {
+          kind,
+          schemaVersion: 1,
+          assurance: currentStage.evaluator.assurance,
+          payload,
+          hash: digestNormalized(payload),
+        };
+      });
+      const stageResult = artifacts.find((artifact) => artifact.kind === "stage_result")!;
+      const write = reducePipelineEvent({
+        manifest,
+        instance: currentInstance,
+        attempt: currentAttempt,
+        stages,
+        event: {
+          id: `session-lineage-${currentStage.id}`,
+          kind: "stage_result",
+          instanceId: currentInstance.id,
+          generation: currentInstance.generation,
+          attemptId: currentAttempt.id,
+          requestHash: currentAttempt.request_hash,
+          outcome: "success",
+          resultHash: stageResult.hash,
+          nativeSessionId: currentStage.context === "none" ? null : nativeSessionId,
+          artifacts,
+        },
+      });
+      const nextAttempt = write.nextAttempt!;
+      const request = JSON.parse(nextAttempt.requestPayload);
+
+      expect(nextAttempt).toMatchObject({
+        stageId: expectedStageId,
+        nativeSessionId,
+      });
+      expect(request).toMatchObject({
+        contextPolicy: expectedStageId === "publish" ? "resume_required" : "none",
+        nativeSessionId: expectedStageId === "publish" ? nativeSessionId : null,
+      });
+
+      currentInstance = {
+        ...currentInstance,
+        active_stage_id: nextAttempt.stageId,
+        attempt_count: currentInstance.attempt_count + 1,
+        state_version: currentInstance.state_version + 1,
+      };
+      currentAttempt = {
+        ...currentAttempt,
+        id: nextAttempt.id!,
+        stage_id: nextAttempt.stageId,
+        attempt_ordinal: nextAttempt.attemptOrdinal,
+        reentry_ordinal: nextAttempt.reentryOrdinal,
+        run_id: nextAttempt.plannedRunId,
+        planned_run_id: nextAttempt.plannedRunId,
+        expected_subject: nextAttempt.expectedSubject,
+        native_session_id: nextAttempt.nativeSessionId,
+        request_payload: nextAttempt.requestPayload,
+        request_hash: nextAttempt.requestHash,
+        idempotency_key: nextAttempt.idempotencyKey,
+        context_revision: nextAttempt.contextRevision,
+        native_context_policy: nextAttempt.contextPolicy,
+        status: "running",
+        outcome: null,
+        result_hash: null,
+      };
+    }
+  });
+
   it("rolls back every transition write boundary and recovers one complete intent set", () => {
     const { pipelines, instance, attempt } = setup();
     const input = event(instance, attempt, "success", "fault-event");
@@ -757,12 +886,14 @@ describe("pipeline coordinator", () => {
 
   it("idles the sandbox when a publish transition enters provider wait", () => {
     const { manifest, instance, attempt, stages } = setup("core/implement@4");
+    const nativeSessionId = "native-session-before-provider-wait";
     const publishAttempt = {
       ...attempt,
       id: "publish-attempt",
       stage_id: "publish",
       request_hash: "f".repeat(64),
       native_context_policy: "resume_required",
+      native_session_id: nativeSessionId,
     };
     const subject = "c".repeat(40);
     const payload = JSON.stringify({ outcome: "success" });
@@ -785,6 +916,7 @@ describe("pipeline coordinator", () => {
         resultHash: digestNormalized(payload),
         subject,
         providerRevision: subject,
+        nativeSessionId,
         artifacts: [
           {
             kind: "stage_result",
@@ -808,6 +940,13 @@ describe("pipeline coordinator", () => {
 
     expect(write.nextStatus).toBe("waiting_provider");
     expect(write.nextStageId).toBe("provider");
+    expect(write.nextAttempt).toMatchObject({
+      nativeSessionId,
+    });
+    expect(JSON.parse(write.nextAttempt!.requestPayload)).toMatchObject({
+      contextPolicy: "none",
+      nativeSessionId: null,
+    });
     expect(write.effects.map((effect) => effect.kind)).toEqual(["publish_linear", "idle"]);
     expect(write.effects.find((effect) => effect.kind === "idle")).toMatchObject({
       idempotencyKey: `idle:${instance.id}:provider:${write.nextAttempt!.id}`,
@@ -816,12 +955,14 @@ describe("pipeline coordinator", () => {
 
   it("turns a current-head provider snapshot into a bounded typed repair re-entry", () => {
     const { manifest, instance, attempt, stages } = setup("core/implement@4");
+    const nativeSessionId = "native-session-before-provider-repair";
     const providerAttempt = {
       ...attempt,
       id: "provider-attempt",
       stage_id: "provider",
       request_hash: "e".repeat(64),
       native_context_policy: "none",
+      native_session_id: nativeSessionId,
     };
     const stageResult = JSON.stringify({ outcome: "semantic_repair_required" });
     const providerCheck = JSON.stringify({ head: "head-current", conclusion: "failure" });
@@ -846,6 +987,7 @@ describe("pipeline coordinator", () => {
         outcome: "semantic_repair_required",
         resultHash,
         subject: "head-current",
+        nativeSessionId: null,
         artifacts: [
           {
             kind: "stage_result",
@@ -869,6 +1011,14 @@ describe("pipeline coordinator", () => {
     expect(write.nextStageId).toBe("repair_implementation");
     expect(write.nextStatus).toBe("dispatchable");
     expect(write.reentryIncrement).toBe(1);
+    expect(write.nextAttempt).toMatchObject({
+      contextPolicy: "resume_required",
+      nativeSessionId,
+    });
+    expect(JSON.parse(write.nextAttempt!.requestPayload)).toMatchObject({
+      contextPolicy: "resume_required",
+      nativeSessionId,
+    });
   });
 
   it("rejects stale generation, request, subject, and provider-state re-entry", () => {
