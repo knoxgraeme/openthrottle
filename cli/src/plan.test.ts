@@ -629,6 +629,13 @@ describe("plan validation", () => {
     writeFileSync(join(directory, ".openthrottle.yml"), stringify(baseConfig));
     writeFileSync(join(directory, ".openthrottle", "graphs", "structured.json"), JSON.stringify(graph));
     expect(() => validateLocalGraphSelection({ directory })).toThrow(/must be one of: test, lint, build, format/);
+
+    baseConfig.commands = { test: "npm test" };
+    graph.nodes[2]!.command = "test";
+    graph.workers[1]!.credentials = ["repo.read", "repo.write", "model.invoke"];
+    writeFileSync(join(directory, ".openthrottle.yml"), stringify(baseConfig));
+    writeFileSync(join(directory, ".openthrottle", "graphs", "structured.json"), JSON.stringify(graph));
+    expect(() => validateLocalGraphSelection({ directory })).toThrow(/gate phases cannot request repo\.write/);
   });
 
   it("requires the execution block to match the selected graph", () => {

@@ -39,6 +39,7 @@ const invalidCases = [
   ["graph-unknown-loop.json", /nodes\.implement\.phases\[0\]\.loop: references an unknown loop/],
   ["graph-unbounded-cycle.json", /transitions\.success: creates an unbounded cycle/],
   ["graph-excess-bounds.json", /max_parallel: must be an integer between 1 and 1/],
+  ["graph-gate-worker-repo-write.json", /nodes\.implement\.phases\[3\]\.worker\.credentials: gate phases cannot request repo\.write/],
   ["graph-internal-node-kind.json", /nodes\[0\]\.kind: must be one of/],
   ["graph-duplicate-integrate-phase.json", /nodes\.implement\.phases: must not contain duplicate phase IDs/],
   ["graph-integrate-not-last-phase.json", /nodes\.implement\.phases\[3\]: integrate must be the last unit phase/],
@@ -195,6 +196,15 @@ describe("Stage C contract fixtures", () => {
     graph.workers[0]!.skills = ["repo://missing"];
     expect(() => parseGraphContract(JSON.stringify(graph), { source: "graph", config: parsedConfig.value }))
       .toThrow(/workers\.implementer\.skills: references an undeclared repository skill/);
+
+    graph.workers[0]!.skills = ["builtin://implement-unit@1"];
+    graph.loops[0]!.skill = "builtin://implement-unit@1";
+    graph.workers[1]!.skills = ["repo://accept_unit"];
+    graph.loops[1]!.skill = "repo://accept_unit";
+    config.skills = [{ id: "accept_unit", path: ".agents/skills/accept-unit" }];
+    const parsedGateConfig = parseRepositoryConfigContract(JSON.stringify(config), { source: "config" });
+    expect(() => parseGraphContract(JSON.stringify(graph), { source: "graph", config: parsedGateConfig.value }))
+      .not.toThrow();
 
     config.skills = [{ id: "bad", path: "../skills/bad" }];
     expect(() => parseRepositoryConfigContract(JSON.stringify(config), { source: "config" }))

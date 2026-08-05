@@ -428,7 +428,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     const timestamp = now();
     const graphId = deterministicId("execution-graph", [input.pipelineInstanceId, input.parentAttemptId]);
     const phaseProjection = unitPhaseProjection(input);
-    if (phaseProjection.unitPhases.length > 0) assertValidUnitPhaseSequence(phaseProjection.unitPhases);
+    assertValidUnitPhaseSequence(phaseProjection.unitPhases);
     const existing = graphStmt.get(input.parentAttemptId) as ExecutionUnitGraph | undefined;
     if (existing) {
       assertGraphReplayMatches(input, existing, phaseProjection);
@@ -691,13 +691,11 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
             WHERE id = ?
           `).run(next, input.decision.subject, timestamp, unitRow.id);
         } else if (routing.action === "repair") {
-          const repairPhase = phases.find((phase) => phase === "implement");
-          if (!repairPhase) throw new Error(`execution graph ${graph.id} repair phase is missing implement`);
           db.prepare(`
             UPDATE execution_units
             SET phase = ?, current_cycle = current_cycle + 1, command_index = 0, repair_rounds = ?, updated_at = ?
             WHERE id = ?
-          `).run(repairPhase, routing.repairRounds, timestamp, unitRow.id);
+          `).run("implement", routing.repairRounds, timestamp, unitRow.id);
         } else if (routing.action === "settle") {
           settleUnitRow({ parentAttemptId: completedAction.parent_attempt_id, unitId: unitRow.unit_id, reason: "defect", timestamp });
           settleStructurallyBlockedDependents(completedAction.parent_attempt_id, timestamp);

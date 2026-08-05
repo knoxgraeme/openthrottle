@@ -339,7 +339,7 @@ describe("execution graph compiler", () => {
   it("rejects gate phases whose worker requests write credentials", () => {
     expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
       leadWorker: { credentials: ["model.invoke", "repo.read", "repo.write"] },
-    }))).toThrow(/graph\.nodes\.units\.phases\.2\.worker\.credentials: gate phases cannot request repo\.write/);
+    }))).toThrow(/graph\.nodes\.units\.phases\[2\]\.worker\.credentials: gate phases cannot request repo\.write/);
   });
 
   it("rejects gate phases whose capability requires write credentials", () => {
@@ -349,7 +349,7 @@ describe("execution graph compiler", () => {
         credentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
       },
       leadLoop: { skill: "builtin://ce/implement@1" },
-    }))).toThrow(/graph\.nodes\.units\.phases\.2\.worker\.credentials: gate phases cannot request repo\.write/);
+    }))).toThrow(/graph\.nodes\.units\.phases\[2\]\.worker\.credentials: gate phases cannot request repo\.write/);
 
     expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
       leadWorker: {
@@ -434,6 +434,9 @@ describe("execution graph compiler", () => {
     [
       "for_each_unit nodes",
       minimalGraph({
+        worker: {
+          credentials: ["model.invoke", "repo.read"],
+        },
         node: {
           kind: "for_each_unit",
           loop: undefined,
