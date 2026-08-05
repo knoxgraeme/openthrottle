@@ -299,8 +299,15 @@ function validateFence(
     throw new Error(`artifact ${artifact.kind} input subject fence mismatch`);
   }
   // A contextless attempt may retain lineage that is intentionally absent
-  // from its request and result; resumable policies still fence exact identity.
-  if ((stage.context === "none" && payload.run.native_session_id !== null) ||
+  // from its request and result. During a rolling deploy, an already-sealed
+  // legacy request may still carry that session, so accept a reported value
+  // only when it is bound to the sealed request. Resumable policies continue
+  // to fence against the attempt's durable session identity.
+  const sealedRequestNativeSessionId = stage.context === "none" && attempt.request_payload !== null
+    ? (JSON.parse(attempt.request_payload) as { nativeSessionId?: unknown }).nativeSessionId
+    : null;
+  if ((stage.context === "none" && payload.run.native_session_id !== null &&
+        payload.run.native_session_id !== sealedRequestNativeSessionId) ||
       (stage.context !== "none" && attempt.native_session_id !== null &&
         payload.run.native_session_id !== attempt.native_session_id)) {
     throw new Error(`artifact ${artifact.kind} native session fence mismatch`);
