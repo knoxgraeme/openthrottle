@@ -30,6 +30,14 @@ import {
   unitPhaseBindingCommandNames,
   unitPhaseBindingIds,
 } from "./manifest.js";
+import {
+  FOR_EACH_UNIT_CAPABILITY,
+  REPOSITORY_SKILL_CAPABILITY,
+  capabilityCredentialContract,
+  capabilityRequiresCredential,
+} from "./capability-contracts.js";
+
+export { FOR_EACH_UNIT_CAPABILITY, REPOSITORY_SKILL_CAPABILITY } from "./capability-contracts.js";
 
 export interface CompileExecutionGraphOptions {
   id?: string;
@@ -50,9 +58,6 @@ export interface CompiledExecutionGraph {
   unitPhaseBindings: readonly PipelineUnitPhaseBinding[];
   manifest: ValidatedPipelineManifest;
 }
-
-export const FOR_EACH_UNIT_CAPABILITY = "graph/for-each-unit@1";
-export const REPOSITORY_SKILL_CAPABILITY = "agent/repository-skill@1";
 
 type StageTemplate = {
   executor: { kind: ExecutorKind; capability: string };
@@ -84,50 +89,6 @@ const DEFAULT_TERMINALS: Pick<Record<StageOutcome, PipelineTransition>, "needs_h
   needs_human: { terminal: "needs_human" },
   canceled: { terminal: "canceled" },
   superseded: { terminal: "superseded" },
-};
-
-const CAPABILITY_CREDENTIALS: Record<string, {
-  minimum: readonly string[];
-  allowed: readonly string[];
-  contexts: readonly ContextPolicy[];
-  artifacts: readonly ArtifactKind[];
-}> = {
-  "ce/implement@1": {
-    minimum: ["model.invoke", "provider.read", "repo.read", "repo.write"],
-    allowed: ["model.invoke", "provider.read", "repo.read", "repo.write"],
-    contexts: ["fresh", "resume_required", "prefer_resume"],
-    artifacts: ["stage_result", "review"],
-  },
-  "ce/investigate@1": {
-    minimum: ["model.invoke", "provider.read", "repo.read", "repo.write"],
-    allowed: ["model.invoke", "provider.read", "repo.read", "repo.write"],
-    contexts: ["fresh", "resume_required", "prefer_resume"],
-    artifacts: ["stage_result", "review"],
-  },
-  "ce/review@1": {
-    minimum: ["model.invoke", "repo.read"],
-    allowed: ["model.invoke", "repo.read", "repo.write"],
-    contexts: ["fresh", "resume_required", "prefer_resume"],
-    artifacts: ["stage_result", "review"],
-  },
-  "ce/simplify@1": {
-    minimum: ["model.invoke", "repo.read"],
-    allowed: ["model.invoke", "repo.read", "repo.write"],
-    contexts: ["resume_required", "prefer_resume"],
-    artifacts: ["stage_result"],
-  },
-  [FOR_EACH_UNIT_CAPABILITY]: {
-    minimum: ["repo.read", "repo.write"],
-    allowed: ["repo.read", "repo.write", "provider.read"],
-    contexts: ["none"],
-    artifacts: ["stage_result", "execution_graph_result"],
-  },
-  [REPOSITORY_SKILL_CAPABILITY]: {
-    minimum: ["model.invoke", "repo.read"],
-    allowed: ["model.invoke", "provider.read", "repo.read", "repo.write", "mcp"],
-    contexts: ["fresh", "resume_required", "prefer_resume"],
-    artifacts: ["stage_result", "review"],
-  },
 };
 
 function fail(path: string, message: string): never {
@@ -202,7 +163,7 @@ function assertNoDependencies(node: GraphNode): void {
 }
 
 function assertCapabilityAuthorized(template: StageTemplate, path: string): void {
-  const contract = CAPABILITY_CREDENTIALS[template.executor.capability];
+  const contract = capabilityCredentialContract(template.executor.capability);
   if (!contract) return;
   if (!contract.contexts.includes(template.context)) {
     fail(path, `${template.executor.capability} does not support context policy ${template.context}`);
@@ -234,8 +195,7 @@ function assertGateReadOnly(
   if (worker.credentials.includes("repo.write")) {
     fail(`${path}.worker.credentials`, "gate phases cannot request repo.write");
   }
-  const contract = CAPABILITY_CREDENTIALS[capability];
-  if (contract?.minimum.includes("repo.write")) {
+  if (capabilityRequiresCredential(capability, "repo.write")) {
     fail(`${path}.skill`, `${capability} requires repo.write and cannot be used for gate phases`);
   }
 }
@@ -390,7 +350,7 @@ function forEachUnitTemplate(
   });
   const credentialScopes = unitPhaseBindings.flatMap((binding) =>
     binding.kind === "agent" || binding.kind === "gate" ? binding.worker.credentials : []);
-  const allowedCredentials = new Set(CAPABILITY_CREDENTIALS[FOR_EACH_UNIT_CAPABILITY].allowed);
+  const allowedCredentials = new Set(capabilityCredentialContract(FOR_EACH_UNIT_CAPABILITY)!.allowed);
   const unitCommandNames = unitPhaseBindingCommandNames(unitPhaseBindings);
   const template: StageTemplate = {
     executor: { kind: "loop_action", capability: FOR_EACH_UNIT_CAPABILITY },

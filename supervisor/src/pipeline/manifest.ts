@@ -12,6 +12,11 @@ import {
   type GraphUnitPhaseId,
 } from "@openthrottle/contracts";
 import { parseDocument } from "yaml";
+import {
+  FOR_EACH_UNIT_CAPABILITY,
+  REPOSITORY_SKILL_CAPABILITY,
+  capabilityRequiresCredential,
+} from "./capability-contracts.js";
 
 export const STAGE_OUTCOMES = [
   "success",
@@ -358,6 +363,10 @@ function validateUnitPhaseBindings(
   }
   for (const [index, binding] of bindings.entries()) {
     if (binding.kind !== "agent" && binding.kind !== "gate") continue;
+    const expectedCapability = capabilityForUnitPhaseBindingSkill(binding, `${path}[${index}]`);
+    if (binding.executor.capability !== expectedCapability) {
+      fail(`${path}[${index}].executor.capability`, "must match loop.skill");
+    }
     const canonicalContext = contextForWorkerSessionScope(binding.worker.session_scope);
     if (binding.context !== canonicalContext) {
       fail(`${path}[${index}].context`, "must match worker.session_scope");
@@ -369,11 +378,40 @@ function validateUnitPhaseBindings(
       if (binding.worker.credentials.includes("repo.write")) {
         fail(`${path}[${index}].worker.credentials`, "gate phase bindings cannot request repo.write");
       }
+      if (capabilityRequiresCredential(binding.executor.capability, "repo.write")) {
+        fail(
+          `${path}[${index}].executor.capability`,
+          `${binding.executor.capability} requires repo.write and cannot be used for gate phase bindings`
+        );
+      }
     }
     if (canonicalJson(binding.credentials) !== canonicalJson(binding.worker.credentials)) {
       fail(`${path}[${index}].credentials`, "must match worker.credentials");
     }
   }
+}
+
+function capabilityForUnitPhaseBindingSkill(
+  binding: PipelineUnitAgentPhaseBinding,
+  path: string
+): string {
+  if (binding.loop.skill.startsWith("builtin://")) {
+    if (binding.repositorySkill) {
+      fail(`${path}.repositorySkill`, "is allowed only for repo:// loop skills");
+    }
+    return binding.loop.skill.slice("builtin://".length);
+  }
+  if (binding.loop.skill.startsWith("repo://")) {
+    const invocation = binding.loop.skill.slice("repo://".length);
+    if (!binding.repositorySkill) {
+      fail(`${path}.repositorySkill`, "is required for repo:// loop skills");
+    }
+    if (binding.repositorySkill.invocation !== invocation) {
+      fail(`${path}.repositorySkill.invocation`, "must match loop.skill");
+    }
+    return REPOSITORY_SKILL_CAPABILITY;
+  }
+  fail(`${path}.loop.skill`, "must be a builtin or repository skill reference");
 }
 
 function parseYaml(raw: string, source: string): unknown {
@@ -552,11 +590,11 @@ function parseStage(
     fail(`${path}.commandName`, "is allowed only for command executors");
   }
   if (stage.repositorySkill) {
-    if (stage.executor.kind !== "agent" || stage.executor.capability !== "agent/repository-skill@1") {
+    if (stage.executor.kind !== "agent" || stage.executor.capability !== REPOSITORY_SKILL_CAPABILITY) {
       fail(`${path}.repositorySkill`, "is allowed only for agent/repository-skill@1 stages");
     }
   }
-  const isForEachUnitStage = stage.executor.kind === "loop_action" && stage.executor.capability === "graph/for-each-unit@1";
+  const isForEachUnitStage = stage.executor.kind === "loop_action" && stage.executor.capability === FOR_EACH_UNIT_CAPABILITY;
   if (stage.unitPhases || stage.unitCommandNames || stage.unitPhaseBindings) {
     if (!isForEachUnitStage) fail(`${path}.unitPhases`, "unit phase metadata is allowed only for graph/for-each-unit@1 stages");
   }

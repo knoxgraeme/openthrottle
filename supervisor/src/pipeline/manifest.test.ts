@@ -104,6 +104,22 @@ function unitPhaseBindings(): unknown[] {
   ];
 }
 
+function repositorySkillPackage(): Record<string, unknown> {
+  return {
+    schema: "openthrottle.repository-skill-package/v1",
+    reference: `repo://owner/repo@${"a".repeat(40)}#.agents/skills/lead`,
+    invocation: "lead",
+    directory: ".agents/skills/lead",
+    commit: "a".repeat(40),
+    packageDigest: "b".repeat(64),
+    files: [{
+      path: ".agents/skills/lead/SKILL.md",
+      blobSha: "c".repeat(40),
+      digest: "d".repeat(64),
+    }],
+  };
+}
+
 const CORE_IMPLEMENT_V4_STAGE_IDS = [
   "implementation",
   "repair_implementation",
@@ -562,6 +578,59 @@ describe("pipeline manifest validation", () => {
     (writeGateWorkerBinding.worker as Record<string, unknown>).credentials = ["model.invoke", "repo.read", "repo.write"];
     expect(() => validatePipelineManifest(writeGateWorker))
       .toThrow(/unitPhaseBindings\[2\]\.worker\.credentials: gate phase bindings cannot request repo\.write/);
+
+    const writeMinimumCapability = structuredClone(value) as Record<string, unknown>;
+    const writeMinimumCapabilityBinding =
+      (firstStage(writeMinimumCapability).unitPhaseBindings as Array<Record<string, unknown>>)[2]!;
+    (writeMinimumCapabilityBinding.loop as Record<string, unknown>).skill = "builtin://ce/implement@1";
+    writeMinimumCapabilityBinding.executor = { kind: "agent", capability: "ce/implement@1" };
+    expect(() => validatePipelineManifest(writeMinimumCapability))
+      .toThrow(/unitPhaseBindings\[2\]\.executor\.capability: ce\/implement@1 requires repo\.write and cannot be used for gate phase bindings/);
+
+    const missingFromOriginalSupervisorContract = structuredClone(value) as Record<string, unknown>;
+    (missingFromOriginalSupervisorContract.requires as { capabilities: string[] }).capabilities = [
+      ...UNIT_PHASE_RUNTIME_CAPABILITIES,
+      "ce/publish@1",
+    ];
+    const publishBinding =
+      (firstStage(missingFromOriginalSupervisorContract).unitPhaseBindings as Array<Record<string, unknown>>)[2]!;
+    (publishBinding.loop as Record<string, unknown>).skill = "builtin://ce/publish@1";
+    publishBinding.executor = { kind: "agent", capability: "ce/publish@1" };
+    expect(() => validatePipelineManifest(missingFromOriginalSupervisorContract))
+      .toThrow(/unitPhaseBindings\[2\]\.executor\.capability: ce\/publish@1 requires repo\.write and cannot be used for gate phase bindings/);
+
+    const mismatchedSkillCapability = structuredClone(value) as Record<string, unknown>;
+    const mismatchedSkillCapabilityBinding =
+      (firstStage(mismatchedSkillCapability).unitPhaseBindings as Array<Record<string, unknown>>)[2]!;
+    mismatchedSkillCapabilityBinding.executor = { kind: "agent", capability: "ce/implement@1" };
+    expect(() => validatePipelineManifest(mismatchedSkillCapability))
+      .toThrow(/unitPhaseBindings\[2\]\.executor\.capability: must match loop\.skill/);
+
+    const readOnlyBuiltinCapability = structuredClone(value) as Record<string, unknown>;
+    expect(validatePipelineManifest(readOnlyBuiltinCapability).manifest.stages[0]?.unitPhaseBindings?.[2])
+      .toMatchObject({
+        kind: "gate",
+        executor: { kind: "agent", capability: "ce/review@1" },
+        credentials: ["model.invoke", "repo.read"],
+      });
+
+    const repositorySkillCapability = structuredClone(value) as Record<string, unknown>;
+    (repositorySkillCapability.requires as { capabilities: string[] }).capabilities = [
+      ...UNIT_PHASE_RUNTIME_CAPABILITIES,
+      "agent/repository-skill@1",
+    ];
+    const repositorySkillBinding =
+      (firstStage(repositorySkillCapability).unitPhaseBindings as Array<Record<string, unknown>>)[2]!;
+    (repositorySkillBinding.loop as Record<string, unknown>).skill = "repo://lead";
+    repositorySkillBinding.executor = { kind: "agent", capability: "agent/repository-skill@1" };
+    repositorySkillBinding.repositorySkill = repositorySkillPackage();
+    expect(validatePipelineManifest(repositorySkillCapability).manifest.stages[0]?.unitPhaseBindings?.[2])
+      .toMatchObject({
+        kind: "gate",
+        executor: { kind: "agent", capability: "agent/repository-skill@1" },
+        credentials: ["model.invoke", "repo.read"],
+        repositorySkill: { invocation: "lead" },
+      });
   });
 
   it("bounds repository skill package identity inside its declared directory", () => {
