@@ -22,7 +22,7 @@ import {
 import { FOR_EACH_UNIT_CAPABILITY, parseAndCompileExecutionGraph } from "../pipeline/execution-graph.js";
 import type { RepositorySkillPackage } from "../pipeline/manifest.js";
 import type { PipelineStore } from "../pipeline/store.js";
-import { extractJsonBlocks } from "../shared/markdown.js";
+import { extractJsonBlocks } from "../pipeline/markdown.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import type { AdmissionPreflight } from "./admission-preflight.js";
 import type { PipelineCoordinatorContext, SessionServicePorts } from "./session-service.js";

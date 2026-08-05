@@ -278,7 +278,7 @@ export function validateLoopRequest(value) {
     "protocol", "actionId", "attemptId", "graphId", "parentRunId", "unitId", "role", "loop",
     "agent", "skill", "worktree", "candidateSubject", "nativeSessionId", "contextPolicy", "timeoutMs",
     "transitionContext", "allowedMcpServers", "credentialScopes", "receiptSchema",
-    "repositorySkill", "requestHash", "idempotencyKey",
+    "expectedProducerSkill", "repositorySkill", "requestHash", "idempotencyKey",
   ]);
   const unknown = Object.keys(input).find((key) => !allowed.has(key));
   if (unknown) throw new Error(`loop request has unknown field ${unknown}`);
@@ -296,7 +296,7 @@ export function validateLoopRequest(value) {
     actionId: stagePathId(input.actionId, "actionId"),
     attemptId: stagePathId(input.attemptId, "attemptId"),
     graphId: string(input.graphId, "graphId"),
-    parentRunId: stagePathId(input.parentRunId, "parentRunId"),
+    ...(input.parentRunId === undefined ? {} : { parentRunId: stagePathId(input.parentRunId, "parentRunId") }),
     unitId: nullableString(input.unitId, "unitId"),
     role: string(input.role, "role"),
     loop: string(input.loop, "loop"),
@@ -312,6 +312,9 @@ export function validateLoopRequest(value) {
     allowedMcpServers: boundedArray(input.allowedMcpServers, "allowedMcpServers"),
     credentialScopes: boundedArray(input.credentialScopes, "credentialScopes"),
     receiptSchema: string(input.receiptSchema, "receiptSchema", /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,159}$/),
+    ...(input.expectedProducerSkill === undefined
+      ? {}
+      : { expectedProducerSkill: string(input.expectedProducerSkill, "expectedProducerSkill", /^[A-Za-z0-9][A-Za-z0-9._:/@#-]{0,255}$/) }),
   };
   if (request.receiptSchema !== STANDARD_RECEIPT_SCHEMA) throw new Error("loop receipt schema is unsupported");
   if (!ROLES.has(request.role)) throw new Error("role is invalid");
@@ -763,7 +766,7 @@ function assertLoopReceiptFence(receipt, request, subject) {
   if (subject !== null && receipt.subject.post !== subject) {
     throw new Error("loop receipt subject fence mismatch");
   }
-  const expectedProducerSkill = request.repositorySkill?.reference ?? `builtin://${request.skill}@1`;
+  const expectedProducerSkill = request.expectedProducerSkill ?? request.repositorySkill?.reference ?? `builtin://${request.skill}@1`;
   if (receipt.producer.skill !== expectedProducerSkill) {
     throw new Error("loop receipt producer skill mismatch");
   }
@@ -873,7 +876,7 @@ export function executeLoopAction({
         : failed ? "failure" : "success",
       native_session_id: execution.nativeSessionId ?? request.nativeSessionId ?? null,
       subject: subject ?? parsedReceipt?.subject?.post ?? null,
-      receipt: parsedReceipt
+      receipt: parsedReceipt && !receiptError
         ? canonicalJson(parsedReceipt)
         : sanitizeArtifactText(retryableInfrastructureFailure
           ? execution.stderr || "loop action infrastructure failure"

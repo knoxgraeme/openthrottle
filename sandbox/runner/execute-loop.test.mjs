@@ -261,9 +261,70 @@ describe("loop action request validation", () => {
     const valid = request();
     expect(validateLoopRequest(valid)).toMatchObject({
       actionId: "action-1",
+      parentRunId: "run-parent",
       worktree: { id: "unit-1" },
     });
     expect(() => validateLoopRequest({ ...valid, skill: "ce-code-review" })).toThrow(/stale/);
+  });
+
+  it("keeps loop-action@2 backward-compatible when parentRunId is absent", () => {
+    const { parentRunId: _parentRunId, requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...legacyWithoutFence } = request();
+    const legacy = { ...legacyWithoutFence, ...createLoopRequestHash(legacyWithoutFence) };
+
+    expect(validateLoopRequest(legacy)).toMatchObject({
+      actionId: "action-1",
+      worktree: { id: "unit-1" },
+    });
+    expect(validateLoopRequest(legacy)).not.toHaveProperty("parentRunId");
+  });
+
+  it("accepts graph-declared producer skill fences separately from adapter invocation", () => {
+    const valid = request({ expectedProducerSkill: "builtin://ce/implement@1" });
+    const producer = {
+      ...standardReceipt(valid).producer,
+      skill: "builtin://ce/implement@1",
+    };
+    const receipt = standardReceipt(valid, { producer });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent: () => ({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: JSON.stringify(receipt),
+        stderr: "",
+        nativeSessionId: "thread-1",
+      }),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(JSON.parse(result.receipt).producer.skill).toBe("builtin://ce/implement@1");
+  });
+
+  it("rejects receipts that do not match the sealed expected producer skill", () => {
+    const valid = request({ expectedProducerSkill: "builtin://ce/implement@1" });
+    const receipt = standardReceipt(valid);
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent: () => ({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: JSON.stringify(receipt),
+        stderr: "",
+        nativeSessionId: "thread-1",
+      }),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result).toMatchObject({
+      outcome: "failure",
+      subject: expect.any(String),
+    });
+    expect(result.receipt).toContain("loop receipt producer skill mismatch");
   });
 
   it("rejects absolute worktree paths and writes action-attempt scoped result paths", () => {

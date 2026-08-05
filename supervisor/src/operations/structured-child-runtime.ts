@@ -33,7 +33,7 @@ import type { PipelineInstance, PipelineStore } from "../pipeline/store.js";
 import type { StageRequestEnvelope } from "../pipeline/stage-request.js";
 import type { ExecutionGateReceipt, ExecutionUnitStore, ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
 import type { ChildExecutorActionRequest, LoopActionRequest, RuntimeResource, SandboxRuntime } from "../runtime/contracts.js";
-import { extractJsonBlocks } from "../shared/markdown.js";
+import { extractJsonBlocks } from "../pipeline/markdown.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import { createUnitEffectProcessor } from "./unit-effects.js";
 
@@ -212,7 +212,9 @@ function adapterSkillFor(actionKind: UnitActionKind): LoopActionRequest["skill"]
 }
 
 function expectedSkillFor(binding: LoopDispatchBinding): string {
-  return binding.repositorySkill?.reference ?? binding.loop.skill;
+  if (binding.repositorySkill) return binding.repositorySkill.reference;
+  if (binding.loop.skill.startsWith("builtin://")) return binding.loop.skill;
+  return `builtin://${binding.loop.skill}@1`;
 }
 
 function builtinProducer(
@@ -602,6 +604,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       allowedMcpServers: workerBinding?.worker.allowed_mcp_servers ?? [],
       credentialScopes: workerBinding.credentials as LoopActionRequest["credentialScopes"],
       receiptSchema: RECEIPT_SCHEMA,
+      expectedProducerSkill: expectedSkillFor(workerBinding),
       ...(workerBinding?.repositorySkill ? { repositorySkill: workerBinding.repositorySkill } : {}),
     });
     await deps.runtime.dispatchLoopAction(resource, loopRequest);

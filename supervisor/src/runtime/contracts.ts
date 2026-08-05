@@ -68,7 +68,7 @@ export interface LoopActionRequest {
   actionId: string;
   attemptId: string;
   graphId: string;
-  parentRunId: string;
+  parentRunId?: string;
   unitId: string | null;
   role: "worker" | "lead" | "reviewer" | "publisher";
   loop: "implement" | "simplify" | "command" | "repair" | "lead" | "review" | "publish";
@@ -83,6 +83,7 @@ export interface LoopActionRequest {
   allowedMcpServers: readonly string[];
   credentialScopes: readonly LogicalCredential[];
   receiptSchema: string;
+  expectedProducerSkill?: string;
   repositorySkill?: RepositorySkillPackage;
   requestHash: string;
   idempotencyKey: string;

@@ -577,6 +577,7 @@ describe("pipeline effect processor", () => {
         role: "worker",
         loop: "implement",
         skill: "implement-unit",
+        expectedProducerSkill: "builtin://ce/implement@1",
       })
     );
     expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
@@ -766,6 +767,7 @@ describe("pipeline effect processor", () => {
         protocol: "loop-action@2",
         attemptId: attempt.id,
         skill: "implement_unit",
+        expectedProducerSkill: repoSkill.reference,
         repositorySkill: repoSkill,
       })
     );
@@ -1099,6 +1101,7 @@ describe("pipeline effect processor", () => {
         protocol: "loop-action@2",
         role: "reviewer",
         skill: "final-review",
+        expectedProducerSkill: "builtin://final-review@1",
         worktree: null,
       })
     );
@@ -1249,7 +1252,7 @@ describe("pipeline effect processor", () => {
     expect(runtime.setActive).toHaveBeenCalledTimes(activationsAfterAggregate);
   });
 
-  it("persists retryable child loop errors instead of parsing them as receipts", async () => {
+  it("leaves retryable child loop errors active for effect retry instead of parsing them as receipts", async () => {
     db = openDb(":memory:");
     const pipelines = createPipelineStore(db);
     const tickets = createSupervisorStore(db, pipelines);
@@ -1350,16 +1353,16 @@ describe("pipeline effect processor", () => {
 
     await processor.drain();
     expect(pipelines.listWorkAttempts(attempt.id)[0]).toMatchObject({
-      status: "failed",
-      result_hash: expect.any(String),
-      last_error: expect.stringContaining("model credential unavailable"),
+      status: "dispatched",
+      result_hash: null,
+      last_error: null,
     });
     expect(pipelines.listUnits(attempt.id)).toEqual([
       expect.objectContaining({
         unitId: "unit_a",
-        status: "failed",
-        terminalLevel: "failed",
-        alarm: true,
+        status: "running",
+        terminalLevel: null,
+        alarm: false,
       }),
     ]);
   });
