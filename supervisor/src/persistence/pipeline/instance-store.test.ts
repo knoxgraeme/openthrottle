@@ -3,13 +3,61 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { loadPipelineCatalog, parseRepositoryConfig } from "../../pipeline/manifest.js";
+import { loadPipelineCatalog, parseRepositoryConfig, type PipelineUnitPhaseBinding } from "../../pipeline/manifest.js";
 import { openDb } from "../database.js";
 import { createSupervisorStore } from "../store.js";
 import { createPipelineStore } from "./create-store.js";
 import { catalogPath, runtime, setupPipelineStore, shippedCatalogPath, ticket } from "../../__fixtures__/pipeline-store.js";
 import { parsePipelinePublication } from "../../pipeline/publication.js";
 import type { ExecutionUnitStore } from "./unit-store.js";
+
+function unitPhaseBindings(): PipelineUnitPhaseBinding[] {
+  const worker = {
+    id: "worker",
+    engine: "agent" as const,
+    allowed_mcp_servers: [],
+    session_scope: "fresh" as const,
+    credentials: ["model.invoke", "repo.read", "repo.write"],
+  };
+  return [
+    {
+      id: "implement",
+      kind: "agent",
+      loop: {
+        id: "loop",
+        skill: "builtin://ce/implement@1",
+        input_scope: "unit",
+        receipt: "unit_completion",
+        max_parallel: 1,
+        max_rounds: 1,
+        timeout_seconds: 60,
+      },
+      worker,
+      executor: { kind: "agent", capability: "ce/implement@1" },
+      context: "fresh",
+      credentials: worker.credentials,
+    },
+    { id: "candidate", kind: "evidence" },
+    {
+      id: "lead",
+      kind: "gate",
+      loop: {
+        id: "lead-loop",
+        skill: "builtin://ce/implement@1",
+        input_scope: "unit",
+        receipt: "unit_decision",
+        max_parallel: 1,
+        max_rounds: 1,
+        timeout_seconds: 60,
+      },
+      worker,
+      executor: { kind: "agent", capability: "ce/implement@1" },
+      context: "fresh",
+      credentials: worker.credentials,
+    },
+    { id: "integrate", kind: "integrate" },
+  ];
+}
 
 describe("pipeline instance store", () => {
   let db: Database.Database | undefined;
@@ -106,6 +154,7 @@ describe("pipeline instance store", () => {
       graphDigest: "graph-digest",
       planDigest: "plan-digest",
       units: [{ id: "U1" }],
+      unitPhaseBindings: unitPhaseBindings(),
     });
 
     tickets.upsert({ ...ticket("session-new", "shared-issue"), pipeline });

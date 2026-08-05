@@ -8,7 +8,7 @@ import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { STRUCTURED_STATUS_UNITS_SQL } from "../persistence/pipeline/status-store.js";
 import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 import type { PipelineStore } from "../pipeline/store.js";
-import { loadPipelineCatalog, parseRepositoryConfig } from "../pipeline/manifest.js";
+import { loadPipelineCatalog, parseRepositoryConfig, type PipelineUnitPhaseBinding } from "../pipeline/manifest.js";
 import { buildInstalledRuntimeDescriptor, type RuntimeInventory, type RuntimeLogs, type RuntimeSnapshotReadiness } from "../__fixtures__/runtime.js";
 import { createServer, createServerWebhookDeliveryProcessor } from "./server.js";
 
@@ -42,6 +42,54 @@ const cfg: Config = {
 };
 
 type ServerRuntime = RuntimeInventory & RuntimeLogs & RuntimeSnapshotReadiness;
+
+function unitPhaseBindings(): PipelineUnitPhaseBinding[] {
+  const worker = {
+    id: "worker",
+    engine: "agent" as const,
+    allowed_mcp_servers: [],
+    session_scope: "fresh" as const,
+    credentials: ["model.invoke", "repo.read", "repo.write"],
+  };
+  return [
+    {
+      id: "implement",
+      kind: "agent",
+      loop: {
+        id: "loop",
+        skill: "builtin://ce/implement@1",
+        input_scope: "unit",
+        receipt: "unit_completion",
+        max_parallel: 1,
+        max_rounds: 1,
+        timeout_seconds: 60,
+      },
+      worker,
+      executor: { kind: "agent", capability: "ce/implement@1" },
+      context: "fresh",
+      credentials: worker.credentials,
+    },
+    { id: "candidate", kind: "evidence" },
+    {
+      id: "lead",
+      kind: "gate",
+      loop: {
+        id: "lead-loop",
+        skill: "builtin://ce/implement@1",
+        input_scope: "unit",
+        receipt: "unit_decision",
+        max_parallel: 1,
+        max_rounds: 1,
+        timeout_seconds: 60,
+      },
+      worker,
+      executor: { kind: "agent", capability: "ce/implement@1" },
+      context: "fresh",
+      credentials: worker.credentials,
+    },
+    { id: "integrate", kind: "integrate" },
+  ];
+}
 
 describe("coordinator-only server", () => {
   let db: ReturnType<typeof openDb>;
@@ -317,6 +365,7 @@ describe("coordinator-only server", () => {
       graphDigest: "graph-old",
       planDigest: "plan-old",
       units: [{ id: "old-unit" }],
+      unitPhaseBindings: unitPhaseBindings(),
     });
     db.prepare(`
       INSERT INTO pipeline_instance_stages (
@@ -353,6 +402,7 @@ describe("coordinator-only server", () => {
       graphDigest: "graph-latest",
       planDigest: "plan-latest",
       units: [{ id: "latest-unit-z" }, { id: "latest-unit-a" }],
+      unitPhaseBindings: unitPhaseBindings(),
     });
     db.prepare(`
       UPDATE execution_graphs

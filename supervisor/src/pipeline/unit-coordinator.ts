@@ -68,13 +68,8 @@ export function nextUnitPhase(phase: UnitPhase, phases: readonly UnitPhase[] = B
 }
 
 export function repairCyclePhaseSequence(phases: readonly UnitPhase[] = BUILTIN_UNIT_PHASES): UnitPhase[] {
-  const implementIndex = phases.indexOf("implement");
-  if (implementIndex < 0) return [...phases];
-  return [
-    "implement",
-    ...phases.slice(0, implementIndex),
-    ...phases.slice(implementIndex + 1),
-  ];
+  const repairOrder: readonly UnitPhase[] = ["implement", "simplify", "command", "candidate", "lead", "integrate"];
+  return repairOrder.filter((phase) => phases.includes(phase));
 }
 
 export function nextUnitPhaseForCycle(

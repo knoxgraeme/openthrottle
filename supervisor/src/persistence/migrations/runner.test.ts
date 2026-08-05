@@ -4,11 +4,79 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { openDb } from "../database.js";
-import { parsePipelineManifest } from "../../pipeline/manifest.js";
+import { canonicalJson, parsePipelineManifest, type PipelineUnitPhaseBinding } from "../../pipeline/manifest.js";
+import { createExecutionUnitStore } from "../pipeline/unit-store.js";
 import { applyDatabaseMigrations, databaseMigrations } from "./runner.js";
 
 let db: Database.Database | undefined;
 const temporaryDirectories: string[] = [];
+
+function builtinUnitPhaseBindings(): PipelineUnitPhaseBinding[] {
+  const worker = {
+    id: "worker",
+    engine: "agent" as const,
+    allowed_mcp_servers: [],
+    session_scope: "fresh" as const,
+    credentials: ["model.invoke", "repo.read", "repo.write"],
+  };
+  const implement: PipelineUnitPhaseBinding = {
+    id: "implement",
+    kind: "agent",
+    loop: {
+      id: "implement-loop",
+      skill: "builtin://ce/implement@1",
+      input_scope: "unit",
+      receipt: "unit_completion",
+      max_parallel: 1,
+      max_rounds: 1,
+      timeout_seconds: 60,
+    },
+    worker,
+    executor: { kind: "agent", capability: "ce/implement@1" },
+    context: "fresh",
+    credentials: worker.credentials,
+  };
+  return [
+    implement,
+    {
+      id: "simplify",
+      kind: "agent",
+      loop: {
+        id: "simplify-loop",
+        skill: "builtin://ce/simplify@1",
+        input_scope: "unit",
+        receipt: "unit_completion",
+        max_parallel: 1,
+        max_rounds: 1,
+        timeout_seconds: 60,
+      },
+      worker,
+      executor: { kind: "agent", capability: "ce/simplify@1" },
+      context: "fresh",
+      credentials: worker.credentials,
+    },
+    { id: "command", kind: "command", commands: [] },
+    { id: "candidate", kind: "evidence" },
+    {
+      id: "lead",
+      kind: "gate",
+      loop: {
+        id: "lead-loop",
+        skill: "builtin://ce/implement@1",
+        input_scope: "unit",
+        receipt: "unit_decision",
+        max_parallel: 1,
+        max_rounds: 1,
+        timeout_seconds: 60,
+      },
+      worker,
+      executor: { kind: "agent", capability: "ce/implement@1" },
+      context: "fresh",
+      credentials: worker.credentials,
+    },
+    { id: "integrate", kind: "integrate" },
+  ];
+}
 
 afterEach(() => {
   db?.close();
@@ -322,6 +390,31 @@ describe("database migrations", () => {
       version: 18,
     });
     expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+
+    const store = createExecutionUnitStore(db, () => now);
+    expect(store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings(),
+    })).toMatchObject({
+      unit_phases: canonicalJson([]),
+      unit_phase_bindings: canonicalJson([]),
+    });
+    expect(() => store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings().filter((binding) => binding.id !== "simplify"),
+    })).toThrow(/replay fence mismatch/);
   });
 
   it("upgrades databases already stamped with the immutable v16 checksum through v17", () => {

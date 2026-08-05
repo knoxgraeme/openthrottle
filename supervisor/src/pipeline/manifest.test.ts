@@ -531,6 +531,20 @@ describe("pipeline manifest validation", () => {
     });
     expect(() => validatePipelineManifest(value, { runtime: withoutModelCredential.descriptor }))
       .toThrow(/runtime capability mismatch.*credential:model\.invoke/);
+
+    const mismatchedContext = structuredClone(value) as Record<string, unknown>;
+    const contextBinding =
+      (firstStage(mismatchedContext).unitPhaseBindings as Array<Record<string, unknown>>)[0]!;
+    contextBinding.context = "prefer_resume";
+    expect(() => validatePipelineManifest(mismatchedContext))
+      .toThrow(/unitPhaseBindings\[0\]\.context: must match worker\.session_scope/);
+
+    const mismatchedCredentials = structuredClone(value) as Record<string, unknown>;
+    const credentialBinding =
+      (firstStage(mismatchedCredentials).unitPhaseBindings as Array<Record<string, unknown>>)[0]!;
+    credentialBinding.credentials = ["repo.read"];
+    expect(() => validatePipelineManifest(mismatchedCredentials))
+      .toThrow(/unitPhaseBindings\[0\]\.credentials: must match worker\.credentials/);
   });
 
   it("bounds repository skill package identity inside its declared directory", () => {

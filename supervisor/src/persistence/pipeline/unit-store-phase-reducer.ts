@@ -4,7 +4,9 @@ import {
   assertValidUnitPhaseSequence,
   actionKindForUnitPhase,
   BUILTIN_UNIT_PHASES,
+  nextUnitPhase,
   nextUnitPhaseForCycle,
+  repairCyclePhaseSequence,
   type ChildGateDecision,
   type ChildGateEvaluatorKind,
   type ExecutionUnitState,
@@ -119,6 +121,66 @@ export function unitPhasesOf(graph: { unit_phases?: string }): UnitPhase[] {
 export function phaseSequenceOf(graph: { unit_phases?: string }): UnitPhase[] {
   const phases = unitPhasesOf(graph);
   return phases.length > 0 ? phases : [...BUILTIN_UNIT_PHASES];
+}
+
+function lastMutatingPhase(phases: readonly UnitPhase[]): UnitPhase {
+  return phases.includes("simplify") ? "simplify" : "implement";
+}
+
+function preflightCommandNeedsRefresh(phases: readonly UnitPhase[]): boolean {
+  const commandIndex = phases.indexOf("command");
+  const implementIndex = phases.indexOf("implement");
+  return commandIndex >= 0 && implementIndex >= 0 && commandIndex < implementIndex;
+}
+
+function completedMutationExistsInCycle(
+  db: Database.Database,
+  input: { unitRowId: string; cycle: number }
+): boolean {
+  return Boolean(db.prepare(`
+    SELECT 1 FROM execution_work_attempts
+    WHERE execution_unit_id = ?
+      AND cycle = ?
+      AND action_kind IN ('implement', 'repair', 'simplify')
+      AND status = 'completed'
+    LIMIT 1
+  `).get(input.unitRowId, input.cycle));
+}
+
+export function nextUnitPhaseAfterCompletion(
+  db: Database.Database,
+  input: {
+    unitRowId: string;
+    currentPhase: UnitPhase;
+    currentCycle: number;
+    phases: readonly UnitPhase[];
+  }
+): { phase: UnitPhase | undefined; resetCommandIndex: boolean } {
+  if (input.currentPhase === "command" && preflightCommandNeedsRefresh(input.phases)) {
+    if (completedMutationExistsInCycle(db, { unitRowId: input.unitRowId, cycle: input.currentCycle })) {
+      return {
+        phase: nextUnitPhase("command", repairCyclePhaseSequence(input.phases)),
+        resetCommandIndex: false,
+      };
+    }
+    return {
+      phase: nextUnitPhase("command", input.phases),
+      resetCommandIndex: false,
+    };
+  }
+
+  if (
+    input.currentCycle === 1 &&
+    preflightCommandNeedsRefresh(input.phases) &&
+    input.currentPhase === lastMutatingPhase(input.phases)
+  ) {
+    return { phase: "command", resetCommandIndex: true };
+  }
+
+  return {
+    phase: nextUnitPhaseForCycle(input.currentPhase, input.currentCycle, input.phases),
+    resetCommandIndex: false,
+  };
 }
 
 export function listUnitRowsForParentAttempt(db: Database.Database, parentAttemptId: string): ExecutionUnitRow[] {
@@ -244,7 +306,12 @@ export function createOrResumeUnitAction(
   const phases = phaseSequenceOf(input.graph);
   for (let guard = 0; guard < phases.length + commandNames.length + 1; guard += 1) {
     if (unitRow.phase === "command" && unitRow.command_index >= commandNames.length) {
-      const next = nextUnitPhaseForCycle("command", unitRow.current_cycle, phases);
+      const next = nextUnitPhaseAfterCompletion(db, {
+        unitRowId: unitRow.id,
+        currentPhase: "command",
+        currentCycle: unitRow.current_cycle,
+        phases,
+      }).phase;
       if (!next) throw new Error(`execution unit ${unitRow.unit_id} command phase has no successor`);
       db.prepare(`UPDATE execution_units SET phase = ?, updated_at = ? WHERE id = ?`)
         .run(next, input.nowIso, unitRow.id);

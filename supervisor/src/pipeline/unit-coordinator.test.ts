@@ -8,6 +8,7 @@ import {
   decideDownstreamContext,
   deriveUnitTerminalState,
   nextUnitPhase,
+  repairCyclePhaseSequence,
   routeFinalReviewDecision,
   routeIntegrationDecision,
   routeUnitAcceptanceDecision,
@@ -398,6 +399,8 @@ describe("unit coordinator", () => {
     expect(actionKindForUnitPhase("candidate", 1)).toBe("candidate");
     expect(actionKindForUnitPhase("lead", 1)).toBe("lead");
     expect(actionKindForUnitPhase("integrate", 1)).toBe("integrate");
+    expect(repairCyclePhaseSequence(["command", "implement", "simplify", "candidate", "lead", "integrate"]))
+      .toEqual(["implement", "simplify", "command", "candidate", "lead", "integrate"]);
   });
 
   it("routes a unit acceptance decision to integrate, bounded repair, or escalation", () => {

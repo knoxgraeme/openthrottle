@@ -334,6 +334,14 @@ function validateUnitPhaseSequence(phases: readonly GraphUnitPhaseId[], path: st
   if (candidateIndex !== leadIndex - 1) fail(path, "candidate must immediately precede lead");
 }
 
+function contextForWorkerSessionScope(
+  sessionScope: PipelineUnitAgentPhaseBinding["worker"]["session_scope"]
+): ContextPolicy {
+  if (sessionScope === "fresh") return "fresh";
+  if (sessionScope === "graph") return "prefer_resume";
+  return "resume_required";
+}
+
 function validateUnitPhaseBindings(
   bindings: readonly PipelineUnitPhaseBinding[],
   stage: { unitPhases?: readonly GraphUnitPhaseId[]; unitCommandNames?: readonly CommandName[] },
@@ -347,6 +355,16 @@ function validateUnitPhaseBindings(
   const commandNames = unitPhaseBindingCommandNames(bindings);
   if (stage.unitCommandNames && canonicalJson(commandNames) !== canonicalJson(stage.unitCommandNames)) {
     fail(path, "command phase bindings must match unitCommandNames");
+  }
+  for (const [index, binding] of bindings.entries()) {
+    if (binding.kind !== "agent" && binding.kind !== "gate") continue;
+    const canonicalContext = contextForWorkerSessionScope(binding.worker.session_scope);
+    if (binding.context !== canonicalContext) {
+      fail(`${path}[${index}].context`, "must match worker.session_scope");
+    }
+    if (canonicalJson(binding.credentials) !== canonicalJson(binding.worker.credentials)) {
+      fail(`${path}[${index}].credentials`, "must match worker.credentials");
+    }
   }
 }
 

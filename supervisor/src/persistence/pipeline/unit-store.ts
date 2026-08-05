@@ -13,7 +13,6 @@ import {
   deriveUnitTerminalState,
   assertValidUnitPhaseSequence,
   nextUnitPhase,
-  nextUnitPhaseForCycle,
   routeFinalReviewDecision,
   routeIntegrationDecision,
   routeUnitAcceptanceDecision,
@@ -38,6 +37,7 @@ import {
   listUnitRowsForParentAttempt,
   loadActiveAction,
   markActionCompleted,
+  nextUnitPhaseAfterCompletion,
   PHASE_FOR_COMPLETING_ACTION_KIND,
   phaseSequenceOf,
   unitPhasesOf,
@@ -350,8 +350,13 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     const legacyBuiltinUnitPhasesReplay =
       persistedUnitPhases.length === 0 &&
       expectedUnitPhases === canonicalJson(phaseSequenceOf(existing));
+    const unitPhaseBindingsMigratedAt = (db.prepare(
+      "SELECT applied_at FROM schema_migrations WHERE version = 21"
+    ).get() as { applied_at: string } | undefined)?.applied_at;
     const legacyUnboundPhaseReplay =
       existing.unit_phase_bindings === "[]" &&
+      unitPhaseBindingsMigratedAt !== undefined &&
+      existing.created_at < unitPhaseBindingsMigratedAt &&
       phaseProjection.unitPhaseBindings.length > 0 &&
       (existing.unit_phases === expectedUnitPhases || legacyBuiltinUnitPhasesReplay) &&
       existing.command_names === expectedCommandNames;
@@ -385,11 +390,8 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
   }
 
   function assertUnitPhaseBindingsMatch(input: Parameters<ExecutionUnitStore["createGraph"]>[0]): void {
-    if (!input.unitPhaseBindings) {
-      if (input.unitPhases || input.commandNames) {
-        throw new Error("execution graph unitPhaseBindings are required when unit phase projections are supplied");
-      }
-      return;
+    if (!input.unitPhaseBindings || input.unitPhaseBindings.length === 0) {
+      throw new Error("execution graph unitPhaseBindings are required");
     }
     if (
       input.unitPhases &&
@@ -414,13 +416,11 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
 
   function unitPhaseProjection(input: Parameters<ExecutionUnitStore["createGraph"]>[0]): UnitPhaseProjection {
     assertUnitPhaseBindingsMatch(input);
-    if (!input.unitPhaseBindings) {
-      return { commandNames: [], unitPhases: [], unitPhaseBindings: [] };
-    }
+    const unitPhaseBindings = input.unitPhaseBindings!;
     return {
-      commandNames: unitPhaseBindingCommandNames(input.unitPhaseBindings),
-      unitPhases: unitPhaseBindingIds(input.unitPhaseBindings),
-      unitPhaseBindings: input.unitPhaseBindings,
+      commandNames: unitPhaseBindingCommandNames(unitPhaseBindings),
+      unitPhases: unitPhaseBindingIds(unitPhaseBindings),
+      unitPhaseBindings,
     };
   }
 
@@ -590,10 +590,19 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       } else if (PHASE_FOR_COMPLETING_ACTION_KIND[action.action_kind]) {
         const currentPhase = PHASE_FOR_COMPLETING_ACTION_KIND[action.action_kind]!;
         const graph = graphStmt.get(action.parent_attempt_id) as ExecutionUnitGraph;
-        const next = nextUnitPhaseForCycle(currentPhase, action.cycle, phaseSequenceOf(graph));
+        const nextPhase = nextUnitPhaseAfterCompletion(db, {
+          unitRowId: action.execution_unit_id,
+          currentPhase,
+          currentCycle: action.cycle,
+          phases: phaseSequenceOf(graph),
+        });
+        const next = nextPhase.phase;
         if (!next) throw new Error(`execution unit phase ${currentPhase} has no successor`);
-        db.prepare(`UPDATE execution_units SET phase = ?, updated_at = ? WHERE id = ?`)
-          .run(next, timestamp, action.execution_unit_id);
+        db.prepare(`
+          UPDATE execution_units
+          SET phase = ?, command_index = CASE WHEN ? = 1 THEN 0 ELSE command_index END, updated_at = ?
+          WHERE id = ?
+        `).run(next, nextPhase.resetCommandIndex ? 1 : 0, timestamp, action.execution_unit_id);
       } else {
         throw new Error(`execution work attempt ${input.actionId} action kind is not handled by completeUnitAction`);
       }
