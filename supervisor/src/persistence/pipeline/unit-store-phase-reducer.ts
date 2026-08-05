@@ -127,24 +127,25 @@ function lastMutatingPhase(phases: readonly UnitPhase[]): UnitPhase {
   return phases.includes("simplify") ? "simplify" : "implement";
 }
 
-function preflightCommandNeedsRefresh(phases: readonly UnitPhase[]): boolean {
+function commandPrecedesFinalMutation(phases: readonly UnitPhase[]): boolean {
   const commandIndex = phases.indexOf("command");
-  const implementIndex = phases.indexOf("implement");
-  return commandIndex >= 0 && implementIndex >= 0 && commandIndex < implementIndex;
+  const finalMutationIndex = phases.indexOf(lastMutatingPhase(phases));
+  return commandIndex >= 0 && finalMutationIndex >= 0 && commandIndex < finalMutationIndex;
 }
 
-function completedMutationExistsInCycle(
+function completedFinalMutationExistsInCycle(
   db: Database.Database,
-  input: { unitRowId: string; cycle: number }
+  input: { unitRowId: string; cycle: number; phase: UnitPhase }
 ): boolean {
+  const actionKind = actionKindForUnitPhase(input.phase, input.cycle);
   return Boolean(db.prepare(`
     SELECT 1 FROM execution_work_attempts
     WHERE execution_unit_id = ?
       AND cycle = ?
-      AND action_kind IN ('implement', 'repair', 'simplify')
+      AND action_kind = ?
       AND status = 'completed'
     LIMIT 1
-  `).get(input.unitRowId, input.cycle));
+  `).get(input.unitRowId, input.cycle, actionKind));
 }
 
 export function nextUnitPhaseAfterCompletion(
@@ -156,8 +157,14 @@ export function nextUnitPhaseAfterCompletion(
     phases: readonly UnitPhase[];
   }
 ): { phase: UnitPhase | undefined; resetCommandIndex: boolean } {
-  if (input.currentPhase === "command" && preflightCommandNeedsRefresh(input.phases)) {
-    if (completedMutationExistsInCycle(db, { unitRowId: input.unitRowId, cycle: input.currentCycle })) {
+  const finalMutation = lastMutatingPhase(input.phases);
+  const commandRefreshRequired = commandPrecedesFinalMutation(input.phases);
+  if (input.currentPhase === "command" && commandRefreshRequired) {
+    if (completedFinalMutationExistsInCycle(db, {
+      unitRowId: input.unitRowId,
+      cycle: input.currentCycle,
+      phase: finalMutation,
+    })) {
       return {
         phase: nextUnitPhase("command", repairCyclePhaseSequence(input.phases)),
         resetCommandIndex: false,
@@ -170,9 +177,8 @@ export function nextUnitPhaseAfterCompletion(
   }
 
   if (
-    input.currentCycle === 1 &&
-    preflightCommandNeedsRefresh(input.phases) &&
-    input.currentPhase === lastMutatingPhase(input.phases)
+    commandRefreshRequired &&
+    input.currentPhase === finalMutation
   ) {
     return { phase: "command", resetCommandIndex: true };
   }

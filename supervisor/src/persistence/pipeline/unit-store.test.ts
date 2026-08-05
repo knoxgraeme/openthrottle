@@ -111,6 +111,36 @@ function commandFirstWithSimplifyUnitPhaseBindings(commands: string[]): Pipeline
   return [command!, implement, simplify, candidate!, lead!, integrate!];
 }
 
+function commandBeforeSimplifyUnitPhaseBindings(commands: string[]): PipelineUnitPhaseBinding[] {
+  const [implement, candidate, lead, integrate] = unitPhaseBindings();
+  if (!implement || implement.kind !== "agent") throw new Error("expected implement agent binding");
+  const simplify: PipelineUnitPhaseBinding = {
+    id: "simplify",
+    kind: "agent",
+    loop: {
+      id: "simplify-loop",
+      skill: "builtin://ce/simplify@1",
+      input_scope: "unit",
+      receipt: "unit_completion",
+      max_parallel: 1,
+      max_rounds: 1,
+      timeout_seconds: 60,
+    },
+    worker: implement.worker,
+    executor: { kind: "agent", capability: "ce/simplify@1" },
+    context: "fresh",
+    credentials: implement.credentials,
+  };
+  return [
+    implement,
+    { id: "command", kind: "command", commands },
+    simplify,
+    candidate!,
+    lead!,
+    integrate!,
+  ];
+}
+
 function builtinUnitPhaseBindings(commands: string[]): PipelineUnitPhaseBinding[] {
   const [implement, candidate, lead, integrate] = unitPhaseBindings();
   if (implement?.kind !== "agent") throw new Error("expected implement agent binding");
@@ -867,6 +897,160 @@ describe("execution unit store", () => {
       expect.objectContaining({ action_kind: "command", cycle: 1, command_name: "test", output_subject: simplifiedSubject }),
       expect.objectContaining({ action_kind: "candidate", cycle: 1, command_name: null, output_subject: simplifiedSubject }),
       expect.objectContaining({ action_kind: "lead", cycle: 1, command_name: null, output_subject: null }),
+    ]);
+  });
+
+  it("reruns commands declared between implement and simplify before candidate and repair acceptance", () => {
+    const store = setup();
+    const implementedSubject = "1".repeat(40);
+    const staleCommandSubject = "2".repeat(40);
+    const simplifiedSubject = "3".repeat(40);
+    const repairedSubject = "4".repeat(40);
+    const repairedSimplifiedSubject = "5".repeat(40);
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: commandBeforeSimplifyUnitPhaseBindings(["test"]),
+    });
+
+    const implement = lease(store);
+    expect(implement).toMatchObject({ action_kind: "implement", cycle: 1 });
+    store.completeUnitAction({
+      actionId: implement.id,
+      resultHash: "r-implement",
+      outputSubject: implementedSubject,
+      receipt: receiptJson("unit_completion"),
+    });
+
+    const staleCommand = lease(store);
+    expect(staleCommand).toMatchObject({ action_kind: "command", command_name: "test", cycle: 1 });
+    store.completeUnitAction({
+      actionId: staleCommand.id,
+      resultHash: "r-command-stale",
+      outputSubject: staleCommandSubject,
+      receipt: receiptJson("command_result", { payload: { command: "test" } }),
+    });
+
+    const simplify = lease(store);
+    expect(simplify).toMatchObject({ action_kind: "simplify", cycle: 1 });
+    store.completeUnitAction({
+      actionId: simplify.id,
+      resultHash: "r-simplify",
+      outputSubject: simplifiedSubject,
+    });
+
+    const freshCommand = lease(store);
+    expect(freshCommand).toMatchObject({ action_kind: "command", command_name: "test", cycle: 1 });
+    store.completeUnitAction({
+      actionId: freshCommand.id,
+      resultHash: "r-command-fresh",
+      outputSubject: simplifiedSubject,
+      receipt: receiptJson("command_result", { payload: { command: "test" } }),
+    });
+
+    const candidate = lease(store);
+    expect(candidate).toMatchObject({ action_kind: "candidate", cycle: 1 });
+    store.completeUnitAction({
+      actionId: candidate.id,
+      resultHash: "r-candidate",
+      outputSubject: simplifiedSubject,
+      receipt: receiptJson("candidate_evidence"),
+    });
+    const lead = lease(store);
+    expect(lead).toMatchObject({ action_kind: "lead", cycle: 1 });
+    store.completeGatedAction({
+      actionId: lead.id,
+      resultHash: "r-lead",
+      outputSubject: simplifiedSubject,
+      receipt: receiptJson("unit_decision"),
+      decision: gateDecision({
+        gateKind: "unit_acceptance",
+        outcome: "semantic_repair_required",
+        subject: simplifiedSubject,
+      }),
+    });
+
+    expect(store.listUnits("attempt-parent")[0]).toMatchObject({
+      phase: "implement",
+      currentCycle: 2,
+      repairRounds: 1,
+      commandIndex: 0,
+    });
+    const repair = lease(store);
+    expect(repair).toMatchObject({ action_kind: "repair", cycle: 2 });
+    store.completeUnitAction({
+      actionId: repair.id,
+      resultHash: "r-repair",
+      outputSubject: repairedSubject,
+      receipt: receiptJson("unit_completion"),
+    });
+
+    const repairSimplify = lease(store);
+    expect(repairSimplify).toMatchObject({ action_kind: "simplify", cycle: 2 });
+    store.completeUnitAction({
+      actionId: repairSimplify.id,
+      resultHash: "r-simplify-repair",
+      outputSubject: repairedSimplifiedSubject,
+    });
+
+    const repairCommand = lease(store);
+    expect(repairCommand).toMatchObject({ action_kind: "command", command_name: "test", cycle: 2 });
+    store.completeUnitAction({
+      actionId: repairCommand.id,
+      resultHash: "r-command-repair",
+      outputSubject: repairedSimplifiedSubject,
+      receipt: receiptJson("command_result", { payload: { command: "test" } }),
+    });
+
+    const repairCandidate = lease(store);
+    expect(repairCandidate).toMatchObject({ action_kind: "candidate", cycle: 2 });
+    store.completeUnitAction({
+      actionId: repairCandidate.id,
+      resultHash: "r-candidate-repair",
+      outputSubject: repairedSimplifiedSubject,
+      receipt: receiptJson("candidate_evidence"),
+    });
+    const repairLead = lease(store);
+    expect(repairLead).toMatchObject({ action_kind: "lead", cycle: 2 });
+    store.completeGatedAction({
+      actionId: repairLead.id,
+      resultHash: "r-lead-repair",
+      outputSubject: repairedSimplifiedSubject,
+      receipt: receiptJson("unit_decision"),
+      decision: gateDecision({
+        gateKind: "unit_acceptance",
+        outcome: "success",
+        subject: repairedSimplifiedSubject,
+      }),
+    });
+
+    expect(store.listUnits("attempt-parent")[0]).toMatchObject({
+      phase: "integrate",
+      acceptedCandidateSubject: repairedSimplifiedSubject,
+      commandIndex: 1,
+    });
+    const attempts = db!.prepare(`
+      SELECT action_kind, cycle, command_name, output_subject FROM execution_work_attempts
+      WHERE parent_attempt_id = ? AND unit_id = ?
+      ORDER BY rowid
+    `).all("attempt-parent", "a");
+    expect(attempts).toEqual([
+      expect.objectContaining({ action_kind: "implement", cycle: 1, command_name: null, output_subject: implementedSubject }),
+      expect.objectContaining({ action_kind: "command", cycle: 1, command_name: "test", output_subject: staleCommandSubject }),
+      expect.objectContaining({ action_kind: "simplify", cycle: 1, command_name: null, output_subject: simplifiedSubject }),
+      expect.objectContaining({ action_kind: "command", cycle: 1, command_name: "test", output_subject: simplifiedSubject }),
+      expect.objectContaining({ action_kind: "candidate", cycle: 1, command_name: null, output_subject: simplifiedSubject }),
+      expect.objectContaining({ action_kind: "lead", cycle: 1, command_name: null, output_subject: simplifiedSubject }),
+      expect.objectContaining({ action_kind: "repair", cycle: 2, command_name: null, output_subject: repairedSubject }),
+      expect.objectContaining({ action_kind: "simplify", cycle: 2, command_name: null, output_subject: repairedSimplifiedSubject }),
+      expect.objectContaining({ action_kind: "command", cycle: 2, command_name: "test", output_subject: repairedSimplifiedSubject }),
+      expect.objectContaining({ action_kind: "candidate", cycle: 2, command_name: null, output_subject: repairedSimplifiedSubject }),
+      expect.objectContaining({ action_kind: "lead", cycle: 2, command_name: null, output_subject: repairedSimplifiedSubject }),
     ]);
   });
 
