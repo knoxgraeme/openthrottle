@@ -6,9 +6,10 @@ import { pathToFileURL } from "node:url";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
 import { writeJsonAtomic } from "./atomic-write.mjs";
-import { computeWorkspaceTreeOid } from "./repository-control.mjs";
+import { computeWorkspaceTreeOid, runGitAsExecutor } from "./repository-control.mjs";
 import { defaultExecuteCommand, resolveCommand } from "./execute-stage.mjs";
 import { integrateCandidate } from "./integrate-unit.mjs";
+import { restoreIntegrationCheckout } from "./execute-loop.mjs";
 import { deriveCandidateCommit, grantWorktreeToAgent, lockWorktree, worktreePath } from "./worktrees.mjs";
 
 function configPath() {
@@ -78,6 +79,21 @@ function repoDirFor(request) {
   return INTEGRATION_REPO_DIR;
 }
 
+function currentHead(repoDir) {
+  return sha1Subject(runGitAsExecutor(repoDir, ["rev-parse", "HEAD"]), "integration HEAD");
+}
+
+function cleanCheckout(repoDir) {
+  return runGitAsExecutor(repoDir, ["status", "--porcelain=v1", "--untracked-files=all"]) === "";
+}
+
+function resetIntegrationCheckout({ repoDir, subject: expectedHead }) {
+  const head = sha1Subject(expectedHead, "integration reset subject");
+  runGitAsExecutor(repoDir, ["reset", "--hard", head]);
+  runGitAsExecutor(repoDir, ["clean", "-fd"]);
+  restoreIntegrationCheckout(repoDir);
+}
+
 function producer(type, request) {
   return {
     worker_id: "executor",
@@ -120,28 +136,51 @@ function receiptBase({ request, type, result, post, evidence = [], payload }) {
   };
 }
 
+function commandEvidence(request, result, payload) {
+  return [
+    `executor:command:${request.actionId}:${payload.command}:${result}:${payload.stdout_digest}:${payload.stderr_digest}`,
+  ];
+}
+
+function candidateEvidence(request, candidate) {
+  return [
+    `executor:candidate:${request.actionId}:${candidate.candidateCommit ?? request.baseSubject}:${candidate.tree}:${digest(canonicalJson(candidate.changedPaths))}`,
+  ];
+}
+
+function integrationEvidence(request, evidence) {
+  return [
+    `executor:integration:${request.actionId}:${evidence.integrated_head}:${evidence.tree}:${digest(canonicalJson(evidence.changed_paths ?? []))}`,
+  ];
+}
+
 function commandReceipt(request, {
   executeCommand = defaultExecuteCommand,
   grantWorktree = grantWorktreeToAgent,
   lockWorktreeHandle = lockWorktree,
   computeSubject = computeWorkspaceTreeOid,
+  commitSubject = currentHead,
+  isClean = cleanCheckout,
+  resetIntegration = resetIntegrationCheckout,
 } = {}) {
   const commandName = request.commandName;
   const config = JSON.parse(readFileSync(configPath(), "utf8"));
   const command = resolveCommand(config, commandName);
   if (!command) {
+    const payload = {
+      command: commandName,
+      exit_code: 1,
+      summary: `Repository command ${commandName} is not configured.`,
+      stdout_digest: digest(""),
+      stderr_digest: digest(""),
+    };
     return receiptBase({
       request,
       type: "command_result",
       result: "not_configured",
       post: request.inputSubject,
-      payload: {
-        command: commandName,
-        exit_code: 1,
-        summary: `Repository command ${commandName} is not configured.`,
-        stdout_digest: digest(""),
-        stderr_digest: digest(""),
-      },
+      evidence: commandEvidence(request, "not_configured", payload),
+      payload,
     });
   }
   let repoDir = repoDirFor(request);
@@ -153,29 +192,50 @@ function commandReceipt(request, {
   }
   let execution;
   let post;
+  let finalCommandMutated = false;
   try {
     execution = executeCommand({ command, repoDir, timeoutMs: 7_200_000 });
-    post = computeSubject(repoDir);
+    if (request.actionKind === "final_command") {
+      const observedPost = commitSubject(repoDir);
+      finalCommandMutated = observedPost !== request.inputSubject || !isClean(repoDir);
+      post = finalCommandMutated ? request.inputSubject : observedPost;
+    } else {
+      post = computeSubject(repoDir);
+    }
   } finally {
+    if (request.actionKind === "final_command") {
+      const observedPost = commitSubject(repoDir);
+      if (observedPost !== request.inputSubject || !isClean(repoDir)) {
+        resetIntegration({ repoDir, subject: request.inputSubject });
+      }
+    }
     if (relockWorktree) relockWorktree();
   }
   const result = execution.notConfigured
     ? "not_configured"
+    : finalCommandMutated
+      ? "failure"
     : execution.exitCode === 0 && !execution.timedOut && !execution.signal
       ? "success"
       : "failure";
+  const payload = {
+    command: commandName,
+    exit_code: finalCommandMutated
+      ? 1
+      : execution.exitCode ?? 1,
+    summary: finalCommandMutated
+      ? `Repository final command ${commandName} mutated the tracked integration subject.`
+      : `Repository command ${commandName} exited with ${execution.exitCode}.`,
+    stdout_digest: digest(execution.stdout ?? ""),
+    stderr_digest: digest(execution.stderr ?? ""),
+  };
   return receiptBase({
     request,
     type: "command_result",
     result,
     post,
-    payload: {
-      command: commandName,
-      exit_code: execution.exitCode ?? 1,
-      summary: `Repository command ${commandName} exited with ${execution.exitCode}.`,
-      stdout_digest: digest(execution.stdout ?? ""),
-      stderr_digest: digest(execution.stderr ?? ""),
-    },
+    evidence: commandEvidence(request, result, payload),
+    payload,
   });
 }
 
@@ -192,6 +252,7 @@ function candidateReceipt(request) {
     type: "candidate_evidence",
     result: "success",
     post: candidateSubject,
+    evidence: candidateEvidence(request, candidate),
     payload: {
       tree: candidate.tree,
       diff_digest: digest(canonicalJson({
@@ -218,6 +279,7 @@ function integrationReceipt(request) {
     type: "integration_evidence",
     result: "success",
     post: evidence.integrated_head,
+    evidence: integrationEvidence(request, evidence),
     payload: {
       tree: evidence.tree,
       diff_digest: digest(canonicalJson(evidence)),
@@ -233,10 +295,21 @@ export function executeChildAction({
   grantWorktree = grantWorktreeToAgent,
   lockWorktreeHandle = lockWorktree,
   computeSubject = computeWorkspaceTreeOid,
+  commitSubject = currentHead,
+  isClean = cleanCheckout,
+  resetIntegration = resetIntegrationCheckout,
 } = {}) {
   const request = validateRequest(rawRequest);
   const receipt = request.actionKind === "command" || request.actionKind === "final_command"
-    ? commandReceipt(request, { executeCommand, grantWorktree, lockWorktreeHandle, computeSubject })
+    ? commandReceipt(request, {
+        executeCommand,
+        grantWorktree,
+        lockWorktreeHandle,
+        computeSubject,
+        commitSubject,
+        isClean,
+        resetIntegration,
+      })
     : request.actionKind === "candidate"
       ? candidateReceipt(request)
       : integrationReceipt(request);

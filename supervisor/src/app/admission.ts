@@ -99,8 +99,17 @@ function pipelineInvokesModel(manifest: ValidatedPipelineManifest): boolean {
   );
 }
 
-function pipelineUsesLoopActions(manifest: ValidatedPipelineManifest): boolean {
-  return manifest.manifest.stages.some((stage) => stage.executor.kind === "loop_action");
+function pipelineUsesOpenCodeLoopActions(manifest: ValidatedPipelineManifest, selectedAgent: Agent): boolean {
+  return manifest.manifest.stages.some((stage) =>
+    stage.executor.kind === "loop_action" &&
+    (
+      selectedAgent === "opencode" ||
+      (stage.unitPhaseBindings ?? []).some((binding) =>
+        (binding.kind === "agent" || binding.kind === "gate") &&
+        binding.worker.agent === "opencode"
+      )
+    )
+  );
 }
 
 function extractShipSelectionGraphId(context: string): string | undefined {
@@ -502,7 +511,7 @@ export async function handleCreated(
         `(set ${agentCredentialVariable(selectedAgent)}). No sandbox was provisioned.`
       );
     }
-    if (selectedAgent === "opencode" && pipelineUsesLoopActions(manifest)) {
+    if (pipelineUsesOpenCodeLoopActions(manifest, selectedAgent)) {
       throw new Error("OpenCode structured loop actions are not supported yet. No sandbox was provisioned.");
     }
     const snapshot = coordinator.store.saveRepositoryConfigSnapshot({
@@ -554,7 +563,7 @@ export async function handleCreated(
         runtime: coordinator.runtime,
         authorizedCapabilities: pinned.manifest.manifest.requires.capabilities,
         taskType,
-        taskContext: sanitizeText(initialContext).slice(0, 64_000),
+        taskContext: sanitizeText(initialContext),
       },
     });
   } catch (error) {

@@ -72,6 +72,7 @@ describe("child executor action", () => {
         pre: request.inputSubject,
         post: request.inputSubject,
       },
+      evidence: [expect.stringContaining("executor:command:action-1:missing:not_configured")],
       payload: {
         command: "missing",
         exit_code: 1,
@@ -182,6 +183,124 @@ describe("child executor action", () => {
     expect(result).toMatchObject({
       outcome: "success",
       subject: "3".repeat(40),
+    });
+    expect(JSON.parse(result.receipt).evidence).toEqual([
+      expect.stringContaining("executor:command:action-1:test:success"),
+    ]);
+  });
+
+  it("fails final commands that mutate the tracked integration subject", () => {
+    useRepositoryConfig({ test: "npm test" });
+
+    const resetIntegration = vi.fn();
+    const request = childExecutorRequest({
+      actionKind: "final_command",
+      unitId: null,
+      worktree: null,
+      commandName: "test",
+      inputSubject: "4".repeat(40),
+    });
+    const result = executeChildAction({
+      request,
+      executeCommand: () => ({ exitCode: 0, signal: null, timedOut: false, stdout: "ok", stderr: "" }),
+      commitSubject: () => "5".repeat(40),
+      isClean: () => true,
+      resetIntegration,
+    });
+    const receipt = JSON.parse(result.receipt);
+
+    expect(result).toMatchObject({
+      outcome: "failure",
+      subject: request.inputSubject,
+    });
+    expect(resetIntegration).toHaveBeenCalledWith({ repoDir: "/home/agent/repo", subject: request.inputSubject });
+    expect(receipt).toMatchObject({
+      type: "command_result",
+      result: "failure",
+      subject: {
+        pre: request.inputSubject,
+        post: request.inputSubject,
+      },
+      payload: {
+        command: "test",
+        exit_code: 1,
+        summary: expect.stringContaining("mutated the tracked integration subject"),
+      },
+    });
+  });
+
+  it("keeps final command subjects bound to the integration commit when the checkout stays clean", () => {
+    useRepositoryConfig({ test: "npm test" });
+
+    const resetIntegration = vi.fn();
+    const request = childExecutorRequest({
+      actionKind: "final_command",
+      unitId: null,
+      worktree: null,
+      commandName: "test",
+      inputSubject: "4".repeat(40),
+    });
+    const result = executeChildAction({
+      request,
+      executeCommand: () => ({ exitCode: 0, signal: null, timedOut: false, stdout: "ok", stderr: "" }),
+      commitSubject: () => request.inputSubject,
+      isClean: () => true,
+      resetIntegration,
+    });
+    const receipt = JSON.parse(result.receipt);
+
+    expect(result).toMatchObject({
+      outcome: "success",
+      subject: request.inputSubject,
+    });
+    expect(resetIntegration).not.toHaveBeenCalled();
+    expect(receipt).toMatchObject({
+      type: "command_result",
+      result: "success",
+      subject: {
+        pre: request.inputSubject,
+        post: request.inputSubject,
+      },
+    });
+  });
+
+  it("fails and restores final commands that leave the integration checkout dirty", () => {
+    useRepositoryConfig({ test: "npm test" });
+
+    const resetIntegration = vi.fn();
+    const request = childExecutorRequest({
+      actionKind: "final_command",
+      unitId: null,
+      worktree: null,
+      commandName: "test",
+      inputSubject: "4".repeat(40),
+    });
+    const result = executeChildAction({
+      request,
+      executeCommand: () => ({ exitCode: 0, signal: null, timedOut: false, stdout: "ok", stderr: "" }),
+      commitSubject: () => request.inputSubject,
+      isClean: () => false,
+      resetIntegration,
+    });
+    const receipt = JSON.parse(result.receipt);
+
+    expect(result).toMatchObject({
+      outcome: "failure",
+      subject: request.inputSubject,
+    });
+    expect(resetIntegration).toHaveBeenCalledWith({ repoDir: "/home/agent/repo", subject: request.inputSubject });
+    expect(receipt).toMatchObject({
+      type: "command_result",
+      result: "failure",
+      subject: {
+        pre: request.inputSubject,
+        post: request.inputSubject,
+      },
+      payload: {
+        command: "test",
+        exit_code: 1,
+        summary: expect.stringContaining("mutated the tracked integration subject"),
+      },
     });
   });
 

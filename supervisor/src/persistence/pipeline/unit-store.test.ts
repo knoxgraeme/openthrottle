@@ -550,11 +550,43 @@ describe("execution unit store", () => {
       ...input,
       unitPhases: ["command", "implement", "candidate", "lead", "integrate"],
     })).toThrow(/unitPhaseBindings must match unitPhases/);
+  });
 
-    expect(() => store.createGraph({
-      ...input,
-      commandNames: ["test"],
-    })).toThrow(/unitPhaseBindings command phases must match commandNames/);
+  it("persists per-unit plan command sequences instead of substituting graph command defaults", () => {
+    const store = setup();
+    const subject = "1".repeat(40);
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      commandNames: ["docs-check"],
+      units: [
+        { id: "a", commandNames: ["docs-check"] },
+        { id: "b", commandNames: [] },
+      ],
+      unitPhaseBindings: builtinUnitPhaseBindings(["test", "lint", "build"]),
+    });
+
+    expect(store.listUnits("attempt-parent")).toEqual([
+      expect.objectContaining({ unitId: "a", commandNames: ["docs-check"] }),
+      expect.objectContaining({ unitId: "b", commandNames: [] }),
+    ]);
+
+    const implement = lease(store);
+    store.completeUnitAction({ actionId: implement.id, resultHash: "r1", outputSubject: subject, receipt: receiptJson("unit_completion") });
+    store.completeUnitAction({ actionId: lease(store).id, resultHash: "r2", outputSubject: subject });
+    const unitCommand = lease(store);
+    expect(unitCommand).toMatchObject({ unit_id: "a", action_kind: "command", command_name: "docs-check" });
+    store.completeUnitAction({
+      actionId: unitCommand.id,
+      resultHash: "r3",
+      outputSubject: subject,
+      receipt: receiptJson("command_result", { payload: { command: "docs-check" } }),
+    });
+    expect(lease(store)).toMatchObject({ unit_id: "a", action_kind: "candidate" });
   });
 
   it("leases exactly one active child action at a time", () => {
@@ -1304,7 +1336,21 @@ describe("execution unit store", () => {
       resultHash: "result-hash",
       outcome: "failure",
       lastError: "child action returned failure",
+      nativeSessionId: "native-session-2",
     })).toMatchObject({ id: failed.id, status: "failed" });
+    expect(() => store.failUnitAction({
+      actionId: failed.id,
+      resultHash: "different-result",
+      outcome: "failure",
+      lastError: "child action returned failure",
+      nativeSessionId: "native-session-2",
+    })).toThrow(/already terminated with a different result/);
+    expect(() => store.stopRetryableUnitAction({
+      actionId: failed.id,
+      resultHash: "result-hash",
+      lastError: "child action returned failure",
+      nativeSessionId: "native-session-2",
+    })).toThrow(/already terminated with a different result/);
   });
 
   it("stops the graph from retryable child infrastructure evidence without marking a unit defect", () => {
@@ -1360,6 +1406,25 @@ describe("execution unit store", () => {
         alarm: false,
       }),
     ]);
+    expect(store.stopRetryableUnitAction({
+      actionId: retryable.id,
+      resultHash: "result-hash",
+      lastError: "model credential unavailable",
+      nativeSessionId: "native-session-2",
+    })).toMatchObject({ id: retryable.id, status: "dead" });
+    expect(() => store.stopRetryableUnitAction({
+      actionId: retryable.id,
+      resultHash: "result-hash",
+      lastError: "different infrastructure evidence",
+      nativeSessionId: "native-session-2",
+    })).toThrow(/already terminated with a different result/);
+    expect(() => store.failUnitAction({
+      actionId: retryable.id,
+      resultHash: "result-hash",
+      outcome: "failure",
+      lastError: "model credential unavailable",
+      nativeSessionId: "native-session-2",
+    })).toThrow(/already terminated with a different result/);
   });
 
   it("completes a recovered result through the current action pointer before any heal", () => {

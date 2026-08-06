@@ -19,6 +19,7 @@ import type { PipelineInstance, PipelineStageAttempt } from "./store.js";
 export interface ExecutionPlanUnit {
   id: string;
   dependencies?: readonly string[];
+  commandNames?: readonly string[];
 }
 
 // The durable per-unit sequence: implement/repair produces a unit_completion
@@ -58,6 +59,7 @@ export interface ExecutionUnitState {
   currentCycle: number;
   repairRounds: number;
   commandIndex: number;
+  commandNames?: readonly string[];
   acceptedCandidateSubject: string | null;
   integrationSubject: string | null;
   terminalLevel: UnitTerminalLevel | null;

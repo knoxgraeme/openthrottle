@@ -68,13 +68,18 @@ export interface LoopActionRequest {
   actionId: string;
   attemptId: string;
   graphId: string;
+  pipelineInstanceId?: string;
+  graphDigest?: string;
   parentRunId?: string;
   unitId: string | null;
+  generation?: number;
   role: "worker" | "lead" | "reviewer" | "publisher";
   loop: "implement" | "simplify" | "command" | "repair" | "lead" | "review" | "publish";
   agent: "claude" | "codex" | "opencode";
   skill: string;
   worktree: RuntimeWorktreeHandle | null;
+  baseSubject?: string;
+  inputSubject?: string;
   candidateSubject?: string | null;
   nativeSessionId: string | null;
   contextPolicy: "fresh" | "resume_required" | "prefer_resume";
@@ -84,6 +89,13 @@ export interface LoopActionRequest {
   credentialScopes: readonly LogicalCredential[];
   receiptSchema: string;
   expectedProducerSkill?: string;
+  expectedProducer?: {
+    workerId: string;
+    skill: string;
+    capabilityDigest: string;
+    skillPackageDigest: string | null;
+    assurance: AssuranceClass;
+  };
   repositorySkill?: RepositorySkillPackage;
   requestHash: string;
   idempotencyKey: string;

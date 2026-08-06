@@ -554,7 +554,8 @@ plus the graph-declared unit phase sequence, the pinned configured command
 names, the bounded max repair rounds, and the whole-change final phase
 (`command`/`review`/`repair`/`done`, `NULL` before the first unit integrates);
 `execution_units` stores the immutable unit projection, dependency list,
-authored order, active work pointer, current phase
+authored order, canonical execution-plan command sequence for that unit,
+active work pointer, current phase
 (`implement`/`simplify`/`command`/`candidate`/`lead`/`integrate`), current
 repair cycle, repair round count, command index, accepted/integration subjects,
 and terminal level/alarm fields; and `execution_work_attempts` stores each
@@ -564,7 +565,15 @@ name, idempotency key, runtime request/session hashes, lease owner/window,
 payload, result hash, output subject, receipt, and terminal/error state.
 Composite foreign keys bind every unit, action, receipt, and downstream
 context record to the same execution graph and parent attempt so cross-instance
-or mixed-attempt child identities are rejected durably. The durable unit
+or mixed-attempt child identities are rejected durably. When an execution plan
+declares commands, those commands are the authoritative command sequence:
+unit-scoped commands run only for their named unit, unscoped commands run for
+every unit, and the whole-change final command sequence uses the canonical plan
+command names. If the plan declares no commands, the graph's command phase
+defaults are used for backward-compatible structured runs. A declared command
+missing from the sealed repository config fails closed before child dispatch,
+and a `not_configured` receipt for a declared unit or final command is a failed
+gate. The durable unit
 reducer advances a unit through the persisted graph-declared phase order:
 implement (or repair on re-entry), optional simplify, declared command slots,
 executor candidate derivation, lead acceptance bound to that exact candidate

@@ -21,6 +21,7 @@ import {
   type UnitActionKind,
 } from "../pipeline/unit-coordinator.js";
 import {
+  assertStandardReceiptFence,
   assertCandidateEvidenceFence,
   evaluateFinalReviewGate,
   evaluateIntegrationGate,
@@ -165,6 +166,50 @@ function extractExecutionPlan(context: string): ExecutionPlanContract {
   return parseExecutionPlanContract(blocks[0]!, { source: "sealed.execution_plan" }).value;
 }
 
+function configuredCommandNamesFor(instance: PipelineInstance, store: PipelineStore): Set<string> {
+  const snapshot = store.getRepositoryConfigSnapshot(instance.repository_config_snapshot_id);
+  if (!snapshot || snapshot.digest !== instance.repository_config_digest) {
+    throw new Error(`pipeline instance ${instance.id} lost its sealed repository config`);
+  }
+  const config = JSON.parse(snapshot.normalized_config) as { commands?: Record<string, unknown> };
+  return new Set(Object.keys(config.commands ?? {}));
+}
+
+function uniqueInOrder(values: readonly string[]): string[] {
+  return values.filter((value, index) => values.indexOf(value) === index);
+}
+
+function commandPlanForUnits(input: {
+  plan: ExecutionPlanContract;
+  fallbackCommandNames: readonly string[];
+  configuredCommandNames: ReadonlySet<string>;
+}): {
+  graphCommandNames: string[];
+  units: Array<{ id: string; dependencies: readonly string[]; commandNames: string[] }>;
+} {
+  const planCommandNames = uniqueInOrder(input.plan.commands.map((command) => command.name));
+  const graphCommandNames = planCommandNames.length > 0
+    ? planCommandNames
+    : [...input.fallbackCommandNames];
+  for (const commandName of graphCommandNames) {
+    if (!input.configuredCommandNames.has(commandName)) {
+      throw new Error(`execution plan command ${commandName} is not configured in the sealed repository config`);
+    }
+  }
+  return {
+    graphCommandNames,
+    units: input.plan.units.map((unit) => ({
+      id: unit.id,
+      dependencies: unit.depends_on,
+      commandNames: input.plan.commands.length > 0
+        ? uniqueInOrder(input.plan.commands
+          .filter((command) => command.unit === undefined || command.unit === unit.id)
+          .map((command) => command.name))
+        : [...input.fallbackCommandNames],
+    })),
+  };
+}
+
 function normalizedLoopRequestForHash(
   request: Omit<LoopActionRequest, "requestHash" | "idempotencyKey">
 ): Omit<LoopActionRequest, "requestHash" | "idempotencyKey"> {
@@ -242,6 +287,15 @@ function loopKindFor(actionKind: UnitActionKind): LoopActionRequest["loop"] {
   throw new Error(`child action kind ${actionKind} has no loop kind`);
 }
 
+function receiptRoleFor(actionKind: UnitActionKind): ReceiptProducerRole {
+  if (actionKind === "command" || actionKind === "final_command") return "command";
+  if (actionKind === "candidate") return "candidate";
+  if (actionKind === "lead") return "lead";
+  if (actionKind === "integrate") return "integration";
+  if (actionKind === "final_review") return "review";
+  return "completion";
+}
+
 function roleFor(actionKind: UnitActionKind): LoopActionRequest["role"] {
   if (actionKind === "lead") return "lead";
   if (actionKind === "final_review") return "reviewer";
@@ -267,6 +321,34 @@ function compareAttemptOrder(left: ExecutionWorkAttempt, right: ExecutionWorkAtt
     left.attempt_ordinal - right.attempt_ordinal ||
     left.created_at.localeCompare(right.created_at) ||
     left.id.localeCompare(right.id);
+}
+
+function parentTaskContextFor(store: PipelineStore, parentAttemptId: string): string {
+  const attempt = store.getAttempt(parentAttemptId);
+  if (!attempt?.request_payload) return "";
+  const payload = JSON.parse(attempt.request_payload) as { taskContext?: unknown };
+  return typeof payload.taskContext === "string" ? payload.taskContext : "";
+}
+
+function planContextForAction(input: {
+  plan: ExecutionPlanContract | null;
+  action: ExecutionWorkAttempt;
+}): Record<string, unknown> | null {
+  if (!input.plan) return null;
+  const unit = input.action.unit_id
+    ? input.plan.units.find((unit) => unit.id === input.action.unit_id)
+    : undefined;
+  return {
+    schema: "openthrottle.loop-action-plan-context/v1",
+    graph_id: input.plan.graph_id,
+    action_kind: input.action.action_kind,
+    unit: unit ?? null,
+    instructions: input.plan.instructions,
+    acceptance: input.plan.acceptance,
+    commands: input.action.unit_id
+      ? input.plan.commands.filter((command) => command.unit === undefined || command.unit === input.action.unit_id)
+      : input.plan.commands,
+  };
 }
 
 function sha1SubjectForGitOperation(subject: string, label: string): string {
@@ -405,10 +487,12 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     instance: PipelineInstance,
     action: ExecutionWorkAttempt
   ): Record<ReceiptProducerRole, ExpectedReceiptProducer> => {
-    const implementationProbe = { ...action, action_kind: action.cycle > 1 ? "repair" as const : "implement" as const };
+    const completionProbe = action.action_kind === "simplify" || action.action_kind === "final_repair"
+      ? action
+      : { ...action, action_kind: action.cycle > 1 ? "repair" as const : "implement" as const };
     const leadProbe = { ...action, action_kind: "lead" as const };
     return {
-      completion: agentProducerFor(instance, implementationProbe, "completion"),
+      completion: agentProducerFor(instance, completionProbe, "completion"),
       candidate: builtinProducer("candidate_evidence", instance.capability_digest),
       command: builtinProducer("command_result", instance.capability_digest),
       lead: agentProducerFor(instance, leadProbe, "lead"),
@@ -417,25 +501,41 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     };
   };
 
+  const expectedProducerForAction = (
+    instance: PipelineInstance,
+    action: ExecutionWorkAttempt
+  ): ExpectedReceiptProducer => {
+    const role = receiptRoleFor(action.action_kind);
+    if (role === "candidate") return builtinProducer("candidate_evidence", instance.capability_digest);
+    if (role === "command") return builtinProducer("command_result", instance.capability_digest);
+    if (role === "integration") return builtinProducer("integration_evidence", instance.capability_digest);
+    return agentProducerFor(instance, action, role);
+  };
+
   const standardFenceFor = (
     instance: PipelineInstance,
     action: ExecutionWorkAttempt,
     subject: string
-  ): StandardReceiptFence => ({
-    pipelineInstanceId: instance.id,
-    graphDigest: instance.manifest_digest,
-    unitId: action.unit_id ?? "__final__",
-    attemptId: action.parent_attempt_id,
-    parentRunId: action.parent_run_id,
-    actionAttemptId: action.id,
-    generation: instance.generation,
-    nativeSessionId: action.native_session_id,
-    requestHash: action.request_hash ?? "",
-    baseSubject: worktreeBaseFor(instance, action),
-    preSubject: actionInputSubjectFor(instance, action),
-    subject,
-    producers: expectedProducersFor(instance, action),
-  });
+  ): StandardReceiptFence => {
+    const receiptNativeSessionId = action.receipt
+      ? parseStandardReceipt(action.receipt, { source: `child_action.${action.id}.receipt` }).value.fence.native_session_id
+      : action.native_session_id;
+    return {
+      pipelineInstanceId: instance.id,
+      graphDigest: instance.manifest_digest,
+      unitId: action.unit_id ?? "__final__",
+      attemptId: action.parent_attempt_id,
+      parentRunId: action.parent_run_id,
+      actionAttemptId: action.id,
+      generation: instance.generation,
+      nativeSessionId: receiptNativeSessionId,
+      requestHash: action.request_hash ?? "",
+      baseSubject: worktreeBaseFor(instance, action),
+      preSubject: actionInputSubjectFor(instance, action),
+      subject,
+      producers: expectedProducersFor(instance, action),
+    };
+  };
 
   const completedAttemptReceiptsFor = (parentAttemptId: string): Array<{
     attempt: ExecutionWorkAttempt;
@@ -557,12 +657,17 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       throw new Error(`child action kind ${action.action_kind} is executor-owned and cannot dispatch as a loop agent`);
     }
     const baseCommit = sha1SubjectForGitOperation(worktreeBaseFor(instance, action), "child action base subject");
+    const parentTaskContext = parentTaskContextFor(deps.store, action.parent_attempt_id);
+    const executionPlan = parentTaskContext
+      ? extractExecutionPlan(parentTaskContext)
+      : null;
+    const inputSubject = actionInputSubjectFor(instance, action);
     const createNewWorktree = action.action_kind === "implement" ||
       action.action_kind === "repair" ||
       action.action_kind === "final_repair";
-    const worktree = await (async (): Promise<LoopActionRequest["worktree"]> => {
-      if (roleFor(action.action_kind) !== "worker") return null;
-      if (!createNewWorktree || action.status === "dispatched") return worktreeHandleFor(action, baseCommit);
+      const worktree = await (async (): Promise<LoopActionRequest["worktree"]> => {
+        if (roleFor(action.action_kind) !== "worker") return null;
+      if (!createNewWorktree) return worktreeHandleFor(action, baseCommit);
       return deps.runtime.createWorktree(resource, {
         idempotencyKey: worktreeIdempotencyKey(action),
         attemptId: action.parent_attempt_id,
@@ -579,8 +684,11 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       actionId: action.id,
       attemptId: action.parent_attempt_id,
       graphId: action.execution_graph_id,
+      pipelineInstanceId: instance.id,
+      graphDigest: instance.manifest_digest,
       parentRunId: action.parent_run_id,
       unitId: action.unit_id,
+      generation: instance.generation,
       role: roleFor(action.action_kind),
       loop: loopKindFor(action.action_kind),
       agent: workerBinding?.worker.agent && workerBinding.worker.agent !== "inherit"
@@ -588,10 +696,26 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         : instance.agent,
       skill: workerBinding.repositorySkill?.invocation ?? adapterSkillFor(action.action_kind),
       worktree,
+      baseSubject: worktreeBaseFor(instance, action),
+      inputSubject,
       nativeSessionId: action.native_session_id,
       contextPolicy,
       timeoutMs: (workerBinding?.loop.timeout_seconds ?? deps.taskTimeoutSeconds) * 1_000,
-      transitionContext: action.payload,
+      transitionContext: [
+        "## Unit Action Context",
+        action.payload,
+        "",
+        "## Execution Plan Context",
+        canonicalJson(planContextForAction({ plan: executionPlan, action }) ?? {
+          schema: "openthrottle.loop-action-plan-context/v1",
+          action_kind: action.action_kind,
+          unit_id: action.unit_id,
+          unavailable: true,
+        }),
+        "",
+        "## Parent Task Context",
+        parentTaskContext,
+      ].join("\n"),
       ...(action.action_kind === "lead"
         ? {
             candidateSubject: deps.store.listUnits(action.parent_attempt_id)
@@ -608,6 +732,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       credentialScopes: workerBinding.credentials as LoopActionRequest["credentialScopes"],
       receiptSchema: RECEIPT_SCHEMA,
       expectedProducerSkill: expectedSkillFor(workerBinding),
+      expectedProducer: expectedProducerForAction(instance, action),
       ...(workerBinding?.repositorySkill ? { repositorySkill: workerBinding.repositorySkill } : {}),
     });
     await deps.runtime.dispatchLoopAction(resource, loopRequest);
@@ -663,101 +788,128 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     try {
       receipt = parseStandardReceipt(result.receipt, { source: `child_action.${action.id}.receipt` }).value;
     } catch (error) {
-      if (result.outcome === "failure" || result.outcome === "needs_human" ||
-          result.outcome === "retryable_infrastructure_failure") {
-        return {
-          terminal: true,
-          resultHash: digestNormalized(canonicalJson(result)),
-          outcome: result.outcome,
-          lastError: `child action ${action.id} returned ${result.outcome}: ${sanitizeText(result.receipt).slice(-500)}`,
-          nativeSessionId,
-        };
+      const outcome = result.outcome === "retryable_infrastructure_failure"
+        ? "retryable_infrastructure_failure"
+        : result.outcome === "needs_human"
+          ? "needs_human"
+          : "failure";
+      return {
+        terminal: true,
+        resultHash: digestNormalized(canonicalJson(result)),
+        outcome,
+        lastError: `child action ${action.id} returned malformed ${result.outcome} receipt: ${sanitizeText(result.receipt).slice(-500)}`,
+        nativeSessionId,
+      };
+    }
+    try {
+      const resultSubject = result.subject ?? receipt.subject.post;
+      if (!GIT_SUBJECT.test(resultSubject)) {
+        throw new Error(`child action ${action.id} completed without an exact subject`);
       }
-      throw error;
-    }
-    const resultSubject = result.subject ?? receipt.subject.post;
-    if (!GIT_SUBJECT.test(resultSubject)) {
-      throw new Error(`child action ${action.id} completed without an exact subject`);
-    }
-    if (action.action_kind === "lead") {
-      if (receipt.type !== "unit_decision") {
-        throw new Error(`child action ${action.id} returned ${receipt.type}, expected unit_decision`);
+      if (action.action_kind === "lead") {
+        if (receipt.type !== "unit_decision") {
+          throw new Error(`child action ${action.id} returned ${receipt.type}, expected unit_decision`);
+        }
+        const receiptEntries = completedAttemptReceiptsFor(action.parent_attempt_id);
+        const completion = unitCompletionAttemptReceipt(receiptEntries, action.unit_id, action.cycle);
+        const candidate = latestAttemptReceipt<CandidateEvidenceReceipt>(
+          receiptEntries,
+          "candidate_evidence",
+          action.unit_id,
+          action.cycle
+        );
+        const commands = commandAttemptReceipts(receiptEntries, action.unit_id, action.cycle);
+        const acceptedSubject = candidate.receipt.subject.post;
+        const decision = evaluateUnitAcceptanceGate({
+          expected: standardFenceFor(instance, action, acceptedSubject),
+          expectedReceipts: {
+            completion: standardFenceFor(instance, completion.attempt, completion.receipt.subject.post),
+            candidate: standardFenceFor(instance, candidate.attempt, candidate.receipt.subject.post),
+            commands: commands.map((command) => standardFenceFor(instance, command.attempt, command.receipt.subject.post)),
+            lead: standardFenceFor(instance, action, acceptedSubject),
+          },
+          completion: completion.receipt,
+          candidate: candidate.receipt,
+          commands: commands.map((command) => command.receipt),
+          expectedCommandNames: (() => {
+            const graph = deps.store.getGraphForAttempt(action.parent_attempt_id);
+            const unit = deps.store.listUnits(action.parent_attempt_id)
+              .find((unit) => unit.unitId === action.unit_id);
+            return unit?.commandNames ? [...unit.commandNames] : graph ? JSON.parse(graph.command_names) as string[] : [];
+          })(),
+          lead: receipt as UnitDecisionReceipt,
+        });
+        return collected(acceptedSubject, receipt, decision);
       }
-      const receiptEntries = completedAttemptReceiptsFor(action.parent_attempt_id);
-      const completion = unitCompletionAttemptReceipt(receiptEntries, action.unit_id, action.cycle);
-      const candidate = latestAttemptReceipt<CandidateEvidenceReceipt>(
-        receiptEntries,
-        "candidate_evidence",
-        action.unit_id,
-        action.cycle
-      );
-      const commands = commandAttemptReceipts(receiptEntries, action.unit_id, action.cycle);
-      const acceptedSubject = candidate.receipt.subject.post;
-      const decision = evaluateUnitAcceptanceGate({
-        expected: standardFenceFor(instance, action, acceptedSubject),
-        expectedReceipts: {
-          completion: standardFenceFor(instance, completion.attempt, completion.receipt.subject.post),
-          candidate: standardFenceFor(instance, candidate.attempt, candidate.receipt.subject.post),
-          commands: commands.map((command) => standardFenceFor(instance, command.attempt, command.receipt.subject.post)),
-          lead: standardFenceFor(instance, action, acceptedSubject),
-        },
-        completion: completion.receipt,
-        candidate: candidate.receipt,
-        commands: commands.map((command) => command.receipt),
-        expectedCommandNames: (() => {
-          const graph = deps.store.getGraphForAttempt(action.parent_attempt_id);
-          return graph ? JSON.parse(graph.command_names) as string[] : [];
-        })(),
-        lead: receipt as UnitDecisionReceipt,
-      });
-      return collected(acceptedSubject, receipt, decision);
-    }
-    if (action.action_kind === "integrate") {
-      if (receipt.type !== "integration_evidence") {
-        throw new Error(`child action ${action.id} returned ${receipt.type}, expected integration_evidence`);
+      if (action.action_kind === "integrate") {
+        if (receipt.type !== "integration_evidence") {
+          throw new Error(`child action ${action.id} returned ${receipt.type}, expected integration_evidence`);
+        }
+        const integrationSubject = receipt.subject.post;
+        const decision = evaluateIntegrationGate({
+          expected: standardFenceFor(instance, action, integrationSubject),
+          integration: receipt as IntegrationEvidenceReceipt,
+        });
+        return collected(integrationSubject, receipt, decision);
       }
-      const integrationSubject = receipt.subject.post;
-      const decision = evaluateIntegrationGate({
-        expected: standardFenceFor(instance, action, integrationSubject),
-        integration: receipt as IntegrationEvidenceReceipt,
-      });
-      return collected(integrationSubject, receipt, decision);
-    }
-    if (action.action_kind === "final_review") {
-      if (receipt.type !== "semantic_review") {
-        throw new Error(`child action ${action.id} returned ${receipt.type}, expected semantic_review`);
+      if (action.action_kind === "final_review") {
+        if (receipt.type !== "semantic_review") {
+          throw new Error(`child action ${action.id} returned ${receipt.type}, expected semantic_review`);
+        }
+        const receipts = completedAttemptReceiptsFor(action.parent_attempt_id);
+        const graph = deps.store.getGraphForAttempt(action.parent_attempt_id);
+        const commands = commandAttemptReceipts(receipts, null, action.cycle);
+        const reviewSubject = actionInputSubjectFor(instance, action);
+        const decision = evaluateFinalReviewGate({
+          expected: standardFenceFor(instance, action, reviewSubject),
+          expectedReceipts: {
+            commands: commands.map((command) => standardFenceFor(instance, command.attempt, command.receipt.subject.post)),
+            review: standardFenceFor(instance, action, reviewSubject),
+          },
+          commands: commands.map((command) => command.receipt),
+          expectedCommandNames: graph ? JSON.parse(graph.command_names) as string[] : [],
+          review: receipt as SemanticReviewReceipt,
+        });
+        return collected(reviewSubject, receipt, decision);
       }
-      const receipts = completedAttemptReceiptsFor(action.parent_attempt_id);
-      const graph = deps.store.getGraphForAttempt(action.parent_attempt_id);
-      const commands = commandAttemptReceipts(receipts, null, action.cycle);
-      const reviewSubject = actionInputSubjectFor(instance, action);
-      const decision = evaluateFinalReviewGate({
-        expected: standardFenceFor(instance, action, reviewSubject),
-        expectedReceipts: {
-          commands: commands.map((command) => standardFenceFor(instance, command.attempt, command.receipt.subject.post)),
-          review: standardFenceFor(instance, action, reviewSubject),
-        },
-        commands: commands.map((command) => command.receipt),
-        expectedCommandNames: graph ? JSON.parse(graph.command_names) as string[] : [],
-        review: receipt as SemanticReviewReceipt,
-      });
-      return collected(reviewSubject, receipt, decision);
+      const expectedType = action.action_kind === "command" || action.action_kind === "final_command"
+        ? "command_result"
+        : action.action_kind === "candidate"
+          ? "candidate_evidence"
+          : "unit_completion";
+      if (receipt.type !== expectedType) {
+        throw new Error(`child action ${action.id} returned ${receipt.type}, expected ${expectedType}`);
+      }
+      if (action.action_kind === "candidate") {
+        assertCandidateEvidenceFence({
+          expected: standardFenceFor(instance, action, receipt.subject.post),
+          candidate: receipt as CandidateEvidenceReceipt,
+        });
+      } else if (action.action_kind === "command" || action.action_kind === "final_command") {
+        assertStandardReceiptFence({
+          expected: standardFenceFor(instance, action, receipt.subject.post),
+          receipt: receipt as CommandResultReceipt,
+          role: "command",
+        });
+      } else {
+        assertStandardReceiptFence({
+          expected: standardFenceFor(instance, action, receipt.subject.post),
+          receipt: receipt as UnitCompletionReceipt,
+          role: "completion",
+        });
+      }
+      return collected(resultSubject, receipt);
+    } catch (error) {
+      return {
+        terminal: true,
+        resultHash: digestNormalized(canonicalJson(result)),
+        outcome: "failure",
+        lastError: `child action ${action.id} returned invalid ${result.outcome} receipt: ${
+          sanitizeText(error instanceof Error ? error.message : String(error)).slice(-500)
+        }`,
+        nativeSessionId,
+      };
     }
-    const expectedType = action.action_kind === "command" || action.action_kind === "final_command"
-      ? "command_result"
-      : action.action_kind === "candidate"
-        ? "candidate_evidence"
-        : "unit_completion";
-    if (receipt.type !== expectedType) {
-      throw new Error(`child action ${action.id} returned ${receipt.type}, expected ${expectedType}`);
-    }
-    if (action.action_kind === "candidate" && action.unit_id === null) {
-      assertCandidateEvidenceFence({
-        expected: standardFenceFor(instance, action, receipt.subject.post),
-        candidate: receipt as CandidateEvidenceReceipt,
-      });
-    }
-    return collected(resultSubject, receipt);
   };
 
   return {
@@ -767,6 +919,11 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         throw new Error(`pipeline composite stage ${request.stageId} is not active`);
       }
       const plan = extractExecutionPlan(request.taskContext);
+      const commandPlan = commandPlanForUnits({
+        plan,
+        fallbackCommandNames: stage.unitCommandNames ?? [],
+        configuredCommandNames: configuredCommandNamesFor(instance, deps.store),
+      });
       deps.store.createGraph({
         pipelineInstanceId: instance.id,
         parentAttemptId: request.attemptId,
@@ -774,8 +931,8 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         parentRunId: request.runId,
         graphDigest: instance.manifest_digest,
         planDigest: digestNormalized(canonicalJson(plan)),
-        units: plan.units.map((unit) => ({ id: unit.id, dependencies: unit.depends_on })),
-        commandNames: stage.unitCommandNames ?? [],
+        units: commandPlan.units,
+        commandNames: commandPlan.graphCommandNames,
         unitPhases: stage.unitPhases,
         unitPhaseBindings: stage.unitPhaseBindings,
       });

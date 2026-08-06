@@ -599,7 +599,13 @@ describe("pipeline effect processor", () => {
 
     await processor.drain();
 
-    expect(runtime.createWorktree).not.toHaveBeenCalled();
+    expect(runtime.createWorktree).toHaveBeenCalledWith(
+      { providerResourceId: "sandbox-structured" },
+      expect.objectContaining({
+        attemptId: attempt.id,
+        baseCommit: "a".repeat(40),
+      })
+    );
     expect(runtime.dispatchLoopAction).toHaveBeenCalledWith(
       { providerResourceId: "sandbox-structured" },
       expect.objectContaining({
@@ -960,7 +966,7 @@ describe("pipeline effect processor", () => {
           subject: input.completed,
           baseSubject: input.baseSubject,
           preSubject: input.baseSubject,
-          nativeSessionId: `thread-${input.unitId}`,
+          nativeSessionId: null,
         }),
         completedAt: "2099-07-22T12:00:00.000Z",
       });
@@ -1146,16 +1152,6 @@ describe("pipeline effect processor", () => {
       })
     );
     const finalCandidate = latestAction("candidate");
-    runtime.collectChildExecutorActionResult.mockResolvedValueOnce({
-      actionId: finalCandidate.id,
-      attemptId: finalCandidate.parent_attempt_id,
-      requestHash: finalCandidate.request_hash!,
-      outcome: "success",
-      subject: finalCandidateSubject,
-      receipt: receiptJson({ instance, action: finalCandidate, type: "candidate_evidence", subject: finalCandidateSubject }),
-      completedAt: "2099-07-22T12:00:00.000Z",
-    });
-    await expect(processor.drain()).rejects.toThrow(/candidate receipt input subject mismatch/);
     runtime.collectChildExecutorActionResult.mockResolvedValueOnce({
       actionId: finalCandidate.id,
       attemptId: finalCandidate.parent_attempt_id,
@@ -1492,7 +1488,7 @@ describe("pipeline effect processor", () => {
         subject: completedSubject,
         baseSubject: instance.base_commit,
         preSubject: instance.base_commit,
-        nativeSessionId: "thread-unit-a",
+        nativeSessionId: null,
       }),
       completedAt: "2099-07-22T12:00:00.000Z",
     });

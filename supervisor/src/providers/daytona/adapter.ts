@@ -183,16 +183,16 @@ function childExecutorEnv(request: ChildExecutorActionRequest): string {
   ].join(" ");
 }
 
-function requireLoopParentRunId(request: LoopActionRequest): string {
-  if (!request.parentRunId) throw new Error(`loop action ${request.actionId} is missing its parent run binding`);
-  return request.parentRunId;
-}
-
 function loopActionHeartbeatEnv(request: LoopActionRequest): string {
-  const parentRunId = requireLoopParentRunId(request);
+  if (!request.parentRunId) {
+    return [
+      "env",
+      `OT_CHILD_ACTION_ID=${shellSingleQuoted(request.actionId)}`,
+    ].join(" ");
+  }
   return [
     "env",
-    `RUN_ID=${shellSingleQuoted(parentRunId)}`,
+    `RUN_ID=${shellSingleQuoted(request.parentRunId)}`,
     `OT_CHILD_ACTION_ID=${shellSingleQuoted(request.actionId)}`,
   ].join(" ");
 }

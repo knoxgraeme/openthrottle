@@ -102,6 +102,14 @@ function assertReceiptFence(
   ) throw new Error(`${label} receipt producer mismatch`);
 }
 
+export function assertStandardReceiptFence(input: {
+  expected: StandardReceiptFence;
+  receipt: UnitCompletionReceipt | UnitDecisionReceipt | CommandResultReceipt | CandidateEvidenceReceipt | IntegrationEvidenceReceipt | SemanticReviewReceipt;
+  role: ReceiptProducerRole;
+}): void {
+  assertReceiptFence(input.receipt, input.expected, input.role);
+}
+
 // A lead or final-review receipt attests to a decision made from exact prior
 // evidence. Binding its `evidence` field to the receipt hashes of that prior
 // evidence stops an attestation with a correct identity/subject envelope but
@@ -128,12 +136,18 @@ function commandOutcome(
     return { outcome: "failure", result: "failed", reason: "command_receipts_missing_or_unexpected" };
   }
   for (const receipt of receipts) {
+    if (receipt.result === "not_configured") {
+      return { outcome: "failure", result: "failed", reason: "required_command_not_configured" };
+    }
     const decision = commandDecisionForEvidence({
-      not_configured: receipt.result === "not_configured",
+      not_configured: false,
       timed_out: false,
       exit_code: receipt.payload.exit_code,
       signal: null,
     });
+    if (receipt.result !== "success" && (decision.outcome === "success" || decision.outcome === "no_change")) {
+      return { outcome: "failure", result: "failed", reason: "command_receipt_failed" };
+    }
     if (decision.outcome !== "success" && decision.outcome !== "no_change") return decision;
   }
   return { outcome: "success", result: "passed", reason: "all_commands_current" };

@@ -60,6 +60,7 @@ export type ExecutionUnitRow = {
   unit_id: string;
   authored_order: number;
   dependency_unit_ids: string;
+  command_names: string;
   status: ExecutionUnitState["status"];
   phase: UnitPhase;
   current_cycle: number;
@@ -93,6 +94,7 @@ export function unitState(row: ExecutionUnitRow): ExecutionUnitState {
     currentCycle: row.current_cycle,
     repairRounds: row.repair_rounds,
     commandIndex: row.command_index,
+    commandNames: commandNamesForUnit(row),
     acceptedCandidateSubject: row.accepted_candidate_subject,
     integrationSubject: row.integration_subject,
     terminalLevel: row.terminal_level,
@@ -102,6 +104,10 @@ export function unitState(row: ExecutionUnitRow): ExecutionUnitState {
 
 export function commandNamesOf(graph: { command_names: string }): string[] {
   return parseJsonStringArray(graph.command_names);
+}
+
+export function commandNamesForUnit(unitRow: { command_names: string }): string[] {
+  return parseJsonStringArray(unitRow.command_names);
 }
 
 export function unitPhasesOf(graph: { unit_phases?: string }): UnitPhase[] {
@@ -206,7 +212,7 @@ export function nextUnitPhaseAfterCompletion(
 
 export function listUnitRowsForParentAttempt(db: Database.Database, parentAttemptId: string): ExecutionUnitRow[] {
   return db.prepare(`
-    SELECT id, unit_id, authored_order, dependency_unit_ids, status, phase, current_cycle,
+    SELECT id, unit_id, authored_order, dependency_unit_ids, command_names, status, phase, current_cycle,
       repair_rounds, command_index, active_work_attempt_id, accepted_candidate_subject,
       integration_subject, terminal_level, alarm
     FROM execution_units WHERE parent_attempt_id = ?
@@ -324,7 +330,7 @@ export function createOrResumeUnitAction(
   }
 ): ExecutionWorkAttempt {
   let unitRow = input.unitRow;
-  const commandNames = commandNamesOf(input.graph);
+  const commandNames = commandNamesForUnit(unitRow);
   const phases = phaseSequenceOf(input.graph);
   for (let guard = 0; guard < phases.length + commandNames.length + 1; guard += 1) {
     if (unitRow.phase === "command" && unitRow.command_index >= commandNames.length) {

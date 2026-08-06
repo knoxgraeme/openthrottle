@@ -135,6 +135,22 @@ function boundedArray(value, label, max = 32) {
   return [...value].sort();
 }
 
+function expectedProducer(value, label) {
+  const input = record(value, label);
+  const allowed = new Set(["workerId", "skill", "capabilityDigest", "skillPackageDigest", "assurance"]);
+  const unknown = Object.keys(input).find((key) => !allowed.has(key));
+  if (unknown) throw new Error(`${label} has unknown field ${unknown}`);
+  return {
+    workerId: string(input.workerId, `${label}.workerId`, /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
+    skill: string(input.skill, `${label}.skill`, /^[A-Za-z0-9][A-Za-z0-9._:/@#-]{0,255}$/),
+    capabilityDigest: string(input.capabilityDigest, `${label}.capabilityDigest`, /^[a-f0-9]{64}$/),
+    skillPackageDigest: input.skillPackageDigest === null
+      ? null
+      : string(input.skillPackageDigest, `${label}.skillPackageDigest`, /^[a-f0-9]{64}$/),
+    assurance: string(input.assurance, `${label}.assurance`, /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/),
+  };
+}
+
 export function configuredActionRoot(env = process.env) {
   const root = env.OT_LOOP_ACTION_ROOT ?? DEFAULT_ACTION_ROOT;
   if (typeof root !== "string" || !ABSOLUTE_PATH.test(root)) throw new Error("loop action root is invalid");
@@ -275,10 +291,11 @@ export function createLoopRequestHash(requestWithoutFence) {
 export function validateLoopRequest(value) {
   const input = record(value, "loop request");
   const allowed = new Set([
-    "protocol", "actionId", "attemptId", "graphId", "parentRunId", "unitId", "role", "loop",
-    "agent", "skill", "worktree", "candidateSubject", "nativeSessionId", "contextPolicy", "timeoutMs",
+    "protocol", "actionId", "attemptId", "graphId", "pipelineInstanceId", "graphDigest", "parentRunId",
+    "unitId", "generation", "role", "loop", "agent", "skill", "worktree", "baseSubject", "inputSubject",
+    "candidateSubject", "nativeSessionId", "contextPolicy", "timeoutMs",
     "transitionContext", "allowedMcpServers", "credentialScopes", "receiptSchema",
-    "expectedProducerSkill", "repositorySkill", "requestHash", "idempotencyKey",
+    "expectedProducerSkill", "expectedProducer", "repositorySkill", "requestHash", "idempotencyKey",
   ]);
   const unknown = Object.keys(input).find((key) => !allowed.has(key));
   if (unknown) throw new Error(`loop request has unknown field ${unknown}`);
@@ -296,8 +313,11 @@ export function validateLoopRequest(value) {
     actionId: stagePathId(input.actionId, "actionId"),
     attemptId: stagePathId(input.attemptId, "attemptId"),
     graphId: string(input.graphId, "graphId"),
+    ...(input.pipelineInstanceId === undefined ? {} : { pipelineInstanceId: stagePathId(input.pipelineInstanceId, "pipelineInstanceId") }),
+    ...(input.graphDigest === undefined ? {} : { graphDigest: string(input.graphDigest, "graphDigest", /^[a-f0-9]{64}$/) }),
     ...(input.parentRunId === undefined ? {} : { parentRunId: stagePathId(input.parentRunId, "parentRunId") }),
     unitId: nullableString(input.unitId, "unitId"),
+    ...(input.generation === undefined ? {} : { generation: input.generation }),
     role: string(input.role, "role"),
     loop: string(input.loop, "loop"),
     agent: string(input.agent, "agent"),
@@ -305,16 +325,19 @@ export function validateLoopRequest(value) {
     worktree: worktree === null ? null : {
       id: string(worktree.id, "worktree.id", /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
     },
+    ...(input.baseSubject === undefined ? {} : { baseSubject: string(input.baseSubject, "baseSubject", GIT_OBJECT_ID) }),
+    ...(input.inputSubject === undefined ? {} : { inputSubject: string(input.inputSubject, "inputSubject", GIT_OBJECT_ID) }),
     nativeSessionId: nullableString(input.nativeSessionId, "nativeSessionId", NATIVE_SESSION_ID),
     contextPolicy: string(input.contextPolicy, "contextPolicy"),
     timeoutMs: input.timeoutMs,
-    transitionContext: boundedText(input.transitionContext, "transitionContext", 64_000),
+    transitionContext: boundedText(input.transitionContext, "transitionContext", 262_144),
     allowedMcpServers: boundedArray(input.allowedMcpServers, "allowedMcpServers"),
     credentialScopes: boundedArray(input.credentialScopes, "credentialScopes"),
     receiptSchema: string(input.receiptSchema, "receiptSchema", /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,159}$/),
     ...(input.expectedProducerSkill === undefined
       ? {}
       : { expectedProducerSkill: string(input.expectedProducerSkill, "expectedProducerSkill", /^[A-Za-z0-9][A-Za-z0-9._:/@#-]{0,255}$/) }),
+    ...(input.expectedProducer === undefined ? {} : { expectedProducer: expectedProducer(input.expectedProducer, "expectedProducer") }),
   };
   if (request.receiptSchema !== STANDARD_RECEIPT_SCHEMA) throw new Error("loop receipt schema is unsupported");
   if (!ROLES.has(request.role)) throw new Error("role is invalid");
@@ -344,6 +367,10 @@ export function validateLoopRequest(value) {
   }
   if (!Number.isSafeInteger(request.timeoutMs) || request.timeoutMs < 1_000 || request.timeoutMs > 86_400_000) {
     throw new Error("timeoutMs is invalid");
+  }
+  if (request.generation !== undefined &&
+      (!Number.isSafeInteger(request.generation) || request.generation < 0)) {
+    throw new Error("generation is invalid");
   }
   if (request.role === "worker" && !request.worktree) throw new Error("worker loop requires a worktree");
   if (request.role !== "worker" && request.worktree) throw new Error("non-worker loop cannot receive a writable worktree");
@@ -378,10 +405,31 @@ export function resolveLoopInvocation(request) {
 export function loopPrompt(request) {
   const prefix = request.agent === "claude" ? "/" : "$";
   const entry = `${prefix}${request.skill}`;
+  const contract = canonicalJson({
+    schema: "openthrottle.loop-receipt-contract/v1",
+    pipeline_instance_id: request.pipelineInstanceId ?? null,
+    graph_id: request.graphId,
+    graph_digest: request.graphDigest ?? null,
+    parent_run_id: request.parentRunId ?? null,
+    unit_id: request.unitId ?? "__final__",
+    action_attempt_id: request.actionId,
+    generation: request.generation ?? null,
+    native_session_id: request.nativeSessionId,
+    request_hash: request.requestHash,
+    subject: {
+      base: request.baseSubject ?? null,
+      pre: request.inputSubject ?? null,
+    },
+    producer: request.expectedProducer ?? {
+      skill: request.expectedProducerSkill ?? request.repositorySkill?.reference ?? `builtin://${request.skill}@1`,
+    },
+    evidence: "Bind this receipt to exact output evidence for the requested action; do not reuse sibling or prior action evidence.",
+  });
   return `${entry}\n\n` +
     `This is one fenced OpenThrottle loop action (${request.actionId}) for ${request.role}/${request.loop}. ` +
     `Edit only the provided worktree when one is present. Do not commit, push, or alter executor state. ` +
-    `Return one receipt matching ${request.receiptSchema}.\n\n${request.transitionContext}`;
+    `Return one receipt matching ${request.receiptSchema} and the authority contract below.\n\n` +
+    `## Receipt Authority Contract\n${contract}\n\n${request.transitionContext}`;
 }
 
 export function prepareRootReadOnlyDirectory(path) {
@@ -757,11 +805,34 @@ export function parseLoopReceipt(raw, env = process.env) {
 }
 
 function assertLoopReceiptFence(receipt, request, subject) {
-  if (receipt.fence.attempt_id !== request.attemptId || receipt.fence.request_hash !== request.requestHash) {
+  if (receipt.fence.attempt_id !== request.attemptId || receipt.fence.request_hash !== request.requestHash ||
+      receipt.fence.action_attempt_id !== request.actionId) {
     throw new Error("loop receipt request fence mismatch");
   }
-  if (request.unitId !== null && receipt.fence.unit_id !== request.unitId) {
+  if (request.pipelineInstanceId !== undefined && receipt.fence.pipeline_instance_id !== request.pipelineInstanceId) {
+    throw new Error("loop receipt pipeline fence mismatch");
+  }
+  if (request.graphDigest !== undefined && receipt.fence.graph_digest !== request.graphDigest) {
+    throw new Error("loop receipt graph fence mismatch");
+  }
+  if (request.parentRunId !== undefined && receipt.fence.parent_run_id !== request.parentRunId) {
+    throw new Error("loop receipt parent run fence mismatch");
+  }
+  if (request.generation !== undefined && receipt.fence.generation !== request.generation) {
+    throw new Error("loop receipt generation fence mismatch");
+  }
+  if (receipt.fence.native_session_id !== request.nativeSessionId) {
+    throw new Error("loop receipt native session fence mismatch");
+  }
+  const expectedUnitId = request.unitId ?? "__final__";
+  if (receipt.fence.unit_id !== expectedUnitId) {
     throw new Error("loop receipt unit fence mismatch");
+  }
+  if (request.baseSubject !== undefined && receipt.subject.base !== request.baseSubject) {
+    throw new Error("loop receipt base subject mismatch");
+  }
+  if (request.inputSubject !== undefined && receipt.subject.pre !== request.inputSubject) {
+    throw new Error("loop receipt input subject mismatch");
   }
   if (subject !== null && receipt.subject.post !== subject) {
     throw new Error("loop receipt subject fence mismatch");
@@ -769,6 +840,15 @@ function assertLoopReceiptFence(receipt, request, subject) {
   const expectedProducerSkill = request.expectedProducerSkill ?? request.repositorySkill?.reference ?? `builtin://${request.skill}@1`;
   if (receipt.producer.skill !== expectedProducerSkill) {
     throw new Error("loop receipt producer skill mismatch");
+  }
+  if (request.expectedProducer) {
+    if (receipt.producer.worker_id !== request.expectedProducer.workerId ||
+        receipt.producer.skill !== request.expectedProducer.skill ||
+        receipt.producer.capability_digest !== request.expectedProducer.capabilityDigest ||
+        receipt.producer.skill_package_digest !== request.expectedProducer.skillPackageDigest ||
+        receipt.assurance !== request.expectedProducer.assurance) {
+      throw new Error("loop receipt producer mismatch");
+    }
   }
 }
 

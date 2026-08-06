@@ -120,7 +120,7 @@ const command = (
 describe("structured execution gates", () => {
   it("accepts a unit only from worker success, executor candidate evidence, commands, and a lead scope decision", () => {
     const candidate = receipt("candidate_evidence", "success");
-    const commands = [command("success", 0), command("not_configured", 0, "lint")];
+    const commands = [command("success", 0), command("success", 0, "lint")];
     expect(evaluateUnitAcceptanceGate({
       expected,
       completion: receipt("unit_completion", "success") as never,
@@ -139,6 +139,77 @@ describe("structured execution gates", () => {
       outcome: "success",
       result: "passed",
       reason: "lead_scope_match_accept",
+    });
+  });
+
+  it("fails unit acceptance when a declared plan command receipt was not executed", () => {
+    const candidate = receipt("candidate_evidence", "success");
+    expect(evaluateUnitAcceptanceGate({
+      expected,
+      completion: receipt("unit_completion", "success") as never,
+      candidate: candidate as never,
+      commands: [],
+      expectedCommandNames: ["docs-check"],
+      lead: receipt("unit_decision", "accept", {
+        payload: {
+          rationale: "Matches assigned scope.",
+          context_updates: [],
+          accepted_subject: expected.subject,
+        },
+        evidence: [hashOf(candidate)],
+      }) as never,
+    })).toMatchObject({
+      outcome: "failure",
+      result: "failed",
+      reason: "command_receipts_missing_or_unexpected",
+    });
+  });
+
+  it("fails unit acceptance when a declared plan command is reported not configured", () => {
+    const candidate = receipt("candidate_evidence", "success");
+    const docsCheck = command("not_configured", 0, "docs-check");
+    expect(evaluateUnitAcceptanceGate({
+      expected,
+      completion: receipt("unit_completion", "success") as never,
+      candidate: candidate as never,
+      commands: [docsCheck] as never,
+      expectedCommandNames: ["docs-check"],
+      lead: receipt("unit_decision", "accept", {
+        payload: {
+          rationale: "Matches assigned scope.",
+          context_updates: [],
+          accepted_subject: expected.subject,
+        },
+        evidence: [hashOf(candidate), hashOf(docsCheck)],
+      }) as never,
+    })).toMatchObject({
+      outcome: "failure",
+      result: "failed",
+      reason: "required_command_not_configured",
+    });
+  });
+
+  it("fails command gates from receipt result before interpreting payload exit code", () => {
+    const candidate = receipt("candidate_evidence", "success");
+    const failedCommand = command("failure", 0, "test");
+    expect(evaluateUnitAcceptanceGate({
+      expected,
+      completion: receipt("unit_completion", "success") as never,
+      candidate: candidate as never,
+      commands: [failedCommand] as never,
+      expectedCommandNames: ["test"],
+      lead: receipt("unit_decision", "accept", {
+        payload: {
+          rationale: "Matches assigned scope.",
+          context_updates: [],
+          accepted_subject: expected.subject,
+        },
+        evidence: [hashOf(candidate), hashOf(failedCommand)],
+      }) as never,
+    })).toMatchObject({
+      outcome: "failure",
+      result: "failed",
+      reason: "command_receipt_failed",
     });
   });
 

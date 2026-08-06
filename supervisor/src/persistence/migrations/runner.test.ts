@@ -123,6 +123,7 @@ describe("database migrations", () => {
       "5cf580fcb6d73b2b4ff4fdaa5cf4e1a7c14b2f84b945fcdf313caf36ca4cf662",
       "a4b0a5723dfa7953ca199dcb5e84da498771882bb19ecfde2e98f0e20cb4f825",
       "60d16031c8c20060780fa6e5517d0b7b4bd39484b63c5e972d19ab43ba1828b8",
+      "b75e921b54e36b415be7159cafe28f96a857ccc28127300f132680b9d0d6fa5e",
     ]);
   });
 

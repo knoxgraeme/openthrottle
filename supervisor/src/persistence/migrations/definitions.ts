@@ -1571,6 +1571,20 @@ ALTER TABLE execution_graphs ADD COLUMN unit_phase_bindings TEXT NOT NULL DEFAUL
 const executionGraphUnitPhaseBindingsMigrationSource = `${executionGraphUnitPhaseBindingsSchema}
 unit-phase-binding-contract:execution graphs persist the full compiled ordered unit phase binding without rereading mutable graph data/v1`;
 
+const executionUnitPlanCommandNamesSchema = `
+ALTER TABLE execution_units ADD COLUMN command_names TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(command_names));
+UPDATE execution_units
+SET command_names = COALESCE((
+  SELECT execution_graphs.command_names
+  FROM execution_graphs
+  WHERE execution_graphs.id = execution_units.execution_graph_id
+), '[]')
+WHERE command_names = '[]';
+`;
+
+const executionUnitPlanCommandNamesMigrationSource = `${executionUnitPlanCommandNamesSchema}
+unit-command-contract:execution units persist their canonical execution-plan command sequence and do not substitute graph defaults/v1`;
+
 function addExecutionGraphStopFence(db: Database.Database): void {
   if (!hasColumns(db, "execution_graphs", ["stopped_at"])) {
     db.exec("ALTER TABLE execution_graphs ADD COLUMN stopped_at TEXT");
@@ -2069,6 +2083,16 @@ const definitions: DatabaseMigrationDefinition[] = [
     up(db) {
       if (hasTable(db, "execution_graphs") && !hasColumns(db, "execution_graphs", ["unit_phase_bindings"])) {
         db.exec(executionGraphUnitPhaseBindingsSchema);
+      }
+    },
+  },
+  {
+    version: 22,
+    name: "execution-unit-plan-command-names",
+    source: executionUnitPlanCommandNamesMigrationSource,
+    up(db) {
+      if (hasTable(db, "execution_units") && !hasColumns(db, "execution_units", ["command_names"])) {
+        db.exec(executionUnitPlanCommandNamesSchema);
       }
     },
   },

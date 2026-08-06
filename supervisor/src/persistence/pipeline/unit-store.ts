@@ -32,6 +32,7 @@ import {
   createOrResumeFinalAction,
   createOrResumeUnitAction,
   DEFAULT_MAX_REPAIR_ROUNDS,
+  commandNamesForUnit,
   dependenciesFor,
   GATED_ACTION_KINDS,
   insertGateReceipt,
@@ -407,11 +408,13 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       unit_id: unit.id,
       authored_order: index,
       dependency_unit_ids: [...(unit.dependencies ?? [])].sort(),
+      command_names: [...(unit.commandNames ?? phaseProjection.commandNames)],
     }));
     const actualUnits = listUnitRows(input.parentAttemptId).map((row) => canonicalJson({
       unit_id: row.unit_id,
       authored_order: row.authored_order,
       dependency_unit_ids: dependenciesFor(row),
+      command_names: commandNamesForUnit(row),
     }));
     if (canonicalJson(actualUnits) !== canonicalJson(expectedUnits)) {
       throw new Error(`execution graph ${existing.id} replay unit set mismatch`);
@@ -427,13 +430,6 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       canonicalJson(unitPhaseBindingIds(input.unitPhaseBindings)) !== canonicalJson([...input.unitPhases])
     ) {
       throw new Error("execution graph unitPhaseBindings must match unitPhases");
-    }
-    const boundCommandNames = unitPhaseBindingCommandNames(input.unitPhaseBindings);
-    if (
-      input.commandNames &&
-      canonicalJson(boundCommandNames) !== canonicalJson([...input.commandNames])
-    ) {
-      throw new Error("execution graph unitPhaseBindings command phases must match commandNames");
     }
   }
 
@@ -456,6 +452,23 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     }
   }
 
+  function assertTerminalActionReplayMatches(input: {
+    action: ExecutionWorkAttempt;
+    status: "failed" | "dead";
+    resultHash: string;
+    nativeSessionId?: string | null;
+    lastError: string;
+  }): void {
+    if (
+      input.action.status !== input.status ||
+      input.action.result_hash !== input.resultHash ||
+      input.action.last_error !== input.lastError ||
+      (input.nativeSessionId !== undefined && input.action.native_session_id !== input.nativeSessionId)
+    ) {
+      throw new Error(`execution work attempt ${input.action.id} already terminated with a different result`);
+    }
+  }
+
   type UnitPhaseProjection = {
     commandNames: string[];
     unitPhases: UnitPhase[];
@@ -466,7 +479,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     assertUnitPhaseBindingsMatch(input);
     const unitPhaseBindings = input.unitPhaseBindings!;
     return {
-      commandNames: unitPhaseBindingCommandNames(unitPhaseBindings),
+      commandNames: input.commandNames ? [...input.commandNames] : unitPhaseBindingCommandNames(unitPhaseBindings),
       unitPhases: unitPhaseBindingIds(unitPhaseBindings),
       unitPhaseBindings,
     };
@@ -513,11 +526,12 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       timestamp
     );
     for (const [index, unit] of input.units.entries()) {
+      const unitCommandNames = canonicalJson([...(unit.commandNames ?? phaseProjection.commandNames)]);
       db.prepare(`
         INSERT INTO execution_units (
           id, execution_graph_id, pipeline_instance_id, parent_attempt_id, unit_id,
-          authored_order, dependency_unit_ids, status, phase, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+          authored_order, dependency_unit_ids, command_names, status, phase, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
         ON CONFLICT(parent_attempt_id, unit_id) DO NOTHING
       `).run(
         deterministicId("execution-unit", [input.parentAttemptId, unit.id]),
@@ -527,6 +541,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         unit.id,
         index,
         canonicalJson([...(unit.dependencies ?? [])].sort()),
+        unitCommandNames,
         initialUnitPhase,
         timestamp,
         timestamp
@@ -829,11 +844,23 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
   ): ExecutionWorkAttempt => {
     const timestamp = now();
     const action = loadActiveAction(db, input.actionId);
-    if (action.status === "failed" || action.status === "dead") return action;
+    const lastError = input.lastError.slice(0, 2_000);
+    if (action.status === "failed") {
+      assertTerminalActionReplayMatches({
+        action,
+        status: "failed",
+        resultHash: input.resultHash,
+        nativeSessionId: input.nativeSessionId,
+        lastError,
+      });
+      return action;
+    }
+    if (action.status === "dead") {
+      throw new Error(`execution work attempt ${input.actionId} already terminated with a different result`);
+    }
     if (!["leased", "dispatched", "running"].includes(action.status)) {
       throw new Error(`execution work attempt ${input.actionId} is not active`);
     }
-    const lastError = input.lastError.slice(0, 2_000);
     const update = db.prepare(`
       UPDATE execution_work_attempts
       SET status = 'failed', result_hash = ?, native_session_id = COALESCE(?, native_session_id),
@@ -867,11 +894,23 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
   ): ExecutionWorkAttempt => {
     const timestamp = now();
     const action = loadActiveAction(db, input.actionId);
-    if (action.status === "dead") return action;
+    const lastError = `retryable_infrastructure_failure: ${input.lastError}`.slice(0, 2_000);
+    if (action.status === "dead") {
+      assertTerminalActionReplayMatches({
+        action,
+        status: "dead",
+        resultHash: input.resultHash,
+        nativeSessionId: input.nativeSessionId,
+        lastError,
+      });
+      return action;
+    }
+    if (action.status === "failed") {
+      throw new Error(`execution work attempt ${input.actionId} already terminated with a different result`);
+    }
     if (!["leased", "dispatched", "running"].includes(action.status)) {
       throw new Error(`execution work attempt ${input.actionId} is not active`);
     }
-    const lastError = `retryable_infrastructure_failure: ${input.lastError}`.slice(0, 2_000);
     const update = db.prepare(`
       UPDATE execution_work_attempts
       SET status = 'dead', result_hash = ?, native_session_id = COALESCE(?, native_session_id),
