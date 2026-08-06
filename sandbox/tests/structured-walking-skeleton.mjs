@@ -19,7 +19,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 
 import { createPipelineEffectProcessor } from "../../supervisor/dist/operations/pipeline-effects.js";
 import { createSupervisorStore } from "../../supervisor/dist/persistence/store.js";
@@ -28,6 +28,7 @@ import { createPipelineStore } from "../../supervisor/dist/persistence/pipeline/
 import { loadPipelineCatalog, parseRepositoryConfig } from "../../supervisor/dist/pipeline/manifest.js";
 import { parseAndCompileExecutionGraph } from "../../supervisor/dist/pipeline/execution-graph.js";
 import { validateRuntimeCapabilityDescriptor } from "../../supervisor/dist/runtime/contracts.js";
+import { digestCanonicalJson } from "../../contracts/dist/index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..", "..");
@@ -44,13 +45,27 @@ const MAX_DRAIN_STEPS = 400;
 // A wedged container init or hung `docker exec` must fail this proof gate
 // loudly and fast, not hang until an outer CI timeout eventually kills it.
 const DOCKER_EXEC_TIMEOUT_MS = 10 * 60 * 1000;
+// Bounds real wall-clock time spent honoring pipeline-effects' RETRY_BASE_MS
+// * 2^n backoff in drainUntilSettled -- generous for the deliberate one-shot
+// command repair this harness exercises, without hot-looping through a
+// genuine failure's real backoff schedule only to discard the cause.
+const DRAIN_RETRY_BUDGET_MS = 3 * 60 * 1000;
+
+const BASE_EXEC_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+// The image's `claude` at /usr/local/bin/claude resolves through a symlink
+// to a `.exe`-suffixed target (pinned CLAUDE_CODE_VERSION). Docker's bind
+// mount resolves that destination symlink, so mounting the ESM stub directly
+// over /usr/local/bin/claude lands it under the `.exe` name and Node's
+// loader rejects it with ERR_UNKNOWN_FILE_EXTENSION. Instead the stub is
+// mounted at a fixed non-symlink container path and shadowed onto the
+// agent's PATH via a plain wrapper script, leaving the image's own claude
+// symlink untouched.
+const STUB_AGENT_CONTAINER_PATH = "/opt/openthrottle-stub/claude-stub.mjs";
+const STUB_BIN_DIR = "/opt/openthrottle-stub/bin";
+const AGENT_EXEC_PATH = `${STUB_BIN_DIR}:${BASE_EXEC_PATH}`;
 
 function log(message) {
   process.stderr.write(`[walking-skeleton] ${message}\n`);
-}
-
-function sha256(text) {
-  return createHash("sha256").update(text).digest("hex");
 }
 
 function assert(condition, message) {
@@ -189,12 +204,27 @@ function startContainer(fixture) {
     "-v",
     `${fixture.bareDir}:/fixture/repo.git`,
     "-v",
-    `${STUB_AGENT_PATH}:/usr/local/bin/claude:ro`,
+    `${STUB_AGENT_PATH}:${STUB_AGENT_CONTAINER_PATH}:ro`,
     IMAGE,
     "-f",
     "/dev/null",
   ]);
   return name;
+}
+
+// Shadows `claude` on the agent-facing PATH (AGENT_EXEC_PATH) with a plain
+// wrapper that execs the mounted stub -- see AGENT_EXEC_PATH's comment for
+// why this cannot just bind-mount over /usr/local/bin/claude directly. Both
+// the wrapper directory and the wrapper file must be world-traversable /
+// world-executable: the loop action later execs this as the unprivileged
+// `agent` user via gosu, not root.
+function installClaudeStubShadow(container) {
+  dockerExec(container, ["sh", "-c", `install -d -o root -g root -m 0755 '${STUB_BIN_DIR}'`]);
+  dockerExec(
+    container,
+    ["sh", "-c", `cat > '${STUB_BIN_DIR}/claude' && chown root:root '${STUB_BIN_DIR}/claude' && chmod 0755 '${STUB_BIN_DIR}/claude'`],
+    { input: `#!/bin/sh\nexec node '${STUB_AGENT_CONTAINER_PATH}' "$@"\n` }
+  );
 }
 
 function stopContainer(name) {
@@ -227,15 +257,28 @@ function createDockerSandboxRuntime(container) {
   const cachedLoopResults = new Map();
   const cachedChildResults = new Map();
   const worktreeHandles = new Map();
+  const dispatchedWorktreeIds = new Set();
   const counters = { createWorktree: 0, dispatchLoopAction: 0, dispatchChildExecutorAction: 0, cleanupWorktree: 0 };
 
+  // Must byte-for-byte match production's worktreeHandleFor
+  // (supervisor/src/operations/structured-child-runtime.ts), which computes
+  // the sealed worktree handle production embeds in the dispatched request
+  // and then DISCARDS this adapter's own createWorktree return value. If
+  // this derivation ever drifted from production's, the container worktree
+  // this adapter creates would silently stop matching the handle the sealed
+  // request actually references ("worktree handle does not exist").
   function requestHandleFor(input) {
-    return sha256(`${input.idempotencyKey}:${input.attemptId}:${input.baseCommit}`).slice(0, 32);
+    return digestCanonicalJson({
+      idempotencyKey: input.idempotencyKey,
+      attemptId: input.attemptId,
+      baseCommit: input.baseCommit,
+    }).slice(0, 32);
   }
 
   return {
     counters,
     worktreeHandles,
+    dispatchedWorktreeIds,
 
     async provision() {
       return { providerResourceId: container };
@@ -260,6 +303,7 @@ function createDockerSandboxRuntime(container) {
         "env",
         "-i",
         "HOME=/home/agent",
+        `PATH=${BASE_EXEC_PATH}`,
         "OT_COMPOSITE_PREPARE_ONLY=1",
         `OT_STAGE_REQUEST_FILE=${requestPath}`,
         `OT_STAGE_CONFIG_FILE=${STAGE_INPUT_DIR}/repository-config.json`,
@@ -307,6 +351,7 @@ function createDockerSandboxRuntime(container) {
 
     async dispatchLoopAction(_resource, request) {
       counters.dispatchLoopAction += 1;
+      if (request.worktree?.id) dispatchedWorktreeIds.add(request.worktree.id);
       const requestPath = `${LOOP_ACTION_DIR}/${request.attemptId}/${request.actionId}/request.json`;
       const outputPath = `${LOOP_ACTION_DIR}/${request.attemptId}/${request.actionId}/result.json`;
       const credentialsPath = `${LOOP_ACTION_DIR}/${request.attemptId}/${request.actionId}/credentials.json`;
@@ -318,7 +363,7 @@ function createDockerSandboxRuntime(container) {
         "USER=agent",
         "LOGNAME=agent",
         "SHELL=/bin/bash",
-        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        `PATH=${AGENT_EXEC_PATH}`,
         `RUN_ID=${request.parentRunId ?? "walking-skeleton"}`,
         `OT_CHILD_ACTION_ID=${request.actionId}`,
         "node",
@@ -359,6 +404,7 @@ function createDockerSandboxRuntime(container) {
 
     async dispatchChildExecutorAction(_resource, request) {
       counters.dispatchChildExecutorAction += 1;
+      if (request.worktree?.id) dispatchedWorktreeIds.add(request.worktree.id);
       const requestPath = `${CHILD_EXECUTOR_DIR}/${request.attemptId}/${request.actionId}/request.json`;
       const outputPath = `${CHILD_EXECUTOR_DIR}/${request.attemptId}/${request.actionId}/result.json`;
       dockerWriteRootFile(container, requestPath, JSON.stringify(request));
@@ -369,7 +415,7 @@ function createDockerSandboxRuntime(container) {
         "USER=agent",
         "LOGNAME=agent",
         "SHELL=/bin/bash",
-        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        `PATH=${BASE_EXEC_PATH}`,
         `OT_STAGE_CONFIG_FILE=${STAGE_INPUT_DIR}/repository-config.json`,
         `RUN_ID=${request.parentRunId}`,
         `OT_CHILD_ACTION_ID=${request.actionId}`,
@@ -524,18 +570,71 @@ function readGraphFile() {
   return graphFileCache;
 }
 
-async function drainUntilSettled(processor, pipelines, attemptId, label) {
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// pipeline-effects schedules a failed effect's retry at RETRY_BASE_MS * 2^n
+// against real wall-clock `now`. A tight drain() loop with no wait between
+// steps burns through MAX_DRAIN_STEPS in milliseconds without ever reaching
+// that retryAt, so a single transient effect failure looks identical to a
+// hang -- and the real cause (last_error) was discarded. This honors the
+// processor's own backoff with a bounded real wait instead, and surfaces the
+// underlying effect error verbatim when the retry budget is exhausted. Every
+// drain loop in this harness (full settlement, or a scenario's own
+// intermediate pause point) must go through this so none of them can
+// silently regress to the tight-loop-without-backoff anti-pattern this was
+// written to fix.
+async function drainWithBackoff(processor, pipelines, instanceId, isDone, label) {
+  const deadline = Date.now() + DRAIN_RETRY_BUDGET_MS;
+  let lastEffectError = null;
   for (let step = 0; step < MAX_DRAIN_STEPS; step += 1) {
     await processor.drain();
-    const attempt = pipelines.getAttempt(attemptId);
-    if (attempt && ["completed", "failed", "canceled", "superseded"].includes(attempt.status)) {
+    const result = isDone();
+    if (result) return result;
+    const pendingEffects = instanceId
+      ? pipelines.listEffects(instanceId).filter((effect) => effect.status === "pending" || effect.status === "failed")
+      : [];
+    if (pendingEffects.length === 0) continue;
+    for (const effect of pendingEffects) {
+      if (effect.last_error) lastEffectError = effect.last_error;
+    }
+    const earliestRetryAtMs = pendingEffects.reduce(
+      (earliest, effect) => Math.min(earliest, Date.parse(effect.next_attempt_at)),
+      Infinity
+    );
+    const waitMs = earliestRetryAtMs - Date.now();
+    if (waitMs <= 0) continue;
+    if (Date.now() + waitMs > deadline) {
+      throw new Error(
+        `${label}: did not settle within the ${DRAIN_RETRY_BUDGET_MS}ms retry budget` +
+          (lastEffectError ? `; last effect error: ${lastEffectError}` : "")
+      );
+    }
+    await sleep(waitMs);
+  }
+  throw new Error(
+    `${label}: did not settle within ${MAX_DRAIN_STEPS} drain steps` +
+      (lastEffectError ? `; last effect error: ${lastEffectError}` : "")
+  );
+}
+
+async function drainUntilSettled(processor, pipelines, attemptId, label) {
+  const instanceId = pipelines.getAttempt(attemptId)?.pipeline_instance_id ?? null;
+  return drainWithBackoff(
+    processor,
+    pipelines,
+    instanceId,
+    () => {
+      const attempt = pipelines.getAttempt(attemptId);
+      if (!attempt || !["completed", "failed", "canceled", "superseded"].includes(attempt.status)) return null;
       const outstanding = pipelines
         .listWorkAttempts(attemptId)
         .some((action) => ["pending", "leased", "dispatched", "running"].includes(action.status));
-      if (!outstanding) return attempt;
-    }
-  }
-  throw new Error(`${label}: graph did not settle within ${MAX_DRAIN_STEPS} drain steps`);
+      return outstanding ? null : attempt;
+    },
+    `${label}: graph`
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -598,6 +697,15 @@ async function runHappyPath({ db, container, fixture }) {
     "unit_a's deliberately failing first test command did not trigger a repair cycle"
   );
 
+  // Every sealed request that carried a worktree handle must be bound to a
+  // container worktree this adapter actually created under that exact
+  // handle -- production computes the handle independently of this
+  // adapter's createWorktree return value (see requestHandleFor's comment),
+  // so this is the proof the two never silently diverged.
+  for (const handle of runtime.dispatchedWorktreeIds) {
+    assert(runtime.worktreeHandles.has(handle), `sealed request referenced worktree handle ${handle} that was never created in the container`);
+  }
+
   log(
     `happy path settled: unit_a=${unitA.integrationSubject.slice(0, 12)} unit_b=${unitB.integrationSubject.slice(0, 12)} ` +
       `worktreeCreates=${runtime.counters.createWorktree} loopDispatches=${runtime.counters.dispatchLoopAction} ` +
@@ -608,28 +716,90 @@ async function runHappyPath({ db, container, fixture }) {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario: restart/replay -- a fresh processor bound to the SAME durable
-// store must not re-integrate or duplicate the aggregate.
+// Scenario: restart/replay -- paused at a genuinely NON-TERMINAL, mid-flight
+// point (unit_a integrated, unit_b not yet started -- real outstanding
+// work), a fresh processor and runtime bound to the SAME durable store must
+// resume without re-running or duplicating unit_a's already-completed
+// integration. Re-draining an already-terminal attempt (the prior version of
+// this scenario) can't exercise that resume path at all, and its aggregate
+// check could pass vacuously as null === null; this drives the run to a
+// real, non-null aggregate hash.
 // ---------------------------------------------------------------------------
 
-async function runReplayScenario({ db, container, happy }) {
-  log("scenario: restart/replay does not duplicate integration");
-  const runtime = createDockerSandboxRuntime(container);
-  const processor = createPipelineEffectProcessor({
-    store: happy.pipelines,
-    tickets: happy.tickets,
-    runtime,
+async function runReplayScenario({ db, container, fixture }) {
+  log("scenario: restart/replay from a non-terminal mid-integration state does not duplicate integration");
+  const pipelines = createPipelineStore(db);
+  const tickets = createSupervisorStore(db, pipelines);
+  const runtimeDescriptor = readRuntimeDescriptor(container);
+  const runtimeA = createDockerSandboxRuntime(container);
+  const plan = buildTwoUnitPlan({ planId: "walking-skeleton-replay" });
+  const { instance, attempt } = setupInstance({
+    db,
+    pipelines,
+    tickets,
+    runtimeDescriptor,
+    fixture,
+    issueId: "walking-skeleton-replay",
+    plan,
+  });
+  const processorA = createPipelineEffectProcessor({
+    store: pipelines,
+    tickets,
+    runtime: runtimeA,
     taskTimeoutSeconds: 300,
     now: () => new Date(),
   });
-  const before = happy.pipelines.getGraphForAttempt(happy.attempt.id);
-  for (let step = 0; step < 5; step += 1) await processor.drain();
-  const after = happy.pipelines.getGraphForAttempt(happy.attempt.id);
-  assert(after.aggregate_artifact_hash === before.aggregate_artifact_hash, "replay must not change the sealed aggregate hash");
-  assert(after.integration_subject === before.integration_subject, "replay must not move the integration head");
-  assert(runtime.counters.dispatchChildExecutorAction === 0, "replay must not dispatch a new integration");
-  assert(runtime.counters.dispatchLoopAction === 0, "replay must not dispatch a new loop action");
-  log("replay settled with zero new dispatches");
+
+  const unitAIntegrated = await drainWithBackoff(
+    processorA,
+    pipelines,
+    instance.id,
+    () =>
+      pipelines
+        .listWorkAttempts(attempt.id)
+        .find((action) => action.unit_id === "unit_a" && action.action_kind === "integrate" && action.status === "completed") ?? null,
+    "replay setup: unit_a's integration"
+  );
+
+  const midAttempt = pipelines.getAttempt(attempt.id);
+  assert(
+    !["completed", "failed", "canceled", "superseded"].includes(midAttempt.status),
+    `replay setup: attempt must still be non-terminal at the pause point, got ${midAttempt.status}`
+  );
+  assert(
+    pipelines.listWorkAttempts(attempt.id).every((action) => action.unit_id !== "unit_b"),
+    "replay setup: unit_b must not have started yet for this to be a genuine mid-flight pause"
+  );
+  const beforeOutputSubject = unitAIntegrated.output_subject;
+  const beforeCompletedAt = unitAIntegrated.completed_at;
+
+  // Simulate a supervisor restart: a brand-new processor and runtime
+  // adapter bound to the SAME durable store, with zero in-memory dispatch
+  // history -- proving durable idempotency, not just in-process
+  // continuation of the same processor/runtime objects.
+  const runtimeB = createDockerSandboxRuntime(container);
+  const processorB = createPipelineEffectProcessor({
+    store: pipelines,
+    tickets,
+    runtime: runtimeB,
+    taskTimeoutSeconds: 300,
+    now: () => new Date(),
+  });
+  const settled = await drainUntilSettled(processorB, pipelines, attempt.id, "replay restart");
+  assert(settled.status === "completed", `replay restart must still complete, got ${settled.status}`);
+
+  const unitAAfter = pipelines.listWorkAttempts(attempt.id).find((action) => action.id === unitAIntegrated.id);
+  assert(unitAAfter, "unit_a's original integrate action disappeared after restart");
+  assert(unitAAfter.output_subject === beforeOutputSubject, "restart must not recompute unit_a's already-completed integration");
+  assert(unitAAfter.completed_at === beforeCompletedAt, "restart must not re-run unit_a's already-completed integration");
+  const unitAIntegrateActions = pipelines
+    .listWorkAttempts(attempt.id)
+    .filter((action) => action.unit_id === "unit_a" && action.action_kind === "integrate");
+  assert(unitAIntegrateActions.length === 1, `unit_a must have exactly one integrate action, found ${unitAIntegrateActions.length} after restart`);
+
+  const graph = pipelines.getGraphForAttempt(attempt.id);
+  assert(graph?.aggregate_artifact_hash, "restart must still yield a non-null aggregate hash");
+  log(`replay restart settled with unit_a's integration unchanged (output_subject=${beforeOutputSubject.slice(0, 12)}) and aggregate hash ${graph.aggregate_artifact_hash.slice(0, 12)}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -663,7 +833,11 @@ async function runNeedsHumanScenario({ db, container, fixture }) {
     now: () => new Date(),
   });
   const settled = await drainUntilSettled(processor, pipelines, attempt.id, "needs-human");
-  assert(settled.status !== "completed", `an unaccepted unit must not settle as completed, got ${settled.status}`);
+  // attemptStatusForOutcome (supervisor/src/persistence/pipeline/transition-store.ts)
+  // maps every outcome except canceled/superseded/failure/retryable_infrastructure_failure
+  // -- including needs_human -- to status "completed"; the real semantic result lives in
+  // the separate `outcome` field, not `status`.
+  assert(settled.outcome === "needs_human", `an unaccepted unit must settle with outcome "needs_human", got ${settled.outcome}`);
   const units = pipelines.listUnits(attempt.id);
   const unitB = units.find((unit) => unit.unitId === "unit_b");
   // Pin the specific RAE6/RR16 mechanism -- not just "some non-completed
@@ -677,25 +851,46 @@ async function runNeedsHumanScenario({ db, container, fixture }) {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario: a worker cannot commit, push, or integrate directly -- reuses
-// the worktree created for unit_a's happy-path implement action.
+// Scenario: a worker cannot commit, push, or integrate directly -- runs
+// against the executor-owned integration checkout after the happy path has
+// populated it. lockIntegrationCheckout (sandbox/runner/execute-loop.mjs)
+// chowns this checkout root:root and chmods everything under .git to
+// 0600/0700, so the unprivileged `agent` user cannot even read .git/HEAD;
+// asserting only "nonzero exit" would also pass for an unrelated git
+// failure, so this pins the actual denial cause and proves the integration
+// ref never moved.
 // ---------------------------------------------------------------------------
 
 function runDirectMutationScenario({ container, happy }) {
   log("scenario: direct agent commit/push/integration attempts fail");
+  const beforeHead = dockerExec(container, ["git", "-C", INTEGRATION_REPO_DIR, "rev-parse", "HEAD"]).trim();
+
   const push = dockerExecStatus(
     container,
     ["git", "-C", INTEGRATION_REPO_DIR, "push", "origin", "HEAD:refs/heads/main"],
     { user: "agent" }
   );
   assert(push.status !== 0, "the agent user must not be able to push the integration checkout directly");
+  assert(
+    /permission denied/i.test(push.stderr),
+    `expected the direct push to fail on the root-owned integration-checkout permission fence, got: ${push.stderr}`
+  );
+
   const commit = dockerExecStatus(
     container,
     ["git", "-C", INTEGRATION_REPO_DIR, "commit", "--allow-empty", "-m", "direct mutation attempt"],
     { user: "agent" }
   );
   assert(commit.status !== 0, "the agent user must not be able to commit directly in the integration checkout");
-  log("direct commit/push attempts against the integration checkout were rejected as expected");
+  assert(
+    /permission denied/i.test(commit.stderr),
+    `expected the direct commit to fail on the root-owned integration-checkout permission fence, got: ${commit.stderr}`
+  );
+
+  const afterHead = dockerExec(container, ["git", "-C", INTEGRATION_REPO_DIR, "rev-parse", "HEAD"]).trim();
+  assert(afterHead === beforeHead, "the integration ref must be unchanged after the rejected direct mutation attempts");
+
+  log("direct commit/push attempts against the integration checkout were rejected on the permission fence; integration ref unchanged");
 }
 
 const GIT_SHA1 = /^[a-f0-9]{40}$/;
@@ -713,11 +908,12 @@ async function main() {
     const fixture = createFixtureRepo(workDir);
     log(`starting container from image ${IMAGE}`);
     container = startContainer(fixture);
+    installClaudeStubShadow(container);
 
     db = openDb(":memory:");
     const happy = await runHappyPath({ db, container, fixture });
     runDirectMutationScenario({ container, happy });
-    await runReplayScenario({ db, container, happy });
+    await runReplayScenario({ db, container, fixture });
     await runNeedsHumanScenario({ db, container, fixture });
 
     log("structured walking skeleton PASSED");

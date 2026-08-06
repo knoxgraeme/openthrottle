@@ -72,6 +72,7 @@ npm test --prefix sandbox
 bats sandbox/tests/runtime.bats
 docker build -f sandbox/Dockerfile -t openthrottle:test .   # context is repo root
 sandbox/tests/smoke.sh openthrottle:test                     # full lifecycle with stub agents
+node sandbox/tests/structured-walking-skeleton.mjs openthrottle:test  # two-unit structured Docker proof
 ```
 
 `.github/workflows/ci.yml` runs the typecheck/build/test/bats matrix plus the
