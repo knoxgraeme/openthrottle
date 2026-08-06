@@ -118,6 +118,165 @@ function candidateReceipt(subject: string, attempt: ExecutionWorkAttempt): strin
   });
 }
 
+function completionReceipt(subject: string, attempt: ExecutionWorkAttempt): string {
+  return canonicalJson({
+    schema: "openthrottle.receipt/v1",
+    type: "unit_completion",
+    assurance: "semantic_attested",
+    result: "success",
+    producer: {
+      worker_id: "worker-1",
+      skill: "builtin://implement-unit@1",
+      capability_digest: "d".repeat(64),
+      skill_package_digest: null,
+    },
+    subject: {
+      base: "a".repeat(40),
+      pre: "a".repeat(40),
+      post: subject,
+    },
+    fence: {
+      pipeline_instance_id: "instance-1",
+      graph_digest: "c".repeat(64),
+      unit_id: "unit_a",
+      attempt_id: "parent-attempt",
+      parent_run_id: "run-1",
+      action_attempt_id: attempt.id,
+      generation: 1,
+      native_session_id: null,
+      request_hash: attempt.request_hash,
+    },
+    evidence: [digestNormalized(`${attempt.id}:${subject}`)],
+    payload: {
+      summary: "Implemented.",
+      assumptions: [],
+      decisions: [],
+      issues: [],
+      verification: [],
+      downstream_context: [],
+      requested_human_input: [],
+    },
+    issued_at: "2099-07-22T12:00:00.000Z",
+  });
+}
+
+function semanticReviewReceipt(subject: string, attempt: ExecutionWorkAttempt, message: string): string {
+  return canonicalJson({
+    schema: "openthrottle.receipt/v1",
+    type: "semantic_review",
+    assurance: "semantic_attested",
+    result: "semantic_repair_required",
+    producer: {
+      worker_id: "reviewer",
+      skill: "builtin://final-review@1",
+      capability_digest: "d".repeat(64),
+      skill_package_digest: null,
+    },
+    subject: {
+      base: "a".repeat(40),
+      pre: subject,
+      post: subject,
+    },
+    fence: {
+      pipeline_instance_id: "instance-1",
+      graph_digest: "c".repeat(64),
+      unit_id: "__final__",
+      attempt_id: "parent-attempt",
+      parent_run_id: "run-1",
+      action_attempt_id: attempt.id,
+      generation: 7,
+      native_session_id: null,
+      request_hash: attempt.request_hash,
+    },
+    evidence: ["reviewed final subject"],
+    payload: {
+      summary: "Repair required.",
+      findings: [{ severity: "P1", message }],
+    },
+    issued_at: "2099-07-22T12:00:00.000Z",
+  });
+}
+
+function commandReceipt(subject: string, attempt: ExecutionWorkAttempt, summary = "passed"): string {
+  return canonicalJson({
+    schema: "openthrottle.receipt/v1",
+    type: "command_result",
+    assurance: "executor_verified",
+    result: "success",
+    producer: {
+      worker_id: "executor",
+      skill: "builtin://command_result@1",
+      capability_digest: "d".repeat(64),
+      skill_package_digest: null,
+    },
+    subject: {
+      base: "a".repeat(40),
+      pre: subject,
+      post: subject,
+    },
+    fence: {
+      pipeline_instance_id: "instance-1",
+      graph_digest: "c".repeat(64),
+      unit_id: "unit_a",
+      attempt_id: "parent-attempt",
+      parent_run_id: "run-1",
+      action_attempt_id: attempt.id,
+      generation: 1,
+      native_session_id: null,
+      request_hash: attempt.request_hash,
+    },
+    evidence: [digestNormalized(`${attempt.id}:${subject}`)],
+    payload: {
+      command: attempt.command_name ?? "test",
+      exit_code: 0,
+      summary,
+    },
+    issued_at: "2099-07-22T12:00:00.000Z",
+  });
+}
+
+function finalRepairCompletionReceipt(subject: string, attempt: ExecutionWorkAttempt, evidence: string[]): string {
+  return canonicalJson({
+    schema: "openthrottle.receipt/v1",
+    type: "unit_completion",
+    assurance: "semantic_attested",
+    result: "success",
+    producer: {
+      worker_id: "final-repair",
+      skill: "builtin://final-repair@1",
+      capability_digest: "d".repeat(64),
+      skill_package_digest: null,
+    },
+    subject: {
+      base: "a".repeat(40),
+      pre: subject,
+      post: subject,
+    },
+    fence: {
+      pipeline_instance_id: "instance-1",
+      graph_digest: "c".repeat(64),
+      unit_id: "__final__",
+      attempt_id: "parent-attempt",
+      parent_run_id: "run-1",
+      action_attempt_id: attempt.id,
+      generation: 7,
+      native_session_id: attempt.native_session_id,
+      request_hash: attempt.request_hash,
+    },
+    evidence,
+    payload: {
+      summary: "Repaired final review findings.",
+      assumptions: [],
+      decisions: [],
+      issues: [],
+      verification: [],
+      downstream_context: [],
+      requested_human_input: [],
+    },
+    issued_at: "2099-07-22T12:00:00.000Z",
+  });
+}
+
 function parentAttemptRequestPayload(plan: object = {
   schema: "openthrottle.execution-plan/v1",
   graph_id: "structured",
@@ -544,6 +703,19 @@ describe("structured child runtime repair fences", () => {
   });
 
   it("dispatches later final-repair rounds with a sealed resume session", async () => {
+    const finalReview = action({
+      id: "final-review-cycle-2",
+      action_kind: "final_review",
+      cycle: 2,
+      status: "completed",
+      attempt_ordinal: 3,
+      unit_id: null,
+      execution_unit_id: null,
+      request_hash: "e".repeat(64),
+      output_subject: "a".repeat(40),
+    });
+    finalReview.receipt = semanticReviewReceipt("a".repeat(40), finalReview, "current cycle finding");
+    finalReview.receipt_hash = digestNormalized(finalReview.receipt);
     const finalRepair = action({
       id: "final-repair-cycle-2",
       action_kind: "final_repair",
@@ -570,7 +742,7 @@ describe("structured child runtime repair fences", () => {
         markActionDispatching: vi.fn(),
         markActionDispatched: vi.fn(),
         markActionWorktreeReady: vi.fn(),
-        listWorkAttempts: () => [finalRepair],
+        listWorkAttempts: () => [finalReview, finalRepair],
         getGraphForAttempt: () => ({
           integration_subject: "a".repeat(40),
           command_names: "[]",
@@ -596,7 +768,183 @@ describe("structured child runtime repair fences", () => {
       loop: "repair",
       contextPolicy: "resume_required",
       nativeSessionId: "native-session-final-repair-1",
+      priorEvidence: {
+        schema: "openthrottle.loop-prior-evidence/v1",
+        role: "final_repair",
+      },
     });
+    expect(dispatched?.priorEvidence?.receipts[0]).toMatchObject({
+      role: "final_review",
+      actionAttemptId: "final-review-cycle-2",
+      receiptHash: finalReview.receipt_hash,
+    });
+    expect(dispatched?.priorEvidence?.receipts[0]?.receipt).toContain("current cycle finding");
+  });
+
+  it.each([
+    {
+      name: "missing final-review receipt",
+      attempts: (_finalReview: ExecutionWorkAttempt, finalRepair: ExecutionWorkAttempt) => [finalRepair],
+      error: /no triggering final-review receipt/,
+    },
+    {
+      name: "invalid final-review request fence",
+      attempts: (finalReview: ExecutionWorkAttempt, finalRepair: ExecutionWorkAttempt) => {
+        const receipt = JSON.parse(finalReview.receipt ?? "{}");
+        finalReview.receipt = canonicalJson({
+          ...receipt,
+          fence: {
+            ...receipt.fence,
+            request_hash: "f".repeat(64),
+          },
+        });
+        finalReview.receipt_hash = digestNormalized(finalReview.receipt);
+        return [finalReview, finalRepair];
+      },
+      error: /triggering final-review fence is invalid/,
+    },
+    {
+      name: "stale final-review subject",
+      attempts: (finalReview: ExecutionWorkAttempt, finalRepair: ExecutionWorkAttempt) => {
+        finalReview.receipt = semanticReviewReceipt("b".repeat(40), finalReview, "stale finding");
+        finalReview.receipt_hash = digestNormalized(finalReview.receipt);
+        return [finalReview, finalRepair];
+      },
+      error: /triggering final-review subject is stale/,
+    },
+  ])("fails closed before final-repair dispatch for $name", async ({ attempts, error }) => {
+    const finalReview = action({
+      id: "final-review-invalid-trigger",
+      action_kind: "final_review",
+      cycle: 2,
+      status: "completed",
+      attempt_ordinal: 3,
+      unit_id: null,
+      execution_unit_id: null,
+      request_hash: "e".repeat(64),
+      output_subject: "a".repeat(40),
+    });
+    finalReview.receipt = semanticReviewReceipt("a".repeat(40), finalReview, "current cycle finding");
+    finalReview.receipt_hash = digestNormalized(finalReview.receipt);
+    const finalRepair = action({
+      id: "final-repair-invalid-trigger",
+      action_kind: "final_repair",
+      cycle: 2,
+      status: "leased",
+      attempt_ordinal: 4,
+      unit_id: null,
+      execution_unit_id: null,
+      native_session_id: "native-session-final-repair-1",
+    });
+    const dispatchLoopAction = vi.fn();
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: {
+        createWorktree: vi.fn(async () => ({ id: "worktree-handle" })),
+        dispatchLoopAction,
+      } as any,
+      store: {
+        leaseNextUnitAction: () => finalRepair,
+        markActionDispatching: vi.fn(),
+        markActionDispatched: vi.fn(),
+        markActionWorktreeReady: vi.fn(),
+        listWorkAttempts: () => attempts(finalReview, finalRepair),
+        getGraphForAttempt: () => ({
+          integration_subject: "a".repeat(40),
+          command_names: "[]",
+        }),
+        getAttempt: () => ({ request_payload: parentAttemptRequestPayload() }),
+      } as any,
+    });
+
+    await expect(childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+      id: "instance-1",
+      active_stage_id: "structured",
+      agent: "codex",
+      generation: 7,
+      base_commit: "a".repeat(40),
+      immutable_subject: "a".repeat(40),
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({ stages: [{ id: "structured", unitPhaseBindings: [] }] }),
+    } as any, "parent-attempt")).rejects.toThrow(error);
+    expect(dispatchLoopAction).not.toHaveBeenCalled();
+  });
+
+  it("durably fails final-repair results that omit the triggering review hash", async () => {
+    const finalReview = action({
+      id: "final-review-trigger",
+      action_kind: "final_review",
+      cycle: 1,
+      status: "completed",
+      attempt_ordinal: 3,
+      unit_id: null,
+      execution_unit_id: null,
+      request_hash: "e".repeat(64),
+      output_subject: "a".repeat(40),
+    });
+    finalReview.receipt = semanticReviewReceipt("a".repeat(40), finalReview, "trigger finding");
+    finalReview.receipt_hash = digestNormalized(finalReview.receipt);
+    const finalRepair = action({
+      id: "final-repair-result",
+      action_kind: "final_repair",
+      cycle: 1,
+      status: "dispatched",
+      attempt_ordinal: 4,
+      unit_id: null,
+      execution_unit_id: null,
+      request_hash: "b".repeat(64),
+      native_session_id: "native-session-final-repair-1",
+    });
+    const receipt = finalRepairCompletionReceipt("a".repeat(40), finalRepair, ["repaired without trigger hash"]);
+    const failUnitAction = vi.fn();
+    const completeUnitAction = vi.fn();
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: {
+        collectLoopActionResult: async () => ({
+          actionId: finalRepair.id,
+          attemptId: "parent-attempt",
+          requestHash: "b".repeat(64),
+          outcome: "success",
+          nativeSessionId: "native-session-final-repair-1",
+          subject: "a".repeat(40),
+          receipt,
+          completedAt: "2099-07-22T12:00:00.000Z",
+        }),
+      } as any,
+      store: {
+        leaseNextUnitAction: () => finalRepair,
+        listWorkAttempts: () => [finalReview, finalRepair],
+        getGraphForAttempt: () => ({
+          integration_subject: "a".repeat(40),
+          command_names: "[]",
+        }),
+        failUnitAction,
+        completeUnitAction,
+      } as any,
+    });
+
+    await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+      id: "instance-1",
+      active_stage_id: "structured",
+      agent: "codex",
+      generation: 7,
+      base_commit: "a".repeat(40),
+      immutable_subject: "a".repeat(40),
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({ stages: [{ id: "structured", unitPhaseBindings: [] }] }),
+    } as any, "parent-attempt");
+
+    expect(completeUnitAction).not.toHaveBeenCalled();
+    expect(failUnitAction).toHaveBeenCalledWith(expect.objectContaining({
+      actionId: "final-repair-result",
+      outcome: "failure",
+      lastError: expect.stringContaining("final repair receipt evidence missing triggering final-review hash"),
+    }));
   });
 
   it("keeps an empty typed prior-evidence envelope on final review dispatch", async () => {
@@ -685,6 +1033,20 @@ describe("structured child runtime repair fences", () => {
     });
     currentCandidate.receipt = candidateReceipt(currentCandidateSubject, currentCandidate);
     currentCandidate.receipt_hash = digestNormalized(currentCandidate.receipt);
+    const completion = action({
+      id: "implement-cycle-2",
+      action_kind: "implement",
+      cycle: 2,
+      status: "completed",
+      attempt_ordinal: 1,
+      request_hash: "f".repeat(64),
+      output_subject: currentCandidateSubject,
+      receipt: null,
+      created_at: "2099-01-01T00:00:00.000Z",
+      completed_at: "2099-01-01T00:00:00.000Z",
+    });
+    completion.receipt = completionReceipt(currentCandidateSubject, completion);
+    completion.receipt_hash = digestNormalized(completion.receipt);
     const lead = action({
       id: "lead-cycle-2",
       action_kind: "lead",
@@ -715,7 +1077,7 @@ describe("structured child runtime repair fences", () => {
           integrationSubject: null,
           terminalLevel: null,
         })],
-        listWorkAttempts: () => [staleCandidate, currentCandidate, lead],
+        listWorkAttempts: () => [staleCandidate, completion, currentCandidate, lead],
         getGraphForAttempt: () => ({
           integration_subject: "a".repeat(40),
           command_names: "[]",
@@ -758,6 +1120,210 @@ describe("structured child runtime repair fences", () => {
     expect(dispatched).toMatchObject({
       actionId: "lead-cycle-2",
       candidateSubject: currentCandidateSubject,
+      priorEvidence: {
+        schema: "openthrottle.loop-prior-evidence/v1",
+        role: "lead",
+      },
     });
+    expect(dispatched?.priorEvidence?.receipts.map((receipt) => receipt.role)).toEqual(["completion", "candidate"]);
+    expect(dispatched?.priorEvidence?.receipts[1]?.actionAttemptId).toBe("candidate-cycle-2");
+  });
+
+  it("fails closed before dispatch when lead prior evidence exceeds the aggregate budget", async () => {
+    const subject = "2".repeat(40);
+    const completion = action({
+      id: "implement-large-evidence",
+      action_kind: "implement",
+      cycle: 1,
+      status: "completed",
+      attempt_ordinal: 1,
+      request_hash: "f".repeat(64),
+      output_subject: subject,
+    });
+    completion.receipt = completionReceipt(subject, completion);
+    completion.receipt_hash = digestNormalized(completion.receipt);
+    const candidate = action({
+      id: "candidate-large-evidence",
+      action_kind: "candidate",
+      cycle: 1,
+      status: "completed",
+      attempt_ordinal: 2,
+      request_hash: "e".repeat(64),
+      output_subject: subject,
+    });
+    candidate.receipt = candidateReceipt(subject, candidate);
+    candidate.receipt_hash = digestNormalized(candidate.receipt);
+    const commands = Array.from({ length: 16 }, (_, index) => {
+      const command = action({
+        id: `command-large-evidence-${index}`,
+        action_kind: "command",
+        cycle: 1,
+        status: "completed",
+        attempt_ordinal: 3 + index,
+        command_name: `test${index}`,
+        request_hash: digestNormalized(`command-many-receipts-${index}`),
+        output_subject: subject,
+      });
+      command.receipt = commandReceipt(subject, command, "x".repeat(4_000));
+      command.receipt_hash = digestNormalized(command.receipt);
+      return command;
+    });
+    const lead = action({
+      id: "lead-large-evidence",
+      action_kind: "lead",
+      cycle: 1,
+      status: "leased",
+      attempt_ordinal: 20,
+    });
+    const dispatchLoopAction = vi.fn();
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: { dispatchLoopAction } as any,
+      store: {
+        leaseNextUnitAction: () => lead,
+        markActionDispatching: vi.fn(),
+        markActionDispatched: vi.fn(),
+        listUnits: () => [unit({
+          unitId: "unit_a",
+          ordinal: 0,
+          status: "running",
+          phase: "lead",
+          currentCycle: 1,
+          integrationSubject: null,
+          terminalLevel: null,
+        })],
+        listWorkAttempts: () => [completion, candidate, ...commands, lead],
+        getGraphForAttempt: () => ({
+          integration_subject: "a".repeat(40),
+          command_names: JSON.stringify(commands.map((command) => command.command_name)),
+        }),
+        getAttempt: () => ({ request_payload: parentAttemptRequestPayload() }),
+      } as any,
+    });
+
+    await expect(childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+      id: "instance-1",
+      active_stage_id: "structured",
+      agent: "codex",
+      generation: 1,
+      base_commit: "a".repeat(40),
+      immutable_subject: "a".repeat(40),
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({
+        stages: [{
+          id: "structured",
+          unitPhaseBindings: [{
+            id: "lead",
+            kind: "gate",
+            loop: { skill: "builtin://accept-unit@1", timeout_seconds: 60 },
+            worker: { id: "lead-worker", agent: "inherit", allowed_mcp_servers: [] },
+            credentials: ["model.invoke", "repo.read"],
+            context: "fresh",
+          }],
+        }],
+      }),
+    } as any, "parent-attempt")).rejects.toThrow(/prior evidence exceeds aggregate bound/);
+    expect(dispatchLoopAction).not.toHaveBeenCalled();
+  });
+
+  it("fails closed before dispatch when lead prior evidence exceeds the receipt-count budget", async () => {
+    const subject = "2".repeat(40);
+    const completion = action({
+      id: "implement-many-receipts",
+      action_kind: "implement",
+      cycle: 1,
+      status: "completed",
+      attempt_ordinal: 1,
+      request_hash: "f".repeat(64),
+      output_subject: subject,
+    });
+    completion.receipt = completionReceipt(subject, completion);
+    completion.receipt_hash = digestNormalized(completion.receipt);
+    const candidate = action({
+      id: "candidate-many-receipts",
+      action_kind: "candidate",
+      cycle: 1,
+      status: "completed",
+      attempt_ordinal: 2,
+      request_hash: "e".repeat(64),
+      output_subject: subject,
+    });
+    candidate.receipt = candidateReceipt(subject, candidate);
+    candidate.receipt_hash = digestNormalized(candidate.receipt);
+    const commands = Array.from({ length: 17 }, (_, index) => {
+      const command = action({
+        id: `command-many-receipts-${index}`,
+        action_kind: "command",
+        cycle: 1,
+        status: "completed",
+        attempt_ordinal: 3 + index,
+        command_name: `test${index}`,
+        request_hash: digestNormalized(`command-count-receipts-${index}`),
+        output_subject: subject,
+      });
+      command.receipt = commandReceipt(subject, command);
+      command.receipt_hash = digestNormalized(command.receipt);
+      return command;
+    });
+    const lead = action({
+      id: "lead-many-receipts",
+      action_kind: "lead",
+      cycle: 1,
+      status: "leased",
+      attempt_ordinal: 21,
+    });
+    const dispatchLoopAction = vi.fn();
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: { dispatchLoopAction } as any,
+      store: {
+        leaseNextUnitAction: () => lead,
+        markActionDispatching: vi.fn(),
+        markActionDispatched: vi.fn(),
+        listUnits: () => [unit({
+          unitId: "unit_a",
+          ordinal: 0,
+          status: "running",
+          phase: "lead",
+          currentCycle: 1,
+          integrationSubject: null,
+          terminalLevel: null,
+        })],
+        listWorkAttempts: () => [completion, candidate, ...commands, lead],
+        getGraphForAttempt: () => ({
+          integration_subject: "a".repeat(40),
+          command_names: JSON.stringify(commands.map((command) => command.command_name)),
+        }),
+        getAttempt: () => ({ request_payload: parentAttemptRequestPayload() }),
+      } as any,
+    });
+
+    await expect(childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+      id: "instance-1",
+      active_stage_id: "structured",
+      agent: "codex",
+      generation: 1,
+      base_commit: "a".repeat(40),
+      immutable_subject: "a".repeat(40),
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({
+        stages: [{
+          id: "structured",
+          unitPhaseBindings: [{
+            id: "lead",
+            kind: "gate",
+            loop: { skill: "builtin://accept-unit@1", timeout_seconds: 60 },
+            worker: { id: "lead-worker", agent: "inherit", allowed_mcp_servers: [] },
+            credentials: ["model.invoke", "repo.read"],
+            context: "fresh",
+          }],
+        }],
+      }),
+    } as any, "parent-attempt")).rejects.toThrow(/prior evidence has too many receipts/);
+    expect(dispatchLoopAction).not.toHaveBeenCalled();
   });
 });

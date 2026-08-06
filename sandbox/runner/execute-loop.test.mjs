@@ -505,6 +505,78 @@ describe("loop action request validation", () => {
       .toThrow(/receiptHash does not match receipt/);
   });
 
+  it("validates triggering final-review evidence for final repair", () => {
+    const finalRepair = request({
+      unitId: null,
+      loop: "repair",
+      skill: "final-repair",
+      nativeSessionId: "native-final-repair-1",
+      contextPolicy: "resume_required",
+    });
+    const semanticReview = canonicalJson(standardReceipt(finalRepair, {
+      type: "semantic_review",
+      result: "semantic_repair_required",
+      subject: {
+        base: "1".repeat(40),
+        pre: "1".repeat(40),
+        post: computeWorkspaceTreeOid(loopWorktreeDirectory(finalRepair)),
+      },
+      fence: {
+        ...standardReceipt(finalRepair).fence,
+        unit_id: "__final__",
+        action_attempt_id: "final-review-1",
+      },
+      payload: {
+        summary: "Repair required.",
+        findings: [{ severity: "P1", message: "Fix the final review finding." }],
+      },
+    }));
+    const withoutFence = {
+      ...finalRepair,
+      priorEvidence: {
+        schema: "openthrottle.loop-prior-evidence/v1",
+        role: "final_repair",
+        receipts: [{
+          role: "final_review",
+          actionAttemptId: "final-review-1",
+          receiptHash: digest(semanticReview),
+          receipt: semanticReview,
+        }],
+      },
+    };
+    const { requestHash: _hash, idempotencyKey: _key, ...unfenced } = withoutFence;
+    const valid = validateLoopRequest({ ...unfenced, ...createLoopRequestHash(unfenced) });
+
+    expect(valid.priorEvidence.role).toBe("final_repair");
+    expect(loopPrompt(valid)).toContain("Fix the final review finding.");
+
+    const wrongReceipt = canonicalJson(standardReceipt(finalRepair, {
+      fence: {
+        ...standardReceipt(finalRepair).fence,
+        unit_id: "__final__",
+        action_attempt_id: "final-review-1",
+      },
+    }));
+    const malformed = {
+      ...unfenced,
+      priorEvidence: {
+        ...unfenced.priorEvidence,
+        receipts: [{ ...unfenced.priorEvidence.receipts[0], receiptHash: digest(wrongReceipt), receipt: wrongReceipt }],
+      },
+    };
+    expect(() => validateLoopRequest({ ...malformed, ...createLoopRequestHash(malformed) }))
+      .toThrow(/triggering receipt must be semantic_review/);
+
+    const wrongAction = {
+      ...unfenced,
+      unitId: "unit-1",
+      loop: "implement",
+      skill: "implement-unit",
+    };
+    expect(() => validateLoopRequest({ ...wrongAction, ...createLoopRequestHash(wrongAction) }))
+      .toThrow(/final repair prior evidence is only valid for final-repair loops/);
+  });
+
   it("rejects malformed typed loop context before agent invocation", () => {
     const receipt = canonicalJson(standardReceipt(request()));
     const malformedPrior = {
@@ -621,16 +693,15 @@ describe("loop action request validation", () => {
     })).toThrow(/repositorySkill\.reference is invalid/);
   });
 
-  it("passes native session IDs to every resumable engine adapter", () => {
-    for (const agent of ["claude", "codex", "opencode"]) {
+  it("passes native session IDs to supported resumable engine adapters", () => {
+    for (const agent of ["claude", "codex"]) {
       const valid = validateLoopRequest(request({
         agent,
-        ...(agent === "opencode" ? { model: "kimi-code/kimi-for-coding" } : {}),
         nativeSessionId: "native-1",
         contextPolicy: "resume_required",
       }));
       const built = loopAgentCommand({ request: valid, invocation: resolveLoopInvocation(valid) });
-      expect(built.args).toContain(agent === "claude" ? "--resume" : agent === "opencode" ? "--session" : "resume");
+      expect(built.args).toContain(agent === "claude" ? "--resume" : "resume");
       expect(built.args).toContain("native-1");
       if (agent === "codex") {
         expect(built.args.at(-1)).toBe(loopPrompt(valid));
@@ -642,22 +713,19 @@ describe("loop action request validation", () => {
   it("passes sealed models to each engine adapter and leaves omitted models on provider defaults", () => {
     const claude = validateLoopRequest(request({ agent: "claude", model: "claude-opus-4-1" }));
     const codex = validateLoopRequest(request({ agent: "codex", model: "gpt-5.1-code" }));
-    const opencode = validateLoopRequest(request({ agent: "opencode", model: "kimi-code/kimi-for-coding" }));
     const defaultCodex = validateLoopRequest(request({ agent: "codex" }));
 
     expect(loopAgentCommand({ request: claude, invocation: resolveLoopInvocation(claude) }).args)
       .toEqual(expect.arrayContaining(["--model", "claude-opus-4-1"]));
     expect(loopAgentCommand({ request: codex, invocation: resolveLoopInvocation(codex) }).args)
       .toEqual(expect.arrayContaining(["-m", "gpt-5.1-code"]));
-    expect(loopAgentCommand({ request: opencode, invocation: resolveLoopInvocation(opencode) }).args)
-      .toEqual(expect.arrayContaining(["--model", "kimi-code/kimi-for-coding"]));
     expect(loopAgentCommand({ request: defaultCodex, invocation: resolveLoopInvocation(defaultCodex) }).args)
       .not.toContain("-m");
+  });
 
-    expect(() => loopAgentCommand({
-      request: validateLoopRequest(request({ agent: "opencode" })),
-      invocation: { mode: "fresh", nativeSessionId: null },
-    })).toThrow(/requires a sealed model/);
+  it("rejects correctly hashed OpenCode loop requests before launch", () => {
+    expect(() => validateLoopRequest(request({ agent: "opencode", model: "kimi-code/kimi-for-coding" })))
+      .toThrow(/OpenCode loop actions are not supported yet/);
   });
 
   it("rejects a loop request declaring a credential scope outside the closed logical set", () => {

@@ -77,9 +77,10 @@ const STANDARD_RECEIPT_SCHEMA = "openthrottle.receipt/v1";
 const PRIOR_EVIDENCE_SCHEMA = "openthrottle.loop-prior-evidence/v1";
 const DOWNSTREAM_CONTEXT_SCHEMA = "openthrottle.downstream-context/v1";
 const MODEL_REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,239}$/;
-const PRIOR_EVIDENCE_ROLES = new Set(["lead", "final_review"]);
-const PRIOR_RECEIPT_ROLES = new Set(["completion", "candidate", "command", "final_command"]);
-const MAX_PRIOR_EVIDENCE_RECEIPTS = 34;
+const PRIOR_EVIDENCE_ROLES = new Set(["lead", "final_review", "final_repair"]);
+const PRIOR_RECEIPT_ROLES = new Set(["completion", "candidate", "command", "final_command", "final_review"]);
+const MAX_PRIOR_EVIDENCE_RECEIPTS = 18;
+const MAX_PRIOR_EVIDENCE_BYTES = 49_152;
 const MAX_PRIOR_EVIDENCE_RECEIPT_BYTES = 64 * 1024;
 const MAX_DOWNSTREAM_CONTEXT_RECORDS = 32;
 const MAX_DOWNSTREAM_CONTEXT_BYTES = 32_768;
@@ -210,7 +211,22 @@ function priorEvidence(value, label) {
   if (role === "final_review" && receipts.some((receipt) => receipt.role !== "final_command")) {
     throw new Error(`${label} contains non-final-command evidence for final review`);
   }
-  return { schema: PRIOR_EVIDENCE_SCHEMA, role, receipts };
+  if (role === "final_repair") {
+    if (receipts.length !== 1 || receipts[0].role !== "final_review") {
+      throw new Error(`${label} must contain exactly one triggering final-review receipt`);
+    }
+    const receipt = JSON.parse(receipts[0].receipt);
+    if (receipt.type !== "semantic_review") {
+      throw new Error(`${label} triggering receipt must be semantic_review`);
+    }
+  } else if (receipts.some((receipt) => receipt.role === "final_review")) {
+    throw new Error(`${label} contains final-review evidence for a non-repair action`);
+  }
+  const normalized = { schema: PRIOR_EVIDENCE_SCHEMA, role, receipts };
+  if (Buffer.byteLength(canonicalJson(normalized), "utf8") > MAX_PRIOR_EVIDENCE_BYTES) {
+    throw new Error(`${label} exceeds aggregate bound`);
+  }
+  return normalized;
 }
 
 function downstreamContext(value, label) {
@@ -463,6 +479,12 @@ export function validateLoopRequest(value) {
   if (request.role !== "lead" && candidateSubject) throw new Error("candidate subject is only valid for lead loops");
   if (request.priorEvidence?.role === "lead" && request.role !== "lead") throw new Error("lead prior evidence is only valid for lead loops");
   if (request.priorEvidence?.role === "final_review" && request.loop !== "review") throw new Error("final review prior evidence is only valid for review loops");
+  if (
+    request.priorEvidence?.role === "final_repair" &&
+    (request.role !== "worker" || request.loop !== "repair" || request.skill !== "final-repair" || request.unitId !== null)
+  ) {
+    throw new Error("final repair prior evidence is only valid for final-repair loops");
+  }
   if (worktree !== null && worktree.path !== undefined) throw new Error("loop request cannot carry an absolute worktree path");
   const requestWithSkill = {
     ...request,
@@ -472,6 +494,9 @@ export function validateLoopRequest(value) {
   const expected = createLoopRequestHash(requestWithSkill);
   if (input.requestHash !== expected.requestHash || input.idempotencyKey !== expected.idempotencyKey) {
     throw new Error("loop request hash or idempotency key is stale");
+  }
+  if (requestWithSkill.agent === "opencode") {
+    throw new Error("OpenCode loop actions are not supported yet");
   }
   return { ...requestWithSkill, ...expected };
 }
@@ -756,13 +781,7 @@ export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDi
     };
   }
   if (request.agent === "opencode") {
-    if (!request.model) throw new Error("OpenCode loop execution requires a sealed model selection");
-    return {
-      repoDir,
-      command: "opencode",
-      args: ["run", "--format", "json", "--model", request.model, "--dir", repoDir, "--auto", ...(invocation.mode === "resume" ? ["--session", invocation.nativeSessionId] : []), prompt],
-      input: undefined,
-    };
+    throw new Error("OpenCode loop actions are not supported yet");
   }
   return {
     repoDir,

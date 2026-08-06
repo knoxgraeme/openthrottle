@@ -27,6 +27,10 @@ import {
   loopActionTransitionContext,
 } from "../pipeline/structured-loop-envelope.js";
 import {
+  MAX_PRIOR_EVIDENCE_BYTES,
+  MAX_PRIOR_EVIDENCE_RECEIPTS,
+} from "../pipeline/structured-loop-limits.js";
+import {
   assertStandardReceiptFence,
   assertCandidateEvidenceFence,
   evaluateFinalReviewGate,
@@ -595,7 +599,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         (cycle === undefined || entry.attempt.cycle === cycle));
 
   const priorReceiptEntry = (
-    role: "completion" | "candidate" | "command" | "final_command",
+    role: "completion" | "candidate" | "command" | "final_command" | "final_review",
     entry: { attempt: ExecutionWorkAttempt; receipt: StandardReceipt }
   ): NonNullable<LoopActionRequest["priorEvidence"]>["receipts"][number] => {
     const receipt = canonicalJson(entry.receipt);
@@ -607,7 +611,20 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     };
   };
 
+  const assertPriorEvidenceEnvelopeBound = (
+    evidence: NonNullable<LoopActionRequest["priorEvidence"]>,
+    action: ExecutionWorkAttempt
+  ): void => {
+    if (evidence.receipts.length > MAX_PRIOR_EVIDENCE_RECEIPTS) {
+      throw new Error(`child action ${action.id} prior evidence has too many receipts`);
+    }
+    if (Buffer.byteLength(canonicalJson(evidence), "utf8") > MAX_PRIOR_EVIDENCE_BYTES) {
+      throw new Error(`child action ${action.id} prior evidence exceeds aggregate bound`);
+    }
+  };
+
   const priorEvidenceForAction = (
+    instance: PipelineInstance,
     action: ExecutionWorkAttempt,
     receipts: readonly { attempt: ExecutionWorkAttempt; receipt: StandardReceipt }[]
   ): LoopActionRequest["priorEvidence"] | undefined => {
@@ -621,7 +638,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         return undefined;
       }
       const commands = commandAttemptReceipts(receipts, action.unit_id, action.cycle);
-      return {
+      const evidence = {
         schema: "openthrottle.loop-prior-evidence/v1",
         role: "lead",
         receipts: [
@@ -629,15 +646,41 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           priorReceiptEntry("candidate", candidate),
           ...commands.map((command) => priorReceiptEntry("command", command)),
         ],
-      };
+      } satisfies NonNullable<LoopActionRequest["priorEvidence"]>;
+      assertPriorEvidenceEnvelopeBound(evidence, action);
+      return evidence;
     }
     if (action.action_kind === "final_review") {
       const commands = commandAttemptReceipts(receipts, null, action.cycle);
-      return {
+      const evidence = {
         schema: "openthrottle.loop-prior-evidence/v1",
         role: "final_review",
         receipts: commands.map((command) => priorReceiptEntry("final_command", command)),
-      };
+      } satisfies NonNullable<LoopActionRequest["priorEvidence"]>;
+      assertPriorEvidenceEnvelopeBound(evidence, action);
+      return evidence;
+    }
+    if (action.action_kind === "final_repair") {
+      let review: { attempt: ExecutionWorkAttempt; receipt: SemanticReviewReceipt };
+      try {
+        review = latestAttemptReceipt<SemanticReviewReceipt>(receipts, "semantic_review", null, action.cycle);
+      } catch {
+        throw new Error(`child final repair action ${action.id} has no triggering final-review receipt`);
+      }
+      if (review.attempt.action_kind !== "final_review" || review.attempt.request_hash !== review.receipt.fence.request_hash) {
+        throw new Error(`child final repair action ${action.id} triggering final-review fence is invalid`);
+      }
+      const expectedSubject = actionInputSubjectFor(instance, review.attempt);
+      if (review.receipt.subject.post !== expectedSubject) {
+        throw new Error(`child final repair action ${action.id} triggering final-review subject is stale`);
+      }
+      const evidence = {
+        schema: "openthrottle.loop-prior-evidence/v1",
+        role: "final_repair",
+        receipts: [priorReceiptEntry("final_review", review)],
+      } satisfies NonNullable<LoopActionRequest["priorEvidence"]>;
+      assertPriorEvidenceEnvelopeBound(evidence, action);
+      return evidence;
     }
     return undefined;
   };
@@ -734,13 +777,16 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     const worktree = roleFor(action.action_kind) === "worker"
       ? worktreeHandleFor(action, baseCommit)
       : null;
-    const needsPriorEvidence = action.action_kind === "lead" || action.action_kind === "final_review";
+    const needsPriorEvidence = action.action_kind === "lead" || action.action_kind === "final_review" || action.action_kind === "final_repair";
     const receipts = needsPriorEvidence
       ? completedAttemptReceiptsFor(action.parent_attempt_id)
       : [];
     const priorEvidence = needsPriorEvidence
-      ? priorEvidenceForAction(action, receipts)
+        ? priorEvidenceForAction(instance, action, receipts)
       : undefined;
+    if (needsPriorEvidence && !priorEvidence) {
+      throw new Error(`child action ${action.id} has no sealed prior evidence`);
+    }
     const leadCandidateSubject = action.action_kind === "lead"
       ? deps.store.listUnits(action.parent_attempt_id)
         .find((unit) => unit.unitId === action.unit_id)?.acceptedCandidateSubject ??
@@ -982,6 +1028,14 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           review: receipt as SemanticReviewReceipt,
         });
         return collected(reviewSubject, receipt, decision);
+      }
+      if (action.action_kind === "final_repair") {
+        const receipts = completedAttemptReceiptsFor(action.parent_attempt_id);
+        const trigger = priorEvidenceForAction(instance, action, receipts)?.receipts[0];
+        if (!trigger) throw new Error(`child final repair action ${action.id} has no triggering final-review evidence`);
+        if (!receipt.evidence.includes(trigger.receiptHash)) {
+          throw new Error(`final repair receipt evidence missing triggering final-review hash`);
+        }
       }
       const expectedType = action.action_kind === "command" || action.action_kind === "final_command"
         ? "command_result"

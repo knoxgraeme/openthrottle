@@ -6,9 +6,14 @@ import type {
   RepositorySkillPackage,
   ValidatedPipelineManifest,
 } from "./manifest.js";
+import {
+  MAX_LOOP_REQUEST_ENVELOPE_BYTES,
+  MAX_PRIOR_EVIDENCE_BYTES,
+} from "./structured-loop-limits.js";
 import type { UnitActionKind } from "./unit-coordinator.js";
 
-export const MAX_LOOP_REQUEST_ENVELOPE_BYTES = 262_144;
+export { MAX_LOOP_REQUEST_ENVELOPE_BYTES } from "./structured-loop-limits.js";
+
 const MAX_NATIVE_SESSION_ID = "n" + "s".repeat(199);
 
 type LoopActionPlanContextInput = {
@@ -99,12 +104,12 @@ function actionPayloadProbe(input: {
 }
 
 function priorReceiptProbe(input: {
-  role: "completion" | "candidate" | "command" | "final_command";
+  role: "completion" | "candidate" | "command" | "final_command" | "final_review";
   actionAttemptId: string;
-  receiptType: "unit_completion" | "candidate_evidence" | "command_result";
+  receiptType: "unit_completion" | "candidate_evidence" | "command_result" | "semantic_review";
   subject?: string;
 }): {
-  role: "completion" | "candidate" | "command" | "final_command";
+  role: "completion" | "candidate" | "command" | "final_command" | "final_review";
   actionAttemptId: string;
   receiptHash: string;
   receipt: string;
@@ -117,7 +122,11 @@ function priorReceiptProbe(input: {
     result: "success",
     producer: {
       worker_id: "worker-" + "w".repeat(32),
-      skill: input.receiptType === "command_result" ? "builtin://command@1" : "builtin://implement-unit@1",
+      skill: input.receiptType === "command_result"
+        ? "builtin://command@1"
+        : input.receiptType === "semantic_review"
+          ? "builtin://final-review@1"
+          : "builtin://implement-unit@1",
       capability_digest: "3".repeat(64),
       skill_package_digest: null,
     },
@@ -125,7 +134,7 @@ function priorReceiptProbe(input: {
     fence: {
       pipeline_instance_id: "instance-" + "i".repeat(32),
       graph_digest: "4".repeat(64),
-      unit_id: input.role === "final_command" ? "__final__" : "unit-" + "u".repeat(32),
+      unit_id: input.role === "final_command" || input.role === "final_review" ? "__final__" : "unit-" + "u".repeat(32),
       attempt_id: "attempt-" + "a".repeat(32),
       parent_run_id: "run-" + "b".repeat(32),
       action_attempt_id: input.actionAttemptId,
@@ -138,7 +147,9 @@ function priorReceiptProbe(input: {
       ? { command: "test", exit_code: 0, summary: "passed" }
       : input.receiptType === "candidate_evidence"
         ? { tree: subject, diff_digest: "6".repeat(64), changed_paths: [], clean: true }
-        : {
+        : input.receiptType === "semantic_review"
+          ? { summary: "review requires repair", findings: [{ severity: "P1", message: "repair required" }] }
+          : {
             summary: "completed",
             assumptions: [],
             decisions: [],
@@ -311,7 +322,7 @@ function loopRequestProbe(input: {
                 actionAttemptId: "execution-work-" + "b".repeat(32),
                 receiptType: "candidate_evidence",
               }),
-              ...Array.from({ length: 32 }, (_, index) => ({
+              ...Array.from({ length: 16 }, (_, index) => ({
                 ...priorReceiptProbe({
                   role: "command",
                   actionAttemptId: `execution-work-${index.toString(16).padStart(32, "0")}`,
@@ -327,13 +338,26 @@ function loopRequestProbe(input: {
           priorEvidence: {
             schema: "openthrottle.loop-prior-evidence/v1",
             role: "final_review",
-            receipts: Array.from({ length: 32 }, (_, index) => ({
+            receipts: Array.from({ length: 16 }, (_, index) => ({
               ...priorReceiptProbe({
                 role: "final_command",
                 actionAttemptId: `execution-work-${index.toString(16).padStart(32, "0")}`,
                 receiptType: "command_result",
               }),
             })),
+          },
+        }
+      : {}),
+    ...(input.actionKind === "final_repair"
+      ? {
+          priorEvidence: {
+            schema: "openthrottle.loop-prior-evidence/v1",
+            role: "final_repair",
+            receipts: [priorReceiptProbe({
+              role: "final_review",
+              actionAttemptId: "execution-work-" + "r".repeat(32),
+              receiptType: "semantic_review",
+            })],
           },
         }
       : {}),
@@ -363,6 +387,41 @@ function loopRequestProbe(input: {
   };
 }
 
+function withAggregatePriorEvidenceBudget(request: Record<string, unknown>): Record<string, unknown> {
+  if (!request.priorEvidence || typeof request.priorEvidence !== "object" || Array.isArray(request.priorEvidence)) {
+    return request;
+  }
+  const priorEvidence = request.priorEvidence as {
+    schema: string;
+    role: string;
+    receipts: Array<{ receipt: string }>;
+  };
+  if (priorEvidence.receipts.length === 0) return request;
+  const evidenceBytes = Buffer.byteLength(canonicalJson(priorEvidence), "utf8");
+  if (evidenceBytes >= MAX_PRIOR_EVIDENCE_BYTES) return request;
+  const last = priorEvidence.receipts[priorEvidence.receipts.length - 1]!;
+  const fillerBytes = MAX_PRIOR_EVIDENCE_BYTES - evidenceBytes;
+  const paddedReceipt = `${last.receipt}${"x".repeat(fillerBytes)}`;
+  return {
+    ...request,
+    priorEvidence: {
+      ...priorEvidence,
+      receipts: [
+        ...priorEvidence.receipts.slice(0, -1),
+        {
+          ...last,
+          // This intentionally makes the probe reserve the aggregate transport
+          // budget for prior evidence. Runtime validation owns semantic receipt
+          // validity; admission sizing must reserve bytes, not revalidate the
+          // synthetic probe receipt.
+          receiptHash: digestNormalized(paddedReceipt),
+          receipt: paddedReceipt,
+        },
+      ],
+    },
+  };
+}
+
 function loopActionEnvelopeBytes(input: {
   plan: ExecutionPlanContract;
   actionKind: UnitActionKind;
@@ -377,13 +436,13 @@ function loopActionEnvelopeBytes(input: {
     actionKind: input.actionKind,
     unitId: input.unitId,
   });
-  return Buffer.byteLength(canonicalJson(loopRequestProbe({
+  return Buffer.byteLength(canonicalJson(withAggregatePriorEvidenceBudget(loopRequestProbe({
     actionKind: input.actionKind,
     unitId: input.unitId,
     transitionContext,
     binding: input.binding,
     selectedAgent: input.selectedAgent,
-  })), "utf8");
+  }))), "utf8");
 }
 
 function unitEnvelopeActionsForManifest(input: {
