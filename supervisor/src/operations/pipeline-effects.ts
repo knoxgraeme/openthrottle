@@ -66,6 +66,10 @@ interface PipelineEffectProcessorDeps {
   runtime: SandboxRuntime & SandboxAutostopRuntime;
   taskTimeoutSeconds: number;
   now?: () => Date;
+  // Persists a Codex OAuth blob rotated inside one structured child action's
+  // own scoped CODEX_HOME. Supplied by the caller (see index.ts) rather than
+  // imported here: `operations` may not depend on `providers` directly.
+  captureCodexAuth?: (blob: string) => void;
 }
 
 interface StopEffectControl {
@@ -216,6 +220,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     runtime: deps.runtime,
     taskTimeoutSeconds: deps.taskTimeoutSeconds,
     now,
+    captureCodexAuth: deps.captureCodexAuth,
   });
 
   const resourceFor = async (instance: PipelineInstance): Promise<RuntimeResource> => {

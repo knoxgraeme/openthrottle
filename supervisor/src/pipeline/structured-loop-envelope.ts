@@ -7,6 +7,9 @@ import type {
   ValidatedPipelineManifest,
 } from "./manifest.js";
 import {
+  MAX_DOWNSTREAM_CONTEXT_BYTES,
+  MAX_DOWNSTREAM_CONTEXT_RECORDS,
+  MAX_DOWNSTREAM_CONTEXT_RECORD_PAYLOAD_BYTES,
   MAX_LOOP_REQUEST_ENVELOPE_BYTES,
   MAX_PRIOR_EVIDENCE_BYTES,
 } from "./structured-loop-limits.js";
@@ -262,6 +265,76 @@ function requestSkillFor(actionKind: UnitActionKind, binding: LoopEnvelopeBindin
   return binding.repositorySkill?.invocation ?? skillFor(actionKind);
 }
 
+const DOWNSTREAM_CONTEXT_SCHEMA = "openthrottle.downstream-context/v1";
+
+function downstreamContextPayloadFor(index: number, summaryLength: number): Record<string, unknown> {
+  return {
+    schema: DOWNSTREAM_CONTEXT_SCHEMA,
+    from_unit_id: `upstream-${index.toString(16).padStart(2, "0")}`,
+    summary: "x".repeat(Math.max(0, summaryLength)),
+  };
+}
+
+function downstreamContextRecordFor(index: number, summaryLength: number): {
+  fromUnitId: string;
+  payloadHash: string;
+  payload: Record<string, unknown>;
+} {
+  const payload = downstreamContextPayloadFor(index, summaryLength);
+  return {
+    fromUnitId: payload.from_unit_id as string,
+    payloadHash: digestCanonicalJson(payload),
+    payload,
+  };
+}
+
+// The longest summary whose payload still canonicalizes within the sandbox's
+// per-record cap (`boundedRecordPayload` in sandbox/runner/execute-loop.mjs).
+const MAX_DOWNSTREAM_CONTEXT_RECORD_SUMMARY_LENGTH = (() => {
+  let length = MAX_DOWNSTREAM_CONTEXT_RECORD_PAYLOAD_BYTES;
+  while (
+    length > 0 &&
+    Buffer.byteLength(canonicalJson(downstreamContextPayloadFor(0, length)), "utf8") >
+      MAX_DOWNSTREAM_CONTEXT_RECORD_PAYLOAD_BYTES
+  ) {
+    length -= 1;
+  }
+  return length;
+})();
+
+// The true maximum valid downstream-context aggregate: as many
+// per-record-capped records as fit under the shared aggregate byte cap
+// (MAX_DOWNSTREAM_CONTEXT_BYTES), with the final record's summary padded to
+// consume the exact remaining budget. This reserves the complete canonical
+// maximum admission, persistence, and the sandbox boundary all enforce,
+// rather than a representative under-sized sample.
+export const MAX_VALID_DOWNSTREAM_CONTEXT: Array<{
+  fromUnitId: string;
+  payloadHash: string;
+  payload: Record<string, unknown>;
+}> = (() => {
+  const records: ReturnType<typeof downstreamContextRecordFor>[] = [];
+  for (let index = 0; index < MAX_DOWNSTREAM_CONTEXT_RECORDS; index++) {
+    let summaryLength = MAX_DOWNSTREAM_CONTEXT_RECORD_SUMMARY_LENGTH;
+    let candidate = downstreamContextRecordFor(index, summaryLength);
+    let projected = Buffer.byteLength(canonicalJson([...records, candidate]), "utf8");
+    if (projected <= MAX_DOWNSTREAM_CONTEXT_BYTES) {
+      records.push(candidate);
+      continue;
+    }
+    // This record no longer fits at the per-record cap: shrink it until it
+    // exactly consumes the remaining aggregate budget, then stop.
+    while (summaryLength > 0 && projected > MAX_DOWNSTREAM_CONTEXT_BYTES) {
+      summaryLength -= 1;
+      candidate = downstreamContextRecordFor(index, summaryLength);
+      projected = Buffer.byteLength(canonicalJson([...records, candidate]), "utf8");
+    }
+    if (projected <= MAX_DOWNSTREAM_CONTEXT_BYTES) records.push(candidate);
+    break;
+  }
+  return records;
+})();
+
 function loopRequestProbe(input: {
   actionKind: UnitActionKind;
   unitId: string | null;
@@ -363,18 +436,7 @@ function loopRequestProbe(input: {
       : {}),
     ...(input.unitId
       ? {
-          downstreamContext: Array.from({ length: 32 }, (_, index) => {
-            const payload = {
-              schema: "openthrottle.downstream-context/v1",
-              from_unit_id: `upstream-${index.toString(16).padStart(2, "0")}`,
-              summary: "x".repeat(760),
-            };
-            return {
-              fromUnitId: payload.from_unit_id,
-              payloadHash: digestCanonicalJson(payload),
-              payload,
-            };
-          }),
+          downstreamContext: MAX_VALID_DOWNSTREAM_CONTEXT,
         }
       : {}),
     ...(input.binding.repositorySkill === undefined ? {} : { repositorySkill: input.binding.repositorySkill }),

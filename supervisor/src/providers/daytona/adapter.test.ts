@@ -464,6 +464,86 @@ describe("Daytona stage execution", () => {
     })).rejects.toThrow(/invalid envelope/);
   });
 
+  it("parses a rotated Codex auth blob within the byte cap and rejects an invalid or oversized one", async () => {
+    const remoteFiles = new Map<string, Buffer>();
+    const sandbox = {
+      id: "provider-opaque-codex-auth",
+      state: "started",
+      fs: {
+        downloadFile: vi.fn(async (path: string) => {
+          const file = remoteFiles.get(path);
+          if (!file) throw new Error("not found");
+          return file;
+        }),
+      },
+    } as unknown as Sandbox;
+    const runtime = createDaytonaSandboxRuntime({ get: vi.fn(async () => sandbox) } as never, {
+      snapshot: "snapshot-v1",
+      materializeCredentialEnv: vi.fn(async () => ({ env: {} })),
+    });
+    const resource = { providerResourceId: "provider-opaque-codex-auth" };
+    const baseResult = {
+      version: 1,
+      kind: "loop_action_result",
+      action_id: "loop-1",
+      attempt_id: "attempt-child",
+      outcome: "success",
+      native_session_id: "thread-1",
+      subject: "d".repeat(40),
+      receipt: "done",
+      created_at: "2026-07-22T00:00:00.000Z",
+    };
+
+    remoteFiles.set("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/result.json", Buffer.from(JSON.stringify({
+      ...baseResult,
+      request_hash: "a".repeat(64),
+      codex_auth_json: "rotated-codex-auth-blob",
+    })));
+    await expect(runtime.collectLoopActionResult(resource, {
+      attemptId: "attempt-child",
+      actionId: "loop-1",
+      requestHash: "a".repeat(64),
+    })).resolves.toMatchObject({
+      actionId: "loop-1",
+      codexAuthJson: "rotated-codex-auth-blob",
+    });
+
+    remoteFiles.set("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/result.json", Buffer.from(JSON.stringify({
+      ...baseResult,
+      request_hash: "b".repeat(64),
+      codex_auth_json: 12345,
+    })));
+    await expect(runtime.collectLoopActionResult(resource, {
+      attemptId: "attempt-child",
+      actionId: "loop-1",
+      requestHash: "b".repeat(64),
+    })).rejects.toThrow(/invalid envelope/);
+
+    remoteFiles.set("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/result.json", Buffer.from(JSON.stringify({
+      ...baseResult,
+      request_hash: "c".repeat(64),
+      codex_auth_json: "a".repeat(65_536),
+    })));
+    await expect(runtime.collectLoopActionResult(resource, {
+      attemptId: "attempt-child",
+      actionId: "loop-1",
+      requestHash: "c".repeat(64),
+    })).resolves.toMatchObject({
+      codexAuthJson: "a".repeat(65_536),
+    });
+
+    remoteFiles.set("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/result.json", Buffer.from(JSON.stringify({
+      ...baseResult,
+      request_hash: "d".repeat(64),
+      codex_auth_json: "a".repeat(65_537),
+    })));
+    await expect(runtime.collectLoopActionResult(resource, {
+      attemptId: "attempt-child",
+      actionId: "loop-1",
+      requestHash: "d".repeat(64),
+    })).rejects.toThrow(/invalid envelope/);
+  });
+
   it("refuses credentials outside the sandbox allowlist", async () => {
     const sandbox = {
       id: "provider-opaque-2",

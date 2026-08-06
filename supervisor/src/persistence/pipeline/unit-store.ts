@@ -46,9 +46,10 @@ import {
   unitState,
   type ExecutionUnitRow,
 } from "./unit-store-phase-reducer.js";
-
-const MAX_DOWNSTREAM_CONTEXT_AGGREGATE_BYTES = 32_768;
-const MAX_DOWNSTREAM_CONTEXT_RECORDS = 32;
+import {
+  MAX_DOWNSTREAM_CONTEXT_BYTES as MAX_DOWNSTREAM_CONTEXT_AGGREGATE_BYTES,
+  MAX_DOWNSTREAM_CONTEXT_RECORDS,
+} from "../../pipeline/structured-loop-limits.js";
 
 export type ExecutionGateKind = ChildGateDecision["gateKind"] | "integration" | "final_review";
 

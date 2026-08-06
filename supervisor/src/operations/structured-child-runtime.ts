@@ -71,6 +71,13 @@ type StructuredChildRuntimeDeps = {
   runtime: SandboxRuntime;
   taskTimeoutSeconds: number;
   now: () => Date;
+  // Persists a Codex OAuth blob rotated inside one action's own scoped
+  // CODEX_HOME (see readCodexAuthSnapshot in execute-loop.mjs). Keyed to the
+  // action that actually ran as a Codex worker -- never to the parent
+  // ticket's engine -- and only ever invoked with the exact-fenced result of
+  // that action's own sealed request (see collectChildAction). Best-effort:
+  // malformed/stale/unchanged blobs are rejected by the callee.
+  captureCodexAuth?: (blob: string) => void;
 };
 
 type LoopDispatchBinding = {
@@ -924,6 +931,15 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       };
     }
     if (!result) return null;
+    // Captured regardless of the action's eventual semantic outcome (success,
+    // failure, or needs_human): a Codex worker that rotated its refresh token
+    // and then failed a lead/review gate still spent the old token, so the
+    // rotation must not be lost. Only ever set when this exact action (fenced
+    // by attempt/action/request hash in parseCollectedLoopResult) ran as a
+    // Codex worker; a Claude or OpenCode action never carries this field.
+    if ("codexAuthJson" in result && typeof result.codexAuthJson === "string" && result.codexAuthJson) {
+      deps.captureCodexAuth?.(result.codexAuthJson);
+    }
     const nativeSessionId: string | null = "nativeSessionId" in result
       ? (result as { nativeSessionId: string | null }).nativeSessionId
       : null;
@@ -1029,14 +1045,12 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         });
         return collected(reviewSubject, receipt, decision);
       }
-      if (action.action_kind === "final_repair") {
-        const receipts = completedAttemptReceiptsFor(action.parent_attempt_id);
-        const trigger = priorEvidenceForAction(instance, action, receipts)?.receipts[0];
-        if (!trigger) throw new Error(`child final repair action ${action.id} has no triggering final-review evidence`);
-        if (!receipt.evidence.includes(trigger.receiptHash)) {
-          throw new Error(`final repair receipt evidence missing triggering final-review hash`);
-        }
-      }
+      // The triggering final-review receipt is bound deterministically via the
+      // completion receipt's request_hash fence (asserted below), which was
+      // computed over the dispatched request's priorEvidence at dispatch time
+      // (see priorEvidenceForAction). This does not depend on agent-authored
+      // `evidence[]` content, so a correct repair that follows the sandbox
+      // instruction not to reuse prior-action evidence still validates.
       const expectedType = action.action_kind === "command" || action.action_kind === "final_command"
         ? "command_result"
         : action.action_kind === "candidate"
