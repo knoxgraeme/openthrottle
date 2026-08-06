@@ -22,6 +22,11 @@ import {
   type UnitActionKind,
 } from "../pipeline/unit-coordinator.js";
 import {
+  MAX_LOOP_REQUEST_ENVELOPE_BYTES,
+  loopActionPlanContext,
+  loopActionTransitionContext,
+} from "../pipeline/structured-loop-envelope.js";
+import {
   assertStandardReceiptFence,
   assertCandidateEvidenceFence,
   evaluateFinalReviewGate,
@@ -337,25 +342,10 @@ function parentTaskContextFor(store: PipelineStore, parentAttemptId: string): st
   return typeof payload.taskContext === "string" ? payload.taskContext : "";
 }
 
-function planContextForAction(input: {
-  plan: ExecutionPlanContract | null;
-  action: ExecutionWorkAttempt;
-}): Record<string, unknown> | null {
-  if (!input.plan) return null;
-  const unit = input.action.unit_id
-    ? input.plan.units.find((unit) => unit.id === input.action.unit_id)
-    : undefined;
-  return {
-    schema: "openthrottle.loop-action-plan-context/v1",
-    graph_id: input.plan.graph_id,
-    action_kind: input.action.action_kind,
-    unit: unit ?? null,
-    instructions: input.plan.instructions,
-    acceptance: input.plan.acceptance,
-    commands: input.action.unit_id
-      ? input.plan.commands.filter((command) => command.unit === undefined || command.unit === input.action.unit_id)
-      : input.plan.commands,
-  };
+function assertLoopRequestEnvelopeBound(request: LoopActionRequest): void {
+  if (Buffer.byteLength(canonicalJson(request), "utf8") > MAX_LOOP_REQUEST_ENVELOPE_BYTES) {
+    throw new Error("sealed loop action request exceeds 262144 bytes");
+  }
 }
 
 function sha1SubjectForGitOperation(subject: string, label: string): string {
@@ -777,24 +767,16 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       nativeSessionId: action.native_session_id,
       contextPolicy,
       timeoutMs: (workerBinding?.loop.timeout_seconds ?? deps.taskTimeoutSeconds) * 1_000,
-      transitionContext: [
-        "## Unit Action Context",
-        action.payload,
-        "",
-        "## Execution Plan Context",
-        canonicalJson(planContextForAction({ plan: executionPlan, action }) ?? {
-          schema: "openthrottle.loop-action-plan-context/v1",
-          action_kind: action.action_kind,
-          unit_id: action.unit_id,
-          unavailable: true,
+      transitionContext: loopActionTransitionContext({
+        actionPayload: action.payload,
+        planContext: loopActionPlanContext({
+          plan: executionPlan,
+          actionKind: action.action_kind,
+          unitId: action.unit_id,
         }),
-        "",
-        "## Prior Evidence",
-        canonicalJson(priorEvidence ?? { schema: "openthrottle.loop-prior-evidence/v1", role: null, receipts: [] }),
-        "",
-        "## Downstream Context",
-        canonicalJson(downstreamContext),
-      ].join("\n"),
+        actionKind: action.action_kind,
+        unitId: action.unit_id,
+      }),
       ...(priorEvidence ? { priorEvidence } : {}),
       ...(downstreamContext.length > 0 ? { downstreamContext } : {}),
       ...(action.action_kind === "lead"
@@ -816,6 +798,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       expectedProducer: expectedProducerForAction(instance, action),
       ...(workerBinding?.repositorySkill ? { repositorySkill: workerBinding.repositorySkill } : {}),
     });
+    assertLoopRequestEnvelopeBound(loopRequest);
     deps.store.prepareActionDispatch?.({
       actionId: action.id,
       requestHash: loopRequest.requestHash,

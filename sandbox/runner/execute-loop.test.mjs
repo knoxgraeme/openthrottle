@@ -439,6 +439,96 @@ describe("loop action request validation", () => {
     expect(loopPrompt(valid)).not.toContain('"skillPackageDigest"');
   });
 
+  it("validates typed prior evidence and downstream context into the sealed prompt contract", () => {
+    const contextPayload = {
+      schema: "openthrottle.downstream-context/v1",
+      from_unit_id: "unit_0",
+      summary: "Use the accepted API shape.",
+    };
+    const withoutFence = {
+      ...leadRequest(),
+      transitionContext: "Review the current candidate.",
+      priorEvidence: {
+        schema: "openthrottle.loop-prior-evidence/v1",
+        role: "lead",
+        receipts: [
+          { role: "completion", actionAttemptId: "implement-1", receiptHash: "1".repeat(64) },
+          { role: "candidate", actionAttemptId: "candidate-1", receiptHash: "2".repeat(64) },
+          { role: "command", actionAttemptId: "command-1", receiptHash: "3".repeat(64) },
+        ],
+      },
+      downstreamContext: [{
+        fromUnitId: "unit_0",
+        payloadHash: digest(canonicalJson(contextPayload)),
+        payload: contextPayload,
+      }],
+    };
+    const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...unfenced } = withoutFence;
+    const valid = validateLoopRequest({ ...unfenced, ...createLoopRequestHash(unfenced) });
+    const prompt = loopPrompt(valid);
+
+    expect(valid.priorEvidence.receipts).toHaveLength(3);
+    expect(valid.downstreamContext).toHaveLength(1);
+    expect(prompt).toContain("## Prior Evidence");
+    expect(prompt).toContain('"actionAttemptId":"candidate-1"');
+    expect(prompt).toContain("## Downstream Context");
+    expect(prompt).toContain("Use the accepted API shape.");
+    expect(prompt).toContain('"downstream_context_hash"');
+
+    const stale = { ...valid, downstreamContext: [] };
+    expect(() => validateLoopRequest(stale)).toThrow(/stale/);
+  });
+
+  it("rejects malformed typed loop context before agent invocation", () => {
+    const malformedPrior = {
+      ...leadRequest(),
+      priorEvidence: {
+        schema: "openthrottle.loop-prior-evidence/v1",
+        role: "lead",
+        receipts: [{ role: "candidate", actionAttemptId: "candidate-1", receiptHash: "2".repeat(64) }],
+      },
+    };
+    const { requestHash: _priorHash, idempotencyKey: _priorKey, ...priorUnfenced } = malformedPrior;
+    expect(() => validateLoopRequest({ ...priorUnfenced, ...createLoopRequestHash(priorUnfenced) }))
+      .toThrow(/missing completion/);
+
+    const payload = {
+      schema: "openthrottle.downstream-context/v1",
+      from_unit_id: "unit_0",
+      summary: "bad hash",
+    };
+    const badContext = {
+      ...request(),
+      downstreamContext: [{
+        fromUnitId: "unit_0",
+        payloadHash: "0".repeat(64),
+        payload,
+      }],
+    };
+    const { requestHash: _contextHash, idempotencyKey: _contextKey, ...contextUnfenced } = badContext;
+    expect(() => validateLoopRequest({ ...contextUnfenced, ...createLoopRequestHash(contextUnfenced) }))
+      .toThrow(/payloadHash does not match/);
+
+    const oversized = {
+      ...request(),
+      downstreamContext: Array.from({ length: 33 }, (_, index) => {
+        const entryPayload = {
+          schema: "openthrottle.downstream-context/v1",
+          from_unit_id: `unit_${index}`,
+          summary: "x",
+        };
+        return {
+          fromUnitId: `unit_${index}`,
+          payloadHash: digest(canonicalJson(entryPayload)),
+          payload: entryPayload,
+        };
+      }),
+    };
+    const { requestHash: _oversizedHash, idempotencyKey: _oversizedKey, ...oversizedUnfenced } = oversized;
+    expect(() => validateLoopRequest({ ...oversizedUnfenced, ...createLoopRequestHash(oversizedUnfenced) }))
+      .toThrow(/downstreamContext must be a bounded array/);
+  });
+
   it("validates repository skill packages as sealed loop input", () => {
     const valid = validateLoopRequest(repositorySkillRequest());
     expect(valid.skill).toBe("implement_unit");

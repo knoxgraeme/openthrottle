@@ -39,6 +39,7 @@ describe("pipeline effect processor", () => {
     return {
       provision: vi.fn(async () => ({ providerResourceId: `sandbox-${issueId}` })),
       bootstrap: vi.fn(async () => undefined),
+      prepareCompositeWorkspace: vi.fn(async () => undefined),
       materializeCredentials: vi.fn(async () => undefined),
       dispatchStage: vi.fn(async () => ({ providerDispatchId: ids.providerDispatchId ?? `dispatch-${issueId}` })),
       collectStageResult: vi.fn(async () => null),
@@ -561,6 +562,15 @@ describe("pipeline effect processor", () => {
     await processor.drain();
 
     expect(runtime.dispatchStage).not.toHaveBeenCalled();
+    expect(runtime.prepareCompositeWorkspace).toHaveBeenCalledWith(
+      { providerResourceId: "sandbox-structured" },
+      expect.objectContaining({
+        attemptId: attempt.id,
+        capability: "graph/for-each-unit@1",
+      })
+    );
+    expect(runtime.prepareCompositeWorkspace.mock.invocationCallOrder[0])
+      .toBeLessThan(runtime.createWorktree.mock.invocationCallOrder[0]);
     expect(runtime.createWorktree).toHaveBeenCalledWith(
       { providerResourceId: "sandbox-structured" },
       expect.objectContaining({

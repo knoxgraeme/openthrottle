@@ -2067,6 +2067,67 @@ describe("execution unit store", () => {
     })).toThrow(/is not pending/);
   });
 
+  it("fails integration transactionally when receipt-authored downstream targets are invalid", () => {
+    for (const [name, target] of [
+      ["unknown", "missing"],
+      ["unrelated", "c"],
+      ["terminal", "b"],
+    ] as const) {
+      const store = setup();
+      store.createGraph({
+        pipelineInstanceId: "instance-1",
+        parentAttemptId: "attempt-parent",
+        parentStageId: "units",
+        parentRunId: "run-parent",
+        graphDigest: "graph-digest",
+        planDigest: "plan-digest",
+        units: [{ id: "a" }, { id: "b", dependencies: ["a"] }, { id: "c" }],
+        unitPhaseBindings: unitPhaseBindings(),
+      });
+      if (name === "terminal") {
+        // Make declared dependent b non-pending before a integrates.
+        db!.prepare("UPDATE execution_units SET status = 'failed', terminal_level = 'failed' WHERE unit_id = 'b'")
+          .run();
+      }
+      const subject = "1".repeat(40);
+      const implement = lease(store);
+      store.completeUnitAction({
+        actionId: implement.id,
+        resultHash: `r-implement-${name}`,
+        outputSubject: subject,
+        receipt: receiptJson("unit_completion", {
+          payload: {
+            downstream_context: [{ unit_id: target, summary: "invalid target" }],
+          },
+        }),
+      });
+      const candidate = lease(store);
+      store.completeUnitAction({ actionId: candidate.id, resultHash: `r-candidate-${name}`, outputSubject: subject, receipt: receiptJson("candidate_evidence") });
+      const leadAction = lease(store);
+      store.completeGatedAction({
+        actionId: leadAction.id,
+        resultHash: `r-lead-${name}`,
+        outputSubject: subject,
+        receipt: receiptJson("unit_decision"),
+        decision: gateDecision({ gateKind: "unit_acceptance", outcome: "success", subject }),
+      });
+      const integrate = lease(store);
+
+      expect(() => store.completeGatedAction({
+        actionId: integrate.id,
+        resultHash: `r-integrate-${name}`,
+        outputSubject: subject,
+        decision: gateDecision({ gateKind: "integration", outcome: "success", subject }),
+      })).toThrow(/downstream context target|unknown downstream context target/);
+
+      expect(store.listDownstreamContext("attempt-parent")).toEqual([]);
+      expect(store.listWorkAttempts("attempt-parent").find((attempt) => attempt.id === integrate.id))
+        .toMatchObject({ status: "leased" });
+      db?.close();
+      db = undefined;
+    }
+  });
+
   it("builds a structured publication snapshot from durable child state", () => {
     const store = setup();
     store.createGraph({

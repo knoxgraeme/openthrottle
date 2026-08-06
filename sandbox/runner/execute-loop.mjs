@@ -74,6 +74,13 @@ const SKILLS = new Set([
 ]);
 const CONTEXTS = new Set(["fresh", "resume_required", "prefer_resume"]);
 const STANDARD_RECEIPT_SCHEMA = "openthrottle.receipt/v1";
+const PRIOR_EVIDENCE_SCHEMA = "openthrottle.loop-prior-evidence/v1";
+const DOWNSTREAM_CONTEXT_SCHEMA = "openthrottle.downstream-context/v1";
+const PRIOR_EVIDENCE_ROLES = new Set(["lead", "final_review"]);
+const PRIOR_RECEIPT_ROLES = new Set(["completion", "candidate", "command", "final_command"]);
+const MAX_PRIOR_EVIDENCE_RECEIPTS = 34;
+const MAX_DOWNSTREAM_CONTEXT_RECORDS = 32;
+const MAX_DOWNSTREAM_CONTEXT_BYTES = 32_768;
 const DEFAULT_ACTION_ROOT = "/var/lib/openthrottle/loop-actions";
 const DEFAULT_WORKTREE_ROOT = "/var/lib/openthrottle/worktrees";
 const INTEGRATION_REPO_DIR = "/home/agent/repo";
@@ -149,6 +156,74 @@ function expectedProducer(value, label) {
       : string(input.skillPackageDigest, `${label}.skillPackageDigest`, /^[a-f0-9]{64}$/),
     assurance: string(input.assurance, `${label}.assurance`, /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/),
   };
+}
+
+function boundedRecordPayload(value, label) {
+  const payload = record(value, label);
+  const normalized = canonicalJson(payload);
+  if (Buffer.byteLength(normalized, "utf8") > 8_192) throw new Error(`${label} exceeds 8 KiB`);
+  return payload;
+}
+
+function priorEvidence(value, label) {
+  const input = record(value, label);
+  const allowed = new Set(["schema", "role", "receipts"]);
+  const unknown = Object.keys(input).find((key) => !allowed.has(key));
+  if (unknown) throw new Error(`${label} has unknown field ${unknown}`);
+  if (input.schema !== PRIOR_EVIDENCE_SCHEMA) throw new Error(`${label}.schema is invalid`);
+  const role = string(input.role, `${label}.role`, /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/);
+  if (!PRIOR_EVIDENCE_ROLES.has(role)) throw new Error(`${label}.role is invalid`);
+  if (!Array.isArray(input.receipts) || input.receipts.length > MAX_PRIOR_EVIDENCE_RECEIPTS) {
+    throw new Error(`${label}.receipts must be a bounded array`);
+  }
+  const receipts = input.receipts.map((receipt, index) => {
+    const entry = record(receipt, `${label}.receipts[${index}]`);
+    const receiptAllowed = new Set(["role", "actionAttemptId", "receiptHash"]);
+    const receiptUnknown = Object.keys(entry).find((key) => !receiptAllowed.has(key));
+    if (receiptUnknown) throw new Error(`${label}.receipts[${index}] has unknown field ${receiptUnknown}`);
+    const receiptRole = string(entry.role, `${label}.receipts[${index}].role`, /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/);
+    if (!PRIOR_RECEIPT_ROLES.has(receiptRole)) throw new Error(`${label}.receipts[${index}].role is invalid`);
+    return {
+      role: receiptRole,
+      actionAttemptId: stagePathId(entry.actionAttemptId, `${label}.receipts[${index}].actionAttemptId`),
+      receiptHash: string(entry.receiptHash, `${label}.receipts[${index}].receiptHash`, /^[a-f0-9]{64}$/),
+    };
+  });
+  if (role === "lead") {
+    for (const required of ["completion", "candidate"]) {
+      if (!receipts.some((receipt) => receipt.role === required)) throw new Error(`${label} is missing ${required} receipt evidence`);
+    }
+    if (receipts.some((receipt) => receipt.role === "final_command")) throw new Error(`${label} contains final command evidence for a lead action`);
+  }
+  if (role === "final_review" && receipts.some((receipt) => receipt.role !== "final_command")) {
+    throw new Error(`${label} contains non-final-command evidence for final review`);
+  }
+  return { schema: PRIOR_EVIDENCE_SCHEMA, role, receipts };
+}
+
+function downstreamContext(value, label) {
+  if (!Array.isArray(value) || value.length > MAX_DOWNSTREAM_CONTEXT_RECORDS) {
+    throw new Error(`${label} must be a bounded array`);
+  }
+  const records = value.map((entry, index) => {
+    const input = record(entry, `${label}[${index}]`);
+    const allowed = new Set(["fromUnitId", "payloadHash", "payload"]);
+    const unknown = Object.keys(input).find((key) => !allowed.has(key));
+    if (unknown) throw new Error(`${label}[${index}] has unknown field ${unknown}`);
+    const payload = boundedRecordPayload(input.payload, `${label}[${index}].payload`);
+    const payloadHash = string(input.payloadHash, `${label}[${index}].payloadHash`, /^[a-f0-9]{64}$/);
+    if (digest(canonicalJson(payload)) !== payloadHash) throw new Error(`${label}[${index}].payloadHash does not match payload`);
+    if (payload.schema !== DOWNSTREAM_CONTEXT_SCHEMA) throw new Error(`${label}[${index}].payload.schema is invalid`);
+    return {
+      fromUnitId: string(input.fromUnitId, `${label}[${index}].fromUnitId`),
+      payloadHash,
+      payload,
+    };
+  });
+  if (Buffer.byteLength(canonicalJson(records), "utf8") > MAX_DOWNSTREAM_CONTEXT_BYTES) {
+    throw new Error(`${label} exceeds aggregate bound`);
+  }
+  return records;
 }
 
 export function configuredActionRoot(env = process.env) {
@@ -294,7 +369,7 @@ export function validateLoopRequest(value) {
     "protocol", "actionId", "attemptId", "graphId", "pipelineInstanceId", "graphDigest", "parentRunId",
     "unitId", "generation", "role", "loop", "agent", "skill", "worktree", "baseSubject", "inputSubject",
     "candidateSubject", "nativeSessionId", "contextPolicy", "timeoutMs",
-    "transitionContext", "allowedMcpServers", "credentialScopes", "receiptSchema",
+    "transitionContext", "priorEvidence", "downstreamContext", "allowedMcpServers", "credentialScopes", "receiptSchema",
     "expectedProducerSkill", "expectedProducer", "repositorySkill", "requestHash", "idempotencyKey",
   ]);
   const unknown = Object.keys(input).find((key) => !allowed.has(key));
@@ -331,6 +406,8 @@ export function validateLoopRequest(value) {
     contextPolicy: string(input.contextPolicy, "contextPolicy"),
     timeoutMs: input.timeoutMs,
     transitionContext: boundedText(input.transitionContext, "transitionContext", 262_144),
+    ...(input.priorEvidence === undefined ? {} : { priorEvidence: priorEvidence(input.priorEvidence, "priorEvidence") }),
+    ...(input.downstreamContext === undefined ? {} : { downstreamContext: downstreamContext(input.downstreamContext, "downstreamContext") }),
     allowedMcpServers: boundedArray(input.allowedMcpServers, "allowedMcpServers"),
     credentialScopes: boundedArray(input.credentialScopes, "credentialScopes"),
     receiptSchema: string(input.receiptSchema, "receiptSchema", /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,159}$/),
@@ -376,6 +453,8 @@ export function validateLoopRequest(value) {
   if (request.role !== "worker" && request.worktree) throw new Error("non-worker loop cannot receive a writable worktree");
   if (request.role === "lead" && !candidateSubject) throw new Error("lead loop requires a candidate subject");
   if (request.role !== "lead" && candidateSubject) throw new Error("candidate subject is only valid for lead loops");
+  if (request.priorEvidence?.role === "lead" && request.role !== "lead") throw new Error("lead prior evidence is only valid for lead loops");
+  if (request.priorEvidence?.role === "final_review" && request.loop !== "review") throw new Error("final review prior evidence is only valid for review loops");
   if (worktree !== null && worktree.path !== undefined) throw new Error("loop request cannot carry an absolute worktree path");
   const requestWithSkill = {
     ...request,
@@ -416,7 +495,7 @@ export function loopPrompt(request) {
     : {
         skill: request.expectedProducerSkill ?? request.repositorySkill?.reference ?? `builtin://${request.skill}@1`,
       };
-  const contract = canonicalJson({
+  const contractPayload = {
     schema: "openthrottle.loop-receipt-contract/v1",
     pipeline_instance_id: request.pipelineInstanceId ?? null,
     graph_id: request.graphId,
@@ -433,12 +512,19 @@ export function loopPrompt(request) {
     },
     producer,
     evidence: "Bind this receipt to exact output evidence for the requested action; do not reuse sibling or prior action evidence.",
-  });
+    prior_evidence: request.priorEvidence ?? { schema: PRIOR_EVIDENCE_SCHEMA, role: null, receipts: [] },
+    downstream_context_hash: digest(canonicalJson(request.downstreamContext ?? [])),
+  };
+  const contract = canonicalJson(contractPayload);
+  const priorEvidence = canonicalJson(request.priorEvidence ?? { schema: PRIOR_EVIDENCE_SCHEMA, role: null, receipts: [] });
+  const downstreamContext = canonicalJson(request.downstreamContext ?? []);
   return `${entry}\n\n` +
     `This is one fenced OpenThrottle loop action (${request.actionId}) for ${request.role}/${request.loop}. ` +
     `Edit only the provided worktree when one is present. Do not commit, push, or alter executor state. ` +
     `Return one receipt matching ${request.receiptSchema} and the authority contract below.\n\n` +
-    `## Receipt Authority Contract\n${contract}\n\n${request.transitionContext}`;
+    `## Receipt Authority Contract\n${contract}\n\n${request.transitionContext}\n\n` +
+    `## Prior Evidence\n${priorEvidence}\n\n` +
+    `## Downstream Context\n${downstreamContext}`;
 }
 
 export function prepareRootReadOnlyDirectory(path) {

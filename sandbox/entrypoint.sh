@@ -582,6 +582,11 @@ case "$BOOTSTRAP_DECISION" in
     ;;
 esac
 
+if [[ "${OT_COMPOSITE_PREPARE_ONLY:-}" == "1" ]]; then
+  log "composite workspace preparation complete; exiting before agent invocation"
+  exit 0
+fi
+
 log "phase 6-8: fenced one-stage executor"
 for sealed_input in "$OT_STAGE_REQUEST_FILE" "$OT_STAGE_CONFIG_FILE" "$OT_STAGE_MANIFEST_FILE"; do
   chmod 0400 "$sealed_input"

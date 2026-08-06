@@ -47,6 +47,8 @@ import {
   type ExecutionUnitRow,
 } from "./unit-store-phase-reducer.js";
 
+const MAX_DOWNSTREAM_CONTEXT_AGGREGATE_BYTES = 32_768;
+
 export type ExecutionGateKind = ChildGateDecision["gateKind"] | "integration" | "final_review";
 
 function assertGateMatchesAction(action: ExecutionWorkAttempt, gateKind: ExecutionGateKind): void {
@@ -383,10 +385,10 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     cycle: number;
   }): Array<{ toUnitId: string; payload: Record<string, unknown> }> {
     const rows = listUnitRows(input.parentAttemptId);
-    const dependentTargets = new Set(rows
-      .filter((row) => dependenciesFor(row).includes(input.unitId) && row.status === "pending" && row.terminal_level === null)
+    const rowByUnitId = new Map(rows.map((row) => [row.unit_id, row]));
+    const declaredDependents = new Set(rows
+      .filter((row) => dependenciesFor(row).includes(input.unitId))
       .map((row) => row.unit_id));
-    if (dependentTargets.size === 0) return [];
     const receiptRows = db.prepare(`
       SELECT receipt FROM execution_work_attempts
       WHERE parent_attempt_id = ? AND unit_id = ? AND cycle = ? AND status = 'completed'
@@ -408,7 +410,14 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
           ? receipt.payload?.context_updates ?? []
           : [];
       for (const record of contextRecords) {
-        if (!dependentTargets.has(record.unit_id)) continue;
+        const target = rowByUnitId.get(record.unit_id);
+        if (!target) throw new Error(`unknown downstream context target ${record.unit_id}`);
+        if (!declaredDependents.has(record.unit_id)) {
+          throw new Error(`downstream context target ${record.unit_id} is not a declared dependent of ${input.unitId}`);
+        }
+        if (target.status !== "pending" || target.terminal_level !== null) {
+          throw new Error(`downstream context target ${record.unit_id} is not pending`);
+        }
         records.push({
           toUnitId: record.unit_id,
           payload: {
@@ -418,6 +427,9 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
           },
         });
       }
+    }
+    if (Buffer.byteLength(canonicalJson(records), "utf8") > MAX_DOWNSTREAM_CONTEXT_AGGREGATE_BYTES) {
+      throw new Error("downstream context aggregate exceeds 32768 bytes");
     }
     return records;
   }

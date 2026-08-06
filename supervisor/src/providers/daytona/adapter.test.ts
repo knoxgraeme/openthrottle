@@ -182,7 +182,7 @@ describe("Daytona stage execution", () => {
     expect(sandbox.updateEnv).toHaveBeenLastCalledWith(expect.objectContaining({
       RUN_ID: "run-1",
       BASE_BRANCH: "release/2.0",
-    }), { unset: ["OT_CHILD_ACTION_ID"] });
+    }), { unset: ["OT_CHILD_ACTION_ID", "OT_COMPOSITE_PREPARE_ONLY"] });
 
     const childWithoutFence: Omit<StageRequestEnvelope, "requestHash" | "idempotencyKey"> = {
       ...withoutFence,
@@ -198,7 +198,7 @@ describe("Daytona stage execution", () => {
     expect(sandbox.updateEnv).toHaveBeenLastCalledWith(expect.objectContaining({
       RUN_ID: "run-parent",
       OT_CHILD_ACTION_ID: "action-1",
-    }), { unset: [] });
+    }), { unset: ["OT_COMPOSITE_PREPARE_ONLY"] });
     expect(sandbox.process.executeSessionCommand).toHaveBeenCalledWith(
       "stage-attempt-1",
       expect.objectContaining({
@@ -207,6 +207,25 @@ describe("Daytona stage execution", () => {
       expect.any(Number)
     );
     expect(JSON.stringify(updateEnv.mock.calls.at(-1))).not.toContain("secret-token");
+
+    const compositeWithoutFence: Omit<StageRequestEnvelope, "requestHash" | "idempotencyKey"> = {
+      ...withoutFence,
+      stageId: "structured",
+      attemptId: "attempt-composite",
+      capability: "graph/for-each-unit@1",
+      commandName: undefined,
+    };
+    const compositeRequest = { ...compositeWithoutFence, ...createStageRequestHash(compositeWithoutFence) };
+    await expect(runtime.prepareCompositeWorkspace(resource, compositeRequest)).resolves.toBeUndefined();
+    expect(sandbox.updateEnv).toHaveBeenLastCalledWith({ OT_COMPOSITE_PREPARE_ONLY: "1" }, { unset: [] });
+    expect(sandbox.process.executeSessionCommand).toHaveBeenCalledWith(
+      "composite-prepare-attempt-composite",
+      expect.objectContaining({
+        runAsync: false,
+        command: expect.stringContaining("OT_COMPOSITE_PREPARE_ONLY=1 /opt/openthrottle/entrypoint.sh"),
+      }),
+      expect.any(Number)
+    );
 
     const worktree = await runtime.createWorktree(resource, {
       idempotencyKey: "worktree:attempt-child",

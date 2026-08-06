@@ -2,6 +2,7 @@ import type Database from "better-sqlite3";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ExecutionPlanContract } from "@openthrottle/contracts";
 import type { Config } from "./config.js";
 import type { ActivityPublicationInput } from "./ports.js";
 import { createSupervisorStore } from "../persistence/store.js";
@@ -24,10 +25,15 @@ import { canonicalJson, digestNormalized, loadPipelineCatalog } from "../pipelin
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 import { coordinatePipelineEvent } from "../pipeline/coordinator.js";
+import {
+  MAX_LOOP_REQUEST_ENVELOPE_BYTES,
+  structuredPlanLoopEnvelopeBytes,
+} from "../pipeline/structured-loop-envelope.js";
 
 const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
 const fixtureCatalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
 const executionPlanFixturePath = fileURLToPath(new URL("../../../contracts/fixtures/valid/execution-plan.json", import.meta.url));
+const EXECUTION_PLAN_PARSE_LIMIT_BYTES = 256 * 1024;
 
 function config(): Config {
   return {
@@ -95,6 +101,105 @@ graphs:
     ref: core/simple@1
 pipelines: ${pipelines}
 ${extra}`;
+}
+
+function structuredPlanWithContextExtra(extraBytes: number): ExecutionPlanContract {
+  const instructions: Record<string, string> = {};
+  const acceptance: Record<string, string> = {};
+  let remaining = extraBytes;
+  const nextText = () => {
+    const extra = Math.min(1_999, remaining);
+    remaining -= extra;
+    return "x".repeat(1 + extra);
+  };
+  for (let index = 0; index < 64; index += 1) instructions[`instruction_${index}`] = nextText();
+  for (let index = 0; index < 64; index += 1) acceptance[`acceptance_${index}`] = nextText();
+  if (remaining > 0) throw new Error("test plan context exceeds per-entry execution plan limits");
+  return {
+    schema: "openthrottle.execution-plan/v1" as const,
+    graph_id: "structured",
+    plan_id: "structured_envelope_bound",
+    instructions,
+    acceptance,
+    units: [{
+      id: "unit_a",
+      title: "Unit A",
+      depends_on: [],
+      instructions: Object.keys(instructions),
+      acceptance: Object.keys(acceptance),
+    }],
+    commands: [],
+  };
+}
+
+function structuredPlanContextBoundary(): {
+  accepted: ExecutionPlanContract;
+  rejected: ExecutionPlanContract;
+} {
+  const maxExtra = (64 + 64) * 1_999;
+  let low = 0;
+  let high = maxExtra;
+  let acceptedExtra = 0;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const plan = structuredPlanWithContextExtra(mid);
+    const rawBytes = Buffer.byteLength(JSON.stringify(plan), "utf8");
+    const envelopeBytes = structuredPlanLoopEnvelopeBytes(plan);
+    if (rawBytes <= EXECUTION_PLAN_PARSE_LIMIT_BYTES && envelopeBytes <= MAX_LOOP_REQUEST_ENVELOPE_BYTES) {
+      acceptedExtra = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  const rejected = structuredPlanWithContextExtra(acceptedExtra + 1);
+  expect(Buffer.byteLength(JSON.stringify(rejected), "utf8")).toBeLessThanOrEqual(EXECUTION_PLAN_PARSE_LIMIT_BYTES);
+  expect(structuredPlanLoopEnvelopeBytes(rejected)).toBeGreaterThan(MAX_LOOP_REQUEST_ENVELOPE_BYTES);
+  return {
+    accepted: structuredPlanWithContextExtra(acceptedExtra),
+    rejected,
+  };
+}
+
+const MAX_TEST_NATIVE_SESSION_ID = "n" + "s".repeat(199);
+
+function resumePayloadDeltaBytes(): number {
+  const payload = {
+    parent_attempt_id: "attempt-" + "a".repeat(32),
+    parent_run_id: "run-" + "b".repeat(32),
+    unit_id: "unit_a",
+    action_kind: "repair",
+    cycle: 999_999,
+  };
+  return Buffer.byteLength(canonicalJson({
+    ...payload,
+    resume_native_session_id: MAX_TEST_NATIVE_SESSION_ID,
+  }), "utf8") - Buffer.byteLength(canonicalJson(payload), "utf8");
+}
+
+function structuredPlanAcceptedOnlyWithoutResumePayload(): ExecutionPlanContract {
+  const maxExtra = (64 + 64) * 1_999;
+  const delta = resumePayloadDeltaBytes();
+  let low = 0;
+  let high = maxExtra;
+  let acceptedWithoutResumeExtra = 0;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const plan = structuredPlanWithContextExtra(mid);
+    const rawBytes = Buffer.byteLength(JSON.stringify(plan), "utf8");
+    const oldEnvelopeWithoutResumePayload = structuredPlanLoopEnvelopeBytes(plan) - delta;
+    if (rawBytes <= EXECUTION_PLAN_PARSE_LIMIT_BYTES && oldEnvelopeWithoutResumePayload <= MAX_LOOP_REQUEST_ENVELOPE_BYTES) {
+      acceptedWithoutResumeExtra = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  const plan = structuredPlanWithContextExtra(acceptedWithoutResumeExtra);
+  expect(Buffer.byteLength(JSON.stringify(plan), "utf8")).toBeLessThanOrEqual(EXECUTION_PLAN_PARSE_LIMIT_BYTES);
+  expect(structuredPlanLoopEnvelopeBytes(plan) - delta).toBeLessThanOrEqual(MAX_LOOP_REQUEST_ENVELOPE_BYTES);
+  expect(structuredPlanLoopEnvelopeBytes(plan)).toBeGreaterThan(MAX_LOOP_REQUEST_ENVELOPE_BYTES);
+  return plan;
 }
 
 describe("pipeline admission", () => {
@@ -1368,6 +1473,268 @@ intents:
     });
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(1);
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_stage_attempts").pluck().get()).toBe(1);
+  });
+
+  it("bounds the complete sealed structured child envelope before provisioning", async () => {
+    const boundary = structuredPlanContextBoundary();
+    const config = `schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: structured
+    kind: builtin
+    ref: core/structured@1
+pipelines: { implement: implement }
+intents:
+  implement:
+    default_graph: simple
+    allowed_graphs: [simple, structured]
+`;
+    const contextFor = (executionPlan: ExecutionPlanContract) => [
+      "# Structured work",
+      "",
+      "```json openthrottle.execution-plan/v1",
+      JSON.stringify(executionPlan),
+      "```",
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }),
+      "```",
+    ].join("\n");
+
+    {
+      const { tickets } = await run(
+        config,
+        { claudeCodeOauthToken: "claude-oauth" },
+        shippedCatalogPath,
+        payload("session-bound-ok", "issue-bound-ok", "OT-BOUND-OK", contextFor(boundary.accepted), ["agent:claude"])
+      );
+      expect(tickets.getByIssueId("issue-bound-ok")).toMatchObject({
+        state: "active",
+        sandbox_id: null,
+        run_id: null,
+      });
+      db?.close();
+      db = undefined;
+    }
+
+    const { tickets } = await run(
+      config,
+      { claudeCodeOauthToken: "claude-oauth" },
+      shippedCatalogPath,
+      payload("session-bound-reject", "issue-bound-reject", "OT-BOUND-REJECT", contextFor(boundary.rejected), ["agent:claude"])
+    );
+    expect(tickets.getByIssueId("issue-bound-reject")).toMatchObject({
+      state: "error",
+      sandbox_id: null,
+      run_id: null,
+    });
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
+    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(payloads.some((entry) =>
+      entry.includes("structured execution plan would seal a") &&
+      entry.includes("No sandbox was provisioned")
+    )).toBe(true);
+  });
+
+  it("reserves resumed loop action payload bytes before provisioning", async () => {
+    const config = `schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: structured
+    kind: builtin
+    ref: core/structured@1
+pipelines: { implement: implement }
+intents:
+  implement:
+    default_graph: simple
+    allowed_graphs: [simple, structured]
+`;
+    const executionPlan = structuredPlanAcceptedOnlyWithoutResumePayload();
+    const context = [
+      "# Structured work",
+      "",
+      "```json openthrottle.execution-plan/v1",
+      JSON.stringify(executionPlan),
+      "```",
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }),
+      "```",
+    ].join("\n");
+
+    const { tickets } = await run(
+      config,
+      { claudeCodeOauthToken: "claude-oauth" },
+      shippedCatalogPath,
+      payload("session-resume-bound", "issue-resume-bound", "OT-RESUME-BOUND", context, ["agent:claude"])
+    );
+    expect(tickets.getByIssueId("issue-resume-bound")).toMatchObject({
+      state: "error",
+      sandbox_id: null,
+      run_id: null,
+    });
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
+    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(payloads.some((entry) =>
+      entry.includes("structured execution plan would seal a") &&
+      entry.includes("No sandbox was provisioned")
+    )).toBe(true);
+  });
+
+  it("includes repository skill package metadata in the structured envelope bound", async () => {
+    const graphPath = ".openthrottle/graphs/structured-repo-skill.json";
+    const skillPath = ".agents/skills/implement-unit/SKILL.md";
+    const boundary = structuredPlanContextBoundary();
+    const context = [
+      "# Structured work",
+      "",
+      "```json openthrottle.execution-plan/v1",
+      JSON.stringify(boundary.accepted),
+      "```",
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }),
+      "```",
+    ].join("\n");
+    const graph = JSON.stringify({
+      schema: "openthrottle.graph/v1",
+      id: "repository/structured",
+      version: 1,
+      entry_node: "units",
+      workers: [
+        {
+          id: "unit-worker",
+          engine: "agent",
+          skills: ["repo://implement_unit"],
+          session_scope: "attempt",
+          credentials: ["model.invoke", "repo.read"],
+        },
+        {
+          id: "simplify-worker",
+          engine: "agent",
+          skills: ["builtin://ce/simplify@1"],
+          session_scope: "attempt",
+          credentials: ["model.invoke", "repo.read"],
+        },
+        {
+          id: "lead-worker",
+          engine: "agent",
+          skills: ["builtin://accept-unit@1"],
+          session_scope: "fresh",
+          credentials: ["model.invoke", "repo.read"],
+        },
+      ],
+      loops: [
+        {
+          id: "unit-loop",
+          worker: "unit-worker",
+          skill: "repo://implement_unit",
+          input_scope: "unit",
+          receipt: "unit_completion",
+          max_parallel: 1,
+          max_rounds: 8,
+          timeout_seconds: 86400,
+        },
+        {
+          id: "simplify-loop",
+          worker: "simplify-worker",
+          skill: "builtin://ce/simplify@1",
+          input_scope: "unit",
+          receipt: "unit_completion",
+          max_parallel: 1,
+          max_rounds: 3,
+          timeout_seconds: 86400,
+        },
+        {
+          id: "lead-loop",
+          worker: "lead-worker",
+          skill: "builtin://accept-unit@1",
+          input_scope: "unit",
+          receipt: "unit_decision",
+          max_parallel: 1,
+          max_rounds: 1,
+          timeout_seconds: 86400,
+        },
+      ],
+      nodes: [{
+        id: "units",
+        kind: "for_each_unit",
+        phases: [
+          { id: "implement", kind: "agent", loop: "unit-loop" },
+          { id: "simplify", kind: "agent", loop: "simplify-loop" },
+          { id: "command", kind: "command", commands: ["test", "lint", "build"] },
+          { id: "candidate", kind: "evidence" },
+          { id: "lead", kind: "gate", loop: "lead-loop" },
+          { id: "integrate", kind: "integrate" },
+        ],
+        depends_on: [],
+        transitions: {
+          success: { terminal: "completed" },
+          repair_required: { terminal: "needs_human" },
+          retryable_failure: { terminal: "failed" },
+          failure: { terminal: "failed" },
+        },
+      }],
+    });
+
+    const { tickets } = await run(
+      `schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: structured
+    kind: repository
+    ref: ${graphPath}
+skills:
+  - id: implement_unit
+    path: .agents/skills/implement-unit
+commands:
+  test: "npm test"
+  lint: "npm run lint"
+  build: "npm run build"
+pipelines: { implement: implement }
+intents:
+  implement:
+    default_graph: simple
+    allowed_graphs: [simple, structured]
+`,
+      { claudeCodeOauthToken: "claude-oauth" },
+      shippedCatalogPath,
+      payload("session-repo-bound", "issue-repo-bound", "OT-REPO-BOUND", context, ["agent:claude"]),
+      {
+        [graphPath]: graph,
+        [skillPath]: "---\nname: implement_unit\n---\n# Implement Unit\n",
+      },
+      {
+        capabilities: [
+          ...buildInstalledRuntimeDescriptor("repository-structured-bound-test/v1").descriptor.capabilities,
+          "accept-unit@1",
+          "agent/repository-skill@1",
+          "ce/simplify@1",
+          "graph/for-each-unit@1",
+        ],
+      }
+    );
+
+    expect(tickets.getByIssueId("issue-repo-bound")).toMatchObject({
+      state: "error",
+      sandbox_id: null,
+      run_id: null,
+    });
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
+    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(payloads.some((entry) =>
+      entry.includes("structured execution plan would seal a") &&
+      entry.includes("No sandbox was provisioned")
+    )).toBe(true);
   });
 
   it("requires a model subscription for the simple graph despite legacy command pipeline overrides", async () => {

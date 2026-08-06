@@ -320,6 +320,28 @@ export function createDaytonaSandboxRuntime(
     }
     return result;
   };
+  const prepareStageInput = async (sandbox: Sandbox, request: StageRequestEnvelope): Promise<string> => {
+    const requestDirectory = `${STAGE_INPUT_DIR}/requests`;
+    await prepareRootFolder(sandbox, requestDirectory);
+    const requestPath = `${requestDirectory}/${request.attemptId}.json`;
+    await sandbox.fs.uploadFile(Buffer.from(canonicalJson(request)), requestPath);
+    await sandbox.fs.setFilePermissions(requestPath, { owner: "root", group: "root", mode: "400" });
+    await sandbox.updateEnv({
+      OT_STAGE_REQUEST_FILE: requestPath,
+      OT_STAGE_CONFIG_FILE: `${STAGE_INPUT_DIR}/repository-config.json`,
+      OT_STAGE_MANIFEST_FILE: `${STAGE_INPUT_DIR}/pipeline-manifest.json`,
+      TASK_TYPE: request.taskType,
+      GITHUB_REPO: request.repository,
+      BASE_BRANCH: request.baseBranch,
+      BRANCH_NAME: request.branch,
+      AGENT: request.agent,
+      RUN_ID: request.runId,
+      ...(request.childActionId ? { OT_CHILD_ACTION_ID: request.childActionId } : {}),
+      LINEAR_ISSUE_ID: request.issueId,
+      LINEAR_ISSUE_IDENTIFIER: request.issueId,
+    }, { unset: request.childActionId ? ["OT_COMPOSITE_PREPARE_ONLY"] : ["OT_CHILD_ACTION_ID", "OT_COMPOSITE_PREPARE_ONLY"] });
+    return requestPath;
+  };
 
   return {
     async provision(input) {
@@ -405,25 +427,7 @@ export function createDaytonaSandboxRuntime(
         throw new Error(`stage ${request.attemptId} does not match the sandbox bootstrap`);
       }
       const sandbox = await ensureStarted(resource);
-      const requestDirectory = `${STAGE_INPUT_DIR}/requests`;
-      await prepareRootFolder(sandbox, requestDirectory);
-      const requestPath = `${requestDirectory}/${request.attemptId}.json`;
-      await sandbox.fs.uploadFile(Buffer.from(canonicalJson(request)), requestPath);
-      await sandbox.fs.setFilePermissions(requestPath, { owner: "root", group: "root", mode: "400" });
-      await sandbox.updateEnv({
-        OT_STAGE_REQUEST_FILE: requestPath,
-        OT_STAGE_CONFIG_FILE: `${STAGE_INPUT_DIR}/repository-config.json`,
-        OT_STAGE_MANIFEST_FILE: `${STAGE_INPUT_DIR}/pipeline-manifest.json`,
-        TASK_TYPE: request.taskType,
-        GITHUB_REPO: request.repository,
-        BASE_BRANCH: request.baseBranch,
-        BRANCH_NAME: request.branch,
-        AGENT: request.agent,
-        RUN_ID: request.runId,
-        ...(request.childActionId ? { OT_CHILD_ACTION_ID: request.childActionId } : {}),
-        LINEAR_ISSUE_ID: request.issueId,
-        LINEAR_ISSUE_IDENTIFIER: request.issueId,
-      }, { unset: request.childActionId ? [] : ["OT_CHILD_ACTION_ID"] });
+      await prepareStageInput(sandbox, request);
       const sessionId = `stage-${request.attemptId}`;
       await sandbox.process.createSession(sessionId).catch(() => undefined);
       const dispatched = await sandbox.process.executeSessionCommand(sessionId, {
@@ -438,6 +442,36 @@ export function createDaytonaSandboxRuntime(
         suppressInputEcho: true,
       }, options.taskTimeoutSeconds ?? 7_200);
       return { providerDispatchId: dispatched.cmdId ?? sessionId };
+    },
+
+    async prepareCompositeWorkspace(resource, request) {
+      assertStageRequestFence(request);
+      if (materializedScopes.get(resource.providerResourceId) !== canonicalJson(request.credentialScopes)) {
+        throw new Error(`composite stage ${request.attemptId} credentials were not materialized for the exact requested scopes`);
+      }
+      const bootstrap = bootstrapped.get(resource.providerResourceId);
+      if (!bootstrap || bootstrap.configDigest !== request.repositoryConfigDigest ||
+          bootstrap.manifestDigest !== request.manifestDigest) {
+        throw new Error(`composite stage ${request.attemptId} does not match the sandbox bootstrap`);
+      }
+      const sandbox = await ensureStarted(resource);
+      await prepareStageInput(sandbox, request);
+      await sandbox.updateEnv({ OT_COMPOSITE_PREPARE_ONLY: "1" }, { unset: [] });
+      const marker = `${STAGE_RESULT_DIR}/${request.attemptId}.composite-prepared`;
+      const sessionId = `composite-prepare-${request.attemptId}`;
+      await sandbox.process?.createSession?.(sessionId).catch(() => undefined);
+      if (!sandbox.process?.executeSessionCommand) {
+        throw new Error("Daytona runtime does not expose session command execution");
+      }
+      const prepared = await sandbox.process.executeSessionCommand(sessionId, {
+        command: `flock --nonblock ${STAGE_RESULT_DIR}/${request.attemptId}.prepare.lock sh -c ` +
+          shellSingleQuoted(`test -f ${marker} || (OT_COMPOSITE_PREPARE_ONLY=1 /opt/openthrottle/entrypoint.sh && install -o root -g root -m 0400 /dev/null ${marker})`),
+        runAsync: false,
+        suppressInputEcho: true,
+      }, options.taskTimeoutSeconds ?? 7_200);
+      if (prepared.exitCode !== undefined && prepared.exitCode !== 0) {
+        throw new Error(`composite workspace preparation failed with exit ${prepared.exitCode}`);
+      }
     },
 
     async collectStageResult(resource, attemptId) {
