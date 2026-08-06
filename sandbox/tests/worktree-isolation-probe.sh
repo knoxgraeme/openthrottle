@@ -403,6 +403,7 @@ const base = {
   actionId: "action-current",
   attemptId: "attempt-current",
   graphId: "graph-1",
+  parentRunId: "run-parent",
   unitId: "unit-1",
   role: "worker",
   loop: "implement",
@@ -438,6 +439,7 @@ const base = {
   actionId: "action-lead",
   attemptId: "attempt-current",
   graphId: "graph-1",
+  parentRunId: "run-parent",
   unitId: "unit-1",
   role: "lead",
   loop: "lead",
@@ -472,6 +474,7 @@ const base = {
   actionId: "action-reviewer",
   attemptId: "attempt-current",
   graphId: "graph-1",
+  parentRunId: "run-parent",
   unitId: "unit-1",
   role: "reviewer",
   loop: "review",
@@ -506,6 +509,7 @@ const base = {
   actionId: "action-builtin",
   attemptId: "attempt-current",
   graphId: "graph-1",
+  parentRunId: "run-parent",
   unitId: "unit-1",
   role: "lead",
   loop: "lead",
@@ -569,9 +573,9 @@ write_probe_env \
   PROBE_RECEIPT_ATTEMPT_ID "attempt-current" \
   PROBE_RECEIPT_REQUEST_HASH "$CURRENT_REQUEST_HASH" \
   PROBE_RECEIPT_PARENT_RUN_ID "run-parent" \
-  PROBE_RECEIPT_ACTION_ATTEMPT_ID "action-attempt-1" \
+  PROBE_RECEIPT_ACTION_ATTEMPT_ID "action-current" \
   PROBE_RECEIPT_GENERATION "1" \
-  PROBE_RECEIPT_NATIVE_SESSION_ID "" \
+  PROBE_RECEIPT_NATIVE_SESSION_ID "native-current" \
   PROBE_RECEIPT_SKILL "repo://owner/repo@$BASE#.agents/skills/current"
 PATH="$BIN:$PATH" \
 OT_LOOP_ACTION_ROOT="$ACTION_ROOT" \
@@ -608,7 +612,7 @@ write_probe_env \
   PROBE_RECEIPT_ATTEMPT_ID "attempt-current" \
   PROBE_RECEIPT_REQUEST_HASH "$LEAD_REQUEST_HASH" \
   PROBE_RECEIPT_PARENT_RUN_ID "run-parent" \
-  PROBE_RECEIPT_ACTION_ATTEMPT_ID "action-attempt-1" \
+  PROBE_RECEIPT_ACTION_ATTEMPT_ID "action-lead" \
   PROBE_RECEIPT_GENERATION "1" \
   PROBE_RECEIPT_NATIVE_SESSION_ID "" \
   PROBE_RECEIPT_SKILL "builtin://accept-unit@1"
@@ -625,7 +629,7 @@ if (result.kind !== "loop_action_result" ||
     result.attempt_id !== "attempt-current" ||
     result.action_id !== "action-lead" ||
     result.outcome !== "success" ||
-    result.subject !== null) {
+    !/^[a-f0-9]{40}$/.test(result.subject)) {
   throw new Error(`invalid lead probe result: ${JSON.stringify(result)}`);
 }
 NODE
@@ -639,7 +643,7 @@ write_probe_env \
   PROBE_RECEIPT_ATTEMPT_ID "attempt-current" \
   PROBE_RECEIPT_REQUEST_HASH "$REVIEWER_REQUEST_HASH" \
   PROBE_RECEIPT_PARENT_RUN_ID "run-parent" \
-  PROBE_RECEIPT_ACTION_ATTEMPT_ID "action-attempt-1" \
+  PROBE_RECEIPT_ACTION_ATTEMPT_ID "action-reviewer" \
   PROBE_RECEIPT_GENERATION "1" \
   PROBE_RECEIPT_NATIVE_SESSION_ID "" \
   PROBE_RECEIPT_SKILL "builtin://final-review@1"
@@ -656,7 +660,7 @@ if (result.kind !== "loop_action_result" ||
     result.attempt_id !== "attempt-current" ||
     result.action_id !== "action-reviewer" ||
     result.outcome !== "success" ||
-    result.subject !== null) {
+    !/^[a-f0-9]{40}$/.test(result.subject)) {
   throw new Error(`invalid reviewer probe result: ${JSON.stringify(result)}`);
 }
 NODE
@@ -668,7 +672,7 @@ write_probe_env \
   PROBE_RECEIPT_ATTEMPT_ID "attempt-current" \
   PROBE_RECEIPT_REQUEST_HASH "$BUILTIN_REQUEST_HASH" \
   PROBE_RECEIPT_PARENT_RUN_ID "run-parent" \
-  PROBE_RECEIPT_ACTION_ATTEMPT_ID "action-attempt-1" \
+  PROBE_RECEIPT_ACTION_ATTEMPT_ID "action-builtin" \
   PROBE_RECEIPT_GENERATION "1" \
   PROBE_RECEIPT_NATIVE_SESSION_ID "" \
   PROBE_RECEIPT_SKILL "builtin://accept-unit@1"
@@ -685,7 +689,7 @@ if (result.kind !== "loop_action_result" ||
     result.attempt_id !== "attempt-current" ||
     result.action_id !== "action-builtin" ||
     result.outcome !== "success" ||
-    result.subject !== null) {
+    !/^[a-f0-9]{40}$/.test(result.subject)) {
   throw new Error(`invalid built-in probe result: ${JSON.stringify(result)}`);
 }
 NODE

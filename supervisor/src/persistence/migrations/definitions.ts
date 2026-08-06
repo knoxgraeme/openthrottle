@@ -1571,6 +1571,54 @@ ALTER TABLE execution_graphs ADD COLUMN unit_phase_bindings TEXT NOT NULL DEFAUL
 const executionGraphUnitPhaseBindingsMigrationSource = `${executionGraphUnitPhaseBindingsSchema}
 unit-phase-binding-contract:execution graphs persist the full compiled ordered unit phase binding without rereading mutable graph data/v1`;
 
+const executionUnitPlanCommandNamesSchema = `
+ALTER TABLE execution_units ADD COLUMN command_names TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(command_names));
+UPDATE execution_units
+SET command_names = COALESCE((
+  SELECT execution_graphs.command_names
+  FROM execution_graphs
+  WHERE execution_graphs.id = execution_units.execution_graph_id
+), '[]')
+WHERE command_names = '[]';
+`;
+
+const executionUnitPlanCommandNamesMigrationSource = `${executionUnitPlanCommandNamesSchema}
+unit-command-contract:execution units persist their canonical execution-plan command sequence and do not substitute graph defaults/v1`;
+
+const executionWorkPreparedRequestsSchema = `
+ALTER TABLE execution_work_attempts ADD COLUMN request_payload TEXT CHECK(request_payload IS NULL OR json_valid(request_payload));
+ALTER TABLE execution_work_attempts ADD COLUMN request_launch_state TEXT CHECK(
+  request_launch_state IS NULL OR request_launch_state IN ('prepared', 'worktree_ready', 'launched')
+);
+UPDATE execution_work_attempts
+SET request_launch_state = 'launched'
+WHERE request_hash IS NOT NULL AND request_launch_state IS NULL;
+`;
+
+const executionWorkPreparedRequestsMigrationSource = `${executionWorkPreparedRequestsSchema}
+prepared-child-request-contract:child action sealed request payloads and launch state are durable before provider launch/v1`;
+
+const executionWorkTerminalOutcomeSchema = `
+ALTER TABLE execution_work_attempts ADD COLUMN terminal_result_outcome TEXT CHECK(
+  terminal_result_outcome IS NULL OR terminal_result_outcome IN (
+    'failure',
+    'needs_human',
+    'retryable_infrastructure_failure'
+  )
+);
+UPDATE execution_work_attempts
+SET terminal_result_outcome = CASE
+  WHEN status = 'dead' THEN 'retryable_infrastructure_failure'
+  WHEN status = 'failed' AND last_error LIKE 'retryable_infrastructure_failure:%' THEN 'retryable_infrastructure_failure'
+  WHEN status = 'failed' THEN 'failure'
+  ELSE NULL
+END
+WHERE terminal_result_outcome IS NULL;
+`;
+
+const executionWorkTerminalOutcomeMigrationSource = `${executionWorkTerminalOutcomeSchema}
+terminal-child-result-contract:child action terminal replay compares exact failure needs-human and retryable outcomes/v1`;
+
 function addExecutionGraphStopFence(db: Database.Database): void {
   if (!hasColumns(db, "execution_graphs", ["stopped_at"])) {
     db.exec("ALTER TABLE execution_graphs ADD COLUMN stopped_at TEXT");
@@ -2069,6 +2117,36 @@ const definitions: DatabaseMigrationDefinition[] = [
     up(db) {
       if (hasTable(db, "execution_graphs") && !hasColumns(db, "execution_graphs", ["unit_phase_bindings"])) {
         db.exec(executionGraphUnitPhaseBindingsSchema);
+      }
+    },
+  },
+  {
+    version: 22,
+    name: "execution-unit-plan-command-names",
+    source: executionUnitPlanCommandNamesMigrationSource,
+    up(db) {
+      if (hasTable(db, "execution_units") && !hasColumns(db, "execution_units", ["command_names"])) {
+        db.exec(executionUnitPlanCommandNamesSchema);
+      }
+    },
+  },
+  {
+    version: 23,
+    name: "execution-work-prepared-requests",
+    source: executionWorkPreparedRequestsMigrationSource,
+    up(db) {
+      if (hasTable(db, "execution_work_attempts") && !hasColumns(db, "execution_work_attempts", ["request_payload"])) {
+        db.exec(executionWorkPreparedRequestsSchema);
+      }
+    },
+  },
+  {
+    version: 24,
+    name: "execution-work-terminal-outcome",
+    source: executionWorkTerminalOutcomeMigrationSource,
+    up(db) {
+      if (hasTable(db, "execution_work_attempts") && !hasColumns(db, "execution_work_attempts", ["terminal_result_outcome"])) {
+        db.exec(executionWorkTerminalOutcomeSchema);
       }
     },
   },

@@ -126,7 +126,7 @@ function minimalUnitGraph(overrides: {
       skills: ["builtin://ce/implement@1"],
       allowed_mcp_servers: [],
       session_scope: "fresh",
-      credentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+      credentials: ["model.invoke", "provider.read", "repo.read"],
       ...overrides.worker,
     }, {
       id: "lead-worker",
@@ -250,7 +250,7 @@ describe("execution graph compiler", () => {
         evaluator: { kind: "semantic", assurance: "executor_verified", required_artifacts: ["execution_graph_result"] },
         context: "none",
         live_steering: false,
-        credentials: ["provider.read", "repo.read", "repo.write"],
+        credentials: ["provider.read", "repo.read"],
         produces: ["stage_result", "execution_graph_result"],
         unitPhases: ["implement", "simplify", "command", "candidate", "lead", "integrate"],
         unitCommandNames: ["test", "lint", "build"],
@@ -279,11 +279,12 @@ describe("execution graph compiler", () => {
     expect(compiled.manifest.manifest.stages[0]?.transitions.no_change).toEqual({ terminal: "no_change" });
   });
 
-  it("rejects the structured graph against the shipped production runtime descriptor until the composite runtime lands", () => {
-    expect(() => parseAndCompileExecutionGraph(readFileSync(structuredGraphPath, "utf8"), {
+  it("compiles the structured graph against the shipped production runtime descriptor", () => {
+    const compiled = parseAndCompileExecutionGraph(readFileSync(structuredGraphPath, "utf8"), {
       source: structuredGraphPath,
       runtime: buildInstalledRuntimeDescriptor("production-like/v1").descriptor,
-    })).toThrow(/runtime capability mismatch: .*capability:graph\/for-each-unit@1/);
+    });
+    expect(compiled.manifest.manifest.requires.capabilities).toContain("graph/for-each-unit@1");
   });
 
   it("changes the pinned manifest digest when only a unit phase worker binding changes", () => {
@@ -312,7 +313,7 @@ describe("execution graph compiler", () => {
     const compiled = validateAndCompileExecutionGraph(minimalUnitGraph({
       worker: {
         skills: ["repo://implement_unit"],
-        credentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+        credentials: ["model.invoke", "provider.read", "repo.read"],
       },
       loop: { skill: "repo://implement_unit" },
     }), {
@@ -360,6 +361,21 @@ describe("execution graph compiler", () => {
     }))).toThrow(/graph\.nodes\.units\.phases\.2\.skill: ce\/implement@1 requires repo\.write and cannot be used for gate phases/);
   });
 
+  it("allows implement unit workers to request declared MCP access", () => {
+    const compiled = validateAndCompileExecutionGraph(minimalUnitGraph({
+      worker: {
+        allowed_mcp_servers: ["github"],
+        credentials: ["model.invoke", "mcp", "provider.read", "repo.read"],
+      },
+    }));
+
+    expect(compiled.manifest.manifest.stages[0]?.unitPhaseBindings?.[0]).toMatchObject({
+      id: "implement",
+      credentials: ["model.invoke", "mcp", "provider.read", "repo.read"],
+      worker: { allowed_mcp_servers: ["github"] },
+    });
+  });
+
   it("rejects accept-unit gate phases that violate the shared credential contract", () => {
     expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
       leadWorker: {
@@ -367,7 +383,7 @@ describe("execution graph compiler", () => {
         credentials: ["repo.read"],
       },
       leadLoop: { skill: "builtin://accept-unit@1" },
-    }))).toThrow(/graph\.loops\.lead-loop: accept-unit@1 requires credential scope model\.invoke/);
+    }))).toThrow(/unitPhaseBindings\[2\]\.credentials: accept-unit@1 requires credential scope model\.invoke/);
 
     expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
       leadWorker: {
@@ -375,7 +391,7 @@ describe("execution graph compiler", () => {
         credentials: ["model.invoke", "repo.read", "provider.read"],
       },
       leadLoop: { skill: "builtin://accept-unit@1" },
-    }))).toThrow(/graph\.loops\.lead-loop: accept-unit@1 is not authorized for credential scope provider\.read/);
+    }))).toThrow(/unitPhaseBindings\[2\]\.credentials: accept-unit@1 is not authorized for credential scope provider\.read/);
   });
 
   it("compiles repository skills to the platform repository-skill capability with pinned package identity", () => {

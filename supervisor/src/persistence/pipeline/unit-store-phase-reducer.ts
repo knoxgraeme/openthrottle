@@ -60,6 +60,7 @@ export type ExecutionUnitRow = {
   unit_id: string;
   authored_order: number;
   dependency_unit_ids: string;
+  command_names: string;
   status: ExecutionUnitState["status"];
   phase: UnitPhase;
   current_cycle: number;
@@ -93,6 +94,7 @@ export function unitState(row: ExecutionUnitRow): ExecutionUnitState {
     currentCycle: row.current_cycle,
     repairRounds: row.repair_rounds,
     commandIndex: row.command_index,
+    commandNames: commandNamesForUnit(row),
     acceptedCandidateSubject: row.accepted_candidate_subject,
     integrationSubject: row.integration_subject,
     terminalLevel: row.terminal_level,
@@ -102,6 +104,10 @@ export function unitState(row: ExecutionUnitRow): ExecutionUnitState {
 
 export function commandNamesOf(graph: { command_names: string }): string[] {
   return parseJsonStringArray(graph.command_names);
+}
+
+export function commandNamesForUnit(unitRow: { command_names: string }): string[] {
+  return parseJsonStringArray(unitRow.command_names);
 }
 
 export function unitPhasesOf(graph: { unit_phases?: string }): UnitPhase[] {
@@ -148,6 +154,21 @@ function completedFinalMutationExistsInCycle(
   `).get(input.unitRowId, input.cycle, actionKind));
 }
 
+function completedGraphActionExistsInCycle(
+  db: Database.Database,
+  input: { graphId: string; cycle: number; actionKind: UnitActionKind }
+): boolean {
+  return Boolean(db.prepare(`
+    SELECT 1 FROM execution_work_attempts
+    WHERE execution_graph_id = ?
+      AND execution_unit_id IS NULL
+      AND cycle = ?
+      AND action_kind = ?
+      AND status = 'completed'
+    LIMIT 1
+  `).get(input.graphId, input.cycle, input.actionKind));
+}
+
 export function nextUnitPhaseAfterCompletion(
   db: Database.Database,
   input: {
@@ -191,7 +212,7 @@ export function nextUnitPhaseAfterCompletion(
 
 export function listUnitRowsForParentAttempt(db: Database.Database, parentAttemptId: string): ExecutionUnitRow[] {
   return db.prepare(`
-    SELECT id, unit_id, authored_order, dependency_unit_ids, status, phase, current_cycle,
+    SELECT id, unit_id, authored_order, dependency_unit_ids, command_names, status, phase, current_cycle,
       repair_rounds, command_index, active_work_attempt_id, accepted_candidate_subject,
       integration_subject, terminal_level, alarm
     FROM execution_units WHERE parent_attempt_id = ?
@@ -266,8 +287,8 @@ export function insertWorkAttempt(
     INSERT INTO execution_work_attempts (
       id, execution_graph_id, execution_unit_id, pipeline_instance_id, parent_attempt_id,
       parent_run_id, unit_id, attempt_ordinal, action_kind, cycle, command_name, idempotency_key,
-      status, lease_owner, lease_until, payload, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'leased', ?, ?, ?, ?, ?)
+      native_session_id, status, lease_owner, lease_until, payload, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'leased', ?, ?, ?, ?, ?)
   `).run(
     actionId,
     input.graph.id,
@@ -281,6 +302,7 @@ export function insertWorkAttempt(
     input.cycle,
     input.commandName,
     idempotencyKey,
+    input.resumeNativeSessionId,
     input.leaseOwner,
     input.leaseUntilIso,
     payload,
@@ -308,7 +330,7 @@ export function createOrResumeUnitAction(
   }
 ): ExecutionWorkAttempt {
   let unitRow = input.unitRow;
-  const commandNames = commandNamesOf(input.graph);
+  const commandNames = commandNamesForUnit(unitRow);
   const phases = phaseSequenceOf(input.graph);
   for (let guard = 0; guard < phases.length + commandNames.length + 1; guard += 1) {
     if (unitRow.phase === "command" && unitRow.command_index >= commandNames.length) {
@@ -328,7 +350,9 @@ export function createOrResumeUnitAction(
     const commandName = unitRow.phase === "command" ? commandNames[unitRow.command_index]! : null;
     const resumeNativeSessionId = actionKind === "repair"
       ? priorSessionId(db, { unitRowId: unitRow.id, graphId: input.graph.id, kinds: ["implement", "repair"] })
-      : null;
+      : actionKind === "simplify"
+        ? priorSessionId(db, { unitRowId: unitRow.id, graphId: input.graph.id, kinds: ["implement", "repair", "simplify"] })
+        : null;
     return insertWorkAttempt(db, {
       unitRow,
       graph: input.graph,
@@ -355,7 +379,7 @@ export function createOrResumeFinalAction(
 ): ExecutionWorkAttempt | undefined {
   let graph = input.graph;
   const commandNames = commandNamesOf(graph);
-  for (let guard = 0; guard < commandNames.length + 3; guard += 1) {
+  for (let guard = 0; guard < commandNames.length + 5; guard += 1) {
     const phase: FinalPhase = graph.final_phase ?? "command";
     if (phase === "done") return undefined;
     if (phase === "command" && graph.final_command_index >= commandNames.length) {
@@ -391,7 +415,44 @@ export function createOrResumeFinalAction(
         leaseUntilIso: input.leaseUntilIso,
       });
     }
-    // phase === "repair"
+    // phase === "repair": a final repair edits a worktree. Before final
+    // commands/review rerun, the executor must turn that tree into candidate
+    // evidence and integrate it into the authoritative integration checkout.
+    if (completedGraphActionExistsInCycle(db, { graphId: graph.id, cycle: graph.final_cycle, actionKind: "final_repair" })) {
+      if (!completedGraphActionExistsInCycle(db, { graphId: graph.id, cycle: graph.final_cycle, actionKind: "candidate" })) {
+        return insertWorkAttempt(db, {
+          unitRow: null,
+          graph,
+          actionKind: "candidate",
+          cycle: graph.final_cycle,
+          commandName: null,
+          resumeNativeSessionId: null,
+          leaseOwner: input.leaseOwner,
+          nowIso: input.nowIso,
+          leaseUntilIso: input.leaseUntilIso,
+        });
+      }
+      if (!completedGraphActionExistsInCycle(db, { graphId: graph.id, cycle: graph.final_cycle, actionKind: "integrate" })) {
+        return insertWorkAttempt(db, {
+          unitRow: null,
+          graph,
+          actionKind: "integrate",
+          cycle: graph.final_cycle,
+          commandName: null,
+          resumeNativeSessionId: null,
+          leaseOwner: input.leaseOwner,
+          nowIso: input.nowIso,
+          leaseUntilIso: input.leaseUntilIso,
+        });
+      }
+      db.prepare(`
+        UPDATE execution_graphs
+        SET final_phase = 'command', final_command_index = 0, final_cycle = final_cycle + 1, updated_at = ?
+        WHERE id = ?
+      `).run(input.nowIso, graph.id);
+      graph = { ...graph, final_phase: "command", final_command_index: 0, final_cycle: graph.final_cycle + 1 };
+      continue;
+    }
     const resumeNativeSessionId = priorSessionId(db, {
       unitRowId: null,
       graphId: graph.id,
@@ -426,6 +487,7 @@ export function markActionCompleted(
     resultHash: string;
     outputSubject: string;
     receipt?: string;
+    nativeSessionId?: string | null;
     timestamp: string;
   }
 ): void {
@@ -450,9 +512,19 @@ export function markActionCompleted(
   db.prepare(`
     UPDATE execution_work_attempts
     SET status = 'completed', result_hash = ?, output_subject = ?, receipt = ?, receipt_hash = ?,
+        native_session_id = COALESCE(?, native_session_id),
         completed_at = ?, updated_at = ?
     WHERE id = ? AND status IN ('leased', 'dispatched', 'running')
-  `).run(input.resultHash, input.outputSubject, receiptJson, receiptHash, input.timestamp, input.timestamp, input.action.id);
+  `).run(
+    input.resultHash,
+    input.outputSubject,
+    receiptJson,
+    receiptHash,
+    input.nativeSessionId ?? null,
+    input.timestamp,
+    input.timestamp,
+    input.action.id
+  );
 }
 
 export function insertGateReceipt(

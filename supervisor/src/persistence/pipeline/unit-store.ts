@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import {
   canonicalJson,
+  digestNormalized,
   type PipelineUnitPhaseBinding,
   type StageOutcome,
   unitPhaseBindingCommandNames,
@@ -31,6 +32,7 @@ import {
   createOrResumeFinalAction,
   createOrResumeUnitAction,
   DEFAULT_MAX_REPAIR_ROUNDS,
+  commandNamesForUnit,
   dependenciesFor,
   GATED_ACTION_KINDS,
   insertGateReceipt,
@@ -44,8 +46,23 @@ import {
   unitState,
   type ExecutionUnitRow,
 } from "./unit-store-phase-reducer.js";
+import {
+  MAX_DOWNSTREAM_CONTEXT_BYTES as MAX_DOWNSTREAM_CONTEXT_AGGREGATE_BYTES,
+  MAX_DOWNSTREAM_CONTEXT_RECORDS,
+} from "../../pipeline/structured-loop-limits.js";
 
 export type ExecutionGateKind = ChildGateDecision["gateKind"] | "integration" | "final_review";
+
+function assertGateMatchesAction(action: ExecutionWorkAttempt, gateKind: ExecutionGateKind): void {
+  const expectedAction = gateKind === "unit_acceptance"
+    ? "lead"
+    : gateKind === "integration"
+      ? "integrate"
+      : "final_review";
+  if (action.action_kind !== expectedAction) {
+    throw new Error(`execution work attempt ${action.id} action ${action.action_kind} cannot complete ${gateKind} gate`);
+  }
+}
 
 export interface ExecutionUnitGraph {
   id: string;
@@ -87,7 +104,10 @@ export interface ExecutionWorkAttempt {
   command_name: string | null;
   idempotency_key: string;
   request_hash: string | null;
+  request_payload?: string | null;
+  request_launch_state?: "prepared" | "worktree_ready" | "launched" | null;
   result_hash: string | null;
+  terminal_result_outcome: "failure" | "needs_human" | "retryable_infrastructure_failure" | null;
   receipt: string | null;
   receipt_hash: string | null;
   native_session_id: string | null;
@@ -151,6 +171,7 @@ export interface ExecutionUnitStore {
   }): ExecutionUnitGraph;
   getGraphForAttempt(parentAttemptId: string): ExecutionUnitGraph | undefined;
   listUnits(parentAttemptId: string): ExecutionUnitState[];
+  listWorkAttempts(parentAttemptId: string): ExecutionWorkAttempt[];
   leaseNextUnitAction(input: {
     parentAttemptId: string;
     leaseOwner: string;
@@ -158,24 +179,47 @@ export interface ExecutionUnitStore {
     leaseUntilIso: string;
   }): ExecutionWorkAttempt | undefined;
   markActionDispatching(actionId: string): void;
+  prepareActionDispatch(input: {
+    actionId: string;
+    requestHash: string;
+    requestPayload: string;
+    nativeSessionId?: string | null;
+  }): ExecutionWorkAttempt;
+  markActionWorktreeReady(actionId: string): void;
   markActionDispatched(actionId: string, requestHash: string, nativeSessionId?: string | null): void;
   completeUnitAction(input: {
     actionId: string;
     resultHash: string;
     outputSubject: string;
     receipt?: string;
+    nativeSessionId?: string | null;
   }): ExecutionWorkAttempt;
   completeGatedAction(input: {
     actionId: string;
     resultHash: string;
     outputSubject: string;
     receipt?: string;
+    nativeSessionId?: string | null;
     decision: ExecutionGateDecision;
+  }): ExecutionWorkAttempt;
+  failUnitAction(input: {
+    actionId: string;
+    resultHash: string;
+    outcome: "failure" | "needs_human" | "retryable_infrastructure_failure";
+    lastError: string;
+    nativeSessionId?: string | null;
+  }): ExecutionWorkAttempt;
+  stopRetryableUnitAction(input: {
+    actionId: string;
+    resultHash: string;
+    lastError: string;
+    nativeSessionId?: string | null;
   }): ExecutionWorkAttempt;
   emitAggregateOnce(input: {
     parentAttemptId: string;
     artifactHash: string;
     integrationSubject: string | null;
+    requireFinalReview?: boolean;
   }): "emitted" | "already_emitted";
   recordGateReceipt(input: {
     actionId: string;
@@ -337,6 +381,58 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     }
   }
 
+  function acceptedDownstreamContextRecords(input: {
+    parentAttemptId: string;
+    unitId: string;
+    cycle: number;
+  }): Array<{ toUnitId: string; payload: Record<string, unknown> }> {
+    const rows = listUnitRows(input.parentAttemptId);
+    const rowByUnitId = new Map(rows.map((row) => [row.unit_id, row]));
+    const declaredDependents = new Set(rows
+      .filter((row) => dependenciesFor(row).includes(input.unitId))
+      .map((row) => row.unit_id));
+    const receiptRows = db.prepare(`
+      SELECT receipt FROM execution_work_attempts
+      WHERE parent_attempt_id = ? AND unit_id = ? AND cycle = ? AND status = 'completed'
+        AND action_kind IN ('implement', 'repair', 'lead') AND receipt IS NOT NULL
+      ORDER BY created_at, id
+    `).all(input.parentAttemptId, input.unitId, input.cycle) as Array<{ receipt: string }>;
+    const records: Array<{ toUnitId: string; payload: Record<string, unknown> }> = [];
+    for (const row of receiptRows) {
+      const receipt = JSON.parse(row.receipt) as {
+        type?: string;
+        payload?: {
+          downstream_context?: Array<{ unit_id: string; summary: string }>;
+          context_updates?: Array<{ unit_id: string; summary: string }>;
+        };
+      };
+      const contextRecords = receipt.type === "unit_completion"
+        ? receipt.payload?.downstream_context ?? []
+        : receipt.type === "unit_decision"
+          ? receipt.payload?.context_updates ?? []
+          : [];
+      for (const record of contextRecords) {
+        const target = rowByUnitId.get(record.unit_id);
+        if (!target) throw new Error(`unknown downstream context target ${record.unit_id}`);
+        if (!declaredDependents.has(record.unit_id)) {
+          throw new Error(`downstream context target ${record.unit_id} is not a declared dependent of ${input.unitId}`);
+        }
+        if (target.status !== "pending" || target.terminal_level !== null) {
+          throw new Error(`downstream context target ${record.unit_id} is not pending`);
+        }
+        records.push({
+          toUnitId: record.unit_id,
+          payload: {
+            schema: "openthrottle.downstream-context/v1",
+            from_unit_id: input.unitId,
+            summary: record.summary,
+          },
+        });
+      }
+    }
+    return records;
+  }
+
   function assertGraphReplayMatches(
     input: Parameters<ExecutionUnitStore["createGraph"]>[0],
     existing: ExecutionUnitGraph,
@@ -378,11 +474,13 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       unit_id: unit.id,
       authored_order: index,
       dependency_unit_ids: [...(unit.dependencies ?? [])].sort(),
+      command_names: [...(unit.commandNames ?? phaseProjection.commandNames)],
     }));
     const actualUnits = listUnitRows(input.parentAttemptId).map((row) => canonicalJson({
       unit_id: row.unit_id,
       authored_order: row.authored_order,
       dependency_unit_ids: dependenciesFor(row),
+      command_names: commandNamesForUnit(row),
     }));
     if (canonicalJson(actualUnits) !== canonicalJson(expectedUnits)) {
       throw new Error(`execution graph ${existing.id} replay unit set mismatch`);
@@ -399,12 +497,65 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     ) {
       throw new Error("execution graph unitPhaseBindings must match unitPhases");
     }
-    const boundCommandNames = unitPhaseBindingCommandNames(input.unitPhaseBindings);
+  }
+
+  function assertCompletedActionReplayMatches(input: {
+    action: ExecutionWorkAttempt;
+    resultHash: string;
+    outputSubject: string;
+    receipt?: string;
+    nativeSessionId?: string | null;
+  }): void {
+    const receiptHash = input.receipt === undefined ? null : digestNormalized(input.receipt);
     if (
-      input.commandNames &&
-      canonicalJson(boundCommandNames) !== canonicalJson([...input.commandNames])
+      input.action.result_hash !== input.resultHash ||
+      input.action.output_subject !== input.outputSubject ||
+      input.action.receipt_hash !== receiptHash ||
+      (input.receipt !== undefined && input.action.receipt !== input.receipt) ||
+      (input.nativeSessionId !== undefined && input.action.native_session_id !== input.nativeSessionId)
     ) {
-      throw new Error("execution graph unitPhaseBindings command phases must match commandNames");
+      throw new Error(`execution work attempt ${input.action.id} already completed with a different result`);
+    }
+  }
+
+  function assertTerminalActionReplayMatches(input: {
+    action: ExecutionWorkAttempt;
+    status: "failed" | "dead";
+    outcome: "failure" | "needs_human" | "retryable_infrastructure_failure";
+    resultHash: string;
+    nativeSessionId?: string | null;
+    lastError: string;
+  }): void {
+    if (
+      input.action.status !== input.status ||
+      input.action.terminal_result_outcome !== input.outcome ||
+      input.action.result_hash !== input.resultHash ||
+      input.action.last_error !== input.lastError ||
+      (input.nativeSessionId !== undefined && input.action.native_session_id !== input.nativeSessionId)
+    ) {
+      throw new Error(`execution work attempt ${input.action.id} already terminated with a different result`);
+    }
+  }
+
+  function assertPreparedRequestReplayMatches(input: {
+    action: ExecutionWorkAttempt;
+    requestHash: string;
+    requestPayload: string;
+    nativeSessionId?: string | null;
+  }): void {
+    if (
+      input.action.request_hash !== input.requestHash ||
+      input.action.request_payload !== input.requestPayload ||
+      (input.nativeSessionId !== undefined &&
+        input.nativeSessionId !== null &&
+        input.action.native_session_id !== null &&
+        input.action.native_session_id !== input.nativeSessionId)
+    ) {
+      throw new Error(
+        `execution work attempt ${input.action.id} already prepared a different request ` +
+        `(existing_hash=${input.action.request_hash ?? "<none>"} new_hash=${input.requestHash} ` +
+        `existing_payload=${input.action.request_payload == null ? "<none>" : "present"})`
+      );
     }
   }
 
@@ -418,7 +569,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     assertUnitPhaseBindingsMatch(input);
     const unitPhaseBindings = input.unitPhaseBindings!;
     return {
-      commandNames: unitPhaseBindingCommandNames(unitPhaseBindings),
+      commandNames: input.commandNames ? [...input.commandNames] : unitPhaseBindingCommandNames(unitPhaseBindings),
       unitPhases: unitPhaseBindingIds(unitPhaseBindings),
       unitPhaseBindings,
     };
@@ -465,11 +616,12 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       timestamp
     );
     for (const [index, unit] of input.units.entries()) {
+      const unitCommandNames = canonicalJson([...(unit.commandNames ?? phaseProjection.commandNames)]);
       db.prepare(`
         INSERT INTO execution_units (
           id, execution_graph_id, pipeline_instance_id, parent_attempt_id, unit_id,
-          authored_order, dependency_unit_ids, status, phase, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+          authored_order, dependency_unit_ids, command_names, status, phase, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
         ON CONFLICT(parent_attempt_id, unit_id) DO NOTHING
       `).run(
         deterministicId("execution-unit", [input.parentAttemptId, unit.id]),
@@ -479,6 +631,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         unit.id,
         index,
         canonicalJson([...(unit.dependencies ?? [])].sort()),
+        unitCommandNames,
         initialUnitPhase,
         timestamp,
         timestamp
@@ -506,8 +659,16 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       UPDATE execution_work_attempts
       SET status = 'failed', updated_at = ?, last_error = 'lease expired before acknowledgement'
       WHERE parent_attempt_id = ? AND status = 'leased'
+        AND request_hash IS NULL
         AND lease_until IS NOT NULL AND lease_until <= ?
     `).run(input.nowIso, input.parentAttemptId, input.nowIso);
+    const prepared = db.prepare(`
+      SELECT * FROM execution_work_attempts
+      WHERE parent_attempt_id = ? AND status = 'leased' AND request_hash IS NOT NULL
+      ORDER BY created_at, id
+      LIMIT 1
+    `).get(input.parentAttemptId) as ExecutionWorkAttempt | undefined;
+    if (prepared) return prepared;
     const dispatched = db.prepare(`
       SELECT * FROM execution_work_attempts
       WHERE parent_attempt_id = ? AND status IN ('dispatched', 'running')
@@ -566,14 +727,24 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
   ): ExecutionWorkAttempt => {
     const timestamp = now();
     const action = loadActiveAction(db, input.actionId);
-    if (action.status === "completed") return action;
+    if (action.status === "completed") {
+      assertCompletedActionReplayMatches({ action, ...input });
+      return action;
+    }
     if (!["leased", "dispatched", "running"].includes(action.status)) {
       throw new Error(`execution work attempt ${input.actionId} is not active`);
     }
     if (GATED_ACTION_KINDS.has(action.action_kind)) {
       throw new Error(`execution work attempt ${input.actionId} requires a gate decision to complete`);
     }
-    markActionCompleted(db, { action, resultHash: input.resultHash, outputSubject: input.outputSubject, receipt: input.receipt, timestamp });
+    markActionCompleted(db, {
+      action,
+      resultHash: input.resultHash,
+      outputSubject: input.outputSubject,
+      receipt: input.receipt,
+      nativeSessionId: input.nativeSessionId,
+      timestamp,
+    });
 
     if (action.execution_unit_id) {
       const unitUpdate = db.prepare(`
@@ -611,11 +782,11 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         db.prepare(`UPDATE execution_graphs SET final_command_index = final_command_index + 1, updated_at = ? WHERE id = ?`)
           .run(timestamp, action.execution_graph_id);
       } else if (action.action_kind === "final_repair") {
-        db.prepare(`
-          UPDATE execution_graphs
-          SET final_phase = 'command', final_command_index = 0, final_cycle = final_cycle + 1, updated_at = ?
-          WHERE id = ?
-        `).run(timestamp, action.execution_graph_id);
+        db.prepare(`UPDATE execution_graphs SET updated_at = ? WHERE id = ?`)
+          .run(timestamp, action.execution_graph_id);
+      } else if (action.action_kind === "candidate") {
+        db.prepare(`UPDATE execution_graphs SET updated_at = ? WHERE id = ?`)
+          .run(timestamp, action.execution_graph_id);
       } else {
         throw new Error(`execution work attempt ${input.actionId} action kind is not handled by completeUnitAction`);
       }
@@ -631,13 +802,24 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     if (!GATED_ACTION_KINDS.has(action.action_kind)) {
       throw new Error(`execution work attempt ${input.actionId} is not a gated action`);
     }
+    if (action.status === "completed") {
+      assertCompletedActionReplayMatches({ action, ...input });
+    }
     if (action.status !== "completed") {
       if (!["leased", "dispatched", "running"].includes(action.status)) {
         throw new Error(`execution work attempt ${input.actionId} is not active`);
       }
-      markActionCompleted(db, { action, resultHash: input.resultHash, outputSubject: input.outputSubject, receipt: input.receipt, timestamp });
+      markActionCompleted(db, {
+        action,
+        resultHash: input.resultHash,
+        outputSubject: input.outputSubject,
+        receipt: input.receipt,
+        nativeSessionId: input.nativeSessionId,
+        timestamp,
+      });
     }
     const completedAction = loadActiveAction(db, input.actionId);
+    assertGateMatchesAction(completedAction, input.decision.gateKind);
 
     const evaluatorKind: ChildGateEvaluatorKind = input.decision.gateKind === "unit_acceptance"
       ? "human"
@@ -707,7 +889,21 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         if (routing.action === "settle_completed") {
           db.prepare(`UPDATE execution_units SET integration_subject = ?, updated_at = ? WHERE id = ?`)
             .run(input.decision.subject, timestamp, unitRow.id);
+          db.prepare(`UPDATE execution_graphs SET integration_subject = ?, updated_at = ? WHERE parent_attempt_id = ?`)
+            .run(input.decision.subject, timestamp, completedAction.parent_attempt_id);
           settleUnitRow({ parentAttemptId: completedAction.parent_attempt_id, unitId: unitRow.unit_id, reason: "acceptance_passed", timestamp });
+          const contextRecords = acceptedDownstreamContextRecords({
+            parentAttemptId: completedAction.parent_attempt_id,
+            unitId: unitRow.unit_id,
+            cycle: completedAction.cycle,
+          });
+          if (contextRecords.length > 0) {
+            appendDownstreamContext({
+              parentAttemptId: completedAction.parent_attempt_id,
+              fromUnitId: unitRow.unit_id,
+              records: contextRecords,
+            });
+          }
         } else {
           stopActiveWork({ parentAttemptId: completedAction.parent_attempt_id, reason: routing.reason });
         }
@@ -715,10 +911,23 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         throw new Error(`execution work attempt ${input.actionId} gate kind ${input.decision.gateKind} is not valid for a unit action`);
       }
     } else {
+      const graph = graphStmt.get(completedAction.parent_attempt_id) as ExecutionUnitGraph;
+      if (input.decision.gateKind === "integration") {
+        const routing = routeIntegrationDecision({ outcome: input.decision.outcome, reason: input.decision.reason });
+        if (routing.action === "settle_completed") {
+          db.prepare(`
+            UPDATE execution_graphs SET integration_subject = ?, final_phase = 'command',
+              final_command_index = 0, final_cycle = final_cycle + 1, updated_at = ?
+            WHERE id = ?
+          `).run(input.decision.subject, timestamp, graph.id);
+        } else {
+          stopActiveWork({ parentAttemptId: completedAction.parent_attempt_id, reason: routing.reason });
+        }
+        return loadActiveAction(db, input.actionId);
+      }
       if (input.decision.gateKind !== "final_review") {
         throw new Error(`execution work attempt ${input.actionId} gate kind ${input.decision.gateKind} is not valid for a final action`);
       }
-      const graph = graphStmt.get(completedAction.parent_attempt_id) as ExecutionUnitGraph;
       const routing = routeFinalReviewDecision({
         outcome: input.decision.outcome,
         reason: input.decision.reason,
@@ -737,6 +946,106 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         stopActiveWork({ parentAttemptId: completedAction.parent_attempt_id, reason: routing.reason });
       }
     }
+    return loadActiveAction(db, input.actionId);
+  });
+
+  const failUnitAction = db.transaction((
+    input: Parameters<ExecutionUnitStore["failUnitAction"]>[0]
+  ): ExecutionWorkAttempt => {
+    const timestamp = now();
+    const action = loadActiveAction(db, input.actionId);
+    const lastError = input.lastError.slice(0, 2_000);
+    if (action.status === "failed") {
+      assertTerminalActionReplayMatches({
+        action,
+        status: "failed",
+        outcome: input.outcome,
+        resultHash: input.resultHash,
+        nativeSessionId: input.nativeSessionId,
+        lastError,
+      });
+      return action;
+    }
+    if (action.status === "dead") {
+      throw new Error(`execution work attempt ${input.actionId} already terminated with a different result`);
+    }
+    if (!["leased", "dispatched", "running"].includes(action.status)) {
+      throw new Error(`execution work attempt ${input.actionId} is not active`);
+    }
+    const update = db.prepare(`
+      UPDATE execution_work_attempts
+      SET status = 'failed', result_hash = ?, terminal_result_outcome = ?,
+          native_session_id = COALESCE(?, native_session_id),
+          lease_until = NULL, last_error = ?, completed_at = ?, updated_at = ?
+      WHERE id = ? AND status IN ('leased', 'dispatched', 'running')
+    `).run(input.resultHash, input.outcome, input.nativeSessionId ?? null, lastError, timestamp, timestamp, input.actionId);
+    if (update.changes !== 1) throw new Error(`execution work attempt ${input.actionId} failure compare-and-set failed`);
+    if (action.execution_unit_id && action.unit_id) {
+      const unitUpdate = db.prepare(`
+        UPDATE execution_units SET active_work_attempt_id = NULL, updated_at = ?
+        WHERE id = ? AND active_work_attempt_id = ?
+      `).run(timestamp, action.execution_unit_id, action.id);
+      if (unitUpdate.changes !== 1) {
+        throw new Error(`execution work attempt ${input.actionId} is not the current active action`);
+      }
+      settleUnitRow({
+        parentAttemptId: action.parent_attempt_id,
+        unitId: action.unit_id,
+        reason: input.outcome === "needs_human" ? "structural_exit" : "defect",
+        timestamp,
+      });
+      settleStructurallyBlockedDependents(action.parent_attempt_id, timestamp);
+    } else {
+      stopActiveWork({ parentAttemptId: action.parent_attempt_id, reason: lastError });
+    }
+    return loadActiveAction(db, input.actionId);
+  });
+
+  const stopRetryableUnitAction = db.transaction((
+    input: Parameters<ExecutionUnitStore["stopRetryableUnitAction"]>[0]
+  ): ExecutionWorkAttempt => {
+    const timestamp = now();
+    const action = loadActiveAction(db, input.actionId);
+    const lastError = `retryable_infrastructure_failure: ${input.lastError}`.slice(0, 2_000);
+    if (action.status === "dead") {
+      assertTerminalActionReplayMatches({
+        action,
+        status: "dead",
+        outcome: "retryable_infrastructure_failure",
+        resultHash: input.resultHash,
+        nativeSessionId: input.nativeSessionId,
+        lastError,
+      });
+      return action;
+    }
+    if (action.status === "failed") {
+      throw new Error(`execution work attempt ${input.actionId} already terminated with a different result`);
+    }
+    if (!["leased", "dispatched", "running"].includes(action.status)) {
+      throw new Error(`execution work attempt ${input.actionId} is not active`);
+    }
+    const update = db.prepare(`
+      UPDATE execution_work_attempts
+      SET status = 'dead', result_hash = ?, terminal_result_outcome = 'retryable_infrastructure_failure',
+          native_session_id = COALESCE(?, native_session_id),
+          lease_until = NULL, last_error = ?, completed_at = ?, updated_at = ?
+      WHERE id = ? AND status IN ('leased', 'dispatched', 'running')
+    `).run(input.resultHash, input.nativeSessionId ?? null, lastError, timestamp, timestamp, input.actionId);
+    if (update.changes !== 1) throw new Error(`execution work attempt ${input.actionId} retryable stop compare-and-set failed`);
+    const graph = graphStmt.get(action.parent_attempt_id) as ExecutionUnitGraph | undefined;
+    if (graph && !graph.aggregate_emitted_at && !graph.stopped_at) {
+      db.prepare(`
+        UPDATE execution_graphs
+        SET stopped_at = ?, stop_reason = ?, updated_at = ?
+        WHERE parent_attempt_id = ? AND stopped_at IS NULL
+      `).run(timestamp, lastError, timestamp, action.parent_attempt_id);
+    }
+    db.prepare(`
+      UPDATE execution_units
+      SET status = 'exited', terminal_level = 'exited', alarm = 0,
+          active_work_attempt_id = NULL, updated_at = ?
+      WHERE parent_attempt_id = ? AND terminal_level IS NULL
+    `).run(timestamp, action.parent_attempt_id);
     return loadActiveAction(db, input.actionId);
   });
 
@@ -760,7 +1069,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     const hasCompletedUnit = db.prepare(`
       SELECT 1 FROM execution_units WHERE parent_attempt_id = ? AND terminal_level = 'completed' LIMIT 1
     `).get(input.parentAttemptId);
-    if (hasCompletedUnit && graph.final_phase !== "done") {
+    if ((input.requireFinalReview ?? true) && hasCompletedUnit && graph.final_phase !== "done") {
       throw new Error(`execution graph ${graph.id} whole-change final review has not passed`);
     }
     const timestamp = now();
@@ -820,6 +1129,50 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         throw new Error(`downstream context source ${input.fromUnitId} is not integrated`);
       }
       throw new Error(decision.reason);
+    }
+    const existingByTarget = new Map<string, Array<{ fromUnitId: string; payloadHash: string; payload: Record<string, unknown> }>>();
+    const existingRows = db.prepare(`
+      SELECT from_unit_id, to_unit_id, payload_hash, payload
+      FROM execution_downstream_context
+      WHERE parent_attempt_id = ?
+      ORDER BY created_at, id
+    `).all(input.parentAttemptId) as Array<{
+      from_unit_id: string;
+      to_unit_id: string;
+      payload_hash: string;
+      payload: string;
+    }>;
+    for (const row of existingRows) {
+      const records = existingByTarget.get(row.to_unit_id) ?? [];
+      records.push({
+        fromUnitId: row.from_unit_id,
+        payloadHash: row.payload_hash,
+        payload: JSON.parse(row.payload) as Record<string, unknown>,
+      });
+      existingByTarget.set(row.to_unit_id, records);
+    }
+    const candidateByTarget = new Map(existingByTarget);
+    for (const record of decision.records) {
+      const targetRecords = [...(candidateByTarget.get(record.toUnitId) ?? [])];
+      const wireRecord = {
+        fromUnitId: record.fromUnitId,
+        payloadHash: record.payloadHash,
+        payload: record.payload,
+      };
+      if (!targetRecords.some((existing) =>
+        existing.fromUnitId === wireRecord.fromUnitId && existing.payloadHash === wireRecord.payloadHash
+      )) {
+        targetRecords.push(wireRecord);
+      }
+      candidateByTarget.set(record.toUnitId, targetRecords);
+    }
+    for (const [target, records] of candidateByTarget) {
+      if (records.length > MAX_DOWNSTREAM_CONTEXT_RECORDS) {
+        throw new Error(`downstream context target ${target} exceeds 32 records`);
+      }
+      if (Buffer.byteLength(canonicalJson(records), "utf8") > MAX_DOWNSTREAM_CONTEXT_AGGREGATE_BYTES) {
+        throw new Error(`downstream context target ${target} exceeds 32768 bytes`);
+      }
     }
     const unitRowsById = new Map(rows.map((row) => [row.unit_id, row]));
     const from = unitRowsById.get(input.fromUnitId)!;
@@ -955,6 +1308,13 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     listUnits(parentAttemptId) {
       return listUnitRows(parentAttemptId).map(unitState);
     },
+    listWorkAttempts(parentAttemptId) {
+      return db.prepare(`
+        SELECT * FROM execution_work_attempts
+        WHERE parent_attempt_id = ?
+        ORDER BY created_at, id
+      `).all(parentAttemptId) as ExecutionWorkAttempt[];
+    },
     leaseNextUnitAction,
     markActionDispatching(actionId) {
       const timestamp = now();
@@ -965,17 +1325,79 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       `).run(timestamp, actionId);
       if (update.changes !== 1) throw new Error(`execution work attempt ${actionId} is not leased`);
     },
-    markActionDispatched(actionId, requestHash, nativeSessionId = null) {
+    prepareActionDispatch(input) {
+      const timestamp = now();
+      const action = db.prepare("SELECT * FROM execution_work_attempts WHERE id = ?")
+        .get(input.actionId) as ExecutionWorkAttempt | undefined;
+      if (!action) throw new Error(`unknown execution work attempt ${input.actionId}`);
+      if (action.request_hash != null || action.request_payload != null) {
+        if (action.request_hash == null) {
+          db.prepare(`
+            UPDATE execution_work_attempts
+            SET request_hash = ?, request_payload = ?, request_launch_state = COALESCE(request_launch_state, 'prepared'),
+                native_session_id = COALESCE(?, native_session_id), updated_at = ?
+            WHERE id = ? AND request_hash IS NULL
+          `).run(input.requestHash, input.requestPayload, input.nativeSessionId ?? null, timestamp, input.actionId);
+          return db.prepare("SELECT * FROM execution_work_attempts WHERE id = ?")
+            .get(input.actionId) as ExecutionWorkAttempt;
+        }
+        if (action.request_hash === input.requestHash && action.request_payload == null) {
+          db.prepare(`
+            UPDATE execution_work_attempts
+            SET request_payload = ?, request_launch_state = COALESCE(request_launch_state, 'prepared'),
+                native_session_id = COALESCE(?, native_session_id), updated_at = ?
+            WHERE id = ? AND request_hash = ? AND request_payload IS NULL
+          `).run(input.requestPayload, input.nativeSessionId ?? null, timestamp, input.actionId, input.requestHash);
+          return db.prepare("SELECT * FROM execution_work_attempts WHERE id = ?")
+            .get(input.actionId) as ExecutionWorkAttempt;
+        }
+        assertPreparedRequestReplayMatches({ action, ...input });
+        return action;
+      }
+      const update = db.prepare(`
+        UPDATE execution_work_attempts
+        SET request_hash = ?, request_payload = ?, request_launch_state = 'prepared',
+            native_session_id = COALESCE(?, native_session_id), updated_at = ?
+        WHERE id = ? AND status IN ('leased', 'dispatched')
+          AND request_hash IS NULL AND request_payload IS NULL
+      `).run(input.requestHash, input.requestPayload, input.nativeSessionId ?? null, timestamp, input.actionId);
+      if (update.changes !== 1) throw new Error(`execution work attempt ${input.actionId} is not preparable`);
+      return db.prepare("SELECT * FROM execution_work_attempts WHERE id = ?")
+        .get(input.actionId) as ExecutionWorkAttempt;
+    },
+    markActionWorktreeReady(actionId) {
       const timestamp = now();
       const update = db.prepare(`
         UPDATE execution_work_attempts
-        SET status = 'dispatched', request_hash = ?, native_session_id = ?, updated_at = ?
+        SET request_launch_state = 'worktree_ready', updated_at = ?
+        WHERE id = ? AND request_hash IS NOT NULL AND request_payload IS NOT NULL
+          AND (request_launch_state IS NULL OR request_launch_state IN ('prepared', 'worktree_ready'))
+      `).run(timestamp, actionId);
+      if (update.changes !== 1) return;
+    },
+    markActionDispatched(actionId, requestHash, nativeSessionId = null) {
+      const timestamp = now();
+      const action = db.prepare("SELECT * FROM execution_work_attempts WHERE id = ?")
+        .get(actionId) as ExecutionWorkAttempt | undefined;
+      if (!action) throw new Error(`unknown execution work attempt ${actionId}`);
+      if (action.request_hash !== null && action.request_hash !== requestHash) {
+        throw new Error(`execution work attempt ${actionId} already dispatched with a different request`);
+      }
+      if (action.native_session_id !== null && nativeSessionId !== null && action.native_session_id !== nativeSessionId) {
+        throw new Error(`execution work attempt ${actionId} already dispatched with a different native session`);
+      }
+      const update = db.prepare(`
+        UPDATE execution_work_attempts
+        SET status = 'dispatched', request_hash = ?, request_launch_state = 'launched',
+            native_session_id = COALESCE(?, native_session_id), updated_at = ?
         WHERE id = ? AND status IN ('leased', 'dispatched', 'running')
       `).run(requestHash, nativeSessionId, timestamp, actionId);
       if (update.changes !== 1) throw new Error(`execution work attempt ${actionId} is not active`);
     },
     completeUnitAction,
     completeGatedAction,
+    failUnitAction,
+    stopRetryableUnitAction,
     emitAggregateOnce,
     recordGateReceipt,
     listGateReceipts(parentAttemptId) {

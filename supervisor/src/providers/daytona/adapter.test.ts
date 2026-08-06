@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createDaytonaSandboxRuntime } from "./adapter.js";
 import { canonicalJson, digestNormalized } from "../../pipeline/manifest.js";
 import { STAGE_EXECUTOR_PROTOCOL, createStageRequestHash, type StageRequestEnvelope } from "../../pipeline/stage-request.js";
-import type { LoopActionRequest } from "../../runtime/contracts.js";
+import type { ChildExecutorActionRequest, LoopActionRequest } from "../../runtime/contracts.js";
 
 function fencedLoopRequest(overrides: Partial<Omit<LoopActionRequest, "requestHash" | "idempotencyKey">> = {}): LoopActionRequest {
   const withoutFence = {
@@ -11,6 +11,7 @@ function fencedLoopRequest(overrides: Partial<Omit<LoopActionRequest, "requestHa
     actionId: "loop-1",
     attemptId: "attempt-child",
     graphId: "graph-1",
+    parentRunId: "run-parent",
     unitId: "unit-1",
     role: "worker" as const,
     loop: "implement" as const,
@@ -23,7 +24,7 @@ function fencedLoopRequest(overrides: Partial<Omit<LoopActionRequest, "requestHa
     timeoutMs: 30_000,
     transitionContext: "implement unit",
     allowedMcpServers: ["github"],
-    credentialScopes: ["model.invoke", "repo.read", "repo.write"] as const,
+    credentialScopes: ["model.invoke", "repo.read"] as const,
     receiptSchema: "openthrottle.receipt/v1",
     ...overrides,
   } as Omit<LoopActionRequest, "requestHash" | "idempotencyKey">;
@@ -36,6 +37,35 @@ function fencedLoopRequest(overrides: Partial<Omit<LoopActionRequest, "requestHa
     ...withoutFence,
     requestHash,
     idempotencyKey: `loop:${withoutFence.attemptId}:${withoutFence.actionId}:${requestHash}`,
+  };
+}
+
+function fencedChildExecutorRequest(
+  overrides: Partial<Omit<ChildExecutorActionRequest, "requestHash" | "idempotencyKey">> = {}
+): ChildExecutorActionRequest {
+  const withoutFence = {
+    protocol: "child-executor-action@1" as const,
+    actionId: "child-action-1",
+    attemptId: "attempt-child",
+    graphId: "graph-1",
+    pipelineInstanceId: "pipeline-1",
+    graphDigest: "a".repeat(64),
+    parentRunId: "run-parent",
+    generation: 1,
+    capabilityDigest: "b".repeat(64),
+    unitId: "unit-1",
+    actionKind: "command" as const,
+    commandName: "test",
+    worktree: { id: "worktree-1" },
+    baseSubject: "c".repeat(40),
+    inputSubject: "d".repeat(40),
+    ...overrides,
+  } as Omit<ChildExecutorActionRequest, "requestHash" | "idempotencyKey">;
+  const requestHash = digestNormalized(canonicalJson(withoutFence));
+  return {
+    ...withoutFence,
+    requestHash,
+    idempotencyKey: `child-executor:${withoutFence.attemptId}:${withoutFence.actionId}:${requestHash}`,
   };
 }
 
@@ -152,7 +182,7 @@ describe("Daytona stage execution", () => {
     expect(sandbox.updateEnv).toHaveBeenLastCalledWith(expect.objectContaining({
       RUN_ID: "run-1",
       BASE_BRANCH: "release/2.0",
-    }), { unset: ["OT_CHILD_ACTION_ID"] });
+    }), { unset: ["OT_CHILD_ACTION_ID", "OT_COMPOSITE_PREPARE_ONLY"] });
 
     const childWithoutFence: Omit<StageRequestEnvelope, "requestHash" | "idempotencyKey"> = {
       ...withoutFence,
@@ -168,7 +198,7 @@ describe("Daytona stage execution", () => {
     expect(sandbox.updateEnv).toHaveBeenLastCalledWith(expect.objectContaining({
       RUN_ID: "run-parent",
       OT_CHILD_ACTION_ID: "action-1",
-    }), { unset: [] });
+    }), { unset: ["OT_COMPOSITE_PREPARE_ONLY"] });
     expect(sandbox.process.executeSessionCommand).toHaveBeenCalledWith(
       "stage-attempt-1",
       expect.objectContaining({
@@ -178,6 +208,25 @@ describe("Daytona stage execution", () => {
     );
     expect(JSON.stringify(updateEnv.mock.calls.at(-1))).not.toContain("secret-token");
 
+    const compositeWithoutFence: Omit<StageRequestEnvelope, "requestHash" | "idempotencyKey"> = {
+      ...withoutFence,
+      stageId: "structured",
+      attemptId: "attempt-composite",
+      capability: "graph/for-each-unit@1",
+      commandName: undefined,
+    };
+    const compositeRequest = { ...compositeWithoutFence, ...createStageRequestHash(compositeWithoutFence) };
+    await expect(runtime.prepareCompositeWorkspace(resource, compositeRequest)).resolves.toBeUndefined();
+    expect(sandbox.updateEnv).toHaveBeenLastCalledWith({ OT_COMPOSITE_PREPARE_ONLY: "1" }, { unset: [] });
+    expect(sandbox.process.executeSessionCommand).toHaveBeenCalledWith(
+      "composite-prepare-attempt-composite",
+      expect.objectContaining({
+        runAsync: false,
+        command: expect.stringContaining("OT_COMPOSITE_PREPARE_ONLY=1 /opt/openthrottle/entrypoint.sh"),
+      }),
+      expect.any(Number)
+    );
+
     const worktree = await runtime.createWorktree(resource, {
       idempotencyKey: "worktree:attempt-child",
       attemptId: "attempt-child",
@@ -185,7 +234,7 @@ describe("Daytona stage execution", () => {
     });
     expect(worktree).toEqual({ id: expect.stringMatching(/^[a-f0-9]{32}$/) });
     expect(sandbox.process.executeCommand).toHaveBeenCalledWith(
-      expect.stringContaining("/opt/openthrottle/runner/worktrees.mjs create"),
+      expect.stringContaining("/opt/openthrottle/runner/worktrees.mjs create --idempotent"),
       "/home/agent/repo",
       {},
       120
@@ -231,7 +280,8 @@ describe("Daytona stage execution", () => {
           `then rm -f .*${escapeForRegExp(stagedCredentialsPath)}.*exit 0; fi.*install -d .* -m 0711 .*loop-actions.*` +
           `loop-actions/attempt-child.*loop-actions/attempt-child/loop-1.*` +
           `cp .*${escapeForRegExp(stagedRequestPath)}.*loop-actions/attempt-child/loop-1/request\\.json.*` +
-          `execute-loop\\.mjs --request .*loop-actions/attempt-child/loop-1/request\\.json.*` +
+          `env -i .*RUN_ID=.*run-parent.*OT_CHILD_ACTION_ID=.*loop-1.*heartbeat\\.mjs.*` +
+          `env -i .*execute-loop\\.mjs --request .*loop-actions/attempt-child/loop-1/request\\.json.*` +
           `--output .*loop-actions/attempt-child/loop-1/result\\.json`
         )),
       }),
@@ -257,7 +307,7 @@ describe("Daytona stage execution", () => {
     // whatever the ticket-level default would have selected.
     expect(credentialProvider).toHaveBeenLastCalledWith(
       resource,
-      ["model.invoke", "repo.read", "repo.write"],
+      ["model.invoke", "repo.read"],
       "codex"
     );
     expect(JSON.parse((uploadedCredentialsCall![0] as Buffer).toString("utf8"))).toEqual({
@@ -269,9 +319,13 @@ describe("Daytona stage execution", () => {
     );
     const dispatchLoopActionCommand = (sandbox.process.executeSessionCommand as ReturnType<typeof vi.fn>).mock.calls
       .find(([sessionId]) => sessionId === "loop-loop-1")?.[1].command as string;
+    expect(dispatchLoopActionCommand).toContain("env -i HOME=/home/agent");
+    expect(dispatchLoopActionCommand).not.toContain("GITHUB_TOKEN");
+    expect(dispatchLoopActionCommand).not.toContain("secret-token");
+    expect(dispatchLoopActionCommand).not.toContain("CODEX_AUTH_JSON");
     expect(dispatchLoopActionCommand).toMatch(new RegExp(
       `cp .*${escapeForRegExp(stagedCredentialsPath)}.*loop-actions/attempt-child/loop-1/credentials\\.json.*` +
-      `rm -f .*${escapeForRegExp(stagedCredentialsPath)}.*execute-loop\\.mjs --request .*request\\.json.*` +
+      `rm -f .*${escapeForRegExp(stagedCredentialsPath)}.*env -i .*execute-loop\\.mjs --request .*request\\.json.*` +
       `--credentials .*loop-actions/attempt-child/loop-1/credentials\\.json.*--output`
     ));
     // A losing `flock --nonblock` (another dispatch for this exact action
@@ -410,6 +464,86 @@ describe("Daytona stage execution", () => {
     })).rejects.toThrow(/invalid envelope/);
   });
 
+  it("parses a rotated Codex auth blob within the byte cap and rejects an invalid or oversized one", async () => {
+    const remoteFiles = new Map<string, Buffer>();
+    const sandbox = {
+      id: "provider-opaque-codex-auth",
+      state: "started",
+      fs: {
+        downloadFile: vi.fn(async (path: string) => {
+          const file = remoteFiles.get(path);
+          if (!file) throw new Error("not found");
+          return file;
+        }),
+      },
+    } as unknown as Sandbox;
+    const runtime = createDaytonaSandboxRuntime({ get: vi.fn(async () => sandbox) } as never, {
+      snapshot: "snapshot-v1",
+      materializeCredentialEnv: vi.fn(async () => ({ env: {} })),
+    });
+    const resource = { providerResourceId: "provider-opaque-codex-auth" };
+    const baseResult = {
+      version: 1,
+      kind: "loop_action_result",
+      action_id: "loop-1",
+      attempt_id: "attempt-child",
+      outcome: "success",
+      native_session_id: "thread-1",
+      subject: "d".repeat(40),
+      receipt: "done",
+      created_at: "2026-07-22T00:00:00.000Z",
+    };
+
+    remoteFiles.set("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/result.json", Buffer.from(JSON.stringify({
+      ...baseResult,
+      request_hash: "a".repeat(64),
+      codex_auth_json: "rotated-codex-auth-blob",
+    })));
+    await expect(runtime.collectLoopActionResult(resource, {
+      attemptId: "attempt-child",
+      actionId: "loop-1",
+      requestHash: "a".repeat(64),
+    })).resolves.toMatchObject({
+      actionId: "loop-1",
+      codexAuthJson: "rotated-codex-auth-blob",
+    });
+
+    remoteFiles.set("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/result.json", Buffer.from(JSON.stringify({
+      ...baseResult,
+      request_hash: "b".repeat(64),
+      codex_auth_json: 12345,
+    })));
+    await expect(runtime.collectLoopActionResult(resource, {
+      attemptId: "attempt-child",
+      actionId: "loop-1",
+      requestHash: "b".repeat(64),
+    })).rejects.toThrow(/invalid envelope/);
+
+    remoteFiles.set("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/result.json", Buffer.from(JSON.stringify({
+      ...baseResult,
+      request_hash: "c".repeat(64),
+      codex_auth_json: "a".repeat(65_536),
+    })));
+    await expect(runtime.collectLoopActionResult(resource, {
+      attemptId: "attempt-child",
+      actionId: "loop-1",
+      requestHash: "c".repeat(64),
+    })).resolves.toMatchObject({
+      codexAuthJson: "a".repeat(65_536),
+    });
+
+    remoteFiles.set("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/result.json", Buffer.from(JSON.stringify({
+      ...baseResult,
+      request_hash: "d".repeat(64),
+      codex_auth_json: "a".repeat(65_537),
+    })));
+    await expect(runtime.collectLoopActionResult(resource, {
+      attemptId: "attempt-child",
+      actionId: "loop-1",
+      requestHash: "d".repeat(64),
+    })).rejects.toThrow(/invalid envelope/);
+  });
+
   it("refuses credentials outside the sandbox allowlist", async () => {
     const sandbox = {
       id: "provider-opaque-2",
@@ -447,6 +581,7 @@ describe("Daytona stage execution", () => {
       actionId: "loop-forbidden",
       attemptId: "attempt-forbidden",
       graphId: "graph-1",
+      parentRunId: "run-parent",
       unitId: null,
       role: "lead" as const,
       loop: "lead" as const,
@@ -470,6 +605,137 @@ describe("Daytona stage execution", () => {
     await expect(runtime.dispatchLoopAction({ providerResourceId: "provider-opaque-loop-forbidden" }, request))
       .rejects.toThrow(/forbidden sandbox variable DAYTONA_API_KEY for loop action loop-forbidden/);
     expect(sandbox.fs.uploadFile).not.toHaveBeenCalled();
+  });
+
+  it("dispatches child executor actions with clean process env, heartbeat, and unit worktree fences", async () => {
+    const uploadedPaths: string[] = [];
+    const sandbox = {
+      id: "provider-opaque-child-executor",
+      state: "started",
+      autoStopInterval: 60,
+      setAutostopInterval: vi.fn(async () => undefined),
+      fs: {
+        createFolder: vi.fn(async () => undefined),
+        uploadFile: vi.fn(async (_content: Buffer, path: string) => {
+          uploadedPaths.push(path);
+        }),
+        setFilePermissions: vi.fn(async () => undefined),
+      },
+      process: {
+        createSession: vi.fn(async () => undefined),
+        executeSessionCommand: vi.fn(async () => ({ cmdId: "dispatch-child" })),
+      },
+    } as unknown as Sandbox;
+    const runtime = createDaytonaSandboxRuntime({ get: vi.fn(async () => sandbox) } as never, {
+      snapshot: "snapshot-v1",
+      materializeCredentialEnv: vi.fn(async () => ({ env: {} })),
+    });
+    const resource = { providerResourceId: "provider-opaque-child-executor" };
+    const request = fencedChildExecutorRequest({
+      actionId: "child-command",
+      attemptId: "attempt-child-executor",
+      parentRunId: "run-child-executor",
+      worktree: { id: "worktree-child" },
+    });
+
+    await expect(runtime.dispatchChildExecutorAction(resource, request)).resolves.toEqual({
+      providerDispatchId: "dispatch-child",
+    });
+
+    const command = (sandbox.process.executeSessionCommand as ReturnType<typeof vi.fn>).mock.calls[0]?.[1].command as string;
+    expect(command).toContain("env -i HOME=/home/agent");
+    expect(command).toMatch(/RUN_ID=.*run-child-executor/);
+    expect(command).toMatch(/OT_CHILD_ACTION_ID=.*child-command/);
+    expect(command).toContain("/opt/openthrottle/runner/heartbeat.mjs");
+    expect(command).toContain("/opt/openthrottle/runner/execute-child-action.mjs");
+    expect(command).not.toContain("GITHUB_TOKEN");
+    expect(command).not.toContain("secret-token");
+    expect(command).not.toContain("CODEX_AUTH_JSON");
+    expect(uploadedPaths).toContainEqual(expect.stringMatching(
+      /^\/var\/lib\/openthrottle\/child-executor-dispatch\/attempt-child-executor\.child-command\..*\.request\.json$/
+    ));
+
+    const missingWorktree = fencedChildExecutorRequest({
+      actionId: "child-command-missing-worktree",
+      worktree: null,
+    });
+    await expect(runtime.dispatchChildExecutorAction(resource, missingWorktree))
+      .rejects.toThrow(/requires a unit worktree/);
+    expect(sandbox.process.executeSessionCommand).toHaveBeenCalledTimes(1);
+
+    const wrongProtocol = fencedChildExecutorRequest({
+      protocol: "stage-executor@1" as never,
+      actionId: "child-command-wrong-protocol",
+    });
+    await expect(runtime.dispatchChildExecutorAction(resource, wrongProtocol))
+      .rejects.toThrow(/invalid protocol/);
+    expect(sandbox.process.executeSessionCommand).toHaveBeenCalledTimes(1);
+
+    const graphCandidate = fencedChildExecutorRequest({
+      actionId: "child-final-candidate",
+      actionKind: "candidate",
+      commandName: undefined,
+      unitId: null,
+      worktree: { id: "worktree-final-repair" },
+    });
+    await expect(runtime.dispatchChildExecutorAction(resource, graphCandidate)).resolves.toEqual({
+      providerDispatchId: "dispatch-child",
+    });
+    expect(sandbox.process.executeSessionCommand).toHaveBeenCalledTimes(2);
+  });
+
+  it("collects child executor results only from the exact attempt/action path", async () => {
+    const remoteFiles = new Map<string, Buffer>();
+    const sandbox = {
+      id: "provider-child-collect",
+      state: "started",
+      fs: {
+        downloadFile: vi.fn(async (path: string) => {
+          const file = remoteFiles.get(path);
+          if (!file) throw new Error("not found");
+          return file;
+        }),
+      },
+    } as unknown as Sandbox;
+    const runtime = createDaytonaSandboxRuntime({ get: vi.fn(async () => sandbox) } as never, {
+      snapshot: "snapshot-v1",
+      materializeCredentialEnv: vi.fn(async () => ({ env: {} })),
+    });
+    const result = {
+      version: 1,
+      kind: "child_executor_action_result",
+      action_id: "child-1",
+      attempt_id: "attempt-child",
+      request_hash: "a".repeat(64),
+      outcome: "success",
+      subject: "b".repeat(40),
+      receipt: "done",
+      created_at: "2026-07-22T00:00:00.000Z",
+    };
+
+    await expect(runtime.collectChildExecutorActionResult(
+      { providerResourceId: "provider-child-collect" },
+      { attemptId: "attempt-child", actionId: "child-1", requestHash: "a".repeat(64) }
+    )).resolves.toBeNull();
+
+    remoteFiles.set(
+      "/var/lib/openthrottle/child-executor-actions/attempt-child/child-1/result.json",
+      Buffer.from(JSON.stringify(result))
+    );
+    await expect(runtime.collectChildExecutorActionResult(
+      { providerResourceId: "provider-child-collect" },
+      { attemptId: "attempt-child", actionId: "child-1", requestHash: "a".repeat(64) }
+    )).resolves.toMatchObject({
+      actionId: "child-1",
+      attemptId: "attempt-child",
+      outcome: "success",
+      subject: "b".repeat(40),
+    });
+
+    await expect(runtime.collectChildExecutorActionResult(
+      { providerResourceId: "provider-child-collect" },
+      { attemptId: "attempt-child", actionId: "child-1", requestHash: "c".repeat(64) }
+    )).rejects.toThrow(/invalid envelope/);
   });
 
   it("refuses lead loop write credentials before materializing credentials", async () => {
@@ -501,7 +767,7 @@ describe("Daytona stage execution", () => {
     });
 
     await expect(runtime.dispatchLoopAction({ providerResourceId: "provider-opaque-lead-write" }, request))
-      .rejects.toThrow(/lead loop actions cannot request repo\.write/);
+      .rejects.toThrow(/structured loop actions cannot request repo\.write/);
     expect(materializeCredentialEnv).not.toHaveBeenCalled();
     expect(sandbox.fs.uploadFile).not.toHaveBeenCalled();
   });
@@ -536,6 +802,7 @@ describe("Daytona stage execution", () => {
       actionId: "loop-redispatch",
       attemptId: "attempt-redispatch",
       graphId: "graph-1",
+      parentRunId: "run-parent",
       unitId: null,
       role: "worker" as const,
       loop: "implement" as const,
@@ -605,6 +872,7 @@ describe("Daytona stage execution", () => {
       actionId: "loop-scope",
       attemptId: "attempt-scope",
       graphId: "graph-1",
+      parentRunId: "run-parent",
       unitId: null,
       role: "reviewer" as const,
       loop: "review" as const,

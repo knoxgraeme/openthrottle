@@ -119,11 +119,12 @@ const command = (
 
 describe("structured execution gates", () => {
   it("accepts a unit only from worker success, executor candidate evidence, commands, and a lead scope decision", () => {
+    const completion = receipt("unit_completion", "success");
     const candidate = receipt("candidate_evidence", "success");
-    const commands = [command("success", 0), command("not_configured", 0, "lint")];
+    const commands = [command("success", 0), command("success", 0, "lint")];
     expect(evaluateUnitAcceptanceGate({
       expected,
-      completion: receipt("unit_completion", "success") as never,
+      completion: completion as never,
       candidate: candidate as never,
       commands: commands as never,
       expectedCommandNames: ["test", "lint"],
@@ -133,12 +134,86 @@ describe("structured execution gates", () => {
           context_updates: [],
           accepted_subject: expected.subject,
         },
-        evidence: [hashOf(candidate), ...commands.map(hashOf)],
+        evidence: [hashOf(completion), hashOf(candidate), ...commands.map(hashOf)],
       }) as never,
     })).toMatchObject({
       outcome: "success",
       result: "passed",
       reason: "lead_scope_match_accept",
+    });
+  });
+
+  it("fails unit acceptance when a declared plan command receipt was not executed", () => {
+    const completion = receipt("unit_completion", "success");
+    const candidate = receipt("candidate_evidence", "success");
+    expect(evaluateUnitAcceptanceGate({
+      expected,
+      completion: completion as never,
+      candidate: candidate as never,
+      commands: [],
+      expectedCommandNames: ["docs-check"],
+      lead: receipt("unit_decision", "accept", {
+        payload: {
+          rationale: "Matches assigned scope.",
+          context_updates: [],
+          accepted_subject: expected.subject,
+        },
+        evidence: [hashOf(completion), hashOf(candidate)],
+      }) as never,
+    })).toMatchObject({
+      outcome: "failure",
+      result: "failed",
+      reason: "command_receipts_missing_or_unexpected",
+    });
+  });
+
+  it("fails unit acceptance when a declared plan command is reported not configured", () => {
+    const completion = receipt("unit_completion", "success");
+    const candidate = receipt("candidate_evidence", "success");
+    const docsCheck = command("not_configured", 0, "docs-check");
+    expect(evaluateUnitAcceptanceGate({
+      expected,
+      completion: completion as never,
+      candidate: candidate as never,
+      commands: [docsCheck] as never,
+      expectedCommandNames: ["docs-check"],
+      lead: receipt("unit_decision", "accept", {
+        payload: {
+          rationale: "Matches assigned scope.",
+          context_updates: [],
+          accepted_subject: expected.subject,
+        },
+        evidence: [hashOf(completion), hashOf(candidate), hashOf(docsCheck)],
+      }) as never,
+    })).toMatchObject({
+      outcome: "failure",
+      result: "failed",
+      reason: "required_command_not_configured",
+    });
+  });
+
+  it("fails command gates from receipt result before interpreting payload exit code", () => {
+    const completion = receipt("unit_completion", "success");
+    const candidate = receipt("candidate_evidence", "success");
+    const failedCommand = command("failure", 0, "test");
+    expect(evaluateUnitAcceptanceGate({
+      expected,
+      completion: completion as never,
+      candidate: candidate as never,
+      commands: [failedCommand] as never,
+      expectedCommandNames: ["test"],
+      lead: receipt("unit_decision", "accept", {
+        payload: {
+          rationale: "Matches assigned scope.",
+          context_updates: [],
+          accepted_subject: expected.subject,
+        },
+        evidence: [hashOf(completion), hashOf(candidate), hashOf(failedCommand)],
+      }) as never,
+    })).toMatchObject({
+      outcome: "failure",
+      result: "failed",
+      reason: "command_receipt_failed",
     });
   });
 
@@ -165,30 +240,32 @@ describe("structured execution gates", () => {
   });
 
   it("maps lead revision and command failure to repair-required/failure deterministically", () => {
+    const revisionCompletion = receipt("unit_completion", "success");
     const revisionCandidate = receipt("candidate_evidence", "success");
     expect(evaluateUnitAcceptanceGate({
       expected,
-      completion: receipt("unit_completion", "success") as never,
+      completion: revisionCompletion as never,
       candidate: revisionCandidate as never,
       commands: [],
       expectedCommandNames: [],
       lead: receipt("unit_decision", "revise", {
         payload: { rationale: "Missing scoped behavior.", revision_request: "Add the required case.", context_updates: [] },
-        evidence: [hashOf(revisionCandidate)],
+        evidence: [hashOf(revisionCompletion), hashOf(revisionCandidate)],
       }) as never,
     })).toMatchObject({ outcome: "semantic_repair_required", reason: "lead_requested_revision" });
 
+    const failingCompletion = receipt("unit_completion", "success");
     const failingCandidate = receipt("candidate_evidence", "success");
     const failingCommand = command("failure", 1);
     expect(evaluateUnitAcceptanceGate({
       expected,
-      completion: receipt("unit_completion", "success") as never,
+      completion: failingCompletion as never,
       candidate: failingCandidate as never,
       commands: [failingCommand] as never,
       expectedCommandNames: ["test"],
       lead: receipt("unit_decision", "accept", {
         payload: { rationale: "Matches.", context_updates: [], accepted_subject: expected.subject },
-        evidence: [hashOf(failingCandidate), hashOf(failingCommand)],
+        evidence: [hashOf(failingCompletion), hashOf(failingCandidate), hashOf(failingCommand)],
       }) as never,
     })).toMatchObject({ outcome: "failure", reason: "command_exit_nonzero" });
   });

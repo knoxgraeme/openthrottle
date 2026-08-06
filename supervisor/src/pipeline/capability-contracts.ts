@@ -31,7 +31,7 @@ const CAPABILITY_CREDENTIALS: Readonly<Record<string, CapabilityCredentialContra
   },
   "ce/implement@1": {
     minimum: ["model.invoke", "provider.read", "repo.read", "repo.write"],
-    allowed: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+    allowed: ["model.invoke", "mcp", "provider.read", "repo.read", "repo.write"],
     contexts: ["fresh", "resume_required", "prefer_resume"],
     artifacts: ["stage_result", "review"],
   },
@@ -72,8 +72,8 @@ const CAPABILITY_CREDENTIALS: Readonly<Record<string, CapabilityCredentialContra
     artifacts: ["stage_result"],
   },
   [FOR_EACH_UNIT_CAPABILITY]: {
-    minimum: ["repo.read", "repo.write"],
-    allowed: ["repo.read", "repo.write", "provider.read"],
+    minimum: ["repo.read"],
+    allowed: ["repo.read", "provider.read"],
     contexts: ["none"],
     artifacts: ["stage_result", "execution_graph_result"],
   },

@@ -9,14 +9,14 @@
       "engine": "agent",
       "skills": ["builtin://ce/implement@1"],
       "session_scope": "attempt",
-      "credentials": ["model.invoke", "provider.read", "repo.read", "repo.write"]
+      "credentials": ["model.invoke", "provider.read", "repo.read"]
     },
     {
       "id": "simplify-worker",
       "engine": "agent",
       "skills": ["builtin://ce/simplify@1"],
       "session_scope": "attempt",
-      "credentials": ["model.invoke", "repo.read", "repo.write"]
+      "credentials": ["model.invoke", "repo.read"]
     },
     {
       "id": "lead-worker",

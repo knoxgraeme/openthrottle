@@ -74,6 +74,16 @@ const SKILLS = new Set([
 ]);
 const CONTEXTS = new Set(["fresh", "resume_required", "prefer_resume"]);
 const STANDARD_RECEIPT_SCHEMA = "openthrottle.receipt/v1";
+const PRIOR_EVIDENCE_SCHEMA = "openthrottle.loop-prior-evidence/v1";
+const DOWNSTREAM_CONTEXT_SCHEMA = "openthrottle.downstream-context/v1";
+const MODEL_REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,239}$/;
+const PRIOR_EVIDENCE_ROLES = new Set(["lead", "final_review", "final_repair"]);
+const PRIOR_RECEIPT_ROLES = new Set(["completion", "candidate", "command", "final_command", "final_review"]);
+const MAX_PRIOR_EVIDENCE_RECEIPTS = 18;
+const MAX_PRIOR_EVIDENCE_BYTES = 49_152;
+const MAX_PRIOR_EVIDENCE_RECEIPT_BYTES = 64 * 1024;
+const MAX_DOWNSTREAM_CONTEXT_RECORDS = 32;
+const MAX_DOWNSTREAM_CONTEXT_BYTES = 32_768;
 const DEFAULT_ACTION_ROOT = "/var/lib/openthrottle/loop-actions";
 const DEFAULT_WORKTREE_ROOT = "/var/lib/openthrottle/worktrees";
 const INTEGRATION_REPO_DIR = "/home/agent/repo";
@@ -133,6 +143,115 @@ function boundedArray(value, label, max = 32) {
     throw new Error(`${label} must be a bounded unique string array`);
   }
   return [...value].sort();
+}
+
+function expectedProducer(value, label) {
+  const input = record(value, label);
+  const allowed = new Set(["workerId", "skill", "capabilityDigest", "skillPackageDigest", "assurance"]);
+  const unknown = Object.keys(input).find((key) => !allowed.has(key));
+  if (unknown) throw new Error(`${label} has unknown field ${unknown}`);
+  return {
+    workerId: string(input.workerId, `${label}.workerId`, /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
+    skill: string(input.skill, `${label}.skill`, /^[A-Za-z0-9][A-Za-z0-9._:/@#-]{0,255}$/),
+    capabilityDigest: string(input.capabilityDigest, `${label}.capabilityDigest`, /^[a-f0-9]{64}$/),
+    skillPackageDigest: input.skillPackageDigest === null
+      ? null
+      : string(input.skillPackageDigest, `${label}.skillPackageDigest`, /^[a-f0-9]{64}$/),
+    assurance: string(input.assurance, `${label}.assurance`, /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/),
+  };
+}
+
+function boundedRecordPayload(value, label) {
+  const payload = record(value, label);
+  const normalized = canonicalJson(payload);
+  if (Buffer.byteLength(normalized, "utf8") > 8_192) throw new Error(`${label} exceeds 8 KiB`);
+  return payload;
+}
+
+function priorEvidence(value, label) {
+  const input = record(value, label);
+  const allowed = new Set(["schema", "role", "receipts"]);
+  const unknown = Object.keys(input).find((key) => !allowed.has(key));
+  if (unknown) throw new Error(`${label} has unknown field ${unknown}`);
+  if (input.schema !== PRIOR_EVIDENCE_SCHEMA) throw new Error(`${label}.schema is invalid`);
+  const role = string(input.role, `${label}.role`, /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/);
+  if (!PRIOR_EVIDENCE_ROLES.has(role)) throw new Error(`${label}.role is invalid`);
+  if (!Array.isArray(input.receipts) || input.receipts.length > MAX_PRIOR_EVIDENCE_RECEIPTS) {
+    throw new Error(`${label}.receipts must be a bounded array`);
+  }
+  const receipts = input.receipts.map((receiptEntry, index) => {
+    const entry = record(receiptEntry, `${label}.receipts[${index}]`);
+    const receiptAllowed = new Set(["role", "actionAttemptId", "receiptHash", "receipt"]);
+    const receiptUnknown = Object.keys(entry).find((key) => !receiptAllowed.has(key));
+    if (receiptUnknown) throw new Error(`${label}.receipts[${index}] has unknown field ${receiptUnknown}`);
+    const receiptRole = string(entry.role, `${label}.receipts[${index}].role`, /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/);
+    if (!PRIOR_RECEIPT_ROLES.has(receiptRole)) throw new Error(`${label}.receipts[${index}].role is invalid`);
+    const receipt = string(entry.receipt, `${label}.receipts[${index}].receipt`, /^[\s\S]{1,65536}$/);
+    if (Buffer.byteLength(receipt, "utf8") > MAX_PRIOR_EVIDENCE_RECEIPT_BYTES) {
+      throw new Error(`${label}.receipts[${index}].receipt exceeds 64 KiB`);
+    }
+    const receiptHash = string(entry.receiptHash, `${label}.receipts[${index}].receiptHash`, /^[a-f0-9]{64}$/);
+    if (digest(receipt) !== receiptHash) {
+      throw new Error(`${label}.receipts[${index}].receiptHash does not match receipt`);
+    }
+    validateStandardReceipt(JSON.parse(receipt), { source: `${label}.receipts[${index}].receipt` });
+    return {
+      role: receiptRole,
+      actionAttemptId: stagePathId(entry.actionAttemptId, `${label}.receipts[${index}].actionAttemptId`),
+      receiptHash,
+      receipt,
+    };
+  });
+  if (role === "lead") {
+    for (const required of ["completion", "candidate"]) {
+      if (!receipts.some((receipt) => receipt.role === required)) throw new Error(`${label} is missing ${required} receipt evidence`);
+    }
+    if (receipts.some((receipt) => receipt.role === "final_command")) throw new Error(`${label} contains final command evidence for a lead action`);
+  }
+  if (role === "final_review" && receipts.some((receipt) => receipt.role !== "final_command")) {
+    throw new Error(`${label} contains non-final-command evidence for final review`);
+  }
+  if (role === "final_repair") {
+    if (receipts.length !== 1 || receipts[0].role !== "final_review") {
+      throw new Error(`${label} must contain exactly one triggering final-review receipt`);
+    }
+    const receipt = JSON.parse(receipts[0].receipt);
+    if (receipt.type !== "semantic_review") {
+      throw new Error(`${label} triggering receipt must be semantic_review`);
+    }
+  } else if (receipts.some((receipt) => receipt.role === "final_review")) {
+    throw new Error(`${label} contains final-review evidence for a non-repair action`);
+  }
+  const normalized = { schema: PRIOR_EVIDENCE_SCHEMA, role, receipts };
+  if (Buffer.byteLength(canonicalJson(normalized), "utf8") > MAX_PRIOR_EVIDENCE_BYTES) {
+    throw new Error(`${label} exceeds aggregate bound`);
+  }
+  return normalized;
+}
+
+function downstreamContext(value, label) {
+  if (!Array.isArray(value) || value.length > MAX_DOWNSTREAM_CONTEXT_RECORDS) {
+    throw new Error(`${label} must be a bounded array`);
+  }
+  const records = value.map((entry, index) => {
+    const input = record(entry, `${label}[${index}]`);
+    const allowed = new Set(["fromUnitId", "payloadHash", "payload"]);
+    const unknown = Object.keys(input).find((key) => !allowed.has(key));
+    if (unknown) throw new Error(`${label}[${index}] has unknown field ${unknown}`);
+    const payload = boundedRecordPayload(input.payload, `${label}[${index}].payload`);
+    const payloadHash = string(input.payloadHash, `${label}[${index}].payloadHash`, /^[a-f0-9]{64}$/);
+    if (digest(canonicalJson(payload)) !== payloadHash) throw new Error(`${label}[${index}].payloadHash does not match payload`);
+    if (payload.schema !== DOWNSTREAM_CONTEXT_SCHEMA) throw new Error(`${label}[${index}].payload.schema is invalid`);
+    return {
+      fromUnitId: string(input.fromUnitId, `${label}[${index}].fromUnitId`),
+      payloadHash,
+      payload,
+    };
+  });
+  if (Buffer.byteLength(canonicalJson(records), "utf8") > MAX_DOWNSTREAM_CONTEXT_BYTES) {
+    throw new Error(`${label} exceeds aggregate bound`);
+  }
+  return records;
 }
 
 export function configuredActionRoot(env = process.env) {
@@ -275,10 +394,11 @@ export function createLoopRequestHash(requestWithoutFence) {
 export function validateLoopRequest(value) {
   const input = record(value, "loop request");
   const allowed = new Set([
-    "protocol", "actionId", "attemptId", "graphId", "unitId", "role", "loop",
-    "agent", "skill", "worktree", "candidateSubject", "nativeSessionId", "contextPolicy", "timeoutMs",
-    "transitionContext", "allowedMcpServers", "credentialScopes", "receiptSchema",
-    "repositorySkill", "requestHash", "idempotencyKey",
+    "protocol", "actionId", "attemptId", "graphId", "pipelineInstanceId", "graphDigest", "parentRunId",
+    "unitId", "generation", "role", "loop", "agent", "model", "skill", "worktree", "baseSubject", "inputSubject",
+    "candidateSubject", "nativeSessionId", "contextPolicy", "timeoutMs",
+    "transitionContext", "priorEvidence", "downstreamContext", "allowedMcpServers", "credentialScopes", "receiptSchema",
+    "expectedProducerSkill", "expectedProducer", "repositorySkill", "requestHash", "idempotencyKey",
   ]);
   const unknown = Object.keys(input).find((key) => !allowed.has(key));
   if (unknown) throw new Error(`loop request has unknown field ${unknown}`);
@@ -296,21 +416,34 @@ export function validateLoopRequest(value) {
     actionId: stagePathId(input.actionId, "actionId"),
     attemptId: stagePathId(input.attemptId, "attemptId"),
     graphId: string(input.graphId, "graphId"),
+    ...(input.pipelineInstanceId === undefined ? {} : { pipelineInstanceId: stagePathId(input.pipelineInstanceId, "pipelineInstanceId") }),
+    ...(input.graphDigest === undefined ? {} : { graphDigest: string(input.graphDigest, "graphDigest", /^[a-f0-9]{64}$/) }),
+    ...(input.parentRunId === undefined ? {} : { parentRunId: stagePathId(input.parentRunId, "parentRunId") }),
     unitId: nullableString(input.unitId, "unitId"),
+    ...(input.generation === undefined ? {} : { generation: input.generation }),
     role: string(input.role, "role"),
     loop: string(input.loop, "loop"),
     agent: string(input.agent, "agent"),
+    ...(input.model === undefined ? {} : { model: string(input.model, "model", MODEL_REFERENCE) }),
     skill: string(input.skill, "skill", /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
     worktree: worktree === null ? null : {
       id: string(worktree.id, "worktree.id", /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
     },
+    ...(input.baseSubject === undefined ? {} : { baseSubject: string(input.baseSubject, "baseSubject", GIT_OBJECT_ID) }),
+    ...(input.inputSubject === undefined ? {} : { inputSubject: string(input.inputSubject, "inputSubject", GIT_OBJECT_ID) }),
     nativeSessionId: nullableString(input.nativeSessionId, "nativeSessionId", NATIVE_SESSION_ID),
     contextPolicy: string(input.contextPolicy, "contextPolicy"),
     timeoutMs: input.timeoutMs,
-    transitionContext: boundedText(input.transitionContext, "transitionContext", 64_000),
+    transitionContext: boundedText(input.transitionContext, "transitionContext", 262_144),
+    ...(input.priorEvidence === undefined ? {} : { priorEvidence: priorEvidence(input.priorEvidence, "priorEvidence") }),
+    ...(input.downstreamContext === undefined ? {} : { downstreamContext: downstreamContext(input.downstreamContext, "downstreamContext") }),
     allowedMcpServers: boundedArray(input.allowedMcpServers, "allowedMcpServers"),
     credentialScopes: boundedArray(input.credentialScopes, "credentialScopes"),
     receiptSchema: string(input.receiptSchema, "receiptSchema", /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,159}$/),
+    ...(input.expectedProducerSkill === undefined
+      ? {}
+      : { expectedProducerSkill: string(input.expectedProducerSkill, "expectedProducerSkill", /^[A-Za-z0-9][A-Za-z0-9._:/@#-]{0,255}$/) }),
+    ...(input.expectedProducer === undefined ? {} : { expectedProducer: expectedProducer(input.expectedProducer, "expectedProducer") }),
   };
   if (request.receiptSchema !== STANDARD_RECEIPT_SCHEMA) throw new Error("loop receipt schema is unsupported");
   if (!ROLES.has(request.role)) throw new Error("role is invalid");
@@ -318,13 +451,8 @@ export function validateLoopRequest(value) {
   if (!AGENTS.has(request.agent)) throw new Error("agent is invalid");
   const unknownScope = request.credentialScopes.find((scope) => !LOGICAL_CREDENTIAL_SCOPES.has(scope));
   if (unknownScope) throw new Error(`credential scope ${unknownScope} is not a recognized logical credential`);
-  if (request.role === "lead" && request.credentialScopes.includes("repo.write")) {
-    throw new Error("lead loop cannot request repo.write");
-  }
-  if (request.agent === "opencode") {
-    // OpenCode loop actions need database-backed session sealing and adapter
-    // body delivery that RU5 does not provide; fail closed until that unit.
-    throw new Error("opencode loop actions are not supported yet");
+  if (request.role !== "publisher" && request.credentialScopes.includes("repo.write")) {
+    throw new Error("structured loop actions cannot request repo.write");
   }
   const repositorySkill = input.repositorySkill === undefined
     ? undefined
@@ -341,10 +469,22 @@ export function validateLoopRequest(value) {
   if (!Number.isSafeInteger(request.timeoutMs) || request.timeoutMs < 1_000 || request.timeoutMs > 86_400_000) {
     throw new Error("timeoutMs is invalid");
   }
+  if (request.generation !== undefined &&
+      (!Number.isSafeInteger(request.generation) || request.generation < 0)) {
+    throw new Error("generation is invalid");
+  }
   if (request.role === "worker" && !request.worktree) throw new Error("worker loop requires a worktree");
   if (request.role !== "worker" && request.worktree) throw new Error("non-worker loop cannot receive a writable worktree");
   if (request.role === "lead" && !candidateSubject) throw new Error("lead loop requires a candidate subject");
   if (request.role !== "lead" && candidateSubject) throw new Error("candidate subject is only valid for lead loops");
+  if (request.priorEvidence?.role === "lead" && request.role !== "lead") throw new Error("lead prior evidence is only valid for lead loops");
+  if (request.priorEvidence?.role === "final_review" && request.loop !== "review") throw new Error("final review prior evidence is only valid for review loops");
+  if (
+    request.priorEvidence?.role === "final_repair" &&
+    (request.role !== "worker" || request.loop !== "repair" || request.skill !== "final-repair" || request.unitId !== null)
+  ) {
+    throw new Error("final repair prior evidence is only valid for final-repair loops");
+  }
   if (worktree !== null && worktree.path !== undefined) throw new Error("loop request cannot carry an absolute worktree path");
   const requestWithSkill = {
     ...request,
@@ -354,6 +494,9 @@ export function validateLoopRequest(value) {
   const expected = createLoopRequestHash(requestWithSkill);
   if (input.requestHash !== expected.requestHash || input.idempotencyKey !== expected.idempotencyKey) {
     throw new Error("loop request hash or idempotency key is stale");
+  }
+  if (requestWithSkill.agent === "opencode") {
+    throw new Error("OpenCode loop actions are not supported yet");
   }
   return { ...requestWithSkill, ...expected };
 }
@@ -374,10 +517,47 @@ export function resolveLoopInvocation(request) {
 export function loopPrompt(request) {
   const prefix = request.agent === "claude" ? "/" : "$";
   const entry = `${prefix}${request.skill}`;
+  const producer = request.expectedProducer
+    ? {
+        worker_id: request.expectedProducer.workerId,
+        skill: request.expectedProducer.skill,
+        capability_digest: request.expectedProducer.capabilityDigest,
+        skill_package_digest: request.expectedProducer.skillPackageDigest,
+        assurance: request.expectedProducer.assurance,
+      }
+    : {
+        skill: request.expectedProducerSkill ?? request.repositorySkill?.reference ?? `builtin://${request.skill}@1`,
+      };
+  const contractPayload = {
+    schema: "openthrottle.loop-receipt-contract/v1",
+    pipeline_instance_id: request.pipelineInstanceId ?? null,
+    graph_id: request.graphId,
+    graph_digest: request.graphDigest ?? null,
+    parent_run_id: request.parentRunId ?? null,
+    unit_id: request.unitId ?? "__final__",
+    action_attempt_id: request.actionId,
+    generation: request.generation ?? null,
+    native_session_id: request.nativeSessionId,
+    request_hash: request.requestHash,
+    subject: {
+      base: request.baseSubject ?? null,
+      pre: request.inputSubject ?? null,
+    },
+    producer,
+    evidence: "Bind this receipt to exact output evidence for the requested action; do not reuse sibling or prior action evidence.",
+    prior_evidence: request.priorEvidence ?? { schema: PRIOR_EVIDENCE_SCHEMA, role: null, receipts: [] },
+    downstream_context_hash: digest(canonicalJson(request.downstreamContext ?? [])),
+  };
+  const contract = canonicalJson(contractPayload);
+  const priorEvidence = canonicalJson(request.priorEvidence ?? { schema: PRIOR_EVIDENCE_SCHEMA, role: null, receipts: [] });
+  const downstreamContext = canonicalJson(request.downstreamContext ?? []);
   return `${entry}\n\n` +
     `This is one fenced OpenThrottle loop action (${request.actionId}) for ${request.role}/${request.loop}. ` +
     `Edit only the provided worktree when one is present. Do not commit, push, or alter executor state. ` +
-    `Return one receipt matching ${request.receiptSchema}.\n\n${request.transitionContext}`;
+    `Return one receipt matching ${request.receiptSchema} and the authority contract below.\n\n` +
+    `## Receipt Authority Contract\n${contract}\n\n${request.transitionContext}\n\n` +
+    `## Prior Evidence\n${priorEvidence}\n\n` +
+    `## Downstream Context\n${downstreamContext}`;
 }
 
 export function prepareRootReadOnlyDirectory(path) {
@@ -593,19 +773,30 @@ function makeCurrentActionDirectoryTraverseOnly(request) {
 export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDirectory(request) ?? "/home/agent/repo", mcpConfigPath = null }) {
   const prompt = loopPrompt(request);
   if (request.agent === "codex") {
+    // The prompt always travels over stdin ("-" tells Codex to read it there)
+    // rather than argv: an admitted sealed prompt can exceed Linux's
+    // MAX_ARG_STRLEN per-argument ceiling, and argv is visible to any
+    // co-resident process via /proc/<pid>/cmdline.
     return {
       repoDir,
       command: "codex",
-      args: ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-C", repoDir, ...(invocation.mode === "resume" ? ["resume", invocation.nativeSessionId, prompt] : ["-"])],
-      input: invocation.mode !== "resume" ? prompt : undefined,
+      args: ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-C", repoDir, ...(request.model ? ["-m", request.model] : []), ...(invocation.mode === "resume" ? ["resume", invocation.nativeSessionId, "-"] : ["-"])],
+      input: prompt,
     };
+  }
+  if (request.agent === "opencode") {
+    throw new Error("OpenCode loop actions are not supported yet");
   }
   return {
     repoDir,
     command: "claude",
     args: [
-      "-p", ...(invocation.mode === "resume" ? ["--resume", invocation.nativeSessionId] : []), prompt,
-      "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions",
+      // The long-form --print (not -p) is required for Claude to read the
+      // prompt from stdin instead of taking it as a positional argument; the
+      // prompt itself is never passed via argv (see the Codex note above for
+      // why: MAX_ARG_STRLEN and /proc/<pid>/cmdline visibility).
+      "--print", ...(invocation.mode === "resume" ? ["--resume", invocation.nativeSessionId] : []),
+      "--output-format", "stream-json", "--verbose", ...(request.model ? ["--model", request.model] : []), "--dangerously-skip-permissions",
       // Unconditional: --strict-mcp-config closes MCP entirely to just the
       // declared set (or to nothing, when no MCP servers were declared),
       // rather than leaving a repo-committed .mcp.json or other ambient
@@ -614,8 +805,34 @@ export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDi
       "--plugin-dir", "/opt/openthrottle/compound-engineering-marketplace",
       "--setting-sources", "user",
     ],
-    input: undefined,
+    input: prompt,
   };
+}
+
+const MAX_CODEX_AUTH_SNAPSHOT_BYTES = 65_536;
+
+// Codex may rotate its OAuth refresh token inside this action's own scoped
+// CODEX_HOME while running; that state is wiped with the rest of the action
+// directory once cleanup locks it, so it must be read back here -- after the
+// agent process exits but before cleanup -- rather than out-of-band later.
+// Keyed to this action's own engine (request.agent), never the parent
+// ticket's engine, so a Codex worker override inside a Claude-selected
+// ticket still has its rotation captured.
+function readCodexAuthSnapshot(codexHome, runProcess) {
+  const path = pathInside(codexHome, "auth.json");
+  let result;
+  try {
+    result = runProcess("gosu", ["agent", "cat", path], {
+      timeout: 5_000,
+      captureBytes: MAX_CODEX_AUTH_SNAPSHOT_BYTES,
+    });
+  } catch {
+    return null;
+  }
+  if (result.error || result.status !== 0) return null;
+  const blob = result.stdout;
+  if (!blob || Buffer.byteLength(blob, "utf8") > MAX_CODEX_AUTH_SNAPSHOT_BYTES) return null;
+  return blob;
 }
 
 export function runLoopAgentInPreparedRepository({
@@ -670,11 +887,15 @@ export function runLoopAgentInPreparedRepository({
     if (nativeSessionId && !sealedNativeSessionPackage) {
       throw new Error("native session id was reported without a sealed executor package");
     }
+    const codexAuthJson = request.agent === "codex"
+      ? readCodexAuthSnapshot(preparedEnvironment.nativeSessionProfileRoot, runProcess)
+      : null;
     return {
       ...result,
       nativeSessionId,
       gitObjectEnv: preparedEnvironment.gitObjectEnv,
       integrationRepoDir,
+      codexAuthJson,
     };
   } catch (error) {
     bodyError = error;
@@ -753,18 +974,50 @@ export function parseLoopReceipt(raw, env = process.env) {
 }
 
 function assertLoopReceiptFence(receipt, request, subject) {
-  if (receipt.fence.attempt_id !== request.attemptId || receipt.fence.request_hash !== request.requestHash) {
+  if (receipt.fence.attempt_id !== request.attemptId || receipt.fence.request_hash !== request.requestHash ||
+      receipt.fence.action_attempt_id !== request.actionId) {
     throw new Error("loop receipt request fence mismatch");
   }
-  if (request.unitId !== null && receipt.fence.unit_id !== request.unitId) {
+  if (request.pipelineInstanceId !== undefined && receipt.fence.pipeline_instance_id !== request.pipelineInstanceId) {
+    throw new Error("loop receipt pipeline fence mismatch");
+  }
+  if (request.graphDigest !== undefined && receipt.fence.graph_digest !== request.graphDigest) {
+    throw new Error("loop receipt graph fence mismatch");
+  }
+  if (request.parentRunId !== undefined && receipt.fence.parent_run_id !== request.parentRunId) {
+    throw new Error("loop receipt parent run fence mismatch");
+  }
+  if (request.generation !== undefined && receipt.fence.generation !== request.generation) {
+    throw new Error("loop receipt generation fence mismatch");
+  }
+  if (receipt.fence.native_session_id !== request.nativeSessionId) {
+    throw new Error("loop receipt native session fence mismatch");
+  }
+  const expectedUnitId = request.unitId ?? "__final__";
+  if (receipt.fence.unit_id !== expectedUnitId) {
     throw new Error("loop receipt unit fence mismatch");
+  }
+  if (request.baseSubject !== undefined && receipt.subject.base !== request.baseSubject) {
+    throw new Error("loop receipt base subject mismatch");
+  }
+  if (request.inputSubject !== undefined && receipt.subject.pre !== request.inputSubject) {
+    throw new Error("loop receipt input subject mismatch");
   }
   if (subject !== null && receipt.subject.post !== subject) {
     throw new Error("loop receipt subject fence mismatch");
   }
-  const expectedProducerSkill = request.repositorySkill?.reference ?? `builtin://${request.skill}@1`;
+  const expectedProducerSkill = request.expectedProducerSkill ?? request.repositorySkill?.reference ?? `builtin://${request.skill}@1`;
   if (receipt.producer.skill !== expectedProducerSkill) {
     throw new Error("loop receipt producer skill mismatch");
+  }
+  if (request.expectedProducer) {
+    if (receipt.producer.worker_id !== request.expectedProducer.workerId ||
+        receipt.producer.skill !== request.expectedProducer.skill ||
+        receipt.producer.capability_digest !== request.expectedProducer.capabilityDigest ||
+        receipt.producer.skill_package_digest !== request.expectedProducer.skillPackageDigest ||
+        receipt.assurance !== request.expectedProducer.assurance) {
+      throw new Error("loop receipt producer mismatch");
+    }
   }
 }
 
@@ -785,7 +1038,7 @@ export function executeLoopAction({
   // the spawned agent process only), so sanitizeArtifactText's default
   // process.env lookup alone would miss them if a failure message ever
   // echoed one -- including in the cleanup-failure path below.
-  const sanitizeEnv = { ...process.env, ...credentialEnv };
+  let sanitizeEnv = { ...process.env, ...credentialEnv };
   let result;
   let execution;
   try {
@@ -807,6 +1060,12 @@ export function executeLoopAction({
         retryableInfrastructureFailure: Boolean(error?.retryableInfrastructureFailure),
         processTerminationUnconfirmed: Boolean(error?.processTerminationUnconfirmed),
       };
+    }
+    // A rotated Codex auth blob matches sanitizeArtifactText's AUTH_JSON
+    // secret-name pattern, so any accidental echo of it in agent stdout/stderr
+    // is redacted the same way the seeded CODEX_AUTH_JSON credential is.
+    if (execution.codexAuthJson) {
+      sanitizeEnv = { ...sanitizeEnv, OT_ROTATED_CODEX_AUTH_JSON: execution.codexAuthJson };
     }
     const worktreeDir = loopWorktreeDirectory(request);
     let subject = null;
@@ -871,13 +1130,18 @@ export function executeLoopAction({
         ? "retryable_infrastructure_failure"
         : failed ? "failure" : "success",
       native_session_id: execution.nativeSessionId ?? request.nativeSessionId ?? null,
-      subject,
-      receipt: parsedReceipt
+      subject: subject ?? parsedReceipt?.subject?.post ?? null,
+      receipt: parsedReceipt && !receiptError
         ? canonicalJson(parsedReceipt)
         : sanitizeArtifactText(retryableInfrastructureFailure
           ? execution.stderr || "loop action infrastructure failure"
           : failureNarrative, sanitizeEnv).slice(0, 128_000),
       created_at: now(),
+      // Never derived from agent-authored stdout/stderr (which is sanitized
+      // and truncated above): this travels as its own typed field so a
+      // rotated Codex refresh token is captured regardless of the action's
+      // semantic outcome, without ever passing through free-text logging.
+      ...(execution.codexAuthJson ? { codex_auth_json: execution.codexAuthJson } : {}),
     };
   } finally {
     const cleanups = [

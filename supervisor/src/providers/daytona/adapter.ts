@@ -5,6 +5,8 @@ import {
   type RuntimeControl,
   type RuntimeInventoryResource,
   type RuntimeWorktreeHandle,
+  type ChildExecutorActionRequest,
+  type ChildExecutorActionResult,
   type LoopActionRequest,
   type LoopActionResult,
   type StageExecutionResult,
@@ -23,6 +25,8 @@ const STAGE_INPUT_DIR = "/var/lib/openthrottle/stage-input";
 const STAGE_RESULT_DIR = "/var/lib/openthrottle/stage-results";
 const LOOP_ACTION_DIR = "/var/lib/openthrottle/loop-actions";
 const LOOP_DISPATCH_DIR = "/var/lib/openthrottle/loop-dispatch";
+const CHILD_EXECUTOR_DIR = "/var/lib/openthrottle/child-executor-actions";
+const CHILD_EXECUTOR_DISPATCH_DIR = "/var/lib/openthrottle/child-executor-dispatch";
 const STAGE_CREDENTIAL_ENV = new Set([
   "GITHUB_TOKEN",
   "CLAUDE_CODE_OAUTH_TOKEN",
@@ -90,13 +94,46 @@ function assertLoopRequestFence(request: LoopActionRequest): void {
     // sealing lands; fail closed before dispatch rather than in-sandbox.
     throw new Error("opencode loop actions are not supported yet");
   }
-  if (request.role === "lead" && request.credentialScopes.includes("repo.write")) {
-    throw new Error("lead loop actions cannot request repo.write");
+  if (request.role !== "publisher" && request.credentialScopes.includes("repo.write")) {
+    throw new Error("structured loop actions cannot request repo.write");
   }
   const expectedHash = digestNormalized(canonicalJson(normalizedLoopRequestForHash(request)));
   const expectedKey = `loop:${request.attemptId}:${request.actionId}:${expectedHash}`;
   if (request.requestHash !== expectedHash || request.idempotencyKey !== expectedKey) {
     throw new Error(`loop action ${request.actionId} has a stale hash or idempotency key`);
+  }
+}
+
+function assertChildExecutorRequestFence(request: ChildExecutorActionRequest): void {
+  if (request.protocol !== "child-executor-action@1") {
+    throw new Error(`child executor action ${request.actionId} has an invalid protocol`);
+  }
+  safeStagePathId(request.actionId, "child executor action ID");
+  safeStagePathId(request.attemptId, "child executor attempt ID");
+  if (!["command", "final_command", "candidate", "integrate"].includes(request.actionKind)) {
+    throw new Error(`child executor action ${request.actionId} has an invalid kind`);
+  }
+  if (request.actionKind === "command" &&
+      (!request.unitId || !request.worktree?.id)) {
+    throw new Error(`child executor action ${request.actionId} requires a unit worktree`);
+  }
+  if (request.actionKind === "candidate" && !request.worktree?.id) {
+    throw new Error(`child executor action ${request.actionId} requires a worktree`);
+  }
+  if (request.actionKind === "final_command" && request.unitId !== null) {
+    throw new Error(`child executor action ${request.actionId} final command must be graph-scoped`);
+  }
+  if ((request.actionKind === "command" || request.actionKind === "final_command") && !request.commandName) {
+    throw new Error(`child executor action ${request.actionId} is missing its command name`);
+  }
+  if (request.actionKind === "integrate" && !request.candidateSubject) {
+    throw new Error(`child executor action ${request.actionId} is missing its candidate subject`);
+  }
+  const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...withoutFence } = request;
+  const expectedHash = digestNormalized(canonicalJson(withoutFence));
+  const expectedKey = `child-executor:${request.attemptId}:${request.actionId}:${expectedHash}`;
+  if (request.requestHash !== expectedHash || request.idempotencyKey !== expectedKey) {
+    throw new Error(`child executor action ${request.actionId} has a stale hash or idempotency key`);
   }
 }
 
@@ -122,8 +159,41 @@ function loopActionPath(attemptId: string, actionId: string, name: string): stri
   return `${LOOP_ACTION_DIR}/${attemptId}/${actionId}/${name}`;
 }
 
+function childExecutorActionPath(attemptId: string, actionId: string, name: string): string {
+  safeStagePathId(attemptId, "child executor attempt ID");
+  safeStagePathId(actionId, "child executor action ID");
+  return `${CHILD_EXECUTOR_DIR}/${attemptId}/${actionId}/${name}`;
+}
+
 function shellSingleQuoted(value: string): string {
   return `'${value.replace(/'/g, "'\"'\"'")}'`;
+}
+
+function childExecutorEnv(request: ChildExecutorActionRequest): string {
+  return [
+    "env -i",
+    "HOME=/home/agent",
+    "USER=agent",
+    "LOGNAME=agent",
+    "SHELL=/bin/bash",
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    `OT_STAGE_CONFIG_FILE=${shellSingleQuoted(`${STAGE_INPUT_DIR}/repository-config.json`)}`,
+    `RUN_ID=${shellSingleQuoted(request.parentRunId)}`,
+    `OT_CHILD_ACTION_ID=${shellSingleQuoted(request.actionId)}`,
+  ].join(" ");
+}
+
+function loopActionEnv(request: LoopActionRequest): string {
+  return [
+    "env -i",
+    "HOME=/home/agent",
+    "USER=agent",
+    "LOGNAME=agent",
+    "SHELL=/bin/bash",
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    ...(request.parentRunId ? [`RUN_ID=${shellSingleQuoted(request.parentRunId)}`] : []),
+    `OT_CHILD_ACTION_ID=${shellSingleQuoted(request.actionId)}`,
+  ].join(" ");
 }
 
 function parseCollectedStageResult(raw: string, attemptId: string): StageExecutionResult {
@@ -179,7 +249,9 @@ function parseCollectedLoopResult(raw: string, input: { attemptId: string; actio
       typeof event.created_at !== "string" || Number.isNaN(Date.parse(event.created_at)) ||
       (event.subject !== null && (typeof event.subject !== "string" || !/^[a-f0-9]{40,64}$/.test(event.subject))) ||
       (event.native_session_id !== null && typeof event.native_session_id !== "string") ||
-      typeof event.receipt !== "string") {
+      typeof event.receipt !== "string" ||
+      (event.codex_auth_json !== undefined &&
+        (typeof event.codex_auth_json !== "string" || Buffer.byteLength(event.codex_auth_json, "utf8") > 65_536))) {
     throw new Error(`sealed loop result ${input.attemptId}/${input.actionId} has an invalid envelope`);
   }
   return {
@@ -188,6 +260,32 @@ function parseCollectedLoopResult(raw: string, input: { attemptId: string; actio
     requestHash: event.request_hash as string,
     outcome: event.outcome as LoopActionResult["outcome"],
     nativeSessionId: event.native_session_id as string | null,
+    subject: event.subject as string | null,
+    receipt: event.receipt as string,
+    completedAt: event.created_at as string,
+    ...(typeof event.codex_auth_json === "string" ? { codexAuthJson: event.codex_auth_json } : {}),
+  };
+}
+
+function parseCollectedChildExecutorResult(
+  raw: string,
+  input: { attemptId: string; actionId: string; requestHash: string }
+): ChildExecutorActionResult {
+  if (Buffer.byteLength(raw, "utf8") > 256 * 1024) throw new Error("sealed child executor result exceeds 256 KiB");
+  const event = JSON.parse(raw) as Record<string, unknown>;
+  if (event.kind !== "child_executor_action_result" || event.version !== 1 || event.action_id !== input.actionId ||
+      event.attempt_id !== input.attemptId || event.request_hash !== input.requestHash ||
+      !["success", "failure", "needs_human", "retryable_infrastructure_failure"].includes(String(event.outcome)) ||
+      typeof event.created_at !== "string" || Number.isNaN(Date.parse(event.created_at)) ||
+      (event.subject !== null && (typeof event.subject !== "string" || !/^[a-f0-9]{40,64}$/.test(event.subject))) ||
+      typeof event.receipt !== "string") {
+    throw new Error(`sealed child executor result ${input.attemptId}/${input.actionId} has an invalid envelope`);
+  }
+  return {
+    actionId: input.actionId,
+    attemptId: event.attempt_id as string,
+    requestHash: event.request_hash as string,
+    outcome: event.outcome as ChildExecutorActionResult["outcome"],
     subject: event.subject as string | null,
     receipt: event.receipt as string,
     completedAt: event.created_at as string,
@@ -223,6 +321,28 @@ export function createDaytonaSandboxRuntime(
       throw new Error(`sandbox command failed with exit ${result.exitCode}`);
     }
     return result;
+  };
+  const prepareStageInput = async (sandbox: Sandbox, request: StageRequestEnvelope): Promise<string> => {
+    const requestDirectory = `${STAGE_INPUT_DIR}/requests`;
+    await prepareRootFolder(sandbox, requestDirectory);
+    const requestPath = `${requestDirectory}/${request.attemptId}.json`;
+    await sandbox.fs.uploadFile(Buffer.from(canonicalJson(request)), requestPath);
+    await sandbox.fs.setFilePermissions(requestPath, { owner: "root", group: "root", mode: "400" });
+    await sandbox.updateEnv({
+      OT_STAGE_REQUEST_FILE: requestPath,
+      OT_STAGE_CONFIG_FILE: `${STAGE_INPUT_DIR}/repository-config.json`,
+      OT_STAGE_MANIFEST_FILE: `${STAGE_INPUT_DIR}/pipeline-manifest.json`,
+      TASK_TYPE: request.taskType,
+      GITHUB_REPO: request.repository,
+      BASE_BRANCH: request.baseBranch,
+      BRANCH_NAME: request.branch,
+      AGENT: request.agent,
+      RUN_ID: request.runId,
+      ...(request.childActionId ? { OT_CHILD_ACTION_ID: request.childActionId } : {}),
+      LINEAR_ISSUE_ID: request.issueId,
+      LINEAR_ISSUE_IDENTIFIER: request.issueId,
+    }, { unset: request.childActionId ? ["OT_COMPOSITE_PREPARE_ONLY"] : ["OT_CHILD_ACTION_ID", "OT_COMPOSITE_PREPARE_ONLY"] });
+    return requestPath;
   };
 
   return {
@@ -309,25 +429,7 @@ export function createDaytonaSandboxRuntime(
         throw new Error(`stage ${request.attemptId} does not match the sandbox bootstrap`);
       }
       const sandbox = await ensureStarted(resource);
-      const requestDirectory = `${STAGE_INPUT_DIR}/requests`;
-      await prepareRootFolder(sandbox, requestDirectory);
-      const requestPath = `${requestDirectory}/${request.attemptId}.json`;
-      await sandbox.fs.uploadFile(Buffer.from(canonicalJson(request)), requestPath);
-      await sandbox.fs.setFilePermissions(requestPath, { owner: "root", group: "root", mode: "400" });
-      await sandbox.updateEnv({
-        OT_STAGE_REQUEST_FILE: requestPath,
-        OT_STAGE_CONFIG_FILE: `${STAGE_INPUT_DIR}/repository-config.json`,
-        OT_STAGE_MANIFEST_FILE: `${STAGE_INPUT_DIR}/pipeline-manifest.json`,
-        TASK_TYPE: request.taskType,
-        GITHUB_REPO: request.repository,
-        BASE_BRANCH: request.baseBranch,
-        BRANCH_NAME: request.branch,
-        AGENT: request.agent,
-        RUN_ID: request.runId,
-        ...(request.childActionId ? { OT_CHILD_ACTION_ID: request.childActionId } : {}),
-        LINEAR_ISSUE_ID: request.issueId,
-        LINEAR_ISSUE_IDENTIFIER: request.issueId,
-      }, { unset: request.childActionId ? [] : ["OT_CHILD_ACTION_ID"] });
+      await prepareStageInput(sandbox, request);
       const sessionId = `stage-${request.attemptId}`;
       await sandbox.process.createSession(sessionId).catch(() => undefined);
       const dispatched = await sandbox.process.executeSessionCommand(sessionId, {
@@ -342,6 +444,36 @@ export function createDaytonaSandboxRuntime(
         suppressInputEcho: true,
       }, options.taskTimeoutSeconds ?? 7_200);
       return { providerDispatchId: dispatched.cmdId ?? sessionId };
+    },
+
+    async prepareCompositeWorkspace(resource, request) {
+      assertStageRequestFence(request);
+      if (materializedScopes.get(resource.providerResourceId) !== canonicalJson(request.credentialScopes)) {
+        throw new Error(`composite stage ${request.attemptId} credentials were not materialized for the exact requested scopes`);
+      }
+      const bootstrap = bootstrapped.get(resource.providerResourceId);
+      if (!bootstrap || bootstrap.configDigest !== request.repositoryConfigDigest ||
+          bootstrap.manifestDigest !== request.manifestDigest) {
+        throw new Error(`composite stage ${request.attemptId} does not match the sandbox bootstrap`);
+      }
+      const sandbox = await ensureStarted(resource);
+      await prepareStageInput(sandbox, request);
+      await sandbox.updateEnv({ OT_COMPOSITE_PREPARE_ONLY: "1" }, { unset: [] });
+      const marker = `${STAGE_RESULT_DIR}/${request.attemptId}.composite-prepared`;
+      const sessionId = `composite-prepare-${request.attemptId}`;
+      await sandbox.process?.createSession?.(sessionId).catch(() => undefined);
+      if (!sandbox.process?.executeSessionCommand) {
+        throw new Error("Daytona runtime does not expose session command execution");
+      }
+      const prepared = await sandbox.process.executeSessionCommand(sessionId, {
+        command: `flock --nonblock ${STAGE_RESULT_DIR}/${request.attemptId}.prepare.lock sh -c ` +
+          shellSingleQuoted(`test -f ${marker} || (OT_COMPOSITE_PREPARE_ONLY=1 /opt/openthrottle/entrypoint.sh && install -o root -g root -m 0400 /dev/null ${marker})`),
+        runAsync: false,
+        suppressInputEcho: true,
+      }, options.taskTimeoutSeconds ?? 7_200);
+      if (prepared.exitCode !== undefined && prepared.exitCode !== 0) {
+        throw new Error(`composite workspace preparation failed with exit ${prepared.exitCode}`);
+      }
     },
 
     async collectStageResult(resource, attemptId) {
@@ -369,7 +501,7 @@ export function createDaytonaSandboxRuntime(
       };
       await executeSandboxCommand(
         sandbox,
-        `/opt/openthrottle/runner/worktrees.mjs create --handle '${handle.id}' --base '${input.baseCommit}'`,
+        `/opt/openthrottle/runner/worktrees.mjs create --idempotent --handle ${shellSingleQuoted(handle.id)} --base ${shellSingleQuoted(input.baseCommit)}`,
         120
       );
       return handle;
@@ -427,6 +559,7 @@ export function createDaytonaSandboxRuntime(
         throw new Error("Daytona runtime does not expose session command execution");
       }
       await sandbox.process?.createSession?.(sessionId).catch(() => undefined);
+      const cleanEnv = loopActionEnv(request);
       const dispatched = await sandbox.process.executeSessionCommand(sessionId, {
         command: `flock --nonblock ${lockPath} sh -c ` +
           shellSingleQuoted([
@@ -441,7 +574,9 @@ export function createDaytonaSandboxRuntime(
             `chown root:root ${shellSingleQuoted(requestPath)} ${shellSingleQuoted(credentialsPath)}`,
             `chmod 400 ${shellSingleQuoted(requestPath)} ${shellSingleQuoted(credentialsPath)}`,
             `rm -f ${shellSingleQuoted(stagedCredentialsPath)}`,
-            `exec /opt/openthrottle/runner/execute-loop.mjs --request ${shellSingleQuoted(requestPath)} --credentials ${shellSingleQuoted(credentialsPath)} --output ${shellSingleQuoted(resultPath)}`,
+            `${cleanEnv} /opt/openthrottle/runner/heartbeat.mjs & heartbeat_pid=$!`,
+            `trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT INT TERM`,
+            `set +e; ${cleanEnv} /opt/openthrottle/runner/execute-loop.mjs --request ${shellSingleQuoted(requestPath)} --credentials ${shellSingleQuoted(credentialsPath)} --output ${shellSingleQuoted(resultPath)}; status=$?; kill "$heartbeat_pid" 2>/dev/null || true; wait "$heartbeat_pid" 2>/dev/null || true; exit "$status"`,
           ].join(" && ")) +
           // A losing `flock --nonblock` (another dispatch for this exact
           // action already holds it) exits nonzero without ever running the
@@ -464,6 +599,59 @@ export function createDaytonaSandboxRuntime(
       try {
         const raw = (await sandbox.fs.downloadFile(loopActionPath(input.attemptId, input.actionId, "result.json"))).toString("utf8");
         return parseCollectedLoopResult(raw, input);
+      } catch (error) {
+        if (String(error).toLowerCase().includes("not found")) return null;
+        throw error;
+      }
+    },
+
+    async dispatchChildExecutorAction(resource, request) {
+      assertChildExecutorRequestFence(request);
+      const sandbox = await ensureStarted(resource);
+      const actionDirectory = `${CHILD_EXECUTOR_DIR}/${request.attemptId}/${request.actionId}`;
+      const requestPath = childExecutorActionPath(request.attemptId, request.actionId, "request.json");
+      const resultPath = childExecutorActionPath(request.attemptId, request.actionId, "result.json");
+      await prepareRootFolder(sandbox, CHILD_EXECUTOR_DISPATCH_DIR);
+      const dispatchNonce = randomUUID();
+      const stagedRequestPath =
+        `${CHILD_EXECUTOR_DISPATCH_DIR}/${request.attemptId}.${request.actionId}.${dispatchNonce}.request.json`;
+      const lockPath = `${CHILD_EXECUTOR_DISPATCH_DIR}/${request.attemptId}.${request.actionId}.lock`;
+      await sandbox.fs.uploadFile(Buffer.from(canonicalJson(request)), stagedRequestPath);
+      await sandbox.fs.setFilePermissions(stagedRequestPath, { owner: "root", group: "root", mode: "400" });
+      const sessionId = `child-executor-${request.actionId}`;
+      if (!sandbox.process?.executeSessionCommand) {
+        throw new Error("Daytona runtime does not expose session command execution");
+      }
+      await sandbox.process?.createSession?.(sessionId).catch(() => undefined);
+      const cleanEnv = childExecutorEnv(request);
+      const dispatched = await sandbox.process.executeSessionCommand(sessionId, {
+        command: `flock --nonblock ${lockPath} sh -c ` +
+          shellSingleQuoted([
+            `if test -f ${shellSingleQuoted(resultPath)}; then rm -f ${shellSingleQuoted(stagedRequestPath)}; exit 0; fi`,
+            `install -d -o root -g root -m 0711 ${shellSingleQuoted(CHILD_EXECUTOR_DIR)} ${shellSingleQuoted(`${CHILD_EXECUTOR_DIR}/${request.attemptId}`)} ${shellSingleQuoted(actionDirectory)}`,
+            `cp ${shellSingleQuoted(stagedRequestPath)} ${shellSingleQuoted(requestPath)}`,
+            `chown root:root ${shellSingleQuoted(requestPath)}`,
+            `chmod 400 ${shellSingleQuoted(requestPath)}`,
+            `rm -f ${shellSingleQuoted(stagedRequestPath)}`,
+            `${cleanEnv} /opt/openthrottle/runner/heartbeat.mjs & heartbeat_pid=$!`,
+            `trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT INT TERM`,
+            `set +e; ${cleanEnv} /opt/openthrottle/runner/execute-child-action.mjs --request ${shellSingleQuoted(requestPath)} --output ${shellSingleQuoted(resultPath)}; status=$?; kill "$heartbeat_pid" 2>/dev/null || true; wait "$heartbeat_pid" 2>/dev/null || true; exit "$status"`,
+          ].join(" && ")) +
+          ` || rm -f ${shellSingleQuoted(stagedRequestPath)}`,
+        runAsync: true,
+        suppressInputEcho: true,
+      }, options.taskTimeoutSeconds ?? 7_200);
+      return { providerDispatchId: dispatched.cmdId ?? sessionId };
+    },
+
+    async collectChildExecutorActionResult(resource, input) {
+      safeStagePathId(input.attemptId, "child executor attempt ID");
+      safeStagePathId(input.actionId, "child executor action ID");
+      if (!/^[a-f0-9]{64}$/.test(input.requestHash)) throw new Error("child executor request hash is invalid");
+      const sandbox = await getSandbox(resource);
+      try {
+        const raw = (await sandbox.fs.downloadFile(childExecutorActionPath(input.attemptId, input.actionId, "result.json"))).toString("utf8");
+        return parseCollectedChildExecutorResult(raw, input);
       } catch (error) {
         if (String(error).toLowerCase().includes("not found")) return null;
         throw error;

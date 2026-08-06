@@ -324,9 +324,11 @@ function validateUnitPhaseSequence(phases: readonly GraphUnitPhaseId[], path: st
   let candidateIndex = -1;
   let implementIndex = -1;
   let simplifyIndex = -1;
+  let commandIndex = -1;
   for (const [index, phase] of phases.entries()) {
     if (phase === "implement") implementIndex = index;
     if (phase === "simplify") simplifyIndex = index;
+    if (phase === "command") commandIndex = index;
     if (phase === "integrate") integrateIndex = index;
     if (phase === "lead") leadIndex = index;
     if (phase === "candidate") candidateIndex = index;
@@ -336,6 +338,7 @@ function validateUnitPhaseSequence(phases: readonly GraphUnitPhaseId[], path: st
   }
   if (integrateIndex !== phases.length - 1) fail(path, "integrate must be last");
   if (simplifyIndex !== -1 && simplifyIndex < implementIndex) fail(path, "simplify must not precede implement");
+  if (commandIndex !== -1 && commandIndex < implementIndex) fail(path, "command must not precede implement");
   if (leadIndex !== integrateIndex - 1) fail(path, "lead must immediately precede integrate");
   if (candidateIndex !== leadIndex - 1) fail(path, "candidate must immediately precede lead");
 }
@@ -386,6 +389,9 @@ function validateUnitPhaseBindings(
         );
       }
     }
+    if (binding.credentials.includes("repo.write") || binding.worker.credentials.includes("repo.write")) {
+      fail(`${path}[${index}].credentials`, "structured child phase bindings cannot request repo.write");
+    }
     if (canonicalJson(binding.credentials) !== canonicalJson(binding.worker.credentials)) {
       fail(`${path}[${index}].credentials`, "must match worker.credentials");
     }
@@ -402,6 +408,7 @@ function validateUnitPhaseBindingCapabilityContract(
     context: binding.context,
     credentials: binding.credentials,
   })) {
+    if (violation.field === "credentials" && /repo\.write/.test(violation.message)) continue;
     fail(`${path}.${violation.field}`, violation.message);
   }
 }
@@ -446,6 +453,15 @@ export function canonicalJson(value: unknown): string {
 
 export function digestNormalized(normalized: string): string {
   return sharedDigestNormalized(normalized);
+}
+
+export function stageById(normalizedManifest: string, stageId: string | null | undefined): PipelineStage | undefined {
+  const manifest = JSON.parse(normalizedManifest) as { stages?: unknown };
+  const stages = Array.isArray(manifest.stages) ? manifest.stages : [];
+  return stages.find((stage) =>
+    typeof stage === "object" && stage !== null &&
+    (stage as { id?: unknown }).id === stageId
+  ) as PipelineStage | undefined;
 }
 
 export function isPipelineReentry(manifest: PipelineManifest, stageId: string, targetId: string): boolean {

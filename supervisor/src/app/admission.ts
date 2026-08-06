@@ -3,7 +3,13 @@ import { fileURLToPath } from "node:url";
 import type { Config } from "./config.js";
 import type { SupervisorStore } from "../persistence/store.js";
 import type { Agent, TaskType } from "../pipeline/types.js";
-import { canonicalJson, digestNormalized, parseExecutionPlanContract, parseGraphContract } from "@openthrottle/contracts";
+import {
+  canonicalJson,
+  digestNormalized,
+  parseExecutionPlanContract,
+  parseGraphContract,
+  type ExecutionPlanContract,
+} from "@openthrottle/contracts";
 import type {
   LinearAgentSessionEvent,
   RepositoryDirectorySnapshot,
@@ -20,19 +26,21 @@ import {
   type ValidatedRepositoryConfig,
 } from "../pipeline/manifest.js";
 import { FOR_EACH_UNIT_CAPABILITY, parseAndCompileExecutionGraph } from "../pipeline/execution-graph.js";
+import { assertStructuredPlanLoopEnvelopeBound } from "../pipeline/structured-loop-envelope.js";
 import type { RepositorySkillPackage } from "../pipeline/manifest.js";
 import type { PipelineStore } from "../pipeline/store.js";
+import { extractJsonBlocks } from "../pipeline/markdown.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import type { AdmissionPreflight } from "./admission-preflight.js";
 import type { PipelineCoordinatorContext, SessionServicePorts } from "./session-service.js";
 
 const EXECUTION_PLAN_FENCE = "openthrottle.execution-plan/v1";
 const SHIP_SELECTION_FENCE = "openthrottle.ship-selection/v1";
-const FENCE_PATTERN = /```([^\n`]*)\n([\s\S]*?)```/g;
 const BUILTIN_SIMPLE_GRAPH = fileURLToPath(new URL("../../graphs/simple-v1.json", import.meta.url));
 const BUILTIN_STRUCTURED_GRAPH = fileURLToPath(new URL("../../graphs/structured-v1.json", import.meta.url));
 const SIMPLE_IMPLEMENT_DESCRIPTION = "Staged CE implementation from a pre-approved plan with round-based repair budgeting, scoped repair re-entry, sealed repository gates, exact-tree publication, and bounded provider repair. The initial forward pass may simplify; repair passes re-run semantic review and command gates without re-running simplification.";
 const REPOSITORY_SKILL_PACKAGE_SCHEMA = "openthrottle.repository-skill-package/v1";
+const ORDINARY_STAGE_TASK_CONTEXT_LIMIT = 64_000;
 
 function linearContext(
   payload: LinearAgentSessionEvent,
@@ -99,14 +107,40 @@ function pipelineInvokesModel(manifest: ValidatedPipelineManifest): boolean {
   );
 }
 
-function extractJsonBlocks(markdown: string, schema: string): string[] {
-  const blocks: string[] = [];
-  for (const match of markdown.matchAll(FENCE_PATTERN)) {
-    const marker = match[1]?.trim().split(/\s+/) ?? [];
-    if (!marker.includes(schema)) continue;
-    blocks.push(match[2]?.trim() ?? "");
+function pipelineUsesOpenCodeLoopActions(manifest: ValidatedPipelineManifest, selectedAgent: Agent): boolean {
+  return manifest.manifest.stages.some((stage) =>
+    stage.executor.kind === "loop_action" &&
+    (
+      selectedAgent === "opencode" ||
+      (stage.unitPhaseBindings ?? []).some((binding) =>
+        (binding.kind === "agent" || binding.kind === "gate") &&
+        binding.worker.agent === "opencode"
+      )
+    )
+  );
+}
+
+function effectiveStructuredWorkerAgents(manifest: ValidatedPipelineManifest, selectedAgent: Agent): Set<Agent> {
+  const agents = new Set<Agent>();
+  for (const stage of manifest.manifest.stages) {
+    if (stage.credentials.includes("model.invoke")) agents.add(selectedAgent);
+    if (stage.executor.kind !== "loop_action") continue;
+    // Built-in final review/final repair workers inherit the ticket-selected
+    // engine even when every unit phase overrides it.
+    agents.add(selectedAgent);
+    for (const binding of stage.unitPhaseBindings ?? []) {
+      if (binding.kind !== "agent" && binding.kind !== "gate") continue;
+      const workerAgent = binding.worker.agent === undefined || binding.worker.agent === "inherit"
+        ? selectedAgent
+        : binding.worker.agent;
+      agents.add(workerAgent);
+    }
   }
-  return blocks;
+  return agents;
+}
+
+function manifestUsesCompositeRuntime(manifest: ValidatedPipelineManifest): boolean {
+  return manifest.manifest.stages.some((stage) => stage.executor.kind === "loop_action");
 }
 
 function extractShipSelectionGraphId(context: string): string | undefined {
@@ -127,23 +161,25 @@ function extractShipSelectionGraphId(context: string): string | undefined {
   return record.graph_id;
 }
 
-function extractExecutionPlanGraphId(context: string): string | undefined {
+function extractExecutionPlan(context: string): ExecutionPlanContract | undefined {
   const blocks = extractJsonBlocks(context, EXECUTION_PLAN_FENCE);
   if (blocks.length === 0) return undefined;
   if (blocks.length > 1) throw new Error(`expected at most one ${EXECUTION_PLAN_FENCE} block, found ${blocks.length}`);
-  return parseExecutionPlanContract(blocks[0]!, { source: "issue.execution_plan" }).value.graph_id;
+  return parseExecutionPlanContract(blocks[0]!, { source: "issue.execution_plan" }).value;
 }
 
 function extractRequestedGraph(context: string): {
   graphId?: string;
   hasExecutionPlan: boolean;
+  executionPlan?: ExecutionPlanContract;
 } {
   const selected = extractShipSelectionGraphId(context);
-  const planned = extractExecutionPlanGraphId(context);
+  const executionPlan = extractExecutionPlan(context);
+  const planned = executionPlan?.graph_id;
   if (selected && planned && selected !== planned) {
     throw new Error(`ship selection graph_id ${selected} does not match execution_plan.graph_id ${planned}`);
   }
-  return { graphId: selected ?? planned, hasExecutionPlan: planned !== undefined };
+  return { graphId: selected ?? planned, hasExecutionPlan: planned !== undefined, executionPlan };
 }
 
 function repositorySkillIds(rawGraph: string, source: string, config: ValidatedRepositoryConfig["config"]): string[] {
@@ -220,7 +256,8 @@ async function resolvePipelineSelection(
   readPinnedFile: (path: string) => Promise<RepositoryFileSnapshot>,
   readPinnedDirectory: (path: string) => Promise<RepositoryDirectorySnapshot>,
   runtime: PipelineCoordinatorContext["runtime"],
-  catalog: ValidatedPipelineCatalog
+  catalog: ValidatedPipelineCatalog,
+  selectedAgent: Agent
 ): Promise<ValidatedPipelineManifest> {
   const intent = repositoryConfig.config.intents?.implement;
   const requested = extractRequestedGraph(context);
@@ -283,6 +320,12 @@ async function resolvePipelineSelection(
   const compiled = parseAndCompileExecutionGraph(rawGraph, compileOptions);
   if (compiled.manifest.manifest.requires.capabilities.includes(FOR_EACH_UNIT_CAPABILITY) && !requested.hasExecutionPlan) {
     throw new Error(`graph ${graphId} requires a canonical ${EXECUTION_PLAN_FENCE} block`);
+  }
+  if (compiled.manifest.manifest.requires.capabilities.includes(FOR_EACH_UNIT_CAPABILITY) && requested.executionPlan) {
+    assertStructuredPlanLoopEnvelopeBound(requested.executionPlan, {
+      manifest: compiled.manifest,
+      selectedAgent,
+    });
   }
   try {
     validatePipelineManifest(compiled.manifest.manifest, {
@@ -491,9 +534,10 @@ export async function handleCreated(
             selectedRepository.repo,
             remote.baseCommit,
             path
-          ),
+        ),
         coordinator.runtime,
-        coordinator.catalog
+        coordinator.catalog,
+        selectedAgent
       )
       : resolvePipelineReference(
         coordinator.catalog,
@@ -502,10 +546,24 @@ export async function handleCreated(
     // Fail closed here, before the repository snapshot, the capacity preflight,
     // the ticket row, and any Daytona provisioning: a generation whose engine
     // has no credential can only end as an opaque in-sandbox launch failure.
-    if (pipelineInvokesModel(manifest) && !hasAgentSubscription(cfg, selectedAgent)) {
+    const requiredAgents = pipelineInvokesModel(manifest)
+      ? effectiveStructuredWorkerAgents(manifest, selectedAgent)
+      : new Set<Agent>();
+    const missingAgent = [...requiredAgents].find((agent) => !hasAgentSubscription(cfg, agent));
+    if (missingAgent) {
       throw new Error(
-        `${agentDisplayName(selectedAgent)} is selected for this pipeline but its credential is not configured on the supervisor ` +
-        `(set ${agentCredentialVariable(selectedAgent)}). No sandbox was provisioned.`
+        `${agentDisplayName(missingAgent)} is selected for this pipeline but its credential is not configured on the supervisor ` +
+        `(set ${agentCredentialVariable(missingAgent)}). No sandbox was provisioned.`
+      );
+    }
+    if (pipelineUsesOpenCodeLoopActions(manifest, selectedAgent)) {
+      throw new Error("OpenCode structured loop actions are not supported yet. No sandbox was provisioned.");
+    }
+    if (!manifestUsesCompositeRuntime(manifest) &&
+        Buffer.byteLength(sanitizeText(initialContext), "utf8") > ORDINARY_STAGE_TASK_CONTEXT_LIMIT) {
+      throw new Error(
+        `Task context exceeds ${ORDINARY_STAGE_TASK_CONTEXT_LIMIT} bytes for an ordinary stage pipeline. ` +
+        "No sandbox was provisioned."
       );
     }
     const snapshot = coordinator.store.saveRepositoryConfigSnapshot({
@@ -557,7 +615,7 @@ export async function handleCreated(
         runtime: coordinator.runtime,
         authorizedCapabilities: pinned.manifest.manifest.requires.capabilities,
         taskType,
-        taskContext: sanitizeText(initialContext).slice(0, 64_000),
+        taskContext: sanitizeText(initialContext),
       },
     });
   } catch (error) {

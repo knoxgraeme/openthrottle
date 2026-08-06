@@ -19,6 +19,7 @@ import type { PipelineInstance, PipelineStageAttempt } from "./store.js";
 export interface ExecutionPlanUnit {
   id: string;
   dependencies?: readonly string[];
+  commandNames?: readonly string[];
 }
 
 // The durable per-unit sequence: implement/repair produces a unit_completion
@@ -34,6 +35,12 @@ export const UNIT_ACTION_KINDS = [
   "final_command", "final_review", "final_repair", "aggregate", "stop", "cleanup",
 ] as const;
 export type UnitActionKind = (typeof UNIT_ACTION_KINDS)[number];
+
+function structuredAggregateSummary(result: StageOutcome): string {
+  return result === "success"
+    ? "Structured execution units completed."
+    : "Structured execution did not integrate every unit.";
+}
 
 // Whole-change final phases run once every unit has settled: full commands
 // rerun against the final integrated subject, then one fresh report-only
@@ -52,6 +59,7 @@ export interface ExecutionUnitState {
   currentCycle: number;
   repairRounds: number;
   commandIndex: number;
+  commandNames?: readonly string[];
   acceptedCandidateSubject: string | null;
   integrationSubject: string | null;
   terminalLevel: UnitTerminalLevel | null;
@@ -126,7 +134,10 @@ export function routeUnitAcceptanceDecision(input: {
   maxRepairRounds: number;
 }): UnitAcceptanceRouting {
   if (input.outcome === "success") return { action: "integrate" };
-  if (input.outcome === "semantic_repair_required") {
+  if (
+    input.outcome === "semantic_repair_required" ||
+    (input.outcome === "failure" && input.reason.includes("command"))
+  ) {
     if (input.repairRounds + 1 > input.maxRepairRounds) return { action: "settle", reason: "defect" };
     return { action: "repair", repairRounds: input.repairRounds + 1 };
   }
@@ -478,6 +489,7 @@ export function buildExecutionGraphResultArtifact(input: {
 }): PipelineEventArtifact {
   const ordered = [...input.units].sort((left, right) => left.ordinal - right.ordinal || left.unitId.localeCompare(right.unitId));
   const completedAt = input.completedAt ?? input.parentAttempt.completed_at ?? input.parentAttempt.updated_at;
+  const result = input.result ?? "success";
   const payload = canonicalJson({
     ...typedArtifactBase({
       kind: "execution_graph_result",
@@ -486,10 +498,10 @@ export function buildExecutionGraphResultArtifact(input: {
       stage: input.stage,
       subject: input.subject,
       assurance: input.assurance ?? input.stage.evaluator.assurance,
-      result: input.result ?? "success",
+      result,
       completedAt,
     }),
-    summary: "Structured execution units completed.",
+    summary: structuredAggregateSummary(result),
     evidence: [],
     findings: [],
     actions: [],
@@ -527,13 +539,25 @@ export function buildAggregateStageEvent(input: {
 }): PipelineCoordinatorEvent {
   const stage = input.manifest.stages.find((candidate) => candidate.id === input.parentAttempt.stage_id);
   if (!stage) throw new Error(`parent stage ${input.parentAttempt.stage_id} is absent from the pinned manifest`);
+  if (!input.subject) throw new Error("artifact stage_result requires a gated subject");
+  const ordered = [...input.units].sort((left, right) =>
+    left.ordinal - right.ordinal || left.unitId.localeCompare(right.unitId)
+  );
+  const allIntegrated = ordered.length > 0 && ordered.every((unit) =>
+    unit.terminalLevel === "completed" &&
+    unit.integrationSubject !== null
+  );
+  const outcome = input.outcome ?? "success";
+  if (outcome === "success" && !allIntegrated) {
+    throw new Error("structured aggregate success requires every unit to have accepted exact-subject integration evidence");
+  }
   const graphResult = buildExecutionGraphResultArtifact({
     instance: input.instance,
     parentAttempt: input.parentAttempt,
     stage,
     units: input.units,
     subject: input.subject,
-    result: input.outcome ?? "success",
+    result: outcome,
     completedAt: input.completedAt,
   });
   const completedAt = input.completedAt ?? input.parentAttempt.completed_at ?? input.parentAttempt.updated_at;
@@ -545,10 +569,10 @@ export function buildAggregateStageEvent(input: {
       stage,
       subject: input.subject,
       assurance: stage.evaluator.assurance,
-      result: input.outcome ?? "success",
+      result: outcome,
       completedAt,
     }),
-    summary: "Structured execution units completed.",
+    summary: structuredAggregateSummary(outcome),
     evidence: [graphResult.hash],
     findings: [],
     actions: [],
@@ -574,7 +598,7 @@ export function buildAggregateStageEvent(input: {
     stageId: input.parentAttempt.stage_id,
     attemptId: input.parentAttempt.id,
     requestHash: input.parentAttempt.request_hash,
-    outcome: input.outcome ?? "success",
+    outcome,
     resultHash: stageResult.hash,
     subject: input.subject,
     nativeSessionId: input.nativeSessionId ?? input.parentAttempt.native_session_id,

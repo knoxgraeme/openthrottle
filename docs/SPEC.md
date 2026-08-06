@@ -130,10 +130,12 @@ the manifest and sealed request. Production advertises `agent/repository-skill@1
 in its installed runtime capability descriptor, so a `run` node backed by a
 repository skill is reachable through the existing whole-attempt dispatch path.
 The composite `graph/for-each-unit@1` capability (structured multi-unit
-execution) remains fail closed in production: the descriptor omits it until
-the composition root that constructs and drains the child unit runtime is
-installed, so admission and the CLI's pre-mutation ship check (below) both
-continue to reject an explicit structured selection before any Linear access.
+execution) is installed only with the composition root that constructs and
+drains the child unit runtime. A composite host stage dispatches no
+whole-stage sandbox request; entering it provisions/bootstrap the runtime,
+binds the parent actor, seeds one child execution graph from the sealed
+execution-plan block and graph-declared phase sequence, and drains child work
+actions through the provider-neutral unit effect port.
 For a `for_each_unit` node, the repository graph owns the ordered `phases`
 array. The platform owns the closed mechanism vocabulary and the security
 contract behind each mechanism:
@@ -552,7 +554,8 @@ plus the graph-declared unit phase sequence, the pinned configured command
 names, the bounded max repair rounds, and the whole-change final phase
 (`command`/`review`/`repair`/`done`, `NULL` before the first unit integrates);
 `execution_units` stores the immutable unit projection, dependency list,
-authored order, active work pointer, current phase
+authored order, canonical execution-plan command sequence for that unit,
+active work pointer, current phase
 (`implement`/`simplify`/`command`/`candidate`/`lead`/`integrate`), current
 repair cycle, repair round count, command index, accepted/integration subjects,
 and terminal level/alarm fields; and `execution_work_attempts` stores each
@@ -562,7 +565,15 @@ name, idempotency key, runtime request/session hashes, lease owner/window,
 payload, result hash, output subject, receipt, and terminal/error state.
 Composite foreign keys bind every unit, action, receipt, and downstream
 context record to the same execution graph and parent attempt so cross-instance
-or mixed-attempt child identities are rejected durably. The durable unit
+or mixed-attempt child identities are rejected durably. When an execution plan
+declares commands, those commands are the authoritative command sequence:
+unit-scoped commands run only for their named unit, unscoped commands run for
+every unit, and the whole-change final command sequence uses the canonical plan
+command names. If the plan declares no commands, the graph's command phase
+defaults are used for backward-compatible structured runs. A declared command
+missing from the sealed repository config fails closed before child dispatch,
+and a `not_configured` receipt for a declared unit or final command is a failed
+gate. The durable unit
 reducer advances a unit through the persisted graph-declared phase order:
 implement (or repair on re-entry), optional simplify, declared command slots,
 executor candidate derivation, lead acceptance bound to that exact candidate
@@ -618,8 +629,11 @@ whole-change final review has passed (`execution_graphs.final_phase = 'done'`),
 the reducer emits one `execution_graph_result` artifact and one aggregate
 `stage_result` for the parent attempt; the aggregate hash is compare-and-set on
 `execution_graphs` so the parent can settle once through the ordinary
-stage-result path. A graph with no completed unit (all units exited or failed)
-never claims structured success.
+stage-result path. Structured success requires every authored unit to have a
+`completed` terminal level plus accepted integration evidence for that unit's
+exact integration subject. The aggregate subject is the final integrated graph
+head after all unit and whole-change integration phases complete. A stopped,
+exited, failed, or partially integrated graph never claims structured success.
 
 `pipeline_artifacts.kind` includes `execution_graph_result` for the child
 aggregate artifact in addition to the existing stage, review, command,

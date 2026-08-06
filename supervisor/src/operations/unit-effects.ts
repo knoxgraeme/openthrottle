@@ -1,4 +1,5 @@
 import type { ExecutionUnitStore, ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
+import type { ExecutionGateDecision } from "../pipeline/execution-gates.js";
 
 export interface UnitEffectRuntime {
   dispatchUnitAction(action: ExecutionWorkAttempt): Promise<{
@@ -6,8 +7,18 @@ export interface UnitEffectRuntime {
     nativeSessionId?: string | null;
   }>;
   collectUnitAction(action: ExecutionWorkAttempt): Promise<{
+    terminal?: false;
     resultHash: string;
     outputSubject: string;
+    receipt?: string;
+    nativeSessionId?: string | null;
+    decision?: ExecutionGateDecision;
+  } | {
+    terminal: true;
+    resultHash: string;
+    outcome: "failure" | "needs_human" | "retryable_infrastructure_failure";
+    lastError: string;
+    nativeSessionId?: string | null;
   } | null>;
 }
 
@@ -34,15 +45,50 @@ export function createUnitEffectProcessor(input: {
         leaseUntilIso: new Date(leasedAt.getTime() + leaseMs).toISOString(),
       });
       if (!action) return undefined;
-      const requestlessDispatch = action.status === "dispatched" && !action.request_hash && !action.native_session_id;
-      if (!requestlessDispatch) {
+      const preparedNotLaunched = action.request_hash != null &&
+        action.request_payload != null &&
+        action.request_launch_state !== "launched";
+      const requestlessDispatch = action.status === "dispatched" && !action.request_hash;
+      if (!requestlessDispatch && !preparedNotLaunched) {
         const recovered = await input.runtime.collectUnitAction(action);
         if (recovered) {
-          input.store.completeUnitAction({
-            actionId: action.id,
-            resultHash: recovered.resultHash,
-            outputSubject: recovered.outputSubject,
-          });
+          if (recovered.terminal) {
+            if (recovered.outcome === "retryable_infrastructure_failure") {
+              input.store.stopRetryableUnitAction({
+                actionId: action.id,
+                resultHash: recovered.resultHash,
+                lastError: recovered.lastError,
+                nativeSessionId: recovered.nativeSessionId,
+              });
+              return action;
+            }
+            input.store.failUnitAction({
+              actionId: action.id,
+              resultHash: recovered.resultHash,
+              outcome: recovered.outcome,
+              lastError: recovered.lastError,
+              nativeSessionId: recovered.nativeSessionId,
+            });
+            return action;
+          }
+          if (recovered.decision) {
+            input.store.completeGatedAction({
+              actionId: action.id,
+              resultHash: recovered.resultHash,
+              outputSubject: recovered.outputSubject,
+              receipt: recovered.receipt,
+              nativeSessionId: recovered.nativeSessionId,
+              decision: recovered.decision,
+            });
+          } else {
+            input.store.completeUnitAction({
+              actionId: action.id,
+              resultHash: recovered.resultHash,
+              outputSubject: recovered.outputSubject,
+              receipt: recovered.receipt,
+              nativeSessionId: recovered.nativeSessionId,
+            });
+          }
           return action;
         }
         if (
@@ -59,9 +105,9 @@ export function createUnitEffectProcessor(input: {
           return action;
         }
       }
-      const shouldDispatch = action.status === "leased" || requestlessDispatch;
+      const shouldDispatch = action.status === "leased" || requestlessDispatch || preparedNotLaunched;
       if (!shouldDispatch) return action;
-      if (action.status === "leased") input.store.markActionDispatching(action.id);
+      if (action.status === "leased" && !action.request_hash) input.store.markActionDispatching(action.id);
       const dispatched = await input.runtime.dispatchUnitAction(action);
       input.store.markActionDispatched(action.id, dispatched.requestHash, dispatched.nativeSessionId ?? null);
       return action;

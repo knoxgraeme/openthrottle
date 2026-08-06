@@ -95,6 +95,7 @@ function request(overrides = {}) {
     actionId: "action-1",
     attemptId: "attempt-1",
     graphId: "graph-1",
+    parentRunId: "run-parent",
     unitId: "unit-1",
     role: "worker",
     loop: "implement",
@@ -106,7 +107,7 @@ function request(overrides = {}) {
     timeoutMs: 30_000,
     transitionContext: "Implement the unit.",
     allowedMcpServers: ["github"],
-    credentialScopes: ["model.invoke", "repo.read", "repo.write"],
+    credentialScopes: ["model.invoke", "repo.read"],
     receiptSchema: "openthrottle.receipt/v1",
     ...overrides,
   };
@@ -157,6 +158,7 @@ function repositorySkillRequest() {
     actionId: "action-repo-skill",
     attemptId: "attempt-repo-skill",
     graphId: "graph-1",
+    parentRunId: "run-parent",
     unitId: "unit-1",
     role: "worker",
     loop: "implement",
@@ -168,7 +170,7 @@ function repositorySkillRequest() {
     timeoutMs: 30_000,
     transitionContext: "Implement the unit.",
     allowedMcpServers: [],
-    credentialScopes: ["model.invoke", "repo.read", "repo.write"],
+    credentialScopes: ["model.invoke", "repo.read"],
     receiptSchema: "openthrottle.receipt/v1",
     repositorySkill,
   };
@@ -226,7 +228,7 @@ function standardReceipt(loopRequest, overrides = {}) {
       graph_digest: "a".repeat(64),
       unit_id: loopRequest.unitId,
       attempt_id: loopRequest.attemptId,
-      parent_run_id: "run-1",
+      parent_run_id: loopRequest.parentRunId ?? "run-1",
       action_attempt_id: "action-1",
       generation: 1,
       native_session_id: loopRequest.nativeSessionId,
@@ -259,9 +261,70 @@ describe("loop action request validation", () => {
     const valid = request();
     expect(validateLoopRequest(valid)).toMatchObject({
       actionId: "action-1",
+      parentRunId: "run-parent",
       worktree: { id: "unit-1" },
     });
     expect(() => validateLoopRequest({ ...valid, skill: "ce-code-review" })).toThrow(/stale/);
+  });
+
+  it("keeps loop-action@2 backward-compatible when parentRunId is absent", () => {
+    const { parentRunId: _parentRunId, requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...legacyWithoutFence } = request();
+    const legacy = { ...legacyWithoutFence, ...createLoopRequestHash(legacyWithoutFence) };
+
+    expect(validateLoopRequest(legacy)).toMatchObject({
+      actionId: "action-1",
+      worktree: { id: "unit-1" },
+    });
+    expect(validateLoopRequest(legacy)).not.toHaveProperty("parentRunId");
+  });
+
+  it("accepts graph-declared producer skill fences separately from adapter invocation", () => {
+    const valid = request({ expectedProducerSkill: "builtin://ce/implement@1" });
+    const producer = {
+      ...standardReceipt(valid).producer,
+      skill: "builtin://ce/implement@1",
+    };
+    const receipt = standardReceipt(valid, { producer });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent: () => ({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: JSON.stringify(receipt),
+        stderr: "",
+        nativeSessionId: "thread-1",
+      }),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(JSON.parse(result.receipt).producer.skill).toBe("builtin://ce/implement@1");
+  });
+
+  it("rejects receipts that do not match the sealed expected producer skill", () => {
+    const valid = request({ expectedProducerSkill: "builtin://ce/implement@1" });
+    const receipt = standardReceipt(valid);
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent: () => ({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: JSON.stringify(receipt),
+        stderr: "",
+        nativeSessionId: "thread-1",
+      }),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result).toMatchObject({
+      outcome: "failure",
+      subject: expect.any(String),
+    });
+    expect(result.receipt).toContain("loop receipt producer skill mismatch");
   });
 
   it("rejects absolute worktree paths and writes action-attempt scoped result paths", () => {
@@ -270,6 +333,7 @@ describe("loop action request validation", () => {
       actionId: "action-2",
       attemptId: "attempt-2",
       graphId: "graph-1",
+      parentRunId: "run-parent",
       unitId: "unit-1",
       role: "worker",
       loop: "implement",
@@ -356,6 +420,229 @@ describe("loop action request validation", () => {
     expect(loopPrompt(valid)).not.toContain("$ce-work");
   });
 
+  it("renders expected producers in standard receipt shape", () => {
+    const valid = validateLoopRequest(request({
+      expectedProducer: {
+        workerId: "worker-1",
+        skill: "builtin://implement-unit@1",
+        capabilityDigest: "c".repeat(64),
+        skillPackageDigest: null,
+        assurance: "semantic_attested",
+      },
+    }));
+
+    expect(loopPrompt(valid)).toContain('"worker_id":"worker-1"');
+    expect(loopPrompt(valid)).toContain('"capability_digest":"cccc');
+    expect(loopPrompt(valid)).toContain('"skill_package_digest":null');
+    expect(loopPrompt(valid)).not.toContain('"workerId"');
+    expect(loopPrompt(valid)).not.toContain('"capabilityDigest"');
+    expect(loopPrompt(valid)).not.toContain('"skillPackageDigest"');
+  });
+
+  it("validates typed prior evidence and downstream context into the sealed prompt contract", () => {
+    const contextPayload = {
+      schema: "openthrottle.downstream-context/v1",
+      from_unit_id: "unit_0",
+      summary: "Use the accepted API shape.",
+    };
+    const receiptRequest = request();
+    const receiptFence = standardReceipt(receiptRequest).fence;
+    const priorReceipt = (role, actionAttemptId) => {
+      const receipt = canonicalJson(standardReceipt(receiptRequest, {
+        fence: {
+          ...receiptFence,
+          action_attempt_id: actionAttemptId,
+        },
+      }));
+      return { role, actionAttemptId, receiptHash: digest(receipt), receipt };
+    };
+    const withoutFence = {
+      ...leadRequest(),
+      transitionContext: "Review the current candidate.",
+      priorEvidence: {
+        schema: "openthrottle.loop-prior-evidence/v1",
+        role: "lead",
+        receipts: [
+          priorReceipt("completion", "implement-1"),
+          priorReceipt("candidate", "candidate-1"),
+          priorReceipt("command", "command-1"),
+        ],
+      },
+      downstreamContext: [{
+        fromUnitId: "unit_0",
+        payloadHash: digest(canonicalJson(contextPayload)),
+        payload: contextPayload,
+      }],
+    };
+    const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...unfenced } = withoutFence;
+    const valid = validateLoopRequest({ ...unfenced, ...createLoopRequestHash(unfenced) });
+    const prompt = loopPrompt(valid);
+
+    expect(valid.priorEvidence.receipts).toHaveLength(3);
+    expect(valid.downstreamContext).toHaveLength(1);
+    expect(prompt).toContain("## Prior Evidence");
+    expect(prompt).toContain('"actionAttemptId":"candidate-1"');
+    expect(prompt).toContain('"receipt":"');
+    expect(prompt).toContain("## Downstream Context");
+    expect(prompt).toContain("Use the accepted API shape.");
+    expect(prompt).toContain('"downstream_context_hash"');
+
+    const stale = { ...valid, downstreamContext: [] };
+    expect(() => validateLoopRequest(stale)).toThrow(/stale/);
+
+    const tampered = {
+      ...withoutFence,
+      priorEvidence: {
+        ...withoutFence.priorEvidence,
+        receipts: [{
+          ...withoutFence.priorEvidence.receipts[0],
+          receipt: canonicalJson({ ...JSON.parse(withoutFence.priorEvidence.receipts[0].receipt), evidence: ["tampered"] }),
+        }],
+      },
+    };
+    const { requestHash: _tamperedHash, idempotencyKey: _tamperedKey, ...tamperedUnfenced } = tampered;
+    expect(() => validateLoopRequest({ ...tamperedUnfenced, ...createLoopRequestHash(tamperedUnfenced) }))
+      .toThrow(/receiptHash does not match receipt/);
+  });
+
+  it("validates triggering final-review evidence for final repair", () => {
+    const finalRepair = request({
+      unitId: null,
+      loop: "repair",
+      skill: "final-repair",
+      nativeSessionId: "native-final-repair-1",
+      contextPolicy: "resume_required",
+    });
+    const semanticReview = canonicalJson(standardReceipt(finalRepair, {
+      type: "semantic_review",
+      result: "semantic_repair_required",
+      subject: {
+        base: "1".repeat(40),
+        pre: "1".repeat(40),
+        post: computeWorkspaceTreeOid(loopWorktreeDirectory(finalRepair)),
+      },
+      fence: {
+        ...standardReceipt(finalRepair).fence,
+        unit_id: "__final__",
+        action_attempt_id: "final-review-1",
+      },
+      payload: {
+        summary: "Repair required.",
+        findings: [{ severity: "P1", message: "Fix the final review finding." }],
+      },
+    }));
+    const withoutFence = {
+      ...finalRepair,
+      priorEvidence: {
+        schema: "openthrottle.loop-prior-evidence/v1",
+        role: "final_repair",
+        receipts: [{
+          role: "final_review",
+          actionAttemptId: "final-review-1",
+          receiptHash: digest(semanticReview),
+          receipt: semanticReview,
+        }],
+      },
+    };
+    const { requestHash: _hash, idempotencyKey: _key, ...unfenced } = withoutFence;
+    const valid = validateLoopRequest({ ...unfenced, ...createLoopRequestHash(unfenced) });
+
+    expect(valid.priorEvidence.role).toBe("final_repair");
+    expect(loopPrompt(valid)).toContain("Fix the final review finding.");
+
+    const wrongReceipt = canonicalJson(standardReceipt(finalRepair, {
+      fence: {
+        ...standardReceipt(finalRepair).fence,
+        unit_id: "__final__",
+        action_attempt_id: "final-review-1",
+      },
+    }));
+    const malformed = {
+      ...unfenced,
+      priorEvidence: {
+        ...unfenced.priorEvidence,
+        receipts: [{ ...unfenced.priorEvidence.receipts[0], receiptHash: digest(wrongReceipt), receipt: wrongReceipt }],
+      },
+    };
+    expect(() => validateLoopRequest({ ...malformed, ...createLoopRequestHash(malformed) }))
+      .toThrow(/triggering receipt must be semantic_review/);
+
+    const wrongAction = {
+      ...unfenced,
+      unitId: "unit-1",
+      loop: "implement",
+      skill: "implement-unit",
+    };
+    expect(() => validateLoopRequest({ ...wrongAction, ...createLoopRequestHash(wrongAction) }))
+      .toThrow(/final repair prior evidence is only valid for final-repair loops/);
+  });
+
+  it("rejects malformed typed loop context before agent invocation", () => {
+    const receipt = canonicalJson(standardReceipt(request()));
+    const malformedPrior = {
+      ...leadRequest(),
+      priorEvidence: {
+        schema: "openthrottle.loop-prior-evidence/v1",
+        role: "lead",
+        receipts: [{ role: "candidate", actionAttemptId: "candidate-1", receiptHash: digest(receipt), receipt }],
+      },
+    };
+    const { requestHash: _priorHash, idempotencyKey: _priorKey, ...priorUnfenced } = malformedPrior;
+    expect(() => validateLoopRequest({ ...priorUnfenced, ...createLoopRequestHash(priorUnfenced) }))
+      .toThrow(/missing completion/);
+
+    const payload = {
+      schema: "openthrottle.downstream-context/v1",
+      from_unit_id: "unit_0",
+      summary: "bad hash",
+    };
+    const badContext = {
+      ...request(),
+      downstreamContext: [{
+        fromUnitId: "unit_0",
+        payloadHash: "0".repeat(64),
+        payload,
+      }],
+    };
+    const { requestHash: _contextHash, idempotencyKey: _contextKey, ...contextUnfenced } = badContext;
+    expect(() => validateLoopRequest({ ...contextUnfenced, ...createLoopRequestHash(contextUnfenced) }))
+      .toThrow(/payloadHash does not match/);
+
+    const oversized = {
+      ...request(),
+      downstreamContext: Array.from({ length: 33 }, (_, index) => {
+        const entryPayload = {
+          schema: "openthrottle.downstream-context/v1",
+          from_unit_id: `unit_${index}`,
+          summary: "x",
+        };
+        return {
+          fromUnitId: `unit_${index}`,
+          payloadHash: digest(canonicalJson(entryPayload)),
+          payload: entryPayload,
+        };
+      }),
+    };
+    const { requestHash: _oversizedHash, idempotencyKey: _oversizedKey, ...oversizedUnfenced } = oversized;
+    expect(() => validateLoopRequest({ ...oversizedUnfenced, ...createLoopRequestHash(oversizedUnfenced) }))
+      .toThrow(/downstreamContext must be a bounded array/);
+  });
+
+  it("validates model as a hash-bound loop request field", () => {
+    const valid = validateLoopRequest(request({ model: "gpt-5.1-code" }));
+    expect(valid.model).toBe("gpt-5.1-code");
+
+    const malformed = request({ model: "bad model with spaces" });
+    expect(() => validateLoopRequest(malformed)).toThrow(/model is invalid/);
+
+    const oversized = request({ model: "m".repeat(241) });
+    expect(() => validateLoopRequest(oversized)).toThrow(/model is invalid/);
+
+    const stale = request({ model: "gpt-5.1-code" });
+    delete stale.model;
+    expect(() => validateLoopRequest(stale)).toThrow(/stale/);
+  });
+
   it("validates repository skill packages as sealed loop input", () => {
     const valid = validateLoopRequest(repositorySkillRequest());
     expect(valid.skill).toBe("implement_unit");
@@ -406,7 +693,7 @@ describe("loop action request validation", () => {
     })).toThrow(/repositorySkill\.reference is invalid/);
   });
 
-  it("passes native session IDs to every resumable engine adapter", () => {
+  it("passes native session IDs to supported resumable engine adapters, always over stdin", () => {
     for (const agent of ["claude", "codex"]) {
       const valid = validateLoopRequest(request({
         agent,
@@ -416,16 +703,30 @@ describe("loop action request validation", () => {
       const built = loopAgentCommand({ request: valid, invocation: resolveLoopInvocation(valid) });
       expect(built.args).toContain(agent === "claude" ? "--resume" : "resume");
       expect(built.args).toContain("native-1");
-      if (agent === "codex") {
-        expect(built.args.at(-1)).toBe(loopPrompt(valid));
-        expect(built.input).toBeUndefined();
-      }
+      // The prompt never rides argv (Linux's MAX_ARG_STRLEN per-argument
+      // ceiling and /proc/<pid>/cmdline visibility) for either engine.
+      expect(built.args).not.toContain(loopPrompt(valid));
+      if (agent === "codex") expect(built.args.at(-1)).toBe("-");
+      expect(built.input).toBe(loopPrompt(valid));
     }
   });
 
-  it("rejects opencode loop actions until their session-store contract lands", () => {
-    expect(() => validateLoopRequest(request({ agent: "opencode" })))
-      .toThrow(/opencode loop actions are not supported/);
+  it("passes sealed models to each engine adapter and leaves omitted models on provider defaults", () => {
+    const claude = validateLoopRequest(request({ agent: "claude", model: "claude-opus-4-1" }));
+    const codex = validateLoopRequest(request({ agent: "codex", model: "gpt-5.1-code" }));
+    const defaultCodex = validateLoopRequest(request({ agent: "codex" }));
+
+    expect(loopAgentCommand({ request: claude, invocation: resolveLoopInvocation(claude) }).args)
+      .toEqual(expect.arrayContaining(["--model", "claude-opus-4-1"]));
+    expect(loopAgentCommand({ request: codex, invocation: resolveLoopInvocation(codex) }).args)
+      .toEqual(expect.arrayContaining(["-m", "gpt-5.1-code"]));
+    expect(loopAgentCommand({ request: defaultCodex, invocation: resolveLoopInvocation(defaultCodex) }).args)
+      .not.toContain("-m");
+  });
+
+  it("rejects correctly hashed OpenCode loop requests before launch", () => {
+    expect(() => validateLoopRequest(request({ agent: "opencode", model: "kimi-code/kimi-for-coding" })))
+      .toThrow(/OpenCode loop actions are not supported yet/);
   });
 
   it("rejects a loop request declaring a credential scope outside the closed logical set", () => {
@@ -433,21 +734,21 @@ describe("loop action request validation", () => {
       .toThrow(/credential scope daytona\.admin is not a recognized logical credential/);
   });
 
-  it("rejects lead loop requests carrying write credentials while preserving worker writes", () => {
+  it("rejects structured loop requests carrying write credentials", () => {
     expect(() => validateLoopRequest(leadRequest({
       credentialScopes: ["model.invoke", "repo.read", "repo.write"],
-    }))).toThrow(/lead loop cannot request repo\.write/);
+    }))).toThrow(/structured loop actions cannot request repo\.write/);
 
     expect(() => validateLoopRequest(request({
       role: "worker",
       loop: "implement",
       credentialScopes: ["model.invoke", "repo.read", "repo.write"],
-    }))).not.toThrow();
+    }))).toThrow(/structured loop actions cannot request repo\.write/);
   });
 
   it("accepts every closed logical credential scope, including mcp", () => {
     expect(() => validateLoopRequest(request({
-      credentialScopes: ["mcp", "model.invoke", "provider.read", "repo.read", "repo.write"],
+      credentialScopes: ["mcp", "model.invoke", "provider.read", "repo.read"],
     }))).not.toThrow();
   });
 
@@ -512,6 +813,157 @@ describe("loop action request validation", () => {
     expect(built.input).toBe(loopPrompt(valid));
   });
 
+  describe("launch shapes above Linux's per-argument prompt ceiling", () => {
+    // MAX_ARG_STRLEN on Linux is 131,072 bytes; an admitted sealed
+    // transitionContext can reach up to 262,144 bytes, well above it.
+    const LINUX_MAX_ARG_STRLEN = 131_072;
+    const hugeTransitionContext = "x".repeat(LINUX_MAX_ARG_STRLEN + 10_000);
+
+    function launchShapes() {
+      return [
+        { label: "Claude fresh", agent: "claude", nativeSessionId: null, contextPolicy: "prefer_resume" },
+        { label: "Claude resume", agent: "claude", nativeSessionId: "native-claude-1", contextPolicy: "resume_required" },
+        { label: "Codex fresh", agent: "codex", nativeSessionId: null, contextPolicy: "prefer_resume" },
+        { label: "Codex resume", agent: "codex", nativeSessionId: "native-codex-1", contextPolicy: "resume_required" },
+      ];
+    }
+
+    for (const shape of launchShapes()) {
+      it(`keeps every argv element under the Linux ceiling and carries the full prompt over stdin for ${shape.label}`, () => {
+        const valid = validateLoopRequest(request({
+          agent: shape.agent,
+          nativeSessionId: shape.nativeSessionId,
+          contextPolicy: shape.contextPolicy,
+          transitionContext: hugeTransitionContext,
+        }));
+        const prompt = loopPrompt(valid);
+        expect(Buffer.byteLength(prompt, "utf8")).toBeGreaterThan(LINUX_MAX_ARG_STRLEN);
+
+        const built = loopAgentCommand({ request: valid, invocation: resolveLoopInvocation(valid) });
+        for (const arg of built.args) {
+          expect(Buffer.byteLength(arg, "utf8")).toBeLessThan(LINUX_MAX_ARG_STRLEN);
+        }
+        expect(built.args.join("\n")).not.toContain(prompt);
+        expect(built.input).toBe(prompt);
+      });
+    }
+
+    for (const shape of launchShapes()) {
+      it(`launches through gosu with no oversized argv element and cleans up correctly for ${shape.label}`, () => {
+        const valid = validateLoopRequest(request({
+          agent: shape.agent,
+          nativeSessionId: shape.nativeSessionId,
+          contextPolicy: shape.contextPolicy,
+          transitionContext: hugeTransitionContext,
+        }));
+        const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+        const integrationRepoDir = mkdtempSync(join(tmpdir(), "ot-loop-integration-"));
+        directories.push(actionRoot, integrationRepoDir);
+        process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+        if (shape.nativeSessionId) {
+          const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
+          directories.push(sessionRoot);
+          process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sessionRoot;
+          sealSessionFixture({ agent: shape.agent, nativeSessionId: shape.nativeSessionId, sourceRoot: sessionRoot });
+        }
+        const events = [];
+        let capturedArgs;
+        let capturedOptions;
+
+        const result = runLoopAgentInPreparedRepository({
+          request: valid,
+          invocation: resolveLoopInvocation(valid),
+          integrationRepoDir,
+          processFence: (execute) => execute(),
+          lockIntegration: (path) => {
+            events.push(`lock-integration:${path}`);
+            return true;
+          },
+          lockPersistentProfiles: () => {
+            events.push("lock-persistent-profiles");
+            return [];
+          },
+          restorePersistentProfiles: () => {
+            events.push("restore-persistent-profiles");
+          },
+          runProcess: (command, args, options) => {
+            expect(command).toBe("gosu");
+            // For Codex, the same runProcess is also used for the
+            // post-launch action-scoped auth-snapshot read (see
+            // readCodexAuthSnapshot); that call carries no `input`, so the
+            // main agent launch call is the one to identify by it.
+            if ("input" in options) {
+              capturedArgs = args;
+              capturedOptions = options;
+            }
+            return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+          },
+        });
+
+        expect(result.status).toBe(0);
+        for (const arg of capturedArgs) {
+          expect(Buffer.byteLength(arg, "utf8")).toBeLessThan(LINUX_MAX_ARG_STRLEN);
+        }
+        expect(Buffer.byteLength(capturedOptions.input, "utf8")).toBeGreaterThan(LINUX_MAX_ARG_STRLEN);
+        expect(events).toEqual([
+          `lock-integration:${integrationRepoDir}`,
+          "lock-persistent-profiles",
+          `lock-integration:${integrationRepoDir}`,
+          "restore-persistent-profiles",
+        ]);
+      });
+
+      it(`releases locks and cleans up when the oversized-prompt launch fails for ${shape.label}`, () => {
+        const valid = validateLoopRequest(request({
+          agent: shape.agent,
+          nativeSessionId: shape.nativeSessionId,
+          contextPolicy: shape.contextPolicy,
+          transitionContext: hugeTransitionContext,
+        }));
+        const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+        directories.push(actionRoot);
+        process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+        if (shape.nativeSessionId) {
+          const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
+          directories.push(sessionRoot);
+          process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sessionRoot;
+          sealSessionFixture({ agent: shape.agent, nativeSessionId: shape.nativeSessionId, sourceRoot: sessionRoot });
+        }
+        const events = [];
+
+        expect(() => runLoopAgentInPreparedRepository({
+          request: valid,
+          invocation: resolveLoopInvocation(valid),
+          integrationRepoDir: "/tmp/integration",
+          lockIntegration: () => {
+            events.push("lock-integration");
+            return true;
+          },
+          lockPersistentProfiles: () => {
+            events.push("lock-persistent-profiles");
+            return [];
+          },
+          restorePersistentProfiles: () => {
+            events.push("restore-persistent-profiles");
+          },
+          processFence: (execute) => execute(),
+          runProcess: () => {
+            events.push("run");
+            throw new Error("agent launch failed");
+          },
+        })).toThrow(/agent launch failed/);
+
+        expect(events).toEqual([
+          "lock-integration",
+          "lock-persistent-profiles",
+          "run",
+          "lock-integration",
+          "restore-persistent-profiles",
+        ]);
+      });
+    }
+  });
+
   it("keeps the integration checkout locked around worker execution", () => {
     const valid = validateLoopRequest(request());
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
@@ -541,6 +993,14 @@ describe("loop action request validation", () => {
       },
       runProcess: (command, args, options) => {
         events.push(`run:${command}:${options.cwd}`);
+        if (args[1] === "cat") {
+          // The post-launch action-scoped Codex auth-snapshot read (see
+          // readCodexAuthSnapshot): a distinct, narrower gosu call than the
+          // main agent launch below, so it is asserted separately.
+          expect(command).toBe("gosu");
+          expect(args[0]).toBe("agent");
+          return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+        }
         const actionDirectory = join(actionRoot, valid.attemptId, valid.actionId);
         expect(statSync(actionRoot).mode & 0o777).toBe(0o711);
         expect(statSync(join(actionRoot, valid.attemptId)).mode & 0o777).toBe(0o711);
@@ -571,6 +1031,10 @@ describe("loop action request validation", () => {
       "lock-persistent-profiles",
       "process-fence",
       `run:gosu:${loopWorktreeDirectory(valid)}`,
+      // The default request agent is Codex, so the action-scoped auth
+      // snapshot read (readCodexAuthSnapshot) runs a second, distinct gosu
+      // call after launch and before cleanup; it passes no cwd.
+      "run:gosu:undefined",
       `lock-integration:${integrationRepoDir}`,
       "restore-persistent-profiles:/home/agent/.codex",
     ]);
@@ -580,7 +1044,7 @@ describe("loop action request validation", () => {
     const valid = validateLoopRequest(request({
       agent: "claude",
       allowedMcpServers: [],
-      credentialScopes: ["model.invoke", "repo.read", "repo.write"],
+      credentialScopes: ["model.invoke", "repo.read"],
     }));
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
     const integrationRepoDir = mkdtempSync(join(tmpdir(), "ot-loop-integration-"));
@@ -650,7 +1114,7 @@ describe("loop action request validation", () => {
     const valid = validateLoopRequest(request({
       agent: "claude",
       allowedMcpServers: ["github"],
-      credentialScopes: ["mcp", "model.invoke", "repo.read", "repo.write"],
+      credentialScopes: ["mcp", "model.invoke", "repo.read"],
     }));
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
     const integrationRepoDir = mkdtempSync(join(tmpdir(), "ot-loop-integration-"));
@@ -1864,6 +2328,80 @@ describe("executeLoopAction", () => {
     expect(lockWorkerWorktree).toHaveBeenCalledWith(expect.objectContaining({ worktree: { id: "unit-1" } }));
     expect(lockActionDirectory).toHaveBeenCalledWith(expect.objectContaining({ actionId: "action-1" }));
     expect(restoreIntegration).toHaveBeenCalledWith("/tmp/integration-current");
+  });
+
+  it("uses the standard receipt subject for read-only lead loop results", () => {
+    const integrationRepoDir = repository();
+    writeFileSync(join(integrationRepoDir, "candidate.txt"), "candidate\n");
+    execFileSync("git", ["add", "candidate.txt"], { cwd: integrationRepoDir });
+    execFileSync("git", ["commit", "-qm", "candidate"], { cwd: integrationRepoDir });
+    const candidateSubject = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: integrationRepoDir,
+      encoding: "utf8",
+    }).trim();
+    const valid = validateLoopRequest(leadRequest({ candidateSubject, skill: "accept-unit" }));
+    const receipt = {
+      schema: "openthrottle.receipt/v1",
+      type: "unit_decision",
+      assurance: "semantic_attested",
+      result: "accept",
+      producer: {
+        worker_id: "worker-1",
+        skill: "builtin://accept-unit@1",
+        capability_digest: "c".repeat(64),
+        skill_package_digest: null,
+      },
+      subject: {
+        base: candidateSubject,
+        pre: candidateSubject,
+        post: candidateSubject,
+      },
+      fence: {
+        pipeline_instance_id: "instance-1",
+        graph_digest: "a".repeat(64),
+        unit_id: valid.unitId,
+        attempt_id: valid.attemptId,
+        parent_run_id: valid.parentRunId ?? "run-1",
+        action_attempt_id: valid.actionId,
+        generation: 1,
+        native_session_id: valid.nativeSessionId,
+        request_hash: valid.requestHash,
+      },
+      evidence: ["accepted exact candidate"],
+      payload: {
+        rationale: "Candidate matches the unit.",
+        context_updates: [],
+        accepted_subject: candidateSubject,
+      },
+      issued_at: "2026-07-29T00:00:00.000Z",
+    };
+
+    const result = executeLoopAction({
+      request: valid,
+      integrationRepoDir,
+      runLoopAgent: () => ({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: canonicalJson(receipt),
+        stderr: "",
+        nativeSessionId: null,
+        integrationRepoDir,
+      }),
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result).toMatchObject({
+      outcome: "success",
+      subject: candidateSubject,
+    });
+    expect(JSON.parse(result.receipt)).toMatchObject({
+      type: "unit_decision",
+      result: "accept",
+    });
   });
 
   it("redacts a materialized credential from the failure receipt even when it never touched this process's own env", () => {

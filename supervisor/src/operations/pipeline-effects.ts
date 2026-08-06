@@ -1,6 +1,8 @@
 import type { Ticket, SupervisorStore } from "../persistence/store.js";
-import { canonicalJson } from "../pipeline/manifest.js";
+import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
+import { canonicalJson, stageById } from "../pipeline/manifest.js";
 import { digestNormalized } from "../pipeline/manifest.js";
+import { FOR_EACH_UNIT_CAPABILITY } from "../pipeline/capability-contracts.js";
 import { coordinatePipelineEvent } from "../pipeline/coordinator.js";
 import type {
   PipelineEffectIntent,
@@ -12,6 +14,7 @@ import type { StageRequestEnvelope } from "../pipeline/stage-request.js";
 import type { RuntimeResource, SandboxAutostopRuntime, SandboxRuntime } from "../runtime/contracts.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import { terminateAndSettleActor } from "./actor-settlement.js";
+import { createStructuredChildRuntime } from "./structured-child-runtime.js";
 
 const EFFECT_LEASE_MS = 60_000;
 const RETRY_BASE_MS = 5_000;
@@ -58,11 +61,15 @@ export interface PipelineEffectProcessor {
 }
 
 interface PipelineEffectProcessorDeps {
-  store: PipelineStore;
+  store: PipelineStore & ExecutionUnitStore;
   tickets: SupervisorStore;
   runtime: SandboxRuntime & SandboxAutostopRuntime;
   taskTimeoutSeconds: number;
   now?: () => Date;
+  // Persists a Codex OAuth blob rotated inside one structured child action's
+  // own scoped CODEX_HOME. Supplied by the caller (see index.ts) rather than
+  // imported here: `operations` may not depend on `providers` directly.
+  captureCodexAuth?: (blob: string) => void;
 }
 
 interface StopEffectControl {
@@ -185,6 +192,37 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     }
   };
 
+  const bindCompositeParentRun = (instance: PipelineInstance, request: StageRequestEnvelope): void => {
+    assertActiveAttempt(instance, request);
+    const ticket = deps.tickets.getByIssueId(instance.linear_issue_id);
+    if (!ticket || ticket.linear_session_id !== instance.linear_session_id) {
+      throw new Error(`pipeline instance ${instance.id} has no current ticket binding`);
+    }
+    if (ticket.run_id && ticket.run_id !== request.runId) {
+      throw new Error(`ticket ${ticket.linear_issue_identifier} already has active actor ${ticket.run_id}`);
+    }
+    if (!ticket.run_id) {
+      const started = deps.tickets.beginRun({
+        issueId: instance.linear_issue_id,
+        runId: request.runId,
+        taskType: instance.task_type,
+        tokenHash: request.requestHash,
+        expiresAt: new Date(now().getTime() + deps.taskTimeoutSeconds * 1_000).toISOString(),
+      });
+      if (!started) throw new Error(`pipeline composite stage ${request.attemptId} could not acquire the ticket actor`);
+    }
+    deps.store.bindStageRun(request.attemptId, request.runId);
+    deps.store.markStageDispatched(request.attemptId);
+  };
+
+  const structuredChildren = createStructuredChildRuntime({
+    store: deps.store,
+    runtime: deps.runtime,
+    taskTimeoutSeconds: deps.taskTimeoutSeconds,
+    now,
+    captureCodexAuth: deps.captureCodexAuth,
+  });
+
   const resourceFor = async (instance: PipelineInstance): Promise<RuntimeResource> => {
     const existing = deps.store.getRuntimeResource(instance.id);
     if (existing) {
@@ -297,6 +335,21 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     const request = effect.kind === "dispatch_stage"
       ? parseRequest(effect, deps.store)
       : parseProvisionRequest(effect, deps.store);
+    if (request.capability === FOR_EACH_UNIT_CAPABILITY) {
+      if (request.pipelineInstanceId !== instance.id || request.generation !== instance.generation) {
+        throw new Error(`pipeline composite request ${request.attemptId} has a stale instance fence`);
+      }
+      await deps.runtime.materializeCredentials(resource, request.credentialScopes);
+      bindCompositeParentRun(instance, request);
+      await deps.runtime.prepareCompositeWorkspace(resource, request);
+      structuredChildren.seedCompositeGraph(instance, request);
+      await structuredChildren.drainCompositeChildren(resource, instance, request.attemptId);
+      acknowledgeEffect(effect, eventId, {
+        providerResourceId: resource.providerResourceId,
+        compositeGraphId: deps.store.getGraphForAttempt(request.attemptId)?.id ?? null,
+      });
+      return;
+    }
     const requestedAttempt = deps.store.getAttempt(request.attemptId);
     if (effect.kind === "provision" && requestedAttempt &&
         ["completed", "canceled", "superseded", "failed"].includes(requestedAttempt.status)) {
@@ -523,6 +576,23 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     });
   };
 
+  const drainActiveCompositeGraphs = async (): Promise<void> => {
+    const tickets = deps.tickets.listRunning();
+    for (const ticket of tickets) {
+      const instance = deps.store.getInstanceForSession(ticket.linear_session_id);
+      if (!instance || ticket.run_id === null) continue;
+      const attempt = deps.store.getActiveAttempt(instance.id);
+      if (!attempt || attempt.run_id !== ticket.run_id || attempt.status === "completed") continue;
+      const stage = stageById(instance.normalized_manifest, instance.active_stage_id);
+      if (!stage || stage.executor.capability !== FOR_EACH_UNIT_CAPABILITY) continue;
+      const binding = runtimeBindingFor(instance);
+      if (!binding.resource || binding.status !== "active") continue;
+      if (!structuredChildren.compositeGraphNeedsDrain(attempt.id)) continue;
+      await deps.runtime.setActive(binding.resource.providerResourceId);
+      await structuredChildren.drainCompositeChildren(binding.resource, instance, attempt.id);
+    }
+  };
+
   const enqueueCapacityWaitActivity = (effect: PipelineEffectIntent, message: string): void => {
     try {
       const id = `capacity-wait:${effect.id}`;
@@ -636,6 +706,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
           new Date(current.getTime() + EFFECT_LEASE_MS).toISOString()
         );
         await Promise.all(effects.map(processClaimed));
+        await drainActiveCompositeGraphs();
       } finally {
         draining = false;
       }

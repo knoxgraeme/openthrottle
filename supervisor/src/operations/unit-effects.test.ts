@@ -18,6 +18,7 @@ function action(overrides: Partial<ExecutionWorkAttempt> = {}): ExecutionWorkAtt
     idempotency_key: "unit-action:attempt-parent:a:1",
     request_hash: null,
     result_hash: null,
+    terminal_result_outcome: null,
     receipt: null,
     receipt_hash: null,
     native_session_id: null,
@@ -40,6 +41,8 @@ function storeFor(leased: ExecutionWorkAttempt): ExecutionUnitStore {
     markActionDispatching: vi.fn(),
     markActionDispatched: vi.fn(),
     completeUnitAction: vi.fn(),
+    failUnitAction: vi.fn(),
+    stopRetryableUnitAction: vi.fn(),
     healExpiredCurrentChildAction: vi.fn(),
   } as unknown as ExecutionUnitStore;
 }
@@ -73,7 +76,7 @@ describe("unit effect processor", () => {
     const leased = action();
     const store = storeFor(leased);
     const runtime: UnitEffectRuntime = {
-      collectUnitAction: vi.fn(async () => ({ resultHash: "result-hash", outputSubject: "abc123" })),
+      collectUnitAction: vi.fn(async () => ({ resultHash: "result-hash", outputSubject: "abc123", nativeSessionId: "native-1" })),
       dispatchUnitAction: vi.fn(),
     };
 
@@ -90,7 +93,72 @@ describe("unit effect processor", () => {
       actionId: "action-1",
       resultHash: "result-hash",
       outputSubject: "abc123",
+      nativeSessionId: "native-1",
     });
+  });
+
+  it("persists collected terminal child failures without duplicate dispatch", async () => {
+    const leased = action({ status: "running", request_hash: "request-hash" });
+    const store = storeFor(leased);
+    const runtime: UnitEffectRuntime = {
+      collectUnitAction: vi.fn(async () => ({
+        terminal: true as const,
+        outcome: "failure" as const,
+        resultHash: "result-hash",
+        lastError: "child action failed",
+        nativeSessionId: null,
+      })),
+      dispatchUnitAction: vi.fn(),
+    };
+
+    await createUnitEffectProcessor({
+      store,
+      runtime,
+      leaseOwner: "owner",
+      now: () => new Date("2026-07-29T00:00:00.000Z"),
+    }).drain("attempt-parent");
+
+    expect(store.failUnitAction).toHaveBeenCalledWith({
+      actionId: "action-1",
+      resultHash: "result-hash",
+      outcome: "failure",
+      lastError: "child action failed",
+      nativeSessionId: null,
+    });
+    expect(store.completeUnitAction).not.toHaveBeenCalled();
+    expect(runtime.dispatchUnitAction).not.toHaveBeenCalled();
+  });
+
+  it("persists retryable terminal child failures through the graph stop path", async () => {
+    const leased = action({ status: "running", request_hash: "request-hash" });
+    const store = storeFor(leased);
+    const runtime: UnitEffectRuntime = {
+      collectUnitAction: vi.fn(async () => ({
+        terminal: true as const,
+        outcome: "retryable_infrastructure_failure" as const,
+        resultHash: "result-hash",
+        lastError: "sandbox result collection failed",
+        nativeSessionId: null,
+      })),
+      dispatchUnitAction: vi.fn(),
+    };
+
+    await createUnitEffectProcessor({
+      store,
+      runtime,
+      leaseOwner: "owner",
+      now: () => new Date("2026-07-29T00:00:00.000Z"),
+    }).drain("attempt-parent");
+
+    expect(store.stopRetryableUnitAction).toHaveBeenCalledWith({
+      actionId: "action-1",
+      resultHash: "result-hash",
+      lastError: "sandbox result collection failed",
+      nativeSessionId: null,
+    });
+    expect(store.failUnitAction).not.toHaveBeenCalled();
+    expect(store.completeUnitAction).not.toHaveBeenCalled();
+    expect(runtime.dispatchUnitAction).not.toHaveBeenCalled();
   });
 
   it("collects an already-dispatched child action without duplicate dispatch", async () => {
@@ -115,7 +183,7 @@ describe("unit effect processor", () => {
   });
 
   it("reissues a request-less dispatched action with the same idempotency key", async () => {
-    const leased = action({ status: "dispatched" });
+    const leased = action({ status: "dispatched", native_session_id: "native-before-request" });
     const store = storeFor(leased);
     const runtime: UnitEffectRuntime = {
       collectUnitAction: vi.fn(async () => {

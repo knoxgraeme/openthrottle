@@ -287,18 +287,18 @@ describe("unit coordinator", () => {
       created_at: "2026-07-29T00:00:00.000Z",
       updated_at: "2026-07-29T00:00:01.000Z",
     } as PipelineStageAttempt;
+    const finalSubject = "5".repeat(40);
 
     const event = buildAggregateStageEvent({
       id: "aggregate-1",
       manifest,
       instance,
       parentAttempt,
-      subject,
+      subject: finalSubject,
       completedAt: "2026-07-29T00:00:02.000Z",
       units: [
         unit({ unitId: "a", ordinal: 0, status: "completed", terminalLevel: "completed", integrationSubject: subject }),
-        unit({ unitId: "b", ordinal: 1, status: "exited", terminalLevel: "exited", alarm: false }),
-        unit({ unitId: "c", ordinal: 2, status: "failed", terminalLevel: "failed", alarm: true }),
+        unit({ unitId: "b", ordinal: 1, status: "completed", terminalLevel: "completed", integrationSubject: subject }),
       ],
     });
 
@@ -334,7 +334,7 @@ describe("unit coordinator", () => {
       schema: "openthrottle.artifact/stage_result@1",
       evidence: [graphResult!.hash],
       details: { execution_graph_result_hash: graphResult!.hash },
-      repository: { subject },
+      repository: { subject: finalSubject },
     });
     expect(graphPayload).toMatchObject({
       schema: "openthrottle.artifact/execution_graph_result@1",
@@ -349,29 +349,33 @@ describe("unit coordinator", () => {
           },
           {
             id: "b",
-            status: "exited",
-            terminal_level: "exited",
+            status: "completed",
+            terminal_level: "completed",
             alarm: false,
-            integration_subject: null,
-          },
-          {
-            id: "c",
-            status: "failed",
-            terminal_level: "failed",
-            alarm: true,
-            integration_subject: null,
+            integration_subject: subject,
           },
         ],
       },
-      repository: { subject },
+      repository: { subject: finalSubject },
     });
+    expect(() => buildAggregateStageEvent({
+      id: "aggregate-exited",
+      manifest,
+      instance,
+      parentAttempt,
+      subject,
+      units: [
+        unit({ unitId: "a", ordinal: 0, status: "completed", terminalLevel: "completed", integrationSubject: subject }),
+        unit({ unitId: "b", ordinal: 1, status: "exited", terminalLevel: "exited", alarm: false }),
+      ],
+    })).toThrow(/requires every unit/);
     expect(() => buildAggregateStageEvent({
       id: "aggregate-1",
       manifest,
       instance,
       parentAttempt,
       subject: null,
-      units: [unit({ unitId: "a", ordinal: 0, status: "integrated", integrationSubject: subject })],
+      units: [unit({ unitId: "a", ordinal: 0, status: "completed", terminalLevel: "completed", integrationSubject: null })],
     })).toThrow(/requires a gated subject/);
     expect(() => buildAggregateStageEvent({
       id: "aggregate-1",
@@ -379,7 +383,7 @@ describe("unit coordinator", () => {
       instance,
       parentAttempt: { ...parentAttempt, run_id: null, planned_run_id: null },
       subject,
-      units: [unit({ unitId: "a", ordinal: 0, status: "integrated", integrationSubject: subject })],
+      units: [unit({ unitId: "a", ordinal: 0, status: "completed", terminalLevel: "completed", integrationSubject: subject })],
     })).toThrow(/requires a parent run binding/);
   });
 

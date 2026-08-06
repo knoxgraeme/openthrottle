@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import type { PipelineStore } from "../../pipeline/store.js";
+import type { ExecutionUnitStore } from "./unit-store.js";
 import { createCatalogStore } from "./catalog-store.js";
 import { createEffectStore } from "./effect-store.js";
 import { createInstanceStore } from "./instance-store.js";
@@ -9,7 +10,7 @@ import { createStatusStore } from "./status-store.js";
 import { createTransitionStore } from "./transition-store.js";
 import { createExecutionUnitStore } from "./unit-store.js";
 
-export function createPipelineStore(db: Database.Database): PipelineStore {
+export function createPipelineStore(db: Database.Database): PipelineStore & ExecutionUnitStore {
   const now = () => new Date().toISOString();
 
   return {

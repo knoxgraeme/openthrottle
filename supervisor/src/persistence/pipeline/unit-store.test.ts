@@ -550,11 +550,43 @@ describe("execution unit store", () => {
       ...input,
       unitPhases: ["command", "implement", "candidate", "lead", "integrate"],
     })).toThrow(/unitPhaseBindings must match unitPhases/);
+  });
 
-    expect(() => store.createGraph({
-      ...input,
-      commandNames: ["test"],
-    })).toThrow(/unitPhaseBindings command phases must match commandNames/);
+  it("persists per-unit plan command sequences instead of substituting graph command defaults", () => {
+    const store = setup();
+    const subject = "1".repeat(40);
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      commandNames: ["docs-check"],
+      units: [
+        { id: "a", commandNames: ["docs-check"] },
+        { id: "b", commandNames: [] },
+      ],
+      unitPhaseBindings: builtinUnitPhaseBindings(["test", "lint", "build"]),
+    });
+
+    expect(store.listUnits("attempt-parent")).toEqual([
+      expect.objectContaining({ unitId: "a", commandNames: ["docs-check"] }),
+      expect.objectContaining({ unitId: "b", commandNames: [] }),
+    ]);
+
+    const implement = lease(store);
+    store.completeUnitAction({ actionId: implement.id, resultHash: "r1", outputSubject: subject, receipt: receiptJson("unit_completion") });
+    store.completeUnitAction({ actionId: lease(store).id, resultHash: "r2", outputSubject: subject });
+    const unitCommand = lease(store);
+    expect(unitCommand).toMatchObject({ unit_id: "a", action_kind: "command", command_name: "docs-check" });
+    store.completeUnitAction({
+      actionId: unitCommand.id,
+      resultHash: "r3",
+      outputSubject: subject,
+      receipt: receiptJson("command_result", { payload: { command: "docs-check" } }),
+    });
+    expect(lease(store)).toMatchObject({ unit_id: "a", action_kind: "candidate" });
   });
 
   it("leases exactly one active child action at a time", () => {
@@ -1249,6 +1281,161 @@ describe("execution unit store", () => {
     expect(next?.unit_id).toBe("b");
   });
 
+  it("durably fails a collected child action and structurally exits dependents", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b", dependencies: ["a"] }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+
+    const failed = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: "2026-07-29T00:00:00.000Z",
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })!;
+    store.markActionDispatched(failed.id, "request-hash", "native-session");
+
+    expect(store.failUnitAction({
+      actionId: failed.id,
+      resultHash: "result-hash",
+      outcome: "failure",
+      lastError: "child action returned failure",
+      nativeSessionId: "native-session-2",
+    })).toMatchObject({
+      id: failed.id,
+      status: "failed",
+      terminal_result_outcome: "failure",
+      result_hash: "result-hash",
+      native_session_id: "native-session-2",
+      last_error: "child action returned failure",
+    });
+    expect(store.listUnits("attempt-parent")).toEqual([
+      expect.objectContaining({
+        unitId: "a",
+        status: "failed",
+        activeActionId: null,
+        terminalLevel: "failed",
+        alarm: true,
+      }),
+      expect.objectContaining({
+        unitId: "b",
+        status: "exited",
+        activeActionId: null,
+        terminalLevel: "exited",
+        alarm: false,
+      }),
+    ]);
+    expect(store.failUnitAction({
+      actionId: failed.id,
+      resultHash: "result-hash",
+      outcome: "failure",
+      lastError: "child action returned failure",
+      nativeSessionId: "native-session-2",
+    })).toMatchObject({ id: failed.id, status: "failed" });
+    expect(() => store.failUnitAction({
+      actionId: failed.id,
+      resultHash: "different-result",
+      outcome: "failure",
+      lastError: "child action returned failure",
+      nativeSessionId: "native-session-2",
+    })).toThrow(/already terminated with a different result/);
+    expect(() => store.failUnitAction({
+      actionId: failed.id,
+      resultHash: "result-hash",
+      outcome: "needs_human",
+      lastError: "child action returned failure",
+      nativeSessionId: "native-session-2",
+    })).toThrow(/already terminated with a different result/);
+    expect(() => store.stopRetryableUnitAction({
+      actionId: failed.id,
+      resultHash: "result-hash",
+      lastError: "child action returned failure",
+      nativeSessionId: "native-session-2",
+    })).toThrow(/already terminated with a different result/);
+  });
+
+  it("stops the graph from retryable child infrastructure evidence without marking a unit defect", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b", dependencies: ["a"] }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+
+    const retryable = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: "2026-07-29T00:00:00.000Z",
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })!;
+    store.markActionDispatched(retryable.id, "request-hash", "native-session");
+
+    expect(store.stopRetryableUnitAction({
+      actionId: retryable.id,
+      resultHash: "result-hash",
+      lastError: "model credential unavailable",
+      nativeSessionId: "native-session-2",
+    })).toMatchObject({
+      id: retryable.id,
+      status: "dead",
+      terminal_result_outcome: "retryable_infrastructure_failure",
+      result_hash: "result-hash",
+      native_session_id: "native-session-2",
+      last_error: expect.stringContaining("retryable_infrastructure_failure"),
+    });
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({
+      stopped_at: expect.any(String),
+      stop_reason: expect.stringContaining("retryable_infrastructure_failure"),
+    });
+    expect(store.listUnits("attempt-parent")).toEqual([
+      expect.objectContaining({
+        unitId: "a",
+        status: "exited",
+        activeActionId: null,
+        terminalLevel: "exited",
+        alarm: false,
+      }),
+      expect.objectContaining({
+        unitId: "b",
+        status: "exited",
+        activeActionId: null,
+        terminalLevel: "exited",
+        alarm: false,
+      }),
+    ]);
+    expect(store.stopRetryableUnitAction({
+      actionId: retryable.id,
+      resultHash: "result-hash",
+      lastError: "model credential unavailable",
+      nativeSessionId: "native-session-2",
+    })).toMatchObject({ id: retryable.id, status: "dead" });
+    expect(() => store.stopRetryableUnitAction({
+      actionId: retryable.id,
+      resultHash: "result-hash",
+      lastError: "different infrastructure evidence",
+      nativeSessionId: "native-session-2",
+    })).toThrow(/already terminated with a different result/);
+    expect(() => store.failUnitAction({
+      actionId: retryable.id,
+      resultHash: "result-hash",
+      outcome: "failure",
+      lastError: "model credential unavailable",
+      nativeSessionId: "native-session-2",
+    })).toThrow(/already terminated with a different result/);
+  });
+
   it("completes a recovered result through the current action pointer before any heal", () => {
     const store = setup();
     store.createGraph({
@@ -1662,6 +1849,68 @@ describe("execution unit store", () => {
     })).toBe("already_stopped");
   });
 
+  it("advances the graph integration head after each serial integration", () => {
+    const store = setup();
+    const firstSubject = "1".repeat(40);
+    const secondSubject = "2".repeat(40);
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b", dependencies: ["a"] }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+
+    completeUnitToTerminal(store, firstSubject);
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ integration_subject: firstSubject });
+    completeUnitToTerminal(store, secondSubject);
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ integration_subject: secondSubject });
+
+    const finalReview = lease(store);
+    expect(finalReview).toMatchObject({ action_kind: "final_review", unit_id: null });
+    store.completeGatedAction({
+      actionId: finalReview.id,
+      resultHash: "fr-hash",
+      outputSubject: secondSubject,
+      decision: gateDecision({ gateKind: "final_review", outcome: "success", subject: secondSubject }),
+    });
+
+    expect(store.emitAggregateOnce({
+      parentAttemptId: "attempt-parent",
+      artifactHash: "hash-serial",
+      integrationSubject: secondSubject,
+    })).toBe("emitted");
+  });
+
+  it("emits a non-success aggregate for a terminal unintegrated graph without final review", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+    store.settleUnitTerminal({
+      parentAttemptId: "attempt-parent",
+      unitId: "a",
+      reason: "structural_exit",
+    });
+
+    expect(store.emitAggregateOnce({
+      parentAttemptId: "attempt-parent",
+      artifactHash: "hash-unintegrated",
+      integrationSubject: null,
+      requireFinalReview: false,
+    })).toBe("emitted");
+  });
+
   it("records child gate receipts idempotently and rejects conflicting replay", () => {
     const store = setup();
     store.createGraph({
@@ -1714,6 +1963,65 @@ describe("execution unit store", () => {
     ]);
   });
 
+  it("rejects conflicting dispatch and completion replays for the same child action", () => {
+    const store = setup();
+    const subject = "1".repeat(40);
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+
+    const implement = lease(store);
+    store.markActionDispatched(implement.id, "request-hash", "native-session");
+    expect(() => store.markActionDispatched(implement.id, "different-request", "native-session"))
+      .toThrow(/different request/);
+    expect(() => store.markActionDispatched(implement.id, "request-hash", "different-native"))
+      .toThrow(/different native session/);
+
+    const receipt = receiptJson("unit_completion");
+    store.completeUnitAction({
+      actionId: implement.id,
+      resultHash: "result-hash",
+      outputSubject: subject,
+      receipt,
+      nativeSessionId: "native-session",
+    });
+    expect(store.completeUnitAction({
+      actionId: implement.id,
+      resultHash: "result-hash",
+      outputSubject: subject,
+      receipt,
+      nativeSessionId: "native-session",
+    })).toMatchObject({ id: implement.id, status: "completed" });
+    expect(() => store.completeUnitAction({
+      actionId: implement.id,
+      resultHash: "different-result",
+      outputSubject: subject,
+      receipt,
+      nativeSessionId: "native-session",
+    })).toThrow(/different result/);
+    expect(() => store.completeUnitAction({
+      actionId: implement.id,
+      resultHash: "result-hash",
+      outputSubject: "2".repeat(40),
+      receipt,
+      nativeSessionId: "native-session",
+    })).toThrow(/different result/);
+    expect(() => store.completeUnitAction({
+      actionId: implement.id,
+      resultHash: "result-hash",
+      outputSubject: subject,
+      receipt: receiptJson("candidate_evidence"),
+      nativeSessionId: "native-session",
+    })).toThrow(/different result/);
+  });
+
   it("appends downstream context immutably for pending units only", () => {
     const store = setup();
     store.createGraph({
@@ -1757,6 +2065,255 @@ describe("execution unit store", () => {
       fromUnitId: "a",
       records: [{ toUnitId: "a", payload: { summary: "already integrated" } }],
     })).toThrow(/is not pending/);
+  });
+
+  it("enforces cumulative downstream context bounds per destination transactionally", () => {
+    const store = setup();
+    const sourceUnits = Array.from({ length: 33 }, (_, index) => ({ id: `u${index}` }));
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [...sourceUnits, { id: "target", dependencies: sourceUnits.map((unit) => unit.id) }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+    db!.prepare("UPDATE execution_units SET status = 'completed', terminal_level = 'completed', integration_subject = ? WHERE unit_id LIKE 'u%'")
+      .run("1".repeat(40));
+
+    for (let index = 0; index < 32; index += 1) {
+      store.appendDownstreamContext({
+        parentAttemptId: "attempt-parent",
+        fromUnitId: `u${index}`,
+        records: [{
+          toUnitId: "target",
+          payload: {
+            schema: "openthrottle.downstream-context/v1",
+            from_unit_id: `u${index}`,
+            summary: `context ${index}`,
+          },
+        }],
+      });
+    }
+    expect(store.listDownstreamContext("attempt-parent", "target")).toHaveLength(32);
+
+    const replay = store.appendDownstreamContext({
+      parentAttemptId: "attempt-parent",
+      fromUnitId: "u0",
+      records: [{
+        toUnitId: "target",
+        payload: {
+          schema: "openthrottle.downstream-context/v1",
+          from_unit_id: "u0",
+          summary: "context 0",
+        },
+      }],
+    });
+    expect(replay).toHaveLength(1);
+    expect(store.listDownstreamContext("attempt-parent", "target")).toHaveLength(32);
+
+    expect(() => store.appendDownstreamContext({
+      parentAttemptId: "attempt-parent",
+      fromUnitId: "u32",
+      records: [{
+        toUnitId: "target",
+        payload: {
+          schema: "openthrottle.downstream-context/v1",
+          from_unit_id: "u32",
+          summary: "one too many",
+        },
+      }],
+    })).toThrow(/exceeds 32 records/);
+    expect(store.listDownstreamContext("attempt-parent", "target")).toHaveLength(32);
+  });
+
+  it("rolls back downstream context byte overflows without partially persisting records", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b" }, { id: "target", dependencies: ["a", "b"] }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+    db!.prepare("UPDATE execution_units SET status = 'completed', terminal_level = 'completed', integration_subject = ? WHERE unit_id IN ('a', 'b')")
+      .run("1".repeat(40));
+
+    let low = 0;
+    let high = 32_768;
+    let acceptedSummaryLength = 0;
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2);
+      const payload = {
+        schema: "openthrottle.downstream-context/v1",
+        from_unit_id: "a",
+        summary: "x".repeat(mid),
+      };
+      const wire = [{
+        fromUnitId: "a",
+        payloadHash: digestNormalized(canonicalJson(payload)),
+        payload,
+      }];
+      if (Buffer.byteLength(canonicalJson(wire), "utf8") <= 32_768) {
+        acceptedSummaryLength = mid;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+
+    store.appendDownstreamContext({
+      parentAttemptId: "attempt-parent",
+      fromUnitId: "a",
+      records: [{
+        toUnitId: "target",
+        payload: {
+          schema: "openthrottle.downstream-context/v1",
+          from_unit_id: "a",
+          summary: "x".repeat(acceptedSummaryLength),
+        },
+      }],
+    });
+    expect(store.listDownstreamContext("attempt-parent", "target")).toHaveLength(1);
+
+    expect(() => store.appendDownstreamContext({
+      parentAttemptId: "attempt-parent",
+      fromUnitId: "b",
+      records: [{
+        toUnitId: "target",
+        payload: {
+          schema: "openthrottle.downstream-context/v1",
+          from_unit_id: "b",
+          summary: "y",
+        },
+      }],
+    })).toThrow(/exceeds 32768 bytes/);
+    expect(store.listDownstreamContext("attempt-parent", "target")).toHaveLength(1);
+  });
+
+  it("deduplicates identical receipt-authored downstream context before enforcing delivery bounds", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b", dependencies: ["a"] }],
+      unitPhaseBindings: unitPhaseBindings(),
+    });
+    const subject = "1".repeat(40);
+    const duplicateContext = {
+      unit_id: "b",
+      summary: "x".repeat(32_000),
+    };
+
+    const implement = lease(store);
+    store.completeUnitAction({
+      actionId: implement.id,
+      resultHash: "r-implement-duplicate-context",
+      outputSubject: subject,
+      receipt: receiptJson("unit_completion", {
+        payload: { downstream_context: [duplicateContext] },
+      }),
+    });
+    const candidate = lease(store);
+    store.completeUnitAction({
+      actionId: candidate.id,
+      resultHash: "r-candidate-duplicate-context",
+      outputSubject: subject,
+      receipt: receiptJson("candidate_evidence"),
+    });
+    const leadAction = lease(store);
+    store.completeGatedAction({
+      actionId: leadAction.id,
+      resultHash: "r-lead-duplicate-context",
+      outputSubject: subject,
+      receipt: receiptJson("unit_decision", {
+        payload: {
+          decision: "accept",
+          summary: "accepted",
+          context_updates: [duplicateContext],
+        },
+      }),
+      decision: gateDecision({ gateKind: "unit_acceptance", outcome: "success", subject }),
+    });
+    const integrate = lease(store);
+    store.completeGatedAction({
+      actionId: integrate.id,
+      resultHash: "r-integrate-duplicate-context",
+      outputSubject: subject,
+      decision: gateDecision({ gateKind: "integration", outcome: "success", subject }),
+    });
+
+    expect(store.listDownstreamContext("attempt-parent", "b")).toHaveLength(1);
+  });
+
+  it("fails integration transactionally when receipt-authored downstream targets are invalid", () => {
+    for (const [name, target] of [
+      ["unknown", "missing"],
+      ["unrelated", "c"],
+      ["terminal", "b"],
+    ] as const) {
+      const store = setup();
+      store.createGraph({
+        pipelineInstanceId: "instance-1",
+        parentAttemptId: "attempt-parent",
+        parentStageId: "units",
+        parentRunId: "run-parent",
+        graphDigest: "graph-digest",
+        planDigest: "plan-digest",
+        units: [{ id: "a" }, { id: "b", dependencies: ["a"] }, { id: "c" }],
+        unitPhaseBindings: unitPhaseBindings(),
+      });
+      if (name === "terminal") {
+        // Make declared dependent b non-pending before a integrates.
+        db!.prepare("UPDATE execution_units SET status = 'failed', terminal_level = 'failed' WHERE unit_id = 'b'")
+          .run();
+      }
+      const subject = "1".repeat(40);
+      const implement = lease(store);
+      store.completeUnitAction({
+        actionId: implement.id,
+        resultHash: `r-implement-${name}`,
+        outputSubject: subject,
+        receipt: receiptJson("unit_completion", {
+          payload: {
+            downstream_context: [{ unit_id: target, summary: "invalid target" }],
+          },
+        }),
+      });
+      const candidate = lease(store);
+      store.completeUnitAction({ actionId: candidate.id, resultHash: `r-candidate-${name}`, outputSubject: subject, receipt: receiptJson("candidate_evidence") });
+      const leadAction = lease(store);
+      store.completeGatedAction({
+        actionId: leadAction.id,
+        resultHash: `r-lead-${name}`,
+        outputSubject: subject,
+        receipt: receiptJson("unit_decision"),
+        decision: gateDecision({ gateKind: "unit_acceptance", outcome: "success", subject }),
+      });
+      const integrate = lease(store);
+
+      expect(() => store.completeGatedAction({
+        actionId: integrate.id,
+        resultHash: `r-integrate-${name}`,
+        outputSubject: subject,
+        decision: gateDecision({ gateKind: "integration", outcome: "success", subject }),
+      })).toThrow(/downstream context target|unknown downstream context target/);
+
+      expect(store.listDownstreamContext("attempt-parent")).toEqual([]);
+      expect(store.listWorkAttempts("attempt-parent").find((attempt) => attempt.id === integrate.id))
+        .toMatchObject({ status: "leased" });
+      db?.close();
+      db = undefined;
+    }
   });
 
   it("builds a structured publication snapshot from durable child state", () => {
@@ -2094,6 +2651,12 @@ describe("execution unit store", () => {
     // Replaying the exact same decision for the same (already-completed) action must be a no-op.
     store.completeGatedAction({ actionId: lead.id, resultHash: "r4", outputSubject: subject, decision });
     expect(store.listUnits("attempt-parent")[0]).toMatchObject({ repairRounds: 1, currentCycle: 2 });
+    expect(() => store.completeGatedAction({
+      actionId: lead.id,
+      resultHash: "different-result",
+      outputSubject: subject,
+      decision,
+    })).toThrow(/different result/);
 
     // A conflicting replay for the same action is rejected outright.
     expect(() => store.completeGatedAction({
@@ -2211,13 +2774,40 @@ describe("execution unit store", () => {
     const finalRepair = lease(store);
     expect(finalRepair.action_kind).toBe("final_repair");
     store.markActionDispatched(finalRepair.id, "request-hash", "native-session-final-repair-1");
-    store.completeUnitAction({ actionId: finalRepair.id, resultHash: "frp", outputSubject: subject });
-    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ final_phase: "command", final_command_index: 0, final_cycle: 2 });
+    const repairedSubject = "2".repeat(40);
+    const repairedCandidate = "3".repeat(40);
+    const repairedIntegratedSubject = "4".repeat(40);
+    store.completeUnitAction({ actionId: finalRepair.id, resultHash: "frp", outputSubject: repairedSubject });
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ final_phase: "repair", final_cycle: 1 });
+
+    const finalCandidate = lease(store);
+    expect(finalCandidate).toMatchObject({ action_kind: "candidate", unit_id: null, cycle: 1 });
+    store.completeUnitAction({
+      actionId: finalCandidate.id, resultHash: "fcandidate", outputSubject: repairedCandidate,
+      receipt: receiptJson("candidate_evidence"),
+    });
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ final_phase: "repair", final_cycle: 1 });
+
+    const finalIntegrate = lease(store);
+    expect(finalIntegrate).toMatchObject({ action_kind: "integrate", unit_id: null, cycle: 1 });
+    store.completeGatedAction({
+      actionId: finalIntegrate.id,
+      resultHash: "fintegrate",
+      outputSubject: repairedIntegratedSubject,
+      receipt: receiptJson("integration_evidence"),
+      decision: gateDecision({ gateKind: "integration", subject: repairedIntegratedSubject }),
+    });
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({
+      final_phase: "command",
+      final_command_index: 0,
+      final_cycle: 2,
+      integration_subject: repairedIntegratedSubject,
+    });
 
     const finalCommand2 = lease(store);
     expect(finalCommand2).toMatchObject({ action_kind: "final_command", command_name: "test", cycle: 2 });
     store.completeUnitAction({
-      actionId: finalCommand2.id, resultHash: "fc2", outputSubject: subject,
+      actionId: finalCommand2.id, resultHash: "fc2", outputSubject: repairedIntegratedSubject,
       receipt: receiptJson("command_result", { payload: { command: "test" } }),
     });
     const finalReview2 = lease(store);
@@ -2225,15 +2815,37 @@ describe("execution unit store", () => {
     store.completeGatedAction({
       actionId: finalReview2.id,
       resultHash: "fr2",
-      outputSubject: subject,
-      decision: gateDecision({ gateKind: "final_review", outcome: "semantic_repair_required", subject, reason: "unresolved_review_finding" }),
+      outputSubject: repairedIntegratedSubject,
+      decision: gateDecision({
+        gateKind: "final_review",
+        outcome: "semantic_repair_required",
+        subject: repairedIntegratedSubject,
+        reason: "unresolved_review_finding",
+      }),
     });
     expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ final_phase: "repair", final_repair_rounds: 2 });
 
     const finalRepair2 = lease(store);
     expect(finalRepair2.action_kind).toBe("final_repair");
     expect(JSON.parse(finalRepair2.payload)).toMatchObject({ resume_native_session_id: "native-session-final-repair-1" });
-    store.completeUnitAction({ actionId: finalRepair2.id, resultHash: "frp2", outputSubject: subject });
+    store.completeUnitAction({ actionId: finalRepair2.id, resultHash: "frp2", outputSubject: repairedIntegratedSubject });
+
+    const finalCandidate2 = lease(store);
+    expect(finalCandidate2).toMatchObject({ action_kind: "candidate", unit_id: null, cycle: 2 });
+    store.completeUnitAction({
+      actionId: finalCandidate2.id, resultHash: "fcandidate2", outputSubject: repairedIntegratedSubject,
+      receipt: receiptJson("candidate_evidence"),
+    });
+
+    const finalIntegrate2 = lease(store);
+    expect(finalIntegrate2).toMatchObject({ action_kind: "integrate", unit_id: null, cycle: 2 });
+    store.completeGatedAction({
+      actionId: finalIntegrate2.id,
+      resultHash: "fintegrate2",
+      outputSubject: repairedIntegratedSubject,
+      receipt: receiptJson("integration_evidence"),
+      decision: gateDecision({ gateKind: "integration", subject: repairedIntegratedSubject }),
+    });
 
     const finalCommand3 = lease(store);
     expect(finalCommand3).toMatchObject({ action_kind: "final_command", command_name: "test", cycle: 3 });
@@ -2281,6 +2893,12 @@ describe("execution unit store", () => {
     expect(() => store.completeUnitAction({
       actionId: lead.id, resultHash: "r4", outputSubject: subject,
     })).toThrow(/requires a gate decision to complete/);
+    expect(() => store.completeGatedAction({
+      actionId: lead.id,
+      resultHash: "r4",
+      outputSubject: subject,
+      decision: gateDecision({ gateKind: "integration", outcome: "success", subject }),
+    })).toThrow(/action lead cannot complete integration gate/);
 
     // A non-gated action that already reached 'completed' via completeUnitAction
     // (e.g. the earlier implement action) must still be rejected by

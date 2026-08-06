@@ -68,24 +68,56 @@ export interface LoopActionRequest {
   actionId: string;
   attemptId: string;
   graphId: string;
+  pipelineInstanceId?: string;
+  graphDigest?: string;
+  parentRunId?: string;
   unitId: string | null;
+  generation?: number;
   role: "worker" | "lead" | "reviewer" | "publisher";
   loop: "implement" | "simplify" | "command" | "repair" | "lead" | "review" | "publish";
   agent: "claude" | "codex" | "opencode";
+  model?: string;
   skill: string;
   worktree: RuntimeWorktreeHandle | null;
+  baseSubject?: string;
+  inputSubject?: string;
   candidateSubject?: string | null;
   nativeSessionId: string | null;
   contextPolicy: "fresh" | "resume_required" | "prefer_resume";
   timeoutMs: number;
   transitionContext: string;
+  priorEvidence?: {
+    schema: "openthrottle.loop-prior-evidence/v1";
+    role: "lead" | "final_review" | "final_repair";
+    receipts: Array<{
+      role: ReceiptEvidenceRole;
+      actionAttemptId: string;
+      receiptHash: string;
+      receipt: string;
+    }>;
+  };
+  downstreamContext?: Array<{
+    fromUnitId: string;
+    payloadHash: string;
+    payload: Record<string, unknown>;
+  }>;
   allowedMcpServers: readonly string[];
   credentialScopes: readonly LogicalCredential[];
   receiptSchema: string;
+  expectedProducerSkill?: string;
+  expectedProducer?: {
+    workerId: string;
+    skill: string;
+    capabilityDigest: string;
+    skillPackageDigest: string | null;
+    assurance: AssuranceClass;
+  };
   repositorySkill?: RepositorySkillPackage;
   requestHash: string;
   idempotencyKey: string;
 }
+
+type ReceiptEvidenceRole = "completion" | "candidate" | "command" | "final_command" | "final_review";
 
 export interface LoopActionResult {
   actionId: string;
@@ -93,6 +125,41 @@ export interface LoopActionResult {
   requestHash: string;
   outcome: "success" | "failure" | "needs_human" | "retryable_infrastructure_failure";
   nativeSessionId: string | null;
+  subject: string | null;
+  receipt: string;
+  completedAt: string;
+  // Present only when this exact action ran as a Codex worker and its
+  // action-scoped CODEX_HOME rotated its OAuth refresh token. Never derived
+  // from agent-authored text.
+  codexAuthJson?: string | null;
+}
+
+export interface ChildExecutorActionRequest {
+  protocol: "child-executor-action@1";
+  actionId: string;
+  attemptId: string;
+  graphId: string;
+  pipelineInstanceId: string;
+  graphDigest: string;
+  parentRunId: string;
+  generation: number;
+  capabilityDigest: string;
+  unitId: string | null;
+  actionKind: "command" | "final_command" | "candidate" | "integrate";
+  commandName?: string;
+  worktree?: RuntimeWorktreeHandle | null;
+  baseSubject: string;
+  inputSubject: string;
+  candidateSubject?: string;
+  requestHash: string;
+  idempotencyKey: string;
+}
+
+export interface ChildExecutorActionResult {
+  actionId: string;
+  attemptId: string;
+  requestHash: string;
+  outcome: "success" | "failure" | "needs_human" | "retryable_infrastructure_failure";
   subject: string | null;
   receipt: string;
   completedAt: string;
@@ -115,6 +182,7 @@ export interface SandboxRuntime {
     normalizedManifest: string;
     manifestDigest: string;
   }): Promise<void>;
+  prepareCompositeWorkspace(resource: RuntimeResource, request: StageRequestEnvelope): Promise<void>;
   dispatchStage(resource: RuntimeResource, request: StageRequestEnvelope): Promise<{ providerDispatchId: string }>;
   collectStageResult(resource: RuntimeResource, attemptId: string): Promise<StageExecutionResult | null>;
   createWorktree(resource: RuntimeResource, input: {
@@ -128,6 +196,12 @@ export interface SandboxRuntime {
     actionId: string;
     requestHash: string;
   }): Promise<LoopActionResult | null>;
+  dispatchChildExecutorAction(resource: RuntimeResource, request: ChildExecutorActionRequest): Promise<{ providerDispatchId: string }>;
+  collectChildExecutorActionResult(resource: RuntimeResource, input: {
+    attemptId: string;
+    actionId: string;
+    requestHash: string;
+  }): Promise<ChildExecutorActionResult | null>;
   cleanupWorktree(resource: RuntimeResource, handle: RuntimeWorktreeHandle): Promise<void>;
   renewLiveness(resource: RuntimeResource, attemptId: string): Promise<{ observedAt: string }>;
   stop(resource: RuntimeResource, reason: string): Promise<{ confirmed: boolean }>;

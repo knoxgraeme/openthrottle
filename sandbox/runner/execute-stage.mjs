@@ -261,7 +261,7 @@ export function validateSealedInputs({ request, configRaw, manifestRaw }) {
   return { config, manifest, stage };
 }
 
-function resolveCommand(config, commandName) {
+export function resolveCommand(config, commandName) {
   if (typeof config.commands?.[commandName] === "string") return config.commands[commandName];
   if (typeof config[commandName] === "string") return config[commandName];
   return "";
@@ -279,7 +279,7 @@ export function resolveContextInvocation(request) {
     : { mode: "fresh", nativeSessionId: null, reconstructed: true, readOnly: false };
 }
 
-function defaultExecuteCommand({ command, repoDir, timeoutMs }) {
+export function defaultExecuteCommand({ command, repoDir, timeoutMs }) {
   if (!command) return { notConfigured: true, exitCode: null, signal: null, timedOut: false, stdout: "", stderr: "" };
   const result = runWithAgentProcessFence(
     () => runCapturedProcess("gosu", ["agent", "env", "HOME=/home/agent", "USER=agent", "bash", "-lc", command], {

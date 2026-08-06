@@ -7,6 +7,7 @@ import { runSweep } from "./operations/sweep.js";
 import { createLinearClientProvider } from "./providers/linear/auth.js";
 import {
   captureCodexAuthFromSandbox,
+  captureCodexAuthJson,
   createCredentialMaterializer,
 } from "./providers/codex/auth.js";
 import { pollSandboxEvents } from "./runtime/event-poller.js";
@@ -66,6 +67,9 @@ async function main() {
     tickets: store,
     runtime,
     taskTimeoutSeconds: cfg.taskTimeout,
+    captureCodexAuth: (blob) => {
+      captureCodexAuthJson(store, blob);
+    },
   });
   const pipelineCoordinator = {
     catalog: pipelineCatalog,
