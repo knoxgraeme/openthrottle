@@ -1,0 +1,155 @@
+#!/usr/bin/env node
+// Deterministic stand-in for the `claude` CLI used only by
+// sandbox/tests/structured-walking-skeleton.mjs. Bind-mounted over
+// /usr/local/bin/claude inside the built image so execute-loop.mjs's real
+// invocation path (gosu agent env ... claude --print ...) runs unmodified.
+//
+// A structured loop action carries every fence value a worker needs inside
+// the "## Receipt Authority Contract" block of its prompt (see
+// sandbox/runner/execute-loop.mjs loopPrompt()); this stub parses that block
+// instead of reading any sealed file directly, exactly like a real agent
+// would, so it proves the same agent-facing contract a real engine uses.
+//
+// It makes one deterministic worktree edit (implement/simplify/repair) and
+// computes subject.post with the executor's own tree-oid algorithm so the
+// receipt it prints is byte-for-byte fence-correct without needing to guess.
+
+import { appendFileSync, readFileSync } from "node:fs";
+import { computeWorkspaceTreeOid } from "/opt/openthrottle/runner/repository-control.mjs";
+
+function readStdin() {
+  try {
+    return readFileSync(0, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function jsonBlockAfter(text, marker) {
+  const start = text.indexOf(marker);
+  if (start === -1) return null;
+  const rest = text.slice(start + marker.length);
+  const end = rest.indexOf("\n\n##");
+  const raw = (end === -1 ? rest : rest.slice(0, end)).trim();
+  return JSON.parse(raw);
+}
+
+function findControlMarker(planContext, name) {
+  const text = JSON.stringify(planContext ?? {});
+  const match = text.match(new RegExp(`${name}=([a-zA-Z_]+)`));
+  return match ? match[1] : null;
+}
+
+function receiptFence(contract) {
+  return {
+    pipeline_instance_id: contract.pipeline_instance_id,
+    graph_digest: contract.graph_digest,
+    unit_id: contract.unit_id,
+    attempt_id: contract.attempt_id,
+    parent_run_id: contract.parent_run_id,
+    action_attempt_id: contract.action_attempt_id,
+    generation: contract.generation,
+    native_session_id: contract.native_session_id,
+    request_hash: contract.request_hash,
+  };
+}
+
+function buildReceipt({ contract, type, result, subjectPost, payload }) {
+  return {
+    schema: "openthrottle.receipt/v1",
+    type,
+    assurance: contract.assurance ?? "semantic_attested",
+    result,
+    producer: contract.producer,
+    subject: { base: contract.subject.base, pre: contract.subject.pre, post: subjectPost },
+    fence: receiptFence(contract),
+    evidence: ["walking-skeleton stub agent deterministic edit"],
+    payload,
+    issued_at: new Date().toISOString(),
+  };
+}
+
+function priorCandidateSubject(priorEvidence) {
+  const entry = (priorEvidence?.receipts ?? []).find((candidate) => candidate.role === "candidate");
+  if (!entry) throw new Error("stub lead action found no candidate receipt in prior evidence");
+  return JSON.parse(entry.receipt).subject.post;
+}
+
+function makeDeterministicEdit(cwd, contract) {
+  appendFileSync(
+    `${cwd}/WORK.md`,
+    `- ${contract.unit_id}/${contract.action_attempt_id} touched by walking-skeleton stub agent\n`
+  );
+  return computeWorkspaceTreeOid(cwd);
+}
+
+function main() {
+  const prompt = readStdin();
+  const firstLine = prompt.split("\n", 1)[0]?.trim() ?? "";
+  const skill = firstLine.replace(/^\//, "");
+  const contract = jsonBlockAfter(prompt, "## Receipt Authority Contract\n");
+  const priorEvidence = jsonBlockAfter(prompt, "## Prior Evidence\n");
+  if (!contract) throw new Error("stub agent could not find the Receipt Authority Contract in its prompt");
+  const cwd = process.cwd();
+
+  let receipt;
+  if (skill === "implement-unit" || skill === "repair-unit" || skill === "simplify-unit" || skill === "final-repair") {
+    const subjectPost = makeDeterministicEdit(cwd, contract);
+    receipt = buildReceipt({
+      contract,
+      type: "unit_completion",
+      result: "success",
+      subjectPost,
+      payload: {
+        summary: `walking-skeleton stub completed ${skill} for ${contract.unit_id}`,
+        assumptions: [],
+        decisions: [],
+        issues: [],
+        verification: ["walking-skeleton stub: deterministic edit applied"],
+        downstream_context: [],
+        requested_human_input: [],
+      },
+    });
+  } else if (skill === "accept-unit") {
+    const planContext = jsonBlockAfter(prompt, "## Execution Plan Context\n");
+    const forcedResult = findControlMarker(planContext, "STUB_LEAD_RESULT");
+    const result = forcedResult ?? "accept";
+    const acceptedSubject = priorCandidateSubject(priorEvidence);
+    receipt = buildReceipt({
+      contract,
+      type: "unit_decision",
+      result,
+      subjectPost: acceptedSubject,
+      payload: {
+        rationale: `walking-skeleton stub lead decision: ${result} for ${contract.unit_id}`,
+        context_updates: [],
+        ...(result === "accept" ? { accepted_subject: acceptedSubject } : {}),
+      },
+    });
+  } else if (skill === "final-review") {
+    receipt = buildReceipt({
+      contract,
+      type: "semantic_review",
+      result: "success",
+      subjectPost: contract.subject.pre,
+      payload: {
+        summary: "walking-skeleton stub final review: no findings",
+        findings: [],
+      },
+    });
+  } else {
+    throw new Error(`stub agent does not recognize skill invocation ${JSON.stringify(firstLine)}`);
+  }
+
+  process.stdout.write(`${JSON.stringify({ type: "system", subtype: "init", session_id: `stub-${contract.action_attempt_id}`, model: "stub" })}\n`);
+  process.stdout.write(`${JSON.stringify({
+    type: "result",
+    subtype: "success",
+    is_error: false,
+    num_turns: 1,
+    total_cost_usd: 0.01,
+    result: receipt,
+  })}\n`);
+}
+
+main();

@@ -523,7 +523,6 @@ export function loopPrompt(request) {
         skill: request.expectedProducer.skill,
         capability_digest: request.expectedProducer.capabilityDigest,
         skill_package_digest: request.expectedProducer.skillPackageDigest,
-        assurance: request.expectedProducer.assurance,
       }
     : {
         skill: request.expectedProducerSkill ?? request.repositorySkill?.reference ?? `builtin://${request.skill}@1`,
@@ -533,10 +532,17 @@ export function loopPrompt(request) {
     pipeline_instance_id: request.pipelineInstanceId ?? null,
     graph_id: request.graphId,
     graph_digest: request.graphDigest ?? null,
+    attempt_id: request.attemptId,
     parent_run_id: request.parentRunId ?? null,
     unit_id: request.unitId ?? "__final__",
     action_attempt_id: request.actionId,
     generation: request.generation ?? null,
+    // The receipt fence checks this against the receipt's top-level
+    // `assurance`, never `producer.assurance` -- ReceiptProducer has no such
+    // field (contracts/src/receipts.ts), so it must not appear inside
+    // `producer` here or an agent that echoes the contract verbatim would
+    // produce a receipt the schema rejects.
+    assurance: request.expectedProducer?.assurance ?? null,
     native_session_id: request.nativeSessionId,
     request_hash: request.requestHash,
     subject: {

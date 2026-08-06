@@ -83,6 +83,18 @@ function repository() {
   return directory;
 }
 
+function firstJsonObject(text) {
+  let depth = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    if (text[i] === "{") depth += 1;
+    else if (text[i] === "}") {
+      depth -= 1;
+      if (depth === 0) return text.slice(0, i + 1);
+    }
+  }
+  throw new Error("no balanced JSON object found");
+}
+
 function request(overrides = {}) {
   const repoDir = repository();
   const rootDir = mkdtempSync(join(tmpdir(), "ot-loop-worktrees-"));
@@ -437,6 +449,11 @@ describe("loop action request validation", () => {
     expect(loopPrompt(valid)).not.toContain('"workerId"');
     expect(loopPrompt(valid)).not.toContain('"capabilityDigest"');
     expect(loopPrompt(valid)).not.toContain('"skillPackageDigest"');
+
+    const contract = JSON.parse(firstJsonObject(loopPrompt(valid).split("\n\n## Receipt Authority Contract\n")[1]));
+    expect(contract.attempt_id).toBe(valid.attemptId);
+    expect(contract.assurance).toBe("semantic_attested");
+    expect(contract.producer).not.toHaveProperty("assurance");
   });
 
   it("validates typed prior evidence and downstream context into the sealed prompt contract", () => {
