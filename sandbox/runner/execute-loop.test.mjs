@@ -693,7 +693,7 @@ describe("loop action request validation", () => {
     })).toThrow(/repositorySkill\.reference is invalid/);
   });
 
-  it("passes native session IDs to supported resumable engine adapters", () => {
+  it("passes native session IDs to supported resumable engine adapters, always over stdin", () => {
     for (const agent of ["claude", "codex"]) {
       const valid = validateLoopRequest(request({
         agent,
@@ -703,10 +703,11 @@ describe("loop action request validation", () => {
       const built = loopAgentCommand({ request: valid, invocation: resolveLoopInvocation(valid) });
       expect(built.args).toContain(agent === "claude" ? "--resume" : "resume");
       expect(built.args).toContain("native-1");
-      if (agent === "codex") {
-        expect(built.args.at(-1)).toBe(loopPrompt(valid));
-        expect(built.input).toBeUndefined();
-      }
+      // The prompt never rides argv (Linux's MAX_ARG_STRLEN per-argument
+      // ceiling and /proc/<pid>/cmdline visibility) for either engine.
+      expect(built.args).not.toContain(loopPrompt(valid));
+      if (agent === "codex") expect(built.args.at(-1)).toBe("-");
+      expect(built.input).toBe(loopPrompt(valid));
     }
   });
 
@@ -812,6 +813,157 @@ describe("loop action request validation", () => {
     expect(built.input).toBe(loopPrompt(valid));
   });
 
+  describe("launch shapes above Linux's per-argument prompt ceiling", () => {
+    // MAX_ARG_STRLEN on Linux is 131,072 bytes; an admitted sealed
+    // transitionContext can reach up to 262,144 bytes, well above it.
+    const LINUX_MAX_ARG_STRLEN = 131_072;
+    const hugeTransitionContext = "x".repeat(LINUX_MAX_ARG_STRLEN + 10_000);
+
+    function launchShapes() {
+      return [
+        { label: "Claude fresh", agent: "claude", nativeSessionId: null, contextPolicy: "prefer_resume" },
+        { label: "Claude resume", agent: "claude", nativeSessionId: "native-claude-1", contextPolicy: "resume_required" },
+        { label: "Codex fresh", agent: "codex", nativeSessionId: null, contextPolicy: "prefer_resume" },
+        { label: "Codex resume", agent: "codex", nativeSessionId: "native-codex-1", contextPolicy: "resume_required" },
+      ];
+    }
+
+    for (const shape of launchShapes()) {
+      it(`keeps every argv element under the Linux ceiling and carries the full prompt over stdin for ${shape.label}`, () => {
+        const valid = validateLoopRequest(request({
+          agent: shape.agent,
+          nativeSessionId: shape.nativeSessionId,
+          contextPolicy: shape.contextPolicy,
+          transitionContext: hugeTransitionContext,
+        }));
+        const prompt = loopPrompt(valid);
+        expect(Buffer.byteLength(prompt, "utf8")).toBeGreaterThan(LINUX_MAX_ARG_STRLEN);
+
+        const built = loopAgentCommand({ request: valid, invocation: resolveLoopInvocation(valid) });
+        for (const arg of built.args) {
+          expect(Buffer.byteLength(arg, "utf8")).toBeLessThan(LINUX_MAX_ARG_STRLEN);
+        }
+        expect(built.args.join("\n")).not.toContain(prompt);
+        expect(built.input).toBe(prompt);
+      });
+    }
+
+    for (const shape of launchShapes()) {
+      it(`launches through gosu with no oversized argv element and cleans up correctly for ${shape.label}`, () => {
+        const valid = validateLoopRequest(request({
+          agent: shape.agent,
+          nativeSessionId: shape.nativeSessionId,
+          contextPolicy: shape.contextPolicy,
+          transitionContext: hugeTransitionContext,
+        }));
+        const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+        const integrationRepoDir = mkdtempSync(join(tmpdir(), "ot-loop-integration-"));
+        directories.push(actionRoot, integrationRepoDir);
+        process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+        if (shape.nativeSessionId) {
+          const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
+          directories.push(sessionRoot);
+          process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sessionRoot;
+          sealSessionFixture({ agent: shape.agent, nativeSessionId: shape.nativeSessionId, sourceRoot: sessionRoot });
+        }
+        const events = [];
+        let capturedArgs;
+        let capturedOptions;
+
+        const result = runLoopAgentInPreparedRepository({
+          request: valid,
+          invocation: resolveLoopInvocation(valid),
+          integrationRepoDir,
+          processFence: (execute) => execute(),
+          lockIntegration: (path) => {
+            events.push(`lock-integration:${path}`);
+            return true;
+          },
+          lockPersistentProfiles: () => {
+            events.push("lock-persistent-profiles");
+            return [];
+          },
+          restorePersistentProfiles: () => {
+            events.push("restore-persistent-profiles");
+          },
+          runProcess: (command, args, options) => {
+            expect(command).toBe("gosu");
+            // For Codex, the same runProcess is also used for the
+            // post-launch action-scoped auth-snapshot read (see
+            // readCodexAuthSnapshot); that call carries no `input`, so the
+            // main agent launch call is the one to identify by it.
+            if ("input" in options) {
+              capturedArgs = args;
+              capturedOptions = options;
+            }
+            return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+          },
+        });
+
+        expect(result.status).toBe(0);
+        for (const arg of capturedArgs) {
+          expect(Buffer.byteLength(arg, "utf8")).toBeLessThan(LINUX_MAX_ARG_STRLEN);
+        }
+        expect(Buffer.byteLength(capturedOptions.input, "utf8")).toBeGreaterThan(LINUX_MAX_ARG_STRLEN);
+        expect(events).toEqual([
+          `lock-integration:${integrationRepoDir}`,
+          "lock-persistent-profiles",
+          `lock-integration:${integrationRepoDir}`,
+          "restore-persistent-profiles",
+        ]);
+      });
+
+      it(`releases locks and cleans up when the oversized-prompt launch fails for ${shape.label}`, () => {
+        const valid = validateLoopRequest(request({
+          agent: shape.agent,
+          nativeSessionId: shape.nativeSessionId,
+          contextPolicy: shape.contextPolicy,
+          transitionContext: hugeTransitionContext,
+        }));
+        const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+        directories.push(actionRoot);
+        process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+        if (shape.nativeSessionId) {
+          const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
+          directories.push(sessionRoot);
+          process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sessionRoot;
+          sealSessionFixture({ agent: shape.agent, nativeSessionId: shape.nativeSessionId, sourceRoot: sessionRoot });
+        }
+        const events = [];
+
+        expect(() => runLoopAgentInPreparedRepository({
+          request: valid,
+          invocation: resolveLoopInvocation(valid),
+          integrationRepoDir: "/tmp/integration",
+          lockIntegration: () => {
+            events.push("lock-integration");
+            return true;
+          },
+          lockPersistentProfiles: () => {
+            events.push("lock-persistent-profiles");
+            return [];
+          },
+          restorePersistentProfiles: () => {
+            events.push("restore-persistent-profiles");
+          },
+          processFence: (execute) => execute(),
+          runProcess: () => {
+            events.push("run");
+            throw new Error("agent launch failed");
+          },
+        })).toThrow(/agent launch failed/);
+
+        expect(events).toEqual([
+          "lock-integration",
+          "lock-persistent-profiles",
+          "run",
+          "lock-integration",
+          "restore-persistent-profiles",
+        ]);
+      });
+    }
+  });
+
   it("keeps the integration checkout locked around worker execution", () => {
     const valid = validateLoopRequest(request());
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
@@ -841,6 +993,14 @@ describe("loop action request validation", () => {
       },
       runProcess: (command, args, options) => {
         events.push(`run:${command}:${options.cwd}`);
+        if (args[1] === "cat") {
+          // The post-launch action-scoped Codex auth-snapshot read (see
+          // readCodexAuthSnapshot): a distinct, narrower gosu call than the
+          // main agent launch below, so it is asserted separately.
+          expect(command).toBe("gosu");
+          expect(args[0]).toBe("agent");
+          return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+        }
         const actionDirectory = join(actionRoot, valid.attemptId, valid.actionId);
         expect(statSync(actionRoot).mode & 0o777).toBe(0o711);
         expect(statSync(join(actionRoot, valid.attemptId)).mode & 0o777).toBe(0o711);
@@ -871,6 +1031,10 @@ describe("loop action request validation", () => {
       "lock-persistent-profiles",
       "process-fence",
       `run:gosu:${loopWorktreeDirectory(valid)}`,
+      // The default request agent is Codex, so the action-scoped auth
+      // snapshot read (readCodexAuthSnapshot) runs a second, distinct gosu
+      // call after launch and before cleanup; it passes no cwd.
+      "run:gosu:undefined",
       `lock-integration:${integrationRepoDir}`,
       "restore-persistent-profiles:/home/agent/.codex",
     ]);

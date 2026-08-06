@@ -3,6 +3,8 @@ import { canonicalJson, digestNormalized } from "../pipeline/manifest.js";
 import type { ExecutionGateReceipt, ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
 import type { ExecutionUnitState } from "../pipeline/unit-coordinator.js";
 import type { LoopActionRequest } from "../runtime/contracts.js";
+import { MAX_VALID_DOWNSTREAM_CONTEXT } from "../pipeline/structured-loop-envelope.js";
+import { MAX_LOOP_REQUEST_ENVELOPE_BYTES } from "../pipeline/structured-loop-limits.js";
 import { aggregateOutcomeFor, createStructuredChildRuntime } from "./structured-child-runtime.js";
 
 function unit(overrides: Partial<ExecutionUnitState> & { unitId: string; ordinal: number }): ExecutionUnitState {
@@ -702,6 +704,72 @@ describe("structured child runtime repair fences", () => {
     expect(dispatched?.transitionContext).toContain("Unit is done.");
   });
 
+  it("dispatches with the true maximum valid downstream-context aggregate without exceeding the sealed envelope", async () => {
+    const implement = action({
+      id: "implement-max-downstream-context",
+      action_kind: "implement",
+      cycle: 1,
+      status: "dispatched",
+      attempt_ordinal: 1,
+      request_hash: null,
+    });
+    let dispatched: LoopActionRequest | undefined;
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: {
+        createWorktree: vi.fn(async () => ({ id: "worktree-handle" })),
+        dispatchLoopAction: async (_resource: { providerResourceId: string }, request: LoopActionRequest) => {
+          dispatched = request;
+          return { providerDispatchId: "dispatch-1" };
+        },
+      } as any,
+      store: {
+        leaseNextUnitAction: () => implement,
+        markActionDispatching: vi.fn(),
+        markActionDispatched: vi.fn(),
+        listWorkAttempts: () => [implement],
+        getGraphForAttempt: () => ({
+          integration_subject: "a".repeat(40),
+          command_names: "[]",
+        }),
+        getAttempt: () => ({ request_payload: parentAttemptRequestPayload() }),
+        listDownstreamContext: () => MAX_VALID_DOWNSTREAM_CONTEXT.map((record) => ({
+          from_unit_id: record.fromUnitId,
+          payload_hash: record.payloadHash,
+          payload: canonicalJson(record.payload),
+        })),
+      } as any,
+    });
+
+    await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+      id: "instance-1",
+      active_stage_id: "structured",
+      agent: "codex",
+      generation: 7,
+      base_commit: "a".repeat(40),
+      immutable_subject: "a".repeat(40),
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({
+        stages: [{
+          id: "structured",
+          unitPhaseBindings: [{
+            id: "implement",
+            kind: "agent",
+            loop: { skill: "builtin://implement-unit@1", timeout_seconds: 60 },
+            worker: { id: "worker-1", agent: "inherit", allowed_mcp_servers: [] },
+            credentials: ["model.invoke", "repo.read", "repo.write"],
+            context: "fresh",
+          }],
+        }],
+      }),
+    } as any, "parent-attempt");
+
+    expect(dispatched?.downstreamContext).toHaveLength(MAX_VALID_DOWNSTREAM_CONTEXT.length);
+    expect(Buffer.byteLength(canonicalJson(dispatched), "utf8")).toBeLessThanOrEqual(MAX_LOOP_REQUEST_ENVELOPE_BYTES);
+  });
+
   it("dispatches later final-repair rounds with a sealed resume session", async () => {
     const finalReview = action({
       id: "final-review-cycle-2",
@@ -872,7 +940,11 @@ describe("structured child runtime repair fences", () => {
     expect(dispatchLoopAction).not.toHaveBeenCalled();
   });
 
-  it("durably fails final-repair results that omit the triggering review hash", async () => {
+  it("accepts final-repair results that do not echo the triggering review hash in evidence", async () => {
+    // The sandbox prompt tells agents not to reuse prior-action evidence, so
+    // the triggering final-review receipt must be bound deterministically
+    // through the completion receipt's request_hash fence rather than
+    // requiring the agent to copy the hash into `evidence[]`.
     const finalReview = action({
       id: "final-review-trigger",
       action_kind: "final_review",
@@ -936,15 +1008,465 @@ describe("structured child runtime repair fences", () => {
       immutable_subject: "a".repeat(40),
       manifest_digest: "c".repeat(64),
       capability_digest: "d".repeat(64),
-      normalized_manifest: canonicalJson({ stages: [{ id: "structured", unitPhaseBindings: [] }] }),
+      normalized_manifest: canonicalJson({
+        stages: [{
+          id: "structured",
+          unitPhaseBindings: [{
+            id: "lead",
+            kind: "gate",
+            loop: { skill: "builtin://accept-unit@1", timeout_seconds: 60 },
+            worker: { id: "lead-worker", agent: "inherit", allowed_mcp_servers: [] },
+            credentials: ["model.invoke", "repo.read"],
+            context: "fresh",
+          }],
+        }],
+      }),
+    } as any, "parent-attempt");
+
+    expect(failUnitAction).not.toHaveBeenCalled();
+    expect(completeUnitAction).toHaveBeenCalledWith(expect.objectContaining({
+      actionId: "final-repair-result",
+      outputSubject: "a".repeat(40),
+    }));
+  });
+
+  it("fails closed when a final-repair completion receipt's request-hash fence does not match the dispatched trigger", async () => {
+    // A receipt whose fence points at a different (stale or foreign) request
+    // hash cannot have been produced in response to the sealed request that
+    // bound this action's own triggering final-review receipt, even though
+    // its evidence[] array is unconstrained.
+    const finalReview = action({
+      id: "final-review-trigger",
+      action_kind: "final_review",
+      cycle: 1,
+      status: "completed",
+      attempt_ordinal: 3,
+      unit_id: null,
+      execution_unit_id: null,
+      request_hash: "e".repeat(64),
+      output_subject: "a".repeat(40),
+    });
+    finalReview.receipt = semanticReviewReceipt("a".repeat(40), finalReview, "trigger finding");
+    finalReview.receipt_hash = digestNormalized(finalReview.receipt);
+    const finalRepair = action({
+      id: "final-repair-result",
+      action_kind: "final_repair",
+      cycle: 1,
+      status: "dispatched",
+      attempt_ordinal: 4,
+      unit_id: null,
+      execution_unit_id: null,
+      request_hash: "b".repeat(64),
+      native_session_id: "native-session-final-repair-1",
+    });
+    const receipt = finalRepairCompletionReceipt("a".repeat(40), finalRepair, ["repaired the review findings"]);
+    const staleFenceReceipt = canonicalJson({
+      ...JSON.parse(receipt),
+      fence: { ...JSON.parse(receipt).fence, request_hash: "f".repeat(64) },
+    });
+    const failUnitAction = vi.fn();
+    const completeUnitAction = vi.fn();
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: {
+        collectLoopActionResult: async () => ({
+          actionId: finalRepair.id,
+          attemptId: "parent-attempt",
+          requestHash: "b".repeat(64),
+          outcome: "success",
+          nativeSessionId: "native-session-final-repair-1",
+          subject: "a".repeat(40),
+          receipt: staleFenceReceipt,
+          completedAt: "2099-07-22T12:00:00.000Z",
+        }),
+      } as any,
+      store: {
+        leaseNextUnitAction: () => finalRepair,
+        listWorkAttempts: () => [finalReview, finalRepair],
+        getGraphForAttempt: () => ({
+          integration_subject: "a".repeat(40),
+          command_names: "[]",
+        }),
+        failUnitAction,
+        completeUnitAction,
+      } as any,
+    });
+
+    await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+      id: "instance-1",
+      active_stage_id: "structured",
+      agent: "codex",
+      generation: 7,
+      base_commit: "a".repeat(40),
+      immutable_subject: "a".repeat(40),
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({
+        stages: [{
+          id: "structured",
+          unitPhaseBindings: [{
+            id: "lead",
+            kind: "gate",
+            loop: { skill: "builtin://accept-unit@1", timeout_seconds: 60 },
+            worker: { id: "lead-worker", agent: "inherit", allowed_mcp_servers: [] },
+            credentials: ["model.invoke", "repo.read"],
+            context: "fresh",
+          }],
+        }],
+      }),
     } as any, "parent-attempt");
 
     expect(completeUnitAction).not.toHaveBeenCalled();
     expect(failUnitAction).toHaveBeenCalledWith(expect.objectContaining({
       actionId: "final-repair-result",
       outcome: "failure",
-      lastError: expect.stringContaining("final repair receipt evidence missing triggering final-review hash"),
+      lastError: expect.stringContaining("completion receipt fence mismatch"),
     }));
+  });
+
+  it("accepts a second-cycle final-repair completion bound to its fresh cycle-2 trigger hash", async () => {
+    // Mirrors the cycle-1 acceptance test above, but for a second repair
+    // round: the completion receipt's fence.request_hash must match the
+    // cycle-2 finalRepair action's own request_hash, not the round-1 one.
+    const finalReviewRoundTwo = action({
+      id: "final-review-trigger-cycle-2",
+      action_kind: "final_review",
+      cycle: 2,
+      status: "completed",
+      attempt_ordinal: 5,
+      unit_id: null,
+      execution_unit_id: null,
+      request_hash: "1".repeat(64),
+      output_subject: "a".repeat(40),
+    });
+    finalReviewRoundTwo.receipt = semanticReviewReceipt("a".repeat(40), finalReviewRoundTwo, "second cycle finding");
+    finalReviewRoundTwo.receipt_hash = digestNormalized(finalReviewRoundTwo.receipt);
+    const finalRepairRoundTwo = action({
+      id: "final-repair-result-cycle-2",
+      action_kind: "final_repair",
+      cycle: 2,
+      status: "dispatched",
+      attempt_ordinal: 6,
+      unit_id: null,
+      execution_unit_id: null,
+      request_hash: "2".repeat(64),
+      native_session_id: "native-session-final-repair-1",
+    });
+    const receipt = finalRepairCompletionReceipt("a".repeat(40), finalRepairRoundTwo, ["repaired the second cycle findings"]);
+    const failUnitAction = vi.fn();
+    const completeUnitAction = vi.fn();
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: {
+        collectLoopActionResult: async () => ({
+          actionId: finalRepairRoundTwo.id,
+          attemptId: "parent-attempt",
+          requestHash: "2".repeat(64),
+          outcome: "success",
+          nativeSessionId: "native-session-final-repair-1",
+          subject: "a".repeat(40),
+          receipt,
+          completedAt: "2099-07-22T12:00:00.000Z",
+        }),
+      } as any,
+      store: {
+        leaseNextUnitAction: () => finalRepairRoundTwo,
+        listWorkAttempts: () => [finalReviewRoundTwo, finalRepairRoundTwo],
+        getGraphForAttempt: () => ({
+          integration_subject: "a".repeat(40),
+          command_names: "[]",
+        }),
+        failUnitAction,
+        completeUnitAction,
+      } as any,
+    });
+
+    await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+      id: "instance-1",
+      active_stage_id: "structured",
+      agent: "codex",
+      generation: 7,
+      base_commit: "a".repeat(40),
+      immutable_subject: "a".repeat(40),
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({
+        stages: [{
+          id: "structured",
+          unitPhaseBindings: [{
+            id: "lead",
+            kind: "gate",
+            loop: { skill: "builtin://accept-unit@1", timeout_seconds: 60 },
+            worker: { id: "lead-worker", agent: "inherit", allowed_mcp_servers: [] },
+            credentials: ["model.invoke", "repo.read"],
+            context: "fresh",
+          }],
+        }],
+      }),
+    } as any, "parent-attempt");
+
+    expect(failUnitAction).not.toHaveBeenCalled();
+    expect(completeUnitAction).toHaveBeenCalledWith(expect.objectContaining({
+      actionId: "final-repair-result-cycle-2",
+      outputSubject: "a".repeat(40),
+    }));
+  });
+
+  it("fails closed when a second-cycle final-repair completion is bound to the stale cycle-1 trigger hash", async () => {
+    // A second-round completion whose fence still points at the round-1
+    // finalRepair request hash was produced against a stale trigger and must
+    // not be accepted merely because it shares the resumed native session.
+    const finalReviewRoundTwo = action({
+      id: "final-review-trigger-cycle-2",
+      action_kind: "final_review",
+      cycle: 2,
+      status: "completed",
+      attempt_ordinal: 5,
+      unit_id: null,
+      execution_unit_id: null,
+      request_hash: "1".repeat(64),
+      output_subject: "a".repeat(40),
+    });
+    finalReviewRoundTwo.receipt = semanticReviewReceipt("a".repeat(40), finalReviewRoundTwo, "second cycle finding");
+    finalReviewRoundTwo.receipt_hash = digestNormalized(finalReviewRoundTwo.receipt);
+    const finalRepairRoundTwo = action({
+      id: "final-repair-result-cycle-2",
+      action_kind: "final_repair",
+      cycle: 2,
+      status: "dispatched",
+      attempt_ordinal: 6,
+      unit_id: null,
+      execution_unit_id: null,
+      request_hash: "2".repeat(64),
+      native_session_id: "native-session-final-repair-1",
+    });
+    const receipt = finalRepairCompletionReceipt("a".repeat(40), finalRepairRoundTwo, ["repaired using a stale round-1 request"]);
+    const staleFenceReceipt = canonicalJson({
+      ...JSON.parse(receipt),
+      // Stale: points at round 1's finalRepair request_hash ("b".repeat(64)
+      // in the cycle-1 tests above) instead of this round's "2".repeat(64).
+      fence: { ...JSON.parse(receipt).fence, request_hash: "b".repeat(64) },
+    });
+    const failUnitAction = vi.fn();
+    const completeUnitAction = vi.fn();
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: {
+        collectLoopActionResult: async () => ({
+          actionId: finalRepairRoundTwo.id,
+          attemptId: "parent-attempt",
+          requestHash: "2".repeat(64),
+          outcome: "success",
+          nativeSessionId: "native-session-final-repair-1",
+          subject: "a".repeat(40),
+          receipt: staleFenceReceipt,
+          completedAt: "2099-07-22T12:00:00.000Z",
+        }),
+      } as any,
+      store: {
+        leaseNextUnitAction: () => finalRepairRoundTwo,
+        listWorkAttempts: () => [finalReviewRoundTwo, finalRepairRoundTwo],
+        getGraphForAttempt: () => ({
+          integration_subject: "a".repeat(40),
+          command_names: "[]",
+        }),
+        failUnitAction,
+        completeUnitAction,
+      } as any,
+    });
+
+    await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+      id: "instance-1",
+      active_stage_id: "structured",
+      agent: "codex",
+      generation: 7,
+      base_commit: "a".repeat(40),
+      immutable_subject: "a".repeat(40),
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({
+        stages: [{
+          id: "structured",
+          unitPhaseBindings: [{
+            id: "lead",
+            kind: "gate",
+            loop: { skill: "builtin://accept-unit@1", timeout_seconds: 60 },
+            worker: { id: "lead-worker", agent: "inherit", allowed_mcp_servers: [] },
+            credentials: ["model.invoke", "repo.read"],
+            context: "fresh",
+          }],
+        }],
+      }),
+    } as any, "parent-attempt");
+
+    expect(completeUnitAction).not.toHaveBeenCalled();
+    expect(failUnitAction).toHaveBeenCalledWith(expect.objectContaining({
+      actionId: "final-repair-result-cycle-2",
+      outcome: "failure",
+      lastError: expect.stringContaining("completion receipt fence mismatch"),
+    }));
+  });
+
+  it("captures a rotated Codex auth blob from a completed action-scoped Codex worker under a Claude-selected ticket", async () => {
+    const implement = action({
+      id: "implement-codex-worker",
+      action_kind: "implement",
+      cycle: 1,
+      status: "dispatched",
+      attempt_ordinal: 1,
+      request_hash: "b".repeat(64),
+    });
+    const rotatedBlob = JSON.stringify({ tokens: { refresh_token: "rotated-refresh-token" } });
+    const captureCodexAuth = vi.fn();
+    const completeUnitAction = vi.fn();
+    const failUnitAction = vi.fn();
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      captureCodexAuth,
+      runtime: {
+        // The action's own engine (a Codex worker override) rotated its
+        // scoped CODEX_HOME auth even though the ticket itself is Claude.
+        collectLoopActionResult: async () => ({
+          actionId: implement.id,
+          attemptId: "parent-attempt",
+          requestHash: "b".repeat(64),
+          outcome: "success",
+          nativeSessionId: null,
+          subject: "a".repeat(40),
+          receipt: completionReceipt("a".repeat(40), implement),
+          completedAt: "2099-07-22T12:00:00.000Z",
+          codexAuthJson: rotatedBlob,
+        }),
+      } as any,
+      store: {
+        leaseNextUnitAction: () => implement,
+        completeUnitAction,
+        failUnitAction,
+        getGraphForAttempt: () => ({
+          integration_subject: "a".repeat(40),
+          command_names: "[]",
+        }),
+      } as any,
+    });
+
+    await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+      id: "instance-1",
+      // The parent ticket's own engine is Claude; the completed action ran
+      // as an explicit Codex worker override, so capture must key off the
+      // action's own engine, not this field.
+      agent: "claude",
+      active_stage_id: "structured",
+      generation: 1,
+      base_commit: "a".repeat(40),
+      immutable_subject: "a".repeat(40),
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({
+        stages: [{
+          id: "structured",
+          unitPhaseBindings: [{
+            id: "implement",
+            kind: "agent",
+            loop: { skill: "builtin://implement-unit@1", timeout_seconds: 60 },
+            worker: { id: "worker-1", agent: "inherit", allowed_mcp_servers: [] },
+            credentials: ["model.invoke", "repo.read", "repo.write"],
+            context: "fresh",
+          }, {
+            id: "lead",
+            kind: "gate",
+            loop: { skill: "builtin://accept-unit@1", timeout_seconds: 60 },
+            worker: { id: "lead-worker", agent: "inherit", allowed_mcp_servers: [] },
+            credentials: ["model.invoke", "repo.read"],
+            context: "fresh",
+          }],
+        }],
+      }),
+    } as any, "parent-attempt");
+
+    expect(failUnitAction).not.toHaveBeenCalled();
+    expect(captureCodexAuth).toHaveBeenCalledTimes(1);
+    expect(captureCodexAuth).toHaveBeenCalledWith(rotatedBlob);
+    expect(completeUnitAction).toHaveBeenCalled();
+  });
+
+  it("never captures Codex auth from a non-Codex action's result", async () => {
+    const implement = action({
+      id: "implement-claude-worker",
+      action_kind: "implement",
+      cycle: 1,
+      status: "dispatched",
+      attempt_ordinal: 1,
+      request_hash: "b".repeat(64),
+    });
+    const captureCodexAuth = vi.fn();
+    const completeUnitAction = vi.fn();
+    const failUnitAction = vi.fn();
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      captureCodexAuth,
+      runtime: {
+        collectLoopActionResult: async () => ({
+          actionId: implement.id,
+          attemptId: "parent-attempt",
+          requestHash: "b".repeat(64),
+          outcome: "success",
+          nativeSessionId: null,
+          subject: "a".repeat(40),
+          receipt: completionReceipt("a".repeat(40), implement),
+          completedAt: "2099-07-22T12:00:00.000Z",
+          // A Claude (or OpenCode) action never carries this field.
+        }),
+      } as any,
+      store: {
+        leaseNextUnitAction: () => implement,
+        completeUnitAction,
+        failUnitAction,
+        getGraphForAttempt: () => ({
+          integration_subject: "a".repeat(40),
+          command_names: "[]",
+        }),
+      } as any,
+    });
+
+    await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+      id: "instance-1",
+      agent: "claude",
+      active_stage_id: "structured",
+      generation: 1,
+      base_commit: "a".repeat(40),
+      immutable_subject: "a".repeat(40),
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({
+        stages: [{
+          id: "structured",
+          unitPhaseBindings: [{
+            id: "implement",
+            kind: "agent",
+            loop: { skill: "builtin://implement-unit@1", timeout_seconds: 60 },
+            worker: { id: "worker-1", agent: "inherit", allowed_mcp_servers: [] },
+            credentials: ["model.invoke", "repo.read", "repo.write"],
+            context: "fresh",
+          }, {
+            id: "lead",
+            kind: "gate",
+            loop: { skill: "builtin://accept-unit@1", timeout_seconds: 60 },
+            worker: { id: "lead-worker", agent: "inherit", allowed_mcp_servers: [] },
+            credentials: ["model.invoke", "repo.read"],
+            context: "fresh",
+          }],
+        }],
+      }),
+    } as any, "parent-attempt");
+
+    expect(failUnitAction).not.toHaveBeenCalled();
+    expect(captureCodexAuth).not.toHaveBeenCalled();
+    expect(completeUnitAction).toHaveBeenCalled();
   });
 
   it("keeps an empty typed prior-evidence envelope on final review dispatch", async () => {

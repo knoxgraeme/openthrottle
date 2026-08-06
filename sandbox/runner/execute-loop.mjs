@@ -773,11 +773,15 @@ function makeCurrentActionDirectoryTraverseOnly(request) {
 export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDirectory(request) ?? "/home/agent/repo", mcpConfigPath = null }) {
   const prompt = loopPrompt(request);
   if (request.agent === "codex") {
+    // The prompt always travels over stdin ("-" tells Codex to read it there)
+    // rather than argv: an admitted sealed prompt can exceed Linux's
+    // MAX_ARG_STRLEN per-argument ceiling, and argv is visible to any
+    // co-resident process via /proc/<pid>/cmdline.
     return {
       repoDir,
       command: "codex",
-      args: ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-C", repoDir, ...(request.model ? ["-m", request.model] : []), ...(invocation.mode === "resume" ? ["resume", invocation.nativeSessionId, prompt] : ["-"])],
-      input: invocation.mode !== "resume" ? prompt : undefined,
+      args: ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-C", repoDir, ...(request.model ? ["-m", request.model] : []), ...(invocation.mode === "resume" ? ["resume", invocation.nativeSessionId, "-"] : ["-"])],
+      input: prompt,
     };
   }
   if (request.agent === "opencode") {
@@ -787,7 +791,11 @@ export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDi
     repoDir,
     command: "claude",
     args: [
-      "-p", ...(invocation.mode === "resume" ? ["--resume", invocation.nativeSessionId] : []), prompt,
+      // The long-form --print (not -p) is required for Claude to read the
+      // prompt from stdin instead of taking it as a positional argument; the
+      // prompt itself is never passed via argv (see the Codex note above for
+      // why: MAX_ARG_STRLEN and /proc/<pid>/cmdline visibility).
+      "--print", ...(invocation.mode === "resume" ? ["--resume", invocation.nativeSessionId] : []),
       "--output-format", "stream-json", "--verbose", ...(request.model ? ["--model", request.model] : []), "--dangerously-skip-permissions",
       // Unconditional: --strict-mcp-config closes MCP entirely to just the
       // declared set (or to nothing, when no MCP servers were declared),
@@ -797,8 +805,34 @@ export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDi
       "--plugin-dir", "/opt/openthrottle/compound-engineering-marketplace",
       "--setting-sources", "user",
     ],
-    input: undefined,
+    input: prompt,
   };
+}
+
+const MAX_CODEX_AUTH_SNAPSHOT_BYTES = 65_536;
+
+// Codex may rotate its OAuth refresh token inside this action's own scoped
+// CODEX_HOME while running; that state is wiped with the rest of the action
+// directory once cleanup locks it, so it must be read back here -- after the
+// agent process exits but before cleanup -- rather than out-of-band later.
+// Keyed to this action's own engine (request.agent), never the parent
+// ticket's engine, so a Codex worker override inside a Claude-selected
+// ticket still has its rotation captured.
+function readCodexAuthSnapshot(codexHome, runProcess) {
+  const path = pathInside(codexHome, "auth.json");
+  let result;
+  try {
+    result = runProcess("gosu", ["agent", "cat", path], {
+      timeout: 5_000,
+      captureBytes: MAX_CODEX_AUTH_SNAPSHOT_BYTES,
+    });
+  } catch {
+    return null;
+  }
+  if (result.error || result.status !== 0) return null;
+  const blob = result.stdout;
+  if (!blob || Buffer.byteLength(blob, "utf8") > MAX_CODEX_AUTH_SNAPSHOT_BYTES) return null;
+  return blob;
 }
 
 export function runLoopAgentInPreparedRepository({
@@ -853,11 +887,15 @@ export function runLoopAgentInPreparedRepository({
     if (nativeSessionId && !sealedNativeSessionPackage) {
       throw new Error("native session id was reported without a sealed executor package");
     }
+    const codexAuthJson = request.agent === "codex"
+      ? readCodexAuthSnapshot(preparedEnvironment.nativeSessionProfileRoot, runProcess)
+      : null;
     return {
       ...result,
       nativeSessionId,
       gitObjectEnv: preparedEnvironment.gitObjectEnv,
       integrationRepoDir,
+      codexAuthJson,
     };
   } catch (error) {
     bodyError = error;
@@ -1000,7 +1038,7 @@ export function executeLoopAction({
   // the spawned agent process only), so sanitizeArtifactText's default
   // process.env lookup alone would miss them if a failure message ever
   // echoed one -- including in the cleanup-failure path below.
-  const sanitizeEnv = { ...process.env, ...credentialEnv };
+  let sanitizeEnv = { ...process.env, ...credentialEnv };
   let result;
   let execution;
   try {
@@ -1022,6 +1060,12 @@ export function executeLoopAction({
         retryableInfrastructureFailure: Boolean(error?.retryableInfrastructureFailure),
         processTerminationUnconfirmed: Boolean(error?.processTerminationUnconfirmed),
       };
+    }
+    // A rotated Codex auth blob matches sanitizeArtifactText's AUTH_JSON
+    // secret-name pattern, so any accidental echo of it in agent stdout/stderr
+    // is redacted the same way the seeded CODEX_AUTH_JSON credential is.
+    if (execution.codexAuthJson) {
+      sanitizeEnv = { ...sanitizeEnv, OT_ROTATED_CODEX_AUTH_JSON: execution.codexAuthJson };
     }
     const worktreeDir = loopWorktreeDirectory(request);
     let subject = null;
@@ -1093,6 +1137,11 @@ export function executeLoopAction({
           ? execution.stderr || "loop action infrastructure failure"
           : failureNarrative, sanitizeEnv).slice(0, 128_000),
       created_at: now(),
+      // Never derived from agent-authored stdout/stderr (which is sanitized
+      // and truncated above): this travels as its own typed field so a
+      // rotated Codex refresh token is captured regardless of the action's
+      // semantic outcome, without ever passing through free-text logging.
+      ...(execution.codexAuthJson ? { codex_auth_json: execution.codexAuthJson } : {}),
     };
   } finally {
     const cleanups = [
