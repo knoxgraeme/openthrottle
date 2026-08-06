@@ -1,6 +1,6 @@
 import type { Ticket, SupervisorStore } from "../persistence/store.js";
 import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
-import { canonicalJson, type PipelineStage } from "../pipeline/manifest.js";
+import { canonicalJson, stageById } from "../pipeline/manifest.js";
 import { digestNormalized } from "../pipeline/manifest.js";
 import { FOR_EACH_UNIT_CAPABILITY } from "../pipeline/capability-contracts.js";
 import { coordinatePipelineEvent } from "../pipeline/coordinator.js";
@@ -186,15 +186,6 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         !attempt || attempt.id !== request.attemptId) {
       throw new Error(`pipeline stage request ${request.attemptId} is no longer active`);
     }
-  };
-
-  const activeStageFor = (instance: PipelineInstance) => {
-    const manifest = JSON.parse(instance.normalized_manifest) as { stages?: unknown };
-    const stages = Array.isArray(manifest.stages) ? manifest.stages : [];
-    return stages.find((stage) =>
-      typeof stage === "object" && stage !== null &&
-      (stage as { id?: unknown }).id === instance.active_stage_id
-    ) as PipelineStage | undefined;
   };
 
   const bindCompositeParentRun = (instance: PipelineInstance, request: StageRequestEnvelope): void => {
@@ -586,7 +577,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       if (!instance || ticket.run_id === null) continue;
       const attempt = deps.store.getActiveAttempt(instance.id);
       if (!attempt || attempt.run_id !== ticket.run_id || attempt.status === "completed") continue;
-      const stage = activeStageFor(instance);
+      const stage = stageById(instance.normalized_manifest, instance.active_stage_id);
       if (!stage || stage.executor.capability !== FOR_EACH_UNIT_CAPABILITY) continue;
       const binding = runtimeBindingFor(instance);
       if (!binding.resource || binding.status !== "active") continue;

@@ -451,6 +451,15 @@ export function digestNormalized(normalized: string): string {
   return sharedDigestNormalized(normalized);
 }
 
+export function stageById(normalizedManifest: string, stageId: string | null | undefined): PipelineStage | undefined {
+  const manifest = JSON.parse(normalizedManifest) as { stages?: unknown };
+  const stages = Array.isArray(manifest.stages) ? manifest.stages : [];
+  return stages.find((stage) =>
+    typeof stage === "object" && stage !== null &&
+    (stage as { id?: unknown }).id === stageId
+  ) as PipelineStage | undefined;
+}
+
 export function isPipelineReentry(manifest: PipelineManifest, stageId: string, targetId: string): boolean {
   const stageIndex = manifest.stages.findIndex((stage) => stage.id === stageId);
   const targetIndex = manifest.stages.findIndex((stage) => stage.id === targetId);

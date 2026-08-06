@@ -405,6 +405,17 @@ export function resolveLoopInvocation(request) {
 export function loopPrompt(request) {
   const prefix = request.agent === "claude" ? "/" : "$";
   const entry = `${prefix}${request.skill}`;
+  const producer = request.expectedProducer
+    ? {
+        worker_id: request.expectedProducer.workerId,
+        skill: request.expectedProducer.skill,
+        capability_digest: request.expectedProducer.capabilityDigest,
+        skill_package_digest: request.expectedProducer.skillPackageDigest,
+        assurance: request.expectedProducer.assurance,
+      }
+    : {
+        skill: request.expectedProducerSkill ?? request.repositorySkill?.reference ?? `builtin://${request.skill}@1`,
+      };
   const contract = canonicalJson({
     schema: "openthrottle.loop-receipt-contract/v1",
     pipeline_instance_id: request.pipelineInstanceId ?? null,
@@ -420,9 +431,7 @@ export function loopPrompt(request) {
       base: request.baseSubject ?? null,
       pre: request.inputSubject ?? null,
     },
-    producer: request.expectedProducer ?? {
-      skill: request.expectedProducerSkill ?? request.repositorySkill?.reference ?? `builtin://${request.skill}@1`,
-    },
+    producer,
     evidence: "Bind this receipt to exact output evidence for the requested action; do not reuse sibling or prior action evidence.",
   });
   return `${entry}\n\n` +

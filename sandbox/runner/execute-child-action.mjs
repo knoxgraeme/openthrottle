@@ -193,19 +193,23 @@ function commandReceipt(request, {
   let execution;
   let post;
   let finalCommandMutated = false;
+  let finalCommandHead = null;
+  let finalCommandClean = null;
   try {
     execution = executeCommand({ command, repoDir, timeoutMs: 7_200_000 });
     if (request.actionKind === "final_command") {
-      const observedPost = commitSubject(repoDir);
-      finalCommandMutated = observedPost !== request.inputSubject || !isClean(repoDir);
-      post = finalCommandMutated ? request.inputSubject : observedPost;
+      finalCommandHead = commitSubject(repoDir);
+      finalCommandClean = isClean(repoDir);
+      finalCommandMutated = finalCommandHead !== request.inputSubject || !finalCommandClean;
+      post = finalCommandMutated ? request.inputSubject : finalCommandHead;
     } else {
       post = computeSubject(repoDir);
     }
   } finally {
     if (request.actionKind === "final_command") {
-      const observedPost = commitSubject(repoDir);
-      if (observedPost !== request.inputSubject || !isClean(repoDir)) {
+      const observedPost = finalCommandHead ?? commitSubject(repoDir);
+      const observedClean = finalCommandClean ?? isClean(repoDir);
+      if (observedPost !== request.inputSubject || !observedClean) {
         resetIntegration({ repoDir, subject: request.inputSubject });
       }
     }

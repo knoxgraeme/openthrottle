@@ -1383,6 +1383,116 @@ describe("pipeline effect processor", () => {
     expect(pipelines.getGraphForAttempt(attempt.id)!.aggregate_emitted_at).toBe(aggregateEmittedAt);
   });
 
+  it("settles active composite drain exceptions as retryable instead of wedging the action", async () => {
+    db = openDb(":memory:");
+    const pipelines = createPipelineStore(db);
+    const tickets = createSupervisorStore(db, pipelines);
+    const runtimeDescriptor = buildInstalledRuntimeDescriptor("structured-active-drain-throw-test/v1");
+    const catalog = loadPipelineCatalog(catalogPath, runtimeDescriptor.descriptor);
+    pipelines.acceptRuntimeDescriptor(runtimeDescriptor);
+    pipelines.acceptCatalog(catalog);
+    const repositoryConfig = parseRepositoryConfig([
+      "schema: openthrottle.config/v1",
+      "default_graph: simple",
+      "graphs:",
+      "  - id: simple",
+      "    kind: builtin",
+      "    ref: core/simple@1",
+      "  - id: structured",
+      "    kind: builtin",
+      "    ref: core/structured@1",
+      "commands: { test: npm test, lint: npm run lint, build: npm run build }",
+      "pipelines: { implement: implement }",
+    ].join("\n"));
+    const config = pipelines.saveRepositoryConfigSnapshot({
+      repository: "owner/repo",
+      baseCommit: "a".repeat(40),
+      blobSha: "b".repeat(40),
+      config: repositoryConfig,
+    });
+    const manifest = parseAndCompileExecutionGraph(readFileSync(structuredGraphPath, "utf8"), {
+      id: "builtin/structured",
+      runtime: runtimeDescriptor.descriptor,
+      config: repositoryConfig.config,
+    }).manifest;
+    pipelines.acceptManifest(manifest);
+    const executionPlan = {
+      schema: "openthrottle.execution-plan/v1",
+      graph_id: "structured",
+      plan_id: "structured-active-drain-throw",
+      instructions: { implement_a: "Implement unit A." },
+      acceptance: { unit_a_done: "Unit A is complete." },
+      units: [{
+        id: "unit_a",
+        title: "Unit A",
+        depends_on: [],
+        instructions: ["implement_a"],
+        acceptance: ["unit_a_done"],
+      }],
+      commands: [],
+    };
+    tickets.upsert({
+      linear_issue_id: "issue-active-drain-throw",
+      linear_issue_identifier: "OT-ACTIVE-DRAIN-THROW",
+      linear_session_id: "session-active-drain-throw",
+      sandbox_id: null,
+      branch: "ot/active-drain-throw",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+      pipeline: {
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        manifest,
+        repositoryConfig: config,
+        runtime: runtimeDescriptor,
+        authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
+        taskContext: [
+          "Approved structured plan.",
+          "",
+          "```json openthrottle.execution-plan/v1",
+          JSON.stringify(executionPlan, null, 2),
+          "```",
+        ].join("\n"),
+      },
+    });
+    const instance = pipelines.getInstanceForSession("session-active-drain-throw")!;
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    const runtime = sandboxRuntimeMock({ issueId: "active-drain-throw" });
+    const processor = createPipelineEffectProcessor({
+      store: pipelines,
+      tickets,
+      runtime,
+      taskTimeoutSeconds: 300,
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+    });
+
+    await processor.drain();
+    runtime.collectLoopActionResult.mockRejectedValueOnce(new Error("Daytona collection timeout"));
+
+    await expect(processor.drain()).resolves.toBeUndefined();
+    expect(pipelines.listWorkAttempts(attempt.id)[0]).toMatchObject({
+      status: "dead",
+      last_error: expect.stringContaining("Daytona collection timeout"),
+    });
+    expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
+      stopped_at: expect.any(String),
+      stop_reason: expect.stringContaining("retryable_infrastructure_failure"),
+      aggregate_emitted_at: null,
+    });
+
+    await processor.drain();
+    expect(pipelines.getAttempt(attempt.id)).toMatchObject({
+      status: "failed",
+      outcome: "retryable_infrastructure_failure",
+    });
+    expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
+      aggregate_emitted_at: expect.any(String),
+    });
+  });
+
   it("preserves valid failed command receipts for reducer handling", async () => {
     db = openDb(":memory:");
     const pipelines = createPipelineStore(db);

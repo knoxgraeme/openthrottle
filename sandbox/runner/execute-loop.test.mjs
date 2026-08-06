@@ -420,6 +420,25 @@ describe("loop action request validation", () => {
     expect(loopPrompt(valid)).not.toContain("$ce-work");
   });
 
+  it("renders expected producers in standard receipt shape", () => {
+    const valid = validateLoopRequest(request({
+      expectedProducer: {
+        workerId: "worker-1",
+        skill: "builtin://implement-unit@1",
+        capabilityDigest: "c".repeat(64),
+        skillPackageDigest: null,
+        assurance: "semantic_attested",
+      },
+    }));
+
+    expect(loopPrompt(valid)).toContain('"worker_id":"worker-1"');
+    expect(loopPrompt(valid)).toContain('"capability_digest":"cccc');
+    expect(loopPrompt(valid)).toContain('"skill_package_digest":null');
+    expect(loopPrompt(valid)).not.toContain('"workerId"');
+    expect(loopPrompt(valid)).not.toContain('"capabilityDigest"');
+    expect(loopPrompt(valid)).not.toContain('"skillPackageDigest"');
+  });
+
   it("validates repository skill packages as sealed loop input", () => {
     const valid = validateLoopRequest(repositorySkillRequest());
     expect(valid.skill).toBe("implement_unit");

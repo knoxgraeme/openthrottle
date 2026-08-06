@@ -1,5 +1,6 @@
 import {
   EXECUTION_PLAN_SCHEMA,
+  digestCanonicalJson,
   parseExecutionPlanContract,
   parseStandardReceipt,
   RECEIPT_SCHEMA,
@@ -12,7 +13,7 @@ import {
   type UnitCompletionReceipt,
   type UnitDecisionReceipt,
 } from "@openthrottle/contracts";
-import { canonicalJson, digestNormalized, type PipelineStage, type StageOutcome } from "../pipeline/manifest.js";
+import { canonicalJson, stageById, type StageOutcome } from "../pipeline/manifest.js";
 import { FOR_EACH_UNIT_CAPABILITY } from "../pipeline/capability-contracts.js";
 import { coordinatePipelineEvent } from "../pipeline/coordinator.js";
 import {
@@ -176,7 +177,7 @@ function configuredCommandNamesFor(instance: PipelineInstance, store: PipelineSt
 }
 
 function uniqueInOrder(values: readonly string[]): string[] {
-  return values.filter((value, index) => values.indexOf(value) === index);
+  return [...new Set(values)];
 }
 
 function commandPlanForUnits(input: {
@@ -196,15 +197,21 @@ function commandPlanForUnits(input: {
       throw new Error(`execution plan command ${commandName} is not configured in the sealed repository config`);
     }
   }
+  const commandNamesByUnit = new Map(input.plan.units.map((unit) => [unit.id, [] as string[]]));
+  for (const command of input.plan.commands) {
+    if (command.unit === undefined) {
+      for (const unitCommandNames of commandNamesByUnit.values()) unitCommandNames.push(command.name);
+    } else {
+      commandNamesByUnit.get(command.unit)?.push(command.name);
+    }
+  }
   return {
     graphCommandNames,
     units: input.plan.units.map((unit) => ({
       id: unit.id,
       dependencies: unit.depends_on,
       commandNames: input.plan.commands.length > 0
-        ? uniqueInOrder(input.plan.commands
-          .filter((command) => command.unit === undefined || command.unit === unit.id)
-          .map((command) => command.name))
+        ? uniqueInOrder(commandNamesByUnit.get(unit.id) ?? [])
         : [...input.fallbackCommandNames],
     })),
   };
@@ -223,7 +230,7 @@ function buildLoopActionRequest(
   request: Omit<LoopActionRequest, "requestHash" | "idempotencyKey">
 ): LoopActionRequest {
   const normalized = normalizedLoopRequestForHash(request);
-  const requestHash = digestNormalized(canonicalJson(normalized));
+  const requestHash = digestCanonicalJson(normalized);
   return {
     ...normalized,
     requestHash,
@@ -234,7 +241,7 @@ function buildLoopActionRequest(
 function buildChildExecutorActionRequest(
   request: Omit<ChildExecutorActionRequest, "requestHash" | "idempotencyKey">
 ): ChildExecutorActionRequest {
-  const requestHash = digestNormalized(canonicalJson(request));
+  const requestHash = digestCanonicalJson(request);
   return {
     ...request,
     requestHash,
@@ -308,11 +315,11 @@ function worktreeIdempotencyKey(action: ExecutionWorkAttempt): string {
 
 function worktreeHandleFor(action: ExecutionWorkAttempt, baseCommit: string): { id: string } {
   return {
-    id: digestNormalized(canonicalJson({
+    id: digestCanonicalJson({
       idempotencyKey: worktreeIdempotencyKey(action),
       attemptId: action.parent_attempt_id,
       baseCommit,
-    })).slice(0, 32),
+    }).slice(0, 32),
   };
 }
 
@@ -371,15 +378,6 @@ function finalRepairWorktreeHandleFor(
   );
   if (!finalRepair) throw new Error(`child final candidate action ${action.id} has no completed final repair worktree`);
   return worktreeHandleFor(finalRepair, baseCommit);
-}
-
-function activeStageFor(instance: PipelineInstance): PipelineStage | undefined {
-  const manifest = JSON.parse(instance.normalized_manifest) as { stages?: unknown };
-  const stages = Array.isArray(manifest.stages) ? manifest.stages : [];
-  return stages.find((stage) =>
-    typeof stage === "object" && stage !== null &&
-    (stage as { id?: unknown }).id === instance.active_stage_id
-  ) as PipelineStage | undefined;
 }
 
 export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): StructuredChildRuntime {
@@ -444,7 +442,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
   const actionBinding = (instance: PipelineInstance, action: ExecutionWorkAttempt): LoopDispatchBinding | undefined => {
     if (action.action_kind === "final_review") return FINAL_REVIEW_BINDING;
     if (action.action_kind === "final_repair") return FINAL_REPAIR_BINDING;
-    const stage = activeStageFor(instance);
+    const stage = stageById(instance.normalized_manifest, instance.active_stage_id);
     if (!stage?.unitPhaseBindings) throw new Error(`child action ${action.id} has no graph-declared phase bindings`);
     const phaseId = action.action_kind === "repair" ? "implement"
       : action.action_kind === "final_command"
@@ -758,17 +756,32 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     nativeSessionId?: string | null;
   } | null> => {
     if (!action.request_hash) return null;
-    const result = isChildExecutorActionKind(action.action_kind)
-      ? await deps.runtime.collectChildExecutorActionResult(resource, {
-          attemptId: action.parent_attempt_id,
-          actionId: action.id,
-          requestHash: action.request_hash,
-        })
-      : await deps.runtime.collectLoopActionResult(resource, {
-          attemptId: action.parent_attempt_id,
-          actionId: action.id,
-          requestHash: action.request_hash,
-    });
+    let result: Awaited<ReturnType<SandboxRuntime["collectChildExecutorActionResult"]>> |
+      Awaited<ReturnType<SandboxRuntime["collectLoopActionResult"]>>;
+    const collectionRequest = {
+      attemptId: action.parent_attempt_id,
+      actionId: action.id,
+      requestHash: action.request_hash,
+    };
+    try {
+      result = isChildExecutorActionKind(action.action_kind)
+        ? await deps.runtime.collectChildExecutorActionResult(resource, collectionRequest)
+        : await deps.runtime.collectLoopActionResult(resource, collectionRequest);
+    } catch (error) {
+      const message = sanitizeText(error instanceof Error ? error.message : String(error)).slice(-500);
+      return {
+        terminal: true,
+        resultHash: digestCanonicalJson({
+          schema: "openthrottle.child-action-collection-error/v1",
+          action_id: action.id,
+          request_hash: action.request_hash,
+          message,
+        }),
+        outcome: "retryable_infrastructure_failure",
+        lastError: `runtime result collection failed: ${message}`,
+        nativeSessionId: null,
+      };
+    }
     if (!result) return null;
     const nativeSessionId: string | null = "nativeSessionId" in result
       ? (result as { nativeSessionId: string | null }).nativeSessionId
@@ -778,7 +791,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       receipt: StandardReceipt,
       decision?: ReturnType<typeof evaluateUnitAcceptanceGate>
     ) => ({
-      resultHash: digestNormalized(canonicalJson(result)),
+      resultHash: digestCanonicalJson(result),
       outputSubject,
       receipt: canonicalJson(receipt),
       nativeSessionId,
@@ -795,7 +808,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           : "failure";
       return {
         terminal: true,
-        resultHash: digestNormalized(canonicalJson(result)),
+        resultHash: digestCanonicalJson(result),
         outcome,
         lastError: `child action ${action.id} returned malformed ${result.outcome} receipt: ${sanitizeText(result.receipt).slice(-500)}`,
         nativeSessionId,
@@ -902,7 +915,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     } catch (error) {
       return {
         terminal: true,
-        resultHash: digestNormalized(canonicalJson(result)),
+        resultHash: digestCanonicalJson(result),
         outcome: "failure",
         lastError: `child action ${action.id} returned invalid ${result.outcome} receipt: ${
           sanitizeText(error instanceof Error ? error.message : String(error)).slice(-500)
@@ -914,7 +927,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
 
   return {
     seedCompositeGraph(instance, request) {
-      const stage = activeStageFor(instance);
+      const stage = stageById(instance.normalized_manifest, instance.active_stage_id);
       if (!stage || stage.executor.capability !== FOR_EACH_UNIT_CAPABILITY) {
         throw new Error(`pipeline composite stage ${request.stageId} is not active`);
       }
@@ -930,7 +943,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         parentStageId: request.stageId,
         parentRunId: request.runId,
         graphDigest: instance.manifest_digest,
-        planDigest: digestNormalized(canonicalJson(plan)),
+        planDigest: digestCanonicalJson(plan),
         units: commandPlan.units,
         commandNames: commandPlan.graphCommandNames,
         unitPhases: stage.unitPhases,
