@@ -280,8 +280,8 @@ describe("Daytona stage execution", () => {
           `then rm -f .*${escapeForRegExp(stagedCredentialsPath)}.*exit 0; fi.*install -d .* -m 0711 .*loop-actions.*` +
           `loop-actions/attempt-child.*loop-actions/attempt-child/loop-1.*` +
           `cp .*${escapeForRegExp(stagedRequestPath)}.*loop-actions/attempt-child/loop-1/request\\.json.*` +
-          `RUN_ID=.*run-parent.*OT_CHILD_ACTION_ID=.*loop-1.*heartbeat\\.mjs.*` +
-          `execute-loop\\.mjs --request .*loop-actions/attempt-child/loop-1/request\\.json.*` +
+          `env -i .*RUN_ID=.*run-parent.*OT_CHILD_ACTION_ID=.*loop-1.*heartbeat\\.mjs.*` +
+          `env -i .*execute-loop\\.mjs --request .*loop-actions/attempt-child/loop-1/request\\.json.*` +
           `--output .*loop-actions/attempt-child/loop-1/result\\.json`
         )),
       }),
@@ -319,9 +319,13 @@ describe("Daytona stage execution", () => {
     );
     const dispatchLoopActionCommand = (sandbox.process.executeSessionCommand as ReturnType<typeof vi.fn>).mock.calls
       .find(([sessionId]) => sessionId === "loop-loop-1")?.[1].command as string;
+    expect(dispatchLoopActionCommand).toContain("env -i HOME=/home/agent");
+    expect(dispatchLoopActionCommand).not.toContain("GITHUB_TOKEN");
+    expect(dispatchLoopActionCommand).not.toContain("secret-token");
+    expect(dispatchLoopActionCommand).not.toContain("CODEX_AUTH_JSON");
     expect(dispatchLoopActionCommand).toMatch(new RegExp(
       `cp .*${escapeForRegExp(stagedCredentialsPath)}.*loop-actions/attempt-child/loop-1/credentials\\.json.*` +
-      `rm -f .*${escapeForRegExp(stagedCredentialsPath)}.*execute-loop\\.mjs --request .*request\\.json.*` +
+      `rm -f .*${escapeForRegExp(stagedCredentialsPath)}.*env -i .*execute-loop\\.mjs --request .*request\\.json.*` +
       `--credentials .*loop-actions/attempt-child/loop-1/credentials\\.json.*--output`
     ));
     // A losing `flock --nonblock` (another dispatch for this exact action

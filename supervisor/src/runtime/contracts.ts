@@ -76,6 +76,7 @@ export interface LoopActionRequest {
   role: "worker" | "lead" | "reviewer" | "publisher";
   loop: "implement" | "simplify" | "command" | "repair" | "lead" | "review" | "publish";
   agent: "claude" | "codex" | "opencode";
+  model?: string;
   skill: string;
   worktree: RuntimeWorktreeHandle | null;
   baseSubject?: string;
@@ -92,6 +93,7 @@ export interface LoopActionRequest {
       role: ReceiptEvidenceRole;
       actionAttemptId: string;
       receiptHash: string;
+      receipt: string;
     }>;
   };
   downstreamContext?: Array<{

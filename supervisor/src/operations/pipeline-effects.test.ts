@@ -1044,7 +1044,7 @@ describe("pipeline effect processor", () => {
         .filter((attempt) =>
           attempt.unit_id === input.unitId &&
           attempt.cycle === lead.cycle &&
-          (attempt.action_kind === "candidate" || attempt.action_kind === "command") &&
+          (attempt.action_kind === "implement" || attempt.action_kind === "candidate" || attempt.action_kind === "command") &&
           attempt.receipt)
         .map((attempt) => digestNormalized(attempt.receipt!));
       runtime.collectLoopActionResult.mockResolvedValueOnce({

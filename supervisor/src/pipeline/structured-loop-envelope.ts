@@ -1,5 +1,5 @@
 import type { ExecutionPlanContract } from "@openthrottle/contracts";
-import { digestNormalized } from "@openthrottle/contracts";
+import { digestCanonicalJson, digestNormalized } from "@openthrottle/contracts";
 import { canonicalJson } from "./manifest.js";
 import type {
   PipelineUnitAgentPhaseBinding,
@@ -18,21 +18,22 @@ type LoopActionPlanContextInput = {
 };
 
 export function loopActionPlanContext(input: LoopActionPlanContextInput): Record<string, unknown> | null {
-  if (!input.plan) return null;
+  const plan = input.plan;
+  if (!plan) return null;
   const unit = input.unitId
-    ? input.plan.units.find((unit) => unit.id === input.unitId)
+    ? plan.units.find((unit) => unit.id === input.unitId)
     : undefined;
   return {
     schema: "openthrottle.loop-action-plan-context/v1",
-    graph_id: input.plan.graph_id,
-    plan_id: input.plan.plan_id,
+    graph_id: plan.graph_id,
+    plan_id: plan.plan_id,
     action_kind: input.actionKind,
     unit: unit ?? null,
-    instructions: Object.fromEntries((unit?.instructions ?? []).map((id) => [id, input.plan!.instructions[id]])),
-    acceptance: Object.fromEntries((unit?.acceptance ?? []).map((id) => [id, input.plan!.acceptance[id]])),
+    instructions: Object.fromEntries((unit?.instructions ?? []).map((id) => [id, plan.instructions[id]])),
+    acceptance: Object.fromEntries((unit?.acceptance ?? []).map((id) => [id, plan.acceptance[id]])),
     commands: input.unitId
-      ? input.plan.commands.filter((command) => command.unit === undefined || command.unit === input.unitId)
-      : input.plan.commands,
+      ? plan.commands.filter((command) => command.unit === undefined || command.unit === input.unitId)
+      : plan.commands,
   };
 }
 
@@ -97,10 +98,70 @@ function actionPayloadProbe(input: {
   });
 }
 
+function priorReceiptProbe(input: {
+  role: "completion" | "candidate" | "command" | "final_command";
+  actionAttemptId: string;
+  receiptType: "unit_completion" | "candidate_evidence" | "command_result";
+  subject?: string;
+}): {
+  role: "completion" | "candidate" | "command" | "final_command";
+  actionAttemptId: string;
+  receiptHash: string;
+  receipt: string;
+} {
+  const subject = input.subject ?? "2".repeat(40);
+  const receipt = canonicalJson({
+    schema: "openthrottle.receipt/v1",
+    type: input.receiptType,
+    assurance: input.receiptType === "command_result" ? "executor_verified" : "semantic_attested",
+    result: "success",
+    producer: {
+      worker_id: "worker-" + "w".repeat(32),
+      skill: input.receiptType === "command_result" ? "builtin://command@1" : "builtin://implement-unit@1",
+      capability_digest: "3".repeat(64),
+      skill_package_digest: null,
+    },
+    subject: { base: "1".repeat(40), pre: "1".repeat(40), post: subject },
+    fence: {
+      pipeline_instance_id: "instance-" + "i".repeat(32),
+      graph_digest: "4".repeat(64),
+      unit_id: input.role === "final_command" ? "__final__" : "unit-" + "u".repeat(32),
+      attempt_id: "attempt-" + "a".repeat(32),
+      parent_run_id: "run-" + "b".repeat(32),
+      action_attempt_id: input.actionAttemptId,
+      generation: 999_999,
+      native_session_id: null,
+      request_hash: "5".repeat(64),
+    },
+    evidence: ["prior evidence"],
+    payload: input.receiptType === "command_result"
+      ? { command: "test", exit_code: 0, summary: "passed" }
+      : input.receiptType === "candidate_evidence"
+        ? { tree: subject, diff_digest: "6".repeat(64), changed_paths: [], clean: true }
+        : {
+            summary: "completed",
+            assumptions: [],
+            decisions: [],
+            issues: [],
+            verification: [],
+            downstream_context: [],
+            requested_human_input: [],
+          },
+    issued_at: "2099-07-22T12:00:00.000Z",
+  });
+  return {
+    role: input.role,
+    actionAttemptId: input.actionAttemptId,
+    receiptHash: digestNormalized(receipt),
+    receipt,
+  };
+}
+
 type LoopEnvelopeBinding = {
   kind: "agent" | "gate";
   workerId: string;
   workerAgent?: "inherit" | "claude" | "codex" | "opencode";
+  workerModel?: string;
   loopSkill: string;
   allowedMcpServers: readonly string[];
   credentialScopes: readonly string[];
@@ -154,6 +215,7 @@ const FINAL_REPAIR_ENVELOPE_BINDING = builtinLoopEnvelopeBinding({
   workerId: "final-repair",
   loopSkill: "final-repair",
   credentialScopes: ["model.invoke", "repo.read"],
+  contextPolicy: "resume_required",
 });
 
 const FINAL_REVIEW_ENVELOPE_BINDING = builtinLoopEnvelopeBinding({
@@ -170,6 +232,7 @@ function envelopeBindingForPhase(
     kind: binding.kind,
     workerId: binding.worker.id,
     workerAgent: binding.worker.agent,
+    ...(binding.worker.model === undefined ? {} : { workerModel: binding.worker.model }),
     loopSkill: binding.loop.skill,
     allowedMcpServers: binding.worker.allowed_mcp_servers,
     credentialScopes: binding.credentials,
@@ -211,6 +274,7 @@ function loopRequestProbe(input: {
     agent: input.binding.workerAgent && input.binding.workerAgent !== "inherit"
       ? input.binding.workerAgent
       : input.selectedAgent,
+    ...(input.binding.workerModel === undefined ? {} : { model: input.binding.workerModel }),
     skill: requestSkillFor(input.actionKind, input.binding),
     worktree: roleFor(input.actionKind) === "worker" ? { id: "0".repeat(64) } : null,
     baseSubject: "1".repeat(40),
@@ -231,9 +295,67 @@ function loopRequestProbe(input: {
       skillPackageDigest: input.binding.repositorySkill?.packageDigest ?? null,
       assurance: "semantic_attested",
     },
+    ...(input.actionKind === "lead"
+      ? {
+          priorEvidence: {
+            schema: "openthrottle.loop-prior-evidence/v1",
+            role: "lead",
+            receipts: [
+              priorReceiptProbe({
+                role: "completion",
+                actionAttemptId: "execution-work-" + "a".repeat(32),
+                receiptType: "unit_completion",
+              }),
+              priorReceiptProbe({
+                role: "candidate",
+                actionAttemptId: "execution-work-" + "b".repeat(32),
+                receiptType: "candidate_evidence",
+              }),
+              ...Array.from({ length: 32 }, (_, index) => ({
+                ...priorReceiptProbe({
+                  role: "command",
+                  actionAttemptId: `execution-work-${index.toString(16).padStart(32, "0")}`,
+                  receiptType: "command_result",
+                }),
+              })),
+            ],
+          },
+        }
+      : {}),
+    ...(input.actionKind === "final_review"
+      ? {
+          priorEvidence: {
+            schema: "openthrottle.loop-prior-evidence/v1",
+            role: "final_review",
+            receipts: Array.from({ length: 32 }, (_, index) => ({
+              ...priorReceiptProbe({
+                role: "final_command",
+                actionAttemptId: `execution-work-${index.toString(16).padStart(32, "0")}`,
+                receiptType: "command_result",
+              }),
+            })),
+          },
+        }
+      : {}),
+    ...(input.unitId
+      ? {
+          downstreamContext: Array.from({ length: 32 }, (_, index) => {
+            const payload = {
+              schema: "openthrottle.downstream-context/v1",
+              from_unit_id: `upstream-${index.toString(16).padStart(2, "0")}`,
+              summary: "x".repeat(760),
+            };
+            return {
+              fromUnitId: payload.from_unit_id,
+              payloadHash: digestCanonicalJson(payload),
+              payload,
+            };
+          }),
+        }
+      : {}),
     ...(input.binding.repositorySkill === undefined ? {} : { repositorySkill: input.binding.repositorySkill }),
   };
-  const requestHash = digestNormalized(canonicalJson(requestWithoutFence));
+  const requestHash = digestCanonicalJson(requestWithoutFence);
   return {
     ...requestWithoutFence,
     requestHash,

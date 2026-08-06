@@ -223,9 +223,10 @@ export function evaluateUnitAcceptanceGate(input: {
   assertReceiptFence(input.candidate, fences.candidate, "candidate");
   assertReceiptFence(input.lead, fences.lead, "lead");
   input.commands.forEach((command, index) => assertReceiptFence(command, fences.commands[index] ?? input.expected, "command"));
+  const completionHash = receiptHash(input.completion);
   const candidateHash = receiptHash(input.candidate);
   const commandHashes = input.commands.map(receiptHash);
-  assertEvidenceBinding(input.lead, [candidateHash, ...commandHashes], "lead");
+  assertEvidenceBinding(input.lead, [completionHash, candidateHash, ...commandHashes], "lead");
   const artifactHashes = [
     input.completion,
     input.candidate,

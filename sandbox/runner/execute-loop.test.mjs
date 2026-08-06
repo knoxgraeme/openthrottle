@@ -445,6 +445,17 @@ describe("loop action request validation", () => {
       from_unit_id: "unit_0",
       summary: "Use the accepted API shape.",
     };
+    const receiptRequest = request();
+    const receiptFence = standardReceipt(receiptRequest).fence;
+    const priorReceipt = (role, actionAttemptId) => {
+      const receipt = canonicalJson(standardReceipt(receiptRequest, {
+        fence: {
+          ...receiptFence,
+          action_attempt_id: actionAttemptId,
+        },
+      }));
+      return { role, actionAttemptId, receiptHash: digest(receipt), receipt };
+    };
     const withoutFence = {
       ...leadRequest(),
       transitionContext: "Review the current candidate.",
@@ -452,9 +463,9 @@ describe("loop action request validation", () => {
         schema: "openthrottle.loop-prior-evidence/v1",
         role: "lead",
         receipts: [
-          { role: "completion", actionAttemptId: "implement-1", receiptHash: "1".repeat(64) },
-          { role: "candidate", actionAttemptId: "candidate-1", receiptHash: "2".repeat(64) },
-          { role: "command", actionAttemptId: "command-1", receiptHash: "3".repeat(64) },
+          priorReceipt("completion", "implement-1"),
+          priorReceipt("candidate", "candidate-1"),
+          priorReceipt("command", "command-1"),
         ],
       },
       downstreamContext: [{
@@ -471,21 +482,37 @@ describe("loop action request validation", () => {
     expect(valid.downstreamContext).toHaveLength(1);
     expect(prompt).toContain("## Prior Evidence");
     expect(prompt).toContain('"actionAttemptId":"candidate-1"');
+    expect(prompt).toContain('"receipt":"');
     expect(prompt).toContain("## Downstream Context");
     expect(prompt).toContain("Use the accepted API shape.");
     expect(prompt).toContain('"downstream_context_hash"');
 
     const stale = { ...valid, downstreamContext: [] };
     expect(() => validateLoopRequest(stale)).toThrow(/stale/);
+
+    const tampered = {
+      ...withoutFence,
+      priorEvidence: {
+        ...withoutFence.priorEvidence,
+        receipts: [{
+          ...withoutFence.priorEvidence.receipts[0],
+          receipt: canonicalJson({ ...JSON.parse(withoutFence.priorEvidence.receipts[0].receipt), evidence: ["tampered"] }),
+        }],
+      },
+    };
+    const { requestHash: _tamperedHash, idempotencyKey: _tamperedKey, ...tamperedUnfenced } = tampered;
+    expect(() => validateLoopRequest({ ...tamperedUnfenced, ...createLoopRequestHash(tamperedUnfenced) }))
+      .toThrow(/receiptHash does not match receipt/);
   });
 
   it("rejects malformed typed loop context before agent invocation", () => {
+    const receipt = canonicalJson(standardReceipt(request()));
     const malformedPrior = {
       ...leadRequest(),
       priorEvidence: {
         schema: "openthrottle.loop-prior-evidence/v1",
         role: "lead",
-        receipts: [{ role: "candidate", actionAttemptId: "candidate-1", receiptHash: "2".repeat(64) }],
+        receipts: [{ role: "candidate", actionAttemptId: "candidate-1", receiptHash: digest(receipt), receipt }],
       },
     };
     const { requestHash: _priorHash, idempotencyKey: _priorKey, ...priorUnfenced } = malformedPrior;
@@ -527,6 +554,21 @@ describe("loop action request validation", () => {
     const { requestHash: _oversizedHash, idempotencyKey: _oversizedKey, ...oversizedUnfenced } = oversized;
     expect(() => validateLoopRequest({ ...oversizedUnfenced, ...createLoopRequestHash(oversizedUnfenced) }))
       .toThrow(/downstreamContext must be a bounded array/);
+  });
+
+  it("validates model as a hash-bound loop request field", () => {
+    const valid = validateLoopRequest(request({ model: "gpt-5.1-code" }));
+    expect(valid.model).toBe("gpt-5.1-code");
+
+    const malformed = request({ model: "bad model with spaces" });
+    expect(() => validateLoopRequest(malformed)).toThrow(/model is invalid/);
+
+    const oversized = request({ model: "m".repeat(241) });
+    expect(() => validateLoopRequest(oversized)).toThrow(/model is invalid/);
+
+    const stale = request({ model: "gpt-5.1-code" });
+    delete stale.model;
+    expect(() => validateLoopRequest(stale)).toThrow(/stale/);
   });
 
   it("validates repository skill packages as sealed loop input", () => {
@@ -580,14 +622,15 @@ describe("loop action request validation", () => {
   });
 
   it("passes native session IDs to every resumable engine adapter", () => {
-    for (const agent of ["claude", "codex"]) {
+    for (const agent of ["claude", "codex", "opencode"]) {
       const valid = validateLoopRequest(request({
         agent,
+        ...(agent === "opencode" ? { model: "kimi-code/kimi-for-coding" } : {}),
         nativeSessionId: "native-1",
         contextPolicy: "resume_required",
       }));
       const built = loopAgentCommand({ request: valid, invocation: resolveLoopInvocation(valid) });
-      expect(built.args).toContain(agent === "claude" ? "--resume" : "resume");
+      expect(built.args).toContain(agent === "claude" ? "--resume" : agent === "opencode" ? "--session" : "resume");
       expect(built.args).toContain("native-1");
       if (agent === "codex") {
         expect(built.args.at(-1)).toBe(loopPrompt(valid));
@@ -596,9 +639,25 @@ describe("loop action request validation", () => {
     }
   });
 
-  it("rejects opencode loop actions until their session-store contract lands", () => {
-    expect(() => validateLoopRequest(request({ agent: "opencode" })))
-      .toThrow(/opencode loop actions are not supported/);
+  it("passes sealed models to each engine adapter and leaves omitted models on provider defaults", () => {
+    const claude = validateLoopRequest(request({ agent: "claude", model: "claude-opus-4-1" }));
+    const codex = validateLoopRequest(request({ agent: "codex", model: "gpt-5.1-code" }));
+    const opencode = validateLoopRequest(request({ agent: "opencode", model: "kimi-code/kimi-for-coding" }));
+    const defaultCodex = validateLoopRequest(request({ agent: "codex" }));
+
+    expect(loopAgentCommand({ request: claude, invocation: resolveLoopInvocation(claude) }).args)
+      .toEqual(expect.arrayContaining(["--model", "claude-opus-4-1"]));
+    expect(loopAgentCommand({ request: codex, invocation: resolveLoopInvocation(codex) }).args)
+      .toEqual(expect.arrayContaining(["-m", "gpt-5.1-code"]));
+    expect(loopAgentCommand({ request: opencode, invocation: resolveLoopInvocation(opencode) }).args)
+      .toEqual(expect.arrayContaining(["--model", "kimi-code/kimi-for-coding"]));
+    expect(loopAgentCommand({ request: defaultCodex, invocation: resolveLoopInvocation(defaultCodex) }).args)
+      .not.toContain("-m");
+
+    expect(() => loopAgentCommand({
+      request: validateLoopRequest(request({ agent: "opencode" })),
+      invocation: { mode: "fresh", nativeSessionId: null },
+    })).toThrow(/requires a sealed model/);
   });
 
   it("rejects a loop request declaring a credential scope outside the closed logical set", () => {

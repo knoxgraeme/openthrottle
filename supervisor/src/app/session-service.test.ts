@@ -1595,7 +1595,7 @@ intents:
       "# Structured work",
       "",
       "```json openthrottle.execution-plan/v1",
-      JSON.stringify(boundary.accepted),
+      JSON.stringify(boundary.rejected),
       "```",
       "```json openthrottle.ship-selection/v1",
       JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }),
@@ -1610,6 +1610,7 @@ intents:
         {
           id: "unit-worker",
           engine: "agent",
+          model: "m".repeat(240),
           skills: ["repo://implement_unit"],
           session_scope: "attempt",
           credentials: ["model.invoke", "repo.read"],

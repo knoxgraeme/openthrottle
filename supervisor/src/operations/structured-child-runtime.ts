@@ -75,6 +75,7 @@ type LoopDispatchBinding = {
   worker: {
     id: string;
     agent?: "inherit" | "claude" | "codex" | "opencode";
+    model?: string;
     allowed_mcp_servers: string[];
   };
   credentials: LoopActionRequest["credentialScopes"];
@@ -133,6 +134,7 @@ function builtinLoopBinding(input: {
   workerId: string;
   skill: string;
   credentials: LoopActionRequest["credentialScopes"];
+  context?: LoopDispatchBinding["context"];
 }): LoopDispatchBinding {
   return Object.freeze({
     kind: input.kind,
@@ -146,7 +148,7 @@ function builtinLoopBinding(input: {
       timeout_seconds: undefined,
     },
     credentials: input.credentials,
-    context: "fresh",
+    context: input.context ?? "fresh",
     repositorySkill: undefined,
   });
 }
@@ -162,6 +164,7 @@ const FINAL_REPAIR_BINDING = builtinLoopBinding({
   workerId: "final-repair",
   skill: "final-repair",
   credentials: ["model.invoke", "repo.read"],
+  context: "resume_required",
 });
 
 function extractExecutionPlan(context: string): ExecutionPlanContract {
@@ -591,6 +594,19 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         entry.receipt.fence.unit_id === (unitId ?? "__final__") &&
         (cycle === undefined || entry.attempt.cycle === cycle));
 
+  const priorReceiptEntry = (
+    role: "completion" | "candidate" | "command" | "final_command",
+    entry: { attempt: ExecutionWorkAttempt; receipt: StandardReceipt }
+  ): NonNullable<LoopActionRequest["priorEvidence"]>["receipts"][number] => {
+    const receipt = canonicalJson(entry.receipt);
+    return {
+      role,
+      actionAttemptId: entry.attempt.id,
+      receiptHash: digestNormalized(receipt),
+      receipt,
+    };
+  };
+
   const priorEvidenceForAction = (
     action: ExecutionWorkAttempt,
     receipts: readonly { attempt: ExecutionWorkAttempt; receipt: StandardReceipt }[]
@@ -609,13 +625,9 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         schema: "openthrottle.loop-prior-evidence/v1",
         role: "lead",
         receipts: [
-          { role: "completion", actionAttemptId: completion.attempt.id, receiptHash: digestNormalized(canonicalJson(completion.receipt)) },
-          { role: "candidate", actionAttemptId: candidate.attempt.id, receiptHash: digestNormalized(canonicalJson(candidate.receipt)) },
-          ...commands.map((command) => ({
-            role: "command" as const,
-            actionAttemptId: command.attempt.id,
-            receiptHash: digestNormalized(canonicalJson(command.receipt)),
-          })),
+          priorReceiptEntry("completion", completion),
+          priorReceiptEntry("candidate", candidate),
+          ...commands.map((command) => priorReceiptEntry("command", command)),
         ],
       };
     }
@@ -624,11 +636,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       return {
         schema: "openthrottle.loop-prior-evidence/v1",
         role: "final_review",
-        receipts: commands.map((command) => ({
-          role: "final_command" as const,
-          actionAttemptId: command.attempt.id,
-          receiptHash: digestNormalized(canonicalJson(command.receipt)),
-        })),
+        receipts: commands.map((command) => priorReceiptEntry("final_command", command)),
       };
     }
     return undefined;
@@ -723,13 +731,26 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     const createNewWorktree = action.action_kind === "implement" ||
       action.action_kind === "repair" ||
       action.action_kind === "final_repair";
-      const worktree = (() : LoopActionRequest["worktree"] => {
-        if (roleFor(action.action_kind) !== "worker") return null;
-      if (!createNewWorktree) return worktreeHandleFor(action, baseCommit);
-      return worktreeHandleFor(action, baseCommit);
-    })();
-    const receipts = completedAttemptReceiptsFor(action.parent_attempt_id);
-    const priorEvidence = priorEvidenceForAction(action, receipts);
+    const worktree = roleFor(action.action_kind) === "worker"
+      ? worktreeHandleFor(action, baseCommit)
+      : null;
+    const needsPriorEvidence = action.action_kind === "lead" || action.action_kind === "final_review";
+    const receipts = needsPriorEvidence
+      ? completedAttemptReceiptsFor(action.parent_attempt_id)
+      : [];
+    const priorEvidence = needsPriorEvidence
+      ? priorEvidenceForAction(action, receipts)
+      : undefined;
+    const leadCandidateSubject = action.action_kind === "lead"
+      ? deps.store.listUnits(action.parent_attempt_id)
+        .find((unit) => unit.unitId === action.unit_id)?.acceptedCandidateSubject ??
+        latestAttemptReceipt<CandidateEvidenceReceipt>(
+          receipts,
+          "candidate_evidence",
+          action.unit_id,
+          action.cycle
+        ).receipt.subject.post
+      : undefined;
     const downstreamContext = action.unit_id
       ? (typeof deps.store.listDownstreamContext === "function"
           ? deps.store.listDownstreamContext(action.parent_attempt_id, action.unit_id)
@@ -757,16 +778,17 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       generation: instance.generation,
       role: roleFor(action.action_kind),
       loop: loopKindFor(action.action_kind),
-      agent: workerBinding?.worker.agent && workerBinding.worker.agent !== "inherit"
+      agent: workerBinding.worker.agent && workerBinding.worker.agent !== "inherit"
         ? workerBinding.worker.agent
         : instance.agent,
+      ...(workerBinding.worker.model === undefined ? {} : { model: workerBinding.worker.model }),
       skill: workerBinding.repositorySkill?.invocation ?? adapterSkillFor(action.action_kind),
       worktree,
       baseSubject: worktreeBaseFor(instance, action),
       inputSubject,
       nativeSessionId: action.native_session_id,
       contextPolicy,
-      timeoutMs: (workerBinding?.loop.timeout_seconds ?? deps.taskTimeoutSeconds) * 1_000,
+      timeoutMs: (workerBinding.loop.timeout_seconds ?? deps.taskTimeoutSeconds) * 1_000,
       transitionContext: loopActionTransitionContext({
         actionPayload: action.payload,
         planContext: loopActionPlanContext({
@@ -781,22 +803,15 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       ...(downstreamContext.length > 0 ? { downstreamContext } : {}),
       ...(action.action_kind === "lead"
         ? {
-            candidateSubject: deps.store.listUnits(action.parent_attempt_id)
-              .find((unit) => unit.unitId === action.unit_id)?.acceptedCandidateSubject ??
-              latestAttemptReceipt<CandidateEvidenceReceipt>(
-                completedAttemptReceiptsFor(action.parent_attempt_id),
-                "candidate_evidence",
-                action.unit_id,
-                action.cycle
-              ).receipt.subject.post,
+            candidateSubject: leadCandidateSubject,
           }
         : {}),
-      allowedMcpServers: workerBinding?.worker.allowed_mcp_servers ?? [],
+      allowedMcpServers: workerBinding.worker.allowed_mcp_servers,
       credentialScopes: workerBinding.credentials as LoopActionRequest["credentialScopes"],
       receiptSchema: RECEIPT_SCHEMA,
       expectedProducerSkill: expectedSkillFor(workerBinding),
       expectedProducer: expectedProducerForAction(instance, action),
-      ...(workerBinding?.repositorySkill ? { repositorySkill: workerBinding.repositorySkill } : {}),
+      ...(workerBinding.repositorySkill ? { repositorySkill: workerBinding.repositorySkill } : {}),
     });
     assertLoopRequestEnvelopeBound(loopRequest);
     deps.store.prepareActionDispatch?.({
@@ -895,7 +910,10 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       };
     }
     try {
-      const resultSubject = result.subject ?? receipt.subject.post;
+      if (result.subject !== null && result.subject !== undefined && result.subject !== receipt.subject.post) {
+        throw new Error(`child action ${action.id} result subject does not match receipt subject`);
+      }
+      const resultSubject = receipt.subject.post;
       if (!GIT_SUBJECT.test(resultSubject)) {
         throw new Error(`child action ${action.id} completed without an exact subject`);
       }

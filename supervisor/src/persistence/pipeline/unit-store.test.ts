@@ -2067,6 +2067,194 @@ describe("execution unit store", () => {
     })).toThrow(/is not pending/);
   });
 
+  it("enforces cumulative downstream context bounds per destination transactionally", () => {
+    const store = setup();
+    const sourceUnits = Array.from({ length: 33 }, (_, index) => ({ id: `u${index}` }));
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [...sourceUnits, { id: "target", dependencies: sourceUnits.map((unit) => unit.id) }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+    db!.prepare("UPDATE execution_units SET status = 'completed', terminal_level = 'completed', integration_subject = ? WHERE unit_id LIKE 'u%'")
+      .run("1".repeat(40));
+
+    for (let index = 0; index < 32; index += 1) {
+      store.appendDownstreamContext({
+        parentAttemptId: "attempt-parent",
+        fromUnitId: `u${index}`,
+        records: [{
+          toUnitId: "target",
+          payload: {
+            schema: "openthrottle.downstream-context/v1",
+            from_unit_id: `u${index}`,
+            summary: `context ${index}`,
+          },
+        }],
+      });
+    }
+    expect(store.listDownstreamContext("attempt-parent", "target")).toHaveLength(32);
+
+    const replay = store.appendDownstreamContext({
+      parentAttemptId: "attempt-parent",
+      fromUnitId: "u0",
+      records: [{
+        toUnitId: "target",
+        payload: {
+          schema: "openthrottle.downstream-context/v1",
+          from_unit_id: "u0",
+          summary: "context 0",
+        },
+      }],
+    });
+    expect(replay).toHaveLength(1);
+    expect(store.listDownstreamContext("attempt-parent", "target")).toHaveLength(32);
+
+    expect(() => store.appendDownstreamContext({
+      parentAttemptId: "attempt-parent",
+      fromUnitId: "u32",
+      records: [{
+        toUnitId: "target",
+        payload: {
+          schema: "openthrottle.downstream-context/v1",
+          from_unit_id: "u32",
+          summary: "one too many",
+        },
+      }],
+    })).toThrow(/exceeds 32 records/);
+    expect(store.listDownstreamContext("attempt-parent", "target")).toHaveLength(32);
+  });
+
+  it("rolls back downstream context byte overflows without partially persisting records", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b" }, { id: "target", dependencies: ["a", "b"] }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+    db!.prepare("UPDATE execution_units SET status = 'completed', terminal_level = 'completed', integration_subject = ? WHERE unit_id IN ('a', 'b')")
+      .run("1".repeat(40));
+
+    let low = 0;
+    let high = 32_768;
+    let acceptedSummaryLength = 0;
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2);
+      const payload = {
+        schema: "openthrottle.downstream-context/v1",
+        from_unit_id: "a",
+        summary: "x".repeat(mid),
+      };
+      const wire = [{
+        fromUnitId: "a",
+        payloadHash: digestNormalized(canonicalJson(payload)),
+        payload,
+      }];
+      if (Buffer.byteLength(canonicalJson(wire), "utf8") <= 32_768) {
+        acceptedSummaryLength = mid;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+
+    store.appendDownstreamContext({
+      parentAttemptId: "attempt-parent",
+      fromUnitId: "a",
+      records: [{
+        toUnitId: "target",
+        payload: {
+          schema: "openthrottle.downstream-context/v1",
+          from_unit_id: "a",
+          summary: "x".repeat(acceptedSummaryLength),
+        },
+      }],
+    });
+    expect(store.listDownstreamContext("attempt-parent", "target")).toHaveLength(1);
+
+    expect(() => store.appendDownstreamContext({
+      parentAttemptId: "attempt-parent",
+      fromUnitId: "b",
+      records: [{
+        toUnitId: "target",
+        payload: {
+          schema: "openthrottle.downstream-context/v1",
+          from_unit_id: "b",
+          summary: "y",
+        },
+      }],
+    })).toThrow(/exceeds 32768 bytes/);
+    expect(store.listDownstreamContext("attempt-parent", "target")).toHaveLength(1);
+  });
+
+  it("deduplicates identical receipt-authored downstream context before enforcing delivery bounds", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b", dependencies: ["a"] }],
+      unitPhaseBindings: unitPhaseBindings(),
+    });
+    const subject = "1".repeat(40);
+    const duplicateContext = {
+      unit_id: "b",
+      summary: "x".repeat(32_000),
+    };
+
+    const implement = lease(store);
+    store.completeUnitAction({
+      actionId: implement.id,
+      resultHash: "r-implement-duplicate-context",
+      outputSubject: subject,
+      receipt: receiptJson("unit_completion", {
+        payload: { downstream_context: [duplicateContext] },
+      }),
+    });
+    const candidate = lease(store);
+    store.completeUnitAction({
+      actionId: candidate.id,
+      resultHash: "r-candidate-duplicate-context",
+      outputSubject: subject,
+      receipt: receiptJson("candidate_evidence"),
+    });
+    const leadAction = lease(store);
+    store.completeGatedAction({
+      actionId: leadAction.id,
+      resultHash: "r-lead-duplicate-context",
+      outputSubject: subject,
+      receipt: receiptJson("unit_decision", {
+        payload: {
+          decision: "accept",
+          summary: "accepted",
+          context_updates: [duplicateContext],
+        },
+      }),
+      decision: gateDecision({ gateKind: "unit_acceptance", outcome: "success", subject }),
+    });
+    const integrate = lease(store);
+    store.completeGatedAction({
+      actionId: integrate.id,
+      resultHash: "r-integrate-duplicate-context",
+      outputSubject: subject,
+      decision: gateDecision({ gateKind: "integration", outcome: "success", subject }),
+    });
+
+    expect(store.listDownstreamContext("attempt-parent", "b")).toHaveLength(1);
+  });
+
   it("fails integration transactionally when receipt-authored downstream targets are invalid", () => {
     for (const [name, target] of [
       ["unknown", "missing"],

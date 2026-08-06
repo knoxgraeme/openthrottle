@@ -76,9 +76,11 @@ const CONTEXTS = new Set(["fresh", "resume_required", "prefer_resume"]);
 const STANDARD_RECEIPT_SCHEMA = "openthrottle.receipt/v1";
 const PRIOR_EVIDENCE_SCHEMA = "openthrottle.loop-prior-evidence/v1";
 const DOWNSTREAM_CONTEXT_SCHEMA = "openthrottle.downstream-context/v1";
+const MODEL_REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,239}$/;
 const PRIOR_EVIDENCE_ROLES = new Set(["lead", "final_review"]);
 const PRIOR_RECEIPT_ROLES = new Set(["completion", "candidate", "command", "final_command"]);
 const MAX_PRIOR_EVIDENCE_RECEIPTS = 34;
+const MAX_PRIOR_EVIDENCE_RECEIPT_BYTES = 64 * 1024;
 const MAX_DOWNSTREAM_CONTEXT_RECORDS = 32;
 const MAX_DOWNSTREAM_CONTEXT_BYTES = 32_768;
 const DEFAULT_ACTION_ROOT = "/var/lib/openthrottle/loop-actions";
@@ -176,17 +178,27 @@ function priorEvidence(value, label) {
   if (!Array.isArray(input.receipts) || input.receipts.length > MAX_PRIOR_EVIDENCE_RECEIPTS) {
     throw new Error(`${label}.receipts must be a bounded array`);
   }
-  const receipts = input.receipts.map((receipt, index) => {
-    const entry = record(receipt, `${label}.receipts[${index}]`);
-    const receiptAllowed = new Set(["role", "actionAttemptId", "receiptHash"]);
+  const receipts = input.receipts.map((receiptEntry, index) => {
+    const entry = record(receiptEntry, `${label}.receipts[${index}]`);
+    const receiptAllowed = new Set(["role", "actionAttemptId", "receiptHash", "receipt"]);
     const receiptUnknown = Object.keys(entry).find((key) => !receiptAllowed.has(key));
     if (receiptUnknown) throw new Error(`${label}.receipts[${index}] has unknown field ${receiptUnknown}`);
     const receiptRole = string(entry.role, `${label}.receipts[${index}].role`, /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/);
     if (!PRIOR_RECEIPT_ROLES.has(receiptRole)) throw new Error(`${label}.receipts[${index}].role is invalid`);
+    const receipt = string(entry.receipt, `${label}.receipts[${index}].receipt`, /^[\s\S]{1,65536}$/);
+    if (Buffer.byteLength(receipt, "utf8") > MAX_PRIOR_EVIDENCE_RECEIPT_BYTES) {
+      throw new Error(`${label}.receipts[${index}].receipt exceeds 64 KiB`);
+    }
+    const receiptHash = string(entry.receiptHash, `${label}.receipts[${index}].receiptHash`, /^[a-f0-9]{64}$/);
+    if (digest(receipt) !== receiptHash) {
+      throw new Error(`${label}.receipts[${index}].receiptHash does not match receipt`);
+    }
+    validateStandardReceipt(JSON.parse(receipt), { source: `${label}.receipts[${index}].receipt` });
     return {
       role: receiptRole,
       actionAttemptId: stagePathId(entry.actionAttemptId, `${label}.receipts[${index}].actionAttemptId`),
-      receiptHash: string(entry.receiptHash, `${label}.receipts[${index}].receiptHash`, /^[a-f0-9]{64}$/),
+      receiptHash,
+      receipt,
     };
   });
   if (role === "lead") {
@@ -367,7 +379,7 @@ export function validateLoopRequest(value) {
   const input = record(value, "loop request");
   const allowed = new Set([
     "protocol", "actionId", "attemptId", "graphId", "pipelineInstanceId", "graphDigest", "parentRunId",
-    "unitId", "generation", "role", "loop", "agent", "skill", "worktree", "baseSubject", "inputSubject",
+    "unitId", "generation", "role", "loop", "agent", "model", "skill", "worktree", "baseSubject", "inputSubject",
     "candidateSubject", "nativeSessionId", "contextPolicy", "timeoutMs",
     "transitionContext", "priorEvidence", "downstreamContext", "allowedMcpServers", "credentialScopes", "receiptSchema",
     "expectedProducerSkill", "expectedProducer", "repositorySkill", "requestHash", "idempotencyKey",
@@ -396,6 +408,7 @@ export function validateLoopRequest(value) {
     role: string(input.role, "role"),
     loop: string(input.loop, "loop"),
     agent: string(input.agent, "agent"),
+    ...(input.model === undefined ? {} : { model: string(input.model, "model", MODEL_REFERENCE) }),
     skill: string(input.skill, "skill", /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
     worktree: worktree === null ? null : {
       id: string(worktree.id, "worktree.id", /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
@@ -424,11 +437,6 @@ export function validateLoopRequest(value) {
   if (unknownScope) throw new Error(`credential scope ${unknownScope} is not a recognized logical credential`);
   if (request.role !== "publisher" && request.credentialScopes.includes("repo.write")) {
     throw new Error("structured loop actions cannot request repo.write");
-  }
-  if (request.agent === "opencode") {
-    // OpenCode loop actions need database-backed session sealing and adapter
-    // body delivery that RU5 does not provide; fail closed until that unit.
-    throw new Error("opencode loop actions are not supported yet");
   }
   const repositorySkill = input.repositorySkill === undefined
     ? undefined
@@ -743,8 +751,17 @@ export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDi
     return {
       repoDir,
       command: "codex",
-      args: ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-C", repoDir, ...(invocation.mode === "resume" ? ["resume", invocation.nativeSessionId, prompt] : ["-"])],
+      args: ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-C", repoDir, ...(request.model ? ["-m", request.model] : []), ...(invocation.mode === "resume" ? ["resume", invocation.nativeSessionId, prompt] : ["-"])],
       input: invocation.mode !== "resume" ? prompt : undefined,
+    };
+  }
+  if (request.agent === "opencode") {
+    if (!request.model) throw new Error("OpenCode loop execution requires a sealed model selection");
+    return {
+      repoDir,
+      command: "opencode",
+      args: ["run", "--format", "json", "--model", request.model, "--dir", repoDir, "--auto", ...(invocation.mode === "resume" ? ["--session", invocation.nativeSessionId] : []), prompt],
+      input: undefined,
     };
   }
   return {
@@ -752,7 +769,7 @@ export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDi
     command: "claude",
     args: [
       "-p", ...(invocation.mode === "resume" ? ["--resume", invocation.nativeSessionId] : []), prompt,
-      "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions",
+      "--output-format", "stream-json", "--verbose", ...(request.model ? ["--model", request.model] : []), "--dangerously-skip-permissions",
       // Unconditional: --strict-mcp-config closes MCP entirely to just the
       // declared set (or to nothing, when no MCP servers were declared),
       // rather than leaving a repo-committed .mcp.json or other ambient

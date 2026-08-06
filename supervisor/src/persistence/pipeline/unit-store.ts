@@ -48,6 +48,7 @@ import {
 } from "./unit-store-phase-reducer.js";
 
 const MAX_DOWNSTREAM_CONTEXT_AGGREGATE_BYTES = 32_768;
+const MAX_DOWNSTREAM_CONTEXT_RECORDS = 32;
 
 export type ExecutionGateKind = ChildGateDecision["gateKind"] | "integration" | "final_review";
 
@@ -427,9 +428,6 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
           },
         });
       }
-    }
-    if (Buffer.byteLength(canonicalJson(records), "utf8") > MAX_DOWNSTREAM_CONTEXT_AGGREGATE_BYTES) {
-      throw new Error("downstream context aggregate exceeds 32768 bytes");
     }
     return records;
   }
@@ -1130,6 +1128,50 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         throw new Error(`downstream context source ${input.fromUnitId} is not integrated`);
       }
       throw new Error(decision.reason);
+    }
+    const existingByTarget = new Map<string, Array<{ fromUnitId: string; payloadHash: string; payload: Record<string, unknown> }>>();
+    const existingRows = db.prepare(`
+      SELECT from_unit_id, to_unit_id, payload_hash, payload
+      FROM execution_downstream_context
+      WHERE parent_attempt_id = ?
+      ORDER BY created_at, id
+    `).all(input.parentAttemptId) as Array<{
+      from_unit_id: string;
+      to_unit_id: string;
+      payload_hash: string;
+      payload: string;
+    }>;
+    for (const row of existingRows) {
+      const records = existingByTarget.get(row.to_unit_id) ?? [];
+      records.push({
+        fromUnitId: row.from_unit_id,
+        payloadHash: row.payload_hash,
+        payload: JSON.parse(row.payload) as Record<string, unknown>,
+      });
+      existingByTarget.set(row.to_unit_id, records);
+    }
+    const candidateByTarget = new Map(existingByTarget);
+    for (const record of decision.records) {
+      const targetRecords = [...(candidateByTarget.get(record.toUnitId) ?? [])];
+      const wireRecord = {
+        fromUnitId: record.fromUnitId,
+        payloadHash: record.payloadHash,
+        payload: record.payload,
+      };
+      if (!targetRecords.some((existing) =>
+        existing.fromUnitId === wireRecord.fromUnitId && existing.payloadHash === wireRecord.payloadHash
+      )) {
+        targetRecords.push(wireRecord);
+      }
+      candidateByTarget.set(record.toUnitId, targetRecords);
+    }
+    for (const [target, records] of candidateByTarget) {
+      if (records.length > MAX_DOWNSTREAM_CONTEXT_RECORDS) {
+        throw new Error(`downstream context target ${target} exceeds 32 records`);
+      }
+      if (Buffer.byteLength(canonicalJson(records), "utf8") > MAX_DOWNSTREAM_CONTEXT_AGGREGATE_BYTES) {
+        throw new Error(`downstream context target ${target} exceeds 32768 bytes`);
+      }
     }
     const unitRowsById = new Map(rows.map((row) => [row.unit_id, row]));
     const from = unitRowsById.get(input.fromUnitId)!;

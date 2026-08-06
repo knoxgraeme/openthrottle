@@ -183,16 +183,15 @@ function childExecutorEnv(request: ChildExecutorActionRequest): string {
   ].join(" ");
 }
 
-function loopActionHeartbeatEnv(request: LoopActionRequest): string {
-  if (!request.parentRunId) {
-    return [
-      "env",
-      `OT_CHILD_ACTION_ID=${shellSingleQuoted(request.actionId)}`,
-    ].join(" ");
-  }
+function loopActionEnv(request: LoopActionRequest): string {
   return [
-    "env",
-    `RUN_ID=${shellSingleQuoted(request.parentRunId)}`,
+    "env -i",
+    "HOME=/home/agent",
+    "USER=agent",
+    "LOGNAME=agent",
+    "SHELL=/bin/bash",
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    ...(request.parentRunId ? [`RUN_ID=${shellSingleQuoted(request.parentRunId)}`] : []),
     `OT_CHILD_ACTION_ID=${shellSingleQuoted(request.actionId)}`,
   ].join(" ");
 }
@@ -557,7 +556,7 @@ export function createDaytonaSandboxRuntime(
         throw new Error("Daytona runtime does not expose session command execution");
       }
       await sandbox.process?.createSession?.(sessionId).catch(() => undefined);
-      const heartbeatEnv = loopActionHeartbeatEnv(request);
+      const cleanEnv = loopActionEnv(request);
       const dispatched = await sandbox.process.executeSessionCommand(sessionId, {
         command: `flock --nonblock ${lockPath} sh -c ` +
           shellSingleQuoted([
@@ -572,9 +571,9 @@ export function createDaytonaSandboxRuntime(
             `chown root:root ${shellSingleQuoted(requestPath)} ${shellSingleQuoted(credentialsPath)}`,
             `chmod 400 ${shellSingleQuoted(requestPath)} ${shellSingleQuoted(credentialsPath)}`,
             `rm -f ${shellSingleQuoted(stagedCredentialsPath)}`,
-            `${heartbeatEnv} /opt/openthrottle/runner/heartbeat.mjs & heartbeat_pid=$!`,
+            `${cleanEnv} /opt/openthrottle/runner/heartbeat.mjs & heartbeat_pid=$!`,
             `trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT INT TERM`,
-            `set +e; /opt/openthrottle/runner/execute-loop.mjs --request ${shellSingleQuoted(requestPath)} --credentials ${shellSingleQuoted(credentialsPath)} --output ${shellSingleQuoted(resultPath)}; status=$?; kill "$heartbeat_pid" 2>/dev/null || true; wait "$heartbeat_pid" 2>/dev/null || true; exit "$status"`,
+            `set +e; ${cleanEnv} /opt/openthrottle/runner/execute-loop.mjs --request ${shellSingleQuoted(requestPath)} --credentials ${shellSingleQuoted(credentialsPath)} --output ${shellSingleQuoted(resultPath)}; status=$?; kill "$heartbeat_pid" 2>/dev/null || true; wait "$heartbeat_pid" 2>/dev/null || true; exit "$status"`,
           ].join(" && ")) +
           // A losing `flock --nonblock` (another dispatch for this exact
           // action already holds it) exits nonzero without ever running the
