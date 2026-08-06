@@ -107,7 +107,7 @@ function request(overrides = {}) {
     timeoutMs: 30_000,
     transitionContext: "Implement the unit.",
     allowedMcpServers: ["github"],
-    credentialScopes: ["model.invoke", "repo.read", "repo.write"],
+    credentialScopes: ["model.invoke", "repo.read"],
     receiptSchema: "openthrottle.receipt/v1",
     ...overrides,
   };
@@ -170,7 +170,7 @@ function repositorySkillRequest() {
     timeoutMs: 30_000,
     transitionContext: "Implement the unit.",
     allowedMcpServers: [],
-    credentialScopes: ["model.invoke", "repo.read", "repo.write"],
+    credentialScopes: ["model.invoke", "repo.read"],
     receiptSchema: "openthrottle.receipt/v1",
     repositorySkill,
   };
@@ -516,21 +516,21 @@ describe("loop action request validation", () => {
       .toThrow(/credential scope daytona\.admin is not a recognized logical credential/);
   });
 
-  it("rejects lead loop requests carrying write credentials while preserving worker writes", () => {
+  it("rejects structured loop requests carrying write credentials", () => {
     expect(() => validateLoopRequest(leadRequest({
       credentialScopes: ["model.invoke", "repo.read", "repo.write"],
-    }))).toThrow(/lead loop cannot request repo\.write/);
+    }))).toThrow(/structured loop actions cannot request repo\.write/);
 
     expect(() => validateLoopRequest(request({
       role: "worker",
       loop: "implement",
       credentialScopes: ["model.invoke", "repo.read", "repo.write"],
-    }))).not.toThrow();
+    }))).toThrow(/structured loop actions cannot request repo\.write/);
   });
 
   it("accepts every closed logical credential scope, including mcp", () => {
     expect(() => validateLoopRequest(request({
-      credentialScopes: ["mcp", "model.invoke", "provider.read", "repo.read", "repo.write"],
+      credentialScopes: ["mcp", "model.invoke", "provider.read", "repo.read"],
     }))).not.toThrow();
   });
 
@@ -663,7 +663,7 @@ describe("loop action request validation", () => {
     const valid = validateLoopRequest(request({
       agent: "claude",
       allowedMcpServers: [],
-      credentialScopes: ["model.invoke", "repo.read", "repo.write"],
+      credentialScopes: ["model.invoke", "repo.read"],
     }));
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
     const integrationRepoDir = mkdtempSync(join(tmpdir(), "ot-loop-integration-"));
@@ -733,7 +733,7 @@ describe("loop action request validation", () => {
     const valid = validateLoopRequest(request({
       agent: "claude",
       allowedMcpServers: ["github"],
-      credentialScopes: ["mcp", "model.invoke", "repo.read", "repo.write"],
+      credentialScopes: ["mcp", "model.invoke", "repo.read"],
     }));
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
     const integrationRepoDir = mkdtempSync(join(tmpdir(), "ot-loop-integration-"));

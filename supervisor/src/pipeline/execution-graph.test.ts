@@ -126,7 +126,7 @@ function minimalUnitGraph(overrides: {
       skills: ["builtin://ce/implement@1"],
       allowed_mcp_servers: [],
       session_scope: "fresh",
-      credentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+      credentials: ["model.invoke", "provider.read", "repo.read"],
       ...overrides.worker,
     }, {
       id: "lead-worker",
@@ -250,7 +250,7 @@ describe("execution graph compiler", () => {
         evaluator: { kind: "semantic", assurance: "executor_verified", required_artifacts: ["execution_graph_result"] },
         context: "none",
         live_steering: false,
-        credentials: ["provider.read", "repo.read", "repo.write"],
+        credentials: ["provider.read", "repo.read"],
         produces: ["stage_result", "execution_graph_result"],
         unitPhases: ["implement", "simplify", "command", "candidate", "lead", "integrate"],
         unitCommandNames: ["test", "lint", "build"],
@@ -313,7 +313,7 @@ describe("execution graph compiler", () => {
     const compiled = validateAndCompileExecutionGraph(minimalUnitGraph({
       worker: {
         skills: ["repo://implement_unit"],
-        credentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+        credentials: ["model.invoke", "provider.read", "repo.read"],
       },
       loop: { skill: "repo://implement_unit" },
     }), {
@@ -365,13 +365,13 @@ describe("execution graph compiler", () => {
     const compiled = validateAndCompileExecutionGraph(minimalUnitGraph({
       worker: {
         allowed_mcp_servers: ["github"],
-        credentials: ["model.invoke", "mcp", "provider.read", "repo.read", "repo.write"],
+        credentials: ["model.invoke", "mcp", "provider.read", "repo.read"],
       },
     }));
 
     expect(compiled.manifest.manifest.stages[0]?.unitPhaseBindings?.[0]).toMatchObject({
       id: "implement",
-      credentials: ["model.invoke", "mcp", "provider.read", "repo.read", "repo.write"],
+      credentials: ["model.invoke", "mcp", "provider.read", "repo.read"],
       worker: { allowed_mcp_servers: ["github"] },
     });
   });
@@ -383,7 +383,7 @@ describe("execution graph compiler", () => {
         credentials: ["repo.read"],
       },
       leadLoop: { skill: "builtin://accept-unit@1" },
-    }))).toThrow(/graph\.loops\.lead-loop: accept-unit@1 requires credential scope model\.invoke/);
+    }))).toThrow(/unitPhaseBindings\[2\]\.credentials: accept-unit@1 requires credential scope model\.invoke/);
 
     expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
       leadWorker: {
@@ -391,7 +391,7 @@ describe("execution graph compiler", () => {
         credentials: ["model.invoke", "repo.read", "provider.read"],
       },
       leadLoop: { skill: "builtin://accept-unit@1" },
-    }))).toThrow(/graph\.loops\.lead-loop: accept-unit@1 is not authorized for credential scope provider\.read/);
+    }))).toThrow(/unitPhaseBindings\[2\]\.credentials: accept-unit@1 is not authorized for credential scope provider\.read/);
   });
 
   it("compiles repository skills to the platform repository-skill capability with pinned package identity", () => {

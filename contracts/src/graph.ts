@@ -306,6 +306,13 @@ function validateGraph(graph: GraphContract, source: string, config?: Repository
             fail(`${source}.nodes.${node.id}.phases[${index}].worker.credentials`, "gate phases cannot request repo.write");
           }
         }
+        if ((phase.kind === "agent" || phase.kind === "gate") && phase.loop) {
+          const loop = loops.get(phase.loop);
+          const worker = loop ? workers.get(loop.worker) : undefined;
+          if (worker?.credentials.includes("repo.write")) {
+            fail(`${source}.nodes.${node.id}.phases[${index}].worker.credentials`, "structured child phases cannot request repo.write");
+          }
+        }
         if (phase.kind === "command" && phase.commands && configuredCommands) {
           for (const command of phase.commands) {
             if (!configuredCommands.has(command)) {

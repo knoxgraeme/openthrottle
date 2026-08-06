@@ -63,6 +63,7 @@ function action(overrides: Partial<ExecutionWorkAttempt> & {
     idempotency_key: `idem-${overrides.id}`,
     request_hash: null,
     result_hash: null,
+    terminal_result_outcome: null,
     receipt: null,
     receipt_hash: null,
     native_session_id: null,

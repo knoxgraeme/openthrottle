@@ -112,6 +112,22 @@ function pipelineUsesOpenCodeLoopActions(manifest: ValidatedPipelineManifest, se
   );
 }
 
+function effectiveStructuredWorkerAgents(manifest: ValidatedPipelineManifest, selectedAgent: Agent): Set<Agent> {
+  const agents = new Set<Agent>();
+  for (const stage of manifest.manifest.stages) {
+    if (stage.credentials.includes("model.invoke")) agents.add(selectedAgent);
+    if (stage.executor.kind !== "loop_action") continue;
+    for (const binding of stage.unitPhaseBindings ?? []) {
+      if (binding.kind !== "agent" && binding.kind !== "gate") continue;
+      const workerAgent = binding.worker.agent === undefined || binding.worker.agent === "inherit"
+        ? selectedAgent
+        : binding.worker.agent;
+      agents.add(workerAgent);
+    }
+  }
+  return agents;
+}
+
 function extractShipSelectionGraphId(context: string): string | undefined {
   const blocks = extractJsonBlocks(context, SHIP_SELECTION_FENCE);
   if (blocks.length === 0) return undefined;
@@ -505,10 +521,14 @@ export async function handleCreated(
     // Fail closed here, before the repository snapshot, the capacity preflight,
     // the ticket row, and any Daytona provisioning: a generation whose engine
     // has no credential can only end as an opaque in-sandbox launch failure.
-    if (pipelineInvokesModel(manifest) && !hasAgentSubscription(cfg, selectedAgent)) {
+    const requiredAgents = pipelineInvokesModel(manifest)
+      ? effectiveStructuredWorkerAgents(manifest, selectedAgent)
+      : new Set<Agent>();
+    const missingAgent = [...requiredAgents].find((agent) => !hasAgentSubscription(cfg, agent));
+    if (missingAgent) {
       throw new Error(
-        `${agentDisplayName(selectedAgent)} is selected for this pipeline but its credential is not configured on the supervisor ` +
-        `(set ${agentCredentialVariable(selectedAgent)}). No sandbox was provisioned.`
+        `${agentDisplayName(missingAgent)} is selected for this pipeline but its credential is not configured on the supervisor ` +
+        `(set ${agentCredentialVariable(missingAgent)}). No sandbox was provisioned.`
       );
     }
     if (pipelineUsesOpenCodeLoopActions(manifest, selectedAgent)) {

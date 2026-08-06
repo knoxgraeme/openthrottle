@@ -18,6 +18,7 @@ function action(overrides: Partial<ExecutionWorkAttempt> = {}): ExecutionWorkAtt
     idempotency_key: "unit-action:attempt-parent:a:1",
     request_hash: null,
     result_hash: null,
+    terminal_result_outcome: null,
     receipt: null,
     receipt_hash: null,
     native_session_id: null,

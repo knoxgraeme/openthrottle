@@ -88,7 +88,7 @@ function unitPhaseBindings(): unknown[] {
     engine: "agent",
     allowed_mcp_servers: [],
     session_scope: "fresh",
-    credentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+    credentials: ["model.invoke", "provider.read", "repo.read"],
   };
   const loop = {
     id: "loop",
@@ -109,7 +109,7 @@ function unitPhaseBindings(): unknown[] {
       worker,
       executor: { kind: "agent", capability: "ce/implement@1" },
       context: "fresh",
-      credentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+      credentials: ["model.invoke", "provider.read", "repo.read"],
     },
     { id: "candidate", kind: "evidence" },
     {
@@ -478,7 +478,7 @@ describe("pipeline manifest validation", () => {
       evaluator: { kind: "semantic", assurance: "executor_verified", required_artifacts: ["execution_graph_result"] },
       context: "none",
       live_steering: false,
-      credentials: ["repo.read", "repo.write"],
+      credentials: ["repo.read"],
       produces: ["stage_result", "execution_graph_result"],
       unitPhases: ["implement", "candidate", "lead", "integrate"],
       unitCommandNames: [],
@@ -549,7 +549,7 @@ describe("pipeline manifest validation", () => {
       evaluator: { kind: "semantic", assurance: "executor_verified", required_artifacts: ["execution_graph_result"] },
       context: "none",
       live_steering: false,
-      credentials: ["repo.read", "repo.write"],
+      credentials: ["repo.read"],
       produces: ["stage_result", "execution_graph_result"],
       unitPhases: ["implement", "candidate", "lead", "integrate"],
       unitCommandNames: [],
@@ -581,17 +581,17 @@ describe("pipeline manifest validation", () => {
       value,
       0,
       "ce/plan@1",
-      ["model.invoke", "repo.read", "repo.write"],
+      ["model.invoke", "provider.read", "repo.read"],
     )))
-      .toThrow(/unitPhaseBindings\[0\]\.credentials: ce\/plan@1 is not authorized for credential scope repo\.write/);
+      .toThrow(/unitPhaseBindings\[0\]\.credentials: ce\/plan@1 is not authorized for credential scope provider\.read/);
 
     expect(() => validatePipelineManifest(manifestWithUnitBindingCapability(
       value,
       0,
       "ce/implement@1",
-      ["model.invoke", "provider.read", "repo.read"],
+      ["provider.read", "repo.read"],
     )))
-      .toThrow(/unitPhaseBindings\[0\]\.credentials: ce\/implement@1 requires credential scope repo\.write/);
+      .toThrow(/unitPhaseBindings\[0\]\.credentials: ce\/implement@1 requires credential scope model\.invoke/);
 
     expect(() => validatePipelineManifest(manifestWithUnitBindingCapability(value, 0, "ce/publish@1")))
       .toThrow(/unitPhaseBindings\[0\]\.context: ce\/publish@1 does not support context policy fresh/);

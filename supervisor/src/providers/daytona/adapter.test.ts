@@ -24,7 +24,7 @@ function fencedLoopRequest(overrides: Partial<Omit<LoopActionRequest, "requestHa
     timeoutMs: 30_000,
     transitionContext: "implement unit",
     allowedMcpServers: ["github"],
-    credentialScopes: ["model.invoke", "repo.read", "repo.write"] as const,
+    credentialScopes: ["model.invoke", "repo.read"] as const,
     receiptSchema: "openthrottle.receipt/v1",
     ...overrides,
   } as Omit<LoopActionRequest, "requestHash" | "idempotencyKey">;
@@ -288,7 +288,7 @@ describe("Daytona stage execution", () => {
     // whatever the ticket-level default would have selected.
     expect(credentialProvider).toHaveBeenLastCalledWith(
       resource,
-      ["model.invoke", "repo.read", "repo.write"],
+      ["model.invoke", "repo.read"],
       "codex"
     );
     expect(JSON.parse((uploadedCredentialsCall![0] as Buffer).toString("utf8"))).toEqual({
@@ -664,7 +664,7 @@ describe("Daytona stage execution", () => {
     });
 
     await expect(runtime.dispatchLoopAction({ providerResourceId: "provider-opaque-lead-write" }, request))
-      .rejects.toThrow(/lead loop actions cannot request repo\.write/);
+      .rejects.toThrow(/structured loop actions cannot request repo\.write/);
     expect(materializeCredentialEnv).not.toHaveBeenCalled();
     expect(sandbox.fs.uploadFile).not.toHaveBeenCalled();
   });

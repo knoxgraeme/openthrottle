@@ -13,7 +13,7 @@ import {
   type UnitCompletionReceipt,
   type UnitDecisionReceipt,
 } from "@openthrottle/contracts";
-import { canonicalJson, stageById, type StageOutcome } from "../pipeline/manifest.js";
+import { canonicalJson, digestNormalized, stageById, type StageOutcome } from "../pipeline/manifest.js";
 import { FOR_EACH_UNIT_CAPABILITY } from "../pipeline/capability-contracts.js";
 import { coordinatePipelineEvent } from "../pipeline/coordinator.js";
 import {
@@ -156,7 +156,7 @@ const FINAL_REPAIR_BINDING = builtinLoopBinding({
   kind: "agent",
   workerId: "final-repair",
   skill: "final-repair",
-  credentials: ["model.invoke", "repo.read", "repo.write"],
+  credentials: ["model.invoke", "repo.read"],
 });
 
 function extractExecutionPlan(context: string): ExecutionPlanContract {
@@ -601,12 +601,60 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         entry.receipt.fence.unit_id === (unitId ?? "__final__") &&
         (cycle === undefined || entry.attempt.cycle === cycle));
 
+  const priorEvidenceForAction = (
+    action: ExecutionWorkAttempt,
+    receipts: readonly { attempt: ExecutionWorkAttempt; receipt: StandardReceipt }[]
+  ): LoopActionRequest["priorEvidence"] | undefined => {
+    if (action.action_kind === "lead") {
+      let completion: { attempt: ExecutionWorkAttempt; receipt: UnitCompletionReceipt };
+      let candidate: { attempt: ExecutionWorkAttempt; receipt: CandidateEvidenceReceipt };
+      try {
+        completion = unitCompletionAttemptReceipt(receipts, action.unit_id, action.cycle);
+        candidate = latestAttemptReceipt<CandidateEvidenceReceipt>(receipts, "candidate_evidence", action.unit_id, action.cycle);
+      } catch {
+        return undefined;
+      }
+      const commands = commandAttemptReceipts(receipts, action.unit_id, action.cycle);
+      return {
+        schema: "openthrottle.loop-prior-evidence/v1",
+        role: "lead",
+        receipts: [
+          { role: "completion", actionAttemptId: completion.attempt.id, receiptHash: digestNormalized(canonicalJson(completion.receipt)) },
+          { role: "candidate", actionAttemptId: candidate.attempt.id, receiptHash: digestNormalized(canonicalJson(candidate.receipt)) },
+          ...commands.map((command) => ({
+            role: "command" as const,
+            actionAttemptId: command.attempt.id,
+            receiptHash: digestNormalized(canonicalJson(command.receipt)),
+          })),
+        ],
+      };
+    }
+    if (action.action_kind === "final_review") {
+      const commands = commandAttemptReceipts(receipts, null, action.cycle);
+      return {
+        schema: "openthrottle.loop-prior-evidence/v1",
+        role: "final_review",
+        receipts: commands.map((command) => ({
+          role: "final_command" as const,
+          actionAttemptId: command.attempt.id,
+          receiptHash: digestNormalized(canonicalJson(command.receipt)),
+        })),
+      };
+    }
+    return undefined;
+  };
+
   const dispatchChildAction = async (
     resource: RuntimeResource,
     instance: PipelineInstance,
     action: ExecutionWorkAttempt
   ): Promise<{ requestHash: string; nativeSessionId?: string | null }> => {
     if (isChildExecutorActionKind(action.action_kind)) {
+      if (action.request_payload && action.request_hash) {
+        const replayRequest = JSON.parse(action.request_payload) as ChildExecutorActionRequest;
+        await deps.runtime.dispatchChildExecutorAction(resource, replayRequest);
+        return { requestHash: replayRequest.requestHash, nativeSessionId: null };
+      }
       const baseSubject = sha1SubjectForGitOperation(worktreeBaseFor(instance, action), "child action base subject");
       const candidateSubject = action.action_kind === "integrate"
         ? action.unit_id === null
@@ -646,8 +694,30 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         inputSubject: actionInputSubjectFor(instance, action),
         ...(integrationCandidateSubject ? { candidateSubject: integrationCandidateSubject } : {}),
       });
+      deps.store.prepareActionDispatch?.({
+        actionId: action.id,
+        requestHash: request.requestHash,
+        requestPayload: canonicalJson(request),
+        nativeSessionId: null,
+      });
       await deps.runtime.dispatchChildExecutorAction(resource, request);
       return { requestHash: request.requestHash, nativeSessionId: null };
+    }
+    if (action.request_payload && action.request_hash) {
+      const replayRequest = JSON.parse(action.request_payload) as LoopActionRequest;
+      const needsWorktree = replayRequest.worktree !== null &&
+        (action.request_launch_state === "prepared" || action.request_launch_state == null) &&
+        (action.action_kind === "implement" || action.action_kind === "repair" || action.action_kind === "final_repair");
+      if (needsWorktree) {
+        await deps.runtime.createWorktree(resource, {
+          idempotencyKey: worktreeIdempotencyKey(action),
+          attemptId: action.parent_attempt_id,
+          baseCommit: sha1SubjectForGitOperation(worktreeBaseFor(instance, action), "child action base subject"),
+        });
+        deps.store.markActionWorktreeReady?.(action.id);
+      }
+      await deps.runtime.dispatchLoopAction(resource, replayRequest);
+      return { requestHash: replayRequest.requestHash, nativeSessionId: replayRequest.nativeSessionId ?? null };
     }
     const binding = actionBinding(instance, action);
     const workerBinding = binding && (binding.kind === "agent" || binding.kind === "gate") ? binding : undefined;
@@ -663,15 +733,23 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     const createNewWorktree = action.action_kind === "implement" ||
       action.action_kind === "repair" ||
       action.action_kind === "final_repair";
-      const worktree = await (async (): Promise<LoopActionRequest["worktree"]> => {
+      const worktree = (() : LoopActionRequest["worktree"] => {
         if (roleFor(action.action_kind) !== "worker") return null;
       if (!createNewWorktree) return worktreeHandleFor(action, baseCommit);
-      return deps.runtime.createWorktree(resource, {
-        idempotencyKey: worktreeIdempotencyKey(action),
-        attemptId: action.parent_attempt_id,
-        baseCommit,
-      });
+      return worktreeHandleFor(action, baseCommit);
     })();
+    const receipts = completedAttemptReceiptsFor(action.parent_attempt_id);
+    const priorEvidence = priorEvidenceForAction(action, receipts);
+    const downstreamContext = action.unit_id
+      ? (typeof deps.store.listDownstreamContext === "function"
+          ? deps.store.listDownstreamContext(action.parent_attempt_id, action.unit_id)
+          : []
+        ).map((record) => ({
+          fromUnitId: record.from_unit_id,
+          payloadHash: record.payload_hash,
+          payload: JSON.parse(record.payload) as Record<string, unknown>,
+        }))
+      : [];
     const contextPolicy = workerBinding.context === "none"
       ? "fresh"
       : workerBinding.context === "resume_required" && !action.native_session_id
@@ -711,9 +789,14 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           unavailable: true,
         }),
         "",
-        "## Parent Task Context",
-        parentTaskContext,
+        "## Prior Evidence",
+        canonicalJson(priorEvidence ?? { schema: "openthrottle.loop-prior-evidence/v1", role: null, receipts: [] }),
+        "",
+        "## Downstream Context",
+        canonicalJson(downstreamContext),
       ].join("\n"),
+      ...(priorEvidence ? { priorEvidence } : {}),
+      ...(downstreamContext.length > 0 ? { downstreamContext } : {}),
       ...(action.action_kind === "lead"
         ? {
             candidateSubject: deps.store.listUnits(action.parent_attempt_id)
@@ -733,6 +816,20 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       expectedProducer: expectedProducerForAction(instance, action),
       ...(workerBinding?.repositorySkill ? { repositorySkill: workerBinding.repositorySkill } : {}),
     });
+    deps.store.prepareActionDispatch?.({
+      actionId: action.id,
+      requestHash: loopRequest.requestHash,
+      requestPayload: canonicalJson(loopRequest),
+      nativeSessionId: loopRequest.nativeSessionId,
+    });
+    if (createNewWorktree && worktree) {
+      await deps.runtime.createWorktree(resource, {
+        idempotencyKey: worktreeIdempotencyKey(action),
+        attemptId: action.parent_attempt_id,
+        baseCommit,
+      });
+      deps.store.markActionWorktreeReady?.(action.id);
+    }
     await deps.runtime.dispatchLoopAction(resource, loopRequest);
     return { requestHash: loopRequest.requestHash, nativeSessionId: action.native_session_id ?? null };
   };

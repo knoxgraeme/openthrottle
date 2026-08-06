@@ -45,8 +45,11 @@ export function createUnitEffectProcessor(input: {
         leaseUntilIso: new Date(leasedAt.getTime() + leaseMs).toISOString(),
       });
       if (!action) return undefined;
+      const preparedNotLaunched = action.request_hash != null &&
+        action.request_payload != null &&
+        action.request_launch_state !== "launched";
       const requestlessDispatch = action.status === "dispatched" && !action.request_hash;
-      if (!requestlessDispatch) {
+      if (!requestlessDispatch && !preparedNotLaunched) {
         const recovered = await input.runtime.collectUnitAction(action);
         if (recovered) {
           if (recovered.terminal) {
@@ -102,9 +105,9 @@ export function createUnitEffectProcessor(input: {
           return action;
         }
       }
-      const shouldDispatch = action.status === "leased" || requestlessDispatch;
+      const shouldDispatch = action.status === "leased" || requestlessDispatch || preparedNotLaunched;
       if (!shouldDispatch) return action;
-      if (action.status === "leased") input.store.markActionDispatching(action.id);
+      if (action.status === "leased" && !action.request_hash) input.store.markActionDispatching(action.id);
       const dispatched = await input.runtime.dispatchUnitAction(action);
       input.store.markActionDispatched(action.id, dispatched.requestHash, dispatched.nativeSessionId ?? null);
       return action;

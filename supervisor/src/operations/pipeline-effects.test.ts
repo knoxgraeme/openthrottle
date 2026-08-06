@@ -660,7 +660,7 @@ describe("pipeline effect processor", () => {
         skills: ["repo://implement_unit"],
         allowed_mcp_servers: [],
         session_scope: "fresh",
-        credentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+        credentials: ["model.invoke", "provider.read", "repo.read"],
       }, {
         id: "lead-worker",
         engine: "agent",

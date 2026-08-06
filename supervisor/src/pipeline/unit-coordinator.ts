@@ -134,7 +134,10 @@ export function routeUnitAcceptanceDecision(input: {
   maxRepairRounds: number;
 }): UnitAcceptanceRouting {
   if (input.outcome === "success") return { action: "integrate" };
-  if (input.outcome === "semantic_repair_required") {
+  if (
+    input.outcome === "semantic_repair_required" ||
+    (input.outcome === "failure" && input.reason.includes("command"))
+  ) {
     if (input.repairRounds + 1 > input.maxRepairRounds) return { action: "settle", reason: "defect" };
     return { action: "repair", repairRounds: input.repairRounds + 1 };
   }

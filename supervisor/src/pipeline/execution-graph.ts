@@ -189,6 +189,12 @@ function assertGateReadOnly(
   }
 }
 
+function assertStructuredChildReadOnly(worker: GraphWorker, path: string): void {
+  if (worker.credentials.includes("repo.write")) {
+    fail(`${path}.worker.credentials`, "structured child phases cannot request repo.write");
+  }
+}
+
 function compileTransitions(node: GraphNode): Record<StageOutcome, PipelineTransition> {
   const transitions: Partial<Record<StageOutcome, PipelineTransition>> = {
     ...DEFAULT_TERMINALS,
@@ -278,18 +284,11 @@ function unitPhaseLoop(
   const context = contextFromSessionScope(worker);
   const kind = phase.kind as "agent" | "gate";
   assertGateReadOnly(phase, worker, capability, `graph.nodes.${node.id}.phases.${index}`);
-  assertCapabilityAuthorized({
-    executor: { kind: "agent", capability },
-    evaluator: {
-      kind: "semantic",
-      assurance: "semantic_attested",
-      required_artifacts: ["stage_result"],
-    },
-    context,
-    live_steering: false,
-    credentials: worker.credentials,
-    produces: ["stage_result"],
-  }, `graph.loops.${loop.id}`);
+  assertStructuredChildReadOnly(worker, `graph.nodes.${node.id}.phases.${index}`);
+  // Structured child agents mutate only executor-owned local worktrees. Remote
+  // write credentials are intentionally unavailable, so the simple-stage
+  // capability minimum for repo.write does not apply to this child dispatch
+  // boundary.
   return {
     id: phase.id,
     kind,

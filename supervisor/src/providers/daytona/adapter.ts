@@ -94,8 +94,8 @@ function assertLoopRequestFence(request: LoopActionRequest): void {
     // sealing lands; fail closed before dispatch rather than in-sandbox.
     throw new Error("opencode loop actions are not supported yet");
   }
-  if (request.role === "lead" && request.credentialScopes.includes("repo.write")) {
-    throw new Error("lead loop actions cannot request repo.write");
+  if (request.role !== "publisher" && request.credentialScopes.includes("repo.write")) {
+    throw new Error("structured loop actions cannot request repo.write");
   }
   const expectedHash = digestNormalized(canonicalJson(normalizedLoopRequestForHash(request)));
   const expectedKey = `loop:${request.attemptId}:${request.actionId}:${expectedHash}`;

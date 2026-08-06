@@ -85,6 +85,20 @@ export interface LoopActionRequest {
   contextPolicy: "fresh" | "resume_required" | "prefer_resume";
   timeoutMs: number;
   transitionContext: string;
+  priorEvidence?: {
+    schema: "openthrottle.loop-prior-evidence/v1";
+    role: "lead" | "final_review";
+    receipts: Array<{
+      role: ReceiptEvidenceRole;
+      actionAttemptId: string;
+      receiptHash: string;
+    }>;
+  };
+  downstreamContext?: Array<{
+    fromUnitId: string;
+    payloadHash: string;
+    payload: Record<string, unknown>;
+  }>;
   allowedMcpServers: readonly string[];
   credentialScopes: readonly LogicalCredential[];
   receiptSchema: string;
@@ -100,6 +114,8 @@ export interface LoopActionRequest {
   requestHash: string;
   idempotencyKey: string;
 }
+
+type ReceiptEvidenceRole = "completion" | "candidate" | "command" | "final_command";
 
 export interface LoopActionResult {
   actionId: string;

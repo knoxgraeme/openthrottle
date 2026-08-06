@@ -79,8 +79,8 @@ export const CAPABILITY_CONTRACTS = Object.freeze({
   },
   "graph/for-each-unit@1": {
     kind: "loop_action",
-    minimumCredentials: ["repo.read", "repo.write"],
-    allowedCredentials: ["provider.read", "repo.read", "repo.write"],
+    minimumCredentials: ["repo.read"],
+    allowedCredentials: ["provider.read", "repo.read"],
     contexts: ["none"],
     artifacts: ["stage_result", "execution_graph_result"],
   },

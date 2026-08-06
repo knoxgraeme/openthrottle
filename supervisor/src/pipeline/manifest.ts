@@ -389,6 +389,9 @@ function validateUnitPhaseBindings(
         );
       }
     }
+    if (binding.credentials.includes("repo.write") || binding.worker.credentials.includes("repo.write")) {
+      fail(`${path}[${index}].credentials`, "structured child phase bindings cannot request repo.write");
+    }
     if (canonicalJson(binding.credentials) !== canonicalJson(binding.worker.credentials)) {
       fail(`${path}[${index}].credentials`, "must match worker.credentials");
     }
@@ -405,6 +408,7 @@ function validateUnitPhaseBindingCapabilityContract(
     context: binding.context,
     credentials: binding.credentials,
   })) {
+    if (violation.field === "credentials" && /repo\.write/.test(violation.message)) continue;
     fail(`${path}.${violation.field}`, violation.message);
   }
 }

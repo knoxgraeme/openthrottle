@@ -1311,6 +1311,7 @@ describe("execution unit store", () => {
     })).toMatchObject({
       id: failed.id,
       status: "failed",
+      terminal_result_outcome: "failure",
       result_hash: "result-hash",
       native_session_id: "native-session-2",
       last_error: "child action returned failure",
@@ -1342,6 +1343,13 @@ describe("execution unit store", () => {
       actionId: failed.id,
       resultHash: "different-result",
       outcome: "failure",
+      lastError: "child action returned failure",
+      nativeSessionId: "native-session-2",
+    })).toThrow(/already terminated with a different result/);
+    expect(() => store.failUnitAction({
+      actionId: failed.id,
+      resultHash: "result-hash",
+      outcome: "needs_human",
       lastError: "child action returned failure",
       nativeSessionId: "native-session-2",
     })).toThrow(/already terminated with a different result/);
@@ -1382,6 +1390,7 @@ describe("execution unit store", () => {
     })).toMatchObject({
       id: retryable.id,
       status: "dead",
+      terminal_result_outcome: "retryable_infrastructure_failure",
       result_hash: "result-hash",
       native_session_id: "native-session-2",
       last_error: expect.stringContaining("retryable_infrastructure_failure"),
