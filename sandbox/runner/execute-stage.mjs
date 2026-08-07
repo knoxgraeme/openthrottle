@@ -89,6 +89,26 @@ const CONTEXT_POLICIES = new Set([
 const COMMAND_NAME = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
 const REMOTE_GIT_TIMEOUT_MS = 15_000;
 const DEFAULT_STAGE_ACTION_ROOT = "/var/lib/openthrottle/stage-actions";
+// Explicit capability -> skill binding for `ce/`-prefixed agent stages.
+// review-change/simplify-change ship in the adoption ticket; the constants
+// are named now so this map selects them the moment their skill packages
+// land, instead of silently keying skill selection off `taskType` (which
+// only ever distinguishes implement from investigate and left every other
+// capability -- review, simplify, publish -- falling through to
+// implement-plan).
+const STAGE_CAPABILITY_SKILLS = {
+  "ce/implement@1": "implement-plan",
+  "ce/review@1": "review-change",
+  "ce/simplify@1": "simplify-change",
+  "ce/publish@1": "publish",
+  "ce/investigate@1": "investigate",
+  // ce/plan@1 is a registered, build-gate-pinned capability with no drafted
+  // skill of its own yet (no graph node in this repo uses it, but a
+  // repository-configured pipeline could). Map it explicitly to implement-plan
+  // -- the exact behavior every ce/ capability had before this map existed --
+  // instead of leaving it to fail closed as a genuinely unmapped capability.
+  "ce/plan@1": "implement-plan",
+};
 
 function record(value, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -393,7 +413,16 @@ export function stagePrompt(
       entry += `\n\n${skillBody(readFileSync(join(root, "SKILL.md"), "utf8"))}`;
     }
   } else if (request.capability.startsWith("ce/")) {
-    const skillName = request.taskType === "investigate" ? "investigate" : "implement-plan";
+    const mappedSkillName = STAGE_CAPABILITY_SKILLS[request.capability];
+    if (!mappedSkillName) throw new Error(`stage capability ${request.capability} has no mapped skill`);
+    // review-change/simplify-change land in the adoption ticket; until their
+    // packages are installed, fall back to implement-plan -- the same skill
+    // every ce/ capability resolved to before this map existed, and one that
+    // already branches on the sealed `capability` field in this same prompt.
+    // This keeps a mapped-but-not-yet-installed capability behaviorally
+    // identical to pre-map dispatch instead of instructing the agent to
+    // invoke a skill name nothing on disk provides.
+    const skillName = existsSync(join(skillRoot, mappedSkillName, "SKILL.md")) ? mappedSkillName : "implement-plan";
     entry = `${agent === "claude" ? "/" : "$"}${skillName}`;
     // OpenCode has no admin-scope skill discovery equivalent. Give it the
     // canonical adapter body from the same single source used by other engines.
@@ -576,6 +605,15 @@ export function defaultRunAgent({
     }
   }
 }
+
+// Distinguishes the publish subject-drift fence from a generic executor
+// crash so fallbackStageResultEvent can classify it the same way
+// reconcilePublication classifies the identical problem (a published tree
+// that does not match what was gated) -- semantic_repair_required, not
+// retryable_infrastructure_failure. Undistinguished, the drift would retry
+// against an unrecoverable workspace and exhaust into `failed` instead of
+// routing to a human/repair review.
+class PublishSubjectDriftError extends Error {}
 
 function failureProposal(summary, suggestedOutcome = "retryable_infrastructure_failure") {
   return {
@@ -887,6 +925,24 @@ export function executeStage({
       }
     }
     const gatedSubject = computeWorkspaceTreeOid(repoDir);
+    // The pre-run fence above only proves the workspace matched the sealed
+    // subject before the agent ran; nothing previously re-checked it after.
+    // A publish stage that committed and pushed `gatedSubject` unconditionally
+    // would silently ship whatever tree the agent (or anything else) left
+    // behind, even if no gate ever ran against it. Fail closed here, before
+    // `reconcilePublication` can push, the same way the pre-run fence does --
+    // an uncaught throw routes through `main()`'s fallback path, which reports
+    // `request.expectedSubject` (never the drifted tree) for every subject
+    // field. A publish stage with no sealed expected subject at all has
+    // nothing to verify the gated tree against, so it fails closed the same
+    // way rather than publishing unfenced.
+    if (request.capability === "ce/publish@1" && (!request.expectedSubject || gatedSubject !== request.expectedSubject)) {
+      throw new PublishSubjectDriftError(
+        request.expectedSubject
+          ? "workspace subject drifted from the fenced expected subject before publication"
+          : "publish stage has no sealed expected subject to verify the gated workspace against",
+      );
+    }
     let proposal = execution.proposal;
     let publishedCommit;
     const incompleteAgentExecution = !execution.executorFailure &&
@@ -1019,7 +1075,10 @@ export function fallbackStageResultEvent({ request, repoDir, error }) {
         requiredArtifacts: request.requiredArtifacts,
       })
     : buildSemanticArtifacts({
-        proposal: failureProposal(`Stage execution failed before sealing evidence: ${String(error)}`),
+        proposal: failureProposal(
+          `Stage execution failed before sealing evidence: ${String(error)}`,
+          error instanceof PublishSubjectDriftError ? "semantic_repair_required" : "retryable_infrastructure_failure",
+        ),
         fence,
         requiredArtifacts: request.requiredArtifacts,
       });

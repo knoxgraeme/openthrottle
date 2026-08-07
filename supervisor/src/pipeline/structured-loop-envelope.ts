@@ -107,12 +107,12 @@ function actionPayloadProbe(input: {
 }
 
 function priorReceiptProbe(input: {
-  role: "completion" | "candidate" | "command" | "final_command" | "final_review";
+  role: "completion" | "candidate" | "command" | "final_command" | "final_review" | "lead" | "final_repair";
   actionAttemptId: string;
-  receiptType: "unit_completion" | "candidate_evidence" | "command_result" | "semantic_review";
+  receiptType: "unit_completion" | "candidate_evidence" | "command_result" | "semantic_review" | "unit_decision";
   subject?: string;
 }): {
-  role: "completion" | "candidate" | "command" | "final_command" | "final_review";
+  role: "completion" | "candidate" | "command" | "final_command" | "final_review" | "lead" | "final_repair";
   actionAttemptId: string;
   receiptHash: string;
   receipt: string;
@@ -129,7 +129,9 @@ function priorReceiptProbe(input: {
         ? "builtin://command@1"
         : input.receiptType === "semantic_review"
           ? "builtin://final-review@1"
-          : "builtin://implement-unit@1",
+          : input.receiptType === "unit_decision"
+            ? "builtin://accept-unit@1"
+            : "builtin://implement-unit@1",
       capability_digest: "3".repeat(64),
       skill_package_digest: null,
     },
@@ -137,7 +139,9 @@ function priorReceiptProbe(input: {
     fence: {
       pipeline_instance_id: "instance-" + "i".repeat(32),
       graph_digest: "4".repeat(64),
-      unit_id: input.role === "final_command" || input.role === "final_review" ? "__final__" : "unit-" + "u".repeat(32),
+      unit_id: input.role === "final_command" || input.role === "final_review" || input.role === "final_repair"
+        ? "__final__"
+        : "unit-" + "u".repeat(32),
       attempt_id: "attempt-" + "a".repeat(32),
       parent_run_id: "run-" + "b".repeat(32),
       action_attempt_id: input.actionAttemptId,
@@ -152,15 +156,17 @@ function priorReceiptProbe(input: {
         ? { tree: subject, diff_digest: "6".repeat(64), changed_paths: [], clean: true }
         : input.receiptType === "semantic_review"
           ? { summary: "review requires repair", findings: [{ severity: "P1", message: "repair required" }] }
-          : {
-            summary: "completed",
-            assumptions: [],
-            decisions: [],
-            issues: [],
-            verification: [],
-            downstream_context: [],
-            requested_human_input: [],
-          },
+          : input.receiptType === "unit_decision"
+            ? { rationale: "scope mismatch", revision_request: "repair required", context_updates: [] }
+            : {
+              summary: "completed",
+              assumptions: [],
+              decisions: [],
+              issues: [],
+              verification: [],
+              downstream_context: [],
+              requested_human_input: [],
+            },
     issued_at: "2099-07-22T12:00:00.000Z",
   });
   return {
@@ -406,18 +412,54 @@ function loopRequestProbe(input: {
           },
         }
       : {}),
+    ...(input.actionKind === "repair"
+      ? {
+          priorEvidence: {
+            schema: "openthrottle.loop-prior-evidence/v1",
+            role: "repair",
+            receipts: [
+              priorReceiptProbe({
+                role: "lead",
+                actionAttemptId: "execution-work-" + "l".repeat(32),
+                receiptType: "unit_decision",
+              }),
+              ...Array.from({ length: 16 }, (_, index) => ({
+                ...priorReceiptProbe({
+                  role: "command",
+                  actionAttemptId: `execution-work-${index.toString(16).padStart(32, "0")}`,
+                  receiptType: "command_result",
+                }),
+              })),
+            ],
+          },
+        }
+      : {}),
     ...(input.actionKind === "final_review"
       ? {
           priorEvidence: {
             schema: "openthrottle.loop-prior-evidence/v1",
             role: "final_review",
-            receipts: Array.from({ length: 16 }, (_, index) => ({
-              ...priorReceiptProbe({
-                role: "final_command",
-                actionAttemptId: `execution-work-${index.toString(16).padStart(32, "0")}`,
-                receiptType: "command_result",
+            receipts: [
+              ...Array.from({ length: 16 }, (_, index) => ({
+                ...priorReceiptProbe({
+                  role: "final_command",
+                  actionAttemptId: `execution-work-${index.toString(16).padStart(32, "0")}`,
+                  receiptType: "command_result",
+                }),
+              })),
+              // A re-review round's own worst-case bundle: the previous
+              // round's review plus its intervening repair completion (Q3).
+              priorReceiptProbe({
+                role: "final_review",
+                actionAttemptId: "execution-work-" + "r".repeat(32),
+                receiptType: "semantic_review",
               }),
-            })),
+              priorReceiptProbe({
+                role: "final_repair",
+                actionAttemptId: "execution-work-" + "p".repeat(32),
+                receiptType: "unit_completion",
+              }),
+            ],
           },
         }
       : {}),

@@ -81,8 +81,8 @@ const STANDARD_RECEIPT_SCHEMA = "openthrottle.receipt/v1";
 const PRIOR_EVIDENCE_SCHEMA = "openthrottle.loop-prior-evidence/v1";
 const DOWNSTREAM_CONTEXT_SCHEMA = "openthrottle.downstream-context/v1";
 const MODEL_REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,239}$/;
-const PRIOR_EVIDENCE_ROLES = new Set(["lead", "final_review", "final_repair"]);
-const PRIOR_RECEIPT_ROLES = new Set(["completion", "candidate", "command", "final_command", "final_review"]);
+const PRIOR_EVIDENCE_ROLES = new Set(["lead", "repair", "final_review", "final_repair"]);
+const PRIOR_RECEIPT_ROLES = new Set(["completion", "candidate", "command", "final_command", "final_review", "lead", "final_repair"]);
 const MAX_PRIOR_EVIDENCE_RECEIPTS = 18;
 const MAX_PRIOR_EVIDENCE_BYTES = 49_152;
 const MAX_PRIOR_EVIDENCE_RECEIPT_BYTES = 64 * 1024;
@@ -210,10 +210,46 @@ function priorEvidence(value, label) {
     for (const required of ["completion", "candidate"]) {
       if (!receipts.some((receipt) => receipt.role === required)) throw new Error(`${label} is missing ${required} receipt evidence`);
     }
-    if (receipts.some((receipt) => receipt.role === "final_command")) throw new Error(`${label} contains final command evidence for a lead action`);
+    if (receipts.some((receipt) => receipt.role !== "completion" && receipt.role !== "candidate" && receipt.role !== "command")) {
+      throw new Error(`${label} contains evidence outside completion/candidate/command for a lead action`);
+    }
   }
-  if (role === "final_review" && receipts.some((receipt) => receipt.role !== "final_command")) {
-    throw new Error(`${label} contains non-final-command evidence for final review`);
+  if (role === "repair") {
+    const triggeringLead = receipts.filter((receipt) => receipt.role === "lead");
+    if (triggeringLead.length !== 1) throw new Error(`${label} must contain exactly one triggering lead receipt`);
+    if (JSON.parse(triggeringLead[0].receipt).type !== "unit_decision") {
+      throw new Error(`${label} triggering lead receipt must be unit_decision`);
+    }
+    if (receipts.some((receipt) => receipt.role !== "lead" && receipt.role !== "command")) {
+      throw new Error(`${label} contains evidence outside lead/command for a repair action`);
+    }
+  }
+  // A prior semantic_review round (role final_review) is embedded both as
+  // final_repair's own triggering receipt and, for anti-churn, inside
+  // final_review's own bundle (the previous round's findings). A prior
+  // final_repair completion (role final_repair) is embedded only inside
+  // final_review's bundle -- the intervening repair the reviewer is
+  // re-checking. Each role's own positive allow-list below already rejects
+  // every entry role it doesn't name, so no receipt role can leak into an
+  // action it was never meant for.
+  if (role === "final_review") {
+    const allowed = new Set(["final_command", "final_review", "final_repair"]);
+    if (receipts.some((receipt) => !allowed.has(receipt.role))) {
+      throw new Error(`${label} contains evidence outside final-command/final-review/final-repair for final review`);
+    }
+    const priorReviews = receipts.filter((receipt) => receipt.role === "final_review");
+    const priorRepairs = receipts.filter((receipt) => receipt.role === "final_repair");
+    if (priorReviews.length > 1) throw new Error(`${label} must contain at most one prior final-review receipt`);
+    if (priorRepairs.length > 1) throw new Error(`${label} must contain at most one intervening final-repair receipt`);
+    if (priorRepairs.length > 0 && priorReviews.length === 0) {
+      throw new Error(`${label} contains an intervening final-repair receipt without its triggering final-review receipt`);
+    }
+    for (const entry of priorReviews) {
+      if (JSON.parse(entry.receipt).type !== "semantic_review") throw new Error(`${label} prior review receipt must be semantic_review`);
+    }
+    for (const entry of priorRepairs) {
+      if (JSON.parse(entry.receipt).type !== "unit_completion") throw new Error(`${label} intervening repair receipt must be unit_completion`);
+    }
   }
   if (role === "final_repair") {
     if (receipts.length !== 1 || receipts[0].role !== "final_review") {
@@ -223,8 +259,6 @@ function priorEvidence(value, label) {
     if (receipt.type !== "semantic_review") {
       throw new Error(`${label} triggering receipt must be semantic_review`);
     }
-  } else if (receipts.some((receipt) => receipt.role === "final_review")) {
-    throw new Error(`${label} contains final-review evidence for a non-repair action`);
   }
   const normalized = { schema: PRIOR_EVIDENCE_SCHEMA, role, receipts };
   if (Buffer.byteLength(canonicalJson(normalized), "utf8") > MAX_PRIOR_EVIDENCE_BYTES) {
@@ -484,6 +518,12 @@ export function validateLoopRequest(value) {
   if (request.role === "lead" && !candidateSubject) throw new Error("lead loop requires a candidate subject");
   if (request.role !== "lead" && candidateSubject) throw new Error("candidate subject is only valid for lead loops");
   if (request.priorEvidence?.role === "lead" && request.role !== "lead") throw new Error("lead prior evidence is only valid for lead loops");
+  if (
+    request.priorEvidence?.role === "repair" &&
+    (request.role !== "worker" || request.loop !== "repair" || request.skill !== "repair-unit" || request.unitId === null)
+  ) {
+    throw new Error("repair prior evidence is only valid for repair-unit loops");
+  }
   if (request.priorEvidence?.role === "final_review" && request.loop !== "review") throw new Error("final review prior evidence is only valid for review loops");
   if (
     request.priorEvidence?.role === "final_repair" &&

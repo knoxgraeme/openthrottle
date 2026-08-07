@@ -199,6 +199,44 @@ function semanticReviewReceipt(subject: string, attempt: ExecutionWorkAttempt, m
   });
 }
 
+function unitDecisionReceipt(unitId: string, attempt: ExecutionWorkAttempt, revisionRequest: string): string {
+  return canonicalJson({
+    schema: "openthrottle.receipt/v1",
+    type: "unit_decision",
+    assurance: "semantic_attested",
+    result: "revise",
+    producer: {
+      worker_id: "lead-worker",
+      skill: "builtin://accept-unit@1",
+      capability_digest: "d".repeat(64),
+      skill_package_digest: null,
+    },
+    subject: {
+      base: "a".repeat(40),
+      pre: "a".repeat(40),
+      post: "a".repeat(40),
+    },
+    fence: {
+      pipeline_instance_id: "instance-1",
+      graph_digest: "c".repeat(64),
+      unit_id: unitId,
+      attempt_id: "parent-attempt",
+      parent_run_id: "run-1",
+      action_attempt_id: attempt.id,
+      generation: 1,
+      native_session_id: null,
+      request_hash: attempt.request_hash,
+    },
+    evidence: ["scope mismatch"],
+    payload: {
+      rationale: "Scope mismatch.",
+      revision_request: revisionRequest,
+      context_updates: [],
+    },
+    issued_at: "2099-07-22T12:00:00.000Z",
+  });
+}
+
 function commandReceipt(subject: string, attempt: ExecutionWorkAttempt, summary = "passed"): string {
   return canonicalJson({
     schema: "openthrottle.receipt/v1",
@@ -1719,6 +1757,169 @@ describe("structured child runtime repair fences", () => {
     expect(completeUnitAction).toHaveBeenCalled();
   });
 
+  it("gives a repair action the triggering lead decision and failing command evidence", async () => {
+    const lead = action({
+      id: "lead-cycle-1",
+      action_kind: "lead",
+      cycle: 1,
+      status: "completed",
+      attempt_ordinal: 3,
+      request_hash: "f".repeat(64),
+      output_subject: "a".repeat(40),
+    });
+    lead.receipt = unitDecisionReceipt("unit_a", lead, "Fix the off-by-one in the paginator.");
+    lead.receipt_hash = digestNormalized(lead.receipt);
+    const command = action({
+      id: "command-cycle-1",
+      action_kind: "command",
+      cycle: 1,
+      status: "completed",
+      attempt_ordinal: 1,
+      command_name: "test",
+      request_hash: "e".repeat(64),
+      output_subject: "a".repeat(40),
+    });
+    command.receipt = commandReceipt("a".repeat(40), command, "unit tests failed: off-by-one");
+    command.receipt_hash = digestNormalized(command.receipt);
+    const repair = action({
+      id: "repair-cycle-2",
+      action_kind: "repair",
+      cycle: 2,
+      status: "leased",
+      attempt_ordinal: 4,
+    });
+    let dispatched: LoopActionRequest | undefined;
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: {
+        createWorktree: vi.fn(async () => ({ id: "worktree-handle" })),
+        dispatchLoopAction: async (_resource: { providerResourceId: string }, request: LoopActionRequest) => {
+          dispatched = request;
+          return { providerDispatchId: "dispatch-1" };
+        },
+      } as any,
+      store: {
+        leaseNextUnitAction: () => repair,
+        markActionDispatching: vi.fn(),
+        markActionDispatched: vi.fn(),
+        markActionWorktreeReady: vi.fn(),
+        listWorkAttempts: () => [lead, command, repair],
+        getGraphForAttempt: () => ({
+          integration_subject: "a".repeat(40),
+          command_names: "[]",
+        }),
+        getAttempt: () => ({ request_payload: parentAttemptRequestPayload() }),
+      } as any,
+    });
+
+    await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+      id: "instance-1",
+      active_stage_id: "structured",
+      agent: "codex",
+      generation: 1,
+      base_commit: "a".repeat(40),
+      immutable_subject: "a".repeat(40),
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({
+        stages: [{
+          id: "structured",
+          unitPhaseBindings: [{
+            id: "implement",
+            kind: "agent",
+            loop: { skill: "builtin://ce/implement@1", timeout_seconds: 60 },
+            worker: { id: "unit-worker", agent: "inherit", allowed_mcp_servers: [] },
+            credentials: ["model.invoke", "provider.read", "repo.read"],
+            context: "resume_required",
+          }],
+        }],
+      }),
+    } as any, "parent-attempt");
+
+    expect(dispatched).toMatchObject({
+      actionId: "repair-cycle-2",
+      skill: "repair-unit",
+      loop: "repair",
+      priorEvidence: {
+        schema: "openthrottle.loop-prior-evidence/v1",
+        role: "repair",
+      },
+    });
+    expect(dispatched?.priorEvidence?.receipts.map((receipt) => receipt.role)).toEqual(["lead", "command"]);
+    expect(dispatched?.priorEvidence?.receipts[0]?.receipt).toContain("Fix the off-by-one in the paginator.");
+    expect(dispatched?.priorEvidence?.receipts[1]?.receipt).toContain("unit tests failed: off-by-one");
+  });
+
+  it("fails closed before repair dispatch when the triggering lead receipt's request-hash fence does not match", async () => {
+    const lead = action({
+      id: "lead-cycle-1-invalid",
+      action_kind: "lead",
+      cycle: 1,
+      status: "completed",
+      attempt_ordinal: 3,
+      request_hash: "f".repeat(64),
+      output_subject: "a".repeat(40),
+    });
+    lead.receipt = unitDecisionReceipt("unit_a", lead, "Fix the off-by-one in the paginator.");
+    const receipt = JSON.parse(lead.receipt);
+    lead.receipt = canonicalJson({ ...receipt, fence: { ...receipt.fence, request_hash: "1".repeat(64) } });
+    lead.receipt_hash = digestNormalized(lead.receipt);
+    const repair = action({
+      id: "repair-cycle-2-invalid",
+      action_kind: "repair",
+      cycle: 2,
+      status: "leased",
+      attempt_ordinal: 4,
+    });
+    const dispatchLoopAction = vi.fn();
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: {
+        createWorktree: vi.fn(async () => ({ id: "worktree-handle" })),
+        dispatchLoopAction,
+      } as any,
+      store: {
+        leaseNextUnitAction: () => repair,
+        markActionDispatching: vi.fn(),
+        markActionDispatched: vi.fn(),
+        markActionWorktreeReady: vi.fn(),
+        listWorkAttempts: () => [lead, repair],
+        getGraphForAttempt: () => ({
+          integration_subject: "a".repeat(40),
+          command_names: "[]",
+        }),
+        getAttempt: () => ({ request_payload: parentAttemptRequestPayload() }),
+      } as any,
+    });
+
+    await expect(childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+      id: "instance-1",
+      active_stage_id: "structured",
+      agent: "codex",
+      generation: 1,
+      base_commit: "a".repeat(40),
+      immutable_subject: "a".repeat(40),
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({
+        stages: [{
+          id: "structured",
+          unitPhaseBindings: [{
+            id: "implement",
+            kind: "agent",
+            loop: { skill: "builtin://ce/implement@1", timeout_seconds: 60 },
+            worker: { id: "unit-worker", agent: "inherit", allowed_mcp_servers: [] },
+            credentials: ["model.invoke", "provider.read", "repo.read"],
+            context: "resume_required",
+          }],
+        }],
+      }),
+    } as any, "parent-attempt")).rejects.toThrow(/triggering lead fence is invalid/);
+    expect(dispatchLoopAction).not.toHaveBeenCalled();
+  });
+
   it("keeps an empty typed prior-evidence envelope on final review dispatch", async () => {
     const finalReview = action({
       id: "final-review-no-commands",
@@ -1899,6 +2100,153 @@ describe("structured child runtime repair fences", () => {
     });
     expect(dispatched?.priorEvidence?.receipts.map((receipt) => receipt.role)).toEqual(["completion", "candidate"]);
     expect(dispatched?.priorEvidence?.receipts[1]?.actionAttemptId).toBe("candidate-cycle-2");
+  });
+
+  it("gives a second-cycle final review the first round's findings and its intervening repair completion", async () => {
+    const priorFinalReview = action({
+      id: "final-review-cycle-1",
+      action_kind: "final_review",
+      cycle: 1,
+      status: "completed",
+      attempt_ordinal: 3,
+      unit_id: null,
+      execution_unit_id: null,
+      request_hash: "e".repeat(64),
+      output_subject: "a".repeat(40),
+    });
+    priorFinalReview.receipt = semanticReviewReceipt("a".repeat(40), priorFinalReview, "first round finding");
+    priorFinalReview.receipt_hash = digestNormalized(priorFinalReview.receipt);
+    const priorFinalRepair = action({
+      id: "final-repair-cycle-1",
+      action_kind: "final_repair",
+      cycle: 1,
+      status: "completed",
+      attempt_ordinal: 4,
+      unit_id: null,
+      execution_unit_id: null,
+      request_hash: "9".repeat(64),
+      native_session_id: "native-session-final-repair-1",
+    });
+    priorFinalRepair.receipt = finalRepairCompletionReceipt("a".repeat(40), priorFinalRepair, ["repaired the first round finding"]);
+    priorFinalRepair.receipt_hash = digestNormalized(priorFinalRepair.receipt);
+    const finalReviewRoundTwo = action({
+      id: "final-review-cycle-2",
+      action_kind: "final_review",
+      cycle: 2,
+      status: "leased",
+      attempt_ordinal: 5,
+      unit_id: null,
+      execution_unit_id: null,
+    });
+    let dispatched: LoopActionRequest | undefined;
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: {
+        dispatchLoopAction: async (_resource: { providerResourceId: string }, request: LoopActionRequest) => {
+          dispatched = request;
+          return { providerDispatchId: "dispatch-review-2" };
+        },
+      } as any,
+      store: {
+        leaseNextUnitAction: () => finalReviewRoundTwo,
+        markActionDispatching: vi.fn(),
+        markActionDispatched: vi.fn(),
+        listWorkAttempts: () => [priorFinalReview, priorFinalRepair, finalReviewRoundTwo],
+        getGraphForAttempt: () => ({
+          integration_subject: "a".repeat(40),
+          command_names: "[]",
+        }),
+        getAttempt: () => ({ request_payload: parentAttemptRequestPayload() }),
+      } as any,
+    });
+
+    await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+      id: "instance-1",
+      active_stage_id: "structured",
+      agent: "codex",
+      generation: 7,
+      base_commit: "a".repeat(40),
+      immutable_subject: "a".repeat(40),
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({ stages: [{ id: "structured", unitPhaseBindings: [] }] }),
+    } as any, "parent-attempt");
+
+    expect(dispatched).toMatchObject({
+      actionId: "final-review-cycle-2",
+      role: "reviewer",
+      loop: "review",
+      priorEvidence: {
+        schema: "openthrottle.loop-prior-evidence/v1",
+        role: "final_review",
+      },
+    });
+    expect(dispatched?.priorEvidence?.receipts.map((receipt) => receipt.role)).toEqual(["final_review", "final_repair"]);
+    expect(dispatched?.priorEvidence?.receipts[0]?.receipt).toContain("first round finding");
+    expect(dispatched?.priorEvidence?.receipts[1]?.receipt).toContain("repaired the first round finding");
+  });
+
+  it("gives a second-cycle final review only the prior round's findings when no intervening repair completion is on record", async () => {
+    const priorFinalReview = action({
+      id: "final-review-cycle-1-no-repair",
+      action_kind: "final_review",
+      cycle: 1,
+      status: "completed",
+      attempt_ordinal: 3,
+      unit_id: null,
+      execution_unit_id: null,
+      request_hash: "e".repeat(64),
+      output_subject: "a".repeat(40),
+    });
+    priorFinalReview.receipt = semanticReviewReceipt("a".repeat(40), priorFinalReview, "first round finding");
+    priorFinalReview.receipt_hash = digestNormalized(priorFinalReview.receipt);
+    const finalReviewRoundTwo = action({
+      id: "final-review-cycle-2-no-repair",
+      action_kind: "final_review",
+      cycle: 2,
+      status: "leased",
+      attempt_ordinal: 5,
+      unit_id: null,
+      execution_unit_id: null,
+    });
+    let dispatched: LoopActionRequest | undefined;
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: {
+        dispatchLoopAction: async (_resource: { providerResourceId: string }, request: LoopActionRequest) => {
+          dispatched = request;
+          return { providerDispatchId: "dispatch-review-2" };
+        },
+      } as any,
+      store: {
+        leaseNextUnitAction: () => finalReviewRoundTwo,
+        markActionDispatching: vi.fn(),
+        markActionDispatched: vi.fn(),
+        listWorkAttempts: () => [priorFinalReview, finalReviewRoundTwo],
+        getGraphForAttempt: () => ({
+          integration_subject: "a".repeat(40),
+          command_names: "[]",
+        }),
+        getAttempt: () => ({ request_payload: parentAttemptRequestPayload() }),
+      } as any,
+    });
+
+    await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+      id: "instance-1",
+      active_stage_id: "structured",
+      agent: "codex",
+      generation: 7,
+      base_commit: "a".repeat(40),
+      immutable_subject: "a".repeat(40),
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({ stages: [{ id: "structured", unitPhaseBindings: [] }] }),
+    } as any, "parent-attempt");
+
+    expect(dispatched?.priorEvidence?.receipts.map((receipt) => receipt.role)).toEqual(["final_review"]);
+    expect(dispatched?.priorEvidence?.receipts[0]?.receipt).toContain("first round finding");
   });
 
   it("fails closed before dispatch when lead prior evidence exceeds the aggregate budget", async () => {

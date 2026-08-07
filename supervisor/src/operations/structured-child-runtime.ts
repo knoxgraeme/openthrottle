@@ -597,6 +597,49 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     throw new Error(`missing implement/repair unit_completion receipt for ${unitId ?? "final"}`);
   };
 
+  // The lead decision that routed this unit back to `repair` (see
+  // routeUnitAcceptanceDecision / unit-store.ts): the store bumps
+  // current_cycle when it routes to repair, so the triggering lead ran one
+  // cycle earlier than the repair action it produced.
+  const triggeringLeadDecisionAttemptReceipt = (
+    receipts: readonly { attempt: ExecutionWorkAttempt; receipt: StandardReceipt }[],
+    unitId: string,
+    triggeringCycle: number
+  ): { attempt: ExecutionWorkAttempt; receipt: UnitDecisionReceipt } => {
+    for (let index = receipts.length - 1; index >= 0; index -= 1) {
+      const entry = receipts[index]!;
+      if (
+        entry.receipt.type === "unit_decision" &&
+        entry.attempt.action_kind === "lead" &&
+        entry.attempt.unit_id === unitId &&
+        entry.attempt.cycle === triggeringCycle
+      ) {
+        return { attempt: entry.attempt, receipt: entry.receipt as UnitDecisionReceipt };
+      }
+    }
+    throw new Error(`missing triggering lead unit_decision receipt for ${unitId} cycle ${triggeringCycle}`);
+  };
+
+  // The most recent final_repair action's own unit_completion receipt for
+  // this cycle, when a repair round ran between the prior final_review and
+  // this one -- prior evidence for anti-churn (Q3), not required.
+  const priorFinalRepairCompletionAttemptReceipt = (
+    receipts: readonly { attempt: ExecutionWorkAttempt; receipt: StandardReceipt }[],
+    cycle: number
+  ): { attempt: ExecutionWorkAttempt; receipt: UnitCompletionReceipt } | undefined => {
+    for (let index = receipts.length - 1; index >= 0; index -= 1) {
+      const entry = receipts[index]!;
+      if (
+        entry.receipt.type === "unit_completion" &&
+        entry.attempt.action_kind === "final_repair" &&
+        entry.attempt.cycle === cycle
+      ) {
+        return { attempt: entry.attempt, receipt: entry.receipt as UnitCompletionReceipt };
+      }
+    }
+    return undefined;
+  };
+
   const commandAttemptReceipts = (
     receipts: readonly { attempt: ExecutionWorkAttempt; receipt: StandardReceipt }[],
     unitId: string | null,
@@ -609,7 +652,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         (cycle === undefined || entry.attempt.cycle === cycle));
 
   const priorReceiptEntry = (
-    role: "completion" | "candidate" | "command" | "final_command" | "final_review",
+    role: "completion" | "candidate" | "command" | "final_command" | "final_review" | "lead" | "final_repair",
     entry: { attempt: ExecutionWorkAttempt; receipt: StandardReceipt }
   ): NonNullable<LoopActionRequest["priorEvidence"]>["receipts"][number] => {
     const receipt = canonicalJson(entry.receipt);
@@ -660,12 +703,52 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       assertPriorEvidenceEnvelopeBound(evidence, action);
       return evidence;
     }
+    if (action.action_kind === "repair") {
+      if (action.unit_id === null) throw new Error(`child repair action ${action.id} has no unit id`);
+      // The store bumps current_cycle in the same transaction that routes a
+      // lead's non-accept decision to repair (unit-store.ts insertGateReceipt),
+      // so the triggering lead ran at this repair's cycle minus one.
+      const lead = triggeringLeadDecisionAttemptReceipt(receipts, action.unit_id, action.cycle - 1);
+      if (lead.attempt.request_hash !== lead.receipt.fence.request_hash) {
+        throw new Error(`child repair action ${action.id} triggering lead fence is invalid`);
+      }
+      const commands = commandAttemptReceipts(receipts, action.unit_id, action.cycle - 1);
+      const evidence = {
+        schema: "openthrottle.loop-prior-evidence/v1",
+        role: "repair",
+        receipts: [
+          priorReceiptEntry("lead", lead),
+          ...commands.map((command) => priorReceiptEntry("command", command)),
+        ],
+      } satisfies NonNullable<LoopActionRequest["priorEvidence"]>;
+      assertPriorEvidenceEnvelopeBound(evidence, action);
+      return evidence;
+    }
     if (action.action_kind === "final_review") {
       const commands = commandAttemptReceipts(receipts, null, action.cycle);
+      // Anti-churn (Q3): a re-review round can also see the previous round's
+      // findings and, when one ran, the intervening final_repair's own
+      // completion -- both settled at this review's cycle minus one, since
+      // the final-phase cycle only bumps after the repair/candidate/integrate
+      // sequence finishes and the next round's final_command begins.
+      const priorReview = action.cycle > 0
+        ? (() => {
+            try {
+              return latestAttemptReceipt<SemanticReviewReceipt>(receipts, "semantic_review", null, action.cycle - 1);
+            } catch {
+              return undefined;
+            }
+          })()
+        : undefined;
+      const priorRepair = priorReview ? priorFinalRepairCompletionAttemptReceipt(receipts, action.cycle - 1) : undefined;
       const evidence = {
         schema: "openthrottle.loop-prior-evidence/v1",
         role: "final_review",
-        receipts: commands.map((command) => priorReceiptEntry("final_command", command)),
+        receipts: [
+          ...commands.map((command) => priorReceiptEntry("final_command", command)),
+          ...(priorReview ? [priorReceiptEntry("final_review", priorReview)] : []),
+          ...(priorRepair ? [priorReceiptEntry("final_repair", priorRepair)] : []),
+        ],
       } satisfies NonNullable<LoopActionRequest["priorEvidence"]>;
       assertPriorEvidenceEnvelopeBound(evidence, action);
       return evidence;
@@ -787,7 +870,8 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     const worktree = roleFor(action.action_kind) === "worker"
       ? worktreeHandleFor(action, baseCommit)
       : null;
-    const needsPriorEvidence = action.action_kind === "lead" || action.action_kind === "final_review" || action.action_kind === "final_repair";
+    const needsPriorEvidence = action.action_kind === "lead" || action.action_kind === "repair" ||
+      action.action_kind === "final_review" || action.action_kind === "final_repair";
     const receipts = needsPriorEvidence
       ? completedAttemptReceiptsFor(action.parent_attempt_id)
       : [];
