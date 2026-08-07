@@ -32,6 +32,7 @@ import { identityForUser } from "./filesystem-isolation.mjs";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
 import { extractJsonBlock } from "./json-block.mjs";
+import { subjectPost } from "../bin/ot-subject-post.mjs";
 
 const directories = [];
 
@@ -527,6 +528,17 @@ describe("loop action request validation", () => {
     const { requestHash: _tamperedHash, idempotencyKey: _tamperedKey, ...tamperedUnfenced } = tampered;
     expect(() => validateLoopRequest({ ...tamperedUnfenced, ...createLoopRequestHash(tamperedUnfenced) }))
       .toThrow(/receiptHash does not match receipt/);
+
+    const foreignLeadEvidence = {
+      ...withoutFence,
+      priorEvidence: {
+        ...withoutFence.priorEvidence,
+        receipts: [...withoutFence.priorEvidence.receipts, priorReceipt("final_review", "final-review-leak")],
+      },
+    };
+    const { requestHash: _foreignHash, idempotencyKey: _foreignKey, ...foreignUnfenced } = foreignLeadEvidence;
+    expect(() => validateLoopRequest({ ...foreignUnfenced, ...createLoopRequestHash(foreignUnfenced) }))
+      .toThrow(/outside completion\/candidate\/command for a lead action/);
   });
 
   it("validates triggering final-review evidence for final repair", () => {
@@ -599,6 +611,194 @@ describe("loop action request validation", () => {
     };
     expect(() => validateLoopRequest({ ...wrongAction, ...createLoopRequestHash(wrongAction) }))
       .toThrow(/final repair prior evidence is only valid for final-repair loops/);
+  });
+
+  it("gives a repair action the triggering lead decision and failing command evidence", () => {
+    const repairRequest = request({ loop: "repair", skill: "repair-unit" });
+    const receiptFence = standardReceipt(repairRequest).fence;
+    const priorReceipt = (role, actionAttemptId, overrides = {}) => {
+      const receipt = canonicalJson(standardReceipt(repairRequest, {
+        fence: { ...receiptFence, action_attempt_id: actionAttemptId },
+        ...overrides,
+      }));
+      return { role, actionAttemptId, receiptHash: digest(receipt), receipt };
+    };
+    const leadReceipt = priorReceipt("lead", "lead-1", {
+      type: "unit_decision",
+      result: "revise",
+      payload: {
+        rationale: "Scope mismatch.",
+        revision_request: "Fix the off-by-one in the paginator.",
+        context_updates: [],
+      },
+    });
+    const commandReceipt = priorReceipt("command", "command-1", {
+      type: "command_result",
+      result: "failure",
+      payload: { command: "npm test", exit_code: 1, summary: "unit tests failed" },
+    });
+    const withoutFence = {
+      ...repairRequest,
+      priorEvidence: {
+        schema: "openthrottle.loop-prior-evidence/v1",
+        role: "repair",
+        receipts: [leadReceipt, commandReceipt],
+      },
+    };
+    const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...unfenced } = withoutFence;
+    const valid = validateLoopRequest({ ...unfenced, ...createLoopRequestHash(unfenced) });
+
+    expect(valid.priorEvidence.receipts).toHaveLength(2);
+    expect(loopPrompt(valid)).toContain("Fix the off-by-one in the paginator.");
+
+    const missingLead = {
+      ...unfenced,
+      priorEvidence: { ...unfenced.priorEvidence, receipts: [commandReceipt] },
+    };
+    expect(() => validateLoopRequest({ ...missingLead, ...createLoopRequestHash(missingLead) }))
+      .toThrow(/exactly one triggering lead receipt/);
+
+    const nonRevisionEvidence = {
+      ...unfenced,
+      priorEvidence: {
+        ...unfenced.priorEvidence,
+        receipts: [{ ...leadReceipt, role: "candidate" }, commandReceipt],
+      },
+    };
+    expect(() => validateLoopRequest({ ...nonRevisionEvidence, ...createLoopRequestHash(nonRevisionEvidence) }))
+      .toThrow(/exactly one triggering lead receipt/);
+
+    const wrongLoop = { ...unfenced, loop: "implement", skill: "implement-unit" };
+    expect(() => validateLoopRequest({ ...wrongLoop, ...createLoopRequestHash(wrongLoop) }))
+      .toThrow(/repair prior evidence is only valid for repair-unit loops/);
+
+    const nonDecisionLead = {
+      ...unfenced,
+      priorEvidence: {
+        ...unfenced.priorEvidence,
+        receipts: [priorReceipt("lead", "lead-1"), commandReceipt],
+      },
+    };
+    expect(() => validateLoopRequest({ ...nonDecisionLead, ...createLoopRequestHash(nonDecisionLead) }))
+      .toThrow(/triggering lead receipt must be unit_decision/);
+
+    const foreignEvidence = {
+      ...unfenced,
+      priorEvidence: {
+        ...unfenced.priorEvidence,
+        receipts: [leadReceipt, priorReceipt("completion", "completion-1")],
+      },
+    };
+    expect(() => validateLoopRequest({ ...foreignEvidence, ...createLoopRequestHash(foreignEvidence) }))
+      .toThrow(/outside lead\/command for a repair action/);
+  });
+
+  it("includes the prior review round and intervening repair completion for final-review anti-churn", () => {
+    const finalReview = request({
+      unitId: null,
+      role: "reviewer",
+      loop: "review",
+      skill: "final-review",
+      worktree: null,
+      credentialScopes: ["repo.read"],
+    });
+    const fixedSubject = { base: "1".repeat(40), pre: "1".repeat(40), post: "2".repeat(40) };
+    const baseFence = { ...standardReceipt(request()).fence, unit_id: "__final__" };
+    const priorReceipt = (role, actionAttemptId, overrides = {}) => {
+      const receipt = canonicalJson(standardReceipt(request(), {
+        subject: fixedSubject,
+        fence: { ...baseFence, action_attempt_id: actionAttemptId },
+        ...overrides,
+      }));
+      return { role, actionAttemptId, receiptHash: digest(receipt), receipt };
+    };
+    const finalCommand = priorReceipt("final_command", "final-command-1", {
+      type: "command_result",
+      result: "failure",
+      payload: { command: "npm test", exit_code: 1, summary: "unit tests failed" },
+    });
+    const priorReview = priorReceipt("final_review", "final-review-0", {
+      type: "semantic_review",
+      result: "semantic_repair_required",
+      payload: {
+        summary: "Repair required.",
+        findings: [{ severity: "P1", message: "Fix the final review finding." }],
+      },
+    });
+    const interveningRepair = priorReceipt("final_repair", "final-repair-0", {
+      type: "unit_completion",
+      result: "success",
+    });
+    const withoutFence = {
+      ...finalReview,
+      priorEvidence: {
+        schema: "openthrottle.loop-prior-evidence/v1",
+        role: "final_review",
+        receipts: [finalCommand, priorReview, interveningRepair],
+      },
+    };
+    const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...unfenced } = withoutFence;
+    const valid = validateLoopRequest({ ...unfenced, ...createLoopRequestHash(unfenced) });
+
+    expect(valid.priorEvidence.receipts).toHaveLength(3);
+    expect(loopPrompt(valid)).toContain("Fix the final review finding.");
+
+    const repairWithoutReview = {
+      ...unfenced,
+      priorEvidence: { ...unfenced.priorEvidence, receipts: [finalCommand, interveningRepair] },
+    };
+    expect(() => validateLoopRequest({ ...repairWithoutReview, ...createLoopRequestHash(repairWithoutReview) }))
+      .toThrow(/intervening final-repair receipt without its triggering final-review receipt/);
+
+    const leadLeak = {
+      ...unfenced,
+      priorEvidence: {
+        ...unfenced.priorEvidence,
+        receipts: [finalCommand, { ...priorReview, role: "lead" }],
+      },
+    };
+    expect(() => validateLoopRequest({ ...leadLeak, ...createLoopRequestHash(leadLeak) }))
+      .toThrow(/outside final-command\/final-review\/final-repair/);
+
+    const duplicateReview = {
+      ...unfenced,
+      priorEvidence: {
+        ...unfenced.priorEvidence,
+        receipts: [finalCommand, priorReview, { ...priorReview, actionAttemptId: "final-review-0-dup" }],
+      },
+    };
+    expect(() => validateLoopRequest({ ...duplicateReview, ...createLoopRequestHash(duplicateReview) }))
+      .toThrow(/at most one prior final-review receipt/);
+
+    const duplicateRepair = {
+      ...unfenced,
+      priorEvidence: {
+        ...unfenced.priorEvidence,
+        receipts: [finalCommand, priorReview, interveningRepair, { ...interveningRepair, actionAttemptId: "final-repair-0-dup" }],
+      },
+    };
+    expect(() => validateLoopRequest({ ...duplicateRepair, ...createLoopRequestHash(duplicateRepair) }))
+      .toThrow(/at most one intervening final-repair receipt/);
+
+    const wrongReviewType = {
+      ...unfenced,
+      priorEvidence: {
+        ...unfenced.priorEvidence,
+        receipts: [finalCommand, { ...priorReview, receipt: finalCommand.receipt, receiptHash: finalCommand.receiptHash }],
+      },
+    };
+    expect(() => validateLoopRequest({ ...wrongReviewType, ...createLoopRequestHash(wrongReviewType) }))
+      .toThrow(/prior review receipt must be semantic_review/);
+
+    const wrongRepairType = {
+      ...unfenced,
+      priorEvidence: {
+        ...unfenced.priorEvidence,
+        receipts: [finalCommand, priorReview, { ...interveningRepair, receipt: finalCommand.receipt, receiptHash: finalCommand.receiptHash }],
+      },
+    };
+    expect(() => validateLoopRequest({ ...wrongRepairType, ...createLoopRequestHash(wrongRepairType) }))
+      .toThrow(/intervening repair receipt must be unit_completion/);
   });
 
   it("rejects malformed typed loop context before agent invocation", () => {
@@ -2685,6 +2885,36 @@ describe("executeLoopAction", () => {
     expect(lockWorkerWorktree).toHaveBeenCalledWith(expect.objectContaining({ worktree: { id: "unit-1" } }));
     expect(lockActionDirectory).toHaveBeenCalledWith(expect.objectContaining({ actionId: "action-1" }));
     expect(restoreIntegration).toHaveBeenCalledWith("/tmp/integration-current");
+  });
+
+  it("accepts a completion receipt whose subject.post came from ot-subject-post on a real worktree with real edits", () => {
+    const valid = request();
+    const worktreeDir = loopWorktreeDirectory(valid);
+    writeFileSync(join(worktreeDir, "file.txt"), "changed\n");
+    writeFileSync(join(worktreeDir, "new-file.txt"), "new\n");
+    const helperSubject = subjectPost(worktreeDir);
+    const receipt = standardReceipt(valid, {
+      subject: { base: "1".repeat(40), pre: "1".repeat(40), post: helperSubject },
+    });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent: () => ({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: JSON.stringify(receipt),
+        stderr: "",
+        nativeSessionId: "thread-1",
+        integrationRepoDir: "/tmp/integration-current",
+      }),
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result).toMatchObject({ outcome: "success", subject: helperSubject });
   });
 
   it("uses the standard receipt subject for read-only lead loop results", () => {

@@ -88,7 +88,7 @@ export interface LoopActionRequest {
   transitionContext: string;
   priorEvidence?: {
     schema: "openthrottle.loop-prior-evidence/v1";
-    role: "lead" | "final_review" | "final_repair";
+    role: "lead" | "repair" | "final_review" | "final_repair";
     receipts: Array<{
       role: ReceiptEvidenceRole;
       actionAttemptId: string;
@@ -117,7 +117,7 @@ export interface LoopActionRequest {
   idempotencyKey: string;
 }
 
-type ReceiptEvidenceRole = "completion" | "candidate" | "command" | "final_command" | "final_review";
+type ReceiptEvidenceRole = "completion" | "candidate" | "command" | "final_command" | "final_review" | "lead" | "final_repair";
 
 export interface LoopActionResult {
   actionId: string;
