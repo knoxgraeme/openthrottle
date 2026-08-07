@@ -732,7 +732,7 @@ function lockGitMetadata(gitDir) {
   }
 }
 
-function lockIntegrationCheckout(path = INTEGRATION_REPO_DIR) {
+export function lockIntegrationCheckout(path = INTEGRATION_REPO_DIR) {
   if (!isRoot() || !existsSync(path)) return false;
   chownSync(path, ROOT_UID, ROOT_GID);
   chmodSync(path, 0o711);
@@ -1115,6 +1115,10 @@ export function executeLoopAction({
     const diagnosticTail = engineFailed
       ? launchDiagnosticTail({ stdout: execution.stdout, stderr: execution.stderr, env: sanitizeEnv })
       : "";
+    // execution.executorFailure means our own prepare/run code already threw
+    // a precise error (execution.stderr); a later, best-effort subject
+    // attestation against a now-possibly-relocked worktree can fail too, but
+    // that failure is a symptom, not the cause, and must never bury it.
     const failureNarrative = launchFailure
       ? [
         `loop action failed (reason=${launchFailure.reason})`,
@@ -1123,8 +1127,10 @@ export function executeLoopAction({
         receiptError,
         diagnosticTail,
       ].filter(Boolean).join(" ")
-      : subjectError || receiptError || execution.stdout || execution.stderr ||
-        (failed ? "loop action failed" : "loop action completed");
+      : execution.executorFailure
+        ? (execution.stderr || subjectError || receiptError || "loop action failed")
+        : subjectError || receiptError || execution.stdout || execution.stderr ||
+          (failed ? "loop action failed" : "loop action completed");
     result = {
       version: 1,
       kind: "loop_action_result",

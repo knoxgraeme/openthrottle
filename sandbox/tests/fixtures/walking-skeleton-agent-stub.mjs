@@ -14,7 +14,8 @@
 // computes subject.post with the executor's own tree-oid algorithm so the
 // receipt it prints is byte-for-byte fence-correct without needing to guess.
 
-import { appendFileSync, readFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { computeWorkspaceTreeOid } from "/opt/openthrottle/runner/repository-control.mjs";
 
 function readStdin() {
@@ -23,6 +24,32 @@ function readStdin() {
   } catch {
     return "";
   }
+}
+
+// sealNativeSessionPackage (sandbox/runner/native-session-package.mjs) rejects
+// a reported session id unless the profile's own durable transcript already
+// contains a record carrying that same id -- exactly what a real `claude`
+// process leaves under `$HOME/.claude/projects/`. Mirror that here, matching
+// the fixture pattern in sandbox/tests/smoke.sh (write the transcript before
+// printing the matching session_id), so the executor's seal step finds it.
+function nativeSessionTranscriptDir() {
+  const home = process.env.HOME;
+  if (!home) throw new Error("stub agent requires HOME to materialize its session transcript");
+  return join(home, ".claude", "projects");
+}
+
+function writeNativeSessionTranscript(sessionId, contract) {
+  const dir = nativeSessionTranscriptDir();
+  mkdirSync(dir, { recursive: true });
+  const record = {
+    type: "user",
+    sessionId,
+    message: {
+      role: "user",
+      content: `walking-skeleton stub agent session for ${contract.unit_id ?? "__final__"}/${contract.action_attempt_id}`,
+    },
+  };
+  appendFileSync(join(dir, `${sessionId}.jsonl`), `${JSON.stringify(record)}\n`);
 }
 
 function jsonBlockAfter(text, marker) {
@@ -141,7 +168,14 @@ function main() {
     throw new Error(`stub agent does not recognize skill invocation ${JSON.stringify(firstLine)}`);
   }
 
-  process.stdout.write(`${JSON.stringify({ type: "system", subtype: "init", session_id: `stub-${contract.action_attempt_id}`, model: "stub" })}\n`);
+  // A sealed loop request bound to session_scope:"attempt" (implement/simplify)
+  // rejects a reported session id that does not match the one it sealed into
+  // the request; only mint a fresh id when the contract carries none (the
+  // first action of an attempt).
+  const sessionId = contract.native_session_id ?? `stub-${contract.action_attempt_id}`;
+  writeNativeSessionTranscript(sessionId, contract);
+
+  process.stdout.write(`${JSON.stringify({ type: "system", subtype: "init", session_id: sessionId, model: "stub" })}\n`);
   process.stdout.write(`${JSON.stringify({
     type: "result",
     subtype: "success",

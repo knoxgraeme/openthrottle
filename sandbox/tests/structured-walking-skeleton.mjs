@@ -851,19 +851,46 @@ async function runNeedsHumanScenario({ db, container, fixture }) {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario: a worker cannot commit, push, or integrate directly -- runs
-// against the executor-owned integration checkout after the happy path has
-// populated it. lockIntegrationCheckout (sandbox/runner/execute-loop.mjs)
-// chowns this checkout root:root and chmods everything under .git to
-// 0600/0700, so the unprivileged `agent` user cannot even read .git/HEAD;
-// asserting only "nonzero exit" would also pass for an unrelated git
-// failure, so this pins the actual denial cause and proves the integration
-// ref never moved.
+// Scenario: a worker cannot commit, push, or integrate directly against the
+// executor-owned integration checkout.
+//
+// lockIntegrationCheckout (sandbox/runner/execute-loop.mjs) chowns this
+// checkout root:root and chmods everything under .git to 0600/0700 -- but
+// only while a loop action's own agent process is actually running.
+// restoreIntegrationCheckout deep-restores agent:agent ownership in every
+// loop action's own success-path cleanup, so by the time the happy path has
+// settled (between actions, which is when this scenario runs), the checkout
+// is genuinely agent-owned, not root-locked. Re-establish the mid-turn
+// locked state here before attempting the mutation, matching what an agent
+// actually faces if it tries this from inside its own turn; asserting only
+// "nonzero exit" would also pass for an unrelated git failure, so this pins
+// the actual denial cause and proves the integration ref never moved.
+//
+// Invokes the real production lockIntegrationCheckout (exported alongside
+// restoreIntegrationCheckout for this reason) instead of hand-transcribing
+// its chown/chmod scheme in shell, so this proof can never silently drift
+// from the actual production fence.
 // ---------------------------------------------------------------------------
+
+function lockIntegrationCheckoutForScenario(container) {
+  // The explicit .catch() (rather than relying on Node's default
+  // unhandled-rejection-crashes-the-process behavior) is what actually
+  // guarantees a failed lock fails this scenario loudly instead of silently
+  // proceeding to prove nothing against an unlocked checkout.
+  dockerExec(container, ["node", "-e", `
+    import("/opt/openthrottle/runner/execute-loop.mjs").then((m) => {
+      if (!m.lockIntegrationCheckout()) throw new Error("lockIntegrationCheckout did not lock the integration checkout");
+    }).catch((error) => {
+      console.error(error);
+      process.exitCode = 1;
+    });
+  `]);
+}
 
 function runDirectMutationScenario({ container, happy }) {
   log("scenario: direct agent commit/push/integration attempts fail");
   const beforeHead = dockerExec(container, ["git", "-C", INTEGRATION_REPO_DIR, "rev-parse", "HEAD"]).trim();
+  lockIntegrationCheckoutForScenario(container);
 
   const push = dockerExecStatus(
     container,

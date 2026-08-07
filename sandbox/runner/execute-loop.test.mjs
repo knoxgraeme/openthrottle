@@ -456,6 +456,12 @@ describe("loop action request validation", () => {
     expect(contract.producer).not.toHaveProperty("assurance");
   });
 
+  it("falls back to a null contract assurance without an expected producer", () => {
+    const valid = validateLoopRequest(request());
+    const contract = JSON.parse(firstJsonObject(loopPrompt(valid).split("\n\n## Receipt Authority Contract\n")[1]));
+    expect(contract.assurance).toBeNull();
+  });
+
   it("validates typed prior evidence and downstream context into the sealed prompt contract", () => {
     const contextPayload = {
       schema: "openthrottle.downstream-context/v1",
@@ -2614,7 +2620,11 @@ describe("executeLoopAction", () => {
       subject: null,
       created_at: "2026-07-29T00:00:00.000Z",
     });
-    expect(result.receipt).toMatch(/workspace subject attestation failed/);
+    // The executor's own launch error is the real cause; a best-effort
+    // subject attestation against the now-unreadable worktree fails too, but
+    // that symptom must not bury the original diagnosis.
+    expect(result.receipt).toMatch(/agent launch failed/);
+    expect(result.receipt).not.toMatch(/workspace subject attestation failed/);
     expect(lockWorkerWorktree).toHaveBeenCalledOnce();
     expect(lockActionDirectory).toHaveBeenCalledOnce();
   });

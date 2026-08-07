@@ -2,10 +2,11 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, cpSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   captureRepositoryControl,
   computeWorkspaceTreeOid,
+  computeWorkspaceTreeOidAsExecutor,
   repositoryControlMatches,
 } from "./repository-control.mjs";
 
@@ -168,6 +169,27 @@ describe("computeWorkspaceTreeOid", () => {
       }, () => computeWorkspaceTreeOid(repoDir))).toBe(expectedTree);
     } finally {
       chmodSync(join(repoDir, ".git"), 0o700);
+    }
+  });
+});
+
+describe("computeWorkspaceTreeOidAsExecutor", () => {
+  // Real gosu refuses to drop privileges unless the calling process is
+  // genuinely root (verified: `gosu agent true` as a non-root process exits
+  // "operation not permitted"). Mocking process.getuid() to report 0, without
+  // the OS process actually being root, reproduces that same denial for
+  // computeWorkspaceTreeOid's agent-authority git calls without requiring
+  // this test to run as real root -- standing in for a linked worktree admin
+  // dir another loop action's cleanup already relocked to root:root.
+  it("computes the workspace subject with executor authority when agent-authority gosu is unavailable", () => {
+    const repoDir = repository();
+    const expectedTree = execFileSync("git", ["-C", repoDir, "rev-parse", "HEAD^{tree}"], { encoding: "utf8" }).trim();
+    const getuidSpy = vi.spyOn(process, "getuid").mockReturnValue(0);
+    try {
+      expect(() => computeWorkspaceTreeOid(repoDir)).toThrow(/operation not permitted|failed switching|gosu/i);
+      expect(computeWorkspaceTreeOidAsExecutor(repoDir)).toBe(expectedTree);
+    } finally {
+      getuidSpy.mockRestore();
     }
   });
 });
