@@ -1111,17 +1111,18 @@ printf '{"type":"thread.started","thread_id":"native-1"}\\n' >&2
 printf '{"type":"thread.started","thread_id":"native-1"}\\n'
 `);
     withPrependedPath(binDir, () => {
-      // The engine's own stdout (its real evidence of what it did) must
+      // The engine's own streams (its real evidence of what it did) must
       // survive a seal failure instead of being replaced by a bare
       // "does not contain the reported native session id" message, mirroring
-      // execute-loop.mjs's runLoopAgentInPreparedRepository.
+      // execute-loop.mjs's runLoopAgentInPreparedRepository. They arrive as a
+      // bounded, sanitized launchDiagnosticTail rather than raw streams.
       expect(() => defaultRunAgent({
         request: input.request,
         invocation: resolveContextInvocation(input.request),
         repoDir: input.repoDir,
         proposalPath: join(actionRoot, "proposal.json"),
         timeoutMs: 1000,
-      })).toThrow(/does not contain the reported native session id[\s\S]*engine stdout[\s\S]*thread\.started/);
+      })).toThrow(/does not contain the reported native session id[\s\S]*engine diagnostics:[\s\S]*thread\.started/);
     });
   });
 

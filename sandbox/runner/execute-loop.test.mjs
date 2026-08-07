@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -28,6 +28,7 @@ import {
   sealNativeSessionPackage,
 } from "./native-session-package.mjs";
 import { computeWorkspaceTreeOid } from "./repository-control.mjs";
+import { identityForUser } from "./filesystem-isolation.mjs";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
 import { extractJsonBlock } from "./json-block.mjs";
@@ -1335,6 +1336,88 @@ describe("loop action request validation", () => {
     }
 
     expect(error?.message).toMatch(/profile root was replaced/);
+    expect(error?.retryableInfrastructureFailure).toBe(true);
+  });
+
+  // The action-scoped profile root is deliberately agent-owned and writable
+  // (OPE-101: a real engine writes its config/plugins/telemetry there), which
+  // means the read-only lock on the executor-sealed skills/ tree cannot stop
+  // the agent renaming that whole directory ENTRY aside -- Unix governs
+  // unlink/rename by the parent directory. The nonce fence alone does not see
+  // that (it only proves the root and its own fence file survived), so
+  // assertProfileRootFence re-verifies each sealed tree. These two cases are
+  // the swap the reviewer feared, proven caught.
+  it("fails closed when the executor-sealed skill tree is renamed aside during the action", () => {
+    const baseRequest = repositorySkillRequest();
+    const valid = withFreshLoopFence(baseRequest, { agent: "claude" });
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-skill-aside-"));
+    directories.push(actionRoot);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+    const skillTree = join(actionRoot, valid.attemptId, valid.actionId, "home", ".claude", "skills");
+
+    let error;
+    try {
+      runLoopAgentInPreparedRepository({
+        request: valid,
+        invocation: resolveLoopInvocation(valid),
+        integrationRepoDir: "/tmp/integration",
+        lockIntegration: () => true,
+        processFence: (execute) => execute(),
+        runProcess: () => {
+          // chmod is test-harness plumbing, not part of the attack: BSD/macOS
+          // rename(2) additionally requires write permission on the directory
+          // being renamed, while Linux (where the sandbox runs) needs only
+          // write on the shared parent. The Linux-side feasibility of the
+          // agent performing this rename for real is proven by
+          // sandbox/tests/worktree-isolation-probe.sh.
+          chmodSync(skillTree, 0o700);
+          renameSync(skillTree, `${skillTree}-attack`);
+          return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+        },
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error?.message).toMatch(/executor-sealed skill tree was replaced/);
+    // Executor-owned integrity, not an agent defect: it must not consume a
+    // repair round with a malformed-receipt failure.
+    expect(error?.retryableInfrastructureFailure).toBe(true);
+  });
+
+  it("fails closed when the executor-sealed skill tree is swapped for an agent-owned tree", () => {
+    // The full attack needs real uids: the agent cannot chown anything to
+    // root, which is exactly what makes the ownership re-check unforgeable.
+    if (typeof process.getuid !== "function" || process.getuid() !== 0) return;
+    const baseRequest = repositorySkillRequest();
+    const valid = withFreshLoopFence(baseRequest, { agent: "claude" });
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-skill-swap-"));
+    directories.push(actionRoot);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+    const skillTree = join(actionRoot, valid.attemptId, valid.actionId, "home", ".claude", "skills");
+
+    let error;
+    try {
+      runLoopAgentInPreparedRepository({
+        request: valid,
+        invocation: resolveLoopInvocation(valid),
+        integrationRepoDir: "/tmp/integration",
+        lockIntegration: () => true,
+        processFence: (execute) => execute(),
+        runProcess: () => {
+          chmodSync(skillTree, 0o700);
+          renameSync(skillTree, `${skillTree}-attack`);
+          mkdirSync(skillTree, { recursive: true, mode: 0o700 });
+          const identity = identityForUser("agent");
+          if (identity) chownSync(skillTree, identity.uid, identity.gid);
+          return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+        },
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error?.message).toMatch(/executor-sealed skill tree was replaced/);
     expect(error?.retryableInfrastructureFailure).toBe(true);
   });
 

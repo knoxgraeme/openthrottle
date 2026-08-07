@@ -46,7 +46,7 @@ import {
   lockedPersistentProfilesFrom,
   pathInside as containedPath,
   prepareAgentOwnedDirectory,
-  prepareExecutorOwnedProfileRoot,
+  prepareAgentOwnedProfileRoot,
   restorePersistentAgentPrivateRoots,
 } from "./filesystem-isolation.mjs";
 import { materializeClaudeProfileBaseline, materializeCodexProfileBaseline } from "./action-home-baseline.mjs";
@@ -329,7 +329,7 @@ export function repositorySkillStageEnvironment(request) {
     prepareAgentOwnedDirectory(codexHome);
     materializeCodexProfileBaseline({ destinationHome: codexHome });
     prepareAgentOwnedDirectory(nativeSessionStoragePath(request.agent, codexHome));
-    prepareExecutorOwnedProfileRoot(codexHome);
+    prepareAgentOwnedProfileRoot(codexHome);
     env.push(`CODEX_HOME=${codexHome}`);
     return {
       env,
@@ -341,15 +341,12 @@ export function repositorySkillStageEnvironment(request) {
     const claudeHome = pathInside(home, ".claude", "stage claude home");
     materializeClaudeProfileBaseline({ destinationHome: claudeHome });
     prepareAgentOwnedDirectory(nativeSessionStoragePath(request.agent, claudeHome));
-    prepareExecutorOwnedProfileRoot(claudeHome);
-    // claudeHome's own directory ENTRY is only protected from agent
-    // rename/delete if its parent (home) also denies the agent that
-    // capability -- Unix governs unlink/rename by the parent, not the
-    // entry's own permissions, so a plain agent-owned home (as prepared
-    // above) would let the agent replace the whole locked claudeHome
-    // wholesale, sidestepping every lock above. Lock home the same way now
-    // that claudeHome exists inside it.
-    prepareExecutorOwnedProfileRoot(home);
+    // Agent-owned and writable (OPE-101), matching the persistent stage
+    // profile the engine is known to run under. materializeRepositorySkill
+    // still seals its own discovery tree root-owned read-only inside this
+    // root; see prepareAgentOwnedProfileRoot for why an agent-writable root
+    // is the deliberate posture.
+    prepareAgentOwnedProfileRoot(claudeHome);
     return {
       env,
       repositorySkillDiscoveryRoot: pathInside(claudeHome, "skills", "stage repository skill discovery"),
@@ -541,12 +538,10 @@ export function defaultRunAgent({
         // otherwise discard that evidence (mirrors execute-loop.mjs's
         // runLoopAgentInPreparedRepository, whose executeStage() caller
         // already routes any throw here through retryable_infrastructure_failure).
+        // launchDiagnosticTail keeps that evidence bounded and sanitized.
         const message = error instanceof Error ? error.message : String(error);
-        throw new Error([
-          message,
-          result.stdout && `--- engine stdout ---\n${result.stdout}`,
-          result.stderr && `--- engine stderr ---\n${result.stderr}`,
-        ].filter(Boolean).join("\n\n"));
+        const engineTail = launchDiagnosticTail({ stdout: result.stdout, stderr: result.stderr });
+        throw new Error([message, engineTail && `engine diagnostics: ${engineTail}`].filter(Boolean).join("\n"));
       }
     }
     return {

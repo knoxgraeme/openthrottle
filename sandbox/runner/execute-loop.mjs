@@ -580,7 +580,7 @@ function retryableInfrastructureError(message, extra = {}) {
   return error;
 }
 
-function assertProfileRootFence(profileRoot, nonce) {
+function assertProfileRootFence(profileRoot, nonce, sealedSkillTrees = []) {
   const replaced = new Error("native session profile root was replaced during the action");
   let rootMetadata;
   let fenceMetadata;
@@ -595,6 +595,26 @@ function assertProfileRootFence(profileRoot, nonce) {
   if (!fenceMetadata.isFile() || fenceMetadata.isSymbolicLink()) throw replaced;
   if (isRoot() && fenceMetadata.uid !== ROOT_UID) throw replaced;
   if (readFileSync(fencePath, "utf8") !== nonce) throw replaced;
+  // The profile root is agent-writable (OPE-101), so the agent can rename the
+  // executor-sealed skills/ entry aside and drop its own tree in its place --
+  // the read-only lock on skills/ governs writes *into* it, never its own
+  // directory entry, which its parent governs. The nonce above does not catch
+  // that: it only proves the root itself and the fence file survived. What the
+  // agent cannot do is produce a uid-0 directory, so re-verifying ownership of
+  // every tree the executor sealed is the seal that catches the swap. Fails
+  // closed as a retryable executor fault (the caller wraps it), so a tampered
+  // action never yields an accepted receipt.
+  const swapped = new Error("executor-sealed skill tree was replaced during the action");
+  for (const tree of sealedSkillTrees) {
+    let treeMetadata;
+    try {
+      treeMetadata = lstatSync(tree);
+    } catch {
+      throw swapped;
+    }
+    if (!treeMetadata.isDirectory() || treeMetadata.isSymbolicLink()) throw swapped;
+    if (isRoot() && treeMetadata.uid !== ROOT_UID) throw swapped;
+  }
 }
 
 function packReachableBaseObjects(repoDir, destinationPackBase, subject = "HEAD") {
@@ -900,7 +920,11 @@ export function runLoopAgentInPreparedRepository({
     try {
       // The profile-root tamper fence is an independent integrity check, not
       // a symptom of how the engine exited, so it always runs.
-      assertProfileRootFence(preparedEnvironment.nativeSessionProfileRoot, preparedEnvironment.profileRootFenceNonce);
+      assertProfileRootFence(
+        preparedEnvironment.nativeSessionProfileRoot,
+        preparedEnvironment.profileRootFenceNonce,
+        preparedEnvironment.sealedSkillTrees,
+      );
       if (engineExited) {
         const sealedNativeSessionPackage = sealNativeSessionPackage({
           agent: request.agent,
@@ -1085,12 +1109,19 @@ export function executeLoopAction({
       // A fault raised after the engine itself ran (e.g. a session-seal or
       // profile-fence failure) carries the real engine streams on the error
       // (see runLoopAgentInPreparedRepository) so they survive here instead
-      // of being discarded by this wholesale replacement. Both fold into
+      // of being discarded by this wholesale replacement -- OPE-101 was
+      // undiagnosable precisely because they were dropped. Both fold into
       // `stderr`, not `stdout`: every downstream receipt/narrative branch for
       // an executor fault reads only execution.stderr (execution.status stays
       // null here, so the execution.stdout-reading branches never trigger).
-      const engineStdout = typeof error?.engineStdout === "string" ? error.engineStdout : "";
-      const engineStderr = typeof error?.engineStderr === "string" ? error.engineStderr : "";
+      // launchDiagnosticTail bounds and sanitizes them the same way the
+      // engine-crash path does, so a multi-megabyte stream-json transcript
+      // cannot crowd the executor's own message out of the receipt.
+      const engineTail = launchDiagnosticTail({
+        stdout: typeof error?.engineStdout === "string" ? error.engineStdout : "",
+        stderr: typeof error?.engineStderr === "string" ? error.engineStderr : "",
+        env: sanitizeEnv,
+      });
       const executorMessage = error instanceof Error ? error.message : String(error);
       execution = {
         status: null,
@@ -1098,13 +1129,12 @@ export function executeLoopAction({
         timedOut: false,
         stdout: "",
         // The executor's own diagnostic stays primary (it is what
-        // classification and the receipt text key off), with any real engine
-        // output appended as evidence rather than dropped.
+        // classification and the receipt text key off), with the engine's own
+        // bounded diagnostic tail appended as evidence rather than dropped.
         stderr: [
           executorMessage,
-          engineStdout && `--- engine stdout ---\n${engineStdout}`,
-          engineStderr && `--- engine stderr ---\n${engineStderr}`,
-        ].filter(Boolean).join("\n\n"),
+          engineTail && `engine diagnostics: ${engineTail}`,
+        ].filter(Boolean).join("\n"),
         nativeSessionId: request.nativeSessionId,
         integrationRepoDir,
         // The executor itself failed before (or around) the engine, so its

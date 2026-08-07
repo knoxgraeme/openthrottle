@@ -88,28 +88,30 @@ export function resetAgentOwnedDirectory(path) {
   prepareAgentOwnedDirectory(path);
 }
 
-// Non-recursive, unlike prepareAgentOwnedDirectory: chowns/chmods only `path`
-// itself. A real engine writes its own config, plugins, telemetry, and shell
-// state directly under a profile root at startup, so the root itself must be
-// writable by the agent.
+// An engine profile root (~/.claude, $CODEX_HOME) must be agent-owned and
+// writable: a real engine writes its own config, plugins, telemetry, and
+// shell state directly into the root at startup. A root-owned read-only root
+// EACCESed every one of those writes and is what broke the first live
+// structured run (OPE-101). This mirrors the proven persistent stage profile
+// (`install -d -o agent -g agent -m 0700 ~/.claude`, entrypoint.sh).
 //
-// It must NOT simply be agent-owned, though: Unix governs unlink/rename of a
-// directory ENTRY by the *parent* directory's own owner+mode, never by the
-// entry's own permissions. An agent-owned parent would let the agent delete
-// or rename *any* child regardless of the child's own lock -- including a
-// root-owned, read-only-locked skills/ tree the caller places inside it
-// (lockExecutorOwnedSkillTree only protects writes *into* skills/, not the
-// "skills" directory entry itself).
+// Non-recursive, unlike prepareAgentOwnedDirectory: only `path` itself is
+// chowned/chmoded, so executor-sealed children materialized inside it (the
+// root-owned read-only skills/ tree, a restored native-session package) keep
+// their own ownership.
 //
-// Instead this mirrors /tmp's own model: root-owned, agent-group-writable,
-// with the sticky bit set. The sticky bit lets unlink/rename of an entry
-// proceed only when the caller owns that entry OR owns the directory; the
-// agent owns neither for a root-owned child like skills/, so it is blocked
-// from touching that entry, while still getting full read/write/create
-// access to the directory (via the group bits) for its own new files -- and
-// can freely delete/replace files it created itself, since it owns those.
-export function prepareExecutorOwnedProfileRoot(path) {
-  if (!isRoot()) return;
+// Integrity boundary, deliberately chosen: Unix governs unlink/rename of a
+// directory ENTRY by the *parent* directory, not by the entry's own mode, so
+// an agent-writable root does let the agent rename a sealed child (skills/,
+// the profile fence file) aside. That is detected, not prevented -- the
+// executor re-verifies the root-owned uid-0 fence nonce and every sealed
+// skill tree's uid-0 ownership after the engine exits
+// (assertProfileRootFence in execute-loop.mjs), and the agent cannot forge a
+// uid-0 file or directory, so any swap fails the action closed. Prevention
+// via a root-owned parent was rejected: it is exactly the unproven ownership
+// model that caused OPE-101, and it is not the posture of the persistent
+// stage profile that real engines are known to run under.
+export function prepareAgentOwnedProfileRoot(path) {
   // A stale agent-planted symlink at `path` would otherwise cause the
   // chownSync/chmodSync below (which follow symlinks) to retarget whatever
   // arbitrary location it points to, as root -- mirrors the same guard
@@ -120,10 +122,10 @@ export function prepareExecutorOwnedProfileRoot(path) {
       rmSync(path, { recursive: true, force: true });
     }
   }
+  mkdirSync(path, { recursive: true, mode: 0o700 });
   const identity = identityForUser("agent");
-  mkdirSync(path, { recursive: true });
-  if (identity) chownSync(path, ROOT_UID, identity.gid);
-  chmodSync(path, 0o1770);
+  if (identity) chownSync(path, identity.uid, identity.gid);
+  chmodSync(path, 0o700);
 }
 
 // Read-only views must keep tracked executable bits or the checkout shows
