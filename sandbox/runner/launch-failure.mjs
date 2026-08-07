@@ -152,6 +152,14 @@ function remediationFor(reason, agent) {
   return "";
 }
 
+// A timed-out, signaled, or non-zero-exit engine process has no complete
+// transcript to seal -- sealing predictably fails for a reason that is only
+// a symptom of the exit itself, so callers gate sealing (never classification)
+// on this before attempting it.
+export function engineExitedCleanly({ timedOut, signal, status }) {
+  return !timedOut && !signal && status === 0;
+}
+
 /**
  * Classifies why an agent process died before producing terminal evidence.
  * `credentialPresent` is the authoritative signal when it is known; text

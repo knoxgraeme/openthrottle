@@ -1086,6 +1086,84 @@ printf '{"type":"thread.started","thread_id":"native-1"}\\n'
     });
   });
 
+  it("preserves real engine stdout as evidence when a clean exit's session cannot be sealed", () => {
+    const repoDir = repository();
+    const { repositorySkill } = sealedRepositorySkillPackage(repoDir);
+    const input = fixture({
+      capability: "agent/repository-skill@1",
+      repositorySkill,
+    });
+    input.repoDir = repoDir;
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-stage-actions-"));
+    const sourceRoot = mkdtempSync(join(tmpdir(), "ot-stage-native-sessions-"));
+    const binDir = mkdtempSync(join(tmpdir(), "ot-fake-bin-"));
+    directories.push(actionRoot, sourceRoot, binDir);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sourceRoot;
+
+    installFakeGosu(binDir);
+    writeExecutable(join(binDir, "codex"), `#!/usr/bin/env bash
+set -euo pipefail
+cat > "$OT_STAGE_PROPOSAL_FILE" <<'JSON'
+{"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"ok","evidence":["session reported"],"findings":[],"actions":[],"uncertainty":[]}
+JSON
+printf '{"type":"thread.started","thread_id":"native-1"}\\n' >&2
+printf '{"type":"thread.started","thread_id":"native-1"}\\n'
+`);
+    withPrependedPath(binDir, () => {
+      // The engine's own streams (its real evidence of what it did) must
+      // survive a seal failure instead of being replaced by a bare
+      // "does not contain the reported native session id" message, mirroring
+      // execute-loop.mjs's runLoopAgentInPreparedRepository. They arrive as a
+      // bounded, sanitized launchDiagnosticTail rather than raw streams.
+      expect(() => defaultRunAgent({
+        request: input.request,
+        invocation: resolveContextInvocation(input.request),
+        repoDir: input.repoDir,
+        proposalPath: join(actionRoot, "proposal.json"),
+        timeoutMs: 1000,
+      })).toThrow(/does not contain the reported native session id[\s\S]*engine diagnostics:[\s\S]*thread\.started/);
+    });
+  });
+
+  it("does not return a freshly reported but unsealed native session id when the engine did not exit cleanly", () => {
+    const repoDir = repository();
+    const { repositorySkill } = sealedRepositorySkillPackage(repoDir);
+    const input = fixture({
+      capability: "agent/repository-skill@1",
+      repositorySkill,
+    });
+    input.repoDir = repoDir;
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-stage-actions-"));
+    const sourceRoot = mkdtempSync(join(tmpdir(), "ot-stage-native-sessions-"));
+    const binDir = mkdtempSync(join(tmpdir(), "ot-fake-bin-"));
+    directories.push(actionRoot, sourceRoot, binDir);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sourceRoot;
+
+    installFakeGosu(binDir);
+    writeExecutable(join(binDir, "codex"), `#!/usr/bin/env bash
+set -euo pipefail
+cat > "$OT_STAGE_PROPOSAL_FILE" <<'JSON'
+{"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"ok","evidence":["session reported"],"findings":[],"actions":[],"uncertainty":[]}
+JSON
+printf '{"type":"thread.started","thread_id":"native-crashed"}\\n'
+exit 1
+`);
+    withPrependedPath(binDir, () => {
+      const result = defaultRunAgent({
+        request: input.request,
+        invocation: resolveContextInvocation(input.request),
+        repoDir: input.repoDir,
+        proposalPath: join(actionRoot, "proposal.json"),
+        timeoutMs: 1000,
+      });
+      // Sealing is skipped on a non-clean exit, so the reported-but-unsealed
+      // id must not be returned as if it were valid evidence.
+      expect(result.nativeSessionId).toBeNull();
+    });
+  });
+
   it("executes only the sealed allowlisted command and records tree mutation", () => {
     const input = fixture({
       capability: "command/run@1",

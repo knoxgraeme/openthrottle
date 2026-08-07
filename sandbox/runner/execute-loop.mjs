@@ -29,6 +29,7 @@ import { readLoopActionCredentialEnv } from "./loop-credentials.mjs";
 import {
   classifyLaunchFailure,
   engineCredentialPresent,
+  engineExitedCleanly,
   launchDiagnosticTail,
 } from "./launch-failure.mjs";
 import { prepareLoopAgentEnvironment } from "./loop-agent-environment.mjs";
@@ -572,13 +573,14 @@ export function prepareRootReadOnlyDirectory(path) {
   chmodTree(path, { fileMode: 0o444, directoryMode: 0o555 });
 }
 
-function retryableInfrastructureError(message) {
+function retryableInfrastructureError(message, extra = {}) {
   const error = new Error(message);
   error.retryableInfrastructureFailure = true;
+  Object.assign(error, extra);
   return error;
 }
 
-function assertProfileRootFence(profileRoot, nonce) {
+function assertProfileRootFence(profileRoot, nonce, sealedSkillTrees = []) {
   const replaced = new Error("native session profile root was replaced during the action");
   let rootMetadata;
   let fenceMetadata;
@@ -593,6 +595,26 @@ function assertProfileRootFence(profileRoot, nonce) {
   if (!fenceMetadata.isFile() || fenceMetadata.isSymbolicLink()) throw replaced;
   if (isRoot() && fenceMetadata.uid !== ROOT_UID) throw replaced;
   if (readFileSync(fencePath, "utf8") !== nonce) throw replaced;
+  // The profile root is agent-writable (OPE-101), so the agent can rename the
+  // executor-sealed skills/ entry aside and drop its own tree in its place --
+  // the read-only lock on skills/ governs writes *into* it, never its own
+  // directory entry, which its parent governs. The nonce above does not catch
+  // that: it only proves the root itself and the fence file survived. What the
+  // agent cannot do is produce a uid-0 directory, so re-verifying ownership of
+  // every tree the executor sealed is the seal that catches the swap. Fails
+  // closed as a retryable executor fault (the caller wraps it), so a tampered
+  // action never yields an accepted receipt.
+  const swapped = new Error("executor-sealed skill tree was replaced during the action");
+  for (const tree of sealedSkillTrees) {
+    let treeMetadata;
+    try {
+      treeMetadata = lstatSync(tree);
+    } catch {
+      throw swapped;
+    }
+    if (!treeMetadata.isDirectory() || treeMetadata.isSymbolicLink()) throw swapped;
+    if (isRoot() && treeMetadata.uid !== ROOT_UID) throw swapped;
+  }
 }
 
 function packReachableBaseObjects(repoDir, destinationPackBase, subject = "HEAD") {
@@ -883,15 +905,45 @@ export function runLoopAgentInPreparedRepository({
     if (request.nativeSessionId && reportedNativeSessionId && reportedNativeSessionId !== request.nativeSessionId) {
       throw new Error("reported native session id does not match the sealed loop request");
     }
-    const nativeSessionId = request.nativeSessionId ?? reportedNativeSessionId;
-    assertProfileRootFence(preparedEnvironment.nativeSessionProfileRoot, preparedEnvironment.profileRootFenceNonce);
-    const sealedNativeSessionPackage = sealNativeSessionPackage({
-      agent: request.agent,
-      nativeSessionId,
-      profileRoot: preparedEnvironment.nativeSessionProfileRoot,
-    });
-    if (nativeSessionId && !sealedNativeSessionPackage) {
-      throw new Error("native session id was reported without a sealed executor package");
+    // A genuine engine failure (timeout/signal/non-zero exit) has no complete
+    // session transcript to seal; classify it by its own exit evidence
+    // (executeLoopAction's own classifyLaunchFailure path) instead of a
+    // predictable sealing failure that would otherwise mask the real cause.
+    const engineExited = engineExitedCleanly(result);
+    // A reported id carries no evidence until sealNativeSessionPackage below
+    // validates it. On a non-clean exit sealing is never attempted, so only
+    // an id this action already had sealed for it (request.nativeSessionId,
+    // from a prior action) is trustworthy -- never a freshly reported id from
+    // a crashed/timed-out engine, which would otherwise poison a later
+    // resume attempt into sealing against a session that was never sealed.
+    const nativeSessionId = request.nativeSessionId ?? (engineExited ? reportedNativeSessionId : null);
+    try {
+      // The profile-root tamper fence is an independent integrity check, not
+      // a symptom of how the engine exited, so it always runs.
+      assertProfileRootFence(
+        preparedEnvironment.nativeSessionProfileRoot,
+        preparedEnvironment.profileRootFenceNonce,
+        preparedEnvironment.sealedSkillTrees,
+      );
+      if (engineExited) {
+        const sealedNativeSessionPackage = sealNativeSessionPackage({
+          agent: request.agent,
+          nativeSessionId,
+          profileRoot: preparedEnvironment.nativeSessionProfileRoot,
+        });
+        if (nativeSessionId && !sealedNativeSessionPackage) {
+          throw new Error("native session id was reported without a sealed executor package");
+        }
+      }
+    } catch (error) {
+      // The engine itself produced real, evidence-bearing output before this
+      // executor-owned fence/seal step failed; a wholesale rethrow would
+      // otherwise discard that evidence (see the executeLoopAction catch
+      // below) and settle this as a non-retryable defect.
+      throw retryableInfrastructureError(
+        error instanceof Error ? error.message : String(error),
+        { engineStdout: result.stdout, engineStderr: result.stderr },
+      );
     }
     const codexAuthJson = request.agent === "codex"
       ? readCodexAuthSnapshot(preparedEnvironment.nativeSessionProfileRoot, runProcess)
@@ -929,6 +981,8 @@ export function runLoopAgentInPreparedRepository({
       // The compounded error must not launder an unconfirmed-termination body
       // error into one that lets executeLoopAction restore agent access.
       if (bodyError?.processTerminationUnconfirmed) compounded.processTerminationUnconfirmed = true;
+      if (bodyError?.engineStdout !== undefined) compounded.engineStdout = bodyError.engineStdout;
+      if (bodyError?.engineStderr !== undefined) compounded.engineStderr = bodyError.engineStderr;
       throw compounded;
     }
   }
@@ -1052,12 +1106,35 @@ export function executeLoopAction({
     try {
       execution = runLoopAgent({ request, invocation, integrationRepoDir, credentialEnv });
     } catch (error) {
+      // A fault raised after the engine itself ran (e.g. a session-seal or
+      // profile-fence failure) carries the real engine streams on the error
+      // (see runLoopAgentInPreparedRepository) so they survive here instead
+      // of being discarded by this wholesale replacement -- OPE-101 was
+      // undiagnosable precisely because they were dropped. Both fold into
+      // `stderr`, not `stdout`: every downstream receipt/narrative branch for
+      // an executor fault reads only execution.stderr (execution.status stays
+      // null here, so the execution.stdout-reading branches never trigger).
+      // launchDiagnosticTail bounds and sanitizes them the same way the
+      // engine-crash path does, so a multi-megabyte stream-json transcript
+      // cannot crowd the executor's own message out of the receipt.
+      const engineTail = launchDiagnosticTail({
+        stdout: typeof error?.engineStdout === "string" ? error.engineStdout : "",
+        stderr: typeof error?.engineStderr === "string" ? error.engineStderr : "",
+        env: sanitizeEnv,
+      });
+      const executorMessage = error instanceof Error ? error.message : String(error);
       execution = {
         status: null,
         signal: null,
         timedOut: false,
         stdout: "",
-        stderr: String(error),
+        // The executor's own diagnostic stays primary (it is what
+        // classification and the receipt text key off), with the engine's own
+        // bounded diagnostic tail appended as evidence rather than dropped.
+        stderr: [
+          executorMessage,
+          engineTail && `engine diagnostics: ${engineTail}`,
+        ].filter(Boolean).join("\n"),
         nativeSessionId: request.nativeSessionId,
         integrationRepoDir,
         // The executor itself failed before (or around) the engine, so its

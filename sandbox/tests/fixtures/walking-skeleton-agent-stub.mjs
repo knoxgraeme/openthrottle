@@ -14,7 +14,7 @@
 // computes subject.post with the executor's own tree-oid algorithm so the
 // receipt it prints is byte-for-byte fence-correct without needing to guess.
 
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { computeWorkspaceTreeOid } from "/opt/openthrottle/runner/repository-control.mjs";
 import { extractJsonBlock } from "/opt/openthrottle/runner/json-block.mjs";
@@ -33,10 +33,15 @@ function readStdin() {
 // process leaves under `$HOME/.claude/projects/`. Mirror that here, matching
 // the fixture pattern in sandbox/tests/smoke.sh (write the transcript before
 // printing the matching session_id), so the executor's seal step finds it.
+// Real Claude Code files each transcript under a per-cwd slug directory
+// (projects/<slug>/<sessionId>.jsonl), not flat in projects/. Mirroring the
+// slug keeps the skeleton exercising collectNativeSessionPackage's recursive
+// walk rather than only its top-level scan.
 function nativeSessionTranscriptDir() {
   const home = process.env.HOME;
   if (!home) throw new Error("stub agent requires HOME to materialize its session transcript");
-  return join(home, ".claude", "projects");
+  const slug = process.cwd().replace(/[^a-zA-Z0-9]+/g, "-");
+  return join(home, ".claude", "projects", slug);
 }
 
 function writeNativeSessionTranscript(sessionId, contract) {
@@ -51,6 +56,22 @@ function writeNativeSessionTranscript(sessionId, contract) {
     },
   };
   appendFileSync(join(dir, `${sessionId}.jsonl`), `${JSON.stringify(record)}\n`);
+}
+
+// A real Claude Code process writes its own config, plugins, and shell state
+// directly into the profile root itself at startup, not just into its
+// projects/ transcript subtree (see filesystem-isolation.mjs's
+// prepareAgentOwnedProfileRoot). OPE-101 was invisible to this skeleton
+// because the stub only ever wrote into the one pre-created carve-out;
+// mirror the top-level write here so the Docker walking skeleton pins the
+// profile root staying agent-writable.
+function writeProfileRootStartupFile() {
+  const home = process.env.HOME;
+  if (!home) throw new Error("stub agent requires HOME to materialize its profile root startup file");
+  writeFileSync(
+    join(home, ".claude", "ot-stub-agent-startup.json"),
+    `${JSON.stringify({ startedAt: new Date().toISOString() })}\n`,
+  );
 }
 
 function findControlMarker(planContext, name) {
@@ -176,6 +197,7 @@ function main() {
   // the request; only mint a fresh id when the contract carries none (the
   // first action of an attempt).
   const sessionId = contract.native_session_id ?? `stub-${contract.action_attempt_id}`;
+  writeProfileRootStartupFile();
   writeNativeSessionTranscript(sessionId, contract);
 
   process.stdout.write(`${JSON.stringify({ type: "system", subtype: "init", session_id: sessionId, model: "stub" })}\n`);

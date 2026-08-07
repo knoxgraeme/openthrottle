@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -28,6 +28,7 @@ import {
   sealNativeSessionPackage,
 } from "./native-session-package.mjs";
 import { computeWorkspaceTreeOid } from "./repository-control.mjs";
+import { identityForUser } from "./filesystem-isolation.mjs";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
 import { extractJsonBlock } from "./json-block.mjs";
@@ -1274,25 +1275,179 @@ describe("loop action request validation", () => {
     expect(error?.processTerminationUnconfirmed).toBe(true);
   });
 
-  it("rejects sealing when the native session profile root was replaced during the action", () => {
+  it("rejects sealing when the native session profile root was replaced during the action, as a retryable infrastructure fault", () => {
     const valid = validateLoopRequest(request({ agent: "claude" }));
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
     directories.push(actionRoot);
     process.env.OT_LOOP_ACTION_ROOT = actionRoot;
     const profileRoot = join(actionRoot, valid.attemptId, valid.actionId, "home", ".claude");
 
-    expect(() => runLoopAgentInPreparedRepository({
+    let error;
+    try {
+      runLoopAgentInPreparedRepository({
+        request: valid,
+        invocation: resolveLoopInvocation(valid),
+        integrationRepoDir: "/tmp/integration",
+        lockIntegration: () => true,
+        processFence: (execute) => execute(),
+        runProcess: () => {
+          rmSync(profileRoot, { recursive: true, force: true });
+          mkdirSync(profileRoot, { recursive: true });
+          return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+        },
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error?.message).toMatch(/profile root was replaced/);
+    // A fence failure is executor-owned infrastructure, not agent defect: it
+    // must route through the retryable path instead of consuming a repair
+    // round with a malformed-receipt defect.
+    expect(error?.retryableInfrastructureFailure).toBe(true);
+  });
+
+  it("still detects a replaced profile root even when the engine did not exit cleanly", () => {
+    // The profile-root tamper fence is an independent integrity check, not a
+    // symptom of how the engine exited: only sealing (which predictably fails
+    // on an incomplete transcript) is gated on a clean exit, never the fence.
+    const valid = validateLoopRequest(request({ agent: "claude" }));
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+    directories.push(actionRoot);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+    const profileRoot = join(actionRoot, valid.attemptId, valid.actionId, "home", ".claude");
+
+    let error;
+    try {
+      runLoopAgentInPreparedRepository({
+        request: valid,
+        invocation: resolveLoopInvocation(valid),
+        integrationRepoDir: "/tmp/integration",
+        lockIntegration: () => true,
+        processFence: (execute) => execute(),
+        runProcess: () => {
+          rmSync(profileRoot, { recursive: true, force: true });
+          mkdirSync(profileRoot, { recursive: true });
+          return { status: 1, signal: null, timedOut: false, stdout: "", stderr: "engine crashed" };
+        },
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error?.message).toMatch(/profile root was replaced/);
+    expect(error?.retryableInfrastructureFailure).toBe(true);
+  });
+
+  // The action-scoped profile root is deliberately agent-owned and writable
+  // (OPE-101: a real engine writes its config/plugins/telemetry there), which
+  // means the read-only lock on the executor-sealed skills/ tree cannot stop
+  // the agent renaming that whole directory ENTRY aside -- Unix governs
+  // unlink/rename by the parent directory. The nonce fence alone does not see
+  // that (it only proves the root and its own fence file survived), so
+  // assertProfileRootFence re-verifies each sealed tree. These two cases are
+  // the swap the reviewer feared, proven caught.
+  it("fails closed when the executor-sealed skill tree is renamed aside during the action", () => {
+    const baseRequest = repositorySkillRequest();
+    const valid = withFreshLoopFence(baseRequest, { agent: "claude" });
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-skill-aside-"));
+    directories.push(actionRoot);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+    const skillTree = join(actionRoot, valid.attemptId, valid.actionId, "home", ".claude", "skills");
+
+    let error;
+    try {
+      runLoopAgentInPreparedRepository({
+        request: valid,
+        invocation: resolveLoopInvocation(valid),
+        integrationRepoDir: "/tmp/integration",
+        lockIntegration: () => true,
+        processFence: (execute) => execute(),
+        runProcess: () => {
+          // chmod is test-harness plumbing, not part of the attack: BSD/macOS
+          // rename(2) additionally requires write permission on the directory
+          // being renamed, while Linux (where the sandbox runs) needs only
+          // write on the shared parent. The Linux-side feasibility of the
+          // agent performing this rename for real is proven by
+          // sandbox/tests/worktree-isolation-probe.sh.
+          chmodSync(skillTree, 0o700);
+          renameSync(skillTree, `${skillTree}-attack`);
+          return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+        },
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error?.message).toMatch(/executor-sealed skill tree was replaced/);
+    // Executor-owned integrity, not an agent defect: it must not consume a
+    // repair round with a malformed-receipt failure.
+    expect(error?.retryableInfrastructureFailure).toBe(true);
+  });
+
+  it("fails closed when the executor-sealed skill tree is swapped for an agent-owned tree", () => {
+    // The full attack needs real uids: the agent cannot chown anything to
+    // root, which is exactly what makes the ownership re-check unforgeable.
+    if (typeof process.getuid !== "function" || process.getuid() !== 0) return;
+    const baseRequest = repositorySkillRequest();
+    const valid = withFreshLoopFence(baseRequest, { agent: "claude" });
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-skill-swap-"));
+    directories.push(actionRoot);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+    const skillTree = join(actionRoot, valid.attemptId, valid.actionId, "home", ".claude", "skills");
+
+    let error;
+    try {
+      runLoopAgentInPreparedRepository({
+        request: valid,
+        invocation: resolveLoopInvocation(valid),
+        integrationRepoDir: "/tmp/integration",
+        lockIntegration: () => true,
+        processFence: (execute) => execute(),
+        runProcess: () => {
+          chmodSync(skillTree, 0o700);
+          renameSync(skillTree, `${skillTree}-attack`);
+          mkdirSync(skillTree, { recursive: true, mode: 0o700 });
+          const identity = identityForUser("agent");
+          if (identity) chownSync(skillTree, identity.uid, identity.gid);
+          return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+        },
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error?.message).toMatch(/executor-sealed skill tree was replaced/);
+    expect(error?.retryableInfrastructureFailure).toBe(true);
+  });
+
+  it("does not return a freshly reported but unsealed native session id when the engine did not exit cleanly", () => {
+    // Sealing is skipped on a non-clean exit (nothing to validate the
+    // reported id against), so returning that unverified id anyway would let
+    // a later resume attempt seal request.nativeSessionId against a session
+    // that was never actually sealed, failing confusingly instead of
+    // starting fresh.
+    const valid = validateLoopRequest(request());
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+    directories.push(actionRoot);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+
+    const result = runLoopAgentInPreparedRepository({
       request: valid,
       invocation: resolveLoopInvocation(valid),
       integrationRepoDir: "/tmp/integration",
       lockIntegration: () => true,
       processFence: (execute) => execute(),
-      runProcess: () => {
-        rmSync(profileRoot, { recursive: true, force: true });
-        mkdirSync(profileRoot, { recursive: true });
-        return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
-      },
-    })).toThrow(/profile root was replaced/);
+      runProcess: () => ({
+        status: 1,
+        signal: null,
+        timedOut: false,
+        stdout: "{\"type\":\"thread.started\",\"thread_id\":\"thread-crashed\"}\n",
+        stderr: "engine crashed after reporting a session",
+      }),
+    });
+
+    expect(result.nativeSessionId).toBeNull();
   });
 
   it("preserves tracked executable bits in read-only repository views", () => {
@@ -1671,24 +1826,70 @@ describe("loop action request validation", () => {
     process.env.OT_LOOP_ACTION_ROOT = actionRoot;
     process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sessionRoot;
 
-    expect(() => runLoopAgentInPreparedRepository({
+    let error;
+    try {
+      runLoopAgentInPreparedRepository({
+        request: valid,
+        invocation: resolveLoopInvocation(valid),
+        integrationRepoDir: "/tmp/integration",
+        lockIntegration: () => true,
+        lockPersistentProfiles: () => ["/home/agent/.codex"],
+        restorePersistentProfiles: () => {
+          throw new Error("profile restore failed");
+        },
+        processFence: (execute) => execute(),
+        runProcess: () => ({
+          status: 0,
+          signal: null,
+          timedOut: false,
+          stdout: "{\"type\":\"thread.started\",\"thread_id\":\"thread-1\"}\n",
+          stderr: "",
+        }),
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error?.message).toMatch(/native session package does not contain the reported native session id.*profile restore failed/s);
+    expect(error?.retryableInfrastructureFailure).toBe(true);
+  });
+
+  it("preserves real engine stdout/stderr as infrastructure evidence when a clean exit's session cannot be sealed", () => {
+    // Mirrors OPE-101: the engine exits cleanly (status 0) and produced real
+    // diagnostic output, but its transcript never landed, so sealing fails.
+    // That executor-owned fault must not discard the engine's own evidence,
+    // and must route as retryable infrastructure rather than a bare-string
+    // defect that consumes no repair round (see execute-loop.mjs's
+    // executeLoopAction catch and runLoopAgentInPreparedRepository).
+    const valid = validateLoopRequest(request());
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+    const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
+    directories.push(actionRoot, sessionRoot);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+    process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sessionRoot;
+
+    const result = executeLoopActionWithIntegration({
       request: valid,
-      invocation: resolveLoopInvocation(valid),
-      integrationRepoDir: "/tmp/integration",
-      lockIntegration: () => true,
-      lockPersistentProfiles: () => ["/home/agent/.codex"],
-      restorePersistentProfiles: () => {
-        throw new Error("profile restore failed");
-      },
-      processFence: (execute) => execute(),
-      runProcess: () => ({
-        status: 0,
-        signal: null,
-        timedOut: false,
-        stdout: "{\"type\":\"thread.started\",\"thread_id\":\"thread-1\"}\n",
-        stderr: "",
+      runLoopAgent: (args) => runLoopAgentInPreparedRepository({
+        ...args,
+        lockIntegration: () => true,
+        lockPersistentProfiles: () => [],
+        restorePersistentProfiles: () => {},
+        processFence: (execute) => execute(),
+        runProcess: () => ({
+          status: 0,
+          signal: null,
+          timedOut: false,
+          stdout: "{\"type\":\"thread.started\",\"thread_id\":\"thread-1\"}\n",
+          stderr: "real engine diagnostic noise the executor must not discard",
+        }),
       }),
-    })).toThrow(/native session package does not contain the reported native session id.*profile restore failed/s);
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+    expect(result.receipt).toContain("native session package does not contain the reported native session id");
+    expect(result.receipt).toContain("real engine diagnostic noise the executor must not discard");
   });
 
   it("rejects path-like native session ids before package storage can collapse", () => {

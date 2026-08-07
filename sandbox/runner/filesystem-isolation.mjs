@@ -88,6 +88,46 @@ export function resetAgentOwnedDirectory(path) {
   prepareAgentOwnedDirectory(path);
 }
 
+// An engine profile root (~/.claude, $CODEX_HOME) must be agent-owned and
+// writable: a real engine writes its own config, plugins, telemetry, and
+// shell state directly into the root at startup. A root-owned read-only root
+// EACCESed every one of those writes and is what broke the first live
+// structured run (OPE-101). This mirrors the proven persistent stage profile
+// (`install -d -o agent -g agent -m 0700 ~/.claude`, entrypoint.sh).
+//
+// Non-recursive, unlike prepareAgentOwnedDirectory: only `path` itself is
+// chowned/chmoded, so executor-sealed children materialized inside it (the
+// root-owned read-only skills/ tree, a restored native-session package) keep
+// their own ownership.
+//
+// Integrity boundary, deliberately chosen: Unix governs unlink/rename of a
+// directory ENTRY by the *parent* directory, not by the entry's own mode, so
+// an agent-writable root does let the agent rename a sealed child (skills/,
+// the profile fence file) aside. That is detected, not prevented -- the
+// executor re-verifies the root-owned uid-0 fence nonce and every sealed
+// skill tree's uid-0 ownership after the engine exits
+// (assertProfileRootFence in execute-loop.mjs), and the agent cannot forge a
+// uid-0 file or directory, so any swap fails the action closed. Prevention
+// via a root-owned parent was rejected: it is exactly the unproven ownership
+// model that caused OPE-101, and it is not the posture of the persistent
+// stage profile that real engines are known to run under.
+export function prepareAgentOwnedProfileRoot(path) {
+  // A stale agent-planted symlink at `path` would otherwise cause the
+  // chownSync/chmodSync below (which follow symlinks) to retarget whatever
+  // arbitrary location it points to, as root -- mirrors the same guard
+  // prepareAgentOwnedDirectory applies above.
+  if (existsSync(path)) {
+    const metadata = lstatSync(path);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      rmSync(path, { recursive: true, force: true });
+    }
+  }
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  const identity = identityForUser("agent");
+  if (identity) chownSync(path, identity.uid, identity.gid);
+  chmodSync(path, 0o700);
+}
+
 // Read-only views must keep tracked executable bits or the checkout shows
 // filemode modifications and stops being Git-clean.
 export function chmodReadOnlyPreservingExecuteTree(path) {

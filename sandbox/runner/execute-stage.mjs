@@ -35,6 +35,7 @@ import { runWithAgentProcessFence } from "./agent-process-fence.mjs";
 import {
   classifyLaunchFailure,
   engineCredentialPresent,
+  engineExitedCleanly,
   launchDiagnosticTail,
 } from "./launch-failure.mjs";
 import {
@@ -45,6 +46,7 @@ import {
   lockedPersistentProfilesFrom,
   pathInside as containedPath,
   prepareAgentOwnedDirectory,
+  prepareAgentOwnedProfileRoot,
   restorePersistentAgentPrivateRoots,
 } from "./filesystem-isolation.mjs";
 import { materializeClaudeProfileBaseline, materializeCodexProfileBaseline } from "./action-home-baseline.mjs";
@@ -305,13 +307,6 @@ export function materializeRepositorySkill({ request, repoDir, discoveryRoot }) 
   return materializeRepositorySkillPackage({ packageInfo: request.repositorySkill, repoDir, agent: request.agent, discoveryRoot });
 }
 
-function prepareExecutorOwnedProfileRoot(path) {
-  if (!isRoot()) return;
-  mkdirSync(path, { recursive: true, mode: 0o555 });
-  chownSync(path, 0, 0);
-  chmodSync(path, 0o555);
-}
-
 export function repositorySkillStageEnvironment(request) {
   if (request.capability !== REPOSITORY_SKILL_CAPABILITY) {
     const home = "/home/agent";
@@ -334,7 +329,7 @@ export function repositorySkillStageEnvironment(request) {
     prepareAgentOwnedDirectory(codexHome);
     materializeCodexProfileBaseline({ destinationHome: codexHome });
     prepareAgentOwnedDirectory(nativeSessionStoragePath(request.agent, codexHome));
-    prepareExecutorOwnedProfileRoot(codexHome);
+    prepareAgentOwnedProfileRoot(codexHome);
     env.push(`CODEX_HOME=${codexHome}`);
     return {
       env,
@@ -346,7 +341,12 @@ export function repositorySkillStageEnvironment(request) {
     const claudeHome = pathInside(home, ".claude", "stage claude home");
     materializeClaudeProfileBaseline({ destinationHome: claudeHome });
     prepareAgentOwnedDirectory(nativeSessionStoragePath(request.agent, claudeHome));
-    prepareExecutorOwnedProfileRoot(claudeHome);
+    // Agent-owned and writable (OPE-101), matching the persistent stage
+    // profile the engine is known to run under. materializeRepositorySkill
+    // still seals its own discovery tree root-owned read-only inside this
+    // root; see prepareAgentOwnedProfileRoot for why an agent-writable root
+    // is the deliberate posture.
+    prepareAgentOwnedProfileRoot(claudeHome);
     return {
       env,
       repositorySkillDiscoveryRoot: pathInside(claudeHome, "skills", "stage repository skill discovery"),
@@ -510,14 +510,39 @@ export function defaultRunAgent({
     if (request.nativeSessionId && reportedNativeSessionId && reportedNativeSessionId !== request.nativeSessionId) {
       throw new Error("reported native session id does not match the sealed stage request");
     }
-    const nativeSessionId = request.nativeSessionId ?? reportedNativeSessionId;
-    const sealedNativeSessionPackage = sealNativeSessionPackage({
-      agent,
-      nativeSessionId,
-      profileRoot: stageEnvironment?.nativeSessionProfileRoot,
-    });
-    if (nativeSessionId && !sealedNativeSessionPackage) {
-      throw new Error("native session id was reported without a sealed executor package");
+    // A genuine engine failure (timeout/signal/non-zero exit) has no complete
+    // session transcript to seal; classify it by its own exit evidence
+    // instead of a predictable sealing failure that would otherwise mask it.
+    const engineExited = engineExitedCleanly(result);
+    // A reported id carries no evidence until sealNativeSessionPackage below
+    // validates it. On a non-clean exit sealing is never attempted, so only
+    // an id this stage already had sealed for it (request.nativeSessionId,
+    // from a prior attempt) is trustworthy -- never a freshly reported id
+    // from a crashed/timed-out engine, which would otherwise poison a later
+    // resume attempt into sealing against a session that was never sealed.
+    const nativeSessionId = request.nativeSessionId ?? (engineExited ? reportedNativeSessionId : null);
+    if (engineExited) {
+      let sealedNativeSessionPackage;
+      try {
+        sealedNativeSessionPackage = sealNativeSessionPackage({
+          agent,
+          nativeSessionId,
+          profileRoot: stageEnvironment?.nativeSessionProfileRoot,
+        });
+        if (nativeSessionId && !sealedNativeSessionPackage) {
+          throw new Error("native session id was reported without a sealed executor package");
+        }
+      } catch (error) {
+        // The engine itself produced real, evidence-bearing output before
+        // this executor-owned seal step failed; a bare rethrow would
+        // otherwise discard that evidence (mirrors execute-loop.mjs's
+        // runLoopAgentInPreparedRepository, whose executeStage() caller
+        // already routes any throw here through retryable_infrastructure_failure).
+        // launchDiagnosticTail keeps that evidence bounded and sanitized.
+        const message = error instanceof Error ? error.message : String(error);
+        const engineTail = launchDiagnosticTail({ stdout: result.stdout, stderr: result.stderr });
+        throw new Error([message, engineTail && `engine diagnostics: ${engineTail}`].filter(Boolean).join("\n"));
+      }
     }
     return {
       exitCode: result.status,

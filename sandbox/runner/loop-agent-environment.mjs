@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmodSync, chownSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { chownSync, existsSync, lstatSync, writeFileSync } from "node:fs";
 import {
   chmodReadOnlyPreservingExecuteTree,
   chownTree,
@@ -7,6 +7,7 @@ import {
   isRoot,
   pathInside as containedPath,
   prepareAgentOwnedDirectory,
+  prepareAgentOwnedProfileRoot,
   resetAgentOwnedDirectory,
 } from "./filesystem-isolation.mjs";
 import { materializeClaudeProfileBaseline, materializeCodexProfileBaseline } from "./action-home-baseline.mjs";
@@ -19,17 +20,27 @@ import { pathInside, PROFILE_ROOT_FENCE_FILE } from "./loop-paths.mjs";
 const ROOT_UID = 0;
 const ROOT_GID = 0;
 
-function prepareExecutorOwnedProfileRoot(path) {
-  if (!isRoot()) return;
-  mkdirSync(path, { recursive: true, mode: 0o555 });
-  chownSync(path, ROOT_UID, ROOT_GID);
-  chmodSync(path, 0o555);
-}
-
 function lockExecutorOwnedSkillTree(path) {
   if (!existsSync(path)) return;
   if (isRoot()) chownTree(path, ROOT_UID, ROOT_GID);
   chmodReadOnlyPreservingExecuteTree(path);
+}
+
+// The read-only lock above protects writes *into* the tree, but not the
+// "skills" directory ENTRY itself: its parent is the agent-writable profile
+// root, and Unix governs unlink/rename by the parent. Recording the sealed
+// trees here lets assertProfileRootFence re-verify after the engine exits
+// that each one is still a uid-0 directory -- which the agent cannot fake,
+// because it cannot chown anything to root. Computed after every
+// materialization step (including a repository skill package, which wipes
+// and re-seals the same discovery root) so it reflects the tree the engine
+// actually ran against.
+function executorSealedSkillTrees(profileRoot) {
+  if (!profileRoot) return [];
+  const skills = containedPath(profileRoot, "skills", "sealed skill tree escapes its profile root");
+  if (!existsSync(skills)) return [];
+  if (isRoot() && lstatSync(skills).uid !== ROOT_UID) return [];
+  return [skills];
 }
 
 // Inode identity cannot detect replace-after-delete on filesystems that
@@ -66,7 +77,6 @@ function prepareActionHomeEnvironment(request, credentialEnv = {}) {
   if (request.agent === "claude") {
     const profileRoot = pathInside(home, ".claude");
     materializeClaudeProfileBaseline({ destinationHome: profileRoot });
-    lockExecutorOwnedSkillTree(pathInside(profileRoot, "skills"));
     materializeNativeSessionState({ request, profileRoot });
     prepareAgentOwnedDirectory(nativeSessionStoragePath(request.agent, profileRoot));
     if (Object.keys(selectedMcpServers).length > 0) {
@@ -74,7 +84,11 @@ function prepareActionHomeEnvironment(request, credentialEnv = {}) {
       mcpConfigPath = writeClaudeMcpConfigFile(selectedMcpServers, mcpDir);
       if (mcpConfigPath) prepareRootReadOnlyDirectory(mcpDir);
     }
-    prepareExecutorOwnedProfileRoot(profileRoot);
+    // Agent-owned and writable (OPE-101): the engine's own startup writes
+    // land directly in the profile root. The skills tree is re-locked
+    // afterwards so it stays root-owned read-only inside a writable root.
+    prepareAgentOwnedProfileRoot(profileRoot);
+    lockExecutorOwnedSkillTree(pathInside(profileRoot, "skills"));
     nativeSessionProfileRoot = profileRoot;
   }
   if (request.agent === "codex") {
@@ -90,7 +104,7 @@ function prepareActionHomeEnvironment(request, credentialEnv = {}) {
       appendCodexMcpConfig(selectedMcpServers, pathInside(codexHome, "config.toml"));
     }
     if (credentialEnv.CODEX_AUTH_JSON) writeCodexAuthFile(codexHome, credentialEnv.CODEX_AUTH_JSON);
-    prepareExecutorOwnedProfileRoot(codexHome);
+    prepareAgentOwnedProfileRoot(codexHome);
     env.push(`CODEX_HOME=${codexHome}`);
     nativeSessionProfileRoot = codexHome;
   }
@@ -185,6 +199,7 @@ export function prepareLoopAgentEnvironment(request, repoDir, credentialEnv = {}
     gitObjectEnv: gitObjectEnv.values,
     nativeSessionProfileRoot: homeEnv.nativeSessionProfileRoot,
     profileRootFenceNonce: homeEnv.profileRootFenceNonce,
+    sealedSkillTrees: executorSealedSkillTrees(homeEnv.nativeSessionProfileRoot),
     mcpConfigPath: homeEnv.mcpConfigPath,
   };
 }
