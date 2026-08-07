@@ -38,6 +38,7 @@ const STRUCTURED_GRAPH_PATH = join(REPO_ROOT, "supervisor", "graphs", "structure
 const CATALOG_PATH = join(REPO_ROOT, "supervisor", "pipelines", "catalog.yaml");
 const STUB_AGENT_PATH = join(__dirname, "fixtures", "walking-skeleton-agent-stub.mjs");
 
+const OPENTHROTTLE_ROOT = "/var/lib/openthrottle";
 const LOOP_ACTION_DIR = "/var/lib/openthrottle/loop-actions";
 const CHILD_EXECUTOR_DIR = "/var/lib/openthrottle/child-executor-actions";
 const STAGE_INPUT_DIR = "/var/lib/openthrottle/stage-input";
@@ -224,6 +225,21 @@ function startContainer(fixture) {
     "/dev/null",
   ]);
   return name;
+}
+
+// OPE-104 regression pin. The real Daytona bootstrap creates the sandbox
+// root itself as root:root 0700 (MkdirAll stamps that same mode on every
+// directory it creates, including parents). This harness's own directory
+// creation instead uses GNU coreutils `install -d`, which -- unlike Go's
+// MkdirAll -- does NOT stamp the requested mode on parents it creates only
+// implicitly; without this pin, the first `install -d -m 0700 <subdir>`
+// call anywhere below would leave OPENTHROTTLE_ROOT itself at the default
+// 0755 (already traversable), which is exactly why CI never caught the
+// untraversable-root trap. Must run before any other directory gets created
+// under OPENTHROTTLE_ROOT, so nothing else has a chance to auto-create it
+// with the wrong mode first.
+function pinSandboxRootMode(container) {
+  dockerExec(container, ["sh", "-c", `install -d -o root -g root -m 0700 '${OPENTHROTTLE_ROOT}'`]);
 }
 
 // Shadows `claude` on the agent-facing PATH (AGENT_EXEC_PATH) with a plain
@@ -1030,6 +1046,7 @@ async function main() {
     const fixture = createFixtureRepo(workDir);
     log(`starting container from image ${IMAGE}`);
     container = startContainer(fixture);
+    pinSandboxRootMode(container);
     installClaudeStubShadow(container);
 
     db = openDb(":memory:");

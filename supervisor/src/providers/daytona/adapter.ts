@@ -21,6 +21,7 @@ import {
 const ACTIVE_SANDBOX_AUTOSTOP_MINUTES = 60;
 const IDLE_SANDBOX_AUTOSTOP_MINUTES = 5;
 const LOOP_ACTION_DISPATCH_GRACE_SECONDS = 30;
+const OPENTHROTTLE_ROOT = "/var/lib/openthrottle";
 const STAGE_INPUT_DIR = "/var/lib/openthrottle/stage-input";
 const STAGE_RESULT_DIR = "/var/lib/openthrottle/stage-results";
 const LOOP_ACTION_DIR = "/var/lib/openthrottle/loop-actions";
@@ -303,6 +304,7 @@ export function createDaytonaSandboxRuntime(
 ): RuntimeControl {
   const materializedScopes = new Map<string, string>();
   const bootstrapped = new Map<string, { configDigest: string; manifestDigest: string }>();
+  const sandboxRootTraversalGranted = new Set<string>();
   const getSandbox = async (resource: RuntimeResource) => daytona.get(resource.providerResourceId);
   const ensureStarted = async (resource: RuntimeResource) => {
     const sandbox = await getSandbox(resource);
@@ -310,7 +312,26 @@ export function createDaytonaSandboxRuntime(
     await ensureSandboxActive(sandbox);
     return sandbox;
   };
+  // Belt-and-braces alongside the runner's own traversal grant
+  // (ensureCurrentActionTraversal / prepareWorktreeRoot): stamp the sandbox
+  // root itself traversable, ahead of every root:root 0700 child folder this
+  // adapter creates under it. MkdirAll-style folder creation stamps the same
+  // mode on every parent it creates, so an 0700 child created before this
+  // ever ran would otherwise leave OPENTHROTTLE_ROOT itself untraversable to
+  // the agent uid -- the exact OPE-101 trap this closes off at the source.
+  const prepareSandboxRootTraversal = async (sandbox: Sandbox) => {
+    // The grant is idempotent but each call is two Daytona API round-trips;
+    // prepareRootFolder runs on every stage/loop-action/child-executor
+    // dispatch for the sandbox's whole lifetime, so skip the repeat once a
+    // sandbox's root is already known-traversable (mirrors the `bootstrapped`
+    // / `materializedScopes` per-resource memoization above).
+    if (sandboxRootTraversalGranted.has(sandbox.id)) return;
+    await sandbox.fs.createFolder(OPENTHROTTLE_ROOT, "711").catch(() => undefined);
+    await sandbox.fs.setFilePermissions(OPENTHROTTLE_ROOT, { owner: "root", group: "root", mode: "711" });
+    sandboxRootTraversalGranted.add(sandbox.id);
+  };
   const prepareRootFolder = async (sandbox: Sandbox, path: string) => {
+    await prepareSandboxRootTraversal(sandbox);
     await sandbox.fs.createFolder(path, "700").catch(() => undefined);
     await sandbox.fs.setFilePermissions(path, { owner: "root", group: "root", mode: "700" });
   };
@@ -695,6 +716,7 @@ export function createDaytonaSandboxRuntime(
       }
       materializedScopes.delete(resource.providerResourceId);
       bootstrapped.delete(resource.providerResourceId);
+      sandboxRootTraversalGranted.delete(resource.providerResourceId);
     },
 
     async setActive(providerResourceId) {

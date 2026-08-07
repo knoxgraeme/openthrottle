@@ -4,6 +4,7 @@ import {
   classifyLaunchFailure,
   engineCredentialPresent,
   hasRejectedRateLimitEvent,
+  isUnregisteredCommandResult,
   launchDiagnosticTail,
 } from "./launch-failure.mjs";
 import { classifyAgentExecutionFailure } from "./execute-stage.mjs";
@@ -116,6 +117,56 @@ describe("launch failure classification", () => {
       stdout: "Not logged in. Run `claude login` to authenticate.",
       stderr: "",
     })).toMatchObject({ reason: "credential_missing", credentialFailure: true });
+  });
+
+  it("classifies an unregistered-command answer as a retryable, non-credential launch failure", () => {
+    const stdout = [
+      JSON.stringify({ type: "system", subtype: "init", session_id: "s" }),
+      JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "Unknown command: /implement-unit" }),
+    ].join("\n");
+    const classified = classifyLaunchFailure({ agent: "claude", stdout, stderr: "", credentialPresent: true });
+    expect(classified).toMatchObject({
+      reason: "unregistered_command",
+      credentialFailure: false,
+      retryable: true,
+    });
+    expect(classified.remediation).toContain("did not register its requested skill");
+  });
+
+  it("classifies an unregistered-command answer even without a known credential state", () => {
+    const stdout = JSON.stringify({ type: "result", subtype: "success", result: "Unknown command: /ot-nonexistent-probe" });
+    expect(classifyLaunchFailure({ agent: "claude", stdout, stderr: "" }).reason).toBe("unregistered_command");
+  });
+});
+
+describe("isUnregisteredCommandResult", () => {
+  it("reads the engine's own final result field, not raw stdout", () => {
+    const stdout = [
+      JSON.stringify({ type: "system", subtype: "init" }),
+      JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "Unknown command: /implement-unit" }),
+    ].join("\n");
+    expect(isUnregisteredCommandResult(stdout)).toBe(true);
+  });
+
+  it("is false for a normal completion", () => {
+    const stdout = JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "done" });
+    expect(isUnregisteredCommandResult(stdout)).toBe(false);
+  });
+
+  it("is false when the phrase appears only outside the engine's final result text", () => {
+    // A transcript that merely discusses or quotes the phrase mid-conversation
+    // (not as the engine's own terminal answer) must not misfire.
+    const stdout = [
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "I saw Unknown command: /foo earlier" }] } }),
+      JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "done" }),
+    ].join("\n");
+    expect(isUnregisteredCommandResult(stdout)).toBe(false);
+  });
+
+  it("is false for empty or malformed stdout", () => {
+    expect(isUnregisteredCommandResult("")).toBe(false);
+    expect(isUnregisteredCommandResult("not json")).toBe(false);
+    expect(isUnregisteredCommandResult(undefined)).toBe(false);
   });
 });
 

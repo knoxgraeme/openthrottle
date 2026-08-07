@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 
-import { chmodSync, chownSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { runGitAsExecutor } from "./repository-control.mjs";
-import { chmodOwnerPrivateTree, chmodTree, chownTree, identityForUser, isRoot, pathInside as containedPath } from "./filesystem-isolation.mjs";
+import { chmodOwnerPrivateTree, chmodTree, chownTree, ensureSandboxRootTraversal, ensureTraverseOnlyDirectory, identityForUser, isRoot, pathInside as containedPath } from "./filesystem-isolation.mjs";
 
 const HANDLE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const COMMIT = /^[a-f0-9]{40}$/;
@@ -69,10 +69,8 @@ function lockCandidateReadableWorktree(path) {
 }
 
 function prepareWorktreeRoot(rootDir) {
-  mkdirSync(rootDir, { recursive: true, mode: 0o711 });
-  assertDirectory(rootDir, "worktree root");
-  if (isRoot()) chownSync(rootDir, ROOT_UID, ROOT_GID);
-  chmodSync(rootDir, 0o711);
+  ensureSandboxRootTraversal(rootDir);
+  ensureTraverseOnlyDirectory(rootDir, "worktree root");
 }
 
 function lockGitIndirectionFile(target) {

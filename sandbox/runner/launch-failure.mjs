@@ -22,8 +22,18 @@ export const LAUNCH_FAILURE_REASONS = Object.freeze([
   "credential_missing",
   "credential_rejected",
   "rate_limited",
+  "unregistered_command",
   "engine_crash",
 ]);
+
+// OPE-104: an untraversable sandbox root let Claude launch without ever
+// resolving its own skill discovery root, so it silently registered zero
+// user skills, answered this exact prefix for the requested slash command,
+// and exited 0 with no other symptom -- a clean-looking exit that is
+// actually a launch failure. Matched against the engine's own final `result`
+// text (see decisiveEngineFieldsFromFinalResultLine below), not the raw
+// stdout stream, since that is where the engine's literal answer lives.
+const UNREGISTERED_COMMAND_PREFIX = "Unknown command: /";
 
 // Claude's stream-json carries a `rate_limit_event`; only these statuses mean
 // the request was actually served. `allowed_warning` is the high-utilization
@@ -149,6 +159,9 @@ function remediationFor(reason, agent) {
   if (reason === "rate_limited") {
     return `The ${agent} engine refused the request with a usage, quota, or rate limit.`;
   }
+  if (reason === "unregistered_command") {
+    return `The ${agent} engine did not register its requested skill as a known command before answering; the sandbox skill discovery root may be untraversable or the skill package may be missing.`;
+  }
   return "";
 }
 
@@ -174,7 +187,9 @@ export function classifyLaunchFailure({
   const text = `${String(stderr ?? "")}\n${String(stdout ?? "")}`;
   const prose = withoutServedRateLimitLines(text);
   let reason = "engine_crash";
-  if (credentialPresent === false) {
+  if (isUnregisteredCommandResult(stdout)) {
+    reason = "unregistered_command";
+  } else if (credentialPresent === false) {
     reason = "credential_missing";
   } else if (hasRejectedRateLimitEvent(text) || matchesAny(RATE_LIMIT_PATTERNS, prose)) {
     reason = "rate_limited";
@@ -225,6 +240,19 @@ function decisiveEngineFieldsFromFinalResultLine(stdout) {
     return Object.keys(fields).length > 0 ? fields : null;
   }
   return null;
+}
+
+// True when the engine's own final answer is an unregistered-command
+// refusal -- a clean-looking (often exit 0) response that is nonetheless not
+// a real completion: the requested skill was never discoverable, so nothing
+// downstream (a receipt, a proposal, real work) was ever produced. Read from
+// the engine's own final `result` text rather than scanning raw stdout: a
+// legitimate transcript can otherwise quote or discuss that exact phrase
+// without it being the engine's own terminal answer.
+export function isUnregisteredCommandResult(stdout) {
+  const fields = decisiveEngineFieldsFromFinalResultLine(stdout);
+  const result = typeof fields?.result === "string" ? fields.result : "";
+  return result.startsWith(UNREGISTERED_COMMAND_PREFIX);
 }
 
 function formatDecisiveEngineFields(fields) {

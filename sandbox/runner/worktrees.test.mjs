@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -173,5 +173,21 @@ describe("executor-owned worktrees", () => {
 
     lockWorktree({ rootDir, handle: "unit-b" });
     expect(statSync(second.path).mode & 0o777).toBe(0o700);
+  });
+
+  it("rejects a symlinked worktree root before chown/chmod ever follows it to its target", () => {
+    const attackTarget = mkdtempSync(join(tmpdir(), "ot-worktrees-attack-target-"));
+    directories.push(attackTarget);
+    chmodSync(attackTarget, 0o755);
+    const symlinkParent = mkdtempSync(join(tmpdir(), "ot-worktrees-symlink-parent-"));
+    directories.push(symlinkParent);
+    const rootDir = join(symlinkParent, "root");
+    symlinkSync(attackTarget, rootDir);
+
+    expect(() => grantWorktreeToAgent({ rootDir, handle: "unit-1" })).toThrow(/worktree root must be a real directory/);
+    // The attacker-controlled symlink target must never be touched: if
+    // assertDirectory ran after chown/chmod instead of before, this mode
+    // would already be 0711.
+    expect(statSync(attackTarget).mode & 0o777).toBe(0o755);
   });
 });

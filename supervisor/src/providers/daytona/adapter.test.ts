@@ -138,6 +138,20 @@ describe("Daytona stage execution", () => {
       normalizedManifest: manifest,
       manifestDigest: digestNormalized(manifest),
     });
+    // Belt-and-braces (OPE-104): the sandbox root itself is normalized
+    // traversable ahead of every root:root 0700 child folder, so a future
+    // path can never recreate the untraversable-root trap.
+    expect(sandbox.fs.createFolder).toHaveBeenCalledWith("/var/lib/openthrottle", "711");
+    expect(sandbox.fs.setFilePermissions).toHaveBeenCalledWith(
+      "/var/lib/openthrottle",
+      { owner: "root", group: "root", mode: "711" }
+    );
+    const rootTraversalCallOrder = (sandbox.fs.setFilePermissions as ReturnType<typeof vi.fn>).mock.calls
+      .findIndex(([path]) => path === "/var/lib/openthrottle");
+    const stageInputCallOrder = (sandbox.fs.setFilePermissions as ReturnType<typeof vi.fn>).mock.calls
+      .findIndex(([path]) => path === "/var/lib/openthrottle/stage-input");
+    expect(rootTraversalCallOrder).toBeGreaterThanOrEqual(0);
+    expect(stageInputCallOrder).toBeGreaterThan(rootTraversalCallOrder);
     await runtime.materializeCredentials(resource, ["repo.read"]);
     expect(credentialProvider).toHaveBeenCalledWith(resource, ["repo.read"]);
     expect(updateEnv).toHaveBeenCalledWith({ GITHUB_TOKEN: "secret-token" }, {
@@ -183,6 +197,14 @@ describe("Daytona stage execution", () => {
       RUN_ID: "run-1",
       BASE_BRANCH: "release/2.0",
     }), { unset: ["OT_CHILD_ACTION_ID", "OT_COMPOSITE_PREPARE_ONLY"] });
+    // The sandbox root traversal grant is memoized per sandbox: bootstrap()
+    // above already triggered it once (for STAGE_INPUT_DIR), so this
+    // dispatchStage call's own prepareStageInput -> prepareRootFolder must
+    // not repeat the two Daytona API round-trips for an already-granted root.
+    expect(
+      (sandbox.fs.setFilePermissions as ReturnType<typeof vi.fn>).mock.calls
+        .filter(([path]) => path === "/var/lib/openthrottle")
+    ).toHaveLength(1);
 
     const childWithoutFence: Omit<StageRequestEnvelope, "requestHash" | "idempotencyKey"> = {
       ...withoutFence,
