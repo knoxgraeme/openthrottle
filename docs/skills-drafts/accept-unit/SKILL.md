@@ -85,6 +85,7 @@ entries; do not add a requirement between rounds. If your previous
 `revision_request` has been satisfied, accept — do not substitute a fresh
 objection unless it violates a stated acceptance entry or a criterion you can
 show was already unmet in the earlier candidate.
+For the judgment method in full, read `references/acceptance-judgment.md`.
 
 **The executor already grades the commands.** Failed `test`/`lint`/`build`
 receipts and a failed candidate are decided before your receipt is read. Read

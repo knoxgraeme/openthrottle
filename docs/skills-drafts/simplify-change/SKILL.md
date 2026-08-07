@@ -52,6 +52,8 @@ it missed.
    over data already traversed, an unnecessary round trip. Do not restructure
    for speculative performance.
 
+For the full heuristics, read `references/simplification-heuristics.md`.
+
 ## Never
 
 - Change observable behaviour, including error messages that a caller or test

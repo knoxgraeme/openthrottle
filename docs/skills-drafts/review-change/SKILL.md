@@ -44,6 +44,7 @@ Read the whole diff before judging any part of it.
 
 A fixed roster is the point: the same change must produce the same findings on
 every round, or the repair loop never converges.
+For the full lens checklists, read `references/branch-review-passes.md`.
 
 1. **Correctness** — does the code do what the plan says, on the success path
    and on the failure and boundary paths?

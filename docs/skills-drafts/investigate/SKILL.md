@@ -61,6 +61,7 @@ problem; passing locally and failing in CI means the difference is environment.
 tests that should have caught this and why they did not, and the fix — applied
 or recommended. The report is the deliverable of this stage; a fix without a
 stated cause is not a result.
+For the full diagnostic method, read `references/diagnostic-method.md`.
 
 ## Convergent fixes only
 

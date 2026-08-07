@@ -216,3 +216,57 @@ a second pass from the first. Separately, `final-repair`'s per-finding
 disposition lives only in a `unit_completion.verification` string list. If the
 ledger or the next review is meant to consume it, it wants a first-class
 representation rather than a formatted string.
+
+---
+
+## Added by the references tier (see `REVIEW.md` §5)
+
+### Q21 — subdirectory delivery is unverified on every engine (OPE-107)
+**Blocking for the references tier.** Eight skills now carry a
+`references/<name>.md` file and a `SKILL.md` line telling the agent to read it.
+Nothing in the tree proves that file arrives, or is readable, on any of the
+three engines. Verify each independently before the tier lands:
+
+- **Claude** — `sandbox/entrypoint.sh` copies skills into `~/.claude/skills`.
+  Confirm the copy is recursive (whole package directory, not `SKILL.md` alone)
+  and that the relative path `references/<name>.md` resolves from the skill's
+  own directory at read time rather than from the process working directory.
+- **Codex** — the admin-scope bake at `/etc/codex/skills` plus
+  `agents/openai.yaml`. Confirm the bake carries subdirectories, and that a
+  read-only admin scope permits reading a sibling file inside the skill package.
+- **OpenCode** — the body is rendered into the prompt at run time. If only
+  `SKILL.md` is inlined, an OpenCode run gets a pointer to a file it can never
+  open, which is strictly worse than no pointer. Either resolve and inline the
+  reference at render time, or suppress the pointer line for that engine.
+
+This is the same failure class as Q10: an unreadable reference exits 0 and
+grades as a clean run. Pair the verification with the readability preflight.
+
+### Q22 — the two duplicated reference files need a byte-identical assertion
+`implement-unit` / `repair-unit` share `references/implementation-discipline.md`
+and `simplify-unit` / `simplify-change` share
+`references/simplification-heuristics.md`, both as byte-identical copies — the
+same trade the §3 canonical blocks make (separate packages, separate sessions).
+The rewritten `sandbox/tests/ce-adapters.test.mjs` must assert the equality, or
+the pairs drift the first time one is edited. If the Q21 resolution allows a
+shared package-external references directory, collapse both pairs to one file
+and add `implement-plan` as a third consumer of the implementation file.
+
+### Q23 — `final-review`'s deepening sub-passes assume a subject property
+`references/review-lens-passes.md` makes each sub-pass fire on a stated property
+of the subject (the change touches an error handler, a request handler, more
+than one module, a type crossing a boundary, a query). That is deterministic
+given the diff, which is what the anti-churn design needs — but it is agent
+judgment, not a computed trigger. If review churn persists after this lands,
+the next lever is to compute the trigger set executor-side from the diff and
+pass it in the stage/loop context, so the roster is machine-fixed rather than
+model-fixed.
+
+### Q24 — `references/finding-quality.md` presumes a repair round can act
+The finding-actionability rules assume the repair action receives the review's
+findings. That holds for `final-repair` (prior evidence carries the
+`semantic_review` receipt) and for the stage-path repair briefs. It does **not**
+hold for `repair-unit` (Q2). Until Q2 is resolved, `accept-unit`'s
+`revision_request` is the only channel by which a unit repair learns what to do,
+which is why `references/acceptance-judgment.md` spends a whole section on that
+one string.
