@@ -30,6 +30,7 @@ import {
 import { computeWorkspaceTreeOid } from "./repository-control.mjs";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
+import { extractJsonBlock } from "./json-block.mjs";
 
 const directories = [];
 
@@ -437,6 +438,17 @@ describe("loop action request validation", () => {
     expect(loopPrompt(valid)).not.toContain('"workerId"');
     expect(loopPrompt(valid)).not.toContain('"capabilityDigest"');
     expect(loopPrompt(valid)).not.toContain('"skillPackageDigest"');
+
+    const contract = extractJsonBlock(loopPrompt(valid), "## Receipt Authority Contract\n");
+    expect(contract.attempt_id).toBe(valid.attemptId);
+    expect(contract.assurance).toBe("semantic_attested");
+    expect(contract.producer).not.toHaveProperty("assurance");
+  });
+
+  it("falls back to a null contract assurance without an expected producer", () => {
+    const valid = validateLoopRequest(request());
+    const contract = extractJsonBlock(loopPrompt(valid), "## Receipt Authority Contract\n");
+    expect(contract.assurance).toBeNull();
   });
 
   it("validates typed prior evidence and downstream context into the sealed prompt contract", () => {
@@ -2597,7 +2609,11 @@ describe("executeLoopAction", () => {
       subject: null,
       created_at: "2026-07-29T00:00:00.000Z",
     });
-    expect(result.receipt).toMatch(/workspace subject attestation failed/);
+    // The executor's own launch error is the real cause; a best-effort
+    // subject attestation against the now-unreadable worktree fails too, but
+    // that symptom must not bury the original diagnosis.
+    expect(result.receipt).toMatch(/agent launch failed/);
+    expect(result.receipt).not.toMatch(/workspace subject attestation failed/);
     expect(lockWorkerWorktree).toHaveBeenCalledOnce();
     expect(lockActionDirectory).toHaveBeenCalledOnce();
   });

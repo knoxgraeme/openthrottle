@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
 import { writeJsonAtomic } from "./atomic-write.mjs";
-import { computeWorkspaceTreeOid, runGitAsExecutor } from "./repository-control.mjs";
+import { computeWorkspaceTreeOidAsExecutor, runGitAsExecutor } from "./repository-control.mjs";
 import { defaultExecuteCommand, resolveCommand } from "./execute-stage.mjs";
 import { integrateCandidate } from "./integrate-unit.mjs";
 import { restoreIntegrationCheckout } from "./execute-loop.mjs";
@@ -158,7 +158,7 @@ function commandReceipt(request, {
   executeCommand = defaultExecuteCommand,
   grantWorktree = grantWorktreeToAgent,
   lockWorktreeHandle = lockWorktree,
-  computeSubject = computeWorkspaceTreeOid,
+  computeSubject = computeWorkspaceTreeOidAsExecutor,
   commitSubject = currentHead,
   isClean = cleanCheckout,
   resetIntegration = resetIntegrationCheckout,
@@ -298,7 +298,7 @@ export function executeChildAction({
   executeCommand = defaultExecuteCommand,
   grantWorktree = grantWorktreeToAgent,
   lockWorktreeHandle = lockWorktree,
-  computeSubject = computeWorkspaceTreeOid,
+  computeSubject = computeWorkspaceTreeOidAsExecutor,
   commitSubject = currentHead,
   isClean = cleanCheckout,
   resetIntegration = resetIntegrationCheckout,

@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -187,6 +188,54 @@ describe("child executor action", () => {
     expect(JSON.parse(result.receipt).evidence).toEqual([
       expect.stringContaining("executor:command:action-1:test:success"),
     ]);
+  });
+
+  it("computes a command action's post-command subject on a worktree whose shared admin dir another action's cleanup already relocked", () => {
+    useRepositoryConfig({ test: "npm test" });
+
+    // A real linked worktree, mirroring what a structured command action
+    // actually runs against: its .git is an indirection file pointing back at
+    // repoDir/.git/worktrees/<handle> (the shared admin dir a prior loop
+    // action's cleanup relocks to root:root -- see execute-loop.mjs
+    // lockGitMetadata). computeSubject must not need agent-authority (gosu)
+    // access to that shared metadata to read this worktree's tree.
+    const repoDir = mkdtempSync(join(tmpdir(), "ot-child-action-repo-"));
+    directories.push(repoDir);
+    execFileSync("git", ["init", "-q", "-b", "main"], { cwd: repoDir });
+    execFileSync("git", ["config", "user.name", "Test"], { cwd: repoDir });
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repoDir });
+    writeFileSync(join(repoDir, "file.txt"), "initial\n");
+    execFileSync("git", ["add", "."], { cwd: repoDir });
+    execFileSync("git", ["commit", "-qm", "initial"], { cwd: repoDir });
+    const worktreeParent = mkdtempSync(join(tmpdir(), "ot-child-action-wt-parent-"));
+    directories.push(worktreeParent);
+    const worktreeDir = join(worktreeParent, "worktree-1");
+    execFileSync("git", ["worktree", "add", "--detach", worktreeDir, "HEAD"], { cwd: repoDir });
+
+    const request = childExecutorRequest({ commandName: "test" });
+    const expectedTree = execFileSync("git", ["-C", worktreeDir, "rev-parse", "HEAD^{tree}"], { encoding: "utf8" }).trim();
+    // Real gosu refuses to drop privileges unless the process is genuinely
+    // root (`gosu agent true` as non-root exits "operation not permitted").
+    // Mocking process.getuid() to report 0 without the OS process actually
+    // being root reproduces that same agent-authority denial here, standing
+    // in for the relocked shared admin dir without requiring real root.
+    const getuidSpy = vi.spyOn(process, "getuid").mockReturnValue(0);
+    try {
+      const result = executeChildAction({
+        request,
+        grantWorktree: () => ({ id: "worktree-1", path: worktreeDir, writable: true }),
+        executeCommand: () => ({ exitCode: 0, signal: null, timedOut: false, stdout: "ok", stderr: "" }),
+        lockWorktreeHandle: () => {},
+        // computeSubject intentionally left at its real default
+        // (computeWorkspaceTreeOidAsExecutor) -- this test exists to prove
+        // that default works under this condition, not a stand-in for it.
+      });
+
+      expect(result.outcome).toBe("success");
+      expect(result.subject).toBe(expectedTree);
+    } finally {
+      getuidSpy.mockRestore();
+    }
   });
 
   it("fails final commands that mutate the tracked integration subject", () => {

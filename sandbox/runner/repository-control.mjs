@@ -89,9 +89,13 @@ export function runGitAsExecutor(repoDir, args, env = {}, { timeoutMs = LOCAL_GI
   return runGit(repoDir, args, env, { timeoutMs });
 }
 
-function optionalRepositoryOwnerGit(repoDir, args) {
+function ownerGit(asExecutor) {
+  return asExecutor ? runGitAsExecutor : runGitAsRepositoryOwner;
+}
+
+function optionalOwnerGit(repoDir, args, asExecutor = false) {
   try {
-    return runGitAsRepositoryOwner(repoDir, args);
+    return ownerGit(asExecutor)(repoDir, args);
   } catch {
     return null;
   }
@@ -147,16 +151,19 @@ function gitRepositoryEnvironment(extraGitEnv) {
   );
 }
 
-export function computeWorkspaceTreeOidFromTree(repoDir, baseTree, extraGitEnv = {}) {
+export function computeWorkspaceTreeOidFromTree(repoDir, baseTree, extraGitEnv = {}, { asExecutor = false } = {}) {
   const temporary = mkdtempSync(join(tmpdir(), "ot-stage-index-"));
   const indexPath = join(temporary, "index");
   const objectPath = join(temporary, "objects");
   try {
-    prepareRepositoryOwnerDirectory(temporary);
+    // Executor-authority reads run every git call as the literal executor
+    // (root), never gosu'd to agent: the mkdtemp'd temp dir is already
+    // executor-owned, so no agent-identity handoff is needed or wanted.
+    if (!asExecutor) prepareRepositoryOwnerDirectory(temporary);
     const effectiveGitEnv = { ...inheritedGitEnvironment(), ...extraGitEnv };
     const extraAlternates = gitAlternateObjectDirectories(effectiveGitEnv);
     const commonDir = extraAlternates.length === 0
-      ? optionalRepositoryOwnerGit(repoDir, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
+      ? optionalOwnerGit(repoDir, ["rev-parse", "--path-format=absolute", "--git-common-dir"], asExecutor)
       : null;
     const commonObjects = commonDir ? join(commonDir, "objects") : null;
     const isolateObjects = extraAlternates.length > 0 || (commonObjects &&
@@ -164,7 +171,7 @@ export function computeWorkspaceTreeOidFromTree(repoDir, baseTree, extraGitEnv =
     );
     if (isolateObjects) {
       mkdirSync(objectPath, { recursive: true, mode: 0o700 });
-      prepareRepositoryOwnerDirectory(objectPath);
+      if (!asExecutor) prepareRepositoryOwnerDirectory(objectPath);
     }
     const alternates = extraAlternates.length > 0 ? extraAlternates : (commonObjects ? [commonObjects] : []);
     const env = {
@@ -175,9 +182,10 @@ export function computeWorkspaceTreeOidFromTree(repoDir, baseTree, extraGitEnv =
         GIT_ALTERNATE_OBJECT_DIRECTORIES: alternates.join(delimiter),
       } : {}),
     };
-    runGitAsRepositoryOwner(repoDir, ["read-tree", baseTree], env);
-    runGitAsRepositoryOwner(repoDir, ["add", "-A", "--", "."], env);
-    return commit(runGitAsRepositoryOwner(repoDir, ["write-tree"], env), "workspace tree");
+    const runOwnerGit = ownerGit(asExecutor);
+    runOwnerGit(repoDir, ["read-tree", baseTree], env);
+    runOwnerGit(repoDir, ["add", "-A", "--", "."], env);
+    return commit(runOwnerGit(repoDir, ["write-tree"], env), "workspace tree");
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }
@@ -188,6 +196,18 @@ export function computeWorkspaceTreeOidFromTree(repoDir, baseTree, extraGitEnv =
 // temporary index means the agent-controlled index is never consulted.
 export function computeWorkspaceTreeOid(repoDir, extraGitEnv = {}) {
   return computeWorkspaceTreeOidFromTree(repoDir, "HEAD", extraGitEnv);
+}
+
+// Same computation, but every git call runs with executor (root) authority
+// instead of being gosu'd to the agent user. Needed post-command/post-action,
+// after another action's cleanup may already have re-locked this worktree's
+// linked admin dir (.git/worktrees/<handle>) to root:root 0700 -- running as
+// agent there fails "not a git repository", not because the worktree changed,
+// but because the parent repo's shared admin metadata was relocked in
+// between. Never grants the agent standing access to that metadata; it just
+// reads it with the authority the executor already has.
+export function computeWorkspaceTreeOidAsExecutor(repoDir, extraGitEnv = {}) {
+  return computeWorkspaceTreeOidFromTree(repoDir, "HEAD", extraGitEnv, { asExecutor: true });
 }
 
 function fileModeAt(path) {
@@ -286,7 +306,7 @@ export function captureRepositoryControl(repoDir) {
     headMode,
     headSignature: bufferSignature(head, headMode),
     headOid: commit(runGitAsRepositoryOwner(repoDir, ["rev-parse", "HEAD"]), "HEAD"),
-    symbolicRef: optionalRepositoryOwnerGit(repoDir, ["symbolic-ref", "-q", "HEAD"]),
+    symbolicRef: optionalOwnerGit(repoDir, ["symbolic-ref", "-q", "HEAD"]),
     index,
     indexMode,
     indexSignature: bufferSignature(index, indexMode),
@@ -320,8 +340,8 @@ export function repositoryControlMatches(repoDir, snapshot) {
   return canonicalJson(control.head) === canonicalJson(snapshot.headSignature) &&
     indexMatches(repoDir, control.index, snapshot) &&
     canonicalJson(control.operationState) === canonicalJson(snapshot.operationState) &&
-    optionalRepositoryOwnerGit(repoDir, ["rev-parse", "HEAD"]) === snapshot.headOid &&
-    optionalRepositoryOwnerGit(repoDir, ["symbolic-ref", "-q", "HEAD"]) === snapshot.symbolicRef &&
+    optionalOwnerGit(repoDir, ["rev-parse", "HEAD"]) === snapshot.headOid &&
+    optionalOwnerGit(repoDir, ["symbolic-ref", "-q", "HEAD"]) === snapshot.symbolicRef &&
     canonicalJson(captureRepositoryRefs(repoDir)) === canonicalJson(snapshot.refs);
 }
 

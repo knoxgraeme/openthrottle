@@ -523,7 +523,6 @@ export function loopPrompt(request) {
         skill: request.expectedProducer.skill,
         capability_digest: request.expectedProducer.capabilityDigest,
         skill_package_digest: request.expectedProducer.skillPackageDigest,
-        assurance: request.expectedProducer.assurance,
       }
     : {
         skill: request.expectedProducerSkill ?? request.repositorySkill?.reference ?? `builtin://${request.skill}@1`,
@@ -533,10 +532,17 @@ export function loopPrompt(request) {
     pipeline_instance_id: request.pipelineInstanceId ?? null,
     graph_id: request.graphId,
     graph_digest: request.graphDigest ?? null,
+    attempt_id: request.attemptId,
     parent_run_id: request.parentRunId ?? null,
     unit_id: request.unitId ?? "__final__",
     action_attempt_id: request.actionId,
     generation: request.generation ?? null,
+    // The receipt fence checks this against the receipt's top-level
+    // `assurance`, never `producer.assurance` -- ReceiptProducer has no such
+    // field (contracts/src/receipts.ts), so it must not appear inside
+    // `producer` here or an agent that echoes the contract verbatim would
+    // produce a receipt the schema rejects.
+    assurance: request.expectedProducer?.assurance ?? null,
     native_session_id: request.nativeSessionId,
     request_hash: request.requestHash,
     subject: {
@@ -726,7 +732,7 @@ function lockGitMetadata(gitDir) {
   }
 }
 
-function lockIntegrationCheckout(path = INTEGRATION_REPO_DIR) {
+export function lockIntegrationCheckout(path = INTEGRATION_REPO_DIR) {
   if (!isRoot() || !existsSync(path)) return false;
   chownSync(path, ROOT_UID, ROOT_GID);
   chmodSync(path, 0o711);
@@ -1109,6 +1115,10 @@ export function executeLoopAction({
     const diagnosticTail = engineFailed
       ? launchDiagnosticTail({ stdout: execution.stdout, stderr: execution.stderr, env: sanitizeEnv })
       : "";
+    // execution.executorFailure means our own prepare/run code already threw
+    // a precise error (execution.stderr); a later, best-effort subject
+    // attestation against a now-possibly-relocked worktree can fail too, but
+    // that failure is a symptom, not the cause, and must never bury it.
     const failureNarrative = launchFailure
       ? [
         `loop action failed (reason=${launchFailure.reason})`,
@@ -1117,8 +1127,10 @@ export function executeLoopAction({
         receiptError,
         diagnosticTail,
       ].filter(Boolean).join(" ")
-      : subjectError || receiptError || execution.stdout || execution.stderr ||
-        (failed ? "loop action failed" : "loop action completed");
+      : execution.executorFailure
+        ? (execution.stderr || subjectError || receiptError || "loop action failed")
+        : subjectError || receiptError || execution.stdout || execution.stderr ||
+          (failed ? "loop action failed" : "loop action completed");
     result = {
       version: 1,
       kind: "loop_action_result",
