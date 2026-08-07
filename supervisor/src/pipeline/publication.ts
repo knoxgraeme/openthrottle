@@ -212,12 +212,14 @@ interface RenderContext {
   stageIndex: number;
   transition: PipelineManifest["stages"][number]["transitions"][StageOutcome] | undefined;
   repairSourceStageId?: string;
+  publishedCommit: string | null;
 }
 
 interface RenderExtras {
   scheduledReentryOrdinal?: number;
   repairBannerFinding?: PublicationFinding;
   repairSourceStageId?: string;
+  publishedCommit?: string | null;
 }
 
 const STAGE_LABELS: Readonly<Record<string, { display: string; action?: string }>> = {
@@ -354,6 +356,7 @@ function renderContext(
     stageIndex,
     transition: stage?.transitions[envelope.decision.outcome as StageOutcome],
     repairSourceStageId: extras?.repairSourceStageId,
+    publishedCommit: extras?.publishedCommit ?? null,
   };
 }
 
@@ -441,15 +444,15 @@ function eventSentence(
     case "repair_reentry":
       return reentrySentence(envelope, context, extras);
     case "needs_human":
-      return terminalSentence(envelope);
+      return terminalSentence(envelope, context);
     case "provider_wait":
       return "The run is waiting for GitHub provider evidence.";
     case "terminal":
-      return terminalSentence(envelope);
+      return terminalSentence(envelope, context);
   }
 }
 
-function terminalSentence(envelope: PipelinePublicationBodyInput): string {
+function terminalSentence(envelope: PipelinePublicationBodyInput, context: RenderContext): string {
   const reason = envelope.decision.wait_reason
     ? boundedPublicationLine(envelope.decision.wait_reason, 1_000)
     : null;
@@ -460,7 +463,16 @@ function terminalSentence(envelope: PipelinePublicationBodyInput): string {
     case "shipped":
       return `The job shipped.${providerLink}`;
     case "no_change":
-      return "The job finished because no code change was needed; no pull request was created.";
+      // A no_change terminal can still follow an earlier publish in the same
+      // generation (e.g. a later repair round found nothing further to
+      // change). published_commit is set only once a publish_subject stage
+      // actually succeeds (see gates.ts); envelope.links/immutable_subject is
+      // sealed on every stage result regardless of publication and would
+      // misreport an ordinary first-stage no_change (which never published
+      // anything) as an already-published run.
+      return context.publishedCommit
+        ? `The job finished with no further code change needed; the already-published tree remains current.${providerLink}`
+        : "The job finished because no code change was needed; no pull request was created.";
     case "needs_human":
       return `The job needs a human decision before it can finish${reason ? `: ${reason}` : ""}. The workspace is preserved.`;
     case "failed":
@@ -528,7 +540,8 @@ function checklistProjection(envelope: PipelinePublicationBodyInput, context: Re
 
 function whoseMoveLine(
   envelope: PipelinePublicationBodyInput,
-  checklist: ChecklistProjection
+  checklist: ChecklistProjection,
+  context: RenderContext
 ): string {
   const waitReason = envelope.decision.wait_reason
     ? boundedPublicationLine(envelope.decision.wait_reason, 1_000)
@@ -543,7 +556,7 @@ function whoseMoveLine(
   if (envelope.template.name === "terminal" ||
       envelope.decision.next_status === envelope.decision.outcome &&
       TERMINAL_STATUSES.has(envelope.decision.next_status)) {
-    return `**Your move: nothing — this run is finished. ${terminalSentence(envelope)}**`;
+    return `**Your move: nothing — this run is finished. ${terminalSentence(envelope, context)}**`;
   }
   return `**Your move: nothing — ${stageActionName(checklist.stageId)} ${suffix}**`;
 }
@@ -566,13 +579,13 @@ function stageChecklistLines(envelope: PipelinePublicationBodyInput, checklist: 
 function summaryHeaderLines(envelope: PipelinePublicationBodyInput, context: RenderContext): string[] {
   const checklist = checklistProjection(envelope, context);
   return [
-    whoseMoveLine(envelope, checklist),
+    whoseMoveLine(envelope, checklist, context),
     ...stageChecklistLines(envelope, checklist),
-    ...terminalDecisionContextLines(envelope),
+    ...terminalDecisionContextLines(envelope, context),
   ];
 }
 
-function terminalDecisionContextLines(envelope: PipelinePublicationBodyInput): string[] {
+function terminalDecisionContextLines(envelope: PipelinePublicationBodyInput, context: RenderContext): string[] {
   if (envelope.decision.outcome === "shipped" ||
       envelope.template.name !== "terminal" && envelope.template.name !== "needs_human" &&
         envelope.decision.next_status !== "waiting_human") {
@@ -580,7 +593,7 @@ function terminalDecisionContextLines(envelope: PipelinePublicationBodyInput): s
   }
   const reason = envelope.decision.wait_reason
     ? boundedPublicationLine(envelope.decision.wait_reason, 1_000)
-    : terminalSentence(envelope);
+    : terminalSentence(envelope, context);
   const asked = envelope.decision.outcome === "needs_human"
     ? reason
     : "No decision is required; review the terminal outcome.";
@@ -951,7 +964,12 @@ export function buildLifecyclePublication(input: {
     ...(input.structuredExecution ? { structured_execution: input.structuredExecution } : {}),
     resume_status: null,
   };
-  return { ...partial, body: renderBody(partial, input.instance.normalized_manifest) };
+  return {
+    ...partial,
+    body: renderBody(partial, input.instance.normalized_manifest, {
+      publishedCommit: input.instance.published_commit,
+    }),
+  };
 }
 
 export function buildStagePublication(input: {
@@ -1042,6 +1060,7 @@ export function buildStagePublication(input: {
     repairBannerFinding: currentFindingsWithDisposition
       .find((finding) => finding.disposition === "carried to repair"),
     repairSourceStageId,
+    publishedCommit: input.instance.published_commit,
   });
   return artifactBytes <= INLINE_ARTIFACT_LIMIT_BYTES
     ? {

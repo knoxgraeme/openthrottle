@@ -646,7 +646,11 @@ export function coordinatePipelineEvent(
   const priorPayloads = summaryPayloads.length > 0 ? summaryPayloads : receipts.map((receipt) => receipt.payload);
   const priorFindings = accumulatedPublicationFindings(priorPayloads);
   const priorRepairSourceStageId = accumulatedPublicationRepairSource(priorPayloads);
-  const structuredExecution = store.getStructuredExecutionPublication(attempt.id);
+  // Once the structured stage hands off to a later stage (e.g. publish), the
+  // attempt that is transitioning is no longer the one that owns the
+  // execution graph, so this must resolve by instance rather than by the
+  // current attempt's id or the terminal receipt would never carry it.
+  const structuredExecution = store.getStructuredExecutionPublicationForInstance(instance.id);
   const publication = canonicalJson(buildStagePublication({
     instance,
     attempt,

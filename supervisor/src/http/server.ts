@@ -44,6 +44,9 @@ import { createAdmissionPreflight } from "../app/admission-preflight.js";
 import { handleGithubEvent } from "../providers/github/events.js";
 import { renderPipelineLogHeader } from "../pipeline/publication.js";
 import { canSteerPipelineRun, requestPipelineStop } from "../pipeline/control.js";
+import { stageById } from "../pipeline/manifest.js";
+import type { PipelineStore } from "../pipeline/store.js";
+import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 import type { RuntimeInventory, RuntimeLogs, RuntimeSnapshotReadiness } from "../runtime/contracts.js";
 
 export interface ServerDeps {
@@ -565,11 +568,13 @@ export function createServer(deps: ServerDeps): Hono {
     }
     const pipeline = deps.pipelineCoordinator.store.getInstanceForSession(ticket.linear_session_id);
     if (!pipeline) return context.json({ error: "pipeline not found" }, 409);
+    const activeAttempt = deps.pipelineCoordinator.store.getActiveAttempt(pipeline.id);
     const canSteerNow = canSteerPipelineRun({
       store: deps.pipelineCoordinator.store,
       sessionId: ticket.linear_session_id,
       runId: ticket.run_id,
       agent: ticket.agent,
+      attempt: activeAttempt,
     });
     if (!canSteerNow && pipeline.status !== "running") {
       return context.json({ error: "the current pipeline stage does not accept live steering" }, 409);
@@ -584,6 +589,30 @@ export function createServer(deps: ServerDeps): Hono {
       source: "operator",
       body: message,
     });
+    // A composite (`for_each_unit`) run has no steerable child-action fence
+    // today, so a reply captured here can never be bound and delivered live
+    // (see docs/SPEC.md "Live steering"). Record that fact durably in the
+    // structured ledger instead of letting it be silently canceled later
+    // with no trace, so the terminal receipt says so.
+    if (!canSteerNow) {
+      const activeStage = activeAttempt
+        ? stageById(pipeline.normalized_manifest, activeAttempt.stage_id)
+        : undefined;
+      if (activeAttempt && activeStage?.executor.kind === "loop_action") {
+        // Best-effort: the message is already durably captured above. A
+        // failure here should not turn an already-captured steer into a
+        // client-visible error or invite a duplicating retry.
+        try {
+          (deps.pipelineCoordinator.store as PipelineStore & ExecutionUnitStore).recordSteeringCaptured({
+            parentAttemptId: activeAttempt.id,
+            id: record.id,
+            body: "Operator steering message captured but not delivered: this run is a structured multi-unit stage, which does not yet support live steering to a specific child action. The message is recorded in Linear session activity only.",
+          });
+        } catch (error) {
+          console.error("[steer] failed to record steering_undelivered ledger note:", error);
+        }
+      }
+    }
     return context.json({
       ok: true,
       id: record.id,

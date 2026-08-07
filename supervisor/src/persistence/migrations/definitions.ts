@@ -1619,6 +1619,28 @@ WHERE terminal_result_outcome IS NULL;
 const executionWorkTerminalOutcomeMigrationSource = `${executionWorkTerminalOutcomeSchema}
 terminal-child-result-contract:child action terminal replay compares exact failure needs-human and retryable outcomes/v1`;
 
+const executionPublicationEventsSchema = `
+CREATE TABLE execution_publication_events (
+  id TEXT PRIMARY KEY,
+  execution_graph_id TEXT NOT NULL,
+  pipeline_instance_id TEXT NOT NULL,
+  parent_attempt_id TEXT NOT NULL,
+  unit_id TEXT,
+  sequence INTEGER NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('unit_repair', 'unit_settled', 'graph_stopped', 'final_review', 'aggregate', 'steering_undelivered')),
+  body TEXT NOT NULL,
+  linear_outbox_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(execution_graph_id, pipeline_instance_id, parent_attempt_id)
+    REFERENCES execution_graphs(id, pipeline_instance_id, parent_attempt_id) ON DELETE RESTRICT,
+  FOREIGN KEY(linear_outbox_id) REFERENCES linear_outbox(id) ON DELETE RESTRICT,
+  UNIQUE(parent_attempt_id, sequence)
+);
+`;
+
+const executionPublicationEventsMigrationSource = `${executionPublicationEventsSchema}
+child-publication-event-contract:each reportable child transition durably inserts one ordered publication event and its correlated linear_outbox activity in the same transaction, so restart converges without duplication/v1`;
+
 function addExecutionGraphStopFence(db: Database.Database): void {
   if (!hasColumns(db, "execution_graphs", ["stopped_at"])) {
     db.exec("ALTER TABLE execution_graphs ADD COLUMN stopped_at TEXT");
@@ -2147,6 +2169,16 @@ const definitions: DatabaseMigrationDefinition[] = [
     up(db) {
       if (hasTable(db, "execution_work_attempts") && !hasColumns(db, "execution_work_attempts", ["terminal_result_outcome"])) {
         db.exec(executionWorkTerminalOutcomeSchema);
+      }
+    },
+  },
+  {
+    version: 25,
+    name: "execution-publication-events",
+    source: executionPublicationEventsMigrationSource,
+    up(db) {
+      if (hasTable(db, "execution_graphs") && !hasTable(db, "execution_publication_events")) {
+        db.exec(executionPublicationEventsSchema);
       }
     },
   },

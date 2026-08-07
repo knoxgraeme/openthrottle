@@ -24,6 +24,7 @@ import {
   renderGithubPipelineSummary,
   shouldPostLinearEventComment,
 } from "./publication.js";
+import { executionLedgerLines } from "./execution-publication.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { createPipelinePublicationWriter } from "../persistence/pipeline/helpers.js";
 import type { LinearOutboxRecord } from "../persistence/delivery-store.js";
@@ -514,14 +515,126 @@ describe("pipeline publication", () => {
           }],
           downstream_context: [],
         }],
+        activity_log: [
+          { sequence: 1, kind: "unit_settled", unit_id: "U1", body: "Unit U1 completed: acceptance_passed." },
+          { sequence: 2, kind: "aggregate", unit_id: null, body: "Structured execution complete: 1 unit(s) integrated, aggregate aggregate-hash." },
+        ],
       },
     });
 
     expect(publication.body).toContain("**Structured Unit Ledger**");
     expect(publication.body).toContain("- U1: completed (no alarm); state=completed");
     expect(publication.body).toContain("unit_acceptance: passed/success by human");
-    expect(renderGithubPipelineSummary(publication)).toContain("**Structured Unit Ledger**");
+    expect(publication.body).toContain("**Structured Activity Log** (ordered)");
+    expect(publication.body).toContain("- [1] `U1` unit_settled: Unit U1 completed: acceptance_passed.");
+    expect(publication.body).toContain("- [2] aggregate: Structured execution complete: 1 unit(s) integrated, aggregate aggregate-hash.");
+    expect(renderGithubPipelineSummary(publication)).toContain("**Structured Activity Log** (ordered)");
     expect(parsePipelinePublication(canonicalJson(publication)).structured_execution?.units[0]?.unit_id).toBe("U1");
+  });
+
+  it("bounds an oversized structured ledger so the receipt cannot evict its own link, event sentence, or findings", () => {
+    const { instance } = setup();
+    // 64 units, each with a gate rationale at its full 1,000-char cap --
+    // enough alone to exceed PUBLICATION_BODY_LIMIT (12,000) before the
+    // structured-ledger aggregate budget was introduced.
+    const units = Array.from({ length: 64 }, (_, index) => ({
+      unit_id: `U${index + 1}`,
+      ordinal: index,
+      dependencies: [],
+      status: "completed" as const,
+      terminal_level: "completed" as const,
+      alarm: false,
+      active_action_id: null,
+      integration_subject: SUBJECT,
+      attempts: [],
+      gates: [{
+        kind: "unit_acceptance",
+        evaluator: "human",
+        result: "passed",
+        outcome: "success",
+        subject: SUBJECT,
+        reason: "r".repeat(1_000),
+        artifact_hashes: [],
+        receipt_hash: "receipt-hash",
+      }],
+      downstream_context: [],
+    }));
+    const publication = buildLifecyclePublication({
+      instance: { ...instance, immutable_subject: SUBJECT },
+      outcome: "shipped",
+      reason: "The pull request merged.",
+      structuredExecution: {
+        graph: {
+          id: "graph-1",
+          parent_attempt_id: "attempt-parent",
+          parent_stage_id: "units",
+          integration_subject: SUBJECT,
+          aggregate_artifact_hash: "aggregate-hash",
+          aggregate_emitted_at: "2026-07-29T00:03:00.000Z",
+          stopped_at: null,
+          stop_reason: null,
+        },
+        units,
+        activity_log: [
+          { sequence: 1, kind: "aggregate", unit_id: null, body: "Structured execution complete." },
+        ],
+      },
+    });
+
+    expect(publication.body.length).toBeLessThanOrEqual(12_000);
+    expect(publication.links.length).toBeGreaterThan(0);
+    const link = publication.links[0]!;
+    expect(publication.body).toContain(`- [${link.label}](${link.url})`);
+    expect(publication.body).toMatch(/Your move:/);
+    expect(publication.body).toContain("earlier unit(s) omitted");
+    expect(renderGithubPipelineSummary(publication)).toContain(`- [${link.label}](${link.url})`);
+  });
+
+  it("parses and renders a structured_execution envelope persisted before activity_log existed", () => {
+    const { instance, attempt } = setup();
+    const input = event(instance, attempt);
+    const publication = buildStagePublication({
+      instance,
+      attempt,
+      event: input.event,
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: attempt.id,
+        outcome: "success",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        nextStageId: "publish",
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+      structuredExecution: {
+        graph: {
+          id: "graph-1",
+          parent_attempt_id: attempt.id,
+          parent_stage_id: attempt.stage_id,
+          integration_subject: SUBJECT,
+          aggregate_artifact_hash: null,
+          aggregate_emitted_at: null,
+          stopped_at: null,
+          stop_reason: null,
+        },
+        units: [],
+        activity_log: [],
+      },
+    });
+    const legacyStructuredExecution = { ...publication.structured_execution } as Record<string, unknown>;
+    delete legacyStructuredExecution.activity_log;
+    const legacyPublication = { ...publication, structured_execution: legacyStructuredExecution };
+    const parsed = parsePipelinePublication(canonicalJson(legacyPublication));
+
+    expect(parsed.structured_execution).toBeDefined();
+    expect(parsed.structured_execution && "activity_log" in parsed.structured_execution).toBe(false);
+    expect(() => executionLedgerLines(parsed.structured_execution)).not.toThrow();
+    expect(executionLedgerLines(parsed.structured_execution).join("\n")).not.toContain("Structured Activity Log");
   });
 
   it("keeps persisted v1 publication envelopes parseable after the template bump", () => {
@@ -2311,6 +2424,94 @@ describe("pipeline publication", () => {
     expect(publication.body).toContain(sentence);
   });
 
+  it("does not claim no pull request was created on a no_change terminal that follows an earlier publish", () => {
+    const { instance, attempt } = setup();
+    const publication = buildLifecyclePublication({
+      instance: {
+        ...instance,
+        status: "no_change",
+        terminal_outcome: "no_change",
+        immutable_subject: SUBJECT,
+        published_commit: SUBJECT,
+      },
+      attempt,
+      outcome: "no_change",
+      reason: "A later repair round found nothing further to change.",
+    });
+    expect(publication.body).not.toContain("no pull request was created");
+    expect(publication.body).toContain("already-published tree remains current");
+    expect(publication.body).toContain(`tree/${SUBJECT}`);
+  });
+
+  it("still reports no pull request was created for an ordinary no_change with a sealed subject but no publish", () => {
+    // immutable_subject is sealed on every stage result regardless of
+    // publication (it is just the workspace's current commit); only
+    // published_commit proves a publish_subject stage actually succeeded.
+    // The most common no_change path never reaches publish at all (the
+    // shipped manifest routes implementation's own no_change straight to
+    // terminal), so this must not be misreported as "already published."
+    const { instance, attempt } = setup();
+    const publication = buildLifecyclePublication({
+      instance: {
+        ...instance,
+        status: "no_change",
+        terminal_outcome: "no_change",
+        immutable_subject: SUBJECT,
+        published_commit: null,
+      },
+      attempt,
+      outcome: "no_change",
+      reason: "No code change was needed.",
+    });
+    expect(publication.body).toContain("no pull request was created");
+    expect(publication.body).not.toContain("already-published tree remains current");
+  });
+
+  // buildLifecyclePublication (above) is production-reachable only for the
+  // "superseded" outcome (buildTerminalPublicationPayload's outcome type is
+  // literally "superseded"); an ordinary no_change terminal is always built
+  // by buildStagePublication inside coordinatePipelineEvent. These two tests
+  // drive that real path end-to-end so the published_commit distinction is
+  // proven against the function production actually calls, not a stand-in.
+  it("renders the no_change published-commit distinction through the real production path", () => {
+    const { pipelines, instance, attempt } = setup("fixture/agent@1");
+    // Simulate an earlier publish_subject stage succeeding in this same
+    // generation (production sets this via gates.ts) before a later
+    // ordinary stage reaches no_change.
+    db!.prepare("UPDATE pipeline_instances SET published_commit = ? WHERE id = ?").run(SUBJECT, instance.id);
+
+    const noChange = semanticEvent({
+      instance,
+      attempt,
+      outcome: "no_change",
+      summary: "No further change needed.",
+    });
+    coordinatePipelineEvent(pipelines, noChange.event, undefined, noChange.receipt);
+
+    const receipt = pipelines.listPublications(instance.id)
+      .find((row) => row.kind === "linear_ledger" && row.attempt_id === attempt.id)!;
+    const publication = parsePipelinePublication(receipt.payload);
+    expect(publication.body).not.toContain("no pull request was created");
+    expect(publication.body).toContain("already-published tree remains current");
+  });
+
+  it("still reports no pull request was created through the real production path when no publish occurred", () => {
+    const { pipelines, instance, attempt } = setup("fixture/agent@1");
+    const noChange = semanticEvent({
+      instance,
+      attempt,
+      outcome: "no_change",
+      summary: "No further change needed.",
+    });
+    coordinatePipelineEvent(pipelines, noChange.event, undefined, noChange.receipt);
+
+    const receipt = pipelines.listPublications(instance.id)
+      .find((row) => row.kind === "linear_ledger" && row.attempt_id === attempt.id)!;
+    const publication = parsePipelinePublication(receipt.payload);
+    expect(publication.body).toContain("no pull request was created");
+    expect(publication.body).not.toContain("already-published tree remains current");
+  });
+
   it("queues one permanent receipt through an outage and finalizes only after acknowledgement", async () => {
     const { tickets, pipelines, instance, attempt } = setup();
     await acknowledgeSelection(tickets);
@@ -2454,6 +2655,54 @@ describe("pipeline publication", () => {
       store: tickets,
       getLinearClient: async () => ({ accessToken: "oauth", fetch: successfulLinearFetch() }),
     });
+    await recovered.process(publication.id);
+    expect(pipelines.getInstance(instance.id)?.status).toBe("shipped");
+  });
+
+  it("gives a manually retried outbox row a fresh attempt budget instead of re-dying on its next failure", async () => {
+    const { tickets, pipelines, instance, attempt } = setup();
+    await acknowledgeSelection(tickets);
+    const input = event(instance, attempt);
+    coordinatePipelineEvent(pipelines, input.event, undefined, input.receipt);
+    const publication = pipelines.listPublications(instance.id)
+      .find((row) => row.kind === "linear_ledger" && row.attempt_id === attempt.id)!;
+
+    const flaky = createLinearOutboxProcessor({
+      store: tickets,
+      getLinearClient: async () => ({
+        accessToken: "oauth",
+        fetch: vi.fn(async () => new Response(
+          JSON.stringify({ errors: [{ message: "temporary schema violation" }] }),
+          { status: 500 }
+        )) as unknown as typeof fetch,
+      }),
+    });
+    // Drive the row to MAX_LINEAR_OUTBOX_ATTEMPTS through real failures whose
+    // text never matches a dead-token pattern -- the attempt cap, not the
+    // error classification, is what dead-letters it.
+    for (let attemptNumber = 1; attemptNumber <= 10; attemptNumber += 1) {
+      db!.prepare("UPDATE linear_outbox SET next_attempt_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
+        .run(publication.id);
+      await flaky.process(publication.id);
+    }
+    expect(getLinearOutbox(publication.id)).toMatchObject({ status: "dead", attempts: 10 });
+
+    expect(pipelines.retryPublication(publication.id).status).toBe("pending");
+    expect(getLinearOutbox(publication.id)?.attempts).toBe(0);
+
+    // A second failure right after the manual retry must not immediately
+    // re-die on a stale attempts count -- it needs a genuine fresh budget.
+    db!.prepare("UPDATE linear_outbox SET next_attempt_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
+      .run(publication.id);
+    await flaky.process(publication.id);
+    expect(getLinearOutbox(publication.id)).toMatchObject({ status: "failed", attempts: 1 });
+
+    const recovered = createLinearOutboxProcessor({
+      store: tickets,
+      getLinearClient: async () => ({ accessToken: "oauth", fetch: successfulLinearFetch() }),
+    });
+    db!.prepare("UPDATE linear_outbox SET next_attempt_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
+      .run(publication.id);
     await recovered.process(publication.id);
     expect(pipelines.getInstance(instance.id)?.status).toBe("shipped");
   });

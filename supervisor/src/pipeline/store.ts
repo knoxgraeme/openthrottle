@@ -393,6 +393,7 @@ export interface PipelineStore extends ChildActionLivenessPort {
   getRepositoryConfigSnapshot(id: string): RepositoryConfigSnapshot | undefined;
   getStageRequest(attemptId: string): StageRequestEnvelope;
   getStructuredExecutionPublication(parentAttemptId: string): ExecutionPublicationSnapshot | undefined;
+  getStructuredExecutionPublicationForInstance(pipelineInstanceId: string): ExecutionPublicationSnapshot | undefined;
   bindStageRun(attemptId: string, runId: string): void;
   markStageDispatched(attemptId: string): void;
   bindRuntimeResource(instanceId: string, provider: string, providerResourceId: string): PipelineRuntimeResource;

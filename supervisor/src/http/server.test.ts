@@ -1,4 +1,5 @@
 import { createHmac } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "../app/config.js";
@@ -8,9 +9,12 @@ import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { STRUCTURED_STATUS_UNITS_SQL } from "../persistence/pipeline/status-store.js";
 import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 import type { PipelineStore } from "../pipeline/store.js";
-import { loadPipelineCatalog, parseRepositoryConfig, type PipelineUnitPhaseBinding } from "../pipeline/manifest.js";
+import { loadPipelineCatalog, parseRepositoryConfig, stageById, type PipelineUnitPhaseBinding } from "../pipeline/manifest.js";
+import { parseAndCompileExecutionGraph } from "../pipeline/execution-graph.js";
 import { buildInstalledRuntimeDescriptor, type RuntimeInventory, type RuntimeLogs, type RuntimeSnapshotReadiness } from "../__fixtures__/runtime.js";
 import { createServer, createServerWebhookDeliveryProcessor } from "./server.js";
+
+const structuredGraphPath = fileURLToPath(new URL("../../graphs/structured-v1.json", import.meta.url));
 
 const cfg: Config = {
   port: 3000,
@@ -167,6 +171,49 @@ describe("coordinator-only server", () => {
         repositoryConfig,
         runtime,
         authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
+      },
+    });
+  }
+
+  function seedStructuredPipelineTicket(): void {
+    const runtime = buildInstalledRuntimeDescriptor("server-structured-test/v1", {
+      capabilities: [
+        ...buildInstalledRuntimeDescriptor("server-structured-base/v1").descriptor.capabilities,
+        "accept-unit@1",
+        "ce/simplify@1",
+        "graph/for-each-unit@1",
+      ],
+    });
+    const compiled = parseAndCompileExecutionGraph(readFileSync(structuredGraphPath, "utf8"), {
+      source: structuredGraphPath,
+      runtime: runtime.descriptor,
+    });
+    pipelines.acceptRuntimeDescriptor(runtime);
+    pipelines.acceptManifest(compiled.manifest);
+    const repositoryConfig = pipelines.saveRepositoryConfigSnapshot({
+      repository: "owner/repo",
+      baseCommit: "a".repeat(40),
+      blobSha: "b".repeat(40),
+      config: parseRepositoryConfig("schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }, { id: structured, kind: builtin, ref: builtin/structured@1 }]\npipelines: { implement: structured }\n"),
+    });
+    store.upsert({
+      linear_issue_id: "issue-1",
+      linear_issue_identifier: "OT-1",
+      linear_session_id: "session-1",
+      sandbox_id: null,
+      branch: "ot/ot-1",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+      pipeline: {
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        manifest: compiled.manifest,
+        repositoryConfig,
+        runtime,
+        authorizedCapabilities: compiled.manifest.manifest.requires.capabilities,
         taskType: "implement",
       },
     });
@@ -598,6 +645,146 @@ describe("coordinator-only server", () => {
       source: "operator",
       body: "carry this forward",
     });
+  });
+
+  it("records a durable, visible note when steering is captured during a structured composite run", async () => {
+    seedStructuredPipelineTicket();
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    expect(attempt.stage_id).toBe("units");
+    const request = pipelines.getStageRequest(attempt.id);
+    expect(request.liveSteering).toBe(false);
+    expect(store.beginRun({
+      issueId: "issue-1",
+      runId: request.runId,
+      taskType: "implement",
+      tokenHash: "token-hash",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    })).toBe(true);
+    pipelines.bindStageRun(attempt.id, request.runId);
+    pipelines.markStageDispatched(attempt.id);
+    const unitStore = pipelines as PipelineStore & ExecutionUnitStore;
+    unitStore.createGraph({
+      pipelineInstanceId: instance.id,
+      parentAttemptId: attempt.id,
+      parentStageId: attempt.stage_id,
+      parentRunId: attempt.run_id ?? attempt.planned_run_id!,
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "U1" }],
+      unitPhaseBindings: stageById(instance.normalized_manifest, "units")?.unitPhaseBindings,
+    });
+
+    const response = await app().request("/tickets/OT-1/steer", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer status-token",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ message: "carry this forward" }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ ok: true, status: "captured" });
+    expect(db.prepare("SELECT run_id, source, body FROM session_inbox").get()).toEqual({
+      run_id: null,
+      source: "operator",
+      body: "carry this forward",
+    });
+
+    const events = db.prepare(
+      "SELECT kind, unit_id, body FROM execution_publication_events WHERE parent_attempt_id = ?"
+    ).all(attempt.id) as Array<{ kind: string; unit_id: string | null; body: string }>;
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      kind: "steering_undelivered",
+      unit_id: null,
+    });
+    expect(events[0]?.body).toContain("structured multi-unit stage");
+
+    // A second capture during the same composite run records a second,
+    // distinct event rather than silently deduping or overwriting the first.
+    const second = await app().request("/tickets/OT-1/steer", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer status-token",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ message: "and this too" }),
+    });
+    expect(second.status).toBe(200);
+    const eventsAfterSecond = db.prepare(
+      "SELECT kind FROM execution_publication_events WHERE parent_attempt_id = ?"
+    ).all(attempt.id);
+    expect(eventsAfterSecond).toHaveLength(2);
+  });
+
+  it("still captures steering and returns 200 when recording the undelivered ledger note fails", async () => {
+    seedStructuredPipelineTicket();
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    const request = pipelines.getStageRequest(attempt.id);
+    expect(store.beginRun({
+      issueId: "issue-1",
+      runId: request.runId,
+      taskType: "implement",
+      tokenHash: "token-hash",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    })).toBe(true);
+    pipelines.bindStageRun(attempt.id, request.runId);
+    pipelines.markStageDispatched(attempt.id);
+    const unitStore = pipelines as PipelineStore & ExecutionUnitStore;
+    unitStore.createGraph({
+      pipelineInstanceId: instance.id,
+      parentAttemptId: attempt.id,
+      parentStageId: attempt.stage_id,
+      parentRunId: attempt.run_id ?? attempt.planned_run_id!,
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "U1" }],
+      unitPhaseBindings: stageById(instance.normalized_manifest, "units")?.unitPhaseBindings,
+    });
+    const failingStore = new Proxy(pipelines, {
+      get(target, prop, receiver) {
+        if (prop === "recordSteeringCaptured") {
+          return () => {
+            throw new Error("simulated durable-ledger write failure");
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const response = await app({
+      pipelineCoordinator: {
+        catalog: {} as never,
+        runtime: {} as never,
+        store: failingStore,
+        drainEffects: async () => undefined,
+      },
+    }).request("/tickets/OT-1/steer", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer status-token",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ message: "carry this forward despite the ledger write failing" }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ ok: true, status: "captured" });
+    expect(db.prepare("SELECT run_id, source, body FROM session_inbox").get()).toEqual({
+      run_id: null,
+      source: "operator",
+      body: "carry this forward despite the ledger write failing",
+    });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM execution_publication_events").get()).toEqual({ count: 0 });
+    expect(consoleError).toHaveBeenCalledWith(
+      "[steer] failed to record steering_undelivered ledger note:",
+      expect.any(Error)
+    );
+    consoleError.mockRestore();
   });
 
   it("distinguishes an accepted stop request from confirmed durable settlement", async () => {

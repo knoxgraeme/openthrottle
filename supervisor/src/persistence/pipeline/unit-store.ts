@@ -27,7 +27,7 @@ import {
   type UnitPhase,
   type UnitTerminalReason,
 } from "../../pipeline/unit-coordinator.js";
-import { deterministicId } from "./helpers.js";
+import { deterministicId, insertExecutionPublicationEvent, listExecutionPublicationEvents } from "./helpers.js";
 import {
   createOrResumeFinalAction,
   createOrResumeUnitAction,
@@ -244,6 +244,16 @@ export interface ExecutionUnitStore {
     parentAttemptId: string;
     reason: string;
   }): "stopped" | "already_stopped";
+  // Records that an operator steering reply arrived while this composite
+  // run was active and could not be bound to a live child action fence
+  // (there is none today -- see docs/SPEC.md "Live steering"), so it stays
+  // audit-only instead of vanishing silently when it is later canceled.
+  // A no-op when this parent attempt has no execution graph yet.
+  recordSteeringCaptured(input: {
+    parentAttemptId: string;
+    id: string;
+    body: string;
+  }): void;
   settleUnitTerminal(input: {
     parentAttemptId: string;
     unitId: string;
@@ -262,15 +272,14 @@ export interface ExecutionUnitStore {
     leaseUntilIso: string;
   }): boolean;
   getStructuredExecutionPublication(parentAttemptId: string): ReturnType<typeof buildExecutionPublicationSnapshot>;
+  getStructuredExecutionPublicationForInstance(pipelineInstanceId: string): ReturnType<typeof buildExecutionPublicationSnapshot>;
 }
 
-export function getStructuredExecutionPublicationForAttempt(
+function buildExecutionPublicationSnapshotForGraph(
   db: Database.Database,
-  parentAttemptId: string
+  graph: ExecutionUnitGraph
 ): ReturnType<typeof buildExecutionPublicationSnapshot> {
-  const graph = db.prepare("SELECT * FROM execution_graphs WHERE parent_attempt_id = ?")
-    .get(parentAttemptId) as ExecutionUnitGraph | undefined;
-  if (!graph) return undefined;
+  const parentAttemptId = graph.parent_attempt_id;
   const attempts = db.prepare(`
     SELECT * FROM (
       SELECT * FROM (
@@ -304,13 +313,49 @@ export function getStructuredExecutionPublicationForAttempt(
     WHERE row_number <= 3
     ORDER BY from_unit_id, created_at, id
   `).all(parentAttemptId) as ExecutionDownstreamContext[];
+  const activityLog = listExecutionPublicationEvents(db, parentAttemptId).map((event) => ({
+    sequence: event.sequence,
+    kind: event.kind,
+    unit_id: event.unit_id,
+    body: event.body,
+  }));
   return buildExecutionPublicationSnapshot({
     graph,
     units: listUnitRowsForParentAttempt(db, parentAttemptId).map(unitState),
     attempts: attempts as Array<ExecutionWorkAttempt & { unit_id: string }>,
     gates: gates as Array<ExecutionGateReceipt & { unit_id: string }>,
     downstreamContext,
+    activityLog,
   });
+}
+
+export function getStructuredExecutionPublicationForAttempt(
+  db: Database.Database,
+  parentAttemptId: string
+): ReturnType<typeof buildExecutionPublicationSnapshot> {
+  const graph = db.prepare("SELECT * FROM execution_graphs WHERE parent_attempt_id = ?")
+    .get(parentAttemptId) as ExecutionUnitGraph | undefined;
+  if (!graph) return undefined;
+  return buildExecutionPublicationSnapshotForGraph(db, graph);
+}
+
+// The pipeline coordinator renders the structured ledger from whichever
+// attempt is currently transitioning -- which, once the composite/structured
+// stage hands off to a later stage (e.g. publish), is a different attempt id
+// than the one that owns the execution graph. Each generation is its own
+// pipeline_instances row (see supersedeOtherInstances), so the latest graph
+// for this instance is unambiguously this generation's structured execution,
+// independent of which attempt is currently active.
+export function getStructuredExecutionPublicationForInstance(
+  db: Database.Database,
+  pipelineInstanceId: string
+): ReturnType<typeof buildExecutionPublicationSnapshot> {
+  const graph = db.prepare(`
+    SELECT * FROM execution_graphs WHERE pipeline_instance_id = ?
+    ORDER BY created_at DESC, id DESC LIMIT 1
+  `).get(pipelineInstanceId) as ExecutionUnitGraph | undefined;
+  if (!graph) return undefined;
+  return buildExecutionPublicationSnapshotForGraph(db, graph);
 }
 
 export function createExecutionUnitStore(db: Database.Database, now: () => string): ExecutionUnitStore {
@@ -355,6 +400,16 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       input.unitId
     );
     if (update.changes !== 1) throw new Error(`execution unit ${input.unitId} terminal compare-and-set failed`);
+    const graph = graphStmt.get(input.parentAttemptId) as ExecutionUnitGraph;
+    insertExecutionPublicationEvent({
+      db,
+      id: deterministicId("execution-activity-unit-settled", [input.parentAttemptId, input.unitId]),
+      graph,
+      unitId: input.unitId,
+      kind: "unit_settled",
+      body: `Unit ${input.unitId} ${terminal.terminalLevel}${terminal.alarm ? " (alarm)" : ""}: ${input.reason}.`,
+      timestamp: input.timestamp,
+    });
     return "settled";
   }
 
@@ -878,6 +933,17 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
             SET phase = ?, current_cycle = current_cycle + 1, command_index = 0, repair_rounds = ?, updated_at = ?
             WHERE id = ?
           `).run("implement", routing.repairRounds, timestamp, unitRow.id);
+          insertExecutionPublicationEvent({
+            db,
+            id: deterministicId("execution-activity-unit-repair", [
+              completedAction.parent_attempt_id, unitRow.unit_id, routing.repairRounds,
+            ]),
+            graph,
+            unitId: unitRow.unit_id,
+            kind: "unit_repair",
+            body: `Unit ${unitRow.unit_id} needs another implementation pass (repair round ${routing.repairRounds}/${graph.max_repair_rounds}): ${input.decision.reason}.`,
+            timestamp,
+          });
         } else if (routing.action === "settle") {
           settleUnitRow({ parentAttemptId: completedAction.parent_attempt_id, unitId: unitRow.unit_id, reason: "defect", timestamp });
           settleStructurallyBlockedDependents(completedAction.parent_attempt_id, timestamp);
@@ -938,10 +1004,28 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         db.prepare(`
           UPDATE execution_graphs SET final_phase = 'done', final_review_passed_at = ?, updated_at = ? WHERE id = ?
         `).run(timestamp, timestamp, graph.id);
+        insertExecutionPublicationEvent({
+          db,
+          id: deterministicId("execution-activity-final-review", [completedAction.parent_attempt_id, "done"]),
+          graph,
+          unitId: null,
+          kind: "final_review",
+          body: `Whole-change final review passed for ${completedAction.parent_attempt_id}.`,
+          timestamp,
+        });
       } else if (routing.action === "repair") {
         db.prepare(`
           UPDATE execution_graphs SET final_phase = 'repair', final_repair_rounds = ?, updated_at = ? WHERE id = ?
         `).run(routing.repairRounds, timestamp, graph.id);
+        insertExecutionPublicationEvent({
+          db,
+          id: deterministicId("execution-activity-final-review", [completedAction.parent_attempt_id, "repair", routing.repairRounds]),
+          graph,
+          unitId: null,
+          kind: "final_review",
+          body: `Whole-change final review needs another repair pass (round ${routing.repairRounds}/${graph.max_repair_rounds}): ${input.decision.reason}.`,
+          timestamp,
+        });
       } else {
         stopActiveWork({ parentAttemptId: completedAction.parent_attempt_id, reason: routing.reason });
       }
@@ -1039,6 +1123,15 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         SET stopped_at = ?, stop_reason = ?, updated_at = ?
         WHERE parent_attempt_id = ? AND stopped_at IS NULL
       `).run(timestamp, lastError, timestamp, action.parent_attempt_id);
+      insertExecutionPublicationEvent({
+        db,
+        id: deterministicId("execution-activity-graph-stopped", [action.parent_attempt_id]),
+        graph,
+        unitId: null,
+        kind: "graph_stopped",
+        body: `Structured execution stopped: ${lastError}.`,
+        timestamp,
+      });
     }
     db.prepare(`
       UPDATE execution_units
@@ -1080,6 +1173,18 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       WHERE parent_attempt_id = ? AND aggregate_emitted_at IS NULL
     `).run(input.artifactHash, timestamp, input.integrationSubject, timestamp, input.parentAttemptId);
     if (update.changes !== 1) throw new Error(`execution graph ${graph.id} aggregate compare-and-set failed`);
+    const integratedUnits = (db.prepare(`
+      SELECT COUNT(*) AS count FROM execution_units WHERE parent_attempt_id = ? AND terminal_level = 'completed'
+    `).get(input.parentAttemptId) as { count: number }).count;
+    insertExecutionPublicationEvent({
+      db,
+      id: deterministicId("execution-activity-aggregate", [input.parentAttemptId]),
+      graph,
+      unitId: null,
+      kind: "aggregate",
+      body: `Structured execution complete: ${integratedUnits} unit(s) integrated, aggregate ${input.artifactHash}.`,
+      timestamp,
+    });
     return "emitted";
   });
 
@@ -1244,7 +1349,32 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
           active_work_attempt_id = NULL, updated_at = ?
       WHERE parent_attempt_id = ? AND terminal_level IS NULL
     `).run(timestamp, input.parentAttemptId);
+    insertExecutionPublicationEvent({
+      db,
+      id: deterministicId("execution-activity-graph-stopped", [input.parentAttemptId]),
+      graph,
+      unitId: null,
+      kind: "graph_stopped",
+      body: `Structured execution stopped: ${input.reason}.`,
+      timestamp,
+    });
     return "stopped";
+  });
+
+  const recordSteeringCaptured = db.transaction((
+    input: Parameters<ExecutionUnitStore["recordSteeringCaptured"]>[0]
+  ): void => {
+    const graph = graphStmt.get(input.parentAttemptId) as ExecutionUnitGraph | undefined;
+    if (!graph) return;
+    insertExecutionPublicationEvent({
+      db,
+      id: deterministicId("execution-activity-steering-undelivered", [input.id]),
+      graph,
+      unitId: null,
+      kind: "steering_undelivered",
+      body: input.body,
+      timestamp: now(),
+    });
   });
 
   const settleUnitTerminal = db.transaction((
@@ -1410,6 +1540,9 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     getStructuredExecutionPublication(parentAttemptId) {
       return getStructuredExecutionPublicationForAttempt(db, parentAttemptId);
     },
+    getStructuredExecutionPublicationForInstance(pipelineInstanceId) {
+      return getStructuredExecutionPublicationForInstance(db, pipelineInstanceId);
+    },
     appendDownstreamContext,
     listDownstreamContext(parentAttemptId, toUnitId) {
       if (toUnitId != null) {
@@ -1426,6 +1559,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       `).all(parentAttemptId) as ExecutionDownstreamContext[];
     },
     stopActiveWork,
+    recordSteeringCaptured,
     settleUnitTerminal,
     healExpiredCurrentChildAction,
     renewChildActionLiveness(input) {

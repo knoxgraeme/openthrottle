@@ -5,6 +5,7 @@ import type { PipelineUnitPhaseBinding } from "../../pipeline/manifest.js";
 import type { ExecutionGateDecision } from "../../pipeline/execution-gates.js";
 import { openDb } from "../database.js";
 import { createExecutionUnitStore, type ExecutionUnitStore } from "./unit-store.js";
+import { executionLedgerLines } from "../../pipeline/execution-publication.js";
 
 let db: Database.Database | undefined;
 let timestamp = "2026-07-29T00:00:00.000Z";
@@ -3088,5 +3089,414 @@ describe("execution unit store", () => {
 
     expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ stopped_at: timestamp, stop_reason: "final_review_needs_human" });
     expect(lease(store)).toBeUndefined();
+  });
+
+  function publicationEvents(parentAttemptId: string): Array<{
+    sequence: number;
+    kind: string;
+    unit_id: string | null;
+    body: string;
+    outboxKind: string;
+    outboxStatus: string;
+    outboxBody: string;
+  }> {
+    const rows = db!.prepare(`
+      SELECT e.sequence, e.kind, e.unit_id, e.body, o.kind AS outboxKind, o.status AS outboxStatus, o.payload AS outboxPayload
+      FROM execution_publication_events e
+      JOIN linear_outbox o ON o.id = e.linear_outbox_id
+      WHERE e.parent_attempt_id = ?
+      ORDER BY e.sequence ASC
+    `).all(parentAttemptId) as Array<{
+      sequence: number; kind: string; unit_id: string | null; body: string;
+      outboxKind: string; outboxStatus: string; outboxPayload: string;
+    }>;
+    return rows.map((row) => ({
+      sequence: row.sequence,
+      kind: row.kind,
+      unit_id: row.unit_id,
+      body: row.body,
+      outboxKind: row.outboxKind,
+      outboxStatus: row.outboxStatus,
+      outboxBody: (JSON.parse(row.outboxPayload) as { activity: { body: string } }).activity.body,
+    }));
+  }
+
+  it("durably records ordered child-publication events across repair, settlement, final review, and aggregate", () => {
+    const store = setup();
+    const subject = "1".repeat(40);
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      maxRepairRounds: 2,
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+
+    // Round 1: repair.
+    const implement1 = lease(store);
+    store.completeUnitAction({ actionId: implement1.id, resultHash: "ri1", outputSubject: subject, receipt: receiptJson("unit_completion") });
+    store.completeUnitAction({ actionId: lease(store).id, resultHash: "rs1", outputSubject: subject });
+    const candidate1 = lease(store);
+    store.completeUnitAction({ actionId: candidate1.id, resultHash: "rc1", outputSubject: subject, receipt: receiptJson("candidate_evidence") });
+    const lead1 = lease(store);
+    store.completeGatedAction({
+      actionId: lead1.id,
+      resultHash: "rl1",
+      outputSubject: subject,
+      decision: gateDecision({ gateKind: "unit_acceptance", outcome: "semantic_repair_required", subject, reason: "command_exit_nonzero" }),
+    });
+
+    // Round 2: accepted and integrated to completion.
+    completeUnitToTerminal(store, subject);
+
+    const finalReview = lease(store);
+    store.completeGatedAction({
+      actionId: finalReview.id,
+      resultHash: "fr-hash",
+      outputSubject: subject,
+      decision: gateDecision({ gateKind: "final_review", outcome: "success", subject }),
+    });
+
+    const aggregate = store.emitAggregateOnce({
+      parentAttemptId: "attempt-parent",
+      artifactHash: "agg-hash",
+      integrationSubject: subject,
+    });
+    expect(aggregate).toBe("emitted");
+
+    const events = publicationEvents("attempt-parent");
+    expect(events.map((event) => event.kind)).toEqual(["unit_repair", "unit_settled", "final_review", "aggregate"]);
+    expect(events.map((event) => event.sequence)).toEqual([1, 2, 3, 4]);
+    expect(events.every((event) => event.outboxKind === "activity")).toBe(true);
+    expect(events.every((event) => event.outboxStatus === "pending")).toBe(true);
+    expect(events[0]).toMatchObject({ unit_id: "a" });
+    expect(events[0]!.body).toContain("repair round 1/2");
+    expect(events[0]!.outboxBody).toBe(events[0]!.body);
+    expect(events[1]).toMatchObject({ unit_id: "a" });
+    expect(events[1]!.body).toContain("completed");
+    expect(events[2]).toMatchObject({ unit_id: null });
+    expect(events[2]!.body).toContain("final review passed");
+    expect(events[3]).toMatchObject({ unit_id: null });
+    expect(events[3]!.body).toContain("1 unit(s) integrated");
+  });
+
+  it("records one durable event per unit, in order, when a structural exit cascades to multiple dependents in one transaction", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [
+        { id: "a" },
+        { id: "b", dependencies: ["a"] },
+        { id: "c", dependencies: ["a"] },
+      ],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+
+    // Settling "a" as a structural exit cascades to both of its dependents
+    // ("b" and "c") inside the same settleUnitTerminal transaction --
+    // settleStructurallyBlockedDependents loops until no pending unit remains
+    // blocked, calling settleUnitRow (and its event insert) once per unit.
+    const result = store.settleUnitTerminal({
+      parentAttemptId: "attempt-parent",
+      unitId: "a",
+      reason: "structural_exit",
+    });
+    expect(result).toBe("settled");
+
+    const units = store.listUnits("attempt-parent");
+    expect(units.every((unit) => unit.terminalLevel === "exited")).toBe(true);
+
+    const events = publicationEvents("attempt-parent");
+    expect(events).toHaveLength(3);
+    expect(events.map((event) => event.kind)).toEqual(["unit_settled", "unit_settled", "unit_settled"]);
+    // One event per unit, addressed to the right unit and delivered in a
+    // single strictly-increasing per-attempt sequence -- not per-unit streams
+    // that could interleave or duplicate a sequence number across units.
+    expect(events.map((event) => event.unit_id)).toEqual(["a", "b", "c"]);
+    expect(events.map((event) => event.sequence)).toEqual([1, 2, 3]);
+    expect(events.every((event) => event.outboxKind === "activity")).toBe(true);
+    expect(new Set(events.map((event) => event.outboxBody)).size).toBe(3);
+
+    // The store's own read path (the terminal ledger's convergence source)
+    // exposes the same three events immediately and in the same order.
+    const activityLog = store.getStructuredExecutionPublication("attempt-parent")?.activity_log ?? [];
+    expect(activityLog.map((event) => [event.sequence, event.unit_id])).toEqual([
+      [1, "a"],
+      [2, "b"],
+      [3, "c"],
+    ]);
+  });
+
+  it("does not duplicate a child-publication event when an already-recorded gate decision replays", () => {
+    const store = setup();
+    const subject = "1".repeat(40);
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+
+    const implement = lease(store);
+    store.completeUnitAction({ actionId: implement.id, resultHash: "ri", outputSubject: subject, receipt: receiptJson("unit_completion") });
+    store.completeUnitAction({ actionId: lease(store).id, resultHash: "rs", outputSubject: subject });
+    const candidate = lease(store);
+    store.completeUnitAction({ actionId: candidate.id, resultHash: "rc", outputSubject: subject, receipt: receiptJson("candidate_evidence") });
+    const lead = lease(store);
+    const decision = gateDecision({ gateKind: "unit_acceptance", outcome: "semantic_repair_required", subject, reason: "command_exit_nonzero" });
+    store.completeGatedAction({ actionId: lead.id, resultHash: "rl", outputSubject: subject, decision });
+    // Replaying the identical gate decision on the already-completed action must
+    // short-circuit before routing/event-emission runs again (see the
+    // "already_recorded" guard in completeGatedAction).
+    store.completeGatedAction({ actionId: lead.id, resultHash: "rl", outputSubject: subject, decision });
+
+    expect(publicationEvents("attempt-parent")).toHaveLength(1);
+  });
+
+  it("sanitizes secret-shaped reason text before it is durably inserted, and cannot be bypassed on replay", () => {
+    const store = setup();
+    const subject = "1".repeat(40);
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      maxRepairRounds: 2,
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+
+    const implement = lease(store);
+    store.completeUnitAction({ actionId: implement.id, resultHash: "ri", outputSubject: subject, receipt: receiptJson("unit_completion") });
+    store.completeUnitAction({ actionId: lease(store).id, resultHash: "rs", outputSubject: subject });
+    const candidate = lease(store);
+    store.completeUnitAction({ actionId: candidate.id, resultHash: "rc", outputSubject: subject, receipt: receiptJson("candidate_evidence") });
+    const lead = lease(store);
+    store.completeGatedAction({
+      actionId: lead.id,
+      resultHash: "rl",
+      outputSubject: subject,
+      decision: gateDecision({
+        gateKind: "unit_acceptance",
+        outcome: "semantic_repair_required",
+        subject,
+        reason: "leaked credential Bearer sk-live-abcdef1234567890",
+      }),
+    });
+
+    const events = publicationEvents("attempt-parent");
+    expect(events).toHaveLength(1);
+    expect(events[0]!.body).not.toContain("sk-live-abcdef1234567890");
+    expect(events[0]!.body).toContain("[REDACTED]");
+    expect(events[0]!.outboxBody).not.toContain("sk-live-abcdef1234567890");
+  });
+
+  it("stamps a graph-stop child-publication event once, not on a redundant stop request", () => {
+    const store = setup();
+    const subject = "1".repeat(40);
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+
+    const implement = lease(store);
+    store.completeUnitAction({ actionId: implement.id, resultHash: "ri", outputSubject: subject, receipt: receiptJson("unit_completion") });
+    store.completeUnitAction({ actionId: lease(store).id, resultHash: "rs", outputSubject: subject });
+    const candidate = lease(store);
+    store.completeUnitAction({ actionId: candidate.id, resultHash: "rc", outputSubject: subject, receipt: receiptJson("candidate_evidence") });
+    const lead = lease(store);
+    store.completeGatedAction({
+      actionId: lead.id,
+      resultHash: "rl",
+      outputSubject: subject,
+      decision: gateDecision({ gateKind: "unit_acceptance", outcome: "needs_human", subject, reason: "escalated_to_operator" }),
+    });
+
+    expect(store.stopActiveWork({ parentAttemptId: "attempt-parent", reason: "already stopped by the escalation above" }))
+      .toBe("already_stopped");
+
+    const events = publicationEvents("attempt-parent");
+    expect(events.filter((event) => event.kind === "graph_stopped")).toHaveLength(1);
+    expect(events.find((event) => event.kind === "graph_stopped")?.body).toContain("escalated_to_operator");
+  });
+
+  it("records a graph-stop child-publication event when a retryable infrastructure failure stops the graph", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+
+    const retryable = lease(store);
+    store.markActionDispatched(retryable.id, "request-hash", "native-session");
+    store.stopRetryableUnitAction({
+      actionId: retryable.id,
+      resultHash: "result-hash",
+      lastError: "model credential unavailable",
+    });
+
+    const events = publicationEvents("attempt-parent");
+    expect(events.filter((event) => event.kind === "graph_stopped")).toHaveLength(1);
+    expect(events.find((event) => event.kind === "graph_stopped")?.body).toContain("model credential unavailable");
+  });
+
+  it("records a durable steering_undelivered event that surfaces in the rendered structured ledger", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+
+    store.recordSteeringCaptured({
+      parentAttemptId: "attempt-parent",
+      id: "steer-1",
+      body: "Operator steering message captured but not delivered: this run is a structured multi-unit stage.",
+    });
+
+    const events = publicationEvents("attempt-parent");
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      kind: "steering_undelivered",
+      unit_id: null,
+      outboxKind: "activity",
+    });
+    expect(events[0]?.body).toContain("structured multi-unit stage");
+
+    const snapshot = store.getStructuredExecutionPublicationForInstance("instance-1");
+    expect(executionLedgerLines(snapshot)).toEqual(expect.arrayContaining([
+      "**Structured Activity Log** (ordered)",
+      expect.stringContaining("steering_undelivered: Operator steering message captured"),
+    ]));
+
+    // A second capture is recorded as a distinct, separately ordered event.
+    store.recordSteeringCaptured({
+      parentAttemptId: "attempt-parent",
+      id: "steer-2",
+      body: "A second captured reply.",
+    });
+    const eventsAfterSecond = publicationEvents("attempt-parent");
+    expect(eventsAfterSecond).toHaveLength(2);
+    expect(eventsAfterSecond.map((event) => event.sequence)).toEqual([1, 2]);
+
+    // Retrying the same capture id (e.g. a retried request) is a no-op, not
+    // a duplicate or a re-sanitized overwrite.
+    store.recordSteeringCaptured({
+      parentAttemptId: "attempt-parent",
+      id: "steer-1",
+      body: "a different body must not overwrite the original",
+    });
+    expect(publicationEvents("attempt-parent")).toHaveLength(2);
+  });
+
+  it("is a no-op recording steering capture for a parent attempt with no execution graph", () => {
+    const store = setup();
+    expect(() => store.recordSteeringCaptured({
+      parentAttemptId: "attempt-without-a-graph",
+      id: "steer-1",
+      body: "should not throw",
+    })).not.toThrow();
+    expect(publicationEvents("attempt-without-a-graph")).toHaveLength(0);
+  });
+
+  it("gives the correlated linear_outbox activity an RFC-4122-shaped id", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+    store.settleUnitTerminal({ parentAttemptId: "attempt-parent", unitId: "a", reason: "structural_exit" });
+
+    const outboxIds = db!.prepare(
+      "SELECT linear_outbox_id FROM execution_publication_events WHERE parent_attempt_id = ?"
+    ).all("attempt-parent") as Array<{ linear_outbox_id: string }>;
+    expect(outboxIds).toHaveLength(1);
+    // Linear's AgentActivityCreateInput.id is client-supplied and must be
+    // RFC-4122-shaped, same as every other id on this path (deterministicPublicationId).
+    expect(outboxIds[0]!.linear_outbox_id).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+    );
+  });
+
+  it("exposes child-publication events through the store's own read path immediately, in sequence order", () => {
+    const store = setup();
+    const subject = "1".repeat(40);
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      maxRepairRounds: 1,
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+
+    const implement = lease(store);
+    store.completeUnitAction({ actionId: implement.id, resultHash: "ri", outputSubject: subject, receipt: receiptJson("unit_completion") });
+    store.completeUnitAction({ actionId: lease(store).id, resultHash: "rs", outputSubject: subject });
+    const candidate = lease(store);
+    store.completeUnitAction({ actionId: candidate.id, resultHash: "rc", outputSubject: subject, receipt: receiptJson("candidate_evidence") });
+    const lead = lease(store);
+    store.completeGatedAction({
+      actionId: lead.id,
+      resultHash: "rl",
+      outputSubject: subject,
+      decision: gateDecision({ gateKind: "unit_acceptance", outcome: "semantic_repair_required", subject, reason: "command_exit_nonzero" }),
+    });
+
+    // The repair round produced exactly one durable event, inserted in the same
+    // transaction as the state change. The read path must expose it immediately
+    // from that durable row rather than waiting on the event's own correlated
+    // linear_outbox activity to be delivered -- delivery of that activity is a
+    // separate, independent concern from this projection converging.
+    const activityLog = store.getStructuredExecutionPublication("attempt-parent")?.activity_log ?? [];
+    expect(activityLog).toHaveLength(1);
+    expect(activityLog[0]).toMatchObject({ kind: "unit_repair", unit_id: "a", sequence: 1 });
+
+    const outboxId = db!.prepare(
+      "SELECT linear_outbox_id FROM execution_publication_events WHERE parent_attempt_id = ?"
+    ).get("attempt-parent") as { linear_outbox_id: string };
+    const outboxRow = db!.prepare("SELECT status FROM linear_outbox WHERE id = ?").get(outboxId.linear_outbox_id) as { status: string };
+    expect(outboxRow.status).toBe("pending");
   });
 });

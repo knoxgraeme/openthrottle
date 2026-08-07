@@ -32,6 +32,26 @@ revision.
 - Cutover cleanup: removed live direct-run scheduling, task adapter registry,
   standalone resume tasks, completion callback/markers, preview revival,
   repository routing fallbacks, and their production tests/configuration.
+- Stage C remediation (RU1–RU11): the structured, repository-configurable
+  `for_each_unit` graph is now admission-reachable, fenced, durably reduced,
+  and proven end-to-end by a local two-unit Docker walking skeleton (see
+  [`docs/plans/2026-07-29-001-fix-complete-structured-workflows-u2-u7-plan.md`](plans/2026-07-29-001-fix-complete-structured-workflows-u2-u7-plan.md)).
+  RU11 closes the lane: reportable child transitions durably insert an
+  ordered, sanitized child-publication event and its correlated Linear outbox
+  activity in the same transaction as the reducer write, and every terminal
+  ledger renders directly from those durable event rows -- independent of the
+  correlated outbox activity's own delivery -- so Linear/GitHub converge from
+  restart-safe records instead of a point-in-time snapshot. The repository
+  default graph remains `simple`.
+
+## Origin U8 (live credentialed dogfood)
+
+The Stage C remediation chain is now locally complete. Origin U8 — migrating
+a repository's public config/graph surface to select `structured` and running
+the first live, credentialed Linear → Fly → Daytona → GitHub dogfood
+(OPE-35) — remains explicitly out of scope for this plan and is tracked
+separately. No PR in this lane changes the repository default or claims
+hosted credential/provider acceptance.
 
 ## Acceptance gate for this PR
 

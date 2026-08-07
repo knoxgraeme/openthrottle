@@ -397,6 +397,27 @@ unacknowledged deliveries. Once steering has been leased to a run, it is sealed
 to that owning run and attempt and never crosses that boundary into a later
 actor.
 
+The structured `for_each_unit` composite stage does not support live steering
+yet. It always compiles with `live_steering: false` -- the manifest forbids
+`live_steering: true` for any executor other than a plain `agent` stage, and
+the composite stage's executor is `loop_action` -- so `canSteerPipelineRun`
+never treats a running composite stage as steerable, no matter which child
+action (unit-scoped or whole-change) is currently live underneath it. A reply
+sent while a structured run is active is always captured unbound (never fenced
+to a run) and stays pending until that run ends, at which point terminal
+cleanup cancels it; it is never delivered into any child action's sandbox.
+Capture still records the reply durably in the structured ledger's activity
+log (`steering_undelivered`) so the terminal receipt says so, rather than
+losing the fact silently, and the reply remains visible as ordinary Linear
+session activity throughout. Live steering to a specific in-progress child
+action -- fenced to that action's own attempt/request so a stale or
+cross-action reply is rejected fail-closed -- is a tracked follow-up, not
+current behavior.
+
+Outside the structured composite stage, stale session/request/subject replies
+remain audit-only under the same generation/context-revision/run fence used
+for the top-level pipeline.
+
 Native session continuation is not steering and is not a task type. It is
 selected solely by the next stage’s context policy and sealed native session id.
 
@@ -451,10 +472,63 @@ needs-human terminal outcomes do not advance the issue to completed. Projection
 delivery is idempotent and forward-only: issues already at or beyond the target,
 or manually moved to `completed` or `canceled`, are skipped. Projection delivery
 failures are logged and retried by the Linear outbox but never block the run,
-publication, provider evidence handling, or terminal acknowledgement.
+publication, provider evidence handling, or terminal acknowledgement. A Linear
+outbox row's retry is bounded (`MAX_LINEAR_OUTBOX_ATTEMPTS`): once a row keeps
+failing without its error matching a recognized dead-token pattern, it goes
+`dead` after the attempt cap rather than retrying forever, so it stops
+head-of-line-blocking later same-session rows -- including a session's own
+terminal receipt -- behind it.
 
 Published content is sanitized and bounded. Raw task logs, secret values, and
 untrusted webhook bodies are never automatically attached to Linear or a PR.
+
+### Structured child publication
+
+Each reportable child transition -- a unit repair round, a unit settling to
+`completed`/`exited`/`failed`, the whole-change final review passing or
+requesting a repair, the graph stopping, and aggregate emission -- inserts one
+row into `execution_publication_events` and its correlated `linear_outbox`
+activity row in the same SQL transaction as the durable reducer transition
+that produced it (`supervisor/src/persistence/pipeline/unit-store.ts`). Both
+rows are addressed by a deterministic id derived from the parent attempt, unit,
+and transition, so a retried transaction is a pure no-op rather than a
+duplicate or re-sanitized insert. `execution_publication_events` carries its
+own strictly increasing `sequence` per parent attempt, independent of the
+`linear_outbox` session-wide sequence, giving a restart-safe, gap-free replay
+order for the structured graph specifically.
+
+The event body is sanitized and bounded (`bounded()` in
+`supervisor/src/pipeline/execution-publication.ts`, reusing the same
+`sanitizeText` redaction used elsewhere) before either row is inserted, so
+sanitization cannot be bypassed by replaying the same transition: a replay
+either no-ops against the existing row or re-derives the identical sanitized
+body from the same inputs. Only the bounded transition summary is durably
+recorded; raw prompts, logs, and command output are never captured here.
+
+The correlated `linear_outbox` row projects and is acknowledged through the
+existing outbox processor and delivery ordering, but that delivery is an
+independent, separate concern from reading the ledger back: the structured
+ledger's restart-safe "Structured Activity Log" section (appended after the
+live per-unit status breakdown in both the Linear and GitHub publication
+bodies) renders directly from the `execution_publication_events` rows
+themselves (`listExecutionPublicationEvents`), ordered by that per-attempt
+sequence, without waiting on the correlated `linear_outbox` activity to reach
+`processed`. Because each event row is inserted in the same transaction as the
+reportable transition it reports, this converges immediately from durable
+state -- including on the very same pass that emits an event (e.g. the
+aggregate emitted alongside the terminal transition) and after a
+crash-and-restart replay -- rather than depending on a second, independent
+delivery to finish first. Every attempt whose terminal receipt is built after
+the structured stage hands off to a later stage (e.g. `publish`) still carries
+this ledger: it is resolved by `pipeline_instance_id`
+(`getStructuredExecutionPublicationForInstance`), not by whichever attempt id
+happens to be transitioning, since a later attempt in the same generation owns
+no execution graph of its own. The rendered log is capped both by count (the
+most recent 32 events) and by an explicit byte budget
+(`MAX_ACTIVITY_LOG_BYTES`), dropping the oldest entries first with an
+omitted-count note, so a long-running or repair-heavy graph's history can
+never itself consume the whole publication body and evict the findings, event
+sentence, or links rendered after it.
 
 ## Supervisor HTTP contract
 
@@ -523,7 +597,7 @@ SQLite is the authority. Core tables include:
   `pipeline_publication_receipts`, `pipeline_effect_intents`;
 - structured child execution: `execution_graphs`, `execution_units`,
   `execution_work_attempts`, `execution_gate_receipts`,
-  `execution_downstream_context`;
+  `execution_downstream_context`, `execution_publication_events`;
 - cross-run orchestration history: `orchestration_journal`;
 - operations: `repository_registrations`, `supervisor_leases`, `settings`,
   `schema_migrations`, `migration_reconciliation`.
@@ -638,6 +712,15 @@ exited, failed, or partially integrated graph never claims structured success.
 `pipeline_artifacts.kind` includes `execution_graph_result` for the child
 aggregate artifact in addition to the existing stage, review, command,
 provider, human, and publish artifacts.
+
+`execution_publication_events` records the ordered, durable child-publication
+event described in "Structured child publication" above: one row per
+reportable transition, fenced to its exact execution graph/pipeline
+instance/parent attempt, carrying a per-attempt sequence, an event `kind`
+(`unit_repair`, `unit_settled`, `graph_stopped`, `final_review`, `aggregate`,
+`steering_undelivered`),
+its sanitized body, and the id of the `linear_outbox` row it produced in the
+same transaction.
 
 ## Supervisor environment
 
