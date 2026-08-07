@@ -1089,6 +1089,12 @@ export function executeLoopAction({
   restoreIntegration = restoreIntegrationCheckout,
   integrationRepoDir = configuredIntegrationRepoDir(),
   credentialEnv = {},
+  // True when the caller resolved the sealed credential envelope and found
+  // it genuinely absent (as opposed to present but declaring zero vars).
+  // Only meaningful when the request also declares "model.invoke": a role
+  // with no declared credential scopes never has an envelope to begin with,
+  // so an absent envelope there is expected, not a failure.
+  credentialEnvelopeMissing = false,
   now = () => new Date().toISOString(),
 }) {
   const request = validateLoopRequest(rawRequest);
@@ -1103,8 +1109,26 @@ export function executeLoopAction({
   let execution;
   try {
     const invocation = resolveLoopInvocation(request);
+    // Fail closed before ever spawning the engine: a retry that finds no
+    // usable credential envelope must never launch logged-out (a silent
+    // "Not logged in" zero-token exit that then gets misdiagnosed as a
+    // generic engine crash). Reusing the empty-`stdout`/`stderr` shape below
+    // routes this through the exact same classifyLaunchFailure/outcome logic
+    // as a real launch, so it comes out `retryable_infrastructure_failure`
+    // with `reason=credential_missing` without ever running `runLoopAgent`.
+    const requiresEngineCredential = request.credentialScopes.includes("model.invoke");
     try {
-      execution = runLoopAgent({ request, invocation, integrationRepoDir, credentialEnv });
+      execution = requiresEngineCredential && credentialEnvelopeMissing
+        ? {
+          status: null,
+          signal: null,
+          timedOut: false,
+          stdout: "",
+          stderr: "",
+          nativeSessionId: request.nativeSessionId,
+          integrationRepoDir,
+        }
+        : runLoopAgent({ request, invocation, integrationRepoDir, credentialEnv });
     } catch (error) {
       // A fault raised after the engine itself ran (e.g. a session-seal or
       // profile-fence failure) carries the real engine streams on the error
@@ -1278,13 +1302,17 @@ function main() {
     actionId: request.actionId,
     rootDir: configuredActionRoot(),
   })));
-  const credentialEnv = readLoopActionCredentialEnv(credentialsPath);
+  const credentialEnvelope = readLoopActionCredentialEnv(credentialsPath);
   const outputPath = resolve(arg("--output", process.env.OT_LOOP_RESULT_FILE ?? loopResultPath({
     attemptId: request.attemptId,
     actionId: request.actionId,
     rootDir: configuredActionRoot(),
   })));
-  writeJsonAtomic(outputPath, executeLoopAction({ request, credentialEnv }));
+  writeJsonAtomic(outputPath, executeLoopAction({
+    request,
+    credentialEnv: credentialEnvelope ?? {},
+    credentialEnvelopeMissing: credentialEnvelope === null,
+  }));
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

@@ -194,10 +194,52 @@ export function classifyLaunchFailure({
   };
 }
 
+// The fields that ARE the diagnosis on Claude's final stream-json `result`
+// line. They sit at the head of that line, ahead of the (often long)
+// `result` text itself, so a byte-level tail of the whole stdout stream
+// reliably keeps only the trailing fragment of `result` and drops the rest --
+// on a long transcript that is every bit of information that matters.
+const DECISIVE_ENGINE_RESULT_FIELDS = ["subtype", "is_error", "api_error_status", "result"];
+
+// Extracted here unsanitized and untruncated -- launchDiagnosticTail sanitizes
+// the formatted prefix before ever slicing it, so a credential value never
+// gets cut in half ahead of the substring-match redaction that would
+// otherwise fail to recognize the truncated fragment.
+function decisiveEngineFieldsFromFinalResultLine(stdout) {
+  const lines = String(stdout ?? "").split(/\r?\n/);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const trimmed = lines[index].trim();
+    if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object" || parsed.type !== "result") continue;
+    const fields = {};
+    for (const key of DECISIVE_ENGINE_RESULT_FIELDS) {
+      if (parsed[key] === undefined) continue;
+      fields[key] = parsed[key];
+    }
+    return Object.keys(fields).length > 0 ? fields : null;
+  }
+  return null;
+}
+
+function formatDecisiveEngineFields(fields) {
+  return Object.entries(fields)
+    .map(([key, value]) => `${key}=${typeof value === "string" ? value : JSON.stringify(value)}`)
+    .join(" ");
+}
+
 /**
  * Bounded, sanitized tail of both engine streams. stderr leads (it is where a
  * crash lands) but stdout always keeps at least half the budget, because that
- * is where every engine writes its launch refusal.
+ * is where every engine writes its launch refusal. The decisive fields from
+ * Claude's final stream-json `result` line (subtype, is_error,
+ * api_error_status, result) are extracted and prepended first, so they
+ * survive even when the tail budget alone would cut them off.
  */
 export function launchDiagnosticTail({
   stdout = "",
@@ -209,14 +251,29 @@ export function launchDiagnosticTail({
   const cleanStderr = sanitizeArtifactText(stderr ?? "", env).trim();
   const cleanStdout = sanitizeArtifactText(stdout ?? "", env).trim();
   if (!cleanStderr && !cleanStdout) return "";
+  const decisiveFields = decisiveEngineFieldsFromFinalResultLine(stdout);
+  // Sanitize the whole formatted prefix before ever slicing it (never
+  // truncate a raw field first -- that can cut a credential value in half
+  // and defeat the sanitizer's exact substring match), then cap it to at
+  // most half the budget so an oversized/malformed engine field can never
+  // exhaust the remaining budget down to zero.
+  const decisivePrefix = decisiveFields
+    ? sanitizeArtifactText(formatDecisiveEngineFields(decisiveFields), env).trim().slice(0, Math.floor(budget / 2))
+    : "";
   const separator = " | ";
+  const remainingBudget = Math.max(0, budget - decisivePrefix.length - (decisivePrefix ? separator.length : 0));
   const stderrBudget = cleanStdout
-    ? Math.max(Math.floor(budget / 2), budget - cleanStdout.length - separator.length)
-    : budget;
-  const stderrTail = cleanStderr.slice(-Math.max(0, stderrBudget));
-  const stdoutBudget = budget - stderrTail.length - (stderrTail && cleanStdout ? separator.length : 0);
-  const stdoutTail = cleanStdout.slice(-Math.max(0, stdoutBudget));
+    ? Math.max(Math.floor(remainingBudget / 2), remainingBudget - cleanStdout.length - separator.length)
+    : remainingBudget;
+  // A zero-or-negative budget must yield an empty tail: `slice(-0)` is
+  // equivalent to `slice(0)` in JavaScript and returns the entire string,
+  // not an empty one, so `-Math.max(0, n)` cannot be used to represent "no
+  // characters" -- it must short-circuit instead.
+  const stderrTail = stderrBudget > 0 ? cleanStderr.slice(-stderrBudget) : "";
+  const stdoutBudget = remainingBudget - stderrTail.length - (stderrTail && cleanStdout ? separator.length : 0);
+  const stdoutTail = stdoutBudget > 0 ? cleanStdout.slice(-stdoutBudget) : "";
   return [
+    decisivePrefix,
     stderrTail ? `stderr: ${stderrTail}` : "",
     stdoutTail ? `stdout: ${stdoutTail}` : "",
   ].filter(Boolean).join(separator);

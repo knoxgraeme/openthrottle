@@ -44,10 +44,13 @@ function validateCredentialEnvelope(value) {
 // envelope so its bytes cannot be observed by a later action, a retained
 // failed worktree, or a subsequent read of this same action directory. Safe
 // to call more than once (idempotent after a restart): a missing envelope
-// (already consumed, or a role with no declared credential scopes) yields no
-// credentials rather than an error.
+// yields `null` rather than an error, because a missing envelope is only
+// ever legitimate for a role with no declared credential scopes (the caller,
+// which knows the request's credentialScopes, is the one that can tell that
+// apart from an engine invocation that needed a credential and never got
+// one -- this function only reports presence, never adjudicates it).
 export function readLoopActionCredentialEnv(path) {
-  if (!existsSync(path)) return {};
+  if (!existsSync(path)) return null;
   let raw;
   try {
     raw = readFileSync(path, "utf8");

@@ -50,6 +50,9 @@ import { createUnitEffectProcessor } from "./unit-effects.js";
 
 const GIT_SUBJECT = /^[a-f0-9]{40,64}$/;
 const GIT_SHA1_SUBJECT = /^[a-f0-9]{40}$/;
+// Head slice for a non-success diagnostic stored as lastError -- fits inside
+// the 2,000-char budget the store applies (unit-store.ts) with room to spare.
+const DIAGNOSTIC_TEXT_HEAD_CHARS = 1_500;
 const ACTION_OUTPUT_ORDER: Record<UnitActionKind, number> = {
   implement: 10,
   repair: 10,
@@ -954,10 +957,27 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       nativeSessionId,
       ...(decision ? { decision } : {}),
     });
-    let receipt: StandardReceipt;
-    try {
-      receipt = parseStandardReceipt(result.receipt, { source: `child_action.${action.id}.receipt` }).value;
-    } catch (error) {
+    // `result.receipt` is dual-typed by contract, but the outcomes that carry
+    // free text instead of receipt JSON differ by executor: a loop action
+    // (execute-loop.mjs) only ever produces receipt JSON on a `success`
+    // outcome -- every other outcome carries a classification head, e.g.
+    // "loop action failed (reason=credential_rejected)". A child-executor
+    // action (execute-child-action.mjs) runs a deterministic command/git
+    // operation that still produces a valid, meaningful `command_result` or
+    // `integration_evidence` receipt on a semantic `failure` (e.g. the test
+    // command exited non-zero); only its own infrastructure faults
+    // (`retryable_infrastructure_failure`) fall back to free text. Route the
+    // free-text case straight into the graded/retryable handling without ever
+    // running it through parseStandardReceipt -- that reliably fails and
+    // reports every infrastructure fault as a tautological "malformed
+    // receipt" that carries no information -- and preserve the diagnostic's
+    // head (not tail): the tail is byte-identical padding across different
+    // failure reasons, while the head is the one place the classification
+    // signal actually lives.
+    const receiptIsDiagnosticText = isChildExecutorActionKind(action.action_kind)
+      ? result.outcome === "retryable_infrastructure_failure"
+      : result.outcome !== "success";
+    if (receiptIsDiagnosticText) {
       const outcome = result.outcome === "retryable_infrastructure_failure"
         ? "retryable_infrastructure_failure"
         : result.outcome === "needs_human"
@@ -967,7 +987,19 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         terminal: true,
         resultHash: digestCanonicalJson(result),
         outcome,
-        lastError: `child action ${action.id} returned malformed ${result.outcome} receipt: ${sanitizeText(result.receipt).slice(-500)}`,
+        lastError: `${result.outcome}: ${sanitizeText(result.receipt).slice(0, DIAGNOSTIC_TEXT_HEAD_CHARS)}`,
+        nativeSessionId,
+      };
+    }
+    let receipt: StandardReceipt;
+    try {
+      receipt = parseStandardReceipt(result.receipt, { source: `child_action.${action.id}.receipt` }).value;
+    } catch (error) {
+      return {
+        terminal: true,
+        resultHash: digestCanonicalJson(result),
+        outcome: "failure",
+        lastError: `child action ${action.id} returned malformed ${result.outcome} receipt: ${sanitizeText(result.receipt).slice(0, DIAGNOSTIC_TEXT_HEAD_CHARS)}`,
         nativeSessionId,
       };
     }
