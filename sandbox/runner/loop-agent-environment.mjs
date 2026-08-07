@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmodSync, chownSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { chownSync, existsSync, writeFileSync } from "node:fs";
 import {
   chmodReadOnlyPreservingExecuteTree,
   chownTree,
@@ -7,6 +7,7 @@ import {
   isRoot,
   pathInside as containedPath,
   prepareAgentOwnedDirectory,
+  prepareExecutorOwnedProfileRoot,
   resetAgentOwnedDirectory,
 } from "./filesystem-isolation.mjs";
 import { materializeClaudeProfileBaseline, materializeCodexProfileBaseline } from "./action-home-baseline.mjs";
@@ -19,14 +20,7 @@ import { pathInside, PROFILE_ROOT_FENCE_FILE } from "./loop-paths.mjs";
 const ROOT_UID = 0;
 const ROOT_GID = 0;
 
-function prepareExecutorOwnedProfileRoot(path) {
-  if (!isRoot()) return;
-  mkdirSync(path, { recursive: true, mode: 0o555 });
-  chownSync(path, ROOT_UID, ROOT_GID);
-  chmodSync(path, 0o555);
-}
-
-function lockExecutorOwnedSkillTree(path) {
+export function lockExecutorOwnedSkillTree(path) {
   if (!existsSync(path)) return;
   if (isRoot()) chownTree(path, ROOT_UID, ROOT_GID);
   chmodReadOnlyPreservingExecuteTree(path);
@@ -66,7 +60,6 @@ function prepareActionHomeEnvironment(request, credentialEnv = {}) {
   if (request.agent === "claude") {
     const profileRoot = pathInside(home, ".claude");
     materializeClaudeProfileBaseline({ destinationHome: profileRoot });
-    lockExecutorOwnedSkillTree(pathInside(profileRoot, "skills"));
     materializeNativeSessionState({ request, profileRoot });
     prepareAgentOwnedDirectory(nativeSessionStoragePath(request.agent, profileRoot));
     if (Object.keys(selectedMcpServers).length > 0) {
@@ -75,6 +68,18 @@ function prepareActionHomeEnvironment(request, credentialEnv = {}) {
       if (mcpConfigPath) prepareRootReadOnlyDirectory(mcpDir);
     }
     prepareExecutorOwnedProfileRoot(profileRoot);
+    lockExecutorOwnedSkillTree(pathInside(profileRoot, "skills"));
+    // profileRoot's own directory ENTRY is only protected from agent
+    // rename/delete if its parent (home) also denies the agent that
+    // capability -- Unix governs unlink/rename by the parent, not the
+    // entry's own permissions, so a plain agent-owned home would let the
+    // agent replace the whole locked .claude wholesale (e.g. `mv .claude
+    // .claude-x && mkdir .claude`), sidestepping every lock above. Apply the
+    // same root-owned/agent-group/sticky-bit treatment to home now that
+    // .claude exists inside it, so the agent keeps full create access for
+    // anything else it needs directly at $HOME but cannot touch the
+    // pre-existing .claude entry it does not own.
+    prepareExecutorOwnedProfileRoot(home);
     nativeSessionProfileRoot = profileRoot;
   }
   if (request.agent === "codex") {

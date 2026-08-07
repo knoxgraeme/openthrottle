@@ -88,6 +88,44 @@ export function resetAgentOwnedDirectory(path) {
   prepareAgentOwnedDirectory(path);
 }
 
+// Non-recursive, unlike prepareAgentOwnedDirectory: chowns/chmods only `path`
+// itself. A real engine writes its own config, plugins, telemetry, and shell
+// state directly under a profile root at startup, so the root itself must be
+// writable by the agent.
+//
+// It must NOT simply be agent-owned, though: Unix governs unlink/rename of a
+// directory ENTRY by the *parent* directory's own owner+mode, never by the
+// entry's own permissions. An agent-owned parent would let the agent delete
+// or rename *any* child regardless of the child's own lock -- including a
+// root-owned, read-only-locked skills/ tree the caller places inside it
+// (lockExecutorOwnedSkillTree only protects writes *into* skills/, not the
+// "skills" directory entry itself).
+//
+// Instead this mirrors /tmp's own model: root-owned, agent-group-writable,
+// with the sticky bit set. The sticky bit lets unlink/rename of an entry
+// proceed only when the caller owns that entry OR owns the directory; the
+// agent owns neither for a root-owned child like skills/, so it is blocked
+// from touching that entry, while still getting full read/write/create
+// access to the directory (via the group bits) for its own new files -- and
+// can freely delete/replace files it created itself, since it owns those.
+export function prepareExecutorOwnedProfileRoot(path) {
+  if (!isRoot()) return;
+  // A stale agent-planted symlink at `path` would otherwise cause the
+  // chownSync/chmodSync below (which follow symlinks) to retarget whatever
+  // arbitrary location it points to, as root -- mirrors the same guard
+  // prepareAgentOwnedDirectory applies above.
+  if (existsSync(path)) {
+    const metadata = lstatSync(path);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      rmSync(path, { recursive: true, force: true });
+    }
+  }
+  const identity = identityForUser("agent");
+  mkdirSync(path, { recursive: true });
+  if (identity) chownSync(path, ROOT_UID, identity.gid);
+  chmodSync(path, 0o1770);
+}
+
 // Read-only views must keep tracked executable bits or the checkout shows
 // filemode modifications and stops being Git-clean.
 export function chmodReadOnlyPreservingExecuteTree(path) {
