@@ -303,12 +303,40 @@ describe("one-stage executor", () => {
       .toThrow(/nativeSessionId/);
     expect(stagePrompt(request, "/tmp/proposal.json")).toContain("Implement the approved fixture change.");
     expect(stagePrompt({ ...request, taskType: "investigate", capability: "ce/publish@1" }, "/tmp/proposal.json"))
-      .toMatch(/^\$investigate/);
+      .toMatch(/^\$publish/);
     expect(stagePrompt(
       { ...request, agent: "claude", capability: "ce/implement@1" },
       "/tmp/proposal.json",
       { agent: "claude" }
     )).toMatch(/^\/implement-plan/);
+  });
+
+  it("selects the stage skill from the capability, not the task type", () => {
+    const { request } = fixture();
+    const skillRoot = mkdtempSync(join(tmpdir(), "ot-stage-capability-skills-"));
+    directories.push(skillRoot);
+    for (const name of ["implement-plan", "investigate", "publish"]) {
+      mkdirSync(join(skillRoot, name), { recursive: true });
+      writeFileSync(join(skillRoot, name, "SKILL.md"), `---\nname: ${name}\n---\nFixture.\n`);
+    }
+    const prompt = (capability) => stagePrompt({ ...request, capability }, "/tmp/proposal.json", { skillRoot });
+
+    expect(prompt("ce/investigate@1")).toMatch(/^\$investigate/);
+    expect(prompt("ce/publish@1")).toMatch(/^\$publish/);
+    // review-change/simplify-change land in the adoption ticket; until their
+    // packages are installed, the capability map falls back to implement-plan
+    // rather than instructing the agent to invoke a skill nothing provides.
+    expect(prompt("ce/review@1")).toMatch(/^\$implement-plan/);
+    expect(prompt("ce/simplify@1")).toMatch(/^\$implement-plan/);
+    // ce/plan@1 is a registered capability with no drafted skill of its own;
+    // it maps explicitly to implement-plan rather than failing closed like a
+    // genuinely unmapped capability.
+    expect(prompt("ce/plan@1")).toMatch(/^\$implement-plan/);
+    expect(() => prompt("ce/unmapped@1")).toThrow(/has no mapped skill/);
+
+    mkdirSync(join(skillRoot, "review-change"), { recursive: true });
+    writeFileSync(join(skillRoot, "review-change", "SKILL.md"), "---\nname: review-change\n---\nFixture.\n");
+    expect(prompt("ce/review@1")).toMatch(/^\$review-change/);
   });
 
   it("renders the canonical adapter body for OpenCode fenced stages", () => {
@@ -1323,6 +1351,71 @@ exit 1
 
     expect(result.outcome).toBe("success");
     expect(JSON.parse(publish.payload).details.published_commit).toBe(head);
+  });
+
+  it("fails closed instead of publishing when the workspace drifts from the fenced expected subject", () => {
+    const input = publishFixture();
+    const remote = addBareOrigin(input);
+
+    expect(() => executeStage({
+      ...input,
+      runAgent: () => {
+        writeFileSync(join(input.repoDir, "drift-during-publish.txt"), "unexpected mutation\n");
+        return { exitCode: 0, proposal: successProposal(), nativeSessionId: "publish-session" };
+      },
+      now: clock(),
+    })).toThrow(/workspace subject drifted from the fenced expected subject/);
+
+    expect(execFileSync("git", ["for-each-ref", "refs/heads"], { cwd: remote, encoding: "utf8" })).toBe("");
+  });
+
+  it("fails closed instead of publishing when a publish stage has no sealed expected subject to verify against", () => {
+    const input = publishFixture();
+    const remote = addBareOrigin(input);
+    const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, expectedSubject: _expectedSubject, ...withoutFence } = input.request;
+    const unfencedRequest = { ...withoutFence, expectedSubject: null, ...createStageRequestHash({ ...withoutFence, expectedSubject: null }) };
+
+    expect(() => executeStage({
+      ...input,
+      request: unfencedRequest,
+      runAgent: () => ({ exitCode: 0, proposal: successProposal(), nativeSessionId: "publish-session" }),
+      now: clock(),
+    })).toThrow(/no sealed expected subject/);
+
+    expect(execFileSync("git", ["for-each-ref", "refs/heads"], { cwd: remote, encoding: "utf8" })).toBe("");
+  });
+
+  it("classifies a publish subject-drift fallback as semantic repair required, not generic infrastructure failure", () => {
+    // The drift fence throws the same way an executor crash would, but it
+    // means something different: a repair-worthy defect (an unauthorized or
+    // unreviewed tree), not a transient infrastructure fault. A generic
+    // retryable_infrastructure_failure classification would retry against an
+    // already-drifted, unrecoverable workspace and exhaust into a silent
+    // `failed` terminal instead of routing to review/repair.
+    const input = publishFixture();
+    addBareOrigin(input);
+    let caught;
+    try {
+      executeStage({
+        ...input,
+        runAgent: () => {
+          writeFileSync(join(input.repoDir, "drift-during-publish.txt"), "unexpected mutation\n");
+          return { exitCode: 0, proposal: successProposal(), nativeSessionId: "publish-session" };
+        },
+        now: clock(),
+      });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeTruthy();
+
+    const event = fallbackStageResultEvent({ request: input.request, repoDir: input.repoDir, error: caught });
+
+    expect(event.outcome).toBe("semantic_repair_required");
+    const stageResult = event.artifacts.find((artifact) => artifact.kind === "stage_result");
+    const payload = JSON.parse(stageResult.payload);
+    expect(payload.result).toBe("semantic_repair_required");
+    expect(payload.repository.pre_subject).toBe(input.request.expectedSubject);
   });
 
   it("makes a malformed publish-success proposal retryable even when the exact branch exists", () => {
