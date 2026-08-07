@@ -302,8 +302,21 @@ describe("one-stage executor", () => {
     expect(() => validateStageRequest({ ...slashNativeSessionRequest, ...createStageRequestHash(slashNativeSessionRequest) }))
       .toThrow(/nativeSessionId/);
     expect(stagePrompt(request, "/tmp/proposal.json")).toContain("Implement the approved fixture change.");
-    expect(stagePrompt({ ...request, taskType: "investigate", capability: "ce/publish@1" }, "/tmp/proposal.json"))
-      .toMatch(/^\$publish/);
+    // The default skillRoot ("/opt/openthrottle/skills/tasks") only exists
+    // inside the baked sandbox image, not a bare CI checkout -- publish is
+    // mapped to a real skill name distinct from the existsSync fallback
+    // (implement-plan), so this assertion needs its own hermetic skillRoot
+    // to prove capability-keyed selection rather than depend on ambient
+    // filesystem state that differs between environments.
+    const publishSkillRoot = mkdtempSync(join(tmpdir(), "ot-stage-publish-skill-"));
+    directories.push(publishSkillRoot);
+    mkdirSync(join(publishSkillRoot, "publish"), { recursive: true });
+    writeFileSync(join(publishSkillRoot, "publish", "SKILL.md"), "---\nname: publish\n---\nFixture.\n");
+    expect(stagePrompt(
+      { ...request, taskType: "investigate", capability: "ce/publish@1" },
+      "/tmp/proposal.json",
+      { skillRoot: publishSkillRoot },
+    )).toMatch(/^\$publish/);
     expect(stagePrompt(
       { ...request, agent: "claude", capability: "ce/implement@1" },
       "/tmp/proposal.json",
