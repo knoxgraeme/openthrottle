@@ -187,6 +187,17 @@ function withFreshLoopFence(loopRequest, overrides = {}) {
   return validateLoopRequest({ ...withoutFence, ...createLoopRequestHash(withoutFence) });
 }
 
+// The pre-launch sealed-skill preflight (item 3, OPE-104) issues its own
+// "test -r" gosu call before the real engine launch. Tests that simulate
+// tampering during the launch call wrap their attack body with this so the
+// preflight passes through untouched and the attack still happens exactly
+// once, on the real launch call.
+function passThroughSealedSkillPreflight(onLaunch) {
+  return (command, args) => (args[1] === "test"
+    ? { status: 0, signal: null, timedOut: false, stdout: "", stderr: "" }
+    : onLaunch(command, args));
+}
+
 function sessionEventFixture(agent, nativeSessionId) {
   if (agent === "claude") return `{"type":"system","session_id":"${nativeSessionId}"}\n`;
   if (agent === "codex") return `{"type":"thread.started","thread_id":"${nativeSessionId}"}\n`;
@@ -1290,11 +1301,11 @@ describe("loop action request validation", () => {
         integrationRepoDir: "/tmp/integration",
         lockIntegration: () => true,
         processFence: (execute) => execute(),
-        runProcess: () => {
+        runProcess: passThroughSealedSkillPreflight(() => {
           rmSync(profileRoot, { recursive: true, force: true });
           mkdirSync(profileRoot, { recursive: true });
           return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
-        },
+        }),
       });
     } catch (caught) {
       error = caught;
@@ -1325,11 +1336,11 @@ describe("loop action request validation", () => {
         integrationRepoDir: "/tmp/integration",
         lockIntegration: () => true,
         processFence: (execute) => execute(),
-        runProcess: () => {
+        runProcess: passThroughSealedSkillPreflight(() => {
           rmSync(profileRoot, { recursive: true, force: true });
           mkdirSync(profileRoot, { recursive: true });
           return { status: 1, signal: null, timedOut: false, stdout: "", stderr: "engine crashed" };
-        },
+        }),
       });
     } catch (caught) {
       error = caught;
@@ -1363,7 +1374,7 @@ describe("loop action request validation", () => {
         integrationRepoDir: "/tmp/integration",
         lockIntegration: () => true,
         processFence: (execute) => execute(),
-        runProcess: () => {
+        runProcess: passThroughSealedSkillPreflight(() => {
           // chmod is test-harness plumbing, not part of the attack: BSD/macOS
           // rename(2) additionally requires write permission on the directory
           // being renamed, while Linux (where the sandbox runs) needs only
@@ -1373,7 +1384,7 @@ describe("loop action request validation", () => {
           chmodSync(skillTree, 0o700);
           renameSync(skillTree, `${skillTree}-attack`);
           return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
-        },
+        }),
       });
     } catch (caught) {
       error = caught;
@@ -1404,14 +1415,14 @@ describe("loop action request validation", () => {
         integrationRepoDir: "/tmp/integration",
         lockIntegration: () => true,
         processFence: (execute) => execute(),
-        runProcess: () => {
+        runProcess: passThroughSealedSkillPreflight(() => {
           chmodSync(skillTree, 0o700);
           renameSync(skillTree, `${skillTree}-attack`);
           mkdirSync(skillTree, { recursive: true, mode: 0o700 });
           const identity = identityForUser("agent");
           if (identity) chownSync(skillTree, identity.uid, identity.gid);
           return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
-        },
+        }),
       });
     } catch (caught) {
       error = caught;
@@ -1419,6 +1430,89 @@ describe("loop action request validation", () => {
 
     expect(error?.message).toMatch(/executor-sealed skill tree was replaced/);
     expect(error?.retryableInfrastructureFailure).toBe(true);
+  });
+
+  it("raises a retryable infrastructure failure before launch when the sealed Claude skill is not readable by the agent uid", () => {
+    const valid = validateLoopRequest(request({ agent: "claude" }));
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+    directories.push(actionRoot);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+
+    let error;
+    let launchCalled = false;
+    try {
+      runLoopAgentInPreparedRepository({
+        request: valid,
+        invocation: resolveLoopInvocation(valid),
+        integrationRepoDir: "/tmp/integration",
+        lockIntegration: () => true,
+        processFence: (execute) => execute(),
+        runProcess: (_command, args) => {
+          expect(args).toEqual(["agent", "test", "-r", expect.stringContaining("skills/implement-unit/SKILL.md")]);
+          launchCalled = true;
+          return { status: 1, signal: null, timedOut: false, stdout: "", stderr: "" };
+        },
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(launchCalled).toBe(true);
+    expect(error?.message).toMatch(/sealed skill implement-unit is not readable/);
+    expect(error?.retryableInfrastructureFailure).toBe(true);
+  });
+
+  it("never launches the engine once the sealed-skill preflight fails", () => {
+    const valid = validateLoopRequest(request({ agent: "claude" }));
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+    directories.push(actionRoot);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+    let preflightCalls = 0;
+
+    expect(() => runLoopAgentInPreparedRepository({
+      request: valid,
+      invocation: resolveLoopInvocation(valid),
+      integrationRepoDir: "/tmp/integration",
+      lockIntegration: () => true,
+      processFence: (execute) => {
+        throw new Error("the engine must never be launched once the preflight has failed closed");
+      },
+      runProcess: (_command, args) => {
+        if (args[1] === "test") {
+          preflightCalls += 1;
+          return { status: 1, signal: null, timedOut: false, stdout: "", stderr: "" };
+        }
+        throw new Error("unexpected launch-shaped runProcess call");
+      },
+    })).toThrow(/sealed skill implement-unit is not readable/);
+
+    expect(preflightCalls).toBe(1);
+  });
+
+  it("skips the sealed-skill preflight for a built-in Codex skill, which is discovered at the separate admin-scope root", () => {
+    // materializeCodexProfileBaseline never copies a "skills" tree into the
+    // action-scoped codex profile root -- built-in Codex skills live at
+    // /etc/codex/skills instead (see sandbox/Dockerfile), so a preflight
+    // check against <profileRoot>/skills/<skill>/SKILL.md would always be a
+    // false positive here.
+    const valid = validateLoopRequest(request({ agent: "codex", skill: "implement-unit" }));
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+    directories.push(actionRoot);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+
+    const result = runLoopAgentInPreparedRepository({
+      request: valid,
+      invocation: resolveLoopInvocation(valid),
+      integrationRepoDir: "/tmp/integration",
+      lockIntegration: () => true,
+      processFence: (execute) => execute(),
+      runProcess: (_command, args) => {
+        if (args[1] === "test") throw new Error("the preflight must not run for a built-in Codex skill");
+        return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+      },
+    });
+
+    expect(result.status).toBe(0);
   });
 
   it("does not return a freshly reported but unsealed native session id when the engine did not exit cleanly", () => {
@@ -1631,6 +1725,47 @@ describe("loop action request validation", () => {
     })).toThrow(/unsafe system directory/);
   });
 
+  it("rejects a symlinked attempt directory before chown/chmod ever follows it to its target, as a retryable infrastructure fault", () => {
+    // Mirrors worktrees.test.mjs's "rejects a symlinked worktree root..."
+    // test: ensureCurrentActionTraversal shares the same
+    // ensureTraverseOnlyDirectory guard (filesystem-isolation.mjs), which
+    // must validate a path is a real directory before chown/chmod ever
+    // follow a symlink to its target. configuredActionRoot() only validates
+    // the top-level rootDir itself, so the attempt/action subdirectories --
+    // created fresh on demand -- are this guard's real attack surface.
+    const valid = validateLoopRequest(request());
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+    directories.push(actionRoot);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+    const attackTarget = mkdtempSync(join(tmpdir(), "ot-loop-actions-attack-target-"));
+    directories.push(attackTarget);
+    chmodSync(attackTarget, 0o755);
+    symlinkSync(attackTarget, join(actionRoot, valid.attemptId));
+
+    let error;
+    try {
+      runLoopAgentInPreparedRepository({
+        request: valid,
+        invocation: resolveLoopInvocation(valid),
+        integrationRepoDir: "/tmp/integration",
+        lockIntegration: () => true,
+        processFence: (execute) => execute(),
+        runProcess: () => {
+          throw new Error("the engine must never be launched once directory-prep integrity fails");
+        },
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error?.message).toMatch(/attempt directory must be a real directory/);
+    expect(error?.retryableInfrastructureFailure).toBe(true);
+    // The attacker-controlled symlink target must never be touched: if the
+    // guard ran after chown/chmod instead of before, this mode would
+    // already be 0711.
+    expect(statSync(attackTarget).mode & 0o777).toBe(0o755);
+  });
+
   it("materializes only the current sealed repository skill under the action discovery root", () => {
     for (const agent of ["claude", "codex"]) {
       const baseRequest = repositorySkillRequest();
@@ -1650,14 +1785,23 @@ describe("loop action request validation", () => {
           const actionDirectory = join(actionRoot, valid.attemptId, valid.actionId);
           const home = join(actionDirectory, "home");
           const codexHome = join(actionDirectory, "codex");
+          const skillRoot = agent === "claude"
+            ? join(home, ".claude", "skills", valid.repositorySkill.invocation)
+            : join(codexHome, "skills", valid.repositorySkill.invocation);
+          // The pre-launch sealed-skill preflight (item 3, OPE-104) runs its
+          // own "test -r" gosu call before the main launch call this test
+          // otherwise asserts against; assert it resolves the correct path
+          // for both agents (this is the only test exercising the preflight
+          // for codex + a repository skill) and let it pass through.
+          if (args[1] === "test") {
+            expect(args).toEqual(["agent", "test", "-r", join(skillRoot, "SKILL.md")]);
+            return { status: 0, signal: null, timedOut: false, stdout: "", stderr: "" };
+          }
           expect(args).toContain(`OT_OUTBOX_DIR=${join(actionDirectory, "outbox")}`);
           expect(args).toContain(`OT_INBOX_DIR=${join(actionDirectory, "inbox")}`);
           expect(args).toContain(`OT_INBOX_PROCESSED_DIR=${join(actionDirectory, "inbox-processed")}`);
           expect(args).toContain(`OT_NATIVE_SESSION_DIR=${join(actionDirectory, "native-session")}`);
           expect(args).toContain(`HOME=${home}`);
-          const skillRoot = agent === "claude"
-            ? join(home, ".claude", "skills", valid.repositorySkill.invocation)
-            : join(codexHome, "skills", valid.repositorySkill.invocation);
           if (agent === "codex") expect(args).toContain(`CODEX_HOME=${codexHome}`);
           if (agent !== "codex") expect(args.some((entry) => entry.startsWith("CODEX_HOME="))).toBe(false);
           expect(readFileSync(join(skillRoot, "SKILL.md"), "utf8")).toContain("pinned repository package");
@@ -2742,6 +2886,37 @@ describe("executeLoopAction", () => {
     expect(result.receipt).toContain("stdout: ");
     expect(result.receipt).not.toContain("claude-oauth-secret-value");
     expect(result.receipt).toContain("[REDACTED]");
+  });
+
+  it("classifies a clean-exit unregistered-command answer as a retryable infrastructure failure, never success or plain failure", () => {
+    // OPE-104: the untraversable-sandbox-root trap made Claude silently
+    // register zero skills and exit 0 answering "Unknown command: /...". A
+    // status-0 exit must not be enough on its own to reach the ordinary
+    // receipt-parsing/success path for this exact shape.
+    const unregisteredCommand = JSON.stringify({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "Unknown command: /implement-unit",
+    });
+    const result = executeLoopActionWithIntegration({
+      request: request({ agent: "claude" }),
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      runLoopAgent: () => ({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: `${JSON.stringify({ type: "system", subtype: "init" })}\n${unregisteredCommand}`,
+        stderr: "",
+        nativeSessionId: null,
+        integrationRepoDir: "/tmp/integration-current",
+      }),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+    expect(result.receipt).toContain("reason=unregistered_command");
   });
 
   it("rejects successful loop exits without a valid standard receipt", () => {

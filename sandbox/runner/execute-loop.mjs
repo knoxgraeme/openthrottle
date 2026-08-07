@@ -15,6 +15,8 @@ import {
   chmodReadOnlyPreservingExecuteTree,
   chmodTree,
   chownTree,
+  ensureSandboxRootTraversal,
+  ensureTraverseOnlyDirectory,
   identityForUser,
   isRoot,
   lockPersistentAgentPrivateRoots,
@@ -30,6 +32,7 @@ import {
   classifyLaunchFailure,
   engineCredentialPresent,
   engineExitedCleanly,
+  isUnregisteredCommandResult,
   launchDiagnosticTail,
 } from "./launch-failure.mjs";
 import { prepareLoopAgentEnvironment } from "./loop-agent-environment.mjs";
@@ -298,18 +301,20 @@ export function loopCredentialsPath({ attemptId, actionId, rootDir = DEFAULT_ACT
   return actionFilePath({ attemptId: stagePathId(attemptId, "attemptId"), actionId: stagePathId(actionId, "actionId"), rootDir }, "credentials.json");
 }
 
-function ensureTraverseOnly(path) {
-  mkdirSync(path, { recursive: true, mode: 0o711 });
-  if (isRoot()) chownSync(path, ROOT_UID, ROOT_GID);
-  chmodSync(path, 0o711);
-}
-
 function ensureCurrentActionTraversal(request, rootDir = configuredActionRoot()) {
   const attemptDirectory = pathInside(rootDir, request.attemptId);
   const currentActionDirectory = actionDirectory(request, rootDir);
-  ensureTraverseOnly(rootDir);
-  ensureTraverseOnly(attemptDirectory);
-  ensureTraverseOnly(currentActionDirectory);
+  try {
+    ensureSandboxRootTraversal(rootDir);
+    ensureTraverseOnlyDirectory(rootDir, "loop action root");
+    ensureTraverseOnlyDirectory(attemptDirectory, "attempt directory");
+    ensureTraverseOnlyDirectory(currentActionDirectory, "action directory");
+  } catch (error) {
+    // Executor-owned directory-prep integrity, not an agent defect (same
+    // reasoning as assertProfileRootFence below): a symlink swap or
+    // filesystem fault here must never consume a semantic repair round.
+    throw retryableInfrastructureError(error instanceof Error ? error.message : String(error));
+  }
   return currentActionDirectory;
 }
 
@@ -720,10 +725,18 @@ function prepareLoopRepository(request, integrationRepoDir = INTEGRATION_REPO_DI
   ensureCurrentActionTraversal(request);
   if (request.worktree) {
     lockNonCurrentActionDirectories(request);
-    return grantWorktreeToAgent({
-      rootDir: process.env.OT_WORKTREE_ROOT ?? DEFAULT_WORKTREE_ROOT,
-      handle: request.worktree.id,
-    }).path;
+    try {
+      return grantWorktreeToAgent({
+        rootDir: process.env.OT_WORKTREE_ROOT ?? DEFAULT_WORKTREE_ROOT,
+        handle: request.worktree.id,
+      }).path;
+    } catch (error) {
+      // Same reasoning as ensureCurrentActionTraversal above: the worktree
+      // was already created by the executor's own createWorktree flow, so a
+      // missing handle, a symlink swap, or any other integrity failure here
+      // is executor-owned, never an agent defect.
+      throw retryableInfrastructureError(error instanceof Error ? error.message : String(error));
+    }
   }
   return createReadOnlyRepositoryView(request, integrationRepoDir);
 }
@@ -863,6 +876,37 @@ function readCodexAuthSnapshot(codexHome, runProcess) {
   return blob;
 }
 
+// OPE-101/OPE-104: an untraversable sandbox root let the engine launch
+// without ever being able to resolve its own skill discovery root, so it
+// silently registered zero skills, answered `Unknown command: /...`, and
+// exited 0 with no evidence of the real cause. Verified as the agent uid
+// (never root, which bypasses DAC permission checks and would never observe
+// the traversal-denied failure this exists to catch) so this fails closed
+// before the engine ever launches, instead of after it has already produced
+// an undiagnosable silent failure. Only checked where the sealed skill is
+// actually expected to be materialized under the profile root: always for
+// Claude (both built-in and repository skills land in
+// <profileRoot>/skills/), and for Codex only when a repository skill was
+// materialized there too -- a built-in Codex skill lives at the separate
+// admin-scope /etc/codex/skills instead, so this must not fire for that case.
+function assertSealedSkillPreflight({ request, profileRoot, runProcess }) {
+  if (request.agent !== "claude" && !request.repositorySkill) return;
+  const skillMarkdownPath = pathInside(pathInside(pathInside(profileRoot, "skills"), request.skill), "SKILL.md");
+  let result;
+  try {
+    result = runProcess("gosu", ["agent", "test", "-r", skillMarkdownPath], { timeout: 5_000 });
+  } catch (error) {
+    throw retryableInfrastructureError(
+      `sealed skill preflight for ${request.skill} could not run: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (result.error || result.status !== 0) {
+    throw retryableInfrastructureError(
+      `sealed skill ${request.skill} is not readable by the agent uid before launch (${skillMarkdownPath})`,
+    );
+  }
+}
+
 export function runLoopAgentInPreparedRepository({
   request,
   invocation,
@@ -889,6 +933,7 @@ export function runLoopAgentInPreparedRepository({
     const preparedEnvironment = prepareLoopAgentEnvironment(request, repoDir, credentialEnv);
     const built = loopAgentCommand({ request, invocation, repoDir, mcpConfigPath: preparedEnvironment.mcpConfigPath });
     makeCurrentActionDirectoryTraverseOnly(request);
+    assertSealedSkillPreflight({ request, profileRoot: preparedEnvironment.nativeSessionProfileRoot, runProcess });
     const result = processFence(() => runProcess("gosu", [
       "agent", "env", ...preparedEnvironment.env, built.command, ...built.args,
     ], {
@@ -1200,8 +1245,13 @@ export function executeLoopAction({
     // credential, provider usage limit, or a genuine crash) and carry a
     // bounded, sanitized tail of both streams into the receipt. Without this
     // every launch failure reaches the ledger as one indistinguishable line.
+    // An unregistered-command answer is included even on a clean (status 0)
+    // exit: OPE-104 showed that trap silently registers zero skills and
+    // exits 0 with no other symptom, so it must never fall through to the
+    // ordinary receipt-parsing/"success" path below on exit code alone.
     const engineFailed = !retryableInfrastructureFailure && !execution.executorFailure &&
-      (execution.timedOut || Boolean(execution.signal) || execution.status !== 0);
+      (execution.timedOut || Boolean(execution.signal) || execution.status !== 0 ||
+        isUnregisteredCommandResult(execution.stdout));
     const launchFailure = engineFailed
       ? classifyLaunchFailure({
         agent: request.agent,

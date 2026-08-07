@@ -12,6 +12,11 @@ const PERSISTENT_AGENT_PRIVATE_ROOTS = [
   "/home/agent/.ot",
 ];
 const PERSISTENT_PROFILE_PARENT = "/home/agent";
+// The sandbox root. The Daytona bootstrap creates it root:root 0700
+// (MkdirAll stamps that mode on every created parent), so the agent uid
+// cannot resolve an absolute path through it unless something grants it
+// traversal -- see ensureSandboxRootTraversal below.
+const OPENTHROTTLE_ROOT = "/var/lib/openthrottle";
 
 export function pathInside(root, child, errorMessage) {
   const rootPath = resolve(root);
@@ -41,6 +46,29 @@ export function chmodOwnerPrivateTree(path) {
 
 export function isRoot() {
   return typeof process.getuid === "function" && process.getuid() === 0;
+}
+
+// Grants traverse-only (0711, execute-not-read) access on a directory that
+// must remain a real directory, never a symlink. Validates before mutating:
+// mkdirSync silently accepts a path that already exists as a symlink to a
+// directory, and chownSync/chmodSync both follow symlinks, so checking here
+// -- before either runs -- stops a symlink swap from ever receiving root's
+// privileged chown/chmod on whatever it points at.
+export function ensureTraverseOnlyDirectory(path, label) {
+  mkdirSync(path, { recursive: true, mode: 0o711 });
+  const metadata = lstatSync(path);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error(`${label} must be a real directory`);
+  if (isRoot()) chownSync(path, ROOT_UID, ROOT_GID);
+  chmodSync(path, 0o711);
+}
+
+// Only the real sandbox root needs this extra hop: a configured root that
+// points elsewhere (a test/temp directory) has no untraversable parent to
+// grant here, and this must never touch an unrelated system path.
+export function ensureSandboxRootTraversal(rootDir) {
+  if (rootDir === OPENTHROTTLE_ROOT || rootDir.startsWith(`${OPENTHROTTLE_ROOT}/`)) {
+    ensureTraverseOnlyDirectory(OPENTHROTTLE_ROOT, "sandbox root");
+  }
 }
 
 export function identityForUser(name) {
