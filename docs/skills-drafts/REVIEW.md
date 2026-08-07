@@ -431,3 +431,64 @@ test passes trivially — the referenced set is now empty.
   `final-review`.
 - Replace the CE-token *requirements* with a CE-token *prohibition* over
   `allSkillsText()` using `\bce-[a-z][a-z-]*[a-z]\b` (not a bare `ce-`).
+- Assert every `references/*.md` file resolves from the pointer line in its
+  `SKILL.md`, and that the two duplicated reference files are byte-identical
+  across their pairs (see §5).
+
+---
+
+## 5. References tier
+
+The single-`SKILL.md` distillation dropped the reference-file depth the audit
+priced as the largest fork cost (`skill-audit.md` §6, *What full ownership
+costs*, items 1, 2 and 4). Nine files restore it. Each is **craft only** — no
+fence, receipt, budget, or gate material, so there is no second copy of anything
+in §3 to drift.
+
+| Skill | File | Lines | Restores |
+|---|---|---|---|
+| `final-review` | `references/review-lens-passes.md` | 200 | The reviewer-persona set, converted to serial lens passes: correctness, failure handling, untrusted input/authorization, composition-and-sequence (the adversarial brief's assumption/composition/cascade/abuse techniques), regression + API-contract, type-and-invariant design, cost-and-scale, test proof |
+| `final-review` | `references/finding-quality.md` | 139 | The synthesis pipeline's judgment layer: the quote-the-line gate, the confidence-anchor rubric re-expressed as an honesty ladder, the false-positive suppression catalog, the `suggested_fix` commitment rule, and the observable-behaviour-first message shape — plus worked stable-identity examples for the design in §2 F20/`accept-unit` RATIONALE |
+| `review-change` | `references/branch-review-passes.md` | 140 | Branch-scope variant of the same passes, mapped onto this skill's six lenses, plus the primary/secondary/pre-existing tier rule and per-mode (fresh / repair / post-simplify) adjustment |
+| `accept-unit` | `references/acceptance-judgment.md` | 124 | The PR-feedback evaluation rubric inverted for an acceptance gate: criteria classification, read-depth tiers, default-to-accept with explicit tripwires, accept-with-note, and the one-round revision-request shape |
+| `implement-unit` | `references/implementation-discipline.md` | 146 | The implementation evidence discipline: read-before-write, test discovery, the test-scenario-completeness matrix, the system-wide "trace two levels out" check, verify-as-you-go — plus the debug skill's reproduce ladder, hypothesis-invalidation rule, and shortcut-signal list |
+| `repair-unit` | `references/implementation-discipline.md` | 146 | **Byte-identical copy** of the above (same reason as the §3 canonical blocks: separate packages, separate sessions) |
+| `simplify-unit` | `references/simplification-heuristics.md` | 95 | The three simplification reviewer briefs expanded with before/after patterns and a per-pattern over-simplification counterweight, the safety-property prohibition, and the four-point per-edit behaviour check |
+| `simplify-change` | `references/simplification-heuristics.md` | 95 | **Byte-identical copy** of the above |
+| `investigate` | `references/diagnostic-method.md` | 115 | The diagnosis loop expanded: reproduce (including non-reproducing and order-pollution techniques, and repro minimization), isolate (environment sanity, backward tracing, multi-component boundary instrumentation, the observer-effect rule), root-cause (assumption audit, grounding observations, causal-chain gate, prediction quality, stuck-diagnosis table, bug-class checklist), and an explicit evidence bar for the report |
+
+**Total: 1,200 lines** (1,041 unique + 159 duplicated across the two pairs).
+
+### `SKILL.md` deltas
+
+One pointer line per reference, added inside an existing non-canonical
+paragraph or immediately after a non-canonical list. No canonical block in §3
+was touched.
+
+| Skill | Before | After | Δ | Section |
+|---|---|---|---|---|
+| `final-review` | 142 | 144 | +2 | Review lenses; Severity and finding identity |
+| `review-change` | 119 | 120 | +1 | Lenses |
+| `accept-unit` | 135 | 136 | +1 | Deciding |
+| `implement-unit` | 142 | 144 | +2 | Implementation discipline |
+| `repair-unit` | 141 | 142 | +1 | Establish the failure before you change anything |
+| `simplify-unit` | 130 | 131 | +1 | What to look for |
+| `simplify-change` | 115 | 117 | +2 | Lenses |
+| `investigate` | 119 | 120 | +1 | Method |
+
+`final-repair` (132), `implement-plan` (111) and `publish` (137) are unchanged.
+
+### Skills deliberately given no reference file
+
+- **`final-repair`** — its craft is the per-finding disposition loop, which is
+  contract-shaped and already stated in the body. The implementation half is
+  covered by material it would have to duplicate from `implement-unit`.
+- **`implement-plan`** — the same implementation discipline applies, but a third
+  byte-identical copy of one file is a worse trade than the pointer it would
+  carry. If the delivery question below resolves in favour of shared
+  subdirectories, point it at the same file rather than copying.
+- **`publish`** — the genuine remaining depth in the upstream publication skill
+  is PR-plumbing correctness (fork `--head` traps, multi-fork disambiguation,
+  `--body-file` never-stdin, unknown-vs-none PR state). Most of it is already in
+  the draft body, and the rest is contract material, which this tier excludes by
+  rule. Padding it would add a drift surface for no craft gain.

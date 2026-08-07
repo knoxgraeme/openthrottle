@@ -53,6 +53,7 @@ Name the failure in one sentence before editing. In order of preference:
 
 If you still cannot state what failed, do not guess and do not rewrite the unit:
 return `needs_human` with the question.
+For the full method, read `references/implementation-discipline.md`.
 
 ## Repair scope
 

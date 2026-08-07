@@ -80,6 +80,8 @@ Do this unit. Do not do the next one.
    against the tree you leave behind — do not run whole-repository suites to
    preempt them, and record only checks you actually ran, with real outcomes.
 
+For the full method, read `references/implementation-discipline.md`.
+
 ## The receipt
 
 Your final message must be exactly one `openthrottle.receipt/v1` JSON object

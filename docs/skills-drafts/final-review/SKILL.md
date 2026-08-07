@@ -76,6 +76,7 @@ the mocks; behavioral change with no test work at all.
 Out of scope everywhere: naming and style opinions, trivial accessors, test-style
 preferences, coverage percentages, speculative performance work, defensive checks
 for impossible conditions, untouched code, and pre-existing problems.
+For the full lens-pass checklists, read `references/review-lens-passes.md`.
 
 ## Severity and finding identity
 
@@ -89,6 +90,7 @@ style nit is never `P0`; a silent data-corruption path is never `P2`.
 **Anchor every `P0` and `P1`.** Name the file in `path` and, in `message`, quote
 the exact construct that makes the finding true. If you cannot point at specific
 code in *this* subject, it is not blocking — downgrade or drop it.
+For severity and finding calibration, read `references/finding-quality.md`.
 
 Open every `message` with a content-derived identity, so the same defect stays
 recognizable after a repair moves it:

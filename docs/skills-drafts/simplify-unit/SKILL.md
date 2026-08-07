@@ -65,6 +65,7 @@ queries inside a loop, independent operations forced into sequence, new work on
 a hot path, unbounded accumulation, reads broader than the need. Logic at the
 wrong level: a detail surfacing in a coordinating layer, a policy buried in a
 leaf.
+For the full heuristics, read `references/simplification-heuristics.md`.
 
 ## What not to do
 
