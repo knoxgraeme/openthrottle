@@ -1,6 +1,6 @@
 import { canonicalJson, digestNormalized } from "./manifest.js";
 import { coordinatePipelineEvent } from "./coordinator.js";
-import type { PipelineInstance, PipelineStore } from "./store.js";
+import type { PipelineInstance, PipelineStageAttempt, PipelineStore } from "./store.js";
 
 const TERMINAL_STATUSES = new Set([
   "shipped",
@@ -52,11 +52,14 @@ export function canSteerPipelineRun(input: {
   sessionId: string;
   runId: string | null;
   agent: "claude" | "codex" | "opencode";
+  // Callers that already fetched the active attempt for another purpose in
+  // the same request may pass it here to avoid a redundant store lookup.
+  attempt?: PipelineStageAttempt;
 }): boolean {
   if (!input.runId || input.agent === "opencode") return false;
   const instance = input.store.getInstanceForSession(input.sessionId);
   if (!instance || instance.status !== "running") return false;
-  const attempt = input.store.getActiveAttempt(instance.id);
+  const attempt = input.attempt ?? input.store.getActiveAttempt(instance.id);
   if (!attempt || attempt.run_id !== input.runId || attempt.status !== "running") return false;
   const request = input.store.getStageRequest(attempt.id);
   return request.runId === input.runId && request.liveSteering;

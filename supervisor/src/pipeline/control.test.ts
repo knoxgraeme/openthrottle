@@ -120,6 +120,33 @@ describe("canSteerPipelineRun", () => {
     })).toBe(true);
   });
 
+  it("uses a caller-supplied attempt instead of re-querying, and actually consults it rather than ignoring it", () => {
+    const { pipelines, tickets, instance, attempt } = setup();
+    const runId = attempt.planned_run_id!;
+    dispatch(pipelines, tickets, instance, attempt, runId);
+    const liveAttempt = pipelines.getActiveAttempt(instance.id)!;
+
+    expect(canSteerPipelineRun({
+      store: pipelines,
+      sessionId: instance.linear_session_id,
+      runId,
+      agent: "codex",
+      attempt: liveAttempt,
+    })).toBe(true);
+
+    // A store fresh-query for this instance would still find the live
+    // attempt above and return true; passing a stale attempt object proves
+    // the supplied attempt is actually consulted, not silently ignored in
+    // favor of an internal re-query.
+    expect(canSteerPipelineRun({
+      store: pipelines,
+      sessionId: instance.linear_session_id,
+      runId,
+      agent: "codex",
+      attempt: { ...liveAttempt, run_id: "stale-run-id-from-a-prior-child" },
+    })).toBe(false);
+  });
+
   it("rejects a reply carrying a stale run id even while the current child is live", () => {
     const { pipelines, tickets, instance, attempt } = setup();
     const runId = attempt.planned_run_id!;
