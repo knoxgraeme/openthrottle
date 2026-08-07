@@ -6,6 +6,13 @@ const RATIONALE_LIMIT = 1_000;
 const MAX_ACTIONS_PER_UNIT = 3;
 const MAX_CONTEXT_PER_UNIT = 3;
 
+export interface ExecutionPublicationActivityEvent {
+  sequence: number;
+  kind: string;
+  unit_id: string | null;
+  body: string;
+}
+
 export interface ExecutionPublicationSnapshot {
   graph: {
     id: string;
@@ -18,6 +25,12 @@ export interface ExecutionPublicationSnapshot {
     stop_reason: string | null;
   };
   units: ExecutionPublicationUnit[];
+  // Restart-safe, ordered activity history sourced from acknowledged durable
+  // child-publication events (RR18/RAE7) -- distinct from `units`, which is a
+  // live snapshot of current state. Empty until the outbox has delivered and
+  // acknowledged at least one event. Optional: envelopes persisted before this
+  // field existed round-trip through parsePipelinePublication without it.
+  activity_log?: ExecutionPublicationActivityEvent[];
 }
 
 export interface ExecutionPublicationUnit {
@@ -98,9 +111,10 @@ export interface ExecutionPublicationInput {
     payload: string;
     payload_hash: string;
   }[];
+  activityLog?: readonly ExecutionPublicationActivityEvent[];
 }
 
-function bounded(value: string | null | undefined, limit = TEXT_LIMIT): string | null {
+export function bounded(value: string | null | undefined, limit = TEXT_LIMIT): string | null {
   if (value == null) return null;
   const sanitized = sanitizeText(value)
     .replace(/[\r\n\t]+/g, " ")
@@ -203,6 +217,12 @@ export function buildExecutionPublicationSnapshot(
         payload_hash: context.payload_hash,
       })),
     })),
+    activity_log: (input.activityLog ?? []).map((event) => ({
+      sequence: event.sequence,
+      kind: event.kind,
+      unit_id: event.unit_id,
+      body: bounded(event.body) ?? "",
+    })),
   };
 }
 
@@ -224,6 +244,17 @@ export function executionLedgerLines(snapshot: ExecutionPublicationSnapshot | un
     lines.push(
       `Whole change: subject${shortSubject(snapshot.graph.integration_subject)}; aggregate=${snapshot.graph.aggregate_artifact_hash ?? "pending"}`
     );
+  }
+  // Restart-safe ordered history, distinct from the live per-unit state above:
+  // only events whose linear_outbox activity has actually been acknowledged
+  // are eligible (see listAcknowledgedExecutionPublicationEvents), so this
+  // section converges after an outage instead of re-deriving from in-flight state.
+  if (snapshot.activity_log && snapshot.activity_log.length > 0) {
+    lines.push("**Structured Activity Log** (acknowledged, ordered)");
+    for (const event of snapshot.activity_log) {
+      const unitLabel = event.unit_id ? ` \`${event.unit_id}\`` : "";
+      lines.push(`- [${event.sequence}]${unitLabel} ${event.kind}: ${event.body}`);
+    }
   }
   return lines;
 }

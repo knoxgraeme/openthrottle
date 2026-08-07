@@ -23,7 +23,7 @@ import type {
   PipelineStageAttempt,
   RepositoryConfigSnapshot,
 } from "../../pipeline/store.js";
-import type { ExecutionPublicationSnapshot } from "../../pipeline/execution-publication.js";
+import { bounded, type ExecutionPublicationSnapshot } from "../../pipeline/execution-publication.js";
 
 export const SAFE_BRANCH = /^(?!.*\.\.)(?!\/)(?!.*\/$)[A-Za-z0-9._/-]{1,200}$/;
 
@@ -284,7 +284,7 @@ function insertPendingLinearOutbox(input: {
   id: string;
   linearSessionId: string;
   linearIssueId: string;
-  kind: "pipeline_receipt" | "issue_state";
+  kind: "pipeline_receipt" | "issue_state" | "activity";
   payload: string;
   timestamp: string;
 }): void {
@@ -304,6 +304,127 @@ function insertPendingLinearOutbox(input: {
     input.timestamp,
     input.timestamp
   );
+}
+
+export type ExecutionPublicationEventKind =
+  | "unit_repair"
+  | "unit_settled"
+  | "graph_stopped"
+  | "final_review"
+  | "aggregate";
+
+// Inserts one durable, ordered child-publication event (RR18) plus its
+// correlated linear_outbox activity row in the caller's already-open SQL
+// transaction, so a reportable child transition and its external projection
+// become durable atomically. Sanitization runs before either insert, so a
+// replayed/retried transaction can never re-derive or bypass it -- retrying
+// this call with the same deterministic id is a pure no-op (ON CONFLICT DO
+// NOTHING), never a re-sanitize-and-overwrite.
+export function insertExecutionPublicationEvent(input: {
+  db: Database.Database;
+  id: string;
+  executionGraphId: string;
+  pipelineInstanceId: string;
+  parentAttemptId: string;
+  unitId: string | null;
+  kind: ExecutionPublicationEventKind;
+  body: string;
+  timestamp: string;
+}): void {
+  const already = input.db.prepare(
+    "SELECT 1 FROM execution_publication_events WHERE id = ?"
+  ).get(input.id);
+  if (already) return;
+  const binding = input.db.prepare(
+    "SELECT linear_session_id, linear_issue_id FROM pipeline_instances WHERE id = ?"
+  ).get(input.pipelineInstanceId) as { linear_session_id: string; linear_issue_id: string } | undefined;
+  if (!binding) throw new Error(`pipeline instance ${input.pipelineInstanceId} is missing`);
+  const sanitizedBody = bounded(input.body) ?? "(no detail)";
+  const outboxId = `${input.id}-outbox`;
+  const activityPayload = canonicalJson({
+    type: "activity",
+    activity: {
+      sessionId: binding.linear_session_id,
+      type: "thought" as const,
+      body: sanitizedBody,
+      ephemeral: false,
+    },
+  });
+  // The upfront `already` check above is transactionally atomic with this
+  // insert (same already-open caller transaction), so a genuine retry never
+  // reaches here twice -- reuse the canonical insert idiom rather than a
+  // fourth divergent ON CONFLICT variant.
+  insertPendingLinearOutbox({
+    db: input.db,
+    id: outboxId,
+    linearSessionId: binding.linear_session_id,
+    linearIssueId: binding.linear_issue_id,
+    kind: "activity",
+    payload: activityPayload,
+    timestamp: input.timestamp,
+  });
+  const sequence = (input.db.prepare(`
+    SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence
+    FROM execution_publication_events WHERE parent_attempt_id = ?
+  `).get(input.parentAttemptId) as { sequence: number }).sequence;
+  input.db.prepare(`
+    INSERT INTO execution_publication_events (
+      id, execution_graph_id, pipeline_instance_id, parent_attempt_id, unit_id,
+      sequence, kind, body, linear_outbox_id, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO NOTHING
+  `).run(
+    input.id,
+    input.executionGraphId,
+    input.pipelineInstanceId,
+    input.parentAttemptId,
+    input.unitId,
+    sequence,
+    input.kind,
+    sanitizedBody,
+    outboxId,
+    input.timestamp
+  );
+}
+
+export interface ExecutionPublicationEventRecord {
+  id: string;
+  execution_graph_id: string;
+  pipeline_instance_id: string;
+  parent_attempt_id: string;
+  unit_id: string | null;
+  sequence: number;
+  kind: ExecutionPublicationEventKind;
+  body: string;
+  linear_outbox_id: string;
+  created_at: string;
+}
+
+// Bounds the rendered activity log the same way MAX_DOWNSTREAM_CONTEXT_RECORDS
+// bounds downstream context: a long-running or repair-heavy graph must not
+// let this history push the rest of the publication body (findings, links)
+// past PUBLICATION_BODY_LIMIT's plain truncation.
+export const MAX_ACTIVITY_LOG_EVENTS = 32;
+
+// Restart-safe convergence source for the final structured ledger (RR18/RAE7):
+// only events whose correlated linear_outbox row has been durably delivered
+// and acknowledged are eligible, so a partially-drained outage never fabricates
+// history that has not actually converged externally.
+export function listAcknowledgedExecutionPublicationEvents(
+  db: Database.Database,
+  parentAttemptId: string
+): ExecutionPublicationEventRecord[] {
+  return db.prepare(`
+    SELECT * FROM (
+      SELECT e.*
+      FROM execution_publication_events e
+      JOIN linear_outbox o ON o.id = e.linear_outbox_id
+      WHERE e.parent_attempt_id = ? AND o.status = 'processed'
+      ORDER BY e.sequence DESC
+      LIMIT ?
+    )
+    ORDER BY sequence ASC
+  `).all(parentAttemptId, MAX_ACTIVITY_LOG_EVENTS) as ExecutionPublicationEventRecord[];
 }
 
 function persistIssueStateProjection(input: {
