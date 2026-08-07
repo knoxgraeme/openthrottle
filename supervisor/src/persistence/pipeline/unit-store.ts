@@ -27,7 +27,7 @@ import {
   type UnitPhase,
   type UnitTerminalReason,
 } from "../../pipeline/unit-coordinator.js";
-import { deterministicId, insertExecutionPublicationEvent, listAcknowledgedExecutionPublicationEvents } from "./helpers.js";
+import { deterministicId, insertExecutionPublicationEvent, listExecutionPublicationEvents } from "./helpers.js";
 import {
   createOrResumeFinalAction,
   createOrResumeUnitAction,
@@ -262,15 +262,14 @@ export interface ExecutionUnitStore {
     leaseUntilIso: string;
   }): boolean;
   getStructuredExecutionPublication(parentAttemptId: string): ReturnType<typeof buildExecutionPublicationSnapshot>;
+  getStructuredExecutionPublicationForInstance(pipelineInstanceId: string): ReturnType<typeof buildExecutionPublicationSnapshot>;
 }
 
-export function getStructuredExecutionPublicationForAttempt(
+function buildExecutionPublicationSnapshotForGraph(
   db: Database.Database,
-  parentAttemptId: string
+  graph: ExecutionUnitGraph
 ): ReturnType<typeof buildExecutionPublicationSnapshot> {
-  const graph = db.prepare("SELECT * FROM execution_graphs WHERE parent_attempt_id = ?")
-    .get(parentAttemptId) as ExecutionUnitGraph | undefined;
-  if (!graph) return undefined;
+  const parentAttemptId = graph.parent_attempt_id;
   const attempts = db.prepare(`
     SELECT * FROM (
       SELECT * FROM (
@@ -304,7 +303,7 @@ export function getStructuredExecutionPublicationForAttempt(
     WHERE row_number <= 3
     ORDER BY from_unit_id, created_at, id
   `).all(parentAttemptId) as ExecutionDownstreamContext[];
-  const activityLog = listAcknowledgedExecutionPublicationEvents(db, parentAttemptId).map((event) => ({
+  const activityLog = listExecutionPublicationEvents(db, parentAttemptId).map((event) => ({
     sequence: event.sequence,
     kind: event.kind,
     unit_id: event.unit_id,
@@ -318,6 +317,35 @@ export function getStructuredExecutionPublicationForAttempt(
     downstreamContext,
     activityLog,
   });
+}
+
+export function getStructuredExecutionPublicationForAttempt(
+  db: Database.Database,
+  parentAttemptId: string
+): ReturnType<typeof buildExecutionPublicationSnapshot> {
+  const graph = db.prepare("SELECT * FROM execution_graphs WHERE parent_attempt_id = ?")
+    .get(parentAttemptId) as ExecutionUnitGraph | undefined;
+  if (!graph) return undefined;
+  return buildExecutionPublicationSnapshotForGraph(db, graph);
+}
+
+// The pipeline coordinator renders the structured ledger from whichever
+// attempt is currently transitioning -- which, once the composite/structured
+// stage hands off to a later stage (e.g. publish), is a different attempt id
+// than the one that owns the execution graph. Each generation is its own
+// pipeline_instances row (see supersedeOtherInstances), so the latest graph
+// for this instance is unambiguously this generation's structured execution,
+// independent of which attempt is currently active.
+export function getStructuredExecutionPublicationForInstance(
+  db: Database.Database,
+  pipelineInstanceId: string
+): ReturnType<typeof buildExecutionPublicationSnapshot> {
+  const graph = db.prepare(`
+    SELECT * FROM execution_graphs WHERE pipeline_instance_id = ?
+    ORDER BY created_at DESC, id DESC LIMIT 1
+  `).get(pipelineInstanceId) as ExecutionUnitGraph | undefined;
+  if (!graph) return undefined;
+  return buildExecutionPublicationSnapshotForGraph(db, graph);
 }
 
 export function createExecutionUnitStore(db: Database.Database, now: () => string): ExecutionUnitStore {
@@ -366,9 +394,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     insertExecutionPublicationEvent({
       db,
       id: deterministicId("execution-activity-unit-settled", [input.parentAttemptId, input.unitId]),
-      executionGraphId: graph.id,
-      pipelineInstanceId: graph.pipeline_instance_id,
-      parentAttemptId: input.parentAttemptId,
+      graph,
       unitId: input.unitId,
       kind: "unit_settled",
       body: `Unit ${input.unitId} ${terminal.terminalLevel}${terminal.alarm ? " (alarm)" : ""}: ${input.reason}.`,
@@ -902,9 +928,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
             id: deterministicId("execution-activity-unit-repair", [
               completedAction.parent_attempt_id, unitRow.unit_id, routing.repairRounds,
             ]),
-            executionGraphId: graph.id,
-            pipelineInstanceId: graph.pipeline_instance_id,
-            parentAttemptId: completedAction.parent_attempt_id,
+            graph,
             unitId: unitRow.unit_id,
             kind: "unit_repair",
             body: `Unit ${unitRow.unit_id} needs another implementation pass (repair round ${routing.repairRounds}/${graph.max_repair_rounds}): ${input.decision.reason}.`,
@@ -973,9 +997,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         insertExecutionPublicationEvent({
           db,
           id: deterministicId("execution-activity-final-review", [completedAction.parent_attempt_id, "done"]),
-          executionGraphId: graph.id,
-          pipelineInstanceId: graph.pipeline_instance_id,
-          parentAttemptId: completedAction.parent_attempt_id,
+          graph,
           unitId: null,
           kind: "final_review",
           body: `Whole-change final review passed for ${completedAction.parent_attempt_id}.`,
@@ -988,9 +1010,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         insertExecutionPublicationEvent({
           db,
           id: deterministicId("execution-activity-final-review", [completedAction.parent_attempt_id, "repair", routing.repairRounds]),
-          executionGraphId: graph.id,
-          pipelineInstanceId: graph.pipeline_instance_id,
-          parentAttemptId: completedAction.parent_attempt_id,
+          graph,
           unitId: null,
           kind: "final_review",
           body: `Whole-change final review needs another repair pass (round ${routing.repairRounds}/${graph.max_repair_rounds}): ${input.decision.reason}.`,
@@ -1096,9 +1116,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       insertExecutionPublicationEvent({
         db,
         id: deterministicId("execution-activity-graph-stopped", [action.parent_attempt_id]),
-        executionGraphId: graph.id,
-        pipelineInstanceId: graph.pipeline_instance_id,
-        parentAttemptId: action.parent_attempt_id,
+        graph,
         unitId: null,
         kind: "graph_stopped",
         body: `Structured execution stopped: ${lastError}.`,
@@ -1151,9 +1169,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     insertExecutionPublicationEvent({
       db,
       id: deterministicId("execution-activity-aggregate", [input.parentAttemptId]),
-      executionGraphId: graph.id,
-      pipelineInstanceId: graph.pipeline_instance_id,
-      parentAttemptId: input.parentAttemptId,
+      graph,
       unitId: null,
       kind: "aggregate",
       body: `Structured execution complete: ${integratedUnits} unit(s) integrated, aggregate ${input.artifactHash}.`,
@@ -1326,9 +1342,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     insertExecutionPublicationEvent({
       db,
       id: deterministicId("execution-activity-graph-stopped", [input.parentAttemptId]),
-      executionGraphId: graph.id,
-      pipelineInstanceId: graph.pipeline_instance_id,
-      parentAttemptId: input.parentAttemptId,
+      graph,
       unitId: null,
       kind: "graph_stopped",
       body: `Structured execution stopped: ${input.reason}.`,
@@ -1499,6 +1513,9 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     },
     getStructuredExecutionPublication(parentAttemptId) {
       return getStructuredExecutionPublicationForAttempt(db, parentAttemptId);
+    },
+    getStructuredExecutionPublicationForInstance(pipelineInstanceId) {
+      return getStructuredExecutionPublicationForInstance(db, pipelineInstanceId);
     },
     appendDownstreamContext,
     listDownstreamContext(parentAttemptId, toUnitId) {

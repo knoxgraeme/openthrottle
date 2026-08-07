@@ -1,7 +1,9 @@
 import type Database from "better-sqlite3";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
 import {
@@ -11,6 +13,7 @@ import {
 } from "./coordinator.js";
 import {
   STAGE_OUTCOMES,
+  canonicalJson,
   digestNormalized,
   loadPipelineCatalog,
   parseRepositoryConfig,
@@ -21,6 +24,8 @@ import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import type { PipelineInstance, PipelineInstanceStage, PipelineStageAttempt } from "./store.js";
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
+import type { ExecutionGateDecision } from "./execution-gates.js";
+import { createLinearOutboxProcessor } from "../providers/linear/outbox.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
 const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
@@ -1224,5 +1229,343 @@ describe("pipeline coordinator", () => {
     const source = readFileSync(fileURLToPath(new URL("./coordinator.ts", import.meta.url)), "utf8");
     expect(source).not.toMatch(/ce\//i);
     expect(source).not.toMatch(/ce-work|ce-code-review|ce-debug/i);
+  });
+
+  describe("structured execution ledger convergence", () => {
+    const temporaryDirectories: string[] = [];
+    afterEach(() => {
+      for (const directory of temporaryDirectories.splice(0)) {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+
+    function gateDecision(overrides: {
+      gateKind: ExecutionGateDecision["gateKind"];
+      outcome?: PipelineCoordinatorEvent["outcome"];
+      result?: ExecutionGateDecision["result"];
+      reason?: string;
+      subject: string;
+    }): ExecutionGateDecision {
+      const base = {
+        gateKind: overrides.gateKind,
+        outcome: overrides.outcome ?? "success",
+        result: overrides.result ?? "passed",
+        reason: overrides.reason ?? "test_reason",
+        subject: overrides.subject,
+        artifactHashes: ["a".repeat(64)],
+      };
+      const payload = canonicalJson({ schema: "test.gate-decision/v1", ...base });
+      return { ...base, payload, hash: digestNormalized(payload) };
+    }
+
+    // Drives one unit through implement/candidate/lead/integrate plus the
+    // whole-change final review and emits the aggregate, all attached to the
+    // given parent attempt -- mirroring what structured-child-runtime.ts does
+    // to the real "implementation" stage attempt in production.
+    function driveSingleUnitToAggregate(input: {
+      unitStore: ExecutionUnitStore;
+      instanceId: string;
+      parentAttemptId: string;
+      plannedRunId: string;
+      subject: string;
+    }): void {
+      const { unitStore, instanceId, parentAttemptId, plannedRunId, subject } = input;
+      unitStore.createGraph({
+        pipelineInstanceId: instanceId,
+        parentAttemptId,
+        parentStageId: "implementation",
+        parentRunId: plannedRunId,
+        graphDigest: "graph-digest",
+        planDigest: "plan-digest",
+        units: [{ id: "U1" }],
+        unitPhaseBindings: unitPhaseBindings(),
+      });
+      const lease = () => unitStore.leaseNextUnitAction({
+        parentAttemptId,
+        leaseOwner: "worker-1",
+        nowIso: "2026-07-29T00:00:00.000Z",
+        leaseUntilIso: "2026-07-29T00:01:00.000Z",
+      })!;
+      const implement = lease();
+      unitStore.completeUnitAction({
+        actionId: implement.id, resultHash: "r-implement", outputSubject: subject,
+        receipt: JSON.stringify({ type: "unit_completion", payload: {} }),
+      });
+      const candidate = lease();
+      unitStore.completeUnitAction({
+        actionId: candidate.id, resultHash: "r-candidate", outputSubject: subject,
+        receipt: JSON.stringify({ type: "candidate_evidence", payload: {} }),
+      });
+      const lead = lease();
+      unitStore.completeGatedAction({
+        actionId: lead.id, resultHash: "r-lead", outputSubject: subject,
+        receipt: JSON.stringify({ type: "unit_decision", payload: {} }),
+        decision: gateDecision({ gateKind: "unit_acceptance", outcome: "success", subject }),
+      });
+      const integrate = lease();
+      unitStore.completeGatedAction({
+        actionId: integrate.id, resultHash: "r-integrate", outputSubject: subject,
+        decision: gateDecision({ gateKind: "integration", outcome: "success", subject }),
+      });
+      const finalReview = lease();
+      unitStore.completeGatedAction({
+        actionId: finalReview.id, resultHash: "r-final-review", outputSubject: subject,
+        decision: gateDecision({ gateKind: "final_review", outcome: "success", subject }),
+      });
+      expect(unitStore.emitAggregateOnce({
+        parentAttemptId,
+        artifactHash: "aggregate-hash",
+        integrationSubject: subject,
+      })).toBe("emitted");
+    }
+
+    function githubSummaryEnvelope(database: Database.Database, instanceId: string): {
+      attempt_id: string | null;
+      payload: string;
+    } {
+      return database.prepare(`
+        SELECT attempt_id, payload FROM pipeline_publication_receipts
+        WHERE pipeline_instance_id = ? AND kind = 'github_summary'
+      `).get(instanceId) as { attempt_id: string | null; payload: string };
+    }
+
+    function activityLogKinds(payload: string): string[] {
+      const envelope = JSON.parse(payload) as {
+        structured_execution?: { activity_log?: Array<{ kind: string }> };
+      };
+      return (envelope.structured_execution?.activity_log ?? []).map((entry) => entry.kind);
+    }
+
+    it("renders the structured ledger on a later attempt that does not own the execution graph", () => {
+      const { pipelines, instance, attempt } = setup("core/implement@4");
+      if (!attempt.planned_run_id) {
+        throw new Error("expected active attempt to have a planned run id");
+      }
+      const unitStore = pipelines as typeof pipelines & ExecutionUnitStore;
+      const subject = "1".repeat(40);
+
+      driveSingleUnitToAggregate({
+        unitStore,
+        instanceId: instance.id,
+        parentAttemptId: attempt.id,
+        plannedRunId: attempt.planned_run_id,
+        subject,
+      });
+
+      // The composite attempt's own transition -- structuredExecution is
+      // available here because attempt.id equals the graph's owning attempt.
+      coordinatePipelineEvent(pipelines, stageResultEvent({
+        instance,
+        attempt,
+        id: "implementation-success",
+        summary: "Implemented and integrated unit U1.",
+      }));
+      expect(activityLogKinds(githubSummaryEnvelope(db!, instance.id).payload))
+        .toEqual(["unit_settled", "final_review", "aggregate"]);
+
+      const afterImplementation = pipelines.getInstance(instance.id)!;
+      expect(afterImplementation.active_stage_id).toBe("semantic_review");
+      const reviewAttempt = pipelines.getActiveAttempt(instance.id)!;
+      expect(reviewAttempt.id).not.toBe(attempt.id);
+
+      // A later stage's attempt does not own the execution graph at all, yet
+      // its own publication must still carry the same converged ledger.
+      coordinatePipelineEvent(pipelines, event(
+        afterImplementation,
+        reviewAttempt,
+        "no_change",
+        "semantic-review-no-change",
+        ["stage_result", "review"]
+      ));
+
+      const latest = githubSummaryEnvelope(db!, instance.id);
+      expect(latest.attempt_id).toBe(reviewAttempt.id);
+      expect(latest.attempt_id).not.toBe(attempt.id);
+      expect(activityLogKinds(latest.payload)).toEqual(["unit_settled", "final_review", "aggregate"]);
+    });
+
+    it("renders the aggregate in the terminal receipt on the same pass and survives real Linear delivery plus a crash-and-restart replay", async () => {
+      const directory = mkdtempSync(join(tmpdir(), "openthrottle-coordinator-structured-"));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "supervisor.db");
+      db = openDb(path);
+      let pipelines = createPipelineStore(db);
+      const tickets = createSupervisorStore(db, pipelines);
+      const catalog = loadPipelineCatalog(shippedCatalogPath, runtime.descriptor);
+      pipelines.acceptRuntimeDescriptor(runtime);
+      pipelines.acceptCatalog(catalog);
+      const config = parseRepositoryConfig("schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]\npipelines: { implement: fixture-command }\n");
+      const snapshot = pipelines.saveRepositoryConfigSnapshot({
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        blobSha: "b".repeat(40),
+        config,
+      });
+      const manifest = catalog.manifests.get("core/implement@4")!;
+      tickets.upsert({
+        linear_issue_id: "issue-1",
+        linear_issue_identifier: "ISSUE-1",
+        linear_session_id: "session-1",
+        sandbox_id: null,
+        branch: "ot/issue-1",
+        agent: "codex",
+        repo: "owner/repo",
+        pr_url: null,
+        state: "active",
+        pipeline: {
+          repository: "owner/repo",
+          baseCommit: "a".repeat(40),
+          manifest,
+          repositoryConfig: snapshot,
+          runtime,
+          authorizedCapabilities: manifest.manifest.requires.capabilities,
+          taskType: "implement",
+        },
+      });
+      const instance = pipelines.getInstanceForSession("session-1")!;
+      const attempt = pipelines.getActiveAttempt(instance.id)!;
+      if (!attempt.planned_run_id) {
+        throw new Error("expected active attempt to have a planned run id");
+      }
+      const unitStore = pipelines as typeof pipelines & ExecutionUnitStore;
+      const subject = "1".repeat(40);
+
+      driveSingleUnitToAggregate({
+        unitStore,
+        instanceId: instance.id,
+        parentAttemptId: attempt.id,
+        plannedRunId: attempt.planned_run_id,
+        subject,
+      });
+
+      // "implementation" no_change goes straight to terminal in the SAME
+      // coordinatePipelineEvent call that just emitted the aggregate --
+      // exactly the same-pass path structured-child-runtime.ts drives.
+      coordinatePipelineEvent(pipelines, stageResultEvent({
+        instance,
+        attempt,
+        id: "implementation-no-change",
+        outcome: "no_change",
+        summary: "Integrated the only unit; no further change needed.",
+      }));
+
+      // Before any outbox delivery at all, the persisted terminal receipts
+      // already carry the full activity log.
+      const expectedKinds = ["unit_settled", "final_review", "aggregate"];
+      expect(activityLogKinds(githubSummaryEnvelope(db, instance.id).payload)).toEqual(expectedKinds);
+      const terminalLedgerId = db.prepare(`
+        SELECT id FROM pipeline_publication_receipts
+        WHERE pipeline_instance_id = ? AND kind = 'linear_ledger'
+          AND idempotency_key = ?
+      `).get(instance.id, `linear-terminal:${instance.id}:no_change`) as { id: string } | undefined;
+      expect(terminalLedgerId).toBeDefined();
+      const terminalLedgerPayload = (db.prepare(
+        "SELECT payload FROM pipeline_publication_receipts WHERE id = ?"
+      ).get(terminalLedgerId!.id) as { payload: string }).payload;
+      expect(activityLogKinds(terminalLedgerPayload)).toEqual(expectedKinds);
+
+      const pendingBeforeDelivery = db.prepare(
+        "SELECT COUNT(*) AS count FROM linear_outbox WHERE status = 'processed'"
+      ).get() as { count: number };
+      expect(pendingBeforeDelivery.count).toBe(0);
+
+      const deliveredActivityBodies: string[] = [];
+      const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+        const request = JSON.parse(String(init?.body)) as {
+          query?: string;
+          variables?: { id?: string; input?: { content?: { body?: string } } };
+        };
+        if (request.query?.includes("query Comment")) {
+          return Response.json({ data: { comment: null } });
+        }
+        if (request.query?.includes("IssueComments")) {
+          return Response.json({ data: { issue: { comments: { nodes: [] } } } });
+        }
+        if (request.query?.includes("IssueWorkflowState")) {
+          return Response.json({
+            data: { issue: { id: "issue-1", state: { id: "backlog", name: "Backlog", type: "backlog" }, team: { id: "team-1" } } },
+          });
+        }
+        if (request.query?.includes("TeamWorkflowStates")) {
+          return Response.json({
+            data: { team: { states: { nodes: [
+              { id: "backlog", name: "Backlog", type: "backlog" },
+              { id: "progress", name: "In Progress", type: "started" },
+              { id: "done", name: "Done", type: "completed" },
+            ] } } },
+          });
+        }
+        if (request.query?.includes("IssueStateUpdate")) {
+          return Response.json({
+            data: { issueUpdate: { success: true, issue: { id: "issue-1", state: { id: "progress", name: "In Progress" } } } },
+          });
+        }
+        if (request.query?.includes("CommentCreate")) {
+          return Response.json({
+            data: { commentCreate: {
+              success: true,
+              comment: { id: "status-comment", url: "https://linear.test/comment/status" },
+            } },
+          });
+        }
+        if (request.query?.includes("AgentActivityCreate")) {
+          const body = request.variables?.input?.content?.body ?? "";
+          deliveredActivityBodies.push(body);
+          return Response.json({
+            data: { agentActivityCreate: { success: true, agentActivity: { id: "activity-1" } } },
+          });
+        }
+        throw new Error(`unexpected Linear request: ${request.query}`);
+      }) as unknown as typeof fetch;
+
+      const processor = createLinearOutboxProcessor({
+        store: tickets,
+        getLinearClient: async () => ({ accessToken: "oauth", fetch: fetchMock }),
+      });
+      // Same-session rows deliver strictly in sequence (head-of-line), so
+      // draining the whole queue takes one pass per row -- exactly the real
+      // background sweep loop's behavior, not a single drain() call.
+      for (let pass = 0; pass < 10; pass += 1) {
+        await processor.drain(50);
+      }
+
+      const stillPending = db.prepare(
+        "SELECT COUNT(*) AS count FROM linear_outbox WHERE status != 'processed'"
+      ).get() as { count: number };
+      expect(stillPending.count).toBe(0);
+      const deliveredTerminalReceipt = deliveredActivityBodies.find((body) =>
+        body.includes("Structured Activity Log"));
+      expect(deliveredTerminalReceipt).toBeDefined();
+      expect(deliveredTerminalReceipt).toContain("unit_settled: Unit U1");
+      expect(deliveredTerminalReceipt).toContain("final_review: Whole-change final review passed");
+      expect(deliveredTerminalReceipt).toContain("aggregate: Structured execution complete");
+
+      // Crash and restart: reopen a fresh handle and store from the same
+      // file, and confirm the already-persisted receipts still converge --
+      // nothing here depends on in-memory processor or delivery state.
+      db.close();
+      db = openDb(path);
+      pipelines = createPipelineStore(db);
+      const recoveredPayload = (db.prepare(
+        "SELECT payload FROM pipeline_publication_receipts WHERE id = ?"
+      ).get(terminalLedgerId!.id) as { payload: string }).payload;
+      expect(activityLogKinds(recoveredPayload)).toEqual(expectedKinds);
+
+      // Replaying the same terminal event post-restart is a pure no-op.
+      const receiptCountBefore = (db.prepare(
+        "SELECT COUNT(*) AS count FROM pipeline_publication_receipts WHERE pipeline_instance_id = ?"
+      ).get(instance.id) as { count: number }).count;
+      coordinatePipelineEvent(pipelines, stageResultEvent({
+        instance,
+        attempt,
+        id: "implementation-no-change",
+        outcome: "no_change",
+        summary: "Integrated the only unit; no further change needed.",
+      }));
+      const receiptCountAfter = (db.prepare(
+        "SELECT COUNT(*) AS count FROM pipeline_publication_receipts WHERE pipeline_instance_id = ?"
+      ).get(instance.id) as { count: number }).count;
+      expect(receiptCountAfter).toBe(receiptCountBefore);
+    });
   });
 });

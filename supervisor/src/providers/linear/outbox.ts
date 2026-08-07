@@ -140,6 +140,14 @@ function classifyRetry(error: unknown): { retry: boolean; message: string } {
   return classifyPermanentFailure(error, /invalid|permission|forbidden|unauthorized|revoked|missing/i);
 }
 
+// classifyRetry only recognizes a fixed set of dead-token error patterns, so a
+// Linear rejection whose message doesn't match one (e.g. a malformed
+// activity) would otherwise retry forever, head-of-line blocking every later
+// same-session row -- including the terminal ledger's own pipeline_receipt --
+// behind it indefinitely. Capping attempts guarantees a row eventually goes
+// dead (and stops blocking) even when its failure text never matches.
+const MAX_LINEAR_OUTBOX_ATTEMPTS = 10;
+
 function isNotFoundError(error: unknown): boolean {
   return /\bnot[ _-]?found\b|not_found|does not exist|could not find/i.test(String(error));
 }
@@ -265,10 +273,11 @@ export function createLinearOutboxProcessor(params: {
         await processRow(row);
       } catch (error) {
         const classified = classifyRetry(error);
+        const retry = classified.retry && row.attempts < MAX_LINEAR_OUTBOX_ATTEMPTS;
         params.store.markLinearOutboxFailed(
           row.id,
           classified.message,
-          classified.retry
+          retry
             ? new Date(Date.now() + exponentialBackoffDelayMs(row.attempts)).toISOString()
             : null,
           row.payload_hash

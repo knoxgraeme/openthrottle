@@ -463,7 +463,12 @@ needs-human terminal outcomes do not advance the issue to completed. Projection
 delivery is idempotent and forward-only: issues already at or beyond the target,
 or manually moved to `completed` or `canceled`, are skipped. Projection delivery
 failures are logged and retried by the Linear outbox but never block the run,
-publication, provider evidence handling, or terminal acknowledgement.
+publication, provider evidence handling, or terminal acknowledgement. A Linear
+outbox row's retry is bounded (`MAX_LINEAR_OUTBOX_ATTEMPTS`): once a row keeps
+failing without its error matching a recognized dead-token pattern, it goes
+`dead` after the attempt cap rather than retrying forever, so it stops
+head-of-line-blocking later same-session rows -- including a session's own
+terminal receipt -- behind it.
 
 Published content is sanitized and bounded. Raw task logs, secret values, and
 untrusted webhook bodies are never automatically attached to Linear or a PR.
@@ -492,16 +497,29 @@ body from the same inputs. Only the bounded transition summary is durably
 recorded; raw prompts, logs, and command output are never captured here.
 
 The correlated `linear_outbox` row projects and is acknowledged through the
-existing outbox processor and delivery ordering, independently of the
-`execution_publication_events` row that produced it. The structured ledger's
-restart-safe "Structured Activity Log" section (appended after the live
-per-unit status breakdown in both the Linear and GitHub publication bodies)
-renders only from events whose correlated outbox row has reached `processed`
-(`listAcknowledgedExecutionPublicationEvents`), ordered by that per-attempt
-sequence -- so an outage-and-restart converges from the durable record instead
-of re-deriving a possibly different in-flight snapshot, and a partially
-delivered batch never fabricates history for an event that has not actually
-reached Linear.
+existing outbox processor and delivery ordering, but that delivery is an
+independent, separate concern from reading the ledger back: the structured
+ledger's restart-safe "Structured Activity Log" section (appended after the
+live per-unit status breakdown in both the Linear and GitHub publication
+bodies) renders directly from the `execution_publication_events` rows
+themselves (`listExecutionPublicationEvents`), ordered by that per-attempt
+sequence, without waiting on the correlated `linear_outbox` activity to reach
+`processed`. Because each event row is inserted in the same transaction as the
+reportable transition it reports, this converges immediately from durable
+state -- including on the very same pass that emits an event (e.g. the
+aggregate emitted alongside the terminal transition) and after a
+crash-and-restart replay -- rather than depending on a second, independent
+delivery to finish first. Every attempt whose terminal receipt is built after
+the structured stage hands off to a later stage (e.g. `publish`) still carries
+this ledger: it is resolved by `pipeline_instance_id`
+(`getStructuredExecutionPublicationForInstance`), not by whichever attempt id
+happens to be transitioning, since a later attempt in the same generation owns
+no execution graph of its own. The rendered log is capped both by count (the
+most recent 32 events) and by an explicit byte budget
+(`MAX_ACTIVITY_LOG_BYTES`), dropping the oldest entries first with an
+omitted-count note, so a long-running or repair-heavy graph's history can
+never itself consume the whole publication body and evict the findings, event
+sentence, or links rendered after it.
 
 ## Supervisor HTTP contract
 

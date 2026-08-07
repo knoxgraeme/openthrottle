@@ -5,6 +5,13 @@ const TEXT_LIMIT = 500;
 const RATIONALE_LIMIT = 1_000;
 const MAX_ACTIONS_PER_UNIT = 3;
 const MAX_CONTEXT_PER_UNIT = 3;
+// Pairs the MAX_ACTIVITY_LOG_EVENTS count cap with an explicit byte budget,
+// the same downstream-context precedent as MAX_DOWNSTREAM_CONTEXT_RECORDS +
+// MAX_DOWNSTREAM_CONTEXT_BYTES (structured-loop-limits.ts): 32 events at the
+// per-event TEXT_LIMIT can alone exceed PUBLICATION_BODY_LIMIT, which would
+// otherwise let the log evict the findings, event sentence, and links that
+// are rendered after it in the body.
+export const MAX_ACTIVITY_LOG_BYTES = 6_000;
 
 export interface ExecutionPublicationActivityEvent {
   sequence: number;
@@ -25,11 +32,14 @@ export interface ExecutionPublicationSnapshot {
     stop_reason: string | null;
   };
   units: ExecutionPublicationUnit[];
-  // Restart-safe, ordered activity history sourced from acknowledged durable
-  // child-publication events (RR18/RAE7) -- distinct from `units`, which is a
-  // live snapshot of current state. Empty until the outbox has delivered and
-  // acknowledged at least one event. Optional: envelopes persisted before this
-  // field existed round-trip through parsePipelinePublication without it.
+  // Restart-safe, ordered activity history sourced from the durable
+  // child-publication event rows (RR18/RAE7) -- distinct from `units`, which
+  // is a live snapshot of current state. Each row is inserted in the same
+  // transaction as the child transition it reports, so this converges
+  // immediately from durable state without waiting on that event's own
+  // correlated Linear activity to finish delivering. Optional: envelopes
+  // persisted before this field existed round-trip through
+  // parsePipelinePublication without it.
   activity_log?: ExecutionPublicationActivityEvent[];
 }
 
@@ -246,15 +256,39 @@ export function executionLedgerLines(snapshot: ExecutionPublicationSnapshot | un
     );
   }
   // Restart-safe ordered history, distinct from the live per-unit state above:
-  // only events whose linear_outbox activity has actually been acknowledged
-  // are eligible (see listAcknowledgedExecutionPublicationEvents), so this
-  // section converges after an outage instead of re-deriving from in-flight state.
+  // sourced from the durable child-publication event rows (see
+  // listExecutionPublicationEvents), so this section converges from durable
+  // state after an outage instead of re-deriving from in-flight state.
   if (snapshot.activity_log && snapshot.activity_log.length > 0) {
-    lines.push("**Structured Activity Log** (acknowledged, ordered)");
-    for (const event of snapshot.activity_log) {
+    const eventLines = snapshot.activity_log.map((event) => {
       const unitLabel = event.unit_id ? ` \`${event.unit_id}\`` : "";
-      lines.push(`- [${event.sequence}]${unitLabel} ${event.kind}: ${event.body}`);
+      return `- [${event.sequence}]${unitLabel} ${event.kind}: ${event.body}`;
+    });
+    const { lines: boundedEventLines, omitted } = boundActivityLogLinesByBytes(eventLines, MAX_ACTIVITY_LOG_BYTES);
+    lines.push("**Structured Activity Log** (ordered)");
+    if (omitted > 0) {
+      lines.push(`- (${omitted} earlier entries omitted to stay within the publication byte budget)`);
     }
+    lines.push(...boundedEventLines);
   }
   return lines;
+}
+
+// Keeps the most recent lines that fit within maxBytes, dropping the oldest
+// first -- always keeps at least one line so a single oversized entry still
+// renders rather than vanishing entirely.
+function boundActivityLogLinesByBytes(
+  lines: string[],
+  maxBytes: number
+): { lines: string[]; omitted: number } {
+  let usedBytes = 0;
+  const kept: string[] = [];
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]!;
+    const lineBytes = Buffer.byteLength(line, "utf8") + 1;
+    if (usedBytes + lineBytes > maxBytes && kept.length > 0) break;
+    usedBytes += lineBytes;
+    kept.unshift(line);
+  }
+  return { lines: kept, omitted: lines.length - kept.length };
 }

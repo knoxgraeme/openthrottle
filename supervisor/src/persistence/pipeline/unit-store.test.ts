@@ -3183,6 +3183,58 @@ describe("execution unit store", () => {
     expect(events[3]!.body).toContain("1 unit(s) integrated");
   });
 
+  it("records one durable event per unit, in order, when a structural exit cascades to multiple dependents in one transaction", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [
+        { id: "a" },
+        { id: "b", dependencies: ["a"] },
+        { id: "c", dependencies: ["a"] },
+      ],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+
+    // Settling "a" as a structural exit cascades to both of its dependents
+    // ("b" and "c") inside the same settleUnitTerminal transaction --
+    // settleStructurallyBlockedDependents loops until no pending unit remains
+    // blocked, calling settleUnitRow (and its event insert) once per unit.
+    const result = store.settleUnitTerminal({
+      parentAttemptId: "attempt-parent",
+      unitId: "a",
+      reason: "structural_exit",
+    });
+    expect(result).toBe("settled");
+
+    const units = store.listUnits("attempt-parent");
+    expect(units.every((unit) => unit.terminalLevel === "exited")).toBe(true);
+
+    const events = publicationEvents("attempt-parent");
+    expect(events).toHaveLength(3);
+    expect(events.map((event) => event.kind)).toEqual(["unit_settled", "unit_settled", "unit_settled"]);
+    // One event per unit, addressed to the right unit and delivered in a
+    // single strictly-increasing per-attempt sequence -- not per-unit streams
+    // that could interleave or duplicate a sequence number across units.
+    expect(events.map((event) => event.unit_id)).toEqual(["a", "b", "c"]);
+    expect(events.map((event) => event.sequence)).toEqual([1, 2, 3]);
+    expect(events.every((event) => event.outboxKind === "activity")).toBe(true);
+    expect(new Set(events.map((event) => event.outboxBody)).size).toBe(3);
+
+    // The store's own read path (the terminal ledger's convergence source)
+    // exposes the same three events immediately and in the same order.
+    const activityLog = store.getStructuredExecutionPublication("attempt-parent")?.activity_log ?? [];
+    expect(activityLog.map((event) => [event.sequence, event.unit_id])).toEqual([
+      [1, "a"],
+      [2, "b"],
+      [3, "c"],
+    ]);
+  });
+
   it("does not duplicate a child-publication event when an already-recorded gate decision replays", () => {
     const store = setup();
     const subject = "1".repeat(40);
@@ -3314,7 +3366,32 @@ describe("execution unit store", () => {
     expect(events.find((event) => event.kind === "graph_stopped")?.body).toContain("model credential unavailable");
   });
 
-  it("exposes only acknowledged child-publication events through the store's own read path, in sequence order", () => {
+  it("gives the correlated linear_outbox activity an RFC-4122-shaped id", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+    store.settleUnitTerminal({ parentAttemptId: "attempt-parent", unitId: "a", reason: "structural_exit" });
+
+    const outboxIds = db!.prepare(
+      "SELECT linear_outbox_id FROM execution_publication_events WHERE parent_attempt_id = ?"
+    ).all("attempt-parent") as Array<{ linear_outbox_id: string }>;
+    expect(outboxIds).toHaveLength(1);
+    // Linear's AgentActivityCreateInput.id is client-supplied and must be
+    // RFC-4122-shaped, same as every other id on this path (deterministicPublicationId).
+    expect(outboxIds[0]!.linear_outbox_id).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+    );
+  });
+
+  it("exposes child-publication events through the store's own read path immediately, in sequence order", () => {
     const store = setup();
     const subject = "1".repeat(40);
     store.createGraph({
@@ -3342,18 +3419,19 @@ describe("execution unit store", () => {
       decision: gateDecision({ gateKind: "unit_acceptance", outcome: "semantic_repair_required", subject, reason: "command_exit_nonzero" }),
     });
 
-    // The repair round produced exactly one durable event, but its correlated
-    // linear_outbox row has not been delivered yet -- the read path must not
-    // fabricate history for an event that has not actually converged externally.
-    expect(store.getStructuredExecutionPublication("attempt-parent")?.activity_log).toEqual([]);
+    // The repair round produced exactly one durable event, inserted in the same
+    // transaction as the state change. The read path must expose it immediately
+    // from that durable row rather than waiting on the event's own correlated
+    // linear_outbox activity to be delivered -- delivery of that activity is a
+    // separate, independent concern from this projection converging.
+    const activityLog = store.getStructuredExecutionPublication("attempt-parent")?.activity_log ?? [];
+    expect(activityLog).toHaveLength(1);
+    expect(activityLog[0]).toMatchObject({ kind: "unit_repair", unit_id: "a", sequence: 1 });
 
     const outboxId = db!.prepare(
       "SELECT linear_outbox_id FROM execution_publication_events WHERE parent_attempt_id = ?"
     ).get("attempt-parent") as { linear_outbox_id: string };
-    db!.prepare("UPDATE linear_outbox SET status = 'processed' WHERE id = ?").run(outboxId.linear_outbox_id);
-
-    const activityLog = store.getStructuredExecutionPublication("attempt-parent")?.activity_log ?? [];
-    expect(activityLog).toHaveLength(1);
-    expect(activityLog[0]).toMatchObject({ kind: "unit_repair", unit_id: "a", sequence: 1 });
+    const outboxRow = db!.prepare("SELECT status FROM linear_outbox WHERE id = ?").get(outboxId.linear_outbox_id) as { status: string };
+    expect(outboxRow.status).toBe("pending");
   });
 });

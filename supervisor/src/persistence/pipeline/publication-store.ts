@@ -170,9 +170,14 @@ export function createPublicationStore(db: Database.Database, now: () => string)
       WHERE id = ?
     `).run(timestamp, timestamp, id);
     if (publication.kind === "linear_ledger") {
+      // Reset attempts along with status: MAX_LINEAR_OUTBOX_ATTEMPTS caps a
+      // row's own automatic retries, but an operator-triggered retry through
+      // this endpoint is a distinct, deliberate recovery action and must get
+      // a fresh attempt budget -- otherwise a row already at the cap dies
+      // again on its very next failure regardless of this reset.
       const update = db.prepare(`
         UPDATE linear_outbox
-        SET status = 'pending', next_attempt_at = ?, last_error = NULL, processed_at = NULL
+        SET status = 'pending', next_attempt_at = ?, last_error = NULL, processed_at = NULL, attempts = 0
         WHERE id = ? AND status IN ('dead', 'failed')
       `).run(timestamp, id);
       if (update.changes !== 1) throw new Error(`pipeline publication ${id} has no recoverable outbox row`);

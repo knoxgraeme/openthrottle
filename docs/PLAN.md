@@ -38,9 +38,11 @@ revision.
   [`docs/plans/2026-07-29-001-fix-complete-structured-workflows-u2-u7-plan.md`](plans/2026-07-29-001-fix-complete-structured-workflows-u2-u7-plan.md)).
   RU11 closes the lane: reportable child transitions durably insert an
   ordered, sanitized child-publication event and its correlated Linear outbox
-  activity in the same transaction as the reducer write, so Linear/GitHub
-  converge from acknowledged, restart-safe records instead of a
-  point-in-time snapshot. The repository default graph remains `simple`.
+  activity in the same transaction as the reducer write, and every terminal
+  ledger renders directly from those durable event rows -- independent of the
+  correlated outbox activity's own delivery -- so Linear/GitHub converge from
+  restart-safe records instead of a point-in-time snapshot. The repository
+  default graph remains `simple`.
 
 ## Origin U8 (live credentialed dogfood)
 

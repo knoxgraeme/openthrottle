@@ -323,9 +323,7 @@ export type ExecutionPublicationEventKind =
 export function insertExecutionPublicationEvent(input: {
   db: Database.Database;
   id: string;
-  executionGraphId: string;
-  pipelineInstanceId: string;
-  parentAttemptId: string;
+  graph: { id: string; pipeline_instance_id: string; parent_attempt_id: string };
   unitId: string | null;
   kind: ExecutionPublicationEventKind;
   body: string;
@@ -337,10 +335,10 @@ export function insertExecutionPublicationEvent(input: {
   if (already) return;
   const binding = input.db.prepare(
     "SELECT linear_session_id, linear_issue_id FROM pipeline_instances WHERE id = ?"
-  ).get(input.pipelineInstanceId) as { linear_session_id: string; linear_issue_id: string } | undefined;
-  if (!binding) throw new Error(`pipeline instance ${input.pipelineInstanceId} is missing`);
+  ).get(input.graph.pipeline_instance_id) as { linear_session_id: string; linear_issue_id: string } | undefined;
+  if (!binding) throw new Error(`pipeline instance ${input.graph.pipeline_instance_id} is missing`);
   const sanitizedBody = bounded(input.body) ?? "(no detail)";
-  const outboxId = `${input.id}-outbox`;
+  const outboxId = deterministicPublicationId(`${input.id}-outbox`);
   const activityPayload = canonicalJson({
     type: "activity",
     activity: {
@@ -366,7 +364,7 @@ export function insertExecutionPublicationEvent(input: {
   const sequence = (input.db.prepare(`
     SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence
     FROM execution_publication_events WHERE parent_attempt_id = ?
-  `).get(input.parentAttemptId) as { sequence: number }).sequence;
+  `).get(input.graph.parent_attempt_id) as { sequence: number }).sequence;
   input.db.prepare(`
     INSERT INTO execution_publication_events (
       id, execution_graph_id, pipeline_instance_id, parent_attempt_id, unit_id,
@@ -375,9 +373,9 @@ export function insertExecutionPublicationEvent(input: {
     ON CONFLICT(id) DO NOTHING
   `).run(
     input.id,
-    input.executionGraphId,
-    input.pipelineInstanceId,
-    input.parentAttemptId,
+    input.graph.id,
+    input.graph.pipeline_instance_id,
+    input.graph.parent_attempt_id,
     input.unitId,
     sequence,
     input.kind,
@@ -407,10 +405,15 @@ export interface ExecutionPublicationEventRecord {
 export const MAX_ACTIVITY_LOG_EVENTS = 32;
 
 // Restart-safe convergence source for the final structured ledger (RR18/RAE7):
-// only events whose correlated linear_outbox row has been durably delivered
-// and acknowledged are eligible, so a partially-drained outage never fabricates
-// history that has not actually converged externally.
-export function listAcknowledgedExecutionPublicationEvents(
+// each event row is inserted in the same transaction as the child transition
+// it reports, so reading it directly (rather than gating on its correlated
+// linear_outbox activity's own delivery status) is what makes the ledger
+// converge immediately from durable state -- including on the very same pass
+// that emits the event, and after a crash-and-restart replay, with no
+// dependency on the separate per-event Linear activity having been delivered
+// yet. The correlated linear_outbox row still tracks that activity's own
+// delivery independently; it is not a precondition for this projection.
+export function listExecutionPublicationEvents(
   db: Database.Database,
   parentAttemptId: string
 ): ExecutionPublicationEventRecord[] {
@@ -418,8 +421,7 @@ export function listAcknowledgedExecutionPublicationEvents(
     SELECT * FROM (
       SELECT e.*
       FROM execution_publication_events e
-      JOIN linear_outbox o ON o.id = e.linear_outbox_id
-      WHERE e.parent_attempt_id = ? AND o.status = 'processed'
+      WHERE e.parent_attempt_id = ?
       ORDER BY e.sequence DESC
       LIMIT ?
     )
