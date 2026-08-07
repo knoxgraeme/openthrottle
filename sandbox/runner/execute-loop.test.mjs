@@ -30,6 +30,7 @@ import {
 import { computeWorkspaceTreeOid } from "./repository-control.mjs";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
+import { extractJsonBlock } from "./json-block.mjs";
 
 const directories = [];
 
@@ -81,18 +82,6 @@ function repository() {
   execFileSync("git", ["add", "."], { cwd: directory });
   execFileSync("git", ["commit", "-qm", "initial"], { cwd: directory });
   return directory;
-}
-
-function firstJsonObject(text) {
-  let depth = 0;
-  for (let i = 0; i < text.length; i += 1) {
-    if (text[i] === "{") depth += 1;
-    else if (text[i] === "}") {
-      depth -= 1;
-      if (depth === 0) return text.slice(0, i + 1);
-    }
-  }
-  throw new Error("no balanced JSON object found");
 }
 
 function request(overrides = {}) {
@@ -450,7 +439,7 @@ describe("loop action request validation", () => {
     expect(loopPrompt(valid)).not.toContain('"capabilityDigest"');
     expect(loopPrompt(valid)).not.toContain('"skillPackageDigest"');
 
-    const contract = JSON.parse(firstJsonObject(loopPrompt(valid).split("\n\n## Receipt Authority Contract\n")[1]));
+    const contract = extractJsonBlock(loopPrompt(valid), "## Receipt Authority Contract\n");
     expect(contract.attempt_id).toBe(valid.attemptId);
     expect(contract.assurance).toBe("semantic_attested");
     expect(contract.producer).not.toHaveProperty("assurance");
@@ -458,7 +447,7 @@ describe("loop action request validation", () => {
 
   it("falls back to a null contract assurance without an expected producer", () => {
     const valid = validateLoopRequest(request());
-    const contract = JSON.parse(firstJsonObject(loopPrompt(valid).split("\n\n## Receipt Authority Contract\n")[1]));
+    const contract = extractJsonBlock(loopPrompt(valid), "## Receipt Authority Contract\n");
     expect(contract.assurance).toBeNull();
   });
 

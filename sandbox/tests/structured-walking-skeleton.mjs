@@ -20,6 +20,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
+import { setTimeout as sleep } from "node:timers/promises";
 
 import { createPipelineEffectProcessor } from "../../supervisor/dist/operations/pipeline-effects.js";
 import { createSupervisorStore } from "../../supervisor/dist/persistence/store.js";
@@ -235,9 +236,16 @@ function stopContainer(name) {
   }
 }
 
+// The container's reported capabilities cannot change within one run, so
+// cache it the same way readGraphFile below caches the static graph file --
+// every scenario in main() shares the one container this harness starts.
+let runtimeDescriptorCache;
 function readRuntimeDescriptor(container) {
-  const raw = dockerExec(container, ["node", "/opt/openthrottle/runner/capabilities.mjs", "--print"]);
-  return validateRuntimeCapabilityDescriptor(JSON.parse(raw));
+  if (!runtimeDescriptorCache) {
+    const raw = dockerExec(container, ["node", "/opt/openthrottle/runner/capabilities.mjs", "--print"]);
+    runtimeDescriptorCache = validateRuntimeCapabilityDescriptor(JSON.parse(raw));
+  }
+  return runtimeDescriptorCache;
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +267,12 @@ function createDockerSandboxRuntime(container) {
   const worktreeHandles = new Map();
   const dispatchedWorktreeIds = new Set();
   const counters = { createWorktree: 0, dispatchLoopAction: 0, dispatchChildExecutorAction: 0, cleanupWorktree: 0 };
+  // The container is genuinely shared across scenarios, but production
+  // enforces one pipeline instance per runtime_provider_resource_id -- give
+  // each runtime adapter (one per scenario, or per restart within a
+  // scenario) its own resource id so distinct instances never collide on
+  // that DB-level UNIQUE constraint.
+  const providerResourceId = `${container}-${randomBytes(4).toString("hex")}`;
 
   // Must byte-for-byte match production's worktreeHandleFor
   // (supervisor/src/operations/structured-child-runtime.ts), which computes
@@ -281,7 +295,7 @@ function createDockerSandboxRuntime(container) {
     dispatchedWorktreeIds,
 
     async provision() {
-      return { providerResourceId: container };
+      return { providerResourceId };
     },
 
     async bootstrap(_resource, input) {
@@ -320,7 +334,9 @@ function createDockerSandboxRuntime(container) {
         "/opt/openthrottle/entrypoint.sh",
       ]);
       if (result.status !== 0) {
-        throw new Error(`composite workspace preparation failed (${result.status}): ${result.stderr}`);
+        throw new Error(
+          `composite workspace preparation failed (${result.status}): stderr=${result.stderr} stdout=${result.stdout}`
+        );
       }
     },
 
@@ -520,7 +536,10 @@ function setupInstance({ db, pipelines, tickets, runtimeDescriptor, fixture, iss
       "  - id: structured",
       "    kind: builtin",
       "    ref: core/structured@1",
-      "commands: { test: test, lint: lint, build: build }",
+      "commands:",
+      "  test: \"test -f /tmp/ot-walking-skeleton-test-marker || { touch /tmp/ot-walking-skeleton-test-marker; exit 1; }\"",
+      "  lint: \"true\"",
+      "  build: \"true\"",
       "pipelines: { implement: implement }",
     ].join("\n")
   );
@@ -568,10 +587,6 @@ let graphFileCache;
 function readGraphFile() {
   if (!graphFileCache) graphFileCache = readFileSync(STRUCTURED_GRAPH_PATH, "utf8");
   return graphFileCache;
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // pipeline-effects schedules a failed effect's retry at RETRY_BASE_MS * 2^n
@@ -637,6 +652,37 @@ async function drainUntilSettled(processor, pipelines, attemptId, label) {
   );
 }
 
+// A settle assertion failure is otherwise a bare "expected X, got Y" -- the
+// actual cause (which action or effect is stuck, and why) already lives in
+// the harness's own DB at that point but was being discarded. Dump it before
+// throwing so a CI failure is diagnosable from its log alone.
+function dumpSettleDiagnostics({ pipelines, instance, attemptId, label }) {
+  const attempt = pipelines.getAttempt(attemptId);
+  const units = pipelines.listUnits(attemptId).map((unit) => ({
+    unitId: unit.unitId,
+    status: unit.status,
+    terminalLevel: unit.terminalLevel,
+    phase: unit.phase,
+    alarm: unit.alarm,
+  }));
+  const actions = pipelines
+    .listWorkAttempts(attemptId)
+    .filter((action) => action.status !== "completed")
+    .map((action) => ({ id: action.id, status: action.status, last_error: action.last_error }));
+  const effects = pipelines.listEffects(instance.id).map((effect) => ({
+    status: effect.status,
+    attempts: effect.attempts,
+    last_error: effect.last_error,
+  }));
+  log(
+    `${label} settle-assertion diagnostics -- ` +
+      `attempt: ${JSON.stringify({ status: attempt?.status ?? null, outcome: attempt?.outcome ?? null, last_error: attempt?.last_error ?? null })} ` +
+      `units: ${JSON.stringify(units)} ` +
+      `non-completed actions: ${JSON.stringify(actions)} ` +
+      `effects: ${JSON.stringify(effects)}`
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Scenario: happy path -- two ordered stub units through the full sequence,
 // including one deliberate command failure/repair on unit A. Proves RAE8.
@@ -667,6 +713,7 @@ async function runHappyPath({ db, container, fixture }) {
   });
 
   const settled = await drainUntilSettled(processor, pipelines, attempt.id, "happy path");
+  if (settled.status !== "completed") dumpSettleDiagnostics({ pipelines, instance, attemptId: attempt.id, label: "happy path" });
   assert(settled.status === "completed", `expected the composite stage to complete, got ${settled.status}`);
 
   const graph = pipelines.getGraphForAttempt(attempt.id);
@@ -786,6 +833,7 @@ async function runReplayScenario({ db, container, fixture }) {
     now: () => new Date(),
   });
   const settled = await drainUntilSettled(processorB, pipelines, attempt.id, "replay restart");
+  if (settled.status !== "completed") dumpSettleDiagnostics({ pipelines, instance, attemptId: attempt.id, label: "replay restart" });
   assert(settled.status === "completed", `replay restart must still complete, got ${settled.status}`);
 
   const unitAAfter = pipelines.listWorkAttempts(attempt.id).find((action) => action.id === unitAIntegrated.id);
@@ -837,6 +885,7 @@ async function runNeedsHumanScenario({ db, container, fixture }) {
   // maps every outcome except canceled/superseded/failure/retryable_infrastructure_failure
   // -- including needs_human -- to status "completed"; the real semantic result lives in
   // the separate `outcome` field, not `status`.
+  if (settled.outcome !== "needs_human") dumpSettleDiagnostics({ pipelines, instance, attemptId: attempt.id, label: "needs-human" });
   assert(settled.outcome === "needs_human", `an unaccepted unit must settle with outcome "needs_human", got ${settled.outcome}`);
   const units = pipelines.listUnits(attempt.id);
   const unitB = units.find((unit) => unit.unitId === "unit_b");
@@ -872,14 +921,14 @@ async function runNeedsHumanScenario({ db, container, fixture }) {
 // from the actual production fence.
 // ---------------------------------------------------------------------------
 
-function lockIntegrationCheckoutForScenario(container) {
-  // The explicit .catch() (rather than relying on Node's default
-  // unhandled-rejection-crashes-the-process behavior) is what actually
-  // guarantees a failed lock fails this scenario loudly instead of silently
-  // proceeding to prove nothing against an unlocked checkout.
+// The explicit .catch() (rather than relying on Node's default
+// unhandled-rejection-crashes-the-process behavior) is what actually
+// guarantees a failed lock/restore fails the scenario loudly instead of
+// silently proceeding to prove nothing.
+function invokeIntegrationCheckoutFn(container, fnName) {
   dockerExec(container, ["node", "-e", `
     import("/opt/openthrottle/runner/execute-loop.mjs").then((m) => {
-      if (!m.lockIntegrationCheckout()) throw new Error("lockIntegrationCheckout did not lock the integration checkout");
+      if (!m.${fnName}()) throw new Error("${fnName} did not succeed");
     }).catch((error) => {
       console.error(error);
       process.exitCode = 1;
@@ -887,35 +936,58 @@ function lockIntegrationCheckoutForScenario(container) {
   `]);
 }
 
-function runDirectMutationScenario({ container, happy }) {
+function lockIntegrationCheckoutForScenario(container) {
+  invokeIntegrationCheckoutFn(container, "lockIntegrationCheckout");
+}
+
+// The counterpart to lockIntegrationCheckoutForScenario: without this, the
+// checkout stays root-owned after this scenario, and every later
+// prepareCompositeWorkspace in this shared container dies exit 128 trying to
+// operate on a root-owned tree it no longer has authority over.
+function restoreIntegrationCheckoutForScenario(container) {
+  invokeIntegrationCheckoutFn(container, "restoreIntegrationCheckout");
+}
+
+function runDirectMutationScenario({ container }) {
   log("scenario: direct agent commit/push/integration attempts fail");
-  const beforeHead = dockerExec(container, ["git", "-C", INTEGRATION_REPO_DIR, "rev-parse", "HEAD"]).trim();
+  // The checkout is still agent-owned here (not yet locked), so reading it
+  // as root trips git's dubious-ownership safety check; read it as the
+  // authority that actually owns it right now.
+  const beforeHead = dockerExec(
+    container,
+    ["git", "-C", INTEGRATION_REPO_DIR, "rev-parse", "HEAD"],
+    { user: "agent" }
+  ).trim();
   lockIntegrationCheckoutForScenario(container);
 
-  const push = dockerExecStatus(
-    container,
-    ["git", "-C", INTEGRATION_REPO_DIR, "push", "origin", "HEAD:refs/heads/main"],
-    { user: "agent" }
-  );
-  assert(push.status !== 0, "the agent user must not be able to push the integration checkout directly");
-  assert(
-    /permission denied/i.test(push.stderr),
-    `expected the direct push to fail on the root-owned integration-checkout permission fence, got: ${push.stderr}`
-  );
+  try {
+    const push = dockerExecStatus(
+      container,
+      ["git", "-C", INTEGRATION_REPO_DIR, "push", "origin", "HEAD:refs/heads/main"],
+      { user: "agent" }
+    );
+    assert(push.status !== 0, "the agent user must not be able to push the integration checkout directly");
+    assert(
+      /not a git repository/i.test(push.stderr),
+      `expected the direct push to fail because the locked .git metadata is unreadable, got: ${push.stderr}`
+    );
 
-  const commit = dockerExecStatus(
-    container,
-    ["git", "-C", INTEGRATION_REPO_DIR, "commit", "--allow-empty", "-m", "direct mutation attempt"],
-    { user: "agent" }
-  );
-  assert(commit.status !== 0, "the agent user must not be able to commit directly in the integration checkout");
-  assert(
-    /permission denied/i.test(commit.stderr),
-    `expected the direct commit to fail on the root-owned integration-checkout permission fence, got: ${commit.stderr}`
-  );
+    const commit = dockerExecStatus(
+      container,
+      ["git", "-C", INTEGRATION_REPO_DIR, "commit", "--allow-empty", "-m", "direct mutation attempt"],
+      { user: "agent" }
+    );
+    assert(commit.status !== 0, "the agent user must not be able to commit directly in the integration checkout");
+    assert(
+      /not a git repository/i.test(commit.stderr),
+      `expected the direct commit to fail because the locked .git metadata is unreadable, got: ${commit.stderr}`
+    );
 
-  const afterHead = dockerExec(container, ["git", "-C", INTEGRATION_REPO_DIR, "rev-parse", "HEAD"]).trim();
-  assert(afterHead === beforeHead, "the integration ref must be unchanged after the rejected direct mutation attempts");
+    const afterHead = dockerExec(container, ["git", "-C", INTEGRATION_REPO_DIR, "rev-parse", "HEAD"]).trim();
+    assert(afterHead === beforeHead, "the integration ref must be unchanged after the rejected direct mutation attempts");
+  } finally {
+    restoreIntegrationCheckoutForScenario(container);
+  }
 
   log("direct commit/push attempts against the integration checkout were rejected on the permission fence; integration ref unchanged");
 }
@@ -938,8 +1010,8 @@ async function main() {
     installClaudeStubShadow(container);
 
     db = openDb(":memory:");
-    const happy = await runHappyPath({ db, container, fixture });
-    runDirectMutationScenario({ container, happy });
+    await runHappyPath({ db, container, fixture });
+    runDirectMutationScenario({ container });
     await runReplayScenario({ db, container, fixture });
     await runNeedsHumanScenario({ db, container, fixture });
 

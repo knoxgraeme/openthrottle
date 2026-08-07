@@ -17,6 +17,7 @@
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { computeWorkspaceTreeOid } from "/opt/openthrottle/runner/repository-control.mjs";
+import { extractJsonBlock } from "/opt/openthrottle/runner/json-block.mjs";
 
 function readStdin() {
   try {
@@ -52,15 +53,6 @@ function writeNativeSessionTranscript(sessionId, contract) {
   appendFileSync(join(dir, `${sessionId}.jsonl`), `${JSON.stringify(record)}\n`);
 }
 
-function jsonBlockAfter(text, marker) {
-  const start = text.indexOf(marker);
-  if (start === -1) return null;
-  const rest = text.slice(start + marker.length);
-  const end = rest.indexOf("\n\n##");
-  const raw = (end === -1 ? rest : rest.slice(0, end)).trim();
-  return JSON.parse(raw);
-}
-
 function findControlMarker(planContext, name) {
   const text = JSON.stringify(planContext ?? {});
   const match = text.match(new RegExp(`${name}=([a-zA-Z_]+)`));
@@ -81,7 +73,7 @@ function receiptFence(contract) {
   };
 }
 
-function buildReceipt({ contract, type, result, subjectPost, payload }) {
+function buildReceipt({ contract, type, result, subjectPost, payload, evidence }) {
   return {
     schema: "openthrottle.receipt/v1",
     type,
@@ -90,7 +82,7 @@ function buildReceipt({ contract, type, result, subjectPost, payload }) {
     producer: contract.producer,
     subject: { base: contract.subject.base, pre: contract.subject.pre, post: subjectPost },
     fence: receiptFence(contract),
-    evidence: ["walking-skeleton stub agent deterministic edit"],
+    evidence: evidence ?? ["walking-skeleton stub agent deterministic edit"],
     payload,
     issued_at: new Date().toISOString(),
   };
@@ -100,6 +92,15 @@ function priorCandidateSubject(priorEvidence) {
   const entry = (priorEvidence?.receipts ?? []).find((candidate) => candidate.role === "candidate");
   if (!entry) throw new Error("stub lead action found no candidate receipt in prior evidence");
   return JSON.parse(entry.receipt).subject.post;
+}
+
+// The acceptance and final-review gates (supervisor/src/pipeline/execution-gates.ts
+// assertEvidenceBinding) require a lead/review receipt's evidence[] to contain the
+// exact receipt hashes of the prior evidence it attests to. Echo them verbatim.
+function priorReceiptHashes(priorEvidence) {
+  const receipts = priorEvidence?.receipts ?? [];
+  if (receipts.length === 0) throw new Error("stub gated action found no prior evidence receipts to bind");
+  return receipts.map((entry) => entry.receiptHash);
 }
 
 function makeDeterministicEdit(cwd, contract) {
@@ -114,8 +115,8 @@ function main() {
   const prompt = readStdin();
   const firstLine = prompt.split("\n", 1)[0]?.trim() ?? "";
   const skill = firstLine.replace(/^\//, "");
-  const contract = jsonBlockAfter(prompt, "## Receipt Authority Contract\n");
-  const priorEvidence = jsonBlockAfter(prompt, "## Prior Evidence\n");
+  const contract = extractJsonBlock(prompt, "## Receipt Authority Contract\n");
+  const priorEvidence = extractJsonBlock(prompt, "## Prior Evidence\n");
   if (!contract) throw new Error("stub agent could not find the Receipt Authority Contract in its prompt");
   const cwd = process.cwd();
 
@@ -138,7 +139,7 @@ function main() {
       },
     });
   } else if (skill === "accept-unit") {
-    const planContext = jsonBlockAfter(prompt, "## Execution Plan Context\n");
+    const planContext = extractJsonBlock(prompt, "## Execution Plan Context\n");
     const forcedResult = findControlMarker(planContext, "STUB_LEAD_RESULT");
     const result = forcedResult ?? "accept";
     const acceptedSubject = priorCandidateSubject(priorEvidence);
@@ -147,6 +148,7 @@ function main() {
       type: "unit_decision",
       result,
       subjectPost: acceptedSubject,
+      evidence: priorReceiptHashes(priorEvidence),
       payload: {
         rationale: `walking-skeleton stub lead decision: ${result} for ${contract.unit_id}`,
         context_updates: [],
@@ -159,6 +161,7 @@ function main() {
       type: "semantic_review",
       result: "success",
       subjectPost: contract.subject.pre,
+      evidence: priorReceiptHashes(priorEvidence),
       payload: {
         summary: "walking-skeleton stub final review: no findings",
         findings: [],

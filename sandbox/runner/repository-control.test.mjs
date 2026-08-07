@@ -186,7 +186,9 @@ describe("computeWorkspaceTreeOidAsExecutor", () => {
     const expectedTree = execFileSync("git", ["-C", repoDir, "rev-parse", "HEAD^{tree}"], { encoding: "utf8" }).trim();
     const getuidSpy = vi.spyOn(process, "getuid").mockReturnValue(0);
     try {
-      expect(() => computeWorkspaceTreeOid(repoDir)).toThrow(/operation not permitted|failed switching|gosu/i);
+      expect(() => computeWorkspaceTreeOid(repoDir)).toThrow(
+        /operation not permitted|failed switching|gosu|could not resolve the installed agent identity/i
+      );
       expect(computeWorkspaceTreeOidAsExecutor(repoDir)).toBe(expectedTree);
     } finally {
       getuidSpy.mockRestore();
