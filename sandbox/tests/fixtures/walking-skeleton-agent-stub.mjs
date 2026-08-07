@@ -33,10 +33,15 @@ function readStdin() {
 // process leaves under `$HOME/.claude/projects/`. Mirror that here, matching
 // the fixture pattern in sandbox/tests/smoke.sh (write the transcript before
 // printing the matching session_id), so the executor's seal step finds it.
+// Real Claude Code files each transcript under a per-cwd slug directory
+// (projects/<slug>/<sessionId>.jsonl), not flat in projects/. Mirroring the
+// slug keeps the skeleton exercising collectNativeSessionPackage's recursive
+// walk rather than only its top-level scan.
 function nativeSessionTranscriptDir() {
   const home = process.env.HOME;
   if (!home) throw new Error("stub agent requires HOME to materialize its session transcript");
-  return join(home, ".claude", "projects");
+  const slug = process.cwd().replace(/[^a-zA-Z0-9]+/g, "-");
+  return join(home, ".claude", "projects", slug);
 }
 
 function writeNativeSessionTranscript(sessionId, contract) {
@@ -55,9 +60,11 @@ function writeNativeSessionTranscript(sessionId, contract) {
 
 // A real Claude Code process writes its own config, plugins, and shell state
 // directly into the profile root itself at startup, not just into its
-// projects/ transcript subtree (see loop-agent-environment.mjs's
-// prepareExecutorOwnedProfileRoot). Mirror that top-level write here so the
-// Docker walking skeleton pins the profile root staying agent-writable.
+// projects/ transcript subtree (see filesystem-isolation.mjs's
+// prepareAgentOwnedProfileRoot). OPE-101 was invisible to this skeleton
+// because the stub only ever wrote into the one pre-created carve-out;
+// mirror the top-level write here so the Docker walking skeleton pins the
+// profile root staying agent-writable.
 function writeProfileRootStartupFile() {
   const home = process.env.HOME;
   if (!home) throw new Error("stub agent requires HOME to materialize its profile root startup file");

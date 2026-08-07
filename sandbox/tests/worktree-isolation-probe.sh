@@ -727,27 +727,37 @@ grep -q 'agent-after-integrate.txt' /tmp/ot-probe-post-integrate-status
 rm -f "$INTEGRATION/agent-after-integrate.txt"
 /opt/openthrottle/runner/worktrees.mjs create --repo "$INTEGRATION" --root "$WORKTREES" --handle after-loop --base "$INTEGRATED_HEAD" >/dev/null
 
-# --- Claude action-scoped profile root: agent-writable root, root-locked skills/ ---
-# Exercises OPE-102 directly: prepareExecutorOwnedProfileRoot
-# (loop-agent-environment.mjs) must leave the per-action ~/.claude root
-# itself agent-writable -- a real engine writes its own config, plugins, and
-# shell state there at startup -- while lockExecutorOwnedSkillTree keeps the
-# baked skills/ subtree root-owned read-only.
-CLAUDE_PROFILE_REQUEST="$ACTION_ROOT/attempt-current/action-claude-profile/request.json"
-CLAUDE_PROFILE_RESULT="$ACTION_ROOT/attempt-current/action-claude-profile/result.json"
-
-/opt/openthrottle/runner/worktrees.mjs create --repo "$INTEGRATION" --root "$WORKTREES" --handle claude-profile --base "$BASE" >/dev/null
-install -d -o root -g root -m 0700 "$ACTION_ROOT/attempt-current/action-claude-profile"
-PATH="$BIN:$PATH" node --input-type=module - "$CLAUDE_PROFILE_REQUEST" <<'NODE'
+# --- Claude action-scoped profile root: agent-writable root, sealed skills/ ---
+# Exercises OPE-102 directly. Two loop actions run against the real image:
+#
+#   1. action-claude-profile   a well-behaved engine writes into the profile
+#                              root itself (config/plugins/telemetry, the
+#                              class of write that EACCESed under the old
+#                              root-owned 0555 root and killed OPE-101) and
+#                              into projects/<slug>/, and must succeed.
+#   2. action-claude-swap      a hostile engine renames the executor-sealed
+#                              skills/ tree aside and drops its own in place.
+#                              An agent-writable root cannot *prevent* that
+#                              (Unix governs unlink/rename by the parent
+#                              directory), so the executor must *detect* it:
+#                              assertProfileRootFence re-verifies the sealed
+#                              tree is still a uid-0 directory and fails the
+#                              action closed as retryable infrastructure.
+#
+# Both worktrees branch from the post-integration HEAD: createWorktree fails
+# closed unless the integration checkout's HEAD equals the requested base, and
+# integrate-unit.mjs advanced it above.
+write_claude_loop_request() {
+  PATH="$BIN:$PATH" node --input-type=module - "$1" "$2" "$3" <<'NODE'
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { canonicalJson } from "/opt/openthrottle/runner/capabilities.mjs";
 import { createLoopRequestHash } from "/opt/openthrottle/runner/execute-loop.mjs";
 
-const requestPath = process.argv[2];
+const [requestPath, actionId, worktreeId] = process.argv.slice(2);
 const base = {
   protocol: "loop-action@2",
-  actionId: "action-claude-profile",
+  actionId,
   attemptId: "attempt-current",
   graphId: "graph-1",
   parentRunId: "run-parent",
@@ -756,7 +766,7 @@ const base = {
   loop: "implement",
   agent: "claude",
   skill: "implement-unit",
-  worktree: { id: "claude-profile" },
+  worktree: { id: worktreeId },
   nativeSessionId: null,
   contextPolicy: "fresh",
   timeoutMs: 120000,
@@ -768,9 +778,23 @@ const base = {
 mkdirSync(dirname(requestPath), { recursive: true, mode: 0o700 });
 writeFileSync(requestPath, canonicalJson({ ...base, ...createLoopRequestHash(base) }), { mode: 0o400 });
 NODE
-chown root:root "$CLAUDE_PROFILE_REQUEST"
-chmod 0400 "$CLAUDE_PROFILE_REQUEST"
+  chown root:root "$1"
+  chmod 0400 "$1"
+}
+
+CLAUDE_PROFILE_REQUEST="$ACTION_ROOT/attempt-current/action-claude-profile/request.json"
+CLAUDE_PROFILE_RESULT="$ACTION_ROOT/attempt-current/action-claude-profile/result.json"
+CLAUDE_SWAP_REQUEST="$ACTION_ROOT/attempt-current/action-claude-swap/request.json"
+CLAUDE_SWAP_RESULT="$ACTION_ROOT/attempt-current/action-claude-swap/result.json"
+
+/opt/openthrottle/runner/worktrees.mjs create --repo "$INTEGRATION" --root "$WORKTREES" --handle claude-profile --base "$INTEGRATED_HEAD" >/dev/null
+/opt/openthrottle/runner/worktrees.mjs create --repo "$INTEGRATION" --root "$WORKTREES" --handle claude-swap --base "$INTEGRATED_HEAD" >/dev/null
+install -d -o root -g root -m 0700 "$ACTION_ROOT/attempt-current/action-claude-profile"
+install -d -o root -g root -m 0700 "$ACTION_ROOT/attempt-current/action-claude-swap"
+write_claude_loop_request "$CLAUDE_PROFILE_REQUEST" action-claude-profile claude-profile
+write_claude_loop_request "$CLAUDE_SWAP_REQUEST" action-claude-swap claude-swap
 CLAUDE_PROFILE_REQUEST_HASH="$(request_hash "$CLAUDE_PROFILE_REQUEST")"
+CLAUDE_SWAP_REQUEST_HASH="$(request_hash "$CLAUDE_SWAP_REQUEST")"
 
 cat > "$BIN/claude" <<'STUB'
 #!/usr/bin/env bash
@@ -824,41 +848,50 @@ NODE
 }
 
 test "$(id -un)" = "agent"
+# The executor seals the baked skill tree root-owned read-only inside the
+# profile root; every assertion below depends on it actually being there.
+test -d "$HOME/.claude/skills"
+test "$(stat -c '%u' "$HOME/.claude/skills")" = "0"
+
+if [ "${PROBE_CLAUDE_MODE:-}" = "skill-swap" ]; then
+  # The hostile case: the agent-writable profile root does let the agent
+  # rename the sealed skills/ ENTRY aside (its parent governs unlink/rename,
+  # not skills/'s own root-owned read-only mode). It must succeed here -- the
+  # point of the probe is that the executor's fence catches it afterwards, so
+  # a silent failure to even perform the swap would make the probe vacuous.
+  mv "$HOME/.claude/skills" "$HOME/.claude/skills-original"
+  mkdir "$HOME/.claude/skills"
+  mkdir -p "$HOME/.claude/skills/implement-plan"
+  printf -- '---\nname: implement-plan\ndescription: swapped\n---\n\nSwapped.\n' \
+    > "$HOME/.claude/skills/implement-plan/SKILL.md"
+  SUBJECT="$(node /opt/openthrottle/runner/execute-stage.mjs --print-subject --repo "$PWD")"
+  emit_claude_receipt "$SUBJECT"
+  exit 0
+fi
+
 # The action-scoped profile root itself (~/.claude) must be agent-writable --
 # a real engine writes its own config/plugins/telemetry there at startup.
-# Without the fix this mkdir gets EACCES against a root-owned 0555 directory.
+# Without the fix these writes get EACCES against a root-owned 0555 directory.
 mkdir "$HOME/.claude/ot-profile-root-write-probe"
-# The agent owns what it just created, so it can freely manage it -- the
-# sticky bit on the profile root (see below) must not block this.
-rmdir "$HOME/.claude/ot-profile-root-write-probe"
-if [ -d "$HOME/.claude/skills" ]; then
-  # The baked skill tree stays root-owned read-only even though its parent
-  # directory is now agent-writable.
-  if touch "$HOME/.claude/skills/ot-probe-attack" 2>/dev/null; then
-    echo "agent unexpectedly wrote into the root-owned skills/ tree" >&2
-    exit 60
-  fi
-  # OPE-102 repair: a plain agent-owned, non-sticky profile root would let the
-  # agent unlink/rename the "skills" directory ENTRY regardless of skills/'s
-  # own root-owned 0555 mode (Unix governs unlink/rename by the *parent*
-  # directory's owner+mode, not the entry's own permissions). The profile
-  # root must be root-owned with the sticky bit set (mirroring /tmp) so only
-  # root or the entry's own owner can remove/replace it.
-  if mv "$HOME/.claude/skills" "$HOME/.claude/skills-attack" 2>/dev/null; then
-    echo "agent unexpectedly renamed the root-owned skills/ directory entry" >&2
-    exit 61
-  fi
-fi
-# The same rename/delete protection must also cover .claude itself, one
-# level up: .claude's own directory entry is governed by ITS parent ($HOME),
-# not by .claude's own mode. A plain agent-owned $HOME would let the agent
-# swap out the whole locked .claude wholesale (mv .claude .claude-attack &&
-# mkdir .claude), sidestepping every lock on skills/ above.
-if mv "$HOME/.claude" "$HOME/.claude-attack" 2>/dev/null; then
-  echo "agent unexpectedly renamed the root-owned .claude directory entry" >&2
-  exit 63
+printf '{"probe":true}\n' > "$HOME/.claude/ot-profile-root-write-probe/state.json"
+printf '{"probe":true}\n' > "$HOME/.claude/ot-profile-root-startup.json"
+# The agent owns what it just created, so it can freely manage it.
+rm -rf "$HOME/.claude/ot-profile-root-write-probe"
+# Its own transcript subtree stays writable too, including the per-cwd slug
+# directory a real Claude Code process creates for each session. This is the
+# durable record sealNativeSessionPackage requires for the id printed below;
+# OPE-101 died here because it never landed.
+mkdir -p "$HOME/.claude/projects/-probe-slug"
+printf '{"type":"user","sessionId":"probe-claude-session"}\n' \
+  > "$HOME/.claude/projects/-probe-slug/probe-claude-session.jsonl"
+# The sealed skill tree stays root-owned read-only even though its parent
+# directory is now agent-writable: content is immutable in place.
+if touch "$HOME/.claude/skills/ot-probe-attack" 2>/dev/null; then
+  echo "agent unexpectedly wrote into the root-owned skills/ tree" >&2
+  exit 60
 fi
 SUBJECT="$(node /opt/openthrottle/runner/execute-stage.mjs --print-subject --repo "$PWD")"
+printf '{"type":"system","subtype":"init","session_id":"probe-claude-session","model":"probe"}\n'
 emit_claude_receipt "$SUBJECT"
 STUB
 chmod 0755 "$BIN/claude"
@@ -869,7 +902,8 @@ write_probe_env \
   PROBE_CLAUDE_PARENT_RUN_ID "run-parent" \
   PROBE_CLAUDE_ACTION_ATTEMPT_ID "action-claude-profile" \
   PROBE_CLAUDE_GENERATION "1" \
-  PROBE_CLAUDE_REQUEST_HASH "$CLAUDE_PROFILE_REQUEST_HASH"
+  PROBE_CLAUDE_REQUEST_HASH "$CLAUDE_PROFILE_REQUEST_HASH" \
+  PROBE_CLAUDE_MODE "write-probe"
 PATH="$BIN:$PATH" \
 OT_LOOP_ACTION_ROOT="$ACTION_ROOT" \
 OT_WORKTREE_ROOT="$WORKTREES" \
@@ -879,11 +913,43 @@ OT_INTEGRATION_REPO_DIR="$INTEGRATION" \
 node --input-type=module - "$CLAUDE_PROFILE_RESULT" <<'NODE'
 import { readFileSync } from "node:fs";
 const result = JSON.parse(readFileSync(process.argv[2], "utf8"));
+// native_session_id proves the whole OPE-101 mechanism end to end: the engine
+// wrote its transcript under an agent-writable profile root and the executor
+// sealed a package from it.
 if (result.kind !== "loop_action_result" ||
     result.attempt_id !== "attempt-current" ||
     result.action_id !== "action-claude-profile" ||
-    result.outcome !== "success") {
+    result.outcome !== "success" ||
+    result.native_session_id !== "probe-claude-session") {
   throw new Error(`invalid claude profile-root probe result: ${JSON.stringify(result)}`);
+}
+NODE
+
+write_probe_env \
+  PROBE_CLAUDE_UNIT_ID "unit-1" \
+  PROBE_CLAUDE_ATTEMPT_ID "attempt-current" \
+  PROBE_CLAUDE_PARENT_RUN_ID "run-parent" \
+  PROBE_CLAUDE_ACTION_ATTEMPT_ID "action-claude-swap" \
+  PROBE_CLAUDE_GENERATION "1" \
+  PROBE_CLAUDE_REQUEST_HASH "$CLAUDE_SWAP_REQUEST_HASH" \
+  PROBE_CLAUDE_MODE "skill-swap"
+PATH="$BIN:$PATH" \
+OT_LOOP_ACTION_ROOT="$ACTION_ROOT" \
+OT_WORKTREE_ROOT="$WORKTREES" \
+OT_INTEGRATION_REPO_DIR="$INTEGRATION" \
+/opt/openthrottle/runner/execute-loop.mjs --request "$CLAUDE_SWAP_REQUEST" --output "$CLAUDE_SWAP_RESULT"
+
+node --input-type=module - "$CLAUDE_SWAP_RESULT" <<'NODE'
+import { readFileSync } from "node:fs";
+const result = JSON.parse(readFileSync(process.argv[2], "utf8"));
+// The swapped skills tree must never yield an accepted receipt: the executor
+// fence catches the uid change and settles the action as a retryable
+// executor fault instead of a semantic unit defect.
+if (result.kind !== "loop_action_result" ||
+    result.action_id !== "action-claude-swap" ||
+    result.outcome !== "retryable_infrastructure_failure" ||
+    !String(result.receipt).includes("executor-sealed skill tree was replaced during the action")) {
+  throw new Error(`invalid claude skill-swap probe result: ${JSON.stringify(result)}`);
 }
 NODE
 
