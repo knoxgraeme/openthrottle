@@ -153,6 +153,94 @@ describe("launch diagnostic tail", () => {
   it("returns an empty tail when both streams are empty", () => {
     expect(launchDiagnosticTail({ stdout: "", stderr: "   ", env: {} })).toBe("");
   });
+
+  it("preserves subtype, is_error, api_error_status, and result from Claude's final stream-json line even when the tail would otherwise cut them off", () => {
+    const finalLine = JSON.stringify({
+      type: "result",
+      subtype: "error_during_execution",
+      is_error: true,
+      api_error_status: 529,
+      result: "the assistant's long trailing text",
+      session_id: "0199a1de-0000-7000-8000-000000000000",
+    });
+    // Padding after the final line pushes a plain byte tail past it, so a
+    // naive `.slice(-N)` would keep none of `finalLine`'s decisive fields.
+    const stdout = [
+      `{"type":"system","subtype":"init"}`,
+      finalLine,
+      "o".repeat(10_000),
+    ].join("\n");
+
+    const tail = launchDiagnosticTail({ stdout, stderr: "", env: {} });
+
+    expect(tail).toContain("subtype=error_during_execution");
+    expect(tail).toContain("is_error=true");
+    expect(tail).toContain("api_error_status=529");
+    expect(tail).toContain("result=the assistant's long trailing text");
+    expect(tail.length).toBeLessThanOrEqual(MAX_LAUNCH_DIAGNOSTIC_CHARS + 64);
+  });
+
+  it("truncates an overlong decisive result field instead of letting it crowd out the rest of the budget", () => {
+    const finalLine = JSON.stringify({
+      type: "result",
+      subtype: "error_during_execution",
+      is_error: true,
+      result: "r".repeat(5_000),
+    });
+    const tail = launchDiagnosticTail({ stdout: finalLine, stderr: "s".repeat(500), env: {} });
+
+    expect(tail).toContain("subtype=error_during_execution");
+    expect(tail).toContain("stderr: ");
+    expect(tail.length).toBeLessThanOrEqual(MAX_LAUNCH_DIAGNOSTIC_CHARS + 64);
+  });
+
+  it("stays bounded even when an uncapped decisive field (subtype) alone exceeds the budget", () => {
+    const finalLine = JSON.stringify({
+      type: "result",
+      subtype: "s".repeat(2_500),
+      is_error: true,
+    });
+    const tail = launchDiagnosticTail({ stdout: finalLine, stderr: "e".repeat(5_000), env: {} });
+
+    // A decisive field large enough to exhaust the whole budget must not
+    // fall back to returning the entire (unbounded) stderr/stdout -- that
+    // was a `slice(-0)` bug: a zero-or-negative remaining budget slices to
+    // "no characters", not "the whole string".
+    expect(tail.length).toBeLessThanOrEqual(MAX_LAUNCH_DIAGNOSTIC_CHARS + 64);
+  });
+
+  it("never lets a credential value survive redaction by truncating a decisive field before sanitizing it", () => {
+    const secret = "sk-ant-oat01-" + "s".repeat(600);
+    const finalLine = JSON.stringify({
+      type: "result",
+      subtype: "error_during_execution",
+      result: `leaked token: ${secret}`,
+    });
+    const tail = launchDiagnosticTail({
+      stdout: finalLine,
+      stderr: "",
+      env: { CLAUDE_CODE_OAUTH_TOKEN: secret },
+    });
+
+    // Truncating the raw `result` field to a fixed character budget before
+    // sanitizeArtifactText runs would cut the credential in half, so its
+    // exact-substring redaction match would silently fail on the remaining
+    // fragment. Sanitizing before truncating keeps the whole value visible
+    // to the matcher regardless of where the eventual cap falls.
+    expect(tail).not.toContain(secret);
+    expect(tail).not.toContain("sk-ant-oat01-");
+    expect(tail).toContain("[REDACTED]");
+  });
+
+  it("ignores a served (non-final, non-result) stream-json line when looking for decisive fields", () => {
+    const tail = launchDiagnosticTail({
+      stdout: `{"type":"system","subtype":"init","session_id":"x"}`,
+      stderr: "engine crashed",
+      env: {},
+    });
+    expect(tail).not.toContain("subtype=init");
+    expect(tail).toContain("stderr: engine crashed");
+  });
 });
 
 describe("agent stage failure summaries", () => {

@@ -65,6 +65,19 @@ const STUB_AGENT_CONTAINER_PATH = "/opt/openthrottle-stub/claude-stub.mjs";
 const STUB_BIN_DIR = "/opt/openthrottle-stub/bin";
 const AGENT_EXEC_PATH = `${STUB_BIN_DIR}:${BASE_EXEC_PATH}`;
 
+// Mirrors sandbox/runner/launch-failure.mjs's ENGINE_CREDENTIAL_ENV: the one
+// env var each engine authenticates with. The stub agent never reads these
+// values (see walking-skeleton-agent-stub.mjs) -- only their *presence*
+// matters, since execute-loop.mjs now fails closed before ever launching the
+// engine when a "model.invoke" action finds no staged credential envelope at
+// all (as opposed to one that stages zero vars for a role that declares no
+// credential scopes).
+const ENGINE_CREDENTIAL_ENV_BY_AGENT = {
+  claude: "CLAUDE_CODE_OAUTH_TOKEN",
+  codex: "CODEX_AUTH_JSON",
+  opencode: "KIMI_CODE_API_KEY",
+};
+
 function log(message) {
   process.stderr.write(`[walking-skeleton] ${message}\n`);
 }
@@ -304,10 +317,9 @@ function createDockerSandboxRuntime(container) {
     },
 
     async materializeCredentials() {
-      // RU10 uses no operator credentials; every loop/child-executor action
-      // below runs with a materialized-empty credential envelope (see
-      // dispatchLoopAction), matching sandbox/runner/loop-credentials.mjs's
-      // documented empty-envelope fallback.
+      // RU10 uses no operator credentials; dispatchLoopAction below stages a
+      // stub-valued credential envelope per loop action instead (a real
+      // value is never used or read -- see ENGINE_CREDENTIAL_ENV_BY_AGENT).
     },
 
     async prepareCompositeWorkspace(_resource, request) {
@@ -372,6 +384,17 @@ function createDockerSandboxRuntime(container) {
       const outputPath = `${LOOP_ACTION_DIR}/${request.attemptId}/${request.actionId}/result.json`;
       const credentialsPath = `${LOOP_ACTION_DIR}/${request.attemptId}/${request.actionId}/credentials.json`;
       dockerWriteRootFile(container, requestPath, JSON.stringify(request));
+      // Real provider adapters always stage a credentials.json for every loop
+      // action (materializeCredentialEnv runs unconditionally in
+      // supervisor/src/providers/daytona/adapter.ts, even when it resolves to
+      // an empty env for a role with no declared scopes) -- a *missing* file
+      // is reserved for "never staged at all". Match that contract here: a
+      // stub value only when the action actually declares "model.invoke",
+      // never a real credential ("No ... model credentials are used or read").
+      const credentialEnv = request.credentialScopes.includes("model.invoke")
+        ? { [ENGINE_CREDENTIAL_ENV_BY_AGENT[request.agent]]: "walking-skeleton-stub-token" }
+        : {};
+      dockerWriteRootFile(container, credentialsPath, JSON.stringify({ env: credentialEnv }));
       const result = dockerExecStatus(container, [
         "env",
         "-i",

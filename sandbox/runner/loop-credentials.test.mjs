@@ -16,8 +16,8 @@ describe("loop action credential envelope", () => {
     return join(directory, name);
   }
 
-  it("returns no credentials when the envelope is missing", () => {
-    expect(readLoopActionCredentialEnv(tempPath("missing.json"))).toEqual({});
+  it("reports the envelope as absent rather than silently yielding no credentials", () => {
+    expect(readLoopActionCredentialEnv(tempPath("missing.json"))).toBeNull();
   });
 
   it("reads, validates, and deletes the sealed envelope", () => {
@@ -27,11 +27,11 @@ describe("loop action credential envelope", () => {
     expect(existsSync(path)).toBe(false);
   });
 
-  it("is idempotent after a restart: a second read of an already-consumed envelope yields no credentials", () => {
+  it("is idempotent after a restart: a second read of an already-consumed envelope reports absent", () => {
     const path = tempPath("credentials.json");
     writeFileSync(path, JSON.stringify({ env: { GITHUB_TOKEN: "secret-token" } }));
     readLoopActionCredentialEnv(path);
-    expect(readLoopActionCredentialEnv(path)).toEqual({});
+    expect(readLoopActionCredentialEnv(path)).toBeNull();
   });
 
   it("deletes the envelope even when its content is invalid", () => {

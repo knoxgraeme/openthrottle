@@ -2669,6 +2669,51 @@ describe("executeLoopAction", () => {
     expect(result.receipt).toContain("CODEX_AUTH_JSON");
   });
 
+  it("fails closed before launching the engine when the credential envelope is genuinely absent", () => {
+    const runLoopAgent = vi.fn();
+    const result = executeLoopActionWithIntegration({
+      request: request(),
+      credentialEnv: {},
+      credentialEnvelopeMissing: true,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      runLoopAgent,
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    // A retried action that finds no re-staged envelope must never spawn the
+    // engine logged out -- it fails pre-launch instead of wasting a real
+    // engine invocation on a doomed "Not logged in" exit.
+    expect(runLoopAgent).not.toHaveBeenCalled();
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+    expect(result.receipt).toContain("reason=credential_missing");
+  });
+
+  it("proceeds without an envelope for a role that declares no credential scopes", () => {
+    const runLoopAgent = vi.fn(() => ({
+      status: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "",
+      stderr: "",
+      nativeSessionId: null,
+      integrationRepoDir: "/tmp/integration-current",
+    }));
+    executeLoopActionWithIntegration({
+      request: request({ credentialScopes: ["repo.read"] }),
+      credentialEnv: {},
+      credentialEnvelopeMissing: true,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      runLoopAgent,
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    // No model.invoke scope was declared, so an absent envelope is expected
+    // (nothing was ever staged for this role) and must not block launch.
+    expect(runLoopAgent).toHaveBeenCalled();
+  });
+
   it("classifies a rate-limited loop action and carries a sanitized stdout tail", () => {
     const rateLimited = JSON.stringify({
       type: "system",

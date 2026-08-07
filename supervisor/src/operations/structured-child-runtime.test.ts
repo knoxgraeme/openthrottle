@@ -519,6 +519,184 @@ describe("structured child runtime repair fences", () => {
     }));
   });
 
+  it("routes a non-success loop result straight to the graded handling without attempting to parse it as a receipt", async () => {
+    const implement = action({
+      id: "implement-retryable-infrastructure",
+      action_kind: "implement",
+      cycle: 1,
+      status: "dispatched",
+      attempt_ordinal: 1,
+      request_hash: "b".repeat(64),
+    });
+    const diagnostic = "loop action failed (reason=credential_missing) The claude engine credential " +
+      "CLAUDE_CODE_OAUTH_TOKEN was empty or absent when the engine launched; configure it on the supervisor.";
+    const stopRetryableUnitAction = vi.fn();
+    const failUnitAction = vi.fn();
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: {
+        collectLoopActionResult: async () => ({
+          actionId: implement.id,
+          attemptId: "parent-attempt",
+          requestHash: "b".repeat(64),
+          outcome: "retryable_infrastructure_failure",
+          nativeSessionId: null,
+          subject: null,
+          receipt: diagnostic,
+          completedAt: "2099-07-22T12:00:00.000Z",
+        }),
+      } as any,
+      store: {
+        leaseNextUnitAction: () => implement,
+        stopRetryableUnitAction,
+        failUnitAction,
+      } as any,
+    });
+
+    await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+      id: "instance-1",
+      active_stage_id: "structured",
+      agent: "codex",
+      generation: 1,
+      base_commit: "a".repeat(40),
+      immutable_subject: "a".repeat(40),
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({ stages: [{ id: "structured", unitPhaseBindings: [] }] }),
+    } as any, "parent-attempt");
+
+    // A non-success outcome's `receipt` field is a diagnostic string by
+    // contract, never receipt JSON -- it must never reach parseStandardReceipt
+    // (which would reliably fail and report a tautological "malformed
+    // receipt" that carries no information about what actually went wrong).
+    expect(failUnitAction).not.toHaveBeenCalled();
+    expect(stopRetryableUnitAction).toHaveBeenCalledWith(expect.objectContaining({
+      actionId: implement.id,
+      lastError: `retryable_infrastructure_failure: ${diagnostic}`,
+    }));
+    const [[call]] = stopRetryableUnitAction.mock.calls;
+    expect(call.lastError).not.toContain("malformed");
+  });
+
+  it("preserves the reason= classification head across two different failure reasons even when the diagnostic is long", async () => {
+    const buildDiagnostic = (reason: string) => `loop action failed (reason=${reason}) ${"x".repeat(2_000)}`;
+    const runFor = async (reason: string) => {
+      const implement = action({
+        id: `implement-reason-${reason}`,
+        action_kind: "implement",
+        cycle: 1,
+        status: "dispatched",
+        attempt_ordinal: 1,
+        request_hash: "b".repeat(64),
+      });
+      const stopRetryableUnitAction = vi.fn();
+      const childRuntime = createStructuredChildRuntime({
+        now: () => new Date("2099-07-22T12:00:00.000Z"),
+        taskTimeoutSeconds: 300,
+        runtime: {
+          collectLoopActionResult: async () => ({
+            actionId: implement.id,
+            attemptId: "parent-attempt",
+            requestHash: "b".repeat(64),
+            outcome: "retryable_infrastructure_failure",
+            nativeSessionId: null,
+            subject: null,
+            receipt: buildDiagnostic(reason),
+            completedAt: "2099-07-22T12:00:00.000Z",
+          }),
+        } as any,
+        store: {
+          leaseNextUnitAction: () => implement,
+          stopRetryableUnitAction,
+        } as any,
+      });
+
+      await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+        id: "instance-1",
+        active_stage_id: "structured",
+        agent: "codex",
+        generation: 1,
+        base_commit: "a".repeat(40),
+        immutable_subject: "a".repeat(40),
+        manifest_digest: "c".repeat(64),
+        capability_digest: "d".repeat(64),
+        normalized_manifest: canonicalJson({ stages: [{ id: "structured", unitPhaseBindings: [] }] }),
+      } as any, "parent-attempt");
+
+      return stopRetryableUnitAction.mock.calls[0][0].lastError as string;
+    };
+
+    const rejected = await runFor("credential_rejected");
+    const missing = await runFor("credential_missing");
+
+    // Under the old tail-only slice, both diagnostics were padded to the same
+    // length and so ended in byte-identical text regardless of reason -- the
+    // classification signal at the head was lost. Storing the head instead
+    // keeps the two reasons distinguishable.
+    expect(rejected).toContain("reason=credential_rejected");
+    expect(missing).toContain("reason=credential_missing");
+    expect(rejected).not.toBe(missing);
+  });
+
+  it("routes a retryable-infrastructure child-executor result the same way, without attempting to parse it as a receipt", async () => {
+    const command = action({
+      id: "command-retryable-infrastructure",
+      action_kind: "command",
+      command_name: "test",
+      cycle: 1,
+      status: "dispatched",
+      attempt_ordinal: 1,
+      request_hash: "b".repeat(64),
+    });
+    const diagnostic = "sandbox unreachable while running the test command";
+    const stopRetryableUnitAction = vi.fn();
+    const failUnitAction = vi.fn();
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: {
+        collectChildExecutorActionResult: async () => ({
+          actionId: command.id,
+          attemptId: "parent-attempt",
+          requestHash: "b".repeat(64),
+          outcome: "retryable_infrastructure_failure",
+          subject: null,
+          receipt: diagnostic,
+          completedAt: "2099-07-22T12:00:00.000Z",
+        }),
+      } as any,
+      store: {
+        leaseNextUnitAction: () => command,
+        stopRetryableUnitAction,
+        failUnitAction,
+      } as any,
+    });
+
+    await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+      id: "instance-1",
+      active_stage_id: "structured",
+      agent: "codex",
+      generation: 1,
+      base_commit: "a".repeat(40),
+      immutable_subject: "a".repeat(40),
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({ stages: [{ id: "structured", unitPhaseBindings: [] }] }),
+    } as any, "parent-attempt");
+
+    // A child-executor action's infrastructure fault carries a diagnostic
+    // string, exactly like a loop action's -- it must route the same way,
+    // never through parseStandardReceipt, and never report "malformed".
+    expect(failUnitAction).not.toHaveBeenCalled();
+    expect(stopRetryableUnitAction).toHaveBeenCalledWith(expect.objectContaining({
+      actionId: command.id,
+      lastError: `retryable_infrastructure_failure: ${diagnostic}`,
+    }));
+    const [[call]] = stopRetryableUnitAction.mock.calls;
+    expect(call.lastError).not.toContain("malformed");
+  });
+
   it("durably fails loop results whose envelope subject disagrees with the receipt subject", async () => {
     const implement = action({
       id: "implement-subject-mismatch",
@@ -702,6 +880,78 @@ describe("structured child runtime repair fences", () => {
     expect(dispatched?.transitionContext).toContain("Execution Plan Context");
     expect(dispatched?.transitionContext).toContain("Implement the unit.");
     expect(dispatched?.transitionContext).toContain("Unit is done.");
+  });
+
+  it("re-dispatches (and so re-stages a fresh credential envelope for) a prepared/worktree_ready replay instead of assuming the prior invocation is still credentialed", async () => {
+    const requestPayload: LoopActionRequest = {
+      protocol: "loop-action@2",
+      actionId: "implement-worktree-ready-replay",
+      attemptId: "parent-attempt",
+      graphId: "graph-1",
+      unitId: "unit_a",
+      role: "worker",
+      loop: "implement",
+      agent: "codex",
+      skill: "builtin://implement-unit@1",
+      worktree: { id: "worktree-handle" },
+      nativeSessionId: null,
+      contextPolicy: "fresh",
+      timeoutMs: 60_000,
+      transitionContext: "Implement the unit.",
+      allowedMcpServers: [],
+      credentialScopes: ["model.invoke", "repo.read", "repo.write"],
+      receiptSchema: "openthrottle.receipt/v1",
+      requestHash: "b".repeat(64),
+      idempotencyKey: "idem-implement-worktree-ready-replay",
+    };
+    const implement = action({
+      id: "implement-worktree-ready-replay",
+      action_kind: "implement",
+      cycle: 1,
+      status: "dispatched",
+      attempt_ordinal: 1,
+      request_hash: requestPayload.requestHash,
+      request_payload: canonicalJson(requestPayload),
+      request_launch_state: "worktree_ready",
+    });
+    const dispatchLoopAction = vi.fn(async () => ({ providerDispatchId: "dispatch-1" }));
+    const createWorktree = vi.fn(async () => ({ id: "worktree-handle" }));
+    const markActionDispatched = vi.fn();
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: { dispatchLoopAction, createWorktree } as any,
+      store: {
+        leaseNextUnitAction: () => implement,
+        markActionDispatching: vi.fn(),
+        markActionDispatched,
+      } as any,
+    });
+
+    await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+      id: "instance-1",
+      active_stage_id: "structured",
+      agent: "codex",
+      generation: 1,
+      base_commit: "a".repeat(40),
+      immutable_subject: "a".repeat(40),
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({ stages: [{ id: "structured", unitPhaseBindings: [] }] }),
+    } as any, "parent-attempt");
+
+    // The replay must re-enter the provider's dispatch path -- the only place
+    // a fresh credential envelope gets materialized and staged -- rather than
+    // silently reusing whatever (possibly already-consumed) envelope a prior,
+    // interrupted dispatch attempt may have left behind.
+    expect(dispatchLoopAction).toHaveBeenCalledTimes(1);
+    expect(dispatchLoopAction).toHaveBeenCalledWith(
+      { providerResourceId: "sandbox-1" },
+      expect.objectContaining({ actionId: implement.id, requestHash: requestPayload.requestHash })
+    );
+    // The worktree is already ready, so it must not be recreated.
+    expect(createWorktree).not.toHaveBeenCalled();
+    expect(markActionDispatched).toHaveBeenCalledWith(implement.id, requestPayload.requestHash, null);
   });
 
   it("dispatches with the true maximum valid downstream-context aggregate without exceeding the sealed envelope", async () => {
