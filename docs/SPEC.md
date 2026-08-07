@@ -397,17 +397,26 @@ unacknowledged deliveries. Once steering has been leased to a run, it is sealed
 to that owning run and attempt and never crosses that boundary into a later
 actor.
 
-For the structured `for_each_unit` composite stage, the same run/attempt fence
-already routes a reply to the exact current child fence: the durable unit
-reducer leases at most one active child action -- unit-scoped or whole-change
--- per parent attempt at a time, so exactly one child action can ever be the
-delivery target while the composite stage's run is live. A reply captured
-between two child actions has no live target to bind to and remains pending
-until the next dispatched action's drain hook consumes it as that action's
-current input, rather than crossing into an action other than the one that
-was current at capture. Stale session/request/subject replies remain audit-only
-under the same generation/context-revision/run fence used for the top-level
-pipeline.
+The structured `for_each_unit` composite stage does not support live steering
+yet. It always compiles with `live_steering: false` -- the manifest forbids
+`live_steering: true` for any executor other than a plain `agent` stage, and
+the composite stage's executor is `loop_action` -- so `canSteerPipelineRun`
+never treats a running composite stage as steerable, no matter which child
+action (unit-scoped or whole-change) is currently live underneath it. A reply
+sent while a structured run is active is always captured unbound (never fenced
+to a run) and stays pending until that run ends, at which point terminal
+cleanup cancels it; it is never delivered into any child action's sandbox.
+Capture still records the reply durably in the structured ledger's activity
+log (`steering_undelivered`) so the terminal receipt says so, rather than
+losing the fact silently, and the reply remains visible as ordinary Linear
+session activity throughout. Live steering to a specific in-progress child
+action -- fenced to that action's own attempt/request so a stale or
+cross-action reply is rejected fail-closed -- is a tracked follow-up, not
+current behavior.
+
+Outside the structured composite stage, stale session/request/subject replies
+remain audit-only under the same generation/context-revision/run fence used
+for the top-level pipeline.
 
 Native session continuation is not steering and is not a task type. It is
 selected solely by the next stage’s context policy and sealed native session id.
@@ -708,7 +717,8 @@ provider, human, and publish artifacts.
 event described in "Structured child publication" above: one row per
 reportable transition, fenced to its exact execution graph/pipeline
 instance/parent attempt, carrying a per-attempt sequence, an event `kind`
-(`unit_repair`, `unit_settled`, `graph_stopped`, `final_review`, `aggregate`),
+(`unit_repair`, `unit_settled`, `graph_stopped`, `final_review`, `aggregate`,
+`steering_undelivered`),
 its sanitized body, and the id of the `linear_outbox` row it produced in the
 same transaction.
 

@@ -532,6 +532,64 @@ describe("pipeline publication", () => {
     expect(parsePipelinePublication(canonicalJson(publication)).structured_execution?.units[0]?.unit_id).toBe("U1");
   });
 
+  it("bounds an oversized structured ledger so the receipt cannot evict its own link, event sentence, or findings", () => {
+    const { instance } = setup();
+    // 64 units, each with a gate rationale at its full 1,000-char cap --
+    // enough alone to exceed PUBLICATION_BODY_LIMIT (12,000) before the
+    // structured-ledger aggregate budget was introduced.
+    const units = Array.from({ length: 64 }, (_, index) => ({
+      unit_id: `U${index + 1}`,
+      ordinal: index,
+      dependencies: [],
+      status: "completed" as const,
+      terminal_level: "completed" as const,
+      alarm: false,
+      active_action_id: null,
+      integration_subject: SUBJECT,
+      attempts: [],
+      gates: [{
+        kind: "unit_acceptance",
+        evaluator: "human",
+        result: "passed",
+        outcome: "success",
+        subject: SUBJECT,
+        reason: "r".repeat(1_000),
+        artifact_hashes: [],
+        receipt_hash: "receipt-hash",
+      }],
+      downstream_context: [],
+    }));
+    const publication = buildLifecyclePublication({
+      instance: { ...instance, immutable_subject: SUBJECT },
+      outcome: "shipped",
+      reason: "The pull request merged.",
+      structuredExecution: {
+        graph: {
+          id: "graph-1",
+          parent_attempt_id: "attempt-parent",
+          parent_stage_id: "units",
+          integration_subject: SUBJECT,
+          aggregate_artifact_hash: "aggregate-hash",
+          aggregate_emitted_at: "2026-07-29T00:03:00.000Z",
+          stopped_at: null,
+          stop_reason: null,
+        },
+        units,
+        activity_log: [
+          { sequence: 1, kind: "aggregate", unit_id: null, body: "Structured execution complete." },
+        ],
+      },
+    });
+
+    expect(publication.body.length).toBeLessThanOrEqual(12_000);
+    expect(publication.links.length).toBeGreaterThan(0);
+    const link = publication.links[0]!;
+    expect(publication.body).toContain(`- [${link.label}](${link.url})`);
+    expect(publication.body).toMatch(/Your move:/);
+    expect(publication.body).toContain("earlier unit(s) omitted");
+    expect(renderGithubPipelineSummary(publication)).toContain(`- [${link.label}](${link.url})`);
+  });
+
   it("parses and renders a structured_execution envelope persisted before activity_log existed", () => {
     const { instance, attempt } = setup();
     const input = event(instance, attempt);

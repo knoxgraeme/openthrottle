@@ -4,6 +4,7 @@ import {
   buildExecutionPublicationSnapshot,
   executionLedgerLines,
   MAX_ACTIVITY_LOG_BYTES,
+  MAX_STRUCTURED_LEDGER_BYTES,
   type ExecutionPublicationSnapshot,
 } from "./execution-publication.js";
 
@@ -135,5 +136,96 @@ describe("execution publication", () => {
     expect(logLines[0]).toContain("[2]");
     expect(logLines[logLines.length - 1]).toContain(`[${totalEvents}]`);
     expect(lines.some((line) => line.includes("1 earlier entries omitted"))).toBe(true);
+  });
+
+  it("bounds the unit ledger to the aggregate structured-ledger byte budget, dropping the oldest units first at the exact boundary", () => {
+    // 9 single-digit unit ordinals keep every rendered unit line the same
+    // length, so padding the unit id lands the aggregate budget on an exact
+    // 8-kept/1-dropped split, mirroring the activity-log boundary test above.
+    const totalUnits = 9;
+    const perBlockBytes = MAX_STRUCTURED_LEDGER_BYTES / (totalUnits - 1);
+    const suffix = ": completed (no alarm); state=completed";
+    const fixedOverhead = "- U1".length + suffix.length + 1;
+    const padLength = perBlockBytes - fixedOverhead;
+    const snapshot: ExecutionPublicationSnapshot = {
+      graph: {
+        id: "graph-1",
+        parent_attempt_id: "attempt-parent",
+        parent_stage_id: "units",
+        integration_subject: null,
+        aggregate_artifact_hash: null,
+        aggregate_emitted_at: null,
+        stopped_at: null,
+        stop_reason: null,
+      },
+      units: Array.from({ length: totalUnits }, (_, index) => ({
+        unit_id: `U${index + 1}${"x".repeat(padLength)}`,
+        ordinal: index,
+        dependencies: [],
+        status: "completed" as const,
+        terminal_level: "completed" as const,
+        alarm: false,
+        active_action_id: null,
+        integration_subject: null,
+        attempts: [],
+        gates: [],
+        downstream_context: [],
+      })),
+    };
+
+    const lines = executionLedgerLines(snapshot);
+    const unitLines = lines.filter((line) => line.startsWith("- U"));
+
+    expect(unitLines).toHaveLength(totalUnits - 1);
+    expect(unitLines[0]).toContain("U2x");
+    expect(unitLines[unitLines.length - 1]).toContain(`U${totalUnits}x`);
+    expect(lines.some((line) => line.includes("1 earlier unit(s) omitted"))).toBe(true);
+    expect(Buffer.byteLength(lines.join("\n"), "utf8")).toBeLessThanOrEqual(MAX_STRUCTURED_LEDGER_BYTES + 100);
+  });
+
+  it("reserves the activity log's own budget first, so a huge unit ledger cannot starve the durable activity log", () => {
+    const snapshot: ExecutionPublicationSnapshot = {
+      graph: {
+        id: "graph-1",
+        parent_attempt_id: "attempt-parent",
+        parent_stage_id: "units",
+        integration_subject: null,
+        aggregate_artifact_hash: null,
+        aggregate_emitted_at: null,
+        stopped_at: null,
+        stop_reason: null,
+      },
+      units: Array.from({ length: 64 }, (_, index) => ({
+        unit_id: `U${index + 1}`,
+        ordinal: index,
+        dependencies: [],
+        status: "completed" as const,
+        terminal_level: "completed" as const,
+        alarm: false,
+        active_action_id: null,
+        integration_subject: null,
+        attempts: [],
+        gates: [{
+          kind: "unit_acceptance",
+          evaluator: "human",
+          result: "passed",
+          outcome: "success",
+          subject: null,
+          reason: "r".repeat(1_000),
+          artifact_hashes: [],
+          receipt_hash: "receipt-hash",
+        }],
+        downstream_context: [],
+      })),
+      activity_log: [
+        { sequence: 1, kind: "unit_settled", unit_id: "U1", body: "Unit U1 completed." },
+      ],
+    };
+
+    const lines = executionLedgerLines(snapshot);
+    expect(lines).toContain("**Structured Activity Log** (ordered)");
+    expect(lines).toContain("- [1] `U1` unit_settled: Unit U1 completed.");
+    expect(lines.some((line) => line.includes("earlier unit(s) omitted"))).toBe(true);
+    expect(Buffer.byteLength(lines.join("\n"), "utf8")).toBeLessThan(MAX_STRUCTURED_LEDGER_BYTES + 1_100);
   });
 });

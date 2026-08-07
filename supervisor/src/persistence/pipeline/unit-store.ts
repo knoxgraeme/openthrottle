@@ -244,6 +244,16 @@ export interface ExecutionUnitStore {
     parentAttemptId: string;
     reason: string;
   }): "stopped" | "already_stopped";
+  // Records that an operator steering reply arrived while this composite
+  // run was active and could not be bound to a live child action fence
+  // (there is none today -- see docs/SPEC.md "Live steering"), so it stays
+  // audit-only instead of vanishing silently when it is later canceled.
+  // A no-op when this parent attempt has no execution graph yet.
+  recordSteeringCaptured(input: {
+    parentAttemptId: string;
+    id: string;
+    body: string;
+  }): void;
   settleUnitTerminal(input: {
     parentAttemptId: string;
     unitId: string;
@@ -1351,6 +1361,22 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     return "stopped";
   });
 
+  const recordSteeringCaptured = db.transaction((
+    input: Parameters<ExecutionUnitStore["recordSteeringCaptured"]>[0]
+  ): void => {
+    const graph = graphStmt.get(input.parentAttemptId) as ExecutionUnitGraph | undefined;
+    if (!graph) return;
+    insertExecutionPublicationEvent({
+      db,
+      id: deterministicId("execution-activity-steering-undelivered", [input.id]),
+      graph,
+      unitId: null,
+      kind: "steering_undelivered",
+      body: input.body,
+      timestamp: now(),
+    });
+  });
+
   const settleUnitTerminal = db.transaction((
     input: Parameters<ExecutionUnitStore["settleUnitTerminal"]>[0]
   ): "settled" | "already_settled" => {
@@ -1533,6 +1559,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       `).all(parentAttemptId) as ExecutionDownstreamContext[];
     },
     stopActiveWork,
+    recordSteeringCaptured,
     settleUnitTerminal,
     healExpiredCurrentChildAction,
     renewChildActionLiveness(input) {

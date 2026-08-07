@@ -311,7 +311,13 @@ export type ExecutionPublicationEventKind =
   | "unit_settled"
   | "graph_stopped"
   | "final_review"
-  | "aggregate";
+  | "aggregate"
+  // A composite (`for_each_unit`) run has no steerable child action fence
+  // today (RU11 leaves this a documented gap rather than a silent one, see
+  // docs/SPEC.md "Live steering"): a reply captured while this run is active
+  // can never be bound to a live child, so capture records this event
+  // instead of only canceling the reply at cleanup with no durable trace.
+  | "steering_undelivered";
 
 // Inserts one durable, ordered child-publication event (RR18) plus its
 // correlated linear_outbox activity row in the caller's already-open SQL

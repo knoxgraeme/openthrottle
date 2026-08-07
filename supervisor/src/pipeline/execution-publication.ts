@@ -12,6 +12,19 @@ const MAX_CONTEXT_PER_UNIT = 3;
 // otherwise let the log evict the findings, event sentence, and links that
 // are rendered after it in the body.
 export const MAX_ACTIVITY_LOG_BYTES = 6_000;
+// The unit ledger loop above (units x gates x downstream context) has no
+// per-unit or per-gate count cap -- only each gate's own rationale string is
+// bounded (RATIONALE_LIMIT) -- so a graph with many units can alone exceed
+// PUBLICATION_BODY_LIMIT even with the activity log empty. This is the
+// aggregate ceiling for the *entire* structured-ledger block this function
+// returns (unit ledger + whole-change line + activity log combined), so the
+// rest of the publication body (findings, event sentence, links -- including
+// the PR link) always has PUBLICATION_BODY_LIMIT - MAX_STRUCTURED_LEDGER_BYTES
+// bytes of guaranteed headroom regardless of how many units or gates exist.
+// The activity log keeps its own MAX_ACTIVITY_LOG_BYTES allotment first (it
+// is the durable, restart-safe history); the live unit ledger gets whatever
+// remains of the aggregate budget.
+export const MAX_STRUCTURED_LEDGER_BYTES = 8_000;
 
 export interface ExecutionPublicationActivityEvent {
   sequence: number;
@@ -238,57 +251,92 @@ export function buildExecutionPublicationSnapshot(
 
 export function executionLedgerLines(snapshot: ExecutionPublicationSnapshot | undefined): string[] {
   if (!snapshot) return [];
-  const lines = ["**Structured Unit Ledger**"];
-  for (const unit of snapshot.units) {
+
+  const unitBlocks = snapshot.units.map((unit) => {
     const level = unit.terminal_level ?? "active";
     const alarm = unit.alarm ? "alarm" : "no alarm";
-    lines.push(`- ${unit.unit_id}: ${level} (${alarm}); state=${unit.status}${shortSubject(unit.integration_subject)}`);
+    const block = [
+      `- ${unit.unit_id}: ${level} (${alarm}); state=${unit.status}${shortSubject(unit.integration_subject)}`,
+    ];
     for (const gate of unit.gates) {
-      lines.push(`  - ${gate.kind}: ${gate.result}/${gate.outcome} by ${gate.evaluator}${shortSubject(gate.subject)} - ${gate.reason}`);
+      block.push(`  - ${gate.kind}: ${gate.result}/${gate.outcome} by ${gate.evaluator}${shortSubject(gate.subject)} - ${gate.reason}`);
     }
     for (const context of unit.downstream_context) {
-      lines.push(`  - context to ${context.to_unit_id}: ${context.summary}`);
+      block.push(`  - context to ${context.to_unit_id}: ${context.summary}`);
     }
-  }
-  if (snapshot.graph.aggregate_artifact_hash || snapshot.graph.integration_subject) {
-    lines.push(
-      `Whole change: subject${shortSubject(snapshot.graph.integration_subject)}; aggregate=${snapshot.graph.aggregate_artifact_hash ?? "pending"}`
-    );
-  }
-  // Restart-safe ordered history, distinct from the live per-unit state above:
-  // sourced from the durable child-publication event rows (see
+    return block;
+  });
+
+  const wholeChangeLines = snapshot.graph.aggregate_artifact_hash || snapshot.graph.integration_subject
+    ? [`Whole change: subject${shortSubject(snapshot.graph.integration_subject)}; aggregate=${snapshot.graph.aggregate_artifact_hash ?? "pending"}`]
+    : [];
+
+  // Restart-safe ordered history, distinct from the live per-unit state
+  // above: sourced from the durable child-publication event rows (see
   // listExecutionPublicationEvents), so this section converges from durable
-  // state after an outage instead of re-deriving from in-flight state.
+  // state after an outage instead of re-deriving from in-flight state. It
+  // keeps its own MAX_ACTIVITY_LOG_BYTES allotment first, ahead of the live
+  // unit ledger below, since it is the durable record.
+  const activityLogLines: string[] = [];
   if (snapshot.activity_log && snapshot.activity_log.length > 0) {
     const eventLines = snapshot.activity_log.map((event) => {
       const unitLabel = event.unit_id ? ` \`${event.unit_id}\`` : "";
       return `- [${event.sequence}]${unitLabel} ${event.kind}: ${event.body}`;
     });
-    const { lines: boundedEventLines, omitted } = boundActivityLogLinesByBytes(eventLines, MAX_ACTIVITY_LOG_BYTES);
-    lines.push("**Structured Activity Log** (ordered)");
+    const { items: boundedEventLines, omitted } = boundByBytes(
+      eventLines,
+      (line) => Buffer.byteLength(line, "utf8") + 1,
+      MAX_ACTIVITY_LOG_BYTES
+    );
+    activityLogLines.push("**Structured Activity Log** (ordered)");
     if (omitted > 0) {
-      lines.push(`- (${omitted} earlier entries omitted to stay within the publication byte budget)`);
+      activityLogLines.push(`- (${omitted} earlier entries omitted to stay within the publication byte budget)`);
     }
-    lines.push(...boundedEventLines);
+    activityLogLines.push(...boundedEventLines);
   }
+
+  // The live unit ledger gets whatever remains of the aggregate structured
+  // budget once the activity log's own allotment is set aside, so the
+  // combined block never exceeds MAX_STRUCTURED_LEDGER_BYTES regardless of
+  // unit/gate count.
+  const reservedBytes = Buffer.byteLength([...wholeChangeLines, ...activityLogLines].join("\n"), "utf8");
+  const unitLedgerBudget = Math.max(0, MAX_STRUCTURED_LEDGER_BYTES - reservedBytes);
+  const { items: keptUnitBlocks, omitted: omittedUnits } = boundByBytes(
+    unitBlocks,
+    (block) => Buffer.byteLength(block.join("\n"), "utf8") + block.length,
+    unitLedgerBudget
+  );
+
+  const lines = ["**Structured Unit Ledger**"];
+  if (omittedUnits > 0) {
+    lines.push(`- (${omittedUnits} earlier unit(s) omitted to stay within the publication byte budget)`);
+  }
+  for (const block of keptUnitBlocks) lines.push(...block);
+  lines.push(...wholeChangeLines);
+  lines.push(...activityLogLines);
   return lines;
 }
 
-// Keeps the most recent lines that fit within maxBytes, dropping the oldest
-// first -- always keeps at least one line so a single oversized entry still
-// renders rather than vanishing entirely.
-function boundActivityLogLinesByBytes(
-  lines: string[],
+// Keeps the most recent items that fit within maxBytes, dropping the oldest
+// first -- always keeps at least one item so a single oversized entry still
+// renders rather than vanishing entirely. Used both for individual activity
+// log lines and for whole unit-ledger blocks (a unit's summary line plus its
+// gate/context sub-lines), which callers keep atomic by measuring and
+// unshifting the block as one item so truncation never separates a unit's
+// gate detail from its own summary line.
+function boundByBytes<T>(
+  items: T[],
+  sizeOf: (item: T) => number,
   maxBytes: number
-): { lines: string[]; omitted: number } {
+): { items: T[]; omitted: number } {
   let usedBytes = 0;
-  const kept: string[] = [];
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    const line = lines[index]!;
-    const lineBytes = Buffer.byteLength(line, "utf8") + 1;
-    if (usedBytes + lineBytes > maxBytes && kept.length > 0) break;
-    usedBytes += lineBytes;
-    kept.unshift(line);
+  const kept: T[] = [];
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index]!;
+    const itemBytes = sizeOf(item);
+    if (usedBytes + itemBytes > maxBytes && kept.length > 0) break;
+    usedBytes += itemBytes;
+    kept.unshift(item);
   }
-  return { lines: kept, omitted: lines.length - kept.length };
+  return { items: kept, omitted: items.length - kept.length };
 }

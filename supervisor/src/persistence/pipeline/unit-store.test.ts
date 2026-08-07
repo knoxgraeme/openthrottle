@@ -5,6 +5,7 @@ import type { PipelineUnitPhaseBinding } from "../../pipeline/manifest.js";
 import type { ExecutionGateDecision } from "../../pipeline/execution-gates.js";
 import { openDb } from "../database.js";
 import { createExecutionUnitStore, type ExecutionUnitStore } from "./unit-store.js";
+import { executionLedgerLines } from "../../pipeline/execution-publication.js";
 
 let db: Database.Database | undefined;
 let timestamp = "2026-07-29T00:00:00.000Z";
@@ -3364,6 +3365,70 @@ describe("execution unit store", () => {
     const events = publicationEvents("attempt-parent");
     expect(events.filter((event) => event.kind === "graph_stopped")).toHaveLength(1);
     expect(events.find((event) => event.kind === "graph_stopped")?.body).toContain("model credential unavailable");
+  });
+
+  it("records a durable steering_undelivered event that surfaces in the rendered structured ledger", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+
+    store.recordSteeringCaptured({
+      parentAttemptId: "attempt-parent",
+      id: "steer-1",
+      body: "Operator steering message captured but not delivered: this run is a structured multi-unit stage.",
+    });
+
+    const events = publicationEvents("attempt-parent");
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      kind: "steering_undelivered",
+      unit_id: null,
+      outboxKind: "activity",
+    });
+    expect(events[0]?.body).toContain("structured multi-unit stage");
+
+    const snapshot = store.getStructuredExecutionPublicationForInstance("instance-1");
+    expect(executionLedgerLines(snapshot)).toEqual(expect.arrayContaining([
+      "**Structured Activity Log** (ordered)",
+      expect.stringContaining("steering_undelivered: Operator steering message captured"),
+    ]));
+
+    // A second capture is recorded as a distinct, separately ordered event.
+    store.recordSteeringCaptured({
+      parentAttemptId: "attempt-parent",
+      id: "steer-2",
+      body: "A second captured reply.",
+    });
+    const eventsAfterSecond = publicationEvents("attempt-parent");
+    expect(eventsAfterSecond).toHaveLength(2);
+    expect(eventsAfterSecond.map((event) => event.sequence)).toEqual([1, 2]);
+
+    // Retrying the same capture id (e.g. a retried request) is a no-op, not
+    // a duplicate or a re-sanitized overwrite.
+    store.recordSteeringCaptured({
+      parentAttemptId: "attempt-parent",
+      id: "steer-1",
+      body: "a different body must not overwrite the original",
+    });
+    expect(publicationEvents("attempt-parent")).toHaveLength(2);
+  });
+
+  it("is a no-op recording steering capture for a parent attempt with no execution graph", () => {
+    const store = setup();
+    expect(() => store.recordSteeringCaptured({
+      parentAttemptId: "attempt-without-a-graph",
+      id: "steer-1",
+      body: "should not throw",
+    })).not.toThrow();
+    expect(publicationEvents("attempt-without-a-graph")).toHaveLength(0);
   });
 
   it("gives the correlated linear_outbox activity an RFC-4122-shaped id", () => {

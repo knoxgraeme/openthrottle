@@ -1627,7 +1627,7 @@ CREATE TABLE execution_publication_events (
   parent_attempt_id TEXT NOT NULL,
   unit_id TEXT,
   sequence INTEGER NOT NULL,
-  kind TEXT NOT NULL CHECK(kind IN ('unit_repair', 'unit_settled', 'graph_stopped', 'final_review', 'aggregate')),
+  kind TEXT NOT NULL CHECK(kind IN ('unit_repair', 'unit_settled', 'graph_stopped', 'final_review', 'aggregate', 'steering_undelivered')),
   body TEXT NOT NULL,
   linear_outbox_id TEXT NOT NULL,
   created_at TEXT NOT NULL,
