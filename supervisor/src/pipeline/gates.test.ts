@@ -867,6 +867,132 @@ describe("deterministic supervisor stage gates", () => {
     `).get(fixture.instance.id)).toEqual({ count: 2 });
   });
 
+  it("consumes the pipeline's own repair synchronize webhook when it beats publish settlement", () => {
+    const fixture = setup("core/implement@4");
+    const oldPublishedCommit = "a".repeat(40);
+    const repairedSubject = "2".repeat(40);
+    const repairedPublishedCommit = "b".repeat(40);
+    settleRepairRoundPublishes(fixture, 1);
+
+    expect(routePipelineProviderEvent({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      ticket: fixture.tickets.getByIssueId("issue-1")!,
+      eventId: "provider-repair-before-race",
+      outcome: "semantic_repair_required",
+      summary: "Provider feedback for the first published head.",
+      evidence: ["https://github.com/owner/repo/pull/1#repair"],
+      payload: { kind: "pull_request_review", head_sha: oldPublishedCommit },
+      headSha: oldPublishedCommit,
+      pullRequestUrl: "https://github.com/owner/repo/pull/1",
+    })).toBe(true);
+    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+      status: "dispatchable",
+      active_stage_id: "repair_implementation",
+    });
+
+    const publishing = settleForwardChainToPublish(fixture, repairedSubject, "1".repeat(40), 2);
+    expect(publishing).toMatchObject({ status: "dispatchable", active_stage_id: "publish" });
+    fixture.tickets.setSetting("github-head:issue-1", repairedPublishedCommit);
+    expect(routePipelineProviderEvent({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      ticket: fixture.tickets.getByIssueId("issue-1")!,
+      eventId: `github-pull-synchronize:owner/repo:1:${repairedPublishedCommit}`,
+      outcome: "needs_human",
+      summary: "The pull-request head changed after the pipeline entered provider wait.",
+      evidence: ["https://github.com/owner/repo/pull/1"],
+      payload: { kind: "pull_request", action: "synchronize" },
+      headSha: repairedPublishedCommit,
+      pullRequestUrl: "https://github.com/owner/repo/pull/1",
+    })).toBe(true);
+    const snapshot = fixture.db.prepare("SELECT id FROM feedback_snapshots WHERE status = 'collecting'")
+      .get() as { id: string };
+
+    const settled = settleCurrentStage(fixture, "success", {
+      id: "publish-race-settles",
+      subject: repairedSubject,
+      preSubject: repairedSubject,
+      details: {
+        proposal_schema: "openthrottle.stage-proposal/v1",
+        published_commit: repairedPublishedCommit,
+        provider_revision: repairedPublishedCommit,
+      },
+    });
+    expect(settled).toMatchObject({
+      status: "waiting_provider",
+      active_stage_id: "provider",
+      published_commit: repairedPublishedCommit,
+    });
+
+    expect(drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(0);
+    expect(fixture.db.prepare("SELECT status FROM feedback_snapshots WHERE id = ?").get(snapshot.id))
+      .toEqual({ status: "consumed" });
+    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+      status: "waiting_provider",
+      active_stage_id: "provider",
+      terminal_outcome: null,
+    });
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "provider",
+      expected_subject: repairedSubject,
+    });
+  });
+
+  it("fails closed when a queued synchronize head differs from the settled publish subject", () => {
+    const fixture = setup("core/implement@4");
+    const oldPublishedCommit = "a".repeat(40);
+    const repairedSubject = "2".repeat(40);
+    const repairedPublishedCommit = "b".repeat(40);
+    const externalHead = "f".repeat(40);
+    settleRepairRoundPublishes(fixture, 1);
+
+    expect(routePipelineProviderEvent({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      ticket: fixture.tickets.getByIssueId("issue-1")!,
+      eventId: "provider-repair-before-external-race",
+      outcome: "semantic_repair_required",
+      summary: "Provider feedback for the first published head.",
+      evidence: ["https://github.com/owner/repo/pull/1#repair"],
+      payload: { kind: "pull_request_review", head_sha: oldPublishedCommit },
+      headSha: oldPublishedCommit,
+      pullRequestUrl: "https://github.com/owner/repo/pull/1",
+    })).toBe(true);
+    settleForwardChainToPublish(fixture, repairedSubject, "1".repeat(40), 2);
+    fixture.tickets.setSetting("github-head:issue-1", externalHead);
+    expect(routePipelineProviderEvent({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      ticket: fixture.tickets.getByIssueId("issue-1")!,
+      eventId: `github-pull-synchronize:owner/repo:1:${externalHead}`,
+      outcome: "needs_human",
+      summary: "The pull-request head changed after the pipeline entered provider wait.",
+      evidence: ["https://github.com/owner/repo/pull/1"],
+      payload: { kind: "pull_request", action: "synchronize" },
+      headSha: externalHead,
+      pullRequestUrl: "https://github.com/owner/repo/pull/1",
+    })).toBe(true);
+
+    settleCurrentStage(fixture, "success", {
+      id: "publish-external-race-settles",
+      subject: repairedSubject,
+      preSubject: repairedSubject,
+      details: {
+        proposal_schema: "openthrottle.stage-proposal/v1",
+        published_commit: repairedPublishedCommit,
+        provider_revision: repairedPublishedCommit,
+      },
+    });
+
+    expect(drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(1);
+    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+      status: "completion_pending_publication",
+      terminal_outcome: "needs_human",
+      published_commit: repairedPublishedCommit,
+    });
+  });
+
   it("settles a third publish under the raw 20-attempt budget after two provider feedback repair rounds", () => {
     const fixture = setup("core/implement@4", { maxAttempts: 20 });
 
@@ -1825,6 +1951,33 @@ describe("deterministic supervisor stage gates", () => {
     expect(fixture.db.prepare(
       "SELECT evaluator_kind, result FROM pipeline_gate_receipts WHERE attempt_id = ?"
     ).get(fixture.attempt.id)).toEqual({ evaluator_kind: "provider", result: "failed" });
+  });
+
+  it("fails closed for an external synchronize while already waiting on provider evidence", () => {
+    const fixture = setup("core/implement@4");
+    const observedHead = "d".repeat(40);
+    moveFixtureToProviderWait(fixture, SUBJECT);
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    fixture.tickets.setSetting("github-head:issue-1", observedHead);
+
+    expect(routePipelineProviderEvent({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      ticket: fixture.tickets.getByIssueId("issue-1")!,
+      eventId: `github-pull-synchronize:owner/repo:1:${observedHead}`,
+      outcome: "needs_human",
+      summary: "The pull-request head changed after the pipeline entered provider wait.",
+      evidence: ["https://github.com/owner/repo/pull/1"],
+      payload: { kind: "pull_request", action: "synchronize" },
+      headSha: observedHead,
+      pullRequestUrl: "https://github.com/owner/repo/pull/1",
+    })).toBe(true);
+
+    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+      status: "completion_pending_publication",
+      terminal_outcome: "needs_human",
+      published_commit: SUBJECT,
+    });
   });
 
   it("coalesces feedback arriving during repair and replays a claimed snapshot at provider wait", () => {
