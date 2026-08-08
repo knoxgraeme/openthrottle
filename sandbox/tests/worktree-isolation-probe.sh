@@ -104,10 +104,23 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  claudeProjectSlug,
   materializeNativeSessionState,
   nativeSessionStoragePath,
   sealNativeSessionPackage,
 } from "/opt/openthrottle/runner/native-session-package.mjs";
+
+// OPE-101: a repair cycle runs in a brand-new worktree, and Claude resolves
+// `--resume <id>` only under the project slug for its own cwd. Seal under one
+// worktree and restore into another so this probe covers the relocation the
+// image has to perform, not just which package got selected.
+const SEALING_WORKTREE = "/var/lib/openthrottle/worktrees/5ea1ed5ea1ed5ea1ed5ea1ed5ea1ed5e";
+const RESUMING_WORKTREE = "/var/lib/openthrottle/worktrees/re5umedre5umedre5umedre5umedre50";
+
+function sessionDirectoryFor(agent, profileRoot, workingDirectory) {
+  const sessionStore = nativeSessionStoragePath(agent, profileRoot);
+  return agent === "claude" ? join(sessionStore, claudeProjectSlug(workingDirectory)) : sessionStore;
+}
 
 function sessionRecord(agent, nativeSessionId) {
   if (agent === "claude") return `{"type":"user","sessionId":"${nativeSessionId}","message":{"role":"user","content":"x"}}\n`;
@@ -118,7 +131,7 @@ function sessionRecord(agent, nativeSessionId) {
 
 function writeSessionFile({ agent, nativeSessionId, contents = sessionRecord(agent, nativeSessionId), fileName = `${nativeSessionId}.jsonl` }) {
   const profileRoot = mkdtempSync(join(tmpdir(), `ot-native-${agent}-${nativeSessionId}-`));
-  const sessionStore = nativeSessionStoragePath(agent, profileRoot);
+  const sessionStore = sessionDirectoryFor(agent, profileRoot, SEALING_WORKTREE);
   mkdirSync(sessionStore, { recursive: true });
   writeFileSync(join(sessionStore, fileName), contents);
   return { profileRoot, sessionStore, fileName, contents };
@@ -139,13 +152,20 @@ function assertMaterializesOnlySelectedPackage(agent) {
   materializeNativeSessionState({
     request: { agent, nativeSessionId: currentId, contextPolicy: "resume_required" },
     profileRoot,
+    workingDirectory: RESUMING_WORKTREE,
   });
-  const sessionStore = nativeSessionStoragePath(agent, profileRoot);
+  // For Claude this is deliberately NOT the directory the package was sealed
+  // under: the restore has to have moved the transcript to the slug for the
+  // cwd the resume will run in, or `claude --resume` never finds it.
+  const sessionStore = sessionDirectoryFor(agent, profileRoot, RESUMING_WORKTREE);
   if (readFileSync(join(sessionStore, current.fileName), "utf8") !== current.contents) {
-    throw new Error(`${agent} canonical native session did not materialize`);
+    throw new Error(`${agent} canonical native session did not materialize under the resuming working directory`);
   }
   if (existsSync(join(sessionStore, `${siblingId}.jsonl`))) {
     throw new Error(`${agent} sibling native session package materialized`);
+  }
+  if (agent === "claude" && existsSync(sessionDirectoryFor(agent, profileRoot, SEALING_WORKTREE))) {
+    throw new Error("claude native session was left behind under the sealing working directory's slug");
   }
 }
 
