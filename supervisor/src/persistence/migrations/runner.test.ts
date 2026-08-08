@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { openDb } from "../database.js";
 import { canonicalJson, parsePipelineManifest, type PipelineUnitPhaseBinding } from "../../pipeline/manifest.js";
 import { createExecutionUnitStore } from "../pipeline/unit-store.js";
+import { GATE_RECEIPT_REASONS } from "../../pipeline/gates.js";
 import { applyDatabaseMigrations, databaseMigrations } from "./runner.js";
 
 let db: Database.Database | undefined;
@@ -127,6 +128,8 @@ describe("database migrations", () => {
       "5d9718a2604226bee84c076db80af6c44524f98997825d80b2d6d7ebb939ee1f",
       "523d304d8f13e0cf3852785ceb1c5878224a3ca22eb42766aa30eab1e7a8bf9d",
       "f58ac346a0822417b9d3ff3a40df91beb77d1f8c52c135ebb5a795bc29f73914",
+      "97611e1f750392871f83ff7944039c761695e834d54661ee225bd205b0c38b1b",
+      "393246d3d56b685e1a25e7a18e6a8a2485c70b96301836a8437bfac5568bd009",
     ]);
   });
 
@@ -1149,5 +1152,232 @@ describe("database migrations", () => {
     expect(
       db.prepare("SELECT actor_state FROM runs WHERE id = 'run-reaping'").get()
     ).toEqual({ actor_state: "settled" });
+  });
+
+  it("closes the execution_gate_receipts reason vocabulary and enforces it", () => {
+    db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    db.exec(`
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      )
+    `);
+    for (const migration of databaseMigrations.filter((candidate) => candidate.version <= 25)) {
+      migration.up(db);
+      db.prepare(`
+        INSERT INTO schema_migrations(version, name, checksum, applied_at)
+        VALUES (?, ?, ?, '2026-08-08T00:00:00.000Z')
+      `).run(migration.version, migration.name, migration.checksum);
+    }
+    const now = "2026-08-08T00:00:00.000Z";
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS tickets (
+        linear_issue_id TEXT PRIMARY KEY,
+        linear_issue_identifier TEXT NOT NULL,
+        linear_session_id TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        agent TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        base_branch TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS agent_sessions (
+        id TEXT PRIMARY KEY,
+        linear_issue_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        state TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(id, linear_issue_id, generation)
+      );
+      CREATE TABLE IF NOT EXISTS runs (
+        id TEXT PRIMARY KEY,
+        linear_issue_id TEXT NOT NULL,
+        linear_session_id TEXT NOT NULL,
+        session_generation INTEGER NOT NULL,
+        task_type TEXT NOT NULL,
+        token_hash TEXT NOT NULL,
+        status TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        expires_at TEXT
+      );
+      INSERT INTO tickets (
+        linear_issue_id, linear_issue_identifier, linear_session_id, branch, agent,
+        repo, base_branch, created_at, updated_at
+      ) VALUES ('issue-1', 'OPE-1', 'session-1', 'ot/ope-1', 'codex', 'owner/repo', 'main', '${now}', '${now}');
+      INSERT INTO agent_sessions (
+        id, linear_issue_id, generation, state, created_at, updated_at
+      ) VALUES ('session-1', 'issue-1', 1, 'current', '${now}', '${now}');
+      INSERT INTO runs (
+        id, linear_issue_id, linear_session_id, session_generation, task_type,
+        token_hash, status, started_at, expires_at
+      ) VALUES (
+        'run-parent', 'issue-1', 'session-1', 1, 'implement', 'request-hash',
+        'running', '${now}', '2026-08-08T01:00:00.000Z'
+      );
+      INSERT INTO repository_config_snapshots (
+        id, repository, base_commit, blob_sha, digest, normalized_config, created_at
+      ) VALUES ('config-1', 'owner/repo', '${"a".repeat(40)}', '${"b".repeat(40)}', '${"c".repeat(64)}', '{}', '${now}');
+      INSERT INTO runtime_capability_descriptors (
+        runtime_release, digest, protocol, normalized_descriptor, accepted_at
+      ) VALUES ('runtime/v1', '${"d".repeat(64)}', 'stage-executor@1', '{}', '${now}');
+      INSERT INTO pipeline_catalog_entries (
+        pipeline_id, version, digest, normalized_manifest, accepted_at
+      ) VALUES ('structured', 1, '${"e".repeat(64)}', '{}', '${now}');
+      INSERT INTO pipeline_instances (
+        id, linear_issue_id, linear_session_id, generation, pipeline_id, pipeline_version,
+        manifest_digest, normalized_manifest, repository, base_commit, branch,
+        repository_config_snapshot_id, repository_config_digest, runtime_release, capability_digest,
+        executor_protocol, authorized_capabilities, status, active_stage_id, state_version,
+        attempt_count, created_at, updated_at
+      ) VALUES (
+        'instance-1', 'issue-1', 'session-1', 1, 'structured', 1, '${"e".repeat(64)}',
+        '{}', 'owner/repo', '${"a".repeat(40)}', 'ot/ope-1', 'config-1', '${"c".repeat(64)}',
+        'runtime/v1', '${"d".repeat(64)}', 'stage-executor@1', '[]', 'running',
+        'units', 1, 1, '${now}', '${now}'
+      );
+      INSERT INTO pipeline_instance_stages (
+        pipeline_instance_id, stage_id, ordinal, status, attempt_count, created_at, updated_at
+      ) VALUES ('instance-1', 'units', 1, 'running', 1, '${now}', '${now}');
+      INSERT INTO pipeline_stage_attempts (
+        id, pipeline_instance_id, stage_id, attempt_ordinal, reentry_ordinal,
+        request_hash, idempotency_key, context_revision, native_context_policy,
+        planned_run_id, run_id, status, created_at, updated_at
+      ) VALUES (
+        'attempt-parent', 'instance-1', 'units', 1, 0, '${"f".repeat(64)}',
+        'attempt-key', 0, 'none', 'run-parent', 'run-parent', 'running', '${now}', '${now}'
+      );
+      INSERT INTO execution_graphs (
+        id, pipeline_instance_id, parent_attempt_id, parent_stage_id, parent_run_id,
+        graph_digest, plan_digest, created_at, updated_at
+      ) VALUES (
+        'graph-1', 'instance-1', 'attempt-parent', 'units', 'run-parent',
+        'graph-digest', 'plan-digest', '${now}', '${now}'
+      );
+      INSERT INTO execution_units (
+        id, execution_graph_id, pipeline_instance_id, parent_attempt_id, unit_id,
+        authored_order, dependency_unit_ids, status, active_work_attempt_id,
+        created_at, updated_at
+      ) VALUES (
+        'unit-1', 'graph-1', 'instance-1', 'attempt-parent', 'a',
+        0, '[]', 'completed', NULL, '${now}', '${now}'
+      );
+      INSERT INTO execution_work_attempts (
+        id, execution_graph_id, execution_unit_id, pipeline_instance_id, parent_attempt_id,
+        parent_run_id, unit_id, attempt_ordinal, action_kind, idempotency_key,
+        status, payload, created_at, updated_at
+      ) VALUES (
+        'action-1', 'graph-1', 'unit-1', 'instance-1', 'attempt-parent',
+        'run-parent', 'a', 1, 'lead', 'action-key-1',
+        'completed', '{}', '${now}', '${now}'
+      );
+    `);
+
+    // Seeded under the pre-v26 schema, which has no CHECK on reason -- proves
+    // an already-produced value survives the CHECK-adding rebuild.
+    db.prepare(`
+      INSERT INTO execution_gate_receipts (
+        id, execution_graph_id, execution_unit_id, execution_work_attempt_id,
+        parent_attempt_id, unit_id, gate_kind, evaluator_kind, subject, result,
+        outcome, reason, artifact_hashes, payload, receipt_hash, created_at
+      ) VALUES (
+        'receipt-1', 'graph-1', 'unit-1', 'action-1', 'attempt-parent', 'a',
+        'unit_acceptance', 'human', 'subject-1', 'passed', 'success',
+        'lead_scope_match_accept', '[]', '{}', 'receipt-hash-1', '${now}'
+      )
+    `).run();
+
+    applyDatabaseMigrations(db);
+
+    expect(db.prepare("SELECT version FROM schema_migrations WHERE version = 26").get()).toEqual({ version: 26 });
+    expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+    expect(
+      db.prepare("SELECT reason FROM execution_gate_receipts WHERE id = 'receipt-1'").get()
+    ).toEqual({ reason: "lead_scope_match_accept" });
+
+    const insertReceipt = (id: string, gateKind: string, reason: string) => db!.prepare(`
+      INSERT INTO execution_gate_receipts (
+        id, execution_graph_id, execution_unit_id, execution_work_attempt_id,
+        parent_attempt_id, unit_id, gate_kind, evaluator_kind, subject, result,
+        outcome, reason, artifact_hashes, payload, receipt_hash, created_at
+      ) VALUES (?, 'graph-1', 'unit-1', 'action-1', 'attempt-parent', 'a',
+        ?, 'human', 'subject-1', 'passed', 'success', ?, '[]', '{}', ?, '${now}')
+    `).run(id, gateKind, reason, `receipt-hash-${id}`);
+
+    expect(() => insertReceipt("receipt-bad", "final_review", "not_a_real_reason")).toThrow();
+    insertReceipt("receipt-good", "integration", "executor_integrated_candidate");
+    expect(
+      db.prepare("SELECT reason FROM execution_gate_receipts WHERE id = 'receipt-good'").get()
+    ).toEqual({ reason: "executor_integrated_candidate" });
+  });
+
+  it("closes orchestration_journal.kind by dropping the unproduced escalated_human value", () => {
+    db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      )
+    `);
+    for (const migration of databaseMigrations.filter((candidate) => candidate.version <= 25)) {
+      migration.up(db);
+      db.prepare(`
+        INSERT INTO schema_migrations(version, name, checksum, applied_at)
+        VALUES (?, ?, ?, '2026-08-08T00:00:00.000Z')
+      `).run(migration.version, migration.name, migration.checksum);
+    }
+    const now = "2026-08-08T00:00:00.000Z";
+    db.prepare(`
+      INSERT INTO orchestration_journal (
+        id, recorded_at, team, repository, issue, actor, kind, trigger, action, refs
+      ) VALUES ('journal-1', ?, 'team', 'owner/repo', 'OPE-1', 'supervisor', 'run_note', 'trigger', 'action', '[]')
+    `).run(now);
+
+    applyDatabaseMigrations(db);
+
+    expect(db.prepare("SELECT version FROM schema_migrations WHERE version = 27").get()).toEqual({ version: 27 });
+    expect(
+      db.prepare("SELECT kind FROM orchestration_journal WHERE id = 'journal-1'").get()
+    ).toEqual({ kind: "run_note" });
+
+    expect(() => db!.prepare(`
+      INSERT INTO orchestration_journal (
+        id, recorded_at, team, repository, issue, actor, kind, trigger, action, refs
+      ) VALUES ('journal-2', ?, 'team', 'owner/repo', 'OPE-1', 'human', 'escalated_human', 'trigger', 'action', '[]')
+    `).run(now)).toThrow();
+
+    db.prepare(`
+      INSERT INTO orchestration_journal (
+        id, recorded_at, team, repository, issue, actor, kind, trigger, action, refs
+      ) VALUES ('journal-3', ?, 'team', 'owner/repo', 'OPE-1', 'human', 'terminal_observed', 'trigger', 'action', '[]')
+    `).run(now);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM orchestration_journal").get()).toEqual({ count: 2 });
+  });
+
+  it("keeps the execution_gate_receipts reason CHECK constraint in sync with GATE_RECEIPT_REASONS", () => {
+    db = new Database(":memory:");
+    applyDatabaseMigrations(db);
+
+    const table = db.prepare(`
+      SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'execution_gate_receipts'
+    `).get() as { sql: string };
+    const match = table.sql.match(/reason TEXT NOT NULL CHECK\(reason IN \(([\s\S]*?)\)\)/);
+    if (!match) throw new Error("execution_gate_receipts.sql has no reason CHECK(reason IN (...)) clause");
+    const constraintReasons = match[1]!
+      .split(",")
+      .map((entry) => entry.trim().replace(/^'|'$/g, ""))
+      .filter(Boolean);
+
+    // The TS vocabulary (GATE_RECEIPT_REASONS) and the SQL CHECK constraint
+    // are two hand-maintained lists with no shared source -- this proves they
+    // stay in exact sync instead of only drifting apart at a live INSERT.
+    expect(new Set(constraintReasons)).toEqual(new Set(GATE_RECEIPT_REASONS));
+    expect(constraintReasons).toHaveLength(GATE_RECEIPT_REASONS.length);
   });
 });

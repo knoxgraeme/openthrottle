@@ -9,6 +9,7 @@ import {
 } from "../../pipeline/manifest.js";
 import { buildExecutionPublicationSnapshot } from "../../pipeline/execution-publication.js";
 import type { ExecutionGateDecision } from "../../pipeline/execution-gates.js";
+import type { GateReceiptReason } from "../../pipeline/gates.js";
 import {
   decideDownstreamContext,
   deriveUnitTerminalState,
@@ -134,7 +135,7 @@ export interface ExecutionGateReceipt {
   subject: string | null;
   result: ChildGateDecision["result"];
   outcome: StageOutcome;
-  reason: string;
+  reason: GateReceiptReason;
   artifact_hashes: string;
   payload: string;
   receipt_hash: string;
@@ -228,7 +229,7 @@ export interface ExecutionUnitStore {
     subject: string | null;
     result: ChildGateDecision["result"];
     outcome: StageOutcome;
-    reason: string;
+    reason: GateReceiptReason;
     artifactHashes: readonly string[];
     payload: string;
     hash: string;

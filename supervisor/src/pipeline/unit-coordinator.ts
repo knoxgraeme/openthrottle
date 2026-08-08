@@ -12,6 +12,7 @@ import type { PipelineCoordinatorEvent, PipelineEventArtifact } from "./coordina
 import {
   commandDecisionForEvidence,
   semanticDecisionForEvidence,
+  type GateReceiptReason,
   type GateResult,
 } from "./gates.js";
 import type { PipelineInstance, PipelineStageAttempt } from "./store.js";
@@ -256,7 +257,7 @@ export interface ChildGateDecision {
   subject: string;
   result: GateResult;
   outcome: StageOutcome;
-  reason: string;
+  reason: GateReceiptReason;
   artifactHashes: string[];
   payload: string;
   hash: string;

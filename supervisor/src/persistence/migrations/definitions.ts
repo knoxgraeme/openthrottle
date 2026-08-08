@@ -1641,6 +1641,124 @@ CREATE TABLE execution_publication_events (
 const executionPublicationEventsMigrationSource = `${executionPublicationEventsSchema}
 child-publication-event-contract:each reportable child transition durably inserts one ordered publication event and its correlated linear_outbox activity in the same transaction, so restart converges without duplication/v1`;
 
+// The reason vocabulary is closed and grown bottom-up per incident, mirroring
+// LAUNCH_FAILURE_REASONS (sandbox/runner/launch-failure.mjs): every value
+// below is a literal already produced by supervisor/src/pipeline/gates.ts or
+// execution-gates.ts (see GATE_RECEIPT_REASONS in gates.ts). A new reason
+// requires both a code change there and a follow-up migration here.
+const executionGateReceiptReasonEnumSchema = `
+ALTER TABLE execution_gate_receipts RENAME TO execution_gate_receipts_old4;
+DROP INDEX IF EXISTS execution_gate_receipts_parent_idx;
+
+CREATE TABLE execution_gate_receipts (
+  id TEXT PRIMARY KEY,
+  execution_graph_id TEXT NOT NULL,
+  execution_unit_id TEXT,
+  execution_work_attempt_id TEXT NOT NULL,
+  parent_attempt_id TEXT NOT NULL,
+  unit_id TEXT,
+  gate_kind TEXT NOT NULL CHECK(gate_kind IN (
+    'unit_completion', 'unit_command', 'unit_acceptance', 'final_semantic', 'integration', 'final_review'
+  )),
+  evaluator_kind TEXT NOT NULL CHECK(evaluator_kind IN ('semantic', 'command', 'human', 'publish_subject')),
+  subject TEXT,
+  result TEXT NOT NULL CHECK(result IN ('passed', 'failed', 'indeterminate', 'not_configured')),
+  outcome TEXT NOT NULL CHECK(outcome IN (
+    'success', 'no_change', 'semantic_repair_required', 'retryable_infrastructure_failure',
+    'needs_human', 'canceled', 'superseded', 'failure'
+  )),
+  reason TEXT NOT NULL CHECK(reason IN (
+    'blocking_findings', 'no_change_contradicted_by_tree_delta', 'typed_semantic_result',
+    'command_not_configured', 'command_terminated', 'command_exit_zero', 'command_exit_nonzero',
+    'command_receipts_missing_or_unexpected', 'required_command_not_configured', 'command_receipt_failed',
+    'all_commands_current', 'candidate_evidence_failed', 'worker_completion_not_success',
+    'lead_scope_match_accept', 'lead_requested_revision', 'lead_needs_human', 'lead_context_update',
+    'executor_integrated_candidate', 'integration_evidence_failed'
+  )),
+  artifact_hashes TEXT NOT NULL CHECK(json_valid(artifact_hashes)),
+  payload TEXT NOT NULL CHECK(json_valid(payload)),
+  receipt_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(execution_graph_id, execution_unit_id, execution_work_attempt_id, parent_attempt_id, unit_id)
+    REFERENCES execution_work_attempts(execution_graph_id, execution_unit_id, id, parent_attempt_id, unit_id) ON DELETE RESTRICT,
+  UNIQUE(execution_work_attempt_id, gate_kind)
+);
+CREATE INDEX execution_gate_receipts_parent_idx
+  ON execution_gate_receipts(parent_attempt_id, unit_id, created_at);
+
+INSERT INTO execution_gate_receipts (
+  id, execution_graph_id, execution_unit_id, execution_work_attempt_id,
+  parent_attempt_id, unit_id, gate_kind, evaluator_kind, subject, result,
+  outcome, reason, artifact_hashes, payload, receipt_hash, created_at
+)
+SELECT
+  id, execution_graph_id, execution_unit_id, execution_work_attempt_id,
+  parent_attempt_id, unit_id, gate_kind, evaluator_kind, subject, result,
+  outcome, reason, artifact_hashes, payload, receipt_hash, created_at
+FROM execution_gate_receipts_old4;
+
+DROP TABLE execution_gate_receipts_old4;
+`;
+
+const executionGateReceiptReasonEnumMigrationSource = `${executionGateReceiptReasonEnumSchema}
+reason-vocabulary-contract:execution_gate_receipts.reason is a closed enum grown bottom-up per incident, mirroring LAUNCH_FAILURE_REASONS/v1`;
+
+// escalated_human was declared in the v15 orchestration_journal.kind enum but
+// never had a producer: the decision corpus (including needs_human/escalation
+// outcomes) lives in the receipt/gate tables -- execution_gate_receipts above
+// already has composite join keys and CHECK-enforced enums for exactly this --
+// so orchestration_journal must not grow a parallel, duplicate decision kind.
+const orchestrationJournalCloseEscalatedHumanSchema = `
+ALTER TABLE orchestration_journal RENAME TO orchestration_journal_old;
+DROP INDEX IF EXISTS orchestration_journal_issue_recorded_idx;
+DROP INDEX IF EXISTS orchestration_journal_repository_recorded_idx;
+DROP INDEX IF EXISTS orchestration_journal_issue_lower_recorded_idx;
+DROP INDEX IF EXISTS orchestration_journal_repository_lower_recorded_idx;
+
+CREATE TABLE orchestration_journal (
+  id TEXT PRIMARY KEY,
+  recorded_at TEXT NOT NULL,
+  team TEXT NOT NULL,
+  repository TEXT NOT NULL,
+  issue TEXT NOT NULL,
+  instance_id TEXT,
+  run_id TEXT,
+  actor TEXT NOT NULL CHECK(actor IN ('supervisor', 'stage_agent', 'orchestrator', 'human')),
+  kind TEXT NOT NULL CHECK(kind IN (
+    'delegated', 'published', 'merged', 'relayed_finding', 'dispatched_fix',
+    'detected_stall', 'capacity_refused',
+    'terminal_observed', 'run_note'
+  )),
+  trigger TEXT NOT NULL,
+  action TEXT NOT NULL,
+  outcome TEXT,
+  refs TEXT NOT NULL,
+  note TEXT,
+  structured TEXT,
+  CHECK(json_valid(refs)),
+  CHECK(structured IS NULL OR json_valid(structured)),
+  CHECK(note IS NULL OR length(note) <= 8000)
+);
+CREATE INDEX orchestration_journal_issue_recorded_idx
+  ON orchestration_journal(issue, recorded_at);
+CREATE INDEX orchestration_journal_repository_recorded_idx
+  ON orchestration_journal(repository, recorded_at);
+CREATE INDEX orchestration_journal_issue_lower_recorded_idx
+  ON orchestration_journal(lower(issue), recorded_at);
+CREATE INDEX orchestration_journal_repository_lower_recorded_idx
+  ON orchestration_journal(lower(repository), recorded_at);
+
+INSERT INTO orchestration_journal
+SELECT id, recorded_at, team, repository, issue, instance_id, run_id, actor, kind,
+  trigger, action, outcome, refs, note, structured
+FROM orchestration_journal_old;
+
+DROP TABLE orchestration_journal_old;
+`;
+
+const orchestrationJournalCloseEscalatedHumanMigrationSource = `${orchestrationJournalCloseEscalatedHumanSchema}
+journal-kind-contract:orchestration_journal.kind never carries a declared value with zero producers; the decision corpus stays in the receipt/gate tables/v1`;
+
 function addExecutionGraphStopFence(db: Database.Database): void {
   if (!hasColumns(db, "execution_graphs", ["stopped_at"])) {
     db.exec("ALTER TABLE execution_graphs ADD COLUMN stopped_at TEXT");
@@ -2179,6 +2297,26 @@ const definitions: DatabaseMigrationDefinition[] = [
     up(db) {
       if (hasTable(db, "execution_graphs") && !hasTable(db, "execution_publication_events")) {
         db.exec(executionPublicationEventsSchema);
+      }
+    },
+  },
+  {
+    version: 26,
+    name: "execution-gate-receipt-reason-enum",
+    source: executionGateReceiptReasonEnumMigrationSource,
+    up(db) {
+      if (hasTable(db, "execution_gate_receipts")) {
+        db.exec(executionGateReceiptReasonEnumSchema);
+      }
+    },
+  },
+  {
+    version: 27,
+    name: "orchestration-journal-close-escalated-human",
+    source: orchestrationJournalCloseEscalatedHumanMigrationSource,
+    up(db) {
+      if (hasTable(db, "orchestration_journal")) {
+        db.exec(orchestrationJournalCloseEscalatedHumanSchema);
       }
     },
   },

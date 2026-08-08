@@ -14,6 +14,7 @@ import {
 import {
   commandDecisionForEvidence,
   semanticDecisionForEvidence,
+  type GateReceiptReason,
   type GateResult,
 } from "./gates.js";
 
@@ -53,7 +54,7 @@ export interface ExecutionGateDecision {
   gateKind: "unit_acceptance" | "integration" | "final_review";
   outcome: StageOutcome;
   result: GateResult;
-  reason: string;
+  reason: GateReceiptReason;
   subject: string;
   artifactHashes: string[];
   payload: string;
@@ -129,7 +130,7 @@ function assertEvidenceBinding(
 function commandOutcome(
   receipts: readonly CommandResultReceipt[],
   expectedCommandNames: readonly string[]
-): { outcome: StageOutcome; result: GateResult; reason: string } {
+): { outcome: StageOutcome; result: GateResult; reason: GateReceiptReason } {
   const expectedNames = [...new Set(expectedCommandNames)].sort();
   const actualNames = receipts.map((receipt) => receipt.payload.command).sort();
   if (canonicalJson(actualNames) !== canonicalJson(expectedNames)) {
@@ -157,7 +158,7 @@ function seal(kind: ExecutionGateDecision["gateKind"], input: {
   expected: StandardReceiptFence;
   outcome: StageOutcome;
   result: GateResult;
-  reason: string;
+  reason: GateReceiptReason;
   artifactHashes: string[];
 }): ExecutionGateDecision {
   const artifactHashes = [...input.artifactHashes].sort();
