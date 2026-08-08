@@ -7,10 +7,10 @@ import type {
   PipelineStore,
 } from "../../pipeline/store.js";
 import { sanitizeText } from "../../shared/sanitize.js";
+import { queryLimit, queryTimestamp } from "./query-filters.js";
 
 const NOTE_LIMIT = 8_000;
 const TEXT_LIMIT = 2_000;
-const QUERY_LIMIT = 200;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function bounded(value: string, max = TEXT_LIMIT): string {
@@ -96,13 +96,6 @@ function metadataForIssue(db: Database.Database, issueId: string): {
   };
 }
 
-function queryTimestamp(value: string | undefined, label: string): string | undefined {
-  if (value === undefined) return undefined;
-  const timestamp = Date.parse(value);
-  if (Number.isNaN(timestamp)) throw new Error(`${label} must be an ISO-8601 timestamp`);
-  return new Date(timestamp).toISOString();
-}
-
 export function createJournalStore(db: Database.Database, now: () => string): Pick<
   PipelineStore,
   "recordJournalEntry" | "listJournalEntries"
@@ -141,8 +134,7 @@ export function createJournalStore(db: Database.Database, now: () => string): Pi
     listJournalEntries(query: OrchestrationJournalQuery): OrchestrationJournalEntry[] {
       const from = queryTimestamp(query.from, "from");
       const to = queryTimestamp(query.to, "to");
-      const requestedLimit = Number.isSafeInteger(query.limit) ? query.limit! : QUERY_LIMIT;
-      const limit = Math.max(1, Math.min(requestedLimit, QUERY_LIMIT));
+      const limit = queryLimit(query.limit);
       const filters: string[] = [];
       const args: unknown[] = [];
       if (query.issueId) {

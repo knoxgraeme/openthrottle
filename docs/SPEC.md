@@ -660,14 +660,16 @@ two rules. The first names the gate (`pipeline/gates.ts`,
 transition (`persistence/pipeline/transition-store.ts`,
 `persistence/pipeline/instance-store.ts`), scheduler (`pipeline/coordinator.ts`,
 `pipeline/unit-coordinator.ts`), and effect-drain (`operations/pipeline-effects.ts`,
-`operations/unit-effects.ts`, `operations/structured-child-runtime.ts`)
-modules explicitly and fails if any of them imports the analysis surface. The
-second confines every `run_outcomes` SQL literal, anywhere in the source
-tree, to exactly `run-outcome-store.ts` (the write path) and
-`analysis-store.ts` (the read surface) -- closing the gap the first rule
-alone leaves open, where a decision module under the `persistence` boundary
-could otherwise read the corpus with a raw query of its own and no import to
-catch.
+`operations/unit-effects.ts`, `operations/structured-child-runtime.ts`,
+`pipeline/control.ts`, `pipeline/settlement.ts`) modules as roots and walks
+the import graph forward from them, transitively, so it fails if any of them
+-- or anything they come to depend on, at any depth -- imports the analysis
+surface, not just a direct import from a listed file itself. The second
+confines every `run_outcomes` SQL literal, anywhere in the source tree, to
+exactly `run-outcome-store.ts` (the write path) and `analysis-store.ts` (the
+read surface) -- closing the gap the first rule alone leaves open, where a
+decision module under the `persistence` boundary could otherwise read the
+corpus with a raw query of its own and no import to catch.
 
 Schema migrations are transactional, checksum-pinned, and idempotent. Migration
 code may recognize historical direct-run rows solely to reconcile an older

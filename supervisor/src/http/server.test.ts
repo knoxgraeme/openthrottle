@@ -334,6 +334,18 @@ describe("coordinator-only server", () => {
     expect(response.status).toBe(400);
   });
 
+  it("rejects a non-safe-integer limit instead of silently applying the default", async () => {
+    // Every other filter on this endpoint fails closed on a malformed value;
+    // `?limit=abc` (also `1.5`, `Infinity`) previously coerced to the 200-row
+    // default silently instead (PR #156 follow-up review).
+    for (const limit of ["abc", "1.5", "Infinity"]) {
+      const response = await app().request(`/analysis/runs?limit=${limit}`, {
+        headers: { Authorization: "Bearer status-token" },
+      });
+      expect(response.status, `limit=${limit}`).toBe(400);
+    }
+  });
+
   it("includes repeated sandbox ingestion failures in pipeline status", async () => {
     seedPipelineTicket();
     // Diagnostics are instance-scoped through the run/attempt binding, so the
@@ -869,6 +881,7 @@ describe("coordinator-only server", () => {
     seedTicket();
     for (const [path, method] of [
       ["/status", "GET"],
+      ["/status/journal", "GET"],
       ["/capabilities", "GET"],
       ["/analysis/runs", "GET"],
       ["/repositories", "GET"],
@@ -876,6 +889,7 @@ describe("coordinator-only server", () => {
       ["/tickets/OT-1/stop", "POST"],
       ["/tickets/OT-1/steer", "POST"],
       ["/tickets/OT-1/logs", "GET"],
+      ["/tickets/OT-1/journal", "GET"],
       ["/tickets/OT-1/publications/missing/retry", "POST"],
     ] as const) {
       const response = await app().request(path, { method });
