@@ -3173,6 +3173,42 @@ describe("executeLoopAction", () => {
     expect(lockActionDirectory).toHaveBeenCalledOnce();
   });
 
+  it("names the nested validator defect and keeps the model's final message when a receipt misses a field", () => {
+    // OPE-101: both failed generations emitted a receipt missing `schema`, and
+    // the ledger only ever said "loop action emitted invalid standard receipt".
+    // The precise message existed and was thrown away, and the engine's own
+    // final message was discarded too because it exited 0. Both must survive.
+    const valid = request({ agent: "claude" });
+    const { schema: _schema, ...withoutSchema } = standardReceipt(valid);
+    const stdout = [
+      JSON.stringify({ type: "system", subtype: "init", session_id: "s-1", model: "stub" }),
+      JSON.stringify({ type: "result", subtype: "success", is_error: false, result: JSON.stringify(withoutSchema) }),
+    ].join("\n");
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      runLoopAgent: () => ({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout,
+        stderr: "",
+        nativeSessionId: null,
+      }),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("failure");
+    // The nested-layer error names the field. The top-layer candidate is the
+    // stream-json envelope, whose "unknown field subtype" must never win.
+    expect(result.receipt).toContain("loop action emitted invalid standard receipt: standard receipt is missing field schema");
+    expect(result.receipt).not.toContain("unknown field subtype");
+    // A bounded, sanitized head of what the model actually said travels with it.
+    expect(result.receipt).toContain("subtype=success");
+    expect(result.receipt).toContain("unit_completion");
+  });
+
   it("relocks the worker worktree when the loop agent throws before evidence", () => {
     const lockWorkerWorktree = vi.fn();
     const lockActionDirectory = vi.fn();
