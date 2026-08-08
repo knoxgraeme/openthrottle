@@ -1659,7 +1659,7 @@ describe("pipeline publication", () => {
     expect(publication.body).not.toMatch(/^\+\d+ more$/m);
   });
 
-  it("carries review findings and dispositions into later publications and the final summary", () => {
+  it("carries review findings with current dispositions into later publications and the final summary", () => {
     const { pipelines, instance, attempt } = setup("fixture/agent@1");
 
     const fresh = semanticEvent({
@@ -1717,12 +1717,15 @@ describe("pipeline publication", () => {
     coordinatePipelineEvent(pipelines, repair.event, undefined, repair.receipt);
     const repairPublication = parsePipelinePublication(pipelines.listPublications(instance.id)
       .find((row) => row.kind === "linear_ledger" && row.attempt_id === repairAttempt.id)!.payload);
-    // The repair stage emitted no findings of its own, yet the earlier review
-    // findings stay visible with their updated dispositions.
+    // The repair stage emitted no findings of its own, yet earlier review
+    // findings stop rendering as still carried to repair once the repair
+    // branch produces a new tree.
     expect(repairPublication.body)
       .toContain("[P1] provider-snapshot-bounding — snapshot payload unbounded → fixed in-stage");
     expect(repairPublication.body)
-      .toContain("[P2] status-copy — receipt copy needs clarity → carried to repair");
+      .toContain("[P2] status-copy — receipt copy needs clarity → repaired-at-cccccccccccc");
+    expect(repairPublication.body)
+      .not.toContain("[P2] status-copy — receipt copy needs clarity → carried to repair");
 
     const finalAttempt = pipelines.getActiveAttempt(instance.id)!;
     expect(finalAttempt.stage_id).toBe("review");
