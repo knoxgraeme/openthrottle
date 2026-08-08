@@ -384,7 +384,9 @@ describe("pipeline coordinator", () => {
       outcome: "shipped",
       closed_reason: "success",
       fault_attribution: null,
-      token_cost_usd: 0,
+      // No production path stamps runs.cost_usd -- NULL means unmeasured,
+      // never a fabricated 0.
+      token_cost_usd: null,
     });
     expect(JSON.parse(outcome!.repair_rounds_by_unit)).toEqual({});
     expect(JSON.parse(outcome!.phase_durations_ms)).toEqual({});

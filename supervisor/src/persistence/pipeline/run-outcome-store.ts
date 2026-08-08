@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import { parseStandardReceipt } from "@openthrottle/contracts";
-import { canonicalJson } from "../../pipeline/manifest.js";
+import { canonicalJson, PIPELINE_OUTCOMES, STAGE_OUTCOMES } from "../../pipeline/manifest.js";
+import { FAULT_ATTRIBUTIONS } from "../../pipeline/fault-attribution.js";
 import type {
   CoordinatorTransitionWrite,
   PipelineInstance,
@@ -10,11 +11,18 @@ import type {
 import { getLatestExecutionGraphForInstance } from "./unit-store.js";
 
 export interface RunOutcomeStore {
-  /** Called once, from within applyTransition's transaction, when write.terminalOutcome is set. */
+  /**
+   * Called once per pipeline instance, at its terminal transition: either
+   * applyTransition's normal settlement (persistence/pipeline/transition-store.ts,
+   * within its own db.transaction) or supersedeOtherInstances' fencing of a
+   * superseded generation (persistence/pipeline/instance-store.ts, within its
+   * own separate db.transaction). `attempt` is undefined when the superseded
+   * instance had no dispatchable/running attempt at fencing time.
+   */
   recordSettlement(
     instance: PipelineInstance,
-    attempt: PipelineStageAttempt,
-    write: CoordinatorTransitionWrite,
+    attempt: PipelineStageAttempt | undefined,
+    write: Pick<CoordinatorTransitionWrite, "terminalOutcome" | "outcome">,
     timestamp: string
   ): void;
   getRunOutcome(pipelineInstanceId: string): RunOutcome | undefined;
@@ -26,6 +34,14 @@ interface SkillDigest {
   skill_package_digest: string | null;
 }
 
+// No shared runtime vocabulary exists for this union elsewhere in the
+// codebase (every other call site inlines the same literal union as a type,
+// e.g. pipeline/types.ts's `Agent` type); exported so migrations/
+// runner.test.ts can cross-check it against run_outcomes.engine's CHECK
+// constraint the same way it does for PIPELINE_OUTCOMES/STAGE_OUTCOMES/
+// FAULT_ATTRIBUTIONS.
+export const ENGINES = ["claude", "codex", "opencode"] as const;
+
 export function createRunOutcomeStore(db: Database.Database): RunOutcomeStore {
   const runFaultStmt = db.prepare("SELECT fault_attribution FROM runs WHERE id = ?");
   const unitRepairRoundsStmt = db.prepare(
@@ -35,8 +51,11 @@ export function createRunOutcomeStore(db: Database.Database): RunOutcomeStore {
     SELECT stage_id, started_at, completed_at FROM pipeline_stage_attempts
     WHERE pipeline_instance_id = ? AND started_at IS NOT NULL AND completed_at IS NOT NULL
   `);
+  // No production path stamps runs.cost_usd yet (real cost plumbing is
+  // out of scope here), so SUM legitimately returns NULL -- never coalesced
+  // to a fabricated 0 -- until a real producer starts reporting cost.
   const runCostSumStmt = db.prepare(`
-    SELECT COALESCE(SUM(r.cost_usd), 0) AS total
+    SELECT SUM(r.cost_usd) AS total
     FROM runs r
     JOIN pipeline_stage_attempts a ON a.run_id = r.id
     WHERE a.pipeline_instance_id = ?
@@ -51,7 +70,7 @@ export function createRunOutcomeStore(db: Database.Database): RunOutcomeStore {
     WHERE pipeline_instance_id = ? AND receipt IS NOT NULL
   `);
   const insertStmt = db.prepare(`
-    INSERT OR IGNORE INTO run_outcomes (
+    INSERT INTO run_outcomes (
       pipeline_instance_id, linear_issue_id, generation, execution_graph_id, plan_digest,
       base_commit, engine, outcome, closed_reason, fault_attribution, generations_consumed,
       repair_rounds_by_unit, phase_durations_ms, token_cost_usd, skill_digests, created_at
@@ -63,9 +82,50 @@ export function createRunOutcomeStore(db: Database.Database): RunOutcomeStore {
   return {
     recordSettlement(instance, attempt, write, timestamp) {
       if (!write.terminalOutcome) return;
-      const fault = attempt.run_id
+      // PK idempotency, made explicit instead of leaning on INSERT OR IGNORE:
+      // that statement form ignores every constraint violation, not just the
+      // primary-key replay this guards, so a CHECK/NOT-NULL violation from
+      // vocabulary drift would otherwise vanish the same way -- the exact
+      // silent row-drop this corpus exists to prevent. Recorded exactly once.
+      if (getStmt.get(instance.id)) return;
+      const fault = attempt?.run_id
         ? (runFaultStmt.get(attempt.run_id) as { fault_attribution: RunOutcome["fault_attribution"] } | undefined)
         : undefined;
+      // write.terminalOutcome/write.outcome/instance.agent are TS-typed to
+      // closed enums, but that is load-bearing only at the call site -- a
+      // future caller built from less-trusted data (a cast, a new producer,
+      // or -- for engine -- a legacy row backfilled by
+      // migrations/definitions.ts's backfillPipelineExecutionIdentity from a
+      // NULL/missing ticket) would otherwise fail only at the DB CHECK
+      // constraint, an opaque SqliteError naming neither field nor value
+      // (same rationale as insertGateReceipt's GATE_RECEIPT_REASONS check).
+      // This is measurement data, not a pipeline-correctness gate, so
+      // failing here is a warn-and-skip (like the receipt-parse failure
+      // below) rather than a throw that would abort the caller's
+      // transaction -- which, for both call sites, already committed the
+      // real terminal_outcome/state_version write -- over a corpus-only
+      // concern. fault_attribution is the only nullable column of the four
+      // (null legitimately means "not a fault"); outcome/closed_reason/engine
+      // are all NOT NULL, so a null there -- e.g. a legacy pipeline_instances
+      // row whose `agent` a correlated backfill left NULL -- must warn-and-skip
+      // exactly like an unrecognized value would, not be waved through.
+      const vocabularyChecks: Array<{ label: string; value: string | null; vocab: readonly string[]; nullable?: true }> = [
+        { label: "outcome", value: write.terminalOutcome, vocab: PIPELINE_OUTCOMES },
+        { label: "closed_reason", value: write.outcome, vocab: STAGE_OUTCOMES },
+        { label: "engine", value: instance.agent, vocab: ENGINES },
+        { label: "fault_attribution", value: fault?.fault_attribution ?? null, vocab: FAULT_ATTRIBUTIONS, nullable: true },
+      ];
+      for (const check of vocabularyChecks) {
+        if (check.value === null) {
+          if (check.nullable) continue;
+          console.warn(`[run-outcome-store] skipped settlement for ${instance.id}: missing ${check.label}`);
+          return;
+        }
+        if (!check.vocab.includes(check.value)) {
+          console.warn(`[run-outcome-store] skipped settlement for ${instance.id}: unrecognized ${check.label} ${JSON.stringify(check.value)}`);
+          return;
+        }
+      }
       const graph = getLatestExecutionGraphForInstance(db, instance.id);
 
       const repairRoundsByUnit = graph
@@ -88,7 +148,7 @@ export function createRunOutcomeStore(db: Database.Database): RunOutcomeStore {
         }
       }
 
-      const costRow = runCostSumStmt.get(instance.id) as { total: number };
+      const costRow = runCostSumStmt.get(instance.id) as { total: number | null };
 
       // Parsed via the same contract-validated parser every other receipt
       // reader uses (structured-child-runtime.ts), instead of an ad hoc

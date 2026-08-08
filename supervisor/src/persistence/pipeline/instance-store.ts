@@ -27,6 +27,7 @@ import {
   validatePinnedInstance,
 } from "./helpers.js";
 import { createJournalStore } from "./journal-store.js";
+import { createRunOutcomeStore } from "./run-outcome-store.js";
 import { getStructuredExecutionPublicationForAttempt } from "./unit-store.js";
 
 interface ValidatedInstanceSeed {
@@ -63,6 +64,7 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
   const getAttemptStmt = db.prepare("SELECT * FROM pipeline_stage_attempts WHERE id = ?");
   const persistPublication = createPipelinePublicationWriter(db);
   const journal = createJournalStore(db, now);
+  const runOutcomes = createRunOutcomeStore(db);
   const runtimeResourceForInstance = (
     instance: PipelineInstance | undefined
   ): PipelineRuntimeResource | undefined => {
@@ -191,6 +193,17 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
     const nextVersion = instance.state_version + 1;
     const activeAttempt = getSupersedableAttempt(instance.id);
     markInstanceSuperseded(instance, nextVersion, timestamp);
+    // markInstanceSuperseded writes terminal_outcome = 'superseded' directly
+    // -- it never routes through applyTransition, so without this the
+    // settlement rollup writer never runs for a superseded generation and
+    // the 'superseded' outcome/closed_reason values are unreachable in
+    // run_outcomes.
+    runOutcomes.recordSettlement(
+      instance,
+      activeAttempt,
+      { terminalOutcome: "superseded", outcome: "superseded" },
+      timestamp
+    );
     publishSupersededInstance(instance, activeAttempt, nextVersion, timestamp);
     enqueueSupersedeStop(instance, activeAttempt, nextVersion, currentSessionId, timestamp);
   };

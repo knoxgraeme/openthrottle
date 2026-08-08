@@ -1780,10 +1780,13 @@ const runFaultAttributionMigrationSource = `${runFaultAttributionSchema}
 fault-attribution-contract:runs.fault_attribution is stamped at settlement alongside settlement_reason, closed to executor/agent/provider/unknown, NULL only for pre-attribution rows/v1`;
 
 // One deterministic row per pipeline instance, written exactly once at the
-// terminal transition (persistence/pipeline/transition-store.ts applyTransition,
-// the sole writer of pipeline_instances.terminal_outcome). Supervisor-derived
-// facts only -- no agent-authored free text -- so this is safe to retain far
-// longer than operational tables and to read for skill-tuning measurement.
+// terminal transition -- either persistence/pipeline/transition-store.ts
+// applyTransition's normal settlement, or persistence/pipeline/
+// instance-store.ts supersedeOtherInstances' fencing of a superseded
+// generation (both write pipeline_instances.terminal_outcome). Supervisor-
+// derived facts only -- no agent-authored free text -- so this is safe to
+// retain far longer than operational tables and to read for skill-tuning
+// measurement.
 const runOutcomesSchema = `
 CREATE TABLE run_outcomes (
   pipeline_instance_id TEXT PRIMARY KEY,
@@ -1813,7 +1816,9 @@ CREATE TABLE run_outcomes (
   generations_consumed INTEGER NOT NULL CHECK(generations_consumed >= 1),
   repair_rounds_by_unit TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(repair_rounds_by_unit)),
   phase_durations_ms TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(phase_durations_ms)),
-  token_cost_usd REAL NOT NULL DEFAULT 0 CHECK(token_cost_usd >= 0),
+  -- No production path stamps a token cost yet; NULL means unmeasured,
+  -- never a fabricated 0.
+  token_cost_usd REAL CHECK(token_cost_usd IS NULL OR token_cost_usd >= 0),
   skill_digests TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(skill_digests)),
   created_at TEXT NOT NULL,
   FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,

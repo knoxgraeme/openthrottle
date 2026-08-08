@@ -4,9 +4,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { openDb } from "../database.js";
-import { canonicalJson, parsePipelineManifest, type PipelineUnitPhaseBinding } from "../../pipeline/manifest.js";
+import {
+  canonicalJson,
+  parsePipelineManifest,
+  PIPELINE_OUTCOMES,
+  STAGE_OUTCOMES,
+  type PipelineUnitPhaseBinding,
+} from "../../pipeline/manifest.js";
 import { createExecutionUnitStore } from "../pipeline/unit-store.js";
 import { GATE_RECEIPT_REASONS } from "../../pipeline/gates.js";
+import { FAULT_ATTRIBUTIONS } from "../../pipeline/fault-attribution.js";
+import { ENGINES } from "../pipeline/run-outcome-store.js";
 import { applyDatabaseMigrations, databaseMigrations } from "./runner.js";
 
 let db: Database.Database | undefined;
@@ -131,7 +139,7 @@ describe("database migrations", () => {
       "97611e1f750392871f83ff7944039c761695e834d54661ee225bd205b0c38b1b",
       "393246d3d56b685e1a25e7a18e6a8a2485c70b96301836a8437bfac5568bd009",
       "d07f005df485a8b7506a2e81046846c0c070a4790109e22e8c7081df9a2f29f0",
-      "f2938e6bce2d6d1af5de90cb806f8f098692349a89b3b580d8cf013f9f45d76e",
+      "f814f7519462623d684c0d8b15f997afeaa4391ac861dc93ecd6dd8326677367",
     ]);
   });
 
@@ -1362,23 +1370,34 @@ describe("database migrations", () => {
     expect(db.prepare("SELECT COUNT(*) AS count FROM orchestration_journal").get()).toEqual({ count: 2 });
   });
 
+  // Shared by every "hand-maintained SQL CHECK(col IN (...)) vocabulary stays
+  // in sync with its TS const array" test below -- one extraction regex
+  // instead of a copy per table/column, generalized to also match a nullable
+  // `col IS NULL OR col IN (...)` variant (needed for run_outcomes'
+  // fault_attribution, the one nullable column among them).
+  function checkConstraintValues(db: Database.Database, table: string, column: string): string[] {
+    const row = db.prepare(`
+      SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?
+    `).get(table) as { sql: string } | undefined;
+    if (!row) throw new Error(`table ${table} was not found in sqlite_master`);
+    const match = row.sql.match(new RegExp(
+      `${column} TEXT(?: NOT NULL)? CHECK\\(\\s*(?:${column} IS NULL OR\\s*)?${column} IN \\(([\\s\\S]*?)\\)\\s*\\)`
+    ));
+    if (!match) throw new Error(`${table}.sql has no ${column} CHECK(${column} IN (...)) clause`);
+    return match[1]!
+      .split(",")
+      .map((entry) => entry.trim().replace(/^'|'$/g, ""))
+      .filter(Boolean);
+  }
+
   it("keeps the execution_gate_receipts reason CHECK constraint in sync with GATE_RECEIPT_REASONS", () => {
     db = new Database(":memory:");
     applyDatabaseMigrations(db);
 
-    const table = db.prepare(`
-      SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'execution_gate_receipts'
-    `).get() as { sql: string };
-    const match = table.sql.match(/reason TEXT NOT NULL CHECK\(reason IN \(([\s\S]*?)\)\)/);
-    if (!match) throw new Error("execution_gate_receipts.sql has no reason CHECK(reason IN (...)) clause");
-    const constraintReasons = match[1]!
-      .split(",")
-      .map((entry) => entry.trim().replace(/^'|'$/g, ""))
-      .filter(Boolean);
-
     // The TS vocabulary (GATE_RECEIPT_REASONS) and the SQL CHECK constraint
     // are two hand-maintained lists with no shared source -- this proves they
     // stay in exact sync instead of only drifting apart at a live INSERT.
+    const constraintReasons = checkConstraintValues(db, "execution_gate_receipts", "reason");
     expect(new Set(constraintReasons)).toEqual(new Set(GATE_RECEIPT_REASONS));
     expect(constraintReasons).toHaveLength(GATE_RECEIPT_REASONS.length);
   });
@@ -1396,5 +1415,22 @@ describe("database migrations", () => {
     expect(table.sql).toMatch(/closed_reason TEXT NOT NULL CHECK\(closed_reason IN \(/);
     expect(table.sql).toMatch(/fault_attribution TEXT CHECK\(/);
     expect(db.prepare("SELECT version FROM schema_migrations WHERE version = 29").get()).toEqual({ version: 29 });
+  });
+
+  // The four hand-maintained CHECK vocabularies on run_outcomes (outcome,
+  // closed_reason, engine, fault_attribution) each share no SQL-level source
+  // with their TS vocabulary -- these prove they stay in exact sync instead
+  // of only drifting apart at a live INSERT.
+  it.each([
+    ["outcome", PIPELINE_OUTCOMES],
+    ["closed_reason", STAGE_OUTCOMES],
+    ["engine", ENGINES],
+    ["fault_attribution", FAULT_ATTRIBUTIONS],
+  ] as const)("keeps the run_outcomes %s CHECK constraint in sync", (column, vocabulary) => {
+    db = new Database(":memory:");
+    applyDatabaseMigrations(db);
+    const constraintValues = checkConstraintValues(db, "run_outcomes", column);
+    expect(new Set(constraintValues)).toEqual(new Set(vocabulary));
+    expect(constraintValues).toHaveLength(vocabulary.length);
   });
 });

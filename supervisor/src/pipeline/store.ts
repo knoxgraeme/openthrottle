@@ -251,7 +251,8 @@ export interface RunOutcome {
   repair_rounds_by_unit: string;
   /** JSON object: { [stage_id]: duration_ms } */
   phase_durations_ms: string;
-  token_cost_usd: number;
+  /** NULL means unmeasured -- no production path supplies cost yet. */
+  token_cost_usd: number | null;
   /** JSON array of { skill, skill_package_digest } */
   skill_digests: string;
   created_at: string;
