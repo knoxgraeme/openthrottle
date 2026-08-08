@@ -5,6 +5,8 @@ import {
   buildStandardReceiptArtifacts,
   buildSemanticArtifacts,
   digest,
+  isStageProposalShaped,
+  isStandardReceiptShaped,
   parseAgentJson,
   validateStandardReceipt,
   validateSemanticProposal,
@@ -347,5 +349,81 @@ describe("agent-authored JSON parsing", () => {
     // Only one fence is peeled: two concatenated blocks stay unparseable.
     expect(() => parseAgentJson(`\`\`\`json\n${pretty}\n\`\`\`\n\`\`\`json\n${pretty}\n\`\`\``)).toThrow(SyntaxError);
     expect(() => parseAgentJson("not json at all")).toThrow(SyntaxError);
+  });
+});
+
+describe("narrated agent JSON extraction", () => {
+  const receipt = { schema: "openthrottle.receipt/v1", type: "unit_completion", result: "success" };
+  const proposal = { schema: "openthrottle.stage-proposal/v1", suggested_outcome: "success", summary: "ok" };
+  const asReceipt = { qualifies: isStandardReceiptShaped, label: "receipt" };
+  const asProposal = { qualifies: isStageProposalShaped, label: "proposal" };
+  const fence = (value) => `\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``;
+  // OPE-101 generation 8, verbatim.
+  const narrated = `Good — only the test file is modified. Now composing the receipt.\n\n${fence(receipt)}`;
+
+  it("recognizes only an exact schema id and a known kind", () => {
+    expect(isStandardReceiptShaped(receipt)).toBe(true);
+    expect(isStandardReceiptShaped({ ...receipt, type: "unit_invented" })).toBe(false);
+    expect(isStandardReceiptShaped({ ...receipt, schema: "openthrottle.receipt/v2" })).toBe(false);
+    expect(isStandardReceiptShaped({ type: "unit_completion" })).toBe(false);
+    expect(isStandardReceiptShaped([receipt])).toBe(false);
+    expect(isStandardReceiptShaped(null)).toBe(false);
+    expect(isStageProposalShaped(proposal)).toBe(true);
+    expect(isStageProposalShaped({ ...proposal, suggested_outcome: "canceled" })).toBe(false);
+    expect(isStageProposalShaped(receipt)).toBe(false);
+    expect(isStandardReceiptShaped(proposal)).toBe(false);
+  });
+
+  it("takes the one recognizable block out of a narrated message", () => {
+    expect(parseAgentJson(narrated, asReceipt)).toEqual(receipt);
+    expect(parseAgentJson(`${fence(receipt)}\n\nLet me know if anything else is needed.`, asReceipt)).toEqual(receipt);
+    expect(parseAgentJson(`Before.\n\`\`\`\n${JSON.stringify(receipt)}\n\`\`\`\nAfter.`, asReceipt)).toEqual(receipt);
+    // Other fenced blocks are not competition unless they are receipts too.
+    expect(parseAgentJson(
+      `Diff:\n\`\`\`diff\n- old\n+ new\n\`\`\`\nReceipt:\n${fence(receipt)}`,
+      asReceipt,
+    )).toEqual(receipt);
+    expect(parseAgentJson(`Notes.\n${fence(proposal)}`, asProposal)).toEqual(proposal);
+  });
+
+  it("refuses to choose between recognizable blocks and says how many it saw", () => {
+    const twoReceipts = `${narrated}\n\nOn reflection, this one:\n${fence({ ...receipt, result: "failure" })}`;
+    expect(() => parseAgentJson(twoReceipts, asReceipt))
+      .toThrow(/2 receipt-like blocks found; refusing to guess which one is the receipt/);
+    try {
+      parseAgentJson(twoReceipts, asReceipt);
+    } catch (error) {
+      // The flag is what lets parseLoopReceipt prefer this over a validator
+      // error that would describe only whichever block it reached first.
+      expect(error.ambiguousAgentJson).toBe(true);
+    }
+    expect(() => parseAgentJson(`x\n${fence(proposal)}\ny\n${fence(proposal)}`, asProposal))
+      .toThrow(/2 proposal-like blocks found/);
+  });
+
+  it("keeps the original parse error when nothing in the message is recognizable", () => {
+    // A fenced object that is not this document is not a candidate at all, so
+    // the failure is the one the caller would have reported before extraction.
+    expect(() => parseAgentJson(`Checked the diff.\n\`\`\`json\n{"files":1}\n\`\`\``, asReceipt)).toThrow(SyntaxError);
+    expect(() => parseAgentJson(`Here it is.\n${fence(proposal)}`, asReceipt)).toThrow(SyntaxError);
+    // Un-fenced receipt-shaped JSON in prose never qualifies: where the object
+    // starts and stops is a guess, and guessing is the thing being avoided.
+    expect(() => parseAgentJson(`Here it is: ${JSON.stringify(receipt)} — done.`, asReceipt)).toThrow(SyntaxError);
+    // An unterminated fence has no extent, so it holds no block.
+    expect(() => parseAgentJson(`Composing:\n\`\`\`json\n${JSON.stringify(receipt)}`, asReceipt)).toThrow(SyntaxError);
+  });
+
+  it("extracts only after a direct parse and a whole-message fence both fail", () => {
+    // Tier order matters: a message that already parses is never rescanned, so
+    // extraction can never change an outcome #151/#152 already decided.
+    expect(parseAgentJson(JSON.stringify(receipt), asReceipt)).toEqual(receipt);
+    expect(parseAgentJson(fence(receipt), asReceipt)).toEqual(receipt);
+    // The whole-message fence peel is unconditional, so an unrecognizable
+    // interior is still returned for the validator to reject by name rather
+    // than being replaced by a recognizable block from somewhere else.
+    const { schema: _schema, ...withoutSchema } = receipt;
+    expect(parseAgentJson(fence(withoutSchema), asReceipt)).toEqual(withoutSchema);
+    // Callers that pass no qualifier stay exactly on the #152 chain.
+    expect(() => parseAgentJson(narrated)).toThrow(SyntaxError);
   });
 });

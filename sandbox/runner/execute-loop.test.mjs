@@ -3413,17 +3413,130 @@ describe("executeLoopAction", () => {
     expect(withoutEventId(bareFenced)).toEqual(withoutEventId(plain));
   });
 
-  it("still rejects a fence that is not the entire final message", () => {
+  it("accepts the one fenced receipt a narrated final message wraps", () => {
+    // OPE-101 generation 8, verbatim: the model narrated, then emitted a fully
+    // valid fenced receipt. Generation 6 (bare fence) had already proved that
+    // the skill's "no prose, no code fence" prohibition does not stop the
+    // narration, so the outcome must come from what the message contains, not
+    // from how the model introduced it -- and it must be the same outcome,
+    // byte for byte, as the clean emission.
+    const valid = request({ agent: "claude" });
+    const receipt = standardReceipt(valid);
+    const runFinalMessage = (finalMessage) => executeLoopActionWithIntegration({
+      request: valid,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      runLoopAgent: () => ({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: [
+          JSON.stringify({ type: "system", subtype: "init", session_id: "s-1", model: "stub" }),
+          JSON.stringify({ type: "result", subtype: "success", is_error: false, result: finalMessage }),
+        ].join("\n"),
+        stderr: "",
+        nativeSessionId: null,
+      }),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+    const pretty = JSON.stringify(receipt, null, 2);
+    const plain = runFinalMessage(JSON.stringify(receipt));
+    const narrated = runFinalMessage(
+      `Good — only the test file is modified. Now composing the receipt.\n\n\`\`\`json\n${pretty}\n\`\`\``,
+    );
+    const trailing = runFinalMessage(`\`\`\`json\n${pretty}\n\`\`\`\n\nLet me know if anything else is needed.`);
+
+    expect(plain.outcome).toBe("success");
+    const withoutEventId = ({ event_id: _eventId, ...rest }) => rest;
+    expect(withoutEventId(narrated)).toEqual(withoutEventId(plain));
+    expect(withoutEventId(trailing)).toEqual(withoutEventId(plain));
+  });
+
+  it("refuses to choose when a narrated message carries two receipt-like blocks", () => {
+    // Extraction is only ever allowed to remove narrative. Two candidates is a
+    // choice, and the ledger gets told that is what happened rather than a
+    // validator complaint about whichever block the scan reached first.
+    const valid = request({ agent: "claude" });
+    const receipt = standardReceipt(valid);
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      runLoopAgent: () => ({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: [
+          JSON.stringify({ type: "system", subtype: "init", session_id: "s-1", model: "stub" }),
+          JSON.stringify({
+            type: "result",
+            subtype: "success",
+            is_error: false,
+            result: [
+              "Here is the receipt:",
+              `\`\`\`json\n${JSON.stringify(receipt, null, 2)}\n\`\`\``,
+              "On reflection, this one is right:",
+              `\`\`\`json\n${JSON.stringify({ ...receipt, result: "failure" }, null, 2)}\n\`\`\``,
+            ].join("\n"),
+          }),
+        ].join("\n"),
+        stderr: "",
+        nativeSessionId: null,
+      }),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("failure");
+    expect(result.receipt).toContain("2 receipt-like blocks found");
+    expect(result.receipt).not.toContain("unknown field subtype");
+  });
+
+  it("still fails when a narrated message fences no receipt at all", () => {
+    // A fenced object that is not a receipt is not a candidate, so this is the
+    // pre-extraction failure unchanged, diagnostics included.
+    const valid = request({ agent: "claude" });
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      runLoopAgent: () => ({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: [
+          JSON.stringify({ type: "system", subtype: "init", session_id: "s-1", model: "stub" }),
+          JSON.stringify({
+            type: "result",
+            subtype: "success",
+            is_error: false,
+            result: "Only the test file is modified:\n```json\n{\"files_changed\": 1}\n```",
+          }),
+        ].join("\n"),
+        stderr: "",
+        nativeSessionId: null,
+      }),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("failure");
+    expect(result.receipt).toContain("loop action emitted invalid standard receipt");
+    expect(result.receipt).not.toContain("receipt-like blocks found");
+    expect(result.receipt).toContain("files_changed");
+  });
+
+  it("still rejects a receipt that no complete fence encloses", () => {
     // The interior is pretty-printed on purpose: no single line parses on its
     // own either, so this exercises the fence rule rather than the line scan.
     const valid = request({ agent: "claude" });
-    const pretty = JSON.stringify(standardReceipt(valid), null, 2);
-    expect(() => parseLoopReceipt(`Here is the receipt:\n\`\`\`json\n${pretty}\n\`\`\``, {}))
-      .toThrow(/invalid standard receipt/);
-    expect(() => parseLoopReceipt(`\`\`\`json\n${pretty}\n\`\`\`\nDone.`, {}))
-      .toThrow(/invalid standard receipt/);
-    // A partial fence is not a fence.
+    const receipt = standardReceipt(valid);
+    const pretty = JSON.stringify(receipt, null, 2);
+    // A partial fence is not a fence: its extent is unknown.
     expect(() => parseLoopReceipt(`\`\`\`json\n${pretty}`, {})).toThrow(/invalid standard receipt/);
+    expect(() => parseLoopReceipt(`Composing the receipt:\n\`\`\`json\n${pretty}`, {}))
+      .toThrow(/invalid standard receipt/);
+    // Un-fenced, buried in prose: nothing marks where the receipt begins.
+    expect(() => parseLoopReceipt(`Here is the receipt: ${JSON.stringify(receipt)} — done.`, {}))
+      .toThrow(/invalid standard receipt/);
   });
 
   it("names the nested validator defect for an invalid receipt inside a code fence", () => {

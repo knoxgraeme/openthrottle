@@ -956,6 +956,47 @@ printf '{"type":"thread.started","thread_id":"native-1"}\\n'
     });
   });
 
+  it("reads the one recognizable proposal a narrated proposal file wraps, and refuses two", () => {
+    // The executor reads this file once, after the agent has exited: a model
+    // that writes it itself instead of calling ot-stage-result gets no second
+    // chance, exactly like the loop receipt's final message (OPE-101).
+    const proposal = {
+      schema: "openthrottle.stage-proposal/v1",
+      suggested_outcome: "success",
+      summary: "ok",
+      evidence: ["narrated"],
+      findings: [],
+      actions: [],
+      uncertainty: [],
+    };
+    const runWithProposalFile = (body) => {
+      const input = fixture();
+      const actionRoot = mkdtempSync(join(tmpdir(), "ot-stage-actions-"));
+      const binDir = mkdtempSync(join(tmpdir(), "ot-fake-bin-"));
+      directories.push(actionRoot, binDir);
+      process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+      installFakeGosu(binDir);
+      writeExecutable(join(binDir, "codex"), `#!/usr/bin/env bash
+set -euo pipefail
+cat > "$OT_STAGE_PROPOSAL_FILE" <<'PROPOSAL'
+${body}
+PROPOSAL
+`);
+      return withPrependedPath(binDir, () => defaultRunAgent({
+        request: input.request,
+        invocation: resolveContextInvocation(input.request),
+        repoDir: input.repoDir,
+        proposalPath: join(actionRoot, "proposal.json"),
+        timeoutMs: 5_000,
+      }));
+    };
+    const fenced = `\`\`\`json\n${JSON.stringify(proposal, null, 2)}\n\`\`\``;
+
+    expect(runWithProposalFile(`Wrote the proposal below.\n\n${fenced}`).proposal).toEqual(proposal);
+    expect(() => runWithProposalFile(`First:\n${fenced}\nOr maybe:\n${fenced}`))
+      .toThrow(/2 proposal-like blocks found/);
+  });
+
   it("removes stale action-local repository-skill proposals before invocation", () => {
     const repoDir = repository();
     const { repositorySkill } = sealedRepositorySkillPackage(repoDir);

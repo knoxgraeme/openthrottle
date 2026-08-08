@@ -53,9 +53,54 @@ describe("ot-stage-result proposal writer", () => {
       uncertainty: [],
     };
     const pretty = JSON.stringify(proposal, null, 2);
-    expect(parseProposalInput(`\`\`\`json\n${pretty}\n\`\`\``)).toEqual(parseProposalInput(JSON.stringify(proposal)));
-    expect(() => parseProposalInput(`Here it is:\n\`\`\`json\n${pretty}\n\`\`\``)).toThrow();
+    const clean = parseProposalInput(JSON.stringify(proposal));
+    expect(parseProposalInput(`\`\`\`json\n${pretty}\n\`\`\``)).toEqual(clean);
+    // Narration around exactly one recognizable proposal is narration, and is
+    // dropped (OPE-101 generation 8, the receipt's twin failure).
+    expect(parseProposalInput(`Here it is:\n\`\`\`json\n${pretty}\n\`\`\``)).toEqual(clean);
+    // Two candidates is a choice the writer does not get to make for the model.
+    expect(() => parseProposalInput(`One:\n\`\`\`json\n${pretty}\n\`\`\`\nOr:\n\`\`\`json\n${pretty}\n\`\`\``))
+      .toThrow(/2 proposal-like blocks found/);
+    // A fenced object that is not a proposal is not a candidate at all.
+    expect(() => parseProposalInput(`Notes:\n\`\`\`json\n{"files":1}\n\`\`\``)).toThrow();
     expect(() => parseProposalInput(`\`\`\`json\n${pretty}`)).toThrow();
+  });
+
+  it("qualifies a --receipt invocation's narration against the receipt schema", () => {
+    // The same file, written for the other document: the qualifier must follow
+    // what this invocation is actually writing, or narration would be dropped
+    // around whichever schema happened to be hard-coded.
+    const receipt = {
+      schema: "openthrottle.receipt/v1",
+      type: "command_result",
+      assurance: "executor_verified",
+      result: "success",
+      producer: {
+        worker_id: "worker-1",
+        skill: "builtin://run-command@1",
+        capability_digest: "c".repeat(64),
+        skill_package_digest: null,
+      },
+      subject: { base: "1".repeat(40), pre: "1".repeat(40), post: "1".repeat(40) },
+      fence: {
+        pipeline_instance_id: "instance-1",
+        graph_digest: "a".repeat(64),
+        unit_id: "unit-1",
+        attempt_id: "attempt-1",
+        parent_run_id: "run-1",
+        action_attempt_id: "action-1",
+        generation: 1,
+        native_session_id: null,
+        request_hash: "b".repeat(64),
+      },
+      evidence: ["ran the suite"],
+      payload: { command: "npm test", exit_code: 0, summary: "passed", stdout_digest: "d".repeat(64) },
+      issued_at: "2026-07-29T00:00:00.000Z",
+    };
+    const pretty = JSON.stringify(receipt, null, 2);
+    const clean = parseProposalInput(JSON.stringify(receipt), { receipt: true });
+    expect(parseProposalInput(`All green.\n\`\`\`json\n${pretty}\n\`\`\``, { receipt: true })).toEqual(clean);
+    expect(() => parseProposalInput(`All green.\n\`\`\`json\n${pretty}\n\`\`\``)).toThrow();
   });
 
   it("runs through an installed symlink", async () => {

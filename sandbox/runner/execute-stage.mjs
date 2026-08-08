@@ -23,6 +23,7 @@ import {
   buildCommandArtifacts,
   buildSemanticArtifacts,
   digest,
+  isStageProposalShaped,
   parseAgentJson,
   sanitizeArtifactText,
   validateSemanticProposal,
@@ -598,8 +599,14 @@ export function defaultRunAgent({
       // ot-stage-result normally writes this file, but the executor never
       // trusts that: reconcilePublication re-runs validateSemanticProposal on
       // whatever is here, so this file is agent-authored data and gets the
-      // same one-fence tolerance as the loop receipt (OPE-101).
-      proposal: proposalRead.status === 0 ? parseAgentJson(proposalRead.stdout) : undefined,
+      // same tolerances as the loop receipt -- one whole fence, or narration
+      // around exactly one recognizable proposal block (OPE-101). A model that
+      // writes this file itself instead of calling ot-stage-result gets no
+      // second chance either: the executor reads it once, after the agent has
+      // exited.
+      proposal: proposalRead.status === 0
+        ? parseAgentJson(proposalRead.stdout, { qualifies: isStageProposalShaped, label: "proposal" })
+        : undefined,
       authSnapshot: authRead?.status === 0 ? authRead.stdout : undefined,
     };
   } catch (error) {
