@@ -454,7 +454,10 @@ export async function handleCreated(
       resolvedMatchNames
     )} base=${requestedBase ?? "(route default)"}`
   );
-  const selectedAgent = pickAgent(resolvedMatchNames, existing?.agent ?? cfg.defaultAgent);
+  // DEFAULT_AGENT applies whenever the issue carries no agent label (see
+  // supervisor/README.md), including on regeneration -- an engine pinned by
+  // a label that has since been removed must not stick around as a fallback.
+  const selectedAgent = pickAgent(resolvedMatchNames, cfg.defaultAgent);
   const selectedRepository = repositoryFor(store, issue);
   if (!selectedRepository) {
     await providers.activityPublisher.publishError(

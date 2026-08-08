@@ -304,7 +304,9 @@ describe("pipeline admission", () => {
     event = payload(),
     repositoryFiles: Record<string, string> = {},
     runtimeOverrides: Parameters<typeof buildInstalledRuntimeDescriptor>[1] = {},
-    linearIssueLabels: Array<{ name: string; parentName?: string }> = [],
+    linearIssueLabels:
+      | Array<{ name: string; parentName?: string }>
+      | (() => Array<{ name: string; parentName?: string }>) = [],
     linearLabelsFetchError?: string
   ) {
     db = openDb(":memory:");
@@ -387,11 +389,12 @@ describe("pipeline admission", () => {
         if (linearLabelsFetchError !== undefined) {
           throw new Error(linearLabelsFetchError);
         }
+        const labels = typeof linearIssueLabels === "function" ? linearIssueLabels() : linearIssueLabels;
         return Response.json({
           data: {
             issue: {
               labels: {
-                nodes: linearIssueLabels.map((label) => ({
+                nodes: labels.map((label) => ({
                   name: label.name,
                   parent: label.parentName ? { name: label.parentName } : null,
                 })),
@@ -846,6 +849,27 @@ intents:
       expect(refusal).toBeDefined();
       expect(refusal).toContain("Linear API unreachable");
       expect(refusal).toContain("Engine selection requires a fresh label read");
+    });
+
+    it("reverts to DEFAULT_AGENT on regeneration once the agent label has been removed", async () => {
+      let fetchCount = 0;
+      const { tickets, invoke } = await run(
+        repositoryConfigYaml("{ implement: implement }"),
+        allCredentials,
+        shippedCatalogPath,
+        payload("session-1", "issue-1", "OT-1"),
+        {},
+        {},
+        () => {
+          fetchCount += 1;
+          return fetchCount === 1 ? [{ name: "agent:claude" }] : [];
+        }
+      );
+      expect(tickets.getByIssueId("issue-1")).toMatchObject({ state: "active", agent: "claude" });
+
+      await invoke({}, payload("session-2"));
+
+      expect(tickets.getByIssueId("issue-1")).toMatchObject({ state: "active", agent: "codex" });
     });
   });
 
