@@ -335,7 +335,6 @@ function currentPublicationRecorded(pipelines: PipelineStore, instance: Pipeline
   if (instance.published_commit === null) return false;
   return pipelines.listPublications(instance.id)
     .some((publication) =>
-      publication.status !== "failed" &&
       publication.status !== "dead" &&
       publicationSubjects(publication.payload).includes(instance.published_commit!)
     );

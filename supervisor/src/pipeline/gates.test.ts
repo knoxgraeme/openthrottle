@@ -867,7 +867,7 @@ describe("deterministic supervisor stage gates", () => {
     `).get(fixture.instance.id)).toEqual({ count: 2 });
   });
 
-  it("consumes the pipeline's own repair synchronize webhook when it beats publish settlement", () => {
+  it("consumes the pipeline's own repair synchronize webhook when publish delivery is retrying", () => {
     const fixture = setup("core/implement@4");
     const oldPublishedCommit = "a".repeat(40);
     const repairedSubject = "2".repeat(40);
@@ -924,6 +924,12 @@ describe("deterministic supervisor stage gates", () => {
       active_stage_id: "provider",
       published_commit: repairedPublishedCommit,
     });
+    expect(fixture.db.prepare(`
+      UPDATE pipeline_publication_receipts
+      SET status = 'failed', next_attempt_at = '2099-01-01T00:00:00.000Z',
+          last_error = 'transient publication failure'
+      WHERE pipeline_instance_id = ? AND payload LIKE ?
+    `).run(fixture.instance.id, `%${repairedPublishedCommit}%`).changes).toBeGreaterThan(0);
 
     expect(drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(0);
     expect(fixture.db.prepare("SELECT status FROM feedback_snapshots WHERE id = ?").get(snapshot.id))
