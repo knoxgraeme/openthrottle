@@ -21,7 +21,7 @@ export interface RunStore {
     runId: string,
     owner: string,
     reason: string,
-    faultAttribution: FaultAttribution
+    faultAttribution: FaultAttribution | null
   ): Run | undefined;
   finishReapingRun(params: FinishRunParams & { owner: string }): Run | undefined;
   finishReapingRunAndThen(
@@ -219,7 +219,7 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
     return getRunStmt.get(params.runId) as Run;
   });
   const claimRunForReapingTransaction = db.transaction(
-    (runId: string, owner: string, reason: string, faultAttribution: FaultAttribution): Run | undefined => {
+    (runId: string, owner: string, reason: string, faultAttribution: FaultAttribution | null): Run | undefined => {
       const timestamp = now();
       const existing = getRunStmt.get(runId) as Run | undefined;
       if (existing?.status === "reaping") {
