@@ -115,6 +115,18 @@ describe("analysis store", () => {
     expect(
       store.listRunOutcomes({ to: "2026-08-05T00:00:00.000Z" }).map((r) => r.pipeline_instance_id)
     ).toEqual([instance1.id]);
+
+    // The ISO-8601 basic offset form (no colon) is just as unambiguous as the
+    // extended form above and Date.parse itself already accepts it -- the
+    // shape check must not reject it here while /status/journal accepts it;
+    // both endpoints now validate through the shared query-filters.ts
+    // (PR #158 review: the hand-copied regexes had diverged on exactly this).
+    expect(
+      store.listRunOutcomes({ from: "2026-08-05T02:00:00+0200" }).map((r) => r.pipeline_instance_id)
+    ).toEqual([instance2.id]);
+    expect(
+      store.listRunOutcomes({ to: "2026-08-05T02:00:00+0200" }).map((r) => r.pipeline_instance_id)
+    ).toEqual([instance1.id]);
   });
 
   it("clamps an oversized limit to the query cap and keeps at least one row", () => {
@@ -172,5 +184,6 @@ describe("analysis store", () => {
     expect(() => store.listRunOutcomes({ to: "2026-08-08" })).toThrow(/to must be an ISO-8601 timestamp/);
     expect(store.listRunOutcomes({ from: "2026-08-08T00:00:00.000Z" })).toEqual([]);
     expect(store.listRunOutcomes({ from: "2026-08-08T00:00:00+00:00" })).toEqual([]);
+    expect(store.listRunOutcomes({ from: "2026-08-08T00:00:00+0000" })).toEqual([]);
   });
 });

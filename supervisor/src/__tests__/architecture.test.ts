@@ -106,6 +106,13 @@ function decisionSurfaceClosure(modules: readonly ResolvedModule[]): ReadonlySet
     const rel = relativeSource(module.file);
     const merged = importsByFile.get(rel) ?? new Set<string>();
     for (const edge of edges) {
+      // Same reasoning as typeOnlyExceptions above: an `import type` edge is
+      // erased at emit and cannot execute a read at run time, so following
+      // it here would only pull pure-type contract modules (pipeline/
+      // store.ts, runtime/contracts.ts, ...) into the closure and turn every
+      // module that shares those type shapes into a future false positive.
+      // Only value edges propagate the decision-surface restriction.
+      if (edge.typeOnly) continue;
       if (edge.resolved) merged.add(relativeSource(edge.resolved));
     }
     importsByFile.set(rel, merged);
