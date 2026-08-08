@@ -131,6 +131,7 @@ describe("database migrations", () => {
       "97611e1f750392871f83ff7944039c761695e834d54661ee225bd205b0c38b1b",
       "393246d3d56b685e1a25e7a18e6a8a2485c70b96301836a8437bfac5568bd009",
       "d07f005df485a8b7506a2e81046846c0c070a4790109e22e8c7081df9a2f29f0",
+      "f2938e6bce2d6d1af5de90cb806f8f098692349a89b3b580d8cf013f9f45d76e",
     ]);
   });
 
@@ -1380,5 +1381,20 @@ describe("database migrations", () => {
     // stay in exact sync instead of only drifting apart at a live INSERT.
     expect(new Set(constraintReasons)).toEqual(new Set(GATE_RECEIPT_REASONS));
     expect(constraintReasons).toHaveLength(GATE_RECEIPT_REASONS.length);
+  });
+
+  it("creates the run_outcomes settlement rollup table", () => {
+    db = new Database(":memory:");
+    applyDatabaseMigrations(db);
+
+    const table = db.prepare(`
+      SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'run_outcomes'
+    `).get() as { sql: string } | undefined;
+    if (!table) throw new Error("run_outcomes table was not created");
+    expect(table.sql).toContain("pipeline_instance_id TEXT PRIMARY KEY");
+    expect(table.sql).toMatch(/outcome TEXT NOT NULL CHECK\(outcome IN \(/);
+    expect(table.sql).toMatch(/closed_reason TEXT NOT NULL CHECK\(closed_reason IN \(/);
+    expect(table.sql).toMatch(/fault_attribution TEXT CHECK\(/);
+    expect(db.prepare("SELECT version FROM schema_migrations WHERE version = 29").get()).toEqual({ version: 29 });
   });
 });

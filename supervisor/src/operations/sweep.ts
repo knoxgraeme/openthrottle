@@ -7,6 +7,10 @@ import { reapExpiredRuns } from "./reaper.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+function daysAgoIso(days: number): string {
+  return new Date(Date.now() - days * DAY_MS).toISOString();
+}
+
 /**
  * Cron sweep, per SPEC "Event flows > 4. Sweep":
  *  - expired pipeline runs → stop/clean through coordinator effects
@@ -29,10 +33,11 @@ export async function runSweep(
     console.error("[sweep] webhook reconciliation failed:", error);
   }
   await deleteOrphanSandboxes(runtime, store, cfg);
-  const retentionCutoff = new Date(Date.now() - 7 * DAY_MS).toISOString();
+  const retentionCutoff = daysAgoIso(7);
   store.pruneDeliveries(retentionCutoff);
   store.pruneSandboxEvents(retentionCutoff);
   store.pruneEphemeralLinearOutbox(retentionCutoff);
+  pipelines.pruneRunOutcomes(daysAgoIso(cfg.runOutcomeRetentionDays));
 }
 
 async function deleteOrphanSandboxes(

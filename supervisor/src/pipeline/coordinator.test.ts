@@ -366,6 +366,41 @@ describe("pipeline coordinator", () => {
     expect(pipelines.listEffects(instance.id)).toHaveLength(4);
   });
 
+  it("writes one run_outcomes settlement row when the pipeline reaches a terminal outcome", () => {
+    const { pipelines, instance, attempt } = setup();
+    const completed = coordinatePipelineEvent(pipelines, event(instance, attempt));
+    expect(completed.terminal_outcome).toBe("shipped");
+
+    const outcome = pipelines.getRunOutcome(instance.id);
+    expect(outcome).toMatchObject({
+      pipeline_instance_id: instance.id,
+      linear_issue_id: instance.linear_issue_id,
+      generation: instance.generation,
+      generations_consumed: instance.generation,
+      execution_graph_id: null,
+      plan_digest: null,
+      base_commit: instance.base_commit,
+      engine: instance.agent,
+      outcome: "shipped",
+      closed_reason: "success",
+      fault_attribution: null,
+      token_cost_usd: 0,
+    });
+    expect(JSON.parse(outcome!.repair_rounds_by_unit)).toEqual({});
+    expect(JSON.parse(outcome!.phase_durations_ms)).toEqual({});
+    expect(JSON.parse(outcome!.skill_digests)).toEqual([]);
+
+    expect(pipelines.pruneRunOutcomes("2099-01-01T00:00:00.000Z")).toBe(1);
+    expect(pipelines.getRunOutcome(instance.id)).toBeUndefined();
+  });
+
+  it("does not write a run_outcomes row for a non-terminal transition", () => {
+    const { pipelines, instance, attempt } = setup("core/implement@4");
+    const completed = coordinatePipelineEvent(pipelines, event(instance, attempt, "semantic_repair_required"));
+    expect(completed.terminal_outcome).toBeNull();
+    expect(pipelines.getRunOutcome(instance.id)).toBeUndefined();
+  });
+
   it("projects notable repair stages into run notes without changing transitions", () => {
     const { pipelines, instance, attempt } = setup("core/implement@4");
     db!.prepare(`

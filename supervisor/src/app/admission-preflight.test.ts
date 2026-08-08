@@ -172,6 +172,7 @@ describe("admission preflight wired into Linear admission", () => {
       kimiCodeApiKey: undefined,
       taskTimeout: 300,
       orphanGraceMinutes: 5,
+      runOutcomeRetentionDays: 180,
       webhookMaxAgeSeconds: 60,
       allowLinearMerge: false,
       sandboxEventPollIntervalMs: 5_000,
