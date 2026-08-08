@@ -38,7 +38,7 @@ export async function runSweep(
   } catch (error) {
     console.error("[sweep] webhook reconciliation failed:", error);
   }
-  await deleteOrphanSandboxes(runtime, store, cfg);
+  await deleteOrphanSandboxes(runtime, store, pipelines, cfg);
   try {
     await reclaimEligibleRuntimeResources({
       store: pipelines,
@@ -60,6 +60,7 @@ export async function runSweep(
 async function deleteOrphanSandboxes(
   runtime: RuntimeInventory,
   store: SupervisorStore,
+  pipelines: PipelineStore,
   cfg: Config
 ): Promise<void> {
   let sandboxes: RuntimeInventoryResource[];
@@ -74,6 +75,18 @@ async function deleteOrphanSandboxes(
     const ticket = store.getBySandboxId(sandbox.id);
     if (ticket && ticket.state !== "closed" && ticket.state !== "expired") {
       continue; // active, stopped, and error workspaces remain reusable
+    }
+
+    // tickets.sandbox_id is a projection a newer generation's delegation
+    // overwrites (setSandboxId), so an older generation's still-bound
+    // resource can look orphaned here even though a pipeline_instances row
+    // still owns it -- the exact OPE-75 hole a review caught: this path's
+    // ORPHAN_GRACE_MINUTES otherwise bypasses RUNTIME_RESOURCE_RETENTION_MINUTES
+    // and the eligibility checks reclaimEligibleRuntimeResources enforces.
+    // Defer entirely to that reconciler for anything still pipeline-bound.
+    const boundInstance = pipelines.getInstanceByRuntimeResourceId(sandbox.id);
+    if (boundInstance && pipelines.getRuntimeResource(boundInstance.id)?.status !== "cleaned") {
+      continue;
     }
 
     // A sandbox can become visible to list() before handleCreated persists its

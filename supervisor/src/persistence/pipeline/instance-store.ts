@@ -54,6 +54,7 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
   | "getRuntimeResource"
   | "setRuntimeResourceStatus"
   | "listReclaimableRuntimeResources"
+  | "getInstanceByRuntimeResourceId"
   | "getActiveAttempt"
   | "listProviderReadyInstances"
   | "listStages"
@@ -62,6 +63,9 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
   | "getPublication"
 > {
   const getInstanceStmt = db.prepare("SELECT * FROM pipeline_instances WHERE id = ?");
+  const getInstanceByRuntimeResourceIdStmt = db.prepare(
+    "SELECT * FROM pipeline_instances WHERE runtime_provider_resource_id = ?"
+  );
   const getAttemptStmt = db.prepare("SELECT * FROM pipeline_stage_attempts WHERE id = ?");
   const persistPublication = createPipelinePublicationWriter(db);
   const journal = createJournalStore(db, now);
@@ -601,6 +605,9 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
           AND runtime_resource_updated_at <= ?
         ORDER BY runtime_resource_updated_at LIMIT ?
       `).all(cutoffIso, limit) as PipelineInstance[];
+    },
+    getInstanceByRuntimeResourceId(providerResourceId) {
+      return getInstanceByRuntimeResourceIdStmt.get(providerResourceId) as PipelineInstance | undefined;
     },
     getActiveAttempt(instanceId) {
       return db.prepare(`

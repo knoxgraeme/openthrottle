@@ -225,7 +225,12 @@ visibility and event polling, not coordinator authority.
 Hard expiry uses `TASK_TIMEOUT`. Stalled actors are detected from actor state
 on `runs` and `pipeline_stage_attempts` plus `STALL_TIMEOUT_SECONDS`. The sweep also resumes pending effects,
 reaps expired runs, releases or quarantines resources safely, and removes
-unbound Daytona orphans after `ORPHAN_GRACE_MINUTES`.
+unbound Daytona orphans after `ORPHAN_GRACE_MINUTES`. "Unbound" means no
+`pipeline_instances` row still owns the resource (by `runtime_provider_
+resource_id`, not by the ticket's possibly-stale `sandbox_id` projection,
+which a newer generation's delegation overwrites); a resource still owned by
+some generation is left entirely to the reclaim path below regardless of
+`ORPHAN_GRACE_MINUTES`.
 
 A terminal instance's `stopped` runtime resource (e.g. the needs_human
 cleanup effect's `preserve` path, which stops rather than deletes so the
