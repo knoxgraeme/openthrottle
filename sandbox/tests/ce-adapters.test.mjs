@@ -39,6 +39,20 @@ function agentsYaml(task) {
   );
 }
 
+function assertSupportedOpenAiMetadata(task) {
+  const yaml = agentsYaml(task);
+  expect(yaml, `${task} must not use the unsupported flat allow_implicit_invocation key`).not.toMatch(
+    /^allow_implicit_invocation:/m,
+  );
+  expect(yaml, `${task} must not use the legacy implicit key`).not.toMatch(/^implicit:/m);
+  expect(yaml, `${task} must declare nested policy.allow_implicit_invocation`).toMatch(
+    /^policy:\n(?:  [^\n]*\n)*  allow_implicit_invocation: false(?:\n|$)/m,
+  );
+  expect(yaml, `${task} must declare a non-empty interface.display_name`).toMatch(
+    /^interface:\n(?:  [^\n]*\n)*  display_name: \S.+(?:\n|$)/m,
+  );
+}
+
 // Every regular file anywhere under skills/, used to assert a phrase never
 // appears again in the tree (not just in the two canonical files).
 function walk(dir) {
@@ -196,10 +210,7 @@ describe("OpenThrottle canonical task skills", () => {
 
   it("both new stage skills declare an openai.yaml in the stage-path pattern", () => {
     for (const task of ["review-change", "simplify-change"]) {
-      const yaml = agentsYaml(task);
-      expect(yaml).toContain("allow_implicit_invocation: false");
-      expect(yaml).toContain("interface:");
-      expect(yaml).toContain("display_name:");
+      assertSupportedOpenAiMetadata(task);
     }
   });
 
@@ -427,10 +438,9 @@ describe("OpenThrottle canonical task skills", () => {
     expect(simplificationHeuristics("simplify-unit")).toBe(simplificationHeuristics("simplify-change"));
   });
 
-  it("each of the eleven skills declares an openai.yaml with implicit invocation disabled", () => {
+  it("each of the eleven skills declares supported Codex metadata with implicit invocation disabled", () => {
     for (const task of tasks) {
-      const yaml = agentsYaml(task);
-      expect(yaml).toContain("allow_implicit_invocation: false");
+      assertSupportedOpenAiMetadata(task);
     }
   });
 

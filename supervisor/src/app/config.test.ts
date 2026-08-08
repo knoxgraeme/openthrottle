@@ -19,6 +19,7 @@ function setRequiredEnv(): void {
     "KIMI_CODE_API_KEY",
     "TASK_TIMEOUT",
     "ORPHAN_GRACE_MINUTES",
+    "RUNTIME_RESOURCE_RETENTION_MINUTES",
     "WEBHOOK_MAX_AGE_SECONDS",
     "ALLOW_LINEAR_MERGE",
     "SANDBOX_EVENT_POLL_INTERVAL_MS",
@@ -60,8 +61,23 @@ describe("loadConfig", () => {
       kimiCodeApiKey: "kimi",
       sandboxEventPollIntervalMs: 5_000,
       sandboxRuntimeRelease: "openthrottle-snapshot/v9",
+      runtimeResourceRetentionMinutes: 60,
       runOutcomeRetentionDays: 180,
     });
+  });
+
+  it("loads and validates the runtime resource retention window", () => {
+    setRequiredEnv();
+    process.env.RUNTIME_RESOURCE_RETENTION_MINUTES = "15";
+    expect(loadConfig().runtimeResourceRetentionMinutes).toBe(15);
+
+    process.env.RUNTIME_RESOURCE_RETENTION_MINUTES = "0";
+    expect(loadConfig().runtimeResourceRetentionMinutes).toBe(0);
+
+    process.env.RUNTIME_RESOURCE_RETENTION_MINUTES = "-1";
+    expect(() => loadConfig()).toThrow(
+      "RUNTIME_RESOURCE_RETENTION_MINUTES must be between 0"
+    );
   });
 
   it("rejects an out-of-range run outcome retention window", () => {

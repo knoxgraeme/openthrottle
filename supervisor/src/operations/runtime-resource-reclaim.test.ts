@@ -1,7 +1,10 @@
 import type Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { setupPipelineStore, ticket } from "../__fixtures__/pipeline-store.js";
-import { reclaimEligibleRuntimeResources } from "./runtime-resource-reclaim.js";
+import {
+  createRuntimeResourceReconciler,
+  reclaimEligibleRuntimeResources,
+} from "./runtime-resource-reclaim.js";
 
 const FUTURE_CUTOFF = "2999-01-01T00:00:00.000Z";
 
@@ -9,6 +12,8 @@ describe("reclaimEligibleRuntimeResources", () => {
   let db: Database.Database | undefined;
 
   afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
     db?.close();
     db = undefined;
   });
@@ -24,8 +29,7 @@ describe("reclaimEligibleRuntimeResources", () => {
     resourceId: string;
     updatedAt?: string;
     settleProvisionEffect?: boolean;
-  }) {
-    const setup = setupPipelineStore();
+  }, setup = setupPipelineStore()) {
     db = setup.db;
     const { tickets, pipelines, catalog, snapshot } = setup;
     const manifest = catalog.manifests.get("fixture/command@1")!;
@@ -110,6 +114,37 @@ describe("reclaimEligibleRuntimeResources", () => {
     expect(pipelines.getRuntimeResource(instance.id)?.status).toBe("stopped");
   });
 
+  it("re-checks the retention cutoff when a concurrent stop refreshes a listed candidate", async () => {
+    const { pipelines, tickets, instance, db: database } = seedStoppedTerminalInstance({
+      sessionId: "session-refreshed-after-list",
+      resourceId: "sandbox-refreshed-after-list",
+      updatedAt: "2020-01-01T00:00:00.000Z",
+    });
+    const getInstance = pipelines.getInstance.bind(pipelines);
+    vi.spyOn(pipelines, "getInstance").mockImplementationOnce((instanceId) => {
+      database.prepare(`
+        UPDATE pipeline_instances SET runtime_resource_updated_at = ? WHERE id = ?
+      `).run("2030-01-01T00:00:00.000Z", instanceId);
+      return getInstance(instanceId);
+    });
+    const cleanup = vi.fn(async () => undefined);
+
+    const result = await reclaimEligibleRuntimeResources({
+      store: pipelines,
+      tickets,
+      runtime: { cleanup },
+      cutoffIso: "2025-01-01T00:00:00.000Z",
+      trigger: "test concurrent refresh",
+    });
+
+    expect(result).toEqual({ reclaimed: 0, candidates: 1 });
+    expect(cleanup).not.toHaveBeenCalled();
+    expect(pipelines.getRuntimeResource(instance.id)).toMatchObject({
+      status: "stopped",
+      updated_at: "2030-01-01T00:00:00.000Z",
+    });
+  });
+
   it("never reclaims a resource with an active stage attempt, even if listed as terminal+stopped", async () => {
     const { pipelines, tickets, instance, db: database } = seedStoppedTerminalInstance({
       sessionId: "session-active-attempt",
@@ -139,26 +174,32 @@ describe("reclaimEligibleRuntimeResources", () => {
     expect(pipelines.getRuntimeResource(instance.id)?.status).toBe("stopped");
   });
 
-  it("never reclaims a resource with an unsettled (pending) effect intent", async () => {
-    const { pipelines, tickets, instance } = seedStoppedTerminalInstance({
-      sessionId: "session-pending-effect",
-      resourceId: "sandbox-pending-effect",
-      settleProvisionEffect: false,
-    });
-    const cleanup = vi.fn(async () => undefined);
+  it.each(["pending", "processing", "failed"] as const)(
+    "never reclaims a resource with an unsettled %s effect intent",
+    async (effectStatus) => {
+      const { pipelines, tickets, instance } = seedStoppedTerminalInstance({
+        sessionId: `session-${effectStatus}-effect`,
+        resourceId: `sandbox-${effectStatus}-effect`,
+        settleProvisionEffect: false,
+      });
+      db!.prepare(`
+        UPDATE pipeline_effect_intents SET status = ? WHERE pipeline_instance_id = ?
+      `).run(effectStatus, instance.id);
+      const cleanup = vi.fn(async () => undefined);
 
-    const result = await reclaimEligibleRuntimeResources({
-      store: pipelines,
-      tickets,
-      runtime: { cleanup },
-      cutoffIso: FUTURE_CUTOFF,
-      trigger: "test sweep",
-    });
+      const result = await reclaimEligibleRuntimeResources({
+        store: pipelines,
+        tickets,
+        runtime: { cleanup },
+        cutoffIso: FUTURE_CUTOFF,
+        trigger: "test sweep",
+      });
 
-    expect(result.reclaimed).toBe(0);
-    expect(cleanup).not.toHaveBeenCalled();
-    expect(pipelines.getRuntimeResource(instance.id)?.status).toBe("stopped");
-  });
+      expect(result.reclaimed).toBe(0);
+      expect(cleanup).not.toHaveBeenCalled();
+      expect(pipelines.getRuntimeResource(instance.id)?.status).toBe("stopped");
+    }
+  );
 
   it("leaves the resource stopped (not cleaned) and does not throw when provider deletion fails", async () => {
     const { pipelines, tickets, instance } = seedStoppedTerminalInstance({
@@ -205,6 +246,96 @@ describe("reclaimEligibleRuntimeResources", () => {
     expect(second).toEqual({ reclaimed: 0, candidates: 0 });
     expect(cleanup).toHaveBeenCalledOnce();
     expect(pipelines.getRuntimeResource(instance.id)?.status).toBe("cleaned");
+  });
+
+  it("does not disturb a replacement ticket binding while cleaning an older generation", async () => {
+    const { pipelines, tickets, instance } = seedStoppedTerminalInstance({
+      sessionId: "session-old-binding",
+      resourceId: "sandbox-old-binding",
+    });
+    tickets.upsertUnpinned({
+      ...ticket("session-replacement-binding", instance.linear_issue_id),
+      sandbox_id: "sandbox-replacement-binding",
+    });
+    const cleanup = vi.fn(async () => undefined);
+
+    await reclaimEligibleRuntimeResources({
+      store: pipelines,
+      tickets,
+      runtime: { cleanup },
+      cutoffIso: FUTURE_CUTOFF,
+      trigger: "test replacement binding",
+    });
+
+    expect(cleanup).toHaveBeenCalledWith({ providerResourceId: "sandbox-old-binding" });
+    expect(pipelines.getRuntimeResource(instance.id)?.status).toBe("cleaned");
+    expect(tickets.getByIssueId(instance.linear_issue_id)).toMatchObject({
+      linear_session_id: "session-replacement-binding",
+      sandbox_id: "sandbox-replacement-binding",
+    });
+  });
+
+  it("bounds hot-path waiting, coalesces overlap, and leaves the rest for a bulk sweep", async () => {
+    vi.useFakeTimers();
+    const setup = setupPipelineStore();
+    const firstInstance = seedStoppedTerminalInstance({
+      sessionId: "session-slow-first",
+      resourceId: "sandbox-slow-first",
+    }, setup).instance;
+    const secondInstance = seedStoppedTerminalInstance({
+      sessionId: "session-slow-second",
+      resourceId: "sandbox-slow-second",
+    }, setup).instance;
+    const { pipelines, tickets } = setup;
+    let releaseFirst!: () => void;
+    const firstCleanup = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let activeCleanups = 0;
+    let maxActiveCleanups = 0;
+    const cleanup = vi.fn(async () => {
+      activeCleanups++;
+      maxActiveCleanups = Math.max(maxActiveCleanups, activeCleanups);
+      try {
+        if (cleanup.mock.calls.length === 1) await firstCleanup;
+      } finally {
+        activeCleanups--;
+      }
+    });
+    const reconcile = createRuntimeResourceReconciler({
+      store: pipelines,
+      tickets,
+      runtime: { cleanup },
+    });
+    const hotRequest = {
+      cutoffIso: FUTURE_CUTOFF,
+      limit: 1,
+      trigger: "test hot path",
+      waitTimeoutMs: 5_000,
+    };
+
+    const firstHot = reconcile(hotRequest);
+    const overlappingHot = reconcile(hotRequest);
+    const bulk = reconcile({
+      cutoffIso: FUTURE_CUTOFF,
+      limit: 50,
+      trigger: "test periodic sweep",
+    });
+
+    expect(cleanup).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await expect(firstHot).resolves.toEqual({ reclaimed: 0, candidates: 0 });
+    await expect(overlappingHot).resolves.toEqual({ reclaimed: 0, candidates: 0 });
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(pipelines.getRuntimeResource(firstInstance.id)?.status).toBe("stopped");
+    expect(pipelines.getRuntimeResource(secondInstance.id)?.status).toBe("stopped");
+
+    releaseFirst();
+    await expect(bulk).resolves.toEqual({ reclaimed: 1, candidates: 1 });
+    expect(cleanup).toHaveBeenCalledTimes(2);
+    expect(maxActiveCleanups).toBe(1);
+    expect(pipelines.getRuntimeResource(firstInstance.id)?.status).toBe("cleaned");
+    expect(pipelines.getRuntimeResource(secondInstance.id)?.status).toBe("cleaned");
   });
 
   it("never reclaims an active or quarantined resource regardless of terminal status", async () => {

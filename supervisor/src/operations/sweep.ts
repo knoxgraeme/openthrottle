@@ -4,7 +4,11 @@ import type { SupervisorStore } from "../persistence/store.js";
 import type { PipelineStore } from "../pipeline/store.js";
 import type { RuntimeInventory, RuntimeInventoryResource, RuntimeStopper, SandboxRuntime } from "../runtime/contracts.js";
 import { reapExpiredRuns } from "./reaper.js";
-import { reclaimEligibleRuntimeResources } from "./runtime-resource-reclaim.js";
+import {
+  PERIODIC_RECLAIM_LIMIT,
+  reclaimEligibleRuntimeResources,
+  type RuntimeResourceReconciler,
+} from "./runtime-resource-reclaim.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const MINUTE_MS = 60 * 1000;
@@ -30,7 +34,8 @@ export async function runSweep(
   cfg: Config,
   pipelines: PipelineStore,
   activityPublisher: Pick<ActivityPublicationPort, "publishError">,
-  reconcileWebhooks?: () => Promise<void>
+  reconcileWebhooks?: () => Promise<void>,
+  reconcileRuntimeResources?: RuntimeResourceReconciler
 ): Promise<void> {
   await reapExpiredRuns({ runtime, store, activityPublisher, pipelines });
   try {
@@ -40,11 +45,18 @@ export async function runSweep(
   }
   await deleteOrphanSandboxes(runtime, store, pipelines, cfg);
   try {
-    await reclaimEligibleRuntimeResources({
-      store: pipelines,
-      tickets: store,
-      runtime,
+    const reconcile = reconcileRuntimeResources ?? ((request) =>
+      reclaimEligibleRuntimeResources({
+        store: pipelines,
+        tickets: store,
+        runtime,
+        cutoffIso: request.cutoffIso,
+        limit: request.limit,
+        trigger: request.trigger,
+      }));
+    await reconcile({
       cutoffIso: minutesAgoIso(cfg.runtimeResourceRetentionMinutes),
+      limit: PERIODIC_RECLAIM_LIMIT,
       trigger: "runtime-resource-retention sweep",
     });
   } catch (error) {

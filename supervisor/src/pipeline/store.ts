@@ -440,7 +440,7 @@ export interface PipelineStore extends ChildActionLivenessPort {
    * Terminal instances whose bound runtime resource is `stopped` and has sat
    * past `cutoffIso` (the configured diagnostic-retention window) — the
    * candidate pool for `operations/runtime-resource-reclaim.ts`. Callers
-   * still re-check status, active attempt, and pending effects per candidate
+   * still re-check status, the cutoff, active attempt, and unsettled effects per candidate
    * before deleting: this listing can be stale by the time it is consumed.
    */
   listReclaimableRuntimeResources(cutoffIso: string, limit?: number): PipelineInstance[];

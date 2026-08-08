@@ -15,7 +15,12 @@ import type { RuntimeResource, SandboxAutostopRuntime, SandboxRuntime } from "..
 import { sanitizeText } from "../shared/sanitize.js";
 import { terminateAndSettleActor } from "./actor-settlement.js";
 import { createStructuredChildRuntime } from "./structured-child-runtime.js";
-import { reclaimEligibleRuntimeResources } from "./runtime-resource-reclaim.js";
+import {
+  createRuntimeResourceReconciler,
+  HOT_PATH_RECLAIM_LIMIT,
+  HOT_PATH_RECLAIM_WAIT_TIMEOUT_MS,
+  type RuntimeResourceReconciler,
+} from "./runtime-resource-reclaim.js";
 
 const EFFECT_LEASE_MS = 60_000;
 const RETRY_BASE_MS = 5_000;
@@ -73,6 +78,8 @@ interface PipelineEffectProcessorDeps {
   // capacity-constrained admission preflight (the same eligibility rule
   // everywhere -- see operations/runtime-resource-reclaim.ts).
   runtimeResourceRetentionMinutes: number;
+  /** Shared production single-flight reconciler; tests may omit it. */
+  reconcileRuntimeResources?: RuntimeResourceReconciler;
   now?: () => Date;
   // Persists a Codex OAuth blob rotated inside one structured child action's
   // own scoped CODEX_HOME. Supplied by the caller (see index.ts) rather than
@@ -160,6 +167,12 @@ function parseProvisionRequest(effect: PipelineEffectIntent, store: PipelineStor
 
 export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps): PipelineEffectProcessor {
   const now = deps.now ?? (() => new Date());
+  const reconcileRuntimeResources = deps.reconcileRuntimeResources ??
+    createRuntimeResourceReconciler({
+      store: deps.store,
+      tickets: deps.tickets,
+      runtime: deps.runtime,
+    });
   let draining = false;
 
   const runMatchesInstance = (runId: string, instance: PipelineInstance): boolean => {
@@ -643,12 +656,11 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         effect.attempts >= MAX_EFFECT_ATTEMPTS;
       if (!exhausted && errorClass === "capacity") {
         try {
-          await reclaimEligibleRuntimeResources({
-            store: deps.store,
-            tickets: deps.tickets,
-            runtime: deps.runtime,
+          await reconcileRuntimeResources({
             cutoffIso: new Date(now().getTime() - deps.runtimeResourceRetentionMinutes * 60_000).toISOString(),
+            limit: HOT_PATH_RECLAIM_LIMIT,
             trigger: "capacity-constrained effect drain",
+            waitTimeoutMs: HOT_PATH_RECLAIM_WAIT_TIMEOUT_MS,
           });
         } catch (reclaimError) {
           console.error("[pipeline-effects] runtime resource reconciliation failed:",

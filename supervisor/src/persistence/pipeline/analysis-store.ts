@@ -2,6 +2,7 @@ import type Database from "better-sqlite3";
 import { FAULT_ATTRIBUTIONS } from "../../pipeline/fault-attribution.js";
 import { PIPELINE_OUTCOMES, STAGE_OUTCOMES } from "../../pipeline/manifest.js";
 import type { RunOutcome } from "../../pipeline/store.js";
+import { queryLimit, queryTimestamp } from "./query-filters.js";
 
 // Read-only evidence for improvement proposals, never a decision input --
 // see docs/SPEC.md "Analysis read-contract". supervisor/src/__tests__/
@@ -13,15 +14,6 @@ import type { RunOutcome } from "../../pipeline/store.js";
 // exactly the leak PR #156's review closed: PipelineStore.getRunOutcome was
 // reachable by any code already holding the store gate/transition/scheduler/
 // effect-drain modules depend on, with no import of this file required).
-
-const QUERY_LIMIT = 200;
-
-// Deliberately narrow: requires the 'T' separator and a trailing 'Z' or
-// numeric UTC offset so a loosely-formatted or ambiguous value (`0`,
-// `08/08/2026`) is rejected by shape before Date.parse ever sees it --
-// Date.parse's non-standard fallback parsing accepts both and would
-// otherwise silently query an unintended time range instead of failing closed.
-const ISO_8601_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
 
 export interface AnalysisRunOutcomeQuery {
   outcome?: string;
@@ -38,14 +30,6 @@ export interface AnalysisStore {
   listRunOutcomes(query: AnalysisRunOutcomeQuery): RunOutcome[];
 }
 
-function queryTimestamp(value: string | undefined, label: string): string | undefined {
-  if (value === undefined) return undefined;
-  if (!ISO_8601_TIMESTAMP.test(value)) throw new Error(`${label} must be an ISO-8601 timestamp`);
-  const timestamp = Date.parse(value);
-  if (Number.isNaN(timestamp)) throw new Error(`${label} must be an ISO-8601 timestamp`);
-  return new Date(timestamp).toISOString();
-}
-
 function enumFilter(value: string | undefined, label: string, vocab: readonly string[]): string | undefined {
   if (value === undefined) return undefined;
   if (!vocab.includes(value)) throw new Error(`${label} must be one of: ${vocab.join(", ")}`);
@@ -60,8 +44,7 @@ export function createAnalysisStore(db: Database.Database): AnalysisStore {
       const attribution = enumFilter(query.attribution, "attribution", FAULT_ATTRIBUTIONS);
       const from = queryTimestamp(query.from, "from");
       const to = queryTimestamp(query.to, "to");
-      const requestedLimit = Number.isSafeInteger(query.limit) ? query.limit! : QUERY_LIMIT;
-      const limit = Math.max(1, Math.min(requestedLimit, QUERY_LIMIT));
+      const limit = queryLimit(query.limit);
 
       const filters: string[] = [];
       const args: unknown[] = [];

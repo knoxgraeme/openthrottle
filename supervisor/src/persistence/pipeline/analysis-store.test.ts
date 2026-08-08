@@ -115,6 +115,18 @@ describe("analysis store", () => {
     expect(
       store.listRunOutcomes({ to: "2026-08-05T00:00:00.000Z" }).map((r) => r.pipeline_instance_id)
     ).toEqual([instance1.id]);
+
+    // The ISO-8601 basic offset form (no colon) is just as unambiguous as the
+    // extended form above and Date.parse itself already accepts it -- the
+    // shape check must not reject it here while /status/journal accepts it;
+    // both endpoints now validate through the shared query-filters.ts
+    // (PR #158 review: the hand-copied regexes had diverged on exactly this).
+    expect(
+      store.listRunOutcomes({ from: "2026-08-05T02:00:00+0200" }).map((r) => r.pipeline_instance_id)
+    ).toEqual([instance2.id]);
+    expect(
+      store.listRunOutcomes({ to: "2026-08-05T02:00:00+0200" }).map((r) => r.pipeline_instance_id)
+    ).toEqual([instance1.id]);
   });
 
   it("clamps an oversized limit to the query cap and keeps at least one row", () => {
@@ -127,6 +139,19 @@ describe("analysis store", () => {
 
     expect(store.listRunOutcomes({ limit: 100_000 })).toHaveLength(1);
     expect(store.listRunOutcomes({ limit: 0 })).toHaveLength(1);
+  });
+
+  it("rejects a non-safe-integer limit instead of silently falling back to the default", () => {
+    // Every other filter on this endpoint fails closed on a malformed value;
+    // `Number("abc")`/`Number("Infinity")`/`Number("1.5")` all reach here as
+    // a non-safe-integer number, and previously fell back to the 200-row
+    // default silently instead (PR #156 follow-up review).
+    db = setupPipelineStore().db;
+    const store = createAnalysisStore(db);
+
+    expect(() => store.listRunOutcomes({ limit: Number.NaN })).toThrow(/limit must be a safe integer/);
+    expect(() => store.listRunOutcomes({ limit: Number.POSITIVE_INFINITY })).toThrow(/limit must be a safe integer/);
+    expect(() => store.listRunOutcomes({ limit: 1.5 })).toThrow(/limit must be a safe integer/);
   });
 
   it("rejects an unrecognized outcome, reason, or attribution instead of silently matching nothing", () => {
@@ -159,5 +184,6 @@ describe("analysis store", () => {
     expect(() => store.listRunOutcomes({ to: "2026-08-08" })).toThrow(/to must be an ISO-8601 timestamp/);
     expect(store.listRunOutcomes({ from: "2026-08-08T00:00:00.000Z" })).toEqual([]);
     expect(store.listRunOutcomes({ from: "2026-08-08T00:00:00+00:00" })).toEqual([]);
+    expect(store.listRunOutcomes({ from: "2026-08-08T00:00:00+0000" })).toEqual([]);
   });
 });

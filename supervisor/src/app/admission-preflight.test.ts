@@ -26,7 +26,11 @@ import { loadPipelineCatalog } from "../pipeline/manifest.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 import { setupPipelineStore, ticket } from "../__fixtures__/pipeline-store.js";
-import { reclaimEligibleRuntimeResources } from "../operations/runtime-resource-reclaim.js";
+import {
+  createRuntimeResourceReconciler,
+  HOT_PATH_RECLAIM_LIMIT,
+  HOT_PATH_RECLAIM_WAIT_TIMEOUT_MS,
+} from "../operations/runtime-resource-reclaim.js";
 
 const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
 
@@ -227,8 +231,8 @@ describe("runAdmissionPreflight", () => {
   });
 
   it(
-    "OPE-75 regression: reclaims three stopped 8 GiB terminal resources filling a 24 GiB quota " +
-      "so a fourth follow-up run provisions without operator intervention",
+    "OPE-75 regression: reclaims one stopped 8 GiB terminal resource filling a 24 GiB quota " +
+      "so a fourth follow-up run fits while the rest remain queued for the sweep",
     async () => {
       const setup = setupPipelineStore();
       const { db: fixtureDb, tickets, pipelines, catalog, snapshot } = setup;
@@ -275,17 +279,21 @@ describe("runAdmissionPreflight", () => {
         ];
         expect(aliveSandboxes.size).toBe(3);
 
-        const reconcile = () =>
-          reclaimEligibleRuntimeResources({
-            store: pipelines,
-            tickets,
-            runtime: {
-              cleanup: async ({ providerResourceId }) => {
-                aliveSandboxes.delete(providerResourceId);
-              },
+        const reconcileRuntimeResources = createRuntimeResourceReconciler({
+          store: pipelines,
+          tickets,
+          runtime: {
+            cleanup: async ({ providerResourceId }) => {
+              aliveSandboxes.delete(providerResourceId);
             },
+          },
+        });
+        const reconcile = () =>
+          reconcileRuntimeResources({
             cutoffIso: "2999-01-01T00:00:00.000Z",
+            limit: HOT_PATH_RECLAIM_LIMIT,
             trigger: "capacity-constrained admission preflight",
+            waitTimeoutMs: HOT_PATH_RECLAIM_WAIT_TIMEOUT_MS,
           });
 
         const verdict = await runAdmissionPreflight(
@@ -303,11 +311,13 @@ describe("runAdmissionPreflight", () => {
         // The fourth follow-up run provisions -- no operator had to stop or
         // delete an existing sandbox by hand.
         expect(verdict).toEqual({ ok: true });
-        expect(aliveSandboxes.size).toBe(0);
-        for (const instance of stale) {
-          expect(pipelines.getRuntimeResource(instance.id)?.status).toBe("cleaned");
-          expect(tickets.getByIssueId(instance.linear_issue_id)?.sandbox_id).toBeNull();
-        }
+        expect(aliveSandboxes.size).toBe(2);
+        expect(stale.filter((instance) =>
+          pipelines.getRuntimeResource(instance.id)?.status === "cleaned"
+        )).toHaveLength(1);
+        expect(stale.filter((instance) =>
+          pipelines.getRuntimeResource(instance.id)?.status === "stopped"
+        )).toHaveLength(2);
       } finally {
         fixtureDb.close();
       }

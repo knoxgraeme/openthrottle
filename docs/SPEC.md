@@ -237,18 +237,23 @@ cleanup effect's `preserve` path, which stops rather than deletes so the
 workspace stays inspectable) is otherwise kept indefinitely and still counts
 against the Daytona memory quota. `operations/runtime-resource-reclaim.ts`
 deletes it once `RUNTIME_RESOURCE_RETENTION_MINUTES` has elapsed and the
-instance has no active stage attempt or unsettled effect intent; a resource
+instance has no active stage attempt or unsettled effect intent (`pending`,
+`processing`, or retryable `failed`); a resource
 is deleted only when its exact provider binding is still `stopped` on the
-owning (single-generation) `pipeline_instances` row, and the DB only records
-`cleaned` after provider deletion is confirmed (provider "not found" and
-duplicate cleanup both converge for free — see `cleanup()` in
-`providers/daytona/adapter.ts`). The periodic sweep runs this on the
-configured retention window; capacity-constrained provisioning
+owning (single-generation) `pipeline_instances` row and its stopped timestamp
+is still at or before the retention cutoff immediately before deletion. The
+DB only records `cleaned` after provider deletion is confirmed (provider "not
+found" and duplicate cleanup both converge for free — see `cleanup()` in
+`providers/daytona/adapter.ts`). The periodic sweep runs this on the configured
+retention window; capacity-constrained provisioning
 (`app/admission-preflight.ts`'s `checkDaytonaCapacity`, and a provision/
 dispatch effect that fails with a capacity error in
-`operations/pipeline-effects.ts`) runs the identical pass once, with the same
-eligibility rule, before rejecting or retrying — never bypassing the
-retention window under capacity pressure, since doing so could destroy
+`operations/pipeline-effects.ts`) runs a one-candidate, five-second-wait pass
+with the same eligibility rule before rejecting or retrying. Reclaim triggers
+share one local single-flight; a slow provider deletion may finish after the
+hot caller's wait budget, while remaining candidates stay queued for the
+periodic bulk sweep. Capacity pressure never bypasses the
+retention window, since doing so could destroy
 another operator's still-fresh diagnostic workspace.
 
 ## Sandbox stage contract
@@ -684,14 +689,16 @@ two rules. The first names the gate (`pipeline/gates.ts`,
 transition (`persistence/pipeline/transition-store.ts`,
 `persistence/pipeline/instance-store.ts`), scheduler (`pipeline/coordinator.ts`,
 `pipeline/unit-coordinator.ts`), and effect-drain (`operations/pipeline-effects.ts`,
-`operations/unit-effects.ts`, `operations/structured-child-runtime.ts`)
-modules explicitly and fails if any of them imports the analysis surface. The
-second confines every `run_outcomes` SQL literal, anywhere in the source
-tree, to exactly `run-outcome-store.ts` (the write path) and
-`analysis-store.ts` (the read surface) -- closing the gap the first rule
-alone leaves open, where a decision module under the `persistence` boundary
-could otherwise read the corpus with a raw query of its own and no import to
-catch.
+`operations/unit-effects.ts`, `operations/structured-child-runtime.ts`,
+`pipeline/control.ts`, `pipeline/settlement.ts`) modules as roots and walks
+the import graph forward from them, transitively, so it fails if any of them
+-- or anything they come to depend on, at any depth -- imports the analysis
+surface, not just a direct import from a listed file itself. The second
+confines every `run_outcomes` SQL literal, anywhere in the source tree, to
+exactly `run-outcome-store.ts` (the write path) and `analysis-store.ts` (the
+read surface) -- closing the gap the first rule alone leaves open, where a
+decision module under the `persistence` boundary could otherwise read the
+corpus with a raw query of its own and no import to catch.
 
 Schema migrations are transactional, checksum-pinned, and idempotent. Migration
 code may recognize historical direct-run rows solely to reconcile an older

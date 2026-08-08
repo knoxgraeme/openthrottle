@@ -21,6 +21,7 @@ import type { GateReceiptReason } from "../pipeline/gates.js";
 import type { ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
 import type { PipelineInstance, PipelineStageAttempt } from "../pipeline/store.js";
 import type { LinearOutboxRecord } from "../persistence/delivery-store.js";
+import type { RuntimeResourceReconciler } from "./runtime-resource-reclaim.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
 const structuredGraphPath = fileURLToPath(new URL("../../graphs/structured-v1.json", import.meta.url));
@@ -59,7 +60,11 @@ describe("pipeline effect processor", () => {
     } satisfies SandboxRuntime & SandboxAutostopRuntime;
   }
 
-  function harness(issueId: string, sessionId: string) {
+  function harness(
+    issueId: string,
+    sessionId: string,
+    options: { reconcileRuntimeResources?: RuntimeResourceReconciler } = {}
+  ) {
     db = openDb(":memory:");
     const pipelines = createPipelineStore(db);
     const tickets = createSupervisorStore(db, pipelines);
@@ -101,6 +106,9 @@ describe("pipeline effect processor", () => {
       runtime,
       taskTimeoutSeconds: 300,
       runtimeResourceRetentionMinutes: 60,
+      ...(options.reconcileRuntimeResources
+        ? { reconcileRuntimeResources: options.reconcileRuntimeResources }
+        : {}),
       now: () => new Date("2099-07-22T12:00:00.000Z"),
     });
     const instance = pipelines.getInstanceForSession(sessionId)!;
@@ -2295,6 +2303,29 @@ describe("pipeline effect processor", () => {
 
     expect(runtime.cleanup).toHaveBeenCalledWith({ providerResourceId: "sandbox-stale-needs-human" });
     expect(pipelines.getRuntimeResource(staleInstance.id)?.status).toBe("cleaned");
+    expect(pipelines.getInstance(instance.id)).toMatchObject({ terminal_outcome: null });
+  });
+
+  it("bounds capacity-triggered reconciliation below the effect lease", async () => {
+    const reconcileRuntimeResources = vi.fn<RuntimeResourceReconciler>(async () => ({
+      reclaimed: 0,
+      candidates: 1,
+    }));
+    const { pipelines, runtime, processor, instance } = harness(
+      "issue-capacity-bounded",
+      "session-capacity-bounded",
+      { reconcileRuntimeResources }
+    );
+    runtime.provision.mockRejectedValue(new Error("Total memory limit exceeded"));
+
+    await processor.drain();
+
+    expect(reconcileRuntimeResources).toHaveBeenCalledWith({
+      cutoffIso: "2099-07-22T11:00:00.000Z",
+      limit: 1,
+      trigger: "capacity-constrained effect drain",
+      waitTimeoutMs: 5_000,
+    });
     expect(pipelines.getInstance(instance.id)).toMatchObject({ terminal_outcome: null });
   });
 

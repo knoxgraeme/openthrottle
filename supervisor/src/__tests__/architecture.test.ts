@@ -18,6 +18,11 @@ interface ImportEdge {
   resolved?: string;
 }
 
+interface ResolvedModule {
+  module: SourceModule;
+  edges: ImportEdge[];
+}
+
 const boundaries = new Set([
   "app",
   "http",
@@ -62,6 +67,11 @@ const analysisSurfaceModules = new Set([
   "persistence/pipeline/analysis-store.ts",
 ]);
 
+// Named entry points only -- everything each one pulls in transitively
+// (walked below by decisionSurfaceClosure) is covered automatically, so this
+// list only needs a new entry when a genuinely new gate/transition/
+// scheduler/effect-drain entry point is added, not for every helper it comes
+// to depend on.
 const decisionSurfaceModules = new Set([
   // gate
   "pipeline/gates.ts",
@@ -77,7 +87,49 @@ const decisionSurfaceModules = new Set([
   "operations/pipeline-effects.ts",
   "operations/unit-effects.ts",
   "operations/structured-child-runtime.ts",
+  // control/settlement call coordinatePipelineEvent/evaluateStageGate
+  // directly, exactly like the scheduler/gate entries above -- they are
+  // peer decision entry points, not derived helpers.
+  "pipeline/control.ts",
+  "pipeline/settlement.ts",
 ]);
+
+// A prior version of this check only looked at direct import edges out of
+// decisionSurfaceModules, so a helper a root module started depending on
+// (operations/actor-settlement.ts, imported by operations/pipeline-effects.ts)
+// could import the analysis surface with no violation raised (PR #156
+// follow-up review). Walk the import graph forward from the named roots so
+// any transitive dependency inherits the same restriction.
+function decisionSurfaceClosure(modules: readonly ResolvedModule[]): ReadonlySet<string> {
+  const importsByFile = new Map<string, Set<string>>();
+  for (const { module, edges } of modules) {
+    const rel = relativeSource(module.file);
+    const merged = importsByFile.get(rel) ?? new Set<string>();
+    for (const edge of edges) {
+      // Same reasoning as typeOnlyExceptions above: an `import type` edge is
+      // erased at emit and cannot execute a read at run time, so following
+      // it here would only pull pure-type contract modules (pipeline/
+      // store.ts, runtime/contracts.ts, ...) into the closure and turn every
+      // module that shares those type shapes into a future false positive.
+      // Only value edges propagate the decision-surface restriction.
+      if (edge.typeOnly) continue;
+      if (edge.resolved) merged.add(relativeSource(edge.resolved));
+    }
+    importsByFile.set(rel, merged);
+  }
+
+  const closure = new Set<string>();
+  const queue = [...decisionSurfaceModules];
+  while (queue.length > 0) {
+    const current = queue.pop()!;
+    if (closure.has(current)) continue;
+    closure.add(current);
+    for (const next of importsByFile.get(current) ?? []) {
+      if (!closure.has(next)) queue.push(next);
+    }
+  }
+  return closure;
+}
 
 // The import-edge rule above only catches importing analysis-store.ts by
 // name; a decision-surface module living under persistence/ (e.g.
@@ -219,9 +271,14 @@ function collectStringLiterals(module: SourceModule): string[] {
 function findArchitectureViolations(modules: SourceModule[]): string[] {
   productionFileSet.clear();
   for (const module of modules) productionFileSet.add(path.resolve(module.file));
+  // Resolve each module's imports once and share the result with the
+  // decision-surface walk below, instead of re-parsing every production
+  // file's AST a second time.
+  const resolvedModules = modules.map((module) => ({ module, edges: collectImports(module) }));
+  const decisionSurface = decisionSurfaceClosure(resolvedModules);
 
   const violations: string[] = [];
-  for (const module of modules) {
+  for (const { module, edges } of resolvedModules) {
     const rel = relativeSource(module.file);
     const boundary = boundaryFor(module.file);
     if (boundary === "root" && rel !== "index.ts") {
@@ -231,7 +288,7 @@ function findArchitectureViolations(modules: SourceModule[]): string[] {
       violations.push(`${rel}: deleted flat module returned as a production facade`);
     }
 
-    for (const edge of collectImports(module)) {
+    for (const edge of edges) {
       const specifier = edge.specifier;
       if (specifier.startsWith(".")) {
         if (!specifier.endsWith(".js")) {
@@ -246,7 +303,7 @@ function findArchitectureViolations(modules: SourceModule[]): string[] {
         if (toRel.startsWith("__fixtures__/")) {
           violations.push(`${rel}: production module imports test fixture ${toRel}`);
         }
-        if (decisionSurfaceModules.has(rel) && analysisSurfaceModules.has(toRel)) {
+        if (decisionSurface.has(rel) && analysisSurfaceModules.has(toRel)) {
           violations.push(`${rel}: gate/transition/scheduler/effect-drain code may not import the read-only analysis surface ${toRel}`);
         }
         if (boundary === "root" && rel === "index.ts") continue;
@@ -329,6 +386,14 @@ describe("supervisor source architecture", () => {
         file: path.join(sourceRoot, "persistence", "pipeline", "instance-store.ts"),
         source: "export const sql = 'SELECT * FROM run_outcomes';",
       },
+      // Not itself a listed root: operations/actor-settlement.ts is only
+      // reachable because operations/pipeline-effects.ts (a real root)
+      // really imports it. Proves the walk is transitive, not just a check
+      // against the enumerated root list itself (OPE-118).
+      {
+        file: path.join(sourceRoot, "operations", "actor-settlement.ts"),
+        source: "import '../persistence/pipeline/analysis-store.js';",
+      },
     ];
 
     expect(findArchitectureViolations([...productionSources(), ...fixtures])).toEqual(
@@ -345,6 +410,7 @@ describe("supervisor source architecture", () => {
         "persistence/pipeline/transition-store.ts: gate/transition/scheduler/effect-drain code may not import the read-only analysis surface persistence/pipeline/analysis-store.ts",
         "operations/pipeline-effects.ts: gate/transition/scheduler/effect-drain code may not import the read-only analysis surface persistence/pipeline/analysis-store.ts",
         "persistence/pipeline/instance-store.ts: run_outcomes SQL is confined to run-outcome-store.ts and analysis-store.ts",
+        "operations/actor-settlement.ts: gate/transition/scheduler/effect-drain code may not import the read-only analysis surface persistence/pipeline/analysis-store.ts",
       ])
     );
   });
