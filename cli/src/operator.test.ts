@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import analysis from './analysis.js';
 import logs from './logs.js';
 import status from './status.js';
 import stop from './stop.js';
@@ -194,5 +195,59 @@ describe('operator commands', () => {
       expect.objectContaining({ signal: expect.any(AbortSignal) })
     );
     expect(output).toHaveBeenCalledWith('last task line\n');
+  });
+
+  it('queries the read-only analysis surface with the given filters and prints a table', async () => {
+    const fetchMock = vi.fn(
+      async (_input: string | URL | Request, _init?: RequestInit) => Response.json({
+        runs: [
+          {
+            pipeline_instance_id: 'instance-1',
+            linear_issue_id: 'issue-1',
+            generation: 1,
+            execution_graph_id: 'graph-1',
+            plan_digest: 'plan-digest',
+            base_commit: 'a'.repeat(40),
+            engine: 'codex',
+            outcome: 'shipped',
+            closed_reason: 'success',
+            fault_attribution: null,
+            generations_consumed: 1,
+            token_cost_usd: null,
+            created_at: '2026-08-08T00:00:00.000Z',
+          },
+        ],
+      })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const output = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    await analysis(['--outcome', 'shipped', '--skill-digest', 'builtin://ce/implement@1']);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://supervisor.test/analysis/runs?outcome=shipped&skill_digest=builtin%3A%2F%2Fce%2Fimplement%401',
+      expect.objectContaining({ headers: expect.any(Headers), signal: expect.any(AbortSignal) })
+    );
+    const printed = output.mock.calls.flat().join('\n');
+    expect(printed).toContain('instance-1');
+    expect(printed).toContain('shipped');
+    expect(printed).toContain('graph-1');
+  });
+
+  it('exits on an unrecognized analysis flag without calling the supervisor', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const exit = process.exit;
+    process.exit = ((code?: string | number | null) => {
+      throw new Error(`exit ${code}`);
+    }) as typeof process.exit;
+
+    try {
+      await expect(analysis(['--not-a-real-flag', 'x'])).rejects.toThrow(/exit 1/);
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      process.exit = exit;
+    }
   });
 });

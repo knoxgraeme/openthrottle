@@ -6,6 +6,7 @@ import type { Config } from "../app/config.js";
 import { createSupervisorStore, type SupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
+import { createAnalysisStore, type AnalysisStore } from "../persistence/pipeline/analysis-store.js";
 import { STRUCTURED_STATUS_UNITS_SQL } from "../persistence/pipeline/status-store.js";
 import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 import type { PipelineStore } from "../pipeline/store.js";
@@ -100,11 +101,13 @@ describe("coordinator-only server", () => {
   let db: ReturnType<typeof openDb>;
   let store: SupervisorStore;
   let pipelines: PipelineStore;
+  let analysisStore: AnalysisStore;
 
   beforeEach(() => {
     db = openDb(":memory:");
     pipelines = createPipelineStore(db);
     store = createSupervisorStore(db, pipelines);
+    analysisStore = createAnalysisStore(db);
   });
 
   afterEach(() => db.close());
@@ -114,6 +117,7 @@ describe("coordinator-only server", () => {
       cfg,
       store,
       runtime: {} as ServerRuntime,
+      analysisStore,
       getLinearClient: async () => undefined,
       pipelineCoordinator: {
         catalog: {} as never,
@@ -289,6 +293,45 @@ describe("coordinator-only server", () => {
       repository: "owner/repo",
       kind: "terminal_observed",
     });
+  });
+
+  it("serves filterable run_outcomes evidence through the read-only analysis surface", async () => {
+    seedPipelineTicket();
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    db.prepare(`
+      INSERT INTO run_outcomes (
+        pipeline_instance_id, linear_issue_id, generation, execution_graph_id, plan_digest,
+        base_commit, engine, outcome, closed_reason, fault_attribution, generations_consumed,
+        repair_rounds_by_unit, phase_durations_ms, token_cost_usd, skill_digests, created_at
+      ) VALUES (?, ?, 1, NULL, NULL, ?, 'codex', 'shipped', 'success', NULL, 1, '{}', '{}', NULL, ?, ?)
+    `).run(
+      instance.id,
+      instance.linear_issue_id,
+      instance.base_commit,
+      JSON.stringify([{ skill: "builtin://ce/implement@1", skill_package_digest: null }]),
+      "2026-08-08T00:00:00.000Z"
+    );
+
+    const matching = await app().request(
+      "/analysis/runs?outcome=shipped&skill_digest=builtin%3A%2F%2Fce%2Fimplement%401",
+      { headers: { Authorization: "Bearer status-token" } }
+    );
+    expect(matching.status).toBe(200);
+    const matchingBody = await matching.json() as { runs: Array<{ pipeline_instance_id: string; outcome: string }> };
+    expect(matchingBody.runs).toHaveLength(1);
+    expect(matchingBody.runs[0]).toMatchObject({ pipeline_instance_id: instance.id, outcome: "shipped" });
+
+    const nonMatching = await app().request("/analysis/runs?outcome=failed", {
+      headers: { Authorization: "Bearer status-token" },
+    });
+    expect((await nonMatching.json() as { runs: unknown[] }).runs).toHaveLength(0);
+  });
+
+  it("rejects an unrecognized analysis filter value instead of silently returning no evidence", async () => {
+    const response = await app().request("/analysis/runs?outcome=not_a_real_outcome", {
+      headers: { Authorization: "Bearer status-token" },
+    });
+    expect(response.status).toBe(400);
   });
 
   it("includes repeated sandbox ingestion failures in pipeline status", async () => {
@@ -827,6 +870,7 @@ describe("coordinator-only server", () => {
     for (const [path, method] of [
       ["/status", "GET"],
       ["/capabilities", "GET"],
+      ["/analysis/runs", "GET"],
       ["/repositories", "GET"],
       ["/repositories/register", "POST"],
       ["/tickets/OT-1/stop", "POST"],

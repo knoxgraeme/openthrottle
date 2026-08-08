@@ -21,6 +21,7 @@ import {
   type PipelineUnitPhaseBinding,
 } from "./manifest.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
+import { createRunOutcomeStore } from "../persistence/pipeline/run-outcome-store.js";
 import type { PipelineInstance, PipelineInstanceStage, PipelineStageAttempt } from "./store.js";
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
@@ -371,7 +372,11 @@ describe("pipeline coordinator", () => {
     const completed = coordinatePipelineEvent(pipelines, event(instance, attempt));
     expect(completed.terminal_outcome).toBe("shipped");
 
-    const outcome = pipelines.getRunOutcome(instance.id);
+    // getRunOutcome is deliberately absent from PipelineStore (see
+    // pipeline/store.ts) so gate/transition/scheduler/effect-drain code has
+    // no read path into the corpus; this assertion goes straight to
+    // RunOutcomeStore, the same way run-outcome-store.test.ts does.
+    const outcome = createRunOutcomeStore(db!).getRunOutcome(instance.id);
     expect(outcome).toMatchObject({
       pipeline_instance_id: instance.id,
       linear_issue_id: instance.linear_issue_id,
@@ -393,14 +398,14 @@ describe("pipeline coordinator", () => {
     expect(JSON.parse(outcome!.skill_digests)).toEqual([]);
 
     expect(pipelines.pruneRunOutcomes("2099-01-01T00:00:00.000Z")).toBe(1);
-    expect(pipelines.getRunOutcome(instance.id)).toBeUndefined();
+    expect(createRunOutcomeStore(db!).getRunOutcome(instance.id)).toBeUndefined();
   });
 
   it("does not write a run_outcomes row for a non-terminal transition", () => {
     const { pipelines, instance, attempt } = setup("core/implement@4");
     const completed = coordinatePipelineEvent(pipelines, event(instance, attempt, "semantic_repair_required"));
     expect(completed.terminal_outcome).toBeNull();
-    expect(pipelines.getRunOutcome(instance.id)).toBeUndefined();
+    expect(createRunOutcomeStore(db!).getRunOutcome(instance.id)).toBeUndefined();
   });
 
   it("projects notable repair stages into run notes without changing transitions", () => {

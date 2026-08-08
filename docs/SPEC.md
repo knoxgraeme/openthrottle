@@ -541,6 +541,7 @@ sentence, or links rendered after it.
 | `GET` | `/oauth/callback` | one-time OAuth state | exchange and store installation |
 | `GET` | `/status` | `OT_STATUS_TOKEN` bearer | tickets and pipeline/effect/publication state |
 | `GET` | `/capabilities` | `OT_STATUS_TOKEN` bearer | active runtime release, capability digest, and capability IDs |
+| `GET` | `/analysis/runs` | `OT_STATUS_TOKEN` bearer | read-only, filterable `run_outcomes` evidence for improvement proposals |
 | `GET` | `/repositories` | `OT_STATUS_TOKEN` bearer | registered routes |
 | `POST` | `/repositories/register` | `OT_STATUS_TOKEN` bearer | verify and upsert route/webhook |
 | `POST` | `/tickets/:id/stop` | `OT_STATUS_TOKEN` bearer | coordinator stop |
@@ -579,6 +580,16 @@ pre-mutation activation check (see "CLI contract" below): explicit structured
 selection never proceeds to any Linear call, let alone mutation, when the
 endpoint is unreachable, unauthenticated, or its response is missing,
 malformed, or does not list the exact structured capability.
+
+`GET /analysis/runs` returns `run_outcomes` rows (see "Persistence contract"
+below), filterable by `outcome`, `reason` (`closed_reason`), `attribution`
+(`fault_attribution`), `graph` (`execution_graph_id`), `skill_digest` (matches
+an entry in `skill_digests`), and an inclusive `from`/`to` range over
+`created_at`; `limit` is clamped to a 200-row cap. An unrecognized filter
+value or a malformed timestamp fails the request with `400` rather than
+silently matching nothing. This is the analysis read-contract's only sanctioned
+entry point into the corpus -- see "Persistence contract" for the doctrine and
+its enforcement.
 
 ## Persistence contract
 
@@ -623,6 +634,40 @@ deduped skill digests that ran (from receipt producers). Retained under the
 separate, longer `RUN_OUTCOME_RETENTION_DAYS` cutoff rather than the other
 operational-data retention windows, since it is safe to keep for
 skill-tuning measurement.
+
+### Analysis read-contract
+
+`run_outcomes` and the receipt tables it is derived from are exposed
+read-only through `GET /analysis/runs` and `openthrottle analysis` (see
+"Supervisor HTTP contract" above). This generalizes the `orchestration_journal`
+doctrine above: the corpus is evidence for improvement proposals, never an
+input to a pipeline decision -- no gate, transition, scheduler, or
+effect-drain module may import or query it.
+`supervisor/src/persistence/pipeline/analysis-store.ts` is the corpus's only
+read surface and is wired into the HTTP layer from a plain `db` handle in
+`index.ts`, deliberately separate from `PipelineStore` (which
+gate/transition/scheduler/effect-drain code consumes). `PipelineStore`
+exposes no `run_outcomes` read method of its own for exactly that reason: a
+method on that interface would be reachable by any decision code already
+holding the store, without importing `analysis-store.ts` at all -- the
+single-row lookup a settlement write wants to verify still exists on
+`RunOutcomeStore` itself (`persistence/pipeline/run-outcome-store.ts`), not
+on `PipelineStore`.
+
+`supervisor/src/__tests__/architecture.test.ts` enforces the contract with
+two rules. The first names the gate (`pipeline/gates.ts`,
+`pipeline/execution-gates.ts`, `persistence/pipeline/unit-store-phase-reducer.ts`),
+transition (`persistence/pipeline/transition-store.ts`,
+`persistence/pipeline/instance-store.ts`), scheduler (`pipeline/coordinator.ts`,
+`pipeline/unit-coordinator.ts`), and effect-drain (`operations/pipeline-effects.ts`,
+`operations/unit-effects.ts`, `operations/structured-child-runtime.ts`)
+modules explicitly and fails if any of them imports the analysis surface. The
+second confines every `run_outcomes` SQL literal, anywhere in the source
+tree, to exactly `run-outcome-store.ts` (the write path) and
+`analysis-store.ts` (the read surface) -- closing the gap the first rule
+alone leaves open, where a decision module under the `persistence` boundary
+could otherwise read the corpus with a raw query of its own and no import to
+catch.
 
 Schema migrations are transactional, checksum-pinned, and idempotent. Migration
 code may recognize historical direct-run rows solely to reconcile an older
@@ -784,7 +829,9 @@ stage.
 secret checklist. `openthrottle init` detects the GitHub origin/default branch,
 writes `.openthrottle.yml`, and idempotently registers the Linear-team route and
 GitHub webhook. `openthrottle ship <plan.md>` creates and delegates a Linear
-issue. `status`, `stop`, and `logs` call authenticated supervisor endpoints.
+issue. `status`, `stop`, `logs`, and `analysis` call authenticated supervisor
+endpoints; `analysis` filters `GET /analysis/runs` by `--outcome`, `--reason`,
+`--attribution`, `--graph`, `--skill-digest`, `--from`, `--to`, and `--limit`.
 
 An explicit structured (unit-consuming) graph selection adds one pre-mutation
 step to `ship`: before any Linear call, the CLI calls the configured

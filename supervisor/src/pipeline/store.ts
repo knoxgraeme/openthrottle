@@ -481,6 +481,14 @@ export interface PipelineStore extends ChildActionLivenessPort {
   applyTransition(write: CoordinatorTransitionWrite, faultAfterWrite?: (writeCount: number) => void): PipelineInstance;
   recordJournalEntry(input: OrchestrationJournalWrite): void;
   listJournalEntries(query: OrchestrationJournalQuery): OrchestrationJournalEntry[];
-  getRunOutcome(pipelineInstanceId: string): RunOutcome | undefined;
+  // No getRunOutcome here on purpose: every gate/transition/scheduler/
+  // effect-drain module is constructed with a PipelineStore, so a read
+  // method on this interface would be reachable by decision code with no
+  // import of persistence/pipeline/analysis-store.ts required, defeating the
+  // read-contract architecture.test.ts enforces (see analysis-store.ts).
+  // The single-row lookup still exists on RunOutcomeStore itself
+  // (run-outcome-store.ts) for the write-path idempotency check and for
+  // tests asserting settlement wrote a row; production reads go through
+  // AnalysisStore.listRunOutcomes.
   pruneRunOutcomes(beforeIso: string): number;
 }

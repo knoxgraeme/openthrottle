@@ -47,6 +47,52 @@ const typeOnlyExceptions = new Set([
   "pipeline->runtime:runtime/contracts.ts",
 ]);
 
+// OPE-112 read-contract, promoted from SPEC prose to an assertion here:
+// run_outcomes and the receipt tables are evidence for improvement
+// proposals, never a decision input (see docs/SPEC.md "Analysis
+// read-contract", generalizing the pre-existing orchestration_journal
+// doctrine). No gate, transition, scheduler, or effect-drain module may
+// import or query the read-only analysis surface. Most of these already sit
+// in the "pipeline" boundary, which allowedEdges already confines to
+// pipeline/shared -- this list is deliberately explicit (and includes those
+// too) so the doctrine reads as one rule instead of depending on nobody ever
+// loosening the coarser boundary map, and so it also reaches the persistence
+// and operations modules the coarse map does not block from one another.
+const analysisSurfaceModules = new Set([
+  "persistence/pipeline/analysis-store.ts",
+]);
+
+const decisionSurfaceModules = new Set([
+  // gate
+  "pipeline/gates.ts",
+  "pipeline/execution-gates.ts",
+  "persistence/pipeline/unit-store-phase-reducer.ts",
+  // transition
+  "persistence/pipeline/transition-store.ts",
+  "persistence/pipeline/instance-store.ts",
+  // scheduler
+  "pipeline/coordinator.ts",
+  "pipeline/unit-coordinator.ts",
+  // effect drain
+  "operations/pipeline-effects.ts",
+  "operations/unit-effects.ts",
+  "operations/structured-child-runtime.ts",
+]);
+
+// The import-edge rule above only catches importing analysis-store.ts by
+// name; a decision-surface module living under persistence/ (e.g.
+// transition-store.ts, instance-store.ts) is otherwise free to write its own
+// `SELECT ... FROM run_outcomes` and read the corpus with no import at all
+// (PR #156 review). Confine the table itself to its two legitimate SQL
+// authors: the write path (and its own idempotency read) and the read-only
+// analysis surface. Deliberately not folded into the runs/run_liveness
+// check below, which exempts all of persistence/ -- this one must NOT
+// exempt persistence/pipeline/{transition,instance}-store.ts.
+const RUN_OUTCOMES_SQL_ALLOWLIST = new Set([
+  "persistence/pipeline/run-outcome-store.ts",
+  "persistence/pipeline/analysis-store.ts",
+]);
+
 const deletedFlatModules = new Set([
   "actor-settlement.ts",
   "commands.ts",
@@ -200,6 +246,9 @@ function findArchitectureViolations(modules: SourceModule[]): string[] {
         if (toRel.startsWith("__fixtures__/")) {
           violations.push(`${rel}: production module imports test fixture ${toRel}`);
         }
+        if (decisionSurfaceModules.has(rel) && analysisSurfaceModules.has(toRel)) {
+          violations.push(`${rel}: gate/transition/scheduler/effect-drain code may not import the read-only analysis surface ${toRel}`);
+        }
         if (boundary === "root" && rel === "index.ts") continue;
         const allowed = allowedEdges.get(boundary)?.has(toBoundary) ?? false;
         const exceptionKey = `${boundary}->${toBoundary}:${toRel}`;
@@ -231,6 +280,14 @@ function findArchitectureViolations(modules: SourceModule[]): string[] {
         }
       }
     }
+
+    if (!RUN_OUTCOMES_SQL_ALLOWLIST.has(rel)) {
+      for (const literal of collectStringLiterals(module)) {
+        if (/\b(?:FROM|JOIN|UPDATE|INSERT\s+INTO|DELETE\s+FROM)\s+run_outcomes\b/i.test(literal)) {
+          violations.push(`${rel}: run_outcomes SQL is confined to run-outcome-store.ts and analysis-store.ts`);
+        }
+      }
+    }
   }
   return violations;
 }
@@ -251,6 +308,27 @@ describe("supervisor source architecture", () => {
       { file: path.join(sourceRoot, "operations", "bad-sql.ts"), source: "export const sql = 'SELECT * FROM runs';" },
       { file: path.join(sourceRoot, "__fixtures__", "helper.ts"), source: "export const fixture = true;" },
       { file: path.join(sourceRoot, "app", "bad-fixture.ts"), source: "import '../__fixtures__/helper.js';" },
+      // Same paths as two real decision-surface modules, with fake content:
+      // the real files (scanned separately via productionSources()) don't
+      // import the analysis surface and so contribute no violation of their
+      // own; these fixture copies exercise the OPE-112 rule for the two
+      // categories (transition, effect drain) the coarse boundary map above
+      // would otherwise silently allow, since persistence->persistence and
+      // operations->persistence edges are both already permitted.
+      {
+        file: path.join(sourceRoot, "persistence", "pipeline", "transition-store.ts"),
+        source: "import './analysis-store.js';",
+      },
+      {
+        file: path.join(sourceRoot, "operations", "pipeline-effects.ts"),
+        source: "import '../persistence/pipeline/analysis-store.js';",
+      },
+      // A decision-surface module reading run_outcomes with its own SQL,
+      // no import required -- the gap the review named directly.
+      {
+        file: path.join(sourceRoot, "persistence", "pipeline", "instance-store.ts"),
+        source: "export const sql = 'SELECT * FROM run_outcomes';",
+      },
     ];
 
     expect(findArchitectureViolations([...productionSources(), ...fixtures])).toEqual(
@@ -264,6 +342,9 @@ describe("supervisor source architecture", () => {
         "providers/linear/bad-sibling.ts: provider linear may not import provider github module providers/github/client.ts",
         "operations/bad-sql.ts: runs/run_liveness SQL is confined to persistence",
         "app/bad-fixture.ts: production module imports test fixture __fixtures__/helper.ts",
+        "persistence/pipeline/transition-store.ts: gate/transition/scheduler/effect-drain code may not import the read-only analysis surface persistence/pipeline/analysis-store.ts",
+        "operations/pipeline-effects.ts: gate/transition/scheduler/effect-drain code may not import the read-only analysis surface persistence/pipeline/analysis-store.ts",
+        "persistence/pipeline/instance-store.ts: run_outcomes SQL is confined to run-outcome-store.ts and analysis-store.ts",
       ])
     );
   });

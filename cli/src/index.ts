@@ -24,6 +24,10 @@ Usage:
   openthrottle status              Show ticket status from the supervisor.
   openthrottle stop <ticket>       Stop a ticket's active run and workspace.
   openthrottle logs <ticket>       Print sanitized sandbox logs.
+  openthrottle analysis [flags]    Read-only run_outcomes evidence for
+                                    improvement proposals: --outcome, --reason,
+                                    --attribution, --graph, --skill-digest,
+                                    --from, --to, --limit.
 
   openthrottle --help              Show this message.
   openthrottle --version           Print the CLI version.
@@ -71,6 +75,11 @@ async function main(): Promise<void> {
     case 'logs': {
       const { default: logs } = await import('./logs.js');
       await logs(rest[0]);
+      break;
+    }
+    case 'analysis': {
+      const { default: analysis } = await import('./analysis.js');
+      await analysis(rest);
       break;
     }
     case '--version':

@@ -16,6 +16,7 @@ import { reapStalledRuns } from "./operations/reaper.js";
 import { activityPayload, createLinearActivityPublisher, createLinearOutboxProcessor, enqueueSessionUpdate } from "./providers/linear/outbox.js";
 import { loadPipelineCatalog } from "./pipeline/manifest.js";
 import { createPipelineStore } from "./persistence/pipeline/create-store.js";
+import { createAnalysisStore } from "./persistence/pipeline/analysis-store.js";
 import { loadRuntimeCapabilityDescriptor } from "./runtime/contracts.js";
 import { drainDeferredProviderEvidence } from "./pipeline/gates.js";
 import { completeStageAttemptActor } from "./pipeline/settlement.js";
@@ -40,6 +41,7 @@ async function main() {
   const db = openDb(cfg.databasePath);
   const pipelineStore = createPipelineStore(db);
   const store = createSupervisorStore(db, pipelineStore);
+  const analysisStore = createAnalysisStore(db);
   const runtimeCapabilities = loadRuntimeCapabilityDescriptor(
     cfg.sandboxRuntimeDescriptorPath,
     cfg.sandboxRuntimeRelease
@@ -103,6 +105,7 @@ async function main() {
     cfg,
     store,
     runtime,
+    analysisStore,
     getLinearClient,
     deliveryProcessor,
     linearOutboxProcessor,
