@@ -23,6 +23,7 @@ import {
   buildCommandArtifacts,
   buildSemanticArtifacts,
   digest,
+  parseAgentJson,
   sanitizeArtifactText,
   validateSemanticProposal,
 } from "./artifacts.mjs";
@@ -590,7 +591,11 @@ export function defaultRunAgent({
       stdout: result.stdout ?? "",
       stderr: result.stderr ?? result.error?.message ?? "",
       nativeSessionId,
-      proposal: proposalRead.status === 0 ? JSON.parse(proposalRead.stdout) : undefined,
+      // ot-stage-result normally writes this file, but the executor never
+      // trusts that: reconcilePublication re-runs validateSemanticProposal on
+      // whatever is here, so this file is agent-authored data and gets the
+      // same one-fence tolerance as the loop receipt (OPE-101).
+      proposal: proposalRead.status === 0 ? parseAgentJson(proposalRead.stdout) : undefined,
       authSnapshot: authRead?.status === 0 ? authRead.stdout : undefined,
     };
   } catch (error) {

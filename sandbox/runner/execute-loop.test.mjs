@@ -3209,6 +3209,90 @@ describe("executeLoopAction", () => {
     expect(result.receipt).toContain("unit_completion");
   });
 
+  it("accepts a receipt wrapped in one markdown code fence and returns the identical result", () => {
+    // OPE-101 generation 6: the model emitted a byte-perfect unit_completion
+    // receipt -- every field correct, subject matching the executor's own
+    // recompute -- inside ```json ... ```, and lost the generation to three
+    // backticks. The fenced emission must be indistinguishable from the plain
+    // one, through the same validators, not merely "also succeed".
+    const valid = request({ agent: "claude" });
+    const receipt = standardReceipt(valid);
+    const runFinalMessage = (finalMessage) => executeLoopActionWithIntegration({
+      request: valid,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      runLoopAgent: () => ({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: [
+          JSON.stringify({ type: "system", subtype: "init", session_id: "s-1", model: "stub" }),
+          JSON.stringify({ type: "result", subtype: "success", is_error: false, result: finalMessage }),
+        ].join("\n"),
+        stderr: "",
+        nativeSessionId: null,
+      }),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+    const plain = runFinalMessage(JSON.stringify(receipt));
+    const fenced = runFinalMessage(`\`\`\`json\n${JSON.stringify(receipt, null, 2)}\n\`\`\``);
+    const bareFenced = runFinalMessage(`\`\`\`\n${JSON.stringify(receipt, null, 2)}\n\`\`\``);
+
+    expect(plain.outcome).toBe("success");
+    // event_id is a fresh UUID per action; every other byte, the canonical
+    // receipt included, must match the unfenced emission exactly.
+    const withoutEventId = ({ event_id: _eventId, ...rest }) => rest;
+    expect(withoutEventId(fenced)).toEqual(withoutEventId(plain));
+    expect(withoutEventId(bareFenced)).toEqual(withoutEventId(plain));
+  });
+
+  it("still rejects a fence that is not the entire final message", () => {
+    // The interior is pretty-printed on purpose: no single line parses on its
+    // own either, so this exercises the fence rule rather than the line scan.
+    const valid = request({ agent: "claude" });
+    const pretty = JSON.stringify(standardReceipt(valid), null, 2);
+    expect(() => parseLoopReceipt(`Here is the receipt:\n\`\`\`json\n${pretty}\n\`\`\``, {}))
+      .toThrow(/invalid standard receipt/);
+    expect(() => parseLoopReceipt(`\`\`\`json\n${pretty}\n\`\`\`\nDone.`, {}))
+      .toThrow(/invalid standard receipt/);
+    // A partial fence is not a fence.
+    expect(() => parseLoopReceipt(`\`\`\`json\n${pretty}`, {})).toThrow(/invalid standard receipt/);
+  });
+
+  it("names the nested validator defect for an invalid receipt inside a code fence", () => {
+    // Fence tolerance must not cost the OPE-101 diagnostics: a fenced receipt
+    // that is genuinely wrong still reports the field the validator named,
+    // never the stream-json envelope's useless "unknown field subtype".
+    const valid = request({ agent: "claude" });
+    const { schema: _schema, ...withoutSchema } = standardReceipt(valid);
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      runLoopAgent: () => ({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: [
+          JSON.stringify({ type: "system", subtype: "init", session_id: "s-1", model: "stub" }),
+          JSON.stringify({
+            type: "result",
+            subtype: "success",
+            is_error: false,
+            result: `\`\`\`json\n${JSON.stringify(withoutSchema, null, 2)}\n\`\`\``,
+          }),
+        ].join("\n"),
+        stderr: "",
+        nativeSessionId: null,
+      }),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("failure");
+    expect(result.receipt).toContain("loop action emitted invalid standard receipt: standard receipt is missing field schema");
+    expect(result.receipt).not.toContain("unknown field subtype");
+  });
+
   it("relocks the worker worktree when the loop agent throws before evidence", () => {
     const lockWorkerWorktree = vi.fn();
     const lockActionDirectory = vi.fn();
