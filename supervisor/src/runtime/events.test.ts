@@ -113,4 +113,41 @@ describe("runtime event contracts", () => {
       }],
     }))).toThrow(/request_hash/);
   });
+
+  it("parses an optional fault_reason on stage_result and rejects an unrecognized value", () => {
+    const validStageResult = {
+      version: 1,
+      kind: "stage_result",
+      event_id: "33333333-3333-4333-8333-333333333333",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:00.000Z",
+      pipeline_instance_id: "pipeline-1",
+      generation: 1,
+      stage_id: "implementation",
+      attempt_id: "attempt-1",
+      request_hash: "1".repeat(64),
+      outcome: "retryable_infrastructure_failure",
+      result_hash: "2".repeat(64),
+      native_session_id: null,
+      subject: "c".repeat(40),
+      artifacts: [{
+        kind: "stage_result",
+        schema_version: 1,
+        assurance: "semantic_attested",
+        subject: "c".repeat(40),
+        payload: "{}",
+        hash: "2".repeat(64),
+      }],
+    };
+
+    const withoutReason = parseSandboxEvent(JSON.stringify(validStageResult));
+    expect(withoutReason).not.toHaveProperty("fault_reason");
+
+    const withReason = parseSandboxEvent(JSON.stringify({ ...validStageResult, fault_reason: "rate_limited" }));
+    if (withReason.kind !== "stage_result") throw new Error("expected stage_result event");
+    expect(withReason.fault_reason).toBe("rate_limited");
+
+    expect(() => parseSandboxEvent(JSON.stringify({ ...validStageResult, fault_reason: "not_a_real_reason" })))
+      .toThrow(/fault_reason/);
+  });
 });

@@ -1759,6 +1759,20 @@ DROP TABLE orchestration_journal_old;
 const orchestrationJournalCloseEscalatedHumanMigrationSource = `${orchestrationJournalCloseEscalatedHumanSchema}
 journal-kind-contract:orchestration_journal.kind never carries a declared value with zero producers; the decision corpus stays in the receipt/gate tables/v1`;
 
+// Additive: existing rows stay NULL (pre-attribution era). Stamped at every
+// site that writes runs.settlement_reason (run-store.ts finishRunTransaction,
+// claimRunForReapingTransaction) so a run's fault domain -- executor, agent,
+// provider, or the first-class unknown -- travels with its terminal outcome
+// instead of being inferred from prose after the fact.
+const runFaultAttributionSchema = `
+ALTER TABLE runs ADD COLUMN fault_attribution TEXT CHECK(
+  fault_attribution IS NULL OR fault_attribution IN ('executor', 'agent', 'provider', 'unknown')
+);
+`;
+
+const runFaultAttributionMigrationSource = `${runFaultAttributionSchema}
+fault-attribution-contract:runs.fault_attribution is stamped at settlement alongside settlement_reason, closed to executor/agent/provider/unknown, NULL only for pre-attribution rows/v1`;
+
 function addExecutionGraphStopFence(db: Database.Database): void {
   if (!hasColumns(db, "execution_graphs", ["stopped_at"])) {
     db.exec("ALTER TABLE execution_graphs ADD COLUMN stopped_at TEXT");
@@ -2317,6 +2331,16 @@ const definitions: DatabaseMigrationDefinition[] = [
     up(db) {
       if (hasTable(db, "orchestration_journal")) {
         db.exec(orchestrationJournalCloseEscalatedHumanSchema);
+      }
+    },
+  },
+  {
+    version: 28,
+    name: "run-fault-attribution",
+    source: runFaultAttributionMigrationSource,
+    up(db) {
+      if (hasTable(db, "runs") && !hasColumns(db, "runs", ["fault_attribution"])) {
+        db.exec(runFaultAttributionSchema);
       }
     },
   },

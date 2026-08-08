@@ -1,5 +1,6 @@
 import { sanitizeText } from "../shared/sanitize.js";
 import { STAGE_OUTCOMES } from "../pipeline/manifest.js";
+import { LAUNCH_FAULT_REASONS, type LaunchFaultReason } from "../pipeline/fault-attribution.js";
 import type { PipelineCoordinatorEvent, PipelineEventArtifact } from "../pipeline/coordinator.js";
 
 const MAX_EVENT_BYTES = 32 * 1024;
@@ -65,6 +66,11 @@ export interface SandboxStageResultEvent {
   result_hash: string;
   native_session_id: string | null;
   subject: string;
+  // Optional and additive: only present when the sandbox classified a launch
+  // failure (see LAUNCH_FAILURE_REASONS in launch-failure.mjs). Absent on
+  // older runners and on any other terminal outcome; the supervisor treats
+  // absence as "attribute unknown", never as an error.
+  fault_reason?: LaunchFaultReason;
   artifacts: PipelineEventArtifact[];
 }
 
@@ -183,6 +189,9 @@ export function parseSandboxEvent(raw: string): SandboxEvent {
     if (!Array.isArray(value.artifacts) || value.artifacts.length < 1 || value.artifacts.length > 8) {
       throw new Error("stage result has invalid artifacts");
     }
+    if (value.fault_reason !== undefined && !LAUNCH_FAULT_REASONS.includes(value.fault_reason as never)) {
+      throw new Error("stage result has invalid fault_reason");
+    }
     const artifacts = value.artifacts.map((entry, index): PipelineEventArtifact => {
       if (!isRecord(entry)) throw new Error(`stage result artifact ${index} is invalid`);
       if (typeof entry.kind !== "string" || entry.kind.length > 80 ||
@@ -216,6 +225,7 @@ export function parseSandboxEvent(raw: string): SandboxEvent {
       result_hash: sha(value.result_hash, "result_hash"),
       native_session_id: value.native_session_id as string | null,
       subject: value.subject,
+      ...(value.fault_reason ? { fault_reason: value.fault_reason as LaunchFaultReason } : {}),
       artifacts,
     };
   }

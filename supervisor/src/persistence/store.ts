@@ -16,6 +16,7 @@ import { createSteeringStore, type SteeringStore } from "./steering-store.js";
 import { createWorkStore } from "./work-store.js";
 import type { PipelineInstance, PipelineInstanceSeed } from "../pipeline/store.js";
 import type { Agent, TaskType } from "../pipeline/types.js";
+import type { FaultAttribution } from "../pipeline/fault-attribution.js";
 
 export type TicketState = "active" | "closed" | "expired" | "error" | "stopped";
 export type TerminalRunStatus = "completed" | "failed" | "timed_out" | "stopped";
@@ -61,6 +62,7 @@ export interface Run {
   last_heartbeat_at: string | null;
   settlement_owner: string | null;
   settlement_reason: string | null;
+  fault_attribution: FaultAttribution | null;
   termination_confirmed_at: string | null;
   quarantine_reason: string | null;
   actor_created_at: string | null;
@@ -124,6 +126,17 @@ export interface FinishRunParams {
   ticketFailureTail?: string | null;
   logTail?: string;
   ticketState?: TicketState;
+}
+
+// finishRun/finishRunAndThen is the only settlement path that writes
+// fault_attribution (see run-store.ts finishRunTransaction). The reaping and
+// quarantine paths stamp it once at claimRunForReaping and preserve it
+// through their later transitions without re-accepting it, so this field
+// lives on a narrower type than FinishRunParams rather than silently no-op
+// on finishReapingRun/settleQuarantinedRun. `undefined` (the default) is
+// treated the same as `null` -- no fault to attribute.
+export interface DirectFinishRunParams extends FinishRunParams {
+  faultAttribution?: FaultAttribution | null;
 }
 
 export interface FeedbackCapability {

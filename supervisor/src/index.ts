@@ -161,6 +161,7 @@ async function main() {
               resultHash: event.result_hash,
               subject: event.subject,
               nativeSessionId: event.native_session_id,
+              ...(event.fault_reason ? { faultReason: event.fault_reason } : {}),
               artifacts: event.artifacts,
             },
             { observedSubject }

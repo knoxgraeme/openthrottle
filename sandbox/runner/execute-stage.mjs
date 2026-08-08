@@ -842,6 +842,11 @@ export function executeStage({
   }
   let nativeSessionId = request.nativeSessionId;
   let artifacts;
+  // Populated only when classifyAgentExecutionFailure identifies a launch
+  // failure (see LAUNCH_FAILURE_REASONS in launch-failure.mjs); carried on the
+  // stage_result event so the supervisor can attribute the terminal outcome's
+  // fault domain instead of guessing from prose.
+  let faultReason = null;
   if (contract.kind === "command") {
     const commandName = request.commandName ?? request.stageId;
     if (!COMMAND_NAME.test(commandName)) throw new Error(`stage ${request.stageId} does not select a valid repository command`);
@@ -950,6 +955,7 @@ export function executeStage({
     const classifiedFailure = incompleteAgentExecution
       ? classifyIncompleteAgentExecution({ execution, request, proposal, redactionEnv })
       : null;
+    faultReason = classifiedFailure?.reason ?? null;
     if (request.capability === "ce/publish@1" && classifiedFailure?.credentialFailure) {
       proposal = failureProposal(classifiedFailure.summary, classifiedFailure.suggestedOutcome);
     } else if (request.capability === "ce/publish@1") {
@@ -1005,6 +1011,7 @@ export function executeStage({
     subject: stageResult.subject ?? null,
     artifacts,
     completedAt: payload.completed_at,
+    faultReason,
   };
 }
 
@@ -1024,6 +1031,7 @@ export function buildStageResultEvent({ request, result }) {
     result_hash: result.artifacts.find((artifact) => artifact.kind === "stage_result").hash,
     native_session_id: result.nativeSessionId,
     subject: result.subject,
+    ...(result.faultReason ? { fault_reason: result.faultReason } : {}),
     artifacts: result.artifacts.map((artifact) => ({
       kind: artifact.kind,
       schema_version: artifact.schemaVersion,

@@ -89,6 +89,9 @@ describe("reapStalledRuns", () => {
 
     // The stalled run is reaped: run terminal, ticket errored, run_id cleared.
     expect(store.getRun("run-stalled")?.status).toBe("timed_out");
+    // A stall is executor/runner territory, not a semantic agent defect --
+    // see the fault_attribution stamp at the reaping claim.
+    expect(store.getRun("run-stalled")?.fault_attribution).toBe("executor");
     const stalledTicket = store.getByIssueId("stalled");
     expect(stalledTicket?.state).toBe("error");
     expect(stalledTicket?.run_id).toBeNull();
@@ -417,7 +420,7 @@ describe("reapStalledRuns", () => {
       tokenHash: "hash",
       expiresAt: "2999-01-01T00:00:00.000Z",
     });
-    expect(store.claimRunForReaping("run-race", "reaper-a", "stalled")?.status).toBe("reaping");
+    expect(store.claimRunForReaping("run-race", "reaper-a", "stalled", "executor")?.status).toBe("reaping");
     expect(store.finishRun({ runId: "run-race", status: "completed" })).toBeUndefined();
     expect(store.finishReapingRun({
       runId: "run-race",

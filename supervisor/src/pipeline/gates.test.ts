@@ -639,6 +639,21 @@ describe("deterministic supervisor stage gates", () => {
     expect(fixture.tickets.getByIssueId("issue-1")?.run_id).toBeNull();
   });
 
+  it.each([
+    { outcome: "success", faultReason: undefined, expected: null },
+    { outcome: "failure", faultReason: undefined, expected: "agent" },
+    { outcome: "retryable_infrastructure_failure", faultReason: undefined, expected: "executor" },
+    { outcome: "retryable_infrastructure_failure", faultReason: "credential_missing", expected: "provider" },
+  ] as const)(
+    "stamps the run's fault_attribution as $expected for outcome=$outcome faultReason=$faultReason",
+    ({ outcome, faultReason, expected }) => {
+      const fixture = setup();
+      const input = faultReason ? { ...event(fixture, outcome), faultReason } : event(fixture, outcome);
+      completeStageAttemptActor(fixture.pipelines, fixture.tickets, input, { observedSubject: SUBJECT });
+      expect(fixture.tickets.getRun(fixture.attempt.planned_run_id!)?.fault_attribution).toBe(expected);
+    }
+  );
+
   it("accepts restored fresh-review evidence and enters the bounded semantic-repair transition", () => {
     const fixture = setup();
     const input = event(fixture, "semantic_repair_required", {

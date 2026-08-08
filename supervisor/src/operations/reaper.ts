@@ -127,6 +127,10 @@ export async function reapStalledRuns(params: {
           sandboxId: ticket.sandbox_id,
           owner,
           reason: message,
+          // No executor progress for the stall window: the stage executor
+          // likely crashed, never started, or exited without reporting a
+          // result -- executor/runner internals, not the agent's semantic work.
+          faultAttribution: "executor",
           status: "timed_out",
           ticketState: pipelineStillHealthy ? "active" : "error",
           ticketFailureTail: pipelineStillHealthy ? null : message,
@@ -210,6 +214,9 @@ export async function reapExpiredRuns(params: {
         sandboxId: ticket.sandbox_id,
         owner,
         reason: message,
+        // Hard wall-clock cap exceeded regardless of agent progress -- an
+        // executor/runtime enforcement, not a semantic agent fault.
+        faultAttribution: "executor",
         status: "timed_out",
         ticketState: pipelineStillHealthy ? "active" : "error",
         ticketFailureTail: pipelineStillHealthy ? null : message,

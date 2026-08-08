@@ -1,5 +1,6 @@
 import { evaluateStageGate } from "./gates.js";
 import { coordinatePipelineEvent, type PipelineCoordinatorEvent } from "./coordinator.js";
+import { deriveStageFaultAttribution, type FaultAttribution } from "./fault-attribution.js";
 import type { PipelineInstance, PipelineStore } from "./store.js";
 
 // The stage settlement composes a persistence-facing run settlement with the
@@ -13,6 +14,7 @@ export interface StageSettlementStore {
       status: "completed";
       exitCode: number;
       ticketState: "active";
+      faultAttribution: FaultAttribution | null;
     },
     after: () => T
   ): T;
@@ -30,12 +32,14 @@ export function completeStageAttemptActor(
 ): PipelineInstance {
   const evaluated = evaluateStageGate(pipelines, event, options);
   if (!event.runId) throw new Error(`pipeline stage event ${event.id} has no run binding`);
+  const faultAttribution = deriveStageFaultAttribution(evaluated.event.outcome, evaluated.event.faultReason);
   return tickets.finishRunAndThen(
     {
       runId: event.runId,
       status: "completed",
       exitCode: 0,
       ticketState: "active",
+      faultAttribution,
     },
     () => coordinatePipelineEvent(pipelines, evaluated.event, options.faultAfterWrite, evaluated.receipt)
   );

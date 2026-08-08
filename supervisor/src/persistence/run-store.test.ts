@@ -48,6 +48,59 @@ describe("run store", () => {
     expect(store.getByIssueId("issue-1")?.run_id).toBeNull();
   });
 
+  it("stamps fault_attribution alongside settlement_reason at finish, defaulting to null when omitted", () => {
+    expect(store.beginRun({
+      issueId: "issue-1",
+      runId: "run-1",
+      taskType: "implement",
+      tokenHash: "a".repeat(64),
+      expiresAt: "2026-07-23T00:00:00.000Z",
+    })).toBe(true);
+    expect(store.finishRun({ runId: "run-1", status: "completed", faultAttribution: "agent" })).toMatchObject({
+      id: "run-1",
+      status: "completed",
+      settlement_reason: "completed",
+      fault_attribution: "agent",
+    });
+
+    expect(store.beginRun({
+      issueId: "issue-1",
+      runId: "run-2",
+      taskType: "implement",
+      tokenHash: "b".repeat(64),
+      expiresAt: "2026-07-23T00:00:00.000Z",
+    })).toBe(true);
+    expect(store.finishRun({ runId: "run-2", status: "completed" })).toMatchObject({
+      id: "run-2",
+      fault_attribution: null,
+    });
+  });
+
+  it("stamps fault_attribution at the reaping claim and preserves it through the terminal settlement", () => {
+    expect(store.beginRun({
+      issueId: "issue-1",
+      runId: "run-1",
+      taskType: "implement",
+      tokenHash: "a".repeat(64),
+      expiresAt: "2026-07-23T00:00:00.000Z",
+    })).toBe(true);
+    expect(store.claimRunForReaping("run-1", "reaper-a", "stalled", "executor")).toMatchObject({
+      id: "run-1",
+      status: "reaping",
+      settlement_reason: "stalled",
+      fault_attribution: "executor",
+    });
+    expect(store.finishReapingRun({
+      runId: "run-1",
+      owner: "reaper-a",
+      status: "timed_out",
+    })).toMatchObject({
+      id: "run-1",
+      status: "timed_out",
+      fault_attribution: "executor",
+    });
+  });
+
   it("roots pipeline actor liveness on the owning attempt", () => {
     db.close();
     const fixture = setupPipelineStore();
