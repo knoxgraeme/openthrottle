@@ -68,10 +68,25 @@ function branchFor(issueIdentifier: string): string {
   return `ot/${issueIdentifier.toLowerCase()}`;
 }
 
+// An `agent › <engine>` label (also `agent >`, `agent:`, `agent/`) selects the
+// delegation engine -- flat (a label literally named `agent:codex`) or
+// group-child (a label group named `agent` with a child label named
+// `codex`), same convention as the `branch` label. Matching happens against
+// labels re-fetched fresh from Linear at admission (see handleCreated); the
+// event payload's label snapshot can be stale by the time admission runs.
+// Multiple/conflicting agent labels resolve deterministically: opencode
+// outranks codex outranks claude.
+const AGENT_LABEL_PATTERN = /^agent\s*(?:›|>|:|\/)\s*(claude|codex|opencode)\s*$/i;
+
 function pickAgent(labels: string[], defaultAgent: Agent): Agent {
-  if (labels.includes("agent:opencode")) return "opencode";
-  if (labels.includes("agent:codex")) return "codex";
-  if (labels.includes("agent:claude")) return "claude";
+  const selected = new Set<Agent>();
+  for (const label of labels) {
+    const match = label.trim().match(AGENT_LABEL_PATTERN);
+    if (match) selected.add(match[1]!.toLowerCase() as Agent);
+  }
+  if (selected.has("opencode")) return "opencode";
+  if (selected.has("codex")) return "codex";
+  if (selected.has("claude")) return "claude";
   return defaultAgent;
 }
 
@@ -406,36 +421,40 @@ export async function handleCreated(
     }
     return;
   }
-  let routingLabels = labels;
-  let requestedBase = baseBranchFromLabels(labels);
-  if (!requestedBase) {
-    try {
-      const resolved = await providers.labelResolver.fetchIssueLabels(issue.id);
-      const resolvedMatchNames = labelMatchNames(resolved);
-      requestedBase = baseBranchFromLabels(resolvedMatchNames);
-      const baseChildren = new Set(
-        resolved
-          .filter(
-            (label) =>
-              label.parentName && baseBranchFromLabels([`${label.parentName} › ${label.name}`])
-          )
-          .map((label) => label.name)
-      );
-      if (baseChildren.size > 0) {
-        routingLabels = labels.filter((name) => !baseChildren.has(name));
-      }
-      console.log(
-        `[base-label] ${issue.identifier}: resolved=${JSON.stringify(
-          resolvedMatchNames
-        )} base=${requestedBase ?? "(route default)"}`
-      );
-    } catch (error) {
-      console.warn(
-        `[base-label] grouped-label lookup failed for ${issue.identifier}: ${String(error)}`
-      );
-    }
+  // Engine selection must derive from the issue's labels as they stand right
+  // now, not from the delegation event payload's label snapshot: a label
+  // applied after (or even shortly before) the event fires can otherwise be
+  // silently ignored (OPE-82/OPE-119). Fail closed -- never fall back to the
+  // default engine while a label might exist unseen.
+  let resolvedLabels: ResolvedLinearLabel[];
+  try {
+    resolvedLabels = await providers.labelResolver.fetchIssueLabels(issue.id);
+  } catch (error) {
+    await providers.activityPublisher.publishError(
+      sessionId,
+      issue.id,
+      `OpenThrottle could not read ${issue.identifier}'s current Linear labels: ${String(error)}. ` +
+      "Engine selection requires a fresh label read, so no sandbox was provisioned. Try again."
+    );
+    return;
   }
-  const selectedAgent = pickAgent(routingLabels, existing?.agent ?? cfg.defaultAgent);
+  const resolvedMatchNames = labelMatchNames(resolvedLabels);
+  const baseChildren = new Set(
+    resolvedLabels
+      .filter(
+        (label) =>
+          label.parentName && baseBranchFromLabels([`${label.parentName} › ${label.name}`])
+      )
+      .map((label) => label.name)
+  );
+  const routingLabels = baseChildren.size > 0 ? labels.filter((name) => !baseChildren.has(name)) : labels;
+  const requestedBase = baseBranchFromLabels(labels) ?? baseBranchFromLabels(resolvedMatchNames);
+  console.log(
+    `[base-label] ${issue.identifier}: resolved=${JSON.stringify(
+      resolvedMatchNames
+    )} base=${requestedBase ?? "(route default)"}`
+  );
+  const selectedAgent = pickAgent(resolvedMatchNames, existing?.agent ?? cfg.defaultAgent);
   const selectedRepository = repositoryFor(store, issue);
   if (!selectedRepository) {
     await providers.activityPublisher.publishError(
