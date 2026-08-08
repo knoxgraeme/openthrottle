@@ -373,6 +373,42 @@ describe("one-stage executor", () => {
     expect(prompt).not.toContain("name: implement-plan");
   });
 
+  it("inlines references/*.md into the OpenCode prompt so a SKILL.md pointer resolves", () => {
+    const skillRoot = mkdtempSync(join(tmpdir(), "ot-stage-skills-refs-"));
+    directories.push(skillRoot);
+    mkdirSync(join(skillRoot, "review-change", "references"), { recursive: true });
+    writeFileSync(
+      join(skillRoot, "review-change", "SKILL.md"),
+      "---\nname: review-change\n---\nFor the full lens checklists, read `references/branch-review-passes.md`.\n"
+    );
+    writeFileSync(
+      join(skillRoot, "review-change", "references", "branch-review-passes.md"),
+      "# Branch review passes\n\nThe full lens checklist content goes here.\n"
+    );
+    const prompt = stagePrompt(
+      { ...fixture().request, capability: "ce/review@1" },
+      "/tmp/proposal.json",
+      { agent: "opencode", skillRoot }
+    );
+    expect(prompt).toContain("For the full lens checklists, read `references/branch-review-passes.md`");
+    expect(prompt).toContain("# Branch review passes");
+    expect(prompt).toContain("The full lens checklist content goes here.");
+  });
+
+  it("adds nothing for an OpenCode skill with no references directory", () => {
+    const skillRoot = mkdtempSync(join(tmpdir(), "ot-stage-skills-norefs-"));
+    directories.push(skillRoot);
+    mkdirSync(join(skillRoot, "publish"), { recursive: true });
+    writeFileSync(join(skillRoot, "publish", "SKILL.md"), "---\nname: publish\n---\nPublish body.\n");
+    const prompt = stagePrompt(
+      { ...fixture().request, capability: "ce/publish@1" },
+      "/tmp/proposal.json",
+      { agent: "opencode", skillRoot }
+    );
+    expect(prompt).toContain("Publish body.");
+    expect(prompt).not.toContain("## references/");
+  });
+
   it("rejects wrong sealed config/manifest digests before invocation", () => {
     const input = fixture();
     const runAgent = vi.fn();

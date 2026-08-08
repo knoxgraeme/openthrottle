@@ -65,7 +65,7 @@ The canonical `SKILL.md` is maintained once:
 |---|---|
 | Claude | `sandbox/entrypoint.sh` copies the canonical task skills to `~/.claude/skills/`; the stage prompt invokes `/<skill-name>`. |
 | Codex | `sandbox/Dockerfile` bakes the same directories into `/etc/codex/skills/`; `agents/openai.yaml` disables implicit invocation and the prompt explicitly invokes `$<skill-name>`. |
-| OpenCode | The entrypoint strips YAML frontmatter from the same canonical file and renders it into the stage prompt because the pinned CLI cannot safely discover only sandbox-owned external skills. |
+| OpenCode | The entrypoint strips YAML frontmatter from the same canonical file, inlines every `references/*.md` file the skill carries, and renders the result into the stage prompt — because the pinned CLI cannot safely discover only sandbox-owned external skills, a `references/` pointer would otherwise be unresolvable. |
 
 Planning skills use the same one-body-per-skill layout, but they are packaged
 for local authoring tools instead of sealed stage execution. A planning skill

@@ -56,6 +56,7 @@ import {
   materializeRepositorySkillPackage,
   repositorySkillDiscoveryRoot,
   skillBody,
+  skillReferencesText,
 } from "./repository-skills.mjs";
 import {
   extractNativeSessionId,
@@ -425,9 +426,13 @@ export function stagePrompt(
     const skillName = existsSync(join(skillRoot, mappedSkillName, "SKILL.md")) ? mappedSkillName : "implement-plan";
     entry = `${agent === "claude" ? "/" : "$"}${skillName}`;
     // OpenCode has no admin-scope skill discovery equivalent. Give it the
-    // canonical adapter body from the same single source used by other engines.
+    // canonical adapter body from the same single source used by other engines,
+    // plus every references/*.md file inlined -- OpenCode cannot resolve a
+    // SKILL.md pointer to a sibling file once only the body is embedded.
     if (agent === "opencode") {
-      entry += `\n\n${skillBody(readFileSync(join(skillRoot, skillName, "SKILL.md"), "utf8"))}`;
+      const skillDir = join(skillRoot, skillName);
+      entry += `\n\n${skillBody(readFileSync(join(skillDir, "SKILL.md"), "utf8"))}`;
+      entry += skillReferencesText(skillDir);
     }
   }
   return `${entry}\n\nThis is one fenced OpenThrottle stage (${request.stageId}/${request.attemptId}) ` +
