@@ -229,6 +229,16 @@ function snapshotProviderOutcome(input: {
   return PROVIDER_OUTCOME_PRIORITY.find((candidate) => outcomes.has(candidate)) ?? "success";
 }
 
+function isGithubSynchronizeHeadChange(event: FeedbackSnapshotEvent, parsed: StoredPipelineProviderEvent): boolean {
+  if (event.provider !== "github" || parsed.outcome !== "needs_human") return false;
+  try {
+    const payload = JSON.parse(parsed.payload) as { kind?: unknown; action?: unknown };
+    return payload.kind === "pull_request" && payload.action === "synchronize";
+  } catch {
+    return false;
+  }
+}
+
 function commitString(value: unknown): string | undefined {
   return typeof value === "string" && GIT_COMMIT.test(value) ? value : undefined;
 }
@@ -319,6 +329,15 @@ function currentPublicationAcknowledgedAt(pipelines: PipelineStore, instance: Pi
     .map((publication) => publication.acknowledged_at ?? publication.created_at)
     .sort()
     .at(-1);
+}
+
+function currentPublicationRecorded(pipelines: PipelineStore, instance: PipelineInstance): boolean {
+  if (instance.published_commit === null) return false;
+  return pipelines.listPublications(instance.id)
+    .some((publication) =>
+      publication.status !== "dead" &&
+      publicationSubjects(publication.payload).includes(instance.published_commit!)
+    );
 }
 
 function snapshotFeedbackPredatesCurrentPublication(
@@ -438,29 +457,39 @@ export function processPipelineFeedbackSnapshot(params: {
   const events = claim.events.map((event) => ({ event, parsed: parseStoredPipelineEvent(event) }));
   const revisionMatches = params.instance.published_commit !== null &&
     claim.snapshot.head_sha === params.instance.published_commit;
-  const eventsWithFindings = events.map(({ parsed }) => ({
+  const neutralSelfSynchronizeRace = revisionMatches &&
+    currentPublicationRecorded(params.pipelines, params.instance);
+  const eventsWithFindings = events.map(({ event, parsed }) => ({
+    event,
     parsed,
     findings: parsed.findings.length > 0
       ? parsed.findings
       : providerFindings(parsed.payload),
   }));
-  const findings = eventsWithFindings.flatMap(({ findings }) =>
-    findings
+  const decisionEvents = eventsWithFindings.filter(({ event, parsed }) =>
+    !neutralSelfSynchronizeRace || !isGithubSynchronizeHeadChange(event, parsed)
   );
-  const outcome = snapshotProviderOutcome({
-    revisionMatches,
-    events: eventsWithFindings.map(({ parsed, findings }) => ({
-      outcome: parsed.outcome,
-      findings,
-    })),
-  });
-  const artifactFindings = findings.slice(0, 50);
   const drainedAt = new Date().toISOString();
   params.store.setSetting(`feedback-snapshot-drained-at:${claim.snapshot.id}`, drainedAt);
   params.store.setSetting(
     `feedback-snapshot-drain-source:${claim.snapshot.id}`,
     params.drainSource ?? DEFAULT_FEEDBACK_SNAPSHOT_DRAIN_SOURCE
   );
+  if (decisionEvents.length === 0) {
+    params.store.consumeFeedbackSnapshot(claim.snapshot.id);
+    return false;
+  }
+  const findings = eventsWithFindings.flatMap(({ findings }) =>
+    findings
+  );
+  const outcome = snapshotProviderOutcome({
+    revisionMatches,
+    events: decisionEvents.map(({ parsed, findings }) => ({
+      outcome: parsed.outcome,
+      findings,
+    })),
+  });
+  const artifactFindings = findings.slice(0, 50);
   processProviderEvidence(params.pipelines, {
     id: `provider-feedback-snapshot:${claim.snapshot.id}`,
     instanceId: params.instance.id,
