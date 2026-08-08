@@ -1,1 +1,4 @@
-allow_implicit_invocation: false
+policy:
+  allow_implicit_invocation: false
+interface:
+  display_name: Accept unit
