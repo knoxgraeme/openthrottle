@@ -5,6 +5,7 @@ import {
   buildStandardReceiptArtifacts,
   buildSemanticArtifacts,
   digest,
+  parseAgentJson,
   validateStandardReceipt,
   validateSemanticProposal,
 } from "./artifacts.mjs";
@@ -316,5 +317,35 @@ describe("normalized stage artifacts", () => {
       ...receipt,
       fence: { ...receipt.fence, action_attempt_id: "" },
     }, {})).toThrow(/action attempt/);
+  });
+});
+
+describe("agent-authored JSON parsing", () => {
+  const payload = { schema: "openthrottle.receipt/v1", nested: { list: ["a", "b"] } };
+  const pretty = JSON.stringify(payload, null, 2);
+
+  it("parses unfenced JSON exactly as JSON.parse does", () => {
+    expect(parseAgentJson(JSON.stringify(payload))).toEqual(payload);
+    expect(parseAgentJson(`  ${pretty}\n`)).toEqual(payload);
+  });
+
+  it("peels exactly one complete outer code fence, with or without a language tag", () => {
+    // OPE-101 generation 6 emitted a byte-perfect receipt inside ```json.
+    expect(parseAgentJson(`\`\`\`json\n${pretty}\n\`\`\``)).toEqual(payload);
+    expect(parseAgentJson(`\`\`\`\n${pretty}\n\`\`\``)).toEqual(payload);
+    expect(parseAgentJson(`\n\`\`\`JSON \n${pretty}\n\`\`\`\n`)).toEqual(payload);
+  });
+
+  it("rejects anything that is not one whole fence, keeping the original parse error", () => {
+    // Text outside the fence means the model wrote something other than one
+    // object; guessing which part it meant is exactly what must not happen.
+    expect(() => parseAgentJson(`Here it is:\n\`\`\`json\n${pretty}\n\`\`\``)).toThrow(SyntaxError);
+    expect(() => parseAgentJson(`\`\`\`json\n${pretty}\n\`\`\`\nDone.`)).toThrow(SyntaxError);
+    // A partial fence is not a fence.
+    expect(() => parseAgentJson(`\`\`\`json\n${pretty}`)).toThrow(SyntaxError);
+    expect(() => parseAgentJson(`${pretty}\n\`\`\``)).toThrow(SyntaxError);
+    // Only one fence is peeled: two concatenated blocks stay unparseable.
+    expect(() => parseAgentJson(`\`\`\`json\n${pretty}\n\`\`\`\n\`\`\`json\n${pretty}\n\`\`\``)).toThrow(SyntaxError);
+    expect(() => parseAgentJson("not json at all")).toThrow(SyntaxError);
   });
 });

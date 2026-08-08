@@ -5,7 +5,7 @@ import { chmodSync, chownSync, existsSync, lstatSync, mkdirSync, readFileSync, r
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { canonicalJson } from "./capabilities.mjs";
-import { digest, sanitizeArtifactText, validateStandardReceipt } from "./artifacts.mjs";
+import { digest, parseAgentJson, sanitizeArtifactText, validateStandardReceipt } from "./artifacts.mjs";
 import { computeWorkspaceTreeOid } from "./repository-control.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
 import { runWithAgentProcessFence } from "./agent-process-fence.mjs";
@@ -1108,14 +1108,18 @@ export function parseLoopReceipt(raw, env = process.env) {
   let topError = null;
   for (const candidate of candidates) {
     try {
-      const parsed = typeof candidate === "string" ? JSON.parse(candidate) : candidate;
+      // parseAgentJson, not JSON.parse: both layers carry text the model
+      // typed, and a receipt wrapped in one markdown code fence is parsed as
+      // its interior (OPE-101 generation 6). The parsed value is identical to
+      // the unfenced case, so validation below is untouched.
+      const parsed = typeof candidate === "string" ? parseAgentJson(candidate) : candidate;
       try {
         return validateStandardReceipt(parsed, env);
       } catch (error) {
         topError ??= error;
         for (const nested of receiptCandidatesFromJson(parsed)) {
           try {
-            const normalized = typeof nested === "string" ? JSON.parse(nested) : nested;
+            const normalized = typeof nested === "string" ? parseAgentJson(nested) : nested;
             return validateStandardReceipt(normalized, env);
           } catch (error) {
             nestedError ??= error;

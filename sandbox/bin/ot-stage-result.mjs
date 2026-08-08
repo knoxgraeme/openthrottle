@@ -4,11 +4,13 @@ import { realpathSync } from "node:fs";
 import { readFile, mkdir, rename, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { validateSemanticProposal, validateStandardReceipt } from "../runner/artifacts.mjs";
+import { parseAgentJson, validateSemanticProposal, validateStandardReceipt } from "../runner/artifacts.mjs";
 
 export function parseProposalInput(raw, { receipt = false } = {}) {
   if (Buffer.byteLength(raw, "utf8") > 64 * 1024) throw new Error("stage result input exceeds 64 KiB");
-  const parsed = JSON.parse(raw);
+  // The `--file` argument names a file the model wrote, so it is agent-authored
+  // JSON and gets the same one-fence tolerance as the loop receipt (OPE-101).
+  const parsed = parseAgentJson(raw);
   return receipt ? validateStandardReceipt(parsed) : validateSemanticProposal(parsed);
 }
 

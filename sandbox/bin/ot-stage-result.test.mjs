@@ -40,6 +40,24 @@ describe("ot-stage-result proposal writer", () => {
     }))).toThrow(/authoritative field result/);
   });
 
+  it("accepts a proposal the model wrapped in one code fence, and nothing looser", () => {
+    // Same agent-authored JSON boundary as the loop receipt: --file names a
+    // file the model wrote, and models fence JSON by reflex (OPE-101).
+    const proposal = {
+      schema: "openthrottle.stage-proposal/v1",
+      suggested_outcome: "success",
+      summary: "Fenced by the model",
+      evidence: [],
+      findings: [],
+      actions: [],
+      uncertainty: [],
+    };
+    const pretty = JSON.stringify(proposal, null, 2);
+    expect(parseProposalInput(`\`\`\`json\n${pretty}\n\`\`\``)).toEqual(parseProposalInput(JSON.stringify(proposal)));
+    expect(() => parseProposalInput(`Here it is:\n\`\`\`json\n${pretty}\n\`\`\``)).toThrow();
+    expect(() => parseProposalInput(`\`\`\`json\n${pretty}`)).toThrow();
+  });
+
   it("runs through an installed symlink", async () => {
     const directory = await mkdtemp(join(tmpdir(), "ot-stage-result-link-"));
     directories.push(directory);

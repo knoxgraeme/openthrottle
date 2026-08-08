@@ -80,6 +80,32 @@ export function digest(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+// One complete markdown code fence and nothing else: an opening ``` with an
+// optional info string on its own line, a closing ``` on the final line.
+const OUTER_CODE_FENCE = /^```[^\n]*\n([\s\S]*)\n```$/;
+
+// Agent-authored JSON reaches us as text the model typed, and models fence
+// JSON by reflex. OPE-101 generation 6 emitted a byte-perfect
+// `unit_completion` receipt -- every field correct, subject matching the
+// executor's independent recompute -- wrapped in ```json ... ```, and lost the
+// whole generation to three backticks. Peel exactly one complete outer fence
+// and parse the interior; the value returned is identical to the unfenced
+// case, so every downstream schema/fence/subject check is unchanged. Anything
+// else -- prose before or after the fence, an unterminated fence, a fence
+// buried in other text -- still throws the original JSON parse error, because
+// then the surrounding text is evidence the model wrote something other than
+// one object and we must not guess which part it meant.
+export function parseAgentJson(raw) {
+  const text = String(raw).trim();
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    const fenced = OUTER_CODE_FENCE.exec(text);
+    if (!fenced) throw error;
+    return JSON.parse(fenced[1]);
+  }
+}
+
 export function sanitizeArtifactText(value, env = process.env) {
   let output = String(value ?? "");
   const secrets = Object.entries(env)
