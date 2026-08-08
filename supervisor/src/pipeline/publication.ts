@@ -112,7 +112,7 @@ interface PublicationFinding {
   disposition?: FindingDisposition;
 }
 
-type FindingDisposition = "fixed in-stage" | "carried to repair" | "remaining/accepted";
+type FindingDisposition = "fixed in-stage" | "carried to repair" | "remaining/accepted" | `repaired-at-${string}`;
 
 const FINDING_DISPOSITIONS: readonly FindingDisposition[] =
   ["fixed in-stage", "carried to repair", "remaining/accepted"];
@@ -664,21 +664,29 @@ function findingsWithDisposition(
 
 /**
  * Accumulates the run's finding state: prior findings keep their persisted
- * disposition unless this stage's recorded actions resolve them, and findings
- * re-emitted by the current stage take a freshly computed disposition.
+ * disposition unless this stage's recorded actions resolve them or the repair
+ * branch produces a new subject; current findings take a fresh disposition.
  */
 function mergeRunFindings(
   prior: readonly PublicationFinding[],
   currentWithDisposition: readonly PublicationFinding[],
-  actions: readonly string[]
+  actions: readonly string[],
+  repairedAtSubject?: string
 ): PublicationFinding[] {
   const merged = new Map<string, PublicationFinding>();
   for (const finding of dedupeFindings(prior)) {
     const resolved = finding.disposition !== "fixed in-stage" &&
       actions.some((action) => actionAddressesFinding(action, finding));
-    merged.set(findingIdentity(finding), resolved
-      ? { ...finding, disposition: "fixed in-stage" }
-      : finding);
+    const repaired = !resolved &&
+      finding.disposition === "carried to repair" &&
+      repairedAtSubject !== undefined;
+    let nextFinding = finding;
+    if (resolved) {
+      nextFinding = { ...finding, disposition: "fixed in-stage" };
+    } else if (repaired) {
+      nextFinding = { ...finding, disposition: `repaired-at-${repairedAtSubject}` };
+    }
+    merged.set(findingIdentity(finding), nextFinding);
   }
   for (const finding of currentWithDisposition) {
     merged.set(findingIdentity(finding), finding);
@@ -687,7 +695,33 @@ function mergeRunFindings(
 }
 
 function storedFindingDisposition(value: unknown): FindingDisposition | undefined {
-  return FINDING_DISPOSITIONS.find((disposition) => disposition === value);
+  if (typeof value !== "string") return undefined;
+  const staticDisposition = FINDING_DISPOSITIONS.find((disposition) => disposition === value);
+  if (staticDisposition) return staticDisposition;
+  return /^repaired-at-[a-f0-9]{7,12}$/.test(value) ? value as FindingDisposition : undefined;
+}
+
+function repairedAtSubject(input: {
+  normalizedManifest: string;
+  repairSourceStageId: string | undefined;
+  currentStageId: string;
+  outcome: StageOutcome | PipelineOutcome;
+  expectedSubject: string | null | undefined;
+  subject: string | null | undefined;
+}): string | undefined {
+  if (!input.repairSourceStageId ||
+      !input.subject ||
+      input.outcome !== "success" ||
+      input.subject === input.expectedSubject) {
+    return undefined;
+  }
+  const manifest = JSON.parse(input.normalizedManifest) as PipelineManifest;
+  const stagesById = stageById(manifest);
+  const start = stagesById.get(input.repairSourceStageId)?.transitions.semantic_repair_required?.to;
+  if (!start) return undefined;
+  return followSuccessPath(stagesById, start).includes(input.currentStageId)
+    ? input.subject.slice(0, 12)
+    : undefined;
 }
 
 /**
@@ -1002,6 +1036,10 @@ export function buildStagePublication(input: {
   const outcome = input.write.terminalOutcome ?? input.write.outcome;
   const actions = evidence.flatMap((item) => item.actions).slice(0, 50);
   const currentFindings = evidence.flatMap((item) => item.findings);
+  const requestRepairSource = repairSourceStageIdFromRequestPayload(input.attempt.request_payload);
+  const repairSourceStageId = requestRepairSource?.startsWith("repair_")
+    ? input.priorRepairSourceStageId
+    : requestRepairSource ?? input.priorRepairSourceStageId;
   const currentFindingsWithDisposition = findingsWithDisposition(
     currentFindings,
     actions,
@@ -1010,12 +1048,16 @@ export function buildStagePublication(input: {
   const findings = mergeRunFindings(
     input.priorFindings ?? [],
     currentFindingsWithDisposition,
-    actions
+    actions,
+    repairedAtSubject({
+      normalizedManifest: input.instance.normalized_manifest,
+      repairSourceStageId,
+      currentStageId: input.attempt.stage_id,
+      outcome,
+      expectedSubject: input.attempt.expected_subject,
+      subject,
+    })
   );
-  const requestRepairSource = repairSourceStageIdFromRequestPayload(input.attempt.request_payload);
-  const repairSourceStageId = requestRepairSource?.startsWith("repair_")
-    ? input.priorRepairSourceStageId
-    : requestRepairSource ?? input.priorRepairSourceStageId;
   const partial: PipelinePublicationBodyInput = {
     schema: PIPELINE_PUBLICATION_SCHEMA,
     template: { name: template, version: PIPELINE_PUBLICATION_TEMPLATE_VERSION },

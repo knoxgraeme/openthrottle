@@ -10,11 +10,12 @@
 FROM node:22-bookworm
 
 # ---------------------------------------------------------------------------
-# System packages: git curl jq ripgrep gh yq gosu
+# System packages: git curl jq ripgrep bats gh yq gosu
 # ---------------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git \
       curl \
+      bats \
       ca-certificates \
       gnupg \
       jq \

@@ -83,10 +83,14 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
   gosu agent env HOME=/home/agent CODEX_HOME=/home/agent/.codex codex plugin list --json | jq -e '\''.installed[] | select(.pluginId == "compound-engineering@compound-engineering-plugin" and .version == "3.19.0" and .enabled == true)'\'' >/dev/null &&
   test -f /home/agent/.codex/plugins/cache/compound-engineering-plugin/compound-engineering/3.19.0/skills/ce-work/SKILL.md &&
   test -f /etc/codex/skills/ce-work/SKILL.md &&
-  test -f /etc/codex/skills/implement-plan/SKILL.md &&
-  test -f /etc/codex/skills/investigate/SKILL.md &&
-  rg -q "allow_implicit_invocation: false" /etc/codex/skills/implement-plan/agents/openai.yaml &&
-  rg -q "allow_implicit_invocation: false" /etc/codex/skills/investigate/agents/openai.yaml &&
+  for name in implement-plan investigate review-change simplify-change publish implement-unit simplify-unit repair-unit accept-unit final-review final-repair; do
+    test -f "/etc/codex/skills/$name/SKILL.md" || exit 1
+    yaml="/etc/codex/skills/$name/agents/openai.yaml"
+    test -f "$yaml" || exit 1
+    ! rg -q "^(allow_implicit_invocation|implicit):" "$yaml" || exit 1
+    rg -U -q "^policy:\n  allow_implicit_invocation: false" "$yaml" || exit 1
+    rg -U -q "^interface:\n  display_name: .+" "$yaml" || exit 1
+  done &&
   opencode --version 2>&1 | rg -q "1\.18\.3" &&
   opencode run --help 2>&1 | rg -q -- "--format" &&
   opencode run --help 2>&1 | rg -q -- "--session" &&
