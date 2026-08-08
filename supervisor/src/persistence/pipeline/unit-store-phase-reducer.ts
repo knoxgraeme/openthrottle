@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
-import { canonicalJson, digestNormalized, type StageOutcome } from "../../pipeline/manifest.js";
-import type { GateReceiptReason } from "../../pipeline/gates.js";
+import { canonicalJson, digestNormalized, STAGE_OUTCOMES, type StageOutcome } from "../../pipeline/manifest.js";
+import { GATE_RECEIPT_REASONS, type GateReceiptReason } from "../../pipeline/gates.js";
 import {
   assertValidUnitPhaseSequence,
   actionKindForUnitPhase,
@@ -544,6 +544,19 @@ export function insertGateReceipt(
     hash: string;
   }
 ): "recorded" | "already_recorded" {
+  // GATE_RECEIPT_REASONS/STAGE_OUTCOMES have no other production importer:
+  // the TS parameter types are load-bearing only at the call site, so a
+  // caller that constructs `outcome`/`reason` from less-trusted data (a cast,
+  // a future producer) would otherwise fail only at the DB CHECK constraint
+  // -- an opaque SqliteError that names neither field nor value. Failing
+  // closed here, before any write, keeps a bad producer diagnosable instead
+  // of a poison-pill effect that re-drives forever without ever committing.
+  if (!STAGE_OUTCOMES.includes(input.outcome)) {
+    throw new Error(`execution gate receipt for ${input.action.id} has an unrecognized outcome ${JSON.stringify(input.outcome)}`);
+  }
+  if (!GATE_RECEIPT_REASONS.includes(input.reason)) {
+    throw new Error(`execution gate receipt for ${input.action.id} has an unrecognized reason ${JSON.stringify(input.reason)}`);
+  }
   if (digestNormalized(input.payload) !== input.hash) throw new Error("execution gate receipt hash mismatch");
   const existing = db.prepare(`
     SELECT * FROM execution_gate_receipts
