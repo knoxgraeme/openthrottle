@@ -132,12 +132,13 @@ Engineering / "CE")**. Keep new logic on the correct side:
   non-fast-forward — this complements, does not replace, GitHub branch
   protection.
 
-- **`skills/`** — thin OpenThrottle task **adapters** over the native CE
-  toolkit, not reimplementations. `skills/tasks/<name>/SKILL.md` is the single
-  hand-maintained source per task (`implement-plan`, `investigate`); its YAML
+- **`skills/`** — self-contained OpenThrottle task adapters, not delegation
+  wrappers. `skills/tasks/<name>/SKILL.md` is the single hand-maintained
+  source per task (`implement-plan`, `investigate`, `review-change`,
+  `simplify-change`, `publish`, plus the structured-loop skills); its YAML
   frontmatter is exactly what Claude Code loads as a user skill. Pipeline
-  manifests own ordering across CE planning, implementation, review,
-  simplification, command gates, publication, and provider verification. Read
+  manifests own stage ordering across implementation, review, simplification,
+  command gates, publication, and provider verification. Read
   `skills/README.md` before editing anything here.
 
 - **`cli/`** — the published `openthrottle` package (`src/index.ts` is a plain
@@ -148,10 +149,14 @@ Engineering / "CE")**. Keep new logic on the correct side:
 
 ## Invariants worth knowing before you change things
 
-- **Skills are adapters, never CE copies.** The snapshot installs the pinned
-  `compound-engineering` plugin natively for all three engines. Do not copy CE
-  source into `skills/` or into target repos. Each `SKILL.md` is agent-neutral
-  and maintained once; the only per-agent difference is *delivery*, which lives
+- **Task skills are self-contained, not CE delegation.** Every
+  `skills/tasks/` adapter restates its own craft in its own words instead of
+  invoking a second-hop toolkit; none references `ce-*` or
+  `compound-engineering`. Planning-time authoring skills (`skills/planning/`)
+  still use the pinned `compound-engineering` plugin, which the snapshot
+  installs natively for all three engines — never copy CE source into
+  `skills/` or into target repos. Each `SKILL.md` is agent-neutral and
+  maintained once; the only per-agent difference is *delivery*, which lives
   entirely in `sandbox/entrypoint.sh` + `sandbox/Dockerfile` (Claude: copy into
   `~/.claude/skills`; Codex: admin-scope bake at `/etc/codex/skills` +
   `agents/openai.yaml`; OpenCode: prompt rendered at run time). Never

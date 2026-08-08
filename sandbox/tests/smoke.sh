@@ -61,13 +61,14 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
   gosu agent env HOME=/home/agent claude plugin list --json | jq -e '\''.[] | select(.id == "compound-engineering@compound-engineering-plugin" and .version == "3.19.0" and .enabled == true)'\'' >/dev/null &&
   gosu agent env HOME=/home/agent claude plugin details compound-engineering@compound-engineering-plugin | rg -q "ce-work" &&
   test -f /home/agent/.claude/plugins/cache/compound-engineering-plugin/compound-engineering/3.19.0/skills/ce-work/SKILL.md &&
-  rg -q "ce-work" /opt/openthrottle/skills/tasks/implement-plan/SKILL.md &&
-  for ce_skill in $(rg -o "\bce-[a-z][a-z-]*[a-z]\b" /opt/openthrottle/skills/tasks/implement-plan/SKILL.md | sort -u); do
-    test -f "/home/agent/.claude/plugins/cache/compound-engineering-plugin/compound-engineering/3.19.0/skills/${ce_skill}/SKILL.md" &&
-    test -f "/home/agent/.codex/plugins/cache/compound-engineering-plugin/compound-engineering/3.19.0/skills/${ce_skill}/SKILL.md" &&
-    find /opt/openthrottle/compound-engineering-marketplace -type f -path "*/skills/${ce_skill}/SKILL.md" -print -quit | rg -q .
+  # OPE-107: the self-contained task skills carry zero CE delegation tokens --
+  # invert the old per-token plugin-resolution loop into a flat prohibition.
+  ! rg -q "\bce-[a-z][a-z-]*[a-z]\b" /opt/openthrottle/skills &&
+  for name in implement-plan investigate review-change simplify-change publish \
+              implement-unit repair-unit simplify-unit accept-unit final-review \
+              final-repair; do
+    test -f "/opt/openthrottle/skills/tasks/$name/SKILL.md" || exit 1
   done &&
-  test -f /opt/openthrottle/skills/tasks/investigate/SKILL.md &&
   test ! -e /opt/openthrottle/skills/claude &&
   test ! -e /opt/openthrottle/skills/opencode &&
   test ! -e /opt/openthrottle/skills/codex/implement-plan.md &&
