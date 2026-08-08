@@ -186,7 +186,6 @@ export type OrchestrationJournalKind =
   | "dispatched_fix"
   | "detected_stall"
   | "capacity_refused"
-  | "escalated_human"
   | "terminal_observed"
   | "run_note";
 

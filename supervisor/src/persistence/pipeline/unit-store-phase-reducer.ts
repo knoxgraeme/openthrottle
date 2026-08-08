@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import { canonicalJson, digestNormalized, type StageOutcome } from "../../pipeline/manifest.js";
+import type { GateReceiptReason } from "../../pipeline/gates.js";
 import {
   assertValidUnitPhaseSequence,
   actionKindForUnitPhase,
@@ -537,7 +538,7 @@ export function insertGateReceipt(
     subject: string | null;
     result: ChildGateDecision["result"];
     outcome: StageOutcome;
-    reason: string;
+    reason: GateReceiptReason;
     artifactHashes: readonly string[];
     payload: string;
     hash: string;

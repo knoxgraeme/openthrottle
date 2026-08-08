@@ -17,6 +17,7 @@ import { parseAndCompileExecutionGraph } from "../pipeline/execution-graph.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { buildInstalledRuntimeDescriptor, type SandboxAutostopRuntime, type SandboxRuntime } from "../__fixtures__/runtime.js";
 import type { ExecutionGateDecision } from "../pipeline/execution-gates.js";
+import type { GateReceiptReason } from "../pipeline/gates.js";
 import type { ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
 import type { PipelineInstance, PipelineStageAttempt } from "../pipeline/store.js";
 import type { LinearOutboxRecord } from "../persistence/delivery-store.js";
@@ -159,13 +160,13 @@ describe("pipeline effect processor", () => {
     subject: string;
     outcome?: ExecutionGateDecision["outcome"];
     result?: ExecutionGateDecision["result"];
-    reason?: string;
+    reason?: GateReceiptReason;
   }): ExecutionGateDecision {
     const base = {
       gateKind: input.gateKind,
       outcome: input.outcome ?? "success",
       result: input.result ?? "passed",
-      reason: input.reason ?? "test_reason",
+      reason: input.reason ?? "typed_semantic_result",
       subject: input.subject,
       artifactHashes: ["a".repeat(64)],
     };
@@ -1132,7 +1133,7 @@ describe("pipeline effect processor", () => {
         subject: integratedSubjectB,
         outcome: "semantic_repair_required",
         result: "failed",
-        reason: "review found a repairable issue",
+        reason: "blocking_findings",
       }),
     });
 

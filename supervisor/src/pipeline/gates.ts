@@ -40,6 +40,36 @@ const ARTIFACT_KEYS = new Set([
 type ArtifactResult = StageOutcome | "not_configured";
 export type GateResult = CoordinatorGateReceiptWrite["result"];
 
+// The closed, bottom-up vocabulary for execution_gate_receipts.reason (see
+// the LAUNCH_FAILURE_REASONS pattern in sandbox/runner/launch-failure.mjs).
+// Every value here is produced somewhere in gates.ts or execution-gates.ts;
+// a new gate decision reason must be added here (and to the DB CHECK
+// constraint via a migration) before it can be written to a receipt.
+export const GATE_RECEIPT_REASONS = Object.freeze([
+  // gates.ts: semanticDecisionForEvidence / commandDecisionForEvidence
+  "blocking_findings",
+  "no_change_contradicted_by_tree_delta",
+  "typed_semantic_result",
+  "command_not_configured",
+  "command_terminated",
+  "command_exit_zero",
+  "command_exit_nonzero",
+  // execution-gates.ts: commandOutcome / evaluateUnitAcceptanceGate / evaluateIntegrationGate
+  "command_receipts_missing_or_unexpected",
+  "required_command_not_configured",
+  "command_receipt_failed",
+  "all_commands_current",
+  "candidate_evidence_failed",
+  "worker_completion_not_success",
+  "lead_scope_match_accept",
+  "lead_requested_revision",
+  "lead_needs_human",
+  "lead_context_update",
+  "executor_integrated_candidate",
+  "integration_evidence_failed",
+] as const);
+export type GateReceiptReason = (typeof GATE_RECEIPT_REASONS)[number];
+
 export interface SemanticDecisionEvidence {
   result: ArtifactResult;
   findings: Array<{ severity: string }>;
@@ -327,7 +357,7 @@ export function gateResultForOutcome(outcome: StageOutcome): GateResult {
   return "failed";
 }
 
-export function semanticDecisionForEvidence(input: SemanticDecisionEvidence): { outcome: StageOutcome; result: GateResult; reason: string } {
+export function semanticDecisionForEvidence(input: SemanticDecisionEvidence): { outcome: StageOutcome; result: GateResult; reason: GateReceiptReason } {
   if (input.result === "not_configured" || input.result === "canceled" || input.result === "superseded") {
     throw new Error(`semantic stage proposed forbidden result ${input.result}`);
   }
@@ -354,7 +384,7 @@ export function semanticDecisionForEvidence(input: SemanticDecisionEvidence): { 
   };
 }
 
-function semanticDecision(payloads: TypedArtifactPayload[]): { outcome: StageOutcome; result: GateResult; reason: string } {
+function semanticDecision(payloads: TypedArtifactPayload[]): { outcome: StageOutcome; result: GateResult; reason: GateReceiptReason } {
   const stageResult = payloads.find((payload) => payload.kind === "stage_result")!;
   return semanticDecisionForEvidence({
     result: stageResult.result,
@@ -363,7 +393,7 @@ function semanticDecision(payloads: TypedArtifactPayload[]): { outcome: StageOut
   });
 }
 
-export function commandDecisionForEvidence(input: CommandDecisionEvidence): { outcome: StageOutcome; result: GateResult; reason: string } {
+export function commandDecisionForEvidence(input: CommandDecisionEvidence): { outcome: StageOutcome; result: GateResult; reason: GateReceiptReason } {
   if (input.not_configured) return { outcome: "no_change", result: "not_configured", reason: "command_not_configured" };
   if (input.timed_out || input.signal !== null || input.exit_code === 137) {
     return { outcome: "retryable_infrastructure_failure", result: "indeterminate", reason: "command_terminated" };
@@ -372,7 +402,7 @@ export function commandDecisionForEvidence(input: CommandDecisionEvidence): { ou
   return { outcome: "failure", result: "failed", reason: "command_exit_nonzero" };
 }
 
-function commandDecision(payloads: TypedArtifactPayload[]): { outcome: StageOutcome; result: GateResult; reason: string } {
+function commandDecision(payloads: TypedArtifactPayload[]): { outcome: StageOutcome; result: GateResult; reason: GateReceiptReason } {
   const command = payloads.find((payload) => payload.kind === "command_result");
   if (!command) throw new Error("command gate is missing command_result");
   const details = command.details;

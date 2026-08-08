@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { canonicalJson, digestNormalized, type StageOutcome } from "../../pipeline/manifest.js";
 import type { PipelineUnitPhaseBinding } from "../../pipeline/manifest.js";
 import type { ExecutionGateDecision } from "../../pipeline/execution-gates.js";
+import type { GateReceiptReason } from "../../pipeline/gates.js";
 import { openDb } from "../database.js";
 import { createExecutionUnitStore, type ExecutionUnitStore } from "./unit-store.js";
 import { executionLedgerLines } from "../../pipeline/execution-publication.js";
@@ -14,14 +15,14 @@ function gateDecision(overrides: {
   gateKind: ExecutionGateDecision["gateKind"];
   outcome?: StageOutcome;
   result?: ExecutionGateDecision["result"];
-  reason?: string;
+  reason?: GateReceiptReason;
   subject: string;
 }): ExecutionGateDecision {
   const base = {
     gateKind: overrides.gateKind,
     outcome: overrides.outcome ?? "success",
     result: overrides.result ?? "passed",
-    reason: overrides.reason ?? "test_reason",
+    reason: overrides.reason ?? "typed_semantic_result",
     subject: overrides.subject,
     artifactHashes: ["a".repeat(64)],
   };
@@ -1939,7 +1940,7 @@ describe("execution unit store", () => {
       subject: "1".repeat(40),
       result: "passed" as const,
       outcome: "success" as const,
-      reason: "typed_semantic_result",
+      reason: "typed_semantic_result" as const,
       artifactHashes: ["a".repeat(64)],
       payload,
       hash: digestNormalized(payload),
@@ -2344,7 +2345,7 @@ describe("execution unit store", () => {
       outputSubject: subject,
       receipt: receiptJson("unit_decision"),
       decision: {
-        ...gateDecision({ gateKind: "unit_acceptance", outcome: "success", subject, reason: "Lead accepted the scoped unit." }),
+        ...gateDecision({ gateKind: "unit_acceptance", outcome: "success", subject, reason: "lead_scope_match_accept" }),
       },
     });
     const integrate = lease(store);
@@ -2370,7 +2371,7 @@ describe("execution unit store", () => {
           gates: expect.arrayContaining([expect.objectContaining({
             kind: "unit_acceptance",
             evaluator: "human",
-            reason: "Lead accepted the scoped unit.",
+            reason: "lead_scope_match_accept",
           })]),
           downstream_context: [expect.objectContaining({
             to_unit_id: "b",
@@ -2768,7 +2769,7 @@ describe("execution unit store", () => {
       actionId: finalReview1.id,
       resultHash: "fr1",
       outputSubject: subject,
-      decision: gateDecision({ gateKind: "final_review", outcome: "semantic_repair_required", subject, reason: "unresolved_review_finding" }),
+      decision: gateDecision({ gateKind: "final_review", outcome: "semantic_repair_required", subject, reason: "blocking_findings" }),
     });
     expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ final_phase: "repair", final_repair_rounds: 1 });
 
@@ -2821,7 +2822,7 @@ describe("execution unit store", () => {
         gateKind: "final_review",
         outcome: "semantic_repair_required",
         subject: repairedIntegratedSubject,
-        reason: "unresolved_review_finding",
+        reason: "blocking_findings",
       }),
     });
     expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ final_phase: "repair", final_repair_rounds: 2 });
@@ -3055,10 +3056,10 @@ describe("execution unit store", () => {
       actionId: integrate.id,
       resultHash: "r5",
       outputSubject: subject,
-      decision: gateDecision({ gateKind: "integration", outcome: "needs_human", subject, reason: "integration_publish_failed" }),
+      decision: gateDecision({ gateKind: "integration", outcome: "needs_human", subject, reason: "integration_evidence_failed" }),
     });
 
-    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ stopped_at: timestamp, stop_reason: "integration_publish_failed" });
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ stopped_at: timestamp, stop_reason: "integration_evidence_failed" });
     expect(lease(store)).toBeUndefined();
   });
 
@@ -3084,10 +3085,10 @@ describe("execution unit store", () => {
       actionId: finalReview.id,
       resultHash: "fr-hash",
       outputSubject: subject,
-      decision: gateDecision({ gateKind: "final_review", outcome: "needs_human", subject, reason: "final_review_needs_human" }),
+      decision: gateDecision({ gateKind: "final_review", outcome: "needs_human", subject, reason: "lead_needs_human" }),
     });
 
-    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ stopped_at: timestamp, stop_reason: "final_review_needs_human" });
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ stopped_at: timestamp, stop_reason: "lead_needs_human" });
     expect(lease(store)).toBeUndefined();
   });
 
@@ -3266,7 +3267,7 @@ describe("execution unit store", () => {
     expect(publicationEvents("attempt-parent")).toHaveLength(1);
   });
 
-  it("sanitizes secret-shaped reason text before it is durably inserted, and cannot be bypassed on replay", () => {
+  it("rejects a gate decision reason outside the closed vocabulary before any receipt or publication event is durably recorded, then succeeds on retry", () => {
     const store = setup();
     const subject = "1".repeat(40);
     store.createGraph({
@@ -3287,6 +3288,28 @@ describe("execution unit store", () => {
     const candidate = lease(store);
     store.completeUnitAction({ actionId: candidate.id, resultHash: "rc", outputSubject: subject, receipt: receiptJson("candidate_evidence") });
     const lead = lease(store);
+
+    // A gate decision cannot smuggle a secret (or any other free-text value)
+    // through `reason` into a durable receipt or Linear-visible publication
+    // event: the CHECK-enforced closed vocabulary rejects it before either
+    // write even happens, which is a stronger guarantee than redacting it
+    // after the fact. This simulates a decision built outside the type
+    // system's guardrails (e.g. a bug in a future producer).
+    expect(() => store.completeGatedAction({
+      actionId: lead.id,
+      resultHash: "rl",
+      outputSubject: subject,
+      decision: gateDecision({
+        gateKind: "unit_acceptance",
+        outcome: "semantic_repair_required",
+        subject,
+        reason: "leaked credential Bearer sk-live-abcdef1234567890" as GateReceiptReason,
+      }),
+    })).toThrow(/CHECK constraint failed/);
+    expect(publicationEvents("attempt-parent")).toHaveLength(0);
+
+    // The throw rolls back the whole transaction, so a retry with a real,
+    // closed-vocabulary reason succeeds cleanly rather than being stranded.
     store.completeGatedAction({
       actionId: lead.id,
       resultHash: "rl",
@@ -3295,15 +3318,12 @@ describe("execution unit store", () => {
         gateKind: "unit_acceptance",
         outcome: "semantic_repair_required",
         subject,
-        reason: "leaked credential Bearer sk-live-abcdef1234567890",
+        reason: "command_exit_nonzero",
       }),
     });
-
     const events = publicationEvents("attempt-parent");
     expect(events).toHaveLength(1);
-    expect(events[0]!.body).not.toContain("sk-live-abcdef1234567890");
-    expect(events[0]!.body).toContain("[REDACTED]");
-    expect(events[0]!.outboxBody).not.toContain("sk-live-abcdef1234567890");
+    expect(events[0]!.body).toContain("command_exit_nonzero");
   });
 
   it("stamps a graph-stop child-publication event once, not on a redundant stop request", () => {
@@ -3330,7 +3350,7 @@ describe("execution unit store", () => {
       actionId: lead.id,
       resultHash: "rl",
       outputSubject: subject,
-      decision: gateDecision({ gateKind: "unit_acceptance", outcome: "needs_human", subject, reason: "escalated_to_operator" }),
+      decision: gateDecision({ gateKind: "unit_acceptance", outcome: "needs_human", subject, reason: "lead_needs_human" }),
     });
 
     expect(store.stopActiveWork({ parentAttemptId: "attempt-parent", reason: "already stopped by the escalation above" }))
@@ -3338,7 +3358,7 @@ describe("execution unit store", () => {
 
     const events = publicationEvents("attempt-parent");
     expect(events.filter((event) => event.kind === "graph_stopped")).toHaveLength(1);
-    expect(events.find((event) => event.kind === "graph_stopped")?.body).toContain("escalated_to_operator");
+    expect(events.find((event) => event.kind === "graph_stopped")?.body).toContain("lead_needs_human");
   });
 
   it("records a graph-stop child-publication event when a retryable infrastructure failure stops the graph", () => {

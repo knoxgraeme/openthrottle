@@ -25,6 +25,7 @@ import type { PipelineInstance, PipelineInstanceStage, PipelineStageAttempt } fr
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 import type { ExecutionGateDecision } from "./execution-gates.js";
+import type { GateReceiptReason } from "./gates.js";
 import { createLinearOutboxProcessor } from "../providers/linear/outbox.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
@@ -1243,14 +1244,14 @@ describe("pipeline coordinator", () => {
       gateKind: ExecutionGateDecision["gateKind"];
       outcome?: PipelineCoordinatorEvent["outcome"];
       result?: ExecutionGateDecision["result"];
-      reason?: string;
+      reason?: GateReceiptReason;
       subject: string;
     }): ExecutionGateDecision {
       const base = {
         gateKind: overrides.gateKind,
         outcome: overrides.outcome ?? "success",
         result: overrides.result ?? "passed",
-        reason: overrides.reason ?? "test_reason",
+        reason: overrides.reason ?? "typed_semantic_result",
         subject: overrides.subject,
         artifactHashes: ["a".repeat(64)],
       };
