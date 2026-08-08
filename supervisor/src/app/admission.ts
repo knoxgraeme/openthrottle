@@ -65,6 +65,7 @@ interface BoundedTaskContext {
     droppedParentSections: number;
     summarizedParentSections: number;
   };
+  selectionError?: string;
   ordinaryLimitError?: string;
 }
 
@@ -114,12 +115,46 @@ function contextSectionsOf(sections: ContextSection[], kind: ContextSectionKind)
   return sections.filter((section) => section.kind === kind);
 }
 
+function hasCanonicalLinearContextShape(sections: ContextSection[]): boolean {
+  if (sections.length < 2 || sections[0]?.kind !== "issue" ||
+      sections[1]?.kind !== "primary-directive-thread") {
+    return false;
+  }
+  if (contextSectionsOf(sections, "issue").length !== 1 ||
+      contextSectionsOf(sections, "primary-directive-thread").length !== 1) {
+    return false;
+  }
+
+  let parentCount = 0;
+  let sawOtherThread = false;
+  for (const section of sections.slice(2)) {
+    if (section.kind === "parent-issue") {
+      parentCount += 1;
+      if (parentCount > 1 || sawOtherThread) return false;
+      continue;
+    }
+    if (section.kind === "other-thread") {
+      sawOtherThread = true;
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
 function withoutSections(context: string, sections: ContextSection[]): string {
   let output = context;
   for (const section of sections) {
     output = output.replace(section.text, "");
   }
   return output.trim();
+}
+
+function hasLinearContextStructuralDelimiter(context: string): boolean {
+  return new RegExp(
+    `</?(?:${LINEAR_CONTEXT_SECTION_KINDS.join("|")})\\b[^>]*>`,
+    "i"
+  ).test(context);
 }
 
 function parentIssueSummary(section: ContextSection): string {
@@ -142,6 +177,15 @@ function composeBoundedOrdinaryTaskContext(rawContext: string): BoundedTaskConte
   const sanitized = sanitizeText(rawContext);
   const originalBytes = utf8Bytes(sanitized);
   const sections = linearContextSections(sanitized);
+  if (sections.length > 0 && !hasCanonicalLinearContextShape(sections)) {
+    return {
+      context: sanitized,
+      selectionContext: "",
+      selectionError:
+        "Linear prompt context has an invalid top-level section structure. Expected exactly one issue followed by " +
+        "exactly one primary directive, then an optional parent issue and comment threads. No sandbox was provisioned.",
+    };
+  }
   const issueSections = contextSectionsOf(sections, "issue");
   const directiveSections = contextSectionsOf(sections, "primary-directive-thread");
   if (issueSections.length === 0 || directiveSections.length === 0) {
@@ -166,20 +210,27 @@ function composeBoundedOrdinaryTaskContext(rawContext: string): BoundedTaskConte
     ...otherThreadSections,
   ];
   const remaining = withoutSections(sanitized, knownSections);
+  if (hasLinearContextStructuralDelimiter(remaining)) {
+    return {
+      context: sanitized,
+      selectionContext: "",
+      selectionError:
+        "Linear prompt context has an invalid top-level section structure. Expected exactly one issue followed by " +
+        "exactly one primary directive, then an optional parent issue and comment threads. No sandbox was provisioned.",
+    };
+  }
   const parentSummaries = parentSections.map(parentIssueSummary);
   const requiredSections = [
     ...issueSections,
     ...directiveSections,
   ].map((section) => section.text);
-  const selectionParts = [
-    ...requiredSections,
-    ...(remaining ? [remaining] : []),
-  ];
-  const requiredContext = selectionParts.join("\n\n").trim();
+  const selectionContext = requiredSections.join("\n\n").trim();
+  const contextParts = [...requiredSections, ...(remaining ? [remaining] : [])];
+  const requiredContext = contextParts.join("\n\n").trim();
   if (utf8Bytes(requiredContext) > ORDINARY_STAGE_TASK_CONTEXT_LIMIT) {
     return {
       context: sanitized,
-      selectionContext: requiredContext,
+      selectionContext,
       ordinaryLimitError:
         `Task context required content exceeds ${ORDINARY_STAGE_TASK_CONTEXT_LIMIT} bytes for an ordinary stage pipeline. ` +
         "Reduce the issue description or primary directive. No sandbox was provisioned.",
@@ -187,7 +238,7 @@ function composeBoundedOrdinaryTaskContext(rawContext: string): BoundedTaskConte
   }
 
   if (originalBytes <= ORDINARY_STAGE_TASK_CONTEXT_LIMIT) {
-    return { context: sanitized, selectionContext: requiredContext };
+    return { context: sanitized, selectionContext };
   }
 
   const keptParentSummaries: string[] = [];
@@ -210,14 +261,14 @@ function composeBoundedOrdinaryTaskContext(rawContext: string): BoundedTaskConte
   }
   keptOptional.reverse();
   const context = [
-    ...selectionParts,
+    ...contextParts,
     ...keptParentSummaries,
     ...keptOptional.map((section) => section.text),
   ].join("\n\n").trim();
 
   return {
     context,
-    selectionContext: requiredContext,
+    selectionContext,
     pruning: {
       originalBytes,
       boundedBytes: utf8Bytes(context),
@@ -709,6 +760,9 @@ export async function handleCreated(
   };
   const boundedTaskContext = composeBoundedOrdinaryTaskContext(initialContext);
   try {
+    if (boundedTaskContext.selectionError) {
+      throw new Error(boundedTaskContext.selectionError);
+    }
     const remote = await providers.repositoryReader.getRepositoryConfigAtCommit(
       selectedRepository.repo,
       selectedRepository.baseBranch
@@ -822,7 +876,7 @@ export async function handleCreated(
     await failSelection(error);
     return;
   }
-  if (boundedTaskContext.pruning) {
+  if (!manifestUsesCompositeRuntime(pinned.manifest) && boundedTaskContext.pruning) {
     coordinator.store.recordJournalEntry({
       issueId: issue.id,
       actor: "supervisor",
