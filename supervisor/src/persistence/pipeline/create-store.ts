@@ -6,6 +6,7 @@ import { createEffectStore } from "./effect-store.js";
 import { createInstanceStore } from "./instance-store.js";
 import { createJournalStore } from "./journal-store.js";
 import { createPublicationStore } from "./publication-store.js";
+import { createRunOutcomeStore } from "./run-outcome-store.js";
 import { createStatusStore } from "./status-store.js";
 import { createTransitionStore } from "./transition-store.js";
 import { createExecutionUnitStore } from "./unit-store.js";
@@ -21,6 +22,7 @@ export function createPipelineStore(db: Database.Database): PipelineStore & Exec
     ...createEffectStore(db, now),
     ...createTransitionStore(db, now),
     ...createJournalStore(db, now),
+    ...createRunOutcomeStore(db),
     ...createExecutionUnitStore(db, now),
   };
 }

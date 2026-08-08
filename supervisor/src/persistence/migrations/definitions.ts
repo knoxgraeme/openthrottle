@@ -30,6 +30,12 @@ function hasColumns(db: Database.Database, table: string, columns: string[]): bo
   return columns.every((column) => present.has(column));
 }
 
+function hasIndex(db: Database.Database, name: string): boolean {
+  return Boolean(
+    db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(name)
+  );
+}
+
 function backfillPipelinePublicationState(db: Database.Database): void {
   if (!hasTable(db, "pipeline_publication_receipts")) return;
   const timestamp = new Date().toISOString();
@@ -1773,6 +1779,69 @@ ALTER TABLE runs ADD COLUMN fault_attribution TEXT CHECK(
 const runFaultAttributionMigrationSource = `${runFaultAttributionSchema}
 fault-attribution-contract:runs.fault_attribution is stamped at settlement alongside settlement_reason, closed to executor/agent/provider/unknown, NULL only for pre-attribution rows/v1`;
 
+// One deterministic row per pipeline instance, written exactly once at the
+// terminal transition -- either persistence/pipeline/transition-store.ts
+// applyTransition's normal settlement, or persistence/pipeline/
+// instance-store.ts supersedeOtherInstances' fencing of a superseded
+// generation (both write pipeline_instances.terminal_outcome). Supervisor-
+// derived facts only -- no agent-authored free text -- so this is safe to
+// retain far longer than operational tables and to read for skill-tuning
+// measurement.
+const runOutcomesSchema = `
+CREATE TABLE run_outcomes (
+  pipeline_instance_id TEXT PRIMARY KEY,
+  linear_issue_id TEXT NOT NULL,
+  generation INTEGER NOT NULL CHECK(generation >= 1),
+  execution_graph_id TEXT,
+  plan_digest TEXT,
+  base_commit TEXT NOT NULL,
+  engine TEXT NOT NULL CHECK(engine IN ('claude', 'codex', 'opencode')),
+  outcome TEXT NOT NULL CHECK(outcome IN (
+    'shipped', 'no_change', 'needs_human', 'canceled', 'superseded', 'failed'
+  )),
+  closed_reason TEXT NOT NULL CHECK(closed_reason IN (
+    'success', 'no_change', 'semantic_repair_required', 'retryable_infrastructure_failure',
+    'needs_human', 'canceled', 'superseded', 'failure'
+  )),
+  fault_attribution TEXT CHECK(
+    fault_attribution IS NULL OR fault_attribution IN ('executor', 'agent', 'provider', 'unknown')
+  ),
+  -- Currently always equal to generation: generation numbers are minted as
+  -- a strictly monotonic per-ticket delegation-cycle counter (one new
+  -- session/generation = one new pipeline_instances row = one run_outcomes
+  -- row), so "generations consumed as of this settlement" and "this row's
+  -- generation ordinal" are the same fact by construction. Kept as a distinct
+  -- column because the source ticket names both explicitly; revisit if a
+  -- within-run retry/reentry consumption metric is ever wanted here instead.
+  generations_consumed INTEGER NOT NULL CHECK(generations_consumed >= 1),
+  repair_rounds_by_unit TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(repair_rounds_by_unit)),
+  phase_durations_ms TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(phase_durations_ms)),
+  -- No production path stamps a token cost yet; NULL means unmeasured,
+  -- never a fabricated 0.
+  token_cost_usd REAL CHECK(token_cost_usd IS NULL OR token_cost_usd >= 0),
+  skill_digests TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(skill_digests)),
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
+  FOREIGN KEY(linear_issue_id) REFERENCES tickets(linear_issue_id) ON DELETE RESTRICT
+);
+CREATE INDEX run_outcomes_issue_idx ON run_outcomes(linear_issue_id, created_at DESC);
+CREATE INDEX run_outcomes_created_idx ON run_outcomes(created_at);
+`;
+
+// execution_work_attempts has no index with pipeline_instance_id as a leading
+// column (its only pipeline_instance_id-bearing constraint buries it as the
+// 4th column of a composite UNIQUE), so recordSettlement's per-instance
+// receipt scan (persistence/pipeline/run-outcome-store.ts) would otherwise do
+// a full table scan of every work attempt ever recorded, system-wide, on
+// every single pipeline terminal transition.
+const runOutcomesReceiptIndexSchema = `
+CREATE INDEX execution_work_attempts_pipeline_instance_idx
+  ON execution_work_attempts(pipeline_instance_id);
+`;
+
+const runOutcomesMigrationSource = `${runOutcomesSchema}${runOutcomesReceiptIndexSchema}
+run-outcomes-contract:run_outcomes is written exactly once per pipeline instance terminal transition, supervisor-derived facts only, closed_reason/outcome/fault_attribution reuse the existing StageOutcome/PipelineOutcome/FaultAttribution vocabularies/v1`;
+
 function addExecutionGraphStopFence(db: Database.Database): void {
   if (!hasColumns(db, "execution_graphs", ["stopped_at"])) {
     db.exec("ALTER TABLE execution_graphs ADD COLUMN stopped_at TEXT");
@@ -2341,6 +2410,22 @@ const definitions: DatabaseMigrationDefinition[] = [
     up(db) {
       if (hasTable(db, "runs") && !hasColumns(db, "runs", ["fault_attribution"])) {
         db.exec(runFaultAttributionSchema);
+      }
+    },
+  },
+  {
+    version: 29,
+    name: "run-outcomes-settlement-rollup",
+    source: runOutcomesMigrationSource,
+    up(db) {
+      if (hasTable(db, "pipeline_instances") && !hasTable(db, "run_outcomes")) {
+        db.exec(runOutcomesSchema);
+      }
+      if (
+        hasTable(db, "execution_work_attempts") &&
+        !hasIndex(db, "execution_work_attempts_pipeline_instance_idx")
+      ) {
+        db.exec(runOutcomesReceiptIndexSchema);
       }
     },
   },

@@ -60,7 +60,14 @@ describe("loadConfig", () => {
       kimiCodeApiKey: "kimi",
       sandboxEventPollIntervalMs: 5_000,
       sandboxRuntimeRelease: "openthrottle-snapshot/v9",
+      runOutcomeRetentionDays: 180,
     });
+  });
+
+  it("rejects an out-of-range run outcome retention window", () => {
+    setRequiredEnv();
+    process.env.RUN_OUTCOME_RETENTION_DAYS = "0";
+    expect(() => loadConfig()).toThrow("RUN_OUTCOME_RETENTION_DAYS must be between 1");
   });
 
   it("validates explicit runtime settings", () => {

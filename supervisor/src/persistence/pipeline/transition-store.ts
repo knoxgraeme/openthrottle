@@ -14,6 +14,7 @@ import {
   validatePinnedInstance,
 } from "./helpers.js";
 import { createJournalStore } from "./journal-store.js";
+import { createRunOutcomeStore } from "./run-outcome-store.js";
 
 function attemptStatusForOutcome(
   outcome: CoordinatorTransitionWrite["outcome"]
@@ -32,6 +33,7 @@ export function createTransitionStore(db: Database.Database, now: () => string):
   const getAttemptStmt = db.prepare("SELECT * FROM pipeline_stage_attempts WHERE id = ?");
   const persistPublication = createPipelinePublicationWriter(db);
   const journal = createJournalStore(db, now);
+  const runOutcomes = createRunOutcomeStore(db);
 
   const maybeRecordRunNote = (
     instance: PipelineInstance,
@@ -443,6 +445,8 @@ export function createTransitionStore(db: Database.Database, now: () => string):
           subject: write.publishedCommit ?? write.immutableSubject ?? null,
         },
       });
+      wrote();
+      runOutcomes.recordSettlement(instance, attempt, write, timestamp);
       wrote();
     }
     const consumed = db.prepare(`

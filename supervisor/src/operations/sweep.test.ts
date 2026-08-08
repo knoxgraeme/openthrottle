@@ -68,7 +68,7 @@ describe("runSweep", () => {
     await runSweep(
       runtime,
       store,
-      { orphanGraceMinutes: 5 } as Config,
+      { orphanGraceMinutes: 5, runOutcomeRetentionDays: 180 } as Config,
       pipelines,
       activityPublisherFor(store),
       reconcileWebhooks
@@ -103,7 +103,7 @@ describe("runSweep", () => {
     await runSweep(
       runtime,
       store,
-      { orphanGraceMinutes: 5 } as Config,
+      { orphanGraceMinutes: 5, runOutcomeRetentionDays: 180 } as Config,
       pipelines,
       activityPublisherFor(store),
       vi.fn(async () => {
@@ -174,7 +174,7 @@ describe("runSweep", () => {
     await runSweep(
       runtime,
       store,
-      { orphanGraceMinutes: 5 } as Config,
+      { orphanGraceMinutes: 5, runOutcomeRetentionDays: 180 } as Config,
       pipelines,
       activityPublisherFor(store)
     );
@@ -217,7 +217,7 @@ describe("runSweep", () => {
     await runSweep(
       runtime,
       store,
-      { orphanGraceMinutes: 5 } as Config,
+      { orphanGraceMinutes: 5, runOutcomeRetentionDays: 180 } as Config,
       pipelines,
       activityPublisherFor(store)
     );

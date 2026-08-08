@@ -404,8 +404,10 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
           : null,
         owner,
         reason: "pipeline stop",
-        // An operator/system-initiated stop is not a fault in any domain.
-        faultAttribution: "unknown",
+        // An operator/system-initiated stop is not a fault in any domain --
+        // NULL, not the first-class 'unknown' value, which means "a fault
+        // occurred but its domain could not be determined."
+        faultAttribution: null,
         status: "stopped",
         ticketState: currentSession ? ticketState : undefined,
         failureTail: settlementReason,
@@ -683,8 +685,8 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
           : null;
         const owner = `pipeline-stop:${effect.id}`;
         // Same rationale as handleStopEffect above: a stop is not a fault in
-        // any domain, exhausted retries or not.
-        if (runId && !deps.tickets.claimRunForReaping(runId, owner, "pipeline stop exhausted", "unknown")) {
+        // any domain, exhausted retries or not -- NULL, not 'unknown'.
+        if (runId && !deps.tickets.claimRunForReaping(runId, owner, "pipeline stop exhausted", null)) {
           runId = null;
         }
         deps.store.markStopEffectExhausted({

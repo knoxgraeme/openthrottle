@@ -599,6 +599,7 @@ SQLite is the authority. Core tables include:
   `execution_work_attempts`, `execution_gate_receipts`,
   `execution_downstream_context`, `execution_publication_events`;
 - cross-run orchestration history: `orchestration_journal`;
+- settlement rollup measurement corpus: `run_outcomes`;
 - operations: `repository_registrations`, `supervisor_leases`, `settings`,
   `schema_migrations`, `migration_reconciliation`.
 
@@ -609,6 +610,19 @@ use `actor = 'stage_agent'` with sanitized, bounded notes and structured
 evidence references. The journal is queryable for operator or future
 orchestrator inspection, but no coordinator transition, gate, or effect
 scheduling logic may consume it as authority.
+
+`run_outcomes` holds one deterministic row per pipeline instance, written
+exactly once at its terminal transition -- either applyTransition's normal
+settlement or supersedeOtherInstances' fencing of a superseded generation.
+Supervisor-derived facts only, no agent-authored free text: join keys
+(ticket, instance, generation, execution graph id, plan digest, base
+commit), outcome and closed reason, fault attribution, generations
+consumed, per-unit repair rounds, per-phase durations, token cost (`NULL`
+means unmeasured -- no production path stamps a cost yet), engine, and the
+deduped skill digests that ran (from receipt producers). Retained under the
+separate, longer `RUN_OUTCOME_RETENTION_DAYS` cutoff rather than the other
+operational-data retention windows, since it is safe to keep for
+skill-tuning measurement.
 
 Schema migrations are transactional, checksum-pinned, and idempotent. Migration
 code may recognize historical direct-run rows solely to reconcile an older
@@ -741,7 +755,8 @@ Optional/defaulted:
   `CLAUDE_CODE_OAUTH_TOKEN`, `CODEX_AUTH_JSON`, or `KIMI_CODE_API_KEY`;
 - `TASK_TIMEOUT=7200`, `ORPHAN_GRACE_MINUTES=5`,
   `WEBHOOK_MAX_AGE_SECONDS=60`, `SANDBOX_EVENT_POLL_INTERVAL_MS=5000`,
-  `STALL_TIMEOUT_SECONDS=900`, `ALLOW_LINEAR_MERGE=false`;
+  `STALL_TIMEOUT_SECONDS=900`, `ALLOW_LINEAR_MERGE=false`,
+  `RUN_OUTCOME_RETENTION_DAYS=180`;
 - `PIPELINE_CATALOG_PATH`, `SANDBOX_RUNTIME_RELEASE`, and
   `SANDBOX_RUNTIME_DESCRIPTOR_PATH` for pinned deployment assets.
 

@@ -6,6 +6,7 @@ import type {
   ValidatedPipelineManifest,
   ValidatedRepositoryConfig,
 } from "./manifest.js";
+import type { FaultAttribution } from "./fault-attribution.js";
 import type {
   ValidatedRuntimeCapabilityDescriptor,
 } from "../runtime/contracts.js";
@@ -231,6 +232,32 @@ export interface OrchestrationJournalQuery {
   limit?: number;
 }
 
+// Supervisor-derived settlement facts only -- never agent-authored content.
+// Written exactly once per pipeline instance, at its terminal transition. See
+// persistence/pipeline/run-outcome-store.ts.
+export interface RunOutcome {
+  pipeline_instance_id: string;
+  linear_issue_id: string;
+  generation: number;
+  execution_graph_id: string | null;
+  plan_digest: string | null;
+  base_commit: string;
+  engine: "claude" | "codex" | "opencode";
+  outcome: PipelineOutcome;
+  closed_reason: StageOutcome;
+  fault_attribution: FaultAttribution | null;
+  generations_consumed: number;
+  /** JSON object: { [unit_id]: repair_rounds } */
+  repair_rounds_by_unit: string;
+  /** JSON object: { [stage_id]: duration_ms } */
+  phase_durations_ms: string;
+  /** NULL means unmeasured -- no production path supplies cost yet. */
+  token_cost_usd: number | null;
+  /** JSON array of { skill, skill_package_digest } */
+  skill_digests: string;
+  created_at: string;
+}
+
 export interface ChildActionLivenessPort {
   renewChildActionLiveness(input: {
     parentRunId: string;
@@ -454,4 +481,6 @@ export interface PipelineStore extends ChildActionLivenessPort {
   applyTransition(write: CoordinatorTransitionWrite, faultAfterWrite?: (writeCount: number) => void): PipelineInstance;
   recordJournalEntry(input: OrchestrationJournalWrite): void;
   listJournalEntries(query: OrchestrationJournalQuery): OrchestrationJournalEntry[];
+  getRunOutcome(pipelineInstanceId: string): RunOutcome | undefined;
+  pruneRunOutcomes(beforeIso: string): number;
 }

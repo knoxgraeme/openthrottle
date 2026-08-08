@@ -346,15 +346,25 @@ export function getStructuredExecutionPublicationForAttempt(
 // than the one that owns the execution graph. Each generation is its own
 // pipeline_instances row (see supersedeOtherInstances), so the latest graph
 // for this instance is unambiguously this generation's structured execution,
-// independent of which attempt is currently active.
+// independent of which attempt is currently active. Shared with
+// run-outcome-store.ts's settlement rollup, which needs the same row for its
+// graph id/plan digest join keys -- one tie-break definition for "the" graph
+// of a pipeline instance, not two that could drift apart.
+export function getLatestExecutionGraphForInstance(
+  db: Database.Database,
+  pipelineInstanceId: string
+): ExecutionUnitGraph | undefined {
+  return db.prepare(`
+    SELECT * FROM execution_graphs WHERE pipeline_instance_id = ?
+    ORDER BY created_at DESC, id DESC LIMIT 1
+  `).get(pipelineInstanceId) as ExecutionUnitGraph | undefined;
+}
+
 export function getStructuredExecutionPublicationForInstance(
   db: Database.Database,
   pipelineInstanceId: string
 ): ReturnType<typeof buildExecutionPublicationSnapshot> {
-  const graph = db.prepare(`
-    SELECT * FROM execution_graphs WHERE pipeline_instance_id = ?
-    ORDER BY created_at DESC, id DESC LIMIT 1
-  `).get(pipelineInstanceId) as ExecutionUnitGraph | undefined;
+  const graph = getLatestExecutionGraphForInstance(db, pipelineInstanceId);
   if (!graph) return undefined;
   return buildExecutionPublicationSnapshotForGraph(db, graph);
 }

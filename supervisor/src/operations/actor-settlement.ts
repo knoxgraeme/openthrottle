@@ -21,7 +21,9 @@ export async function terminateAndSettleActor(params: {
   // Stamped on the run alongside settlement_reason at reaping-claim time (see
   // run-store.ts claimRunForReapingTransaction). The caller already knows why
   // it is terminating this actor, so it is required rather than derived here.
-  faultAttribution: FaultAttribution;
+  // NULL means no fault domain applies (an operator/system-initiated stop),
+  // distinct from the first-class 'unknown' fault value.
+  faultAttribution: FaultAttribution | null;
   status: "timed_out" | "stopped";
   ticketState?: Ticket["state"];
   failureTail?: string;

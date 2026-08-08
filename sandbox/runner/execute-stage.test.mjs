@@ -1822,6 +1822,12 @@ exit 1
     expect(result.outcome).toBe("retryable_infrastructure_failure");
     expect(payload.summary).toContain("reason=credential_missing");
     expect(payload.summary).toContain("CLAUDE_CODE_OAUTH_TOKEN");
+    // Positive counterpart to the engine_crash-withholding tests above: a
+    // real provider fault (missing engine credential, a PROVIDER_LAUNCH_
+    // FAULT_REASONS member per fault-attribution.ts) must produce a non-null
+    // fault_reason, since that is the only signal the supervisor has to stamp
+    // runs.fault_attribution = 'provider' at settlement.
+    expect(result.faultReason).toBe("credential_missing");
   });
 
   it("rejects a valid proposal when agent execution exceeded its timeout", () => {

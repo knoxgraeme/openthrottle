@@ -123,6 +123,14 @@ describe("pipeline instance store", () => {
     expect(pipelines.listEffects(oldInstance.id).map((effect) => [effect.kind, effect.status]))
       .toEqual([["provision", "dead"], ["stop", "pending"]]);
     expect(pipelines.getInstanceForSession("session-new")?.status).toBe("dispatchable");
+
+    expect(pipelines.getRunOutcome(oldInstance.id)).toMatchObject({
+      pipeline_instance_id: oldInstance.id,
+      linear_issue_id: oldInstance.linear_issue_id,
+      outcome: "superseded",
+      closed_reason: "superseded",
+      fault_attribution: null,
+    });
   });
 
   it("preserves the active structured ledger in superseded terminal publications", () => {

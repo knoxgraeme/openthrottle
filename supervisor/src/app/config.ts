@@ -79,6 +79,7 @@ export interface Config {
 
   taskTimeout: number;
   orphanGraceMinutes: number;
+  runOutcomeRetentionDays: number;
   webhookMaxAgeSeconds: number;
   allowLinearMerge: boolean;
   sandboxEventPollIntervalMs: number;
@@ -116,6 +117,7 @@ export function loadConfig(): Config {
 
     taskTimeout: optionalInt("TASK_TIMEOUT", 7200),
     orphanGraceMinutes: optionalInt("ORPHAN_GRACE_MINUTES", 5),
+    runOutcomeRetentionDays: optionalInt("RUN_OUTCOME_RETENTION_DAYS", 180),
     webhookMaxAgeSeconds: optionalInt("WEBHOOK_MAX_AGE_SECONDS", 60),
     allowLinearMerge: optionalBool("ALLOW_LINEAR_MERGE", false),
     sandboxEventPollIntervalMs: optionalInt("SANDBOX_EVENT_POLL_INTERVAL_MS", 5_000),
@@ -149,6 +151,7 @@ export function loadConfig(): Config {
   requireRange("PORT", cfg.port, 1, 65_535);
   requireRange("TASK_TIMEOUT", cfg.taskTimeout, 1);
   requireRange("ORPHAN_GRACE_MINUTES", cfg.orphanGraceMinutes, 0);
+  requireRange("RUN_OUTCOME_RETENTION_DAYS", cfg.runOutcomeRetentionDays, 1);
   requireRange("WEBHOOK_MAX_AGE_SECONDS", cfg.webhookMaxAgeSeconds, 1);
   requireRange("SANDBOX_EVENT_POLL_INTERVAL_MS", cfg.sandboxEventPollIntervalMs, 1_000);
   requireRange("DAYTONA_TOTAL_MEMORY_GIB", cfg.daytonaTotalMemoryGib!, 1);
