@@ -170,10 +170,12 @@ describe("pipeline publication", () => {
     attempt: PipelineStageAttempt;
     outcome: PipelineCoordinatorEvent["outcome"];
     summary: string;
+    subject?: string;
     findings?: Array<{ severity: string; code: string; summary: string }>;
     actions?: string[];
     withReviewArtifact?: boolean;
   }): { event: PipelineCoordinatorEvent; receipt: CoordinatorGateReceiptWrite } {
+    const subject = input.subject ?? SUBJECT;
     const artifactBody = {
       summary: input.summary,
       evidence: [`${input.attempt.stage_id} stage evidence for ${input.summary}`],
@@ -186,7 +188,7 @@ describe("pipeline publication", () => {
       kind: "stage_result",
       schemaVersion: 1,
       assurance: "semantic_attested" as const,
-      subject: SUBJECT,
+      subject,
       payload: stagePayload,
       hash: digestNormalized(stagePayload),
     }];
@@ -196,7 +198,7 @@ describe("pipeline publication", () => {
         kind: "review",
         schemaVersion: 1,
         assurance: "semantic_attested" as const,
-        subject: SUBJECT,
+        subject,
         payload: reviewPayload,
         hash: digestNormalized(reviewPayload),
       });
@@ -204,7 +206,7 @@ describe("pipeline publication", () => {
     const receiptPayload = canonicalJson({
       attempt_id: input.attempt.id,
       decision: "passed",
-      subject: SUBJECT,
+      subject,
     });
     return {
       event: {
@@ -216,13 +218,13 @@ describe("pipeline publication", () => {
         requestHash: input.attempt.request_hash,
         outcome: input.outcome,
         resultHash: artifacts[0]!.hash,
-        subject: SUBJECT,
+        subject,
         artifacts,
       },
       receipt: {
         evaluatorKind: "semantic",
         policyDigest: "d".repeat(64),
-        subject: SUBJECT,
+        subject,
         result: "passed",
         artifactHashes: artifacts.map((artifact) => artifact.hash).sort(),
         payload: receiptPayload,
@@ -1707,11 +1709,44 @@ describe("pipeline publication", () => {
 
     const repairAttempt = pipelines.getActiveAttempt(instance.id)!;
     expect(repairAttempt.stage_id).toBe("resume");
+    const noChangeRepair = semanticEvent({
+      instance: afterReview,
+      attempt: repairAttempt,
+      outcome: "no_change",
+      summary: "repair round found no tree delta",
+    });
+    const noChangeRepairPublication = buildStagePublication({
+      instance: afterReview,
+      attempt: repairAttempt,
+      event: noChangeRepair.event,
+      write: {
+        instanceId: instance.id,
+        eventId: noChangeRepair.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(noChangeRepair.event)),
+        expectedVersion: afterReview.state_version,
+        expectedStatus: afterReview.status,
+        attemptId: repairAttempt.id,
+        outcome: "no_change",
+        resultHash: noChangeRepair.event.resultHash,
+        nextStatus: "dispatchable",
+        effects: [],
+      },
+      gateReceipt: noChangeRepair.receipt,
+      priorFindings: reviewPublication.evidence.findings,
+      priorRepairSourceStageId: "review",
+    });
+    expect(noChangeRepairPublication.body)
+      .toContain("[P2] status-copy — receipt copy needs clarity → carried to repair");
+    expect(noChangeRepairPublication.body)
+      .not.toContain("[P2] status-copy — receipt copy needs clarity → repaired-at-cccccccccccc");
+
+    const repairedSubject = "d".repeat(40);
     const repair = semanticEvent({
       instance: afterReview,
       attempt: repairAttempt,
       outcome: "success",
       summary: "repair round applied the requested fix",
+      subject: repairedSubject,
       actions: ["Fixed provider snapshot bounding and verified coverage."],
     });
     coordinatePipelineEvent(pipelines, repair.event, undefined, repair.receipt);
@@ -1723,7 +1758,7 @@ describe("pipeline publication", () => {
     expect(repairPublication.body)
       .toContain("[P1] provider-snapshot-bounding — snapshot payload unbounded → fixed in-stage");
     expect(repairPublication.body)
-      .toContain("[P2] status-copy — receipt copy needs clarity → repaired-at-cccccccccccc");
+      .toContain("[P2] status-copy — receipt copy needs clarity → repaired-at-dddddddddddd");
     expect(repairPublication.body)
       .not.toContain("[P2] status-copy — receipt copy needs clarity → carried to repair");
 
@@ -1734,6 +1769,7 @@ describe("pipeline publication", () => {
       attempt: finalAttempt,
       outcome: "success",
       summary: "review accepted the remaining finding",
+      subject: repairedSubject,
       findings: [
         { severity: "P2", code: "status-copy", summary: "receipt copy needs clarity" },
       ],

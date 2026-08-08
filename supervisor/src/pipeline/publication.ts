@@ -706,11 +706,13 @@ function repairedAtSubject(input: {
   repairSourceStageId: string | undefined;
   currentStageId: string;
   outcome: StageOutcome | PipelineOutcome;
+  expectedSubject: string | null | undefined;
   subject: string | null | undefined;
 }): string | undefined {
   if (!input.repairSourceStageId ||
       !input.subject ||
-      !["success", "no_change"].includes(input.outcome)) {
+      input.outcome !== "success" ||
+      input.subject === input.expectedSubject) {
     return undefined;
   }
   const manifest = JSON.parse(input.normalizedManifest) as PipelineManifest;
@@ -1052,6 +1054,7 @@ export function buildStagePublication(input: {
       repairSourceStageId,
       currentStageId: input.attempt.stage_id,
       outcome,
+      expectedSubject: input.attempt.expected_subject,
       subject,
     })
   );
