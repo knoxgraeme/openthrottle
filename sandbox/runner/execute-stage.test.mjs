@@ -303,24 +303,26 @@ describe("one-stage executor", () => {
       .toThrow(/nativeSessionId/);
     expect(stagePrompt(request, "/tmp/proposal.json")).toContain("Implement the approved fixture change.");
     // The default skillRoot ("/opt/openthrottle/skills/tasks") only exists
-    // inside the baked sandbox image, not a bare CI checkout -- publish is
-    // mapped to a real skill name distinct from the existsSync fallback
-    // (implement-plan), so this assertion needs its own hermetic skillRoot
-    // to prove capability-keyed selection rather than depend on ambient
-    // filesystem state that differs between environments.
-    const publishSkillRoot = mkdtempSync(join(tmpdir(), "ot-stage-publish-skill-"));
-    directories.push(publishSkillRoot);
-    mkdirSync(join(publishSkillRoot, "publish"), { recursive: true });
-    writeFileSync(join(publishSkillRoot, "publish", "SKILL.md"), "---\nname: publish\n---\nFixture.\n");
+    // inside the baked sandbox image, not a bare CI checkout, and a mapped
+    // skill whose package is missing now fails closed rather than falling
+    // back -- so these assertions need their own hermetic skillRoot to prove
+    // capability-keyed selection rather than depend on ambient filesystem
+    // state that differs between environments.
+    const stageSkillRoot = mkdtempSync(join(tmpdir(), "ot-stage-publish-skill-"));
+    directories.push(stageSkillRoot);
+    for (const name of ["publish", "implement-plan"]) {
+      mkdirSync(join(stageSkillRoot, name), { recursive: true });
+      writeFileSync(join(stageSkillRoot, name, "SKILL.md"), `---\nname: ${name}\n---\nFixture.\n`);
+    }
     expect(stagePrompt(
       { ...request, taskType: "investigate", capability: "ce/publish@1" },
       "/tmp/proposal.json",
-      { skillRoot: publishSkillRoot },
+      { skillRoot: stageSkillRoot },
     )).toMatch(/^\$publish/);
     expect(stagePrompt(
       { ...request, agent: "claude", capability: "ce/implement@1" },
       "/tmp/proposal.json",
-      { agent: "claude" }
+      { agent: "claude", skillRoot: stageSkillRoot }
     )).toMatch(/^\/implement-plan/);
   });
 
@@ -336,16 +338,16 @@ describe("one-stage executor", () => {
 
     expect(prompt("ce/investigate@1")).toMatch(/^\$investigate/);
     expect(prompt("ce/publish@1")).toMatch(/^\$publish/);
-    // review-change/simplify-change land in the adoption ticket; until their
-    // packages are installed, the capability map falls back to implement-plan
-    // rather than instructing the agent to invoke a skill nothing provides.
-    expect(prompt("ce/review@1")).toMatch(/^\$implement-plan/);
-    expect(prompt("ce/simplify@1")).toMatch(/^\$implement-plan/);
     // ce/plan@1 is a registered capability with no drafted skill of its own;
     // it maps explicitly to implement-plan rather than failing closed like a
     // genuinely unmapped capability.
     expect(prompt("ce/plan@1")).toMatch(/^\$implement-plan/);
     expect(() => prompt("ce/unmapped@1")).toThrow(/has no mapped skill/);
+    // A mapped capability whose package is missing fails closed. It must never
+    // silently resolve to implement-plan: that would run an implement-and-
+    // commit skill for a read-only review or simplify stage.
+    expect(() => prompt("ce/review@1")).toThrow(/maps to skill review-change, which is not installed/);
+    expect(() => prompt("ce/simplify@1")).toThrow(/maps to skill simplify-change, which is not installed/);
 
     mkdirSync(join(skillRoot, "review-change"), { recursive: true });
     writeFileSync(join(skillRoot, "review-change", "SKILL.md"), "---\nname: review-change\n---\nFixture.\n");

@@ -11,13 +11,23 @@
 // would, so it proves the same agent-facing contract a real engine uses.
 //
 // It makes one deterministic worktree edit (implement/simplify/repair) and
-// computes subject.post with the executor's own tree-oid algorithm so the
-// receipt it prints is byte-for-byte fence-correct without needing to guess.
+// computes subject.post by running the installed `ot-subject-post` command,
+// exactly as a real agent is instructed to by canonical block E of every
+// worker SKILL.md, so the receipt it prints is byte-for-byte fence-correct
+// without needing to guess.
 
+import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { computeWorkspaceTreeOid } from "/opt/openthrottle/runner/repository-control.mjs";
 import { extractJsonBlock } from "/opt/openthrottle/runner/json-block.mjs";
+
+// The one path an agent actually has: the installed command, not the module
+// behind it. Importing `computeWorkspaceTreeOid` directly (as this stub used
+// to) left Dockerfile's COPY/chmod/symlink of ot-subject-post untestable --
+// all three could break and docker-smoke would still go green, with the first
+// failure a live loop action whose `ot-subject-post` call `command not
+// found`s. Exercising the binary makes those install lines load-bearing.
+const OT_SUBJECT_POST = "/usr/local/bin/ot-subject-post";
 
 function readStdin() {
   try {
@@ -129,7 +139,17 @@ function makeDeterministicEdit(cwd, contract) {
     `${cwd}/WORK.md`,
     `- ${contract.unit_id}/${contract.action_attempt_id} touched by walking-skeleton stub agent\n`
   );
-  return computeWorkspaceTreeOid(cwd);
+  // Run from the worktree root under this process's own sealed environment --
+  // the GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE/GIT_OBJECT_DIRECTORY/
+  // GIT_ALTERNATE_OBJECT_DIRECTORIES the executor exported for this action
+  // (execute-loop.mjs) are already in process.env, and ot-subject-post reads
+  // them exactly the way the executor's own post-run fence computation does.
+  return execFileSync(OT_SUBJECT_POST, [], {
+    cwd,
+    env: process.env,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "inherit"],
+  }).trim();
 }
 
 function main() {

@@ -16,6 +16,16 @@ set -euo pipefail
 # name -- the eleven self-contained skills replaced the CE-delegating
 # adapters, and a rename/typo in any single directory would exit 0 under a
 # probe that only ever checked `/implement-unit`.
+#
+# OPE-107 (references tier): registration alone is not enough. A SKILL.md
+# points at its sibling craft file with a bare relative path
+# (`read `references/branch-review-passes.md``) while the agent's cwd is the
+# target repository, so the pointer resolves against the skill package
+# directory. Arrival of those files is provable by inspection; the *read* as
+# the agent uid is not, and it is the half that fails silently -- an
+# unreadable reference exits 0 and grades as a clean run, quietly dropping
+# the craft the reference carries. Probe it here, on the same real
+# materialized action HOME, with the same privilege drop.
 
 IMAGE="${1:-openthrottle:test}"
 
@@ -86,8 +96,42 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
     fi
   }
 
+  # Read one references/*.md per skill that ships them, as the agent uid,
+  # resolved relatively from the skill package directory exactly the way the
+  # SKILL.md pointer reads it. Exercises traversal into the root-owned
+  # read-only skill tree plus the file mode, which is the whole runtime
+  # question. Skills with no references/ directory are skipped, not failed.
+  check_references_readable() {
+    local name="$1"
+    local skill_dir="$home_dir/.claude/skills/$name"
+    if [ ! -d "$skill_dir/references" ]; then
+      echo "--- $name has no references/ (skipped) ---"
+      return 0
+    fi
+
+    local first=""
+    local candidate
+    for candidate in "$skill_dir"/references/*.md; do
+      if [ -f "$candidate" ]; then
+        first="$(basename "$candidate")"
+        break
+      fi
+    done
+    if [ -z "$first" ]; then
+      echo "skill $name has a references/ directory containing no *.md file" >&2
+      exit 1
+    fi
+
+    if ! gosu agent env -C "$skill_dir" cat "references/$first" > /dev/null; then
+      echo "agent uid cannot read $name/references/$first -- its SKILL.md pointer does not resolve at runtime" >&2
+      exit 1
+    fi
+    echo "--- $name/references/$first is readable as agent ---"
+  }
+
   for name in "$@"; do
     check_registered "$name"
+    check_references_readable "$name"
   done
 
   bogus_output="$(run_probe "/ot-nonexistent-probe")" || true
@@ -98,5 +142,5 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
     exit 1
   fi
 
-  echo "slash-command registration oracle passed for all eleven adopted skills"
+  echo "slash-command registration oracle passed for all eleven adopted skills, and every references/ pointer read back as agent"
 ' bash "${SKILL_NAMES[@]}"
