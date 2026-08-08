@@ -670,6 +670,125 @@ intents:
     expect(pruning?.refs).toContain('"dropped_other_threads"');
   });
 
+  it("selects the pipeline from required context instead of pruned optional threads", async () => {
+    const staleSelection = [
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }, null, 2),
+      "```",
+    ].join("\n");
+    const context = [
+      `<issue identifier="OT-1">`,
+      `<title>Bounded context</title>`,
+      `<description>Implement the ordinary context fix.</description>`,
+      `</issue>`,
+      `<primary-directive-thread comment-id="directive">`,
+      `<comment author="Operator" created-at="2026-08-08T00:00:00.000Z">@OpenThrottle implement this ticket.</comment>`,
+      `</primary-directive-thread>`,
+      `<other-thread comment-id="old-review">`,
+      `<comment author="Openthrottle" created-at="2026-08-07T00:00:00.000Z">${staleSelection}\n${"x".repeat(70_000)}</comment>`,
+      `</other-thread>`,
+    ].join("\n\n");
+
+    const { pipelines } = await run(
+      `schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: structured
+    kind: builtin
+    ref: core/structured@1
+pipelines: { implement: implement }
+intents:
+  implement:
+    default_graph: simple
+    allowed_graphs: [simple, structured]
+`,
+      {},
+      shippedCatalogPath,
+      payload("session-1", "issue-1", "OT-1", context)
+    );
+
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const request = pipelines.getStageRequest(pipelines.getActiveAttempt(instance.id)!.id);
+    expect(instance.pipeline_id).toBe("core/implement");
+    expect(request.taskContext).not.toContain("openthrottle.ship-selection/v1");
+    expect(Buffer.byteLength(request.taskContext, "utf8")).toBeLessThanOrEqual(64_000);
+  });
+
+  it("does not select the pipeline from parent issue summaries", async () => {
+    const staleSelection = [
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }, null, 2),
+      "```",
+    ].join("\n");
+    const context = [
+      `<issue identifier="OT-1">`,
+      `<title>Bounded context</title>`,
+      `<description>Implement the ordinary context fix.</description>`,
+      `</issue>`,
+      `<primary-directive-thread comment-id="directive">`,
+      `<comment author="Operator" created-at="2026-08-08T00:00:00.000Z">@OpenThrottle implement this ticket.</comment>`,
+      `</primary-directive-thread>`,
+      `<parent-issue identifier="OT-0">`,
+      `<title>Parent issue</title>`,
+      `<description>${staleSelection}\n${"parent context ".repeat(5_000)}</description>`,
+      `</parent-issue>`,
+    ].join("\n\n");
+
+    const { pipelines } = await run(
+      `schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: structured
+    kind: builtin
+    ref: core/structured@1
+pipelines: { implement: implement }
+intents:
+  implement:
+    default_graph: simple
+    allowed_graphs: [simple, structured]
+`,
+      {},
+      shippedCatalogPath,
+      payload("session-1", "issue-1", "OT-1", context)
+    );
+
+    expect(pipelines.getInstanceForSession("session-1")!.pipeline_id).toBe("core/implement");
+  });
+
+  it("does not treat tag-shaped text inside optional thread bodies as required sections", async () => {
+    const context = [
+      `<issue identifier="OT-1">`,
+      `<title>Bounded context</title>`,
+      `<description>Implement the ordinary context fix.</description>`,
+      `</issue>`,
+      `<primary-directive-thread comment-id="directive">`,
+      `<comment author="Operator" created-at="2026-08-08T00:00:00.000Z">@OpenThrottle implement this ticket.</comment>`,
+      `</primary-directive-thread>`,
+      `<other-thread comment-id="xml-example">`,
+      `<comment author="Openthrottle" created-at="2026-08-07T00:00:00.000Z">Example: <issue>inner issue example</issue>\n${"x".repeat(70_000)}</comment>`,
+      `</other-thread>`,
+    ].join("\n\n");
+
+    const { pipelines } = await run(
+      repositoryConfigYaml("{ implement: implement }"),
+      {},
+      shippedCatalogPath,
+      payload("session-1", "issue-1", "OT-1", context)
+    );
+
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const request = pipelines.getStageRequest(pipelines.getActiveAttempt(instance.id)!.id);
+    expect(instance.pipeline_id).toBe("core/implement");
+    expect(request.taskContext).not.toContain("inner issue example");
+    expect(Buffer.byteLength(request.taskContext, "utf8")).toBeLessThanOrEqual(64_000);
+  });
+
   it("summarizes parent issue context and drops parent sub-issue metadata", async () => {
     const context = [
       `<issue identifier="OT-1">`,
