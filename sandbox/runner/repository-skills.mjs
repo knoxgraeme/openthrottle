@@ -97,6 +97,24 @@ export function skillBody(raw) {
   return (end === -1 ? raw : lines.slice(end + 1).join("\n")).trim();
 }
 
+// OpenCode inlines the whole prompt at render time and has no admin-scope
+// skill discovery equivalent (see repositorySkillDiscoveryRoot): a SKILL.md
+// pointer like "read `references/x.md`" is unresolvable once only the body
+// is embedded, since OpenCode's process runs from the target repository, not
+// the skill package directory. Render every references/*.md file inline so
+// the pointer has something to resolve against.
+export function skillReferencesText(skillDir) {
+  const referencesDir = resolve(skillDir, "references");
+  if (!existsSync(referencesDir)) return "";
+  const names = readdirSync(referencesDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".md"))
+    .map((entry) => entry.name)
+    .sort();
+  return names
+    .map((name) => `\n\n## references/${name}\n\n${readFileSync(resolve(referencesDir, name), "utf8").trim()}`)
+    .join("");
+}
+
 export function validateRepositorySkillPackage(value, label = "repositorySkill") {
   const input = record(value, label);
   const allowed = new Set(["schema", "reference", "invocation", "directory", "commit", "packageDigest", "files"]);

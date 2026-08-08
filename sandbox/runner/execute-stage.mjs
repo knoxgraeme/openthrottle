@@ -56,6 +56,7 @@ import {
   materializeRepositorySkillPackage,
   repositorySkillDiscoveryRoot,
   skillBody,
+  skillReferencesText,
 } from "./repository-skills.mjs";
 import {
   extractNativeSessionId,
@@ -90,12 +91,11 @@ const COMMAND_NAME = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
 const REMOTE_GIT_TIMEOUT_MS = 15_000;
 const DEFAULT_STAGE_ACTION_ROOT = "/var/lib/openthrottle/stage-actions";
 // Explicit capability -> skill binding for `ce/`-prefixed agent stages.
-// review-change/simplify-change ship in the adoption ticket; the constants
-// are named now so this map selects them the moment their skill packages
-// land, instead of silently keying skill selection off `taskType` (which
-// only ever distinguishes implement from investigate and left every other
-// capability -- review, simplify, publish -- falling through to
-// implement-plan).
+// Every entry names a skill package that ships in skills/tasks/, so selection
+// never keys off `taskType` (which only ever distinguishes implement from
+// investigate and left every other capability -- review, simplify, publish --
+// falling through to implement-plan). An unmapped capability, or a mapped one
+// whose package is missing from disk, fails closed; see stagePrompt.
 const STAGE_CAPABILITY_SKILLS = {
   "ce/implement@1": "implement-plan",
   "ce/review@1": "review-change",
@@ -413,21 +413,31 @@ export function stagePrompt(
       entry += `\n\n${skillBody(readFileSync(join(root, "SKILL.md"), "utf8"))}`;
     }
   } else if (request.capability.startsWith("ce/")) {
-    const mappedSkillName = STAGE_CAPABILITY_SKILLS[request.capability];
-    if (!mappedSkillName) throw new Error(`stage capability ${request.capability} has no mapped skill`);
-    // review-change/simplify-change land in the adoption ticket; until their
-    // packages are installed, fall back to implement-plan -- the same skill
-    // every ce/ capability resolved to before this map existed, and one that
-    // already branches on the sealed `capability` field in this same prompt.
-    // This keeps a mapped-but-not-yet-installed capability behaviorally
-    // identical to pre-map dispatch instead of instructing the agent to
-    // invoke a skill name nothing on disk provides.
-    const skillName = existsSync(join(skillRoot, mappedSkillName, "SKILL.md")) ? mappedSkillName : "implement-plan";
+    const skillName = STAGE_CAPABILITY_SKILLS[request.capability];
+    if (!skillName) throw new Error(`stage capability ${request.capability} has no mapped skill`);
+    // Fail closed on a missing package. This used to fall back to
+    // implement-plan, which was behaviorally identical to pre-map dispatch
+    // while review-change/simplify-change did not yet exist. Now that they
+    // do, that fallback would silently run an implement-and-commit skill for
+    // a `ce/review@1` or `ce/simplify@1` stage that asked for a read-only
+    // review -- a delivery regression turning into wrong work instead of a
+    // stopped stage. The throw becomes a retryable_infrastructure_failure
+    // proposal (executeStage's runAgent catch), which is the honest outcome
+    // for an image that shipped without a skill its own map requires.
+    if (!existsSync(join(skillRoot, skillName, "SKILL.md"))) {
+      throw new Error(
+        `stage capability ${request.capability} maps to skill ${skillName}, which is not installed at ${skillRoot}`
+      );
+    }
     entry = `${agent === "claude" ? "/" : "$"}${skillName}`;
     // OpenCode has no admin-scope skill discovery equivalent. Give it the
-    // canonical adapter body from the same single source used by other engines.
+    // canonical adapter body from the same single source used by other engines,
+    // plus every references/*.md file inlined -- OpenCode cannot resolve a
+    // SKILL.md pointer to a sibling file once only the body is embedded.
     if (agent === "opencode") {
-      entry += `\n\n${skillBody(readFileSync(join(skillRoot, skillName, "SKILL.md"), "utf8"))}`;
+      const skillDir = join(skillRoot, skillName);
+      entry += `\n\n${skillBody(readFileSync(join(skillDir, "SKILL.md"), "utf8"))}`;
+      entry += skillReferencesText(skillDir);
     }
   }
   return `${entry}\n\nThis is one fenced OpenThrottle stage (${request.stageId}/${request.attemptId}) ` +
