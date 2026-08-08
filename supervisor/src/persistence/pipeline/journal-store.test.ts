@@ -77,6 +77,18 @@ describe("orchestration journal store", () => {
       issueId: "issue-1",
       to: "2026-07-27T01:00:00+02:00",
     })).toHaveLength(0);
+
+    // The ISO-8601 basic offset form (no colon) is just as unambiguous as the
+    // extended form above and Date.parse itself already accepts it -- a
+    // stricter shape check must not reject it (PR #158 review).
+    expect(journal.listJournalEntries({
+      issueId: "issue-1",
+      from: "2026-07-27T01:00:00+0200",
+    })).toHaveLength(1);
+    expect(journal.listJournalEntries({
+      issueId: "issue-1",
+      to: "2026-07-27T01:00:00+0200",
+    })).toHaveLength(0);
   });
 
   it("rejects a value Date.parse would loosely accept but that is not ISO-8601 shaped", () => {

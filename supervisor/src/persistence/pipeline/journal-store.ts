@@ -19,7 +19,12 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Date.parse's non-standard fallback parsing accepts both and would
 // otherwise silently query an unintended time range instead of failing closed
 // (backported from analysis-store.ts's queryTimestamp, PR #156 follow-up).
-const ISO_8601_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
+// The offset's colon is optional so both extended (`+00:00`) and basic
+// (`+0000`) ISO-8601 numeric offsets are accepted -- Date.parse itself
+// already accepts both, and requiring the colon would silently reject a
+// well-formed, unambiguous timestamp a caller previously relied on being
+// accepted (PR #158 review).
+const ISO_8601_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:?\d{2})$/;
 
 function bounded(value: string, max = TEXT_LIMIT): string {
   return sanitizeText(value).slice(0, max);
