@@ -642,19 +642,32 @@ read-only through `GET /analysis/runs` and `openthrottle analysis` (see
 "Supervisor HTTP contract" above). This generalizes the `orchestration_journal`
 doctrine above: the corpus is evidence for improvement proposals, never an
 input to a pipeline decision -- no gate, transition, scheduler, or
-effect-drain module may import or query it. `supervisor/src/persistence/
-pipeline/analysis-store.ts` is the corpus's only read surface and is wired
-into the HTTP layer from a plain `db` handle in `index.ts`, deliberately
-separate from `PipelineStore` (which gate/transition/scheduler/effect-drain
-code consumes). `supervisor/src/__tests__/architecture.test.ts` enforces this
-as an assertion: it names the gate (`pipeline/gates.ts`,
-`pipeline/execution-gates.ts`, `persistence/pipeline/
-unit-store-phase-reducer.ts`), transition (`persistence/pipeline/
-transition-store.ts`, `persistence/pipeline/instance-store.ts`), scheduler
-(`pipeline/coordinator.ts`, `pipeline/unit-coordinator.ts`), and effect-drain
-(`operations/pipeline-effects.ts`, `operations/unit-effects.ts`,
-`operations/structured-child-runtime.ts`) modules explicitly and fails if any
-of them imports the analysis surface.
+effect-drain module may import or query it.
+`supervisor/src/persistence/pipeline/analysis-store.ts` is the corpus's only
+read surface and is wired into the HTTP layer from a plain `db` handle in
+`index.ts`, deliberately separate from `PipelineStore` (which
+gate/transition/scheduler/effect-drain code consumes). `PipelineStore`
+exposes no `run_outcomes` read method of its own for exactly that reason: a
+method on that interface would be reachable by any decision code already
+holding the store, without importing `analysis-store.ts` at all -- the
+single-row lookup a settlement write wants to verify still exists on
+`RunOutcomeStore` itself (`persistence/pipeline/run-outcome-store.ts`), not
+on `PipelineStore`.
+
+`supervisor/src/__tests__/architecture.test.ts` enforces the contract with
+two rules. The first names the gate (`pipeline/gates.ts`,
+`pipeline/execution-gates.ts`, `persistence/pipeline/unit-store-phase-reducer.ts`),
+transition (`persistence/pipeline/transition-store.ts`,
+`persistence/pipeline/instance-store.ts`), scheduler (`pipeline/coordinator.ts`,
+`pipeline/unit-coordinator.ts`), and effect-drain (`operations/pipeline-effects.ts`,
+`operations/unit-effects.ts`, `operations/structured-child-runtime.ts`)
+modules explicitly and fails if any of them imports the analysis surface. The
+second confines every `run_outcomes` SQL literal, anywhere in the source
+tree, to exactly `run-outcome-store.ts` (the write path) and
+`analysis-store.ts` (the read surface) -- closing the gap the first rule
+alone leaves open, where a decision module under the `persistence` boundary
+could otherwise read the corpus with a raw query of its own and no import to
+catch.
 
 Schema migrations are transactional, checksum-pinned, and idempotent. Migration
 code may recognize historical direct-run rows solely to reconcile an older

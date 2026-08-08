@@ -91,6 +91,11 @@ describe("analysis store", () => {
     expect(store.listRunOutcomes({ attribution: "provider" }).map((r) => r.pipeline_instance_id)).toEqual([instance2.id]);
     expect(store.listRunOutcomes({ graph: "graph-1" }).map((r) => r.pipeline_instance_id)).toEqual([instance1.id]);
     expect(store.listRunOutcomes({ skillDigest: "builtin://final-review@1" }).map((r) => r.pipeline_instance_id)).toEqual([instance2.id]);
+    // The filter must match the actual 64-char skill_package_digest too, not
+    // just the skill identifier -- a caller distinguishing repository skill
+    // versions has no other way to ask "which runs used exactly this
+    // package" (PR #156 review).
+    expect(store.listRunOutcomes({ skillDigest: "e".repeat(64) }).map((r) => r.pipeline_instance_id)).toEqual([instance2.id]);
     expect(store.listRunOutcomes({}).map((r) => r.pipeline_instance_id).sort()).toEqual([instance1.id, instance2.id].sort());
   });
 
@@ -139,5 +144,20 @@ describe("analysis store", () => {
 
     expect(() => store.listRunOutcomes({ from: "not-a-date" })).toThrow(/from must be an ISO-8601 timestamp/);
     expect(() => store.listRunOutcomes({ to: "not-a-date" })).toThrow(/to must be an ISO-8601 timestamp/);
+  });
+
+  it("rejects a value Date.parse would loosely accept but that is not ISO-8601 shaped", () => {
+    // Date.parse's non-standard fallback parser accepts both of these
+    // (`0` -> epoch, `08/08/2026` -> a valid local date), so relying on
+    // Date.parse alone would silently query an unintended time range
+    // instead of failing closed (PR #156 review).
+    db = setupPipelineStore().db;
+    const store = createAnalysisStore(db);
+
+    expect(() => store.listRunOutcomes({ from: "0" })).toThrow(/from must be an ISO-8601 timestamp/);
+    expect(() => store.listRunOutcomes({ from: "08/08/2026" })).toThrow(/from must be an ISO-8601 timestamp/);
+    expect(() => store.listRunOutcomes({ to: "2026-08-08" })).toThrow(/to must be an ISO-8601 timestamp/);
+    expect(store.listRunOutcomes({ from: "2026-08-08T00:00:00.000Z" })).toEqual([]);
+    expect(store.listRunOutcomes({ from: "2026-08-08T00:00:00+00:00" })).toEqual([]);
   });
 });

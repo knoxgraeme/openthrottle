@@ -6,11 +6,22 @@ import type { RunOutcome } from "../../pipeline/store.js";
 // Read-only evidence for improvement proposals, never a decision input --
 // see docs/SPEC.md "Analysis read-contract". supervisor/src/__tests__/
 // architecture.test.ts forbids every gate, transition, scheduler, and
-// effect-drain module from importing this file, so wire it into the HTTP
-// layer only from a plain `db` handle (persistence/analysis-store.ts, not
-// PipelineStore) -- never add these methods to PipelineStore itself.
+// effect-drain module from importing this file *and* from writing a raw
+// run_outcomes SQL literal of their own, so wire it into the HTTP layer only
+// from a plain `db` handle (persistence/analysis-store.ts, not PipelineStore)
+// -- never add a run_outcomes read method to PipelineStore itself (that is
+// exactly the leak PR #156's review closed: PipelineStore.getRunOutcome was
+// reachable by any code already holding the store gate/transition/scheduler/
+// effect-drain modules depend on, with no import of this file required).
 
 const QUERY_LIMIT = 200;
+
+// Deliberately narrow: requires the 'T' separator and a trailing 'Z' or
+// numeric UTC offset so a loosely-formatted or ambiguous value (`0`,
+// `08/08/2026`) is rejected by shape before Date.parse ever sees it --
+// Date.parse's non-standard fallback parsing accepts both and would
+// otherwise silently query an unintended time range instead of failing closed.
+const ISO_8601_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
 
 export interface AnalysisRunOutcomeQuery {
   outcome?: string;
@@ -29,6 +40,7 @@ export interface AnalysisStore {
 
 function queryTimestamp(value: string | undefined, label: string): string | undefined {
   if (value === undefined) return undefined;
+  if (!ISO_8601_TIMESTAMP.test(value)) throw new Error(`${label} must be an ISO-8601 timestamp`);
   const timestamp = Date.parse(value);
   if (Number.isNaN(timestamp)) throw new Error(`${label} must be an ISO-8601 timestamp`);
   return new Date(timestamp).toISOString();
@@ -73,11 +85,17 @@ export function createAnalysisStore(db: Database.Database): AnalysisStore {
         // skill_digests is a JSON array of {skill, skill_package_digest}
         // (deduped receipt producers -- see run-outcome-store.ts); no side
         // table exists for it, so membership is a json_each predicate.
+        // Matches either property: a caller distinguishing repository skill
+        // versions passes the 64-char skill_package_digest, while a caller
+        // filtering by which skill ran at all (digest-less builtin skills
+        // included) passes the skill identifier -- both are "the skill
+        // digest" for this one filter dimension.
         filters.push(`EXISTS (
           SELECT 1 FROM json_each(run_outcomes.skill_digests) skill_digest
           WHERE json_extract(skill_digest.value, '$.skill') = ?
+             OR json_extract(skill_digest.value, '$.skill_package_digest') = ?
         )`);
-        args.push(query.skillDigest);
+        args.push(query.skillDigest, query.skillDigest);
       }
       if (from) {
         filters.push("created_at >= ?");

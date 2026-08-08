@@ -7,6 +7,7 @@ import { loadPipelineCatalog, parseRepositoryConfig, type PipelineUnitPhaseBindi
 import { openDb } from "../database.js";
 import { createSupervisorStore } from "../store.js";
 import { createPipelineStore } from "./create-store.js";
+import { createRunOutcomeStore } from "./run-outcome-store.js";
 import { catalogPath, runtime, setupPipelineStore, shippedCatalogPath, ticket } from "../../__fixtures__/pipeline-store.js";
 import { parsePipelinePublication } from "../../pipeline/publication.js";
 import type { ExecutionUnitStore } from "./unit-store.js";
@@ -124,7 +125,10 @@ describe("pipeline instance store", () => {
       .toEqual([["provision", "dead"], ["stop", "pending"]]);
     expect(pipelines.getInstanceForSession("session-new")?.status).toBe("dispatchable");
 
-    expect(pipelines.getRunOutcome(oldInstance.id)).toMatchObject({
+    // getRunOutcome is deliberately absent from PipelineStore (see
+    // pipeline/store.ts's read-contract note) -- read straight from
+    // RunOutcomeStore instead.
+    expect(createRunOutcomeStore(db!).getRunOutcome(oldInstance.id)).toMatchObject({
       pipeline_instance_id: oldInstance.id,
       linear_issue_id: oldInstance.linear_issue_id,
       outcome: "superseded",
