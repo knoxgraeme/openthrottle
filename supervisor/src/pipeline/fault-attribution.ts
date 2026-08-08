@@ -46,14 +46,28 @@ export type FaultAttribution = (typeof FAULT_ATTRIBUTIONS)[number];
 // canceled/superseded) -- there is nothing to attribute. `"unknown"` is a
 // first-class result: it is returned whenever the available evidence does
 // not determine a domain, and it is never guessed.
+//
+// launchFaultReason is only trusted when the outcome is
+// retryable_infrastructure_failure. classifyLaunchFailure (launch-failure.mjs)
+// falls back to "engine_crash" whenever no other pattern matches, including
+// for a clean, non-terminated process that simply never produced a proposal
+// -- an agent protocol failure, not a provider fault. That fallback is only
+// distinguishable from a genuine crash by the outcome it produced: a real
+// crash (timeout/signal/exit 137) always resolves to
+// retryable_infrastructure_failure, while the ambiguous clean-exit case
+// resolves to failure. The other four reasons never co-occur with a
+// non-retryable outcome (classifyLaunchFailure marks all of them retryable),
+// so scoping the lookup this way changes nothing for them.
 export function deriveStageFaultAttribution(
   outcome: StageOutcome,
   launchFaultReason?: LaunchFaultReason | null
 ): FaultAttribution | null {
   if (NON_FAULT_OUTCOMES.has(outcome)) return null;
-  if (launchFaultReason === "unregistered_command") return "executor";
-  if (launchFaultReason && PROVIDER_LAUNCH_FAULT_REASONS.has(launchFaultReason)) return "provider";
-  if (outcome === "retryable_infrastructure_failure") return "executor";
+  if (outcome === "retryable_infrastructure_failure") {
+    if (launchFaultReason === "unregistered_command") return "executor";
+    if (launchFaultReason && PROVIDER_LAUNCH_FAULT_REASONS.has(launchFaultReason)) return "provider";
+    return "executor";
+  }
   if (outcome === "semantic_repair_required" || outcome === "failure") return "agent";
   return "unknown";
 }

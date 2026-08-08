@@ -642,6 +642,10 @@ describe("deterministic supervisor stage gates", () => {
   it.each([
     { outcome: "success", faultReason: undefined, expected: null },
     { outcome: "failure", faultReason: undefined, expected: "agent" },
+    // A stale "engine_crash" fallback reason (classifyLaunchFailure's generic
+    // default) must not override a failure outcome into "provider" -- see
+    // fault-attribution.ts's outcome-scoped lookup.
+    { outcome: "failure", faultReason: "engine_crash", expected: "agent" },
     { outcome: "retryable_infrastructure_failure", faultReason: undefined, expected: "executor" },
     { outcome: "retryable_infrastructure_failure", faultReason: "credential_missing", expected: "provider" },
   ] as const)(

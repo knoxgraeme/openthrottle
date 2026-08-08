@@ -11,16 +11,26 @@ describe("deriveStageFaultAttribution", () => {
     }
   });
 
-  it("attributes provider-caused launch failures to provider regardless of outcome", () => {
+  it("attributes provider-caused launch failures to provider on a retryable infrastructure outcome", () => {
     for (const reason of ["credential_missing", "credential_rejected", "rate_limited", "engine_crash"] as const) {
       expect(deriveStageFaultAttribution("retryable_infrastructure_failure", reason)).toBe("provider");
-      expect(deriveStageFaultAttribution("failure", reason)).toBe("provider");
     }
   });
 
-  it("attributes an unregistered_command launch failure to executor", () => {
+  it("attributes an unregistered_command launch failure to executor on a retryable infrastructure outcome", () => {
     expect(deriveStageFaultAttribution("retryable_infrastructure_failure", "unregistered_command")).toBe("executor");
-    expect(deriveStageFaultAttribution("failure", "unregistered_command")).toBe("executor");
+  });
+
+  it("does not let a stale engine_crash fallback reason override a failure outcome", () => {
+    // classifyLaunchFailure (launch-failure.mjs) falls back to "engine_crash"
+    // whenever no other pattern matches, including for a clean, non-terminated
+    // process that simply never produced a proposal -- e.g. exit 0 with a
+    // missing proposal. That case resolves to outcome "failure", not
+    // retryable_infrastructure_failure, so the launch reason must not be
+    // trusted here: the semantic outcome is the agent's, not the provider's.
+    for (const reason of ["credential_missing", "credential_rejected", "rate_limited", "engine_crash", "unregistered_command"] as const) {
+      expect(deriveStageFaultAttribution("failure", reason)).toBe("agent");
+    }
   });
 
   it("attributes retryable infrastructure failures to executor without a launch reason", () => {
