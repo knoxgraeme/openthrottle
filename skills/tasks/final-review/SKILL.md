@@ -112,6 +112,9 @@ recognizable after a repair moves it:
 
 ## The receipt — one `openthrottle.receipt/v1`, `type: "semantic_review"`
 
+- `schema` is exactly `openthrottle.receipt/v1`. This is the receipt's own
+  schema id, not the `schema` value carried by the
+  `## Receipt Authority Contract`, which names the contract, not the receipt.
 - Copy `fence` and `producer` from the `## Receipt Authority Contract`
   verbatim. `fence` holds exactly `pipeline_instance_id`, `graph_digest`,
   `unit_id`, `attempt_id`, `parent_run_id`, `action_attempt_id`, `generation`,
@@ -122,8 +125,10 @@ recognizable after a repair moves it:
   `assurance`; it must never appear inside `producer`.
 - `subject.base` and `subject.pre`: copy from the contract's `subject`. This
   action changes nothing, so `subject.post` is the same value as `subject.pre`.
-- `result`: `success` (nothing blocking), `semantic_repair_required` (at least
-  one `P0`/`P1`), `no_change`, `failure`, or `needs_human`.
+- `result` is a required top-level field, exactly one of `success`,
+  `no_change`, `semantic_repair_required`, `failure`, or `needs_human`:
+  `success` when nothing is blocking, `semantic_repair_required` on at least
+  one `P0`/`P1`.
 - `payload` holds exactly `summary` and `findings`. `summary` gives the verdict
   and the single most important thing to fix; each finding is
   `{severity, message, path}` and no other field. **Rank by severity.**
@@ -138,7 +143,65 @@ the action hard-fails, and only the first ten findings reach the human-visible
 ledger — rank by importance and stay well under every ceiling.
 
 Your final message must be exactly one `openthrottle.receipt/v1` JSON object
-and nothing else — no prose, no code fence. The executor parses the whole final
-message first, then each individual line, so if your engine appends text anyway
-the complete object must still appear on one line. Pretty-printed JSON inside a
-fence is neither, and fails the action.
+and nothing else — no prose, no code fence. The entire final message must parse
+as JSON on its own: any character before or after the object — a sentence, a
+code fence, a sign-off — fails the action. There is no line-level fallback.
+
+**Every list holds plain strings, never objects.** `evidence`, and the payload's
+`verification`, `assumptions`, `decisions`, `issues`, and
+`requested_human_input`, are arrays of strings: write a check as the single
+string `"npm test --prefix supervisor: 266 passed"`, never as
+`{"check": "...", "outcome": "..."}`. The only object-valued lists are
+`findings` (`{severity, message, path}`) and the context-record lists
+(`{unit_id, summary}`), in exactly those shapes.
+
+One complete receipt, for illustration only. Every digest, id, and subject
+below is a placeholder: copy the real values from the contract, never from
+here. The code fence belongs to this document; your final message carries the
+object alone.
+
+```json
+{
+  "schema": "openthrottle.receipt/v1",
+  "type": "semantic_review",
+  "assurance": "semantic_attested",
+  "result": "semantic_repair_required",
+  "producer": {
+    "worker_id": "worker-example",
+    "skill": "builtin://example-skill@1",
+    "capability_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+    "skill_package_digest": null
+  },
+  "subject": {
+    "base": "1111111111111111111111111111111111111111",
+    "pre": "2222222222222222222222222222222222222222",
+    "post": "2222222222222222222222222222222222222222"
+  },
+  "fence": {
+    "pipeline_instance_id": "instance-example",
+    "graph_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+    "unit_id": "__final__",
+    "attempt_id": "attempt-example",
+    "parent_run_id": "run-example",
+    "action_attempt_id": "action-example",
+    "generation": 1,
+    "native_session_id": null,
+    "request_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "evidence": [
+    "test command receipt hash 3333333333333333333333333333333333333333333333333333333333333333",
+    "read src/example/widget.ts and src/example/widget.test.ts end to end"
+  ],
+  "payload": {
+    "summary": "The retry is correct but unbounded on the error path; fix that first.",
+    "findings": [
+      {
+        "severity": "P1",
+        "message": "The retry loop has no ceiling when the call keeps throwing.",
+        "path": "src/example/widget.ts"
+      }
+    ]
+  },
+  "issued_at": "2026-01-01T00:00:00Z"
+}
+```

@@ -85,12 +85,16 @@ Record only checks you actually ran; an unverified repair is a failed repair.
 ## The receipt
 
 Your final message must be exactly one `openthrottle.receipt/v1` JSON object
-and nothing else — no prose, no code fence. The executor parses the whole final
-message first, then each individual line, so if your engine appends text anyway
-the complete object must still appear on one line. Pretty-printed JSON inside a
-fence is neither, and fails the action.
+and nothing else — no prose, no code fence. The entire final message must parse
+as JSON on its own: any character before or after the object — a sentence, a
+code fence, a sign-off — fails the action. There is no line-level fallback.
 
+- `schema` is exactly `openthrottle.receipt/v1`. This is the receipt's own
+  schema id, not the `schema` value carried by the
+  `## Receipt Authority Contract`, which names the contract, not the receipt.
 - `type` is `unit_completion` — a repair returns the same receipt shape.
+- `result` is a required top-level field, exactly one of `success`, `failure`,
+  `needs_human`, or `exited`.
 - Copy `fence` and `producer` from the `## Receipt Authority Contract`
   verbatim. `fence` holds exactly `pipeline_instance_id`, `graph_digest`,
   `unit_id`, `attempt_id`, `parent_run_id`, `action_attempt_id`, `generation`,
@@ -125,6 +129,64 @@ strings of ≤1,000 characters. The payload's prose field (`summary` or
 (≤2,000). The sealed artifact carrying your receipt must stay under 12 KiB or
 the action hard-fails, and only the first ten findings reach the human-visible
 ledger — rank by importance and stay well under every ceiling.
+
+**Every list holds plain strings, never objects.** `evidence`, and the payload's
+`verification`, `assumptions`, `decisions`, `issues`, and
+`requested_human_input`, are arrays of strings: write a check as the single
+string `"npm test --prefix supervisor: 266 passed"`, never as
+`{"check": "...", "outcome": "..."}`. The only object-valued lists are
+`findings` (`{severity, message, path}`) and the context-record lists
+(`{unit_id, summary}`), in exactly those shapes.
+
+One complete receipt, for illustration only. Every digest, id, and subject
+below is a placeholder: copy the real values from the contract and from
+`ot-subject-post`, never from here. The code fence belongs to this document;
+your final message carries the object alone.
+
+```json
+{
+  "schema": "openthrottle.receipt/v1",
+  "type": "unit_completion",
+  "assurance": "semantic_attested",
+  "result": "success",
+  "producer": {
+    "worker_id": "worker-example",
+    "skill": "builtin://example-skill@1",
+    "capability_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+    "skill_package_digest": null
+  },
+  "subject": {
+    "base": "1111111111111111111111111111111111111111",
+    "pre": "1111111111111111111111111111111111111111",
+    "post": "2222222222222222222222222222222222222222"
+  },
+  "fence": {
+    "pipeline_instance_id": "instance-example",
+    "graph_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+    "unit_id": "example_unit",
+    "attempt_id": "attempt-example",
+    "parent_run_id": "run-example",
+    "action_attempt_id": "action-example",
+    "generation": 1,
+    "native_session_id": null,
+    "request_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "evidence": [
+    "src/example/widget.ts: added the bounded retry the unit asked for",
+    "npm test --prefix supervisor: 266 passed, 0 failed"
+  ],
+  "payload": {
+    "summary": "Added the bounded retry and covered both branches.",
+    "verification": ["npm test --prefix supervisor: 266 passed, 0 failed"],
+    "assumptions": [],
+    "decisions": ["Reused the existing backoff helper instead of adding one."],
+    "issues": [],
+    "downstream_context": [],
+    "requested_human_input": []
+  },
+  "issued_at": "2026-01-01T00:00:00Z"
+}
+```
 
 ## Results
 

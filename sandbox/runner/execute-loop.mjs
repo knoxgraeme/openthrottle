@@ -1096,18 +1096,29 @@ export function parseLoopReceipt(raw, env = process.env) {
   const sanitized = sanitizeArtifactText(raw, env).trim();
   if (!sanitized) throw new Error("loop action did not emit a receipt");
   const candidates = [sanitized, ...sanitized.split("\n").map((line) => line.trim()).filter(Boolean).reverse()];
+  // The validator's rejection message is precise ("standard receipt is missing
+  // field schema"); discarding it made OPE-101 cost a full live reproduction to
+  // learn one sentence. Keep the first error from each layer and report the
+  // decisive one. Layer preference matters: the top-layer candidate is the
+  // engine's own stream-json envelope, whose rejection is always the same
+  // uninformative "unknown field subtype". The nested layer is where the
+  // agent-authored receipt actually lives (the `type: "result"` line's `result`
+  // text), so its error is the one that names the real defect.
+  let nestedError = null;
+  let topError = null;
   for (const candidate of candidates) {
     try {
       const parsed = typeof candidate === "string" ? JSON.parse(candidate) : candidate;
       try {
         return validateStandardReceipt(parsed, env);
-      } catch {
+      } catch (error) {
+        topError ??= error;
         for (const nested of receiptCandidatesFromJson(parsed)) {
           try {
             const normalized = typeof nested === "string" ? JSON.parse(nested) : nested;
             return validateStandardReceipt(normalized, env);
-          } catch {
-            // Try the next nested field.
+          } catch (error) {
+            nestedError ??= error;
           }
         }
       }
@@ -1115,7 +1126,9 @@ export function parseLoopReceipt(raw, env = process.env) {
       // Continue searching bounded agent output for the structured receipt.
     }
   }
-  throw new Error("loop action emitted invalid standard receipt");
+  const cause = nestedError ?? topError;
+  const detail = cause instanceof Error ? cause.message : cause ? String(cause) : "";
+  throw new Error(`loop action emitted invalid standard receipt${detail ? `: ${detail}` : ""}`);
 }
 
 function assertLoopReceiptFence(receipt, request, subject) {
@@ -1303,7 +1316,12 @@ export function executeLoopAction({
         ),
       })
       : null;
-    const diagnosticTail = engineFailed
+    // A receipt that fails validation is exactly the case where the engine's
+    // own final message is the only evidence that matters, and it exited 0 so
+    // the engineFailed classification above never fires. Carry the same
+    // bounded, sanitized tail here instead of destroying the one artifact that
+    // explains the failure (OPE-101).
+    const diagnosticTail = engineFailed || receiptError
       ? launchDiagnosticTail({ stdout: execution.stdout, stderr: execution.stderr, env: sanitizeEnv })
       : "";
     // execution.executorFailure means our own prepare/run code already threw
@@ -1320,7 +1338,9 @@ export function executeLoopAction({
       ].filter(Boolean).join(" ")
       : execution.executorFailure
         ? (execution.stderr || subjectError || receiptError || "loop action failed")
-        : subjectError || receiptError || execution.stdout || execution.stderr ||
+        : subjectError ||
+          (receiptError ? [receiptError, diagnosticTail].filter(Boolean).join(" ") : "") ||
+          execution.stdout || execution.stderr ||
           (failed ? "loop action failed" : "loop action completed");
     result = {
       version: 1,
