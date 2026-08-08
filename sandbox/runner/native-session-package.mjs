@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, copyFileSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, relative, resolve, sep } from "node:path";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
@@ -287,8 +287,8 @@ function nativeSessionStorageRelativePath(agent) {
 // OPE-101 gen-7 crash. Same-cycle resume (implement -> simplify) shares one
 // worktree, which is exactly why it worked and hid this.
 const CLAUDE_PROJECT_SLUG_RESERVED = /[^A-Za-z0-9-]/g;
-// The first transcript record carrying a cwd appears within the first few
-// hundred bytes; this only has to bound the read on a multi-MiB transcript.
+// Records carrying a cwd appear within the first few hundred bytes of either
+// end of a transcript; this only has to bound each read on a multi-MiB one.
 const CLAUDE_TRANSCRIPT_CWD_SCAN_BYTES = 64 * 1024;
 
 export function claudeProjectSlug(workingDirectory) {
@@ -298,30 +298,70 @@ export function claudeProjectSlug(workingDirectory) {
   return resolve(workingDirectory).replace(CLAUDE_PROJECT_SLUG_RESERVED, "-");
 }
 
+function transcriptWorkingDirectoriesInWindow(handle, position, length, { dropFirstLine, dropLastLine }) {
+  const buffer = Buffer.alloc(length);
+  const read = readSync(handle, buffer, 0, length, position);
+  const lines = buffer.subarray(0, read).toString("utf8").split(/\r?\n/);
+  // A window that begins or ends mid-record holds a fragment of one, and a
+  // truncated record must not parse as evidence.
+  if (dropLastLine) lines.pop();
+  if (dropFirstLine) lines.shift();
+  const workingDirectories = [];
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const record = JSON.parse(line);
+      if (typeof record.cwd === "string" && ABSOLUTE_PATH.test(record.cwd)) workingDirectories.push(resolve(record.cwd));
+    } catch {
+      // Non-JSON or partial records carry no working-directory evidence.
+    }
+  }
+  return workingDirectories;
+}
+
 // Every Claude transcript record carries the cwd the session runs in, so the
-// sealed directory name and the cwd that produced it both travel inside the
-// package. That pair is what lets alignClaudeProjectDirectory below check its
-// own slug spelling against the CLI that actually wrote the directory instead
-// of assuming they agree.
-function recordedTranscriptWorkingDirectory(transcript) {
+// sealed directory name and the cwds that produced it all travel inside the
+// package. That is what lets alignClaudeProjectDirectory below check its own
+// slug spelling against the CLI that actually wrote the directory instead of
+// assuming they agree.
+//
+// A session that has already been moved once carries more than one cwd: the
+// one it started in at the head of the transcript, and the one the action that
+// resumed it appended from at the tail. Reading only the head reports a
+// location the session left cycles ago -- the OPE-101 gen-9 crash, where the
+// third cycle checked cycle 1's cwd against the directory cycle 2's alignment
+// had already moved the session into, and fell through to the fail-closed
+// branch on a package that was in exactly the right place. The last record is
+// only reachable from the end of a transcript that has outgrown the scan
+// bound, so both ends are read.
+function recordedTranscriptWorkingDirectories(transcript) {
   const handle = openSync(transcript, "r");
   try {
-    const buffer = Buffer.alloc(CLAUDE_TRANSCRIPT_CWD_SCAN_BYTES);
-    const read = readSync(handle, buffer, 0, buffer.length, 0);
-    const lines = buffer.subarray(0, read).toString("utf8").split(/\r?\n/);
-    // A short read consumed the whole file; a full one may have cut the final
-    // record mid-line, and a truncated record must not parse as evidence.
-    if (read === buffer.length) lines.pop();
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const record = JSON.parse(line);
-        if (typeof record.cwd === "string" && ABSOLUTE_PATH.test(record.cwd)) return resolve(record.cwd);
-      } catch {
-        // Non-JSON or partial records carry no working-directory evidence.
-      }
+    const { size } = fstatSync(handle);
+    if (size <= CLAUDE_TRANSCRIPT_CWD_SCAN_BYTES) {
+      const workingDirectories = transcriptWorkingDirectoriesInWindow(handle, 0, size, {
+        dropFirstLine: false,
+        dropLastLine: false,
+      });
+      return { latest: workingDirectories.at(-1) ?? null, workingDirectories };
     }
-    return null;
+    const head = transcriptWorkingDirectoriesInWindow(handle, 0, CLAUDE_TRANSCRIPT_CWD_SCAN_BYTES, {
+      dropFirstLine: false,
+      dropLastLine: true,
+    });
+    const tail = transcriptWorkingDirectoriesInWindow(
+      handle,
+      size - CLAUDE_TRANSCRIPT_CWD_SCAN_BYTES,
+      CLAUDE_TRANSCRIPT_CWD_SCAN_BYTES,
+      { dropFirstLine: true, dropLastLine: false },
+    );
+    return {
+      // A tail window landing entirely inside one oversized record carries no
+      // usable cwd, which the caller reads as "no evidence" rather than as a
+      // location.
+      latest: tail.at(-1) ?? null,
+      workingDirectories: [...head, ...tail],
+    };
   } finally {
     closeSync(handle);
   }
@@ -381,20 +421,28 @@ function alignClaudeProjectDirectory({ projectsRoot, nativeSessionId, workingDir
     pruneSupersededProjectDirectories(projectsRoot, target);
     return target;
   }
-  const recordedWorkingDirectory = recordedTranscriptWorkingDirectory(chosen.transcript);
-  if (recordedWorkingDirectory !== null && recordedWorkingDirectory === resolve(workingDirectory)) {
-    // The sealing CLI named this directory itself, for exactly the cwd this
-    // action will run in. It is already the directory the engine will read,
-    // so leave it alone rather than trusting our slug spelling over the
-    // CLI's own -- this is the case a future slug-convention change would
-    // otherwise turn into a regression on same-cwd resume.
+  const recorded = recordedTranscriptWorkingDirectories(chosen.transcript);
+  if (recorded.latest !== null && recorded.latest === resolve(workingDirectory)) {
+    // The session's most recent action already ran in the cwd this one will,
+    // and the CLI named the directory it is sitting in for exactly that cwd.
+    // It is already the directory the engine will read, so leave it alone
+    // rather than trusting our slug spelling over the CLI's own -- this is the
+    // case a future slug-convention change would otherwise turn into a
+    // regression on same-cwd resume.
     return chosen.projectDirectory;
   }
-  if (recordedWorkingDirectory !== null &&
-    claudeProjectSlug(recordedWorkingDirectory) !== basename(chosen.projectDirectory)) {
-    // The pinned CLI's slug convention moved out from under us. Relocating on
-    // a spelling we can prove wrong would silently reproduce the OPE-101
-    // crash, so fail closed here where the cause is still nameable.
+  if (recorded.workingDirectories.length > 0 &&
+    !recorded.workingDirectories.some((cwd) => claudeProjectSlug(cwd) === basename(chosen.projectDirectory))) {
+    // No cwd in the session's own history spells this directory's name, so
+    // either the pinned CLI's slug convention moved out from under us or the
+    // package is not the one it claims to be. Relocating on a spelling we can
+    // prove wrong would silently reproduce the OPE-101 crash, so fail closed
+    // here where the cause is still nameable.
+    //
+    // A directory an earlier cycle's alignment moved the session into is
+    // corroborated rather than alien: the action that resumed there appended
+    // records carrying that cwd, so the name is still one this convention
+    // produces from the session's own history.
     throw new Error("sealed Claude transcript directory does not follow the pinned CLI project slug convention");
   }
   rmSync(target, { recursive: true, force: true });

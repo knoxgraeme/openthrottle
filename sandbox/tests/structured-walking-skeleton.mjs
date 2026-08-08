@@ -37,6 +37,21 @@ const IMAGE = process.argv[2] ?? "openthrottle:test";
 const STRUCTURED_GRAPH_PATH = join(REPO_ROOT, "supervisor", "graphs", "structured-v1.json");
 const CATALOG_PATH = join(REPO_ROOT, "supervisor", "pipelines", "catalog.yaml");
 const STUB_AGENT_PATH = join(__dirname, "fixtures", "walking-skeleton-agent-stub.mjs");
+// The configured `test` command, shared by the fixture's own .openthrottle.yml
+// and the repository-config snapshot the supervisor seals, so the two can
+// never drift into disagreeing about how many times it fails.
+//
+// It fails its first TWO runs, then passes, so unit_a takes two consecutive
+// repair cycles. One was not enough: a repair cycle gets a fresh worktree, and
+// OPE-101 gen-9 only fired on the SECOND move, when the transcript being
+// restored already carried two different cwds (see alignClaudeProjectDirectory
+// in sandbox/runner/native-session-package.mjs). The count lives in the
+// container's /tmp rather than a worktree, so the failure budget is spent once
+// across the whole run: unit_b's command run and every later scenario's pass
+// on the first try.
+const TEST_COMMAND_COUNT_PATH = "/tmp/ot-walking-skeleton-test-count";
+const TEST_COMMAND = `count=$(cat ${TEST_COMMAND_COUNT_PATH} 2>/dev/null || echo 0); `
+  + `count=$((count + 1)); echo $count > ${TEST_COMMAND_COUNT_PATH}; test $count -gt 2`;
 
 const OPENTHROTTLE_ROOT = "/var/lib/openthrottle";
 const LOOP_ACTION_DIR = "/var/lib/openthrottle/loop-actions";
@@ -189,7 +204,7 @@ function createFixtureRepo(workDir) {
       "  max_turns: 2",
       "  task_timeout: 30",
       "commands:",
-      "  test: \"test -f /tmp/ot-walking-skeleton-test-marker || { touch /tmp/ot-walking-skeleton-test-marker; exit 1; }\"",
+      `  test: "${TEST_COMMAND}"`,
       "  lint: \"true\"",
       "  build: \"true\"",
       "",
@@ -588,7 +603,7 @@ function setupInstance({ db, pipelines, tickets, runtimeDescriptor, fixture, iss
       "    kind: builtin",
       "    ref: core/structured@1",
       "commands:",
-      "  test: \"test -f /tmp/ot-walking-skeleton-test-marker || { touch /tmp/ot-walking-skeleton-test-marker; exit 1; }\"",
+      `  test: "${TEST_COMMAND}"`,
       "  lint: \"true\"",
       "  build: \"true\"",
       "pipelines: { implement: implement }",
@@ -736,11 +751,12 @@ function dumpSettleDiagnostics({ pipelines, instance, attemptId, label }) {
 
 // ---------------------------------------------------------------------------
 // Scenario: happy path -- two ordered stub units through the full sequence,
-// including one deliberate command failure/repair on unit A. Proves RAE8.
+// including two consecutive deliberate command failures/repairs on unit A.
+// Proves RAE8.
 // ---------------------------------------------------------------------------
 
 async function runHappyPath({ db, container, fixture }) {
-  log("scenario: happy path (two units, one command repair)");
+  log("scenario: happy path (two units, two consecutive command repairs)");
   const pipelines = createPipelineStore(db);
   const tickets = createSupervisorStore(db, pipelines);
   const runtimeDescriptor = readRuntimeDescriptor(container);
@@ -790,21 +806,28 @@ async function runHappyPath({ db, container, fixture }) {
   );
 
   const unitAActions = pipelines.listWorkAttempts(attempt.id).filter((action) => action.unit_id === "unit_a");
+  const unitARepairs = unitAActions.filter((action) => action.action_kind === "repair" && action.status === "completed");
   assert(
-    unitAActions.some((action) => action.action_kind === "repair" && action.status === "completed"),
-    "unit_a's deliberately failing first test command did not trigger a repair cycle"
+    unitARepairs.length >= 2,
+    `unit_a's deliberately failing test command must drive two consecutive repair cycles, got ${unitARepairs.length}`
   );
 
   // OPE-101: a repair cycle gets a brand-new worktree, so its resume runs in
   // a different cwd than the action that sealed the session -- and Claude
   // resolves --resume only under its own cwd's project slug. The stub agent
   // refuses a resume it cannot find there, so this run only stays honest
-  // while at least one session is actually resumed across two worktrees. If
-  // the graph ever stopped resuming, or repair reused its cycle-1 worktree,
+  // while a session is actually resumed across successive worktrees. If the
+  // graph ever stopped resuming, or repair reused an earlier cycle's worktree,
   // the whole scenario would go green without exercising the restore at all.
+  //
+  // THREE, not two: one move only proves the transcript can be relocated out
+  // of the directory the CLI itself named. The second move is the one that
+  // restores a transcript an earlier move already relocated -- whose records
+  // now carry two different cwds -- which is the case gen-9 died on and a
+  // single-repair scenario cannot reach.
   assert(
-    [...runtime.resumedSessionWorktrees.values()].some((handles) => handles.size > 1),
-    "no native session was resumed across two different worktrees; the restore relocation is untested"
+    [...runtime.resumedSessionWorktrees.values()].some((handles) => handles.size > 2),
+    "no native session was resumed across three different worktrees; the second restore relocation is untested"
   );
 
   // Every sealed request that carried a worktree handle must be bound to a

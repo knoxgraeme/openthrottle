@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, chownSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, chownSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -2666,6 +2666,99 @@ describe("loop action request validation", () => {
       // Nothing is left behind under the sealing cwd's slug: a superseded copy
       // would be re-sealed and grow the package by a transcript per cycle.
       expect(existsSync(join(projectsRoot, claudeProjectSlug(cycleOneWorktree)))).toBe(false);
+    });
+
+    // One resumed action of the cycle: restore the sealed package into its own
+    // worktree, let the engine append the records it writes there -- every
+    // Claude record carries the cwd it was written in -- and seal the result.
+    // A session that has hopped worktrees therefore carries the older cwd at
+    // the head of its transcript and the newer one at the tail.
+    function resumeAppendAndReseal({ sourceRoot, workingDirectory, records = 2, nativeSessionId = SESSION_ID }) {
+      const profileRoot = mkdtempSync(join(tmpdir(), "ot-claude-cycle-profile-"));
+      directories.push(profileRoot);
+      process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sourceRoot;
+      materializeNativeSessionState({
+        request: { agent: "claude", nativeSessionId, contextPolicy: "resume_required" },
+        profileRoot,
+        workingDirectory,
+      });
+      const projectsRoot = nativeSessionStoragePath("claude", profileRoot);
+      expect(readdirSync(projectsRoot)).toEqual([claudeProjectSlug(workingDirectory)]);
+      appendFileSync(
+        join(projectsRoot, claudeProjectSlug(workingDirectory), `${nativeSessionId}.jsonl`),
+        claudeTranscript(nativeSessionId, workingDirectory, records),
+      );
+      sealNativeSessionPackage({ agent: "claude", nativeSessionId, profileRoot, sourceRoot });
+      return projectsRoot;
+    }
+
+    // OPE-101 gen-9: the structured unit ran two consecutive repair cycles, so
+    // the third cycle restored a package that had already been moved once and
+    // then grown by an engine running in the second worktree. Its transcript
+    // carries two cwds and sits in the directory named for the later one, which
+    // is exactly the shape the convention guard must not mistake for an alien
+    // package.
+    it("resumes a session that has already been moved once and appended to in its new worktree", () => {
+      const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
+      directories.push(sessionRoot);
+      const cycleOne = "/var/lib/openthrottle/worktrees/aaaa1111bbbb2222cccc3333dddd4444";
+      const cycleTwo = "/var/lib/openthrottle/worktrees/eeee5555ffff6666aaaa7777bbbb8888";
+      const cycleThree = "/var/lib/openthrottle/worktrees/99990000888811117777222266663333";
+      sealClaudeSessionForCwd({ sourceRoot: sessionRoot, cwd: cycleOne });
+      resumeAppendAndReseal({ sourceRoot: sessionRoot, workingDirectory: cycleTwo });
+
+      const projectsRoot = restoreInto({ sourceRoot: sessionRoot, workingDirectory: cycleThree });
+
+      const resumedFrom = join(projectsRoot, claudeProjectSlug(cycleThree));
+      expect(readFileSync(join(resumedFrom, `${SESSION_ID}.jsonl`), "utf8"))
+        .toBe(`${claudeTranscript(SESSION_ID, cycleOne)}${claudeTranscript(SESSION_ID, cycleTwo)}`);
+      expect(existsSync(join(resumedFrom, SESSION_ID, "sidechain.jsonl"))).toBe(true);
+      expect(readdirSync(projectsRoot)).toEqual([claudeProjectSlug(cycleThree)]);
+    });
+
+    // Real transcripts run to megabytes, so on a genuine second hop the newer
+    // cwd is only reachable from the end of the file: a head-only scan sees
+    // nothing but the cwd the session started in.
+    it("finds the session's latest working directory past the bounded head scan", () => {
+      const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
+      directories.push(sessionRoot);
+      const cycleOne = "/var/lib/openthrottle/worktrees/aaaa1111bbbb2222cccc3333dddd4444";
+      const cycleTwo = "/var/lib/openthrottle/worktrees/eeee5555ffff6666aaaa7777bbbb8888";
+      const cycleThree = "/var/lib/openthrottle/worktrees/99990000888811117777222266663333";
+      // Well past the 64 KiB the alignment is allowed to read from either end.
+      const cycleOneRecords = 1200;
+      expect(claudeTranscript(SESSION_ID, cycleOne, cycleOneRecords).length).toBeGreaterThan(128 * 1024);
+      sealClaudeSessionForCwd({ sourceRoot: sessionRoot, cwd: cycleOne, records: cycleOneRecords });
+      resumeAppendAndReseal({ sourceRoot: sessionRoot, workingDirectory: cycleTwo });
+
+      const projectsRoot = restoreInto({ sourceRoot: sessionRoot, workingDirectory: cycleThree });
+
+      expect(readdirSync(projectsRoot)).toEqual([claudeProjectSlug(cycleThree)]);
+      expect(readFileSync(join(projectsRoot, claudeProjectSlug(cycleThree), `${SESSION_ID}.jsonl`), "utf8"))
+        .toBe(`${claudeTranscript(SESSION_ID, cycleOne, cycleOneRecords)}${claudeTranscript(SESSION_ID, cycleTwo)}`);
+    });
+
+    it("refuses a multi-cwd transcript whose directory name no recorded cwd spells", () => {
+      const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
+      const profileRoot = mkdtempSync(join(tmpdir(), "ot-claude-alien-profile-"));
+      directories.push(sessionRoot, profileRoot);
+      const cycleOne = "/var/lib/openthrottle/worktrees/aaaa1111bbbb2222cccc3333dddd4444";
+      const cycleTwo = "/var/lib/openthrottle/worktrees/eeee5555ffff6666aaaa7777bbbb8888";
+      // The same two-cwd history a real second hop produces, but sealed under a
+      // name neither cwd spells: a moved session stays explainable by its own
+      // history, an alien or corrupted package does not.
+      const projectDirectory = join(nativeSessionStoragePath("claude", profileRoot), "written-by-some-other-convention");
+      mkdirSync(projectDirectory, { recursive: true });
+      writeFileSync(
+        join(projectDirectory, `${SESSION_ID}.jsonl`),
+        `${claudeTranscript(SESSION_ID, cycleOne)}${claudeTranscript(SESSION_ID, cycleTwo)}`,
+      );
+      sealNativeSessionPackage({ agent: "claude", nativeSessionId: SESSION_ID, profileRoot, sourceRoot: sessionRoot });
+
+      expect(() => restoreInto({
+        sourceRoot: sessionRoot,
+        workingDirectory: "/var/lib/openthrottle/worktrees/99990000888811117777222266663333",
+      })).toThrow(/does not follow the pinned CLI project slug convention/);
     });
 
     it("leaves a session sealed under the same worktree exactly where the engine already looks", () => {
