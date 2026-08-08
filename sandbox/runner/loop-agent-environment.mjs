@@ -66,7 +66,7 @@ function writeCodexAuthFile(codexHome, authJson) {
   }
 }
 
-function prepareActionHomeEnvironment(request, credentialEnv = {}) {
+function prepareActionHomeEnvironment(request, credentialEnv = {}, workingDirectory = null) {
   const currentActionDirectory = actionDirectory(request);
   const home = pathInside(currentActionDirectory, "home");
   resetAgentOwnedDirectory(home);
@@ -77,7 +77,11 @@ function prepareActionHomeEnvironment(request, credentialEnv = {}) {
   if (request.agent === "claude") {
     const profileRoot = pathInside(home, ".claude");
     materializeClaudeProfileBaseline({ destinationHome: profileRoot });
-    materializeNativeSessionState({ request, profileRoot });
+    // `workingDirectory` is this action's own repoDir -- the exact value
+    // runLoopAgentInPreparedRepository hands loopAgentCommand and then spawns
+    // the engine with as its cwd, so the restored transcript lands under the
+    // project slug the resuming engine will look in (OPE-101).
+    materializeNativeSessionState({ request, profileRoot, workingDirectory });
     prepareAgentOwnedDirectory(nativeSessionStoragePath(request.agent, profileRoot));
     if (Object.keys(selectedMcpServers).length > 0) {
       const mcpDir = pathInside(currentActionDirectory, "mcp");
@@ -95,7 +99,9 @@ function prepareActionHomeEnvironment(request, credentialEnv = {}) {
     const codexHome = pathInside(currentActionDirectory, "codex");
     resetAgentOwnedDirectory(codexHome);
     materializeCodexProfileBaseline({ destinationHome: codexHome });
-    materializeNativeSessionState({ request, profileRoot: codexHome });
+    // Codex keys its rollouts by thread id under sessions/, not by cwd, so
+    // its restore needs no working-directory alignment.
+    materializeNativeSessionState({ request, profileRoot: codexHome, workingDirectory });
     prepareAgentOwnedDirectory(nativeSessionStoragePath(request.agent, codexHome));
     // MCP config wiring runs before the auth-file write: appendCodexMcpConfig
     // fails closed for a remote-only server, and that check must not leave
@@ -173,7 +179,7 @@ export { writeCodexAuthFile };
 export function prepareLoopAgentEnvironment(request, repoDir, credentialEnv = {}) {
   const gitObjectEnv = prepareLoopGitObjectEnvironment(request, repoDir);
   const transportEnv = prepareLoopTransportEnvironment(request);
-  const homeEnv = prepareActionHomeEnvironment(request, credentialEnv);
+  const homeEnv = prepareActionHomeEnvironment(request, credentialEnv, repoDir);
   const repositoryViewGitEnv = request.worktree ? [] : gitSafeDirectoryEnv(repoDir);
   const env = [
     "USER=agent", "GIT_OPTIONAL_LOCKS=0",

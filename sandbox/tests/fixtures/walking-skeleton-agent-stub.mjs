@@ -17,9 +17,10 @@
 // without needing to guess.
 
 import { execFileSync } from "node:child_process";
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { extractJsonBlock } from "/opt/openthrottle/runner/json-block.mjs";
+import { claudeProjectSlug } from "/opt/openthrottle/runner/native-session-package.mjs";
 
 // The one path an agent actually has: the installed command, not the module
 // behind it. Importing `computeWorkspaceTreeOid` directly (as this stub used
@@ -46,12 +47,49 @@ function readStdin() {
 // Real Claude Code files each transcript under a per-cwd slug directory
 // (projects/<slug>/<sessionId>.jsonl), not flat in projects/. Mirroring the
 // slug keeps the skeleton exercising collectNativeSessionPackage's recursive
-// walk rather than only its top-level scan.
+// walk rather than only its top-level scan -- and, since resumeOrFail() below
+// reads back the same location, keeps the skeleton honest about the executor
+// having to relocate a restored transcript to this action's own cwd.
+// claudeProjectSlug is imported from the runner rather than re-spelled here
+// so the stub cannot drift from the convention production restores to.
 function nativeSessionTranscriptDir() {
   const home = process.env.HOME;
   if (!home) throw new Error("stub agent requires HOME to materialize its session transcript");
-  const slug = process.cwd().replace(/[^a-zA-Z0-9]+/g, "-");
-  return join(home, ".claude", "projects", slug);
+  return join(home, ".claude", "projects", claudeProjectSlug(process.cwd()));
+}
+
+// The resume id the executor actually asked for, taken from argv exactly
+// where the real CLI takes it (execute-loop.mjs loopAgentCommand appends
+// `--resume <id>` only for invocation.mode === "resume").
+function requestedResumeSessionId(argv) {
+  const index = argv.indexOf("--resume");
+  return index >= 0 ? argv[index + 1] ?? null : null;
+}
+
+// Real `claude --resume <id>` resolves the id ONLY under the project slug for
+// its own cwd, and when it is not there it dies before turn one: exit 1, the
+// bare message on stderr, and a subtype:"error_during_execution" result
+// record on stdout (verified against the pinned CLI 2.1.201). The stub used
+// to fabricate a transcript for whatever id it was handed, so a restore that
+// materialized the session under some *other* cwd's slug still looked like a
+// clean resume here -- which is why OPE-101 shipped through a green
+// walking skeleton. Failing the same way the real engine does makes this
+// harness prove the restore, not just the plumbing around it.
+function resumeOrFail(sessionId) {
+  if (existsSync(join(nativeSessionTranscriptDir(), `${sessionId}.jsonl`))) return;
+  const message = `No conversation found with session ID: ${sessionId}`;
+  process.stderr.write(`${message}\n`);
+  process.stdout.write(`${JSON.stringify({
+    type: "result",
+    subtype: "error_during_execution",
+    is_error: true,
+    num_turns: 0,
+    stop_reason: null,
+    session_id: sessionId,
+    total_cost_usd: 0,
+    errors: [message],
+  })}\n`);
+  process.exit(1);
 }
 
 function writeNativeSessionTranscript(sessionId, contract) {
@@ -153,7 +191,12 @@ function makeDeterministicEdit(cwd, contract) {
 }
 
 function main() {
+  // stdin is drained before the resume fence so a refused resume never leaves
+  // the executor's prompt write hitting a closed pipe -- an EPIPE would show
+  // up as a different launch failure than the one being emulated.
   const prompt = readStdin();
+  const resumeSessionId = requestedResumeSessionId(process.argv);
+  if (resumeSessionId) resumeOrFail(resumeSessionId);
   const firstLine = prompt.split("\n", 1)[0]?.trim() ?? "";
   const skill = firstLine.replace(/^\//, "");
   const contract = extractJsonBlock(prompt, "## Receipt Authority Contract\n");

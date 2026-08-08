@@ -295,6 +295,12 @@ function createDockerSandboxRuntime(container) {
   const cachedChildResults = new Map();
   const worktreeHandles = new Map();
   const dispatchedWorktreeIds = new Set();
+  // Worktree handle each resuming dispatch was sealed against, keyed by the
+  // session it resumed. The stub agent refuses a resume whose transcript is
+  // not under its own cwd's project slug (walking-skeleton-agent-stub.mjs),
+  // so a resume dispatched into a DIFFERENT worktree than the one that
+  // sealed the session is what proves the restore relocates it (OPE-101).
+  const resumedSessionWorktrees = new Map();
   const counters = { createWorktree: 0, dispatchLoopAction: 0, dispatchChildExecutorAction: 0, cleanupWorktree: 0 };
   // The container is genuinely shared across scenarios, but production
   // enforces one pipeline instance per runtime_provider_resource_id -- give
@@ -322,6 +328,7 @@ function createDockerSandboxRuntime(container) {
     counters,
     worktreeHandles,
     dispatchedWorktreeIds,
+    resumedSessionWorktrees,
 
     async provision() {
       return { providerResourceId };
@@ -396,6 +403,11 @@ function createDockerSandboxRuntime(container) {
     async dispatchLoopAction(_resource, request) {
       counters.dispatchLoopAction += 1;
       if (request.worktree?.id) dispatchedWorktreeIds.add(request.worktree.id);
+      if (request.nativeSessionId && request.worktree?.id) {
+        const seen = resumedSessionWorktrees.get(request.nativeSessionId) ?? new Set();
+        seen.add(request.worktree.id);
+        resumedSessionWorktrees.set(request.nativeSessionId, seen);
+      }
       const requestPath = `${LOOP_ACTION_DIR}/${request.attemptId}/${request.actionId}/request.json`;
       const outputPath = `${LOOP_ACTION_DIR}/${request.attemptId}/${request.actionId}/result.json`;
       const credentialsPath = `${LOOP_ACTION_DIR}/${request.attemptId}/${request.actionId}/credentials.json`;
@@ -781,6 +793,18 @@ async function runHappyPath({ db, container, fixture }) {
   assert(
     unitAActions.some((action) => action.action_kind === "repair" && action.status === "completed"),
     "unit_a's deliberately failing first test command did not trigger a repair cycle"
+  );
+
+  // OPE-101: a repair cycle gets a brand-new worktree, so its resume runs in
+  // a different cwd than the action that sealed the session -- and Claude
+  // resolves --resume only under its own cwd's project slug. The stub agent
+  // refuses a resume it cannot find there, so this run only stays honest
+  // while at least one session is actually resumed across two worktrees. If
+  // the graph ever stopped resuming, or repair reused its cycle-1 worktree,
+  // the whole scenario would go green without exercising the restore at all.
+  assert(
+    [...runtime.resumedSessionWorktrees.values()].some((handles) => handles.size > 1),
+    "no native session was resumed across two different worktrees; the restore relocation is untested"
   );
 
   // Every sealed request that carried a worktree handle must be bound to a

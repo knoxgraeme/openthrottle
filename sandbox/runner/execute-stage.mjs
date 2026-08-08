@@ -486,7 +486,11 @@ export function defaultRunAgent({
       discoveryRoot: stageEnvironment.repositorySkillDiscoveryRoot,
     });
     if (request.capability === REPOSITORY_SKILL_CAPABILITY) {
-      materializeNativeSessionState({ request, profileRoot: stageEnvironment.nativeSessionProfileRoot });
+      // `repoDir` is the cwd this stage's engine is spawned with below, which
+      // is what a Claude restore has to be aligned to (OPE-101). A stage keeps
+      // one repoDir across its whole run, so this is a no-op relocation here
+      // and load-bearing only for the per-worktree structured loop path.
+      materializeNativeSessionState({ request, profileRoot: stageEnvironment.nativeSessionProfileRoot, workingDirectory: repoDir });
       rmSync(actionProposalPath, { force: true });
     }
     const prompt = stagePrompt(request, actionProposalPath, { agent, repositorySkillRoot });
