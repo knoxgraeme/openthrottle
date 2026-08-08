@@ -1,0 +1,143 @@
+import type Database from "better-sqlite3";
+import { afterEach, describe, expect, it } from "vitest";
+import { setupPipelineStore, ticket } from "../../__fixtures__/pipeline-store.js";
+import type { PipelineInstance } from "../../pipeline/store.js";
+import { createAnalysisStore } from "./analysis-store.js";
+
+let db: Database.Database | undefined;
+
+afterEach(() => {
+  db?.close();
+  db = undefined;
+});
+
+const TS = "2026-08-08T00:00:00.000Z";
+
+// Reuses the shared pipeline-store fixture (already exercised by
+// instance-store.test.ts et al.) instead of hand-rolling the FK-satisfying
+// tickets/agent_sessions/repository_config_snapshots/pipeline_instances rows
+// run-outcome-store.test.ts's own local seedInstance duplicates elsewhere.
+function seedInstance(setup: ReturnType<typeof setupPipelineStore>, sessionId: string): PipelineInstance {
+  const manifest = setup.catalog.manifests.get("fixture/command@1")!;
+  setup.tickets.upsert({
+    ...ticket(sessionId),
+    pipeline: {
+      repository: "owner/repo",
+      baseCommit: "a".repeat(40),
+      manifest,
+      repositoryConfig: setup.snapshot,
+      runtime: setup.runtime,
+      authorizedCapabilities: manifest.manifest.requires.capabilities,
+      taskType: "implement" as const,
+    },
+  });
+  return setup.pipelines.getInstanceForSession(sessionId)!;
+}
+
+function seedRunOutcome(
+  database: Database.Database,
+  instance: PipelineInstance,
+  overrides: {
+    outcome?: string;
+    closedReason?: string;
+    faultAttribution?: string | null;
+    executionGraphId?: string | null;
+    skillDigests?: Array<{ skill: string; skill_package_digest: string | null }>;
+    createdAt?: string;
+  } = {}
+): void {
+  database.prepare(`
+    INSERT INTO run_outcomes (
+      pipeline_instance_id, linear_issue_id, generation, execution_graph_id, plan_digest,
+      base_commit, engine, outcome, closed_reason, fault_attribution, generations_consumed,
+      repair_rounds_by_unit, phase_durations_ms, token_cost_usd, skill_digests, created_at
+    ) VALUES (?, ?, 1, ?, NULL, '${"a".repeat(40)}', 'claude', ?, ?, ?, 1, '{}', '{}', NULL, ?, ?)
+  `).run(
+    instance.id,
+    instance.linear_issue_id,
+    overrides.executionGraphId ?? null,
+    overrides.outcome ?? "shipped",
+    overrides.closedReason ?? "success",
+    overrides.faultAttribution ?? null,
+    JSON.stringify(overrides.skillDigests ?? []),
+    overrides.createdAt ?? TS
+  );
+}
+
+describe("analysis store", () => {
+  it("filters run_outcomes by outcome, reason, attribution, graph, and skill digest", () => {
+    const setup = setupPipelineStore();
+    db = setup.db;
+    const instance1 = seedInstance(setup, "session-1");
+    const instance2 = seedInstance(setup, "session-2");
+    seedRunOutcome(db, instance1, {
+      outcome: "shipped",
+      closedReason: "success",
+      executionGraphId: "graph-1",
+      skillDigests: [{ skill: "builtin://ce/implement@1", skill_package_digest: null }],
+    });
+    seedRunOutcome(db, instance2, {
+      outcome: "failed",
+      closedReason: "failure",
+      faultAttribution: "provider",
+      executionGraphId: "graph-2",
+      skillDigests: [{ skill: "builtin://final-review@1", skill_package_digest: "e".repeat(64) }],
+    });
+
+    const store = createAnalysisStore(db);
+
+    expect(store.listRunOutcomes({ outcome: "shipped" }).map((r) => r.pipeline_instance_id)).toEqual([instance1.id]);
+    expect(store.listRunOutcomes({ reason: "failure" }).map((r) => r.pipeline_instance_id)).toEqual([instance2.id]);
+    expect(store.listRunOutcomes({ attribution: "provider" }).map((r) => r.pipeline_instance_id)).toEqual([instance2.id]);
+    expect(store.listRunOutcomes({ graph: "graph-1" }).map((r) => r.pipeline_instance_id)).toEqual([instance1.id]);
+    expect(store.listRunOutcomes({ skillDigest: "builtin://final-review@1" }).map((r) => r.pipeline_instance_id)).toEqual([instance2.id]);
+    expect(store.listRunOutcomes({}).map((r) => r.pipeline_instance_id).sort()).toEqual([instance1.id, instance2.id].sort());
+  });
+
+  it("filters run_outcomes by an inclusive created_at time range", () => {
+    const setup = setupPipelineStore();
+    db = setup.db;
+    const instance1 = seedInstance(setup, "session-1");
+    const instance2 = seedInstance(setup, "session-2");
+    seedRunOutcome(db, instance1, { createdAt: "2026-08-01T00:00:00.000Z" });
+    seedRunOutcome(db, instance2, { createdAt: "2026-08-08T00:00:00.000Z" });
+
+    const store = createAnalysisStore(db);
+
+    expect(
+      store.listRunOutcomes({ from: "2026-08-05T00:00:00.000Z" }).map((r) => r.pipeline_instance_id)
+    ).toEqual([instance2.id]);
+    expect(
+      store.listRunOutcomes({ to: "2026-08-05T00:00:00.000Z" }).map((r) => r.pipeline_instance_id)
+    ).toEqual([instance1.id]);
+  });
+
+  it("clamps an oversized limit to the query cap and keeps at least one row", () => {
+    const setup = setupPipelineStore();
+    db = setup.db;
+    const instance1 = seedInstance(setup, "session-1");
+    seedRunOutcome(db, instance1);
+
+    const store = createAnalysisStore(db);
+
+    expect(store.listRunOutcomes({ limit: 100_000 })).toHaveLength(1);
+    expect(store.listRunOutcomes({ limit: 0 })).toHaveLength(1);
+  });
+
+  it("rejects an unrecognized outcome, reason, or attribution instead of silently matching nothing", () => {
+    db = setupPipelineStore().db;
+    const store = createAnalysisStore(db);
+
+    expect(() => store.listRunOutcomes({ outcome: "not_a_real_outcome" })).toThrow(/outcome must be one of/);
+    expect(() => store.listRunOutcomes({ reason: "not_a_real_reason" })).toThrow(/reason must be one of/);
+    expect(() => store.listRunOutcomes({ attribution: "not_a_real_attribution" })).toThrow(/attribution must be one of/);
+  });
+
+  it("rejects a malformed time filter", () => {
+    db = setupPipelineStore().db;
+    const store = createAnalysisStore(db);
+
+    expect(() => store.listRunOutcomes({ from: "not-a-date" })).toThrow(/from must be an ISO-8601 timestamp/);
+    expect(() => store.listRunOutcomes({ to: "not-a-date" })).toThrow(/to must be an ISO-8601 timestamp/);
+  });
+});

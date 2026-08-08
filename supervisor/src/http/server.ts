@@ -47,12 +47,18 @@ import { canSteerPipelineRun, requestPipelineStop } from "../pipeline/control.js
 import { stageById } from "../pipeline/manifest.js";
 import type { PipelineStore } from "../pipeline/store.js";
 import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
+import type { AnalysisStore } from "../persistence/pipeline/analysis-store.js";
 import type { RuntimeInventory, RuntimeLogs, RuntimeSnapshotReadiness } from "../runtime/contracts.js";
 
 export interface ServerDeps {
   cfg: Config;
   store: SupervisorStore;
   runtime: RuntimeLogs & RuntimeSnapshotReadiness & RuntimeInventory;
+  // A plain read-only handle onto run_outcomes/receipt evidence, wired
+  // directly off `db` in index.ts -- deliberately not part of
+  // pipelineCoordinator.store (PipelineStore), which gate/transition/
+  // scheduler/effect-drain code consumes. See analysis-store.ts.
+  analysisStore: AnalysisStore;
   runBackground?: (task: Promise<void>) => void;
   getLinearClient?: () => Promise<LinearClient | undefined>;
   deliveryProcessor?: WebhookDeliveryProcessor;
@@ -327,6 +333,33 @@ export function createServer(deps: ServerDeps): Hono {
           repository,
           from,
           to,
+          limit: limit ? Number(limit) : undefined,
+        }),
+      });
+    } catch (error) {
+      return context.json({ error: sanitizeText(String(error)) }, 400);
+    }
+  });
+
+  // Read-only evidence for improvement proposals: run_outcomes and the
+  // receipt data folded into it (see docs/SPEC.md "Analysis read-contract").
+  // Never consumed by gate, transition, scheduler, or effect-drain code --
+  // enforced by supervisor/src/__tests__/architecture.test.ts.
+  app.get("/analysis/runs", (context) => {
+    if (!requireStatusAuth(context.req.header("Authorization"))) {
+      return context.json({ error: "unauthorized" }, 401);
+    }
+    const limit = context.req.query("limit");
+    try {
+      return context.json({
+        runs: deps.analysisStore.listRunOutcomes({
+          outcome: context.req.query("outcome"),
+          reason: context.req.query("reason"),
+          attribution: context.req.query("attribution"),
+          graph: context.req.query("graph"),
+          skillDigest: context.req.query("skill_digest"),
+          from: context.req.query("from"),
+          to: context.req.query("to"),
           limit: limit ? Number(limit) : undefined,
         }),
       });
