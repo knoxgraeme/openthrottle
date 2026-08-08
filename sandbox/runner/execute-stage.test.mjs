@@ -572,6 +572,10 @@ describe("one-stage executor", () => {
     });
     expect(result.outcome).toBe("failure");
     expect(JSON.parse(result.artifacts[0].payload).summary).toMatch(/without the required terminal/);
+    // A clean, non-terminated exit falls through classifyLaunchFailure's
+    // generic "engine_crash" fallback; that is not evidence of an actual
+    // crash, so it must not be surfaced as a structured fault reason.
+    expect(result.faultReason).toBeNull();
   });
 
   it("turns an invalid terminal proposal into typed failure evidence", () => {
@@ -1451,6 +1455,25 @@ exit 1
       severity: "P2",
       code: "publish-reconciliation-incomplete",
     }));
+  });
+
+  it("does not report engine_crash as the fault reason for a clean publish exit with no proposal", () => {
+    // reconcilePublication forces retryable_infrastructure_failure for any
+    // missing proposal regardless of whether the process actually crashed --
+    // unlike other capabilities, outcome alone can't disambiguate a genuine
+    // crash from a clean exit here, so the classifier's generic fallback
+    // reason must not ride along as fault evidence.
+    const input = publishFixture();
+    addBareOrigin(input, { push: true });
+
+    const result = executeStage({
+      ...input,
+      runAgent: () => ({ exitCode: 0, nativeSessionId: "publish-session" }),
+      now: clock(),
+    });
+
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+    expect(result.faultReason).toBeNull();
   });
 
   it("retains blocking findings from a valid publish-success proposal", () => {

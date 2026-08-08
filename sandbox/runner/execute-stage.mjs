@@ -842,6 +842,11 @@ export function executeStage({
   }
   let nativeSessionId = request.nativeSessionId;
   let artifacts;
+  // Populated only when classifyAgentExecutionFailure identifies a launch
+  // failure (see LAUNCH_FAILURE_REASONS in launch-failure.mjs); carried on the
+  // stage_result event so the supervisor can attribute the terminal outcome's
+  // fault domain instead of guessing from prose.
+  let faultReason = null;
   if (contract.kind === "command") {
     const commandName = request.commandName ?? request.stageId;
     if (!COMMAND_NAME.test(commandName)) throw new Error(`stage ${request.stageId} does not select a valid repository command`);
@@ -950,6 +955,19 @@ export function executeStage({
     const classifiedFailure = incompleteAgentExecution
       ? classifyIncompleteAgentExecution({ execution, request, proposal, redactionEnv })
       : null;
+    // "engine_crash" is classifyLaunchFailure's generic fallback, not
+    // evidence of an actual crash -- it is reported the same way for a clean,
+    // non-terminated exit (e.g. missing proposal) as for a genuine kill. A
+    // publish stage's reconcilePublication independently forces
+    // retryable_infrastructure_failure for any missing proposal, so outcome
+    // alone can't disambiguate this case downstream the way it can for other
+    // capabilities. Withhold the fallback reason here, at the only place that
+    // still has the raw termination signal, rather than trusting it as
+    // provider-caused fault evidence.
+    const terminated = execution.timedOut || execution.signal || execution.exitCode === 137;
+    faultReason = classifiedFailure && (classifiedFailure.reason !== "engine_crash" || terminated)
+      ? classifiedFailure.reason
+      : null;
     if (request.capability === "ce/publish@1" && classifiedFailure?.credentialFailure) {
       proposal = failureProposal(classifiedFailure.summary, classifiedFailure.suggestedOutcome);
     } else if (request.capability === "ce/publish@1") {
@@ -1005,6 +1023,7 @@ export function executeStage({
     subject: stageResult.subject ?? null,
     artifacts,
     completedAt: payload.completed_at,
+    faultReason,
   };
 }
 
@@ -1024,6 +1043,7 @@ export function buildStageResultEvent({ request, result }) {
     result_hash: result.artifacts.find((artifact) => artifact.kind === "stage_result").hash,
     native_session_id: result.nativeSessionId,
     subject: result.subject,
+    ...(result.faultReason ? { fault_reason: result.faultReason } : {}),
     artifacts: result.artifacts.map((artifact) => ({
       kind: artifact.kind,
       schema_version: artifact.schemaVersion,

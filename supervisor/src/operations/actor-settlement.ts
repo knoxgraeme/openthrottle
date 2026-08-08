@@ -1,4 +1,5 @@
 import type { Run, Ticket, SupervisorStore } from "../persistence/store.js";
+import type { FaultAttribution } from "../pipeline/fault-attribution.js";
 import type { RuntimeStopper } from "../runtime/contracts.js";
 import { sanitizeText } from "../shared/sanitize.js";
 
@@ -17,6 +18,10 @@ export async function terminateAndSettleActor(params: {
   sandboxId: string | null;
   owner: string;
   reason: string;
+  // Stamped on the run alongside settlement_reason at reaping-claim time (see
+  // run-store.ts claimRunForReapingTransaction). The caller already knows why
+  // it is terminating this actor, so it is required rather than derived here.
+  faultAttribution: FaultAttribution;
   status: "timed_out" | "stopped";
   ticketState?: Ticket["state"];
   failureTail?: string;
@@ -26,7 +31,12 @@ export async function terminateAndSettleActor(params: {
   onTerminated?: () => void;
   onSettled?: (run: Run) => void;
 }): Promise<ActorSettlementResult> {
-  const claimed = params.store.claimRunForReaping(params.runId, params.owner, params.reason);
+  const claimed = params.store.claimRunForReaping(
+    params.runId,
+    params.owner,
+    params.reason,
+    params.faultAttribution
+  );
   if (!claimed) return { kind: "lost" };
 
   try {

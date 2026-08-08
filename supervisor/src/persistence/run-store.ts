@@ -1,7 +1,8 @@
 import type Database from "better-sqlite3";
 import type { TaskType } from "../pipeline/types.js";
+import type { FaultAttribution } from "../pipeline/fault-attribution.js";
 import type { WorkStore } from "./work-store.js";
-import type { FinishRunParams, Run, Ticket } from "./store.js";
+import type { DirectFinishRunParams, FinishRunParams, Run, Ticket } from "./store.js";
 
 export interface RunStore {
   listRunning(): Ticket[];
@@ -14,9 +15,14 @@ export interface RunStore {
   }): boolean;
   getRun(runId: string): Run | undefined;
   getLatestRunWithLog(issueId: string): Run | undefined;
-  finishRun(params: FinishRunParams): Run | undefined;
-  finishRunAndThen<T>(params: FinishRunParams, after: () => T): T;
-  claimRunForReaping(runId: string, owner: string, reason: string): Run | undefined;
+  finishRun(params: DirectFinishRunParams): Run | undefined;
+  finishRunAndThen<T>(params: DirectFinishRunParams, after: () => T): T;
+  claimRunForReaping(
+    runId: string,
+    owner: string,
+    reason: string,
+    faultAttribution: FaultAttribution
+  ): Run | undefined;
   finishReapingRun(params: FinishRunParams & { owner: string }): Run | undefined;
   finishReapingRunAndThen(
     params: FinishRunParams & { owner: string },
@@ -156,7 +162,7 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
       return true;
     }
   );
-  const finishRunTransaction = db.transaction((params: FinishRunParams): Run | undefined => {
+  const finishRunTransaction = db.transaction((params: DirectFinishRunParams): Run | undefined => {
     const existing = getRunStmt.get(params.runId) as Run | undefined;
     if (!existing || existing.status !== "running") return undefined;
     const completedAt = now();
@@ -202,9 +208,9 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
     settleRunningAttemptActorStmt.run(params.status, completedAt, params.runId, params.runId);
     db.prepare(`
       UPDATE runs
-      SET actor_state = 'settled', settlement_reason = ?, actor_updated_at = ?
+      SET actor_state = 'settled', settlement_reason = ?, fault_attribution = ?, actor_updated_at = ?
       WHERE id = ? AND actor_state = 'running'
-    `).run(params.status, completedAt, params.runId);
+    `).run(params.status, params.faultAttribution ?? null, completedAt, params.runId);
     workStore.consumeAcknowledgedForRun(params.runId, params.runId);
     workStore.releaseUnacknowledgedForRun(
       params.runId,
@@ -213,7 +219,7 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
     return getRunStmt.get(params.runId) as Run;
   });
   const claimRunForReapingTransaction = db.transaction(
-    (runId: string, owner: string, reason: string): Run | undefined => {
+    (runId: string, owner: string, reason: string, faultAttribution: FaultAttribution): Run | undefined => {
       const timestamp = now();
       const existing = getRunStmt.get(runId) as Run | undefined;
       if (existing?.status === "reaping") {
@@ -228,9 +234,9 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
       claimAttemptActorForReapingStmt.run(owner, reason, timestamp, runId, runId);
       const liveness = db.prepare(`
         UPDATE runs
-        SET actor_state = 'reaping', settlement_owner = ?, settlement_reason = ?, actor_updated_at = ?
+        SET actor_state = 'reaping', settlement_owner = ?, settlement_reason = ?, fault_attribution = ?, actor_updated_at = ?
         WHERE id = ? AND actor_state = 'running'
-      `).run(owner, reason, timestamp, runId);
+      `).run(owner, reason, faultAttribution, timestamp, runId);
       if (liveness.changes !== 1) throw new Error(`run ${runId} has inconsistent actor state`);
       return getRunStmt.get(runId) as Run;
     }
@@ -396,8 +402,8 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
         return after();
       }).immediate();
     },
-    claimRunForReaping(runId, owner, reason) {
-      return claimRunForReapingTransaction.immediate(runId, owner, reason);
+    claimRunForReaping(runId, owner, reason, faultAttribution) {
+      return claimRunForReapingTransaction.immediate(runId, owner, reason, faultAttribution);
     },
     finishReapingRun(params) {
       return finishReapingRunTransaction.immediate(params);

@@ -25,6 +25,7 @@ import {
   accumulatedPublicationRepairSource,
   buildStagePublication,
 } from "./publication.js";
+import type { LaunchFaultReason } from "./fault-attribution.js";
 
 export interface PipelineEventArtifact {
   id?: string;
@@ -56,6 +57,10 @@ export interface PipelineCoordinatorEvent {
   subject?: string | null;
   providerRevision?: string;
   nativeSessionId?: string | null;
+  // Additive/optional: only set when the sandbox classified a launch failure
+  // for this stage_result (see runtime/events.ts). Read by settlement.ts to
+  // derive the run's fault_attribution; it has no receipt or fencing meaning.
+  faultReason?: LaunchFaultReason;
   controlTicketState?: "stopped" | "closed";
   exhaustedEffectId?: string;
   exhaustedEffectError?: string;

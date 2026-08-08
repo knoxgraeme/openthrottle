@@ -3291,10 +3291,11 @@ describe("execution unit store", () => {
 
     // A gate decision cannot smuggle a secret (or any other free-text value)
     // through `reason` into a durable receipt or Linear-visible publication
-    // event: the CHECK-enforced closed vocabulary rejects it before either
-    // write even happens, which is a stronger guarantee than redacting it
-    // after the fact. This simulates a decision built outside the type
-    // system's guardrails (e.g. a bug in a future producer).
+    // event: insertGateReceipt's fail-closed vocabulary check rejects it
+    // before either write even happens (and the DB CHECK constraint still
+    // backstops it independently), which is a stronger guarantee than
+    // redacting it after the fact. This simulates a decision built outside
+    // the type system's guardrails (e.g. a bug in a future producer).
     expect(() => store.completeGatedAction({
       actionId: lead.id,
       resultHash: "rl",
@@ -3305,7 +3306,7 @@ describe("execution unit store", () => {
         subject,
         reason: "leaked credential Bearer sk-live-abcdef1234567890" as GateReceiptReason,
       }),
-    })).toThrow(/CHECK constraint failed/);
+    })).toThrow(/unrecognized reason/);
     expect(publicationEvents("attempt-parent")).toHaveLength(0);
 
     // The throw rolls back the whole transaction, so a retry with a real,
