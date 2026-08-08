@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { runGitAsExecutor } from "./repository-control.mjs";
+import { removeWorktreeBootstrapMarker } from "./worktree-bootstrap.mjs";
 import { chmodOwnerPrivateTree, chmodTree, chownTree, ensureSandboxRootTraversal, ensureTraverseOnlyDirectory, identityForUser, isRoot, pathInside as containedPath } from "./filesystem-isolation.mjs";
 
 const HANDLE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -162,6 +163,7 @@ export function createWorktree({
   baseCommit,
   hooksPath = HOOKS_PATH,
   idempotent = false,
+  markerRootDir = undefined,
 }) {
   const safeBase = commit(baseCommit, "worktree base commit");
   const target = worktreePath({ rootDir, handle });
@@ -173,6 +175,9 @@ export function createWorktree({
   const head = runGitAsExecutor(repoDir, ["rev-parse", "HEAD"]);
   if (head !== safeBase) throw new Error("integration checkout HEAD does not match requested worktree base");
   prepareWorktreeRoot(rootDir);
+  // A fresh checkout has no dependency state yet: a bootstrap marker left by
+  // an earlier same-handle worktree must not let this one skip bootstrap.
+  removeWorktreeBootstrapMarker({ ...(markerRootDir === undefined ? {} : { markerRootDir }), handle });
   try {
     runGitAsExecutor(repoDir, ["worktree", "add", "--detach", target, safeBase]);
     runGitAsExecutor(target, ["config", "extensions.worktreeConfig", "true"]);
@@ -233,9 +238,13 @@ export function deriveCandidateCommit({
   }
 }
 
-export function removeWorktree({ repoDir, rootDir = DEFAULT_ROOT, handle }) {
+export function removeWorktree({ repoDir, rootDir = DEFAULT_ROOT, handle, markerRootDir = undefined }) {
   const target = worktreePath({ rootDir, handle });
-  if (!existsSync(target)) return { id: safeHandle(handle), removed: false };
+  const markerArgs = { ...(markerRootDir === undefined ? {} : { markerRootDir }), handle };
+  if (!existsSync(target)) {
+    removeWorktreeBootstrapMarker(markerArgs);
+    return { id: safeHandle(handle), removed: false };
+  }
   try {
     runGitAsExecutor(repoDir, ["worktree", "remove", "--force", target]);
   } catch (error) {
@@ -245,11 +254,14 @@ export function removeWorktree({ repoDir, rootDir = DEFAULT_ROOT, handle }) {
       .split(/\n(?=worktree )/)
       .some((entry) => entry.split("\n")[0] === `worktree ${target}`);
     if (registered || existsSync(target)) {
+      // The worktree may still exist, so its bootstrap marker stays valid.
       throw new Error(`stale worktree cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
     }
+    removeWorktreeBootstrapMarker(markerArgs);
     return { id: safeHandle(handle), removed: true, recovered: true };
   }
   rmSync(target, { recursive: true, force: true });
+  removeWorktreeBootstrapMarker(markerArgs);
   return { id: safeHandle(handle), removed: true };
 }
 

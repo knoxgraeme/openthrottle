@@ -303,6 +303,8 @@ export function resolveContextInvocation(request) {
     : { mode: "fresh", nativeSessionId: null, reconstructed: true, readOnly: false };
 }
 
+export const REPOSITORY_COMMAND_TIMEOUT_MS = 7_200_000;
+
 export function defaultExecuteCommand({ command, repoDir, timeoutMs }) {
   if (!command) return { notConfigured: true, exitCode: null, signal: null, timedOut: false, stdout: "", stderr: "" };
   const result = runWithAgentProcessFence(

@@ -297,6 +297,22 @@ validation, and the per-stage scrub of ignored agent-executable config
 surfaces remain per-run; ignored dependency state installed by the bake-once
 bootstrap persists for the sandbox lifetime under the recorded digest.
 
+That bake-once dependency state covers only the integration checkout.
+Structured unit and final-repair worktrees are created bare (`git worktree
+add --detach`) and inherit none of it, so before the first repository command
+executes in a unit worktree the child executor re-runs the sealed config's
+`post_bootstrap` commands inside that worktree, as the agent user under the
+same process fence and bounded output/timeout as the command itself. The
+re-run happens once per worktree under a root-owned marker recording the
+sealed repository-config digest; a digest-mismatched or unreadable marker
+fails closed. A started-but-incomplete marker also fails closed so replay
+cannot repeat arbitrary bootstrap side effects in-place; removing or freshly
+recreating a worktree clears its marker and permits one new attempt. A
+worktree bootstrap failure is a retryable infrastructure failure
+for that child action — never a command receipt — so it cannot consume a
+semantic repair round. Graph-scoped final commands carry no worktree and run
+in the bake-once-bootstrapped integration checkout.
+
 The executor runs exactly one stage:
 
 - agent capabilities invoke the appropriate OpenThrottle adapter and native CE
@@ -853,7 +869,9 @@ the exact base commit, strictly validated, normalized, hashed, and uploaded as a
 sealed snapshot. Registered repositories are trusted for code execution because
 `post_bootstrap` is arbitrary code. `post_bootstrap` runs once per sandbox
 lifetime under the bake-once marker (see Sandbox stage contract), not once per
-stage.
+stage, plus once per structured unit worktree before the first repository
+command executes there — it is the repository's declared way to make any
+fresh checkout runnable, and unit worktrees are fresh checkouts.
 
 ## CLI contract
 

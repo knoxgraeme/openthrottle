@@ -11,6 +11,7 @@ import {
   removeWorktree,
   worktreePath,
 } from "./worktrees.mjs";
+import { ensureWorktreeBootstrap, worktreeBootstrapMarkerPath } from "./worktree-bootstrap.mjs";
 
 const directories = [];
 
@@ -132,6 +133,35 @@ describe("executor-owned worktrees", () => {
       id: "unit-a",
       removed: false,
     });
+  });
+
+  it("clears the bootstrap marker on removal and on fresh creation so a recreated handle bootstraps again", () => {
+    const repoDir = repository();
+    const rootDir = mkdtempSync(join(tmpdir(), "ot-worktrees-"));
+    directories.push(rootDir);
+    const markerRootDir = mkdtempSync(join(tmpdir(), "ot-worktree-markers-"));
+    directories.push(markerRootDir);
+    const baseCommit = git(repoDir, ["rev-parse", "HEAD"]);
+    const sealMarker = () => ensureWorktreeBootstrap({
+      worktreeDir: worktreePath({ rootDir, handle: "unit-a" }),
+      handle: "unit-a",
+      config: { post_bootstrap: ["true"] },
+      configDigest: "a".repeat(64),
+      markerRootDir,
+      executeCommand: () => ({ exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" }),
+    });
+    const markerPath = worktreeBootstrapMarkerPath({ markerRootDir, handle: "unit-a" });
+
+    createWorktree({ repoDir, rootDir, handle: "unit-a", baseCommit, markerRootDir });
+    sealMarker();
+    removeWorktree({ repoDir, rootDir, handle: "unit-a", markerRootDir });
+    expect(existsSync(markerPath)).toBe(false);
+
+    // A marker left behind by any earlier same-handle worktree must not let
+    // a freshly created (dependency-free) worktree skip its bootstrap.
+    sealMarker();
+    createWorktree({ repoDir, rootDir, handle: "unit-a", baseCommit, markerRootDir });
+    expect(existsSync(markerPath)).toBe(false);
   });
 
   it("recovers a stale worktree registration when normal removal fails", () => {

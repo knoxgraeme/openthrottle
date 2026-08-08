@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -45,12 +45,13 @@ function childExecutorRequest(overrides = {}) {
   };
 }
 
-function useRepositoryConfig(commands) {
+function useRepositoryConfig(commands, extra = {}) {
   const configDir = mkdtempSync(join(tmpdir(), "ot-child-action-config-"));
   directories.push(configDir);
   const configPath = join(configDir, "repository-config.json");
-  writeFileSync(configPath, JSON.stringify({ commands }));
+  writeFileSync(configPath, JSON.stringify({ commands, ...extra }));
   process.env.OT_STAGE_CONFIG_FILE = configPath;
+  return configPath;
 }
 
 describe("child executor action", () => {
@@ -369,6 +370,120 @@ describe("child executor action", () => {
       computeSubject: () => "3".repeat(40),
     })).toThrow(/command launch failed/);
     expect(lockWorktreeHandle).toHaveBeenCalledWith({ rootDir: "/var/lib/openthrottle/worktrees", handle: "worktree-1" });
+  });
+
+  it("bootstraps a granted unit worktree from the sealed post_bootstrap before the repository command", () => {
+    const configFile = useRepositoryConfig({ test: "npm test" }, { post_bootstrap: ["npm ci"] });
+
+    const events = [];
+    let bootstrapInput = null;
+    const executeCommand = ({ command, repoDir }) => {
+      events.push(`command:${command}:${repoDir}`);
+      return { exitCode: 0, signal: null, timedOut: false, stdout: "ok", stderr: "" };
+    };
+    const request = childExecutorRequest({ commandName: "test" });
+    const result = executeChildAction({
+      request,
+      grantWorktree: ({ handle }) => {
+        events.push(`grant:${handle}`);
+        return { id: handle, path: `/tmp/${handle}`, writable: true };
+      },
+      bootstrapWorktree: (input) => {
+        events.push(`bootstrap:${input.worktreeDir}:${input.handle}`);
+        bootstrapInput = input;
+        return { bootstrapped: true, commands: 1 };
+      },
+      executeCommand,
+      computeSubject: (repoDir) => {
+        events.push(`subject:${repoDir}`);
+        return "3".repeat(40);
+      },
+      lockWorktreeHandle: ({ handle }) => {
+        events.push(`lock:${handle}`);
+      },
+    });
+
+    expect(events).toEqual([
+      "grant:worktree-1",
+      "bootstrap:/tmp/worktree-1:worktree-1",
+      "command:npm test:/tmp/worktree-1",
+      "subject:/tmp/worktree-1",
+      "lock:worktree-1",
+    ]);
+    expect(result.outcome).toBe("success");
+    // The bootstrap must run the sealed config's commands through the exact
+    // same fenced executor as the repository command, under the sealed
+    // config digest, so its execution surface can never drift.
+    expect(bootstrapInput.executeCommand).toBe(executeCommand);
+    expect(bootstrapInput.commandTimeoutMs).toBe(7_200_000);
+    expect(bootstrapInput.config).toMatchObject({ post_bootstrap: ["npm ci"] });
+    expect(bootstrapInput.configDigest).toBe(digest(readFileSync(configFile, "utf8")));
+  });
+
+  it("classifies a worktree bootstrap failure as retryable infrastructure and relocks without a command receipt", () => {
+    useRepositoryConfig({ test: "npm test" }, { post_bootstrap: ["npm ci"] });
+
+    const events = [];
+    const request = childExecutorRequest({ commandName: "test" });
+    let thrown = null;
+    try {
+      executeChildAction({
+        request,
+        grantWorktree: ({ handle }) => ({ id: handle, path: `/tmp/${handle}`, writable: true }),
+        bootstrapWorktree: () => {
+          throw new Error("worktree bootstrap command exited with 127: npm ci");
+        },
+        executeCommand: () => {
+          events.push("command");
+          return { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" };
+        },
+        computeSubject: () => {
+          events.push("subject");
+          return "3".repeat(40);
+        },
+        lockWorktreeHandle: () => {
+          events.push("lock");
+        },
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown?.message).toMatch(/worktree bootstrap command exited with 127/);
+    // The repository command never ran and no receipt was produced, but the
+    // worktree still converged back to its locked state.
+    expect(events).toEqual(["lock"]);
+    const failure = childActionFailureResult(request, thrown);
+    expect(failure).toMatchObject({
+      kind: "child_executor_action_result",
+      outcome: "retryable_infrastructure_failure",
+      subject: request.inputSubject,
+      receipt: expect.stringContaining("worktree bootstrap command exited with 127"),
+    });
+  });
+
+  it("does not bootstrap final commands, which run in the bake-once integration checkout", () => {
+    useRepositoryConfig({ test: "npm test" }, { post_bootstrap: ["npm ci"] });
+
+    const bootstrapWorktree = vi.fn();
+    const request = childExecutorRequest({
+      actionKind: "final_command",
+      unitId: null,
+      worktree: null,
+      commandName: "test",
+      inputSubject: "4".repeat(40),
+    });
+    const result = executeChildAction({
+      request,
+      bootstrapWorktree,
+      executeCommand: () => ({ exitCode: 0, signal: null, timedOut: false, stdout: "ok", stderr: "" }),
+      commitSubject: () => request.inputSubject,
+      isClean: () => true,
+      resetIntegration: vi.fn(),
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(bootstrapWorktree).not.toHaveBeenCalled();
   });
 
   it("builds retryable failure envelopes that preserve child executor errors", () => {

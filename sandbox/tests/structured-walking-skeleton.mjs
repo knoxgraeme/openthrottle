@@ -50,7 +50,15 @@ const STUB_AGENT_PATH = join(__dirname, "fixtures", "walking-skeleton-agent-stub
 // across the whole run: unit_b's command run and every later scenario's pass
 // on the first try.
 const TEST_COMMAND_COUNT_PATH = "/tmp/ot-walking-skeleton-test-count";
-const TEST_COMMAND = `count=$(cat ${TEST_COMMAND_COUNT_PATH} 2>/dev/null || echo 0); `
+// The unit `command` gate runs in a bare per-cycle worktree, not in the
+// bake-once-bootstrapped integration checkout. post_bootstrap installs an
+// executable under the gitignored node_modules/.bin, and the test command
+// REQUIRES it before anything else -- so a worktree whose sealed
+// post_bootstrap was never re-run fails exit 127 exactly like the live
+// defect (`sh: 1: tsc: not found`), and this skeleton fails with it.
+const BOOTSTRAP_TOOL = "node_modules/.bin/ot-bootstrap-dep";
+const POST_BOOTSTRAP_COMMAND = `mkdir -p node_modules/.bin && cp /bin/true ${BOOTSTRAP_TOOL} && chmod 0755 ${BOOTSTRAP_TOOL}`;
+const TEST_COMMAND = `./${BOOTSTRAP_TOOL} || exit 127; count=$(cat ${TEST_COMMAND_COUNT_PATH} 2>/dev/null || echo 0); `
   + `count=$((count + 1)); echo $count > ${TEST_COMMAND_COUNT_PATH}; test $count -gt 2`;
 
 const OPENTHROTTLE_ROOT = "/var/lib/openthrottle";
@@ -194,12 +202,17 @@ function createFixtureRepo(workDir) {
   git(["config", "user.name", "OpenThrottle Walking Skeleton"]);
   writeFileSync(join(checkoutDir, "package.json"), `{"name":"walking-skeleton","private":true}\n`);
   writeFileSync(join(checkoutDir, "WORK.md"), "# Walking skeleton fixture\n");
+  // node_modules must be ignored, exactly as in a real repository: the
+  // bootstrap-produced dependency state must never dirty the integration
+  // checkout's clean fence or leak into a derived candidate commit.
+  writeFileSync(join(checkoutDir, ".gitignore"), "node_modules/\n");
   writeFileSync(
     join(checkoutDir, ".openthrottle.yml"),
     [
       "agent: claude",
       "model: kimi-code/kimi-for-coding",
-      "post_bootstrap: []",
+      "post_bootstrap:",
+      `  - "${POST_BOOTSTRAP_COMMAND}"`,
       "limits:",
       "  max_turns: 2",
       "  task_timeout: 30",
@@ -210,7 +223,7 @@ function createFixtureRepo(workDir) {
       "",
     ].join("\n")
   );
-  git(["add", "package.json", "WORK.md", ".openthrottle.yml"]);
+  git(["add", "package.json", "WORK.md", ".gitignore", ".openthrottle.yml"]);
   execFileSync("git", ["-C", checkoutDir, "commit", "-m", "test: seed walking-skeleton fixture"], { stdio: "ignore" });
   execFileSync("git", ["-C", checkoutDir, "remote", "add", "origin", `file://${bareDir}`], { stdio: "ignore" });
   execFileSync("git", ["-C", checkoutDir, "push", "-u", "origin", "main"], { stdio: "ignore" });
@@ -602,6 +615,8 @@ function setupInstance({ db, pipelines, tickets, runtimeDescriptor, fixture, iss
       "  - id: structured",
       "    kind: builtin",
       "    ref: core/structured@1",
+      "post_bootstrap:",
+      `  - "${POST_BOOTSTRAP_COMMAND}"`,
       "commands:",
       `  test: "${TEST_COMMAND}"`,
       "  lint: \"true\"",
