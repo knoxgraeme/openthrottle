@@ -15,6 +15,9 @@ const PROPOSAL_OUTCOMES = STAGE_OUTCOMES.filter(
   (outcome) => outcome !== "canceled" && outcome !== "superseded",
 );
 
+const STAGE_PROPOSAL_SCHEMA = "openthrottle.stage-proposal/v1";
+const STANDARD_RECEIPT_SCHEMA = "openthrottle.receipt/v1";
+
 const PROPOSAL_KEYS = new Set([
   "schema",
   "suggested_outcome",
@@ -84,25 +87,102 @@ export function digest(value) {
 // optional info string on its own line, a closing ``` on the final line.
 const OUTER_CODE_FENCE = /^```[^\n]*\n([\s\S]*)\n```$/;
 
-// Agent-authored JSON reaches us as text the model typed, and models fence
-// JSON by reflex. OPE-101 generation 6 emitted a byte-perfect
-// `unit_completion` receipt -- every field correct, subject matching the
-// executor's independent recompute -- wrapped in ```json ... ```, and lost the
-// whole generation to three backticks. Peel exactly one complete outer fence
-// and parse the interior; the value returned is identical to the unfenced
-// case, so every downstream schema/fence/subject check is unchanged. Anything
-// else -- prose before or after the fence, an unterminated fence, a fence
-// buried in other text -- still throws the original JSON parse error, because
-// then the surrounding text is evidence the model wrote something other than
-// one object and we must not guess which part it meant.
-export function parseAgentJson(raw) {
+// Every complete markdown code fence in the text, in order: an opening ``` with
+// an optional info string, a closing ``` alone on a later line. A fence left
+// unterminated at the end of the text yields nothing, because its extent is
+// unknown.
+function fencedBlocks(text) {
+  const blocks = [];
+  let open = null;
+  for (const line of text.split("\n")) {
+    if (open === null) {
+      if (/^[ \t]{0,3}```/.test(line)) open = [];
+    } else if (/^[ \t]{0,3}```[ \t]*$/.test(line)) {
+      blocks.push(open.join("\n"));
+      open = null;
+    } else {
+      open.push(line);
+    }
+  }
+  return blocks;
+}
+
+// The qualifying blocks, in order. A block qualifies only when it parses as
+// JSON *and* the caller's predicate recognizes it, so prose, diffs, and log
+// excerpts inside fences are simply not candidates.
+function qualifyingFencedBlocks(text, qualifies) {
+  const found = [];
+  for (const block of fencedBlocks(text)) {
+    let parsed;
+    try {
+      parsed = JSON.parse(block);
+    } catch {
+      continue;
+    }
+    if (qualifies(parsed)) found.push(parsed);
+  }
+  return found;
+}
+
+function shapedObject(value, schema) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value) && value.schema === schema;
+}
+
+// The qualifiers are deliberately narrower than the validators: a candidate
+// must carry the exact schema id and a value from the closed vocabulary that
+// gives the document its kind. Anything that passes is unambiguously an
+// attempt at this document, whatever else is wrong with it -- and a document
+// that passes here still faces the full validator (and, for a loop receipt,
+// assertLoopReceiptFence) before it can be believed.
+export function isStandardReceiptShaped(value) {
+  return shapedObject(value, STANDARD_RECEIPT_SCHEMA) &&
+    Object.hasOwn(STANDARD_RECEIPT_RESULTS, String(value.type));
+}
+
+export function isStageProposalShaped(value) {
+  return shapedObject(value, STAGE_PROPOSAL_SCHEMA) &&
+    PROPOSAL_OUTCOMES.includes(value.suggested_outcome);
+}
+
+// Agent-authored JSON reaches us as text the model typed, and models fence JSON
+// by reflex and narrate around it by reflex. Three tiers, each strictly
+// narrower than guessing:
+//
+//   1. The text is the JSON (unchanged, the only tier before OPE-101).
+//   2. The text is exactly one complete fence and nothing else: peel it and
+//      parse the interior (generation 6, PR #152). The value is identical to
+//      the unfenced case, so every downstream check is untouched.
+//   3. The text is prose *around* fenced blocks, and exactly one of those
+//      blocks is recognizably the document the caller asked for (generation 8,
+//      below). Callers opt in by passing `qualifies`.
+//
+// Tier 3 needs a qualifier because "some JSON is in here somewhere" is not a
+// decision an executor may make. Un-fenced JSON buried in prose never
+// qualifies at all: its extent is a guess.
+export function parseAgentJson(raw, { qualifies, label = "receipt" } = {}) {
   const text = String(raw).trim();
   try {
     return JSON.parse(text);
   } catch (error) {
     const fenced = OUTER_CODE_FENCE.exec(text);
-    if (!fenced) throw error;
-    return JSON.parse(fenced[1]);
+    if (fenced) return JSON.parse(fenced[1]);
+    if (!qualifies) throw error;
+    // Narration around the payload. OPE-101 generation 8 wrote "Good -- only
+    // the test file is modified. Now composing the receipt." and then a fully
+    // valid fenced receipt; generation 6 had already proved that a text
+    // prohibition does not stop a model from narrating. When exactly one
+    // fenced block is recognizably this document, the surrounding text is
+    // narrative and the block is the answer -- there is nothing to guess.
+    // Zero or several and we still refuse: the whole point is that the
+    // executor never picks between competing candidates.
+    const candidates = qualifyingFencedBlocks(text, qualifies);
+    if (candidates.length === 1) return candidates[0];
+    if (candidates.length === 0) throw error;
+    const ambiguous = new Error(
+      `${candidates.length} ${label}-like blocks found; refusing to guess which one is the ${label}`,
+    );
+    ambiguous.ambiguousAgentJson = true;
+    throw ambiguous;
   }
 }
 
@@ -280,7 +360,7 @@ export function validateSemanticProposal(value, env = process.env) {
   for (const key of Object.keys(value)) {
     if (!PROPOSAL_KEYS.has(key)) throw new Error(`stage proposal cannot set authoritative field ${key}`);
   }
-  if (value.schema !== "openthrottle.stage-proposal/v1") {
+  if (value.schema !== STAGE_PROPOSAL_SCHEMA) {
     throw new Error("stage proposal has an invalid schema");
   }
   if (!PROPOSAL_OUTCOMES.includes(value.suggested_outcome)) {
@@ -313,7 +393,7 @@ export function validateSemanticProposal(value, env = process.env) {
     };
   });
   return {
-    schema: "openthrottle.stage-proposal/v1",
+    schema: STAGE_PROPOSAL_SCHEMA,
     suggested_outcome: value.suggested_outcome,
     summary: boundedText(value.summary, "summary", 1_000, env),
     evidence: boundedStrings(value.evidence, "evidence", 50, 300, env).slice(0, 10),
@@ -350,7 +430,7 @@ function nullable(value, parse) {
 
 export function validateStandardReceipt(value, env = process.env) {
   const input = exactObject(value, "standard receipt", STANDARD_RECEIPT_KEYS);
-  if (input.schema !== "openthrottle.receipt/v1") throw new Error("standard receipt has an invalid schema");
+  if (input.schema !== STANDARD_RECEIPT_SCHEMA) throw new Error("standard receipt has an invalid schema");
   const results = STANDARD_RECEIPT_RESULTS[input.type];
   if (!results) throw new Error("standard receipt has an invalid type");
   if (!["semantic_attested", "semantic_corroborated", "executor_verified", "provider_verified", "human_approved"].includes(input.assurance)) {
@@ -386,7 +466,7 @@ export function validateStandardReceipt(value, env = process.env) {
   const issuedAt = boundedText(input.issued_at, "standard receipt issued_at", 64, env);
   if (Number.isNaN(Date.parse(issuedAt))) throw new Error("standard receipt issued_at is invalid");
   return {
-    schema: "openthrottle.receipt/v1",
+    schema: STANDARD_RECEIPT_SCHEMA,
     type: input.type,
     assurance: input.assurance,
     result: input.result,

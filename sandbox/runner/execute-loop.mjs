@@ -5,7 +5,13 @@ import { chmodSync, chownSync, existsSync, lstatSync, mkdirSync, readFileSync, r
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { canonicalJson } from "./capabilities.mjs";
-import { digest, parseAgentJson, sanitizeArtifactText, validateStandardReceipt } from "./artifacts.mjs";
+import {
+  digest,
+  isStandardReceiptShaped,
+  parseAgentJson,
+  sanitizeArtifactText,
+  validateStandardReceipt,
+} from "./artifacts.mjs";
 import { computeWorkspaceTreeOid } from "./repository-control.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
 import { runWithAgentProcessFence } from "./agent-process-fence.mjs";
@@ -1104,33 +1110,42 @@ export function parseLoopReceipt(raw, env = process.env) {
   // uninformative "unknown field subtype". The nested layer is where the
   // agent-authored receipt actually lives (the `type: "result"` line's `result`
   // text), so its error is the one that names the real defect.
+  // Several receipt-shaped blocks in one message is its own situation, and the
+  // most decisive thing we can say about that message: the receipt was found,
+  // more than once, and the executor declined to pick. It outranks either
+  // validator error, which would otherwise describe whichever candidate the
+  // scan happened to reach first.
+  let ambiguityError = null;
   let nestedError = null;
   let topError = null;
+  const asReceipt = { qualifies: isStandardReceiptShaped, label: "receipt" };
   for (const candidate of candidates) {
     try {
       // parseAgentJson, not JSON.parse: both layers carry text the model
-      // typed, and a receipt wrapped in one markdown code fence is parsed as
-      // its interior (OPE-101 generation 6). The parsed value is identical to
-      // the unfenced case, so validation below is untouched.
-      const parsed = typeof candidate === "string" ? parseAgentJson(candidate) : candidate;
+      // typed, so both get the fence peel (OPE-101 generation 6) and the
+      // single-qualifying-block extraction (generation 8). The parsed value is
+      // identical to the unfenced case, so validation below is untouched.
+      const parsed = typeof candidate === "string" ? parseAgentJson(candidate, asReceipt) : candidate;
       try {
         return validateStandardReceipt(parsed, env);
       } catch (error) {
         topError ??= error;
         for (const nested of receiptCandidatesFromJson(parsed)) {
           try {
-            const normalized = typeof nested === "string" ? parseAgentJson(nested) : nested;
+            const normalized = typeof nested === "string" ? parseAgentJson(nested, asReceipt) : nested;
             return validateStandardReceipt(normalized, env);
           } catch (error) {
-            nestedError ??= error;
+            if (error?.ambiguousAgentJson) ambiguityError ??= error;
+            else nestedError ??= error;
           }
         }
       }
-    } catch {
+    } catch (error) {
       // Continue searching bounded agent output for the structured receipt.
+      if (error?.ambiguousAgentJson) ambiguityError ??= error;
     }
   }
-  const cause = nestedError ?? topError;
+  const cause = ambiguityError ?? nestedError ?? topError;
   const detail = cause instanceof Error ? cause.message : cause ? String(cause) : "";
   throw new Error(`loop action emitted invalid standard receipt${detail ? `: ${detail}` : ""}`);
 }
