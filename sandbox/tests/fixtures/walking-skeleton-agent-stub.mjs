@@ -92,12 +92,22 @@ function resumeOrFail(sessionId) {
   process.exit(1);
 }
 
+// Appends, never rewrites: a resumed action lands on the transcript the
+// restore just relocated here, exactly as the real CLI would. Every real
+// Claude record carries the cwd it was written in, and that field is the only
+// evidence alignClaudeProjectDirectory has about where a session has actually
+// lived. Recording it here is what gives a session resumed across successive
+// worktrees the genuine multi-cwd history the restore has to read correctly
+// (OPE-101 gen-9): without it the transcript looks placeless, the alignment's
+// convention check has nothing to check, and a second consecutive move goes
+// green in CI while failing live.
 function writeNativeSessionTranscript(sessionId, contract) {
   const dir = nativeSessionTranscriptDir();
   mkdirSync(dir, { recursive: true });
   const record = {
     type: "user",
     sessionId,
+    cwd: process.cwd(),
     message: {
       role: "user",
       content: `walking-skeleton stub agent session for ${contract.unit_id ?? "__final__"}/${contract.action_attempt_id}`,
