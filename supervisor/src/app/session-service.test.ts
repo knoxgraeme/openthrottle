@@ -303,7 +303,11 @@ describe("pipeline admission", () => {
     catalogPath = shippedCatalogPath,
     event = payload(),
     repositoryFiles: Record<string, string> = {},
-    runtimeOverrides: Parameters<typeof buildInstalledRuntimeDescriptor>[1] = {}
+    runtimeOverrides: Parameters<typeof buildInstalledRuntimeDescriptor>[1] = {},
+    linearIssueLabels:
+      | Array<{ name: string; parentName?: string }>
+      | (() => Array<{ name: string; parentName?: string }>) = [],
+    linearLabelsFetchError?: string
   ) {
     db = openDb(":memory:");
     const pipelines = createPipelineStore(db);
@@ -381,9 +385,24 @@ describe("pipeline admission", () => {
     vi.stubGlobal("fetch", githubFetch);
     const linear: LinearClient = {
       accessToken: "linear-token",
-      fetch: vi.fn(async () => Response.json({
-        data: { issue: { labels: { nodes: [] } } },
-      })) as unknown as typeof fetch,
+      fetch: vi.fn(async () => {
+        if (linearLabelsFetchError !== undefined) {
+          throw new Error(linearLabelsFetchError);
+        }
+        const labels = typeof linearIssueLabels === "function" ? linearIssueLabels() : linearIssueLabels;
+        return Response.json({
+          data: {
+            issue: {
+              labels: {
+                nodes: labels.map((label) => ({
+                  name: label.name,
+                  parent: label.parentName ? { name: label.parentName } : null,
+                })),
+              },
+            },
+          },
+        });
+      }) as unknown as typeof fetch,
     };
     const outbox = {
       process: vi.fn(async () => undefined),
@@ -696,7 +715,10 @@ intents:
         repositoryConfigYaml("{ implement: implement }"),
         { claudeCodeOauthToken: undefined, codexAuthJson: undefined, kimiCodeApiKey: undefined },
         shippedCatalogPath,
-        payload("session-1", "issue-1", "OT-1", undefined, [`agent:${agent}`])
+        payload("session-1", "issue-1", "OT-1"),
+        {},
+        {},
+        [{ name: `agent:${agent}` }]
       );
 
       expect(tickets.getByIssueId("issue-1")).toMatchObject({
@@ -715,6 +737,141 @@ intents:
       expect(refusal).toContain("No sandbox was provisioned.");
     }
   );
+
+  describe("engine selection from freshly-fetched Linear labels", () => {
+    const allCredentials: Partial<Config> = {
+      claudeCodeOauthToken: "claude-oauth",
+      codexAuthJson: "{}",
+      kimiCodeApiKey: "kimi-key",
+    };
+
+    it.each([
+      ["claude", "agent:claude"],
+      ["codex", "agent:codex"],
+      ["opencode", "agent:opencode"],
+    ])("selects %s from a flat agent label", async (agent, flatLabel) => {
+      const { tickets } = await run(
+        repositoryConfigYaml("{ implement: implement }"),
+        allCredentials,
+        shippedCatalogPath,
+        payload("session-1", "issue-1", "OT-1"),
+        {},
+        {},
+        [{ name: flatLabel }]
+      );
+      expect(tickets.getByIssueId("issue-1")).toMatchObject({ state: "active", agent });
+    });
+
+    it.each([
+      ["claude", "claude"],
+      ["codex", "codex"],
+      ["opencode", "opencode"],
+    ])("selects %s from a group-child agent label", async (agent, childName) => {
+      const { tickets } = await run(
+        repositoryConfigYaml("{ implement: implement }"),
+        allCredentials,
+        shippedCatalogPath,
+        payload("session-1", "issue-1", "OT-1"),
+        {},
+        {},
+        [{ name: childName, parentName: "agent" }]
+      );
+      expect(tickets.getByIssueId("issue-1")).toMatchObject({ state: "active", agent });
+    });
+
+    it("falls back to DEFAULT_AGENT when the issue carries no agent label", async () => {
+      const { tickets } = await run(
+        repositoryConfigYaml("{ implement: implement }"),
+        allCredentials,
+        shippedCatalogPath,
+        payload("session-1", "issue-1", "OT-1"),
+        {},
+        {},
+        []
+      );
+      expect(tickets.getByIssueId("issue-1")).toMatchObject({ state: "active", agent: "codex" });
+    });
+
+    it("resolves multiple conflicting agent labels with deterministic precedence: opencode > codex > claude", async () => {
+      const { tickets } = await run(
+        repositoryConfigYaml("{ implement: implement }"),
+        allCredentials,
+        shippedCatalogPath,
+        payload("session-1", "issue-1", "OT-1"),
+        {},
+        {},
+        [{ name: "agent:claude" }, { name: "agent:codex" }, { name: "agent:opencode" }]
+      );
+      expect(tickets.getByIssueId("issue-1")).toMatchObject({ state: "active", agent: "opencode" });
+    });
+
+    it("resolves codex over claude when opencode is absent", async () => {
+      const { tickets } = await run(
+        repositoryConfigYaml("{ implement: implement }"),
+        allCredentials,
+        shippedCatalogPath,
+        payload("session-1", "issue-1", "OT-1"),
+        {},
+        {},
+        [{ name: "agent:claude" }, { name: "agent:codex" }]
+      );
+      expect(tickets.getByIssueId("issue-1")).toMatchObject({ state: "active", agent: "codex" });
+    });
+
+    it("ignores a stale agent label on the delegation event payload and selects from the fresh label read instead", async () => {
+      const { tickets } = await run(
+        repositoryConfigYaml("{ implement: implement }"),
+        allCredentials,
+        shippedCatalogPath,
+        payload("session-1", "issue-1", "OT-1", undefined, ["agent:codex"]),
+        {},
+        {},
+        [{ name: "agent:claude" }]
+      );
+      expect(tickets.getByIssueId("issue-1")).toMatchObject({ state: "active", agent: "claude" });
+    });
+
+    it("fails closed and provisions no sandbox when the fresh label read fails", async () => {
+      const { tickets } = await run(
+        repositoryConfigYaml("{ implement: implement }"),
+        allCredentials,
+        shippedCatalogPath,
+        payload("session-1", "issue-1", "OT-1"),
+        {},
+        {},
+        [],
+        "Linear API unreachable"
+      );
+      expect(tickets.getByIssueId("issue-1")).toBeUndefined();
+      expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
+      const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+      const refusal = payloads.find((entry) => entry.includes("could not read"));
+      expect(refusal).toBeDefined();
+      expect(refusal).toContain("Linear API unreachable");
+      expect(refusal).toContain("Engine selection requires a fresh label read");
+    });
+
+    it("reverts to DEFAULT_AGENT on regeneration once the agent label has been removed", async () => {
+      let fetchCount = 0;
+      const { tickets, invoke } = await run(
+        repositoryConfigYaml("{ implement: implement }"),
+        allCredentials,
+        shippedCatalogPath,
+        payload("session-1", "issue-1", "OT-1"),
+        {},
+        {},
+        () => {
+          fetchCount += 1;
+          return fetchCount === 1 ? [{ name: "agent:claude" }] : [];
+        }
+      );
+      expect(tickets.getByIssueId("issue-1")).toMatchObject({ state: "active", agent: "claude" });
+
+      await invoke({}, payload("session-2"));
+
+      expect(tickets.getByIssueId("issue-1")).toMatchObject({ state: "active", agent: "codex" });
+    });
+  });
 
   it("refuses a unit-consuming graph whose only stage hosts loop actions when the engine credential is absent", async () => {
     // Regression (OPE-59): the compiled `for_each_unit` stage carries no
@@ -752,7 +909,7 @@ intents:
 `,
       { claudeCodeOauthToken: undefined, codexAuthJson: undefined, kimiCodeApiKey: undefined },
       shippedCatalogPath,
-      payload("session-1", "issue-1", "OT-1", context, ["agent:claude"]),
+      payload("session-1", "issue-1", "OT-1", context),
       {},
       {
         capabilities: [
@@ -761,7 +918,8 @@ intents:
           "ce/simplify@1",
           "graph/for-each-unit@1",
         ],
-      }
+      },
+      [{ name: "agent:claude" }]
     );
 
     expect(tickets.getByIssueId("issue-1")).toMatchObject({
@@ -807,7 +965,7 @@ intents:
 `,
       { claudeCodeOauthToken: "claude-oauth", codexAuthJson: undefined, kimiCodeApiKey: undefined },
       shippedCatalogPath,
-      payload("session-1", "issue-1", "OT-1", context, ["agent:claude"]),
+      payload("session-1", "issue-1", "OT-1", context),
       {},
       {
         capabilities: [
@@ -816,7 +974,8 @@ intents:
           "ce/simplify@1",
           "graph/for-each-unit@1",
         ],
-      }
+      },
+      [{ name: "agent:claude" }]
     );
 
     expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
@@ -857,7 +1016,10 @@ intents:
 `,
       { codexAuthJson: undefined, kimiCodeApiKey: "kimi-key" },
       shippedCatalogPath,
-      payload("session-1", "issue-1", "OT-1", context, ["agent:opencode"])
+      payload("session-1", "issue-1", "OT-1", context),
+      {},
+      {},
+      [{ name: "agent:opencode" }]
     );
 
     expect(tickets.getByIssueId("issue-1")).toMatchObject({
@@ -1509,7 +1671,10 @@ intents:
         config,
         { claudeCodeOauthToken: "claude-oauth" },
         shippedCatalogPath,
-        payload("session-bound-ok", "issue-bound-ok", "OT-BOUND-OK", contextFor(boundary.accepted), ["agent:claude"])
+        payload("session-bound-ok", "issue-bound-ok", "OT-BOUND-OK", contextFor(boundary.accepted)),
+        {},
+        {},
+        [{ name: "agent:claude" }]
       );
       expect(tickets.getByIssueId("issue-bound-ok")).toMatchObject({
         state: "active",
@@ -1524,7 +1689,10 @@ intents:
       config,
       { claudeCodeOauthToken: "claude-oauth" },
       shippedCatalogPath,
-      payload("session-bound-reject", "issue-bound-reject", "OT-BOUND-REJECT", contextFor(boundary.rejected), ["agent:claude"])
+      payload("session-bound-reject", "issue-bound-reject", "OT-BOUND-REJECT", contextFor(boundary.rejected)),
+      {},
+      {},
+      [{ name: "agent:claude" }]
     );
     expect(tickets.getByIssueId("issue-bound-reject")).toMatchObject({
       state: "error",
@@ -1572,7 +1740,10 @@ intents:
       config,
       { claudeCodeOauthToken: "claude-oauth" },
       shippedCatalogPath,
-      payload("session-resume-bound", "issue-resume-bound", "OT-RESUME-BOUND", context, ["agent:claude"])
+      payload("session-resume-bound", "issue-resume-bound", "OT-RESUME-BOUND", context),
+      {},
+      {},
+      [{ name: "agent:claude" }]
     );
     expect(tickets.getByIssueId("issue-resume-bound")).toMatchObject({
       state: "error",
@@ -1709,7 +1880,7 @@ intents:
 `,
       { claudeCodeOauthToken: "claude-oauth" },
       shippedCatalogPath,
-      payload("session-repo-bound", "issue-repo-bound", "OT-REPO-BOUND", context, ["agent:claude"]),
+      payload("session-repo-bound", "issue-repo-bound", "OT-REPO-BOUND", context),
       {
         [graphPath]: graph,
         [skillPath]: "---\nname: implement_unit\n---\n# Implement Unit\n",
@@ -1722,7 +1893,8 @@ intents:
           "ce/simplify@1",
           "graph/for-each-unit@1",
         ],
-      }
+      },
+      [{ name: "agent:claude" }]
     );
 
     expect(tickets.getByIssueId("issue-repo-bound")).toMatchObject({

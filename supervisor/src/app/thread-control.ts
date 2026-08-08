@@ -20,7 +20,7 @@ async function publishMissingPipeline(
   await providers.activityPublisher.publishError(
     sessionId,
     issueId,
-    "OpenThrottle couldn't find a pipeline for this session. Delegate the issue again to start one."
+    "OpenThrottle couldn't find a pipeline for this session. @-mention the agent in a new comment on the issue to start one."
   );
 }
 
@@ -42,7 +42,7 @@ export async function handlePrompted(
     await providers.activityPublisher.publishError(
       sessionId,
       issue?.id,
-      "OpenThrottle couldn't find an existing workspace. Delegate the issue again to start one."
+      "OpenThrottle couldn't find an existing workspace. @-mention the agent in a new comment on the issue to start one."
     );
     return;
   }
@@ -155,7 +155,7 @@ export async function handlePrompted(
   await providers.activityPublisher.publishError(
     sessionId,
     ticket.linear_issue_id,
-    "The current pipeline stage does not accept live steering. Add feedback to the pull request, or re-delegate the issue to create a new generation."
+    "The current pipeline stage does not accept live steering. Add feedback to the pull request, or @-mention the agent in a new comment to start a new generation."
   );
 }
 
