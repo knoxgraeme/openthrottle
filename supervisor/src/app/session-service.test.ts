@@ -627,6 +627,114 @@ intents:
     expect(payloads.some((entry) => entry.includes(expectedMessage))).toBe(true);
   }
 
+  it("bounds ordinary-stage Linear context by dropping older optional threads", async () => {
+    const context = [
+      `<issue identifier="OT-1">`,
+      `<title>Bounded context</title>`,
+      `<description>Implement the bounded context composer.</description>`,
+      `</issue>`,
+      `<primary-directive-thread comment-id="directive">`,
+      `<comment author="Operator" created-at="2026-08-08T00:00:00.000Z">@OpenThrottle implement this ticket.</comment>`,
+      `</primary-directive-thread>`,
+      ...Array.from({ length: 12 }, (_, index) => [
+        `<other-thread comment-id="thread-${index}">`,
+        `<comment author="Openthrottle" created-at="2026-08-08T00:${String(index).padStart(2, "0")}:00.000Z">`,
+        `${index === 0 ? "oldest optional thread" : index === 11 ? "newest optional thread" : "optional thread"} ${"x".repeat(7_000)}`,
+        `</comment>`,
+        `</other-thread>`,
+      ].join("\n")),
+    ].join("\n\n");
+
+    const { pipelines } = await run(
+      repositoryConfigYaml("{ implement: implement }"),
+      {},
+      shippedCatalogPath,
+      payload("session-1", "issue-1", "OT-1", context)
+    );
+
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    const request = pipelines.getStageRequest(attempt.id);
+    expect(Buffer.byteLength(request.taskContext, "utf8")).toBeLessThanOrEqual(64_000);
+    expect(request.taskContext).toContain("Implement the bounded context composer.");
+    expect(request.taskContext).toContain("@OpenThrottle implement this ticket.");
+    expect(request.taskContext).not.toContain("oldest optional thread");
+    expect(request.taskContext).toContain("newest optional thread");
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(1);
+    const journal = pipelines.listJournalEntries({ issueId: "issue-1" });
+    const pruning = journal.find((entry) => entry.outcome === "context_bounded");
+    expect(pruning).toMatchObject({
+      actor: "supervisor",
+      kind: "run_note",
+    });
+    expect(pruning?.refs).toContain('"dropped_other_threads"');
+  });
+
+  it("summarizes parent issue context and drops parent sub-issue metadata", async () => {
+    const context = [
+      `<issue identifier="OT-1">`,
+      `<title>Child issue</title>`,
+      `<description>Fix the child issue.</description>`,
+      `</issue>`,
+      `<primary-directive-thread comment-id="directive">`,
+      `<comment author="Operator" created-at="2026-08-08T00:00:00.000Z">Use the current label.</comment>`,
+      `</primary-directive-thread>`,
+      `<parent-issue identifier="OT-0">`,
+      `<title>Parent issue</title>`,
+      `<description>${"parent description ".repeat(4_500)}</description>`,
+      `<sub-issue identifier="OT-999">${"sub issue metadata ".repeat(1_000)}</sub-issue>`,
+      `</parent-issue>`,
+    ].join("\n\n");
+
+    const { pipelines } = await run(
+      repositoryConfigYaml("{ implement: implement }"),
+      {},
+      shippedCatalogPath,
+      payload("session-1", "issue-1", "OT-1", context)
+    );
+
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const request = pipelines.getStageRequest(pipelines.getActiveAttempt(instance.id)!.id);
+    expect(Buffer.byteLength(request.taskContext, "utf8")).toBeLessThanOrEqual(64_000);
+    expect(request.taskContext).toContain(`<parent-issue-context source="linear" status="summarized">`);
+    expect(request.taskContext).toContain("<description-summary>");
+    expect(request.taskContext).not.toContain("<sub-issue");
+    expect(pipelines.listJournalEntries({ issueId: "issue-1" }).some((entry) =>
+      entry.outcome === "context_bounded" && entry.refs.includes('"summarized_parent_sections":1')
+    )).toBe(true);
+  });
+
+  it("rejects ordinary-stage context when required issue and directive content exceed the bound", async () => {
+    const context = [
+      `<issue identifier="OT-1">`,
+      `<title>Oversized required context</title>`,
+      `<description>${"required issue text ".repeat(4_000)}</description>`,
+      `</issue>`,
+      `<primary-directive-thread comment-id="directive">`,
+      `<comment author="Operator" created-at="2026-08-08T00:00:00.000Z">${"required directive text ".repeat(500)}</comment>`,
+      `</primary-directive-thread>`,
+    ].join("\n\n");
+
+    const { tickets } = await run(
+      repositoryConfigYaml("{ implement: implement }"),
+      {},
+      shippedCatalogPath,
+      payload("session-1", "issue-1", "OT-1", context)
+    );
+
+    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+      state: "error",
+      sandbox_id: null,
+      run_id: null,
+    });
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_stage_attempts").pluck().get()).toBe(0);
+    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(payloads.some((entry) =>
+      entry.includes("Task context required content exceeds 64000 bytes for an ordinary stage pipeline")
+    )).toBe(true);
+  });
+
   it("preserves the generated simple investigate intent when no graph is explicitly requested", async () => {
     const { pipelines } = await run(
       repositoryConfigYaml(
