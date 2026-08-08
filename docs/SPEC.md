@@ -225,7 +225,36 @@ visibility and event polling, not coordinator authority.
 Hard expiry uses `TASK_TIMEOUT`. Stalled actors are detected from actor state
 on `runs` and `pipeline_stage_attempts` plus `STALL_TIMEOUT_SECONDS`. The sweep also resumes pending effects,
 reaps expired runs, releases or quarantines resources safely, and removes
-unbound Daytona orphans after `ORPHAN_GRACE_MINUTES`.
+unbound Daytona orphans after `ORPHAN_GRACE_MINUTES`. "Unbound" means no
+`pipeline_instances` row still owns the resource (by `runtime_provider_
+resource_id`, not by the ticket's possibly-stale `sandbox_id` projection,
+which a newer generation's delegation overwrites); a resource still owned by
+some generation is left entirely to the reclaim path below regardless of
+`ORPHAN_GRACE_MINUTES`.
+
+A terminal instance's `stopped` runtime resource (e.g. the needs_human
+cleanup effect's `preserve` path, which stops rather than deletes so the
+workspace stays inspectable) is otherwise kept indefinitely and still counts
+against the Daytona memory quota. `operations/runtime-resource-reclaim.ts`
+deletes it once `RUNTIME_RESOURCE_RETENTION_MINUTES` has elapsed and the
+instance has no active stage attempt or unsettled effect intent (`pending`,
+`processing`, or retryable `failed`); a resource
+is deleted only when its exact provider binding is still `stopped` on the
+owning (single-generation) `pipeline_instances` row and its stopped timestamp
+is still at or before the retention cutoff immediately before deletion. The
+DB only records `cleaned` after provider deletion is confirmed (provider "not
+found" and duplicate cleanup both converge for free — see `cleanup()` in
+`providers/daytona/adapter.ts`). The periodic sweep runs this on the configured
+retention window; capacity-constrained provisioning
+(`app/admission-preflight.ts`'s `checkDaytonaCapacity`, and a provision/
+dispatch effect that fails with a capacity error in
+`operations/pipeline-effects.ts`) runs a one-candidate, five-second-wait pass
+with the same eligibility rule before rejecting or retrying. Reclaim triggers
+share one local single-flight; a slow provider deletion may finish after the
+hot caller's wait budget, while remaining candidates stay queued for the
+periodic bulk sweep. Capacity pressure never bypasses the
+retention window, since doing so could destroy
+another operator's still-fresh diagnostic workspace.
 
 ## Sandbox stage contract
 
@@ -801,6 +830,7 @@ Optional/defaulted:
 - `DEFAULT_AGENT=codex`, plus the selected agent credential:
   `CLAUDE_CODE_OAUTH_TOKEN`, `CODEX_AUTH_JSON`, or `KIMI_CODE_API_KEY`;
 - `TASK_TIMEOUT=7200`, `ORPHAN_GRACE_MINUTES=5`,
+  `RUNTIME_RESOURCE_RETENTION_MINUTES=60`,
   `WEBHOOK_MAX_AGE_SECONDS=60`, `SANDBOX_EVENT_POLL_INTERVAL_MS=5000`,
   `STALL_TIMEOUT_SECONDS=900`, `ALLOW_LINEAR_MERGE=false`,
   `RUN_OUTCOME_RETENTION_DAYS=180`;

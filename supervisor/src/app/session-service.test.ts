@@ -56,6 +56,7 @@ function config(): Config {
     kimiCodeApiKey: undefined,
     taskTimeout: 300,
     orphanGraceMinutes: 5,
+    runtimeResourceRetentionMinutes: 60,
     runOutcomeRetentionDays: 180,
     webhookMaxAgeSeconds: 60,
     allowLinearMerge: false,

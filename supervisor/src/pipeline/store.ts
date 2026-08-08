@@ -425,6 +425,25 @@ export interface PipelineStore extends ChildActionLivenessPort {
   bindRuntimeResource(instanceId: string, provider: string, providerResourceId: string): PipelineRuntimeResource;
   getRuntimeResource(instanceId: string): PipelineRuntimeResource | undefined;
   setRuntimeResourceStatus(instanceId: string, status: PipelineRuntimeResource["status"]): void;
+  /**
+   * The pipeline instance (any generation, any status) still bound to this
+   * exact provider resource, if any. `runtime_provider_resource_id` is
+   * unique per non-null value, so at most one instance can own a given
+   * resource at a time. Used to keep resource-lifecycle ownership out of
+   * `sweep.ts`'s orphan path once a resource is pipeline-bound: `tickets.
+   * sandbox_id` is a projection that a newer generation's delegation
+   * overwrites, so it cannot answer "does *any* pipeline instance still own
+   * this resource" on its own.
+   */
+  getInstanceByRuntimeResourceId(providerResourceId: string): PipelineInstance | undefined;
+  /**
+   * Terminal instances whose bound runtime resource is `stopped` and has sat
+   * past `cutoffIso` (the configured diagnostic-retention window) — the
+   * candidate pool for `operations/runtime-resource-reclaim.ts`. Callers
+   * still re-check status, the cutoff, active attempt, and unsettled effects per candidate
+   * before deleting: this listing can be stale by the time it is consumed.
+   */
+  listReclaimableRuntimeResources(cutoffIso: string, limit?: number): PipelineInstance[];
   getActiveAttempt(instanceId: string): PipelineStageAttempt | undefined;
   listProviderReadyInstances(limit?: number): PipelineInstance[];
   listStages(instanceId: string): PipelineInstanceStage[];

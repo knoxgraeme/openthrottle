@@ -5,6 +5,7 @@ import { createSupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
 import { createLinearActivityPublisher, createLinearOutboxProcessor } from "../providers/linear/outbox.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
+import { setupPipelineStore, ticket } from "../__fixtures__/pipeline-store.js";
 import { runSweep } from "./sweep.js";
 
 describe("runSweep", () => {
@@ -61,6 +62,7 @@ describe("runSweep", () => {
     const runtime = {
       deleteResource: remove,
       stopResource: vi.fn(async () => undefined),
+      cleanup: vi.fn(async () => undefined),
       listLabeledResources: async () => [oldOrphan, newOrphan, knownActive],
     };
     const reconcileWebhooks = vi.fn(async () => undefined);
@@ -68,7 +70,7 @@ describe("runSweep", () => {
     await runSweep(
       runtime,
       store,
-      { orphanGraceMinutes: 5, runOutcomeRetentionDays: 180 } as Config,
+      { orphanGraceMinutes: 5, runtimeResourceRetentionMinutes: 60, runOutcomeRetentionDays: 180 } as Config,
       pipelines,
       activityPublisherFor(store),
       reconcileWebhooks
@@ -92,6 +94,7 @@ describe("runSweep", () => {
     const runtime = {
       deleteResource: remove,
       stopResource: vi.fn(async () => undefined),
+      cleanup: vi.fn(async () => undefined),
       listLabeledResources: async () => [{
         id: "old-orphan",
         createdAt: "2020-01-01T00:00:00.000Z",
@@ -103,7 +106,7 @@ describe("runSweep", () => {
     await runSweep(
       runtime,
       store,
-      { orphanGraceMinutes: 5, runOutcomeRetentionDays: 180 } as Config,
+      { orphanGraceMinutes: 5, runtimeResourceRetentionMinutes: 60, runOutcomeRetentionDays: 180 } as Config,
       pipelines,
       activityPublisherFor(store),
       vi.fn(async () => {
@@ -165,6 +168,7 @@ describe("runSweep", () => {
     const runtime = {
       deleteResource: vi.fn(async () => undefined),
       stopResource: vi.fn(async () => undefined),
+      cleanup: vi.fn(async () => undefined),
       listLabeledResources: vi.fn(async () => {
         throw new Error("inventory unavailable");
       }),
@@ -174,7 +178,7 @@ describe("runSweep", () => {
     await runSweep(
       runtime,
       store,
-      { orphanGraceMinutes: 5, runOutcomeRetentionDays: 180 } as Config,
+      { orphanGraceMinutes: 5, runtimeResourceRetentionMinutes: 60, runOutcomeRetentionDays: 180 } as Config,
       pipelines,
       activityPublisherFor(store)
     );
@@ -199,6 +203,7 @@ describe("runSweep", () => {
     const runtime = {
       deleteResource: remove,
       stopResource: vi.fn(async () => undefined),
+      cleanup: vi.fn(async () => undefined),
       listLabeledResources: async () => [
         {
           id: "old-orphan-a",
@@ -217,7 +222,7 @@ describe("runSweep", () => {
     await runSweep(
       runtime,
       store,
-      { orphanGraceMinutes: 5, runOutcomeRetentionDays: 180 } as Config,
+      { orphanGraceMinutes: 5, runtimeResourceRetentionMinutes: 60, runOutcomeRetentionDays: 180 } as Config,
       pipelines,
       activityPublisherFor(store)
     );
@@ -229,5 +234,131 @@ describe("runSweep", () => {
       expect.any(Error)
     );
     error.mockRestore();
+  });
+
+  it("reclaims a terminal instance's stopped runtime resource once its retention window elapses", async () => {
+    // A needs_human terminal instance whose resource the cleanup effect
+    // stopped-but-preserved (coordinator.ts terminalCleanupEffect,
+    // preserve: true) -- exactly the OPE-75 dogfood state: no active stage,
+    // resource `stopped`, stopped well past any retention window.
+    const setup = setupPipelineStore();
+    db = setup.db;
+    const { tickets, pipelines, catalog, snapshot } = setup;
+    const manifest = catalog.manifests.get("fixture/command@1")!;
+    tickets.upsert({
+      ...ticket("session-needs-human-old"),
+      pipeline: {
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        manifest,
+        repositoryConfig: snapshot,
+        runtime: setup.runtime,
+        authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
+      },
+    });
+    const instance = pipelines.getInstanceForSession("session-needs-human-old")!;
+    pipelines.bindRuntimeResource(instance.id, "daytona", "sandbox-needs-human-old");
+    pipelines.setRuntimeResourceStatus(instance.id, "stopped");
+    tickets.setSandboxId(instance.linear_issue_id, "sandbox-needs-human-old");
+    db.prepare(`
+      UPDATE pipeline_effect_intents SET status = 'acknowledged'
+      WHERE pipeline_instance_id = ? AND status = 'pending'
+    `).run(instance.id);
+    db.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'needs_human', terminal_outcome = 'needs_human', active_stage_id = NULL,
+          runtime_resource_updated_at = '2020-01-01T00:00:00.000Z'
+      WHERE id = ?
+    `).run(instance.id);
+
+    const cleanup = vi.fn(async () => undefined);
+    const runtime = {
+      deleteResource: vi.fn(async () => undefined),
+      stopResource: vi.fn(async () => undefined),
+      cleanup,
+      listLabeledResources: async () => [],
+    };
+
+    await runSweep(
+      runtime,
+      tickets,
+      { orphanGraceMinutes: 5, runtimeResourceRetentionMinutes: 60, runOutcomeRetentionDays: 180 } as Config,
+      pipelines,
+      activityPublisherFor(tickets)
+    );
+
+    expect(cleanup).toHaveBeenCalledWith({ providerResourceId: "sandbox-needs-human-old" });
+    expect(pipelines.getRuntimeResource(instance.id)?.status).toBe("cleaned");
+    expect(tickets.getByIssueId(instance.linear_issue_id)?.sandbox_id).toBeNull();
+  });
+
+  it("protects a still pipeline-bound sandbox from the orphan path once a newer generation reassigns tickets.sandbox_id", async () => {
+    // Reproduces the PR #159 review finding: a needs_human terminal
+    // instance's resource is stopped but still within its retention window
+    // (not yet eligible for reclaimEligibleRuntimeResources), and the ticket
+    // has since been re-delegated -- tickets.sandbox_id now points at a
+    // newer generation's sandbox, so store.getBySandboxId(old resource id)
+    // returns undefined and the old resource looks orphaned by ticket
+    // linkage alone. It must not be deleted by ORPHAN_GRACE_MINUTES; only
+    // the retention-aware reconciler may reclaim it, and only once eligible.
+    const setup = setupPipelineStore();
+    db = setup.db;
+    const { tickets, pipelines, catalog, snapshot } = setup;
+    const manifest = catalog.manifests.get("fixture/command@1")!;
+    tickets.upsert({
+      ...ticket("session-old-generation"),
+      pipeline: {
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        manifest,
+        repositoryConfig: snapshot,
+        runtime: setup.runtime,
+        authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
+      },
+    });
+    const instance = pipelines.getInstanceForSession("session-old-generation")!;
+    pipelines.bindRuntimeResource(instance.id, "daytona", "sandbox-old-generation");
+    pipelines.setRuntimeResourceStatus(instance.id, "stopped");
+    db.prepare(`
+      UPDATE pipeline_effect_intents SET status = 'acknowledged'
+      WHERE pipeline_instance_id = ? AND status = 'pending'
+    `).run(instance.id);
+    db.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'needs_human', terminal_outcome = 'needs_human', active_stage_id = NULL,
+          runtime_resource_updated_at = ?
+      WHERE id = ?
+    `).run(new Date().toISOString(), instance.id);
+    // The re-delegation that moved the ticket on to a new generation's
+    // sandbox -- the old resource's id no longer appears anywhere on the
+    // ticket, only on the (still terminal, still 'stopped') pipeline instance.
+    tickets.setSandboxId(instance.linear_issue_id, "sandbox-new-generation");
+
+    const deleteResource = vi.fn(async () => undefined);
+    const cleanup = vi.fn(async () => undefined);
+    const runtime = {
+      deleteResource,
+      stopResource: vi.fn(async () => undefined),
+      cleanup,
+      listLabeledResources: async () => [{
+        id: "sandbox-old-generation",
+        createdAt: "2020-01-01T00:00:00.000Z",
+        labels: { ticket: instance.linear_issue_id },
+      }],
+    };
+
+    await runSweep(
+      runtime,
+      tickets,
+      { orphanGraceMinutes: 5, runtimeResourceRetentionMinutes: 60, runOutcomeRetentionDays: 180 } as Config,
+      pipelines,
+      activityPublisherFor(tickets)
+    );
+
+    expect(deleteResource).not.toHaveBeenCalled();
+    expect(cleanup).not.toHaveBeenCalled();
+    expect(pipelines.getRuntimeResource(instance.id)?.status).toBe("stopped");
   });
 });

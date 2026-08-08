@@ -38,6 +38,7 @@ const cfg: Config = {
   taskTimeout: 7200,
   stallTimeoutSeconds: 900,
   orphanGraceMinutes: 15,
+  runtimeResourceRetentionMinutes: 60,
   runOutcomeRetentionDays: 180,
   webhookMaxAgeSeconds: 300,
   sandboxEventPollIntervalMs: 5000,

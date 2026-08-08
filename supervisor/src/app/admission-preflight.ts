@@ -12,6 +12,12 @@
 //     quota; when it is exhausted, provisioning churns retries and fails
 //     opaquely. Estimate usage from live sandboxes and reject when one more
 //     sandbox cannot fit. A broken capacity probe never blocks admission.
+//     Before rejecting, run the terminal-runtime-resource reconciler once
+//     (OPE-75): a needs_human/failed/shipped backlog can leave stopped-but-
+//     undeleted sandboxes billed against this exact quota forever, deadlocking
+//     every future delegation even though no pipeline action is active. One
+//     reconciliation pass frees whatever is eligible and the usage estimate is
+//     recomputed before the final verdict.
 
 import type { Config } from "./config.js";
 import type { RuntimeInventory } from "../runtime/contracts.js";
@@ -39,6 +45,14 @@ export interface AdmissionPreflightDeps {
   listSandboxes?: () => Promise<Array<{ state?: string; memory?: number }>>;
   totalMemoryGib?: number;
   sandboxMemoryGib?: number;
+  /**
+   * Best-effort idempotent reclaim of eligible terminal stopped runtime
+   * resources, run at most once per preflight call when capacity is tight.
+   * Omit to skip reconciliation (the capacity check still runs; it just
+   * cannot free anything before rejecting). A throwing reconciler must not
+   * block admission any more than a broken capacity probe does.
+   */
+  reconcile?: () => Promise<unknown>;
 }
 
 type RuntimeInventoryReader = Pick<RuntimeInventory, "listLabeledResources">;
@@ -53,7 +67,11 @@ export async function runAdmissionPreflight(
 }
 
 /** Bind the preflight to supervisor config and the live runtime inventory. */
-export function createAdmissionPreflight(cfg: Config, runtime: RuntimeInventoryReader): AdmissionPreflight {
+export function createAdmissionPreflight(
+  cfg: Config,
+  runtime: RuntimeInventoryReader,
+  reconcile?: () => Promise<unknown>
+): AdmissionPreflight {
   return (target) =>
     runAdmissionPreflight(
       {
@@ -61,6 +79,7 @@ export function createAdmissionPreflight(cfg: Config, runtime: RuntimeInventoryR
         listSandboxes: () => runtime.listLabeledResources(),
         totalMemoryGib: cfg.daytonaTotalMemoryGib,
         sandboxMemoryGib: cfg.daytonaSandboxMemoryGib,
+        reconcile,
       },
       target
     );
@@ -116,14 +135,14 @@ function readTokenFailureReason(repository: string, status: number): string {
   return `${base} Fine-grained PATs need the Contents: Read repository permission.`;
 }
 
-async function checkDaytonaCapacity(deps: AdmissionPreflightDeps): Promise<AdmissionPreflightResult> {
-  if (!deps.listSandboxes) return { ok: true };
-  const totalGib = deps.totalMemoryGib ?? DEFAULT_DAYTONA_TOTAL_MEMORY_GIB;
-  const sandboxGib = deps.sandboxMemoryGib ?? DEFAULT_DAYTONA_SANDBOX_MEMORY_GIB;
-  let usedGib: number;
+async function measureDaytonaUsageGib(
+  deps: AdmissionPreflightDeps,
+  sandboxGib: number
+): Promise<number | undefined> {
+  if (!deps.listSandboxes) return undefined;
   try {
     const sandboxes = await deps.listSandboxes();
-    usedGib = sandboxes
+    return sandboxes
       .filter((sandbox) => sandbox.state !== "destroyed" && sandbox.state !== "destroying")
       .reduce(
         (sum, sandbox) =>
@@ -132,7 +151,25 @@ async function checkDaytonaCapacity(deps: AdmissionPreflightDeps): Promise<Admis
       );
   } catch (error) {
     console.warn(`[preflight] Daytona capacity check failed; proceeding: ${String(error)}`);
-    return { ok: true };
+    return undefined;
+  }
+}
+
+async function checkDaytonaCapacity(deps: AdmissionPreflightDeps): Promise<AdmissionPreflightResult> {
+  const totalGib = deps.totalMemoryGib ?? DEFAULT_DAYTONA_TOTAL_MEMORY_GIB;
+  const sandboxGib = deps.sandboxMemoryGib ?? DEFAULT_DAYTONA_SANDBOX_MEMORY_GIB;
+  let usedGib = await measureDaytonaUsageGib(deps, sandboxGib);
+  if (usedGib === undefined) return { ok: true };
+  if (usedGib + sandboxGib > totalGib && deps.reconcile) {
+    try {
+      await deps.reconcile();
+    } catch (error) {
+      console.warn(`[preflight] runtime resource reconciliation failed; proceeding with the prior usage estimate: ${String(error)}`);
+    }
+    // Re-measure regardless of whether reconcile() reported anything reclaimed:
+    // its own view of what is eligible can differ from what we can observe here.
+    const reconciledGib = await measureDaytonaUsageGib(deps, sandboxGib);
+    if (reconciledGib !== undefined) usedGib = reconciledGib;
   }
   if (usedGib + sandboxGib > totalGib) {
     return {

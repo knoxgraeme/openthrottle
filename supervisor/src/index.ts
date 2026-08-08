@@ -27,6 +27,11 @@ import { drainPipelineFeedbackSnapshots } from "./app/provider-feedback.js";
 import { createGithubWebhookReconciler } from "./operations/github-webhook-reconciliation.js";
 import { reconcileRepositoryWebhook } from "./providers/github/client.js";
 import { canSteerPipelineRun } from "./pipeline/control.js";
+import {
+  createRuntimeResourceReconciler,
+  HOT_PATH_RECLAIM_LIMIT,
+  HOT_PATH_RECLAIM_WAIT_TIMEOUT_MS,
+} from "./operations/runtime-resource-reclaim.js";
 
 const SWEEP_INTERVAL_MS = 15 * 60 * 1000; // run every 15 min while awake; SPEC only requires "on every boot" + periodic while awake
 const DELIVERY_DRAIN_INTERVAL_MS = 30 * 1000;
@@ -64,11 +69,18 @@ async function main() {
     taskTimeoutSeconds: cfg.taskTimeout,
     materializeCredentialEnv: createCredentialMaterializer(cfg, store),
   });
+  const reconcileRuntimeResources = createRuntimeResourceReconciler({
+    store: pipelineStore,
+    tickets: store,
+    runtime,
+  });
   const pipelineEffectProcessor = createPipelineEffectProcessor({
     store: pipelineStore,
     tickets: store,
     runtime,
     taskTimeoutSeconds: cfg.taskTimeout,
+    runtimeResourceRetentionMinutes: cfg.runtimeResourceRetentionMinutes,
+    reconcileRuntimeResources,
     captureCodexAuth: (blob) => {
       captureCodexAuthJson(store, blob);
     },
@@ -92,6 +104,13 @@ async function main() {
     reconcileRepositoryWebhook,
     concurrency: WEBHOOK_RECONCILIATION_CONCURRENCY,
   });
+  const reconcileRuntimeCapacity = () =>
+    reconcileRuntimeResources({
+      cutoffIso: new Date(Date.now() - cfg.runtimeResourceRetentionMinutes * 60_000).toISOString(),
+      limit: HOT_PATH_RECLAIM_LIMIT,
+      trigger: "capacity-constrained admission preflight",
+      waitTimeoutMs: HOT_PATH_RECLAIM_WAIT_TIMEOUT_MS,
+    });
   const deliveryProcessor = createServerWebhookDeliveryProcessor({
     cfg,
     store,
@@ -99,6 +118,7 @@ async function main() {
     getLinearClient,
     linearOutbox: linearOutboxProcessor,
     pipelineCoordinator,
+    reconcileRuntimeCapacity,
   });
 
   const app = createServer({
@@ -200,7 +220,15 @@ async function main() {
   githubPublicationProcessor.drain().catch((err) => console.error("[github-publication] boot drain failed:", err));
   pipelineEffectProcessor.drain().catch((err) => console.error("[pipeline-effects] boot drain failed:", err));
   pollActiveSandboxes().catch((err) => console.error("[sandbox-events] boot poll failed:", err));
-  runSweep(runtime, store, cfg, pipelineStore, activityPublisher, reconcileGithubWebhooks)
+  runSweep(
+    runtime,
+    store,
+    cfg,
+    pipelineStore,
+    activityPublisher,
+    reconcileGithubWebhooks,
+    reconcileRuntimeResources
+  )
     .catch((err) => console.error("[sweep] boot sweep failed:", err));
   const reapStalled = () =>
     reapStalledRuns({ runtime, store, activityPublisher, cfg, pipelines: pipelineStore }).catch((err) =>
@@ -227,7 +255,15 @@ async function main() {
     );
   }, cfg.sandboxEventPollIntervalMs).unref();
   setInterval(() => {
-    runSweep(runtime, store, cfg, pipelineStore, activityPublisher, reconcileGithubWebhooks)
+    runSweep(
+      runtime,
+      store,
+      cfg,
+      pipelineStore,
+      activityPublisher,
+      reconcileGithubWebhooks,
+      reconcileRuntimeResources
+    )
       .catch((err) => console.error("[sweep] interval sweep failed:", err));
   }, SWEEP_INTERVAL_MS).unref();
 

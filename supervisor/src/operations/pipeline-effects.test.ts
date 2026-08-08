@@ -21,6 +21,7 @@ import type { GateReceiptReason } from "../pipeline/gates.js";
 import type { ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
 import type { PipelineInstance, PipelineStageAttempt } from "../pipeline/store.js";
 import type { LinearOutboxRecord } from "../persistence/delivery-store.js";
+import type { RuntimeResourceReconciler } from "./runtime-resource-reclaim.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
 const structuredGraphPath = fileURLToPath(new URL("../../graphs/structured-v1.json", import.meta.url));
@@ -59,7 +60,11 @@ describe("pipeline effect processor", () => {
     } satisfies SandboxRuntime & SandboxAutostopRuntime;
   }
 
-  function harness(issueId: string, sessionId: string) {
+  function harness(
+    issueId: string,
+    sessionId: string,
+    options: { reconcileRuntimeResources?: RuntimeResourceReconciler } = {}
+  ) {
     db = openDb(":memory:");
     const pipelines = createPipelineStore(db);
     const tickets = createSupervisorStore(db, pipelines);
@@ -100,11 +105,15 @@ describe("pipeline effect processor", () => {
       tickets,
       runtime,
       taskTimeoutSeconds: 300,
+      runtimeResourceRetentionMinutes: 60,
+      ...(options.reconcileRuntimeResources
+        ? { reconcileRuntimeResources: options.reconcileRuntimeResources }
+        : {}),
       now: () => new Date("2099-07-22T12:00:00.000Z"),
     });
     const instance = pipelines.getInstanceForSession(sessionId)!;
     const attempt = pipelines.getActiveAttempt(instance.id)!;
-    return { tickets, pipelines, runtime, processor, instance, attempt };
+    return { tickets, pipelines, runtime, processor, instance, attempt, catalog, config, runtimeDescriptor };
   }
 
   function rewriteEffectPayload(
@@ -339,6 +348,7 @@ describe("pipeline effect processor", () => {
       tickets,
       runtime,
       taskTimeoutSeconds: 300,
+      runtimeResourceRetentionMinutes: 60,
       now: () => new Date("2099-07-22T12:00:00.000Z"),
     });
 
@@ -557,6 +567,7 @@ describe("pipeline effect processor", () => {
       tickets,
       runtime,
       taskTimeoutSeconds: 300,
+      runtimeResourceRetentionMinutes: 60,
       now: () => new Date("2099-07-22T12:00:00.000Z"),
     });
 
@@ -773,6 +784,7 @@ describe("pipeline effect processor", () => {
       tickets,
       runtime,
       taskTimeoutSeconds: 300,
+      runtimeResourceRetentionMinutes: 60,
       now: () => new Date("2099-07-22T12:00:00.000Z"),
     });
 
@@ -889,6 +901,7 @@ describe("pipeline effect processor", () => {
       tickets,
       runtime,
       taskTimeoutSeconds: 300,
+      runtimeResourceRetentionMinutes: 60,
       now: () => new Date("2099-07-22T12:00:00.000Z"),
     });
     const completedSubject = "1".repeat(40);
@@ -1342,6 +1355,7 @@ describe("pipeline effect processor", () => {
       tickets,
       runtime,
       taskTimeoutSeconds: 300,
+      runtimeResourceRetentionMinutes: 60,
       now: () => new Date("2099-07-22T12:00:00.000Z"),
     });
 
@@ -1477,6 +1491,7 @@ describe("pipeline effect processor", () => {
       tickets,
       runtime,
       taskTimeoutSeconds: 300,
+      runtimeResourceRetentionMinutes: 60,
       now: () => new Date("2099-07-22T12:00:00.000Z"),
     });
 
@@ -1587,6 +1602,7 @@ describe("pipeline effect processor", () => {
       tickets,
       runtime,
       taskTimeoutSeconds: 300,
+      runtimeResourceRetentionMinutes: 60,
       now: () => new Date("2099-07-22T12:00:00.000Z"),
     });
     const latestAction = () => [...pipelines.listWorkAttempts(attempt.id)].reverse()
@@ -1870,6 +1886,7 @@ describe("pipeline effect processor", () => {
       tickets,
       runtime,
       taskTimeoutSeconds: 300,
+      runtimeResourceRetentionMinutes: 60,
       now: () => new Date("2099-07-22T12:00:00.000Z"),
     });
 
@@ -2234,6 +2251,80 @@ describe("pipeline effect processor", () => {
         status: "failed",
         attempts: 1,
         next_attempt_at: "2099-07-22T12:05:00.000Z",
+    });
+    expect(pipelines.getInstance(instance.id)).toMatchObject({ terminal_outcome: null });
+  });
+
+  it("reconciles eligible terminal stopped runtime resources once on a capacity error", async () => {
+    const { pipelines, tickets, runtime, processor, instance, catalog, config, runtimeDescriptor } =
+      harness("issue-capacity-reconcile", "session-capacity-reconcile");
+    // A second, unrelated terminal instance whose resource was stopped-but-
+    // preserved (the needs_human cleanup effect) and is well past its
+    // retention window -- exactly what the capacity-triggered reconciler
+    // should be able to free up before the provision retry is scheduled.
+    const manifest = catalog.manifests.get("fixture/command@2")!;
+    tickets.upsert({
+      linear_issue_id: "issue-stale-needs-human",
+      linear_issue_identifier: "ISSUE-STALE-NEEDS-HUMAN",
+      linear_session_id: "session-stale-needs-human",
+      sandbox_id: null,
+      branch: "ot/issue-stale-needs-human",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+      pipeline: {
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        manifest,
+        repositoryConfig: config,
+        runtime: runtimeDescriptor,
+        authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "investigate",
+      },
+    });
+    const staleInstance = pipelines.getInstanceForSession("session-stale-needs-human")!;
+    pipelines.bindRuntimeResource(staleInstance.id, "daytona", "sandbox-stale-needs-human");
+    pipelines.setRuntimeResourceStatus(staleInstance.id, "stopped");
+    tickets.setSandboxId("issue-stale-needs-human", "sandbox-stale-needs-human");
+    db!.prepare(`
+      UPDATE pipeline_effect_intents SET status = 'acknowledged'
+      WHERE pipeline_instance_id = ? AND status = 'pending'
+    `).run(staleInstance.id);
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'needs_human', terminal_outcome = 'needs_human', active_stage_id = NULL,
+          runtime_resource_updated_at = '2020-01-01T00:00:00.000Z'
+      WHERE id = ?
+    `).run(staleInstance.id);
+
+    runtime.provision.mockRejectedValue(new Error("Total memory limit exceeded"));
+    await processor.drain();
+
+    expect(runtime.cleanup).toHaveBeenCalledWith({ providerResourceId: "sandbox-stale-needs-human" });
+    expect(pipelines.getRuntimeResource(staleInstance.id)?.status).toBe("cleaned");
+    expect(pipelines.getInstance(instance.id)).toMatchObject({ terminal_outcome: null });
+  });
+
+  it("bounds capacity-triggered reconciliation below the effect lease", async () => {
+    const reconcileRuntimeResources = vi.fn<RuntimeResourceReconciler>(async () => ({
+      reclaimed: 0,
+      candidates: 1,
+    }));
+    const { pipelines, runtime, processor, instance } = harness(
+      "issue-capacity-bounded",
+      "session-capacity-bounded",
+      { reconcileRuntimeResources }
+    );
+    runtime.provision.mockRejectedValue(new Error("Total memory limit exceeded"));
+
+    await processor.drain();
+
+    expect(reconcileRuntimeResources).toHaveBeenCalledWith({
+      cutoffIso: "2099-07-22T11:00:00.000Z",
+      limit: 1,
+      trigger: "capacity-constrained effect drain",
+      waitTimeoutMs: 5_000,
     });
     expect(pipelines.getInstance(instance.id)).toMatchObject({ terminal_outcome: null });
   });
