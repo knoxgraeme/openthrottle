@@ -129,6 +129,19 @@ describe("analysis store", () => {
     expect(store.listRunOutcomes({ limit: 0 })).toHaveLength(1);
   });
 
+  it("rejects a non-safe-integer limit instead of silently falling back to the default", () => {
+    // Every other filter on this endpoint fails closed on a malformed value;
+    // `Number("abc")`/`Number("Infinity")`/`Number("1.5")` all reach here as
+    // a non-safe-integer number, and previously fell back to the 200-row
+    // default silently instead (PR #156 follow-up review).
+    db = setupPipelineStore().db;
+    const store = createAnalysisStore(db);
+
+    expect(() => store.listRunOutcomes({ limit: Number.NaN })).toThrow(/limit must be a safe integer/);
+    expect(() => store.listRunOutcomes({ limit: Number.POSITIVE_INFINITY })).toThrow(/limit must be a safe integer/);
+    expect(() => store.listRunOutcomes({ limit: 1.5 })).toThrow(/limit must be a safe integer/);
+  });
+
   it("rejects an unrecognized outcome, reason, or attribution instead of silently matching nothing", () => {
     db = setupPipelineStore().db;
     const store = createAnalysisStore(db);

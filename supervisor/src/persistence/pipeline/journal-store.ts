@@ -13,6 +13,14 @@ const TEXT_LIMIT = 2_000;
 const QUERY_LIMIT = 200;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+// Deliberately narrow: requires the 'T' separator and a trailing 'Z' or
+// numeric UTC offset so a loosely-formatted or ambiguous value (`0`,
+// `08/08/2026`) is rejected by shape before Date.parse ever sees it --
+// Date.parse's non-standard fallback parsing accepts both and would
+// otherwise silently query an unintended time range instead of failing closed
+// (backported from analysis-store.ts's queryTimestamp, PR #156 follow-up).
+const ISO_8601_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
+
 function bounded(value: string, max = TEXT_LIMIT): string {
   return sanitizeText(value).slice(0, max);
 }
@@ -98,9 +106,19 @@ function metadataForIssue(db: Database.Database, issueId: string): {
 
 function queryTimestamp(value: string | undefined, label: string): string | undefined {
   if (value === undefined) return undefined;
+  if (!ISO_8601_TIMESTAMP.test(value)) throw new Error(`${label} must be an ISO-8601 timestamp`);
   const timestamp = Date.parse(value);
   if (Number.isNaN(timestamp)) throw new Error(`${label} must be an ISO-8601 timestamp`);
   return new Date(timestamp).toISOString();
+}
+
+// Every other filter on this endpoint fails closed on a malformed value; a
+// non-safe-integer limit (`abc`, `1.5`, `Infinity`) must too instead of
+// silently falling back to the default (PR #156 follow-up review).
+function queryLimit(value: number | undefined): number {
+  if (value === undefined) return QUERY_LIMIT;
+  if (!Number.isSafeInteger(value)) throw new Error("limit must be a safe integer");
+  return Math.max(1, Math.min(value, QUERY_LIMIT));
 }
 
 export function createJournalStore(db: Database.Database, now: () => string): Pick<
@@ -141,8 +159,7 @@ export function createJournalStore(db: Database.Database, now: () => string): Pi
     listJournalEntries(query: OrchestrationJournalQuery): OrchestrationJournalEntry[] {
       const from = queryTimestamp(query.from, "from");
       const to = queryTimestamp(query.to, "to");
-      const requestedLimit = Number.isSafeInteger(query.limit) ? query.limit! : QUERY_LIMIT;
-      const limit = Math.max(1, Math.min(requestedLimit, QUERY_LIMIT));
+      const limit = queryLimit(query.limit);
       const filters: string[] = [];
       const args: unknown[] = [];
       if (query.issueId) {

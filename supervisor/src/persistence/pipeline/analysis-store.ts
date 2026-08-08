@@ -52,6 +52,15 @@ function enumFilter(value: string | undefined, label: string, vocab: readonly st
   return value;
 }
 
+// Every other filter on this endpoint fails closed on a malformed value; a
+// non-safe-integer limit (`abc`, `1.5`, `Infinity`) must too instead of
+// silently falling back to the default (PR #156 follow-up review).
+function queryLimit(value: number | undefined): number {
+  if (value === undefined) return QUERY_LIMIT;
+  if (!Number.isSafeInteger(value)) throw new Error("limit must be a safe integer");
+  return Math.max(1, Math.min(value, QUERY_LIMIT));
+}
+
 export function createAnalysisStore(db: Database.Database): AnalysisStore {
   return {
     listRunOutcomes(query) {
@@ -60,8 +69,7 @@ export function createAnalysisStore(db: Database.Database): AnalysisStore {
       const attribution = enumFilter(query.attribution, "attribution", FAULT_ATTRIBUTIONS);
       const from = queryTimestamp(query.from, "from");
       const to = queryTimestamp(query.to, "to");
-      const requestedLimit = Number.isSafeInteger(query.limit) ? query.limit! : QUERY_LIMIT;
-      const limit = Math.max(1, Math.min(requestedLimit, QUERY_LIMIT));
+      const limit = queryLimit(query.limit);
 
       const filters: string[] = [];
       const args: unknown[] = [];

@@ -78,4 +78,41 @@ describe("orchestration journal store", () => {
       to: "2026-07-27T01:00:00+02:00",
     })).toHaveLength(0);
   });
+
+  it("rejects a value Date.parse would loosely accept but that is not ISO-8601 shaped", () => {
+    // Date.parse's non-standard fallback parser accepts both of these
+    // (`0` -> epoch, `08/08/2026` -> a valid local date), so relying on
+    // Date.parse alone would silently query an unintended time range instead
+    // of failing closed (backported from analysis-store.ts, PR #156
+    // follow-up review).
+    db = openDb(":memory:");
+    seedTicket();
+    registerRepository("OT", "2026-07-27T00:00:00.000Z");
+    const journal = createJournalStore(db, () => "2026-07-27T00:00:00.000Z");
+
+    expect(() => journal.listJournalEntries({ issueId: "issue-1", from: "0" }))
+      .toThrow(/from must be an ISO-8601 timestamp/);
+    expect(() => journal.listJournalEntries({ issueId: "issue-1", from: "08/08/2026" }))
+      .toThrow(/from must be an ISO-8601 timestamp/);
+    expect(() => journal.listJournalEntries({ issueId: "issue-1", to: "2026-08-08" }))
+      .toThrow(/to must be an ISO-8601 timestamp/);
+  });
+
+  it("rejects a non-safe-integer limit instead of silently falling back to the default", () => {
+    // Every other filter on this endpoint fails closed on a malformed value;
+    // `Number("abc")`/`Number("Infinity")`/`Number("1.5")` all reach here as
+    // a non-safe-integer number, and previously fell back to the 200-row
+    // default silently instead (PR #156 follow-up review).
+    db = openDb(":memory:");
+    seedTicket();
+    registerRepository("OT", "2026-07-27T00:00:00.000Z");
+    const journal = createJournalStore(db, () => "2026-07-27T00:00:00.000Z");
+
+    expect(() => journal.listJournalEntries({ issueId: "issue-1", limit: Number.NaN }))
+      .toThrow(/limit must be a safe integer/);
+    expect(() => journal.listJournalEntries({ issueId: "issue-1", limit: Number.POSITIVE_INFINITY }))
+      .toThrow(/limit must be a safe integer/);
+    expect(() => journal.listJournalEntries({ issueId: "issue-1", limit: 1.5 }))
+      .toThrow(/limit must be a safe integer/);
+  });
 });
