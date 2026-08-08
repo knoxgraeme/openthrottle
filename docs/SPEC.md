@@ -227,6 +227,25 @@ on `runs` and `pipeline_stage_attempts` plus `STALL_TIMEOUT_SECONDS`. The sweep 
 reaps expired runs, releases or quarantines resources safely, and removes
 unbound Daytona orphans after `ORPHAN_GRACE_MINUTES`.
 
+A terminal instance's `stopped` runtime resource (e.g. the needs_human
+cleanup effect's `preserve` path, which stops rather than deletes so the
+workspace stays inspectable) is otherwise kept indefinitely and still counts
+against the Daytona memory quota. `operations/runtime-resource-reclaim.ts`
+deletes it once `RUNTIME_RESOURCE_RETENTION_MINUTES` has elapsed and the
+instance has no active stage attempt or unsettled effect intent; a resource
+is deleted only when its exact provider binding is still `stopped` on the
+owning (single-generation) `pipeline_instances` row, and the DB only records
+`cleaned` after provider deletion is confirmed (provider "not found" and
+duplicate cleanup both converge for free — see `cleanup()` in
+`providers/daytona/adapter.ts`). The periodic sweep runs this on the
+configured retention window; capacity-constrained provisioning
+(`app/admission-preflight.ts`'s `checkDaytonaCapacity`, and a provision/
+dispatch effect that fails with a capacity error in
+`operations/pipeline-effects.ts`) runs the identical pass once, with the same
+eligibility rule, before rejecting or retrying — never bypassing the
+retention window under capacity pressure, since doing so could destroy
+another operator's still-fresh diagnostic workspace.
+
 ## Sandbox stage contract
 
 The supervisor launches `/opt/openthrottle/entrypoint.sh` with paths to three
@@ -799,6 +818,7 @@ Optional/defaulted:
 - `DEFAULT_AGENT=codex`, plus the selected agent credential:
   `CLAUDE_CODE_OAUTH_TOKEN`, `CODEX_AUTH_JSON`, or `KIMI_CODE_API_KEY`;
 - `TASK_TIMEOUT=7200`, `ORPHAN_GRACE_MINUTES=5`,
+  `RUNTIME_RESOURCE_RETENTION_MINUTES=60`,
   `WEBHOOK_MAX_AGE_SECONDS=60`, `SANDBOX_EVENT_POLL_INTERVAL_MS=5000`,
   `STALL_TIMEOUT_SECONDS=900`, `ALLOW_LINEAR_MERGE=false`,
   `RUN_OUTCOME_RETENTION_DAYS=180`;

@@ -425,6 +425,14 @@ export interface PipelineStore extends ChildActionLivenessPort {
   bindRuntimeResource(instanceId: string, provider: string, providerResourceId: string): PipelineRuntimeResource;
   getRuntimeResource(instanceId: string): PipelineRuntimeResource | undefined;
   setRuntimeResourceStatus(instanceId: string, status: PipelineRuntimeResource["status"]): void;
+  /**
+   * Terminal instances whose bound runtime resource is `stopped` and has sat
+   * past `cutoffIso` (the configured diagnostic-retention window) — the
+   * candidate pool for `operations/runtime-resource-reclaim.ts`. Callers
+   * still re-check status, active attempt, and pending effects per candidate
+   * before deleting: this listing can be stale by the time it is consumed.
+   */
+  listReclaimableRuntimeResources(cutoffIso: string, limit?: number): PipelineInstance[];
   getActiveAttempt(instanceId: string): PipelineStageAttempt | undefined;
   listProviderReadyInstances(limit?: number): PipelineInstance[];
   listStages(instanceId: string): PipelineInstanceStage[];

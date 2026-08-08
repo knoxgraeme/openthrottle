@@ -53,6 +53,7 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
   | "bindRuntimeResource"
   | "getRuntimeResource"
   | "setRuntimeResourceStatus"
+  | "listReclaimableRuntimeResources"
   | "getActiveAttempt"
   | "listProviderReadyInstances"
   | "listStages"
@@ -591,6 +592,15 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
       `).run(status, timestamp, timestamp, instanceId);
       if (update.changes === 1) return;
       throw new Error(`pipeline instance ${instanceId} has no runtime resource`);
+    },
+    listReclaimableRuntimeResources(cutoffIso, limit = 50) {
+      return db.prepare(`
+        SELECT * FROM pipeline_instances
+        WHERE runtime_resource_status = 'stopped'
+          AND terminal_outcome IS NOT NULL
+          AND runtime_resource_updated_at <= ?
+        ORDER BY runtime_resource_updated_at LIMIT ?
+      `).all(cutoffIso, limit) as PipelineInstance[];
     },
     getActiveAttempt(instanceId) {
       return db.prepare(`

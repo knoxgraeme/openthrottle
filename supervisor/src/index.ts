@@ -27,6 +27,7 @@ import { drainPipelineFeedbackSnapshots } from "./app/provider-feedback.js";
 import { createGithubWebhookReconciler } from "./operations/github-webhook-reconciliation.js";
 import { reconcileRepositoryWebhook } from "./providers/github/client.js";
 import { canSteerPipelineRun } from "./pipeline/control.js";
+import { reclaimEligibleRuntimeResources } from "./operations/runtime-resource-reclaim.js";
 
 const SWEEP_INTERVAL_MS = 15 * 60 * 1000; // run every 15 min while awake; SPEC only requires "on every boot" + periodic while awake
 const DELIVERY_DRAIN_INTERVAL_MS = 30 * 1000;
@@ -69,6 +70,7 @@ async function main() {
     tickets: store,
     runtime,
     taskTimeoutSeconds: cfg.taskTimeout,
+    runtimeResourceRetentionMinutes: cfg.runtimeResourceRetentionMinutes,
     captureCodexAuth: (blob) => {
       captureCodexAuthJson(store, blob);
     },
@@ -92,6 +94,14 @@ async function main() {
     reconcileRepositoryWebhook,
     concurrency: WEBHOOK_RECONCILIATION_CONCURRENCY,
   });
+  const reconcileRuntimeCapacity = () =>
+    reclaimEligibleRuntimeResources({
+      store: pipelineStore,
+      tickets: store,
+      runtime,
+      cutoffIso: new Date(Date.now() - cfg.runtimeResourceRetentionMinutes * 60_000).toISOString(),
+      trigger: "capacity-constrained admission preflight",
+    });
   const deliveryProcessor = createServerWebhookDeliveryProcessor({
     cfg,
     store,
@@ -99,6 +109,7 @@ async function main() {
     getLinearClient,
     linearOutbox: linearOutboxProcessor,
     pipelineCoordinator,
+    reconcileRuntimeCapacity,
   });
 
   const app = createServer({

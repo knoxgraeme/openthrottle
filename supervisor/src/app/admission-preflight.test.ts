@@ -25,6 +25,8 @@ import { createLinearActivityPublisher } from "../providers/linear/outbox.js";
 import { loadPipelineCatalog } from "../pipeline/manifest.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
+import { setupPipelineStore, ticket } from "../__fixtures__/pipeline-store.js";
+import { reclaimEligibleRuntimeResources } from "../operations/runtime-resource-reclaim.js";
 
 const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
 
@@ -139,6 +141,178 @@ describe("runAdmissionPreflight", () => {
     expect(verdict).toEqual({ ok: true });
     expect(console.warn).toHaveBeenCalledOnce();
   });
+
+  it("runs the reconciler once and admits after it frees enough capacity", async () => {
+    const reconcile = vi.fn(async () => undefined);
+    let listed = [{ state: "stopped", memory: 8 }, { state: "stopped", memory: 8 }];
+    reconcile.mockImplementation(async () => {
+      listed = []; // simulates the reconciler deleting the eligible resources
+    });
+    const listSandboxes = vi.fn(async () => listed);
+
+    const verdict = await runAdmissionPreflight(
+      readCheckDeps({
+        fetch: async () => Response.json({ tree: [] }),
+        listSandboxes,
+        totalMemoryGib: 16,
+        sandboxMemoryGib: 8,
+        reconcile,
+      }),
+      target
+    );
+
+    expect(reconcile).toHaveBeenCalledOnce();
+    expect(listSandboxes).toHaveBeenCalledTimes(2);
+    expect(verdict).toEqual({ ok: true });
+  });
+
+  it("still rejects when the reconciler cannot free enough capacity", async () => {
+    const reconcile = vi.fn(async () => undefined);
+    const verdict = await runAdmissionPreflight(
+      readCheckDeps({
+        fetch: async () => Response.json({ tree: [] }),
+        listSandboxes: async () => [{ state: "started", memory: 8 }, { state: "started", memory: 8 }],
+        totalMemoryGib: 16,
+        sandboxMemoryGib: 8,
+        reconcile,
+      }),
+      target
+    );
+
+    expect(reconcile).toHaveBeenCalledOnce();
+    expect(verdict.ok).toBe(false);
+    if (verdict.ok) throw new Error("expected rejection");
+    expect(verdict.reason).toContain("Daytona capacity: 16 GiB of 16 GiB");
+  });
+
+  it("does not run the reconciler when capacity already fits", async () => {
+    const reconcile = vi.fn(async () => undefined);
+    const verdict = await runAdmissionPreflight(
+      readCheckDeps({
+        fetch: async () => Response.json({ tree: [] }),
+        listSandboxes: async () => [{ state: "stopped", memory: 2 }],
+        totalMemoryGib: 10,
+        sandboxMemoryGib: 8,
+        reconcile,
+      }),
+      target
+    );
+
+    expect(reconcile).not.toHaveBeenCalled();
+    expect(verdict).toEqual({ ok: true });
+  });
+
+  it("falls back to the prior usage estimate, without crashing, when the reconciler itself throws", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const reconcile = vi.fn(async () => {
+      throw new Error("reconciliation unavailable");
+    });
+    const verdict = await runAdmissionPreflight(
+      readCheckDeps({
+        fetch: async () => Response.json({ tree: [] }),
+        listSandboxes: async () => [{ state: "started", memory: 8 }, { state: "started", memory: 8 }],
+        totalMemoryGib: 16,
+        sandboxMemoryGib: 8,
+        reconcile,
+      }),
+      target
+    );
+
+    // A broken reconciler must not crash the preflight; it just cannot free
+    // anything, so the original over-quota verdict stands.
+    expect(reconcile).toHaveBeenCalledOnce();
+    expect(verdict.ok).toBe(false);
+    if (verdict.ok) throw new Error("expected rejection");
+    expect(verdict.reason).toContain("Daytona capacity: 16 GiB of 16 GiB");
+  });
+
+  it(
+    "OPE-75 regression: reclaims three stopped 8 GiB terminal resources filling a 24 GiB quota " +
+      "so a fourth follow-up run provisions without operator intervention",
+    async () => {
+      const setup = setupPipelineStore();
+      const { db: fixtureDb, tickets, pipelines, catalog, snapshot } = setup;
+      try {
+        const manifest = catalog.manifests.get("fixture/command@1")!;
+        const aliveSandboxes = new Map<string, number>();
+        const seedTerminalStoppedInstance = (sessionId: string, resourceId: string) => {
+          tickets.upsert({
+            ...ticket(sessionId),
+            pipeline: {
+              repository: "owner/repo",
+              baseCommit: "a".repeat(40),
+              manifest,
+              repositoryConfig: snapshot,
+              runtime: setup.runtime,
+              authorizedCapabilities: manifest.manifest.requires.capabilities,
+              taskType: "implement",
+            },
+          });
+          const instance = pipelines.getInstanceForSession(sessionId)!;
+          pipelines.bindRuntimeResource(instance.id, "daytona", resourceId);
+          pipelines.setRuntimeResourceStatus(instance.id, "stopped");
+          tickets.setSandboxId(instance.linear_issue_id, resourceId);
+          fixtureDb.prepare(`
+            UPDATE pipeline_effect_intents SET status = 'acknowledged'
+            WHERE pipeline_instance_id = ? AND status = 'pending'
+          `).run(instance.id);
+          fixtureDb.prepare(`
+            UPDATE pipeline_instances
+            SET status = 'needs_human', terminal_outcome = 'needs_human', active_stage_id = NULL,
+                runtime_resource_updated_at = '2020-01-01T00:00:00.000Z'
+            WHERE id = ?
+          `).run(instance.id);
+          aliveSandboxes.set(resourceId, 8);
+          return instance;
+        };
+
+        // Exactly the OPE-74/OPE-73/OPE-58 dogfood inventory: three stopped
+        // 8 GiB terminal (needs_human) resources filling a 24 GiB quota.
+        const stale = [
+          seedTerminalStoppedInstance("session-ope-73", "sandbox-ope-73"),
+          seedTerminalStoppedInstance("session-ope-72", "sandbox-ope-72"),
+          seedTerminalStoppedInstance("session-ope-58", "sandbox-ope-58"),
+        ];
+        expect(aliveSandboxes.size).toBe(3);
+
+        const reconcile = () =>
+          reclaimEligibleRuntimeResources({
+            store: pipelines,
+            tickets,
+            runtime: {
+              cleanup: async ({ providerResourceId }) => {
+                aliveSandboxes.delete(providerResourceId);
+              },
+            },
+            cutoffIso: "2999-01-01T00:00:00.000Z",
+            trigger: "capacity-constrained admission preflight",
+          });
+
+        const verdict = await runAdmissionPreflight(
+          readCheckDeps({
+            fetch: async () => Response.json({ tree: [] }),
+            listSandboxes: async () =>
+              [...aliveSandboxes.entries()].map(([, memory]) => ({ state: "stopped", memory })),
+            totalMemoryGib: 24,
+            sandboxMemoryGib: 8,
+            reconcile,
+          }),
+          target
+        );
+
+        // The fourth follow-up run provisions -- no operator had to stop or
+        // delete an existing sandbox by hand.
+        expect(verdict).toEqual({ ok: true });
+        expect(aliveSandboxes.size).toBe(0);
+        for (const instance of stale) {
+          expect(pipelines.getRuntimeResource(instance.id)?.status).toBe("cleaned");
+          expect(tickets.getByIssueId(instance.linear_issue_id)?.sandbox_id).toBeNull();
+        }
+      } finally {
+        fixtureDb.close();
+      }
+    }
+  );
 });
 
 describe("admission preflight wired into Linear admission", () => {
@@ -172,6 +346,7 @@ describe("admission preflight wired into Linear admission", () => {
       kimiCodeApiKey: undefined,
       taskTimeout: 300,
       orphanGraceMinutes: 5,
+      runtimeResourceRetentionMinutes: 60,
       runOutcomeRetentionDays: 180,
       webhookMaxAgeSeconds: 60,
       allowLinearMerge: false,

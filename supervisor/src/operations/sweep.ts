@@ -2,13 +2,19 @@ import type { Config } from "../app/config.js";
 import type { ActivityPublicationPort } from "../app/ports.js";
 import type { SupervisorStore } from "../persistence/store.js";
 import type { PipelineStore } from "../pipeline/store.js";
-import type { RuntimeInventory, RuntimeInventoryResource, RuntimeStopper } from "../runtime/contracts.js";
+import type { RuntimeInventory, RuntimeInventoryResource, RuntimeStopper, SandboxRuntime } from "../runtime/contracts.js";
 import { reapExpiredRuns } from "./reaper.js";
+import { reclaimEligibleRuntimeResources } from "./runtime-resource-reclaim.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const MINUTE_MS = 60 * 1000;
 
 function daysAgoIso(days: number): string {
   return new Date(Date.now() - days * DAY_MS).toISOString();
+}
+
+function minutesAgoIso(minutes: number): string {
+  return new Date(Date.now() - minutes * MINUTE_MS).toISOString();
 }
 
 /**
@@ -19,7 +25,7 @@ function daysAgoIso(days: number): string {
  *    delete (orphans).
  */
 export async function runSweep(
-  runtime: RuntimeInventory & RuntimeStopper,
+  runtime: RuntimeInventory & RuntimeStopper & Pick<SandboxRuntime, "cleanup">,
   store: SupervisorStore,
   cfg: Config,
   pipelines: PipelineStore,
@@ -33,6 +39,17 @@ export async function runSweep(
     console.error("[sweep] webhook reconciliation failed:", error);
   }
   await deleteOrphanSandboxes(runtime, store, cfg);
+  try {
+    await reclaimEligibleRuntimeResources({
+      store: pipelines,
+      tickets: store,
+      runtime,
+      cutoffIso: minutesAgoIso(cfg.runtimeResourceRetentionMinutes),
+      trigger: "runtime-resource-retention sweep",
+    });
+  } catch (error) {
+    console.error("[sweep] runtime resource reclaim failed:", error);
+  }
   const retentionCutoff = daysAgoIso(7);
   store.pruneDeliveries(retentionCutoff);
   store.pruneSandboxEvents(retentionCutoff);

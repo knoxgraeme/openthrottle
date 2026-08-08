@@ -15,6 +15,7 @@ import type { RuntimeResource, SandboxAutostopRuntime, SandboxRuntime } from "..
 import { sanitizeText } from "../shared/sanitize.js";
 import { terminateAndSettleActor } from "./actor-settlement.js";
 import { createStructuredChildRuntime } from "./structured-child-runtime.js";
+import { reclaimEligibleRuntimeResources } from "./runtime-resource-reclaim.js";
 
 const EFFECT_LEASE_MS = 60_000;
 const RETRY_BASE_MS = 5_000;
@@ -65,6 +66,13 @@ interface PipelineEffectProcessorDeps {
   tickets: SupervisorStore;
   runtime: SandboxRuntime & SandboxAutostopRuntime;
   taskTimeoutSeconds: number;
+  // OPE-75: bounded diagnostic-retention window a terminal instance's stopped
+  // runtime resource must clear before the reclaim path may delete it. Used
+  // to run one reconciliation pass here too when a provision/dispatch effect
+  // hits a provider capacity error, alongside the periodic sweep and the
+  // capacity-constrained admission preflight (the same eligibility rule
+  // everywhere -- see operations/runtime-resource-reclaim.ts).
+  runtimeResourceRetentionMinutes: number;
   now?: () => Date;
   // Persists a Codex OAuth blob rotated inside one structured child action's
   // own scoped CODEX_HOME. Supplied by the caller (see index.ts) rather than
@@ -633,6 +641,20 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       // reroute live actors into quarantine on the first provider auth blip.
       const exhausted = (errorClass === "auth" && effect.kind !== "stop") ||
         effect.attempts >= MAX_EFFECT_ATTEMPTS;
+      if (!exhausted && errorClass === "capacity") {
+        try {
+          await reclaimEligibleRuntimeResources({
+            store: deps.store,
+            tickets: deps.tickets,
+            runtime: deps.runtime,
+            cutoffIso: new Date(now().getTime() - deps.runtimeResourceRetentionMinutes * 60_000).toISOString(),
+            trigger: "capacity-constrained effect drain",
+          });
+        } catch (reclaimError) {
+          console.error("[pipeline-effects] runtime resource reconciliation failed:",
+            sanitizeText(String(reclaimError)).slice(-500));
+        }
+      }
       const retryAt = exhausted
         ? null
         : errorClass === "capacity"

@@ -165,11 +165,17 @@ export function createServerWebhookDeliveryProcessor(deps: {
   getLinearClient: () => Promise<LinearClient | undefined>;
   linearOutbox?: LinearOutboxProcessor;
   pipelineCoordinator: PipelineCoordinatorContext;
+  // OPE-75: best-effort reclaim of eligible terminal stopped runtime
+  // resources, wired in index.ts (operations/runtime-resource-reclaim.ts).
+  // The admission preflight runs this once before rejecting a delegation on
+  // capacity. Kept as a generic callback here so http/ stays clear of an
+  // operations/ import (see __tests__/architecture.test.ts boundary map).
+  reconcileRuntimeCapacity?: () => Promise<unknown>;
 }): WebhookDeliveryProcessor {
   const linearOutbox =
     deps.linearOutbox ??
     createLinearOutboxProcessor({ store: deps.store, getLinearClient: deps.getLinearClient });
-  const admissionPreflight = createAdmissionPreflight(deps.cfg, deps.runtime);
+  const admissionPreflight = createAdmissionPreflight(deps.cfg, deps.runtime, deps.reconcileRuntimeCapacity);
   const activityPublisher = createLinearActivityPublisher(deps.store, linearOutbox);
   const createSessionServicePorts = (linear: LinearClient): SessionServicePorts => ({
     activityPublisher,
