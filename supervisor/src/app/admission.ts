@@ -587,6 +587,7 @@ async function resolvePipelineSelection(
       version: builtinGraph.version,
       description: builtinGraph.description,
       maxAttempts: 200,
+      ...(source.ref === "core/structured@2" ? { aggregatePublishContext: "prefer_resume" as const } : {}),
     } : {
       id: manifestId,
       description: `Compiled execution graph ${graphId} from ${blobDescription}.`,

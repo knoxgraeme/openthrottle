@@ -194,6 +194,7 @@ describe("coordinator-only server", () => {
     const compiled = parseAndCompileExecutionGraph(readFileSync(structuredGraphPath, "utf8"), {
       source: structuredGraphPath,
       runtime: runtime.descriptor,
+      aggregatePublishContext: "prefer_resume",
     });
     pipelines.acceptRuntimeDescriptor(runtime);
     pipelines.acceptManifest(compiled.manifest);
