@@ -73,6 +73,7 @@ export interface PipelineReductionInput {
   manifest: PipelineManifest;
   instance: PipelineInstance;
   attempt: PipelineStageAttempt;
+  attempts?: readonly PipelineStageAttempt[];
   stages: readonly PipelineInstanceStage[];
   event: PipelineCoordinatorEvent;
 }
@@ -154,18 +155,22 @@ function activeStage(input: PipelineReductionInput): PipelineStage {
   return stage;
 }
 
-function successPathIncludesPublication(manifest: PipelineManifest): boolean {
-  const visited = new Set<string>();
-  let current: string | undefined = manifest.entry_stage;
-  while (current && !visited.has(current)) {
-    const stage = manifest.stages.find((candidate) => candidate.id === current);
-    if (!stage) return false;
-    if (stage.executor.kind === "agent" && stage.executor.capability === PUBLISH_CAPABILITY) return true;
-    if (stage.executor.kind === "provider_wait") return true;
-    visited.add(current);
-    current = stage.transitions.success?.to;
-  }
-  return false;
+function isPublicationStage(stage: PipelineStage): boolean {
+  return (stage.executor.kind === "agent" && stage.executor.capability === PUBLISH_CAPABILITY) ||
+    stage.executor.kind === "provider_wait";
+}
+
+function executionIncludesPublication(
+  input: PipelineReductionInput,
+  active: PipelineStage
+): boolean {
+  if (isPublicationStage(active)) return true;
+  const stagesById = new Map(input.manifest.stages.map((stage) => [stage.id, stage]));
+  return (input.attempts ?? [input.attempt]).some((attempt) => {
+    if (attempt.status !== "completed" || attempt.outcome !== "success") return false;
+    const stage = stagesById.get(attempt.stage_id);
+    return stage ? isPublicationStage(stage) : false;
+  });
 }
 
 function eventHasExactPublishedSubject(input: PipelineReductionInput, stage: PipelineStage): boolean {
@@ -185,11 +190,12 @@ function eventHasExactPublishedSubject(input: PipelineReductionInput, stage: Pip
 
 function terminalRequiresExactPublicationEvidence(
   input: PipelineReductionInput,
+  stage: PipelineStage,
   terminal: PipelineOutcome,
   clearsPublishedBinding: boolean
 ): boolean {
   return terminal === "shipped"
-    ? successPathIncludesPublication(input.manifest)
+    ? executionIncludesPublication(input, stage)
     : terminal === "no_change" &&
       !clearsPublishedBinding &&
       (input.instance.published_commit !== null || input.instance.published_subject !== null);
@@ -202,7 +208,7 @@ function assertTerminalPublishedBinding(
   clearsPublishedBinding: boolean
 ): void {
   if (
-    terminalRequiresExactPublicationEvidence(input, terminal, clearsPublishedBinding) &&
+    terminalRequiresExactPublicationEvidence(input, stage, terminal, clearsPublishedBinding) &&
     !eventHasExactPublishedSubject(input, stage)
   ) {
     throw new Error("publishing pipeline cannot settle terminal without exact published provider evidence");
@@ -741,7 +747,8 @@ export function coordinatePipelineEvent(
   if (!attempt) throw new Error(`unknown pipeline attempt ${event.attemptId}`);
   const manifest = JSON.parse(instance.normalized_manifest) as PipelineManifest;
   const stages = store.listStages(instance.id);
-  const write = reducePipelineEvent({ manifest, instance, attempt, stages, event });
+  const attempts = store.listAttempts(instance.id);
+  const write = reducePipelineEvent({ manifest, instance, attempt, attempts, stages, event });
   write.exhaustedEffectId = event.exhaustedEffectId;
   write.exhaustedEffectError = event.exhaustedEffectError;
   write.gateReceipt = gateReceipt;
