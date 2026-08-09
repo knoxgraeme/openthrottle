@@ -162,6 +162,35 @@ describe("normalized stage artifacts", () => {
     expect(() => validateStandardReceipt({ ...receipt, payload: {} }, {}))
       .toThrow(/payload rationale/);
 
+    const commandReceipt = {
+      ...receipt,
+      type: "command_result",
+      assurance: "executor_verified",
+      result: "failure",
+      producer: { ...receipt.producer, skill: "builtin://command@1" },
+      payload: {
+        command: "test",
+        exit_code: 1,
+        summary: "Tests failed.",
+        stdout_tail: "AssertionError: expected 2 to equal 3",
+        stderr_tail: "FAIL runner/command.test.mjs",
+      },
+    };
+    expect(validateStandardReceipt(commandReceipt, {}).payload).toMatchObject({
+      stdout_tail: "AssertionError: expected 2 to equal 3",
+      stderr_tail: "FAIL runner/command.test.mjs",
+    });
+    for (const [result, tail] of [
+      ["success", { stdout_tail: "tests passed" }],
+      ["not_configured", { stderr_tail: "no command configured" }],
+    ]) {
+      expect(() => validateStandardReceipt({
+        ...commandReceipt,
+        result,
+        payload: { ...commandReceipt.payload, ...tail },
+      }, {})).toThrow(/diagnostic tails are only valid for failed command receipts/);
+    }
+
     const artifacts = buildStandardReceiptArtifacts({
       receipt,
       fence: {

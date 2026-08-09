@@ -495,6 +495,11 @@ export function validateStandardReceipt(value, env = process.env) {
   const evidence = boundedStrings(input.evidence, "standard receipt evidence", 32, 1_000, env);
   const issuedAt = boundedText(input.issued_at, "standard receipt issued_at", 64, env);
   if (Number.isNaN(Date.parse(issuedAt))) throw new Error("standard receipt issued_at is invalid");
+  const payload = receiptPayload(input.type, input.payload, env);
+  if (input.type === "command_result" && input.result !== "failure"
+      && (payload.stdout_tail !== undefined || payload.stderr_tail !== undefined)) {
+    throw new Error("standard receipt payload diagnostic tails are only valid for failed command receipts");
+  }
   return {
     schema: STANDARD_RECEIPT_SCHEMA,
     type: input.type,
@@ -519,7 +524,7 @@ export function validateStandardReceipt(value, env = process.env) {
       request_hash: fence.request_hash,
     },
     evidence,
-    payload: receiptPayload(input.type, input.payload, env),
+    payload,
     issued_at: issuedAt,
   };
 }

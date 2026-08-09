@@ -406,6 +406,10 @@ export function validateStandardReceipt(
     payload: parsePayload(type, input.payload, `${source}.payload`),
     issued_at: timestamp(input.issued_at, `${source}.issued_at`),
   } as StandardReceipt;
+  if (receipt.type === "command_result" && receipt.result !== "failure"
+      && (receipt.payload.stdout_tail !== undefined || receipt.payload.stderr_tail !== undefined)) {
+    fail(`${source}.payload`, "diagnostic tails are only valid for failed command receipts");
+  }
   if (SEMANTIC_RECEIPTS.has(type) && ["executor_verified", "provider_verified", "human_approved"].includes(receipt.assurance)) {
     fail(`${source}.assurance`, "semantic receipts cannot claim executor, provider, or human assurance");
   }
