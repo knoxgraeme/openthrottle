@@ -2484,6 +2484,26 @@ describe("pipeline publication", () => {
     expect(publication.body).toContain(`tree/${SUBJECT}`);
   });
 
+  it("does not render an unbound no_change published_commit as current", () => {
+    const { instance, attempt } = setup();
+    const publishedCommit = "d".repeat(40);
+    const publication = buildLifecyclePublication({
+      instance: {
+        ...instance,
+        status: "no_change",
+        terminal_outcome: "no_change",
+        immutable_subject: SUBJECT,
+        published_commit: publishedCommit,
+        published_subject: null,
+      },
+      attempt,
+      outcome: "no_change",
+      reason: "A later repair round found nothing further to change.",
+    });
+    expect(publication.body).toContain("no pull request was created");
+    expect(publication.body).not.toContain("already-published tree remains current");
+  });
+
   it("still reports no pull request was created for an ordinary no_change with a sealed subject but no publish", () => {
     // immutable_subject is sealed on every stage result regardless of
     // publication (it is just the workspace's current commit); only
