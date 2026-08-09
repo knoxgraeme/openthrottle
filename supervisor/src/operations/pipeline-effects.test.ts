@@ -24,7 +24,7 @@ import type { LinearOutboxRecord } from "../persistence/delivery-store.js";
 import type { RuntimeResourceReconciler } from "./runtime-resource-reclaim.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
-const structuredGraphPath = fileURLToPath(new URL("../../graphs/structured-v1.json", import.meta.url));
+const structuredGraphPath = fileURLToPath(new URL("../../graphs/structured-v2.json", import.meta.url));
 
 describe("pipeline effect processor", () => {
   let db: Database.Database | undefined;
@@ -500,7 +500,7 @@ describe("pipeline effect processor", () => {
       "    ref: core/simple@1",
       "  - id: structured",
       "    kind: builtin",
-      "    ref: core/structured@1",
+      "    ref: core/structured@2",
       "commands: { test: npm test, lint: npm run lint, build: npm run build }",
       "pipelines: { implement: implement }",
     ].join("\n"));
@@ -660,7 +660,7 @@ describe("pipeline effect processor", () => {
       "    ref: core/simple@1",
       "  - id: structured",
       "    kind: builtin",
-      "    ref: core/structured@1",
+      "    ref: core/structured@2",
       "commands: { test: npm test, lint: npm run lint, build: npm run build }",
       "pipelines: { implement: implement }",
     ].join("\n"));
@@ -819,7 +819,7 @@ describe("pipeline effect processor", () => {
       "    ref: core/simple@1",
       "  - id: structured",
       "    kind: builtin",
-      "    ref: core/structured@1",
+      "    ref: core/structured@2",
       "commands: { test: npm test, lint: npm run lint, build: npm run build }",
       "pipelines: { implement: implement }",
     ].join("\n"));
@@ -1342,7 +1342,7 @@ describe("pipeline effect processor", () => {
       "    ref: core/simple@1",
       "  - id: structured",
       "    kind: builtin",
-      "    ref: core/structured@1",
+      "    ref: core/structured@2",
       "commands: { test: npm test, lint: npm run lint, build: npm run build }",
       "pipelines: { implement: implement }",
     ].join("\n"));
@@ -1478,7 +1478,7 @@ describe("pipeline effect processor", () => {
       "    ref: core/simple@1",
       "  - id: structured",
       "    kind: builtin",
-      "    ref: core/structured@1",
+      "    ref: core/structured@2",
       "commands: { test: npm test, lint: npm run lint, build: npm run build }",
       "pipelines: { implement: implement }",
     ].join("\n"));
@@ -1589,7 +1589,7 @@ describe("pipeline effect processor", () => {
       "    ref: core/simple@1",
       "  - id: structured",
       "    kind: builtin",
-      "    ref: core/structured@1",
+      "    ref: core/structured@2",
       "commands: { test: npm test, lint: npm run lint, build: npm run build }",
       "pipelines: { implement: implement }",
     ].join("\n"));

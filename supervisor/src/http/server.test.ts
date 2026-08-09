@@ -15,7 +15,7 @@ import { parseAndCompileExecutionGraph } from "../pipeline/execution-graph.js";
 import { buildInstalledRuntimeDescriptor, type RuntimeInventory, type RuntimeLogs, type RuntimeSnapshotReadiness } from "../__fixtures__/runtime.js";
 import { createServer, createServerWebhookDeliveryProcessor } from "./server.js";
 
-const structuredGraphPath = fileURLToPath(new URL("../../graphs/structured-v1.json", import.meta.url));
+const structuredGraphPath = fileURLToPath(new URL("../../graphs/structured-v2.json", import.meta.url));
 
 const cfg: Config = {
   port: 3000,
@@ -201,7 +201,7 @@ describe("coordinator-only server", () => {
       repository: "owner/repo",
       baseCommit: "a".repeat(40),
       blobSha: "b".repeat(40),
-      config: parseRepositoryConfig("schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }, { id: structured, kind: builtin, ref: builtin/structured@1 }]\npipelines: { implement: structured }\n"),
+      config: parseRepositoryConfig("schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }, { id: structured, kind: builtin, ref: core/structured@2 }]\npipelines: { implement: structured }\n"),
     });
     store.upsert({
       linear_issue_id: "issue-1",

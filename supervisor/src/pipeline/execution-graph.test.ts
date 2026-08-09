@@ -12,7 +12,8 @@ import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 const catalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
 const simpleGraphPath = fileURLToPath(new URL("../../graphs/simple-v1.json", import.meta.url));
 const investigateGraphPath = fileURLToPath(new URL("../../graphs/investigate-v1.json", import.meta.url));
-const structuredGraphPath = fileURLToPath(new URL("../../graphs/structured-v1.json", import.meta.url));
+const structuredV1GraphPath = fileURLToPath(new URL("../../graphs/structured-v1.json", import.meta.url));
+const structuredV2GraphPath = fileURLToPath(new URL("../../graphs/structured-v2.json", import.meta.url));
 const SIMPLE_GRAPH_DIGEST = "2f25ae9b891405d0e73e5f3c0f103354183c8cb27ca923cbd06baa6c470b76d1";
 const SIMPLE_MANIFEST_DIGEST = "9b705c003313187cb2f7e219c99e1cbf795d966be0e1d257015462219833ac6a";
 const INVESTIGATE_GRAPH_DIGEST = "a76d3e1360d92f41bc7aa9ed2372e294555478d5854808bf0c2a5ed7febaf317";
@@ -225,7 +226,7 @@ describe("execution graph compiler", () => {
     });
   });
 
-  it("compiles for_each_unit to the structured graph runtime capability with test descriptors", () => {
+  it("keeps built-in structured v1 on the legacy aggregate terminal behavior", () => {
     const runtime = buildInstalledRuntimeDescriptor("structured-test/v1", {
       capabilities: [
         ...buildInstalledRuntimeDescriptor("base-test/v1").descriptor.capabilities,
@@ -234,14 +235,45 @@ describe("execution graph compiler", () => {
         "graph/for-each-unit@1",
       ],
     });
-    const compiled = parseAndCompileExecutionGraph(readFileSync(structuredGraphPath, "utf8"), {
-      source: structuredGraphPath,
+    const compiled = parseAndCompileExecutionGraph(readFileSync(structuredV1GraphPath, "utf8"), {
+      source: structuredV1GraphPath,
       runtime: runtime.descriptor,
     });
 
     expect(compiled.manifest.manifest).toMatchObject({
       id: "builtin/structured",
       version: 1,
+      entry_stage: "units",
+      requires: {
+        capabilities: [
+          "ce/implement@1",
+          "ce/simplify@1",
+          "graph/for-each-unit@1",
+          "accept-unit@1",
+        ],
+      },
+    });
+    expect(compiled.manifest.manifest.stages.map((stage) => stage.id)).toEqual(["units"]);
+    expect(compiled.manifest.manifest.stages[0]?.transitions.success).toEqual({ terminal: "shipped" });
+  });
+
+  it("compiles structured v2 to the repaired aggregate publish provider tail", () => {
+    const runtime = buildInstalledRuntimeDescriptor("structured-test/v1", {
+      capabilities: [
+        ...buildInstalledRuntimeDescriptor("base-test/v1").descriptor.capabilities,
+        "accept-unit@1",
+        "ce/simplify@1",
+        "graph/for-each-unit@1",
+      ],
+    });
+    const compiled = parseAndCompileExecutionGraph(readFileSync(structuredV2GraphPath, "utf8"), {
+      source: structuredV2GraphPath,
+      runtime: runtime.descriptor,
+    });
+
+    expect(compiled.manifest.manifest).toMatchObject({
+      id: "builtin/structured",
+      version: 2,
       entry_stage: "units",
       requires: {
         capabilities: [
@@ -308,8 +340,8 @@ describe("execution graph compiler", () => {
   });
 
   it("compiles the structured graph against the shipped production runtime descriptor", () => {
-    const compiled = parseAndCompileExecutionGraph(readFileSync(structuredGraphPath, "utf8"), {
-      source: structuredGraphPath,
+    const compiled = parseAndCompileExecutionGraph(readFileSync(structuredV2GraphPath, "utf8"), {
+      source: structuredV2GraphPath,
       runtime: buildInstalledRuntimeDescriptor("production-like/v1").descriptor,
     });
     expect(compiled.manifest.manifest.requires.capabilities).toContain("graph/for-each-unit@1");
