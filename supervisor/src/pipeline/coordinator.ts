@@ -170,7 +170,7 @@ function successPathIncludesPublication(manifest: PipelineManifest): boolean {
 
 function eventHasExactPublishedSubject(input: PipelineReductionInput, stage: PipelineStage): boolean {
   if (stage.executor.kind === "provider_wait") {
-    return input.instance.published_commit !== null && input.event.subject === input.instance.published_commit;
+    return input.instance.published_commit !== null && input.event.providerRevision === input.instance.published_commit;
   }
   if (stage.evaluator.kind === "publish_subject") {
     return input.event.providerRevision !== undefined && input.event.subject != null;
@@ -188,8 +188,14 @@ function shouldClearPublishedBinding(input: PipelineReductionInput): boolean {
     input.event.subject !== input.instance.immutable_subject;
 }
 
-function publishedSubjectForEvent(input: PipelineReductionInput): string | null {
-  return input.event.providerRevision === undefined ? null : input.event.subject ?? null;
+function publishedCommitForEvent(input: PipelineReductionInput, stage: PipelineStage): string | null {
+  return stage.evaluator.kind === "publish_subject" ? input.event.providerRevision ?? null : null;
+}
+
+function publishedSubjectForEvent(input: PipelineReductionInput, stage: PipelineStage): string | null {
+  return stage.evaluator.kind === "publish_subject" && input.event.providerRevision !== undefined
+    ? input.event.subject ?? null
+    : null;
 }
 
 function verifyInput(input: PipelineReductionInput): PipelineStage {
@@ -282,21 +288,25 @@ function verifyInput(input: PipelineReductionInput): PipelineStage {
     throw new Error("pipeline event result hash does not match stage_result artifact");
   }
   if (event.providerRevision !== undefined) {
-    if (event.kind !== "stage_result" || stage.evaluator.kind !== "publish_subject" ||
-        !/^[a-f0-9]{40}$/.test(event.providerRevision)) {
+    if (!/^[a-f0-9]{40}$/.test(event.providerRevision)) {
       throw new Error("pipeline event has an invalid provider revision");
     }
-    const publish = artifacts.find((artifact) => artifact.kind === "publish_subject");
-    let publishedCommit: unknown;
-    try {
-      publishedCommit = publish
-        ? (JSON.parse(publish.payload) as { details?: { published_commit?: unknown } }).details?.published_commit
-        : undefined;
-    } catch {
-      publishedCommit = undefined;
-    }
-    if (publishedCommit !== event.providerRevision) {
-      throw new Error("pipeline provider revision does not match publish evidence");
+    if (event.kind === "stage_result" && stage.evaluator.kind === "publish_subject") {
+      const publish = artifacts.find((artifact) => artifact.kind === "publish_subject");
+      let publishedCommit: unknown;
+      try {
+        publishedCommit = publish
+          ? (JSON.parse(publish.payload) as { details?: { published_commit?: unknown } }).details?.published_commit
+          : undefined;
+      } catch {
+        publishedCommit = undefined;
+      }
+      if (publishedCommit !== event.providerRevision) {
+        throw new Error("pipeline provider revision does not match publish evidence");
+      }
+    } else if (event.kind !== "provider_snapshot" || stage.executor.kind !== "provider_wait" ||
+        stage.evaluator.kind !== "provider") {
+      throw new Error("pipeline event has an invalid provider revision");
     }
   }
   return stage;
@@ -634,8 +644,8 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
           ? `provider evidence required at ${target.id}`
           : null,
       immutableSubject: input.event.subject ?? null,
-      publishedCommit: input.event.providerRevision ?? null,
-      publishedSubject: publishedSubjectForEvent(input),
+      publishedCommit: publishedCommitForEvent(input, stage),
+      publishedSubject: publishedSubjectForEvent(input, stage),
       clearPublishedCommit: shouldClearPublishedBinding(input),
       reentryIncrement: isReentry ? 1 : 0,
       artifacts: artifactsFor(input.event),
@@ -658,8 +668,8 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
     terminal,
     publishIdempotencyKey: `linear-terminal:${input.instance.id}:${terminal}`,
     immutableSubject: input.event.subject ?? null,
-    publishedCommit: input.event.providerRevision ?? null,
-    publishedSubject: publishedSubjectForEvent(input),
+    publishedCommit: publishedCommitForEvent(input, stage),
+    publishedSubject: publishedSubjectForEvent(input, stage),
     clearPublishedCommit: shouldClearPublishedBinding(input),
     effects: terminal === "failed" ? [failedTerminalStopEffect({
       instanceId: input.instance.id,

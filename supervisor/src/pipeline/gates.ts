@@ -70,6 +70,11 @@ export const GATE_RECEIPT_REASONS = Object.freeze([
 ] as const);
 export type GateReceiptReason = (typeof GATE_RECEIPT_REASONS)[number];
 
+function providerRevisionFromPayload(payload: Record<string, unknown>): string | undefined {
+  const revision = payload.observed_head_sha ?? payload.head_sha;
+  return typeof revision === "string" && GIT_COMMIT.test(revision) ? revision : undefined;
+}
+
 export interface SemanticDecisionEvidence {
   result: ArtifactResult;
   findings: Array<{ severity: string }>;
@@ -600,6 +605,7 @@ export function processProviderEvidence(
   }
   const subject = instance.immutable_subject;
   if (!subject || !GIT_SUBJECT.test(subject)) throw new Error("provider evidence has no immutable subject");
+  const providerRevision = providerRevisionFromPayload(input.providerPayload);
   // Provider webhook identities are replayed by GitHub. Bind receipt time to
   // the immutable provider attempt so the same stable event ID always hashes
   // to the same inbox payload across retries and supervisor restarts.
@@ -667,6 +673,7 @@ export function processProviderEvidence(
     outcome: input.outcome,
     resultHash: artifacts[0]!.hash,
     subject,
+    ...(providerRevision ? { providerRevision } : {}),
     nativeSessionId: stage.context === "none" ? null : attempt.native_session_id,
     artifacts,
   };

@@ -214,7 +214,8 @@ describe("pipeline coordinator", () => {
     instance: PipelineInstance,
     attempt: PipelineStageAttempt,
     outcome: PipelineCoordinatorEvent["outcome"],
-    id: string
+    id: string,
+    options: { providerRevision?: string } = {}
   ): PipelineCoordinatorEvent {
     const stageResultPayload = JSON.stringify({ id, outcome });
     const providerCheckPayload = JSON.stringify({ id: `${id}-provider-check`, outcome });
@@ -229,6 +230,7 @@ describe("pipeline coordinator", () => {
       outcome,
       resultHash: digestNormalized(stageResultPayload),
       subject,
+      ...(options.providerRevision ? { providerRevision: options.providerRevision } : {}),
       artifacts: [
         {
           kind: "stage_result",
@@ -445,6 +447,7 @@ describe("pipeline coordinator", () => {
   it("refuses to settle a publishing manifest as shipped without exact provider publication evidence", () => {
     const { manifest, instance, attempt, stages } = setup("core/implement@4");
     const subject = "f".repeat(40);
+    const publishedCommit = "d".repeat(40);
     const providerAttempt = {
       ...attempt,
       id: "provider-attempt",
@@ -458,11 +461,16 @@ describe("pipeline coordinator", () => {
       status: "waiting_provider" as const,
       active_stage_id: "provider",
       immutable_subject: subject,
-      published_commit: subject,
+      published_commit: publishedCommit,
       published_subject: null,
     };
     const providerStages = providerWaitStages(stages, 0);
-    const providerEvent = providerFeedbackEvent(providerInstance, providerAttempt, "success", "provider-success");
+    const providerEvent = providerFeedbackEvent(providerInstance, providerAttempt, "success", "provider-success", {
+      providerRevision: publishedCommit,
+    });
+    expect(providerEvent.subject).toBe(subject);
+    expect(providerEvent.providerRevision).toBe(publishedCommit);
+    expect(providerEvent.subject).not.toBe(providerEvent.providerRevision);
 
     expect(reducePipelineEvent({
       manifest,
@@ -485,10 +493,10 @@ describe("pipeline coordinator", () => {
 
     expect(() => reducePipelineEvent({
       manifest,
-      instance: { ...providerInstance, published_commit: "e".repeat(40) },
+      instance: providerInstance,
       attempt: providerAttempt,
       stages: providerStages,
-      event: providerEvent,
+      event: { ...providerEvent, providerRevision: "e".repeat(40) },
     })).toThrow(/cannot settle shipped without exact published provider evidence/);
   });
 
