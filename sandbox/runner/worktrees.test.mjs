@@ -37,6 +37,28 @@ function repository() {
   return directory;
 }
 
+function markerRoot() {
+  const markerRootDir = mkdtempSync(join(tmpdir(), "ot-worktree-markers-"));
+  directories.push(markerRootDir);
+  return markerRootDir;
+}
+
+function worktreeEnvironment() {
+  const rootDir = mkdtempSync(join(tmpdir(), "ot-worktrees-"));
+  directories.push(rootDir);
+  return { rootDir, markerRootDir: markerRoot() };
+}
+
+function createTestWorktree(options) {
+  if (!options.markerRootDir) throw new Error("worktree tests must use a temporary marker root");
+  return createWorktree(options);
+}
+
+function removeTestWorktree(options) {
+  if (!options.markerRootDir) throw new Error("worktree tests must use a temporary marker root");
+  return removeWorktree(options);
+}
+
 describe("executor-owned worktrees", () => {
   it("rejects traversal handles before touching the filesystem", () => {
     const rootDir = mkdtempSync(join(tmpdir(), "ot-worktrees-"));
@@ -46,11 +68,10 @@ describe("executor-owned worktrees", () => {
 
   it("creates an exact-base clean worktree with sealed hooks and disabled push URL", () => {
     const repoDir = repository();
-    const rootDir = mkdtempSync(join(tmpdir(), "ot-worktrees-"));
-    directories.push(rootDir);
+    const { rootDir, markerRootDir } = worktreeEnvironment();
     const baseCommit = git(repoDir, ["rev-parse", "HEAD"]);
 
-    const created = createWorktree({ repoDir, rootDir, handle: "unit-1", baseCommit, hooksPath: "/sealed/hooks" });
+    const created = createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "unit-1", baseCommit, hooksPath: "/sealed/hooks" });
 
     expect(git(created.path, ["rev-parse", "HEAD"])).toBe(baseCommit);
     expect(git(created.path, ["status", "--porcelain"])).toBe("");
@@ -61,50 +82,47 @@ describe("executor-owned worktrees", () => {
 
   it("refuses wrong-base and dirty integration checkouts", () => {
     const repoDir = repository();
-    const rootDir = mkdtempSync(join(tmpdir(), "ot-worktrees-"));
-    directories.push(rootDir);
+    const { rootDir, markerRootDir } = worktreeEnvironment();
     const baseCommit = git(repoDir, ["rev-parse", "HEAD"]);
-    expect(() => createWorktree({ repoDir, rootDir, handle: "wrong", baseCommit: "b".repeat(40) }))
+    expect(() => createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "wrong", baseCommit: "b".repeat(40) }))
       .toThrow(/does not match requested/);
 
     writeFileSync(join(repoDir, "dirty.txt"), "dirty\n");
-    expect(() => createWorktree({ repoDir, rootDir, handle: "dirty", baseCommit }))
+    expect(() => createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "dirty", baseCommit }))
       .toThrow(/must be clean/);
   });
 
   it("reuses an existing clean exact-base worktree only in idempotent mode", () => {
     const repoDir = repository();
-    const rootDir = mkdtempSync(join(tmpdir(), "ot-worktrees-"));
-    directories.push(rootDir);
+    const { rootDir, markerRootDir } = worktreeEnvironment();
     const baseCommit = git(repoDir, ["rev-parse", "HEAD"]);
-    const created = createWorktree({ repoDir, rootDir, handle: "unit-repeat", baseCommit, hooksPath: "/sealed/hooks" });
+    const created = createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "unit-repeat", baseCommit, hooksPath: "/sealed/hooks" });
 
-    expect(() => createWorktree({ repoDir, rootDir, handle: "unit-repeat", baseCommit }))
+    expect(() => createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "unit-repeat", baseCommit }))
       .toThrow(/already exists/);
     writeFileSync(join(repoDir, "next.txt"), "next\n");
     git(repoDir, ["add", "next.txt"]);
     git(repoDir, ["commit", "-qm", "next"]);
     const nextCommit = git(repoDir, ["rev-parse", "HEAD"]);
-    expect(() => createWorktree({ repoDir, rootDir, handle: "unit-repeat", baseCommit: nextCommit, idempotent: true }))
+    expect(() => createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "unit-repeat", baseCommit: nextCommit, idempotent: true }))
       .toThrow(/different base commit/);
     git(created.path, ["config", "--worktree", "core.hooksPath", "/tmp/unsealed-hooks"]);
     git(created.path, ["config", "--worktree", "remote.origin.pushurl", "https://example.invalid/push.git"]);
-    expect(createWorktree({ repoDir, rootDir, handle: "unit-repeat", baseCommit, hooksPath: "/sealed/hooks", idempotent: true }))
+    expect(createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "unit-repeat", baseCommit, hooksPath: "/sealed/hooks", idempotent: true }))
       .toEqual({ id: "unit-repeat", path: created.path, baseCommit });
     expect(git(created.path, ["config", "--get", "core.hooksPath"])).toBe("/sealed/hooks");
     expect(git(created.path, ["config", "--get", "remote.origin.pushurl"])).toBe("DISABLED_BY_OPENTHROTTLE_LOOP_WORKTREE");
 
     writeFileSync(join(created.path, "dirty.txt"), "dirty\n");
-    expect(() => createWorktree({ repoDir, rootDir, handle: "unit-repeat", baseCommit, idempotent: true }))
+    expect(() => createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "unit-repeat", baseCommit, idempotent: true }))
       .toThrow(/existing worktree is dirty/);
   });
 
   it("derives an internal candidate commit without moving worker HEAD", () => {
     const repoDir = repository();
-    const rootDir = mkdtempSync(join(tmpdir(), "ot-worktrees-"));
-    directories.push(rootDir);
+    const { rootDir, markerRootDir } = worktreeEnvironment();
     const baseCommit = git(repoDir, ["rev-parse", "HEAD"]);
-    const created = createWorktree({ repoDir, rootDir, handle: "unit-2", baseCommit });
+    const created = createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "unit-2", baseCommit });
     writeFileSync(join(created.path, "file.txt"), "changed\n");
     writeFileSync(join(created.path, "new-executable.sh"), "#!/bin/sh\n");
     chmodSync(join(created.path, "new-executable.sh"), 0o755);
@@ -119,17 +137,16 @@ describe("executor-owned worktrees", () => {
 
   it("removes only the selected worktree handle", () => {
     const repoDir = repository();
-    const rootDir = mkdtempSync(join(tmpdir(), "ot-worktrees-"));
-    directories.push(rootDir);
+    const { rootDir, markerRootDir } = worktreeEnvironment();
     const baseCommit = git(repoDir, ["rev-parse", "HEAD"]);
-    const first = createWorktree({ repoDir, rootDir, handle: "unit-a", baseCommit });
-    const second = createWorktree({ repoDir, rootDir, handle: "unit-b", baseCommit });
+    const first = createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "unit-a", baseCommit });
+    const second = createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "unit-b", baseCommit });
 
-    removeWorktree({ repoDir, rootDir, handle: "unit-a" });
+    removeTestWorktree({ repoDir, rootDir, markerRootDir, handle: "unit-a" });
 
     expect(existsSync(first.path)).toBe(false);
     expect(existsSync(second.path)).toBe(true);
-    expect(removeWorktree({ repoDir, rootDir, handle: "unit-a" })).toEqual({
+    expect(removeTestWorktree({ repoDir, rootDir, markerRootDir, handle: "unit-a" })).toEqual({
       id: "unit-a",
       removed: false,
     });
@@ -137,10 +154,7 @@ describe("executor-owned worktrees", () => {
 
   it("clears the bootstrap marker on removal and on fresh creation so a recreated handle bootstraps again", () => {
     const repoDir = repository();
-    const rootDir = mkdtempSync(join(tmpdir(), "ot-worktrees-"));
-    directories.push(rootDir);
-    const markerRootDir = mkdtempSync(join(tmpdir(), "ot-worktree-markers-"));
-    directories.push(markerRootDir);
+    const { rootDir, markerRootDir } = worktreeEnvironment();
     const baseCommit = git(repoDir, ["rev-parse", "HEAD"]);
     const sealMarker = () => ensureWorktreeBootstrap({
       worktreeDir: worktreePath({ rootDir, handle: "unit-a" }),
@@ -152,43 +166,41 @@ describe("executor-owned worktrees", () => {
     });
     const markerPath = worktreeBootstrapMarkerPath({ markerRootDir, handle: "unit-a" });
 
-    createWorktree({ repoDir, rootDir, handle: "unit-a", baseCommit, markerRootDir });
+    createTestWorktree({ repoDir, rootDir, handle: "unit-a", baseCommit, markerRootDir });
     sealMarker();
-    removeWorktree({ repoDir, rootDir, handle: "unit-a", markerRootDir });
+    removeTestWorktree({ repoDir, rootDir, handle: "unit-a", markerRootDir });
     expect(existsSync(markerPath)).toBe(false);
 
     // A marker left behind by any earlier same-handle worktree must not let
     // a freshly created (dependency-free) worktree skip its bootstrap.
     sealMarker();
-    createWorktree({ repoDir, rootDir, handle: "unit-a", baseCommit, markerRootDir });
+    createTestWorktree({ repoDir, rootDir, handle: "unit-a", baseCommit, markerRootDir });
     expect(existsSync(markerPath)).toBe(false);
   });
 
   it("recovers a stale worktree registration when normal removal fails", () => {
     const repoDir = repository();
-    const rootDir = mkdtempSync(join(tmpdir(), "ot-worktrees-"));
-    directories.push(rootDir);
+    const { rootDir, markerRootDir } = worktreeEnvironment();
     const baseCommit = git(repoDir, ["rev-parse", "HEAD"]);
-    const created = createWorktree({ repoDir, rootDir, handle: "stale", baseCommit });
+    const created = createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "stale", baseCommit });
     rmSync(join(created.path, ".git"), { force: true });
 
-    expect(removeWorktree({ repoDir, rootDir, handle: "stale" })).toEqual({
+    expect(removeTestWorktree({ repoDir, rootDir, markerRootDir, handle: "stale" })).toEqual({
       id: "stale",
       removed: true,
       recovered: true,
     });
     expect(existsSync(created.path)).toBe(false);
     expect(git(repoDir, ["worktree", "list", "--porcelain"])).not.toContain(created.path);
-    expect(createWorktree({ repoDir, rootDir, handle: "stale", baseCommit }).id).toBe("stale");
+    expect(createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "stale", baseCommit }).id).toBe("stale");
   });
 
   it("locks retained worktrees and grants only the current handle", () => {
     const repoDir = repository();
-    const rootDir = mkdtempSync(join(tmpdir(), "ot-worktrees-"));
-    directories.push(rootDir);
+    const { rootDir, markerRootDir } = worktreeEnvironment();
     const baseCommit = git(repoDir, ["rev-parse", "HEAD"]);
-    const first = createWorktree({ repoDir, rootDir, handle: "unit-a", baseCommit });
-    const second = createWorktree({ repoDir, rootDir, handle: "unit-b", baseCommit });
+    const first = createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "unit-a", baseCommit });
+    const second = createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "unit-b", baseCommit });
 
     expect(statSync(rootDir).mode & 0o777).toBe(0o711);
     expect(statSync(first.path).mode & 0o777).toBe(0o700);
