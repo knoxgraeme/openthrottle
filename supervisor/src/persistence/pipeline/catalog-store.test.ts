@@ -252,6 +252,7 @@ describe("pipeline catalog store", () => {
     `).run(manifest.manifest.id, manifest.manifest.version, manifest.digest, manifest.normalized, new Date(0).toISOString());
 
     expect(() => pipelines.acceptManifest(manifest)).not.toThrow();
+    expect(pipelines.getAcceptedManifestDigest(manifest.manifest.id, manifest.manifest.version)).toBe(manifest.digest);
   });
 
   it("revalidates pinned hashes and restricts deletion of audit-bearing parents", () => {

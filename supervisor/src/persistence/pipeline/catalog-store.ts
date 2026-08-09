@@ -11,7 +11,7 @@ import { assertDigest, deterministicId } from "./helpers.js";
 
 export function createCatalogStore(db: Database.Database, now: () => string): Pick<
   PipelineStore,
-  "acceptCatalog" | "acceptManifest" | "acceptRuntimeDescriptor" | "saveRepositoryConfigSnapshot"
+  "acceptCatalog" | "acceptManifest" | "getAcceptedManifestDigest" | "acceptRuntimeDescriptor" | "saveRepositoryConfigSnapshot"
 > {
   const selectPipelineCatalogEntry = db.prepare(
     "SELECT digest, normalized_manifest FROM pipeline_catalog_entries WHERE pipeline_id = ? AND version = ?"
@@ -21,6 +21,12 @@ export function createCatalogStore(db: Database.Database, now: () => string): Pi
       pipeline_id, version, digest, normalized_manifest, accepted_at
     ) VALUES (?, ?, ?, ?, ?)
   `);
+  const getAcceptedManifestDigest = (pipelineId: string, version: number): string | undefined => {
+    const existing = selectPipelineCatalogEntry.get(pipelineId, version) as
+      | { digest: string; normalized_manifest: string }
+      | undefined;
+    return existing?.digest;
+  };
   const acceptManifest = (validated: ValidatedPipelineManifest): void => {
     assertDigest(`${validated.manifest.id}@${validated.manifest.version}`, validated.normalized, validated.digest);
     if (canonicalJson(validated.manifest) !== validated.normalized) {
@@ -117,5 +123,5 @@ export function createCatalogStore(db: Database.Database, now: () => string): Pi
     return db.prepare("SELECT * FROM repository_config_snapshots WHERE id = ?").get(id) as RepositoryConfigSnapshot;
   });
 
-  return { acceptCatalog, acceptManifest, acceptRuntimeDescriptor, saveRepositoryConfigSnapshot };
+  return { acceptCatalog, acceptManifest, getAcceptedManifestDigest, acceptRuntimeDescriptor, saveRepositoryConfigSnapshot };
 }

@@ -402,6 +402,7 @@ export interface CoordinatorTransitionWrite {
 export interface PipelineStore extends ChildActionLivenessPort {
   acceptCatalog(catalog: ValidatedPipelineCatalog): void;
   acceptManifest(manifest: ValidatedPipelineManifest): void;
+  getAcceptedManifestDigest(pipelineId: string, version: number): string | undefined;
   acceptRuntimeDescriptor(runtime: ValidatedRuntimeCapabilityDescriptor): void;
   saveRepositoryConfigSnapshot(input: {
     id?: string;
