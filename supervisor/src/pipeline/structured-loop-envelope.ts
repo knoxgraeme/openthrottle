@@ -32,6 +32,120 @@ function boundedText(value: string | undefined, limit: number): string {
   return value.length <= limit ? value : `${value.slice(0, limit)}...`;
 }
 
+function referencedTextDigest(ids: Set<string>, values: Record<string, string>): string {
+  return digestCanonicalJson(Object.fromEntries([...ids].map((id) => [id, values[id] ?? null])));
+}
+
+function finalReviewFallbackContext(input: {
+  plan: ExecutionPlanContract;
+  actionKind: UnitActionKind;
+  instructionIds: Set<string>;
+  acceptanceIds: Set<string>;
+}): Record<string, unknown> {
+  const fullDetailDigest = digestCanonicalJson({
+    units: input.plan.units.map((unit) => ({
+      id: unit.id,
+      title: unit.title,
+      depends_on: unit.depends_on,
+      instructions: unit.instructions,
+      acceptance: unit.acceptance,
+    })),
+    instructions: Object.fromEntries([...input.instructionIds].map((id) => [id, input.plan.instructions[id] ?? null])),
+    acceptance: Object.fromEntries([...input.acceptanceIds].map((id) => [id, input.plan.acceptance[id] ?? null])),
+    commands: input.plan.commands,
+  });
+  const dependencyRefCount = input.plan.units.reduce((count, unit) => count + unit.depends_on.length, 0);
+  const instructionRefCount = input.plan.units.reduce((count, unit) => count + unit.instructions.length, 0);
+  const acceptanceRefCount = input.plan.units.reduce((count, unit) => count + unit.acceptance.length, 0);
+
+  const unitIndexById = new Map(input.plan.units.map((unit, index) => [unit.id, index]));
+  const contextForTitleLimit = (titleLimit: number, includeUnitDetailDigests: boolean) => ({
+    schema: "openthrottle.loop-action-plan-context/v1",
+    graph_id: input.plan.graph_id,
+    plan_id: input.plan.plan_id,
+    action_kind: input.actionKind,
+    unit: null,
+    whole_plan: true,
+    context_complete: false,
+    truncated: true,
+    truncation: {
+      reason: "final_review_plan_context_byte_limit",
+      limit_bytes: FINAL_REVIEW_PLAN_CONTEXT_LIMIT_BYTES,
+      unit_count: input.plan.units.length,
+      dependency_reference_count: dependencyRefCount,
+      instruction_reference_count: instructionRefCount,
+      acceptance_reference_count: acceptanceRefCount,
+      referenced_instruction_count: input.instructionIds.size,
+      referenced_acceptance_count: input.acceptanceIds.size,
+      command_count: input.plan.commands.length,
+      omitted_dependency_reference_count: dependencyRefCount,
+      omitted_instruction_reference_count: instructionRefCount,
+      omitted_acceptance_reference_count: acceptanceRefCount,
+      omitted_instruction_detail_count: input.instructionIds.size,
+      omitted_acceptance_detail_count: input.acceptanceIds.size,
+      omitted_detail_digest: fullDetailDigest,
+    },
+    unit_details: {
+      format: "parallel_arrays",
+      ids: input.plan.units.map((unit) => unit.id),
+      titles: input.plan.units.map((unit) => boundedText(unit.title, titleLimit)),
+      detail_counts: input.plan.units.map((unit) => [
+        unit.depends_on.length,
+        unit.instructions.length,
+        unit.acceptance.length,
+      ]),
+      ...(includeUnitDetailDigests
+        ? {
+            detail_digests: input.plan.units.map((unit) =>
+              digestCanonicalJson({
+                depends_on: unit.depends_on,
+                instructions: unit.instructions,
+                acceptance: unit.acceptance,
+              })
+            ),
+          }
+        : {}),
+    },
+    instructions_summary: {
+      referenced_count: input.instructionIds.size,
+      detail_digest: referencedTextDigest(input.instructionIds, input.plan.instructions),
+    },
+    acceptance_summary: {
+      referenced_count: input.acceptanceIds.size,
+      detail_digest: referencedTextDigest(input.acceptanceIds, input.plan.acceptance),
+    },
+    commands: input.plan.commands.map((command) => ({
+      name: boundedText(command.name, 80),
+      ...(command.unit === undefined ? {} : { unit_index: unitIndexById.get(command.unit) ?? null }),
+    })),
+    commands_digest: digestCanonicalJson(input.plan.commands),
+  });
+
+  const bestContext = (includeUnitDetailDigests: boolean): Record<string, unknown> | null => {
+    let low = 0;
+    let high = 120;
+    let best: Record<string, unknown> | null = null;
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2);
+      const candidate = contextForTitleLimit(mid, includeUnitDetailDigests);
+      if (Buffer.byteLength(canonicalJson(candidate), "utf8") <= FINAL_REVIEW_PLAN_CONTEXT_LIMIT_BYTES) {
+        best = candidate;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+    return best;
+  };
+
+  const best = bestContext(true) ?? bestContext(false) ?? contextForTitleLimit(0, false);
+  const bytes = Buffer.byteLength(canonicalJson(best), "utf8");
+  if (bytes > FINAL_REVIEW_PLAN_CONTEXT_LIMIT_BYTES) {
+    throw new Error(`final review plan context fallback exceeds ${FINAL_REVIEW_PLAN_CONTEXT_LIMIT_BYTES} bytes`);
+  }
+  return best;
+}
+
 function finalReviewPlanContext(plan: ExecutionPlanContract, actionKind: UnitActionKind): Record<string, unknown> {
   const instructionIds = new Set<string>();
   const acceptanceIds = new Set<string>();
@@ -70,23 +184,7 @@ function finalReviewPlanContext(plan: ExecutionPlanContract, actionKind: UnitAct
   };
   if (Buffer.byteLength(canonicalJson(compact), "utf8") <= FINAL_REVIEW_PLAN_CONTEXT_LIMIT_BYTES) return compact;
 
-  return {
-    schema: "openthrottle.loop-action-plan-context/v1",
-    graph_id: plan.graph_id,
-    plan_id: plan.plan_id,
-    action_kind: actionKind,
-    unit: null,
-    whole_plan: true,
-    truncated: true,
-    units: plan.units.map((unit) => ({
-      id: unit.id,
-      title: boundedText(unit.title, 120),
-      depends_on: unit.depends_on,
-      instructions: unit.instructions,
-      acceptance: unit.acceptance,
-    })),
-    commands: plan.commands.map((command) => ({ name: command.name, unit: command.unit })),
-  };
+  return finalReviewFallbackContext({ plan, actionKind, instructionIds, acceptanceIds });
 }
 
 export function loopActionPlanContext(input: LoopActionPlanContextInput): Record<string, unknown> | null {

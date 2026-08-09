@@ -31,6 +31,53 @@ function unitPlan(unitCount: number): ExecutionPlanContract {
   };
 }
 
+function longIdentifier(prefix: string, index: number): string {
+  return `${prefix}_${index.toString().padStart(3, "0")}_${"segment_".repeat(18)}tail`;
+}
+
+function denseLegacyPlan(): ExecutionPlanContract {
+  const instructionIds = Array.from({ length: 64 }, (_, index) => longIdentifier("instruction", index));
+  const acceptanceIds = Array.from({ length: 64 }, (_, index) => longIdentifier("acceptance", index));
+  const unitIds = Array.from({ length: 64 }, (_, index) => longIdentifier("unit", index));
+  const instructions = Object.fromEntries(instructionIds.map((id, index) => [
+    id,
+    `Instruction ${index}: preserve behavior.`,
+  ]));
+  const acceptance = Object.fromEntries(acceptanceIds.map((id, index) => [
+    id,
+    `Acceptance ${index}: verify behavior.`,
+  ]));
+  const units = Array.from({ length: 64 }, (_, index) => {
+    const id = unitIds[index]!;
+    return {
+      id,
+      title: `Dense legacy unit ${index} ${"with a bounded but descriptive title ".repeat(3)}`,
+      depends_on: unitsBefore(index).map((dependencyIndex) => unitIds[dependencyIndex]!),
+      instructions: instructionIds,
+      acceptance: acceptanceIds,
+    };
+  });
+  return {
+    schema: "openthrottle.execution-plan/v1",
+    graph_id: "structured",
+    plan_id: "dense_legacy_final_review_context",
+    instructions,
+    acceptance,
+    units,
+    commands: [
+      { name: "test" },
+      { name: "lint" },
+      { name: "build" },
+      { name: "test", unit: units[63]!.id },
+    ],
+  };
+}
+
+function unitsBefore(index: number): number[] {
+  const first = Math.max(0, index - 32);
+  return Array.from({ length: index - first }, (_, offset) => first + offset);
+}
+
 describe("downstream-context admission bound", () => {
   it("reserves exactly the shared canonical aggregate maximum, not a representative sample", () => {
     const bytes = Buffer.byteLength(canonicalJson(MAX_VALID_DOWNSTREAM_CONTEXT), "utf8");
@@ -121,5 +168,69 @@ describe("downstream-context admission bound", () => {
       },
     });
     expect(Buffer.byteLength(canonicalJson(context), "utf8")).toBeLessThanOrEqual(MAX_LOOP_REQUEST_ENVELOPE_BYTES);
+  });
+
+  it("byte-bounds adversarial legacy final-review fallback context with explicit omission metadata", () => {
+    const plan = denseLegacyPlan();
+    const oldFallback = {
+      schema: "openthrottle.loop-action-plan-context/v1",
+      graph_id: plan.graph_id,
+      plan_id: plan.plan_id,
+      action_kind: "final_review",
+      unit: null,
+      whole_plan: true,
+      truncated: true,
+      units: plan.units.map((unit) => ({
+        id: unit.id,
+        title: unit.title.length <= 120 ? unit.title : `${unit.title.slice(0, 120)}...`,
+        depends_on: unit.depends_on,
+        instructions: unit.instructions,
+        acceptance: unit.acceptance,
+      })),
+      commands: plan.commands.map((command) => ({ name: command.name, unit: command.unit })),
+    };
+    expect(Buffer.byteLength(canonicalJson(oldFallback), "utf8")).toBeGreaterThan(227 * 1024);
+
+    const first = loopActionPlanContext({ plan, actionKind: "final_review", unitId: null });
+    const second = loopActionPlanContext({ plan, actionKind: "final_review", unitId: null });
+
+    expect(canonicalJson(second)).toBe(canonicalJson(first));
+    expect(Buffer.byteLength(canonicalJson(first), "utf8")).toBeLessThanOrEqual(48 * 1024);
+    expect(structuredPlanLoopEnvelopeBytes(plan)).toBeLessThanOrEqual(MAX_LOOP_REQUEST_ENVELOPE_BYTES);
+    expect(first).toMatchObject({
+      whole_plan: true,
+      context_complete: false,
+      truncated: true,
+      truncation: {
+        reason: "final_review_plan_context_byte_limit",
+        unit_count: 64,
+        dependency_reference_count: 1_520,
+        instruction_reference_count: 4_096,
+        acceptance_reference_count: 4_096,
+        referenced_instruction_count: 64,
+        referenced_acceptance_count: 64,
+        command_count: 4,
+        omitted_dependency_reference_count: 1_520,
+        omitted_instruction_reference_count: 4_096,
+        omitted_acceptance_reference_count: 4_096,
+        omitted_instruction_detail_count: 64,
+        omitted_acceptance_detail_count: 64,
+      },
+      unit_details: {
+        format: "parallel_arrays",
+      },
+      instructions_summary: {
+        referenced_count: 64,
+      },
+      acceptance_summary: {
+        referenced_count: 64,
+      },
+    });
+    const unitDetails = first?.unit_details as { ids: string[]; titles: string[]; detail_counts: number[][] };
+    expect(unitDetails.ids).toHaveLength(64);
+    expect(unitDetails.ids[0]).toBe(plan.units[0]!.id);
+    expect(unitDetails.ids[63]).toBe(plan.units[63]!.id);
+    expect(unitDetails.titles[0]).toContain("Dense legacy unit 0");
+    expect(unitDetails.detail_counts[63]).toEqual([32, 64, 64]);
   });
 });
