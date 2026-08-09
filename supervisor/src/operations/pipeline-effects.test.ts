@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
 import { createPipelineEffectProcessor } from "./pipeline-effects.js";
+import { createStructuredChildRuntime } from "./structured-child-runtime.js";
 import { coordinatePipelineEvent } from "../pipeline/coordinator.js";
 import { requestPipelineStop } from "../pipeline/control.js";
 import {
@@ -42,7 +43,8 @@ describe("pipeline effect processor", () => {
   function repositoryStructuredGraphWithPublishStage(
     publishStageId: string,
     intermediateStageId?: string,
-    cycleStageId?: string
+    cycleStageId?: string,
+    alternatePublishStageId?: string
   ): string {
     const graph = JSON.parse(readFileSync(structuredGraphPath, "utf8")) as {
       id: string;
@@ -72,7 +74,7 @@ describe("pipeline effect processor", () => {
           retryable_failure: { to: intermediateStageId, max_reentries: 2, on_exhausted: "failed" },
           success: { to: cycleStageId ?? publishStageId },
           repair_required: { to: publishStageId },
-          failure: { to: publishStageId },
+          failure: { to: alternatePublishStageId ?? publishStageId },
         },
       });
       if (cycleStageId) {
@@ -85,10 +87,39 @@ describe("pipeline effect processor", () => {
             retryable_failure: { to: cycleStageId, max_reentries: 2, on_exhausted: "failed" },
             success: { to: intermediateStageId, max_reentries: 2, on_exhausted: "failed" },
             repair_required: { to: publishStageId },
-            failure: { to: publishStageId },
+            failure: { to: alternatePublishStageId ?? publishStageId },
           },
         });
       }
+    }
+    if (alternatePublishStageId) {
+      const publishNode = graph.nodes.find((node) => node.id === publishStageId);
+      if (!publishNode) throw new Error(`publish node ${publishStageId} not found`);
+      const providerNode = graph.nodes.find((node) => node.id === "provider");
+      if (!providerNode) throw new Error("provider node not found");
+      const alternateProviderStageId = `${alternatePublishStageId}_provider`;
+      graph.nodes.push({
+        ...structuredClone(publishNode),
+        id: alternatePublishStageId,
+        transitions: Object.fromEntries(Object.entries(publishNode.transitions).map(([outcome, transition]) => [
+          outcome,
+          transition.to === "provider"
+            ? { ...transition, to: alternateProviderStageId }
+            : transition.to === publishStageId
+              ? { ...transition, to: alternatePublishStageId, max_reentries: transition.max_reentries ?? 2 }
+              : transition,
+        ])),
+      });
+      graph.nodes.push({
+        ...structuredClone(providerNode),
+        id: alternateProviderStageId,
+        transitions: Object.fromEntries(Object.entries(providerNode.transitions).map(([outcome, transition]) => [
+          outcome,
+          transition.to === "provider"
+            ? { ...transition, to: alternateProviderStageId, max_reentries: transition.max_reentries ?? 2 }
+            : transition,
+        ])),
+      });
     }
     return JSON.stringify(graph);
   }
@@ -897,12 +928,14 @@ describe("pipeline effect processor", () => {
       config: repositoryConfig,
     });
     const publishStageId = "release";
+    const alternatePublishStageId = "repair_release";
     const intermediateStageId = "verify_release";
     const cycleStageId = "bounded_cycle_before_release";
     const manifest = parseAndCompileExecutionGraph(repositoryStructuredGraphWithPublishStage(
       publishStageId,
       intermediateStageId,
-      cycleStageId
+      cycleStageId,
+      alternatePublishStageId
     ), {
       id: `repository/structured-${publishStageId}`,
       runtime: runtimeDescriptor.descriptor,
@@ -2141,6 +2174,32 @@ describe("pipeline effect processor", () => {
       effect.status === "pending" &&
       effect.idempotency_key === settledRunReplayRequest.idempotencyKey
     )).toHaveLength(1);
+
+    rewriteAggregatePublicationToLegacyHash();
+    persistLegacyAggregateArtifacts();
+    db!.prepare(`
+      UPDATE execution_graphs
+      SET aggregate_artifact_hash = ?, updated_at = ?
+      WHERE parent_attempt_id = ?
+    `).run(legacyGraphResult!.hash, "2099-07-22T12:00:00.000Z", attempt.id);
+    expect(pipelines.getAttempt(attempt.id)).toMatchObject({
+      status: "completed",
+      result_hash: legacyStageResult!.hash,
+    });
+    const childRuntime = createStructuredChildRuntime({
+      store: pipelines,
+      runtime,
+      taskTimeoutSeconds: 300,
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+    });
+    await expect(childRuntime.drainCompositeChildren(
+      { providerResourceId: "sandbox-child-drain" },
+      pipelines.getInstance(instance.id)!,
+      attempt.id
+    )).rejects.toThrow(/ambiguous structured publish successors/);
+    expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
+      aggregate_artifact_hash: legacyGraphResult!.hash,
+    });
   });
 
   it("leaves retryable child loop errors active for effect retry instead of parsing them as receipts", async () => {

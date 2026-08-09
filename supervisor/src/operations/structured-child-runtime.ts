@@ -1576,8 +1576,6 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       }
       const aggregateCompletedAt = graph.aggregate_emitted_at ?? deps.now().toISOString();
       const manifest = JSON.parse(instance.normalized_manifest);
-      const parentStage = stageById(instance.normalized_manifest, parentAttempt.stage_id);
-      const publishStageId = successReachablePublishStageId(manifest, parentStage?.transitions[outcome]?.to);
       let event = buildAggregateStageEvent({
         id: `execution-aggregate:${parentAttemptId}:${aggregateSubject}:${outcome}`,
         manifest,
@@ -1691,6 +1689,14 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           }
         }
         if (legacyGraphResult) {
+          let legacyFallbackPublishStageId: string | null = null;
+          if (!options.successorStageId && parentAlreadyTerminal) {
+            const parentStage = stageById(instance.normalized_manifest, parentAttempt.stage_id);
+            legacyFallbackPublishStageId = successReachablePublishStageId(
+              manifest,
+              parentStage?.transitions[outcome]?.to
+            );
+          }
           deps.store.migrateAggregateArtifactHash({
             parentAttemptId,
             fromArtifactHash: graph.aggregate_artifact_hash,
@@ -1704,7 +1710,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
             fromSubject: integrationSubject,
             toSubject: aggregateSubject,
             ...(options.successorStageId ? { successorStageId: options.successorStageId } : {}),
-            ...(publishStageId ? { publishStageId } : {}),
+            ...(legacyFallbackPublishStageId ? { publishStageId: legacyFallbackPublishStageId } : {}),
           });
         }
         if (["completed", "canceled", "superseded", "failed"].includes(parentAttempt.status)) return;
