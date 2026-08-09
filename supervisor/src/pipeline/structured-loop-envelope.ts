@@ -36,13 +36,16 @@ function referencedTextDigest(ids: Set<string>, values: Record<string, string>):
   return digestCanonicalJson(Object.fromEntries([...ids].map((id) => [id, values[id] ?? null])));
 }
 
-function finalReviewFallbackContext(input: {
+function truncatedTextCount(ids: Set<string>, values: Record<string, string>, limit: number): number {
+  return [...ids].filter((id) => (values[id]?.length ?? 0) > limit).length;
+}
+
+function finalReviewFullDetailDigest(input: {
   plan: ExecutionPlanContract;
-  actionKind: UnitActionKind;
   instructionIds: Set<string>;
   acceptanceIds: Set<string>;
-}): Record<string, unknown> {
-  const fullDetailDigest = digestCanonicalJson({
+}): string {
+  return digestCanonicalJson({
     units: input.plan.units.map((unit) => ({
       id: unit.id,
       title: unit.title,
@@ -54,9 +57,19 @@ function finalReviewFallbackContext(input: {
     acceptance: Object.fromEntries([...input.acceptanceIds].map((id) => [id, input.plan.acceptance[id] ?? null])),
     commands: input.plan.commands,
   });
+}
+
+function finalReviewFallbackContext(input: {
+  plan: ExecutionPlanContract;
+  actionKind: UnitActionKind;
+  instructionIds: Set<string>;
+  acceptanceIds: Set<string>;
+}): Record<string, unknown> {
+  const fullDetailDigest = finalReviewFullDetailDigest(input);
   const dependencyRefCount = input.plan.units.reduce((count, unit) => count + unit.depends_on.length, 0);
   const instructionRefCount = input.plan.units.reduce((count, unit) => count + unit.instructions.length, 0);
   const acceptanceRefCount = input.plan.units.reduce((count, unit) => count + unit.acceptance.length, 0);
+  const commandNameTruncatedCount = input.plan.commands.filter((command) => command.name.length > 80).length;
 
   const unitIndexById = new Map(input.plan.units.map((unit, index) => [unit.id, index]));
   const contextForTitleLimit = (titleLimit: number, includeUnitDetailDigests: boolean) => ({
@@ -83,6 +96,9 @@ function finalReviewFallbackContext(input: {
       omitted_acceptance_reference_count: acceptanceRefCount,
       omitted_instruction_detail_count: input.instructionIds.size,
       omitted_acceptance_detail_count: input.acceptanceIds.size,
+      truncated_unit_title_count: input.plan.units.filter((unit) => unit.title.length > titleLimit).length,
+      truncated_command_name_count: commandNameTruncatedCount,
+      full_detail_digest: fullDetailDigest,
       omitted_detail_digest: fullDetailDigest,
     },
     unit_details: {
@@ -162,25 +178,50 @@ function finalReviewPlanContext(plan: ExecutionPlanContract, actionKind: UnitAct
     whole_plan: true,
     units: plan.units.map((unit) => ({
       id: unit.id,
-      title: boundedText(unit.title, 240),
+      title: unit.title,
       depends_on: unit.depends_on,
       instructions: unit.instructions,
       acceptance: unit.acceptance,
     })),
-    instructions: Object.fromEntries([...instructionIds].map((id) => [id, boundedText(plan.instructions[id], 1_000)])),
-    acceptance: Object.fromEntries([...acceptanceIds].map((id) => [id, boundedText(plan.acceptance[id], 1_000)])),
+    instructions: Object.fromEntries([...instructionIds].map((id) => [id, plan.instructions[id]])),
+    acceptance: Object.fromEntries([...acceptanceIds].map((id) => [id, plan.acceptance[id]])),
     commands: plan.commands,
   };
   if (Buffer.byteLength(canonicalJson(context), "utf8") <= FINAL_REVIEW_PLAN_CONTEXT_LIMIT_BYTES) return context;
 
+  const titleLimit = 120;
+  const detailLimit = 320;
   const compact = {
     ...context,
+    context_complete: false,
+    truncated: true,
+    truncation: {
+      reason: "final_review_plan_context_byte_limit",
+      limit_bytes: FINAL_REVIEW_PLAN_CONTEXT_LIMIT_BYTES,
+      unit_count: plan.units.length,
+      dependency_reference_count: plan.units.reduce((count, unit) => count + unit.depends_on.length, 0),
+      instruction_reference_count: plan.units.reduce((count, unit) => count + unit.instructions.length, 0),
+      acceptance_reference_count: plan.units.reduce((count, unit) => count + unit.acceptance.length, 0),
+      referenced_instruction_count: instructionIds.size,
+      referenced_acceptance_count: acceptanceIds.size,
+      command_count: plan.commands.length,
+      omitted_dependency_reference_count: 0,
+      omitted_instruction_reference_count: 0,
+      omitted_acceptance_reference_count: 0,
+      omitted_instruction_detail_count: 0,
+      omitted_acceptance_detail_count: 0,
+      truncated_unit_title_count: plan.units.filter((unit) => unit.title.length > titleLimit).length,
+      truncated_instruction_detail_count: truncatedTextCount(instructionIds, plan.instructions, detailLimit),
+      truncated_acceptance_detail_count: truncatedTextCount(acceptanceIds, plan.acceptance, detailLimit),
+      truncated_command_name_count: 0,
+      full_detail_digest: finalReviewFullDetailDigest({ plan, instructionIds, acceptanceIds }),
+    },
     units: context.units.map((unit) => ({
       ...unit,
-      title: boundedText(unit.title, 120),
+      title: boundedText(unit.title, titleLimit),
     })),
-    instructions: Object.fromEntries([...instructionIds].map((id) => [id, boundedText(plan.instructions[id], 320)])),
-    acceptance: Object.fromEntries([...acceptanceIds].map((id) => [id, boundedText(plan.acceptance[id], 320)])),
+    instructions: Object.fromEntries([...instructionIds].map((id) => [id, boundedText(plan.instructions[id], detailLimit)])),
+    acceptance: Object.fromEntries([...acceptanceIds].map((id) => [id, boundedText(plan.acceptance[id], detailLimit)])),
   };
   if (Buffer.byteLength(canonicalJson(compact), "utf8") <= FINAL_REVIEW_PLAN_CONTEXT_LIMIT_BYTES) return compact;
 

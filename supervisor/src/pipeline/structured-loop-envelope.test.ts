@@ -73,6 +73,60 @@ function denseLegacyPlan(): ExecutionPlanContract {
   };
 }
 
+function finalReviewPlanWithReferencedText(input: {
+  planId: string;
+  instructionText: string;
+  acceptanceText: string;
+}): ExecutionPlanContract {
+  return {
+    schema: "openthrottle.execution-plan/v1",
+    graph_id: "structured",
+    plan_id: input.planId,
+    instructions: { instruction: input.instructionText },
+    acceptance: { acceptance: input.acceptanceText },
+    units: [
+      {
+        id: "unit",
+        title: "Unit",
+        depends_on: [],
+        instructions: ["instruction"],
+        acceptance: ["acceptance"],
+      },
+    ],
+    commands: [],
+  };
+}
+
+function compactableFinalReviewPlan(): ExecutionPlanContract {
+  const instructionIds = Array.from({ length: 24 }, (_, index) => `instruction_${index}`);
+  const acceptanceIds = Array.from({ length: 24 }, (_, index) => `acceptance_${index}`);
+  const instructions = Object.fromEntries(instructionIds.map((id, index) => [
+    id,
+    `Instruction ${index} ${"preserve complete requirements before compacting ".repeat(35)}tail-${index}`,
+  ]));
+  const acceptance = Object.fromEntries(acceptanceIds.map((id, index) => [
+    id,
+    `Acceptance ${index} ${"verify complete criteria before compacting ".repeat(35)}tail-${index}`,
+  ]));
+  return {
+    schema: "openthrottle.execution-plan/v1",
+    graph_id: "structured",
+    plan_id: "compactable_final_review_context",
+    instructions,
+    acceptance,
+    units: [
+      {
+        id: "unit",
+        title: `${"Long final review unit title ".repeat(8)}tail`,
+        depends_on: [],
+        instructions: instructionIds,
+        acceptance: acceptanceIds,
+      },
+    ],
+    commands: [{ name: "test" }],
+  };
+}
+
 function unitsBefore(index: number): number[] {
   const first = Math.max(0, index - 32);
   return Array.from({ length: index - first }, (_, offset) => first + offset);
@@ -168,6 +222,128 @@ describe("downstream-context admission bound", () => {
       },
     });
     expect(Buffer.byteLength(canonicalJson(context), "utf8")).toBeLessThanOrEqual(MAX_LOOP_REQUEST_ENVELOPE_BYTES);
+  });
+
+  it("preserves valid 1,001-2,000 character final-review criteria when the full context fits", () => {
+    const instructionTail = "INSTRUCTION_TAIL_SENTINEL";
+    const acceptanceTail = "ACCEPTANCE_TAIL_SENTINEL";
+    const plan = finalReviewPlanWithReferencedText({
+      planId: "small_complete_final_review_context",
+      instructionText: `${"i".repeat(1_450)}${instructionTail}`,
+      acceptanceText: `${"a".repeat(1_450)}${acceptanceTail}`,
+    });
+
+    const context = loopActionPlanContext({ plan, actionKind: "final_review", unitId: null }) as {
+      instructions: Record<string, string>;
+      acceptance: Record<string, string>;
+      truncated?: boolean;
+      context_complete?: boolean;
+    };
+
+    expect(Buffer.byteLength(canonicalJson(context), "utf8")).toBeLessThanOrEqual(48 * 1024);
+    expect(context.truncated).toBeUndefined();
+    expect(context.context_complete).toBeUndefined();
+    expect(context.instructions.instruction).toBe(plan.instructions.instruction);
+    expect(context.acceptance.acceptance).toBe(plan.acceptance.acceptance);
+    expect(context.instructions.instruction).toContain(instructionTail);
+    expect(context.acceptance.acceptance).toContain(acceptanceTail);
+  });
+
+  it("marks compact final-review context incomplete only after the full context exceeds the byte limit", () => {
+    const plan = compactableFinalReviewPlan();
+    const completeShape = {
+      schema: "openthrottle.loop-action-plan-context/v1",
+      graph_id: plan.graph_id,
+      plan_id: plan.plan_id,
+      action_kind: "final_review",
+      unit: null,
+      whole_plan: true,
+      units: plan.units,
+      instructions: plan.instructions,
+      acceptance: plan.acceptance,
+      commands: plan.commands,
+    };
+    expect(Buffer.byteLength(canonicalJson(completeShape), "utf8")).toBeGreaterThan(48 * 1024);
+
+    const first = loopActionPlanContext({ plan, actionKind: "final_review", unitId: null }) as {
+      truncation: Record<string, unknown>;
+      truncated: boolean;
+      context_complete: boolean;
+      instructions: Record<string, string>;
+      acceptance: Record<string, string>;
+      units: Array<{ title: string }>;
+    };
+    const second = loopActionPlanContext({ plan, actionKind: "final_review", unitId: null });
+
+    expect(canonicalJson(second)).toBe(canonicalJson(first));
+    expect(Buffer.byteLength(canonicalJson(first), "utf8")).toBeLessThanOrEqual(48 * 1024);
+    expect(first.context_complete).toBe(false);
+    expect(first.truncated).toBe(true);
+    expect(first.truncation).toMatchObject({
+      reason: "final_review_plan_context_byte_limit",
+      limit_bytes: 48 * 1024,
+      unit_count: 1,
+      referenced_instruction_count: 24,
+      referenced_acceptance_count: 24,
+      omitted_instruction_detail_count: 0,
+      omitted_acceptance_detail_count: 0,
+      truncated_unit_title_count: 1,
+      truncated_instruction_detail_count: 24,
+      truncated_acceptance_detail_count: 24,
+    });
+    expect(typeof first.truncation.full_detail_digest).toBe("string");
+    expect(first.instructions.instruction_0).not.toContain("tail-0");
+    expect(first.acceptance.acceptance_0).not.toContain("tail-0");
+    expect(first.units[0]!.title).not.toContain("tail");
+  });
+
+  it("uses canonical UTF-8 byte counts at the final-review completeness boundary", () => {
+    const planFor = (entries: number): ExecutionPlanContract => {
+      const instructionIds = Array.from({ length: entries }, (_, index) => `instruction_${index}`);
+      const acceptanceIds = Array.from({ length: entries }, (_, index) => `acceptance_${index}`);
+      return {
+        schema: "openthrottle.execution-plan/v1",
+        graph_id: "structured",
+        plan_id: `utf8_boundary_${entries}`,
+        instructions: Object.fromEntries(instructionIds.map((id) => [id, `${"界".repeat(1_000)}tail`])),
+        acceptance: Object.fromEntries(acceptanceIds.map((id) => [id, `${"界".repeat(1_000)}tail`])),
+        units: [
+          {
+            id: "unit",
+            title: "Unit",
+            depends_on: [],
+            instructions: instructionIds,
+            acceptance: acceptanceIds,
+          },
+        ],
+        commands: [],
+      };
+    };
+    let maxComplete = 0;
+    for (let entries = 1; entries < 40; entries += 1) {
+      const context = loopActionPlanContext({ plan: planFor(entries), actionKind: "final_review", unitId: null });
+      if ((context as { truncated?: boolean }).truncated) break;
+      maxComplete = entries;
+    }
+
+    const complete = loopActionPlanContext({ plan: planFor(maxComplete), actionKind: "final_review", unitId: null }) as {
+      truncated?: boolean;
+      instructions: Record<string, string>;
+    };
+    const compact = loopActionPlanContext({ plan: planFor(maxComplete + 1), actionKind: "final_review", unitId: null }) as {
+      truncated: boolean;
+      context_complete: boolean;
+      truncation: Record<string, unknown>;
+    };
+
+    expect(maxComplete).toBeGreaterThan(0);
+    expect(Buffer.byteLength(canonicalJson(complete), "utf8")).toBeLessThanOrEqual(48 * 1024);
+    expect(complete.truncated).toBeUndefined();
+    expect(complete.instructions.instruction_0).toContain("tail");
+    expect(Buffer.byteLength(canonicalJson(compact), "utf8")).toBeLessThanOrEqual(48 * 1024);
+    expect(compact.context_complete).toBe(false);
+    expect(compact.truncated).toBe(true);
+    expect(compact.truncation.reason).toBe("final_review_plan_context_byte_limit");
   });
 
   it("byte-bounds adversarial legacy final-review fallback context with explicit omission metadata", () => {
