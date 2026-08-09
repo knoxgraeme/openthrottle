@@ -345,6 +345,91 @@ function insertPublishAttempt(input: {
   return request;
 }
 
+function insertProviderWaitAttempt(input: {
+  id: string;
+  expectedSubject: string;
+  immutableSubject?: string;
+  publishedSubject?: string;
+  staleDispatchEffect?: boolean;
+}): StageRequestEnvelope {
+  db!.prepare(`
+    INSERT OR IGNORE INTO pipeline_instance_stages (
+      pipeline_instance_id, stage_id, ordinal, status, attempt_count, created_at, updated_at
+    ) VALUES ('instance-1', 'provider', 3, 'waiting', 1, ?, ?)
+  `).run(timestamp, timestamp);
+  const withoutFence: Omit<StageRequestEnvelope, "requestHash" | "idempotencyKey"> = {
+    protocol: "stage-executor@1",
+    pipelineInstanceId: "instance-1",
+    manifestDigest: "e".repeat(64),
+    runtimeRelease: "runtime/v1",
+    capabilityDigest: "d".repeat(64),
+    repositoryConfigDigest: "c".repeat(64),
+    stageId: "provider",
+    attemptId: input.id,
+    runId: `run-${input.id}`,
+    issueId: "issue-1",
+    sessionId: "session-1",
+    generation: 1,
+    taskType: "implement",
+    taskContext: "task",
+    transitionContext: "transition",
+    repository: "owner/repo",
+    baseCommit: "a".repeat(40),
+    baseBranch: "main",
+    branch: "ot/ope-1",
+    agent: "codex",
+    contextRevision: 1,
+    expectedSubject: input.expectedSubject,
+    contextPolicy: "none",
+    nativeSessionId: null,
+    capability: "provider/wait@1",
+    requiredArtifacts: [],
+    credentialScopes: [],
+    liveSteering: false,
+  };
+  const fence = createStageRequestHash(withoutFence);
+  const request = { ...withoutFence, ...fence };
+  const payload = canonicalJson(request);
+  db!.prepare(`
+    INSERT INTO pipeline_stage_attempts (
+      id, pipeline_instance_id, stage_id, attempt_ordinal, reentry_ordinal,
+      request_hash, idempotency_key, context_revision, native_context_policy,
+      planned_run_id, run_id, status, expected_subject, native_session_id,
+      request_payload, created_at, updated_at
+    ) VALUES (?, 'instance-1', 'provider', 3, 0, ?, ?, 1, 'none', ?, NULL, 'pending', ?, NULL, ?, ?, ?)
+  `).run(
+    input.id,
+    request.requestHash,
+    request.idempotencyKey,
+    request.runId,
+    input.expectedSubject,
+    payload,
+    timestamp,
+    timestamp
+  );
+  if (input.staleDispatchEffect) {
+    db!.prepare(`
+      INSERT INTO pipeline_effect_intents (
+        id, pipeline_instance_id, transition_version, kind, idempotency_key,
+        payload, payload_hash, status, attempts, next_attempt_at, created_at
+      ) VALUES (?, 'instance-1', 100, 'dispatch_stage', ?, ?, ?, 'pending', 0, ?, ?)
+    `).run(
+      `effect-${input.id}`,
+      request.idempotencyKey,
+      payload,
+      digestNormalized(payload),
+      timestamp,
+      timestamp
+    );
+  }
+  db!.prepare(`
+    UPDATE pipeline_instances
+    SET immutable_subject = ?, published_subject = ?, active_stage_id = 'provider', status = 'waiting_provider'
+    WHERE id = 'instance-1'
+  `).run(input.immutableSubject ?? input.expectedSubject, input.publishedSubject ?? input.expectedSubject);
+  return request;
+}
+
 afterEach(() => {
   db?.close();
   db = undefined;
@@ -2313,6 +2398,148 @@ describe("execution unit store", () => {
       toSubject: "2".repeat(40),
       publishStageId: "publish",
     })).toThrow(/stage request binding mismatch/);
+  });
+
+  it("migrates provider wait publication subjects without synthesizing dispatch effects", () => {
+    const store = setup();
+    const commitSubject = "1".repeat(40);
+    const treeSubject = "2".repeat(40);
+    emitSingleUnitAggregate(store, commitSubject, "legacy-hash");
+    insertProviderWaitAttempt({
+      id: "attempt-provider-wait",
+      expectedSubject: commitSubject,
+    });
+
+    expect(store.migrateAggregateArtifactHash({
+      parentAttemptId: "attempt-parent",
+      fromArtifactHash: "legacy-hash",
+      toArtifactHash: "canonical-hash",
+      fromSubject: commitSubject,
+      toSubject: treeSubject,
+      successorStageId: "provider",
+    })).toBe("migrated");
+
+    expect(db!.prepare(`
+      SELECT immutable_subject, published_subject, status, active_stage_id
+      FROM pipeline_instances WHERE id = 'instance-1'
+    `).get()).toEqual({
+      immutable_subject: treeSubject,
+      published_subject: treeSubject,
+      status: "waiting_provider",
+      active_stage_id: "provider",
+    });
+    const attempt = db!.prepare(`
+      SELECT expected_subject, request_payload
+      FROM pipeline_stage_attempts WHERE id = 'attempt-provider-wait'
+    `).get() as { expected_subject: string; request_payload: string };
+    expect(attempt.expected_subject).toBe(treeSubject);
+    expect(JSON.parse(attempt.request_payload)).toMatchObject({
+      stageId: "provider",
+      capability: "provider/wait@1",
+      expectedSubject: treeSubject,
+    });
+    expect(db!.prepare(`
+      SELECT COUNT(*) AS count
+      FROM pipeline_effect_intents
+      WHERE pipeline_instance_id = 'instance-1' AND kind = 'dispatch_stage'
+        AND status NOT IN ('acknowledged', 'dead')
+    `).get()).toEqual({ count: 0 });
+  });
+
+  it("migrates already canonical provider wait published subjects by exact compare-and-set", () => {
+    const store = setup();
+    const commitSubject = "1".repeat(40);
+    const treeSubject = "2".repeat(40);
+    emitSingleUnitAggregate(store, commitSubject, "canonical-hash");
+    insertProviderWaitAttempt({
+      id: "attempt-provider-wait-replay",
+      expectedSubject: treeSubject,
+      immutableSubject: treeSubject,
+      publishedSubject: commitSubject,
+    });
+
+    expect(store.migrateAggregateArtifactHash({
+      parentAttemptId: "attempt-parent",
+      fromArtifactHash: "legacy-hash",
+      toArtifactHash: "canonical-hash",
+      fromSubject: commitSubject,
+      toSubject: treeSubject,
+      successorStageId: "provider",
+    })).toBe("already_canonical");
+
+    expect(db!.prepare(`
+      SELECT immutable_subject, published_subject
+      FROM pipeline_instances WHERE id = 'instance-1'
+    `).get()).toEqual({
+      immutable_subject: treeSubject,
+      published_subject: treeSubject,
+    });
+  });
+
+  it("fails closed when provider wait published subject changed independently", () => {
+    const store = setup();
+    const commitSubject = "1".repeat(40);
+    const treeSubject = "2".repeat(40);
+    const thirdSubject = "3".repeat(40);
+    emitSingleUnitAggregate(store, commitSubject, "legacy-hash");
+    insertProviderWaitAttempt({
+      id: "attempt-provider-wait-drift",
+      expectedSubject: commitSubject,
+      publishedSubject: thirdSubject,
+    });
+
+    expect(() => store.migrateAggregateArtifactHash({
+      parentAttemptId: "attempt-parent",
+      fromArtifactHash: "legacy-hash",
+      toArtifactHash: "canonical-hash",
+      fromSubject: commitSubject,
+      toSubject: treeSubject,
+      successorStageId: "provider",
+    })).toThrow(/provider wait published subject does not match migration source/);
+
+    expect(db!.prepare(`
+      SELECT aggregate_artifact_hash FROM execution_graphs WHERE parent_attempt_id = 'attempt-parent'
+    `).get()).toEqual({ aggregate_artifact_hash: "legacy-hash" });
+    expect(db!.prepare(`
+      SELECT immutable_subject, published_subject FROM pipeline_instances WHERE id = 'instance-1'
+    `).get()).toEqual({
+      immutable_subject: commitSubject,
+      published_subject: thirdSubject,
+    });
+  });
+
+  it("retires stale provider wait dispatch effects instead of rewriting or recreating them", () => {
+    const store = setup();
+    const commitSubject = "1".repeat(40);
+    const treeSubject = "2".repeat(40);
+    emitSingleUnitAggregate(store, commitSubject, "legacy-hash");
+    insertProviderWaitAttempt({
+      id: "attempt-provider-wait-stale-dispatch",
+      expectedSubject: commitSubject,
+      staleDispatchEffect: true,
+    });
+
+    expect(store.migrateAggregateArtifactHash({
+      parentAttemptId: "attempt-parent",
+      fromArtifactHash: "legacy-hash",
+      toArtifactHash: "canonical-hash",
+      fromSubject: commitSubject,
+      toSubject: treeSubject,
+      successorStageId: "provider",
+    })).toBe("migrated");
+
+    expect(db!.prepare(`
+      SELECT kind, status, last_error
+      FROM pipeline_effect_intents WHERE id = 'effect-attempt-provider-wait-stale-dispatch'
+    `).get()).toEqual({
+      kind: "dispatch_stage",
+      status: "dead",
+      last_error: "provider wait successor is idle after aggregate migration",
+    });
+    expect(db!.prepare(`
+      SELECT COUNT(*) AS count FROM pipeline_effect_intents
+      WHERE pipeline_instance_id = 'instance-1' AND kind = 'dispatch_stage' AND status != 'dead'
+    `).get()).toEqual({ count: 0 });
   });
 
   it("treats a stale aggregate marker replay as already canonical without duplicating activity", () => {

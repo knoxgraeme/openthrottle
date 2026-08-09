@@ -1459,25 +1459,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     }>;
     if (downstreamAttempts.length === 0) return;
 
-    const instance = input.db.prepare(`
-      SELECT immutable_subject FROM pipeline_instances WHERE id = ?
-    `).get(input.graph.pipeline_instance_id) as { immutable_subject: string | null } | undefined;
-    if (!instance) throw new Error(`pipeline instance ${input.graph.pipeline_instance_id} is missing`);
-    if (instance.immutable_subject === input.fromSubject) {
-      const instanceUpdate = input.db.prepare(`
-        UPDATE pipeline_instances
-        SET immutable_subject = ?,
-            status = CASE WHEN active_stage_id = ? AND status = 'running' THEN 'dispatchable' ELSE status END
-        WHERE id = ? AND immutable_subject = ?
-      `).run(input.toSubject, stageId, input.graph.pipeline_instance_id, input.fromSubject);
-      if (instanceUpdate.changes !== 1) {
-        throw new Error(`execution graph ${input.graph.id} publication subject compare-and-set failed`);
-      }
-    } else if (instance.immutable_subject !== input.toSubject) {
-      throw new Error(`execution graph ${input.graph.id} publication subject does not match migration source`);
-    }
-
-    for (const attempt of downstreamAttempts) {
+    const parsedAttempts = downstreamAttempts.map((attempt) => {
       if (!attempt.request_payload) {
         throw new Error(`downstream attempt ${attempt.id} has no sealed request`);
       }
@@ -1491,6 +1473,79 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
           request.expectedSubject !== attempt.expected_subject) {
         throw new Error(`downstream attempt ${attempt.id} stage request binding mismatch`);
       }
+      return {
+        attempt: { ...attempt, request_payload: attempt.request_payload },
+        request,
+        providerWait: request.capability === "provider/wait@1",
+      };
+    });
+    const hasProviderWaitSuccessor = parsedAttempts.some((entry) => entry.providerWait);
+    const instance = input.db.prepare(`
+      SELECT immutable_subject, published_subject FROM pipeline_instances WHERE id = ?
+    `).get(input.graph.pipeline_instance_id) as {
+      immutable_subject: string | null;
+      published_subject: string | null;
+    } | undefined;
+    if (!instance) throw new Error(`pipeline instance ${input.graph.pipeline_instance_id} is missing`);
+    if (instance.immutable_subject === input.fromSubject && !hasProviderWaitSuccessor) {
+      const instanceUpdate = input.db.prepare(`
+        UPDATE pipeline_instances
+        SET immutable_subject = ?,
+            status = CASE WHEN active_stage_id = ? AND status = 'running' THEN 'dispatchable' ELSE status END
+        WHERE id = ? AND immutable_subject = ?
+      `).run(input.toSubject, stageId, input.graph.pipeline_instance_id, input.fromSubject);
+      if (instanceUpdate.changes !== 1) {
+        throw new Error(`execution graph ${input.graph.id} publication subject compare-and-set failed`);
+      }
+    } else if (instance.immutable_subject === input.fromSubject &&
+        instance.published_subject === input.fromSubject) {
+      const instanceUpdate = input.db.prepare(`
+        UPDATE pipeline_instances
+        SET immutable_subject = ?,
+            published_subject = ?,
+            status = CASE WHEN active_stage_id = ? AND status = 'running' THEN 'dispatchable' ELSE status END
+        WHERE id = ? AND immutable_subject = ? AND published_subject = ?
+      `).run(
+        input.toSubject,
+        input.toSubject,
+        stageId,
+        input.graph.pipeline_instance_id,
+        input.fromSubject,
+        input.fromSubject
+      );
+      if (instanceUpdate.changes !== 1) {
+        throw new Error(`execution graph ${input.graph.id} provider wait publication subject compare-and-set failed`);
+      }
+    } else if (instance.immutable_subject === input.fromSubject &&
+        instance.published_subject === input.toSubject) {
+      const instanceUpdate = input.db.prepare(`
+        UPDATE pipeline_instances
+        SET immutable_subject = ?,
+            status = CASE WHEN active_stage_id = ? AND status = 'running' THEN 'dispatchable' ELSE status END
+        WHERE id = ? AND immutable_subject = ? AND published_subject = ?
+      `).run(input.toSubject, stageId, input.graph.pipeline_instance_id, input.fromSubject, input.toSubject);
+      if (instanceUpdate.changes !== 1) {
+        throw new Error(`execution graph ${input.graph.id} publication subject compare-and-set failed`);
+      }
+    } else if (instance.immutable_subject === input.fromSubject) {
+      throw new Error(`execution graph ${input.graph.id} provider wait published subject does not match migration source`);
+    } else if (instance.immutable_subject !== input.toSubject) {
+      throw new Error(`execution graph ${input.graph.id} publication subject does not match migration source`);
+    } else if (hasProviderWaitSuccessor &&
+        instance.published_subject === input.fromSubject) {
+      const instanceUpdate = input.db.prepare(`
+        UPDATE pipeline_instances
+        SET published_subject = ?
+        WHERE id = ? AND immutable_subject = ? AND published_subject = ?
+      `).run(input.toSubject, input.graph.pipeline_instance_id, input.toSubject, input.fromSubject);
+      if (instanceUpdate.changes !== 1) {
+        throw new Error(`execution graph ${input.graph.id} provider wait published subject compare-and-set failed`);
+      }
+    } else if (hasProviderWaitSuccessor && instance.published_subject !== input.toSubject) {
+      throw new Error(`execution graph ${input.graph.id} provider wait published subject does not match migration source`);
+    }
+
+    for (const { attempt, request, providerWait } of parsedAttempts) {
       if (attempt.expected_subject !== input.fromSubject && attempt.expected_subject !== input.toSubject) {
         throw new Error(`downstream attempt ${attempt.id} expected subject does not match aggregate migration`);
       }
@@ -1544,6 +1599,51 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         attempt.request_payload !== updatedRequest
       ) {
         throw new Error(`downstream attempt ${attempt.id} canonical request binding mismatch`);
+      }
+
+      if (providerWait) {
+        const staleEffects = input.db.prepare(`
+          SELECT id, payload, payload_hash, idempotency_key, status
+          FROM pipeline_effect_intents
+          WHERE pipeline_instance_id = ? AND kind = 'dispatch_stage'
+            AND status NOT IN ('acknowledged', 'dead')
+            AND (idempotency_key IN (?, ?) OR payload_hash IN (?, ?))
+          ORDER BY transition_version, created_at, id
+        `).all(
+          input.graph.pipeline_instance_id,
+          attempt.idempotency_key,
+          updatedFence.idempotencyKey,
+          oldEffectPayloadHash,
+          updatedEffectPayloadHash
+        ) as Array<{
+          id: string;
+          payload: string;
+          payload_hash: string;
+          idempotency_key: string;
+          status: string;
+        }>;
+        for (const effect of staleEffects) {
+          if (effect.status !== "pending" && effect.status !== "failed" && effect.status !== "processing") {
+            throw new Error(`downstream attempt ${attempt.id} dispatch effect is already leased`);
+          }
+          const matchesLegacy = effect.payload === attempt.request_payload &&
+            effect.idempotency_key === attempt.idempotency_key;
+          const matchesCanonical = effect.payload === updatedRequest &&
+            effect.idempotency_key === updatedFence.idempotencyKey;
+          if (!matchesLegacy && !matchesCanonical) {
+            throw new Error(`downstream attempt ${attempt.id} dispatch effect does not match migration source`);
+          }
+          const effectUpdate = input.db.prepare(`
+            UPDATE pipeline_effect_intents
+            SET status = 'dead',
+                last_error = 'provider wait successor is idle after aggregate migration'
+            WHERE id = ? AND status IN ('pending', 'failed', 'processing') AND payload_hash = ?
+          `).run(effect.id, effect.payload_hash);
+          if (effectUpdate.changes !== 1) {
+            throw new Error(`downstream attempt ${attempt.id} dispatch effect compare-and-set failed`);
+          }
+        }
+        continue;
       }
 
       let effect = input.db.prepare(`
