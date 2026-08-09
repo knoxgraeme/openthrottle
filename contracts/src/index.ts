@@ -55,6 +55,7 @@ export {
 } from "./execution-plan.js";
 export {
   ASSURANCE_CLASSES,
+  COMMAND_DIAGNOSTIC_TAIL_MAX_BYTES,
   RECEIPT_RESULTS_BY_TYPE,
   RECEIPT_SCHEMA,
   parseStandardReceipt,

@@ -313,6 +313,15 @@ for that child action — never a command receipt — so it cannot consume a
 semantic repair round. Graph-scoped final commands carry no worktree and run
 in the bake-once-bootstrapped integration checkout.
 
+Executor-owned repository command receipts retain sha256 digests of the bounded
+process captures for stdout and stderr. Failed receipts also carry independently
+optional,
+secret-sanitized diagnostic tails of at most 512 UTF-8 bytes per stream. The
+canonical receipt, including those tails, is passed unchanged in the bounded
+prior-evidence envelope to unit repair and final review actions; it remains
+subject to the standard-receipt schema and the 48 KiB aggregate prior-evidence
+limit.
+
 The executor runs exactly one stage:
 
 - agent capabilities invoke the appropriate OpenThrottle adapter and native CE

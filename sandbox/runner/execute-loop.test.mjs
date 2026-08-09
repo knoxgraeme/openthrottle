@@ -644,7 +644,13 @@ describe("loop action request validation", () => {
     const commandReceipt = priorReceipt("command", "command-1", {
       type: "command_result",
       result: "failure",
-      payload: { command: "npm test", exit_code: 1, summary: "unit tests failed" },
+      payload: {
+        command: "npm test",
+        exit_code: 1,
+        summary: "unit tests failed",
+        stdout_tail: "AssertionError: expected 2 to equal 3",
+        stderr_tail: "FAIL runner/command.test.mjs",
+      },
     });
     const withoutFence = {
       ...repairRequest,
@@ -658,7 +664,27 @@ describe("loop action request validation", () => {
     const valid = validateLoopRequest({ ...unfenced, ...createLoopRequestHash(unfenced) });
 
     expect(valid.priorEvidence.receipts).toHaveLength(2);
-    expect(loopPrompt(valid)).toContain("Fix the off-by-one in the paginator.");
+    const prompt = loopPrompt(valid);
+    expect(prompt).toContain("Fix the off-by-one in the paginator.");
+    expect(prompt).toContain("AssertionError: expected 2 to equal 3");
+    expect(prompt).toContain("FAIL runner/command.test.mjs");
+
+    const oversizedCommand = priorReceipt("command", "command-oversized", {
+      type: "command_result",
+      result: "failure",
+      payload: {
+        command: "npm test",
+        exit_code: 1,
+        summary: "unit tests failed",
+        stderr_tail: "x".repeat(513),
+      },
+    });
+    const oversizedEvidence = {
+      ...unfenced,
+      priorEvidence: { ...unfenced.priorEvidence, receipts: [leadReceipt, oversizedCommand] },
+    };
+    expect(() => validateLoopRequest({ ...oversizedEvidence, ...createLoopRequestHash(oversizedEvidence) }))
+      .toThrow(/stderr_tail must contain at most 512 UTF-8 bytes/);
 
     const missingLead = {
       ...unfenced,

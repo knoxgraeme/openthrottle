@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { canonicalJson } from "./capabilities.mjs";
-import { digest } from "./artifacts.mjs";
+import { commandDiagnosticTail, digest } from "./artifacts.mjs";
 import { writeJsonAtomic } from "./atomic-write.mjs";
 import { computeWorkspaceTreeOidAsExecutor, runGitAsExecutor } from "./repository-control.mjs";
 import {
@@ -246,6 +246,8 @@ function commandReceipt(request, {
     : execution.exitCode === 0 && !execution.timedOut && !execution.signal
       ? "success"
       : "failure";
+  const stdoutTail = result === "failure" ? commandDiagnosticTail(execution.stdout) : undefined;
+  const stderrTail = result === "failure" ? commandDiagnosticTail(execution.stderr) : undefined;
   const payload = {
     command: commandName,
     exit_code: finalCommandMutated
@@ -256,6 +258,8 @@ function commandReceipt(request, {
       : `Repository command ${commandName} exited with ${execution.exitCode}.`,
     stdout_digest: digest(execution.stdout ?? ""),
     stderr_digest: digest(execution.stderr ?? ""),
+    ...(stdoutTail === undefined ? {} : { stdout_tail: stdoutTail }),
+    ...(stderrTail === undefined ? {} : { stderr_tail: stderrTail }),
   };
   return receiptBase({
     request,

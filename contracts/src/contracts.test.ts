@@ -5,7 +5,7 @@ import { digestCanonicalJson } from "./canonical.js";
 import { parseRepositoryConfigContract } from "./config.js";
 import { parseExecutionPlanContract } from "./execution-plan.js";
 import { parseGraphContract } from "./graph.js";
-import { parseStandardReceipt } from "./receipts.js";
+import { parseStandardReceipt, validateStandardReceipt } from "./receipts.js";
 
 const fixtureRoot = new URL("../fixtures", import.meta.url);
 
@@ -67,6 +67,51 @@ const invalidCases = [
 ] as const;
 
 describe("Stage C contract fixtures", () => {
+  it("accepts bounded command diagnostic tails and rejects oversized UTF-8 tails", () => {
+    const receipt = JSON.parse(readFixture("valid", "receipt-unit-decision.json")) as Record<string, unknown>;
+    receipt.type = "command_result";
+    receipt.assurance = "executor_verified";
+    receipt.result = "failure";
+    receipt.producer = {
+      worker_id: "executor",
+      skill: "builtin://command@1",
+      capability_digest: "e".repeat(64),
+      skill_package_digest: null,
+    };
+    receipt.payload = {
+      command: "test",
+      exit_code: 1,
+      summary: "Repository command test exited with 1.",
+      stdout_digest: "a".repeat(64),
+      stderr_digest: "b".repeat(64),
+      stdout_tail: "AssertionError: expected 2 to equal 3",
+      stderr_tail: "FAIL runner/command.test.mjs",
+    };
+
+    expect(validateStandardReceipt(receipt, { source: "command receipt" }).value.payload).toMatchObject({
+      stdout_tail: "AssertionError: expected 2 to equal 3",
+      stderr_tail: "FAIL runner/command.test.mjs",
+    });
+    expect(() => validateStandardReceipt({
+      ...receipt,
+      payload: { ...(receipt.payload as Record<string, unknown>), stdout_tail: "💥".repeat(129) },
+    }, { source: "command receipt" })).toThrow(/stdout_tail: must contain at most 512 UTF-8 bytes/);
+    for (const result of ["success", "not_configured"] as const) {
+      for (const tailField of ["stdout_tail", "stderr_tail"] as const) {
+        expect(() => validateStandardReceipt({
+          ...receipt,
+          result,
+          payload: {
+            command: "test",
+            exit_code: 0,
+            summary: "No failed command output.",
+            [tailField]: "unexpected diagnostic tail",
+          },
+        }, { source: "command receipt" })).toThrow(/diagnostic tails are only valid for failed command receipts/);
+      }
+    }
+  });
+
   it("keeps the committed repository bootstrap on all four npm projects", () => {
     const config = readFileSync(new URL("../../.openthrottle.yml", import.meta.url), "utf8");
     for (const project of ["contracts", "supervisor", "cli", "sandbox"]) {

@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { canonicalJson } from "./capabilities.mjs";
-import { digest } from "./artifacts.mjs";
+import {
+  COMMAND_DIAGNOSTIC_TAIL_MAX_BYTES,
+  digest,
+  validateStandardReceipt,
+} from "./artifacts.mjs";
 import { childActionFailureResult, executeChildAction } from "./execute-child-action.mjs";
 
 const directories = [];
@@ -12,6 +16,7 @@ const directories = [];
 afterEach(() => {
   for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
   delete process.env.OT_STAGE_CONFIG_FILE;
+  delete process.env.OT_TEST_COMMAND_TOKEN;
 });
 
 function childRequestHash(requestWithoutFence) {
@@ -191,6 +196,42 @@ describe("child executor action", () => {
     ]);
   });
 
+  it("carries bounded sanitized diagnostic tails on failed repository command receipts", () => {
+    useRepositoryConfig({ test: "npm test" });
+    process.env.OT_TEST_COMMAND_TOKEN = "private-command-token-value";
+    const stdout = `discarded stdout ${"💥".repeat(300)}\nAssertionError: expected 2 to equal 3\nprivate-command-token-value`;
+    const stderr = `discarded stderr ${"y".repeat(800)}\nFAIL runner/command.test.mjs\nghp_abcdefghijklmnop`;
+    const request = childExecutorRequest({ commandName: "test" });
+
+    const result = executeChildAction({
+      request,
+      grantWorktree: ({ handle }) => ({ id: handle, path: `/tmp/${handle}`, writable: true }),
+      bootstrapWorktree: () => {},
+      executeCommand: () => ({ exitCode: 1, signal: null, timedOut: false, stdout, stderr }),
+      computeSubject: () => "3".repeat(40),
+      lockWorktreeHandle: () => {},
+    });
+    const receipt = JSON.parse(result.receipt);
+
+    expect(result.outcome).toBe("failure");
+    expect(receipt.payload).toMatchObject({
+      stdout_digest: digest(stdout),
+      stderr_digest: digest(stderr),
+      stdout_tail: expect.stringContaining("AssertionError: expected 2 to equal 3"),
+      stderr_tail: expect.stringContaining("FAIL runner/command.test.mjs"),
+    });
+    expect(result.receipt).not.toContain("private-command-token-value");
+    expect(result.receipt).not.toContain("ghp_abcdefghijklmnop");
+    expect(Buffer.byteLength(receipt.payload.stdout_tail, "utf8"))
+      .toBeLessThanOrEqual(COMMAND_DIAGNOSTIC_TAIL_MAX_BYTES);
+    expect(Buffer.byteLength(receipt.payload.stderr_tail, "utf8"))
+      .toBeLessThanOrEqual(COMMAND_DIAGNOSTIC_TAIL_MAX_BYTES);
+    expect(receipt.payload.stdout_tail).not.toContain("discarded stdout");
+    expect(receipt.payload.stderr_tail).not.toContain("discarded stderr");
+    expect(receipt.payload.stdout_tail).not.toContain("�");
+    expect(() => validateStandardReceipt(receipt, process.env)).not.toThrow();
+  });
+
   it("computes a command action's post-command subject on a worktree whose shared admin dir another action's cleanup already relocked", () => {
     useRepositoryConfig({ test: "npm test" });
 
@@ -312,6 +353,9 @@ describe("child executor action", () => {
         post: request.inputSubject,
       },
     });
+    expect(receipt.payload).not.toHaveProperty("stdout_tail");
+    expect(receipt.payload).not.toHaveProperty("stderr_tail");
+    expect(() => validateStandardReceipt(receipt, {})).not.toThrow();
   });
 
   it("fails and restores final commands that leave the integration checkout dirty", () => {

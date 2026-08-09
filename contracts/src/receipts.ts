@@ -17,6 +17,11 @@ import {
 import { RECEIPT_TYPES, type ReceiptType } from "./graph.js";
 
 export const RECEIPT_SCHEMA = "openthrottle.receipt/v1" as const;
+// Kept byte-identical with sandbox/runner/artifacts.mjs. A structured repair
+// can carry up to sixteen command receipts inside a 48 KiB prior-evidence
+// envelope, so each stream gets a deliberately small byte (not character)
+// budget.
+export const COMMAND_DIAGNOSTIC_TAIL_MAX_BYTES = 512;
 export const ASSURANCE_CLASSES = [
   "semantic_attested",
   "semantic_corroborated",
@@ -89,6 +94,8 @@ export interface CommandResultPayload {
   summary: string;
   stdout_digest?: string;
   stderr_digest?: string;
+  stdout_tail?: string;
+  stderr_tail?: string;
 }
 
 export interface SubjectEvidencePayload {
@@ -240,6 +247,14 @@ function stringList(value: unknown, path: string, max = 32): string[] {
   return arrayAt(value, path, (entry, entryPath) => stringAt(entry, entryPath, { max: 1_000 }), { max });
 }
 
+function commandDiagnosticTail(value: unknown, path: string): string {
+  const tail = stringAt(value, path, { max: COMMAND_DIAGNOSTIC_TAIL_MAX_BYTES });
+  if (Buffer.byteLength(tail, "utf8") > COMMAND_DIAGNOSTIC_TAIL_MAX_BYTES) {
+    fail(path, `must contain at most ${COMMAND_DIAGNOSTIC_TAIL_MAX_BYTES} UTF-8 bytes`);
+  }
+  return tail;
+}
+
 export interface ContextRecord {
   unit_id: string;
   summary: string;
@@ -316,13 +331,17 @@ function parseReceiptPayload(type: ReceiptType, value: unknown, path: string): S
     };
   }
   if (type === "command_result") {
-    const input = objectAt(value, path, ["command", "exit_code", "summary", "stdout_digest", "stderr_digest"]);
+    const input = objectAt(value, path, [
+      "command", "exit_code", "summary", "stdout_digest", "stderr_digest", "stdout_tail", "stderr_tail",
+    ]);
     return {
       command: stringAt(input.command, `${path}.command`, { max: 80 }),
       exit_code: integerAt(input.exit_code, `${path}.exit_code`, 0, 255),
       summary: stringAt(input.summary, `${path}.summary`, { max: 4_000 }),
       ...(input.stdout_digest === undefined ? {} : { stdout_digest: stringAt(input.stdout_digest, `${path}.stdout_digest`, { pattern: SHA256 }) }),
       ...(input.stderr_digest === undefined ? {} : { stderr_digest: stringAt(input.stderr_digest, `${path}.stderr_digest`, { pattern: SHA256 }) }),
+      ...(input.stdout_tail === undefined ? {} : { stdout_tail: commandDiagnosticTail(input.stdout_tail, `${path}.stdout_tail`) }),
+      ...(input.stderr_tail === undefined ? {} : { stderr_tail: commandDiagnosticTail(input.stderr_tail, `${path}.stderr_tail`) }),
     };
   }
   if (type === "candidate_evidence" || type === "integration_evidence") {
@@ -387,6 +406,10 @@ export function validateStandardReceipt(
     payload: parsePayload(type, input.payload, `${source}.payload`),
     issued_at: timestamp(input.issued_at, `${source}.issued_at`),
   } as StandardReceipt;
+  if (receipt.type === "command_result" && receipt.result !== "failure"
+      && (receipt.payload.stdout_tail !== undefined || receipt.payload.stderr_tail !== undefined)) {
+    fail(`${source}.payload`, "diagnostic tails are only valid for failed command receipts");
+  }
   if (SEMANTIC_RECEIPTS.has(type) && ["executor_verified", "provider_verified", "human_approved"].includes(receipt.assurance)) {
     fail(`${source}.assurance`, "semantic receipts cannot claim executor, provider, or human assurance");
   }
