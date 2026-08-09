@@ -1655,6 +1655,38 @@ CREATE TABLE execution_publication_events (
 const executionPublicationEventsMigrationSource = `${executionPublicationEventsSchema}
 child-publication-event-contract:each reportable child transition durably inserts one ordered publication event and its correlated linear_outbox activity in the same transaction, so restart converges without duplication/v1`;
 
+const executionPublicationAggregateCorrectionKindSchema = `
+CREATE TABLE execution_publication_events_v31 (
+  id TEXT PRIMARY KEY,
+  execution_graph_id TEXT NOT NULL,
+  pipeline_instance_id TEXT NOT NULL,
+  parent_attempt_id TEXT NOT NULL,
+  unit_id TEXT,
+  sequence INTEGER NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('unit_repair', 'unit_settled', 'graph_stopped', 'final_review', 'aggregate', 'aggregate_correction', 'steering_undelivered')),
+  body TEXT NOT NULL,
+  linear_outbox_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(execution_graph_id, pipeline_instance_id, parent_attempt_id)
+    REFERENCES execution_graphs(id, pipeline_instance_id, parent_attempt_id) ON DELETE RESTRICT,
+  FOREIGN KEY(linear_outbox_id) REFERENCES linear_outbox(id) ON DELETE RESTRICT,
+  UNIQUE(parent_attempt_id, sequence)
+);
+INSERT INTO execution_publication_events_v31 (
+  id, execution_graph_id, pipeline_instance_id, parent_attempt_id, unit_id,
+  sequence, kind, body, linear_outbox_id, created_at
+)
+SELECT
+  id, execution_graph_id, pipeline_instance_id, parent_attempt_id, unit_id,
+  sequence, kind, body, linear_outbox_id, created_at
+FROM execution_publication_events;
+DROP TABLE execution_publication_events;
+ALTER TABLE execution_publication_events_v31 RENAME TO execution_publication_events;
+`;
+
+const executionPublicationAggregateCorrectionKindMigrationSource = `${executionPublicationAggregateCorrectionKindSchema}
+child-publication-event-contract:aggregate correction notices have a distinct durable event kind/v1`;
+
 // The reason vocabulary is closed and grown bottom-up per incident, mirroring
 // LAUNCH_FAILURE_REASONS (sandbox/runner/launch-failure.mjs): every value
 // below is a literal already produced by supervisor/src/pipeline/gates.ts or
@@ -2445,6 +2477,25 @@ const definitions: DatabaseMigrationDefinition[] = [
       if (hasTable(db, "pipeline_instances") && !hasColumns(db, "pipeline_instances", ["published_subject"])) {
         db.exec(pipelinePublishedSubjectSchema);
       }
+    },
+  },
+  {
+    version: 31,
+    name: "execution-publication-aggregate-correction-kind",
+    source: executionPublicationAggregateCorrectionKindMigrationSource,
+    up(db) {
+      if (!hasTable(db, "execution_publication_events")) return;
+      if (!hasTable(db, "execution_graphs")) return;
+      const sql = db.prepare(`
+        SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'execution_publication_events'
+      `).get() as { sql: string } | undefined;
+      if (sql?.sql.includes("aggregate_correction")) return;
+      db.exec(hasTable(db, "linear_outbox")
+        ? executionPublicationAggregateCorrectionKindSchema
+        : executionPublicationAggregateCorrectionKindSchema.replace(
+            "  FOREIGN KEY(linear_outbox_id) REFERENCES linear_outbox(id) ON DELETE RESTRICT,\n",
+            ""
+          ));
     },
   },
 ];

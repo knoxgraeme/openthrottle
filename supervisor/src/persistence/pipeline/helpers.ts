@@ -312,6 +312,7 @@ export type ExecutionPublicationEventKind =
   | "graph_stopped"
   | "final_review"
   | "aggregate"
+  | "aggregate_correction"
   // A composite (`for_each_unit`) run has no steerable child action fence
   // today (RU11 leaves this a documented gap rather than a silent one, see
   // docs/SPEC.md "Live steering"): a reply captured while this run is active
@@ -537,7 +538,7 @@ export function migrateAggregatePublicationActivity(input: {
     id: correctionEventId,
     graph: input.graph,
     unitId: null,
-    kind: "aggregate",
+    kind: "aggregate_correction",
     body: aggregateCorrectionBody(input.fromArtifactHash, input.toArtifactHash),
     timestamp: input.timestamp,
   });

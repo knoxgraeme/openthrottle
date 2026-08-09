@@ -10,6 +10,7 @@ import {
 import { buildExecutionPublicationSnapshot } from "../../pipeline/execution-publication.js";
 import type { ExecutionGateDecision } from "../../pipeline/execution-gates.js";
 import type { GateReceiptReason } from "../../pipeline/gates.js";
+import { createStageRequestHash, type StageRequestEnvelope } from "../../pipeline/stage-request.js";
 import {
   decideDownstreamContext,
   deriveUnitTerminalState,
@@ -231,6 +232,8 @@ export interface ExecutionUnitStore {
     parentAttemptId: string;
     fromArtifactHash: string;
     toArtifactHash: string;
+    fromSubject?: string;
+    toSubject?: string;
   }): "migrated" | "already_canonical";
   recordGateReceipt(input: {
     actionId: string;
@@ -1224,8 +1227,18 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       toArtifactHash: input.toArtifactHash,
       timestamp,
     });
+    const migrateDownstream = () => {
+      if (!input.fromSubject || !input.toSubject) return;
+      migrateAggregateDownstreamPublication({
+        db,
+        graph,
+        fromSubject: input.fromSubject,
+        toSubject: input.toSubject,
+      });
+    };
     if (graph.aggregate_artifact_hash === input.toArtifactHash) {
       migrateActivity(now());
+      migrateDownstream();
       return "already_canonical";
     }
     if (graph.aggregate_artifact_hash !== input.fromArtifactHash) {
@@ -1241,12 +1254,152 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     `).run(input.toArtifactHash, timestamp, input.parentAttemptId, input.fromArtifactHash);
     if (update.changes === 1) {
       migrateActivity(timestamp);
+      migrateDownstream();
       return "migrated";
     }
     const current = graphStmt.get(input.parentAttemptId) as ExecutionUnitGraph | undefined;
-    if (current?.aggregate_artifact_hash === input.toArtifactHash) return "already_canonical";
+    if (current?.aggregate_artifact_hash === input.toArtifactHash) {
+      migrateDownstream();
+      return "already_canonical";
+    }
     throw new Error(`execution graph ${graph.id} aggregate marker compare-and-set failed`);
   });
+
+  function migrateAggregateDownstreamPublication(input: {
+    db: Database.Database;
+    graph: ExecutionUnitGraph;
+    fromSubject: string;
+    toSubject: string;
+  }): void {
+    const publishAttempts = input.db.prepare(`
+      SELECT id, request_hash, idempotency_key, request_payload, expected_subject, status
+      FROM pipeline_stage_attempts
+      WHERE pipeline_instance_id = ? AND stage_id = 'publish'
+        AND status NOT IN ('completed', 'canceled', 'superseded', 'failed')
+      ORDER BY attempt_ordinal, reentry_ordinal, created_at, id
+    `).all(input.graph.pipeline_instance_id) as Array<{
+      id: string;
+      request_hash: string;
+      idempotency_key: string;
+      request_payload: string | null;
+      expected_subject: string | null;
+      status: string;
+    }>;
+    if (publishAttempts.length === 0) return;
+
+    const instance = input.db.prepare(`
+      SELECT immutable_subject FROM pipeline_instances WHERE id = ?
+    `).get(input.graph.pipeline_instance_id) as { immutable_subject: string | null } | undefined;
+    if (!instance) throw new Error(`pipeline instance ${input.graph.pipeline_instance_id} is missing`);
+    if (instance.immutable_subject === input.fromSubject) {
+      const instanceUpdate = input.db.prepare(`
+        UPDATE pipeline_instances
+        SET immutable_subject = ?
+        WHERE id = ? AND immutable_subject = ?
+      `).run(input.toSubject, input.graph.pipeline_instance_id, input.fromSubject);
+      if (instanceUpdate.changes !== 1) {
+        throw new Error(`execution graph ${input.graph.id} publication subject compare-and-set failed`);
+      }
+    } else if (instance.immutable_subject !== input.toSubject) {
+      throw new Error(`execution graph ${input.graph.id} publication subject does not match migration source`);
+    }
+
+    for (const attempt of publishAttempts) {
+      if (!attempt.request_payload) {
+        throw new Error(`publish attempt ${attempt.id} has no sealed request`);
+      }
+      const request = JSON.parse(attempt.request_payload) as StageRequestEnvelope;
+      if (request.stageId !== "publish" || request.attemptId !== attempt.id ||
+          request.requestHash !== attempt.request_hash ||
+          request.idempotencyKey !== attempt.idempotency_key ||
+          request.expectedSubject !== attempt.expected_subject) {
+        throw new Error(`publish attempt ${attempt.id} stage request binding mismatch`);
+      }
+      if (attempt.expected_subject !== input.fromSubject && attempt.expected_subject !== input.toSubject) {
+        throw new Error(`publish attempt ${attempt.id} expected subject does not match aggregate migration`);
+      }
+      const withoutFence = (({ requestHash, idempotencyKey, ...rest }: StageRequestEnvelope) => {
+        void requestHash;
+        void idempotencyKey;
+        return rest;
+      })(request);
+      const updatedWithoutFence = { ...withoutFence, expectedSubject: input.toSubject };
+      const updatedFence = createStageRequestHash(updatedWithoutFence);
+      const updatedRequest = canonicalJson({ ...updatedWithoutFence, ...updatedFence });
+      const oldEffectPayloadHash = digestNormalized(attempt.request_payload);
+      const updatedEffectPayloadHash = digestNormalized(updatedRequest);
+
+      if (attempt.expected_subject === input.fromSubject) {
+        const attemptUpdate = input.db.prepare(`
+          UPDATE pipeline_stage_attempts
+          SET expected_subject = ?, request_hash = ?, idempotency_key = ?, request_payload = ?
+          WHERE id = ? AND request_hash = ? AND status NOT IN ('completed', 'canceled', 'superseded', 'failed')
+        `).run(
+          input.toSubject,
+          updatedFence.requestHash,
+          updatedFence.idempotencyKey,
+          updatedRequest,
+          attempt.id,
+          attempt.request_hash
+        );
+        if (attemptUpdate.changes !== 1) {
+          throw new Error(`publish attempt ${attempt.id} aggregate subject compare-and-set failed`);
+        }
+      } else if (
+        attempt.request_hash !== updatedFence.requestHash ||
+        attempt.idempotency_key !== updatedFence.idempotencyKey ||
+        attempt.request_payload !== updatedRequest
+      ) {
+        throw new Error(`publish attempt ${attempt.id} canonical request binding mismatch`);
+      }
+
+      const effect = input.db.prepare(`
+        SELECT id, payload, payload_hash, idempotency_key, status
+        FROM pipeline_effect_intents
+        WHERE pipeline_instance_id = ? AND kind = 'dispatch_stage'
+          AND status NOT IN ('acknowledged', 'dead')
+          AND (idempotency_key IN (?, ?) OR payload_hash IN (?, ?))
+        ORDER BY transition_version, created_at, id
+        LIMIT 1
+      `).get(
+        input.graph.pipeline_instance_id,
+        attempt.idempotency_key,
+        updatedFence.idempotencyKey,
+        oldEffectPayloadHash,
+        updatedEffectPayloadHash
+      ) as | {
+        id: string;
+        payload: string;
+        payload_hash: string;
+        idempotency_key: string;
+        status: string;
+      } | undefined;
+      if (!effect) {
+        throw new Error(`publish attempt ${attempt.id} has no migratable dispatch effect`);
+      }
+      if (effect.status !== "pending" && effect.status !== "failed" && effect.status !== "processing") {
+        throw new Error(`publish attempt ${attempt.id} dispatch effect is already leased`);
+      }
+      if (effect.payload === updatedRequest && effect.idempotency_key === updatedFence.idempotencyKey) continue;
+      if (effect.payload !== attempt.request_payload || effect.idempotency_key !== attempt.idempotency_key) {
+        throw new Error(`publish attempt ${attempt.id} dispatch effect does not match migration source`);
+      }
+      const effectUpdate = input.db.prepare(`
+        UPDATE pipeline_effect_intents
+        SET idempotency_key = ?, payload = ?, payload_hash = ?, attempts = 0, last_error = NULL
+        WHERE id = ? AND status IN ('pending', 'failed', 'processing') AND payload_hash = ?
+      `).run(
+        updatedFence.idempotencyKey,
+        updatedRequest,
+        updatedEffectPayloadHash,
+        effect.id,
+        effect.payload_hash
+      );
+      if (effectUpdate.changes !== 1) {
+        throw new Error(`publish attempt ${attempt.id} dispatch effect compare-and-set failed`);
+      }
+    }
+  }
 
   const recordGateReceipt = db.transaction((
     input: Parameters<ExecutionUnitStore["recordGateReceipt"]>[0]

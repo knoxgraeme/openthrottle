@@ -1323,10 +1323,6 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       if (!graph) return;
       const parentAttempt = deps.store.getAttempt(parentAttemptId);
       if (!parentAttempt) throw new Error(`structured parent attempt ${parentAttemptId} is missing`);
-      if (
-        graph.aggregate_emitted_at &&
-        ["completed", "canceled", "superseded", "failed"].includes(parentAttempt.status)
-      ) return;
       const units = deps.store.listUnits(parentAttemptId);
       const attempts = deps.store.listWorkAttempts(parentAttemptId);
       const gates = deps.store.listGateReceipts(parentAttemptId);
@@ -1371,8 +1367,21 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       const graphResult = event.artifacts?.find((artifact) => artifact.kind === "execution_graph_result");
       if (!graphResult) throw new Error(`structured aggregate ${event.id} did not include execution_graph_result`);
       if (graph.aggregate_emitted_at) {
-        const legacyGraphResult = outcome === "success" && aggregateSubject !== integrationSubject
-          ? buildAggregateStageEvent({
+        const legacyGraphResults = outcome === "success" && aggregateSubject !== integrationSubject
+          ? [
+            graph.aggregate_emitted_at
+              ? buildAggregateStageEvent({
+                  id: `execution-aggregate:${parentAttemptId}:${integrationSubject}:${outcome}`,
+                  manifest,
+                  instance,
+                  parentAttempt,
+                  outcome,
+                  subject: integrationSubject,
+                  completedAt: graph.aggregate_emitted_at,
+                  units,
+                }).artifacts?.find((artifact) => artifact.kind === "execution_graph_result")
+              : undefined,
+            buildAggregateStageEvent({
               id: `execution-aggregate:${parentAttemptId}:${integrationSubject}:${outcome}`,
               manifest,
               instance,
@@ -1380,8 +1389,12 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
               outcome,
               subject: integrationSubject,
               units,
-            }).artifacts?.find((artifact) => artifact.kind === "execution_graph_result")
-          : null;
+            }).artifacts?.find((artifact) => artifact.kind === "execution_graph_result"),
+          ].filter((artifact): artifact is NonNullable<typeof artifact> => Boolean(artifact))
+          : [];
+        const legacyGraphResult = legacyGraphResults.find((artifact) => artifact.hash === graph.aggregate_artifact_hash) ??
+          legacyGraphResults[0] ??
+          null;
         if (graph.aggregate_artifact_hash !== graphResult.hash) {
           if (!legacyGraphResult || graph.aggregate_artifact_hash !== legacyGraphResult.hash) {
             throw new Error(`structured aggregate ${parentAttemptId} replay hash does not match durable graph marker`);
@@ -1392,8 +1405,11 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
             parentAttemptId,
             fromArtifactHash: legacyGraphResult.hash,
             toArtifactHash: graphResult.hash,
+            fromSubject: integrationSubject,
+            toSubject: aggregateSubject,
           });
         }
+        if (["completed", "canceled", "superseded", "failed"].includes(parentAttempt.status)) return;
         completeParentStage(event);
         return;
       }

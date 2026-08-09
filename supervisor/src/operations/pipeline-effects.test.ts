@@ -16,6 +16,7 @@ import {
 import { parseAndCompileExecutionGraph } from "../pipeline/execution-graph.js";
 import { buildAggregateStageEvent } from "../pipeline/unit-coordinator.js";
 import { executionLedgerLines } from "../pipeline/execution-publication.js";
+import { createStageRequestHash, type StageRequestEnvelope } from "../pipeline/stage-request.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { buildInstalledRuntimeDescriptor, type SandboxAutostopRuntime, type SandboxRuntime } from "../__fixtures__/runtime.js";
 import type { ExecutionGateDecision } from "../pipeline/execution-gates.js";
@@ -1351,6 +1352,7 @@ describe("pipeline effect processor", () => {
       parentAttempt: pipelines.getAttempt(attempt.id)!,
       outcome: "success",
       subject: finalIntegratedSubject,
+      completedAt: pipelines.getGraphForAttempt(attempt.id)!.aggregate_emitted_at ?? undefined,
       units: pipelines.listUnits(attempt.id),
     });
     const legacyGraphResult = legacyCommitSubjectAggregate.artifacts
@@ -1365,22 +1367,6 @@ describe("pipeline effect processor", () => {
     `).run("0".repeat(64), "2099-07-22T12:00:00.000Z", attempt.id);
     await expect(processor.drain()).rejects.toThrow(/replay hash does not match durable graph marker/);
 
-    db!.prepare(`
-      UPDATE execution_graphs
-      SET aggregate_artifact_hash = ?, updated_at = ?
-      WHERE parent_attempt_id = ?
-    `).run(legacyGraphResult!.hash, "2099-07-22T12:00:00.000Z", attempt.id);
-    db!.prepare("UPDATE pipeline_instances SET status = 'publication_blocked' WHERE id = ?").run(instance.id);
-    await expect(processor.drain()).rejects.toThrow(/pipeline publication is blocked/);
-    expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
-      aggregate_artifact_hash: canonicalGraphResultHash,
-    });
-    const structuredPublication = pipelines.getStructuredExecutionPublicationForInstance(instance.id)!;
-    expect(structuredPublication.graph.aggregate_artifact_hash).toBe(canonicalGraphResultHash);
-    expect(executionLedgerLines(structuredPublication))
-      .toEqual(expect.arrayContaining([
-        expect.stringContaining(`aggregate=${canonicalGraphResultHash}`),
-      ]));
     const aggregatePublication = db!.prepare(`
       SELECT e.id, e.body, e.linear_outbox_id, o.payload
       FROM execution_publication_events e
@@ -1400,14 +1386,34 @@ describe("pipeline effect processor", () => {
         body: legacyAggregateBody,
       },
     });
-    db!.prepare("UPDATE execution_publication_events SET body = ? WHERE id = ?")
-      .run(legacyAggregateBody, aggregatePublication.id);
-    db!.prepare("UPDATE linear_outbox SET payload = ?, payload_hash = ? WHERE id = ?")
-      .run(
-        legacyAggregateOutboxPayload,
-        digestNormalized(legacyAggregateOutboxPayload),
-        aggregatePublication.linear_outbox_id
-      );
+    const rewriteAggregatePublicationToLegacyHash = () => {
+      db!.prepare("UPDATE execution_publication_events SET body = ? WHERE id = ?")
+        .run(legacyAggregateBody, aggregatePublication.id);
+      db!.prepare("UPDATE linear_outbox SET payload = ?, payload_hash = ? WHERE id = ?")
+        .run(
+          legacyAggregateOutboxPayload,
+          digestNormalized(legacyAggregateOutboxPayload),
+          aggregatePublication.linear_outbox_id
+        );
+    };
+    rewriteAggregatePublicationToLegacyHash();
+    db!.prepare(`
+      UPDATE execution_graphs
+      SET aggregate_artifact_hash = ?, updated_at = ?
+      WHERE parent_attempt_id = ?
+    `).run(legacyGraphResult!.hash, "2099-07-22T12:00:00.000Z", attempt.id);
+    db!.prepare("UPDATE pipeline_instances SET status = 'publication_blocked' WHERE id = ?").run(instance.id);
+    await expect(processor.drain()).rejects.toThrow(/pipeline publication is blocked/);
+    expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
+      aggregate_artifact_hash: canonicalGraphResultHash,
+    });
+    const structuredPublication = pipelines.getStructuredExecutionPublicationForInstance(instance.id)!;
+    expect(structuredPublication.graph.aggregate_artifact_hash).toBe(canonicalGraphResultHash);
+    expect(executionLedgerLines(structuredPublication))
+      .toEqual(expect.arrayContaining([
+        expect.stringContaining(`aggregate=${canonicalGraphResultHash}`),
+      ]));
+    rewriteAggregatePublicationToLegacyHash();
     await expect(processor.drain()).rejects.toThrow(/pipeline publication is blocked/);
     const reconciledPublication = pipelines.getStructuredExecutionPublicationForInstance(instance.id)!;
     expect(reconciledPublication.graph.aggregate_artifact_hash).toBe(canonicalGraphResultHash);
@@ -1459,6 +1465,46 @@ describe("pipeline effect processor", () => {
     });
     expect(tickets.getByIssueId(instance.linear_issue_id)?.run_id).toBeNull();
 
+    const publishAttempt = pipelines.getActiveAttempt(instance.id)!;
+    const canonicalRequest = JSON.parse(publishAttempt.request_payload!) as StageRequestEnvelope;
+    const canonicalWithoutFence = (({ requestHash, idempotencyKey, ...rest }: StageRequestEnvelope) => {
+      void requestHash;
+      void idempotencyKey;
+      return rest;
+    })(canonicalRequest);
+    const legacyWithoutFence = { ...canonicalWithoutFence, expectedSubject: finalIntegratedSubject };
+    const legacyFence = createStageRequestHash(legacyWithoutFence);
+    const legacyRequest = canonicalJson({ ...legacyWithoutFence, ...legacyFence });
+    const dispatchEffect = effects.find((effect) => effect.kind === "dispatch_stage" && effect.status === "pending")!;
+    rewriteAggregatePublicationToLegacyHash();
+    db!.prepare(`
+      UPDATE execution_graphs
+      SET aggregate_artifact_hash = ?, updated_at = ?
+      WHERE parent_attempt_id = ?
+    `).run(legacyGraphResult!.hash, "2099-07-22T12:00:00.000Z", attempt.id);
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET immutable_subject = ?, updated_at = ?
+      WHERE id = ?
+    `).run(finalIntegratedSubject, "2099-07-22T12:00:00.000Z", instance.id);
+    db!.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET expected_subject = ?, request_hash = ?, idempotency_key = ?, request_payload = ?, updated_at = ?
+      WHERE id = ?
+    `).run(
+      finalIntegratedSubject,
+      legacyFence.requestHash,
+      legacyFence.idempotencyKey,
+      legacyRequest,
+      "2099-07-22T12:00:00.000Z",
+      publishAttempt.id
+    );
+    db!.prepare(`
+      UPDATE pipeline_effect_intents
+      SET idempotency_key = ?, payload = ?, payload_hash = ?
+      WHERE id = ?
+    `).run(legacyFence.idempotencyKey, legacyRequest, digestNormalized(legacyRequest), dispatchEffect.id);
+
     const dispatchCallsBeforePublish = runtime.dispatchStage.mock.calls.length;
     await processor.drain();
     expect(runtime.dispatchStage).toHaveBeenCalledTimes(dispatchCallsBeforePublish + 1);
@@ -1472,6 +1518,14 @@ describe("pipeline effect processor", () => {
         nativeSessionId: null,
       })
     );
+    expect(pipelines.getInstance(instance.id)).toMatchObject({ immutable_subject: finalIntegratedTreeSubject });
+    expect(pipelines.getActiveAttempt(instance.id)).toMatchObject({
+      stage_id: "publish",
+      expected_subject: finalIntegratedTreeSubject,
+    });
+    expect(JSON.parse(pipelines.getEffect(dispatchEffect.id)!.payload)).toMatchObject({
+      expectedSubject: finalIntegratedTreeSubject,
+    });
     expect(tickets.getByIssueId(instance.linear_issue_id)?.run_id).toBe(publishRequest.runId);
   });
 

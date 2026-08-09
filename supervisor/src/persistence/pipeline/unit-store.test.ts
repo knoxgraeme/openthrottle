@@ -1897,7 +1897,8 @@ describe("execution unit store", () => {
     expect(store.getStructuredExecutionPublication("attempt-parent")?.graph).toMatchObject({
       aggregate_artifact_hash: "canonical-hash",
     });
-    let events = publicationEvents("attempt-parent").filter((event) => event.kind === "aggregate");
+    let events = publicationEvents("attempt-parent").filter((event) =>
+      event.kind === "aggregate" || event.kind === "aggregate_correction");
     expect(events).toHaveLength(2);
     expect(events[0]).toMatchObject({
       body: expect.stringContaining("canonical-hash"),
@@ -1920,7 +1921,9 @@ describe("execution unit store", () => {
       fromArtifactHash: "legacy-hash",
       toArtifactHash: "canonical-hash",
     })).toBe("migrated");
-    events = publicationEvents("attempt-parent").filter((event) => event.kind === "aggregate");
+    expect(events[1]!.kind).toBe("aggregate_correction");
+    events = publicationEvents("attempt-parent").filter((event) =>
+      event.kind === "aggregate" || event.kind === "aggregate_correction");
     expect(events).toHaveLength(2);
   });
 
@@ -1970,7 +1973,8 @@ describe("execution unit store", () => {
     expect(store.getStructuredExecutionPublication("attempt-parent")?.graph).toMatchObject({
       aggregate_artifact_hash: "canonical-hash",
     });
-    let events = publicationEvents("attempt-parent").filter((event) => event.kind === "aggregate");
+    let events = publicationEvents("attempt-parent").filter((event) =>
+      event.kind === "aggregate" || event.kind === "aggregate_correction");
     expect(events).toHaveLength(2);
     expect(events[0]).toMatchObject({
       body: expect.stringContaining("canonical-hash"),
@@ -1988,7 +1992,9 @@ describe("execution unit store", () => {
       fromArtifactHash: "legacy-hash",
       toArtifactHash: "canonical-hash",
     })).toBe("already_canonical");
-    events = publicationEvents("attempt-parent").filter((event) => event.kind === "aggregate");
+    expect(events[1]!.kind).toBe("aggregate_correction");
+    events = publicationEvents("attempt-parent").filter((event) =>
+      event.kind === "aggregate" || event.kind === "aggregate_correction");
     expect(events).toHaveLength(2);
   });
 

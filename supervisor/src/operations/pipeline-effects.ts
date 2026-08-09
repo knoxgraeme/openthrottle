@@ -367,8 +367,23 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
   ): Promise<void> => {
     const resource = await resourceFor(instance);
     await bootstrap(instance, resource);
-    const request = effect.kind === "dispatch_stage"
-      ? parseRequest(effect, deps.store)
+    let currentEffect = effect;
+    if (effect.kind === "dispatch_stage") {
+      const pendingRequest = JSON.parse(effect.payload) as StageRequestEnvelope;
+      if (pendingRequest.stageId === "publish") {
+        const manifest = JSON.parse(instance.normalized_manifest) as { stages?: Array<{ id: string; executor?: { capability?: string } }> };
+        const compositeStageIds = new Set((manifest.stages ?? [])
+          .filter((stage) => stage.executor?.capability === FOR_EACH_UNIT_CAPABILITY)
+          .map((stage) => stage.id));
+        for (const attempt of deps.store.listAttempts(instance.id)) {
+          if (!compositeStageIds.has(attempt.stage_id) || attempt.status !== "completed") continue;
+          await structuredChildren.drainCompositeChildren(resource, instance, attempt.id);
+        }
+        currentEffect = deps.store.getEffect(effect.id) ?? effect;
+      }
+    }
+    const request = currentEffect.kind === "dispatch_stage"
+      ? parseRequest(currentEffect, deps.store)
       : parseProvisionRequest(effect, deps.store);
     if (request.capability === FOR_EACH_UNIT_CAPABILITY) {
       if (request.pipelineInstanceId !== instance.id || request.generation !== instance.generation) {
@@ -379,7 +394,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       await deps.runtime.prepareCompositeWorkspace(resource, request);
       structuredChildren.seedCompositeGraph(instance, request);
       await structuredChildren.drainCompositeChildren(resource, instance, request.attemptId);
-      acknowledgeEffect(effect, eventId, {
+      acknowledgeEffect(currentEffect, eventId, {
         providerResourceId: resource.providerResourceId,
         compositeGraphId: deps.store.getGraphForAttempt(request.attemptId)?.id ?? null,
       });
@@ -395,7 +410,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       return;
     }
     const dispatched = await dispatch(instance, resource, request);
-    acknowledgeEffect(effect, eventId, { providerResourceId: resource.providerResourceId, ...dispatched });
+    acknowledgeEffect(currentEffect, eventId, { providerResourceId: resource.providerResourceId, ...dispatched });
   };
 
   const handleStopEffect = async (
