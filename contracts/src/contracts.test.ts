@@ -96,15 +96,19 @@ describe("Stage C contract fixtures", () => {
       ...receipt,
       payload: { ...(receipt.payload as Record<string, unknown>), stdout_tail: "💥".repeat(129) },
     }, { source: "command receipt" })).toThrow(/stdout_tail: must contain at most 512 UTF-8 bytes/);
-    for (const [result, tail] of [
-      ["success", { stdout_tail: "tests passed" }],
-      ["not_configured", { stderr_tail: "no command configured" }],
-    ] as const) {
-      expect(() => validateStandardReceipt({
-        ...receipt,
-        result,
-        payload: { ...(receipt.payload as Record<string, unknown>), ...tail },
-      }, { source: "command receipt" })).toThrow(/diagnostic tails are only valid for failed command receipts/);
+    for (const result of ["success", "not_configured"] as const) {
+      for (const tailField of ["stdout_tail", "stderr_tail"] as const) {
+        expect(() => validateStandardReceipt({
+          ...receipt,
+          result,
+          payload: {
+            command: "test",
+            exit_code: 0,
+            summary: "No failed command output.",
+            [tailField]: "unexpected diagnostic tail",
+          },
+        }, { source: "command receipt" })).toThrow(/diagnostic tails are only valid for failed command receipts/);
+      }
     }
   });
 

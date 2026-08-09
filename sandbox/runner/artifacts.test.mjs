@@ -180,15 +180,19 @@ describe("normalized stage artifacts", () => {
       stdout_tail: "AssertionError: expected 2 to equal 3",
       stderr_tail: "FAIL runner/command.test.mjs",
     });
-    for (const [result, tail] of [
-      ["success", { stdout_tail: "tests passed" }],
-      ["not_configured", { stderr_tail: "no command configured" }],
-    ]) {
-      expect(() => validateStandardReceipt({
-        ...commandReceipt,
-        result,
-        payload: { ...commandReceipt.payload, ...tail },
-      }, {})).toThrow(/diagnostic tails are only valid for failed command receipts/);
+    for (const result of ["success", "not_configured"]) {
+      for (const tailField of ["stdout_tail", "stderr_tail"]) {
+        expect(() => validateStandardReceipt({
+          ...commandReceipt,
+          result,
+          payload: {
+            command: "test",
+            exit_code: 0,
+            summary: "No failed command output.",
+            [tailField]: "unexpected diagnostic tail",
+          },
+        }, {})).toThrow(/diagnostic tails are only valid for failed command receipts/);
+      }
     }
 
     const artifacts = buildStandardReceiptArtifacts({
