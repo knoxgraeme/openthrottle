@@ -71,6 +71,10 @@ const GIT_SUBJECT = /^[a-f0-9]{40,64}$/;
 const SKILL_REFERENCE = /^(?:builtin:\/\/[a-z][a-z0-9]*(?:[._/@-][a-z0-9]+)*@\d+|repo:\/\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+@[a-f0-9]{40}#(?:(?!\.{1,2}(?:\/|$))[A-Za-z0-9._-]+\/)*(?!\.{1,2}$)[A-Za-z0-9._-]+)$/;
 const NATIVE_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 const MAX_ARTIFACT_PAYLOAD_BYTES = 12 * 1024;
+// Kept byte-identical with contracts/src/receipts.ts. Sixteen command receipts
+// can enter one bounded prior-evidence envelope, so these diagnostics are byte
+// bounded independently of the outer artifact limit.
+export const COMMAND_DIAGNOSTIC_TAIL_MAX_BYTES = 512;
 const SECRET_PATTERNS = [
   /gh[opsu]_[A-Za-z0-9_]+/g,
   /github_pat_[A-Za-z0-9_]+/g,
@@ -210,11 +214,33 @@ export function sanitizeArtifactText(value, env = process.env) {
   return output;
 }
 
+export function commandDiagnosticTail(value, env = process.env) {
+  const sanitized = sanitizeArtifactText(value, env).trim();
+  if (!sanitized) return undefined;
+  const bytes = Buffer.from(sanitized, "utf8");
+  if (bytes.length <= COMMAND_DIAGNOSTIC_TAIL_MAX_BYTES) return sanitized;
+  let start = bytes.length - COMMAND_DIAGNOSTIC_TAIL_MAX_BYTES;
+  // Do not begin inside a multi-byte UTF-8 code point. Moving forward can
+  // only shrink the tail, preserving the hard byte ceiling.
+  while (start < bytes.length && (bytes[start] & 0xc0) === 0x80) start += 1;
+  return bytes.subarray(start).toString("utf8");
+}
+
 function boundedText(value, label, max, env) {
   if (typeof value !== "string") throw new Error(`${label} must be a string`);
   const sanitized = sanitizeArtifactText(value, env).trim();
   if (!sanitized) throw new Error(`${label} must not be empty`);
   return sanitized.slice(0, max);
+}
+
+function boundedDiagnosticTail(value, label, env) {
+  if (typeof value !== "string") throw new Error(`${label} must be a string`);
+  const tail = sanitizeArtifactText(value, env).trim();
+  if (!tail) throw new Error(`${label} must not be empty`);
+  if (Buffer.byteLength(tail, "utf8") > COMMAND_DIAGNOSTIC_TAIL_MAX_BYTES) {
+    throw new Error(`${label} must contain at most ${COMMAND_DIAGNOSTIC_TAIL_MAX_BYTES} UTF-8 bytes`);
+  }
+  return tail;
 }
 
 function boundedStrings(value, label, maxItems, maxLength, env) {
@@ -312,13 +338,17 @@ function receiptPayload(type, value, env) {
     };
   }
   if (type === "command_result") {
-    const payload = exactPayload(value, "standard receipt payload", new Set(["command", "exit_code", "summary", "stdout_digest", "stderr_digest"]), env);
+    const payload = exactPayload(value, "standard receipt payload", new Set([
+      "command", "exit_code", "summary", "stdout_digest", "stderr_digest", "stdout_tail", "stderr_tail",
+    ]), env);
     return {
       command: boundedText(payload.command, "standard receipt payload command", 80, env),
       exit_code: integer(payload.exit_code, "standard receipt payload exit_code", 0, 255),
       summary: boundedText(payload.summary, "standard receipt payload summary", 4_000, env),
       ...(payload.stdout_digest === undefined ? {} : { stdout_digest: patternedText(payload.stdout_digest, "standard receipt payload stdout_digest", SHA256, env, 64) }),
       ...(payload.stderr_digest === undefined ? {} : { stderr_digest: patternedText(payload.stderr_digest, "standard receipt payload stderr_digest", SHA256, env, 64) }),
+      ...(payload.stdout_tail === undefined ? {} : { stdout_tail: boundedDiagnosticTail(payload.stdout_tail, "standard receipt payload stdout_tail", env) }),
+      ...(payload.stderr_tail === undefined ? {} : { stderr_tail: boundedDiagnosticTail(payload.stderr_tail, "standard receipt payload stderr_tail", env) }),
     };
   }
   if (type === "candidate_evidence" || type === "integration_evidence") {
