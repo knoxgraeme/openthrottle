@@ -2022,7 +2022,7 @@ intents:
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_stage_attempts").pluck().get()).toBe(1);
   });
 
-  it("admits explicit legacy structured v1 without upgrading its digest or behavior", async () => {
+  it("keeps legacy structured config on v1 until an explicit config upgrade selects v2", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "structured";
     const context = [
@@ -2051,8 +2051,9 @@ intents:
     allowed_graphs: [simple, structured]
 `;
 
-    const first = await run(config, {}, shippedCatalogPath, payload("session-1", "issue-1", "OT-1", context));
-    const legacyInstance = first.pipelines.getInstanceForSession("session-1")!;
+    const { pipelines, invoke, setRepositoryConfig } =
+      await run(config, {}, shippedCatalogPath, payload("session-1", "issue-1", "OT-1", context));
+    const legacyInstance = pipelines.getInstanceForSession("session-1")!;
     const legacyManifest = JSON.parse(legacyInstance.normalized_manifest) as {
       stages: Array<{ id: string; transitions: { success: unknown } }>;
     };
@@ -2065,10 +2066,26 @@ intents:
     expect(legacyManifest.stages.map((stage) => stage.id)).toEqual(["units"]);
     expect(legacyManifest.stages[0]?.transitions.success).toEqual({ terminal: "shipped" });
 
-    db!.close();
-    db = undefined;
-    const second = await run(config, {}, shippedCatalogPath, payload("session-2", "issue-2", "OT-2", context));
-    expect(second.pipelines.getInstanceForSession("session-2")?.manifest_digest).toBe(legacyDigest);
+    const upgradedConfig = config.replace("ref: core/structured@1", "ref: core/structured@2");
+    setRepositoryConfig(upgradedConfig);
+    await invoke({}, payload("session-2", "issue-2", "OT-2", context));
+    const upgradedInstance = pipelines.getInstanceForSession("session-2")!;
+    const upgradedManifest = JSON.parse(upgradedInstance.normalized_manifest) as {
+      stages: Array<{ id: string; transitions: { success: unknown } }>;
+    };
+    expect(upgradedInstance).toMatchObject({
+      pipeline_id: "builtin/structured",
+      pipeline_version: 2,
+      active_stage_id: "units",
+    });
+    expect(upgradedManifest.stages.map((stage) => stage.id)).toEqual(["units", "publish", "provider"]);
+    expect(upgradedManifest.stages[0]?.transitions.success).toEqual({ to: "publish" });
+    expect(upgradedInstance.manifest_digest).not.toBe(legacyDigest);
+    expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
+      pipeline_id: "builtin/structured",
+      pipeline_version: 1,
+      manifest_digest: legacyDigest,
+    });
   });
 
   it("fails closed for unknown built-in structured versions", async () => {
