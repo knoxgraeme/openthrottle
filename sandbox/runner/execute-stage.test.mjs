@@ -1346,6 +1346,10 @@ exit 1
       "OT_HEARTBEAT_FILE",
       "OT_EXECUTOR_HEARTBEAT_INTERVAL_MS",
       "OT_CHILD_EXECUTOR_REQUEST_FILE",
+      "OT_CHILD_EXECUTOR_RESULT_FILE",
+      "OT_LOOP_CREDENTIALS_FILE",
+      "OT_LOOP_REQUEST_FILE",
+      "OT_LOOP_RESULT_FILE",
       "GITHUB_REPO",
     ].map((name) => [name, process.env[name]]));
     try {
@@ -1354,6 +1358,10 @@ exit 1
       process.env.OT_HEARTBEAT_FILE = "/private/heartbeat.json";
       process.env.OT_EXECUTOR_HEARTBEAT_INTERVAL_MS = "1000";
       process.env.OT_CHILD_EXECUTOR_REQUEST_FILE = "/private/request.json";
+      process.env.OT_CHILD_EXECUTOR_RESULT_FILE = "/private/result.json";
+      process.env.OT_LOOP_CREDENTIALS_FILE = "/private/loop-credentials.json";
+      process.env.OT_LOOP_REQUEST_FILE = "/private/loop-request.json";
+      process.env.OT_LOOP_RESULT_FILE = "/private/loop-result.json";
       process.env.GITHUB_REPO = "owner/repo";
       const binDir = mkdtempSync(join(tmpdir(), "ot-fake-bin-"));
       directories.push(binDir);
@@ -1365,6 +1373,10 @@ exit 1
         "heartbeat: process.env.OT_HEARTBEAT_FILE ?? null",
         "interval: process.env.OT_EXECUTOR_HEARTBEAT_INTERVAL_MS ?? null",
         "childRequest: process.env.OT_CHILD_EXECUTOR_REQUEST_FILE ?? null",
+        "childResult: process.env.OT_CHILD_EXECUTOR_RESULT_FILE ?? null",
+        "loopCredentials: process.env.OT_LOOP_CREDENTIALS_FILE ?? null",
+        "loopRequest: process.env.OT_LOOP_REQUEST_FILE ?? null",
+        "loopResult: process.env.OT_LOOP_RESULT_FILE ?? null",
         "repo: process.env.GITHUB_REPO ?? null",
         "home: process.env.HOME ?? null",
         "user: process.env.USER ?? null",
@@ -1381,6 +1393,10 @@ exit 1
         heartbeat: null,
         interval: null,
         childRequest: null,
+        childResult: null,
+        loopCredentials: null,
+        loopRequest: null,
+        loopResult: null,
         repo: "owner/repo",
         home: "/home/agent",
         user: "agent",
@@ -1397,6 +1413,10 @@ exit 1
       expect(commandEnv.OT_HEARTBEAT_FILE).toBeUndefined();
       expect(commandEnv.OT_EXECUTOR_HEARTBEAT_INTERVAL_MS).toBeUndefined();
       expect(commandEnv.OT_CHILD_EXECUTOR_REQUEST_FILE).toBeUndefined();
+      expect(commandEnv.OT_CHILD_EXECUTOR_RESULT_FILE).toBeUndefined();
+      expect(commandEnv.OT_LOOP_CREDENTIALS_FILE).toBeUndefined();
+      expect(commandEnv.OT_LOOP_REQUEST_FILE).toBeUndefined();
+      expect(commandEnv.OT_LOOP_RESULT_FILE).toBeUndefined();
     } finally {
       for (const [name, value] of Object.entries(previous)) {
         if (value === undefined) delete process.env[name];
