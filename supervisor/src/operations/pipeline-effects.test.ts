@@ -1551,6 +1551,22 @@ describe("pipeline effect processor", () => {
           aggregatePublication.linear_outbox_id
         );
     };
+    const rewriteAggregatePublicationOutboxToArtifactHash = (artifactHash: string) => {
+      const aggregateBody = aggregatePublication.body.replaceAll(canonicalGraphResultHash, artifactHash);
+      const aggregateOutboxPayloadForHash = canonicalJson({
+        ...aggregateOutboxPayload,
+        activity: {
+          ...aggregateOutboxPayload.activity,
+          body: aggregateBody,
+        },
+      });
+      db!.prepare("UPDATE linear_outbox SET payload = ?, payload_hash = ? WHERE id = ?")
+        .run(
+          aggregateOutboxPayloadForHash,
+          digestNormalized(aggregateOutboxPayloadForHash),
+          aggregatePublication.linear_outbox_id
+        );
+    };
     const rewriteAggregatePublicationToLegacyHash = () => {
       rewriteAggregatePublicationToArtifactHash(legacyGraphResult!.hash);
     };
@@ -1703,6 +1719,7 @@ describe("pipeline effect processor", () => {
     })(queuedIntermediateRequest);
     const legacyIntermediateWithoutFence = {
       ...queuedIntermediateWithoutFence,
+      runId: "run-legacy-intermediate-replay",
       expectedSubject: finalIntegratedSubject,
     };
     const legacyIntermediateFence = createStageRequestHash(legacyIntermediateWithoutFence);
@@ -1712,6 +1729,75 @@ describe("pipeline effect processor", () => {
       effect.status === "pending" &&
       effect.idempotency_key === queuedIntermediateRequest.idempotencyKey
     )!;
+    const aggregateCorrectionsBeforeFreshReplay = db!.prepare(`
+      SELECT COUNT(*) AS count
+      FROM execution_publication_events
+      WHERE parent_attempt_id = ? AND kind = 'aggregate_correction'
+    `).get(attempt.id) as { count: number };
+    const dispatchCallsBeforeFreshReplay = runtime.dispatchStage.mock.calls.length;
+    await processor.drain();
+    expect(runtime.dispatchStage).toHaveBeenCalledTimes(dispatchCallsBeforeFreshReplay + 1);
+    expect(runtime.dispatchStage).toHaveBeenLastCalledWith(
+      { providerResourceId: "sandbox-child-drain" },
+      expect.objectContaining({
+        stageId: intermediateStageId,
+        expectedSubject: finalIntegratedTreeSubject,
+      })
+    );
+    expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
+      aggregate_artifact_hash: canonicalGraphResultHash,
+    });
+    expect(db!.prepare(`
+      SELECT COUNT(*) AS count
+      FROM execution_publication_events
+      WHERE parent_attempt_id = ? AND kind = 'aggregate_correction'
+    `).get(attempt.id)).toEqual(aggregateCorrectionsBeforeFreshReplay);
+    expect(pipelines.getActiveAttempt(instance.id)).toMatchObject({
+      id: queuedIntermediateAttempt.id,
+      stage_id: intermediateStageId,
+      status: "running",
+      expected_subject: finalIntegratedTreeSubject,
+    });
+    expect(tickets.getByIssueId(instance.linear_issue_id)?.run_id).toBe(queuedIntermediateRequest.runId);
+    tickets.finishRun({
+      runId: queuedIntermediateRequest.runId,
+      status: "stopped",
+      ticketState: "active",
+      faultAttribution: null,
+    });
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'dispatchable', updated_at = ?
+      WHERE id = ?
+    `).run("2099-07-22T12:00:00.000Z", instance.id);
+    db!.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET status = 'pending', run_id = NULL, updated_at = ?
+      WHERE id = ?
+    `).run("2099-07-22T12:00:00.000Z", queuedIntermediateAttempt.id);
+    db!.prepare(`
+      UPDATE pipeline_effect_intents
+      SET status = 'pending', attempts = 0, acknowledged_at = NULL, last_error = NULL, next_attempt_at = ?
+      WHERE id = ?
+    `).run("2099-07-22T12:00:00.000Z", intermediateEffect.id);
+    rewriteAggregatePublicationToLegacyHash();
+    rewriteAggregatePublicationOutboxToArtifactHash("f".repeat(64));
+    const dispatchCallsBeforeMixedLegacyEvidence = runtime.dispatchStage.mock.calls.length;
+    await processor.drain();
+    expect(runtime.dispatchStage).toHaveBeenCalledTimes(dispatchCallsBeforeMixedLegacyEvidence);
+    expect(pipelines.getEffect(intermediateEffect.id)).toMatchObject({
+      status: "failed",
+      last_error: expect.stringContaining("durable legacy aggregate evidence does not match the canonical replay"),
+    });
+    expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
+      aggregate_artifact_hash: canonicalGraphResultHash,
+    });
+    rewriteAggregatePublicationToArtifactHash(canonicalGraphResultHash);
+    db!.prepare(`
+      UPDATE pipeline_effect_intents
+      SET status = 'pending', attempts = 0, last_error = NULL, next_attempt_at = ?
+      WHERE id = ?
+    `).run("2099-07-22T12:00:00.000Z", intermediateEffect.id);
     persistLegacyAggregateArtifacts();
     rewriteAggregatePublicationToLegacyHash();
     db!.prepare(`
@@ -1727,12 +1813,13 @@ describe("pipeline effect processor", () => {
     db!.prepare(`
       UPDATE pipeline_stage_attempts
       SET expected_subject = ?, request_hash = ?, idempotency_key = ?,
-          request_payload = ?, updated_at = ?
+          planned_run_id = ?, request_payload = ?, updated_at = ?
       WHERE id = ?
     `).run(
       finalIntegratedSubject,
       legacyIntermediateFence.requestHash,
       legacyIntermediateFence.idempotencyKey,
+      legacyIntermediateWithoutFence.runId,
       legacyIntermediateRequest,
       "2099-07-22T12:00:00.000Z",
       queuedIntermediateAttempt.id
@@ -1790,6 +1877,7 @@ describe("pipeline effect processor", () => {
       integrationSubject: "7".repeat(40),
       aggregateArtifactHash: "7".repeat(64),
     });
+    await processor.drain();
     await processor.drain();
     const intermediateAttempt = pipelines.getActiveAttempt(instance.id)!;
     expect(pipelines.getAttempt(attempt.id)).toMatchObject({ result_hash: expectedCanonicalStageResultHash });
