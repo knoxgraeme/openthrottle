@@ -1078,6 +1078,144 @@ intents:
     expect(request.capability).toBe("graph/for-each-unit@1");
     expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
   });
+
+  it("admits a new repository aggregate-publish graph with fresh-capable publication", async () => {
+    const graphPath = ".openthrottle/graphs/repo-structured.json";
+    const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
+    executionPlan.graph_id = "repo_structured";
+    const context = [
+      "# Repository structured work",
+      "",
+      "```json openthrottle.execution-plan/v1",
+      JSON.stringify(executionPlan, null, 2),
+      "```",
+      "",
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "repo_structured" }, null, 2),
+      "```",
+    ].join("\n");
+    const graph = JSON.stringify({
+      schema: "openthrottle.graph/v1",
+      id: "repo-structured",
+      version: 1,
+      entry_node: "units",
+      workers: [{
+        id: "worker",
+        engine: "agent",
+        skills: ["builtin://ce/implement@1"],
+        allowed_mcp_servers: [],
+        session_scope: "attempt",
+        credentials: ["model.invoke", "provider.read", "repo.read"],
+      }, {
+        id: "lead-worker",
+        engine: "agent",
+        skills: ["builtin://accept-unit@1"],
+        allowed_mcp_servers: [],
+        session_scope: "fresh",
+        credentials: ["model.invoke", "repo.read"],
+      }],
+      loops: [{
+        id: "loop",
+        worker: "worker",
+        skill: "builtin://ce/implement@1",
+        input_scope: "unit",
+        receipt: "unit_completion",
+        max_parallel: 1,
+        max_rounds: 1,
+        timeout_seconds: 60,
+      }, {
+        id: "lead-loop",
+        worker: "lead-worker",
+        skill: "builtin://accept-unit@1",
+        input_scope: "unit",
+        receipt: "unit_decision",
+        max_parallel: 1,
+        max_rounds: 1,
+        timeout_seconds: 60,
+      }],
+      nodes: [{
+        id: "units",
+        kind: "for_each_unit",
+        phases: [
+          { id: "implement", kind: "agent", loop: "loop" },
+          { id: "candidate", kind: "evidence" },
+          { id: "lead", kind: "gate", loop: "lead-loop" },
+          { id: "integrate", kind: "integrate" },
+        ],
+        depends_on: [],
+        transitions: {
+          success: { to: "publish" },
+          repair_required: { terminal: "needs_human" },
+          retryable_failure: { terminal: "failed" },
+          failure: { terminal: "failed" },
+        },
+      }, {
+        id: "publish",
+        kind: "publish",
+        depends_on: [],
+        transitions: {
+          success: { to: "provider" },
+          repair_required: { terminal: "needs_human" },
+          retryable_failure: { terminal: "failed" },
+          failure: { terminal: "failed" },
+        },
+      }, {
+        id: "provider",
+        kind: "wait_for_provider",
+        depends_on: [],
+        transitions: {
+          success: { terminal: "completed" },
+          repair_required: { terminal: "needs_human" },
+          retryable_failure: { terminal: "failed" },
+          failure: { terminal: "failed" },
+        },
+      }],
+    });
+    const { tickets, pipelines } = await run(
+      `schema: openthrottle.config/v1
+default_graph: repo_structured
+graphs:
+  - id: repo_structured
+    kind: repository
+    ref: ${graphPath}
+pipelines: { implement: implement }
+intents:
+  implement:
+    default_graph: repo_structured
+    allowed_graphs: [repo_structured]
+`,
+      {},
+      shippedCatalogPath,
+      payload("session-1", "issue-1", "OT-1", context),
+      { [graphPath]: graph },
+      {
+        capabilities: [
+          ...buildInstalledRuntimeDescriptor("base-repository-structured-test/v1").descriptor.capabilities,
+          "accept-unit@1",
+          "graph/for-each-unit@1",
+        ],
+      }
+    );
+
+    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+      state: "active",
+      sandbox_id: null,
+      run_id: null,
+    });
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(1);
+    expect(db!.prepare("SELECT execution_mode FROM agent_sessions WHERE id = 'session-1'").pluck().get()).toBe("pipeline");
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const manifest = JSON.parse(instance.normalized_manifest) as {
+      stages: Array<{ id: string; context: string }>;
+    };
+    expect(instance.pipeline_id).toBe(`repository/${digestNormalized(canonicalJson({
+      graphId: "repo_structured",
+      blobSha: "c".repeat(40),
+      path: graphPath,
+    }))}`);
+    expect(manifest.stages.find((stage) => stage.id === "publish")?.context).toBe("prefer_resume");
+  });
+
   it.each([
     ["claude", "CLAUDE_CODE_OAUTH_TOKEN", "Claude"],
     ["codex", "CODEX_AUTH_JSON", "Codex"],

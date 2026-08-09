@@ -514,6 +514,7 @@ describe("pipeline effect processor", () => {
       id: "builtin/structured",
       runtime: runtimeDescriptor.descriptor,
       config: repositoryConfig.config,
+      aggregatePublishContext: "prefer_resume",
     }).manifest;
     pipelines.acceptManifest(manifest);
     const executionPlan = {
@@ -833,6 +834,7 @@ describe("pipeline effect processor", () => {
       id: "builtin/structured",
       runtime: runtimeDescriptor.descriptor,
       config: repositoryConfig.config,
+      aggregatePublishContext: "prefer_resume",
     }).manifest;
     pipelines.acceptManifest(manifest);
     const executionPlan = {
@@ -1356,6 +1358,7 @@ describe("pipeline effect processor", () => {
       id: "builtin/structured",
       runtime: runtimeDescriptor.descriptor,
       config: repositoryConfig.config,
+      aggregatePublishContext: "prefer_resume",
     }).manifest;
     pipelines.acceptManifest(manifest);
     const executionPlan = {
@@ -1492,6 +1495,7 @@ describe("pipeline effect processor", () => {
       id: "builtin/structured",
       runtime: runtimeDescriptor.descriptor,
       config: repositoryConfig.config,
+      aggregatePublishContext: "prefer_resume",
     }).manifest;
     pipelines.acceptManifest(manifest);
     const executionPlan = {
@@ -1603,6 +1607,7 @@ describe("pipeline effect processor", () => {
       id: "builtin/structured",
       runtime: runtimeDescriptor.descriptor,
       config: repositoryConfig.config,
+      aggregatePublishContext: "prefer_resume",
     }).manifest;
     pipelines.acceptManifest(manifest);
     const executionPlan = {

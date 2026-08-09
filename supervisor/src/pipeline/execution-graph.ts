@@ -46,6 +46,7 @@ export interface CompileExecutionGraphOptions {
   description?: string;
   maxAttempts?: number;
   maxRepairRounds?: number;
+  aggregatePublishContext?: "prefer_resume";
   runtime?: RuntimeCapabilityInventory;
   config?: RepositoryConfigContract;
   repositorySkills?: ReadonlyMap<string, RepositorySkillPackage>;
@@ -379,17 +380,25 @@ function capabilityOrder(capability: string): number {
   ].indexOf(capability);
 }
 
-function publishContextFor(graph: GraphContract, node: GraphNode): ContextPolicy {
+function publishContextFor(
+  graph: GraphContract,
+  node: GraphNode,
+  aggregatePublishContext?: CompileExecutionGraphOptions["aggregatePublishContext"]
+): ContextPolicy {
+  if (aggregatePublishContext !== undefined && aggregatePublishContext !== "prefer_resume") {
+    fail("compile.aggregatePublishContext", "must be prefer_resume when provided");
+  }
   const followsStructuredAggregate = graph.nodes.some((candidate) =>
     candidate.kind === "for_each_unit" &&
     Object.values(candidate.transitions).some((transition) => transition.to === node.id)
   );
-  return followsStructuredAggregate ? "prefer_resume" : "resume_required";
+  return followsStructuredAggregate && aggregatePublishContext === "prefer_resume" ? "prefer_resume" : "resume_required";
 }
 
 function nodeTemplate(
   graph: GraphContract,
   node: GraphNode,
+  options: Pick<CompileExecutionGraphOptions, "aggregatePublishContext"> = {},
   config?: RepositoryConfigContract,
   repositorySkills?: ReadonlyMap<string, RepositorySkillPackage>
 ): StageTemplate {
@@ -411,7 +420,7 @@ function nodeTemplate(
     return {
       executor: { kind: "agent", capability: "ce/publish@1" },
       evaluator: { kind: "publish_subject", assurance: "semantic_attested", required_artifacts: ["publish_subject"] },
-      context: publishContextFor(graph, node),
+      context: publishContextFor(graph, node, options.aggregatePublishContext),
       live_steering: false,
       credentials: ["model.invoke", "repo.read", "repo.write", "provider.read"],
       produces: ["stage_result", "publish_subject"],
@@ -469,7 +478,8 @@ export function compileExecutionGraph(
   graph: GraphContract,
   options: CompileExecutionGraphOptions = {}
 ): ValidatedPipelineManifest {
-  const templates = graph.nodes.map((node) => nodeTemplate(graph, node, options.config, options.repositorySkills));
+  const templates = graph.nodes.map((node) =>
+    nodeTemplate(graph, node, options, options.config, options.repositorySkills));
   const manifest: PipelineManifest = {
     schema: "openthrottle.pipeline/v1",
     id: options.id ?? graph.id,

@@ -634,6 +634,7 @@ function setupInstance({ db, pipelines, tickets, runtimeDescriptor, fixture, iss
     id: "builtin/structured",
     runtime: runtimeDescriptor.descriptor,
     config: repositoryConfig.config,
+    aggregatePublishContext: "prefer_resume",
   }).manifest;
   pipelines.acceptManifest(manifest);
   tickets.upsert({

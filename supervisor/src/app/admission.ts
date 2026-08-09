@@ -522,7 +522,8 @@ async function resolvePipelineSelection(
   readPinnedDirectory: (path: string) => Promise<RepositoryDirectorySnapshot>,
   runtime: PipelineCoordinatorContext["runtime"],
   catalog: ValidatedPipelineCatalog,
-  selectedAgent: Agent
+  selectedAgent: Agent,
+  acceptedManifestDigest?: (pipelineId: string, version: number) => string | undefined
 ): Promise<ValidatedPipelineManifest> {
   const intent = repositoryConfig.config.intents?.implement;
   const requested = extractRequestedGraph(context);
@@ -587,13 +588,29 @@ async function resolvePipelineSelection(
       version: builtinGraph.version,
       description: builtinGraph.description,
       maxAttempts: 200,
+      ...(source.ref === "core/structured@2" ? { aggregatePublishContext: "prefer_resume" as const } : {}),
     } : {
       id: manifestId,
       description: `Compiled execution graph ${graphId} from ${blobDescription}.`,
       maxAttempts: 200,
     }),
   };
-  const compiled = parseAndCompileExecutionGraph(rawGraph, compileOptions);
+  let compiled = parseAndCompileExecutionGraph(rawGraph, compileOptions);
+  if (source.kind === "repository") {
+    const aggregatePublishCompiled = parseAndCompileExecutionGraph(rawGraph, {
+      ...compileOptions,
+      aggregatePublishContext: "prefer_resume" as const,
+    });
+    const existingDigest = acceptedManifestDigest?.(
+      compiled.manifest.manifest.id,
+      compiled.manifest.manifest.version
+    );
+    if (existingDigest === aggregatePublishCompiled.manifest.digest) {
+      compiled = aggregatePublishCompiled;
+    } else if (!existingDigest) {
+      compiled = aggregatePublishCompiled;
+    }
+  }
   if (compiled.manifest.manifest.requires.capabilities.includes(FOR_EACH_UNIT_CAPABILITY) && !requested.hasExecutionPlan) {
     throw new Error(`graph ${graphId} requires a canonical ${EXECUTION_PLAN_FENCE} block`);
   }
@@ -824,7 +841,8 @@ export async function handleCreated(
         ),
         coordinator.runtime,
         coordinator.catalog,
-        selectedAgent
+        selectedAgent,
+        (pipelineId, version) => coordinator.store.getAcceptedManifestDigest(pipelineId, version)
       )
       : resolvePipelineReference(
         coordinator.catalog,

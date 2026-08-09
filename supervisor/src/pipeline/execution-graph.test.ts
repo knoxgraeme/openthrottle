@@ -18,6 +18,9 @@ const SIMPLE_GRAPH_DIGEST = "2f25ae9b891405d0e73e5f3c0f103354183c8cb27ca923cbd06
 const SIMPLE_MANIFEST_DIGEST = "9b705c003313187cb2f7e219c99e1cbf795d966be0e1d257015462219833ac6a";
 const INVESTIGATE_GRAPH_DIGEST = "a76d3e1360d92f41bc7aa9ed2372e294555478d5854808bf0c2a5ed7febaf317";
 const INVESTIGATE_MANIFEST_DIGEST = "d159ef720f5dbc7216b8dd502e3961ac30ffb2c4d4ea44a5afdc71a78f84da4e";
+const STRUCTURED_V2_COMPILE_OPTIONS = {
+  aggregatePublishContext: "prefer_resume",
+} as const;
 
 function shippedManifest(reference: string): PipelineManifest {
   const catalog = loadPipelineCatalog(catalogPath, buildInstalledRuntimeDescriptor("test-runtime/v1").descriptor);
@@ -269,6 +272,7 @@ describe("execution graph compiler", () => {
     const compiled = parseAndCompileExecutionGraph(readFileSync(structuredV2GraphPath, "utf8"), {
       source: structuredV2GraphPath,
       runtime: runtime.descriptor,
+      ...STRUCTURED_V2_COMPILE_OPTIONS,
     });
 
     expect(compiled.manifest.manifest).toMatchObject({
@@ -343,8 +347,74 @@ describe("execution graph compiler", () => {
     const compiled = parseAndCompileExecutionGraph(readFileSync(structuredV2GraphPath, "utf8"), {
       source: structuredV2GraphPath,
       runtime: buildInstalledRuntimeDescriptor("production-like/v1").descriptor,
+      ...STRUCTURED_V2_COMPILE_OPTIONS,
     });
     expect(compiled.manifest.manifest.requires.capabilities).toContain("graph/for-each-unit@1");
+  });
+
+  it("preserves repository graph output for direct aggregate publish unless explicitly opted in", () => {
+    const graph = minimalUnitGraph({
+      worker: { session_scope: "attempt" },
+    });
+    const units = (graph.nodes as Record<string, unknown>[])[0]!;
+    units.transitions = {
+      success: { to: "publish" },
+      repair_required: { terminal: "needs_human" },
+      retryable_failure: { terminal: "failed" },
+      failure: { terminal: "failed" },
+    };
+    (graph.nodes as Record<string, unknown>[]).push({
+      id: "publish",
+      kind: "publish",
+      depends_on: [],
+      transitions: {
+        success: { terminal: "completed" },
+        repair_required: { terminal: "needs_human" },
+        retryable_failure: { terminal: "failed" },
+        failure: { terminal: "failed" },
+      },
+    });
+
+    const compiled = validateAndCompileExecutionGraph(graph, {
+      id: "repository/a",
+      version: 7,
+    });
+    const publish = compiled.manifest.manifest.stages.find((stage) => stage.id === "publish")!;
+
+    expect(publish.context).toBe("resume_required");
+    expect(compiled.manifest.digest).toBe("eeb2f6bed1d6e6b20a478f4f77284c935714ad5b2e11d47623363d2fa8edb769");
+  });
+
+  it("opts aggregate publish into prefer_resume only through the explicit compiler option", () => {
+    const graph = minimalUnitGraph();
+    const units = (graph.nodes as Record<string, unknown>[])[0]!;
+    units.transitions = {
+      success: { to: "publish" },
+      repair_required: { terminal: "needs_human" },
+      retryable_failure: { terminal: "failed" },
+      failure: { terminal: "failed" },
+    };
+    (graph.nodes as Record<string, unknown>[]).push({
+      id: "publish",
+      kind: "publish",
+      depends_on: [],
+      transitions: {
+        success: { terminal: "completed" },
+        repair_required: { terminal: "needs_human" },
+        retryable_failure: { terminal: "failed" },
+        failure: { terminal: "failed" },
+      },
+    });
+
+    const compiled = validateAndCompileExecutionGraph(graph, {
+      aggregatePublishContext: "prefer_resume",
+    });
+    const publish = compiled.manifest.manifest.stages.find((stage) => stage.id === "publish")!;
+
+    expect(publish.context).toBe("prefer_resume");
+    expect(() => validateAndCompileExecutionGraph(graph, {
+      aggregatePublishContext: "fresh" as unknown as "prefer_resume",
+    })).toThrow(/compile\.aggregatePublishContext: must be prefer_resume when provided/);
   });
 
   it("changes the pinned manifest digest when only a unit phase worker binding changes", () => {
