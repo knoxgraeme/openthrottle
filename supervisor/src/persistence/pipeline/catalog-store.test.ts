@@ -29,6 +29,7 @@ describe("pipeline catalog store", () => {
   const temporaryDirectories: string[] = [];
   const structuredV1GraphPath = fileURLToPath(new URL("../../../graphs/structured-v1.json", import.meta.url));
   const structuredV2GraphPath = fileURLToPath(new URL("../../../graphs/structured-v2.json", import.meta.url));
+  const legacyStructuredV1Digest = "13f4b9ed94324317a78a2228a53f781d5f382b406063316bfeb85e53c37b0830";
 
   afterEach(() => {
     db?.close();
@@ -104,25 +105,42 @@ describe("pipeline catalog store", () => {
     expect(pipelines.getInstanceForSession("session-v2")?.pipeline_version).toBe(3);
   });
 
-  it("keeps legacy structured v1 immutable while admitting repaired structured v2", () => {
+  it("keeps the exact legacy structured v1 catalog entry immutable while admitting repaired structured v2", () => {
     db = openDb(":memory:");
     const pipelines = createPipelineStore(db);
     const runtimeDescriptor = buildInstalledRuntimeDescriptor("structured-catalog-test/v1");
     pipelines.acceptRuntimeDescriptor(runtimeDescriptor);
     const legacyV1 = parseAndCompileExecutionGraph(readFileSync(structuredV1GraphPath, "utf8"), {
-      source: structuredV1GraphPath,
+      source: "builtin:core/structured@1",
       id: "builtin/structured",
       version: 1,
+      description: "Compiled execution graph structured from builtin core/structured@1.",
+      maxAttempts: 200,
       runtime: runtimeDescriptor.descriptor,
     }).manifest;
     const repairedV2 = parseAndCompileExecutionGraph(readFileSync(structuredV2GraphPath, "utf8"), {
-      source: structuredV2GraphPath,
+      source: "builtin:core/structured@2",
       id: "builtin/structured",
       version: 2,
+      description: "Compiled execution graph structured from builtin core/structured@2.",
+      maxAttempts: 200,
       runtime: runtimeDescriptor.descriptor,
     }).manifest;
+    expect(legacyV1.digest).toBe(legacyStructuredV1Digest);
+    db.prepare(`
+      INSERT INTO pipeline_catalog_entries (
+        pipeline_id, version, digest, normalized_manifest, accepted_at
+      ) VALUES (?, ?, ?, ?, ?)
+    `).run("builtin/structured", 1, legacyStructuredV1Digest, legacyV1.normalized, new Date(0).toISOString());
 
-    pipelines.acceptManifest(legacyV1);
+    expect(() => pipelines.acceptManifest(legacyV1)).not.toThrow();
+    const changedLegacyManifest = JSON.parse(legacyV1.normalized) as Record<string, unknown>;
+    const changedLegacyV1 = validatePipelineManifest({
+      ...changedLegacyManifest,
+      description: "Changed legacy structured v1 bytes.",
+    }, { source: "builtin:core/structured@1", runtime: runtimeDescriptor.descriptor });
+    expect(changedLegacyV1.digest).not.toBe(legacyStructuredV1Digest);
+    expect(() => pipelines.acceptManifest(changedLegacyV1)).toThrow(/different digest/);
     pipelines.acceptManifest(repairedV2);
     expect(() => pipelines.acceptManifest(repairedV2)).not.toThrow();
 
