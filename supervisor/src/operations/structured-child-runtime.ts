@@ -110,7 +110,7 @@ export interface StructuredChildRuntime {
     resource: RuntimeResource,
     instance: PipelineInstance,
     parentAttemptId: string,
-    options?: { successorStageId?: string }
+    options?: { successorStageId?: string; suppressLegacyFallback?: boolean }
   ): Promise<void>;
   compositeGraphNeedsDrain(parentAttemptId: string): boolean;
 }
@@ -706,9 +706,11 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
   const canonicalAggregatePayloadFromLegacy = (
     payload: Record<string, unknown>,
     fromSubject: string,
-    toSubject: string
+    toSubject: string,
+    completedAt?: string
   ): Record<string, unknown> => ({
     ...payload,
+    ...(completedAt ? { completed_at: completedAt } : {}),
     repository: {
       ...((payload.repository as Record<string, unknown> | undefined) ?? {}),
       subject: toSubject,
@@ -724,11 +726,12 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     fromSubject: string,
     toSubject: string,
     fromGraphResultHash: string,
-    toGraphResultHash: string
+    toGraphResultHash: string,
+    completedAt?: string
   ): Record<string, unknown> => {
     const details = (payload.details as Record<string, unknown> | undefined) ?? {};
     return {
-      ...canonicalAggregatePayloadFromLegacy(payload, fromSubject, toSubject),
+      ...canonicalAggregatePayloadFromLegacy(payload, fromSubject, toSubject, completedAt),
       evidence: Array.isArray(payload.evidence)
         ? payload.evidence.map((item) => item === fromGraphResultHash ? toGraphResultHash : item)
         : payload.evidence,
@@ -753,6 +756,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     stageResult: PipelineEventArtifact;
     instance: PipelineInstance;
     parentAttempt: { id: string; stage_id: string; request_hash: string; run_id: string | null; planned_run_id: string | null };
+    canonicalCompletedAt?: string;
   }): { graphResult: PipelineEventArtifact; stageResult: PipelineEventArtifact; completedAt?: string } => {
     const artifact = input.graphArtifact;
     const stageArtifact = input.stageArtifact;
@@ -844,7 +848,8 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     const transformedPayload = canonicalJson(canonicalAggregatePayloadFromLegacy(
       payload,
       input.integrationSubject,
-      input.aggregateSubject
+      input.aggregateSubject,
+      input.canonicalCompletedAt
     ));
     if (transformedPayload !== input.graphResult.payload) {
       throw new Error(`structured aggregate ${input.parentAttemptId} canonical aggregate artifact does not derive from durable legacy evidence`);
@@ -854,7 +859,8 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       input.integrationSubject,
       input.aggregateSubject,
       input.graphArtifactHash,
-      input.graphResult.hash
+      input.graphResult.hash,
+      input.canonicalCompletedAt
     ));
     return {
       graphResult: {
@@ -1593,23 +1599,109 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       if (graph.aggregate_emitted_at) {
         let legacyGraphResult: PipelineEventArtifact | null = null;
         let legacyStageResult: PipelineEventArtifact | null = null;
+        let legacyFromArtifactHash: string | null = null;
         const parentAlreadyTerminal = ["completed", "canceled", "superseded", "failed"].includes(parentAttempt.status);
-        if (graph.aggregate_artifact_hash !== graphResult.hash) {
+        const canReplayLegacyCommitAggregate = outcome === "success" && aggregateSubject !== integrationSubject && graph.aggregate_artifact_hash;
+        if (graph.aggregate_artifact_hash !== graphResult.hash || canReplayLegacyCommitAggregate) {
           if (outcome !== "success" || aggregateSubject === integrationSubject || !graph.aggregate_artifact_hash) {
             throw new Error(`structured aggregate ${parentAttemptId} replay hash does not match durable graph marker`);
           }
-          const durableLegacyArtifact = deps.store.getPipelineArtifactByHash({
+          let durableLegacyArtifact = deps.store.getPipelineArtifactByHash({
             pipelineInstanceId: instance.id,
             attemptId: parentAttempt.id,
             kind: "execution_graph_result",
             artifactHash: graph.aggregate_artifact_hash,
           });
-          const durableLegacyStageArtifact = deps.store.getPipelineArtifactByHash({
+          let durableLegacyStageArtifact = deps.store.getPipelineArtifactByHash({
             pipelineInstanceId: instance.id,
             attemptId: parentAttempt.id,
             kind: "stage_result",
             artifactHash: parentAttempt.result_hash ?? "",
           });
+          let legacyGraphArtifactHash = graph.aggregate_artifact_hash;
+          let legacyStageArtifactHash = parentAttempt.result_hash;
+          let markerOnlyGraphResult: PipelineEventArtifact | undefined;
+          let markerOnlyStageResult: PipelineEventArtifact | undefined;
+          const legacyEventArtifacts = (completedAt: string): {
+            graph: PipelineEventArtifact;
+            stage: PipelineEventArtifact;
+          } => {
+            const legacyEvent = buildAggregateStageEvent({
+              id: `execution-aggregate:${parentAttemptId}:${integrationSubject}:${outcome}`,
+              manifest,
+              instance,
+              parentAttempt,
+              outcome,
+              subject: integrationSubject,
+              completedAt,
+              units,
+            });
+            const graphArtifact = legacyEvent.artifacts
+              ?.find((artifact) => artifact.kind === "execution_graph_result");
+            const stageArtifact = legacyEvent.artifacts
+              ?.find((artifact) => artifact.kind === "stage_result");
+            if (!graphArtifact || !stageArtifact) {
+              throw new Error(`structured aggregate ${parentAttemptId} legacy replay did not include aggregate artifacts`);
+            }
+            return { graph: graphArtifact, stage: stageArtifact };
+          };
+          if (graph.aggregate_artifact_hash === graphResult.hash) {
+            const markerOnlyArtifacts = legacyEventArtifacts(aggregateCompletedAt);
+            markerOnlyGraphResult = markerOnlyArtifacts.graph;
+            markerOnlyStageResult = markerOnlyArtifacts.stage;
+            legacyGraphArtifactHash = markerOnlyGraphResult.hash;
+            legacyStageArtifactHash = markerOnlyStageResult.hash;
+            const candidateHashes = new Set([
+              ...deps.store.listAggregatePublicationArtifactHashes(parentAttemptId),
+              legacyGraphArtifactHash,
+            ]);
+            const durableMatches: Array<{
+              graphArtifact: PipelineArtifactRecord;
+              stageArtifact: PipelineArtifactRecord | undefined;
+              graphArtifactHash: string;
+              stageArtifactHash: string;
+            }> = [];
+            for (const candidateHash of candidateHashes) {
+              if (candidateHash === graphResult.hash) continue;
+              const candidateArtifact = deps.store.getPipelineArtifactByHash({
+                pipelineInstanceId: instance.id,
+                attemptId: parentAttempt.id,
+                kind: "execution_graph_result",
+                artifactHash: candidateHash,
+              });
+              if (!candidateArtifact) continue;
+              let candidateCompletedAt = aggregateCompletedAt;
+              try {
+                candidateCompletedAt = exactString((JSON.parse(candidateArtifact.payload) as Record<string, unknown>).completed_at) ?? aggregateCompletedAt;
+              } catch {
+                candidateCompletedAt = aggregateCompletedAt;
+              }
+              const candidateArtifacts = legacyEventArtifacts(candidateCompletedAt);
+              if (candidateArtifacts.graph.hash !== candidateHash) continue;
+              const candidateStageArtifact = deps.store.getPipelineArtifactByHash({
+                pipelineInstanceId: instance.id,
+                attemptId: parentAttempt.id,
+                kind: "stage_result",
+                artifactHash: candidateArtifacts.stage.hash,
+              });
+              durableMatches.push({
+                graphArtifact: candidateArtifact,
+                stageArtifact: candidateStageArtifact,
+                graphArtifactHash: candidateHash,
+                stageArtifactHash: candidateArtifacts.stage.hash,
+              });
+            }
+            if (durableMatches.length > 1) {
+              throw new Error(`structured aggregate ${parentAttemptId} has ambiguous durable legacy aggregate artifacts`);
+            }
+            const durableMatch = durableMatches[0];
+            if (durableMatch) {
+              durableLegacyArtifact = durableMatch.graphArtifact;
+              durableLegacyStageArtifact = durableMatch.stageArtifact;
+              legacyGraphArtifactHash = durableMatch.graphArtifactHash;
+              legacyStageArtifactHash = durableMatch.stageArtifactHash;
+            }
+          }
           let legacyCompletedAt: string | undefined;
           if (durableLegacyArtifact) {
             try {
@@ -1618,7 +1710,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
               legacyCompletedAt = undefined;
             }
           }
-          if (legacyCompletedAt) {
+          if (legacyCompletedAt && graph.aggregate_artifact_hash !== graphResult.hash) {
             event = buildAggregateStageEvent({
               id: `execution-aggregate:${parentAttemptId}:${aggregateSubject}:${outcome}`,
               manifest,
@@ -1634,36 +1726,32 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
             stageResult = event.artifacts?.find((artifact) => artifact.kind === "stage_result");
             if (!stageResult) throw new Error(`structured aggregate ${event.id} did not include stage_result`);
           }
-          if (durableLegacyArtifact || parentAlreadyTerminal) {
+          if (durableLegacyArtifact || (parentAlreadyTerminal && graph.aggregate_artifact_hash !== graphResult.hash)) {
             const legacy = validateDurableLegacyAggregateArtifact({
               parentAttemptId,
               graphArtifact: durableLegacyArtifact,
-              graphArtifactHash: graph.aggregate_artifact_hash,
+              graphArtifactHash: legacyGraphArtifactHash,
               stageArtifact: durableLegacyStageArtifact,
-              stageArtifactHash: parentAttempt.result_hash,
+              stageArtifactHash: legacyStageArtifactHash,
               integrationSubject,
               aggregateSubject,
               graphResult,
               stageResult,
               instance,
               parentAttempt,
+              canonicalCompletedAt: graph.aggregate_artifact_hash === graphResult.hash ? aggregateCompletedAt : undefined,
             });
             legacyGraphResult = legacy.graphResult;
             legacyStageResult = legacy.stageResult;
+            legacyFromArtifactHash = legacyGraphArtifactHash;
           } else {
-            const legacyEvent = buildAggregateStageEvent({
-              id: `execution-aggregate:${parentAttemptId}:${integrationSubject}:${outcome}`,
-              manifest,
-              instance,
-              parentAttempt,
-              outcome,
-              subject: integrationSubject,
-              completedAt: aggregateCompletedAt,
-              units,
-            });
-            const markerOnlyGraphResult = legacyEvent.artifacts
-              ?.find((artifact) => artifact.kind === "execution_graph_result");
-            if (!markerOnlyGraphResult || markerOnlyGraphResult.hash !== graph.aggregate_artifact_hash) {
+            if (!markerOnlyGraphResult) {
+              markerOnlyGraphResult = legacyEventArtifacts(aggregateCompletedAt).graph;
+            }
+            if (!markerOnlyGraphResult || (
+              graph.aggregate_artifact_hash !== graphResult.hash &&
+              markerOnlyGraphResult.hash !== graph.aggregate_artifact_hash
+            )) {
               throw new Error(`structured aggregate ${parentAttemptId} marker-only legacy replay hash does not match durable graph marker`);
             }
             const markerOnlyPayload = JSON.parse(markerOnlyGraphResult.payload) as Record<string, unknown>;
@@ -1681,6 +1769,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
               payload: transformedPayload,
               hash: digestNormalized(transformedPayload),
             };
+            legacyFromArtifactHash = markerOnlyGraphResult.hash;
           }
           if (legacyStageResult) {
             if (legacyStageResult.payload !== stageResult.payload || legacyStageResult.hash !== stageResult.hash) {
@@ -1689,8 +1778,12 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           }
         }
         if (legacyGraphResult) {
+          const fromArtifactHash = legacyFromArtifactHash ?? graph.aggregate_artifact_hash;
+          if (!fromArtifactHash) {
+            throw new Error(`structured aggregate ${parentAttemptId} legacy replay has no aggregate migration source`);
+          }
           let legacyFallbackPublishStageId: string | null = null;
-          if (!options.successorStageId && parentAlreadyTerminal) {
+          if (!options.successorStageId && !options.suppressLegacyFallback && parentAlreadyTerminal) {
             const parentStage = stageById(instance.normalized_manifest, parentAttempt.stage_id);
             legacyFallbackPublishStageId = successReachablePublishStageId(
               manifest,
@@ -1699,7 +1792,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           }
           deps.store.migrateAggregateArtifactHash({
             parentAttemptId,
-            fromArtifactHash: graph.aggregate_artifact_hash,
+            fromArtifactHash,
             toArtifactHash: graphResult.hash,
             ...(parentAlreadyTerminal ? {
               fromStageResultHash: parentAttempt.result_hash ?? undefined,

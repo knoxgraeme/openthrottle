@@ -2009,6 +2009,106 @@ describe("execution unit store", () => {
     expect(events).toHaveLength(2);
   });
 
+  it("repairs exact legacy aggregate activity when the graph marker is already canonical", () => {
+    const store = setup();
+    const subject = "1".repeat(40);
+    emitSingleUnitAggregate(store, subject, "canonical-hash");
+    rewriteAggregateActivityHash("attempt-parent", "canonical-hash", "legacy-hash");
+
+    expect(store.migrateAggregateArtifactHash({
+      parentAttemptId: "attempt-parent",
+      fromArtifactHash: "legacy-hash",
+      toArtifactHash: "canonical-hash",
+    })).toBe("already_canonical");
+    expect(publicationEvents("attempt-parent").filter((event) =>
+      event.kind === "aggregate" || event.kind === "aggregate_correction"
+    )).toEqual([
+      expect.objectContaining({
+        kind: "aggregate",
+        body: expect.stringContaining("canonical-hash"),
+        outboxBody: expect.stringContaining("canonical-hash"),
+        outboxStatus: "pending",
+      }),
+    ]);
+
+    rewriteAggregateActivityHash("attempt-parent", "canonical-hash", "legacy-hash");
+    db!.prepare("UPDATE linear_outbox SET status = 'processed', processed_at = ? WHERE payload LIKE ?")
+      .run(timestamp, "%legacy-hash%");
+    expect(store.migrateAggregateArtifactHash({
+      parentAttemptId: "attempt-parent",
+      fromArtifactHash: "legacy-hash",
+      toArtifactHash: "canonical-hash",
+    })).toBe("already_canonical");
+    let events = publicationEvents("attempt-parent").filter((event) =>
+      event.kind === "aggregate" || event.kind === "aggregate_correction"
+    );
+    expect(events).toHaveLength(2);
+    expect(events[0]).toMatchObject({
+      kind: "aggregate",
+      body: expect.stringContaining("canonical-hash"),
+      outboxBody: expect.stringContaining("legacy-hash"),
+      outboxStatus: "processed",
+    });
+    expect(events[1]).toMatchObject({
+      kind: "aggregate_correction",
+      body: expect.stringContaining("canonical-hash"),
+      outboxBody: expect.stringContaining("canonical-hash"),
+      outboxStatus: "pending",
+    });
+
+    expect(store.migrateAggregateArtifactHash({
+      parentAttemptId: "attempt-parent",
+      fromArtifactHash: "legacy-hash",
+      toArtifactHash: "canonical-hash",
+    })).toBe("already_canonical");
+    events = publicationEvents("attempt-parent").filter((event) =>
+      event.kind === "aggregate" || event.kind === "aggregate_correction"
+    );
+    expect(events).toHaveLength(2);
+  });
+
+  it("records one correction when only delivered outbox activity still names the legacy aggregate", () => {
+    const store = setup();
+    const subject = "1".repeat(40);
+    emitSingleUnitAggregate(store, subject, "canonical-hash");
+    rewriteAggregateOutboxActivityHash("attempt-parent", "canonical-hash", "legacy-hash");
+    db!.prepare("UPDATE linear_outbox SET status = 'processed', processed_at = ? WHERE payload LIKE ?")
+      .run(timestamp, "%legacy-hash%");
+
+    expect(store.migrateAggregateArtifactHash({
+      parentAttemptId: "attempt-parent",
+      fromArtifactHash: "legacy-hash",
+      toArtifactHash: "canonical-hash",
+    })).toBe("already_canonical");
+
+    let events = publicationEvents("attempt-parent").filter((event) =>
+      event.kind === "aggregate" || event.kind === "aggregate_correction"
+    );
+    expect(events).toHaveLength(2);
+    expect(events[0]).toMatchObject({
+      kind: "aggregate",
+      body: expect.stringContaining("canonical-hash"),
+      outboxBody: expect.stringContaining("legacy-hash"),
+      outboxStatus: "processed",
+    });
+    expect(events[1]).toMatchObject({
+      kind: "aggregate_correction",
+      body: expect.stringContaining("canonical-hash"),
+      outboxBody: expect.stringContaining("canonical-hash"),
+      outboxStatus: "pending",
+    });
+
+    expect(store.migrateAggregateArtifactHash({
+      parentAttemptId: "attempt-parent",
+      fromArtifactHash: "legacy-hash",
+      toArtifactHash: "canonical-hash",
+    })).toBe("already_canonical");
+    events = publicationEvents("attempt-parent").filter((event) =>
+      event.kind === "aggregate" || event.kind === "aggregate_correction"
+    );
+    expect(events).toHaveLength(2);
+  });
+
   it("atomically migrates terminal legacy aggregate and parent stage artifacts", () => {
     const store = setup();
     const subject = "1".repeat(40);
@@ -3595,6 +3695,30 @@ describe("execution unit store", () => {
     });
     db!.prepare("UPDATE execution_publication_events SET body = ? WHERE id = ?")
       .run(rewrittenBody, aggregateEvent.id);
+    db!.prepare("UPDATE linear_outbox SET payload = ?, payload_hash = ? WHERE id = ?")
+      .run(rewrittenOutboxPayload, digestNormalized(rewrittenOutboxPayload), aggregateEvent.linear_outbox_id);
+  }
+
+  function rewriteAggregateOutboxActivityHash(parentAttemptId: string, fromArtifactHash: string, toArtifactHash: string): void {
+    const aggregateEvent = db!.prepare(`
+      SELECT e.body, e.linear_outbox_id, o.payload
+      FROM execution_publication_events e
+      JOIN linear_outbox o ON o.id = e.linear_outbox_id
+      WHERE e.parent_attempt_id = ? AND e.kind = 'aggregate'
+      ORDER BY e.sequence ASC
+      LIMIT 1
+    `).get(parentAttemptId) as { body: string; linear_outbox_id: string; payload: string };
+    const rewrittenBody = aggregateEvent.body.replaceAll(fromArtifactHash, toArtifactHash);
+    const outboxPayload = JSON.parse(aggregateEvent.payload) as {
+      activity: Record<string, unknown>;
+    } & Record<string, unknown>;
+    const rewrittenOutboxPayload = canonicalJson({
+      ...outboxPayload,
+      activity: {
+        ...outboxPayload.activity,
+        body: rewrittenBody,
+      },
+    });
     db!.prepare("UPDATE linear_outbox SET payload = ?, payload_hash = ? WHERE id = ?")
       .run(rewrittenOutboxPayload, digestNormalized(rewrittenOutboxPayload), aggregateEvent.linear_outbox_id);
   }

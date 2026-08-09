@@ -537,8 +537,7 @@ describe("one-stage executor", () => {
         `
           const { writeFileSync } = require("node:fs");
           writeFileSync(${JSON.stringify(commandPidPath)}, String(process.pid));
-          process.stdin.resume();
-          process.stdin.once("end", () => process.kill(process.ppid, "SIGSTOP"));
+          process.kill(process.ppid, "SIGSTOP");
           setInterval(() => {}, 1000);
         `,
       ], { timeout: 100, killAfterMs: 50 });

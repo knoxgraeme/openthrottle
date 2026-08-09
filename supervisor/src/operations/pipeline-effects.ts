@@ -473,7 +473,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     await stopLegacySuccessorActorIfNeeded(instance, resource, successorStageId, supplyingParentAttemptId);
     for (const attempt of completedCompositeAttempts) {
       await structuredChildren.drainCompositeChildren(resource, instance, attempt.id, {
-        ...(attempt.id === supplyingParentAttemptId ? { successorStageId } : {}),
+        ...(attempt.id === supplyingParentAttemptId ? { successorStageId } : { suppressLegacyFallback: true }),
       });
     }
   };

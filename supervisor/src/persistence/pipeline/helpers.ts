@@ -470,8 +470,22 @@ export function migrateAggregatePublicationActivity(input: {
 
   const bodyHasSource = event.body.includes(input.fromArtifactHash);
   const bodyHasTarget = event.body.includes(input.toArtifactHash);
+  const outboxHasSource = event.outbox_payload.includes(input.fromArtifactHash);
   if (!bodyHasSource && bodyHasTarget) {
-    if (event.outbox_status !== "pending" && event.outbox_status !== "failed") return "already_canonical";
+    if (event.outbox_status !== "pending" && event.outbox_status !== "failed") {
+      if (!outboxHasSource) return "already_canonical";
+      if (correction) return "correction_recorded";
+      insertExecutionPublicationEvent({
+        db: input.db,
+        id: correctionEventId,
+        graph: input.graph,
+        unitId: null,
+        kind: "aggregate_correction",
+        body: aggregateCorrectionBody(input.fromArtifactHash, input.toArtifactHash),
+        timestamp: input.timestamp,
+      });
+      return "correction_recorded";
+    }
     const canonicalOutboxPayload = activityOutboxPayload({
       sessionId: event.linear_session_id,
       body: event.body,

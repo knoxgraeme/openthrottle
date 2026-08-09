@@ -1457,8 +1457,27 @@ describe("pipeline effect processor", () => {
       ?.find((artifact) => artifact.kind === "stage_result");
     expect(legacyGraphResult).toBeDefined();
     expect(legacyStageResult).toBeDefined();
-    const persistLegacyAggregateArtifacts = () => {
-      for (const legacyArtifact of [legacyStageResult!, legacyGraphResult!]) {
+    const shiftedLegacyCompletedAt = "2099-07-22T12:00:01.000Z";
+    const shiftedLegacyCommitSubjectAggregate = buildAggregateStageEvent({
+      id: `execution-aggregate:${attempt.id}:${finalIntegratedSubject}:success`,
+      manifest: manifest.manifest,
+      instance,
+      parentAttempt: pipelines.getAttempt(attempt.id)!,
+      outcome: "success",
+      subject: finalIntegratedSubject,
+      completedAt: shiftedLegacyCompletedAt,
+      units: pipelines.listUnits(attempt.id),
+    });
+    const shiftedLegacyGraphResult = shiftedLegacyCommitSubjectAggregate.artifacts
+      ?.find((artifact) => artifact.kind === "execution_graph_result");
+    const shiftedLegacyStageResult = shiftedLegacyCommitSubjectAggregate.artifacts
+      ?.find((artifact) => artifact.kind === "stage_result");
+    expect(shiftedLegacyGraphResult).toBeDefined();
+    expect(shiftedLegacyStageResult).toBeDefined();
+    expect(shiftedLegacyGraphResult!.hash).not.toBe(legacyGraphResult!.hash);
+    const persistAggregateArtifacts = (...artifacts: Array<typeof legacyGraphResult>) => {
+      for (const legacyArtifact of artifacts) {
+        if (!legacyArtifact) throw new Error("missing legacy aggregate artifact fixture");
         db!.prepare(`
           INSERT INTO pipeline_artifacts (
             id, pipeline_instance_id, attempt_id, kind, schema_version,
@@ -1474,7 +1493,7 @@ describe("pipeline effect processor", () => {
             payload = excluded.payload,
             artifact_hash = excluded.artifact_hash
         `).run(
-          `legacy-artifact-${attempt.id}-${legacyArtifact.kind}`,
+          `legacy-artifact-${attempt.id}-${legacyArtifact.kind}-${legacyArtifact.hash}`,
           instance.id,
           attempt.id,
           legacyArtifact.kind,
@@ -1486,6 +1505,9 @@ describe("pipeline effect processor", () => {
           "2099-07-22T12:00:00.000Z"
         );
       }
+    };
+    const persistLegacyAggregateArtifacts = () => {
+      persistAggregateArtifacts(legacyStageResult, legacyGraphResult);
       db!.prepare(`
         UPDATE pipeline_stage_attempts
         SET result_hash = ?, updated_at = ?
@@ -1508,26 +1530,29 @@ describe("pipeline effect processor", () => {
       ORDER BY e.sequence ASC
       LIMIT 1
     `).get(attempt.id) as { id: string; body: string; linear_outbox_id: string; payload: string };
-    const legacyAggregateBody = aggregatePublication.body.replaceAll(canonicalGraphResultHash, legacyGraphResult!.hash);
     const aggregateOutboxPayload = JSON.parse(aggregatePublication.payload) as {
       activity: Record<string, unknown>;
     } & Record<string, unknown>;
-    const legacyAggregateOutboxPayload = canonicalJson({
-      ...aggregateOutboxPayload,
-      activity: {
-        ...aggregateOutboxPayload.activity,
-        body: legacyAggregateBody,
-      },
-    });
-    const rewriteAggregatePublicationToLegacyHash = () => {
+    const rewriteAggregatePublicationToArtifactHash = (artifactHash: string) => {
+      const aggregateBody = aggregatePublication.body.replaceAll(canonicalGraphResultHash, artifactHash);
+      const aggregateOutboxPayloadForHash = canonicalJson({
+        ...aggregateOutboxPayload,
+        activity: {
+          ...aggregateOutboxPayload.activity,
+          body: aggregateBody,
+        },
+      });
       db!.prepare("UPDATE execution_publication_events SET body = ? WHERE id = ?")
-        .run(legacyAggregateBody, aggregatePublication.id);
+        .run(aggregateBody, aggregatePublication.id);
       db!.prepare("UPDATE linear_outbox SET payload = ?, payload_hash = ? WHERE id = ?")
         .run(
-          legacyAggregateOutboxPayload,
-          digestNormalized(legacyAggregateOutboxPayload),
+          aggregateOutboxPayloadForHash,
+          digestNormalized(aggregateOutboxPayloadForHash),
           aggregatePublication.linear_outbox_id
         );
+    };
+    const rewriteAggregatePublicationToLegacyHash = () => {
+      rewriteAggregatePublicationToArtifactHash(legacyGraphResult!.hash);
     };
     rewriteAggregatePublicationToLegacyHash();
     db!.prepare(`
@@ -1548,6 +1573,35 @@ describe("pipeline effect processor", () => {
     expect(executionLedgerLines(structuredPublication))
       .toEqual(expect.arrayContaining([
         expect.stringContaining(`aggregate=${canonicalGraphResultHash}`),
+      ]));
+    rewriteAggregatePublicationToLegacyHash();
+    await expect(processor.drain()).rejects.toThrow(/pipeline publication is blocked/);
+    expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
+      aggregate_artifact_hash: canonicalGraphResultHash,
+    });
+    let alreadyCanonicalPublication = pipelines.getStructuredExecutionPublicationForInstance(instance.id)!;
+    expect(executionLedgerLines(alreadyCanonicalPublication))
+      .toEqual(expect.arrayContaining([
+        expect.stringContaining(`aggregate=${canonicalGraphResultHash}`),
+      ]));
+    expect(executionLedgerLines(alreadyCanonicalPublication))
+      .not.toEqual(expect.arrayContaining([
+        expect.stringContaining(`aggregate=${legacyGraphResult!.hash}`),
+      ]));
+    persistAggregateArtifacts(shiftedLegacyStageResult, shiftedLegacyGraphResult);
+    rewriteAggregatePublicationToArtifactHash(shiftedLegacyGraphResult!.hash);
+    await expect(processor.drain()).rejects.toThrow(/pipeline publication is blocked/);
+    alreadyCanonicalPublication = pipelines.getStructuredExecutionPublicationForInstance(instance.id)!;
+    expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
+      aggregate_artifact_hash: canonicalGraphResultHash,
+    });
+    expect(executionLedgerLines(alreadyCanonicalPublication))
+      .toEqual(expect.arrayContaining([
+        expect.stringContaining(`aggregate=${canonicalGraphResultHash}`),
+      ]));
+    expect(executionLedgerLines(alreadyCanonicalPublication))
+      .not.toEqual(expect.arrayContaining([
+        expect.stringContaining(`aggregate=${shiftedLegacyGraphResult!.hash}`),
       ]));
     rewriteAggregatePublicationToLegacyHash();
     await expect(processor.drain()).rejects.toThrow(/pipeline publication is blocked/);
@@ -2260,6 +2314,15 @@ describe("pipeline effect processor", () => {
     )).rejects.toThrow(/ambiguous structured publish successors/);
     expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
       aggregate_artifact_hash: legacyGraphResult!.hash,
+    });
+    await childRuntime.drainCompositeChildren(
+      { providerResourceId: "sandbox-child-drain" },
+      pipelines.getInstance(instance.id)!,
+      attempt.id,
+      { suppressLegacyFallback: true }
+    );
+    expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
+      aggregate_artifact_hash: canonicalGraphResultHash,
     });
   });
 

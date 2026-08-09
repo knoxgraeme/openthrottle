@@ -271,6 +271,7 @@ export interface ExecutionUnitStore {
     kind: string;
     artifactHash: string;
   }): PipelineArtifactRecord | undefined;
+  listAggregatePublicationArtifactHashes(parentAttemptId: string): string[];
   recordGateReceipt(input: {
     actionId: string;
     gateKind: ExecutionGateKind;
@@ -1976,6 +1977,29 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         input.kind,
         input.artifactHash
       ) as PipelineArtifactRecord | undefined;
+    },
+    listAggregatePublicationArtifactHashes(parentAttemptId) {
+      const rows = db.prepare(`
+        SELECT e.body, o.payload AS outbox_payload
+        FROM execution_publication_events e
+        JOIN linear_outbox o ON o.id = e.linear_outbox_id
+        WHERE e.parent_attempt_id = ? AND e.kind = 'aggregate'
+        ORDER BY e.sequence ASC
+      `).all(parentAttemptId) as Array<{ body: string; outbox_payload: string }>;
+      const hashes = new Set<string>();
+      const addHashes = (text: string): void => {
+        for (const match of text.matchAll(/[a-f0-9]{64}/g)) hashes.add(match[0]!);
+      };
+      for (const row of rows) {
+        addHashes(row.body);
+        try {
+          const payload = JSON.parse(row.outbox_payload) as { activity?: { body?: unknown } };
+          if (typeof payload.activity?.body === "string") addHashes(payload.activity.body);
+        } catch {
+          addHashes(row.outbox_payload);
+        }
+      }
+      return [...hashes].sort();
     },
     recordGateReceipt,
     listGateReceipts(parentAttemptId) {
