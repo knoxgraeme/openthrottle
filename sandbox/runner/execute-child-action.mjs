@@ -7,10 +7,15 @@ import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
 import { writeJsonAtomic } from "./atomic-write.mjs";
 import { computeWorkspaceTreeOidAsExecutor, runGitAsExecutor } from "./repository-control.mjs";
-import { defaultExecuteCommand, resolveCommand } from "./execute-stage.mjs";
+import {
+  defaultExecuteCommand,
+  REPOSITORY_COMMAND_TIMEOUT_MS,
+  resolveCommand,
+} from "./execute-stage.mjs";
 import { integrateCandidate } from "./integrate-unit.mjs";
 import { restoreIntegrationCheckout } from "./execute-loop.mjs";
 import { deriveCandidateCommit, grantWorktreeToAgent, lockWorktree, worktreePath } from "./worktrees.mjs";
+import { ensureWorktreeBootstrap } from "./worktree-bootstrap.mjs";
 
 function configPath() {
   return process.env.OT_STAGE_CONFIG_FILE ?? "/var/lib/openthrottle/stage-input/repository-config.json";
@@ -156,6 +161,7 @@ function integrationEvidence(request, evidence) {
 
 function commandReceipt(request, {
   executeCommand = defaultExecuteCommand,
+  bootstrapWorktree = ensureWorktreeBootstrap,
   grantWorktree = grantWorktreeToAgent,
   lockWorktreeHandle = lockWorktree,
   computeSubject = computeWorkspaceTreeOidAsExecutor,
@@ -164,7 +170,8 @@ function commandReceipt(request, {
   resetIntegration = resetIntegrationCheckout,
 } = {}) {
   const commandName = request.commandName;
-  const config = JSON.parse(readFileSync(configPath(), "utf8"));
+  const configRaw = readFileSync(configPath(), "utf8");
+  const config = JSON.parse(configRaw);
   const command = resolveCommand(config, commandName);
   if (!command) {
     const payload = {
@@ -196,7 +203,24 @@ function commandReceipt(request, {
   let finalCommandHead = null;
   let finalCommandClean = null;
   try {
-    execution = executeCommand({ command, repoDir, timeoutMs: 7_200_000 });
+    if (request.actionKind === "command") {
+      // The unit worktree was created bare and carries none of the ignored
+      // dependency state the bake-once bootstrap installed in the
+      // integration checkout. Re-run the sealed post_bootstrap there, once
+      // per worktree, before the first repository command; a bootstrap
+      // failure throws (retryable infrastructure via
+      // childActionFailureResult) rather than becoming a command receipt,
+      // so it can never consume a semantic repair round.
+      bootstrapWorktree({
+        worktreeDir: repoDir,
+        handle: request.worktree.id,
+        config,
+        configDigest: digest(configRaw),
+        executeCommand,
+        commandTimeoutMs: REPOSITORY_COMMAND_TIMEOUT_MS,
+      });
+    }
+    execution = executeCommand({ command, repoDir, timeoutMs: REPOSITORY_COMMAND_TIMEOUT_MS });
     if (request.actionKind === "final_command") {
       finalCommandHead = commitSubject(repoDir);
       finalCommandClean = isClean(repoDir);
@@ -296,6 +320,7 @@ function integrationReceipt(request) {
 export function executeChildAction({
   request: rawRequest,
   executeCommand = defaultExecuteCommand,
+  bootstrapWorktree = ensureWorktreeBootstrap,
   grantWorktree = grantWorktreeToAgent,
   lockWorktreeHandle = lockWorktree,
   computeSubject = computeWorkspaceTreeOidAsExecutor,
@@ -307,6 +332,7 @@ export function executeChildAction({
   const receipt = request.actionKind === "command" || request.actionKind === "final_command"
     ? commandReceipt(request, {
         executeCommand,
+        bootstrapWorktree,
         grantWorktree,
         lockWorktreeHandle,
         computeSubject,
