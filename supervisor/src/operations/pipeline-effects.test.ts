@@ -14,6 +14,7 @@ import {
   parseRepositoryConfig,
 } from "../pipeline/manifest.js";
 import { parseAndCompileExecutionGraph } from "../pipeline/execution-graph.js";
+import { buildAggregateStageEvent } from "../pipeline/unit-coordinator.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { buildInstalledRuntimeDescriptor, type SandboxAutostopRuntime, type SandboxRuntime } from "../__fixtures__/runtime.js";
 import type { ExecutionGateDecision } from "../pipeline/execution-gates.js";
@@ -1340,6 +1341,39 @@ describe("pipeline effect processor", () => {
       aggregate_artifact_hash: expect.any(String),
     });
     expect(pipelines.getAttempt(attempt.id)).toMatchObject({ status: "running" });
+
+    const legacyCommitSubjectAggregate = buildAggregateStageEvent({
+      id: `execution-aggregate:${attempt.id}:${finalIntegratedSubject}:success`,
+      manifest: manifest.manifest,
+      instance,
+      parentAttempt: pipelines.getAttempt(attempt.id)!,
+      outcome: "success",
+      subject: finalIntegratedSubject,
+      units: pipelines.listUnits(attempt.id),
+    });
+    const legacyGraphResult = legacyCommitSubjectAggregate.artifacts
+      ?.find((artifact) => artifact.kind === "execution_graph_result");
+    expect(legacyGraphResult).toBeDefined();
+
+    db!.prepare("UPDATE pipeline_instances SET status = ? WHERE id = ?").run(beforeAggregateStatus, instance.id);
+    db!.prepare(`
+      UPDATE execution_graphs
+      SET aggregate_artifact_hash = ?, updated_at = ?
+      WHERE parent_attempt_id = ?
+    `).run("0".repeat(64), "2099-07-22T12:00:00.000Z", attempt.id);
+    await expect(processor.drain()).rejects.toThrow(/replay hash does not match durable graph marker/);
+
+    db!.prepare(`
+      UPDATE execution_graphs
+      SET aggregate_artifact_hash = ?, updated_at = ?
+      WHERE parent_attempt_id = ?
+    `).run(legacyGraphResult!.hash, "2099-07-22T12:00:00.000Z", attempt.id);
+    db!.prepare("UPDATE pipeline_instances SET status = 'publication_blocked' WHERE id = ?").run(instance.id);
+    await expect(processor.drain()).rejects.toThrow(/pipeline publication is blocked/);
+    expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
+      aggregate_artifact_hash: legacyGraphResult!.hash,
+    });
+
     db!.prepare("UPDATE pipeline_instances SET status = ? WHERE id = ?").run(beforeAggregateStatus, instance.id);
 
     await processor.drain();

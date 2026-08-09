@@ -1358,9 +1358,10 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           throw new Error("structured aggregate success requires the fresh final review subject to match the integrated subject");
         }
       }
+      const manifest = JSON.parse(instance.normalized_manifest);
       const event = buildAggregateStageEvent({
         id: `execution-aggregate:${parentAttemptId}:${aggregateSubject}:${outcome}`,
-        manifest: JSON.parse(instance.normalized_manifest),
+        manifest,
         instance,
         parentAttempt,
         outcome,
@@ -1371,7 +1372,22 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       if (!graphResult) throw new Error(`structured aggregate ${event.id} did not include execution_graph_result`);
       if (graph.aggregate_emitted_at) {
         if (graph.aggregate_artifact_hash !== graphResult.hash) {
-          throw new Error(`structured aggregate ${parentAttemptId} replay hash does not match durable graph marker`);
+          const legacyEvent = outcome === "success" && aggregateSubject !== integrationSubject
+            ? buildAggregateStageEvent({
+                id: `execution-aggregate:${parentAttemptId}:${integrationSubject}:${outcome}`,
+                manifest,
+                instance,
+                parentAttempt,
+                outcome,
+                subject: integrationSubject,
+                units,
+              })
+            : null;
+          const legacyGraphResult = legacyEvent?.artifacts
+            ?.find((artifact) => artifact.kind === "execution_graph_result");
+          if (!legacyGraphResult || graph.aggregate_artifact_hash !== legacyGraphResult.hash) {
+            throw new Error(`structured aggregate ${parentAttemptId} replay hash does not match durable graph marker`);
+          }
         }
         completeParentStage(event);
         return;
