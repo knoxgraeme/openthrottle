@@ -1510,6 +1510,7 @@ describe("pipeline effect processor", () => {
       outcome: "success",
       resultHash: digestNormalized(intermediateStagePayload),
       subject: finalIntegratedTreeSubject,
+      nativeSessionId: "publish-native-session",
       artifacts: [{
         kind: "stage_result",
         schemaVersion: 1,
@@ -1551,7 +1552,7 @@ describe("pipeline effect processor", () => {
       stageId: publishStageId,
       capability: "ce/publish@1",
       expectedSubject: finalIntegratedTreeSubject,
-      contextPolicy: expect.any(String),
+      contextPolicy: "resume_required",
       nativeSessionId: null,
     });
     expect(tickets.getByIssueId(instance.linear_issue_id)?.run_id).toBeNull();
@@ -1563,7 +1564,11 @@ describe("pipeline effect processor", () => {
       void idempotencyKey;
       return rest;
     })(canonicalRequest);
-    const legacyWithoutFence = { ...canonicalWithoutFence, expectedSubject: finalIntegratedSubject };
+    const legacyWithoutFence = {
+      ...canonicalWithoutFence,
+      expectedSubject: finalIntegratedSubject,
+      nativeSessionId: "publish-native-session",
+    };
     const legacyFence = createStageRequestHash(legacyWithoutFence);
     const legacyRequest = canonicalJson({ ...legacyWithoutFence, ...legacyFence });
     const dispatchEffect = effects.find((effect) => effect.kind === "dispatch_stage" && effect.status === "pending")!;
@@ -1580,12 +1585,14 @@ describe("pipeline effect processor", () => {
     `).run(finalIntegratedSubject, "2099-07-22T12:00:00.000Z", instance.id);
     db!.prepare(`
       UPDATE pipeline_stage_attempts
-      SET expected_subject = ?, request_hash = ?, idempotency_key = ?, request_payload = ?, updated_at = ?
+      SET expected_subject = ?, request_hash = ?, idempotency_key = ?,
+          native_session_id = ?, request_payload = ?, updated_at = ?
       WHERE id = ?
     `).run(
       finalIntegratedSubject,
       legacyFence.requestHash,
       legacyFence.idempotencyKey,
+      "publish-native-session",
       legacyRequest,
       "2099-07-22T12:00:00.000Z",
       publishAttempt.id
@@ -1618,7 +1625,7 @@ describe("pipeline effect processor", () => {
         capability: "ce/publish@1",
         expectedSubject: finalIntegratedTreeSubject,
         contextPolicy: publishRequest.contextPolicy,
-        nativeSessionId: null,
+        nativeSessionId: "publish-native-session",
       })
     );
     expect(pipelines.getInstance(instance.id)).toMatchObject({ immutable_subject: finalIntegratedTreeSubject });
@@ -1646,7 +1653,7 @@ describe("pipeline effect processor", () => {
       UPDATE pipeline_stage_attempts
       SET expected_subject = ?, request_hash = ?, idempotency_key = ?,
           planned_run_id = ?, run_id = ?, request_payload = ?, status = 'running',
-          native_session_id = NULL, updated_at = ?
+          native_session_id = ?, updated_at = ?
       WHERE id = ?
     `).run(
       finalIntegratedSubject,
@@ -1655,6 +1662,7 @@ describe("pipeline effect processor", () => {
       legacyWithoutFence.runId,
       legacyWithoutFence.runId,
       legacyRequest,
+      "publish-native-session",
       "2099-07-22T12:00:00.000Z",
       publishAttempt.id
     );
@@ -1680,13 +1688,13 @@ describe("pipeline effect processor", () => {
       stage_id: publishStageId,
       status: "pending",
       run_id: null,
-      native_session_id: null,
+      native_session_id: "publish-native-session",
       expected_subject: finalIntegratedTreeSubject,
     });
     expect(restartedRequest).toMatchObject({
       stageId: publishStageId,
       expectedSubject: finalIntegratedTreeSubject,
-      nativeSessionId: null,
+      nativeSessionId: "publish-native-session",
     });
     expect(restartedRequest.runId).not.toBe(legacyWithoutFence.runId);
     const restartedEffect = pipelines.listEffects(instance.id).find((effect) =>
@@ -1708,10 +1716,113 @@ describe("pipeline effect processor", () => {
         stageId: publishStageId,
         expectedSubject: finalIntegratedTreeSubject,
         runId: restartedRequest.runId,
-        nativeSessionId: null,
+        nativeSessionId: "publish-native-session",
       })
     );
     expect(tickets.getByIssueId(instance.linear_issue_id)?.run_id).toBe(restartedRequest.runId);
+
+    const postRestartAttempt = pipelines.getActiveAttempt(instance.id)!;
+    const postRestartCanonicalRequest = JSON.parse(postRestartAttempt.request_payload!) as StageRequestEnvelope;
+    const postRestartCanonicalWithoutFence = (({ requestHash, idempotencyKey, ...rest }: StageRequestEnvelope) => {
+      void requestHash;
+      void idempotencyKey;
+      return rest;
+    })(postRestartCanonicalRequest);
+    const postRestartLegacyWithoutFence = {
+      ...postRestartCanonicalWithoutFence,
+      expectedSubject: finalIntegratedSubject,
+    };
+    const postRestartLegacyFence = createStageRequestHash(postRestartLegacyWithoutFence);
+    const postRestartLegacyRequest = canonicalJson({ ...postRestartLegacyWithoutFence, ...postRestartLegacyFence });
+    const postRestartEffect = pipelines.listEffects(instance.id).find((effect) =>
+      effect.kind === "dispatch_stage" &&
+      effect.idempotency_key === postRestartCanonicalRequest.idempotencyKey
+    )!;
+
+    rewriteAggregatePublicationToLegacyHash();
+    db!.prepare(`
+      UPDATE execution_graphs
+      SET aggregate_artifact_hash = ?, updated_at = ?
+      WHERE parent_attempt_id = ?
+    `).run(legacyGraphResult!.hash, "2099-07-22T12:00:00.000Z", attempt.id);
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET immutable_subject = ?, status = 'running', updated_at = ?
+      WHERE id = ?
+    `).run(finalIntegratedSubject, "2099-07-22T12:00:00.000Z", instance.id);
+    db!.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET expected_subject = ?, request_hash = ?, idempotency_key = ?,
+          planned_run_id = ?, run_id = ?, request_payload = ?, status = 'running',
+          native_session_id = ?, updated_at = ?
+      WHERE id = ?
+    `).run(
+      finalIntegratedSubject,
+      postRestartLegacyFence.requestHash,
+      postRestartLegacyFence.idempotencyKey,
+      postRestartLegacyWithoutFence.runId,
+      postRestartLegacyWithoutFence.runId,
+      postRestartLegacyRequest,
+      "publish-native-session",
+      "2099-07-22T12:00:00.000Z",
+      postRestartAttempt.id
+    );
+    db!.prepare("DELETE FROM pipeline_effect_intents WHERE id = ?").run(postRestartEffect.id);
+    db!.prepare(`
+      INSERT INTO pipeline_effect_intents (
+        id, pipeline_instance_id, transition_version, kind, idempotency_key,
+        payload, payload_hash, status, attempts, next_attempt_at, created_at, acknowledged_at
+      ) VALUES (
+        'effect-crash-legacy-publish', ?, 500, 'dispatch_stage', ?, ?, ?,
+        'acknowledged', 1, ?, ?, ?
+      )
+    `).run(
+      instance.id,
+      postRestartLegacyFence.idempotencyKey,
+      postRestartLegacyRequest,
+      digestNormalized(postRestartLegacyRequest),
+      "2099-07-22T12:00:00.000Z",
+      "2099-07-22T12:00:00.000Z",
+      "2099-07-22T12:00:00.000Z"
+    );
+    tickets.finishRun({
+      runId: postRestartLegacyWithoutFence.runId,
+      status: "stopped",
+      ticketState: "active",
+      faultAttribution: null,
+    });
+    expect(tickets.getByIssueId(instance.linear_issue_id)?.run_id).toBeNull();
+
+    const restartedProcessor = createPipelineEffectProcessor({
+      store: pipelines,
+      tickets,
+      runtime,
+      taskTimeoutSeconds: 300,
+      runtimeResourceRetentionMinutes: 60,
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+    });
+    const stopCallsBeforeSettledRunReplay = runtime.stop.mock.calls.length;
+    await restartedProcessor.drain();
+    expect(runtime.stop).toHaveBeenCalledTimes(stopCallsBeforeSettledRunReplay);
+    const settledRunReplayAttempt = pipelines.getActiveAttempt(instance.id)!;
+    const settledRunReplayRequest = JSON.parse(settledRunReplayAttempt.request_payload!) as StageRequestEnvelope;
+    expect(settledRunReplayAttempt).toMatchObject({
+      stage_id: publishStageId,
+      status: "pending",
+      run_id: null,
+      native_session_id: "publish-native-session",
+      expected_subject: finalIntegratedTreeSubject,
+    });
+    expect(settledRunReplayRequest).toMatchObject({
+      stageId: publishStageId,
+      expectedSubject: finalIntegratedTreeSubject,
+      nativeSessionId: "publish-native-session",
+    });
+    expect(pipelines.listEffects(instance.id).filter((effect) =>
+      effect.kind === "dispatch_stage" &&
+      effect.status === "pending" &&
+      effect.idempotency_key === settledRunReplayRequest.idempotencyKey
+    )).toHaveLength(1);
   });
 
   it("leaves retryable child loop errors active for effect retry instead of parsing them as receipts", async () => {

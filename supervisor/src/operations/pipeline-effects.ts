@@ -379,29 +379,32 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     const legacyGraph = legacyGraphs[0];
     if (!legacyGraph) return;
     const ticket = deps.tickets.getByIssueId(instance.linear_issue_id);
-    if (ticket?.run_id !== attempt.run_id) return;
-    const settlement = await terminateAndSettleActor({
-      runtime: {
-        async stopResource(sandboxId, reason) {
-          const termination = await deps.runtime.stop({ providerResourceId: sandboxId }, reason);
-          if (!termination.confirmed) {
-            throw new Error(`pipeline runtime ${sandboxId} did not confirm termination`);
-          }
+    const run = deps.tickets.getRun(attempt.run_id);
+    if (ticket?.run_id && ticket.run_id !== attempt.run_id) return;
+    if (run?.status !== "stopped") {
+      const settlement = await terminateAndSettleActor({
+        runtime: {
+          async stopResource(sandboxId, reason) {
+            const termination = await deps.runtime.stop({ providerResourceId: sandboxId }, reason);
+            if (!termination.confirmed) {
+              throw new Error(`pipeline runtime ${sandboxId} did not confirm termination`);
+            }
+          },
         },
-      },
-      store: deps.tickets,
-      runId: attempt.run_id,
-      sandboxId: resource.providerResourceId,
-      owner: `aggregate-publish-restart:${attempt.id}`,
-      reason: "legacy commit-fenced publish actor replaced by canonical tree-fenced dispatch",
-      faultAttribution: null,
-      status: "stopped",
-      ticketState: "active",
-      ticketFailureTail: null,
-      quarantineOnStopFailure: true,
-    });
-    if (settlement.kind !== "settled") {
-      throw new Error(`publish attempt ${attempt.id} legacy actor could not be terminated for aggregate migration`);
+        store: deps.tickets,
+        runId: attempt.run_id,
+        sandboxId: resource.providerResourceId,
+        owner: `aggregate-publish-restart:${attempt.id}`,
+        reason: "legacy commit-fenced publish actor replaced by canonical tree-fenced dispatch",
+        faultAttribution: null,
+        status: "stopped",
+        ticketState: "active",
+        ticketFailureTail: null,
+        quarantineOnStopFailure: true,
+      });
+      if (settlement.kind !== "settled") {
+        throw new Error(`publish attempt ${attempt.id} legacy actor could not be terminated for aggregate migration`);
+      }
     }
   };
 
@@ -746,6 +749,12 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
   };
 
   const drainActivePublishReconciliations = async (): Promise<void> => {
+    const drained = new Set<string>();
+    const drainInstance = async (instance: PipelineInstance, resource: RuntimeResource, publishStageId: string): Promise<void> => {
+      if (drained.has(instance.id)) return;
+      drained.add(instance.id);
+      await drainCompletedCompositeParentsForPublish(resource, instance, publishStageId);
+    };
     const tickets = deps.tickets.listRunning();
     for (const ticket of tickets) {
       const instance = deps.store.getInstanceForSession(ticket.linear_session_id);
@@ -754,7 +763,17 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       if (!attempt || attempt.run_id !== ticket.run_id || attempt.status !== "running") continue;
       const binding = runtimeBindingFor(instance);
       if (!binding.resource || binding.status !== "active") continue;
-      await drainCompletedCompositeParentsForPublish(binding.resource, instance, attempt.stage_id);
+      await drainInstance(instance, binding.resource, attempt.stage_id);
+    }
+    for (const instance of deps.store.listActiveRuntimeInstances()) {
+      if (!isPublishStage(instance.normalized_manifest, instance.active_stage_id)) continue;
+      const attempt = deps.store.getActiveAttempt(instance.id);
+      if (!attempt || attempt.status !== "running" || !attempt.run_id) continue;
+      const run = deps.tickets.getRun(attempt.run_id);
+      if (run?.status === "running") continue;
+      const binding = runtimeBindingFor(instance);
+      if (!binding.resource || binding.status !== "active") continue;
+      await drainInstance(instance, binding.resource, attempt.stage_id);
     }
   };
 

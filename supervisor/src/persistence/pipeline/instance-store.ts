@@ -54,6 +54,7 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
   | "getRuntimeResource"
   | "setRuntimeResourceStatus"
   | "listReclaimableRuntimeResources"
+  | "listActiveRuntimeInstances"
   | "getInstanceByRuntimeResourceId"
   | "getActiveAttempt"
   | "listAttempts"
@@ -606,6 +607,16 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
           AND runtime_resource_updated_at <= ?
         ORDER BY runtime_resource_updated_at LIMIT ?
       `).all(cutoffIso, limit) as PipelineInstance[];
+    },
+    listActiveRuntimeInstances(limit = 50) {
+      const instances = db.prepare(`
+        SELECT * FROM pipeline_instances
+        WHERE runtime_resource_status = 'active'
+          AND status IN ('running', 'dispatchable')
+        ORDER BY updated_at, id LIMIT ?
+      `).all(limit) as PipelineInstance[];
+      for (const instance of instances) validatePinnedInstance(db, instance);
+      return instances;
     },
     getInstanceByRuntimeResourceId(providerResourceId) {
       return getInstanceByRuntimeResourceIdStmt.get(providerResourceId) as PipelineInstance | undefined;

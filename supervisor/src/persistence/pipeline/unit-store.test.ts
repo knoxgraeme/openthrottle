@@ -7,6 +7,7 @@ import type { GateReceiptReason } from "../../pipeline/gates.js";
 import { openDb } from "../database.js";
 import { createExecutionUnitStore, type ExecutionUnitStore } from "./unit-store.js";
 import { executionLedgerLines } from "../../pipeline/execution-publication.js";
+import { createStageRequestHash, type StageRequestEnvelope } from "../../pipeline/stage-request.js";
 
 let db: Database.Database | undefined;
 let timestamp = "2026-07-29T00:00:00.000Z";
@@ -261,6 +262,87 @@ function setup(): ReturnType<typeof createExecutionUnitStore> {
     );
   `);
   return createExecutionUnitStore(db, () => timestamp);
+}
+
+function insertPublishAttempt(input: {
+  id: string;
+  expectedSubject: string;
+  contextPolicy: StageRequestEnvelope["contextPolicy"];
+  nativeSessionId: string | null;
+}): StageRequestEnvelope {
+  db!.prepare(`
+    INSERT OR IGNORE INTO pipeline_instance_stages (
+      pipeline_instance_id, stage_id, ordinal, status, attempt_count, created_at, updated_at
+    ) VALUES ('instance-1', 'publish', 2, 'running', 1, ?, ?)
+  `).run(timestamp, timestamp);
+  const withoutFence: Omit<StageRequestEnvelope, "requestHash" | "idempotencyKey"> = {
+    protocol: "stage-executor@1",
+    pipelineInstanceId: "instance-1",
+    manifestDigest: "e".repeat(64),
+    runtimeRelease: "runtime/v1",
+    capabilityDigest: "d".repeat(64),
+    repositoryConfigDigest: "c".repeat(64),
+    stageId: "publish",
+    attemptId: input.id,
+    runId: `run-${input.id}`,
+    issueId: "issue-1",
+    sessionId: "session-1",
+    generation: 1,
+    taskType: "implement",
+    taskContext: "task",
+    transitionContext: "transition",
+    repository: "owner/repo",
+    baseCommit: "a".repeat(40),
+    baseBranch: "main",
+    branch: "ot/ope-1",
+    agent: "codex",
+    contextRevision: 1,
+    expectedSubject: input.expectedSubject,
+    contextPolicy: input.contextPolicy,
+    nativeSessionId: input.nativeSessionId,
+    capability: "ce/publish@1",
+    requiredArtifacts: ["stage_result"],
+    credentialScopes: ["repo.write"],
+    liveSteering: false,
+  };
+  const fence = createStageRequestHash(withoutFence);
+  const request = { ...withoutFence, ...fence };
+  const payload = canonicalJson(request);
+  db!.prepare(`
+    INSERT INTO pipeline_stage_attempts (
+      id, pipeline_instance_id, stage_id, attempt_ordinal, reentry_ordinal,
+      request_hash, idempotency_key, context_revision, native_context_policy,
+      planned_run_id, run_id, status, expected_subject, native_session_id,
+      request_payload, created_at, updated_at
+    ) VALUES (?, 'instance-1', 'publish', 2, 0, ?, ?, 1, ?, ?, NULL, 'pending', ?, ?, ?, ?, ?)
+  `).run(
+    input.id,
+    request.requestHash,
+    request.idempotencyKey,
+    input.contextPolicy,
+    request.runId,
+    input.expectedSubject,
+    input.nativeSessionId,
+    payload,
+    timestamp,
+    timestamp
+  );
+  db!.prepare(`
+    INSERT INTO pipeline_effect_intents (
+      id, pipeline_instance_id, transition_version, kind, idempotency_key,
+      payload, payload_hash, status, attempts, next_attempt_at, created_at
+    ) VALUES (?, 'instance-1', 100, 'dispatch_stage', ?, ?, ?, 'pending', 0, ?, ?)
+  `).run(
+    `effect-${input.id}`,
+    request.idempotencyKey,
+    payload,
+    digestNormalized(payload),
+    timestamp,
+    timestamp
+  );
+  db!.prepare("UPDATE pipeline_instances SET immutable_subject = ?, active_stage_id = 'publish' WHERE id = 'instance-1'")
+    .run(input.expectedSubject);
+  return request;
 }
 
 afterEach(() => {
@@ -1925,6 +2007,75 @@ describe("execution unit store", () => {
     events = publicationEvents("attempt-parent").filter((event) =>
       event.kind === "aggregate" || event.kind === "aggregate_correction");
     expect(events).toHaveLength(2);
+  });
+
+  it("rewrites migrated publish requests with the sealed native context policy", () => {
+    const subject = "1".repeat(40);
+    const treeSubject = "2".repeat(40);
+    for (const [policy, originalSession, migratedSession] of [
+      ["resume_required", "native-required", "native-required"],
+      ["prefer_resume", "native-preferred", null],
+      ["fresh", "native-fresh", null],
+    ] as const) {
+      const store = setup();
+      emitSingleUnitAggregate(store, subject, "legacy-hash");
+      insertPublishAttempt({
+        id: `attempt-publish-${policy}`,
+        expectedSubject: subject,
+        contextPolicy: policy,
+        nativeSessionId: originalSession,
+      });
+
+      expect(store.migrateAggregateArtifactHash({
+        parentAttemptId: "attempt-parent",
+        fromArtifactHash: "legacy-hash",
+        toArtifactHash: "canonical-hash",
+        fromSubject: subject,
+        toSubject: treeSubject,
+        publishStageId: "publish",
+      })).toBe("migrated");
+
+      const attempt = db!.prepare(`
+        SELECT native_session_id, request_payload
+        FROM pipeline_stage_attempts
+        WHERE id = ?
+      `).get(`attempt-publish-${policy}`) as { native_session_id: string | null; request_payload: string };
+      const request = JSON.parse(attempt.request_payload) as StageRequestEnvelope;
+      expect(attempt.native_session_id).toBe(migratedSession);
+      expect(request).toMatchObject({
+        contextPolicy: policy,
+        nativeSessionId: migratedSession,
+        expectedSubject: treeSubject,
+      });
+      db?.close();
+      db = undefined;
+    }
+  });
+
+  it("rejects migrated publish requests whose sealed and pinned context policies disagree", () => {
+    const store = setup();
+    const subject = "1".repeat(40);
+    emitSingleUnitAggregate(store, subject, "legacy-hash");
+    insertPublishAttempt({
+      id: "attempt-publish-policy-mismatch",
+      expectedSubject: subject,
+      contextPolicy: "resume_required",
+      nativeSessionId: "native-required",
+    });
+    db!.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET native_context_policy = 'prefer_resume'
+      WHERE id = 'attempt-publish-policy-mismatch'
+    `).run();
+
+    expect(() => store.migrateAggregateArtifactHash({
+      parentAttemptId: "attempt-parent",
+      fromArtifactHash: "legacy-hash",
+      toArtifactHash: "canonical-hash",
+      fromSubject: subject,
+      toSubject: "2".repeat(40),
+      publishStageId: "publish",
+    })).toThrow(/stage request binding mismatch/);
   });
 
   it("treats a stale aggregate marker replay as already canonical without duplicating activity", () => {

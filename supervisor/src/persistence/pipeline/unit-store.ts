@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import {
   canonicalJson,
+  type ContextPolicy,
   digestNormalized,
   type PipelineUnitPhaseBinding,
   type StageOutcome,
@@ -1362,9 +1363,23 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
   }): void {
     if (!input.publishStageId) return;
     const publishStageId = input.publishStageId;
+    const nativeSessionForMigratedRequest = (
+      policy: ContextPolicy,
+      existingNativeSessionId: string | null
+    ): string | null => {
+      if (policy === "resume_required") {
+        if (!existingNativeSessionId) {
+          throw new Error(`publish stage ${publishStageId} requires a native session for aggregate migration`);
+        }
+        return existingNativeSessionId;
+      }
+      if (policy === "prefer_resume") return null;
+      if (policy === "fresh" || policy === "none") return null;
+      throw new Error(`publish stage ${publishStageId} has unsupported native context policy ${String(policy)}`);
+    };
     const publishAttempts = input.db.prepare(`
       SELECT id, request_hash, idempotency_key, request_payload, planned_run_id,
-             expected_subject, native_session_id, status, run_id
+             expected_subject, native_context_policy, native_session_id, status, run_id
       FROM pipeline_stage_attempts
       WHERE pipeline_instance_id = ? AND stage_id = ?
         AND status NOT IN ('completed', 'canceled', 'superseded', 'failed')
@@ -1376,6 +1391,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       request_payload: string | null;
       planned_run_id: string | null;
       expected_subject: string | null;
+      native_context_policy: ContextPolicy;
       native_session_id: string | null;
       status: string;
       run_id: string | null;
@@ -1409,6 +1425,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
           request.requestHash !== attempt.request_hash ||
           request.idempotencyKey !== attempt.idempotency_key ||
           request.runId !== attempt.planned_run_id ||
+          request.contextPolicy !== attempt.native_context_policy ||
           request.nativeSessionId !== attempt.native_session_id ||
           request.expectedSubject !== attempt.expected_subject) {
         throw new Error(`publish attempt ${attempt.id} stage request binding mismatch`);
@@ -1428,7 +1445,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         ...withoutFence,
         runId: updatedRunId,
         expectedSubject: input.toSubject,
-        nativeSessionId: null,
+        nativeSessionId: nativeSessionForMigratedRequest(request.contextPolicy, attempt.native_session_id),
       };
       const updatedFence = createStageRequestHash(updatedWithoutFence);
       const updatedRequest = canonicalJson({ ...updatedWithoutFence, ...updatedFence });
@@ -1439,7 +1456,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         const attemptUpdate = input.db.prepare(`
           UPDATE pipeline_stage_attempts
           SET expected_subject = ?, request_hash = ?, idempotency_key = ?,
-              planned_run_id = ?, run_id = NULL, native_session_id = NULL,
+              planned_run_id = ?, run_id = NULL, native_session_id = ?,
               request_payload = ?, status = CASE WHEN status = 'running' THEN 'pending' ELSE status END
           WHERE id = ? AND request_hash = ? AND status NOT IN ('completed', 'canceled', 'superseded', 'failed')
         `).run(
@@ -1447,6 +1464,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
           updatedFence.requestHash,
           updatedFence.idempotencyKey,
           updatedRunId,
+          updatedWithoutFence.nativeSessionId,
           updatedRequest,
           attempt.id,
           attempt.request_hash
