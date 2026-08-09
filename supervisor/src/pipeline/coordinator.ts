@@ -168,6 +168,16 @@ function successPathIncludesPublication(manifest: PipelineManifest): boolean {
   return false;
 }
 
+function eventHasExactPublishedSubject(input: PipelineReductionInput, stage: PipelineStage): boolean {
+  if (stage.executor.kind === "provider_wait") {
+    return input.instance.published_commit !== null && input.event.subject === input.instance.published_commit;
+  }
+  if (stage.evaluator.kind === "publish_subject") {
+    return input.event.providerRevision !== undefined && input.event.subject === input.event.providerRevision;
+  }
+  return false;
+}
+
 function verifyInput(input: PipelineReductionInput): PipelineStage {
   const { manifest, instance, attempt, event } = input;
   const normalized = canonicalJson(manifest);
@@ -618,11 +628,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
   if (
     terminal === "shipped" &&
     successPathIncludesPublication(input.manifest) &&
-    (
-      stage.executor.kind !== "provider_wait" ||
-      input.instance.published_commit === null ||
-      input.event.subject !== input.instance.published_commit
-    )
+    !eventHasExactPublishedSubject(input, stage)
   ) {
     throw new Error("publishing pipeline cannot settle shipped without exact published provider evidence");
   }

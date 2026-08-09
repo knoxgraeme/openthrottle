@@ -379,6 +379,14 @@ function capabilityOrder(capability: string): number {
   ].indexOf(capability);
 }
 
+function publishContextFor(graph: GraphContract, node: GraphNode): ContextPolicy {
+  const followsStructuredAggregate = graph.nodes.some((candidate) =>
+    candidate.kind === "for_each_unit" &&
+    Object.values(candidate.transitions).some((transition) => transition.to === node.id)
+  );
+  return followsStructuredAggregate ? "prefer_resume" : "resume_required";
+}
+
 function nodeTemplate(
   graph: GraphContract,
   node: GraphNode,
@@ -403,7 +411,7 @@ function nodeTemplate(
     return {
       executor: { kind: "agent", capability: "ce/publish@1" },
       evaluator: { kind: "publish_subject", assurance: "semantic_attested", required_artifacts: ["publish_subject"] },
-      context: "resume_required",
+      context: publishContextFor(graph, node),
       live_steering: false,
       credentials: ["model.invoke", "repo.read", "repo.write", "provider.read"],
       produces: ["stage_result", "publish_subject"],

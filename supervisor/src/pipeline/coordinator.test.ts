@@ -457,6 +457,75 @@ describe("pipeline coordinator", () => {
     })).toThrow(/cannot settle shipped without exact published provider evidence/);
   });
 
+  it("allows a direct publish terminal to ship with exact publish-stage evidence", () => {
+    const { manifest, instance, attempt, stages } = setup("core/investigate@1");
+    const subject = "f".repeat(40);
+    const publishAttempt = {
+      ...attempt,
+      id: "publish-attempt",
+      stage_id: "publish",
+      request_hash: digestNormalized("publish-request"),
+      native_context_policy: "resume_required" as const,
+      expected_subject: subject,
+    };
+    const publishPayload = JSON.stringify({ details: { published_commit: subject } });
+    const stageResultPayload = JSON.stringify({ outcome: "success" });
+    const publishEvent: PipelineCoordinatorEvent = {
+      id: "direct-publish-terminal",
+      kind: "stage_result",
+      instanceId: instance.id,
+      generation: instance.generation,
+      attemptId: publishAttempt.id,
+      requestHash: publishAttempt.request_hash,
+      outcome: "success",
+      resultHash: digestNormalized(stageResultPayload),
+      subject,
+      providerRevision: subject,
+      artifacts: [
+        {
+          kind: "stage_result",
+          schemaVersion: 1,
+          assurance: "semantic_attested",
+          subject,
+          payload: stageResultPayload,
+          hash: digestNormalized(stageResultPayload),
+        },
+        {
+          kind: "publish_subject",
+          schemaVersion: 1,
+          assurance: "semantic_attested",
+          subject,
+          payload: publishPayload,
+          hash: digestNormalized(publishPayload),
+        },
+      ],
+    };
+    const publishStages = stages.map((stage) => stage.stage_id === "publish" ? { ...stage, status: "running" } : stage);
+
+    expect(reducePipelineEvent({
+      manifest,
+      instance: { ...instance, active_stage_id: "publish", status: "running" },
+      attempt: publishAttempt,
+      stages: publishStages,
+      event: publishEvent,
+    })).toMatchObject({
+      terminalOutcome: "shipped",
+      publishedCommit: subject,
+    });
+
+    expect(() => reducePipelineEvent({
+      manifest,
+      instance: { ...instance, active_stage_id: "publish", status: "running" },
+      attempt: publishAttempt,
+      stages: publishStages,
+      event: {
+        ...publishEvent,
+        subject: "e".repeat(40),
+        artifacts: publishEvent.artifacts?.map((artifact) => ({ ...artifact, subject: "e".repeat(40) })),
+      },
+    })).toThrow(/cannot settle shipped without exact published provider evidence/);
+  });
+
   it("projects notable repair stages into run notes without changing transitions", () => {
     const { pipelines, instance, attempt } = setup("core/implement@4");
     db!.prepare(`

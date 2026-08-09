@@ -288,6 +288,7 @@ describe("execution graph compiler", () => {
     expect(compiled.manifest.manifest.stages[1]).toMatchObject({
       id: "publish",
       executor: { kind: "agent", capability: "ce/publish@1" },
+      context: "prefer_resume",
       transitions: {
         success: { to: "provider" },
         semantic_repair_required: { terminal: "needs_human" },

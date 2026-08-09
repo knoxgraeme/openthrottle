@@ -1292,11 +1292,20 @@ describe("pipeline effect processor", () => {
       });
     const publishRequest = JSON.parse(
       effects.find((effect) => effect.kind === "dispatch_stage" && effect.status === "pending")!.payload
-    ) as { stageId: string; capability: string; expectedSubject: string; runId: string };
+    ) as {
+      stageId: string;
+      capability: string;
+      expectedSubject: string;
+      runId: string;
+      contextPolicy: string;
+      nativeSessionId: string | null;
+    };
     expect(publishRequest).toMatchObject({
       stageId: "publish",
       capability: "ce/publish@1",
       expectedSubject: finalIntegratedSubject,
+      contextPolicy: "prefer_resume",
+      nativeSessionId: null,
     });
     expect(tickets.getByIssueId(instance.linear_issue_id)?.run_id).toBeNull();
 
@@ -1309,6 +1318,8 @@ describe("pipeline effect processor", () => {
         stageId: "publish",
         capability: "ce/publish@1",
         expectedSubject: finalIntegratedSubject,
+        contextPolicy: "prefer_resume",
+        nativeSessionId: null,
       })
     );
     expect(tickets.getByIssueId(instance.linear_issue_id)?.run_id).toBe(publishRequest.runId);
