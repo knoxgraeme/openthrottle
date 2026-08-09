@@ -956,6 +956,109 @@ describe("pipeline coordinator", () => {
     });
   });
 
+  it("replays a persisted branching publication terminal without duplicating durable writes", () => {
+    const { pipelines, manifest, instance, attempt } = setup();
+    const branching: PipelineManifest = {
+      ...branchingPublicationManifest(manifest),
+      id: "fixture/branching-publication",
+    };
+    const normalizedManifest = canonicalJson(branching);
+    const manifestDigest = digestNormalized(normalizedManifest);
+    const subject = "f".repeat(40);
+    const publishedCommit = "a".repeat(40);
+    pipelines.acceptManifest({ manifest: branching, normalized: normalizedManifest, digest: manifestDigest });
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET pipeline_id = ?, pipeline_version = ?, manifest_digest = ?,
+          normalized_manifest = ?, authorized_capabilities = ?,
+          status = 'running', active_stage_id = 'command',
+          immutable_subject = ?, published_commit = ?, published_subject = ?
+      WHERE id = ?
+    `).run(
+      branching.id,
+      branching.version,
+      manifestDigest,
+      normalizedManifest,
+      canonicalJson([...branching.requires.capabilities].sort()),
+      subject,
+      publishedCommit,
+      subject,
+      instance.id
+    );
+    const now = "2026-08-09T00:00:00.000Z";
+    db!.prepare(`
+      UPDATE pipeline_instance_stages
+      SET ordinal = 3, status = 'running', attempt_count = 1, updated_at = ?
+      WHERE pipeline_instance_id = ? AND stage_id = 'command'
+    `).run(now, instance.id);
+    for (const [stageId, ordinal, status, attemptCount] of [
+      ["entry", 1, "passed", 1],
+      ["publish", 2, "passed", 1],
+    ] as const) {
+      db!.prepare(`
+        INSERT INTO pipeline_instance_stages (
+          pipeline_instance_id, stage_id, ordinal, status, attempt_count, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(instance.id, stageId, ordinal, status, attemptCount, now, now);
+    }
+    db!.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET stage_id = 'command', request_hash = ?, native_context_policy = 'none',
+          expected_subject = ?, status = 'running'
+      WHERE id = ?
+    `).run(digestNormalized("command-request"), subject, attempt.id);
+
+    const persistedInstance = pipelines.getInstance(instance.id)!;
+    const persistedAttempt = pipelines.getAttempt(attempt.id)!;
+    const terminal = commandTerminalEvent({
+      instance: persistedInstance,
+      attempt: persistedAttempt,
+      id: "persisted-branching-publication-terminal",
+      subject,
+    });
+
+    const completed = coordinatePipelineEvent(pipelines, terminal);
+
+    expect(completed).toMatchObject({
+      state_version: 1,
+      status: "completion_pending_publication",
+      terminal_outcome: "shipped",
+      published_commit: publishedCommit,
+      published_subject: subject,
+    });
+    const effectsAfterFirst = pipelines.listEffects(instance.id);
+    expect(effectsAfterFirst.map((effect) => effect.kind)).toEqual([
+      "provision",
+      "publish_linear",
+      "publish_github",
+      "cleanup",
+    ]);
+    const attemptsAfterFirst = db!.prepare(
+      "SELECT COUNT(*) AS count FROM pipeline_stage_attempts WHERE pipeline_instance_id = ?"
+    ).get(instance.id) as { count: number };
+    const receiptsAfterFirst = db!.prepare(
+      "SELECT COUNT(*) AS count FROM pipeline_publication_receipts WHERE pipeline_instance_id = ?"
+    ).get(instance.id) as { count: number };
+    const outboxAfterFirst = db!.prepare(
+      "SELECT COUNT(*) AS count FROM linear_outbox WHERE linear_session_id = ?"
+    ).get(instance.linear_session_id) as { count: number };
+
+    const restartedStore = createPipelineStore(db!);
+    const replay = coordinatePipelineEvent(restartedStore, terminal);
+
+    expect(replay.state_version).toBe(1);
+    expect(restartedStore.listEffects(instance.id)).toHaveLength(effectsAfterFirst.length);
+    expect(db!.prepare(
+      "SELECT COUNT(*) AS count FROM pipeline_stage_attempts WHERE pipeline_instance_id = ?"
+    ).get(instance.id)).toEqual(attemptsAfterFirst);
+    expect(db!.prepare(
+      "SELECT COUNT(*) AS count FROM pipeline_publication_receipts WHERE pipeline_instance_id = ?"
+    ).get(instance.id)).toEqual(receiptsAfterFirst);
+    expect(db!.prepare(
+      "SELECT COUNT(*) AS count FROM linear_outbox WHERE linear_session_id = ?"
+    ).get(instance.linear_session_id)).toEqual(outboxAfterFirst);
+  });
+
   it("projects notable repair stages into run notes without changing transitions", () => {
     const { pipelines, instance, attempt } = setup("core/implement@4");
     db!.prepare(`
