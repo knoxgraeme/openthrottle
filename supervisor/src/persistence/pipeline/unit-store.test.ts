@@ -1835,14 +1835,34 @@ describe("execution unit store", () => {
       artifactHash: "hash-1",
       integrationSubject: subject,
     })).toBe("emitted");
+    const emittedAt = store.getGraphForAttempt("attempt-parent")!.aggregate_emitted_at;
+    expect(() => store.migrateAggregateArtifactHash({
+      parentAttemptId: "attempt-parent",
+      fromArtifactHash: "stale-hash",
+      toArtifactHash: "hash-2",
+    })).toThrow(/aggregate marker does not match migration source/);
+    expect(store.migrateAggregateArtifactHash({
+      parentAttemptId: "attempt-parent",
+      fromArtifactHash: "hash-1",
+      toArtifactHash: "hash-2",
+    })).toBe("migrated");
+    expect(store.getStructuredExecutionPublication("attempt-parent")?.graph).toMatchObject({
+      aggregate_artifact_hash: "hash-2",
+      aggregate_emitted_at: emittedAt,
+    });
+    expect(store.migrateAggregateArtifactHash({
+      parentAttemptId: "attempt-parent",
+      fromArtifactHash: "hash-1",
+      toArtifactHash: "hash-2",
+    })).toBe("already_canonical");
     expect(store.emitAggregateOnce({
       parentAttemptId: "attempt-parent",
-      artifactHash: "hash-1",
+      artifactHash: "hash-2",
       integrationSubject: subject,
     })).toBe("already_emitted");
     expect(() => store.emitAggregateOnce({
       parentAttemptId: "attempt-parent",
-      artifactHash: "hash-2",
+      artifactHash: "hash-3",
       integrationSubject: "222",
     })).toThrow(/different aggregate/);
     expect(store.stopActiveWork({

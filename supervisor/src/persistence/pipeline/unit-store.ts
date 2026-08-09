@@ -222,6 +222,11 @@ export interface ExecutionUnitStore {
     integrationSubject: string | null;
     requireFinalReview?: boolean;
   }): "emitted" | "already_emitted";
+  migrateAggregateArtifactHash(input: {
+    parentAttemptId: string;
+    fromArtifactHash: string;
+    toArtifactHash: string;
+  }): "migrated" | "already_canonical";
   recordGateReceipt(input: {
     actionId: string;
     gateKind: ExecutionGateKind;
@@ -1199,6 +1204,31 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     return "emitted";
   });
 
+  const migrateAggregateArtifactHash = db.transaction((
+    input: Parameters<ExecutionUnitStore["migrateAggregateArtifactHash"]>[0]
+  ): "migrated" | "already_canonical" => {
+    const graph = graphStmt.get(input.parentAttemptId) as ExecutionUnitGraph | undefined;
+    if (!graph) throw new Error(`execution graph for parent attempt ${input.parentAttemptId} is missing`);
+    if (!graph.aggregate_emitted_at) {
+      throw new Error(`execution graph ${graph.id} has no aggregate marker to migrate`);
+    }
+    if (graph.aggregate_artifact_hash === input.toArtifactHash) return "already_canonical";
+    if (graph.aggregate_artifact_hash !== input.fromArtifactHash) {
+      throw new Error(`execution graph ${graph.id} aggregate marker does not match migration source`);
+    }
+    const update = db.prepare(`
+      UPDATE execution_graphs
+      SET aggregate_artifact_hash = ?, updated_at = ?
+      WHERE parent_attempt_id = ?
+        AND aggregate_emitted_at IS NOT NULL
+        AND aggregate_artifact_hash = ?
+    `).run(input.toArtifactHash, now(), input.parentAttemptId, input.fromArtifactHash);
+    if (update.changes === 1) return "migrated";
+    const current = graphStmt.get(input.parentAttemptId) as ExecutionUnitGraph | undefined;
+    if (current?.aggregate_artifact_hash === input.toArtifactHash) return "already_canonical";
+    throw new Error(`execution graph ${graph.id} aggregate marker compare-and-set failed`);
+  });
+
   const recordGateReceipt = db.transaction((
     input: Parameters<ExecutionUnitStore["recordGateReceipt"]>[0]
   ): "recorded" | "already_recorded" => {
@@ -1540,6 +1570,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     failUnitAction,
     stopRetryableUnitAction,
     emitAggregateOnce,
+    migrateAggregateArtifactHash,
     recordGateReceipt,
     listGateReceipts(parentAttemptId) {
       return db.prepare(`

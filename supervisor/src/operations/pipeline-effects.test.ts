@@ -15,6 +15,7 @@ import {
 } from "../pipeline/manifest.js";
 import { parseAndCompileExecutionGraph } from "../pipeline/execution-graph.js";
 import { buildAggregateStageEvent } from "../pipeline/unit-coordinator.js";
+import { executionLedgerLines } from "../pipeline/execution-publication.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { buildInstalledRuntimeDescriptor, type SandboxAutostopRuntime, type SandboxRuntime } from "../__fixtures__/runtime.js";
 import type { ExecutionGateDecision } from "../pipeline/execution-gates.js";
@@ -1340,6 +1341,7 @@ describe("pipeline effect processor", () => {
       aggregate_emitted_at: expect.any(String),
       aggregate_artifact_hash: expect.any(String),
     });
+    const canonicalGraphResultHash = pipelines.getGraphForAttempt(attempt.id)!.aggregate_artifact_hash!;
     expect(pipelines.getAttempt(attempt.id)).toMatchObject({ status: "running" });
 
     const legacyCommitSubjectAggregate = buildAggregateStageEvent({
@@ -1371,8 +1373,14 @@ describe("pipeline effect processor", () => {
     db!.prepare("UPDATE pipeline_instances SET status = 'publication_blocked' WHERE id = ?").run(instance.id);
     await expect(processor.drain()).rejects.toThrow(/pipeline publication is blocked/);
     expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
-      aggregate_artifact_hash: legacyGraphResult!.hash,
+      aggregate_artifact_hash: canonicalGraphResultHash,
     });
+    const structuredPublication = pipelines.getStructuredExecutionPublicationForInstance(instance.id)!;
+    expect(structuredPublication.graph.aggregate_artifact_hash).toBe(canonicalGraphResultHash);
+    expect(executionLedgerLines(structuredPublication))
+      .toEqual(expect.arrayContaining([
+        expect.stringContaining(`aggregate=${canonicalGraphResultHash}`),
+      ]));
 
     db!.prepare("UPDATE pipeline_instances SET status = ? WHERE id = ?").run(beforeAggregateStatus, instance.id);
 
@@ -1380,6 +1388,7 @@ describe("pipeline effect processor", () => {
     const aggregate = pipelines.getGraphForAttempt(attempt.id);
     expect(aggregate).toMatchObject({
       aggregate_emitted_at: expect.any(String),
+      aggregate_artifact_hash: canonicalGraphResultHash,
       integration_subject: finalIntegratedSubject,
     });
     expect(pipelines.getInstance(instance.id)).toMatchObject({

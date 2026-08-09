@@ -1388,6 +1388,11 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           if (!legacyGraphResult || graph.aggregate_artifact_hash !== legacyGraphResult.hash) {
             throw new Error(`structured aggregate ${parentAttemptId} replay hash does not match durable graph marker`);
           }
+          deps.store.migrateAggregateArtifactHash({
+            parentAttemptId,
+            fromArtifactHash: legacyGraphResult.hash,
+            toArtifactHash: graphResult.hash,
+          });
         }
         completeParentStage(event);
         return;
