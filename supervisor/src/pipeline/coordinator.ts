@@ -176,8 +176,7 @@ function eventHasExactPublishedSubject(input: PipelineReductionInput, stage: Pip
     return input.event.providerRevision !== undefined && input.event.subject === input.event.providerRevision;
   }
   return input.instance.published_commit !== null &&
-    input.instance.immutable_subject !== null &&
-    input.event.subject === input.instance.immutable_subject;
+    input.event.subject === input.instance.published_commit;
 }
 
 function shouldClearPublishedCommit(input: PipelineReductionInput): boolean {

@@ -574,7 +574,7 @@ describe("pipeline coordinator", () => {
   ])("settles a post-publication terminal %s stage from persisted exact publication evidence", (stageId, postStage) => {
     const { manifest, instance, attempt, stages } = setup("core/investigate@1");
     const subject = "f".repeat(40);
-    const publishedCommit = "c".repeat(40);
+    const stalePublishedCommit = "c".repeat(40);
     const payload = JSON.stringify({ outcome: "success" });
     const resultHash = digestNormalized(payload);
     const postPublicationManifest: PipelineManifest = {
@@ -636,11 +636,10 @@ describe("pipeline coordinator", () => {
       active_stage_id: stageId,
       status: "running" as const,
       immutable_subject: subject,
-      published_commit: publishedCommit,
+      published_commit: subject,
       manifest_digest: digestNormalized(canonicalJson(postPublicationManifest)),
       normalized_manifest: canonicalJson(postPublicationManifest),
     };
-    expect(subject).not.toBe(publishedCommit);
 
     expect(reducePipelineEvent({
       manifest: postPublicationManifest,
@@ -663,7 +662,7 @@ describe("pipeline coordinator", () => {
 
     expect(() => reducePipelineEvent({
       manifest: postPublicationManifest,
-      instance: { ...postInstance, immutable_subject: "e".repeat(40) },
+      instance: { ...postInstance, published_commit: stalePublishedCommit },
       attempt: postAttempt,
       stages,
       event: exactEvent,
