@@ -8,7 +8,7 @@ graphs:
     ref: core/simple@1
   - id: structured
     kind: builtin
-    ref: core/structured@1
+    ref: core/structured@2
 agent: codex
 commands:
   test: npm run typecheck --prefix contracts && npm run build --prefix contracts && npm run typecheck --prefix supervisor && npm run typecheck --prefix cli && npm run build --prefix supervisor && npm run build --prefix cli && npm test --prefix contracts && npm test --prefix supervisor && npm test --prefix cli && npm test --prefix sandbox

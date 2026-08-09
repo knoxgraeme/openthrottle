@@ -1,7 +1,8 @@
 import type Database from "better-sqlite3";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   canonicalJson,
@@ -9,6 +10,7 @@ import {
   loadPipelineCatalog,
   validatePipelineManifest,
 } from "../../pipeline/manifest.js";
+import { parseAndCompileExecutionGraph } from "../../pipeline/execution-graph.js";
 import { buildInstalledRuntimeDescriptor, loadRuntimeCapabilityDescriptor } from "../../__fixtures__/runtime.js";
 import { openDb } from "../database.js";
 import { createPipelineStore } from "./create-store.js";
@@ -25,6 +27,8 @@ import {
 describe("pipeline catalog store", () => {
   let db: Database.Database | undefined;
   const temporaryDirectories: string[] = [];
+  const structuredV1GraphPath = fileURLToPath(new URL("../../../graphs/structured-v1.json", import.meta.url));
+  const structuredV2GraphPath = fileURLToPath(new URL("../../../graphs/structured-v2.json", import.meta.url));
 
   afterEach(() => {
     db?.close();
@@ -98,6 +102,39 @@ describe("pipeline catalog store", () => {
     }
     expect(pipelines.getInstanceForSession("session-v1")?.pipeline_version).toBe(1);
     expect(pipelines.getInstanceForSession("session-v2")?.pipeline_version).toBe(3);
+  });
+
+  it("keeps legacy structured v1 immutable while admitting repaired structured v2", () => {
+    db = openDb(":memory:");
+    const pipelines = createPipelineStore(db);
+    const runtimeDescriptor = buildInstalledRuntimeDescriptor("structured-catalog-test/v1");
+    pipelines.acceptRuntimeDescriptor(runtimeDescriptor);
+    const legacyV1 = parseAndCompileExecutionGraph(readFileSync(structuredV1GraphPath, "utf8"), {
+      source: structuredV1GraphPath,
+      id: "builtin/structured",
+      version: 1,
+      runtime: runtimeDescriptor.descriptor,
+    }).manifest;
+    const repairedV2 = parseAndCompileExecutionGraph(readFileSync(structuredV2GraphPath, "utf8"), {
+      source: structuredV2GraphPath,
+      id: "builtin/structured",
+      version: 2,
+      runtime: runtimeDescriptor.descriptor,
+    }).manifest;
+
+    pipelines.acceptManifest(legacyV1);
+    pipelines.acceptManifest(repairedV2);
+    expect(() => pipelines.acceptManifest(repairedV2)).not.toThrow();
+
+    expect(db.prepare(`
+      SELECT pipeline_id, version, digest FROM pipeline_catalog_entries
+      WHERE pipeline_id = 'builtin/structured'
+      ORDER BY version
+    `).all()).toEqual([
+      { pipeline_id: "builtin/structured", version: 1, digest: legacyV1.digest },
+      { pipeline_id: "builtin/structured", version: 2, digest: repairedV2.digest },
+    ]);
+    expect(legacyV1.digest).not.toBe(repairedV2.digest);
   });
 
   it("revalidates pinned hashes and restricts deletion of audit-bearing parents", () => {

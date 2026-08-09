@@ -525,7 +525,7 @@ graphs:
     ref: core/simple@1
   - id: structured
     kind: builtin
-    ref: core/structured@1
+    ref: core/structured@2
 pipelines: { implement: implement, structured: fixture-command }
 intents:
   implement:
@@ -544,7 +544,7 @@ intents:
     });
     expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
       pipeline_id: "builtin/structured",
-      pipeline_version: 1,
+      pipeline_version: 2,
       active_stage_id: "units",
     });
   });
@@ -568,7 +568,7 @@ graphs:
     ref: core/simple@1
   - id: structured
     kind: builtin
-    ref: core/structured@1
+    ref: core/structured@2
 pipelines: { implement: implement, structured: fixture-command }
 intents:
   implement:
@@ -605,7 +605,7 @@ graphs:
     ref: core/simple@1
   - id: structured
     kind: builtin
-    ref: core/structured@1
+    ref: core/structured@2
 pipelines: { implement: implement, structured: fixture-command }
 intents:
   implement:
@@ -699,7 +699,7 @@ graphs:
     ref: core/simple@1
   - id: structured
     kind: builtin
-    ref: core/structured@1
+    ref: core/structured@2
 pipelines: { implement: implement }
 intents:
   implement:
@@ -747,7 +747,7 @@ graphs:
     ref: core/simple@1
   - id: structured
     kind: builtin
-    ref: core/structured@1
+    ref: core/structured@2
 pipelines: { implement: implement }
 intents:
   implement:
@@ -834,7 +834,7 @@ graphs:
     ref: core/simple@1
   - id: structured
     kind: builtin
-    ref: core/structured@1
+    ref: core/structured@2
 pipelines: { implement: implement }
 intents:
   implement:
@@ -979,7 +979,7 @@ graphs:
     ref: core/simple@1
   - id: structured
     kind: builtin
-    ref: core/structured@1
+    ref: core/structured@2
 pipelines: { implement: implement }
 intents:
   implement:
@@ -1042,7 +1042,7 @@ graphs:
     ref: core/simple@1
   - id: structured
     kind: builtin
-    ref: core/structured@1
+    ref: core/structured@2
 pipelines: { implement: implement }
 intents:
   implement:
@@ -1070,7 +1070,7 @@ intents:
     });
     expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
       pipeline_id: "builtin/structured",
-      pipeline_version: 1,
+      pipeline_version: 2,
       active_stage_id: "units",
     });
     const attempt = pipelines.getActiveAttempt(pipelines.getInstanceForSession("session-1")!.id)!;
@@ -1274,7 +1274,7 @@ graphs:
     ref: core/simple@1
   - id: structured
     kind: builtin
-    ref: core/structured@1
+    ref: core/structured@2
 pipelines: { implement: implement }
 intents:
   implement:
@@ -1330,7 +1330,7 @@ graphs:
     ref: core/simple@1
   - id: structured
     kind: builtin
-    ref: core/structured@1
+    ref: core/structured@2
 pipelines: { implement: implement }
 intents:
   implement:
@@ -1381,7 +1381,7 @@ graphs:
     ref: core/simple@1
   - id: structured
     kind: builtin
-    ref: core/structured@1
+    ref: core/structured@2
 pipelines: { implement: implement }
 intents:
   implement:
@@ -1982,7 +1982,7 @@ intents:
       JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }, null, 2),
       "```",
     ].join("\n");
-    const { tickets } = await run(
+    const { tickets, pipelines } = await run(
       `schema: openthrottle.config/v1
 default_graph: simple
 graphs:
@@ -1991,7 +1991,7 @@ graphs:
     ref: core/simple@1
   - id: structured
     kind: builtin
-    ref: core/structured@1
+    ref: core/structured@2
 pipelines: { implement: implement }
 intents:
   implement:
@@ -2008,8 +2008,107 @@ intents:
       sandbox_id: null,
       run_id: null,
     });
+    expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
+      pipeline_id: "builtin/structured",
+      pipeline_version: 2,
+      active_stage_id: "units",
+    });
+    const manifest = JSON.parse(pipelines.getInstanceForSession("session-1")!.normalized_manifest) as {
+      stages: Array<{ id: string; transitions: { success: unknown } }>;
+    };
+    expect(manifest.stages.map((stage) => stage.id)).toEqual(["units", "publish", "provider"]);
+    expect(manifest.stages[0]?.transitions.success).toEqual({ to: "publish" });
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(1);
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_stage_attempts").pluck().get()).toBe(1);
+  });
+
+  it("admits explicit legacy structured v1 without upgrading its digest or behavior", async () => {
+    const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
+    executionPlan.graph_id = "structured";
+    const context = [
+      "# Structured work",
+      "",
+      "```json openthrottle.execution-plan/v1",
+      JSON.stringify(executionPlan, null, 2),
+      "```",
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }, null, 2),
+      "```",
+    ].join("\n");
+    const config = `schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: structured
+    kind: builtin
+    ref: core/structured@1
+pipelines: { implement: implement }
+intents:
+  implement:
+    default_graph: simple
+    allowed_graphs: [simple, structured]
+`;
+
+    const first = await run(config, {}, shippedCatalogPath, payload("session-1", "issue-1", "OT-1", context));
+    const legacyInstance = first.pipelines.getInstanceForSession("session-1")!;
+    const legacyManifest = JSON.parse(legacyInstance.normalized_manifest) as {
+      stages: Array<{ id: string; transitions: { success: unknown } }>;
+    };
+    const legacyDigest = legacyInstance.manifest_digest;
+    expect(legacyInstance).toMatchObject({
+      pipeline_id: "builtin/structured",
+      pipeline_version: 1,
+      active_stage_id: "units",
+    });
+    expect(legacyManifest.stages.map((stage) => stage.id)).toEqual(["units"]);
+    expect(legacyManifest.stages[0]?.transitions.success).toEqual({ terminal: "shipped" });
+
+    db!.close();
+    db = undefined;
+    const second = await run(config, {}, shippedCatalogPath, payload("session-2", "issue-2", "OT-2", context));
+    expect(second.pipelines.getInstanceForSession("session-2")?.manifest_digest).toBe(legacyDigest);
+  });
+
+  it("fails closed for unknown built-in structured versions", async () => {
+    const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
+    executionPlan.graph_id = "structured";
+    const context = [
+      "# Structured work",
+      "",
+      "```json openthrottle.execution-plan/v1",
+      JSON.stringify(executionPlan, null, 2),
+      "```",
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }, null, 2),
+      "```",
+    ].join("\n");
+    const { tickets } = await run(
+      `schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: structured
+    kind: builtin
+    ref: core/structured@3
+pipelines: { implement: implement }
+intents:
+  implement:
+    default_graph: simple
+    allowed_graphs: [simple, structured]
+`,
+      {},
+      shippedCatalogPath,
+      payload("session-1", "issue-1", "OT-1", context)
+    );
+
+    expect(tickets.getByIssueId("issue-1")).toMatchObject({ state: "error" });
+    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(payloads.some((entry) => entry.includes("unknown built-in graph reference core/structured@3"))).toBe(true);
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
   });
 
   it("bounds the complete sealed structured child envelope before provisioning", async () => {
@@ -2022,7 +2121,7 @@ graphs:
     ref: core/simple@1
   - id: structured
     kind: builtin
-    ref: core/structured@1
+    ref: core/structured@2
 pipelines: { implement: implement }
 intents:
   implement:
@@ -2091,7 +2190,7 @@ graphs:
     ref: core/simple@1
   - id: structured
     kind: builtin
-    ref: core/structured@1
+    ref: core/structured@2
 pipelines: { implement: implement }
 intents:
   implement:

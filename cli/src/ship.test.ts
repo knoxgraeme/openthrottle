@@ -37,7 +37,7 @@ function writeStructuredConfig(
       default_graph: defaultGraph,
       graphs: [
         { id: "simple", kind: "builtin", ref: "core/simple@1" },
-        { id: "structured", kind: "builtin", ref: "core/structured@1" },
+        { id: "structured", kind: "builtin", ref: "core/structured@2" },
       ],
       intents: {
         implement: { default_graph: defaultGraph, allowed_graphs: allowedGraphs },
