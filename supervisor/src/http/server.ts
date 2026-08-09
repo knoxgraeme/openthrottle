@@ -234,7 +234,8 @@ export function createServerWebhookDeliveryProcessor(deps: {
         deps.store,
         activityPublisher,
         parseGithubWebhook(delivery.event_name ?? undefined, delivery.payload),
-        deps.pipelineCoordinator.store
+        deps.pipelineCoordinator.store,
+        deps.pipelineCoordinator.reconcileWaitingProviderSuccessor
       );
       await deps.pipelineCoordinator.drainEffects?.();
     },

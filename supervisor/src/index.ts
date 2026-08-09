@@ -90,6 +90,8 @@ async function main() {
     runtime: runtimeCapabilities,
     store: pipelineStore,
     drainEffects: () => pipelineEffectProcessor.drain(),
+    reconcileWaitingProviderSuccessor: (instanceId: string) =>
+      pipelineEffectProcessor.reconcileWaitingProviderSuccessor(instanceId),
   };
   const githubPublicationProcessor = createGithubPublicationProcessor({
     store: pipelineStore,
@@ -133,8 +135,14 @@ async function main() {
   });
   const drainLinearAndDeferredProvider = async () => {
     await linearOutboxProcessor.drain();
-    const deferred = drainDeferredProviderEvidence(pipelineStore);
-    const feedback = drainPipelineFeedbackSnapshots(pipelineStore, store);
+    const deferred = await drainDeferredProviderEvidence(pipelineStore, {
+      reconcileWaitingProviderSuccessor: (instanceId) =>
+        pipelineEffectProcessor.reconcileWaitingProviderSuccessor(instanceId),
+    });
+    const feedback = await drainPipelineFeedbackSnapshots(pipelineStore, store, {
+      reconcileWaitingProviderSuccessor: (instanceId) =>
+        pipelineEffectProcessor.reconcileWaitingProviderSuccessor(instanceId),
+    });
     if (deferred + feedback > 0) {
       await pipelineEffectProcessor.drain();
     }

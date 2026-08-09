@@ -17,7 +17,9 @@ import {
   pipelineIsTerminal,
   processPipelineFeedbackSnapshot,
   providerStageCanReceive,
+  reconcileProviderWaitBeforeEvidence,
   recordPipelineProviderEvent,
+  type WaitingProviderReconciler,
   type PipelineProviderOutcome,
 } from "../../app/provider-feedback.js";
 import { sanitizeText } from "../../shared/sanitize.js";
@@ -28,7 +30,7 @@ type ProviderFinding = {
   summary: string;
 };
 
-export function routePipelineProviderEvent(params: {
+export async function routePipelineProviderEvent(params: {
   pipelines: PipelineStore;
   store: SupervisorStore;
   ticket: NonNullable<ReturnType<SupervisorStore["getByIssueId"]>>;
@@ -40,9 +42,16 @@ export function routePipelineProviderEvent(params: {
   payload: Record<string, unknown>;
   headSha: string | undefined;
   pullRequestUrl?: string;
-}): boolean {
-  const instance = params.pipelines.getInstanceForSession(params.ticket.linear_session_id);
-  if (!instance) return false;
+  reconcileWaitingProviderSuccessor?: WaitingProviderReconciler;
+}): Promise<boolean> {
+  const listedInstance = params.pipelines.getInstanceForSession(params.ticket.linear_session_id);
+  if (!listedInstance) return false;
+  const instance = await reconcileProviderWaitBeforeEvidence({
+    pipelines: params.pipelines,
+    instanceId: listedInstance.id,
+    currentInstance: listedInstance,
+    reconcileWaitingProviderSuccessor: params.reconcileWaitingProviderSuccessor,
+  });
   if (params.pullRequestUrl && params.ticket.pr_url && params.pullRequestUrl !== params.ticket.pr_url) {
     return true;
   }
@@ -67,12 +76,13 @@ export function routePipelineProviderEvent(params: {
       pullRequestUrl: params.pullRequestUrl,
     });
     if (canReceive) {
-      processPipelineFeedbackSnapshot({
+      await processPipelineFeedbackSnapshot({
         pipelines: params.pipelines,
         store: params.store,
         instance,
         snapshot,
         drainSource: "github-webhook",
+        reconcileWaitingProviderSuccessor: params.reconcileWaitingProviderSuccessor,
       });
     }
     return true;
@@ -265,7 +275,8 @@ export async function handleGithubEvent(
   store: SupervisorStore,
   activityPublisher: ActivityPublicationPort,
   event: GithubWebhookEvent,
-  pipelines: PipelineStore
+  pipelines: PipelineStore,
+  reconcileWaitingProviderSuccessor?: WaitingProviderReconciler
 ): Promise<void> {
   if (event.kind === "pull_request") {
     const branch = event.pull_request.head.ref;
@@ -282,7 +293,7 @@ export async function handleGithubEvent(
       }
     }
     if (event.action === "synchronize" && event.pull_request.head.sha) {
-      routePipelineProviderEvent({
+      await routePipelineProviderEvent({
         pipelines,
         store,
         ticket,
@@ -298,6 +309,7 @@ export async function handleGithubEvent(
         payload: { kind: "pull_request", action: "synchronize" },
         headSha: event.pull_request.head.sha,
         pullRequestUrl: event.pull_request.html_url,
+        reconcileWaitingProviderSuccessor,
       });
     }
     if (event.action === "closed") {
@@ -311,7 +323,7 @@ export async function handleGithubEvent(
         setAuthoritativeGithubHead(store, ticket.linear_issue_id, event.pull_request.head.sha);
       }
       store.setPrUrl(ticket.linear_issue_id, event.pull_request.html_url);
-      const routedPipeline = routePipelineProviderEvent({
+      const routedPipeline = await routePipelineProviderEvent({
         pipelines,
         store,
         ticket,
@@ -322,6 +334,7 @@ export async function handleGithubEvent(
         payload: { kind: "pull_request", action: "closed", merged: event.pull_request.merged },
         headSha: event.pull_request.head.sha ?? store.getSetting(`github-head:${ticket.linear_issue_id}`),
         pullRequestUrl: event.pull_request.html_url,
+        reconcileWaitingProviderSuccessor,
       });
       const currentPipeline = routedPipeline
         ? pipelines.getInstanceForSession(ticket.linear_session_id)
@@ -396,7 +409,7 @@ export async function handleGithubEvent(
     } else if (!store.getSetting(`github-head:${ticket.linear_issue_id}`)) {
       store.setSetting(`github-head:${ticket.linear_issue_id}`, headSha);
     }
-    routePipelineProviderEvent({
+    await routePipelineProviderEvent({
       pipelines,
       store,
       ticket,
@@ -407,6 +420,7 @@ export async function handleGithubEvent(
       payload: { kind: "pull_request_review", state: event.review.state, head_sha: headSha },
       headSha,
       pullRequestUrl: event.pull_request.html_url,
+      reconcileWaitingProviderSuccessor,
     });
     return;
   }
@@ -435,7 +449,7 @@ export async function handleGithubEvent(
     }, ticket.linear_issue_id);
     const headSha = store.getSetting(`github-head:${ticket.linear_issue_id}`) ??
       `unknown:${ticket.branch}`;
-    routePipelineProviderEvent({
+    await routePipelineProviderEvent({
       pipelines,
       store,
       ticket,
@@ -445,6 +459,7 @@ export async function handleGithubEvent(
       evidence: [event.comment.html_url],
       payload: { kind: "issue_comment", head_sha: headSha },
       headSha,
+      reconcileWaitingProviderSuccessor,
     });
     return;
   }
@@ -505,7 +520,7 @@ export async function handleGithubEvent(
       workflowRunId: ci.workflowRunId,
       workflowName: ci.name,
     });
-    routePipelineProviderEvent({
+    await routePipelineProviderEvent({
       pipelines,
       store,
       ticket,
@@ -531,6 +546,7 @@ export async function handleGithubEvent(
         ...(enrichment.note === null ? {} : { enrichment_note: enrichment.note }),
       },
       headSha: ci.headSha,
+      reconcileWaitingProviderSuccessor,
     });
   }
 }

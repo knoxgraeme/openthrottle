@@ -367,6 +367,90 @@ describe("pipeline instance store", () => {
     expect(seen.has(tail.id)).toBe(true);
   });
 
+  it("pages waiting-provider reconciliation candidates without offset skips or running-instance starvation", () => {
+    const setup = setupPipelineStore();
+    db = setup.db;
+    const { tickets, pipelines, catalog, snapshot } = setup;
+    const manifest = catalog.manifests.get("fixture/command@1")!;
+    const pipeline = {
+      repository: "owner/repo",
+      baseCommit: "a".repeat(40),
+      manifest,
+      repositoryConfig: snapshot,
+      runtime,
+      authorizedCapabilities: manifest.manifest.requires.capabilities,
+      taskType: "implement" as const,
+    };
+    const sameTimestamp = "2026-08-09T20:10:00.000Z";
+    const laterTimestamp = "2026-08-09T20:11:00.000Z";
+
+    for (let index = 0; index < 55; index += 1) {
+      const suffix = index.toString().padStart(2, "0");
+      tickets.upsert({ ...ticket(`wait-page-session-${suffix}`, `wait-page-issue-${suffix}`), pipeline });
+      const instance = pipelines.getInstanceForSession(`wait-page-session-${suffix}`)!;
+      pipelines.bindRuntimeResource(instance.id, "daytona", `sandbox-wait-page-${suffix}`);
+      db!.prepare(`
+        UPDATE pipeline_instances
+        SET status = 'waiting_provider', updated_at = ?, runtime_resource_status = 'active',
+            runtime_resource_updated_at = ?
+        WHERE id = ?
+      `).run(sameTimestamp, sameTimestamp, instance.id);
+      db!.prepare(`
+        UPDATE pipeline_stage_attempts
+        SET status = 'running'
+        WHERE pipeline_instance_id = ? AND stage_id = ?
+      `).run(instance.id, instance.active_stage_id);
+    }
+    for (let index = 0; index < 75; index += 1) {
+      const suffix = index.toString().padStart(2, "0");
+      tickets.upsert({ ...ticket(`running-noise-session-${suffix}`, `running-noise-issue-${suffix}`), pipeline });
+      const instance = pipelines.getInstanceForSession(`running-noise-session-${suffix}`)!;
+      pipelines.bindRuntimeResource(instance.id, "daytona", `sandbox-running-noise-${suffix}`);
+      db!.prepare(`
+        UPDATE pipeline_instances
+        SET status = 'running', updated_at = ?, runtime_resource_status = 'active',
+            runtime_resource_updated_at = ?
+        WHERE id = ?
+      `).run(sameTimestamp, sameTimestamp, instance.id);
+    }
+    tickets.upsert({ ...ticket("wait-page-session-tail", "wait-page-issue-tail"), pipeline });
+    const tail = pipelines.getInstanceForSession("wait-page-session-tail")!;
+    pipelines.bindRuntimeResource(tail.id, "daytona", "sandbox-wait-page-tail");
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'waiting_provider', updated_at = ?, runtime_resource_status = 'active',
+          runtime_resource_updated_at = ?
+      WHERE id = ?
+    `).run(laterTimestamp, laterTimestamp, tail.id);
+    db!.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET status = 'running'
+      WHERE pipeline_instance_id = ? AND stage_id = ?
+    `).run(tail.id, tail.active_stage_id);
+
+    const first = pipelines.listWaitingProviderInstancesAfter(null, 50);
+    expect(first).toHaveLength(50);
+    expect(new Set(first.map((instance) => instance.status))).toEqual(new Set(["waiting_provider"]));
+    const cursor = { updatedAt: first.at(-1)!.updated_at, id: first.at(-1)!.id };
+    for (const instance of first) {
+      db!.prepare("UPDATE pipeline_instances SET updated_at = ? WHERE id = ?")
+        .run("2026-08-09T20:12:00.000Z", instance.id);
+    }
+
+    const seen = new Set(first.map((instance) => instance.id));
+    let nextCursor = cursor;
+    while (true) {
+      const page = pipelines.listWaitingProviderInstancesAfter(nextCursor, 50);
+      if (page.length === 0) break;
+      for (const instance of page) {
+        seen.add(instance.id);
+        nextCursor = { updatedAt: instance.updated_at, id: instance.id };
+      }
+    }
+    expect(seen.size).toBe(56);
+    expect(seen.has(tail.id)).toBe(true);
+  });
+
   it("recovers the same pinned state and pending effects from a file-backed restart", () => {
     const directory = mkdtempSync(join(tmpdir(), "openthrottle-pipeline-store-"));
     temporaryDirectories.push(directory);

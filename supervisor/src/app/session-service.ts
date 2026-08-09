@@ -26,6 +26,7 @@ export interface PipelineCoordinatorContext {
   runtime: ValidatedRuntimeCapabilityDescriptor;
   store: PipelineStore;
   drainEffects?: () => Promise<void>;
+  reconcileWaitingProviderSuccessor?: (instanceId: string) => Promise<void>;
 }
 
 export async function handleLinearEvent(

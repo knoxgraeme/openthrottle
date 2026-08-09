@@ -67,6 +67,7 @@ function classifyEffectError(message: string): EffectErrorClass {
 
 export interface PipelineEffectProcessor {
   drain(): Promise<void>;
+  reconcileWaitingProviderSuccessor(instanceId: string): Promise<void>;
 }
 
 interface PipelineEffectProcessorDeps {
@@ -477,6 +478,18 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     }
   };
 
+  const reconcileWaitingProviderSuccessor = async (instanceId: string): Promise<void> => {
+    const instance = deps.store.getInstance(instanceId);
+    if (!instance || instance.status !== "waiting_provider" || !instance.active_stage_id) return;
+    const attempt = deps.store.getActiveAttempt(instance.id);
+    if (!attempt || attempt.stage_id !== instance.active_stage_id) return;
+    const stage = stageById(instance.normalized_manifest, attempt.stage_id);
+    if (!stage || stage.executor.kind !== "provider_wait") return;
+    const resource = runtimeBindingFor(instance).resource;
+    if (!resource) return;
+    await drainCompletedCompositeParentsForSuccessor(resource, instance, attempt.stage_id);
+  };
+
   const isCurrentIdleWait = (instanceId: string, control: IdleEffectControl): boolean => {
     const current = deps.store.getInstance(instanceId);
     const activeAttempt = deps.store.getActiveAttempt(instanceId);
@@ -794,6 +807,19 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       }
       if (activeInstances.length < ACTIVE_RUNTIME_RECONCILIATION_PAGE_SIZE) break;
     }
+    cursor = null;
+    while (true) {
+      const waitingInstances = deps.store.listWaitingProviderInstancesAfter(
+        cursor,
+        ACTIVE_RUNTIME_RECONCILIATION_PAGE_SIZE
+      );
+      if (waitingInstances.length === 0) break;
+      for (const instance of waitingInstances) {
+        cursor = { updatedAt: instance.updated_at, id: instance.id };
+        await reconcileWaitingProviderSuccessor(instance.id);
+      }
+      if (waitingInstances.length < ACTIVE_RUNTIME_RECONCILIATION_PAGE_SIZE) break;
+    }
   };
 
   const enqueueCapacityWaitActivity = (effect: PipelineEffectIntent, message: string): void => {
@@ -914,6 +940,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
   };
 
   return {
+    reconcileWaitingProviderSuccessor,
     async drain() {
       if (draining) return;
       draining = true;

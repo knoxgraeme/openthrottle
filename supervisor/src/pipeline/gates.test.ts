@@ -456,7 +456,7 @@ describe("deterministic supervisor stage gates", () => {
     return instance;
   }
 
-  function settleRepairRoundPublishes(fixture: Fixture, rounds: number): PipelineInstance {
+  async function settleRepairRoundPublishes(fixture: Fixture, rounds: number): Promise<PipelineInstance> {
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
     let instance = fixture.instance;
     let previousSubject = fixture.instance.base_commit;
@@ -486,7 +486,7 @@ describe("deterministic supervisor stage gates", () => {
 
       if (round === rounds) break;
 
-      expect(routePipelineProviderEvent({
+      expect(await routePipelineProviderEvent({
         pipelines: fixture.pipelines,
         store: fixture.tickets,
         ticket: fixture.tickets.getByIssueId("issue-1")!,
@@ -515,7 +515,7 @@ describe("deterministic supervisor stage gates", () => {
     return instance;
   }
 
-  it("creates an identical canonical receipt for identical evidence", () => {
+  it("creates an identical canonical receipt for identical evidence", async () => {
     const fixture = setup();
     const input = event(fixture);
     const first = evaluateStageGate(fixture.pipelines, input, { observedSubject: SUBJECT });
@@ -526,7 +526,7 @@ describe("deterministic supervisor stage gates", () => {
     expect(first.event.outcome).toBe("success");
   });
 
-  it("settles the sealed tree subject and rejects the integrated commit as workspace drift", () => {
+  it("settles the sealed tree subject and rejects the integrated commit as workspace drift", async () => {
     const fixture = setup();
     const integratedCommit = "e".repeat(40);
     const canonicalTree = "9".repeat(40);
@@ -538,7 +538,7 @@ describe("deterministic supervisor stage gates", () => {
       .toThrow(/workspace changed after stage evidence was sealed/);
   });
 
-  it("lets blocking P0/P1 evidence override success prose and the proposed result", () => {
+  it("lets blocking P0/P1 evidence override success prose and the proposed result", async () => {
     const fixture = setup();
     const evaluated = evaluateStageGate(fixture.pipelines, event(fixture, "success", {
       findings: [{ severity: "P1", code: "unsafe-change", summary: "The change is not safe." }],
@@ -553,7 +553,7 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
-  it("derives command decisions only from executor evidence", () => {
+  it("derives command decisions only from executor evidence", async () => {
     const fixture = setup("fixture/command@1");
     const cases: Array<[Record<string, unknown>, StageOutcome | "not_configured", StageOutcome, string]> = [
       [{ not_configured: false, timed_out: false, exit_code: 0, signal: null }, "success", "success", "passed"],
@@ -569,7 +569,7 @@ describe("deterministic supervisor stage gates", () => {
     }
   });
 
-  it("rejects wrong request, run, generation, assurance, secret, and current-tree fences", () => {
+  it("rejects wrong request, run, generation, assurance, secret, and current-tree fences", async () => {
     const fixture = setup();
     const input = event(fixture);
     expect(() => evaluateStageGate(fixture.pipelines, { ...input, requestHash: "0".repeat(64) })).toThrow(/attempt fence/);
@@ -611,7 +611,7 @@ describe("deterministic supervisor stage gates", () => {
     expect(() => evaluateStageGate(fixture.pipelines, input)).toThrow(/native session fence/);
   });
 
-  it("commits the receipt, artifacts, transition, and effects atomically", () => {
+  it("commits the receipt, artifacts, transition, and effects atomically", async () => {
     const fixture = setup();
     const input = event(fixture);
     expect(() => processStageEvidence(fixture.pipelines, input, {
@@ -632,7 +632,7 @@ describe("deterministic supervisor stage gates", () => {
     expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM pipeline_artifacts").get()).toEqual({ count: 2 });
   });
 
-  it("settles the actor and pipeline transition in one replayable transaction", () => {
+  it("settles the actor and pipeline transition in one replayable transaction", async () => {
     const fixture = setup();
     const input = event(fixture);
     expect(() => completeStageAttemptActor(fixture.pipelines, fixture.tickets, input, {
@@ -675,7 +675,7 @@ describe("deterministic supervisor stage gates", () => {
     }
   );
 
-  it("accepts restored fresh-review evidence and enters the bounded semantic-repair transition", () => {
+  it("accepts restored fresh-review evidence and enters the bounded semantic-repair transition", async () => {
     const fixture = setup();
     const input = event(fixture, "semantic_repair_required", {
       findings: [{
@@ -701,7 +701,7 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
-  it("turns an executor lease expiry into a bounded coordinator retry without semantic artifacts", () => {
+  it("turns an executor lease expiry into a bounded coordinator retry without semantic artifacts", async () => {
     const fixture = setup();
     const transitioned = processPipelineInfrastructureFailure({
       store: fixture.pipelines,
@@ -730,7 +730,7 @@ describe("deterministic supervisor stage gates", () => {
     })).toMatchObject({ state_version: transitioned!.state_version });
   });
 
-  it("accepts contextless stage evidence while retaining durable native session lineage", () => {
+  it("accepts contextless stage evidence while retaining durable native session lineage", async () => {
     const fixture = setup("fixture/command@1");
     fixture.db.prepare(`
       UPDATE pipeline_stage_attempts SET native_session_id = ? WHERE id = ?
@@ -749,7 +749,7 @@ describe("deterministic supervisor stage gates", () => {
     )).toThrow(/native session fence/);
   });
 
-  it("accepts a matching native session from a legacy contextless sealed request", () => {
+  it("accepts a matching native session from a legacy contextless sealed request", async () => {
     const fixture = sealLegacyContextlessRequest(
       setup("fixture/command@1"),
       "legacy-native-session"
@@ -765,7 +765,7 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
-  it("rejects a mismatching native session from a legacy contextless sealed request", () => {
+  it("rejects a mismatching native session from a legacy contextless sealed request", async () => {
     const fixture = sealLegacyContextlessRequest(
       setup("fixture/command@1"),
       "legacy-native-session"
@@ -777,7 +777,7 @@ describe("deterministic supervisor stage gates", () => {
     expect(() => evaluateStageGate(fixture.pipelines, input)).toThrow(/native session fence/);
   });
 
-  it("does not carry a prior native session into a fresh-stage infrastructure retry", () => {
+  it("does not carry a prior native session into a fresh-stage infrastructure retry", async () => {
     const fixture = setup("core/implement@4");
     fixture.db.prepare(`
       UPDATE pipeline_stage_attempts SET native_session_id = ? WHERE id = ?
@@ -802,7 +802,7 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
-  it("pins the exact provider commit when the agent-backed publish gate passes", () => {
+  it("pins the exact provider commit when the agent-backed publish gate passes", async () => {
     const fixture = setup("core/implement@4");
     const stage = fixture.manifest.stages.find((candidate) => candidate.id === "publish")!;
     const publishedCommit = "e".repeat(40);
@@ -836,10 +836,10 @@ describe("deterministic supervisor stage gates", () => {
     expect(() => evaluateStageGate(fixture.pipelines, missing)).toThrow(/provider commit/);
   });
 
-  it("settles a second publish after provider feedback repair re-entry", () => {
+  it("settles a second publish after provider feedback repair re-entry", async () => {
     const fixture = setup("core/implement@4");
 
-    const completed = settleRepairRoundPublishes(fixture, 2);
+    const completed = await settleRepairRoundPublishes(fixture, 2);
 
     expect(completed).toMatchObject({
       status: "waiting_provider",
@@ -884,14 +884,14 @@ describe("deterministic supervisor stage gates", () => {
     `).get(fixture.instance.id)).toEqual({ count: 2 });
   });
 
-  it("consumes the pipeline's own repair synchronize webhook when publish delivery is retrying", () => {
+  it("consumes the pipeline's own repair synchronize webhook when publish delivery is retrying", async () => {
     const fixture = setup("core/implement@4");
     const oldPublishedCommit = "a".repeat(40);
     const repairedSubject = "2".repeat(40);
     const repairedPublishedCommit = "b".repeat(40);
-    settleRepairRoundPublishes(fixture, 1);
+    await settleRepairRoundPublishes(fixture, 1);
 
-    expect(routePipelineProviderEvent({
+    expect(await routePipelineProviderEvent({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       ticket: fixture.tickets.getByIssueId("issue-1")!,
@@ -911,7 +911,7 @@ describe("deterministic supervisor stage gates", () => {
     const publishing = settleForwardChainToPublish(fixture, repairedSubject, "1".repeat(40), 2);
     expect(publishing).toMatchObject({ status: "dispatchable", active_stage_id: "publish" });
     fixture.tickets.setSetting("github-head:issue-1", repairedPublishedCommit);
-    expect(routePipelineProviderEvent({
+    expect(await routePipelineProviderEvent({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       ticket: fixture.tickets.getByIssueId("issue-1")!,
@@ -948,7 +948,7 @@ describe("deterministic supervisor stage gates", () => {
       WHERE pipeline_instance_id = ? AND payload LIKE ?
     `).run(fixture.instance.id, `%${repairedPublishedCommit}%`).changes).toBeGreaterThan(0);
 
-    expect(drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(0);
+    expect(await drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(0);
     expect(fixture.db.prepare("SELECT status FROM feedback_snapshots WHERE id = ?").get(snapshot.id))
       .toEqual({ status: "consumed" });
     expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
@@ -962,15 +962,62 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
-  it("fails closed when a queued synchronize head differs from the settled publish subject", () => {
+  it("fails closed before recording provider feedback when waiting-provider reconciliation fails", async () => {
+    const fixture = setup("core/implement@4");
+    const publishedSubject = "2".repeat(40);
+    const publishedCommit = "b".repeat(40);
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    fixture.tickets.setSetting("github-head:issue-1", publishedCommit);
+    settleForwardChainToPublish(fixture, publishedSubject, "1".repeat(40), 1);
+    settleCurrentStage(fixture, "success", {
+      id: "publish-before-provider-race",
+      subject: publishedSubject,
+      preSubject: publishedSubject,
+      details: {
+        proposal_schema: "openthrottle.stage-proposal/v1",
+        published_commit: publishedCommit,
+        provider_revision: publishedCommit,
+      },
+    });
+    const calls: string[] = [];
+
+    await expect(routePipelineProviderEvent({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      ticket: fixture.tickets.getByIssueId("issue-1")!,
+      eventId: "github-review:reconcile-fails-before-record",
+      outcome: "semantic_repair_required",
+      summary: "Provider feedback must not persist before reconciliation.",
+      evidence: ["https://github.com/owner/repo/pull/1#discussion"],
+      payload: { kind: "review", id: "reconcile-fails-before-record" },
+      headSha: publishedCommit,
+      pullRequestUrl: "https://github.com/owner/repo/pull/1",
+      reconcileWaitingProviderSuccessor: async (instanceId) => {
+        calls.push(instanceId);
+        throw new Error("legacy aggregate reconciliation not complete");
+      },
+    })).rejects.toThrow(/legacy aggregate reconciliation not complete/);
+
+    expect(calls).toEqual([fixture.instance.id]);
+    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM feedback_snapshots").get())
+      .toEqual({ count: 0 });
+    expect(fixture.pipelines.getInboxEvent("github-review:reconcile-fails-before-record")).toBeUndefined();
+    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+      status: "waiting_provider",
+      active_stage_id: "provider",
+      immutable_subject: publishedSubject,
+    });
+  });
+
+  it("fails closed when a queued synchronize head differs from the settled publish subject", async () => {
     const fixture = setup("core/implement@4");
     const oldPublishedCommit = "a".repeat(40);
     const repairedSubject = "2".repeat(40);
     const repairedPublishedCommit = "b".repeat(40);
     const externalHead = "f".repeat(40);
-    settleRepairRoundPublishes(fixture, 1);
+    await settleRepairRoundPublishes(fixture, 1);
 
-    expect(routePipelineProviderEvent({
+    expect(await routePipelineProviderEvent({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       ticket: fixture.tickets.getByIssueId("issue-1")!,
@@ -984,7 +1031,7 @@ describe("deterministic supervisor stage gates", () => {
     })).toBe(true);
     settleForwardChainToPublish(fixture, repairedSubject, "1".repeat(40), 2);
     fixture.tickets.setSetting("github-head:issue-1", externalHead);
-    expect(routePipelineProviderEvent({
+    expect(await routePipelineProviderEvent({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       ticket: fixture.tickets.getByIssueId("issue-1")!,
@@ -1008,7 +1055,7 @@ describe("deterministic supervisor stage gates", () => {
       },
     });
 
-    expect(drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(1);
+    expect(await drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(1);
     expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
       status: "completion_pending_publication",
       terminal_outcome: "needs_human",
@@ -1016,10 +1063,10 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
-  it("settles a third publish under the raw 20-attempt budget after two provider feedback repair rounds", () => {
+  it("settles a third publish under the raw 20-attempt budget after two provider feedback repair rounds", async () => {
     const fixture = setup("core/implement@4", { maxAttempts: 20 });
 
-    const completed = settleRepairRoundPublishes(fixture, 3);
+    const completed = await settleRepairRoundPublishes(fixture, 3);
 
     expect(completed).toMatchObject({
       status: "waiting_provider",
@@ -1038,10 +1085,10 @@ describe("deterministic supervisor stage gates", () => {
     expect(fixture.pipelines.getInstance(fixture.instance.id)?.attempt_count).toBeGreaterThan(20);
   });
 
-  it("exhausts the whole-run attempt budget only at a provider repair round boundary", () => {
+  it("exhausts the whole-run attempt budget only at a provider repair round boundary", async () => {
     const fixture = setup("core/implement@4", { maxAttempts: 20 });
 
-    const thirdPublishedRound = settleRepairRoundPublishes(fixture, 3);
+    const thirdPublishedRound = await settleRepairRoundPublishes(fixture, 3);
 
     expect(thirdPublishedRound).toMatchObject({
       status: "waiting_provider",
@@ -1059,7 +1106,7 @@ describe("deterministic supervisor stage gates", () => {
       WHERE pipeline_instance_id = ? AND evaluator_kind = 'publish_subject'
     `).pluck().get(fixture.instance.id)).toBe(3);
 
-    expect(routePipelineProviderEvent({
+    expect(await routePipelineProviderEvent({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       ticket: fixture.tickets.getByIssueId("issue-1")!,
@@ -1089,7 +1136,7 @@ describe("deterministic supervisor stage gates", () => {
     `).pluck().get()).toBe(3);
   });
 
-  it("keeps non-blocking publication diagnostics on the bounded publish retry", () => {
+  it("keeps non-blocking publication diagnostics on the bounded publish retry", async () => {
     const fixture = setup("core/implement@4");
     const stage = fixture.manifest.stages.find((candidate) => candidate.id === "publish")!;
     fixture.db.prepare(`
@@ -1125,7 +1172,7 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
-  it("turns supervisor-owned provider evidence into a fenced terminal receipt", () => {
+  it("turns supervisor-owned provider evidence into a fenced terminal receipt", async () => {
     const fixture = setup("core/implement@4");
     const publishedCommit = "d".repeat(40);
     fixture.db.prepare(`
@@ -1150,7 +1197,7 @@ describe("deterministic supervisor stage gates", () => {
     };
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
     fixture.tickets.setSetting("github-head:issue-1", publishedCommit);
-    expect(routePipelineProviderEvent({
+    expect(await routePipelineProviderEvent({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       ticket: fixture.tickets.getByIssueId("issue-1")!,
@@ -1165,7 +1212,7 @@ describe("deterministic supervisor stage gates", () => {
     expect(fixture.pipelines.getInstance(fixture.instance.id)?.status)
       .toBe("completion_pending_publication");
     expect(fixture.pipelines.getInboxEvent("provider-synchronize-published-commit")).toBeUndefined();
-    expect(routePipelineProviderEvent({
+    expect(await routePipelineProviderEvent({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       ticket: fixture.tickets.getByIssueId("issue-1")!,
@@ -1185,14 +1232,14 @@ describe("deterministic supervisor stage gates", () => {
 
     fixture.db.prepare("UPDATE pipeline_instances SET status = 'waiting_provider' WHERE id = ?")
       .run(fixture.instance.id);
-    expect(drainDeferredProviderEvidence(fixture.pipelines)).toBe(1);
+    expect(await drainDeferredProviderEvidence(fixture.pipelines)).toBe(1);
     const completed = fixture.pipelines.getInstance(fixture.instance.id)!;
 
     expect(completed).toMatchObject({
       status: "completion_pending_publication",
       terminal_outcome: "shipped",
     });
-    expect(routePipelineProviderEvent({
+    expect(await routePipelineProviderEvent({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       ticket: fixture.tickets.getByIssueId("issue-1")!,
@@ -1209,6 +1256,72 @@ describe("deterministic supervisor stage gates", () => {
     expect(fixture.db.prepare(
       "SELECT evaluator_kind, result FROM pipeline_gate_receipts WHERE attempt_id = ?"
     ).get(fixture.attempt.id)).toEqual({ evaluator_kind: "provider", result: "passed" });
+  });
+
+  it("reconciles deferred provider evidence before settlement and leaves stale legacy evidence pending", async () => {
+    const fixture = setup("core/implement@4");
+    const legacySubject = SUBJECT;
+    const canonicalSubject = "9".repeat(40);
+    const publishedCommit = "d".repeat(40);
+    fixture.db.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET stage_id = 'provider', native_context_policy = 'none', expected_subject = ?
+      WHERE id = ?
+    `).run(legacySubject, fixture.attempt.id);
+    fixture.db.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'completion_pending_publication', active_stage_id = 'provider',
+          immutable_subject = ?, published_commit = ?, published_subject = ?
+      WHERE id = ?
+    `).run(legacySubject, publishedCommit, legacySubject, fixture.instance.id);
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    fixture.tickets.setSetting("github-head:issue-1", publishedCommit);
+
+    expect(await routePipelineProviderEvent({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      ticket: fixture.tickets.getByIssueId("issue-1")!,
+      eventId: "provider-success-before-wait-reconcile",
+      outcome: "success",
+      summary: "GitHub reports the pull request merged.",
+      evidence: ["https://github.com/owner/repo/pull/1"],
+      payload: { merged: true, head_sha: publishedCommit },
+      headSha: publishedCommit,
+      pullRequestUrl: "https://github.com/owner/repo/pull/1",
+    })).toBe(true);
+    const pendingEvent = fixture.pipelines.getInboxEvent("provider-success-before-wait-reconcile")!;
+    expect(pendingEvent).toMatchObject({ status: "pending" });
+    expect((JSON.parse(pendingEvent.payload) as { subject?: string }).subject).toBe(legacySubject);
+
+    fixture.db.prepare("UPDATE pipeline_instances SET status = 'waiting_provider' WHERE id = ?")
+      .run(fixture.instance.id);
+    const reconciled: string[] = [];
+    await expect(drainDeferredProviderEvidence(fixture.pipelines, {
+      reconcileWaitingProviderSuccessor: async (instanceId) => {
+        reconciled.push(instanceId);
+        fixture.db.prepare(`
+          UPDATE pipeline_instances
+          SET immutable_subject = ?, published_subject = ?
+          WHERE id = ?
+        `).run(canonicalSubject, canonicalSubject, instanceId);
+        fixture.db.prepare(`
+          UPDATE pipeline_stage_attempts
+          SET expected_subject = ?
+          WHERE id = ?
+        `).run(canonicalSubject, fixture.attempt.id);
+      },
+    })).rejects.toThrow(/pipeline event subject is stale/);
+
+    expect(reconciled).toEqual([fixture.instance.id]);
+    const stillPendingEvent = fixture.pipelines.getInboxEvent("provider-success-before-wait-reconcile")!;
+    expect(stillPendingEvent).toMatchObject({ status: "pending" });
+    expect((JSON.parse(stillPendingEvent.payload) as { subject?: string }).subject).toBe(legacySubject);
+    expect(fixture.db.prepare("SELECT COUNT(*) FROM pipeline_gate_receipts").pluck().get()).toBe(0);
+    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+      status: "waiting_provider",
+      immutable_subject: canonicalSubject,
+      terminal_outcome: null,
+    });
   });
 
   it.each([
@@ -1257,7 +1370,7 @@ describe("deterministic supervisor stage gates", () => {
 
     fixture.db.prepare("UPDATE pipeline_instances SET status = 'waiting_provider' WHERE id = ?")
       .run(fixture.instance.id);
-    expect(drainDeferredProviderEvidence(fixture.pipelines)).toBe(1);
+    expect(await drainDeferredProviderEvidence(fixture.pipelines)).toBe(1);
     expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
       status: "completion_pending_publication",
       terminal_outcome: terminalOutcome,
@@ -1898,7 +2011,7 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
-  it("keeps oversized enriched provider snapshot payloads valid JSON", () => {
+  it("keeps oversized enriched provider snapshot payloads valid JSON", async () => {
     const fixture = setup("core/implement@4");
     fixture.db.prepare(`
       UPDATE pipeline_instances
@@ -1914,7 +2027,7 @@ describe("deterministic supervisor stage gates", () => {
       html_url: "https://github.com/owner/repo/actions/runs/20/job/101",
     };
 
-    expect(routePipelineProviderEvent({
+    expect(await routePipelineProviderEvent({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       ticket: fixture.tickets.getByIssueId("issue-1")!,
@@ -1939,7 +2052,7 @@ describe("deterministic supervisor stage gates", () => {
     expect(() => JSON.parse(wrapper.payload)).not.toThrow();
   });
 
-  it("fails closed when GitHub's current head differs from the executor-verified commit", () => {
+  it("fails closed when GitHub's current head differs from the executor-verified commit", async () => {
     const fixture = setup("core/implement@4");
     const observedHead = "d".repeat(40);
     fixture.db.prepare(`
@@ -1956,7 +2069,7 @@ describe("deterministic supervisor stage gates", () => {
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
     fixture.tickets.setSetting("github-head:issue-1", observedHead);
 
-    expect(routePipelineProviderEvent({
+    expect(await routePipelineProviderEvent({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       ticket: fixture.tickets.getByIssueId("issue-1")!,
@@ -1978,14 +2091,14 @@ describe("deterministic supervisor stage gates", () => {
     ).get(fixture.attempt.id)).toEqual({ evaluator_kind: "provider", result: "failed" });
   });
 
-  it("fails closed for an external synchronize while already waiting on provider evidence", () => {
+  it("fails closed for an external synchronize while already waiting on provider evidence", async () => {
     const fixture = setup("core/implement@4");
     const observedHead = "d".repeat(40);
     moveFixtureToProviderWait(fixture, SUBJECT);
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
     fixture.tickets.setSetting("github-head:issue-1", observedHead);
 
-    expect(routePipelineProviderEvent({
+    expect(await routePipelineProviderEvent({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       ticket: fixture.tickets.getByIssueId("issue-1")!,
@@ -2005,7 +2118,7 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
-  it("coalesces feedback arriving during repair and replays a claimed snapshot at provider wait", () => {
+  it("coalesces feedback arriving during repair and replays a claimed snapshot at provider wait", async () => {
     const fixture = setup("core/implement@4");
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
     fixture.tickets.setSetting("github-head:issue-1", PUBLISHED_COMMIT);
@@ -2025,8 +2138,8 @@ describe("deterministic supervisor stage gates", () => {
       pullRequestUrl: "https://github.com/owner/repo/pull/1",
     });
 
-    expect(route("review-during-repair-1")).toBe(true);
-    expect(route("ci-during-repair-2")).toBe(true);
+    expect(await route("review-during-repair-1")).toBe(true);
+    expect(await route("ci-during-repair-2")).toBe(true);
     const snapshot = fixture.db.prepare("SELECT * FROM feedback_snapshots").get() as { id: string; work_item_id: string };
     expect(fixture.db.prepare("SELECT COUNT(*) FROM provider_events").pluck().get()).toBe(2);
     const claimed = fixture.tickets.claimFeedbackSnapshot(snapshot.id, Number.MAX_SAFE_INTEGER);
@@ -2059,7 +2172,7 @@ describe("deterministic supervisor stage gates", () => {
       WHERE id = ?
     `).run(SUBJECT, PUBLISHED_COMMIT, SUBJECT, fixture.instance.id);
 
-    expect(drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(1);
+    expect(await drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(1);
     expect(fixture.db.prepare("SELECT status FROM feedback_snapshots WHERE id = ?").get(snapshot.id))
       .toEqual({ status: "consumed" });
     expect(fixture.tickets.getSetting(`feedback-snapshot-drained-at:${snapshot.id}`))
@@ -2070,10 +2183,10 @@ describe("deterministic supervisor stage gates", () => {
       stage_id: "repair_implementation",
       reentry_ordinal: 1,
     });
-    expect(drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(0);
+    expect(await drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(0);
   });
 
-  it("routes a mixed same-head snapshot to repair re-entry, not the successful outcome", () => {
+  it("routes a mixed same-head snapshot to repair re-entry, not the successful outcome", async () => {
     const fixture = setup("core/implement@4");
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
     fixture.tickets.setSetting("github-head:issue-1", PUBLISHED_COMMIT);
@@ -2083,7 +2196,7 @@ describe("deterministic supervisor stage gates", () => {
 
     // GitHub reports success for the published head before the provider-wait
     // stage can receive, so the event is collected into the pending snapshot.
-    expect(routePipelineProviderEvent({
+    expect(await routePipelineProviderEvent({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       ticket: fixture.tickets.getByIssueId("issue-1")!,
@@ -2131,7 +2244,7 @@ describe("deterministic supervisor stage gates", () => {
       payload: { kind: "linear_reply", activity_id: "activity-1" },
       headSha: PUBLISHED_COMMIT,
     });
-    expect(processPipelineFeedbackSnapshot({
+    expect(await processPipelineFeedbackSnapshot({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       instance,
@@ -2149,7 +2262,7 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
-  it("ships provider feedback with only live P2 findings after repair budget is exhausted", () => {
+  it("ships provider feedback with only live P2 findings after repair budget is exhausted", async () => {
     const fixture = setup("core/implement@4");
     moveFixtureToProviderWait(fixture, SUBJECT);
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
@@ -2158,7 +2271,7 @@ describe("deterministic supervisor stage gates", () => {
       WHERE pipeline_instance_id = ? AND stage_id = 'repair_implementation'
     `).run(fixture.instance.id);
 
-    expect(routePipelineProviderEvent({
+    expect(await routePipelineProviderEvent({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       ticket: fixture.tickets.getByIssueId("issue-1")!,
@@ -2189,7 +2302,7 @@ describe("deterministic supervisor stage gates", () => {
       .toEqual({ status: "consumed" });
   });
 
-  it("preserves an unstructured repair request mixed with non-blocking diagnostics", () => {
+  it("preserves an unstructured repair request mixed with non-blocking diagnostics", async () => {
     const fixture = setup("core/implement@4");
     moveFixtureToProviderWait(fixture, SUBJECT);
     const workItemId = `pipeline-feedback:${fixture.instance.id}:${PUBLISHED_COMMIT}`;
@@ -2236,7 +2349,7 @@ describe("deterministic supervisor stage gates", () => {
       receivedAt: "2026-01-01T00:00:01.000Z",
     }).snapshot;
 
-    expect(processPipelineFeedbackSnapshot({
+    expect(await processPipelineFeedbackSnapshot({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       instance: fixture.pipelines.getInstance(fixture.instance.id)!,
@@ -2250,7 +2363,7 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
-  it("checks blocking findings before applying the provider artifact cap", () => {
+  it("checks blocking findings before applying the provider artifact cap", async () => {
     const fixture = setup("core/implement@4");
     moveFixtureToProviderWait(fixture, SUBJECT);
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
@@ -2305,7 +2418,7 @@ describe("deterministic supervisor stage gates", () => {
       receivedAt: "2026-01-01T00:00:03.000Z",
     }).snapshot;
 
-    expect(processPipelineFeedbackSnapshot({
+    expect(await processPipelineFeedbackSnapshot({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       instance: fixture.pipelines.getInstance(fixture.instance.id)!,
@@ -2327,7 +2440,7 @@ describe("deterministic supervisor stage gates", () => {
     )).toBe(false);
   });
 
-  it("still escalates live P1 provider feedback when repair re-entry is exhausted", () => {
+  it("still escalates live P1 provider feedback when repair re-entry is exhausted", async () => {
     const fixture = setup("core/implement@4");
     moveFixtureToProviderWait(fixture, SUBJECT);
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
@@ -2336,7 +2449,7 @@ describe("deterministic supervisor stage gates", () => {
       WHERE pipeline_instance_id = ? AND stage_id = 'repair_implementation'
     `).run(fixture.instance.id);
 
-    expect(routePipelineProviderEvent({
+    expect(await routePipelineProviderEvent({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       ticket: fixture.tickets.getByIssueId("issue-1")!,
@@ -2367,7 +2480,7 @@ describe("deterministic supervisor stage gates", () => {
     expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toBeUndefined();
   });
 
-  it("keeps provider head drift human-required even when drift evidence has only P2 findings", () => {
+  it("keeps provider head drift human-required even when drift evidence has only P2 findings", async () => {
     const fixture = setup("core/implement@4");
     moveFixtureToProviderWait(fixture, SUBJECT);
     const driftHead = "d".repeat(40);
@@ -2401,7 +2514,7 @@ describe("deterministic supervisor stage gates", () => {
   it.each([
     ["published commit", { publishedCommit: "d".repeat(40) }],
     ["provider revision", { providerRevision: "e".repeat(40) }],
-  ])("carries same-run feedback from a superseded %s into the current provider wait", (_label, publicationOptions) => {
+  ])("carries same-run feedback from a superseded %s into the current provider wait", async (_label, publicationOptions) => {
     const fixture = setup("core/implement@4");
     const oldHead = Object.values(publicationOptions)[0];
     const currentPublishedCommit = "f".repeat(40);
@@ -2413,7 +2526,7 @@ describe("deterministic supervisor stage gates", () => {
     `).run(oldHead, fixture.instance.id);
     recordAcknowledgedPublication(fixture, localSubject, publicationOptions);
 
-    expect(routePipelineProviderEvent({
+    expect(await routePipelineProviderEvent({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       ticket: fixture.tickets.getByIssueId("issue-1")!,
@@ -2431,7 +2544,7 @@ describe("deterministic supervisor stage gates", () => {
     const snapshot = fixture.db.prepare("SELECT * FROM feedback_snapshots").get() as { id: string };
     moveFixtureToProviderWait(fixture, SUBJECT, currentPublishedCommit);
 
-    expect(drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(1);
+    expect(await drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(1);
     expect(fixture.db.prepare("SELECT status, head_sha FROM feedback_snapshots WHERE id = ?").get(snapshot.id))
       .toEqual({ status: "consumed", head_sha: currentPublishedCommit });
     expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
@@ -2442,7 +2555,7 @@ describe("deterministic supervisor stage gates", () => {
       .pluck().get()).toBe(0);
   });
 
-  it("discounts superseded-head review feedback after a repair round and lets fresh success ship", () => {
+  it("discounts superseded-head review feedback after a repair round and lets fresh success ship", async () => {
     const fixture = setup("core/implement@4");
     const staleHead = "d".repeat(40);
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
@@ -2453,7 +2566,7 @@ describe("deterministic supervisor stage gates", () => {
     fixture.db.prepare("UPDATE pipeline_instances SET reentry_count = 1 WHERE id = ?")
       .run(fixture.instance.id);
 
-    expect(routePipelineProviderEvent({
+    expect(await routePipelineProviderEvent({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       ticket: fixture.tickets.getByIssueId("issue-1")!,
@@ -2477,7 +2590,7 @@ describe("deterministic supervisor stage gates", () => {
       reentry_ordinal: 0,
     });
 
-    expect(routePipelineProviderEvent({
+    expect(await routePipelineProviderEvent({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       ticket: fixture.tickets.getByIssueId("issue-1")!,
@@ -2495,7 +2608,7 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
-  it("still carries later-round feedback that predates the current publication", () => {
+  it("still carries later-round feedback that predates the current publication", async () => {
     const fixture = setup("core/implement@4");
     const previousHead = "d".repeat(40);
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
@@ -2526,7 +2639,7 @@ describe("deterministic supervisor stage gates", () => {
       receivedAt: "2025-12-31T23:59:59.000Z",
     }).snapshot;
 
-    expect(processPipelineFeedbackSnapshot({
+    expect(await processPipelineFeedbackSnapshot({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       instance: fixture.pipelines.getInstance(fixture.instance.id)!,
@@ -2541,7 +2654,7 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
-  it("resolves the claimed repair-driving snapshot after a repaired republish", () => {
+  it("resolves the claimed repair-driving snapshot after a repaired republish", async () => {
     const fixture = setup("core/implement@4");
     const previousHead = "d".repeat(40);
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
@@ -2594,7 +2707,7 @@ describe("deterministic supervisor stage gates", () => {
     fixture.db.prepare("UPDATE pipeline_instances SET reentry_count = 1 WHERE id = ?")
       .run(fixture.instance.id);
 
-    expect(processPipelineFeedbackSnapshot({
+    expect(await processPipelineFeedbackSnapshot({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       instance: fixture.pipelines.getInstance(fixture.instance.id)!,
@@ -2613,7 +2726,7 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
-  it("does not resolve a claimed superseded snapshot without durable provider proof", () => {
+  it("does not resolve a claimed superseded snapshot without durable provider proof", async () => {
     const fixture = setup("core/implement@4");
     const previousHead = "d".repeat(40);
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
@@ -2651,7 +2764,7 @@ describe("deterministic supervisor stage gates", () => {
     fixture.db.prepare("UPDATE pipeline_instances SET reentry_count = 1 WHERE id = ?")
       .run(fixture.instance.id);
 
-    expect(processPipelineFeedbackSnapshot({
+    expect(await processPipelineFeedbackSnapshot({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       instance: fixture.pipelines.getInstance(fixture.instance.id)!,
@@ -2664,7 +2777,7 @@ describe("deterministic supervisor stage gates", () => {
       .get(`feedback-snapshot-stale:${snapshot.id}`)).toBeDefined();
   });
 
-  it("still acts on new provider findings anchored to the repaired head", () => {
+  it("still acts on new provider findings anchored to the repaired head", async () => {
     const fixture = setup("core/implement@4");
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
     fixture.tickets.setSetting("github-head:issue-1", PUBLISHED_COMMIT);
@@ -2673,7 +2786,7 @@ describe("deterministic supervisor stage gates", () => {
     fixture.db.prepare("UPDATE pipeline_instances SET reentry_count = 1 WHERE id = ?")
       .run(fixture.instance.id);
 
-    expect(routePipelineProviderEvent({
+    expect(await routePipelineProviderEvent({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       ticket: fixture.tickets.getByIssueId("issue-1")!,
@@ -2698,7 +2811,7 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
-  it("does not carry an old snapshot after a post-publication event joins it", () => {
+  it("does not carry an old snapshot after a post-publication event joins it", async () => {
     const fixture = setup("core/implement@4");
     const previousHead = "d".repeat(40);
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
@@ -2744,7 +2857,7 @@ describe("deterministic supervisor stage gates", () => {
     }).snapshot;
     expect(second.id).toBe(first.id);
 
-    expect(processPipelineFeedbackSnapshot({
+    expect(await processPipelineFeedbackSnapshot({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       instance: fixture.pipelines.getInstance(fixture.instance.id)!,
@@ -2759,7 +2872,7 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
-  it("seals carried feedback under the head it was observed against, not the drainable head", () => {
+  it("seals carried feedback under the head it was observed against, not the drainable head", async () => {
     const fixture = setup("core/implement@4");
     const observedHead = "d".repeat(40);
     const currentPublishedCommit = "f".repeat(40);
@@ -2771,7 +2884,7 @@ describe("deterministic supervisor stage gates", () => {
     `).run(observedHead, fixture.instance.id);
     recordAcknowledgedPublication(fixture, localSubject, { publishedCommit: observedHead });
 
-    expect(routePipelineProviderEvent({
+    expect(await routePipelineProviderEvent({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       ticket: fixture.tickets.getByIssueId("issue-1")!,
@@ -2789,7 +2902,7 @@ describe("deterministic supervisor stage gates", () => {
     expect(snapshot.observed_head_sha).toBe(observedHead);
 
     moveFixtureToProviderWait(fixture, SUBJECT, currentPublishedCommit);
-    expect(drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(1);
+    expect(await drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(1);
 
     // OPE-27 drainability is preserved: the snapshot is retargeted to the
     // current published commit and re-enters implementation, while its
@@ -2824,7 +2937,7 @@ describe("deterministic supervisor stage gates", () => {
     expect(sealed?.details?.expected_published_commit).toBe(currentPublishedCommit);
   });
 
-  it("continues draining when the oldest same-session feedback snapshot is stale", () => {
+  it("continues draining when the oldest same-session feedback snapshot is stale", async () => {
     const fixture = setup("core/implement@4");
     const staleHead = "d".repeat(40);
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
@@ -2884,7 +2997,7 @@ describe("deterministic supervisor stage gates", () => {
       WHERE id = ?
     `).run(SUBJECT, SUBJECT, fixture.instance.id);
 
-    expect(drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(1);
+    expect(await drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(1);
     expect(fixture.db.prepare("SELECT status FROM feedback_snapshots WHERE id = ?").get(stale.id))
       .toEqual({ status: "stale" });
     expect(fixture.db.prepare("SELECT status FROM feedback_snapshots WHERE id = ?").get(fresh.id))
@@ -2905,7 +3018,7 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
-  it("keeps generation and instance fences when same-head feedback reaches the current provider wait", () => {
+  it("keeps generation and instance fences when same-head feedback reaches the current provider wait", async () => {
     const fixture = setup("core/implement@4");
     const cases = [
       { id: "other-generation", generation: fixture.instance.generation + 1, workItemId: `pipeline-feedback:${fixture.instance.id}:${SUBJECT}` },
@@ -2936,7 +3049,7 @@ describe("deterministic supervisor stage gates", () => {
         workItemId: item.workItemId,
       }).snapshot;
 
-      expect(processPipelineFeedbackSnapshot({
+      expect(await processPipelineFeedbackSnapshot({
         pipelines: fixture.pipelines,
         store: fixture.tickets,
         instance: fixture.pipelines.getInstance(fixture.instance.id)!,
@@ -2949,7 +3062,7 @@ describe("deterministic supervisor stage gates", () => {
     }
   });
 
-  it("keeps unrelated heads stale even when the snapshot matches the current instance", () => {
+  it("keeps unrelated heads stale even when the snapshot matches the current instance", async () => {
     const fixture = setup("core/implement@4");
     const unrelatedHead = "f".repeat(40);
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
@@ -2974,7 +3087,7 @@ describe("deterministic supervisor stage gates", () => {
       workItemId: `pipeline-feedback:${fixture.instance.id}:${unrelatedHead}`,
     }).snapshot;
 
-    expect(processPipelineFeedbackSnapshot({
+    expect(await processPipelineFeedbackSnapshot({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       instance: fixture.pipelines.getInstance(fixture.instance.id)!,
@@ -2986,7 +3099,7 @@ describe("deterministic supervisor stage gates", () => {
       .get(`feedback-snapshot-stale:${snapshot.id}`)).toBeDefined();
   });
 
-  it("does not carry forward a snapshot that was already claimed under an older head", () => {
+  it("does not carry forward a snapshot that was already claimed under an older head", async () => {
     const fixture = setup("core/implement@4");
     const oldHead = "2".repeat(40);
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
@@ -2995,7 +3108,7 @@ describe("deterministic supervisor stage gates", () => {
       UPDATE pipeline_instances SET status = 'running', published_commit = ? WHERE id = ?
     `).run(oldHead, fixture.instance.id);
     recordAcknowledgedPublication(fixture, "b".repeat(40), { providerRevision: oldHead });
-    const snapshot = routePipelineProviderEvent({
+    const snapshot = await routePipelineProviderEvent({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       ticket: fixture.tickets.getByIssueId("issue-1")!,
@@ -3014,7 +3127,7 @@ describe("deterministic supervisor stage gates", () => {
 
     moveFixtureToProviderWait(fixture, SUBJECT);
 
-    expect(processPipelineFeedbackSnapshot({
+    expect(await processPipelineFeedbackSnapshot({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       instance: fixture.pipelines.getInstance(fixture.instance.id)!,
@@ -3026,7 +3139,7 @@ describe("deterministic supervisor stage gates", () => {
       .get(`feedback-snapshot-stale:${stored.id}`)).toBeDefined();
   });
 
-  it("does not stale a feedback snapshot when its stale notice cannot be enqueued", () => {
+  it("does not stale a feedback snapshot when its stale notice cannot be enqueued", async () => {
     const fixture = setup("core/implement@4");
     const staleHead = "1".repeat(40);
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
@@ -3058,12 +3171,12 @@ describe("deterministic supervisor stage gates", () => {
       payload: canonicalJson({ incompatible: true }),
     });
 
-    expect(() => processPipelineFeedbackSnapshot({
+    await expect(processPipelineFeedbackSnapshot({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       instance: fixture.pipelines.getInstance(fixture.instance.id)!,
       snapshot,
-    })).toThrow(/different intent/);
+    })).rejects.toThrow(/different intent/);
     expect(fixture.db.prepare("SELECT status, head_sha FROM feedback_snapshots WHERE id = ?").get(snapshot.id))
       .toEqual({ status: "collecting", head_sha: staleHead });
   });
@@ -3085,7 +3198,7 @@ describe("deterministic supervisor stage gates", () => {
     expect(instance).toMatchObject({ status: "dispatchable", active_stage_id: "simplification" });
   }
 
-  it("reclassifies a self-reported simplification no_change into a reviewed success when the sealed tree changed", () => {
+  it("reclassifies a self-reported simplification no_change into a reviewed success when the sealed tree changed", async () => {
     const fixture = setup("core/implement@4");
     const priorSubject = "d".repeat(40);
     const simplifiedSubject = "e".repeat(40);
@@ -3122,7 +3235,7 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
-  it("keeps a genuine simplification no_change on the fast path to test when the sealed tree is unchanged", () => {
+  it("keeps a genuine simplification no_change on the fast path to test when the sealed tree is unchanged", async () => {
     const fixture = setup("core/implement@4");
     const priorSubject = "d".repeat(40);
     driveCoreImplementToSimplification(fixture, priorSubject);

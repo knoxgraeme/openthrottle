@@ -56,6 +56,7 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
   | "listReclaimableRuntimeResources"
   | "listActiveRuntimeInstances"
   | "listActiveRuntimeInstancesAfter"
+  | "listWaitingProviderInstancesAfter"
   | "getInstanceByRuntimeResourceId"
   | "getActiveAttempt"
   | "listAttempts"
@@ -112,6 +113,32 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
         WHERE runtime_resource_status = 'active'
           AND status IN ('running', 'dispatchable')
         ORDER BY updated_at, id LIMIT ?
+      `).all(limit)) as PipelineInstance[];
+    for (const instance of instances) validatePinnedInstance(db, instance);
+    return instances;
+  };
+
+  const listWaitingProviderInstancesAfter = (
+    cursor: { updatedAt: string; id: string } | null,
+    limit = 50
+  ): PipelineInstance[] => {
+    const instances = (cursor
+      ? db.prepare(`
+        SELECT DISTINCT pi.* FROM pipeline_instances pi
+        JOIN pipeline_stage_attempts psa
+          ON psa.pipeline_instance_id = pi.id AND psa.stage_id = pi.active_stage_id
+        WHERE pi.status = 'waiting_provider'
+          AND psa.status IN ('pending', 'leased', 'dispatched', 'acknowledged', 'running')
+          AND (pi.updated_at > ? OR (pi.updated_at = ? AND pi.id > ?))
+        ORDER BY pi.updated_at, pi.id LIMIT ?
+      `).all(cursor.updatedAt, cursor.updatedAt, cursor.id, limit)
+      : db.prepare(`
+        SELECT DISTINCT pi.* FROM pipeline_instances pi
+        JOIN pipeline_stage_attempts psa
+          ON psa.pipeline_instance_id = pi.id AND psa.stage_id = pi.active_stage_id
+        WHERE pi.status = 'waiting_provider'
+          AND psa.status IN ('pending', 'leased', 'dispatched', 'acknowledged', 'running')
+        ORDER BY pi.updated_at, pi.id LIMIT ?
       `).all(limit)) as PipelineInstance[];
     for (const instance of instances) validatePinnedInstance(db, instance);
     return instances;
@@ -635,6 +662,7 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
       return listActiveRuntimeInstancesAfter(null, limit);
     },
     listActiveRuntimeInstancesAfter,
+    listWaitingProviderInstancesAfter,
     getInstanceByRuntimeResourceId(providerResourceId) {
       return getInstanceByRuntimeResourceIdStmt.get(providerResourceId) as PipelineInstance | undefined;
     },
