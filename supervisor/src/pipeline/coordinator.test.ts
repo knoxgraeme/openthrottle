@@ -1075,6 +1075,69 @@ describe("pipeline coordinator", () => {
       .toEqual(["publish_linear", "stop", "cleanup"]);
   });
 
+  it("fences no_change terminals produced by re-entry exhaustion", () => {
+    const { manifest, instance, attempt, stages } = setup("core/implement@4");
+    const noChangeExhaustionManifest: PipelineManifest = {
+      ...manifest,
+      stages: manifest.stages.map((stage) => stage.id === "implementation"
+        ? {
+            ...stage,
+            transitions: {
+              ...stage.transitions,
+              semantic_repair_required: { to: "implementation", max_reentries: 1, on_exhausted: "no_change" },
+            },
+          }
+        : stage),
+    };
+    const normalizedManifest = canonicalJson(noChangeExhaustionManifest);
+    const publishedSubject = "b".repeat(40);
+    const unpublishedSubject = "e".repeat(40);
+    const publishedCommit = "d".repeat(40);
+    const exhaustedStages = stages.map((stage) => stage.stage_id === "implementation"
+      ? { ...stage, reentry_count: 1 }
+      : stage);
+    const exhaustedInstance = {
+      ...instance,
+      manifest_digest: digestNormalized(normalizedManifest),
+      normalized_manifest: normalizedManifest,
+      immutable_subject: publishedSubject,
+      published_commit: publishedCommit,
+      published_subject: publishedSubject,
+    };
+    const repair = event(exhaustedInstance, attempt, "semantic_repair_required", "repair-exhausted-no-change");
+    const subjectAdvance = {
+      ...repair,
+      subject: unpublishedSubject,
+      artifacts: repair.artifacts?.map((artifact) => ({ ...artifact, subject: unpublishedSubject })),
+    };
+
+    expect(reducePipelineEvent({
+      manifest: noChangeExhaustionManifest,
+      instance: exhaustedInstance,
+      attempt,
+      stages: exhaustedStages,
+      event: subjectAdvance,
+    })).toMatchObject({
+      terminalOutcome: "no_change",
+      clearPublishedCommit: true,
+      immutableSubject: unpublishedSubject,
+    });
+
+    const sameSubject = {
+      ...repair,
+      id: "repair-exhausted-no-change-unbound",
+      subject: publishedSubject,
+      artifacts: repair.artifacts?.map((artifact) => ({ ...artifact, subject: publishedSubject })),
+    };
+    expect(() => reducePipelineEvent({
+      manifest: noChangeExhaustionManifest,
+      instance: { ...exhaustedInstance, published_subject: null },
+      attempt,
+      stages: exhaustedStages,
+      event: sameSubject,
+    })).toThrow(/cannot settle terminal without exact published provider evidence/);
+  });
+
   it("does not exhaust the raw attempt budget in the middle of a forward repair round", () => {
     const { manifest, instance, attempt, stages } = setup("core/implement@4");
     const repairedImplementation = reducePipelineEvent({

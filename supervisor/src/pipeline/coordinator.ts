@@ -183,6 +183,32 @@ function eventHasExactPublishedSubject(input: PipelineReductionInput, stage: Pip
     input.event.subject === input.instance.published_subject;
 }
 
+function terminalRequiresExactPublicationEvidence(
+  input: PipelineReductionInput,
+  terminal: PipelineOutcome,
+  clearsPublishedBinding: boolean
+): boolean {
+  return terminal === "shipped"
+    ? successPathIncludesPublication(input.manifest)
+    : terminal === "no_change" &&
+      !clearsPublishedBinding &&
+      (input.instance.published_commit !== null || input.instance.published_subject !== null);
+}
+
+function assertTerminalPublishedBinding(
+  input: PipelineReductionInput,
+  stage: PipelineStage,
+  terminal: PipelineOutcome,
+  clearsPublishedBinding: boolean
+): void {
+  if (
+    terminalRequiresExactPublicationEvidence(input, terminal, clearsPublishedBinding) &&
+    !eventHasExactPublishedSubject(input, stage)
+  ) {
+    throw new Error("publishing pipeline cannot settle terminal without exact published provider evidence");
+  }
+}
+
 function shouldClearPublishedBinding(input: PipelineReductionInput): boolean {
   return input.instance.published_commit !== null &&
     input.event.providerRevision === undefined &&
@@ -548,12 +574,17 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
     if (!targetState) throw new Error(`stage state ${target.id} is absent for pipeline instance ${input.instance.id}`);
     if (isReentry && input.manifest.max_repair_rounds !== undefined &&
       input.instance.reentry_count >= input.manifest.max_repair_rounds) {
+      const clearsPublishedBinding = shouldClearPublishedBinding(input);
       return terminalWrite({
         ...input,
         eventPayloadHash,
         terminal: "failed",
         publishIdempotencyKey: `linear-repair-rounds-exhausted:${input.instance.id}:${input.manifest.max_repair_rounds}`,
         waitReason: `pipeline repair round limit ${input.manifest.max_repair_rounds} exhausted`,
+        immutableSubject: input.event.subject ?? null,
+        publishedCommit: publishedCommitForEvent(input, stage),
+        publishedSubject: publishedSubjectForEvent(input, stage),
+        clearPublishedCommit: clearsPublishedBinding,
         effects: [failedTerminalStopEffect({
           instanceId: input.instance.id,
           idempotencyKey: `stop:${input.instance.id}:repair-rounds-exhausted`,
@@ -563,12 +594,18 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
     }
     if (isReentry && transition.max_reentries !== undefined && targetState.reentry_count >= transition.max_reentries) {
       const exhausted = transition.on_exhausted!;
+      const clearsPublishedBinding = shouldClearPublishedBinding(input);
+      assertTerminalPublishedBinding(input, stage, exhausted, clearsPublishedBinding);
       return terminalWrite({
         ...input,
         eventPayloadHash,
         terminal: exhausted,
         publishIdempotencyKey: `linear-exhausted:${input.instance.id}:${stage.id}:${targetState.reentry_count}`,
         waitReason: `re-entry exhausted at ${stage.id}`,
+        immutableSubject: input.event.subject ?? null,
+        publishedCommit: publishedCommitForEvent(input, stage),
+        publishedSubject: publishedSubjectForEvent(input, stage),
+        clearPublishedCommit: clearsPublishedBinding,
         effects: exhausted === "failed" ? [failedTerminalStopEffect({
           instanceId: input.instance.id,
           idempotencyKey: `stop:${input.instance.id}:reentry-exhausted`,
@@ -582,12 +619,17 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
     // coordinator must not strand a successfully repaired tree before
     // publish/provider.
     if (isReentry && input.instance.attempt_count >= input.manifest.max_attempts) {
+      const clearsPublishedBinding = shouldClearPublishedBinding(input);
       return terminalWrite({
         ...input,
         eventPayloadHash,
         terminal: "failed",
         publishIdempotencyKey: `linear-attempts-exhausted:${input.instance.id}:${input.manifest.max_attempts}`,
         waitReason: `pipeline attempt limit ${input.manifest.max_attempts} exhausted`,
+        immutableSubject: input.event.subject ?? null,
+        publishedCommit: publishedCommitForEvent(input, stage),
+        publishedSubject: publishedSubjectForEvent(input, stage),
+        clearPublishedCommit: clearsPublishedBinding,
         effects: [failedTerminalStopEffect({
           instanceId: input.instance.id,
           idempotencyKey: `stop:${input.instance.id}:attempts-exhausted`,
@@ -659,17 +701,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
 
   const terminal = transition.terminal!;
   const clearsPublishedBinding = shouldClearPublishedBinding(input);
-  const requiresExactPublicationEvidence = terminal === "shipped"
-    ? successPathIncludesPublication(input.manifest)
-    : terminal === "no_change" &&
-      !clearsPublishedBinding &&
-      (input.instance.published_commit !== null || input.instance.published_subject !== null);
-  if (
-    requiresExactPublicationEvidence &&
-    !eventHasExactPublishedSubject(input, stage)
-  ) {
-    throw new Error("publishing pipeline cannot settle terminal without exact published provider evidence");
-  }
+  assertTerminalPublishedBinding(input, stage, terminal, clearsPublishedBinding);
   return terminalWrite({
     ...input,
     eventPayloadHash,
