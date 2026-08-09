@@ -540,8 +540,7 @@ untrusted webhook bodies are never automatically attached to Linear or a PR.
 
 Each reportable child transition -- a unit repair round, a unit settling to
 `completed`/`exited`/`failed`, the whole-change final review passing or
-requesting a repair, the graph stopping, aggregate emission, and a rolling-
-upgrade aggregate correction notice -- inserts one
+requesting a repair, the graph stopping, and aggregate emission -- inserts one
 row into `execution_publication_events` and its correlated `linear_outbox`
 activity row in the same SQL transaction as the durable reducer transition
 that produced it (`supervisor/src/persistence/pipeline/unit-store.ts`). Both
@@ -842,7 +841,7 @@ event described in "Structured child publication" above: one row per
 reportable transition, fenced to its exact execution graph/pipeline
 instance/parent attempt, carrying a per-attempt sequence, an event `kind`
 (`unit_repair`, `unit_settled`, `graph_stopped`, `final_review`, `aggregate`,
-`aggregate_correction`, `steering_undelivered`),
+`steering_undelivered`),
 its sanitized body, and the id of the `linear_outbox` row it produced in the
 same transaction.
 

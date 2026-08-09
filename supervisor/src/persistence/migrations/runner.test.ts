@@ -141,7 +141,6 @@ describe("database migrations", () => {
       "d07f005df485a8b7506a2e81046846c0c070a4790109e22e8c7081df9a2f29f0",
       "f814f7519462623d684c0d8b15f997afeaa4391ac861dc93ecd6dd8326677367",
       "62d23bf76b20a18c4ff15352d3ef1558fe6bb364860d58915a26a84c8a6ed2b3",
-      "4a2ce2b9111394e2cfcf34b6c7489ee5569fc795063ef952a0febcd4905b53a7",
     ]);
   });
 
@@ -1420,15 +1419,6 @@ describe("database migrations", () => {
     expect(table.sql).toMatch(/closed_reason TEXT NOT NULL CHECK\(closed_reason IN \(/);
     expect(table.sql).toMatch(/fault_attribution TEXT CHECK\(/);
     expect(db.prepare("SELECT version FROM schema_migrations WHERE version = 29").get()).toEqual({ version: 29 });
-  });
-
-  it("widens execution_publication_events to typed aggregate correction events", () => {
-    db = new Database(":memory:");
-    applyDatabaseMigrations(db);
-
-    expect(checkConstraintValues(db, "execution_publication_events", "kind"))
-      .toEqual(expect.arrayContaining(["aggregate", "aggregate_correction"]));
-    expect(db.prepare("SELECT version FROM schema_migrations WHERE version = 31").get()).toEqual({ version: 31 });
   });
 
   // The four hand-maintained CHECK vocabularies on run_outcomes (outcome,

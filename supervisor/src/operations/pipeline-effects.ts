@@ -9,7 +9,6 @@ import type {
   PipelineEffectIntent,
   PipelineInstance,
   PipelineRuntimeResource,
-  PipelineStageAttempt,
   PipelineStore,
 } from "../pipeline/store.js";
 import type { StageRequestEnvelope } from "../pipeline/stage-request.js";
@@ -28,7 +27,6 @@ const EFFECT_LEASE_MS = 60_000;
 const RETRY_BASE_MS = 5_000;
 const MAX_EFFECT_ATTEMPTS = 8;
 const CAPACITY_RETRY_MS = 5 * 60_000;
-const ACTIVE_RUNTIME_RECONCILIATION_PAGE_SIZE = 50;
 
 // Deterministic provider failures must not burn the whole retry budget on hot
 // exponential backoff. Auth failures never self-heal, so they exhaust on the
@@ -67,7 +65,6 @@ function classifyEffectError(message: string): EffectErrorClass {
 
 export interface PipelineEffectProcessor {
   drain(): Promise<void>;
-  reconcileWaitingProviderSuccessor(instanceId: string): Promise<void>;
 }
 
 interface PipelineEffectProcessorDeps {
@@ -350,146 +347,6 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     };
   };
 
-  const stopLegacySuccessorActorIfNeeded = async (
-    instance: PipelineInstance,
-    resource: RuntimeResource,
-    successorStageId: string,
-    supplyingParentAttemptId: string | null
-  ): Promise<void> => {
-    const current = deps.store.getInstance(instance.id);
-    const attempt = deps.store.getActiveAttempt(instance.id);
-    if (!current || current.active_stage_id !== successorStageId || !attempt ||
-        attempt.stage_id !== successorStageId || attempt.status !== "running" ||
-        !attempt.run_id || !attempt.expected_subject || !supplyingParentAttemptId) {
-      return;
-    }
-    const legacyGraph = deps.store.getGraphForAttempt(supplyingParentAttemptId);
-    if (!legacyGraph) return;
-    const ticket = deps.tickets.getByIssueId(instance.linear_issue_id);
-    const run = deps.tickets.getRun(attempt.run_id);
-    if (ticket?.run_id && ticket.run_id !== attempt.run_id) return;
-    if (run?.status !== "stopped") {
-      const settlement = await terminateAndSettleActor({
-        runtime: {
-          async stopResource(sandboxId, reason) {
-            const termination = await deps.runtime.stop({ providerResourceId: sandboxId }, reason);
-            if (!termination.confirmed) {
-              throw new Error(`pipeline runtime ${sandboxId} did not confirm termination`);
-            }
-          },
-        },
-        store: deps.tickets,
-        runId: attempt.run_id,
-        sandboxId: resource.providerResourceId,
-        owner: `aggregate-successor-restart:${attempt.id}`,
-        reason: "legacy commit-fenced successor actor replaced by canonical tree-fenced dispatch",
-        faultAttribution: null,
-        status: "stopped",
-        ticketState: "active",
-        ticketFailureTail: null,
-        quarantineOnStopFailure: true,
-      });
-      if (settlement.kind !== "settled") {
-        throw new Error(`successor attempt ${attempt.id} legacy actor could not be terminated for aggregate migration`);
-      }
-    }
-  };
-
-  const downstreamSupplyingCompositeParent = (
-    instance: PipelineInstance,
-    successorStageId: string,
-    completedCompositeAttempts: PipelineStageAttempt[]
-  ): string | null => {
-    const attempt = deps.store.getActiveAttempt(instance.id);
-    if (!attempt || attempt.stage_id !== successorStageId || !attempt.expected_subject) return null;
-    const request = attempt.request_payload ? JSON.parse(attempt.request_payload) as { expectedSubject?: unknown } : null;
-    if (request?.expectedSubject !== attempt.expected_subject) {
-      throw new Error(`successor attempt ${attempt.id} sealed expected subject does not match durable state`);
-    }
-    const matchingParents = completedCompositeAttempts.filter((candidate) => {
-      const graph = deps.store.getGraphForAttempt(candidate.id);
-      return Boolean(
-        graph?.aggregate_emitted_at &&
-        graph.aggregate_artifact_hash &&
-        graph.integration_subject === attempt.expected_subject &&
-        instance.immutable_subject === attempt.expected_subject
-      );
-    });
-    if (matchingParents.length > 1) {
-      throw new Error(`successor attempt ${attempt.id} has ambiguous structured aggregate predecessors`);
-    }
-    return matchingParents[0]?.id ?? null;
-  };
-
-  const completedCompositeAttemptsForSuccessor = (
-    instance: PipelineInstance,
-    successorStageId: string
-  ): PipelineStageAttempt[] => {
-    const manifest = JSON.parse(instance.normalized_manifest) as {
-      stages?: Array<{
-        id: string;
-        executor?: { capability?: string };
-        transitions?: Record<string, { to?: string | null }>;
-      }>;
-    };
-    const stages = new Map((manifest.stages ?? []).map((stage) => [stage.id, stage]));
-    const reachesSuccessor = (stageId: string): boolean => {
-      const visiting = new Set<string>();
-      const visited = new Set<string>();
-      const visit = (currentId: string): boolean => {
-        if (currentId === successorStageId) return true;
-        if (visiting.has(currentId)) {
-          return false;
-        }
-        if (visited.has(currentId)) return false;
-        visiting.add(currentId);
-        const current = stages.get(currentId);
-        if (!current) throw new Error(`pipeline manifest transition references unknown stage ${currentId}`);
-        for (const transition of Object.values(current.transitions ?? {})) {
-          if (typeof transition === "object" && transition !== null && transition.to) {
-            if (visit(transition.to)) return true;
-          }
-        }
-        visiting.delete(currentId);
-        visited.add(currentId);
-        return false;
-      };
-      return visit(stageId);
-    };
-    const compositeStageIds = new Set((manifest.stages ?? []).filter((stage) =>
-      stage.executor?.capability === FOR_EACH_UNIT_CAPABILITY && reachesSuccessor(stage.id)
-    ).map((stage) => stage.id));
-    return deps.store.listAttempts(instance.id)
-      .filter((attempt) => compositeStageIds.has(attempt.stage_id) && attempt.status === "completed");
-  };
-
-  const drainCompletedCompositeParentsForSuccessor = async (
-    resource: RuntimeResource,
-    instance: PipelineInstance,
-    successorStageId: string
-  ): Promise<void> => {
-    const completedCompositeAttempts = completedCompositeAttemptsForSuccessor(instance, successorStageId);
-    const supplyingParentAttemptId = downstreamSupplyingCompositeParent(instance, successorStageId, completedCompositeAttempts);
-    await stopLegacySuccessorActorIfNeeded(instance, resource, successorStageId, supplyingParentAttemptId);
-    for (const attempt of completedCompositeAttempts) {
-      await structuredChildren.drainCompositeChildren(resource, instance, attempt.id, {
-        ...(attempt.id === supplyingParentAttemptId ? { successorStageId } : { suppressLegacyFallback: true }),
-      });
-    }
-  };
-
-  const reconcileWaitingProviderSuccessor = async (instanceId: string): Promise<void> => {
-    const instance = deps.store.getInstance(instanceId);
-    if (!instance || instance.status !== "waiting_provider" || !instance.active_stage_id) return;
-    const attempt = deps.store.getActiveAttempt(instance.id);
-    if (!attempt || attempt.stage_id !== instance.active_stage_id) return;
-    const stage = stageById(instance.normalized_manifest, attempt.stage_id);
-    if (!stage || stage.executor.kind !== "provider_wait") return;
-    const resource = runtimeBindingFor(instance).resource;
-    if (!resource) return;
-    await drainCompletedCompositeParentsForSuccessor(resource, instance, attempt.stage_id);
-  };
-
   const isCurrentIdleWait = (instanceId: string, control: IdleEffectControl): boolean => {
     const current = deps.store.getInstance(instanceId);
     const activeAttempt = deps.store.getActiveAttempt(instanceId);
@@ -510,14 +367,8 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
   ): Promise<void> => {
     const resource = await resourceFor(instance);
     await bootstrap(instance, resource);
-    let currentEffect = effect;
-    if (effect.kind === "dispatch_stage") {
-      const pendingRequest = JSON.parse(effect.payload) as StageRequestEnvelope;
-      await drainCompletedCompositeParentsForSuccessor(resource, instance, pendingRequest.stageId);
-      currentEffect = deps.store.getEffect(effect.id) ?? effect;
-    }
-    const request = currentEffect.kind === "dispatch_stage"
-      ? parseRequest(currentEffect, deps.store)
+    const request = effect.kind === "dispatch_stage"
+      ? parseRequest(effect, deps.store)
       : parseProvisionRequest(effect, deps.store);
     if (request.capability === FOR_EACH_UNIT_CAPABILITY) {
       if (request.pipelineInstanceId !== instance.id || request.generation !== instance.generation) {
@@ -528,7 +379,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       await deps.runtime.prepareCompositeWorkspace(resource, request);
       structuredChildren.seedCompositeGraph(instance, request);
       await structuredChildren.drainCompositeChildren(resource, instance, request.attemptId);
-      acknowledgeEffect(currentEffect, eventId, {
+      acknowledgeEffect(effect, eventId, {
         providerResourceId: resource.providerResourceId,
         compositeGraphId: deps.store.getGraphForAttempt(request.attemptId)?.id ?? null,
       });
@@ -544,7 +395,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       return;
     }
     const dispatched = await dispatch(instance, resource, request);
-    acknowledgeEffect(currentEffect, eventId, { providerResourceId: resource.providerResourceId, ...dispatched });
+    acknowledgeEffect(effect, eventId, { providerResourceId: resource.providerResourceId, ...dispatched });
   };
 
   const handleStopEffect = async (
@@ -781,47 +632,6 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     }
   };
 
-  const drainActiveSuccessorReconciliations = async (): Promise<void> => {
-    const drained = new Set<string>();
-    const drainInstance = async (instance: PipelineInstance, resource: RuntimeResource, successorStageId: string): Promise<void> => {
-      const key = `${instance.id}:${successorStageId}`;
-      if (drained.has(key)) return;
-      drained.add(key);
-      await drainCompletedCompositeParentsForSuccessor(resource, instance, successorStageId);
-    };
-    let cursor: { updatedAt: string; id: string } | null = null;
-    while (true) {
-      const activeInstances = deps.store.listActiveRuntimeInstancesAfter(
-        cursor,
-        ACTIVE_RUNTIME_RECONCILIATION_PAGE_SIZE
-      );
-      if (activeInstances.length === 0) break;
-      for (const instance of activeInstances) {
-        cursor = { updatedAt: instance.updated_at, id: instance.id };
-        if (!instance.active_stage_id) continue;
-        const attempt = deps.store.getActiveAttempt(instance.id);
-        if (!attempt || attempt.status !== "running" || !attempt.run_id) continue;
-        const binding = runtimeBindingFor(instance);
-        if (!binding.resource || binding.status !== "active") continue;
-        await drainInstance(instance, binding.resource, attempt.stage_id);
-      }
-      if (activeInstances.length < ACTIVE_RUNTIME_RECONCILIATION_PAGE_SIZE) break;
-    }
-    cursor = null;
-    while (true) {
-      const waitingInstances = deps.store.listWaitingProviderInstancesAfter(
-        cursor,
-        ACTIVE_RUNTIME_RECONCILIATION_PAGE_SIZE
-      );
-      if (waitingInstances.length === 0) break;
-      for (const instance of waitingInstances) {
-        cursor = { updatedAt: instance.updated_at, id: instance.id };
-        await reconcileWaitingProviderSuccessor(instance.id);
-      }
-      if (waitingInstances.length < ACTIVE_RUNTIME_RECONCILIATION_PAGE_SIZE) break;
-    }
-  };
-
   const enqueueCapacityWaitActivity = (effect: PipelineEffectIntent, message: string): void => {
     try {
       const id = `capacity-wait:${effect.id}`;
@@ -940,7 +750,6 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
   };
 
   return {
-    reconcileWaitingProviderSuccessor,
     async drain() {
       if (draining) return;
       draining = true;
@@ -951,7 +760,6 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
           new Date(current.getTime() + EFFECT_LEASE_MS).toISOString()
         );
         await Promise.all(effects.map(processClaimed));
-        await drainActiveSuccessorReconciliations();
         await drainActiveCompositeGraphs();
       } finally {
         draining = false;

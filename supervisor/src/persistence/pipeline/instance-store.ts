@@ -54,9 +54,6 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
   | "getRuntimeResource"
   | "setRuntimeResourceStatus"
   | "listReclaimableRuntimeResources"
-  | "listActiveRuntimeInstances"
-  | "listActiveRuntimeInstancesAfter"
-  | "listWaitingProviderInstancesAfter"
   | "getInstanceByRuntimeResourceId"
   | "getActiveAttempt"
   | "listAttempts"
@@ -95,54 +92,6 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
         AND terminal_outcome IS NULL
         AND status NOT IN ('shipped', 'no_change', 'needs_human', 'canceled', 'superseded', 'failed')
     `).all(issueId, currentSessionId) as PipelineInstance[];
-
-  const listActiveRuntimeInstancesAfter = (
-    cursor: { updatedAt: string; id: string } | null,
-    limit = 50
-  ): PipelineInstance[] => {
-    const instances = (cursor
-      ? db.prepare(`
-        SELECT * FROM pipeline_instances
-        WHERE runtime_resource_status = 'active'
-          AND status IN ('running', 'dispatchable')
-          AND (updated_at > ? OR (updated_at = ? AND id > ?))
-        ORDER BY updated_at, id LIMIT ?
-      `).all(cursor.updatedAt, cursor.updatedAt, cursor.id, limit)
-      : db.prepare(`
-        SELECT * FROM pipeline_instances
-        WHERE runtime_resource_status = 'active'
-          AND status IN ('running', 'dispatchable')
-        ORDER BY updated_at, id LIMIT ?
-      `).all(limit)) as PipelineInstance[];
-    for (const instance of instances) validatePinnedInstance(db, instance);
-    return instances;
-  };
-
-  const listWaitingProviderInstancesAfter = (
-    cursor: { updatedAt: string; id: string } | null,
-    limit = 50
-  ): PipelineInstance[] => {
-    const instances = (cursor
-      ? db.prepare(`
-        SELECT DISTINCT pi.* FROM pipeline_instances pi
-        JOIN pipeline_stage_attempts psa
-          ON psa.pipeline_instance_id = pi.id AND psa.stage_id = pi.active_stage_id
-        WHERE pi.status = 'waiting_provider'
-          AND psa.status IN ('pending', 'leased', 'dispatched', 'acknowledged', 'running')
-          AND (pi.updated_at > ? OR (pi.updated_at = ? AND pi.id > ?))
-        ORDER BY pi.updated_at, pi.id LIMIT ?
-      `).all(cursor.updatedAt, cursor.updatedAt, cursor.id, limit)
-      : db.prepare(`
-        SELECT DISTINCT pi.* FROM pipeline_instances pi
-        JOIN pipeline_stage_attempts psa
-          ON psa.pipeline_instance_id = pi.id AND psa.stage_id = pi.active_stage_id
-        WHERE pi.status = 'waiting_provider'
-          AND psa.status IN ('pending', 'leased', 'dispatched', 'acknowledged', 'running')
-        ORDER BY pi.updated_at, pi.id LIMIT ?
-      `).all(limit)) as PipelineInstance[];
-    for (const instance of instances) validatePinnedInstance(db, instance);
-    return instances;
-  };
 
   const getSupersedableAttempt = (instanceId: string): PipelineStageAttempt | undefined =>
     db.prepare(`
@@ -658,11 +607,6 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
         ORDER BY runtime_resource_updated_at LIMIT ?
       `).all(cutoffIso, limit) as PipelineInstance[];
     },
-    listActiveRuntimeInstances(limit = 50) {
-      return listActiveRuntimeInstancesAfter(null, limit);
-    },
-    listActiveRuntimeInstancesAfter,
-    listWaitingProviderInstancesAfter,
     getInstanceByRuntimeResourceId(providerResourceId) {
       return getInstanceByRuntimeResourceIdStmt.get(providerResourceId) as PipelineInstance | undefined;
     },

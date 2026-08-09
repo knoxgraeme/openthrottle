@@ -448,15 +448,6 @@ export interface PipelineStore extends ChildActionLivenessPort {
    * before deleting: this listing can be stale by the time it is consumed.
    */
   listReclaimableRuntimeResources(cutoffIso: string, limit?: number): PipelineInstance[];
-  listActiveRuntimeInstances(limit?: number): PipelineInstance[];
-  listActiveRuntimeInstancesAfter(
-    cursor: { updatedAt: string; id: string } | null,
-    limit?: number
-  ): PipelineInstance[];
-  listWaitingProviderInstancesAfter(
-    cursor: { updatedAt: string; id: string } | null,
-    limit?: number
-  ): PipelineInstance[];
   getActiveAttempt(instanceId: string): PipelineStageAttempt | undefined;
   listAttempts(instanceId: string): PipelineStageAttempt[];
   listProviderReadyInstances(limit?: number): PipelineInstance[];

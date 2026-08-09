@@ -11,7 +11,6 @@ export type FeedbackSnapshotDrainSource =
   | typeof DEFAULT_FEEDBACK_SNAPSHOT_DRAIN_SOURCE
   | "periodic-feedback-drain"
   | "github-webhook";
-export type WaitingProviderReconciler = (instanceId: string) => Promise<void>;
 const TERMINAL_PIPELINE_STATUSES = new Set([
   "shipped",
   "no_change",
@@ -95,22 +94,6 @@ export function providerStageCanReceive(
   const activeStage = manifest.stages.find((stage) => stage.id === instance.active_stage_id);
   const activeAttempt = pipelines.getActiveAttempt(instance.id);
   return activeStage?.executor.kind === "provider_wait" && activeAttempt?.stage_id === activeStage.id;
-}
-
-export async function reconcileProviderWaitBeforeEvidence(params: {
-  pipelines: PipelineStore;
-  instanceId: string;
-  currentInstance?: PipelineInstance;
-  reconcileWaitingProviderSuccessor?: WaitingProviderReconciler;
-}): Promise<PipelineInstance> {
-  if (params.reconcileWaitingProviderSuccessor) {
-    await params.reconcileWaitingProviderSuccessor(params.instanceId);
-  }
-  const instance = typeof params.pipelines.getInstance === "function"
-    ? params.pipelines.getInstance(params.instanceId)
-    : params.currentInstance;
-  if (!instance) throw new Error(`unknown pipeline instance ${params.instanceId}`);
-  return instance;
 }
 
 export function pipelineIsTerminal(instance: PipelineInstance): boolean {
@@ -415,30 +398,23 @@ function markStaleFeedbackWithNotice(params: {
   });
 }
 
-export async function processPipelineFeedbackSnapshot(params: {
+export function processPipelineFeedbackSnapshot(params: {
   pipelines: PipelineStore;
   store: SupervisorStore;
   instance: PipelineInstance;
   snapshot: FeedbackSnapshot;
   acknowledgedPublicationSubjects?: ReadonlySet<string>;
   drainSource?: FeedbackSnapshotDrainSource;
-  reconcileWaitingProviderSuccessor?: WaitingProviderReconciler;
-}): Promise<boolean> {
-  const instance = await reconcileProviderWaitBeforeEvidence({
-    pipelines: params.pipelines,
-    instanceId: params.instance.id,
-    currentInstance: params.instance,
-    reconcileWaitingProviderSuccessor: params.reconcileWaitingProviderSuccessor,
-  });
-  const canCheckCarryForward = snapshotCouldCarryForward(params.snapshot, instance);
+}): boolean {
+  const canCheckCarryForward = snapshotCouldCarryForward(params.snapshot, params.instance);
   const subjects = canCheckCarryForward
-    ? params.acknowledgedPublicationSubjects ?? acknowledgedPublicationSubjects(params.pipelines, instance.id)
+    ? params.acknowledgedPublicationSubjects ?? acknowledgedPublicationSubjects(params.pipelines, params.instance.id)
     : undefined;
   if (subjects && snapshotCompletedRepairBeforeCurrentPublication(
     params.pipelines,
     subjects,
     params.snapshot,
-    instance
+    params.instance
   )) {
     params.store.consumeFeedbackSnapshot(params.snapshot.id);
     return false;
@@ -447,20 +423,20 @@ export async function processPipelineFeedbackSnapshot(params: {
   // repair request that caused this republish. The provider watermark tracks
   // the latest event in the snapshot, so delayed post-publication stale anchors
   // appended to an older snapshot cannot ride along with pre-publication events.
-  const canCarryPastFirstRepair = instance.reentry_count === 0 ||
-    snapshotFeedbackPredatesCurrentPublication(params.pipelines, params.snapshot, instance);
-  const currentSnapshot = subjects && snapshotCanCarryForward(subjects, params.snapshot, instance)
+  const canCarryPastFirstRepair = params.instance.reentry_count === 0 ||
+    snapshotFeedbackPredatesCurrentPublication(params.pipelines, params.snapshot, params.instance);
+  const currentSnapshot = subjects && snapshotCanCarryForward(subjects, params.snapshot, params.instance)
     && canCarryPastFirstRepair
     ? params.store.carryForwardFeedbackSnapshot(
       params.snapshot.id,
-      instance.published_commit!,
-      pipelineFeedbackWorkItemId(instance.id, instance.published_commit!)
+      params.instance.published_commit!,
+      pipelineFeedbackWorkItemId(params.instance.id, params.instance.published_commit!)
     ) ?? params.snapshot
     : params.snapshot;
-  if (!snapshotBelongsToInstance(currentSnapshot, instance)) {
+  if (!snapshotBelongsToInstance(currentSnapshot, params.instance)) {
     markStaleFeedbackWithNotice({
       store: params.store,
-      instance,
+      instance: params.instance,
       snapshot: currentSnapshot,
       eventCount: 1,
     });
@@ -471,7 +447,7 @@ export async function processPipelineFeedbackSnapshot(params: {
     if (claim.status === "stale") {
       markStaleFeedbackWithNotice({
         store: params.store,
-        instance,
+        instance: params.instance,
         snapshot: claim.snapshot ?? currentSnapshot,
         eventCount: claim.eventCount ?? 0,
       });
@@ -479,10 +455,10 @@ export async function processPipelineFeedbackSnapshot(params: {
     return false;
   }
   const events = claim.events.map((event) => ({ event, parsed: parseStoredPipelineEvent(event) }));
-  const revisionMatches = instance.published_commit !== null &&
-    claim.snapshot.head_sha === instance.published_commit;
+  const revisionMatches = params.instance.published_commit !== null &&
+    claim.snapshot.head_sha === params.instance.published_commit;
   const neutralSelfSynchronizeRace = revisionMatches &&
-    currentPublicationRecorded(params.pipelines, instance);
+    currentPublicationRecorded(params.pipelines, params.instance);
   const eventsWithFindings = events.map(({ event, parsed }) => ({
     event,
     parsed,
@@ -516,7 +492,7 @@ export async function processPipelineFeedbackSnapshot(params: {
   const artifactFindings = findings.slice(0, 50);
   processProviderEvidence(params.pipelines, {
     id: `provider-feedback-snapshot:${claim.snapshot.id}`,
-    instanceId: instance.id,
+    instanceId: params.instance.id,
     outcome,
     summary: revisionMatches
       ? `Immutable provider snapshot contains ${events.length} event(s) for the published commit.`
@@ -526,7 +502,7 @@ export async function processPipelineFeedbackSnapshot(params: {
     providerPayload: {
       snapshot_id: claim.snapshot.id,
       repair_round: claim.snapshot.repair_round,
-      expected_published_commit: instance.published_commit,
+      expected_published_commit: params.instance.published_commit,
       // Seal against the head the evidence was actually observed against, not
       // the drainable head it was carried forward to; the latter would falsely
       // claim a superseded review was observed against the current subject.
@@ -543,39 +519,25 @@ export async function processPipelineFeedbackSnapshot(params: {
   return true;
 }
 
-export async function drainPipelineFeedbackSnapshots(
+export function drainPipelineFeedbackSnapshots(
   pipelines: PipelineStore,
   store: SupervisorStore,
-  optionsOrLimit: number | {
-    limit?: number;
-    reconcileWaitingProviderSuccessor?: WaitingProviderReconciler;
-  } = 50
-): Promise<number> {
-  const limit = typeof optionsOrLimit === "number" ? optionsOrLimit : optionsOrLimit.limit ?? 50;
-  const reconcileWaitingProviderSuccessor = typeof optionsOrLimit === "number"
-    ? undefined
-    : optionsOrLimit.reconcileWaitingProviderSuccessor;
+  limit = 50
+): number {
   let processed = 0;
-  for (const listedInstance of pipelines.listProviderReadyInstances(limit)) {
-    const instance = await reconcileProviderWaitBeforeEvidence({
-      pipelines,
-      instanceId: listedInstance.id,
-      currentInstance: listedInstance,
-      reconcileWaitingProviderSuccessor,
-    });
+  for (const instance of pipelines.listProviderReadyInstances(limit)) {
     if (!providerStageCanReceive(pipelines, instance)) continue;
     const snapshots = store.listPendingFeedbackSnapshots(instance.linear_session_id, limit);
     if (snapshots.length === 0) continue;
     const publicationSubjects = acknowledgedPublicationSubjects(pipelines, instance.id);
     for (const snapshot of snapshots) {
-      if (await processPipelineFeedbackSnapshot({
+      if (processPipelineFeedbackSnapshot({
         pipelines,
         store,
         instance,
         snapshot,
         acknowledgedPublicationSubjects: publicationSubjects,
         drainSource: "periodic-feedback-drain",
-        reconcileWaitingProviderSuccessor,
       })) {
         processed += 1;
         break;

@@ -694,28 +694,11 @@ export function processProviderEvidence(
   return coordinatePipelineEvent(store, event, undefined, providerGateReceipt(instance, attempt, stage, event));
 }
 
-type DeferredProviderReconciler = (instanceId: string) => Promise<void>;
-
-export async function drainDeferredProviderEvidence(
-  store: PipelineStore,
-  optionsOrLimit: number | {
-    limit?: number;
-    reconcileWaitingProviderSuccessor?: DeferredProviderReconciler;
-  } = 50
-): Promise<number> {
-  const limit = typeof optionsOrLimit === "number" ? optionsOrLimit : optionsOrLimit.limit ?? 50;
-  const reconcileWaitingProviderSuccessor = typeof optionsOrLimit === "number"
-    ? undefined
-    : optionsOrLimit.reconcileWaitingProviderSuccessor;
+export function drainDeferredProviderEvidence(store: PipelineStore, limit = 50): number {
   let processed = 0;
   for (const record of store.listPendingInboxEvents("provider_snapshot", limit)) {
-    let instance = store.getInstance(record.pipeline_instance_id);
+    const instance = store.getInstance(record.pipeline_instance_id);
     if (!instance || instance.status !== "waiting_provider") continue;
-    if (reconcileWaitingProviderSuccessor) {
-      await reconcileWaitingProviderSuccessor(instance.id);
-      instance = store.getInstance(record.pipeline_instance_id);
-      if (!instance || instance.status !== "waiting_provider") continue;
-    }
     const event = JSON.parse(record.payload) as PipelineCoordinatorEvent;
     const attempt = store.getAttempt(event.attemptId);
     if (!attempt || attempt.pipeline_instance_id !== instance.id) {

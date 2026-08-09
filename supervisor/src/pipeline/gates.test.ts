@@ -962,53 +962,6 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
-  it("fails closed before recording provider feedback when waiting-provider reconciliation fails", async () => {
-    const fixture = setup("core/implement@4");
-    const publishedSubject = "2".repeat(40);
-    const publishedCommit = "b".repeat(40);
-    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
-    fixture.tickets.setSetting("github-head:issue-1", publishedCommit);
-    settleForwardChainToPublish(fixture, publishedSubject, "1".repeat(40), 1);
-    settleCurrentStage(fixture, "success", {
-      id: "publish-before-provider-race",
-      subject: publishedSubject,
-      preSubject: publishedSubject,
-      details: {
-        proposal_schema: "openthrottle.stage-proposal/v1",
-        published_commit: publishedCommit,
-        provider_revision: publishedCommit,
-      },
-    });
-    const calls: string[] = [];
-
-    await expect(routePipelineProviderEvent({
-      pipelines: fixture.pipelines,
-      store: fixture.tickets,
-      ticket: fixture.tickets.getByIssueId("issue-1")!,
-      eventId: "github-review:reconcile-fails-before-record",
-      outcome: "semantic_repair_required",
-      summary: "Provider feedback must not persist before reconciliation.",
-      evidence: ["https://github.com/owner/repo/pull/1#discussion"],
-      payload: { kind: "review", id: "reconcile-fails-before-record" },
-      headSha: publishedCommit,
-      pullRequestUrl: "https://github.com/owner/repo/pull/1",
-      reconcileWaitingProviderSuccessor: async (instanceId) => {
-        calls.push(instanceId);
-        throw new Error("legacy aggregate reconciliation not complete");
-      },
-    })).rejects.toThrow(/legacy aggregate reconciliation not complete/);
-
-    expect(calls).toEqual([fixture.instance.id]);
-    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM feedback_snapshots").get())
-      .toEqual({ count: 0 });
-    expect(fixture.pipelines.getInboxEvent("github-review:reconcile-fails-before-record")).toBeUndefined();
-    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
-      status: "waiting_provider",
-      active_stage_id: "provider",
-      immutable_subject: publishedSubject,
-    });
-  });
-
   it("fails closed when a queued synchronize head differs from the settled publish subject", async () => {
     const fixture = setup("core/implement@4");
     const oldPublishedCommit = "a".repeat(40);
@@ -1258,72 +1211,6 @@ describe("deterministic supervisor stage gates", () => {
     ).get(fixture.attempt.id)).toEqual({ evaluator_kind: "provider", result: "passed" });
   });
 
-  it("reconciles deferred provider evidence before settlement and leaves stale legacy evidence pending", async () => {
-    const fixture = setup("core/implement@4");
-    const legacySubject = SUBJECT;
-    const canonicalSubject = "9".repeat(40);
-    const publishedCommit = "d".repeat(40);
-    fixture.db.prepare(`
-      UPDATE pipeline_stage_attempts
-      SET stage_id = 'provider', native_context_policy = 'none', expected_subject = ?
-      WHERE id = ?
-    `).run(legacySubject, fixture.attempt.id);
-    fixture.db.prepare(`
-      UPDATE pipeline_instances
-      SET status = 'completion_pending_publication', active_stage_id = 'provider',
-          immutable_subject = ?, published_commit = ?, published_subject = ?
-      WHERE id = ?
-    `).run(legacySubject, publishedCommit, legacySubject, fixture.instance.id);
-    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
-    fixture.tickets.setSetting("github-head:issue-1", publishedCommit);
-
-    expect(await routePipelineProviderEvent({
-      pipelines: fixture.pipelines,
-      store: fixture.tickets,
-      ticket: fixture.tickets.getByIssueId("issue-1")!,
-      eventId: "provider-success-before-wait-reconcile",
-      outcome: "success",
-      summary: "GitHub reports the pull request merged.",
-      evidence: ["https://github.com/owner/repo/pull/1"],
-      payload: { merged: true, head_sha: publishedCommit },
-      headSha: publishedCommit,
-      pullRequestUrl: "https://github.com/owner/repo/pull/1",
-    })).toBe(true);
-    const pendingEvent = fixture.pipelines.getInboxEvent("provider-success-before-wait-reconcile")!;
-    expect(pendingEvent).toMatchObject({ status: "pending" });
-    expect((JSON.parse(pendingEvent.payload) as { subject?: string }).subject).toBe(legacySubject);
-
-    fixture.db.prepare("UPDATE pipeline_instances SET status = 'waiting_provider' WHERE id = ?")
-      .run(fixture.instance.id);
-    const reconciled: string[] = [];
-    await expect(drainDeferredProviderEvidence(fixture.pipelines, {
-      reconcileWaitingProviderSuccessor: async (instanceId) => {
-        reconciled.push(instanceId);
-        fixture.db.prepare(`
-          UPDATE pipeline_instances
-          SET immutable_subject = ?, published_subject = ?
-          WHERE id = ?
-        `).run(canonicalSubject, canonicalSubject, instanceId);
-        fixture.db.prepare(`
-          UPDATE pipeline_stage_attempts
-          SET expected_subject = ?
-          WHERE id = ?
-        `).run(canonicalSubject, fixture.attempt.id);
-      },
-    })).rejects.toThrow(/pipeline event subject is stale/);
-
-    expect(reconciled).toEqual([fixture.instance.id]);
-    const stillPendingEvent = fixture.pipelines.getInboxEvent("provider-success-before-wait-reconcile")!;
-    expect(stillPendingEvent).toMatchObject({ status: "pending" });
-    expect((JSON.parse(stillPendingEvent.payload) as { subject?: string }).subject).toBe(legacySubject);
-    expect(fixture.db.prepare("SELECT COUNT(*) FROM pipeline_gate_receipts").pluck().get()).toBe(0);
-    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
-      status: "waiting_provider",
-      immutable_subject: canonicalSubject,
-      terminal_outcome: null,
-    });
-  });
-
   it.each([
     { merged: true, terminalOutcome: "shipped" },
     { merged: false, terminalOutcome: "no_change" },
@@ -1376,7 +1263,6 @@ describe("deterministic supervisor stage gates", () => {
       terminal_outcome: terminalOutcome,
     });
   });
-
   it("scopes merged pull request journal idempotency keys by repository", async () => {
     const recordJournalEntry = vi.fn();
     const ticket = {
@@ -3171,12 +3057,12 @@ describe("deterministic supervisor stage gates", () => {
       payload: canonicalJson({ incompatible: true }),
     });
 
-    await expect(processPipelineFeedbackSnapshot({
+    expect(() => processPipelineFeedbackSnapshot({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       instance: fixture.pipelines.getInstance(fixture.instance.id)!,
       snapshot,
-    })).rejects.toThrow(/different intent/);
+    })).toThrow(/different intent/);
     expect(fixture.db.prepare("SELECT status, head_sha FROM feedback_snapshots WHERE id = ?").get(snapshot.id))
       .toEqual({ status: "collecting", head_sha: staleHead });
   });
