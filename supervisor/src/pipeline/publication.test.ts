@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSupervisorStore, type SupervisorStore } from "../persistence/store.js";
@@ -37,6 +38,10 @@ import type {
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
+const legacyPublicationPreV25Path = fileURLToPath(new URL(
+  "../__fixtures__/legacy-publication-envelope-pre-v25.json",
+  import.meta.url
+));
 const runtime = buildInstalledRuntimeDescriptor("publication-test/v1");
 const SUBJECT = "c".repeat(40);
 
@@ -593,50 +598,28 @@ describe("pipeline publication", () => {
   });
 
   it("parses and renders a structured_execution envelope persisted before activity_log existed", () => {
-    const { instance, attempt } = setup();
-    const input = event(instance, attempt);
-    const publication = buildStagePublication({
-      instance,
-      attempt,
-      event: input.event,
-      write: {
-        instanceId: instance.id,
-        eventId: input.event.id,
-        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
-        expectedVersion: instance.state_version,
-        expectedStatus: instance.status,
-        attemptId: attempt.id,
-        outcome: "success",
-        resultHash: input.event.resultHash,
-        nextStatus: "dispatchable",
-        nextStageId: "publish",
-        effects: [],
-      },
-      gateReceipt: input.receipt,
-      structuredExecution: {
-        graph: {
-          id: "graph-1",
-          parent_attempt_id: attempt.id,
-          parent_stage_id: attempt.stage_id,
-          integration_subject: SUBJECT,
-          aggregate_artifact_hash: null,
-          aggregate_emitted_at: null,
-          stopped_at: null,
-          stop_reason: null,
-        },
-        units: [],
-        activity_log: [],
-      },
-    });
-    const legacyStructuredExecution = { ...publication.structured_execution } as Record<string, unknown>;
-    delete legacyStructuredExecution.activity_log;
-    const legacyPublication = { ...publication, structured_execution: legacyStructuredExecution };
-    const parsed = parsePipelinePublication(canonicalJson(legacyPublication));
+    const persistedLegacyPublication = readFileSync(legacyPublicationPreV25Path, "utf8").replace(/\r?\n$/, "");
+    const expectedLegacyPublication = JSON.parse(persistedLegacyPublication);
+    const parsed = parsePipelinePublication(persistedLegacyPublication);
+    const ledger = executionLedgerLines(parsed.structured_execution).join("\n");
 
-    expect(parsed.structured_execution).toBeDefined();
+    expect(parsed).toEqual(expectedLegacyPublication);
     expect(parsed.structured_execution && "activity_log" in parsed.structured_execution).toBe(false);
-    expect(() => executionLedgerLines(parsed.structured_execution)).not.toThrow();
-    expect(executionLedgerLines(parsed.structured_execution).join("\n")).not.toContain("Structured Activity Log");
+    expect(parsed.structured_execution?.activity_log ?? []).toEqual([]);
+    expect(parsed.structured_execution?.graph).toEqual({
+      id: "graph-legacy-pre-v25",
+      parent_attempt_id: "attempt-parent-legacy",
+      parent_stage_id: "structured",
+      integration_subject: "abcdef1234567890abcdef1234567890abcdef12",
+      aggregate_artifact_hash: "aggregate-hash-legacy",
+      aggregate_emitted_at: "2026-07-29T00:03:00.000Z",
+      stopped_at: null,
+      stop_reason: null,
+    });
+    expect(parsed.structured_execution?.units[0]?.gates[0]?.reason).toBe("Lead accepted the legacy unit.");
+    expect(parsed.structured_execution?.units[0]?.downstream_context[0]?.summary).toBe("Legacy downstream context survives parsing.");
+    expect(ledger).toContain("legacy_envelope_pin: completed");
+    expect(ledger).not.toContain("Structured Activity Log");
   });
 
   it("keeps persisted v1 publication envelopes parseable after the template bump", () => {
