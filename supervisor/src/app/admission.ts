@@ -577,6 +577,11 @@ async function resolvePipelineSelection(
       description: SIMPLE_IMPLEMENT_DESCRIPTION,
       maxAttempts: 200,
       maxRepairRounds: 5,
+    } : source.ref === "core/structured@1" ? {
+      id: `builtin/${graphId}`,
+      version: 1,
+      description: `Compiled execution graph ${graphId} from ${blobDescription}.`,
+      maxAttempts: 200,
     } : builtinGraph ? {
       id: builtinGraph.id,
       version: builtinGraph.version,

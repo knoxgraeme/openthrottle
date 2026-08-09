@@ -2088,6 +2088,61 @@ intents:
     });
   });
 
+  it("preserves legacy structured v1 identity for custom graph ids", async () => {
+    const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
+    executionPlan.graph_id = "release";
+    const context = [
+      "# Structured work",
+      "",
+      "```json openthrottle.execution-plan/v1",
+      JSON.stringify(executionPlan, null, 2),
+      "```",
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "release" }, null, 2),
+      "```",
+    ].join("\n");
+    const config = `schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: release
+    kind: builtin
+    ref: core/structured@1
+pipelines: { implement: implement }
+intents:
+  implement:
+    default_graph: simple
+    allowed_graphs: [simple, release]
+`;
+
+    const { pipelines, invoke, setRepositoryConfig } =
+      await run(config, {}, shippedCatalogPath, payload("session-1", "issue-1", "OT-1", context));
+    const legacyInstance = pipelines.getInstanceForSession("session-1")!;
+    const legacyManifest = JSON.parse(legacyInstance.normalized_manifest) as {
+      description: string;
+      stages: Array<{ id: string; transitions: { success: unknown } }>;
+    };
+    expect(legacyInstance).toMatchObject({
+      pipeline_id: "builtin/release",
+      pipeline_version: 1,
+      active_stage_id: "units",
+    });
+    expect(legacyManifest.description).toBe("Compiled execution graph release from builtin core/structured@1.");
+    expect(legacyManifest.stages.map((stage) => stage.id)).toEqual(["units"]);
+    expect(legacyManifest.stages[0]?.transitions.success).toEqual({ terminal: "shipped" });
+
+    setRepositoryConfig(config.replace("ref: core/structured@1", "ref: core/structured@2"));
+    await invoke({}, payload("session-2", "issue-2", "OT-2", context));
+    const upgradedInstance = pipelines.getInstanceForSession("session-2")!;
+    expect(upgradedInstance).toMatchObject({
+      pipeline_id: "builtin/structured",
+      pipeline_version: 2,
+      active_stage_id: "units",
+    });
+  });
+
   it("fails closed for unknown built-in structured versions", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "structured";
