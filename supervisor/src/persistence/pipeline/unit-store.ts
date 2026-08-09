@@ -28,7 +28,12 @@ import {
   type UnitPhase,
   type UnitTerminalReason,
 } from "../../pipeline/unit-coordinator.js";
-import { deterministicId, insertExecutionPublicationEvent, listExecutionPublicationEvents } from "./helpers.js";
+import {
+  deterministicId,
+  insertExecutionPublicationEvent,
+  listExecutionPublicationEvents,
+  migrateAggregatePublicationActivity,
+} from "./helpers.js";
 import {
   createOrResumeFinalAction,
   createOrResumeUnitAction,
@@ -1212,18 +1217,32 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     if (!graph.aggregate_emitted_at) {
       throw new Error(`execution graph ${graph.id} has no aggregate marker to migrate`);
     }
-    if (graph.aggregate_artifact_hash === input.toArtifactHash) return "already_canonical";
+    const migrateActivity = (timestamp: string) => migrateAggregatePublicationActivity({
+      db,
+      graph,
+      fromArtifactHash: input.fromArtifactHash,
+      toArtifactHash: input.toArtifactHash,
+      timestamp,
+    });
+    if (graph.aggregate_artifact_hash === input.toArtifactHash) {
+      migrateActivity(now());
+      return "already_canonical";
+    }
     if (graph.aggregate_artifact_hash !== input.fromArtifactHash) {
       throw new Error(`execution graph ${graph.id} aggregate marker does not match migration source`);
     }
+    const timestamp = now();
     const update = db.prepare(`
       UPDATE execution_graphs
       SET aggregate_artifact_hash = ?, updated_at = ?
       WHERE parent_attempt_id = ?
         AND aggregate_emitted_at IS NOT NULL
         AND aggregate_artifact_hash = ?
-    `).run(input.toArtifactHash, now(), input.parentAttemptId, input.fromArtifactHash);
-    if (update.changes === 1) return "migrated";
+    `).run(input.toArtifactHash, timestamp, input.parentAttemptId, input.fromArtifactHash);
+    if (update.changes === 1) {
+      migrateActivity(timestamp);
+      return "migrated";
+    }
     const current = graphStmt.get(input.parentAttemptId) as ExecutionUnitGraph | undefined;
     if (current?.aggregate_artifact_hash === input.toArtifactHash) return "already_canonical";
     throw new Error(`execution graph ${graph.id} aggregate marker compare-and-set failed`);

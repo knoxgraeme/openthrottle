@@ -391,6 +391,159 @@ export function insertExecutionPublicationEvent(input: {
   );
 }
 
+function aggregateCorrectionBody(fromArtifactHash: string, toArtifactHash: string): string {
+  return `Structured execution aggregate corrected: legacy aggregate ${fromArtifactHash} migrated to canonical aggregate ${toArtifactHash}.`;
+}
+
+function activityOutboxPayload(input: {
+  sessionId: string;
+  body: string;
+}): string {
+  return canonicalJson({
+    type: "activity",
+    activity: {
+      sessionId: input.sessionId,
+      type: "thought" as const,
+      body: input.body,
+      ephemeral: false,
+    },
+  });
+}
+
+function updateAggregateEventBody(input: {
+  db: Database.Database;
+  graphId: string;
+  eventId: string;
+  fromBody: string;
+  toBody: string;
+}): void {
+  const eventUpdate = input.db.prepare(`
+    UPDATE execution_publication_events
+    SET body = ?
+    WHERE id = ? AND body = ?
+  `).run(input.toBody, input.eventId, input.fromBody);
+  if (eventUpdate.changes !== 1) {
+    throw new Error(`execution graph ${input.graphId} aggregate event compare-and-set failed`);
+  }
+}
+
+export function migrateAggregatePublicationActivity(input: {
+  db: Database.Database;
+  graph: { id: string; pipeline_instance_id: string; parent_attempt_id: string };
+  fromArtifactHash: string;
+  toArtifactHash: string;
+  timestamp: string;
+}): "migrated" | "already_canonical" | "correction_recorded" {
+  const aggregateEventId = deterministicId("execution-activity-aggregate", [input.graph.parent_attempt_id]);
+  const correctionEventId = deterministicId("execution-activity-aggregate-correction", [
+    input.graph.parent_attempt_id,
+    input.fromArtifactHash,
+    input.toArtifactHash,
+  ]);
+  const correction = input.db.prepare(
+    "SELECT 1 FROM execution_publication_events WHERE id = ?"
+  ).get(correctionEventId);
+  const event = input.db.prepare(`
+    SELECT e.id, e.body, e.linear_outbox_id, o.status AS outbox_status,
+           o.payload AS outbox_payload, o.payload_hash AS outbox_payload_hash,
+           p.linear_session_id
+    FROM execution_publication_events e
+    JOIN linear_outbox o ON o.id = e.linear_outbox_id
+    JOIN pipeline_instances p ON p.id = e.pipeline_instance_id
+    WHERE e.id = ? AND e.parent_attempt_id = ? AND e.kind = 'aggregate'
+  `).get(aggregateEventId, input.graph.parent_attempt_id) as
+    | {
+      id: string;
+      body: string;
+      linear_outbox_id: string;
+      outbox_status: string;
+      outbox_payload: string;
+      outbox_payload_hash: string;
+      linear_session_id: string;
+    }
+    | undefined;
+  if (!event) {
+    if (correction) return "correction_recorded";
+    throw new Error(`execution graph ${input.graph.id} aggregate publication event is missing`);
+  }
+
+  const bodyHasSource = event.body.includes(input.fromArtifactHash);
+  const bodyHasTarget = event.body.includes(input.toArtifactHash);
+  if (!bodyHasSource && bodyHasTarget) {
+    if (event.outbox_status !== "pending" && event.outbox_status !== "failed") return "already_canonical";
+    const canonicalOutboxPayload = activityOutboxPayload({
+      sessionId: event.linear_session_id,
+      body: event.body,
+    });
+    if (event.outbox_payload === canonicalOutboxPayload) return "already_canonical";
+    const outboxUpdate = input.db.prepare(`
+      UPDATE linear_outbox
+      SET payload = ?, payload_hash = ?
+      WHERE id = ? AND status IN ('pending', 'failed') AND payload_hash = ?
+    `).run(
+      canonicalOutboxPayload,
+      digestNormalized(canonicalOutboxPayload),
+      event.linear_outbox_id,
+      event.outbox_payload_hash
+    );
+    if (outboxUpdate.changes !== 1) {
+      throw new Error(`execution graph ${input.graph.id} aggregate activity outbox compare-and-set failed`);
+    }
+    return "already_canonical";
+  }
+  if (!bodyHasSource) {
+    throw new Error(`execution graph ${input.graph.id} aggregate publication event does not match migration source`);
+  }
+
+  const migratedBody = bounded(event.body.replaceAll(input.fromArtifactHash, input.toArtifactHash)) ?? event.body;
+  if (event.outbox_status === "pending" || event.outbox_status === "failed") {
+    const migratedPayload = activityOutboxPayload({
+      sessionId: event.linear_session_id,
+      body: migratedBody,
+    });
+    updateAggregateEventBody({
+      db: input.db,
+      graphId: input.graph.id,
+      eventId: event.id,
+      fromBody: event.body,
+      toBody: migratedBody,
+    });
+    const outboxUpdate = input.db.prepare(`
+      UPDATE linear_outbox
+      SET payload = ?, payload_hash = ?
+      WHERE id = ? AND status IN ('pending', 'failed') AND payload_hash = ?
+    `).run(
+      migratedPayload,
+      digestNormalized(migratedPayload),
+      event.linear_outbox_id,
+      event.outbox_payload_hash
+    );
+    if (outboxUpdate.changes !== 1) {
+      throw new Error(`execution graph ${input.graph.id} aggregate activity outbox compare-and-set failed`);
+    }
+    return "migrated";
+  }
+
+  updateAggregateEventBody({
+    db: input.db,
+    graphId: input.graph.id,
+    eventId: event.id,
+    fromBody: event.body,
+    toBody: migratedBody,
+  });
+  if (correction) return "correction_recorded";
+  insertExecutionPublicationEvent({
+    db: input.db,
+    id: correctionEventId,
+    graph: input.graph,
+    unitId: null,
+    kind: "aggregate",
+    body: aggregateCorrectionBody(input.fromArtifactHash, input.toArtifactHash),
+    timestamp: input.timestamp,
+  });
+  return "correction_recorded";
+}
+
 export interface ExecutionPublicationEventRecord {
   id: string;
   execution_graph_id: string;
