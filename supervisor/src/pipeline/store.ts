@@ -49,6 +49,7 @@ export interface PipelineInstance {
   agent: "claude" | "codex" | "opencode";
   task_type: "implement" | "investigate";
   published_commit: string | null;
+  published_subject: string | null;
   repository_config_snapshot_id: string;
   repository_config_digest: string;
   runtime_release: string;
@@ -377,6 +378,8 @@ export interface CoordinatorTransitionWrite {
   waitReason?: string | null;
   immutableSubject?: string | null;
   publishedCommit?: string | null;
+  publishedSubject?: string | null;
+  clearPublishedCommit?: boolean;
   reentryIncrement?: number;
   artifacts?: CoordinatorArtifactWrite[];
   gateReceipt?: CoordinatorGateReceiptWrite;
