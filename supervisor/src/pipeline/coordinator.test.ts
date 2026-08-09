@@ -677,12 +677,17 @@ describe("pipeline coordinator", () => {
       manifest_digest: digestNormalized(canonicalJson(postPublicationManifest)),
       normalized_manifest: canonicalJson(postPublicationManifest),
     };
+    const postPublicationStages = stages.map((state) => state.stage_id === "publish"
+      ? { ...state, status: "passed" }
+      : state.stage_id === stageId
+        ? { ...state, status: "running" }
+        : state);
 
     expect(reducePipelineEvent({
       manifest: postPublicationManifest,
       instance: postInstance,
       attempt: postAttempt,
-      stages,
+      stages: postPublicationStages,
       event: exactEvent,
     })).toMatchObject({
       terminalOutcome: "shipped",
@@ -710,7 +715,7 @@ describe("pipeline coordinator", () => {
       manifest: postPublicationManifest,
       instance: postInstance,
       attempt: postAttempt,
-      stages,
+      stages: postPublicationStages,
       event: noChangeEvent,
     })).toMatchObject({
       terminalOutcome: "no_change",
@@ -721,7 +726,7 @@ describe("pipeline coordinator", () => {
       manifest: postPublicationManifest,
       instance: { ...postInstance, published_commit: null },
       attempt: postAttempt,
-      stages,
+      stages: postPublicationStages,
       event: exactEvent,
     })).toThrow(/cannot settle terminal without exact published provider evidence/);
 
@@ -729,7 +734,7 @@ describe("pipeline coordinator", () => {
       manifest: postPublicationManifest,
       instance: { ...postInstance, published_commit: stalePublishedCommit, published_subject: null },
       attempt: postAttempt,
-      stages,
+      stages: postPublicationStages,
       event: exactEvent,
     })).toThrow(/cannot settle terminal without exact published provider evidence/);
 
@@ -737,7 +742,7 @@ describe("pipeline coordinator", () => {
       manifest: postPublicationManifest,
       instance: { ...postInstance, published_subject: stalePublishedSubject },
       attempt: postAttempt,
-      stages,
+      stages: postPublicationStages,
       event: exactEvent,
     })).toThrow(/cannot settle terminal without exact published provider evidence/);
 
@@ -745,7 +750,7 @@ describe("pipeline coordinator", () => {
       manifest: postPublicationManifest,
       instance: { ...postInstance, published_subject: null },
       attempt: postAttempt,
-      stages,
+      stages: postPublicationStages,
       event: noChangeEvent,
     })).toThrow(/cannot settle terminal without exact published provider evidence/);
 
@@ -753,7 +758,7 @@ describe("pipeline coordinator", () => {
       manifest: postPublicationManifest,
       instance: postInstance,
       attempt: postAttempt,
-      stages,
+      stages: postPublicationStages,
       event: {
         ...exactEvent,
         id: `${stageId}-changed-subject-terminal`,
@@ -761,6 +766,194 @@ describe("pipeline coordinator", () => {
         artifacts: exactEvent.artifacts?.map((artifact) => ({ ...artifact, subject: "d".repeat(40) })),
       },
     })).toThrow(/cannot settle terminal without exact published provider evidence/);
+  });
+
+  function branchingPublicationManifest(base: PipelineManifest): PipelineManifest {
+    const commandStage = base.stages.find((stage) => stage.id === "command")!;
+    return {
+      ...base,
+      requires: {
+        ...base.requires,
+        capabilities: ["command/run@1", "ce/publish@1"],
+      },
+      entry_stage: "entry",
+      stages: [
+        {
+          ...commandStage,
+          id: "entry",
+          transitions: {
+            success: { terminal: "shipped" },
+            no_change: { terminal: "no_change" },
+            semantic_repair_required: { to: "publish" },
+            retryable_infrastructure_failure: { terminal: "failed" },
+            needs_human: { terminal: "needs_human" },
+            canceled: { terminal: "canceled" },
+            superseded: { terminal: "superseded" },
+            failure: { terminal: "failed" },
+          },
+        },
+        {
+          id: "publish",
+          executor: { kind: "agent", capability: "ce/publish@1" },
+          evaluator: { kind: "publish_subject", assurance: "semantic_attested", required_artifacts: ["publish_subject"] },
+          context: "resume_required",
+          live_steering: false,
+          credentials: ["model.invoke", "repo.read", "repo.write", "provider.read"],
+          produces: ["stage_result", "publish_subject"],
+          transitions: {
+            success: { to: "command" },
+            no_change: { terminal: "no_change" },
+            semantic_repair_required: { terminal: "needs_human" },
+            retryable_infrastructure_failure: { terminal: "failed" },
+            needs_human: { terminal: "needs_human" },
+            canceled: { terminal: "canceled" },
+            superseded: { terminal: "superseded" },
+            failure: { terminal: "failed" },
+          },
+        },
+        {
+          ...commandStage,
+          id: "command",
+          transitions: {
+            success: { terminal: "shipped" },
+            no_change: { terminal: "no_change" },
+            semantic_repair_required: { terminal: "failed" },
+            retryable_infrastructure_failure: { terminal: "failed" },
+            needs_human: { terminal: "needs_human" },
+            canceled: { terminal: "canceled" },
+            superseded: { terminal: "superseded" },
+            failure: { terminal: "failed" },
+          },
+        },
+      ],
+    };
+  }
+
+  function branchingStages(
+    stages: PipelineInstanceStage[],
+    publishStatus: "pending" | "passed"
+  ): PipelineInstanceStage[] {
+    const template = stages[0]!;
+    return [
+      { ...template, stage_id: "entry", ordinal: 0, status: "passed" },
+      { ...template, stage_id: "publish", ordinal: 1, status: publishStatus },
+      { ...template, stage_id: "command", ordinal: 2, status: "running" },
+    ];
+  }
+
+  function commandTerminalEvent(input: {
+    instance: PipelineInstance;
+    attempt: PipelineStageAttempt;
+    id: string;
+    subject?: string;
+  }): PipelineCoordinatorEvent {
+    const next = event(input.instance, input.attempt, "success", input.id);
+    if (!input.subject) return next;
+    return {
+      ...next,
+      subject: input.subject,
+      artifacts: next.artifacts?.map((artifact) => ({ ...artifact, subject: input.subject })),
+    };
+  }
+
+  it("fences shipped terminals by the actually executed publication branch, not the entry success path", () => {
+    const { manifest, instance, attempt, stages } = setup();
+    const branching = branchingPublicationManifest(manifest);
+    const normalizedManifest = canonicalJson(branching);
+    const subject = "f".repeat(40);
+    const publishedCommit = "a".repeat(40);
+    const commandAttempt = {
+      ...attempt,
+      id: "command-attempt",
+      stage_id: "command",
+      request_hash: digestNormalized("command-request"),
+      native_context_policy: "none" as const,
+      expected_subject: subject,
+    };
+    const commandInstance = {
+      ...instance,
+      active_stage_id: "command",
+      status: "running" as const,
+      immutable_subject: subject,
+      published_commit: publishedCommit,
+      published_subject: subject,
+      manifest_digest: digestNormalized(normalizedManifest),
+      normalized_manifest: normalizedManifest,
+    };
+    const passedPublicationStages = branchingStages(stages, "passed");
+    const terminal = commandTerminalEvent({
+      instance: commandInstance,
+      attempt: commandAttempt,
+      id: "actual-published-branch-terminal",
+      subject,
+    });
+
+    expect(reducePipelineEvent({
+      manifest: branching,
+      instance: commandInstance,
+      attempt: commandAttempt,
+      stages: passedPublicationStages,
+      event: terminal,
+    })).toMatchObject({
+      terminalOutcome: "shipped",
+      publishedCommit: null,
+    });
+
+    expect(() => reducePipelineEvent({
+      manifest: branching,
+      instance: { ...commandInstance, published_commit: null },
+      attempt: commandAttempt,
+      stages: passedPublicationStages,
+      event: terminal,
+    })).toThrow(/cannot settle terminal without exact published provider evidence/);
+
+    const advancedSubject = "b".repeat(40);
+    expect(() => reducePipelineEvent({
+      manifest: branching,
+      instance: commandInstance,
+      attempt: commandAttempt,
+      stages: passedPublicationStages,
+      event: commandTerminalEvent({
+        instance: commandInstance,
+        attempt: commandAttempt,
+        id: "actual-published-branch-advanced-terminal",
+        subject: advancedSubject,
+      }),
+    })).toThrow(/cannot settle terminal without exact published provider evidence/);
+  });
+
+  it("does not require publication evidence when the actual branch bypassed publication", () => {
+    const { manifest, instance, attempt, stages } = setup();
+    const branching = branchingPublicationManifest(manifest);
+    const normalizedManifest = canonicalJson(branching);
+    const commandAttempt = {
+      ...attempt,
+      id: "command-attempt",
+      stage_id: "command",
+      request_hash: digestNormalized("command-request"),
+      native_context_policy: "none" as const,
+    };
+    const commandInstance = {
+      ...instance,
+      active_stage_id: "command",
+      status: "running" as const,
+      manifest_digest: digestNormalized(normalizedManifest),
+      normalized_manifest: normalizedManifest,
+    };
+
+    expect(reducePipelineEvent({
+      manifest: branching,
+      instance: commandInstance,
+      attempt: commandAttempt,
+      stages: branchingStages(stages, "pending"),
+      event: commandTerminalEvent({
+        instance: commandInstance,
+        attempt: commandAttempt,
+        id: "actual-publication-bypass-terminal",
+      }),
+    })).toMatchObject({
+      terminalOutcome: "shipped",
+    });
   });
 
   it("projects notable repair stages into run notes without changing transitions", () => {

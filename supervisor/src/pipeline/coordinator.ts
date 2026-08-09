@@ -154,18 +154,22 @@ function activeStage(input: PipelineReductionInput): PipelineStage {
   return stage;
 }
 
-function successPathIncludesPublication(manifest: PipelineManifest): boolean {
-  const visited = new Set<string>();
-  let current: string | undefined = manifest.entry_stage;
-  while (current && !visited.has(current)) {
-    const stage = manifest.stages.find((candidate) => candidate.id === current);
-    if (!stage) return false;
-    if (stage.executor.kind === "agent" && stage.executor.capability === PUBLISH_CAPABILITY) return true;
-    if (stage.executor.kind === "provider_wait") return true;
-    visited.add(current);
-    current = stage.transitions.success?.to;
-  }
-  return false;
+function isPublicationStage(stage: PipelineStage): boolean {
+  return (stage.executor.kind === "agent" && stage.executor.capability === PUBLISH_CAPABILITY) ||
+    stage.executor.kind === "provider_wait";
+}
+
+function executionIncludesPublication(
+  input: PipelineReductionInput,
+  active: PipelineStage
+): boolean {
+  if (isPublicationStage(active)) return true;
+  const stagesById = new Map(input.manifest.stages.map((stage) => [stage.id, stage]));
+  return input.stages.some((state) => {
+    if (state.status !== "passed") return false;
+    const stage = stagesById.get(state.stage_id);
+    return stage ? isPublicationStage(stage) : false;
+  });
 }
 
 function eventHasExactPublishedSubject(input: PipelineReductionInput, stage: PipelineStage): boolean {
@@ -185,11 +189,12 @@ function eventHasExactPublishedSubject(input: PipelineReductionInput, stage: Pip
 
 function terminalRequiresExactPublicationEvidence(
   input: PipelineReductionInput,
+  stage: PipelineStage,
   terminal: PipelineOutcome,
   clearsPublishedBinding: boolean
 ): boolean {
   return terminal === "shipped"
-    ? successPathIncludesPublication(input.manifest)
+    ? executionIncludesPublication(input, stage)
     : terminal === "no_change" &&
       !clearsPublishedBinding &&
       (input.instance.published_commit !== null || input.instance.published_subject !== null);
@@ -202,7 +207,7 @@ function assertTerminalPublishedBinding(
   clearsPublishedBinding: boolean
 ): void {
   if (
-    terminalRequiresExactPublicationEvidence(input, terminal, clearsPublishedBinding) &&
+    terminalRequiresExactPublicationEvidence(input, stage, terminal, clearsPublishedBinding) &&
     !eventHasExactPublishedSubject(input, stage)
   ) {
     throw new Error("publishing pipeline cannot settle terminal without exact published provider evidence");
