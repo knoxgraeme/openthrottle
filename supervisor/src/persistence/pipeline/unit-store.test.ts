@@ -2014,7 +2014,7 @@ describe("execution unit store", () => {
     const treeSubject = "2".repeat(40);
     for (const [policy, originalSession, migratedSession] of [
       ["resume_required", "native-required", "native-required"],
-      ["prefer_resume", "native-preferred", null],
+      ["prefer_resume", "native-preferred", "native-preferred"],
       ["fresh", "native-fresh", null],
     ] as const) {
       const store = setup();

@@ -149,6 +149,19 @@ export interface ExecutionGateReceipt {
   created_at: string;
 }
 
+export interface PipelineArtifactRecord {
+  id: string;
+  pipeline_instance_id: string;
+  attempt_id: string;
+  kind: string;
+  schema_version: number;
+  assurance: string;
+  subject: string | null;
+  payload: string;
+  artifact_hash: string;
+  created_at: string;
+}
+
 export interface ExecutionDownstreamContext {
   id: string;
   execution_graph_id: string;
@@ -244,8 +257,15 @@ export interface ExecutionUnitStore {
     };
     fromSubject?: string;
     toSubject?: string;
+    successorStageId?: string;
     publishStageId?: string;
   }): "migrated" | "already_canonical";
+  getPipelineArtifactByHash(input: {
+    pipelineInstanceId: string;
+    attemptId: string;
+    kind: string;
+    artifactHash: string;
+  }): PipelineArtifactRecord | undefined;
   recordGateReceipt(input: {
     actionId: string;
     gateKind: ExecutionGateKind;
@@ -1317,12 +1337,12 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     });
     const migrateDownstream = () => {
       if (!input.fromSubject || !input.toSubject) return;
-      migrateAggregateDownstreamPublication({
+      migrateAggregateDownstreamStage({
         db,
         graph,
         fromSubject: input.fromSubject,
         toSubject: input.toSubject,
-        publishStageId: input.publishStageId,
+        stageId: input.successorStageId ?? input.publishStageId,
       });
     };
     if (graph.aggregate_artifact_hash === input.toArtifactHash) {
@@ -1354,37 +1374,37 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     throw new Error(`execution graph ${graph.id} aggregate marker compare-and-set failed`);
   });
 
-  function migrateAggregateDownstreamPublication(input: {
+  function migrateAggregateDownstreamStage(input: {
     db: Database.Database;
     graph: ExecutionUnitGraph;
     fromSubject: string;
     toSubject: string;
-    publishStageId?: string;
+    stageId?: string;
   }): void {
-    if (!input.publishStageId) return;
-    const publishStageId = input.publishStageId;
+    if (!input.stageId) return;
+    const stageId = input.stageId;
     const nativeSessionForMigratedRequest = (
       policy: ContextPolicy,
       existingNativeSessionId: string | null
     ): string | null => {
       if (policy === "resume_required") {
         if (!existingNativeSessionId) {
-          throw new Error(`publish stage ${publishStageId} requires a native session for aggregate migration`);
+          throw new Error(`downstream stage ${stageId} requires a native session for aggregate migration`);
         }
         return existingNativeSessionId;
       }
-      if (policy === "prefer_resume") return null;
+      if (policy === "prefer_resume") return existingNativeSessionId;
       if (policy === "fresh" || policy === "none") return null;
-      throw new Error(`publish stage ${publishStageId} has unsupported native context policy ${String(policy)}`);
+      throw new Error(`downstream stage ${stageId} has unsupported native context policy ${String(policy)}`);
     };
-    const publishAttempts = input.db.prepare(`
+    const downstreamAttempts = input.db.prepare(`
       SELECT id, request_hash, idempotency_key, request_payload, planned_run_id,
              expected_subject, native_context_policy, native_session_id, status, run_id
       FROM pipeline_stage_attempts
       WHERE pipeline_instance_id = ? AND stage_id = ?
         AND status NOT IN ('completed', 'canceled', 'superseded', 'failed')
       ORDER BY attempt_ordinal, reentry_ordinal, created_at, id
-    `).all(input.graph.pipeline_instance_id, publishStageId) as Array<{
+    `).all(input.graph.pipeline_instance_id, stageId) as Array<{
       id: string;
       request_hash: string;
       idempotency_key: string;
@@ -1396,7 +1416,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       status: string;
       run_id: string | null;
     }>;
-    if (publishAttempts.length === 0) return;
+    if (downstreamAttempts.length === 0) return;
 
     const instance = input.db.prepare(`
       SELECT immutable_subject FROM pipeline_instances WHERE id = ?
@@ -1408,7 +1428,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         SET immutable_subject = ?,
             status = CASE WHEN active_stage_id = ? AND status = 'running' THEN 'dispatchable' ELSE status END
         WHERE id = ? AND immutable_subject = ?
-      `).run(input.toSubject, publishStageId, input.graph.pipeline_instance_id, input.fromSubject);
+      `).run(input.toSubject, stageId, input.graph.pipeline_instance_id, input.fromSubject);
       if (instanceUpdate.changes !== 1) {
         throw new Error(`execution graph ${input.graph.id} publication subject compare-and-set failed`);
       }
@@ -1416,22 +1436,22 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       throw new Error(`execution graph ${input.graph.id} publication subject does not match migration source`);
     }
 
-    for (const attempt of publishAttempts) {
+    for (const attempt of downstreamAttempts) {
       if (!attempt.request_payload) {
-        throw new Error(`publish attempt ${attempt.id} has no sealed request`);
+        throw new Error(`downstream attempt ${attempt.id} has no sealed request`);
       }
       const request = JSON.parse(attempt.request_payload) as StageRequestEnvelope;
-      if (request.stageId !== publishStageId || request.attemptId !== attempt.id ||
+      if (request.stageId !== stageId || request.attemptId !== attempt.id ||
           request.requestHash !== attempt.request_hash ||
           request.idempotencyKey !== attempt.idempotency_key ||
           request.runId !== attempt.planned_run_id ||
           request.contextPolicy !== attempt.native_context_policy ||
           request.nativeSessionId !== attempt.native_session_id ||
           request.expectedSubject !== attempt.expected_subject) {
-        throw new Error(`publish attempt ${attempt.id} stage request binding mismatch`);
+        throw new Error(`downstream attempt ${attempt.id} stage request binding mismatch`);
       }
       if (attempt.expected_subject !== input.fromSubject && attempt.expected_subject !== input.toSubject) {
-        throw new Error(`publish attempt ${attempt.id} expected subject does not match aggregate migration`);
+        throw new Error(`downstream attempt ${attempt.id} expected subject does not match aggregate migration`);
       }
       const withoutFence = (({ requestHash, idempotencyKey, ...rest }: StageRequestEnvelope) => {
         void requestHash;
@@ -1470,19 +1490,19 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
           attempt.request_hash
         );
         if (attemptUpdate.changes !== 1) {
-          throw new Error(`publish attempt ${attempt.id} aggregate subject compare-and-set failed`);
+          throw new Error(`downstream attempt ${attempt.id} aggregate subject compare-and-set failed`);
         }
         input.db.prepare(`
           UPDATE pipeline_instance_stages
           SET status = CASE WHEN status = 'running' THEN 'dispatchable' ELSE status END
           WHERE pipeline_instance_id = ? AND stage_id = ?
-        `).run(input.graph.pipeline_instance_id, publishStageId);
+        `).run(input.graph.pipeline_instance_id, stageId);
       } else if (
         attempt.request_hash !== updatedFence.requestHash ||
         attempt.idempotency_key !== updatedFence.idempotencyKey ||
         attempt.request_payload !== updatedRequest
       ) {
-        throw new Error(`publish attempt ${attempt.id} canonical request binding mismatch`);
+        throw new Error(`downstream attempt ${attempt.id} canonical request binding mismatch`);
       }
 
       let effect = input.db.prepare(`
@@ -1538,14 +1558,14 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       }
       if (!effect && attempt.expected_subject === input.toSubject) continue;
       if (!effect) {
-        throw new Error(`publish attempt ${attempt.id} has no migratable dispatch effect`);
+        throw new Error(`downstream attempt ${attempt.id} has no migratable dispatch effect`);
       }
       if (effect.status !== "pending" && effect.status !== "failed" && effect.status !== "processing") {
-        throw new Error(`publish attempt ${attempt.id} dispatch effect is already leased`);
+        throw new Error(`downstream attempt ${attempt.id} dispatch effect is already leased`);
       }
       if (effect.payload === updatedRequest && effect.idempotency_key === updatedFence.idempotencyKey) continue;
       if (effect.payload !== attempt.request_payload || effect.idempotency_key !== attempt.idempotency_key) {
-        throw new Error(`publish attempt ${attempt.id} dispatch effect does not match migration source`);
+        throw new Error(`downstream attempt ${attempt.id} dispatch effect does not match migration source`);
       }
       const effectUpdate = input.db.prepare(`
         UPDATE pipeline_effect_intents
@@ -1559,7 +1579,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         effect.payload_hash
       );
       if (effectUpdate.changes !== 1) {
-        throw new Error(`publish attempt ${attempt.id} dispatch effect compare-and-set failed`);
+        throw new Error(`downstream attempt ${attempt.id} dispatch effect compare-and-set failed`);
       }
     }
   }
@@ -1906,6 +1926,17 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     stopRetryableUnitAction,
     emitAggregateOnce,
     migrateAggregateArtifactHash,
+    getPipelineArtifactByHash(input) {
+      return db.prepare(`
+        SELECT * FROM pipeline_artifacts
+        WHERE pipeline_instance_id = ? AND attempt_id = ? AND kind = ? AND artifact_hash = ?
+      `).get(
+        input.pipelineInstanceId,
+        input.attemptId,
+        input.kind,
+        input.artifactHash
+      ) as PipelineArtifactRecord | undefined;
+    },
     recordGateReceipt,
     listGateReceipts(parentAttemptId) {
       return db.prepare(`

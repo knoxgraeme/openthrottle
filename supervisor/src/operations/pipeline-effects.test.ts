@@ -1388,6 +1388,7 @@ describe("pipeline effect processor", () => {
       aggregate_artifact_hash: expect.any(String),
     });
     let canonicalGraphResultHash = pipelines.getGraphForAttempt(attempt.id)!.aggregate_artifact_hash!;
+    const expectedCanonicalGraphResultHash = canonicalGraphResultHash;
     expect(pipelines.getAttempt(attempt.id)).toMatchObject({ status: "running" });
 
     const legacyCommitSubjectAggregate = buildAggregateStageEvent({
@@ -1403,6 +1404,35 @@ describe("pipeline effect processor", () => {
     const legacyGraphResult = legacyCommitSubjectAggregate.artifacts
       ?.find((artifact) => artifact.kind === "execution_graph_result");
     expect(legacyGraphResult).toBeDefined();
+    const persistLegacyGraphResult = () => {
+      db!.prepare(`
+        INSERT INTO pipeline_artifacts (
+          id, pipeline_instance_id, attempt_id, kind, schema_version,
+          assurance, subject, payload, artifact_hash, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          pipeline_instance_id = excluded.pipeline_instance_id,
+          attempt_id = excluded.attempt_id,
+          kind = excluded.kind,
+          schema_version = excluded.schema_version,
+          assurance = excluded.assurance,
+          subject = excluded.subject,
+          payload = excluded.payload,
+          artifact_hash = excluded.artifact_hash
+      `).run(
+        `legacy-artifact-${attempt.id}`,
+        instance.id,
+        attempt.id,
+        legacyGraphResult!.kind,
+        legacyGraphResult!.schemaVersion,
+        legacyGraphResult!.assurance,
+        legacyGraphResult!.subject ?? null,
+        legacyGraphResult!.payload,
+        legacyGraphResult!.hash,
+        "2099-07-22T12:00:00.000Z"
+      );
+    };
+    persistLegacyGraphResult();
 
     db!.prepare("UPDATE pipeline_instances SET status = ? WHERE id = ?").run(beforeAggregateStatus, instance.id);
     db!.prepare(`
@@ -1410,7 +1440,7 @@ describe("pipeline effect processor", () => {
       SET aggregate_artifact_hash = ?, updated_at = ?
       WHERE parent_attempt_id = ?
     `).run("0".repeat(64), "2099-07-22T12:00:00.000Z", attempt.id);
-    await expect(processor.drain()).rejects.toThrow(/replay hash does not match durable graph marker/);
+    await expect(processor.drain()).rejects.toThrow(/durable legacy aggregate artifact is missing/);
 
     const aggregatePublication = db!.prepare(`
       SELECT e.id, e.body, e.linear_outbox_id, o.payload
@@ -1450,6 +1480,8 @@ describe("pipeline effect processor", () => {
     db!.prepare("UPDATE pipeline_instances SET status = 'publication_blocked' WHERE id = ?").run(instance.id);
     await expect(processor.drain()).rejects.toThrow(/pipeline publication is blocked/);
     canonicalGraphResultHash = pipelines.getGraphForAttempt(attempt.id)!.aggregate_artifact_hash!;
+    expect(canonicalGraphResultHash).toBe(expectedCanonicalGraphResultHash);
+    expect(canonicalGraphResultHash).not.toBe(legacyGraphResult!.hash);
     expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
       aggregate_artifact_hash: canonicalGraphResultHash,
     });
@@ -1486,6 +1518,58 @@ describe("pipeline effect processor", () => {
       status: "dispatchable",
       immutable_subject: finalIntegratedTreeSubject,
     });
+    const queuedIntermediateAttempt = pipelines.getActiveAttempt(instance.id)!;
+    const queuedIntermediateRequest = JSON.parse(queuedIntermediateAttempt.request_payload!) as StageRequestEnvelope;
+    const queuedIntermediateWithoutFence = (({ requestHash, idempotencyKey, ...rest }: StageRequestEnvelope) => {
+      void requestHash;
+      void idempotencyKey;
+      return rest;
+    })(queuedIntermediateRequest);
+    const legacyIntermediateWithoutFence = {
+      ...queuedIntermediateWithoutFence,
+      expectedSubject: finalIntegratedSubject,
+    };
+    const legacyIntermediateFence = createStageRequestHash(legacyIntermediateWithoutFence);
+    const legacyIntermediateRequest = canonicalJson({ ...legacyIntermediateWithoutFence, ...legacyIntermediateFence });
+    const intermediateEffect = pipelines.listEffects(instance.id).find((effect) =>
+      effect.kind === "dispatch_stage" &&
+      effect.status === "pending" &&
+      effect.idempotency_key === queuedIntermediateRequest.idempotencyKey
+    )!;
+    rewriteAggregatePublicationToLegacyHash();
+    db!.prepare(`
+      UPDATE execution_graphs
+      SET aggregate_artifact_hash = ?, updated_at = ?
+      WHERE parent_attempt_id = ?
+    `).run(legacyGraphResult!.hash, "2099-07-22T12:00:00.000Z", attempt.id);
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET immutable_subject = ?, updated_at = ?
+      WHERE id = ?
+    `).run(finalIntegratedSubject, "2099-07-22T12:00:00.000Z", instance.id);
+    db!.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET expected_subject = ?, request_hash = ?, idempotency_key = ?,
+          request_payload = ?, updated_at = ?
+      WHERE id = ?
+    `).run(
+      finalIntegratedSubject,
+      legacyIntermediateFence.requestHash,
+      legacyIntermediateFence.idempotencyKey,
+      legacyIntermediateRequest,
+      "2099-07-22T12:00:00.000Z",
+      queuedIntermediateAttempt.id
+    );
+    db!.prepare(`
+      UPDATE pipeline_effect_intents
+      SET idempotency_key = ?, payload = ?, payload_hash = ?
+      WHERE id = ?
+    `).run(
+      legacyIntermediateFence.idempotencyKey,
+      legacyIntermediateRequest,
+      digestNormalized(legacyIntermediateRequest),
+      intermediateEffect.id
+    );
     await processor.drain();
     const intermediateAttempt = pipelines.getActiveAttempt(instance.id)!;
     expect(intermediateAttempt).toMatchObject({
@@ -1493,6 +1577,13 @@ describe("pipeline effect processor", () => {
       status: "running",
       expected_subject: finalIntegratedTreeSubject,
     });
+    expect(runtime.dispatchStage).toHaveBeenLastCalledWith(
+      { providerResourceId: "sandbox-child-drain" },
+      expect.objectContaining({
+        stageId: intermediateStageId,
+        expectedSubject: finalIntegratedTreeSubject,
+      })
+    );
     const intermediateStagePayload = JSON.stringify({ id: "intermediate-release-check", outcome: "success" });
     const intermediateCommandPayload = JSON.stringify({ command: "test", exit_code: 0, summary: "command passed" });
     tickets.finishRunAndThen({

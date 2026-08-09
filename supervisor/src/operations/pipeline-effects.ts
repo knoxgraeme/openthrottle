@@ -408,9 +408,9 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     }
   };
 
-  const completedCompositeAttemptsForPublish = (
+  const completedCompositeAttemptsForSuccessor = (
     instance: PipelineInstance,
-    publishStageId: string
+    successorStageId: string
   ): PipelineStageAttempt[] => {
     const manifest = JSON.parse(instance.normalized_manifest) as {
       stages?: Array<{
@@ -420,13 +420,13 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       }>;
     };
     const stages = new Map((manifest.stages ?? []).map((stage) => [stage.id, stage]));
-    const reachesPublish = (stageId: string): boolean => {
+    const reachesSuccessor = (stageId: string): boolean => {
       const visited = new Set<string>();
       let currentId: string | null | undefined = stageId;
       while (currentId) {
-        if (currentId === publishStageId) return true;
+        if (currentId === successorStageId) return true;
         if (visited.has(currentId)) {
-          throw new Error(`pipeline manifest has a success-transition cycle while resolving publish predecessor ${stageId}`);
+          throw new Error(`pipeline manifest has a success-transition cycle while resolving structured successor ${stageId}`);
         }
         visited.add(currentId);
         const current = stages.get(currentId);
@@ -437,21 +437,25 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       return false;
     };
     const compositeStageIds = new Set((manifest.stages ?? []).filter((stage) =>
-      stage.executor?.capability === FOR_EACH_UNIT_CAPABILITY && reachesPublish(stage.id)
+      stage.executor?.capability === FOR_EACH_UNIT_CAPABILITY && reachesSuccessor(stage.id)
     ).map((stage) => stage.id));
     return deps.store.listAttempts(instance.id)
       .filter((attempt) => compositeStageIds.has(attempt.stage_id) && attempt.status === "completed");
   };
 
-  const drainCompletedCompositeParentsForPublish = async (
+  const drainCompletedCompositeParentsForSuccessor = async (
     resource: RuntimeResource,
     instance: PipelineInstance,
-    publishStageId: string
+    successorStageId: string
   ): Promise<void> => {
-    const completedCompositeAttempts = completedCompositeAttemptsForPublish(instance, publishStageId);
-    await stopLegacyPublishActorIfNeeded(instance, resource, publishStageId, completedCompositeAttempts);
+    const completedCompositeAttempts = completedCompositeAttemptsForSuccessor(instance, successorStageId);
+    if (isPublishStage(instance.normalized_manifest, successorStageId)) {
+      await stopLegacyPublishActorIfNeeded(instance, resource, successorStageId, completedCompositeAttempts);
+    }
     for (const attempt of completedCompositeAttempts) {
-      await structuredChildren.drainCompositeChildren(resource, instance, attempt.id);
+      await structuredChildren.drainCompositeChildren(resource, instance, attempt.id, {
+        successorStageId,
+      });
     }
   };
 
@@ -478,10 +482,8 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     let currentEffect = effect;
     if (effect.kind === "dispatch_stage") {
       const pendingRequest = JSON.parse(effect.payload) as StageRequestEnvelope;
-      if (isPublishStage(instance.normalized_manifest, pendingRequest.stageId)) {
-        await drainCompletedCompositeParentsForPublish(resource, instance, pendingRequest.stageId);
-        currentEffect = deps.store.getEffect(effect.id) ?? effect;
-      }
+      await drainCompletedCompositeParentsForSuccessor(resource, instance, pendingRequest.stageId);
+      currentEffect = deps.store.getEffect(effect.id) ?? effect;
     }
     const request = currentEffect.kind === "dispatch_stage"
       ? parseRequest(currentEffect, deps.store)
@@ -753,7 +755,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     const drainInstance = async (instance: PipelineInstance, resource: RuntimeResource, publishStageId: string): Promise<void> => {
       if (drained.has(instance.id)) return;
       drained.add(instance.id);
-      await drainCompletedCompositeParentsForPublish(resource, instance, publishStageId);
+      await drainCompletedCompositeParentsForSuccessor(resource, instance, publishStageId);
     };
     const tickets = deps.tickets.listRunning();
     for (const ticket of tickets) {
