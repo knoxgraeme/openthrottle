@@ -602,9 +602,10 @@ describe("coordinator-only server", () => {
     db.prepare(`
       UPDATE pipeline_instances
       SET status = 'waiting_provider', active_stage_id = 'provider',
-          published_commit = ?, updated_at = '2026-07-26T00:20:00.000Z'
+          immutable_subject = ?, published_commit = ?, published_subject = NULL,
+          updated_at = '2026-07-26T00:20:00.000Z'
       WHERE id = ?
-    `).run("c".repeat(40), instance.id);
+    `).run("d".repeat(40), "c".repeat(40), instance.id);
     // Production transitions never persist a pull_request receipt, so the
     // ticket projection (populated by the pull-request webhook) must back
     // published_pr_url on its own.
@@ -617,8 +618,94 @@ describe("coordinator-only server", () => {
       tickets: Array<{ pipeline: Record<string, unknown> | null }>;
     };
     expect(ticketFallbackBody.tickets[0]?.pipeline).toMatchObject({
+      published_commit: null,
       published_pr_url: "https://github.com/owner/repo/pull/11",
     });
+
+    db.prepare(`
+      UPDATE pipeline_instances
+      SET published_subject = ?, updated_at = '2026-07-26T00:20:30.000Z'
+      WHERE id = ?
+    `).run("d".repeat(40), instance.id);
+    const boundTicketFallbackResponse = await app().request("/status", {
+      headers: { Authorization: "Bearer status-token" },
+    });
+    const boundTicketFallbackBody = await boundTicketFallbackResponse.json() as {
+      tickets: Array<{ pipeline: Record<string, unknown> | null }>;
+    };
+    expect(boundTicketFallbackBody.tickets[0]?.pipeline).toMatchObject({
+      published_commit: "c".repeat(40),
+      published_pr_url: "https://github.com/owner/repo/pull/11",
+    });
+
+    db.prepare(`
+      UPDATE pipeline_instances
+      SET published_commit = NULL, published_subject = NULL,
+          updated_at = '2026-07-26T00:21:00.000Z'
+      WHERE id = ?
+    `).run(instance.id);
+    const stalePublicationResponse = await app().request("/status", {
+      headers: { Authorization: "Bearer status-token" },
+    });
+    const stalePublicationBody = await stalePublicationResponse.json() as {
+      tickets: Array<{ pipeline: Record<string, unknown> | null }>;
+    };
+    expect(stalePublicationBody.tickets[0]?.pipeline).toMatchObject({
+      published_commit: null,
+      published_pr_url: "https://github.com/owner/repo/pull/11",
+    });
+
+    db.prepare(`
+      UPDATE pipeline_instances
+      SET immutable_subject = ?, published_commit = ?, published_subject = ?,
+          updated_at = '2026-07-26T00:21:30.000Z'
+      WHERE id = ?
+    `).run("e".repeat(40), "c".repeat(40), "d".repeat(40), instance.id);
+    const advancedSubjectResponse = await app().request("/status", {
+      headers: { Authorization: "Bearer status-token" },
+    });
+    const advancedSubjectBody = await advancedSubjectResponse.json() as {
+      tickets: Array<{ pipeline: Record<string, unknown> | null }>;
+    };
+    expect(advancedSubjectBody.tickets[0]?.pipeline).toMatchObject({
+      published_commit: null,
+      published_pr_url: "https://github.com/owner/repo/pull/11",
+    });
+
+    db.prepare(`
+      UPDATE tickets
+      SET pr_url = NULL
+      WHERE linear_issue_id = 'issue-1'
+    `).run();
+    db.prepare(`
+      INSERT INTO pipeline_publication_receipts (
+        id, pipeline_instance_id, kind, idempotency_key, payload, payload_hash,
+        status, external_url, attempts, next_attempt_at, created_at, updated_at
+      ) VALUES (
+        'pending-pr', ?, 'pull_request', 'pending-pr', '{}',
+        '44136fa355b3678a1146ad16f7e8649e94fb4f35495fb8a8e07a41149dc82ca4',
+        'pending', 'https://github.com/owner/repo/pull/pending', 1,
+        '2026-07-26T00:21:30.000Z', '2026-07-26T00:21:30.000Z',
+        '2026-07-26T00:21:30.000Z'
+      )
+    `).run(instance.id);
+    const unknownUrlResponse = await app().request("/status", {
+      headers: { Authorization: "Bearer status-token" },
+    });
+    const unknownUrlBody = await unknownUrlResponse.json() as {
+      tickets: Array<{ pipeline: Record<string, unknown> | null }>;
+    };
+    expect(unknownUrlBody.tickets[0]?.pipeline).toMatchObject({
+      published_commit: null,
+      published_pr_url: null,
+    });
+    db.prepare(`
+      UPDATE pipeline_instances
+      SET immutable_subject = ?, published_commit = ?, published_subject = ?,
+          updated_at = '2026-07-26T00:22:00.000Z'
+      WHERE id = ?
+    `).run("d".repeat(40), "c".repeat(40), "d".repeat(40), instance.id);
+    store.setPrUrl("issue-1", "https://github.com/owner/repo/pull/11");
 
     db.prepare(`
       INSERT INTO pipeline_publication_receipts (

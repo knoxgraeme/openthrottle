@@ -639,6 +639,14 @@ base-branch-contract:review and publication receive the immutable selected branc
 backfill-contract:existing pipeline instances inherit the selected branch from their bound ticket when available
 provider-revision-contract:executor-verified published commit is pinned separately from the gated tree/v1`;
 
+const pipelinePublishedSubjectSchema = `
+ALTER TABLE pipeline_instances ADD COLUMN published_subject TEXT;
+`;
+
+const pipelinePublishedSubjectMigrationSource = `${pipelinePublishedSubjectSchema}
+publication-binding-contract:published commit evidence is bound to the exact workspace tree subject it covered/v1
+rolling-upgrade-contract:existing published commits are not backfilled from mutable immutable_subject and fail closed until republished/v1`;
+
 const pipelineAttemptActorSchema = `
 CREATE TABLE pipeline_attempt_actors (
   attempt_id TEXT PRIMARY KEY,
@@ -2426,6 +2434,16 @@ const definitions: DatabaseMigrationDefinition[] = [
         !hasIndex(db, "execution_work_attempts_pipeline_instance_idx")
       ) {
         db.exec(runOutcomesReceiptIndexSchema);
+      }
+    },
+  },
+  {
+    version: 30,
+    name: "pipeline-published-subject-binding",
+    source: pipelinePublishedSubjectMigrationSource,
+    up(db) {
+      if (hasTable(db, "pipeline_instances") && !hasColumns(db, "pipeline_instances", ["published_subject"])) {
+        db.exec(pipelinePublishedSubjectSchema);
       }
     },
   },

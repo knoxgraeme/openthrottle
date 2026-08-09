@@ -140,6 +140,7 @@ describe("database migrations", () => {
       "393246d3d56b685e1a25e7a18e6a8a2485c70b96301836a8437bfac5568bd009",
       "d07f005df485a8b7506a2e81046846c0c070a4790109e22e8c7081df9a2f29f0",
       "f814f7519462623d684c0d8b15f997afeaa4391ac861dc93ecd6dd8326677367",
+      "62d23bf76b20a18c4ff15352d3ef1558fe6bb364860d58915a26a84c8a6ed2b3",
     ]);
   });
 
@@ -178,6 +179,9 @@ describe("database migrations", () => {
       SELECT name FROM sqlite_master
       WHERE type = 'index' AND name = 'orchestration_journal_repository_lower_recorded_idx'
     `).get()).toEqual({ name: "orchestration_journal_repository_lower_recorded_idx" });
+    expect(db.prepare(`
+      SELECT name FROM pragma_table_info('pipeline_instances') WHERE name = 'published_subject'
+    `).get()).toEqual({ name: "published_subject" });
     expect(db.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'execution_units'"
     ).get()).toEqual({ name: "execution_units" });

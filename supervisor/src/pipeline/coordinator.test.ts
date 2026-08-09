@@ -214,7 +214,8 @@ describe("pipeline coordinator", () => {
     instance: PipelineInstance,
     attempt: PipelineStageAttempt,
     outcome: PipelineCoordinatorEvent["outcome"],
-    id: string
+    id: string,
+    options: { providerRevision?: string } = {}
   ): PipelineCoordinatorEvent {
     const stageResultPayload = JSON.stringify({ id, outcome });
     const providerCheckPayload = JSON.stringify({ id: `${id}-provider-check`, outcome });
@@ -229,6 +230,7 @@ describe("pipeline coordinator", () => {
       outcome,
       resultHash: digestNormalized(stageResultPayload),
       subject,
+      ...(options.providerRevision ? { providerRevision: options.providerRevision } : {}),
       artifacts: [
         {
           kind: "stage_result",
@@ -374,11 +376,16 @@ describe("pipeline coordinator", () => {
     const publishedCommit = "d".repeat(40);
     db!.prepare(`
       UPDATE pipeline_instances
-      SET immutable_subject = ?, published_commit = ?
+      SET immutable_subject = ?, published_commit = ?, published_subject = ?
       WHERE id = ?
-    `).run(publishedSubject, publishedCommit, instance.id);
+    `).run(publishedSubject, publishedCommit, publishedSubject, instance.id);
     const input = event(
-      { ...instance, immutable_subject: publishedSubject, published_commit: publishedCommit },
+      {
+        ...instance,
+        immutable_subject: publishedSubject,
+        published_commit: publishedCommit,
+        published_subject: publishedSubject,
+      },
       attempt,
       "retryable_infrastructure_failure",
       "post-publication-subject-advance"
@@ -393,6 +400,7 @@ describe("pipeline coordinator", () => {
 
     expect(next.immutable_subject).toBe(unpublishedSubject);
     expect(next.published_commit).toBeNull();
+    expect(next.published_subject).toBeNull();
   });
 
   it("writes one run_outcomes settlement row when the pipeline reaches a terminal outcome", () => {
@@ -439,6 +447,7 @@ describe("pipeline coordinator", () => {
   it("refuses to settle a publishing manifest as shipped without exact provider publication evidence", () => {
     const { manifest, instance, attempt, stages } = setup("core/implement@4");
     const subject = "f".repeat(40);
+    const publishedCommit = "d".repeat(40);
     const providerAttempt = {
       ...attempt,
       id: "provider-attempt",
@@ -452,10 +461,16 @@ describe("pipeline coordinator", () => {
       status: "waiting_provider" as const,
       active_stage_id: "provider",
       immutable_subject: subject,
-      published_commit: subject,
+      published_commit: publishedCommit,
+      published_subject: subject,
     };
     const providerStages = providerWaitStages(stages, 0);
-    const providerEvent = providerFeedbackEvent(providerInstance, providerAttempt, "success", "provider-success");
+    const providerEvent = providerFeedbackEvent(providerInstance, providerAttempt, "success", "provider-success", {
+      providerRevision: publishedCommit,
+    });
+    expect(providerEvent.subject).toBe(subject);
+    expect(providerEvent.providerRevision).toBe(publishedCommit);
+    expect(providerEvent.subject).not.toBe(providerEvent.providerRevision);
 
     expect(reducePipelineEvent({
       manifest,
@@ -474,20 +489,37 @@ describe("pipeline coordinator", () => {
       attempt: providerAttempt,
       stages: providerStages,
       event: providerEvent,
-    })).toThrow(/cannot settle shipped without exact published provider evidence/);
+    })).toThrow(/cannot settle terminal without exact published provider evidence/);
 
     expect(() => reducePipelineEvent({
       manifest,
-      instance: { ...providerInstance, published_commit: "e".repeat(40) },
+      instance: { ...providerInstance, published_subject: null },
       attempt: providerAttempt,
       stages: providerStages,
       event: providerEvent,
-    })).toThrow(/cannot settle shipped without exact published provider evidence/);
+    })).toThrow(/cannot settle terminal without exact published provider evidence/);
+
+    expect(() => reducePipelineEvent({
+      manifest,
+      instance: { ...providerInstance, published_subject: "c".repeat(40) },
+      attempt: providerAttempt,
+      stages: providerStages,
+      event: providerEvent,
+    })).toThrow(/cannot settle terminal without exact published provider evidence/);
+
+    expect(() => reducePipelineEvent({
+      manifest,
+      instance: providerInstance,
+      attempt: providerAttempt,
+      stages: providerStages,
+      event: { ...providerEvent, providerRevision: "e".repeat(40) },
+    })).toThrow(/cannot settle terminal without exact published provider evidence/);
   });
 
   it("allows a direct publish terminal to ship with exact publish-stage evidence", () => {
     const { manifest, instance, attempt, stages } = setup("core/investigate@1");
     const subject = "f".repeat(40);
+    const publishedCommit = "e".repeat(40);
     const publishAttempt = {
       ...attempt,
       id: "publish-attempt",
@@ -496,7 +528,7 @@ describe("pipeline coordinator", () => {
       native_context_policy: "resume_required" as const,
       expected_subject: subject,
     };
-    const publishPayload = JSON.stringify({ details: { published_commit: subject } });
+    const publishPayload = JSON.stringify({ details: { published_commit: publishedCommit } });
     const stageResultPayload = JSON.stringify({ outcome: "success" });
     const publishEvent: PipelineCoordinatorEvent = {
       id: "direct-publish-terminal",
@@ -508,7 +540,7 @@ describe("pipeline coordinator", () => {
       outcome: "success",
       resultHash: digestNormalized(stageResultPayload),
       subject,
-      providerRevision: subject,
+      providerRevision: publishedCommit,
       artifacts: [
         {
           kind: "stage_result",
@@ -538,7 +570,8 @@ describe("pipeline coordinator", () => {
       event: publishEvent,
     })).toMatchObject({
       terminalOutcome: "shipped",
-      publishedCommit: subject,
+      publishedCommit,
+      publishedSubject: subject,
     });
 
     expect(() => reducePipelineEvent({
@@ -550,8 +583,9 @@ describe("pipeline coordinator", () => {
         ...publishEvent,
         subject: "e".repeat(40),
         artifacts: publishEvent.artifacts?.map((artifact) => ({ ...artifact, subject: "e".repeat(40) })),
+        providerRevision: undefined,
       },
-    })).toThrow(/cannot settle shipped without exact published provider evidence/);
+    })).toThrow(/cannot settle terminal without exact published provider evidence/);
   });
 
   it.each([
@@ -574,7 +608,9 @@ describe("pipeline coordinator", () => {
   ])("settles a post-publication terminal %s stage from persisted exact publication evidence", (stageId, postStage) => {
     const { manifest, instance, attempt, stages } = setup("core/investigate@1");
     const subject = "f".repeat(40);
+    const publishedCommit = "a".repeat(40);
     const stalePublishedCommit = "c".repeat(40);
+    const stalePublishedSubject = "d".repeat(40);
     const payload = JSON.stringify({ outcome: "success" });
     const resultHash = digestNormalized(payload);
     const postPublicationManifest: PipelineManifest = {
@@ -636,7 +672,8 @@ describe("pipeline coordinator", () => {
       active_stage_id: stageId,
       status: "running" as const,
       immutable_subject: subject,
-      published_commit: subject,
+      published_commit: publishedCommit,
+      published_subject: subject,
       manifest_digest: digestNormalized(canonicalJson(postPublicationManifest)),
       normalized_manifest: canonicalJson(postPublicationManifest),
     };
@@ -652,21 +689,65 @@ describe("pipeline coordinator", () => {
       publishedCommit: null,
     });
 
+    const noChangePayload = JSON.stringify({ outcome: "no_change" });
+    const noChangeHash = digestNormalized(noChangePayload);
+    const noChangeEvent: PipelineCoordinatorEvent = {
+      ...exactEvent,
+      id: `${stageId}-post-publication-no-change-terminal`,
+      outcome: "no_change",
+      resultHash: noChangeHash,
+      artifacts: postStage.artifacts.map((kind) => ({
+        kind,
+        schemaVersion: 1,
+        assurance: postStage.assurance,
+        subject,
+        payload: noChangePayload,
+        hash: noChangeHash,
+      })),
+    };
+
+    expect(reducePipelineEvent({
+      manifest: postPublicationManifest,
+      instance: postInstance,
+      attempt: postAttempt,
+      stages,
+      event: noChangeEvent,
+    })).toMatchObject({
+      terminalOutcome: "no_change",
+      publishedCommit: null,
+    });
+
     expect(() => reducePipelineEvent({
       manifest: postPublicationManifest,
       instance: { ...postInstance, published_commit: null },
       attempt: postAttempt,
       stages,
       event: exactEvent,
-    })).toThrow(/cannot settle shipped without exact published provider evidence/);
+    })).toThrow(/cannot settle terminal without exact published provider evidence/);
 
     expect(() => reducePipelineEvent({
       manifest: postPublicationManifest,
-      instance: { ...postInstance, published_commit: stalePublishedCommit },
+      instance: { ...postInstance, published_commit: stalePublishedCommit, published_subject: null },
       attempt: postAttempt,
       stages,
       event: exactEvent,
-    })).toThrow(/cannot settle shipped without exact published provider evidence/);
+    })).toThrow(/cannot settle terminal without exact published provider evidence/);
+
+    expect(() => reducePipelineEvent({
+      manifest: postPublicationManifest,
+      instance: { ...postInstance, published_subject: stalePublishedSubject },
+      attempt: postAttempt,
+      stages,
+      event: exactEvent,
+    })).toThrow(/cannot settle terminal without exact published provider evidence/);
+
+    expect(() => reducePipelineEvent({
+      manifest: postPublicationManifest,
+      instance: { ...postInstance, published_subject: null },
+      attempt: postAttempt,
+      stages,
+      event: noChangeEvent,
+    })).toThrow(/cannot settle terminal without exact published provider evidence/);
 
     expect(() => reducePipelineEvent({
       manifest: postPublicationManifest,
@@ -679,7 +760,7 @@ describe("pipeline coordinator", () => {
         subject: "d".repeat(40),
         artifacts: exactEvent.artifacts?.map((artifact) => ({ ...artifact, subject: "d".repeat(40) })),
       },
-    })).toThrow(/cannot settle shipped without exact published provider evidence/);
+    })).toThrow(/cannot settle terminal without exact published provider evidence/);
   });
 
   it("projects notable repair stages into run notes without changing transitions", () => {
@@ -992,6 +1073,69 @@ describe("pipeline coordinator", () => {
     expect(attemptsExhausted.nextAttempt).toBeUndefined();
     expect(attemptsExhausted.effects.map((effect) => effect.kind))
       .toEqual(["publish_linear", "stop", "cleanup"]);
+  });
+
+  it("fences no_change terminals produced by re-entry exhaustion", () => {
+    const { manifest, instance, attempt, stages } = setup("core/implement@4");
+    const noChangeExhaustionManifest: PipelineManifest = {
+      ...manifest,
+      stages: manifest.stages.map((stage) => stage.id === "implementation"
+        ? {
+            ...stage,
+            transitions: {
+              ...stage.transitions,
+              semantic_repair_required: { to: "implementation", max_reentries: 1, on_exhausted: "no_change" },
+            },
+          }
+        : stage),
+    };
+    const normalizedManifest = canonicalJson(noChangeExhaustionManifest);
+    const publishedSubject = "b".repeat(40);
+    const unpublishedSubject = "e".repeat(40);
+    const publishedCommit = "d".repeat(40);
+    const exhaustedStages = stages.map((stage) => stage.stage_id === "implementation"
+      ? { ...stage, reentry_count: 1 }
+      : stage);
+    const exhaustedInstance = {
+      ...instance,
+      manifest_digest: digestNormalized(normalizedManifest),
+      normalized_manifest: normalizedManifest,
+      immutable_subject: publishedSubject,
+      published_commit: publishedCommit,
+      published_subject: publishedSubject,
+    };
+    const repair = event(exhaustedInstance, attempt, "semantic_repair_required", "repair-exhausted-no-change");
+    const subjectAdvance = {
+      ...repair,
+      subject: unpublishedSubject,
+      artifacts: repair.artifacts?.map((artifact) => ({ ...artifact, subject: unpublishedSubject })),
+    };
+
+    expect(reducePipelineEvent({
+      manifest: noChangeExhaustionManifest,
+      instance: exhaustedInstance,
+      attempt,
+      stages: exhaustedStages,
+      event: subjectAdvance,
+    })).toMatchObject({
+      terminalOutcome: "no_change",
+      clearPublishedCommit: true,
+      immutableSubject: unpublishedSubject,
+    });
+
+    const sameSubject = {
+      ...repair,
+      id: "repair-exhausted-no-change-unbound",
+      subject: publishedSubject,
+      artifacts: repair.artifacts?.map((artifact) => ({ ...artifact, subject: publishedSubject })),
+    };
+    expect(() => reducePipelineEvent({
+      manifest: noChangeExhaustionManifest,
+      instance: { ...exhaustedInstance, published_subject: null },
+      attempt,
+      stages: exhaustedStages,
+      event: sameSubject,
+    })).toThrow(/cannot settle terminal without exact published provider evidence/);
   });
 
   it("does not exhaust the raw attempt budget in the middle of a forward repair round", () => {
