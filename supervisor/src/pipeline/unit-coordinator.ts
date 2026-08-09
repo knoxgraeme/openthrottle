@@ -39,7 +39,7 @@ export type UnitActionKind = (typeof UNIT_ACTION_KINDS)[number];
 
 function structuredAggregateSummary(result: StageOutcome): string {
   return result === "success"
-    ? "Structured execution units completed."
+    ? "Structured execution units completed and the integrated subject is ready for publication."
     : "Structured execution did not integrate every unit.";
 }
 

@@ -25,9 +25,76 @@ type LoopActionPlanContextInput = {
   unitId: string | null;
 };
 
+const FINAL_REVIEW_PLAN_CONTEXT_LIMIT_BYTES = 48 * 1024;
+
+function boundedText(value: string | undefined, limit: number): string {
+  if (!value) return "";
+  return value.length <= limit ? value : `${value.slice(0, limit)}...`;
+}
+
+function finalReviewPlanContext(plan: ExecutionPlanContract, actionKind: UnitActionKind): Record<string, unknown> {
+  const instructionIds = new Set<string>();
+  const acceptanceIds = new Set<string>();
+  for (const unit of plan.units) {
+    for (const id of unit.instructions) instructionIds.add(id);
+    for (const id of unit.acceptance) acceptanceIds.add(id);
+  }
+  const context = {
+    schema: "openthrottle.loop-action-plan-context/v1",
+    graph_id: plan.graph_id,
+    plan_id: plan.plan_id,
+    action_kind: actionKind,
+    unit: null,
+    whole_plan: true,
+    units: plan.units.map((unit) => ({
+      id: unit.id,
+      title: boundedText(unit.title, 240),
+      depends_on: unit.depends_on,
+      instructions: unit.instructions,
+      acceptance: unit.acceptance,
+    })),
+    instructions: Object.fromEntries([...instructionIds].map((id) => [id, boundedText(plan.instructions[id], 1_000)])),
+    acceptance: Object.fromEntries([...acceptanceIds].map((id) => [id, boundedText(plan.acceptance[id], 1_000)])),
+    commands: plan.commands,
+  };
+  if (Buffer.byteLength(canonicalJson(context), "utf8") <= FINAL_REVIEW_PLAN_CONTEXT_LIMIT_BYTES) return context;
+
+  const compact = {
+    ...context,
+    units: context.units.map((unit) => ({
+      ...unit,
+      title: boundedText(unit.title, 120),
+    })),
+    instructions: Object.fromEntries([...instructionIds].map((id) => [id, boundedText(plan.instructions[id], 320)])),
+    acceptance: Object.fromEntries([...acceptanceIds].map((id) => [id, boundedText(plan.acceptance[id], 320)])),
+  };
+  if (Buffer.byteLength(canonicalJson(compact), "utf8") <= FINAL_REVIEW_PLAN_CONTEXT_LIMIT_BYTES) return compact;
+
+  return {
+    schema: "openthrottle.loop-action-plan-context/v1",
+    graph_id: plan.graph_id,
+    plan_id: plan.plan_id,
+    action_kind: actionKind,
+    unit: null,
+    whole_plan: true,
+    truncated: true,
+    units: plan.units.map((unit) => ({
+      id: unit.id,
+      title: boundedText(unit.title, 120),
+      depends_on: unit.depends_on,
+      instructions: unit.instructions,
+      acceptance: unit.acceptance,
+    })),
+    commands: plan.commands.map((command) => ({ name: command.name, unit: command.unit })),
+  };
+}
+
 export function loopActionPlanContext(input: LoopActionPlanContextInput): Record<string, unknown> | null {
   const plan = input.plan;
   if (!plan) return null;
+  if (input.unitId === null && input.actionKind === "final_review") {
+    return finalReviewPlanContext(plan, input.actionKind);
+  }
   const unit = input.unitId
     ? plan.units.find((unit) => unit.id === input.unitId)
     : undefined;

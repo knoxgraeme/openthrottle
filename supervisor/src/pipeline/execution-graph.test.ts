@@ -243,18 +243,27 @@ describe("execution graph compiler", () => {
       id: "builtin/structured",
       version: 1,
       entry_stage: "units",
-      requires: { capabilities: ["ce/implement@1", "ce/simplify@1", "graph/for-each-unit@1", "accept-unit@1"] },
-      stages: [{
-        id: "units",
-        executor: { kind: "loop_action", capability: "graph/for-each-unit@1" },
-        evaluator: { kind: "semantic", assurance: "executor_verified", required_artifacts: ["execution_graph_result"] },
-        context: "none",
-        live_steering: false,
-        credentials: ["provider.read", "repo.read"],
-        produces: ["stage_result", "execution_graph_result"],
-        unitPhases: ["implement", "simplify", "command", "candidate", "lead", "integrate"],
-        unitCommandNames: ["test", "lint", "build"],
-      }],
+      requires: {
+        capabilities: [
+          "ce/implement@1",
+          "ce/simplify@1",
+          "ce/publish@1",
+          "graph/for-each-unit@1",
+          "provider/wait@1",
+          "accept-unit@1",
+        ],
+      },
+    });
+    expect(compiled.manifest.manifest.stages[0]).toMatchObject({
+      id: "units",
+      executor: { kind: "loop_action", capability: "graph/for-each-unit@1" },
+      evaluator: { kind: "semantic", assurance: "executor_verified", required_artifacts: ["execution_graph_result"] },
+      context: "none",
+      live_steering: false,
+      credentials: ["provider.read", "repo.read"],
+      produces: ["stage_result", "execution_graph_result"],
+      unitPhases: ["implement", "simplify", "command", "candidate", "lead", "integrate"],
+      unitCommandNames: ["test", "lint", "build"],
     });
     const phaseAction = (phase: NonNullable<PipelineStage["unitPhaseBindings"]>[number]): string => {
       if (phase.kind === "command") return "command";
@@ -274,6 +283,24 @@ describe("execution graph compiler", () => {
       { id: "lead", kind: "gate", action: "accept-unit@1", receipt: "unit_decision" },
       { id: "integrate", kind: "integrate", action: "integrate", receipt: undefined },
     ]);
+    expect(compiled.manifest.manifest.stages.map((stage) => stage.id)).toEqual(["units", "publish", "provider"]);
+    expect(compiled.manifest.manifest.stages[0]?.transitions.success).toEqual({ to: "publish" });
+    expect(compiled.manifest.manifest.stages[1]).toMatchObject({
+      id: "publish",
+      executor: { kind: "agent", capability: "ce/publish@1" },
+      transitions: {
+        success: { to: "provider" },
+        semantic_repair_required: { terminal: "needs_human" },
+      },
+    });
+    expect(compiled.manifest.manifest.stages[2]).toMatchObject({
+      id: "provider",
+      executor: { kind: "provider_wait", capability: "provider/wait@1" },
+      transitions: {
+        success: { terminal: "shipped" },
+        semantic_repair_required: { terminal: "needs_human" },
+      },
+    });
     expect(compiled.unitPhases).toEqual(["implement", "simplify", "command", "candidate", "lead", "integrate"]);
     expect(compiled.unitCommandNames).toEqual(["test", "lint", "build"]);
     expect(compiled.manifest.manifest.stages[0]?.transitions.no_change).toEqual({ terminal: "no_change" });

@@ -3,7 +3,8 @@ import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 import { canonicalJson, stageById } from "../pipeline/manifest.js";
 import { digestNormalized } from "../pipeline/manifest.js";
 import { FOR_EACH_UNIT_CAPABILITY } from "../pipeline/capability-contracts.js";
-import { coordinatePipelineEvent } from "../pipeline/coordinator.js";
+import { coordinatePipelineEvent, type PipelineCoordinatorEvent } from "../pipeline/coordinator.js";
+import { deriveStageFaultAttribution } from "../pipeline/fault-attribution.js";
 import type {
   PipelineEffectIntent,
   PipelineInstance,
@@ -241,6 +242,19 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     runtime: deps.runtime,
     taskTimeoutSeconds: deps.taskTimeoutSeconds,
     now,
+    completeParentStage(event: PipelineCoordinatorEvent): PipelineInstance {
+      if (!event.runId) throw new Error(`pipeline composite event ${event.id} has no run binding`);
+      return deps.tickets.finishRunAndThen(
+        {
+          runId: event.runId,
+          status: "completed",
+          exitCode: 0,
+          ticketState: "active",
+          faultAttribution: deriveStageFaultAttribution(event.outcome, event.faultReason),
+        },
+        () => coordinatePipelineEvent(deps.store, event)
+      );
+    },
     captureCodexAuth: deps.captureCodexAuth,
   });
 

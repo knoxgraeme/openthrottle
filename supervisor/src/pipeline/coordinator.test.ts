@@ -408,6 +408,55 @@ describe("pipeline coordinator", () => {
     expect(createRunOutcomeStore(db!).getRunOutcome(instance.id)).toBeUndefined();
   });
 
+  it("refuses to settle a publishing manifest as shipped without exact provider publication evidence", () => {
+    const { manifest, instance, attempt, stages } = setup("core/implement@4");
+    const subject = "f".repeat(40);
+    const providerAttempt = {
+      ...attempt,
+      id: "provider-attempt",
+      stage_id: "provider",
+      request_hash: digestNormalized("provider-request"),
+      native_context_policy: "none" as const,
+      expected_subject: subject,
+    };
+    const providerInstance = {
+      ...instance,
+      status: "waiting_provider" as const,
+      active_stage_id: "provider",
+      immutable_subject: subject,
+      published_commit: subject,
+    };
+    const providerStages = providerWaitStages(stages, 0);
+    const providerEvent = providerFeedbackEvent(providerInstance, providerAttempt, "success", "provider-success");
+
+    expect(reducePipelineEvent({
+      manifest,
+      instance: providerInstance,
+      attempt: providerAttempt,
+      stages: providerStages,
+      event: providerEvent,
+    })).toMatchObject({
+      terminalOutcome: "shipped",
+      publishedCommit: null,
+    });
+
+    expect(() => reducePipelineEvent({
+      manifest,
+      instance: { ...providerInstance, published_commit: null },
+      attempt: providerAttempt,
+      stages: providerStages,
+      event: providerEvent,
+    })).toThrow(/cannot settle shipped without exact published provider evidence/);
+
+    expect(() => reducePipelineEvent({
+      manifest,
+      instance: { ...providerInstance, published_commit: "e".repeat(40) },
+      attempt: providerAttempt,
+      stages: providerStages,
+      event: providerEvent,
+    })).toThrow(/cannot settle shipped without exact published provider evidence/);
+  });
+
   it("projects notable repair stages into run notes without changing transitions", () => {
     const { pipelines, instance, attempt } = setup("core/implement@4");
     db!.prepare(`

@@ -3,6 +3,7 @@ import type { ExecutionPlanContract } from "@openthrottle/contracts";
 import { canonicalJson } from "./manifest.js";
 import {
   MAX_VALID_DOWNSTREAM_CONTEXT,
+  loopActionPlanContext,
   structuredPlanLoopEnvelopeBytes,
 } from "./structured-loop-envelope.js";
 import {
@@ -70,5 +71,55 @@ describe("downstream-context admission bound", () => {
     const trueMaxBytes = Buffer.byteLength(canonicalJson(MAX_VALID_DOWNSTREAM_CONTEXT), "utf8");
     expect(trueMaxBytes).toBeGreaterThan(oldRepresentativeSampleBytes);
     expect(trueMaxBytes).toBe(MAX_DOWNSTREAM_CONTEXT_BYTES);
+  });
+
+  it("supplies bounded whole-plan intent and acceptance context to final review", () => {
+    const plan: ExecutionPlanContract = {
+      schema: "openthrottle.execution-plan/v1",
+      graph_id: "structured",
+      plan_id: "final-review-context",
+      instructions: {
+        build_api: "Build the API behavior.",
+        build_ui: "Build the UI behavior.",
+      },
+      acceptance: {
+        api_done: "The API accepts the new input.",
+        ui_done: "The UI renders the new state.",
+      },
+      units: [
+        {
+          id: "api",
+          title: "API",
+          depends_on: [],
+          instructions: ["build_api"],
+          acceptance: ["api_done"],
+        },
+        {
+          id: "ui",
+          title: "UI",
+          depends_on: ["api"],
+          instructions: ["build_ui"],
+          acceptance: ["ui_done"],
+        },
+      ],
+      commands: [{ name: "test" }],
+    };
+
+    const context = loopActionPlanContext({ plan, actionKind: "final_review", unitId: null });
+
+    expect(context).toMatchObject({
+      schema: "openthrottle.loop-action-plan-context/v1",
+      whole_plan: true,
+      unit: null,
+      instructions: {
+        build_api: "Build the API behavior.",
+        build_ui: "Build the UI behavior.",
+      },
+      acceptance: {
+        api_done: "The API accepts the new input.",
+        ui_done: "The UI renders the new state.",
+      },
+    });
+    expect(Buffer.byteLength(canonicalJson(context), "utf8")).toBeLessThanOrEqual(MAX_LOOP_REQUEST_ENVELOPE_BYTES);
   });
 });

@@ -1132,6 +1132,8 @@ describe("pipeline effect processor", () => {
         role: "reviewer",
         skill: "final-review",
         expectedProducerSkill: "builtin://final-review@1",
+        baseSubject: instance.base_commit,
+        inputSubject: integratedSubjectB,
         worktree: null,
       })
     );
@@ -1219,6 +1221,16 @@ describe("pipeline effect processor", () => {
 
     await processor.drain();
     const freshReview = latestAction("final_review");
+    expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
+      { providerResourceId: "sandbox-child-drain" },
+      expect.objectContaining({
+        protocol: "loop-action@2",
+        role: "reviewer",
+        skill: "final-review",
+        baseSubject: instance.base_commit,
+        inputSubject: finalIntegratedSubject,
+      })
+    );
     pipelines.completeGatedAction({
       actionId: freshReview.id,
       resultHash: "result-review-fresh",
@@ -1267,9 +1279,39 @@ describe("pipeline effect processor", () => {
       aggregate_emitted_at: expect.any(String),
       integration_subject: finalIntegratedSubject,
     });
-    const activationsAfterAggregate = runtime.setActive.mock.calls.length;
+    expect(pipelines.getInstance(instance.id)).toMatchObject({
+      active_stage_id: "publish",
+      status: "dispatchable",
+      immutable_subject: finalIntegratedSubject,
+    });
+    const effects = pipelines.listEffects(instance.id);
+    expect(effects.find((effect) => effect.kind === "dispatch_stage" && effect.status === "pending"))
+      .toMatchObject({
+        kind: "dispatch_stage",
+        idempotency_key: expect.stringContaining("publish"),
+      });
+    const publishRequest = JSON.parse(
+      effects.find((effect) => effect.kind === "dispatch_stage" && effect.status === "pending")!.payload
+    ) as { stageId: string; capability: string; expectedSubject: string; runId: string };
+    expect(publishRequest).toMatchObject({
+      stageId: "publish",
+      capability: "ce/publish@1",
+      expectedSubject: finalIntegratedSubject,
+    });
+    expect(tickets.getByIssueId(instance.linear_issue_id)?.run_id).toBeNull();
+
+    const dispatchCallsBeforePublish = runtime.dispatchStage.mock.calls.length;
     await processor.drain();
-    expect(runtime.setActive).toHaveBeenCalledTimes(activationsAfterAggregate);
+    expect(runtime.dispatchStage).toHaveBeenCalledTimes(dispatchCallsBeforePublish + 1);
+    expect(runtime.dispatchStage).toHaveBeenLastCalledWith(
+      { providerResourceId: "sandbox-child-drain" },
+      expect.objectContaining({
+        stageId: "publish",
+        capability: "ce/publish@1",
+        expectedSubject: finalIntegratedSubject,
+      })
+    );
+    expect(tickets.getByIssueId(instance.linear_issue_id)?.run_id).toBe(publishRequest.runId);
   });
 
   it("leaves retryable child loop errors active for effect retry instead of parsing them as receipts", async () => {

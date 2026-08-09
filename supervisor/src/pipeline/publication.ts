@@ -237,6 +237,7 @@ const STAGE_LABELS: Readonly<Record<string, { display: string; action?: string }
   semantic_review: { display: "code review", action: "reviewing changes" },
   simplification: { display: "simplifying", action: "simplifying changes" },
   test: { display: "testing" },
+  units: { display: "structured execution" },
 };
 
 function stageDisplayName(stageId: string): string {
@@ -438,6 +439,9 @@ function eventSentence(
     case "selection":
       return "OpenThrottle selected the pinned pipeline and recorded the starting receipt.";
     case "gate":
+      if (envelope.stage?.id === "units" && envelope.decision.outcome === "success") {
+        return "The structured execution aggregate is ready for publication.";
+      }
       return envelope.decision.gate_result === "passed"
         ? "The supervisor accepted the stage result and verified the required fences."
         : `The supervisor recorded the stage result: ${sentenceForOutcome(envelope.decision.outcome)}`;

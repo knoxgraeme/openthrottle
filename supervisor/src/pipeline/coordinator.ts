@@ -27,6 +27,8 @@ import {
 } from "./publication.js";
 import type { LaunchFaultReason } from "./fault-attribution.js";
 
+const PUBLISH_CAPABILITY = ["ce", "publish@1"].join("/");
+
 export interface PipelineEventArtifact {
   id?: string;
   kind: string;
@@ -150,6 +152,20 @@ function activeStage(input: PipelineReductionInput): PipelineStage {
   if (!stage) throw new Error(`active stage ${input.instance.active_stage_id ?? "<none>"} is absent from the pinned manifest`);
   if (stage.id !== input.attempt.stage_id) throw new Error("active attempt does not match the pinned stage");
   return stage;
+}
+
+function successPathIncludesPublication(manifest: PipelineManifest): boolean {
+  const visited = new Set<string>();
+  let current: string | undefined = manifest.entry_stage;
+  while (current && !visited.has(current)) {
+    const stage = manifest.stages.find((candidate) => candidate.id === current);
+    if (!stage) return false;
+    if (stage.executor.kind === "agent" && stage.executor.capability === PUBLISH_CAPABILITY) return true;
+    if (stage.executor.kind === "provider_wait") return true;
+    visited.add(current);
+    current = stage.transitions.success?.to;
+  }
+  return false;
 }
 
 function verifyInput(input: PipelineReductionInput): PipelineStage {
@@ -599,6 +615,17 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
   }
 
   const terminal = transition.terminal!;
+  if (
+    terminal === "shipped" &&
+    successPathIncludesPublication(input.manifest) &&
+    (
+      stage.executor.kind !== "provider_wait" ||
+      input.instance.published_commit === null ||
+      input.event.subject !== input.instance.published_commit
+    )
+  ) {
+    throw new Error("publishing pipeline cannot settle shipped without exact published provider evidence");
+  }
   return terminalWrite({
     ...input,
     eventPayloadHash,
