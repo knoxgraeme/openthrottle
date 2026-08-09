@@ -170,6 +170,7 @@ describe("pipeline effect processor", () => {
     outcome?: ExecutionGateDecision["outcome"];
     result?: ExecutionGateDecision["result"];
     reason?: GateReceiptReason;
+    artifactHashes?: string[];
   }): ExecutionGateDecision {
     const base = {
       gateKind: input.gateKind,
@@ -177,7 +178,7 @@ describe("pipeline effect processor", () => {
       result: input.result ?? "passed",
       reason: input.reason ?? "typed_semantic_result",
       subject: input.subject,
-      artifactHashes: ["a".repeat(64)],
+      artifactHashes: input.artifactHashes ?? ["a".repeat(64)],
     };
     const payload = canonicalJson({ schema: "test.gate-decision/v1", ...base });
     return { ...base, payload, hash: digestNormalized(payload) };
@@ -194,6 +195,8 @@ describe("pipeline effect processor", () => {
     commandName?: string | null;
     nativeSessionId?: string | null;
     evidence?: string[];
+    treeSubject?: string;
+    clean?: boolean;
   }): string {
     const executorVerified = input.type === "command_result" || input.type.endsWith("_evidence");
     const producer = (() => {
@@ -260,7 +263,12 @@ describe("pipeline effect processor", () => {
           ? { summary: "no findings", findings: [] }
         : input.type === "unit_decision"
           ? { rationale: "candidate matches the unit scope", context_updates: [], accepted_subject: input.subject }
-          : { tree: input.subject, diff_digest: "d".repeat(64), changed_paths: [], clean: true };
+        : {
+            tree: input.treeSubject ?? input.subject,
+            diff_digest: "d".repeat(64),
+            changed_paths: [],
+            clean: input.clean ?? true,
+          };
     return canonicalJson({
       schema: "openthrottle.receipt/v1",
       type: input.type,
@@ -1166,6 +1174,7 @@ describe("pipeline effect processor", () => {
     const repairedSubject = "c".repeat(40);
     const finalCandidateSubject = "d".repeat(40);
     const finalIntegratedSubject = "e".repeat(40);
+    const finalIntegratedTreeSubject = "9".repeat(40);
     completeUnitAction("final_repair", repairedSubject, "unit_completion");
 
     await processor.drain();
@@ -1210,12 +1219,23 @@ describe("pipeline effect processor", () => {
       })
     );
     const finalIntegrate = latestAction("integrate");
+    const finalIntegrationReceipt = receiptJson({
+      instance,
+      action: finalIntegrate,
+      type: "integration_evidence",
+      subject: finalIntegratedSubject,
+      treeSubject: finalIntegratedTreeSubject,
+    });
     pipelines.completeGatedAction({
       actionId: finalIntegrate.id,
       resultHash: "result-final-integrate",
       outputSubject: finalIntegratedSubject,
-      receipt: receiptJson({ instance, action: finalIntegrate, type: "integration_evidence", subject: finalIntegratedSubject }),
-      decision: gateDecision({ gateKind: "integration", subject: finalIntegratedSubject }),
+      receipt: finalIntegrationReceipt,
+      decision: gateDecision({
+        gateKind: "integration",
+        subject: finalIntegratedSubject,
+        artifactHashes: [digestNormalized(finalIntegrationReceipt)],
+      }),
     });
     expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({ integration_subject: finalIntegratedSubject });
 
@@ -1265,6 +1285,53 @@ describe("pipeline effect processor", () => {
       freshReview.id
     );
 
+    db!.prepare(`
+      UPDATE execution_graphs
+      SET integration_subject = NULL, updated_at = ?
+      WHERE parent_attempt_id = ?
+    `).run("2099-07-22T12:00:00.000Z", attempt.id);
+    await expect(processor.drain()).rejects.toThrow(/has no exact subject/);
+    db!.prepare(`
+      UPDATE execution_graphs
+      SET integration_subject = ?, updated_at = ?
+      WHERE parent_attempt_id = ?
+    `).run(finalIntegratedSubject, "2099-07-22T12:00:00.000Z", attempt.id);
+
+    const rewriteFinalIntegrationReceipt = (receipt: string) => {
+      const receiptHash = digestNormalized(receipt);
+      const gate = gateDecision({
+        gateKind: "integration",
+        subject: finalIntegratedSubject,
+        artifactHashes: [receiptHash],
+      });
+      db!.prepare(`
+        UPDATE execution_work_attempts
+        SET receipt = ?, receipt_hash = ?, updated_at = ?
+        WHERE id = ?
+      `).run(receipt, receiptHash, "2099-07-22T12:00:00.000Z", finalIntegrate.id);
+      db!.prepare(`
+        UPDATE execution_gate_receipts
+        SET artifact_hashes = ?, payload = ?, receipt_hash = ?
+        WHERE execution_work_attempt_id = ? AND gate_kind = 'integration'
+      `).run(canonicalJson(gate.artifactHashes), gate.payload, gate.hash, finalIntegrate.id);
+    };
+    rewriteFinalIntegrationReceipt(receiptJson({
+      instance,
+      action: finalIntegrate,
+      type: "integration_evidence",
+      subject: finalIntegratedSubject,
+      treeSubject: finalIntegratedTreeSubject,
+      clean: false,
+    }));
+    await expect(processor.drain()).rejects.toThrow(/accepted integration receipt does not seal a clean tree/);
+    rewriteFinalIntegrationReceipt(receiptJson({
+      instance,
+      action: finalIntegrate,
+      type: "integration_evidence",
+      subject: finalIntegratedSubject,
+      treeSubject: finalIntegratedTreeSubject,
+    }));
+
     const beforeAggregateStatus = pipelines.getInstance(instance.id)!.status;
     db!.prepare("UPDATE pipeline_instances SET status = 'publication_blocked' WHERE id = ?").run(instance.id);
     await expect(processor.drain()).rejects.toThrow(/pipeline publication is blocked/);
@@ -1284,7 +1351,7 @@ describe("pipeline effect processor", () => {
     expect(pipelines.getInstance(instance.id)).toMatchObject({
       active_stage_id: "publish",
       status: "dispatchable",
-      immutable_subject: finalIntegratedSubject,
+      immutable_subject: finalIntegratedTreeSubject,
     });
     const effects = pipelines.listEffects(instance.id);
     expect(effects.find((effect) => effect.kind === "dispatch_stage" && effect.status === "pending"))
@@ -1305,7 +1372,7 @@ describe("pipeline effect processor", () => {
     expect(publishRequest).toMatchObject({
       stageId: "publish",
       capability: "ce/publish@1",
-      expectedSubject: finalIntegratedSubject,
+      expectedSubject: finalIntegratedTreeSubject,
       contextPolicy: "prefer_resume",
       nativeSessionId: null,
     });
@@ -1319,7 +1386,7 @@ describe("pipeline effect processor", () => {
       expect.objectContaining({
         stageId: "publish",
         capability: "ce/publish@1",
-        expectedSubject: finalIntegratedSubject,
+        expectedSubject: finalIntegratedTreeSubject,
         contextPolicy: "prefer_resume",
         nativeSessionId: null,
       })

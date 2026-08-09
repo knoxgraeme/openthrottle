@@ -526,6 +526,18 @@ describe("deterministic supervisor stage gates", () => {
     expect(first.event.outcome).toBe("success");
   });
 
+  it("settles the sealed tree subject and rejects the integrated commit as workspace drift", () => {
+    const fixture = setup();
+    const integratedCommit = "e".repeat(40);
+    const canonicalTree = "9".repeat(40);
+    const input = event(fixture, "success", { subject: canonicalTree });
+
+    expect(evaluateStageGate(fixture.pipelines, input, { observedSubject: canonicalTree }).event.subject)
+      .toBe(canonicalTree);
+    expect(() => evaluateStageGate(fixture.pipelines, input, { observedSubject: integratedCommit }))
+      .toThrow(/workspace changed after stage evidence was sealed/);
+  });
+
   it("lets blocking P0/P1 evidence override success prose and the proposed result", () => {
     const fixture = setup();
     const evaluated = evaluateStageGate(fixture.pipelines, event(fixture, "success", {
