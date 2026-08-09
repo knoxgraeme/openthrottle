@@ -9,6 +9,7 @@ import type {
   PipelineEffectIntent,
   PipelineInstance,
   PipelineRuntimeResource,
+  PipelineStageAttempt,
   PipelineStore,
 } from "../pipeline/store.js";
 import type { StageRequestEnvelope } from "../pipeline/stage-request.js";
@@ -27,6 +28,7 @@ const EFFECT_LEASE_MS = 60_000;
 const RETRY_BASE_MS = 5_000;
 const MAX_EFFECT_ATTEMPTS = 8;
 const CAPACITY_RETRY_MS = 5 * 60_000;
+const PUBLISH_CAPABILITY = "ce/publish@1";
 
 // Deterministic provider failures must not burn the whole retry budget on hot
 // exponential backoff. Auth failures never self-heal, so they exhaust on the
@@ -61,6 +63,11 @@ function classifyEffectError(message: string): EffectErrorClass {
   if (CAPACITY_ERROR_PATTERNS.some((pattern) => pattern.test(text))) return "capacity";
   if (AUTH_ERROR_PATTERNS.some((pattern) => pattern.test(text))) return "auth";
   return "transient";
+}
+
+function isPublishStage(normalizedManifest: string, stageId: string | null | undefined): boolean {
+  const stage = stageById(normalizedManifest, stageId);
+  return stage?.executor.capability === PUBLISH_CAPABILITY && stage.evaluator.kind === "publish_subject";
 }
 
 export interface PipelineEffectProcessor {
@@ -347,6 +354,88 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     };
   };
 
+  const stopLegacyPublishActorIfNeeded = async (
+    instance: PipelineInstance,
+    resource: RuntimeResource,
+    publishStageId: string,
+    completedCompositeAttempts: PipelineStageAttempt[]
+  ): Promise<void> => {
+    const current = deps.store.getInstance(instance.id);
+    const attempt = deps.store.getActiveAttempt(instance.id);
+    if (!current || current.active_stage_id !== publishStageId || !attempt ||
+        attempt.stage_id !== publishStageId || attempt.status !== "running" ||
+        !attempt.run_id || !attempt.expected_subject) {
+      return;
+    }
+    const legacyGraph = completedCompositeAttempts
+      .map((candidate) => deps.store.getGraphForAttempt(candidate.id))
+      .find((graph) =>
+        graph?.aggregate_emitted_at &&
+        graph.integration_subject === attempt.expected_subject
+      );
+    if (!legacyGraph) return;
+    const ticket = deps.tickets.getByIssueId(instance.linear_issue_id);
+    if (ticket?.run_id !== attempt.run_id) return;
+    const settlement = await terminateAndSettleActor({
+      runtime: {
+        async stopResource(sandboxId, reason) {
+          const termination = await deps.runtime.stop({ providerResourceId: sandboxId }, reason);
+          if (!termination.confirmed) {
+            throw new Error(`pipeline runtime ${sandboxId} did not confirm termination`);
+          }
+        },
+      },
+      store: deps.tickets,
+      runId: attempt.run_id,
+      sandboxId: resource.providerResourceId,
+      owner: `aggregate-publish-restart:${attempt.id}`,
+      reason: "legacy commit-fenced publish actor replaced by canonical tree-fenced dispatch",
+      faultAttribution: null,
+      status: "stopped",
+      ticketState: "active",
+      ticketFailureTail: null,
+      quarantineOnStopFailure: true,
+    });
+    if (settlement.kind !== "settled") {
+      throw new Error(`publish attempt ${attempt.id} legacy actor could not be terminated for aggregate migration`);
+    }
+  };
+
+  const completedCompositeAttemptsForPublish = (
+    instance: PipelineInstance,
+    publishStageId: string
+  ): PipelineStageAttempt[] => {
+    const manifest = JSON.parse(instance.normalized_manifest) as {
+      stages?: Array<{
+        id: string;
+        executor?: { capability?: string };
+        transitions?: Record<string, { to?: string | null }>;
+      }>;
+    };
+    const compositeStageIds = new Set((manifest.stages ?? []).filter((stage) =>
+      stage.executor?.capability === FOR_EACH_UNIT_CAPABILITY &&
+      Object.values(stage.transitions ?? {}).some((transition) =>
+        typeof transition === "object" && transition !== null &&
+        "to" in transition && transition.to === publishStageId
+      )
+    )
+      .map((stage) => stage.id));
+    return deps.store.listAttempts(instance.id)
+      .filter((attempt) => compositeStageIds.has(attempt.stage_id) && attempt.status === "completed");
+  };
+
+  const drainCompletedCompositeParentsForPublish = async (
+    resource: RuntimeResource,
+    instance: PipelineInstance,
+    publishStageId: string
+  ): Promise<void> => {
+    const completedCompositeAttempts = completedCompositeAttemptsForPublish(instance, publishStageId);
+    await stopLegacyPublishActorIfNeeded(instance, resource, publishStageId, completedCompositeAttempts);
+    for (const attempt of completedCompositeAttempts) {
+      await structuredChildren.drainCompositeChildren(resource, instance, attempt.id);
+    }
+  };
+
   const isCurrentIdleWait = (instanceId: string, control: IdleEffectControl): boolean => {
     const current = deps.store.getInstance(instanceId);
     const activeAttempt = deps.store.getActiveAttempt(instanceId);
@@ -370,15 +459,8 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     let currentEffect = effect;
     if (effect.kind === "dispatch_stage") {
       const pendingRequest = JSON.parse(effect.payload) as StageRequestEnvelope;
-      if (pendingRequest.stageId === "publish") {
-        const manifest = JSON.parse(instance.normalized_manifest) as { stages?: Array<{ id: string; executor?: { capability?: string } }> };
-        const compositeStageIds = new Set((manifest.stages ?? [])
-          .filter((stage) => stage.executor?.capability === FOR_EACH_UNIT_CAPABILITY)
-          .map((stage) => stage.id));
-        for (const attempt of deps.store.listAttempts(instance.id)) {
-          if (!compositeStageIds.has(attempt.stage_id) || attempt.status !== "completed") continue;
-          await structuredChildren.drainCompositeChildren(resource, instance, attempt.id);
-        }
+      if (isPublishStage(instance.normalized_manifest, pendingRequest.stageId)) {
+        await drainCompletedCompositeParentsForPublish(resource, instance, pendingRequest.stageId);
         currentEffect = deps.store.getEffect(effect.id) ?? effect;
       }
     }
@@ -647,6 +729,19 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     }
   };
 
+  const drainActivePublishReconciliations = async (): Promise<void> => {
+    const tickets = deps.tickets.listRunning();
+    for (const ticket of tickets) {
+      const instance = deps.store.getInstanceForSession(ticket.linear_session_id);
+      if (!instance || ticket.run_id === null || !isPublishStage(instance.normalized_manifest, instance.active_stage_id)) continue;
+      const attempt = deps.store.getActiveAttempt(instance.id);
+      if (!attempt || attempt.run_id !== ticket.run_id || attempt.status !== "running") continue;
+      const binding = runtimeBindingFor(instance);
+      if (!binding.resource || binding.status !== "active") continue;
+      await drainCompletedCompositeParentsForPublish(binding.resource, instance, attempt.stage_id);
+    }
+  };
+
   const enqueueCapacityWaitActivity = (effect: PipelineEffectIntent, message: string): void => {
     try {
       const id = `capacity-wait:${effect.id}`;
@@ -776,6 +871,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         );
         await Promise.all(effects.map(processClaimed));
         await drainActiveCompositeGraphs();
+        await drainActivePublishReconciliations();
       } finally {
         draining = false;
       }

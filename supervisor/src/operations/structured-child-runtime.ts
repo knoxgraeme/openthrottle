@@ -1355,6 +1355,8 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         }
       }
       const manifest = JSON.parse(instance.normalized_manifest);
+      const parentStage = stageById(instance.normalized_manifest, parentAttempt.stage_id);
+      const publishStageId = parentStage?.transitions[outcome]?.to;
       const event = buildAggregateStageEvent({
         id: `execution-aggregate:${parentAttemptId}:${aggregateSubject}:${outcome}`,
         manifest,
@@ -1407,6 +1409,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
             toArtifactHash: graphResult.hash,
             fromSubject: integrationSubject,
             toSubject: aggregateSubject,
+            ...(publishStageId ? { publishStageId } : {}),
           });
         }
         if (["completed", "canceled", "superseded", "failed"].includes(parentAttempt.status)) return;

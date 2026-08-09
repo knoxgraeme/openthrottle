@@ -16,6 +16,13 @@ import {
 import { createJournalStore } from "./journal-store.js";
 import { createRunOutcomeStore } from "./run-outcome-store.js";
 
+const PUBLISH_CAPABILITY = "ce/publish@1";
+
+function isPublishStage(manifest: PipelineManifest, stageId: string): boolean {
+  const stage = manifest.stages.find((candidate) => candidate.id === stageId);
+  return stage?.executor.capability === PUBLISH_CAPABILITY && stage.evaluator.kind === "publish_subject";
+}
+
 function attemptStatusForOutcome(
   outcome: CoordinatorTransitionWrite["outcome"]
 ): PipelineStageAttempt["status"] {
@@ -409,7 +416,7 @@ export function createTransitionStore(db: Database.Database, now: () => string):
       });
       wrote();
     }
-    if (attempt.stage_id === "publish" && write.outcome === "success") {
+    if (isPublishStage(JSON.parse(instance.normalized_manifest) as PipelineManifest, attempt.stage_id) && write.outcome === "success") {
       journal.recordJournalEntry({
         id: deterministicId("journal", [instance.id, attempt.id, "published"]),
         issueId: instance.linear_issue_id,

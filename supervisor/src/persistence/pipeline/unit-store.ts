@@ -234,6 +234,7 @@ export interface ExecutionUnitStore {
     toArtifactHash: string;
     fromSubject?: string;
     toSubject?: string;
+    publishStageId?: string;
   }): "migrated" | "already_canonical";
   recordGateReceipt(input: {
     actionId: string;
@@ -1234,6 +1235,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         graph,
         fromSubject: input.fromSubject,
         toSubject: input.toSubject,
+        publishStageId: input.publishStageId,
       });
     };
     if (graph.aggregate_artifact_hash === input.toArtifactHash) {
@@ -1270,20 +1272,26 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     graph: ExecutionUnitGraph;
     fromSubject: string;
     toSubject: string;
+    publishStageId?: string;
   }): void {
+    const publishStageId = input.publishStageId ?? "publish";
     const publishAttempts = input.db.prepare(`
-      SELECT id, request_hash, idempotency_key, request_payload, expected_subject, status
+      SELECT id, request_hash, idempotency_key, request_payload, planned_run_id,
+             expected_subject, native_session_id, status, run_id
       FROM pipeline_stage_attempts
-      WHERE pipeline_instance_id = ? AND stage_id = 'publish'
+      WHERE pipeline_instance_id = ? AND stage_id = ?
         AND status NOT IN ('completed', 'canceled', 'superseded', 'failed')
       ORDER BY attempt_ordinal, reentry_ordinal, created_at, id
-    `).all(input.graph.pipeline_instance_id) as Array<{
+    `).all(input.graph.pipeline_instance_id, publishStageId) as Array<{
       id: string;
       request_hash: string;
       idempotency_key: string;
       request_payload: string | null;
+      planned_run_id: string | null;
       expected_subject: string | null;
+      native_session_id: string | null;
       status: string;
+      run_id: string | null;
     }>;
     if (publishAttempts.length === 0) return;
 
@@ -1294,9 +1302,10 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     if (instance.immutable_subject === input.fromSubject) {
       const instanceUpdate = input.db.prepare(`
         UPDATE pipeline_instances
-        SET immutable_subject = ?
+        SET immutable_subject = ?,
+            status = CASE WHEN active_stage_id = ? AND status = 'running' THEN 'dispatchable' ELSE status END
         WHERE id = ? AND immutable_subject = ?
-      `).run(input.toSubject, input.graph.pipeline_instance_id, input.fromSubject);
+      `).run(input.toSubject, publishStageId, input.graph.pipeline_instance_id, input.fromSubject);
       if (instanceUpdate.changes !== 1) {
         throw new Error(`execution graph ${input.graph.id} publication subject compare-and-set failed`);
       }
@@ -1309,9 +1318,11 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         throw new Error(`publish attempt ${attempt.id} has no sealed request`);
       }
       const request = JSON.parse(attempt.request_payload) as StageRequestEnvelope;
-      if (request.stageId !== "publish" || request.attemptId !== attempt.id ||
+      if (request.stageId !== publishStageId || request.attemptId !== attempt.id ||
           request.requestHash !== attempt.request_hash ||
           request.idempotencyKey !== attempt.idempotency_key ||
+          request.runId !== attempt.planned_run_id ||
+          request.nativeSessionId !== attempt.native_session_id ||
           request.expectedSubject !== attempt.expected_subject) {
         throw new Error(`publish attempt ${attempt.id} stage request binding mismatch`);
       }
@@ -1323,7 +1334,15 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         void idempotencyKey;
         return rest;
       })(request);
-      const updatedWithoutFence = { ...withoutFence, expectedSubject: input.toSubject };
+      const updatedRunId = attempt.run_id && attempt.expected_subject === input.fromSubject
+        ? deterministicId("run", [attempt.id, input.toSubject, "aggregate-publication-restart"])
+        : withoutFence.runId;
+      const updatedWithoutFence = {
+        ...withoutFence,
+        runId: updatedRunId,
+        expectedSubject: input.toSubject,
+        nativeSessionId: null,
+      };
       const updatedFence = createStageRequestHash(updatedWithoutFence);
       const updatedRequest = canonicalJson({ ...updatedWithoutFence, ...updatedFence });
       const oldEffectPayloadHash = digestNormalized(attempt.request_payload);
@@ -1332,12 +1351,15 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       if (attempt.expected_subject === input.fromSubject) {
         const attemptUpdate = input.db.prepare(`
           UPDATE pipeline_stage_attempts
-          SET expected_subject = ?, request_hash = ?, idempotency_key = ?, request_payload = ?
+          SET expected_subject = ?, request_hash = ?, idempotency_key = ?,
+              planned_run_id = ?, run_id = NULL, native_session_id = NULL,
+              request_payload = ?, status = CASE WHEN status = 'running' THEN 'pending' ELSE status END
           WHERE id = ? AND request_hash = ? AND status NOT IN ('completed', 'canceled', 'superseded', 'failed')
         `).run(
           input.toSubject,
           updatedFence.requestHash,
           updatedFence.idempotencyKey,
+          updatedRunId,
           updatedRequest,
           attempt.id,
           attempt.request_hash
@@ -1345,6 +1367,11 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         if (attemptUpdate.changes !== 1) {
           throw new Error(`publish attempt ${attempt.id} aggregate subject compare-and-set failed`);
         }
+        input.db.prepare(`
+          UPDATE pipeline_instance_stages
+          SET status = CASE WHEN status = 'running' THEN 'dispatchable' ELSE status END
+          WHERE pipeline_instance_id = ? AND stage_id = ?
+        `).run(input.graph.pipeline_instance_id, publishStageId);
       } else if (
         attempt.request_hash !== updatedFence.requestHash ||
         attempt.idempotency_key !== updatedFence.idempotencyKey ||
@@ -1353,7 +1380,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         throw new Error(`publish attempt ${attempt.id} canonical request binding mismatch`);
       }
 
-      const effect = input.db.prepare(`
+      let effect = input.db.prepare(`
         SELECT id, payload, payload_hash, idempotency_key, status
         FROM pipeline_effect_intents
         WHERE pipeline_instance_id = ? AND kind = 'dispatch_stage'
@@ -1374,6 +1401,37 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         idempotency_key: string;
         status: string;
       } | undefined;
+      if (!effect && attempt.expected_subject === input.fromSubject) {
+        const timestamp = now();
+        const newEffectId = deterministicId("effect", [
+          input.graph.pipeline_instance_id,
+          attempt.id,
+          updatedFence.idempotencyKey,
+          "aggregate-publication-restart",
+        ]);
+        input.db.prepare(`
+          INSERT INTO pipeline_effect_intents (
+            id, pipeline_instance_id, transition_version, kind, idempotency_key,
+            payload, payload_hash, status, attempts, next_attempt_at, created_at
+          ) VALUES (?, ?, (
+              SELECT COALESCE(MAX(transition_version), 0) + 1
+              FROM pipeline_effect_intents WHERE pipeline_instance_id = ?
+            ), 'dispatch_stage', ?, ?, ?, 'pending', 0, ?, ?)
+          ON CONFLICT(id) DO NOTHING
+        `).run(
+          newEffectId,
+          input.graph.pipeline_instance_id,
+          input.graph.pipeline_instance_id,
+          updatedFence.idempotencyKey,
+          updatedRequest,
+          updatedEffectPayloadHash,
+          timestamp,
+          timestamp
+        );
+        effect = input.db.prepare("SELECT id, payload, payload_hash, idempotency_key, status FROM pipeline_effect_intents WHERE id = ?")
+          .get(newEffectId) as typeof effect;
+      }
+      if (!effect && attempt.expected_subject === input.toSubject) continue;
       if (!effect) {
         throw new Error(`publish attempt ${attempt.id} has no migratable dispatch effect`);
       }

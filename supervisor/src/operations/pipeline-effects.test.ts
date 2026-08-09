@@ -39,6 +39,25 @@ describe("pipeline effect processor", () => {
   const listLinearOutbox = (): LinearOutboxRecord[] =>
     db!.prepare("SELECT * FROM linear_outbox ORDER BY created_at, sequence").all() as LinearOutboxRecord[];
 
+  function repositoryStructuredGraphWithPublishStage(publishStageId: string): string {
+    const graph = JSON.parse(readFileSync(structuredGraphPath, "utf8")) as {
+      id: string;
+      nodes: Array<{
+        id: string;
+        transitions: Record<string, { to?: string; terminal?: string }>;
+      }>;
+    };
+    graph.id = `repository/structured-${publishStageId}`;
+    for (const node of graph.nodes) {
+      if (node.id === "units") node.transitions.success = { to: publishStageId };
+      if (node.id === "publish") {
+        node.id = publishStageId;
+        node.transitions.retryable_failure = { ...node.transitions.retryable_failure, to: publishStageId };
+      }
+    }
+    return JSON.stringify(graph);
+  }
+
   function sandboxRuntimeMock(ids: { issueId?: string; providerDispatchId?: string } = {}) {
     const issueId = ids.issueId ?? "1";
     return {
@@ -521,8 +540,9 @@ describe("pipeline effect processor", () => {
       blobSha: "b".repeat(40),
       config: repositoryConfig,
     });
-    const manifest = parseAndCompileExecutionGraph(readFileSync(structuredGraphPath, "utf8"), {
-      id: "builtin/structured",
+    const publishStageId = "release";
+    const manifest = parseAndCompileExecutionGraph(repositoryStructuredGraphWithPublishStage(publishStageId), {
+      id: `repository/structured-${publishStageId}`,
       runtime: runtimeDescriptor.descriptor,
       config: repositoryConfig.config,
       aggregatePublishContext: "prefer_resume",
@@ -841,8 +861,9 @@ describe("pipeline effect processor", () => {
       blobSha: "b".repeat(40),
       config: repositoryConfig,
     });
-    const manifest = parseAndCompileExecutionGraph(readFileSync(structuredGraphPath, "utf8"), {
-      id: "builtin/structured",
+    const publishStageId = "release";
+    const manifest = parseAndCompileExecutionGraph(repositoryStructuredGraphWithPublishStage(publishStageId), {
+      id: `repository/structured-${publishStageId}`,
       runtime: runtimeDescriptor.descriptor,
       config: repositoryConfig.config,
       aggregatePublishContext: "prefer_resume",
@@ -1436,7 +1457,7 @@ describe("pipeline effect processor", () => {
       integration_subject: finalIntegratedSubject,
     });
     expect(pipelines.getInstance(instance.id)).toMatchObject({
-      active_stage_id: "publish",
+      active_stage_id: publishStageId,
       status: "dispatchable",
       immutable_subject: finalIntegratedTreeSubject,
     });
@@ -1444,7 +1465,7 @@ describe("pipeline effect processor", () => {
     expect(effects.find((effect) => effect.kind === "dispatch_stage" && effect.status === "pending"))
       .toMatchObject({
         kind: "dispatch_stage",
-        idempotency_key: expect.stringContaining("publish"),
+        idempotency_key: expect.stringContaining(publishStageId),
       });
     const publishRequest = JSON.parse(
       effects.find((effect) => effect.kind === "dispatch_stage" && effect.status === "pending")!.payload
@@ -1457,7 +1478,7 @@ describe("pipeline effect processor", () => {
       nativeSessionId: string | null;
     };
     expect(publishRequest).toMatchObject({
-      stageId: "publish",
+      stageId: publishStageId,
       capability: "ce/publish@1",
       expectedSubject: finalIntegratedTreeSubject,
       contextPolicy: "prefer_resume",
@@ -1511,7 +1532,7 @@ describe("pipeline effect processor", () => {
     expect(runtime.dispatchStage).toHaveBeenLastCalledWith(
       { providerResourceId: "sandbox-child-drain" },
       expect.objectContaining({
-        stageId: "publish",
+        stageId: publishStageId,
         capability: "ce/publish@1",
         expectedSubject: finalIntegratedTreeSubject,
         contextPolicy: "prefer_resume",
@@ -1520,13 +1541,95 @@ describe("pipeline effect processor", () => {
     );
     expect(pipelines.getInstance(instance.id)).toMatchObject({ immutable_subject: finalIntegratedTreeSubject });
     expect(pipelines.getActiveAttempt(instance.id)).toMatchObject({
-      stage_id: "publish",
+      stage_id: publishStageId,
       expected_subject: finalIntegratedTreeSubject,
     });
     expect(JSON.parse(pipelines.getEffect(dispatchEffect.id)!.payload)).toMatchObject({
       expectedSubject: finalIntegratedTreeSubject,
     });
     expect(tickets.getByIssueId(instance.linear_issue_id)?.run_id).toBe(publishRequest.runId);
+
+    rewriteAggregatePublicationToLegacyHash();
+    db!.prepare(`
+      UPDATE execution_graphs
+      SET aggregate_artifact_hash = ?, updated_at = ?
+      WHERE parent_attempt_id = ?
+    `).run(legacyGraphResult!.hash, "2099-07-22T12:00:00.000Z", attempt.id);
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET immutable_subject = ?, status = 'running', updated_at = ?
+      WHERE id = ?
+    `).run(finalIntegratedSubject, "2099-07-22T12:00:00.000Z", instance.id);
+    db!.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET expected_subject = ?, request_hash = ?, idempotency_key = ?,
+          planned_run_id = ?, run_id = ?, request_payload = ?, status = 'running',
+          native_session_id = NULL, updated_at = ?
+      WHERE id = ?
+    `).run(
+      finalIntegratedSubject,
+      legacyFence.requestHash,
+      legacyFence.idempotencyKey,
+      legacyWithoutFence.runId,
+      legacyWithoutFence.runId,
+      legacyRequest,
+      "2099-07-22T12:00:00.000Z",
+      publishAttempt.id
+    );
+    db!.prepare(`
+      UPDATE pipeline_effect_intents
+      SET idempotency_key = ?, payload = ?, payload_hash = ?, status = 'acknowledged'
+      WHERE id = ?
+    `).run(legacyFence.idempotencyKey, legacyRequest, digestNormalized(legacyRequest), dispatchEffect.id);
+
+    const stopCallsBeforeRecovery = runtime.stop.mock.calls.length;
+    await processor.drain();
+    expect(runtime.stop).toHaveBeenCalledTimes(stopCallsBeforeRecovery + 1);
+    expect(tickets.getRun(legacyWithoutFence.runId)).toMatchObject({ status: "stopped" });
+    expect(tickets.getByIssueId(instance.linear_issue_id)?.run_id).toBeNull();
+    expect(pipelines.getInstance(instance.id)).toMatchObject({
+      active_stage_id: publishStageId,
+      status: "dispatchable",
+      immutable_subject: finalIntegratedTreeSubject,
+    });
+    const restartedAttempt = pipelines.getActiveAttempt(instance.id)!;
+    const restartedRequest = JSON.parse(restartedAttempt.request_payload!) as StageRequestEnvelope;
+    expect(restartedAttempt).toMatchObject({
+      stage_id: publishStageId,
+      status: "pending",
+      run_id: null,
+      native_session_id: null,
+      expected_subject: finalIntegratedTreeSubject,
+    });
+    expect(restartedRequest).toMatchObject({
+      stageId: publishStageId,
+      expectedSubject: finalIntegratedTreeSubject,
+      nativeSessionId: null,
+    });
+    expect(restartedRequest.runId).not.toBe(legacyWithoutFence.runId);
+    const restartedEffect = pipelines.listEffects(instance.id).find((effect) =>
+      effect.kind === "dispatch_stage" &&
+      effect.status === "pending" &&
+      effect.id !== dispatchEffect.id
+    );
+    expect(restartedEffect).toMatchObject({
+      idempotency_key: restartedRequest.idempotencyKey,
+      payload: canonicalJson(restartedRequest),
+    });
+
+    const dispatchCallsBeforeRestart = runtime.dispatchStage.mock.calls.length;
+    await processor.drain();
+    expect(runtime.dispatchStage).toHaveBeenCalledTimes(dispatchCallsBeforeRestart + 1);
+    expect(runtime.dispatchStage).toHaveBeenLastCalledWith(
+      { providerResourceId: "sandbox-child-drain" },
+      expect.objectContaining({
+        stageId: publishStageId,
+        expectedSubject: finalIntegratedTreeSubject,
+        runId: restartedRequest.runId,
+        nativeSessionId: null,
+      })
+    );
+    expect(tickets.getByIssueId(instance.linear_issue_id)?.run_id).toBe(restartedRequest.runId);
   });
 
   it("leaves retryable child loop errors active for effect retry instead of parsing them as receipts", async () => {
